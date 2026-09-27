@@ -161,6 +161,11 @@ test_globs:
 extra_top_level_dirs: [mergepath, packaging]
 EOF
 
+# Stage B copies the template's ignore rules. Keep the source file real so the
+# generated-repository assertion catches an accidental removal of local review
+# state protection from the template.
+cp "$ROOT/.gitignore" "$FAKE_MP/.gitignore"
+
 cat >"$FAKE_MP/SECURITY.md" <<'EOF'
 # Security
 Report issues to security@mergepath.example.
@@ -431,6 +436,21 @@ set -e
 [ "$ec" -eq 0 ] \
   && pass "stage B live run completes (exit 0)" \
   || fail "stage B live run failed; rc=$ec; out: $out"
+
+# --- assertion 0: local review state is ignored in the generated repo ---
+grep -Fxq 'coverage/' "$TARGET/.gitignore" \
+  && pass "bootstrap preserves existing .gitignore rules" \
+  || fail "bootstrap removed the existing coverage/ ignore rule"
+ignore_rule_count=$(grep -Fxc '.mergepath/' "$TARGET/.gitignore" || true)
+[ "$ignore_rule_count" -eq 1 ] \
+  && pass "bootstrap preserves one .mergepath/ local-review-state ignore rule (#1047)" \
+  || fail "bootstrap did not preserve exactly one .mergepath/ ignore rule (found $ignore_rule_count)"
+if git -C "$TARGET" check-ignore -q \
+  .mergepath/phase-4b-loops/nathanjohnpayne-example-pr1.jsonl; then
+  pass "a generated Phase 4b JSONL is ignored by git (#1047)"
+else
+  fail "a generated Phase 4b JSONL is not ignored by git"
+fi
 
 # --- assertion 1: excludes honored ---
 for excluded in \

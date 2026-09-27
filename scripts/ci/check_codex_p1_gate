@@ -28,11 +28,12 @@ RELAY_WORKFLOW=".github/workflows/codex-feedback-archive-relay.yml"
 RELAY_SOURCE="scripts/workflow/feedback-archive-relay-source.sh"
 TEST="tests/test_codex_p1_gate.sh"
 RELAY_TEST="tests/test_feedback_archive_relay_source.sh"
+WORKFLOW_RUNTIME_TEST="tests/test_codex_p1_workflow_runtime.sh"
 
 FAILED=0
 
 # Existence + executability checks.
-for rel in "$SCRIPT" "$RELAY_SOURCE" "$TEST" "$RELAY_TEST"; do
+for rel in "$SCRIPT" "$RELAY_SOURCE" "$TEST" "$RELAY_TEST" "$WORKFLOW_RUNTIME_TEST"; do
   if [ ! -f "$rel" ]; then
     echo "FAIL: Missing required file: $rel"
     FAILED=1
@@ -267,8 +268,13 @@ if gate.is_a?(Hash)
   require_shape.call(!gate_run.nil?, "codex-p1-gate has no gate publisher step")
   if gate_run
     require_shape.call(
-      gate_run.include?("if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]") &&
-        gate_run.include?(".mergepath-sync.yml") && gate_run.include?("::error::") &&
+        gate_run.include?("if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]") &&
+        gate_run.include?("[ ! -e .github/workflows/codex-p1-gate.yml ]") &&
+        gate_run.include?("[ ! -L .github/workflows/codex-p1-gate.yml ]") &&
+        gate_run.include?(".github/workflows/codex-p1-gate.yml") &&
+        !gate_run.include?(".mergepath-sync.yml") && gate_run.include?("::error::") &&
+        gate_run.include?("Could not read the trusted Codex P1 workflow to determine fingerprint-helper bootstrap state") &&
+        gate_run.include?("[ \"$?\" -ne 1 ]") &&
         gate_run.include?("::warning::"),
       "codex-p1-gate does not fail closed when an installed fingerprint helper is missing"
     )
@@ -345,8 +351,9 @@ if sweep.is_a?(Hash)
   if sweep_run
     require_shape.call(
       sweep_run.include?("if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]") &&
-        sweep_run.include?(".mergepath-sync.yml") && sweep_run.include?("::error::") &&
-        sweep_run.include?("::warning::"),
+        !sweep_run.include?(".mergepath-sync.yml") && !sweep_run.include?("::warning::") &&
+        sweep_run.include?("Scheduled runs load this default-branch workflow and helper from") &&
+        sweep_run.include?("Installed feedback-fingerprint helper is missing or not executable"),
       "scheduled-sweep does not fail closed when an installed fingerprint helper is missing"
     )
     helper_guard = sweep_run.index('if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]')
@@ -397,6 +404,25 @@ if sweep.is_a?(Hash)
         lease < before && before < evaluate && evaluate < after && after < compare &&
         compare < reject && reject < close,
       "scheduled-sweep does not lease, evaluate, reject drift, and close the same check generation"
+    )
+    pr_read = sweep_run.index('if ! pr_json=$(gh api "repos/$REPO/pulls/$PR"); then')
+    head_read = sweep_run.index(%q{if ! head_sha=$(jq -r '.head.sha' <<<"$pr_json")})
+    require_shape.call(
+      [pr_read, head_read, lease].all? && pr_read < head_read && head_read < lease &&
+        sweep_run.include?('Could not read PR #$PR; cannot open a fail-closed lease') &&
+        sweep_run.include?('Could not parse PR #$PR response; cannot open a fail-closed lease') &&
+        sweep_run.include?(%q{|| ! pr_created_at=$(jq -r '.created_at // ""' <<<"$pr_json")}) &&
+        sweep_run.index("continue", pr_read + 1) < lease,
+      "scheduled-sweep can abort later PRs or mutate a check lease after an unreadable or malformed per-PR read"
+    )
+    before_read = sweep_run.index("if ! feedback_fp_before=$(scripts/review-feedback-surface-fingerprint.sh")
+    after_read = sweep_run.index("if ! feedback_fp_after=$(scripts/review-feedback-surface-fingerprint.sh")
+    require_shape.call(
+      [lease, before_read, evaluate, after_read, close].all? &&
+        lease < before_read && before_read < evaluate && evaluate < after_read && after_read < close &&
+        sweep_run.include?('Could not read the feedback surface before evaluating PR #$PR; closing this generation as failure.') &&
+        sweep_run.include?('Could not read the feedback surface after evaluating PR #$PR; closing this generation as failure.'),
+      "scheduled-sweep can strand a lease or publish success after a failed feedback-surface read"
     )
     # #1091: same reordering as the event-driven gate above, in the scheduled
     # re-evaluation's own copy of the fence. The pre-fix form echoed the raw
@@ -692,6 +718,10 @@ if ! bash "$TEST"; then
 fi
 if ! bash "$RELAY_TEST"; then
   echo "check_codex_p1_gate: FAIL (relay source binding suite)"
+  exit 1
+fi
+if ! bash "$WORKFLOW_RUNTIME_TEST"; then
+  echo "check_codex_p1_gate: FAIL (workflow runtime suite)"
   exit 1
 fi
 
