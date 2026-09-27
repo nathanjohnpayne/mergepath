@@ -4089,6 +4089,14 @@ codex:
   max_review_rounds: 2
   reaction_freshness_window_seconds: 1800
 EOF
+cat >"$WORK/cap-noauthor.yml" <<'EOF'
+coderabbit:
+  enabled: false
+  max_wait_seconds: 100
+codex:
+  enabled: true
+  max_review_rounds: 0
+EOF
 _cap_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 _cap_old='[{"id":5101,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-08-01T00:00:00Z"},{"id":5102,"user":{"login":"nathanjohnpayne"},"body":"@CODEX REVIEW","created_at":"2026-08-02T00:00:00Z"}]'
 _cap_final=$(printf '%s' "$_cap_old" | jq -c --arg now "$_cap_now" '.[1].created_at=$now')
@@ -4097,6 +4105,9 @@ rm -rf "$WORK/barrier-state/phase-4b-barrier"
 out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_old" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
 [ "$rc" = 3 ] || bad="$bad exhausted-not-tiebreak"
 printf '%s' "$out" | jq -e '.decision == "human-tiebreaker" and .request_budget.request_attempts == 2 and .request_budget.max_request_attempts == 2' >/dev/null 2>&1 || bad="$bad exhausted-payload"
+
+out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-noauthor.yml" P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-noauthor.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 3 ] && [ "$(printf '%s' "$out" | jq -r '.request_budget.max_request_attempts')" = 0 ] || bad="$bad omitted-author-default"
 
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
 out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?

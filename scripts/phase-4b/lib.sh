@@ -536,8 +536,7 @@ p4b_codex_request_budget_state() {
   fi
   config="$(p4b_config)"
   author="$(p4b_top_field author_identity)"
-  [ -n "$author" ] \
-    || { jq -nc '{state:"unreadable",reason:"author-identity-missing"}'; return 2; }
+  author="${author:-nathanjohnpayne}"
   resolver="${P4B_RESOLVE_BASE_POLICY:-$P4B_LIB_DIR/../workflow/resolve_base_policy.sh}"
   budget=$(crqe_governing_budget "$repo" "$pr" "$config" "$author" "$resolver") \
     || { jq -nc '{state:"unreadable",reason:"governing-policy-unreadable"}'; return 2; }
