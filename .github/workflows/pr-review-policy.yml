@@ -585,7 +585,7 @@ jobs:
             err=$(mktemp)
             gh api --paginate "$endpoint" >"$raw" 2>"$err" || rc=$?
             if [ "$rc" -ne 0 ] || ! jq -s 'add // []' "$raw" >"$output"; then
-              echo "::error::Could not read complete $endpoint data; preserving needs-external-review." >&2
+              echo "::warning::Could not read complete $endpoint data; preserving needs-external-review." >&2
               cat "$err" >&2 || true
               rm -f "$raw" "$err"
               return 1
@@ -604,7 +604,7 @@ jobs:
                     | select((.labels | type) == "array")
                     | {head_sha:.head.sha, labels:[.labels[] | select((.name | type) == "string") | .name]}
                   ' "$raw" >"$output"; then
-              echo "::error::Could not read current PR head and labels; preserving needs-external-review." >&2
+              echo "::warning::Could not read current PR head and labels; preserving needs-external-review." >&2
               cat "$err" >&2 || true
               rm -f "$raw" "$err"
               return 1
@@ -618,19 +618,23 @@ jobs:
           cleanup_reconcile() { rm -f "$LIVE" "$TIMELINE" "$COMMENTS"; }
           trap cleanup_reconcile EXIT
 
-          read_live_pr "$LIVE"
+          if ! read_live_pr "$LIVE"; then
+            exit 0
+          fi
           LIVE_HEAD=$(jq -r '.head_sha' "$LIVE")
           if [ "$LIVE_HEAD" != "$EXPECTED_HEAD_SHA" ]; then
-            echo "::error::PR head moved from $EXPECTED_HEAD_SHA to $LIVE_HEAD during classification; preserving needs-external-review." >&2
-            exit 1
+            echo "::warning::PR head moved from $EXPECTED_HEAD_SHA to $LIVE_HEAD during classification; preserving needs-external-review." >&2
+            exit 0
           fi
           if ! jq -e '.labels | index("needs-external-review") != null' "$LIVE" >/dev/null; then
             echo "needs-external-review is already absent; nothing to reconcile."
             exit 0
           fi
 
-          fetch_array "repos/$REPO/issues/$PR_NUMBER/timeline" "$TIMELINE"
-          fetch_array "repos/$REPO/issues/$PR_NUMBER/comments" "$COMMENTS"
+          if ! fetch_array "repos/$REPO/issues/$PR_NUMBER/timeline" "$TIMELINE" \
+             || ! fetch_array "repos/$REPO/issues/$PR_NUMBER/comments" "$COMMENTS"; then
+            exit 0
+          fi
           LATEST=$(jq -c '
             [ .[]
               | select((.event == "labeled" or .event == "unlabeled")
@@ -644,7 +648,6 @@ jobs:
           fi
           LABEL_EVENT_ID=$(jq -r '.id' <<<"$LATEST")
           LABEL_EVENT_TIME=$(jq -r '.created_at' <<<"$LATEST")
-          LABEL_EVENT_COMMIT=$(jq -r '.commit_id // ""' <<<"$LATEST")
 
           # New applications carry an exact-head marker. Legacy applications
           # are admitted only through the original exact body plus a five-minute
@@ -670,9 +673,8 @@ jobs:
             | sed -n 's/.*mergepath-external-review-label:v1 head=\([0-9a-fA-F]\{40\}\) cause=fail-closed.*/\1/p' \
             | head -1)
           if printf '%s\n' "$OWNER_BODY" | grep -Fq 'mergepath-external-review-label:v1'; then
-            if [ -z "$MARKED_HEAD" ] \
-               || { [ -n "$LABEL_EVENT_COMMIT" ] && [ "$MARKED_HEAD" != "$LABEL_EVENT_COMMIT" ]; }; then
-              echo "Fail-closed provenance marker does not match its label event; preserving needs-external-review."
+            if [ -z "$MARKED_HEAD" ] || [ "$MARKED_HEAD" != "$EXPECTED_HEAD_SHA" ]; then
+              echo "Fail-closed provenance marker does not match the classified PR head; preserving needs-external-review."
               exit 0
             fi
           fi
@@ -680,28 +682,35 @@ jobs:
           # Close the read/delete race as far as the API permits: repeat both
           # mutable facts immediately before deletion. A human re-application,
           # an unlinking event, a head move, or any read failure holds the label.
-          fetch_array "repos/$REPO/issues/$PR_NUMBER/timeline" "$TIMELINE"
+          if ! fetch_array "repos/$REPO/issues/$PR_NUMBER/timeline" "$TIMELINE"; then
+            exit 0
+          fi
           LATEST_AGAIN=$(jq -c '
             [ .[]
               | select((.event == "labeled" or .event == "unlabeled")
                        and .label.name == "needs-external-review") ]
             | sort_by(.created_at, .id) | last // null
           ' "$TIMELINE")
-          read_live_pr "$LIVE"
+          if ! read_live_pr "$LIVE"; then
+            exit 0
+          fi
           if [ "$(jq -r '.id // ""' <<<"$LATEST_AGAIN")" != "$LABEL_EVENT_ID" ] \
              || [ "$(jq -r '.event // ""' <<<"$LATEST_AGAIN")" != labeled ] \
              || [ "$(jq -r '.actor.login // ""' <<<"$LATEST_AGAIN")" != 'github-actions[bot]' ] \
              || [ "$(jq -r '.head_sha' "$LIVE")" != "$EXPECTED_HEAD_SHA" ] \
              || ! jq -e '.labels | index("needs-external-review") != null' "$LIVE" >/dev/null; then
-            echo "::error::PR head, label, or ownership changed during reconciliation; preserving needs-external-review." >&2
-            exit 1
+            echo "::warning::PR head, label, or ownership changed during reconciliation; preserving needs-external-review." >&2
+            exit 0
           fi
           if [ -z "$LABEL_REMOVAL_TOKEN" ]; then
-            echo "::error::Label-removal token is unavailable; preserving needs-external-review." >&2
-            exit 1
+            echo "::warning::Label-removal token is unavailable; preserving needs-external-review." >&2
+            exit 0
           fi
-          GH_TOKEN="$LABEL_REMOVAL_TOKEN" gh api -X DELETE \
-            "repos/$REPO/issues/$PR_NUMBER/labels/needs-external-review"
+          if ! GH_TOKEN="$LABEL_REMOVAL_TOKEN" gh api -X DELETE \
+            "repos/$REPO/issues/$PR_NUMBER/labels/needs-external-review"; then
+            echo "::warning::Could not remove needs-external-review; preserving the label for Label Gate." >&2
+            exit 0
+          fi
           echo "Removed workflow-owned fail-closed needs-external-review after a fresh under-threshold evaluation."
 
       - name: Propagation PR review lane

@@ -205,6 +205,7 @@ case "$*" in
       cat "$GH_STUB_DIR/live.json"
     fi ;;
   "api -X DELETE repos/o/r/issues/42/labels/needs-external-review")
+    [ ! -f "$GH_STUB_DIR/fail-delete" ] || exit 1
     printf 'deleted\n' >>"$GH_STUB_DIR/deletes"
     printf '{}\n' ;;
   *)
@@ -232,7 +233,7 @@ JSON
 run_reconcile() { # <fixture-dir>
   local dir=$1 rc=0
   env PATH="$WORK/bin:$PATH" GH_STUB_DIR="$dir" \
-    GH_TOKEN=fake-read LABEL_REMOVAL_TOKEN=fake-write \
+    GH_TOKEN=fake-read LABEL_REMOVAL_TOKEN="${LABEL_REMOVAL_TOKEN_OVERRIDE-fake-write}" \
     PR_NUMBER=42 EXPECTED_HEAD_SHA="$HEAD40" REPO=o/r \
     bash "$WORK/reconcile.sh" >"$dir/out" 2>"$dir/err" || rc=$?
   printf '%s' "$rc"
@@ -272,8 +273,8 @@ cat >"$R4/live-2.json" <<JSON
 {"head":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"labels":[{"name":"needs-external-review"}]}
 JSON
 rc=$(run_reconcile "$R4")
-if [ "$rc" -ne 0 ] && [ ! -f "$R4/deletes" ]; then
-  pass "a head move during reconciliation fails closed without removing the label (#1321)"
+if [ "$rc" -eq 0 ] && [ ! -f "$R4/deletes" ]; then
+  pass "a head move preserves the label without failing successful classification (#1321)"
 else
   fail "head move did not hold reconciliation (rc=$rc)"
 fi
@@ -282,8 +283,8 @@ R5="$WORK/reconcile-read-failure"
 write_reconcile_fixture "$R5" 'github-actions[bot]' '2026-09-25T01:36:20Z'
 touch "$R5/fail-timeline"
 rc=$(run_reconcile "$R5")
-if [ "$rc" -ne 0 ] && [ ! -f "$R5/deletes" ]; then
-  pass "an unreadable timeline fails closed without removing the label (#1321)"
+if [ "$rc" -eq 0 ] && [ ! -f "$R5/deletes" ]; then
+  pass "an unreadable timeline preserves the label without failing successful classification (#1321)"
 else
   fail "timeline read failure did not hold reconciliation (rc=$rc)"
 fi
@@ -295,9 +296,43 @@ jq '.[] .body = "<!-- mergepath-external-review-label:v1 head=bbbbbbbbbbbbbbbbbb
 mv "$R6/comments.tmp" "$R6/comments.json"
 rc=$(run_reconcile "$R6")
 if [ "$rc" -eq 0 ] && [ ! -f "$R6/deletes" ]; then
-  pass "a head marker that disagrees with its label event does not authorize removal (#1321)"
+  pass "a head marker that disagrees with the classified PR head does not authorize removal (#1321)"
 else
   fail "mismatched provenance marker authorized removal (rc=$rc)"
+fi
+
+R7="$WORK/reconcile-missing-token"
+write_reconcile_fixture "$R7" 'github-actions[bot]' '2026-09-25T01:36:20Z'
+LABEL_REMOVAL_TOKEN_OVERRIDE=
+export LABEL_REMOVAL_TOKEN_OVERRIDE
+rc=$(run_reconcile "$R7")
+unset LABEL_REMOVAL_TOKEN_OVERRIDE
+if [ "$rc" -eq 0 ] && [ ! -f "$R7/deletes" ]; then
+  pass "a missing removal token preserves the label without failing successful classification (#1321)"
+else
+  fail "missing removal token did not preserve the label cleanly (rc=$rc)"
+fi
+
+R8="$WORK/reconcile-delete-failure"
+write_reconcile_fixture "$R8" 'github-actions[bot]' '2026-09-25T01:36:20Z'
+touch "$R8/fail-delete"
+rc=$(run_reconcile "$R8")
+if [ "$rc" -eq 0 ] && [ ! -f "$R8/deletes" ]; then
+  pass "a failed removal preserves the label for live Label Gate evaluation (#1321)"
+else
+  fail "failed removal did not preserve the label cleanly (rc=$rc)"
+fi
+
+R9="$WORK/reconcile-matching-marker"
+write_reconcile_fixture "$R9" 'github-actions[bot]' '2026-09-25T01:36:20Z'
+jq --arg head "$HEAD40" '.[] .body = "<!-- mergepath-external-review-label:v1 head=\($head) cause=fail-closed -->\\n**External Review Required**\\n- read failed; requiring review fail-closed"' \
+  "$R9/comments.json" >"$R9/comments.tmp"
+mv "$R9/comments.tmp" "$R9/comments.json"
+rc=$(run_reconcile "$R9")
+if [ "$rc" -eq 0 ] && [ "$(cat "$R9/deletes" 2>/dev/null)" = deleted ]; then
+  pass "a provenance marker matching the classified PR head can authorize removal (#1321)"
+else
+  fail "matching provenance marker did not authorize safe removal (rc=$rc)"
 fi
 
 echo
