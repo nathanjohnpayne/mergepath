@@ -185,11 +185,14 @@ else
 fi
 
 mkdir -p "$WORK/bin"
+REAL_BASH=$(command -v bash)
 cat >"$WORK/bin/gh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"$GH_STUB_DIR/calls"
 case "$*" in
+  "api --paginate repos/o/r/pulls/42/files")
+    printf '[{"filename":"src/example.sh","status":"modified","additions":400,"deletions":0}]\n' ;;
   "api --paginate repos/o/r/issues/42/timeline")
     [ ! -f "$GH_STUB_DIR/fail-timeline" ] || exit 1
     cat "$GH_STUB_DIR/timeline.json" ;;
@@ -215,6 +218,89 @@ esac
 SH
 chmod +x "$WORK/bin/gh"
 
+# Execute the real classifier shell body for the carry-forward boundary. The
+# workflow still materializes its trusted base tree and selects the trusted
+# helpers; only those helpers' responses and GitHub's files endpoint are
+# replaced, so duplicate or contradictory GITHUB_OUTPUT writes remain visible.
+cat >"$WORK/bin/bash" <<'SH'
+#!/bin/bash
+set -euo pipefail
+case "${1-}" in
+  */external_review_fingerprint.sh)
+    [ "${FINGERPRINT_RC:-0}" -eq 0 ] || exit "$FINGERPRINT_RC"
+    printf '%s\n' "${FINGERPRINT_JSON:?}" ;;
+  */external_review_carryforward.sh)
+    [ "${CARRY_RC:-0}" -eq 0 ] || exit "$CARRY_RC"
+    printf '%s\n' "${CARRY_JSON:?}" ;;
+  *) exec "$REAL_BASH" "$@" ;;
+esac
+SH
+chmod +x "$WORK/bin/bash"
+
+yq -r '.jobs."external-review-labeling".steps[] | select(.id == "check") | .run' \
+  "$WORKFLOW" \
+  | sed \
+      -e "s|\${{ github.event.pull_request.base.sha }}|$(git -C "$ROOT" rev-parse HEAD^)|g" \
+      -e "s|\${{ github.event.pull_request.head.sha }}|$(git -C "$ROOT" rev-parse HEAD)|g" \
+      -e 's|${{ github.event.pull_request.head.ref }}|codex/test-carry-forward|g' \
+      -e 's|${{ github.event.pull_request.user.login }}|fixture-author|g' \
+      -e 's|${{ github.event.repository.default_branch }}|main|g' \
+      -e 's|${{ github.repository }}|o/r|g' \
+  >"$WORK/classifier.sh"
+
+run_classifier() { # <fixture-dir> <fingerprint-rc> <carry-rc> <carry-json>
+  local dir=$1 fingerprint_rc=$2 carry_rc=$3 carry_json=$4 rc=0
+  mkdir -p "$dir"
+  env PATH="$WORK/bin:$PATH" REAL_BASH="$REAL_BASH" GH_STUB_DIR="$dir" \
+    GITHUB_OUTPUT="$dir/output" PR_NUMBER=42 \
+    FINGERPRINT_RC="$fingerprint_rc" \
+    FINGERPRINT_JSON='{"requires_review":true,"fingerprint":"fp-1","reasons":["protected path"]}' \
+    CARRY_RC="$carry_rc" CARRY_JSON="$carry_json" \
+    "$REAL_BASH" "$WORK/classifier.sh" >"$dir/out" 2>"$dir/err" || rc=$?
+  printf '%s' "$rc"
+}
+
+last_output() { # <file> <key>
+  awk -F= -v key="$2" '$1 == key { value=substr($0, length(key) + 2) } END { print value }' "$1"
+}
+
+C1="$WORK/classifier-carried"
+rc=$(run_classifier "$C1" 0 0 '{"carried":true,"source_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","source_time":"2026-09-27T00:00:00Z"}')
+if [ "$rc" -eq 0 ] \
+   && [ "$(last_output "$C1/output" needs_review)" = false ] \
+   && [ "$(last_output "$C1/output" classification)" = carried-forward ]; then
+  pass "successful carry-forward publishes a reconcilable classification"
+else
+  fail "successful carry-forward left contradictory outputs (rc=$rc output=$(cat "$C1/output" 2>/dev/null) err=$(cat "$C1/err"))"
+fi
+
+C2="$WORK/classifier-carry-failed"
+rc=$(run_classifier "$C2" 0 9 '{}')
+if [ "$rc" -eq 0 ] \
+   && [ "$(last_output "$C2/output" needs_review)" = true ] \
+   && [ "$(last_output "$C2/output" classification)" = external-required ]; then
+  pass "a failed carry-forward remains external-required"
+else
+  fail "failed carry-forward weakened fail-closed classification (rc=$rc output=$(cat "$C2/output" 2>/dev/null) err=$(cat "$C2/err"))"
+fi
+
+C3="$WORK/classifier-fingerprint-failed"
+rc=$(run_classifier "$C3" 8 0 '{}')
+if [ "$rc" -eq 0 ] \
+   && [ "$(last_output "$C3/output" needs_review)" = true ] \
+   && [ "$(last_output "$C3/output" classification)" = fail-closed ]; then
+  pass "a failed fingerprint remains fail-closed"
+else
+  fail "fingerprint failure weakened fail-closed classification (rc=$rc output=$(cat "$C3/output" 2>/dev/null) err=$(cat "$C3/err"))"
+fi
+
+RECONCILE_IF=$(yq -r '.jobs."external-review-labeling".steps[] | select(.name == "Reconcile a policy-owned fail-closed label") | .if' "$WORKFLOW")
+if [[ "$RECONCILE_IF" == *"under-threshold"* ]] && [[ "$RECONCILE_IF" == *"carried-forward"* ]]; then
+  pass "reconciliation accepts ordinary and carried-forward no-review classifications"
+else
+  fail "reconciliation condition excludes a no-review classification: $RECONCILE_IF"
+fi
+
 HEAD40=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 write_reconcile_fixture() { # <dir> <latest actor> <comment time> [event]
   local dir=$1 actor=$2 comment_time=$3 event=${4:-labeled}
@@ -232,7 +318,7 @@ JSON
 
 run_reconcile() { # <fixture-dir>
   local dir=$1 rc=0
-  env PATH="$WORK/bin:$PATH" GH_STUB_DIR="$dir" \
+  env PATH="$WORK/bin:$PATH" REAL_BASH="$REAL_BASH" GH_STUB_DIR="$dir" \
     GH_TOKEN=fake-read LABEL_REMOVAL_TOKEN="${LABEL_REMOVAL_TOKEN_OVERRIDE-fake-write}" \
     PR_NUMBER=42 EXPECTED_HEAD_SHA="$HEAD40" REPO=o/r \
     bash "$WORK/reconcile.sh" >"$dir/out" 2>"$dir/err" || rc=$?

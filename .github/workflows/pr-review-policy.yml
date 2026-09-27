@@ -507,6 +507,7 @@ jobs:
               SOURCE_COMMIT=$(echo "$CARRY_JSON" | jq -r '.source_commit')
               SOURCE_TIME=$(echo "$CARRY_JSON" | jq -r '.source_time')
               echo "External-review carry-forward: Codex already cleared the same external-review fingerprint on $SOURCE_COMMIT at $SOURCE_TIME; skipping needs-external-review on base-only sync (#705)."
+              echo "classification=carried-forward" >> "$GITHUB_OUTPUT"
               echo "needs_review=false" >> "$GITHUB_OUTPUT"
               echo "reasons=" >> "$GITHUB_OUTPUT"
               exit 0
@@ -565,7 +566,9 @@ jobs:
           )"
 
       - name: Reconcile a policy-owned fail-closed label
-        if: steps.check.outputs.classification == 'under-threshold'
+        if: >-
+          steps.check.outputs.classification == 'under-threshold' ||
+          steps.check.outputs.classification == 'carried-forward'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LABEL_REMOVAL_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
@@ -574,11 +577,12 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          # #1321: a successful under-threshold evaluation may retract only a
+          # #1321: a successful no-review classification may retract only a
           # label this workflow previously applied because an earlier read
-          # failed closed. An old comment is not ownership: a human could have
-          # removed and re-applied the label since then. Bind the decision to
-          # the latest label timeline event and its adjacent automation comment.
+          # failed closed. This includes an ordinary under-threshold result and
+          # a same-fingerprint carry-forward. An old comment is not ownership:
+          # a human could have removed and re-applied the label since then. Bind
+          # the decision to the latest label event and adjacent automation comment.
           fetch_array() { # <endpoint> <output-file>
             local endpoint=$1 output=$2 raw err rc=0
             raw=$(mktemp)
@@ -711,7 +715,7 @@ jobs:
             echo "::warning::Could not remove needs-external-review; preserving the label for Label Gate." >&2
             exit 0
           fi
-          echo "Removed workflow-owned fail-closed needs-external-review after a fresh under-threshold evaluation."
+          echo "Removed workflow-owned fail-closed needs-external-review after a trusted no-review classification."
 
       - name: Propagation PR review lane
         if: steps.check.outputs.propagation_lane == 'true'
