@@ -2785,23 +2785,36 @@ thread_reply_disposition() {
 # finding_dispositioned <thread_json> → prints the evidence description,
 # exit 0; exit 1 when this specific finding was never dispositioned.
 #
-# The finding's comment id is .all_comments[0].databaseId — the thread's
-# ORIGINAL comment, which is the id both recorder scripts key their ledger
-# rows on. That index is only trustworthy over a COMPLETE comment list, which
-# every caller already guarantees via complete_thread_comments (fail-closed on
-# a re-fetch failure, #573 item 2).
+# Recorder scripts key their ledger rows to the comment they dispositioned.
+# A current bot/reviewer re-raise has a new comment id, so consult every
+# eligible current-round non-agent comment id rather than only the original
+# .all_comments[0] id. The current round begins at latest_nonagent_created;
+# ledger_verdict_for_finding separately requires recorded_at to be after that
+# same floor. The complete list invariant remains mandatory (fail-closed on a
+# re-fetch failure, #573 item 2).
 finding_dispositioned() {
-  local tj="$1" cid floor lf
+  local tj="$1" cid floor lf cnt i login created
   if thread_reply_disposition "$tj"; then
     printf 'agent reply on the thread after the latest re-raise'
     return 0
   fi
-  cid=$(printf '%s' "$tj" | jq -r '.all_comments[0].databaseId // ""' 2>/dev/null) || cid=""
   floor=$(latest_nonagent_created "$tj")
-  if lf=$(ledger_verdict_for_finding "$cid" "$floor"); then
-    printf 'verdict for finding %s recorded in %s' "$cid" "${lf##*/}"
-    return 0
-  fi
+  cnt=$(printf '%s' "$tj" | jq '.all_comments | length' 2>/dev/null || echo 0)
+  case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
+  i=0
+  while [ "$i" -lt "$cnt" ]; do
+    login=$(printf '%s' "$tj" | jq -r ".all_comments[$i].author.login // \"\"")
+    created=$(printf '%s' "$tj" | jq -r ".all_comments[$i].createdAt // \"\"")
+    cid=$(printf '%s' "$tj" | jq -r ".all_comments[$i].databaseId // \"\"")
+    if ! is_agent_author_local "$login" \
+      && { [ "$created" = "$floor" ] || [ "$created" \> "$floor" ]; }; then
+      if lf=$(ledger_verdict_for_finding "$cid" "$floor"); then
+        printf 'verdict for finding %s recorded in %s' "$cid" "${lf##*/}"
+        return 0
+      fi
+    fi
+    i=$((i + 1))
+  done
   return 1
 }
 
