@@ -28,11 +28,12 @@ RELAY_WORKFLOW=".github/workflows/codex-feedback-archive-relay.yml"
 RELAY_SOURCE="scripts/workflow/feedback-archive-relay-source.sh"
 TEST="tests/test_codex_p1_gate.sh"
 RELAY_TEST="tests/test_feedback_archive_relay_source.sh"
+WORKFLOW_RUNTIME_TEST="tests/test_codex_p1_workflow_runtime.sh"
 
 FAILED=0
 
 # Existence + executability checks.
-for rel in "$SCRIPT" "$RELAY_SOURCE" "$TEST" "$RELAY_TEST"; do
+for rel in "$SCRIPT" "$RELAY_SOURCE" "$TEST" "$RELAY_TEST" "$WORKFLOW_RUNTIME_TEST"; do
   if [ ! -f "$rel" ]; then
     echo "FAIL: Missing required file: $rel"
     FAILED=1
@@ -713,6 +714,10 @@ if ! bash "$TEST"; then
 fi
 if ! bash "$RELAY_TEST"; then
   echo "check_codex_p1_gate: FAIL (relay source binding suite)"
+  exit 1
+fi
+if ! bash "$WORKFLOW_RUNTIME_TEST"; then
+  echo "check_codex_p1_gate: FAIL (workflow runtime suite)"
   exit 1
 fi
 
