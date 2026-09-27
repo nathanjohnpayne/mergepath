@@ -1427,14 +1427,14 @@ sync_all_normalized_pathset() {
       MERGEPATH_TPL_PATH="$target" yq -r '
         env(MERGEPATH_TPL_PATH) as $p
         | .paths[] | select(.path == $p) | (.dest // .path)
-      ' "$manifest"
+      ' "$manifest" || return 1
     done <<< "$templated_targets"
   } | sed '/^$/d' | LC_ALL=C sort -u
 }
 
 sync_all_scope_digest() {
   local normalized_pathset=$1
-  printf '%s\n' "$normalized_pathset" | git hash-object --stdin | cut -c1-12
+  printf '%s\n' "$normalized_pathset" | git -C "$MERGEPATH_ROOT" hash-object --stdin | cut -c1-12
 }
 
 # Branch name for --sync-all runs. Every run appends a digest of its normalized,

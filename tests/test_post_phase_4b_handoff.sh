@@ -225,6 +225,17 @@ printf '%s' "$MALFORMED_OUT" | grep -q "novel work" \
   && pass "malformed sync-all scope suffix is not trusted as a mirror" \
   || fail "malformed sync-all scope suffix widened mirror classification"
 
+write_pr_fixture nathanjohnpayne mergepath 285 \
+  "mergepath-sync/sync-all-a-0123456789ab" \
+  "5555555555555555555555555555555555555555" \
+  "2222222222222222222222222222222222222222" \
+  1
+write_threads_fixture nathanjohnpayne mergepath 285 0
+SHORT_SHA_OUT="$("$SCRIPT" nathanjohnpayne/mergepath#285)"
+printf '%s' "$SHORT_SHA_OUT" | grep -q "novel work" \
+  && pass "short source sha in scoped sync-all branch is not trusted as a mirror" \
+  || fail "short source sha widened scoped mirror classification"
+
 # ---------------------------------------------------------------------------
 # Case 2: Single-PR — non-sync branch → "novel work".
 # ---------------------------------------------------------------------------

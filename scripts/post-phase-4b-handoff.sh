@@ -150,7 +150,7 @@ classify_content() {
   local head_ref="$1"
   local commits_count="$2"
   local sha=""
-  if [[ "$head_ref" =~ ^mergepath-sync/sync-all-([0-9a-f]+)-[0-9a-f]{12}$ ]]; then
+  if [[ "$head_ref" =~ ^mergepath-sync/sync-all-([0-9a-f]{7,40})-[0-9a-f]{12}$ ]]; then
     sha="${BASH_REMATCH[1]}"
   elif [[ "$head_ref" =~ ^mergepath-sync/(sync-all-)?([0-9a-f]+)$ ]]; then
     sha="${BASH_REMATCH[2]}"

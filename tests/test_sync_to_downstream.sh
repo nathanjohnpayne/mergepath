@@ -1469,7 +1469,8 @@ mkdir -p "$SA_HASH_FAIL_BIN"
 SA_REAL_GIT=$(command -v git)
 cat >"$SA_HASH_FAIL_BIN/git" <<'GITSTUB'
 #!/usr/bin/env bash
-if [ "${1:-}" = "hash-object" ]; then
+if [ "${1:-}" = "hash-object" ] \
+  || { [ "${1:-}" = "-C" ] && [ "${3:-}" = "hash-object" ]; }; then
   exit 71
 fi
 exec "$MERGEPATH_TEST_REAL_GIT" "$@"
@@ -1487,6 +1488,40 @@ echo "$sa_hash_fail_out" | grep -q 'could not fingerprint requested sync-all des
   || fail "sync-all fingerprint failure lacked a precise diagnostic: $sa_hash_fail_out"
 echo "$sa_hash_fail_out" | grep -q 'would open PR on branch' \
   && fail "sync-all fingerprint failure produced a valid-looking branch: $sa_hash_fail_out"
+
+# Every templated destination lookup contributes to the requested-scope key.
+# Prove an early lookup failure cannot be hidden by a later successful lookup.
+SA_MP_YQ_FAIL="$syncall_workdir/mergepath-yq-fail"
+cp -R "$SA_MP" "$SA_MP_YQ_FAIL"
+cat >>"$SA_MP_YQ_FAIL/.mergepath-sync.yml" <<'YAML'
+  - {path: SECOND.md, type: templated, consumers: [alpha]}
+YAML
+printf 'second template\n' >"$SA_MP_YQ_FAIL/SECOND.md"
+git -C "$SA_MP_YQ_FAIL" -c user.email=t@t -c user.name=t add -A
+git -C "$SA_MP_YQ_FAIL" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "add second template"
+SA_YQ_FAIL_BIN="$syncall_workdir/yq-fail-bin"
+mkdir -p "$SA_YQ_FAIL_BIN"
+SA_REAL_YQ=$(command -v yq)
+cat >"$SA_YQ_FAIL_BIN/yq" <<'YQSTUB'
+#!/usr/bin/env bash
+if [ "${MERGEPATH_TPL_PATH:-}" = "AGENTS.md" ]; then
+  exit 73
+fi
+exec "$MERGEPATH_TEST_REAL_YQ" "$@"
+YQSTUB
+chmod +x "$SA_YQ_FAIL_BIN/yq"
+set +e
+sa_yq_fail_out=$(PATH="$SA_YQ_FAIL_BIN:$PATH" MERGEPATH_TEST_REAL_YQ="$SA_REAL_YQ" \
+  MERGEPATH_ROOT_OVERRIDE="$SA_MP_YQ_FAIL" MERGEPATH_SIBLINGS_DIR="$SA_SIBLINGS" \
+  "$SCRIPT" --sync-all --dry-run --repos alpha --paths '*.md' 2>&1)
+sa_yq_fail_rc=$?
+set -e
+[ "$sa_yq_fail_rc" -ne 0 ] \
+  || fail "sync-all hid an earlier templated destination lookup failure: $sa_yq_fail_out"
+echo "$sa_yq_fail_out" | grep -q 'could not resolve requested sync-all destination paths' \
+  || fail "templated destination lookup failure lacked a precise diagnostic: $sa_yq_fail_out"
+echo "$sa_yq_fail_out" | grep -q 'would open PR on branch' \
+  && fail "templated destination lookup failure produced a valid-looking branch: $sa_yq_fail_out"
 
 # Manifest order and duplicate entries are not semantic path-set changes. Keep
 # the key stable after normalizing the resolved paths.
