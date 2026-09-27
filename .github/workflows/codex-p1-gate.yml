@@ -822,14 +822,19 @@ jobs:
               echo "::endgroup::"
               continue
             fi
-            head_sha=$(jq -r '.head.sha' <<<"$pr_json")
-            is_fork=$(jq -r '.head.repo.fork // false' <<<"$pr_json")
-            pr_actor=$(jq -r '.user.login // ""' <<<"$pr_json")
+            if ! head_sha=$(jq -r '.head.sha' <<<"$pr_json") \
+              || ! is_fork=$(jq -r '.head.repo.fork // false' <<<"$pr_json") \
+              || ! pr_actor=$(jq -r '.user.login // ""' <<<"$pr_json") \
+              || ! pr_created_at=$(jq -r '.created_at // ""' <<<"$pr_json"); then
+              echo "::error::Could not parse PR #$PR response; cannot open a fail-closed lease"
+              had_infra_error=1
+              echo "::endgroup::"
+              continue
+            fi
             requires_relay="$is_fork"
             if [ "$pr_actor" = 'dependabot[bot]' ]; then
               requires_relay=true
             fi
-            pr_created_at=$(jq -r '.created_at // ""' <<<"$pr_json")
             if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
               echo "::error::Could not resolve head SHA for PR #$PR; cannot open a fail-closed lease"
               had_infra_error=1

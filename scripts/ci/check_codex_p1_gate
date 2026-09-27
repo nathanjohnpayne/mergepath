@@ -406,12 +406,14 @@ if sweep.is_a?(Hash)
       "scheduled-sweep does not lease, evaluate, reject drift, and close the same check generation"
     )
     pr_read = sweep_run.index('if ! pr_json=$(gh api "repos/$REPO/pulls/$PR"); then')
-    head_read = sweep_run.index(%q{head_sha=$(jq -r '.head.sha' <<<"$pr_json")})
+    head_read = sweep_run.index(%q{if ! head_sha=$(jq -r '.head.sha' <<<"$pr_json")})
     require_shape.call(
       [pr_read, head_read, lease].all? && pr_read < head_read && head_read < lease &&
         sweep_run.include?('Could not read PR #$PR; cannot open a fail-closed lease') &&
+        sweep_run.include?('Could not parse PR #$PR response; cannot open a fail-closed lease') &&
+        sweep_run.include?(%q{|| ! pr_created_at=$(jq -r '.created_at // ""' <<<"$pr_json")}) &&
         sweep_run.index("continue", pr_read + 1) < lease,
-      "scheduled-sweep can abort later PRs or mutate a check lease after an unreadable per-PR read"
+      "scheduled-sweep can abort later PRs or mutate a check lease after an unreadable or malformed per-PR read"
     )
     before_read = sweep_run.index("if ! feedback_fp_before=$(scripts/review-feedback-surface-fingerprint.sh")
     after_read = sweep_run.index("if ! feedback_fp_after=$(scripts/review-feedback-surface-fingerprint.sh")

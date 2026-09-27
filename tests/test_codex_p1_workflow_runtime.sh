@@ -268,6 +268,11 @@ if [[ "$endpoint" =~ ^repos/[^/]+/[^/]+/pulls/([0-9]+)$ ]]; then
     echo 'simulated PR read failure' >&2
     exit 1
   fi
+  if [ "${SWEEP_MODE:-stable}" = first-json-malformed ] && [ "$pr" = 1 ] \
+    && [[ " $* " != *" --jq "* ]]; then
+    echo '{'
+    exit 0
+  fi
   sha="head-$pr"
   if [ "${SWEEP_MODE:-stable}" = head-moves ] && [ "$pr" = 1 ] && [ "$count" -gt 1 ]; then
     sha="moved-$pr"
@@ -330,6 +335,20 @@ elif ! grep -Fxq 'open 2 lease-2' "$dir/mutations.log" \
   fail "failed first PR read performs no mutation and continues" "the later PR was not processed successfully"
 else
   pass "failed first PR read performs no mutation and continues"
+fi
+
+dir="$TMP/sweep-pr-parse-failure"
+make_sweep_fixture "$dir"
+rc=$(run_sweep "$dir" first-json-malformed stable)
+if [ "$rc" -eq 0 ]; then
+  fail "malformed first PR response performs no mutation and continues" "sweep did not report its infrastructure failure"
+elif grep -Eq '(^| )1( |$)|lease-1' "$dir/mutations.log"; then
+  fail "malformed first PR response performs no mutation and continues" "the unparseable PR received a check mutation"
+elif ! grep -Fxq 'open 2 lease-2' "$dir/mutations.log" \
+  || ! grep -Fxq 'close lease-2 success' "$dir/mutations.log"; then
+  fail "malformed first PR response performs no mutation and continues" "the later PR was not processed successfully"
+else
+  pass "malformed first PR response performs no mutation and continues"
 fi
 
 dir="$TMP/sweep-pre-fingerprint-failure"
