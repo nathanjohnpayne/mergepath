@@ -23,12 +23,12 @@
 # producer run has none of those obligations. See
 # docs/architecture/0003-pr-review-policy-recovery-producer.md.
 #
-# WHY A BODY EDIT AND NOT A LABEL TOGGLE. `labeled`/`unlabeled` are also in
-# the workflow's trigger list, but its `external-review-labeling` job — the
-# Phase 4 classifier — is explicitly gated OFF for those two actions. A label
-# toggle would recover the two gates and leave the classification unrecovered,
-# which is precisely the case where an absent `needs-external-review` is a
-# symptom of the missed delivery rather than a clearance.
+# WHY A BODY EDIT AND NOT A LABEL TOGGLE. Since #1254, `labeled`/`unlabeled`
+# events also run the Phase 4 classifier. The nudge still uses a body edit:
+# changing its inert provenance marker triggers the canonical producer without
+# changing label-based policy input or protected merge state. It performs no
+# label write and publishes no independent verdict. See ADR 0003 for the
+# historical label-event restriction and the retained recovery constraints.
 #
 # THIS IS NOT A "RERUN MY FAILING CHECKS" BUTTON. The refusal below is on
 # presence, not on success: once both contexts have reported on the head,
