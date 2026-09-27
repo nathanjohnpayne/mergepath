@@ -74,6 +74,32 @@ FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
+# #1254: label-only deliveries are recovery inputs for the classifier too. A
+# workflow-level `if` that excludes them can publish the two older required
+# contexts without ever deriving Phase 4 applicability. Label writes made by
+# this workflow use GITHUB_TOKEN, so allowing these deliveries does not create
+# a recursive run; PAT/human deliveries get one fresh classification.
+CLASSIFIER_IF=$(yq -r '.jobs."external-review-labeling".if // ""' "$WORKFLOW")
+if [[ "$CLASSIFIER_IF" != *"github.event.action != 'labeled'"* ]] \
+   && [[ "$CLASSIFIER_IF" != *"github.event.action != 'unlabeled'"* ]]; then
+  pass "label events are not excluded from the external-review classifier (#1254)"
+else
+  fail "external-review classifier still excludes label events: $CLASSIFIER_IF"
+fi
+
+# The classifier body itself has no label-event early exit: even the
+# needs-external-review lifecycle gets a fresh classification. Only the label
+# APPLY step suppresses re-adding a PAT-cleared label (#969).
+CLASSIFIER_BODY=$(yq -r '.jobs."external-review-labeling".steps[] | select(.id == "check") | .run' "$WORKFLOW")
+APPLY_IF=$(yq -r '.jobs."external-review-labeling".steps[] | select(.name == "Apply label and comment") | .if' "$WORKFLOW")
+if [[ "$CLASSIFIER_BODY" != *'label_lifecycle_event=true'* ]] \
+   && [[ "$APPLY_IF" == *"github.event.action == 'unlabeled'"* ]] \
+   && [[ "$APPLY_IF" == *"github.event.label.name == 'needs-external-review'"* ]]; then
+  pass "needs-external-review removals are classified without being immediately re-added (#1254/#969)"
+else
+  fail "label lifecycle classification/apply boundary is missing"
+fi
+
 run() { node "$WORK/harness.mjs" "$WORK/script.js" "$1"; }
 
 # <label> <scenario-json> <jq assertion over the harness result>

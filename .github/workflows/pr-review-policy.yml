@@ -111,7 +111,6 @@ jobs:
 
   external-review-labeling:
     name: External Review Check
-    if: github.event.action != 'labeled' && github.event.action != 'unlabeled'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -494,7 +493,14 @@ jobs:
           echo "reasons=$REASONS" >> "$GITHUB_OUTPUT"
 
       - name: Apply label and comment
-        if: steps.check.outputs.needs_review == 'true'
+        # A PAT-driven auto-clear removal intentionally triggers this workflow.
+        # Re-evaluate and publish External Review Check, but do not undo that
+        # same removal by re-adding the label (#969). Every other label event
+        # follows the ordinary classification result (#1254).
+        if: >-
+          steps.check.outputs.needs_review == 'true' &&
+          !(github.event.action == 'unlabeled' &&
+            github.event.label.name == 'needs-external-review')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
