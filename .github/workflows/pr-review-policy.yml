@@ -513,6 +513,9 @@ jobs:
               exit 0
             elif [ "$carry_rc" -ne 0 ]; then
               echo "External-review carry-forward failed (rc=$carry_rc); requiring current-head review fail-closed."
+              echo "classification=fail-closed" >> "$GITHUB_OUTPUT"
+              NEEDS_REVIEW=true
+              REASONS="- External-review carry-forward lookup failed (rc=$carry_rc); requiring review fail-closed"
             fi
           fi
 

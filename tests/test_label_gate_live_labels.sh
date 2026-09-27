@@ -264,11 +264,12 @@ write_apply_fixture() { # <dir> <live-head> [labels]
   printf '%s\n' "$labels" >"$dir/labels.txt"
 }
 
-run_apply() { # <fixture-dir>
-  local dir=$1 rc=0
+run_apply() { # <fixture-dir> [classification] [reasons]
+  local dir=$1 classification=${2:-fail-closed}
+  local reasons=${3:-- Could not read policy; requiring review fail-closed} rc=0
   env PATH="$WORK/bin:$PATH" REAL_BASH="$REAL_BASH" GH_STUB_DIR="$dir" \
-    PR_NUMBER=42 HEAD_SHA="$HEAD40" CLASSIFICATION=fail-closed \
-    REASONS='- Could not read policy; requiring review fail-closed' \
+    PR_NUMBER=42 HEAD_SHA="$HEAD40" CLASSIFICATION="$classification" \
+    REASONS="$reasons" \
     "$REAL_BASH" "$WORK/apply.sh" >"$dir/out" 2>"$dir/err" || rc=$?
   printf '%s' "$rc"
 }
@@ -361,10 +362,34 @@ C2="$WORK/classifier-carry-failed"
 rc=$(run_classifier "$C2" 0 9 '{}')
 if [ "$rc" -eq 0 ] \
    && [ "$(last_output "$C2/output" needs_review)" = true ] \
-   && [ "$(last_output "$C2/output" classification)" = external-required ]; then
-  pass "a failed carry-forward remains external-required"
+   && [ "$(last_output "$C2/output" classification)" = fail-closed ] \
+   && [[ "$(last_output "$C2/output" reasons)" == *'requiring review fail-closed'* ]]; then
+  pass "a failed carry-forward publishes a provenance-bearing fail-closed result"
 else
-  fail "failed carry-forward weakened fail-closed classification (rc=$rc output=$(cat "$C2/output" 2>/dev/null) err=$(cat "$C2/err"))"
+  fail "failed carry-forward did not publish fail-closed outputs (rc=$rc output=$(cat "$C2/output" 2>/dev/null) err=$(cat "$C2/err"))"
+fi
+
+A6="$WORK/apply-carry-failed"
+write_apply_fixture "$A6" "$HEAD40"
+rc=$(run_apply "$A6" \
+  "$(last_output "$C2/output" classification)" \
+  "$(last_output "$C2/output" reasons)")
+if [ "$rc" -eq 0 ] && [ "$(cat "$A6/label-writes" 2>/dev/null)" = added ] \
+   && grep -Fq "mergepath-external-review-label:v1 head=$HEAD40 cause=fail-closed" "$A6/comment-writes" \
+   && grep -Fq 'requiring review fail-closed' "$A6/comment-writes"; then
+  pass "a carry lookup failure applies head-bound fail-closed provenance"
+else
+  fail "carry lookup failure did not apply reconcilable provenance (rc=$rc out=$(cat "$A6/out") err=$(cat "$A6/err"))"
+fi
+
+C4="$WORK/classifier-not-carried"
+rc=$(run_classifier "$C4" 0 0 '{"carried":false}')
+if [ "$rc" -eq 0 ] \
+   && [ "$(last_output "$C4/output" needs_review)" = true ] \
+   && [ "$(last_output "$C4/output" classification)" = external-required ]; then
+  pass "a successful carried-false lookup remains ordinary external-required"
+else
+  fail "carried-false lookup changed classification (rc=$rc output=$(cat "$C4/output" 2>/dev/null) err=$(cat "$C4/err"))"
 fi
 
 C3="$WORK/classifier-fingerprint-failed"
@@ -501,6 +526,18 @@ if [ "$rc" -eq 0 ] && [ "$(cat "$R9/deletes" 2>/dev/null)" = deleted ]; then
   pass "a provenance marker matching the classified PR head can authorize removal (#1321)"
 else
   fail "matching provenance marker did not authorize safe removal (rc=$rc)"
+fi
+
+R10="$WORK/reconcile-carry-failure-marker"
+write_reconcile_fixture "$R10" 'github-actions[bot]' '2026-09-25T01:36:20Z'
+jq --rawfile body "$A6/comment-writes" '.[] .body = $body' \
+  "$R10/comments.json" >"$R10/comments.tmp"
+mv "$R10/comments.tmp" "$R10/comments.json"
+rc=$(run_reconcile "$R10")
+if [ "$rc" -eq 0 ] && [ "$(cat "$R10/deletes" 2>/dev/null)" = deleted ]; then
+  pass "carry-failure provenance authorizes later matching-head reconciliation"
+else
+  fail "carry-failure provenance did not support reconciliation (rc=$rc out=$(cat "$R10/out") err=$(cat "$R10/err"))"
 fi
 
 echo
