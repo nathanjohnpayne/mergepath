@@ -355,19 +355,42 @@ else
   fail "malformed live base did not fail closed (rc=$rc out=$(cat "$A5C/out") err=$(cat "$A5C/err"))"
 fi
 
+# The classifier materializes trusted base trees with git worktree, so give it
+# a tiny self-contained repository instead of borrowing the test caller's
+# history. This deliberately has exactly the base and head commits the event
+# needs: the suite can therefore run from a depth-1 Actions checkout too.
+CLASSIFIER_REPO="$WORK/classifier-repo"
+mkdir -p "$CLASSIFIER_REPO/.github" "$CLASSIFIER_REPO/scripts/workflow" "$CLASSIFIER_REPO/src"
+git -C "$CLASSIFIER_REPO" init --quiet -b main
+git -C "$CLASSIFIER_REPO" config user.name "NathanPayne"
+git -C "$CLASSIFIER_REPO" config user.email "github@nathanpayne.com"
+printf '%s\n' 'external_review_threshold: 100' >"$CLASSIFIER_REPO/.github/review-policy.yml"
+for helper in \
+  scripts/workflow/external_review_fingerprint.sh \
+  scripts/workflow/external_review_carryforward.sh \
+  scripts/codex-review-check.sh; do
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 99' >"$CLASSIFIER_REPO/$helper"
+  chmod +x "$CLASSIFIER_REPO/$helper"
+done
+printf '%s\n' 'base' >"$CLASSIFIER_REPO/src/example.sh"
+git -C "$CLASSIFIER_REPO" add .
+git -C "$CLASSIFIER_REPO" commit --quiet -m 'fixture base'
+EVENT_BASE=$(git -C "$CLASSIFIER_REPO" rev-parse HEAD)
+printf '%s\n' 'head' >"$CLASSIFIER_REPO/src/example.sh"
+git -C "$CLASSIFIER_REPO" add src/example.sh
+git -C "$CLASSIFIER_REPO" commit --quiet -m 'fixture head'
+EVENT_HEAD=$(git -C "$CLASSIFIER_REPO" rev-parse HEAD)
+
 yq -r '.jobs."external-review-labeling".steps[] | select(.id == "check") | .run' \
   "$WORKFLOW" \
   | sed \
-      -e "s|\${{ github.event.pull_request.base.sha }}|$(git -C "$ROOT" rev-parse HEAD^)|g" \
-      -e "s|\${{ github.event.pull_request.head.sha }}|$(git -C "$ROOT" rev-parse HEAD)|g" \
+      -e "s|\${{ github.event.pull_request.base.sha }}|$EVENT_BASE|g" \
+      -e "s|\${{ github.event.pull_request.head.sha }}|$EVENT_HEAD|g" \
       -e 's|${{ github.event.pull_request.head.ref }}|codex/test-carry-forward|g' \
       -e 's|${{ github.event.pull_request.user.login }}|fixture-author|g' \
       -e 's|${{ github.event.repository.default_branch }}|main|g' \
       -e 's|${{ github.repository }}|o/r|g' \
   >"$WORK/classifier.sh"
-
-EVENT_HEAD=$(git -C "$ROOT" rev-parse HEAD)
-EVENT_BASE=$(git -C "$ROOT" rev-parse HEAD^)
 
 run_classifier() { # <fixture-dir> <fingerprint-rc> <carry-rc> <carry-json> [clearance-rc]
   local dir=$1 fingerprint_rc=$2 carry_rc=$3 carry_json=$4 clearance_rc=${5:-1} rc=0
@@ -376,12 +399,15 @@ run_classifier() { # <fixture-dir> <fingerprint-rc> <carry-rc> <carry-json> [cle
     jq -n --arg head "$EVENT_HEAD" --arg base "$EVENT_BASE" '{head:$head,base:$base}' \
       >"$dir/live-pair"
   fi
-  env PATH="$WORK/bin:$PATH" REAL_BASH="$REAL_BASH" GH_STUB_DIR="$dir" \
-    GITHUB_OUTPUT="$dir/output" PR_NUMBER=42 EVENT_ACTION="${EVENT_ACTION_OVERRIDE:-labeled}" \
-    FINGERPRINT_RC="$fingerprint_rc" \
-    FINGERPRINT_JSON='{"requires_review":true,"fingerprint":"fp-1","reasons":["protected path"]}' \
-    CARRY_RC="$carry_rc" CARRY_JSON="$carry_json" CLEARANCE_RC="$clearance_rc" \
-    "$REAL_BASH" "$WORK/classifier.sh" >"$dir/out" 2>"$dir/err" || rc=$?
+  (
+    cd "$CLASSIFIER_REPO"
+    env PATH="$WORK/bin:$PATH" REAL_BASH="$REAL_BASH" GH_STUB_DIR="$dir" \
+      GITHUB_OUTPUT="$dir/output" PR_NUMBER=42 EVENT_ACTION="${EVENT_ACTION_OVERRIDE:-labeled}" \
+      FINGERPRINT_RC="$fingerprint_rc" \
+      FINGERPRINT_JSON='{"requires_review":true,"fingerprint":"fp-1","reasons":["protected path"]}' \
+      CARRY_RC="$carry_rc" CARRY_JSON="$carry_json" CLEARANCE_RC="$clearance_rc" \
+      "$REAL_BASH" "$WORK/classifier.sh"
+  ) >"$dir/out" 2>"$dir/err" || rc=$?
   printf '%s' "$rc"
 }
 
