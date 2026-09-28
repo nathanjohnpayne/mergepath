@@ -425,6 +425,15 @@ FAKE_TITLE_SHA="$C2" FAKE_BRANCH_SHA="$C2" FAKE_BRANCH_SUFFIX="" \
   run_wa_lane good 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null \
   && pass "legacy SHA-only sync-all branch remains parseable" \
   || fail "legacy SHA-only sync-all branch was rejected"
+C2_UPPER="$(printf '%s' "$C2" | tr '[:lower:]' '[:upper:]')"
+if FAKE_TITLE_SHA="$C2" FAKE_BRANCH_SHA="$C2_UPPER" \
+  FAKE_BRANCH_SUFFIX="-0123456789ab" \
+  run_wa_lane good 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null 2>&1; then
+  fail "uppercase source SHA widened the scoped sync-all grammar"
+else
+  [ $? -eq 3 ] && pass "uppercase source SHA in scoped sync-all branch fails closed" \
+    || fail "wrong exit for uppercase scoped source SHA"
+fi
 if FAKE_TITLE_SHA="$C2" FAKE_BRANCH_SHA="$C2" FAKE_BRANCH_SUFFIX="-bad" \
   run_wa_lane good 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null 2>&1; then
   fail "malformed sync-all scope suffix was accepted"

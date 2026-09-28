@@ -214,6 +214,17 @@ printf '%s' "$SCOPED_OUT" | grep -q "verbatim mirror of mergepath@abcdef123456" 
   && pass "scoped sync-all branch retains mirror classification" \
   || fail "scoped sync-all branch was not classified as a mirror"
 
+write_pr_fixture nathanjohnpayne mergepath 286 \
+  "mergepath-sync/sync-all-ABCDEF1234567890-0123456789ab" \
+  "6666666666666666666666666666666666666666" \
+  "2222222222222222222222222222222222222222" \
+  1
+write_threads_fixture nathanjohnpayne mergepath 286 0
+UPPER_SCOPED_OUT="$("$SCRIPT" nathanjohnpayne/mergepath#286)"
+printf '%s' "$UPPER_SCOPED_OUT" | grep -q "novel work" \
+  && pass "uppercase source SHA is rejected in the scoped sync-all form" \
+  || fail "uppercase source SHA widened the scoped sync-all grammar"
+
 write_pr_fixture nathanjohnpayne mergepath 284 \
   "mergepath-sync/sync-all-abcdef1234567890-bad" \
   "4444444444444444444444444444444444444444" \

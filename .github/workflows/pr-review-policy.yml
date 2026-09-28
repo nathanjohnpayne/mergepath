@@ -279,7 +279,11 @@ jobs:
             # PUBLIC mergepath at that sha, and run mergepath@<sha>'s
             # OWN verifier against this PR. Anything off → no lane.
             SYNC_KEY="${HEAD_REF#"$PROP_PREFIX"}"     # strip "mergepath-sync/"
-            if [[ "$SYNC_KEY" =~ ^sync-all-([0-9a-fA-F]{7,40})(-[0-9a-f]{12})?$ ]]; then
+            # Scoped keys are newly generated lowercase syntax. Preserve the
+            # pre-existing mixed-case acceptance only for legacy SHA-only keys.
+            if [[ "$SYNC_KEY" =~ ^sync-all-([0-9a-f]{7,40})-[0-9a-f]{12}$ ]]; then
+              SYNC_SHA="${BASH_REMATCH[1]}"
+            elif [[ "$SYNC_KEY" =~ ^sync-all-([0-9a-fA-F]{7,40})$ ]]; then
               SYNC_SHA="${BASH_REMATCH[1]}"
             else
               SYNC_SHA="$SYNC_KEY"
