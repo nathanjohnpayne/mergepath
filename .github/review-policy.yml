@@ -524,9 +524,10 @@ codex:
   cli_login: nathanpayne-codex
 
   # Maximum number of `@codex review` rounds before escalating as runaway.
-  # The 11th round trips the guard (10 since #1084). Normal termination is either approval,
+  # The 21st round trips the guard. Normal termination is either approval,
   # disagreement (repeat-after-rebuttal), or timeout → Phase 4b fallback.
-  # Raised 2 -> 10 (#1084). Codex is now the primary reviewer on every PR,
+  # Raised 10 -> 20 by the owner on 2026-09-28 after #1474 exhausted 10 requests.
+  # Previously raised 2 -> 10 (#1084). Codex is the primary reviewer on every PR,
   # so the budget has to cover a real convergence run rather than two
   # courtesy rounds: #1080 took four rounds, and rounds 2 and 3 each found a
   # defect the previous round's fix introduced. Exhausting the budget takes the
@@ -536,7 +537,7 @@ codex:
   # 4b is the wrong destination for THIS trigger because that leg can post an
   # APPROVED, which would let a review that never converged merge with nobody
   # adjudicating it.
-  max_review_rounds: 10
+  max_review_rounds: 20
 
   # Poll timeout per round, in seconds, for `codex-review-request.sh`.
   # If Codex has not posted a review within this window, treat as timeout
