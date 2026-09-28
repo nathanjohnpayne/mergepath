@@ -191,8 +191,8 @@ if [ "$1" = "pr" ]; then
     *"title,headRefName,headRefOid,baseRefOid"*)
       # meta fetch: title / branch / head oid as tsv. FAKE_TITLE_SHA and
       # FAKE_BRANCH_SHA drive the round-3 title-vs-branch validation tests.
-      printf 'sync: bulk reconcile to mergepath@%s\tmergepath-sync/sync-all-%s\t%s\t%s\n' \
-        "${FAKE_TITLE_SHA:?}" "${FAKE_BRANCH_SHA:?}" "$live_head" "$live_base"
+      printf 'sync: bulk reconcile to mergepath@%s\tmergepath-sync/sync-all-%s%s\t%s\t%s\n' \
+        "${FAKE_TITLE_SHA:?}" "${FAKE_BRANCH_SHA:?}" "${FAKE_BRANCH_SUFFIX:-}" "$live_head" "$live_base"
       ;;
     *)
       printf '%s\t%s\n' "$live_head" "$live_base"
@@ -223,6 +223,7 @@ run_wa_lane() { # run_wa_lane <FAKE_LANE mode> <args...> — lane check ACTIVE, 
   rm -rf "$CAPTURE"; mkdir -p "$CAPTURE"
   PATH="$FAKEBIN:$PATH" FAKE_LANE="$lane" \
   FAKE_TITLE_SHA="${FAKE_TITLE_SHA:-$C2}" FAKE_BRANCH_SHA="${FAKE_BRANCH_SHA:-$C2}" \
+  FAKE_BRANCH_SUFFIX="${FAKE_BRANCH_SUFFIX--0123456789ab}" \
   FAKE_CANARY_HEAD="${FAKE_CANARY_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
   FAKE_CANARY_BASE="${FAKE_CANARY_BASE:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" \
   FAKE_CANARY_HEAD_AFTER="${FAKE_CANARY_HEAD_AFTER:-${FAKE_CANARY_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}" \
@@ -420,6 +421,25 @@ FAKE_TITLE_SHA="$C2" FAKE_BRANCH_SHA="$C2" run_wa_lane good 64 --repo owner/cons
   || fail "branch-derived head resolution failed"
 grep -q "scripts/b.sh" "$CAPTURE/diff" \
   && pass "audit range keyed off the branch sha" || fail "branch-derived range wrong"
+FAKE_TITLE_SHA="$C2" FAKE_BRANCH_SHA="$C2" FAKE_BRANCH_SUFFIX="" \
+  run_wa_lane good 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null \
+  && pass "legacy SHA-only sync-all branch remains parseable" \
+  || fail "legacy SHA-only sync-all branch was rejected"
+C2_UPPER="$(printf '%s' "$C2" | tr '[:lower:]' '[:upper:]')"
+if FAKE_TITLE_SHA="$C2" FAKE_BRANCH_SHA="$C2_UPPER" \
+  FAKE_BRANCH_SUFFIX="-0123456789ab" \
+  run_wa_lane good 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null 2>&1; then
+  fail "uppercase source SHA widened the scoped sync-all grammar"
+else
+  [ $? -eq 3 ] && pass "uppercase source SHA in scoped sync-all branch fails closed" \
+    || fail "wrong exit for uppercase scoped source SHA"
+fi
+if FAKE_TITLE_SHA="$C2" FAKE_BRANCH_SHA="$C2" FAKE_BRANCH_SUFFIX="-bad" \
+  run_wa_lane good 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null 2>&1; then
+  fail "malformed sync-all scope suffix was accepted"
+else
+  [ $? -eq 3 ] && pass "malformed sync-all scope suffix fails closed" || fail "wrong exit for malformed scope suffix"
+fi
 if FAKE_TITLE_SHA="$C3" FAKE_BRANCH_SHA="$C2" run_wa_lane good 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null 2>&1; then
   fail "title/branch sha mismatch was accepted"
 else
