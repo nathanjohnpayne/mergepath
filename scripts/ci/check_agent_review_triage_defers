@@ -5,8 +5,8 @@
 # `pr-review-policy.yml`'s External Review Check both decide
 # `needs-external-review`, but only the latter BYTE-VERIFIES a
 # `mergepath-sync/` PR against mergepath@<sha> and exempts a faithful
-# mirror (removing the label + posting the head-pinned
-# `mergepath-propagation-lane verified-head=<sha>` marker as
+# mirror (removing the label + posting the head/base-pinned
+# `mergepath-propagation-lane:v2 verified-head=<sha> verified-base=<sha>` marker as
 # github-actions[bot]). Pre-#656, triage never consulted that verdict and
 # re-added the label on any later event, stranding approved, byte-verified
 # sync PRs on Label Gate (tadlockpsychiatry#93: lane-cleared 14:55, triage
@@ -15,7 +15,7 @@
 # The fix keeps triage FAIL-CLOSED (every unverified sync head is still
 # labeled — fresh push, diverged hand-edit, reopened-with-new-head) and
 # skips the add ONLY when a github-actions[bot] comment pins the marker to
-# the current head — mirroring scripts/merge-clearance-gate.sh
+# the current head/base pair — mirroring scripts/merge-clearance-gate.sh
 # lane_verified()'s matching semantics and trust model (#620). The naive
 # alternative (skip by branch name) was rejected as fail-OPEN: Codex P1 on
 # the closed first-attempt PR showed a diverged sync PR could ride an
@@ -45,7 +45,7 @@ cd "$ROOT"
 WORKFLOW=".github/workflows/agent-review.yml"
 LANE_WORKFLOW=".github/workflows/pr-review-policy.yml"
 MERGE_GATE="scripts/merge-clearance-gate.sh"
-MARKER_LITERAL="mergepath-propagation-lane verified-head="
+MARKER_LITERAL="mergepath-propagation-lane:v2 verified-head="
 
 for f in "$WORKFLOW" "$LANE_WORKFLOW" "$MERGE_GATE"; do
   if [ ! -f "$f" ]; then
@@ -57,8 +57,8 @@ done
 fail() {
   echo "check_agent_review_triage_defers: $1" >&2
   echo "  The triage job must skip its needs-external-review add ONLY for" >&2
-  echo "  a head the propagation lane has byte-verified (github-actions[bot]" >&2
-  echo "  marker pinned to the current head), and stay fail-closed for" >&2
+  echo "  a pair the propagation lane has byte-verified (github-actions[bot]" >&2
+  echo "  marker pinned to the current head/base), and stay fail-closed for" >&2
   echo "  every other sync head (see #656). Dropping the marker gate" >&2
   echo "  reintroduces the tadlockpsychiatry#93 flap; widening the skip" >&2
   echo "  beyond the marker reintroduces the fail-open Codex P1 that" >&2
@@ -93,12 +93,18 @@ for f in "$WORKFLOW" "$LANE_WORKFLOW" "$MERGE_GATE"; do
     || fail "$f no longer carries the shared marker literal '$MARKER_LITERAL' (three-file lockstep broken)"
 done
 
-# 3. The skip is HEAD-PINNED: triage must interpolate the event head SHA
-#    into the marker it looks for, not accept any stale marker.
+# 3. The skip is PAIR-PINNED: triage must interpolate the event head and base
+#    SHAs into the marker it looks for, not accept a stale or legacy marker.
 # shellcheck disable=SC2016  # grepping for the LITERAL JS template
 # `${pr.head.sha}` — single quotes are intentional (no shell expansion).
 grep -qF 'verified-head=${pr.head.sha}' "$WORKFLOW" \
   || fail "$WORKFLOW no longer pins the marker lookup to pr.head.sha (a stale-head marker must not skip labeling)"
+grep -qF 'verified-base=${pr.base.sha}' "$WORKFLOW" \
+  || fail "$WORKFLOW no longer pins the marker lookup to pr.base.sha (a same-head retarget must not skip labeling)"
+grep -qF '<!-- mergepath-propagation-lane:v2' "$WORKFLOW" \
+  || fail "$WORKFLOW no longer requires the non-overlapping v2 marker (legacy head-only markers must fail closed)"
+grep -qF "typeof value === 'string' && /^[0-9a-f]{40}$/i.test(value)" "$WORKFLOW" \
+  || fail "$WORKFLOW no longer validates both live marker inputs as full SHAs before matching"
 
 # 4. The skip is TRUST-SCOPED: only github-actions[bot]-authored comments
 #    count, mirroring lane_verified(). A PR author posting the marker text
