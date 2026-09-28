@@ -4553,7 +4553,10 @@ rm -rf "$WORK/barrier-state/phase-4b-barrier"
 out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_superseded" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
 [ "$rc" = 3 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = human-tiebreaker ] || bad="$bad expired-uppercase-timeout-bypass"
 out="$(crqe_select_trigger() { return 9; }; P4B_TEST_COMMENTS_JSON="$_current" _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
-[ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = error ] || bad="$bad timeout-selector-error-not-fail-closed"
+[ "$rc" = 4 ] \
+  && [ "$(printf '%s' "$out" | jq -r .decision)" = error ] \
+  && [ "$(printf '%s' "$out" | jq -r .request_budget.reason)" = latest-request-selector-failed ] \
+  || bad="$bad timeout-selector-error-not-fail-closed"
 
 out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/does-not-exist" P4B_TEST_COMMENTS_JSON='[]' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
 [ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = error ] || bad="$bad unreadable-not-fail-closed"

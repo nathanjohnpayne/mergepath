@@ -2058,7 +2058,8 @@ p4b_same_head_barrier() {
   # appended after the budget's comments snapshot without changing the PR
   # head/base tuple. Pending outcomes carry no fallback authority and can
   # observe the new generation on their next bounded retry.
-  if [ "$cx_budget_state" = available ] \
+  if [ "$budget_unsafe" != true ] \
+     && [ "$cx_budget_state" = available ] \
      && { [ -n "$why" ] || [ "$pending" != true ]; }; then
     cx_generation_expected="$(printf '%s' "$cx_budget_json" | jq -c '.request_generation // empty' 2>/dev/null || true)"
     cx_generation_author="$(p4b_top_field author_identity)"
