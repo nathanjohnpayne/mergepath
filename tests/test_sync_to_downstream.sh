@@ -780,7 +780,12 @@ case "${1:-} ${2:-}" in
     printf '%s\n' "nathanjohnpayne"
     ;;
   "api "*)
-    # Existing-PR probe: no prior propagation PR.
+    # Existing-PR probe. Tests may name one exact branch as a completed PR;
+    # every other branch remains unused.
+    if [ -n "${MERGEPATH_TEST_EXISTING_BRANCH:-}" ] \
+       && [ "${2:-}" = "repos/example/alpha/pulls?state=all&head=example:${MERGEPATH_TEST_EXISTING_BRANCH}" ]; then
+      printf 'closed\t413\n'
+    fi
     exit 0
     ;;
   "repo clone")
@@ -876,6 +881,53 @@ metadata_run_and_assert \
   "cursor" \
   "Co-Authored-By: Cursor <noreply@cursor.com>" \
   MERGEPATH_AGENT=cursor \
+
+# #1150: a legacy SHA-only sync-all branch may have delivered a partial scope.
+# It must not suppress the new full-scope key at the same source SHA. Once the
+# scope-aware branch itself is completed, the exact repeat remains idempotent.
+scope_remote="$metadata_workdir/scope.git"
+scope_seed="$metadata_workdir/scope-seed"
+setup_metadata_remote "$scope_remote" "$scope_seed"
+legacy_scope_branch="mergepath-sync/sync-all-${meta_sha:0:7}"
+set +e
+scope_first_out=$(env \
+  PATH="$META_FAKE_BIN:$PATH" \
+  MERGEPATH_ROOT_OVERRIDE="$META_MP" \
+  MERGEPATH_TEST_REMOTE_ALPHA="$scope_remote" \
+  MERGEPATH_TEST_CAPTURE_DIR="$META_CAPTURE" \
+  MERGEPATH_TEST_RUN="scope-first" \
+  MERGEPATH_TEST_EXISTING_BRANCH="$legacy_scope_branch" \
+  MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
+  "$SCRIPT" --sync-all --repos alpha 2>&1)
+scope_first_rc=$?
+set -e
+[ "$scope_first_rc" -eq 0 ] \
+  || fail "full sync-all after legacy partial branch failed: $scope_first_out"
+echo "$scope_first_out" | grep -q 'opened https://github.com/example/alpha/pull/scope-first' \
+  || fail "legacy SHA-only completed PR suppressed a new scope-aware full sync: $scope_first_out"
+scope_branch=$(git --git-dir="$scope_remote" for-each-ref --format='%(refname:short)' \
+  'refs/heads/mergepath-sync/sync-all-*' | head -1)
+[[ "$scope_branch" =~ ^mergepath-sync/sync-all-${meta_sha:0:7}-[0-9a-f]{12}$ ]] \
+  || fail "full sync-all did not push a scope-aware branch: $scope_branch"
+
+set +e
+scope_repeat_out=$(env \
+  PATH="$META_FAKE_BIN:$PATH" \
+  MERGEPATH_ROOT_OVERRIDE="$META_MP" \
+  MERGEPATH_TEST_REMOTE_ALPHA="$metadata_workdir/unused-repeat.git" \
+  MERGEPATH_TEST_CAPTURE_DIR="$META_CAPTURE" \
+  MERGEPATH_TEST_RUN="scope-repeat" \
+  MERGEPATH_TEST_EXISTING_BRANCH="$scope_branch" \
+  MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
+  "$SCRIPT" --sync-all --repos alpha 2>&1)
+scope_repeat_rc=$?
+set -e
+[ "$scope_repeat_rc" -eq 0 ] \
+  || fail "exact completed scope repeat failed: $scope_repeat_out"
+echo "$scope_repeat_out" | grep -q "already done (sync-all PR #413 closed/merged on branch $scope_branch; requested scope:" \
+  || fail "exact completed scope did not remain idempotent or omitted its scope diagnostic: $scope_repeat_out"
+[ ! -f "$META_CAPTURE/pr-body-scope-repeat.md" ] \
+  || fail "exact completed scope repeat opened a duplicate PR"
 
 set +e
 metadata_unknown_out=$(env \
@@ -1381,13 +1433,119 @@ echo "$sa_repos_out" | grep -q "^beta (" \
 echo "$sa_repos_out" | grep -qE "^(alpha|gamma|delta) \(" \
   && fail "--sync-all --repos beta leaked a non-filtered consumer; got: $sa_repos_out"
 
-# 6) Branch-name scheme for --sync-all is distinct from per-commit: it
-#    carries the `sync-all-` infix. Per-commit branches are
-#    `mergepath-sync/<sha>`; sync-all is `mergepath-sync/sync-all-<sha>`.
-echo "$sa_out" | grep -q "mergepath-sync/sync-all-${sa_short}" \
+# 6) Branch-name scheme for --sync-all is distinct from per-commit and every
+#    scope, including the full manifest, carries a resolved path-set digest.
+echo "$sa_out" | grep -qE "mergepath-sync/sync-all-${sa_short}-[0-9a-f]{12}" \
   || fail "--sync-all branch name missing the 'sync-all-' prefix scheme; got: $sa_out"
 echo "$sa_out" | grep -qE "branch mergepath-sync/${sa_short} " \
   && fail "--sync-all used the bare per-commit branch scheme (mergepath-sync/<sha>); must use sync-all- infix"
+
+# 6b) A filtered delivery keys idempotency on the concrete resolved path set,
+#     not only on HEAD and not on the raw spelling of --paths. Two scopes at
+#     the same SHA must differ; an exact selector and a glob resolving to the
+#     same one path must agree.
+sa_hook_exact_out=$(MERGEPATH_ROOT_OVERRIDE="$SA_MP" MERGEPATH_SIBLINGS_DIR="$SA_SIBLINGS" \
+  "$SCRIPT" --sync-all --dry-run --repos alpha --paths 'scripts/hooks/the-hook.sh' 2>&1)
+sa_hook_glob_out=$(MERGEPATH_ROOT_OVERRIDE="$SA_MP" MERGEPATH_SIBLINGS_DIR="$SA_SIBLINGS" \
+  "$SCRIPT" --sync-all --dry-run --repos alpha --paths 'scripts/hooks/*' 2>&1)
+sa_wait_out=$(MERGEPATH_ROOT_OVERRIDE="$SA_MP" MERGEPATH_SIBLINGS_DIR="$SA_SIBLINGS" \
+  "$SCRIPT" --sync-all --dry-run --repos alpha --paths 'scripts/coderabbit-wait.sh' 2>&1)
+sa_hook_exact_branch=$(sed -n 's/.*would open PR on branch \([^ ]*\).*/\1/p' <<<"$sa_hook_exact_out")
+sa_hook_glob_branch=$(sed -n 's/.*would open PR on branch \([^ ]*\).*/\1/p' <<<"$sa_hook_glob_out")
+sa_wait_branch=$(sed -n 's/.*would open PR on branch \([^ ]*\).*/\1/p' <<<"$sa_wait_out")
+[[ "$sa_hook_exact_branch" =~ ^mergepath-sync/sync-all-${sa_short}-[0-9a-f]{12}$ ]] \
+  || fail "filtered --sync-all branch should name its delivered-scope digest; got: $sa_hook_exact_branch"
+[ "$sa_hook_exact_branch" = "$sa_hook_glob_branch" ] \
+  || fail "selectors resolving to the same delivered path set produced different keys: exact=$sa_hook_exact_branch glob=$sa_hook_glob_branch"
+[ "$sa_hook_exact_branch" != "$sa_wait_branch" ] \
+  || fail "different delivered path sets at the same SHA reused one key: $sa_hook_exact_branch"
+echo "$sa_hook_exact_out" | grep -q "requested scope: ${sa_hook_exact_branch##*-} (1 requested path, before consumer overrides)" \
+  || fail "filtered --sync-all diagnostic does not name its requested scope: $sa_hook_exact_out"
+
+# Fingerprint failures are infrastructure errors, never an empty path set that
+# becomes a valid-looking branch. Delegate every other git operation.
+SA_HASH_FAIL_BIN="$syncall_workdir/hash-fail-bin"
+mkdir -p "$SA_HASH_FAIL_BIN"
+SA_REAL_GIT=$(command -v git)
+cat >"$SA_HASH_FAIL_BIN/git" <<'GITSTUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = "hash-object" ] \
+  || { [ "${1:-}" = "-C" ] && [ "${3:-}" = "hash-object" ]; }; then
+  exit 71
+fi
+exec "$MERGEPATH_TEST_REAL_GIT" "$@"
+GITSTUB
+chmod +x "$SA_HASH_FAIL_BIN/git"
+set +e
+sa_hash_fail_out=$(PATH="$SA_HASH_FAIL_BIN:$PATH" MERGEPATH_TEST_REAL_GIT="$SA_REAL_GIT" \
+  MERGEPATH_ROOT_OVERRIDE="$SA_MP" MERGEPATH_SIBLINGS_DIR="$SA_SIBLINGS" \
+  "$SCRIPT" --sync-all --dry-run --repos alpha --paths 'scripts/hooks/the-hook.sh' 2>&1)
+sa_hash_fail_rc=$?
+set -e
+[ "$sa_hash_fail_rc" -ne 0 ] \
+  || fail "sync-all accepted a failed path-set fingerprint: $sa_hash_fail_out"
+echo "$sa_hash_fail_out" | grep -q 'could not fingerprint requested sync-all destination paths' \
+  || fail "sync-all fingerprint failure lacked a precise diagnostic: $sa_hash_fail_out"
+echo "$sa_hash_fail_out" | grep -q 'would open PR on branch' \
+  && fail "sync-all fingerprint failure produced a valid-looking branch: $sa_hash_fail_out"
+
+# Every templated destination lookup contributes to the requested-scope key.
+# Prove an early lookup failure cannot be hidden by a later successful lookup.
+SA_MP_YQ_FAIL="$syncall_workdir/mergepath-yq-fail"
+cp -R "$SA_MP" "$SA_MP_YQ_FAIL"
+cat >>"$SA_MP_YQ_FAIL/.mergepath-sync.yml" <<'YAML'
+  - {path: SECOND.md, type: templated, consumers: [alpha]}
+YAML
+printf 'second template\n' >"$SA_MP_YQ_FAIL/SECOND.md"
+git -C "$SA_MP_YQ_FAIL" -c user.email=t@t -c user.name=t add -A
+git -C "$SA_MP_YQ_FAIL" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "add second template"
+SA_YQ_FAIL_BIN="$syncall_workdir/yq-fail-bin"
+mkdir -p "$SA_YQ_FAIL_BIN"
+SA_REAL_YQ=$(command -v yq)
+cat >"$SA_YQ_FAIL_BIN/yq" <<'YQSTUB'
+#!/usr/bin/env bash
+if [ "${MERGEPATH_TPL_PATH:-}" = "AGENTS.md" ]; then
+  exit 73
+fi
+exec "$MERGEPATH_TEST_REAL_YQ" "$@"
+YQSTUB
+chmod +x "$SA_YQ_FAIL_BIN/yq"
+set +e
+sa_yq_fail_out=$(PATH="$SA_YQ_FAIL_BIN:$PATH" MERGEPATH_TEST_REAL_YQ="$SA_REAL_YQ" \
+  MERGEPATH_ROOT_OVERRIDE="$SA_MP_YQ_FAIL" MERGEPATH_SIBLINGS_DIR="$SA_SIBLINGS" \
+  "$SCRIPT" --sync-all --dry-run --repos alpha --paths '*.md' 2>&1)
+sa_yq_fail_rc=$?
+set -e
+[ "$sa_yq_fail_rc" -ne 0 ] \
+  || fail "sync-all hid an earlier templated destination lookup failure: $sa_yq_fail_out"
+echo "$sa_yq_fail_out" | grep -q 'could not resolve requested sync-all destination paths' \
+  || fail "templated destination lookup failure lacked a precise diagnostic: $sa_yq_fail_out"
+echo "$sa_yq_fail_out" | grep -q 'would open PR on branch' \
+  && fail "templated destination lookup failure produced a valid-looking branch: $sa_yq_fail_out"
+
+# Manifest order and duplicate entries are not semantic path-set changes. Keep
+# the key stable after normalizing the resolved paths.
+SA_MP_REORDERED="$syncall_workdir/mergepath-reordered"
+cp -R "$SA_MP" "$SA_MP_REORDERED"
+python3 - "$SA_MP_REORDERED/.mergepath-sync.yml" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+needle = "  - {path: scripts/hooks/the-hook.sh,  type: canonical, consumers: all}\n"
+text = text.replace(needle, "")
+text = text.replace(
+    "paths:\n",
+    "paths:\n" + needle + needle,
+)
+path.write_text(text)
+PY
+sa_hook_reordered_out=$(MERGEPATH_ROOT_OVERRIDE="$SA_MP_REORDERED" MERGEPATH_SIBLINGS_DIR="$SA_SIBLINGS" \
+  "$SCRIPT" --sync-all --dry-run --repos alpha --paths 'scripts/hooks/the-hook.sh' 2>&1)
+sa_hook_reordered_branch=$(sed -n 's/.*would open PR on branch \([^ ]*\).*/\1/p' <<<"$sa_hook_reordered_out")
+[ "$sa_hook_exact_branch" = "$sa_hook_reordered_branch" ] \
+  || fail "resolved path-set key changed with manifest order/duplication: base=$sa_hook_exact_branch reordered=$sa_hook_reordered_branch"
 
 # ---------------------------------------------------------------------------
 # --version / --help smoke

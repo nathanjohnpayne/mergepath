@@ -599,9 +599,9 @@ done <<< "$WIRED"
 # a kit check is a hard failure (it would slip past the single-line matcher),
 # and the parsed name set must equal the awk-derived $WIRED set used above.
 #
-# Paired hub-side assertion: because the tail exits 0 on an ABSENT script, it
-# would also mask a script deleted from the hub while its wire stayed. Every
-# wired name must therefore resolve to a file in the hub's scripts/ci/.
+# The marker distinguishes the two absent-script cases: consumers without the
+# kit soft-pass, while a hub checkout with its sync orchestrator still present
+# fails. The latter makes deleting a wired wrapper a visible CI failure.
 # ---------------------------------------------------------------------------
 GUARD_DIR="$WORKDIR/guard"
 mkdir -p "$GUARD_DIR"
@@ -709,6 +709,20 @@ while IFS=$'\t' read -r kind name cmd; do
     fail "#979 guard: $name — the run: body exits nonzero when scripts/ci/ is EMPTY; a consumer that skips the kit (gaycruisebingo) reds its repo-lint on rc 127. Add the #590 soft-pass tail: || { rc=\$?; if [ ! -f scripts/ci/$name ]; then echo '...'; exit 0; fi; exit \"\$rc\"; }"
   fi
 
+  # A missing wrapper is only soft-passable on a consumer. On the hub, the
+  # sync orchestrator is present, so the same missing file must preserve the
+  # command's failure instead of silently disabling this check.
+  guard_tree "$GUARD_DIR/hubmissing" "$name" ""
+  touch "$GUARD_DIR/hubmissing/scripts/sync-to-downstream.sh"
+  set +e
+  guard_run "$GUARD_DIR/hubmissing" "$cmd"
+  hrc=$?
+  set -e
+  if [ "$hrc" -eq 0 ]; then
+    ok=0
+    fail "#1256 guard: $name — the run: body soft-passes a missing wrapper with scripts/sync-to-downstream.sh present; hub wrapper deletion must fail lint"
+  fi
+
   guard_tree "$GUARD_DIR/stubpass" "$name" 0
   if ! guard_run "$GUARD_DIR/stubpass" "$cmd"; then
     ok=0
@@ -735,7 +749,7 @@ while IFS=$'\t' read -r kind name cmd; do
 done <"$GUARD_DIR/steps.tsv"
 
 if [ "$GUARDED" -gt 0 ]; then
-  pass "#979 guard: $GUARDED wired steps soft-pass a missing script, pass a passing one, and propagate a real failure"
+  pass "#979/#1256 guard: $GUARDED wired steps soft-pass a consumer-missing script, fail a hub-missing wrapper, pass a passing one, and propagate a real failure"
 fi
 
 # ---------------------------------------------------------------------------
