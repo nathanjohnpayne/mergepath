@@ -408,6 +408,30 @@ if [ "${1:-}" = "api" ]; then
       # skip is declared per-fixture, never implied by a flag.
       for a in "$@"; do
         case "$a" in
+          *'.head.sha'*'.base.sha'*)
+            # Optional expected-base fence: one API response supplies both
+            # refs, so the test can model a same-head base retarget without
+            # conflating it with the legacy scalar head reads below.
+            if [ -n "${P4B_FAKE_LIVE_PAIR_FAIL:-}" ]; then
+              printf '{"message":"Not Found","status":"404"}\n'
+              exit 1
+            fi
+            if [ -n "${P4B_FAKE_LIVE_PAIR_MALFORMED:-}" ]; then
+              printf '%s\n' "${P4B_FAKE_LIVE_PAIR_MALFORMED}"
+              exit 0
+            fi
+            pair_count_file="${P4B_FAKE_LIVE_PAIR_COUNT:-${TMPDIR:-/tmp}/p4b-fake-pair-count}"
+            pair_count=$(( $( [ -f "$pair_count_file" ] && cat "$pair_count_file" || echo 0 ) + 1 ))
+            printf '%s\n' "$pair_count" > "$pair_count_file"
+            pair_head="${P4B_FAKE_LIVE_HEAD:-abc123}"
+            pair_base="${P4B_FAKE_LIVE_BASE:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}"
+            if [ -n "${P4B_FAKE_LIVE_BASE2:-}" ] \
+               && [ "$pair_count" -ge "${P4B_FAKE_LIVE_BASE2_FROM:-2}" ]; then
+              pair_base="$P4B_FAKE_LIVE_BASE2"
+            fi
+            printf '%s %s\n' "$pair_head" "$pair_base"
+            exit 0
+            ;;
           *'.body'*)
             # Body-read counter (#1143). The orchestrator reads the body up
             # front and again at each identity fence, so a case can serve a
@@ -2879,6 +2903,106 @@ else fail "#672 opt-out (rc=$rc): $out"; fi
 
 # Stale-head guard: a non-dry-run APPROVED must re-read the live head and
 # fall back before the wrapper writes if the reviewed SHA is no longer live.
+echo "orchestrator — optional expected-base fence (#1475)"
+P4B_EXPECTED_BASE="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+P4B_MOVED_BASE="cccccccccccccccccccccccccccccccccccccccc"
+
+# A matching captured base preserves the ordinary approval path.
+WRAPPER_LOG="$WORK/base-fence-success-wrapper.log"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" \
+  P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_BASE="$P4B_EXPECTED_BASE" \
+  P4B_FAKE_LIVE_PAIR_COUNT="$WORK/base-fence-success.count" \
+  bash "$ORCH" 14751 --repo o/r --author claude --head abc123 --expected-base-sha "$P4B_EXPECTED_BASE" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ -s "$WRAPPER_LOG" ] && [ "$(cat "$WORK/base-fence-success.count")" -ge 2 ]; then
+  pass "expected base fence allows a coherent matching head/base pair"
+else fail "expected base matching pair (rc=$rc, out=$out)"; fi
+
+# The base can move while the adapter reasons without moving HEAD. The fence
+# must refuse before filing any post-review observation or approval.
+BASE_MOVE_EARLY_ISSUES="$WORK/base-fence-early-issues.log"
+BASE_MOVE_EARLY_WRAPPER="$WORK/base-fence-early-wrapper.log"
+: > "$BASE_MOVE_EARLY_ISSUES"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$BASE_MOVE_EARLY_ISSUES" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" \
+  P4B_WRAPPER_LOG="$BASE_MOVE_EARLY_WRAPPER" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_BASE="$P4B_EXPECTED_BASE" \
+  P4B_FAKE_LIVE_BASE2="$P4B_MOVED_BASE" P4B_FAKE_LIVE_BASE2_FROM=2 P4B_FAKE_LIVE_PAIR_COUNT="$WORK/base-fence-early.count" \
+  bash "$ORCH" 14752 --repo o/r --author claude --head abc123 --expected-base-sha "$P4B_EXPECTED_BASE" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] \
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "PR base changed during review" \
+   && [ ! -s "$BASE_MOVE_EARLY_ISSUES" ] && [ ! -e "$BASE_MOVE_EARLY_WRAPPER" ]; then
+  pass "same-head base move during adapter work refuses before post-review filing"
+else fail "early expected-base drift (rc=$rc, out=$out)"; fi
+
+# A base move after filing but before the authority POST closes this run's
+# just-created follow-up, matching the existing late-head-drift cleanup.
+BASE_MOVE_LATE_ISSUES="$WORK/base-fence-late-issues.log"
+BASE_MOVE_LATE_WRAPPER="$WORK/base-fence-late-wrapper.log"
+: > "$BASE_MOVE_LATE_ISSUES"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$BASE_MOVE_LATE_ISSUES" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" \
+  P4B_WRAPPER_LOG="$BASE_MOVE_LATE_WRAPPER" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_BASE="$P4B_EXPECTED_BASE" \
+  P4B_FAKE_LIVE_BASE2="$P4B_MOVED_BASE" P4B_FAKE_LIVE_BASE2_FROM=3 P4B_FAKE_LIVE_PAIR_COUNT="$WORK/base-fence-late.count" \
+  bash "$ORCH" 14753 --repo o/r --author claude --head abc123 --expected-base-sha "$P4B_EXPECTED_BASE" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] \
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "PR base changed during review" \
+   && grep -q '^ARGV ' "$BASE_MOVE_LATE_ISSUES" && grep -q '^CLOSE #901$' "$BASE_MOVE_LATE_ISSUES" \
+   && [ ! -e "$BASE_MOVE_LATE_WRAPPER" ]; then
+  pass "pre-POST base fence closes raced post-review follow-ups before refusing"
+else fail "late expected-base drift cleanup (rc=$rc, out=$out)"; fi
+
+for base_case in unreadable malformed; do
+  case "$base_case" in
+    unreadable) base_env=(P4B_FAKE_LIVE_PAIR_FAIL=1) ;;
+    malformed)  base_env=(P4B_FAKE_LIVE_PAIR_MALFORMED='not-a-base-pair') ;;
+  esac
+  set +e
+  out="$(env PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
+    "${base_env[@]}" P4B_FAKE_LIVE_HEAD=abc123 \
+    bash "$ORCH" 14754 --repo o/r --author claude --head abc123 --expected-base-sha "$P4B_EXPECTED_BASE" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  set -e
+  if [ "$rc" = 3 ] && [ -z "$out" ]; then
+    pass "expected base fence fails closed when the live pair is $base_case"
+  else fail "expected base $base_case pair (rc=$rc, out=$out)"; fi
+done
+
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+  bash "$ORCH" 14756 --repo o/r --head abc123 --expected-base-sha '' --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 3 ] && [ -z "$out" ]; then
+  pass "explicit empty expected-base argument fails validation instead of disabling the fence"
+else fail "empty expected-base validation (rc=$rc, out=$out)"; fi
+
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+  bash "$ORCH" 14757 --repo o/r --head abc123 --expected-base-sha 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 3 ] && [ -z "$out" ]; then
+  pass "missing expected-base argument fails validation instead of a shell shift error"
+else fail "missing expected-base validation (rc=$rc, out=$out)"; fi
+
+# Existing callers pass no base, so even an unreadable pair fixture must not
+# add a new network dependency or change their approval behavior.
+WRAPPER_LOG="$WORK/base-fence-absent-wrapper.log"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" \
+  P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_PAIR_FAIL=1 \
+  bash "$ORCH" 14755 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ -s "$WRAPPER_LOG" ]; then
+  pass "absent expected-base flag preserves the head-only approval path"
+else fail "absent expected-base compatibility (rc=$rc, out=$out)"; fi
+
 WRAPPER_LOG="$WORK/wrapper.log"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \

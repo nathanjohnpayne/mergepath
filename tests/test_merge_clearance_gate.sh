@@ -280,19 +280,20 @@ make_comments_fixture() {  # <json_array_literal>  issue comments
   echo "$file"
 }
 
-make_pr_fixture() {  # <sha> <author> <labels_json_array> [base_ref] [default_branch]
+make_pr_fixture() {  # <sha> <author> <labels_json_array> [base_ref] [default_branch] [base_sha]
   local sha=$1 author=$2 labels=${3:-'[]'}
   # Default to base_ref == default_branch: the ordinary case, in which the
   # #763 base-policy fetch is deliberately skipped entirely.
-  local base_ref=${4:-main} default_branch=${5:-main}
+  local base_ref=${4:-main} default_branch=${5:-main} base_sha=${6:-$BASE_SHA}
   local file="$WORKDIR/pr.$$.$RANDOM.json"
   jq -n --arg sha "$sha" --arg author "$author" --argjson labels "$labels" \
-        --arg base_ref "$base_ref" --arg default_branch "$default_branch" '
+        --arg base_ref "$base_ref" --arg default_branch "$default_branch" \
+        --arg base_sha "$base_sha" '
     { number: 99,
       head: { sha: $sha },
       user: { login: $author },
       labels: $labels,
-      base: { sha: "base000aaa", ref: $base_ref,
+      base: { sha: $base_sha, ref: $base_ref,
               repo: { default_branch: $default_branch } } }
   ' >"$file"
   echo "$file"
@@ -368,8 +369,10 @@ export FIXTURE_RULESET_OBJ
 FIXTURE_ADMIN_ENFORCE=true
 export FIXTURE_ADMIN_ENFORCE
 
-HEAD_SHA="head000aaa"
-OLD_SHA="old111bbb"
+HEAD_SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+OLD_SHA="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+BASE_SHA="cccccccccccccccccccccccccccccccccccccccc"
+OLD_BASE_SHA="dddddddddddddddddddddddddddddddddddddddd"
 DEPENDABOT='dependabot[bot]'
 EXT_LABEL='[{"name":"needs-external-review"}]'
 
@@ -686,7 +689,7 @@ for hold_label in human-hold needs-human-review policy-violation; do
       dependabot) hold_author="$DEPENDABOT"; SCRATCH=$(make_scratch false false) ;;
       propagation)
         FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":400,"deletions":50}]')
-        FIXTURE_COMMENTS=$(make_comments_fixture "[{\"user\":{\"login\":\"github-actions[bot]\"},\"body\":\"<!-- mergepath-propagation-lane verified-head=$HEAD_SHA -->\"}]") ;;
+        FIXTURE_COMMENTS=$(make_comments_fixture "[{\"user\":{\"login\":\"github-actions[bot]\"},\"body\":\"<!-- mergepath-propagation-lane:v2 verified-head=$HEAD_SHA verified-base=$BASE_SHA -->\"}]") ;;
     esac
     FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$hold_author" "[{\"name\":\"$hold_label\"}]")
     set +e
@@ -1030,12 +1033,12 @@ fi
 # needs-external-review label, with a github-actions[bot] lane marker scoped
 # to the CURRENT head → EXEMPT (not applicable), must NOT delegate.
 # ---------------------------------------------------------------------------
-echo; echo "--- Test 17: verified propagation lane (head-pinned) → exempt"
+echo; echo "--- Test 17: verified propagation lane (head/base-pinned) → exempt"
 SCRATCH=$(make_scratch false true)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]')
 FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":400,"deletions":50}]')
-FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg h "$HEAD_SHA" '
-  [{user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane verified-head=" + $h + " -->\nverified faithful mirror ✅")}]')")
+FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg h "$HEAD_SHA" --arg b "$BASE_SHA" '
+  [{user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane:v2 verified-head=" + $h + " verified-base=" + $b + " -->\nverified faithful mirror ✅")}]')")
 set +e
 OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
       MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
@@ -1044,7 +1047,7 @@ OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="
 RC=$?
 set -e
 if [ "$RC" = 0 ] && echo "$OUT" | grep -qi "not applicable"; then
-  pass "verified propagation lane (current-head marker) → exempt (exit 0, no delegate)"
+  pass "verified propagation lane (current-pair marker) → exempt (exit 0, no delegate)"
 else
   fail "expected rc=0 not-applicable (exempt); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
 fi
@@ -1060,8 +1063,8 @@ echo; echo "--- Test 17b: STALE bot marker (old head) + diverged head → NOT ex
 SCRATCH=$(make_scratch false true)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]')
 FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":400,"deletions":50}]')
-FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg old "$OLD_SHA" '
-  [{user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane verified-head=" + $old + " -->\nverified faithful mirror ✅")}]')")
+FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg old "$OLD_SHA" --arg b "$BASE_SHA" '
+  [{user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane:v2 verified-head=" + $old + " verified-base=" + $b + " -->\nverified faithful mirror ✅")}]')")
 set +e
 OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
       MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
@@ -1075,6 +1078,58 @@ else
   fail "expected rc=1 BLOCKED (stale marker ignored); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
 fi
 
+# Same head with a marker bound to the former base must not exempt a retarget.
+echo; echo "--- Test 17c: same-head marker for old base after retarget → NOT exempt"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]')
+FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":400,"deletions":50}]')
+FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg h "$HEAD_SHA" --arg old "$OLD_BASE_SHA" '
+  [{user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane:v2 verified-head=" + $h + " verified-base=" + $old + " -->")}]')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "BLOCKED"; then
+  pass "same-head marker for old base → NOT exempt → delegate blocks"
+else
+  fail "wrong-base marker unexpectedly exempted the retarget; got rc=$RC: $OUT"
+fi
+
+# Legacy head-only markers cannot prove a base and grant no v2 exemption.
+echo; echo "--- Test 17d: legacy head-only marker → NOT exempt"
+FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg h "$HEAD_SHA" '
+  [{user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane verified-head=" + $h + " -->")}]')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "BLOCKED"; then
+  pass "legacy head-only marker → NOT exempt → delegate blocks"
+else
+  fail "legacy marker unexpectedly granted the v2 exemption; got rc=$RC: $OUT"
+fi
+
+# A bot-authored marker with extra material inside the machine envelope is not
+# the exact v2 pair marker.
+echo; echo "--- Test 17e: malformed v2 marker → NOT exempt"
+FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg h "$HEAD_SHA" --arg b "$BASE_SHA" '
+  [{user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane:v2 verified-head=" + $h + " verified-base=" + $b + " malformed -->")}]')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "BLOCKED"; then
+  pass "malformed v2 marker → NOT exempt → delegate blocks"
+else
+  fail "malformed marker unexpectedly granted the v2 exemption; got rc=$RC: $OUT"
+fi
+
 # ---------------------------------------------------------------------------
 # Test 18: SPOOFED lane marker — current-head marker but authored by a NON-bot
 # login → must NOT exempt (a PR author can't forge github-actions[bot]).
@@ -1084,8 +1139,8 @@ echo; echo "--- Test 18: spoofed (non-bot) lane marker → NOT exempt"
 SCRATCH=$(make_scratch false true)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]')
 FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/big.ts","additions":250,"deletions":120}]')
-FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg h "$HEAD_SHA" '
-  [{user:{login:"nathanjohnpayne"}, body:("<!-- mergepath-propagation-lane verified-head=" + $h + " --> nice try")}]')")
+FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg h "$HEAD_SHA" --arg b "$BASE_SHA" '
+  [{user:{login:"nathanjohnpayne"}, body:("<!-- mergepath-propagation-lane:v2 verified-head=" + $h + " verified-base=" + $b + " --> nice try")}]')")
 set +e
 OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
       MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
@@ -2038,8 +2093,8 @@ echo; echo "--- Query 5: verified lane marker for HEAD, label absent → false"
 SCRATCH=$(make_scratch false true)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
 FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":500,"deletions":0}]')
-FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" '
-  [{ user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane verified-head=" + $sha + " -->") }]
+FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" --arg base "$BASE_SHA" '
+  [{ user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane:v2 verified-head=" + $sha + " verified-base=" + $base + " -->") }]
 ')")
 set +e
 OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
@@ -2069,6 +2124,31 @@ if [ "$RC" != 0 ] && [ "$OUT" != "true" ]; then
 else
   fail "query: indeterminate marker read expected nonzero and not 'true'; got rc=$RC out='$OUT'"
 fi
+
+echo; echo "--- Query 5c: malformed live marker pair → nonzero, NOT 'true'"
+for malformed_part in head base; do
+  malformed_head=$HEAD_SHA
+  malformed_base=$BASE_SHA
+  case "$malformed_part" in
+    head) malformed_head=not-a-sha ;;
+    base) malformed_base=not-a-sha ;;
+  esac
+  SCRATCH=$(make_scratch false true)
+  FIXTURE_PR=$(make_pr_fixture "$malformed_head" "someone" '[]' main main "$malformed_base")
+  FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":500,"deletions":0}]')
+  FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg h "$malformed_head" --arg b "$malformed_base" '
+    [{user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane:v2 verified-head=" + $h + " verified-base=" + $b + " -->")}]')")
+  set +e
+  OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+    run_gate "$SCRATCH" --derive-external-requiredness 99 owner/repo 2>/dev/null)
+  RC=$?
+  set -e
+  if [ "$RC" != 0 ] && [ "$OUT" != "true" ]; then
+    pass "query: malformed live $malformed_part cannot grant propagation authority"
+  else
+    fail "query: malformed live $malformed_part expected nonzero/no true; got rc=$RC out='$OUT'"
+  fi
+done
 
 echo; echo "--- Query 6: external gate disabled → false"
 SCRATCH=$(make_scratch false false)
@@ -2140,12 +2220,12 @@ else
   fail "Phase 4 query: disabled-gate over-threshold expected true/0; got rc=$RC out='$OUT'"
 fi
 
-echo; echo "--- Phase 4 Query 2: exact-head verified propagation lane → false"
+echo; echo "--- Phase 4 Query 2: exact-pair verified propagation lane → false"
 SCRATCH=$(make_scratch false false)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
 FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":500,"deletions":0}]')
-FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" '
-  [{ user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane verified-head=" + $sha + " -->") }]
+FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" --arg base "$BASE_SHA" '
+  [{ user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane:v2 verified-head=" + $sha + " verified-base=" + $base + " -->") }]
 ')")
 set +e
 OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
@@ -2153,17 +2233,17 @@ OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="
 RC=$?
 set -e
 if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
-  pass "Phase 4 query: exact-head verified propagation keeps under-threshold-equivalent standing"
+  pass "Phase 4 query: exact-pair verified propagation keeps under-threshold-equivalent standing"
 else
   fail "Phase 4 query: verified propagation expected false/0; got rc=$RC out='$OUT'"
 fi
 
-echo; echo "--- Phase 4 Query 2b: force-on label outranks exact-head propagation lane"
+echo; echo "--- Phase 4 Query 2b: force-on label outranks exact-pair propagation lane"
 SCRATCH=$(make_scratch false false)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone" "$EXT_LABEL")
 FIXTURE_FILES=$(make_files_fixture '[{"filename":"small.txt","additions":1,"deletions":0}]')
-FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" '
-  [{ user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane verified-head=" + $sha + " -->") }]
+FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" --arg base "$BASE_SHA" '
+  [{ user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane:v2 verified-head=" + $sha + " verified-base=" + $base + " -->") }]
 ')")
 set +e
 OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
@@ -2199,7 +2279,7 @@ FIXTURE_COMMENTS=$(make_comments_fixture '[]')
 set +e
 OUT=$(MERGE_CLEARANCE_EXPECTED_HEAD_SHA="$HEAD_SHA" \
   MERGE_CLEARANCE_EXPECTED_BASE_REF=main \
-  MERGE_CLEARANCE_EXPECTED_BASE_SHA=base000aaa \
+  MERGE_CLEARANCE_EXPECTED_BASE_SHA="$BASE_SHA" \
   MERGE_CLEARANCE_MATERIALIZE_DEFAULT_POLICY=true \
   FIXTURE_BASE_POLICY="$SCRATCH/.github/review-policy.yml" \
   FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
@@ -2215,7 +2295,7 @@ fi
 for pin_case in head base-ref base-sha; do
   expected_head=$HEAD_SHA
   expected_base_ref=main
-  expected_base_sha=base000aaa
+  expected_base_sha="$BASE_SHA"
   case "$pin_case" in
     head) expected_head=unexpected-head ;;
     base-ref) expected_base_ref=release ;;
@@ -2414,8 +2494,8 @@ echo; echo "--- Protection 1f (#772): propagation-lane-exempt head short-circuit
 SCRATCH=$(make_scratch false true)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
 FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":500,"deletions":0}]')
-FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" '
-  [{ user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane verified-head=" + $sha + " -->") }]
+FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" --arg base "$BASE_SHA" '
+  [{ user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane:v2 verified-head=" + $sha + " verified-base=" + $base + " -->") }]
 ')")
 # Enforced-gate fixture on purpose: if the lane exemption did NOT short-circuit,
 # arm 1 would find the context and wrongly print true.

@@ -166,45 +166,73 @@ run_wa_repo() { # run_wa_repo <repo-dir> <policy> <capture-reset> <args...>
     bash "$WA" "$@"
 }
 
-# fake gh for the lane-precondition tests: serves the canary PR head and the
-# issue-comments feed (with or without the head-pinned lane marker per
-# FAKE_LANE).
+# fake gh for the lane-precondition tests: serves the canary PR's live pair
+# and the issue-comments feed. FAKE_LANE selects a valid v2 marker or a
+# rejected legacy/malformed/wrong-pair/non-bot form.
 FAKEBIN="$WORK/fakebin"
 mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/gh" <<'GH'
 #!/usr/bin/env bash
 if [ "$1" = "pr" ]; then
+  count=0
+  [ ! -f "${FAKE_GH_STATE:?}" ] || count="$(cat "$FAKE_GH_STATE")"
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$FAKE_GH_STATE"
+  if [ "${FAKE_PAIR_READ_FAIL_AT:-0}" -eq "$count" ]; then
+    exit 1
+  fi
+  live_head="${FAKE_CANARY_HEAD:?}"
+  live_base="${FAKE_CANARY_BASE:?}"
+  if [ "$count" -ge "${FAKE_PAIR_DRIFT_AT:-999}" ]; then
+    live_head="${FAKE_CANARY_HEAD_AFTER:-$live_head}"
+    live_base="${FAKE_CANARY_BASE_AFTER:-$live_base}"
+  fi
   case "$*" in
-    *"title,headRefName,headRefOid"*)
+    *"title,headRefName,headRefOid,baseRefOid"*)
       # meta fetch: title / branch / head oid as tsv. FAKE_TITLE_SHA and
       # FAKE_BRANCH_SHA drive the round-3 title-vs-branch validation tests.
-      printf 'sync: bulk reconcile to mergepath@%s\tmergepath-sync/sync-all-%s%s\tcanaryhead1230000000000000000000000000000\n' \
-        "${FAKE_TITLE_SHA:?}" "${FAKE_BRANCH_SHA:?}" "${FAKE_BRANCH_SUFFIX:-}"
+      printf 'sync: bulk reconcile to mergepath@%s\tmergepath-sync/sync-all-%s%s\t%s\t%s\n' \
+        "${FAKE_TITLE_SHA:?}" "${FAKE_BRANCH_SHA:?}" "${FAKE_BRANCH_SUFFIX:-}" "$live_head" "$live_base"
       ;;
     *)
-      printf 'canaryhead1230000000000000000000000000000\n'
+      printf '%s\t%s\n' "$live_head" "$live_base"
       ;;
   esac
   exit 0
 fi
 if [ "$1" = "api" ]; then
-  if [ "${FAKE_LANE:-1}" = "1" ]; then
-    printf '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-propagation-lane verified-head=canaryhead1230000000000000000000000000000 -->"}]\n'
-  else
-    printf '[]\n'
-  fi
+  case "${FAKE_LANE:-good}" in
+    good) printf '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-propagation-lane:v2 verified-head=%s verified-base=%s -->"}]\n' "${FAKE_CANARY_HEAD:?}" "${FAKE_CANARY_BASE:?}" ;;
+    prose) printf '[{"user":{"login":"github-actions[bot]"},"body":"lane complete: <!-- mergepath-propagation-lane:v2 verified-head=%s verified-base=%s -->; dispatch authorized"}]\n' "${FAKE_CANARY_HEAD:?}" "${FAKE_CANARY_BASE:?}" ;;
+    wrong-head) printf '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-propagation-lane:v2 verified-head=dddddddddddddddddddddddddddddddddddddddd verified-base=%s -->"}]\n' "${FAKE_CANARY_BASE:?}" ;;
+    wrong-base) printf '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-propagation-lane:v2 verified-head=%s verified-base=cccccccccccccccccccccccccccccccccccccccc -->"}]\n' "${FAKE_CANARY_HEAD:?}" ;;
+    v1) printf '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-propagation-lane verified-head=%s -->"}]\n' "${FAKE_CANARY_HEAD:?}" ;;
+    malformed) printf '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-propagation-lane:v2 verified-head=%s verified-base=bad -->"}]\n' "${FAKE_CANARY_HEAD:?}" ;;
+    nonbot) printf '[{"user":{"login":"contributor"},"body":"<!-- mergepath-propagation-lane:v2 verified-head=%s verified-base=%s -->"}]\n' "${FAKE_CANARY_HEAD:?}" "${FAKE_CANARY_BASE:?}" ;;
+    unreadable) exit 1 ;;
+    *) printf '[]\n' ;;
+  esac
   exit 0
 fi
 exit 1
 GH
 chmod +x "$FAKEBIN/gh"
 
-run_wa_lane() { # run_wa_lane <FAKE_LANE 0|1> <args...> — lane check ACTIVE, fake gh
+run_wa_lane() { # run_wa_lane <FAKE_LANE mode> <args...> — lane check ACTIVE, fake gh
   local lane="$1"; shift
   rm -rf "$CAPTURE"; mkdir -p "$CAPTURE"
   PATH="$FAKEBIN:$PATH" FAKE_LANE="$lane" \
   FAKE_TITLE_SHA="${FAKE_TITLE_SHA:-$C2}" FAKE_BRANCH_SHA="${FAKE_BRANCH_SHA:-$C2}" \
   FAKE_BRANCH_SUFFIX="${FAKE_BRANCH_SUFFIX--0123456789ab}" \
+  FAKE_CANARY_HEAD="${FAKE_CANARY_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
+  FAKE_CANARY_BASE="${FAKE_CANARY_BASE:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" \
+  FAKE_CANARY_HEAD_AFTER="${FAKE_CANARY_HEAD_AFTER:-${FAKE_CANARY_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}" \
+  FAKE_CANARY_BASE_AFTER="${FAKE_CANARY_BASE_AFTER:-${FAKE_CANARY_BASE:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}}" \
+  FAKE_PAIR_DRIFT_AT="${FAKE_PAIR_DRIFT_AT:-999}" \
+  FAKE_PAIR_READ_FAIL_AT="${FAKE_PAIR_READ_FAIL_AT:-0}" \
+  FAKE_GH_STATE="$CAPTURE/gh-state" \
+  REAL_GIT="${REAL_GIT:-$(command -v git)}" \
+  AGE_METADATA_CASE="${AGE_METADATA_CASE:-invalid}" \
   WAVE_AUDIT_REPO_DIR="$CANON" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
   WAVE_AUDIT_LANE_VERIFIED_OK=0 \
@@ -323,37 +351,87 @@ remote_has_tag "$C5" && pass "rerun pushed the local-only watermark to origin" \
 # ===========================================================================
 echo "wave-audit.sh — canary lane precondition (#663 P1)"
 # ===========================================================================
-run_wa_lane 1 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null \
+run_wa_lane good 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null \
   && pass "lane-verified canary dispatches" || fail "lane-verified canary refused"
 [ -e "$CAPTURE/args" ] && pass "orchestrator dispatched under a verified lane" || fail "no dispatch under verified lane"
-grep -q "canaryhead1230000000000000000000000000000" "$CAPTURE/args" \
+grep -q "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$CAPTURE/args" \
   && pass "review pinned to the lane-verified head (--head passed through)" \
   || fail "lane-verified head not pinned on dispatch (round-3 P1)"
-if run_wa_lane 0 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null 2>&1; then
+grep -Fxq -- "--expected-base-sha" "$CAPTURE/args" \
+  && grep -Fxq "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$CAPTURE/args" \
+  && pass "review publication pinned to the lane-verified base" \
+  || fail "lane-verified base not passed to the review publisher"
+run_wa_lane prose 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null \
+  && pass "complete v2 marker in bot prose dispatches" || fail "complete v2 marker in bot prose refused"
+if run_wa_lane none 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null 2>&1; then
   fail "un-lane-verified canary was dispatched"
 else
   [ $? -eq 3 ] && pass "un-lane-verified canary fails closed (exit 3)" || fail "wrong exit for unverified lane"
 fi
 [ ! -e "$CAPTURE/args" ] && pass "orchestrator NOT dispatched without the lane marker" || fail "dispatched despite missing lane marker"
 
+for rejected_lane in wrong-head wrong-base v1 malformed nonbot unreadable; do
+  if run_wa_lane "$rejected_lane" 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null 2>&1; then
+    fail "$rejected_lane lane marker was accepted"
+  else
+    [ $? -eq 3 ] && pass "$rejected_lane lane marker fails closed (exit 3)" || fail "wrong exit for $rejected_lane lane marker"
+  fi
+  [ ! -e "$CAPTURE/args" ] && pass "orchestrator NOT dispatched for $rejected_lane lane marker" || fail "dispatched despite $rejected_lane lane marker"
+done
+
+if FAKE_CANARY_BASE=not-an-oid run_wa_lane good 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null 2>&1; then
+  fail "malformed live head/base pair was accepted"
+else
+  [ $? -eq 3 ] && pass "malformed live head/base pair fails closed (exit 3)" || fail "wrong exit for malformed live pair"
+fi
+[ ! -e "$CAPTURE/args" ] && pass "orchestrator NOT dispatched for malformed live pair" || fail "dispatched despite malformed live pair"
+
+rc=0
+FAKE_PAIR_DRIFT_AT=2 \
+FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+run_wa_lane good 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run \
+  > "$WORK/predispatch-drift.json" 2> "$WORK/predispatch-drift.err" || rc=$?
+[ "$rc" -eq 3 ] && grep -q 'before dispatching external review' "$WORK/predispatch-drift.err" \
+  && [ ! -e "$CAPTURE/args" ] \
+  && pass "same-head base movement before dispatch fails closed" \
+  || fail "same-head base movement reached external review"
+
+rc=0
+FAKE_PAIR_READ_FAIL_AT=2 run_wa_lane good 61 --repo owner/consumer --base "$C1" \
+  --head-sha "$C2" --dry-run > "$WORK/predispatch-unreadable.json" \
+  2> "$WORK/predispatch-unreadable.err" || rc=$?
+[ "$rc" -eq 3 ] && grep -q 'could not re-read.*before dispatching external review' "$WORK/predispatch-unreadable.err" \
+  && [ ! -e "$CAPTURE/args" ] \
+  && pass "unreadable pre-dispatch pair fails closed" \
+  || fail "unreadable pre-dispatch pair reached external review"
+
+rc=0
+FAKE_PAIR_DRIFT_AT=2 FAKE_CANARY_BASE_AFTER=not-an-oid \
+run_wa_lane good 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run \
+  > "$WORK/predispatch-malformed.json" 2> "$WORK/predispatch-malformed.err" || rc=$?
+[ "$rc" -eq 3 ] && grep -q 'invalid PR head/base reading.*before dispatching external review' "$WORK/predispatch-malformed.err" \
+  && [ ! -e "$CAPTURE/args" ] \
+  && pass "malformed pre-dispatch pair fails closed" \
+  || fail "malformed pre-dispatch pair reached external review"
+
 # Round-3 P1: the head is resolved from the lane-verified BRANCH sha, and a
 # parseable title must agree with it.
-FAKE_TITLE_SHA="$C2" FAKE_BRANCH_SHA="$C2" run_wa_lane 1 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null \
+FAKE_TITLE_SHA="$C2" FAKE_BRANCH_SHA="$C2" run_wa_lane good 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null \
   && pass "branch-derived head with agreeing title dispatches" \
   || fail "branch-derived head resolution failed"
 grep -q "scripts/b.sh" "$CAPTURE/diff" \
   && pass "audit range keyed off the branch sha" || fail "branch-derived range wrong"
 FAKE_TITLE_SHA="$C2" FAKE_BRANCH_SHA="$C2" FAKE_BRANCH_SUFFIX="" \
-  run_wa_lane 1 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null \
+  run_wa_lane good 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null \
   && pass "legacy SHA-only sync-all branch remains parseable" \
   || fail "legacy SHA-only sync-all branch was rejected"
 if FAKE_TITLE_SHA="$C2" FAKE_BRANCH_SHA="$C2" FAKE_BRANCH_SUFFIX="-bad" \
-  run_wa_lane 1 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null 2>&1; then
+  run_wa_lane good 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null 2>&1; then
   fail "malformed sync-all scope suffix was accepted"
 else
   [ $? -eq 3 ] && pass "malformed sync-all scope suffix fails closed" || fail "wrong exit for malformed scope suffix"
 fi
-if FAKE_TITLE_SHA="$C3" FAKE_BRANCH_SHA="$C2" run_wa_lane 1 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null 2>&1; then
+if FAKE_TITLE_SHA="$C3" FAKE_BRANCH_SHA="$C2" run_wa_lane good 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null 2>&1; then
   fail "title/branch sha mismatch was accepted"
 else
   [ $? -eq 3 ] && pass "title/branch sha mismatch fails closed (exit 3)" || fail "wrong exit for title/branch mismatch"
@@ -362,12 +440,70 @@ fi
 
 # Round-4 P2: an operational --head-sha must still match the lane-verified
 # branch sha.
-if FAKE_BRANCH_SHA="$C2" run_wa_lane 1 64 --repo owner/consumer --base "$C1" --head-sha "$C3" --dry-run >/dev/null 2>&1; then
+if FAKE_BRANCH_SHA="$C2" run_wa_lane good 64 --repo owner/consumer --base "$C1" --head-sha "$C3" --dry-run >/dev/null 2>&1; then
   fail "mismatched --head-sha was accepted on an operational run"
 else
   [ $? -eq 3 ] && pass "operational --head-sha mismatch fails closed (exit 3)" || fail "wrong exit for --head-sha mismatch"
 fi
 [ ! -e "$CAPTURE/args" ] && pass "orchestrator NOT dispatched on --head-sha mismatch" || fail "dispatched despite --head-sha mismatch"
+
+# A same-head base move must also stop the paths that advance authority after
+# no review or after a completed review. These real workflow runs exercise
+# both the empty-scope watermark and the post-review watermark boundary.
+printf 'excluded race fixture\n' >> "$CANON/tests/t.sh"
+git -C "$CANON" add tests/t.sh && git -C "$CANON" commit -qm race-empty
+RACE_EMPTY_HEAD="$(git -C "$CANON" rev-parse HEAD)"
+printf 'reviewed race fixture\n' > "$CANON/scripts/race.sh"
+git -C "$CANON" add scripts/race.sh && git -C "$CANON" commit -qm race-reviewed
+RACE_REVIEW_HEAD="$(git -C "$CANON" rev-parse HEAD)"
+
+rc=0
+FAKE_TITLE_SHA="$RACE_EMPTY_HEAD" FAKE_BRANCH_SHA="$RACE_EMPTY_HEAD" \
+FAKE_PAIR_DRIFT_AT=2 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+run_wa_lane good 69 --repo owner/consumer --base "$C6" --head-sha "$RACE_EMPTY_HEAD" \
+  > "$WORK/empty-pair-drift.json" 2> "$WORK/empty-pair-drift.err" || rc=$?
+[ "$rc" -eq 3 ] && [ ! -e "$CAPTURE/args" ] \
+  && [ -z "$(git -C "$CANON" tag -l "wave-audit-pass/$RACE_EMPTY_HEAD")" ] \
+  && ! remote_has_tag "$RACE_EMPTY_HEAD" \
+  && grep -q 'before writing wave watermark' "$WORK/empty-pair-drift.err" \
+  && pass "empty-scope pair movement cannot advance the watermark" \
+  || fail "empty-scope pair movement wrote authority"
+
+rc=0
+FAKE_TITLE_SHA="$RACE_REVIEW_HEAD" FAKE_BRANCH_SHA="$RACE_REVIEW_HEAD" \
+FAKE_PAIR_DRIFT_AT=3 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+run_wa_lane good 69 --repo owner/consumer --base "$RACE_EMPTY_HEAD" --head-sha "$RACE_REVIEW_HEAD" \
+  > "$WORK/post-review-pair-drift.json" 2> "$WORK/post-review-pair-drift.err" || rc=$?
+[ "$rc" -eq 3 ] && [ -e "$CAPTURE/args" ] \
+  && [ -z "$(git -C "$CANON" tag -l "wave-audit-pass/$RACE_REVIEW_HEAD")" ] \
+  && ! remote_has_tag "$RACE_REVIEW_HEAD" \
+  && grep -q 'before writing wave watermark' "$WORK/post-review-pair-drift.err" \
+  && pass "post-review pair movement cannot write a watermark" \
+  || fail "post-review pair movement retained stale authority"
+
+rc=0
+FAKE_TITLE_SHA="$RACE_REVIEW_HEAD" FAKE_BRANCH_SHA="$RACE_REVIEW_HEAD" \
+FAKE_PAIR_DRIFT_AT=4 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+run_wa_lane good 69 --repo owner/consumer --base "$RACE_EMPTY_HEAD" --head-sha "$RACE_REVIEW_HEAD" \
+  > "$WORK/prepublish-pair-drift.json" 2> "$WORK/prepublish-pair-drift.err" || rc=$?
+[ "$rc" -eq 3 ] && [ -e "$CAPTURE/args" ] \
+  && [ -n "$(git -C "$CANON" tag -l "wave-audit-pass/$RACE_REVIEW_HEAD")" ] \
+  && ! remote_has_tag "$RACE_REVIEW_HEAD" \
+  && grep -q 'before publishing wave watermark' "$WORK/prepublish-pair-drift.err" \
+  && pass "pre-push pair movement retains local watermark without publishing it" \
+  || fail "pre-push pair movement published a stale watermark"
+
+rc=0
+FAKE_TITLE_SHA="$RACE_REVIEW_HEAD" FAKE_BRANCH_SHA="$RACE_REVIEW_HEAD" \
+FAKE_PAIR_DRIFT_AT=3 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+run_wa_lane good 69 --repo owner/consumer --base "$RACE_EMPTY_HEAD" --head-sha "$RACE_REVIEW_HEAD" \
+  > "$WORK/local-watermark-pair-drift.json" 2> "$WORK/local-watermark-pair-drift.err" || rc=$?
+[ "$rc" -eq 3 ] && [ -n "$(git -C "$CANON" tag -l "wave-audit-pass/$RACE_REVIEW_HEAD")" ] \
+  && ! remote_has_tag "$RACE_REVIEW_HEAD" \
+  && grep -q 'before publishing wave watermark' "$WORK/local-watermark-pair-drift.err" \
+  && pass "already-local watermark cannot publish after pair movement" \
+  || fail "already-local watermark bypassed the publication fence"
+git -C "$CANON" tag -d "wave-audit-pass/$RACE_REVIEW_HEAD" >/dev/null
 
 # ===========================================================================
 echo "wave-audit.sh — exit-3 fail-closed + newly-manifested paths"
@@ -512,6 +648,38 @@ remote_has_prefix() {
   git ls-remote --tags "$REMOTE" "refs/tags/wave-audit-prefix/$1/$2" | grep -q .
 }
 
+# A clean historical provider result is not receipt authority after the
+# originally verified pair moves. Dispatch sees the original pair; the
+# write-boundary read observes the same head on a different base.
+rc=0
+FAKE_TITLE_SHA="$LARGE_HEAD" FAKE_BRANCH_SHA="$LARGE_HEAD" \
+FAKE_ORCH_JSON=clean FAKE_ORCH_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+FAKE_PAIR_DRIFT_AT=3 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+run_wa_lane good 82 --repo owner/consumer --base "$C1" --head-sha "$LARGE_HEAD" \
+  --historical-end "$C2" > "$WORK/historical-pair-drift.json" \
+  2> "$WORK/historical-pair-drift.err" || rc=$?
+[ "$rc" -eq 3 ] && [ -e "$CAPTURE/args" ] \
+  && [ -z "$(git -C "$CANON" tag -l "wave-audit-prefix/$LARGE_HEAD/$C2")" ] \
+  && ! remote_has_prefix "$LARGE_HEAD" "$C2" \
+  && grep -q 'before writing historical prefix receipt' "$WORK/historical-pair-drift.err" \
+  && pass "post-review pair movement cannot write a historical receipt" \
+  || fail "post-review pair movement retained a stale historical receipt"
+
+rc=0
+FAKE_TITLE_SHA="$LARGE_HEAD" FAKE_BRANCH_SHA="$LARGE_HEAD" \
+FAKE_ORCH_JSON=clean FAKE_ORCH_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+FAKE_PAIR_DRIFT_AT=4 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+run_wa_lane good 82 --repo owner/consumer --base "$C1" --head-sha "$LARGE_HEAD" \
+  --historical-end "$C2" > "$WORK/historical-prepublish-drift.json" \
+  2> "$WORK/historical-prepublish-drift.err" || rc=$?
+[ "$rc" -eq 3 ] && [ -e "$CAPTURE/args" ] \
+  && [ -n "$(git -C "$CANON" tag -l "wave-audit-prefix/$LARGE_HEAD/$C2")" ] \
+  && ! remote_has_prefix "$LARGE_HEAD" "$C2" \
+  && grep -q 'before publishing historical prefix receipt' "$WORK/historical-prepublish-drift.err" \
+  && pass "pre-push pair movement retains local historical receipt without publication" \
+  || fail "pre-push pair movement published a stale historical receipt"
+git -C "$CANON" tag -d "wave-audit-prefix/$LARGE_HEAD/$C2" >/dev/null
+
 # Findings, including advisories attached to APPROVED, preserve the complete
 # verdict but write no receipt and grant no clearance.
 rc=0
@@ -572,6 +740,18 @@ FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 82 --repo owner/consumer \
   && pass "failed prefix push leaves the exact validated receipt locally" \
   || fail "failed prefix push did not preserve recoverable local state"
 cat "$CAPTURE/diff" >> "$HIST_CHUNKS"
+rc=0
+FAKE_TITLE_SHA="$LARGE_HEAD" FAKE_BRANCH_SHA="$LARGE_HEAD" \
+FAKE_PAIR_DRIFT_AT=2 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+run_wa_lane good 82 --repo owner/consumer --base "$C1" --head-sha "$LARGE_HEAD" \
+  --historical-end "$C2" > "$WORK/push-retry-drift.json" \
+  2> "$WORK/push-retry-drift.err" || rc=$?
+[ "$rc" -eq 3 ] && [ ! -e "$CAPTURE/args" ] \
+  && [ -n "$(git -C "$CANON" tag -l "wave-audit-prefix/$LARGE_HEAD/$C2")" ] \
+  && ! remote_has_prefix "$LARGE_HEAD" "$C2" \
+  && grep -q 'before publishing retained prefix receipt' "$WORK/push-retry-drift.err" \
+  && pass "pair movement blocks retained-receipt publication without deleting local evidence" \
+  || fail "retained receipt published across pair movement"
 rc=0
 FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 82 --repo owner/consumer \
   --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C2" --dry-run \
@@ -761,6 +941,17 @@ for endpoint in "$C2" "$C3" "$C5" "$C6" "$LARGE_HEAD"; do
 done
 remote_has_tag "$LARGE_HEAD" && fail "partial chain advanced full watermark before finalization" \
   || pass "complete prefix chain alone grants no full-wave clearance"
+rc=0
+FAKE_TITLE_SHA="$LARGE_HEAD" FAKE_BRANCH_SHA="$LARGE_HEAD" \
+FAKE_PAIR_DRIFT_AT=3 FAKE_CANARY_BASE_AFTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+run_wa_lane good 84 --repo owner/consumer --base "$C1" --head-sha "$LARGE_HEAD" \
+  --finalize-historical > "$WORK/finalize-pair-drift.json" \
+  2> "$WORK/finalize-pair-drift.err" || rc=$?
+[ "$rc" -eq 3 ] && [ -e "$CAPTURE/args" ] && ! remote_has_tag "$LARGE_HEAD" \
+  && [ -z "$(git -C "$CANON" tag -l "wave-audit-pass/$LARGE_HEAD")" ] \
+  && grep -q 'before writing wave watermark' "$WORK/finalize-pair-drift.err" \
+  && pass "post-finalization pair movement cannot advance full watermark" \
+  || fail "post-finalization pair movement advanced stale authority"
 for final_rc in 4 5; do
   rc=0
   FAKE_ORCH_EXIT="$final_rc" run_wa "$POLICY_GOOD" reset 84 --repo owner/consumer --base "$C1" \

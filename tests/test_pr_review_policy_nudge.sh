@@ -693,6 +693,8 @@ check_wrapper_condition "github.event_name == 'workflow_dispatch'" 1 \
 check_wrapper_condition false 1 "the live wrapper rejects an always-false expression"
 check_wrapper_condition "github.event.action == 'edited'" 0 \
   "the live wrapper preserves an explicitly supported edited condition"
+check_wrapper_condition "always()" 0 \
+  "the live wrapper accepts a dependent job that always reports its result"
 
 # The nudge's `gh api` scan is a structural non-publication fence. Shell allows
 # arbitrary horizontal whitespace between command words, so preserve the one
