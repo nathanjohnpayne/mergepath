@@ -1222,6 +1222,8 @@ paths:
   - path: tests/test_codex_request_evidence.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/lib/codex-request-evidence.sh"
   # HEAD-anchored Codex issue-comment verdict clearance (#600/#567).
   # check_codex_scripts (scripts/ci kit) hard-runs it, so it must travel to
   # every consumer or the check fails pre-flight with `No such file`.
