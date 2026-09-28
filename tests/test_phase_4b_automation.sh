@@ -5333,6 +5333,9 @@ _issue_line="$(grep -n '^[[:space:]]*_pri_out="$(p4b_file_post_review_issues ' "
 _first_loop_line="$(grep -n '^[[:space:]]*if p4b_acct_hook_record_loop ' "$ORCH" | head -1 | cut -d: -f1)"
 _budget_fallback_line="$(grep -n '^  revalidate_codex_request_budget_generation pre-post$' "$ORCH" | head -1 | cut -d: -f1)"
 _feedback_fallback_line="$(grep -n '^  require_feedback_accounted$' "$ORCH" | head -1 | cut -d: -f1)"
+_fallback_accounting_line="$(grep -n '^[[:space:]]*p4b_acct_hook_note_fallback ' "$ORCH" | head -1 | cut -d: -f1)"
+_budget_fallback_final_line="$(grep -n '^  revalidate_codex_request_budget_generation pre-post$' "$ORCH" | sed -n '2p' | cut -d: -f1)"
+_handoff_writer_line="$(grep -n '^  if \[ -x "\$HANDOFF" \]; then$' "$ORCH" | cut -d: -f1)"
 _budget_pre_post_line="$(grep -n '^  revalidate_codex_request_budget_generation pre-post$' "$ORCH" | tail -1 | cut -d: -f1)"
 _pre_post_line="$(grep -n '^  revalidate_phase4a_timeout_generation pre-post$' "$ORCH" | cut -d: -f1)"
 _live_head_line="$(grep -n '^  live_head="$(gh_api_scalar --shape sha "live PR head for ' "$ORCH" | tail -1 | cut -d: -f1)"
@@ -5347,6 +5350,9 @@ if [ "$n_eval" = "1" ] && [ "$n_call" = "2" ] && [ "$_n_timeout_recheck" = "2" ]
    && [ "$_post_adapter_line" -lt "$_issue_line" ] \
    && [ "$_post_adapter_line" -lt "$_first_loop_line" ] \
    && [ "$_budget_fallback_line" -lt "$_feedback_fallback_line" ] \
+   && [ "$_feedback_fallback_line" -lt "$_fallback_accounting_line" ] \
+   && [ "$_fallback_accounting_line" -lt "$_budget_fallback_final_line" ] \
+   && [ "$_budget_fallback_final_line" -lt "$_handoff_writer_line" ] \
    && [ "$_issue_line" -lt "$_budget_pre_post_line" ] \
    && [ "$_first_loop_line" -lt "$_budget_pre_post_line" ] \
    && [ "$_budget_pre_post_line" -lt "$_pre_post_line" ] \
@@ -5356,7 +5362,7 @@ if [ "$n_eval" = "1" ] && [ "$n_call" = "2" ] && [ "$_n_timeout_recheck" = "2" ]
    && [ "$_live_head_line" -lt "$_payload_line" ]; then
   pass "#814/#1085/#1305: full barrier precedes the adapter; targeted authority reads fence adapter exits, fallback, side effects, and review POST"
 else
-  fail "#814/#1085/#1305: barrier/recheck ordering drifted (barrier=$_full_barrier_line adapter=$_adapter_line budget-post=$_budget_post_adapter_line rc=$_adapter_rc_line validate=$_validate_line timeout-post=$_post_adapter_line fallback-budget=$_budget_fallback_line fallback-feedback=$_feedback_fallback_line issue=$_issue_line loop=$_first_loop_line budget-prepost=$_budget_pre_post_line timeout-prepost=$_pre_post_line live-head=$_live_head_line payload=$_payload_line; evals=$n_eval calls=$n_call rechecks=$_n_timeout_recheck)"
+  fail "#814/#1085/#1305: barrier/recheck ordering drifted (barrier=$_full_barrier_line adapter=$_adapter_line budget-post=$_budget_post_adapter_line rc=$_adapter_rc_line validate=$_validate_line timeout-post=$_post_adapter_line fallback-budget=$_budget_fallback_line fallback-feedback=$_feedback_fallback_line fallback-accounting=$_fallback_accounting_line fallback-final=$_budget_fallback_final_line handoff=$_handoff_writer_line issue=$_issue_line loop=$_first_loop_line budget-prepost=$_budget_pre_post_line timeout-prepost=$_pre_post_line live-head=$_live_head_line payload=$_payload_line; evals=$n_eval calls=$n_call rechecks=$_n_timeout_recheck)"
 fi
 
 # Behavioral form of the adapter-window race. The first timeline read carries
@@ -5510,24 +5516,40 @@ chmod +x "$WORK/stub-cx-blocked.sh" "$WORK/stub-budget-reviewer-guard.sh" \
 _budget_before="$WORK/budget-comments-before.json"
 _budget_after="$WORK/budget-comments-after.json"
 _budget_unreadable="$WORK/budget-comments-unreadable.json"
+_budget_accounting_gate="$WORK/budget-accounting-gate.sh"
 printf '[]\n' >"$_budget_before"
 jq -nc --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   '[{id:7101,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:$now}]' \
   >"$_budget_after"
 printf 'not-json\n' >"$_budget_unreadable"
+cat >"$_budget_accounting_gate" <<'EOF'
+#!/usr/bin/env bash
+printf 'accounting-ran\n' >>"${P4B_BUDGET_ACCOUNTING_LOG:?}"
+printf '{"feedback_policy":{},"findings":[],"missing":[]}\n'
+EOF
+chmod +x "$_budget_accounting_gate"
 
-for _budget_outcome in approve adapter-failure unreadable stable-failure; do
+for _budget_outcome in approve adapter-failure unreadable accounting-window-adapter-failure stable-failure; do
   _budget_count="$WORK/budget-${_budget_outcome}-comments.count"
   _budget_adapter="$WORK/budget-${_budget_outcome}-adapter.log"
   _budget_reviewer="$WORK/budget-${_budget_outcome}-reviewer.log"
   _budget_handoff="$WORK/budget-${_budget_outcome}-handoff.log"
+  _budget_accounting="$WORK/budget-${_budget_outcome}-accounting.log"
   rm -f "$_budget_count" "$_budget_adapter" "$_budget_reviewer" "$_budget_handoff" \
-    "$_budget_fail_adapter"
+    "$_budget_accounting" "$_budget_fail_adapter"
   _budget_after_path="$_budget_after"
+  _budget_switch_after=3
+  _budget_accounting_cmd="$WORK/clear-feedback.sh"
   case "$_budget_outcome" in
     approve) _budget_codex="$BIN/fake-codex-race-approve-p2" ;;
     adapter-failure) _budget_codex="$BIN/fake-codex-budget-fail"; _budget_adapter="$_budget_fail_adapter" ;;
     unreadable) _budget_codex="$BIN/fake-codex-race-approve-p2"; _budget_after_path="$_budget_unreadable" ;;
+    accounting-window-adapter-failure)
+      _budget_codex="$BIN/fake-codex-budget-fail"
+      _budget_adapter="$_budget_fail_adapter"
+      _budget_switch_after=5
+      _budget_accounting_cmd="$_budget_accounting_gate"
+      ;;
     stable-failure) _budget_codex="$BIN/fake-codex-budget-fail"; _budget_adapter="$_budget_fail_adapter"; _budget_after_path="$_budget_before" ;;
   esac
   rm -f "$_race_adapter"
@@ -5537,10 +5559,12 @@ for _budget_outcome in approve adapter-failure unreadable stable-failure; do
     P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-blocked.sh" \
     P4B_GH_AS_REVIEWER="$WORK/stub-budget-reviewer-guard.sh" \
     P4B_BUDGET_REVIEWER_LOG="$_budget_reviewer" \
+    MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$_budget_accounting_cmd" \
+    P4B_BUDGET_ACCOUNTING_LOG="$_budget_accounting" \
     P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$_budget_handoff" \
     P4B_FAKE_LIVE_HEAD="$_race_head" \
     P4B_FAKE_COMMENTS_BEFORE="$_budget_before" P4B_FAKE_COMMENTS_AFTER="$_budget_after_path" \
-    P4B_FAKE_COMMENTS_COUNT="$_budget_count" P4B_FAKE_COMMENTS_SWITCH_AFTER=3 \
+    P4B_FAKE_COMMENTS_COUNT="$_budget_count" P4B_FAKE_COMMENTS_SWITCH_AFTER="$_budget_switch_after" \
     bash "$ORCH" 131 --repo o/r --author claude --head "$_race_head" --diff-file "$DIFF" \
       2>/dev/null)"; rc=$?
   set -e
@@ -5549,10 +5573,22 @@ for _budget_outcome in approve adapter-failure unreadable stable-failure; do
   else
     _budget_adapter_evidence="$(cat "$_budget_adapter" 2>/dev/null || true)"
   fi
-  if [ "$_budget_outcome" = stable-failure ]; then
+  if [ "$_budget_outcome" = accounting-window-adapter-failure ]; then
+    if [ "$rc" = 10 ] \
+       && [ "$(printf '%s' "$out" | jq -r '.barrier.request_budget.reason')" = request-generation-changed ] \
+       && [ "$(cat "$_budget_count" 2>/dev/null || true)" = 6 ] \
+       && [ "$_budget_adapter_evidence" = adapter-ran ] \
+       && [ "$(grep -c '^accounting-ran$' "$_budget_accounting" 2>/dev/null || true)" = 2 ] \
+       && [ ! -e "$_budget_reviewer" ] \
+       && [ ! -e "$_budget_handoff" ]; then
+      pass "#1474: adapter-failure handoff rechecks generation after feedback accounting"
+    else
+      fail "#1474: adapter-failure accounting-window authority leak (rc=$rc reads=$(cat "$_budget_count" 2>/dev/null || true) adapter=$_budget_adapter_evidence accounting-calls=$(grep -c '^accounting-ran$' "$_budget_accounting" 2>/dev/null || true) reviewer=$(cat "$_budget_reviewer" 2>/dev/null || true) handoff=$(cat "$_budget_handoff" 2>/dev/null || true)): $out"
+    fi
+  elif [ "$_budget_outcome" = stable-failure ]; then
     if [ "$rc" = 4 ] \
        && [ "$(printf '%s' "$out" | jq -r .fell_back_to_manual)" = true ] \
-       && [ "$(cat "$_budget_count" 2>/dev/null || true)" = 5 ] \
+       && [ "$(cat "$_budget_count" 2>/dev/null || true)" = 6 ] \
        && [ "$_budget_adapter_evidence" = adapter-ran ] \
        && [ ! -e "$_budget_reviewer" ] \
        && [ -s "$_budget_handoff" ]; then
@@ -5576,6 +5612,36 @@ for _budget_outcome in approve adapter-failure unreadable stable-failure; do
     fi
   fi
 done
+
+# The no-adapter path shares the central fallback writer but skips adapter
+# dispatch entirely. Change the request generation only after its early fence
+# and feedback gate; the last fence must still refuse the handoff.
+_budget_missing_count="$WORK/budget-missing-adapter-comments.count"
+_budget_missing_accounting="$WORK/budget-missing-adapter-accounting.log"
+_budget_missing_handoff="$WORK/budget-missing-adapter-handoff.log"
+rm -f "$_budget_missing_count" "$_budget_missing_accounting" "$_budget_missing_handoff"
+set +e
+out="$(PATH="$WORK/budget-bin:$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-adapter-race.yml" \
+  P4B_ADAPTER_DIR="$WORK/cap-no-adapter" \
+  P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-blocked.sh" \
+  MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$_budget_accounting_gate" \
+  P4B_BUDGET_ACCOUNTING_LOG="$_budget_missing_accounting" \
+  P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$_budget_missing_handoff" \
+  P4B_FAKE_LIVE_HEAD="$_race_head" \
+  P4B_FAKE_COMMENTS_BEFORE="$_budget_before" P4B_FAKE_COMMENTS_AFTER="$_budget_after" \
+  P4B_FAKE_COMMENTS_COUNT="$_budget_missing_count" P4B_FAKE_COMMENTS_SWITCH_AFTER=4 \
+  bash "$ORCH" 131 --repo o/r --author claude --reviewer nathanpayne-codex \
+    --head "$_race_head" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 10 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.barrier.request_budget.reason')" = request-generation-changed ] \
+   && [ "$(cat "$_budget_missing_count" 2>/dev/null || true)" = 5 ] \
+   && [ "$(grep -c '^accounting-ran$' "$_budget_missing_accounting" 2>/dev/null || true)" = 1 ] \
+   && [ ! -e "$_budget_missing_handoff" ]; then
+  pass "#1474: missing-adapter handoff rechecks generation after feedback accounting"
+else
+  fail "#1474: missing-adapter accounting-window authority leak (rc=$rc reads=$(cat "$_budget_missing_count" 2>/dev/null || true) accounting-calls=$(grep -c '^accounting-ran$' "$_budget_missing_accounting" 2>/dev/null || true) handoff=$(cat "$_budget_missing_handoff" 2>/dev/null || true)): $out"
+fi
 
 # The same request can land after the first post-adapter fence, while approval
 # follow-up issues and provisional accounting are created. The final pre-POST

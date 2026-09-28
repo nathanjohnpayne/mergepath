@@ -549,6 +549,13 @@ fall_back_to_manual() {
         || p4b_warn "accounting: could not record the fail-closed loop (continuing)"
     fi
   fi
+  # The feedback gate and advisory fallback accounting above both run external
+  # commands. A final request can arrive after the early fence while either is
+  # in flight, so bind the actual handoff boundary to the same generation too.
+  # Keep the early fence: it performs refusal cleanup before a fallible feedback
+  # read can interrupt that path. This final fence owns the later accounting
+  # window and exits directly on refusal, without recursing through fallback.
+  revalidate_codex_request_budget_generation pre-post
   if [ -x "$HANDOFF" ]; then
     handoff_output=$(PHASE_4B_REVIEWER_IDENTITY="$REVIEWER" "$HANDOFF" "$handoff_ref" 2>&1) \
       || handoff_rc=$?
