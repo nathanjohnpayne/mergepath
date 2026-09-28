@@ -1635,7 +1635,7 @@ p4b_same_head_barrier() {
   local cx_generation_expected="" cx_generation_comments="" cx_generation_live="" cx_generation_author=""
   local cx_terminal_json="" cx_terminal_rc=0 cx_terminal_state="" live_report_head=""
   local initial_cls_cx="" initial_cx_evidence=""
-  local pending=false why="" trigger="skipped" resume="skipped" cls_cr="disabled" cls_cx="disabled"
+  local pending=false why="" coderabbit_cause="" trigger="skipped" resume="skipped" cls_cr="disabled" cls_cx="disabled"
   local cx_evidence="disabled" cr_carry="" cr_carry_json="null"
   local cap_exhausted=false final_request_pending=false human_tiebreaker=false
   local budget_unsafe=false
@@ -1825,6 +1825,16 @@ p4b_same_head_barrier() {
     if [ -n "$probe_head" ] && [ "$probe_head" != "$head" ]; then
       why="PR head moved during evaluation (reviewing $head, live $probe_head) — rerun on the new head"
       cls_cr="drift"
+      # Preserve the legacy ordinary-escalation route for a normal barrier
+      # drift, but never let a drift observed during the exhausted-cap final
+      # wait create manual-handoff authority. The active request remains bound
+      # to the old head and the run cannot safely decide either cap expiry or
+      # fallback authority for the new one.
+      if [ "$final_request_pending" = true ]; then
+        budget_unsafe=true
+        cx_budget_json="$(printf '%s' "$cx_budget_json" | jq -c --arg live "$probe_head" \
+          '. + {state:"unsafe",reason:"head-moved-during-final-request-wait",live_head:$live}')"
+      fi
     else
       cls_cr="$(p4b_barrier_class_coderabbit "$head" "$rc" "$json")"
       # #1335: a not-yet that CodeRabbit will never leave on this head — a
@@ -1927,13 +1937,24 @@ p4b_same_head_barrier() {
           ;;
         *)
           if [ "$rc" = 2 ]; then
-            why="CodeRabbit published a blocking finding carried only by the PR-level summary on $head — no required gate dispositions that class, so a human must read it"
+            coderabbit_cause="CodeRabbit published a blocking finding carried only by the PR-level summary on $head — no required gate dispositions that class, so a human must read it"
           else
-            why="coderabbit probe exited $rc"
+            coderabbit_cause="coderabbit probe exited $rc"
           fi
+          why="$coderabbit_cause"
           ;;
       esac
     fi
+  fi
+
+  # A still-eligible final Codex request owns the wait even when CodeRabbit has
+  # already produced a terminal cause. Letting that cause remain in `why`
+  # skips the bounded wait below and grants the ordinary manual handoff while
+  # the last automated request is active. Retain the cause separately: a
+  # finishing Codex report/timeout restores the existing CodeRabbit escalation,
+  # while final-request expiry stops for the human under the request-cap rule.
+  if [ "$final_request_pending" = true ] && [ -n "$coderabbit_cause" ]; then
+    why=""
   fi
 
   if [ "$scope" = cap-only ] && [ "$cap_exhausted" != true ]; then
@@ -1959,23 +1980,32 @@ p4b_same_head_barrier() {
             cls_cx="reported"
             cx_evidence="signal"
             pending=false
-            case "$cls_cr" in
-              not-yet) why="external review did not reach the current head within ${budget}s" ;;
-            esac
+            if [ -n "$coderabbit_cause" ]; then
+              why="$coderabbit_cause"
+            else
+              case "$cls_cr" in
+                not-yet) why="external review did not reach the current head within ${budget}s" ;;
+              esac
+            fi
             ;;
           0:timeout)
             cls_cx="waived"
             cx_evidence="timeout"
             pending=false
-            case "$cls_cr" in
-              not-yet|rate-limited) why="external review did not reach the current head within ${budget}s" ;;
-            esac
+            if [ -n "$coderabbit_cause" ]; then
+              why="$coderabbit_cause"
+            else
+              case "$cls_cr" in
+                not-yet|rate-limited) why="external review did not reach the current head within ${budget}s" ;;
+              esac
+            fi
             ;;
           0:none)
             human_tiebreaker=true
             cls_cx="cap-exhausted"
             cx_evidence="request-cap-final-wait-exhausted"
             why="Codex request cap exhausted and its eligible final request did not report within ${budget}s; human tiebreaker required"
+            [ -z "$coderabbit_cause" ] || why="$why (CodeRabbit state retained: $coderabbit_cause)"
             ;;
           *)
             pending=false
@@ -2067,31 +2097,32 @@ p4b_same_head_barrier() {
   if [ -n "$why" ]; then
     if [ "$human_tiebreaker" = true ]; then
       jq -nc --arg r "$why" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" \
-        --arg t "$trigger" --arg rs "$resume" --argjson b "${cx_budget_json:-null}" \
+        --arg cc "$coderabbit_cause" --arg t "$trigger" --arg rs "$resume" --argjson b "${cx_budget_json:-null}" \
         '{decision:"human-tiebreaker",reason:$r,coderabbit:$cr,codex:$cx,codex_evidence:$ce,
-          trigger:$t,resume:$rs,request_budget:$b}'
+          coderabbit_cause:$cc,trigger:$t,resume:$rs,request_budget:$b}'
       return 3
     fi
     if [ "$budget_unsafe" = true ]; then
       jq -nc --arg r "$why" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" \
-        --argjson b "${cx_budget_json:-null}" \
-        '{decision:"error",reason:$r,coderabbit:$cr,codex:$cx,codex_evidence:$ce,request_budget:$b}'
+        --arg cc "$coderabbit_cause" --argjson b "${cx_budget_json:-null}" \
+        '{decision:"error",reason:$r,coderabbit:$cr,codex:$cx,codex_evidence:$ce,coderabbit_cause:$cc,request_budget:$b}'
       return 4
     fi
-    jq -nc --arg r "$why" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" --arg t "$trigger" --arg rs "$resume" \
-      '{decision:"escalate", reason:$r, coderabbit:$cr, codex:$cx, codex_evidence:$ce, trigger:$t, resume:$rs}'
+    jq -nc --arg r "$why" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" --arg cc "$coderabbit_cause" --arg t "$trigger" --arg rs "$resume" \
+      '{decision:"escalate", reason:$r, coderabbit:$cr, codex:$cx, codex_evidence:$ce, coderabbit_cause:$cc, trigger:$t, resume:$rs}'
     return 2
   fi
   if [ "$pending" = true ]; then
-    jq -nc --argjson ra "$remaining" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" --arg t "$trigger" --arg rs "$resume" \
-      '{decision:"pending", retry_after:$ra, coderabbit:$cr, codex:$cx, codex_evidence:$ce, trigger:$t, resume:$rs}'
+    jq -nc --argjson ra "$remaining" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" --arg cc "$coderabbit_cause" --arg t "$trigger" --arg rs "$resume" \
+      '{decision:"pending", retry_after:$ra, coderabbit:$cr, codex:$cx, codex_evidence:$ce, coderabbit_cause:$cc, trigger:$t, resume:$rs}'
     return 1
   fi
   # `coderabbit_carryforward` is present only on an open barrier and is null
   # unless the CodeRabbit arm carried (#1335): the orchestrator records the
   # source commit and fingerprint in the approval it posts.
   jq -nc --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" --argjson cf "$cr_carry_json" \
-    '{decision:"open", coderabbit:$cr, codex:$cx, codex_evidence:$ce, coderabbit_carryforward:$cf}'
+    --argjson b "${cx_budget_json:-null}" \
+    '{decision:"open", coderabbit:$cr, codex:$cx, codex_evidence:$ce, coderabbit_carryforward:$cf,request_budget:$b}'
   return 0
 }
 

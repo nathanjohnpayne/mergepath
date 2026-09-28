@@ -4384,6 +4384,77 @@ out="$(P4B_TEST_CODEX_STUB="$WORK/stub-cx-report-on-recheck.sh" P4B_TEST_CODEX_R
 [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r .codex_evidence)" = signal ] \
   || bad="$bad final-wait-report-race-not-rechecked"
 
+# A CodeRabbit terminal cause cannot bypass the authoritative final-request
+# wait. Preserve the cause while Codex is still working; if the wait expires
+# first, the spent request budget stops for the human. If Codex reports during
+# the finishing sample, the retained CodeRabbit cause resumes the existing
+# escalation path instead of incorrectly opening the barrier.
+cat >"$WORK/cap-final-wait-cr.yml" <<'EOF'
+author_identity: nathanjohnpayne
+coderabbit:
+  enabled: true
+  max_wait_seconds: 100
+codex:
+  enabled: true
+  max_review_rounds: 2
+  reaction_freshness_window_seconds: 1800
+EOF
+cat >"$WORK/cap-final-wait-cr-zero.yml" <<'EOF'
+author_identity: nathanjohnpayne
+coderabbit:
+  enabled: true
+  max_wait_seconds: 0
+codex:
+  enabled: true
+  max_review_rounds: 2
+  reaction_freshness_window_seconds: 1800
+EOF
+for _cr_cause_rc in 2 3; do
+  rm -rf "$WORK/barrier-state/phase-4b-barrier"
+  out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-final-wait-cr.yml" \
+    P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+    _barrier 1 "$_cr_cause_rc" "{\"head_sha\":\"$_p4a_head\"}" \
+      "$WORK/cap-final-wait-cr.yml" "$_p4a_head")" && rc=0 || rc=$?
+  [ "$rc" = 1 ] \
+    && [ "$(printf '%s' "$out" | jq -r .decision)" = pending ] \
+    && [ "$(printf '%s' "$out" | jq -r .codex_evidence)" = request-cap-final-pending ] \
+    && [ -n "$(printf '%s' "$out" | jq -r '.coderabbit_cause // empty')" ] \
+    || bad="$bad final-request-cr${_cr_cause_rc}-bypassed-wait(rc=$rc,out=$out)"
+done
+
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-final-wait-cr.yml" \
+  P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+  _barrier 1 0 "{\"head_sha\":\"$_p4a_old\"}" \
+    "$WORK/cap-final-wait-cr.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 4 ] \
+  && [ "$(printf '%s' "$out" | jq -r .decision)" = error ] \
+  && [ "$(printf '%s' "$out" | jq -r '.request_budget.reason')" = head-moved-during-final-request-wait ] \
+  || bad="$bad final-request-head-drift-granted-handoff(rc=$rc,out=$out)"
+
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-final-wait-cr-zero.yml" \
+  P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+  _barrier 1 2 "{\"head_sha\":\"$_p4a_head\"}" \
+    "$WORK/cap-final-wait-cr-zero.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 3 ] \
+  && [ "$(printf '%s' "$out" | jq -r .decision)" = human-tiebreaker ] \
+  && [ -n "$(printf '%s' "$out" | jq -r '.coderabbit_cause // empty')" ] \
+  || bad="$bad final-request-cr-cause-bypassed-exit8(rc=$rc,out=$out)"
+
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+rm -f "$WORK/codex-recheck.marker"
+out="$(P4B_TEST_CODEX_STUB="$WORK/stub-cx-report-on-recheck.sh" \
+  P4B_TEST_CODEX_RECHECK_MARKER="$WORK/codex-recheck.marker" \
+  P4B_TEST_BASE_POLICY_PATH="$WORK/cap-final-wait-cr-zero.yml" \
+  P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+  _barrier 1 2 "{\"head_sha\":\"$_p4a_head\"}" \
+    "$WORK/cap-final-wait-cr-zero.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 2 ] \
+  && [ "$(printf '%s' "$out" | jq -r .decision)" = escalate ] \
+  && [ -n "$(printf '%s' "$out" | jq -r '.coderabbit_cause // empty')" ] \
+  || bad="$bad finishing-report-erased-cr-cause(rc=$rc,out=$out)"
+
 # Unreadable terminal evidence is never equivalent to "no result" at either
 # cap stop. It must take the authority-error path instead of exit 8.
 for _terminal_case in immediate final-wait; do
@@ -5251,26 +5322,38 @@ _full_barrier_line="$(grep -n 'run_same_head_barrier "pre-adapter"' "$ORCH" | cu
 _cap_guard_line="$(grep -n 'run_same_head_barrier "pre-fallback" cap-only' "$ORCH" | cut -d: -f1)"
 _missing_adapter_line="$(grep -n 'fall_back_to_manual "no adapter for reviewer' "$ORCH" | cut -d: -f1)"
 _adapter_line="$(grep -n 'VERDICT_JSON="$(p4b_run_with_timeout ' "$ORCH" | cut -d: -f1)"
+_budget_post_adapter_line="$(grep -n '^  revalidate_codex_request_budget_generation post-adapter$' "$ORCH" | cut -d: -f1)"
+_adapter_rc_line="$(grep -n '^if \[ "\$ADAPTER_RC" -ne 0 \]; then$' "$ORCH" | cut -d: -f1)"
 _validate_line="$(grep -n '^if ! p4b_validate_verdict ' "$ORCH" | cut -d: -f1)"
 _post_adapter_line="$(grep -n '^  revalidate_phase4a_timeout_generation post-adapter$' "$ORCH" | cut -d: -f1)"
 _issue_line="$(grep -n '^[[:space:]]*_pri_out="$(p4b_file_post_review_issues ' "$ORCH" | cut -d: -f1)"
 _first_loop_line="$(grep -n '^[[:space:]]*if p4b_acct_hook_record_loop ' "$ORCH" | head -1 | cut -d: -f1)"
+_budget_fallback_line="$(grep -n '^  revalidate_codex_request_budget_generation pre-post$' "$ORCH" | head -1 | cut -d: -f1)"
+_feedback_fallback_line="$(grep -n '^  require_feedback_accounted$' "$ORCH" | head -1 | cut -d: -f1)"
+_budget_pre_post_line="$(grep -n '^  revalidate_codex_request_budget_generation pre-post$' "$ORCH" | tail -1 | cut -d: -f1)"
 _pre_post_line="$(grep -n '^  revalidate_phase4a_timeout_generation pre-post$' "$ORCH" | cut -d: -f1)"
 _live_head_line="$(grep -n '^  live_head="$(gh_api_scalar --shape sha "live PR head for ' "$ORCH" | tail -1 | cut -d: -f1)"
 _payload_line="$(grep -n '^  payload_file="$(mktemp ' "$ORCH" | cut -d: -f1)"
 if [ "$n_eval" = "1" ] && [ "$n_call" = "2" ] && [ "$_n_timeout_recheck" = "2" ] \
    && [ "$_cap_guard_line" -lt "$_missing_adapter_line" ] \
    && [ "$_full_barrier_line" -lt "$_adapter_line" ] \
+   && [ "$_adapter_line" -lt "$_budget_post_adapter_line" ] \
+   && [ "$_budget_post_adapter_line" -lt "$_adapter_rc_line" ] \
+   && [ "$_adapter_rc_line" -lt "$_validate_line" ] \
    && [ "$_validate_line" -lt "$_post_adapter_line" ] \
    && [ "$_post_adapter_line" -lt "$_issue_line" ] \
    && [ "$_post_adapter_line" -lt "$_first_loop_line" ] \
+   && [ "$_budget_fallback_line" -lt "$_feedback_fallback_line" ] \
+   && [ "$_issue_line" -lt "$_budget_pre_post_line" ] \
+   && [ "$_first_loop_line" -lt "$_budget_pre_post_line" ] \
+   && [ "$_budget_pre_post_line" -lt "$_pre_post_line" ] \
    && [ "$_issue_line" -lt "$_pre_post_line" ] \
    && [ "$_first_loop_line" -lt "$_pre_post_line" ] \
    && [ "$_pre_post_line" -lt "$_live_head_line" ] \
    && [ "$_live_head_line" -lt "$_payload_line" ]; then
-  pass "#814/#1085: full barrier precedes the adapter; targeted timeout reads fence the first side effect, final live-head read, and review POST"
+  pass "#814/#1085/#1305: full barrier precedes the adapter; targeted authority reads fence adapter exits, fallback, side effects, and review POST"
 else
-  fail "#814/#1085: barrier/recheck ordering drifted (barrier=$_full_barrier_line adapter=$_adapter_line validate=$_validate_line post-adapter=$_post_adapter_line issue=$_issue_line loop=$_first_loop_line pre-post=$_pre_post_line live-head=$_live_head_line payload=$_payload_line; evals=$n_eval calls=$n_call rechecks=$_n_timeout_recheck)"
+  fail "#814/#1085/#1305: barrier/recheck ordering drifted (barrier=$_full_barrier_line adapter=$_adapter_line budget-post=$_budget_post_adapter_line rc=$_adapter_rc_line validate=$_validate_line timeout-post=$_post_adapter_line fallback-budget=$_budget_fallback_line fallback-feedback=$_feedback_fallback_line issue=$_issue_line loop=$_first_loop_line budget-prepost=$_budget_pre_post_line timeout-prepost=$_pre_post_line live-head=$_live_head_line payload=$_payload_line; evals=$n_eval calls=$n_call rechecks=$_n_timeout_recheck)"
 fi
 
 # Behavioral form of the adapter-window race. The first timeline read carries
@@ -5362,6 +5445,178 @@ if [ "$rc" = 6 ] \
   pass "#1085: a pre-POST trigger retracts the old timeout and cleans filed issues plus provisional accounting before holding"
 else
   fail "#1085: pre-POST trigger race did not cleanly hold (rc=$rc reads=$(cat "$_race_count" 2>/dev/null || true) issue-log=$(tr '\n' ' ' <"$_race_issue_log" 2>/dev/null || true) loop=$(cat "$_race_loop" 2>/dev/null || true) wrapper=$(test -e "$_race_wrapper" && cat "$_race_wrapper" || true)): $out"
+fi
+
+# #1305/#1474: an account-blocked Codex with budget remaining may dispatch the
+# adapter, but that below-cap snapshot is not permanent authority. A final
+# allowed request arriving during the adapter window invalidates approval and
+# manual-fallback exits without changing HEAD. Changed authority evidence uses
+# exit 10; a clean rerun observes the request and enters the ordinary bounded
+# final-request wait.
+cat >"$WORK/policy-cap-adapter-race.yml" <<'EOF'
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+author_identity: nathanjohnpayne
+phase_4b_automation:
+  enabled: true
+  mode: local
+coderabbit:
+  enabled: false
+  max_wait_seconds: 100
+codex:
+  enabled: true
+  max_review_rounds: 1
+  reaction_freshness_window_seconds: 1800
+EOF
+cat >"$WORK/stub-cx-blocked.sh" <<'EOF'
+#!/bin/sh
+exit 2
+EOF
+cat >"$WORK/stub-budget-reviewer-guard.sh" <<'EOF'
+#!/bin/sh
+printf 'invoked\n' >"$P4B_BUDGET_REVIEWER_LOG"
+exit 9
+EOF
+mkdir -p "$WORK/budget-bin"
+cat >"$WORK/budget-bin/gh" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = api ] && [ "\${2:-}" = repos/o/r/pulls/131 ]; then
+  for a in "\$@"; do
+    case "\$a" in
+      *'{head_sha:.head.sha'*)
+        jq -nc --arg h "\${P4B_FAKE_LIVE_HEAD:-abc123}" \
+          '{head_sha:\$h,base_ref:"main",base_sha:"3333333333333333333333333333333333333333",default_branch:"main"}'
+        exit 0
+        ;;
+    esac
+  done
+fi
+exec "$BIN/gh" "\$@"
+EOF
+_budget_fail_adapter="$WORK/budget-adapter-failure-adapter.log"
+cat >"$BIN/fake-codex-budget-fail" <<EOF
+#!/usr/bin/env bash
+cat >/dev/null 2>&1 || true
+printf 'adapter-ran\n' >"$_budget_fail_adapter"
+exit 9
+EOF
+chmod +x "$WORK/stub-cx-blocked.sh" "$WORK/stub-budget-reviewer-guard.sh" \
+  "$WORK/budget-bin/gh" "$BIN/fake-codex-budget-fail"
+_budget_before="$WORK/budget-comments-before.json"
+_budget_after="$WORK/budget-comments-after.json"
+_budget_unreadable="$WORK/budget-comments-unreadable.json"
+printf '[]\n' >"$_budget_before"
+jq -nc --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '[{id:7101,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:$now}]' \
+  >"$_budget_after"
+printf 'not-json\n' >"$_budget_unreadable"
+
+for _budget_outcome in approve adapter-failure unreadable stable-failure; do
+  _budget_count="$WORK/budget-${_budget_outcome}-comments.count"
+  _budget_adapter="$WORK/budget-${_budget_outcome}-adapter.log"
+  _budget_reviewer="$WORK/budget-${_budget_outcome}-reviewer.log"
+  _budget_handoff="$WORK/budget-${_budget_outcome}-handoff.log"
+  rm -f "$_budget_count" "$_budget_adapter" "$_budget_reviewer" "$_budget_handoff" \
+    "$_budget_fail_adapter"
+  _budget_after_path="$_budget_after"
+  case "$_budget_outcome" in
+    approve) _budget_codex="$BIN/fake-codex-race-approve-p2" ;;
+    adapter-failure) _budget_codex="$BIN/fake-codex-budget-fail"; _budget_adapter="$_budget_fail_adapter" ;;
+    unreadable) _budget_codex="$BIN/fake-codex-race-approve-p2"; _budget_after_path="$_budget_unreadable" ;;
+    stable-failure) _budget_codex="$BIN/fake-codex-budget-fail"; _budget_adapter="$_budget_fail_adapter"; _budget_after_path="$_budget_before" ;;
+  esac
+  rm -f "$_race_adapter"
+  set +e
+  out="$(PATH="$WORK/budget-bin:$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-adapter-race.yml" \
+    CODEX_BIN="$_budget_codex" P4B_BUDGET_ADAPTER_LOG="$_budget_adapter" \
+    P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-blocked.sh" \
+    P4B_GH_AS_REVIEWER="$WORK/stub-budget-reviewer-guard.sh" \
+    P4B_BUDGET_REVIEWER_LOG="$_budget_reviewer" \
+    P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$_budget_handoff" \
+    P4B_FAKE_LIVE_HEAD="$_race_head" \
+    P4B_FAKE_COMMENTS_BEFORE="$_budget_before" P4B_FAKE_COMMENTS_AFTER="$_budget_after_path" \
+    P4B_FAKE_COMMENTS_COUNT="$_budget_count" P4B_FAKE_COMMENTS_SWITCH_AFTER=3 \
+    bash "$ORCH" 131 --repo o/r --author claude --head "$_race_head" --diff-file "$DIFF" \
+      2>/dev/null)"; rc=$?
+  set -e
+  if [ "$_budget_outcome" = approve ] || [ "$_budget_outcome" = unreadable ]; then
+    _budget_adapter_evidence="$(cat "$_race_adapter" 2>/dev/null || true)"
+  else
+    _budget_adapter_evidence="$(cat "$_budget_adapter" 2>/dev/null || true)"
+  fi
+  if [ "$_budget_outcome" = stable-failure ]; then
+    if [ "$rc" = 4 ] \
+       && [ "$(printf '%s' "$out" | jq -r .fell_back_to_manual)" = true ] \
+       && [ "$(cat "$_budget_count" 2>/dev/null || true)" = 5 ] \
+       && [ "$_budget_adapter_evidence" = adapter-ran ] \
+       && [ ! -e "$_budget_reviewer" ] \
+       && [ -s "$_budget_handoff" ]; then
+      pass "#1305: unchanged below-cap generation preserves adapter-failure manual fallback"
+    else
+      fail "#1305: stable adapter-failure control changed (rc=$rc reads=$(cat "$_budget_count" 2>/dev/null || true) adapter=$_budget_adapter_evidence reviewer=$(cat "$_budget_reviewer" 2>/dev/null || true) handoff=$(cat "$_budget_handoff" 2>/dev/null || true)): $out"
+    fi
+  else
+    _budget_expected_reason=request-generation-changed
+    [ "$_budget_outcome" != unreadable ] || _budget_expected_reason=request-generation-reread-failed
+    if [ "$rc" = 10 ] \
+       && [ "$(printf '%s' "$out" | jq -r .infrastructure_error)" = true ] \
+       && [ "$(printf '%s' "$out" | jq -r '.barrier.request_budget.reason')" = "$_budget_expected_reason" ] \
+       && [ "$(cat "$_budget_count" 2>/dev/null || true)" = 4 ] \
+       && [ "$_budget_adapter_evidence" = adapter-ran ] \
+       && [ ! -e "$_budget_reviewer" ] \
+       && [ ! -e "$_budget_handoff" ]; then
+      pass "#1305: adapter-window $_budget_outcome authority stops on $_budget_expected_reason with exit 10"
+    else
+      fail "#1305: adapter-window $_budget_outcome authority leak (rc=$rc reads=$(cat "$_budget_count" 2>/dev/null || true) adapter=$_budget_adapter_evidence reviewer=$(cat "$_budget_reviewer" 2>/dev/null || true) handoff=$(cat "$_budget_handoff" 2>/dev/null || true)): $out"
+    fi
+  fi
+done
+
+# The same request can land after the first post-adapter fence, while approval
+# follow-up issues and provisional accounting are created. The final pre-POST
+# fence must refuse it, close this run's issue, correct the loop to not-posted,
+# and render neither a review nor a manual handoff.
+_budget_count="$WORK/budget-prepost-comments.count"
+_budget_reviewer="$WORK/budget-prepost-reviewer.log"
+_budget_handoff="$WORK/budget-prepost-handoff.log"
+_budget_issue="$WORK/budget-prepost-issue.log"
+_budget_acct="$WORK/budget-prepost-acct"
+_budget_loop="$_budget_acct/phase-4b-loops/o-r-pr131.jsonl"
+_budget_pending="$_budget_acct/phase-4b-pending/o-r-pr131.json"
+rm -rf "$_budget_acct"
+rm -f "$_budget_count" "$_budget_reviewer" "$_budget_handoff" "$_budget_issue" \
+  "$_budget_issue.headreads" "$_race_adapter"
+: >"$_budget_issue"
+set +e
+out="$(PATH="$WORK/budget-bin:$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-adapter-race.yml" \
+  CODEX_BIN="$BIN/fake-codex-race-approve-p2" \
+  P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-blocked.sh" \
+  P4B_GH_AS_REVIEWER="$WORK/stub-budget-reviewer-guard.sh" \
+  P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat \
+  P4B_BUDGET_REVIEWER_LOG="$_budget_reviewer" \
+  P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$_budget_handoff" \
+  P4B_FAKE_LIVE_HEAD="$_race_head" \
+  P4B_FAKE_COMMENTS_BEFORE="$_budget_before" P4B_FAKE_COMMENTS_AFTER="$_budget_after" \
+  P4B_FAKE_COMMENTS_COUNT="$_budget_count" P4B_FAKE_COMMENTS_SWITCH_AFTER=4 \
+  P4B_ISSUE_LOG="$_budget_issue" P4B_ACCT_STATE_DIR="$_budget_acct" \
+  bash "$ORCH" 131 --repo o/r --author claude --head "$_race_head" --diff-file "$DIFF" \
+    2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 10 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.barrier.request_budget.reason')" = request-generation-changed ] \
+   && [ "$(cat "$_budget_count" 2>/dev/null || true)" = 5 ] \
+   && grep -q '^ARGV ' "$_budget_issue" \
+   && grep -q '^CLOSE #901$' "$_budget_issue" \
+   && [ "$(jq -sr 'last.loop.posted' "$_budget_loop" 2>/dev/null)" = not-posted ] \
+   && [ "$(jq -sr 'last.loop.fail_closed.happened' "$_budget_loop" 2>/dev/null)" = true ] \
+   && [ ! -e "$_budget_pending" ] \
+   && [ ! -e "$_budget_reviewer" ] \
+   && [ ! -e "$_budget_handoff" ]; then
+  pass "#1305: pre-POST request-generation drift cleans filed issues and provisional accounting before exit 10"
+else
+  fail "#1305: pre-POST request-generation cleanup failed (rc=$rc reads=$(cat "$_budget_count" 2>/dev/null || true) issue=$(tr '\n' ' ' <"$_budget_issue" 2>/dev/null || true) loop=$(cat "$_budget_loop" 2>/dev/null || true) reviewer=$(cat "$_budget_reviewer" 2>/dev/null || true) handoff=$(cat "$_budget_handoff" 2>/dev/null || true)): $out"
 fi
 
 # Unsafe evidence takes the manual-fallback route rather than a hold. Make the

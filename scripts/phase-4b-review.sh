@@ -527,6 +527,11 @@ fall_back_to_manual() {
   local handoff_ref="$PR"
   local handoff_output="" handoff_rc=0
   [ -n "$REPO" ] && handoff_ref="${REPO}#${PR}"
+  # Every fallback reached after adapter dispatch depends on the same
+  # below-cap request snapshot that authorized that dispatch. Recheck it before
+  # rendering the authority-bearing handoff. The revalidator exits directly on
+  # refusal, so this central guard cannot recurse through this function.
+  revalidate_codex_request_budget_generation pre-post
   require_feedback_accounted
   p4b_warn "falling back to the manual Phase 4b handoff: $why"
   # Accounting (#602): record the fail-closed loop as positive safety
@@ -618,7 +623,7 @@ stop_for_human_tiebreaker() {
 
 stop_for_barrier_error() {
   local payload="$1"
-  p4b_warn "request-budget evidence failed; stopping without adapter dispatch or Phase 4b handoff"
+  p4b_warn "request-budget authority failed; stopping without review publication or Phase 4b handoff"
   jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
         --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" '
@@ -642,6 +647,8 @@ BARRIER_CODERABBIT_CARRIED=""
 # Run the same-head barrier and act on it. Escalation routes to the existing
 # manual handoff; only the non-terminal case takes the new hold path.
 P4B_PRE_ADAPTER_CODEX_EVIDENCE=""
+P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON="null"
+P4B_PRE_ADAPTER_REQUEST_GENERATION=""
 run_same_head_barrier() {
   local where="$1" scope="${2:-all}" out rc=0
   out="$(p4b_same_head_barrier "$REPO" "$PR" "$HEAD" "$REVIEWER" "$DRY_RUN" "$scope")" || rc=$?
@@ -650,6 +657,13 @@ run_same_head_barrier() {
       if [ "$where" = "pre-adapter" ]; then
         P4B_PRE_ADAPTER_CODEX_EVIDENCE="$(printf '%s' "$out" | jq -r '.codex_evidence // "unreadable"')"
       fi
+      case "$where" in
+        pre-adapter|pre-fallback)
+          P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON="$(printf '%s' "$out" | jq -c '.request_budget // null')"
+          P4B_PRE_ADAPTER_REQUEST_GENERATION="$(printf '%s' "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" | \
+            jq -c 'select(.state == "available") | .request_generation // empty')"
+          ;;
+      esac
       # An open barrier is normally silent — every enabled provider reported
       # and there is nothing to say. #1178 adds one shape that opens on a
       # PARTIAL quorum: CodeRabbit refused this head, and Codex alone carries
@@ -725,6 +739,60 @@ cleanup_pre_post_refusal_side_effects() {
     p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: $issue_cause changed before the Phase 4b approval could post; a rerun files fresh follow-ups."
     P4B_CREATED_ISSUE_REFS=""
   fi
+}
+
+# A below-cap request snapshot authorizes adapter dispatch only for the request
+# generation it observed. An exact author-owned `@codex review` can arrive
+# during the long adapter or rendering windows without moving HEAD. Re-read
+# that narrow generation at each authority-bearing exit; current-head Codex
+# reports and trusted timeouts carry no snapshot and therefore pay no extra
+# read or change in precedence.
+#
+# Changed or unreadable evidence exits 10 directly. A clean rerun then observes
+# the new final request and enters the ordinary bounded wait; this invocation
+# must not convert stale budget authority into either a review or manual handoff.
+revalidate_codex_request_budget_generation() {
+  local where="${1:-post-adapter}"
+  local author comments live_generation="" unsafe_budget reason evidence payload
+  [ -n "$P4B_PRE_ADAPTER_REQUEST_GENERATION" ] || return 0
+
+  author="$(p4b_top_field author_identity)"
+  author="${author:-nathanjohnpayne}"
+  if ! comments="$(gh_api_array "repos/$REPO/issues/$PR/comments" \
+    "Codex post-adapter request-generation authority fence")"; then
+    reason="request-generation-reread-failed"
+    evidence="request-generation-unreadable"
+  elif ! live_generation="$(crqe_trigger_generation "$comments" "$author" 2>/dev/null)" \
+       || [ -z "$live_generation" ]; then
+    reason="request-generation-reread-failed"
+    evidence="request-generation-unreadable"
+  elif ! printf '%s' "$live_generation" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    live_generation=""
+    reason="request-generation-reread-failed"
+    evidence="request-generation-unreadable"
+  elif [ "$live_generation" != "$P4B_PRE_ADAPTER_REQUEST_GENERATION" ]; then
+    reason="request-generation-changed"
+    evidence="request-generation-changed"
+  else
+    return 0
+  fi
+
+  unsafe_budget="$(printf '%s' "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" | jq -c \
+    --arg why "$reason" --argjson before "$P4B_PRE_ADAPTER_REQUEST_GENERATION" \
+    --argjson after "${live_generation:-null}" \
+    '. + {state:"unsafe",reason:$why,expected_request_generation:$before,observed_request_generation:$after}')"
+  if [ "$reason" = request-generation-changed ]; then
+    reason="Codex request generation changed during external review; rerun against the current request timeline"
+  else
+    reason="Codex request generation could not be re-read during external review; refusing stale Phase 4b authority"
+  fi
+  if [ "$where" = pre-post ]; then
+    cleanup_pre_post_refusal_side_effects "$reason" true \
+      "Codex request authority" "the governing Codex request generation for ${REPO}#${PR}"
+  fi
+  payload="$(jq -nc --arg r "$reason" --arg ce "$evidence" --argjson b "$unsafe_budget" \
+    '{decision:"error",reason:$r,coderabbit:"unchanged",codex:"escalate",codex_evidence:$ce,request_budget:$b}')"
+  stop_for_barrier_error "$payload"
 }
 
 revalidate_phase4a_timeout_generation() {
@@ -909,6 +977,11 @@ ADAPTER_RC=$?
 set -e
 P4B_ACCT_LOOP_ELAPSED_SECONDS=$(( $(date +%s) - P4B_ACCT_LOOP_STARTED_EPOCH ))
 export P4B_ACCT_LOOP_STARTED_EPOCH P4B_ACCT_LOOP_ELAPSED_SECONDS
+if [ "$DRY_RUN" != true ]; then
+  # This fence precedes adapter rc/schema branching so a failed or malformed
+  # adapter cannot turn a newly occupied final request into a manual handoff.
+  revalidate_codex_request_budget_generation post-adapter
+fi
 if [ "$ADAPTER_RC" -ne 0 ]; then
   if p4b_is_timeout_rc "$ADAPTER_RC"; then
     fall_back_to_manual "adapter timed out after ${ADAPTER_TIMEOUT}s"
@@ -1421,6 +1494,7 @@ post_review() {
   # fallback. This is deliberately not the full provider barrier, so an
   # unrelated late CodeRabbit probe cannot flap a verdict whose ordering
   # evidence was already established.
+  revalidate_codex_request_budget_generation pre-post
   revalidate_phase4a_timeout_generation pre-post
   local live_head
   # #799: the last drift check before a review POSTS. An unreadable read that
