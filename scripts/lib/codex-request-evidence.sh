@@ -11,24 +11,29 @@ crqe_select_trigger() { # comments-json author since
   '
 }
 
-# Count the configured author's exact request commands across a whole PR.
-# Comment IDs, rather than pages or timestamps, are the durable accounting
-# unit: GitHub pagination can repeat an item, while a command can remain the
-# only request evidence when Codex answers with a clean summary or reaction.
-# A malformed qualifying command has no safe count and therefore fails the
-# caller closed instead of being omitted from the budget.
-crqe_count_triggers() { # comments-json author
-  printf '%s\n' "$1" | jq -er --arg author "$2" '
+# Select the immutable comment-ID generation for the configured author's exact
+# request commands across a whole PR. Comment IDs, rather than pages or
+# timestamps, are the durable accounting unit: pagination can repeat an item,
+# while a command can remain the only request evidence when Codex answers with
+# a clean summary or reaction. A malformed qualifying command fails closed.
+crqe_trigger_generation() { # comments-json author
+  printf '%s\n' "$1" | jq -cer --arg author "$2" '
     [ .[]
       | select((.user.login // "") == $author)
       | select((.body // "") | test("\\A@codex review\\z"; "i"))
       | .id
     ] as $ids
     | if all($ids[]; type == "number" and . > 0 and floor == .)
-      then ($ids | unique | length)
+      then ($ids | unique | sort)
       else error("qualifying Codex request comment lacks a positive integer id")
       end
   '
+}
+
+crqe_count_triggers() { # comments-json author
+  local generation
+  generation=$(crqe_trigger_generation "$1" "$2") || return 1
+  printf '%s\n' "$generation" | jq -er 'length'
 }
 
 # Compute the request freshness anchor shared by the requester and Phase 4b

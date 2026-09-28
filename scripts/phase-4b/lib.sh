@@ -557,10 +557,10 @@ p4b_pr_policy_tuple() { # <repo> <pr>
 # request freshness anchor. `final-request-pending` preserves the last
 # request's legitimate wait; it never manufactures a timeout determination.
 p4b_codex_request_budget_state() {
-  local repo="$1" pr="$2" head="$3" config author resolver budget comments count cap
+  local repo="$1" pr="$2" head="$3" config author resolver budget comments generation count cap
   local initial_tuple final_tuple base_ref base_sha default_branch committed timeline threshold seconds epoch anchor selected select_rc=0
   if [ "$P4B_CODEX_REQUEST_BUDGET_OK" != true ] \
-     || ! command -v crqe_governing_budget crqe_count_triggers crqe_select_trigger >/dev/null 2>&1 \
+     || ! command -v crqe_governing_budget crqe_trigger_generation crqe_count_triggers crqe_select_trigger >/dev/null 2>&1 \
      || ! command -v gh_api_array gh_api_scalar >/dev/null 2>&1; then
     jq -nc '{state:"unreadable",reason:"request-budget-helper-unavailable"}'
     return 2
@@ -584,6 +584,8 @@ p4b_codex_request_budget_state() {
     || { jq -nc '{state:"unreadable",reason:"governing-policy-unreadable"}'; return 2; }
   comments=$(gh_api_array "repos/$repo/issues/$pr/comments" "Codex request-attempt evidence") \
     || { jq -nc '{state:"unreadable",reason:"comments-read-failed"}'; return 2; }
+  generation=$(crqe_trigger_generation "$comments" "$author") \
+    || { jq -nc '{state:"unreadable",reason:"request-generation-invalid"}'; return 2; }
   count=$(crqe_count_triggers "$comments" "$author") \
     || { jq -nc '{state:"unreadable",reason:"request-count-invalid"}'; return 2; }
   cap=$(printf '%s' "$budget" | jq -r '.max_request_attempts')
@@ -595,8 +597,8 @@ p4b_codex_request_budget_state() {
     return 2
   fi
   if [ "$count" -lt "$cap" ]; then
-    jq -nc --argjson n "$count" --argjson cap "$cap" \
-      '{state:"available",request_attempts:$n,max_request_attempts:$cap}'
+    jq -nc --argjson n "$count" --argjson cap "$cap" --argjson g "$generation" \
+      '{state:"available",request_attempts:$n,max_request_attempts:$cap,request_generation:$g}'
     return 0
   fi
   committed=$(gh_api_scalar --shape timestamp "Codex cap head commit time" \
@@ -1630,6 +1632,7 @@ p4b_same_head_barrier() {
   local repo="$1" pr="$2" head="$3" reviewer="$4" dry="${5:-false}"
   local root cr_bin cx_bin rc json probe_head cx_timeout_json="" cx_timeout_rc=0
   local cx_budget_json="" cx_budget_rc=0 cx_budget_state=""
+  local cx_generation_expected="" cx_generation_comments="" cx_generation_live="" cx_generation_author=""
   local cx_terminal_json="" cx_terminal_rc=0 cx_terminal_state="" live_report_head=""
   local initial_cls_cx="" initial_cx_evidence=""
   local pending=false why="" trigger="skipped" resume="skipped" cls_cr="disabled" cls_cx="disabled"
@@ -2018,6 +2021,41 @@ p4b_same_head_barrier() {
      && [ "$(p4b_policy_block_field codex allow_phase_4b_substitute)" = "false" ]; then
     cls_cx="escalate"
     why="Phase 4a timed out on $head, but codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c)"
+  fi
+
+  # An `available` budget is authority to continue into Phase 4b. Fence that
+  # authority at the actual open/escalation boundary: a final request can be
+  # appended after the budget's comments snapshot without changing the PR
+  # head/base tuple. Pending outcomes carry no fallback authority and can
+  # observe the new generation on their next bounded retry.
+  if [ "$cx_budget_state" = available ] \
+     && { [ -n "$why" ] || [ "$pending" != true ]; }; then
+    cx_generation_expected="$(printf '%s' "$cx_budget_json" | jq -c '.request_generation // empty' 2>/dev/null || true)"
+    cx_generation_author="$(p4b_top_field author_identity)"
+    cx_generation_author="${cx_generation_author:-nathanjohnpayne}"
+    if [ -z "$cx_generation_expected" ]; then
+      cx_generation_live=""
+    elif cx_generation_comments="$(gh_api_array "repos/$repo/issues/$pr/comments" "Codex request-generation authority fence")"; then
+      cx_generation_live="$(crqe_trigger_generation "$cx_generation_comments" "$cx_generation_author" 2>/dev/null || true)"
+    else
+      cx_generation_live=""
+    fi
+    if [ -z "$cx_generation_expected" ] || [ -z "$cx_generation_live" ]; then
+      pending=false
+      cls_cx="escalate"
+      cx_evidence="request-generation-unreadable"
+      budget_unsafe=true
+      cx_budget_json="$(printf '%s' "$cx_budget_json" | jq -c '. + {state:"unsafe",reason:"request-generation-reread-failed"}')"
+      why="Codex request generation could not be re-read before granting Phase 4b fallback authority"
+    elif [ "$cx_generation_live" != "$cx_generation_expected" ]; then
+      pending=false
+      cls_cx="escalate"
+      cx_evidence="request-generation-changed"
+      budget_unsafe=true
+      cx_budget_json="$(printf '%s' "$cx_budget_json" | jq -c --argjson after "$cx_generation_live" \
+        '. + {state:"unsafe",reason:"request-generation-changed",observed_request_generation:$after}')"
+      why="Codex request generation changed before Phase 4b fallback authority could be granted; rerun against the current request timeline"
+    fi
   fi
 
   # Any outcome other than pending ends this head's wait, so the next not-yet

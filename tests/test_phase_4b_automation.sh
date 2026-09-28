@@ -2706,6 +2706,26 @@ else fail "#674 head-drift pre-check (rc=$rc): $out"; fi
 [ ! -s "$DRIFT_ISSUE_LOG" ] \
   && pass "#674: no issues created for a drifted head" || fail "#674: issues created despite head drift"
 
+# Keep the post-adapter pre-filing fence covered independently of the barrier's
+# earlier head read: the barrier sees the reviewed head, then the next read
+# observes drift before any post-review issue can be created.
+PREFILE_DRIFT_ISSUE_LOG="$WORK/issue-prefile-drift.log"; : > "$PREFILE_DRIFT_ISSUE_LOG"
+PREFILE_DRIFT_WRAPPER_LOG="$WORK/p4b674-prefile-drift-wrapper.log"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$PREFILE_DRIFT_ISSUE_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$PREFILE_DRIFT_WRAPPER_LOG" \
+  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_HEAD2=def456 P4B_FAKE_LIVE_HEAD2_FROM=2 \
+  bash "$ORCH" 1371 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] \
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "refusing to file post-review issues" \
+   && [ "$(cat "$PREFILE_DRIFT_ISSUE_LOG.headreads" 2>/dev/null || printf 0)" -ge 2 ] \
+   && ! grep -q '^ARGV ' "$PREFILE_DRIFT_ISSUE_LOG" \
+   && ! grep -q 'pulls/.*/reviews' "$PREFILE_DRIFT_WRAPPER_LOG" 2>/dev/null; then
+  pass "#674: post-adapter pre-filing fence refuses head drift before any issue or review write"
+else fail "#674 post-adapter pre-filing head fence (rc=$rc): $out"; fi
+
 # #674 round 1: a finding whose wording flags a RISK files under the `risk`
 # label per policy step 9, not a hard-coded `observation`.
 RISK_ISSUE_LOG="$WORK/issue-risk.log"; : > "$RISK_ISSUE_LOG"
@@ -3016,6 +3036,26 @@ if [ "$rc" = 10 ] \
    && [ ! -e "$WRAPPER_LOG" ]; then
   pass "live head drift before posting → authority stop, no review write"
 else fail "stale-head guard (rc=$rc, out=$out, wrapper_log=$(test -e "$WRAPPER_LOG" && cat "$WRAPPER_LOG" || true))"; fi
+
+# A findings-free approval has no issue-filing reads between the barrier and
+# post_review. Make the barrier's first head read succeed, then drift on the
+# second read so this case reaches the final pre-POST head fence directly.
+NO_FINDINGS_DRIFT_LOG="$WORK/no-findings-prepost-drift.log"; : > "$NO_FINDINGS_DRIFT_LOG"
+NO_FINDINGS_DRIFT_WRAPPER="$WORK/no-findings-prepost-drift-wrapper.log"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
+  P4B_ISSUE_LOG="$NO_FINDINGS_DRIFT_LOG" P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" \
+  P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$NO_FINDINGS_DRIFT_WRAPPER" \
+  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_HEAD2=def456 P4B_FAKE_LIVE_HEAD2_FROM=2 \
+  bash "$ORCH" 1271 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] \
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "PR head changed during review" \
+   && [ "$(cat "$NO_FINDINGS_DRIFT_LOG.headreads" 2>/dev/null || printf 0)" -ge 2 ] \
+   && ! grep -q '^ARGV ' "$NO_FINDINGS_DRIFT_LOG" \
+   && ! grep -q 'pulls/.*/reviews' "$NO_FINDINGS_DRIFT_WRAPPER" 2>/dev/null; then
+  pass "findings-free post-adapter pre-POST fence refuses head drift before review write"
+else fail "findings-free post-adapter pre-POST head fence (rc=$rc): $out"; fi
 
 WRAPPER_LOG="$WORK/wrapper-success.log"
 WRAPPER_BODY="$WORK/wrapper-success-body.md"
@@ -4469,6 +4509,65 @@ if [ -z "$bad" ]; then
   pass "#1305: governing request-cap exhaustion stops for a human while final-request polling, old timeout, and current report retain precedence"
 else
   fail "#1305: request-cap barrier routing wrong:$bad"
+fi
+
+# A below-cap comments snapshot cannot grant fallback authority after its
+# request generation changes. The third comments read is the authority fence:
+# timeout detection and budget evaluation see no request, then the final
+# allowed request appears without changing the PR head/base tuple.
+cat >"$WORK/cap-generation-fence.yml" <<'EOF'
+author_identity: nathanjohnpayne
+coderabbit:
+  enabled: false
+  max_wait_seconds: 0
+codex:
+  enabled: true
+  max_review_rounds: 1
+  reaction_freshness_window_seconds: 1800
+EOF
+_cap_generation_after=$(jq -nc --arg now "$_cap_now" \
+  '[{id:6101,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:$now}]')
+bad=""
+
+sed 's/max_review_rounds: 1/max_review_rounds: 2/' \
+  "$WORK/cap-generation-fence.yml" >"$WORK/cap-generation-stable.yml"
+out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-generation-stable.yml" \
+  P4B_TEST_COMMENTS_JSON="$_cap_generation_after" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+  _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-generation-stable.yml" "$_p4a_head" cap-only)" && rc=0 || rc=$?
+[ "$rc" = 0 ] \
+  && [ "$(printf '%s' "$out" | jq -r .decision)" = open ] \
+  || bad="$bad stable-nonempty-generation(rc=$rc,out=$out)"
+
+for _generation_scope in cap-only all; do
+  _generation_race="$WORK/cap-generation-${_generation_scope}.count"
+  rm -f "$_generation_race" "$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-$_p4a_head.pending"
+  out="$(P4B_TEST_COMMENTS_RACE_FILE="$_generation_race" \
+    P4B_TEST_COMMENTS_CHANGE_AFTER=3 P4B_TEST_COMMENTS_JSON_AFTER="$_cap_generation_after" \
+    P4B_TEST_BASE_POLICY_PATH="$WORK/cap-generation-fence.yml" P4B_TEST_COMMENTS_JSON='[]' \
+    P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+    _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-generation-fence.yml" "$_p4a_head" "$_generation_scope")" && rc=0 || rc=$?
+  [ "$rc" = 4 ] \
+    && [ "$(printf '%s' "$out" | jq -r .decision)" = error ] \
+    && [ "$(printf '%s' "$out" | jq -r .request_budget.reason)" = request-generation-changed ] \
+    && [ "$(cat "$_generation_race" 2>/dev/null || true)" = 3 ] \
+    || bad="$bad ${_generation_scope}-generation-race(rc=$rc,out=$out)"
+done
+
+_generation_race="$WORK/cap-generation-unreadable.count"
+rm -f "$_generation_race"
+out="$(P4B_TEST_COMMENTS_RACE_FILE="$_generation_race" P4B_TEST_COMMENTS_FAIL_AFTER=3 \
+  P4B_TEST_BASE_POLICY_PATH="$WORK/cap-generation-fence.yml" P4B_TEST_COMMENTS_JSON='[]' \
+  P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+  _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-generation-fence.yml" "$_p4a_head" cap-only)" && rc=0 || rc=$?
+[ "$rc" = 4 ] \
+  && [ "$(printf '%s' "$out" | jq -r .decision)" = error ] \
+  && [ "$(printf '%s' "$out" | jq -r .request_budget.reason)" = request-generation-reread-failed ] \
+  || bad="$bad unreadable-generation-fence(rc=$rc,out=$out)"
+
+if [ -z "$bad" ]; then
+  pass "#1305: changed or unreadable request generation cannot grant cap-only or expired full-barrier fallback authority"
+else
+  fail "#1305: request-generation authority fence wrong:$bad"
 fi
 
 # An account-blocked Codex must WAIVE, not hold. Phase 4b is the documented
