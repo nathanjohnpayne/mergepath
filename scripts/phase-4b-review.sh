@@ -525,15 +525,14 @@ require_feedback_accounted() {
 fall_back_to_manual() {
   local why="$1"
   local handoff_ref="$PR"
-  local handoff_output="" handoff_rc=0
+  local handoff_output="" handoff_rc=0 handoff_rendered=false
   [ -n "$REPO" ] && handoff_ref="${REPO}#${PR}"
   # Every fallback reached after adapter dispatch depends on the same
   # below-cap request snapshot that authorized that dispatch. Recheck it before
   # rendering the authority-bearing handoff. The revalidator exits directly on
   # refusal, so this central guard cannot recurse through this function.
-  revalidate_codex_request_budget_generation pre-post
+  revalidate_codex_request_budget_authority pre-post
   require_feedback_accounted
-  p4b_warn "falling back to the manual Phase 4b handoff: $why"
   # Accounting (#602): record the fail-closed loop as positive safety
   # evidence. Advisory — a recording failure never alters this fallback.
   # When this invocation's loop is ALREADY in the log (recorded before the
@@ -549,16 +548,22 @@ fall_back_to_manual() {
         || p4b_warn "accounting: could not record the fail-closed loop (continuing)"
     fi
   fi
-  # The feedback gate and advisory fallback accounting above both run external
-  # commands. A final request can arrive after the early fence while either is
-  # in flight, so bind the actual handoff boundary to the same generation too.
-  # Keep the early fence: it performs refusal cleanup before a fallible feedback
-  # read can interrupt that path. This final fence owns the later accounting
-  # window and exits directly on refusal, without recursing through fallback.
-  revalidate_codex_request_budget_generation pre-post
+  # The handoff helper is stdout-only, but it performs its own feedback and PR
+  # metadata reads before returning the rendered block. Capture that read-only
+  # output first; none of it becomes authority until the parent prints it.
   if [ -x "$HANDOFF" ]; then
     handoff_output=$(PHASE_4B_REVIEWER_IDENTITY="$REVIEWER" "$HANDOFF" "$handoff_ref" 2>&1) \
       || handoff_rc=$?
+    handoff_rendered=true
+  fi
+  # The parent feedback gate, advisory accounting, and helper above all run
+  # external commands. Bind their entire window to the request-budget snapshot
+  # at the actual writer boundary. Keep the early fence: it performs refusal
+  # cleanup before a fallible feedback read can interrupt that path. This final
+  # fence is unconditional so a missing helper cannot grant fallback via JSON.
+  revalidate_codex_request_budget_authority pre-post
+  p4b_warn "falling back to the manual Phase 4b handoff: $why"
+  if [ "$handoff_rendered" = true ]; then
     case "$handoff_rc" in
       0) printf '%s\n' "$handoff_output" >&2 ;;
       4)
@@ -748,54 +753,48 @@ cleanup_pre_post_refusal_side_effects() {
   fi
 }
 
-# A below-cap request snapshot authorizes adapter dispatch only for the request
-# generation it observed. An exact author-owned `@codex review` can arrive
-# during the long adapter or rendering windows without moving HEAD. Re-read
-# that narrow generation at each authority-bearing exit; current-head Codex
-# reports and trusted timeouts carry no snapshot and therefore pay no extra
-# read or change in precedence.
+# A below-cap request snapshot authorizes adapter dispatch only while its
+# governing PR tuple, resolved policy budget, and request generation remain
+# current. A base advance/retarget, mutable default-policy fallback, or exact
+# author-owned `@codex review` can change that authority during the long
+# adapter or rendering windows without moving the reviewed head. Re-read that
+# narrow snapshot at each authority-bearing exit; current-head Codex reports
+# and trusted timeouts carry no snapshot and therefore pay no extra read or
+# change in precedence.
 #
 # Changed or unreadable evidence exits 10 directly. A clean rerun then observes
 # the new final request and enters the ordinary bounded wait; this invocation
 # must not convert stale budget authority into either a review or manual handoff.
-revalidate_codex_request_budget_generation() {
+revalidate_codex_request_budget_authority() {
   local where="${1:-post-adapter}"
-  local author comments live_generation="" unsafe_budget reason evidence payload
+  local unsafe_budget="" recheck_rc=0 reason evidence payload
   [ -n "$P4B_PRE_ADAPTER_REQUEST_GENERATION" ] || return 0
 
-  author="$(p4b_top_field author_identity)"
-  author="${author:-nathanjohnpayne}"
-  if ! comments="$(gh_api_array "repos/$REPO/issues/$PR/comments" \
-    "Codex post-adapter request-generation authority fence")"; then
-    reason="request-generation-reread-failed"
-    evidence="request-generation-unreadable"
-  elif ! live_generation="$(crqe_trigger_generation "$comments" "$author" 2>/dev/null)" \
-       || [ -z "$live_generation" ]; then
-    reason="request-generation-reread-failed"
-    evidence="request-generation-unreadable"
-  elif ! printf '%s' "$live_generation" | jq -e 'type == "array"' >/dev/null 2>&1; then
-    live_generation=""
-    reason="request-generation-reread-failed"
-    evidence="request-generation-unreadable"
-  elif [ "$live_generation" != "$P4B_PRE_ADAPTER_REQUEST_GENERATION" ]; then
-    reason="request-generation-changed"
-    evidence="request-generation-changed"
-  else
-    return 0
-  fi
-
-  unsafe_budget="$(printf '%s' "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" | jq -c \
-    --arg why "$reason" --argjson before "$P4B_PRE_ADAPTER_REQUEST_GENERATION" \
-    --argjson after "${live_generation:-null}" \
-    '. + {state:"unsafe",reason:$why,expected_request_generation:$before,observed_request_generation:$after}')"
-  if [ "$reason" = request-generation-changed ]; then
-    reason="Codex request generation changed during external review; rerun against the current request timeline"
-  else
-    reason="Codex request generation could not be re-read during external review; refusing stale Phase 4b authority"
-  fi
+  unsafe_budget="$(p4b_codex_available_authority_revalidate \
+    "$REPO" "$PR" "$HEAD" "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON")" || recheck_rc=$?
+  [ "$recheck_rc" -ne 0 ] || return 0
+  evidence="$(printf '%s' "$unsafe_budget" | jq -r '.reason // "request-budget-authority-unreadable"' \
+    2>/dev/null || printf request-budget-authority-unreadable)"
+  case "$evidence" in
+    request-generation-changed)
+      reason="Codex request generation changed during external review; rerun against the current request timeline"
+      ;;
+    request-generation-reread-failed)
+      reason="Codex request generation could not be re-read during external review; refusing stale Phase 4b authority"
+      ;;
+    pr-policy-tuple-changed)
+      reason="The PR governing policy tuple changed during external review; rerun against the stabilized head and base"
+      ;;
+    governing-budget-changed)
+      reason="The governing Codex request budget changed during external review; rerun under the current base policy"
+      ;;
+    *)
+      reason="Codex governing request-budget authority could not be re-read during external review; refusing stale Phase 4b authority"
+      ;;
+  esac
   if [ "$where" = pre-post ]; then
     cleanup_pre_post_refusal_side_effects "$reason" true \
-      "Codex request authority" "the governing Codex request generation for ${REPO}#${PR}"
+      "Codex request authority" "the governing Codex request-budget snapshot for ${REPO}#${PR}"
   fi
   payload="$(jq -nc --arg r "$reason" --arg ce "$evidence" --argjson b "$unsafe_budget" \
     '{decision:"error",reason:$r,coderabbit:"unchanged",codex:"escalate",codex_evidence:$ce,request_budget:$b}')"
@@ -987,7 +986,7 @@ export P4B_ACCT_LOOP_STARTED_EPOCH P4B_ACCT_LOOP_ELAPSED_SECONDS
 if [ "$DRY_RUN" != true ]; then
   # This fence precedes adapter rc/schema branching so a failed or malformed
   # adapter cannot turn a newly occupied final request into a manual handoff.
-  revalidate_codex_request_budget_generation post-adapter
+  revalidate_codex_request_budget_authority post-adapter
 fi
 if [ "$ADAPTER_RC" -ne 0 ]; then
   if p4b_is_timeout_rc "$ADAPTER_RC"; then
@@ -1492,16 +1491,10 @@ post_review() {
     --request-changes) event="REQUEST_CHANGES" ;;
     *) p4b_die 3 "unsupported review state flag: $state_flag" ;;
   esac
-  # The post-adapter recheck protects every earlier approval-side effect, but
-  # rendering, accounting, and optional step-9 issue filing leave another
-  # window before the review POST. Close it with one final targeted generation
-  # read before the final live-head fence. On a hold, the helper corrects the
-  # provisional accounting record and closes this run's filed follow-ups before
-  # exiting; malformed evidence takes the same cleanup path before the manual
-  # fallback. This is deliberately not the full provider barrier, so an
-  # unrelated late CodeRabbit probe cannot flap a verdict whose ordering
-  # evidence was already established.
-  revalidate_codex_request_budget_generation pre-post
+  # Refuse stale budget authority before the remaining fallible preparation
+  # reads. A second bounded snapshot check below sits at the writer boundary;
+  # this early one preserves cleanup before an intervening read can fail.
+  revalidate_codex_request_budget_authority pre-post
   revalidate_phase4a_timeout_generation pre-post
   local live_head
   # #799: the last drift check before a review POSTS. An unreadable read that
@@ -1545,15 +1538,22 @@ post_review() {
       "the Authoring-Agent declared by ${REPO}#${PR}"
     fall_back_to_manual "$P4B_BODY_DRIFT_REASON"
   fi
-  # Keep the coherent head/base pair as the LAST live read before constructing
-  # the authority payload. Body validation above also reads GitHub, so placing
-  # this fence earlier would leave a fresh base-drift window before POST.
-  # As with late head drift, remove this invocation's filed observations first.
+  # Prepare a coherent expected head/base pair after body validation, which
+  # also reads GitHub. The combined request-budget authority fence below then
+  # performs the final tuple read before constructing the payload. As with late
+  # head drift, remove this invocation's filed observations first.
   if ! revalidate_expected_base pre-post; then
     cleanup_pre_post_refusal_side_effects "$P4B_BASE_FENCE_REASON" true \
       "The PR base" "the base of ${REPO}#${PR}"
     fall_back_to_manual "$P4B_BASE_FENCE_REASON"
   fi
+  # The timeout/head/body/base reads above prepare the final review material
+  # and may outlive the earlier budget check. Revalidate the coherent governing
+  # tuple, resolved request budget, and request generation once more after
+  # those reads and immediately before constructing and posting the payload.
+  # This is a bounded consumer fence, not an atomic GitHub read/write protocol;
+  # a residual network interval remains between this observation and the POST.
+  revalidate_codex_request_budget_authority pre-post
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \
     '{commit_id:$commit_id,event:$event,body:$body}' > "$payload_file"

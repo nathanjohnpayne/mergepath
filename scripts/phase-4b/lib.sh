@@ -598,7 +598,9 @@ p4b_codex_request_budget_state() {
   fi
   if [ "$count" -lt "$cap" ]; then
     jq -nc --argjson n "$count" --argjson cap "$cap" --argjson g "$generation" \
-      '{state:"available",request_attempts:$n,max_request_attempts:$cap,request_generation:$g}'
+      --argjson tuple "$initial_tuple" --argjson budget "$budget" \
+      '{state:"available",request_attempts:$n,max_request_attempts:$cap,request_generation:$g,
+        governing_tuple:$tuple,governing_budget:$budget}'
     return 0
   fi
   committed=$(gh_api_scalar --shape timestamp "Codex cap head commit time" \
@@ -632,6 +634,92 @@ p4b_codex_request_budget_state() {
     jq -nc --argjson n "$count" --argjson cap "$cap" --arg t "$threshold" \
       '{state:"exhausted",request_attempts:$n,max_request_attempts:$cap,threshold:$t}'
   fi
+}
+
+# Revalidate the complete authority carried by an `available` request-budget
+# result without re-probing either review provider. The stable PR tuple binds
+# the policy lookup to the reviewed head/base/default-ref generation; the
+# resolved budget also has to match because a missing base policy may make the
+# resolver consult the mutable default ref. A tuple read on each side of the
+# policy/comments reads keeps this one bounded observation coherent.
+p4b_codex_available_authority_revalidate() { # <repo> <pr> <reviewed-head> <available-snapshot>
+  local repo="$1" pr="$2" head="$3" snapshot="$4"
+  local expected_tuple expected_budget expected_generation live_tuple final_tuple
+  local config author resolver base_ref base_sha default_branch live_budget comments live_generation
+
+  snapshot=$(printf '%s' "$snapshot" | jq -ce '
+    select(type == "object" and .state == "available"
+      and (.request_generation | type == "array")
+      and (.governing_tuple | type == "object")
+      and (.governing_budget | type == "object"))' 2>/dev/null) || {
+    jq -nc '{state:"unsafe",reason:"request-budget-snapshot-invalid"}'
+    return 2
+  }
+  expected_tuple=$(printf '%s' "$snapshot" | jq -cS '.governing_tuple')
+  expected_budget=$(printf '%s' "$snapshot" | jq -cS '.governing_budget')
+  expected_generation=$(printf '%s' "$snapshot" | jq -c '.request_generation')
+
+  live_tuple=$(p4b_pr_policy_tuple "$repo" "$pr") || {
+    printf '%s' "$snapshot" | jq -c '. + {state:"unsafe",reason:"pr-policy-tuple-reread-failed"}'
+    return 2
+  }
+  live_tuple=$(printf '%s' "$live_tuple" | jq -cS '.')
+  if [ "$(printf '%s' "$live_tuple" | jq -r .head_sha)" != "$head" ] \
+     || [ "$live_tuple" != "$expected_tuple" ]; then
+    printf '%s' "$snapshot" | jq -c --argjson after "$live_tuple" \
+      '. + {state:"unsafe",reason:"pr-policy-tuple-changed",observed_governing_tuple:$after}'
+    return 2
+  fi
+
+  config="$(p4b_config)"
+  author="$(p4b_top_field author_identity)"
+  author="${author:-nathanjohnpayne}"
+  resolver="${P4B_RESOLVE_BASE_POLICY:-$P4B_LIB_DIR/../workflow/resolve_base_policy.sh}"
+  base_ref=$(printf '%s' "$live_tuple" | jq -r .base_ref)
+  base_sha=$(printf '%s' "$live_tuple" | jq -r .base_sha)
+  default_branch=$(printf '%s' "$live_tuple" | jq -r .default_branch)
+  live_budget=$(crqe_governing_budget "$repo" "$pr" "$config" "$author" "$resolver" \
+    "$base_ref" "$base_sha" "$default_branch") || {
+    printf '%s' "$snapshot" | jq -c '. + {state:"unsafe",reason:"governing-policy-unreadable"}'
+    return 2
+  }
+  live_budget=$(printf '%s' "$live_budget" | jq -cS '.')
+  if [ "$live_budget" != "$expected_budget" ]; then
+    printf '%s' "$snapshot" | jq -c --argjson after "$live_budget" \
+      '. + {state:"unsafe",reason:"governing-budget-changed",observed_governing_budget:$after}'
+    return 2
+  fi
+
+  comments=$(gh_api_array "repos/$repo/issues/$pr/comments" \
+    "Codex request-budget authority fence") || {
+    printf '%s' "$snapshot" | jq -c '. + {state:"unsafe",reason:"request-generation-reread-failed"}'
+    return 2
+  }
+  live_generation=$(crqe_trigger_generation "$comments" "$author" 2>/dev/null) || {
+    printf '%s' "$snapshot" | jq -c '. + {state:"unsafe",reason:"request-generation-reread-failed"}'
+    return 2
+  }
+  live_generation=$(printf '%s' "$live_generation" | jq -ce 'select(type == "array")' 2>/dev/null) || {
+    printf '%s' "$snapshot" | jq -c '. + {state:"unsafe",reason:"request-generation-reread-failed"}'
+    return 2
+  }
+  if [ "$live_generation" != "$expected_generation" ]; then
+    printf '%s' "$snapshot" | jq -c --argjson after "$live_generation" \
+      '. + {state:"unsafe",reason:"request-generation-changed",observed_request_generation:$after}'
+    return 2
+  fi
+
+  final_tuple=$(p4b_pr_policy_tuple "$repo" "$pr") || {
+    printf '%s' "$snapshot" | jq -c '. + {state:"unsafe",reason:"pr-policy-tuple-reread-failed"}'
+    return 2
+  }
+  final_tuple=$(printf '%s' "$final_tuple" | jq -cS '.')
+  if [ "$final_tuple" != "$live_tuple" ]; then
+    printf '%s' "$snapshot" | jq -c --argjson after "$final_tuple" \
+      '. + {state:"unsafe",reason:"pr-policy-tuple-changed",observed_governing_tuple:$after}'
+    return 2
+  fi
+  printf '%s\n' "$snapshot"
 }
 
 # Re-sample both terminal sources and then bind the result to the live PR head.
@@ -1632,7 +1720,7 @@ p4b_same_head_barrier() {
   local repo="$1" pr="$2" head="$3" reviewer="$4" dry="${5:-false}"
   local root cr_bin cx_bin rc json probe_head cx_timeout_json="" cx_timeout_rc=0
   local cx_budget_json="" cx_budget_rc=0 cx_budget_state=""
-  local cx_generation_expected="" cx_generation_comments="" cx_generation_live="" cx_generation_author=""
+  local cx_budget_recheck="" cx_budget_recheck_rc=0
   local cx_terminal_json="" cx_terminal_rc=0 cx_terminal_state="" live_report_head=""
   local initial_cls_cx="" initial_cx_evidence=""
   local pending=false why="" coderabbit_cause="" trigger="skipped" resume="skipped" cls_cr="disabled" cls_cx="disabled"
@@ -2053,39 +2141,33 @@ p4b_same_head_barrier() {
     why="Phase 4a timed out on $head, but codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c)"
   fi
 
-  # An `available` budget is authority to continue into Phase 4b. Fence that
-  # authority at the actual open/escalation boundary: a final request can be
-  # appended after the budget's comments snapshot without changing the PR
-  # head/base tuple. Pending outcomes carry no fallback authority and can
-  # observe the new generation on their next bounded retry.
+  # An `available` budget is authority to continue into Phase 4b. Fence its
+  # governing tuple, resolved policy budget, and request generation at the
+  # actual open/escalation boundary. Pending outcomes carry no fallback
+  # authority and can observe the new generation on their next bounded retry.
   if [ "$budget_unsafe" != true ] \
      && [ "$cx_budget_state" = available ] \
      && { [ -n "$why" ] || [ "$pending" != true ]; }; then
-    cx_generation_expected="$(printf '%s' "$cx_budget_json" | jq -c '.request_generation // empty' 2>/dev/null || true)"
-    cx_generation_author="$(p4b_top_field author_identity)"
-    cx_generation_author="${cx_generation_author:-nathanjohnpayne}"
-    if [ -z "$cx_generation_expected" ]; then
-      cx_generation_live=""
-    elif cx_generation_comments="$(gh_api_array "repos/$repo/issues/$pr/comments" "Codex request-generation authority fence")"; then
-      cx_generation_live="$(crqe_trigger_generation "$cx_generation_comments" "$cx_generation_author" 2>/dev/null || true)"
-    else
-      cx_generation_live=""
-    fi
-    if [ -z "$cx_generation_expected" ] || [ -z "$cx_generation_live" ]; then
+    cx_budget_recheck_rc=0
+    cx_budget_recheck="$(p4b_codex_available_authority_revalidate \
+      "$repo" "$pr" "$head" "$cx_budget_json")" || cx_budget_recheck_rc=$?
+    if [ "$cx_budget_recheck_rc" -ne 0 ]; then
       pending=false
       cls_cx="escalate"
-      cx_evidence="request-generation-unreadable"
+      cx_evidence="$(printf '%s' "$cx_budget_recheck" | jq -r '.reason // "request-budget-authority-unreadable"' 2>/dev/null || printf request-budget-authority-unreadable)"
       budget_unsafe=true
-      cx_budget_json="$(printf '%s' "$cx_budget_json" | jq -c '. + {state:"unsafe",reason:"request-generation-reread-failed"}')"
-      why="Codex request generation could not be re-read before granting Phase 4b fallback authority"
-    elif [ "$cx_generation_live" != "$cx_generation_expected" ]; then
-      pending=false
-      cls_cx="escalate"
-      cx_evidence="request-generation-changed"
-      budget_unsafe=true
-      cx_budget_json="$(printf '%s' "$cx_budget_json" | jq -c --argjson after "$cx_generation_live" \
-        '. + {state:"unsafe",reason:"request-generation-changed",observed_request_generation:$after}')"
-      why="Codex request generation changed before Phase 4b fallback authority could be granted; rerun against the current request timeline"
+      cx_budget_json="$cx_budget_recheck"
+      case "$cx_evidence" in
+        request-generation-changed)
+          why="Codex request generation changed before Phase 4b fallback authority could be granted; rerun against the current request timeline"
+          ;;
+        request-generation-reread-failed)
+          why="Codex request generation could not be re-read before granting Phase 4b fallback authority"
+          ;;
+        *)
+          why="Codex governing request-budget authority changed or became unreadable before Phase 4b fallback authority could be granted"
+          ;;
+      esac
     fi
   fi
 
