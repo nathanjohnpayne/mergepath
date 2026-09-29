@@ -1082,7 +1082,7 @@ def _find_substitutions(s, quotes_are_literal=False):
             i += 1
             continue
         if c == "$" and s[i + 1 : i + 2] == "(" and s[i + 2 : i + 3] != "(":
-            end = _skip_balanced_parens(s, i + 1)
+            end = _skip_balanced_parens(s, i + 1, shell_source=True)
             out.append((s[i + 2 : end - 1], i, end))
             i = end
             continue
@@ -1095,6 +1095,161 @@ def _find_substitutions(s, quotes_are_literal=False):
             continue
         i += 1
     return out
+
+
+def _is_array_assignment_word(word):
+    """Share the Lexer's existing raw-word compound-array recognition."""
+    return word.endswith("=")
+
+
+def _reserved_word_position(words):
+    # Read only the existing segment prefix.  An ordinary command
+    # consumes this position; time's flags and coproc's optional name
+    # precede a compound command and do not consume it.
+    i = 0
+    while i < len(words):
+        w = words[i]
+        i += 1
+        if w in {"if", "elif", "then", "else", "while", "until", "do", "!", "{"}:
+            continue
+        if w == "time":
+            if words[i : i + 1] == ["-p"]:
+                i += 1
+            # Bash accepts two delimiters; a third is the command.
+            for _ in range(2):
+                if words[i : i + 1] == ["--"]:
+                    i += 1
+            continue
+        if w == "coproc":
+            # Before a compound command Bash accepts either no name
+            # or one name word.  Further words belong to a command.
+            return len(words) - i <= 1
+        return False
+    return True
+
+
+class _CaseContext:
+    """Share subject/in/pattern/body ownership, without matching patterns.
+
+    Each nested case also remembers whether its current pattern has begun;
+    an optional opening parenthesis or alternative makes `esac` pattern data.
+    """
+
+    def __init__(self):
+        self.frames = []
+
+    @property
+    def awaiting_in(self):
+        return bool(self.frames) and self.frames[-1][0] == "in"
+
+    @property
+    def in_pattern(self):
+        return bool(self.frames) and self.frames[-1][0] == "pattern"
+
+    def word(self, raw, reserved):
+        if self.frames:
+            frame = self.frames[-1]
+            if frame[0] == "subject":
+                frame[0] = "in"
+                return
+            if frame[0] == "in":
+                if raw == "in":
+                    frame[0] = "pattern"
+                return
+            if frame[0] == "pattern":
+                # `(esac)` and `x|esac)` are literal patterns. Only a fresh
+                # pattern position can recognize the terminator word.
+                if raw == "esac" and not frame[1]:
+                    self.frames.pop()
+                else:
+                    frame[1] = True
+                return
+            if raw == "esac" and reserved:
+                self.frames.pop()
+                return
+        if raw == "case" and reserved:
+            self.frames.append(["subject", False])
+
+    def begin_pattern(self):
+        if self.in_pattern:
+            self.frames[-1][1] = True
+
+    def close_pattern(self):
+        if not self.in_pattern:
+            return False
+        self.frames[-1][0] = "body"
+        return True
+
+    def end_arm(self):
+        if self.frames and self.frames[-1][0] == "body":
+            self.frames[-1][:] = ["pattern", False]
+
+
+def _heredoc_delimiter(text, start):
+    """Decode the existing << delimiter word; do not inspect or expand its body."""
+    n = len(text)
+    j = start + 2
+    strip_tabs = False
+    if j < n and text[j] == "-":
+        strip_tabs = True
+        j += 1
+    while j < n and text[j] in " \t":
+        j += 1
+    delim_chars = []
+    interpolating = True
+    while j < n:
+        ch = text[j]
+        # `<<$'EOF'` and `<<$"EOF"`.  Bash strips the `$` AND the
+        # quotes and terminates at the bare word, with expansion
+        # disabled.  Stripping only the quotes recorded the
+        # delimiter as `$EOF`, no body line ever matched it, and
+        # the scanner ran to end of file and reported the file as
+        # carrying an unterminated here-doc -- a FALSE finding on
+        # valid shell that reds the required lint gate (#1032
+        # round 6 P2).
+        if ch == "$" and j + 1 < n and text[j + 1] in "'\"":
+            interpolating = False
+            q = text[j + 1]
+            j += 2
+            while j < n and text[j] != q:
+                delim_chars.append(text[j])
+                j += 1
+            j += 1
+            continue
+        if ch in "'\"":
+            interpolating = False
+            q = ch
+            j += 1
+            while j < n and text[j] != q:
+                delim_chars.append(text[j])
+                j += 1
+            j += 1
+            continue
+        if ch == "\\":
+            interpolating = False
+            j += 1
+            if j < n:
+                delim_chars.append(text[j])
+                j += 1
+            continue
+        # The delimiter is a WORD, and a word ends at a shell
+        # METACHARACTER -- not at "the next character outside an
+        # alphanumeric allow-list".  `read x <<E@F` names the
+        # delimiter `E@F`; stopping at the `@` recorded `E`, no
+        # line ever matched it, and the scanner stayed inside a
+        # here-doc body to end of file, missing every later
+        # emitter (#1032 F3).
+        if ch in " \t\n;&|()<>":
+            break
+        delim_chars.append(ch)
+        j += 1
+        continue
+    delim = "".join(delim_chars)
+    return j, delim, interpolating, strip_tabs
+
+
+def _heredoc_terminator(raw, delim, strip_tabs):
+    return (raw.lstrip("\t") if strip_tabs else raw) == delim
 
 
 class Lexer:
@@ -1218,7 +1373,7 @@ class Lexer:
         # pattern terminator; the inner shell text starts with no open case.
         # Keep this stack parallel to `levels` for the same reason quote state
         # is saved and restarted at each substitution/subshell boundary.
-        case_depth = [0]
+        case_context = [_CaseContext()]
         # True while the last structural break was a `|` and no word has been
         # read since.  A pipeline whose `|` ends the physical line CONTINUES
         # on the next one -- `printf '%s' "$PAT" |\n  gh auth login
@@ -1232,42 +1387,15 @@ class Lexer:
         def expanding():
             return "'" not in quotes
 
-        def reserved_word_position():
-            # Read only the existing segment prefix.  An ordinary command
-            # consumes this position; time's flags and coproc's optional name
-            # precede a compound command and do not consume it.
-            words = cur_level()["seg"].words
-            i = 0
-            while i < len(words):
-                w = words[i]
-                i += 1
-                if w in {"if", "elif", "then", "else", "while", "until", "do", "!", "{"}:
-                    continue
-                if w == "time":
-                    if words[i : i + 1] == ["-p"]:
-                        i += 1
-                    if words[i : i + 1] == ["--"]:
-                        i += 1
-                    continue
-                if w == "coproc":
-                    # Before a compound command Bash accepts either no name
-                    # or one name word.  Further words belong to a command.
-                    return len(words) - i <= 1
-                return False
-            return True
-
         def finish_word():
             lv = cur_level()
             if lv["word"]:
                 w = "".join(lv["word"])
-                reserved = reserved_word_position()
+                reserved = _reserved_word_position(lv["seg"].words)
                 lv["seg"].words.append(w)
                 lv["word"] = []
                 pipe_open[0] = False
-                if w == "case" and reserved:
-                    case_depth[-1] += 1
-                elif w == "esac" and reserved and case_depth[-1] > 0:
-                    case_depth[-1] -= 1
+                case_context[-1].word(w, reserved)
 
         def in_assign_prefix():
             """True when the reference sits in an env-assignment PREFIX.
@@ -1321,8 +1449,7 @@ class Lexer:
                 if eol == -1:
                     eol = n
                 raw = text[i:eol]
-                probe = raw.lstrip("\t") if in_heredoc.strip_tabs else raw
-                if probe == in_heredoc.delim:
+                if _heredoc_terminator(raw, in_heredoc.delim, in_heredoc.strip_tabs):
                     # Graded WHOLE, at the terminator, rather than line by
                     # line: a `$( )` in the body can span lines, and a
                     # per-line scan can only see names (#1032 F4).
@@ -1416,7 +1543,7 @@ class Lexer:
                             "saved_quotes": quotes,
                         }
                     )
-                    case_depth.append(0)
+                    case_context.append(_CaseContext())
                     quotes = []
                     i += 2
                     continue
@@ -1530,6 +1657,32 @@ class Lexer:
                 i = close + 1
                 continue
 
+            # Extglob parentheses belong to the case-pattern WORD.  Its
+            # alternatives are not pipelines, and its inner close cannot
+            # terminate the case pattern or its enclosing substitution.
+            # Actual subshells retain enclosing-case eligibility; optional
+            # pattern parentheses stay in their existing shell level.
+            # Quotes/escapes and actual substitutions have already taken
+            # their own paths, so an operator must be current and unquoted.
+            lv = cur_level()
+            if (
+                c in "?*+@!"
+                and text[i + 1 : i + 2] == "("
+                and (case_context[-1].frames or lv.get("enclosing_case", False))
+            ):
+                lv["pattern_parens"] = lv.get("pattern_parens", 0) + 1
+                lv["word"].append(c + "(")
+                i += 2
+                continue
+            if lv.get("pattern_parens", 0) and c in "()|":
+                if c == "(":
+                    lv["pattern_parens"] += 1
+                elif c == ")":
+                    lv["pattern_parens"] -= 1
+                lv["word"].append(c)
+                i += 1
+                continue
+
             # ---- here-doc / here-string openers ----
             if c == "<" and i + 1 < n and text[i + 1] == "<":
                 if i + 2 < n and text[i + 2] == "<":
@@ -1537,63 +1690,7 @@ class Lexer:
                     cur_level()["seg"].words.append("<<<")
                     i += 3
                     continue
-                j = i + 2
-                strip_tabs = False
-                if j < n and text[j] == "-":
-                    strip_tabs = True
-                    j += 1
-                while j < n and text[j] in " \t":
-                    j += 1
-                delim_chars = []
-                interpolating = True
-                while j < n:
-                    ch = text[j]
-                    # `<<$'EOF'` and `<<$"EOF"`.  Bash strips the `$` AND the
-                    # quotes and terminates at the bare word, with expansion
-                    # disabled.  Stripping only the quotes recorded the
-                    # delimiter as `$EOF`, no body line ever matched it, and
-                    # the scanner ran to end of file and reported the file as
-                    # carrying an unterminated here-doc -- a FALSE finding on
-                    # valid shell that reds the required lint gate (#1032
-                    # round 6 P2).
-                    if ch == "$" and j + 1 < n and text[j + 1] in "'\"":
-                        interpolating = False
-                        q = text[j + 1]
-                        j += 2
-                        while j < n and text[j] != q:
-                            delim_chars.append(text[j])
-                            j += 1
-                        j += 1
-                        continue
-                    if ch in "'\"":
-                        interpolating = False
-                        q = ch
-                        j += 1
-                        while j < n and text[j] != q:
-                            delim_chars.append(text[j])
-                            j += 1
-                        j += 1
-                        continue
-                    if ch == "\\":
-                        interpolating = False
-                        j += 1
-                        if j < n:
-                            delim_chars.append(text[j])
-                            j += 1
-                        continue
-                    # The delimiter is a WORD, and a word ends at a shell
-                    # METACHARACTER -- not at "the next character outside an
-                    # alphanumeric allow-list".  `read x <<E@F` names the
-                    # delimiter `E@F`; stopping at the `@` recorded `E`, no
-                    # line ever matched it, and the scanner stayed inside a
-                    # here-doc body to end of file, missing every later
-                    # emitter (#1032 F3).
-                    if ch in " \t\n;&|()<>":
-                        break
-                    delim_chars.append(ch)
-                    j += 1
-                    continue
-                delim = "".join(delim_chars)
+                j, delim, interpolating, strip_tabs = _heredoc_delimiter(text, i)
                 if delim:
                     hd = HereDoc(delim, interpolating, strip_tabs, cur_level()["seg"])
                     pending_heredocs.append(hd)
@@ -1630,8 +1727,14 @@ class Lexer:
                 continue
 
             if c == ";":
+                finish_word()
+                arm_end = next(
+                    (op for op in (";;&", ";;", ";&") if text.startswith(op, i)), None
+                )
+                if arm_end:
+                    case_context[-1].end_arm()
                 start_segment()
-                i += 1
+                i += len(arm_end) if arm_end else 1
                 continue
 
             # ---- redirection operators ----
@@ -1654,7 +1757,7 @@ class Lexer:
                         "saved_quotes": quotes,
                     }
                 )
-                case_depth.append(0)
+                case_context.append(_CaseContext())
                 quotes = []
                 i += 2
                 continue
@@ -1703,6 +1806,12 @@ class Lexer:
                 i += 1
                 continue
 
+            if c == "|" and case_context[-1].in_pattern:
+                case_context[-1].begin_pattern()
+                cur_level()["word"].append(c)
+                i += 1
+                continue
+
             if c == "|":
                 if i + 1 < n and text[i + 1] == "|":
                     start_segment()
@@ -1719,7 +1828,16 @@ class Lexer:
 
             if c == "(":
                 word_so_far = "".join(cur_level()["word"])
-                if word_so_far.endswith("="):
+                if case_context[-1].awaiting_in and word_so_far:
+                    # `in(` ends the header word before opening the pattern.
+                    finish_word()
+                    word_so_far = ""
+                if case_context[-1].in_pattern:
+                    case_context[-1].begin_pattern()
+                    cur_level()["word"].append(c)
+                    i += 1
+                    continue
+                if _is_array_assignment_word(word_so_far):
                     # An ARRAY ASSIGNMENT.  `args=(echo "$PAT")` stores two
                     # strings and writes nothing; reading the `(` as a command
                     # position is how #1012 round 4 flagged it.  The whole
@@ -1772,11 +1890,13 @@ class Lexer:
                             "capture": False,
                             "subshell": True,
                             "kind": "subshell",
+                            "enclosing_case": bool(case_context[-1].frames)
+                            or cur_level().get("enclosing_case", False),
                             "word": [],
                             "saved_quotes": quotes,
                         }
                     )
-                    case_depth.append(0)
+                    case_context.append(_CaseContext())
                     quotes = []
                     i += 1
                     continue
@@ -1785,22 +1905,11 @@ class Lexer:
                 continue
 
             if c == ")":
-                if (
-                    case_depth[-1] > 0
-                    and reserved_word_position()
-                    and "".join(cur_level()["word"]) == "esac"
-                ):
-                    # `esac)` closes the case before the same `)` closes its
-                    # surrounding command substitution.  Finish the reserved
-                    # word first so it cannot be mistaken for another case
-                    # pattern.
+                if case_context[-1].frames:
+                    # Finish esac before deciding whether this close still
+                    # belongs to a pattern or to the surrounding shell.
                     finish_word()
-                if case_depth[-1] > 0 and cur_level()["word"]:
-                    # `case x in pat)`: the nonempty word is the pattern in
-                    # THIS shell level.  Test this before a command-
-                    # substitution close, but only against this level's case
-                    # state; an outer case arm must not capture an inner `$()`
-                    # close as its own pattern terminator.
+                if case_context[-1].close_pattern():
                     start_segment()
                     i += 1
                     continue
@@ -1809,21 +1918,9 @@ class Lexer:
                     kind = levels[-1]["kind"]
                     quotes = levels[-1]["saved_quotes"]
                     levels.pop()
-                    case_depth.pop()
+                    case_context.pop()
                     if kind == "cmdsub":
                         cur_level()["word"].append("$()")
-                    elif case_depth[-1] > 0:
-                        # `case x in (pat) cmd ;;` -- the pattern's `)` ends
-                        # the pattern, and the command after it is its own
-                        # segment.
-                        start_segment()
-                    i += 1
-                    continue
-                if case_depth[-1] > 0:
-                    # `case x in pat) cmd ;;` -- an unmatched `)` inside a
-                    # case body is a pattern terminator, never part of the
-                    # command, so the emitter after it heads its own segment.
-                    start_segment()
                     i += 1
                     continue
                 cur_level()["word"].append(c)
@@ -1884,22 +1981,47 @@ def _find_backtick_close(text, start):
     return None
 
 
-def _skip_balanced_parens(text, start):
-    """Return just past the matching close, preserving shell versus word data.
+def _skip_balanced_parens(text, start, shell_source=False):
+    """Return past the matching close, keeping shell syntax out of word data.
 
-    Comment entry is a forward word-boundary decision.  Parameter operands
-    and extglob/arithmetic parentheses are word data; command substitutions
-    restart shell context and return to the enclosing word.
+    Arrays are word lists, while command/process substitutions start shell
+    source. Only shell frames send complete words to the shared case context
+    or queue here-doc bodies. All frames retain the existing quote/span rules.
     """
-    parens = ["shell"]
+    def frame(kind):
+        return {
+            "kind": kind,
+            "case": _CaseContext() if kind == "shell" else None,
+            "words": [],
+            "word_start": None,
+            "heredocs": [],
+        }
+
+    parens = [frame("shell" if shell_source else "array")]
     i = start + 1
     n = len(text)
     quotes = []
     parameter_depth = 0
-    word_started = False
     glob_prefix = False
+
+    def begin_word(pos):
+        if parens[-1]["word_start"] is None:
+            parens[-1]["word_start"] = pos
+
+    def finish_word(pos):
+        current = parens[-1]
+        word_start = current["word_start"]
+        if word_start is not None:
+            if current["case"] is not None:
+                raw = text[word_start:pos].replace("\\\n", "")
+                current["case"].word(raw, _reserved_word_position(current["words"]))
+                current["words"].append(raw)
+            current["word_start"] = None
+
     while i < n:
         c = text[i]
+        current = parens[-1]
+        case = current["case"]
         if quotes and quotes[-1] == "'":
             if c == "'":
                 quotes.pop()
@@ -1907,7 +2029,7 @@ def _skip_balanced_parens(text, start):
             continue
         if c == "\\":
             if text[i + 1 : i + 2] != "\n":
-                word_started = True
+                begin_word(i)
                 glob_prefix = False
             i += 2
             continue
@@ -1916,31 +2038,30 @@ def _skip_balanced_parens(text, start):
             and text[i + 1 : i + 2] == "("
             and (text[i + 2 : i + 3] != "(" or not (quotes or parameter_depth))
         ):
+            begin_word(i)
             if text[i + 2 : i + 3] != "(":
-                i = _skip_balanced_parens(text, i + 1)
+                i = _skip_balanced_parens(text, i + 1, shell_source=True)
             else:
-                # Retain ordinary balanced arithmetic counting, but its
-                # closes belong to a word rather than a shell separator.
-                parens.append("word")
+                # Keep the existing balanced arithmetic word-frame behavior.
+                parens.append(frame("word"))
                 i += 2
-            word_started = True
             glob_prefix = False
             continue
         if c == "`":
+            begin_word(i)
             close = _find_backtick_close(text, i + 1)
             i = n if close is None else close + 1
-            word_started = True
             glob_prefix = False
             continue
         if c == "$" and not quotes and text[i + 1 : i + 2] == "{":
+            begin_word(i)
             parameter_depth += 1
-            word_started = True
             glob_prefix = False
             i += 2
             continue
         if c == "'" and not (quotes and quotes[-1] == '"'):
             quotes.append("'")
-            word_started = True
+            begin_word(i)
             glob_prefix = False
             i += 1
             continue
@@ -1949,36 +2070,104 @@ def _skip_balanced_parens(text, start):
                 quotes.pop()
             else:
                 quotes.append('"')
-            word_started = True
+            begin_word(i)
             glob_prefix = False
             i += 1
             continue
         if quotes:
             i += 1
             continue
+        if c in "<>" and text[i + 1 : i + 2] == "(":
+            # Shell inside, word outside: the body may contain comments but
+            # a following # continues this word rather than starting one.
+            begin_word(i)
+            i = _skip_balanced_parens(text, i + 1, shell_source=True)
+            glob_prefix = False
+            continue
         if parameter_depth:
             if c == "}":
                 parameter_depth -= 1
-            # Ordinary parentheses and hashes in an operand are data.
             i += 1
             continue
-        if c == "#" and parens[-1] == "shell" and not word_started:
+        if c == "#" and current["kind"] != "word" and current["word_start"] is None:
             eol = text.find("\n", i)
             i = n if eol == -1 else eol
             continue
+        if case is not None and text.startswith("<<", i):
+            finish_word(i)
+            if text.startswith("<<<", i):
+                current["words"].append("<<<")
+                i += 3
+            else:
+                i, delim, _interpolating, strip_tabs = _heredoc_delimiter(text, i)
+                if delim:
+                    current["heredocs"].append((delim, strip_tabs))
+                    current["words"].append("<<")
+            glob_prefix = False
+            continue
         if c == "(":
-            kind = "word" if glob_prefix or parens[-1] == "word" else "shell"
-            parens.append(kind)
-            word_started = kind == "word"
+            if glob_prefix or current["kind"] == "word":
+                parens.append(frame("word"))
+            else:
+                word_start = current["word_start"]
+                raw = "" if word_start is None else text[word_start:i].replace("\\\n", "")
+                if case is not None and case.awaiting_in:
+                    finish_word(i)
+                if case is not None and case.in_pattern:
+                    case.begin_pattern()
+                    begin_word(i)
+                elif case is not None and _is_array_assignment_word(raw):
+                    # The complete assignment is one enclosing word; its
+                    # elements are array data, including case/esac literals.
+                    i = _skip_balanced_parens(text, i)
+                    glob_prefix = False
+                    continue
+                else:
+                    finish_word(i)
+                    parens.append(frame("shell"))
         elif c == ")":
-            kind = parens.pop()
-            if not parens:
-                return i + 1
-            word_started = kind == "word"
-        elif parens[-1] == "shell" and (c.isspace() or c in ";&|<>"):
-            word_started = False
+            finish_word(i)
+            if case is not None and case.close_pattern():
+                current["words"].clear()
+            else:
+                kind = parens.pop()["kind"]
+                if not parens:
+                    return i + 1
+                if kind != "word":
+                    parens[-1]["word_start"] = None
+                    parens[-1]["words"].clear()
+        elif c == "|" and case is not None and case.in_pattern:
+            case.begin_pattern()
+            begin_word(i)
+        elif current["kind"] != "word" and (c.isspace() or c in ";&|<>"):
+            finish_word(i)
+            if c == ";" and case is not None:
+                arm_end = next(
+                    (op for op in (";;&", ";;", ";&") if text.startswith(op, i)), None
+                )
+                if arm_end:
+                    case.end_arm()
+                    i += len(arm_end) - 1
+            if c in "\n;&|":
+                current["words"].clear()
+            if c == "\n" and current["heredocs"]:
+                # Body and delimiter lines are data: neither sends word or
+                # close events to the enclosing shell's case context.
+                i += 1
+                for delim, strip_tabs in current["heredocs"]:
+                    while i < n:
+                        eol = text.find("\n", i)
+                        if eol == -1:
+                            eol = n
+                        raw = text[i:eol]
+                        i = min(eol + 1, n)
+                        if _heredoc_terminator(raw, delim, strip_tabs):
+                            break
+                current["heredocs"].clear()
+                glob_prefix = False
+                continue
         else:
-            word_started = True
+            begin_word(i)
         glob_prefix = c in "?*+@!"
         i += 1
     return n
@@ -2879,7 +3068,7 @@ def _find_compound_close(text, open_idx):
         ):
             # Keep the enclosing function's quote and delimiter state out of
             # the nested command substitution's independent shell text.
-            i = _skip_balanced_parens(text, i + 1)
+            i = _skip_balanced_parens(text, i + 1, shell_source=True)
             continue
         if c == "#" and not quotes and (i == 0 or text[i - 1] in _WORD_BREAK_BEFORE_COMMENT):
             eol = text.find("\n", i)
@@ -3087,7 +3276,7 @@ def _word_has_verbatim_positional(w):
             and w[i + 1 : i + 2] == "("
             and w[i + 2 : i + 3] != "("
         ):
-            close = _skip_balanced_parens(w, i + 1)
+            close = _skip_balanced_parens(w, i + 1, shell_source=True)
             if _word_has_verbatim_positional(w[i + 2 : close - 1]):
                 return True
             i = close
@@ -4811,6 +5000,582 @@ CORPUS = [
         'helper-xtrace-ordinary-coproc-argument-control',
         MUST_NOT_FLAG,
         'safe(){ set -x; : "$(echo coproc case; : \'$1\')"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    # Shell bodies inside process words, case-pattern word parentheses, and
+    # the bounded time prefix must preserve the surrounding quote context.
+    (
+        'array-process-input-hash',
+        MUST_FLAG,
+        'args=("$(printf \'%s\' <(printf x)#bar)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'array-process-input-hash-safe-control',
+        MUST_NOT_FLAG,
+        'args=("$(printf \'%s\' <(printf x)#bar)"); : "$GH_TOKEN"\n',
+    ),
+    (
+        'array-process-input-inner-comment',
+        MUST_FLAG,
+        'args=("$(printf \'%s\' <(printf x # ) fake close\n)#bar)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'array-process-output-hash',
+        MUST_FLAG,
+        'args=("$(printf \'%s\' >(printf x)#bar)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'array-process-output-hash-safe-control',
+        MUST_NOT_FLAG,
+        'args=("$(printf \'%s\' >(printf x)#bar)"); : "$GH_TOKEN"\n',
+    ),
+    (
+        'array-process-output-inner-comment',
+        MUST_FLAG,
+        'args=("$(printf \'%s\' >(printf x # ) fake close\n)#bar)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'array-process-real-comment',
+        MUST_FLAG,
+        'args=("$(printf \'%s\' <(printf x) # ) fake close\n)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'array-process-quoted-literal',
+        MUST_FLAG,
+        'args=("$(printf \'%s\' "<(printf x)#bar")"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'array-process-escaped-literal',
+        MUST_FLAG,
+        'args=("$(printf \'%s\' \\<\\(printf\\ x\\)#bar)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-at-literal-control',
+        MUST_NOT_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case x in @(x|y)) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-at-active',
+        MUST_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case x in @(x|y)) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-question-literal-control',
+        MUST_NOT_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case x in ?(x|y)) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-question-active',
+        MUST_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case x in ?(x|y)) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-star-literal-control',
+        MUST_NOT_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case x in *(x|y)) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-star-active',
+        MUST_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case x in *(x|y)) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-plus-literal-control',
+        MUST_NOT_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case x in +(x|y)) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-plus-active',
+        MUST_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case x in +(x|y)) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-not-literal-control',
+        MUST_NOT_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case x in !(z)) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-not-active',
+        MUST_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case x in !(z)) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-prefixed-literal-control',
+        MUST_NOT_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case prex in pre@(x|y)) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-prefixed-active',
+        MUST_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case prex in pre@(x|y)) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-nested-literal-control',
+        MUST_NOT_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case y in @(x|+(y))) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-nested-active',
+        MUST_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case y in @(x|+(y))) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-optional-open-literal-control',
+        MUST_NOT_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case x in (@(x|y)) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-optional-open-active',
+        MUST_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case x in (@(x|y)) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-optional-open-nested-literal-control',
+        MUST_NOT_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case y in (pre@(x)|@(x|+(y))) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-optional-open-nested-active',
+        MUST_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case y in (pre@(x)|@(x|+(y))) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-alternatives-literal-control',
+        MUST_NOT_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case y in @(x)|@(y)) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-alternatives-active',
+        MUST_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case y in @(x)|@(y)) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-quoted-literal-control',
+        MUST_NOT_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case \'@(x|y)\' in "@(x|y)") : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-quoted-active',
+        MUST_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case \'@(x|y)\' in "@(x|y)") : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-escaped-literal-control',
+        MUST_NOT_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case \'@(x|y)\' in \\@\\(x\\|y\\)) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-escaped-active',
+        MUST_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case \'@(x|y)\' in \\@\\(x\\|y\\)) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-bare-literal-control',
+        MUST_NOT_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case x in x) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-case-pattern-bare-active',
+        MUST_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case x in x) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-time-two-delimiters-literal-control',
+        MUST_NOT_FLAG,
+        'safe(){ set -x; : "$(time -- -- case x in x) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-time-two-delimiters-active',
+        MUST_FLAG,
+        'safe(){ set -x; : "$(time -- -- case x in x) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-time-portable-two-delimiters-literal-control',
+        MUST_NOT_FLAG,
+        'safe(){ set -x; : "$(time -p -- -- case x in x) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-time-portable-two-delimiters-active',
+        MUST_FLAG,
+        'safe(){ set -x; : "$(time -p -- -- case x in x) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-time-third-delimiter-command',
+        MUST_FLAG,
+        'safe(){ set -x; : "$(time -- -- -- case x in x) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-time-portable-third-delimiter-command',
+        MUST_FLAG,
+        'safe(){ set -x; : "$(time -p -- -- -- case x in x) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-time-duplicate-portable-command',
+        MUST_FLAG,
+        'safe(){ set -x; : "$(time -p -p case x in x) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-time-portable-after-delimiter-command',
+        MUST_FLAG,
+        'safe(){ set -x; : "$(time -- -p case x in x) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    # Shell case closes and here-doc body data must stay inside the span
+    # that owns them, including when nested inside a double-quoted array.
+    (
+        'span-bare-case-later-emitter',
+        MUST_FLAG,
+        'args=("$(case x in x) printf \'%s\' \'")\';; esac)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-optional-open-control',
+        MUST_FLAG,
+        'args=("$(case x in (x) printf \'%s\' \'")\';; esac)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-bare-case-no-emitter',
+        MUST_NOT_FLAG,
+        'args=("$(case x in x) printf \'%s\' \'")\';; esac)"); : "$GH_TOKEN"\n',
+    ),
+    (
+        'span-bare-case-no-quote-control',
+        MUST_FLAG,
+        'args=("$(case x in x) printf \'%s\' ok;; esac)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-extglob-case-later-emitter',
+        MUST_FLAG,
+        'shopt -s extglob\nargs=("$(case x in @(x|y)) printf \'%s\' \'")\';; esac)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-optional-esac-array',
+        MUST_FLAG,
+        'args=("$(case esac in (esac) printf \'%s\' \'")\';; esac)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-alternative-esac-array',
+        MUST_FLAG,
+        'args=("$(case esac in (x|esac) printf \'%s\' \'")\';; esac)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-bare-alternative-esac-array',
+        MUST_FLAG,
+        'args=("$(case esac in x|esac) printf \'%s\' \'")\';; esac)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-keyword-subject-array',
+        MUST_FLAG,
+        'args=(case esac); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-empty-subject',
+        MUST_FLAG,
+        'case "" in "") echo "$GH_TOKEN";; esac\n',
+    ),
+    (
+        'span-empty-subsubject',
+        MUST_FLAG,
+        'case "$(printf %s "")" in "") echo "$GH_TOKEN";; esac\n',
+    ),
+    (
+        'span-quoted-case-body',
+        MUST_FLAG,
+        'args=("$(cat <<\'EOF\'\ncase x in\nEOF\n)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-quoted-case-body-safe',
+        MUST_NOT_FLAG,
+        'args=("$(cat <<\'EOF\'\ncase x in\nEOF\n)"); : "$GH_TOKEN"\n',
+    ),
+    (
+        'span-unquoted-case-body',
+        MUST_FLAG,
+        'args=("$(cat <<EOF\ncase x in\nEOF\n)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-double-quoted-case-body',
+        MUST_FLAG,
+        'args=("$(cat <<"EOF"\ncase x in\nEOF\n)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-tab-stripped-case-body',
+        MUST_FLAG,
+        'args=("$(cat <<-\'EOF\'\n\tcase x in\n\tEOF\n)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-escaped-delimiter-case-body',
+        MUST_FLAG,
+        'args=("$(cat <<\\EOF\ncase x in\nEOF\n)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-nonword-delimiter-case-body',
+        MUST_FLAG,
+        'args=("$(cat <<\'E@F\'\ncase x in\nE@F\n)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-heredoc-inside-case-arm',
+        MUST_FLAG,
+        'args=("$(case x in x) cat <<\'EOF\'\nesac\nEOF\n;; esac)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-quoted-fake-close-body',
+        MUST_FLAG,
+        'args=("$(cat <<\'EOF\'\ncase x in x) \'")\'\nEOF\n)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-unquoted-expanding-case-body',
+        MUST_NOT_FLAG,
+        'args=("$(cat <<EOF\ncase x in $GH_TOKEN\nEOF\n)"); : ok\n',
+    ),
+    (
+        'span-newline-keyword-pattern',
+        MUST_FLAG,
+        'args=("$(case case in\ncase) printf \'%s\' \'")\';; esac)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-nested-case',
+        MUST_FLAG,
+        'args=("$(case x in x) case y in y) printf \'%s\' \'")\';; esac;; esac)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-ordinary-keyword-argument',
+        MUST_FLAG,
+        'args=("$(echo case; printf \'%s\' \'")\')"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-ordinary-esac-argument',
+        MUST_FLAG,
+        'args=("$(case x in x) echo esac; printf \'%s\' \'")\';; esac)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-quoted-command-keyword',
+        MUST_FLAG,
+        'args=("$("case" x in x)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-escaped-command-keyword',
+        MUST_FLAG,
+        'args=("$(\\case x in x)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-empty-case',
+        MUST_FLAG,
+        'args=("$(case x in esac)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-spaced-esac-alternative',
+        MUST_FLAG,
+        'args=("$(case esac in x | esac) printf \'%s\' \'")\';; esac)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-empty-subject-capture',
+        MUST_FLAG,
+        'args=("$(case "$(printf %s "")" in "") printf \'%s\' \'")\';; esac)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-arm-end-double-semi',
+        MUST_FLAG,
+        'args=("$(case x in x) : ;;\ncase) printf \'%s\' \'")\';; esac)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-arm-end-fallthrough',
+        MUST_FLAG,
+        'args=("$(case x in x) : ;&\ncase) printf \'%s\' \'")\';; esac)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-arm-end-retest',
+        MUST_FLAG,
+        'args=("$(case x in x) : ;;&\ncase) printf \'%s\' \'")\';; esac)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-two-pending-heredocs',
+        MUST_FLAG,
+        'args=("$(cat <<\'A\' <<-\'B\'\ncase x in\nA\n\tcase y in y) \'")\'\n\tB\n)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-nested-command-heredoc',
+        MUST_FLAG,
+        'args=("$(printf \'%s\' "$(cat <<\'EOF\'\ncase x in x) \'")\'\nEOF\n)")"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-herestring',
+        MUST_FLAG,
+        'args=("$(cat <<<\'case x in\')"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-timed-case',
+        MUST_FLAG,
+        'args=("$(time case x in x) printf \'%s\' \'")\';; esac)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-coproc-case',
+        MUST_FLAG,
+        'args=("$(coproc worker case x in x) printf \'%s\' \'")\';; esac; wait)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-subshell-case',
+        MUST_FLAG,
+        'args=("$( (case x in x) printf \'%s\' \'")\';; esac))"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-case-nested-cmdsub',
+        MUST_FLAG,
+        'args=("$(case x in x) printf \'%s\' "$(case y in y) printf \'%s\' \'")\';; esac)";; esac)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'span-helper-case-active',
+        MUST_FLAG,
+        'die(){ echo "$(case x in x) printf \'%s\' \'")\';; esac) $1" >&2; }; die "$GH_TOKEN"\n',
+    ),
+    (
+        'span-helper-case-silent',
+        MUST_NOT_FLAG,
+        'die(){ : "$(case x in x) printf \'%s\' \'")\';; esac) $1" >&2; }; die "$GH_TOKEN"\n',
+    ),
+    # A nested assignment is still array data, and an adjacent pattern
+    # opener finishes the case header word before deciding its role.
+    (
+        'boundary-nested-array-case-data',
+        MUST_FLAG,
+        'args=("$(vals=(case x in); printf \'%s\' \'")\')"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-nested-array-ordinary-word-control',
+        MUST_FLAG,
+        'args=("$(vals=(x case x in); printf \'%s\' \'")\')"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-nested-array-safe-control',
+        MUST_NOT_FLAG,
+        'args=("$(vals=(case x in); printf \'%s\' \'")\')"); : "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-helper-case-adjacent-pattern-literal',
+        MUST_NOT_FLAG,
+        'safe(){ set -x; : "$(case x in(x) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-helper-case-adjacent-pattern-active',
+        MUST_FLAG,
+        'safe(){ set -x; : "$(case x in(x) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-helper-case-spaced-pattern-literal',
+        MUST_NOT_FLAG,
+        'safe(){ set -x; : "$(case x in (x) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-helper-case-spaced-pattern-active',
+        MUST_FLAG,
+        'safe(){ set -x; : "$(case x in (x) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-helper-case-adjacent-extglob-literal',
+        MUST_NOT_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case x in(@(x|y)) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-helper-case-adjacent-extglob-active',
+        MUST_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case x in(@(x|y)) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-helper-case-spaced-extglob-literal',
+        MUST_NOT_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case x in (@(x|y)) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-helper-case-spaced-extglob-active',
+        MUST_FLAG,
+        'shopt -s extglob\nsafe(){ set -x; : "$(case x in (@(x|y)) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-nested-array-append-silent',
+        MUST_NOT_FLAG,
+        'args=("$(vals+=(case x in); printf \'%s\' \'")\')"); : "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-nested-array-append-active',
+        MUST_FLAG,
+        'args=("$(vals+=(case x in); printf \'%s\' \'")\')"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-nested-array-declared-silent',
+        MUST_NOT_FLAG,
+        'args=("$(declare -a vals=(case x in); printf \'%s\' \'")\')"); : "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-nested-array-declared-active',
+        MUST_FLAG,
+        'args=("$(declare -a vals=(case x in); printf \'%s\' \'")\')"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-nested-array-readonly-silent',
+        MUST_NOT_FLAG,
+        'args=("$(readonly -a vals=(case x in); printf \'%s\' \'")\')"); : "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-nested-array-readonly-active',
+        MUST_FLAG,
+        'args=("$(readonly -a vals=(case x in); printf \'%s\' \'")\')"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-nested-array-exported-silent',
+        MUST_NOT_FLAG,
+        'args=("$(export vals=(case x in); printf \'%s\' \'")\')"); : "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-nested-array-exported-active',
+        MUST_FLAG,
+        'args=("$(export vals=(case x in); printf \'%s\' \'")\')"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-nested-array-associative-silent',
+        MUST_NOT_FLAG,
+        'args=("$(declare -A vals=(case x in y); printf \'%s\' \'")\')"); : "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-nested-array-associative-active',
+        MUST_FLAG,
+        'args=("$(declare -A vals=(case x in y); printf \'%s\' \'")\')"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-nested-array-continued-silent',
+        MUST_NOT_FLAG,
+        'args=("$(vals=\\\n(case x in); printf \'%s\' \'")\')"); : "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-nested-array-continued-active',
+        MUST_FLAG,
+        'args=("$(vals=\\\n(case x in); printf \'%s\' \'")\')"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-nested-array-local-silent',
+        MUST_NOT_FLAG,
+        'f(){ args=("$(local vals=(case x in); printf \'%s\' \'")\')"); : "$1"; }; f "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-nested-array-local-active',
+        MUST_FLAG,
+        'f(){ args=("$(local vals=(case x in); printf \'%s\' \'")\')"); echo "$1"; }; f "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-quoted-ordinary-in-argument',
+        MUST_NOT_FLAG,
+        'safe(){ set -x; : "$(echo "in"; : \'$1\')"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-escaped-ordinary-in-argument',
+        MUST_NOT_FLAG,
+        'safe(){ set -x; : "$(echo \\in; : \'$1\')"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-continued-in-opener-literal',
+        MUST_NOT_FLAG,
+        'safe(){ set -x; : "$(case x i\\\nn(x) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'boundary-continued-in-opener-active',
+        MUST_FLAG,
+        'safe(){ set -x; : "$(case x i\\\nn(x) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
     ),
     (
         "helper-double-quoted-no-apostrophe-control",
