@@ -310,7 +310,7 @@ fi
 # shellcheck source=lib/codex-request-evidence.sh
 if [ ! -r "$__CODEX_REQUEST_DIR/lib/codex-request-evidence.sh" ] \
   || ! . "$__CODEX_REQUEST_DIR/lib/codex-request-evidence.sh" \
-  || ! declare -F crqe_select_trigger crqe_count_triggers crqe_ack_present >/dev/null; then
+  || ! declare -F crqe_select_trigger crqe_count_triggers crqe_ack_present crqe_request_threshold >/dev/null; then
   echo "[codex-review-request] ERROR: request evidence helper unavailable (see #1276)" >&2
   exit 3
 fi
@@ -726,37 +726,16 @@ HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.commi
 # and ordinary-push-of-old-committer-date. Layer 1 advances the anchor
 # via `head_ref_force_pushed` events from the PR-scoped timeline; Layer
 # 2 bounds residual exposure with a freshness floor.
-HEAD_PUSHED_AT="$HEAD_COMMITTER_DATE"
-ANCHOR_SOURCE="HEAD committer date"
-
 TIMELINE_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/timeline" "PR timeline")
-
-LATEST_FORCE_PUSH_TIME=$(echo "$TIMELINE_JSON" | jq -r '
-  [ .[] | select(.event == "head_ref_force_pushed") | .created_at ]
-  | max // ""
-')
-
-if [ -n "$LATEST_FORCE_PUSH_TIME" ] && [[ "$LATEST_FORCE_PUSH_TIME" > "$HEAD_PUSHED_AT" ]]; then
-  HEAD_PUSHED_AT="$LATEST_FORCE_PUSH_TIME"
-  ANCHOR_SOURCE="head_ref_force_pushed @ $LATEST_FORCE_PUSH_TIME"
-fi
-
 EPOCH_NOW=$(date +%s)
-EPOCH_FLOOR=$((EPOCH_NOW - REACTION_FRESHNESS_SECONDS))
-if REACTION_FLOOR_ISO=$(date -u -r "$EPOCH_FLOOR" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null); then
-  :
-else
-  REACTION_FLOOR_ISO=$(date -u -d "@$EPOCH_FLOOR" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) \
-    || die 3 "could not compute reaction freshness floor from epoch $EPOCH_FLOOR"
-fi
-
-if [[ "$REACTION_FLOOR_ISO" > "$HEAD_PUSHED_AT" ]]; then
-  REACTION_THRESHOLD="$REACTION_FLOOR_ISO"
-  REACTION_THRESHOLD_SOURCE="freshness floor (NOW - ${REACTION_FRESHNESS_SECONDS}s)"
-else
-  REACTION_THRESHOLD="$HEAD_PUSHED_AT"
-  REACTION_THRESHOLD_SOURCE="HEAD pushed-at anchor ($ANCHOR_SOURCE)"
-fi
+REACTION_ANCHOR=$(crqe_request_threshold "$HEAD_COMMITTER_DATE" "$TIMELINE_JSON" \
+  "$REACTION_FRESHNESS_SECONDS" "$EPOCH_NOW") \
+  || die 3 "could not compute Codex request freshness threshold"
+HEAD_PUSHED_AT=$(printf '%s' "$REACTION_ANCHOR" | jq -r .head_pushed_at)
+ANCHOR_SOURCE=$(printf '%s' "$REACTION_ANCHOR" | jq -r .anchor_source)
+REACTION_FLOOR_ISO=$(printf '%s' "$REACTION_ANCHOR" | jq -r .reaction_floor)
+REACTION_THRESHOLD=$(printf '%s' "$REACTION_ANCHOR" | jq -r .reaction_threshold)
+REACTION_THRESHOLD_SOURCE=$(printf '%s' "$REACTION_ANCHOR" | jq -r .reaction_threshold_source)
 
 log "HEAD = $HEAD_SHA committed at $HEAD_COMMITTER_DATE"
 log "anchor = $HEAD_PUSHED_AT (source: $ANCHOR_SOURCE)"
@@ -1391,64 +1370,18 @@ governing_request_attempt_cap() {
   # The cap protects the request WRITE, so the policy controlling it must be
   # the PR's governing base policy. Reading only $CONFIG here lets a candidate
   # raise its own budget before asking for another scarce provider review.
-  local base_cfg base_json base_cap base_author resolver rc=0
+  local budget_json base_cap resolver
   GOVERNING_REQUEST_ATTEMPT_CAP=""
 
   resolver="$__CODEX_REQUEST_DIR/workflow/resolve_base_policy.sh"
   [ -x "$resolver" ] \
     || die 3 "governing review-policy resolver unavailable; refusing a new '@codex review' trigger"
-  declare -F policy_yaml_to_json >/dev/null \
+  declare -F crqe_governing_budget >/dev/null \
     || die 3 "governing review-policy parser unavailable; refusing a new '@codex review' trigger"
-
-  set +e
-  base_cfg=$("$resolver" --repo "$REPO" --pr "$PR_NUMBER" \
-    --default-config "$CONFIG" --materialize-default 2>/dev/null)
-  rc=$?
-  set -e
-  [ "$rc" -eq 0 ] && [ -n "$base_cfg" ] && [ -r "$base_cfg" ] \
-    || die 3 "cannot resolve the governing base policy; refusing a new '@codex review' trigger"
-  if [ "$base_cfg" != "$CONFIG" ]; then
-    __cra_retire_base_cfg "$base_cfg"
-  fi
-
-  set +e
-  base_json=$(policy_yaml_to_json "$base_cfg" 2>/dev/null)
-  rc=$?
-  set -e
-  [ "$rc" -eq 0 ] && [ -n "$base_json" ] \
-    || die 3 "cannot read the governing review policy; refusing a new '@codex review' trigger"
-  base_author=$(printf '%s' "$base_json" | jq -er '
-    if type != "object" then
-      error("governing policy must be an object")
-    elif has("author_identity") then
-      if ((.author_identity | type) == "string") and ((.author_identity | length) > 0) then
-        .author_identity
-      else
-        error("governing author_identity must be a nonempty string")
-      end
-    else
-      "nathanjohnpayne"
-    end
-  ') || die 3 "cannot read author_identity from the governing base policy; refusing a new '@codex review' trigger"
-  [ "$AUTHOR_IDENTITY" = "$base_author" ] \
-    || die 3 "candidate author_identity '$AUTHOR_IDENTITY' does not match the governing base policy author_identity '$base_author'; refusing a new '@codex review' trigger"
-  base_cap=$(printf '%s' "$base_json" | jq -r '
-    if (type != "object") then
-      "__invalid__"
-    elif (has("codex") | not) then
-      "10"
-    elif ((.codex | type) != "object") then
-      "__invalid__"
-    elif (.codex | has("max_review_rounds")) then
-      .codex.max_review_rounds
-      | if (type == "string" or type == "number") then tostring else "__invalid__" end
-    else
-      "10"
-    end
-  ') || die 3 "cannot read codex.max_review_rounds from the governing base policy; refusing a new '@codex review' trigger"
-  if ! [[ "$base_cap" =~ ^[0-9]{1,9}$ ]]; then
-    die 3 "governing codex.max_review_rounds must be a non-negative integer no greater than 999999999; refusing a new '@codex review' trigger"
-  fi
+  budget_json=$(crqe_governing_budget "$REPO" "$PR_NUMBER" "$CONFIG" \
+    "$AUTHOR_IDENTITY" "$resolver") \
+    || die 3 "cannot read the governing review policy/request budget; refusing a new '@codex review' trigger"
+  base_cap=$(printf '%s' "$budget_json" | jq -r '.max_request_attempts')
 
   GOVERNING_REQUEST_ATTEMPT_CAP="$base_cap"
 }

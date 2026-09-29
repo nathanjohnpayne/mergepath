@@ -95,6 +95,11 @@
 #      Before dispatch, account for findings and rerun (#1000). After a posted
 #      approval, review_posted:true identifies an acknowledgment to repair
 #      without repeating the review. No handoff block is emitted.
+#   8  HUMAN_TIEBREAKER_REQUIRED — the governing Codex request cap is
+#      exhausted with no automated response path left. No adapter is run and
+#      no Phase 4b handoff is rendered; a human must decide the PR's state.
+#   10 BARRIER_EVIDENCE_ERROR — request-budget evidence was unreadable or the
+#      head moved. No adapter is run and no Phase 4b handoff is rendered.
 
 set -euo pipefail
 
@@ -520,10 +525,14 @@ require_feedback_accounted() {
 fall_back_to_manual() {
   local why="$1"
   local handoff_ref="$PR"
-  local handoff_output="" handoff_rc=0
+  local handoff_output="" handoff_rc=0 handoff_rendered=false
   [ -n "$REPO" ] && handoff_ref="${REPO}#${PR}"
+  # Every fallback reached after adapter dispatch depends on the same
+  # below-cap request snapshot that authorized that dispatch. Recheck it before
+  # rendering the authority-bearing handoff. The revalidator exits directly on
+  # refusal, so this central guard cannot recurse through this function.
+  revalidate_codex_request_budget_authority pre-post
   require_feedback_accounted
-  p4b_warn "falling back to the manual Phase 4b handoff: $why"
   # Accounting (#602): record the fail-closed loop as positive safety
   # evidence. Advisory — a recording failure never alters this fallback.
   # When this invocation's loop is ALREADY in the log (recorded before the
@@ -539,9 +548,22 @@ fall_back_to_manual() {
         || p4b_warn "accounting: could not record the fail-closed loop (continuing)"
     fi
   fi
+  # The handoff helper is stdout-only, but it performs its own feedback and PR
+  # metadata reads before returning the rendered block. Capture that read-only
+  # output first; none of it becomes authority until the parent prints it.
   if [ -x "$HANDOFF" ]; then
     handoff_output=$(PHASE_4B_REVIEWER_IDENTITY="$REVIEWER" "$HANDOFF" "$handoff_ref" 2>&1) \
       || handoff_rc=$?
+    handoff_rendered=true
+  fi
+  # The parent feedback gate, advisory accounting, and helper above all run
+  # external commands. Bind their entire window to the request-budget snapshot
+  # at the actual writer boundary. Keep the early fence: it performs refusal
+  # cleanup before a fallible feedback read can interrupt that path. This final
+  # fence is unconditional so a missing helper cannot grant fallback via JSON.
+  revalidate_codex_request_budget_authority pre-post
+  p4b_warn "falling back to the manual Phase 4b handoff: $why"
+  if [ "$handoff_rendered" = true ]; then
     case "$handoff_rc" in
       0) printf '%s\n' "$handoff_output" >&2 ;;
       4)
@@ -597,6 +619,34 @@ hold_for_external_review() {
   exit 6
 }
 
+stop_for_human_tiebreaker() {
+  local payload="$1"
+  p4b_warn "Codex request budget exhausted; stopping for a human tiebreaker without adapter dispatch or Phase 4b handoff"
+  jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+        --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
+        --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" '
+    {pr_number:$pr,repo:$repo,head_sha:$head,direction:$direction,
+     reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
+     review_posted:false,fell_back_to_manual:false,barrier_pending:false,
+     human_tiebreaker_required:true,barrier:$b,reason:$b.reason,
+     automation_enabled:true,enabled_via:$enabled_via}'
+  exit 8
+}
+
+stop_for_barrier_error() {
+  local payload="$1"
+  p4b_warn "request-budget authority failed; stopping without review publication or Phase 4b handoff"
+  jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+        --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
+        --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" '
+    {pr_number:$pr,repo:$repo,head_sha:$head,direction:$direction,
+     reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
+     review_posted:false,fell_back_to_manual:false,barrier_pending:false,
+     infrastructure_error:true,barrier:$b,reason:$b.reason,
+     automation_enabled:true,enabled_via:$enabled_via}'
+  exit 10
+}
+
 # A barrier that opened over a rate-limited CodeRabbit (#1178). Set when the
 # barrier's CodeRabbit arm classified `rate-limited` and it opened anyway on a
 # head-pinned Codex report. Read only by the review-body renderer below.
@@ -609,14 +659,23 @@ BARRIER_CODERABBIT_CARRIED=""
 # Run the same-head barrier and act on it. Escalation routes to the existing
 # manual handoff; only the non-terminal case takes the new hold path.
 P4B_PRE_ADAPTER_CODEX_EVIDENCE=""
+P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON="null"
+P4B_PRE_ADAPTER_REQUEST_GENERATION=""
 run_same_head_barrier() {
-  local where="$1" out rc=0
-  out="$(p4b_same_head_barrier "$REPO" "$PR" "$HEAD" "$REVIEWER" "$DRY_RUN")" || rc=$?
+  local where="$1" scope="${2:-all}" out rc=0
+  out="$(p4b_same_head_barrier "$REPO" "$PR" "$HEAD" "$REVIEWER" "$DRY_RUN" "$scope")" || rc=$?
   case "$rc" in
     0)
       if [ "$where" = "pre-adapter" ]; then
         P4B_PRE_ADAPTER_CODEX_EVIDENCE="$(printf '%s' "$out" | jq -r '.codex_evidence // "unreadable"')"
       fi
+      case "$where" in
+        pre-adapter|pre-fallback)
+          P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON="$(printf '%s' "$out" | jq -c '.request_budget // null')"
+          P4B_PRE_ADAPTER_REQUEST_GENERATION="$(printf '%s' "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" | \
+            jq -c 'select(.state == "available") | .request_generation // empty')"
+          ;;
+      esac
       # An open barrier is normally silent — every enabled provider reported
       # and there is nothing to say. #1178 adds one shape that opens on a
       # PARTIAL quorum: CodeRabbit refused this head, and Codex alone carries
@@ -638,6 +697,8 @@ run_same_head_barrier() {
       return 0
       ;;
     1) hold_for_external_review "$out" ;;
+    3) stop_for_human_tiebreaker "$out" ;;
+    4) stop_for_barrier_error "$out" ;;
     *) fall_back_to_manual "external review barrier ($where): $(printf '%s' "$out" | jq -r '.reason // "escalated"')" ;;
   esac
 }
@@ -690,6 +751,54 @@ cleanup_pre_post_refusal_side_effects() {
     p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: $issue_cause changed before the Phase 4b approval could post; a rerun files fresh follow-ups."
     P4B_CREATED_ISSUE_REFS=""
   fi
+}
+
+# A below-cap request snapshot authorizes adapter dispatch only while its
+# governing PR tuple, resolved policy budget, and request generation remain
+# current. A base advance/retarget, mutable default-policy fallback, or exact
+# author-owned `@codex review` can change that authority during the long
+# adapter or rendering windows without moving the reviewed head. Re-read that
+# narrow snapshot at each authority-bearing exit; current-head Codex reports
+# and trusted timeouts carry no snapshot and therefore pay no extra read or
+# change in precedence.
+#
+# Changed or unreadable evidence exits 10 directly. A clean rerun then observes
+# the new final request and enters the ordinary bounded wait; this invocation
+# must not convert stale budget authority into either a review or manual handoff.
+revalidate_codex_request_budget_authority() {
+  local where="${1:-post-adapter}"
+  local unsafe_budget="" recheck_rc=0 reason evidence payload
+  [ -n "$P4B_PRE_ADAPTER_REQUEST_GENERATION" ] || return 0
+
+  unsafe_budget="$(p4b_codex_available_authority_revalidate \
+    "$REPO" "$PR" "$HEAD" "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON")" || recheck_rc=$?
+  [ "$recheck_rc" -ne 0 ] || return 0
+  evidence="$(printf '%s' "$unsafe_budget" | jq -r '.reason // "request-budget-authority-unreadable"' \
+    2>/dev/null || printf request-budget-authority-unreadable)"
+  case "$evidence" in
+    request-generation-changed)
+      reason="Codex request generation changed during external review; rerun against the current request timeline"
+      ;;
+    request-generation-reread-failed)
+      reason="Codex request generation could not be re-read during external review; refusing stale Phase 4b authority"
+      ;;
+    pr-policy-tuple-changed)
+      reason="The PR governing policy tuple changed during external review; rerun against the stabilized head and base"
+      ;;
+    governing-budget-changed)
+      reason="The governing Codex request budget changed during external review; rerun under the current base policy"
+      ;;
+    *)
+      reason="Codex governing request-budget authority could not be re-read during external review; refusing stale Phase 4b authority"
+      ;;
+  esac
+  if [ "$where" = pre-post ]; then
+    cleanup_pre_post_refusal_side_effects "$reason" true \
+      "Codex request authority" "the governing Codex request-budget snapshot for ${REPO}#${PR}"
+  fi
+  payload="$(jq -nc --arg r "$reason" --arg ce "$evidence" --argjson b "$unsafe_budget" \
+    '{decision:"error",reason:$r,coderabbit:"unchanged",codex:"escalate",codex_evidence:$ce,request_budget:$b}')"
+  stop_for_barrier_error "$payload"
 }
 
 revalidate_phase4a_timeout_generation() {
@@ -822,6 +931,12 @@ if [ "$DRY_RUN" = true ]; then
 fi
 
 if [ ! -x "$ADAPTER_SCRIPT" ]; then
+  # No adapter is an infrastructure fallback, never authority to bypass the
+  # governing Codex cap. This mode makes no provider-triggering writes and
+  # leaves below-cap fallback behavior unchanged. Offline dry runs stay offline.
+  if [ "$DRY_RUN" != true ]; then
+    run_same_head_barrier "pre-fallback" cap-only
+  fi
   fall_back_to_manual "no adapter for reviewer '$REVIEWER' (expected $ADAPTER_SCRIPT)"
 fi
 
@@ -868,6 +983,11 @@ ADAPTER_RC=$?
 set -e
 P4B_ACCT_LOOP_ELAPSED_SECONDS=$(( $(date +%s) - P4B_ACCT_LOOP_STARTED_EPOCH ))
 export P4B_ACCT_LOOP_STARTED_EPOCH P4B_ACCT_LOOP_ELAPSED_SECONDS
+if [ "$DRY_RUN" != true ]; then
+  # This fence precedes adapter rc/schema branching so a failed or malformed
+  # adapter cannot turn a newly occupied final request into a manual handoff.
+  revalidate_codex_request_budget_authority post-adapter
+fi
 if [ "$ADAPTER_RC" -ne 0 ]; then
   if p4b_is_timeout_rc "$ADAPTER_RC"; then
     fall_back_to_manual "adapter timed out after ${ADAPTER_TIMEOUT}s"
@@ -1371,15 +1491,10 @@ post_review() {
     --request-changes) event="REQUEST_CHANGES" ;;
     *) p4b_die 3 "unsupported review state flag: $state_flag" ;;
   esac
-  # The post-adapter recheck protects every earlier approval-side effect, but
-  # rendering, accounting, and optional step-9 issue filing leave another
-  # window before the review POST. Close it with one final targeted generation
-  # read before the final live-head fence. On a hold, the helper corrects the
-  # provisional accounting record and closes this run's filed follow-ups before
-  # exiting; malformed evidence takes the same cleanup path before the manual
-  # fallback. This is deliberately not the full provider barrier, so an
-  # unrelated late CodeRabbit probe cannot flap a verdict whose ordering
-  # evidence was already established.
+  # Refuse stale budget authority before the remaining fallible preparation
+  # reads. A second bounded snapshot check below sits at the writer boundary;
+  # this early one preserves cleanup before an intervening read can fail.
+  revalidate_codex_request_budget_authority pre-post
   revalidate_phase4a_timeout_generation pre-post
   local live_head
   # #799: the last drift check before a review POSTS. An unreadable read that
@@ -1423,15 +1538,22 @@ post_review() {
       "the Authoring-Agent declared by ${REPO}#${PR}"
     fall_back_to_manual "$P4B_BODY_DRIFT_REASON"
   fi
-  # Keep the coherent head/base pair as the LAST live read before constructing
-  # the authority payload. Body validation above also reads GitHub, so placing
-  # this fence earlier would leave a fresh base-drift window before POST.
-  # As with late head drift, remove this invocation's filed observations first.
+  # Prepare a coherent expected head/base pair after body validation, which
+  # also reads GitHub. The combined request-budget authority fence below then
+  # performs the final tuple read before constructing the payload. As with late
+  # head drift, remove this invocation's filed observations first.
   if ! revalidate_expected_base pre-post; then
     cleanup_pre_post_refusal_side_effects "$P4B_BASE_FENCE_REASON" true \
       "The PR base" "the base of ${REPO}#${PR}"
     fall_back_to_manual "$P4B_BASE_FENCE_REASON"
   fi
+  # The timeout/head/body/base reads above prepare the final review material
+  # and may outlive the earlier budget check. Revalidate the coherent governing
+  # tuple, resolved request budget, and request generation once more after
+  # those reads and immediately before constructing and posting the payload.
+  # This is a bounded consumer fence, not an atomic GitHub read/write protocol;
+  # a residual network interval remains between this observation and the POST.
+  revalidate_codex_request_budget_authority pre-post
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \
     '{commit_id:$commit_id,event:$event,body:$body}' > "$payload_file"

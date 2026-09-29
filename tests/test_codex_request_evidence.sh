@@ -2,6 +2,8 @@
 # #1276: real checker, fake provider. Diagnostics must never decide clearance.
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=../scripts/lib/codex-request-evidence.sh
+. "$ROOT/scripts/lib/codex-request-evidence.sh"
 DIR=$(mktemp -d)
 trap 'rm -rf "$DIR"' EXIT
 mkdir -p "$DIR/scripts/workflow" "$DIR/bin"
@@ -155,4 +157,21 @@ CARRY_FIXTURE='{"carried":true,"source_time":"2026-09-14T00:00:00Z","source_comm
   bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/out" 2>&1 || { cat "$DIR/out"; exit 1; }
 if grep -q 'request evidence' "$DIR/out"; then echo 'FAIL: diagnostic on success'; exit 1; fi
 [ "$(grep -c '/issues/comments/' "$DIR/calls" || true)" = 0 ]
+
+# The count and authority fence share one exact-command generation selector.
+# It is ID-stable, case-insensitive for the complete command, de-duplicates a
+# repeated page item, ignores mentions/foreign authors, and rejects malformed
+# qualifying IDs instead of silently shrinking the generation.
+GENERATION_FIXTURE='[
+  {"id":125,"user":{"login":"nathanjohnpayne"},"body":"@CODEX REVIEW"},
+  {"id":123,"user":{"login":"nathanjohnpayne"},"body":"@codex review"},
+  {"id":125,"user":{"login":"nathanjohnpayne"},"body":"@CODEX REVIEW"},
+  {"id":124,"user":{"login":"nathanjohnpayne"},"body":"status: @codex review"},
+  {"id":126,"user":{"login":"someone-else"},"body":"@codex review"}
+]'
+[ "$(crqe_trigger_generation "$GENERATION_FIXTURE" nathanjohnpayne)" = '[123,125]' ]
+[ "$(crqe_count_triggers "$GENERATION_FIXTURE" nathanjohnpayne)" = 2 ]
+! crqe_trigger_generation '[{"id":"bad","user":{"login":"nathanjohnpayne"},"body":"@codex review"}]' nathanjohnpayne >/dev/null 2>&1
+echo "PASS: shared exact-request generation selector"
+
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"

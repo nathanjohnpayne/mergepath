@@ -47,12 +47,14 @@
 #           If the orchestrator JSON says review_posted:true, repair that
 #           review's acknowledgment without repeating the review. Otherwise
 #           disposition the earlier findings and rerun the same audit.
-#   exit 8  curated diff exceeds the configured byte budget. No reviewer
-#           is dispatched and no tag is written. Never fan out on this:
-#           the range needs bounded review, not another unavailable retry.
+#   exit 8  curated diff exceeds the configured byte budget, OR the Phase 4b
+#           orchestrator requires a human tiebreaker. No reviewer authority
+#           or tag follows. Never fan out on either shape.
 #   exit 9  one historical chunk was validated and optionally retained as a
 #           non-clearance prefix receipt. Never fan out: only an explicit
 #           --finalize-historical run can produce ordinary exit 0 clearance.
+#   exit 10 orchestrator request-budget evidence error. No adapter/handoff or
+#           tag is written. Never fan out; repair the read/head drift and retry.
 #
 # Usage:
 #   scripts/wave-audit.sh <canary-pr> --repo <owner/repo>
@@ -890,6 +892,14 @@ case "$orc" in
     # round is exactly what this status prevents.
     emit_json 7 false null
     log "review feedback is unaccounted on ${REPO}#${PR} (orchestrator exit 7) — no watermark; do NOT fan out. If the orchestrator JSON reports review_posted:true, repair its acknowledgment without repeating the review; otherwise disposition earlier findings and rerun the audit"
+    ;;
+  8)
+    emit_json 8 false null
+    log "Phase 4b stopped without review authority on ${REPO}#${PR} (orchestrator exit 8: curated diff over budget or Codex-cap human tiebreaker) — no watermark; do NOT fan out or substitute Phase 4b authority"
+    ;;
+  10)
+    emit_json 10 false null
+    log "request-budget evidence failed on ${REPO}#${PR} (orchestrator exit 10) — no watermark; do NOT fan out or render a Phase 4b handoff; repair the read/head drift and retry"
     ;;
   *)
     emit_json "$orc" false null
