@@ -2986,6 +2986,16 @@ def _word_has_verbatim_positional(w):
             j = w.find("'", i + 1)
             i = n if j == -1 else j + 1
             continue
+        if (
+            c == "$"
+            and w[i + 1 : i + 2] == "("
+            and w[i + 2 : i + 3] != "("
+        ):
+            close = _skip_balanced_parens(w, i + 1)
+            if _word_has_verbatim_positional(w[i + 2 : close - 1]):
+                return True
+            i = close
+            continue
         if c == "`":
             close = _find_backtick_close(w, i + 1)
             if close is None:
@@ -5289,6 +5299,23 @@ CORPUS = [
         'leak(){ : "${UNSET_VALUE:?$1}"; }\nleak "$GH_TOKEN"\n',
     ),
     ("helper-xtrace-body", MUST_FLAG, 'leak(){ set -x; : "$1"; }\nleak "$GH_TOKEN"\n'),
+    (
+        # A nested substitution has its own quote context.  Its literal
+        # double quote cannot hide the later positional from the helper's
+        # xtrace walk after top-level `set +x` clears file-level state.
+        "helper-xtrace-nested-substitution-quote-context",
+        MUST_FLAG,
+        'leak() {\n  set -x\n  : "$(printf \'%s\' \'"\')$1"\n}\n'
+        'set +x\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        # The nearby positional is genuinely single-quoted and is therefore
+        # literal data even though xtrace prints the command that consumes it.
+        "helper-xtrace-nested-substitution-single-quoted-control",
+        MUST_NOT_FLAG,
+        'leak() {\n  set -x\n  : "$(printf \'%s\' \'"\')"\'$1\'\n}\n'
+        'set +x\nleak "$GH_TOKEN"\necho ok\n',
+    ),
     (
         "helper-subshell-body",
         MUST_FLAG,
