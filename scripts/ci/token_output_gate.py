@@ -1855,6 +1855,47 @@ def _find_backtick_close(text, start):
     return None
 
 
+def _comment_starts_at(text, pos):
+    """Whether an unquoted ``#`` at ``pos`` starts a shell comment.
+
+    Shell removes a backslash before a quoted separator before deciding whether
+    the hash starts a word.  Looking only at the raw preceding character
+    therefore mistakes
+    ``foo\\ #bar`` for a comment, even though the escaped space keeps ``#bar``
+    in the word.  An escaped newline has the same rule: after ``foo \\\n`` the
+    prior space still starts a comment, while after ``foo\\\n`` the hash stays
+    in the word.  This helper is deliberately limited to the balanced-span
+    walker; the main lexer retains its existing logical-word handling.
+    """
+    i = pos - 1
+    while i >= 0:
+        c = text[i]
+        if c == "\n":
+            # An odd run escapes this newline.  Removing its final backslash
+            # and the newline exposes the preceding source character; any
+            # remaining backslashes are literal word data and keep the hash
+            # out of comment position.
+            run_start = i - 1
+            while run_start >= 0 and text[run_start] == "\\":
+                run_start -= 1
+            run = i - run_start - 1
+            if run % 2 == 0:
+                return True
+            if run > 1:
+                return False
+            i = run_start
+            continue
+        if c not in _WORD_BREAK_BEFORE_COMMENT:
+            return False
+        backslashes = 0
+        j = i - 1
+        while j >= 0 and text[j] == "\\":
+            backslashes += 1
+            j -= 1
+        return backslashes % 2 == 0
+    return True
+
+
 def _skip_balanced_parens(text, start):
     """Return the index just past the `)` matching the `(` at `start`."""
     depth = 0
@@ -1915,7 +1956,7 @@ def _skip_balanced_parens(text, start):
             c == "#"
             and not quotes
             and parameter_depth == 0
-            and (i == 0 or text[i - 1] in _WORD_BREAK_BEFORE_COMMENT)
+            and _comment_starts_at(text, i)
         ):
             eol = text.find("\n", i)
             i = n if eol == -1 else eol
@@ -4389,6 +4430,30 @@ CORPUS = [
         "array-cmdsub-parameter-expansion-hash-later-emitter",
         MUST_FLAG,
         'x=; args=("$(printf \'%s\' ${x:- #foo})"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        # The escaped space keeps the following hash in the substitution's
+        # word.  A raw-previous-character check saw that space and swallowed
+        # the later emitter as a comment (#1498).
+        "array-cmdsub-escaped-separator-later-emitter",
+        MUST_FLAG,
+        'args=("$(printf foo\\ #bar)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        # With an even backslash run, the space is a genuine separator and
+        # the hash starts a comment.  Its unmatched parenthesis is comment
+        # text; the close belongs on the next line.
+        "array-cmdsub-escaped-separator-parity-comment-boundary",
+        MUST_FLAG,
+        'args=("$(printf foo\\\\ # ( comment\n)"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        # Backslash-newline is removed before comment recognition.  It
+        # exposes this prior space, so the fake close is comment text and the
+        # next close terminates the substitution.
+        "array-cmdsub-escaped-newline-comment-boundary",
+        MUST_FLAG,
+        'args=("$(printf foo \\\n# ) comment\n)"); echo "$GH_TOKEN"\n',
     ),
     (
         # A nested command substitution in that operand returns to command
