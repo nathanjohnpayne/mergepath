@@ -68,7 +68,8 @@ set -euo pipefail
 #
 #   mergepath_dir  a checkout of nathanjohnpayne/mergepath at the
 #                  sync's source commit (the <sha> in the PR branch
-#                  name mergepath-sync/[sync-all-]<sha>). Provides BOTH
+#                  name mergepath-sync/<sha> or
+#                  mergepath-sync/sync-all-<sha>[-<scope-digest>]). Provides BOTH
 #                  the authoritative manifest AND the canonical content
 #                  to compare against.
 #   consumer_dir   the consumer repo's PR checkout (a git work tree;

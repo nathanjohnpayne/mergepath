@@ -598,6 +598,8 @@ paths:
       - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/phase-4b/"
+      - "scripts/lib/codex-request-evidence.sh"   # #1305, shared request selection and governing budget
+      - "scripts/workflow/resolve_base_policy.sh"   # #1305, governing request-cap policy
       - "scripts/lib/codex-failure-markers.sh"   # #1085, exact-head Phase 4a timeout handoff parsed by phase-4b/lib.sh
       - "scripts/lib/gh-api-array.sh"   # #1008/#1085, strict paginated timeout-evidence read
       - "scripts/gh-as-reviewer.sh"
@@ -1117,6 +1119,13 @@ paths:
   - path: tests/test_codex_p1_gate.sh
     type: canonical
     consumers: all
+  # Executes the propagated workflow's event and scheduled shell payloads
+  # against hermetic API fixtures (#1230/#1434). The check wrapper requires it.
+  - path: tests/test_codex_p1_workflow_runtime.sh
+    type: canonical
+    consumers: all
+    requires:
+      - ".github/workflows/codex-p1-gate.yml"
   - path: tests/test_feedback_archive_relay_source.sh
     type: canonical
     consumers: all
@@ -1213,6 +1222,8 @@ paths:
   - path: tests/test_codex_request_evidence.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/lib/codex-request-evidence.sh"
   # HEAD-anchored Codex issue-comment verdict clearance (#600/#567).
   # check_codex_scripts (scripts/ci kit) hard-runs it, so it must travel to
   # every consumer or the check fails pre-flight with `No such file`.
@@ -1323,6 +1334,33 @@ paths:
   - path: tests/test_phase_4b_automation.sh
     type: canonical
     consumers: all
+    requires:
+      # This suite executes the complete Phase 4b package. Commit-path closure
+      # does not follow nested `requires`, so declare every runtime dependency
+      # directly on the test entry rather than relying on the two entrypoints.
+      - "scripts/phase-4b-review.sh"
+      - "scripts/phase-4b/"
+      - "scripts/lib/pr-body-contract.sh"
+      - "scripts/lib/pr-body-contract.mjs"
+      - "scripts/lib/reviewers-helpers.sh"
+      - "scripts/lib/codex-request-evidence.sh"
+      - "scripts/workflow/resolve_base_policy.sh"
+      - "scripts/lib/codex-failure-markers.sh"
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/gh-api-scalar.sh"
+      - "scripts/lib/gh-retry-helpers.sh"
+      - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/lib/branch-requirements.sh"
+      - "scripts/lib/coderabbit-fence.sh"
+      - "scripts/gh-as-reviewer.sh"
+      - "scripts/post-phase-4b-handoff.sh"
+      - "scripts/coderabbit-wait.sh"
+      - "scripts/codex-review-check.sh"
+      - "scripts/review-feedback-accounting.sh"
+      - "scripts/lib/ghas-alert-severity.sh"
+      - "scripts/lib/preflight-helpers.sh"
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "tests/fixtures/phase_4b_verdicts.jsonl"
   # Pairs with scripts/phase-4b/accounting.sh (+ accounting.schema.json and
   # prices.json, all carried by the scripts/phase-4b/ kit) and is
   # hard-required by scripts/ci/check_phase_4b_accounting (#602). Offline:
@@ -1838,6 +1876,9 @@ paths:
     type: kit
     consumers: all
     requires:
+      - "scripts/lib/feedback-policy-helpers.sh"   # #1305, governing policy parser
+      - "scripts/lib/codex-request-evidence.sh"   # #1305, request counting and timeout reconciliation
+      - "scripts/workflow/resolve_base_policy.sh"   # #1305, governing request-cap policy
       - "scripts/lib/codex-failure-markers.sh"   # #1085, durable timeout grammar/parser sourced by lib.sh
       - "scripts/lib/gh-api-array.sh"   # #1008/#1085, strict paginated timeout-evidence read
       - "scripts/lib/gh-api-scalar.sh"  # #799/#1085, shaped live-head fence before timeout consumption
@@ -1882,6 +1923,7 @@ paths:
       - "tests/test_coderabbit_wait_codex_failover.sh"  # check_coderabbit_wait (#489/#521)
       - "tests/test_coderabbit_automerge_rate_limit_gate.sh"  # check_coderabbit_wait (#489/#521)
       - "tests/test_codex_p1_gate.sh"          # check_codex_p1_gate
+      - "tests/test_codex_p1_workflow_runtime.sh"  # check_codex_p1_gate (#1230/#1434)
       - "tests/test_review_feedback_accounting.sh"  # check_review_feedback_accounting (#1000)
       - "scripts/review-feedback-accounting.sh"  # check_review_feedback_accounting (#1000)
       - "scripts/render-feedback-archive.sh"  # check_review_feedback_accounting (#1000)

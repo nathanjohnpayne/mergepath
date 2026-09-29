@@ -55,7 +55,7 @@ on:
   # review-submission event (external-review path).
   pull_request_review_comment:
     types: [created, edited, deleted]
-  # #658: the propagation lane posts its head-pinned verified-head marker as
+  # #658: the propagation lane posts its v2 head/base-pinned marker as
   # a github-actions[bot] ISSUE comment. After #657 stopped the label
   # add/remove dance, nothing re-ran this gate when the marker landed, and a
   # verified sync PR sat on a fail-closed spurious-red Merge clearance gate
@@ -66,7 +66,7 @@ on:
   # lane, right after posting a fresh marker, sends a repository_dispatch (PAT-
   # driven, best-effort) that DOES create a run. The dispatch only SCHEDULES a
   # re-evaluation — the dispatch-recheck job below re-derives clearance from the
-  # (head-pinned, github-actions[bot]) marker via lane_verified(), never trusts
+  # (head/base-pinned, github-actions[bot]) marker via lane_verified(), never trusts
   # the dispatch payload for clearance, and POSTs a check_run to the PR head
   # (like the sweep — a repository_dispatch run has no PR-head association).
   # Keep the event type `merge-clearance-recheck` in sync with the lane.
@@ -546,14 +546,14 @@ jobs:
     name: Merge clearance dispatch re-evaluation
     # #658: re-evaluate promptly when the propagation lane sends a
     # `merge-clearance-recheck` repository_dispatch right after posting its
-    # head-pinned verified-head marker. The marker itself is a GITHUB_TOKEN
+    # v2 head/base-pinned marker. The marker itself is a GITHUB_TOKEN
     # issue comment, which creates no workflow run — so the lane nudges the
     # gate with a PAT-driven dispatch instead (best-effort; if it never
     # arrives, the */15 sweep still recovers the gate). This job does NOT
     # trust the dispatch for clearance: it only re-runs
     # scripts/merge-clearance-gate.sh, which re-derives clearance from the
-    # (head-pinned, github-actions[bot]) marker via lane_verified() on the
-    # CURRENT head, then POSTs the honest result. A dispatch with any pr
+    # (head/base-pinned, github-actions[bot]) marker via lane_verified() on the
+    # CURRENT head/base pair, then POSTs the honest result. A dispatch with any pr
     # payload can therefore only trigger an honest re-evaluation — never force
     # a pass — so no guard on the payload is needed beyond validating it is a
     # PR number. Label events are still not a trigger (not head-pinned proof —

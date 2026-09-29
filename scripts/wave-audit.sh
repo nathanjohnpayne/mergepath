@@ -13,7 +13,8 @@
 #   base = newest wave-audit-pass/<sha> tag that is an ancestor of the wave
 #          head (--base <sha> on the first audited wave)
 #   head = the mergepath sha in the canary PR BRANCH name
-#          (mergepath-sync/[sync-all-]<sha> — what the lane verifies; a
+#          (mergepath-sync/<sha> or sync-all-<sha>[-<scope-digest>] — what
+#           the lane verifies; a
 #          parseable title must agree or the run fails closed), or --head-sha
 #   diff = git diff base..head -- <manifest paths minus excluded prefixes>
 #
@@ -46,12 +47,14 @@
 #           If the orchestrator JSON says review_posted:true, repair that
 #           review's acknowledgment without repeating the review. Otherwise
 #           disposition the earlier findings and rerun the same audit.
-#   exit 8  curated diff exceeds the configured byte budget. No reviewer
-#           is dispatched and no tag is written. Never fan out on this:
-#           the range needs bounded review, not another unavailable retry.
+#   exit 8  curated diff exceeds the configured byte budget, OR the Phase 4b
+#           orchestrator requires a human tiebreaker. No reviewer authority
+#           or tag follows. Never fan out on either shape.
 #   exit 9  one historical chunk was validated and optionally retained as a
 #           non-clearance prefix receipt. Never fan out: only an explicit
 #           --finalize-historical run can produce ordinary exit 0 clearance.
+#   exit 10 orchestrator request-budget evidence error. No adapter/handoff or
+#           tag is written. Never fan out; repair the read/head drift and retry.
 #
 # Usage:
 #   scripts/wave-audit.sh <canary-pr> --repo <owner/repo>
@@ -206,11 +209,13 @@ EXCLUDES="$(audit_list scope_exclude_prefixes)"
 
 # --- resolve the wave head ----------------------------------------------------
 # The propagation lane derives and byte-verifies against the sha in the
-# BRANCH NAME (mergepath-sync/[sync-all-]<sha>), not the title — an edited
+# BRANCH NAME (mergepath-sync/<sha> or
+# mergepath-sync/sync-all-<sha>[-<scope-digest>]), not the title — an edited
 # or stale title could point the audit (and the watermark) at canonical
 # commits the lane never verified (#663 round-3 P1). The branch is the
 # source of truth; a parseable title must agree with it.
 PR_HEAD_OID=""
+PR_BASE_OID=""
 # Branch metadata is resolved whenever the run is OPERATIONAL (lane check
 # active) — even under --head-sha (#663 round-4 P2): a typo or stale manual
 # sha would otherwise dispatch and watermark a review for a different
@@ -221,12 +226,16 @@ need_meta=false
 [ "${WAVE_AUDIT_LANE_VERIFIED_OK:-0}" != "1" ] && need_meta=true
 if [ "$need_meta" = true ]; then
   command -v gh >/dev/null 2>&1 || die 3 "gh is required to resolve the canary metadata (or pass --head-sha with WAVE_AUDIT_LANE_VERIFIED_OK=1 in hermetic tests)"
-  meta="$(gh pr view "$PR" --repo "$REPO" --json title,headRefName,headRefOid --jq '[.title, .headRefName, .headRefOid] | @tsv' 2>/dev/null)" \
+  meta="$(gh pr view "$PR" --repo "$REPO" --json title,headRefName,headRefOid,baseRefOid --jq '[.title, .headRefName, .headRefOid, .baseRefOid] | @tsv' 2>/dev/null)" \
     || die 3 "could not read PR $REPO#$PR metadata"
   title="$(printf '%s' "$meta" | cut -f1)"
   branch="$(printf '%s' "$meta" | cut -f2)"
   PR_HEAD_OID="$(printf '%s' "$meta" | cut -f3)"
-  branch_sha="$(printf '%s\n' "$branch" | sed -n 's|.*/\(sync-all-\)\{0,1\}\([0-9a-f]\{7,40\}\)$|\2|p')"
+  PR_BASE_OID="$(printf '%s' "$meta" | cut -f4)"
+  branch_sha="$(printf '%s\n' "$branch" | sed -n \
+    -e 's|.*/sync-all-\([0-9a-f]\{7,40\}\)-[0-9a-f]\{12\}$|\1|p' \
+    -e 's|.*/sync-all-\([0-9a-f]\{7,40\}\)$|\1|p' \
+    -e 's|.*/\([0-9a-f]\{7,40\}\)$|\1|p')"
   [ -n "$branch_sha" ] || die 3 "canary branch '$branch' does not carry the mergepath-sync/<sha> shape — not a lane-verifiable sync canary"
   if [ -z "$HEAD_SHA" ]; then
     HEAD_SHA="$branch_sha"
@@ -258,27 +267,54 @@ HEAD_FULL="$(git -C "$REPO_DIR" rev-parse --verify --quiet "${HEAD_SHA}^{commit}
 # the canary PR content == mergepath@head — dispatching against a canary
 # whose current head is NOT lane-verified would let a non-faithful sync PR
 # clear external review without its actual PR diff ever being reviewed.
-# Fail closed unless the canary head carries the head-pinned trusted lane
-# marker (the same github-actions[bot] marker merge-clearance-gate.sh keys
-# on). WAVE_AUDIT_LANE_VERIFIED_OK=1 overrides — hermetic tests only.
+# Fail closed unless the canary's live head/base pair carries the exact
+# pair-bound trusted lane marker (the same github-actions[bot] marker
+# merge-clearance-gate.sh keys on). A legacy head-only marker cannot establish
+# which base was verified, so it is deliberately not a rollout compatibility
+# path. WAVE_AUDIT_LANE_VERIFIED_OK=1 overrides — hermetic tests only.
 pr_head=""
+pr_base=""
 if [ "${WAVE_AUDIT_LANE_VERIFIED_OK:-0}" != "1" ]; then
   command -v gh >/dev/null 2>&1 || die 3 "gh is required for the lane-verification precondition"
-  if [ -n "$PR_HEAD_OID" ]; then
+  if [ -n "$PR_HEAD_OID" ] && [ -n "$PR_BASE_OID" ]; then
     pr_head="$PR_HEAD_OID"
+    pr_base="$PR_BASE_OID"
   else
-    pr_head="$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null)" \
-      || die 3 "could not read PR $REPO#$PR head for lane verification"
+    live_pair="$(gh pr view "$PR" --repo "$REPO" --json headRefOid,baseRefOid --jq '[.headRefOid, .baseRefOid] | @tsv' 2>/dev/null)" \
+      || die 3 "could not read PR $REPO#$PR head/base for lane verification"
+    pr_head="$(printf '%s' "$live_pair" | cut -f1)"
+    pr_base="$(printf '%s' "$live_pair" | cut -f2)"
   fi
-  [ -n "$pr_head" ] || die 3 "empty PR head reading $REPO#$PR for lane verification"
+  [[ "$pr_head" =~ ^[0-9a-fA-F]{40}$ ]] && [[ "$pr_base" =~ ^[0-9a-fA-F]{40}$ ]] \
+    || die 3 "invalid PR head/base reading $REPO#$PR for lane verification"
   lane_comments="$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null)" \
     || die 3 "could not read canary PR comments for lane verification"
-  printf '%s' "$lane_comments" | jq -e --arg head "$pr_head" '
+  marker="<!-- mergepath-propagation-lane:v2 verified-head=$pr_head verified-base=$pr_base -->"
+  printf '%s' "$lane_comments" | jq -e --arg marker "$marker" '
     any(.[]; (.user.login == "github-actions[bot]")
-         and ((.body // "") | contains("mergepath-propagation-lane verified-head=" + $head)))' >/dev/null 2>&1 \
-    || die 3 "canary $REPO#$PR head $pr_head is not lane-verified (no head-pinned mergepath-propagation-lane marker) — wait for the External Review Check lane run or investigate a diverged canary; refusing to dispatch"
-  log "canary lane verified for PR head $pr_head"
+         and ((.body // "") | contains($marker)))' >/dev/null 2>&1 \
+    || die 3 "canary $REPO#$PR pair $pr_head/$pr_base is not lane-verified (no exact pair-bound mergepath-propagation-lane:v2 marker) — wait for the External Review Check lane run or investigate a diverged canary; refusing to dispatch"
+  log "canary lane verified for PR head/base $pr_head/$pr_base"
 fi
+
+# Re-read the live pair at each authority boundary. The initial marker binds
+# the originally observed pair; a later pair is never adopted implicitly,
+# even if it has since acquired its own marker. This closes the intervals in
+# which a same-head base move could otherwise let a stale review dispatch or
+# receipt advance the wave. It is still a read-before-write fence, not an
+# atomic GitHub transaction. The override remains limited to hermetic tests.
+revalidate_canary_pair() { # revalidate_canary_pair <operation>
+  local operation="$1" live_pair live_head live_base
+  [ "${WAVE_AUDIT_LANE_VERIFIED_OK:-0}" != "1" ] || return 0
+  live_pair="$(gh pr view "$PR" --repo "$REPO" --json headRefOid,baseRefOid --jq '[.headRefOid, .baseRefOid] | @tsv' 2>/dev/null)" \
+    || die 3 "could not re-read PR $REPO#$PR head/base before $operation"
+  live_head="$(printf '%s' "$live_pair" | cut -f1)"
+  live_base="$(printf '%s' "$live_pair" | cut -f2)"
+  [[ "$live_head" =~ ^[0-9a-fA-F]{40}$ ]] && [[ "$live_base" =~ ^[0-9a-fA-F]{40}$ ]] \
+    || die 3 "invalid PR head/base reading $REPO#$PR before $operation"
+  [ "$live_head" = "$pr_head" ] && [ "$live_base" = "$pr_base" ] \
+    || die 3 "canary $REPO#$PR moved from verified pair $pr_head/$pr_base to $live_head/$live_base before $operation — refusing stale authority"
+}
 
 # --- resolve the audit base (chaining watermark) ------------------------------
 BASE_WATERMARK_TAG=""
@@ -464,6 +500,7 @@ if [ -n "$HISTORICAL_END" ]; then
     retained_json="$(git -C "$REPO_DIR" for-each-ref --format='%(contents)' "refs/tags/$retained_tag")"
     [ -n "$retained_json" ] || die 3 "historical end equals retained prefix but exact receipt $retained_tag is missing"
     if [ "$DRY_RUN" = false ]; then
+      revalidate_canary_pair "publishing retained prefix receipt"
       git -C "$REPO_DIR" push -q origin "refs/tags/$retained_tag" \
         || die 3 "prefix receipt $retained_tag remains local because retry push failed"
     fi
@@ -577,11 +614,13 @@ advance_watermark() {
   if git -C "$REPO_DIR" rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
     log "watermark $tag already present locally — ensuring it is on origin"
   else
+    revalidate_canary_pair "writing wave watermark"
     GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=tag.gpgsign GIT_CONFIG_VALUE_0=false \
       git -C "$REPO_DIR" tag -a "$tag" \
         -m "wave-audit: base=${BASE_FULL} canary=${REPO}#${PR} effort=${EFFORT} files=${REPORT_FILES} bytes=${REPORT_BYTES}" \
         "$HEAD_FULL"
   fi
+  revalidate_canary_pair "publishing wave watermark"
   git -C "$REPO_DIR" push -q origin "refs/tags/$tag" \
     || die 3 "watermark tag $tag exists locally but the push failed — push it manually or rerun, or the next audit re-covers this range"
   log "watermark advanced: $tag"
@@ -613,9 +652,11 @@ advance_prefix_receipt() { # advance_prefix_receipt <orchestrator-summary-json>
   if git -C "$REPO_DIR" rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
     log "prefix receipt $tag already present locally — ensuring it is on origin"
   else
+    revalidate_canary_pair "writing historical prefix receipt"
     GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=tag.gpgsign GIT_CONFIG_VALUE_0=false \
       git -C "$REPO_DIR" tag -a "$tag" -F "$receipt_file" "$RANGE_HEAD"
   fi
+  revalidate_canary_pair "publishing historical prefix receipt"
   git -C "$REPO_DIR" push -q origin "refs/tags/$tag" \
     || die 3 "prefix receipt $tag exists locally but the push failed — rerun to retain this exact chunk"
   PREFIX_TAG_RESULT="$tag"
@@ -725,14 +766,16 @@ fi
 # there the claude direction falls back to its configured gating-lane effort
 # rather than failing closed on an invalid value.
 orch_args=("$PR" --repo "$REPO" --diff-file "$DIFF_FILE")
-# Pin the review to the lane-verified head (#663 round-3 P1): without
-# --head, the orchestrator resolves the LIVE PR head at dispatch time, so a
-# canary push racing the lane check above could get an APPROVED on a head
-# the lane never verified. With the pin, the orchestrator's own live-head
-# recheck fails closed on any drift.
+# Pin review publication to the lane-verified pair: without --head, the
+# orchestrator could approve a pushed canary head the lane never verified;
+# without --expected-base-sha, a same-head retarget during the long review
+# interval could publish approval for the wrong base. The orchestrator's own
+# final pair check closes that provider interval.
 if [ -n "$pr_head" ]; then
   orch_args[${#orch_args[@]}]="--head"
   orch_args[${#orch_args[@]}]="$pr_head"
+  orch_args[${#orch_args[@]}]="--expected-base-sha"
+  orch_args[${#orch_args[@]}]="$pr_base"
 fi
 if [ "$DRY_RUN" = true ] || [ -n "$HISTORICAL_END" ]; then
   orch_args[${#orch_args[@]}]="--dry-run"
@@ -740,6 +783,7 @@ fi
 if [ "$EFFORT" != "minimal" ]; then
   export P4B_CLAUDE_EFFORT="$EFFORT"
 fi
+revalidate_canary_pair "dispatching external review"
 if [ -n "$HISTORICAL_END" ]; then
   ORCH_OUTPUT="$(mktemp "${TMPDIR:-/tmp}/wave-audit-orchestrator.XXXXXX")"
   TMP_FILES[${#TMP_FILES[@]}]="$ORCH_OUTPUT"
@@ -848,6 +892,14 @@ case "$orc" in
     # round is exactly what this status prevents.
     emit_json 7 false null
     log "review feedback is unaccounted on ${REPO}#${PR} (orchestrator exit 7) — no watermark; do NOT fan out. If the orchestrator JSON reports review_posted:true, repair its acknowledgment without repeating the review; otherwise disposition earlier findings and rerun the audit"
+    ;;
+  8)
+    emit_json 8 false null
+    log "Phase 4b stopped without review authority on ${REPO}#${PR} (orchestrator exit 8: curated diff over budget or Codex-cap human tiebreaker) — no watermark; do NOT fan out or substitute Phase 4b authority"
+    ;;
+  10)
+    emit_json 10 false null
+    log "request-budget evidence failed on ${REPO}#${PR} (orchestrator exit 10) — no watermark; do NOT fan out or render a Phase 4b handoff; repair the read/head drift and retry"
     ;;
   *)
     emit_json "$orc" false null

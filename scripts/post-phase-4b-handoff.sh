@@ -27,7 +27,9 @@
 # emits the batch variant (markdown table + paste-prompt).
 #
 # Content classification:
-#   - branch matches `mergepath-sync/<sha>` or `mergepath-sync/sync-all-<sha>`
+#   - branch matches `mergepath-sync/<sha>`, legacy
+#     `mergepath-sync/sync-all-<sha>`, or scoped
+#     `mergepath-sync/sync-all-<sha>-<scope-digest>`
 #     → "verbatim mirror of mergepath@<sha>"
 #     (if the PR has commits beyond the sync source — detected by a
 #      commit count >1 — annotate as "sync + N convergence commits"
@@ -148,8 +150,12 @@ classify_content() {
   local head_ref="$1"
   local commits_count="$2"
   local sha=""
-  if [[ "$head_ref" =~ ^mergepath-sync/(sync-all-)?([0-9a-f]+)$ ]]; then
+  if [[ "$head_ref" =~ ^mergepath-sync/sync-all-([0-9a-f]{7,40})-[0-9a-f]{12}$ ]]; then
+    sha="${BASH_REMATCH[1]}"
+  elif [[ "$head_ref" =~ ^mergepath-sync/(sync-all-)?([0-9a-f]+)$ ]]; then
     sha="${BASH_REMATCH[2]}"
+  fi
+  if [ -n "$sha" ]; then
     # Trim to 12 chars to keep the chat line readable; full sha is on
     # the PR's HEAD anyway.
     local short="${sha:0:12}"
