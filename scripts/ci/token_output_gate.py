@@ -1213,6 +1213,11 @@ class Lexer:
         pending_heredocs = []  # HereDoc objects awaiting a body
         in_heredoc = None
 
+        # Case syntax belongs to the current shell level.  A `case` outside a
+        # command substitution cannot make a `)` inside that substitution a
+        # pattern terminator; the inner shell text starts with no open case.
+        # Keep this stack parallel to `levels` for the same reason quote state
+        # is saved and restarted at each substitution/subshell boundary.
         case_depth = [0]
         # True while the last structural break was a `|` and no word has been
         # read since.  A pipeline whose `|` ends the physical line CONTINUES
@@ -1235,9 +1240,9 @@ class Lexer:
                 lv["word"] = []
                 pipe_open[0] = False
                 if w == "case":
-                    case_depth[0] += 1
-                elif w == "esac" and case_depth[0] > 0:
-                    case_depth[0] -= 1
+                    case_depth[-1] += 1
+                elif w == "esac" and case_depth[-1] > 0:
+                    case_depth[-1] -= 1
 
         def in_assign_prefix():
             """True when the reference sits in an env-assignment PREFIX.
@@ -1386,6 +1391,7 @@ class Lexer:
                             "saved_quotes": quotes,
                         }
                     )
+                    case_depth.append(0)
                     quotes = []
                     i += 2
                     continue
@@ -1623,6 +1629,7 @@ class Lexer:
                         "saved_quotes": quotes,
                     }
                 )
+                case_depth.append(0)
                 quotes = []
                 i += 2
                 continue
@@ -1744,6 +1751,7 @@ class Lexer:
                             "saved_quotes": quotes,
                         }
                     )
+                    case_depth.append(0)
                     quotes = []
                     i += 1
                     continue
@@ -1752,21 +1760,37 @@ class Lexer:
                 continue
 
             if c == ")":
+                if case_depth[-1] > 0 and "".join(cur_level()["word"]) == "esac":
+                    # `esac)` closes the case before the same `)` closes its
+                    # surrounding command substitution.  Finish the reserved
+                    # word first so it cannot be mistaken for another case
+                    # pattern.
+                    finish_word()
+                if case_depth[-1] > 0 and cur_level()["word"]:
+                    # `case x in pat)`: the nonempty word is the pattern in
+                    # THIS shell level.  Test this before a command-
+                    # substitution close, but only against this level's case
+                    # state; an outer case arm must not capture an inner `$()`
+                    # close as its own pattern terminator.
+                    start_segment()
+                    i += 1
+                    continue
                 if len(levels) > 1:
                     finish_word()
                     kind = levels[-1]["kind"]
                     quotes = levels[-1]["saved_quotes"]
                     levels.pop()
+                    case_depth.pop()
                     if kind == "cmdsub":
                         cur_level()["word"].append("$()")
-                    elif case_depth[0] > 0:
+                    elif case_depth[-1] > 0:
                         # `case x in (pat) cmd ;;` -- the pattern's `)` ends
                         # the pattern, and the command after it is its own
                         # segment.
                         start_segment()
                     i += 1
                     continue
-                if case_depth[0] > 0:
+                if case_depth[-1] > 0:
                     # `case x in pat) cmd ;;` -- an unmatched `)` inside a
                     # case body is a pattern terminator, never part of the
                     # command, so the emitter after it heads its own segment.
@@ -1837,6 +1861,7 @@ def _skip_balanced_parens(text, start):
     i = start
     n = len(text)
     quotes = []
+    parameter_depth = 0
     while i < n:
         c = text[i]
         if quotes and quotes[-1] == "'":
@@ -1866,7 +1891,32 @@ def _skip_balanced_parens(text, start):
             close = _find_backtick_close(text, i + 1)
             i = n if close is None else close + 1
             continue
-        if c == "#" and not quotes and (i == 0 or text[i - 1] in _WORD_BREAK_BEFORE_COMMENT):
+        if (
+            parameter_depth
+            and c == "$"
+            and text[i + 1 : i + 2] == "("
+            and text[i + 2 : i + 3] != "("
+        ):
+            # The operand may itself run shell code.  Skip that substitution
+            # under its own comment/quote context so a comment there does not
+            # mutate the enclosing parameter depth or parenthesis count.
+            i = _skip_balanced_parens(text, i + 1)
+            continue
+        if c == "$" and not quotes and text[i + 1 : i + 2] == "{":
+            # A parameter-expansion operand is not a command position.  In
+            # `${x:- #foo}`, the hash is data rather than a shell comment, so
+            # it cannot hide the real command-substitution close and later
+            # source.  The existing braced-reference helpers classify a
+            # reference but do not return the expansion's matching span.
+            parameter_depth += 1
+            i += 2
+            continue
+        if (
+            c == "#"
+            and not quotes
+            and parameter_depth == 0
+            and (i == 0 or text[i - 1] in _WORD_BREAK_BEFORE_COMMENT)
+        ):
             eol = text.find("\n", i)
             i = n if eol == -1 else eol
             continue
@@ -1882,6 +1932,10 @@ def _skip_balanced_parens(text, start):
             i += 1
             continue
         if quotes:
+            i += 1
+            continue
+        if c == "}" and parameter_depth:
+            parameter_depth -= 1
             i += 1
             continue
         if c == "(":
@@ -2934,16 +2988,22 @@ def discover_emitter_helpers(text):
             # itself, and under xtrace it writes every expanded command.  This
             # loop only promoted segments classified EMIT, so
             # `leak(){ : "${UNSET:?$1}"; }` and `leak(){ set -x; : "$1"; }`
-            # both read clean (#1032 round 8 P1).  Graded on the body TEXT,
-            # which is what those two mechanisms actually act on.
+            # both read clean (#1032 round 8 P1).  Error words are graded on
+            # their raw spans.  Xtrace is graded over the already-lexed body
+            # words so comments and each nested shell level retain the same
+            # quote semantics used everywhere else in helper discovery.
             if not emits:
                 body_text = bodies.get(name, "")
                 for a, b in _error_word_spans(body_text):
                     if _word_has_verbatim_positional(body_text[a:b]):
                         emits = True
                         break
-                if not emits and _text_enables_xtrace(body_text) \
-                        and _word_has_verbatim_positional(body_text):
+                if not emits and _text_enables_xtrace(body_text) and any(
+                    _word_has_verbatim_positional(w)
+                    for ll in lx.logical
+                    for seg in ll.segments
+                    for w in seg.words
+                ):
                     emits = True
             # a here-doc body inside the helper counts too
             if not emits:
@@ -4323,6 +4383,23 @@ CORPUS = [
         'die "$GH_TOKEN"\n',
     ),
     (
+        # A hash in an unquoted parameter-expansion operand is data, not a
+        # command comment.  Skipping through end-of-line there consumes the
+        # real array/substitution closes and hides this later emitter.
+        "array-cmdsub-parameter-expansion-hash-later-emitter",
+        MUST_FLAG,
+        'x=; args=("$(printf \'%s\' ${x:- #foo})"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        # A nested command substitution in that operand returns to command
+        # grammar: its comment may contain fake braces and parentheses without
+        # changing the surrounding parameter or substitution boundaries.
+        "array-cmdsub-parameter-expansion-nested-comment-boundary",
+        MUST_FLAG,
+        'x=; args=("$(printf \'%s\' ${x:-$(# } ) comment\n'
+        'printf foo\n)})"); echo "$GH_TOKEN"\n',
+    ),
+    (
         # Backtick bodies have their own quote context.  This positional is
         # single-quoted there and reaches output only as the literal `$1`.
         "helper-backtick-single-quoted-positional-control",
@@ -5315,6 +5392,46 @@ CORPUS = [
         MUST_NOT_FLAG,
         'leak() {\n  set -x\n  : "$(printf \'%s\' \'"\')"\'$1\'\n}\n'
         'set +x\nleak "$GH_TOKEN"\necho ok\n',
+    ),
+    (
+        # A shell comment in the nested substitution contains only data.  The
+        # helper's xtrace scan must not promote it from the commented `$1`.
+        "helper-xtrace-nested-substitution-commented-positional-control",
+        MUST_NOT_FLAG,
+        'leak(){ set -x; : "$(# "$1\necho ok)"; }\n'
+        'set +x\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        # The case pattern's `)` belongs to the nested substitution, where
+        # the positional remains single-quoted literal data.
+        "helper-xtrace-nested-substitution-case-pattern-control",
+        MUST_NOT_FLAG,
+        'leak(){ set -x; : "$(case x in x) : \'$1\';; esac)"; }\n'
+        'set +x\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        # Bash also accepts an optional opening parenthesis on a case pattern;
+        # its close must keep the same clean verdict as the bare spelling.
+        "helper-xtrace-nested-substitution-parenthesized-case-pattern-control",
+        MUST_NOT_FLAG,
+        'leak(){ set -x; : "$(case x in (x) : \'$1\';; esac)"; }\n'
+        'set +x\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        # An outer case arm does not make the close of an inner `$()` another
+        # pattern terminator.  The active positional still reaches xtrace.
+        "helper-xtrace-case-body-nested-substitution",
+        MUST_FLAG,
+        'leak(){ set -x; : "$(case x in x) : "$(printf \'%s\' "$1")";; esac)"; }\n'
+        'set +x\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        # Boundary for the previous case: the same nested substitution with a
+        # single-quoted positional emits only the literal `$1` under xtrace.
+        "helper-xtrace-case-body-nested-substitution-single-quoted-control",
+        MUST_NOT_FLAG,
+        'leak(){ set -x; : "$(case x in x) : "$(printf \'%s\' \'$1\')";; esac)"; }\n'
+        'set +x\nleak "$GH_TOKEN"\n',
     ),
     (
         "helper-subshell-body",
