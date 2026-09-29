@@ -1232,16 +1232,41 @@ class Lexer:
         def expanding():
             return "'" not in quotes
 
+        def reserved_word_position():
+            # Read only the existing segment prefix.  An ordinary command
+            # consumes this position; time's flags and coproc's optional name
+            # precede a compound command and do not consume it.
+            words = cur_level()["seg"].words
+            i = 0
+            while i < len(words):
+                w = words[i]
+                i += 1
+                if w in {"if", "elif", "then", "else", "while", "until", "do", "!", "{"}:
+                    continue
+                if w == "time":
+                    if words[i : i + 1] == ["-p"]:
+                        i += 1
+                    if words[i : i + 1] == ["--"]:
+                        i += 1
+                    continue
+                if w == "coproc":
+                    # Before a compound command Bash accepts either no name
+                    # or one name word.  Further words belong to a command.
+                    return len(words) - i <= 1
+                return False
+            return True
+
         def finish_word():
             lv = cur_level()
             if lv["word"]:
                 w = "".join(lv["word"])
+                reserved = reserved_word_position()
                 lv["seg"].words.append(w)
                 lv["word"] = []
                 pipe_open[0] = False
-                if w == "case":
+                if w == "case" and reserved:
                     case_depth[-1] += 1
-                elif w == "esac" and case_depth[-1] > 0:
+                elif w == "esac" and reserved and case_depth[-1] > 0:
                     case_depth[-1] -= 1
 
         def in_assign_prefix():
@@ -1760,7 +1785,11 @@ class Lexer:
                 continue
 
             if c == ")":
-                if case_depth[-1] > 0 and "".join(cur_level()["word"]) == "esac":
+                if (
+                    case_depth[-1] > 0
+                    and reserved_word_position()
+                    and "".join(cur_level()["word"]) == "esac"
+                ):
                     # `esac)` closes the case before the same `)` closes its
                     # surrounding command substitution.  Finish the reserved
                     # word first so it cannot be mistaken for another case
@@ -1855,54 +1884,20 @@ def _find_backtick_close(text, start):
     return None
 
 
-def _comment_starts_at(text, pos):
-    """Whether an unquoted ``#`` at ``pos`` starts a shell comment.
-
-    Shell removes a backslash before a quoted separator before deciding whether
-    the hash starts a word.  Looking only at the raw preceding character
-    therefore mistakes
-    ``foo\\ #bar`` for a comment, even though the escaped space keeps ``#bar``
-    in the word.  An escaped newline has the same rule: after ``foo \\\n`` the
-    prior space still starts a comment, while after ``foo\\\n`` the hash stays
-    in the word.  This helper is deliberately limited to the balanced-span
-    walker; the main lexer retains its existing logical-word handling.
-    """
-    i = pos - 1
-    while i >= 0:
-        c = text[i]
-        if c == "\n":
-            # An odd run escapes this newline.  Removing its final backslash
-            # and the newline exposes the preceding source character; any
-            # remaining backslashes are literal word data and keep the hash
-            # out of comment position.
-            run_start = i - 1
-            while run_start >= 0 and text[run_start] == "\\":
-                run_start -= 1
-            run = i - run_start - 1
-            if run % 2 == 0:
-                return True
-            if run > 1:
-                return False
-            i = run_start
-            continue
-        if c not in _WORD_BREAK_BEFORE_COMMENT:
-            return False
-        backslashes = 0
-        j = i - 1
-        while j >= 0 and text[j] == "\\":
-            backslashes += 1
-            j -= 1
-        return backslashes % 2 == 0
-    return True
-
-
 def _skip_balanced_parens(text, start):
-    """Return the index just past the `)` matching the `(` at `start`."""
-    depth = 0
-    i = start
+    """Return just past the matching close, preserving shell versus word data.
+
+    Comment entry is a forward word-boundary decision.  Parameter operands
+    and extglob/arithmetic parentheses are word data; command substitutions
+    restart shell context and return to the enclosing word.
+    """
+    parens = ["shell"]
+    i = start + 1
     n = len(text)
     quotes = []
     parameter_depth = 0
+    word_started = False
+    glob_prefix = False
     while i < n:
         c = text[i]
         if quotes and quotes[-1] == "'":
@@ -1911,58 +1906,42 @@ def _skip_balanced_parens(text, start):
             i += 1
             continue
         if c == "\\":
+            if text[i + 1 : i + 2] != "\n":
+                word_started = True
+                glob_prefix = False
             i += 2
             continue
         if (
-            quotes
-            and quotes[-1] == '"'
-            and c == "$"
+            c == "$"
             and text[i + 1 : i + 2] == "("
-            and text[i + 2 : i + 3] != "("
+            and (text[i + 2 : i + 3] != "(" or not (quotes or parameter_depth))
         ):
-            # A command substitution inside double quotes starts a fresh
-            # shell quote context.  Its quotes and parentheses cannot close
-            # the enclosing double quote or balanced list (#1494 review).
-            i = _skip_balanced_parens(text, i + 1)
+            if text[i + 2 : i + 3] != "(":
+                i = _skip_balanced_parens(text, i + 1)
+            else:
+                # Retain ordinary balanced arithmetic counting, but its
+                # closes belong to a word rather than a shell separator.
+                parens.append("word")
+                i += 2
+            word_started = True
+            glob_prefix = False
             continue
-        if quotes and quotes[-1] == '"' and c == "`":
-            # Backticks also start an independent command-substitution
-            # context.  A quote in their body cannot close the enclosing
-            # double-quoted array element (#1494 review).
+        if c == "`":
             close = _find_backtick_close(text, i + 1)
             i = n if close is None else close + 1
-            continue
-        if (
-            parameter_depth
-            and c == "$"
-            and text[i + 1 : i + 2] == "("
-            and text[i + 2 : i + 3] != "("
-        ):
-            # The operand may itself run shell code.  Skip that substitution
-            # under its own comment/quote context so a comment there does not
-            # mutate the enclosing parameter depth or parenthesis count.
-            i = _skip_balanced_parens(text, i + 1)
+            word_started = True
+            glob_prefix = False
             continue
         if c == "$" and not quotes and text[i + 1 : i + 2] == "{":
-            # A parameter-expansion operand is not a command position.  In
-            # `${x:- #foo}`, the hash is data rather than a shell comment, so
-            # it cannot hide the real command-substitution close and later
-            # source.  The existing braced-reference helpers classify a
-            # reference but do not return the expansion's matching span.
             parameter_depth += 1
+            word_started = True
+            glob_prefix = False
             i += 2
-            continue
-        if (
-            c == "#"
-            and not quotes
-            and parameter_depth == 0
-            and _comment_starts_at(text, i)
-        ):
-            eol = text.find("\n", i)
-            i = n if eol == -1 else eol
             continue
         if c == "'" and not (quotes and quotes[-1] == '"'):
             quotes.append("'")
+            word_started = True
+            glob_prefix = False
             i += 1
             continue
         if c == '"':
@@ -1970,21 +1949,37 @@ def _skip_balanced_parens(text, start):
                 quotes.pop()
             else:
                 quotes.append('"')
+            word_started = True
+            glob_prefix = False
             i += 1
             continue
         if quotes:
             i += 1
             continue
-        if c == "}" and parameter_depth:
-            parameter_depth -= 1
+        if parameter_depth:
+            if c == "}":
+                parameter_depth -= 1
+            # Ordinary parentheses and hashes in an operand are data.
             i += 1
             continue
+        if c == "#" and parens[-1] == "shell" and not word_started:
+            eol = text.find("\n", i)
+            i = n if eol == -1 else eol
+            continue
         if c == "(":
-            depth += 1
+            kind = "word" if glob_prefix or parens[-1] == "word" else "shell"
+            parens.append(kind)
+            word_started = kind == "word"
         elif c == ")":
-            depth -= 1
-            if depth == 0:
+            kind = parens.pop()
+            if not parens:
                 return i + 1
+            word_started = kind == "word"
+        elif parens[-1] == "shell" and (c.isspace() or c in ";&|<>"):
+            word_started = False
+        else:
+            word_started = True
+        glob_prefix = c in "?*+@!"
         i += 1
     return n
 
@@ -4664,6 +4659,158 @@ CORPUS = [
         "helper-double-quoted-apostrophe",
         MUST_FLAG,
         'die() { echo "can\'t: $1" >&2; }\ndie "$GH_TOKEN"\n',
+    ),
+    # Boundary regressions introduced while preserving double-quote context.
+    (
+        'helper-parameter-operand-open-paren',
+        MUST_FLAG,
+        'die(){ x=; echo "$(printf \'%s\' ${x:-foo(bar}) $1" >&2; }; die "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-parameter-operand-open-paren-safe-control',
+        MUST_NOT_FLAG,
+        'safe(){ x=; : "$(printf \'%s\' ${x:-foo(bar}) $1"; }; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-parameter-operand-close-paren',
+        MUST_FLAG,
+        'die(){ x=; echo "$(printf \'%s\' ${x:-foo)bar}) $1" >&2; }; die "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-nested-parameter-operand-paren',
+        MUST_FLAG,
+        'die(){ x=; y=; echo "$(printf \'%s\' ${x:-${y:-foo(bar}}) $1" >&2; }; die "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-parameter-operand-nested-comment',
+        MUST_FLAG,
+        'die(){ x=; echo "$(printf \'%s\' ${x:-$(# } ) comment\nprintf x\n)}) $1" >&2; }; die "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-parameter-operand-single-quoted-positional-control',
+        MUST_NOT_FLAG,
+        'die(){ x=; echo "$(printf \'%s\' ${x:-foo(bar})" \'$1\' >&2; }; die "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-extglob-hash-word',
+        MUST_FLAG,
+        'shopt -s extglob\ndie(){ echo "$(printf \'%s\' @(foo)#bar) $1" >&2; }; die "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-nested-extglob-hash-word',
+        MUST_FLAG,
+        'shopt -s extglob\ndie(){ echo "$(printf \'%s\' pre@(foo|+(bar))#tail) $1" >&2; }; die "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-plus-extglob-hash-word',
+        MUST_FLAG,
+        'shopt -s extglob\ndie(){ echo "$(printf \'%s\' +(foo)#bar) $1" >&2; }; die "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-quoted-glob-hash-word',
+        MUST_FLAG,
+        'shopt -s extglob\ndie(){ echo "$(printf \'%s\' "@(foo)#bar") $1" >&2; }; die "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-escaped-glob-hash-word',
+        MUST_FLAG,
+        'shopt -s extglob\ndie(){ echo "$(printf \'%s\' \\@\\(foo\\)#bar) $1" >&2; }; die "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-extglob-hash-word-safe-control',
+        MUST_NOT_FLAG,
+        'shopt -s extglob\nsafe(){ : "$(printf \'%s\' @(foo)#bar) $1"; }; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-shell-close-comment-boundary',
+        MUST_FLAG,
+        'die(){ echo "$( (printf x)# ) comment\n) $1" >&2; }; die "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-cmdsub-close-hash-word',
+        MUST_FLAG,
+        'die(){ echo "$(printf \'%s\' $(printf x)#bar) $1" >&2; }; die "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-arithmetic-close-hash-word',
+        MUST_FLAG,
+        'die(){ echo "$(printf \'%s\' $((1 + 2))#bar) $1" >&2; }; die "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-ordinary-case-argument-safe-control',
+        MUST_NOT_FLAG,
+        'safe(){ : "$(echo case; printf x)"; }; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-case-ordinary-esac-argument-safe-control',
+        MUST_NOT_FLAG,
+        'safe(){ : "$(case x in x) echo esac; printf x;; esac)"; }; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-case-after-if-prefix-safe-control',
+        MUST_NOT_FLAG,
+        'safe(){ : "$(if case x in x) printf x;; esac; then printf y; fi)"; }; safe "$GH_TOKEN"\n',
+    ),
+    # Prefix controls must reach helper-local xtrace positional discovery.
+    (
+        'helper-xtrace-time-case-literal-control',
+        MUST_NOT_FLAG,
+        'safe(){ set -x; : "$(time case x in x) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-time-case-active',
+        MUST_FLAG,
+        'safe(){ set -x; : "$(time case x in x) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-time-portable-case-literal-control',
+        MUST_NOT_FLAG,
+        'safe(){ set -x; : "$(time -p case x in x) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-time-portable-case-active',
+        MUST_FLAG,
+        'safe(){ set -x; : "$(time -p case x in x) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-time-delimiter-case-literal-control',
+        MUST_NOT_FLAG,
+        'safe(){ set -x; : "$(time -p -- case x in x) : \'$1\';; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-time-delimiter-case-active',
+        MUST_FLAG,
+        'safe(){ set -x; : "$(time -p -- case x in x) : "$1";; esac)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-coproc-case-literal-control',
+        MUST_NOT_FLAG,
+        'safe(){ set -x; : "$(coproc case x in x) : \'$1\';; esac; wait)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-coproc-case-active',
+        MUST_FLAG,
+        'safe(){ set -x; : "$(coproc case x in x) : "$1";; esac; wait)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-named-coproc-case-literal-control',
+        MUST_NOT_FLAG,
+        'safe(){ set -x; : "$(coproc worker case x in x) : \'$1\';; esac; wait)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-named-coproc-case-active',
+        MUST_FLAG,
+        'safe(){ set -x; : "$(coproc worker case x in x) : "$1";; esac; wait)"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-ordinary-time-argument-control',
+        MUST_NOT_FLAG,
+        'safe(){ set -x; : "$(echo time case; : \'$1\')"; }; set +x; safe "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-xtrace-ordinary-coproc-argument-control',
+        MUST_NOT_FLAG,
+        'safe(){ set -x; : "$(echo coproc case; : \'$1\')"; }; set +x; safe "$GH_TOKEN"\n',
     ),
     (
         "helper-double-quoted-no-apostrophe-control",
