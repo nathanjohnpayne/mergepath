@@ -379,6 +379,13 @@ set -e
 [ "$rc" -eq 2 ] && pass "--check: stale cache exits 2" || fail "--check stale: exit $rc"
 guard_fails "--check stale cache" "$out"
 
+jq --argjson t "$(( $(date +%s) + 86400 ))" '.measured_at_epoch = $t' "$WORKDIR/stale.json" >"$CACHE/agent-capability-o_r-nathanpayne-claude.json"
+set +e
+out="$(run_probe -- --check --print-exports 2>/dev/null)"; rc=$?
+set -e
+[ "$rc" -eq 2 ] && pass "--check: future measurement time exits 2" || fail "--check future timestamp: exit $rc"
+guard_fails "--check future measurement time" "$out"
+
 rm -rf "$CACHE"
 set +e
 out="$(run_probe -- --check --print-exports 2>/dev/null)"; rc=$?

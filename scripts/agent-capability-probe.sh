@@ -210,6 +210,9 @@ if [ "$MODE" = "check" ]; then
     || die 2 "capability cache was measured for author '$cached_author' / reviewer '$cached_reviewer', this session expects '$AUTHOR_IDENTITY' / '$REVIEWER_IDENTITY'; re-run the probe"
   printf '%s' "$measured_at" | grep -Eq '^[0-9]+$' || die 2 "capability cache has no measurement time; re-run the probe"
   age=$(( $(date +%s) - measured_at ))
+  # A future timestamp makes age negative, which the TTL test alone would
+  # accept for TTL seconds past that future moment (CodeRabbit on #1526).
+  [ "$age" -ge 0 ] || die 2 "capability cache for $REPO has a future measurement time; re-run the probe"
   [ "$age" -le "$TTL_SECONDS" ] || die 2 "capability cache for $REPO is ${age}s old (TTL ${TTL_SECONDS}s); re-run the probe"
   tier="$(jq -r '.tier' "$CACHE_FILE")"
   if $PRINT_EXPORTS; then
