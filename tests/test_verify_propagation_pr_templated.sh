@@ -96,7 +96,25 @@ build_consumer() {
   HEAD_SHA=$(git -C "$cdir" rev-parse HEAD)
 }
 
+# The verifier only accepts a mergepath_dir that is a git checkout whose HEAD
+# is on the recorded default branch (refs/remotes/origin/HEAD). Commit a
+# plain fixture dir and record its HEAD as origin/main; a dir that is
+# already a repo (Case 8 stages its own index) only gets the default-branch
+# refs, so its deliberate index/disk mismatch is preserved.
+publish_mergepath() {  # $1=mp
+  if [ ! -d "$1/.git" ]; then
+    git_quiet -C "$1" init -q
+    git_quiet -C "$1" add -A
+    git_quiet -C "$1" commit -q -m mp
+  fi
+  if ! git -C "$1" symbolic-ref -q refs/remotes/origin/HEAD >/dev/null; then
+    git -C "$1" update-ref refs/remotes/origin/main HEAD
+    git -C "$1" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  fi
+}
+
 run_verify() {  # $1=mp $2=consumer; sets RC, STDOUT_FILE, STDERR_FILE
+  publish_mergepath "$1"
   STDOUT_FILE=$(mktemp "${TMPDIR:-/tmp}/verify-out.XXXXXX")
   STDERR_FILE=$(mktemp "${TMPDIR:-/tmp}/verify-err.XXXXXX")
   set +e
@@ -221,6 +239,7 @@ build_consumer "$C4" "doesnt matter
 "
 # Run with strict mode on. MERGEPATH_TEMPLATE_STRICT is honored by the
 # template lib at render time.
+publish_mergepath "$MP4"
 STDOUT_FILE=$(mktemp "${TMPDIR:-/tmp}/verify-out.XXXXXX")
 STDERR_FILE=$(mktemp "${TMPDIR:-/tmp}/verify-err.XXXXXX")
 set +e

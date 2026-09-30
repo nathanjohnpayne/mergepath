@@ -63,19 +63,37 @@ set -euo pipefail
 #      equal the templated .path — the PR then routes to normal
 #      Phase 4 review, same as the pre-#323 status quo.
 #
-# Usage:
-#   verify-propagation-pr.sh <mergepath_dir> <consumer_dir> <base_sha> <head_sha>
+# Source-commit provenance (always enforced, before any byte compare):
+#   The <sha> in a sync branch name is attacker-choosable — any commit that
+#   exists anywhere in the public mergepath repository, including one on an
+#   unmerged branch or a fork-PR ref, can be checked out by SHA. A faithful
+#   mirror of such a commit is a faithful mirror of UNREVIEWED content. So
+#   <mergepath_dir> must be a git checkout whose HEAD is an ancestor of (or
+#   equal to) mergepath's default branch as recorded by the clone
+#   (refs/remotes/origin/HEAD) — i.e. content that already merged through
+#   mergepath's own review. When <source_sha> is passed it must be the full
+#   40-hex id of that same HEAD, so the verdict is bound to the commit the
+#   caller resolved from the branch name. Anything unprovable is not
+#   lane-eligible.
 #
-#   mergepath_dir  a checkout of nathanjohnpayne/mergepath at the
+# Usage:
+#   verify-propagation-pr.sh <mergepath_dir> <consumer_dir> <base_sha> <head_sha> [<source_sha>]
+#
+#   mergepath_dir  a git checkout of nathanjohnpayne/mergepath at the
 #                  sync's source commit (the <sha> in the PR branch
 #                  name mergepath-sync/<sha> or
-#                  mergepath-sync/sync-all-<sha>[-<scope-digest>]). Provides BOTH
-#                  the authoritative manifest AND the canonical content
-#                  to compare against.
+#                  mergepath-sync/sync-all-<sha>[-<scope-digest>]), with
+#                  refs/remotes/origin/HEAD naming the default branch (a
+#                  plain `git clone` records it). Provides BOTH the
+#                  authoritative manifest AND the canonical content to
+#                  compare against.
 #   consumer_dir   the consumer repo's PR checkout (a git work tree;
 #                  base..head must be resolvable in it).
 #   base_sha       PR base SHA.
 #   head_sha       PR head SHA.
+#   source_sha     optional; the FULL 40-hex mergepath commit the caller
+#                  resolved from the branch name. Must equal
+#                  mergepath_dir's HEAD.
 #
 # Exit codes:
 #   0  faithful mirror — every changed file is under a manifest path
@@ -86,12 +104,18 @@ set -euo pipefail
 #      manifest, deviates from mergepath@<sha>, or its templated
 #      re-render diverges. The PR must go through normal Phase 3/4
 #      review. Deviations are listed on stderr.
-#   2  usage / environment error (bad args, missing manifest, etc.).
+#   2  usage / environment error (bad args, missing manifest,
+#      mergepath_dir not a git checkout, default branch unrecorded, etc.).
+#
+# The source-commit provenance check exits 1 when mergepath_dir's HEAD is
+# not on mergepath's default branch (a verdict: not lane-eligible) and 2
+# when provenance cannot be evaluated. Every non-zero exit keeps the PR
+# out of the lane.
 #
 # Bash 3.2 portable: no `mapfile`, no associative arrays.
 
 usage() {
-  echo "usage: verify-propagation-pr.sh <mergepath_dir> <consumer_dir> <base_sha> <head_sha>" >&2
+  echo "usage: verify-propagation-pr.sh <mergepath_dir> <consumer_dir> <base_sha> <head_sha> [<source_sha>]" >&2
   exit 2
 }
 
@@ -99,11 +123,57 @@ MERGEPATH_DIR="${1:-}"
 CONSUMER_DIR="${2:-}"
 BASE_SHA="${3:-}"
 HEAD_SHA="${4:-}"
+SOURCE_SHA="${5:-}"
 [ -n "$MERGEPATH_DIR" ] && [ -n "$CONSUMER_DIR" ] && [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ] || usage
+[ $# -le 5 ] || usage
 
 MANIFEST="$MERGEPATH_DIR/.mergepath-sync.yml"
 if [ ! -f "$MANIFEST" ]; then
   echo "verify-propagation-pr.sh: no .mergepath-sync.yml in mergepath checkout: $MANIFEST" >&2
+  exit 2
+fi
+
+# Source-commit provenance — see the header. Runs before any comparison so
+# no verdict is ever issued for content that has not merged into mergepath's
+# default branch.
+if [ "$(git -C "$MERGEPATH_DIR" rev-parse --show-toplevel 2>/dev/null)" != "$(cd "$MERGEPATH_DIR" && pwd -P)" ]; then
+  echo "verify-propagation-pr.sh: mergepath_dir is not the top of a git checkout ($MERGEPATH_DIR) — cannot prove its source commit is on mergepath's default branch" >&2
+  exit 2
+fi
+MP_SOURCE_COMMIT=$(git -C "$MERGEPATH_DIR" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null || true)
+if ! [[ "$MP_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "verify-propagation-pr.sh: could not resolve mergepath_dir HEAD to a full commit id" >&2
+  exit 2
+fi
+if [ -n "$SOURCE_SHA" ]; then
+  if ! [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    echo "verify-propagation-pr.sh: source_sha must be a full 40-hex commit id; got '$SOURCE_SHA'" >&2
+    exit 2
+  fi
+  if [ "$(printf '%s' "$SOURCE_SHA" | tr 'A-F' 'a-f')" != "$MP_SOURCE_COMMIT" ]; then
+    echo "verify-propagation-pr.sh: mergepath_dir HEAD $MP_SOURCE_COMMIT is not the requested source commit $SOURCE_SHA" >&2
+    exit 1
+  fi
+fi
+MP_DEFAULT_REF=$(git -C "$MERGEPATH_DIR" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)
+case "$MP_DEFAULT_REF" in
+  refs/remotes/origin/?*) ;;
+  *)
+    echo "verify-propagation-pr.sh: mergepath_dir records no default branch (refs/remotes/origin/HEAD) — cannot prove $MP_SOURCE_COMMIT is on it" >&2
+    exit 2
+    ;;
+esac
+if ! git -C "$MERGEPATH_DIR" rev-parse --verify --quiet "$MP_DEFAULT_REF^{commit}" >/dev/null 2>&1; then
+  echo "verify-propagation-pr.sh: mergepath default branch ref $MP_DEFAULT_REF does not resolve to a commit" >&2
+  exit 2
+fi
+ancestry_rc=0
+git -C "$MERGEPATH_DIR" merge-base --is-ancestor "$MP_SOURCE_COMMIT" "$MP_DEFAULT_REF" 2>/dev/null || ancestry_rc=$?
+if [ "$ancestry_rc" -eq 1 ]; then
+  echo "verify-propagation-pr.sh: mergepath source commit $MP_SOURCE_COMMIT is NOT on mergepath's default branch (${MP_DEFAULT_REF#refs/remotes/}) — only content that has merged there is lane-eligible" >&2
+  exit 1
+elif [ "$ancestry_rc" -ne 0 ]; then
+  echo "verify-propagation-pr.sh: could not evaluate ancestry of $MP_SOURCE_COMMIT against ${MP_DEFAULT_REF#refs/remotes/} (git rc=$ancestry_rc)" >&2
   exit 2
 fi
 
@@ -390,23 +460,9 @@ if [ "$TEMPLATED_SURFACE_ACTIVE" = "1" ] && [ -n "$CONSUMER_NAME" ]; then
         # exec bit can drift from the recorded git mode, and the consumer
         # side below — plus the canonical loop's mergepath-side read — both
         # read git modes, so reading the source on-disk broke parity. Use
-        # `git ls-tree HEAD` when MERGEPATH_DIR is a git checkout (always so
-        # in production); fall back to an on-disk stat only when it is not
-        # (test fixtures that stage files without a repo), mirroring the
-        # canonical loop's git-or-disk handling below.
-        if [ -d "$MERGEPATH_DIR/.git" ] || [ -f "$MERGEPATH_DIR/.git" ]; then
-          # Git checkout (always so in production): the committed mode is
-          # authoritative.
-          tpl_source_entry=$(git -C "$MERGEPATH_DIR" ls-tree HEAD -- "$tpl_source" 2>/dev/null | awk '{print $1, $2}')
-        else
-          # Non-git fixture dir (tests stage files without a repo): the
-          # filesystem exec bit is the only signal available.
-          if [ -x "$mp_source_abs" ]; then
-            tpl_source_entry="100755 blob"
-          else
-            tpl_source_entry="100644 blob"
-          fi
-        fi
+        # `git ls-tree HEAD`: mergepath_dir is always a git checkout (the
+        # source-commit provenance check above refuses anything else).
+        tpl_source_entry=$(git -C "$MERGEPATH_DIR" ls-tree HEAD -- "$tpl_source" 2>/dev/null | awk '{print $1, $2}')
         # Fail closed unless the source resolves to a regular-file blob.
         # check_sync_manifest already requires templated sources to be
         # regular files; an empty read (source not tracked at HEAD in the
@@ -482,24 +538,11 @@ while IFS= read -r f; do
   consumer_entry=$(git -C "$CONSUMER_DIR" ls-tree "$HEAD_SHA" -- "$f" 2>/dev/null | awk '{print $1, $2, $3}')
   [ -z "$consumer_entry" ] && consumer_present=0
   mergepath_present=1
-  if [ -d "$MERGEPATH_DIR/.git" ] || [ -f "$MERGEPATH_DIR/.git" ]; then
-    # mergepath_dir is a git checkout — `ls-tree HEAD` gives the
-    # authoritative tree entry (mode/type from git's index, not a
-    # filesystem mode that could vary by clone permissions).
-    mergepath_entry=$(git -C "$MERGEPATH_DIR" ls-tree HEAD -- "$f" 2>/dev/null | awk '{print $1, $2, $3}')
-    [ -z "$mergepath_entry" ] && mergepath_present=0
-  else
-    # Test harness fallback: mergepath_dir is a plain directory.
-    # Synthesize a tree entry from the on-disk file: mode 100755 if
-    # executable else 100644, type blob, oid via hash-object.
-    if [ -f "$MERGEPATH_DIR/$f" ]; then
-      if [ -x "$MERGEPATH_DIR/$f" ]; then mode="100755"; else mode="100644"; fi
-      mp_oid=$(git hash-object "$MERGEPATH_DIR/$f")
-      mergepath_entry="$mode blob $mp_oid"
-    else
-      mergepath_entry=""; mergepath_present=0
-    fi
-  fi
+  # mergepath_dir is a git checkout (enforced above) — `ls-tree HEAD` gives
+  # the authoritative tree entry (mode/type from git's index, not a
+  # filesystem mode that could vary by clone permissions).
+  mergepath_entry=$(git -C "$MERGEPATH_DIR" ls-tree HEAD -- "$f" 2>/dev/null | awk '{print $1, $2, $3}')
+  [ -z "$mergepath_entry" ] && mergepath_present=0
 
   if [ "$consumer_present" -eq 0 ] && [ "$mergepath_present" -eq 0 ]; then
     # Faithful delete: f removed in the PR, and absent at mergepath@<sha>.
