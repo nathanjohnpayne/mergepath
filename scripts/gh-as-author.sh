@@ -186,14 +186,13 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
   set -- "${NORMALIZED_COMMAND[@]}"
 fi
 
-# The verified token is the only credential gh may use for the write, on any
-# host: an Enterprise Server target (--repo host/owner/repo) would otherwise
-# read GH_ENTERPRISE_TOKEN / GITHUB_ENTERPRISE_TOKEN or a stored login rather
-# than GH_TOKEN. Pinned, such a write authenticates as the verified token or
-# fails (Codex P1 on #1541).
+# The verified token goes to github.com only. Any other host gets the resolver's
+# non-credential sentinel in place of an Enterprise token or stored login, so
+# it can neither carry the write nor receive the PAT (see gh-token-resolver.sh).
 run_with_author_token() {
   unset GITHUB_TOKEN
-  GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$TOKEN" GITHUB_ENTERPRISE_TOKEN="$TOKEN" "$@"
+  GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+    GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" "$@"
 }
 
 if [ "$IS_PR_CREATE" -eq 1 ]; then
@@ -218,7 +217,8 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
 
   ACTUAL_AUTHOR=$(
     unset GITHUB_TOKEN
-    GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$TOKEN" GITHUB_ENTERPRISE_TOKEN="$TOKEN" gh pr view "$PR_NUM" --repo "$PR_REPO" --json author --jq .author.login 2>/dev/null || echo ""
+    GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+      GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" gh pr view "$PR_NUM" --repo "$PR_REPO" --json author --jq .author.login 2>/dev/null || echo ""
   )
   if [ -z "$ACTUAL_AUTHOR" ]; then
     echo "gh-as-author: ERROR could not read PR author from gh pr view $PR_NUM --repo $PR_REPO; refusing to treat the create as verified." >&2

@@ -20,6 +20,16 @@ gh_resolver_repo_root() {
   printf '%s\n' "$this_dir"
 }
 
+# gh sends GH_TOKEN only to github.com; any other host reads
+# GH_ENTERPRISE_TOKEN / GITHUB_ENTERPRISE_TOKEN, then a stored login. The
+# wrappers set both to this fixed non-credential value for the wrapped command:
+# no ambient Enterprise token or stored login can carry a guarded write, and a
+# non-GitHub destination (--hostname, --repo host/o/r, GH_REPO) receives this
+# string instead of the verified PAT, so its request fails authentication
+# rather than exposing the credential (#1057; Codex and CodeRabbit on #1541).
+# shellcheck disable=SC2034
+GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL="mergepath-guarded-write-github-com-only"
+
 gh_default_reviewer_identity() {
   if [ -n "${GH_AS_REVIEWER_IDENTITY:-}" ]; then
     printf '%s\n' "$GH_AS_REVIEWER_IDENTITY"

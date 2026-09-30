@@ -857,7 +857,7 @@ else
 fi
 
 # Codex P1 on #1541: the author write runs with the Enterprise credentials
-# pinned to the verified token, so an Enterprise Server target cannot use
+# set to a non-credential sentinel, so an Enterprise Server target cannot use
 # another credential.
 reset_log
 : >"$WORKDIR/ent.log"
@@ -866,8 +866,8 @@ STUB_ENT_LOG="$WORKDIR/ent.log" OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" \
   run_wrapper -- gh pr merge 123 --squash >/dev/null 2>&1
 rc=$?
 set -e
-if [ "$rc" -eq 0 ] && grep -qx 'ghp_author-token|ghp_author-token|pr merge' "$WORKDIR/ent.log"; then
-  pass "enterprise credentials: the author write runs with both pinned to the verified token"
+if [ "$rc" -eq 0 ] && grep -qx 'mergepath-guarded-write-github-com-only|mergepath-guarded-write-github-com-only|pr merge' "$WORKDIR/ent.log"; then
+  pass "enterprise credentials: the author write runs with both set to the non-credential sentinel"
 else
   fail "author enterprise pinning: rc=$rc log=$(cat "$WORKDIR/ent.log")"
 fi

@@ -255,7 +255,7 @@ fi
 
 # Codex P1 on #1541: gh reads GH_ENTERPRISE_TOKEN / GITHUB_ENTERPRISE_TOKEN,
 # not GH_TOKEN, for an Enterprise Server target. The write runs with both
-# pinned to the verified token, and an ambient different one stops it.
+# set to a non-credential sentinel, and an ambient different one stops it.
 reset_log
 : >"$WORKDIR/ent.log"
 set +e
@@ -263,8 +263,8 @@ STUB_ENT_LOG="$WORKDIR/ent.log" OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" \
   run_wrapper -- gh pr comment 123 --body "x" >/dev/null 2>&1
 rc=$?
 set -e
-if [ "$rc" -eq 0 ] && grep -qx 'ghp_reviewer-token|ghp_reviewer-token|pr comment' "$WORKDIR/ent.log"; then
-  pass "enterprise credentials: the write runs with both pinned to the verified token"
+if [ "$rc" -eq 0 ] && grep -qx 'mergepath-guarded-write-github-com-only|mergepath-guarded-write-github-com-only|pr comment' "$WORKDIR/ent.log"; then
+  pass "enterprise credentials: the write runs with both set to the non-credential sentinel"
 else
   fail "enterprise pinning: rc=$rc log=$(cat "$WORKDIR/ent.log")"
 fi

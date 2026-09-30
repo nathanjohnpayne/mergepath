@@ -44,12 +44,13 @@ fi
 
 TOKEN="$GH_RESOLVED_TOKEN"
 set +e
-# The verified token is the only credential gh may use, on any host: pinned,
-# an Enterprise Server target authenticates as it or fails, rather than
-# reading an ambient Enterprise token or stored login (Codex P1 on #1541).
+# The verified token goes to github.com only. Any other host gets the resolver's
+# non-credential sentinel in place of an Enterprise token or stored login, so
+# it can neither carry the write nor receive the PAT (see gh-token-resolver.sh).
 (
   unset GITHUB_TOKEN
-  GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$TOKEN" GITHUB_ENTERPRISE_TOKEN="$TOKEN" "$@"
+  GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+    GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" "$@"
 )
 WRAPPED_RC=$?
 set -e
