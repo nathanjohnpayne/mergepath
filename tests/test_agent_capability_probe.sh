@@ -102,7 +102,9 @@ case "$tok" in
   proxy-injected) login=nathanjohnpayne; perms='{"pull":true,"push":true}' ;;
 esac
 status=200; body=""
-if [ -n "${STUB_FAIL_STATUS:-}" ]; then
+if [ "$tok" = "ghp_flaky" ]; then
+  status=503; body='{"message":"Service Unavailable"}'
+elif [ -n "${STUB_FAIL_STATUS:-}" ]; then
   status="$STUB_FAIL_STATUS"; body='{"message":"Server Error"}'
 elif [ -z "$login" ]; then
   status=401; body='{"message":"Bad credentials"}'
@@ -229,9 +231,9 @@ run_probe GH_TOKEN=ghp_author OP_PREFLIGHT_AUTHOR_PAT=ghp_author OP_PREFLIGHT_RE
   >"$WORKDIR/local.json" 2>"$WORKDIR/local.err"
 rc=$?
 set -e
-if [ "$rc" -eq 0 ] && [ "$(jq -r .tier "$WORKDIR/local.json")" = "author-writes,reviewer-writes,graphql,cross-repo,push-multi-branch" ] \
+if [ "$rc" -eq 0 ] && [ "$(jq -r .tier "$WORKDIR/local.json")" = "author-writes,reviewer-writes,graphql,cross-repo" ] \
    && [ "$(jq -r .surface "$WORKDIR/local.json")" = "local" ]; then
-  pass "local + user-held PATs: every capability granted, tier lists all five"
+  pass "local + user-held PATs: every measurable capability granted"
 else
   fail "local + user-held PATs: rc=$rc tier=$(jq -r .tier "$WORKDIR/local.json" 2>/dev/null) err=$(cat "$WORKDIR/local.err")"
 fi
@@ -357,7 +359,7 @@ rc=$?
 set -e
 evald="$(bash -c "$out"'
 printf "%s|%s|%s" "$MERGEPATH_AGENT_TIER" "$MERGEPATH_CAP_AUTHOR_WRITES" "$MERGEPATH_CAP_REVIEWER_WRITES"' 2>/dev/null || true)"
-if [ "$rc" -eq 0 ] && [ "$evald" = "author-writes,graphql,cross-repo,push-multi-branch|1|0" ]; then
+if [ "$rc" -eq 0 ] && [ "$evald" = "author-writes,graphql,cross-repo|1|0" ]; then
   pass "--check --print-exports on a fresh cache: exports evaluate to the cached tier and flags"
 else
   fail "--check --print-exports fresh: rc=$rc evald=$evald out=$out"
@@ -442,15 +444,13 @@ else
   fail "reviewer pull-only: $(jq -c '.capabilities["reviewer-writes"]' "$WORKDIR/rev.json")"
 fi
 
-# A dry-run push that negotiates is not enough without push permission.
-set +e
-run_probe GH_TOKEN=ghp_reviewer -- --no-cache >"$WORKDIR/nopush.json" 2>/dev/null
-set -e
-if [ "$(cap "$WORKDIR/nopush.json" push-multi-branch)" = "false" ] \
-   && reason "$WORKDIR/nopush.json" push-multi-branch | grep -q "does not report push permission"; then
-  pass "dry-run push without push permission: push-multi-branch not granted"
+# Outside Claude cloud, multi-branch push is not measured: nothing short of a
+# real push proves the server accepts one (Codex rounds 1-3 on #1526).
+if [ "$(cap "$WORKDIR/local.json" push-multi-branch)" = "false" ] \
+   && [ "$(jq -r '.capabilities["push-multi-branch"].basis' "$WORKDIR/local.json")" = "not-measured" ]; then
+  pass "local: push-multi-branch reported not-measured, never granted from a dry run"
 else
-  fail "dry-run without permission: $(jq -c '.capabilities["push-multi-branch"]' "$WORKDIR/nopush.json")"
+  fail "local push: $(jq -c '.capabilities["push-multi-branch"]' "$WORKDIR/local.json")"
 fi
 
 # ---------------------------------------------------------------------------
@@ -498,17 +498,6 @@ if [ "$(cap "$WORKDIR/fg.json" author-writes)" = "false" ] \
   pass "fine-grained token with a push role: author-writes unverifiable, not granted"
 else
   fail "fine-grained push role: $(jq -c '.capabilities["author-writes"]' "$WORKDIR/fg.json")"
-fi
-
-# A ruleset restricting branch creation refuses multi-branch push.
-set +e
-run_probe GH_TOKEN=ghp_author STUB_RULES='[{"type":"creation"}]' -- --no-cache >"$WORKDIR/rules.json" 2>/dev/null
-set -e
-if [ "$(cap "$WORKDIR/rules.json" push-multi-branch)" = "false" ] \
-   && reason "$WORKDIR/rules.json" push-multi-branch | grep -q "rulesets restrict new branches (creation)"; then
-  pass "creation ruleset on new branches: push-multi-branch not granted"
-else
-  fail "creation ruleset: $(jq -c '.capabilities["push-multi-branch"]' "$WORKDIR/rules.json")"
 fi
 
 # A server error is not a denial: flagged, and never cached.
@@ -561,6 +550,65 @@ if [ "$rc" -eq 0 ] && [ "$(jq -r .repo "$WORKDIR/alias.json")" = "owner/aliased"
   pass "git@github-claude:owner/repo derives the repository"
 else
   fail "SSH alias: rc=$rc repo=$(jq -r .repo "$WORKDIR/alias.json" 2>/dev/null)"
+fi
+
+# ---------------------------------------------------------------------------
+# Codex round 3 on #1526.
+# ---------------------------------------------------------------------------
+# The cached cross-repo answer is specific to its target.
+rm -rf "$CACHE"
+run_probe GH_TOKEN=ghp_author -- --cross-repo other/one >/dev/null 2>&1
+set +e
+out="$(run_probe -- --check --print-exports 2>/dev/null)"; rc=$?
+same="$(run_probe -- --cross-repo other/one --check --print-exports 2>/dev/null)"; same_rc=$?
+set -e
+if [ "$rc" -eq 2 ] && [ "$same_rc" -eq 0 ]; then
+  pass "--check: a cache measured against another cross-repo target is rejected; the same target is accepted"
+else
+  fail "--check cross-repo target: default=$rc same=$same_rc"
+fi
+guard_fails "--check another cross-repo target" "$out"
+
+# A transient failure inside the resolver's own GET /user is not cached.
+rm -rf "$CACHE"
+set +e
+run_probe GH_TOKEN=ghp_author OP_PREFLIGHT_REVIEWER_PAT=ghp_flaky -- >"$WORKDIR/flaky.json" 2>"$WORKDIR/flaky.err"
+set -e
+if [ "$(jq -r .transient_failures "$WORKDIR/flaky.json")" = "true" ] \
+   && [ "$(cap "$WORKDIR/flaky.json" reviewer-writes)" = "false" ] \
+   && [ ! -e "$CACHE/agent-capability-o_r-nathanpayne-claude.json" ]; then
+  pass "resolver GET /user answered 503: marked transient, reviewer-writes not cached as a denial"
+else
+  fail "resolver transient: transient=$(jq -r .transient_failures "$WORKDIR/flaky.json" 2>/dev/null) cache=$(ls "$CACHE" 2>/dev/null)"
+fi
+
+# curl behind an HTTPS proxy: the origin's status is the last status line.
+CONNECT_DIR="$WORKDIR/connect-bin"
+mkdir -p "$CONNECT_DIR"
+for tool in "$NOGH_DIR"/*; do ln -sf "$(readlink "$tool" 2>/dev/null || echo "$tool")" "$CONNECT_DIR/$(basename "$tool")"; done
+rm -f "$CONNECT_DIR/curl"
+cat >"$CONNECT_DIR/curl" <<'STUB'
+#!/usr/bin/env bash
+hdr=""; out=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -D) hdr="$2"; shift 2 ;;
+    -o) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf 'HTTP/1.1 200 Connection established\r\n\r\nHTTP/2 403\r\ncontent-type: application/json\r\n\r\n' >"$hdr"
+printf '{"message":"Forbidden"}' >"$out"
+STUB
+chmod +x "$CONNECT_DIR/curl"
+set +e
+env -i HOME="$HOME" PATH="$CONNECT_DIR" MERGEPATH_CAPABILITY_CACHE_DIR="$CACHE" GH_TOKEN=ghp_author \
+  "$CONNECT_DIR/bash" "$PROBE" --repo o/r --no-cache >"$WORKDIR/connect.json" 2>/dev/null
+set -e
+if [ "$(cap "$WORKDIR/connect.json" read)" = "false" ] && reason "$WORKDIR/connect.json" read | grep -q "returned 403"; then
+  pass "curl path: a proxy CONNECT 200 before an origin 403 reads as 403"
+else
+  fail "curl CONNECT parse: $(jq -c '.capabilities.read' "$WORKDIR/connect.json" 2>/dev/null)"
 fi
 
 echo

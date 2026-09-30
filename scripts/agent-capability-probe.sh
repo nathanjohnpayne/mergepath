@@ -17,8 +17,8 @@
 #
 #   scripts/agent-capability-probe.sh --check [--print-exports] [--repo OWNER/REPO]
 #     Never probes, never touches the network. Validates the cache for this
-#     repo, surface, author identity, reviewer identity and (in a Claude cloud
-#     session) CLAUDE_CODE_REMOTE_SESSION_ID. Bare --check reports on stderr only. With
+#     repo, surface, cross-repo target, author identity, reviewer identity and
+#     (in a Claude cloud session) CLAUDE_CODE_REMOTE_SESSION_ID. Bare --check reports on stderr only. With
 #     --print-exports, prints `export MERGEPATH_AGENT_TIER=...` and one
 #     `export MERGEPATH_CAP_<NAME>=0|1` per capability for
 #       eval "$(scripts/agent-capability-probe.sh --check --print-exports)"
@@ -34,12 +34,10 @@
 #   cross-repo         GET repos/<cross-repo> succeeds (default
 #                      octocat/Hello-World: public, so only a repository-scope
 #                      restriction can refuse it)
-#   push-multi-branch  `git push --dry-run --no-verify` of HEAD to a fresh
-#                      branch name negotiates AND the repository reports push
-#                      permission AND no ruleset restricts creating or
-#                      updating that name; a dry run alone is never proof, and
-#                      a Claude cloud session is reported false from its
-#                      documented push restriction regardless
+#   push-multi-branch  reported false in a Claude cloud session from the
+#                      proxy's documented one-branch push restriction, and
+#                      `not-measured` elsewhere: nothing short of a real push
+#                      proves a push is accepted
 #   author-writes      the wrapper token resolver finds a token for the
 #                      repo's author_identity AND that token is a user-held
 #                      credential (scripts/lib/credential-class.sh) whose
@@ -60,10 +58,11 @@
 #
 # Surface: MERGEPATH_AGENT_SURFACE (local|claude-cloud|codex-cloud|ci) wins
 # when set; otherwise CLAUDE_CODE_REMOTE=true -> claude-cloud,
-# GITHUB_ACTIONS=true -> ci, else local. Codex cloud sets no documented marker,
-# so its environment must set MERGEPATH_AGENT_SURFACE=codex-cloud (see
-# docs/agents/cloud-environments.md); until it does it reads as local with
-# surface_source "default".
+# GITHUB_ACTIONS=true -> ci, else local. Codex cloud sets no documented marker
+# (the codex-universal image defines no CODEX_* variable), so a Codex cloud
+# environment must set MERGEPATH_AGENT_SURFACE=codex-cloud among its
+# environment variables. Without it the session reads as local with
+# surface_source "default", which the output shows rather than hides.
 #
 # Environment:
 #   MERGEPATH_CAPABILITY_CACHE_DIR    cache dir (default
@@ -219,6 +218,9 @@ if [ "$MODE" = "check" ]; then
   cached_session="$(jq -r '.session_id // empty' "$CACHE_FILE")"
   [ "$cached_session" = "${CLAUDE_CODE_REMOTE_SESSION_ID:-}" ] \
     || die 2 "capability cache was measured in session '${cached_session:-none}', this is '${CLAUDE_CODE_REMOTE_SESSION_ID:-none}'; re-run the probe"
+  cached_cross="$(jq -r '.cross_repo_target // empty' "$CACHE_FILE")"
+  [ "$cached_cross" = "$CROSS_REPO" ] \
+    || die 2 "capability cache measured cross-repo against '$cached_cross', this check asks about '$CROSS_REPO'; re-run the probe"
   cached_author="$(jq -r '.capabilities["author-writes"].identity // empty' "$CACHE_FILE")"
   cached_reviewer="$(jq -r '.capabilities["reviewer-writes"].identity // empty' "$CACHE_FILE")"
   [ "$cached_author" = "$AUTHOR_IDENTITY" ] && [ "$cached_reviewer" = "$REVIEWER_IDENTITY" ] \
@@ -284,16 +286,19 @@ api_request() {
     [ -n "$auth_token" ] && printf 'Authorization: token %s\n' "$auth_token" >"$hdr"
     [ -n "$query" ] && data="$(jq -cn --arg q "$query" '{query: $q}')"
     if [ -n "$data" ]; then
-      curl -sS --connect-timeout 10 --max-time 30 -X "$method" -H @"$hdr" -H 'Accept: application/vnd.github+json' \
+      curl -sS --suppress-connect-headers --connect-timeout 10 --max-time 30 -X "$method" -H @"$hdr" -H 'Accept: application/vnd.github+json' \
         -D "$raw" -o "$prefix.body" --data "$data" "https://api.github.com/$path" 2>/dev/null || true
     else
-      curl -sS --connect-timeout 10 --max-time 30 -X "$method" -H @"$hdr" -H 'Accept: application/vnd.github+json' \
+      curl -sS --suppress-connect-headers --connect-timeout 10 --max-time 30 -X "$method" -H @"$hdr" -H 'Accept: application/vnd.github+json' \
         -D "$raw" -o "$prefix.body" "https://api.github.com/$path" 2>/dev/null || true
     fi
     rm -f "$hdr"
     tr -d '\r' <"$raw" >"$prefix.headers" 2>/dev/null || true
   fi
-  status="$(sed -nE '1s#^HTTP/[0-9.]+ ([0-9]{3}).*#\1#p' "$prefix.headers" 2>/dev/null || true)"
+  # The LAST status line is the origin's: a proxy's "200 Connection
+  # established" block can precede it (Codex P2 on #1526), which
+  # --suppress-connect-headers also drops on the curl path.
+  status="$(sed -nE 's#^HTTP/[0-9.]+ ([0-9]{3}).*#\1#p' "$prefix.headers" 2>/dev/null | tail -1 || true)"
   status="${status:-000}"
   # No response, a server error, or a rate limit says nothing about what this
   # session may do. Record it so the result is not cached as a measurement
@@ -331,6 +336,15 @@ measure_write() {
     gh_resolve_token_for_identity "$identity" "$preferred" "agent-capability-probe" >/dev/null 2>"$WORKDIR/resolve.err" || rc=$?
     if [ "$rc" -ne 0 ] || [ -z "${GH_RESOLVED_TOKEN:-}" ]; then
       reason="no-verified-token (resolver exit $rc)"
+      # The resolver's own GET /user runs inside identity-check.sh, outside
+      # api_request's classifier. Repeat it once for the candidate so an
+      # outage or rate limit marks the run transient instead of caching a
+      # 12-hour denial (Codex P2 on #1526).
+      local candidate="${!preferred:-${GH_TOKEN:-}}"
+      if [ -n "$candidate" ]; then
+        api_request "$candidate" GET user "$WORKDIR/resolve-user" >/dev/null
+      fi
+      candidate=""
     else
       status="$(api_request "$GH_RESOLVED_TOKEN" GET user "$WORKDIR/write-user")"
       class="$(credential_class "$GH_RESOLVED_TOKEN" "$WORKDIR/write-user.headers")"
@@ -443,37 +457,17 @@ else
 fi
 
 # push-multi-branch
+# Only the documented Claude cloud restriction is reported. Everywhere else
+# this is NOT measured: a dry-run push never sends the ref update, so it cannot
+# show the server would accept one, and neither can the API permission of a
+# credential that is not necessarily the one `origin` pushes with (SSH remotes
+# authenticate separately). Earlier rounds of #1526 tried to prove it from
+# those pieces; each addition exposed another gap, so the probe states the
+# limit instead of approximating past it.
 if [ "$SURFACE" = "claude-cloud" ]; then
   cap_json false documented "Claude cloud proxy accepts pushes only to the session's working branch" "$WORKDIR/cap-push-multi-branch.json"
 else
-  probe_branch="mergepath-capability-probe-$(date +%s)-$$"
-  rules_status=""
-  # A dry run never sends the ref update, so on its own it proves only that
-  # the remote is reachable and would negotiate (Codex P2 on #1526). Grant
-  # the capability only when the repository also reports push permission for
-  # the session's credential; branch rulesets on the new name are still not
-  # evaluated, which the reason states.
-  ambient_push="$(jq -r '.permissions.push // false' "$WORKDIR/read.body" 2>/dev/null || echo false)"
-  # Rulesets are the server-side policy a dry run never reaches (Codex P2 on
-  # #1526). GitHub reports the rules that would apply to a branch by name,
-  # including one that does not exist yet; a `creation` or `update` rule means
-  # a real push of a new branch can be refused, and an unreadable answer is
-  # not evidence either way.
-  rules_status="$(api_request "" GET "repos/$REPO/rules/branches/$probe_branch" "$WORKDIR/rules")"
-  restricting_rules="$(jq -r '[.[]?.type | select(. == "creation" or . == "update")] | unique | join(",")' "$WORKDIR/rules.body" 2>/dev/null || echo unreadable)"
-  if ! GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/echo \
-     GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes}" \
-     git -C "$ROOT" push --dry-run --no-verify --quiet origin "HEAD:refs/heads/$probe_branch" >/dev/null 2>&1; then
-    cap_json false measured-dry-run "dry-run push to a second branch was refused" "$WORKDIR/cap-push-multi-branch.json"
-  elif [ "$ambient_push" != "true" ]; then
-    cap_json false measured-dry-run "dry-run push negotiated, but the repository does not report push permission for this session; a real push is unverified" "$WORKDIR/cap-push-multi-branch.json"
-  elif [ "$rules_status" != "200" ]; then
-    cap_json false unverifiable "dry-run push negotiated with push permission, but the branch rules for a new branch could not be read ($rules_status); a real push is unverified" "$WORKDIR/cap-push-multi-branch.json"
-  elif [ -n "$restricting_rules" ]; then
-    cap_json false measured "rulesets restrict new branches ($restricting_rules); a real push of a second branch can be refused" "$WORKDIR/cap-push-multi-branch.json"
-  else
-    cap_json true dry-run-permission-rules "dry-run push to a second branch negotiated, the repository reports push permission, and no ruleset restricts creating or updating it" "$WORKDIR/cap-push-multi-branch.json"
-  fi
+  cap_json false not-measured "not measurable without pushing: a dry run never reaches the server's decision, and the API credential need not be the one origin pushes with" "$WORKDIR/cap-push-multi-branch.json"
 fi
 
 measure_write "$AUTHOR_IDENTITY" "OP_PREFLIGHT_AUTHOR_PAT" push "$WORKDIR/cap-author-writes.json"
