@@ -399,6 +399,16 @@ paths:
   - path: scripts/lib/gh-api-array.sh
     type: canonical
     consumers: all
+  # Dependabot commit provenance: every commit on a Dependabot-opened PR must
+  # be Dependabot-authored, GitHub-committed and signature-verified before
+  # the Dependabot lane applies. HARD-sourced by merge-clearance-gate.sh and
+  # by dependabot-auto-merge.yml (both declare it in requires:), and itself
+  # calls gh_api_array, so it travels with gh-api-array.sh.
+  - path: scripts/lib/dependabot-commit-provenance.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/gh-api-array.sh"
   # Resolves ONE code-scanning alert's severity by its permanent number, not
   # a ref-scoped list (#1113 — nathanjohnpayne/mergepath#1113 closed the same
   # #1101 defect class for GHAS findings that #831/#1008 closed for Codex/
@@ -796,6 +806,7 @@ paths:
       - "scripts/lib/reviewers-helpers.sh"   # #817, hard-sourced for the Dependabot reviewer allow-list
       - "scripts/lib/blocking-labels.sh"   # #1277, holds apply before clearance exemptions
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
+      - "scripts/lib/dependabot-commit-provenance.sh"   # Dependabot arm requires Dependabot-only commits
   - path: scripts/daily-feedback-rollup.sh
     # Cron workhorse invoked by .github/workflows/daily-feedback-rollup.yml.
     # Sources scripts/lib/daily-feedback-rollup-helpers.sh. The
@@ -1676,6 +1687,10 @@ paths:
       # that shipped the workflow without it would leave the gate
       # referencing a missing script (#1070).
       - "scripts/required-head-checks.sh"
+      # The provenance step and the in-step re-check source both libs from
+      # the base checkout and refuse auto-merge when either is absent.
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/dependabot-commit-provenance.sh"
   - path: .github/workflows/auto-clear-blocking-labels.yml
     type: canonical
     consumers: all

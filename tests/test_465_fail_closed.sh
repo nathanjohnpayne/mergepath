@@ -255,6 +255,98 @@ refute_grep "D10: auto-clear no longer removes via the unattributable gh pr edit
 assert_grep "D10: the scheduled sweep re-verifies the label against live state, not the search index (#827)" \
   "$W/auto-clear-blocking-labels.yml" 'stale search-index hit'
 
+# Extract one step's `run: |` body from a workflow (dedented by its own
+# indentation) so the vectors below execute the shipped shell.
+extract_step_run() {  # <workflow> <step name>
+  awk -v name="$2" '
+    index($0, "- name: " name) && !found { found=1; next }
+    found && !in_run && /^[[:space:]]*- name: / { exit }
+    found && /^[[:space:]]*run: \|[[:space:]]*$/ { in_run=1; indent=-1; next }
+    in_run {
+      if ($0 ~ /[^[:space:]]/) {
+        match($0, /^[[:space:]]*/)
+        if (indent < 0) indent=RLENGTH
+        else if (RLENGTH < indent) exit
+      }
+      print (length($0) >= indent ? substr($0, indent + 1) : "")
+    }
+  ' "$1"
+}
+
+# D13: workflow_dispatch inputs reach the rollup shell only through env and
+# are validated, never spliced into the script text next to the reviewer PAT.
+refute_grep "D13: rollup does not interpolate dispatch inputs into run:" \
+  "$W/daily-feedback-rollup.yml" '"${{ github.event.inputs.'
+assert_grep "D13: rollup passes the since input through env" \
+  "$W/daily-feedback-rollup.yml" 'INPUT_SINCE: ${{ github.event.inputs.since }}'
+if [ -f "$W/daily-feedback-rollup.yml" ]; then
+  D13="$(mktemp -d "${TMPDIR:-/tmp}/test465-d13.XXXXXX")"
+  mkdir -p "$D13/scripts"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" >"%s/args"\n' "$D13" >"$D13/scripts/daily-feedback-rollup.sh"
+  extract_step_run "$W/daily-feedback-rollup.yml" "Run rollup" >"$D13/step.sh"
+  run_rollup_step() {  # <since> <until> <dry_run>
+    rm -f "$D13/args" "$D13/pwned"
+    ( cd "$D13" && GH_TOKEN=fixture-token REPO=o/r INPUT_SINCE="$1" INPUT_UNTIL="$2" \
+        INPUT_DRY_RUN="$3" bash step.sh >/dev/null 2>&1 )
+  }
+  if run_rollup_step 2026-09-01 2026-09-02 true \
+     && [ "$(tr '\n' ' ' <"$D13/args")" = "--since 2026-09-01 --until 2026-09-02 --dry-run " ]; then
+    pass "D13 runtime: valid dates and dry_run reach the rollup as arguments"
+  else
+    fail "D13 runtime: valid inputs did not reach the rollup ($(cat "$D13/args" 2>/dev/null))"
+  fi
+  if ! run_rollup_step "2026-09-01\"; touch $D13/pwned; \"" "" "" \
+     && [ ! -e "$D13/pwned" ] && [ ! -e "$D13/args" ]; then
+    pass "D13 runtime: a shell-bearing since input is rejected before anything runs"
+  else
+    fail "D13 runtime: malformed since input was not rejected"
+  fi
+  if ! run_rollup_step "" "" "yes" && [ ! -e "$D13/args" ]; then
+    pass "D13 runtime: a non-boolean dry_run input is rejected"
+  else
+    fail "D13 runtime: non-boolean dry_run input was not rejected"
+  fi
+  if run_rollup_step "" "" "" && [ -e "$D13/args" ] && [ -z "$(tr -d '\n' <"$D13/args")" ]; then
+    pass "D13 runtime: scheduled run (no inputs) calls the rollup with no arguments"
+  else
+    fail "D13 runtime: empty inputs did not produce a bare rollup call"
+  fi
+  rm -rf "$D13"
+fi
+
+# D14: the CodeRabbit severity sweep's open-PR listing survives a transient
+# API failure (bounded retry) and still fails after three.
+if [ -f "$W/coderabbit-severity-gate.yml" ]; then
+  D14="$(mktemp -d "${TMPDIR:-/tmp}/test465-d14.XXXXXX")"
+  mkdir -p "$D14/bin"
+  cat >"$D14/bin/gh" <<'SHIM'
+#!/usr/bin/env bash
+n=$(( $(cat "$D14_COUNT" 2>/dev/null || echo 0) + 1 ))
+printf '%s\n' "$n" >"$D14_COUNT"
+if [ "$n" -le "$D14_FAILS" ]; then echo "HTTP 502" >&2; exit 1; fi
+printf '%s\n' 11 12
+SHIM
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$D14/bin/sleep"
+  chmod +x "$D14/bin/gh" "$D14/bin/sleep"
+  extract_step_run "$W/coderabbit-severity-gate.yml" "Find open PRs" >"$D14/step.sh"
+  run_find_step() {  # <fails>
+    rm -f "$D14/count"; : >"$D14/out"
+    ( PATH="$D14/bin:$PATH" D14_COUNT="$D14/count" D14_FAILS="$1" EVENT_NAME=schedule \
+        REPO=o/r GITHUB_OUTPUT="$D14/out" bash "$D14/step.sh" >/dev/null 2>&1 )
+  }
+  if run_find_step 2 && [ "$(cat "$D14/count")" = 3 ] && grep -qx 12 "$D14/out"; then
+    pass "D14 runtime: open-PR listing retries two transient failures"
+  else
+    fail "D14 runtime: open-PR listing did not recover from two transient failures"
+  fi
+  if ! run_find_step 3 && [ "$(cat "$D14/count")" = 3 ]; then
+    pass "D14 runtime: open-PR listing fails after three attempts"
+  else
+    fail "D14 runtime: open-PR listing must fail after exactly three attempts"
+  fi
+  rm -rf "$D14"
+fi
+
 # #1150: scoped sync-all branch keys retain the propagation lane while the
 # source checkout remains pinned to the SHA component. The suffix grammar is
 # exact so arbitrary text cannot widen branch recognition.

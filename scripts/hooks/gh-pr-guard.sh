@@ -1535,10 +1535,6 @@ guarded_gh_invocation_label() {
         printf 'gh pr %s\n' "$tok"
         return 0
         ;;
-      pr:new)
-        printf 'gh pr create\n'
-        return 0
-        ;;
       issue:comment)
         printf 'gh issue comment\n'
         return 0

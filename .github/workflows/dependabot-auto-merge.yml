@@ -52,8 +52,72 @@ jobs:
           # for the gh calls below, not the default GITHUB_TOKEN.
           persist-credentials: false
 
+      # The job-level `if:` trusts the PR OPENER, and fetch-metadata below
+      # classifies the update from the FIRST commit's message only. Neither
+      # says anything about commits added to the branch afterwards, and anyone
+      # with push access can add them while the PR stays "authored by
+      # dependabot[bot]". So before anything is approved or merged, require
+      # EVERY commit on the PR (current head included) to be Dependabot-
+      # authored, GitHub-committed and signature-verified — the shared
+      # predicate in scripts/lib/dependabot-commit-provenance.sh, which
+      # scripts/merge-clearance-gate.sh applies to its Dependabot arm too.
+      #
+      # trusted=false (a positive "not Dependabot-only" verdict) skips the
+      # approve/merge step and exits 0: the PR is then an ordinary PR that
+      # goes through normal review. It also withdraws any auto-merge request
+      # an earlier run armed on a then-clean head, because GitHub keeps that
+      # request across pushes by write collaborators. An unreadable verdict
+      # (rc 3) or a missing helper fails the job: nothing is approved.
+      - name: Verify Dependabot commit provenance
+        id: provenance
+        run: |
+          set -euo pipefail
+          for lib in scripts/lib/gh-api-array.sh scripts/lib/dependabot-commit-provenance.sh; do
+            if [ ! -r "$lib" ]; then
+              echo "::error::$lib is missing from the base checkout; refusing Dependabot auto-merge because commit provenance cannot be verified. Propagate the scripts/lib kit, then rerun."
+              echo "trusted=false" >>"$GITHUB_OUTPUT"
+              exit 1
+            fi
+          done
+          # shellcheck source=/dev/null
+          . scripts/lib/gh-api-array.sh
+          # shellcheck source=/dev/null
+          . scripts/lib/dependabot-commit-provenance.sh
+
+          rc=0
+          dependabot_commit_provenance "$GITHUB_REPOSITORY" "$PR_NUMBER" "$PR_HEAD_SHA" || rc=$?
+          case "$rc" in
+            0)
+              echo "::notice::Dependabot provenance verified on $PR_HEAD_SHA: $DEPENDABOT_PROVENANCE_REASON"
+              echo "trusted=true" >>"$GITHUB_OUTPUT"
+              ;;
+            1)
+              echo "::warning::PR is not Dependabot-only ($DEPENDABOT_PROVENANCE_REASON); skipping Dependabot auto-approve/merge. It needs ordinary review."
+              echo "trusted=false" >>"$GITHUB_OUTPUT"
+              armed=$(gh pr view "$PR_URL" --json autoMergeRequest --jq 'if .autoMergeRequest == null then "false" else "true" end')
+              if [ "$armed" = "true" ]; then
+                gh pr merge --disable-auto "$PR_URL"
+                echo "::warning::Withdrew the auto-merge request armed on an earlier Dependabot-only head."
+              fi
+              ;;
+            *)
+              echo "::error::Could not verify Dependabot commit provenance on $PR_HEAD_SHA: $DEPENDABOT_PROVENANCE_REASON. Refusing auto-merge."
+              echo "trusted=false" >>"$GITHUB_OUTPUT"
+              exit 1
+              ;;
+          esac
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Reads the PR commits and, only on a failed verdict, withdraws a
+          # stale auto-merge request. Both are covered by this workflow's own
+          # `permissions:` block, so no external PAT is involved here.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Fetch Dependabot metadata
         id: metadata
+        if: steps.provenance.outputs.trusted == 'true'
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
 
       - name: Approve and merge patch/minor + dev-dependency-group updates
@@ -67,9 +131,11 @@ jobs:
         # (#374 Pattern A — matchline#245). Production groups + non-group
         # major bumps still require manual review.
         if: |
-          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
-          steps.metadata.outputs.update-type == 'version-update:semver-minor' ||
-          steps.metadata.outputs.dependency-group == 'dev-dependencies'
+          steps.provenance.outputs.trusted == 'true' && (
+            steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+            steps.metadata.outputs.update-type == 'version-update:semver-minor' ||
+            steps.metadata.outputs.dependency-group == 'dev-dependencies'
+          )
         run: |
           set -euo pipefail
 
@@ -302,6 +368,36 @@ jobs:
             done
           }
 
+          # Re-check commit provenance on the exact SHA about to be approved
+          # or merged. The provenance step above judged the event's head; the
+          # branch can move while this job waits on CI, and every approve /
+          # merge below is pinned to a SHA this function has just verified.
+          # shellcheck source=/dev/null
+          . scripts/lib/gh-api-array.sh
+          # shellcheck source=/dev/null
+          . scripts/lib/dependabot-commit-provenance.sh
+          require_dependabot_provenance() {
+            local sha=$1 rc=0
+            dependabot_commit_provenance "$GITHUB_REPOSITORY" "$PR_NUMBER" "$sha" || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              return 0
+            fi
+            if [ "$rc" -eq 1 ]; then
+              echo "::warning::PR head $sha is not Dependabot-only ($DEPENDABOT_PROVENANCE_REASON); not approving or merging. It needs ordinary review."
+              # An earlier run of this job may have armed native auto-merge
+              # on a then-clean head, and GitHub keeps that request across
+              # pushes by write collaborators. Withdraw it before stopping.
+              armed=$(gh pr view "$PR_URL" --json autoMergeRequest --jq 'if .autoMergeRequest == null then "false" else "true" end')
+              if [ "$armed" = "true" ]; then
+                gh pr merge --disable-auto "$PR_URL"
+                echo "::warning::Withdrew the auto-merge request after provenance became untrusted."
+              fi
+              exit 0
+            fi
+            echo "::error::Could not verify Dependabot commit provenance on $sha: $DEPENDABOT_PROVENANCE_REASON. Refusing auto-merge."
+            exit 1
+          }
+
           has_human_hold() {
             local labels
             if ! labels=$(gh pr view "$PR_URL" --json labels --jq '.labels[].name'); then
@@ -414,7 +510,13 @@ jobs:
 
           # Approve. set -e ensures we abort on failure rather than
           # continuing to the merge step with no approval on record.
-          gh pr review --approve "$PR_URL"
+          # The review is bound to APPROVE_SHA via commit_id, the SHA whose
+          # provenance was just verified — never to whatever the head is by
+          # the time the API call lands.
+          APPROVE_SHA=$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid)
+          require_dependabot_provenance "$APPROVE_SHA"
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews" \
+            -f commit_id="$APPROVE_SHA" -f event=APPROVE >/dev/null
 
           # Major dev-group bumps must NOT merge before CI (mergepath#406).
           # A semver-MAJOR update only reaches this step via the
@@ -440,6 +542,7 @@ jobs:
           fi
 
           require_current_head_checks_success
+          require_dependabot_provenance "$CURRENT_HEAD_SHA"
 
           # Try GitHub-side auto-merge first (fires when required
           # checks pass). Fall back to an immediate squash ONLY when
@@ -474,6 +577,7 @@ jobs:
               exit 0
             fi
             require_current_head_checks_success
+            require_dependabot_provenance "$CURRENT_HEAD_SHA"
             if has_human_hold; then
               echo "::notice::PR carries human-hold after test wait; skipping Dependabot auto-merge until the human removes the label."
               exit 0
