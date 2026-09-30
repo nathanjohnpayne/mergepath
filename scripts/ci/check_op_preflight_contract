@@ -8,6 +8,10 @@
 #   - The five helper scripts auto-source the cache when GH_TOKEN is
 #     unset, and the shared preflight-helpers.sh library works as
 #     documented.
+#   - scripts/agent-capability-probe.sh measures and caches the session's
+#     capability tier, and scripts/lib/credential-class.sh refuses a
+#     brokered or app-installed credential that reads as the right user
+#     (#1057).
 #
 # Hard-fails when either test file is missing so a rename can't
 # silently disable the check.
@@ -21,6 +25,11 @@ TESTS=(
   "tests/test_op_preflight_token_mode.sh"
   "tests/test_helper_autosource.sh"
   "tests/test_preflight_agent_name.sh"
+  # #1057: the capability probe is the other half of "what can this session
+  # do": op-preflight --check answers whether credentials are cached, the
+  # probe answers whether they (or the ambient credential) can actually
+  # write under the right byline, and caches a tier for later tool calls.
+  "tests/test_agent_capability_probe.sh"
 )
 
 FAILED=0

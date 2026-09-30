@@ -517,6 +517,39 @@ test_print_exports_error_paths_fail_closed() {
 }
 
 # ---------------------------------------------------------------------------
+# #1057. Argument errors reach the same `eval "$(...)"` caller as a cache miss,
+# and they used to print nothing on stdout: `eval "$(... --agent Claude --check
+# --print-exports)" && gh ...` returned 0 with both PATs unset and fell through
+# to the gh keyring -- the #1021 fail-open reached through a typo instead of a
+# stale cache. Every argument error must fail the eval, and the stale values a
+# previous eval left behind must not survive to the next command.
+# ---------------------------------------------------------------------------
+test_argument_errors_fail_closed_under_eval() {
+  local case_dir="$WORKDIR/case1057_args"   # never created; unreachable anyway
+  local spec label args rc out
+  for spec in "unknown-agent|--agent nosuchagent --check --print-exports" \
+              "unknown-argument|--agent claude --check --print-exports --bogus" \
+              "missing-agent|--check --print-exports" \
+              "agent-without-value|--check --print-exports --agent" \
+              "mode-without-value|--agent claude --check --print-exports --mode" \
+              "mutex|--agent claude --check --print-exports --refresh" \
+              "bad-ttl|--agent claude --check --print-exports"; do
+    label="${spec%%|*}"
+    args="${spec#*|}"
+    rc=0
+    out=$(bash -c '
+      [ "$4" = bad-ttl ] && export OP_PREFLIGHT_TTL_SECONDS=soon
+      eval "$(PATH="$2:$PATH" OP_PREFLIGHT_CACHE_DIR="$3" "$1" $5 2>/dev/null)" && printf "REACHED"
+    ' _ "$SCRIPT" "$STUB_DIR" "$case_dir" "$label" "$args" 2>/dev/null) || rc=$?
+    if [ "$rc" -eq 0 ] || [ -n "$out" ]; then
+      fail "test_argument_errors_fail_closed_under_eval: $label: eval did not fail closed (rc=$rc out=$out)"
+      return
+    fi
+  done
+  pass "test_argument_errors_fail_closed_under_eval: every argument error fails the eval"
+}
+
+# ---------------------------------------------------------------------------
 # #1021, CodeRabbit round 2. The guard line is EVALUATED by the caller, so every
 # value interpolated into it is code. $MODE is not validated on the --check
 # path, and before the fix `--mode 'review"; <command>; echo "'` escaped the
@@ -2556,6 +2589,7 @@ test_check_emits_no_credentials
 test_check_compat_guard_fails_closed
 test_print_exports_eval_populates_both_vars
 test_print_exports_error_paths_fail_closed
+test_argument_errors_fail_closed_under_eval
 test_check_guard_is_injection_safe
 test_quiet_mode
 test_default_mode_is_review
