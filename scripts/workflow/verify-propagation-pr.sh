@@ -68,10 +68,12 @@ set -euo pipefail
 #   exists anywhere in the public mergepath repository, including one on an
 #   unmerged branch or a fork-PR ref, can be checked out by SHA. A faithful
 #   mirror of such a commit is a faithful mirror of UNREVIEWED content. So
-#   <mergepath_dir> must be a git checkout whose HEAD is an ancestor of (or
-#   equal to) mergepath's default branch as recorded by the clone
-#   (refs/remotes/origin/HEAD) — i.e. content that already merged through
-#   mergepath's own review. When <source_sha> is passed it must be the full
+#   <mergepath_dir> must be a git checkout whose HEAD is on the FIRST-PARENT
+#   history of mergepath's default branch as recorded by the clone
+#   (refs/remotes/origin/HEAD) — i.e. a tree that actually existed on the
+#   default branch after mergepath's own review. Generic ancestry is not
+#   enough: an intermediate commit of a PR branch merged with a true merge
+#   commit is an ancestor too. When <source_sha> is passed it must be the full
 #   40-hex id of that same HEAD, so the verdict is bound to the commit the
 #   caller resolved from the branch name. Anything unprovable is not
 #   lane-eligible.
@@ -167,14 +169,19 @@ if ! git -C "$MERGEPATH_DIR" rev-parse --verify --quiet "$MP_DEFAULT_REF^{commit
   echo "verify-propagation-pr.sh: mergepath default branch ref $MP_DEFAULT_REF does not resolve to a commit" >&2
   exit 2
 fi
-ancestry_rc=0
-git -C "$MERGEPATH_DIR" merge-base --is-ancestor "$MP_SOURCE_COMMIT" "$MP_DEFAULT_REF" 2>/dev/null || ancestry_rc=$?
-if [ "$ancestry_rc" -eq 1 ]; then
-  echo "verify-propagation-pr.sh: mergepath source commit $MP_SOURCE_COMMIT is NOT on mergepath's default branch (${MP_DEFAULT_REF#refs/remotes/}) — only content that has merged there is lane-eligible" >&2
-  exit 1
-elif [ "$ancestry_rc" -ne 0 ]; then
-  echo "verify-propagation-pr.sh: could not evaluate ancestry of $MP_SOURCE_COMMIT against ${MP_DEFAULT_REF#refs/remotes/} (git rc=$ancestry_rc)" >&2
+# FIRST-PARENT membership, not generic ancestry: a commit reachable only
+# through the second parent of a true merge on the default branch (an
+# intermediate commit of a merged PR branch) is an ancestor of the tip, yet
+# its tree never existed as a default-branch state and may carry content the
+# merged PR corrected before landing.
+if ! MP_FIRST_PARENT=$(git -C "$MERGEPATH_DIR" rev-list --first-parent "$MP_DEFAULT_REF" 2>/dev/null) \
+   || [ -z "$MP_FIRST_PARENT" ]; then
+  echo "verify-propagation-pr.sh: could not list the first-parent history of ${MP_DEFAULT_REF#refs/remotes/}" >&2
   exit 2
+fi
+if ! grep -Fxq "$MP_SOURCE_COMMIT" <<<"$MP_FIRST_PARENT"; then
+  echo "verify-propagation-pr.sh: mergepath source commit $MP_SOURCE_COMMIT is NOT on mergepath's default branch (${MP_DEFAULT_REF#refs/remotes/}) first-parent history — only states that existed on the default branch are lane-eligible" >&2
+  exit 1
 fi
 
 # #531: the parser + match helpers run from THIS verifier's own

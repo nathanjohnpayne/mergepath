@@ -301,8 +301,10 @@ fi
 # requires it to be on mergepath's default branch before checking it out.
 assert_grep "D12: propagation lane resolves the branch-key SHA to a single full commit" \
   "$W/pr-review-policy.yml" 'SYNC_FULL_SHA=$(git -C "$MP_DIR" rev-parse --verify --quiet "${SYNC_SHA}^{commit}" 2>/dev/null)'
-assert_grep "D12: propagation lane requires the source commit on mergepath's default branch" \
-  "$W/pr-review-policy.yml" 'git -C "$MP_DIR" merge-base --is-ancestor "$SYNC_FULL_SHA" "$MP_DEFAULT_REF"'
+assert_grep "D12: propagation lane requires the source commit on mergepath's default-branch first-parent history" \
+  "$W/pr-review-policy.yml" 'grep -Fxq "$SYNC_FULL_SHA" <<<"$MP_FIRST_PARENT"'
+refute_grep "D12: propagation lane does not accept generic (second-parent) ancestry" \
+  "$W/pr-review-policy.yml" 'merge-base --is-ancestor "$SYNC_FULL_SHA"'
 assert_grep "D12: propagation lane hands the full SHA to the base verifier" \
   "$W/pr-review-policy.yml" 'bash "$VERIFIER" "$MP_DIR" "$PWD" "$BASE_SHA" "$HEAD_SHA" "$SYNC_FULL_SHA"'
 refute_grep "D12: propagation lane no longer checks out the raw branch-key SHA" \
@@ -321,6 +323,14 @@ if [ -f "$W/pr-review-policy.yml" ]; then
   d12_git -C "$D12/upstream" commit -q --allow-empty -m "not on main"
   D12_SIDE=$(git -C "$D12/upstream" rev-parse HEAD)
   d12_git -C "$D12/upstream" checkout -q main
+  # A PR branch merged with a TRUE merge: its intermediate commit is an
+  # ancestor of main but never a main state.
+  d12_git -C "$D12/upstream" checkout -q -b merged-pr
+  d12_git -C "$D12/upstream" commit -q --allow-empty -m "intermediate merged-PR commit"
+  D12_SECOND=$(git -C "$D12/upstream" rev-parse HEAD)
+  d12_git -C "$D12/upstream" checkout -q main
+  d12_git -C "$D12/upstream" commit -q --allow-empty -m "main moves on"
+  d12_git -C "$D12/upstream" merge -q --no-ff -m "true merge" merged-pr
   mkdir -p "$D12/bin"
   REAL_GIT=$(command -v git)
   cat >"$D12/bin/git" <<SHIM
@@ -352,12 +362,16 @@ SHIM
   out_main=$(run_lane_condition "${D12_MAIN:0:7}")
   out_side=$(run_lane_condition "${D12_SIDE:0:7}")
   out_bogus=$(run_lane_condition "0000000")
+  out_second=$(run_lane_condition "${D12_SECOND:0:7}")
   [ "$out_main" = "checked-out $D12_MAIN" ] \
     && pass "D12 runtime: a default-branch short SHA resolves to its full commit and checks out" \
     || fail "D12 runtime: default-branch short SHA expected checkout of $D12_MAIN, got: $out_main"
   [ "$out_side" = "rejected" ] \
     && pass "D12 runtime: a commit only on an unmerged branch is rejected" \
     || fail "D12 runtime: unmerged-branch commit must be rejected, got: $out_side"
+  [ "$out_second" = "rejected" ] \
+    && pass "D12 runtime: a second-parent-only (merged PR branch) commit is rejected" \
+    || fail "D12 runtime: second-parent-only commit must be rejected, got: $out_second"
   [ "$out_bogus" = "rejected" ] \
     && pass "D12 runtime: an unresolvable SHA is rejected" \
     || fail "D12 runtime: unresolvable SHA must be rejected, got: $out_bogus"

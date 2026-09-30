@@ -211,7 +211,7 @@ jobs:
           #   3. the <sha> in the branch name (mergepath-sync/<sha> or
           #      mergepath-sync/sync-all-<sha>[-<scope-digest>]) is resolved
           #      to one full commit that must be ON mergepath's default
-          #      branch (an ancestor of its tip), checked
+          #      branch's first-parent history, checked
           #      out from PUBLIC nathanjohnpayne/
           #      mergepath, and mergepath@<sha>'s OWN
           #      verify-propagation-pr.sh byte-compares every changed
@@ -300,9 +300,10 @@ jobs:
               # public repo, including one on an unmerged branch. Resolve
               # the (normally 7-char) key to exactly ONE full 40-hex commit
               # — an ambiguous abbreviation fails rev-parse — and require it
-              # to be an ancestor of mergepath's default branch, so only
-              # content that already merged through mergepath's own review
-              # can qualify. The base verifier re-checks both (it receives
+              # on the FIRST-PARENT history of mergepath's default branch, so
+              # only a tree that existed there after mergepath's own review
+              # can qualify (generic ancestry would also admit an
+              # intermediate commit of a PR branch merged with a true merge). The base verifier re-checks both (it receives
               # the full SHA as its 5th argument); checking here too keeps a
               # consumer whose base verifier predates that check safe.
               SYNC_FULL_SHA=""
@@ -313,7 +314,8 @@ jobs:
                  && [[ "$SYNC_FULL_SHA" =~ ^[0-9a-f]{40}$ ]] \
                  && MP_DEFAULT_REF=$(git -C "$MP_DIR" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null) \
                  && [ -n "$MP_DEFAULT_REF" ] \
-                 && git -C "$MP_DIR" merge-base --is-ancestor "$SYNC_FULL_SHA" "$MP_DEFAULT_REF" 2>/dev/null \
+                 && MP_FIRST_PARENT=$(git -C "$MP_DIR" rev-list --first-parent "$MP_DEFAULT_REF" 2>/dev/null) \
+                 && grep -Fxq "$SYNC_FULL_SHA" <<<"$MP_FIRST_PARENT" \
                  && git -C "$MP_DIR" checkout --quiet "$SYNC_FULL_SHA" 2>/dev/null; then
                 SYNC_SHA="$SYNC_FULL_SHA"
                 # #531: run the TRUSTED in-repo verifier from the PR's

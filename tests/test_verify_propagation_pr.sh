@@ -247,6 +247,33 @@ prov_verify "$OLD" "$MP_SHA"
 [ "$RC" -eq 0 ] && pass "source commit is an ancestor of the default-branch tip → exit 0" \
   || fail "ancestor source commit expected exit 0, got $RC: $ERR"
 
+# Case 10b: a commit reachable only through the SECOND parent of a true merge
+# on the default branch is an ancestor of the tip, but its tree never existed
+# on the default branch — not lane-eligible. The merge commit itself (first
+# parent) is.
+MERGED="$WORKDIR/mp-merged"
+git clone -q "$MP" "$MERGED" 2>/dev/null
+git_quiet -C "$MERGED" checkout -q -b pr-branch
+git_quiet -C "$MERGED" commit -q --allow-empty -m "intermediate PR-branch commit"
+PR_BRANCH_SHA=$(git -C "$MERGED" rev-parse HEAD)
+git_quiet -C "$MERGED" checkout -q main
+git_quiet -C "$MERGED" commit -q --allow-empty -m "main moves on"
+git_quiet -C "$MERGED" merge -q --no-ff -m "true merge of pr-branch" pr-branch
+MERGE_SHA=$(git -C "$MERGED" rev-parse HEAD)
+git -C "$MERGED" update-ref refs/remotes/origin/main "$MERGE_SHA"
+git -C "$MERGED" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+git_quiet -C "$MERGED" checkout -q --detach "$PR_BRANCH_SHA"
+prov_verify "$MERGED" "$PR_BRANCH_SHA"
+if [ "$RC" -eq 1 ] && printf '%s' "$ERR" | grep -q "first-parent history"; then
+  pass "second-parent-only commit of a true merge → exit 1 (ancestor but never a default-branch state)"
+else
+  fail "second-parent-only commit expected exit 1 + first-parent diagnostic, got $RC: $ERR"
+fi
+git_quiet -C "$MERGED" checkout -q --detach "$MERGE_SHA"
+prov_verify "$MERGED" "$MERGE_SHA"
+[ "$RC" -eq 0 ] && pass "first-parent merge commit on the default branch → exit 0" \
+  || fail "first-parent merge commit expected exit 0, got $RC: $ERR"
+
 # Case 11: source_sha must be the FULL id of mergepath_dir's HEAD.
 prov_verify "$MP" "$MP_SHA"
 [ "$RC" -eq 0 ] && pass "full source_sha equal to HEAD → exit 0" \
