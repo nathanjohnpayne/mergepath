@@ -2283,7 +2283,7 @@ else
   fail "real bootstrap push to an unexpected repository: $rw_other"
 fi
 if printf '%s' "$rw_out" | grep -q '^RC=0$' \
-   && printf '%s' "$rw_push" | grep -q "^GH_TOKEN=ghp_bootstrap-author|GIT_CONFIG_GLOBAL=/dev/null|ARGS=-c credential.helper= -c credential.helper=!gh auth git-credential .* -C $RW_REPO push -u origin HEAD\$"; then
+   && printf '%s' "$rw_push" | grep -q "^GH_TOKEN=ghp_bootstrap-author|GIT_CONFIG_GLOBAL=/dev/null|ARGS=-c credential.helper= -c credential.helper=!'/[^']*/gh' auth git-credential .* -C $RW_REPO push -u origin HEAD\$"; then
   pass "real bootstrap::run_author_git through the real wrapper: pushes under the verified author token with gh's helper pinned"
 else
   fail "real bootstrap push: out=$rw_out push=$rw_push"

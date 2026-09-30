@@ -391,6 +391,10 @@ for spec in "ghe-only:3:ghe.example.com" "gh-only:0:github.com" "both:0:github.c
   for h in $hosts; do printf '%s:\n    user: someone\n    git_protocol: https\n' "$h" >>"$WORKDIR/ghcfg-$name/hosts.yml"; done
   write_case "hosts.yml $name, GH_HOST unset" "$want" ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-$name"
 done
+printf '# no hosts\n\n' >"$WORKDIR/ghcfg-comments.yml"; mkdir -p "$WORKDIR/ghcfg-empty" "$WORKDIR/ghcfg-comments"
+: >"$WORKDIR/ghcfg-empty/hosts.yml"; cp "$WORKDIR/ghcfg-comments.yml" "$WORKDIR/ghcfg-comments/hosts.yml"
+write_case "empty hosts.yml" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-empty"
+write_case "comment-only hosts.yml" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-comments"
 write_case "hosts.yml ghe-only, GH_HOST=github.com" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-ghe-only" GH_HOST=github.com
 
 # Phase 4b P1 on #1541: an unset GH_HOST does not mean github.com. With a

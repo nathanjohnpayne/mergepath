@@ -235,7 +235,9 @@ if [ "$MODE" = "write" ]; then
   if [ -z "${GH_HOST:-}" ]; then
     GH_HOSTS_FILE="${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/gh}/hosts.yml"
     if [ -r "$GH_HOSTS_FILE" ]; then
-      GH_CONFIGURED_HOSTS="$(grep -E '^[^[:space:]#][^:]*:[[:space:]]*$' "$GH_HOSTS_FILE" | sed -E 's/:[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+      # An empty or comment-only hosts.yml has no hosts: grep's no-match is
+      # tolerated, not an abort under pipefail (Codex on #1541).
+      GH_CONFIGURED_HOSTS="$({ grep -E '^[^[:space:]#][^:]*:[[:space:]]*$' "$GH_HOSTS_FILE" || true; } | sed -E 's/:[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
       if [ "$(printf '%s\n' "$GH_CONFIGURED_HOSTS" | grep -c .)" -eq 1 ] && [ "$GH_CONFIGURED_HOSTS" != "github.com" ]; then
         echo "identity-check: BLOCKED gh's only configured host is '$GH_CONFIGURED_HOSTS', so a bare gh call after this check would write there, not to github.com." >&2
         echo "identity-check:   Set GH_HOST=github.com for guarded writes, or log in to github.com as well." >&2

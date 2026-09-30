@@ -984,7 +984,7 @@ if run_git_wrapper 0 "fresh bootstrap repo" git -C "$PUSHREPO" push -u origin HE
   line="$(cat "$GIT_PUSH_LOG")"
   case "$line" in
     "GH_TOKEN=ghp_author-token|HOME=$HOME|"*) fail "git push ran with the operator's HOME (netrc/XDG reachable): $line" ;;
-    "GH_TOKEN=ghp_author-token|HOME="*"|GIT_CONFIG_GLOBAL=/dev/null|NOSYSTEM=1|PROMPT=0|ARGS=-c credential.helper= -c credential.helper=!gh auth git-credential -c http.extraHeader= -c core.hooksPath=/dev/null "*"push -u origin HEAD ")
+    "GH_TOKEN=ghp_author-token|HOME="*"|GIT_CONFIG_GLOBAL=/dev/null|NOSYSTEM=1|PROMPT=0|ARGS=-c credential.helper= -c credential.helper=!'/"*"/gh' auth git-credential -c http.extraHeader= -c core.hooksPath=/dev/null "*"push -u origin HEAD ")
       pass "fresh bootstrap repo: pushed under the verified token, global/system/prompt/hooks closed, gh's helper alone" ;;
     *) fail "fresh bootstrap repo: unexpected push environment: $line" ;;
   esac
@@ -1170,6 +1170,22 @@ if printf '%s\n' "$cred_out" | grep -qx 'password=ghp_verified-token' && ! print
   pass "real git: the credential it obtains for github.com is the verified token, past hostile global/env/local helpers"
 else
   fail "real git credential under hostile config: $cred_out"
+fi
+
+# A gh the repository ships is never the credential helper, even with "."
+# on PATH: git resolves a bare helper name after entering the repository, so
+# the runner names gh by the absolute path it resolved first (Codex on #1541).
+PATHREPO="$WORKDIR/pathrepo"
+"$REAL_GIT" init -q "$PATHREPO"
+printf '#!/bin/sh\nprintf "%%s" "$GH_TOKEN" >"%s"\nprintf "password=REPO-GH\\n"\n' "$WORKDIR/path-captured" >"$PATHREPO/gh"
+chmod +x "$PATHREPO/gh"
+rm -f "$WORKDIR/path-captured"
+path_out="$(cd "$WORKDIR" && printf 'protocol=https\nhost=github.com\n\n' | PATH=".:$CRED_DIR:$PATH" \
+  bash -c '. "$1"; gh_author_git_exec ghp_path-token -C "$2" credential fill' _ "$ROOT/scripts/lib/gh-token-resolver.sh" "$PATHREPO" 2>&1)"
+if printf '%s\n' "$path_out" | grep -qx 'password=ghp_path-token' && [ ! -e "$WORKDIR/path-captured" ]; then
+  pass "a gh inside the repository never runs as the credential helper, even with . on PATH"
+else
+  fail "repo-shipped gh: out=$path_out captured=$([ -e "$WORKDIR/path-captured" ] && echo yes || echo no)"
 fi
 
 # The trace marker: written after every check, immediately before the gh

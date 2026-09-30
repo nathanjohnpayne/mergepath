@@ -81,8 +81,20 @@ gh_author_payload_kind() { # <payload...>
 # headers are reset, hooks are disabled, and SSH github.com spellings are
 # rewritten to HTTPS so the helper, not an SSH key, decides.
 gh_author_git_exec() { # <token> <git args...>
-  local token="$1" home rc
+  local token="$1" home rc gh_bin
   shift
+  # The credential helper names gh by ABSOLUTE path, resolved here, before
+  # git enters the repository: a bare `!gh` is looked up after `git -C`
+  # changes directory, so a relative PATH entry (".") would run a gh file the
+  # repository ships, with the token in its environment (Codex on #1541).
+  gh_bin="$(command -v gh 2>/dev/null || true)"
+  case "$gh_bin" in
+    /*) ;;
+    *) echo "gh-as-author: refusing git: gh does not resolve to an absolute path ('${gh_bin:-not found}')." >&2; return 5 ;;
+  esac
+  case "$gh_bin" in
+    *"'"*|*'\'*) echo "gh-as-author: refusing git: the gh path contains a quote or backslash." >&2; return 5 ;;
+  esac
   home="$(mktemp -d "${TMPDIR:-/tmp}/gh-as-author-git-home.XXXXXX")" || return 1
   env -u GITHUB_TOKEN -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT -u GIT_CONFIG \
     -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE -u GIT_NAMESPACE \
@@ -91,7 +103,7 @@ gh_author_git_exec() { # <token> <git args...>
     GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= SSH_ASKPASS= \
     GH_TOKEN="$token" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
     GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
-    git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+    git -c credential.helper= -c "credential.helper=!'$gh_bin' auth git-credential" \
         -c http.extraHeader= \
         -c core.hooksPath=/dev/null \
         -c url.https://github.com/.insteadOf=git@github.com: \

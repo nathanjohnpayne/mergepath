@@ -969,6 +969,19 @@ else
   fail "#1540: casing=$case_rc gh_host=$host_rc"
 fi
 
+# Codex on #1541: the write-token opt-in is part of the cache identity.
+rm -rf "$CACHE"
+run_probe GH_TOKEN=ghp_author -- >/dev/null 2>&1
+set +e
+run_probe GH_TOKEN=ghp_author -- --check >/dev/null 2>&1; same_rc=$?
+run_probe GH_TOKEN=ghp_author MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1 -- --check >/dev/null 2>&1; optin_rc=$?
+set -e
+if [ "$same_rc" -eq 0 ] && [ "$optin_rc" -eq 2 ]; then
+  pass "write-token opt-in: toggling it invalidates the capability cache"
+else
+  fail "opt-in cache identity: same=$same_rc optin=$optin_rc"
+fi
+
 echo
 echo "agent-capability-probe tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -216,7 +216,12 @@ credential_fingerprint() {
   # GH_HOST selects which server every bare gh call reaches (#1540).
   # shellcheck disable=SC2034
   local GH_HOST_VALUE="${GH_HOST:-}"
-  for var in OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT GH_TOKEN GITHUB_TOKEN GH_CONFIG_DIR_VALUE GH_HOST_VALUE keyring_author keyring_reviewer keyring_active; do
+  # The write-token opt-in changes what the wrappers accept, so a cache
+  # measured under one setting must not answer for the other (Codex on #1541).
+  # shellcheck disable=SC2034
+  local ALLOW_UNIDENTIFIABLE_VALUE="0"
+  [ "${MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN:-0}" = "1" ] && ALLOW_UNIDENTIFIABLE_VALUE="1"
+  for var in OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT GH_TOKEN GITHUB_TOKEN GH_CONFIG_DIR_VALUE GH_HOST_VALUE ALLOW_UNIDENTIFIABLE_VALUE keyring_author keyring_reviewer keyring_active; do
     val="${!var:-}"
     if [ -z "$val" ]; then
       h="-"
