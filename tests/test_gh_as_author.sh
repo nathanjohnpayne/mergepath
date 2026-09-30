@@ -423,10 +423,26 @@ case " $* " in
 esac
 if [ "${1:-}" = "api" ]; then
   case "$*" in
-    *"/events"*"select(.id >"*) printf '%s\n' ${GH_EDIT_EVENTS_BY-$(login_for "${GH_TOKEN:-}")}; exit 0 ;;
-    *"/events"*) echo 10; exit 0 ;;
+    *mergeQueueEntry*) [ -n "${GH_ENQUEUER:-}" ] && echo "$GH_ENQUEUER"; exit 0 ;;
+    *"/events"*"--jq"*) echo 10; exit 0 ;;
+    *"/events"*)
+      # New label events (id > 10) by each login in GH_EDIT_EVENTS_BY; the
+      # label name comes from GH_EDIT_EVENT_LABEL (default x).
+      out="[]"
+      i=11
+      for entry in ${GH_EDIT_EVENTS_BY-$(login_for "${GH_TOKEN:-}")}; do
+        who="${entry%%:*}"; lbl="${GH_EDIT_EVENT_LABEL:-x}"
+        case "$entry" in *:*) lbl="${entry#*:}" ;; esac
+        out="$(printf '%s' "$out" | jq -c --argjson id "$i" --arg who "$who" --arg l "$lbl" \
+          '. + [{id: $id, event: "labeled", label: {name: $l}, actor: {login: $who}}]')"
+        i=$((i + 1))
+      done
+      printf '%s\n' "$out"
+      exit 0 ;;
     *"repos/example/repo/pulls/"*)
-      printf '%s %s\n' "${GH_MERGE_STATE:-merged}" "${GH_ACTED_AS:-$(login_for "${GH_TOKEN:-}")}"
+      # Mirrors the wrapper's jq: an open PR with no auto_merge reads "open ".
+      if [ "${GH_MERGE_STATE:-merged}" = "open" ]; then printf 'open \n'; else
+        printf '%s %s\n' "${GH_MERGE_STATE:-merged}" "${GH_ACTED_AS:-$(login_for "${GH_TOKEN:-}")}"; fi
       exit 0
       ;;
   esac
@@ -924,7 +940,7 @@ err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_MERGE_STATE=open \
   run_wrapper -- gh pr merge 123 --squash 2>&1 >/dev/null)
 rc=$?
 set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "neither merged nor armed"; then
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "neither merged, armed for auto-merge, nor queued"; then
   pass "merge readback: an unmerged, unarmed PR after a merge exits 5 (unverified)"
 else
   fail "merge readback unverified: rc=$rc err=$err"
@@ -948,7 +964,7 @@ err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_EDIT_EVENTS_BY="claude[bot]"
   run_wrapper -- gh pr edit 123 --add-label x 2>&1 >/dev/null)
 rc=$?
 set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "the edit on example/repo#123 landed under 'claude\[bot\]'"; then
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "the edit ('labeled' event) on example/repo#123 landed under 'claude\[bot\]'"; then
   pass "edit readback: label events by another login exit 5"
 else
   fail "edit readback mismatch: rc=$rc err=$err"
@@ -956,12 +972,12 @@ fi
 
 reset_log
 set +e
-err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_EDIT_EVENTS_BY="github-actions[bot] nathanjohnpayne" \
+err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_EDIT_EVENTS_BY="github-actions[bot]:other nathanjohnpayne:x" \
   run_wrapper -- gh pr edit 123 --add-label x 2>&1 >/dev/null)
 rc=$?
 set -e
 if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q "verified edit events by nathanjohnpayne"; then
-  pass "edit readback: a concurrent bot event beside the author's own event still verifies"
+  pass "edit readback: a concurrent bot event on another label does not disturb the author's own event"
 else
   fail "edit readback concurrent: rc=$rc err=$err"
 fi
@@ -972,10 +988,67 @@ err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_EDIT_EVENTS_BY="" \
   run_wrapper -- gh pr edit 123 --body "b" 2>&1 >/dev/null)
 rc=$?
 set -e
-if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q "no issue event to read back"; then
+if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q "leaves no author record"; then
   pass "edit readback: a body-only edit with no event is accepted on the pre-write check, and says so"
 else
   fail "edit readback no-event: rc=$rc err=$err"
+fi
+
+# Phase 4b on #1541: the same label event by two actors is ambiguous, and
+# ambiguity fails closed rather than trusting the expected login's copy.
+reset_log
+set +e
+err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_EDIT_EVENTS_BY="nathanjohnpayne:x claude[bot]:x" \
+  run_wrapper -- gh pr edit 123 --add-label x 2>&1 >/dev/null)
+rc=$?
+set -e
+if [ "$rc" -eq 5 ]; then
+  pass "edit readback: this write's label event by two actors fails closed"
+else
+  fail "edit readback ambiguous: rc=$rc err=$err"
+fi
+
+# Options before the group or verb still select the repository and still
+# get a readback (Phase 4b P1 on #1541).
+for form in "gh --repo example/repo pr merge 123 --squash" "gh pr --repo example/repo merge 123 --squash" "gh pr merge 123 --squash --repo=example/repo"; do
+  reset_log
+  set +e
+  # shellcheck disable=SC2086
+  err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_ACTED_AS="claude[bot]" run_wrapper -- $form 2>&1 >/dev/null)
+  rc=$?
+  set -e
+  if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "landed under 'claude\[bot\]'"; then
+    pass "flag placement '$form': readback runs and catches a mis-attributed merge"
+  else
+    fail "flag placement '$form': rc=$rc err=$err"
+  fi
+done
+
+# A guarded verb behind a command prefix runs in a context the readback
+# cannot resolve, so it is refused before the write.
+reset_log
+set +e
+OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" run_wrapper -- env GH_REPO=other/repo gh pr merge 123 --squash >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 5 ] && ! grep -q $'gh\tpr\tmerge' "$WORKDIR/calls.log"; then
+  pass "prefixed guarded write: refused before the write"
+else
+  fail "prefixed guarded write: rc=$rc"
+fi
+
+# A PR admitted to a merge queue (open, no auto_merge) is verified through the
+# queue entry's enqueuer.
+reset_log
+set +e
+err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_MERGE_STATE=open GH_ENQUEUER=nathanjohnpayne \
+  run_wrapper -- gh pr merge 123 --squash 2>&1 >/dev/null)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q "verified queued by nathanjohnpayne"; then
+  pass "merge-queue admission: verified through the enqueuer"
+else
+  fail "merge-queue admission: rc=$rc err=$err"
 fi
 
 # The placeholder cannot reach an author write through the ambient candidate.

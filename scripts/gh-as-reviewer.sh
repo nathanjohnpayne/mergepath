@@ -77,11 +77,21 @@ fi
 TMP_OUT=$(mktemp "${TMPDIR:-/tmp}/gh-as-reviewer-out.XXXXXX")
 trap 'rm -f "$TMP_OUT"' EXIT
 set +e
-(
-  unset GITHUB_TOKEN
-  GH_TOKEN="$TOKEN" "$@"
-) | tee "$TMP_OUT"
-WRAPPED_RC=${PIPESTATUS[0]}
+if gh_readback_interactive; then
+  # Capturing stdout would make gh refuse to prompt, so an interactive run
+  # stays attached to the terminal; the readback uses what it can observe.
+  (
+    unset GITHUB_TOKEN
+    GH_TOKEN="$TOKEN" "$@"
+  )
+  WRAPPED_RC=$?
+else
+  (
+    unset GITHUB_TOKEN
+    GH_TOKEN="$TOKEN" "$@"
+  ) | tee "$TMP_OUT"
+  WRAPPED_RC=${PIPESTATUS[0]}
+fi
 set -e
 if [ "$WRAPPED_RC" -ne 0 ]; then
   exit "$WRAPPED_RC"

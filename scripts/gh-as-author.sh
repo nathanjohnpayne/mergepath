@@ -256,8 +256,15 @@ fi
 TMP_OUT=$(mktemp "${TMPDIR:-/tmp}/gh-as-author-out.XXXXXX")
 trap 'rm -f "$TMP_OUT"' EXIT
 set +e
-run_with_author_token "$@" | tee "$TMP_OUT"
-WRAPPED_RC=${PIPESTATUS[0]}
+if gh_readback_interactive; then
+  # Capturing stdout would make gh refuse to prompt (an interactive merge or
+  # edit), so an interactive run stays attached to the terminal.
+  run_with_author_token "$@"
+  WRAPPED_RC=$?
+else
+  run_with_author_token "$@" | tee "$TMP_OUT"
+  WRAPPED_RC=${PIPESTATUS[0]}
+fi
 set -e
 if [ "$WRAPPED_RC" -ne 0 ]; then
   exit "$WRAPPED_RC"

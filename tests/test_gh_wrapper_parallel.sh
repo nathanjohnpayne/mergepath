@@ -52,8 +52,8 @@ case " $* " in
 esac
 if [ "${1:-}" = "api" ]; then
   case "$*" in
-    *"/reviews"*"select(.id >"*) login_for "${GH_TOKEN:-}"; exit 0 ;;
-    *"/reviews"*) echo 1; exit 0 ;;
+    *"/reviews"*"--jq"*) echo 1; exit 0 ;;
+    *"/reviews"*) printf '[{"id":2,"state":"COMMENTED","body":"ok","user":{"login":"%s"}}]\n' "$(login_for "${GH_TOKEN:-}")"; exit 0 ;;
     *"repos/o/r/pulls/1"*) echo "merged $(login_for "${GH_TOKEN:-}")"; exit 0 ;;
   esac
 fi

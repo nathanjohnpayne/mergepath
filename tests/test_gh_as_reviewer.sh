@@ -76,12 +76,25 @@ if { [ "${1:-}" = "pr" ] || [ "${1:-}" = "issue" ]; } && [ "${2:-}" = "view" ]; 
   num=123
   case "${3:-}" in [0-9]*) num="$3" ;; esac
   kind=pull; [ "$1" = issue ] && kind=issues
-  echo "$num https://github.com/o/r/$kind/$num"
+  echo "$num https://${STUB_HOST:-github.com}/o/r/$kind/$num"
   exit 0
 fi
 if [ "${1:-}" = "pr" ] && [ "${2:-}" = "review" ]; then
   [ "${GH_GENERIC_RC:-0}" = 0 ] || exit "$GH_GENERIC_RC"
-  echo "${STUB_WRITE_AS:-$(login_for "${GH_TOKEN:-}")}" >"$STATE/review"
+  # Record the review as GitHub would store it: state, body, author.
+  state=COMMENTED; body=""
+  shift 2
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -a|--approve) state=APPROVED ;;
+      -r|--request-changes) state=CHANGES_REQUESTED ;;
+      -c|--comment) state=COMMENTED ;;
+      -b|--body) body="$2"; shift ;;
+    esac
+    shift
+  done
+  jq -cn --arg s "$state" --arg b "$body" --arg l "${STUB_WRITE_AS:-$(login_for "${GH_TOKEN:-}")}" \
+    '{id: 2, state: $s, body: $b, user: {login: $l}}' >>"$STATE/reviews"
   exit 0
 fi
 if { [ "${1:-}" = "pr" ] || [ "${1:-}" = "issue" ]; } && [ "${2:-}" = "comment" ]; then
@@ -93,8 +106,14 @@ if { [ "${1:-}" = "pr" ] || [ "${1:-}" = "issue" ]; } && [ "${2:-}" = "comment" 
 fi
 if [ "${1:-}" = "api" ]; then
   case "$*" in
-    *"/reviews"*"select(.id >"*) cat "$STATE/review" 2>/dev/null; exit 0 ;;
-    *"/reviews"*) echo 1; exit 0 ;;
+    *"/reviews"*"--jq"*) echo 1; exit 0 ;;
+    *"/reviews"*)
+      # The pre-existing review (id 1), any STUB_EXTRA_REVIEW a case injects
+      # (another session's review landing concurrently), and this write's.
+      { echo '{"id":1,"state":"COMMENTED","body":"old","user":{"login":"someone"}}'
+        [ -n "${STUB_EXTRA_REVIEW:-}" ] && echo "$STUB_EXTRA_REVIEW"
+        cat "$STATE/reviews" 2>/dev/null; } | jq -s -c .
+      exit 0 ;;
     *"issues/comments/900"*) cat "$STATE/comment" 2>/dev/null; exit 0 ;;
   esac
 fi
@@ -330,6 +349,64 @@ if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q "verified comment 900 author=
   pass "comment readback: a correctly attributed comment is verified and exits 0"
 else
   fail "comment readback happy path: rc=$rc err=$err"
+fi
+
+# Phase 4b P1 on #1541: a concurrent review by the expected login does not
+# vouch for THIS write. Our review (state and body) landed as claude[bot]
+# while another session's review by nathanpayne-claude appeared.
+reset_log
+set +e
+err=$(OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" STUB_WRITE_AS="claude[bot]" \
+  STUB_EXTRA_REVIEW='{"id":3,"state":"APPROVED","body":"lgtm","user":{"login":"nathanpayne-claude"}}' \
+  run_wrapper -- gh pr review 123 --comment --body "ours" 2>&1 >/dev/null)
+rc=$?
+set -e
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "landed under 'claude\[bot\]'"; then
+  pass "review readback: a concurrent review by the expected login does not mask this write's bot byline"
+else
+  fail "review readback correlation: rc=$rc err=$err"
+fi
+
+# --attach takes a value, so the selector after it is still the PR.
+reset_log
+set +e
+err=$(OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" run_wrapper -- gh pr comment --attach ./shot.png 123 --body "x" 2>&1 >/dev/null)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q $'gh\tpr\tview\t123' "$WORKDIR/calls.log"; then
+  pass "comment --attach <file> <PR>: the PR, not the file, is resolved as the target"
+else
+  fail "comment --attach: rc=$rc err=$err"
+  cat "$WORKDIR/calls.log" >&2
+fi
+
+# --edit-last keeps the comment's ORIGINAL author, so it is reported as not
+# attributable instead of being claimed verified.
+reset_log
+set +e
+err=$(OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" run_wrapper -- gh pr comment 123 --edit-last --body "x" 2>&1 >/dev/null)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q "edit-last) leaves no author record" && ! printf '%s' "$err" | grep -q "verified comment"; then
+  pass "comment --edit-last: reported as not read back, never claimed verified"
+else
+  fail "comment --edit-last: rc=$rc err=$err"
+fi
+
+# Every readback read is pinned to the host the target resolved on (Phase 4b
+# on #1541): a GHE URL must not be read back against github.com.
+reset_log
+set +e
+OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" STUB_HOST=ghe.example.com \
+  run_wrapper -- gh pr review 123 --comment --body "on ghe" >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep $'gh\tapi' "$WORKDIR/calls.log" | grep -q $'\t--hostname\tghe.example.com\t' \
+   && ! grep $'gh\tapi' "$WORKDIR/calls.log" | grep 'repos/' | grep -v -q -- '--hostname'; then
+  pass "readback reads are pinned to the resolved host (ghe.example.com)"
+else
+  fail "host pinning: rc=$rc"
+  cat "$WORKDIR/calls.log" >&2
 fi
 
 # A target the wrapper cannot resolve cannot be read back, so it is not written.
