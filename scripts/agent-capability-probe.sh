@@ -186,7 +186,7 @@ fi
 REVIEWER_IDENTITY="$(gh_default_reviewer_identity)"
 if [ "${MERGEPATH_AGENT_SURFACE:-}" = "codex-cloud" ] \
    && [ -z "${GH_AS_REVIEWER_IDENTITY:-}${MERGEPATH_AGENT:-}${OP_PREFLIGHT_AGENT:-}" ]; then
-  echo "agent-capability-probe: WARNING MERGEPATH_AGENT_SURFACE=codex-cloud but no agent is named; measuring reviewer $REVIEWER_IDENTITY. Set MERGEPATH_AGENT=codex in the Codex environment (docs/agents/cloud-environments.md)." >&2
+  echo "agent-capability-probe: WARNING MERGEPATH_AGENT_SURFACE=codex-cloud but no agent is named; measuring reviewer $REVIEWER_IDENTITY. Set MERGEPATH_AGENT=codex among the Codex environment variables, beside MERGEPATH_AGENT_SURFACE." >&2
 fi
 
 # A non-secret fingerprint of every credential the measurements can use
@@ -467,16 +467,24 @@ measure_write() {
       # through), otherwise the ambient token and then the keyring token. A
       # fallback the resolver never tried says nothing about its failure.
       # The resolver also refuses a brokered or app-installed candidate before
-      # it reads GET /user, so report the class of the candidate it would have
-      # started from; that is the actionable half of the refusal.
-      local candidate repeat_status repeat_login n=0
-      class="$(credential_class "${!preferred:-${GH_TOKEN:-}}")"
+      # it reads GET /user, so report the class of what it refused: the first
+      # tried candidate that is not user-held, keyring fallback included (Codex
+      # on #1541), else the first one tried. That is the actionable half.
+      local candidate repeat_status repeat_login cand_class n=0
       local -a tried=()
       if [ -n "${!preferred:-}" ]; then
         tried=("${!preferred}")
       else
         tried=("${GH_TOKEN:-}" "$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --user "$identity" 2>/dev/null || true)")
       fi
+      class="empty"
+      for candidate in "${tried[@]}"; do
+        [ -n "$candidate" ] || continue
+        cand_class="$(credential_class "$candidate")"
+        if [ "$class" = "empty" ] || { [ "$class" = "user-held" ] && [ "$cand_class" != "user-held" ]; }; then
+          class="$cand_class"
+        fi
+      done
       for candidate in "${tried[@]}"; do
         [ -n "$candidate" ] || continue
         n=$((n + 1))

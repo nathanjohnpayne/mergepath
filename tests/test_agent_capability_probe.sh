@@ -331,6 +331,18 @@ else
   fail "ghs_ token: $(jq -c '.capabilities["author-writes"]' "$WORKDIR/app.json")"
 fi
 
+# The same token reached only through the keyring fallback (no preferred PAT,
+# no ambient token) is reported by its class too, not as empty (Codex on #1541).
+set +e
+run_probe STUB_KEYRING_nathanjohnpayne=ghs_author -- --no-cache >"$WORKDIR/app-kr.json" 2>/dev/null
+set -e
+if [ "$(cap "$WORKDIR/app-kr.json" author-writes)" = "false" ] \
+   && [ "$(jq -r '.capabilities["author-writes"].credential_class' "$WORKDIR/app-kr.json")" = "app-installed" ]; then
+  pass "ghs_ token in the keyring only: author-writes refused, class app-installed (not empty)"
+else
+  fail "keyring ghs_ token: $(jq -c '.capabilities["author-writes"]' "$WORKDIR/app-kr.json")"
+fi
+
 # ---------------------------------------------------------------------------
 # Surface override and validation.
 # ---------------------------------------------------------------------------

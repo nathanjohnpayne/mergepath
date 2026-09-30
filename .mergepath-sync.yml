@@ -1064,9 +1064,15 @@ paths:
   - path: tests/test_gh_as_author.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
+      - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
   - path: tests/test_gh_as_reviewer.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
+      - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
   - path: tests/test_gh_wrapper_parallel.sh
     type: canonical
     consumers: all
@@ -1113,6 +1119,9 @@ paths:
   - path: tests/test_identity_check.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
+      - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
   # Pairs with scripts/coderabbit-wait.sh + scripts/ci/check_coderabbit_wait.
   # The test locks the timeout status-probe contract from #417: exit 4
   # stays advisory, the status reply is surfaced in JSON, and the reply
@@ -1120,6 +1129,9 @@ paths:
   - path: tests/test_coderabbit_wait_identity_derivation.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
+      - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
   - path: tests/test_coderabbit_wait_status_probe.sh
     type: canonical
     consumers: all
@@ -1251,6 +1263,9 @@ paths:
   - path: tests/test_codex_review_request_ack.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
+      - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
   # #489 CodeRabbit-rate-limit Codex-failover trigger-only path of
   # codex-review-request.sh (posts `@codex review` when CodeRabbit is rate-
   # limited). check_codex_scripts hard-runs it (same `No such file` exit-127
@@ -1338,6 +1353,9 @@ paths:
   - path: tests/test_codex_record_feedback.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
+      - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
   # Codex usage-limit / not-connected marker detection (#722): the shared
   # scripts/lib/codex-failure-markers.sh regexes, codex-review-request.sh's
   # `blocked` short-circuit, and codex-review-check.sh's gate (c) diagnostic.
