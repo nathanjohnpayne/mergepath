@@ -859,6 +859,14 @@ paths:
       - "scripts/lib/gh-retry-helpers.sh"  # retry for the #1104 read path
       - "scripts/lib/template-substitution.sh"
       - "scripts/lib/manifest-fact-helpers.sh"
+      - "scripts/lib/graphql-ceiling.sh"   # #1057 A3: proxy GraphQL refusal -> exit 6 (existence-guarded)
+  # Recognises the Claude cloud proxy's GraphQL refusal ("This GraphQL query
+  # is not enabled for this session") so GraphQL-only helpers exit with a
+  # ceiling (6) instead of a retryable failure (#1057 A3). Its header is the
+  # declared list of GraphQL-only helpers.
+  - path: scripts/lib/graphql-ceiling.sh
+    type: canonical
+    consumers: all
   - path: scripts/request-label-removal.sh
     type: canonical
     consumers: all
@@ -1468,6 +1476,7 @@ paths:
     requires:
       - "scripts/resolve-pr-threads.sh"
       - "scripts/lib/gh-retry-helpers.sh"
+      - "scripts/lib/graphql-ceiling.sh"   # the #1057 ceiling cases source it directly
   - path: tests/test_resolve_pr_threads_rationale_tag.sh
     type: canonical
     consumers: all

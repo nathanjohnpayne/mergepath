@@ -129,6 +129,112 @@ grep -qi "RATE LIMITED" <<<"$nh_out" \
   && ok "a stdout-only rate-limit body is still CLASSIFIED as a rate limit" \
   || bad "stdout-only rate-limit body was not classified: $nh_out"
 
+# ---------------------------------------------------------------------------
+# #1057 A3: the cloud GraphQL ceiling. REST reads succeed and every GraphQL
+# request is refused with the proxy's documented message. That is a property
+# of the session, not a failed read, so it gets its own exit (6) and a message
+# that says so, never the generic "GraphQL query failed" exit 2 that invites a
+# retry. A GraphQL failure WITHOUT the phrase keeps exit 2 (control).
+# ---------------------------------------------------------------------------
+ceiling_run() { # <graphql stderr line> -> echoes rc; output in $STUB_DIR/ceiling.out
+  cat >"$STUB_DIR/gh" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *graphql*) echo $(printf '%q' "$1") >&2; exit 1 ;;
+esac
+echo '{}'
+STUB
+  chmod +x "$STUB_DIR/gh"
+  ( cd "$ROOT" \
+    && PATH="$STUB_DIR:$PATH" \
+       GH_RETRY_BACKOFF_SECONDS=0 GH_RETRY_ATTEMPTS=2 \
+       OP_PREFLIGHT_REVIEWER_PAT=stub-token \
+       bounded 60 bash "$SCRIPT" 999 --repo owner/name --list ) >"$STUB_DIR/ceiling.out" 2>&1
+  echo $?
+}
+
+c_rc=$(ceiling_run "gh: This GraphQL query is not enabled for this session. Use gh api repos/{owner}/{repo}/... (HTTP 403)")
+c_out="$(cat "$STUB_DIR/ceiling.out")"
+[ "$c_rc" = "6" ] \
+  && ok "proxy GraphQL refusal on the thread read exits 6 (ceiling), not 2" \
+  || bad "proxy GraphQL refusal: exited $c_rc, expected 6; output: $c_out"
+grep -q "CEILING" <<<"$c_out" && grep -q "not a credential gap" <<<"$c_out" \
+  && ok "the ceiling message names the ceiling and says a token cannot fix it" \
+  || bad "ceiling message missing its explanation: $c_out"
+grep -q "GraphQL query failed" <<<"$c_out" \
+  && bad "the ceiling was ALSO reported as a generic GraphQL failure: $c_out" \
+  || ok "the ceiling is not reported as a generic GraphQL failure"
+
+g_rc=$(ceiling_run "gh: Something went wrong while executing your query. (HTTP 502)")
+[ "$g_rc" = "2" ] \
+  && ok "control: a GraphQL failure without the proxy phrase keeps exit 2" \
+  || bad "control: generic GraphQL failure exited $g_rc, expected 2"
+
+# The classifier itself: the phrase anywhere in captured text, nothing else.
+(
+  # shellcheck source=../scripts/lib/graphql-ceiling.sh
+  . "$ROOT/scripts/lib/graphql-ceiling.sh"
+  graphql_ceiling_hit '{"message":"This GraphQL query is not enabled for this session"}' || exit 11
+  graphql_ceiling_hit 'gh: Resource not accessible by integration (HTTP 403)' && exit 12
+  graphql_ceiling_hit '' && exit 13
+  exit 0
+)
+cls_rc=$?
+[ "$cls_rc" -eq 0 ] \
+  && ok "graphql_ceiling_hit matches the proxy phrase and nothing else" \
+  || bad "graphql_ceiling_hit misclassified (case $cls_rc)"
+
+# A refusal raised inside nested command substitutions (the per-thread
+# comment refetch runs two levels down) must still end the run with 6, not
+# collapse into an ordinary "pagination failed" (Codex P2 on #1529).
+nest_out=$(bash -c '
+  set -euo pipefail
+  . "$1/scripts/lib/graphql-ceiling.sh"
+  graphql_ceiling_install_trap
+  inner() { graphql_ceiling_refuse probe "a nested read"; }
+  outer() { local x; x=$(inner) || return 1; printf "%s" "$x"; }
+  y=$(outer) || echo "caller saw an ordinary failure"
+  echo "REACHED-AFTER-REFUSAL"
+' _ "$ROOT" 2>&1)
+nest_rc=$?
+if [ "$nest_rc" -eq 6 ] && ! grep -q "REACHED-AFTER-REFUSAL" <<<"$nest_out"; then
+  ok "a refusal two subshells deep ends the main shell with 6"
+else
+  bad "nested refusal: rc=$nest_rc output: $nest_out"
+fi
+
+# End to end: the thread enumeration is served, but the full-comment refetch
+# for a truncated thread (60 comments, 50-comment window) is refused, with the
+# refusal only in the response BODY that gh writes to stdout. Every resolve
+# mode must end with 6 and resolve nothing (CodeRabbit and Codex on #1529).
+cat >"$STUB_DIR/gh" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"node(id"*) echo '{"message":"This GraphQL query is not enabled for this session"}'; echo 'gh: HTTP 403' >&2; exit 1 ;;
+  *resolveReviewThread*|*addPullRequestReviewThreadReply*) echo "MUTATION-ATTEMPTED" >&2; exit 1 ;;
+  *reviewThreads*) cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"PRRT_1","isResolved":false,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a.sh","body":"finding","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc123"}}]},"allComments":{"totalCount":60,"pageInfo":{"hasPreviousPage":true},"nodes":[{"author":{"login":"coderabbitai"},"body":"finding","databaseId":1,"createdAt":"2026-01-01T00:00:00Z"}]}}]}}}}}
+JSON
+  exit 0 ;;
+  *".head.sha"*) echo abc123; exit 0 ;;
+esac
+echo '[]'
+STUB
+chmod +x "$STUB_DIR/gh"
+for mode in --resolve-actioned --auto-resolve-bots; do
+  ( cd "$ROOT" \
+    && PATH="$STUB_DIR:$PATH" GH_RETRY_BACKOFF_SECONDS=0 GH_RETRY_ATTEMPTS=2 \
+       OP_PREFLIGHT_REVIEWER_PAT=stub-token RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+       bounded 60 bash "$SCRIPT" 999 --repo owner/name "$mode" ) >"$STUB_DIR/refetch.out" 2>&1
+  r_rc=$?
+  if [ "$r_rc" -eq 6 ] && grep -q "CEILING — re-fetching the full comment history of review thread PRRT_1" "$STUB_DIR/refetch.out" \
+     && ! grep -q "MUTATION-ATTEMPTED" "$STUB_DIR/refetch.out"; then
+    ok "$mode: a refused comment refetch (body-only refusal) ends the run with 6 before any mutation"
+  else
+    bad "$mode: refused refetch exited $r_rc; output: $(cat "$STUB_DIR/refetch.out")"
+  fi
+done
+
 echo
 echo "test_resolve_pr_threads_read_failure: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
