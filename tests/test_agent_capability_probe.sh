@@ -70,6 +70,12 @@ STUB
 cat >>"$STUB_DIR/gh" <<'STUB'
 tok="${GH_TOKEN:-}"
 [ -n "$tok" ] && printf '%s\n' "$tok" >>"$SEEN"
+if [ "$1 $2" = "auth token" ] && [ "$#" -eq 2 ]; then
+  # gh auth token (no --user): the ACTIVE account, controlled by STUB_KEYRING_ACTIVE
+  [ -n "${STUB_KEYRING_ACTIVE:-}" ] || exit 1
+  printf '%s\n' "$STUB_KEYRING_ACTIVE"
+  exit 0
+fi
 if [ "$1 $2" = "auth token" ]; then
   # gh auth token --user <login>: the keyring, controlled by STUB_KEYRING_<login>
   login="$4"
@@ -94,7 +100,8 @@ done
 login=""; type=User; scopes=""; perms='{"pull":true,"push":false}'
 case "$tok" in
   ghp_author) login=nathanjohnpayne; scopes="repo, workflow"; perms='{"pull":true,"push":true}' ;;
-  ghp_reviewer) login=nathanpayne-claude; scopes="repo" ;;
+  ghp_reviewer) login=nathanpayne-claude; scopes="repo"; perms='{"pull":true,"push":true}' ;;
+  ghp_readreviewer) login=nathanpayne-claude; scopes="repo" ;;
   github_pat_ro) login=nathanjohnpayne ;;
   github_pat_rw) login=nathanjohnpayne; perms='{"pull":true,"push":true}' ;;
   ghp_noscope) login=nathanjohnpayne; scopes="gist, read:org"; perms='{"pull":true,"push":true}' ;;
@@ -121,6 +128,8 @@ elif [ -z "$login" ]; then
   status=401; body='{"message":"Bad credentials"}'
 elif [ "$path" = "user" ]; then
   body="{\"login\":\"$login\",\"type\":\"$type\"}"
+elif [ "$path" = "graphql" ] && [ -n "${STUB_GRAPHQL_RATE_LIMITED:-}" ]; then
+  body='{"data":null,"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}'
 elif [ "$path" = "graphql" ]; then
   if [ "$tok" = "proxy-injected" ] || [ "${CLAUDE_CODE_REMOTE:-}" = "true" ]; then
     status=403; body='{"message":"This GraphQL query is not enabled for this session. Use gh api repos/{owner}/{repo}/... instead."}'
@@ -130,7 +139,7 @@ elif [ "$path" = "graphql" ]; then
 elif [ "${path#repos/$STUB_REPO/rules/branches/}" != "$path" ]; then
   body="${STUB_RULES:-[]}"
 elif [ "$path" = "repos/$STUB_REPO" ]; then
-  body="{\"full_name\":\"x\",\"private\":${STUB_PRIVATE:-true},\"permissions\":$perms}"
+  body="{\"full_name\":\"x\",\"private\":${STUB_PRIVATE:-true},\"archived\":${STUB_ARCHIVED:-false},\"permissions\":$perms}"
 elif [ "$tok" = "proxy-injected" ] || [ "${CLAUDE_CODE_REMOTE:-}" = "true" ]; then
   status=403; body='{"message":"repository not attached to this session"}'
 else
@@ -367,7 +376,7 @@ rm -rf "$CACHE"
 # verified token anywhere: reviewer-writes must export 0.
 run_probe GH_TOKEN=ghp_author -- >/dev/null 2>&1
 set +e
-out="$(run_probe -- --check --print-exports 2>/dev/null)"
+out="$(run_probe GH_TOKEN=ghp_author -- --check --print-exports 2>/dev/null)"
 rc=$?
 set -e
 evald="$(bash -c "$out"'
@@ -387,7 +396,7 @@ guard_fails() { # <label> <stdout of a --print-exports call>
 }
 
 set +e
-out="$(run_probe CLAUDE_CODE_REMOTE=true -- --check --print-exports 2>/dev/null)"; rc=$?
+out="$(run_probe GH_TOKEN=ghp_author CLAUDE_CODE_REMOTE=true -- --check --print-exports 2>/dev/null)"; rc=$?
 set -e
 [ "$rc" -eq 2 ] && pass "--check: surface mismatch exits 2" || fail "--check surface mismatch: exit $rc"
 guard_fails "--check surface mismatch" "$out"
@@ -395,22 +404,22 @@ guard_fails "--check surface mismatch" "$out"
 jq '.measured_at_epoch = 1' "$CACHE/agent-capability-o_r-nathanpayne-claude.json" >"$WORKDIR/stale.json"
 cp "$WORKDIR/stale.json" "$CACHE/agent-capability-o_r-nathanpayne-claude.json"
 set +e
-out="$(run_probe -- --check --print-exports 2>/dev/null)"; rc=$?
+out="$(run_probe GH_TOKEN=ghp_author -- --check --print-exports 2>/dev/null)"; rc=$?
 set -e
 [ "$rc" -eq 2 ] && pass "--check: stale cache exits 2" || fail "--check stale: exit $rc"
 guard_fails "--check stale cache" "$out"
 
 jq --argjson t "$(( $(date +%s) + 86400 ))" '.measured_at_epoch = $t' "$WORKDIR/stale.json" >"$CACHE/agent-capability-o_r-nathanpayne-claude.json"
 set +e
-out="$(run_probe -- --check --print-exports 2>/dev/null)"; rc=$?
+out="$(run_probe GH_TOKEN=ghp_author -- --check --print-exports 2>/dev/null)"; rc=$?
 set -e
 [ "$rc" -eq 2 ] && pass "--check: future measurement time exits 2" || fail "--check future timestamp: exit $rc"
 guard_fails "--check future measurement time" "$out"
 
 rm -rf "$CACHE"
 set +e
-out="$(run_probe -- --check --print-exports 2>/dev/null)"; rc=$?
-bare="$(run_probe -- --check 2>/dev/null)"; bare_rc=$?
+out="$(run_probe GH_TOKEN=ghp_author -- --check --print-exports 2>/dev/null)"; rc=$?
+bare="$(run_probe GH_TOKEN=ghp_author -- --check 2>/dev/null)"; bare_rc=$?
 set -e
 [ "$rc" -eq 2 ] && pass "--check: missing cache exits 2" || fail "--check missing: exit $rc"
 guard_fails "--check missing cache" "$out"
@@ -439,7 +448,7 @@ set -e
 set +e
 run_probe OP_PREFLIGHT_AUTHOR_PAT=github_pat_ro -- --no-cache >"$WORKDIR/ro.json" 2>/dev/null
 run_probe OP_PREFLIGHT_AUTHOR_PAT=ghp_noscope -- --no-cache >"$WORKDIR/noscope.json" 2>/dev/null
-run_probe OP_PREFLIGHT_REVIEWER_PAT=ghp_reviewer -- --no-cache >"$WORKDIR/rev.json" 2>/dev/null
+run_probe OP_PREFLIGHT_REVIEWER_PAT=ghp_readreviewer -- --no-cache >"$WORKDIR/rev.json" 2>/dev/null
 set -e
 if [ "$(cap "$WORKDIR/ro.json" author-writes)" = "false" ] && reason "$WORKDIR/ro.json" author-writes | grep -q "lacks 'push'"; then
   pass "read-only fine-grained token for the author: author-writes refused for lack of push"
@@ -451,8 +460,8 @@ if [ "$(cap "$WORKDIR/noscope.json" author-writes)" = "false" ] && reason "$WORK
 else
   fail "no-scope token: $(jq -c '.capabilities["author-writes"]' "$WORKDIR/noscope.json")"
 fi
-if [ "$(cap "$WORKDIR/rev.json" reviewer-writes)" = "true" ]; then
-  pass "reviewer with pull only: reviewer-writes granted (reviews need read access)"
+if [ "$(cap "$WORKDIR/rev.json" reviewer-writes)" = "false" ] && reason "$WORKDIR/rev.json" reviewer-writes | grep -q "lacks 'push'"; then
+  pass "reviewer with read access only: reviewer-writes refused (approvals and thread resolution need write, #1537)"
 else
   fail "reviewer pull-only: $(jq -c '.capabilities["reviewer-writes"]' "$WORKDIR/rev.json")"
 fi
@@ -473,7 +482,7 @@ fi
 rm -rf "$CACHE"
 run_probe GH_TOKEN=ghp_author OP_PREFLIGHT_REVIEWER_PAT=ghp_reviewer -- >/dev/null 2>&1
 set +e
-out="$(run_probe MERGEPATH_AGENT=codex -- --check --print-exports 2>/dev/null)"; rc=$?
+out="$(run_probe GH_TOKEN=ghp_author OP_PREFLIGHT_REVIEWER_PAT=ghp_reviewer MERGEPATH_AGENT=codex -- --check --print-exports 2>/dev/null)"; rc=$?
 set -e
 [ "$rc" -eq 2 ] && pass "--check for another reviewer identity finds no cache (exit 2)" || fail "--check other identity: exit $rc"
 guard_fails "--check for another reviewer identity" "$out"
@@ -481,7 +490,7 @@ bogus="$CACHE/agent-capability-o_r-nathanpayne-claude.json"
 jq '.capabilities["reviewer-writes"].identity = "nathanpayne-codex"' "$bogus" >"$WORKDIR/relabel.json"
 cp "$WORKDIR/relabel.json" "$bogus"
 set +e
-out="$(run_probe -- --check --print-exports 2>/dev/null)"; rc=$?
+out="$(run_probe GH_TOKEN=ghp_author OP_PREFLIGHT_REVIEWER_PAT=ghp_reviewer -- --check --print-exports 2>/dev/null)"; rc=$?
 set -e
 [ "$rc" -eq 2 ] && pass "--check rejects a cache whose recorded identities do not match" || fail "--check recorded identity mismatch: exit $rc"
 guard_fails "--check recorded identity mismatch" "$out"
@@ -489,7 +498,7 @@ guard_fails "--check recorded identity mismatch" "$out"
 # Every measured capability is exported, read included (Codex P2 on #1526).
 rm -rf "$CACHE"
 run_probe GH_TOKEN=ghp_author -- >/dev/null 2>&1
-out="$(run_probe -- --check --print-exports 2>/dev/null || true)"
+out="$(run_probe GH_TOKEN=ghp_author -- --check --print-exports 2>/dev/null || true)"
 evald="$(bash -c "$out"'
 printf "%s" "${MERGEPATH_CAP_READ:-unset}"' 2>/dev/null || true)"
 if [ "$evald" = "1" ]; then
@@ -531,8 +540,8 @@ fi
 rm -rf "$CACHE"
 run_probe CLAUDE_CODE_REMOTE=true CLAUDE_CODE_REMOTE_SESSION_ID=cse_one GH_TOKEN=proxy-injected -- >/dev/null 2>&1
 set +e
-out="$(run_probe CLAUDE_CODE_REMOTE=true CLAUDE_CODE_REMOTE_SESSION_ID=cse_two -- --check --print-exports 2>/dev/null)"; rc=$?
-same="$(run_probe CLAUDE_CODE_REMOTE=true CLAUDE_CODE_REMOTE_SESSION_ID=cse_one -- --check --print-exports 2>/dev/null)"; same_rc=$?
+out="$(run_probe GH_TOKEN=proxy-injected CLAUDE_CODE_REMOTE=true CLAUDE_CODE_REMOTE_SESSION_ID=cse_two -- --check --print-exports 2>/dev/null)"; rc=$?
+run_probe GH_TOKEN=proxy-injected CLAUDE_CODE_REMOTE=true CLAUDE_CODE_REMOTE_SESSION_ID=cse_one -- --check --print-exports >/dev/null 2>&1; same_rc=$?
 set -e
 if [ "$rc" -eq 2 ] && [ "$same_rc" -eq 0 ]; then
   pass "--check: another cloud session's cache is rejected; the same session's is accepted"
@@ -572,8 +581,8 @@ fi
 rm -rf "$CACHE"
 run_probe GH_TOKEN=ghp_author -- --cross-repo other/one >/dev/null 2>&1
 set +e
-out="$(run_probe -- --check --print-exports 2>/dev/null)"; rc=$?
-same="$(run_probe -- --cross-repo other/one --check --print-exports 2>/dev/null)"; same_rc=$?
+out="$(run_probe GH_TOKEN=ghp_author -- --check --print-exports 2>/dev/null)"; rc=$?
+run_probe GH_TOKEN=ghp_author -- --cross-repo other/one --check --print-exports >/dev/null 2>&1; same_rc=$?
 set -e
 if [ "$rc" -eq 2 ] && [ "$same_rc" -eq 0 ]; then
   pass "--check: a cache measured against another cross-repo target is rejected; the same target is accepted"
@@ -709,7 +718,7 @@ for mutation in '.capabilities.read = true' '.capabilities["author-writes"].gran
   jq "$mutation" "$CF" >"$WORKDIR/mal.json" && cp "$WORKDIR/mal.json" "$CF.mal"
   cp "$CF" "$WORKDIR/good.json"; cp "$CF.mal" "$CF"
   set +e
-  out="$(run_probe -- --check --print-exports 2>/dev/null)"; rc=$?
+  out="$(run_probe GH_TOKEN=ghp_author -- --check --print-exports 2>/dev/null)"; rc=$?
   set -e
   cp "$WORKDIR/good.json" "$CF"
   if [ "$rc" -eq 2 ] && ! printf '%s' "$out" | grep -q '^export ' && ! bash -c "$out; echo reached" 2>/dev/null | grep -q reached; then
@@ -718,6 +727,196 @@ for mutation in '.capabilities.read = true' '.capabilities["author-writes"].gran
     fail "malformed cache ($mutation): rc=$rc out=$out"
   fi
 done
+
+# ---------------------------------------------------------------------------
+# Phase 4b follow-ups on #1526 (#1533-#1536).
+# ---------------------------------------------------------------------------
+# #1533: a record whose identity field cannot be read (a scalar where an
+# object belongs) must fail through the eval guard, never abort with an empty
+# stdout that `eval ... &&` treats as success.
+rm -rf "$CACHE"
+run_probe GH_TOKEN=ghp_author -- >/dev/null 2>&1
+CF="$CACHE/agent-capability-o_r-nathanpayne-claude.json"
+cp "$CF" "$WORKDIR/good.json"
+for mutation in '.capabilities["author-writes"] = true' '.capabilities["reviewer-writes"].identity = 5' '.repo = null' '.measured_at_epoch = "soon"' '.session_id = 3'; do
+  jq "$mutation" "$WORKDIR/good.json" >"$CF"
+  set +e
+  out="$(run_probe GH_TOKEN=ghp_author -- --check --print-exports 2>/dev/null)"; rc=$?
+  reached="$(bash -c "eval \"\$1\" && echo REACHED" _ "$out" 2>/dev/null)"
+  set -e
+  if [ "$rc" -eq 2 ] && [ -n "$out" ] && [ -z "$reached" ]; then
+    pass "#1533 ($mutation): exit 2 and the guard stops eval ... &&"
+  else
+    fail "#1533 ($mutation): rc=$rc out=$out reached=$reached"
+  fi
+done
+cp "$WORKDIR/good.json" "$CF"
+
+# #1534: a revoked preferred PAT is final for the resolver even when the
+# keyring holds a valid token for the identity, so the repeat must not try the
+# keyring, and the 401 is an authoritative, cacheable denial.
+rm -rf "$CACHE"
+set +e
+run_probe GH_TOKEN=ghp_author OP_PREFLIGHT_REVIEWER_PAT=ghp_revoked STUB_KEYRING_nathanpayne_claude=ghp_reviewer -- >"$WORKDIR/fu-revoked.json" 2>/dev/null
+set -e
+if [ "$(jq -r .transient_failures "$WORKDIR/fu-revoked.json")" = "false" ] \
+   && [ "$(cap "$WORKDIR/fu-revoked.json" reviewer-writes)" = "false" ] \
+   && [ -e "$CACHE/agent-capability-o_r-nathanpayne-claude.json" ]; then
+  pass "#1534: revoked preferred PAT with a valid keyring token: not transient, denial cached"
+else
+  fail "#1534: transient=$(jq -r .transient_failures "$WORKDIR/fu-revoked.json" 2>/dev/null) reviewer=$(cap "$WORKDIR/fu-revoked.json" reviewer-writes)"
+fi
+
+# #1535: a GraphQL rate limit answered as HTTP 200 is transient.
+rm -rf "$CACHE"
+set +e
+run_probe GH_TOKEN=ghp_author STUB_GRAPHQL_RATE_LIMITED=1 -- >"$WORKDIR/fu-gql.json" 2>/dev/null
+set -e
+if [ "$(jq -r .transient_failures "$WORKDIR/fu-gql.json")" = "true" ] && [ ! -e "$CACHE/agent-capability-o_r-nathanpayne-claude.json" ]; then
+  pass "#1535: GraphQL RATE_LIMITED over HTTP 200 is transient and not cached"
+else
+  fail "#1535: transient=$(jq -r .transient_failures "$WORKDIR/fu-gql.json" 2>/dev/null)"
+fi
+
+# #1536: an archived repository grants no writes.
+set +e
+run_probe OP_PREFLIGHT_AUTHOR_PAT=ghp_author OP_PREFLIGHT_REVIEWER_PAT=ghp_reviewer STUB_ARCHIVED=true -- --no-cache >"$WORKDIR/fu-arch.json" 2>/dev/null
+set -e
+if [ "$(cap "$WORKDIR/fu-arch.json" author-writes)" = "false" ] && [ "$(cap "$WORKDIR/fu-arch.json" reviewer-writes)" = "false" ] \
+   && reason "$WORKDIR/fu-arch.json" reviewer-writes | grep -q "archived"; then
+  pass "#1536: archived repository: author and reviewer writes not granted"
+else
+  fail "#1536: $(jq -c '[.capabilities["author-writes"], .capabilities["reviewer-writes"]]' "$WORKDIR/fu-arch.json")"
+fi
+
+# ---------------------------------------------------------------------------
+# #1537.
+# ---------------------------------------------------------------------------
+# The cache is bound to the credential environment: a shell without the PATs
+# does not inherit another shell's grants.
+rm -rf "$CACHE"
+run_probe GH_TOKEN=ghp_author OP_PREFLIGHT_REVIEWER_PAT=ghp_reviewer -- >/dev/null 2>&1
+set +e
+run_probe GH_TOKEN=ghp_author OP_PREFLIGHT_REVIEWER_PAT=ghp_reviewer -- --check --print-exports >/dev/null 2>&1; same_rc=$?
+other="$(run_probe GH_TOKEN=ghp_author -- --check --print-exports 2>/dev/null)"; other_rc=$?
+set -e
+if [ "$same_rc" -eq 0 ] && [ "$other_rc" -eq 2 ]; then
+  pass "#1537: --check accepts the same credential environment and rejects a different one"
+else
+  fail "#1537 credential binding: same=$same_rc other=$other_rc"
+fi
+guard_fails "#1537 different credentials" "$other"
+if ! grep -qF ghp_reviewer "$CACHE/agent-capability-o_r-nathanpayne-claude.json"; then
+  pass "#1537: the credential fingerprint holds no token value"
+else
+  fail "#1537: a token value reached the cache"
+fi
+
+# A Codex cloud surface with no explicit agent selects the Codex reviewer.
+set +e
+run_probe MERGEPATH_AGENT_SURFACE=codex-cloud GH_TOKEN=ghp_author -- --no-cache >"$WORKDIR/cx.json" 2>/dev/null
+set -e
+if [ "$(jq -r '.capabilities["reviewer-writes"].identity' "$WORKDIR/cx.json")" = "nathanpayne-codex" ]; then
+  pass "#1537: codex-cloud surface without an explicit agent measures nathanpayne-codex"
+else
+  fail "#1537 codex reviewer: $(jq -r '.capabilities["reviewer-writes"].identity' "$WORKDIR/cx.json")"
+fi
+
+# A timestamp that is not a plain non-negative integer is rejected by the
+# validator, before any shell arithmetic.
+rm -rf "$CACHE"
+run_probe GH_TOKEN=ghp_author -- >/dev/null 2>&1
+CF="$CACHE/agent-capability-o_r-nathanpayne-claude.json"
+cp "$CF" "$WORKDIR/good.json"
+for mutation in '.measured_at_epoch = "09"' '.measured_at_epoch = [1]' '.measured_at_epoch = 1.5' '.measured_at_epoch = -1' '.measured_at_epoch = 1e20'; do
+  jq "$mutation" "$WORKDIR/good.json" >"$CF"
+  set +e
+  out="$(run_probe GH_TOKEN=ghp_author -- --check --print-exports 2>/dev/null)"; rc=$?
+  reached="$(bash -c "eval \"\$1\" && echo REACHED" _ "$out" 2>/dev/null)"
+  set -e
+  if [ "$rc" -eq 2 ] && [ -z "$reached" ]; then
+    pass "#1537 timestamp ($mutation): exit 2, guard stops eval ... &&"
+  else
+    fail "#1537 timestamp ($mutation): rc=$rc reached=$reached"
+  fi
+done
+cp "$WORKDIR/good.json" "$CF"
+
+# Repository names compare case-insensitively.
+set +e
+run_probe GH_TOKEN=ghp_author -- --cross-repo O/R --no-cache >"$WORKDIR/case.json" 2>/dev/null
+set -e
+if [ "$(cap "$WORKDIR/case.json" cross-repo)" = "false" ] && [ "$(jq -r '.capabilities["cross-repo"].basis' "$WORKDIR/case.json")" = "not-measured" ]; then
+  pass "#1537: --cross-repo naming this repository in other casing is not cross-repo evidence"
+else
+  fail "#1537 casing: $(jq -c '.capabilities["cross-repo"]' "$WORKDIR/case.json")"
+fi
+
+# Codex on #1538: the fingerprint covers GITHUB_TOKEN and the keyring, stays
+# out of stdout, and schema-1 records are rejected.
+rm -rf "$CACHE"
+run_probe GH_TOKEN=ghp_author GITHUB_TOKEN=ghp_author STUB_KEYRING_nathanpayne_claude=ghp_reviewer -- >"$WORKDIR/fp.json" 2>/dev/null
+set +e
+run_probe GH_TOKEN=ghp_author GITHUB_TOKEN=ghp_author STUB_KEYRING_nathanpayne_claude=ghp_reviewer -- --check >/dev/null 2>&1; same_rc=$?
+run_probe GH_TOKEN=ghp_author STUB_KEYRING_nathanpayne_claude=ghp_reviewer -- --check >/dev/null 2>&1; gt_rc=$?
+run_probe GH_TOKEN=ghp_author GITHUB_TOKEN=ghp_author -- --check >/dev/null 2>&1; kr_rc=$?
+set -e
+if [ "$same_rc" -eq 0 ] && [ "$gt_rc" -eq 2 ] && [ "$kr_rc" -eq 2 ]; then
+  pass "credential fingerprint covers GITHUB_TOKEN and the keyring token"
+else
+  fail "fingerprint coverage: same=$same_rc github_token=$gt_rc keyring=$kr_rc"
+fi
+if [ "$(jq 'has("credential_fingerprint")' "$WORKDIR/fp.json")" = "false" ] \
+   && [ "$(jq 'has("credential_fingerprint")' "$CACHE/agent-capability-o_r-nathanpayne-claude.json")" = "true" ]; then
+  pass "the fingerprint is in the private cache only, never in probe stdout"
+else
+  fail "fingerprint placement: stdout=$(jq 'has("credential_fingerprint")' "$WORKDIR/fp.json") cache=$(jq 'has("credential_fingerprint")' "$CACHE/agent-capability-o_r-nathanpayne-claude.json")"
+fi
+# GNU stat first: on Linux `stat -f` means filesystem status and still exits 0.
+perm="$(stat -c '%a' "$CACHE/agent-capability-o_r-nathanpayne-claude.json" 2>/dev/null || stat -f '%Lp' "$CACHE/agent-capability-o_r-nathanpayne-claude.json")"
+if [ "$perm" = "600" ]; then
+  pass "the cache file is owner-only (600)"
+else
+  fail "cache file mode is $perm, expected 600"
+fi
+jq '.schema = 1' "$CACHE/agent-capability-o_r-nathanpayne-claude.json" >"$WORKDIR/s1.json" && cp "$WORKDIR/s1.json" "$CACHE/agent-capability-o_r-nathanpayne-claude.json"
+set +e
+run_probe GH_TOKEN=ghp_author GITHUB_TOKEN=ghp_author STUB_KEYRING_nathanpayne_claude=ghp_reviewer -- --check >/dev/null 2>&1; s1_rc=$?
+set -e
+[ "$s1_rc" -eq 2 ] && pass "a schema-1 record (no credential binding) is rejected" || fail "schema-1 record: exit $s1_rc"
+
+# No SHA-256 tool: the fingerprint is unmatchable, so --check never reuses
+# the cache (CodeRabbit on #1538).
+HASHLESS="$WORKDIR/hashless-bin"
+mkdir -p "$HASHLESS"
+for tool in "$NOGH_DIR"/*; do ln -sf "$(readlink "$tool" 2>/dev/null || echo "$tool")" "$HASHLESS/$(basename "$tool")"; done
+rm -f "$HASHLESS/shasum" "$HASHLESS/sha256sum"
+ln -sf "$STUB_DIR/gh" "$HASHLESS/gh"
+rm -rf "$CACHE"
+set +e
+env -i HOME="$HOME" PATH="$HASHLESS" STUB_REPO=o/r MERGEPATH_CAPABILITY_CACHE_DIR="$CACHE" GH_TOKEN=ghp_author \
+  "$HASHLESS/bash" "$PROBE" --repo o/r >/dev/null 2>&1
+env -i HOME="$HOME" PATH="$HASHLESS" STUB_REPO=o/r MERGEPATH_CAPABILITY_CACHE_DIR="$CACHE" GH_TOKEN=ghp_author \
+  "$HASHLESS/bash" "$PROBE" --repo o/r --check >/dev/null 2>&1; hl_rc=$?
+set -e
+if [ "$hl_rc" -eq 2 ] && jq -e '.credential_fingerprint | startswith("unbindable-")' "$CACHE/agent-capability-o_r-nathanpayne-claude.json" >/dev/null 2>&1; then
+  pass "no SHA-256 tool: fingerprint is unbindable and --check re-probes"
+else
+  fail "hashless: check rc=$hl_rc fp=$(jq -r .credential_fingerprint "$CACHE/agent-capability-o_r-nathanpayne-claude.json" 2>/dev/null)"
+fi
+
+# Switching the active gh account invalidates the cache (Codex on #1538).
+rm -rf "$CACHE"
+run_probe GH_TOKEN=ghp_author STUB_KEYRING_ACTIVE=ghp_author -- >/dev/null 2>&1
+set +e
+run_probe GH_TOKEN=ghp_author STUB_KEYRING_ACTIVE=ghp_author -- --check >/dev/null 2>&1; same_rc=$?
+run_probe GH_TOKEN=ghp_author STUB_KEYRING_ACTIVE=ghp_reviewer -- --check >/dev/null 2>&1; sw_rc=$?
+set -e
+if [ "$same_rc" -eq 0 ] && [ "$sw_rc" -eq 2 ]; then
+  pass "a gh auth switch (different active account) invalidates the cache"
+else
+  fail "active account binding: same=$same_rc switched=$sw_rc"
+fi
 
 echo
 echo "agent-capability-probe tests: $PASS passed, $FAIL failed"
