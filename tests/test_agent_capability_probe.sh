@@ -121,6 +121,8 @@ elif [ -z "$login" ]; then
   status=401; body='{"message":"Bad credentials"}'
 elif [ "$path" = "user" ]; then
   body="{\"login\":\"$login\",\"type\":\"$type\"}"
+elif [ "$path" = "graphql" ] && [ -n "${STUB_GRAPHQL_RATE_LIMITED:-}" ]; then
+  body='{"data":null,"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}'
 elif [ "$path" = "graphql" ]; then
   if [ "$tok" = "proxy-injected" ] || [ "${CLAUDE_CODE_REMOTE:-}" = "true" ]; then
     status=403; body='{"message":"This GraphQL query is not enabled for this session. Use gh api repos/{owner}/{repo}/... instead."}'
@@ -130,7 +132,7 @@ elif [ "$path" = "graphql" ]; then
 elif [ "${path#repos/$STUB_REPO/rules/branches/}" != "$path" ]; then
   body="${STUB_RULES:-[]}"
 elif [ "$path" = "repos/$STUB_REPO" ]; then
-  body="{\"full_name\":\"x\",\"private\":${STUB_PRIVATE:-true},\"permissions\":$perms}"
+  body="{\"full_name\":\"x\",\"private\":${STUB_PRIVATE:-true},\"archived\":${STUB_ARCHIVED:-false},\"permissions\":$perms}"
 elif [ "$tok" = "proxy-injected" ] || [ "${CLAUDE_CODE_REMOTE:-}" = "true" ]; then
   status=403; body='{"message":"repository not attached to this session"}'
 else
@@ -718,6 +720,67 @@ for mutation in '.capabilities.read = true' '.capabilities["author-writes"].gran
     fail "malformed cache ($mutation): rc=$rc out=$out"
   fi
 done
+
+# ---------------------------------------------------------------------------
+# Phase 4b follow-ups on #1526 (#1533-#1536).
+# ---------------------------------------------------------------------------
+# #1533: a record whose identity field cannot be read (a scalar where an
+# object belongs) must fail through the eval guard, never abort with an empty
+# stdout that `eval ... &&` treats as success.
+rm -rf "$CACHE"
+run_probe GH_TOKEN=ghp_author -- >/dev/null 2>&1
+CF="$CACHE/agent-capability-o_r-nathanpayne-claude.json"
+cp "$CF" "$WORKDIR/good.json"
+for mutation in '.capabilities["author-writes"] = true' '.capabilities["reviewer-writes"].identity = 5' '.repo = null' '.measured_at_epoch = "soon"' '.session_id = 3'; do
+  jq "$mutation" "$WORKDIR/good.json" >"$CF"
+  set +e
+  out="$(run_probe -- --check --print-exports 2>/dev/null)"; rc=$?
+  reached="$(bash -c "eval \"\$1\" && echo REACHED" _ "$out" 2>/dev/null)"
+  set -e
+  if [ "$rc" -eq 2 ] && [ -n "$out" ] && [ -z "$reached" ]; then
+    pass "#1533 ($mutation): exit 2 and the guard stops eval ... &&"
+  else
+    fail "#1533 ($mutation): rc=$rc out=$out reached=$reached"
+  fi
+done
+cp "$WORKDIR/good.json" "$CF"
+
+# #1534: a revoked preferred PAT is final for the resolver even when the
+# keyring holds a valid token for the identity, so the repeat must not try the
+# keyring, and the 401 is an authoritative, cacheable denial.
+rm -rf "$CACHE"
+set +e
+run_probe GH_TOKEN=ghp_author OP_PREFLIGHT_REVIEWER_PAT=ghp_revoked STUB_KEYRING_nathanpayne_claude=ghp_reviewer -- >"$WORKDIR/fu-revoked.json" 2>/dev/null
+set -e
+if [ "$(jq -r .transient_failures "$WORKDIR/fu-revoked.json")" = "false" ] \
+   && [ "$(cap "$WORKDIR/fu-revoked.json" reviewer-writes)" = "false" ] \
+   && [ -e "$CACHE/agent-capability-o_r-nathanpayne-claude.json" ]; then
+  pass "#1534: revoked preferred PAT with a valid keyring token: not transient, denial cached"
+else
+  fail "#1534: transient=$(jq -r .transient_failures "$WORKDIR/fu-revoked.json" 2>/dev/null) reviewer=$(cap "$WORKDIR/fu-revoked.json" reviewer-writes)"
+fi
+
+# #1535: a GraphQL rate limit answered as HTTP 200 is transient.
+rm -rf "$CACHE"
+set +e
+run_probe GH_TOKEN=ghp_author STUB_GRAPHQL_RATE_LIMITED=1 -- >"$WORKDIR/fu-gql.json" 2>/dev/null
+set -e
+if [ "$(jq -r .transient_failures "$WORKDIR/fu-gql.json")" = "true" ] && [ ! -e "$CACHE/agent-capability-o_r-nathanpayne-claude.json" ]; then
+  pass "#1535: GraphQL RATE_LIMITED over HTTP 200 is transient and not cached"
+else
+  fail "#1535: transient=$(jq -r .transient_failures "$WORKDIR/fu-gql.json" 2>/dev/null)"
+fi
+
+# #1536: an archived repository grants no writes.
+set +e
+run_probe OP_PREFLIGHT_AUTHOR_PAT=ghp_author OP_PREFLIGHT_REVIEWER_PAT=ghp_reviewer STUB_ARCHIVED=true -- --no-cache >"$WORKDIR/fu-arch.json" 2>/dev/null
+set -e
+if [ "$(cap "$WORKDIR/fu-arch.json" author-writes)" = "false" ] && [ "$(cap "$WORKDIR/fu-arch.json" reviewer-writes)" = "false" ] \
+   && reason "$WORKDIR/fu-arch.json" reviewer-writes | grep -q "archived"; then
+  pass "#1536: archived repository: author and reviewer writes not granted"
+else
+  fail "#1536: $(jq -c '[.capabilities["author-writes"], .capabilities["reviewer-writes"]]' "$WORKDIR/fu-arch.json")"
+fi
 
 echo
 echo "agent-capability-probe tests: $PASS passed, $FAIL failed"

@@ -212,22 +212,44 @@ if [ "$MODE" = "check" ]; then
   snap() { printf '%s' "$CACHE_SNAPSHOT" | jq "$@"; }
   snap -e --argjson schema "$SCHEMA" '.schema == $schema' >/dev/null 2>&1 \
     || die 2 "capability cache for $REPO is unreadable or from another schema; re-run the probe"
-  cached_repo="$(snap -r '.repo')"
-  cached_surface="$(snap -r '.surface')"
-  measured_at="$(snap -r '.measured_at_epoch')"
+  # Validate the WHOLE record before reading any field from it (#1533). A
+  # field read that fails inside `$(...)` would abort under set -e with an
+  # empty stdout, and `eval ""` returns 0, so the caller's `&&` would proceed:
+  # the #1021 fail-open. Every field --check reads is typed here, so nothing
+  # after this point can fail, and a malformed record goes through die and
+  # its eval guard. The exports are then assembled in full and printed at
+  # once, so there is never a partial export set either.
+  caps_json="$(printf '%s\n' $EXPORT_CAPABILITIES | jq -R . | jq -s -c .)"
+  snap -e --argjson caps "$caps_json" '
+      . as $r
+      | ($r.repo | type == "string")
+        and ($r.surface | type == "string")
+        and ($r.measured_at_epoch | type == "number")
+        and (($r.session_id // "") | type == "string")
+        and (($r.cross_repo_target // "") | type == "string")
+        and ($r.tier | type == "string" and test("^[a-z,-]+$"))
+        and ($r.capabilities | type == "object")
+        and all($caps[]; ($r.capabilities[.] | type == "object") and ($r.capabilities[.].granted | type == "boolean"))
+        and ((($r.capabilities["author-writes"].identity // "") | type) == "string")
+        and ((($r.capabilities["reviewer-writes"].identity // "") | type) == "string")' \
+      >/dev/null 2>&1 \
+    || die 2 "capability cache for $REPO is malformed (a field --check reads has the wrong type or is missing); re-run the probe"
+  cached_repo="$(snap -r '.repo')" || die 2 "capability cache for $REPO could not be read; re-run the probe"
+  cached_surface="$(snap -r '.surface')" || die 2 "capability cache for $REPO could not be read; re-run the probe"
+  measured_at="$(snap -r '.measured_at_epoch')" || die 2 "capability cache for $REPO could not be read; re-run the probe"
   [ "$cached_repo" = "$REPO" ] || die 2 "capability cache is for $cached_repo, not $REPO; re-run the probe"
   [ "$cached_surface" = "$SURFACE" ] || die 2 "capability cache was measured on $cached_surface, this session is $SURFACE; re-run the probe"
   # A cloud session's proxy scope and provisioned credentials belong to that
   # session, so another session's measurement never answers this one's
   # --check, even for the same repo and identities (Codex P2 on #1526).
-  cached_session="$(snap -r '.session_id // empty')"
+  cached_session="$(snap -r '.session_id // empty')" || die 2 "capability cache for $REPO could not be read; re-run the probe"
   [ "$cached_session" = "${CLAUDE_CODE_REMOTE_SESSION_ID:-}" ] \
     || die 2 "capability cache was measured in session '${cached_session:-none}', this is '${CLAUDE_CODE_REMOTE_SESSION_ID:-none}'; re-run the probe"
-  cached_cross="$(snap -r '.cross_repo_target // empty')"
+  cached_cross="$(snap -r '.cross_repo_target // empty')" || die 2 "capability cache for $REPO could not be read; re-run the probe"
   [ "$cached_cross" = "$CROSS_REPO" ] \
     || die 2 "capability cache measured cross-repo against '$cached_cross', this check asks about '$CROSS_REPO'; re-run the probe"
-  cached_author="$(snap -r '.capabilities["author-writes"].identity // empty')"
-  cached_reviewer="$(snap -r '.capabilities["reviewer-writes"].identity // empty')"
+  cached_author="$(snap -r '.capabilities["author-writes"].identity // empty')" || die 2 "capability cache for $REPO could not be read; re-run the probe"
+  cached_reviewer="$(snap -r '.capabilities["reviewer-writes"].identity // empty')" || die 2 "capability cache for $REPO could not be read; re-run the probe"
   [ "$cached_author" = "$AUTHOR_IDENTITY" ] && [ "$cached_reviewer" = "$REVIEWER_IDENTITY" ] \
     || die 2 "capability cache was measured for author '$cached_author' / reviewer '$cached_reviewer', this session expects '$AUTHOR_IDENTITY' / '$REVIEWER_IDENTITY'; re-run the probe"
   printf '%s' "$measured_at" | grep -Eq '^[0-9]+$' || die 2 "capability cache has no measurement time; re-run the probe"
@@ -236,19 +258,7 @@ if [ "$MODE" = "check" ]; then
   # accept for TTL seconds past that future moment (CodeRabbit on #1526).
   [ "$age" -ge 0 ] || die 2 "capability cache for $REPO has a future measurement time; re-run the probe"
   [ "$age" -le "$TTL_SECONDS" ] || die 2 "capability cache for $REPO is ${age}s old (TTL ${TTL_SECONDS}s); re-run the probe"
-  # Validate the whole shape BEFORE printing anything: a malformed record
-  # must fail through die (and its eval guard), never abort half-way through
-  # the export lines and leave a partial set for eval to run (CodeRabbit on
-  # #1526). The exports are then assembled in full and printed at once.
-  caps_json="$(printf '%s\n' $EXPORT_CAPABILITIES | jq -R . | jq -s -c .)"
-  snap -e --argjson caps "$caps_json" '
-      . as $r
-      | ($r.tier | type == "string" and test("^[a-z,-]+$"))
-        and ($r.capabilities | type == "object")
-        and all($caps[]; ($r.capabilities[.] | type == "object") and ($r.capabilities[.].granted | type == "boolean"))' \
-      >/dev/null 2>&1 \
-    || die 2 "capability cache for $REPO is malformed (tier or capability records); re-run the probe"
-  tier="$(snap -r '.tier')"
+  tier="$(snap -r '.tier')" || die 2 "capability cache for $REPO could not be read; re-run the probe"
   if $PRINT_EXPORTS; then
     exports="$(printf 'export MERGEPATH_AGENT_TIER=%s\n' "$(printf '%q' "$tier")")"
     exports="$exports
@@ -328,6 +338,12 @@ api_request() {
   # headers (a curl timeout, a dropped connection): its body is incomplete,
   # so it is transient too (CodeRabbit on #1526). A non-2xx exit is gh's
   # normal way of reporting an HTTP error and is classified by status below.
+  # GitHub's GraphQL primary rate limit answers HTTP 200 with a RATE_LIMITED
+  # error and no data, and the transfer succeeds, so neither the status nor
+  # the exit code shows it (#1535). Read the body for it.
+  if [ "$status" = "200" ] && jq -e '[.errors[]?.type] | index("RATE_LIMITED")' "$prefix.body" >/dev/null 2>&1; then
+    echo "$path -> 200 with a RATE_LIMITED error" >>"$WORKDIR/transient"
+  fi
   case "$status" in
     2??) [ "$request_rc" -eq 0 ] || echo "$path -> $status, transfer exit $request_rc" >>"$WORKDIR/transient" ;;
     000|429|5??) echo "$path -> $status" >>"$WORKDIR/transient" ;;
@@ -364,16 +380,25 @@ measure_write() {
       reason="no-verified-token (resolver exit $rc)"
       # The resolver's own GET /user runs inside identity-check.sh, outside
       # api_request's classifier, so its outcome cannot tell an outage from a
-      # denial. Repeat GET /user once for EVERY candidate the resolver tries
-      # (preferred PAT, ambient token, the keyring's token) through
+      # denial. Repeat GET /user once for every candidate the resolver tried
+      # (see the candidate order below) through
       # api_request, which classifies by HTTP status: no response, 5xx, 429
       # and a rate-limited 403 mark the run transient, while an authoritative
       # denial such as a revoked token's 401 does not (Codex P2 on #1526,
       # rounds 3-6). A candidate that NOW verifies means the resolver's own
       # failure was the transient one, so that is marked too.
+      # Mirror the resolver's candidate order exactly (#1534): a set preferred
+      # PAT is the ONLY candidate (a failure there is final, it never falls
+      # through), otherwise the ambient token and then the keyring token. A
+      # fallback the resolver never tried says nothing about its failure.
       local candidate repeat_status repeat_login n=0
-      for candidate in "${!preferred:-}" "${GH_TOKEN:-}" \
-                       "$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --user "$identity" 2>/dev/null || true)"; do
+      local -a tried=()
+      if [ -n "${!preferred:-}" ]; then
+        tried=("${!preferred}")
+      else
+        tried=("${GH_TOKEN:-}" "$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --user "$identity" 2>/dev/null || true)")
+      fi
+      for candidate in "${tried[@]}"; do
         [ -n "$candidate" ] || continue
         n=$((n + 1))
         repeat_status="$(api_request "$candidate" GET user "$WORKDIR/resolve-user-$n")"
@@ -407,6 +432,10 @@ measure_write() {
         scopes="$(sed -nE 's/^[Xx]-[Oo][Aa]uth-[Ss]copes:[[:space:]]*//p' "$WORKDIR/write-user.headers" | tr -d ' ')"
         if [ "$repo_status" != "200" ]; then
           reason="verified $identity, but GET repos/$REPO with its token returned $repo_status"
+        elif [ "$(jq -r '.archived // false' "$WORKDIR/write-repo.body" 2>/dev/null || echo false)" = "true" ]; then
+          # An archived repository stays readable but refuses every write,
+          # reviews and comments included (#1536).
+          reason="verified $identity, but $REPO is archived (read-only)"
         elif [ "$has_perm" != "true" ]; then
           reason="verified $identity, but its token lacks '$required' permission on $REPO"
         elif ! grep -Eiq '^x-oauth-scopes:' "$WORKDIR/write-user.headers"; then
