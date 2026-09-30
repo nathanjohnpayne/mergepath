@@ -141,11 +141,116 @@ fi
 # the Codex App requires (#405). Assert the real wrapped invocation, not
 # just the guard around it (Codex r2 on #405: a guard can be present
 # while the post still goes out unwrapped).
-if grep -qE '"\$AS_AUTHOR" -- gh pr comment .* --body "@codex review"' "$CRR"; then
-  pass "codex-review-request: '@codex review' trigger posted via \"\$AS_AUTHOR\" -- gh pr comment (author byline)"
+#
+# Since #1085 the trigger is not a single greppable line: post_codex_trigger
+# calls `post_author_pr_comment "@codex review" ... inline`, which builds
+# `body_args=(--body "$body")` and runs `"$AS_AUTHOR" -- gh pr comment ...
+# "${body_args[@]}"`. A one-line grep for the literal no longer matches (it
+# silently went red while no CI wrapper ran this suite), so the property is
+# asserted in three parts that together cover the whole path:
+#
+#   1. the trigger call site hands the literal '@codex review' to
+#      post_author_pr_comment in inline mode;
+#   2. EVERY `gh pr comment` in the script is prefixed by
+#      `"$AS_AUTHOR" -- `, so no branch can post unwrapped;
+#   3. behaviorally, the extracted post_author_pr_comment, run against a
+#      recording gh-as-author stub on both of its invocation branches,
+#      executes exactly `-- gh pr comment <pr> --repo <repo> --body
+#      '@codex review'` through the wrapper and never reaches a bare gh.
+
+# Part 1: the call site inside post_codex_trigger (the only trigger writer;
+# the eyes-ack retry re-enters it).
+crr_trigger_fn=$(awk '/^post_codex_trigger\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$CRR")
+if [ -z "$crr_trigger_fn" ]; then
+  fail "codex-review-request: post_codex_trigger() not found — cannot locate the '@codex review' trigger write"
+elif printf '%s\n' "$crr_trigger_fn" \
+     | grep -qE '^[[:space:]]*post_author_pr_comment "@codex review" "[^"]*" inline[[:space:]]*$'; then
+  pass "codex-review-request: post_codex_trigger posts '@codex review' via post_author_pr_comment (inline --body mode)"
 else
-  fail "codex-review-request: '@codex review' trigger is NOT wrapped by gh-as-author — the byline would not be nathanjohnpayne"
+  fail "codex-review-request: post_codex_trigger does not post '@codex review' via post_author_pr_comment ... inline"
 fi
+
+# Part 2: no unwrapped `gh pr comment` anywhere in the script. Comment lines
+# are skipped; every remaining occurrence must be immediately preceded by the
+# wrapper invocation.
+crr_comment_writes=$(grep -nE '(^|[^[:alnum:]_-])gh pr comment( |$)' "$CRR" \
+  | grep -vE '^[0-9]+:[[:space:]]*#' || true)
+crr_unwrapped=$(printf '%s\n' "$crr_comment_writes" \
+  | grep -vE '"\$AS_AUTHOR" -- gh pr comment ' | grep -v '^$' || true)
+if [ -z "$crr_comment_writes" ]; then
+  fail "codex-review-request: no 'gh pr comment' write found — the trigger post path is missing"
+elif [ -n "$crr_unwrapped" ]; then
+  fail "codex-review-request: 'gh pr comment' write(s) NOT wrapped by \"\$AS_AUTHOR\" --: $crr_unwrapped"
+else
+  pass "codex-review-request: every 'gh pr comment' write runs through \"\$AS_AUTHOR\" --"
+fi
+
+# Part 3: execute the real post_author_pr_comment body (extracted verbatim)
+# against stubs. The gh-as-author stub records its argv one arg per line; a
+# bare `gh` on PATH records that it was reached unwrapped and fails.
+crr_post_fn=$(awk '/^post_author_pr_comment\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$CRR")
+CRR_STUB="$WORKDIR/crr-stub"
+mkdir -p "$CRR_STUB/bin"
+cat >"$CRR_STUB/gh-as-author.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"$CRR_STUB_LOG"
+printf 'identity=%s\n' "${GH_AS_AUTHOR_IDENTITY:-}" >>"$CRR_STUB_LOG"
+printf 'bridged=%s\n' "${OP_PREFLIGHT_AUTHOR_PAT:-none}" >>"$CRR_STUB_LOG"
+echo "https://github.com/o/r/pull/7#issuecomment-1"
+STUB
+cat >"$CRR_STUB/identity-check.sh" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+cat >"$CRR_STUB/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+echo "UNWRAPPED gh $*" >>"$CRR_STUB_BARE"
+exit 1
+STUB
+chmod +x "$CRR_STUB/gh-as-author.sh" "$CRR_STUB/identity-check.sh" "$CRR_STUB/bin/gh"
+
+# run_crr_post <label> <bridge:0|1>
+# bridge=1 sets an ambient GH_TOKEN that the stub identity-check verifies as
+# the author, driving the OP_PREFLIGHT_AUTHOR_PAT bridge branch; the recorded
+# `bridged=` line proves which branch actually ran.
+run_crr_post() {
+  local label="$1" bridge="$2" log="$WORKDIR/crr-argv.$2" bare="$WORKDIR/crr-bare.$2" rc
+  local bridged=none expected
+  [ "$bridge" = 1 ] && bridged=stub-author-token
+  expected=$(printf '%s\n' -- gh pr comment 7 --repo o/r --body '@codex review' \
+    'identity=test-author' "bridged=$bridged")
+  rm -f "$log" "$bare"
+  set +e
+  (
+    set -euo pipefail
+    export CRR_STUB_LOG="$log" CRR_STUB_BARE="$bare"
+    export PATH="$CRR_STUB/bin:$PATH"
+    unset OP_PREFLIGHT_AUTHOR_PAT GH_TOKEN
+    if [ "$bridge" = 1 ]; then export GH_TOKEN="stub-author-token"; fi
+    log() { :; }
+    die() { shift; echo "die: $*" >&2; exit 3; }
+    __CODEX_REQUEST_DIR="$CRR_STUB"
+    # shellcheck disable=SC2034  # read by the eval'd post_author_pr_comment
+    AUTHOR_IDENTITY="test-author" PR_NUMBER=7 REPO=o/r
+    eval "$crr_post_fn"
+    post_author_pr_comment "@codex review" "'@codex review' trigger comment" inline
+  ) >/dev/null 2>&1
+  rc=$?
+  set -e
+  if [ -z "$crr_post_fn" ]; then
+    fail "codex-review-request ($label): post_author_pr_comment() not found"
+  elif [ -s "$bare" ]; then
+    fail "codex-review-request ($label): trigger reached a bare gh: $(cat "$bare")"
+  elif [ "$rc" -ne 0 ] || [ ! -f "$log" ]; then
+    fail "codex-review-request ($label): trigger write did not go through gh-as-author (rc=$rc)"
+  elif [ "$(cat "$log")" != "$expected" ]; then
+    fail "codex-review-request ($label): gh-as-author argv mismatch; got: $(tr '\n' ' ' <"$log")"
+  else
+    pass "codex-review-request ($label): '@codex review' executed as \"\$AS_AUTHOR\" -- gh pr comment 7 --repo o/r --body '@codex review'"
+  fi
+}
+run_crr_post "wrapper-resolved token" 0
+run_crr_post "bridged ambient author GH_TOKEN" 1
 
 # -----------------------------------------------------------------------
 # Part B — Behavioral: the gate idiom rejects helper absence.
