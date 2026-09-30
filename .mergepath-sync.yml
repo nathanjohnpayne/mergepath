@@ -281,6 +281,25 @@ paths:
   - path: scripts/lib/gh-token-resolver.sh
     type: canonical
     consumers: all
+  # Capability probe (#1057): measures what an agent session (local, Claude
+  # cloud, Codex cloud, CI) can do on GitHub before it tries, and caches a
+  # tier `--check --print-exports` re-exports. It resolves write tokens
+  # through the same resolver the wrappers use, so the resolver and its
+  # identity-check dependency must travel with it, and it classifies them
+  # with credential-class.sh.
+  - path: scripts/agent-capability-probe.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/credential-class.sh"
+      - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/identity-check.sh"
+  # Pure credential classifier (#1057): user-held vs brokered vs
+  # app-installed, decided from the token's own form, never from GET /user
+  # alone (which a brokered credential answers as the user).
+  - path: scripts/lib/credential-class.sh
+    type: canonical
+    consumers: all
   # Sourced by scripts/workflow/verify-propagation-pr.sh (propagated kit) and
   # the sync tooling to read consumer facts from the manifest. Travels with
   # verify-propagation-pr.sh so a consumer running check_verify_propagation_pr
@@ -1395,6 +1414,17 @@ paths:
   - path: tests/test_preflight_agent_name.sh
     type: canonical
     consumers: all
+  # Capability probe suite (#1057), run by check_op_preflight_contract. It
+  # copies the probe's runtime closure into a scratch repo, so every file it
+  # copies must travel with it.
+  - path: tests/test_agent_capability_probe.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/agent-capability-probe.sh"
+      - "scripts/lib/credential-class.sh"
+      - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/identity-check.sh"
   # Pairs with scripts/resolve-pr-threads.sh +
   # scripts/ci/check_resolve_pr_threads (which delegates to this test
   # file after its own in-suite cases). Exercises the mergepath#305
