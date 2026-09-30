@@ -227,6 +227,22 @@ if [ "$MODE" = "write" ]; then
     echo "identity-check: BLOCKED GH_HOST is '$GH_HOST'; write identity is established for github.com only." >&2
     exit 3
   fi
+  # With GH_HOST unset, gh's default host is github.com UNLESS hosts.yml holds
+  # exactly one host, in which case every bare `gh api` a caller runs after
+  # this check targets THAT host with its stored credential (Codex on #1541:
+  # coderabbit-wait.sh writes that way). Refuse that configuration here, where
+  # every write-mode caller passes, rather than patch each caller.
+  if [ -z "${GH_HOST:-}" ]; then
+    GH_HOSTS_FILE="${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/gh}/hosts.yml"
+    if [ -r "$GH_HOSTS_FILE" ]; then
+      GH_CONFIGURED_HOSTS="$(grep -E '^[^[:space:]#][^:]*:[[:space:]]*$' "$GH_HOSTS_FILE" | sed -E 's/:[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+      if [ "$(printf '%s\n' "$GH_CONFIGURED_HOSTS" | grep -c .)" -eq 1 ] && [ "$GH_CONFIGURED_HOSTS" != "github.com" ]; then
+        echo "identity-check: BLOCKED gh's only configured host is '$GH_CONFIGURED_HOSTS', so a bare gh call after this check would write there, not to github.com." >&2
+        echo "identity-check:   Set GH_HOST=github.com for guarded writes, or log in to github.com as well." >&2
+        exit 3
+      fi
+    fi
+  fi
   CLASS_HEADERS=""
   if printf '%s' "$GH_TOKEN" | grep -Eq '^[0-9a-f]{40}$'; then
     # A legacy unprefixed token is user-held only if GitHub answers with

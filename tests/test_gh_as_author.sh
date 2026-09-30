@@ -956,6 +956,7 @@ run_git_wrapper() { # <expected rc> <label> <payload...>
   reset_log
   set +e
   err=$(PATH="$GITSTUB_DIR:$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" GIT_PUSH_LOG="$GIT_PUSH_LOG" \
+    GH_AS_AUTHOR_PUSH_REPO="${PUSH_REPO_OVERRIDE-example/repo}" \
     OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" "$WRAPPER" -- "$@" 2>&1 >/dev/null)
   rc=$?
   set -e
@@ -966,57 +967,127 @@ run_git_wrapper() { # <expected rc> <label> <payload...>
   fi
   return 0
 }
+# A fresh bootstrap-shaped repository: git init + origin, nothing else.
+fresh_pushrepo() {
+  rm -rf "$PUSHREPO"
+  "$REAL_GIT" init -q -b main "$PUSHREPO"
+  "$REAL_GIT" -C "$PUSHREPO" remote add origin "${1:-https://github.com/example/repo.git}"
+}
+refused_case() { # <label>  (expects exit 5 and nothing pushed)
+  if run_git_wrapper 5 "$1" git -C "$PUSHREPO" push -u origin HEAD; then
+    if [ -s "$GIT_PUSH_LOG" ]; then fail "$1: pushed"; else pass "$1: refused before the push"; fi
+  fi
+}
 
-if run_git_wrapper 0 "bootstrap form" git -C "$PUSHREPO" push -u origin HEAD; then
+fresh_pushrepo
+if run_git_wrapper 0 "fresh bootstrap repo" git -C "$PUSHREPO" push -u origin HEAD; then
   line="$(cat "$GIT_PUSH_LOG")"
   case "$line" in
     "GH_TOKEN=ghp_author-token|HOME=$HOME|"*) fail "git push ran with the operator's HOME (netrc/XDG reachable): $line" ;;
-    "GH_TOKEN=ghp_author-token|HOME="*"|GIT_CONFIG_GLOBAL=/dev/null|NOSYSTEM=1|PROMPT=0|ARGS=-c credential.helper= -c credential.helper=!gh auth git-credential -c http.extraHeader= "*"push -u origin HEAD ")
-      pass "bootstrap git form: pushed under the verified token with global, system and prompt paths closed and gh's helper alone" ;;
-    *) fail "bootstrap git form: unexpected push environment: $line" ;;
+    "GH_TOKEN=ghp_author-token|HOME="*"|GIT_CONFIG_GLOBAL=/dev/null|NOSYSTEM=1|PROMPT=0|ARGS=-c credential.helper= -c credential.helper=!gh auth git-credential -c http.extraHeader= -c core.hooksPath=/dev/null "*"push -u origin HEAD ")
+      pass "fresh bootstrap repo: pushed under the verified token, global/system/prompt/hooks closed, gh's helper alone" ;;
+    *) fail "fresh bootstrap repo: unexpected push environment: $line" ;;
   esac
 fi
 
-"$REAL_GIT" -C "$PUSHREPO" remote set-url origin git@github.com:example/repo.git
-if run_git_wrapper 0 "ssh remote" git -C "$PUSHREPO" push -u origin HEAD \
+fresh_pushrepo "git@github.com:example/repo.git"
+if run_git_wrapper 0 "exact ssh spelling" git -C "$PUSHREPO" push -u origin HEAD \
    && grep -q -- '-c url.https://github.com/.insteadOf=git@github.com:' "$GIT_PUSH_LOG"; then
-  pass "SSH github.com remote: rewritten to HTTPS, so gh's helper and not an SSH key authenticates"
+  pass "exact git@github.com: spelling for the expected repo: accepted and pushed over HTTPS"
+fi
+
+# The destination must be exactly the expected repository.
+for url in https://github.com/example/other.git https://github.com/Example/Repo.git https://github.com/example/repo \
+           ssh://git@github.com/example/repo.git "https://x-access-token:EMBEDDEDSECRET@github.com/example/repo.git" \
+           https://gitlab.com/example/repo.git; do
+  fresh_pushrepo "$url"
+  refused_case "origin $(printf '%s' "$url" | sed -E 's#//[^/@]*@#//<redacted>@#')"
+  printf '%s' "$GIT_CASE_ERR" | grep -q EMBEDDEDSECRET && fail "origin URL credential was echoed"
+done
+fresh_pushrepo
+PUSH_REPO_OVERRIDE="" refused_case "no GH_AS_AUTHOR_PUSH_REPO"
+PUSH_REPO_OVERRIDE="example/other" refused_case "GH_AS_AUTHOR_PUSH_REPO names another repository"
+
+# Any key outside the value-checked allowlist refuses the push, named without
+# its value, userinfo in a URL subsection redacted.
+for kv in "remote.origin.pushurl=https://github.com/example/repo.git" "remote.origin.vcs=evil" \
+          "push.gpgSign=true" "gpg.program=/tmp/x" "credential.helper=!echo password=x" \
+          "url.https://evil.example/.insteadOf=https://github.com/" "include.path=/tmp/other.config" \
+          "extensions.worktreeConfig=true" "remote.origin.gh-resolved=base" "user.name=t" \
+          "core.fsmonitor=true" "core.hooksPath=/tmp/hooks" "core.filemode=yes" \
+          "branch.main.remote=Origin" "branch.main.pushRemote=origin" \
+          "http.https://user:KEYSECRET@github.com/.extraheader=x: y"; do
+  fresh_pushrepo
+  "$REAL_GIT" -C "$PUSHREPO" config --local "${kv%%=*}" "${kv#*=}"
+  refused_case "repo-local $(printf '%s' "${kv%%=*}" | sed -E 's#//[^/@]*@#//<redacted>@#')"
+  if printf '%s' "$GIT_CASE_ERR" | grep -q KEYSECRET; then fail "a credential-bearing key name was echoed"; fi
+done
+fresh_pushrepo
+"$REAL_GIT" -C "$PUSHREPO" config --local "http.https://user:KEYSECRET@github.com/.extraheader" "x: y"
+run_git_wrapper 5 "redaction probe" git -C "$PUSHREPO" push -u origin HEAD \
+  && printf '%s' "$GIT_CASE_ERR" | grep -q '<redacted>@github.com' \
+  && pass "credential-bearing key name: named with its userinfo redacted"
+
+fresh_pushrepo
+"$REAL_GIT" -C "$PUSHREPO" config --local --add remote.origin.url https://github.com/example/repo.git
+refused_case "duplicate remote.origin.url (same value)"
+fresh_pushrepo
+"$REAL_GIT" -C "$PUSHREPO" config --local --unset-all remote.origin.fetch
+refused_case "missing remote.origin.fetch"
+fresh_pushrepo
+"$REAL_GIT" -C "$PUSHREPO" config --local branch.main.remote origin
+"$REAL_GIT" -C "$PUSHREPO" config --local branch.main.merge refs/heads/main
+if run_git_wrapper 0 "retry after push -u" git -C "$PUSHREPO" push -u origin HEAD && [ -s "$GIT_PUSH_LOG" ]; then
+  pass "retry after push -u (branch.main.remote=origin, branch.main.merge=refs/heads/main): the push proceeds"
+fi
+
+# Linked worktree: its .git is a gitdir file, not the primary repository.
+fresh_pushrepo
+"$REAL_GIT" -C "$PUSHREPO" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m init
+"$REAL_GIT" -C "$PUSHREPO" worktree add -q "$WORKDIR/linked-wt" -b side 2>/dev/null
+if run_git_wrapper 5 "linked worktree" git -C "$WORKDIR/linked-wt" push -u origin HEAD; then
+  [ -s "$GIT_PUSH_LOG" ] && fail "linked worktree: pushed" || pass "linked worktree: refused before the push"
+fi
+"$REAL_GIT" -C "$PUSHREPO" worktree remove --force "$WORKDIR/linked-wt" 2>/dev/null || true
+
+# Crafted indirection: <dir>/.git is a DIRECTORY holding a clean config and a
+# commondir pointing at another repository, whose config git actually uses
+# for the push (here remote.origin.vcs=evil). Reading <dir>/.git/config alone
+# would pass; the git-dir == common-dir check refuses it. Real git.
+mkdir -p "$WORKDIR/vcs-bin"
+printf '#!/bin/sh\nprintf "%%s" "$GH_TOKEN" >"%s"\nexit 1\n' "$WORKDIR/vcs-captured" >"$WORKDIR/vcs-bin/git-remote-evil"
+chmod +x "$WORKDIR/vcs-bin/git-remote-evil"
+CDA="$WORKDIR/cd-hostile"
+CDW="$WORKDIR/cd-crafted"
+"$REAL_GIT" init -q -b main "$CDA"
+"$REAL_GIT" -C "$CDA" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m init
+"$REAL_GIT" -C "$CDA" remote add origin https://github.com/example/repo.git
+"$REAL_GIT" -C "$CDA" worktree add -q "$CDW" -b crafted 2>/dev/null
+wtname="$(basename "$CDW")"
+rm -f "$CDW/.git"
+cp -R "$CDA/.git/worktrees/$wtname" "$CDW/.git"
+printf '%s\n' "$CDA/.git" >"$CDW/.git/commondir"
+cp "$CDA/.git/config" "$CDW/.git/config"
+"$REAL_GIT" -C "$CDA" config --local remote.origin.vcs evil
+rm -f "$WORKDIR/vcs-captured"
+set +e
+PATH="$WORKDIR/vcs-bin:$PATH" bash -c '. "$1"; gh_author_git_push ghp_cd-token example/repo -C "$2" push -u origin HEAD' _ \
+  "$ROOT/scripts/lib/gh-token-resolver.sh" "$CDW" >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 5 ] && [ ! -e "$WORKDIR/vcs-captured" ]; then
+  pass "crafted commondir indirection: refused, so the other repository's helper never sees the token"
 else
-  fail "ssh remote handling: $(cat "$GIT_PUSH_LOG")"
+  fail "commondir indirection: rc=$rc captured=$([ -e "$WORKDIR/vcs-captured" ] && echo yes || echo no)"
 fi
 
-"$REAL_GIT" -C "$PUSHREPO" remote set-url origin "https://x-access-token:EMBEDDEDSECRET@github.com/example/repo.git"
-if run_git_wrapper 5 "embedded credentials" git -C "$PUSHREPO" push -u origin HEAD; then
-  if [ -s "$GIT_PUSH_LOG" ] || printf '%s' "$GIT_CASE_ERR" | grep -q EMBEDDEDSECRET; then
-    fail "embedded credentials: pushed, or echoed the credential: $GIT_CASE_ERR"
-  else
-    pass "remote with embedded credentials: refused before the push, credential never echoed"
-  fi
-fi
-
-for other in https://gitlab.com/example/repo.git ssh://git@example.com/repo.git; do
-  "$REAL_GIT" -C "$PUSHREPO" remote set-url origin "$other"
-  if run_git_wrapper 5 "non-GitHub remote $other" git -C "$PUSHREPO" push -u origin HEAD; then
-    [ -s "$GIT_PUSH_LOG" ] && fail "non-GitHub remote $other: pushed" || pass "non-GitHub remote $other: refused before the push"
-  fi
-done
-
-"$REAL_GIT" -C "$PUSHREPO" remote set-url origin https://github.com/example/repo.git
-for key in "http.extraHeader=Authorization: bearer OTHER" "http.https://github.com/.extraheader=Authorization: basic OTHER" \
-           "credential.helper=!echo password=OTHER" "url.https://evil.example/.insteadOf=https://github.com/"; do
-  "$REAL_GIT" -C "$PUSHREPO" config --local "${key%%=*}" "${key#*=}"
-  if run_git_wrapper 5 "repo-local ${key%%=*}" git -C "$PUSHREPO" push -u origin HEAD; then
-    [ -s "$GIT_PUSH_LOG" ] && fail "repo-local ${key%%=*}: pushed" || pass "repo-local ${key%%=*}: refused before the push"
-  fi
-  "$REAL_GIT" -C "$PUSHREPO" config --local --unset-all "${key%%=*}"
-done
-
-for shape in "git -c credential.helper=x -C $PUSHREPO push origin HEAD" \
-             "git -C $PUSHREPO fetch origin" \
-             "git -C $PUSHREPO push https://github.com/example/repo.git HEAD" \
-             "git -C $PUSHREPO push origin --force" \
-             "env GH_TOKEN=proxy-injected git -C $PUSHREPO push origin HEAD" \
-             "git -C $PUSHREPO push -u origin HEAD;id"; do
+# Only the exact form, and nothing in front of it.
+fresh_pushrepo
+for shape in "git -C $PUSHREPO push origin HEAD" "git -C $PUSHREPO push -u origin main" \
+             "git -C $PUSHREPO push -u upstream HEAD" "git push -u origin HEAD" \
+             "git -c credential.helper=x -C $PUSHREPO push -u origin HEAD" "git -C $PUSHREPO fetch origin" \
+             "git -C $PUSHREPO push -u origin HEAD --force" \
+             "env GH_TOKEN=proxy-injected git -C $PUSHREPO push -u origin HEAD"; do
   # shellcheck disable=SC2086
   if run_git_wrapper 1 "refused shape: $shape" $shape; then
     if [ -s "$GIT_PUSH_LOG" ] || grep -q $'gh\tapi\tuser' "$WORKDIR/calls.log"; then
@@ -1026,27 +1097,6 @@ for shape in "git -c credential.helper=x -C $PUSHREPO push origin HEAD" \
     fi
   fi
 done
-
-# git push sends to EVERY push URL, so a second one must not slip past the
-# check (CodeRabbit and Codex on #1541): a second pushurl, or a second url.
-for second in "https://evil.example/repo.git" "https://other:SECONDSECRET@github.com/example/repo.git"; do
-  "$REAL_GIT" -C "$PUSHREPO" config --local remote.origin.pushurl https://github.com/example/repo.git
-  "$REAL_GIT" -C "$PUSHREPO" config --local --add remote.origin.pushurl "$second"
-  if run_git_wrapper 5 "second pushurl $second" git -C "$PUSHREPO" push -u origin HEAD; then
-    if [ -s "$GIT_PUSH_LOG" ] || printf '%s' "$GIT_CASE_ERR" | grep -q SECONDSECRET; then
-      fail "second pushurl: pushed or echoed it"
-    else
-      pass "a second push URL that fails the check (${second%%//*}//...): refused before the push"
-    fi
-  fi
-  "$REAL_GIT" -C "$PUSHREPO" config --local --unset-all remote.origin.pushurl
-done
-"$REAL_GIT" -C "$PUSHREPO" config --local --add remote.origin.url https://evil.example/repo.git
-if run_git_wrapper 5 "second url" git -C "$PUSHREPO" push -u origin HEAD; then
-  [ -s "$GIT_PUSH_LOG" ] && fail "second remote url: pushed" || pass "a second remote url that fails the check: refused before the push"
-fi
-"$REAL_GIT" -C "$PUSHREPO" config --local --unset-all remote.origin.url
-"$REAL_GIT" -C "$PUSHREPO" config --local remote.origin.url https://github.com/example/repo.git
 
 # No repository-controlled hook runs with the token in its environment (Codex
 # on #1541). Real git, a real local push: a pre-push hook that would capture
@@ -1070,6 +1120,28 @@ else
   fail "hook isolation: rc=$rc captured=$([ -e "$WORKDIR/hook-captured" ] && echo yes || echo no) out=$hook_out"
 fi
 
+# Real git: with remote.origin.vcs=evil and git-remote-evil on PATH, the
+# helper never starts, so the token is never captured (CodeRabbit on #1541).
+VCSREPO="$WORKDIR/vcsrepo"
+"$REAL_GIT" init -q -b main "$VCSREPO"
+"$REAL_GIT" -C "$VCSREPO" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m init
+"$REAL_GIT" -C "$VCSREPO" remote add origin https://github.com/example/repo.git
+"$REAL_GIT" -C "$VCSREPO" config --local remote.origin.vcs evil
+mkdir -p "$WORKDIR/vcs-bin"
+printf '#!/bin/sh\nprintf "%%s" "$GH_TOKEN" >"%s"\nexit 1\n' "$WORKDIR/vcs-captured" >"$WORKDIR/vcs-bin/git-remote-evil"
+chmod +x "$WORKDIR/vcs-bin/git-remote-evil"
+rm -f "$WORKDIR/vcs-captured"
+set +e
+PATH="$WORKDIR/vcs-bin:$PATH" bash -c '. "$1"; gh_author_git_push ghp_vcs-token example/repo -C "$2" push -u origin HEAD' _ \
+  "$ROOT/scripts/lib/gh-token-resolver.sh" "$VCSREPO" >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 5 ] && [ ! -e "$WORKDIR/vcs-captured" ]; then
+  pass "real git: a remote.<name>.vcs helper never starts, so it never sees the token"
+else
+  fail "vcs helper isolation: rc=$rc captured=$([ -e "$WORKDIR/vcs-captured" ] && echo yes || echo no)"
+fi
+
 # The credential git itself obtains for github.com, under hostile global,
 # netrc, environment and repo-local configuration: only the verified token.
 CRED_DIR="$WORKDIR/cred-bin"
@@ -1087,6 +1159,7 @@ CREDGH
 chmod +x "$CRED_DIR/gh"
 printf '[credential]\n\thelper = "!f() { echo username=other; echo password=HOSTILE-GLOBAL; }; f"\n' >"$WORKDIR/hostile-home/.gitconfig"
 printf 'machine github.com login other password HOSTILE-NETRC\n' >"$WORKDIR/hostile-home/.netrc"
+fresh_pushrepo
 "$REAL_GIT" -C "$PUSHREPO" config --local credential.helper '!f() { echo username=other; echo password=HOSTILE-LOCAL; }; f'
 cred_out="$(cd "$PUSHREPO" && printf 'protocol=https\nhost=github.com\n\n' | \
   HOME="$WORKDIR/hostile-home" GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper \
@@ -1135,12 +1208,10 @@ if [ "$rc" -eq 70 ] && ! grep -q $'gh\tpr\tmerge' "$WORKDIR/calls.log"; then
 else
   fail "unwritable trace marker: rc=$rc"
 fi
-if run_git_wrapper 1 "marker with git" env GH_AS_AUTHOR_TRACE_MARKER="$MARKER" git -C "$PUSHREPO" push origin HEAD; then
-  :
-fi
 set +e
+fresh_pushrepo
 PATH="$GITSTUB_DIR:$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" GIT_PUSH_LOG="$GIT_PUSH_LOG" GH_AS_AUTHOR_TRACE_MARKER="$MARKER" \
-  OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" "$WRAPPER" -- git -C "$PUSHREPO" push origin HEAD >/dev/null 2>&1
+  GH_AS_AUTHOR_PUSH_REPO=example/repo OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" "$WRAPPER" -- git -C "$PUSHREPO" push -u origin HEAD >/dev/null 2>&1
 rc=$?
 set -e
 [ "$rc" -eq 1 ] && pass "trace marker with a git payload: refused (the marker means the gh write ran)" \

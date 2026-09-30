@@ -2271,8 +2271,17 @@ run_real_wrapper_case() { # <author PAT or empty> <bash snippet using the bootst
 }
 
 rw_out="$(run_real_wrapper_case ghp_bootstrap-author '
-  rc=0; bootstrap::run_author_git "push bootstrap commit" -C "$RW_REPO" push -u origin HEAD || rc=$?; echo "RC=$rc"')"
+  rc=0; bootstrap::run_author_git "push bootstrap commit" nathanjohnpayne/realwrap-repo -C "$RW_REPO" push -u origin HEAD || rc=$?; echo "RC=$rc"')"
 rw_push="$(cat "$WORKDIR/rw-git.log")"
+# ...and against a repository whose origin is NOT the one bootstrap created,
+# the same call is refused before any push (owner's allowlist on #1541).
+rw_other="$(run_real_wrapper_case ghp_bootstrap-author '
+  rc=0; bootstrap::run_author_git "push bootstrap commit" nathanjohnpayne/some-other-repo -C "$RW_REPO" push -u origin HEAD || rc=$?; echo "RC=$rc"')"
+if printf '%s' "$rw_other" | grep -q '^RC=5$' && [ ! -s "$WORKDIR/rw-git.log" ]; then
+  pass "real bootstrap::run_author_git: an origin that is not the expected repository is refused before the push"
+else
+  fail "real bootstrap push to an unexpected repository: $rw_other"
+fi
 if printf '%s' "$rw_out" | grep -q '^RC=0$' \
    && printf '%s' "$rw_push" | grep -q "^GH_TOKEN=ghp_bootstrap-author|GIT_CONFIG_GLOBAL=/dev/null|ARGS=-c credential.helper= -c credential.helper=!gh auth git-credential .* -C $RW_REPO push -u origin HEAD\$"; then
   pass "real bootstrap::run_author_git through the real wrapper: pushes under the verified author token with gh's helper pinned"

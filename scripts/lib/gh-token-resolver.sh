@@ -47,13 +47,14 @@ gh_require_direct_gh_payload() { # <label> <payload...>
 }
 
 # The author wrapper also runs bootstrap's initial `git push` (Codex on #1541).
-# A gh identity check does not prove which credential git authenticates
-# with, so that path is a closed contract, not a pass-through:
+# A gh identity check does not prove which credential git authenticates with,
+# so that path is a closed contract, not a pass-through. The payload is
+# exactly
 #
-#   git [-C <dir>] push [-u|--set-upstream] <remote-name> [<refspec>...]
+#   git -C <dir> push -u origin HEAD
 #
-# No -c, no --config-env, no URL argument, no other subcommand. Prints
-# "gh" or "git-push" for an accepted author payload; refuses anything else.
+# and the repository it names must match a fixed, value-checked allowlist
+# (gh_author_git_push). Prints "gh" or "git-push"; refuses anything else.
 gh_author_payload_kind() { # <payload...>
   case "${1:-}" in
     gh|*/gh) printf 'gh\n'; return 0 ;;
@@ -63,104 +64,122 @@ gh_author_payload_kind() { # <payload...>
       return 1
       ;;
   esac
-  shift
-  if [ "${1:-}" = "-C" ] && [ -n "${2:-}" ]; then shift 2; fi
-  if [ "${1:-}" != "push" ]; then
-    echo "gh-as-author: the only git command accepted is: git [-C <dir>] push [-u] <remote> [<refspec>...] (got 'git ${1:-}')." >&2
-    return 1
+  if [ "$#" -eq 7 ] && [ "$2" = "-C" ] && [ -n "$3" ] && [ "$4" = "push" ] \
+     && [ "$5" = "-u" ] && [ "$6" = "origin" ] && [ "$7" = "HEAD" ]; then
+    printf 'git-push\n'
+    return 0
   fi
-  shift
-  case "${1:-}" in -u|--set-upstream) shift ;; esac
-  case "${1:-}" in
-    ''|-*|*/*|*:*|*@*)
-      echo "gh-as-author: git push needs a plain remote name, not '${1:-}' (no URL, no option)." >&2
-      return 1
-      ;;
-  esac
-  shift
-  local ref
-  for ref in "$@"; do
-    case "$ref" in
-      ''|-*|*://*|*@\{*) ;;
-      *[!A-Za-z0-9._/:+^~-]*) ;;
-      *) continue ;;
-    esac
-    echo "gh-as-author: git push refspec '$ref' is not accepted (options, URLs and shell-special forms are refused)." >&2
-    return 1
-  done
-  printf 'git-push\n'
+  echo "gh-as-author: the only git command accepted is: git -C <dir> push -u origin HEAD (bootstrap's initial push)." >&2
+  return 1
 }
 
 # Run git so that the ONLY credential it can present to github.com is
 # <token>. Global and system config, ~/.netrc and XDG config are out of reach
 # (throwaway HOME, GIT_CONFIG_GLOBAL=/dev/null, GIT_CONFIG_NOSYSTEM), config
-# injected through the environment is dropped, the credential helper list is
-# reset to gh's (which reads GH_TOKEN), extra headers are reset, and SSH forms
-# of github.com are rewritten to HTTPS so the helper, not an SSH key, decides.
-# No repository-controlled program runs with the token in its environment:
-# hooks (pre-push, reference-transaction, ...) and fsmonitor are disabled.
+# and repository redirection injected through the environment are dropped,
+# the credential helper list is reset to gh's (which reads GH_TOKEN), extra
+# headers are reset, hooks are disabled, and SSH github.com spellings are
+# rewritten to HTTPS so the helper, not an SSH key, decides.
 gh_author_git_exec() { # <token> <git args...>
   local token="$1" home rc
   shift
   home="$(mktemp -d "${TMPDIR:-/tmp}/gh-as-author-git-home.XXXXXX")" || return 1
   env -u GITHUB_TOKEN -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT -u GIT_CONFIG \
+    -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE -u GIT_NAMESPACE \
+    -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_CEILING_DIRECTORIES \
     HOME="$home" XDG_CONFIG_HOME="$home/.config" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
     GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= SSH_ASKPASS= \
     GH_TOKEN="$token" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
     GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
     git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
         -c http.extraHeader= \
-        -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+        -c core.hooksPath=/dev/null \
         -c url.https://github.com/.insteadOf=git@github.com: \
-        -c url.https://github.com/.insteadOf=ssh://git@github.com/ \
         "$@"
   rc=$?
   rm -rf "$home"
   return "$rc"
 }
 
-# Push under <token> after proving the push can only authenticate with it:
-# the repository's own config may not carry http.*, credential.* or url.*
-# keys (a repo-local extra header, helper or rewrite would outrank nothing we
-# pin, or redirect the push), and the resolved push URL must be plain
-# https://github.com/ with no embedded credentials.
-gh_author_git_push() { # <token> <git args as accepted by gh_author_payload_kind, minus "git">
-  local token="$1"
-  shift
-  local -a dir_args=()
-  if [ "${1:-}" = "-C" ]; then dir_args=(-C "$2"); fi
-  local -a rest=("$@")
-  local i=0
-  [ "${#dir_args[@]}" -gt 0 ] && i=2
-  i=$((i + 1))                                   # past "push"
-  case "${rest[$i]:-}" in -u|--set-upstream) i=$((i + 1)) ;; esac
-  local remote="${rest[$i]}" local_keys url
-  local_keys="$(git ${dir_args[@]+"${dir_args[@]}"} config --local --includes --name-only --get-regexp '^(http|credential|url)\.' 2>/dev/null || true)"
-  if [ -n "$local_keys" ]; then
-    echo "gh-as-author: refusing git push: this repository's config sets keys that can change the credential or destination:" >&2
-    printf '  %s\n' $local_keys >&2
+# Push under <token> after proving the repository is a plain, freshly created
+# bootstrap repository for <owner/repo> and nothing in it can redirect the
+# push or run a program with the token (owner's allowlist on #1541):
+#   - a primary, non-bare work tree: <dir>/.git is a directory and is both the
+#     git dir and the common dir; no config.worktree;
+#   - its .git/config, parsed by git itself with includes off (-z, status
+#     checked), holds EXACTLY:
+#       core.repositoryformatversion=0, core.bare=false,
+#       remote.origin.url = https://github.com/<owner/repo>.git
+#                           (or the exact git@github.com: spelling, which the
+#                           exec rewrites to that HTTPS URL),
+#       remote.origin.fetch = +refs/heads/*:refs/remotes/origin/*;
+#     optionally core.{filemode,logallrefupdates,ignorecase,precomposeunicode,
+#     symlinks} as true/false, and branch.main.remote=origin +
+#     branch.main.merge=refs/heads/main (a retry after push -u);
+#     every key at most once; anything else refuses the push.
+# <owner/repo> comes from the caller's trusted input, never from the URL.
+gh_author_git_push() { # <token> <owner/repo> -C <dir> push -u origin HEAD
+  local token="$1" expected="$2" dir="$4"
+  shift 2
+  case "$expected" in
+    ''|*[!A-Za-z0-9._/-]*|*/*/*|/*|*/) expected="" ;;
+    */*) ;;
+    *) expected="" ;;
+  esac
+  if [ -z "$expected" ]; then
+    echo "gh-as-author: refusing git push: GH_AS_AUTHOR_PUSH_REPO must name the expected owner/repo." >&2
     return 5
   fi
-  # git push sends to EVERY push URL of the remote (all pushurl values, else
-  # all url values), so every one must pass, not only the first (CodeRabbit
-  # and Codex on #1541).
-  local urls
-  if ! urls="$(gh_author_git_exec "$token" ${dir_args[@]+"${dir_args[@]}"} remote get-url --push --all "$remote" 2>/dev/null)" \
-     || [ -z "$urls" ]; then
-    echo "gh-as-author: refusing git push: remote '$remote' has no push URL." >&2
+  local top gitdir common
+  top="$(cd "$dir" 2>/dev/null && pwd -P)" || { echo "gh-as-author: refusing git push: $dir is not a directory." >&2; return 5; }
+  if [ ! -d "$top/.git" ] || [ -L "$top/.git" ]; then
+    echo "gh-as-author: refusing git push: $dir/.git is not a plain directory (linked worktree, submodule or gitdir file)." >&2
     return 5
   fi
-  while IFS= read -r url; do
-    case "$url" in
-      https://github.com/*@*|https://*@*) ;;
-      https://github.com/?*) continue ;;
+  gitdir="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR git -C "$top" rev-parse --absolute-git-dir 2>/dev/null)" || gitdir=""
+  common="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR git -C "$top" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || common=""
+  if [ "$gitdir" != "$top/.git" ] || [ "$common" != "$top/.git" ] || [ -e "$top/.git/config.worktree" ]; then
+    echo "gh-as-author: refusing git push: $dir is not a primary repository whose git dir is $dir/.git." >&2
+    return 5
+  fi
+
+  local cfg entry key value seen=" " bad="" rc=0
+  local want_https="https://github.com/$expected.git" want_ssh="git@github.com:$expected.git"
+  cfg="$(mktemp "${TMPDIR:-/tmp}/gh-as-author-cfg.XXXXXX")" || return 5
+  env -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT git config --file "$top/.git/config" --no-includes --list -z >"$cfg" 2>/dev/null || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$cfg"
+    echo "gh-as-author: refusing git push: could not parse $dir/.git/config." >&2
+    return 5
+  fi
+  while IFS= read -r -d '' entry; do
+    case "$entry" in
+      *$'\n'*) key="${entry%%$'\n'*}"; value="${entry#*$'\n'}" ;;
+      *) key="$entry"; value=$'\001no-value' ;;
     esac
-    # Never echo the URL: it may carry a credential in its userinfo.
-    echo "gh-as-author: refusing git push: a push URL of remote '$remote' does not resolve to https://github.com/ without embedded credentials." >&2
+    case "$seen" in *" $key "*) bad="$bad$key (duplicate)"$'\n'; continue ;; esac
+    seen="$seen$key "
+    case "$key=$value" in
+      "core.repositoryformatversion=0"|"core.bare=false"|"remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*") ;;
+      "remote.origin.url=$want_https"|"remote.origin.url=$want_ssh") ;;
+      core.filemode=true|core.filemode=false|core.logallrefupdates=true|core.logallrefupdates=false) ;;
+      core.ignorecase=true|core.ignorecase=false|core.precomposeunicode=true|core.precomposeunicode=false) ;;
+      core.symlinks=true|core.symlinks=false) ;;
+      "branch.main.remote=origin"|"branch.main.merge=refs/heads/main") ;;
+      *) bad="$bad$key"$'\n' ;;
+    esac
+  done <"$cfg"
+  rm -f "$cfg"
+  for key in core.repositoryformatversion core.bare remote.origin.url remote.origin.fetch; do
+    case "$seen" in *" $key "*) ;; *) bad="$bad$key (missing)"$'\n' ;; esac
+  done
+  if [ -n "$bad" ]; then
+    # Key names only; values can hold credentials, and so can a URL
+    # subsection in a name (http.https://user:secret@host/.extraheader).
+    echo "gh-as-author: refusing git push: $dir/.git/config is not a plain bootstrap repository for $expected; unexpected or invalid:" >&2
+    printf '%s' "$bad" | sed -E 's#//[^/@]*@#//<redacted>@#g; s/^/  /' >&2
     return 5
-  done <<EOF_URLS
-$urls
-EOF_URLS
+  fi
   gh_author_git_exec "$token" "$@"
 }
 

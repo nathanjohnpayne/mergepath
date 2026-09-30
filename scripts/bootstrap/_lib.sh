@@ -322,7 +322,7 @@ BOOTSTRAP_GIT_NONINTERACTIVE_ENV=(
 # stdin, and nothing rewrites the remote.
 #
 # Usage:
-#   bootstrap::run_author_git "push bootstrap commit" -C "$dir" push -u origin HEAD
+#   bootstrap::run_author_git "push bootstrap commit" owner/repo -C "$dir" push -u origin HEAD
 #
 # `git` itself and its credential flags are owned HERE, not by the
 # caller: `-c` is a top-level git option and must precede the
@@ -330,10 +330,10 @@ BOOTSTRAP_GIT_NONINTERACTIVE_ENV=(
 # arrange. Callers pass everything after `git`, mirroring
 # bootstrap::run_author_gh, where `gh` is likewise implicit.
 bootstrap::run_author_git() {
-  local label=$1
-  shift
-  if [ "$#" -eq 0 ]; then
-    bootstrap::err "bootstrap::run_author_git requires git arguments after the label"
+  local label=$1 expected_repo=${2:-}
+  shift 2 || true
+  if [ -z "$expected_repo" ] || [ "$#" -eq 0 ]; then
+    bootstrap::err "bootstrap::run_author_git requires an owner/repo and git arguments after the label"
     return 64
   fi
 
@@ -358,7 +358,7 @@ bootstrap::run_author_git() {
   # out, and refuses a remote that does not resolve to plain
   # https://github.com/ (#1541). A prefix in front of git would be refused.
   bootstrap::run "$label" \
-    env GH_AS_AUTHOR_IDENTITY="$author_identity" "$wrapper" -- git "$@"
+    env GH_AS_AUTHOR_IDENTITY="$author_identity" GH_AS_AUTHOR_PUSH_REPO="$expected_repo" "$wrapper" -- git "$@"
 }
 
 # Append a captured diagnostic to $BOOTSTRAP_LOG_FILE, so the audit

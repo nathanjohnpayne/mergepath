@@ -29,6 +29,8 @@ PASS=0
 FAIL=0
 # The write mode reads these; an operator's own values must not leak in.
 unset GH_HOST GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+# hosts.yml is read too; point it at an empty dir unless a case sets its own.
+export GH_CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/idcheck-ghcfg.XXXXXX")"
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
@@ -378,6 +380,18 @@ else
   pass "--expect-write-identity GH_HOST: refused before any API call"
 fi
 write_case "GH_HOST=GitHub.com" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_HOST=GitHub.com
+
+# Codex on #1541: with GH_HOST unset and a single non-github.com host in
+# hosts.yml, gh's default host is that host, so a caller's later bare `gh api`
+# write would go there. Refused; github.com alone, both, or GH_HOST pinned: fine.
+for spec in "ghe-only:3:ghe.example.com" "gh-only:0:github.com" "both:0:github.com ghe.example.com"; do
+  name="${spec%%:*}"; rest="${spec#*:}"; want="${rest%%:*}"; hosts="${rest#*:}"
+  mkdir -p "$WORKDIR/ghcfg-$name"
+  : >"$WORKDIR/ghcfg-$name/hosts.yml"
+  for h in $hosts; do printf '%s:\n    user: someone\n    git_protocol: https\n' "$h" >>"$WORKDIR/ghcfg-$name/hosts.yml"; done
+  write_case "hosts.yml $name, GH_HOST unset" "$want" ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-$name"
+done
+write_case "hosts.yml ghe-only, GH_HOST=github.com" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-ghe-only" GH_HOST=github.com
 
 # Phase 4b P1 on #1541: an unset GH_HOST does not mean github.com. With a
 # single GHES host configured, a bare `gh api user` answers with THAT login.

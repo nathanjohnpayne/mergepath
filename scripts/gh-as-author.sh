@@ -9,21 +9,24 @@
 #   scripts/gh-as-author.sh -- gh pr create --title ... --body-file pr-body.md
 #   scripts/gh-as-author.sh -- gh pr merge 123 --squash --delete-branch
 #   scripts/gh-as-author.sh -- gh pr edit 123 --add-label foo
-#   scripts/gh-as-author.sh -- git -C <dir> push -u origin HEAD
+#   GH_AS_AUTHOR_PUSH_REPO=owner/repo scripts/gh-as-author.sh -- git -C <dir> push -u origin HEAD
 #
-# The payload must be gh itself, or exactly
-# `git [-C <dir>] push [-u|--set-upstream] <remote> [<refspec>...]` (bootstrap's
-# initial push). A prefix such as env, sudo or command is refused: it could
-# replace the verified token after the check. The git form runs with global and
-# system config, ~/.netrc and injected config out of reach and gh's credential
-# helper (the verified token) alone, and only to a remote resolving to
-# https://github.com/ without embedded credentials (SSH github.com forms are
-# rewritten to HTTPS, so no SSH key authenticates it) (#1541).
+# The payload must be gh itself, or exactly `git -C <dir> push -u origin HEAD`
+# (bootstrap's initial push). A prefix such as env, sudo or command is
+# refused: it could replace the verified token after the check. The git form
+# requires a primary repository whose .git/config holds only the fixed,
+# value-checked bootstrap allowlist, with remote.origin.url exactly
+# https://github.com/$GH_AS_AUTHOR_PUSH_REPO.git (or its git@github.com:
+# spelling, pushed over HTTPS). It runs with global and system config,
+# ~/.netrc, injected config and hooks out of reach and gh's credential helper
+# (the verified token) alone (#1541).
 #
 # Environment:
 #   GH_AS_AUTHOR_IDENTITY   author login to verify.
 #                           Default: nathanjohnpayne
 #   OP_PREFLIGHT_AUTHOR_PAT preferred cached author token.
+#   GH_AS_AUTHOR_PUSH_REPO  owner/repo the git form must push to (required
+#                           for it; from the caller's trusted input).
 #   GH_AS_AUTHOR_TRACE_MARKER  optional path, created after every check
 #                           passed and immediately before the gh write runs
 #                           (never inherited by it); gh payloads only.
@@ -108,7 +111,9 @@ TOKEN="$GH_RESOLVED_TOKEN"
 if [ "$AUTHOR_PAYLOAD_KIND" = "git-push" ]; then
   shift
   set +e
-  gh_author_git_push "$TOKEN" "$@"
+  # GH_AS_AUTHOR_PUSH_REPO: the owner/repo bootstrap created, from its own
+  # input; the repository's remote must be exactly that (#1541).
+  gh_author_git_push "$TOKEN" "${GH_AS_AUTHOR_PUSH_REPO:-}" "$@"
   WRAPPED_RC=$?
   set -e
   exit "$WRAPPED_RC"

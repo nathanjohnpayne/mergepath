@@ -434,7 +434,7 @@ bootstrap::_create_remote_and_push() {
   # one verified credential, which is the whole point of the
   # author/reviewer separation.
   local push_rc=0
-  bootstrap::run_author_git "push bootstrap commit to $full_repo" \
+  bootstrap::run_author_git "push bootstrap commit to $full_repo" "$full_repo" \
     -C "$target" push -u origin HEAD || push_rc=$?
   if [ "$push_rc" -ne 0 ]; then
     bootstrap::err "github-infra: the remote $full_repo EXISTS (created and checkpointed) but the bootstrap commit did not push (rc=$push_rc)"
