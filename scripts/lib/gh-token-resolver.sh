@@ -46,6 +46,111 @@ gh_require_direct_gh_payload() { # <label> <payload...>
   return 1
 }
 
+# The author wrapper also runs bootstrap's initial `git push` (Codex on #1541).
+# A gh identity check does not prove which credential git authenticates
+# with, so that path is a closed contract, not a pass-through:
+#
+#   git [-C <dir>] push [-u|--set-upstream] <remote-name> [<refspec>...]
+#
+# No -c, no --config-env, no URL argument, no other subcommand. Prints
+# "gh" or "git-push" for an accepted author payload; refuses anything else.
+gh_author_payload_kind() { # <payload...>
+  case "${1:-}" in
+    gh|*/gh) printf 'gh\n'; return 0 ;;
+    git|*/git) ;;
+    *)
+      gh_require_direct_gh_payload "gh-as-author" "$@"
+      return 1
+      ;;
+  esac
+  shift
+  if [ "${1:-}" = "-C" ] && [ -n "${2:-}" ]; then shift 2; fi
+  if [ "${1:-}" != "push" ]; then
+    echo "gh-as-author: the only git command accepted is: git [-C <dir>] push [-u] <remote> [<refspec>...] (got 'git ${1:-}')." >&2
+    return 1
+  fi
+  shift
+  case "${1:-}" in -u|--set-upstream) shift ;; esac
+  case "${1:-}" in
+    ''|-*|*/*|*:*|*@*)
+      echo "gh-as-author: git push needs a plain remote name, not '${1:-}' (no URL, no option)." >&2
+      return 1
+      ;;
+  esac
+  shift
+  local ref
+  for ref in "$@"; do
+    case "$ref" in
+      ''|-*|*://*|*@\{*) ;;
+      *[!A-Za-z0-9._/:+^~-]*) ;;
+      *) continue ;;
+    esac
+    echo "gh-as-author: git push refspec '$ref' is not accepted (options, URLs and shell-special forms are refused)." >&2
+    return 1
+  done
+  printf 'git-push\n'
+}
+
+# Run git so that the ONLY credential it can present to github.com is
+# <token>. Global and system config, ~/.netrc and XDG config are out of reach
+# (throwaway HOME, GIT_CONFIG_GLOBAL=/dev/null, GIT_CONFIG_NOSYSTEM), config
+# injected through the environment is dropped, the credential helper list is
+# reset to gh's (which reads GH_TOKEN), extra headers are reset, and SSH forms
+# of github.com are rewritten to HTTPS so the helper, not an SSH key, decides.
+gh_author_git_exec() { # <token> <git args...>
+  local token="$1" home rc
+  shift
+  home="$(mktemp -d "${TMPDIR:-/tmp}/gh-as-author-git-home.XXXXXX")" || return 1
+  env -u GITHUB_TOKEN -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT -u GIT_CONFIG \
+    HOME="$home" XDG_CONFIG_HOME="$home/.config" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= SSH_ASKPASS= \
+    GH_TOKEN="$token" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+    GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+    git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+        -c http.extraHeader= \
+        -c url.https://github.com/.insteadOf=git@github.com: \
+        -c url.https://github.com/.insteadOf=ssh://git@github.com/ \
+        "$@"
+  rc=$?
+  rm -rf "$home"
+  return "$rc"
+}
+
+# Push under <token> after proving the push can only authenticate with it:
+# the repository's own config may not carry http.*, credential.* or url.*
+# keys (a repo-local extra header, helper or rewrite would outrank nothing we
+# pin, or redirect the push), and the resolved push URL must be plain
+# https://github.com/ with no embedded credentials.
+gh_author_git_push() { # <token> <git args as accepted by gh_author_payload_kind, minus "git">
+  local token="$1"
+  shift
+  local -a dir_args=()
+  if [ "${1:-}" = "-C" ]; then dir_args=(-C "$2"); fi
+  local -a rest=("$@")
+  local i=0
+  [ "${#dir_args[@]}" -gt 0 ] && i=2
+  i=$((i + 1))                                   # past "push"
+  case "${rest[$i]:-}" in -u|--set-upstream) i=$((i + 1)) ;; esac
+  local remote="${rest[$i]}" local_keys url
+  local_keys="$(git ${dir_args[@]+"${dir_args[@]}"} config --local --includes --name-only --get-regexp '^(http|credential|url)\.' 2>/dev/null || true)"
+  if [ -n "$local_keys" ]; then
+    echo "gh-as-author: refusing git push: this repository's config sets keys that can change the credential or destination:" >&2
+    printf '  %s\n' $local_keys >&2
+    return 5
+  fi
+  if ! url="$(gh_author_git_exec "$token" ${dir_args[@]+"${dir_args[@]}"} remote get-url --push "$remote" 2>/dev/null)"; then
+    echo "gh-as-author: refusing git push: remote '$remote' has no push URL." >&2
+    return 5
+  fi
+  case "$url" in
+    https://github.com/*@*|https://*@*) ;;
+    https://github.com/*) gh_author_git_exec "$token" "$@"; return $? ;;
+  esac
+  # Never echo the URL: it may carry a credential in its userinfo.
+  echo "gh-as-author: refusing git push: remote '$remote' does not resolve to https://github.com/ without embedded credentials." >&2
+  return 5
+}
+
 gh_default_reviewer_identity() {
   if [ -n "${GH_AS_REVIEWER_IDENTITY:-}" ]; then
     printf '%s\n' "$GH_AS_REVIEWER_IDENTITY"

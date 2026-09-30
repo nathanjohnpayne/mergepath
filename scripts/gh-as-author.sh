@@ -9,18 +9,33 @@
 #   scripts/gh-as-author.sh -- gh pr create --title ... --body-file pr-body.md
 #   scripts/gh-as-author.sh -- gh pr merge 123 --squash --delete-branch
 #   scripts/gh-as-author.sh -- gh pr edit 123 --add-label foo
+#   scripts/gh-as-author.sh -- git -C <dir> push -u origin HEAD
+#
+# The payload must be gh itself, or exactly
+# `git [-C <dir>] push [-u|--set-upstream] <remote> [<refspec>...]` (bootstrap's
+# initial push). A prefix such as env, sudo or command is refused: it could
+# replace the verified token after the check. The git form runs with global and
+# system config, ~/.netrc and injected config out of reach and gh's credential
+# helper (the verified token) alone, and only to a remote resolving to
+# https://github.com/ without embedded credentials (SSH github.com forms are
+# rewritten to HTTPS, so no SSH key authenticates it) (#1541).
 #
 # Environment:
 #   GH_AS_AUTHOR_IDENTITY   author login to verify.
 #                           Default: nathanjohnpayne
 #   OP_PREFLIGHT_AUTHOR_PAT preferred cached author token.
+#   GH_AS_AUTHOR_TRACE_MARKER  optional path, created after every check
+#                           passed and immediately before the gh write runs
+#                           (never inherited by it); gh payloads only.
 #
 # Exit codes:
 #   0    success
 #   1    setup or invocation error
 #   2    token verification failed
 #   3    token lookup failed
-#   5    post-create author verification failed or could not complete
+#   5    post-create author verification failed or could not complete, or
+#        the git push destination or repo config was refused
+#   70   GH_AS_AUTHOR_TRACE_MARKER could not be written; nothing ran
 #   *    propagated from the wrapped command otherwise
 #
 # Bash 3.2 portable.
@@ -67,7 +82,19 @@ if [ "$#" -eq 0 ]; then
   echo "gh-as-author: usage: scripts/gh-as-author.sh -- gh pr <create|merge|edit> ..." >&2
   exit 1
 fi
-gh_require_direct_gh_payload "gh-as-author" "$@" || exit 1
+# gh, or bootstrap's closed `git push` form (gh_author_payload_kind); any
+# prefix that could replace the verified token is refused (#1541).
+AUTHOR_PAYLOAD_KIND="$(gh_author_payload_kind "$@")" || exit 1
+# GH_AS_AUTHOR_TRACE_MARKER: a path the wrapper creates after every check
+# passed, immediately before the gh write runs, so a caller can tell "gh ran"
+# from "the wrapper refused first" (bootstrap::author_gh_traced). It means the
+# gh write ran, so it is not accepted with the git form.
+TRACE_MARKER="${GH_AS_AUTHOR_TRACE_MARKER:-}"
+unset GH_AS_AUTHOR_TRACE_MARKER
+if [ -n "$TRACE_MARKER" ] && [ "$AUTHOR_PAYLOAD_KIND" != "gh" ]; then
+  echo "gh-as-author: GH_AS_AUTHOR_TRACE_MARKER applies to gh writes only." >&2
+  exit 1
+fi
 
 set +e
 gh_resolve_token_for_identity "$AUTHOR" "OP_PREFLIGHT_AUTHOR_PAT" "gh-as-author"
@@ -77,6 +104,15 @@ if [ "$RESOLVE_RC" -ne 0 ]; then
   exit "$RESOLVE_RC"
 fi
 TOKEN="$GH_RESOLVED_TOKEN"
+
+if [ "$AUTHOR_PAYLOAD_KIND" = "git-push" ]; then
+  shift
+  set +e
+  gh_author_git_push "$TOKEN" "$@"
+  WRAPPED_RC=$?
+  set -e
+  exit "$WRAPPED_RC"
+fi
 
 is_pr_create_command() {
   gh_is_pr_create_command "$@"
@@ -192,6 +228,10 @@ fi
 # it can neither carry the write nor receive the PAT (see gh-token-resolver.sh).
 run_with_author_token() {
   unset GITHUB_TOKEN
+  if [ -n "$TRACE_MARKER" ] && ! : >"$TRACE_MARKER"; then
+    echo "gh-as-author: cannot write the trace marker $TRACE_MARKER; refusing to run the write unrecorded." >&2
+    exit 70
+  fi
   GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
     GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" "$@"
 }
