@@ -17,7 +17,7 @@
 #
 #   scripts/agent-capability-probe.sh --check [--print-exports] [--repo OWNER/REPO]
 #     Never probes, never touches the network. Validates the cache for this
-#     repo and surface. Bare --check reports on stderr only. With
+#     repo, surface, author identity and reviewer identity. Bare --check reports on stderr only. With
 #     --print-exports, prints `export MERGEPATH_AGENT_TIER=...` and one
 #     `export MERGEPATH_CAP_<NAME>=0|1` per capability for
 #       eval "$(scripts/agent-capability-probe.sh --check --print-exports)"
@@ -34,15 +34,19 @@
 #                      octocat/Hello-World: public, so only a repository-scope
 #                      restriction can refuse it)
 #   push-multi-branch  `git push --dry-run --no-verify` of HEAD to a fresh
-#                      branch name; a Claude cloud session is reported false
-#                      from its documented push restriction regardless,
-#                      because a dry run is not proof a real push is accepted
+#                      branch name negotiates AND the repository reports push
+#                      permission; a dry run alone is never proof, and a
+#                      Claude cloud session is reported false from its
+#                      documented push restriction regardless
 #   author-writes      the wrapper token resolver finds a token for the
 #                      repo's author_identity AND that token is a user-held
 #                      credential (scripts/lib/credential-class.sh) whose
-#                      `GET /user` is that login with type User
+#                      `GET /user` is that login with type User AND it sees
+#                      `push` on the repository (and `repo` scope, for a
+#                      classic token)
 #   reviewer-writes    the same, for the reviewer identity
-#                      (GH_AS_REVIEWER_IDENTITY / MERGEPATH_AGENT / default)
+#                      (GH_AS_REVIEWER_IDENTITY / MERGEPATH_AGENT / default),
+#                      with `pull`: reviews and comments need read access
 #
 # Tier: the comma-joined set of granted capabilities other than read, in the
 # order above; `read-only` when read is the only one; `none` when not even
@@ -82,7 +86,10 @@ WRITE_CACHE=true
 QUIET=false
 REPO=""
 CROSS_REPO="octocat/Hello-World"
-CAPABILITIES="author-writes reviewer-writes graphql cross-repo push-multi-branch"
+# TIER_CAPABILITIES make up the tier string; EXPORT_CAPABILITIES are what
+# --check --print-exports emits, one MERGEPATH_CAP_<NAME> each, read included.
+TIER_CAPABILITIES="author-writes reviewer-writes graphql cross-repo push-multi-branch"
+EXPORT_CAPABILITIES="read $TIER_CAPABILITIES"
 
 # Every failure that can reach an `eval "$(...)"` caller must leave something
 # on stdout that fails when evaluated; an empty stdout makes eval return 0.
@@ -148,7 +155,20 @@ if [ -z "$REPO" ]; then
   REPO="$(repo_from_origin)"
   [ -n "$REPO" ] || die 1 "could not derive OWNER/REPO from the origin remote; pass --repo"
 fi
-CACHE_FILE="$CACHE_DIR/agent-capability-$(printf '%s' "$REPO" | tr '/' '_').json"
+# --- identities -----------------------------------------------------------
+
+AUTHOR_IDENTITY="nathanjohnpayne"
+if [ -f "$ROOT/.github/review-policy.yml" ]; then
+  policy_author="$(grep -m1 '^author_identity:' "$ROOT/.github/review-policy.yml" | awk '{print $2}' | sed -E "s/^[\"']//; s/[\"']\$//" || true)"
+  [ -n "$policy_author" ] && AUTHOR_IDENTITY="$policy_author"
+fi
+REVIEWER_IDENTITY="$(gh_default_reviewer_identity)"
+
+# The write capabilities are facts about two identities, so the cache is keyed
+# on them as well as the repo: local agents share the cache directory, and a
+# Claude probe must never answer a Codex session's --check (Codex P1 on
+# #1526). --check also re-validates the recorded identities below.
+CACHE_FILE="$CACHE_DIR/agent-capability-$(printf '%s' "$REPO" | tr '/' '_')-$(printf '%s' "$REVIEWER_IDENTITY" | tr -c 'A-Za-z0-9._-' '_').json"
 
 # --- surface --------------------------------------------------------------
 
@@ -184,6 +204,10 @@ if [ "$MODE" = "check" ]; then
   measured_at="$(jq -r '.measured_at_epoch' "$CACHE_FILE")"
   [ "$cached_repo" = "$REPO" ] || die 2 "capability cache is for $cached_repo, not $REPO; re-run the probe"
   [ "$cached_surface" = "$SURFACE" ] || die 2 "capability cache was measured on $cached_surface, this session is $SURFACE; re-run the probe"
+  cached_author="$(jq -r '.capabilities["author-writes"].identity // empty' "$CACHE_FILE")"
+  cached_reviewer="$(jq -r '.capabilities["reviewer-writes"].identity // empty' "$CACHE_FILE")"
+  [ "$cached_author" = "$AUTHOR_IDENTITY" ] && [ "$cached_reviewer" = "$REVIEWER_IDENTITY" ] \
+    || die 2 "capability cache was measured for author '$cached_author' / reviewer '$cached_reviewer', this session expects '$AUTHOR_IDENTITY' / '$REVIEWER_IDENTITY'; re-run the probe"
   printf '%s' "$measured_at" | grep -Eq '^[0-9]+$' || die 2 "capability cache has no measurement time; re-run the probe"
   age=$(( $(date +%s) - measured_at ))
   [ "$age" -le "$TTL_SECONDS" ] || die 2 "capability cache for $REPO is ${age}s old (TTL ${TTL_SECONDS}s); re-run the probe"
@@ -191,7 +215,7 @@ if [ "$MODE" = "check" ]; then
   if $PRINT_EXPORTS; then
     printf 'export MERGEPATH_AGENT_TIER=%s\n' "$(printf '%q' "$tier")"
     printf 'export MERGEPATH_AGENT_SURFACE_MEASURED=%s\n' "$(printf '%q' "$cached_surface")"
-    for cap in $CAPABILITIES; do
+    for cap in $EXPORT_CAPABILITIES; do
       value="$(jq -r --arg c "$cap" 'if .capabilities[$c].granted == true then 1 else 0 end' "$CACHE_FILE")"
       printf 'export %s=%s\n' "$(cap_var_name "$cap")" "$value"
     done
@@ -255,21 +279,19 @@ api_request() {
   printf '%s\n' "${status:-000}"
 }
 
-# --- identities -----------------------------------------------------------
-
-AUTHOR_IDENTITY="nathanjohnpayne"
-if [ -f "$ROOT/.github/review-policy.yml" ]; then
-  policy_author="$(grep -m1 '^author_identity:' "$ROOT/.github/review-policy.yml" | awk '{print $2}' | sed -E "s/^[\"']//; s/[\"']\$//" || true)"
-  [ -n "$policy_author" ] && AUTHOR_IDENTITY="$policy_author"
-fi
-REVIEWER_IDENTITY="$(gh_default_reviewer_identity)"
-
-# measure_write <identity> <preferred var> <json out>
+# measure_write <identity> <preferred var> <required permission> <json out>
 # Resolves the token the guarded wrappers would use, then classifies it. The
 # resolver already verifies GET /user; the class check is what catches a
 # brokered credential that reads as the right user and writes as a bot.
+# Identity alone is not write capability (Codex P1 on #1526): the token must
+# also see <required permission> on the repository (`push` for the author,
+# who creates and merges PRs; `pull` for a reviewer, whose reviews and
+# comments need only read access), and a classic token's X-OAuth-Scopes must
+# carry `repo` (or `public_repo` on a public repository). A fine-grained
+# token's own permission set is not introspectable, so for one the
+# repository role is the evidence and the reason says so.
 measure_write() {
-  local identity="$1" preferred="$2" out="$3"
+  local identity="$1" preferred="$2" required="$3" out="$4"
   local granted=false reason="" class="empty" login="" login_type="" status
   if ! $HAVE_GH; then
     reason="gh-absent"
@@ -293,8 +315,26 @@ measure_write() {
       elif [ "$class" != "user-held" ]; then
         reason="credential class is '$class'; its write identity cannot be established"
       else
-        granted=true
-        reason="verified user-held credential for $identity"
+        local repo_status has_perm private scopes
+        repo_status="$(api_request "$GH_RESOLVED_TOKEN" GET "repos/$REPO" "$WORKDIR/write-repo")"
+        has_perm="$(jq -r --arg p "$required" '.permissions[$p] // false' "$WORKDIR/write-repo.body" 2>/dev/null || echo false)"
+        private="$(jq -r '.private // true' "$WORKDIR/write-repo.body" 2>/dev/null || echo true)"
+        scopes="$(sed -nE 's/^[Xx]-[Oo][Aa]uth-[Ss]copes:[[:space:]]*//p' "$WORKDIR/write-user.headers" | tr -d ' ')"
+        if [ "$repo_status" != "200" ]; then
+          reason="verified $identity, but GET repos/$REPO with its token returned $repo_status"
+        elif [ "$has_perm" != "true" ]; then
+          reason="verified $identity, but its token lacks '$required' permission on $REPO"
+        elif grep -Eiq '^x-oauth-scopes:' "$WORKDIR/write-user.headers" \
+             && ! printf ',%s,' "$scopes" | grep -q ',repo,' \
+             && ! { [ "$private" = "false" ] && printf ',%s,' "$scopes" | grep -q ',public_repo,'; }; then
+          reason="verified $identity with '$required' on $REPO, but the token's scopes ($scopes) do not include repo"
+        else
+          granted=true
+          case "$GH_RESOLVED_TOKEN" in
+            github_pat_*) reason="verified user-held fine-grained token for $identity with '$required' role on $REPO (token-level permissions are not introspectable)" ;;
+            *) reason="verified user-held credential for $identity with '$required' permission on $REPO" ;;
+          esac
+        fi
       fi
     fi
     GH_RESOLVED_TOKEN=""
@@ -327,6 +367,7 @@ AMBIENT_CLASS="$(credential_class "$AMBIENT_TOKEN")"
 AMBIENT_TOKEN=""
 
 # read
+: >"$WORKDIR/read.body"
 if ! $HAVE_TRANSPORT; then
   cap_json false measured "neither gh nor curl is available" "$WORKDIR/cap-read.json"
 else
@@ -371,23 +412,31 @@ if [ "$SURFACE" = "claude-cloud" ]; then
   cap_json false documented "Claude cloud proxy accepts pushes only to the session's working branch" "$WORKDIR/cap-push-multi-branch.json"
 else
   probe_branch="mergepath-capability-probe-$(date +%s)-$$"
-  if GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/echo \
+  # A dry run never sends the ref update, so on its own it proves only that
+  # the remote is reachable and would negotiate (Codex P2 on #1526). Grant
+  # the capability only when the repository also reports push permission for
+  # the session's credential; branch rulesets on the new name are still not
+  # evaluated, which the reason states.
+  ambient_push="$(jq -r '.permissions.push // false' "$WORKDIR/read.body" 2>/dev/null || echo false)"
+  if ! GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/echo \
      GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes}" \
      git -C "$ROOT" push --dry-run --no-verify --quiet origin "HEAD:refs/heads/$probe_branch" >/dev/null 2>&1; then
-    cap_json true measured-dry-run "dry-run push to a second branch was accepted" "$WORKDIR/cap-push-multi-branch.json"
-  else
     cap_json false measured-dry-run "dry-run push to a second branch was refused" "$WORKDIR/cap-push-multi-branch.json"
+  elif [ "$ambient_push" != "true" ]; then
+    cap_json false measured-dry-run "dry-run push negotiated, but the repository does not report push permission for this session; a real push is unverified" "$WORKDIR/cap-push-multi-branch.json"
+  else
+    cap_json true dry-run-and-permission "dry-run push to a second branch negotiated and the repository reports push permission (branch rulesets on new names are not evaluated)" "$WORKDIR/cap-push-multi-branch.json"
   fi
 fi
 
-measure_write "$AUTHOR_IDENTITY" "OP_PREFLIGHT_AUTHOR_PAT" "$WORKDIR/cap-author-writes.json"
-measure_write "$REVIEWER_IDENTITY" "OP_PREFLIGHT_REVIEWER_PAT" "$WORKDIR/cap-reviewer-writes.json"
+measure_write "$AUTHOR_IDENTITY" "OP_PREFLIGHT_AUTHOR_PAT" push "$WORKDIR/cap-author-writes.json"
+measure_write "$REVIEWER_IDENTITY" "OP_PREFLIGHT_REVIEWER_PAT" pull "$WORKDIR/cap-reviewer-writes.json"
 
 # --- assemble -------------------------------------------------------------
 
 READ_GRANTED="$(jq -r '.granted' "$WORKDIR/cap-read.json")"
 TIER_PARTS=""
-for cap in $CAPABILITIES; do
+for cap in $TIER_CAPABILITIES; do
   if [ "$(jq -r '.granted' "$WORKDIR/cap-$cap.json")" = "true" ]; then
     TIER_PARTS="${TIER_PARTS:+$TIER_PARTS,}$cap"
   fi

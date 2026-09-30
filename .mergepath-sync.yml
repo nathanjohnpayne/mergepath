@@ -1947,6 +1947,7 @@ paths:
       - "tests/test_op_preflight_token_mode.sh"  # check_op_preflight_contract
       - "tests/test_helper_autosource.sh"      # check_op_preflight_contract
       - "tests/test_preflight_agent_name.sh"   # check_op_preflight_contract (#466)
+      - "tests/test_agent_capability_probe.sh" # check_op_preflight_contract (#1057)
       - "tests/test_coderabbit_wait_status_probe.sh"  # check_coderabbit_wait
       - "tests/test_coderabbit_wait_identity_derivation.sh"  # check_coderabbit_wait (#438)
       - "tests/test_coderabbit_wait_paused.sh"  # check_coderabbit_wait (#490)

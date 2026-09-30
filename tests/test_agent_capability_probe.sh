@@ -8,8 +8,11 @@
 # whose origin is a local bare repo (so the dry-run push is real but
 # offline), and PATH-shim `gh` with a stub that answers per GH_TOKEN:
 #
-#   ghp_author      nathanjohnpayne, type User, X-OAuth-Scopes present
-#   ghp_reviewer    nathanpayne-claude, type User
+#   ghp_author      nathanjohnpayne, type User, X-OAuth-Scopes present,
+#                   push on the repo
+#   ghp_reviewer    nathanpayne-claude, type User, pull only
+#   github_pat_ro   nathanjohnpayne, fine-grained (no scopes header), pull only
+#   ghp_noscope     nathanjohnpayne, push, but X-OAuth-Scopes lacks repo
 #   ghs_author      nathanjohnpayne, type User (an app installation token
 #                   that nonetheless reads as the user: the class must refuse)
 #   proxy-injected  nathanjohnpayne, type User, NO scopes header; repo read
@@ -87,12 +90,14 @@ while [ "$#" -gt 0 ]; do
     *) path="$1"; shift ;;
   esac
 done
-login=""; type=User; scopes=""
+login=""; type=User; scopes=""; perms='{"pull":true,"push":false}'
 case "$tok" in
-  ghp_author) login=nathanjohnpayne; scopes="repo, workflow" ;;
+  ghp_author) login=nathanjohnpayne; scopes="repo, workflow"; perms='{"pull":true,"push":true}' ;;
   ghp_reviewer) login=nathanpayne-claude; scopes="repo" ;;
+  github_pat_ro) login=nathanjohnpayne ;;
+  ghp_noscope) login=nathanjohnpayne; scopes="gist, read:org"; perms='{"pull":true,"push":true}' ;;
   ghs_author) login=nathanjohnpayne ;;
-  proxy-injected) login=nathanjohnpayne ;;
+  proxy-injected) login=nathanjohnpayne; perms='{"pull":true,"push":true}' ;;
 esac
 status=200; body=""
 if [ -z "$login" ]; then
@@ -106,7 +111,7 @@ elif [ "$path" = "graphql" ]; then
     body="{\"data\":{\"viewer\":{\"login\":\"$login\"}}}"
   fi
 elif [ "$path" = "repos/$STUB_REPO" ]; then
-  body='{"full_name":"x"}'
+  body="{\"full_name\":\"x\",\"private\":true,\"permissions\":$perms}"
 elif [ "$tok" = "proxy-injected" ]; then
   status=403; body='{"message":"repository not attached to this session"}'
 else
@@ -366,8 +371,8 @@ set -e
 [ "$rc" -eq 2 ] && pass "--check: surface mismatch exits 2" || fail "--check surface mismatch: exit $rc"
 guard_fails "--check surface mismatch" "$out"
 
-jq '.measured_at_epoch = 1' "$CACHE/agent-capability-o_r.json" >"$WORKDIR/stale.json"
-cp "$WORKDIR/stale.json" "$CACHE/agent-capability-o_r.json"
+jq '.measured_at_epoch = 1' "$CACHE/agent-capability-o_r-nathanpayne-claude.json" >"$WORKDIR/stale.json"
+cp "$WORKDIR/stale.json" "$CACHE/agent-capability-o_r-nathanpayne-claude.json"
 set +e
 out="$(run_probe -- --check --print-exports 2>/dev/null)"; rc=$?
 set -e
@@ -397,6 +402,75 @@ set +e
 run_probe -- --print-exports >/dev/null 2>&1; rc=$?
 set -e
 [ "$rc" -eq 1 ] && pass "--print-exports without --check is rejected" || fail "--print-exports without --check: exit $rc"
+
+# ---------------------------------------------------------------------------
+# Identity is not write capability (Codex P1 on #1526): the token must also
+# hold the repository permission the role needs, and a classic token the
+# `repo` scope.
+# ---------------------------------------------------------------------------
+set +e
+run_probe OP_PREFLIGHT_AUTHOR_PAT=github_pat_ro -- --no-cache >"$WORKDIR/ro.json" 2>/dev/null
+run_probe OP_PREFLIGHT_AUTHOR_PAT=ghp_noscope -- --no-cache >"$WORKDIR/noscope.json" 2>/dev/null
+run_probe OP_PREFLIGHT_REVIEWER_PAT=ghp_reviewer -- --no-cache >"$WORKDIR/rev.json" 2>/dev/null
+set -e
+if [ "$(cap "$WORKDIR/ro.json" author-writes)" = "false" ] && reason "$WORKDIR/ro.json" author-writes | grep -q "lacks 'push'"; then
+  pass "read-only fine-grained token for the author: author-writes refused for lack of push"
+else
+  fail "read-only token: $(jq -c '.capabilities["author-writes"]' "$WORKDIR/ro.json")"
+fi
+if [ "$(cap "$WORKDIR/noscope.json" author-writes)" = "false" ] && reason "$WORKDIR/noscope.json" author-writes | grep -q "do not include repo"; then
+  pass "classic token without repo scope: author-writes refused"
+else
+  fail "no-scope token: $(jq -c '.capabilities["author-writes"]' "$WORKDIR/noscope.json")"
+fi
+if [ "$(cap "$WORKDIR/rev.json" reviewer-writes)" = "true" ]; then
+  pass "reviewer with pull only: reviewer-writes granted (reviews need read access)"
+else
+  fail "reviewer pull-only: $(jq -c '.capabilities["reviewer-writes"]' "$WORKDIR/rev.json")"
+fi
+
+# A dry-run push that negotiates is not enough without push permission.
+set +e
+run_probe GH_TOKEN=ghp_reviewer -- --no-cache >"$WORKDIR/nopush.json" 2>/dev/null
+set -e
+if [ "$(cap "$WORKDIR/nopush.json" push-multi-branch)" = "false" ] \
+   && reason "$WORKDIR/nopush.json" push-multi-branch | grep -q "does not report push permission"; then
+  pass "dry-run push without push permission: push-multi-branch not granted"
+else
+  fail "dry-run without permission: $(jq -c '.capabilities["push-multi-branch"]' "$WORKDIR/nopush.json")"
+fi
+
+# ---------------------------------------------------------------------------
+# The cache is bound to the identities it measured (Codex P1 on #1526): a
+# Claude probe must not answer a Codex session's --check.
+# ---------------------------------------------------------------------------
+rm -rf "$CACHE"
+run_probe GH_TOKEN=ghp_author OP_PREFLIGHT_REVIEWER_PAT=ghp_reviewer -- >/dev/null 2>&1
+set +e
+out="$(run_probe MERGEPATH_AGENT=codex -- --check --print-exports 2>/dev/null)"; rc=$?
+set -e
+[ "$rc" -eq 2 ] && pass "--check for another reviewer identity finds no cache (exit 2)" || fail "--check other identity: exit $rc"
+guard_fails "--check for another reviewer identity" "$out"
+bogus="$CACHE/agent-capability-o_r-nathanpayne-claude.json"
+jq '.capabilities["reviewer-writes"].identity = "nathanpayne-codex"' "$bogus" >"$WORKDIR/relabel.json"
+cp "$WORKDIR/relabel.json" "$bogus"
+set +e
+out="$(run_probe -- --check --print-exports 2>/dev/null)"; rc=$?
+set -e
+[ "$rc" -eq 2 ] && pass "--check rejects a cache whose recorded identities do not match" || fail "--check recorded identity mismatch: exit $rc"
+guard_fails "--check recorded identity mismatch" "$out"
+
+# Every measured capability is exported, read included (Codex P2 on #1526).
+rm -rf "$CACHE"
+run_probe GH_TOKEN=ghp_author -- >/dev/null 2>&1
+out="$(run_probe -- --check --print-exports 2>/dev/null || true)"
+evald="$(bash -c "$out"'
+printf "%s" "${MERGEPATH_CAP_READ:-unset}"' 2>/dev/null || true)"
+if [ "$evald" = "1" ]; then
+  pass "--check --print-exports exports MERGEPATH_CAP_READ"
+else
+  fail "MERGEPATH_CAP_READ: got '$evald'"
+fi
 
 echo
 echo "agent-capability-probe tests: $PASS passed, $FAIL failed"
