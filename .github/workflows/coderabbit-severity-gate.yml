@@ -294,9 +294,21 @@ jobs:
           # List ALL open PRs. The gate script itself short-circuits when
           # coderabbit.severity_gate.enabled=false, so we don't filter by
           # label here. `--limit 500` mirrors codex-p1-gate.yml's bound.
-          if ! prs_raw=$(gh pr list --repo "$REPO" --state open \
-            --limit 500 --json number --jq '.[].number'); then
-            echo "::error::Failed to list open PRs on $REPO"
+          # Bounded retry: a single transient API failure here used to fail
+          # the whole sweep. Only three consecutive failures are fatal.
+          list_ok=0
+          for attempt in 1 2 3; do
+            if prs_raw=$(gh pr list --repo "$REPO" --state open \
+              --limit 500 --json number --jq '.[].number'); then
+              list_ok=1
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 5))
+            fi
+          done
+          if [ "$list_ok" -ne 1 ]; then
+            echo "::error::Failed to list open PRs on $REPO after 3 attempts"
             exit 1
           fi
           if [ -z "$prs_raw" ]; then

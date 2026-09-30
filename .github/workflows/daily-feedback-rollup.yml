@@ -85,6 +85,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           REPO: ${{ github.repository }}
+          # Dispatch inputs reach the shell ONLY as environment values, never
+          # as `${{ }}` text spliced into the script: an interpolated input is
+          # parsed as shell source in a step that holds the reviewer PAT.
+          # Each is validated below before use.
+          INPUT_SINCE: ${{ github.event.inputs.since }}
+          INPUT_UNTIL: ${{ github.event.inputs.until }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "ERROR: REVIEWER_ASSIGNMENT_TOKEN secret is empty. Daily rollup cannot run without a cross-repo-capable PAT." >&2
@@ -92,14 +99,31 @@ jobs:
             exit 1
           fi
 
+          date_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+          for pair in "since:${INPUT_SINCE:-}" "until:${INPUT_UNTIL:-}"; do
+            name=${pair%%:*}
+            value=${pair#*:}
+            if [ -n "$value" ] && ! [[ "$value" =~ $date_re ]]; then
+              echo "ERROR: input '$name' must be YYYY-MM-DD; refusing to run." >&2
+              exit 1
+            fi
+          done
+          case "${INPUT_DRY_RUN:-}" in
+            ""|true|false) ;;
+            *)
+              echo "ERROR: input 'dry_run' must be true or false; refusing to run." >&2
+              exit 1
+              ;;
+          esac
+
           ARGS=()
-          if [ -n "${{ github.event.inputs.since }}" ]; then
-            ARGS+=(--since "${{ github.event.inputs.since }}")
+          if [ -n "${INPUT_SINCE:-}" ]; then
+            ARGS+=(--since "$INPUT_SINCE")
           fi
-          if [ -n "${{ github.event.inputs.until }}" ]; then
-            ARGS+=(--until "${{ github.event.inputs.until }}")
+          if [ -n "${INPUT_UNTIL:-}" ]; then
+            ARGS+=(--until "$INPUT_UNTIL")
           fi
-          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+          if [ "${INPUT_DRY_RUN:-}" = "true" ]; then
             ARGS+=(--dry-run)
           fi
 
