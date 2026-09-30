@@ -357,6 +357,12 @@
 #       retries, most often a rate-limited token. Distinct from 2 on purpose:
 #       2 means "we looked and it went wrong", 4 means "we never got to look",
 #       and a sweep loop must not treat the second as a completed pass.
+#   6 — CEILING (#1057): a GraphQL operation this helper needs was refused
+#       by the session's proxy ("This GraphQL query is not enabled for this
+#       session"), as in a Claude Code cloud session. Thread state and thread
+#       resolution exist only in GraphQL, so no credential or retry changes
+#       the answer: hand the step to a session that can reach GraphQL. See
+#       scripts/lib/graphql-ceiling.sh.
 #   3 — unresolved threads exist (in --list mode), or a resolve mode left
 #       threads unresolved (human-authored, stale-HEAD, not-actioned,
 #       comments-incomplete, not-propagation-routed, drifted,
@@ -578,6 +584,16 @@ fi
 # and the write consistent. The name is now token-centric, not
 # read-centric, to reflect that.
 PAT_GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}"
+# #1057 A3: classify the cloud proxy's GraphQL refusal as a ceiling (exit 6).
+# Optional like the other helper libs above: without it a refusal is reported
+# as the generic GraphQL failure it was before, which is still fail-closed.
+if [ -r "$__RESOLVE_THREADS_DIR/lib/graphql-ceiling.sh" ]; then
+  # shellcheck source=lib/graphql-ceiling.sh
+  . "$__RESOLVE_THREADS_DIR/lib/graphql-ceiling.sh"
+else
+  graphql_ceiling_hit() { return 1; }
+fi
+
 gh_pat() {
   if [ -n "$PAT_GH_TOKEN" ]; then
     GH_TOKEN="$PAT_GH_TOKEN" gh "$@"
@@ -797,12 +813,14 @@ while :; do
   if [ -z "$CURSOR" ]; then
     PAGE=$(gh_pat api graphql -f query="$QUERY" \
       -F owner="$OWNER" -F repo="$NAME" -F pr="$PR_NUM" -F cursor=null 2>&1) || {
+      graphql_ceiling_hit "$PAGE" && graphql_ceiling_refuse resolve-pr-threads "reading $REPO#$PR_NUM's review threads"
       echo "GraphQL query failed: $PAGE" >&2
       exit 2
     }
   else
     PAGE=$(gh_pat api graphql -f query="$QUERY" \
       -F owner="$OWNER" -F repo="$NAME" -F pr="$PR_NUM" -f cursor="$CURSOR" 2>&1) || {
+      graphql_ceiling_hit "$PAGE" && graphql_ceiling_refuse resolve-pr-threads "reading $REPO#$PR_NUM's review threads"
       echo "GraphQL query failed: $PAGE" >&2
       exit 2
     }
@@ -2974,6 +2992,9 @@ post_tag_reply() {
     -F id="$thread_id" \
     -F body="$body" \
     2>&1 1>/dev/null); then
+    # Called in the main shell (`if post_tag_reply ...`), so the refusal ends
+    # the run before any thread is resolved without its disposition tag.
+    graphql_ceiling_hit "$err" && graphql_ceiling_refuse resolve-pr-threads "posting the disposition reply on review thread $thread_id"
     printf 'tag-reply mutation failed: %s\n' "$err" >&2
     return 1
   fi
@@ -3484,16 +3505,21 @@ while IFS= read -r thread; do
   # as FAILED, not RESOLVED. Threads confirmed true here are collected into
   # RESOLVED_IDS for the consolidated reviewThreads readback after the loop.
   resolve_state=""
+  mutation_err="$(mktemp "${TMPDIR:-/tmp}/resolve-pr-threads-mutation.XXXXXX")"
   if mutation_out=$(gh_pat api graphql -f query='
     mutation($id: ID!) {
       resolveReviewThread(input: {threadId: $id}) {
         thread { isResolved }
       }
     }
-  ' -F id="$THREAD_ID" 2>/dev/null); then
+  ' -F id="$THREAD_ID" 2>"$mutation_err"); then
     resolve_state=$(printf '%s' "$mutation_out" \
       | jq -r '.data.resolveReviewThread.thread.isResolved' 2>/dev/null || echo "")
+  elif graphql_ceiling_hit "$(cat "$mutation_err" 2>/dev/null) ${mutation_out:-}"; then
+    rm -f "$mutation_err"
+    graphql_ceiling_refuse resolve-pr-threads "resolving review thread $THREAD_ID (${RESOLVED_COUNT} resolved before the refusal)"
   fi
+  rm -f "$mutation_err"
   if [ "$resolve_state" = "true" ]; then
     echo "  RESOLVED [$AUTHOR] $PATH_"
     RESOLVED_COUNT=$((RESOLVED_COUNT + 1))
@@ -3557,6 +3583,7 @@ if [ "${#RESOLVED_IDS[@]}" -gt 0 ]; then
     rb_ids_json=$(printf '%s\n' "${rb_batch[@]}" | jq -R . | jq -s -c .)
     rb_query="query { nodes(ids: ${rb_ids_json}) { ... on PullRequestReviewThread { id isResolved } } }"
     if ! rb_resp=$(gh_pat api graphql -f query="$rb_query" 2>&1); then
+      graphql_ceiling_hit "$rb_resp" && graphql_ceiling_refuse resolve-pr-threads "reading back ${#rb_batch[@]} resolved thread(s); they may be resolved but are UNCONFIRMED"
       echo "  READBACK FAILED: reviewThreads readback query errored: $rb_resp" >&2
       # Fail closed — count every id in this batch as unconfirmed.
       for rb_id in "${rb_batch[@]}"; do READBACK_FAILED=$((READBACK_FAILED + 1)); done

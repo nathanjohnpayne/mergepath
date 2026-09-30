@@ -129,6 +129,61 @@ grep -qi "RATE LIMITED" <<<"$nh_out" \
   && ok "a stdout-only rate-limit body is still CLASSIFIED as a rate limit" \
   || bad "stdout-only rate-limit body was not classified: $nh_out"
 
+# ---------------------------------------------------------------------------
+# #1057 A3: the cloud GraphQL ceiling. REST reads succeed and every GraphQL
+# request is refused with the proxy's documented message. That is a property
+# of the session, not a failed read, so it gets its own exit (6) and a message
+# that says so, never the generic "GraphQL query failed" exit 2 that invites a
+# retry. A GraphQL failure WITHOUT the phrase keeps exit 2 (control).
+# ---------------------------------------------------------------------------
+ceiling_run() { # <graphql stderr line> -> echoes rc; output in $STUB_DIR/ceiling.out
+  cat >"$STUB_DIR/gh" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *graphql*) echo $(printf '%q' "$1") >&2; exit 1 ;;
+esac
+echo '{}'
+STUB
+  chmod +x "$STUB_DIR/gh"
+  ( cd "$ROOT" \
+    && PATH="$STUB_DIR:$PATH" \
+       GH_RETRY_BACKOFF_SECONDS=0 GH_RETRY_ATTEMPTS=2 \
+       OP_PREFLIGHT_REVIEWER_PAT=stub-token \
+       bounded 60 bash "$SCRIPT" 999 --repo owner/name --list ) >"$STUB_DIR/ceiling.out" 2>&1
+  echo $?
+}
+
+c_rc=$(ceiling_run "gh: This GraphQL query is not enabled for this session. Use gh api repos/{owner}/{repo}/... (HTTP 403)")
+c_out="$(cat "$STUB_DIR/ceiling.out")"
+[ "$c_rc" = "6" ] \
+  && ok "proxy GraphQL refusal on the thread read exits 6 (ceiling), not 2" \
+  || bad "proxy GraphQL refusal: exited $c_rc, expected 6; output: $c_out"
+grep -q "CEILING" <<<"$c_out" && grep -q "not a credential gap" <<<"$c_out" \
+  && ok "the ceiling message names the ceiling and says a token cannot fix it" \
+  || bad "ceiling message missing its explanation: $c_out"
+grep -q "GraphQL query failed" <<<"$c_out" \
+  && bad "the ceiling was ALSO reported as a generic GraphQL failure: $c_out" \
+  || ok "the ceiling is not reported as a generic GraphQL failure"
+
+g_rc=$(ceiling_run "gh: Something went wrong while executing your query. (HTTP 502)")
+[ "$g_rc" = "2" ] \
+  && ok "control: a GraphQL failure without the proxy phrase keeps exit 2" \
+  || bad "control: generic GraphQL failure exited $g_rc, expected 2"
+
+# The classifier itself: the phrase anywhere in captured text, nothing else.
+(
+  # shellcheck source=../scripts/lib/graphql-ceiling.sh
+  . "$ROOT/scripts/lib/graphql-ceiling.sh"
+  graphql_ceiling_hit '{"message":"This GraphQL query is not enabled for this session"}' || exit 11
+  graphql_ceiling_hit 'gh: Resource not accessible by integration (HTTP 403)' && exit 12
+  graphql_ceiling_hit '' && exit 13
+  exit 0
+)
+cls_rc=$?
+[ "$cls_rc" -eq 0 ] \
+  && ok "graphql_ceiling_hit matches the proxy phrase and nothing else" \
+  || bad "graphql_ceiling_hit misclassified (case $cls_rc)"
+
 echo
 echo "test_resolve_pr_threads_read_failure: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
