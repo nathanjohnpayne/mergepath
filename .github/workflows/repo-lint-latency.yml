@@ -34,6 +34,7 @@ jobs:
             --repo "${{ github.repository }}" \
             --out-dir "$OUT_DIR" \
             --limit 100 \
+            --window-days 14 \
             --min-sample 20 \
             --p50-max 300 \
             --p95-max 480 \

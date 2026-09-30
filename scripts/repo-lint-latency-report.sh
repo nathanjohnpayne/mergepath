@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 # Build a rolling repo-lint latency and duplicate-execution report.
+#
+# The sample is bounded by TIME as well as by count (#1062). The Actions list
+# is one unpaginated page of the newest LIMIT runs; on a low-traffic repo that
+# page can reach back months, to runs from before the duplicate-event fix, and
+# the same_sha_duplicate_execution alert would then fire on history nothing
+# can change — a daily report that fails forever. Only runs created within the
+# last WINDOW_DAYS days (relative to --as-of, default now) are considered, and
+# every run must carry a parseable created_at; the window is applied in
+# created_at order, newest first, before LIMIT.
 
 set -euo pipefail
 
@@ -11,9 +20,11 @@ MIN_SAMPLE=20
 P50_MAX=300
 P95_MAX=480
 DEEP_P95_MAX=720
+WINDOW_DAYS=14
+AS_OF=""
 
 usage() {
-  echo "usage: repo-lint-latency-report.sh [--input FILE] [--repo owner/repo] [--out-dir DIR] [--limit N] [--min-sample N] [--p50-max SECONDS] [--p95-max SECONDS] [--deep-p95-max SECONDS]" >&2
+  echo "usage: repo-lint-latency-report.sh [--input FILE] [--repo owner/repo] [--out-dir DIR] [--limit N] [--window-days N] [--as-of YYYY-MM-DDTHH:MM:SSZ] [--min-sample N] [--p50-max SECONDS] [--p95-max SECONDS] [--deep-p95-max SECONDS]" >&2
   exit 2
 }
 
@@ -23,6 +34,8 @@ while [ "$#" -gt 0 ]; do
     --repo) [ "$#" -ge 2 ] || usage; REPO="$2"; shift 2 ;;
     --out-dir) [ "$#" -ge 2 ] || usage; OUT_DIR="$2"; shift 2 ;;
     --limit) [ "$#" -ge 2 ] || usage; LIMIT="$2"; shift 2 ;;
+    --window-days) [ "$#" -ge 2 ] || usage; WINDOW_DAYS="$2"; shift 2 ;;
+    --as-of) [ "$#" -ge 2 ] || usage; AS_OF="$2"; shift 2 ;;
     --min-sample) [ "$#" -ge 2 ] || usage; MIN_SAMPLE="$2"; shift 2 ;;
     --p50-max) [ "$#" -ge 2 ] || usage; P50_MAX="$2"; shift 2 ;;
     --p95-max) [ "$#" -ge 2 ] || usage; P95_MAX="$2"; shift 2 ;;
@@ -32,19 +45,54 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-for value in "$LIMIT" "$MIN_SAMPLE" "$P50_MAX" "$P95_MAX" "$DEEP_P95_MAX"; do
+for value in "$LIMIT" "$MIN_SAMPLE" "$P50_MAX" "$P95_MAX" "$DEEP_P95_MAX" "$WINDOW_DAYS"; do
   case "$value" in ''|*[!0-9]*) usage ;; esac
 done
 [ "$LIMIT" -ge 1 ] && [ "$LIMIT" -le 100 ] || usage
+# Force base 10: the digit check above accepts a leading zero (`08`, `010`),
+# which $(( )) would otherwise read as octal (an error, or the wrong window).
+WINDOW_DAYS=$((10#$WINDOW_DAYS))
+[ "$WINDOW_DAYS" -ge 1 ] && [ "$WINDOW_DAYS" -le 90 ] || usage
 command -v jq >/dev/null 2>&1 || { echo "repo-lint latency: jq is required" >&2; exit 2; }
+if [ -n "$AS_OF" ]; then
+  [[ "$AS_OF" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || usage
+  AS_OF_EPOCH=$(jq -rn --arg t "$AS_OF" '$t | fromdateiso8601') || usage
+else
+  AS_OF_EPOCH=$(jq -rn 'now | floor')
+fi
+WINDOW_START_EPOCH=$((AS_OF_EPOCH - WINDOW_DAYS * 86400))
+WINDOW_START=$(jq -rn --argjson t "$WINDOW_START_EPOCH" '$t | strftime("%Y-%m-%dT%H:%M:%SZ")')
 mkdir -p "$OUT_DIR"
 
 DATA="$OUT_DIR/runs.json"
 
+# window_runs <file holding a JSON array of runs>: validate that every run has
+# a parseable created_at, keep only runs created at or after WINDOW_START and
+# at or before the as-of instant (so a replayed export's later runs cannot
+# displace the requested window),
+# order newest first by created_at, and cap at LIMIT. Prints the windowed
+# array. A run without a usable created_at makes the whole sample unusable
+# (non-zero exit): its place in the window is unknowable, and silently dropping
+# it would hide exactly the runs this report exists to count.
+window_runs() {
+  jq -e --argjson since "$WINDOW_START_EPOCH" --argjson until "$AS_OF_EPOCH" --argjson limit "$LIMIT" '
+    def created: .created_at | if type == "string" then (try fromdateiso8601 catch null) else null end;
+    if type != "array" then error("runs is not an array")
+    elif any(.[]; created == null) then error("every run must carry an ISO-8601 created_at")
+    else [ .[] | created as $c | select($c >= $since and $c <= $until) ] | sort_by(created) | reverse | .[:$limit]
+    end
+  ' "$1"
+}
+
 if [ -n "$INPUT" ]; then
   jq -e '.runs | type == "array"' "$INPUT" >/dev/null \
     || { echo "repo-lint latency: input must contain a runs array" >&2; exit 2; }
-  jq --argjson limit "$LIMIT" '{runs:(.runs[:$limit])}' "$INPUT" > "$DATA"
+  jq '.runs' "$INPUT" > "$OUT_DIR/input-runs.json"
+  if ! windowed=$(window_runs "$OUT_DIR/input-runs.json"); then
+    echo "repo-lint latency: every input run must carry an ISO-8601 created_at" >&2
+    exit 2
+  fi
+  jq -n --argjson runs "$windowed" '{runs:$runs}' > "$DATA"
 else
   [ -n "$REPO" ] || { echo "repo-lint latency: --repo or GITHUB_REPOSITORY is required" >&2; exit 2; }
   command -v gh >/dev/null 2>&1 || { echo "repo-lint latency: gh is required for live collection" >&2; exit 2; }
@@ -62,9 +110,16 @@ else
   # The report is intentionally bounded to one Actions page. Using
   # --paginate and slicing afterward still downloads the repository's entire
   # workflow history before jq can apply LIMIT — minutes of needless API work.
-  if ! with_gh_retry gh api "repos/$REPO/actions/workflows/repo_lint.yml/runs?status=completed&per_page=$LIMIT" --jq '.workflow_runs[]' \
-      | jq -s --argjson limit "$LIMIT" '.[0:$limit]' > "$RUN_LIST"; then
+  # The server-side `created>=` filter bounds that page by time as well
+  # (#1062); window_runs below re-applies the same bound on created_at so the
+  # verdict never depends on the server honouring the filter.
+  if ! with_gh_retry gh api "repos/$REPO/actions/workflows/repo_lint.yml/runs?status=completed&per_page=$LIMIT&created=%3E%3D$WINDOW_START" --jq '.workflow_runs[]' \
+      | jq -s '.' > "$OUT_DIR/workflow-runs-raw.json"; then
     echo "repo-lint latency: could not fetch workflow runs" >&2
+    exit 3
+  fi
+  if ! window_runs "$OUT_DIR/workflow-runs-raw.json" > "$RUN_LIST"; then
+    echo "repo-lint latency: workflow runs lacked a usable created_at" >&2
     exit 3
   fi
 
@@ -112,7 +167,9 @@ jq -c \
   --argjson min_sample "$MIN_SAMPLE" \
   --argjson p50_max "$P50_MAX" \
   --argjson p95_max "$P95_MAX" \
-  --argjson deep_p95_max "$DEEP_P95_MAX" '
+  --argjson deep_p95_max "$DEEP_P95_MAX" \
+  --argjson window_days "$WINDOW_DAYS" \
+  --arg window_start "$WINDOW_START" '
   def percentile($p):
     sort as $values
     | if ($values|length) == 0 then null
@@ -161,6 +218,7 @@ jq -c \
       if ($duplicates|length) > 0 then "same_sha_duplicate_execution" else empty end]) as $alerts
   | {
       schema:"repo-lint-latency/v1",
+      window:{days:$window_days, since:$window_start, runs:(.runs|length)},
       status:(if ($alerts|length)>0 then "alert" elif ($ordinary_dist.n < $min_sample or $deep_dist.n < $min_sample) then "insufficient-sample" else "healthy" end),
       thresholds:{min_sample:$min_sample,p50_max_seconds:$p50_max,p95_max_seconds:$p95_max,deep_p95_max_seconds:$deep_p95_max},
       ordinary_pr:$ordinary_dist,
@@ -178,6 +236,7 @@ jq -r '
     end;
   "# Repo-lint latency\n\n" +
   "Status: **" + .status + "**\n\n" +
+  "Window: runs created since " + .window.since + " (last " + (.window.days|tostring) + " days; " + (.window.runs|tostring) + " runs).\n\n" +
   "| segment | n | p50 | p95 |\n|---|---:|---:|---:|\n" +
   "| ordinary PR | " + (.ordinary_pr.n|tostring) + " | " + (.ordinary_pr.p50_seconds|duration) + " | " + (.ordinary_pr.p95_seconds|duration) + " |\n" +
   "| deep/governance PR | " + (.deep_pr.n|tostring) + " | " + (.deep_pr.p50_seconds|duration) + " | " + (.deep_pr.p95_seconds|duration) + " |\n\n" +
