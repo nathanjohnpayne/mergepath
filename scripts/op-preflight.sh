@@ -249,10 +249,31 @@ PURGE_ALL=false
 CHECK=false
 PRINT_EXPORTS=false
 
+# Argument errors reach an `eval "$(...)"` caller exactly like a cache miss,
+# and an empty stdout makes that eval return 0: `eval "$(... --agent Claude
+# --check --print-exports)" && gh ...` would sail on with both PATs unset and
+# fall through to the gh keyring (#1057, the residue of #1021). So every
+# argument error leaves a statement on stdout that FAILS when evaluated. The
+# guard is inlined rather than shared with emit_eval_guard below because these
+# errors fire before that function is defined; the message is %q-quoted for the
+# same reason it is there.
+arg_error() { # <message> [<extra stderr line>...]
+  local msg="$1"
+  shift
+  echo "Error: $msg" >&2
+  if [[ $# -gt 0 ]]; then printf '%s\n' "$@" >&2; fi
+  printf 'echo %s >&2; return 1 2>/dev/null || exit 1\n' "$(printf '%q' "op-preflight: $msg")"
+  exit 1
+}
+ARG_USAGE='Usage: eval "$(scripts/op-preflight.sh --agent claude --mode review)"'
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --agent)  AGENT="$2"; shift 2 ;;
-    --mode)   MODE="$2"; shift 2 ;;
+    --agent|--mode)
+      [[ $# -ge 2 ]] || arg_error "$1 requires a value." "$ARG_USAGE"
+      if [[ "$1" == "--agent" ]]; then AGENT="$2"; else MODE="$2"; fi
+      shift 2
+      ;;
     --dry-run) DRY_RUN=true; shift ;;
     --skip-ssh) SKIP_SSH=true; shift ;;
     --refresh) REFRESH=true; shift ;;
@@ -261,9 +282,7 @@ while [[ $# -gt 0 ]]; do
     --check|--status) CHECK=true; shift ;;
     --print-exports) PRINT_EXPORTS=true; shift ;;
     *)
-      echo "Error: unknown argument: $1" >&2
-      echo "Usage: eval \"\$(scripts/op-preflight.sh --agent claude --mode review)\"" >&2
-      exit 1
+      arg_error "unknown argument: $1" "$ARG_USAGE"
       ;;
   esac
 done
@@ -274,8 +293,7 @@ done
 # would mutate state or burn biometric.
 if $CHECK; then
   if $REFRESH || $PURGE || $PURGE_ALL; then
-    echo "Error: --check / --status is mutually exclusive with --refresh, --purge, --purge-all." >&2
-    exit 1
+    arg_error "--check / --status is mutually exclusive with --refresh, --purge, --purge-all."
   fi
 fi
 
@@ -297,19 +315,15 @@ fi
 # dropped by a bulk sync, and restored in #534 — the regression test
 # test_deploy_mode_requires_agent guards against another drop.
 if [[ "$MODE" == "review" || "$MODE" == "all" || "$MODE" == "deploy" || "$PURGE" == "true" || "$CHECK" == "true" ]] && [[ -z "$AGENT" ]]; then
-  echo "Error: --agent is required for review, deploy, all, --purge, or --check mode." >&2
-  echo "Usage: eval \"\$(scripts/op-preflight.sh --agent claude --mode review)\"" >&2
-  exit 1
+  arg_error "--agent is required for review, deploy, all, --purge, or --check mode." "$ARG_USAGE"
 fi
 
 if [[ -n "$AGENT" ]] && [[ -z "$(reviewer_pat_item_for "$AGENT" 2>/dev/null || true)" ]]; then
-  echo "Error: unknown agent '$AGENT'. Valid: claude, cursor, codex" >&2
-  exit 1
+  arg_error "unknown agent '$AGENT'. Valid: claude, cursor, codex"
 fi
 
 if ! [[ "$TTL_SECONDS" =~ ^[0-9]+$ ]]; then
-  echo "Error: OP_PREFLIGHT_TTL_SECONDS must be an integer; got '$TTL_SECONDS'" >&2
-  exit 1
+  arg_error "OP_PREFLIGHT_TTL_SECONDS must be an integer; got '$TTL_SECONDS'"
 fi
 
 SERVICE_ACCOUNT_TOKEN_MODE=false
