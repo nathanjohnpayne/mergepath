@@ -345,9 +345,17 @@ measure_write() {
       # api_request's classifier. Repeat it once for the candidate so an
       # outage or rate limit marks the run transient instead of caching a
       # 12-hour denial (Codex P2 on #1526).
-      local candidate="${!preferred:-${GH_TOKEN:-}}"
+      local candidate="${!preferred:-${GH_TOKEN:-}}" repeat_status repeat_login
       if [ -n "$candidate" ]; then
-        api_request "$candidate" GET user "$WORKDIR/resolve-user" >/dev/null
+        repeat_status="$(api_request "$candidate" GET user "$WORKDIR/resolve-user")"
+        repeat_login="$(jq -r '.login // empty' "$WORKDIR/resolve-user.body" 2>/dev/null || true)"
+        # If the repeat now reads as the expected login, the resolver's own
+        # failure was the transient one (it recovered between the two calls),
+        # so the denial is not a measurement either (Codex P2 on #1526).
+        if [ "$repeat_status" = "200" ] && [ "$repeat_login" = "$identity" ] \
+           && [ "$(credential_class "$candidate" "$WORKDIR/resolve-user.headers")" = "user-held" ]; then
+          echo "resolver for $identity failed, then its candidate verified on repeat" >>"$WORKDIR/transient"
+        fi
       fi
       candidate=""
     else

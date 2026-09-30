@@ -102,7 +102,15 @@ case "$tok" in
   proxy-injected) login=nathanjohnpayne; perms='{"pull":true,"push":true}' ;;
 esac
 status=200; body=""
-if [ "$tok" = "ghp_flaky" ]; then
+if [ "$tok" = "ghp_flap" ]; then
+  # First GET /user (the resolver's, via --jq) fails; later ones succeed.
+  n=$(wc -l <"$STUB_FLAP_COUNT" | tr -d ' '); echo x >>"$STUB_FLAP_COUNT"
+  login=nathanpayne-claude; scopes="repo"
+  if [ "$path" = "user" ] && [ "$n" -eq 0 ]; then status=503; body='{"message":"Service Unavailable"}'; fi
+fi
+if [ "$status" != 200 ]; then
+  :
+elif [ "$tok" = "ghp_flaky" ]; then
   status=503; body='{"message":"Service Unavailable"}'
 elif [ -n "${STUB_FAIL_STATUS:-}" ]; then
   status="$STUB_FAIL_STATUS"; body='{"message":"Server Error"}'
@@ -623,6 +631,20 @@ if [ "$(jq -r .transient_failures "$WORKDIR/cut.json")" = "true" ] && [ ! -e "$C
   pass "200 headers followed by a failed transfer: flagged transient and not cached"
 else
   fail "cut-off transfer: transient=$(jq -r .transient_failures "$WORKDIR/cut.json" 2>/dev/null) cache=$(ls "$CACHE" 2>/dev/null)"
+fi
+
+# The resolver's GET /user fails, but the candidate verifies on the repeat:
+# the resolver's failure was the transient one, so nothing is cached (Codex P2
+# on #1526, round 4).
+rm -rf "$CACHE"
+: >"$WORKDIR/flap-count"
+set +e
+run_probe GH_TOKEN=ghp_author OP_PREFLIGHT_REVIEWER_PAT=ghp_flap STUB_FLAP_COUNT="$WORKDIR/flap-count" -- >"$WORKDIR/flap.json" 2>/dev/null
+set -e
+if [ "$(jq -r .transient_failures "$WORKDIR/flap.json")" = "true" ] && [ ! -e "$CACHE/agent-capability-o_r-nathanpayne-claude.json" ]; then
+  pass "resolver failed but the candidate verified on repeat: marked transient, not cached"
+else
+  fail "resolver flap: transient=$(jq -r .transient_failures "$WORKDIR/flap.json" 2>/dev/null) cache=$(ls "$CACHE" 2>/dev/null)"
 fi
 
 echo
