@@ -1027,6 +1027,49 @@ for shape in "git -c credential.helper=x -C $PUSHREPO push origin HEAD" \
   fi
 done
 
+# git push sends to EVERY push URL, so a second one must not slip past the
+# check (CodeRabbit and Codex on #1541): a second pushurl, or a second url.
+for second in "https://evil.example/repo.git" "https://other:SECONDSECRET@github.com/example/repo.git"; do
+  "$REAL_GIT" -C "$PUSHREPO" config --local remote.origin.pushurl https://github.com/example/repo.git
+  "$REAL_GIT" -C "$PUSHREPO" config --local --add remote.origin.pushurl "$second"
+  if run_git_wrapper 5 "second pushurl $second" git -C "$PUSHREPO" push -u origin HEAD; then
+    if [ -s "$GIT_PUSH_LOG" ] || printf '%s' "$GIT_CASE_ERR" | grep -q SECONDSECRET; then
+      fail "second pushurl: pushed or echoed it"
+    else
+      pass "a second push URL that fails the check (${second%%//*}//...): refused before the push"
+    fi
+  fi
+  "$REAL_GIT" -C "$PUSHREPO" config --local --unset-all remote.origin.pushurl
+done
+"$REAL_GIT" -C "$PUSHREPO" config --local --add remote.origin.url https://evil.example/repo.git
+if run_git_wrapper 5 "second url" git -C "$PUSHREPO" push -u origin HEAD; then
+  [ -s "$GIT_PUSH_LOG" ] && fail "second remote url: pushed" || pass "a second remote url that fails the check: refused before the push"
+fi
+"$REAL_GIT" -C "$PUSHREPO" config --local --unset-all remote.origin.url
+"$REAL_GIT" -C "$PUSHREPO" config --local remote.origin.url https://github.com/example/repo.git
+
+# No repository-controlled hook runs with the token in its environment (Codex
+# on #1541). Real git, a real local push: a pre-push hook that would capture
+# GH_TOKEN never runs.
+HOOKREPO="$WORKDIR/hookrepo"
+HOOKBARE="$WORKDIR/hookbare.git"
+"$REAL_GIT" init -q "$HOOKREPO"
+"$REAL_GIT" init -q --bare "$HOOKBARE"
+"$REAL_GIT" -C "$HOOKREPO" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m init
+printf '#!/bin/sh\nprintf "%%s" "$GH_TOKEN" >"%s"\n' "$WORKDIR/hook-captured" >"$HOOKREPO/.git/hooks/pre-push"
+chmod +x "$HOOKREPO/.git/hooks/pre-push"
+rm -f "$WORKDIR/hook-captured"
+set +e
+hook_out="$(bash -c '. "$1"; gh_author_git_exec ghp_hook-token -C "$2" push "$3" HEAD:refs/heads/main' _ \
+  "$ROOT/scripts/lib/gh-token-resolver.sh" "$HOOKREPO" "$HOOKBARE" 2>&1)"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ ! -e "$WORKDIR/hook-captured" ] && "$REAL_GIT" -C "$HOOKBARE" rev-parse -q --verify refs/heads/main >/dev/null; then
+  pass "real git push: the repository's pre-push hook never runs with the token in its environment"
+else
+  fail "hook isolation: rc=$rc captured=$([ -e "$WORKDIR/hook-captured" ] && echo yes || echo no) out=$hook_out"
+fi
+
 # The credential git itself obtains for github.com, under hostile global,
 # netrc, environment and repo-local configuration: only the verified token.
 CRED_DIR="$WORKDIR/cred-bin"

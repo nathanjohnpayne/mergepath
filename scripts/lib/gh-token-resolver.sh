@@ -97,6 +97,8 @@ gh_author_payload_kind() { # <payload...>
 # injected through the environment is dropped, the credential helper list is
 # reset to gh's (which reads GH_TOKEN), extra headers are reset, and SSH forms
 # of github.com are rewritten to HTTPS so the helper, not an SSH key, decides.
+# No repository-controlled program runs with the token in its environment:
+# hooks (pre-push, reference-transaction, ...) and fsmonitor are disabled.
 gh_author_git_exec() { # <token> <git args...>
   local token="$1" home rc
   shift
@@ -108,6 +110,7 @@ gh_author_git_exec() { # <token> <git args...>
     GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
     git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
         -c http.extraHeader= \
+        -c core.hooksPath=/dev/null -c core.fsmonitor=false \
         -c url.https://github.com/.insteadOf=git@github.com: \
         -c url.https://github.com/.insteadOf=ssh://git@github.com/ \
         "$@"
@@ -138,17 +141,27 @@ gh_author_git_push() { # <token> <git args as accepted by gh_author_payload_kind
     printf '  %s\n' $local_keys >&2
     return 5
   fi
-  if ! url="$(gh_author_git_exec "$token" ${dir_args[@]+"${dir_args[@]}"} remote get-url --push "$remote" 2>/dev/null)"; then
+  # git push sends to EVERY push URL of the remote (all pushurl values, else
+  # all url values), so every one must pass, not only the first (CodeRabbit
+  # and Codex on #1541).
+  local urls
+  if ! urls="$(gh_author_git_exec "$token" ${dir_args[@]+"${dir_args[@]}"} remote get-url --push --all "$remote" 2>/dev/null)" \
+     || [ -z "$urls" ]; then
     echo "gh-as-author: refusing git push: remote '$remote' has no push URL." >&2
     return 5
   fi
-  case "$url" in
-    https://github.com/*@*|https://*@*) ;;
-    https://github.com/*) gh_author_git_exec "$token" "$@"; return $? ;;
-  esac
-  # Never echo the URL: it may carry a credential in its userinfo.
-  echo "gh-as-author: refusing git push: remote '$remote' does not resolve to https://github.com/ without embedded credentials." >&2
-  return 5
+  while IFS= read -r url; do
+    case "$url" in
+      https://github.com/*@*|https://*@*) ;;
+      https://github.com/?*) continue ;;
+    esac
+    # Never echo the URL: it may carry a credential in its userinfo.
+    echo "gh-as-author: refusing git push: a push URL of remote '$remote' does not resolve to https://github.com/ without embedded credentials." >&2
+    return 5
+  done <<EOF_URLS
+$urls
+EOF_URLS
+  gh_author_git_exec "$token" "$@"
 }
 
 gh_default_reviewer_identity() {
