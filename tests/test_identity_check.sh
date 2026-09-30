@@ -393,6 +393,11 @@ for spec in "ghe-only:3:ghe.example.com" "gh-only:0:github.com" "both:0:github.c
 done
 printf '# no hosts\n\n' >"$WORKDIR/ghcfg-comments.yml"; mkdir -p "$WORKDIR/ghcfg-empty" "$WORKDIR/ghcfg-comments"
 : >"$WORKDIR/ghcfg-empty/hosts.yml"; cp "$WORKDIR/ghcfg-comments.yml" "$WORKDIR/ghcfg-comments/hosts.yml"
+mkdir -p "$WORKDIR/ghcfg-inline" "$WORKDIR/ghcfg-quoted"
+printf 'ghe.example.com: # work\n    user: someone\n' >"$WORKDIR/ghcfg-inline/hosts.yml"
+printf '"ghe.example.com":\n    user: someone\n' >"$WORKDIR/ghcfg-quoted/hosts.yml"
+write_case "sole GHES host with an inline comment" 3 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-inline"
+write_case "sole GHES host, quoted key" 3 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-quoted"
 write_case "empty hosts.yml" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-empty"
 write_case "comment-only hosts.yml" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-comments"
 write_case "hosts.yml ghe-only, GH_HOST=github.com" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-ghe-only" GH_HOST=github.com

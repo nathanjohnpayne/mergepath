@@ -937,7 +937,7 @@ for a in "$@"; do
         "${GH_TOKEN:-}" "${HOME:-}" "${GIT_CONFIG_GLOBAL:-}" "${GIT_CONFIG_NOSYSTEM:-}" "${GIT_TERMINAL_PROMPT:-}"  # TOKEN_OUTPUT_EXEMPT: fixture token pinned inline by each case
       printf '%s ' "$@"
       printf '\n'
-    } >>"$GIT_PUSH_LOG"
+    } >>"$PUSH_STUB_LOG"
     exit 0
   fi
 done
@@ -955,7 +955,7 @@ run_git_wrapper() { # <expected rc> <label> <payload...>
   : >"$GIT_PUSH_LOG"
   reset_log
   set +e
-  err=$(PATH="$GITSTUB_DIR:$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" GIT_PUSH_LOG="$GIT_PUSH_LOG" \
+  err=$(PATH="$GITSTUB_DIR:$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" PUSH_STUB_LOG="$GIT_PUSH_LOG" \
     GH_AS_AUTHOR_PUSH_REPO="${PUSH_REPO_OVERRIDE-example/repo}" \
     OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" "$WRAPPER" -- "$@" 2>&1 >/dev/null)
   rc=$?
@@ -1172,6 +1172,22 @@ else
   fail "real git credential under hostile config: $cred_out"
 fi
 
+# Every inherited GIT_* variable is dropped before git runs with the token
+# (Codex on #1541): GIT_EXEC_PATH could substitute git-remote-https, and
+# GIT_TRACE_CURL with GIT_TRACE_REDACT=0 would log the Authorization header.
+mkdir -p "$WORKDIR/fake-exec"
+env_out="$(GIT_EXEC_PATH="$WORKDIR/fake-exec" GIT_TRACE_CURL="$WORKDIR/trace.log" GIT_TRACE_REDACT=0 \
+  GIT_SSL_NO_VERIFY=1 PATH="$CRED_DIR:$PATH" \
+  bash -c '. "$1"; gh_author_git_exec ghp_env-token -c alias.showenv="!env" showenv' _ "$ROOT/scripts/lib/gh-token-resolver.sh" 2>&1)"
+if printf '%s\n' "$env_out" | grep -q "GIT_EXEC_PATH=$WORKDIR/fake-exec" \
+   || printf '%s\n' "$env_out" | grep -qE '^GIT_(TRACE_CURL|TRACE_REDACT|SSL_NO_VERIFY)='; then
+  fail "inherited GIT_* reached the token-bearing git: $(printf '%s\n' "$env_out" | grep '^GIT_' | tr '\n' ' ')"
+elif printf '%s\n' "$env_out" | grep -q '^GH_TOKEN=ghp_env-token$'; then
+  pass "inherited GIT_EXEC_PATH, GIT_TRACE_CURL, GIT_TRACE_REDACT and GIT_SSL_NO_VERIFY never reach the token-bearing git"
+else
+  fail "GIT_* isolation probe did not run: $env_out"
+fi
+
 # A gh the repository ships is never the credential helper, even with "."
 # on PATH: git resolves a bare helper name after entering the repository, so
 # the runner names gh by the absolute path it resolved first (Codex on #1541).
@@ -1226,7 +1242,7 @@ else
 fi
 set +e
 fresh_pushrepo
-PATH="$GITSTUB_DIR:$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" GIT_PUSH_LOG="$GIT_PUSH_LOG" GH_AS_AUTHOR_TRACE_MARKER="$MARKER" \
+PATH="$GITSTUB_DIR:$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" PUSH_STUB_LOG="$GIT_PUSH_LOG" GH_AS_AUTHOR_TRACE_MARKER="$MARKER" \
   GH_AS_AUTHOR_PUSH_REPO=example/repo OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" "$WRAPPER" -- git -C "$PUSHREPO" push -u origin HEAD >/dev/null 2>&1
 rc=$?
 set -e

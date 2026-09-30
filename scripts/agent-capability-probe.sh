@@ -513,7 +513,11 @@ measure_write() {
         reason="token reads as '$login', not '$identity'"
       elif [ "$login_type" != "User" ]; then
         reason="token identity type is '$login_type', not User"
-      elif [ "$class" != "user-held" ]; then
+      elif [ "$class" != "user-held" ] \
+           && ! { [ "$class" = "unidentifiable" ] && [ "${MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN:-0}" = "1" ]; }; then
+        # The opt-in that makes the wrappers accept an unidentifiable token
+        # lets it continue through the same login, role and scope checks
+        # here, so the cached capability matches the verifier (Codex on #1541).
         reason="credential class is '$class'; its write identity cannot be established"
       else
         local repo_status has_perm private scopes

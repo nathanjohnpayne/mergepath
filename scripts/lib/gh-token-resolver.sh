@@ -95,10 +95,18 @@ gh_author_git_exec() { # <token> <git args...>
   case "$gh_bin" in
     *"'"*|*'\'*) echo "gh-as-author: refusing git: the gh path contains a quote or backslash." >&2; return 5 ;;
   esac
+  # Every inherited GIT_* variable is dropped, not a list of known ones:
+  # GIT_EXEC_PATH can substitute git-remote-https itself, GIT_TRACE_CURL with
+  # GIT_TRACE_REDACT=0 logs the Authorization header, and GIT_CONFIG_*,
+  # GIT_DIR and friends redirect config or repository (Codex on #1541). The
+  # runner then sets only its own.
+  local -a drop_git_env=()
+  local v
+  for v in $(compgen -e); do
+    case "$v" in GIT_*) drop_git_env+=(-u "$v") ;; esac
+  done
   home="$(mktemp -d "${TMPDIR:-/tmp}/gh-as-author-git-home.XXXXXX")" || return 1
-  env -u GITHUB_TOKEN -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT -u GIT_CONFIG \
-    -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE -u GIT_NAMESPACE \
-    -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_CEILING_DIRECTORIES \
+  env -u GITHUB_TOKEN ${drop_git_env[@]+"${drop_git_env[@]}"} \
     HOME="$home" XDG_CONFIG_HOME="$home/.config" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
     GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= SSH_ASKPASS= \
     GH_TOKEN="$token" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \

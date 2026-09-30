@@ -110,6 +110,7 @@ case "$tok" in
   ghp_noscope) login=nathanjohnpayne; scopes="gist, read:org"; perms='{"pull":true,"push":true}' ;;
   ghp_pubonly) login=nathanjohnpayne; scopes="public_repo"; perms='{"pull":true,"push":true}' ;;
   ghs_author) login=nathanjohnpayne ;;
+  opaque-author) login=nathanjohnpayne; perms='{"pull":true,"push":true}' ;;  # unidentifiable form
   0123456789abcdef0123456789abcdef01234567) login=nathanpayne-claude; scopes="repo" ;;  # legacy classic PAT
   proxy-injected) login=nathanjohnpayne; perms='{"pull":true,"push":true}' ;;
 esac
@@ -967,6 +968,25 @@ if [ "$case_rc" -eq 0 ] && [ "$host_rc" -eq 2 ]; then
   pass "#1540: a cross-repo casing change keeps the cache; a GH_HOST change invalidates it"
 else
   fail "#1540: casing=$case_rc gh_host=$host_rc"
+fi
+
+# Codex on #1541: with the opt-in, an unidentifiable token is not denied on
+# its class; it continues through the same login, role and scope checks.
+set +e
+run_probe OP_PREFLIGHT_AUTHOR_PAT=opaque-author -- --no-cache >"$WORKDIR/opaque.json" 2>/dev/null
+run_probe OP_PREFLIGHT_AUTHOR_PAT=opaque-author MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1 -- --no-cache >"$WORKDIR/opaque-in.json" 2>/dev/null
+set -e
+r_off="$(jq -r '.capabilities["author-writes"].reason' "$WORKDIR/opaque.json")"
+r_on="$(jq -r '.capabilities["author-writes"].reason' "$WORKDIR/opaque-in.json")"
+# Without the opt-in the resolver refuses the token outright; with it, the
+# probe measures it through the login/role/scope checks (here it verifies the
+# login and then stops on unreadable token permissions), never on its class.
+if [ "$(jq -r '.capabilities["author-writes"].granted' "$WORKDIR/opaque.json")" = "false" ] \
+   && ! printf '%s' "$r_on" | grep -q "cannot be established" \
+   && printf '%s' "$r_on" | grep -q "^verified nathanjohnpayne"; then
+  pass "opt-in: an unidentifiable token is measured through login/role/scope checks, not denied on its class"
+else
+  fail "opt-in grant: off=$r_off on=$r_on"
 fi
 
 # Codex on #1541: the write-token opt-in is part of the cache identity.
