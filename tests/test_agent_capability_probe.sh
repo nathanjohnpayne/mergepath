@@ -107,6 +107,7 @@ case "$tok" in
   ghp_noscope) login=nathanjohnpayne; scopes="gist, read:org"; perms='{"pull":true,"push":true}' ;;
   ghp_pubonly) login=nathanjohnpayne; scopes="public_repo"; perms='{"pull":true,"push":true}' ;;
   ghs_author) login=nathanjohnpayne ;;
+  0123456789abcdef0123456789abcdef01234567) login=nathanpayne-claude; scopes="repo" ;;  # legacy classic PAT
   proxy-injected) login=nathanjohnpayne; perms='{"pull":true,"push":true}' ;;
 esac
 status=200; body=""
@@ -341,6 +342,17 @@ if [ "$(cap "$WORKDIR/app-kr.json" author-writes)" = "false" ] \
   pass "ghs_ token in the keyring only: author-writes refused, class app-installed (not empty)"
 else
   fail "keyring ghs_ token: $(jq -c '.capabilities["author-writes"]' "$WORKDIR/app-kr.json")"
+fi
+
+# A rejected legacy 40-hex PAT is classified with its own response headers, so
+# it reads user-held and does not mask the keyring's app token (Codex on #1541).
+set +e
+run_probe GH_TOKEN=0123456789abcdef0123456789abcdef01234567 STUB_KEYRING_nathanjohnpayne=ghs_author -- --no-cache >"$WORKDIR/app-hex.json" 2>/dev/null
+set -e
+if [ "$(jq -r '.capabilities["author-writes"].credential_class' "$WORKDIR/app-hex.json")" = "app-installed" ]; then
+  pass "legacy PAT ahead of a keyring ghs_ token: classified with its headers, app-installed reported"
+else
+  fail "legacy PAT masking: $(jq -c '.capabilities["author-writes"]' "$WORKDIR/app-hex.json")"
 fi
 
 # ---------------------------------------------------------------------------

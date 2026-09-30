@@ -360,19 +360,17 @@ fi
 
 write_case "app installation token that reads as the login" 3 ghs_x STUB_TOKEN_LOGIN=nathanjohnpayne
 
-# Codex P1 on #1541: gh sends GH_TOKEN only to github.com, so a different
-# Enterprise credential or a GH_HOST elsewhere would carry a write this check
-# never classified. Refused before GET /user; the same token, or github.com in
-# any case, is fine.
-write_case "different GH_ENTERPRISE_TOKEN" 3 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_ENTERPRISE_TOKEN=ghp_other
-if [ -s "$WORKDIR/api.log" ] || ! printf '%s' "$WRITE_OUT" | grep -q "GH_ENTERPRISE_TOKEN holds a different credential"; then
-  fail "--expect-write-identity enterprise token: not refused before GET /user; output: $WRITE_OUT"
-else
-  pass "--expect-write-identity enterprise token: refused before any API call"
-fi
-write_case "different GITHUB_ENTERPRISE_TOKEN" 3 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GITHUB_ENTERPRISE_TOKEN=gho_other
-write_case "Enterprise token equal to GH_TOKEN" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_ENTERPRISE_TOKEN=ghp_x GITHUB_ENTERPRISE_TOKEN=ghp_x
+# Codex on #1541: a GH_HOST elsewhere would verify, and then write, against
+# another server, so it is refused before GET /user; github.com in any case is
+# fine. A separate Enterprise login is not refused: gh uses it only for an
+# Enterprise Server target, and the wrappers overwrite it with a sentinel.
+write_case "separate GH_ENTERPRISE_TOKEN" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_ENTERPRISE_TOKEN=ghp_other GITHUB_ENTERPRISE_TOKEN=gho_other
 write_case "GH_HOST on an Enterprise Server" 3 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_HOST=ghe.example.com
+if [ -s "$WORKDIR/api.log" ]; then
+  fail "--expect-write-identity GH_HOST: GET /user was called before the refusal"
+else
+  pass "--expect-write-identity GH_HOST: refused before any API call"
+fi
 write_case "GH_HOST=GitHub.com" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_HOST=GitHub.com
 write_case "opaque token that reads as the login" 3 some-token STUB_TOKEN_LOGIN=nathanjohnpayne
 write_case "opaque token with the opt-in" 0 some-token STUB_TOKEN_LOGIN=nathanjohnpayne MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1

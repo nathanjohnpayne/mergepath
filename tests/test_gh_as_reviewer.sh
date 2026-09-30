@@ -255,7 +255,7 @@ fi
 
 # Codex P1 on #1541: gh reads GH_ENTERPRISE_TOKEN / GITHUB_ENTERPRISE_TOKEN,
 # not GH_TOKEN, for an Enterprise Server target. The write runs with both
-# set to a non-credential sentinel, and an ambient different one stops it.
+# set to a non-credential sentinel; an ambient separate login is overwritten.
 reset_log
 : >"$WORKDIR/ent.log"
 set +e
@@ -269,16 +269,17 @@ else
   fail "enterprise pinning: rc=$rc log=$(cat "$WORKDIR/ent.log")"
 fi
 reset_log
+: >"$WORKDIR/ent.log"
 set +e
-GH_ENTERPRISE_TOKEN="ghp_other-token" OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" STUB_NO_KEYRING=1 \
-  run_wrapper -- gh pr comment 123 --body "x" >/dev/null 2>&1
+STUB_ENT_LOG="$WORKDIR/ent.log" GH_ENTERPRISE_TOKEN="ghp_other-token" GITHUB_ENTERPRISE_TOKEN="gho_other-token" \
+  OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" run_wrapper -- gh pr comment 123 --body "x" >/dev/null 2>&1
 rc=$?
 set -e
-if [ "$rc" -ne 0 ] && ! grep -q $'gh\tpr\tcomment' "$WORKDIR/calls.log"; then
-  pass "ambient different GH_ENTERPRISE_TOKEN: refused, no write"
+if [ "$rc" -eq 0 ] && grep -qx 'mergepath-guarded-write-github-com-only|mergepath-guarded-write-github-com-only|pr comment' "$WORKDIR/ent.log" \
+   && ! grep -q 'other-token|.*|pr comment\|.*|other-token|pr comment' "$WORKDIR/ent.log"; then
+  pass "ambient separate Enterprise login: the write proceeds and never sees it"
 else
-  fail "ambient enterprise token: rc=$rc"
-  cat "$WORKDIR/calls.log" >&2
+  fail "ambient enterprise token: rc=$rc log=$(cat "$WORKDIR/ent.log")"
 fi
 
 # #1539: the surface does not select the reviewer, so the wrapper, the

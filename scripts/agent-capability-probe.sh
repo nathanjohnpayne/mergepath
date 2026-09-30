@@ -477,21 +477,22 @@ measure_write() {
       else
         tried=("${GH_TOKEN:-}" "$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --user "$identity" 2>/dev/null || true)")
       fi
+      # Each candidate is classified with its own repeat response's headers,
+      # which a legacy 40-hex PAT needs (its X-OAuth-Scopes); without them it
+      # would read unidentifiable and could mask a later app-installed one
+      # (Codex on #1541).
       class="empty"
-      for candidate in "${tried[@]}"; do
-        [ -n "$candidate" ] || continue
-        cand_class="$(credential_class "$candidate")"
-        if [ "$class" = "empty" ] || { [ "$class" = "user-held" ] && [ "$cand_class" != "user-held" ]; }; then
-          class="$cand_class"
-        fi
-      done
       for candidate in "${tried[@]}"; do
         [ -n "$candidate" ] || continue
         n=$((n + 1))
         repeat_status="$(api_request "$candidate" GET user "$WORKDIR/resolve-user-$n")"
         repeat_login="$(jq -r '.login // empty' "$WORKDIR/resolve-user-$n.body" 2>/dev/null || true)"
+        cand_class="$(credential_class "$candidate" "$WORKDIR/resolve-user-$n.headers")"
+        if [ "$class" = "empty" ] || { [ "$class" = "user-held" ] && [ "$cand_class" != "user-held" ]; }; then
+          class="$cand_class"
+        fi
         if [ "$repeat_status" = "200" ] && [ "$repeat_login" = "$identity" ] \
-           && [ "$(credential_class "$candidate" "$WORKDIR/resolve-user-$n.headers")" = "user-held" ]; then
+           && [ "$cand_class" = "user-held" ]; then
           echo "resolver for $identity failed, then candidate $n verified on repeat" >>"$WORKDIR/transient"
         fi
       done

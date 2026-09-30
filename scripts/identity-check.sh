@@ -214,18 +214,14 @@ if [ "$MODE" = "write" ]; then
     echo "identity-check: GH_TOKEN is empty/unset; cannot verify write identity." >&2
     exit 3
   fi
-  # gh sends GH_TOKEN only to github.com. A GitHub Enterprise Server host gets
-  # GH_ENTERPRISE_TOKEN or GITHUB_ENTERPRISE_TOKEN instead, and GH_HOST moves
-  # every bare call to another server. Either would let a later write run
-  # under a credential this check never classified (Codex P1 on #1541), so
-  # write identity is established for github.com only.
-  for ENT_VAR in GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN; do
-    if [ -n "${!ENT_VAR:-}" ] && [ "${!ENT_VAR}" != "$GH_TOKEN" ]; then
-      echo "identity-check: BLOCKED $ENT_VAR holds a different credential than GH_TOKEN." >&2
-      echo "identity-check:   gh would use it for an Enterprise Server target, so a write could land under an unverified identity. Unset it for guarded writes." >&2
-      exit 3
-    fi
-  done
+  # gh sends GH_TOKEN only to github.com, and GH_HOST moves every bare call to
+  # another server, where a later write would run under a credential this
+  # check never classified (Codex P1 on #1541). Write identity is therefore
+  # established for github.com only. GH_ENTERPRISE_TOKEN and
+  # GITHUB_ENTERPRISE_TOKEN are not refused here: gh uses them only for an
+  # Enterprise Server target, and the guarded-write wrappers overwrite both
+  # with a non-credential sentinel, so an operator's separate GHES login
+  # neither carries a guarded write nor blocks one (Codex on #1541).
   WRITE_HOST="$(printf '%s' "${GH_HOST:-github.com}" | tr '[:upper:]' '[:lower:]')"
   if [ "$WRITE_HOST" != "github.com" ]; then
     echo "identity-check: BLOCKED GH_HOST is '$GH_HOST'; write identity is established for github.com only." >&2
