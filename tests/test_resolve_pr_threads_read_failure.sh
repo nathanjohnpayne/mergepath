@@ -203,6 +203,38 @@ else
   bad "nested refusal: rc=$nest_rc output: $nest_out"
 fi
 
+# End to end: the thread enumeration is served, but the full-comment refetch
+# for a truncated thread (60 comments, 50-comment window) is refused, with the
+# refusal only in the response BODY that gh writes to stdout. Every resolve
+# mode must end with 6 and resolve nothing (CodeRabbit and Codex on #1529).
+cat >"$STUB_DIR/gh" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"node(id"*) echo '{"message":"This GraphQL query is not enabled for this session"}'; echo 'gh: HTTP 403' >&2; exit 1 ;;
+  *resolveReviewThread*|*addPullRequestReviewThreadReply*) echo "MUTATION-ATTEMPTED" >&2; exit 1 ;;
+  *reviewThreads*) cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"PRRT_1","isResolved":false,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a.sh","body":"finding","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc123"}}]},"allComments":{"totalCount":60,"pageInfo":{"hasPreviousPage":true},"nodes":[{"author":{"login":"coderabbitai"},"body":"finding","databaseId":1,"createdAt":"2026-01-01T00:00:00Z"}]}}]}}}}}
+JSON
+  exit 0 ;;
+  *".head.sha"*) echo abc123; exit 0 ;;
+esac
+echo '[]'
+STUB
+chmod +x "$STUB_DIR/gh"
+for mode in --resolve-actioned --auto-resolve-bots; do
+  ( cd "$ROOT" \
+    && PATH="$STUB_DIR:$PATH" GH_RETRY_BACKOFF_SECONDS=0 GH_RETRY_ATTEMPTS=2 \
+       OP_PREFLIGHT_REVIEWER_PAT=stub-token RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+       bounded 60 bash "$SCRIPT" 999 --repo owner/name "$mode" ) >"$STUB_DIR/refetch.out" 2>&1
+  r_rc=$?
+  if [ "$r_rc" -eq 6 ] && grep -q "CEILING — re-fetching the full comment history of review thread PRRT_1" "$STUB_DIR/refetch.out" \
+     && ! grep -q "MUTATION-ATTEMPTED" "$STUB_DIR/refetch.out"; then
+    ok "$mode: a refused comment refetch (body-only refusal) ends the run with 6 before any mutation"
+  else
+    bad "$mode: refused refetch exited $r_rc; output: $(cat "$STUB_DIR/refetch.out")"
+  fi
+done
+
 echo
 echo "test_resolve_pr_threads_read_failure: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
