@@ -46,7 +46,9 @@
 #                      classic token)
 #   reviewer-writes    the same, for the reviewer identity
 #                      (GH_AS_REVIEWER_IDENTITY / MERGEPATH_AGENT / default),
-#                      with `pull`: reviews and comments need read access
+#                      with `push`: an approval that satisfies branch
+#                      protection and review-thread resolution both need
+#                      write access (#1537)
 #
 # Tier: the comma-joined set of granted capabilities other than read, in the
 # order above; `read-only` when read is the only one; `none` when nothing is
@@ -170,7 +172,38 @@ if [ -f "$ROOT/.github/review-policy.yml" ]; then
   policy_author="$(grep -m1 '^author_identity:' "$ROOT/.github/review-policy.yml" | awk '{print $2}' | sed -E "s/^[\"']//; s/[\"']\$//" || true)"
   [ -n "$policy_author" ] && AUTHOR_IDENTITY="$policy_author"
 fi
+# A Codex cloud environment configured by the recipe sets only
+# MERGEPATH_AGENT_SURFACE=codex-cloud; without an explicit agent the resolver's
+# default reviewer would be nathanpayne-claude (#1537). The surface names the
+# agent, so it selects the reviewer when nothing more specific does.
+if [ -z "${GH_AS_REVIEWER_IDENTITY:-}${MERGEPATH_AGENT:-}${OP_PREFLIGHT_AGENT:-}" ] \
+   && [ "${MERGEPATH_AGENT_SURFACE:-}" = "codex-cloud" ]; then
+  MERGEPATH_AGENT=codex
+  export MERGEPATH_AGENT
+fi
 REVIEWER_IDENTITY="$(gh_default_reviewer_identity)"
+
+# A non-secret fingerprint of the credential environment the write
+# measurements depend on (#1537): which of the three token sources are set,
+# and a truncated SHA-256 of each value. Two shells for the same reviewer with
+# different credentials then never share a cached answer. Only a hash prefix
+# of each token is ever computed, and it is never printed.
+credential_fingerprint() {
+  local var val h out=""
+  for var in OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT GH_TOKEN; do
+    val="${!var:-}"
+    if [ -z "$val" ]; then
+      h="-"
+    elif command -v shasum >/dev/null 2>&1; then
+      h="$(printf '%s' "$val" | shasum -a 256 | cut -c1-16)"
+    else
+      h="$(printf '%s' "$val" | sha256sum | cut -c1-16)"
+    fi
+    out="$out$var:$h;"
+  done
+  printf '%s' "$out"
+}
+CREDENTIAL_FINGERPRINT="$(credential_fingerprint)"
 
 # The write capabilities are facts about two identities, so the cache is keyed
 # on them as well as the repo: local agents share the cache directory, and a
@@ -224,7 +257,8 @@ if [ "$MODE" = "check" ]; then
       . as $r
       | ($r.repo | type == "string")
         and ($r.surface | type == "string")
-        and ($r.measured_at_epoch | type == "number")
+        and ($r.measured_at_epoch | type == "number" and . >= 0 and . < 100000000000 and floor == .)
+        and (($r.credential_fingerprint // "") | type == "string")
         and (($r.session_id // "") | type == "string")
         and (($r.cross_repo_target // "") | type == "string")
         and ($r.tier | type == "string" and test("^[a-z,-]+$"))
@@ -248,6 +282,9 @@ if [ "$MODE" = "check" ]; then
   cached_cross="$(snap -r '.cross_repo_target // empty')" || die 2 "capability cache for $REPO could not be read; re-run the probe"
   [ "$cached_cross" = "$CROSS_REPO" ] \
     || die 2 "capability cache measured cross-repo against '$cached_cross', this check asks about '$CROSS_REPO'; re-run the probe"
+  cached_fp="$(snap -r '.credential_fingerprint // empty')" || die 2 "capability cache for $REPO could not be read; re-run the probe"
+  [ "$cached_fp" = "$CREDENTIAL_FINGERPRINT" ] \
+    || die 2 "capability cache was measured with different credentials in the environment; re-run the probe"
   cached_author="$(snap -r '.capabilities["author-writes"].identity // empty')" || die 2 "capability cache for $REPO could not be read; re-run the probe"
   cached_reviewer="$(snap -r '.capabilities["reviewer-writes"].identity // empty')" || die 2 "capability cache for $REPO could not be read; re-run the probe"
   [ "$cached_author" = "$AUTHOR_IDENTITY" ] && [ "$cached_reviewer" = "$REVIEWER_IDENTITY" ] \
@@ -360,9 +397,10 @@ api_request() {
 # resolver already verifies GET /user; the class check is what catches a
 # brokered credential that reads as the right user and writes as a bot.
 # Identity alone is not write capability (Codex P1 on #1526): the token must
-# also see <required permission> on the repository (`push` for the author,
-# who creates and merges PRs; `pull` for a reviewer, whose reviews and
-# comments need only read access), and the token's own X-OAuth-Scopes must
+# also see <required permission> on the repository (`push` for both: the
+# author creates and merges PRs, and a reviewer's approval must satisfy branch
+# protection and resolve review threads, which read access cannot, #1537),
+# and the token's own X-OAuth-Scopes must
 # be readable and carry `repo` (or `public_repo` on a public repository). A
 # fine-grained or app-user token sends no scopes header and GitHub offers no
 # way to read its own permissions, so for one the capability is reported
@@ -520,7 +558,8 @@ else
 fi
 
 # cross-repo
-if [ "$CROSS_REPO" = "$REPO" ]; then
+# Repository names are case-insensitive on GitHub (#1537).
+if [ "$(printf '%s' "$CROSS_REPO" | tr 'A-Z' 'a-z')" = "$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')" ]; then
   cap_json false not-measured "cross-repo target is this repository; pass --cross-repo" "$WORKDIR/cap-cross-repo.json"
 elif ! $HAVE_TRANSPORT; then
   cap_json false measured "neither gh nor curl is available" "$WORKDIR/cap-cross-repo.json"
@@ -548,7 +587,7 @@ else
 fi
 
 measure_write "$AUTHOR_IDENTITY" "OP_PREFLIGHT_AUTHOR_PAT" push "$WORKDIR/cap-author-writes.json"
-measure_write "$REVIEWER_IDENTITY" "OP_PREFLIGHT_REVIEWER_PAT" pull "$WORKDIR/cap-reviewer-writes.json"
+measure_write "$REVIEWER_IDENTITY" "OP_PREFLIGHT_REVIEWER_PAT" push "$WORKDIR/cap-reviewer-writes.json"
 
 # --- assemble -------------------------------------------------------------
 
@@ -587,6 +626,7 @@ RESULT="$(jq -n \
   --arg ambient_var "$AMBIENT_VAR" --arg ambient_class "$AMBIENT_CLASS" \
   --arg cross "$CROSS_REPO" \
   --arg tier "$TIER" \
+  --arg fp "$CREDENTIAL_FINGERPRINT" \
   --argjson transient "$TRANSIENT" \
   --slurpfile read "$WORKDIR/cap-read.json" \
   --slurpfile author "$WORKDIR/cap-author-writes.json" \
@@ -597,6 +637,7 @@ RESULT="$(jq -n \
   '{
      schema: $schema,
      measured_at_epoch: $now,
+     credential_fingerprint: $fp,
      repo: $repo,
      head_sha: $head,
      surface: $surface,
