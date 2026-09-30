@@ -672,6 +672,81 @@ else
   fail "no-lease cleanup lost its bound-head failure fallback: $(cat "$GH_LOG")"
 fi
 
+# The bind step (Resolve the source PR) retries the resolver's retryable
+# rc 3 on the same bounded schedule as the failure publisher, and stops on the
+# rc 0 / rc 4 verdicts. The failure publisher exits 0 for a positively bound PR
+# that does not use the relay: its native gate job owns the PR-head check.
+BIND="$TMP/bind.sh"
+awk '
+  /name: Resolve the source PR and read-only boundary/ { active=1 }
+  active && /^      - name: Publish a PR-head failure when source resolution errors/ { exit }
+  active && /^        run: \|$/ { body=1; next }
+  body { sub(/^          /, ""); print }
+' "$ROOT/.github/workflows/codex-feedback-archive-relay.yml" >"$BIND"
+[ -s "$BIND" ] || { echo "could not extract relay bind step" >&2; exit 1; }
+chmod +x "$BIND"
+NOSLEEP="$TMP/nosleep-bin"
+mkdir -p "$NOSLEEP"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"$SLEEP_LOG"\n' >"$NOSLEEP/sleep"
+chmod +x "$NOSLEEP/sleep"
+# A stub resolver: fails with FLAKY_RC for the first FLAKY_FAILS calls, then
+# prints a bound JSON verdict (requires_relay=$STUB_REQUIRES_RELAY).
+FLAKY="$TMP/flaky-resolver.sh"
+cat >"$FLAKY" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+n=$(( $(cat "$FLAKY_COUNT" 2>/dev/null || echo 0) + 1 ))
+printf '%s\n' "$n" >"$FLAKY_COUNT"
+if [ "$n" -le "${FLAKY_FAILS:-0}" ]; then
+  echo "flaky resolver: simulated HTTP 502" >&2
+  exit "${FLAKY_RC:-3}"
+fi
+jq -nc --arg head "$STUB_HEAD" --argjson rr "${STUB_REQUIRES_RELAY:-true}" \
+  '{publish_head_sha:$head, is_fork:false, requires_relay:$rr, pr_actor:"nathanjohnpayne", source_event:"pull_request", source_head_sha:$head}'
+SH
+chmod +x "$FLAKY"
+jq -n '{workflow_run:{id:501,display_title:"Codex P1 Gate relay-v1 PR #41"}}' >"$TMP/bind-event.json"
+run_bind() {  # <fails> <rc>
+  : >"$TMP/bind-output"; : >"$TMP/sleep.log"; rm -f "$TMP/flaky.count"
+  set +e
+  PATH="$NOSLEEP:$PATH" SLEEP_LOG="$TMP/sleep.log" FLAKY_COUNT="$TMP/flaky.count" \
+    FLAKY_FAILS="$1" FLAKY_RC="$2" STUB_HEAD="$PUBLISH" STUB_REQUIRES_RELAY=true \
+    GITHUB_EVENT_PATH="$TMP/bind-event.json" GITHUB_OUTPUT="$TMP/bind-output" \
+    REPO="$BASE_REPO" SOURCE_RUN_ID=501 SOURCE_RESOLVER="$FLAKY" "$BIND" \
+    >"$TMP/bind.out" 2>"$TMP/bind.err"
+  BIND_RC=$?
+  set -e
+  BIND_CALLS=$(cat "$TMP/flaky.count" 2>/dev/null || echo 0)
+}
+run_bind 2 3
+assert_eq "$BIND_RC" 0 "bind step survives two transient resolver failures"
+assert_eq "$BIND_CALLS" 3 "bind step makes exactly three resolver attempts"
+assert_eq "$(sed -n 's/^source_bound=//p' "$TMP/bind-output")" true "bind step arms source_bound after a retried bind"
+assert_eq "$(sed -n 's/^head_sha=//p' "$TMP/bind-output")" "$PUBLISH" "bind step publishes the resolver's head after a retried bind"
+assert_eq "$(tr '\n' ' ' <"$TMP/sleep.log")" "5 10 " "bind step backs off between attempts only"
+run_bind 3 3
+assert_eq "$BIND_RC" 3 "bind step still fails after three transient failures"
+assert_eq "$BIND_CALLS" 3 "bind step stops at three attempts"
+assert_eq "$(tr '\n' ' ' <"$TMP/sleep.log")" "5 10 " "bind step does not sleep after the last attempt"
+run_bind 1 4
+assert_eq "$BIND_RC" 0 "bind step treats a not-bound verdict as terminal and inert"
+assert_eq "$BIND_CALLS" 1 "bind step does not retry the rc 4 verdict"
+assert_eq "$(sed -n 's/^source_bound=//p' "$TMP/bind-output")" false "not-bound verdict leaves source_bound=false"
+
+: >"$GH_LOG"
+set +e
+jq -n '{workflow_run:{id:501,display_title:"Codex P1 Gate relay-v1 PR #41"}}' >"$TMP/event.json"
+rm -f "$TMP/flaky.count"
+PATH="$NOSLEEP:$BIN:$PATH" GH_LOG="$GH_LOG" SLEEP_LOG="$TMP/sleep.log" \
+  FLAKY_COUNT="$TMP/flaky.count" FLAKY_FAILS=0 STUB_HEAD="$PUBLISH" STUB_REQUIRES_RELAY=false \
+  GITHUB_EVENT_PATH="$TMP/event.json" RUNNER_TEMP="$TMP" REPO="$BASE_REPO" \
+  SOURCE_RESOLVER="$FLAKY" SOURCE_RUN_ID=501 CHECK_NAME='Codex P1 unresolved threads' "$RECOVERY" \
+  >"$TMP/recovery.out" 2>"$TMP/recovery.err"
+RECOVERY_RC=$?
+set -e
+assert_eq "$RECOVERY_RC" 0 "failure publisher exits 0 for a bound PR that does not use the relay"
+assert_empty_writes "failure publisher makes no write for a PR that does not use the relay"
+
 if [ "$FAIL" -ne 0 ]; then
   printf 'feedback-archive-relay-source: FAIL (%s failed, %s passed)\n' "$FAIL" "$PASS" >&2
   exit 1

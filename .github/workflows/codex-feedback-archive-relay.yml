@@ -126,11 +126,25 @@ jobs:
               ;;
           esac
           source_run=$(jq -c '.workflow_run' "$GITHUB_EVENT_PATH")
-          set +e
-          binding=$(printf '%s' "$source_run" \
-            | "$SOURCE_RESOLVER" "$REPO" "$pr")
-          bind_rc=$?
-          set -e
+          # The resolver's rc 3 means an API read was indeterminate and may be
+          # retried; rc 0 (bound) and rc 4 (positively not bound) are verdicts.
+          # A single transient 5xx here used to fail the whole relay and leave
+          # the required gate to the 15-minute sweep, so retry on the same
+          # bounded schedule the failure publisher below already uses.
+          binding=""
+          bind_rc=3
+          for attempt in 1 2 3; do
+            set +e
+            binding=$(printf '%s' "$source_run" \
+              | "$SOURCE_RESOLVER" "$REPO" "$pr")
+            bind_rc=$?
+            set -e
+            [ "$bind_rc" -eq 0 ] && break
+            [ "$bind_rc" -eq 4 ] && break
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 5))
+            fi
+          done
           if [ "$bind_rc" -eq 4 ]; then
             echo "Source run $SOURCE_RUN_ID is not positively bound to PR #$pr; leaving the title-selected target inert."
             echo "source_bound=false" >> "$GITHUB_OUTPUT"
@@ -198,8 +212,10 @@ jobs:
           head_sha=$(jq -r '.publish_head_sha' <<<"$binding")
           requires_relay=$(jq -r '.requires_relay' <<<"$binding")
           if [ "$requires_relay" != true ]; then
+            # A positive verdict, not a failure: this PR's native gate job owns
+            # its PR-head check, so there is nothing for the relay to retract.
             echo "PR #$pr does not use the read-only relay; its native gate job owns the PR-head check."
-            exit 1
+            exit 0
           fi
           if [ -z "$head_sha" ]; then
             echo "::error::Could not recover the head SHA for PR #$pr"

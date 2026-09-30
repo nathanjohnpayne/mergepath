@@ -64,8 +64,11 @@ gh_is_pr_create_command() {
         while [ "$#" -gt 0 ]; do
           case "$1" in
             --) shift; consumed=$((consumed + 1)); break ;;
-            *=*) shift; consumed=$((consumed + 1)) ;;
+            # Before `*=*`: `--split-string=STR` also contains `=`, and the
+            # assignment arm would otherwise skip it as NAME=VALUE and go on
+            # to classify the trailing argv, which env -S rewrites at runtime.
             -S|--split-string|--split-string=*) return 1 ;;
+            *=*) shift; consumed=$((consumed + 1)) ;;
             *)
               if gh_prefix_flag_takes_value "$prefix" "$1"; then
                 [ "$#" -ge 2 ] || return 1
