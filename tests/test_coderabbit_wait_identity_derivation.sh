@@ -69,6 +69,7 @@ set -euo pipefail
 state_dir=${CODERABBIT_TEST_STATE_DIR:?}
 [ "${1:-}" = "--expect-write-identity" ] || exit 2
 printf '%s\n' "${2:-}" >>"$state_dir/identity-args"
+printf '%s\n' "${GH_TOKEN:-}" >>"$state_dir/identity-token"
 [ "${2:-}" = "${CODERABBIT_TEST_TOKEN_LOGIN:?}" ] || exit 1
 exit 0
 EOF
@@ -211,6 +212,9 @@ run_case() {
     if [ -n "$explicit_identity" ]; then
       env_args+=(GH_AS_REVIEWER_IDENTITY="$explicit_identity")
     fi
+    if [ -n "${RUN_CASE_REVIEWER_PAT:-}" ]; then
+      env_args+=(OP_PREFLIGHT_REVIEWER_PAT="$RUN_CASE_REVIEWER_PAT")
+    fi
     env -u MERGEPATH_AGENT -u OP_PREFLIGHT_AGENT -u GH_AS_REVIEWER_IDENTITY \
       "${env_args[@]}" \
       ./scripts/coderabbit-wait.sh 999 owner/repo \
@@ -338,7 +342,22 @@ test_453_shared_reviewers_helper() {
   fi
 }
 
+# CodeRabbit on #1541: the identity check verifies the token gh_reviewer
+# signs with (the reviewer PAT when cached), not an unrelated GH_TOKEN.
+test_checks_the_reviewer_pat_not_gh_token() {
+  local dir rc tok
+  dir=$(make_case "reviewer-pat")
+  rc=$(RUN_CASE_REVIEWER_PAT=cached-reviewer-pat run_case "$dir" nathanpayne-codex nathanpayne-codex)
+  tok=$(state_file "$dir" identity-token)
+  if [ "$tok" = "cached-reviewer-pat" ]; then
+    pass "identity check verifies the cached reviewer PAT the write will use (rc=$rc)"
+  else
+    fail "identity check verified '$tok', expected the cached reviewer PAT; stderr=$(cat "$dir/err.log")"
+  fi
+}
+
 test_453_shared_reviewers_helper
+test_checks_the_reviewer_pat_not_gh_token
 test_derives_identity_from_allow_listed_token
 test_derives_identity_from_quoted_commented_entry
 test_non_allow_listed_token_fails_closed
