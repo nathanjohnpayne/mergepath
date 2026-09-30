@@ -520,11 +520,24 @@ jobs:
             # A FAILED lookup withholds too (cross-agent round 4): unknown
             # freshness is possibly-stale, and defaulting to "no newer
             # pending" would let this pass overwrite a hold it never saw.
-            local newer
-            if ! newer=$(gh api --paginate -X GET "repos/$REPO/commits/$head/check-runs" \
-              -f check_name="$context" -f filter=latest -f per_page=100 \
-              --jq ".check_runs[] | select(.status != \"completed\") | select(.started_at >= \"$PASS_START\") | .id"); then
-              echo "::error::Freshness lookup failed for $context on $head; withholding this verdict (fail closed)."
+            # Retried on the same bounded schedule as open_holds above: a
+            # single transient 5xx here used to withhold the verdict AND fail
+            # the whole pass. Only a lookup that fails all three attempts
+            # withholds (still fail closed).
+            local newer fresh_attempt fresh_ok=0
+            for fresh_attempt in 1 2 3; do
+              if newer=$(gh api --paginate -X GET "repos/$REPO/commits/$head/check-runs" \
+                -f check_name="$context" -f filter=latest -f per_page=100 \
+                --jq ".check_runs[] | select(.status != \"completed\") | select(.started_at >= \"$PASS_START\") | .id"); then
+                fresh_ok=1
+                break
+              fi
+              if [ "$fresh_attempt" -lt 3 ]; then
+                sleep "$fresh_attempt"
+              fi
+            done
+            if [ "$fresh_ok" -ne 1 ]; then
+              echo "::error::Freshness lookup failed for $context on $head after 3 attempts; withholding this verdict (fail closed)."
               had_infra_error=1
               return 0
             fi

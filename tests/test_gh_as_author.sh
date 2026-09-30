@@ -52,6 +52,22 @@ assert_allowed_source() {
   fi
 }
 
+# gh_is_pr_create_command must refuse every env split-string spelling,
+# including the attached `--split-string=STR` form that also matches the
+# NAME=VALUE assignment pattern (shellcheck SC2221/SC2222 ordering).
+for split_form in "-S" "--split-string" "--split-string=gh pr create"; do
+  if gh_is_pr_create_command env "$split_form" gh pr create --title t; then
+    fail "pr-create classifier accepted env $split_form"
+  else
+    pass "pr-create classifier refuses env $split_form"
+  fi
+done
+if gh_is_pr_create_command env GH_TOKEN=x gh pr create --title t; then
+  pass "pr-create classifier still skips a plain env NAME=VALUE assignment"
+else
+  fail "pr-create classifier over-rejected env NAME=VALUE"
+fi
+
 assert_prohibited_source "bare native merge" 'gh pr merge 7 --squash'
 assert_prohibited_source "path-qualified native merge" '/opt/bin/gh pr merge 7'
 assert_prohibited_source "prefixed native merge" 'env GH_TOKEN=x gh pr merge 7'

@@ -68,12 +68,28 @@ cat >"$TMP/gh" <<'SH'
 printf '%s\n' "$*" >>"$GH_CALL_LOG"
 case "$*" in
   *"-X POST"*"/check-runs"*) printf '{}\n' ;;
-  *"/commits/"*"/check-runs"*) exit 0 ;;
+  *"/commits/"*"/check-runs"*)
+    # FRESH_FAILS_FILE holds how many freshness lookups still fail (a
+    # simulated transient 502) before the endpoint answers normally.
+    if [ -n "${FRESH_FAILS_FILE:-}" ] && [ -s "$FRESH_FAILS_FILE" ]; then
+      left=$(cat "$FRESH_FAILS_FILE")
+      if [ "$left" -gt 0 ]; then
+        printf '%s\n' $((left - 1)) >"$FRESH_FAILS_FILE"
+        echo "HTTP 502: Bad Gateway" >&2
+        exit 1
+      fi
+    fi
+    exit 0
+    ;;
   *"/pulls/"*" --jq .head.sha"*) printf '%s\n' abc123 ;;
   *) echo "unexpected gh call: $*" >&2; exit 2 ;;
 esac
 SH
 chmod +x "$TMP/gh"
+# The freshness retry backs off between attempts; record instead of waiting.
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"$TMP_SLEEP_LOG"\n' >"$TMP/sleep"
+chmod +x "$TMP/sleep"
+export TMP_SLEEP_LOG="$TMP/sleep-log"
 
 # The real workflow declares no job- or step-wide summary flag. Clear a
 # developer's ambient export so only the extracted CodeRabbit caller can set it.
@@ -201,6 +217,36 @@ set +e
 case_rc=$?
 set -e
 record "recognized terminal result retires a prior rc-3 hold" "$case_rc"
+
+# Freshness lookup retry: two transient failures are absorbed and the verdict
+# still publishes; three consecutive failures withhold it (fail closed) and
+# flag the pass as an infra error.
+reset_case
+: >"$TMP_SLEEP_LOG"
+printf '2\n' >"$TMP/fresh-fails"
+FRESH_FAILS_FILE="$TMP/fresh-fails"; export FRESH_FAILS_FILE
+run_call "$MCG_CALL" >"$TMP/fresh-retry.out" 2>&1
+set +e
+[ "$(grep -c -- '/commits/abc123/check-runs' "$GH_CALL_LOG" || true)" -eq 3 ] \
+  && one_post && [ "$had_infra_error" -eq 0 ] \
+  && [ "$(tr '\n' ' ' <"$TMP_SLEEP_LOG")" = "1 2 " ]
+case_rc=$?
+set -e
+record "freshness lookup retries two transient failures and still publishes" "$case_rc"
+
+reset_case
+: >"$TMP_SLEEP_LOG"
+printf '3\n' >"$TMP/fresh-fails"
+run_call "$MCG_CALL" >"$TMP/fresh-exhausted.out" 2>&1
+set +e
+[ "$(grep -c -- '/commits/abc123/check-runs' "$GH_CALL_LOG" || true)" -eq 3 ] \
+  && [ "$(grep -c -- '-X POST .*check-runs' "$GH_CALL_LOG" || true)" -eq 0 ] \
+  && [ "$had_infra_error" -eq 1 ] \
+  && grep -q 'after 3 attempts; withholding' "$TMP/fresh-exhausted.out"
+case_rc=$?
+set -e
+record "freshness lookup that fails three times withholds the verdict (fail closed)" "$case_rc"
+unset FRESH_FAILS_FILE
 
 if [ "$fail" -ne 0 ]; then
   echo "$fail failed, $pass passed"

@@ -98,6 +98,27 @@ if [ "$1" = "api" ]; then
       cat "${FIXTURE_FILES:-/dev/null}"
       exit 0
       ;;
+    repos/*/pulls/*/commits*)
+      # Dependabot commit provenance. FIXTURE_COMMITS_FAIL=1 simulates an
+      # unreadable commits read. With no FIXTURE_COMMITS, synthesize the
+      # ordinary Dependabot shape (one commit on the PR head, authored by
+      # dependabot[bot], committed and signed by GitHub/web-flow) so the
+      # pre-existing Dependabot cases keep exercising the Dependabot rule.
+      if [ "${FIXTURE_COMMITS_FAIL:-0}" = "1" ]; then
+        echo "STUB gh: simulated PR commits API failure" >&2
+        exit 1
+      fi
+      if [ -n "${FIXTURE_COMMITS:-}" ]; then
+        cat "$FIXTURE_COMMITS"
+      else
+        jq -c '[{ sha: .head.sha,
+                  author: { login: "dependabot[bot]" },
+                  committer: { login: "web-flow" },
+                  commit: { verification: { verified: true, reason: "valid" } } }]' \
+          "${FIXTURE_PR:-/dev/null}"
+      fi
+      exit 0
+      ;;
     repos/*/issues/*/comments)
       # FIXTURE_COMMENTS_FAIL=1 simulates a transient comments-API failure
       # (the indeterminate marker-read case, automated-4b round-5 P1).
@@ -290,6 +311,7 @@ make_pr_fixture() {  # <sha> <author> <labels_json_array> [base_ref] [default_br
         --arg base_ref "$base_ref" --arg default_branch "$default_branch" \
         --arg base_sha "$base_sha" '
     { number: 99,
+      auto_merge: null,
       head: { sha: $sha },
       user: { login: $author },
       labels: $labels,
@@ -656,6 +678,190 @@ if [ "$RC" = 1 ] && echo "$OUT" | grep -q "BLOCKED" && echo "$OUT" | grep -qi "D
   pass "Dependabot + external label → judged by Dependabot rule → exit 1"
 else
   fail "expected rc=1 via Dependabot rule; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 10a–10h: Dependabot commit provenance. The Dependabot rule is earned by
+# the COMMITS the PR would merge, not by its opener. A Dependabot-opened PR
+# carrying any commit that is not Dependabot-authored, GitHub-committed and
+# signature-verified is judged as an ORDINARY PR (external-review / Phase 4
+# derivation); an unreadable commit list fails closed (exit 2).
+# ---------------------------------------------------------------------------
+make_commits_fixture() {  # <json_array_literal>
+  local file="$WORKDIR/commits.$$.$RANDOM.json"
+  echo "$1" >"$file"
+  echo "$file"
+}
+# dep_commit <sha> [author] [committer] [verified]
+dep_commit() {
+  jq -nc --arg sha "$1" --arg a "${2:-dependabot[bot]}" --arg c "${3:-web-flow}" \
+        --argjson v "${4:-true}" '
+    { sha: $sha, author: { login: $a }, committer: { login: $c },
+      commit: { verification: { verified: $v, reason: (if $v then "valid" else "unsigned" end) } } }'
+}
+APPROVED_ON_HEAD=$(make_reviews_fixture "$(jq -n --arg sha "$HEAD_SHA" '
+  [{ user:{login:"nathanpayne-claude"}, state:"APPROVED", commit_id:$sha, submitted_at:"2026-06-01T10:00:00Z" }]
+')")
+OVER_THRESHOLD_FILES=$(make_files_fixture '[{"filename":"src/big.js","additions":400,"deletions":0}]')
+UNDER_THRESHOLD_FILES=$(make_files_fixture '[{"filename":"package.json","additions":1,"deletions":1}]')
+
+# provenance_case <label> <commits_json> <files_fixture> <codex_stub_rc> <expect_rc> <expect_grep> [gate_enabled]
+provenance_case() {
+  local label=$1 commits=$2 files=$3 codex_rc=$4 expect_rc=$5 expect=$6 dep_enabled=${7:-true}
+  echo; echo "--- Test 10*: Dependabot provenance — $label"
+  SCRATCH=$(make_scratch "$dep_enabled" true)
+  FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT")
+  : > "$WORKDIR/gh-calls.log"
+  set +e
+  OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$APPROVED_ON_HEAD" \
+        FIXTURE_COMMITS="$(make_commits_fixture "$commits")" \
+        FIXTURE_FILES="$files" \
+        MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
+        CODEX_STUB_RC="$codex_rc" \
+        run_gate "$SCRATCH" 99 owner/repo 2>&1)
+  RC=$?
+  set -e
+  if [ "$RC" = "$expect_rc" ] && echo "$OUT" | grep -qiE -- "$expect"; then
+    pass "Dependabot provenance: $label → rc=$expect_rc"
+  else
+    fail "Dependabot provenance: $label expected rc=$expect_rc matching /$expect/; got rc=$RC"
+    echo "$OUT" | sed 's/^/      /' >&2
+  fi
+}
+
+# 10a — control: every commit is Dependabot's → Dependabot rule, approval clears.
+provenance_case "all commits Dependabot-produced (control)" \
+  "[$(dep_commit "$OLD_SHA"),$(dep_commit "$HEAD_SHA")]" \
+  "$OVER_THRESHOLD_FILES" 1 0 "latest-state APPROVED review on HEAD"
+
+# 10b — an extra commit by another author on top of the Dependabot commit, on
+# an over-threshold diff: the reviewer approval that clears the Dependabot rule
+# must NOT clear it; the external arm applies and its delegate (rc=1) blocks.
+provenance_case "extra non-Dependabot commit + over threshold → external arm blocks" \
+  "[$(dep_commit "$OLD_SHA"),$(dep_commit "$HEAD_SHA" someone-with-push someone-with-push false)]" \
+  "$OVER_THRESHOLD_FILES" 1 1 "BLOCKED"
+
+# 10c — the same extra commit on an UNDER-threshold diff is judged like any
+# ordinary PR: not applicable, exit 0 (no Dependabot shortcut, no Phase 4).
+provenance_case "extra non-Dependabot commit + under threshold → ordinary PR" \
+  "[$(dep_commit "$OLD_SHA"),$(dep_commit "$HEAD_SHA" someone-with-push someone-with-push false)]" \
+  "$UNDER_THRESHOLD_FILES" 1 0 "not applicable"
+
+# 10d — the gate-disabled shortcut must not apply to a mixed PR either: with
+# dependabot.reviewer_gate.enabled=false the ordinary derivation still runs.
+provenance_case "extra commit + Dependabot gate disabled → still external arm" \
+  "[$(dep_commit "$OLD_SHA"),$(dep_commit "$HEAD_SHA" someone-with-push someone-with-push false)]" \
+  "$OVER_THRESHOLD_FILES" 1 1 "BLOCKED" false
+
+# 10c2 — the SAME under-threshold mixed PR while a native auto-merge request
+# armed for an earlier (Dependabot-only) head still stands: BLOCK, because the
+# withdrawing workflow job is not ordered before this gate.
+echo; echo "--- Test 10*: Dependabot provenance — mixed + auto-merge still armed → blocked"
+SCRATCH=$(make_scratch true true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT")
+jq '.auto_merge = {merge_method:"squash", enabled_by:{login:"nathanjohnpayne"}}' "$FIXTURE_PR" >"$FIXTURE_PR.armed"
+MIXED_ARMED_COMMITS=$(make_commits_fixture "[$(dep_commit "$OLD_SHA"),$(dep_commit "$HEAD_SHA" someone-with-push someone-with-push false)]")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR.armed" FIXTURE_REVIEWS="$APPROVED_ON_HEAD" FIXTURE_COMMITS="$MIXED_ARMED_COMMITS" \
+      FIXTURE_FILES="$UNDER_THRESHOLD_FILES" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+QOUT=$(FIXTURE_PR="$FIXTURE_PR.armed" FIXTURE_COMMITS="$MIXED_ARMED_COMMITS" FIXTURE_FILES="$UNDER_THRESHOLD_FILES" \
+      run_gate "$SCRATCH" --derive-external-requiredness 99 owner/repo 2>/dev/null)
+QRC=$?
+jq 'del(.auto_merge)' "$FIXTURE_PR" >"$FIXTURE_PR.noam"
+OUT_NOAM=$(FIXTURE_PR="$FIXTURE_PR.noam" FIXTURE_REVIEWS="$APPROVED_ON_HEAD" FIXTURE_COMMITS="$MIXED_ARMED_COMMITS" \
+      FIXTURE_FILES="$UNDER_THRESHOLD_FILES" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC_NOAM=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "still carries a native auto-merge request" \
+   && [ "$QRC" = 0 ] && [ "$QOUT" = "false" ] \
+   && [ "$RC_NOAM" = 2 ]; then
+  pass "Dependabot provenance: mixed + armed auto-merge blocks the full gate; query mode keeps ordinary derivation; unreadable auto-merge state → exit 2"
+else
+  fail "mixed + armed expected rc=1 block, query false/0, missing auto_merge rc=2; got rc=$RC q=$QRC/$QOUT noam=$RC_NOAM"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# 10e — Dependabot-authored but committed by someone else (e.g. an amended or
+# rebased commit keeping the author) is not Dependabot-produced.
+provenance_case "Dependabot author, foreign committer → ordinary PR" \
+  "[$(dep_commit "$HEAD_SHA" 'dependabot[bot]' someone-with-push true)]" \
+  "$OVER_THRESHOLD_FILES" 1 1 "committer=someone-with-push"
+
+# 10f — Dependabot author + GitHub committer but an unverified signature.
+provenance_case "unverified signature → ordinary PR" \
+  "[$(dep_commit "$HEAD_SHA" 'dependabot[bot]' web-flow false)]" \
+  "$OVER_THRESHOLD_FILES" 1 1 "signature=unsigned"
+
+# 10g — the listed commits do not include the PR head (the branch moved under
+# the read): no verdict, fail closed.
+provenance_case "head not among listed commits → exit 2" \
+  "[$(dep_commit "$OLD_SHA")]" \
+  "$OVER_THRESHOLD_FILES" 0 2 "is not among the listed commits"
+
+# 10h — 250 commits is the endpoint's ceiling: cannot enumerate → not trusted.
+BIG_COMMITS=$(jq -nc --arg head "$HEAD_SHA" '
+  [ range(0; 249) as $i
+    | { sha: ("f" * 30 + ($i | tostring | ("0" * (10 - length)) + .)),
+        author: { login: "dependabot[bot]" }, committer: { login: "web-flow" },
+        commit: { verification: { verified: true } } } ]
+  + [ { sha: $head, author: { login: "dependabot[bot]" }, committer: { login: "web-flow" },
+        commit: { verification: { verified: true } } } ]')
+provenance_case "250-commit ceiling → ordinary PR" \
+  "$BIG_COMMITS" "$OVER_THRESHOLD_FILES" 1 1 "stops at 250"
+
+# 10i — unreadable commit list fails closed (exit 2), never a lane choice.
+echo; echo "--- Test 10*: Dependabot provenance — commits read failure → exit 2"
+SCRATCH=$(make_scratch true true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$APPROVED_ON_HEAD" FIXTURE_COMMITS_FAIL=1 \
+      run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 2 ] && echo "$OUT" | grep -q "could not verify Dependabot commit provenance"; then
+  pass "Dependabot provenance: unreadable commits → exit 2"
+else
+  fail "Dependabot provenance: unreadable commits expected rc=2; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# 10j — a non-Dependabot PR never pays for the commits read.
+echo; echo "--- Test 10*: Dependabot provenance — ordinary author makes no commits read"
+SCRATCH=$(make_scratch true true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]')
+: > "$WORKDIR/gh-calls.log"
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$UNDER_THRESHOLD_FILES" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && ! grep -q "/commits" "$WORKDIR/gh-calls.log"; then
+  pass "Dependabot provenance: non-Dependabot author → no commits read"
+else
+  fail "Dependabot provenance: non-Dependabot author expected rc=0 and no commits read; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# 10k — the helper is a hard dependency.
+echo; echo "--- Test 10*: missing dependabot-commit-provenance.sh → exit 2"
+SANDBOX2="$WORKDIR/no-prov-lib/scripts"
+mkdir -p "$SANDBOX2/lib"
+cp "$SCRIPT" "$SANDBOX2/merge-clearance-gate.sh"
+chmod +x "$SANDBOX2/merge-clearance-gate.sh"
+for _lib in reviewers-helpers.sh blocking-labels.sh gh-api-array.sh; do
+  cp "$ROOT/scripts/lib/$_lib" "$SANDBOX2/lib/$_lib"
+done
+SCRATCH=$(make_scratch true false)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT")
+set +e
+OUT=$(cd "$SCRATCH" && PATH="$STUB_DIR:$PATH" GH_TOKEN="dummy-token" \
+  GH_CALLS_LOG="$WORKDIR/gh-calls.log" FIXTURE_PR="$FIXTURE_PR" \
+  "$SANDBOX2/merge-clearance-gate.sh" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 2 ] && echo "$OUT" | grep -q "dependabot-commit-provenance helper missing"; then
+  pass "absent dependabot-commit-provenance.sh → exit 2 with a naming error"
+else
+  fail "expected rc=2 'dependabot-commit-provenance helper missing'; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
 fi
 
 # ---------------------------------------------------------------------------
@@ -2184,6 +2390,30 @@ if [ "$RC" = 0 ] && [ "$OUT" = "false" ] && [ "$RC2" = 0 ] && [ "$OUT2" = "false
   pass "query: dependabot → false whether the reviewer gate is enabled or disabled (not a Codex gate)"
 else
   fail "query: dependabot expected false/0 both ways; got rc=$RC out='$OUT' rc2=$RC2 out2='$OUT2'"
+fi
+
+echo; echo "--- Query 7b: Dependabot-opened PR with a foreign commit → derived like any PR"
+# The query modes must not grant the Dependabot `false` to a PR whose commits
+# are not all Dependabot's: over threshold, the external arm applies → true.
+SCRATCH=$(make_scratch true true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT")
+MIXED_COMMITS=$(make_commits_fixture "[$(dep_commit "$OLD_SHA"),$(dep_commit "$HEAD_SHA" someone-with-push someone-with-push false)]")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_COMMITS="$MIXED_COMMITS" FIXTURE_FILES="$OVER_THRESHOLD_FILES" \
+      run_gate "$SCRATCH" --derive-external-requiredness 99 owner/repo 2>/dev/null)
+RC=$?
+OUT_P4=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_COMMITS="$MIXED_COMMITS" FIXTURE_FILES="$OVER_THRESHOLD_FILES" \
+      run_gate "$SCRATCH" --derive-phase-4-requiredness 99 owner/repo 2>/dev/null)
+RC_P4=$?
+OUT_FAIL=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_COMMITS_FAIL=1 FIXTURE_FILES="$OVER_THRESHOLD_FILES" \
+      run_gate "$SCRATCH" --derive-external-requiredness 99 owner/repo 2>/dev/null)
+RC_FAIL=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "true" ] && [ "$RC_P4" = 0 ] && [ "$OUT_P4" = "true" ] \
+   && [ "$RC_FAIL" = 2 ] && [ "$OUT_FAIL" != "true" ] && [ "$OUT_FAIL" != "false" ]; then
+  pass "query: mixed-commit Dependabot PR derives true (external + Phase 4); unreadable commits → exit 2"
+else
+  fail "query: mixed-commit Dependabot PR expected true/true and rc=2 on read failure; got rc=$RC out='$OUT' p4rc=$RC_P4 p4='$OUT_P4' failrc=$RC_FAIL fail='$OUT_FAIL'"
 fi
 
 echo; echo "--- Query 8: PR fetch failure → nonzero (caller fails closed)"
