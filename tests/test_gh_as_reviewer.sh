@@ -429,6 +429,21 @@ else
   fail "gh api readback: rc=$rc ok_rc=$ok_rc err=$err"
 fi
 
+# CodeRabbit on #1541: only a command that would prompt runs attached to a
+# terminal; one that names its body/state is captured and read back.
+prompt_of() { # <gh argv...> -> GH_READBACK_WOULD_PROMPT after prepare
+  PATH="$STUB_DIR:$PATH" STUB_STATE="$WORKDIR/state" bash -c '
+    . "$1/scripts/lib/gh-write-readback.sh"; shift
+    gh_readback_prepare nathanpayne-claude ghp_reviewer-token t -- "$@" >/dev/null 2>&1
+    printf "%s" "$GH_READBACK_WOULD_PROMPT"' _ "$ROOT" "$@"
+}
+if [ "$(prompt_of gh pr comment 123 --body x)" = "0" ] && [ "$(prompt_of gh pr comment 123)" = "1" ] \
+   && [ "$(prompt_of gh pr review 123 --approve)" = "0" ] && [ "$(prompt_of gh pr review 123)" = "1" ]; then
+  pass "would-prompt: a comment with --body or a review with a state never runs attached"
+else
+  fail "would-prompt detection: body=$(prompt_of gh pr comment 123 --body x) none=$(prompt_of gh pr comment 123)"
+fi
+
 # A target the wrapper cannot resolve cannot be read back, so it is not written.
 reset_log
 set +e

@@ -423,6 +423,10 @@ case " $* " in
 esac
 if [ "${1:-}" = "api" ]; then
   case "$*" in
+    *"repos/example/repo/pulls/123")
+      # Pre-edit state read by the edit readback (no --jq).
+      printf '{"title":"t","labels":%s,"assignees":[],"requested_reviewers":[],"requested_teams":[]}\n' "${GH_PR_LABELS:-[]}"
+      exit 0 ;;
     *mergeQueueEntry*) [ -n "${GH_ENQUEUER:-}" ] && echo "$GH_ENQUEUER"; exit 0 ;;
     *"/events"*"--jq"*) echo 10; exit 0 ;;
     *"/events"*)
@@ -439,7 +443,7 @@ if [ "${1:-}" = "api" ]; then
       done
       printf '%s\n' "$out"
       exit 0 ;;
-    *"repos/example/repo/pulls/"*)
+    *"repos/example/repo/pulls/"*"--jq"*)
       # Mirrors the wrapper's jq: an open PR with no auto_merge reads "open ".
       if [ "${GH_MERGE_STATE:-merged}" = "open" ]; then printf 'open \n'; else
         printf '%s %s\n' "${GH_MERGE_STATE:-merged}" "${GH_ACTED_AS:-$(login_for "${GH_TOKEN:-}")}"; fi
@@ -1049,6 +1053,20 @@ if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q "verified queued by nathanjoh
   pass "merge-queue admission: verified through the enqueuer"
 else
   fail "merge-queue admission: rc=$rc err=$err"
+fi
+
+# CodeRabbit on #1541: adding a label that is already applied is a no-op
+# with no event; it is not a failed readback.
+reset_log
+set +e
+err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_PR_LABELS='[{"name":"x"}]' GH_EDIT_EVENTS_BY="" \
+  run_wrapper -- gh pr edit 123 --add-label x 2>&1 >/dev/null)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q "already in place"; then
+  pass "edit readback: a label already applied is a no-op, not a failure"
+else
+  fail "edit readback no-op label: rc=$rc err=$err"
 fi
 
 # The placeholder cannot reach an author write through the ambient candidate.

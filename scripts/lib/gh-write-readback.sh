@@ -80,7 +80,10 @@ _gh_readback_fail() { # <message...>
 }
 
 gh_readback_interactive() {
-  [ -t 0 ] && [ -t 1 ]
+  # Only a command that WOULD prompt runs attached: one that already names its
+  # body/state/method never prompts, so its stdout is captured and read back
+  # even from a terminal (CodeRabbit on #1541).
+  [ "${GH_READBACK_WOULD_PROMPT:-0}" -eq 1 ] && [ -t 0 ] && [ -t 1 ]
 }
 
 # Value-taking flags of the guarded verbs, shared by every verb because a
@@ -121,7 +124,7 @@ _gh_readback_note_edit() { # <flag> <value>: record the events this edit must pr
     --remove-assignee) for item in $2; do GH_READBACK_EDIT_EXPECT+=("unassigned:$item"); done ;;
     --add-reviewer) for item in $2; do GH_READBACK_EDIT_EXPECT+=("review_requested:$item"); done ;;
     --remove-reviewer) for item in $2; do GH_READBACK_EDIT_EXPECT+=("review_request_removed:$item"); done ;;
-    -t|--title) GH_READBACK_EDIT_EXPECT+=("renamed:") ;;
+    -t|--title) GH_READBACK_EDIT_EXPECT+=("renamed:"); GH_READBACK_NEW_TITLE="$2" ;;
     -m|--milestone) GH_READBACK_EDIT_EXPECT+=("milestoned:$2") ;;
     --remove-milestone) GH_READBACK_EDIT_EXPECT+=("demilestoned:") ;;
   esac
@@ -144,6 +147,8 @@ gh_readback_prepare() {
   GH_READBACK_EDIT_EXPECT=()
   GH_READBACK_NOTE=""
   GH_READBACK_DISABLE_AUTO=0
+  GH_READBACK_WOULD_PROMPT=0
+  GH_READBACK_NEW_TITLE=""
 
   # Classify the whole argv first: the group and verb are the first two
   # non-option words after `gh`, skipping the value of any option that takes
@@ -230,6 +235,23 @@ gh_readback_prepare() {
     [ "$key" = "pr-edit" ] && _gh_readback_note_edit "$flag" "$value"
   done
 
+  # Would gh prompt for this invocation? Only when it names nothing it needs:
+  # a comment with no body source, a review with no state, a merge with no
+  # method or auto flag, an edit with no field.
+  local seen=" "
+  i=0
+  while [ "$i" -lt "${#opts[@]}" ]; do seen="$seen${opts[$i]} "; i=$((i + 2)); done
+  case "$key" in
+    pr-comment|issue-comment)
+      case "$seen" in *" -b "*|*" --body "*|*" -F "*|*" --body-file "*|*" --edit-last "*|*" -e "*|*" --editor "*|*" -w "*|*" --web "*) ;; *) GH_READBACK_WOULD_PROMPT=1 ;; esac ;;
+    pr-review)
+      [ -z "$GH_READBACK_REVIEW_STATE" ] && GH_READBACK_WOULD_PROMPT=1 ;;
+    pr-merge)
+      case "$seen" in *" -m "*|*" --merge "*|*" -r "*|*" --rebase "*|*" -s "*|*" --squash "*|*" --auto "*|*" --disable-auto "*) ;; *) GH_READBACK_WOULD_PROMPT=1 ;; esac ;;
+    pr-edit)
+      [ "${#opts[@]}" -le 2 ] && GH_READBACK_WOULD_PROMPT=1 ;;
+  esac
+
   # Resolve the target through gh itself, so every selector form gh accepts
   # (number, URL, branch, none) resolves the same way the write will, and
   # keep the host it resolved on for every later read.
@@ -263,6 +285,41 @@ gh_readback_prepare() {
     fi
     GH_READBACK_SNAPSHOT="$(printf '%s\n' "$ids" | grep -E '^[0-9]+$' | sort -n | tail -1)"
     GH_READBACK_SNAPSHOT="${GH_READBACK_SNAPSHOT:-0}"
+  fi
+  # An edit that changes nothing produces no event (adding a label already
+  # applied, removing one that is absent, an unchanged title, an existing
+  # assignee or requested reviewer). Drop those expectations using the
+  # pre-write state, so a correctly attributed no-op is not read as a failed
+  # readback (CodeRabbit on #1541).
+  if [ "$key" = "pr-edit" ] && [ "${#GH_READBACK_EDIT_EXPECT[@]}" -gt 0 ]; then
+    local state want kind name keep present
+    local -a kept
+    kept=()
+    if ! state="$(_gh_readback_api "repos/$GH_READBACK_REPO/pulls/$GH_READBACK_NUMBER" 2>/dev/null)"; then
+      _gh_readback_fail "could not read $GH_READBACK_REPO#$GH_READBACK_NUMBER before the edit; refusing to write without a byline readback."
+      return 1
+    fi
+    for want in "${GH_READBACK_EDIT_EXPECT[@]}"; do
+      kind="${want%%:*}"; name="${want#*:}"
+      present="$(printf '%s' "$state" | jq -r --arg kind "$kind" --arg name "$name" '
+          ($name | ascii_downcase) as $n
+          | if $kind == "labeled" or $kind == "unlabeled" then any(.labels[]?; (.name | ascii_downcase) == $n)
+            elif $kind == "assigned" or $kind == "unassigned" then any(.assignees[]?; (.login | ascii_downcase) == $n)
+            elif $kind == "review_requested" or $kind == "review_request_removed" then
+              any(.requested_reviewers[]?; (.login | ascii_downcase) == $n)
+              or any(.requested_teams[]?; (.slug | ascii_downcase) == ($n | split("/") | last))
+            else "n/a" end' 2>/dev/null || echo unknown)"
+      keep=1
+      if [ "$kind" = "renamed" ] && [ "$(printf '%s' "$state" | jq -r '.title // ""')" = "$GH_READBACK_NEW_TITLE" ]; then
+        keep=0
+      fi
+      case "$kind:$present" in
+        labeled:true|assigned:true|review_requested:true) keep=0 ;;
+        unlabeled:false|unassigned:false|review_request_removed:false) keep=0 ;;
+      esac
+      [ "$keep" -eq 1 ] && kept+=("$want")
+    done
+    GH_READBACK_EDIT_EXPECT=(${kept[@]+"${kept[@]}"})
   fi
   GH_READBACK_KIND="$key"
   return 0
@@ -348,7 +405,7 @@ _gh_readback_verify_review() {
 
 _gh_readback_verify_edit() {
   if [ "${#GH_READBACK_EDIT_EXPECT[@]}" -eq 0 ]; then
-    _gh_readback_unattributable "This edit (body, base or project only)"; return $?
+    _gh_readback_unattributable "This edit (body, base or project only, or a change that was already in place)"; return $?
   fi
   local events want kind name found others
   events="$(_gh_readback_api --paginate "repos/$GH_READBACK_REPO/issues/$GH_READBACK_NUMBER/events" 2>/dev/null | jq -s 'add // []' 2>/dev/null)" \
@@ -360,7 +417,8 @@ _gh_readback_verify_edit() {
     found="$(printf '%s' "$events" | jq -c --argjson snap "$GH_READBACK_SNAPSHOT" --arg kind "$kind" --arg name "$name" '
         [.[] | select(.id > $snap and .event == $kind)
              | select($name == ""
-                      or (.label.name // .assignee.login // .requested_reviewer.login // .milestone.title // "") == $name)]')"
+                      or ((.label.name // .assignee.login // .requested_reviewer.login // .milestone.title // "") | ascii_downcase) == ($name | ascii_downcase)
+                      or ((.requested_team.slug // "") | ascii_downcase) == ($name | split("/") | last | ascii_downcase))]')"
     if [ "$(printf '%s' "$found" | jq 'length')" -eq 0 ]; then
       _gh_readback_unverified "the edit (no '$kind${name:+ $name}' event newer than the pre-write snapshot)"; return $?
     fi
