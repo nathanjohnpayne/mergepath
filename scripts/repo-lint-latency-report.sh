@@ -49,6 +49,9 @@ for value in "$LIMIT" "$MIN_SAMPLE" "$P50_MAX" "$P95_MAX" "$DEEP_P95_MAX" "$WIND
   case "$value" in ''|*[!0-9]*) usage ;; esac
 done
 [ "$LIMIT" -ge 1 ] && [ "$LIMIT" -le 100 ] || usage
+# Force base 10: the digit check above accepts a leading zero (`08`, `010`),
+# which $(( )) would otherwise read as octal (an error, or the wrong window).
+WINDOW_DAYS=$((10#$WINDOW_DAYS))
 [ "$WINDOW_DAYS" -ge 1 ] && [ "$WINDOW_DAYS" -le 90 ] || usage
 command -v jq >/dev/null 2>&1 || { echo "repo-lint latency: jq is required" >&2; exit 2; }
 if [ -n "$AS_OF" ]; then
@@ -64,17 +67,19 @@ mkdir -p "$OUT_DIR"
 DATA="$OUT_DIR/runs.json"
 
 # window_runs <file holding a JSON array of runs>: validate that every run has
-# a parseable created_at, keep only runs created at or after WINDOW_START,
+# a parseable created_at, keep only runs created at or after WINDOW_START and
+# at or before the as-of instant (so a replayed export's later runs cannot
+# displace the requested window),
 # order newest first by created_at, and cap at LIMIT. Prints the windowed
 # array. A run without a usable created_at makes the whole sample unusable
 # (non-zero exit): its place in the window is unknowable, and silently dropping
 # it would hide exactly the runs this report exists to count.
 window_runs() {
-  jq -e --argjson since "$WINDOW_START_EPOCH" --argjson limit "$LIMIT" '
+  jq -e --argjson since "$WINDOW_START_EPOCH" --argjson until "$AS_OF_EPOCH" --argjson limit "$LIMIT" '
     def created: .created_at | if type == "string" then (try fromdateiso8601 catch null) else null end;
     if type != "array" then error("runs is not an array")
     elif any(.[]; created == null) then error("every run must carry an ISO-8601 created_at")
-    else [ .[] | select(created >= $since) ] | sort_by(created) | reverse | .[:$limit]
+    else [ .[] | created as $c | select($c >= $since and $c <= $until) ] | sort_by(created) | reverse | .[:$limit]
     end
   ' "$1"
 }

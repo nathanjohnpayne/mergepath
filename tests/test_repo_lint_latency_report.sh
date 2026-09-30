@@ -157,7 +157,7 @@ fi
 
 # --window-days narrows the sample; LIMIT applies newest-first by created_at
 # regardless of input order.
-jq '.runs |= reverse' "$TMP/healthy.json" > "$TMP/reversed.json"
+jq '.runs |= sort_by(.created_at)' "$TMP/healthy.json" > "$TMP/reversed.json"
 if run_report --input "$TMP/reversed.json" --out-dir "$TMP/limited" --limit 5 --min-sample 1 >/dev/null 2>&1 || true; then :; fi
 if jq -e '.runs | map(.id) == [120,119,118,117,116]' "$TMP/limited/runs.json" >/dev/null; then
   pass "LIMIT keeps the newest runs by created_at, not by input order"
@@ -169,6 +169,28 @@ if run_report --input "$TMP/healthy.json" --out-dir "$TMP/narrow" --window-days 
   pass "--window-days excludes runs created before the narrower window"
 else
   fail "--window-days must bound the sample by created_at"
+fi
+
+# Zero-prefixed --window-days values are decimal, not octal: 08 is 8 days
+# (octal would be an error) and 010 is 10 days (octal would be 8).
+if run_report --input "$TMP/healthy.json" --out-dir "$TMP/w08" --window-days 08 --min-sample 20 >/dev/null 2>&1 \
+   && jq -e '.window.days == 8 and .window.since == "2026-09-20T00:00:00Z"' "$TMP/w08/summary.json" >/dev/null \
+   && run_report --input "$TMP/healthy.json" --out-dir "$TMP/w010" --window-days 010 --min-sample 20 >/dev/null 2>&1 \
+   && jq -e '.window.days == 10 and .window.since == "2026-09-18T00:00:00Z"' "$TMP/w010/summary.json" >/dev/null; then
+  pass "--window-days 08 and 010 are read as decimal"
+else
+  fail "zero-prefixed --window-days must be decimal"
+fi
+
+# --as-of bounds BOTH ends: runs created after the cutoff (a replayed export)
+# must not fill LIMIT or alert.
+jq '.runs += [range(0;30) as $i | (.runs[0] | .id=(300+$i) | .head_sha="future-sha" | .event=(if $i % 2 == 0 then "push" else "pull_request" end) | .created_at="2026-09-29T00:00:00Z")]' \
+  "$TMP/healthy.json" > "$TMP/future.json"
+if run_report --input "$TMP/future.json" --out-dir "$TMP/future" --min-sample 20 >/dev/null \
+   && jq -e '.window.runs == 40 and (.duplicate_heads | length) == 0 and .status == "healthy"' "$TMP/future/summary.json" >/dev/null; then
+  pass "runs created after --as-of are excluded from the window"
+else
+  fail "runs after the as-of cutoff must be excluded"
 fi
 
 # A run without a parseable created_at cannot be placed in the window.
