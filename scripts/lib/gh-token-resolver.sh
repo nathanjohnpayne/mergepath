@@ -30,6 +30,22 @@ gh_resolver_repo_root() {
 # shellcheck disable=SC2034
 GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL="mergepath-guarded-write-github-com-only"
 
+# The wrappers verify one token and run the payload under it. Anything in
+# front of `gh` (env, sudo, command, nice, ...) can replace or drop that
+# token after verification: `env GH_TOKEN=proxy-injected gh pr comment` writes
+# as the broker (Codex P1 on #1541). Rather than enumerate the forms that can,
+# accept only a payload whose first word is gh itself.
+gh_require_direct_gh_payload() { # <label> <payload...>
+  local label="$1"
+  shift
+  case "${1:-}" in
+    gh|*/gh) return 0 ;;
+  esac
+  echo "$label: the wrapped command must start with gh (got '${1:-}')." >&2
+  echo "$label:   A prefix such as env, sudo or command can replace the verified token after it is checked; run gh directly." >&2
+  return 1
+}
+
 gh_default_reviewer_identity() {
   if [ -n "${GH_AS_REVIEWER_IDENTITY:-}" ]; then
     printf '%s\n' "$GH_AS_REVIEWER_IDENTITY"

@@ -282,6 +282,34 @@ else
   fail "ambient enterprise token: rc=$rc log=$(cat "$WORKDIR/ent.log")"
 fi
 
+# Codex P1 on #1541: a prefix in the payload can replace the verified token
+# (`env GH_TOKEN=proxy-injected gh pr comment` writes as the broker), so only
+# a direct gh payload runs. An absolute path to gh is still gh.
+for prefixed in "env GH_TOKEN=proxy-injected gh" "command gh" "sudo -n gh" "/usr/bin/env gh"; do
+  reset_log
+  set +e
+  # shellcheck disable=SC2086
+  OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" run_wrapper -- $prefixed pr comment 123 --body "x" >/dev/null 2>&1
+  rc=$?
+  set -e
+  if [ "$rc" -eq 1 ] && ! grep -q $'pr\tcomment' "$WORKDIR/calls.log"; then
+    pass "prefixed payload '$prefixed': refused before any write"
+  else
+    fail "prefixed payload '$prefixed': rc=$rc"
+    cat "$WORKDIR/calls.log" >&2
+  fi
+done
+reset_log
+set +e
+OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" run_wrapper -- "$STUB_DIR/gh" pr comment 123 --body "x" >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q $'GH_TOKEN=ghp_reviewer-token GITHUB_TOKEN= gh\tpr\tcomment' "$WORKDIR/calls.log"; then
+  pass "absolute path to gh: accepted and run under the verified token"
+else
+  fail "absolute gh path: rc=$rc"
+fi
+
 # #1539: the surface does not select the reviewer, so the wrapper, the
 # capability probe and gh-pr-guard.sh (which never reads the surface) resolve
 # the same one. MERGEPATH_AGENT=codex selects the Codex reviewer.

@@ -67,6 +67,7 @@ if [ "$#" -eq 0 ]; then
   echo "gh-as-author: usage: scripts/gh-as-author.sh -- gh pr <create|merge|edit> ..." >&2
   exit 1
 fi
+gh_require_direct_gh_payload "gh-as-author" "$@" || exit 1
 
 set +e
 gh_resolve_token_for_identity "$AUTHOR" "OP_PREFLIGHT_AUTHOR_PAT" "gh-as-author"

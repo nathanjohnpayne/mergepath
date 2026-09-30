@@ -642,16 +642,20 @@ for interactive_flag in -e --editor -w --web; do
   fi
 done
 
+# Since #1541 a prefixed payload is refused outright, even with a valid body:
+# a prefix can replace the verified token after it is checked (Codex P1).
 reset_log
+set +e
 OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_CREATE_PR_URL="https://github.com/example/repo/pull/79" GH_VIEW_AUTHOR="nathanjohnpayne" \
   run_wrapper -- sudo -b gh pr create --title "t" --body "$VALID_INLINE_BODY" >/dev/null 2>&1
 rc=$?
-if [ "$rc" -ne 0 ]; then
-  fail "prefixed pr create contract (sudo -b): valid body should pass; rc=$rc"
-elif ! grep -q $'gh\tpr\tcreate\t--title\tt\t--body\tAuthoring-Agent: codex' "$WORKDIR/calls.log"; then
-  fail "prefixed pr create contract (sudo -b): prefix flag was mistaken for a PR body flag"
+set -e
+if [ "$rc" -ne 1 ]; then
+  fail "prefixed pr create contract (sudo -b): valid body but prefixed payload should be refused; rc=$rc"
+elif grep -q $'gh\tpr\tcreate' "$WORKDIR/calls.log"; then
+  fail "prefixed pr create contract (sudo -b): the prefixed create ran"
 else
-  pass "prefixed pr create contract (sudo -b): prefix flags remain outside PR body parsing"
+  pass "prefixed pr create contract (sudo -b): refused before any write, even with a valid body"
 fi
 
 reset_log
@@ -854,6 +858,20 @@ if [ "$rc" -eq 0 ]; then
   pass "runtime pin: absent policy file keeps legacy behavior"
 else
   fail "runtime pin: absent policy file should not block; rc=$rc"
+fi
+
+# Codex P1 on #1541: a prefix in the payload can replace the verified author
+# token after verification, so only a direct gh payload runs.
+reset_log
+set +e
+OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" run_wrapper -- env GH_TOKEN=proxy-injected gh pr merge 123 --squash >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 1 ] && ! grep -q $'pr\tmerge' "$WORKDIR/calls.log"; then
+  pass "prefixed author payload (env GH_TOKEN=...): refused before any write"
+else
+  fail "prefixed author payload: rc=$rc"
+  cat "$WORKDIR/calls.log" >&2
 fi
 
 # Codex P1 on #1541: the author write runs with the Enterprise credentials

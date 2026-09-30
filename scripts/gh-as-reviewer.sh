@@ -33,6 +33,7 @@ if [ "$#" -eq 0 ]; then
   echo "gh-as-reviewer: usage: scripts/gh-as-reviewer.sh -- gh pr review ..." >&2
   exit 1
 fi
+gh_require_direct_gh_payload "gh-as-reviewer" "$@" || exit 1
 
 set +e
 gh_resolve_token_for_identity "$REVIEWER" "OP_PREFLIGHT_REVIEWER_PAT" "gh-as-reviewer"
