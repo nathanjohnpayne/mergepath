@@ -1021,6 +1021,19 @@ paths:
   - path: tests/test_check_no_bare_gh_writes.sh
     type: canonical
     consumers: all
+  # Pairs with the fail-closed helper guards (#284) and the author-wrapped
+  # '@codex review' trigger (#405); run by check_gh_as_author. The suite READS
+  # and EXECUTES code extracted from the scripts below, so a commit-path
+  # propagation that selects it without them would run it against a missing
+  # or stale copy and red the consumer's check_gh_as_author.
+  - path: tests/test_identity_check_fail_closed.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/resolve-pr-threads.sh"     # structural fail-closed shape
+      - "scripts/coderabbit-wait.sh"        # structural fail-closed shape
+      - "scripts/request-label-removal.sh"  # gh-as-reviewer guard + wrapped label ask
+      - "scripts/codex-review-request.sh"   # trigger call site + extracted post_author_pr_comment
   # Pairs with scripts/ci/check_workflow_parsers (#889): a PATH-shimmed gh
   # regression test for the Dependabot current-HEAD check wait. Keep the
   # test with the parser check so consumers receive the behavioral coverage
@@ -1911,6 +1924,7 @@ paths:
       - "tests/test_gh_as_reviewer.sh"         # check_gh_as_author
       - "tests/test_gh_wrapper_parallel.sh"    # check_gh_as_author
       - "tests/test_check_no_bare_gh_writes.sh"  # check_gh_as_author (#466)
+      - "tests/test_identity_check_fail_closed.sh"  # check_gh_as_author (#284/#405)
       - "tests/test_dependabot_auto_merge_check_wait.sh"  # check_workflow_parsers (#889)
       - "tests/test_git_identity_hygiene.sh"   # check_git_identity_hygiene (#777)
       - "tests/test_op_preflight_check.sh"     # check_op_preflight_contract
