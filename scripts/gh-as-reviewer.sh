@@ -44,9 +44,12 @@ fi
 
 TOKEN="$GH_RESOLVED_TOKEN"
 set +e
+# The verified token is the only credential gh may use, on any host: pinned,
+# an Enterprise Server target authenticates as it or fails, rather than
+# reading an ambient Enterprise token or stored login (Codex P1 on #1541).
 (
   unset GITHUB_TOKEN
-  GH_TOKEN="$TOKEN" "$@"
+  GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$TOKEN" GITHUB_ENTERPRISE_TOKEN="$TOKEN" "$@"
 )
 WRAPPED_RC=$?
 set -e

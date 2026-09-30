@@ -22,7 +22,7 @@ COMMAND_CLASSIFIER="$ROOT/scripts/lib/gh-command-classifier.sh"
 # here so "the log holds a fixture token" is true by construction rather
 # than by the stub happening to reject the ambient one. Per-case `VAR=...`
 # prefixes still apply; this only changes the default.
-unset OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT GH_TOKEN GITHUB_TOKEN
+unset OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT GH_TOKEN GITHUB_TOKEN GH_HOST GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/gh-as-author-test.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
@@ -363,6 +363,8 @@ for a in "$@"; do
   printf '\t%s' "$a" >> "$LOG"
 done
 printf '\n' >> "$LOG"
+# Enterprise credentials the wrapped command would see (Codex P1 on #1541).
+[ -n "${STUB_ENT_LOG:-}" ] && printf '%s|%s|%s %s\n' "${GH_ENTERPRISE_TOKEN:-}" "${GITHUB_ENTERPRISE_TOKEN:-}" "${1:-}" "${2:-}" >>"$STUB_ENT_LOG"  # TOKEN_OUTPUT_EXEMPT: fixture tokens pinned inline by the case that sets STUB_ENT_LOG
 
 if [ "${1:-}" = "auth" ] && [ "${2:-}" = "switch" ]; then
   echo "gh auth switch must not be called" >&2
@@ -852,6 +854,22 @@ if [ "$rc" -eq 0 ]; then
   pass "runtime pin: absent policy file keeps legacy behavior"
 else
   fail "runtime pin: absent policy file should not block; rc=$rc"
+fi
+
+# Codex P1 on #1541: the author write runs with the Enterprise credentials
+# pinned to the verified token, so an Enterprise Server target cannot use
+# another credential.
+reset_log
+: >"$WORKDIR/ent.log"
+set +e
+STUB_ENT_LOG="$WORKDIR/ent.log" OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" \
+  run_wrapper -- gh pr merge 123 --squash >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -qx 'ghp_author-token|ghp_author-token|pr merge' "$WORKDIR/ent.log"; then
+  pass "enterprise credentials: the author write runs with both pinned to the verified token"
+else
+  fail "author enterprise pinning: rc=$rc log=$(cat "$WORKDIR/ent.log")"
 fi
 
 # #1057: the Claude cloud placeholder READS as the author through GET /user,

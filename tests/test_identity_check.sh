@@ -27,6 +27,8 @@ trap 'rm -rf "$WORKDIR"' EXIT
 
 PASS=0
 FAIL=0
+# The write mode reads these; an operator's own values must not leak in.
+unset GH_HOST GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
@@ -357,6 +359,21 @@ else
 fi
 
 write_case "app installation token that reads as the login" 3 ghs_x STUB_TOKEN_LOGIN=nathanjohnpayne
+
+# Codex P1 on #1541: gh sends GH_TOKEN only to github.com, so a different
+# Enterprise credential or a GH_HOST elsewhere would carry a write this check
+# never classified. Refused before GET /user; the same token, or github.com in
+# any case, is fine.
+write_case "different GH_ENTERPRISE_TOKEN" 3 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_ENTERPRISE_TOKEN=ghp_other
+if [ -s "$WORKDIR/api.log" ] || ! printf '%s' "$WRITE_OUT" | grep -q "GH_ENTERPRISE_TOKEN holds a different credential"; then
+  fail "--expect-write-identity enterprise token: not refused before GET /user; output: $WRITE_OUT"
+else
+  pass "--expect-write-identity enterprise token: refused before any API call"
+fi
+write_case "different GITHUB_ENTERPRISE_TOKEN" 3 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GITHUB_ENTERPRISE_TOKEN=gho_other
+write_case "Enterprise token equal to GH_TOKEN" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_ENTERPRISE_TOKEN=ghp_x GITHUB_ENTERPRISE_TOKEN=ghp_x
+write_case "GH_HOST on an Enterprise Server" 3 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_HOST=ghe.example.com
+write_case "GH_HOST=GitHub.com" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_HOST=GitHub.com
 write_case "opaque token that reads as the login" 3 some-token STUB_TOKEN_LOGIN=nathanjohnpayne
 write_case "opaque token with the opt-in" 0 some-token STUB_TOKEN_LOGIN=nathanjohnpayne MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1
 if printf '%s' "$WRITE_OUT" | grep -q "WARNING"; then

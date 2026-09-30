@@ -12,7 +12,7 @@ WRAPPER="$ROOT/scripts/gh-as-reviewer.sh"
 # token the wrapper selected and failure branches print that log, so the
 # ambient OP_PREFLIGHT_REVIEWER_PAT / GH_TOKEN of an agent session must not
 # be a candidate. Per-case `VAR=...` prefixes still apply.
-unset OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT GH_TOKEN GITHUB_TOKEN
+unset OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT GH_TOKEN GITHUB_TOKEN GH_HOST GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/gh-as-reviewer-test.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
@@ -32,6 +32,8 @@ for a in "$@"; do
   printf '\t%s' "$a" >> "$LOG"
 done
 printf '\n' >> "$LOG"
+# Enterprise credentials the wrapped command would see (Codex P1 on #1541).
+[ -n "${STUB_ENT_LOG:-}" ] && printf '%s|%s|%s %s\n' "${GH_ENTERPRISE_TOKEN:-}" "${GITHUB_ENTERPRISE_TOKEN:-}" "${1:-}" "${2:-}" >>"$STUB_ENT_LOG"  # TOKEN_OUTPUT_EXEMPT: fixture tokens pinned inline by the case that sets STUB_ENT_LOG
 
 if [ "${1:-}" = "auth" ] && [ "${2:-}" = "switch" ]; then
   echo "gh auth switch must not be called" >&2
@@ -249,6 +251,34 @@ elif grep -q $'GH_TOKEN=proxy-injected GITHUB_TOKEN= gh\tapi\tuser' "$WORKDIR/ca
   fail "brokered placeholder: GET /user was consulted before the class refused it"
 else
   pass "brokered placeholder: refused on its credential class before GET /user and before the write"
+fi
+
+# Codex P1 on #1541: gh reads GH_ENTERPRISE_TOKEN / GITHUB_ENTERPRISE_TOKEN,
+# not GH_TOKEN, for an Enterprise Server target. The write runs with both
+# pinned to the verified token, and an ambient different one stops it.
+reset_log
+: >"$WORKDIR/ent.log"
+set +e
+STUB_ENT_LOG="$WORKDIR/ent.log" OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" \
+  run_wrapper -- gh pr comment 123 --body "x" >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -qx 'ghp_reviewer-token|ghp_reviewer-token|pr comment' "$WORKDIR/ent.log"; then
+  pass "enterprise credentials: the write runs with both pinned to the verified token"
+else
+  fail "enterprise pinning: rc=$rc log=$(cat "$WORKDIR/ent.log")"
+fi
+reset_log
+set +e
+GH_ENTERPRISE_TOKEN="ghp_other-token" OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" STUB_NO_KEYRING=1 \
+  run_wrapper -- gh pr comment 123 --body "x" >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ] && ! grep -q $'gh\tpr\tcomment' "$WORKDIR/calls.log"; then
+  pass "ambient different GH_ENTERPRISE_TOKEN: refused, no write"
+else
+  fail "ambient enterprise token: rc=$rc"
+  cat "$WORKDIR/calls.log" >&2
 fi
 
 # #1539: the surface does not select the reviewer, so the wrapper, the
