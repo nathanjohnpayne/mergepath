@@ -879,6 +879,26 @@ run_probe GH_TOKEN=ghp_author GITHUB_TOKEN=ghp_author STUB_KEYRING_nathanpayne_c
 set -e
 [ "$s1_rc" -eq 2 ] && pass "a schema-1 record (no credential binding) is rejected" || fail "schema-1 record: exit $s1_rc"
 
+# No SHA-256 tool: the fingerprint is unmatchable, so --check never reuses
+# the cache (CodeRabbit on #1538).
+HASHLESS="$WORKDIR/hashless-bin"
+mkdir -p "$HASHLESS"
+for tool in "$NOGH_DIR"/*; do ln -sf "$(readlink "$tool" 2>/dev/null || echo "$tool")" "$HASHLESS/$(basename "$tool")"; done
+rm -f "$HASHLESS/shasum" "$HASHLESS/sha256sum"
+ln -sf "$STUB_DIR/gh" "$HASHLESS/gh"
+rm -rf "$CACHE"
+set +e
+env -i HOME="$HOME" PATH="$HASHLESS" STUB_REPO=o/r MERGEPATH_CAPABILITY_CACHE_DIR="$CACHE" GH_TOKEN=ghp_author \
+  "$HASHLESS/bash" "$PROBE" --repo o/r >/dev/null 2>&1
+env -i HOME="$HOME" PATH="$HASHLESS" STUB_REPO=o/r MERGEPATH_CAPABILITY_CACHE_DIR="$CACHE" GH_TOKEN=ghp_author \
+  "$HASHLESS/bash" "$PROBE" --repo o/r --check >/dev/null 2>&1; hl_rc=$?
+set -e
+if [ "$hl_rc" -eq 2 ] && jq -e '.credential_fingerprint | startswith("unbindable-")' "$CACHE/agent-capability-o_r-nathanpayne-claude.json" >/dev/null 2>&1; then
+  pass "no SHA-256 tool: fingerprint is unbindable and --check re-probes"
+else
+  fail "hashless: check rc=$hl_rc fp=$(jq -r .credential_fingerprint "$CACHE/agent-capability-o_r-nathanpayne-claude.json" 2>/dev/null)"
+fi
+
 echo
 echo "agent-capability-probe tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

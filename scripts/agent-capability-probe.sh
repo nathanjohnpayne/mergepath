@@ -211,8 +211,18 @@ credential_fingerprint() {
       h="-"
     elif command -v shasum >/dev/null 2>&1; then
       h="$(printf '%s' "$val" | shasum -a 256 | cut -c1-16)"
-    else
+    elif command -v sha256sum >/dev/null 2>&1; then
       h="$(printf '%s' "$val" | sha256sum | cut -c1-16)"
+    else
+      h=""
+    fi
+    # No hash tool, or a hash that came out empty, cannot bind the cache to
+    # this credential. An unmatchable value makes every later --check re-probe
+    # rather than letting two different tokens share one fingerprint
+    # (CodeRabbit on #1538).
+    if [ -z "$h" ]; then
+      printf 'unbindable-%s-%s-%s' "$$" "$(date +%s)" "${RANDOM:-0}"
+      return 0
     fi
     out="$out$var:$h;"
   done
