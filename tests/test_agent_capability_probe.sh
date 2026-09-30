@@ -700,6 +700,25 @@ else
   fail "revoked PAT: transient=$(jq -r .transient_failures "$WORKDIR/revoked.json" 2>/dev/null) cache=$(ls "$CACHE" 2>/dev/null)"
 fi
 
+# A malformed capability record fails before any export is printed
+# (CodeRabbit on #1526): no partial export set for eval to run.
+rm -rf "$CACHE"
+run_probe GH_TOKEN=ghp_author -- >/dev/null 2>&1
+CF="$CACHE/agent-capability-o_r-nathanpayne-claude.json"
+for mutation in '.capabilities.read = true' '.capabilities["author-writes"].granted = "yes"' '.tier = 7' 'del(.capabilities.graphql)'; do
+  jq "$mutation" "$CF" >"$WORKDIR/mal.json" && cp "$WORKDIR/mal.json" "$CF.mal"
+  cp "$CF" "$WORKDIR/good.json"; cp "$CF.mal" "$CF"
+  set +e
+  out="$(run_probe -- --check --print-exports 2>/dev/null)"; rc=$?
+  set -e
+  cp "$WORKDIR/good.json" "$CF"
+  if [ "$rc" -eq 2 ] && ! printf '%s' "$out" | grep -q '^export ' && ! bash -c "$out; echo reached" 2>/dev/null | grep -q reached; then
+    pass "malformed cache ($mutation): exit 2, no export printed, guard fails under eval"
+  else
+    fail "malformed cache ($mutation): rc=$rc out=$out"
+  fi
+done
+
 echo
 echo "agent-capability-probe tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

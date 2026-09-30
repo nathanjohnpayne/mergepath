@@ -236,14 +236,30 @@ if [ "$MODE" = "check" ]; then
   # accept for TTL seconds past that future moment (CodeRabbit on #1526).
   [ "$age" -ge 0 ] || die 2 "capability cache for $REPO has a future measurement time; re-run the probe"
   [ "$age" -le "$TTL_SECONDS" ] || die 2 "capability cache for $REPO is ${age}s old (TTL ${TTL_SECONDS}s); re-run the probe"
+  # Validate the whole shape BEFORE printing anything: a malformed record
+  # must fail through die (and its eval guard), never abort half-way through
+  # the export lines and leave a partial set for eval to run (CodeRabbit on
+  # #1526). The exports are then assembled in full and printed at once.
+  caps_json="$(printf '%s\n' $EXPORT_CAPABILITIES | jq -R . | jq -s -c .)"
+  snap -e --argjson caps "$caps_json" '
+      . as $r
+      | ($r.tier | type == "string" and test("^[a-z,-]+$"))
+        and ($r.capabilities | type == "object")
+        and all($caps[]; ($r.capabilities[.] | type == "object") and ($r.capabilities[.].granted | type == "boolean"))' \
+      >/dev/null 2>&1 \
+    || die 2 "capability cache for $REPO is malformed (tier or capability records); re-run the probe"
   tier="$(snap -r '.tier')"
   if $PRINT_EXPORTS; then
-    printf 'export MERGEPATH_AGENT_TIER=%s\n' "$(printf '%q' "$tier")"
-    printf 'export MERGEPATH_AGENT_SURFACE_MEASURED=%s\n' "$(printf '%q' "$cached_surface")"
+    exports="$(printf 'export MERGEPATH_AGENT_TIER=%s\n' "$(printf '%q' "$tier")")"
+    exports="$exports
+$(printf 'export MERGEPATH_AGENT_SURFACE_MEASURED=%s' "$(printf '%q' "$cached_surface")")"
     for cap in $EXPORT_CAPABILITIES; do
-      value="$(snap -r --arg c "$cap" 'if .capabilities[$c].granted == true then 1 else 0 end')"
-      printf 'export %s=%s\n' "$(cap_var_name "$cap")" "$value"
+      value="$(snap -r --arg c "$cap" 'if .capabilities[$c].granted then 1 else 0 end')" \
+        || die 2 "capability cache for $REPO could not be read for $cap; re-run the probe"
+      exports="$exports
+$(printf 'export %s=%s' "$(cap_var_name "$cap")" "$value")"
     done
+    printf '%s\n' "$exports"
   fi
   echo "agent-capability-probe: $REPO on $cached_surface: tier=$tier (measured ${age}s ago)" >&2
   exit 0
