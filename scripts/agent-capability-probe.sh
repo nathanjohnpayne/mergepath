@@ -86,7 +86,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/gh-token-resolver.sh
 . "$ROOT/scripts/lib/gh-token-resolver.sh"
 
-SCHEMA=1
+# 2: records carry a credential fingerprint (#1537). A schema-1 reader would
+# ignore the field and accept a record bound to other credentials, so the
+# bump makes older readers reject these records instead.
+SCHEMA=2
 MODE="probe"
 PRINT_EXPORTS=false
 WRITE_CACHE=true
@@ -183,14 +186,26 @@ if [ -z "${GH_AS_REVIEWER_IDENTITY:-}${MERGEPATH_AGENT:-}${OP_PREFLIGHT_AGENT:-}
 fi
 REVIEWER_IDENTITY="$(gh_default_reviewer_identity)"
 
-# A non-secret fingerprint of the credential environment the write
-# measurements depend on (#1537): which of the three token sources are set,
-# and a truncated SHA-256 of each value. Two shells for the same reviewer with
-# different credentials then never share a cached answer. Only a hash prefix
-# of each token is ever computed, and it is never printed.
+# A non-secret fingerprint of every credential the measurements can use
+# (#1537): the two preflight PATs, both ambient token variables, the gh config
+# directory, and the keyring tokens for both identities (read locally with
+# `gh auth token --user`, no network). Each value contributes a truncated
+# SHA-256; two shells with different effective credentials then never share a
+# cached answer. The fingerprint lives only in the cache file and is never
+# printed (it would let one token be correlated across logs).
 credential_fingerprint() {
-  local var val h out=""
-  for var in OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT GH_TOKEN; do
+  # The keyring and config-dir values are read below by indirect expansion.
+  # shellcheck disable=SC2034
+  local var val h out="" keyring_author="" keyring_reviewer=""
+  if command -v gh >/dev/null 2>&1; then
+    # shellcheck disable=SC2034
+    keyring_author="$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --user "$AUTHOR_IDENTITY" 2>/dev/null || true)"
+    # shellcheck disable=SC2034
+    keyring_reviewer="$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --user "$REVIEWER_IDENTITY" 2>/dev/null || true)"
+  fi
+  # shellcheck disable=SC2034
+  local GH_CONFIG_DIR_VALUE="${GH_CONFIG_DIR:-}"
+  for var in OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT GH_TOKEN GITHUB_TOKEN GH_CONFIG_DIR_VALUE keyring_author keyring_reviewer; do
     val="${!var:-}"
     if [ -z "$val" ]; then
       h="-"
@@ -626,7 +641,6 @@ RESULT="$(jq -n \
   --arg ambient_var "$AMBIENT_VAR" --arg ambient_class "$AMBIENT_CLASS" \
   --arg cross "$CROSS_REPO" \
   --arg tier "$TIER" \
-  --arg fp "$CREDENTIAL_FINGERPRINT" \
   --argjson transient "$TRANSIENT" \
   --slurpfile read "$WORKDIR/cap-read.json" \
   --slurpfile author "$WORKDIR/cap-author-writes.json" \
@@ -637,7 +651,6 @@ RESULT="$(jq -n \
   '{
      schema: $schema,
      measured_at_epoch: $now,
-     credential_fingerprint: $fp,
      repo: $repo,
      head_sha: $head,
      surface: $surface,
@@ -665,7 +678,7 @@ if $WRITE_CACHE && $TRANSIENT; then
   } >&2
 elif $WRITE_CACHE; then
   if mkdir -p "$CACHE_DIR" 2>/dev/null \
-    && printf '%s\n' "$RESULT" >"$CACHE_FILE.tmp.$$" 2>/dev/null \
+    && printf '%s\n' "$RESULT" | jq --arg fp "$CREDENTIAL_FINGERPRINT" '. + {credential_fingerprint: $fp}' >"$CACHE_FILE.tmp.$$" 2>/dev/null \
     && mv -f "$CACHE_FILE.tmp.$$" "$CACHE_FILE" 2>/dev/null; then
     :
   else

@@ -846,6 +846,32 @@ else
   fail "#1537 casing: $(jq -c '.capabilities["cross-repo"]' "$WORKDIR/case.json")"
 fi
 
+# Codex on #1538: the fingerprint covers GITHUB_TOKEN and the keyring, stays
+# out of stdout, and schema-1 records are rejected.
+rm -rf "$CACHE"
+run_probe GH_TOKEN=ghp_author GITHUB_TOKEN=ghp_author STUB_KEYRING_nathanpayne_claude=ghp_reviewer -- >"$WORKDIR/fp.json" 2>/dev/null
+set +e
+run_probe GH_TOKEN=ghp_author GITHUB_TOKEN=ghp_author STUB_KEYRING_nathanpayne_claude=ghp_reviewer -- --check >/dev/null 2>&1; same_rc=$?
+run_probe GH_TOKEN=ghp_author STUB_KEYRING_nathanpayne_claude=ghp_reviewer -- --check >/dev/null 2>&1; gt_rc=$?
+run_probe GH_TOKEN=ghp_author GITHUB_TOKEN=ghp_author -- --check >/dev/null 2>&1; kr_rc=$?
+set -e
+if [ "$same_rc" -eq 0 ] && [ "$gt_rc" -eq 2 ] && [ "$kr_rc" -eq 2 ]; then
+  pass "credential fingerprint covers GITHUB_TOKEN and the keyring token"
+else
+  fail "fingerprint coverage: same=$same_rc github_token=$gt_rc keyring=$kr_rc"
+fi
+if [ "$(jq 'has("credential_fingerprint")' "$WORKDIR/fp.json")" = "false" ] \
+   && [ "$(jq 'has("credential_fingerprint")' "$CACHE/agent-capability-o_r-nathanpayne-claude.json")" = "true" ]; then
+  pass "the fingerprint is in the private cache only, never in probe stdout"
+else
+  fail "fingerprint placement: stdout=$(jq 'has("credential_fingerprint")' "$WORKDIR/fp.json") cache=$(jq 'has("credential_fingerprint")' "$CACHE/agent-capability-o_r-nathanpayne-claude.json")"
+fi
+jq '.schema = 1' "$CACHE/agent-capability-o_r-nathanpayne-claude.json" >"$WORKDIR/s1.json" && cp "$WORKDIR/s1.json" "$CACHE/agent-capability-o_r-nathanpayne-claude.json"
+set +e
+run_probe GH_TOKEN=ghp_author GITHUB_TOKEN=ghp_author STUB_KEYRING_nathanpayne_claude=ghp_reviewer -- --check >/dev/null 2>&1; s1_rc=$?
+set -e
+[ "$s1_rc" -eq 2 ] && pass "a schema-1 record (no credential binding) is rejected" || fail "schema-1 record: exit $s1_rc"
+
 echo
 echo "agent-capability-probe tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
