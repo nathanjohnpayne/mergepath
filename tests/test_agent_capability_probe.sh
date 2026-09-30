@@ -104,9 +104,11 @@ esac
 status=200; body=""
 if [ "$tok" = "ghp_flap" ]; then
   # First GET /user (the resolver's, via --jq) fails; later ones succeed.
-  n=$(wc -l <"$STUB_FLAP_COUNT" | tr -d ' '); echo x >>"$STUB_FLAP_COUNT"
   login=nathanpayne-claude; scopes="repo"
-  if [ "$path" = "user" ] && [ "$n" -eq 0 ]; then status=503; body='{"message":"Service Unavailable"}'; fi
+  if [ "$path" = "user" ]; then
+    n=$(wc -l <"$STUB_FLAP_COUNT" | tr -d ' '); echo x >>"$STUB_FLAP_COUNT"
+    if [ "$n" -eq 0 ]; then status=503; body='{"message":"Service Unavailable"}'; fi
+  fi
 fi
 if [ "$status" != 200 ]; then
   :
@@ -119,7 +121,7 @@ elif [ -z "$login" ]; then
 elif [ "$path" = "user" ]; then
   body="{\"login\":\"$login\",\"type\":\"$type\"}"
 elif [ "$path" = "graphql" ]; then
-  if [ "$tok" = "proxy-injected" ]; then
+  if [ "$tok" = "proxy-injected" ] || [ "${CLAUDE_CODE_REMOTE:-}" = "true" ]; then
     status=403; body='{"message":"This GraphQL query is not enabled for this session. Use gh api repos/{owner}/{repo}/... instead."}'
   else
     body="{\"data\":{\"viewer\":{\"login\":\"$login\"}}}"
@@ -128,7 +130,7 @@ elif [ "${path#repos/$STUB_REPO/rules/branches/}" != "$path" ]; then
   body="${STUB_RULES:-[]}"
 elif [ "$path" = "repos/$STUB_REPO" ]; then
   body="{\"full_name\":\"x\",\"private\":true,\"permissions\":$perms}"
-elif [ "$tok" = "proxy-injected" ]; then
+elif [ "$tok" = "proxy-injected" ] || [ "${CLAUDE_CODE_REMOTE:-}" = "true" ]; then
   status=403; body='{"message":"repository not attached to this session"}'
 else
   body='{"full_name":"y"}'
@@ -542,8 +544,8 @@ guard_fails "--check another session's cache" "$out"
 set +e
 run_probe OP_PREFLIGHT_AUTHOR_PAT=ghp_author -- --no-cache >"$WORKDIR/noread.json" 2>/dev/null
 set -e
-if [ "$(cap "$WORKDIR/noread.json" read)" = "false" ] && [ "$(jq -r .tier "$WORKDIR/noread.json")" = "author-writes" ]; then
-  pass "ambient read refused but author PAT verified: tier is author-writes, not none"
+if [ "$(cap "$WORKDIR/noread.json" read)" = "true" ] && [ "$(jq -r .tier "$WORKDIR/noread.json")" = "author-writes,graphql,cross-repo" ]; then
+  pass "no ambient credential, author PAT only: reads are measured with the PAT and the write path is listed"
 else
   fail "tier with ambient read failure: $(jq -r .tier "$WORKDIR/noread.json")"
 fi
@@ -645,6 +647,30 @@ if [ "$(jq -r .transient_failures "$WORKDIR/flap.json")" = "true" ] && [ ! -e "$
   pass "resolver failed but the candidate verified on repeat: marked transient, not cached"
 else
   fail "resolver flap: transient=$(jq -r .transient_failures "$WORKDIR/flap.json" 2>/dev/null) cache=$(ls "$CACHE" 2>/dev/null)"
+fi
+
+# Round 5 on #1526.
+# An outage while the resolver verifies the KEYRING candidate is transient
+# too: no preferred PAT, no ambient token, the keyring token's GET /user 503s.
+rm -rf "$CACHE"
+set +e
+run_probe OP_PREFLIGHT_AUTHOR_PAT=ghp_author STUB_KEYRING_nathanpayne_claude=ghp_flaky -- >"$WORKDIR/kr.json" 2>/dev/null
+set -e
+if [ "$(jq -r .transient_failures "$WORKDIR/kr.json")" = "true" ] && [ ! -e "$CACHE/agent-capability-o_r-nathanpayne-claude.json" ]; then
+  pass "keyring candidate's GET /user answered 503: marked transient, not cached"
+else
+  fail "keyring transient: transient=$(jq -r .transient_failures "$WORKDIR/kr.json" 2>/dev/null) cache=$(ls "$CACHE" 2>/dev/null)"
+fi
+
+# A read that fails does not hide a verified write path: the reviewer PAT
+# (the read credential) is refused, the author PAT verifies.
+set +e
+run_probe OP_PREFLIGHT_REVIEWER_PAT=ghp_revoked OP_PREFLIGHT_AUTHOR_PAT=ghp_author -- --no-cache >"$WORKDIR/rw.json" 2>/dev/null
+set -e
+if [ "$(cap "$WORKDIR/rw.json" read)" = "false" ] && [ "$(jq -r .tier "$WORKDIR/rw.json")" = "author-writes" ]; then
+  pass "read refused but author PAT verified: tier is author-writes, not none"
+else
+  fail "tier with read refused: read=$(cap "$WORKDIR/rw.json" read) tier=$(jq -r .tier "$WORKDIR/rw.json" 2>/dev/null)"
 fi
 
 echo

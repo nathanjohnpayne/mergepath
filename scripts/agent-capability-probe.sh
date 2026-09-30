@@ -205,24 +205,29 @@ cap_var_name() { # author-writes -> MERGEPATH_CAP_AUTHOR_WRITES
 
 if [ "$MODE" = "check" ]; then
   [ -r "$CACHE_FILE" ] || die 2 "no capability cache for $REPO; run: scripts/agent-capability-probe.sh"
-  jq -e --argjson schema "$SCHEMA" '.schema == $schema' "$CACHE_FILE" >/dev/null 2>&1 \
+  # Read the cache ONCE. A concurrent probe can replace the file between two
+  # reads, so validating one generation and exporting another would bypass
+  # every check below (Codex P2 on #1526); all reads use this snapshot.
+  CACHE_SNAPSHOT="$(cat "$CACHE_FILE" 2>/dev/null || true)"
+  snap() { printf '%s' "$CACHE_SNAPSHOT" | jq "$@"; }
+  snap -e --argjson schema "$SCHEMA" '.schema == $schema' >/dev/null 2>&1 \
     || die 2 "capability cache for $REPO is unreadable or from another schema; re-run the probe"
-  cached_repo="$(jq -r '.repo' "$CACHE_FILE")"
-  cached_surface="$(jq -r '.surface' "$CACHE_FILE")"
-  measured_at="$(jq -r '.measured_at_epoch' "$CACHE_FILE")"
+  cached_repo="$(snap -r '.repo')"
+  cached_surface="$(snap -r '.surface')"
+  measured_at="$(snap -r '.measured_at_epoch')"
   [ "$cached_repo" = "$REPO" ] || die 2 "capability cache is for $cached_repo, not $REPO; re-run the probe"
   [ "$cached_surface" = "$SURFACE" ] || die 2 "capability cache was measured on $cached_surface, this session is $SURFACE; re-run the probe"
   # A cloud session's proxy scope and provisioned credentials belong to that
   # session, so another session's measurement never answers this one's
   # --check, even for the same repo and identities (Codex P2 on #1526).
-  cached_session="$(jq -r '.session_id // empty' "$CACHE_FILE")"
+  cached_session="$(snap -r '.session_id // empty')"
   [ "$cached_session" = "${CLAUDE_CODE_REMOTE_SESSION_ID:-}" ] \
     || die 2 "capability cache was measured in session '${cached_session:-none}', this is '${CLAUDE_CODE_REMOTE_SESSION_ID:-none}'; re-run the probe"
-  cached_cross="$(jq -r '.cross_repo_target // empty' "$CACHE_FILE")"
+  cached_cross="$(snap -r '.cross_repo_target // empty')"
   [ "$cached_cross" = "$CROSS_REPO" ] \
     || die 2 "capability cache measured cross-repo against '$cached_cross', this check asks about '$CROSS_REPO'; re-run the probe"
-  cached_author="$(jq -r '.capabilities["author-writes"].identity // empty' "$CACHE_FILE")"
-  cached_reviewer="$(jq -r '.capabilities["reviewer-writes"].identity // empty' "$CACHE_FILE")"
+  cached_author="$(snap -r '.capabilities["author-writes"].identity // empty')"
+  cached_reviewer="$(snap -r '.capabilities["reviewer-writes"].identity // empty')"
   [ "$cached_author" = "$AUTHOR_IDENTITY" ] && [ "$cached_reviewer" = "$REVIEWER_IDENTITY" ] \
     || die 2 "capability cache was measured for author '$cached_author' / reviewer '$cached_reviewer', this session expects '$AUTHOR_IDENTITY' / '$REVIEWER_IDENTITY'; re-run the probe"
   printf '%s' "$measured_at" | grep -Eq '^[0-9]+$' || die 2 "capability cache has no measurement time; re-run the probe"
@@ -231,12 +236,12 @@ if [ "$MODE" = "check" ]; then
   # accept for TTL seconds past that future moment (CodeRabbit on #1526).
   [ "$age" -ge 0 ] || die 2 "capability cache for $REPO has a future measurement time; re-run the probe"
   [ "$age" -le "$TTL_SECONDS" ] || die 2 "capability cache for $REPO is ${age}s old (TTL ${TTL_SECONDS}s); re-run the probe"
-  tier="$(jq -r '.tier' "$CACHE_FILE")"
+  tier="$(snap -r '.tier')"
   if $PRINT_EXPORTS; then
     printf 'export MERGEPATH_AGENT_TIER=%s\n' "$(printf '%q' "$tier")"
     printf 'export MERGEPATH_AGENT_SURFACE_MEASURED=%s\n' "$(printf '%q' "$cached_surface")"
     for cap in $EXPORT_CAPABILITIES; do
-      value="$(jq -r --arg c "$cap" 'if .capabilities[$c].granted == true then 1 else 0 end' "$CACHE_FILE")"
+      value="$(snap -r --arg c "$cap" 'if .capabilities[$c].granted == true then 1 else 0 end')"
       printf 'export %s=%s\n' "$(cap_var_name "$cap")" "$value"
     done
   fi
@@ -346,6 +351,12 @@ measure_write() {
       # outage or rate limit marks the run transient instead of caching a
       # 12-hour denial (Codex P2 on #1526).
       local candidate="${!preferred:-${GH_TOKEN:-}}" repeat_status repeat_login
+      # identity-check.sh reports an API failure (as opposed to a mismatch or
+      # an unusable class) as "cannot verify token identity", whichever
+      # candidate hit it, the keyring's included (Codex P2 on #1526, round 5).
+      if grep -q "cannot verify token identity" "$WORKDIR/resolve.err" 2>/dev/null; then
+        echo "resolver for $identity could not read a candidate's identity (API failure)" >>"$WORKDIR/transient"
+      fi
       if [ -n "$candidate" ]; then
         repeat_status="$(api_request "$candidate" GET user "$WORKDIR/resolve-user")"
         repeat_login="$(jq -r '.login // empty' "$WORKDIR/resolve-user.body" 2>/dev/null || true)"
@@ -417,6 +428,13 @@ if ! $HAVE_GH && ! $HAVE_CURL; then
   HAVE_TRANSPORT=false
 fi
 
+# The read-only measurements use the credential a session's read path uses:
+# the provisioned reviewer PAT (AGENTS.md: read-path calls run under
+# $OP_PREFLIGHT_REVIEWER_PAT), else the author PAT, else the ambient
+# credential. Measuring with the ambient credential alone recorded read=false
+# for a token-only session whose PAT reads fine (Codex P2 on #1526).
+READ_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${OP_PREFLIGHT_AUTHOR_PAT:-}}"
+
 # Ambient credential class, for the report only (never its value).
 AMBIENT_VAR=""
 AMBIENT_TOKEN=""
@@ -433,7 +451,7 @@ AMBIENT_TOKEN=""
 if ! $HAVE_TRANSPORT; then
   cap_json false measured "neither gh nor curl is available" "$WORKDIR/cap-read.json"
 else
-  status="$(api_request "" GET "repos/$REPO" "$WORKDIR/read")"
+  status="$(api_request "$READ_TOKEN" GET "repos/$REPO" "$WORKDIR/read")"
   if [ "$status" = "200" ]; then
     cap_json true measured "GET repos/$REPO returned 200" "$WORKDIR/cap-read.json"
   else
@@ -445,7 +463,7 @@ fi
 if ! $HAVE_TRANSPORT; then
   cap_json false measured "neither gh nor curl is available" "$WORKDIR/cap-graphql.json"
 else
-  status="$(api_request "" POST graphql "$WORKDIR/graphql" 'query { viewer { login } }')"
+  status="$(api_request "$READ_TOKEN" POST graphql "$WORKDIR/graphql" 'query { viewer { login } }')"
   if [ "$status" = "200" ] && jq -e '.data.viewer.login | type == "string"' "$WORKDIR/graphql.body" >/dev/null 2>&1; then
     cap_json true measured "viewer query returned a login" "$WORKDIR/cap-graphql.json"
   elif grep -q 'not enabled for this session' "$WORKDIR/graphql.body" 2>/dev/null; then
@@ -461,7 +479,7 @@ if [ "$CROSS_REPO" = "$REPO" ]; then
 elif ! $HAVE_TRANSPORT; then
   cap_json false measured "neither gh nor curl is available" "$WORKDIR/cap-cross-repo.json"
 else
-  status="$(api_request "" GET "repos/$CROSS_REPO" "$WORKDIR/cross")"
+  status="$(api_request "$READ_TOKEN" GET "repos/$CROSS_REPO" "$WORKDIR/cross")"
   if [ "$status" = "200" ]; then
     cap_json true measured "GET repos/$CROSS_REPO returned 200" "$WORKDIR/cap-cross-repo.json"
   else
