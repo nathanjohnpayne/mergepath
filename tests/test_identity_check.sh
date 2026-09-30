@@ -44,9 +44,19 @@ case "$1 $2" in
     exit 0
     ;;
   "api user")
+    [ -n "${STUB_API_LOG:-}" ] && echo "api user" >>"$STUB_API_LOG"
     rc="${STUB_TOKEN_RC:-0}"
     if [ "$rc" -ne 0 ]; then exit "$rc"; fi
     echo "${STUB_TOKEN_LOGIN:-}"
+    exit 0
+    ;;
+  "api -i")
+    # `gh api -i user`: the headers --expect-write-identity reads for a
+    # legacy unprefixed token (#1057).
+    [ -n "${STUB_API_LOG:-}" ] && echo "api -i" >>"$STUB_API_LOG"
+    printf 'HTTP/2.0 200 OK\r\n'
+    [ -n "${STUB_SCOPES:-}" ] && printf 'X-Oauth-Scopes: %s\r\n' "$STUB_SCOPES"
+    printf '\r\n{"login":"%s"}\n' "${STUB_TOKEN_LOGIN:-}"
     exit 0
     ;;
   *)
@@ -307,6 +317,80 @@ if [ "$rc" -eq 1 ] && echo "$out" | grep -qi "conflicting modes"; then
   pass "conflicting modes: exit 1"
 else
   fail "conflicting modes: exit $rc, output: $out"
+fi
+
+# -----------------------------------------------------------------------
+# #1057: --expect-write-identity. A token must READ as the login AND be a
+# user-held credential. The class is decided from the token before any API
+# call, because GET /user is exactly what a broker answers truthfully for the
+# wrong writer: the Claude cloud placeholder reads as the human.
+# -----------------------------------------------------------------------
+write_case() { # <label> <expected rc> <token> [env assignments...]
+  local label="$1" want="$2" token="$3" out rc
+  shift 3
+  : >"$WORKDIR/api.log"
+  set +e
+  out=$(env "$@" STUB_API_LOG="$WORKDIR/api.log" GH_TOKEN="$token" \
+    PATH="$STUB_DIR:$PATH" "$SCRIPT" --expect-write-identity nathanjohnpayne 2>&1)
+  rc=$?
+  set -e
+  WRITE_OUT="$out"
+  if [ "$rc" -eq "$want" ]; then
+    pass "--expect-write-identity $label: exit $rc"
+  else
+    fail "--expect-write-identity $label: exit $rc, expected $want; output: $out"
+  fi
+}
+
+write_case "ghp_ PAT reading as the login" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne
+write_case "fine-grained PAT reading as the login" 0 github_pat_x STUB_TOKEN_LOGIN=nathanjohnpayne
+write_case "gh login token reading as the login" 0 gho_x STUB_TOKEN_LOGIN=nathanjohnpayne
+write_case "user-held PAT reading as another login" 2 ghp_x STUB_TOKEN_LOGIN=nathanpayne-claude
+
+write_case "cloud placeholder that reads as the login" 3 proxy-injected STUB_TOKEN_LOGIN=nathanjohnpayne
+if [ -s "$WORKDIR/api.log" ]; then
+  fail "--expect-write-identity placeholder: GET /user was called before the class refused it"
+elif ! printf '%s' "$WRITE_OUT" | grep -q "credential class is 'brokered'"; then
+  fail "--expect-write-identity placeholder: diagnostic does not name the class; output: $WRITE_OUT"
+else
+  pass "--expect-write-identity placeholder: refused on class, before any API call"
+fi
+
+write_case "app installation token that reads as the login" 3 ghs_x STUB_TOKEN_LOGIN=nathanjohnpayne
+write_case "opaque token that reads as the login" 3 some-token STUB_TOKEN_LOGIN=nathanjohnpayne
+write_case "opaque token with the opt-in" 0 some-token STUB_TOKEN_LOGIN=nathanjohnpayne MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1
+if printf '%s' "$WRITE_OUT" | grep -q "WARNING"; then
+  pass "--expect-write-identity opt-in: accepted with a stderr warning"
+else
+  fail "--expect-write-identity opt-in: no warning; output: $WRITE_OUT"
+fi
+write_case "placeholder with the opt-in" 3 proxy-injected STUB_TOKEN_LOGIN=nathanjohnpayne MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1
+write_case "app token with the opt-in" 3 ghs_x STUB_TOKEN_LOGIN=nathanjohnpayne MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1
+
+HEX40=0123456789abcdef0123456789abcdef01234567
+write_case "legacy hex token with X-OAuth-Scopes" 0 "$HEX40" STUB_TOKEN_LOGIN=nathanjohnpayne STUB_SCOPES=repo
+write_case "legacy hex token without X-OAuth-Scopes" 3 "$HEX40" STUB_TOKEN_LOGIN=nathanjohnpayne
+
+set +e
+out=$(env -u GH_TOKEN PATH="$STUB_DIR:$PATH" "$SCRIPT" --expect-write-identity nathanjohnpayne 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 3 ]; then
+  pass "--expect-write-identity with no GH_TOKEN: exit 3"
+else
+  fail "--expect-write-identity with no GH_TOKEN: exit $rc; output: $out"
+fi
+
+# The read-only mode is unchanged: the same placeholder still READS as the
+# login, which is exactly why reads and writes need different modes.
+set +e
+out=$(STUB_TOKEN_LOGIN=nathanjohnpayne GH_TOKEN=proxy-injected run_check --expect-token-identity nathanjohnpayne 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "--expect-token-identity still answers the read question for the placeholder (exit 0)"
+else
+  fail "--expect-token-identity placeholder read: exit $rc; output: $out"
 fi
 
 # -----------------------------------------------------------------------

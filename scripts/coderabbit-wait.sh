@@ -3162,7 +3162,7 @@ verify_reviewer_write_identity() {
         log "GH_TOKEN login '${token_login:-<unresolvable>}' is not in available_reviewers; falling back to default expected reviewer '$EXPECTED_REVIEWER_IDENTITY'"
       fi
     fi
-    GH_TOKEN="$GH_TOKEN" "$checker" --expect-token-identity "$EXPECTED_REVIEWER_IDENTITY" \
+    GH_TOKEN="$GH_TOKEN" "$checker" --expect-write-identity "$EXPECTED_REVIEWER_IDENTITY" \
       || return 1
   fi
 }

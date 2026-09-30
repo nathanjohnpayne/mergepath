@@ -64,7 +64,7 @@ The current CI service account is `nathanpayne-robot`. It holds no reviewer stan
 For repo work, `GH_TOKEN` is now the per-command attribution source for the guarded `gh` writes. Do not rely on the machine-global gh keyring selected account for author/reviewer bylines.
 
 - **Read paths** (`gh api user`, `gh api ...` GETs, `gh pr view`, `gh pr checks`) honor `GH_TOKEN`. Pass it inline per command.
-- **Guarded write paths** (`gh pr create`, `gh pr merge`, `gh pr edit`, `gh pr comment`, `gh pr review`, `gh issue comment`) MUST go through `scripts/gh-as-author.sh` or `scripts/gh-as-reviewer.sh`. The wrapper resolves the expected token, verifies its effective login with `scripts/identity-check.sh --expect-token-identity`, and runs exactly the wrapped command with `GH_TOKEN` set and `GITHUB_TOKEN` cleared. The wrappers never change stored gh account selection.
+- **Guarded write paths** (`gh pr create`, `gh pr merge`, `gh pr edit`, `gh pr comment`, `gh pr review`, `gh issue comment`) MUST go through `scripts/gh-as-author.sh` or `scripts/gh-as-reviewer.sh`. The wrapper resolves the expected token, verifies it with `scripts/identity-check.sh --expect-write-identity` (its login must match and it must be a user-held credential, not a brokered or app-installed one, #1057), and runs exactly the wrapped command with `GH_TOKEN` set and `GITHUB_TOKEN` cleared. After a comment, review, merge, or edit it reads the written object back and exits 5 when GitHub attributes it to another login. The wrappers never change stored gh account selection.
 - **Bare and inline-token guarded writes** fail closed in `scripts/hooks/gh-pr-guard.sh`. `GH_TOKEN=... gh pr review ...` is not an approved substitute for the wrapper because it does not prove the token belongs to the expected identity.
 
 `codex-review-request.sh` posts the load-bearing `@codex review` trigger through `scripts/gh-as-author.sh`. The Codex GitHub App only monitors trigger comments authored by `nathanjohnpayne` (#405), so this trigger is an author-identity write even though the polling reads use the reviewer PAT. `coderabbit-wait.sh` and other long-tail helpers continue to use the cached PATs they load from preflight; the wrapper-mandatory contract in this section covers the core guarded `gh` write surface.
@@ -208,14 +208,15 @@ The current contract is token-attributed for the guarded core `gh` write surface
 | `gh issue comment` | reviewer wrapper | reviewer identity verified from the token |
 | `gh issue close` | not hook-gated by #411 | token selected by caller |
 | `gh api GET ...` | direct read with `GH_TOKEN=<read PAT>` | no write byline |
-| `gh api graphql resolveReviewThread` | `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` plus `identity-check.sh --expect-token-identity <reviewer>` before mutation | reviewer token |
+| `gh api graphql resolveReviewThread` | `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` plus `identity-check.sh --expect-write-identity <reviewer>` before mutation | reviewer token |
 | `gh workflow run` | direct with an author or reviewer PAT that has `workflow` scope | no comment/review byline |
 
 Notes on the token-wrapper contract:
 
 - **Wrapper-mandatory writes.** `scripts/hooks/gh-pr-guard.sh` blocks bare and inline-token forms of the guarded write commands before they can run. Use the author wrapper for author operations and the reviewer wrapper for reviewer comments/reviews. The hook checks command structure, including wrapper spoofing such as a wrapper path in an `echo` before a bare `gh pr create`.
 
-- **Token verification.** `scripts/lib/gh-token-resolver.sh` selects a token from the expected preflight env var or `gh auth token --user <login>`, then verifies it with `scripts/identity-check.sh --expect-token-identity <login>`. No token material is printed. A mismatch exits before the wrapped write starts.
+- **Token verification.** `scripts/lib/gh-token-resolver.sh` selects a token from the expected preflight env var or `gh auth token --user <login>`, then verifies it with `scripts/identity-check.sh --expect-write-identity <login>`: the token must read as `<login>` and be a user-held credential (`ghp_`, `github_pat_`, `gho_`, `ghu_`). A token that only reads as `<login>` is not enough. The Claude cloud placeholder `proxy-injected` reads as the human and writes as `claude[bot]`, so it is refused on its form before any API call (#1057). No token material is printed. A mismatch exits before the wrapped write starts.
+- **Byline readback.** After `gh pr comment`, `gh issue comment`, `gh pr review`, `gh pr merge`, and `gh pr edit`, the wrapper re-reads what the write produced (the comment, a review newer than a pre-write snapshot, `merged_by` or `auto_merge.enabled_by`, or new issue events) with the same token and exits 5, with the #241 recovery text, when its author is another login. A target that cannot be resolved beforehand is not written. A body-only `gh pr edit` leaves no event to read back and is accepted on the pre-write check, which the wrapper reports.
 
 - **Legacy keyring assertions.** `scripts/identity-check.sh` still has keyring assertion modes for helper paths that have not moved to the wrapper contract yet. Those modes are compatibility checks, not the canonical path for the core guarded `gh` writes listed above.
 
@@ -1178,7 +1179,7 @@ scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
 ```
 
 - Use the item ID from the [PAT lookup table](#pat-lookup-table) for your agent identity. Do not use the 1Password item title.
-- Verify token identity with `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login` or by letting the wrapper call `identity-check.sh --expect-token-identity` before the write. Do not use `gh auth status` as an attribution proof.
+- Verify token identity with `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login` or by letting the wrapper call `identity-check.sh --expect-write-identity` before the write. Do not use `gh auth status` as an attribution proof.
 - If `op whoami` says you are not signed in, still run the `op read ...` command in an interactive TTY. That is what triggers the 1Password biometric prompt on local machines.
 - If GitHub returns `Review Can not approve your own pull request`, you either the PR author is wrong, the reviewer token resolved to the author identity, or the [No-self-approve scoping](#no-self-approve-scoping) rule applies. Confirm the PR author and token identity before retrying.
 
@@ -1257,7 +1258,7 @@ Always wrap author-identity writes in `scripts/gh-as-author.sh`:
 scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
 ```
 
-The wrapper resolves a token for `nathanjohnpayne`, verifies that token with `scripts/identity-check.sh --expect-token-identity`, runs the wrapped command with process-local `GH_TOKEN`, and never changes the gh keyring. For `gh pr create` specifically, it also runs a post-create `gh pr view --json author` verification using the same token and exits non-zero (code 5) if `author.login` does not match the expected identity. The `gh-pr-guard.sh` PreToolUse hook independently blocks bare `gh pr create` and inline-token substitutes before they can run.
+The wrapper resolves a token for `nathanjohnpayne`, verifies that token with `scripts/identity-check.sh --expect-write-identity`, runs the wrapped command with process-local `GH_TOKEN`, and never changes the gh keyring. For `gh pr create` specifically, it also runs a post-create `gh pr view --json author` verification using the same token and exits non-zero (code 5) if `author.login` does not match the expected identity. The `gh-pr-guard.sh` PreToolUse hook independently blocks bare `gh pr create` and inline-token substitutes before they can run.
 
 ### Detection
 

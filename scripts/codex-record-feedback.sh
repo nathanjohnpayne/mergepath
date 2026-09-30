@@ -332,7 +332,7 @@ AS_REVIEWER="$__CRF_DIR/gh-as-reviewer.sh"
 # because the wrapper finds no reviewer-token source. When NO other source is
 # present, forward ambient $GH_TOKEN as $OP_PREFLIGHT_REVIEWER_PAT so the wrapper
 # can use it. Attribution is NOT weakened: gh-token-resolver.sh still verifies the
-# token with identity-check.sh --expect-token-identity "$REVIEWER_IDENTITY", so a
+# token with identity-check.sh --expect-write-identity "$REVIEWER_IDENTITY", so a
 # non-reviewer token fails closed and the byline stays the reviewer identity.
 if [ -z "${OP_PREFLIGHT_REVIEWER_PAT:-}" ] && [ -n "${GH_TOKEN:-}" ]; then
   if ! env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --user "$REVIEWER_IDENTITY" >/dev/null 2>&1; then

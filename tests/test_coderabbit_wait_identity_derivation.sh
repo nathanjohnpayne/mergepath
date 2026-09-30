@@ -67,7 +67,7 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 state_dir=${CODERABBIT_TEST_STATE_DIR:?}
-[ "${1:-}" = "--expect-token-identity" ] || exit 2
+[ "${1:-}" = "--expect-write-identity" ] || exit 2
 printf '%s\n' "${2:-}" >>"$state_dir/identity-args"
 [ "${2:-}" = "${CODERABBIT_TEST_TOKEN_LOGIN:?}" ] || exit 1
 exit 0

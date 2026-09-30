@@ -949,7 +949,7 @@ if [ "${RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK:-0}" != "1" ] && ! $DRY_RUN; then
     expected_login="nathanpayne-${MERGEPATH_AGENT:-claude}"
   fi
   if ! GH_TOKEN="$PAT_GH_TOKEN" "$CHECKER" \
-       --expect-token-identity "$expected_login"; then
+       --expect-write-identity "$expected_login"; then
     echo "ERROR: identity-check failed before any mutation. Refusing to" >&2
     echo "       resolve threads. Confirm GH_TOKEN / OP_PREFLIGHT_REVIEWER_PAT" >&2
     echo "       resolves to $expected_login, then re-run." >&2

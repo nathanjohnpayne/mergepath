@@ -175,15 +175,8 @@ if [ -f "$ROOT/.github/review-policy.yml" ]; then
   policy_author="$(grep -m1 '^author_identity:' "$ROOT/.github/review-policy.yml" | awk '{print $2}' | sed -E "s/^[\"']//; s/[\"']\$//" || true)"
   [ -n "$policy_author" ] && AUTHOR_IDENTITY="$policy_author"
 fi
-# A Codex cloud environment configured by the recipe sets only
-# MERGEPATH_AGENT_SURFACE=codex-cloud; without an explicit agent the resolver's
-# default reviewer would be nathanpayne-claude (#1537). The surface names the
-# agent, so it selects the reviewer when nothing more specific does.
-if [ -z "${GH_AS_REVIEWER_IDENTITY:-}${MERGEPATH_AGENT:-}${OP_PREFLIGHT_AGENT:-}" ] \
-   && [ "${MERGEPATH_AGENT_SURFACE:-}" = "codex-cloud" ]; then
-  MERGEPATH_AGENT=codex
-  export MERGEPATH_AGENT
-fi
+# gh_default_reviewer_identity resolves a codex-cloud surface to the Codex
+# reviewer itself (#1539), so the probe and the write wrappers always agree.
 REVIEWER_IDENTITY="$(gh_default_reviewer_identity)"
 
 # A non-secret fingerprint of every credential the measurements can use
@@ -210,7 +203,10 @@ credential_fingerprint() {
   fi
   # shellcheck disable=SC2034
   local GH_CONFIG_DIR_VALUE="${GH_CONFIG_DIR:-}"
-  for var in OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT GH_TOKEN GITHUB_TOKEN GH_CONFIG_DIR_VALUE keyring_author keyring_reviewer keyring_active; do
+  # GH_HOST selects which server every bare gh call reaches (#1540).
+  # shellcheck disable=SC2034
+  local GH_HOST_VALUE="${GH_HOST:-}"
+  for var in OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT GH_TOKEN GITHUB_TOKEN GH_CONFIG_DIR_VALUE GH_HOST_VALUE keyring_author keyring_reviewer keyring_active; do
     val="${!var:-}"
     if [ -z "$val" ]; then
       h="-"
@@ -310,7 +306,8 @@ if [ "$MODE" = "check" ]; then
   [ "$cached_session" = "${CLAUDE_CODE_REMOTE_SESSION_ID:-}" ] \
     || die 2 "capability cache was measured in session '${cached_session:-none}', this is '${CLAUDE_CODE_REMOTE_SESSION_ID:-none}'; re-run the probe"
   cached_cross="$(snap -r '.cross_repo_target // empty')" || die 2 "capability cache for $REPO could not be read; re-run the probe"
-  [ "$cached_cross" = "$CROSS_REPO" ] \
+  # Repository names are case-insensitive, as in the measurement (#1540).
+  [ "$(printf '%s' "$cached_cross" | tr 'A-Z' 'a-z')" = "$(printf '%s' "$CROSS_REPO" | tr 'A-Z' 'a-z')" ] \
     || die 2 "capability cache measured cross-repo against '$cached_cross', this check asks about '$CROSS_REPO'; re-run the probe"
   cached_fp="$(snap -r '.credential_fingerprint // empty')" || die 2 "capability cache for $REPO could not be read; re-run the probe"
   [ "$cached_fp" = "$CREDENTIAL_FINGERPRINT" ] \
@@ -459,7 +456,11 @@ measure_write() {
       # PAT is the ONLY candidate (a failure there is final, it never falls
       # through), otherwise the ambient token and then the keyring token. A
       # fallback the resolver never tried says nothing about its failure.
+      # The resolver also refuses a brokered or app-installed candidate before
+      # it reads GET /user, so report the class of the candidate it would have
+      # started from; that is the actionable half of the refusal.
       local candidate repeat_status repeat_login n=0
+      class="$(credential_class "${!preferred:-${GH_TOKEN:-}}")"
       local -a tried=()
       if [ -n "${!preferred:-}" ]; then
         tried=("${!preferred}")

@@ -7,8 +7,10 @@
 #
 # On success it sets GH_RESOLVED_TOKEN in the caller's shell. It never
 # prints token material. The selected token is verified with
-# scripts/identity-check.sh --expect-token-identity before the caller
-# can use it for a write.
+# scripts/identity-check.sh --expect-write-identity before the caller
+# can use it for a write: the login must match AND the token must be a
+# user-held credential, because a brokered token can read as the right
+# login and still write under a bot's (#1057).
 #
 # Bash 3.2 portable.
 
@@ -25,6 +27,12 @@ gh_default_reviewer_identity() {
     printf 'nathanpayne-%s\n' "$MERGEPATH_AGENT"
   elif [ -n "${OP_PREFLIGHT_AGENT:-}" ]; then
     printf 'nathanpayne-%s\n' "$OP_PREFLIGHT_AGENT"
+  elif [ "${MERGEPATH_AGENT_SURFACE:-}" = "codex-cloud" ]; then
+    # A Codex cloud environment configured by docs/agents/cloud-environments.md
+    # names its surface and may name nothing else. The surface identifies the
+    # agent, and resolving it HERE keeps the capability probe and the write
+    # wrappers on the same reviewer (#1539).
+    printf '%s\n' "nathanpayne-codex"
   else
     printf '%s\n' "nathanpayne-claude"
   fi
@@ -50,7 +58,7 @@ gh_resolve_token_for_identity() {
   fi
 
   # Resolution order (every candidate is verified via identity-check.sh
-  # --expect-token-identity before it can win — no candidate is ever blindly
+  # --expect-write-identity before it can win — no candidate is ever blindly
   # trusted, and no token material is printed):
   #
   #   1. The preferred OP_PREFLIGHT_*_PAT env var (if set). A WRONG identity
@@ -62,6 +70,10 @@ gh_resolve_token_for_identity() {
   #      OP_PREFLIGHT cache, this is the only token material available. It is
   #      tried only when (1) supplied no token. A WRONG-identity ambient token
   #      is REJECTED and falls through to the keyring — never blindly trusted.
+  #      So is one whose write identity cannot be established: the Claude
+  #      cloud placeholder `proxy-injected` reads as the human through
+  #      `GET /user` and writes as `claude[bot]`, and before #1057 it won
+  #      here silently.
   #   3. The `gh auth token --user <login>` keyring fallback. A WRONG identity
   #      here is a hard error (the keyring returned a token for the wrong
   #      account).
@@ -75,7 +87,7 @@ gh_resolve_token_for_identity() {
     token="${!preferred_var:-}"
     if [ -n "$token" ]; then
       source="\$$preferred_var"
-      if ! GH_TOKEN="$token" "$checker" --expect-token-identity "$expected_login"; then
+      if ! GH_TOKEN="$token" "$checker" --expect-write-identity "$expected_login"; then
         echo "$label: selected token source ($source) did not verify as $expected_login." >&2
         return 2
       fi
@@ -90,11 +102,11 @@ gh_resolve_token_for_identity() {
   # GH_TOKEN may belong to a different identity than the one this write needs
   # (e.g. a CI-default token), and the keyring may still hold the right one.
   if [ -n "${GH_TOKEN:-}" ]; then
-    if GH_TOKEN="$GH_TOKEN" "$checker" --expect-token-identity "$expected_login" 2>/dev/null; then
+    if GH_TOKEN="$GH_TOKEN" "$checker" --expect-write-identity "$expected_login" 2>/dev/null; then
       GH_RESOLVED_TOKEN="$GH_TOKEN"
       return 0
     fi
-    echo "$label: ambient GH_TOKEN did not verify as $expected_login; trying gh auth token --user." >&2
+    echo "$label: ambient GH_TOKEN did not verify as a user-held credential for $expected_login; trying gh auth token --user." >&2
   fi
 
   # --- Candidate 3: gh auth token --user keyring fallback (hard-fail) ------
@@ -114,7 +126,7 @@ gh_resolve_token_for_identity() {
     return 3
   fi
 
-  if ! GH_TOKEN="$token" "$checker" --expect-token-identity "$expected_login"; then
+  if ! GH_TOKEN="$token" "$checker" --expect-write-identity "$expected_login"; then
     echo "$label: selected token source ($source) did not verify as $expected_login." >&2
     return 2
   fi

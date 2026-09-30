@@ -891,6 +891,8 @@ paths:
       - "scripts/lib/pr-body-contract.sh"   # sourced; provides pr_body_validate
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/lib/reviewers-helpers.sh"  # pr-body-contract.sh hard-sources it
+      - "scripts/lib/gh-write-readback.sh"  # sourced; post-write byline readback (#1057)
+      - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it
   # Single entrypoint for PR-body validation (#1132). The required
   # Self-Review gate, gh-as-author.sh and local checks all route through it, so
   # the contract has one tested implementation rather than a shell copy and a
@@ -908,6 +910,17 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/identity-check.sh"         # gh-token-resolver.sh executes it before any write
+      - "scripts/lib/gh-write-readback.sh"  # sourced; post-write byline readback (#1057)
+      - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it
+  # Post-write byline readback (#1057 A2 layer 3), sourced by both gh-as-*
+  # wrappers: re-reads the comment / review / merge / edit a guarded write
+  # produced and fails when GitHub attributes it to another login. It is the
+  # one check that holds whatever brokering scheme an environment uses, and
+  # on Codex (no PreToolUse hooks) the only one that runs at call time.
+  - path: scripts/lib/gh-write-readback.sh
+    type: canonical
+    consumers: all
   # Pre-action identity check (#284) — the assertion helper that every
   # WRITE-path helper script calls at the top to fail-close on
   # active-account drift. Travels with the helper scripts that depend
@@ -918,6 +931,8 @@ paths:
   - path: scripts/identity-check.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/lib/credential-class.sh"   # --expect-write-identity sources it; fails closed (exit 3) without it
   # The guard sources scripts/lib/pr-body-contract.sh, which in turn shells out
   # to scripts/lib/pr-body-contract.mjs. Both are declared below and named in
   # `requires:` here, because the coupling is lockstep and fails LOUDLY but
@@ -961,6 +976,8 @@ paths:
       - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/lib/reviewers-helpers.sh"  # transitive dependency of the shell facade
+      - "scripts/lib/gh-write-readback.sh"   # gh-as-author.sh runtime closure (#1057)
+      - "scripts/lib/credential-class.sh"    # identity-check.sh --expect-write-identity (#1057)
       # The suite EXECUTES these, so a commit-path propagation that selects the
       # test without them leaves a consumer running it against a missing or
       # stale copy -- the required check_gh_as_author lint suite then fails on
@@ -1739,6 +1756,8 @@ paths:
       - "scripts/lib/pr-body-contract.sh"
       - "scripts/lib/pr-body-contract.mjs"
       - "scripts/lib/reviewers-helpers.sh"
+      - "scripts/lib/gh-write-readback.sh"   # gh-as-author.sh runtime closure (#1057)
+      - "scripts/lib/credential-class.sh"    # identity-check.sh --expect-write-identity (#1057)
   # The source-pinned required workflow sends its one private-nonce request to
   # this target-base responder. Propagate the workflow and recorder in the
   # same wave: either one without the other makes every queue handshake fail
@@ -1762,6 +1781,8 @@ paths:
       - "scripts/lib/pr-body-contract.sh"
       - "scripts/lib/pr-body-contract.mjs"
       - "scripts/lib/reviewers-helpers.sh"
+      - "scripts/lib/gh-write-readback.sh"   # gh-as-author.sh runtime closure (#1057)
+      - "scripts/lib/credential-class.sh"    # identity-check.sh --expect-write-identity (#1057)
   - path: scripts/workflow/record-merge-queue-final-audit.sh
     type: canonical
     consumers: all
@@ -1778,6 +1799,8 @@ paths:
       - "scripts/lib/pr-body-contract.sh"
       - "scripts/lib/pr-body-contract.mjs"
       - "scripts/lib/reviewers-helpers.sh"
+      - "scripts/lib/gh-write-readback.sh"   # gh-as-author.sh runtime closure (#1057)
+      - "scripts/lib/credential-class.sh"    # identity-check.sh --expect-write-identity (#1057)
   - path: scripts/workflow/report-approval-continuation-failures.sh
     type: canonical
     consumers: all
@@ -2058,6 +2081,8 @@ paths:
       - "scripts/lib/pr-body-contract.sh"      # gh-as-author.sh runtime closure (#1058)
       - "scripts/lib/pr-body-contract.mjs"     # gh-as-author.sh runtime closure (#1058)
       - "scripts/lib/reviewers-helpers.sh"     # pr-body-contract.sh runtime closure (#1058)
+      - "scripts/lib/gh-write-readback.sh"   # gh-as-author.sh runtime closure (#1057)
+      - "scripts/lib/credential-class.sh"    # identity-check.sh --expect-write-identity (#1057)
       - "scripts/gh-as-reviewer.sh"            # check_gh_as_author (transitive)
       - "scripts/hooks/gh-pr-guard.sh"         # tests/test_gh_pr_guard.sh runs it
       - "scripts/coderabbit-automerge-rate-limit-gate.sh"  # tests/test_coderabbit_automerge_rate_limit_gate.sh runs it (#489/#521)
@@ -2119,6 +2144,8 @@ paths:
       - "scripts/gh-as-author.sh"                 # #1058, final target-audit marker write
       - "scripts/lib/gh-token-resolver.sh"         # gh-as-author.sh runtime closure (#1058)
       - "scripts/identity-check.sh"                # gh-token-resolver.sh runtime closure (#1058)
+      - "scripts/lib/gh-write-readback.sh"   # gh-as-author.sh runtime closure (#1057)
+      - "scripts/lib/credential-class.sh"    # identity-check.sh --expect-write-identity (#1057)
       - "scripts/lib/gh-command-classifier.sh"     # gh-as-author.sh runtime closure (#1058)
       - "scripts/lib/pr-body-contract.sh"          # gh-as-author.sh runtime closure (#1058)
       - "scripts/lib/pr-body-contract.mjs"         # gh-as-author.sh runtime closure (#1058)

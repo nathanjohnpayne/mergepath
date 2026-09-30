@@ -20,7 +20,9 @@
 #   1    setup or invocation error
 #   2    token verification failed
 #   3    token lookup failed
-#   5    post-create author verification failed or could not complete
+#   5    post-write author verification failed or could not complete:
+#        `pr create` since #241; `pr comment`, `pr merge`, `pr edit`,
+#        `pr review` and `issue comment` since #1057
 #   *    propagated from the wrapped command otherwise
 #
 # Bash 3.2 portable.
@@ -34,6 +36,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/scripts/lib/pr-body-contract.sh"
 # shellcheck source=lib/gh-command-classifier.sh
 . "$ROOT/scripts/lib/gh-command-classifier.sh"
+# shellcheck source=lib/gh-write-readback.sh
+. "$ROOT/scripts/lib/gh-write-readback.sh"
 
 AUTHOR="${GH_AS_AUTHOR_IDENTITY:-nathanjohnpayne}"
 
@@ -234,8 +238,32 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
   exit 0
 fi
 
+# Byline readback for every other guarded verb (#1057 A2 layer 3), the same
+# contract as the pr-create readback above: verify the token before the write,
+# then the written object after it.
+if ! gh_readback_prepare "$AUTHOR" "$TOKEN" "gh-as-author" -- "$@"; then
+  exit 5
+fi
+
+if [ "$GH_READBACK_KIND" = "none" ]; then
+  set +e
+  run_with_author_token "$@"
+  WRAPPED_RC=$?
+  set -e
+  exit "$WRAPPED_RC"
+fi
+
+TMP_OUT=$(mktemp "${TMPDIR:-/tmp}/gh-as-author-out.XXXXXX")
+trap 'rm -f "$TMP_OUT"' EXIT
 set +e
-run_with_author_token "$@"
-WRAPPED_RC=$?
+run_with_author_token "$@" | tee "$TMP_OUT"
+WRAPPED_RC=${PIPESTATUS[0]}
 set -e
-exit "$WRAPPED_RC"
+if [ "$WRAPPED_RC" -ne 0 ]; then
+  exit "$WRAPPED_RC"
+fi
+set +e
+gh_readback_verify "$TMP_OUT"
+VERIFY_RC=$?
+set -e
+exit "$VERIFY_RC"

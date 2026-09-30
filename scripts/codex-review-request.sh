@@ -1278,7 +1278,7 @@ post_author_pr_comment() { # <body> <purpose> [body-file|inline]
   if [ -n "${GH_TOKEN:-}" ] && [ -z "${OP_PREFLIGHT_AUTHOR_PAT:-}" ]; then
     identity_checker="$__CODEX_REQUEST_DIR/identity-check.sh"
     if [ -x "$identity_checker" ] \
-      && GH_TOKEN="$GH_TOKEN" "$identity_checker" --expect-token-identity "$AUTHOR_IDENTITY" >/dev/null 2>&1; then
+      && GH_TOKEN="$GH_TOKEN" "$identity_checker" --expect-write-identity "$AUTHOR_IDENTITY" >/dev/null 2>&1; then
       log "ambient GH_TOKEN verifies as author identity $AUTHOR_IDENTITY — bridging it into gh-as-author.sh as OP_PREFLIGHT_AUTHOR_PAT"
       bridge_author_pat="$GH_TOKEN"
     fi

@@ -764,7 +764,7 @@ write_identity_check_stub() {
   cat >"$dir/scripts/identity-check.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-[ "${1:-}" = "--expect-token-identity" ] || exit 2
+[ "${1:-}" = "--expect-write-identity" ] || exit 2
 [ "${2:-}" = "nathanjohnpayne" ] || exit 1
 [ "${GH_TOKEN:-}" = "author-pat-123" ] || exit 1
 exit 0
@@ -809,7 +809,7 @@ test_bridge_passes_configured_author_identity() {
   cat >"$dir/scripts/identity-check.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-[ "${1:-}" = "--expect-token-identity" ] || exit 2
+[ "${1:-}" = "--expect-write-identity" ] || exit 2
 [ "${2:-}" = "custom-owner" ] || exit 1
 [ "${GH_TOKEN:-}" = "author-pat-123" ] || exit 1
 exit 0
@@ -844,7 +844,7 @@ test_candidate_author_cannot_reset_governing_request_cap() {
   cat >"$dir/scripts/identity-check.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-[ "${1:-}" = "--expect-token-identity" ] || exit 2
+[ "${1:-}" = "--expect-write-identity" ] || exit 2
 [ "${2:-}" = "custom-owner" ] || exit 1
 [ "${GH_TOKEN:-}" = "author-pat-123" ] || exit 1
 exit 0

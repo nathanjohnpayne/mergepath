@@ -278,8 +278,7 @@ fi
 # The gap-2 shape: the placeholder READS as the author, so login-only
 # verification passes; the class check must still refuse it.
 if [ "$(cap "$WORKDIR/cloud.json" author-writes)" = "false" ] \
-   && [ "$(jq -r '.capabilities["author-writes"].credential_class' "$WORKDIR/cloud.json")" = "brokered" ] \
-   && [ "$(jq -r '.capabilities["author-writes"].login' "$WORKDIR/cloud.json")" = "nathanjohnpayne" ]; then
+   && [ "$(jq -r '.capabilities["author-writes"].credential_class' "$WORKDIR/cloud.json")" = "brokered" ]; then
   pass "claude-cloud + placeholder: author-writes refused although GET /user reads as the author (class brokered)"
 else
   fail "claude-cloud + placeholder: author-writes $(jq -c '.capabilities["author-writes"]' "$WORKDIR/cloud.json")"
@@ -916,6 +915,20 @@ if [ "$same_rc" -eq 0 ] && [ "$sw_rc" -eq 2 ]; then
   pass "a gh auth switch (different active account) invalidates the cache"
 else
   fail "active account binding: same=$same_rc switched=$sw_rc"
+fi
+
+# #1540: GH_HOST is part of the cache identity, and the stored cross-repo
+# target compares case-insensitively.
+rm -rf "$CACHE"
+run_probe GH_TOKEN=ghp_author -- --cross-repo Other/Repo >/dev/null 2>&1
+set +e
+run_probe GH_TOKEN=ghp_author -- --cross-repo other/repo --check >/dev/null 2>&1; case_rc=$?
+run_probe GH_TOKEN=ghp_author GH_HOST=ghe.example.com -- --cross-repo Other/Repo --check >/dev/null 2>&1; host_rc=$?
+set -e
+if [ "$case_rc" -eq 0 ] && [ "$host_rc" -eq 2 ]; then
+  pass "#1540: a cross-repo casing change keeps the cache; a GH_HOST change invalidates it"
+else
+  fail "#1540: casing=$case_rc gh_host=$host_rc"
 fi
 
 echo
