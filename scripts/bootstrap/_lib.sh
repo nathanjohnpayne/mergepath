@@ -352,11 +352,15 @@ bootstrap::run_author_git() {
     return 2
   fi
 
-  # The wrapper owns git's credential and prompting here: it accepts only
-  # `git [-C <dir>] push [-u] <remote> [<refspec>...]`, pins the credential
-  # helper to the verified author token, keeps SSH keys and ambient helpers
-  # out, and refuses a remote that does not resolve to plain
-  # https://github.com/ (#1541). A prefix in front of git would be refused.
+  # The wrapper owns git's credential and prompting here. It accepts exactly
+  # `git -C <dir> push -u origin HEAD` with GH_AS_AUTHOR_PUSH_REPO naming the
+  # repository bootstrap created, and only when <dir> is a primary repository
+  # whose .git/config matches the value-checked allowlist, with
+  # remote.origin.url exactly https://github.com/<owner/repo>.git (or its exact
+  # git@github.com: spelling, pushed over HTTPS). The push runs with gh's
+  # credential helper (the verified author token) alone and with SSH keys,
+  # ambient helpers and hooks out of reach (#1541). A prefix in front of git,
+  # another remote or another refspec is refused.
   bootstrap::run "$label" \
     env GH_AS_AUTHOR_IDENTITY="$author_identity" GH_AS_AUTHOR_PUSH_REPO="$expected_repo" "$wrapper" -- git "$@"
 }
