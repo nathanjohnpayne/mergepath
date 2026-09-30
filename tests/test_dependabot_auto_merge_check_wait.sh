@@ -8,6 +8,11 @@
 # seen-but-pending timeout. This complements the structural checks in
 # scripts/ci/check_workflow_parsers, which cannot prove the request shape or
 # timeout classification.
+#
+# It also covers the Dependabot commit-provenance wiring: the workflow's
+# "Verify Dependabot commit provenance" step and its in-step
+# require_dependabot_provenance re-check, both run against a PATH-shimmed gh
+# serving the PR commits list (trusted, foreign-commit, unreadable).
 
 set -euo pipefail
 
@@ -258,6 +263,162 @@ if [ "$pending_rc" -ne 0 ] && \
   pass "seen pending check takes the completion timeout path"
 else
   fail "pending timeout was misclassified (rc=$pending_rc): $pending_output"
+fi
+
+# ---------------------------------------------------------------------------
+# Dependabot commit provenance. The job-level `if:` trusts the PR opener and
+# fetch-metadata reads only the first commit, so the workflow must refuse to
+# approve or merge unless EVERY commit on the PR is Dependabot-produced.
+# ---------------------------------------------------------------------------
+PROV_DIR="$WORK/prov"
+mkdir -p "$PROV_DIR/bin"
+PROV_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+PROV_OLD=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+cat >"$PROV_DIR/bin/gh" <<'SHIM'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$PROV_LOG"
+case "$1 ${2:-}" in
+  "api --paginate")
+    case "$3" in
+      repos/owner/repo/pulls/1/commits\?per_page=100)
+        [ "${PROV_MODE:-}" != unreadable ] || { echo "HTTP 502" >&2; exit 1; }
+        cat "$PROV_COMMITS"
+        ;;
+      *) echo "gh shim: unexpected api endpoint: $3" >&2; exit 91 ;;
+    esac
+    ;;
+  "pr view")
+    printf '%s\n' "${PROV_ARMED:-false}"
+    ;;
+  "pr merge")
+    [ "${3:-}" = "--disable-auto" ] || { echo "gh shim: unexpected merge: $*" >&2; exit 92; }
+    ;;
+  *) echo "gh shim: unexpected command: $*" >&2; exit 93 ;;
+esac
+SHIM
+chmod +x "$PROV_DIR/bin/gh"
+
+prov_commit() {  # <sha> <author> <committer> <verified>
+  jq -nc --arg sha "$1" --arg a "$2" --arg c "$3" --argjson v "$4" \
+    '{sha:$sha, author:{login:$a}, committer:{login:$c}, commit:{verification:{verified:$v}}}'
+}
+printf '[%s]\n' "$(prov_commit "$PROV_HEAD" 'dependabot[bot]' web-flow true)" >"$PROV_DIR/trusted.json"
+printf '[%s,%s]\n' "$(prov_commit "$PROV_OLD" 'dependabot[bot]' web-flow true)" \
+  "$(prov_commit "$PROV_HEAD" someone-with-push someone-with-push false)" >"$PROV_DIR/foreign.json"
+
+# Extract the provenance step's `run: |` body, dedented by its own indent.
+awk '
+  /- name: Verify Dependabot commit provenance/ { in_step = 1; next }
+  in_step && /^[[:space:]]*run: \|[[:space:]]*$/ { in_run = 1; indent = -1; next }
+  in_run && /^[[:space:]]*env:[[:space:]]*$/ { exit }
+  in_run {
+    if (indent < 0 && $0 ~ /[^[:space:]]/) { match($0, /^[[:space:]]*/); indent = RLENGTH }
+    print (length($0) >= indent ? substr($0, indent + 1) : "")
+  }
+' "$WORKFLOW" >"$PROV_DIR/step.sh"
+
+run_prov_step() {  # <commits_file> <mode> <armed>
+  : >"$PROV_DIR/gh.log"
+  : >"$PROV_DIR/output"
+  ( cd "$ROOT" && PATH="$PROV_DIR/bin:$PATH" PROV_LOG="$PROV_DIR/gh.log" \
+      PROV_COMMITS="$1" PROV_MODE="$2" PROV_ARMED="$3" \
+      GITHUB_OUTPUT="$PROV_DIR/output" GITHUB_REPOSITORY=owner/repo \
+      PR_URL=https://example.test/owner/repo/pull/1 PR_NUMBER=1 PR_HEAD_SHA="$PROV_HEAD" \
+      bash "$PROV_DIR/step.sh" )
+}
+
+if grep -Fq 'dependabot_commit_provenance "$GITHUB_REPOSITORY" "$PR_NUMBER" "$PR_HEAD_SHA"' "$PROV_DIR/step.sh"; then
+  pass "extracted the live provenance step"
+else
+  fail "could not extract the provenance step from the workflow"
+fi
+
+set +e
+out=$(run_prov_step "$PROV_DIR/trusted.json" ok false 2>&1); rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -Fxq 'trusted=true' "$PROV_DIR/output"; then
+  pass "provenance step: Dependabot-only commits → trusted=true"
+else
+  fail "provenance step: trusted case rc=$rc output=$(cat "$PROV_DIR/output"): $out"
+fi
+
+set +e
+out=$(run_prov_step "$PROV_DIR/foreign.json" ok true 2>&1); rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -Fxq 'trusted=false' "$PROV_DIR/output" \
+   && grep -Fq 'pr merge --disable-auto' "$PROV_DIR/gh.log" \
+   && [[ "$out" == *"not Dependabot-only"* ]]; then
+  pass "provenance step: foreign commit → trusted=false and an armed auto-merge is withdrawn"
+else
+  fail "provenance step: foreign case rc=$rc output=$(cat "$PROV_DIR/output") log=$(cat "$PROV_DIR/gh.log"): $out"
+fi
+
+set +e
+out=$(run_prov_step "$PROV_DIR/foreign.json" ok false 2>&1); rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -Fxq 'trusted=false' "$PROV_DIR/output" \
+   && ! grep -Fq 'pr merge' "$PROV_DIR/gh.log"; then
+  pass "provenance step: foreign commit, nothing armed → trusted=false, no merge call"
+else
+  fail "provenance step: foreign/unarmed case rc=$rc log=$(cat "$PROV_DIR/gh.log"): $out"
+fi
+
+set +e
+out=$(run_prov_step "$PROV_DIR/trusted.json" unreadable false 2>&1); rc=$?
+set -e
+if [ "$rc" -ne 0 ] && grep -Fxq 'trusted=false' "$PROV_DIR/output"; then
+  pass "provenance step: unreadable commits → job fails, trusted=false"
+else
+  fail "provenance step: unreadable case rc=$rc output=$(cat "$PROV_DIR/output"): $out"
+fi
+
+# The in-step re-check that guards the approve and both merge paths.
+extract_function require_dependabot_provenance >"$PROV_DIR/recheck.sh"
+run_recheck() {  # <commits_file> <mode> [armed]
+  ( cd "$ROOT" && PATH="$PROV_DIR/bin:$PATH" PROV_LOG="$PROV_DIR/gh.log" \
+      PROV_COMMITS="$1" PROV_MODE="$2" PROV_ARMED="${3:-false}" GITHUB_REPOSITORY=owner/repo PR_NUMBER=1 \
+      PR_URL=https://example.test/owner/repo/pull/1 \
+      bash -c 'set -euo pipefail
+        . scripts/lib/gh-api-array.sh
+        . scripts/lib/dependabot-commit-provenance.sh
+        . "$1"
+        require_dependabot_provenance "$2"
+        echo REACHED_ACTION' bash "$PROV_DIR/recheck.sh" "$PROV_HEAD" )
+}
+set +e
+out_t=$(run_recheck "$PROV_DIR/trusted.json" ok 2>&1); rc_t=$?
+: >"$PROV_DIR/gh.log"
+out_f=$(run_recheck "$PROV_DIR/foreign.json" ok true 2>&1); rc_f=$?
+withdrew_f=$(grep -c 'pr merge --disable-auto' "$PROV_DIR/gh.log" || true)
+out_u=$(run_recheck "$PROV_DIR/trusted.json" unreadable 2>&1); rc_u=$?
+set -e
+if [ "$rc_t" -eq 0 ] && [[ "$out_t" == *REACHED_ACTION* ]] \
+   && [ "$rc_f" -eq 0 ] && [[ "$out_f" != *REACHED_ACTION* ]] && [ "$withdrew_f" -eq 1 ] \
+   && [ "$rc_u" -ne 0 ] && [[ "$out_u" != *REACHED_ACTION* ]]; then
+  pass "require_dependabot_provenance: trusted proceeds; foreign withdraws an armed auto-merge and stops cleanly; unreadable fails"
+else
+  fail "require_dependabot_provenance: t=$rc_t/$out_t f=$rc_f/$out_f u=$rc_u/$out_u"
+fi
+
+# Ordering: the approve is bound to a verified SHA, and each merge path
+# re-verifies the SHA it is pinned to.
+approve_block=$(awk '/APPROVE_SHA=\$\(gh pr view/{p=1} p{print} /event=APPROVE/{exit}' "$WORKFLOW")
+if [[ "$approve_block" == *'require_dependabot_provenance "$APPROVE_SHA"'* ]] \
+   && [[ "$approve_block" == *'-f commit_id="$APPROVE_SHA"'* ]] \
+   && ! grep -Fq 'gh pr review --approve' "$WORKFLOW"; then
+  pass "approve is pinned to a provenance-verified commit_id"
+else
+  fail "approve must verify provenance and bind commit_id to the verified SHA"
+fi
+recheck_before_merge=$(awk '
+  /^[[:space:]]*require_current_head_checks_success[[:space:]]*$/ { getline nxt; if (nxt ~ /require_dependabot_provenance "\$CURRENT_HEAD_SHA"/) n++ }
+  END { print n + 0 }' "$WORKFLOW")
+if [ "$recheck_before_merge" -ge 2 ] \
+   && grep -Fq "steps.provenance.outputs.trusted == 'true'" "$WORKFLOW"; then
+  pass "both merge paths re-verify provenance on the pinned head; approve step gated on trusted"
+else
+  fail "expected provenance re-check after each head pin (got $recheck_before_merge) and a trusted-gated approve step"
 fi
 
 echo "test_dependabot_auto_merge_check_wait: $PASS passed, $FAIL failed"
