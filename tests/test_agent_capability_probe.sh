@@ -866,6 +866,13 @@ if [ "$(jq 'has("credential_fingerprint")' "$WORKDIR/fp.json")" = "false" ] \
 else
   fail "fingerprint placement: stdout=$(jq 'has("credential_fingerprint")' "$WORKDIR/fp.json") cache=$(jq 'has("credential_fingerprint")' "$CACHE/agent-capability-o_r-nathanpayne-claude.json")"
 fi
+# GNU stat first: on Linux `stat -f` means filesystem status and still exits 0.
+perm="$(stat -c '%a' "$CACHE/agent-capability-o_r-nathanpayne-claude.json" 2>/dev/null || stat -f '%Lp' "$CACHE/agent-capability-o_r-nathanpayne-claude.json")"
+if [ "$perm" = "600" ]; then
+  pass "the cache file is owner-only (600)"
+else
+  fail "cache file mode is $perm, expected 600"
+fi
 jq '.schema = 1' "$CACHE/agent-capability-o_r-nathanpayne-claude.json" >"$WORKDIR/s1.json" && cp "$WORKDIR/s1.json" "$CACHE/agent-capability-o_r-nathanpayne-claude.json"
 set +e
 run_probe GH_TOKEN=ghp_author GITHUB_TOKEN=ghp_author STUB_KEYRING_nathanpayne_claude=ghp_reviewer -- --check >/dev/null 2>&1; s1_rc=$?

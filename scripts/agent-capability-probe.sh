@@ -677,8 +677,9 @@ if $WRITE_CACHE && $TRANSIENT; then
     sed 's/^/  /' "$WORKDIR/transient"
   } >&2
 elif $WRITE_CACHE; then
+  # The cache holds the credential fingerprint, so it is created owner-only.
   if mkdir -p "$CACHE_DIR" 2>/dev/null \
-    && printf '%s\n' "$RESULT" | jq --arg fp "$CREDENTIAL_FINGERPRINT" '. + {credential_fingerprint: $fp}' >"$CACHE_FILE.tmp.$$" 2>/dev/null \
+    && ( umask 077; printf '%s\n' "$RESULT" | jq --arg fp "$CREDENTIAL_FINGERPRINT" '. + {credential_fingerprint: $fp}' >"$CACHE_FILE.tmp.$$" ) 2>/dev/null \
     && mv -f "$CACHE_FILE.tmp.$$" "$CACHE_FILE" 2>/dev/null; then
     :
   else
