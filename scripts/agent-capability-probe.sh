@@ -17,7 +17,8 @@
 #
 #   scripts/agent-capability-probe.sh --check [--print-exports] [--repo OWNER/REPO]
 #     Never probes, never touches the network. Validates the cache for this
-#     repo, surface, author identity and reviewer identity. Bare --check reports on stderr only. With
+#     repo, surface, author identity, reviewer identity and (in a Claude cloud
+#     session) CLAUDE_CODE_REMOTE_SESSION_ID. Bare --check reports on stderr only. With
 #     --print-exports, prints `export MERGEPATH_AGENT_TIER=...` and one
 #     `export MERGEPATH_CAP_<NAME>=0|1` per capability for
 #       eval "$(scripts/agent-capability-probe.sh --check --print-exports)"
@@ -35,8 +36,9 @@
 #                      restriction can refuse it)
 #   push-multi-branch  `git push --dry-run --no-verify` of HEAD to a fresh
 #                      branch name negotiates AND the repository reports push
-#                      permission; a dry run alone is never proof, and a
-#                      Claude cloud session is reported false from its
+#                      permission AND no ruleset restricts creating or
+#                      updating that name; a dry run alone is never proof, and
+#                      a Claude cloud session is reported false from its
 #                      documented push restriction regardless
 #   author-writes      the wrapper token resolver finds a token for the
 #                      repo's author_identity AND that token is a user-held
@@ -49,8 +51,12 @@
 #                      with `pull`: reviews and comments need read access
 #
 # Tier: the comma-joined set of granted capabilities other than read, in the
-# order above; `read-only` when read is the only one; `none` when not even
-# read succeeds.
+# order above; `read-only` when read is the only one; `none` when nothing is
+# granted.
+#
+# A result containing a transient failure (no response, 5xx, 429, or a
+# rate-limited 403) is printed with `transient_failures: true` but never
+# cached, so an outage cannot be replayed by --check as a denial.
 #
 # Surface: MERGEPATH_AGENT_SURFACE (local|claude-cloud|codex-cloud|ci) wins
 # when set; otherwise CLAUDE_CODE_REMOTE=true -> claude-cloud,
@@ -148,7 +154,10 @@ CACHE_DIR="${MERGEPATH_CAPABILITY_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/mer
 repo_from_origin() {
   local url
   url="$(git -C "$ROOT" remote get-url origin 2>/dev/null || true)"
-  printf '%s\n' "$url" | sed -nE 's#^(https://[^/]*github\.com/|git@github\.com:|ssh://git@github\.com/)([^/]+/[^/]+)$#\2#p' | sed -E 's/\.git$//'
+  # git@github-claude:owner/repo is the documented per-identity SSH alias form
+  # (github-claude / github-cursor / github-codex), so any git@github-<alias>
+  # host counts (Codex P2 on #1526).
+  printf '%s\n' "$url" | sed -nE 's#^(https://[^/]*github\.com/|git@github(-[A-Za-z0-9]+)?(\.com)?:|ssh://git@github(-[A-Za-z0-9]+)?(\.com)?/)([^/]+/[^/]+)$#\6#p' | sed -E 's/\.git$//'
 }
 
 if [ -z "$REPO" ]; then
@@ -204,6 +213,12 @@ if [ "$MODE" = "check" ]; then
   measured_at="$(jq -r '.measured_at_epoch' "$CACHE_FILE")"
   [ "$cached_repo" = "$REPO" ] || die 2 "capability cache is for $cached_repo, not $REPO; re-run the probe"
   [ "$cached_surface" = "$SURFACE" ] || die 2 "capability cache was measured on $cached_surface, this session is $SURFACE; re-run the probe"
+  # A cloud session's proxy scope and provisioned credentials belong to that
+  # session, so another session's measurement never answers this one's
+  # --check, even for the same repo and identities (Codex P2 on #1526).
+  cached_session="$(jq -r '.session_id // empty' "$CACHE_FILE")"
+  [ "$cached_session" = "${CLAUDE_CODE_REMOTE_SESSION_ID:-}" ] \
+    || die 2 "capability cache was measured in session '${cached_session:-none}', this is '${CLAUDE_CODE_REMOTE_SESSION_ID:-none}'; re-run the probe"
   cached_author="$(jq -r '.capabilities["author-writes"].identity // empty' "$CACHE_FILE")"
   cached_reviewer="$(jq -r '.capabilities["reviewer-writes"].identity // empty' "$CACHE_FILE")"
   [ "$cached_author" = "$AUTHOR_IDENTITY" ] && [ "$cached_reviewer" = "$REVIEWER_IDENTITY" ] \
@@ -269,17 +284,28 @@ api_request() {
     [ -n "$auth_token" ] && printf 'Authorization: token %s\n' "$auth_token" >"$hdr"
     [ -n "$query" ] && data="$(jq -cn --arg q "$query" '{query: $q}')"
     if [ -n "$data" ]; then
-      curl -sS -X "$method" -H @"$hdr" -H 'Accept: application/vnd.github+json' \
+      curl -sS --connect-timeout 10 --max-time 30 -X "$method" -H @"$hdr" -H 'Accept: application/vnd.github+json' \
         -D "$raw" -o "$prefix.body" --data "$data" "https://api.github.com/$path" 2>/dev/null || true
     else
-      curl -sS -X "$method" -H @"$hdr" -H 'Accept: application/vnd.github+json' \
+      curl -sS --connect-timeout 10 --max-time 30 -X "$method" -H @"$hdr" -H 'Accept: application/vnd.github+json' \
         -D "$raw" -o "$prefix.body" "https://api.github.com/$path" 2>/dev/null || true
     fi
     rm -f "$hdr"
     tr -d '\r' <"$raw" >"$prefix.headers" 2>/dev/null || true
   fi
   status="$(sed -nE '1s#^HTTP/[0-9.]+ ([0-9]{3}).*#\1#p' "$prefix.headers" 2>/dev/null || true)"
-  printf '%s\n' "${status:-000}"
+  status="${status:-000}"
+  # No response, a server error, or a rate limit says nothing about what this
+  # session may do. Record it so the result is not cached as a measurement
+  # (Codex P2 on #1526): an outage must not become a 12-hour denial.
+  case "$status" in
+    000|429|5??) echo "$path -> $status" >>"$WORKDIR/transient" ;;
+    403) if grep -Eiq '^x-ratelimit-remaining:[[:space:]]*0' "$prefix.headers" 2>/dev/null \
+            || grep -qi 'rate limit' "$prefix.body" 2>/dev/null; then
+           echo "$path -> 403 (rate limited)" >>"$WORKDIR/transient"
+         fi ;;
+  esac
+  printf '%s\n' "$status"
 }
 
 # measure_write <identity> <preferred var> <required permission> <json out>
@@ -289,13 +315,14 @@ api_request() {
 # Identity alone is not write capability (Codex P1 on #1526): the token must
 # also see <required permission> on the repository (`push` for the author,
 # who creates and merges PRs; `pull` for a reviewer, whose reviews and
-# comments need only read access), and a classic token's X-OAuth-Scopes must
-# carry `repo` (or `public_repo` on a public repository). A fine-grained
-# token's own permission set is not introspectable, so for one the
-# repository role is the evidence and the reason says so.
+# comments need only read access), and the token's own X-OAuth-Scopes must
+# be readable and carry `repo` (or `public_repo` on a public repository). A
+# fine-grained or app-user token sends no scopes header and GitHub offers no
+# way to read its own permissions, so for one the capability is reported
+# unverifiable and not granted.
 measure_write() {
   local identity="$1" preferred="$2" required="$3" out="$4"
-  local granted=false reason="" class="empty" login="" login_type="" status
+  local granted=false basis="measured" reason="" class="empty" login="" login_type="" status
   if ! $HAVE_GH; then
     reason="gh-absent"
   else
@@ -327,24 +354,29 @@ measure_write() {
           reason="verified $identity, but GET repos/$REPO with its token returned $repo_status"
         elif [ "$has_perm" != "true" ]; then
           reason="verified $identity, but its token lacks '$required' permission on $REPO"
-        elif grep -Eiq '^x-oauth-scopes:' "$WORKDIR/write-user.headers" \
-             && ! printf ',%s,' "$scopes" | grep -q ',repo,' \
+        elif ! grep -Eiq '^x-oauth-scopes:' "$WORKDIR/write-user.headers"; then
+          # .permissions is the USER's repository role. A fine-grained or
+          # app-user token can hold less than its user, and GitHub exposes no
+          # way to read that token's own permissions, so its write capability
+          # is unverifiable rather than granted (Codex P1 on #1526). The
+          # wrappers still attempt the write and read its byline back; this
+          # only keeps the tier from promising what was not measured.
+          basis="unverifiable"
+          reason="verified $identity with '$required' role on $REPO, but this token's own permissions cannot be read (fine-grained or app-user token); not granted"
+        elif ! printf ',%s,' "$scopes" | grep -q ',repo,' \
              && ! { [ "$private" = "false" ] && printf ',%s,' "$scopes" | grep -q ',public_repo,'; }; then
           reason="verified $identity with '$required' on $REPO, but the token's scopes ($scopes) do not include repo"
         else
           granted=true
-          case "$GH_RESOLVED_TOKEN" in
-            github_pat_*) reason="verified user-held fine-grained token for $identity with '$required' role on $REPO (token-level permissions are not introspectable)" ;;
-            *) reason="verified user-held credential for $identity with '$required' permission on $REPO" ;;
-          esac
+          reason="verified user-held credential for $identity with '$required' permission and repo scope on $REPO"
         fi
       fi
     fi
     GH_RESOLVED_TOKEN=""
   fi
-  jq -n --argjson g "$granted" --arg r "$reason" --arg i "$identity" \
+  jq -n --argjson g "$granted" --arg b "$basis" --arg r "$reason" --arg i "$identity" \
     --arg c "$class" --arg l "$login" --arg t "$login_type" \
-    '{granted: $g, basis: "measured", reason: $r, identity: $i, credential_class: $c, login: $l, login_type: $t}' >"$out"
+    '{granted: $g, basis: $b, reason: $r, identity: $i, credential_class: $c, login: $l, login_type: $t}' >"$out"
 }
 
 cap_json() { # <granted> <basis> <reason> <out>
@@ -415,20 +447,32 @@ if [ "$SURFACE" = "claude-cloud" ]; then
   cap_json false documented "Claude cloud proxy accepts pushes only to the session's working branch" "$WORKDIR/cap-push-multi-branch.json"
 else
   probe_branch="mergepath-capability-probe-$(date +%s)-$$"
+  rules_status=""
   # A dry run never sends the ref update, so on its own it proves only that
   # the remote is reachable and would negotiate (Codex P2 on #1526). Grant
   # the capability only when the repository also reports push permission for
   # the session's credential; branch rulesets on the new name are still not
   # evaluated, which the reason states.
   ambient_push="$(jq -r '.permissions.push // false' "$WORKDIR/read.body" 2>/dev/null || echo false)"
+  # Rulesets are the server-side policy a dry run never reaches (Codex P2 on
+  # #1526). GitHub reports the rules that would apply to a branch by name,
+  # including one that does not exist yet; a `creation` or `update` rule means
+  # a real push of a new branch can be refused, and an unreadable answer is
+  # not evidence either way.
+  rules_status="$(api_request "" GET "repos/$REPO/rules/branches/$probe_branch" "$WORKDIR/rules")"
+  restricting_rules="$(jq -r '[.[]?.type | select(. == "creation" or . == "update")] | unique | join(",")' "$WORKDIR/rules.body" 2>/dev/null || echo unreadable)"
   if ! GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/echo \
      GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes}" \
      git -C "$ROOT" push --dry-run --no-verify --quiet origin "HEAD:refs/heads/$probe_branch" >/dev/null 2>&1; then
     cap_json false measured-dry-run "dry-run push to a second branch was refused" "$WORKDIR/cap-push-multi-branch.json"
   elif [ "$ambient_push" != "true" ]; then
     cap_json false measured-dry-run "dry-run push negotiated, but the repository does not report push permission for this session; a real push is unverified" "$WORKDIR/cap-push-multi-branch.json"
+  elif [ "$rules_status" != "200" ]; then
+    cap_json false unverifiable "dry-run push negotiated with push permission, but the branch rules for a new branch could not be read ($rules_status); a real push is unverified" "$WORKDIR/cap-push-multi-branch.json"
+  elif [ -n "$restricting_rules" ]; then
+    cap_json false measured "rulesets restrict new branches ($restricting_rules); a real push of a second branch can be refused" "$WORKDIR/cap-push-multi-branch.json"
   else
-    cap_json true dry-run-and-permission "dry-run push to a second branch negotiated and the repository reports push permission (branch rulesets on new names are not evaluated)" "$WORKDIR/cap-push-multi-branch.json"
+    cap_json true dry-run-permission-rules "dry-run push to a second branch negotiated, the repository reports push permission, and no ruleset restricts creating or updating it" "$WORKDIR/cap-push-multi-branch.json"
   fi
 fi
 
@@ -437,6 +481,9 @@ measure_write "$REVIEWER_IDENTITY" "OP_PREFLIGHT_REVIEWER_PAT" pull "$WORKDIR/ca
 
 # --- assemble -------------------------------------------------------------
 
+# The tier lists every granted capability. An ambient read failure does not
+# hide a write path a provisioned PAT does have (Codex P2 on #1526): `none`
+# means nothing at all was granted.
 READ_GRANTED="$(jq -r '.granted' "$WORKDIR/cap-read.json")"
 TIER_PARTS=""
 for cap in $TIER_CAPABILITIES; do
@@ -444,13 +491,15 @@ for cap in $TIER_CAPABILITIES; do
     TIER_PARTS="${TIER_PARTS:+$TIER_PARTS,}$cap"
   fi
 done
-if [ "$READ_GRANTED" != "true" ]; then
-  TIER="none"
-elif [ -z "$TIER_PARTS" ]; then
+if [ -n "$TIER_PARTS" ]; then
+  TIER="$TIER_PARTS"
+elif [ "$READ_GRANTED" = "true" ]; then
   TIER="read-only"
 else
-  TIER="$TIER_PARTS"
+  TIER="none"
 fi
+TRANSIENT=false
+[ -s "$WORKDIR/transient" ] && TRANSIENT=true
 
 HEAD_SHA="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
 NOW="$(date +%s)"
@@ -467,6 +516,7 @@ RESULT="$(jq -n \
   --arg ambient_var "$AMBIENT_VAR" --arg ambient_class "$AMBIENT_CLASS" \
   --arg cross "$CROSS_REPO" \
   --arg tier "$TIER" \
+  --argjson transient "$TRANSIENT" \
   --slurpfile read "$WORKDIR/cap-read.json" \
   --slurpfile author "$WORKDIR/cap-author-writes.json" \
   --slurpfile reviewer "$WORKDIR/cap-reviewer-writes.json" \
@@ -492,10 +542,16 @@ RESULT="$(jq -n \
        "cross-repo": $crossrepo[0],
        "push-multi-branch": $push[0]
      },
-     tier: $tier
+     tier: $tier,
+     transient_failures: $transient
    }')"
 
-if $WRITE_CACHE; then
+if $WRITE_CACHE && $TRANSIENT; then
+  {
+    echo "agent-capability-probe: WARNING some requests failed transiently (no response, 5xx, or rate limit); not caching this result:"
+    sed 's/^/  /' "$WORKDIR/transient"
+  } >&2
+elif $WRITE_CACHE; then
   if mkdir -p "$CACHE_DIR" 2>/dev/null \
     && printf '%s\n' "$RESULT" >"$CACHE_FILE.tmp.$$" 2>/dev/null \
     && mv -f "$CACHE_FILE.tmp.$$" "$CACHE_FILE" 2>/dev/null; then

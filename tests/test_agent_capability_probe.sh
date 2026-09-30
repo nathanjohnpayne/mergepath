@@ -12,6 +12,7 @@
 #                   push on the repo
 #   ghp_reviewer    nathanpayne-claude, type User, pull only
 #   github_pat_ro   nathanjohnpayne, fine-grained (no scopes header), pull only
+#   github_pat_rw   nathanjohnpayne, fine-grained (no scopes header), push
 #   ghp_noscope     nathanjohnpayne, push, but X-OAuth-Scopes lacks repo
 #   ghs_author      nathanjohnpayne, type User (an app installation token
 #                   that nonetheless reads as the user: the class must refuse)
@@ -95,12 +96,15 @@ case "$tok" in
   ghp_author) login=nathanjohnpayne; scopes="repo, workflow"; perms='{"pull":true,"push":true}' ;;
   ghp_reviewer) login=nathanpayne-claude; scopes="repo" ;;
   github_pat_ro) login=nathanjohnpayne ;;
+  github_pat_rw) login=nathanjohnpayne; perms='{"pull":true,"push":true}' ;;
   ghp_noscope) login=nathanjohnpayne; scopes="gist, read:org"; perms='{"pull":true,"push":true}' ;;
   ghs_author) login=nathanjohnpayne ;;
   proxy-injected) login=nathanjohnpayne; perms='{"pull":true,"push":true}' ;;
 esac
 status=200; body=""
-if [ -z "$login" ]; then
+if [ -n "${STUB_FAIL_STATUS:-}" ]; then
+  status="$STUB_FAIL_STATUS"; body='{"message":"Server Error"}'
+elif [ -z "$login" ]; then
   status=401; body='{"message":"Bad credentials"}'
 elif [ "$path" = "user" ]; then
   body="{\"login\":\"$login\",\"type\":\"$type\"}"
@@ -110,6 +114,8 @@ elif [ "$path" = "graphql" ]; then
   else
     body="{\"data\":{\"viewer\":{\"login\":\"$login\"}}}"
   fi
+elif [ "${path#repos/$STUB_REPO/rules/branches/}" != "$path" ]; then
+  body="${STUB_RULES:-[]}"
 elif [ "$path" = "repos/$STUB_REPO" ]; then
   body="{\"full_name\":\"x\",\"private\":true,\"permissions\":$perms}"
 elif [ "$tok" = "proxy-injected" ]; then
@@ -477,6 +483,84 @@ if [ "$evald" = "1" ]; then
   pass "--check --print-exports exports MERGEPATH_CAP_READ"
 else
   fail "MERGEPATH_CAP_READ: got '$evald'"
+fi
+
+# ---------------------------------------------------------------------------
+# Codex round 2 on #1526.
+# ---------------------------------------------------------------------------
+# A fine-grained token whose USER has push is still unverifiable: the token's
+# own permissions cannot be read, so the capability is not granted.
+set +e
+run_probe OP_PREFLIGHT_AUTHOR_PAT=github_pat_rw -- --no-cache >"$WORKDIR/fg.json" 2>/dev/null
+set -e
+if [ "$(cap "$WORKDIR/fg.json" author-writes)" = "false" ] \
+   && [ "$(jq -r '.capabilities["author-writes"].basis' "$WORKDIR/fg.json")" = "unverifiable" ]; then
+  pass "fine-grained token with a push role: author-writes unverifiable, not granted"
+else
+  fail "fine-grained push role: $(jq -c '.capabilities["author-writes"]' "$WORKDIR/fg.json")"
+fi
+
+# A ruleset restricting branch creation refuses multi-branch push.
+set +e
+run_probe GH_TOKEN=ghp_author STUB_RULES='[{"type":"creation"}]' -- --no-cache >"$WORKDIR/rules.json" 2>/dev/null
+set -e
+if [ "$(cap "$WORKDIR/rules.json" push-multi-branch)" = "false" ] \
+   && reason "$WORKDIR/rules.json" push-multi-branch | grep -q "rulesets restrict new branches (creation)"; then
+  pass "creation ruleset on new branches: push-multi-branch not granted"
+else
+  fail "creation ruleset: $(jq -c '.capabilities["push-multi-branch"]' "$WORKDIR/rules.json")"
+fi
+
+# A server error is not a denial: flagged, and never cached.
+rm -rf "$CACHE"
+set +e
+run_probe GH_TOKEN=ghp_author STUB_FAIL_STATUS=502 -- >"$WORKDIR/outage.json" 2>"$WORKDIR/outage.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ "$(jq -r .transient_failures "$WORKDIR/outage.json")" = "true" ] \
+   && [ ! -e "$CACHE/agent-capability-o_r-nathanpayne-claude.json" ] \
+   && grep -q "not caching this result" "$WORKDIR/outage.err"; then
+  pass "5xx during the probe: result flagged transient and not cached"
+else
+  fail "transient outage: rc=$rc transient=$(jq -r .transient_failures "$WORKDIR/outage.json" 2>/dev/null) cache=$(ls "$CACHE" 2>/dev/null)"
+fi
+
+# A cloud cache belongs to its session.
+rm -rf "$CACHE"
+run_probe CLAUDE_CODE_REMOTE=true CLAUDE_CODE_REMOTE_SESSION_ID=cse_one GH_TOKEN=proxy-injected -- >/dev/null 2>&1
+set +e
+out="$(run_probe CLAUDE_CODE_REMOTE=true CLAUDE_CODE_REMOTE_SESSION_ID=cse_two -- --check --print-exports 2>/dev/null)"; rc=$?
+same="$(run_probe CLAUDE_CODE_REMOTE=true CLAUDE_CODE_REMOTE_SESSION_ID=cse_one -- --check --print-exports 2>/dev/null)"; same_rc=$?
+set -e
+if [ "$rc" -eq 2 ] && [ "$same_rc" -eq 0 ]; then
+  pass "--check: another cloud session's cache is rejected; the same session's is accepted"
+else
+  fail "--check session binding: other=$rc same=$same_rc"
+fi
+guard_fails "--check another session's cache" "$out"
+
+# The tier lists a write path even when the ambient credential cannot read.
+set +e
+run_probe OP_PREFLIGHT_AUTHOR_PAT=ghp_author -- --no-cache >"$WORKDIR/noread.json" 2>/dev/null
+set -e
+if [ "$(cap "$WORKDIR/noread.json" read)" = "false" ] && [ "$(jq -r .tier "$WORKDIR/noread.json")" = "author-writes" ]; then
+  pass "ambient read refused but author PAT verified: tier is author-writes, not none"
+else
+  fail "tier with ambient read failure: $(jq -r .tier "$WORKDIR/noread.json")"
+fi
+
+# The documented reviewer SSH aliases derive the repository.
+git -C "$FIX" remote set-url origin git@github-claude:owner/aliased.git
+set +e
+env -u GH_TOKEN GIT_SSH_COMMAND=false PATH="$STUB_DIR:$PATH" STUB_REPO=owner/aliased MERGEPATH_CAPABILITY_CACHE_DIR="$CACHE" \
+  "$PROBE" --no-cache >"$WORKDIR/alias.json" 2>/dev/null
+rc=$?
+set -e
+git -C "$FIX" remote set-url origin "$WORKDIR/origin.git"
+if [ "$rc" -eq 0 ] && [ "$(jq -r .repo "$WORKDIR/alias.json")" = "owner/aliased" ]; then
+  pass "git@github-claude:owner/repo derives the repository"
+else
+  fail "SSH alias: rc=$rc repo=$(jq -r .repo "$WORKDIR/alias.json" 2>/dev/null)"
 fi
 
 echo
