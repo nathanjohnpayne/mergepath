@@ -80,7 +80,10 @@
 #     class exemptions, even when both review-gate knobs are disabled (#1277).
 #     Query modes retain their narrower applicability/coverage contracts.
 #
-#   Dependabot PR (author == 'dependabot[bot]'):
+#   Dependabot PR (author == 'dependabot[bot]' AND every commit on the PR is
+#   Dependabot-authored, GitHub-committed and signature-verified — see
+#   scripts/lib/dependabot-commit-provenance.sh; a Dependabot-opened PR that
+#   carries any other commit is judged as an ordinary PR below):
 #     Gated by `dependabot.reviewer_gate.enabled` (default false; true in
 #     mergepath). When enabled, BLOCKS unless a reviewer identity in
 #     `available_reviewers` (≠ PR author) has a latest-state APPROVED
@@ -177,6 +180,16 @@ if [ ! -r "$SCRIPT_DIR/lib/gh-api-array.sh" ]; then
 fi
 # shellcheck source=lib/gh-api-array.sh
 . "$SCRIPT_DIR/lib/gh-api-array.sh"
+
+# Dependabot commit provenance: the Dependabot arm below is granted by the
+# commits the PR would merge, not by who opened it. Hard-required: without the
+# predicate the arm cannot be judged, and guessing either way is unsafe.
+if [ ! -r "$SCRIPT_DIR/lib/dependabot-commit-provenance.sh" ]; then
+  echo "ERROR: dependabot-commit-provenance helper missing: $SCRIPT_DIR/lib/dependabot-commit-provenance.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/dependabot-commit-provenance.sh
+. "$SCRIPT_DIR/lib/dependabot-commit-provenance.sh"
 
 # --- argument parsing -------------------------------------------------------
 
@@ -1126,8 +1139,36 @@ fi
 # APPROVED on HEAD only — Codex does not review Dependabot PRs). This
 # mirrors pr-audit.yml Check 2's precedence: a Dependabot PR that also
 # carries needs-external-review is still judged by the Dependabot rule.
-
+#
+# The narrower rule is earned by the COMMITS, not by the opener. A PR opened
+# by dependabot[bot] can carry additional commits from anyone with push
+# access, and it is still "authored by dependabot[bot]". So the arm applies
+# only when every commit on the PR, including the current HEAD, is
+# Dependabot-authored, GitHub-committed and signature-verified
+# (scripts/lib/dependabot-commit-provenance.sh). A PR that fails that
+# predicate is judged exactly like any other PR below — threshold /
+# protected-path derivation and the Phase 4 predicate — in the full gate AND
+# in the query modes. An unreadable commit list establishes nothing and fails
+# closed (exit 2) rather than choosing a lane.
+DEPENDABOT_LANE=false
 if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
+  provenance_rc=0
+  dependabot_commit_provenance "$REPO" "$PR_NUMBER" "$HEAD_SHA" || provenance_rc=$?
+  case "$provenance_rc" in
+    0)
+      DEPENDABOT_LANE=true
+      log "Dependabot provenance: $DEPENDABOT_PROVENANCE_REASON"
+      ;;
+    1)
+      log "Dependabot provenance: NOT Dependabot-only — $DEPENDABOT_PROVENANCE_REASON. Judging this PR as an ordinary PR (external-review / Phase 4 derivation), not by the Dependabot rule."
+      ;;
+    *)
+      die 2 "could not verify Dependabot commit provenance on HEAD $HEAD_SHA: $DEPENDABOT_PROVENANCE_REASON"
+      ;;
+  esac
+fi
+
+if [ "$DEPENDABOT_LANE" = "true" ]; then
   if [ "$DERIVE_ONLY" = "true" ] || [ "$PHASE_4_DERIVE_ONLY" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; then
     # Query mode always returns FALSE for a Dependabot PR (automated-4b P1).
     # The query consumers ask a NARROW question: will this PR be protected
