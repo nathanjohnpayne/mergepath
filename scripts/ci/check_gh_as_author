@@ -26,6 +26,12 @@ TESTS=(
   "tests/test_gh_wrapper_parallel.sh"
   "tests/test_gh_pr_guard.sh"
   "tests/test_check_no_bare_gh_writes.sh"
+  # Fail-closed helper guards at the identity-check / gh-as-author /
+  # gh-as-reviewer call sites (#284), including that codex-review-request's
+  # '@codex review' trigger is written through gh-as-author (#405). It had no
+  # CI entrypoint, so it went red on main unnoticed after #1085 reshaped the
+  # trigger write.
+  "tests/test_identity_check_fail_closed.sh"
 )
 
 if ! command -v jq >/dev/null 2>&1; then
