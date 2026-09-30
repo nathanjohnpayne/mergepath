@@ -384,6 +384,14 @@ jobs:
             fi
             if [ "$rc" -eq 1 ]; then
               echo "::warning::PR head $sha is not Dependabot-only ($DEPENDABOT_PROVENANCE_REASON); not approving or merging. It needs ordinary review."
+              # An earlier run of this job may have armed native auto-merge
+              # on a then-clean head, and GitHub keeps that request across
+              # pushes by write collaborators. Withdraw it before stopping.
+              armed=$(gh pr view "$PR_URL" --json autoMergeRequest --jq 'if .autoMergeRequest == null then "false" else "true" end')
+              if [ "$armed" = "true" ]; then
+                gh pr merge --disable-auto "$PR_URL"
+                echo "::warning::Withdrew the auto-merge request after provenance became untrusted."
+              fi
               exit 0
             fi
             echo "::error::Could not verify Dependabot commit provenance on $sha: $DEPENDABOT_PROVENANCE_REASON. Refusing auto-merge."

@@ -1161,6 +1161,25 @@ if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
       ;;
     1)
       log "Dependabot provenance: NOT Dependabot-only — $DEPENDABOT_PROVENANCE_REASON. Judging this PR as an ordinary PR (external-review / Phase 4 derivation), not by the Dependabot rule."
+      # A native auto-merge request armed while the head was Dependabot-only
+      # survives a push by a write collaborator, and the workflow job that
+      # withdraws it is neither required nor ordered before this gate. While
+      # that request stands, ordinary clearance (e.g. under threshold) could
+      # release the merge before the withdrawal lands, so the full gate
+      # blocks until the request is gone. The query modes answer
+      # applicability only and keep the ordinary derivation.
+      if [ "$DERIVE_ONLY" != "true" ] && [ "$PHASE_4_DERIVE_ONLY" != "true" ] && [ "$RATE_LIMIT_PROTECTION_ONLY" != "true" ]; then
+        DEP_AUTO_MERGE=$(printf '%s' "$PR_JSON" | jq -r 'if has("auto_merge") then (if .auto_merge == null then "none" else "armed" end) else "unknown" end')
+        case "$DEP_AUTO_MERGE" in
+          none) ;;
+          armed)
+            block "Dependabot-opened PR is no longer Dependabot-only ($DEPENDABOT_PROVENANCE_REASON) and still carries a native auto-merge request armed for an earlier head. Withdraw the auto-merge request (the Dependabot auto-merge workflow does this on its next run); the PR is then judged as an ordinary PR."
+            ;;
+          *)
+            die 2 "could not read the auto-merge state of Dependabot-opened PR #$PR_NUMBER that failed commit provenance"
+            ;;
+        esac
+      fi
       ;;
     *)
       die 2 "could not verify Dependabot commit provenance on HEAD $HEAD_SHA: $DEPENDABOT_PROVENANCE_REASON"

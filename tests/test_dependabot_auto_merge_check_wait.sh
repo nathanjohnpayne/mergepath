@@ -375,9 +375,10 @@ fi
 
 # The in-step re-check that guards the approve and both merge paths.
 extract_function require_dependabot_provenance >"$PROV_DIR/recheck.sh"
-run_recheck() {  # <commits_file> <mode>
+run_recheck() {  # <commits_file> <mode> [armed]
   ( cd "$ROOT" && PATH="$PROV_DIR/bin:$PATH" PROV_LOG="$PROV_DIR/gh.log" \
-      PROV_COMMITS="$1" PROV_MODE="$2" GITHUB_REPOSITORY=owner/repo PR_NUMBER=1 \
+      PROV_COMMITS="$1" PROV_MODE="$2" PROV_ARMED="${3:-false}" GITHUB_REPOSITORY=owner/repo PR_NUMBER=1 \
+      PR_URL=https://example.test/owner/repo/pull/1 \
       bash -c 'set -euo pipefail
         . scripts/lib/gh-api-array.sh
         . scripts/lib/dependabot-commit-provenance.sh
@@ -387,13 +388,15 @@ run_recheck() {  # <commits_file> <mode>
 }
 set +e
 out_t=$(run_recheck "$PROV_DIR/trusted.json" ok 2>&1); rc_t=$?
-out_f=$(run_recheck "$PROV_DIR/foreign.json" ok 2>&1); rc_f=$?
+: >"$PROV_DIR/gh.log"
+out_f=$(run_recheck "$PROV_DIR/foreign.json" ok true 2>&1); rc_f=$?
+withdrew_f=$(grep -c 'pr merge --disable-auto' "$PROV_DIR/gh.log" || true)
 out_u=$(run_recheck "$PROV_DIR/trusted.json" unreadable 2>&1); rc_u=$?
 set -e
 if [ "$rc_t" -eq 0 ] && [[ "$out_t" == *REACHED_ACTION* ]] \
-   && [ "$rc_f" -eq 0 ] && [[ "$out_f" != *REACHED_ACTION* ]] \
+   && [ "$rc_f" -eq 0 ] && [[ "$out_f" != *REACHED_ACTION* ]] && [ "$withdrew_f" -eq 1 ] \
    && [ "$rc_u" -ne 0 ] && [[ "$out_u" != *REACHED_ACTION* ]]; then
-  pass "require_dependabot_provenance: trusted proceeds; foreign stops cleanly; unreadable fails"
+  pass "require_dependabot_provenance: trusted proceeds; foreign withdraws an armed auto-merge and stops cleanly; unreadable fails"
 else
   fail "require_dependabot_provenance: t=$rc_t/$out_t f=$rc_f/$out_f u=$rc_u/$out_u"
 fi

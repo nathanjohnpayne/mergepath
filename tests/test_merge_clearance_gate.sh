@@ -311,6 +311,7 @@ make_pr_fixture() {  # <sha> <author> <labels_json_array> [base_ref] [default_br
         --arg base_ref "$base_ref" --arg default_branch "$default_branch" \
         --arg base_sha "$base_sha" '
     { number: 99,
+      auto_merge: null,
       head: { sha: $sha },
       user: { login: $author },
       labels: $labels,
@@ -751,6 +752,35 @@ provenance_case "extra non-Dependabot commit + under threshold → ordinary PR" 
 provenance_case "extra commit + Dependabot gate disabled → still external arm" \
   "[$(dep_commit "$OLD_SHA"),$(dep_commit "$HEAD_SHA" someone-with-push someone-with-push false)]" \
   "$OVER_THRESHOLD_FILES" 1 1 "BLOCKED" false
+
+# 10c2 — the SAME under-threshold mixed PR while a native auto-merge request
+# armed for an earlier (Dependabot-only) head still stands: BLOCK, because the
+# withdrawing workflow job is not ordered before this gate.
+echo; echo "--- Test 10*: Dependabot provenance — mixed + auto-merge still armed → blocked"
+SCRATCH=$(make_scratch true true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT")
+jq '.auto_merge = {merge_method:"squash", enabled_by:{login:"nathanjohnpayne"}}' "$FIXTURE_PR" >"$FIXTURE_PR.armed"
+MIXED_ARMED_COMMITS=$(make_commits_fixture "[$(dep_commit "$OLD_SHA"),$(dep_commit "$HEAD_SHA" someone-with-push someone-with-push false)]")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR.armed" FIXTURE_REVIEWS="$APPROVED_ON_HEAD" FIXTURE_COMMITS="$MIXED_ARMED_COMMITS" \
+      FIXTURE_FILES="$UNDER_THRESHOLD_FILES" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+QOUT=$(FIXTURE_PR="$FIXTURE_PR.armed" FIXTURE_COMMITS="$MIXED_ARMED_COMMITS" FIXTURE_FILES="$UNDER_THRESHOLD_FILES" \
+      run_gate "$SCRATCH" --derive-external-requiredness 99 owner/repo 2>/dev/null)
+QRC=$?
+jq 'del(.auto_merge)' "$FIXTURE_PR" >"$FIXTURE_PR.noam"
+OUT_NOAM=$(FIXTURE_PR="$FIXTURE_PR.noam" FIXTURE_REVIEWS="$APPROVED_ON_HEAD" FIXTURE_COMMITS="$MIXED_ARMED_COMMITS" \
+      FIXTURE_FILES="$UNDER_THRESHOLD_FILES" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC_NOAM=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "still carries a native auto-merge request" \
+   && [ "$QRC" = 0 ] && [ "$QOUT" = "false" ] \
+   && [ "$RC_NOAM" = 2 ]; then
+  pass "Dependabot provenance: mixed + armed auto-merge blocks the full gate; query mode keeps ordinary derivation; unreadable auto-merge state → exit 2"
+else
+  fail "mixed + armed expected rc=1 block, query false/0, missing auto_merge rc=2; got rc=$RC q=$QRC/$QOUT noam=$RC_NOAM"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
 
 # 10e — Dependabot-authored but committed by someone else (e.g. an amended or
 # rebased commit keeping the author) is not Dependabot-produced.
