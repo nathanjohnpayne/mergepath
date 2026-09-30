@@ -188,7 +188,7 @@ REVIEWER_IDENTITY="$(gh_default_reviewer_identity)"
 
 # A non-secret fingerprint of every credential the measurements can use
 # (#1537): the two preflight PATs, both ambient token variables, the gh config
-# directory, and the keyring tokens for both identities (read locally with
+# directory, the keyring tokens for both identities and the active account (read locally with
 # `gh auth token --user`, no network). Each value contributes a truncated
 # SHA-256; two shells with different effective credentials then never share a
 # cached answer. The fingerprint lives only in the cache file and is never
@@ -196,16 +196,21 @@ REVIEWER_IDENTITY="$(gh_default_reviewer_identity)"
 credential_fingerprint() {
   # The keyring and config-dir values are read below by indirect expansion.
   # shellcheck disable=SC2034
-  local var val h out="" keyring_author="" keyring_reviewer=""
+  local var val h out="" keyring_author="" keyring_reviewer="" keyring_active=""
   if command -v gh >/dev/null 2>&1; then
     # shellcheck disable=SC2034
     keyring_author="$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --user "$AUTHOR_IDENTITY" 2>/dev/null || true)"
+    # The ACTIVE account is what a bare `gh api` uses when no token variable is
+    # set, and `gh auth switch` changes it without touching either per-user
+    # token (Codex on #1538).
+    # shellcheck disable=SC2034
+    keyring_active="$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token 2>/dev/null || true)"
     # shellcheck disable=SC2034
     keyring_reviewer="$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --user "$REVIEWER_IDENTITY" 2>/dev/null || true)"
   fi
   # shellcheck disable=SC2034
   local GH_CONFIG_DIR_VALUE="${GH_CONFIG_DIR:-}"
-  for var in OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT GH_TOKEN GITHUB_TOKEN GH_CONFIG_DIR_VALUE keyring_author keyring_reviewer; do
+  for var in OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT GH_TOKEN GITHUB_TOKEN GH_CONFIG_DIR_VALUE keyring_author keyring_reviewer keyring_active; do
     val="${!var:-}"
     if [ -z "$val" ]; then
       h="-"

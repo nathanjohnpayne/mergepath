@@ -70,6 +70,12 @@ STUB
 cat >>"$STUB_DIR/gh" <<'STUB'
 tok="${GH_TOKEN:-}"
 [ -n "$tok" ] && printf '%s\n' "$tok" >>"$SEEN"
+if [ "$1 $2" = "auth token" ] && [ "$#" -eq 2 ]; then
+  # gh auth token (no --user): the ACTIVE account, controlled by STUB_KEYRING_ACTIVE
+  [ -n "${STUB_KEYRING_ACTIVE:-}" ] || exit 1
+  printf '%s\n' "$STUB_KEYRING_ACTIVE"
+  exit 0
+fi
 if [ "$1 $2" = "auth token" ]; then
   # gh auth token --user <login>: the keyring, controlled by STUB_KEYRING_<login>
   login="$4"
@@ -897,6 +903,19 @@ if [ "$hl_rc" -eq 2 ] && jq -e '.credential_fingerprint | startswith("unbindable
   pass "no SHA-256 tool: fingerprint is unbindable and --check re-probes"
 else
   fail "hashless: check rc=$hl_rc fp=$(jq -r .credential_fingerprint "$CACHE/agent-capability-o_r-nathanpayne-claude.json" 2>/dev/null)"
+fi
+
+# Switching the active gh account invalidates the cache (Codex on #1538).
+rm -rf "$CACHE"
+run_probe GH_TOKEN=ghp_author STUB_KEYRING_ACTIVE=ghp_author -- >/dev/null 2>&1
+set +e
+run_probe GH_TOKEN=ghp_author STUB_KEYRING_ACTIVE=ghp_author -- --check >/dev/null 2>&1; same_rc=$?
+run_probe GH_TOKEN=ghp_author STUB_KEYRING_ACTIVE=ghp_reviewer -- --check >/dev/null 2>&1; sw_rc=$?
+set -e
+if [ "$same_rc" -eq 0 ] && [ "$sw_rc" -eq 2 ]; then
+  pass "a gh auth switch (different active account) invalidates the cache"
+else
+  fail "active account binding: same=$same_rc switched=$sw_rc"
 fi
 
 echo
