@@ -370,6 +370,7 @@ if [ "${1:-}" = "auth" ] && [ "${2:-}" = "switch" ]; then
 fi
 
 if [ "${1:-}" = "auth" ] && [ "${2:-}" = "token" ]; then
+  [ -n "${STUB_NO_KEYRING:-}" ] && exit 1
   user=""
   shift 2
   while [ "$#" -gt 0 ]; do
@@ -393,6 +394,7 @@ if [ "${1:-}" = "api" ] && [ "${2:-}" = "user" ]; then
     ghp_author-token|gho_fallback-author-token) printf '%s\n' "nathanjohnpayne" ;;
     gho_fallback-custom-author-token) printf '%s\n' "custom-author" ;;
     ghp_reviewer-token) printf '%s\n' "nathanpayne-claude" ;;
+    proxy-injected) printf '%s\n' "nathanjohnpayne" ;;  # the #1057 placeholder READS as the human
     *) exit 4 ;;
   esac
   exit 0
@@ -401,55 +403,6 @@ fi
 if [ "${1:-}" = "pr" ] && { [ "${2:-}" = "create" ] || [ "${2:-}" = "new" ]; }; then
   echo "${GH_CREATE_PR_URL:-https://github.com/example/repo/pull/42}"
   exit "${GH_CREATE_PR_RC:-0}"
-fi
-
-# Byline readback surface (#1057): target resolution, then the merged_by /
-# auto_merge / events reads. GH_ACTED_AS simulates a broker attributing the
-# write to another login; by default a write lands as the token's login.
-login_for() {
-  case "$1" in
-    ghp_author-token|gho_fallback-author-token) echo nathanjohnpayne ;;
-    gho_fallback-custom-author-token) echo custom-author ;;
-    ghp_reviewer-token) echo nathanpayne-claude ;;
-  esac
-}
-case " $* " in
-  *" --json number,url "*)
-    num=123
-    case "${3:-}" in [0-9]*) num="$3" ;; esac
-    echo "$num https://github.com/example/repo/pull/$num"
-    exit 0
-    ;;
-esac
-if [ "${1:-}" = "api" ]; then
-  case "$*" in
-    *"repos/example/repo/pulls/123")
-      # Pre-edit state read by the edit readback (no --jq).
-      printf '{"title":"t","labels":%s,"assignees":[],"requested_reviewers":[],"requested_teams":[]}\n' "${GH_PR_LABELS:-[]}"
-      exit 0 ;;
-    *mergeQueueEntry*) [ -n "${GH_ENQUEUER:-}" ] && echo "$GH_ENQUEUER"; exit 0 ;;
-    *"/events"*"--jq"*) echo 10; exit 0 ;;
-    *"/events"*)
-      # New label events (id > 10) by each login in GH_EDIT_EVENTS_BY; the
-      # label name comes from GH_EDIT_EVENT_LABEL (default x).
-      out="[]"
-      i=11
-      for entry in ${GH_EDIT_EVENTS_BY-$(login_for "${GH_TOKEN:-}")}; do
-        who="${entry%%:*}"; lbl="${GH_EDIT_EVENT_LABEL:-x}"
-        case "$entry" in *:*) lbl="${entry#*:}" ;; esac
-        out="$(printf '%s' "$out" | jq -c --argjson id "$i" --arg who "$who" --arg l "$lbl" \
-          '. + [{id: $id, event: "labeled", label: {name: $l}, actor: {login: $who}}]')"
-        i=$((i + 1))
-      done
-      printf '%s\n' "$out"
-      exit 0 ;;
-    *"repos/example/repo/pulls/"*"--jq"*)
-      # Mirrors the wrapper's jq: an open PR with no auto_merge reads "open ".
-      if [ "${GH_MERGE_STATE:-merged}" = "open" ]; then printf 'open \n'; else
-        printf '%s %s\n' "${GH_MERGE_STATE:-merged}" "${GH_ACTED_AS:-$(login_for "${GH_TOKEN:-}")}"; fi
-      exit 0
-      ;;
-  esac
 fi
 
 if [ "${1:-}" = "pr" ] && [ "${2:-}" = "view" ]; then
@@ -832,7 +785,6 @@ install_wrapper_copy() {
   cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$dir/scripts/lib/reviewers-helpers.sh"
   cp "$ROOT/scripts/identity-check.sh" "$dir/scripts/identity-check.sh"
   cp "$ROOT/scripts/lib/credential-class.sh" "$dir/scripts/lib/credential-class.sh"
-  cp "$ROOT/scripts/lib/gh-write-readback.sh" "$dir/scripts/lib/gh-write-readback.sh"
   chmod +x "$dir/scripts/gh-as-author.sh" "$dir/scripts/identity-check.sh"
 }
 
@@ -902,184 +854,32 @@ else
   fail "runtime pin: absent policy file should not block; rc=$rc"
 fi
 
-# --- #1057 A2 layer 3: byline readback for merge and edit ---------------
+# #1057: the Claude cloud placeholder READS as the author through GET /user,
+# so read identity alone would select it. With a keyring token the resolver
+# must skip it and write under the keyring token; with no keyring it must
+# refuse, never write under the placeholder.
 reset_log
 set +e
-err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" run_wrapper -- gh pr merge 123 --squash 2>&1 >/dev/null)
+GITHUB_TOKEN= GH_TOKEN="proxy-injected" run_wrapper -- gh pr merge 123 --squash >/dev/null 2>&1
 rc=$?
 set -e
-if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q "verified merged by nathanjohnpayne"; then
-  pass "merge readback: merged_by is read back and matches"
+if [ "$rc" -eq 0 ] && grep -q $'GH_TOKEN=gho_fallback-author-token GITHUB_TOKEN= gh\tpr\tmerge' "$WORKDIR/calls.log" \
+   && ! grep -q $'GH_TOKEN=proxy-injected GITHUB_TOKEN= gh\tpr\tmerge' "$WORKDIR/calls.log"; then
+  pass "brokered placeholder: skipped for the keyring token, never the write credential"
 else
-  fail "merge readback happy path: rc=$rc err=$err"
+  fail "brokered placeholder with keyring: rc=$rc"
+  cat "$WORKDIR/calls.log" >&2
 fi
 
 reset_log
 set +e
-err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_ACTED_AS="claude[bot]" \
-  run_wrapper -- gh pr merge 123 --squash 2>&1 >/dev/null)
-rc=$?
-set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "the merged action on example/repo#123 landed under 'claude\[bot\]'"; then
-  pass "merge readback: a merge attributed to another login exits 5"
-else
-  fail "merge readback mismatch: rc=$rc err=$err"
-fi
-
-reset_log
-set +e
-err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_MERGE_STATE=auto GH_ACTED_AS="claude[bot]" \
-  run_wrapper -- gh pr merge 123 --squash --auto 2>&1 >/dev/null)
-rc=$?
-set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "the auto action"; then
-  pass "merge readback: an auto-merge armed by another login exits 5"
-else
-  fail "auto-merge readback mismatch: rc=$rc err=$err"
-fi
-
-reset_log
-set +e
-err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_MERGE_STATE=open \
-  run_wrapper -- gh pr merge 123 --squash 2>&1 >/dev/null)
-rc=$?
-set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "neither merged, armed for auto-merge, nor queued"; then
-  pass "merge readback: an unmerged, unarmed PR after a merge exits 5 (unverified)"
-else
-  fail "merge readback unverified: rc=$rc err=$err"
-fi
-
-reset_log
-set +e
-OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_MERGE_STATE=open \
-  run_wrapper -- gh pr merge 123 --disable-auto >/dev/null 2>&1
-rc=$?
-set -e
-if [ "$rc" -eq 0 ]; then
-  pass "merge readback: --disable-auto needs no attribution readback"
-else
-  fail "merge --disable-auto: rc=$rc"
-fi
-
-reset_log
-set +e
-err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_EDIT_EVENTS_BY="claude[bot]" \
-  run_wrapper -- gh pr edit 123 --add-label x 2>&1 >/dev/null)
-rc=$?
-set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "the edit ('labeled' event) on example/repo#123 landed under 'claude\[bot\]'"; then
-  pass "edit readback: label events by another login exit 5"
-else
-  fail "edit readback mismatch: rc=$rc err=$err"
-fi
-
-reset_log
-set +e
-err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_EDIT_EVENTS_BY="github-actions[bot]:other nathanjohnpayne:x" \
-  run_wrapper -- gh pr edit 123 --add-label x 2>&1 >/dev/null)
-rc=$?
-set -e
-if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q "verified edit events by nathanjohnpayne"; then
-  pass "edit readback: a concurrent bot event on another label does not disturb the author's own event"
-else
-  fail "edit readback concurrent: rc=$rc err=$err"
-fi
-
-reset_log
-set +e
-err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_EDIT_EVENTS_BY="" \
-  run_wrapper -- gh pr edit 123 --body "b" 2>&1 >/dev/null)
-rc=$?
-set -e
-if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q "leaves no author record"; then
-  pass "edit readback: a body-only edit with no event is accepted on the pre-write check, and says so"
-else
-  fail "edit readback no-event: rc=$rc err=$err"
-fi
-
-# Phase 4b on #1541: the same label event by two actors is ambiguous, and
-# ambiguity fails closed rather than trusting the expected login's copy.
-reset_log
-set +e
-err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_EDIT_EVENTS_BY="nathanjohnpayne:x claude[bot]:x" \
-  run_wrapper -- gh pr edit 123 --add-label x 2>&1 >/dev/null)
-rc=$?
-set -e
-if [ "$rc" -eq 5 ]; then
-  pass "edit readback: this write's label event by two actors fails closed"
-else
-  fail "edit readback ambiguous: rc=$rc err=$err"
-fi
-
-# Options before the group or verb still select the repository and still
-# get a readback (Phase 4b P1 on #1541).
-for form in "gh --repo example/repo pr merge 123 --squash" "gh pr --repo example/repo merge 123 --squash" "gh pr merge 123 --squash --repo=example/repo"; do
-  reset_log
-  set +e
-  # shellcheck disable=SC2086
-  err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_ACTED_AS="claude[bot]" run_wrapper -- $form 2>&1 >/dev/null)
-  rc=$?
-  set -e
-  if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "landed under 'claude\[bot\]'"; then
-    pass "flag placement '$form': readback runs and catches a mis-attributed merge"
-  else
-    fail "flag placement '$form': rc=$rc err=$err"
-  fi
-done
-
-# A guarded verb behind a command prefix runs in a context the readback
-# cannot resolve, so it is refused before the write.
-reset_log
-set +e
-OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" run_wrapper -- env GH_REPO=other/repo gh pr merge 123 --squash >/dev/null 2>&1
-rc=$?
-set -e
-if [ "$rc" -eq 5 ] && ! grep -q $'gh\tpr\tmerge' "$WORKDIR/calls.log"; then
-  pass "prefixed guarded write: refused before the write"
-else
-  fail "prefixed guarded write: rc=$rc"
-fi
-
-# A PR admitted to a merge queue (open, no auto_merge) is verified through the
-# queue entry's enqueuer.
-reset_log
-set +e
-err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_MERGE_STATE=open GH_ENQUEUER=nathanjohnpayne \
-  run_wrapper -- gh pr merge 123 --squash 2>&1 >/dev/null)
-rc=$?
-set -e
-if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q "verified queued by nathanjohnpayne"; then
-  pass "merge-queue admission: verified through the enqueuer"
-else
-  fail "merge-queue admission: rc=$rc err=$err"
-fi
-
-# CodeRabbit on #1541: adding a label that is already applied is a no-op
-# with no event; it is not a failed readback.
-reset_log
-set +e
-err=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GH_PR_LABELS='[{"name":"x"}]' GH_EDIT_EVENTS_BY="" \
-  run_wrapper -- gh pr edit 123 --add-label x 2>&1 >/dev/null)
-rc=$?
-set -e
-if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q "already in place"; then
-  pass "edit readback: a label already applied is a no-op, not a failure"
-else
-  fail "edit readback no-op label: rc=$rc err=$err"
-fi
-
-# The placeholder cannot reach an author write through the ambient candidate.
-reset_log
-set +e
-GITHUB_TOKEN= GH_TOKEN="proxy-injected" GH_AS_AUTHOR_IDENTITY=custom-author-nokeyring \
-  run_wrapper -- gh pr merge 123 --squash >/dev/null 2>&1
+STUB_NO_KEYRING=1 GITHUB_TOKEN= GH_TOKEN="proxy-injected" run_wrapper -- gh pr merge 123 --squash >/dev/null 2>&1
 rc=$?
 set -e
 if [ "$rc" -ne 0 ] && ! grep -q $'gh\tpr\tmerge' "$WORKDIR/calls.log"; then
-  pass "brokered placeholder: no author write through the ambient candidate"
+  pass "brokered placeholder: no keyring, so no author write at all"
 else
-  fail "brokered placeholder author: rc=$rc"
+  fail "brokered placeholder without keyring: rc=$rc"
   cat "$WORKDIR/calls.log" >&2
 fi
 

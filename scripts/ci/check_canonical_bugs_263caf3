@@ -96,19 +96,11 @@ case "$1" in
     if [ "${2:-}" = "user" ]; then
       printf 'nathanpayne-claude\n'
     fi
-    # Byline readback (#1057): the comment the wrapper posted reads back
-    # under the reviewer login.
-    case "$*" in *"issues/comments/1 "*) printf 'nathanpayne-claude\n' ;; esac
     ;;
   "pr")
     case "${2:-}" in
-      "view")
-        case "$*" in
-          *"number,url"*) printf '99999 https://github.com/nathanjohnpayne/mergepath/pull/99999\n' ;;
-          *) printf 'https://github.com/nathanjohnpayne/mergepath/pull/99999\n' ;;
-        esac ;;
-      "comment") printf 'STUB_GH_COMMENT_REACHED\n' >&2
-                 printf 'https://github.com/nathanjohnpayne/mergepath/pull/99999#issuecomment-1\n' ;;
+      "view")    printf 'https://github.com/nathanjohnpayne/mergepath/pull/99999\n' ;;
+      "comment") printf 'STUB_GH_COMMENT_REACHED\n' >&2 ;;
       *)         printf 'STUB_GH_UNEXPECTED %s\n' "$*" >&2 ;;
     esac
     ;;
@@ -160,17 +152,10 @@ case "$1" in
     if [ "${2:-}" = "user" ]; then
       printf 'nathanpayne-claude\n'
     fi
-    # Byline readback (#1057): the comment the wrapper posted reads back
-    # under the reviewer login.
-    case "$*" in *"issues/comments/1 "*) printf 'nathanpayne-claude\n' ;; esac
     ;;
   "pr")
     case "${2:-}" in
-      "view")
-        case "$*" in
-          *"number,url"*) printf '99999 https://github.com/nathanjohnpayne/mergepath/pull/99999\n' ;;
-          *) printf 'https://github.com/nathanjohnpayne/mergepath/pull/99999\n' ;;
-        esac ;;
+      "view") printf 'https://github.com/nathanjohnpayne/mergepath/pull/99999\n' ;;
       "comment")
         # Dump --body content to a file so the test can inspect.
         shift 2
@@ -178,7 +163,6 @@ case "$1" in
           if [ "$1" = "--body" ]; then printf '%s' "$2" > "$SCRATCH_BODY_OUT"; fi
           shift
         done
-        printf 'https://github.com/nathanjohnpayne/mergepath/pull/99999#issuecomment-1\n'
         ;;
     esac
     ;;

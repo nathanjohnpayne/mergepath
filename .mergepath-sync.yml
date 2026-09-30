@@ -281,6 +281,9 @@ paths:
   - path: scripts/lib/gh-token-resolver.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
+      - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
   # Capability probe (#1057): measures what an agent session (local, Claude
   # cloud, Codex cloud, CI) can do on GitHub before it tries, and caches a
   # tier `--check --print-exports` re-exports. It resolves write tokens
@@ -484,6 +487,8 @@ paths:
       # exit, which is the correct direction for a predicate whose fail-open
       # mode lets a quoted range suppress a real finding.
       - "scripts/lib/coderabbit-fence.sh"
+      - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
+      - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
   # #489 CodeRabbit-rate-limit auto-merge disposition gate. agent-review.yml's
   # exit-5 (rate-limited) branch calls this script to decide whether the
   # Codex-failover path may auto-merge. Absent on a consumer it exits 127 and
@@ -549,6 +554,8 @@ paths:
       # enough.
       - "scripts/workflow/resolve_base_policy.sh"   # #1100, governing base policy for the relax set
       - "scripts/lib/feedback-policy-helpers.sh"    # #1100, policy_block_field_parsed (#1124)
+      - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
+      - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
   # Complete-history reviewer-feedback accounting gate (#1000). Reads every
   # paginated inline comment, review object, and PR-level comment; reconciles
   # classified findings with finding-bound disposition evidence. It hard-
@@ -611,6 +618,8 @@ paths:
       - "scripts/gh-as-reviewer.sh"
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
+      - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
+      - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
   - path: scripts/phase-4b-classifier.sh
     type: canonical
     consumers: all
@@ -860,6 +869,8 @@ paths:
       - "scripts/lib/template-substitution.sh"
       - "scripts/lib/manifest-fact-helpers.sh"
       - "scripts/lib/graphql-ceiling.sh"   # #1057 A3: proxy GraphQL refusal -> exit 6 (existence-guarded)
+      - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
+      - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
   # Recognises the Claude cloud proxy's GraphQL refusal ("This GraphQL query
   # is not enabled for this session") so GraphQL-only helpers exit with a
   # ceiling (6) instead of a retryable failure (#1057 A3). Its header is the
@@ -891,7 +902,6 @@ paths:
       - "scripts/lib/pr-body-contract.sh"   # sourced; provides pr_body_validate
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/lib/reviewers-helpers.sh"  # pr-body-contract.sh hard-sources it
-      - "scripts/lib/gh-write-readback.sh"  # sourced; post-write byline readback (#1057)
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it
   # Single entrypoint for PR-body validation (#1132). The required
   # Self-Review gate, gh-as-author.sh and local checks all route through it, so
@@ -911,16 +921,7 @@ paths:
     requires:
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/identity-check.sh"         # gh-token-resolver.sh executes it before any write
-      - "scripts/lib/gh-write-readback.sh"  # sourced; post-write byline readback (#1057)
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it
-  # Post-write byline readback (#1057 A2 layer 3), sourced by both gh-as-*
-  # wrappers: re-reads the comment / review / merge / edit a guarded write
-  # produced and fails when GitHub attributes it to another login. It is the
-  # one check that holds whatever brokering scheme an environment uses, and
-  # on Codex (no PreToolUse hooks) the only one that runs at call time.
-  - path: scripts/lib/gh-write-readback.sh
-    type: canonical
-    consumers: all
   # Pre-action identity check (#284) — the assertion helper that every
   # WRITE-path helper script calls at the top to fail-close on
   # active-account drift. Travels with the helper scripts that depend
@@ -976,7 +977,6 @@ paths:
       - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/lib/reviewers-helpers.sh"  # transitive dependency of the shell facade
-      - "scripts/lib/gh-write-readback.sh"   # gh-as-author.sh runtime closure (#1057)
       - "scripts/lib/credential-class.sh"    # identity-check.sh --expect-write-identity (#1057)
       # The suite EXECUTES these, so a commit-path propagation that selects the
       # test without them leaves a consumer running it against a missing or
@@ -1756,7 +1756,6 @@ paths:
       - "scripts/lib/pr-body-contract.sh"
       - "scripts/lib/pr-body-contract.mjs"
       - "scripts/lib/reviewers-helpers.sh"
-      - "scripts/lib/gh-write-readback.sh"   # gh-as-author.sh runtime closure (#1057)
       - "scripts/lib/credential-class.sh"    # identity-check.sh --expect-write-identity (#1057)
   # The source-pinned required workflow sends its one private-nonce request to
   # this target-base responder. Propagate the workflow and recorder in the
@@ -1781,7 +1780,6 @@ paths:
       - "scripts/lib/pr-body-contract.sh"
       - "scripts/lib/pr-body-contract.mjs"
       - "scripts/lib/reviewers-helpers.sh"
-      - "scripts/lib/gh-write-readback.sh"   # gh-as-author.sh runtime closure (#1057)
       - "scripts/lib/credential-class.sh"    # identity-check.sh --expect-write-identity (#1057)
   - path: scripts/workflow/record-merge-queue-final-audit.sh
     type: canonical
@@ -1799,7 +1797,6 @@ paths:
       - "scripts/lib/pr-body-contract.sh"
       - "scripts/lib/pr-body-contract.mjs"
       - "scripts/lib/reviewers-helpers.sh"
-      - "scripts/lib/gh-write-readback.sh"   # gh-as-author.sh runtime closure (#1057)
       - "scripts/lib/credential-class.sh"    # identity-check.sh --expect-write-identity (#1057)
   - path: scripts/workflow/report-approval-continuation-failures.sh
     type: canonical
@@ -2081,7 +2078,6 @@ paths:
       - "scripts/lib/pr-body-contract.sh"      # gh-as-author.sh runtime closure (#1058)
       - "scripts/lib/pr-body-contract.mjs"     # gh-as-author.sh runtime closure (#1058)
       - "scripts/lib/reviewers-helpers.sh"     # pr-body-contract.sh runtime closure (#1058)
-      - "scripts/lib/gh-write-readback.sh"   # gh-as-author.sh runtime closure (#1057)
       - "scripts/lib/credential-class.sh"    # identity-check.sh --expect-write-identity (#1057)
       - "scripts/gh-as-reviewer.sh"            # check_gh_as_author (transitive)
       - "scripts/hooks/gh-pr-guard.sh"         # tests/test_gh_pr_guard.sh runs it
@@ -2112,6 +2108,9 @@ paths:
   - path: scripts/gh-projects/
     type: kit
     consumers: all
+    requires:
+      - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
+      - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
   # scripts/workflow/ — the awk/bash parser helpers the canonical
   # .github/workflows/ files shell out to (parse_policy_list,
   # match_protected_paths, parse_manifest_paths). These were already
@@ -2144,7 +2143,6 @@ paths:
       - "scripts/gh-as-author.sh"                 # #1058, final target-audit marker write
       - "scripts/lib/gh-token-resolver.sh"         # gh-as-author.sh runtime closure (#1058)
       - "scripts/identity-check.sh"                # gh-token-resolver.sh runtime closure (#1058)
-      - "scripts/lib/gh-write-readback.sh"   # gh-as-author.sh runtime closure (#1057)
       - "scripts/lib/credential-class.sh"    # identity-check.sh --expect-write-identity (#1057)
       - "scripts/lib/gh-command-classifier.sh"     # gh-as-author.sh runtime closure (#1058)
       - "scripts/lib/pr-body-contract.sh"          # gh-as-author.sh runtime closure (#1058)

@@ -38,25 +38,6 @@ if [ "${1:-}" = "api" ] && [ "${2:-}" = "user" ]; then
   esac
   exit 0
 fi
-# Byline readback (#1057): resolve the target, snapshot reviews, then report
-# each write under the login of the token that made it. Writes are recorded
-# per token so the two concurrent wrappers cannot see each other's result.
-login_for() {
-  case "$1" in
-    ghp_author-token) echo nathanjohnpayne ;;
-    ghp_reviewer-token) echo nathanpayne-codex ;;
-  esac
-}
-case " $* " in
-  *" --json number,url "*) echo "1 https://github.com/o/r/pull/1"; exit 0 ;;
-esac
-if [ "${1:-}" = "api" ]; then
-  case "$*" in
-    *"/reviews"*"--jq"*) echo 1; exit 0 ;;
-    *"/reviews"*) printf '[{"id":2,"state":"COMMENTED","body":"ok","user":{"login":"%s"}}]\n' "$(login_for "${GH_TOKEN:-}")"; exit 0 ;;
-    *"repos/o/r/pulls/1"*) echo "merged $(login_for "${GH_TOKEN:-}")"; exit 0 ;;
-  esac
-fi
 sleep 0.1
 exit 0
 STUB

@@ -57,70 +57,6 @@ if [ "${1:-}" = "auth" ] && [ "${2:-}" = "token" ]; then
   exit 0
 fi
 
-# --- byline readback surface (#1057) ---------------------------------
-# The wrapper resolves the target through `gh <pr|issue> view`, snapshots
-# reviews before a review, and reads the written object back afterwards. The
-# stub records who each write landed as: the login of the token it ran under,
-# or STUB_WRITE_AS when a case simulates a brokered credential.
-STATE="${STUB_STATE:-/dev/null}"
-login_for() {
-  case "$1" in
-    ghp_reviewer-token|gho_fallback-claude-token) echo nathanpayne-claude ;;
-    ghp_codex-token|gho_fallback-codex-token) echo nathanpayne-codex ;;
-    ghp_author-token) echo nathanjohnpayne ;;
-    proxy-injected) echo nathanjohnpayne ;;
-  esac
-}
-if { [ "${1:-}" = "pr" ] || [ "${1:-}" = "issue" ]; } && [ "${2:-}" = "view" ]; then
-  [ "${STUB_VIEW_RC:-0}" = 0 ] || exit "$STUB_VIEW_RC"
-  num=123
-  case "${3:-}" in [0-9]*) num="$3" ;; esac
-  kind=pull; [ "$1" = issue ] && kind=issues
-  echo "$num https://${STUB_HOST:-github.com}/o/r/$kind/$num"
-  exit 0
-fi
-if [ "${1:-}" = "pr" ] && [ "${2:-}" = "review" ]; then
-  [ "${GH_GENERIC_RC:-0}" = 0 ] || exit "$GH_GENERIC_RC"
-  # Record the review as GitHub would store it: state, body, author.
-  state=COMMENTED; body=""
-  shift 2
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      -a|--approve) state=APPROVED ;;
-      -r|--request-changes) state=CHANGES_REQUESTED ;;
-      -c|--comment) state=COMMENTED ;;
-      -b|--body) body="$2"; shift ;;
-    esac
-    shift
-  done
-  jq -cn --arg s "$state" --arg b "$body" --arg l "${STUB_WRITE_AS:-$(login_for "${GH_TOKEN:-}")}" \
-    '{id: 2, state: $s, body: $b, user: {login: $l}}' >>"$STATE/reviews"
-  exit 0
-fi
-if { [ "${1:-}" = "pr" ] || [ "${1:-}" = "issue" ]; } && [ "${2:-}" = "comment" ]; then
-  [ "${GH_GENERIC_RC:-0}" = 0 ] || exit "$GH_GENERIC_RC"
-  echo "${STUB_WRITE_AS:-$(login_for "${GH_TOKEN:-}")}" >"$STATE/comment"
-  kind=pull; [ "$1" = issue ] && kind=issues
-  echo "https://github.com/o/r/$kind/${3:-1}#issuecomment-900"
-  exit 0
-fi
-if [ "${1:-}" = "api" ]; then
-  case "$*" in
-    *"-X POST repos/o/r/pulls/123/reviews"*)
-      printf '{"id":9,"commit_id":"abc","user":{"login":"%s"}}\n' "${STUB_WRITE_AS:-$(login_for "${GH_TOKEN:-}")}"
-      exit 0 ;;
-    *"/reviews"*"--jq"*) echo 1; exit 0 ;;
-    *"/reviews"*)
-      # The pre-existing review (id 1), any STUB_EXTRA_REVIEW a case injects
-      # (another session's review landing concurrently), and this write's.
-      { echo '{"id":1,"state":"COMMENTED","body":"old","user":{"login":"someone"}}'
-        [ -n "${STUB_EXTRA_REVIEW:-}" ] && echo "$STUB_EXTRA_REVIEW"
-        cat "$STATE/reviews" 2>/dev/null; } | jq -s -c .
-      exit 0 ;;
-    *"issues/comments/900"*) cat "$STATE/comment" 2>/dev/null; exit 0 ;;
-  esac
-fi
-
 if [ "${1:-}" = "api" ] && [ "${2:-}" = "user" ]; then
   case "${GH_TOKEN:-}" in
     ghp_reviewer-token|gho_fallback-claude-token) printf '%s\n' "nathanpayne-claude" ;;
@@ -136,14 +72,12 @@ exit "${GH_GENERIC_RC:-0}"
 STUB
 chmod +x "$STUB_DIR/gh"
 
-mkdir -p "$WORKDIR/state"
 run_wrapper() {
-  PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" STUB_STATE="$WORKDIR/state" "$WRAPPER" "$@"
+  PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" "$WRAPPER" "$@"
 }
 
 reset_log() {
   : > "$WORKDIR/calls.log"
-  rm -f "$WORKDIR/state/"*
 }
 
 reset_log
@@ -293,7 +227,7 @@ else
 fi
 unset GH_TOKEN
 
-# --- #1057: brokered credentials and byline readback ------------------
+# --- #1057: brokered credentials ----------------------------------------
 # The Claude cloud placeholder READS as the human through GET /user. Before
 # #1057 the resolver's ambient candidate accepted it on that basis and the
 # write landed as claude[bot]. It must now be refused before any write, and
@@ -314,161 +248,6 @@ elif grep -q $'GH_TOKEN=proxy-injected GITHUB_TOKEN= gh\tapi\tuser' "$WORKDIR/ca
   fail "brokered placeholder: GET /user was consulted before the class refused it"
 else
   pass "brokered placeholder: refused on its credential class before GET /user and before the write"
-fi
-
-# A review that lands under another login (a broker substituting its own
-# credential) is caught by the readback: exit 5, with the #241 recovery text.
-reset_log
-set +e
-err=$(OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" STUB_WRITE_AS="claude[bot]" \
-  run_wrapper -- gh pr review 123 --comment --body "ok" 2>&1 >/dev/null)
-rc=$?
-set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "landed under 'claude\[bot\]'" \
-   && printf '%s' "$err" | grep -q '#241'; then
-  pass "review readback: a review landing under another login exits 5 with recovery text"
-else
-  fail "review readback: rc=$rc err=$err"
-fi
-
-reset_log
-set +e
-err=$(MERGEPATH_AGENT=codex OP_PREFLIGHT_REVIEWER_PAT="ghp_codex-token" STUB_WRITE_AS="claude[bot]" \
-  run_wrapper -- gh issue comment 7 --body "x" 2>&1 >/dev/null)
-rc=$?
-set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "comment 900 on o/r#7 landed under 'claude\[bot\]'"; then
-  pass "comment readback: an issue comment landing under another login exits 5"
-else
-  fail "comment readback: rc=$rc err=$err"
-fi
-
-reset_log
-set +e
-err=$(OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" run_wrapper -- gh pr comment 123 --body "x" 2>&1 >/dev/null)
-rc=$?
-set -e
-if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q "verified comment 900 author=nathanpayne-claude"; then
-  pass "comment readback: a correctly attributed comment is verified and exits 0"
-else
-  fail "comment readback happy path: rc=$rc err=$err"
-fi
-
-# Phase 4b P1 on #1541: a concurrent review by the expected login does not
-# vouch for THIS write. Our review (state and body) landed as claude[bot]
-# while another session's review by nathanpayne-claude appeared.
-reset_log
-set +e
-err=$(OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" STUB_WRITE_AS="claude[bot]" \
-  STUB_EXTRA_REVIEW='{"id":3,"state":"APPROVED","body":"lgtm","user":{"login":"nathanpayne-claude"}}' \
-  run_wrapper -- gh pr review 123 --comment --body "ours" 2>&1 >/dev/null)
-rc=$?
-set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "landed under 'claude\[bot\]'"; then
-  pass "review readback: a concurrent review by the expected login does not mask this write's bot byline"
-else
-  fail "review readback correlation: rc=$rc err=$err"
-fi
-
-# --attach takes a value, so the selector after it is still the PR.
-reset_log
-set +e
-err=$(OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" run_wrapper -- gh pr comment --attach ./shot.png 123 --body "x" 2>&1 >/dev/null)
-rc=$?
-set -e
-if [ "$rc" -eq 0 ] && grep -q $'gh\tpr\tview\t123' "$WORKDIR/calls.log"; then
-  pass "comment --attach <file> <PR>: the PR, not the file, is resolved as the target"
-else
-  fail "comment --attach: rc=$rc err=$err"
-  cat "$WORKDIR/calls.log" >&2
-fi
-
-# --edit-last keeps the comment's ORIGINAL author, so it is reported as not
-# attributable instead of being claimed verified.
-reset_log
-set +e
-err=$(OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" run_wrapper -- gh pr comment 123 --edit-last --body "x" 2>&1 >/dev/null)
-rc=$?
-set -e
-if [ "$rc" -eq 0 ] && printf '%s' "$err" | grep -q "edit-last) leaves no author record" && ! printf '%s' "$err" | grep -q "verified comment"; then
-  pass "comment --edit-last: reported as not read back, never claimed verified"
-else
-  fail "comment --edit-last: rc=$rc err=$err"
-fi
-
-# Every readback read is pinned to the host the target resolved on (Phase 4b
-# on #1541): a GHE URL must not be read back against github.com.
-reset_log
-set +e
-OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" STUB_HOST=ghe.example.com \
-  run_wrapper -- gh pr review 123 --comment --body "on ghe" >/dev/null 2>&1
-rc=$?
-set -e
-if [ "$rc" -eq 0 ] && grep $'gh\tapi' "$WORKDIR/calls.log" | grep -q $'\t--hostname\tghe.example.com\t' \
-   && ! grep $'gh\tapi' "$WORKDIR/calls.log" | grep 'repos/' | grep -v -q -- '--hostname'; then
-  pass "readback reads are pinned to the resolved host (ghe.example.com)"
-else
-  fail "host pinning: rc=$rc"
-  cat "$WORKDIR/calls.log" >&2
-fi
-
-# `gh api` writes whose response names an author are checked too: the Phase
-# 4b orchestrator posts its review this way (Codex on #1541).
-reset_log
-set +e
-err=$(OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" STUB_WRITE_AS="claude[bot]" \
-  run_wrapper -- gh api -X POST repos/o/r/pulls/123/reviews --input /dev/null 2>&1 >/dev/null)
-rc=$?
-out_ok=$(OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" run_wrapper -- gh api -X POST repos/o/r/pulls/123/reviews --input /dev/null 2>/dev/null)
-ok_rc=$?
-set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "landed under 'claude\[bot\]'" \
-   && [ "$ok_rc" -eq 0 ] && printf '%s' "$out_ok" | jq -e '.id == 9' >/dev/null; then
-  pass "gh api review POST: a response authored by another login exits 5; a matching one passes its JSON through"
-else
-  fail "gh api readback: rc=$rc ok_rc=$ok_rc err=$err"
-fi
-
-# CodeRabbit on #1541: only a command that would prompt runs attached to a
-# terminal; one that names its body/state is captured and read back.
-prompt_of() { # <gh argv...> -> GH_READBACK_WOULD_PROMPT after prepare
-  PATH="$STUB_DIR:$PATH" STUB_STATE="$WORKDIR/state" bash -c '
-    . "$1/scripts/lib/gh-write-readback.sh"; shift
-    gh_readback_prepare nathanpayne-claude ghp_reviewer-token t -- "$@" >/dev/null 2>&1
-    printf "%s" "$GH_READBACK_WOULD_PROMPT"' _ "$ROOT" "$@"
-}
-if [ "$(prompt_of gh pr comment 123 --body x)" = "0" ] && [ "$(prompt_of gh pr comment 123)" = "1" ] \
-   && [ "$(prompt_of gh pr review 123 --approve)" = "0" ] && [ "$(prompt_of gh pr review 123)" = "1" ]; then
-  pass "would-prompt: a comment with --body or a review with a state never runs attached"
-else
-  fail "would-prompt detection: body=$(prompt_of gh pr comment 123 --body x) none=$(prompt_of gh pr comment 123)"
-fi
-
-# A target the wrapper cannot resolve cannot be read back, so it is not written.
-reset_log
-set +e
-OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" STUB_VIEW_RC=1 \
-  run_wrapper -- gh pr review 123 --comment --body "ok" >/dev/null 2>&1
-rc=$?
-set -e
-if [ "$rc" -eq 5 ] && ! grep -q $'gh\tpr\treview' "$WORKDIR/calls.log"; then
-  pass "readback prepare failure: exits 5 before the write"
-else
-  fail "readback prepare failure: rc=$rc"
-  cat "$WORKDIR/calls.log" >&2
-fi
-
-# A failed write propagates its own exit code and skips the readback.
-reset_log
-set +e
-OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" GH_GENERIC_RC=4 \
-  run_wrapper -- gh pr review 123 --comment --body "ok" >/dev/null 2>&1
-rc=$?
-set -e
-if [ "$rc" -eq 4 ]; then
-  pass "failed write: its exit code propagates, no readback verdict"
-else
-  fail "failed write: rc=$rc expected 4"
 fi
 
 # #1539: a codex-cloud surface with no explicit agent resolves the Codex

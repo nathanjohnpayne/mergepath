@@ -106,7 +106,6 @@ make_real_wrapper_case() {
   cp "$ROOT/scripts/identity-check.sh" "$dir/scripts/identity-check.sh"
   chmod +x "$dir/scripts/identity-check.sh"
   cp "$ROOT/scripts/lib/credential-class.sh" "$dir/scripts/lib/credential-class.sh"    # identity-check --expect-write-identity (#1057)
-  cp "$ROOT/scripts/lib/gh-write-readback.sh" "$dir/scripts/lib/gh-write-readback.sh"  # gh-as-reviewer.sh sources it (#1057)
 
   cat >"$dir/.github/review-policy.yml" <<'EOF'
 codex:
