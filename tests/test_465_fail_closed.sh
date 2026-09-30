@@ -388,6 +388,88 @@ fi
   && pass "D11 runtime: legacy uppercase sync-all SHA remains accepted" \
   || fail "D11 runtime: legacy uppercase sync-all SHA compatibility changed"
 
+# Source-commit provenance: the branch-name SHA may name ANY commit in the
+# public mergepath repo, so the lane resolves it to ONE full commit and
+# requires it to be on mergepath's default branch before checking it out.
+assert_grep "D12: propagation lane resolves the branch-key SHA to a single full commit" \
+  "$W/pr-review-policy.yml" 'SYNC_FULL_SHA=$(git -C "$MP_DIR" rev-parse --verify --quiet "${SYNC_SHA}^{commit}" 2>/dev/null)'
+assert_grep "D12: propagation lane requires the source commit on mergepath's default-branch first-parent history" \
+  "$W/pr-review-policy.yml" 'grep -Fxq "$SYNC_FULL_SHA" <<<"$MP_FIRST_PARENT"'
+refute_grep "D12: propagation lane does not accept generic (second-parent) ancestry" \
+  "$W/pr-review-policy.yml" 'merge-base --is-ancestor "$SYNC_FULL_SHA"'
+assert_grep "D12: propagation lane hands the full SHA to the base verifier" \
+  "$W/pr-review-policy.yml" 'bash "$VERIFIER" "$MP_DIR" "$PWD" "$BASE_SHA" "$HEAD_SHA" "$SYNC_FULL_SHA"'
+refute_grep "D12: propagation lane no longer checks out the raw branch-key SHA" \
+  "$W/pr-review-policy.yml" 'checkout --quiet "$SYNC_SHA"'
+
+# Execute the workflow's own resolve/ancestry/checkout condition against a
+# local fixture "mergepath" (git is wrapped only to redirect the public clone
+# URL to the fixture), so the vectors below exercise the real shell.
+if [ -f "$W/pr-review-policy.yml" ]; then
+  D12="$(mktemp -d "${TMPDIR:-/tmp}/test465-d12.XXXXXX")"
+  d12_git() { git -c init.defaultBranch=main -c user.email=t@t -c user.name=t -c commit.gpgsign=false "$@"; }
+  d12_git init -q "$D12/upstream"
+  d12_git -C "$D12/upstream" commit -q --allow-empty -m "on main"
+  D12_MAIN=$(git -C "$D12/upstream" rev-parse HEAD)
+  d12_git -C "$D12/upstream" checkout -q -b unmerged
+  d12_git -C "$D12/upstream" commit -q --allow-empty -m "not on main"
+  D12_SIDE=$(git -C "$D12/upstream" rev-parse HEAD)
+  d12_git -C "$D12/upstream" checkout -q main
+  # A PR branch merged with a TRUE merge: its intermediate commit is an
+  # ancestor of main but never a main state.
+  d12_git -C "$D12/upstream" checkout -q -b merged-pr
+  d12_git -C "$D12/upstream" commit -q --allow-empty -m "intermediate merged-PR commit"
+  D12_SECOND=$(git -C "$D12/upstream" rev-parse HEAD)
+  d12_git -C "$D12/upstream" checkout -q main
+  d12_git -C "$D12/upstream" commit -q --allow-empty -m "main moves on"
+  d12_git -C "$D12/upstream" merge -q --no-ff -m "true merge" merged-pr
+  mkdir -p "$D12/bin"
+  REAL_GIT=$(command -v git)
+  cat >"$D12/bin/git" <<SHIM
+#!/usr/bin/env bash
+args=()
+for a in "\$@"; do
+  if [ "\$a" = "https://github.com/nathanjohnpayne/mergepath" ]; then a="$D12/upstream"; fi
+  args+=("\$a")
+done
+exec "$REAL_GIT" "\${args[@]}"
+SHIM
+  chmod +x "$D12/bin/git"
+  lane_condition="$(awk '
+    /^              SYNC_FULL_SHA=""$/ { capture=1 }
+    capture {
+      line=$0; sub(/^              /, "", line); print line
+      if ($0 ~ /; then$/) exit
+    }
+  ' "$W/pr-review-policy.yml")"
+  run_lane_condition() {  # <sync_sha>
+    ( SYNC_SHA="$1"; MP_DIR=$(mktemp -d "$D12/mp.XXXXXX"); rmdir "$MP_DIR"
+      PATH="$D12/bin:$PATH"
+      eval "$lane_condition
+        echo \"checked-out \$SYNC_FULL_SHA\"
+      else
+        echo rejected
+      fi" )
+  }
+  out_main=$(run_lane_condition "${D12_MAIN:0:7}")
+  out_side=$(run_lane_condition "${D12_SIDE:0:7}")
+  out_bogus=$(run_lane_condition "0000000")
+  out_second=$(run_lane_condition "${D12_SECOND:0:7}")
+  [ "$out_main" = "checked-out $D12_MAIN" ] \
+    && pass "D12 runtime: a default-branch short SHA resolves to its full commit and checks out" \
+    || fail "D12 runtime: default-branch short SHA expected checkout of $D12_MAIN, got: $out_main"
+  [ "$out_side" = "rejected" ] \
+    && pass "D12 runtime: a commit only on an unmerged branch is rejected" \
+    || fail "D12 runtime: unmerged-branch commit must be rejected, got: $out_side"
+  [ "$out_second" = "rejected" ] \
+    && pass "D12 runtime: a second-parent-only (merged PR branch) commit is rejected" \
+    || fail "D12 runtime: second-parent-only commit must be rejected, got: $out_second"
+  [ "$out_bogus" = "rejected" ] \
+    && pass "D12 runtime: an unresolvable SHA is rejected" \
+    || fail "D12 runtime: unresolvable SHA must be rejected, got: $out_bogus"
+  rm -rf "$D12"
+fi
+
 echo ""
 echo "test_465_fail_closed: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ] || exit 1
