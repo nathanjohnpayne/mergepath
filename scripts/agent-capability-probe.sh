@@ -347,27 +347,26 @@ measure_write() {
     if [ "$rc" -ne 0 ] || [ -z "${GH_RESOLVED_TOKEN:-}" ]; then
       reason="no-verified-token (resolver exit $rc)"
       # The resolver's own GET /user runs inside identity-check.sh, outside
-      # api_request's classifier. Repeat it once for the candidate so an
-      # outage or rate limit marks the run transient instead of caching a
-      # 12-hour denial (Codex P2 on #1526).
-      local candidate="${!preferred:-${GH_TOKEN:-}}" repeat_status repeat_login
-      # identity-check.sh reports an API failure (as opposed to a mismatch or
-      # an unusable class) as "cannot verify token identity", whichever
-      # candidate hit it, the keyring's included (Codex P2 on #1526, round 5).
-      if grep -q "cannot verify token identity" "$WORKDIR/resolve.err" 2>/dev/null; then
-        echo "resolver for $identity could not read a candidate's identity (API failure)" >>"$WORKDIR/transient"
-      fi
-      if [ -n "$candidate" ]; then
-        repeat_status="$(api_request "$candidate" GET user "$WORKDIR/resolve-user")"
-        repeat_login="$(jq -r '.login // empty' "$WORKDIR/resolve-user.body" 2>/dev/null || true)"
-        # If the repeat now reads as the expected login, the resolver's own
-        # failure was the transient one (it recovered between the two calls),
-        # so the denial is not a measurement either (Codex P2 on #1526).
+      # api_request's classifier, so its outcome cannot tell an outage from a
+      # denial. Repeat GET /user once for EVERY candidate the resolver tries
+      # (preferred PAT, ambient token, the keyring's token) through
+      # api_request, which classifies by HTTP status: no response, 5xx, 429
+      # and a rate-limited 403 mark the run transient, while an authoritative
+      # denial such as a revoked token's 401 does not (Codex P2 on #1526,
+      # rounds 3-6). A candidate that NOW verifies means the resolver's own
+      # failure was the transient one, so that is marked too.
+      local candidate repeat_status repeat_login n=0
+      for candidate in "${!preferred:-}" "${GH_TOKEN:-}" \
+                       "$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --user "$identity" 2>/dev/null || true)"; do
+        [ -n "$candidate" ] || continue
+        n=$((n + 1))
+        repeat_status="$(api_request "$candidate" GET user "$WORKDIR/resolve-user-$n")"
+        repeat_login="$(jq -r '.login // empty' "$WORKDIR/resolve-user-$n.body" 2>/dev/null || true)"
         if [ "$repeat_status" = "200" ] && [ "$repeat_login" = "$identity" ] \
-           && [ "$(credential_class "$candidate" "$WORKDIR/resolve-user.headers")" = "user-held" ]; then
-          echo "resolver for $identity failed, then its candidate verified on repeat" >>"$WORKDIR/transient"
+           && [ "$(credential_class "$candidate" "$WORKDIR/resolve-user-$n.headers")" = "user-held" ]; then
+          echo "resolver for $identity failed, then candidate $n verified on repeat" >>"$WORKDIR/transient"
         fi
-      fi
+      done
       candidate=""
     else
       status="$(api_request "$GH_RESOLVED_TOKEN" GET user "$WORKDIR/write-user")"
@@ -386,7 +385,9 @@ measure_write() {
         local repo_status has_perm private scopes
         repo_status="$(api_request "$GH_RESOLVED_TOKEN" GET "repos/$REPO" "$WORKDIR/write-repo")"
         has_perm="$(jq -r --arg p "$required" '.permissions[$p] // false' "$WORKDIR/write-repo.body" 2>/dev/null || echo false)"
-        private="$(jq -r '.private // true' "$WORKDIR/write-repo.body" 2>/dev/null || echo true)"
+        # `//` would replace a real `false` too, so test for absence explicitly
+        # (Codex P2 on #1526): only a missing field defaults to private.
+        private="$(jq -r 'if .private == null then true else .private end' "$WORKDIR/write-repo.body" 2>/dev/null || echo true)"
         scopes="$(sed -nE 's/^[Xx]-[Oo][Aa]uth-[Ss]copes:[[:space:]]*//p' "$WORKDIR/write-user.headers" | tr -d ' ')"
         if [ "$repo_status" != "200" ]; then
           reason="verified $identity, but GET repos/$REPO with its token returned $repo_status"

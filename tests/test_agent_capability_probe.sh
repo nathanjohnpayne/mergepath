@@ -98,6 +98,7 @@ case "$tok" in
   github_pat_ro) login=nathanjohnpayne ;;
   github_pat_rw) login=nathanjohnpayne; perms='{"pull":true,"push":true}' ;;
   ghp_noscope) login=nathanjohnpayne; scopes="gist, read:org"; perms='{"pull":true,"push":true}' ;;
+  ghp_pubonly) login=nathanjohnpayne; scopes="public_repo"; perms='{"pull":true,"push":true}' ;;
   ghs_author) login=nathanjohnpayne ;;
   proxy-injected) login=nathanjohnpayne; perms='{"pull":true,"push":true}' ;;
 esac
@@ -129,7 +130,7 @@ elif [ "$path" = "graphql" ]; then
 elif [ "${path#repos/$STUB_REPO/rules/branches/}" != "$path" ]; then
   body="${STUB_RULES:-[]}"
 elif [ "$path" = "repos/$STUB_REPO" ]; then
-  body="{\"full_name\":\"x\",\"private\":true,\"permissions\":$perms}"
+  body="{\"full_name\":\"x\",\"private\":${STUB_PRIVATE:-true},\"permissions\":$perms}"
 elif [ "$tok" = "proxy-injected" ] || [ "${CLAUDE_CODE_REMOTE:-}" = "true" ]; then
   status=403; body='{"message":"repository not attached to this session"}'
 else
@@ -671,6 +672,32 @@ if [ "$(cap "$WORKDIR/rw.json" read)" = "false" ] && [ "$(jq -r .tier "$WORKDIR/
   pass "read refused but author PAT verified: tier is author-writes, not none"
 else
   fail "tier with read refused: read=$(cap "$WORKDIR/rw.json" read) tier=$(jq -r .tier "$WORKDIR/rw.json" 2>/dev/null)"
+fi
+
+# Round 6 on #1526.
+# A public repository reports "private": false; a public_repo-scoped classic
+# token is enough there.
+set +e
+run_probe OP_PREFLIGHT_AUTHOR_PAT=ghp_pubonly STUB_PRIVATE=false -- --no-cache >"$WORKDIR/pub.json" 2>/dev/null
+run_probe OP_PREFLIGHT_AUTHOR_PAT=ghp_pubonly -- --no-cache >"$WORKDIR/priv.json" 2>/dev/null
+set -e
+if [ "$(cap "$WORKDIR/pub.json" author-writes)" = "true" ] && [ "$(cap "$WORKDIR/priv.json" author-writes)" = "false" ]; then
+  pass "public_repo scope: granted on a public repository, refused on a private one"
+else
+  fail "public_repo: public=$(cap "$WORKDIR/pub.json" author-writes) private=$(cap "$WORKDIR/priv.json" author-writes)"
+fi
+
+# A revoked PAT (401) is an authoritative denial: the result is cached.
+rm -rf "$CACHE"
+set +e
+run_probe GH_TOKEN=ghp_author OP_PREFLIGHT_REVIEWER_PAT=ghp_revoked -- >"$WORKDIR/revoked.json" 2>/dev/null
+set -e
+if [ "$(jq -r .transient_failures "$WORKDIR/revoked.json")" = "false" ] \
+   && [ "$(cap "$WORKDIR/revoked.json" reviewer-writes)" = "false" ] \
+   && [ -e "$CACHE/agent-capability-o_r-nathanpayne-claude.json" ]; then
+  pass "revoked reviewer PAT (401): denial is authoritative and cached"
+else
+  fail "revoked PAT: transient=$(jq -r .transient_failures "$WORKDIR/revoked.json" 2>/dev/null) cache=$(ls "$CACHE" 2>/dev/null)"
 fi
 
 echo
