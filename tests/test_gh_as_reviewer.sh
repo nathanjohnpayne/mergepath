@@ -39,6 +39,7 @@ if [ "${1:-}" = "auth" ] && [ "${2:-}" = "switch" ]; then
 fi
 
 if [ "${1:-}" = "auth" ] && [ "${2:-}" = "token" ]; then
+  [ -n "${STUB_NO_KEYRING:-}" ] && exit 1
   user=""
   shift 2
   while [ "$#" -gt 0 ]; do
@@ -250,25 +251,43 @@ else
   pass "brokered placeholder: refused on its credential class before GET /user and before the write"
 fi
 
-# #1539: a codex-cloud surface with no explicit agent resolves the Codex
-# reviewer, in the shared resolver the capability probe also uses.
+# #1539: the surface does not select the reviewer, so the wrapper, the
+# capability probe and gh-pr-guard.sh (which never reads the surface) resolve
+# the same one. MERGEPATH_AGENT=codex selects the Codex reviewer.
 reset_log
 set +e
-MERGEPATH_AGENT_SURFACE=codex-cloud OP_PREFLIGHT_REVIEWER_PAT="ghp_codex-token" \
+MERGEPATH_AGENT_SURFACE=codex-cloud MERGEPATH_AGENT=codex OP_PREFLIGHT_REVIEWER_PAT="ghp_codex-token" \
   run_wrapper -- gh pr comment 123 --body "x" >/dev/null 2>&1
 rc=$?
 set -e
 if [ "$rc" -eq 0 ] && grep -q $'GH_TOKEN=ghp_codex-token GITHUB_TOKEN= gh\tpr\tcomment' "$WORKDIR/calls.log"; then
-  pass "codex-cloud surface: the wrapper resolves nathanpayne-codex, as the probe does"
+  pass "codex-cloud surface with MERGEPATH_AGENT=codex: the wrapper writes as nathanpayne-codex"
 else
   fail "codex-cloud surface: rc=$rc"
   cat "$WORKDIR/calls.log" >&2
 fi
+# Phase 4b P1 on #1541: with only the surface set, the wrapper must resolve
+# the same reviewer gh-pr-guard.sh assumes (nathanpayne-claude). It therefore
+# refuses a Codex PAT rather than post an approval under a reviewer the hook's
+# self-approval check never evaluated.
+reset_log
+set +e
+env -u MERGEPATH_AGENT -u OP_PREFLIGHT_AGENT -u GH_AS_REVIEWER_IDENTITY \
+  MERGEPATH_AGENT_SURFACE=codex-cloud OP_PREFLIGHT_REVIEWER_PAT="ghp_codex-token" STUB_NO_KEYRING=1 \
+  PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" "$WRAPPER" -- gh pr review 123 --approve >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ] && ! grep -q $'gh\tpr\treview' "$WORKDIR/calls.log"; then
+  pass "surface-only Codex PAT: resolved as the hook's reviewer, refused, no approval posted"
+else
+  fail "surface-only Codex PAT approval: rc=$rc"
+  cat "$WORKDIR/calls.log" >&2
+fi
 if [ "$(env -u GH_AS_REVIEWER_IDENTITY -u MERGEPATH_AGENT -u OP_PREFLIGHT_AGENT MERGEPATH_AGENT_SURFACE=codex-cloud \
-        bash -c '. "$1"; gh_default_reviewer_identity' _ "$ROOT/scripts/lib/gh-token-resolver.sh")" = "nathanpayne-codex" ] \
-   && [ "$(env -u GH_AS_REVIEWER_IDENTITY -u MERGEPATH_AGENT -u OP_PREFLIGHT_AGENT MERGEPATH_AGENT_SURFACE=codex-cloud MERGEPATH_AGENT=claude \
-        bash -c '. "$1"; gh_default_reviewer_identity' _ "$ROOT/scripts/lib/gh-token-resolver.sh")" = "nathanpayne-claude" ]; then
-  pass "gh_default_reviewer_identity: codex-cloud surface selects codex, an explicit agent still wins"
+        bash -c '. "$1"; gh_default_reviewer_identity' _ "$ROOT/scripts/lib/gh-token-resolver.sh")" = "nathanpayne-claude" ] \
+   && [ "$(env -u GH_AS_REVIEWER_IDENTITY -u MERGEPATH_AGENT -u OP_PREFLIGHT_AGENT MERGEPATH_AGENT_SURFACE=codex-cloud MERGEPATH_AGENT=codex \
+        bash -c '. "$1"; gh_default_reviewer_identity' _ "$ROOT/scripts/lib/gh-token-resolver.sh")" = "nathanpayne-codex" ]; then
+  pass "gh_default_reviewer_identity: the surface selects nothing; MERGEPATH_AGENT=codex selects codex"
 else
   fail "gh_default_reviewer_identity surface fallback"
 fi

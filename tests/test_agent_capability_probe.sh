@@ -811,14 +811,25 @@ else
   fail "#1537: a token value reached the cache"
 fi
 
-# A Codex cloud surface with no explicit agent selects the Codex reviewer.
+# #1539: the surface never selects the reviewer, because the write wrappers
+# and gh-pr-guard.sh do not read it. A Codex cloud surface with no agent named
+# measures the default reviewer, as the wrapper would use, and says how to fix
+# it; MERGEPATH_AGENT=codex selects the Codex reviewer everywhere.
 set +e
-run_probe MERGEPATH_AGENT_SURFACE=codex-cloud GH_TOKEN=ghp_author -- --no-cache >"$WORKDIR/cx.json" 2>/dev/null
+run_probe MERGEPATH_AGENT_SURFACE=codex-cloud GH_TOKEN=ghp_author -- --no-cache >"$WORKDIR/cx.json" 2>"$WORKDIR/cx.err"
+run_probe MERGEPATH_AGENT_SURFACE=codex-cloud MERGEPATH_AGENT=codex GH_TOKEN=ghp_author -- --no-cache >"$WORKDIR/cx2.json" 2>"$WORKDIR/cx2.err"
 set -e
-if [ "$(jq -r '.capabilities["reviewer-writes"].identity' "$WORKDIR/cx.json")" = "nathanpayne-codex" ]; then
-  pass "#1537: codex-cloud surface without an explicit agent measures nathanpayne-codex"
+if [ "$(jq -r '.capabilities["reviewer-writes"].identity' "$WORKDIR/cx.json")" = "$(env -u GH_AS_REVIEWER_IDENTITY -u MERGEPATH_AGENT -u OP_PREFLIGHT_AGENT MERGEPATH_AGENT_SURFACE=codex-cloud bash -c '. "$1"; gh_default_reviewer_identity' _ "$ROOT/scripts/lib/gh-token-resolver.sh")" ] \
+   && grep -q "Set MERGEPATH_AGENT=codex" "$WORKDIR/cx.err"; then
+  pass "#1539: a codex-cloud surface alone measures the reviewer the wrapper resolves, and warns"
 else
-  fail "#1537 codex reviewer: $(jq -r '.capabilities["reviewer-writes"].identity' "$WORKDIR/cx.json")"
+  fail "#1539 surface-only reviewer: $(jq -r '.capabilities["reviewer-writes"].identity' "$WORKDIR/cx.json")"
+fi
+if [ "$(jq -r '.capabilities["reviewer-writes"].identity' "$WORKDIR/cx2.json")" = "nathanpayne-codex" ] \
+   && ! grep -q "Set MERGEPATH_AGENT=codex" "$WORKDIR/cx2.err"; then
+  pass "#1539: MERGEPATH_AGENT=codex on a codex-cloud surface measures nathanpayne-codex, no warning"
+else
+  fail "#1539 explicit codex agent: $(jq -r '.capabilities["reviewer-writes"].identity' "$WORKDIR/cx2.json")"
 fi
 
 # A timestamp that is not a plain non-negative integer is rejected by the

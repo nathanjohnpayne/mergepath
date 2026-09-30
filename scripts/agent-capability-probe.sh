@@ -64,7 +64,10 @@
 # (the codex-universal image defines no CODEX_* variable), so a Codex cloud
 # environment must set MERGEPATH_AGENT_SURFACE=codex-cloud among its
 # environment variables. Without it the session reads as local with
-# surface_source "default", which the output shows rather than hides.
+# surface_source "default", which the output shows rather than hides. The
+# surface only labels where the session runs; it never selects the reviewer.
+# A Codex environment also sets MERGEPATH_AGENT=codex, which the probe, the
+# write wrappers and gh-pr-guard.sh all read (#1539).
 #
 # Environment:
 #   MERGEPATH_CAPABILITY_CACHE_DIR    cache dir (default
@@ -175,9 +178,16 @@ if [ -f "$ROOT/.github/review-policy.yml" ]; then
   policy_author="$(grep -m1 '^author_identity:' "$ROOT/.github/review-policy.yml" | awk '{print $2}' | sed -E "s/^[\"']//; s/[\"']\$//" || true)"
   [ -n "$policy_author" ] && AUTHOR_IDENTITY="$policy_author"
 fi
-# gh_default_reviewer_identity resolves a codex-cloud surface to the Codex
-# reviewer itself (#1539), so the probe and the write wrappers always agree.
+# The reviewer comes from the one chain the write wrappers and gh-pr-guard.sh
+# also use (GH_AS_REVIEWER_IDENTITY, MERGEPATH_AGENT, OP_PREFLIGHT_AGENT,
+# nathanpayne-claude), so measurement, execution and the self-approval guard
+# always name the same reviewer (#1539). The surface does not select an agent:
+# a Codex cloud environment sets MERGEPATH_AGENT=codex explicitly.
 REVIEWER_IDENTITY="$(gh_default_reviewer_identity)"
+if [ "${MERGEPATH_AGENT_SURFACE:-}" = "codex-cloud" ] \
+   && [ -z "${GH_AS_REVIEWER_IDENTITY:-}${MERGEPATH_AGENT:-}${OP_PREFLIGHT_AGENT:-}" ]; then
+  echo "agent-capability-probe: WARNING MERGEPATH_AGENT_SURFACE=codex-cloud but no agent is named; measuring reviewer $REVIEWER_IDENTITY. Set MERGEPATH_AGENT=codex in the Codex environment (docs/agents/cloud-environments.md)." >&2
+fi
 
 # A non-secret fingerprint of every credential the measurements can use
 # (#1537): the two preflight PATs, both ambient token variables, the gh config

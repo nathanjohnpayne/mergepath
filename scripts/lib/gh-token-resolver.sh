@@ -27,12 +27,6 @@ gh_default_reviewer_identity() {
     printf 'nathanpayne-%s\n' "$MERGEPATH_AGENT"
   elif [ -n "${OP_PREFLIGHT_AGENT:-}" ]; then
     printf 'nathanpayne-%s\n' "$OP_PREFLIGHT_AGENT"
-  elif [ "${MERGEPATH_AGENT_SURFACE:-}" = "codex-cloud" ]; then
-    # A Codex cloud environment configured by docs/agents/cloud-environments.md
-    # names its surface and may name nothing else. The surface identifies the
-    # agent, and resolving it HERE keeps the capability probe and the write
-    # wrappers on the same reviewer (#1539).
-    printf '%s\n' "nathanpayne-codex"
   else
     printf '%s\n' "nathanpayne-claude"
   fi
