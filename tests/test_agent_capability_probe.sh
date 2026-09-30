@@ -94,6 +94,9 @@ while [ "$#" -gt 0 ]; do
     -X) method="$2"; shift 2 ;;
     --jq) jqexpr="$2"; shift 2 ;;
     -f) shift 2 ;;
+    # identity-check.sh pins its write-mode requests to github.com (#1541);
+    # this fixture serves github.com only, like the real token it models.
+    --hostname) [ "$2" = "github.com" ] || { echo "stub: no credentials for $2" >&2; exit 4; }; shift 2 ;;
     *) path="$1"; shift ;;
   esac
 done

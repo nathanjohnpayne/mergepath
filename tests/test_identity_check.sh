@@ -46,16 +46,22 @@ case "$1 $2" in
     exit 0
     ;;
   "api user")
-    [ -n "${STUB_API_LOG:-}" ] && echo "api user" >>"$STUB_API_LOG"
+    [ -n "${STUB_API_LOG:-}" ] && echo "$*" >>"$STUB_API_LOG"
     rc="${STUB_TOKEN_RC:-0}"
     if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+    # gh's host resolution: with a single GHES host in hosts.yml and no
+    # --hostname, the request goes there and its login answers.
+    case " $* " in
+      *" --hostname github.com "*) ;;
+      *) if [ -n "${STUB_SOLE_GHES_LOGIN:-}" ]; then echo "$STUB_SOLE_GHES_LOGIN"; exit 0; fi ;;
+    esac
     echo "${STUB_TOKEN_LOGIN:-}"
     exit 0
     ;;
   "api -i")
     # `gh api -i user`: the headers --expect-write-identity reads for a
     # legacy unprefixed token (#1057).
-    [ -n "${STUB_API_LOG:-}" ] && echo "api -i" >>"$STUB_API_LOG"
+    [ -n "${STUB_API_LOG:-}" ] && echo "$*" >>"$STUB_API_LOG"
     printf 'HTTP/2.0 200 OK\r\n'
     [ -n "${STUB_SCOPES:-}" ] && printf 'X-Oauth-Scopes: %s\r\n' "$STUB_SCOPES"
     printf '\r\n{"login":"%s"}\n' "${STUB_TOKEN_LOGIN:-}"
@@ -372,6 +378,18 @@ else
   pass "--expect-write-identity GH_HOST: refused before any API call"
 fi
 write_case "GH_HOST=GitHub.com" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_HOST=GitHub.com
+
+# Phase 4b P1 on #1541: an unset GH_HOST does not mean github.com. With a
+# single GHES host configured, a bare `gh api user` answers with THAT login.
+# Both write-mode requests are pinned to github.com, so a github.com PAT
+# owned by someone else cannot borrow a matching Enterprise login.
+write_case "single GHES host whose login matches" 2 ghp_x STUB_TOKEN_LOGIN=someone-else STUB_SOLE_GHES_LOGIN=nathanjohnpayne
+write_case "legacy hex token, both requests pinned" 0 0123456789abcdef0123456789abcdef01234567 STUB_TOKEN_LOGIN=nathanjohnpayne STUB_SCOPES=repo
+if [ "$(grep -c -- '--hostname github.com' "$WORKDIR/api.log")" -eq 2 ] && [ "$(wc -l <"$WORKDIR/api.log" | tr -d ' ')" -eq 2 ]; then
+  pass "--expect-write-identity: the header and login requests both target github.com"
+else
+  fail "--expect-write-identity host pinning: $(cat "$WORKDIR/api.log")"
+fi
 write_case "opaque token that reads as the login" 3 some-token STUB_TOKEN_LOGIN=nathanjohnpayne
 write_case "opaque token with the opt-in" 0 some-token STUB_TOKEN_LOGIN=nathanjohnpayne MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1
 if printf '%s' "$WRITE_OUT" | grep -q "WARNING"; then

@@ -233,7 +233,7 @@ if [ "$MODE" = "write" ]; then
     # X-OAuth-Scopes; that is the one case needing the response headers.
     CLASS_HEADERS="$(mktemp "${TMPDIR:-/tmp}/identity-check-headers.XXXXXX")"
     trap 'rm -f "$CLASS_HEADERS"' EXIT
-    gh api -i user 2>/dev/null | tr -d '\r' | sed '/^$/q' >"$CLASS_HEADERS" || true
+    gh api -i user --hostname github.com 2>/dev/null | tr -d '\r' | sed '/^$/q' >"$CLASS_HEADERS" || true
   fi
   WRITE_CLASS="$(credential_class "$GH_TOKEN" "$CLASS_HEADERS")"
   case "$WRITE_CLASS" in
@@ -280,7 +280,12 @@ if [ "$MODE" = "token" ] || [ "$MODE" = "write" ]; then
     exit 3
   fi
   SIGNAL="gh api user --jq .login (with GH_TOKEN)"
-  if ! ACTUAL=$(gh api user --jq .login 2>/dev/null); then
+  # Write mode pins the request to github.com. An unset GH_HOST is not enough:
+  # with a single host in hosts.yml, gh targets THAT host, and a GHES login
+  # would answer for a GH_TOKEN it never saw (Phase 4b P1 on #1541).
+  HOST_ARGS=()
+  [ "$MODE" = "write" ] && HOST_ARGS=(--hostname github.com)
+  if ! ACTUAL=$(gh api user ${HOST_ARGS[@]+"${HOST_ARGS[@]}"} --jq .login 2>/dev/null); then
     echo "identity-check: '$SIGNAL' failed; cannot verify token identity." >&2
     echo "identity-check:   The PAT in GH_TOKEN may be expired, revoked, or lack 'read:user' scope." >&2
     exit 3
