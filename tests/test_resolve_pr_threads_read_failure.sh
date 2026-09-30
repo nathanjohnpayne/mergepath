@@ -184,6 +184,25 @@ cls_rc=$?
   && ok "graphql_ceiling_hit matches the proxy phrase and nothing else" \
   || bad "graphql_ceiling_hit misclassified (case $cls_rc)"
 
+# A refusal raised inside nested command substitutions (the per-thread
+# comment refetch runs two levels down) must still end the run with 6, not
+# collapse into an ordinary "pagination failed" (Codex P2 on #1529).
+nest_out=$(bash -c '
+  set -euo pipefail
+  . "$1/scripts/lib/graphql-ceiling.sh"
+  graphql_ceiling_install_trap
+  inner() { graphql_ceiling_refuse probe "a nested read"; }
+  outer() { local x; x=$(inner) || return 1; printf "%s" "$x"; }
+  y=$(outer) || echo "caller saw an ordinary failure"
+  echo "REACHED-AFTER-REFUSAL"
+' _ "$ROOT" 2>&1)
+nest_rc=$?
+if [ "$nest_rc" -eq 6 ] && ! grep -q "REACHED-AFTER-REFUSAL" <<<"$nest_out"; then
+  ok "a refusal two subshells deep ends the main shell with 6"
+else
+  bad "nested refusal: rc=$nest_rc output: $nest_out"
+fi
+
 echo
 echo "test_resolve_pr_threads_read_failure: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

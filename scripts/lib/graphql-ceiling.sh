@@ -38,6 +38,14 @@
 #     Prints the tier-aware explanation to stderr and exits
 #     GRAPHQL_CEILING_EXIT (6). Call it only after graphql_ceiling_hit.
 #
+#   graphql_ceiling_install_trap
+#     Call once from the helper's MAIN shell. A GraphQL call made inside a
+#     command substitution runs in a subshell, where `exit 6` ends only that
+#     subshell and the caller sees an ordinary failure. After this, a refusal
+#     raised in any subshell also signals the main shell (USR1), which exits 6
+#     as soon as the command it is waiting on returns. BASH_SUBSHELL (bash 3.0+)
+#     tells the two apart, so the lib stays Bash 3.2 portable.
+#
 # Bash 3.2 portable; no top-level side effects.
 
 GRAPHQL_CEILING_EXIT=6
@@ -57,5 +65,14 @@ graphql_ceiling_refuse() {
     echo "$helper:   This is a property of the session (the Claude cloud GraphQL ceiling, mergepath#1057), not a credential gap: retrying or provisioning another token returns the same 403."
     echo "$helper:   Hand this step to a session that can reach GraphQL (a local session, or the CI lane), with the state established here."
   } >&2
+  if [ "${BASH_SUBSHELL:-0}" -gt 0 ] && [ -n "${GRAPHQL_CEILING_MAIN_PID:-}" ]; then
+    kill -USR1 "$GRAPHQL_CEILING_MAIN_PID" 2>/dev/null || true
+  fi
   exit "$GRAPHQL_CEILING_EXIT"
+}
+
+graphql_ceiling_install_trap() {
+  GRAPHQL_CEILING_MAIN_PID=$$
+  # shellcheck disable=SC2064  # expand GRAPHQL_CEILING_EXIT now, deliberately
+  trap "exit $GRAPHQL_CEILING_EXIT" USR1
 }

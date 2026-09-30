@@ -590,6 +590,9 @@ PAT_GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}"
 if [ -r "$__RESOLVE_THREADS_DIR/lib/graphql-ceiling.sh" ]; then
   # shellcheck source=lib/graphql-ceiling.sh
   . "$__RESOLVE_THREADS_DIR/lib/graphql-ceiling.sh"
+  # The per-thread comment refetch runs inside nested command substitutions;
+  # a refusal there must still end the run with exit 6 (Codex P2 on #1529).
+  graphql_ceiling_install_trap
 else
   graphql_ceiling_hit() { return 1; }
 fi
@@ -1088,11 +1091,13 @@ fetch_all_thread_comments() {
     # call, string cursor (-f) on every subsequent page.
     if [ -z "$cursor" ]; then
       resp=$(gh_pat api graphql -f query="$query" -F id="$thread_id" -F cursor=null 2>&1) || {
+        graphql_ceiling_hit "$resp" && graphql_ceiling_refuse resolve-pr-threads "re-fetching the full comment history of review thread $thread_id"
         echo "thread-comments page fetch failed for $thread_id: $resp" >&2
         return 1
       }
     else
       resp=$(gh_pat api graphql -f query="$query" -F id="$thread_id" -f cursor="$cursor" 2>&1) || {
+        graphql_ceiling_hit "$resp" && graphql_ceiling_refuse resolve-pr-threads "re-fetching the full comment history of review thread $thread_id"
         echo "thread-comments page fetch failed for $thread_id: $resp" >&2
         return 1
       }
@@ -2976,12 +2981,10 @@ post_tag_reply() {
   local rationale="$3"
   local body
   body="[mergepath-resolve: $class] $rationale"
-  # Suppress stdout (the mutation response is noise), but capture
-  # stderr for failure-mode logging. The redirection order matters:
-  # `2>&1 1>/dev/null` first dups stderr to stdout (so it lands in
-  # the command substitution), then redirects the original stdout to
-  # /dev/null. The reversed form (`>/dev/null 2>&1`) discards both
-  # streams and leaves $err empty — see #shellcheck SC2327/SC2328.
+  # Capture BOTH streams: `gh api` writes an HTTP error BODY to stdout and
+  # only a summary to stderr, so the proxy's refusal phrase can be in either
+  # (Codex P2 on #1529). On success the captured mutation response is simply
+  # unused; it is only read on the failure path below.
   local err
   if ! err=$(gh_pat api graphql \
     -f query='mutation($id: ID!, $body: String!) {
@@ -2991,7 +2994,7 @@ post_tag_reply() {
     }' \
     -F id="$thread_id" \
     -F body="$body" \
-    2>&1 1>/dev/null); then
+    2>&1); then
     # Called in the main shell (`if post_tag_reply ...`), so the refusal ends
     # the run before any thread is resolved without its disposition tag.
     graphql_ceiling_hit "$err" && graphql_ceiling_refuse resolve-pr-threads "posting the disposition reply on review thread $thread_id"
