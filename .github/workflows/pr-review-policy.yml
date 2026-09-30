@@ -209,7 +209,9 @@ jobs:
           #   2. branch name must start with propagation_prs.branch_prefix
           #      and PR author must be author_identity.
           #   3. the <sha> in the branch name (mergepath-sync/<sha> or
-          #      mergepath-sync/sync-all-<sha>[-<scope-digest>]) is checked
+          #      mergepath-sync/sync-all-<sha>[-<scope-digest>]) is resolved
+          #      to one full commit that must be ON mergepath's default
+          #      branch's first-parent history, checked
           #      out from PUBLIC nathanjohnpayne/
           #      mergepath, and mergepath@<sha>'s OWN
           #      verify-propagation-pr.sh byte-compares every changed
@@ -292,9 +294,30 @@ jobs:
               MP_DIR=$(mktemp -d)
               # mergepath is public — no token needed. blob:none keeps
               # it cheap; the checkout fetches only the blobs it needs.
+              #
+              # Source-commit provenance: the branch-name SHA is chosen by
+              # whoever pushed the branch and may name ANY commit in the
+              # public repo, including one on an unmerged branch. Resolve
+              # the (normally 7-char) key to exactly ONE full 40-hex commit
+              # — an ambiguous abbreviation fails rev-parse — and require it
+              # on the FIRST-PARENT history of mergepath's default branch, so
+              # only a tree that existed there after mergepath's own review
+              # can qualify (generic ancestry would also admit an
+              # intermediate commit of a PR branch merged with a true merge). The base verifier re-checks both (it receives
+              # the full SHA as its 5th argument); checking here too keeps a
+              # consumer whose base verifier predates that check safe.
+              SYNC_FULL_SHA=""
+              MP_DEFAULT_REF=""
               if git clone --quiet --filter=blob:none \
                    https://github.com/nathanjohnpayne/mergepath "$MP_DIR" \
-                 && git -C "$MP_DIR" checkout --quiet "$SYNC_SHA" 2>/dev/null; then
+                 && SYNC_FULL_SHA=$(git -C "$MP_DIR" rev-parse --verify --quiet "${SYNC_SHA}^{commit}" 2>/dev/null) \
+                 && [[ "$SYNC_FULL_SHA" =~ ^[0-9a-f]{40}$ ]] \
+                 && MP_DEFAULT_REF=$(git -C "$MP_DIR" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null) \
+                 && [ -n "$MP_DEFAULT_REF" ] \
+                 && MP_FIRST_PARENT=$(git -C "$MP_DIR" rev-list --first-parent "$MP_DEFAULT_REF" 2>/dev/null) \
+                 && grep -Fxq "$SYNC_FULL_SHA" <<<"$MP_FIRST_PARENT" \
+                 && git -C "$MP_DIR" checkout --quiet "$SYNC_FULL_SHA" 2>/dev/null; then
+                SYNC_SHA="$SYNC_FULL_SHA"
                 # #531: run the TRUSTED in-repo verifier from the PR's
                 # BASE commit (propagated + reviewed; the PR cannot edit
                 # its own base), NOT the verifier shipped inside the
@@ -320,7 +343,7 @@ jobs:
                     # on once the hardened verifier itself has propagated into
                     # the consumer base.
                     echo "Propagation lane: base verifier predates the #531 self-sourcing contract (no self-sourced-helpers-v1 tag) — not lane-eligible; falls through to normal review."
-                  elif bash "$VERIFIER" "$MP_DIR" "$PWD" "$BASE_SHA" "$HEAD_SHA"; then
+                  elif bash "$VERIFIER" "$MP_DIR" "$PWD" "$BASE_SHA" "$HEAD_SHA" "$SYNC_FULL_SHA"; then
                     PROPAGATION_LANE=true
                   fi
                   git worktree remove --force "$BASE_TREE" 2>/dev/null || rm -rf "$BASE_TREE"
@@ -329,7 +352,7 @@ jobs:
                   rm -rf "$BASE_TREE"
                 fi
               else
-                echo "Propagation lane: could not check out mergepath@$SYNC_SHA — not lane-eligible."
+                echo "Propagation lane: mergepath@$SYNC_SHA does not resolve to exactly one commit on mergepath's default branch (resolved='${SYNC_FULL_SHA:-none}', default='${MP_DEFAULT_REF:-unknown}'), or could not be checked out — not lane-eligible."
               fi
               rm -rf "$MP_DIR"
             else
