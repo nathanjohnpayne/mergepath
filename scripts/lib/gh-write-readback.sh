@@ -181,7 +181,11 @@ gh_readback_prepare() {
     esac
     if [ -z "$group" ]; then
       group="$arg"
-      case "$group" in pr|issue) ;; *) return 0 ;; esac
+      case "$group" in
+        pr|issue) ;;
+        api) _gh_readback_prepare_api "$@"; return $? ;;
+        *) return 0 ;;
+      esac
       continue
     fi
     if [ -z "$verb" ]; then
@@ -261,6 +265,37 @@ gh_readback_prepare() {
     GH_READBACK_SNAPSHOT="${GH_READBACK_SNAPSHOT:-0}"
   fi
   GH_READBACK_KIND="$key"
+  return 0
+}
+
+# `gh api` writes (#1057, Codex on #1541). A REST write whose response names
+# its author (a review, a comment, a reaction) is checked against the expected
+# login from the response itself; the wrappers capture stdout for this. A GET,
+# a response with no author object, or one filtered by --jq/--template carries
+# nothing to check, and is left alone rather than claimed verified.
+_gh_readback_prepare_api() {
+  local arg method="" fields=0 filtered=0 prev=""
+  for arg in "$@"; do
+    case "$prev" in
+      -X|--method) method="$arg" ;;
+    esac
+    case "$arg" in
+      -X?*) method="${arg#-X}" ;;
+      --method=*) method="${arg#--method=}" ;;
+      -f|-F|--field|--raw-field|--input|-f?*|-F?*|--field=*|--raw-field=*|--input=*) fields=1 ;;
+      -q|--jq|-t|--template|--jq=*|--template=*|-q?*|-t?*) filtered=1 ;;
+    esac
+    prev="$arg"
+  done
+  [ -z "$method" ] && [ "$fields" -eq 1 ] && method=POST
+  method="$(printf '%s' "$method" | tr 'a-z' 'A-Z')"
+  case "$method" in
+    POST|PATCH|PUT) ;;
+    *) return 0 ;;
+  esac
+  [ "$filtered" -eq 1 ] && return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  GH_READBACK_KIND="api-write"
   return 0
 }
 
@@ -380,6 +415,15 @@ gh_readback_verify() {
       [ -n "$login" ] || { _gh_readback_unverified "comment $id"; return $?; }
       [ "$login" = "$GH_READBACK_EXPECTED" ] || { _gh_readback_mismatch "comment $id" "$login"; return $?; }
       echo "$GH_READBACK_LABEL: verified comment $id author=$login" >&2
+      ;;
+    api-write)
+      login="$(jq -r 'if type == "object" and (.user.login | type) == "string" then .user.login else empty end' "$out" 2>/dev/null || true)"
+      [ -n "$login" ] || return 0
+      if [ "$login" != "$GH_READBACK_EXPECTED" ]; then
+        GH_READBACK_REPO="${GH_READBACK_REPO:-the API}"; GH_READBACK_NUMBER="${GH_READBACK_NUMBER:-write}"
+        _gh_readback_mismatch "the object this API write created" "$login"; return $?
+      fi
+      echo "$GH_READBACK_LABEL: verified API write author=$login" >&2
       ;;
     pr-review) _gh_readback_verify_review; return $? ;;
     pr-merge) _gh_readback_verify_merge; return $? ;;

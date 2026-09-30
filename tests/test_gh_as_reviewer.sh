@@ -106,6 +106,9 @@ if { [ "${1:-}" = "pr" ] || [ "${1:-}" = "issue" ]; } && [ "${2:-}" = "comment" 
 fi
 if [ "${1:-}" = "api" ]; then
   case "$*" in
+    *"-X POST repos/o/r/pulls/123/reviews"*)
+      printf '{"id":9,"commit_id":"abc","user":{"login":"%s"}}\n' "${STUB_WRITE_AS:-$(login_for "${GH_TOKEN:-}")}"
+      exit 0 ;;
     *"/reviews"*"--jq"*) echo 1; exit 0 ;;
     *"/reviews"*)
       # The pre-existing review (id 1), any STUB_EXTRA_REVIEW a case injects
@@ -407,6 +410,23 @@ if [ "$rc" -eq 0 ] && grep $'gh\tapi' "$WORKDIR/calls.log" | grep -q $'\t--hostn
 else
   fail "host pinning: rc=$rc"
   cat "$WORKDIR/calls.log" >&2
+fi
+
+# `gh api` writes whose response names an author are checked too: the Phase
+# 4b orchestrator posts its review this way (Codex on #1541).
+reset_log
+set +e
+err=$(OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" STUB_WRITE_AS="claude[bot]" \
+  run_wrapper -- gh api -X POST repos/o/r/pulls/123/reviews --input /dev/null 2>&1 >/dev/null)
+rc=$?
+out_ok=$(OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" run_wrapper -- gh api -X POST repos/o/r/pulls/123/reviews --input /dev/null 2>/dev/null)
+ok_rc=$?
+set -e
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "landed under 'claude\[bot\]'" \
+   && [ "$ok_rc" -eq 0 ] && printf '%s' "$out_ok" | jq -e '.id == 9' >/dev/null; then
+  pass "gh api review POST: a response authored by another login exits 5; a matching one passes its JSON through"
+else
+  fail "gh api readback: rc=$rc ok_rc=$ok_rc err=$err"
 fi
 
 # A target the wrapper cannot resolve cannot be read back, so it is not written.
