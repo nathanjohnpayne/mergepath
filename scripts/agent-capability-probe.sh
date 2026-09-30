@@ -262,7 +262,7 @@ command -v curl >/dev/null 2>&1 && HAVE_CURL=true
 # gh with the caller's own environment. Token material never reaches argv.
 api_request() {
   local token="$1" method="$2" path="$3" prefix="$4" query="${5:-}"
-  local raw="$prefix.raw" status
+  local raw="$prefix.raw" status request_rc=0
   : >"$prefix.headers"
   : >"$prefix.body"
   if $HAVE_GH; then
@@ -270,9 +270,9 @@ api_request() {
     args=(api -i -X "$method" "$path")
     [ -n "$query" ] && args+=(-f "query=$query")
     if [ -n "$token" ]; then
-      ( unset GITHUB_TOKEN; GH_TOKEN="$token" gh "${args[@]}" ) >"$raw" 2>/dev/null || true
+      ( unset GITHUB_TOKEN; GH_TOKEN="$token" gh "${args[@]}" ) >"$raw" 2>/dev/null || request_rc=$?
     else
-      gh "${args[@]}" >"$raw" 2>/dev/null || true
+      gh "${args[@]}" >"$raw" 2>/dev/null || request_rc=$?
     fi
     tr -d '\r' <"$raw" | awk -v h="$prefix.headers" -v b="$prefix.body" '
       !done && /^$/ { done = 1; next }
@@ -287,10 +287,10 @@ api_request() {
     [ -n "$query" ] && data="$(jq -cn --arg q "$query" '{query: $q}')"
     if [ -n "$data" ]; then
       curl -sS --suppress-connect-headers --connect-timeout 10 --max-time 30 -X "$method" -H @"$hdr" -H 'Accept: application/vnd.github+json' \
-        -D "$raw" -o "$prefix.body" --data "$data" "https://api.github.com/$path" 2>/dev/null || true
+        -D "$raw" -o "$prefix.body" --data "$data" "https://api.github.com/$path" 2>/dev/null || request_rc=$?
     else
       curl -sS --suppress-connect-headers --connect-timeout 10 --max-time 30 -X "$method" -H @"$hdr" -H 'Accept: application/vnd.github+json' \
-        -D "$raw" -o "$prefix.body" "https://api.github.com/$path" 2>/dev/null || true
+        -D "$raw" -o "$prefix.body" "https://api.github.com/$path" 2>/dev/null || request_rc=$?
     fi
     rm -f "$hdr"
     tr -d '\r' <"$raw" >"$prefix.headers" 2>/dev/null || true
@@ -303,7 +303,12 @@ api_request() {
   # No response, a server error, or a rate limit says nothing about what this
   # session may do. Record it so the result is not cached as a measurement
   # (Codex P2 on #1526): an outage must not become a 12-hour denial.
+  # A 2xx status with a non-zero transfer exit is a response cut off after its
+  # headers (a curl timeout, a dropped connection): its body is incomplete,
+  # so it is transient too (CodeRabbit on #1526). A non-2xx exit is gh's
+  # normal way of reporting an HTTP error and is classified by status below.
   case "$status" in
+    2??) [ "$request_rc" -eq 0 ] || echo "$path -> $status, transfer exit $request_rc" >>"$WORKDIR/transient" ;;
     000|429|5??) echo "$path -> $status" >>"$WORKDIR/transient" ;;
     403) if grep -Eiq '^x-ratelimit-remaining:[[:space:]]*0' "$prefix.headers" 2>/dev/null \
             || grep -qi 'rate limit' "$prefix.body" 2>/dev/null; then

@@ -136,6 +136,8 @@ if [ "$include" = 1 ]; then
   printf 'Content-Type: application/json\r\n\r\n'
 fi
 printf '%s\n' "$body"
+# STUB_CUT_OFF: the response arrived with 200 headers, then the transfer failed.
+[ -n "${STUB_CUT_OFF:-}" ] && [ "$path" = "graphql" ] && exit 1
 [ "$status" = 200 ]
 STUB
 chmod +x "$STUB_DIR/gh"
@@ -609,6 +611,18 @@ if [ "$(cap "$WORKDIR/connect.json" read)" = "false" ] && reason "$WORKDIR/conne
   pass "curl path: a proxy CONNECT 200 before an origin 403 reads as 403"
 else
   fail "curl CONNECT parse: $(jq -c '.capabilities.read' "$WORKDIR/connect.json" 2>/dev/null)"
+fi
+
+# A 200 whose transfer then failed is an incomplete answer, not a measurement
+# (CodeRabbit on #1526): flagged transient, never cached.
+rm -rf "$CACHE"
+set +e
+run_probe GH_TOKEN=ghp_author STUB_CUT_OFF=1 -- >"$WORKDIR/cut.json" 2>/dev/null
+set -e
+if [ "$(jq -r .transient_failures "$WORKDIR/cut.json")" = "true" ] && [ ! -e "$CACHE/agent-capability-o_r-nathanpayne-claude.json" ]; then
+  pass "200 headers followed by a failed transfer: flagged transient and not cached"
+else
+  fail "cut-off transfer: transient=$(jq -r .transient_failures "$WORKDIR/cut.json" 2>/dev/null) cache=$(ls "$CACHE" 2>/dev/null)"
 fi
 
 echo
