@@ -204,7 +204,7 @@ trap 'rm -f "$BODY_FILE"' EXIT
     printf '\n\n'
   fi
   printf '### Resuming\n\n'
-  printf 'First confirm the PR head is still `%s`. If it moved, re-derive the state instead of trusting this note. Then run the next command from a session that has `%s`. Remove the `%s` label only once the step it stands for has completed: a dispatch that returned is not completion. For a thread-resolution lane dispatch, find this PR\x27s run by its title (`gh run list --workflow thread-resolution-lane.yml --event repository_dispatch --json databaseId,displayTitle --jq \x27[.[] | select(.displayTitle == "Thread resolution lane: PR #%s")][0].databaseId\x27`), wait with `gh run watch <id> --exit-status`, and check that the threads resolved. The label is informational: no gate reads it, and removing it clears no other label.\n' "$HEAD_SHA" "$BLOCKED" "$LABEL" "$PR"
+  printf 'First confirm the PR head is still `%s`. If it moved, re-derive the state instead of trusting this note. Then run the next command from a session that has `%s`. Remove the `%s` label only once the step it stands for has completed: a dispatch that returned is not completion. For thread resolution, `scripts/dispatch-thread-resolution-lane.sh %s` dispatches the lane and waits for its own run, exiting 0 only when that run succeeded. The label is informational: no gate reads it, and removing it clears no other label.\n' "$HEAD_SHA" "$BLOCKED" "$LABEL" "$PR"
 } >"$BODY_FILE"
 
 if $PRINT; then

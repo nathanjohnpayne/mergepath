@@ -1519,11 +1519,33 @@ paths:
     requires:
       - "scripts/gh-as-reviewer.sh"
       - "scripts/lib/gh-token-resolver.sh"
+  # Dispatches the thread-resolution lane and waits for its own run (#1057
+  # G). Dispatches through the author wrapper, so it repeats that wrapper's
+  # runtime closure.
+  - path: scripts/dispatch-thread-resolution-lane.sh
+    type: canonical
+    consumers: all
+    requires:
+      - ".github/workflows/thread-resolution-lane.yml"
+      - "scripts/gh-as-author.sh"
+      - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/identity-check.sh"
+      - "scripts/lib/gh-command-classifier.sh"
+      - "scripts/lib/pr-body-contract.sh"
+      - "scripts/lib/pr-body-contract.mjs"
+      - "scripts/lib/reviewers-helpers.sh"
+      - "scripts/lib/credential-class.sh"
   - path: tests/test_local_agent_handback.sh
     type: canonical
     consumers: all
     requires:
       - "scripts/post-local-agent-handback.sh"
+      - "scripts/dispatch-thread-resolution-lane.sh"
+      - "scripts/gh-as-author.sh"
+      - "scripts/lib/gh-command-classifier.sh"
+      - "scripts/lib/pr-body-contract.sh"
+      - "scripts/lib/pr-body-contract.mjs"
+      - "scripts/lib/reviewers-helpers.sh"
       - "scripts/gh-as-reviewer.sh"
       - "scripts/identity-check.sh"
       - "scripts/lib/gh-token-resolver.sh"
@@ -2172,6 +2194,7 @@ paths:
       - "docs/agents/cloud-environments.md"    # tests/test_cloud_environment.sh checks it (#1057 F)
       - "scripts/post-local-agent-handback.sh" # tests/test_local_agent_handback.sh runs it (#1057 D)
       - ".github/workflows/thread-resolution-lane.yml"  # tests/test_local_agent_handback.sh checks it (#1057 G)
+      - "scripts/dispatch-thread-resolution-lane.sh"  # tests/test_local_agent_handback.sh runs it (#1057 G)
       - "scripts/lib/ensure-yq.sh"             # check_resolve_pr_threads CI-only yq bootstrap (#616)
       - "scripts/gh-as-author.sh"              # check_gh_as_author (transitive)
       - "scripts/lib/gh-token-resolver.sh"     # gh-as-author.sh runtime closure (#1058)

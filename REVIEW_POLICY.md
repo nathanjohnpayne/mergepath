@@ -210,7 +210,7 @@ The current contract is token-attributed for the guarded core `gh` write surface
 | `gh api GET ...` | direct read with `GH_TOKEN=<read PAT>` | no write byline |
 | `gh api graphql resolveReviewThread` | `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` plus `identity-check.sh --expect-write-identity <reviewer>` before mutation | reviewer token |
 | `gh workflow run` | direct with an author or reviewer PAT that has `workflow` scope | no comment/review byline |
-| `gh api .../dispatches` (`repository_dispatch`) | author wrapper | Contents: write (fine-grained) or `repo` (classic); a `GITHUB_TOKEN` dispatch creates no run |
+| `gh api .../dispatches` (`repository_dispatch`) | author wrapper (`scripts/dispatch-thread-resolution-lane.sh` for the lane) | Contents: write (fine-grained) or `repo` (classic); a `GITHUB_TOKEN` dispatch creates no run |
 
 Notes on the token-wrapper contract:
 
@@ -812,7 +812,7 @@ The fourth member of the handoff family, for a step a session cannot complete, a
 
 It uses REST only, so it works in the session most likely to need it.
 
-The resuming session first confirms the head has not moved. It then runs the next command, confirms the step it stands for actually completed, and only then removes `needs-local-agent`. A dispatch that merely returned is not completion. For a `graphql` handback, the next command is usually a dispatch of the thread-resolution lane: `scripts/gh-as-author.sh -- gh api repos/<owner>/<repo>/dispatches -f event_type=thread-resolution-lane -F 'client_payload[pr]=<PR#>'`. The lane is a `repository_dispatch` workflow, so GitHub runs only the default branch's copy. The dispatch returns before the run starts, so the resumer finds that PR's run by its title (`gh run list --workflow thread-resolution-lane.yml --event repository_dispatch --json databaseId,displayTitle --jq '[.[] | select(.displayTitle == "Thread resolution lane: PR #<PR#>")][0].databaseId'`), waits on it with `gh run watch <id> --exit-status`, and checks that the threads resolved. That lane runs `scripts/resolve-pr-threads.sh --resolve-actioned` from the default branch with the reviewer PAT, as the reviewer that PAT reads as. It sees only GitHub-visible evidence: a thread needs an agent reply, because a verdict recorded only in a session's local ledger does not reach the runner.
+The resuming session first confirms the head has not moved. It then runs the next command, confirms the step it stands for actually completed, and only then removes `needs-local-agent`. A dispatch that merely returned is not completion. For a `graphql` handback, the next command is usually `scripts/dispatch-thread-resolution-lane.sh <PR#>`. It dispatches the thread-resolution lane, a `repository_dispatch` workflow that GitHub runs only from the default branch, then finds the run its own dispatch created (by a nonce in the run title) and waits for it, exiting non-zero unless that run succeeded. That lane runs `scripts/resolve-pr-threads.sh --resolve-actioned` from the default branch with the reviewer PAT, as the reviewer that PAT reads as. It sees only GitHub-visible evidence: a thread needs an agent reply, because a verdict recorded only in a session's local ledger does not reach the runner.
 
 `needs-local-agent` is informational. It is not a blocking label (`scripts/lib/blocking-labels.sh`), no gate reads its presence or absence, and agents may remove it; `label-removal-guard.sh` does not protect it. Removing it clears nothing else: `human-hold`, `needs-human-review` and `policy-violation` keep their own rules.
 

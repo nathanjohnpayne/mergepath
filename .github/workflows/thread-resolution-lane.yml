@@ -1,8 +1,9 @@
 name: Thread resolution lane
-# A per-PR title, so a resumer selects its own PR's run rather than the most
-# recent one (CodeRabbit on #1555). Only a title: the payload never reaches a
-# script through an expression.
-run-name: "Thread resolution lane: PR #${{ github.event.client_payload.pr }}"
+# A per-dispatch title: the PR plus the dispatcher's nonce, so
+# scripts/dispatch-thread-resolution-lane.sh selects exactly the run its own
+# dispatch created (CodeRabbit and Codex on #1555). Only a title: the payload
+# never reaches a script through an expression.
+run-name: "Thread resolution lane: PR #${{ github.event.client_payload.pr }} [${{ github.event.client_payload.nonce }}]"
 
 # Resolve a PR's demonstrably-actioned bot review threads from CI, for a
 # session that cannot (#1057 item G).
@@ -15,13 +16,12 @@ run-name: "Thread resolution lane: PR #${{ github.event.client_payload.pr }}"
 # threads, recording verdicts. This lane runs the resolution step itself, on
 # a real runner, when a session dispatches it:
 #
-#   scripts/gh-as-author.sh -- gh api repos/<owner>/<repo>/dispatches \
-#     -f event_type=thread-resolution-lane -F 'client_payload[pr]=<PR#>'
+#   scripts/dispatch-thread-resolution-lane.sh <PR#>
 #
-# That is a REST call the proxy allows for the attached repository. The
-# wrapper binds the provisioned author PAT (a Codex task has no ambient
-# token); the endpoint needs Contents: write on a fine-grained token, which
-# the author's token has, or `repo` on a classic one. Only `--resolve-actioned` runs here: it resolves a thread only
+# which sends the repository_dispatch through scripts/gh-as-author.sh (the
+# provisioned author PAT: Contents: write on a fine-grained token, or `repo`
+# on a classic one), finds the run its dispatch created, and waits for it.
+# That is REST, which the proxy allows for the attached repository. Only `--resolve-actioned` runs here: it resolves a thread only
 # when its fix or rebuttal is demonstrable AND bound to the finding, and
 # leaves everything else open. This fresh checkout sees only GitHub-visible
 # evidence: an agent reply on the thread. A verdict recorded only in a

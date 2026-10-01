@@ -99,8 +99,7 @@ if [ "$rc" -eq 0 ] \
    && printf '%s' "$body" | grep -q "https://claude.ai/code/session_abc123" \
    && printf '%s' "$body" | grep -q "scripts/resolve-pr-threads.sh 12 --resolve-actioned" \
    && printf '%s' "$body" | grep -q "only once the step it stands for has completed: a dispatch that returned is not completion" \
-   && printf '%s' "$body" | grep -q 'gh run watch <id> --exit-status' \
-   && printf '%s' "$body" | grep -qF "select(.displayTitle == \"Thread resolution lane: PR #12\")][0].databaseId'"; then
+   && printf '%s' "$body" | grep -qF 'scripts/dispatch-thread-resolution-lane.sh 12` dispatches the lane and waits for its own run'; then
   pass "handback comment records capability, tier, head, accounting, session URL and the next command"
 else
   fail "happy path: rc=$rc err=$(cat "$WORKDIR/err") body=$body"
@@ -269,8 +268,8 @@ if [ -r "$LANE" ] && command -v yq >/dev/null 2>&1; then
     fail "lane triggers drifted: on=$triggers types=$types"
   fi
   # Each run is titled with its PR, which is what a resumer selects on.
-  if [ "$(yq -r '."run-name"' "$LANE")" = 'Thread resolution lane: PR #${{ github.event.client_payload.pr }}' ]; then
-    pass "lane runs are titled per PR, so a resumer can select its own PR's run"
+  if [ "$(yq -r '."run-name"' "$LANE")" = 'Thread resolution lane: PR #${{ github.event.client_payload.pr }} [${{ github.event.client_payload.nonce }}]' ]; then
+    pass "lane runs are titled per dispatch (PR and nonce), so the dispatcher selects exactly its own run"
   else
     fail "lane run-name drifted: $(yq -r '."run-name"' "$LANE")"
   fi
@@ -321,6 +320,80 @@ G
   fi
 else
   fail "thread-resolution-lane.yml missing, or yq unavailable to check it"
+fi
+
+# --- dispatch-thread-resolution-lane.sh (#1057 G) -----------------------------
+# The real script through the real author wrapper, against a gh stub that
+# serves run lists from a sequence: the dispatch's own run must be found by
+# its nonce (not the newest run), polled for until it is listed, and watched.
+DFIX="$WORKDIR/dispatch"
+mkdir -p "$DFIX/scripts/lib" "$DFIX/bin"
+cp "$ROOT/scripts/dispatch-thread-resolution-lane.sh" "$ROOT/scripts/gh-as-author.sh" "$ROOT/scripts/identity-check.sh" "$DFIX/scripts/"
+for f in gh-token-resolver.sh credential-class.sh gh-command-classifier.sh pr-body-contract.sh pr-body-contract.mjs reviewers-helpers.sh; do
+  [ -f "$ROOT/scripts/lib/$f" ] && cp "$ROOT/scripts/lib/$f" "$DFIX/scripts/lib/"
+done
+cat >"$DFIX/bin/gh" <<'G'
+#!/usr/bin/env bash
+printf 'TOKEN=%s gh' "${GH_TOKEN:-}" >>"$D_LOG"; for a in "$@"; do printf '\t%s' "$a" >>"$D_LOG"; done; printf '\n' >>"$D_LOG"
+if [ "$1 $2" = "auth token" ]; then exit 1; fi
+if [ "$1" = "api" ] && [ "$2" = "user" ]; then
+  case "${GH_TOKEN:-}" in ghp_author) echo nathanjohnpayne ;; *) exit 4 ;; esac; exit 0
+fi
+case "$1 $2" in
+  "api -X")
+    [ -n "${D_DISPATCH_FAIL:-}" ] && exit 1
+    for a in "$@"; do case "$a" in client_payload\[nonce\]=*) echo "${a#*=}" >"$D_NONCE" ;; esac; done
+    exit 0 ;;
+  "run list")
+    n=$(( $(cat "$D_LOG.n" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$D_LOG.n"
+    nonce="$(cat "$D_NONCE" 2>/dev/null || true)"
+    jq_expr=""; prev=""; for a in "$@"; do [ "$prev" = "--jq" ] && jq_expr="$a"; prev="$a"; done
+    # An older run of the same PR is always listed first; this dispatch's own
+    # run is listed only from poll D_APPEAR_AT on.
+    runs='[{"databaseId":111,"displayTitle":"Thread resolution lane: PR #12 [old-nonce]"}]'
+    if [ -n "${D_APPEAR_AT:-}" ] && [ "$n" -ge "$D_APPEAR_AT" ]; then
+      runs="[{\"databaseId\":222,\"displayTitle\":\"Thread resolution lane: PR #12 [$nonce]\"},{\"databaseId\":111,\"displayTitle\":\"Thread resolution lane: PR #12 [old-nonce]\"}]"
+    fi
+    printf '%s' "$runs" | jq -r "$jq_expr"; exit 0 ;;
+  "run watch") [ -n "${D_RUN_FAILS:-}" ] && exit 1; exit 0 ;;
+esac
+echo "unexpected gh: $*" >&2; exit 9
+G
+chmod +x "$DFIX/bin/gh"
+drun() { # <env...> -- <args...>
+  local -a envs=()
+  while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+  shift
+  : >"$DFIX/d.log"; rm -f "$DFIX/d.log.n" "$DFIX/nonce"
+  env -u GH_TOKEN -u GITHUB_TOKEN -u OP_PREFLIGHT_REVIEWER_PAT -u MERGEPATH_AGENT -u GH_AS_AUTHOR_IDENTITY \
+    PATH="$DFIX/bin:$PATH" D_LOG="$DFIX/d.log" D_NONCE="$DFIX/nonce" OP_PREFLIGHT_AUTHOR_PAT=ghp_author \
+    DISPATCH_LANE_POLL_INTERVAL=1 ${envs[@]+"${envs[@]}"} \
+    "$DFIX/scripts/dispatch-thread-resolution-lane.sh" 12 --repo o/r "$@"
+}
+set +e
+drun D_APPEAR_AT=3 -- >/dev/null 2>"$DFIX/err"; rc=$?
+set -e
+nonce="$(cat "$DFIX/nonce" 2>/dev/null || true)"
+if [ "$rc" -eq 0 ] && [ -n "$nonce" ] \
+   && grep -q $'TOKEN=ghp_author gh\tapi\t-X\tPOST\trepos/o/r/dispatches\t-f\tevent_type=thread-resolution-lane\t-F\tclient_payload\\[pr\\]=12' "$DFIX/d.log" \
+   && [ "$(grep -c $'gh\trun\tlist' "$DFIX/d.log")" -eq 3 ] \
+   && grep -q $'gh\trun\twatch\t222\t--repo\to/r\t--exit-status' "$DFIX/d.log" \
+   && ! grep -q $'gh\trun\twatch\t111' "$DFIX/d.log"; then
+  pass "dispatch: sends a nonce through the author wrapper, polls until its own run is listed, and watches that run, never the older one"
+else
+  fail "dispatch happy path: rc=$rc nonce=$nonce err=$(cat "$DFIX/err") log=$(cat "$DFIX/d.log")"
+fi
+set +e
+drun -- --appear-timeout 2 >/dev/null 2>"$DFIX/err"; r_none=$?
+drun D_APPEAR_AT=1 D_RUN_FAILS=1 -- >/dev/null 2>/dev/null; r_fail=$?
+drun D_DISPATCH_FAIL=1 -- >/dev/null 2>/dev/null; r_refused=$?
+out="$(drun D_APPEAR_AT=1 -- --no-wait 2>/dev/null)"; r_nowait=$?
+set -e
+if [ "$r_none" -eq 6 ] && ! grep -q $'gh\trun\twatch' "$DFIX/d.log" \
+   && [ "$r_fail" -eq 8 ] && [ "$r_refused" -eq 4 ] && [ "$r_nowait" -eq 0 ] && [ "$out" = "222" ]; then
+  pass "dispatch: own run never listed -> exit 6 (the older run is not watched); run failed -> 8; dispatch refused -> 4; --no-wait prints the run id"
+else
+  fail "dispatch exits: none=$r_none fail=$r_fail refused=$r_refused nowait=$r_nowait out=$out"
 fi
 
 echo
