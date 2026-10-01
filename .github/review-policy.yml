@@ -549,10 +549,8 @@ codex:
   # trigger→first Codex response distribution was p50 370s / p90 745s /
   # p95 982s / max 1723s: 19 responses arrived after the previous 840s
   # window (each one then routed to Phase 4b and landed on top of it) and
-  # none after 1800s. 1800s = 120 × the 15s poll interval and equals
-  # reaction_freshness_window_seconds below, so a request the poll is still
-  # waiting on stays selectable for a resume. The previous 840s retune and
-  # its 2026-07 sample are recorded in #623. The dropped/rate-limited
+  # none after 1800s. 1800s = 120 × the 15s poll interval. The previous
+  # 840s retune and its 2026-07 sample are recorded in #623. The dropped/rate-limited
   # non-response tail (#570) is still out of scope: no foreground wait
   # catches it, and --trigger-only (#489) remains its escape path.
   review_timeout_seconds: 1800

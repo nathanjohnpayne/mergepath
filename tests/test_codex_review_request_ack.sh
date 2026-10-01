@@ -1176,6 +1176,25 @@ test_request_with_timeout_marker_is_not_resumed() {
   fi
 }
 
+# The reaction-freshness window is a separate knob that may be shorter than
+# the reply deadline; a request inside its own deadline stays resumable.
+test_resume_survives_short_freshness_window() {
+  local dir rc count
+  dir=$(make_case "resume-short-freshness" 0 0 1800)
+  sed -i.bak 's/reaction_freshness_window_seconds: .*/reaction_freshness_window_seconds: 600/' \
+    "$dir/.github/review-policy.yml" "$dir/state/base-review-policy.yml"
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 700
+  rc=$(run_case "$dir" resume-running 1)
+  count=$(trigger_count "$dir")
+  if [ "$rc" = 0 ] && [ "$count" = 0 ] && grep -q 'resuming pending request 900' "$dir/err.log"; then
+    pass "#1550: a request older than a shorter reaction-freshness window is still resumed inside its own deadline"
+  else
+    fail "#1550 short freshness: exit $rc, $count trigger(s); stderr=$(cat "$dir/err.log")"
+  fi
+}
+
 test_resume_past_deadline_posts_new_request() {
   local dir rc count
   dir=$(make_case "resume-past-deadline" 0 0 60)
@@ -1299,6 +1318,7 @@ test_resume_running_request_posts_nothing
 test_resume_requires_provider_evidence
 test_answered_request_is_not_resumed
 test_resumed_block_does_not_clear_on_stale_review
+test_resume_survives_short_freshness_window
 test_request_with_timeout_marker_is_not_resumed
 test_resume_past_deadline_posts_new_request
 test_resumed_request_expiry_posts_new_request

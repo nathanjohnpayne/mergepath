@@ -477,10 +477,8 @@ fi
 # default and none past 1800s. On 2026-09-30 alone the p90 was 1225s. Each of
 # those 19 timed out at 840s, routed to Phase 4b, and then drew a real Codex
 # review that could invalidate the Phase 4b result. 1800s = 120 × the 15s
-# POLL_INTERVAL, so the final poll lands on the deadline, and it equals the
-# default codex.reaction_freshness_window_seconds, so a trigger this poll is
-# still waiting on is never older than the window that keeps it selectable for
-# a resume (#1550). The earlier 840s retune and its 2026-07 sample are in #623.
+# POLL_INTERVAL, so the final poll lands on the deadline. The earlier 840s
+# retune and its 2026-07 sample are in #623.
 # It is deliberately NOT sized to the dropped/rate-limited non-response tail
 # (#570): that is not a slow verdict and no foreground wait can catch it —
 # --trigger-only + event-driven pickup remains its escape path (#489).
@@ -1856,7 +1854,12 @@ resume_pending_codex_request() {
   local comments pending created created_epoch summary status observed now deadline
   comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments (resume check)") \
     || return 1
-  pending=$(crqe_select_trigger "$comments" "$AUTHOR_IDENTITY" "$REACTION_THRESHOLD") || return 1
+  # Select by the head-push anchor, not REACTION_THRESHOLD: the reaction
+  # freshness window is a separate knob that a repo may set below
+  # review_timeout_seconds, and a request must stay resumable for its whole
+  # wait. The request's own deadline below bounds staleness, and the Running
+  # summary check ties it to this head.
+  pending=$(crqe_select_trigger "$comments" "$AUTHOR_IDENTITY" "$HEAD_PUSHED_AT") || return 1
   [ -n "$pending" ] && [ "$pending" != null ] || return 1
   created=$(printf '%s' "$pending" | jq -r '.created_at // ""') || return 1
   created_epoch=$(jq -rn --arg t "$created" '$t | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null) \
