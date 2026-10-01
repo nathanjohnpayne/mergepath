@@ -237,11 +237,13 @@ if [ "$MODE" = "write" ]; then
     if [ -r "$GH_HOSTS_FILE" ]; then
       # An empty or comment-only hosts.yml has no hosts: grep's no-match is
       # tolerated, not an abort under pipefail (Codex on #1541).
-      # A top-level YAML key may carry an inline comment or quotes
-      # (`ghe.example.com: # work`, `"ghe.example.com":`); both still name a
-      # host gh will target (Codex on #1541).
-      GH_CONFIGURED_HOSTS="$({ grep -E '^[^[:space:]#-][^:]*:[[:space:]]*(#.*)?$' "$GH_HOSTS_FILE" || true; } \
-        | sed -E 's/:[[:space:]]*(#.*)?$//; s/^["'"'"']//; s/["'"'"']$//' | tr '[:upper:]' '[:lower:]')"
+      # A host is a top-level YAML key: an unindented `key:` line, whatever
+      # follows the colon: nested block, inline comment, or a flow mapping
+      # (`ghe.example.com: {user: x}`). The key is the text before the first
+      # colon, unquoted. Comments, document markers and directives are not
+      # keys (Codex and Phase 4b on #1541).
+      GH_CONFIGURED_HOSTS="$({ grep -E '^[^[:space:]#%.-][^:]*:' "$GH_HOSTS_FILE" || true; } \
+        | sed -E 's/^([^:]*):.*$/\1/; s/[[:space:]]+$//; s/^["'"'"']//; s/["'"'"']$//' | tr '[:upper:]' '[:lower:]')"
       if [ "$(printf '%s\n' "$GH_CONFIGURED_HOSTS" | grep -c .)" -eq 1 ] && [ "$GH_CONFIGURED_HOSTS" != "github.com" ]; then
         echo "identity-check: BLOCKED gh's only configured host is '$GH_CONFIGURED_HOSTS', so a bare gh call after this check would write there, not to github.com." >&2
         echo "identity-check:   Set GH_HOST=github.com for guarded writes, or log in to github.com as well." >&2

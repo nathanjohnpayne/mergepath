@@ -115,6 +115,14 @@ case "$tok" in
   proxy-injected) login=nathanjohnpayne; perms='{"pull":true,"push":true}' ;;
 esac
 status=200; body=""
+if [ "$tok" = "opaque-flap" ]; then
+  # An unidentifiable author token whose first GET /user fails transiently.
+  login=nathanjohnpayne; perms='{"pull":true,"push":true}'
+  if [ "$path" = "user" ]; then
+    n=$(wc -l <"$STUB_FLAP_COUNT" | tr -d ' '); echo x >>"$STUB_FLAP_COUNT"
+    if [ "$n" -eq 0 ]; then status=503; body='{"message":"Service Unavailable"}'; fi
+  fi
+fi
 if [ "$tok" = "ghp_flap" ]; then
   # First GET /user (the resolver's, via --jq) fails; later ones succeed.
   login=nathanpayne-claude; scopes="repo"
@@ -684,6 +692,20 @@ if [ "$(jq -r .transient_failures "$WORKDIR/flap.json")" = "true" ] && [ ! -e "$
   pass "resolver failed but the candidate verified on repeat: marked transient, not cached"
 else
   fail "resolver flap: transient=$(jq -r .transient_failures "$WORKDIR/flap.json" 2>/dev/null) cache=$(ls "$CACHE" 2>/dev/null)"
+fi
+
+# Phase 4b on #1541: under the write-token opt-in, an unidentifiable token
+# whose first verification failed transiently and then verifies on repeat is
+# a transient failure too, not a cached stable denial.
+rm -rf "$CACHE"
+: >"$WORKDIR/flap-count"
+set +e
+run_probe OP_PREFLIGHT_AUTHOR_PAT=opaque-flap MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1 STUB_FLAP_COUNT="$WORKDIR/flap-count" -- >"$WORKDIR/oflap.json" 2>/dev/null
+set -e
+if [ "$(jq -r .transient_failures "$WORKDIR/oflap.json")" = "true" ] && [ -z "$(ls "$CACHE" 2>/dev/null)" ]; then
+  pass "opt-in: an unidentifiable token that verifies on repeat marks the run transient, not cached"
+else
+  fail "opt-in repeat: transient=$(jq -r .transient_failures "$WORKDIR/oflap.json" 2>/dev/null) cache=$(ls "$CACHE" 2>/dev/null)"
 fi
 
 # Round 5 on #1526.

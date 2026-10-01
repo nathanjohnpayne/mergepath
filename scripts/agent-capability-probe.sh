@@ -496,8 +496,13 @@ measure_write() {
         if [ "$class" = "empty" ] || { [ "$class" = "user-held" ] && [ "$cand_class" != "user-held" ]; }; then
           class="$cand_class"
         fi
+        # A candidate the verifier would accept, by the same class rule as
+        # the grant below (user-held, or unidentifiable under the opt-in),
+        # that now verifies means the resolver's failure was transient (Phase
+        # 4b on #1541).
         if [ "$repeat_status" = "200" ] && [ "$repeat_login" = "$identity" ] \
-           && [ "$cand_class" = "user-held" ]; then
+           && { [ "$cand_class" = "user-held" ] \
+                || { [ "$cand_class" = "unidentifiable" ] && [ "${MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN:-0}" = "1" ]; }; }; then
           echo "resolver for $identity failed, then candidate $n verified on repeat" >>"$WORKDIR/transient"
         fi
       done
