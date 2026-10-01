@@ -544,19 +544,16 @@ codex:
   # and exit with code 4. Silence is NEVER treated as implicit approval;
   # see issue #27 for the explicit-review-required decision.
   #
-  # 840s is measured, not folklore (#623). The mined trigger→verdict
-  # distribution is p50 217s / p90 426s / p99 630s / max 830s (n=100), and the
-  # 👍-clearance endpoint the poll also breaks on is p99 829s (n=60, #646) —
-  # committed extract docs/audits/data/codex-latency-2026-07/. The prior 600s
-  # sat below p99(verdict)=630s, so the slowest ~1% of clean rounds (and the
-  # 830s max) timed out and fell to Phase 4b needlessly. 840s = 56 × the 15s
-  # poll interval (final poll lands on the deadline), covers the full observed
-  # clean-verdict tail, and stays under the 900s phase-4b adapter ceiling. The
-  # ~19–21% dropped/rate-limited non-response tail (#570) is out of scope by
-  # design — no foreground wait can catch it; --trigger-only is its escape
-  # path (#489). The "Codex takes 15–40 min" belief is contradicted: no
-  # completed round in the recorded history reached 15 min.
-  review_timeout_seconds: 840
+  # 1800s is measured (#1550). Across 243 author-posted triggers on
+  # mergepath and nathanpaynedotcom from 2026-09-14 to 2026-10-01, the
+  # trigger→first Codex response distribution was p50 370s / p90 745s /
+  # p95 982s / max 1723s: 19 responses arrived after the previous 840s
+  # window (each one then routed to Phase 4b and landed on top of it) and
+  # none after 1800s. 1800s = 120 × the 15s poll interval. The previous
+  # 840s retune and its 2026-07 sample are recorded in #623. The dropped/rate-limited
+  # non-response tail (#570) is still out of scope: no foreground wait
+  # catches it, and --trigger-only (#489) remains its escape path.
+  review_timeout_seconds: 1800
 
   # Short acknowledgment window for `@codex review` trigger comments
   # (#419). The Codex GitHub integration reacts with 👀 to the comment

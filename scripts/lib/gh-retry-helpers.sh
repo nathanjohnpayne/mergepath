@@ -20,6 +20,42 @@
 
 set -euo pipefail
 
+# gh_failure_is_permanent <failure-text>
+#
+# Returns 0 when a failed gh call's combined output names a failure that
+# retrying cannot fix, 1 when it is transient. The ONE definition of that
+# split (with_gh_retry below, and codex-review-request.sh's poll scan, #1550).
+#
+# Transient (return 1):
+#   - HTTP 5xx (server-side)
+#   - HTTP 429 (rate limit)
+#   - HTTP 403 with "rate limit" in the body (GitHub rate limits can surface
+#     as 403 in some flows)
+#   - anything naming no HTTP status (network, DNS or TLS failures)
+# Permanent (return 0):
+#   - HTTP 4xx other than 429 or a rate-limited 403 (auth, permissions,
+#     validation; retrying is futile and costs sweep budget)
+#   - "Resource not accessible by integration" (a token permission gap,
+#     fixed by granting the permission; codex P2 #328 round 3 caught the
+#     prior pattern wasting 2x30s sleeps on this surface)
+gh_failure_is_permanent() {
+  local output=${1-}
+  if printf '%s' "$output" | grep -q 'Resource not accessible by integration'; then
+    return 0
+  fi
+  if printf '%s' "$output" | grep -qE 'HTTP 4[0-9]{2}'; then
+    if printf '%s' "$output" | grep -qE 'HTTP 429'; then
+      return 1
+    fi
+    if printf '%s' "$output" | grep -qE 'HTTP 403' \
+       && printf '%s' "$output" | grep -qiE 'rate.?limit'; then
+      return 1
+    fi
+    return 0
+  fi
+  return 1
+}
+
 with_gh_retry() {
   local attempts=${GH_RETRY_ATTEMPTS:-3}
   local backoff=${GH_RETRY_BACKOFF_SECONDS:-30}
@@ -115,32 +151,12 @@ $errtext"
       output="$out"
     fi
 
-    # Classify the failure. Permanent failures break out immediately.
-    #
-    # Retry only:
-    #   - HTTP 5xx (server-side, transient)
-    #   - HTTP 429 (rate-limit, always)
-    #   - HTTP 403 with "rate limit" in the body (GitHub rate-limit
-    #     can surface as 403 in some flows)
-    # Fail-fast on:
-    #   - HTTP 4xx other than 429 or rate-limited 403 (auth, perms,
-    #     validation — retrying is futile and costs sweep budget)
-    #   - "Resource not accessible by integration" (token permission
-    #     issue, fixed by adding the perm to the workflow — codex P2
-    #     #328 round 3 caught the prior pattern wasting 2×30s sleeps
-    #     on this surface, missing the auto-clear window)
+    # Classify the failure. Permanent failures break out immediately; the
+    # rules live in gh_failure_is_permanent above so every caller that has
+    # to tell an outage from a refusal applies the same ones.
     is_permanent=false
-    if printf '%s' "$output" | grep -q 'Resource not accessible by integration'; then
+    if gh_failure_is_permanent "$output"; then
       is_permanent=true
-    elif printf '%s' "$output" | grep -qE 'HTTP 4[0-9]{2}'; then
-      if printf '%s' "$output" | grep -qE 'HTTP 429'; then
-        : # transient rate-limit
-      elif printf '%s' "$output" | grep -qE 'HTTP 403' \
-           && printf '%s' "$output" | grep -qiE 'rate.?limit'; then
-        : # transient rate-limit surfaced as 403
-      else
-        is_permanent=true
-      fi
     fi
     if $is_permanent; then
       printf '%s' "$output" >&2
@@ -159,4 +175,4 @@ $errtext"
   return "$rc"
 }
 
-export -f with_gh_retry
+export -f gh_failure_is_permanent with_gh_retry

@@ -37,7 +37,7 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 # ── 1. Structural: scan_codex_state fetches issue comments and computes a
 #      HEAD-anchored verdict signal, gated on the same anchor/affirmative
 #      logic as the merge gate, referenced to #609.
-if grep -q 'issue_comments=\$(fetch_api_array "repos/\$REPO/issues/\$PR_NUMBER/comments"' "$SCRIPT" \
+if grep -q 'issue_comments=\$(fetch_scan_array "repos/\$REPO/issues/\$PR_NUMBER/comments"' "$SCRIPT" \
    && grep -q "reviewed commit\[\^0-9a-f\]" "$SCRIPT" \
    && grep -qi "didn.?t find any major issues" "$SCRIPT" \
    && grep -q "startswith(\$s)" "$SCRIPT" \
@@ -240,9 +240,12 @@ pts "pre-trigger (stale) verdict → false" \
 #      itself, not merely from the trailing `jq -n --argjson` emitter
 #      crashing on empty input (#966). Extract the LIVE function body
 #      (not a hand-copied stand-in) so this asserts the actual emission
-#      path, stub fetch_api_array to fail on the very first read, and
+#      path, stub its reader to fail on the very first read, and
 #      confirm scan_codex_state's own return status is non-zero BEFORE
-#      it would ever reach the emitter.
+#      it would ever reach the emitter. Since #1550 the reader is
+#      fetch_scan_array, and its status passes through unchanged: 3 for a
+#      permanent failure, 4 for a transient one that rescan_codex_state
+#      may retry.
 SCAN_FN="$(sed -n '/^scan_codex_state() {/,/^}/p' "$SCRIPT")"
 if [ -z "$SCAN_FN" ]; then
   fail "could not extract scan_codex_state from $SCRIPT"
@@ -250,19 +253,21 @@ else
   scan_rc_output="$(bash -c '
     set -eo pipefail
     log() { :; }
-    fetch_api_array() { return 3; }   # every endpoint fails
+    fetch_scan_array() { return "$SCAN_FAIL_STATUS"; }   # every endpoint fails
     REPO=owner/repo PR_NUMBER=1 HEAD_SHA=deadbeef BOT_LOGIN=chatgpt-codex-connector TRIGGER_SIGNAL_THRESHOLD=""
     eval "$1"
-    if scan_codex_state >/dev/null 2>&1; then
-      echo "rc=0"
-    else
-      echo "rc=$?"
-    fi
+    for SCAN_FAIL_STATUS in 3 4; do
+      if scan_codex_state >/dev/null 2>&1; then
+        printf "rc=0 "
+      else
+        printf "rc=%s " "$?"
+      fi
+    done
   ' _ "$SCAN_FN" 2>&1)"
-  if [ "$scan_rc_output" = "rc=3" ]; then
-    pass "scan_codex_state propagates a failed read as its own non-zero status (#966)"
+  if [ "$scan_rc_output" = "rc=3 rc=4 " ]; then
+    pass "scan_codex_state propagates a failed read as its own status, keeping transient (4) distinct from permanent (3) (#966, #1550)"
   else
-    fail "scan_codex_state did not propagate the failed read; got: $scan_rc_output"
+    fail "scan_codex_state did not propagate the failed read status; got: $scan_rc_output"
   fi
 fi
 
@@ -440,6 +445,68 @@ STUB
   fi
 
   rm -rf "$fetch_stub_dir"
+fi
+
+# ── 11. Behavioral (#1550): fetch_scan_array classifies a failed read with the
+#       shared gh_failure_is_permanent rules, so a transient outage (5xx, 429,
+#       a network error) returns 4 and a refusal (404, auth) returns 3. The
+#       driver sources the real gh-api-array and gh-retry-helpers libs under
+#       the extracted wrapper, as section 10 does.
+RETRY_LIB="$ROOT/scripts/lib/gh-retry-helpers.sh"
+SCAN_FETCH_FN="$(sed -n '/^fetch_scan_array() {/,/^}/p' "$SCRIPT")"
+if [ -z "$SCAN_FETCH_FN" ] || [ ! -r "$RETRY_LIB" ] || [ ! -r "$ARRAY_LIB" ]; then
+  fail "could not extract fetch_scan_array from $SCRIPT or read its libs (#1550)"
+else
+  scan_stub_dir="$(mktemp -d "${TMPDIR:-/tmp}/codex-fetch-scan.XXXXXX")"
+  scan_fetch_status() { # <stderr line> [stdout]
+    cat >"$scan_stub_dir/gh" <<STUB
+#!/bin/sh
+printf '%s\n' '${2:-}'
+printf '%s\n' '$1' >&2
+exit 1
+STUB
+    chmod +x "$scan_stub_dir/gh"
+    PATH="$scan_stub_dir:$PATH" bash -c '
+      set -eo pipefail
+      log() { :; }
+      . "$2"; . "$3"
+      eval "$1"
+      fetch_scan_array "repos/o/r/x" "widgets" >/dev/null && echo 0 || echo "$?"
+    ' _ "$SCAN_FETCH_FN" "$ARRAY_LIB" "$RETRY_LIB" 2>/dev/null
+  }
+  got_502=$(scan_fetch_status 'gh: HTTP 502 upstream exploded' '{"message":"Bad Gateway"}')
+  got_429=$(scan_fetch_status 'gh: HTTP 429 too many requests')
+  got_403rl=$(scan_fetch_status 'gh: HTTP 403 API rate limit exceeded')
+  got_net=$(scan_fetch_status 'error connecting to api.github.com')
+  got_404=$(scan_fetch_status 'gh: HTTP 404 Not Found')
+  got_403=$(scan_fetch_status 'gh: HTTP 403 Resource not accessible by integration')
+  got_empty=$(scan_fetch_status '')
+  if [ "$got_502$got_429$got_403rl$got_net" = "4444" ] && [ "$got_404$got_403$got_empty" = "333" ]; then
+    pass "fetch_scan_array: transient failures return 4; refusals and diagnostic-free failures return 3 (#1550)"
+  else
+    fail "fetch_scan_array misclassified a failed read: 502=$got_502 429=$got_429 403rl=$got_403rl net=$got_net 404=$got_404 403=$got_403 empty=$got_empty"
+  fi
+
+  # A malformed (unflattenable) response is not an outage: retrying the same
+  # endpoint would read the same bytes, so it must stay permanent.
+  cat >"$scan_stub_dir/gh" <<'STUB'
+#!/bin/sh
+printf '%s\n' 'not json at all'
+STUB
+  chmod +x "$scan_stub_dir/gh"
+  got_flatten=$(PATH="$scan_stub_dir:$PATH" bash -c '
+    set -eo pipefail
+    log() { :; }
+    . "$2"; . "$3"
+    eval "$1"
+    fetch_scan_array "repos/o/r/x" "widgets" >/dev/null && echo 0 || echo "$?"
+  ' _ "$SCAN_FETCH_FN" "$ARRAY_LIB" "$RETRY_LIB" 2>/dev/null)
+  if [ "$got_flatten" = 3 ]; then
+    pass "fetch_scan_array: an unflattenable response stays a permanent failure (#1550)"
+  else
+    fail "fetch_scan_array treated an unflattenable response as status $got_flatten, expected 3"
+  fi
+  rm -rf "$scan_stub_dir"
 fi
 
 echo ""

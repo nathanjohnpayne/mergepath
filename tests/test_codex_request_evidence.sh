@@ -134,7 +134,7 @@ trigger-then-mention|trigger-then-mention|eyes|[]||1|1|linked eyes acknowledgeme
 foreign-ack|trigger|foreign|[]||1|1|linked eyes acknowledgement=false|1
 error|trigger|none|[]||1|1|linked eyes acknowledgement=unknown|1
 unknown-budget|trigger|none|[]||1|1|review_timeout_seconds=unknown|1
-default-budgets|trigger|none|[]||1|1|configured ack_wait_seconds=30; review_timeout_seconds=840|1
+default-budgets|trigger|none|[]||1|1|configured ack_wait_seconds=30; review_timeout_seconds=1800|1
 future-request|future|none|[]||1|1|age=unknowns|1
 old-request|stale|eyes|[]||1|1|no freshness-qualified author trigger|0
 foreign-request|foreign|eyes|[]||1|1|no freshness-qualified author trigger|0
