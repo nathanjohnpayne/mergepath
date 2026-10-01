@@ -387,6 +387,30 @@ for tool in gh jq; do
   fi
 done
 
+# A tool already on PATH that resolves only through a relative entry is
+# refused, as an installed one is: a re-run must not accept what the install
+# path refuses (Phase 4b on #1552, #1554).
+for tool in gh jq; do
+  RELP="$WORKDIR/relpresent-$tool"
+  mkdir -p "$RELP/rbin"
+  if [ "$tool" = gh ]; then
+    ln -sf "$WORKDIR/p-good/bin/gh" "$RELP/rbin/gh"
+    relpath="rbin:$SBIN"
+  else
+    ln -sf "$SBIN/jq" "$RELP/rbin/jq"
+    relpath="rbin:$WORKDIR/p-good/bin:$SBIN"
+  fi
+  : >"$WORKDIR/curl.log"
+  set +e
+  ( cd "$RELP" && run_setup "$WORKDIR/p-relpresent-$tool" PATH="$relpath" ) >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+  set -e
+  if [ "$rc" -eq 1 ] && [ ! -s "$WORKDIR/curl.log" ] && grep -q "$tool resolves through a relative PATH entry" "$WORKDIR/setup.err"; then
+    pass "setup, a present $tool reachable only through a relative PATH entry: refused, as an install there is"
+  else
+    fail "setup relative present $tool: rc=$rc err=$(cat "$WORKDIR/setup.err")"
+  fi
+done
+
 # gh already present: nothing is downloaded.
 ln -sf "$WORKDIR/p-good/bin/gh" "$SBIN/gh"
 : >"$WORKDIR/curl.log"
