@@ -1509,12 +1509,8 @@ class Lexer:
                 continue
 
             # Inside `${...}` or `$((...))` or `"..."`: track a reference by
-            # name but do not treat operators as structure.  A backtick inside
-            # double quotes is still a command substitution, exactly as `$(`
-            # is above; reading its body as part of the string let a `"` in
-            # it close the string and a later `'` swallow the rest of the
-            # file (#1494 review).
-            if quotes and not (c == "`" and quotes[-1] == '"'):
+            # name but do not treat operators as structure.
+            if quotes:
                 if c == "\n":
                     line += 1
                 cur_level()["word"].append(c)
@@ -1523,18 +1519,9 @@ class Lexer:
 
             if c == "`":
                 # Backticks: treat like a capturing command substitution.
-                # Inside double quotes -- the path #1494 opened -- close at the
-                # first UNESCAPED backtick, as bash does; stopping at an
-                # escaped one lexed the rest of the line under the wrong
-                # structure (#1564 review).  A bare backtick keeps its
-                # pre-#1494 close.
-                if quotes:
-                    end = _skip_backtick(text, i)
-                    close = end - 1 if end - 1 > i and text[end - 1] == "`" else n
-                else:
-                    close = text.find("`", i + 1)
-                    if close == -1:
-                        close = n
+                close = text.find("`", i + 1)
+                if close == -1:
+                    close = n
                 inner = text[i + 1 : close]
                 parent_seg = cur_level()["seg"]
                 sub = Lexer(inner)
@@ -4653,6 +4640,20 @@ CORPUS = [
         MUST_FLAG,
         'x=("\'${x:-"}"}\'"); echo "$GH_TOKEN"\n',
     ),
+    # A fallback re-read must not lose a backtick boundary the walk relied
+    # on, and a double-quoted backtick's shell state stays in its subshell
+    # (#1564 review).
+    (
+        "array-double-quoted-backtick-then-nested-substitution",
+        MUST_FLAG,
+        'x=("`echo ")"` don\'t $( (:) )"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        "backtick-double-quoted-xtrace-stays-in-subshell",
+        MUST_NOT_FLAG,
+        'x="`set -x`"\n'
+        ': "$GH_TOKEN"\n',
+    ),
     (
         "backtick-double-quoted-escaped-delimiter-safe",
         MUST_NOT_FLAG,
@@ -4714,9 +4715,11 @@ CORPUS = [
         'die() { echo "$(printf \'%s\' \'"\')$1" >&2; }\n'
         'die "$GH_TOKEN"\n',
     ),
+    # Declared in KNOWN_MISSES: the function matcher now finds this body, but
+    # the Lexer still reads a backtick inside double quotes as string text.
     (
         "helper-double-quoted-backtick-quote-context",
-        MUST_FLAG,
+        MUST_NOT_FLAG,
         'die() { echo "`printf \'%s\' \'")\'`  $1" >&2; }\n'
         'die "$GH_TOKEN"\n',
     ),
@@ -6257,6 +6260,16 @@ CORPUS.extend(_generated_corpus())
 # fails when an undeclared disagreement appears AND when a declared entry stops
 # disagreeing, so neither list can quietly rot.
 KNOWN_MISSES = {
+    "helper-double-quoted-backtick-quote-context": (
+        "a backtick substitution inside a double-quoted word of a helper "
+        "body.  The function matcher now finds the helper's real close "
+        "(#1494), but the Lexer reads a backtick inside double quotes as "
+        "string text, so a `\"` in its body ends the word and a later `'` "
+        "swallows the call.  Parsing it as a nested substitution needs the "
+        "nested line's pragma and shell-state isolation as well, which #1564 "
+        "review measured reopening verdicts main got right.  Main misses it "
+        "the same way.  Tracked in #1565"
+    ),
     "array-double-quoted-apostrophe-after-nested-substitution": (
         "an apostrophe after a `$( )` whose end cannot be found without "
         "parsing its body as command grammar -- here a nested subshell; case "
