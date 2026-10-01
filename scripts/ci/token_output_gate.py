@@ -1496,7 +1496,16 @@ class Lexer:
                             seg2.parent = parent_seg
                             seg2.parent_is_capture = True
                     for r in ll.refs:
-                        cur_ll.refs.append(Ref(r.name, line, r.seg))
+                        # Re-line the reference but keep what the sub-lexer
+                        # learned about it.  A bare copy dropped
+                        # `in_error_word`, so ``v=`: "${U:?$PAT}"` `` -- which
+                        # bash writes to stderr past the capture -- read clean
+                        # (#1564 review).
+                        ref = Ref(r.name, line, r.seg, r.in_assign_prefix)
+                        ref.in_error_word = r.in_error_word
+                        ref.heredoc_owner = r.heredoc_owner
+                        ref.in_heredoc_body = r.in_heredoc_body
+                        cur_ll.refs.append(ref)
                     cur_ll.segments.extend(ll.segments)
                 line += inner.count("\n")
                 cur_level()["word"].append("`sub`")
@@ -4323,6 +4332,21 @@ CORPUS = [
         MUST_FLAG,
         'msgs=("`printf x` don\'t")\n'
         'echo "$GH_TOKEN"\n',
+    ),
+    # A backtick body's references keep what its lexer learned: an error word
+    # inside it is still written by the expansion itself, past the capture
+    # (#1564 review).  The bare spelling was a miss on main as well.
+    (
+        "backtick-double-quoted-error-word",
+        MUST_FLAG,
+        'unset UNSET_VALUE\n'
+        'v="`: "${UNSET_VALUE:?$GH_TOKEN}"`"\n',
+    ),
+    (
+        "backtick-bare-error-word",
+        MUST_FLAG,
+        'unset UNSET_VALUE\n'
+        'v=`: "${UNSET_VALUE:?$GH_TOKEN}"`\n',
     ),
     # Declared in KNOWN_MISSES: after a `$( )` in the same walk the walkers keep
     # the pre-#1494 reading, so a later apostrophe still opens a span.
