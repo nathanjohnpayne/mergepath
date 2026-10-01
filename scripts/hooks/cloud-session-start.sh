@@ -55,6 +55,6 @@ printf '%s\n' "$result" | jq -r '
        then " (not provable: GitHub does not expose this token type\u0027s permissions; the wrappers still verify its identity before each write, so a re-probe will not change this)"
      elif $transient then " (may be transient: re-run scripts/agent-capability-probe.sh before acting on it)"
      else " (fix the credential, tools or setup, then re-run scripts/agent-capability-probe.sh)" end)),
-  "Writes go through scripts/gh-as-author.sh / scripts/gh-as-reviewer.sh. A no marked as a proxy ceiling is a property of this session: hand those steps to a local session or CI. Any other no is a credential or setup problem to fix first (docs/agents/cloud-environments.md, Credentials)."
+  "Writes go through scripts/gh-as-author.sh / scripts/gh-as-reviewer.sh. Act on each no by its note, which is the only remediation: a proxy ceiling is a property of this session (hand the step to a local session or CI); a fix note is a credential or setup problem (docs/agents/cloud-environments.md, Credentials); may-be-transient means re-probe first; not provable and not measured need no repair."
 ' 2>/dev/null || echo "mergepath cloud session: capability summary could not be rendered; run scripts/agent-capability-probe.sh."
 exit 0

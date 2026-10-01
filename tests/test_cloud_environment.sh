@@ -88,7 +88,8 @@ fi
 # loop (Codex on #1552).
 out="$(CLAUDE_CODE_REMOTE=true PROBE_RW_BASIS=unverifiable PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q -- "- reviewer-writes: no, no-verified-token (not provable: GitHub does not expose this token type's permissions; the wrappers still verify" \
-   && ! printf '%s' "$out" | grep -q -- '- reviewer-writes: .*fix the credential'; then
+   && ! printf '%s' "$out" | grep -q -- '- reviewer-writes: .*fix the credential' \
+   && ! printf '%s' "$out" | grep -qi -- 'any other no'; then
   pass "hook, unverifiable token: reported as not provable, not as a setup problem to fix and re-probe"
 else
   fail "hook unverifiable: rc=$rc out=$out"
