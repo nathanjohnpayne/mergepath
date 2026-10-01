@@ -219,7 +219,21 @@ case "$endpoint" in
     fi
     ;;
   repos/owner/repo/commits/head-sha/statuses)
-    printf '[]\n'
+    # CODERABBIT_TEST_STATUS serves one per-SHA CodeRabbit context in that
+    # state; unset serves none, the shape every other case here relies on.
+    case "${CODERABBIT_TEST_STATUS:-absent}" in
+      pending|success)
+        printf '[{"id":1,"context":"CodeRabbit","state":"%s","created_at":"%s","updated_at":"%s","creator":{"login":"%s"},"description":"Review %s"}]\n' \
+          "$CODERABBIT_TEST_STATUS" "$review_time" "$review_time" "$bot" "$CODERABBIT_TEST_STATUS"
+        ;;
+      tie)
+        # A new run's `pending` (id 2) posted in the same second as the prior
+        # `success` (id 1), served newest-first as the endpoint does.
+        printf '[{"id":2,"context":"CodeRabbit","state":"pending","created_at":"%s","updated_at":"%s","creator":{"login":"%s"},"description":"Review in progress"},{"id":1,"context":"CodeRabbit","state":"success","created_at":"%s","updated_at":"%s","creator":{"login":"%s"},"description":"Review completed"}]\n' \
+          "$review_time" "$review_time" "$bot" "$review_time" "$review_time" "$bot"
+        ;;
+      *) printf '[]\n' ;;
+    esac
     ;;
   repos/owner/repo/issues/999/timeline)
     printf '[]\n'
@@ -263,12 +277,14 @@ case "$endpoint" in
     case "$scenario" in
       probe_skip_with_head_review)
         # Summary landed with the review, so publication is complete and the
-        # case isolates skip-ordering.
-        printf '[{"id":9811,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 1**\\n\\nSummary."}]\n' "$bot" "$review_time" "$review_time"
+        # case isolates skip-ordering. Marker-led, as every live summarize
+        # comment is: the probe accepts no other body as the summary (#878).
+        printf '[{"id":9811,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n**Actionable comments posted: 1**\\n\\nSummary."}]\n' "$bot" "$review_time" "$review_time"
         ;;
-      probe_skip_with_active_review)
+      probe_skip_with_active_review|probe_skip_with_aged_active_review)
         # A manually triggered review is in progress on an otherwise
-        # skip-eligible PR.
+        # skip-eligible PR. The aged variant is the same notice; its case
+        # shrinks the freshness window so the notice falls below HEAD_ANCHOR.
         printf '[{"id":9812,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"CodeRabbit review in progress; hold tight."}]\n' "$bot" "$review_time" "$review_time"
         ;;
       paused_then_review)
@@ -398,6 +414,44 @@ test_probe_active_review_beats_static_skip() {
     fail "#814 probe: expected rc 7/in_progress on a draft PR with an active review; got rc=$rc observed=$status"
     sed 's/^/      /' "$dir/err.log" >&2 || true
   fi
+}
+
+# The in-progress triage keeps only notices at or above HEAD_ANCHOR, which the
+# wall-clock floor raises to now minus the freshness window. A manual run that
+# outlives the window loses its notice, and the static skip then answered rc 6
+# while the run was still going. The per-SHA `pending` status does not age, so
+# it must hold the probe at not-yet; with no pending status the skip stands.
+test_probe_aged_active_review_beats_static_skip() {
+  local st want_rc want_status want_observed want_skip dir rc status observed skip
+  while read -r st want_rc want_status want_observed want_skip; do
+    dir=$(make_case "probe-skip-aged-active-$st" 600 2 "release/legacy" false yes)
+    sed -i.bak -e 's/^  trust_status_context_for_clearance: false$/  trust_status_context_for_clearance: true/' \
+      -e 's/^  wallclock_freshness_window_seconds: 999999999$/  wallclock_freshness_window_seconds: 1800/' \
+      "$dir/.github/review-policy.yml" && rm -f "$dir/.github/review-policy.yml.bak"
+    rc=0
+    ( cd "$dir" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+        CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+        CODERABBIT_TEST_STATE_DIR="$dir/state" \
+        CODERABBIT_TEST_SCENARIO=probe_skip_with_aged_active_review \
+        CODERABBIT_TEST_STATUS="$st" \
+        ./scripts/coderabbit-wait.sh --probe 999 owner/repo \
+        >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
+    status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+    observed=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+    skip=$(jq -r '.skip_reason | tostring' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+    if [ "$rc" = "$want_rc" ] && [ "$status" = "$want_status" ] \
+       && [ "$observed" = "$want_observed" ] && [ "$skip" = "$want_skip" ]; then
+      pass "probe: aged in-progress notice on a non-base-branch PR, status $st → rc $rc, $status, observed=$observed, skip_reason=$skip"
+    else
+      fail "probe: aged in-progress notice, status $st → rc=$rc status=$status observed=$observed skip_reason=$skip (expected rc $want_rc, $want_status, $want_observed, $want_skip)"
+      sed 's/^/      /' "$dir/err.log" >&2 || true
+    fi
+  done <<'CASES'
+pending 7 no_review_yet in_progress null
+tie 7 no_review_yet in_progress null
+success 6 skipped terminal non-base-branch
+absent 6 skipped terminal non-base-branch
+CASES
 }
 
 test_paused_persists_exhausts_cap_exit6() {
@@ -629,6 +683,7 @@ test_default_branch_always_allowed_not_skipped
 test_invalid_base_regex_fails_safe_not_skipped
 test_probe_inspects_head_evidence_before_skip
 test_probe_active_review_beats_static_skip
+test_probe_aged_active_review_beats_static_skip
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

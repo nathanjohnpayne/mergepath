@@ -4389,7 +4389,15 @@ crw_head_pinned_clean_review_run() {
 crw_probe_head_review_in_progress() {
   local rec state desc
   [ "$TRUST_STATUS_CONTEXT" = "true" ] || return 1
-  rec=$(check_status_context_record) || rec=""
+  # `--by-id` reads the ID-ordered record instead: a new run's `pending`
+  # posted in the same second as the prior `success` must win the tie.
+  # Opt-in, so the #919 callers keep their ordering (see
+  # crw_carry_status_record).
+  if [ "${1:-}" = "--by-id" ]; then
+    rec=$(crw_carry_status_record)
+  else
+    rec=$(check_status_context_record) || rec=""
+  fi
   state=$(crw_status_record_state "$rec")
   if [ "$state" = "unreadable" ]; then
     die 3 "failed to read the per-SHA CodeRabbit StatusContext on $HEAD_SHA — a failed read is not evidence that the run finished, so the probe refuses to report terminality on it (#936)"
@@ -4906,8 +4914,17 @@ probe_emit_verdict() {
         # still names the observed state, and no narration hides a published
         # summary deeper in the scan.
         [ "$class" = "status_probe" ] && continue
+        # `review` is classify_comment's FALLBACK, so it also covers an
+        # ordinary acknowledgement or chat reply. Only the summarize comment
+        # (the crw_select_summary_comment rule: body starts with the marker)
+        # is the summary; any other `review`-class body is skipped like
+        # narration, or a later ack would displace a summary carrying a
+        # blocking marker and the probe would report clean (#878 hazard 6).
+        if [ "$class" = "review" ]; then
+          case "$body" in "$SUMMARY_MARKER"*) summary_body="$body"; break ;; esac
+          continue
+        fi
         if [ -z "$newest_class" ]; then newest_class="$class"; newest_body="$body"; fi
-        if [ "$class" = "review" ]; then summary_body="$body"; break; fi
       done <<< "$cand"
 
       [ -n "$summary_body" ] && break
@@ -5235,6 +5252,17 @@ probe_emit_verdict() {
   if [ -n "${PROBE_STATIC_SKIP:-}" ]; then
     # Carry-forward evidence belongs to the idle not-yet paths only (#1335).
     PROBE_CARRYFORWARD_JSON=null
+    # A manually triggered run on a skip-eligible PR can outlive the anchored
+    # in-progress triage above: its notice ages below HEAD_ANCHOR while the
+    # run is still going. The notice stays anchored (the #857 note above says
+    # why); the per-SHA `pending` status is live state rather than an aging
+    # notice, so a run it reports keeps this not-yet instead of WILL-NOT-REPORT.
+    # Same trust gate and same disclosed liveness cost as the #919 sites,
+    # read by status ID so a same-second `pending` beats the older `success`
+    # (Codex on #1570).
+    if crw_probe_head_review_in_progress --by-id; then
+      probe_not_yet "in_progress" "null"
+    fi
     SKIP_REASON="$PROBE_STATIC_SKIP"
     PROBE_OBSERVED="terminal"
     log "probe: no CodeRabbit review on $HEAD_SHA and auto-review will not fire ($PROBE_STATIC_SKIP)"
