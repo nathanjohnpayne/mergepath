@@ -95,12 +95,20 @@ fi
 # ---------------------------------------------------------------------------
 # The recipe names only repository files that exist
 # ---------------------------------------------------------------------------
+# Paths the recipe names that do not exist under <root>. .claude/ is per-repo
+# and not propagated: a consumer wires it itself, as the recipe says, so it is
+# required only on the hub, which the sync marker identifies (Codex on #1552).
+doc_missing_paths() { # <root>
+  local root="$1" path missing=""
+  for path in $(grep -oE '`(scripts|\.claude|\.codex|docs)/[A-Za-z0-9._/-]+`' "$root/docs/agents/cloud-environments.md" | tr -d '`' | sort -u); do
+    case "$path" in .claude/*) [ -f "$root/scripts/sync-to-downstream.sh" ] || continue ;; esac
+    [ -e "$root/$path" ] || missing="$missing $path"
+  done
+  printf '%s' "$missing"
+}
 DOC="$ROOT/docs/agents/cloud-environments.md"
 if [ -r "$DOC" ]; then
-  missing=""
-  for path in $(grep -oE '`(scripts|\.claude|\.codex|docs)/[A-Za-z0-9._/-]+`' "$DOC" | tr -d '`' | sort -u); do
-    [ -e "$ROOT/$path" ] || missing="$missing $path"
-  done
+  missing="$(doc_missing_paths "$ROOT")"
   if [ -z "$missing" ]; then
     pass "docs/agents/cloud-environments.md names only files that exist"
   else
@@ -108,6 +116,21 @@ if [ -r "$DOC" ]; then
   fi
 else
   fail "docs/agents/cloud-environments.md is missing"
+fi
+
+# The same scan on a consumer checkout (no sync-to-downstream.sh, no
+# .claude/settings.json, every propagated file present) reports nothing.
+CONS="$WORKDIR/consumer"
+mkdir -p "$CONS/docs/agents"
+cp "$DOC" "$CONS/docs/agents/"
+for path in $(grep -oE '`(scripts|\.codex)/[A-Za-z0-9._/-]+`' "$DOC" | tr -d '`' | sort -u); do
+  mkdir -p "$CONS/$(dirname "$path")"; : >"$CONS/$path"
+done
+cmissing="$(doc_missing_paths "$CONS")"
+if [ -z "$cmissing" ]; then
+  pass "doc file scan on a consumer checkout: the per-repo .claude/settings.json is not required"
+else
+  fail "doc file scan on a consumer checkout reports:$cmissing"
 fi
 
 # ---------------------------------------------------------------------------
@@ -206,7 +229,8 @@ fi
 set +e
 run_setup "$WORKDIR/p-offpath" MERGEPATH_GH_SHA256="$sum" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && grep -q "is not on PATH, so later commands cannot find gh" "$WORKDIR/setup.err"; then
+if [ "$rc" -eq 1 ] && grep -q "is not on PATH, so later commands cannot find gh" "$WORKDIR/setup.err" \
+   && grep -q "PARENT of a directory already on PATH" "$WORKDIR/setup.err"; then
   pass "setup, install directory off PATH: fails and names the PATH entry to add"
 else
   fail "setup off-PATH: rc=$rc err=$(cat "$WORKDIR/setup.err")"

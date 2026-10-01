@@ -128,7 +128,7 @@ install_gh() {
   # writes cannot find is not installed for them (Codex on #1552).
   case ":$PATH:" in
     *":$prefix/bin:"*) ;;
-    *) log "$prefix/bin is not on PATH, so later commands cannot find gh; add PATH=$prefix/bin:\$PATH to the environment's variables (or set MERGEPATH_TOOL_PREFIX to a directory already on PATH)"; return 1 ;;
+    *) log "$prefix/bin is not on PATH, so later commands cannot find gh; add $prefix/bin to the environment's PATH, or set MERGEPATH_TOOL_PREFIX to the PARENT of a directory already on PATH (gh goes to <prefix>/bin, so for ~/.local/bin on PATH use ~/.local)"; return 1 ;;
   esac
 }
 
