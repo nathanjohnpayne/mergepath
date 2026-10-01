@@ -274,8 +274,21 @@ jobs:
           # the clone line (#1203). A narrower shape regex would instead
           # silently fold a manifest-legal name it did not anticipate (a
           # space, a leading `_`) into the previous consumer's row.
-          yq -r '.consumers[] | (.name + " (" + .repo + ")")' .mergepath-sync.yml \
-            > consumer-headers.txt 2>/dev/null || : > consumer-headers.txt
+          #
+          # The list goes through the same `name<TAB>repo` + `IFS=$'\t'
+          # read` path as run_audit(), not a direct `.name + " (" ...`
+          # render, so whatever that read does to a name (it strips leading
+          # and trailing tabs, for one) happens to both header producers.
+          # An unreadable manifest is warned about rather than left to read
+          # as "the audit printed nothing" (#1562).
+          if ! yq -r '.consumers[] | (.name + "\t" + .repo)' .mergepath-sync.yml \
+               | while IFS=$'\t' read -r consumer_name consumer_repo; do
+                   [ -z "$consumer_name" ] && continue
+                   printf '%s (%s)\n' "$consumer_name" "$consumer_repo"
+                 done > consumer-headers.txt; then
+            echo "::warning::Could not read the consumer list from .mergepath-sync.yml; no consumer header can be recognised."
+            : > consumer-headers.txt
+          fi
           awk '
             FILENAME == ARGV[1] { if ($0 != "") header[$0] = 1; next }
             ($0 in header) { consumer = $0; order[++n] = consumer; next }

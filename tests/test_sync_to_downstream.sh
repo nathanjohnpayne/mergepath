@@ -2377,4 +2377,47 @@ done
   || wf_fail "stderr log lines were read as consumer headers: $(cat "$LOGS/consumer-summary.txt")"
 echo "PASS: interleaved [sync-to-downstream] log lines are not read as consumer headers (#1203)"
 
+# --- (8) Headers are derived through run_audit()'s own manifest read -----
+#
+# run_audit() reads `.consumers[]` as `name<TAB>repo` through
+# `IFS=$'\t' read`, which strips a leading tab from a name, so the audit
+# prints `tabbed (x/tabbed)` for a manifest name of "\ttabbed". A header list
+# rendered straight from yq keeps the tab, misses that header, and folds the
+# consumer's statuses into the previous row (#1562).
+TABS="$WFDIR/tab-name"; mkdir -p "$TABS"; : > "$TABS/gh-calls.log"
+printf '%s\n' 'version: 1' 'consumers:' \
+  '  - name: "alpha"' '    repo: "x/alpha"' \
+  '  - name: "\ttabbed"' '    repo: "x/tabbed"' > "$TABS/.mergepath-sync.yml"
+: > "$TABS/audit-output.txt"
+for c in alpha tabbed; do
+  {
+    printf '%s (x/%s)\n' "$c" "$c"
+    printf '[sync-to-downstream] cloning x/%s into /home/runner/.cache/mergepath-sync/%s (depth=1)\n' "$c" "$c"
+    printf '  ✓ %-50s in sync\n' "scripts/in-sync.sh"
+    printf '  ✗ %-50s drift: 3 diff line(s)\n' "scripts/drifted.sh"
+    printf '\n'
+  } >> "$TABS/audit-output.txt"
+done
+GH_STUB_EXISTING="" GH_STUB_WRITE_FAIL="" wf_run_steps "$TABS"
+[ "$WF_RC" -eq 0 ] || wf_fail "tab-name audit output must file the issue; step exited $WF_RC: $WF_TEXT"
+expected_tabs="$(printf '%s\n' \
+  'alpha (x/alpha) — in sync 1, drifted 1, missing 0, skipped 0' \
+  'tabbed (x/tabbed) — in sync 1, drifted 1, missing 0, skipped 0')"
+[ "$(cat "$TABS/consumer-summary.txt")" = "$expected_tabs" ] \
+  || wf_fail "a leading-tab consumer name was not matched the way run_audit() prints it: $(cat "$TABS/consumer-summary.txt")"
+echo "PASS: consumer headers are derived through run_audit()'s IFS read, not a direct render (#1562)"
+
+# An unreadable manifest must warn and take the announced fallback, not fail
+# the job and not read as an empty roll-up.
+NOMAN="$WFDIR/no-manifest"; mkdir -p "$NOMAN"; : > "$NOMAN/gh-calls.log"
+cp "$TABS/audit-output.txt" "$NOMAN/audit-output.txt"
+( cd "$NOMAN" && GITHUB_STEP_SUMMARY="$NOMAN/step-summary.md" \
+    bash "$WFDIR/summarise-step.sh" > "$NOMAN/step.out" 2>&1 ) \
+  || wf_fail "summarise step must not fail the job on an unreadable manifest: $(cat "$NOMAN/step.out")"
+grep -q '::warning::Could not read the consumer list' "$NOMAN/step.out" \
+  || wf_fail "unreadable manifest was not warned about: $(cat "$NOMAN/step.out")"
+grep -q '^(per-consumer summary unavailable' "$NOMAN/consumer-summary.txt" \
+  || wf_fail "unreadable manifest did not produce the announced fallback: $(cat "$NOMAN/consumer-summary.txt")"
+echo "PASS: an unreadable consumer manifest is warned about and falls back to the summary-unavailable note (#1562)"
+
 echo "test_sync_to_downstream: PASS"
