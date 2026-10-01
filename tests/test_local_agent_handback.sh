@@ -52,7 +52,13 @@ if [ "$1" = "api" ] && [ "$2" = "user" ]; then
   exit 0
 fi
 case "$*" in
-  *"repos/o/r/pulls/12 --jq .head.sha"*) [ -n "${STUB_NO_HEAD:-}" ] && exit 1; echo "$STUB_HEAD"; exit 0 ;;
+  *"repos/o/r/pulls/12 --jq .head.sha"*)
+    [ -n "${STUB_NO_HEAD:-}" ] && exit 1
+    if [ -n "${STUB_HEAD_SEQ:-}" ]; then
+      n=$(( $(cat "$GH_LOG.n" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$GH_LOG.n"
+      set -- $STUB_HEAD_SEQ; [ "$n" -gt "$#" ] && n=$#; eval "echo \${$n}"; exit 0
+    fi
+    echo "$STUB_HEAD"; exit 0 ;;
   *"-X POST repos/o/r/issues/12/comments"*)
     [ -n "${STUB_POST_FAIL:-}" ] && exit 1
     for a in "$@"; do case "$a" in body=@*) cp "${a#body=@}" "$GH_BODY" ;; esac; done
@@ -71,7 +77,7 @@ run() { # <env...> -- <args...>
   local -a envs=()
   while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
   shift
-  : >"$WORKDIR/gh.log"; rm -f "$WORKDIR/body.md"
+  : >"$WORKDIR/gh.log"; rm -f "$WORKDIR/body.md" "$WORKDIR/gh.log.n"
   env -u GH_TOKEN -u GITHUB_TOKEN -u OP_PREFLIGHT_AUTHOR_PAT -u MERGEPATH_AGENT -u OP_PREFLIGHT_AGENT \
     -u CLAUDE_CODE_REMOTE_SESSION_ID -u GH_AS_REVIEWER_IDENTITY -u MERGEPATH_SESSION_URL \
     PATH="$STUB_DIR:$PATH" GH_LOG="$WORKDIR/gh.log" GH_BODY="$WORKDIR/body.md" STUB_HEAD="$HEAD" \
@@ -135,6 +141,29 @@ if [ "$rc" -eq 4 ] && ! grep -q $'POST\trepos/o/r/issues/12/comments' "$WORKDIR/
   pass "label cannot be created: exit 4, nothing posted (no duplicate on retry), body on stdout"
 else
   fail "label create failure: rc=$rc err=$(cat "$WORKDIR/err")"
+fi
+
+# --- the recorded state belongs to the head the comment names (CodeRabbit on #1555)
+H1=1111111111111111111111111111111111111111
+H2=2222222222222222222222222222222222222222
+H3=3333333333333333333333333333333333333333
+set +e
+run STUB_HEAD_SEQ="$H1 $H2 $H2" -- --blocked graphql --next x >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+acct_runs="$(grep -c '^acct ' "$WORKDIR/gh.log" || true)"
+if [ "$rc" -eq 0 ] && grep -q "head=$H2 blocked=graphql" "$WORKDIR/body.md" && ! grep -q "$H1" "$WORKDIR/body.md" \
+   && [ "$acct_runs" -eq 2 ] && grep -q "head moved $H1 -> $H2" "$WORKDIR/err"; then
+  pass "a push while state is collected: collection repeats on the new head, and the comment names that head"
+else
+  fail "head drift: rc=$rc acct_runs=$acct_runs err=$(cat "$WORKDIR/err")"
+fi
+set +e
+run STUB_HEAD_SEQ="$H1 $H2 $H3 $H1 $H2" -- --blocked graphql --next x >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+if [ "$rc" -eq 3 ] && ! grep -q $'POST\trepos/o/r/issues/12/comments' "$WORKDIR/gh.log" && grep -q "kept moving" "$WORKDIR/err"; then
+  pass "a head that keeps moving: exit 3, nothing posted"
+else
+  fail "head churn: rc=$rc err=$(cat "$WORKDIR/err")"
 fi
 
 # --- Codex provenance (Codex on #1555) --------------------------------------

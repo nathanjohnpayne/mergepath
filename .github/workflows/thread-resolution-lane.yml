@@ -40,6 +40,14 @@ on:
 permissions:
   contents: read
 
+# One run per PR at a time: the resolver's skip checks read a snapshot, so
+# two overlapping runs could both reply on the same unresolved thread
+# (CodeRabbit on #1555). Queue, never cancel: a dispatched pass should run.
+# This lane is not a required check, so a queued run blocks no merge.
+concurrency:
+  group: thread-resolution-lane-${{ inputs.pr }}
+  cancel-in-progress: false
+
 jobs:
   resolve:
     name: Resolve actioned bot threads

@@ -124,8 +124,13 @@ read_gh() {
   if [ -n "$READ_TOKEN" ]; then GH_TOKEN="$READ_TOKEN" gh "$@"; else gh "$@"; fi
 }
 
-HEAD_SHA="$(read_gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)"
-printf '%s' "$HEAD_SHA" | grep -Eq '^[0-9a-f]{40}$' || die 3 "could not read the head SHA of $REPO#$PR; a handback without it cannot be resumed safely"
+read_head() {
+  local sha
+  sha="$(read_gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)"
+  printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$' || return 1
+  printf '%s\n' "$sha"
+}
+HEAD_SHA="$(read_head)" || die 3 "could not read the head SHA of $REPO#$PR; a handback without it cannot be resumed safely"
 
 TIER="unmeasured"
 SURFACE="unknown"
@@ -139,8 +144,10 @@ printf "%s|%s" "${MERGEPATH_AGENT_TIER:-}" "${MERGEPATH_AGENT_SURFACE_MEASURED:-
   fi
 fi
 
-ACCOUNTING="not measured"
-if [ -x "$ROOT/scripts/review-feedback-accounting.sh" ]; then
+collect_accounting() {
+  local acct
+  ACCOUNTING="not measured"
+  [ -x "$ROOT/scripts/review-feedback-accounting.sh" ] || return 0
   if [ -n "$READ_TOKEN" ]; then
     acct="$(GH_TOKEN="$READ_TOKEN" "$ROOT/scripts/review-feedback-accounting.sh" "$PR" "$REPO" 2>/dev/null || true)"
   else
@@ -149,7 +156,21 @@ if [ -x "$ROOT/scripts/review-feedback-accounting.sh" ]; then
   if printf '%s' "$acct" | jq -e '.posted | numbers' >/dev/null 2>&1; then
     ACCOUNTING="$(printf '%s' "$acct" | jq -r '"\(.posted) posted, \(.accounted) accounted"')"
   fi
-fi
+}
+
+# The accounting must describe the head the comment names: a push while it
+# runs would record new state against the old SHA (CodeRabbit on #1555). So
+# the head is read again afterwards, and the collection repeats on the new
+# head until the two agree.
+settled=false
+for _ in 1 2 3; do
+  collect_accounting
+  after="$(read_head)" || die 3 "could not re-read the head SHA of $REPO#$PR after collecting its state"
+  if [ "$after" = "$HEAD_SHA" ]; then settled=true; break; fi
+  echo "post-local-agent-handback: head moved $HEAD_SHA -> $after while collecting state; collecting again" >&2
+  HEAD_SHA="$after"
+done
+$settled || die 3 "the head of $REPO#$PR kept moving while its state was collected; wait for the pushes to settle and run again"
 
 # A Codex task has no session variable, so an explicit URL wins; without one
 # the measured surface is still recorded rather than calling a cloud task
