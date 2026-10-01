@@ -160,7 +160,7 @@ run_setup() { # <prefix> [env...]  (MERGEPATH_GH_VERSION defaults to the unpinne
 }
 
 set +e
-run_setup "$WORKDIR/p-good" MERGEPATH_GH_SHA256="$sum" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+run_setup "$WORKDIR/p-good" MERGEPATH_GH_SHA256="$sum" PATH="$WORKDIR/p-good/bin:$SBIN" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
 set -e
 if [ "$rc" -eq 0 ] && [ -x "$WORKDIR/p-good/bin/gh" ] && grep -q "sha256 verified" "$WORKDIR/setup.err" \
    && grep -q "releases/download/v$VER/gh_${VER}_linux_amd64.tar.gz" "$WORKDIR/curl.log" \
@@ -187,17 +187,29 @@ done
 
 # Every install step checks its own status: an unwritable prefix fails the
 # install instead of logging "installed" (CodeRabbit and Codex on #1552).
-mkdir -p "$WORKDIR/p-ro"
-chmod 555 "$WORKDIR/p-ro"
+# The prefix is a regular FILE, so `mkdir -p <prefix>/bin` fails for any
+# user, root included (mode bits do not stop root; CodeRabbit and Codex on
+# #1552).
+: >"$WORKDIR/p-ro"
 set +e
-run_setup "$WORKDIR/p-ro" MERGEPATH_GH_SHA256="$sum" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+run_setup "$WORKDIR/p-ro" MERGEPATH_GH_SHA256="$sum" PATH="$WORKDIR/p-ro/bin:$SBIN" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
 set -e
-chmod 755 "$WORKDIR/p-ro"
-if [ "$rc" -eq 1 ] && [ ! -e "$WORKDIR/p-ro/bin/gh" ] && ! grep -q "installed gh" "$WORKDIR/setup.err" \
+if [ "$rc" -eq 1 ] && [ -f "$WORKDIR/p-ro" ] && ! grep -q "installed gh" "$WORKDIR/setup.err" \
    && grep -q "could not create $WORKDIR/p-ro/bin" "$WORKDIR/setup.err"; then
   pass "setup, unwritable prefix: fails the install, never reports it installed"
 else
   fail "setup unwritable prefix: rc=$rc err=$(cat "$WORKDIR/setup.err")"
+fi
+
+# Installed where nothing will find it: a prefix whose bin is not on PATH fails
+# setup instead of exiting 0 with a note (Codex on #1552).
+set +e
+run_setup "$WORKDIR/p-offpath" MERGEPATH_GH_SHA256="$sum" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && grep -q "is not on PATH, so later commands cannot find gh" "$WORKDIR/setup.err"; then
+  pass "setup, install directory off PATH: fails and names the PATH entry to add"
+else
+  fail "setup off-PATH: rc=$rc err=$(cat "$WORKDIR/setup.err")"
 fi
 
 # The default version's hash is pinned in the script: a tarball that does not

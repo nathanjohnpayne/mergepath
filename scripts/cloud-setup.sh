@@ -124,9 +124,11 @@ install_gh() {
   chmod 755 "$prefix/bin/gh" || { log "could not make $prefix/bin/gh executable"; return 1; }
   [ -x "$prefix/bin/gh" ] || { log "$prefix/bin/gh is not executable after install"; return 1; }
   log "installed gh $GH_VERSION to $prefix/bin/gh (sha256 verified)"
+  # Exit 0 means every required tool is usable afterwards: a gh the guarded
+  # writes cannot find is not installed for them (Codex on #1552).
   case ":$PATH:" in
     *":$prefix/bin:"*) ;;
-    *) log "NOTE: $prefix/bin is not on PATH; add it in the environment (export PATH=\"$prefix/bin:\$PATH\")" ;;
+    *) log "$prefix/bin is not on PATH, so later commands cannot find gh; add PATH=$prefix/bin:\$PATH to the environment's variables (or set MERGEPATH_TOOL_PREFIX to a directory already on PATH)"; return 1 ;;
   esac
 }
 
