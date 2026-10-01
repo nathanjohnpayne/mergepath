@@ -1674,6 +1674,8 @@ paths:
   - path: docs/agents/shared-operating-rules.md
     type: canonical
     consumers: all
+    requires:
+      - "docs/agents/cloud-environments.md"   # linked from § Cloud agent sessions (#1057 F)
   # The soft-wrap prose convention (#780 step 6), extracted from the
   # per-repo-owned docs/agents/documentation-rules.md. The RULE is
   # fleet-wide — a machine's ~/GitHub/CLAUDE.md already named it the

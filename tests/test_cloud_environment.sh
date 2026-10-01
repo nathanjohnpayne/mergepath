@@ -274,6 +274,26 @@ else
   fail "setup trailing-slash PATH: rc=$rc err=$(cat "$WORKDIR/setup.err")"
 fi
 
+# A relative PATH entry resolves gh to a relative path; the same-file test
+# still accepts the install (CodeRabbit on #1552).
+mkdir -p "$WORKDIR/relroot"
+set +e
+( cd "$WORKDIR/relroot" && env -i HOME="$WORKDIR" PATH="tools/bin:$SBIN" MERGEPATH_GH_VERSION="$VER" \
+    MERGEPATH_TOOL_PREFIX=tools MERGEPATH_GH_SHA256="$sum" "$SBIN/bash" "$SETUP" ) >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ -x "$WORKDIR/relroot/tools/bin/gh" ]; then
+  pass "setup, relative prefix on a relative PATH entry: accepted"
+else
+  fail "setup relative PATH: rc=$rc err=$(cat "$WORKDIR/setup.err")"
+fi
+
+# The shared operating rules (propagated) point every repo at the recipe.
+if grep -q '\[Cloud Agent Environments\](cloud-environments.md)' "$ROOT/docs/agents/shared-operating-rules.md"; then
+  pass "shared operating rules link the cloud recipe, so consumers can find it"
+else
+  fail "docs/agents/shared-operating-rules.md does not link cloud-environments.md"
+fi
+
 # A tool on PATH that does not run is not present: setup fails (Codex on #1552).
 for tool in gh jq; do
   BROKE="$WORKDIR/broken-$tool"

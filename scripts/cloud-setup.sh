@@ -138,9 +138,11 @@ install_gh() {
   hash -r 2>/dev/null || true
   local resolved
   resolved="$(command -v gh 2>/dev/null || true)"
-  case "$resolved" in
-    /*) [ "$resolved" -ef "$prefix/bin/gh" ] && return 0 ;;
-  esac
+  # A relative PATH entry resolves to a relative path; the same-file test
+  # (-ef) decides either way (CodeRabbit on #1552).
+  if [ -n "$resolved" ] && [ "$resolved" -ef "$prefix/bin/gh" ]; then
+    return 0
+  fi
   log "$prefix/bin is not on PATH, so later commands cannot find gh; add $prefix/bin to the environment's PATH, or set MERGEPATH_TOOL_PREFIX to the PARENT of a directory already on PATH (gh goes to <prefix>/bin, so for ~/.local/bin on PATH use ~/.local)"
   return 1
 }
