@@ -12,7 +12,8 @@
 #   - the head SHA the state was established at
 #   - the review-feedback accounting at that head (posted / accounted)
 #   - the session's transcript URL, so the next session reads the run
-#     rather than a paraphrase of it (CLAUDE_CODE_REMOTE_SESSION_ID)
+#     rather than a paraphrase of it (--session-url, MERGEPATH_SESSION_URL,
+#     or derived from CLAUDE_CODE_REMOTE_SESSION_ID)
 #   - the exact next command
 #
 # `needs-local-agent` is the fourth member of the handoff family (see
@@ -31,18 +32,23 @@
 #
 # Usage:
 #   scripts/post-local-agent-handback.sh <PR#> --blocked <capability> \
-#     --next "<command>" [--repo OWNER/REPO] [--note-file FILE] [--print]
+#     --next "<command>" [--repo OWNER/REPO] [--note-file FILE]
+#     [--session-url URL] [--print]
 #
 #   <capability>  one of: author-writes reviewer-writes graphql cross-repo
 #                 push-multi-branch (the agent-capability-probe vocabulary)
+#   --session-url the run's transcript URL. A Claude cloud session derives it
+#                 from CLAUDE_CODE_REMOTE_SESSION_ID; a Codex task has no such
+#                 variable, so pass its task URL (or set MERGEPATH_SESSION_URL)
 #   --print       render the comment to stdout and post nothing
 #
 # Exit codes:
 #   0  handback posted and labelled (or rendered, with --print)
 #   1  bad invocation
 #   3  a read the handback needs failed (head SHA)
-#   4  the comment could not be posted: the rendered body is on stdout so
-#      the session can relay it another way
+#   4  the comment could not be posted, or the label it needs could not be
+#      created first: nothing was posted, and the rendered body is on stdout
+#      so the session can relay it another way
 #   5  the comment posted but its author did not read back as the reviewer,
 #      or the label could not be applied
 #
@@ -61,6 +67,7 @@ REPO=""
 BLOCKED=""
 NEXT=""
 NOTE_FILE=""
+SESSION_URL="${MERGEPATH_SESSION_URL:-}"
 PRINT=false
 
 usage() { sed -n '2,/^# Bash 3.2 portable/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; }
@@ -68,13 +75,14 @@ die() { echo "post-local-agent-handback: $2" >&2; exit "$1"; }
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --blocked|--next|--repo|--note-file)
+    --blocked|--next|--repo|--note-file|--session-url)
       [ "$#" -ge 2 ] || die 1 "$1 requires a value"
       case "$1" in
         --blocked) BLOCKED="$2" ;;
         --next) NEXT="$2" ;;
         --repo) REPO="$2" ;;
         --note-file) NOTE_FILE="$2" ;;
+        --session-url) SESSION_URL="$2" ;;
       esac
       shift 2
       ;;
@@ -93,6 +101,8 @@ printf '%s' "$PR" | grep -Eq '^[0-9]+$' || die 1 "PR number required (got '${PR}
 case " $CAPABILITIES " in *" $BLOCKED "*) ;; *) die 1 "--blocked must be one of: $CAPABILITIES (got '$BLOCKED')" ;; esac
 [ -n "$NEXT" ] || die 1 "--next \"<command>\" is required: the resuming session runs it"
 if [ -n "$NOTE_FILE" ] && [ ! -r "$NOTE_FILE" ]; then die 1 "note file not readable: $NOTE_FILE"; fi
+case "$SESSION_URL" in ''|https://*) ;; *) die 1 "--session-url must be an https:// URL (got '$SESSION_URL')" ;; esac
+case "$SESSION_URL" in *[[:space:]]*) die 1 "--session-url must not contain whitespace" ;; esac
 command -v jq >/dev/null 2>&1 || die 1 "jq is required"
 command -v gh >/dev/null 2>&1 || die 1 "gh is required"
 
@@ -105,7 +115,16 @@ fi
 
 # --- state the handback records --------------------------------------------
 
-HEAD_SHA="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)"
+# Reads use a provisioned PAT when there is one: a Codex cloud task has no gh
+# keyring and no ambient token, only the OP_PREFLIGHT_*_PAT variables (Codex
+# on #1555). A read needs no identity proof, so no verification here; every
+# write below goes through the reviewer wrapper, which verifies its token.
+READ_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${OP_PREFLIGHT_AUTHOR_PAT:-${GH_TOKEN:-}}}"
+read_gh() {
+  if [ -n "$READ_TOKEN" ]; then GH_TOKEN="$READ_TOKEN" gh "$@"; else gh "$@"; fi
+}
+
+HEAD_SHA="$(read_gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)"
 printf '%s' "$HEAD_SHA" | grep -Eq '^[0-9a-f]{40}$' || die 3 "could not read the head SHA of $REPO#$PR; a handback without it cannot be resumed safely"
 
 TIER="unmeasured"
@@ -122,15 +141,28 @@ fi
 
 ACCOUNTING="not measured"
 if [ -x "$ROOT/scripts/review-feedback-accounting.sh" ]; then
-  acct="$("$ROOT/scripts/review-feedback-accounting.sh" "$PR" "$REPO" 2>/dev/null || true)"
+  if [ -n "$READ_TOKEN" ]; then
+    acct="$(GH_TOKEN="$READ_TOKEN" "$ROOT/scripts/review-feedback-accounting.sh" "$PR" "$REPO" 2>/dev/null || true)"
+  else
+    acct="$("$ROOT/scripts/review-feedback-accounting.sh" "$PR" "$REPO" 2>/dev/null || true)"
+  fi
   if printf '%s' "$acct" | jq -e '.posted | numbers' >/dev/null 2>&1; then
     ACCOUNTING="$(printf '%s' "$acct" | jq -r '"\(.posted) posted, \(.accounted) accounted"')"
   fi
 fi
 
-SESSION="not a cloud session"
-if [ -n "${CLAUDE_CODE_REMOTE_SESSION_ID:-}" ]; then
+# A Codex task has no session variable, so an explicit URL wins; without one
+# the measured surface is still recorded rather than calling a cloud task
+# local (Codex on #1555).
+if [ -n "$SESSION_URL" ]; then
+  SESSION="$SESSION_URL"
+elif [ -n "${CLAUDE_CODE_REMOTE_SESSION_ID:-}" ]; then
   SESSION="https://claude.ai/code/${CLAUDE_CODE_REMOTE_SESSION_ID/#cse_/session_}"
+else
+  case "$SURFACE" in
+    local) SESSION="local session (no transcript URL)" ;;
+    *) SESSION="\`$SURFACE\` session; no transcript URL was supplied (pass --session-url)" ;;
+  esac
 fi
 
 BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/local-agent-handback.XXXXXX")"
@@ -167,6 +199,17 @@ AS_REVIEWER="$ROOT/scripts/gh-as-reviewer.sh"
 . "$ROOT/scripts/lib/gh-token-resolver.sh"
 EXPECTED="$(gh_default_reviewer_identity)"
 
+# The label is created before anything is posted. A repository that got this
+# script by propagation has no needs-local-agent label (only bootstrap seeds
+# it), and failing on the label after the comment would leave a comment that
+# every retry duplicates (Codex on #1555). Adding a label by name does not
+# reliably create it, so it is created explicitly; "already exists" is fine.
+if ! "$AS_REVIEWER" -- gh api "repos/$REPO/labels/$LABEL" >/dev/null 2>&1 \
+   && ! "$AS_REVIEWER" -- gh api -X POST "repos/$REPO/labels" -f "name=$LABEL" -f "color=$LABEL_COLOR" -f "description=$LABEL_DESC" >/dev/null 2>&1; then
+  cat "$BODY_FILE"
+  die 4 "the $LABEL label does not exist on $REPO and could not be created; nothing was posted, and the rendered body is on stdout: relay it another way"
+fi
+
 posted=""
 if ! posted="$("$AS_REVIEWER" -- gh api -X POST "repos/$REPO/issues/$PR/comments" -F "body=@$BODY_FILE" 2>/dev/null)"; then
   cat "$BODY_FILE"
@@ -179,12 +222,8 @@ if [ "$author" != "$EXPECTED" ]; then
 fi
 echo "post-local-agent-handback: posted $url as $author" >&2
 
-# REST adds a label by name and GitHub creates it with a default colour when
-# the repository has none; setting the colour and description afterwards is
-# cosmetic, so its failure is ignored.
 if ! "$AS_REVIEWER" -- gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$LABEL" >/dev/null 2>&1; then
   die 5 "handback posted ($url) but the $LABEL label could not be applied; add it by hand"
 fi
-"$AS_REVIEWER" -- gh api -X PATCH "repos/$REPO/labels/$LABEL" -f "color=$LABEL_COLOR" -f "description=$LABEL_DESC" >/dev/null 2>&1 || true
 echo "post-local-agent-handback: labelled $REPO#$PR $LABEL" >&2
 exit 0

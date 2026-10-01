@@ -15,14 +15,19 @@ name: Thread resolution lane
 #
 # `gh workflow run` is a REST call the proxy allows for the attached
 # repository. Only `--resolve-actioned` runs here: it resolves a thread only
-# when its fix or rebuttal is demonstrable AND bound to the finding (an agent
-# reply on the thread, or a recorded verdict), and leaves everything else
-# open. Deferral (`--auto-resolve-bots`) stays a deliberate, local decision.
+# when its fix or rebuttal is demonstrable AND bound to the finding, and
+# leaves everything else open. This fresh checkout sees only GitHub-visible
+# evidence: an agent reply on the thread. A verdict recorded only in a
+# session's local feedback ledger (.mergepath/*-feedback-ledger.jsonl) is not
+# visible here, so reply on each thread before dispatching (Codex on #1555).
+# Deferral (`--auto-resolve-bots`) stays a deliberate, local decision.
 #
-# Auth model: REVIEWER_ASSIGNMENT_TOKEN, the nathanpayne-claude reviewer PAT
-# already used by the daily rollup and weekly sweep; the resolver verifies it
-# with identity-check.sh --expect-write-identity before any mutation, and
-# every resolve is read back (isResolved:true) before it counts.
+# Auth model: REVIEWER_ASSIGNMENT_TOKEN, the reviewer PAT already used by the
+# daily rollup and weekly sweep. Bootstrap lets it belong to any selected
+# reviewer, so the expected identity is the login the token reads as, and it
+# must be a nathanpayne-<agent> reviewer (Codex on #1555). The resolver then
+# verifies the token with identity-check.sh --expect-write-identity before
+# any mutation, and every resolve is read back (isResolved:true).
 
 on:
   workflow_dispatch:
@@ -59,7 +64,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           OP_PREFLIGHT_REVIEWER_PAT: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
-          MERGEPATH_AGENT: claude
           PR_NUMBER: ${{ inputs.pr }}
           REPO: ${{ github.repository }}
         run: |
@@ -67,6 +71,12 @@ jobs:
             echo "ERROR: REVIEWER_ASSIGNMENT_TOKEN is empty; the lane cannot resolve threads without the reviewer PAT." >&2
             exit 1
           fi
+          login="$(gh api user --jq .login 2>/dev/null || true)"
+          case "$login" in
+            nathanpayne-*[!a-z]*|nathanpayne-) echo "ERROR: REVIEWER_ASSIGNMENT_TOKEN reads as '$login', not a nathanpayne-<agent> reviewer." >&2; exit 1 ;;
+            nathanpayne-*) export GH_AS_REVIEWER_IDENTITY="$login" MERGEPATH_AGENT="${login#nathanpayne-}" ;;
+            *) echo "ERROR: REVIEWER_ASSIGNMENT_TOKEN reads as '${login:-nothing}', not a nathanpayne-<agent> reviewer." >&2; exit 1 ;;
+          esac
           case "$PR_NUMBER" in
             ''|*[!0-9]*) echo "ERROR: pr must be a PR number; got '$PR_NUMBER'" >&2; exit 1 ;;
           esac
@@ -78,7 +88,7 @@ jobs:
             {
               echo "### Thread resolution lane: $REPO#$PR_NUMBER"
               echo
-              echo "resolve-pr-threads.sh --resolve-actioned exited $rc (0 = nothing left unresolved, 3 = some threads intentionally left open; see the log)."
+              echo "resolve-pr-threads.sh --resolve-actioned exited $rc as $login (0 = nothing left unresolved, 3 = some threads left open; see the log). A thread whose only disposition is in a session's local ledger stays open: reply on it, then dispatch again."
             } >>"$GITHUB_STEP_SUMMARY"
             exit 0
           fi

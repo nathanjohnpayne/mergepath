@@ -806,12 +806,12 @@ The fourth member of the handoff family, for a step a session cannot complete, a
 
 - the blocked capability and the session's measured tier
 - the head SHA the state was established at, and the review-feedback accounting at that head
-- the session's transcript URL
+- the session's transcript URL (derived in a Claude cloud session; passed with `--session-url` from a Codex task)
 - the exact next command
 
 It uses REST only, so it works in the session most likely to need it.
 
-The resuming session first confirms the head has not moved. It then runs the next command and removes `needs-local-agent`. For a `graphql` handback, the next command is usually a dispatch of the thread-resolution lane: `gh workflow run thread-resolution-lane.yml -f pr=<PR#>`. That lane runs `scripts/resolve-pr-threads.sh --resolve-actioned` from the default branch with the reviewer PAT.
+The resuming session first confirms the head has not moved. It then runs the next command and removes `needs-local-agent`. For a `graphql` handback, the next command is usually a dispatch of the thread-resolution lane: `gh workflow run thread-resolution-lane.yml -f pr=<PR#>`. That lane runs `scripts/resolve-pr-threads.sh --resolve-actioned` from the default branch with the reviewer PAT, as the reviewer that PAT reads as. It sees only GitHub-visible evidence: a thread needs an agent reply, because a verdict recorded only in a session's local ledger does not reach the runner.
 
 `needs-local-agent` is informational. It is not a blocking label (`scripts/lib/blocking-labels.sh`), no gate reads its presence or absence, and agents may remove it; `label-removal-guard.sh` does not protect it. Removing it clears nothing else: `human-hold`, `needs-human-review` and `policy-violation` keep their own rules.
 
