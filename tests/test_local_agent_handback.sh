@@ -347,6 +347,7 @@ case "$1 $2" in
   "api repos/o/r/actions/runs/222")
     n=$(( $(cat "$D_LOG.w" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$D_LOG.w"
     jq_expr=""; prev=""; for a in "$@"; do [ "$prev" = "--jq" ] && jq_expr="$a"; prev="$a"; done
+    [ -n "${D_SLOW_REQUEST:-}" ] && sleep "$D_SLOW_REQUEST"
     if [ "$n" -lt 2 ]; then printf '{"status":"in_progress","conclusion":null}'
     elif [ -n "${D_RUN_FAILS:-}" ]; then printf '{"status":"completed","conclusion":"failure"}'
     elif [ -n "${D_RUN_HANGS:-}" ]; then printf '{"status":"queued","conclusion":null}'
@@ -399,13 +400,18 @@ drun -- --appear-timeout 2 >/dev/null 2>"$DFIX/err"; r_none=$?
 drun D_APPEAR_AT=1 D_RUN_FAILS=1 -- >/dev/null 2>/dev/null; r_fail=$?
 drun D_DISPATCH_FAIL=1 -- >/dev/null 2>/dev/null; r_refused=$?
 drun D_APPEAR_AT=1 D_RUN_HANGS=1 -- --watch-timeout 2 >/dev/null 2>/dev/null; r_hang=$?
+# Request time counts against the deadline: with 2s requests and a 3s
+# budget, sleep-only accounting would poll about four times (8s+).
+t0=$SECONDS
+drun D_APPEAR_AT=1 D_RUN_HANGS=1 D_SLOW_REQUEST=2 -- --watch-timeout 3 >/dev/null 2>/dev/null; r_slow=$?
+t_slow=$(( SECONDS - t0 ))
 out="$(drun D_APPEAR_AT=1 -- --no-wait 2>/dev/null)"; r_nowait=$?
 set -e
-if [ "$r_none" -eq 6 ] && [ "$r_hang" -eq 9 ] \
+if [ "$r_none" -eq 6 ] && [ "$r_hang" -eq 9 ] && [ "$r_slow" -eq 9 ] && [ "$t_slow" -le 6 ] \
    && [ "$r_fail" -eq 8 ] && [ "$r_refused" -eq 4 ] && [ "$r_nowait" -eq 0 ] && [ "$out" = "222" ]; then
-  pass "dispatch: own run never listed -> exit 6 (the older run is not watched); run failed -> 8; never completes -> 9; dispatch refused -> 4; --no-wait prints the run id"
+  pass "dispatch: own run never listed -> exit 6 (the older run is not watched); run failed -> 8; never completes -> 9 (a wall-clock deadline that counts request time); dispatch refused -> 4; --no-wait prints the run id"
 else
-  fail "dispatch exits: none=$r_none hang=$r_hang fail=$r_fail refused=$r_refused nowait=$r_nowait out=$out"
+  fail "dispatch exits: none=$r_none hang=$r_hang slow=$r_slow/${t_slow}s fail=$r_fail refused=$r_refused nowait=$r_nowait out=$out"
 fi
 
 echo

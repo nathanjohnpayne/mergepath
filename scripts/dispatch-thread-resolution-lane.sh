@@ -112,16 +112,25 @@ if ! "$AS_AUTHOR" -- gh api -X POST "repos/$REPO/dispatches" \
 fi
 echo "dispatch-thread-resolution-lane: dispatched $EVENT_TYPE for $REPO#$PR (nonce $NONCE)" >&2
 
+# Both waits are wall-clock deadlines (bash's SECONDS), so time spent in
+# requests counts, not only the sleeps (CodeRabbit on #1555); a sleep never
+# runs past the deadline.
+nap() { # <deadline>
+  local left=$(( $1 - SECONDS ))
+  [ "$left" -gt "$POLL_INTERVAL" ] && left="$POLL_INTERVAL"
+  [ "$left" -gt 0 ] && sleep "$left"
+  return 0
+}
+
 run_id=""
-waited=0
+deadline=$(( SECONDS + APPEAR_TIMEOUT ))
 while :; do
   run_id="$(read_gh api "repos/$REPO/actions/workflows/$WORKFLOW/runs?event=repository_dispatch&per_page=100" \
     --jq "[.workflow_runs[] | select(.display_title == \"$TITLE\")][0].id // empty" 2>/dev/null || true)"
   printf '%s' "$run_id" | grep -Eq '^[0-9]+$' && break
   run_id=""
-  [ "$waited" -lt "$APPEAR_TIMEOUT" ] || die 6 "no lane run titled '$TITLE' appeared within ${APPEAR_TIMEOUT}s; check the Actions tab of $REPO"
-  sleep "$POLL_INTERVAL"
-  waited=$((waited + POLL_INTERVAL))
+  [ "$SECONDS" -lt "$deadline" ] || die 6 "no lane run titled '$TITLE' appeared within ${APPEAR_TIMEOUT}s; check the Actions tab of $REPO"
+  nap "$deadline"
 done
 echo "dispatch-thread-resolution-lane: run $run_id: https://github.com/$REPO/actions/runs/$run_id" >&2
 
@@ -129,16 +138,15 @@ if ! $WAIT; then
   printf '%s\n' "$run_id"
   exit 0
 fi
-waited=0
+deadline=$(( SECONDS + WATCH_TIMEOUT ))
 while :; do
   state="$(read_gh api "repos/$REPO/actions/runs/$run_id" --jq '"\(.status) \(.conclusion // "")"' 2>/dev/null || true)"
   case "$state" in
     "completed success") break ;;
     completed\ *) die 8 "lane run $run_id finished with conclusion '${state#completed }'; read its log before retrying" ;;
   esac
-  [ "$waited" -lt "$WATCH_TIMEOUT" ] || die 9 "lane run $run_id did not complete within ${WATCH_TIMEOUT}s (last status: ${state:-unreadable})"
-  sleep "$POLL_INTERVAL"
-  waited=$((waited + POLL_INTERVAL))
+  [ "$SECONDS" -lt "$deadline" ] || die 9 "lane run $run_id did not complete within ${WATCH_TIMEOUT}s (last status: ${state:-unreadable})"
+  nap "$deadline"
 done
 echo "dispatch-thread-resolution-lane: lane run $run_id completed; check the PR for any thread it left open (its summary lists them)" >&2
 exit 0
