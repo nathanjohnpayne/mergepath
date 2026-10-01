@@ -379,10 +379,13 @@ api_request() {
     local -a args
     args=(api -i -X "$method" "$path")
     [ -n "$query" ] && args+=(-f "query=$query")
+    # Every measurement targets github.com, as the curl path below does: a
+    # bare `gh api` follows a sole GHES host in hosts.yml, whose stored login
+    # could answer for a token github.com rejected (Codex on #1541).
     if [ -n "$token" ]; then
-      ( unset GITHUB_TOKEN; GH_TOKEN="$token" gh "${args[@]}" ) >"$raw" 2>/dev/null || request_rc=$?
+      ( unset GITHUB_TOKEN; GH_HOST=github.com GH_TOKEN="$token" gh "${args[@]}" ) >"$raw" 2>/dev/null || request_rc=$?
     else
-      gh "${args[@]}" >"$raw" 2>/dev/null || request_rc=$?
+      GH_HOST=github.com gh "${args[@]}" >"$raw" 2>/dev/null || request_rc=$?
     fi
     tr -d '\r' <"$raw" | awk -v h="$prefix.headers" -v b="$prefix.body" '
       !done && /^$/ { done = 1; next }

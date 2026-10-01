@@ -70,6 +70,7 @@ STUB
 cat >>"$STUB_DIR/gh" <<'STUB'
 tok="${GH_TOKEN:-}"
 [ -n "$tok" ] && printf '%s\n' "$tok" >>"$SEEN"
+[ -n "${STUB_HOST_LOG:-}" ] && printf '%s %s\n' "${GH_HOST:-<unset>}" "$*" >>"$STUB_HOST_LOG"
 if [ "$1 $2" = "auth token" ] && [ "$#" -eq 2 ]; then
   # gh auth token (no --user): the ACTIVE account, controlled by STUB_KEYRING_ACTIVE
   [ -n "${STUB_KEYRING_ACTIVE:-}" ] || exit 1
@@ -706,6 +707,16 @@ if [ "$(jq -r .transient_failures "$WORKDIR/oflap.json")" = "true" ] && [ -z "$(
   pass "opt-in: an unidentifiable token that verifies on repeat marks the run transient, not cached"
 else
   fail "opt-in repeat: transient=$(jq -r .transient_failures "$WORKDIR/oflap.json" 2>/dev/null) cache=$(ls "$CACHE" 2>/dev/null)"
+fi
+
+# Codex on #1541: every probe measurement (api -i -X ...) targets github.com,
+# so a sole GHES host in hosts.yml cannot answer for a rejected token.
+: >"$WORKDIR/probe-hosts.log"
+run_probe GH_TOKEN=ghp_author STUB_HOST_LOG="$WORKDIR/probe-hosts.log" -- --no-cache >/dev/null 2>&1 || true
+if grep -q ' -X ' "$WORKDIR/probe-hosts.log" && ! grep ' -X ' "$WORKDIR/probe-hosts.log" | grep -vq '^github.com '; then
+  pass "every probe measurement runs with GH_HOST=github.com"
+else
+  fail "probe request hosts: $(grep ' -X ' "$WORKDIR/probe-hosts.log" | cut -d' ' -f1 | sort -u | tr '\n' ' ')"
 fi
 
 # Phase 4b on #1541: with GH_HOST naming an Enterprise host the verifier
