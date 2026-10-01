@@ -97,7 +97,9 @@ if [ "$rc" -eq 0 ] \
    && printf '%s' "$body" | grep -q 'Session tier:\*\* `author-writes,reviewer-writes` (surface: `claude-cloud`)' \
    && printf '%s' "$body" | grep -q "Review feedback at this head:\*\* 7 posted, 7 accounted" \
    && printf '%s' "$body" | grep -q "https://claude.ai/code/session_abc123" \
-   && printf '%s' "$body" | grep -q "scripts/resolve-pr-threads.sh 12 --resolve-actioned"; then
+   && printf '%s' "$body" | grep -q "scripts/resolve-pr-threads.sh 12 --resolve-actioned" \
+   && printf '%s' "$body" | grep -q "only once the step it stands for has completed: a dispatch that returned is not completion" \
+   && printf '%s' "$body" | grep -q 'gh run watch <id> --exit-status'; then
   pass "handback comment records capability, tier, head, accounting, session URL and the next command"
 else
   fail "happy path: rc=$rc err=$(cat "$WORKDIR/err") body=$body"
@@ -256,6 +258,15 @@ if [ -r "$LANE" ] && command -v yq >/dev/null 2>&1; then
   else
     fail "lane trust boundary drifted: if=$guard ref=$ref persist=$persist perms=$perms"
   fi
+  # The trigger carries no ref, so a branch cannot run its own copy of the
+  # lane with the reviewer PAT (Codex P1 on #1555, ADR 0002).
+  triggers="$(yq -o=json -I=0 '.on | keys' "$LANE")"
+  types="$(yq -o=json -I=0 '.on.repository_dispatch.types' "$LANE")"
+  if [ "$triggers" = '["repository_dispatch"]' ] && [ "$types" = '["thread-resolution-lane"]' ]; then
+    pass "lane is triggered only by repository_dispatch (default-branch copy only), never workflow_dispatch"
+  else
+    fail "lane triggers drifted: on=$triggers types=$types"
+  fi
   run_step="$(yq -r '.jobs.resolve.steps[] | select(.name == "Resolve actioned threads") | .run' "$LANE")"
   if printf '%s' "$run_step" | grep -q -- '--resolve-actioned' \
      && ! printf '%s' "$run_step" | grep -q -- '--auto-resolve-bots' \
@@ -264,7 +275,7 @@ if [ -r "$LANE" ] && command -v yq >/dev/null 2>&1; then
   else
     fail "lane runs a resolve mode other than --resolve-actioned"
   fi
-  if grep -q 'PR_NUMBER: ${{ inputs.pr }}' "$LANE" && ! grep -q 'resolve-pr-threads.sh "${{' "$LANE"; then
+  if grep -q 'PR_NUMBER: ${{ github.event.client_payload.pr }}' "$LANE" && ! grep -q 'resolve-pr-threads.sh "${{' "$LANE"; then
     pass "lane passes the PR input through the environment, never interpolated into the script"
   else
     fail "lane interpolates an input into its run script"

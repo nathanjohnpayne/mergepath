@@ -11,10 +11,13 @@ name: Thread resolution lane
 # threads, recording verdicts. This lane runs the resolution step itself, on
 # a real runner, when a session dispatches it:
 #
-#   gh workflow run thread-resolution-lane.yml -f pr=<PR#>
+#   scripts/gh-as-author.sh -- gh api repos/<owner>/<repo>/dispatches \
+#     -f event_type=thread-resolution-lane -F 'client_payload[pr]=<PR#>'
 #
-# `gh workflow run` is a REST call the proxy allows for the attached
-# repository. Only `--resolve-actioned` runs here: it resolves a thread only
+# That is a REST call the proxy allows for the attached repository. The
+# wrapper binds the provisioned author PAT (a Codex task has no ambient
+# token); the endpoint needs Contents: write on a fine-grained token, which
+# the author's token has, or `repo` on a classic one. Only `--resolve-actioned` runs here: it resolves a thread only
 # when its fix or rebuttal is demonstrable AND bound to the finding, and
 # leaves everything else open. This fresh checkout sees only GitHub-visible
 # evidence: an agent reply on the thread. A verdict recorded only in a
@@ -30,12 +33,17 @@ name: Thread resolution lane
 # any mutation, and every resolve is read back (isResolved:true).
 
 on:
-  workflow_dispatch:
-    inputs:
-      pr:
-        description: 'Pull request number whose actioned bot threads to resolve'
-        required: true
-        type: number
+  # repository_dispatch, NOT workflow_dispatch (Codex P1 on #1555, the
+  # branch-protection-audit.yml posture, ADR 0002). workflow_dispatch lets
+  # the dispatcher pick a ref, and GitHub then runs the workflow DEFINITION
+  # from that ref, so an in-file guard lives in the very file a branch can
+  # rewrite, and the rewritten job gets REVIEWER_ASSIGNMENT_TOKEN.
+  # repository_dispatch has no ref: GitHub runs only the default branch's
+  # copy. Do not re-add workflow_dispatch; tests/test_local_agent_handback.sh
+  # fails if it reappears. A GITHUB_TOKEN-authored dispatch creates no run,
+  # so the dispatch needs a PAT.
+  repository_dispatch:
+    types: [thread-resolution-lane]
 
 permissions:
   contents: read
@@ -45,16 +53,15 @@ permissions:
 # (CodeRabbit on #1555). Queue, never cancel: a dispatched pass should run.
 # This lane is not a required check, so a queued run blocks no merge.
 concurrency:
-  group: thread-resolution-lane-${{ inputs.pr }}
+  group: thread-resolution-lane-${{ github.event.client_payload.pr }}
   cancel-in-progress: false
 
 jobs:
   resolve:
     name: Resolve actioned bot threads
-    # workflow_dispatch runs the workflow DEFINITION from the dispatched ref,
-    # which a checkout pin cannot constrain: a feature-branch dispatch could
-    # run an edited copy of this file with the reviewer PAT. Run only the
-    # default branch's definition, as daily-feedback-rollup.yml does (#550).
+    # Backstop, not the primary control: with repository_dispatch as the
+    # only trigger, github.ref_name is always the default branch. It exists
+    # so that re-adding a ref-selectable trigger fails closed (#550).
     if: github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -72,7 +79,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           OP_PREFLIGHT_REVIEWER_PAT: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
-          PR_NUMBER: ${{ inputs.pr }}
+          PR_NUMBER: ${{ github.event.client_payload.pr }}
           REPO: ${{ github.repository }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
