@@ -109,6 +109,9 @@ reply_time='2026-06-04T00:00:06Z'
 # and since #900 the emptiness of that field is what separates a run from the
 # body-less review object CodeRabbit creates for a conversational thread reply.
 run_body='**Actionable comments posted: 0**'
+# The issue-comment summary each review-object scenario serves is marker-led,
+# as every live summarize comment is: the probe accepts no other body as the
+# summary, so an ordinary reply cannot displace it (#878 hazard 6).
 
 fake_now() {
   local clock_file="$state_dir/fake-time"
@@ -294,7 +297,7 @@ case "$endpoint" in
         # PR-level summary body carries a Potential issue marker.
         printf '[{"id":9921,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
         ;;
-      probe_review_on_head)
+      probe_review_on_head|probe_ack_after_blocking_summary|probe_blocking_summary_no_ack|probe_ack_after_clean_summary|probe_ack_without_summary)
         # #814: a genuine CodeRabbit review already on HEAD. --probe must
         # return the SAME terminal verdict the polling mode does.
         printf '[{"id":9941,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
@@ -640,14 +643,40 @@ No actionable comments were generated in the recent review.'}
         # it cannot exercise this arm.)
         printf '[{"id":7804,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- CodeRabbit review command invocation: probe -->\\n`@nathanjohnpayne`: Here is a summary of where things stand.\\n\\n### Open CodeRabbit Threads\\nStill checking."}]\n' "$bot" "$reply_time" "$reply_time"
         ;;
+      probe_ack_after_blocking_summary|probe_blocking_summary_no_ack|probe_ack_after_clean_summary|probe_ack_without_summary)
+        # #878 hazard 6. A CodeRabbit chat acknowledgement matches no notice,
+        # so classify_comment grades it `review` by fallback; posted after the
+        # summary it is the NEWER `review`-class row. Before the fix the
+        # probe took it as the summary, scanned the ack for a blocking marker
+        # and reported clean over a summary carrying `_🟠 Major_`.
+        summary_marker='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
+        case "$scenario" in
+          probe_ack_after_clean_summary) summary_body="$summary_marker
+**Actionable comments posted: 0**
+
+Nothing to flag." ;;
+          *) summary_body="$summary_marker
+**Actionable comments posted: 1**
+
+_⚠️ Potential issue_ | _🟠 Major_ carried only by this summary." ;;
+        esac
+        ack_body='<!-- This is an auto-generated reply by CodeRabbit -->
+`@nathanjohnpayne` Thanks for the clarification, that makes sense. I will remember this for future reviews.'
+        jq -nc --arg bot "$bot" --arg sc "$scenario" --arg s "$summary_body" --arg a "$ack_body" \
+          --arg st "$head_time" --arg at "$reply_time" '
+          [ (if $sc == "probe_ack_without_summary" then empty
+             else {id:8781,user:{login:$bot},created_at:$st,updated_at:$st,body:$s} end),
+            (if $sc == "probe_blocking_summary_no_ack" then empty
+             else {id:8782,user:{login:$bot},created_at:$at,updated_at:$at,body:$a} end) ]'
+        ;;
       probe_review_on_head)
-        printf '[{"id":7803,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 0**\\n\\nNothing to flag."}]\n' "$bot" "$head_time" "$head_time"
+        printf '[{"id":7803,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n**Actionable comments posted: 0**\\n\\nNothing to flag."}]\n' "$bot" "$head_time" "$head_time"
         ;;
       probe_finding_predates_head)
         # Summary landed with the review, both older than the head committer
         # date, so the case isolates "aged evidence" from "publication
         # incomplete".
-        printf '[{"id":7808,"user":{"login":"%s"},"created_at":"2026-06-03T00:00:01Z","updated_at":"2026-06-03T00:00:01Z","body":"**Actionable comments posted: 0**\\n\\nAged summary."}]\n' "$bot"
+        printf '[{"id":7808,"user":{"login":"%s"},"created_at":"2026-06-03T00:00:01Z","updated_at":"2026-06-03T00:00:01Z","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n**Actionable comments posted: 0**\\n\\nAged summary."}]\n' "$bot"
         ;;
       probe_stale_anchor)
         # The PRIOR head's summary. It classifies as `review` and passes the
@@ -697,9 +726,9 @@ No actionable comments were generated in the recent review.'}
         printf '%s\n' "$count" >"$state_dir/issues-fetch-count"
         if [ "$count" -ge 2 ]; then
           if [ "$scenario" = "probe_summary_lands_during_probe_marker" ]; then
-            printf '[{"id":7931,"user":{"login":"%s"},"created_at":"2026-06-04T00:00:08Z","updated_at":"2026-06-04T00:00:08Z","body":"**Actionable comments posted: 1**\\n\\n_⚠️ Potential issue_\\n\\nCarried only by this just-landed summary."}]\n' "$bot"
+            printf '[{"id":7931,"user":{"login":"%s"},"created_at":"2026-06-04T00:00:08Z","updated_at":"2026-06-04T00:00:08Z","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n**Actionable comments posted: 1**\\n\\n_⚠️ Potential issue_\\n\\nCarried only by this just-landed summary."}]\n' "$bot"
           else
-            printf '[{"id":7930,"user":{"login":"%s"},"created_at":"2026-06-04T00:00:08Z","updated_at":"2026-06-04T00:00:08Z","body":"**Actionable comments posted: 0**\\n\\nJust-landed summary for this head."}]\n' "$bot"
+            printf '[{"id":7930,"user":{"login":"%s"},"created_at":"2026-06-04T00:00:08Z","updated_at":"2026-06-04T00:00:08Z","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n**Actionable comments posted: 0**\\n\\nJust-landed summary for this head."}]\n' "$bot"
           fi
         else
           printf '[{"id":7929,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 0**\\n\\nPrior head summary."}]\n' "$bot" "$head_time" "$head_time"
@@ -768,7 +797,7 @@ No actionable comments were generated in the recent review.'}
         # rate-limit/paused/in-progress/status-probe narration) and carries a
         # Potential issue marker in its body. The inline count is 0, so the
         # gate must rely on this summary-body marker to emit findings.
-        printf '[{"id":8821,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 1**\\n\\n<details>\\n<summary>foo.sh (1)</summary>\\n\\n_⚠️ Potential issue_\\n\\nThis only appears in the summary body."}]\n' "$bot" "$head_time" "$head_time"
+        printf '[{"id":8821,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n**Actionable comments posted: 1**\\n\\n<details>\\n<summary>foo.sh (1)</summary>\\n\\n_⚠️ Potential issue_\\n\\nThis only appears in the summary body."}]\n' "$bot" "$head_time" "$head_time"
         ;;
       intermediate_review_head_pin)
         # #535.2: a plain review-completed summary with NO Potential issue
@@ -786,7 +815,7 @@ No actionable comments were generated in the recent review.'}
         # PR-level summary. No inline comment exists, so this is the #535
         # class — the finding no required gate dispositions — in the format
         # the retired grep could not see.
-        printf '[{"id":8721,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 1**\\n\\n<details>\\n<summary>scripts/foo.sh (1)</summary>\\n\\n_🔒 Security \\u0026 Privacy_ | _🟠 Major_ | _⚡ Quick win_\\n\\n**Reject the diagnostic bypass in merge-gate callers.**\\n\\n<!-- cr-indicator-types:potential_issue -->"}]\n' "$bot" "$head_time" "$head_time"
+        printf '[{"id":8721,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n**Actionable comments posted: 1**\\n\\n<details>\\n<summary>scripts/foo.sh (1)</summary>\\n\\n_🔒 Security \\u0026 Privacy_ | _🟠 Major_ | _⚡ Quick win_\\n\\n**Reject the diagnostic bypass in merge-gate callers.**\\n\\n<!-- cr-indicator-types:potential_issue -->"}]\n' "$bot" "$head_time" "$head_time"
         ;;
       probe_clean_incremental)
         # #851 fixtures: no review object (reviews endpoint falls to its []
@@ -1973,6 +2002,32 @@ test_probe_summary_only_marker_is_findings() {
     fail "#814: expected rc 2/findings for a summary-only marker; got rc=$rc status=$status"
     sed 's/^/      /' "$dir/err.log" >&2 || true
   fi
+}
+
+# #878 hazard 6. The probe's summary scan took the newest `review`-class
+# comment as the summary, and `review` is classify_comment's fallback, so a
+# later CodeRabbit acknowledgement displaced the real summary and the marker
+# scan ran on the ack. The summary must be positively identified by its
+# leading marker, the crw_select_summary_comment rule.
+test_878_hazard6_ack_cannot_displace_the_summary() {
+  local scenario want_rc want_status want_observed dir rc status observed
+  while read -r scenario want_rc want_status want_observed; do
+    dir=$(make_case "878h6-$scenario" 600 true 30 3 2)
+    rc=$(run_probe_case "$dir" "$scenario")
+    status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+    observed=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+    if [ "$rc" = "$want_rc" ] && [ "$status" = "$want_status" ] && [ "$observed" = "$want_observed" ]; then
+      pass "#878 hazard 6: $scenario → rc $rc, status=$status, observed=$observed"
+    else
+      fail "#878 hazard 6: $scenario → rc=$rc status=$status observed=$observed (expected rc $want_rc, $want_status, $want_observed)"
+      sed 's/^/      /' "$dir/err.log" >&2 || true
+    fi
+  done <<'CASES'
+probe_ack_after_blocking_summary 2 findings terminal
+probe_ack_without_summary 7 no_review_yet awaiting-summary
+probe_blocking_summary_no_ack 2 findings terminal
+probe_ack_after_clean_summary 0 reported terminal
+CASES
 }
 
 test_probe_notice_after_review_is_not_complete() {
@@ -3990,6 +4045,7 @@ test_857_pause_predating_a_run_reaches_the_resume_path
 test_857_summary_selector_unit
 test_probe_reviews_api_failure_is_infra_not_clean
 test_probe_summary_only_marker_is_findings
+test_878_hazard6_ack_cannot_displace_the_summary
 test_probe_notice_after_review_is_not_complete
 test_probe_narration_after_review_is_awaiting_summary
 test_probe_narration_over_notice_surfaces_the_notice
