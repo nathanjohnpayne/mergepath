@@ -1054,7 +1054,62 @@ def _find_substitutions(s, quotes_are_literal=False):
 
     Only the outermost span is yielded -- anything nested inside is found
     when that body is lexed on its own.
+
+    Inside double quotes an apostrophe is literal (#1494).  See
+    `_ExactReadUnavailable` for how that reading falls back.
     """
+    if quotes_are_literal:
+        return _find_substitutions_legacy(s, quotes_are_literal)
+    try:
+        return _find_substitutions_exact(s)
+    except _ExactReadUnavailable:
+        return _find_substitutions_legacy(s, quotes_are_literal)
+
+
+def _find_substitutions_exact(s):
+    out = []
+    i = 0
+    n = len(s)
+    in_single = False
+    in_double = False
+    while i < n:
+        c = s[i]
+        if c == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if in_single:
+            if c == "'":
+                in_single = False
+            i += 1
+            continue
+        if c == '"':
+            in_double = not in_double
+            i += 1
+            continue
+        if c == "'" and not in_double:
+            in_single = True
+            i += 1
+            continue
+        if in_double and c == "$" and s[i + 1 : i + 2] == "{":
+            i = _simple_parameter_end(s, i)
+            continue
+        if c == "$" and s[i + 1 : i + 2] == "(" and s[i + 2 : i + 3] != "(":
+            end = _skip_balanced_parens(s, i + 1)
+            out.append((s[i + 2 : end - 1], i, end))
+            i = end
+            continue
+        if c == "`":
+            close = s.find("`", i + 1)
+            if close == -1:
+                break
+            out.append((s[i + 1 : close], i, close + 1))
+            i = close + 1
+            continue
+        i += 1
+    return out
+
+
+def _find_substitutions_legacy(s, quotes_are_literal=False):
     out = []
     i = 0
     n = len(s)
@@ -1484,7 +1539,16 @@ class Lexer:
                             seg2.parent = parent_seg
                             seg2.parent_is_capture = True
                     for r in ll.refs:
-                        cur_ll.refs.append(Ref(r.name, line, r.seg))
+                        # Re-line the reference but keep what the sub-lexer
+                        # learned about it.  A bare copy dropped
+                        # `in_error_word`, so ``v=`: "${U:?$PAT}"` `` -- which
+                        # bash writes to stderr past the capture -- read clean
+                        # (#1564 review).
+                        ref = Ref(r.name, line, r.seg, r.in_assign_prefix)
+                        ref.in_error_word = r.in_error_word
+                        ref.heredoc_owner = r.heredoc_owner
+                        ref.in_heredoc_body = r.in_heredoc_body
+                        cur_ll.refs.append(ref)
                     cur_ll.segments.extend(ll.segments)
                 line += inner.count("\n")
                 cur_level()["word"].append("`sub`")
@@ -1810,8 +1874,190 @@ class Lexer:
         finish_word()
 
 
+def _skip_backtick(text, i):
+    """Return the index just past the backtick closing the one at `i`.
+
+    A backslash escapes the next character, so `\\`` inside the body is data
+    and does not close it.  Returns len(text) when the body never closes.
+    """
+    j = i + 1
+    n = len(text)
+    while j < n:
+        if text[j] == "\\":
+            j += 2
+            continue
+        if text[j] == "`":
+            return j + 1
+        j += 1
+    return n
+
+
+class _ExactReadUnavailable(Exception):
+    """Raised when a double-quoted span holds a construct read only by parsing.
+
+    An apostrophe inside double quotes is literal in bash, but the structural
+    walkers below read it as opening a single-quoted span, lose the real
+    close, and scan a leaking file clean (#1494).  Reading it as literal is
+    only safe where the walker can also find where every construct inside the
+    string ENDS.  For a `$( )` that means parsing its body as command grammar
+    -- case patterns, `#` comments, nested parentheses, here-docs -- and every
+    structural attempt at that reopened verdicts the walkers already got right
+    (#1498).
+
+    So each walker has two readings.  The exact one accepts only text it can
+    read exactly: literal characters, backticks (bash ends one at the first
+    unescaped backtick), and `$( )`, `$(( ))` and `${ }` spans simple enough
+    that their end is unambiguous.  On anything else it raises this, and the
+    caller re-reads the WHOLE input with the walker's pre-#1494 `_legacy`
+    body, unchanged.  A file therefore gets either the exact reading or
+    exactly the reading it had before, never a mixture of the two.
+    """
+
+
+_CASE_WORD_RE = re.compile(r"(?:case|esac)(?![A-Za-z0-9_])")
+
+
+def _simple_substitution_end(text, i):
+    """End of the `$( )` at `i`, or raise when its body needs a parser.
+
+    Simple means the first unquoted `)` closes it: no unquoted `(`, `{`, `#`
+    or backtick, no `case`/`esac`, no here-doc, and no `$` expansion inside a
+    double-quoted word of the body.  Quoting inside the body is the inner
+    command's own.
+    """
+    j = i + 2
+    n = len(text)
+    quote = None
+    while j < n:
+        c = text[j]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            j += 1
+            continue
+        if c == "\\":
+            j += 2
+            continue
+        if quote == '"':
+            if c == '"':
+                quote = None
+            elif c == "`" or (c == "$" and text[j + 1 : j + 2] in ("(", "{")):
+                raise _ExactReadUnavailable()
+            j += 1
+            continue
+        if c in "'\"":
+            quote = c
+            j += 1
+            continue
+        if c in "({#`" or text.startswith("<<", j):
+            raise _ExactReadUnavailable()
+        if c == ")":
+            return j + 1
+        if (j == 0 or not (text[j - 1].isalnum() or text[j - 1] == "_")) \
+                and _CASE_WORD_RE.match(text, j):
+            raise _ExactReadUnavailable()
+        j += 1
+    raise _ExactReadUnavailable()
+
+
+def _simple_arithmetic_end(text, i):
+    """End of the `$(( ))` at `i`, or raise when it holds quotes or expansions."""
+    depth = 0
+    j = i + 1
+    n = len(text)
+    while j < n:
+        c = text[j]
+        if c in "'\"`\\{":
+            raise _ExactReadUnavailable()
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        j += 1
+    raise _ExactReadUnavailable()
+
+
+def _simple_parameter_end(text, i):
+    """End of the `${ }` at `i`, or raise when its word holds quotes or expansions."""
+    j = i + 2
+    n = len(text)
+    while j < n:
+        c = text[j]
+        if c == "}":
+            return j + 1
+        if c in "'\"`\\${":
+            raise _ExactReadUnavailable()
+        j += 1
+    raise _ExactReadUnavailable()
+
+
+def _double_quoted_construct_end(text, i):
+    """Exact end of an expansion starting at `i` inside double quotes, or None."""
+    if text[i] == "`":
+        return _skip_backtick(text, i)
+    if text[i] != "$":
+        return None
+    nxt = text[i + 1 : i + 2]
+    if nxt == "(":
+        if text[i + 2 : i + 3] == "(":
+            return _simple_arithmetic_end(text, i)
+        return _simple_substitution_end(text, i)
+    if nxt == "{":
+        return _simple_parameter_end(text, i)
+    return None
+
+
 def _skip_balanced_parens(text, start):
     """Return the index just past the `)` matching the `(` at `start`."""
+    try:
+        return _skip_balanced_parens_exact(text, start)
+    except _ExactReadUnavailable:
+        return _skip_balanced_parens_legacy(text, start)
+
+
+def _skip_balanced_parens_exact(text, start):
+    depth = 0
+    i = start
+    n = len(text)
+    quotes = []
+    while i < n:
+        c = text[i]
+        if quotes and quotes[-1] == "'":
+            if c == "'":
+                quotes.pop()
+            i += 1
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'" and not quotes:
+            quotes.append("'")
+            i += 1
+            continue
+        if c == '"':
+            if quotes:
+                quotes.pop()
+            else:
+                quotes.append('"')
+            i += 1
+            continue
+        if quotes:
+            end = _double_quoted_construct_end(text, i)
+            i = i + 1 if end is None else end
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def _skip_balanced_parens_legacy(text, start):
     depth = 0
     i = start
     n = len(text)
@@ -2720,6 +2966,59 @@ def _find_compound_close(text, open_idx):
     early even after the discovery regex stopped matching fake definitions in
     that data.
     """
+    try:
+        return _find_compound_close_exact(text, open_idx)
+    except _ExactReadUnavailable:
+        return _find_compound_close_legacy(text, open_idx)
+
+
+def _find_compound_close_exact(text, open_idx):
+    opener = text[open_idx]
+    closer = "}" if opener == "{" else ")"
+    depth = 0
+    i = open_idx
+    n = len(text)
+    quotes = []
+    while i < n:
+        c = text[i]
+        if quotes and quotes[-1] == "'":
+            if c == "'":
+                quotes.pop()
+            i += 1
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        if c == "#" and not quotes and (i == 0 or text[i - 1] in _WORD_BREAK_BEFORE_COMMENT):
+            eol = text.find("\n", i)
+            i = n if eol == -1 else eol
+            continue
+        if c == "'" and not quotes:
+            quotes.append("'")
+            i += 1
+            continue
+        if c == '"':
+            if quotes:
+                quotes.pop()
+            else:
+                quotes.append('"')
+            i += 1
+            continue
+        if quotes:
+            end = _double_quoted_construct_end(text, i)
+            i = i + 1 if end is None else end
+            continue
+        if c == opener:
+            depth += 1
+        elif c == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _find_compound_close_legacy(text, open_idx):
     opener = text[open_idx]
     closer = "}" if opener == "{" else ")"
     depth = 0
@@ -2916,8 +3215,67 @@ def _word_has_verbatim_positional(w):
 
     Single-quoted text never expands, `${1:+set}` is a constant alternate and
     `${#1}` is a length -- a helper is entitled to use the same two redacted
-    forms the check documents for callers.
+    forms the check documents for callers.  Inside double quotes an
+    apostrophe is literal (#1494); see `_ExactReadUnavailable` for how that
+    reading falls back.
     """
+    try:
+        return _word_has_verbatim_positional_exact(w)
+    except _ExactReadUnavailable:
+        return _word_has_verbatim_positional_legacy(w)
+
+
+def _word_has_verbatim_positional_exact(w):
+    i = 0
+    n = len(w)
+    in_double = False
+    while i < n:
+        c = w[i]
+        if c == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if c == '"':
+            in_double = not in_double
+            i += 1
+            continue
+        if c == "'" and not in_double:
+            j = w.find("'", i + 1)
+            i = n if j == -1 else j + 1
+            continue
+        if in_double and (c == "`" or (c == "$" and w[i + 1 : i + 2] == "(")):
+            # The body still expands: grade it as a word of its own.
+            end = _double_quoted_construct_end(w, i)
+            closed = c != "`" or (end - 1 > i and w[end - 1] == "`")
+            lo = i + 1 if c == "`" else i + 2
+            if _word_has_verbatim_positional_exact(w[lo : end - 1 if closed else end]):
+                return True
+            i = end
+            continue
+        if in_double and c == "$" and w[i + 1 : i + 2] == "{":
+            _simple_parameter_end(w, i)  # raises on a word it cannot read
+        if c == "$":
+            if i + 1 < n and w[i + 1] == "{":
+                j = i + 2
+                if j < n and w[j] in "#!":
+                    i += 2
+                    continue
+                m = re.match(r"([1-9][0-9]*|[@*])", w[j:])
+                if m:
+                    rest = w[j + m.end() : j + m.end() + 2]
+                    if rest[:1] == "+" or rest[:2] == ":+":
+                        i = j + m.end()
+                        continue
+                    return True
+                i += 2
+                continue
+            m = re.match(r"([1-9][0-9]*|[@*])", w[i + 1 :])
+            if m:
+                return True
+        i += 1
+    return False
+
+
+def _word_has_verbatim_positional_legacy(w):
     i = 0
     n = len(w)
     while i < n:
@@ -4174,6 +4532,264 @@ CORPUS = [
         "array-cmdsub-captured",
         MUST_NOT_FLAG,
         'args=($(printf \'%s\' "$GH_TOKEN"))\necho "n=${#args[@]}"\n',
+    ),
+    # #1494: an apostrophe inside double quotes is literal.  Read as an opening
+    # single quote, it made the array walker ignore the real `)` and silently
+    # consume the later emitter; each repro is paired with its no-apostrophe
+    # control.
+    (
+        "array-double-quoted-apostrophe-later-emitter",
+        MUST_FLAG,
+        'msgs=("don\'t panic")\n'
+        'echo "$GH_TOKEN"\n',
+    ),
+    (
+        "array-double-quoted-no-apostrophe-later-emitter-control",
+        MUST_FLAG,
+        'msgs=("do not panic")\n'
+        'echo "$GH_TOKEN"\n',
+    ),
+    (
+        "array-double-quoted-apostrophe-cmdsub-stderr",
+        MUST_FLAG,
+        'msgs=("don\'t $(printf \'%s\' "$GH_TOKEN" >&2)")\n',
+    ),
+    (
+        "array-double-quoted-no-apostrophe-cmdsub-stderr-control",
+        MUST_FLAG,
+        'msgs=("do not $(printf \'%s\' "$GH_TOKEN" >&2)")\n',
+    ),
+    # A quote inside a substitution written in the double-quoted element belongs
+    # to the inner command and must not close the outer string (#1494 review).
+    (
+        "array-double-quoted-nested-substitution-quote-context",
+        MUST_FLAG,
+        'args=("$(printf \'%s\' \'")\')"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        "array-double-quoted-backtick-quote-context",
+        MUST_FLAG,
+        'args=("`printf \'%s\' \'")\'`"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        "array-double-quoted-backtick-quote-context-no-emitter-control",
+        MUST_NOT_FLAG,
+        'args=("`printf \'%s\' \'")\'`"); echo ok\n',
+    ),
+    (
+        "array-double-quoted-escaped-backtick-quote-context",
+        MUST_FLAG,
+        'args=("`printf \'%s\' \'\\`")\'`"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        "array-double-quoted-escaped-backtick-no-emitter-control",
+        MUST_NOT_FLAG,
+        'args=("`printf \'%s\' \'\\`")\'`"); echo ok\n',
+    ),
+    # A backtick substitution ends exactly, so an apostrophe after it is still
+    # literal.
+    (
+        "array-double-quoted-backtick-then-apostrophe",
+        MUST_FLAG,
+        'msgs=("`printf x` don\'t")\n'
+        'echo "$GH_TOKEN"\n',
+    ),
+    # A backtick body's references keep what its lexer learned: an error word
+    # inside it is still written by the expansion itself, past the capture
+    # (#1564 review).  The bare spelling was a miss on main as well.
+    (
+        "backtick-double-quoted-error-word",
+        MUST_FLAG,
+        'unset UNSET_VALUE\n'
+        'v="`: "${UNSET_VALUE:?$GH_TOKEN}"`"\n',
+    ),
+    (
+        "backtick-bare-error-word",
+        MUST_FLAG,
+        'unset UNSET_VALUE\n'
+        'v=`: "${UNSET_VALUE:?$GH_TOKEN}"`\n',
+    ),
+    # A simple `$( )` has an unambiguous end, so an apostrophe after it is
+    # still literal, and apostrophes around simple expansions keep the verdict
+    # main reached (#1564 review).
+    (
+        "array-double-quoted-apostrophe-after-substitution",
+        MUST_FLAG,
+        'msgs=("$(printf x) don\'t")\n'
+        'echo "$GH_TOKEN"\n',
+    ),
+    (
+        "array-double-quoted-apostrophes-around-substitution",
+        MUST_FLAG,
+        'x=("\'$(printf x)\'"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        "array-double-quoted-apostrophes-around-arithmetic",
+        MUST_FLAG,
+        'x=("\'$((1))\'"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        "array-double-quoted-parameter-word-nested-quotes",
+        MUST_FLAG,
+        'x=("\'${x:-"a\'b"}$(printf %s "$GH_TOKEN" >&2)")\n',
+    ),
+    (
+        # The quoted `}` is not the end of the expansion; reading it as one
+        # would leave the trailing apostrophe to open a span.
+        "array-double-quoted-parameter-word-quoted-brace",
+        MUST_FLAG,
+        'x=("\'${x:-"}"}\'"); echo "$GH_TOKEN"\n',
+    ),
+    # A fallback re-read must not lose a backtick boundary the walk relied
+    # on, and a double-quoted backtick's shell state stays in its subshell
+    # (#1564 review).
+    (
+        "array-double-quoted-backtick-then-nested-substitution",
+        MUST_FLAG,
+        'x=("`echo ")"` don\'t $( (:) )"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        "backtick-double-quoted-xtrace-stays-in-subshell",
+        MUST_NOT_FLAG,
+        'x="`set -x`"\n'
+        ': "$GH_TOKEN"\n',
+    ),
+    (
+        "backtick-double-quoted-escaped-delimiter-safe",
+        MUST_NOT_FLAG,
+        'x="`printf \'%s\' \'\\`\'`"; : "$GH_TOKEN"\n',
+    ),
+    # Declared in KNOWN_MISSES: a `$( )` whose end needs its body parsed sends
+    # the walk back to the pre-#1494 reading, where a later apostrophe opens a
+    # span.
+    (
+        "array-double-quoted-apostrophe-after-nested-substitution",
+        MUST_NOT_FLAG,
+        'msgs=("$( (printf x) ) don\'t")\n'
+        'echo "$GH_TOKEN"\n',
+    ),
+    # Here-doc delimiters inside the element's substitution keep their verdicts:
+    # `<<E\<newline>OF` ends at EOF, and `<<''` ends at a blank line with its
+    # body read as data (#1498 review, r4129909600 / r4129909632).
+    (
+        "array-heredoc-continued-delimiter-later-emitter",
+        MUST_FLAG,
+        'args=("$(cat <<E\\\n'
+        'OF\n'
+        'data\n'
+        'EOF\n'
+        ')"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        "array-heredoc-quoted-empty-delimiter-safe",
+        MUST_NOT_FLAG,
+        'args=("$(cat <<\'\'\n'
+        'case x in\n'
+        '\n'
+        ')"); : "$GH_TOKEN"\n',
+    ),
+    # Function bodies: the same rule in the function matcher and the positional
+    # decider (#1494), including the nested `$( )` and backtick cases (#1494
+    # review).
+    (
+        "helper-double-quoted-apostrophe",
+        MUST_FLAG,
+        'die() { echo "can\'t: $1" >&2; }\n'
+        'die "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-double-quoted-no-apostrophe-control",
+        MUST_FLAG,
+        'die() { echo "cannot: $1" >&2; }\n'
+        'die "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-double-quoted-nested-substitution-quote-context",
+        MUST_FLAG,
+        'die() { echo "$(printf \'%s\' \'")\') $1" >&2; }\n'
+        'die "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-double-quoted-nested-substitution-positional",
+        MUST_FLAG,
+        'die() { echo "$(printf \'%s\' \'"\')$1" >&2; }\n'
+        'die "$GH_TOKEN"\n',
+    ),
+    # Declared in KNOWN_MISSES: the function matcher now finds this body, but
+    # the Lexer still reads a backtick inside double quotes as string text.
+    (
+        "helper-double-quoted-backtick-quote-context",
+        MUST_NOT_FLAG,
+        'die() { echo "`printf \'%s\' \'")\'`  $1" >&2; }\n'
+        'die "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-backtick-single-quoted-positional-control",
+        MUST_NOT_FLAG,
+        'die() { echo "`printf \'%s\' \'$1\'`"; }\n'
+        'die "$GH_TOKEN"\n',
+    ),
+    # A redefinition replaces the earlier body in helper discovery, so losing
+    # its close dropped the emitter the first call uses (#1498 review,
+    # r4129909620).
+    (
+        "helper-redefined-with-double-quoted-backtick",
+        MUST_FLAG,
+        'die() { echo "$1"; }\n'
+        'die "$GH_TOKEN"\n'
+        'die() { echo "`printf \'%s\' \'"}\'` $1"; }\n',
+    ),
+    # Xtrace spans: an uncalled function's `set +x` keeps its body span.
+    (
+        "xtrace-disable-after-double-quoted-apostrophe-in-function",
+        MUST_FLAG,
+        'set -x\n'
+        'quiet() {\n'
+        '  echo "don\'t trace"\n'
+        '  set +x\n'
+        '}\n'
+        ': "$GH_TOKEN"\n',
+    ),
+    (
+        "xtrace-disable-after-double-quoted-no-apostrophe-control",
+        MUST_FLAG,
+        'set -x\n'
+        'quiet() {\n'
+        '  echo "do not trace"\n'
+        '  set +x\n'
+        '}\n'
+        ': "$GH_TOKEN"\n',
+    ),
+    (
+        "xtrace-function-nested-substitution-quote-context",
+        MUST_FLAG,
+        'set -x\n'
+        'quiet() {\n'
+        '  printf \'%s\' "$(printf \'%s\' \'")\')" >/dev/null\n'
+        '  set +x\n'
+        '}\n'
+        ': "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-xtrace-nested-substitution-quote-context",
+        MUST_FLAG,
+        'leak() {\n'
+        '  set -x\n'
+        '  : "$(printf \'%s\' \'"\')$1"\n'
+        '}\n'
+        'set +x\n'
+        'leak "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-xtrace-nested-substitution-single-quoted-control",
+        MUST_NOT_FLAG,
+        'leak() {\n'
+        '  set -x\n'
+        '  : "$(printf \'%s\' \'"\')"\'$1\'\n'
+        '}\n'
+        'set +x\n'
+        'leak "$GH_TOKEN"\n'
+        'echo ok\n',
     ),
     (
         # A SUBSHELL inside an array assignment's absorbed `$( )`.  The same
@@ -5644,6 +6260,25 @@ CORPUS.extend(_generated_corpus())
 # fails when an undeclared disagreement appears AND when a declared entry stops
 # disagreeing, so neither list can quietly rot.
 KNOWN_MISSES = {
+    "helper-double-quoted-backtick-quote-context": (
+        "a backtick substitution inside a double-quoted word of a helper "
+        "body.  The function matcher now finds the helper's real close "
+        "(#1494), but the Lexer reads a backtick inside double quotes as "
+        "string text, so a `\"` in its body ends the word and a later `'` "
+        "swallows the call.  Parsing it as a nested substitution needs the "
+        "nested line's pragma and shell-state isolation as well, which #1564 "
+        "review measured reopening verdicts main got right.  Main misses it "
+        "the same way.  Tracked in #1565"
+    ),
+    "array-double-quoted-apostrophe-after-nested-substitution": (
+        "an apostrophe after a `$( )` whose end cannot be found without "
+        "parsing its body as command grammar -- here a nested subshell; case "
+        "patterns, comments and here-docs are the same class.  #1498 measured "
+        "every structural attempt at that body reopening a verdict the walker "
+        "already got right, so on such a body the walker re-reads the whole "
+        "input with its pre-#1494 reading (see `_ExactReadUnavailable`), "
+        "which is never worse than before.  Tracked in #1565"
+    ),
     "numeric-operand-boundary-type": (
         "a builtin whose operand is a NAME reproduces it in its diagnostic "
         "(`type: <value>: not found`) and reads clean -- the same boundary "
