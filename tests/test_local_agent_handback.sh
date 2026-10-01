@@ -290,7 +290,9 @@ if [ -r "$LANE" ] && command -v yq >/dev/null 2>&1; then
   # Claude, and refuses a non-reviewer token (Codex on #1555). Runs the real
   # step against a gh stub and a resolver stub that records what it was given.
   LFIX="$WORKDIR/lane"
-  mkdir -p "$LFIX/scripts" "$LFIX/bin"
+  mkdir -p "$LFIX/scripts/lib" "$LFIX/bin" "$LFIX/.github"
+  cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$LFIX/scripts/lib/"
+  printf 'available_reviewers:\n  - nathanpayne-claude\n  - nathanpayne-codex\n' >"$LFIX/.github/review-policy.yml"
   printf '%s\n' "$run_step" >"$LFIX/step.sh"
   cat >"$LFIX/scripts/resolve-pr-threads.sh" <<'R'
 #!/usr/bin/env bash
@@ -311,12 +313,13 @@ G
   lane_run nathanpayne-codex; c1=$?; l1="$(cat "$LFIX/lane.log")"
   lane_run nathanjohnpayne; c2=$?; l2="$(cat "$LFIX/lane.log")"
   lane_run ""; c3=$?; l3="$(cat "$LFIX/lane.log")"
+  lane_run nathanpayne-rogue; c4=$?; l4="$(cat "$LFIX/lane.log")"
   set -e
   if [ "$c1" -eq 0 ] && [ "$l1" = "agent=codex identity=nathanpayne-codex args=12 --repo o/r --resolve-actioned" ] \
-     && [ "$c2" -ne 0 ] && [ -z "$l2" ] && [ "$c3" -ne 0 ] && [ -z "$l3" ]; then
-    pass "lane resolves as the reviewer its token reads as, and refuses an author or unreadable token before resolving"
+     && [ "$c2" -ne 0 ] && [ -z "$l2" ] && [ "$c3" -ne 0 ] && [ -z "$l3" ] && [ "$c4" -ne 0 ] && [ -z "$l4" ]; then
+    pass "lane resolves as the listed reviewer its token reads as, and refuses an author, unlisted reviewer-shaped or unreadable token before resolving"
   else
-    fail "lane identity: codex rc=$c1 '$l1'; author rc=$c2 '$l2'; empty rc=$c3 '$l3'"
+    fail "lane identity: codex rc=$c1 '$l1'; author rc=$c2 '$l2'; empty rc=$c3 '$l3'; unlisted rc=$c4 '$l4'"
   fi
 else
   fail "thread-resolution-lane.yml missing, or yq unavailable to check it"

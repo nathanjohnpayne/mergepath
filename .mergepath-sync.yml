@@ -1559,6 +1559,7 @@ paths:
     consumers: all
     requires:
       - "scripts/resolve-pr-threads.sh"
+      - "scripts/lib/reviewers-helpers.sh"   # available_reviewers membership of the lane token
   # Claude Code SessionStart hook: runs the capability probe in a cloud
   # session only (CLAUDE_CODE_REMOTE=true) and prints the tier.
   - path: scripts/hooks/cloud-session-start.sh

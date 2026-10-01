@@ -32,7 +32,8 @@ run-name: "Thread resolution lane: PR #${{ github.event.client_payload.pr }} [${
 # Auth model: REVIEWER_ASSIGNMENT_TOKEN, the reviewer PAT already used by the
 # daily rollup and weekly sweep. Bootstrap lets it belong to any selected
 # reviewer, so the expected identity is the login the token reads as, and it
-# must be a nathanpayne-<agent> reviewer (Codex on #1555). The resolver then
+# must be a nathanpayne-<agent> reviewer listed in the default branch's
+# .github/review-policy.yml available_reviewers (Codex on #1555). The resolver then
 # verifies the token with identity-check.sh --expect-write-identity before
 # any mutation, and every resolve is read back (isResolved:true).
 
@@ -97,6 +98,13 @@ jobs:
             nathanpayne-*) export GH_AS_REVIEWER_IDENTITY="$login" MERGEPATH_AGENT="${login#nathanpayne-}" ;;
             *) echo "ERROR: REVIEWER_ASSIGNMENT_TOKEN reads as '${login:-nothing}', not a nathanpayne-<agent> reviewer." >&2; exit 1 ;;
           esac
+          # The shape is not membership: only a reviewer this repository's
+          # default-branch policy lists may resolve threads (Codex on #1555).
+          . scripts/lib/reviewers-helpers.sh
+          if ! login_is_available_reviewer "$login" .github/review-policy.yml; then
+            echo "ERROR: REVIEWER_ASSIGNMENT_TOKEN reads as '$login', which .github/review-policy.yml available_reviewers does not list." >&2
+            exit 1
+          fi
           case "$PR_NUMBER" in
             ''|*[!0-9]*) echo "ERROR: pr must be a PR number; got '$PR_NUMBER'" >&2; exit 1 ;;
           esac
