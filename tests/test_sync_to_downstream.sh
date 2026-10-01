@@ -2203,6 +2203,22 @@ wf_make_audit_output() {  # <file> <drift-lines-per-consumer>
   done
 }
 
+# The summarise step recognises a consumer header only by exact equality
+# with one built from the manifest's `.consumers[]`, so every fixture
+# consumer below has to be listed here. `foo+bar` is a name the manifest
+# check accepts but a character-class header regex would not (#1203).
+cat >"$WFDIR/manifest.yml" <<'MANIFEST'
+consumers:
+  - { name: alpha,      repo: x/alpha }
+  - { name: bravo,      repo: x/bravo }
+  - { name: charlie,    repo: x/charlie }
+  - { name: delta,      repo: x/delta }
+  - { name: epsilon,    repo: x/epsilon }
+  - { name: matchline,  repo: nathanjohnpayne/matchline }
+  - { name: foo+bar,    repo: nathanjohnpayne/foo+bar }
+  - { name: swipewatch, repo: nathanjohnpayne/swipewatch }
+MANIFEST
+
 wf_run_steps() {  # runs both steps in a clean dir; sets WF_RC / WF_TEXT
   local dir=$1
   WF_RC=0
@@ -2216,6 +2232,7 @@ wf_run_steps() {  # runs both steps in a clean dir; sets WF_RC / WF_TEXT
     ISSUE_TITLE="Cross-repo propagation drift detected" \
     REPO="nathanjohnpayne/mergepath" \
     RUN_URL="https://github.com/nathanjohnpayne/mergepath/actions/runs/1" \
+    DRIFT_AUDIT_MANIFEST="$WFDIR/manifest.yml" \
       bash "$WFDIR/summarise-step.sh" > /dev/null && \
     cd "$dir" && \
     PATH="$WFDIR/stub-bin:$PATH" \
@@ -2290,9 +2307,11 @@ echo "PASS: every consumer is still named with its drift counts in a truncated r
 # the clone line opened a consumer section of its own: the real header was
 # reported as `in sync 0, drifted 0, missing 0, skipped 0` and the clone line
 # carried the counts (#1203, run 36396222388). The fixture is the interleaved
-# shape that run produced, plus a refresh line and an ERROR line.
+# shape that run produced, plus a refresh line and an ERROR line, and a
+# `foo+bar` consumer: a header shape narrower than the manifest's own name
+# rule would miss it and fold its counts into `matchline` above it.
 LOGS="$WFDIR/interleaved"; mkdir -p "$LOGS"
-for c in matchline swipewatch; do
+for c in matchline foo+bar swipewatch; do
   printf '%s (nathanjohnpayne/%s)\n' "$c" "$c"
   printf '[sync-to-downstream] cloning nathanjohnpayne/%s into /home/runner/.cache/mergepath-sync/%s (depth=1)\n' "$c" "$c"
   printf '[sync-to-downstream] refreshing cached clone at /home/runner/.cache/mergepath-sync/%s\n' "$c"
@@ -2305,10 +2324,12 @@ for c in matchline swipewatch; do
   printf '\n'
 done > "$LOGS/audit-output.txt"
 ( cd "$LOGS" && GITHUB_STEP_SUMMARY="$LOGS/step-summary.md" \
+    DRIFT_AUDIT_MANIFEST="$WFDIR/manifest.yml" \
     bash "$WFDIR/summarise-step.sh" > /dev/null 2>&1 ) \
   || wf_fail "summarise step failed on interleaved stdout/stderr audit output"
 expected_summary="$(printf '%s\n' \
   'matchline (nathanjohnpayne/matchline) — in sync 3, drifted 2, missing 1, skipped 1' \
+  'foo+bar (nathanjohnpayne/foo+bar) — in sync 3, drifted 2, missing 1, skipped 1' \
   'swipewatch (nathanjohnpayne/swipewatch) — in sync 3, drifted 2, missing 1, skipped 1')"
 [ "$(cat "$LOGS/consumer-summary.txt")" = "$expected_summary" ] \
   || wf_fail "interleaved log lines corrupted the per-consumer summary:
@@ -2317,6 +2338,19 @@ $expected_summary
 --- got
 $(cat "$LOGS/consumer-summary.txt")"
 echo "PASS: stderr log lines interleaved with the audit report do not steal a consumer's counts (#1203)"
+
+# An unreadable manifest leaves the header list empty. That must warn and take
+# the announced "summary unavailable" fallback rather than fail the job or
+# read as an empty roll-up.
+( cd "$LOGS" && GITHUB_STEP_SUMMARY="$LOGS/step-summary.md" \
+    DRIFT_AUDIT_MANIFEST="$WFDIR/no-such-manifest.yml" \
+    bash "$WFDIR/summarise-step.sh" > "$LOGS/nomanifest.out" 2>&1 ) \
+  || wf_fail "summarise step must not fail the job on an unreadable manifest: $(cat "$LOGS/nomanifest.out")"
+grep -q '^(per-consumer summary unavailable' "$LOGS/consumer-summary.txt" \
+  || wf_fail "unreadable manifest did not produce the announced fallback: $(cat "$LOGS/consumer-summary.txt")"
+grep -q '::warning::Could not read the consumer list' "$LOGS/nomanifest.out" \
+  || wf_fail "unreadable manifest was not warned about: $(cat "$LOGS/nomanifest.out")"
+echo "PASS: an unreadable consumer manifest falls back to the announced summary-unavailable note (#1203)"
 
 # --- (4) A small audit is NOT truncated ---------------------------------
 #

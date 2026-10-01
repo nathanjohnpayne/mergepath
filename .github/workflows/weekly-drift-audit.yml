@@ -262,17 +262,29 @@ jobs:
           # prefixes rather than by field index because the detail text
           # after the path is free-form.
           #
-          # The header is matched by its exact `<name> (<owner>/<repo>)`
-          # shape, not by "column 0 and ends in )". audit-output.txt holds
-          # the script's stdout AND stderr (2>&1 above), and its stderr
-          # log() lines also sit at column 0: `[sync-to-downstream]
-          # cloning <owner>/<repo> into <path> (depth=1)` ends in `)`. The
-          # loose match took that clone line, which lands right after each
+          # A header is recognised only by exact equality with one that
+          # run_audit() prints for a manifest consumer, built here from the
+          # same `.consumers[]` list. audit-output.txt holds the script's
+          # stdout AND stderr (2>&1 above), and its stderr log() lines also
+          # sit at column 0: `[sync-to-downstream] cloning <owner>/<repo>
+          # into <path> (depth=1)` ends in `)`. The old "column 0 and ends
+          # in )" match took that clone line, which lands right after each
           # consumer's header, as a consumer of its own, so the real header
           # reported all-zero counts and the clone line carried the
-          # consumer's counts (#1203, run 36396222388).
+          # consumer's counts (#1203, run 36396222388). Matching a header
+          # by a narrower shape instead would still have to guess which
+          # names the manifest accepts, and a name outside the guess would
+          # silently fold its counts into the consumer before it.
+          manifest="${DRIFT_AUDIT_MANIFEST:-.mergepath-sync.yml}"
+          if ! yq -r '.consumers[] | (.name + " (" + .repo + ")")' "$manifest" > consumer-headers.txt; then
+            echo "::warning::Could not read the consumer list from ${manifest}; no consumer header can be recognised."
+            : > consumer-headers.txt
+          fi
+          # FILENAME, not NR == FNR, so an empty header list cannot make the
+          # audit stream itself read as more headers.
           awk '
-            /^[A-Za-z0-9._-]+ \([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\)$/ { consumer = $0; order[++n] = consumer; next }
+            FILENAME == ARGV[1] { header[$0] = 1; next }
+            ($0 in header) { consumer = $0; order[++n] = consumer; next }
             consumer == "" { next }
             index($0, "  ✓ ") == 1 { ok[consumer]++;      next }
             index($0, "  ✗ ") == 1 { drifted[consumer]++; next }
@@ -284,7 +296,7 @@ jobs:
                 printf "%s — in sync %d, drifted %d, missing %d, skipped %d\n", c, ok[c] + 0, drifted[c] + 0, missing[c] + 0, skipped[c] + 0
               }
             }
-          ' audit-output.txt > consumer-summary.txt
+          ' consumer-headers.txt audit-output.txt > consumer-summary.txt
 
           if [ ! -s consumer-summary.txt ]; then
             # No consumer header line was recognised. Do not fail the job —
