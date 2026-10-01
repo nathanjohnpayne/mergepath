@@ -1903,19 +1903,28 @@ resume_pending_codex_request() {
   # not resumable. Malformed trusted marker evidence fails closed, as it does
   # in preserve_final_request_timeout. Only a missing marker helper (a partial
   # install) skips resuming, which is the pre-#1550 behaviour.
-  local marker_state
+  # A `current` marker settles only the request it is bound to: the marker
+  # parser recognizes exact lowercase commands while the request selector also
+  # recognizes case variants, so a newer selected command can postdate a marker
+  # the parser still calls current. Compare the bound trigger id, exactly as
+  # preserve_final_request_timeout does.
+  local marker_json marker_state
   if [ "$CODEX_FAILURE_MARKERS_OK" != true ] \
      || ! command -v codex_phase4a_timeout_marker_state >/dev/null 2>&1; then
     log "terminal-marker helper unavailable — not resuming (#1550)"
     return 1
   fi
-  marker_state=$(codex_phase4a_timeout_marker_state "$HEAD_SHA" "$AUTHOR_IDENTITY" "$comments" \
-    | jq -r '.state // "malformed"' 2>/dev/null) || marker_state=malformed
+  marker_json=$(codex_phase4a_timeout_marker_state "$HEAD_SHA" "$AUTHOR_IDENTITY" "$comments" 2>/dev/null) \
+    || marker_json='{}'
+  marker_state=$(printf '%s' "$marker_json" | jq -r '.state // "malformed"' 2>/dev/null) || marker_state=malformed
   case "$marker_state" in
     none|stale|superseded) ;;
     current)
-      log "pending request $(printf '%s' "$pending" | jq -r .id) has Phase 4a timeout marker state 'current' — not resuming"
-      return 1
+      if printf '%s' "$marker_json" | jq -e --argjson trigger "$pending" \
+           '.trigger_comment_id == $trigger.id' >/dev/null 2>&1; then
+        log "pending request $(printf '%s' "$pending" | jq -r .id) has a current Phase 4a timeout marker — not resuming"
+        return 1
+      fi
       ;;
     *) die 3 "cannot classify the pending Codex request for resume: trusted terminal-marker evidence is malformed" ;;
   esac

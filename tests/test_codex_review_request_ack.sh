@@ -1186,7 +1186,7 @@ test_request_with_timeout_marker_is_not_resumed() {
   set_clock_after_request "$dir" 30
   rc=$(run_case "$dir" absent 1)
   count=$(trigger_count "$dir")
-  if [ "$count" = 1 ] && grep -q "timeout marker state 'current' — not resuming" "$dir/err.log"; then
+  if [ "$count" = 1 ] && grep -q "has a current Phase 4a timeout marker — not resuming" "$dir/err.log"; then
     pass "#1550: a request that already holds a current timeout marker is not resumed"
   else
     fail "#1550 marked: exit $rc, $count trigger(s); stderr=$(cat "$dir/err.log")"
@@ -1290,6 +1290,25 @@ test_expired_rerun_never_resumes() {
     pass "#1550: the post-expiry re-run posts instead of resuming, so the chain cannot loop"
   else
     fail "#1550 re-run guard: exit $rc, $count trigger(s); stderr=$(cat "$dir/err.log")"
+  fi
+}
+
+# A current marker bound to an OLDER lowercase request does not settle a newer
+# case-variant request the selector picked.
+test_marker_for_older_request_does_not_block_resume() {
+  local dir rc count
+  dir=$(make_case "resume-marker-older" 0 0 60)
+  jq -cn '{id:899,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:"2026-06-03T23:59:00Z"}' >>"$dir/state/comments.jsonl"
+  jq -cn '{id:901,user:{login:"nathanjohnpayne"},body:"<!-- mergepath-phase-4a-terminal:v1 provider=codex outcome=timeout head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa trigger_comment_id=899 -->",created_at:"2026-06-03T23:59:30Z"}' >>"$dir/state/comments.jsonl"
+  jq -cn --arg created "$RESUME_TRIGGER_AT" '{id:900,user:{login:"nathanjohnpayne"},body:"@CODEX REVIEW",created_at:$created}' >>"$dir/state/comments.jsonl"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 30
+  rc=$(run_case "$dir" resume-running 1)
+  count=$(trigger_count "$dir")
+  if [ "$rc" = 0 ] && [ "$count" = 0 ] && grep -q 'resuming pending request 900' "$dir/err.log"; then
+    pass "#1550: a current marker bound to an older request does not block resuming a newer case-variant request"
+  else
+    fail "#1550 older-marker: exit $rc, $count trigger(s); stderr=$(cat "$dir/err.log")"
   fi
 }
 
@@ -1425,6 +1444,7 @@ test_resume_survives_future_committer_date
 test_resume_read_failure_is_retried_not_reposted
 test_malformed_timeout_marker_fails_closed_on_resume
 test_expired_rerun_never_resumes
+test_marker_for_older_request_does_not_block_resume
 test_request_with_timeout_marker_is_not_resumed
 test_resume_past_deadline_posts_new_request
 test_resumed_request_expiry_posts_new_request
