@@ -51,7 +51,13 @@ pinned_sha256() { # <asset>
   esac
 }
 DRY_RUN=false
-[ "${1:-}" = "--dry-run" ] && DRY_RUN=true
+# Only the documented forms: an unknown or extra argument (a typo such as
+# --dryrun) must refuse, never fall through to a real install (Codex on #1552).
+case "$#:${1:-}" in
+  0:) ;;
+  1:--dry-run) DRY_RUN=true ;;
+  *) echo "cloud-setup: usage: bash scripts/cloud-setup.sh [--dry-run]" >&2; exit 2 ;;
+esac
 
 log() { echo "cloud-setup: $*" >&2; }
 

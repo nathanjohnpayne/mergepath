@@ -248,6 +248,21 @@ else
   fail "setup pinned: rc=$rc err=$(cat "$WORKDIR/setup.err")"
 fi
 
+# Only no argument or --dry-run: a typo refuses before anything is fetched.
+for bad in --dryrun "--dry-run extra" -n; do
+  : >"$WORKDIR/curl.log"
+  set +e
+  # shellcheck disable=SC2086
+  env -i HOME="$WORKDIR" PATH="$SBIN" MERGEPATH_GH_VERSION="$VER" MERGEPATH_TOOL_PREFIX="$WORKDIR/p-badarg" \
+    "$SBIN/bash" "$SETUP" $bad >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+  set -e
+  if [ "$rc" -eq 2 ] && [ ! -s "$WORKDIR/curl.log" ] && [ ! -e "$WORKDIR/p-badarg/bin/gh" ] && grep -q "usage:" "$WORKDIR/setup.err"; then
+    pass "setup, argument '$bad': refused (exit 2) before any download"
+  else
+    fail "setup argument '$bad': rc=$rc curl=$(cat "$WORKDIR/curl.log")"
+  fi
+done
+
 # gh already present: nothing is downloaded.
 ln -sf "$WORKDIR/p-good/bin/gh" "$SBIN/gh"
 : >"$WORKDIR/curl.log"

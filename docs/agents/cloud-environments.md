@@ -14,13 +14,13 @@ The environment configuration lives in two web UIs (claude.ai and chatgpt.com) a
 | --- | :---: | :---: | :---: |
 | Read the repository and its PRs | yes | yes | yes, with agent internet on |
 | Commit and push the session's branch | yes | yes | yes |
-| Author writes (`gh pr create`, `gh pr comment` / `edit` / `merge`) as the author | yes | yes, with a provisioned author PAT | yes, with a provisioned author PAT |
+| Author writes (`gh pr create`, `gh pr comment` / `edit`) as the author | yes | yes, with a provisioned author PAT | yes, with a provisioned author PAT |
 | Reviewer writes (`gh pr review`, `gh pr comment`) as `nathanpayne-<agent>` | yes | yes, with a provisioned reviewer PAT | yes, with a provisioned reviewer PAT |
 | Trigger `@codex review` / `@coderabbitai` | yes | yes | yes |
 | GraphQL-only helpers (`scripts/resolve-pr-threads.sh`) | yes | only for operations the proxy serves; otherwise exit 6 | unmeasured |
 | Push a second branch (propagation waves) | yes | **no**: the proxy accepts pushes only to the session's branch | unmeasured |
 | Reach another repository (consumer fleet) | yes | **no**: the proxy scopes the API to the attached repositories | unmeasured |
-| Merge to a protected default branch | human | no | no |
+| Merge to a protected default branch | yes: the agent merges as the author once the merge gates pass, never past `human-hold` | no: hand the merge to a local session | no: hand the merge to a local session |
 
 The **no** rows are properties of the Claude cloud GitHub proxy, not credential gaps. A better token does not change them. Route that work to a local session or to CI.
 
