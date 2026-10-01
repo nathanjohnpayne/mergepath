@@ -33,6 +33,7 @@ if [ "$#" -eq 0 ]; then
   echo "gh-as-reviewer: usage: scripts/gh-as-reviewer.sh -- gh pr review ..." >&2
   exit 1
 fi
+gh_require_direct_gh_payload "gh-as-reviewer" "$@" || exit 1
 
 set +e
 gh_resolve_token_for_identity "$REVIEWER" "OP_PREFLIGHT_REVIEWER_PAT" "gh-as-reviewer"
@@ -44,9 +45,13 @@ fi
 
 TOKEN="$GH_RESOLVED_TOKEN"
 set +e
+# The verified token goes to github.com only. Any other host gets the resolver's
+# non-credential sentinel in place of an Enterprise token or stored login, so
+# it can neither carry the write nor receive the PAT (see gh-token-resolver.sh).
 (
   unset GITHUB_TOKEN
-  GH_TOKEN="$TOKEN" "$@"
+  GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+    GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" "$@"
 )
 WRAPPED_RC=$?
 set -e

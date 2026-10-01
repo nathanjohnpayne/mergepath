@@ -70,6 +70,7 @@ STUB
 cat >>"$STUB_DIR/gh" <<'STUB'
 tok="${GH_TOKEN:-}"
 [ -n "$tok" ] && printf '%s\n' "$tok" >>"$SEEN"
+[ -n "${STUB_HOST_LOG:-}" ] && printf '%s %s\n' "${GH_HOST:-<unset>}" "$*" >>"$STUB_HOST_LOG"
 if [ "$1 $2" = "auth token" ] && [ "$#" -eq 2 ]; then
   # gh auth token (no --user): the ACTIVE account, controlled by STUB_KEYRING_ACTIVE
   [ -n "${STUB_KEYRING_ACTIVE:-}" ] || exit 1
@@ -94,6 +95,9 @@ while [ "$#" -gt 0 ]; do
     -X) method="$2"; shift 2 ;;
     --jq) jqexpr="$2"; shift 2 ;;
     -f) shift 2 ;;
+    # identity-check.sh pins its write-mode requests to github.com (#1541);
+    # this fixture serves github.com only, like the real token it models.
+    --hostname) [ "$2" = "github.com" ] || { echo "stub: no credentials for $2" >&2; exit 4; }; shift 2 ;;
     *) path="$1"; shift ;;
   esac
 done
@@ -107,9 +111,19 @@ case "$tok" in
   ghp_noscope) login=nathanjohnpayne; scopes="gist, read:org"; perms='{"pull":true,"push":true}' ;;
   ghp_pubonly) login=nathanjohnpayne; scopes="public_repo"; perms='{"pull":true,"push":true}' ;;
   ghs_author) login=nathanjohnpayne ;;
+  opaque-author) login=nathanjohnpayne; perms='{"pull":true,"push":true}' ;;  # unidentifiable form
+  0123456789abcdef0123456789abcdef01234567) login=nathanpayne-claude; scopes="repo" ;;  # legacy classic PAT
   proxy-injected) login=nathanjohnpayne; perms='{"pull":true,"push":true}' ;;
 esac
 status=200; body=""
+if [ "$tok" = "opaque-flap" ]; then
+  # An unidentifiable author token whose first GET /user fails transiently.
+  login=nathanjohnpayne; perms='{"pull":true,"push":true}'
+  if [ "$path" = "user" ]; then
+    n=$(wc -l <"$STUB_FLAP_COUNT" | tr -d ' '); echo x >>"$STUB_FLAP_COUNT"
+    if [ "$n" -eq 0 ]; then status=503; body='{"message":"Service Unavailable"}'; fi
+  fi
+fi
 if [ "$tok" = "ghp_flap" ]; then
   # First GET /user (the resolver's, via --jq) fails; later ones succeed.
   login=nathanpayne-claude; scopes="repo"
@@ -278,8 +292,7 @@ fi
 # The gap-2 shape: the placeholder READS as the author, so login-only
 # verification passes; the class check must still refuse it.
 if [ "$(cap "$WORKDIR/cloud.json" author-writes)" = "false" ] \
-   && [ "$(jq -r '.capabilities["author-writes"].credential_class' "$WORKDIR/cloud.json")" = "brokered" ] \
-   && [ "$(jq -r '.capabilities["author-writes"].login' "$WORKDIR/cloud.json")" = "nathanjohnpayne" ]; then
+   && [ "$(jq -r '.capabilities["author-writes"].credential_class' "$WORKDIR/cloud.json")" = "brokered" ]; then
   pass "claude-cloud + placeholder: author-writes refused although GET /user reads as the author (class brokered)"
 else
   fail "claude-cloud + placeholder: author-writes $(jq -c '.capabilities["author-writes"]' "$WORKDIR/cloud.json")"
@@ -330,6 +343,29 @@ if [ "$(cap "$WORKDIR/app.json" author-writes)" = "false" ] \
   pass "ghs_ token reading as the author: author-writes refused (class app-installed)"
 else
   fail "ghs_ token: $(jq -c '.capabilities["author-writes"]' "$WORKDIR/app.json")"
+fi
+
+# The same token reached only through the keyring fallback (no preferred PAT,
+# no ambient token) is reported by its class too, not as empty (Codex on #1541).
+set +e
+run_probe STUB_KEYRING_nathanjohnpayne=ghs_author -- --no-cache >"$WORKDIR/app-kr.json" 2>/dev/null
+set -e
+if [ "$(cap "$WORKDIR/app-kr.json" author-writes)" = "false" ] \
+   && [ "$(jq -r '.capabilities["author-writes"].credential_class' "$WORKDIR/app-kr.json")" = "app-installed" ]; then
+  pass "ghs_ token in the keyring only: author-writes refused, class app-installed (not empty)"
+else
+  fail "keyring ghs_ token: $(jq -c '.capabilities["author-writes"]' "$WORKDIR/app-kr.json")"
+fi
+
+# A rejected legacy 40-hex PAT is classified with its own response headers, so
+# it reads user-held and does not mask the keyring's app token (Codex on #1541).
+set +e
+run_probe GH_TOKEN=0123456789abcdef0123456789abcdef01234567 STUB_KEYRING_nathanjohnpayne=ghs_author -- --no-cache >"$WORKDIR/app-hex.json" 2>/dev/null
+set -e
+if [ "$(jq -r '.capabilities["author-writes"].credential_class' "$WORKDIR/app-hex.json")" = "app-installed" ]; then
+  pass "legacy PAT ahead of a keyring ghs_ token: classified with its headers, app-installed reported"
+else
+  fail "legacy PAT masking: $(jq -c '.capabilities["author-writes"]' "$WORKDIR/app-hex.json")"
 fi
 
 # ---------------------------------------------------------------------------
@@ -659,6 +695,44 @@ else
   fail "resolver flap: transient=$(jq -r .transient_failures "$WORKDIR/flap.json" 2>/dev/null) cache=$(ls "$CACHE" 2>/dev/null)"
 fi
 
+# Phase 4b on #1541: under the write-token opt-in, an unidentifiable token
+# whose first verification failed transiently and then verifies on repeat is
+# a transient failure too, not a cached stable denial.
+rm -rf "$CACHE"
+: >"$WORKDIR/flap-count"
+set +e
+run_probe OP_PREFLIGHT_AUTHOR_PAT=opaque-flap MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1 STUB_FLAP_COUNT="$WORKDIR/flap-count" -- >"$WORKDIR/oflap.json" 2>/dev/null
+set -e
+if [ "$(jq -r .transient_failures "$WORKDIR/oflap.json")" = "true" ] && [ -z "$(ls "$CACHE" 2>/dev/null)" ]; then
+  pass "opt-in: an unidentifiable token that verifies on repeat marks the run transient, not cached"
+else
+  fail "opt-in repeat: transient=$(jq -r .transient_failures "$WORKDIR/oflap.json" 2>/dev/null) cache=$(ls "$CACHE" 2>/dev/null)"
+fi
+
+# Codex on #1541: every probe measurement (api -i -X ...) targets github.com,
+# so a sole GHES host in hosts.yml cannot answer for a rejected token.
+: >"$WORKDIR/probe-hosts.log"
+run_probe GH_TOKEN=ghp_author STUB_HOST_LOG="$WORKDIR/probe-hosts.log" -- --no-cache >/dev/null 2>&1 || true
+if grep -q ' -X ' "$WORKDIR/probe-hosts.log" && ! grep ' -X ' "$WORKDIR/probe-hosts.log" | grep -vq '^github.com '; then
+  pass "every probe measurement runs with GH_HOST=github.com"
+else
+  fail "probe request hosts: $(grep ' -X ' "$WORKDIR/probe-hosts.log" | cut -d' ' -f1 | sort -u | tr '\n' ' ')"
+fi
+
+# Phase 4b on #1541: with GH_HOST naming an Enterprise host the verifier
+# refuses permanently; a successful repeat against that host is not a
+# transient recovery, so the result is cached like any stable denial.
+rm -rf "$CACHE"
+set +e
+run_probe GH_TOKEN=ghp_author GH_HOST=ghe.example.com -- >"$WORKDIR/ghehost.json" 2>/dev/null
+set -e
+if [ "$(jq -r .transient_failures "$WORKDIR/ghehost.json")" = "false" ] && [ -n "$(ls "$CACHE" 2>/dev/null)" ] \
+   && [ "$(cap "$WORKDIR/ghehost.json" author-writes)" = "false" ]; then
+  pass "GH_HOST on an Enterprise host: a permanent refusal, cached, not suppressed as transient"
+else
+  fail "GHES GH_HOST: transient=$(jq -r .transient_failures "$WORKDIR/ghehost.json" 2>/dev/null) cache=$(ls "$CACHE" 2>/dev/null)"
+fi
+
 # Round 5 on #1526.
 # An outage while the resolver verifies the KEYRING candidate is transient
 # too: no preferred PAT, no ambient token, the keyring token's GET /user 503s.
@@ -812,14 +886,25 @@ else
   fail "#1537: a token value reached the cache"
 fi
 
-# A Codex cloud surface with no explicit agent selects the Codex reviewer.
+# #1539: the surface never selects the reviewer, because the write wrappers
+# and gh-pr-guard.sh do not read it. A Codex cloud surface with no agent named
+# measures the default reviewer, as the wrapper would use, and says how to fix
+# it; MERGEPATH_AGENT=codex selects the Codex reviewer everywhere.
 set +e
-run_probe MERGEPATH_AGENT_SURFACE=codex-cloud GH_TOKEN=ghp_author -- --no-cache >"$WORKDIR/cx.json" 2>/dev/null
+run_probe MERGEPATH_AGENT_SURFACE=codex-cloud GH_TOKEN=ghp_author -- --no-cache >"$WORKDIR/cx.json" 2>"$WORKDIR/cx.err"
+run_probe MERGEPATH_AGENT_SURFACE=codex-cloud MERGEPATH_AGENT=codex GH_TOKEN=ghp_author -- --no-cache >"$WORKDIR/cx2.json" 2>"$WORKDIR/cx2.err"
 set -e
-if [ "$(jq -r '.capabilities["reviewer-writes"].identity' "$WORKDIR/cx.json")" = "nathanpayne-codex" ]; then
-  pass "#1537: codex-cloud surface without an explicit agent measures nathanpayne-codex"
+if [ "$(jq -r '.capabilities["reviewer-writes"].identity' "$WORKDIR/cx.json")" = "$(env -u GH_AS_REVIEWER_IDENTITY -u MERGEPATH_AGENT -u OP_PREFLIGHT_AGENT MERGEPATH_AGENT_SURFACE=codex-cloud bash -c '. "$1"; gh_default_reviewer_identity' _ "$ROOT/scripts/lib/gh-token-resolver.sh")" ] \
+   && grep -q "Set MERGEPATH_AGENT=codex" "$WORKDIR/cx.err"; then
+  pass "#1539: a codex-cloud surface alone measures the reviewer the wrapper resolves, and warns"
 else
-  fail "#1537 codex reviewer: $(jq -r '.capabilities["reviewer-writes"].identity' "$WORKDIR/cx.json")"
+  fail "#1539 surface-only reviewer: $(jq -r '.capabilities["reviewer-writes"].identity' "$WORKDIR/cx.json")"
+fi
+if [ "$(jq -r '.capabilities["reviewer-writes"].identity' "$WORKDIR/cx2.json")" = "nathanpayne-codex" ] \
+   && ! grep -q "Set MERGEPATH_AGENT=codex" "$WORKDIR/cx2.err"; then
+  pass "#1539: MERGEPATH_AGENT=codex on a codex-cloud surface measures nathanpayne-codex, no warning"
+else
+  fail "#1539 explicit codex agent: $(jq -r '.capabilities["reviewer-writes"].identity' "$WORKDIR/cx2.json")"
 fi
 
 # A timestamp that is not a plain non-negative integer is rejected by the
@@ -916,6 +1001,52 @@ if [ "$same_rc" -eq 0 ] && [ "$sw_rc" -eq 2 ]; then
   pass "a gh auth switch (different active account) invalidates the cache"
 else
   fail "active account binding: same=$same_rc switched=$sw_rc"
+fi
+
+# #1540: GH_HOST is part of the cache identity, and the stored cross-repo
+# target compares case-insensitively.
+rm -rf "$CACHE"
+run_probe GH_TOKEN=ghp_author -- --cross-repo Other/Repo >/dev/null 2>&1
+set +e
+run_probe GH_TOKEN=ghp_author -- --cross-repo other/repo --check >/dev/null 2>&1; case_rc=$?
+run_probe GH_TOKEN=ghp_author GH_HOST=ghe.example.com -- --cross-repo Other/Repo --check >/dev/null 2>&1; host_rc=$?
+set -e
+if [ "$case_rc" -eq 0 ] && [ "$host_rc" -eq 2 ]; then
+  pass "#1540: a cross-repo casing change keeps the cache; a GH_HOST change invalidates it"
+else
+  fail "#1540: casing=$case_rc gh_host=$host_rc"
+fi
+
+# Codex on #1541: with the opt-in, an unidentifiable token is not denied on
+# its class; it continues through the same login, role and scope checks.
+set +e
+run_probe OP_PREFLIGHT_AUTHOR_PAT=opaque-author -- --no-cache >"$WORKDIR/opaque.json" 2>/dev/null
+run_probe OP_PREFLIGHT_AUTHOR_PAT=opaque-author MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1 -- --no-cache >"$WORKDIR/opaque-in.json" 2>/dev/null
+set -e
+r_off="$(jq -r '.capabilities["author-writes"].reason' "$WORKDIR/opaque.json")"
+r_on="$(jq -r '.capabilities["author-writes"].reason' "$WORKDIR/opaque-in.json")"
+# Without the opt-in the resolver refuses the token outright; with it, the
+# probe measures it through the login/role/scope checks (here it verifies the
+# login and then stops on unreadable token permissions), never on its class.
+if [ "$(jq -r '.capabilities["author-writes"].granted' "$WORKDIR/opaque.json")" = "false" ] \
+   && ! printf '%s' "$r_on" | grep -q "cannot be established" \
+   && printf '%s' "$r_on" | grep -q "^verified nathanjohnpayne"; then
+  pass "opt-in: an unidentifiable token is measured through login/role/scope checks, not denied on its class"
+else
+  fail "opt-in grant: off=$r_off on=$r_on"
+fi
+
+# Codex on #1541: the write-token opt-in is part of the cache identity.
+rm -rf "$CACHE"
+run_probe GH_TOKEN=ghp_author -- >/dev/null 2>&1
+set +e
+run_probe GH_TOKEN=ghp_author -- --check >/dev/null 2>&1; same_rc=$?
+run_probe GH_TOKEN=ghp_author MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1 -- --check >/dev/null 2>&1; optin_rc=$?
+set -e
+if [ "$same_rc" -eq 0 ] && [ "$optin_rc" -eq 2 ]; then
+  pass "write-token opt-in: toggling it invalidates the capability cache"
+else
+  fail "opt-in cache identity: same=$same_rc optin=$optin_rc"
 fi
 
 echo

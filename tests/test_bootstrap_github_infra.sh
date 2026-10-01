@@ -1398,6 +1398,13 @@ cat >"$FAKE_ROOT_FORWARD/scripts/gh-as-author.sh" <<'FWD_EOF'
 # Stand-in for a wrapper whose token resolution SUCCEEDS: it runs
 # whatever follows `--`, exactly as scripts/gh-as-author.sh does.
 [ "$1" = "--" ] && shift
+# Models gh-as-author.sh's trace-marker contract (#1541): after its checks
+# pass, write GH_AS_AUTHOR_TRACE_MARKER immediately before the write, exit 70
+# if it cannot, and never pass the variable on.
+if [ -n "${GH_AS_AUTHOR_TRACE_MARKER:-}" ]; then
+  : >"$GH_AS_AUTHOR_TRACE_MARKER" || exit 70
+  unset GH_AS_AUTHOR_TRACE_MARKER
+fi
 exec "$@"
 FWD_EOF
 chmod +x "$FAKE_ROOT_FORWARD/scripts/gh-as-author.sh"
@@ -1971,21 +1978,20 @@ push_line=$(grep -F "push -u origin HEAD" "$WRAPPER_LOG18F" | tail -1 || true)
 [ -n "$push_line" ] \
   && pass "the bootstrap push runs through the author wrapper too" \
   || fail "the push never reached the author wrapper (ambient git credentials); log: $(cat "$WRAPPER_LOG18F")"
-# ...and carries the credential wiring, so the wrapper's token is what
-# git authenticates with rather than whatever helper the machine had
-# configured. The reset and the gh helper must be adjacent and in that
-# order: an appended helper without the reset leaves the inherited ones
-# ahead of it in the list.
-printf '%s\n' "$push_line" \
-  | grep -qF -- "-c credential.helper= -c credential.helper=!gh auth git-credential" \
-  && pass "the push clears inherited credential helpers and takes gh's" \
-  || fail "push carries no gh credential wiring: $push_line"
-printf '%s\n' "$push_line" | grep -qF "GIT_TERMINAL_PROMPT=0" \
-  && pass "the push disables git's terminal prompt" \
-  || fail "push can still prompt on the terminal: $push_line"
-printf '%s\n' "$push_line" | grep -qF "GIT_ASKPASS=" \
-  && pass "the push closes the askpass prompt path" \
-  || fail "push can still raise an askpass dialog: $push_line"
+# ...and hands the wrapper the CLOSED form it accepts: a bare
+# `git -C <dir> push -u origin HEAD`, no env prefix, no -c. Since #1541 the
+# wrapper owns the credential wiring (helper reset to gh's, no prompt, no
+# askpass, SSH keys and ambient helpers out); a prefix or -c here would be
+# refused. tests/test_gh_as_author_git_push.sh proves, against the REAL
+# wrapper, that the push authenticates only with the verified token.
+case "$push_line" in
+  *"-- git -C $T18F push -u origin HEAD") pass "the push reaches the wrapper as the closed git form" ;;
+  *) fail "the push does not reach the wrapper as '-- git -C <dir> push -u origin HEAD': $push_line" ;;
+esac
+case "$push_line" in
+  *"-- env "*|*" -c "*) fail "the push still carries a prefix or -c the wrapper refuses: $push_line" ;;
+  *) pass "the push carries no prefix and no -c for the wrapper to refuse" ;;
+esac
 # The credential travels over the helper protocol, so it must not appear
 # in the remote URL or anywhere else git wrote to disk (reflog included).
 git -C "$T18F" remote get-url origin | grep -qF "fake-author-token" \
@@ -2139,6 +2145,13 @@ mkdir -p "$FAKE_ROOT_TMPFAIL/scripts" "$TARGET15"
 cat >"$FAKE_ROOT_TMPFAIL/scripts/gh-as-author.sh" <<'TMPFWD_EOF'
 #!/bin/sh
 [ "$1" = "--" ] && shift
+# Models gh-as-author.sh's trace-marker contract (#1541): after its checks
+# pass, write GH_AS_AUTHOR_TRACE_MARKER immediately before the write, exit 70
+# if it cannot, and never pass the variable on.
+if [ -n "${GH_AS_AUTHOR_TRACE_MARKER:-}" ]; then
+  : >"$GH_AS_AUTHOR_TRACE_MARKER" || exit 70
+  unset GH_AS_AUTHOR_TRACE_MARKER
+fi
 exec "$@"
 TMPFWD_EOF
 chmod +x "$FAKE_ROOT_TMPFAIL/scripts/gh-as-author.sh"
@@ -2207,6 +2220,103 @@ grep -qF "an unkeyed failure worth keeping" "$TARGET16/.bootstrap-state.warnings
 
 # --- summary --------------------------------------------------------------
 echo
+# ---------------------------------------------------------------------------
+# #1541: the REAL bootstrap helpers through the REAL scripts/gh-as-author.sh.
+# Every other case here substitutes a fake wrapper; that is how a wrapper
+# change that refused both bootstrap payloads passed this suite. These run
+# bootstrap::run_author_git and bootstrap::author_gh_traced unmodified,
+# against the repository's own wrapper, with only gh and git stubbed at the
+# network edge (git delegates to real git except the push it records).
+# ---------------------------------------------------------------------------
+RW_BIN="$WORKDIR/realwrap-bin"
+mkdir -p "$RW_BIN"
+RW_REAL_GIT="$(command -v git)"
+cat >"$RW_BIN/gh" <<'RWGH'
+#!/usr/bin/env bash
+printf '%s|marker=%s\n' "$*" "${GH_AS_AUTHOR_TRACE_MARKER:-<unset>}" >>"$RW_GH_LOG"
+case "$1 $2" in
+  "api user")
+    case "${GH_TOKEN:-}" in ghp_bootstrap-author) echo nathanjohnpayne; exit 0 ;; esac
+    exit 4 ;;
+  "auth token") exit 1 ;;
+  "secret set") printf 'stdin=%s token=%s\n' "$(cat)" "${GH_TOKEN:-}" >>"$RW_GH_LOG"; exit 0 ;;  # TOKEN_OUTPUT_EXEMPT: fixture values pinned inline
+esac
+exit 0
+RWGH
+printf '#!/usr/bin/env bash\nREAL_GIT=%q\n' "$RW_REAL_GIT" >"$RW_BIN/git"
+cat >>"$RW_BIN/git" <<'RWGIT'
+for a in "$@"; do
+  if [ "$a" = push ]; then
+    printf 'GH_TOKEN=%s|GIT_CONFIG_GLOBAL=%s|ARGS=%s\n' "${GH_TOKEN:-}" "${GIT_CONFIG_GLOBAL:-}" "$*" >>"$RW_GIT_LOG"  # TOKEN_OUTPUT_EXEMPT: fixture token pinned inline
+    exit 0
+  fi
+done
+exec "$REAL_GIT" "$@"
+RWGIT
+chmod +x "$RW_BIN/gh" "$RW_BIN/git"
+RW_REPO="$WORKDIR/realwrap-repo"
+"$RW_REAL_GIT" init -q "$RW_REPO"
+"$RW_REAL_GIT" -C "$RW_REPO" remote add origin https://github.com/nathanjohnpayne/realwrap-repo.git
+
+run_real_wrapper_case() { # <author PAT or empty> <bash snippet using the bootstrap lib>
+  : >"$WORKDIR/rw-gh.log"; : >"$WORKDIR/rw-git.log"
+  env -u GH_TOKEN -u GITHUB_TOKEN -u OP_PREFLIGHT_REVIEWER_PAT \
+    PATH="$RW_BIN:$PATH" RW_GH_LOG="$WORKDIR/rw-gh.log" RW_GIT_LOG="$WORKDIR/rw-git.log" \
+    OP_PREFLIGHT_AUTHOR_PAT="$1" BOOTSTRAP_MERGEPATH_ROOT="$ROOT" RW_REPO="$RW_REPO" RW_MARKER="$WORKDIR/rw-marker" \
+    bash -c '
+      . "'"$ROOT"'/scripts/bootstrap/_lib.sh"
+      BOOTSTRAP_DRY_RUN=0
+      BOOTSTRAP_SKIP_AUTHOR_TOKEN=0
+      '"$2" 2>&1
+}
+
+rw_out="$(run_real_wrapper_case ghp_bootstrap-author '
+  rc=0; bootstrap::run_author_git "push bootstrap commit" nathanjohnpayne/realwrap-repo -C "$RW_REPO" push -u origin HEAD || rc=$?; echo "RC=$rc"')"
+rw_push="$(cat "$WORKDIR/rw-git.log")"
+# ...and against a repository whose origin is NOT the one bootstrap created,
+# the same call is refused before any push (owner's allowlist on #1541).
+rw_other="$(run_real_wrapper_case ghp_bootstrap-author '
+  rc=0; bootstrap::run_author_git "push bootstrap commit" nathanjohnpayne/some-other-repo -C "$RW_REPO" push -u origin HEAD || rc=$?; echo "RC=$rc"')"
+if printf '%s' "$rw_other" | grep -q '^RC=5$' && [ ! -s "$WORKDIR/rw-git.log" ]; then
+  pass "real bootstrap::run_author_git: an origin that is not the expected repository is refused before the push"
+else
+  fail "real bootstrap push to an unexpected repository: $rw_other"
+fi
+if printf '%s' "$rw_out" | grep -q '^RC=0$' \
+   && printf '%s' "$rw_push" | grep -q "^GH_TOKEN=ghp_bootstrap-author|GIT_CONFIG_GLOBAL=/dev/null|ARGS=-c credential.helper= -c credential.helper=!'/[^']*/gh' auth git-credential .* -C $RW_REPO push -u origin HEAD\$"; then
+  pass "real bootstrap::run_author_git through the real wrapper: pushes under the verified author token with gh's helper pinned"
+else
+  fail "real bootstrap push: out=$rw_out push=$rw_push"
+fi
+
+rm -f "$WORKDIR/rw-marker"
+rw_out="$(run_real_wrapper_case ghp_bootstrap-author '
+  rc=0; printf "the-pat" | bootstrap::author_gh_traced "$RW_MARKER" secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/realwrap-repo || rc=$?; echo "RC=$rc"')"
+if printf '%s' "$rw_out" | grep -q '^RC=0$' && [ -f "$WORKDIR/rw-marker" ] \
+   && grep -qx 'stdin=the-pat token=ghp_bootstrap-author' "$WORKDIR/rw-gh.log" \
+   && ! grep -q 'marker=/' "$WORKDIR/rw-gh.log"; then
+  pass "real bootstrap::author_gh_traced through the real wrapper: marker written, gh ran with stdin and the verified token, marker never inherited"
+else
+  fail "real traced call: out=$rw_out marker=$([ -f "$WORKDIR/rw-marker" ] && echo yes || echo no) gh=$(cat "$WORKDIR/rw-gh.log")"
+fi
+
+rm -f "$WORKDIR/rw-marker"
+rw_out="$(run_real_wrapper_case "" '
+  rc=0; printf "the-pat" | bootstrap::author_gh_traced "$RW_MARKER" secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/realwrap-repo || rc=$?; echo "RC=$rc"')"
+if ! printf '%s' "$rw_out" | grep -q '^RC=0$' && [ ! -e "$WORKDIR/rw-marker" ] && ! grep -q '^secret set' "$WORKDIR/rw-gh.log"; then
+  pass "real traced call with no author token: refused before gh, marker absent"
+else
+  fail "real traced call without a token: out=$rw_out marker=$([ -e "$WORKDIR/rw-marker" ] && echo present || echo absent)"
+fi
+
+rw_out="$(run_real_wrapper_case ghp_bootstrap-author '
+  rc=0; printf "the-pat" | bootstrap::author_gh_traced "$RW_REPO/no-such-dir/marker" secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/realwrap-repo || rc=$?; echo "RC=$rc"')"
+if printf '%s' "$rw_out" | grep -q '^RC=70$' && ! grep -q '^secret set' "$WORKDIR/rw-gh.log"; then
+  pass "real traced call with an unwritable marker: exit 70, the secret write never ran"
+else
+  fail "real traced call with unwritable marker: out=$rw_out"
+fi
+
 echo "test_bootstrap_github_infra: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

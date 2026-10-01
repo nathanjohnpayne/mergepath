@@ -67,8 +67,9 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 state_dir=${CODERABBIT_TEST_STATE_DIR:?}
-[ "${1:-}" = "--expect-token-identity" ] || exit 2
+[ "${1:-}" = "--expect-write-identity" ] || exit 2
 printf '%s\n' "${2:-}" >>"$state_dir/identity-args"
+printf '%s\n' "${GH_TOKEN:-}" >>"$state_dir/identity-token"
 [ "${2:-}" = "${CODERABBIT_TEST_TOKEN_LOGIN:?}" ] || exit 1
 exit 0
 EOF
@@ -141,6 +142,7 @@ if [ "$method" = "POST" ]; then
       fi
       count=$((count + 1))
       printf '%s\n' "$count" >"$state_dir/post-count"
+      printf '%s\n' "${GH_HOST:-<unset>}" >>"$state_dir/post-host"
       printf '{"id":900%s,"created_at":"%s","body":"probe"}\n' "$count" "$head_time"
       ;;
     *)
@@ -210,6 +212,9 @@ run_case() {
     )
     if [ -n "$explicit_identity" ]; then
       env_args+=(GH_AS_REVIEWER_IDENTITY="$explicit_identity")
+    fi
+    if [ -n "${RUN_CASE_REVIEWER_PAT:-}" ]; then
+      env_args+=(OP_PREFLIGHT_REVIEWER_PAT="$RUN_CASE_REVIEWER_PAT")
     fi
     env -u MERGEPATH_AGENT -u OP_PREFLIGHT_AGENT -u GH_AS_REVIEWER_IDENTITY \
       "${env_args[@]}" \
@@ -338,7 +343,37 @@ test_453_shared_reviewers_helper() {
   fi
 }
 
+# CodeRabbit on #1541: the identity check verifies the token gh_reviewer
+# signs with (the reviewer PAT when cached), not an unrelated GH_TOKEN.
+test_checks_the_reviewer_pat_not_gh_token() {
+  local dir rc tok
+  dir=$(make_case "reviewer-pat")
+  rc=$(RUN_CASE_REVIEWER_PAT=cached-reviewer-pat run_case "$dir" nathanpayne-codex nathanpayne-codex)
+  tok=$(state_file "$dir" identity-token)
+  if [ "$tok" = "cached-reviewer-pat" ]; then
+    pass "identity check verifies the cached reviewer PAT the write will use (rc=$rc)"
+  else
+    fail "identity check verified '$tok', expected the cached reviewer PAT; stderr=$(cat "$dir/err.log")"
+  fi
+}
+
+# #1541: the reviewer write is pinned to github.com, so a sole GHES host in
+# hosts.yml cannot redirect it to another server under a stored credential.
+test_reviewer_write_pinned_to_github_com() {
+  local dir rc host
+  dir=$(make_case "pinned-host")
+  rc=$(run_case "$dir" nathanpayne-codex nathanpayne-codex)
+  host=$(state_file "$dir" post-host)
+  if [ -n "$host" ] && ! printf '%s\n' "$host" | grep -vqx 'github.com'; then
+    pass "reviewer write runs with GH_HOST=github.com (rc=$rc)"
+  else
+    fail "reviewer write host: '${host:-none posted}'; stderr=$(cat "$dir/err.log")"
+  fi
+}
+
 test_453_shared_reviewers_helper
+test_checks_the_reviewer_pat_not_gh_token
+test_reviewer_write_pinned_to_github_com
 test_derives_identity_from_allow_listed_token
 test_derives_identity_from_quoted_commented_entry
 test_non_allow_listed_token_fails_closed

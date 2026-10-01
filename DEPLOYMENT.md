@@ -476,7 +476,7 @@ scripts/gh-as-author.sh -- gh pr merge <PR#> --squash --delete-branch
 > **⚠️ Fallback / setup-only:** the inline `GH_TOKEN="$(op read 'op://Private/<item-id>/token')"` form triggers a biometric prompt on **every** invocation. Use only when `op-preflight.sh` is unavailable. Routine agent work should always use the cached `$OP_PREFLIGHT_REVIEWER_PAT` env var after a one-time `eval "$(scripts/op-preflight.sh --agent <agent> --mode review)"`.
 
 - Use the item ID from the table above for your agent identity. Do not use the 1Password item title.
-- Verify token identity with `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login` or by letting the wrappers call `identity-check.sh --expect-token-identity` before the write.
+- Verify token identity with `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login` or by letting the wrappers call `identity-check.sh --expect-write-identity` before the write.
 - On local interactive machines, the `op read` command itself may trigger the 1Password biometric prompt even if `op whoami` says you are not signed in.
 - `Review Can not approve your own pull request` means the PR author is wrong, the reviewer token resolved to the author identity, or the no-self-approve scoping rule applies (Phase 4 / above-threshold PRs only — see REVIEW_POLICY.md § No-self-approve scoping). For under-threshold PRs the reviewer identity is allowed and expected to `--approve`.
 

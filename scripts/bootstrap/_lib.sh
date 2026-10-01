@@ -194,13 +194,13 @@ bootstrap::author_gh() {
 # => gh ran (and the rc is gh's); marker absent with a non-zero rc => the
 # write never reached gh. The caller owns the path and its cleanup.
 #
-# The marker is written INSIDE the wrapper's process tree, after every
-# guard the wrapper applies, because scripts/gh-as-author.sh runs
-# whatever follows `--` and this passes it a one-line shim that touches
-# the marker and then `exec`s gh. Nothing about the gh invocation
-# changes: argv is identical, stdin passes straight through (the
-# secret-set path pipes its PAT), and the wrapper's GH_TOKEN is
-# inherited across the exec.
+# The marker is written BY scripts/gh-as-author.sh
+# (GH_AS_AUTHOR_TRACE_MARKER), after every check it applies and immediately
+# before gh runs; if it cannot be written the wrapper exits 70 without
+# running the write. The wrapper runs only a direct gh payload (#1541), so
+# the former `sh -c` shim that touched the marker is gone. argv is
+# identical and stdin passes straight through (the secret-set path pipes
+# its PAT).
 bootstrap::author_gh_traced() {
   local reached_marker=$1
   shift
@@ -223,19 +223,11 @@ bootstrap::author_gh_traced() {
     return 2
   fi
 
-  # The shim refuses to exec gh if it cannot write the marker, which is
-  # what makes "marker absent" mean "gh did not run" unconditionally
-  # rather than "gh did not run, probably". A caller that could not
-  # record the boundary must not perform an unattributable write.
-  GH_AS_AUTHOR_IDENTITY="$author_identity" "$wrapper" -- \
-    sh -c '
-      if ! : >"$1"; then
-        echo "bootstrap: cannot write the author-gh trace marker $1 — refusing to run the write unrecorded" >&2
-        exit 70
-      fi
-      shift
-      exec gh "$@"
-    ' bootstrap-author-gh-traced "$reached_marker" "$@"
+  # The wrapper refuses to run gh if it cannot write the marker (exit 70),
+  # which is what makes "marker absent" mean "gh did not run"
+  # unconditionally rather than "gh did not run, probably".
+  GH_AS_AUTHOR_TRACE_MARKER="$reached_marker" GH_AS_AUTHOR_IDENTITY="$author_identity" \
+    "$wrapper" -- gh "$@"
 }
 
 bootstrap::run_author_gh() {
@@ -330,7 +322,7 @@ BOOTSTRAP_GIT_NONINTERACTIVE_ENV=(
 # stdin, and nothing rewrites the remote.
 #
 # Usage:
-#   bootstrap::run_author_git "push bootstrap commit" -C "$dir" push -u origin HEAD
+#   bootstrap::run_author_git "push bootstrap commit" owner/repo -C "$dir" push -u origin HEAD
 #
 # `git` itself and its credential flags are owned HERE, not by the
 # caller: `-c` is a top-level git option and must precede the
@@ -338,18 +330,16 @@ BOOTSTRAP_GIT_NONINTERACTIVE_ENV=(
 # arrange. Callers pass everything after `git`, mirroring
 # bootstrap::run_author_gh, where `gh` is likewise implicit.
 bootstrap::run_author_git() {
-  local label=$1
-  shift
-  if [ "$#" -eq 0 ]; then
-    bootstrap::err "bootstrap::run_author_git requires git arguments after the label"
+  local label=$1 expected_repo=${2:-}
+  shift 2 || true
+  if [ -z "$expected_repo" ] || [ "$#" -eq 0 ]; then
+    bootstrap::err "bootstrap::run_author_git requires an owner/repo and git arguments after the label"
     return 64
   fi
 
-  set -- env "${BOOTSTRAP_GIT_NONINTERACTIVE_ENV[@]}" \
-         git "${BOOTSTRAP_GIT_CREDENTIAL_ARGS[@]}" "$@"
-
   if [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ] || [ "${BOOTSTRAP_SKIP_AUTHOR_TOKEN:-0}" = "1" ]; then
-    bootstrap::run "$label" "$@"
+    bootstrap::run "$label" env "${BOOTSTRAP_GIT_NONINTERACTIVE_ENV[@]}" \
+      git "${BOOTSTRAP_GIT_CREDENTIAL_ARGS[@]}" "$@"
     return $?
   fi
 
@@ -362,8 +352,17 @@ bootstrap::run_author_git() {
     return 2
   fi
 
+  # The wrapper owns git's credential and prompting here. It accepts exactly
+  # `git -C <dir> push -u origin HEAD` with GH_AS_AUTHOR_PUSH_REPO naming the
+  # repository bootstrap created, and only when <dir> is a primary repository
+  # whose .git/config matches the value-checked allowlist, with
+  # remote.origin.url exactly https://github.com/<owner/repo>.git (or its exact
+  # git@github.com: spelling, pushed over HTTPS). The push runs with gh's
+  # credential helper (the verified author token) alone and with SSH keys,
+  # ambient helpers and hooks out of reach (#1541). A prefix in front of git,
+  # another remote or another refspec is refused.
   bootstrap::run "$label" \
-    env GH_AS_AUTHOR_IDENTITY="$author_identity" "$wrapper" -- "$@"
+    env GH_AS_AUTHOR_IDENTITY="$author_identity" GH_AS_AUTHOR_PUSH_REPO="$expected_repo" "$wrapper" -- git "$@"
 }
 
 # Append a captured diagnostic to $BOOTSTRAP_LOG_FILE, so the audit

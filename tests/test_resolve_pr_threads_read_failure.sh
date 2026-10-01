@@ -235,6 +235,19 @@ for mode in --resolve-actioned --auto-resolve-bots; do
   fi
 done
 
+# #1541: every gh call made with the PAT is pinned to github.com, the only
+# host the write-identity check verifies.
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "${GH_HOST:-<unset>}" >>"%s"\necho "gh: HTTP 500" >&2\nexit 1\n' "$STUB_DIR/hosts.log" >"$STUB_DIR/gh"
+chmod +x "$STUB_DIR/gh"
+: >"$STUB_DIR/hosts.log"
+( cd "$ROOT" && PATH="$STUB_DIR:$PATH" GH_RETRY_BACKOFF_SECONDS=0 GH_RETRY_ATTEMPTS=1 \
+    OP_PREFLIGHT_REVIEWER_PAT=stub-token bounded 60 bash "$SCRIPT" 999 --repo owner/name --list ) >/dev/null 2>&1 || true
+if [ -s "$STUB_DIR/hosts.log" ] && ! grep -vqx 'github.com' "$STUB_DIR/hosts.log"; then
+  ok "every gh call made with the PAT runs with GH_HOST=github.com"
+else
+  bad "gh_pat host pinning: $(sort -u "$STUB_DIR/hosts.log" | tr '\n' ' ')"
+fi
+
 echo
 echo "test_resolve_pr_threads_read_failure: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

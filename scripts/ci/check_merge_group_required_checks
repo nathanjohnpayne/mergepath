@@ -266,7 +266,8 @@ author_wrapper_runtime = [
   "scripts/lib/gh-command-classifier.sh",
   "scripts/lib/pr-body-contract.sh",
   "scripts/lib/pr-body-contract.mjs",
-  "scripts/lib/reviewers-helpers.sh"
+  "scripts/lib/reviewers-helpers.sh",
+  "scripts/lib/credential-class.sh"
 ]
 
 expected = {

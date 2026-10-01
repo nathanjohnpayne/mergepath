@@ -110,7 +110,7 @@ GH_STUB
 chmod +x "$SCRATCH/gh"
 
 set +e
-out=$(PATH="$SCRATCH:$PATH" OP_PREFLIGHT_REVIEWER_PAT="fake-reviewer-pat" \
+out=$(PATH="$SCRATCH:$PATH" OP_PREFLIGHT_REVIEWER_PAT="ghp_fake-reviewer-pat" \
   MERGEPATH_NOTIFY_IMESSAGE_TO="" \
   "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review 2>&1)
 rc=$?
@@ -128,7 +128,7 @@ fi
 # Same, but WITH --repo — sanity-check that the explicit-repo path
 # is also still wired up.
 set +e
-out=$(PATH="$SCRATCH:$PATH" OP_PREFLIGHT_REVIEWER_PAT="fake-reviewer-pat" \
+out=$(PATH="$SCRATCH:$PATH" OP_PREFLIGHT_REVIEWER_PAT="ghp_fake-reviewer-pat" \
   MERGEPATH_NOTIFY_IMESSAGE_TO="" \
   "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review --repo nathanjohnpayne/mergepath 2>&1)
 rc=$?
@@ -174,7 +174,7 @@ chmod +x "$SCRATCH/gh"
 # no-repo path
 SCRATCH_BODY_OUT="$SCRATCH/body-norepo.txt" \
   PATH="$SCRATCH:$PATH" \
-  OP_PREFLIGHT_REVIEWER_PAT="fake-reviewer-pat" \
+  OP_PREFLIGHT_REVIEWER_PAT="ghp_fake-reviewer-pat" \
   MERGEPATH_NOTIFY_IMESSAGE_TO="" \
   "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review >/dev/null 2>&1 || true
 
@@ -192,7 +192,7 @@ fi
 # with-repo path
 SCRATCH_BODY_OUT="$SCRATCH/body-repo.txt" \
   PATH="$SCRATCH:$PATH" \
-  OP_PREFLIGHT_REVIEWER_PAT="fake-reviewer-pat" \
+  OP_PREFLIGHT_REVIEWER_PAT="ghp_fake-reviewer-pat" \
   MERGEPATH_NOTIFY_IMESSAGE_TO="" \
   "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review --repo nathanjohnpayne/mergepath >/dev/null 2>&1 || true
 

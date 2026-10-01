@@ -64,7 +64,10 @@
 # (the codex-universal image defines no CODEX_* variable), so a Codex cloud
 # environment must set MERGEPATH_AGENT_SURFACE=codex-cloud among its
 # environment variables. Without it the session reads as local with
-# surface_source "default", which the output shows rather than hides.
+# surface_source "default", which the output shows rather than hides. The
+# surface only labels where the session runs; it never selects the reviewer.
+# A Codex environment also sets MERGEPATH_AGENT=codex, which the probe, the
+# write wrappers and gh-pr-guard.sh all read (#1539).
 #
 # Environment:
 #   MERGEPATH_CAPABILITY_CACHE_DIR    cache dir (default
@@ -175,16 +178,16 @@ if [ -f "$ROOT/.github/review-policy.yml" ]; then
   policy_author="$(grep -m1 '^author_identity:' "$ROOT/.github/review-policy.yml" | awk '{print $2}' | sed -E "s/^[\"']//; s/[\"']\$//" || true)"
   [ -n "$policy_author" ] && AUTHOR_IDENTITY="$policy_author"
 fi
-# A Codex cloud environment configured by the recipe sets only
-# MERGEPATH_AGENT_SURFACE=codex-cloud; without an explicit agent the resolver's
-# default reviewer would be nathanpayne-claude (#1537). The surface names the
-# agent, so it selects the reviewer when nothing more specific does.
-if [ -z "${GH_AS_REVIEWER_IDENTITY:-}${MERGEPATH_AGENT:-}${OP_PREFLIGHT_AGENT:-}" ] \
-   && [ "${MERGEPATH_AGENT_SURFACE:-}" = "codex-cloud" ]; then
-  MERGEPATH_AGENT=codex
-  export MERGEPATH_AGENT
-fi
+# The reviewer comes from the one chain the write wrappers and gh-pr-guard.sh
+# also use (GH_AS_REVIEWER_IDENTITY, MERGEPATH_AGENT, OP_PREFLIGHT_AGENT,
+# nathanpayne-claude), so measurement, execution and the self-approval guard
+# always name the same reviewer (#1539). The surface does not select an agent:
+# a Codex cloud environment sets MERGEPATH_AGENT=codex explicitly.
 REVIEWER_IDENTITY="$(gh_default_reviewer_identity)"
+if [ "${MERGEPATH_AGENT_SURFACE:-}" = "codex-cloud" ] \
+   && [ -z "${GH_AS_REVIEWER_IDENTITY:-}${MERGEPATH_AGENT:-}${OP_PREFLIGHT_AGENT:-}" ]; then
+  echo "agent-capability-probe: WARNING MERGEPATH_AGENT_SURFACE=codex-cloud but no agent is named; measuring reviewer $REVIEWER_IDENTITY. Set MERGEPATH_AGENT=codex among the Codex environment variables, beside MERGEPATH_AGENT_SURFACE." >&2
+fi
 
 # A non-secret fingerprint of every credential the measurements can use
 # (#1537): the two preflight PATs, both ambient token variables, the gh config
@@ -210,7 +213,15 @@ credential_fingerprint() {
   fi
   # shellcheck disable=SC2034
   local GH_CONFIG_DIR_VALUE="${GH_CONFIG_DIR:-}"
-  for var in OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT GH_TOKEN GITHUB_TOKEN GH_CONFIG_DIR_VALUE keyring_author keyring_reviewer keyring_active; do
+  # GH_HOST selects which server every bare gh call reaches (#1540).
+  # shellcheck disable=SC2034
+  local GH_HOST_VALUE="${GH_HOST:-}"
+  # The write-token opt-in changes what the wrappers accept, so a cache
+  # measured under one setting must not answer for the other (Codex on #1541).
+  # shellcheck disable=SC2034
+  local ALLOW_UNIDENTIFIABLE_VALUE="0"
+  [ "${MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN:-0}" = "1" ] && ALLOW_UNIDENTIFIABLE_VALUE="1"
+  for var in OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT GH_TOKEN GITHUB_TOKEN GH_CONFIG_DIR_VALUE GH_HOST_VALUE ALLOW_UNIDENTIFIABLE_VALUE keyring_author keyring_reviewer keyring_active; do
     val="${!var:-}"
     if [ -z "$val" ]; then
       h="-"
@@ -310,7 +321,8 @@ if [ "$MODE" = "check" ]; then
   [ "$cached_session" = "${CLAUDE_CODE_REMOTE_SESSION_ID:-}" ] \
     || die 2 "capability cache was measured in session '${cached_session:-none}', this is '${CLAUDE_CODE_REMOTE_SESSION_ID:-none}'; re-run the probe"
   cached_cross="$(snap -r '.cross_repo_target // empty')" || die 2 "capability cache for $REPO could not be read; re-run the probe"
-  [ "$cached_cross" = "$CROSS_REPO" ] \
+  # Repository names are case-insensitive, as in the measurement (#1540).
+  [ "$(printf '%s' "$cached_cross" | tr 'A-Z' 'a-z')" = "$(printf '%s' "$CROSS_REPO" | tr 'A-Z' 'a-z')" ] \
     || die 2 "capability cache measured cross-repo against '$cached_cross', this check asks about '$CROSS_REPO'; re-run the probe"
   cached_fp="$(snap -r '.credential_fingerprint // empty')" || die 2 "capability cache for $REPO could not be read; re-run the probe"
   [ "$cached_fp" = "$CREDENTIAL_FINGERPRINT" ] \
@@ -367,10 +379,13 @@ api_request() {
     local -a args
     args=(api -i -X "$method" "$path")
     [ -n "$query" ] && args+=(-f "query=$query")
+    # Every measurement targets github.com, as the curl path below does: a
+    # bare `gh api` follows a sole GHES host in hosts.yml, whose stored login
+    # could answer for a token github.com rejected (Codex on #1541).
     if [ -n "$token" ]; then
-      ( unset GITHUB_TOKEN; GH_TOKEN="$token" gh "${args[@]}" ) >"$raw" 2>/dev/null || request_rc=$?
+      ( unset GITHUB_TOKEN; GH_HOST=github.com GH_TOKEN="$token" gh "${args[@]}" ) >"$raw" 2>/dev/null || request_rc=$?
     else
-      gh "${args[@]}" >"$raw" 2>/dev/null || request_rc=$?
+      GH_HOST=github.com gh "${args[@]}" >"$raw" 2>/dev/null || request_rc=$?
     fi
     tr -d '\r' <"$raw" | awk -v h="$prefix.headers" -v b="$prefix.body" '
       !done && /^$/ { done = 1; next }
@@ -459,20 +474,41 @@ measure_write() {
       # PAT is the ONLY candidate (a failure there is final, it never falls
       # through), otherwise the ambient token and then the keyring token. A
       # fallback the resolver never tried says nothing about its failure.
-      local candidate repeat_status repeat_login n=0
+      # The resolver also refuses a brokered or app-installed candidate before
+      # it reads GET /user, so report the class of what it refused: the first
+      # tried candidate that is not user-held, keyring fallback included (Codex
+      # on #1541), else the first one tried. That is the actionable half.
+      local candidate repeat_status repeat_login cand_class n=0
       local -a tried=()
       if [ -n "${!preferred:-}" ]; then
         tried=("${!preferred}")
       else
         tried=("${GH_TOKEN:-}" "$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --user "$identity" 2>/dev/null || true)")
       fi
+      # Each candidate is classified with its own repeat response's headers,
+      # which a legacy 40-hex PAT needs (its X-OAuth-Scopes); without them it
+      # would read unidentifiable and could mask a later app-installed one
+      # (Codex on #1541).
+      class="empty"
       for candidate in "${tried[@]}"; do
         [ -n "$candidate" ] || continue
         n=$((n + 1))
         repeat_status="$(api_request "$candidate" GET user "$WORKDIR/resolve-user-$n")"
         repeat_login="$(jq -r '.login // empty' "$WORKDIR/resolve-user-$n.body" 2>/dev/null || true)"
+        cand_class="$(credential_class "$candidate" "$WORKDIR/resolve-user-$n.headers")"
+        if [ "$class" = "empty" ] || { [ "$class" = "user-held" ] && [ "$cand_class" != "user-held" ]; }; then
+          class="$cand_class"
+        fi
+        # A candidate the verifier would accept, by the same class rule as
+        # the grant below (user-held, or unidentifiable under the opt-in),
+        # that now verifies means the resolver's failure was transient (Phase
+        # 4b on #1541).
+        # ...and only on a host the verifier accepts: with GH_HOST set to
+        # anything but github.com the refusal is permanent, not transient.
         if [ "$repeat_status" = "200" ] && [ "$repeat_login" = "$identity" ] \
-           && [ "$(credential_class "$candidate" "$WORKDIR/resolve-user-$n.headers")" = "user-held" ]; then
+           && { [ -z "${GH_HOST:-}" ] || [ "$(printf '%s' "$GH_HOST" | tr '[:upper:]' '[:lower:]')" = "github.com" ]; } \
+           && { [ "$cand_class" = "user-held" ] \
+                || { [ "$cand_class" = "unidentifiable" ] && [ "${MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN:-0}" = "1" ]; }; }; then
           echo "resolver for $identity failed, then candidate $n verified on repeat" >>"$WORKDIR/transient"
         fi
       done
@@ -488,7 +524,11 @@ measure_write() {
         reason="token reads as '$login', not '$identity'"
       elif [ "$login_type" != "User" ]; then
         reason="token identity type is '$login_type', not User"
-      elif [ "$class" != "user-held" ]; then
+      elif [ "$class" != "user-held" ] \
+           && ! { [ "$class" = "unidentifiable" ] && [ "${MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN:-0}" = "1" ]; }; then
+        # The opt-in that makes the wrappers accept an unidentifiable token
+        # lets it continue through the same login, role and scope checks
+        # here, so the cached capability matches the verifier (Codex on #1541).
         reason="credential class is '$class'; its write identity cannot be established"
       else
         local repo_status has_perm private scopes

@@ -41,15 +41,17 @@ if [ "${GHP_SKIP_TOKEN_IDENTITY_CHECK:-0}" != "1" ]; then
     echo "Error: identity-check helper missing or non-executable: $CHECKER" >&2
     exit 2
   fi
-  if ! GH_TOKEN="$GH_TOKEN" "$CHECKER" --expect-token-identity "$EXPECTED_IDENTITY"; then
+  if ! GH_TOKEN="$GH_TOKEN" "$CHECKER" --expect-write-identity "$EXPECTED_IDENTITY"; then
     echo "Error: GH_TOKEN must resolve to $EXPECTED_IDENTITY for project-item mutations." >&2
     exit 2
   fi
 fi
 
+# Pinned to github.com, the only host the write-identity check verifies: with
+# a sole GHES host in hosts.yml a bare call would otherwise go there (#1541).
 ghp_gh() (
   unset GITHUB_TOKEN
-  gh "$@"
+  GH_HOST=github.com gh "$@"
 )
 
 export STATUS_NAME

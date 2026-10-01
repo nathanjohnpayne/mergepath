@@ -534,7 +534,10 @@ gh_reviewer() (
   # Pin reviewer writes to the reviewer PAT rather than inheriting ambient
   # creds (#533): prefer the preflight-cached reviewer PAT, falling back to
   # GH_TOKEN. Mirrors scripts/resolve-pr-threads.sh's PAT_GH_TOKEN pattern.
-  GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}" gh "$@"
+  # GH_HOST pins every call to github.com, the only host the identity check
+  # verifies: with a sole GHES host in hosts.yml a bare call would otherwise
+  # write there under its stored credential (#1541).
+  GH_HOST=github.com GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}" gh "$@"
 )
 
 # --- config readers ---------------------------------------------------------
@@ -3162,7 +3165,11 @@ verify_reviewer_write_identity() {
         log "GH_TOKEN login '${token_login:-<unresolvable>}' is not in available_reviewers; falling back to default expected reviewer '$EXPECTED_REVIEWER_IDENTITY'"
       fi
     fi
-    GH_TOKEN="$GH_TOKEN" "$checker" --expect-token-identity "$EXPECTED_REVIEWER_IDENTITY" \
+    # Verify the token gh_reviewer will actually sign with: the reviewer PAT
+    # when one is cached, else GH_TOKEN. Checking GH_TOKEN alone refused a
+    # correct reviewer PAT whenever the ambient token differed from it, e.g.
+    # the Claude cloud placeholder (CodeRabbit on #1541).
+    GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}" "$checker" --expect-write-identity "$EXPECTED_REVIEWER_IDENTITY" \
       || return 1
   fi
 }

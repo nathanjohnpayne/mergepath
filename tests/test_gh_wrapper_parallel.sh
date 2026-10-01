@@ -32,8 +32,8 @@ if [ "${1:-}" = "auth" ] && [ "${2:-}" = "switch" ]; then
 fi
 if [ "${1:-}" = "api" ] && [ "${2:-}" = "user" ]; then
   case "${GH_TOKEN:-}" in
-    author-token) echo "nathanjohnpayne" ;;
-    reviewer-token) echo "nathanpayne-codex" ;;
+    ghp_author-token) echo "nathanjohnpayne" ;;
+    ghp_reviewer-token) echo "nathanpayne-codex" ;;
     *) exit 4 ;;
   esac
   exit 0
@@ -43,11 +43,11 @@ exit 0
 STUB
 chmod +x "$STUB_DIR/gh"
 
-PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$LOG" OP_PREFLIGHT_AUTHOR_PAT="author-token" \
+PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$LOG" OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" \
   "$AUTHOR_WRAPPER" -- gh pr merge 1 --squash >/dev/null 2>"$WORKDIR/author.err" &
 author_pid=$!
 
-PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$LOG" OP_PREFLIGHT_REVIEWER_PAT="reviewer-token" \
+PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$LOG" OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" \
   GH_AS_REVIEWER_IDENTITY="nathanpayne-codex" \
   "$REVIEWER_WRAPPER" -- gh pr review 1 --comment --body "ok" >/dev/null 2>"$WORKDIR/reviewer.err" &
 reviewer_pid=$!
@@ -70,13 +70,13 @@ if grep -q $'gh\tauth\tswitch' "$LOG"; then
   cat "$LOG" >&2
   exit 1
 fi
-if ! grep -q $'GH_TOKEN=author-token gh\tpr\tmerge\t1\t--squash' "$LOG"; then
-  echo "FAIL: author write did not run under author-token" >&2
+if ! grep -q $'GH_TOKEN=ghp_author-token gh\tpr\tmerge\t1\t--squash' "$LOG"; then
+  echo "FAIL: author write did not run under ghp_author-token" >&2
   cat "$LOG" >&2
   exit 1
 fi
-if ! grep -q $'GH_TOKEN=reviewer-token gh\tpr\treview\t1\t--comment' "$LOG"; then
-  echo "FAIL: reviewer write did not run under reviewer-token" >&2
+if ! grep -q $'GH_TOKEN=ghp_reviewer-token gh\tpr\treview\t1\t--comment' "$LOG"; then
+  echo "FAIL: reviewer write did not run under ghp_reviewer-token" >&2
   cat "$LOG" >&2
   exit 1
 fi

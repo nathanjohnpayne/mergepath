@@ -105,6 +105,7 @@ make_real_wrapper_case() {
   chmod +x "$dir/scripts/gh-as-reviewer.sh"
   cp "$ROOT/scripts/identity-check.sh" "$dir/scripts/identity-check.sh"
   chmod +x "$dir/scripts/identity-check.sh"
+  cp "$ROOT/scripts/lib/credential-class.sh" "$dir/scripts/lib/credential-class.sh"    # identity-check --expect-write-identity (#1057)
 
   cat >"$dir/.github/review-policy.yml" <<'EOF'
 codex:
@@ -528,7 +529,7 @@ test_ambient_gh_token_bridges_to_reviewer_write() {
   local dir rc
   dir=$(make_real_wrapper_case "ambient-token-bridge")
 
-  local REVIEWER_PAT="reviewer-pat-sentinel-487"
+  local REVIEWER_PAT="ghp_reviewer-pat-sentinel-487"
   # gh stub: serves reaction GET ([]), the identity-check `api user` probe
   # (reviewer login ONLY for the bridged PAT), and the reaction POST; and FAILS
   # `gh auth token --user` so the bridge is the only viable reviewer-token source.
@@ -610,7 +611,7 @@ test_explicit_reviewer_pat_not_clobbered_by_ambient() {
   local dir rc
   dir=$(make_real_wrapper_case "explicit-pat-wins")
 
-  local CACHED_PAT="cached-reviewer-pat-487"
+  local CACHED_PAT="ghp_cached-reviewer-pat-487"
   local AMBIENT_TOKEN="ambient-read-token-487"
   cat >"$dir/bin/gh" <<EOF
 #!/usr/bin/env bash

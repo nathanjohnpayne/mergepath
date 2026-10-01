@@ -9,18 +9,36 @@
 #   scripts/gh-as-author.sh -- gh pr create --title ... --body-file pr-body.md
 #   scripts/gh-as-author.sh -- gh pr merge 123 --squash --delete-branch
 #   scripts/gh-as-author.sh -- gh pr edit 123 --add-label foo
+#   GH_AS_AUTHOR_PUSH_REPO=owner/repo scripts/gh-as-author.sh -- git -C <dir> push -u origin HEAD
+#
+# The payload must be gh itself, or exactly `git -C <dir> push -u origin HEAD`
+# (bootstrap's initial push). A prefix such as env, sudo or command is
+# refused: it could replace the verified token after the check. The git form
+# requires a primary repository whose .git/config holds only the fixed,
+# value-checked bootstrap allowlist, with remote.origin.url exactly
+# https://github.com/$GH_AS_AUTHOR_PUSH_REPO.git (or its git@github.com:
+# spelling, pushed over HTTPS). It runs with global and system config,
+# ~/.netrc, injected config and hooks out of reach and gh's credential helper
+# (the verified token) alone (#1541).
 #
 # Environment:
 #   GH_AS_AUTHOR_IDENTITY   author login to verify.
 #                           Default: nathanjohnpayne
 #   OP_PREFLIGHT_AUTHOR_PAT preferred cached author token.
+#   GH_AS_AUTHOR_PUSH_REPO  owner/repo the git form must push to (required
+#                           for it; from the caller's trusted input).
+#   GH_AS_AUTHOR_TRACE_MARKER  optional path, created after every check
+#                           passed and immediately before the gh write runs
+#                           (never inherited by it); gh payloads only.
 #
 # Exit codes:
 #   0    success
 #   1    setup or invocation error
 #   2    token verification failed
 #   3    token lookup failed
-#   5    post-create author verification failed or could not complete
+#   5    post-create author verification failed or could not complete, or
+#        the git push destination or repo config was refused
+#   70   GH_AS_AUTHOR_TRACE_MARKER could not be written; nothing ran
 #   *    propagated from the wrapped command otherwise
 #
 # Bash 3.2 portable.
@@ -67,6 +85,19 @@ if [ "$#" -eq 0 ]; then
   echo "gh-as-author: usage: scripts/gh-as-author.sh -- gh pr <create|merge|edit> ..." >&2
   exit 1
 fi
+# gh, or bootstrap's closed `git push` form (gh_author_payload_kind); any
+# prefix that could replace the verified token is refused (#1541).
+AUTHOR_PAYLOAD_KIND="$(gh_author_payload_kind "$@")" || exit 1
+# GH_AS_AUTHOR_TRACE_MARKER: a path the wrapper creates after every check
+# passed, immediately before the gh write runs, so a caller can tell "gh ran"
+# from "the wrapper refused first" (bootstrap::author_gh_traced). It means the
+# gh write ran, so it is not accepted with the git form.
+TRACE_MARKER="${GH_AS_AUTHOR_TRACE_MARKER:-}"
+unset GH_AS_AUTHOR_TRACE_MARKER
+if [ -n "$TRACE_MARKER" ] && [ "$AUTHOR_PAYLOAD_KIND" != "gh" ]; then
+  echo "gh-as-author: GH_AS_AUTHOR_TRACE_MARKER applies to gh writes only." >&2
+  exit 1
+fi
 
 set +e
 gh_resolve_token_for_identity "$AUTHOR" "OP_PREFLIGHT_AUTHOR_PAT" "gh-as-author"
@@ -76,6 +107,17 @@ if [ "$RESOLVE_RC" -ne 0 ]; then
   exit "$RESOLVE_RC"
 fi
 TOKEN="$GH_RESOLVED_TOKEN"
+
+if [ "$AUTHOR_PAYLOAD_KIND" = "git-push" ]; then
+  shift
+  set +e
+  # GH_AS_AUTHOR_PUSH_REPO: the owner/repo bootstrap created, from its own
+  # input; the repository's remote must be exactly that (#1541).
+  gh_author_git_push "$TOKEN" "${GH_AS_AUTHOR_PUSH_REPO:-}" "$@"
+  WRAPPED_RC=$?
+  set -e
+  exit "$WRAPPED_RC"
+fi
 
 is_pr_create_command() {
   gh_is_pr_create_command "$@"
@@ -186,9 +228,17 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
   set -- "${NORMALIZED_COMMAND[@]}"
 fi
 
+# The verified token goes to github.com only. Any other host gets the resolver's
+# non-credential sentinel in place of an Enterprise token or stored login, so
+# it can neither carry the write nor receive the PAT (see gh-token-resolver.sh).
 run_with_author_token() {
   unset GITHUB_TOKEN
-  GH_TOKEN="$TOKEN" "$@"
+  if [ -n "$TRACE_MARKER" ] && ! : >"$TRACE_MARKER"; then
+    echo "gh-as-author: cannot write the trace marker $TRACE_MARKER; refusing to run the write unrecorded." >&2
+    exit 70
+  fi
+  GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+    GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" "$@"
 }
 
 if [ "$IS_PR_CREATE" -eq 1 ]; then
@@ -213,7 +263,8 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
 
   ACTUAL_AUTHOR=$(
     unset GITHUB_TOKEN
-    GH_TOKEN="$TOKEN" gh pr view "$PR_NUM" --repo "$PR_REPO" --json author --jq .author.login 2>/dev/null || echo ""
+    GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+      GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" gh pr view "$PR_NUM" --repo "$PR_REPO" --json author --jq .author.login 2>/dev/null || echo ""
   )
   if [ -z "$ACTUAL_AUTHOR" ]; then
     echo "gh-as-author: ERROR could not read PR author from gh pr view $PR_NUM --repo $PR_REPO; refusing to treat the create as verified." >&2
