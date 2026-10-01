@@ -99,7 +99,8 @@ if [ "$rc" -eq 0 ] \
    && printf '%s' "$body" | grep -q "https://claude.ai/code/session_abc123" \
    && printf '%s' "$body" | grep -q "scripts/resolve-pr-threads.sh 12 --resolve-actioned" \
    && printf '%s' "$body" | grep -q "only once the step it stands for has completed: a dispatch that returned is not completion" \
-   && printf '%s' "$body" | grep -q 'gh run watch <id> --exit-status'; then
+   && printf '%s' "$body" | grep -q 'gh run watch <id> --exit-status' \
+   && printf '%s' "$body" | grep -qF "select(.displayTitle == \"Thread resolution lane: PR #12\")][0].databaseId'"; then
   pass "handback comment records capability, tier, head, accounting, session URL and the next command"
 else
   fail "happy path: rc=$rc err=$(cat "$WORKDIR/err") body=$body"
@@ -266,6 +267,12 @@ if [ -r "$LANE" ] && command -v yq >/dev/null 2>&1; then
     pass "lane is triggered only by repository_dispatch (default-branch copy only), never workflow_dispatch"
   else
     fail "lane triggers drifted: on=$triggers types=$types"
+  fi
+  # Each run is titled with its PR, which is what a resumer selects on.
+  if [ "$(yq -r '."run-name"' "$LANE")" = 'Thread resolution lane: PR #${{ github.event.client_payload.pr }}' ]; then
+    pass "lane runs are titled per PR, so a resumer can select its own PR's run"
+  else
+    fail "lane run-name drifted: $(yq -r '."run-name"' "$LANE")"
   fi
   run_step="$(yq -r '.jobs.resolve.steps[] | select(.name == "Resolve actioned threads") | .run' "$LANE")"
   if printf '%s' "$run_step" | grep -q -- '--resolve-actioned' \

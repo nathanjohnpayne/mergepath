@@ -1,4 +1,8 @@
 name: Thread resolution lane
+# A per-PR title, so a resumer selects its own PR's run rather than the most
+# recent one (CodeRabbit on #1555). Only a title: the payload never reaches a
+# script through an expression.
+run-name: "Thread resolution lane: PR #${{ github.event.client_payload.pr }}"
 
 # Resolve a PR's demonstrably-actioned bot review threads from CI, for a
 # session that cannot (#1057 item G).
