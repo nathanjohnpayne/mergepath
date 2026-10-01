@@ -340,22 +340,29 @@ if [ "$1" = "api" ] && [ "$2" = "user" ]; then
   case "${GH_TOKEN:-}" in ghp_author) echo nathanjohnpayne ;; *) exit 4 ;; esac; exit 0
 fi
 case "$1 $2" in
+  "run "*) echo "gh run does not support fine-grained PATs" >&2; exit 1 ;;
+  "api repos/o/r/actions/runs/222")
+    n=$(( $(cat "$D_LOG.w" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$D_LOG.w"
+    jq_expr=""; prev=""; for a in "$@"; do [ "$prev" = "--jq" ] && jq_expr="$a"; prev="$a"; done
+    if [ "$n" -lt 2 ]; then printf '{"status":"in_progress","conclusion":null}'
+    elif [ -n "${D_RUN_FAILS:-}" ]; then printf '{"status":"completed","conclusion":"failure"}'
+    elif [ -n "${D_RUN_HANGS:-}" ]; then printf '{"status":"queued","conclusion":null}'
+    else printf '{"status":"completed","conclusion":"success"}'; fi | jq -r "$jq_expr"; exit 0 ;;
   "api -X")
     [ -n "${D_DISPATCH_FAIL:-}" ] && exit 1
     for a in "$@"; do case "$a" in client_payload\[nonce\]=*) echo "${a#*=}" >"$D_NONCE" ;; esac; done
     exit 0 ;;
-  "run list")
+  "api repos/o/r/actions/workflows/thread-resolution-lane.yml/runs?event=repository_dispatch&per_page=100")
     n=$(( $(cat "$D_LOG.n" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$D_LOG.n"
     nonce="$(cat "$D_NONCE" 2>/dev/null || true)"
     jq_expr=""; prev=""; for a in "$@"; do [ "$prev" = "--jq" ] && jq_expr="$a"; prev="$a"; done
     # An older run of the same PR is always listed first; this dispatch's own
     # run is listed only from poll D_APPEAR_AT on.
-    runs='[{"databaseId":111,"displayTitle":"Thread resolution lane: PR #12 [old-nonce]"}]'
+    runs='[{"id":111,"display_title":"Thread resolution lane: PR #12 [old-nonce]"}]'
     if [ -n "${D_APPEAR_AT:-}" ] && [ "$n" -ge "$D_APPEAR_AT" ]; then
-      runs="[{\"databaseId\":222,\"displayTitle\":\"Thread resolution lane: PR #12 [$nonce]\"},{\"databaseId\":111,\"displayTitle\":\"Thread resolution lane: PR #12 [old-nonce]\"}]"
+      runs="[{\"id\":222,\"display_title\":\"Thread resolution lane: PR #12 [$nonce]\"},{\"id\":111,\"display_title\":\"Thread resolution lane: PR #12 [old-nonce]\"}]"
     fi
-    printf '%s' "$runs" | jq -r "$jq_expr"; exit 0 ;;
-  "run watch") [ -n "${D_RUN_FAILS:-}" ] && exit 1; exit 0 ;;
+    printf '{"workflow_runs":%s}' "$runs" | jq -r "$jq_expr"; exit 0 ;;
 esac
 echo "unexpected gh: $*" >&2; exit 9
 G
@@ -364,9 +371,10 @@ drun() { # <env...> -- <args...>
   local -a envs=()
   while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
   shift
-  : >"$DFIX/d.log"; rm -f "$DFIX/d.log.n" "$DFIX/nonce"
-  env -u GH_TOKEN -u GITHUB_TOKEN -u OP_PREFLIGHT_REVIEWER_PAT -u MERGEPATH_AGENT -u GH_AS_AUTHOR_IDENTITY \
+  : >"$DFIX/d.log"; rm -f "$DFIX/d.log.n" "$DFIX/d.log.w" "$DFIX/nonce"
+  env -u GH_TOKEN -u GITHUB_TOKEN -u MERGEPATH_AGENT -u GH_AS_AUTHOR_IDENTITY \
     PATH="$DFIX/bin:$PATH" D_LOG="$DFIX/d.log" D_NONCE="$DFIX/nonce" OP_PREFLIGHT_AUTHOR_PAT=ghp_author \
+    OP_PREFLIGHT_REVIEWER_PAT=ghp_reviewer_classic \
     DISPATCH_LANE_POLL_INTERVAL=1 ${envs[@]+"${envs[@]}"} \
     "$DFIX/scripts/dispatch-thread-resolution-lane.sh" 12 --repo o/r "$@"
 }
@@ -376,10 +384,10 @@ set -e
 nonce="$(cat "$DFIX/nonce" 2>/dev/null || true)"
 if [ "$rc" -eq 0 ] && [ -n "$nonce" ] \
    && grep -q $'TOKEN=ghp_author gh\tapi\t-X\tPOST\trepos/o/r/dispatches\t-f\tevent_type=thread-resolution-lane\t-F\tclient_payload\\[pr\\]=12' "$DFIX/d.log" \
-   && [ "$(grep -c $'gh\trun\tlist' "$DFIX/d.log")" -eq 3 ] \
-   && grep -q $'gh\trun\twatch\t222\t--repo\to/r\t--exit-status' "$DFIX/d.log" \
-   && ! grep -q $'gh\trun\twatch\t111' "$DFIX/d.log"; then
-  pass "dispatch: sends a nonce through the author wrapper, polls until its own run is listed, and watches that run, never the older one"
+   && [ "$(grep -c 'actions/workflows/thread-resolution-lane.yml/runs' "$DFIX/d.log")" -eq 3 ] \
+   && grep -q $'TOKEN=ghp_reviewer_classic gh\tapi\trepos/o/r/actions/runs/222' "$DFIX/d.log" \
+   && ! grep -q 'actions/runs/111' "$DFIX/d.log" && ! grep -q $'gh\trun\t' "$DFIX/d.log"; then
+  pass "dispatch: sends a nonce through the author wrapper, polls until its own run is listed, and follows that run over REST with the classic reviewer PAT (never gh run, never the older run)"
 else
   fail "dispatch happy path: rc=$rc nonce=$nonce err=$(cat "$DFIX/err") log=$(cat "$DFIX/d.log")"
 fi
@@ -387,13 +395,14 @@ set +e
 drun -- --appear-timeout 2 >/dev/null 2>"$DFIX/err"; r_none=$?
 drun D_APPEAR_AT=1 D_RUN_FAILS=1 -- >/dev/null 2>/dev/null; r_fail=$?
 drun D_DISPATCH_FAIL=1 -- >/dev/null 2>/dev/null; r_refused=$?
+drun D_APPEAR_AT=1 D_RUN_HANGS=1 -- --watch-timeout 2 >/dev/null 2>/dev/null; r_hang=$?
 out="$(drun D_APPEAR_AT=1 -- --no-wait 2>/dev/null)"; r_nowait=$?
 set -e
-if [ "$r_none" -eq 6 ] && ! grep -q $'gh\trun\twatch' "$DFIX/d.log" \
+if [ "$r_none" -eq 6 ] && [ "$r_hang" -eq 9 ] \
    && [ "$r_fail" -eq 8 ] && [ "$r_refused" -eq 4 ] && [ "$r_nowait" -eq 0 ] && [ "$out" = "222" ]; then
-  pass "dispatch: own run never listed -> exit 6 (the older run is not watched); run failed -> 8; dispatch refused -> 4; --no-wait prints the run id"
+  pass "dispatch: own run never listed -> exit 6 (the older run is not watched); run failed -> 8; never completes -> 9; dispatch refused -> 4; --no-wait prints the run id"
 else
-  fail "dispatch exits: none=$r_none fail=$r_fail refused=$r_refused nowait=$r_nowait out=$out"
+  fail "dispatch exits: none=$r_none hang=$r_hang fail=$r_fail refused=$r_refused nowait=$r_nowait out=$out"
 fi
 
 echo
