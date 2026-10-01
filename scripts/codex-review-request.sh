@@ -179,9 +179,9 @@
 #     # provider-authored evidence to its Phase 4b exit-2 waiver.
 #     "trigger_posted": true | false,
 #     "request_resumed": true | false,
-#     # true when this run resumed an earlier in-flight request instead of
-#     # posting one (#1550), including a resumed request this run later
-#     # replaced after it expired. Present only on this terminal JSON (exit 0
+#     # true when this invocation resumed an earlier in-flight request
+#     # instead of posting one (#1550), including one that expired and was
+#     # replaced by the fresh re-run (which reports it). Present only on this terminal JSON (exit 0
 #     # / 4); the --trigger-only, exit 5, exit 7 and timeout-reuse outputs
 #     # omit it. On a resume, rounds_waited_seconds counts from the resumed
 #     # request's posting, so it includes time before this run started.
@@ -309,6 +309,9 @@ if ! declare -F gh_failure_is_permanent >/dev/null 2>&1; then
 fi
 
 # --- argument parsing -------------------------------------------------------
+
+# The exact invocation, kept for the #1550 resume-expiry re-run below.
+__CRR_ORIGINAL_ARGS=("$@")
 
 # #489: --trigger-only posts (or confirms) the @codex review trigger and
 # returns WITHOUT polling for clearance. coderabbit-wait.sh's rate-limit
@@ -1964,7 +1967,10 @@ CAP_REUSED_TRIGGER=false
 CAP_REQUEST_COUNT=0
 CAP_REQUEST_LIMIT=0
 RESUMED_TRIGGER=false
+# A run re-executed after a resumed request expired (#1550) reports that the
+# invocation resumed first, although this process posts normally.
 RESUMED_EVER=false
+[ "${MERGEPATH_CODEX_RESUME_EXPIRED:-}" != 1 ] || RESUMED_EVER=true
 RESUMED_TRIGGER_ID=""
 
 if has_cleared_signal "$INITIAL_SCAN"; then
@@ -1973,7 +1979,8 @@ elif [ "$TRIGGER_ONLY" = "true" ] && existing_codex_trigger_on_head; then
   log "trigger-only: @codex review already requested on HEAD — skipping duplicate trigger (idempotent, #489)"
 elif [ "$TRIGGER_ONLY" = "true" ] && auto_trigger_content_free; then
   log "auto-trigger: $AUTO_TRIGGER_SKIP_REASON — skipping the automatic @codex review (#798)"
-elif [ "$TRIGGER_ONLY" != "true" ] && resume_pending_codex_request; then
+elif [ "$TRIGGER_ONLY" != "true" ] && [ "${MERGEPATH_CODEX_RESUME_EXPIRED:-}" != 1 ] \
+     && resume_pending_codex_request; then
   log "resuming pending request $RESUMED_TRIGGER_ID: Codex reports a review of HEAD Running since it was posted; no new trigger (#1550), ${ELAPSED}s of ${TIMEOUT_SECONDS}s already elapsed"
 else
   post_codex_trigger
@@ -2080,21 +2087,19 @@ run_review_poll
 
 # A resumed request that expired unanswered is a request Codex never answered
 # for this head within its bound, but this run did not post it, so it cannot
-# mint a timeout marker (#1550). Fall back to what the run would have done
-# without resuming: post a new trigger and poll it. At the request cap,
-# post_codex_trigger reuses or refuses exactly as it does for any other run.
+# mint a timeout marker (#1550). Fall back to exactly what an invocation
+# without resuming does by re-running this script as a fresh invocation with
+# resume disabled. The fresh run re-reads the live head, starts its own clock,
+# and reaches post_codex_trigger (cap check, idempotent reuse, accounting gate)
+# through the ordinary path. Continuing in this process instead would carry
+# this run's captured HEAD_SHA and its expired deadline into the replacement.
+# Nothing has been written to stdout yet, so the fresh run's JSON is the only
+# result.
 if [ "$RESUMED_TRIGGER" = true ] && ! has_post_trigger_signal "$FINAL_SCAN" \
    && [ -z "$(current_blocked_reason "$FINAL_SCAN")" ]; then
-  log "resumed request $RESUMED_TRIGGER_ID drew no Codex response within ${TIMEOUT_SECONDS}s of its posting — requesting a new review (#1550)"
-  RESUMED_TRIGGER=false
-  TRIGGER_SIGNAL_THRESHOLD=""
-  INITIAL_SCAN=$FINAL_SCAN
-  post_codex_trigger
-  if [ "$TRIGGER_POSTED" = "true" ]; then
-    FINAL_SCAN='{"review":null,"findings":[],"reaction":null,"verdict":null,"blocked":null}'
-    run_trigger_ack_gate
-  fi
-  run_review_poll
+  log "resumed request $RESUMED_TRIGGER_ID drew no Codex response within ${TIMEOUT_SECONDS}s of its posting — re-running as a fresh request with resume disabled (#1550)"
+  export MERGEPATH_CODEX_RESUME_EXPIRED=1
+  exec bash "$0" ${__CRR_ORIGINAL_ARGS[@]+"${__CRR_ORIGINAL_ARGS[@]}"}
 fi
 
 # A reused trigger grants no new timeout/fallback authority. If its bounded

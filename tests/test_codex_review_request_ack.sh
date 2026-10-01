@@ -1276,6 +1276,23 @@ test_malformed_timeout_marker_fails_closed_on_resume() {
   fi
 }
 
+# The re-run after an expired resume disables resuming outright, so the chain
+# cannot loop even if a pending request still looked resumable.
+test_expired_rerun_never_resumes() {
+  local dir rc count
+  dir=$(make_case "resume-rerun-guard" 0 0 60)
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 30
+  rc=$(MERGEPATH_CODEX_RESUME_EXPIRED=1 run_case "$dir" absent 1)
+  count=$(trigger_count "$dir")
+  if [ "$count" = 1 ] && ! grep -q 'resuming pending request' "$dir/err.log"; then
+    pass "#1550: the post-expiry re-run posts instead of resuming, so the chain cannot loop"
+  else
+    fail "#1550 re-run guard: exit $rc, $count trigger(s); stderr=$(cat "$dir/err.log")"
+  fi
+}
+
 test_resume_past_deadline_posts_new_request() {
   local dir rc count
   dir=$(make_case "resume-past-deadline" 0 0 60)
@@ -1300,7 +1317,11 @@ test_resumed_request_expiry_posts_new_request() {
   rc=$(run_case "$dir" absent 1)
   count=$(trigger_count "$dir")
   grep -q 'resuming pending request 900' "$dir/err.log" || fail "#1550 resume expiry: request was not resumed first"
-  grep -q 'resumed request 900 drew no Codex response' "$dir/err.log" || fail "#1550 resume expiry: no expiry log"
+  grep -q 'resumed request 900 drew no Codex response.*re-running as a fresh request' "$dir/err.log" || fail "#1550 resume expiry: no expiry log"
+  [ "$(grep -c 'resuming pending request' "$dir/err.log")" = 1 ] || fail "#1550 resume expiry: the fresh re-run resumed again"
+  [ "$(grep -c 'fetching HEAD commit metadata' "$dir/err.log")" = 2 ] \
+    || fail "#1550 resume expiry: the replacement did not run as a fresh invocation that re-reads the live head"
+  [ "$(jq -r '.request_resumed' "$dir/out.json")" = true ] || fail "#1550 resume expiry: the re-run did not report the invocation's resume"
   [ "$count" = 1 ] || fail "#1550 resume expiry: $count trigger(s), expected exactly one replacement request"
   # Only the replacement, which this run posted, may mint the timeout marker.
   [ "$rc" = 4 ] || fail "#1550 resume expiry: exit $rc, expected 4 after the replacement also timed out; stderr=$(cat "$dir/err.log")"
@@ -1403,6 +1424,7 @@ test_resume_survives_short_freshness_window
 test_resume_survives_future_committer_date
 test_resume_read_failure_is_retried_not_reposted
 test_malformed_timeout_marker_fails_closed_on_resume
+test_expired_rerun_never_resumes
 test_request_with_timeout_marker_is_not_resumed
 test_resume_past_deadline_posts_new_request
 test_resumed_request_expiry_posts_new_request
