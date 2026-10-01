@@ -77,7 +77,8 @@ Configure at chatgpt.com/codex/cloud/settings/environments:
 
 A session that meets one of the proxy ceilings should not engineer around it inside the sandbox. It should stop with the state it has established and hand the step to a session that can do it:
 
-- **GraphQL-only helpers** exit 6 with a message naming the ceiling (`scripts/lib/graphql-ceiling.sh`). Thread resolution is the common case: post the fix and the thread replies, and leave resolution to a local session or CI.
-- **Multi-branch pushes and cross-repo work** (propagation waves) belong to a local session or to the scheduled workflows that already run them in CI.
+- **Park the step on the PR.** Run `scripts/post-local-agent-handback.sh <PR#> --blocked <capability> --next "<command>"`. It posts a structured comment: the blocked capability, the tier, the head SHA, the feedback accounting, this session's transcript URL, and the next command. It then labels the PR `needs-local-agent`. The label is informational, never a merge gate. It uses REST only, and its author is the session's reviewer identity, so it works without GraphQL or an author token. If the post itself fails, the rendered comment is printed so it can be relayed another way.
+- **GraphQL-only helpers** exit 6 with a message naming the ceiling (`scripts/lib/graphql-ceiling.sh`). Thread resolution is the common case: post the fix and the thread replies, then dispatch the CI lane with `gh workflow run thread-resolution-lane.yml -f pr=<PR#>` (`.github/workflows/thread-resolution-lane.yml`). It runs `scripts/resolve-pr-threads.sh --resolve-actioned` from the default branch with the reviewer PAT. `gh workflow run` is a REST call, so the proxy allows it.
+- **Multi-branch pushes and cross-repo work** (propagation waves) belong to a local session. The branch-protection audit is already dispatchable in CI (`.github/workflows/branch-protection-audit.yml`).
 
 Do not repair a missing credential with `op-preflight.sh --mode review`, which triggers a biometric prompt nobody is present to answer.

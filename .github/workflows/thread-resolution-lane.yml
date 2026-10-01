@@ -1,0 +1,85 @@
+name: Thread resolution lane
+
+# Resolve a PR's demonstrably-actioned bot review threads from CI, for a
+# session that cannot (#1057 item G).
+#
+# Thread state and thread resolution exist only in GitHub's GraphQL API. In a
+# Claude Code cloud session the GitHub proxy serves only a pinned set of
+# GraphQL operations, whatever credential is used, so
+# scripts/resolve-pr-threads.sh can exit 6 (the ceiling) there. Everything
+# around resolution still works from the session: fixing, replying on the
+# threads, recording verdicts. This lane runs the resolution step itself, on
+# a real runner, when a session dispatches it:
+#
+#   gh workflow run thread-resolution-lane.yml -f pr=<PR#>
+#
+# `gh workflow run` is a REST call the proxy allows for the attached
+# repository. Only `--resolve-actioned` runs here: it resolves a thread only
+# when its fix or rebuttal is demonstrable AND bound to the finding (an agent
+# reply on the thread, or a recorded verdict), and leaves everything else
+# open. Deferral (`--auto-resolve-bots`) stays a deliberate, local decision.
+#
+# Auth model: REVIEWER_ASSIGNMENT_TOKEN, the nathanpayne-claude reviewer PAT
+# already used by the daily rollup and weekly sweep; the resolver verifies it
+# with identity-check.sh --expect-write-identity before any mutation, and
+# every resolve is read back (isResolved:true) before it counts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'Pull request number whose actioned bot threads to resolve'
+        required: true
+        type: number
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Resolve actioned bot threads
+    # workflow_dispatch runs the workflow DEFINITION from the dispatched ref,
+    # which a checkout pin cannot constrain: a feature-branch dispatch could
+    # run an edited copy of this file with the reviewer PAT. Run only the
+    # default branch's definition, as daily-feedback-rollup.yml does (#550).
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        # Pin the scripts to the trusted default branch (#465), and leave no
+        # checkout token in .git/config: the resolver authenticates gh with the
+        # explicit reviewer PAT and does no authenticated git.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Resolve actioned threads
+        env:
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          OP_PREFLIGHT_REVIEWER_PAT: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          MERGEPATH_AGENT: claude
+          PR_NUMBER: ${{ inputs.pr }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "ERROR: REVIEWER_ASSIGNMENT_TOKEN is empty; the lane cannot resolve threads without the reviewer PAT." >&2
+            exit 1
+          fi
+          case "$PR_NUMBER" in
+            ''|*[!0-9]*) echo "ERROR: pr must be a PR number; got '$PR_NUMBER'" >&2; exit 1 ;;
+          esac
+          rc=0
+          scripts/resolve-pr-threads.sh "$PR_NUMBER" --repo "$REPO" --resolve-actioned || rc=$?
+          # 3 means threads were left open on purpose (not actioned, human,
+          # stale): a completed pass, reported in the log, not a lane failure.
+          if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]; then
+            {
+              echo "### Thread resolution lane: $REPO#$PR_NUMBER"
+              echo
+              echo "resolve-pr-threads.sh --resolve-actioned exited $rc (0 = nothing left unresolved, 3 = some threads intentionally left open; see the log)."
+            } >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          exit "$rc"

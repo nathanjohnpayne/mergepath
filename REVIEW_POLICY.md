@@ -800,6 +800,21 @@ nathanpayne-{suggested_agent}
 
 The human uses this message to brief the external agent. The external agent does not need access to the internal review thread—the handoff message contains everything needed to begin.
 
+### Local-agent handback
+
+The fourth member of the handoff family, for a step a session cannot complete, as opposed to a review it cannot give. A cloud session that reaches one of its ceilings runs `scripts/post-local-agent-handback.sh <PR#> --blocked <capability> --next "<command>"`. The ceilings are the GraphQL-only thread resolution, pushing a second branch, and reaching another repository (see `docs/agents/cloud-environments.md`). The script posts a structured PR comment (marker `<!-- mergepath-handback: v1 head=<sha> blocked=<capability> -->`) under the session's reviewer identity, reads its author back, and adds the `needs-local-agent` label. The comment records:
+
+- the blocked capability and the session's measured tier
+- the head SHA the state was established at, and the review-feedback accounting at that head
+- the session's transcript URL
+- the exact next command
+
+It uses REST only, so it works in the session most likely to need it.
+
+The resuming session first confirms the head has not moved. It then runs the next command and removes `needs-local-agent`. For a `graphql` handback, the next command is usually a dispatch of the thread-resolution lane: `gh workflow run thread-resolution-lane.yml -f pr=<PR#>`. That lane runs `scripts/resolve-pr-threads.sh --resolve-actioned` from the default branch with the reviewer PAT.
+
+`needs-local-agent` is informational. It is not a blocking label (`scripts/lib/blocking-labels.sh`), no gate reads its presence or absence, and agents may remove it; `label-removal-guard.sh` does not protect it. Removing it clears nothing else: `human-hold`, `needs-human-review` and `policy-violation` keep their own rules.
+
 ### Chat-side handoff block
 
 The PR-side comment above is the durable record on the PR itself. The **chat-side handoff block** is an additive, copy-paste-friendly summary the originating agent emits **into chat** at the same moment it alerts the human — it does NOT replace the PR-side comment. The human pastes the chat-side block directly into the external reviewer's CLI session (typically `nathanpayne-codex`) to brief that session in one keystroke; the external agent then opens the PR for the full context surfaced by the PR-side comment.

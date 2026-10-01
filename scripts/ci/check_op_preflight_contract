@@ -33,6 +33,8 @@ TESTS=(
   # #1057 F: the committed cloud-environment recipe, its SessionStart hook and
   # its setup script.
   "tests/test_cloud_environment.sh"
+  # #1057 D + G: the local-agent handback and the thread-resolution CI lane.
+  "tests/test_local_agent_handback.sh"
 )
 
 FAILED=0
