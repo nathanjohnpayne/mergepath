@@ -263,6 +263,35 @@ for bad in --dryrun "--dry-run extra" -n; do
   fi
 done
 
+# A PATH entry with a trailing slash still resolves the installed gh: the check
+# is real command resolution, not a string match (Codex on #1552).
+set +e
+run_setup "$WORKDIR/p-slash" MERGEPATH_GH_SHA256="$sum" PATH="$WORKDIR/p-slash/bin/:$SBIN" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ -x "$WORKDIR/p-slash/bin/gh" ]; then
+  pass "setup, install directory on PATH with a trailing slash: accepted"
+else
+  fail "setup trailing-slash PATH: rc=$rc err=$(cat "$WORKDIR/setup.err")"
+fi
+
+# A tool on PATH that does not run is not present: setup fails (Codex on #1552).
+for tool in gh jq; do
+  BROKE="$WORKDIR/broken-$tool"
+  mkdir -p "$BROKE"
+  printf '#!/usr/bin/env bash\nexit 126\n' >"$BROKE/$tool"
+  chmod +x "$BROKE/$tool"
+  [ "$tool" = gh ] || ln -sf "$WORKDIR/p-good/bin/gh" "$BROKE/gh"
+  : >"$WORKDIR/curl.log"
+  set +e
+  run_setup "$WORKDIR/p-broken-$tool" PATH="$BROKE:$SBIN" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+  set -e
+  if [ "$rc" -eq 1 ] && grep -q "$tool is on PATH .* but does not run" "$WORKDIR/setup.err"; then
+    pass "setup, a $tool on PATH that does not run: fails instead of reporting it present"
+  else
+    fail "setup broken $tool: rc=$rc err=$(cat "$WORKDIR/setup.err")"
+  fi
+done
+
 # gh already present: nothing is downloaded.
 ln -sf "$WORKDIR/p-good/bin/gh" "$SBIN/gh"
 : >"$WORKDIR/curl.log"

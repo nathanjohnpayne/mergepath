@@ -132,22 +132,41 @@ install_gh() {
   log "installed gh $GH_VERSION to $prefix/bin/gh (sha256 verified)"
   # Exit 0 means every required tool is usable afterwards: a gh the guarded
   # writes cannot find is not installed for them (Codex on #1552).
-  case ":$PATH:" in
-    *":$prefix/bin:"*) ;;
-    *) log "$prefix/bin is not on PATH, so later commands cannot find gh; add $prefix/bin to the environment's PATH, or set MERGEPATH_TOOL_PREFIX to the PARENT of a directory already on PATH (gh goes to <prefix>/bin, so for ~/.local/bin on PATH use ~/.local)"; return 1 ;;
+  # Tested by real command resolution, not a string match on PATH, so an
+  # equivalent entry (a trailing slash, a symlinked directory) counts (Codex on
+  # #1552).
+  hash -r 2>/dev/null || true
+  local resolved
+  resolved="$(command -v gh 2>/dev/null || true)"
+  case "$resolved" in
+    /*) [ "$resolved" -ef "$prefix/bin/gh" ] && return 0 ;;
   esac
+  log "$prefix/bin is not on PATH, so later commands cannot find gh; add $prefix/bin to the environment's PATH, or set MERGEPATH_TOOL_PREFIX to the PARENT of a directory already on PATH (gh goes to <prefix>/bin, so for ~/.local/bin on PATH use ~/.local)"
+  return 1
 }
 
 status=0
 
+# A tool counts as present only if it actually runs: a stale or corrupt binary
+# on PATH must fail setup, not pass it (Codex on #1552).
 if command -v gh >/dev/null 2>&1; then
-  log "gh present: $(gh --version 2>/dev/null | head -1)"
+  if gh_v="$(gh --version 2>/dev/null)"; then
+    log "gh present: $(printf '%s\n' "$gh_v" | head -1)"
+  else
+    log "gh is on PATH ($(command -v gh)) but does not run (gh --version failed); replace it or remove it so this script can install a pinned one"
+    status=1
+  fi
 else
   install_gh || status=1
 fi
 
 if command -v jq >/dev/null 2>&1; then
-  log "jq present: $(jq --version 2>/dev/null)"
+  if jq_v="$(jq --version 2>/dev/null)"; then
+    log "jq present: $jq_v"
+  else
+    log "jq is on PATH ($(command -v jq)) but does not run (jq --version failed); reinstall it with the image's package manager"
+    status=1
+  fi
 else
   log "jq is missing and is required by every helper; install it with the image's package manager (apt-get install -y jq)"
   status=1
