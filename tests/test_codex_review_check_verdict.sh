@@ -41,14 +41,38 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 SUMMARY_SELECTOR=$(sed -n \
   '/^# BEGIN codex_review_summary_selector$/,/^# END codex_review_summary_selector$/p' \
   "$SCRIPT")
+# #1550: the row grammar lives in scripts/lib/codex-request-evidence.sh so the
+# requester's resume check reads it too. The gate keeps a delegating
+# crc_select_codex_review_summary; assert the composition the gate runs.
+EVIDENCE_LIB="$(dirname "$SCRIPT")/lib/codex-request-evidence.sh"
 if [ -n "$SUMMARY_SELECTOR" ] \
    && grep -q '^crc_select_codex_review_summary()' <<<"$SUMMARY_SELECTOR" \
-   && grep -q 'codex-pull-request-review-summary' <<<"$SUMMARY_SELECTOR" \
-   && grep -q 'updated_at' <<<"$SUMMARY_SELECTOR"; then
+   && grep -q 'crqe_select_codex_review_summary' <<<"$SUMMARY_SELECTOR" \
+   && [ -r "$EVIDENCE_LIB" ] \
+   && grep -q 'codex-pull-request-review-summary' "$EVIDENCE_LIB" \
+   && grep -q 'updated_at' "$EVIDENCE_LIB"; then
+  # shellcheck source=../scripts/lib/codex-request-evidence.sh
+  . "$EVIDENCE_LIB"
   eval "$SUMMARY_SELECTOR"
-  pass "#1157: codex-review-check.sh exposes the marker-scoped mutable summary selector"
+  pass "#1157: codex-review-check.sh exposes the marker-scoped mutable summary selector (shared lib, #1550)"
 else
   fail "#1157: codex-review-check.sh is missing the marker-scoped mutable summary selector"
+fi
+
+# Without the lib the gate fails closed (exit 3) instead of reporting "no
+# summary": in diagnostic mode a newer Running summary is what keeps a stale
+# same-head review from clearing (#1157), so a silent null could clear it.
+missing_lib_rc=0
+missing_lib_out=$(env -u BASH_ENV bash -c '
+  __CODEX_CHECK_DIR=/nonexistent
+  eval "$1"
+  crc_select_codex_review_summary "$2" "chatgpt-codex-connector[bot]" d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708
+  echo reached-after-selector
+' _ "$SUMMARY_SELECTOR" '[{"user":{"login":"chatgpt-codex-connector[bot]"},"body":"<!-- codex-pull-request-review-summary -->","id":1}]' 2>/dev/null) || missing_lib_rc=$?
+if [ "$missing_lib_rc" = 3 ] && [ -z "$missing_lib_out" ]; then
+  pass "#1550: crc_select_codex_review_summary fails closed (exit 3) when the shared lib is absent"
+else
+  fail "#1550: crc_select_codex_review_summary without the shared lib returned rc=$missing_lib_rc output='$missing_lib_out', expected exit 3 and no output"
 fi
 
 SUMMARY_BOT="chatgpt-codex-connector[bot]"
