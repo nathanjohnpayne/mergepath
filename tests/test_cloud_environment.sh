@@ -40,6 +40,7 @@ echo "probe $*" >>"$PROBE_LOG"
 cat <<'JSON'
 {"surface":"claude-cloud","repo":"o/r","tier":"author-writes","transient_failures":false,
  "capabilities":{"read":{"granted":true,"reason":"r"},"author-writes":{"granted":true,"reason":"a"},
+ "reviewer-writes":{"granted":false,"reason":"no-verified-token"},
  "push-multi-branch":{"granted":false,"reason":"documented"}}}
 JSON
 PROBE
@@ -56,9 +57,11 @@ fi
 
 out="$(CLAUDE_CODE_REMOTE=true PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'capability tier `author-writes`' \
-   && printf '%s' "$out" | grep -q -- '- push-multi-branch: no, documented' \
+   && printf '%s' "$out" | grep -q -- '- push-multi-branch: no, documented (proxy ceiling: hand this step to a local session or CI)' \
+   && printf '%s' "$out" | grep -q -- '- reviewer-writes: no, no-verified-token (fix the credential or setup, then re-run' \
+   && printf '%s' "$out" | grep -q -- '- author-writes: yes, a$' \
    && grep -q -- '--quiet' "$WORKDIR/probe.log"; then
-  pass "hook, cloud session: runs the probe and prints the tier and each capability"
+  pass "hook, cloud session: prints each capability, a proxy ceiling as hand-off and a credential denial as fix-first"
 else
   fail "hook cloud: rc=$rc out=$out"
 fi

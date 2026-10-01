@@ -34,7 +34,15 @@ fi
 printf '%s\n' "$result" | jq -r '
   "mergepath cloud session on \(.surface) for \(.repo): capability tier `\(.tier)`" +
   (if .transient_failures then " (some checks failed transiently; re-run scripts/agent-capability-probe.sh)" else "" end) + ".",
-  (.capabilities | to_entries[] | "- \(.key): \(if .value.granted then "yes" else "no" end), \(.value.reason)"),
-  "Writes go through scripts/gh-as-author.sh / scripts/gh-as-reviewer.sh. Capabilities marked no are properties of this session, not errors to retry; hand those steps to a local session or CI (docs/agents/cloud-environments.md)."
+  # A "no" is one of two different things (Codex on #1552): the proxy
+  # ceilings (graphql, cross-repo, push-multi-branch) are properties of the
+  # session, to hand off; every other "no" (author-writes, reviewer-writes,
+  # read) is a credential or setup problem, to fix and re-probe.
+  (.capabilities | to_entries[] |
+    "- \(.key): \(if .value.granted then "yes" else "no" end), \(.value.reason)" +
+    (if .value.granted then ""
+     elif (.key == "graphql" or .key == "cross-repo" or .key == "push-multi-branch") then " (proxy ceiling: hand this step to a local session or CI)"
+     else " (fix the credential or setup, then re-run scripts/agent-capability-probe.sh)" end)),
+  "Writes go through scripts/gh-as-author.sh / scripts/gh-as-reviewer.sh. A no marked as a proxy ceiling is a property of this session: hand those steps to a local session or CI. Any other no is a credential or setup problem to fix first (docs/agents/cloud-environments.md, Credentials)."
 ' 2>/dev/null || echo "mergepath cloud session: capability summary could not be rendered; run scripts/agent-capability-probe.sh."
 exit 0
