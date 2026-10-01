@@ -2281,6 +2281,43 @@ for c in alpha bravo charlie delta epsilon; do
 done
 echo "PASS: every consumer is still named with its drift counts in a truncated report (#988)"
 
+# --- (3b) stderr log lines are not mistaken for consumer headers --------
+#
+# The workflow captures `--audit 2>&1`, so the script's log() lines on stderr
+# share the stream with the stdout report. A cold cache puts one directly
+# under each consumer's header, at column 0 and ending in `)` exactly like a
+# header. The summariser used to match headers as "column 0, ends in )", so
+# the clone line opened a consumer section of its own: the real header was
+# reported as `in sync 0, drifted 0, missing 0, skipped 0` and the clone line
+# carried the counts (#1203, run 36396222388). The fixture is the interleaved
+# shape that run produced, plus a refresh line and an ERROR line.
+LOGS="$WFDIR/interleaved"; mkdir -p "$LOGS"
+for c in matchline swipewatch; do
+  printf '%s (nathanjohnpayne/%s)\n' "$c" "$c"
+  printf '[sync-to-downstream] cloning nathanjohnpayne/%s into /home/runner/.cache/mergepath-sync/%s (depth=1)\n' "$c" "$c"
+  printf '[sync-to-downstream] refreshing cached clone at /home/runner/.cache/mergepath-sync/%s\n' "$c"
+  printf '  baseline: main@abc1234 (cache clone, refreshed from origin default branch)\n'
+  printf '  ✓ %-50s in sync\n' "scripts/a.sh" "scripts/b.sh" "scripts/c.sh"
+  printf '[sync-to-downstream] ERROR: transient read for %s (retrying)\n' "$c"
+  printf '  ✗ %-50s drift: 2 diff line(s)\n' "scripts/d.sh" "scripts/e.sh"
+  printf '  ⊘ %-50s missing entirely\n' "scripts/absent.sh"
+  printf '  ↷ %-50s skipped per .sync-overrides.yml: local fork\n' "scripts/override.sh"
+  printf '\n'
+done > "$LOGS/audit-output.txt"
+( cd "$LOGS" && GITHUB_STEP_SUMMARY="$LOGS/step-summary.md" \
+    bash "$WFDIR/summarise-step.sh" > /dev/null 2>&1 ) \
+  || wf_fail "summarise step failed on interleaved stdout/stderr audit output"
+expected_summary="$(printf '%s\n' \
+  'matchline (nathanjohnpayne/matchline) — in sync 3, drifted 2, missing 1, skipped 1' \
+  'swipewatch (nathanjohnpayne/swipewatch) — in sync 3, drifted 2, missing 1, skipped 1')"
+[ "$(cat "$LOGS/consumer-summary.txt")" = "$expected_summary" ] \
+  || wf_fail "interleaved log lines corrupted the per-consumer summary:
+--- expected
+$expected_summary
+--- got
+$(cat "$LOGS/consumer-summary.txt")"
+echo "PASS: stderr log lines interleaved with the audit report do not steal a consumer's counts (#1203)"
+
 # --- (4) A small audit is NOT truncated ---------------------------------
 #
 # Guards the other direction: a step that always truncates would pass every

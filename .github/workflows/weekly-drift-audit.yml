@@ -261,8 +261,18 @@ jobs:
           # per .sync-overrides.yml. They are matched as literal byte
           # prefixes rather than by field index because the detail text
           # after the path is free-form.
+          #
+          # The header is matched by its exact `<name> (<owner>/<repo>)`
+          # shape, not by "column 0 and ends in )". audit-output.txt holds
+          # the script's stdout AND stderr (2>&1 above), and its stderr
+          # log() lines also sit at column 0: `[sync-to-downstream]
+          # cloning <owner>/<repo> into <path> (depth=1)` ends in `)`. The
+          # loose match took that clone line, which lands right after each
+          # consumer's header, as a consumer of its own, so the real header
+          # reported all-zero counts and the clone line carried the
+          # consumer's counts (#1203, run 36396222388).
           awk '
-            /^[^ \t]/ && /\)$/ { consumer = $0; order[++n] = consumer; next }
+            /^[A-Za-z0-9._-]+ \([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\)$/ { consumer = $0; order[++n] = consumer; next }
             consumer == "" { next }
             index($0, "  ✓ ") == 1 { ok[consumer]++;      next }
             index($0, "  ✗ ") == 1 { drifted[consumer]++; next }
