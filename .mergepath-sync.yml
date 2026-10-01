@@ -1274,6 +1274,8 @@ paths:
       - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
       - "scripts/codex-review-request.sh"                 # changed by #1057 A2; the test asserts its new behavior
+      - "scripts/lib/codex-request-evidence.sh"   # #1550, staged into fixtures; Review Summary selector for resume
+      - "scripts/lib/gh-retry-helpers.sh"         # #1550, staged into fixtures; transient-read classifier
   # #489 CodeRabbit-rate-limit Codex-failover trigger-only path of
   # codex-review-request.sh (posts `@codex review` when CodeRabbit is rate-
   # limited). check_codex_scripts hard-runs it (same `No such file` exit-127
@@ -1296,6 +1298,9 @@ paths:
   - path: tests/test_codex_review_request_verdict.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/codex-review-request.sh"   # #1550, asserts fetch_scan_array and scan_codex_state statuses
+      - "scripts/lib/gh-retry-helpers.sh"   # #1550, sourced for the transient-read classifier cases
   # Write-token / keyring-fallback regression (#737): the `@codex review`
   # trigger must resolve a token from the gh keyring when the op-preflight
   # cache has lapsed, and fail loud (never silently no-op) when it cannot.
@@ -1321,6 +1326,9 @@ paths:
   - path: tests/test_codex_review_check_verdict.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/codex-review-check.sh"           # #1550, asserts the delegating summary selector
+      - "scripts/lib/codex-request-evidence.sh"   # #1550, sourced for crqe_select_codex_review_summary
   # Gate (a) required-check scoping regression (#655): force-includes the
   # optional repo_lint_local.yml annex's repo-lint-local check into gate
   # (a)'s scrutiny regardless of branch protection's required-check list.
