@@ -40,8 +40,10 @@ echo "probe $*" >>"$PROBE_LOG"
 cat <<'JSON'
 {"surface":"claude-cloud","repo":"o/r","tier":"author-writes","transient_failures":false,
  "capabilities":{"read":{"granted":true,"reason":"r"},"author-writes":{"granted":true,"reason":"a"},
- "reviewer-writes":{"granted":false,"reason":"no-verified-token"},
- "push-multi-branch":{"granted":false,"reason":"documented"}}}
+ "reviewer-writes":{"granted":false,"basis":"measured","reason":"no-verified-token"},
+ "graphql":{"granted":false,"basis":"measured","reason":"viewer query returned 500"},
+ "cross-repo":{"granted":false,"basis":"measured","reason":"GET repos/x/y returned 403"},
+ "push-multi-branch":{"granted":false,"basis":"documented","reason":"documented"}}}
 JSON
 PROBE
 chmod +x "$HFIX/scripts/agent-capability-probe.sh"
@@ -58,10 +60,12 @@ fi
 out="$(CLAUDE_CODE_REMOTE=true PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'capability tier `author-writes`' \
    && printf '%s' "$out" | grep -q -- '- push-multi-branch: no, documented (proxy ceiling: hand this step to a local session or CI)' \
-   && printf '%s' "$out" | grep -q -- '- reviewer-writes: no, no-verified-token (fix the credential or setup, then re-run' \
+   && printf '%s' "$out" | grep -q -- '- reviewer-writes: no, no-verified-token (fix the credential, tools or setup, then re-run' \
+   && printf '%s' "$out" | grep -q -- '- graphql: no, viewer query returned 500 (fix the credential, tools or setup' \
+   && printf '%s' "$out" | grep -q -- '- cross-repo: no, GET repos/x/y returned 403 (proxy ceiling' \
    && printf '%s' "$out" | grep -q -- '- author-writes: yes, a$' \
    && grep -q -- '--quiet' "$WORKDIR/probe.log"; then
-  pass "hook, cloud session: prints each capability, a proxy ceiling as hand-off and a credential denial as fix-first"
+  pass "hook, cloud session: classifies each no from the probe's basis and reason (a GraphQL 500 is fix-first, a documented or 403 cross-repo denial is a ceiling)"
 else
   fail "hook cloud: rc=$rc out=$out"
 fi
@@ -173,7 +177,7 @@ while [ "\$#" -gt 0 ]; do case "\$1" in -o) out="\$2"; shift 2 ;; http*) url="\$
 echo "\$url" >>"$WORKDIR/curl.log"
 case "\$url" in
   *checksums.txt) exit 22 ;;  # never fetched: the expected hash is pinned, not downloaded
-  *.tar.gz) cp "$REL/gh_${VER}_linux_amd64.tar.gz" "\$out" ;;
+  *.tar.gz) f="$REL/\${url##*/}"; [ -f "\$f" ] || f="$REL/gh_${VER}_linux_amd64.tar.gz"; cp "\$f" "\$out" ;;
   *) exit 22 ;;
 esac
 C
@@ -284,10 +288,28 @@ set +e
 ( cd "$WORKDIR/relroot" && env -i HOME="$WORKDIR" PATH="tools/bin:$SBIN" MERGEPATH_GH_VERSION="$VER" \
     MERGEPATH_TOOL_PREFIX=tools MERGEPATH_GH_SHA256="$sum" "$SBIN/bash" "$SETUP" ) >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
 set -e
-if [ "$rc" -eq 0 ] && [ -x "$WORKDIR/relroot/tools/bin/gh" ]; then
-  pass "setup, relative prefix on a relative PATH entry: accepted"
+if [ "$rc" -eq 1 ] && grep -q "relative PATH entry" "$WORKDIR/setup.err"; then
+  pass "setup, gh reachable only through a relative PATH entry: refused (it would not resolve from another directory)"
 else
   fail "setup relative PATH: rc=$rc err=$(cat "$WORKDIR/setup.err")"
+fi
+
+# An installed binary that does not run (noexec mount, incompatible build)
+# fails setup even though its executable bits are set (Codex on #1552).
+BVER=8.8.8
+mkdir -p "$REL/gh_${BVER}_linux_amd64/bin"
+printf '#!/usr/bin/env bash\nexit 126\n' >"$REL/gh_${BVER}_linux_amd64/bin/gh"
+chmod +x "$REL/gh_${BVER}_linux_amd64/bin/gh"
+tar -czf "$REL/gh_${BVER}_linux_amd64.tar.gz" -C "$REL" "gh_${BVER}_linux_amd64"
+if command -v sha256sum >/dev/null 2>&1; then bsum="$(sha256sum "$REL/gh_${BVER}_linux_amd64.tar.gz" | awk '{print $1}')"
+else bsum="$(shasum -a 256 "$REL/gh_${BVER}_linux_amd64.tar.gz" | awk '{print $1}')"; fi
+set +e
+run_setup "$WORKDIR/p-norun" MERGEPATH_GH_VERSION="$BVER" MERGEPATH_GH_SHA256="$bsum" PATH="$WORKDIR/p-norun/bin:$SBIN" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && grep -q "does not run (gh --version failed" "$WORKDIR/setup.err"; then
+  pass "setup, installed binary that does not run: fails instead of reporting success"
+else
+  fail "setup unrunnable install: rc=$rc err=$(cat "$WORKDIR/setup.err")"
 fi
 
 # The shared operating rules (propagated) point every repo at the recipe.

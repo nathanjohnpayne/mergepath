@@ -34,15 +34,21 @@ fi
 printf '%s\n' "$result" | jq -r '
   "mergepath cloud session on \(.surface) for \(.repo): capability tier `\(.tier)`" +
   (if .transient_failures then " (some checks failed transiently; re-run scripts/agent-capability-probe.sh)" else "" end) + ".",
-  # A "no" is one of two different things (Codex on #1552): the proxy
-  # ceilings (graphql, cross-repo, push-multi-branch) are properties of the
-  # session, to hand off; every other "no" (author-writes, reviewer-writes,
-  # read) is a credential or setup problem, to fix and re-probe.
+  # A "no" is classified from what the probe measured, never from the key
+  # alone (Codex on #1552): a proxy ceiling is a documented denial, the probe
+  # GraphQL-ceiling reason, or a cross-repo 403/404 in a Claude cloud session,
+  # and is handed off; a not-measured capability says so; any other "no" (a
+  # 500, a missing tool, a token problem) is fixed and re-probed.
+  .surface as $surface |
   (.capabilities | to_entries[] |
     "- \(.key): \(if .value.granted then "yes" else "no" end), \(.value.reason)" +
     (if .value.granted then ""
-     elif (.key == "graphql" or .key == "cross-repo" or .key == "push-multi-branch") then " (proxy ceiling: hand this step to a local session or CI)"
-     else " (fix the credential or setup, then re-run scripts/agent-capability-probe.sh)" end)),
+     elif (.value.basis == "documented")
+          or ((.value.reason // "") | startswith("proxy GraphQL ceiling"))
+          or ($surface == "claude-cloud" and .key == "cross-repo" and ((.value.reason // "") | test("returned (403|404)$")))
+       then " (proxy ceiling: hand this step to a local session or CI)"
+     elif (.value.basis == "not-measured") then " (not measured)"
+     else " (fix the credential, tools or setup, then re-run scripts/agent-capability-probe.sh)" end)),
   "Writes go through scripts/gh-as-author.sh / scripts/gh-as-reviewer.sh. A no marked as a proxy ceiling is a property of this session: hand those steps to a local session or CI. Any other no is a credential or setup problem to fix first (docs/agents/cloud-environments.md, Credentials)."
 ' 2>/dev/null || echo "mergepath cloud session: capability summary could not be rendered; run scripts/agent-capability-probe.sh."
 exit 0

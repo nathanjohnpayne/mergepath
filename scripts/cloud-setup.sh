@@ -97,6 +97,8 @@ install_gh() {
   asset="gh_${GH_VERSION}_${os}_${arch}.tar.gz"
   base="https://github.com/cli/cli/releases/download/v${GH_VERSION}"
   prefix="$(choose_prefix)"
+  # An absolute prefix, so the result does not depend on this directory.
+  case "$prefix" in /*) ;; *) prefix="$(pwd)/$prefix" ;; esac
   if ! expected="$(pinned_sha256 "$asset")"; then
     expected="${MERGEPATH_GH_SHA256:-}"
     case "$expected" in
@@ -129,6 +131,9 @@ install_gh() {
   cp "$tmp/gh_${GH_VERSION}_${os}_${arch}/bin/gh" "$prefix/bin/gh" || { log "could not copy gh into $prefix/bin"; return 1; }
   chmod 755 "$prefix/bin/gh" || { log "could not make $prefix/bin/gh executable"; return 1; }
   [ -x "$prefix/bin/gh" ] || { log "$prefix/bin/gh is not executable after install"; return 1; }
+  # Executable bits are not proof it runs (a noexec mount, an incompatible
+  # build): the installed binary must answer --version (Codex on #1552).
+  "$prefix/bin/gh" --version >/dev/null 2>&1 || { log "$prefix/bin/gh does not run (gh --version failed; noexec mount or incompatible build?)"; return 1; }
   log "installed gh $GH_VERSION to $prefix/bin/gh (sha256 verified)"
   # Exit 0 means every required tool is usable afterwards: a gh the guarded
   # writes cannot find is not installed for them (Codex on #1552).
@@ -138,11 +143,15 @@ install_gh() {
   hash -r 2>/dev/null || true
   local resolved
   resolved="$(command -v gh 2>/dev/null || true)"
-  # A relative PATH entry resolves to a relative path; the same-file test
-  # (-ef) decides either way (CodeRabbit on #1552).
-  if [ -n "$resolved" ] && [ "$resolved" -ef "$prefix/bin/gh" ]; then
-    return 0
-  fi
+  # A relative resolution only holds from this directory: a later command run
+  # elsewhere would not find gh, so it is refused (Codex on #1552).
+  case "$resolved" in
+    /*) [ "$resolved" -ef "$prefix/bin/gh" ] && return 0 ;;
+    ?*) if [ "$resolved" -ef "$prefix/bin/gh" ]; then
+          log "gh resolves through a relative PATH entry ($resolved), which works only from this directory; put the absolute $prefix/bin on PATH"
+          return 1
+        fi ;;
+  esac
   log "$prefix/bin is not on PATH, so later commands cannot find gh; add $prefix/bin to the environment's PATH, or set MERGEPATH_TOOL_PREFIX to the PARENT of a directory already on PATH (gh goes to <prefix>/bin, so for ~/.local/bin on PATH use ~/.local)"
   return 1
 }
