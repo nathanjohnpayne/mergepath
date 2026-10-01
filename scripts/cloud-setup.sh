@@ -105,7 +105,10 @@ install_gh() {
   for tool in curl tar; do
     command -v "$tool" >/dev/null 2>&1 || { log "$tool is required to install gh"; return 1; }
   done
-  tmp="$(mktemp -d "${TMPDIR:-/tmp}/cloud-setup.XXXXXX")"
+  # install_gh runs in an `||` list, where `set -e` does not apply inside the
+  # function, so every step checks its own status (CodeRabbit and Codex on
+  # #1552): a failed step must fail the install, never log "installed".
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/cloud-setup.XXXXXX")" || { log "could not create a temporary directory"; return 1; }
   # shellcheck disable=SC2064  # expand $tmp now
   trap "rm -rf '$tmp'" EXIT
   curl -fsSL --connect-timeout 15 --max-time 300 -o "$tmp/$asset" "$base/$asset" \
@@ -115,10 +118,11 @@ install_gh() {
     log "checksum mismatch for $asset (expected $expected, got $actual); refusing to install"
     return 1
   fi
-  tar -xzf "$tmp/$asset" -C "$tmp"
-  mkdir -p "$prefix/bin"
-  cp "$tmp/gh_${GH_VERSION}_${os}_${arch}/bin/gh" "$prefix/bin/gh"
-  chmod 755 "$prefix/bin/gh"
+  tar -xzf "$tmp/$asset" -C "$tmp" || { log "could not unpack $asset"; return 1; }
+  mkdir -p "$prefix/bin" || { log "could not create $prefix/bin"; return 1; }
+  cp "$tmp/gh_${GH_VERSION}_${os}_${arch}/bin/gh" "$prefix/bin/gh" || { log "could not copy gh into $prefix/bin"; return 1; }
+  chmod 755 "$prefix/bin/gh" || { log "could not make $prefix/bin/gh executable"; return 1; }
+  [ -x "$prefix/bin/gh" ] || { log "$prefix/bin/gh is not executable after install"; return 1; }
   log "installed gh $GH_VERSION to $prefix/bin/gh (sha256 verified)"
   case ":$PATH:" in
     *":$prefix/bin:"*) ;;

@@ -130,7 +130,9 @@ fi
 # uname (pretend Linux x86_64) and curl (serve from the fixture dir).
 SBIN="$WORKDIR/setup-bin"
 mkdir -p "$SBIN"
-for tool in bash awk tar mkdir cp chmod mktemp rm head sha256sum shasum perl sed tr cat env jq dirname; do
+# gzip: GNU tar runs it from PATH for -z (bsdtar on macOS does not), so a
+# hermetic PATH without it fails every unpack on Linux (Codex on #1552).
+for tool in bash awk tar gzip mkdir cp chmod mktemp rm head sha256sum shasum perl sed tr cat env jq dirname; do
   real="$(command -v "$tool" 2>/dev/null || true)"
   case "$real" in /*) ln -sf "$real" "$SBIN/$tool" ;; esac
 done
@@ -182,6 +184,21 @@ for spec in "p-bad:0000000000000000000000000000000000000000000000000000000000000
     fail "setup $dir: rc=$rc err=$(cat "$WORKDIR/setup.err")"
   fi
 done
+
+# Every install step checks its own status: an unwritable prefix fails the
+# install instead of logging "installed" (CodeRabbit and Codex on #1552).
+mkdir -p "$WORKDIR/p-ro"
+chmod 555 "$WORKDIR/p-ro"
+set +e
+run_setup "$WORKDIR/p-ro" MERGEPATH_GH_SHA256="$sum" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+chmod 755 "$WORKDIR/p-ro"
+if [ "$rc" -eq 1 ] && [ ! -e "$WORKDIR/p-ro/bin/gh" ] && ! grep -q "installed gh" "$WORKDIR/setup.err" \
+   && grep -q "could not create $WORKDIR/p-ro/bin" "$WORKDIR/setup.err"; then
+  pass "setup, unwritable prefix: fails the install, never reports it installed"
+else
+  fail "setup unwritable prefix: rc=$rc err=$(cat "$WORKDIR/setup.err")"
+fi
 
 # The default version's hash is pinned in the script: a tarball that does not
 # match it (here the fixture, served for the real asset name) is refused.
