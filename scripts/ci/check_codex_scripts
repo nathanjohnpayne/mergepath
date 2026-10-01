@@ -74,6 +74,9 @@ echo "check_codex_scripts: running codex-review-check gate (c) resolution tests"
 echo "check_codex_scripts: running blocked request evidence tests (#1276)"
 "$REPO_ROOT/tests/test_codex_request_evidence.sh"
 
+echo "check_codex_scripts: running report-only Codex review ledger tests (#1560)"
+"$REPO_ROOT/tests/test_codex_review_ledger.sh"
+
 echo "check_codex_scripts: running codex-review-check verdict-comment clearance tests (#600)"
 "$REPO_ROOT/tests/test_codex_review_check_verdict.sh"
 

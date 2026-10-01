@@ -181,3 +181,29 @@ crqe_select_codex_review_summary() { # issue-comments-json bot-login head-sha
     | max_by([.observed_at, .comment_id]) // null
   '
 }
+
+# Parse every Codex-bot issue comment that carries a "Reviewed commit: <sha>"
+# anchor into {comment_id, created_at, reviewed_shas, affirmative}, oldest
+# first. The anchor scan and the affirmative test are the exact expressions
+# codex-review-request.sh (scan_codex_state) and codex-review-check.sh
+# (CODEX_VERDICT_JSON) use for their HEAD-scoped verdict signal;
+# tests/test_codex_review_ledger.sh pins all three copies byte-for-byte so
+# they cannot drift. Callers decide what a verdict means for them: this
+# reports, it does not select a head or decide clearance.
+crqe_verdicts() { # issue-comments-json bot-login
+  printf '%s\n' "${1:-[]}" | jq -c --arg bot "${2:-}" '
+    [ .[]
+      | select((.user.login // "") == $bot)
+      | . as $c
+      | ( [ $c.body // ""
+            | ascii_downcase
+            | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
+            | .[0]
+          ] ) as $shas
+      | select(($shas | length) > 0)
+      | { comment_id: .id, created_at: .created_at, reviewed_shas: $shas,
+          affirmative: ((.body // "") | test("(?im)^\\s*codex review:\\s*didn.?t find any major issues\\b")) }
+    ]
+    | sort_by(.created_at, .comment_id)
+  '
+}
