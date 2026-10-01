@@ -215,14 +215,16 @@ case "$endpoint" in
   repos/owner/repo/pulls/999/reviews)
     # #1550 scenarios count review reads: read 1 is the pre-flight scan.
     case "$scenario" in
-      resume-running|poll-502-once|poll-502-always|poll-404|resume-blocked)
+      resume-running|poll-502-once|poll-502-always|poll-404|resume-blocked|resume-read-502-once)
         reads=0
         [ ! -f "$state_dir/review-reads" ] || reads=$(cat "$state_dir/review-reads")
         reads=$((reads + 1))
         printf '%s\n' "$reads" >"$state_dir/review-reads"
         ;;
     esac
-    if [ "$scenario" = "resume-blocked" ]; then
+    if [ "$scenario" = "resume-read-502-once" ] && [ "$reads" -gt 1 ]; then
+      printf '[{"id":94,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:01:00Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"response to the resumed request"}]\n' "$bot"
+    elif [ "$scenario" = "resume-blocked" ]; then
       # An older P1 review on HEAD that the pending request asked Codex to
       # reconsider; it predates the request, so it is not its answer.
       printf '[{"id":98,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-03T23:59:30Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"older findings"}]\n' "$bot"
@@ -302,6 +304,21 @@ case "$endpoint" in
     fi
     ;;
   repos/owner/repo/issues/999/comments)
+    case "$scenario" in
+      resume-read-502-once|resume-read-502-always)
+        rreads=0
+        [ ! -f "$state_dir/resume-reads" ] || rreads=$(cat "$state_dir/resume-reads")
+        rreads=$((rreads + 1))
+        printf '%s\n' "$rreads" >"$state_dir/resume-reads"
+        # Read 1 is the pre-flight scan; read 2 is the resume check.
+        if { [ "$scenario" = resume-read-502-once ] && [ "$rreads" -eq 2 ]; } \
+           || { [ "$scenario" = resume-read-502-always ] && [ "$rreads" -ge 2 ]; }; then
+          printf '{"message":"Bad Gateway"}\n'
+          echo "gh: HTTP 502 Server Error" >&2
+          exit 1
+        fi
+        ;;
+    esac
     if [ "$scenario" = "resume-blocked" ]; then
       # Reads 1-2 are the pre-flight scan and the resume check; the account
       # block lands while the resumed request is being polled.
@@ -1212,6 +1229,53 @@ test_resume_survives_future_committer_date() {
   fi
 }
 
+# Unreadable resume evidence is not absent evidence: a transient failure is
+# retried, and one that persists fails closed instead of posting a duplicate.
+test_resume_read_failure_is_retried_not_reposted() {
+  local dir rc count before=$FAIL
+  dir=$(make_case "resume-read-502-once" 0 0 60)
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 30
+  rc=$(MERGEPATH_CODEX_SCAN_RETRY_BACKOFF_SECONDS=0 run_case "$dir" resume-read-502-once 1)
+  count=$(trigger_count "$dir")
+  [ "$rc" = 0 ] || fail "#1550 resume read retry: exit $rc, expected 0; stderr=$(cat "$dir/err.log")"
+  [ "$count" = 0 ] || fail "#1550 resume read retry: posted $count trigger(s) after one transient read failure"
+  grep -q 'resume-check issue comments read hit a transient GitHub read failure' "$dir/err.log" \
+    || fail "#1550 resume read retry: no retry log"
+  [ "$FAIL" -ne "$before" ] || pass "#1550: a transient failure reading resume evidence is retried, not turned into a new trigger"
+
+  before=$FAIL
+  dir=$(make_case "resume-read-502-always" 0 0 60)
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 30
+  rc=$(MERGEPATH_CODEX_SCAN_RETRY_BACKOFF_SECONDS=0 run_case "$dir" resume-read-502-always 1)
+  count=$(trigger_count "$dir")
+  [ "$rc" = 3 ] || fail "#1550 resume read persistent: exit $rc, expected 3; stderr=$(cat "$dir/err.log")"
+  [ "$count" = 0 ] || fail "#1550 resume read persistent: posted $count trigger(s) on unreadable evidence"
+  [ "$FAIL" -ne "$before" ] || pass "#1550: resume evidence that stays unreadable fails closed (exit 3) without posting"
+}
+
+# Malformed trusted timeout-marker evidence fails closed, as it does for the
+# cap path's preserve_final_request_timeout, instead of posting.
+test_malformed_timeout_marker_fails_closed_on_resume() {
+  local dir rc count
+  dir=$(make_case "resume-malformed-marker" 0 0 60)
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  jq -cn '{id:901,user:{login:"nathanjohnpayne"},body:"<!-- mergepath-phase-4a-terminal:v1 provider=codex outcome=timeout head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa trigger_comment_id=abc -->",created_at:"2026-06-04T00:00:05Z"}' \
+    >>"$dir/state/comments.jsonl"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 30
+  rc=$(run_case "$dir" absent 1)
+  count=$(trigger_count "$dir")
+  if [ "$rc" = 3 ] && [ "$count" = 0 ] && grep -q 'trusted terminal-marker evidence is malformed' "$dir/err.log"; then
+    pass "#1550: malformed trusted timeout-marker evidence fails closed on the resume check"
+  else
+    fail "#1550 malformed marker: exit $rc, $count trigger(s); stderr=$(cat "$dir/err.log")"
+  fi
+}
+
 test_resume_past_deadline_posts_new_request() {
   local dir rc count
   dir=$(make_case "resume-past-deadline" 0 0 60)
@@ -1337,6 +1401,8 @@ test_answered_request_is_not_resumed
 test_resumed_block_does_not_clear_on_stale_review
 test_resume_survives_short_freshness_window
 test_resume_survives_future_committer_date
+test_resume_read_failure_is_retried_not_reposted
+test_malformed_timeout_marker_fails_closed_on_resume
 test_request_with_timeout_marker_is_not_resumed
 test_resume_past_deadline_posts_new_request
 test_resumed_request_expiry_posts_new_request

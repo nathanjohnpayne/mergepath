@@ -1808,27 +1808,35 @@ record_phase4a_timeout_determination() {
   log "confirmed Phase 4a timeout marker comment $post_id for $HEAD_SHA"
 }
 
-# Re-scan after a trigger, retrying transient read failures (#1550). Sets
-# FINAL_SCAN in the caller's shell, so call it directly, never inside $( ).
-# Status 4 from scan_codex_state means a transient read failure; anything else
-# non-zero is permanent and fails closed at once, as every scan did before.
-rescan_codex_state() { # <what>
-  local attempt=1 rc scan
+# Run a read, retrying transient failures (#1550), and store its output in
+# <out-var> in the caller's shell, so call it directly, never inside $( ).
+# Status 4 from the read means a transient failure; anything else non-zero is
+# permanent and fails closed at once. A transient failure that outlasts the
+# retries fails closed too: an unreadable answer is never treated as an empty
+# one.
+read_with_transient_retry() { # <what> <out-var> <command> [args...]
+  local what=$1 out_var=$2 attempt=1 rc out
+  shift 2
   while :; do
     rc=0
-    scan=$(scan_codex_state) || rc=$?
+    out=$("$@") || rc=$?
     if [ "$rc" -eq 0 ]; then
-      FINAL_SCAN=$scan
+      printf -v "$out_var" '%s' "$out"
       return 0
     fi
-    [ "$rc" -eq 4 ] || die 3 "$1 failed"
+    [ "$rc" -eq 4 ] || die 3 "$what failed"
     if [ "$attempt" -ge "$SCAN_RETRY_ATTEMPTS" ]; then
-      die 3 "$1 failed: transient GitHub read failure persisted across $attempt attempt(s)"
+      die 3 "$what failed: transient GitHub read failure persisted across $attempt attempt(s)"
     fi
-    log "$1 hit a transient GitHub read failure (attempt $attempt/$SCAN_RETRY_ATTEMPTS); retrying in ${SCAN_RETRY_BACKOFF_SECONDS}s (#1550)"
+    log "$what hit a transient GitHub read failure (attempt $attempt/$SCAN_RETRY_ATTEMPTS); retrying in ${SCAN_RETRY_BACKOFF_SECONDS}s (#1550)"
     sleep "$SCAN_RETRY_BACKOFF_SECONDS"
     attempt=$((attempt + 1))
   done
+}
+
+# Re-scan after a trigger (#1550); sets FINAL_SCAN.
+rescan_codex_state() { # <what>
+  read_with_transient_retry "$1" FINAL_SCAN scan_codex_state
 }
 
 # Resume an in-flight request instead of re-posting it (#1550). A rerun after
@@ -1843,7 +1851,11 @@ rescan_codex_state() { # <what>
 # That shows a review of this head is in flight since the request; it still
 # cannot say which request started it, and nothing here needs it to. Without
 # that evidence the caller posts a new trigger exactly as before, so an
-# unproven case costs a request, never a missed review.
+# unproven case costs a request, never a missed review. Evidence that cannot
+# be READ is not evidence of absence: the comments read retries transient
+# failures and then fails closed (exit 3), and a malformed selector result or
+# trusted timeout marker fails closed too, rather than posting a duplicate
+# into a review that may be running.
 #
 # The resumed wait ends at the pending trigger's own deadline (its created_at
 # plus review_timeout_seconds), so resuming never extends a request's wait.
@@ -1851,21 +1863,23 @@ rescan_codex_state() { # <what>
 # caller posts a new trigger, and only that trigger can mint a timeout marker.
 resume_pending_codex_request() {
   [ -n "$AUTHOR_IDENTITY" ] || return 1
-  local comments pending created created_epoch summary status observed now deadline
-  comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments (resume check)") \
-    || return 1
+  local comments="" pending created created_epoch summary status observed now deadline
+  read_with_transient_retry "resume-check issue comments read" comments \
+    fetch_scan_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments (resume check)"
   # The latest exact author request, with no freshness anchor. Neither anchor
   # proves head attribution: the reaction-freshness floor may be shorter than
   # the reply deadline, and HEAD_PUSHED_AT falls back to the author-controlled
   # committer date, which a future date would push past every current request.
   # Staleness is bounded by the request's own deadline below, and the
   # exact-head Running summary is what ties the request to this head.
-  pending=$(crqe_select_trigger "$comments" "$AUTHOR_IDENTITY" "") || return 1
+  pending=$(crqe_select_trigger "$comments" "$AUTHOR_IDENTITY" "") \
+    || die 3 "cannot select the pending Codex request for the resume check"
   [ -n "$pending" ] && [ "$pending" != null ] || return 1
-  created=$(printf '%s' "$pending" | jq -r '.created_at // ""') || return 1
+  created=$(printf '%s' "$pending" | jq -r '.created_at // ""') \
+    || die 3 "cannot read the pending Codex request's timestamp"
   created_epoch=$(jq -rn --arg t "$created" '$t | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null) \
-    || return 1
-  [[ "$created_epoch" =~ ^[0-9]+$ ]] || return 1
+    || die 3 "cannot parse the pending Codex request's timestamp '$created'"
+  [[ "$created_epoch" =~ ^[0-9]+$ ]] || die 3 "cannot parse the pending Codex request's timestamp '$created'"
 
   # Answered or provider-blocked since the pending trigger: a new round needs
   # a new request, so do not resume.
@@ -1882,26 +1896,33 @@ resume_pending_codex_request() {
 
   # A request that already minted a Phase 4a timeout determination (for
   # example at a shorter review_timeout_seconds) is settled: Phase 4b may have
-  # consumed that waiver. Resuming it would reopen a closed attempt, so treat
-  # it as not resumable. An unreadable marker state is not proof either way;
-  # fall back to posting, as before #1550.
-  local marker_state=unknown
-  if [ "$CODEX_FAILURE_MARKERS_OK" = true ] \
-     && command -v codex_phase4a_timeout_marker_state >/dev/null 2>&1; then
-    marker_state=$(codex_phase4a_timeout_marker_state "$HEAD_SHA" "$AUTHOR_IDENTITY" "$comments" \
-      | jq -r '.state // "unknown"' 2>/dev/null) || marker_state=unknown
+  # consumed that waiver. Resuming it would reopen a closed attempt, so it is
+  # not resumable. Malformed trusted marker evidence fails closed, as it does
+  # in preserve_final_request_timeout. Only a missing marker helper (a partial
+  # install) skips resuming, which is the pre-#1550 behaviour.
+  local marker_state
+  if [ "$CODEX_FAILURE_MARKERS_OK" != true ] \
+     || ! command -v codex_phase4a_timeout_marker_state >/dev/null 2>&1; then
+    log "terminal-marker helper unavailable — not resuming (#1550)"
+    return 1
   fi
+  marker_state=$(codex_phase4a_timeout_marker_state "$HEAD_SHA" "$AUTHOR_IDENTITY" "$comments" \
+    | jq -r '.state // "malformed"' 2>/dev/null) || marker_state=malformed
   case "$marker_state" in
     none|stale|superseded) ;;
-    *)
-      log "pending request $(printf '%s' "$pending" | jq -r .id) has Phase 4a timeout marker state '$marker_state' — not resuming"
+    current)
+      log "pending request $(printf '%s' "$pending" | jq -r .id) has Phase 4a timeout marker state 'current' — not resuming"
       return 1
       ;;
+    *) die 3 "cannot classify the pending Codex request for resume: trusted terminal-marker evidence is malformed" ;;
   esac
 
-  summary=$(crqe_select_codex_review_summary "$comments" "$BOT_LOGIN" "$HEAD_SHA") || return 1
-  status=$(printf '%s' "$summary" | jq -r 'if . == null then "" else .status end') || return 1
-  observed=$(printf '%s' "$summary" | jq -r 'if . == null then "" else .observed_at end') || return 1
+  summary=$(crqe_select_codex_review_summary "$comments" "$BOT_LOGIN" "$HEAD_SHA") \
+    || die 3 "cannot read the Codex Review Summary for the resume check"
+  status=$(printf '%s' "$summary" | jq -r 'if . == null then "" else .status end') \
+    || die 3 "cannot read the Codex Review Summary for the resume check"
+  observed=$(printf '%s' "$summary" | jq -r 'if . == null then "" else .observed_at end') \
+    || die 3 "cannot read the Codex Review Summary for the resume check"
   if [ "$status" != running ] || [ -z "$observed" ] || [[ "$observed" < "$created" ]]; then
     log "pending request $(printf '%s' "$pending" | jq -r .id) has no Codex Running summary on HEAD since it was posted (status '${status:-none}') — not resuming"
     return 1
