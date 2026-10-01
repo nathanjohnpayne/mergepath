@@ -1059,6 +1059,10 @@ def _find_substitutions(s, quotes_are_literal=False):
     i = 0
     n = len(s)
     in_single = False
+    # Double-quote state is tracked only so an apostrophe inside double quotes
+    # stays literal; substitutions are still found in both states, because
+    # bash runs a `$( )` written inside double quotes (#1494).
+    in_double = False
     while i < n:
         c = s[i]
         if c == "\\" and i + 1 < n:
@@ -1069,7 +1073,11 @@ def _find_substitutions(s, quotes_are_literal=False):
                 in_single = False
             i += 1
             continue
-        if c == "'" and not quotes_are_literal:
+        if c == '"' and not quotes_are_literal:
+            in_double = not in_double
+            i += 1
+            continue
+        if c == "'" and not quotes_are_literal and not in_double:
             in_single = True
             i += 1
             continue
@@ -1454,8 +1462,12 @@ class Lexer:
                 continue
 
             # Inside `${...}` or `$((...))` or `"..."`: track a reference by
-            # name but do not treat operators as structure.
-            if quotes:
+            # name but do not treat operators as structure.  A backtick inside
+            # double quotes is still a command substitution, exactly as `$(`
+            # is above; reading its body as part of the string let a `"` in
+            # it close the string and a later `'` swallow the rest of the
+            # file (#1494 review).
+            if quotes and not (c == "`" and quotes[-1] == '"'):
                 if c == "\n":
                     line += 1
                 cur_level()["word"].append(c)
@@ -1810,12 +1822,65 @@ class Lexer:
         finish_word()
 
 
+def _skip_backtick(text, i):
+    """Return the index just past the backtick closing the one at `i`.
+
+    A backslash escapes the next character, so `\\`` inside the body is data
+    and does not close it.  Returns len(text) when the body never closes.
+    """
+    j = i + 1
+    n = len(text)
+    while j < n:
+        if text[j] == "\\":
+            j += 2
+            continue
+        if text[j] == "`":
+            return j + 1
+        j += 1
+    return n
+
+
+def _double_quoted_step(text, i, legacy):
+    """Advance one step inside double quotes; return (next_index, legacy).
+
+    Inside double quotes an apostrophe is literal, so the structural walkers
+    must not read it as opening a single-quoted span (#1494).  What they
+    cannot do without a shell parser is find where a `$( )` written inside
+    the string ENDS: its body is full command grammar (case patterns, `#`
+    comments, `${x:-a(b}` operands, here-docs), and every attempt to match it
+    structurally reopened a regression this walker already handled (#1498).
+
+    So the apostrophe fix is scoped to text the walker can read exactly.
+    Until the first `$(` inside double quotes, a `'` is literal -- bash's
+    own rule.  From that `$(` on, `legacy` is set and the caller reverts to
+    the pre-#1494 reading for the REST OF THE WALK, which treats a `'` as
+    quoting wherever it appears.  That reading is what kept a quote inside a
+    nested substitution (`"$(printf '%s' '")')"`) from closing the outer
+    string, so the fix is never worse than the walker it replaces.  An
+    apostrophe AFTER a `$( )` in the same walk keeps the old miss, declared
+    in KNOWN_MISSES.
+
+    A backtick substitution has an unambiguous end -- bash closes it at the
+    first unescaped backtick, quotes included -- so it is skipped exactly
+    and does not need the legacy reading.
+    """
+    c = text[i]
+    if legacy:
+        return i + 1, legacy
+    if c == "$" and text[i + 1 : i + 2] == "(":
+        return i + 1, True
+    if c == "`":
+        return _skip_backtick(text, i), legacy
+    return i + 1, legacy
+
+
 def _skip_balanced_parens(text, start):
     """Return the index just past the `)` matching the `(` at `start`."""
     depth = 0
     i = start
     n = len(text)
     quotes = []
+    legacy = False
     while i < n:
         c = text[i]
         if quotes and quotes[-1] == "'":
@@ -1826,7 +1891,7 @@ def _skip_balanced_parens(text, start):
         if c == "\\":
             i += 2
             continue
-        if c == "'":
+        if c == "'" and (not quotes or legacy):
             quotes.append("'")
             i += 1
             continue
@@ -1838,7 +1903,7 @@ def _skip_balanced_parens(text, start):
             i += 1
             continue
         if quotes:
-            i += 1
+            i, legacy = _double_quoted_step(text, i, legacy)
             continue
         if c == "(":
             depth += 1
@@ -2726,6 +2791,7 @@ def _find_compound_close(text, open_idx):
     i = open_idx
     n = len(text)
     quotes = []
+    legacy = False
     while i < n:
         c = text[i]
         if quotes and quotes[-1] == "'":
@@ -2740,7 +2806,7 @@ def _find_compound_close(text, open_idx):
             eol = text.find("\n", i)
             i = n if eol == -1 else eol
             continue
-        if c == "'":
+        if c == "'" and (not quotes or legacy):
             quotes.append("'")
             i += 1
             continue
@@ -2752,7 +2818,7 @@ def _find_compound_close(text, open_idx):
             i += 1
             continue
         if quotes:
-            i += 1
+            i, legacy = _double_quoted_step(text, i, legacy)
             continue
         if c == opener:
             depth += 1
@@ -2920,15 +2986,37 @@ def _word_has_verbatim_positional(w):
     """
     i = 0
     n = len(w)
+    # Same scoping as _double_quoted_step: an apostrophe inside double quotes
+    # is literal until the first `$(` written inside them; from there on the
+    # rest of the word keeps the pre-#1494 reading, where every `'` quotes.
+    # Double quotes are tracked only for that decision (#1494).
+    in_double = False
+    legacy = False
     while i < n:
         c = w[i]
         if c == "\\" and i + 1 < n:
             i += 2
             continue
-        if c == "'":
+        if c == '"' and not legacy:
+            in_double = not in_double
+            i += 1
+            continue
+        if c == "'" and (legacy or not in_double):
             j = w.find("'", i + 1)
             i = n if j == -1 else j + 1
             continue
+        if in_double and not legacy:
+            if c == "$" and w[i + 1 : i + 2] == "(":
+                legacy = True
+            elif c == "`":
+                # Exact end (first unescaped backtick); its body still
+                # expands, so grade it as a word of its own.
+                end = _skip_backtick(w, i)
+                closed = end - 1 > i and w[end - 1] == "`"
+                if _word_has_verbatim_positional(w[i + 1 : end - 1 if closed else end]):
+                    return True
+                i = end
+                continue
         if c == "$":
             if i + 1 < n and w[i + 1] == "{":
                 j = i + 2
@@ -4174,6 +4262,196 @@ CORPUS = [
         "array-cmdsub-captured",
         MUST_NOT_FLAG,
         'args=($(printf \'%s\' "$GH_TOKEN"))\necho "n=${#args[@]}"\n',
+    ),
+    # #1494: an apostrophe inside double quotes is literal.  Read as an opening
+    # single quote, it made the array walker ignore the real `)` and silently
+    # consume the later emitter; each repro is paired with its no-apostrophe
+    # control.
+    (
+        "array-double-quoted-apostrophe-later-emitter",
+        MUST_FLAG,
+        'msgs=("don\'t panic")\n'
+        'echo "$GH_TOKEN"\n',
+    ),
+    (
+        "array-double-quoted-no-apostrophe-later-emitter-control",
+        MUST_FLAG,
+        'msgs=("do not panic")\n'
+        'echo "$GH_TOKEN"\n',
+    ),
+    (
+        "array-double-quoted-apostrophe-cmdsub-stderr",
+        MUST_FLAG,
+        'msgs=("don\'t $(printf \'%s\' "$GH_TOKEN" >&2)")\n',
+    ),
+    (
+        "array-double-quoted-no-apostrophe-cmdsub-stderr-control",
+        MUST_FLAG,
+        'msgs=("do not $(printf \'%s\' "$GH_TOKEN" >&2)")\n',
+    ),
+    # A quote inside a substitution written in the double-quoted element belongs
+    # to the inner command and must not close the outer string (#1494 review).
+    (
+        "array-double-quoted-nested-substitution-quote-context",
+        MUST_FLAG,
+        'args=("$(printf \'%s\' \'")\')"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        "array-double-quoted-backtick-quote-context",
+        MUST_FLAG,
+        'args=("`printf \'%s\' \'")\'`"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        "array-double-quoted-backtick-quote-context-no-emitter-control",
+        MUST_NOT_FLAG,
+        'args=("`printf \'%s\' \'")\'`"); echo ok\n',
+    ),
+    (
+        "array-double-quoted-escaped-backtick-quote-context",
+        MUST_FLAG,
+        'args=("`printf \'%s\' \'\\`")\'`"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        "array-double-quoted-escaped-backtick-no-emitter-control",
+        MUST_NOT_FLAG,
+        'args=("`printf \'%s\' \'\\`")\'`"); echo ok\n',
+    ),
+    # A backtick substitution ends exactly, so an apostrophe after it is still
+    # literal.
+    (
+        "array-double-quoted-backtick-then-apostrophe",
+        MUST_FLAG,
+        'msgs=("`printf x` don\'t")\n'
+        'echo "$GH_TOKEN"\n',
+    ),
+    # Declared in KNOWN_MISSES: after a `$( )` in the same walk the walkers keep
+    # the pre-#1494 reading, so a later apostrophe still opens a span.
+    (
+        "array-double-quoted-apostrophe-after-substitution",
+        MUST_NOT_FLAG,
+        'msgs=("$(printf x) don\'t")\n'
+        'echo "$GH_TOKEN"\n',
+    ),
+    # Here-doc delimiters inside the element's substitution keep their verdicts:
+    # `<<E\<newline>OF` ends at EOF, and `<<''` ends at a blank line with its
+    # body read as data (#1498 review, r4129909600 / r4129909632).
+    (
+        "array-heredoc-continued-delimiter-later-emitter",
+        MUST_FLAG,
+        'args=("$(cat <<E\\\n'
+        'OF\n'
+        'data\n'
+        'EOF\n'
+        ')"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        "array-heredoc-quoted-empty-delimiter-safe",
+        MUST_NOT_FLAG,
+        'args=("$(cat <<\'\'\n'
+        'case x in\n'
+        '\n'
+        ')"); : "$GH_TOKEN"\n',
+    ),
+    # Function bodies: the same rule in the function matcher and the positional
+    # decider (#1494), including the nested `$( )` and backtick cases (#1494
+    # review).
+    (
+        "helper-double-quoted-apostrophe",
+        MUST_FLAG,
+        'die() { echo "can\'t: $1" >&2; }\n'
+        'die "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-double-quoted-no-apostrophe-control",
+        MUST_FLAG,
+        'die() { echo "cannot: $1" >&2; }\n'
+        'die "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-double-quoted-nested-substitution-quote-context",
+        MUST_FLAG,
+        'die() { echo "$(printf \'%s\' \'")\') $1" >&2; }\n'
+        'die "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-double-quoted-nested-substitution-positional",
+        MUST_FLAG,
+        'die() { echo "$(printf \'%s\' \'"\')$1" >&2; }\n'
+        'die "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-double-quoted-backtick-quote-context",
+        MUST_FLAG,
+        'die() { echo "`printf \'%s\' \'")\'`  $1" >&2; }\n'
+        'die "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-backtick-single-quoted-positional-control",
+        MUST_NOT_FLAG,
+        'die() { echo "`printf \'%s\' \'$1\'`"; }\n'
+        'die "$GH_TOKEN"\n',
+    ),
+    # A redefinition replaces the earlier body in helper discovery, so losing
+    # its close dropped the emitter the first call uses (#1498 review,
+    # r4129909620).
+    (
+        "helper-redefined-with-double-quoted-backtick",
+        MUST_FLAG,
+        'die() { echo "$1"; }\n'
+        'die "$GH_TOKEN"\n'
+        'die() { echo "`printf \'%s\' \'"}\'` $1"; }\n',
+    ),
+    # Xtrace spans: an uncalled function's `set +x` keeps its body span.
+    (
+        "xtrace-disable-after-double-quoted-apostrophe-in-function",
+        MUST_FLAG,
+        'set -x\n'
+        'quiet() {\n'
+        '  echo "don\'t trace"\n'
+        '  set +x\n'
+        '}\n'
+        ': "$GH_TOKEN"\n',
+    ),
+    (
+        "xtrace-disable-after-double-quoted-no-apostrophe-control",
+        MUST_FLAG,
+        'set -x\n'
+        'quiet() {\n'
+        '  echo "do not trace"\n'
+        '  set +x\n'
+        '}\n'
+        ': "$GH_TOKEN"\n',
+    ),
+    (
+        "xtrace-function-nested-substitution-quote-context",
+        MUST_FLAG,
+        'set -x\n'
+        'quiet() {\n'
+        '  printf \'%s\' "$(printf \'%s\' \'")\')" >/dev/null\n'
+        '  set +x\n'
+        '}\n'
+        ': "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-xtrace-nested-substitution-quote-context",
+        MUST_FLAG,
+        'leak() {\n'
+        '  set -x\n'
+        '  : "$(printf \'%s\' \'"\')$1"\n'
+        '}\n'
+        'set +x\n'
+        'leak "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-xtrace-nested-substitution-single-quoted-control",
+        MUST_NOT_FLAG,
+        'leak() {\n'
+        '  set -x\n'
+        '  : "$(printf \'%s\' \'"\')"\'$1\'\n'
+        '}\n'
+        'set +x\n'
+        'leak "$GH_TOKEN"\n'
+        'echo ok\n',
     ),
     (
         # A SUBSHELL inside an array assignment's absorbed `$( )`.  The same
@@ -5644,6 +5922,16 @@ CORPUS.extend(_generated_corpus())
 # fails when an undeclared disagreement appears AND when a declared entry stops
 # disagreeing, so neither list can quietly rot.
 KNOWN_MISSES = {
+    "array-double-quoted-apostrophe-after-substitution": (
+        "an apostrophe that FOLLOWS a `$( )` in the same structural walk.  "
+        "Finding where that substitution ends needs its body parsed as "
+        "command grammar (case patterns, comments, `${x:-a(b}` operands, "
+        "here-docs), and #1498 measured every structural attempt reopening "
+        "a verdict the walker already got right.  So from the first `$(` "
+        "inside double quotes the walkers keep the pre-#1494 reading, which "
+        "is never worse than before; an apostrophe before it, or after a "
+        "backtick substitution, is literal as bash reads it (#1494)"
+    ),
     "numeric-operand-boundary-type": (
         "a builtin whose operand is a NAME reproduces it in its diagnostic "
         "(`type: <value>: not found`) and reads clean -- the same boundary "
