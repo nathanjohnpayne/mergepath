@@ -1504,6 +1504,7 @@ paths:
       - "scripts/hooks/cloud-session-start.sh"
       - "scripts/cloud-setup.sh"
       - "docs/agents/cloud-environments.md"
+      - "docs/agents/shared-operating-rules.md"   # the test asserts its link to the recipe
   # Setup script for Claude / Codex cloud environments (#1057 items A, F):
   # installs a pinned, checksum-verified gh where the image has none.
   - path: scripts/cloud-setup.sh

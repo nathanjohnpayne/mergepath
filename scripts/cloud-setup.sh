@@ -61,6 +61,9 @@ esac
 
 log() { echo "cloud-setup: $*" >&2; }
 
+CLEANUP_DIR=""
+cleanup_tmp() { [ -z "$CLEANUP_DIR" ] || rm -rf "$CLEANUP_DIR"; }
+
 choose_prefix() {
   if [ -n "${MERGEPATH_TOOL_PREFIX:-}" ]; then
     printf '%s\n' "$MERGEPATH_TOOL_PREFIX"
@@ -124,8 +127,10 @@ install_gh() {
   # function, so every step checks its own status (CodeRabbit and Codex on
   # #1552): a failed step must fail the install, never log "installed".
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/cloud-setup.XXXXXX")" || { log "could not create a temporary directory"; return 1; }
-  # shellcheck disable=SC2064  # expand $tmp now
-  trap "rm -rf '$tmp'" EXIT
+  # The path is expanded when the trap runs, never re-parsed as shell code: a
+  # TMPDIR with a quote in it would break a trap string (Codex on #1552).
+  CLEANUP_DIR="$tmp"
+  trap cleanup_tmp EXIT
   curl -fsSL --connect-timeout 15 --max-time 300 -o "$tmp/$asset" "$base/$asset" \
     || { log "download failed: $base/$asset"; return 1; }
   actual="$(sha256_of "$tmp/$asset")" || { log "no SHA-256 tool (sha256sum or shasum); refusing to install unverified"; return 1; }

@@ -41,6 +41,8 @@ printf '%s\n' "$result" | jq -r '
   # returns the same), so it is fixed first like any other "no". When the run
   # had a transient failure (a rate-limited 403, a 5xx), the remaining "no"
   # answers may be that failure, so they are re-probed before anything else.
+  # An unverifiable token (a fine-grained PAT) is neither: no re-probe can
+  # grant it, and the wrappers accept it (Codex on #1552).
   .transient_failures as $transient |
   (.capabilities | to_entries[] |
     "- \(.key): \(if .value.granted then "yes" else "no" end), \(.value.reason)" +
@@ -49,6 +51,8 @@ printf '%s\n' "$result" | jq -r '
           or ((.value.reason // "") | startswith("proxy GraphQL ceiling"))
        then " (proxy ceiling: hand this step to a local session or CI)"
      elif (.value.basis == "not-measured") then " (not measured)"
+     elif (.value.basis == "unverifiable")
+       then " (not provable: GitHub does not expose this token type\u0027s permissions; the wrappers still verify its identity before each write, so a re-probe will not change this)"
      elif $transient then " (may be transient: re-run scripts/agent-capability-probe.sh before acting on it)"
      else " (fix the credential, tools or setup, then re-run scripts/agent-capability-probe.sh)" end)),
   "Writes go through scripts/gh-as-author.sh / scripts/gh-as-reviewer.sh. A no marked as a proxy ceiling is a property of this session: hand those steps to a local session or CI. Any other no is a credential or setup problem to fix first (docs/agents/cloud-environments.md, Credentials)."

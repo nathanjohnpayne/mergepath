@@ -40,7 +40,7 @@ echo "probe $*" >>"$PROBE_LOG"
 cat <<JSON
 {"surface":"claude-cloud","repo":"o/r","tier":"author-writes","transient_failures":${PROBE_TRANSIENT:-false},
  "capabilities":{"read":{"granted":true,"reason":"r"},"author-writes":{"granted":true,"reason":"a"},
- "reviewer-writes":{"granted":false,"basis":"measured","reason":"no-verified-token"},
+ "reviewer-writes":{"granted":false,"basis":"${PROBE_RW_BASIS:-measured}","reason":"no-verified-token"},
  "graphql":{"granted":false,"basis":"measured","reason":"viewer query returned 500"},
  "cross-repo":{"granted":false,"basis":"measured","reason":"GET repos/x/y returned 403"},
  "push-multi-branch":{"granted":false,"basis":"documented","reason":"documented"}}}
@@ -81,6 +81,17 @@ if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q -- '- cross-repo: no, GET rep
   pass "hook, transient run: a measured no is marked may-be-transient, a documented ceiling stays a ceiling"
 else
   fail "hook transient: rc=$rc out=$out"
+fi
+
+# A fine-grained token is unverifiable, not broken: no re-probe can grant it
+# and the wrappers accept it, so it is not sent round the fix-and-re-probe
+# loop (Codex on #1552).
+out="$(CLAUDE_CODE_REMOTE=true PROBE_RW_BASIS=unverifiable PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q -- "- reviewer-writes: no, no-verified-token (not provable: GitHub does not expose this token type's permissions; the wrappers still verify" \
+   && ! printf '%s' "$out" | grep -q -- '- reviewer-writes: .*fix the credential'; then
+  pass "hook, unverifiable token: reported as not provable, not as a setup problem to fix and re-probe"
+else
+  fail "hook unverifiable: rc=$rc out=$out"
 fi
 
 out="$(CLAUDE_CODE_REMOTE=true PROBE_MODE=fail PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
@@ -305,6 +316,18 @@ if [ "$rc" -eq 0 ] && [ -x "$WORKDIR/p-tilde/bin/gh" ] && [ ! -e "$WORKDIR/tilde
   pass "setup, MERGEPATH_TOOL_PREFIX=~/...: expanded to \$HOME, not created under the current directory"
 else
   fail "setup tilde prefix: rc=$rc err=$(cat "$WORKDIR/setup.err")"
+fi
+
+# A TMPDIR containing a quote is a path, never shell code: the install
+# succeeds and its temporary directory is removed (Codex on #1552).
+mkdir -p "$WORKDIR/it's tmp"
+set +e
+run_setup "$WORKDIR/p-quote" MERGEPATH_GH_SHA256="$sum" PATH="$WORKDIR/p-quote/bin:$SBIN" TMPDIR="$WORKDIR/it's tmp" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ -x "$WORKDIR/p-quote/bin/gh" ] && [ -z "$(ls -A "$WORKDIR/it's tmp")" ]; then
+  pass "setup, TMPDIR with a quote: installs, and the cleanup removes its temporary directory"
+else
+  fail "setup quoted TMPDIR: rc=$rc left=$(ls -A "$WORKDIR/it's tmp") err=$(cat "$WORKDIR/setup.err")"
 fi
 
 # A relative PATH entry resolves gh to a relative path; the same-file test
