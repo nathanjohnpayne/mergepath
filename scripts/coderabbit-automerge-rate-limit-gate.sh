@@ -58,9 +58,11 @@
 #       mapping are exercised without re-deriving codex-review-check's behavior
 #       (same seam as MERGE_CLEARANCE_CODEX_CHECK_BIN).
 #   CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_WAIT_SECONDS
-#       Total 2b budget in seconds. Default 840, matching the canonical
-#       `codex.review_timeout_seconds` — how long a Codex review is expected to
-#       take. 0 probes exactly once and never sleeps. The budget is spent on the
+#       Total 2b budget in seconds. Default 1800, matching the canonical
+#       `codex.review_timeout_seconds` (remeasured in #1550: p95 982s, max
+#       1723s) — how long a Codex review is expected to take. A shorter budget
+#       would BLOCK before a reply the requester still waits for. 0 probes
+#       exactly once and never sleeps. The budget is spent on the
 #       Codex verdict the failover just asked for, in place of the CodeRabbit
 #       wait the rate limit already made unwinnable.
 #   CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_POLL_SECONDS
@@ -84,7 +86,7 @@ PR_NUMBER="${3:-}"
 REPO="${4:-}"
 
 CODEX_CHECK_BIN="${CODERABBIT_RATE_LIMIT_GATE_CODEX_CHECK_BIN:-$SCRIPT_DIR/codex-review-check.sh}"
-CLEARANCE_WAIT_SECONDS="${CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_WAIT_SECONDS:-840}"
+CLEARANCE_WAIT_SECONDS="${CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_WAIT_SECONDS:-1800}"
 CLEARANCE_POLL_SECONDS="${CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_POLL_SECONDS:-30}"
 
 # Arm 2b (#825): wait, bounded, for the failover's Codex review to clear the

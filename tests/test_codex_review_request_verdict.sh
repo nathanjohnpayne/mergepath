@@ -480,10 +480,11 @@ STUB
   got_net=$(scan_fetch_status 'error connecting to api.github.com')
   got_404=$(scan_fetch_status 'gh: HTTP 404 Not Found')
   got_403=$(scan_fetch_status 'gh: HTTP 403 Resource not accessible by integration')
-  if [ "$got_502$got_429$got_403rl$got_net" = "4444" ] && [ "$got_404$got_403" = "33" ]; then
-    pass "fetch_scan_array: transient failures return 4 and refusals return 3, by the shared classifier (#1550)"
+  got_empty=$(scan_fetch_status '')
+  if [ "$got_502$got_429$got_403rl$got_net" = "4444" ] && [ "$got_404$got_403$got_empty" = "333" ]; then
+    pass "fetch_scan_array: transient failures return 4; refusals and diagnostic-free failures return 3 (#1550)"
   else
-    fail "fetch_scan_array misclassified a failed read: 502=$got_502 429=$got_429 403rl=$got_403rl net=$got_net 404=$got_404 403=$got_403"
+    fail "fetch_scan_array misclassified a failed read: 502=$got_502 429=$got_429 403rl=$got_403rl net=$got_net 404=$got_404 403=$got_403 empty=$got_empty"
   fi
 
   # A malformed (unflattenable) response is not an outage: retrying the same

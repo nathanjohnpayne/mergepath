@@ -179,8 +179,12 @@
 #     # provider-authored evidence to its Phase 4b exit-2 waiver.
 #     "trigger_posted": true | false,
 #     "request_resumed": true | false,
-#     # true when this run polled an earlier in-flight request instead of
-#     # posting one (#1550). Absent on --trigger-only output.
+#     # true when this run resumed an earlier in-flight request instead of
+#     # posting one (#1550), including a resumed request this run later
+#     # replaced after it expired. Present only on this terminal JSON (exit 0
+#     # / 4); the --trigger-only, exit 5, exit 7 and timeout-reuse outputs
+#     # omit it. On a resume, rounds_waited_seconds counts from the resumed
+#     # request's posting, so it includes time before this run started.
 #     "trigger_requested": true | false,
 #     "rounds_waited_seconds": N
 #   }
@@ -722,7 +726,9 @@ fetch_api_array() {
 fetch_scan_array() {
   gh_api_array "$1" "$2" && return 0
   log "ERROR: $GH_API_ARRAY_ERROR"
-  if [ "$GH_API_ARRAY_ERROR_KIND" = fetch ] \
+  # An empty diagnostic (stderr capture unavailable) proves nothing about the
+  # failure, so it stays permanent: the pre-#1550 behaviour.
+  if [ "$GH_API_ARRAY_ERROR_KIND" = fetch ] && [ -n "$GH_API_ARRAY_DETAIL" ] \
      && ! gh_failure_is_permanent "$GH_API_ARRAY_DETAIL"; then
     return 4
   fi
@@ -1870,6 +1876,25 @@ resume_pending_codex_request() {
   RESUMED_TRIGGER=false
   TRIGGER_SIGNAL_THRESHOLD=""
 
+  # A request that already minted a Phase 4a timeout determination (for
+  # example at a shorter review_timeout_seconds) is settled: Phase 4b may have
+  # consumed that waiver. Resuming it would reopen a closed attempt, so treat
+  # it as not resumable. An unreadable marker state is not proof either way;
+  # fall back to posting, as before #1550.
+  local marker_state=unknown
+  if [ "$CODEX_FAILURE_MARKERS_OK" = true ] \
+     && command -v codex_phase4a_timeout_marker_state >/dev/null 2>&1; then
+    marker_state=$(codex_phase4a_timeout_marker_state "$HEAD_SHA" "$AUTHOR_IDENTITY" "$comments" \
+      | jq -r '.state // "unknown"' 2>/dev/null) || marker_state=unknown
+  fi
+  case "$marker_state" in
+    none|stale|superseded) ;;
+    *)
+      log "pending request $(printf '%s' "$pending" | jq -r .id) has Phase 4a timeout marker state '$marker_state' — not resuming"
+      return 1
+      ;;
+  esac
+
   summary=$(crqe_select_codex_review_summary "$comments" "$BOT_LOGIN" "$HEAD_SHA") || return 1
   status=$(printf '%s' "$summary" | jq -r 'if . == null then "" else .status end') || return 1
   observed=$(printf '%s' "$summary" | jq -r 'if . == null then "" else .observed_at end') || return 1
@@ -1892,6 +1917,7 @@ resume_pending_codex_request() {
   START_TS=$created_epoch
   DEADLINE=$deadline
   ELAPSED=$((now - created_epoch))
+  [ "$ELAPSED" -ge 0 ] || ELAPSED=0
   return 0
 }
 
@@ -2114,7 +2140,12 @@ jq -n \
 # at or after the first trigger in this run — existing pre-trigger
 # signals do not count, otherwise the script would exit 0 with stale
 # findings the moment we time out polling for the new review.
-if [ "$TRIGGER_POSTED" = "true" ]; then
+#
+# A resumed request (#1550) is anchored the same way: only a response at or
+# after the resumed trigger counts. Otherwise a resumed poll that breaks on a
+# provider block would fall to has_signal and exit 0 on an older review the
+# resumed request was asking Codex to reconsider.
+if [ "$TRIGGER_POSTED" = "true" ] || [ "$RESUMED_TRIGGER" = "true" ]; then
   if has_post_trigger_signal "$FINAL_SCAN"; then
     exit 0
   else

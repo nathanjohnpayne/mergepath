@@ -147,9 +147,9 @@ fi
 
 # --- shared Codex request/summary selectors (#1276, #1550) ------------------
 # Read-only jq selectors shared with codex-review-request.sh, declared as a
-# `requires:` of this script. Existence-guarded: the gate path uses only the
-# Review Summary selector, whose absence degrades to "no summary evidence"
-# (see crc_select_codex_review_summary), never to clearance.
+# `requires:` of this script. Sourced existence-guarded so a Codex-disabled
+# run never needs it; crc_select_codex_review_summary fails closed (exit 3)
+# when the gate actually needs the Review Summary selector and it is absent.
 if [ -r "$__CODEX_CHECK_DIR/lib/codex-request-evidence.sh" ]; then
   # shellcheck source=lib/codex-request-evidence.sh
   . "$__CODEX_CHECK_DIR/lib/codex-request-evidence.sh"
@@ -2219,17 +2219,18 @@ fi  # end REQUIRE_CI_GREEN
 # comment_id}` or `null` (#1157). The selector itself lives in
 # scripts/lib/codex-request-evidence.sh (crqe_select_codex_review_summary) so
 # codex-review-request.sh's resume check (#1550) reads the same row grammar
-# instead of a second copy of it. Without the lib (a partial install) this
-# returns `null`: no summary evidence, which never clears the gate and only
-# withholds the diagnostic-mode Completed shortcut, so the gap fails closed.
+# instead of a second copy of it. Without the lib this fails closed rather
+# than reporting `null`: in diagnostic mode a newer Running summary is what
+# keeps a stale same-head review from clearing (#1157), so "no summary" is
+# not a safe default.
 #
 # crc_select_codex_review_summary <issue-comments-json> <bot-login> <head-sha>
 crc_select_codex_review_summary() {
-  if declare -F crqe_select_codex_review_summary >/dev/null 2>&1; then
-    crqe_select_codex_review_summary "$@"
-  else
-    printf 'null\n'
+  if ! declare -F crqe_select_codex_review_summary >/dev/null 2>&1; then
+    echo "ERROR: codex-request-evidence helper missing: $__CODEX_CHECK_DIR/lib/codex-request-evidence.sh (Codex Review Summary selector, #1550)" >&2
+    exit 3
   fi
+  crqe_select_codex_review_summary "$@"
 }
 # END codex_review_summary_selector
 
@@ -2471,7 +2472,7 @@ crc_render_request_evidence() {
   fi
   budget=$(codex_field review_timeout_seconds); ack_budget=$(codex_field ack_wait_seconds)
   # Optional policy fields have the same defaults as codex-review-request.sh.
-  budget=${budget:-840}; ack_budget=${ack_budget:-30}
+  budget=${budget:-1800}; ack_budget=${ack_budget:-30}
   [[ "$budget" =~ ^[0-9]+$ ]] || budget=unknown
   [[ "$ack_budget" =~ ^[0-9]+$ ]] || ack_budget=unknown
   log "request evidence: freshness-qualified author trigger #${id:-unknown} at $posted (anchor $REACTION_THRESHOLD; not immutable SHA attribution)"

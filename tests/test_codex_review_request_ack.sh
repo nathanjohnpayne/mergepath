@@ -215,14 +215,18 @@ case "$endpoint" in
   repos/owner/repo/pulls/999/reviews)
     # #1550 scenarios count review reads: read 1 is the pre-flight scan.
     case "$scenario" in
-      resume-running|poll-502-once|poll-502-always|poll-404)
+      resume-running|poll-502-once|poll-502-always|poll-404|resume-blocked)
         reads=0
         [ ! -f "$state_dir/review-reads" ] || reads=$(cat "$state_dir/review-reads")
         reads=$((reads + 1))
         printf '%s\n' "$reads" >"$state_dir/review-reads"
         ;;
     esac
-    if [ "$scenario" = "answered-running" ]; then
+    if [ "$scenario" = "resume-blocked" ]; then
+      # An older P1 review on HEAD that the pending request asked Codex to
+      # reconsider; it predates the request, so it is not its answer.
+      printf '[{"id":98,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-03T23:59:30Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"older findings"}]\n' "$bot"
+    elif [ "$scenario" = "answered-running" ]; then
       printf '[{"id":96,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:00:20Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"findings on the pending request"}]\n' "$bot"
     elif [ "$scenario" = "resume-running" ] && [ "$reads" -gt 1 ]; then
       printf '[{"id":94,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:01:00Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"response to the resumed request"}]\n' "$bot"
@@ -278,7 +282,9 @@ case "$endpoint" in
     fi
     ;;
   repos/owner/repo/pulls/999/comments)
-    if [ "$scenario" = "answered-running" ]; then
+    if [ "$scenario" = "resume-blocked" ]; then
+      printf '[{"id":99,"user":{"login":"%s"},"pull_request_review_id":98,"path":"scripts/codex-review-request.sh","line":1,"body":"![P1 Badge] older finding"}]\n' "$bot"
+    elif [ "$scenario" = "answered-running" ]; then
       printf '[{"id":97,"user":{"login":"%s"},"pull_request_review_id":96,"path":"scripts/codex-review-request.sh","line":1,"body":"![P1 Badge] answered finding"}]\n' "$bot"
     elif [ "$scenario" = "fresh-terminal-finding" ]; then
       printf '[{"id":90,"user":{"login":"%s"},"pull_request_review_id":89,"path":"scripts/codex-review-request.sh","line":1,"body":"![P1 Badge] current finding"}]\n' "$bot"
@@ -296,6 +302,17 @@ case "$endpoint" in
     fi
     ;;
   repos/owner/repo/issues/999/comments)
+    if [ "$scenario" = "resume-blocked" ]; then
+      # Reads 1-2 are the pre-flight scan and the resume check; the account
+      # block lands while the resumed request is being polled.
+      creads=0
+      [ ! -f "$state_dir/comment-reads" ] || creads=$(cat "$state_dir/comment-reads")
+      creads=$((creads + 1))
+      printf '%s\n' "$creads" >"$state_dir/comment-reads"
+      if [ "$creads" -eq 3 ]; then
+        jq -cn --arg bot "$bot" '{id:3002,user:{login:$bot},body:"You have reached your Codex usage limits for code reviews.",created_at:"2026-06-04T00:00:40Z",updated_at:"2026-06-04T00:00:40Z"}' >>"$state_dir/comments.jsonl"
+      fi
+    fi
     if [ -f "$state_dir/comments.jsonl" ]; then
       jq -sc '.' "$state_dir/comments.jsonl"
     else
@@ -1125,6 +1142,40 @@ test_answered_request_is_not_resumed() {
   fi
 }
 
+# A resumed poll that ends on a provider block must not exit 0 on an older
+# review the resumed request was asking Codex to reconsider.
+test_resumed_block_does_not_clear_on_stale_review() {
+  local dir rc before=$FAIL
+  dir=$(make_case "resume-blocked" 0 0 60)
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 20
+  rc=$(run_case "$dir" resume-blocked 1)
+  grep -q 'resuming pending request 900' "$dir/err.log" || fail "#1550 resumed block: request was not resumed; stderr=$(cat "$dir/err.log")"
+  [ "$rc" = 4 ] || fail "#1550 resumed block: exit $rc, expected 4 (FALLBACK_REQUIRED), not a clearance from the stale review"
+  [ "$(jq -r '.blocked_reason' "$dir/out.json")" = usage_limit ] || fail "#1550 resumed block: blocked_reason is not usage_limit"
+  [ "$(trigger_count "$dir")" = 0 ] || fail "#1550 resumed block: posted a trigger into a provider block"
+  [ "$FAIL" -ne "$before" ] || pass "#1550: a resumed request ending on a provider block exits 4, not 0 on an older review"
+}
+
+# A request that already minted a Phase 4a timeout marker is settled.
+test_request_with_timeout_marker_is_not_resumed() {
+  local dir rc count
+  dir=$(make_case "resume-marked" 0 0 60)
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  jq -cn '{id:901,user:{login:"nathanjohnpayne"},body:"<!-- mergepath-phase-4a-terminal:v1 provider=codex outcome=timeout head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa trigger_comment_id=900 -->",created_at:"2026-06-04T00:00:05Z"}' \
+    >>"$dir/state/comments.jsonl"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 30
+  rc=$(run_case "$dir" absent 1)
+  count=$(trigger_count "$dir")
+  if [ "$count" = 1 ] && grep -q "timeout marker state 'current' — not resuming" "$dir/err.log"; then
+    pass "#1550: a request that already holds a current timeout marker is not resumed"
+  else
+    fail "#1550 marked: exit $rc, $count trigger(s); stderr=$(cat "$dir/err.log")"
+  fi
+}
+
 test_resume_past_deadline_posts_new_request() {
   local dir rc count
   dir=$(make_case "resume-past-deadline" 0 0 60)
@@ -1247,6 +1298,8 @@ test_secret_descriptor_never_reveals_the_value
 test_resume_running_request_posts_nothing
 test_resume_requires_provider_evidence
 test_answered_request_is_not_resumed
+test_resumed_block_does_not_clear_on_stale_review
+test_request_with_timeout_marker_is_not_resumed
 test_resume_past_deadline_posts_new_request
 test_resumed_request_expiry_posts_new_request
 test_transient_poll_failure_is_retried
