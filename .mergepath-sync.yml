@@ -537,8 +537,9 @@ paths:
     # "newer than my trigger?" comparison in the poll loop, so degrading it
     # silently is worse than refusing to run.
     requires:
-      - "scripts/lib/codex-request-evidence.sh"   # #1276, shared read-only request/ack selectors
+      - "scripts/lib/codex-request-evidence.sh"   # #1276 selectors; #1550 Review Summary selector for resume
       - "scripts/lib/codex-failure-markers.sh"
+      - "scripts/lib/gh-retry-helpers.sh"   # #1550, gh_failure_is_permanent for poll-read retry (existence-guarded)
       - "scripts/workflow/codex_auto_trigger_gate.sh"   # #798, content-free auto-trigger gate
       - "scripts/lib/gh-api-scalar.sh"   # #799, fail-closed scalar API reads
       - "scripts/lib/gh-api-array.sh"    # #1008, hard-sourced paginated list reads

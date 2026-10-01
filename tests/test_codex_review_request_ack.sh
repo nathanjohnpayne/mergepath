@@ -59,6 +59,9 @@ make_case() {
   # the poll loop scans for arrives through it.
   cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"
   cp "$ROOT/scripts/lib/codex-request-evidence.sh" "$dir/scripts/lib/codex-request-evidence.sh"
+  # #1550: classifier for retrying transient poll reads (existence-guarded in
+  # the script; without it every failure is permanent, the pre-#1550 shape).
+  cp "$ROOT/scripts/lib/gh-retry-helpers.sh" "$dir/scripts/lib/gh-retry-helpers.sh"
   cp "$ROOT/scripts/lib/codex-failure-markers.sh" "$dir/scripts/lib/codex-failure-markers.sh"
   cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
   cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$dir/scripts/workflow/resolve_base_policy.sh"
@@ -210,7 +213,31 @@ case "$endpoint" in
     printf '[]\n'
     ;;
   repos/owner/repo/pulls/999/reviews)
-    if [ "$scenario" = "review_after_retry" ]; then
+    # #1550 scenarios count review reads: read 1 is the pre-flight scan.
+    case "$scenario" in
+      resume-running|poll-502-once|poll-502-always|poll-404)
+        reads=0
+        [ ! -f "$state_dir/review-reads" ] || reads=$(cat "$state_dir/review-reads")
+        reads=$((reads + 1))
+        printf '%s\n' "$reads" >"$state_dir/review-reads"
+        ;;
+    esac
+    if [ "$scenario" = "answered-running" ]; then
+      printf '[{"id":96,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:00:20Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"findings on the pending request"}]\n' "$bot"
+    elif [ "$scenario" = "resume-running" ] && [ "$reads" -gt 1 ]; then
+      printf '[{"id":94,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:01:00Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"response to the resumed request"}]\n' "$bot"
+    elif { [ "$scenario" = "poll-502-once" ] && [ "$reads" -eq 2 ]; } \
+         || { [ "$scenario" = "poll-502-always" ] && [ "$reads" -gt 1 ]; }; then
+      printf '{"message":"Bad Gateway"}\n'
+      echo "gh: HTTP 502 Server Error" >&2
+      exit 1
+    elif [ "$scenario" = "poll-404" ] && [ "$reads" -gt 1 ]; then
+      printf '{"message":"Not Found"}\n'
+      echo "gh: HTTP 404 Not Found" >&2
+      exit 1
+    elif [ "$scenario" = "poll-502-once" ] && [ "$reads" -gt 2 ]; then
+      printf '[{"id":95,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:00:05Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"response after a transient read failure"}]\n' "$bot"
+    elif [ "$scenario" = "review_after_retry" ]; then
       count=0
       if [ -f "$state_dir/trigger-count" ]; then
         count=$(cat "$state_dir/trigger-count")
@@ -251,7 +278,9 @@ case "$endpoint" in
     fi
     ;;
   repos/owner/repo/pulls/999/comments)
-    if [ "$scenario" = "fresh-terminal-finding" ]; then
+    if [ "$scenario" = "answered-running" ]; then
+      printf '[{"id":97,"user":{"login":"%s"},"pull_request_review_id":96,"path":"scripts/codex-review-request.sh","line":1,"body":"![P1 Badge] answered finding"}]\n' "$bot"
+    elif [ "$scenario" = "fresh-terminal-finding" ]; then
       printf '[{"id":90,"user":{"login":"%s"},"pull_request_review_id":89,"path":"scripts/codex-review-request.sh","line":1,"body":"![P1 Badge] current finding"}]\n' "$bot"
     elif [ "$scenario" = "older-finding-before-final-trigger" ]; then
       printf '[{"id":93,"user":{"login":"%s"},"pull_request_review_id":91,"path":"scripts/codex-review-request.sh","line":1,"body":"![P1 Badge] older finding"}]\n' "$bot"
@@ -1021,6 +1050,172 @@ test_secret_descriptor_never_reveals_the_value() {
   fi
 }
 
+# --- #1550: resume an in-flight request instead of re-posting it ----------
+
+RESUME_TRIGGER_AT="2026-06-04T00:00:00Z"
+
+seed_codex_summary() { # <fixture-dir> <status-cell> <commit> <updated-at>
+  local dir=$1 status=$2 commit=$3 updated=$4 body
+  body=$(printf '<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | %s | `%s` | Manual request |\n' "$status" "$commit")
+  jq -cn --arg body "$body" --arg updated "$updated" \
+    '{id:3001,user:{login:"chatgpt-codex-connector[bot]"},body:$body,created_at:$updated,updated_at:$updated}' \
+    >>"$dir/state/comments.jsonl"
+}
+
+# Put the fake clock <seconds> after the seeded request was posted.
+set_clock_after_request() { # <fixture-dir> <seconds>
+  local epoch
+  epoch=$(jq -rn --arg t "$RESUME_TRIGGER_AT" '$t | fromdateiso8601')
+  printf '%s\n' $((epoch + $2)) >"$1/state/fake-time"
+}
+
+test_resume_running_request_posts_nothing() {
+  local dir rc count before=$FAIL
+  dir=$(make_case "resume-running" 0 0 60)
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 30
+  rc=$(run_case "$dir" resume-running 1)
+  count=$(trigger_count "$dir")
+  [ "$rc" = 0 ] || fail "#1550 resume: exit $rc, expected 0 from the resumed request's response; stderr=$(cat "$dir/err.log")"
+  [ "$count" = 0 ] || fail "#1550 resume: posted $count trigger(s), expected none while Codex reports HEAD Running"
+  [ "$(jq -r '.request_resumed' "$dir/out.json")" = true ] || fail "#1550 resume: JSON request_resumed is not true"
+  grep -q 'resuming pending request 900' "$dir/err.log" || fail "#1550 resume: no resume log"
+  [ "$FAIL" -ne "$before" ] || pass "#1550: an unanswered request with Codex Running on HEAD is resumed, not re-posted"
+}
+
+test_resume_requires_provider_evidence() {
+  local name summary_status summary_commit summary_updated expect dir rc count
+  while IFS='|' read -r name summary_status summary_commit summary_updated expect; do
+    dir=$(make_case "resume-$name" 0 0 60)
+    seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+    [ "$summary_status" = none ] \
+      || seed_codex_summary "$dir" "$summary_status" "$summary_commit" "$summary_updated"
+    set_clock_after_request "$dir" 30
+    rc=$(run_case "$dir" absent 1)
+    count=$(trigger_count "$dir")
+    if [ "$count" != 1 ] || grep -q 'resuming pending request' "$dir/err.log" \
+       || [ "$(jq -r '.request_resumed' "$dir/out.json")" != false ]; then
+      fail "#1550 no-resume ($name): exit $rc, $count trigger(s); expected exactly one new trigger and no resume ($expect); stderr=$(cat "$dir/err.log")"
+    else
+      pass "#1550: posts a new request when $expect"
+    fi
+  done <<'CASES'
+no-summary|none|||no Codex summary ties the pending request to HEAD
+other-head|⏳ **Running**|bbbbbbb|2026-06-04T00:00:10Z|Codex is running on a different commit
+before-request|⏳ **Running**|aaaaaaa|2026-06-03T23:59:00Z|the Running summary predates the pending request
+completed|✅ **Completed**|aaaaaaa|2026-06-04T00:00:10Z|the summary reports Completed rather than Running
+CASES
+}
+
+# A request Codex already answered with a required-tier finding needs a new
+# request for the next round, even while a Running summary is on HEAD.
+test_answered_request_is_not_resumed() {
+  local dir rc count
+  dir=$(make_case "resume-answered" 0 0 60)
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:30Z"
+  set_clock_after_request "$dir" 40
+  rc=$(run_case "$dir" answered-running 1)
+  count=$(trigger_count "$dir")
+  if [ "$count" = 1 ] && ! grep -q 'resuming pending request' "$dir/err.log"; then
+    pass "#1550: a pending request Codex already answered with a P1 is not resumed"
+  else
+    fail "#1550 answered: exit $rc, $count trigger(s); stderr=$(cat "$dir/err.log")"
+  fi
+}
+
+test_resume_past_deadline_posts_new_request() {
+  local dir rc count
+  dir=$(make_case "resume-past-deadline" 0 0 60)
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 90
+  rc=$(run_case "$dir" absent 1)
+  count=$(trigger_count "$dir")
+  if [ "$count" = 1 ] && grep -q 'past its 60s wait' "$dir/err.log"; then
+    pass "#1550: a pending request already past its own deadline is not resumed"
+  else
+    fail "#1550 past deadline: exit $rc, $count trigger(s); stderr=$(cat "$dir/err.log")"
+  fi
+}
+
+test_resumed_request_expiry_posts_new_request() {
+  local dir rc count before=$FAIL
+  dir=$(make_case "resume-expires" 0 0 60)
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 30
+  rc=$(run_case "$dir" absent 1)
+  count=$(trigger_count "$dir")
+  grep -q 'resuming pending request 900' "$dir/err.log" || fail "#1550 resume expiry: request was not resumed first"
+  grep -q 'resumed request 900 drew no Codex response' "$dir/err.log" || fail "#1550 resume expiry: no expiry log"
+  [ "$count" = 1 ] || fail "#1550 resume expiry: $count trigger(s), expected exactly one replacement request"
+  # Only the replacement, which this run posted, may mint the timeout marker.
+  [ "$rc" = 4 ] || fail "#1550 resume expiry: exit $rc, expected 4 after the replacement also timed out; stderr=$(cat "$dir/err.log")"
+  [ "$(jq -r '.terminal_determination.outcome // "none"' "$dir/out.json")" = timeout ] \
+    || fail "#1550 resume expiry: the replacement's timeout was not recorded"
+  [ "$FAIL" -ne "$before" ] || pass "#1550: a resumed request that expires unanswered is replaced, and only the replacement records a timeout"
+}
+
+# --- #1550: transient poll-read failures are retried ----------------------
+
+test_transient_poll_failure_is_retried() {
+  local dir rc before=$FAIL
+  dir=$(make_case "poll-502-once" 0 0 60)
+  rc=$(MERGEPATH_CODEX_SCAN_RETRY_BACKOFF_SECONDS=0 run_case "$dir" poll-502-once)
+  [ "$rc" = 0 ] || fail "#1550 transient: exit $rc, expected 0 after one retried 502; stderr=$(cat "$dir/err.log")"
+  grep -q 'transient GitHub read failure (attempt 1/3)' "$dir/err.log" || fail "#1550 transient: no retry log"
+  [ "$(trigger_count "$dir")" = 1 ] || fail "#1550 transient: retry posted another trigger"
+  [ "$FAIL" -ne "$before" ] || pass "#1550: one HTTP 502 during the review wait is retried, not fatal"
+}
+
+test_persistent_transient_failure_fails_closed() {
+  local dir rc
+  dir=$(make_case "poll-502-always" 0 0 60)
+  rc=$(MERGEPATH_CODEX_SCAN_RETRY_BACKOFF_SECONDS=0 run_case "$dir" poll-502-always)
+  if [ "$rc" = 3 ] && grep -q 'persisted across 3 attempt(s)' "$dir/err.log"; then
+    pass "#1550: a transient failure that persists across every retry still exits 3"
+  else
+    fail "#1550 persistent transient: exit $rc; stderr=$(cat "$dir/err.log")"
+  fi
+}
+
+test_permanent_poll_failure_is_not_retried() {
+  local dir rc
+  dir=$(make_case "poll-404" 0 0 60)
+  rc=$(MERGEPATH_CODEX_SCAN_RETRY_BACKOFF_SECONDS=0 run_case "$dir" poll-404)
+  if [ "$rc" = 3 ] && ! grep -q 'transient GitHub read failure' "$dir/err.log"; then
+    pass "#1550: a permanent read failure (HTTP 404) exits 3 without a retry"
+  else
+    fail "#1550 permanent: exit $rc; stderr=$(cat "$dir/err.log")"
+  fi
+}
+
+test_missing_classifier_degrades_to_fail_closed() {
+  local dir rc
+  dir=$(make_case "poll-502-no-classifier" 0 0 60)
+  rm -f "$dir/scripts/lib/gh-retry-helpers.sh"
+  rc=$(MERGEPATH_CODEX_SCAN_RETRY_BACKOFF_SECONDS=0 run_case "$dir" poll-502-once)
+  if [ "$rc" = 3 ] && ! grep -q 'transient GitHub read failure' "$dir/err.log"; then
+    pass "#1550: without gh-retry-helpers.sh a failed poll read exits 3 at once (pre-#1550 behaviour, never weaker)"
+  else
+    fail "#1550 missing classifier: exit $rc; stderr=$(cat "$dir/err.log")"
+  fi
+}
+
+test_default_reply_deadline_is_1800() {
+  local dir
+  dir=$(make_case "default-deadline" 0 0 0)
+  sed -i.bak '/review_timeout_seconds/d' "$dir/.github/review-policy.yml"
+  run_case "$dir" skip_reaction >/dev/null
+  if grep -q 'timeout = 1800s' "$dir/err.log"; then
+    pass "#1550: an absent codex.review_timeout_seconds defaults to 1800s"
+  else
+    fail "#1550 default deadline: $(grep 'timeout =' "$dir/err.log")"
+  fi
+}
+
 test_eyes_ack_does_not_retrigger_or_clear
 test_missing_ack_retriggers_once
 test_retry_cap_respected
@@ -1049,6 +1244,16 @@ test_non_bridge_path_passes_configured_identity
 test_missing_identity_checker_skips_bridge
 test_ambient_author_pat_is_not_inherited_or_echoed
 test_secret_descriptor_never_reveals_the_value
+test_resume_running_request_posts_nothing
+test_resume_requires_provider_evidence
+test_answered_request_is_not_resumed
+test_resume_past_deadline_posts_new_request
+test_resumed_request_expiry_posts_new_request
+test_transient_poll_failure_is_retried
+test_persistent_transient_failure_fails_closed
+test_permanent_poll_failure_is_not_retried
+test_missing_classifier_degrades_to_fail_closed
+test_default_reply_deadline_is_1800
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

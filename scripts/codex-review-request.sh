@@ -55,9 +55,9 @@
 #      the trigger is posted, never WHETHER Codex participates.
 #   1. Reads codex.review_timeout_seconds, codex.ack_wait_seconds,
 #      codex.max_ack_retries, and codex.bot_login from
-#      .github/review-policy.yml (defaults: 840 / 30 / 1 /
-#      chatgpt-codex-connector[bot]; the 840s review_timeout and 30s
-#      ack_wait are measured retunes — see #623 and the per-constant
+#      .github/review-policy.yml (defaults: 1800 / 30 / 1 /
+#      chatgpt-codex-connector[bot]; the 1800s review_timeout (#1550) and
+#      30s ack_wait are measured retunes — see #623 and the per-constant
 #      comments below).
 #   2. Fetches the PR's current HEAD commit SHA and committer date. Any
 #      Codex review is only considered "current" if it is anchored on
@@ -85,6 +85,14 @@
 #      scripts/workflow/codex_auto_trigger_gate.sh shows a prior Codex verdict
 #      carrying forward to this head on an unchanged external-review
 #      fingerprint — the content-free `update-branch` head of #798.
+#   3b. In full (polling) mode, resumes instead of re-posting when the
+#      latest fresh author trigger is still unanswered AND Codex's own
+#      Review Summary reports a review of the current HEAD Running since
+#      that trigger (#1550). The poll then waits only what remains of
+#      `review_timeout_seconds` measured from that trigger; if it expires
+#      with no response, a new trigger is posted as in step 4. Without that
+#      provider evidence nothing proves the pending trigger targets this
+#      head, so the script posts as before.
 #   4. Otherwise posts `@codex review` as a PR comment, waits a short
 #      bounded window for Codex's documented `eyes` acknowledgment on
 #      that trigger comment, and re-posts the trigger up to
@@ -92,7 +100,11 @@
 #      acknowledgment is never treated as clearance.
 #   5. Polls every 15 seconds for up to `review_timeout_seconds`
 #      measured from the latest trigger comment, while accepting a
-#      terminal response to any trigger posted in this run, for any of:
+#      terminal response to any trigger posted in this run, for any of
+#      the signals below. A poll read that fails transiently (HTTP 5xx,
+#      429, a rate-limited 403, or a network error) is retried up to
+#      MERGEPATH_CODEX_SCAN_RETRY_ATTEMPTS times before the run exits 3
+#      (#1550); a permanent failure still exits 3 at once.
 #        - a review from the Codex bot on the current HEAD, OR
 #        - a +1 reaction from the Codex bot on the PR issue dated after
 #          the current HEAD committer date, OR
@@ -166,6 +178,9 @@
 #     # the later codex-review-check.sh --diagnostic-signal-only probe maps the
 #     # provider-authored evidence to its Phase 4b exit-2 waiver.
 #     "trigger_posted": true | false,
+#     "request_resumed": true | false,
+#     # true when this run polled an earlier in-flight request instead of
+#     # posting one (#1550). Absent on --trigger-only output.
 #     "trigger_requested": true | false,
 #     "rounds_waited_seconds": N
 #   }
@@ -275,6 +290,19 @@ if [ ! -r "$__CODEX_REQUEST_DIR/lib/gh-api-array.sh" ]; then
 fi
 # shellcheck source=lib/gh-api-array.sh
 . "$__CODEX_REQUEST_DIR/lib/gh-api-array.sh"
+
+# --- transient-failure classifier (#1550) ------------------------------------
+# gh_failure_is_permanent decides whether a failed poll read is worth retrying.
+# Declared as a `requires:` of this script. Existence-guarded: without it every
+# read failure is treated as permanent, which is exactly the pre-#1550
+# behaviour (exit 3 on the first failed scan), never a weaker one.
+if [ -r "$__CODEX_REQUEST_DIR/lib/gh-retry-helpers.sh" ]; then
+  # shellcheck source=lib/gh-retry-helpers.sh
+  . "$__CODEX_REQUEST_DIR/lib/gh-retry-helpers.sh"
+fi
+if ! declare -F gh_failure_is_permanent >/dev/null 2>&1; then
+  gh_failure_is_permanent() { return 0; }
+fi
 
 # --- argument parsing -------------------------------------------------------
 
@@ -438,20 +466,22 @@ if [ -z "${GH_TOKEN:-}" ]; then
 fi
 
 # review_timeout_seconds: foreground poll budget for a Codex terminal signal
-# on HEAD. Default 840s is measured, not folklore (#623): the trigger→verdict
-# distribution is p50 217s / p90 426s / p99 630s / max 830s (n=100), and the
-# 👍-clearance endpoint this poll also breaks on is p99 829s (n=60, #646) —
-# both from the committed extract docs/audits/data/codex-latency-2026-07/. The
-# prior 600s sat BELOW p99(verdict)=630s, so the slowest ~1% of clean rounds
-# (and the 830s max) timed out and routed to Phase 4b needlessly. 840s
-# (= 56 × the 15s POLL_INTERVAL, so the final poll lands exactly on the
-# deadline) covers the full observed clean-verdict tail and stays under the
-# 900s phase-4b adapter ceiling. It is deliberately NOT sized to the
-# dropped/rate-limited non-response tail (~19–21% of triggers, #570): that is
-# not a slow verdict and no foreground wait can catch it — --trigger-only +
-# event-driven pickup remains its escape path (#489).
+# on HEAD, measured from the trigger it waits on. Default 1800s (#1550),
+# remeasured from 243 author-posted triggers on mergepath and nathanpaynedotcom
+# between 2026-09-14 and 2026-10-01: trigger→first Codex response p50 370s /
+# p90 745s / p95 982s / max 1723s, with 19 responses past the previous 840s
+# default and none past 1800s. On 2026-09-30 alone the p90 was 1225s. Each of
+# those 19 timed out at 840s, routed to Phase 4b, and then drew a real Codex
+# review that could invalidate the Phase 4b result. 1800s = 120 × the 15s
+# POLL_INTERVAL, so the final poll lands on the deadline, and it equals the
+# default codex.reaction_freshness_window_seconds, so a trigger this poll is
+# still waiting on is never older than the window that keeps it selectable for
+# a resume (#1550). The earlier 840s retune and its 2026-07 sample are in #623.
+# It is deliberately NOT sized to the dropped/rate-limited non-response tail
+# (#570): that is not a slow verdict and no foreground wait can catch it —
+# --trigger-only + event-driven pickup remains its escape path (#489).
 TIMEOUT_SECONDS=$(codex_field review_timeout_seconds)
-TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-840}
+TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1800}
 if ! [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
   echo "ERROR: codex.review_timeout_seconds must be an integer; got '$TIMEOUT_SECONDS'" >&2
   exit 3
@@ -600,6 +630,23 @@ fi
 POLL_INTERVAL_SECONDS=15
 ACK_POLL_INTERVAL_SECONDS=5
 
+# Transient poll-read retry (#1550). A single HTTP 502 during the review wait
+# used to end the run with exit 3 while Codex was still working on an
+# acknowledged trigger, and the rerun then posted a second trigger. Each
+# post-trigger scan now retries a transient read failure (classified by
+# gh_failure_is_permanent) this many times, SCAN_RETRY_BACKOFF_SECONDS apart,
+# before failing closed with exit 3. Permanent failures are not retried.
+SCAN_RETRY_ATTEMPTS=${MERGEPATH_CODEX_SCAN_RETRY_ATTEMPTS:-3}
+SCAN_RETRY_BACKOFF_SECONDS=${MERGEPATH_CODEX_SCAN_RETRY_BACKOFF_SECONDS:-$POLL_INTERVAL_SECONDS}
+if ! [[ "$SCAN_RETRY_ATTEMPTS" =~ ^[1-9][0-9]{0,2}$ ]]; then
+  echo "ERROR: MERGEPATH_CODEX_SCAN_RETRY_ATTEMPTS must be an integer in [1, 999]; got '$SCAN_RETRY_ATTEMPTS'" >&2
+  exit 3
+fi
+if ! [[ "$SCAN_RETRY_BACKOFF_SECONDS" =~ ^[0-9]{1,4}$ ]]; then
+  echo "ERROR: MERGEPATH_CODEX_SCAN_RETRY_BACKOFF_SECONDS must be an integer in [0, 9999]; got '$SCAN_RETRY_BACKOFF_SECONDS'" >&2
+  exit 3
+fi
+
 # --- logging helpers --------------------------------------------------------
 
 log() {
@@ -663,6 +710,23 @@ fetch_api_array() {
     log "ERROR: $GH_API_ARRAY_ERROR"
     return 3
   }
+}
+
+# scan_codex_state's reader (#1550). Same contract as fetch_api_array, except
+# a transient fetch failure returns 4 instead of 3, so rescan_codex_state can
+# retry it. The classification has to travel as a status: this runs inside
+# the caller's command substitution, so GH_API_ARRAY_* never reach it.
+# Kept separate from fetch_api_array on purpose: some of that reader's call
+# sites let a failure fall through `set -e` as the script's own exit status,
+# where a 4 would read as FALLBACK_REQUIRED.
+fetch_scan_array() {
+  gh_api_array "$1" "$2" && return 0
+  log "ERROR: $GH_API_ARRAY_ERROR"
+  if [ "$GH_API_ARRAY_ERROR_KIND" = fetch ] \
+     && ! gh_failure_is_permanent "$GH_API_ARRAY_DETAIL"; then
+    return 4
+  fi
+  return 3
 }
 
 # --- Phase 4a entry gate (#486) ---------------------------------------------
@@ -761,11 +825,12 @@ scan_codex_state() {
   # assignments empty and status 0. `|| return 3` makes the caller's
   # `if ! scan_codex_state; then die …` guard (below and at every call
   # site) actually observe the failure instead of relying on the
-  # trailing `jq -n --argjson` emitter to crash on empty input.
-  reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") || return 3
-  comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments") || return 3
-  reactions=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/reactions" "reactions") || return 3
-  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || return 3
+  # trailing `jq -n --argjson` emitter to crash on empty input. A transient
+  # read failure returns 4 rather than 3 (#1550); see rescan_codex_state.
+  reviews=$(fetch_scan_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") || return $?
+  comments=$(fetch_scan_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments") || return $?
+  reactions=$(fetch_scan_array "repos/$REPO/issues/$PR_NUMBER/reactions" "reactions") || return $?
+  issue_comments=$(fetch_scan_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || return $?
 
   # Latest review from the Codex bot on the current HEAD commit, if any.
   # Codex always uses COMMENTED state regardless of findings. We also
@@ -920,7 +985,8 @@ scan_codex_state() {
 # it — so treating it as a wait-ending signal is correct (#722).
 current_blocked_reason() {
   local scan=$1
-  if [ "$TRIGGER_POSTED" = "true" ] || [ "${CAP_REUSED_TRIGGER:-false}" = true ]; then
+  if [ "$TRIGGER_POSTED" = "true" ] || [ "${CAP_REUSED_TRIGGER:-false}" = true ] \
+     || [ "${RESUMED_TRIGGER:-false}" = true ]; then
     local after=${TRIGGER_SIGNAL_THRESHOLD:-$TRIGGER_POST_TIME}
     echo "$scan" | jq -r --arg after "$after" '
       if (.blocked != null and .blocked.created_at >= $after)
@@ -1597,9 +1663,7 @@ wait_for_trigger_ack() {
     # If a terminal Codex signal arrives before the eyes reaction is
     # observable via REST, do not re-trigger. The terminal signal wins;
     # eyes is only an acknowledgment, never a clearance signal.
-    if ! FINAL_SCAN=$(scan_codex_state); then
-      die 3 "eyes-ack Codex scan failed"
-    fi
+    rescan_codex_state "eyes-ack Codex scan"
     # An account-/connection-level block during the ack window is terminal
     # too (#722): re-posting `@codex review` cannot help a quota-exhausted or
     # not-connected account, so stop the ack gate (no re-trigger) and let the
@@ -1740,6 +1804,97 @@ record_phase4a_timeout_determination() {
   log "confirmed Phase 4a timeout marker comment $post_id for $HEAD_SHA"
 }
 
+# Re-scan after a trigger, retrying transient read failures (#1550). Sets
+# FINAL_SCAN in the caller's shell, so call it directly, never inside $( ).
+# Status 4 from scan_codex_state means a transient read failure; anything else
+# non-zero is permanent and fails closed at once, as every scan did before.
+rescan_codex_state() { # <what>
+  local attempt=1 rc scan
+  while :; do
+    rc=0
+    scan=$(scan_codex_state) || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      FINAL_SCAN=$scan
+      return 0
+    fi
+    [ "$rc" -eq 4 ] || die 3 "$1 failed"
+    if [ "$attempt" -ge "$SCAN_RETRY_ATTEMPTS" ]; then
+      die 3 "$1 failed: transient GitHub read failure persisted across $attempt attempt(s)"
+    fi
+    log "$1 hit a transient GitHub read failure (attempt $attempt/$SCAN_RETRY_ATTEMPTS); retrying in ${SCAN_RETRY_BACKOFF_SECONDS}s (#1550)"
+    sleep "$SCAN_RETRY_BACKOFF_SECONDS"
+    attempt=$((attempt + 1))
+  done
+}
+
+# Resume an in-flight request instead of re-posting it (#1550). A rerun after
+# a crashed or interrupted poll used to post a second trigger while Codex was
+# still working on the first, restarting Codex's clock and spending another
+# request attempt.
+#
+# A trigger comment names no commit (see scripts/lib/codex-request-evidence.sh),
+# so its freshness alone cannot prove it asked for a review of THIS head. The
+# proof comes from the provider: Codex's Review Summary must report a Code
+# Review Running on the current HEAD, updated at or after the pending trigger.
+# That shows a review of this head is in flight since the request; it still
+# cannot say which request started it, and nothing here needs it to. Without
+# that evidence the caller posts a new trigger exactly as before, so an
+# unproven case costs a request, never a missed review.
+#
+# The resumed wait ends at the pending trigger's own deadline (its created_at
+# plus review_timeout_seconds), so resuming never extends a request's wait.
+# A resumed request grants no timeout authority: if it expires unanswered, the
+# caller posts a new trigger, and only that trigger can mint a timeout marker.
+resume_pending_codex_request() {
+  [ -n "$AUTHOR_IDENTITY" ] || return 1
+  local comments pending created created_epoch summary status observed now deadline
+  comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments (resume check)") \
+    || return 1
+  pending=$(crqe_select_trigger "$comments" "$AUTHOR_IDENTITY" "$REACTION_THRESHOLD") || return 1
+  [ -n "$pending" ] && [ "$pending" != null ] || return 1
+  created=$(printf '%s' "$pending" | jq -r '.created_at // ""') || return 1
+  created_epoch=$(jq -rn --arg t "$created" '$t | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null) \
+    || return 1
+  [[ "$created_epoch" =~ ^[0-9]+$ ]] || return 1
+
+  # Answered or provider-blocked since the pending trigger: a new round needs
+  # a new request, so do not resume.
+  TRIGGER_SIGNAL_THRESHOLD=$created
+  RESUMED_TRIGGER=true
+  if has_post_trigger_signal "$INITIAL_SCAN" \
+     || [ -n "$(current_blocked_reason "$INITIAL_SCAN")" ]; then
+    TRIGGER_SIGNAL_THRESHOLD=""
+    RESUMED_TRIGGER=false
+    return 1
+  fi
+  RESUMED_TRIGGER=false
+  TRIGGER_SIGNAL_THRESHOLD=""
+
+  summary=$(crqe_select_codex_review_summary "$comments" "$BOT_LOGIN" "$HEAD_SHA") || return 1
+  status=$(printf '%s' "$summary" | jq -r 'if . == null then "" else .status end') || return 1
+  observed=$(printf '%s' "$summary" | jq -r 'if . == null then "" else .observed_at end') || return 1
+  if [ "$status" != running ] || [ -z "$observed" ] || [[ "$observed" < "$created" ]]; then
+    log "pending request $(printf '%s' "$pending" | jq -r .id) has no Codex Running summary on HEAD since it was posted (status '${status:-none}') — not resuming"
+    return 1
+  fi
+
+  now=$(date +%s)
+  deadline=$((created_epoch + TIMEOUT_SECONDS))
+  if [ "$now" -ge "$deadline" ]; then
+    log "pending request $(printf '%s' "$pending" | jq -r .id) is past its ${TIMEOUT_SECONDS}s wait — not resuming"
+    return 1
+  fi
+
+  RESUMED_TRIGGER=true
+  RESUMED_EVER=true
+  RESUMED_TRIGGER_ID=$(printf '%s' "$pending" | jq -r .id)
+  TRIGGER_SIGNAL_THRESHOLD=$created
+  START_TS=$created_epoch
+  DEADLINE=$deadline
+  ELAPSED=$((now - created_epoch))
+  return 0
+}
+
 # --- pre-flight: is Codex already working on HEAD? --------------------------
 
 log "checking for existing Codex signal on HEAD"
@@ -1757,6 +1912,9 @@ ACK_RETRY_REFUSED_BY_CAP=false
 CAP_REUSED_TRIGGER=false
 CAP_REQUEST_COUNT=0
 CAP_REQUEST_LIMIT=0
+RESUMED_TRIGGER=false
+RESUMED_EVER=false
+RESUMED_TRIGGER_ID=""
 
 if has_cleared_signal "$INITIAL_SCAN"; then
   log "Codex has already cleared on HEAD (reaction, no-blocking-tier review, or affirmative verdict comment) — skipping trigger comment"
@@ -1764,6 +1922,8 @@ elif [ "$TRIGGER_ONLY" = "true" ] && existing_codex_trigger_on_head; then
   log "trigger-only: @codex review already requested on HEAD — skipping duplicate trigger (idempotent, #489)"
 elif [ "$TRIGGER_ONLY" = "true" ] && auto_trigger_content_free; then
   log "auto-trigger: $AUTO_TRIGGER_SKIP_REASON — skipping the automatic @codex review (#798)"
+elif [ "$TRIGGER_ONLY" != "true" ] && resume_pending_codex_request; then
+  log "resuming pending request $RESUMED_TRIGGER_ID: Codex reports a review of HEAD Running since it was posted; no new trigger (#1550), ${ELAPSED}s of ${TIMEOUT_SECONDS}s already elapsed"
 else
   post_codex_trigger
 fi
@@ -1815,12 +1975,13 @@ fi
 
 # --- poll loop --------------------------------------------------------------
 
+run_review_poll() {
 while :; do
-  # If we just triggered a fresh review, only break on a signal
-  # at or after the first trigger in this run. Otherwise (no trigger
-  # sent), any existing signal is fine — that's the cleared-on-arrival
-  # path.
-  if [ "$TRIGGER_POSTED" = "true" ] || [ "$CAP_REUSED_TRIGGER" = true ]; then
+  # If we just triggered a fresh review, or resumed one (#1550), only break on
+  # a signal at or after that trigger. Otherwise (no trigger sent), any
+  # existing signal is fine — that's the cleared-on-arrival path.
+  if [ "$TRIGGER_POSTED" = "true" ] || [ "$CAP_REUSED_TRIGGER" = true ] \
+     || [ "$RESUMED_TRIGGER" = true ]; then
     if has_post_trigger_signal "$FINAL_SCAN"; then
       log "Codex signal received after ${ELAPSED}s (post-trigger)"
       break
@@ -1851,9 +2012,7 @@ while :; do
     # FINAL_SCAN so BOTH the JSON emission and the exit-code decision below
     # reflect current state — if a signal landed, has_*_signal sees it and
     # the script exits 0 instead of 4 (FALLBACK_REQUIRED) on stale data.
-    if ! FINAL_SCAN=$(scan_codex_state); then
-      die 3 "final timeout-path scan failed"
-    fi
+    rescan_codex_state "final timeout-path scan"
     log "deadline reached after ${ELAPSED}s — emitted scan is the final one; exit code decided below"
     break
   fi
@@ -1862,10 +2021,30 @@ while :; do
   sleep "$POLL_INTERVAL_SECONDS"
   ELAPSED=$(( $(date +%s) - START_TS ))
 
-  if ! FINAL_SCAN=$(scan_codex_state); then
-    die 3 "poll scan failed"
-  fi
+  rescan_codex_state "poll scan"
 done
+}
+
+run_review_poll
+
+# A resumed request that expired unanswered is a request Codex never answered
+# for this head within its bound, but this run did not post it, so it cannot
+# mint a timeout marker (#1550). Fall back to what the run would have done
+# without resuming: post a new trigger and poll it. At the request cap,
+# post_codex_trigger reuses or refuses exactly as it does for any other run.
+if [ "$RESUMED_TRIGGER" = true ] && ! has_post_trigger_signal "$FINAL_SCAN" \
+   && [ -z "$(current_blocked_reason "$FINAL_SCAN")" ]; then
+  log "resumed request $RESUMED_TRIGGER_ID drew no Codex response within ${TIMEOUT_SECONDS}s of its posting — requesting a new review (#1550)"
+  RESUMED_TRIGGER=false
+  TRIGGER_SIGNAL_THRESHOLD=""
+  INITIAL_SCAN=$FINAL_SCAN
+  post_codex_trigger
+  if [ "$TRIGGER_POSTED" = "true" ]; then
+    FINAL_SCAN='{"review":null,"findings":[],"reaction":null,"verdict":null,"blocked":null}'
+    run_trigger_ack_gate
+  fi
+  run_review_poll
+fi
 
 # A reused trigger grants no new timeout/fallback authority. If its bounded
 # wait returns no response, report the cap with the final observations. Only
@@ -1902,6 +2081,7 @@ jq -n \
   --arg bot_login "$BOT_LOGIN" \
   --argjson scan "$FINAL_SCAN" \
   --argjson trigger_posted "$TRIGGER_POSTED" \
+  --argjson request_resumed "$RESUMED_EVER" \
   --arg blocked_reason "$BLOCKED_REASON" \
   --argjson terminal_recorded "$PHASE4A_TERMINAL_RECORDED" \
   --arg terminal_comment_id "$PHASE4A_TERMINAL_COMMENT_ID" \
@@ -1923,6 +2103,7 @@ jq -n \
       marker_comment_id: ($terminal_comment_id | tonumber)
     } else null end),
     trigger_posted: $trigger_posted,
+    request_resumed: $request_resumed,
     trigger_requested: true,
     rounds_waited_seconds: $elapsed
   }

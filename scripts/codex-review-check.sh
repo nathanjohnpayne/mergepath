@@ -145,6 +145,16 @@ else
   with_gh_retry() { "$@"; }
 fi
 
+# --- shared Codex request/summary selectors (#1276, #1550) ------------------
+# Read-only jq selectors shared with codex-review-request.sh, declared as a
+# `requires:` of this script. Existence-guarded: the gate path uses only the
+# Review Summary selector, whose absence degrades to "no summary evidence"
+# (see crc_select_codex_review_summary), never to clearance.
+if [ -r "$__CODEX_CHECK_DIR/lib/codex-request-evidence.sh" ]; then
+  # shellcheck source=lib/codex-request-evidence.sh
+  . "$__CODEX_CHECK_DIR/lib/codex-request-evidence.sh"
+fi
+
 # --- Codex failure-marker regexes (#722) ------------------------------------
 # Source the shared usage-limit / not-connected marker patterns so gate (c)'s
 # failure message can name an account-level quota or app-not-connected block
@@ -2206,43 +2216,20 @@ fi  # end REQUIRE_CI_GREEN
 # BEGIN codex_review_summary_selector
 # Select the newest marker-tagged Codex Review Summary whose Code Review row
 # names the current head, as `{status, commit, observed_at, trigger,
-# comment_id}` or `null` (#1157).
-#
-# Codex creates this issue comment when a review starts and edits it in place
-# as the review advances, so `updated_at` — not `created_at` — is the signal
-# time. The row is exact-head evidence because its Commit cell carries a
-# 7-to-40-character hexadecimal prefix. Status remains explicit: `running`
-# proves liveness only, while `completed` can prove terminal delivery to a
-# diagnostic caller. Neither status is an affirmative merge verdict.
-#
-# Pure: jq over the passed strings only, no globals and no I/O.
+# comment_id}` or `null` (#1157). The selector itself lives in
+# scripts/lib/codex-request-evidence.sh (crqe_select_codex_review_summary) so
+# codex-review-request.sh's resume check (#1550) reads the same row grammar
+# instead of a second copy of it. Without the lib (a partial install) this
+# returns `null`: no summary evidence, which never clears the gate and only
+# withholds the diagnostic-mode Completed shortcut, so the gap fails closed.
 #
 # crc_select_codex_review_summary <issue-comments-json> <bot-login> <head-sha>
 crc_select_codex_review_summary() {
-  echo "${1:-[]}" | jq -c \
-    --arg bot "${2:-}" --arg sha "${3:-}" '
-    ($sha | ascii_downcase) as $head
-    | [ .[]
-      | select((.user.login // "") == $bot)
-      | select((.body // "") | startswith("<!-- codex-pull-request-review-summary -->"))
-      | . as $comment
-      | ((.body // "")
-          | capture("(?m)^\\|[[:space:]]*📝[[:space:]]*\\*\\*Code Review\\*\\*[[:space:]]*\\|[[:space:]]*(?<status>[^|]+)[[:space:]]*\\|[[:space:]]*`(?<commit>[0-9A-Fa-f]{7,40})`[[:space:]]*\\|[[:space:]]*(?<trigger>[^|]+)[[:space:]]*\\|[[:space:]]*$")?
-          // null) as $row
-      | select($row != null)
-      | ($row.commit | ascii_downcase) as $commit
-      | select($head | startswith($commit))
-      | { status:
-            (if ($row.status | test("\\*\\*Completed\\*\\*"; "i")) then "completed"
-             elif ($row.status | test("\\*\\*Running\\*\\*"; "i")) then "running"
-             else "unknown" end),
-          commit: $commit,
-          observed_at: ($comment.updated_at // $comment.created_at // ""),
-          trigger: ($row.trigger | gsub("^[[:space:]]+|[[:space:]]+$"; "")),
-          comment_id: ($comment.id // 0) }
-    ]
-    | max_by([.observed_at, .comment_id]) // null
-  '
+  if declare -F crqe_select_codex_review_summary >/dev/null 2>&1; then
+    crqe_select_codex_review_summary "$@"
+  else
+    printf 'null\n'
+  fi
 }
 # END codex_review_summary_selector
 

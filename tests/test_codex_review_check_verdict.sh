@@ -41,14 +41,30 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 SUMMARY_SELECTOR=$(sed -n \
   '/^# BEGIN codex_review_summary_selector$/,/^# END codex_review_summary_selector$/p' \
   "$SCRIPT")
+# #1550: the row grammar lives in scripts/lib/codex-request-evidence.sh so the
+# requester's resume check reads it too. The gate keeps a delegating
+# crc_select_codex_review_summary; assert the composition the gate runs.
+EVIDENCE_LIB="$(dirname "$SCRIPT")/lib/codex-request-evidence.sh"
 if [ -n "$SUMMARY_SELECTOR" ] \
    && grep -q '^crc_select_codex_review_summary()' <<<"$SUMMARY_SELECTOR" \
-   && grep -q 'codex-pull-request-review-summary' <<<"$SUMMARY_SELECTOR" \
-   && grep -q 'updated_at' <<<"$SUMMARY_SELECTOR"; then
+   && grep -q 'crqe_select_codex_review_summary' <<<"$SUMMARY_SELECTOR" \
+   && [ -r "$EVIDENCE_LIB" ] \
+   && grep -q 'codex-pull-request-review-summary' "$EVIDENCE_LIB" \
+   && grep -q 'updated_at' "$EVIDENCE_LIB"; then
+  # shellcheck source=../scripts/lib/codex-request-evidence.sh
+  . "$EVIDENCE_LIB"
   eval "$SUMMARY_SELECTOR"
-  pass "#1157: codex-review-check.sh exposes the marker-scoped mutable summary selector"
+  pass "#1157: codex-review-check.sh exposes the marker-scoped mutable summary selector (shared lib, #1550)"
 else
   fail "#1157: codex-review-check.sh is missing the marker-scoped mutable summary selector"
+fi
+
+# Without the lib the gate gets no summary evidence (null), never a guess:
+# summary evidence can only ever withhold the diagnostic Completed shortcut.
+if [ "$(env -u BASH_ENV bash -c 'eval "$1"; crc_select_codex_review_summary "[]" bot sha' _ "$SUMMARY_SELECTOR")" = null ]; then
+  pass "#1550: crc_select_codex_review_summary returns null when the shared lib is absent"
+else
+  fail "#1550: crc_select_codex_review_summary without the shared lib did not return null"
 fi
 
 SUMMARY_BOT="chatgpt-codex-connector[bot]"
