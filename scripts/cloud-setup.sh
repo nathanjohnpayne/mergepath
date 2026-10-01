@@ -170,10 +170,25 @@ install_gh() {
 
 status=0
 
+# A tool already on PATH must resolve absolutely, as an installed one must: a
+# relative PATH entry finds it only from this directory, and a re-run must not
+# accept what the install path refuses (Phase 4b on #1552, #1554).
+resolves_absolutely() { # <tool>
+  local resolved
+  resolved="$(command -v "$1" 2>/dev/null)" || return 1
+  case "$resolved" in
+    /*) return 0 ;;
+    *) log "$1 resolves through a relative PATH entry ($resolved), which works only from this directory; put its absolute directory on PATH"
+       return 1 ;;
+  esac
+}
+
 # A tool counts as present only if it actually runs: a stale or corrupt binary
 # on PATH must fail setup, not pass it (Codex on #1552).
 if command -v gh >/dev/null 2>&1; then
-  if gh_v="$(gh --version 2>/dev/null)"; then
+  if ! resolves_absolutely gh; then
+    status=1
+  elif gh_v="$(gh --version 2>/dev/null)"; then
     log "gh present: $(printf '%s\n' "$gh_v" | head -1)"
   else
     log "gh is on PATH ($(command -v gh)) but does not run (gh --version failed); replace it or remove it so this script can install a pinned one"
@@ -184,7 +199,9 @@ else
 fi
 
 if command -v jq >/dev/null 2>&1; then
-  if jq_v="$(jq --version 2>/dev/null)"; then
+  if ! resolves_absolutely jq; then
+    status=1
+  elif jq_v="$(jq --version 2>/dev/null)"; then
     log "jq present: $jq_v"
   else
     log "jq is on PATH ($(command -v jq)) but does not run (jq --version failed); reinstall it with the image's package manager"

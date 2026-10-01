@@ -63,7 +63,9 @@ graphql_ceiling_refuse() {
   {
     echo "$helper: CEILING — $what needs a GitHub GraphQL operation this session's proxy does not serve (\"This GraphQL query is not enabled for this session\")."
     echo "$helper:   This is a property of the session (the Claude cloud GraphQL ceiling, mergepath#1057), not a credential gap: retrying or provisioning another token returns the same 403."
-    echo "$helper:   Hand this step to a session that can reach GraphQL (a local session, or the CI lane), with the state established here."
+    echo "$helper:   Hand this step to a session that can reach GraphQL, with the state established here:"
+    echo "$helper:     park it on the PR:   scripts/post-local-agent-handback.sh <PR#> --blocked graphql --next \"<command>\""
+    echo "$helper:     thread resolution:   scripts/dispatch-thread-resolution-lane.sh <PR#>   (runs --resolve-actioned in CI and waits; reply on each thread first)"
   } >&2
   if [ "${BASH_SUBSHELL:-0}" -gt 0 ] && [ -n "${GRAPHQL_CEILING_MAIN_PID:-}" ]; then
     kill -USR1 "$GRAPHQL_CEILING_MAIN_PID" 2>/dev/null || true

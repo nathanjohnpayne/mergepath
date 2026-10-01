@@ -1,0 +1,123 @@
+name: Thread resolution lane
+# A per-dispatch title: the PR plus the dispatcher's nonce, so
+# scripts/dispatch-thread-resolution-lane.sh selects exactly the run its own
+# dispatch created (CodeRabbit and Codex on #1555). Only a title: the payload
+# never reaches a script through an expression.
+run-name: "Thread resolution lane: PR #${{ github.event.client_payload.pr }} [${{ github.event.client_payload.nonce }}]"
+
+# Resolve a PR's demonstrably-actioned bot review threads from CI, for a
+# session that cannot (#1057 item G).
+#
+# Thread state and thread resolution exist only in GitHub's GraphQL API. In a
+# Claude Code cloud session the GitHub proxy serves only a pinned set of
+# GraphQL operations, whatever credential is used, so
+# scripts/resolve-pr-threads.sh can exit 6 (the ceiling) there. Everything
+# around resolution still works from the session: fixing, replying on the
+# threads, recording verdicts. This lane runs the resolution step itself, on
+# a real runner, when a session dispatches it:
+#
+#   scripts/dispatch-thread-resolution-lane.sh <PR#>
+#
+# which sends the repository_dispatch through scripts/gh-as-author.sh (the
+# provisioned author PAT: Contents: write on a fine-grained token, or `repo`
+# on a classic one), finds the run its dispatch created, and waits for it.
+# That is REST, which the proxy allows for the attached repository. Only `--resolve-actioned` runs here: it resolves a thread only
+# when its fix or rebuttal is demonstrable AND bound to the finding, and
+# leaves everything else open. This fresh checkout sees only GitHub-visible
+# evidence: an agent reply on the thread. A verdict recorded only in a
+# session's local feedback ledger (.mergepath/*-feedback-ledger.jsonl) is not
+# visible here, so reply on each thread before dispatching (Codex on #1555).
+# Deferral (`--auto-resolve-bots`) stays a deliberate, local decision.
+#
+# Auth model: REVIEWER_ASSIGNMENT_TOKEN, the reviewer PAT already used by the
+# daily rollup and weekly sweep. Bootstrap lets it belong to any selected
+# reviewer, so the expected identity is the login the token reads as, and it
+# must be a nathanpayne-<agent> reviewer listed in the default branch's
+# .github/review-policy.yml available_reviewers (Codex on #1555). The resolver then
+# verifies the token with identity-check.sh --expect-write-identity before
+# any mutation, and every resolve is read back (isResolved:true).
+
+on:
+  # repository_dispatch, NOT workflow_dispatch (Codex P1 on #1555, the
+  # branch-protection-audit.yml posture, ADR 0002). workflow_dispatch lets
+  # the dispatcher pick a ref, and GitHub then runs the workflow DEFINITION
+  # from that ref, so an in-file guard lives in the very file a branch can
+  # rewrite, and the rewritten job gets REVIEWER_ASSIGNMENT_TOKEN.
+  # repository_dispatch has no ref: GitHub runs only the default branch's
+  # copy. Do not re-add workflow_dispatch; tests/test_local_agent_handback.sh
+  # fails if it reappears. Sessions dispatch as the author through
+  # scripts/dispatch-thread-resolution-lane.sh (repository policy; GitHub
+  # itself does start a repository_dispatch run from a GITHUB_TOKEN).
+  repository_dispatch:
+    types: [thread-resolution-lane]
+
+permissions:
+  contents: read
+
+# One run per PR at a time: the resolver's skip checks read a snapshot, so
+# two overlapping runs could both reply on the same unresolved thread
+# (CodeRabbit on #1555). Queue, never cancel: a dispatched pass should run.
+# This lane is not a required check, so a queued run blocks no merge.
+concurrency:
+  group: thread-resolution-lane-${{ github.event.client_payload.pr }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve actioned bot threads
+    # Backstop, not the primary control: with repository_dispatch as the
+    # only trigger, github.ref_name is always the default branch. It exists
+    # so that re-adding a ref-selectable trigger fails closed (#550).
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        # Pin the scripts to the trusted default branch (#465), and leave no
+        # checkout token in .git/config: the resolver authenticates gh with the
+        # explicit reviewer PAT and does no authenticated git.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Resolve actioned threads
+        env:
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          OP_PREFLIGHT_REVIEWER_PAT: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          PR_NUMBER: ${{ github.event.client_payload.pr }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "ERROR: REVIEWER_ASSIGNMENT_TOKEN is empty; the lane cannot resolve threads without the reviewer PAT." >&2
+            exit 1
+          fi
+          login="$(gh api user --jq .login 2>/dev/null || true)"
+          case "$login" in
+            nathanpayne-*[!a-z]*|nathanpayne-) echo "ERROR: REVIEWER_ASSIGNMENT_TOKEN reads as '$login', not a nathanpayne-<agent> reviewer." >&2; exit 1 ;;
+            nathanpayne-*) export GH_AS_REVIEWER_IDENTITY="$login" MERGEPATH_AGENT="${login#nathanpayne-}" ;;
+            *) echo "ERROR: REVIEWER_ASSIGNMENT_TOKEN reads as '${login:-nothing}', not a nathanpayne-<agent> reviewer." >&2; exit 1 ;;
+          esac
+          # The shape is not membership: only a reviewer this repository's
+          # default-branch policy lists may resolve threads (Codex on #1555).
+          . scripts/lib/reviewers-helpers.sh
+          if ! login_is_available_reviewer "$login" .github/review-policy.yml; then
+            echo "ERROR: REVIEWER_ASSIGNMENT_TOKEN reads as '$login', which .github/review-policy.yml available_reviewers does not list." >&2
+            exit 1
+          fi
+          case "$PR_NUMBER" in
+            ''|*[!0-9]*) echo "ERROR: pr must be a PR number; got '$PR_NUMBER'" >&2; exit 1 ;;
+          esac
+          rc=0
+          scripts/resolve-pr-threads.sh "$PR_NUMBER" --repo "$REPO" --resolve-actioned || rc=$?
+          # 3 means threads were left open on purpose (not actioned, human,
+          # stale): a completed pass, reported in the log, not a lane failure.
+          if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]; then
+            {
+              echo "### Thread resolution lane: $REPO#$PR_NUMBER"
+              echo
+              echo "resolve-pr-threads.sh --resolve-actioned exited $rc as $login (0 = nothing left unresolved, 3 = some threads left open; see the log). A thread whose only disposition is in a session's local ledger stays open: reply on it, then dispatch again."
+            } >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          exit "$rc"

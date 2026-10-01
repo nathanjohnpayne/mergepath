@@ -90,6 +90,7 @@ BOOTSTRAP_LABELS=(
   "needs-human-review|7057ff|Awaiting human triage or decision"
   "policy-violation|b60205|Blocked by review-policy.yml violation"
   "human-hold|000000|Hard merge freeze - human-remove-only; supersedes all gates"
+  "needs-local-agent|fbca04|A cloud/limited session parked this step; a session with the named capability resumes it"
   "human-action|0e8a16|Requires human attention"
   "decision-needed|e99695|Needs a human decision before work proceeds (issue triage, not a PR merge gate)"
   "agent-action|1d76db|Agent task — not blocked on human"
