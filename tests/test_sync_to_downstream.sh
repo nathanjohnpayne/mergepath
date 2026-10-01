@@ -2206,7 +2206,9 @@ wf_make_audit_output() {  # <file> <drift-lines-per-consumer>
 # The summarise step recognises a consumer header only by exact equality
 # with one built from the manifest's `.consumers[]`, so every fixture
 # consumer below has to be listed here. `foo+bar` is a name the manifest
-# check accepts but a character-class header regex would not (#1203).
+# check accepts but a character-class header regex would not, and
+# `<TAB>tabbed` is one run_audit()'s `IFS=$'\t' read` prints as `tabbed`, so
+# a header list that skipped that read would not match it (#1203).
 cat >"$WFDIR/manifest.yml" <<'MANIFEST'
 consumers:
   - { name: alpha,      repo: x/alpha }
@@ -2217,6 +2219,7 @@ consumers:
   - { name: matchline,  repo: nathanjohnpayne/matchline }
   - { name: foo+bar,    repo: nathanjohnpayne/foo+bar }
   - { name: swipewatch, repo: nathanjohnpayne/swipewatch }
+  - { name: "\ttabbed",  repo: nathanjohnpayne/tabbed }
 MANIFEST
 
 wf_run_steps() {  # runs both steps in a clean dir; sets WF_RC / WF_TEXT
@@ -2311,7 +2314,7 @@ echo "PASS: every consumer is still named with its drift counts in a truncated r
 # `foo+bar` consumer: a header shape narrower than the manifest's own name
 # rule would miss it and fold its counts into `matchline` above it.
 LOGS="$WFDIR/interleaved"; mkdir -p "$LOGS"
-for c in matchline foo+bar swipewatch; do
+for c in matchline foo+bar swipewatch tabbed; do
   printf '%s (nathanjohnpayne/%s)\n' "$c" "$c"
   printf '[sync-to-downstream] cloning nathanjohnpayne/%s into /home/runner/.cache/mergepath-sync/%s (depth=1)\n' "$c" "$c"
   printf '[sync-to-downstream] refreshing cached clone at /home/runner/.cache/mergepath-sync/%s\n' "$c"
@@ -2330,7 +2333,8 @@ done > "$LOGS/audit-output.txt"
 expected_summary="$(printf '%s\n' \
   'matchline (nathanjohnpayne/matchline) — in sync 3, drifted 2, missing 1, skipped 1' \
   'foo+bar (nathanjohnpayne/foo+bar) — in sync 3, drifted 2, missing 1, skipped 1' \
-  'swipewatch (nathanjohnpayne/swipewatch) — in sync 3, drifted 2, missing 1, skipped 1')"
+  'swipewatch (nathanjohnpayne/swipewatch) — in sync 3, drifted 2, missing 1, skipped 1' \
+  'tabbed (nathanjohnpayne/tabbed) — in sync 3, drifted 2, missing 1, skipped 1')"
 [ "$(cat "$LOGS/consumer-summary.txt")" = "$expected_summary" ] \
   || wf_fail "interleaved log lines corrupted the per-consumer summary:
 --- expected

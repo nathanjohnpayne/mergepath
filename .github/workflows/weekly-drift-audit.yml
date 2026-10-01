@@ -263,7 +263,8 @@ jobs:
           # after the path is free-form.
           #
           # A header is recognised only by exact equality with one that
-          # run_audit() prints for a manifest consumer, built here from the
+          # run_audit() prints for a manifest consumer
+          # (`echo "$consumer_name ($consumer_repo)"`), built here from the
           # same `.consumers[]` list. audit-output.txt holds the script's
           # stdout AND stderr (2>&1 above), and its stderr log() lines also
           # sit at column 0: `[sync-to-downstream] cloning <owner>/<repo>
@@ -275,8 +276,15 @@ jobs:
           # by a narrower shape instead would still have to guess which
           # names the manifest accepts, and a name outside the guess would
           # silently fold its counts into the consumer before it.
+          # The list goes through the same TSV + `IFS=$'\t' read` path as
+          # run_audit(), so whatever that read does to a name (it strips
+          # leading and trailing tabs, for one) happens here too.
           manifest="${DRIFT_AUDIT_MANIFEST:-.mergepath-sync.yml}"
-          if ! yq -r '.consumers[] | (.name + " (" + .repo + ")")' "$manifest" > consumer-headers.txt; then
+          if ! yq -r '.consumers[] | (.name + "\t" + .repo)' "$manifest" \
+               | while IFS=$'\t' read -r consumer_name consumer_repo; do
+                   [ -z "$consumer_name" ] && continue
+                   printf '%s (%s)\n' "$consumer_name" "$consumer_repo"
+                 done > consumer-headers.txt; then
             echo "::warning::Could not read the consumer list from ${manifest}; no consumer header can be recognised."
             : > consumer-headers.txt
           fi
