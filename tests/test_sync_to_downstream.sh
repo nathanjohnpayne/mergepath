@@ -2185,9 +2185,20 @@ chmod +x "$WFDIR/stub-bin/gh"
 # One consumer section per consumer, each with a header line, a baseline
 # line and a run of status lines — the exact shape emit_status_line() and
 # emit_skip_line() produce above.
+# The summary step recognises headers by exact match against the manifest
+# in its working directory, so every fixture dir carries one.
+wf_make_manifest() {  # <dir> <consumer name>... — repo is x/<name>
+  local dir=$1 c; shift
+  printf 'version: 1\nconsumers:\n' > "$dir/.mergepath-sync.yml"
+  for c in "$@"; do
+    printf '  - name: "%s"\n    repo: "x/%s"\n' "$c" "$c" >> "$dir/.mergepath-sync.yml"
+  done
+}
+
 wf_make_audit_output() {  # <file> <drift-lines-per-consumer>
   local out=$1 n=$2 c i
   : > "$out"
+  wf_make_manifest "$(dirname "$out")" alpha bravo charlie delta epsilon
   for c in alpha bravo charlie delta epsilon; do
     printf '%s (x/%s)\n' "$c" "$c" >> "$out"
     printf '  baseline: main@abc1234 (cache clone, refreshed from origin default branch)\n' >> "$out"
@@ -2339,7 +2350,11 @@ echo "PASS: the edit-in-place path is bounded by the same budget as the create p
 # This fixture is the production shape; the fixture above omits stderr.
 LOGS="$WFDIR/interleaved"; mkdir -p "$LOGS"; : > "$LOGS/gh-calls.log"
 : > "$LOGS/audit-output.txt"
-for c in alpha bravo; do
+# `golf club` and `_hotel` are legal manifest names (check_sync_manifest
+# only requires a non-empty name). A recogniser narrower than the manifest
+# would fold their sections into the previous consumer's row.
+wf_make_manifest "$LOGS" alpha "golf club" _hotel
+for c in alpha "golf club" _hotel; do
   {
     printf '%s (x/%s)\n' "$c" "$c"
     printf '[sync-to-downstream] cloning x/%s into /home/runner/.cache/mergepath-sync/%s (depth=1)\n' "$c" "$c"
@@ -2354,11 +2369,11 @@ for c in alpha bravo; do
 done
 GH_STUB_EXISTING="" GH_STUB_WRITE_FAIL="" wf_run_steps "$LOGS"
 [ "$WF_RC" -eq 0 ] || wf_fail "interleaved audit output must file the issue; step exited $WF_RC: $WF_TEXT"
-for c in alpha bravo; do
-  grep -q "^${c} (x/${c}) — in sync 1, drifted 1, missing 1, skipped 0$" "$LOGS/consumer-summary.txt" \
-    || wf_fail "consumer '$c' miscounted with interleaved stderr: $(cat "$LOGS/consumer-summary.txt")"
+for c in alpha "golf club" _hotel; do
+  grep -qxF "${c} (x/${c}) — in sync 1, drifted 1, missing 1, skipped 0" "$LOGS/consumer-summary.txt" \
+    || wf_fail "consumer '$c' missing or miscounted with interleaved stderr: $(cat "$LOGS/consumer-summary.txt")"
 done
-[ "$(wc -l < "$LOGS/consumer-summary.txt" | tr -d '[:space:]')" -eq 2 ] \
+[ "$(wc -l < "$LOGS/consumer-summary.txt" | tr -d '[:space:]')" -eq 3 ] \
   || wf_fail "stderr log lines were read as consumer headers: $(cat "$LOGS/consumer-summary.txt")"
 echo "PASS: interleaved [sync-to-downstream] log lines are not read as consumer headers (#1203)"
 

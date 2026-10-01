@@ -262,15 +262,23 @@ jobs:
           # prefixes rather than by field index because the detail text
           # after the path is free-form.
           #
-          # The header is matched by its whole shape, `<name> (<owner>/<repo>)`,
-          # and nothing looser. The audit step captures with `2>&1`, so the
-          # script's stderr log() lines are interleaved into this stream, and
-          # `[sync-to-downstream] cloning <owner/repo> into <dir> (depth=1)`
-          # also starts at column 0 and ends in `)`. A "column 0, ends in )"
-          # match took that line for a second header, so every consumer
-          # reported zeros and its real counts landed on the clone line.
+          # A header is recognised only by EXACT match against the headers
+          # the manifest says the audit will print — the same
+          # `.name + " (" + .repo + ")"` the script echoes — never by a
+          # line-shape heuristic. The audit step captures with `2>&1`, so
+          # the script's stderr log() lines are interleaved into this
+          # stream, and `[sync-to-downstream] cloning <owner/repo> into
+          # <dir> (depth=1)` also starts at column 0 and ends in `)`. A
+          # "column 0, ends in )" match took that line for a second header,
+          # so every consumer reported zeros and its real counts landed on
+          # the clone line (#1203). A narrower shape regex would instead
+          # silently fold a manifest-legal name it did not anticipate (a
+          # space, a leading `_`) into the previous consumer's row.
+          yq -r '.consumers[] | (.name + " (" + .repo + ")")' .mergepath-sync.yml \
+            > consumer-headers.txt 2>/dev/null || : > consumer-headers.txt
           awk '
-            /^[A-Za-z0-9][A-Za-z0-9._-]* \([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\)$/ { consumer = $0; order[++n] = consumer; next }
+            FILENAME == ARGV[1] { if ($0 != "") header[$0] = 1; next }
+            ($0 in header) { consumer = $0; order[++n] = consumer; next }
             consumer == "" { next }
             index($0, "  ✓ ") == 1 { ok[consumer]++;      next }
             index($0, "  ✗ ") == 1 { drifted[consumer]++; next }
@@ -282,7 +290,7 @@ jobs:
                 printf "%s — in sync %d, drifted %d, missing %d, skipped %d\n", c, ok[c] + 0, drifted[c] + 0, missing[c] + 0, skipped[c] + 0
               }
             }
-          ' audit-output.txt > consumer-summary.txt
+          ' consumer-headers.txt audit-output.txt > consumer-summary.txt
 
           if [ ! -s consumer-summary.txt ]; then
             # No consumer header line was recognised. Do not fail the job —
