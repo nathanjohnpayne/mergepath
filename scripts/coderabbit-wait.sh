@@ -4389,7 +4389,15 @@ crw_head_pinned_clean_review_run() {
 crw_probe_head_review_in_progress() {
   local rec state desc
   [ "$TRUST_STATUS_CONTEXT" = "true" ] || return 1
-  rec=$(check_status_context_record) || rec=""
+  # `--by-id` reads the ID-ordered record instead: a new run's `pending`
+  # posted in the same second as the prior `success` must win the tie.
+  # Opt-in, so the #919 callers keep their ordering (see
+  # crw_carry_status_record).
+  if [ "${1:-}" = "--by-id" ]; then
+    rec=$(crw_carry_status_record)
+  else
+    rec=$(check_status_context_record) || rec=""
+  fi
   state=$(crw_status_record_state "$rec")
   if [ "$state" = "unreadable" ]; then
     die 3 "failed to read the per-SHA CodeRabbit StatusContext on $HEAD_SHA — a failed read is not evidence that the run finished, so the probe refuses to report terminality on it (#936)"
@@ -5249,8 +5257,10 @@ probe_emit_verdict() {
     # run is still going. The notice stays anchored (the #857 note above says
     # why); the per-SHA `pending` status is live state rather than an aging
     # notice, so a run it reports keeps this not-yet instead of WILL-NOT-REPORT.
-    # Same trust gate and same disclosed liveness cost as the #919 sites.
-    if crw_probe_head_review_in_progress; then
+    # Same trust gate and same disclosed liveness cost as the #919 sites,
+    # read by status ID so a same-second `pending` beats the older `success`
+    # (Codex on #1570).
+    if crw_probe_head_review_in_progress --by-id; then
       probe_not_yet "in_progress" "null"
     fi
     SKIP_REASON="$PROBE_STATIC_SKIP"

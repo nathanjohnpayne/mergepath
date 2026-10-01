@@ -226,6 +226,12 @@ case "$endpoint" in
         printf '[{"id":1,"context":"CodeRabbit","state":"%s","created_at":"%s","updated_at":"%s","creator":{"login":"%s"},"description":"Review %s"}]\n' \
           "$CODERABBIT_TEST_STATUS" "$review_time" "$review_time" "$bot" "$CODERABBIT_TEST_STATUS"
         ;;
+      tie)
+        # A new run's `pending` (id 2) posted in the same second as the prior
+        # `success` (id 1), served newest-first as the endpoint does.
+        printf '[{"id":2,"context":"CodeRabbit","state":"pending","created_at":"%s","updated_at":"%s","creator":{"login":"%s"},"description":"Review in progress"},{"id":1,"context":"CodeRabbit","state":"success","created_at":"%s","updated_at":"%s","creator":{"login":"%s"},"description":"Review completed"}]\n' \
+          "$review_time" "$review_time" "$bot" "$review_time" "$review_time" "$bot"
+        ;;
       *) printf '[]\n' ;;
     esac
     ;;
@@ -442,6 +448,7 @@ test_probe_aged_active_review_beats_static_skip() {
     fi
   done <<'CASES'
 pending 7 no_review_yet in_progress null
+tie 7 no_review_yet in_progress null
 success 6 skipped terminal non-base-branch
 absent 6 skipped terminal non-base-branch
 CASES
