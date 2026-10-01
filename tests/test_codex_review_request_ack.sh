@@ -207,7 +207,7 @@ case "$endpoint" in
     cat "$state_dir/base-review-policy.yml"
     ;;
   repos/owner/repo/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)
-    printf '%s\n' "$now"
+    printf '%s\n' "${CODEX_TEST_COMMIT_DATE:-$now}"
     ;;
   repos/owner/repo/issues/999/timeline)
     printf '[]\n'
@@ -1195,6 +1195,23 @@ test_resume_survives_short_freshness_window() {
   fi
 }
 
+# The committer date is author-controlled; a future one must not hide the
+# pending request from the resume check.
+test_resume_survives_future_committer_date() {
+  local dir rc count
+  dir=$(make_case "resume-future-commit" 0 0 60)
+  seed_author_trigger "$dir" 900 "$RESUME_TRIGGER_AT"
+  seed_codex_summary "$dir" '⏳ **Running**' aaaaaaa "2026-06-04T00:00:10Z"
+  set_clock_after_request "$dir" 30
+  rc=$(CODEX_TEST_COMMIT_DATE="2099-01-01T00:00:00Z" run_case "$dir" resume-running 1)
+  count=$(trigger_count "$dir")
+  if [ "$rc" = 0 ] && [ "$count" = 0 ] && grep -q 'resuming pending request 900' "$dir/err.log"; then
+    pass "#1550: a future committer date does not hide the pending request from the resume check"
+  else
+    fail "#1550 future committer date: exit $rc, $count trigger(s); stderr=$(cat "$dir/err.log")"
+  fi
+}
+
 test_resume_past_deadline_posts_new_request() {
   local dir rc count
   dir=$(make_case "resume-past-deadline" 0 0 60)
@@ -1319,6 +1336,7 @@ test_resume_requires_provider_evidence
 test_answered_request_is_not_resumed
 test_resumed_block_does_not_clear_on_stale_review
 test_resume_survives_short_freshness_window
+test_resume_survives_future_committer_date
 test_request_with_timeout_marker_is_not_resumed
 test_resume_past_deadline_posts_new_request
 test_resumed_request_expiry_posts_new_request

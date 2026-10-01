@@ -1854,12 +1854,13 @@ resume_pending_codex_request() {
   local comments pending created created_epoch summary status observed now deadline
   comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments (resume check)") \
     || return 1
-  # Select by the head-push anchor, not REACTION_THRESHOLD: the reaction
-  # freshness window is a separate knob that a repo may set below
-  # review_timeout_seconds, and a request must stay resumable for its whole
-  # wait. The request's own deadline below bounds staleness, and the Running
-  # summary check ties it to this head.
-  pending=$(crqe_select_trigger "$comments" "$AUTHOR_IDENTITY" "$HEAD_PUSHED_AT") || return 1
+  # The latest exact author request, with no freshness anchor. Neither anchor
+  # proves head attribution: the reaction-freshness floor may be shorter than
+  # the reply deadline, and HEAD_PUSHED_AT falls back to the author-controlled
+  # committer date, which a future date would push past every current request.
+  # Staleness is bounded by the request's own deadline below, and the
+  # exact-head Running summary is what ties the request to this head.
+  pending=$(crqe_select_trigger "$comments" "$AUTHOR_IDENTITY" "") || return 1
   [ -n "$pending" ] && [ "$pending" != null ] || return 1
   created=$(printf '%s' "$pending" | jq -r '.created_at // ""') || return 1
   created_epoch=$(jq -rn --arg t "$created" '$t | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null) \
