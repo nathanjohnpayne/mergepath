@@ -210,7 +210,7 @@ The current contract is token-attributed for the guarded core `gh` write surface
 | `gh api GET ...` | direct read with `GH_TOKEN=<read PAT>` | no write byline |
 | `gh api graphql resolveReviewThread` | `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` plus `identity-check.sh --expect-write-identity <reviewer>` before mutation | reviewer token |
 | `gh workflow run` | direct with an author or reviewer PAT that has `workflow` scope | no comment/review byline |
-| `gh api .../dispatches` (`repository_dispatch`) | author wrapper (`scripts/dispatch-thread-resolution-lane.sh` for the lane) | Contents: write (fine-grained) or `repo` (classic); a `GITHUB_TOKEN` dispatch creates no run |
+| `gh api .../dispatches` (`repository_dispatch`) | author wrapper (`scripts/dispatch-thread-resolution-lane.sh` for the lane) | Contents: write (fine-grained) or `repo` (classic). Repository policy, not a GitHub limit: GitHub does start a `repository_dispatch` run from a suitably permitted `GITHUB_TOKEN`, but sessions dispatch as the author through the wrapper |
 
 Notes on the token-wrapper contract:
 

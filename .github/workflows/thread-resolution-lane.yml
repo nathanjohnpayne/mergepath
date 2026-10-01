@@ -44,8 +44,9 @@ on:
   # rewrite, and the rewritten job gets REVIEWER_ASSIGNMENT_TOKEN.
   # repository_dispatch has no ref: GitHub runs only the default branch's
   # copy. Do not re-add workflow_dispatch; tests/test_local_agent_handback.sh
-  # fails if it reappears. A GITHUB_TOKEN-authored dispatch creates no run,
-  # so the dispatch needs a PAT.
+  # fails if it reappears. Sessions dispatch as the author through
+  # scripts/dispatch-thread-resolution-lane.sh (repository policy; GitHub
+  # itself does start a repository_dispatch run from a GITHUB_TOKEN).
   repository_dispatch:
     types: [thread-resolution-lane]
 
