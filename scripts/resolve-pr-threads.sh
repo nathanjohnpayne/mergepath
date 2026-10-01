@@ -597,11 +597,14 @@ else
   graphql_ceiling_hit() { return 1; }
 fi
 
+# Every call is pinned to github.com, the only host the write-identity check
+# verifies: with a sole GHES host in hosts.yml a bare call would otherwise go
+# there under its stored credential (#1541).
 gh_pat() {
   if [ -n "$PAT_GH_TOKEN" ]; then
-    GH_TOKEN="$PAT_GH_TOKEN" gh "$@"
+    GH_HOST=github.com GH_TOKEN="$PAT_GH_TOKEN" gh "$@"
   else
-    gh "$@"
+    GH_HOST=github.com gh "$@"
   fi
 }
 

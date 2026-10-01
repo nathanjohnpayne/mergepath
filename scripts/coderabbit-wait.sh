@@ -534,7 +534,10 @@ gh_reviewer() (
   # Pin reviewer writes to the reviewer PAT rather than inheriting ambient
   # creds (#533): prefer the preflight-cached reviewer PAT, falling back to
   # GH_TOKEN. Mirrors scripts/resolve-pr-threads.sh's PAT_GH_TOKEN pattern.
-  GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}" gh "$@"
+  # GH_HOST pins every call to github.com, the only host the identity check
+  # verifies: with a sole GHES host in hosts.yml a bare call would otherwise
+  # write there under its stored credential (#1541).
+  GH_HOST=github.com GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}" gh "$@"
 )
 
 # --- config readers ---------------------------------------------------------

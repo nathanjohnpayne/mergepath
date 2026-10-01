@@ -500,7 +500,10 @@ measure_write() {
         # the grant below (user-held, or unidentifiable under the opt-in),
         # that now verifies means the resolver's failure was transient (Phase
         # 4b on #1541).
+        # ...and only on a host the verifier accepts: with GH_HOST set to
+        # anything but github.com the refusal is permanent, not transient.
         if [ "$repeat_status" = "200" ] && [ "$repeat_login" = "$identity" ] \
+           && { [ -z "${GH_HOST:-}" ] || [ "$(printf '%s' "$GH_HOST" | tr '[:upper:]' '[:lower:]')" = "github.com" ]; } \
            && { [ "$cand_class" = "user-held" ] \
                 || { [ "$cand_class" = "unidentifiable" ] && [ "${MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN:-0}" = "1" ]; }; }; then
           echo "resolver for $identity failed, then candidate $n verified on repeat" >>"$WORKDIR/transient"

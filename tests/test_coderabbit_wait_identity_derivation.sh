@@ -142,6 +142,7 @@ if [ "$method" = "POST" ]; then
       fi
       count=$((count + 1))
       printf '%s\n' "$count" >"$state_dir/post-count"
+      printf '%s\n' "${GH_HOST:-<unset>}" >>"$state_dir/post-host"
       printf '{"id":900%s,"created_at":"%s","body":"probe"}\n' "$count" "$head_time"
       ;;
     *)
@@ -356,8 +357,23 @@ test_checks_the_reviewer_pat_not_gh_token() {
   fi
 }
 
+# #1541: the reviewer write is pinned to github.com, so a sole GHES host in
+# hosts.yml cannot redirect it to another server under a stored credential.
+test_reviewer_write_pinned_to_github_com() {
+  local dir rc host
+  dir=$(make_case "pinned-host")
+  rc=$(run_case "$dir" nathanpayne-codex nathanpayne-codex)
+  host=$(state_file "$dir" post-host)
+  if [ -n "$host" ] && ! printf '%s\n' "$host" | grep -vqx 'github.com'; then
+    pass "reviewer write runs with GH_HOST=github.com (rc=$rc)"
+  else
+    fail "reviewer write host: '${host:-none posted}'; stderr=$(cat "$dir/err.log")"
+  fi
+}
+
 test_453_shared_reviewers_helper
 test_checks_the_reviewer_pat_not_gh_token
+test_reviewer_write_pinned_to_github_com
 test_derives_identity_from_allow_listed_token
 test_derives_identity_from_quoted_commented_entry
 test_non_allow_listed_token_fails_closed

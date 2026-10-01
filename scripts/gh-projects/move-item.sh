@@ -47,9 +47,11 @@ if [ "${GHP_SKIP_TOKEN_IDENTITY_CHECK:-0}" != "1" ]; then
   fi
 fi
 
+# Pinned to github.com, the only host the write-identity check verifies: with
+# a sole GHES host in hosts.yml a bare call would otherwise go there (#1541).
 ghp_gh() (
   unset GITHUB_TOKEN
-  gh "$@"
+  GH_HOST=github.com gh "$@"
 )
 
 export STATUS_NAME

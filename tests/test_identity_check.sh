@@ -381,31 +381,18 @@ else
 fi
 write_case "GH_HOST=GitHub.com" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_HOST=GitHub.com
 
-# Codex on #1541: with GH_HOST unset and a single non-github.com host in
-# hosts.yml, gh's default host is that host, so a caller's later bare `gh api`
-# write would go there. Refused; github.com alone, both, or GH_HOST pinned: fine.
-for spec in "ghe-only:3:ghe.example.com" "gh-only:0:github.com" "both:0:github.com ghe.example.com"; do
-  name="${spec%%:*}"; rest="${spec#*:}"; want="${rest%%:*}"; hosts="${rest#*:}"
-  mkdir -p "$WORKDIR/ghcfg-$name"
-  : >"$WORKDIR/ghcfg-$name/hosts.yml"
-  for h in $hosts; do printf '%s:\n    user: someone\n    git_protocol: https\n' "$h" >>"$WORKDIR/ghcfg-$name/hosts.yml"; done
-  write_case "hosts.yml $name, GH_HOST unset" "$want" ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-$name"
-done
-printf '# no hosts\n\n' >"$WORKDIR/ghcfg-comments.yml"; mkdir -p "$WORKDIR/ghcfg-empty" "$WORKDIR/ghcfg-comments"
-: >"$WORKDIR/ghcfg-empty/hosts.yml"; cp "$WORKDIR/ghcfg-comments.yml" "$WORKDIR/ghcfg-comments/hosts.yml"
-mkdir -p "$WORKDIR/ghcfg-inline" "$WORKDIR/ghcfg-quoted"
-printf 'ghe.example.com: # work\n    user: someone\n' >"$WORKDIR/ghcfg-inline/hosts.yml"
-printf '"ghe.example.com":\n    user: someone\n' >"$WORKDIR/ghcfg-quoted/hosts.yml"
-write_case "sole GHES host with an inline comment" 3 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-inline"
-write_case "sole GHES host, quoted key" 3 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-quoted"
-mkdir -p "$WORKDIR/ghcfg-flow" "$WORKDIR/ghcfg-flow-both"
-printf -- '---\nghe.example.com: {user: someone-else, git_protocol: https}\n' >"$WORKDIR/ghcfg-flow/hosts.yml"
-printf 'github.com: {user: me}\nghe.example.com: {user: someone-else}\n' >"$WORKDIR/ghcfg-flow-both/hosts.yml"
-write_case "sole GHES host as a flow mapping" 3 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-flow"
-write_case "github.com and GHES as flow mappings" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-flow-both"
-write_case "empty hosts.yml" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-empty"
-write_case "comment-only hosts.yml" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-comments"
-write_case "hosts.yml ghe-only, GH_HOST=github.com" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-ghe-only" GH_HOST=github.com
+# #1541: hosts.yml is deliberately not parsed (four YAML forms defeated a
+# parser in review). A sole GHES host is handled where the writes happen: the
+# check pins its own requests to github.com, the wrappers give other hosts a
+# non-credential sentinel, and unwrapped callers pin GH_HOST=github.com.
+mkdir -p "$WORKDIR/ghcfg-ghe"
+printf '  ghe.example.com:\n    user: someone-else\n' >"$WORKDIR/ghcfg-ghe/hosts.yml"
+write_case "hosts.yml is not consulted (sole GHES host present)" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-ghe"
+if grep -q -- '--hostname github.com' "$WORKDIR/api.log"; then
+  pass "--expect-write-identity: its identity request is pinned to github.com regardless of hosts.yml"
+else
+  fail "identity request not pinned: $(cat "$WORKDIR/api.log")"
+fi
 
 # Phase 4b P1 on #1541: an unset GH_HOST does not mean github.com. With a
 # single GHES host configured, a bare `gh api user` answers with THAT login.

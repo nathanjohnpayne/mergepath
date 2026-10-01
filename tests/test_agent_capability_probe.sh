@@ -708,6 +708,20 @@ else
   fail "opt-in repeat: transient=$(jq -r .transient_failures "$WORKDIR/oflap.json" 2>/dev/null) cache=$(ls "$CACHE" 2>/dev/null)"
 fi
 
+# Phase 4b on #1541: with GH_HOST naming an Enterprise host the verifier
+# refuses permanently; a successful repeat against that host is not a
+# transient recovery, so the result is cached like any stable denial.
+rm -rf "$CACHE"
+set +e
+run_probe GH_TOKEN=ghp_author GH_HOST=ghe.example.com -- >"$WORKDIR/ghehost.json" 2>/dev/null
+set -e
+if [ "$(jq -r .transient_failures "$WORKDIR/ghehost.json")" = "false" ] && [ -n "$(ls "$CACHE" 2>/dev/null)" ] \
+   && [ "$(cap "$WORKDIR/ghehost.json" author-writes)" = "false" ]; then
+  pass "GH_HOST on an Enterprise host: a permanent refusal, cached, not suppressed as transient"
+else
+  fail "GHES GH_HOST: transient=$(jq -r .transient_failures "$WORKDIR/ghehost.json" 2>/dev/null) cache=$(ls "$CACHE" 2>/dev/null)"
+fi
+
 # Round 5 on #1526.
 # An outage while the resolver verifies the KEYRING candidate is transient
 # too: no preferred PAT, no ambient token, the keyring token's GET /user 503s.

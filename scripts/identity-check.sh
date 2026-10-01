@@ -227,30 +227,13 @@ if [ "$MODE" = "write" ]; then
     echo "identity-check: BLOCKED GH_HOST is '$GH_HOST'; write identity is established for github.com only." >&2
     exit 3
   fi
-  # With GH_HOST unset, gh's default host is github.com UNLESS hosts.yml holds
-  # exactly one host, in which case every bare `gh api` a caller runs after
-  # this check targets THAT host with its stored credential (Codex on #1541:
-  # coderabbit-wait.sh writes that way). Refuse that configuration here, where
-  # every write-mode caller passes, rather than patch each caller.
-  if [ -z "${GH_HOST:-}" ]; then
-    GH_HOSTS_FILE="${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/gh}/hosts.yml"
-    if [ -r "$GH_HOSTS_FILE" ]; then
-      # An empty or comment-only hosts.yml has no hosts: grep's no-match is
-      # tolerated, not an abort under pipefail (Codex on #1541).
-      # A host is a top-level YAML key: an unindented `key:` line, whatever
-      # follows the colon: nested block, inline comment, or a flow mapping
-      # (`ghe.example.com: {user: x}`). The key is the text before the first
-      # colon, unquoted. Comments, document markers and directives are not
-      # keys (Codex and Phase 4b on #1541).
-      GH_CONFIGURED_HOSTS="$({ grep -E '^[^[:space:]#%.-][^:]*:' "$GH_HOSTS_FILE" || true; } \
-        | sed -E 's/^([^:]*):.*$/\1/; s/[[:space:]]+$//; s/^["'"'"']//; s/["'"'"']$//' | tr '[:upper:]' '[:lower:]')"
-      if [ "$(printf '%s\n' "$GH_CONFIGURED_HOSTS" | grep -c .)" -eq 1 ] && [ "$GH_CONFIGURED_HOSTS" != "github.com" ]; then
-        echo "identity-check: BLOCKED gh's only configured host is '$GH_CONFIGURED_HOSTS', so a bare gh call after this check would write there, not to github.com." >&2
-        echo "identity-check:   Set GH_HOST=github.com for guarded writes, or log in to github.com as well." >&2
-        exit 3
-      fi
-    fi
-  fi
+  # GH_HOST unset does not guarantee github.com: with a single host in
+  # hosts.yml, gh targets THAT host. This check pins its own requests to
+  # github.com (below), the wrappers give any non-github.com host only a
+  # non-credential sentinel, and the unwrapped write-mode callers
+  # (coderabbit-wait.sh, resolve-pr-threads.sh, scripts/gh-projects/) pin
+  # GH_HOST=github.com on their own gh calls. hosts.yml is therefore never
+  # parsed here: four YAML forms defeated a parser in review (#1541).
   CLASS_HEADERS=""
   if printf '%s' "$GH_TOKEN" | grep -Eq '^[0-9a-f]{40}$'; then
     # A legacy unprefixed token is user-held only if GitHub answers with
