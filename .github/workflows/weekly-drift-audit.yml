@@ -262,36 +262,35 @@ jobs:
           # prefixes rather than by field index because the detail text
           # after the path is free-form.
           #
-          # A header is recognised only by exact equality with one that
-          # run_audit() prints for a manifest consumer
-          # (`echo "$consumer_name ($consumer_repo)"`), built here from the
-          # same `.consumers[]` list. audit-output.txt holds the script's
-          # stdout AND stderr (2>&1 above), and its stderr log() lines also
-          # sit at column 0: `[sync-to-downstream] cloning <owner>/<repo>
-          # into <path> (depth=1)` ends in `)`. The old "column 0 and ends
-          # in )" match took that clone line, which lands right after each
-          # consumer's header, as a consumer of its own, so the real header
-          # reported all-zero counts and the clone line carried the
-          # consumer's counts (#1203, run 36396222388). Matching a header
-          # by a narrower shape instead would still have to guess which
-          # names the manifest accepts, and a name outside the guess would
-          # silently fold its counts into the consumer before it.
-          # The list goes through the same TSV + `IFS=$'\t' read` path as
-          # run_audit(), so whatever that read does to a name (it strips
-          # leading and trailing tabs, for one) happens here too.
-          manifest="${DRIFT_AUDIT_MANIFEST:-.mergepath-sync.yml}"
-          if ! yq -r '.consumers[] | (.name + "\t" + .repo)' "$manifest" \
+          # A header is recognised only by EXACT match against the headers
+          # the manifest says the audit will print — the same
+          # `.name + " (" + .repo + ")"` the script echoes — never by a
+          # line-shape heuristic. The audit step captures with `2>&1`, so
+          # the script's stderr log() lines are interleaved into this
+          # stream, and `[sync-to-downstream] cloning <owner/repo> into
+          # <dir> (depth=1)` also starts at column 0 and ends in `)`. A
+          # "column 0, ends in )" match took that line for a second header,
+          # so every consumer reported zeros and its real counts landed on
+          # the clone line (#1203). A narrower shape regex would instead
+          # silently fold a manifest-legal name it did not anticipate (a
+          # space, a leading `_`) into the previous consumer's row.
+          #
+          # The list goes through the same `name<TAB>repo` + `IFS=$'\t'
+          # read` path as run_audit(), not a direct `.name + " (" ...`
+          # render, so whatever that read does to a name (it strips leading
+          # and trailing tabs, for one) happens to both header producers.
+          # An unreadable manifest is warned about rather than left to read
+          # as "the audit printed nothing" (#1562).
+          if ! yq -r '.consumers[] | (.name + "\t" + .repo)' .mergepath-sync.yml \
                | while IFS=$'\t' read -r consumer_name consumer_repo; do
                    [ -z "$consumer_name" ] && continue
                    printf '%s (%s)\n' "$consumer_name" "$consumer_repo"
                  done > consumer-headers.txt; then
-            echo "::warning::Could not read the consumer list from ${manifest}; no consumer header can be recognised."
+            echo "::warning::Could not read the consumer list from .mergepath-sync.yml; no consumer header can be recognised."
             : > consumer-headers.txt
           fi
-          # FILENAME, not NR == FNR, so an empty header list cannot make the
-          # audit stream itself read as more headers.
           awk '
-            FILENAME == ARGV[1] { header[$0] = 1; next }
+            FILENAME == ARGV[1] { if ($0 != "") header[$0] = 1; next }
             ($0 in header) { consumer = $0; order[++n] = consumer; next }
             consumer == "" { next }
             index($0, "  ✓ ") == 1 { ok[consumer]++;      next }

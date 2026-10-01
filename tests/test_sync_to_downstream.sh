@@ -2185,9 +2185,20 @@ chmod +x "$WFDIR/stub-bin/gh"
 # One consumer section per consumer, each with a header line, a baseline
 # line and a run of status lines — the exact shape emit_status_line() and
 # emit_skip_line() produce above.
+# The summary step recognises headers by exact match against the manifest
+# in its working directory, so every fixture dir carries one.
+wf_make_manifest() {  # <dir> <consumer name>... — repo is x/<name>
+  local dir=$1 c; shift
+  printf 'version: 1\nconsumers:\n' > "$dir/.mergepath-sync.yml"
+  for c in "$@"; do
+    printf '  - name: "%s"\n    repo: "x/%s"\n' "$c" "$c" >> "$dir/.mergepath-sync.yml"
+  done
+}
+
 wf_make_audit_output() {  # <file> <drift-lines-per-consumer>
   local out=$1 n=$2 c i
   : > "$out"
+  wf_make_manifest "$(dirname "$out")" alpha bravo charlie delta epsilon
   for c in alpha bravo charlie delta epsilon; do
     printf '%s (x/%s)\n' "$c" "$c" >> "$out"
     printf '  baseline: main@abc1234 (cache clone, refreshed from origin default branch)\n' >> "$out"
@@ -2203,25 +2214,6 @@ wf_make_audit_output() {  # <file> <drift-lines-per-consumer>
   done
 }
 
-# The summarise step recognises a consumer header only by exact equality
-# with one built from the manifest's `.consumers[]`, so every fixture
-# consumer below has to be listed here. `foo+bar` is a name the manifest
-# check accepts but a character-class header regex would not, and
-# `<TAB>tabbed` is one run_audit()'s `IFS=$'\t' read` prints as `tabbed`, so
-# a header list that skipped that read would not match it (#1203).
-cat >"$WFDIR/manifest.yml" <<'MANIFEST'
-consumers:
-  - { name: alpha,      repo: x/alpha }
-  - { name: bravo,      repo: x/bravo }
-  - { name: charlie,    repo: x/charlie }
-  - { name: delta,      repo: x/delta }
-  - { name: epsilon,    repo: x/epsilon }
-  - { name: matchline,  repo: nathanjohnpayne/matchline }
-  - { name: foo+bar,    repo: nathanjohnpayne/foo+bar }
-  - { name: swipewatch, repo: nathanjohnpayne/swipewatch }
-  - { name: "\ttabbed",  repo: nathanjohnpayne/tabbed }
-MANIFEST
-
 wf_run_steps() {  # runs both steps in a clean dir; sets WF_RC / WF_TEXT
   local dir=$1
   WF_RC=0
@@ -2235,7 +2227,6 @@ wf_run_steps() {  # runs both steps in a clean dir; sets WF_RC / WF_TEXT
     ISSUE_TITLE="Cross-repo propagation drift detected" \
     REPO="nathanjohnpayne/mergepath" \
     RUN_URL="https://github.com/nathanjohnpayne/mergepath/actions/runs/1" \
-    DRIFT_AUDIT_MANIFEST="$WFDIR/manifest.yml" \
       bash "$WFDIR/summarise-step.sh" > /dev/null && \
     cd "$dir" && \
     PATH="$WFDIR/stub-bin:$PATH" \
@@ -2301,61 +2292,6 @@ for c in alpha bravo charlie delta epsilon; do
 done
 echo "PASS: every consumer is still named with its drift counts in a truncated report (#988)"
 
-# --- (3b) stderr log lines are not mistaken for consumer headers --------
-#
-# The workflow captures `--audit 2>&1`, so the script's log() lines on stderr
-# share the stream with the stdout report. A cold cache puts one directly
-# under each consumer's header, at column 0 and ending in `)` exactly like a
-# header. The summariser used to match headers as "column 0, ends in )", so
-# the clone line opened a consumer section of its own: the real header was
-# reported as `in sync 0, drifted 0, missing 0, skipped 0` and the clone line
-# carried the counts (#1203, run 36396222388). The fixture is the interleaved
-# shape that run produced, plus a refresh line and an ERROR line, and a
-# `foo+bar` consumer: a header shape narrower than the manifest's own name
-# rule would miss it and fold its counts into `matchline` above it.
-LOGS="$WFDIR/interleaved"; mkdir -p "$LOGS"
-for c in matchline foo+bar swipewatch tabbed; do
-  printf '%s (nathanjohnpayne/%s)\n' "$c" "$c"
-  printf '[sync-to-downstream] cloning nathanjohnpayne/%s into /home/runner/.cache/mergepath-sync/%s (depth=1)\n' "$c" "$c"
-  printf '[sync-to-downstream] refreshing cached clone at /home/runner/.cache/mergepath-sync/%s\n' "$c"
-  printf '  baseline: main@abc1234 (cache clone, refreshed from origin default branch)\n'
-  printf '  ✓ %-50s in sync\n' "scripts/a.sh" "scripts/b.sh" "scripts/c.sh"
-  printf '[sync-to-downstream] ERROR: transient read for %s (retrying)\n' "$c"
-  printf '  ✗ %-50s drift: 2 diff line(s)\n' "scripts/d.sh" "scripts/e.sh"
-  printf '  ⊘ %-50s missing entirely\n' "scripts/absent.sh"
-  printf '  ↷ %-50s skipped per .sync-overrides.yml: local fork\n' "scripts/override.sh"
-  printf '\n'
-done > "$LOGS/audit-output.txt"
-( cd "$LOGS" && GITHUB_STEP_SUMMARY="$LOGS/step-summary.md" \
-    DRIFT_AUDIT_MANIFEST="$WFDIR/manifest.yml" \
-    bash "$WFDIR/summarise-step.sh" > /dev/null 2>&1 ) \
-  || wf_fail "summarise step failed on interleaved stdout/stderr audit output"
-expected_summary="$(printf '%s\n' \
-  'matchline (nathanjohnpayne/matchline) — in sync 3, drifted 2, missing 1, skipped 1' \
-  'foo+bar (nathanjohnpayne/foo+bar) — in sync 3, drifted 2, missing 1, skipped 1' \
-  'swipewatch (nathanjohnpayne/swipewatch) — in sync 3, drifted 2, missing 1, skipped 1' \
-  'tabbed (nathanjohnpayne/tabbed) — in sync 3, drifted 2, missing 1, skipped 1')"
-[ "$(cat "$LOGS/consumer-summary.txt")" = "$expected_summary" ] \
-  || wf_fail "interleaved log lines corrupted the per-consumer summary:
---- expected
-$expected_summary
---- got
-$(cat "$LOGS/consumer-summary.txt")"
-echo "PASS: stderr log lines interleaved with the audit report do not steal a consumer's counts (#1203)"
-
-# An unreadable manifest leaves the header list empty. That must warn and take
-# the announced "summary unavailable" fallback rather than fail the job or
-# read as an empty roll-up.
-( cd "$LOGS" && GITHUB_STEP_SUMMARY="$LOGS/step-summary.md" \
-    DRIFT_AUDIT_MANIFEST="$WFDIR/no-such-manifest.yml" \
-    bash "$WFDIR/summarise-step.sh" > "$LOGS/nomanifest.out" 2>&1 ) \
-  || wf_fail "summarise step must not fail the job on an unreadable manifest: $(cat "$LOGS/nomanifest.out")"
-grep -q '^(per-consumer summary unavailable' "$LOGS/consumer-summary.txt" \
-  || wf_fail "unreadable manifest did not produce the announced fallback: $(cat "$LOGS/consumer-summary.txt")"
-grep -q '::warning::Could not read the consumer list' "$LOGS/nomanifest.out" \
-  || wf_fail "unreadable manifest was not warned about: $(cat "$LOGS/nomanifest.out")"
-echo "PASS: an unreadable consumer manifest falls back to the announced summary-unavailable note (#1203)"
-
 # --- (4) A small audit is NOT truncated ---------------------------------
 #
 # Guards the other direction: a step that always truncates would pass every
@@ -2403,5 +2339,85 @@ upd_bytes="$(cat "$UPD/body-bytes.txt")"
 [ "$upd_bytes" -le 65536 ] \
   || wf_fail "update-path body was $upd_bytes characters — over GitHub's cap"
 echo "PASS: the edit-in-place path is bounded by the same budget as the create path (#988)"
+
+# --- (7) Interleaved stderr log lines are not taken for consumer headers --
+#
+# The audit step captures `--audit 2>&1`, so log()/warn() lines land in the
+# same stream as the report. `[sync-to-downstream] cloning <owner/repo> into
+# <dir> (depth=1)` starts at column 0 and ends in `)`, exactly like a real
+# header, and a loose header match turned every consumer into a zero row
+# with its counts misfiled under the clone line (#1203, 2026-09-28 run).
+# This fixture is the production shape; the fixture above omits stderr.
+LOGS="$WFDIR/interleaved"; mkdir -p "$LOGS"; : > "$LOGS/gh-calls.log"
+: > "$LOGS/audit-output.txt"
+# `golf club` and `_hotel` are legal manifest names (check_sync_manifest
+# only requires a non-empty name). A recogniser narrower than the manifest
+# would fold their sections into the previous consumer's row.
+wf_make_manifest "$LOGS" alpha "golf club" _hotel
+for c in alpha "golf club" _hotel; do
+  {
+    printf '%s (x/%s)\n' "$c" "$c"
+    printf '[sync-to-downstream] cloning x/%s into /home/runner/.cache/mergepath-sync/%s (depth=1)\n' "$c" "$c"
+    printf '[sync-to-downstream] refreshing cached clone at /home/runner/.cache/mergepath-sync/%s\n' "$c"
+    printf '[sync-to-downstream] WARN: something odd (x/%s)\n' "$c"
+    printf '  baseline: main@abc1234 (cache clone, refreshed from origin default branch)\n'
+    printf '  ✓ %-50s in sync\n' "scripts/in-sync.sh"
+    printf '  ✗ %-50s drift: 3 diff line(s)\n' "scripts/drifted.sh"
+    printf '  ⊘ %-50s missing entirely\n' "scripts/absent.sh"
+    printf '\n'
+  } >> "$LOGS/audit-output.txt"
+done
+GH_STUB_EXISTING="" GH_STUB_WRITE_FAIL="" wf_run_steps "$LOGS"
+[ "$WF_RC" -eq 0 ] || wf_fail "interleaved audit output must file the issue; step exited $WF_RC: $WF_TEXT"
+for c in alpha "golf club" _hotel; do
+  grep -qxF "${c} (x/${c}) — in sync 1, drifted 1, missing 1, skipped 0" "$LOGS/consumer-summary.txt" \
+    || wf_fail "consumer '$c' missing or miscounted with interleaved stderr: $(cat "$LOGS/consumer-summary.txt")"
+done
+[ "$(wc -l < "$LOGS/consumer-summary.txt" | tr -d '[:space:]')" -eq 3 ] \
+  || wf_fail "stderr log lines were read as consumer headers: $(cat "$LOGS/consumer-summary.txt")"
+echo "PASS: interleaved [sync-to-downstream] log lines are not read as consumer headers (#1203)"
+
+# --- (8) Headers are derived through run_audit()'s own manifest read -----
+#
+# run_audit() reads `.consumers[]` as `name<TAB>repo` through
+# `IFS=$'\t' read`, which strips a leading tab from a name, so the audit
+# prints `tabbed (x/tabbed)` for a manifest name of "\ttabbed". A header list
+# rendered straight from yq keeps the tab, misses that header, and folds the
+# consumer's statuses into the previous row (#1562).
+TABS="$WFDIR/tab-name"; mkdir -p "$TABS"; : > "$TABS/gh-calls.log"
+printf '%s\n' 'version: 1' 'consumers:' \
+  '  - name: "alpha"' '    repo: "x/alpha"' \
+  '  - name: "\ttabbed"' '    repo: "x/tabbed"' > "$TABS/.mergepath-sync.yml"
+: > "$TABS/audit-output.txt"
+for c in alpha tabbed; do
+  {
+    printf '%s (x/%s)\n' "$c" "$c"
+    printf '[sync-to-downstream] cloning x/%s into /home/runner/.cache/mergepath-sync/%s (depth=1)\n' "$c" "$c"
+    printf '  ✓ %-50s in sync\n' "scripts/in-sync.sh"
+    printf '  ✗ %-50s drift: 3 diff line(s)\n' "scripts/drifted.sh"
+    printf '\n'
+  } >> "$TABS/audit-output.txt"
+done
+GH_STUB_EXISTING="" GH_STUB_WRITE_FAIL="" wf_run_steps "$TABS"
+[ "$WF_RC" -eq 0 ] || wf_fail "tab-name audit output must file the issue; step exited $WF_RC: $WF_TEXT"
+expected_tabs="$(printf '%s\n' \
+  'alpha (x/alpha) — in sync 1, drifted 1, missing 0, skipped 0' \
+  'tabbed (x/tabbed) — in sync 1, drifted 1, missing 0, skipped 0')"
+[ "$(cat "$TABS/consumer-summary.txt")" = "$expected_tabs" ] \
+  || wf_fail "a leading-tab consumer name was not matched the way run_audit() prints it: $(cat "$TABS/consumer-summary.txt")"
+echo "PASS: consumer headers are derived through run_audit()'s IFS read, not a direct render (#1562)"
+
+# An unreadable manifest must warn and take the announced fallback, not fail
+# the job and not read as an empty roll-up.
+NOMAN="$WFDIR/no-manifest"; mkdir -p "$NOMAN"; : > "$NOMAN/gh-calls.log"
+cp "$TABS/audit-output.txt" "$NOMAN/audit-output.txt"
+( cd "$NOMAN" && GITHUB_STEP_SUMMARY="$NOMAN/step-summary.md" \
+    bash "$WFDIR/summarise-step.sh" > "$NOMAN/step.out" 2>&1 ) \
+  || wf_fail "summarise step must not fail the job on an unreadable manifest: $(cat "$NOMAN/step.out")"
+grep -q '::warning::Could not read the consumer list' "$NOMAN/step.out" \
+  || wf_fail "unreadable manifest was not warned about: $(cat "$NOMAN/step.out")"
+grep -q '^(per-consumer summary unavailable' "$NOMAN/consumer-summary.txt" \
+  || wf_fail "unreadable manifest did not produce the announced fallback: $(cat "$NOMAN/consumer-summary.txt")"
+echo "PASS: an unreadable consumer manifest is warned about and falls back to the summary-unavailable note (#1562)"
 
 echo "test_sync_to_downstream: PASS"
