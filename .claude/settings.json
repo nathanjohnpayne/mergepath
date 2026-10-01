@@ -21,6 +21,17 @@
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/hooks/cloud-session-start.sh\"",
+            "timeout": 120
+          }
+        ]
+      }
     ]
   }
 }

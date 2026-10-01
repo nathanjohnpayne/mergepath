@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# tests/test_cloud_environment.sh
+#
+# Regression suite for the committed cloud-environment recipe (#1057 item F):
+#   - scripts/hooks/cloud-session-start.sh (Claude Code SessionStart hook)
+#   - scripts/cloud-setup.sh (setup script for Claude and Codex cloud)
+#   - docs/agents/cloud-environments.md names only files that exist, and
+#     .claude/settings.json actually wires the hook the doc describes
+#
+# The setup script's install path is exercised offline: `uname`, `curl` and
+# the checksum tool are real or shimmed so a fake release tarball is
+# "downloaded" from a local fixture, and the checksum gate is tested in both
+# directions.
+#
+# Bash 3.2 portable.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+command -v jq >/dev/null 2>&1 || { echo "jq is required" >&2; exit 1; }
+
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/cloud-environment-test.XXXXXX")"
+trap 'rm -rf "$WORKDIR"' EXIT
+
+PASS=0
+FAIL=0
+pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
+
+# ---------------------------------------------------------------------------
+# SessionStart hook
+# ---------------------------------------------------------------------------
+HFIX="$WORKDIR/hook-repo"
+mkdir -p "$HFIX/scripts/hooks"
+cp "$ROOT/scripts/hooks/cloud-session-start.sh" "$HFIX/scripts/hooks/"
+cat >"$HFIX/scripts/agent-capability-probe.sh" <<'PROBE'
+#!/usr/bin/env bash
+echo "probe $*" >>"$PROBE_LOG"
+[ "${PROBE_MODE:-ok}" = fail ] && exit 1
+cat <<'JSON'
+{"surface":"claude-cloud","repo":"o/r","tier":"author-writes","transient_failures":false,
+ "capabilities":{"read":{"granted":true,"reason":"r"},"author-writes":{"granted":true,"reason":"a"},
+ "push-multi-branch":{"granted":false,"reason":"documented"}}}
+JSON
+PROBE
+chmod +x "$HFIX/scripts/agent-capability-probe.sh"
+HOOK="$HFIX/scripts/hooks/cloud-session-start.sh"
+
+: >"$WORKDIR/probe.log"
+out="$(env -u CLAUDE_CODE_REMOTE PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
+if [ "$rc" -eq 0 ] && [ -z "$out" ] && [ ! -s "$WORKDIR/probe.log" ]; then
+  pass "hook, local session: exits 0, prints nothing, never runs the probe"
+else
+  fail "hook local: rc=$rc out=$out probe=$(cat "$WORKDIR/probe.log")"
+fi
+
+out="$(CLAUDE_CODE_REMOTE=true PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'capability tier `author-writes`' \
+   && printf '%s' "$out" | grep -q -- '- push-multi-branch: no, documented' \
+   && grep -q -- '--quiet' "$WORKDIR/probe.log"; then
+  pass "hook, cloud session: runs the probe and prints the tier and each capability"
+else
+  fail "hook cloud: rc=$rc out=$out"
+fi
+
+out="$(CLAUDE_CODE_REMOTE=true PROBE_MODE=fail PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "capabilities unknown"; then
+  pass "hook, probe failure: still exits 0 and says the capabilities are unknown"
+else
+  fail "hook probe failure: rc=$rc out=$out"
+fi
+
+rm -f "$HFIX/scripts/agent-capability-probe.sh"
+out="$(CLAUDE_CODE_REMOTE=true bash "$HOOK")"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "probe missing"; then
+  pass "hook, probe absent: exits 0 and says so"
+else
+  fail "hook probe absent: rc=$rc out=$out"
+fi
+
+# ---------------------------------------------------------------------------
+# .claude/settings.json wires the hook the recipe describes. Hub only:
+# .claude/settings.json is per-repo and not propagated, so a consumer wires the
+# hook itself (the recipe says how); the sync marker identifies the hub.
+# ---------------------------------------------------------------------------
+if [ ! -f "$ROOT/scripts/sync-to-downstream.sh" ]; then
+  pass ".claude/settings.json wiring: not asserted on a consumer checkout"
+elif jq -e '.hooks.SessionStart[]?.hooks[]? | select(.type == "command") | .command | test("scripts/hooks/cloud-session-start\\.sh")' \
+     "$ROOT/.claude/settings.json" >/dev/null 2>&1; then
+  pass ".claude/settings.json wires the SessionStart hook"
+else
+  fail ".claude/settings.json does not wire scripts/hooks/cloud-session-start.sh as a SessionStart hook"
+fi
+
+# ---------------------------------------------------------------------------
+# The recipe names only repository files that exist
+# ---------------------------------------------------------------------------
+DOC="$ROOT/docs/agents/cloud-environments.md"
+if [ -r "$DOC" ]; then
+  missing=""
+  for path in $(grep -oE '`(scripts|\.claude|\.codex|docs)/[A-Za-z0-9._/-]+`' "$DOC" | tr -d '`' | sort -u); do
+    [ -e "$ROOT/$path" ] || missing="$missing $path"
+  done
+  if [ -z "$missing" ]; then
+    pass "docs/agents/cloud-environments.md names only files that exist"
+  else
+    fail "docs/agents/cloud-environments.md names missing files:$missing"
+  fi
+else
+  fail "docs/agents/cloud-environments.md is missing"
+fi
+
+# ---------------------------------------------------------------------------
+# scripts/cloud-setup.sh
+# ---------------------------------------------------------------------------
+SETUP="$ROOT/scripts/cloud-setup.sh"
+VER=9.9.9
+REL="$WORKDIR/release"
+mkdir -p "$REL/gh_${VER}_linux_amd64/bin"
+printf '#!/usr/bin/env bash\necho "gh version %s (fixture)"\n' "$VER" >"$REL/gh_${VER}_linux_amd64/bin/gh"
+chmod +x "$REL/gh_${VER}_linux_amd64/bin/gh"
+tar -czf "$REL/gh_${VER}_linux_amd64.tar.gz" -C "$REL" "gh_${VER}_linux_amd64"
+if command -v sha256sum >/dev/null 2>&1; then
+  sum="$(sha256sum "$REL/gh_${VER}_linux_amd64.tar.gz" | awk '{print $1}')"
+else
+  sum="$(shasum -a 256 "$REL/gh_${VER}_linux_amd64.tar.gz" | awk '{print $1}')"
+fi
+
+# A PATH with the real tools the script needs, minus gh, plus shims for
+# uname (pretend Linux x86_64) and curl (serve from the fixture dir).
+SBIN="$WORKDIR/setup-bin"
+mkdir -p "$SBIN"
+for tool in bash awk tar mkdir cp chmod mktemp rm head sha256sum shasum perl sed tr cat env jq dirname; do
+  real="$(command -v "$tool" 2>/dev/null || true)"
+  case "$real" in /*) ln -sf "$real" "$SBIN/$tool" ;; esac
+done
+cat >"$SBIN/uname" <<'U'
+#!/usr/bin/env bash
+case "$1" in -s) echo Linux ;; -m) echo x86_64 ;; *) echo Linux ;; esac
+U
+cat >"$SBIN/curl" <<C
+#!/usr/bin/env bash
+out=""; url=""
+while [ "\$#" -gt 0 ]; do case "\$1" in -o) out="\$2"; shift 2 ;; http*) url="\$1"; shift ;; *) shift ;; esac; done
+echo "\$url" >>"$WORKDIR/curl.log"
+case "\$url" in
+  *checksums.txt) exit 22 ;;  # never fetched: the expected hash is pinned, not downloaded
+  *.tar.gz) cp "$REL/gh_${VER}_linux_amd64.tar.gz" "\$out" ;;
+  *) exit 22 ;;
+esac
+C
+chmod +x "$SBIN/uname" "$SBIN/curl"
+
+run_setup() { # <prefix> [env...]  (MERGEPATH_GH_VERSION defaults to the unpinned fixture version)
+  local prefix="$1"; shift
+  env -i HOME="$WORKDIR" PATH="$SBIN" MERGEPATH_GH_VERSION="$VER" MERGEPATH_TOOL_PREFIX="$prefix" "$@" \
+    "$SBIN/bash" "$SETUP"
+}
+
+set +e
+run_setup "$WORKDIR/p-good" MERGEPATH_GH_SHA256="$sum" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ -x "$WORKDIR/p-good/bin/gh" ] && grep -q "sha256 verified" "$WORKDIR/setup.err" \
+   && grep -q "releases/download/v$VER/gh_${VER}_linux_amd64.tar.gz" "$WORKDIR/curl.log" \
+   && ! grep -q checksums "$WORKDIR/curl.log"; then
+  pass "setup, unpinned version with its SHA-256 supplied: installs, never downloads a checksums file"
+else
+  fail "setup install: rc=$rc err=$(cat "$WORKDIR/setup.err") curl=$(cat "$WORKDIR/curl.log")"
+fi
+
+for spec in "p-bad:0000000000000000000000000000000000000000000000000000000000000000:checksum mismatch" \
+            "p-absent::no pinned SHA-256" "p-malformed:xyz:no pinned SHA-256"; do
+  dir="${spec%%:*}"; rest="${spec#*:}"; hash="${rest%%:*}"; want="${rest#*:}"
+  set +e
+  if [ -n "$hash" ]; then run_setup "$WORKDIR/$dir" MERGEPATH_GH_SHA256="$hash" >/dev/null 2>"$WORKDIR/setup.err"
+  else run_setup "$WORKDIR/$dir" >/dev/null 2>"$WORKDIR/setup.err"; fi
+  rc=$?
+  set -e
+  if [ "$rc" -eq 1 ] && [ ! -e "$WORKDIR/$dir/bin/gh" ] && grep -q "$want" "$WORKDIR/setup.err"; then
+    pass "setup, $dir: refuses ($want), installs nothing"
+  else
+    fail "setup $dir: rc=$rc err=$(cat "$WORKDIR/setup.err")"
+  fi
+done
+
+# The default version's hash is pinned in the script: a tarball that does not
+# match it (here the fixture, served for the real asset name) is refused.
+set +e
+run_setup "$WORKDIR/p-pinned" MERGEPATH_GH_VERSION=2.101.0 >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && [ ! -e "$WORKDIR/p-pinned/bin/gh" ] && grep -q "checksum mismatch" "$WORKDIR/setup.err" \
+   && grep -q "expected 9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8" "$WORKDIR/setup.err"; then
+  pass "setup, default version: verified against the hash pinned in the script, not a downloaded one"
+else
+  fail "setup pinned: rc=$rc err=$(cat "$WORKDIR/setup.err")"
+fi
+
+# gh already present: nothing is downloaded.
+ln -sf "$WORKDIR/p-good/bin/gh" "$SBIN/gh"
+: >"$WORKDIR/curl.log"
+set +e
+run_setup "$WORKDIR/p-noop" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ ! -s "$WORKDIR/curl.log" ] && grep -q "gh present" "$WORKDIR/setup.err"; then
+  pass "setup, gh present: downloads nothing"
+else
+  fail "setup no-op: rc=$rc curl=$(cat "$WORKDIR/curl.log")"
+fi
+
+echo
+echo "test_cloud_environment: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]

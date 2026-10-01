@@ -30,6 +30,9 @@ TESTS=(
   # probe answers whether they (or the ambient credential) can actually
   # write under the right byline, and caches a tier for later tool calls.
   "tests/test_agent_capability_probe.sh"
+  # #1057 F: the committed cloud-environment recipe, its SessionStart hook and
+  # its setup script.
+  "tests/test_cloud_environment.sh"
 )
 
 FAILED=0
