@@ -1494,6 +1494,29 @@ paths:
   # Capability probe suite (#1057), run by check_op_preflight_contract. It
   # copies the probe's runtime closure into a scratch repo, so every file it
   # copies must travel with it.
+  # Cloud environment recipe suite (#1057 item F), run by
+  # check_op_preflight_contract: the SessionStart hook, the setup script's
+  # checksum gate, and the recipe naming only files that exist.
+  - path: tests/test_cloud_environment.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/hooks/cloud-session-start.sh"
+      - "scripts/cloud-setup.sh"
+      - "docs/agents/cloud-environments.md"
+      - "docs/agents/shared-operating-rules.md"   # the test asserts its link to the recipe
+  # Setup script for Claude / Codex cloud environments (#1057 items A, F):
+  # installs a pinned, checksum-verified gh where the image has none.
+  - path: scripts/cloud-setup.sh
+    type: canonical
+    consumers: all
+  # Claude Code SessionStart hook: runs the capability probe in a cloud
+  # session only (CLAUDE_CODE_REMOTE=true) and prints the tier.
+  - path: scripts/hooks/cloud-session-start.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/agent-capability-probe.sh"
   - path: tests/test_agent_capability_probe.sh
     type: canonical
     consumers: all
@@ -1617,6 +1640,19 @@ paths:
   - path: docs/agents/worktree-placement.md
     type: canonical
     consumers: all
+  # Cloud agent environments (#1057 item F): the committed statement of the
+  # Claude Code cloud and Codex cloud settings (variable NAMES, network,
+  # setup script, hooks) that otherwise live only in two web UIs. Every
+  # consumer carries the same wrappers and probe, so it is fleet-wide.
+  # Consumer-truth checked: issue refs are fully qualified (mergepath#1057)
+  # and every path it names is itself propagated.
+  - path: docs/agents/cloud-environments.md
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/agent-capability-probe.sh"
+      - "scripts/cloud-setup.sh"
+      - "scripts/hooks/cloud-session-start.sh"
   # Decision records (#770 + #771) — the change-level "## Path taken"
   # record and the issue-level linked decision callout, written as one
   # doc because they are the same discipline at two granularities.
@@ -1639,6 +1675,8 @@ paths:
   - path: docs/agents/shared-operating-rules.md
     type: canonical
     consumers: all
+    requires:
+      - "docs/agents/cloud-environments.md"   # linked from § Cloud agent sessions (#1057 F)
   # The soft-wrap prose convention (#780 step 6), extracted from the
   # per-repo-owned docs/agents/documentation-rules.md. The RULE is
   # fleet-wide — a machine's ~/GitHub/CLAUDE.md already named it the
@@ -2034,6 +2072,7 @@ paths:
       - "tests/test_helper_autosource.sh"      # check_op_preflight_contract
       - "tests/test_preflight_agent_name.sh"   # check_op_preflight_contract (#466)
       - "tests/test_agent_capability_probe.sh" # check_op_preflight_contract (#1057)
+      - "tests/test_cloud_environment.sh"      # check_op_preflight_contract (#1057 F)
       - "tests/test_coderabbit_wait_status_probe.sh"  # check_coderabbit_wait
       - "tests/test_coderabbit_wait_identity_derivation.sh"  # check_coderabbit_wait (#438)
       - "tests/test_coderabbit_wait_paused.sh"  # check_coderabbit_wait (#490)
@@ -2316,6 +2355,8 @@ doc_ownership:
   - path: docs/agents/shared-operating-rules.md
     class: canonical
   - path: docs/agents/worktree-placement.md
+    class: canonical
+  - path: docs/agents/cloud-environments.md
     class: canonical
   # Landed in #776 while this inventory was in flight. Canonical by the same
   # reasoning as worktree-placement.md: a single-purpose, tech-stack-independent

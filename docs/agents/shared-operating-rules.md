@@ -58,6 +58,10 @@ Then follow this procedure:
 
 This rule applies only to 1Password CLI sign-in and authentication errors. Other `op` failures (wrong item ID, missing field, network errors, vault permission errors) should be diagnosed and resolved normally.
 
+## Cloud agent sessions
+
+A Claude Code cloud session or a Codex cloud task has no 1Password and no gh keyring, and the Claude cloud GitHub proxy's ambient token writes as `claude[bot]`, not as you. Before writing to GitHub from one, follow [Cloud Agent Environments](cloud-environments.md): provision the dedicated author and reviewer PATs it names, run `scripts/agent-capability-probe.sh` to learn what the session can do, and hand anything it cannot do (merges, GraphQL-only helpers, multi-branch or cross-repo work) to a local session or CI.
+
 ## Secret handling
 
 These three rules hold in every repository, whatever it deploys and however it deploys it. The repo-specific half — which credential a deploy resolves, which vault item holds it, which command runs the deploy — belongs in that repo's own `docs/agents/deployment-process.md`, not here.
