@@ -97,7 +97,14 @@ install_gh() {
   asset="gh_${GH_VERSION}_${os}_${arch}.tar.gz"
   base="https://github.com/cli/cli/releases/download/v${GH_VERSION}"
   prefix="$(choose_prefix)"
-  # An absolute prefix, so the result does not depend on this directory.
+  # A prefix set in an environment's settings arrives unexpanded, so a leading
+  # ~ means $HOME here, as the recipe writes it (Codex on #1552). Then an
+  # absolute prefix, so the result does not depend on this directory.
+  # shellcheck disable=SC2088  # the literal ~ is what is being matched
+  case "$prefix" in
+    "~") prefix="$HOME" ;;
+    "~/"*) prefix="$HOME/${prefix#"~/"}" ;;
+  esac
   case "$prefix" in /*) ;; *) prefix="$(pwd)/$prefix" ;; esac
   if ! expected="$(pinned_sha256 "$asset")"; then
     expected="${MERGEPATH_GH_SHA256:-}"

@@ -37,8 +37,8 @@ cat >"$HFIX/scripts/agent-capability-probe.sh" <<'PROBE'
 #!/usr/bin/env bash
 echo "probe $*" >>"$PROBE_LOG"
 [ "${PROBE_MODE:-ok}" = fail ] && exit 1
-cat <<'JSON'
-{"surface":"claude-cloud","repo":"o/r","tier":"author-writes","transient_failures":false,
+cat <<JSON
+{"surface":"claude-cloud","repo":"o/r","tier":"author-writes","transient_failures":${PROBE_TRANSIENT:-false},
  "capabilities":{"read":{"granted":true,"reason":"r"},"author-writes":{"granted":true,"reason":"a"},
  "reviewer-writes":{"granted":false,"basis":"measured","reason":"no-verified-token"},
  "graphql":{"granted":false,"basis":"measured","reason":"viewer query returned 500"},
@@ -62,12 +62,25 @@ if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'capability tier `author-writ
    && printf '%s' "$out" | grep -q -- '- push-multi-branch: no, documented (proxy ceiling: hand this step to a local session or CI)' \
    && printf '%s' "$out" | grep -q -- '- reviewer-writes: no, no-verified-token (fix the credential, tools or setup, then re-run' \
    && printf '%s' "$out" | grep -q -- '- graphql: no, viewer query returned 500 (fix the credential, tools or setup' \
-   && printf '%s' "$out" | grep -q -- '- cross-repo: no, GET repos/x/y returned 403 (proxy ceiling' \
+   && printf '%s' "$out" | grep -q -- '- cross-repo: no, GET repos/x/y returned 403 (fix the credential, tools or setup' \
    && printf '%s' "$out" | grep -q -- '- author-writes: yes, a$' \
+   && ! printf '%s' "$out" | grep -q -- 'may be transient' \
    && grep -q -- '--quiet' "$WORKDIR/probe.log"; then
-  pass "hook, cloud session: classifies each no from the probe's basis and reason (a GraphQL 500 is fix-first, a documented or 403 cross-repo denial is a ceiling)"
+  pass "hook, cloud session: classifies each no from the probe's basis and reason (a documented denial is a ceiling; a GraphQL 500 or a bare cross-repo 403 is fix-first)"
 else
   fail "hook cloud: rc=$rc out=$out"
+fi
+
+# A run with a transient failure (a rate-limited 403 among them) re-probes its
+# measured "no" answers before calling them a setup problem or a ceiling.
+out="$(CLAUDE_CODE_REMOTE=true PROBE_TRANSIENT=true PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q -- '- cross-repo: no, GET repos/x/y returned 403 (may be transient: re-run' \
+   && printf '%s' "$out" | grep -q -- '- graphql: no, viewer query returned 500 (may be transient' \
+   && printf '%s' "$out" | grep -q -- '- push-multi-branch: no, documented (proxy ceiling' \
+   && ! printf '%s' "$out" | grep -q -- 'fix the credential, tools or setup, then'; then
+  pass "hook, transient run: a measured no is marked may-be-transient, a documented ceiling stays a ceiling"
+else
+  fail "hook transient: rc=$rc out=$out"
 fi
 
 out="$(CLAUDE_CODE_REMOTE=true PROBE_MODE=fail PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
@@ -279,6 +292,19 @@ if [ "$rc" -eq 0 ] && [ -x "$WORKDIR/p-slash/bin/gh" ]; then
   pass "setup, install directory on PATH with a trailing slash: accepted"
 else
   fail "setup trailing-slash PATH: rc=$rc err=$(cat "$WORKDIR/setup.err")"
+fi
+
+# A literal ~/ prefix, as an environment setting passes it, is $HOME, not a
+# directory named ~ under the current one (Codex on #1552).
+mkdir -p "$WORKDIR/tilde-cwd"
+set +e
+# shellcheck disable=SC2088  # the unexpanded ~ is the input under test
+( cd "$WORKDIR/tilde-cwd" && run_setup '~/p-tilde' MERGEPATH_GH_SHA256="$sum" PATH="$WORKDIR/p-tilde/bin:$SBIN" ) >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ -x "$WORKDIR/p-tilde/bin/gh" ] && [ ! -e "$WORKDIR/tilde-cwd/~" ]; then
+  pass "setup, MERGEPATH_TOOL_PREFIX=~/...: expanded to \$HOME, not created under the current directory"
+else
+  fail "setup tilde prefix: rc=$rc err=$(cat "$WORKDIR/setup.err")"
 fi
 
 # A relative PATH entry resolves gh to a relative path; the same-file test
