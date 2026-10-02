@@ -447,8 +447,11 @@ coderabbit:
 #      `scripts/review-feedback-accounting.sh`.
 #      The request helper runs this automatically before its trigger write;
 #      exit 6 means feedback remains unaccounted and no trigger was posted.
-#   3. Repeat up to `max_review_rounds`. On runaway (round > max), escalate
-#      to the human per REVIEW_POLICY.md § Disagreements and Tiebreaking.
+#   3. Repeat while the request ceiling (`max_review_rounds`) and the
+#      blocking-review budget allow. A spent blocking budget escalates to the
+#      human; a spent ceiling runs automated Phase 4b, which stops for the
+#      human on a runaway, untested rebuttal or disagreement (REVIEW_POLICY.md
+#      § Disagreements and Tiebreaking).
 #   4. On timeout (silence within `review_timeout_seconds`), the script
 #      exits with code 4 (FALLBACK_REQUIRED). The agent then falls back
 #      to the manual handoff in REVIEW_POLICY.md § Phase 4b, targeting
@@ -919,7 +922,7 @@ phase_4b_automation:
   # through 2026-10-15. 999 = effectively uncapped; keep looping automated
   # Phase 4b after CHANGES_REQUESTED until APPROVED. On 2026-10-15 restore
   # `max_review_rounds: 20` and delete this note. Phase 4a's
-  # codex.max_review_rounds runaway guard is NOT waived.
+  # codex.max_review_rounds request ceiling is NOT waived.
   max_review_rounds: 999
 
   # Fail closed: an ambiguous / non-schema-conformant adapter verdict must

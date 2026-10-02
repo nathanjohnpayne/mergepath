@@ -671,7 +671,8 @@ When you pull this template change into an existing repo, the new `phase_4b_defa
   │  ┌─ no unaddressed P0/P1 findings → clearance           │
   │  ├─ P0/P1 findings → fix or reply; round += 1; repeat   │
   │  ├─ repeat-after-rebuttal → ESCALATE (Disagreements)    │
-  │  ├─ round > max_review_rounds → ESCALATE (Disagreements)│
+  │  ├─ blocking budget spent → ESCALATE (Disagreements)    │
+  │  ├─ request ceiling spent → Phase 4b barrier (stops)    │
   │  └─ timeout (exit code 4) → FALL BACK to Phase 4b       │
   └──────────────┬───────────────────────┬──────────────────┘
                  │ clearance              │ escalate / fallback
@@ -1072,7 +1073,7 @@ codex:
   request_by_default: true                    # post `@codex review` on EVERY PR, not just above-threshold (#486)
   bot_login: "chatgpt-codex-connector[bot]"   # REST API form, with [bot] suffix
   cli_login: nathanpayne-codex                # manual CLI fallback (Phase 4b)
-  max_review_rounds: 10                       # runaway guard; 11th round escalates to the human tiebreaker
+  max_review_rounds: 10                       # request ceiling; the 11th request is refused and routes through the Phase 4b barrier
   max_blocking_reviews: 10                    # blocking-review budget; a request is refused once 10 solicited blocking reviews exist (#1560)
   review_timeout_seconds: 1800                # per-round poll timeout (measured response p95/max, #1550; earlier retune #623)
   require_ci_green: true                      # merge gate
