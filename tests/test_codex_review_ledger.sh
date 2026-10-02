@@ -287,6 +287,19 @@ stop_check "stops: a blocking response to a foreign request is no runaway window
   "$(stops "$(inputs "$R2F" "$BBF" '[]' '[]' '[]')" '[]' 10 2)" '.stops == [] and .blocking_windows == 1'
 stop_check "stops: two blocking responses in one request window are no runaway at a ceiling of 2" \
   "$(stops "$(inputs "$R2B" "$BB1" '[]' '[]' '[]')" '[]' 10 2)" '.stops == [] and .blocking_reviews == 2 and .blocking_windows == 1'
+# ...and every counted request must have drawn one (#1584): three author
+# requests, the first answered clean and the next two blocking, are two
+# blocking windows that reach a ceiling of 2, but not every request
+# blocked, so no runaway.
+R3=$(printf '%s\n' "$(req 1 2026-09-25T00:00:00Z)" "$(req 2 2026-09-25T01:00:00Z)" "$(req 3 2026-09-25T02:00:00Z)" | arr)
+CBB=$(printf '%s\n' "$(preview 10 2026-09-25T00:10:00Z '[]')" "$(preview 11 2026-09-25T01:10:00Z '[["a.sh","p1"]]')" \
+     "$(preview 12 2026-09-25T02:10:00Z '[["b.sh","p1"]]' '[]' "$HEAD_B")" | arr)
+stop_check "stops: a clean first request is no runaway when more requests than the ceiling exist" \
+  "$(stops "$(inputs "$R3" "$CBB" '[]' '[]' '[]')" '[]' 10 2)" '.stops == [] and .blocking_windows == 2 and .counted_requests == 3'
+BBB=$(printf '%s\n' "$(preview 10 2026-09-25T00:10:00Z '[["c.sh","p1"]]')" "$(preview 11 2026-09-25T01:10:00Z '[["a.sh","p1"]]')" \
+     "$(preview 12 2026-09-25T02:10:00Z '[["b.sh","p1"]]' '[]' "$HEAD_B")" | arr)
+stop_check "stops: every one of three requests blocking past a ceiling of 2 is a runaway" \
+  "$(stops "$(inputs "$R3" "$BBB" '[]' '[]' '[]')" '[]' 10 2)" '.stops == ["runaway"] and .blocking_windows == 3 and .counted_requests == 3'
 
 L=$(crl_ledger "$(printf '%s' "$IN" | jq -c '.rebuttals = []')")
 [ "$(crl_blocking_count "$L" "$HEAD_A" nathanjohnpayne)" = 2 ] \

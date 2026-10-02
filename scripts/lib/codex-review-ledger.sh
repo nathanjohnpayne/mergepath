@@ -367,6 +367,10 @@ crl_human_stops() {
     # what the ceiling counts; a foreign mention opens a window too (#1584).
     | ([ \$rs[] | select($__CRL_COUNTS) | .window
          | select(. > 0 and (\$reqs[. - 1].counted == true)) ] | unique | length) as \$nw
+    # A runaway needs EVERY counted request to have drawn a blocking review,
+    # not just as many windows as the current ceiling: a lowered ceiling or
+    # concurrent near-cap callers can leave more requests than it (#1584).
+    | ([ \$reqs[] | select(.counted == true) ] | length) as \$nr
     | [ .rebuttals[] | . as \$r
         # Only a response to a request posted AFTER the rebuttal can have read
         # it: a request already in flight may be answered later without
@@ -397,8 +401,9 @@ crl_human_stops() {
         disagreements: [ \$disputes[] | select(.kind == \"disagreement\") | del(.kind) ] }
     | .request_ceiling = \$ceiling
     | .blocking_windows = \$nw
+    | .counted_requests = \$nr
     | .stops = ( [ (if \$n >= \$max then \"blocking-budget\" else empty end),
-                   (if \$n < \$max and \$ceiling != null and \$ceiling > 0 and \$nw >= \$ceiling then \"runaway\" else empty end),
+                   (if \$n < \$max and \$ceiling != null and \$ceiling > 0 and \$nr >= \$ceiling and \$nw >= \$nr then \"runaway\" else empty end),
                    (if (.disagreements | length) > 0 then \"disagreement\" else empty end),
                    (if (.untested_rebuttals | length) > 0 then \"untested-rebuttal\" else empty end) ] )" 2>/dev/null
 }
