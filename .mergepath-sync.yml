@@ -349,6 +349,22 @@ paths:
   - path: scripts/lib/codex-request-evidence.sh
     type: canonical
     consumers: all
+  # Report-only Codex review ledger (#1560): pure attribution over evidence the
+  # caller reads with the shared parsers. Nothing decides on it.
+  - path: scripts/lib/codex-review-ledger.sh
+    type: canonical
+    consumers: all
+  - path: scripts/codex-review-ledger.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/codex-review-ledger.sh"
+      - "scripts/lib/codex-request-evidence.sh"   # trigger grammar, eyes, verdicts, summary
+      - "scripts/lib/codex-failure-markers.sh"    # provider block notices
+      - "scripts/lib/feedback-policy-helpers.sh"  # tiers, policy parsing
+      - "scripts/lib/gh-api-array.sh"             # fail-closed paginated reads
+      - "scripts/lib/preflight-helpers.sh"        # reviewer-token auto-source (existence-guarded)
+      - "scripts/workflow/resolve_base_policy.sh" # governing base policy
   # Single source of truth for the Codex App failure-marker regexes (#722): the
   # live provider-response markers and the audit's broader historical usage-
   # limit classifier share this owner without sharing live terminal semantics.
@@ -1320,6 +1336,20 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/codex-request-evidence.sh"
+  # #1560 report-only ledger: attribution fixtures, CLI contract, and the
+  # verdict-expression pin across the three copies. Run by check_codex_scripts.
+  - path: tests/test_codex_review_ledger.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/codex-review-ledger.sh"
+      - "scripts/lib/codex-review-ledger.sh"
+      - "scripts/lib/codex-request-evidence.sh"
+      - "scripts/lib/codex-failure-markers.sh"
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/codex-review-request.sh"   # verdict-expression pin
+      - "scripts/codex-review-check.sh"     # verdict-expression pin
   # HEAD-anchored Codex issue-comment verdict clearance (#600/#567).
   # check_codex_scripts (scripts/ci kit) hard-runs it, so it must travel to
   # every consumer or the check fails pre-flight with `No such file`.
@@ -2170,6 +2200,7 @@ paths:
       - "tests/test_codex_review_request_token_fallback.sh"  # check_codex_scripts (#737)
       - "tests/test_codex_review_check_resolution.sh"  # check_codex_scripts (#460 Option B)
       - "tests/test_codex_request_evidence.sh"   # #1276, blocked evidence
+      - "tests/test_codex_review_ledger.sh"      # #1560, report-only ledger
       - "tests/test_codex_review_check_verdict.sh"  # check_codex_scripts (#600/#567)
       - "tests/test_codex_review_check_required_checks.sh"  # check_codex_scripts (#655)
       - "tests/test_branch_requirements.sh"    # check_codex_scripts (#1064)

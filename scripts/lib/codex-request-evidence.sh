@@ -181,3 +181,31 @@ crqe_select_codex_review_summary() { # issue-comments-json bot-login head-sha
     | max_by([.observed_at, .comment_id]) // null
   '
 }
+
+# Parse every Codex-bot issue comment that is a verdict into
+# {comment_id, created_at, reviewed_shas, affirmative}, oldest first. A
+# verdict is a comment carrying a "Reviewed commit: <sha>" anchor or headed
+# "Codex Review:" (an older format carries no sha; reviewed_shas is then []).
+# The anchor scan and the affirmative test are the exact expressions
+# codex-review-request.sh (scan_codex_state) and codex-review-check.sh
+# (CODEX_VERDICT_JSON) use; tests/test_codex_review_ledger.sh pins all three
+# copies byte-for-byte. Selection differs by design: those two keep only
+# verdicts whose sha prefixes the current head and take the latest, while
+# this reports every verdict and leaves selection to the caller.
+crqe_verdicts() { # issue-comments-json bot-login
+  printf '%s\n' "${1:-[]}" | jq -c --arg bot "${2:-}" '
+    [ .[]
+      | select((.user.login // "") == $bot)
+      | . as $c
+      | ( [ $c.body // ""
+            | ascii_downcase
+            | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
+            | .[0]
+          ] ) as $shas
+      | select(($shas | length) > 0 or (($c.body // "") | test("(?im)^\\s*codex review:")))
+      | { comment_id: .id, created_at: .created_at, reviewed_shas: $shas,
+          affirmative: ((.body // "") | test("(?im)^\\s*codex review:\\s*didn.?t find any major issues\\b")) }
+    ]
+    | sort_by(.created_at, .comment_id)
+  '
+}
