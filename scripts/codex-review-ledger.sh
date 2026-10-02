@@ -295,6 +295,13 @@ INPUTS=$(jqx "ledger inputs" -n \
     verdicts: $verdicts[0], reactions: $reactions[0], blocks: $blocks[0],
     summary: $summary[0]}')
 LEDGER=$(crl_ledger "$INPUTS") || die "ledger computation failed"
+# The evidence reads above take time; a push that lands during them would
+# leave this ledger describing a head the PR no longer has. Re-read the live
+# head once every read is done and refuse a moved one.
+LIVE_HEAD=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha' 2>/dev/null) \
+  || die "cannot re-read the PR #$PR_NUMBER head after the evidence reads"
+[ "$LIVE_HEAD" = "$HEAD_SHA" ] \
+  || die "PR #$PR_NUMBER head moved from $HEAD_SHA to $LIVE_HEAD during the ledger reads"
 # The blocking-review budget of the policy snapshot this ledger was read
 # under, by crqe_governing_budget's rule (absent: 10; not one to nine digits:
 # null), so a consumer can refuse a limit read from a different snapshot.

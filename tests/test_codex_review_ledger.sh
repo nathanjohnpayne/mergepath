@@ -271,7 +271,15 @@ if [ -n "${LEDGER_TEST_FAIL_ENDPOINT:-}" ] && [ "$1" = "$LEDGER_TEST_FAIL_ENDPOI
   exit 1
 fi
 case "$1" in
-  repos/o/r/pulls/7) printf '{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}\n' ;;
+  repos/o/r/pulls/7)
+    # LEDGER_TEST_HEAD_MOVES=1: the second head read sees a new head.
+    n=0; [ ! -f "$LEDGER_TEST_DIR/head-reads" ] || n=$(cat "$LEDGER_TEST_DIR/head-reads")
+    printf '%s\n' "$((n + 1))" >"$LEDGER_TEST_DIR/head-reads"
+    if [ "${LEDGER_TEST_HEAD_MOVES:-0}" = 1 ] && [ "$n" -ge 1 ]; then
+      case " $* " in *' --jq '*) printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' ;; *) printf '{"head":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}\n' ;; esac
+    else
+      case " $* " in *' --jq '*) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' ;; *) printf '{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}\n' ;; esac
+    fi ;;
   repos/o/r/issues/7/comments) cat "$LEDGER_TEST_DIR/issue_comments.json" ;;
   repos/o/r/pulls/7/reviews) cat "$LEDGER_TEST_DIR/reviews.json" ;;
   repos/o/r/pulls/7/comments) cat "$LEDGER_TEST_DIR/review_comments.json" ;;
@@ -332,6 +340,13 @@ if [ "$RC" = 3 ] && [ ! -s "$D/out" ] && grep -q 'not the expected' "$D/err"; th
   pass "CLI: --expect-head naming another head fails closed (exit 3, nothing printed)"
 else
   fail "CLI expect-head mismatch: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+rm -f "$D/head-reads"
+RC=$(LEDGER_TEST_HEAD_MOVES=1 run_cli "$D" --expect-head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)
+if [ "$RC" = 3 ] && [ ! -s "$D/out" ] && grep -q 'head moved' "$D/err"; then
+  pass "CLI: a head that moves during the evidence reads fails closed (#1576 round 6)"
+else
+  fail "CLI head moved mid-read: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
 fi
 RC=$(run_cli "$D" --expect-head not-a-sha)
 if [ "$RC" = 2 ] && [ ! -s "$D/out" ]; then
