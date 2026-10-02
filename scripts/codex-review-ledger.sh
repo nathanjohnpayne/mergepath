@@ -115,7 +115,13 @@ AUTHOR=$(printf '%s' "$POLICY_JSON" | jq -er '
     (if (.author_identity | type) == "string" and (.author_identity | length) > 0
      then .author_identity else error("author_identity") end)
   else "nathanjohnpayne" end') || die "governing policy or its author_identity is malformed"
-BOT=$(printf '%s' "$POLICY_JSON" | jq -r '.codex.bot_login // ""') || die "governing codex.bot_login is malformed"
+# A non-string bot login would be coerced to text that matches no Codex
+# activity, and an empty ledger would read as zero blocking reviews.
+BOT=$(printf '%s' "$POLICY_JSON" | jq -er '
+  (.codex // {}) | if type != "object" then error("codex")
+  elif (.bot_login == null) then ""
+  elif (.bot_login | type) == "string" then .bot_login
+  else error("bot_login") end') || die "governing codex.bot_login is malformed (must be a string)"
 BOT=${BOT:-chatgpt-codex-connector[bot]}
 # resolve_required_tiers returns 2 for a malformed block; any other status is
 # its normal result (its last statement is a conditional echo).

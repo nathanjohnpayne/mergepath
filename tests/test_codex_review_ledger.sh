@@ -340,6 +340,19 @@ else
   fail "CLI expect-head malformed: rc=$RC out=$(cat "$D/out")"
 fi
 
+# A non-string governing bot login is malformed, never coerced (#1576 round 4).
+for _bot in 42 '["chatgpt-codex-connector[bot]"]' '{x: 1}'; do
+  D="$WORK/bot-$RANDOM"; make_cli_case "$D"
+  printf '[]\n' >"$D/issue_comments.json"
+  printf 'author_identity: nathanjohnpayne\ncodex:\n  bot_login: %s\n' "$_bot" >"$D/policy.yml"
+  RC=$(run_cli "$D")
+  if [ "$RC" = 3 ] && [ ! -s "$D/out" ] && grep -q 'bot_login is malformed' "$D/err"; then
+    pass "CLI: a governing bot_login of $_bot fails closed"
+  else
+    fail "CLI bot_login $_bot: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+  fi
+done
+
 D="$WORK/malformed"; make_cli_case "$D"
 jq -n '[{id: "x", user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"}]' >"$D/issue_comments.json"
 RC=$(run_cli "$D")

@@ -19,6 +19,7 @@ Every comment body is parsed by an existing shared helper: requests by `crqe_tri
 - Codex reacts with eyes while a review runs and usually removes the reaction when it finishes. Each counted request reports `eyes_at`, the reaction's timestamp if it is still present, and nothing else about acknowledgement.
 - The pull-request thumbs-up is one reaction per user, so only its latest creation survives: earlier reaction-only clean passes leave no record, and the requests they answered may read as unanswered.
 - The Review Summary is edited in place. It is reported as `current_summary` and never used as history.
+- Request comments are read as they stand now. An edited or deleted request comment changes the reconstructed windows, so the ledger, like the request cap it shares a grammar with, bounds the observed history rather than an immutable one (`specs/codex_request_evidence.md`). The configured author's comments are trusted on that basis.
 
 Each ledger repeats these four limits in `limits`.
 
@@ -61,6 +62,6 @@ The `summary` object reports counted and foreign request counts and outcomes, `o
 
 `scripts/codex-review-request.sh` runs the ledger before every new request, as `codex-review-ledger.sh --repo <repo> --expect-head <sha> <PR>`, and counts the responses that have `unsolicited: false` and either a `class` of `blocking` or `unknown_tier`, or `conflicting: true`. It refuses the request once that count reaches `codex.max_blocking_reviews` (REVIEW_POLICY.md § Disagreements and Tiebreaking, signal 3). The count reads only response classes, which never depend on which request a response answered, so ambiguous attribution cannot change it.
 
-`--expect-head <sha>` makes the ledger exit `3`, printing nothing, unless the PR head is exactly `<sha>`, so the count is taken at the head the requester is about to request a review of. The requester also refuses output whose `head_sha` or `author` differs from its own, or whose responses lack a boolean `unsolicited`, a boolean `conflicting`, or a `class` from the set above (`blocking`, `discretionary`, `no_findings`, `clean`, `unknown_tier`, `provider_blocked`): an unknown class is refused, never read as non-blocking. Every failure exits `3` with no request posted.
+The governing `codex.bot_login` must be a string or absent; any other type exits `3`, because a coerced login would match no Codex activity and read as zero blocking reviews. `--expect-head <sha>` makes the ledger exit `3`, printing nothing, unless the PR head is exactly `<sha>`, so the count is taken at the head the requester is about to request a review of. The requester also refuses output whose `head_sha` or `author` differs from its own, or whose responses lack a boolean `unsolicited`, a boolean `conflicting`, or a `class` from the set above (`blocking`, `discretionary`, `no_findings`, `clean`, `unknown_tier`, `provider_blocked`): an unknown class is refused, never read as non-blocking. Every failure exits `3` with no request posted.
 
 Coverage: `tests/test_codex_review_ledger.sh`; the consumer is covered by `tests/test_codex_review_request_trigger_only.sh`.
