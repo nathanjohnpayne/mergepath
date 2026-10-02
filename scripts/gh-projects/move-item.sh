@@ -38,13 +38,28 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: move-item.sh [--add-if-missing] <issue_number> <status_name>" >&2
+  echo "usage: move-item.sh [--add-if-missing] [--] <issue_number> <status_name>" >&2
 }
 
+# Options are read until `--` or the first positional. After that only
+# --add-if-missing is still a flag, so a Status option whose name begins with
+# a dash (`move-item.sh 211 -Blocked`) stays selectable, as it was when the
+# script read $1 and $2 directly.
 ADD_IF_MISSING=0
 POSITIONAL=()
+OPTIONS_DONE=0
 for arg in "$@"; do
+  if [ "$OPTIONS_DONE" = "1" ] || [ "${#POSITIONAL[@]}" -gt 0 ]; then
+    case "$arg" in
+      --add-if-missing)
+        if [ "$OPTIONS_DONE" = "1" ]; then POSITIONAL+=("$arg"); else ADD_IF_MISSING=1; fi
+        ;;
+      *) POSITIONAL+=("$arg") ;;
+    esac
+    continue
+  fi
   case "$arg" in
+    --) OPTIONS_DONE=1 ;;
     --add-if-missing) ADD_IF_MISSING=1 ;;
     -h|--help) usage; exit 0 ;;
     -?*) echo "Error: unknown option: $arg" >&2; usage; exit 2 ;;
@@ -95,6 +110,17 @@ ghp_gh() (
   GH_HOST=github.com gh "$@"
 )
 
+# `gh project --owner` accepts @me for the token's own account, but
+# repositoryOwner(login:) needs a real login. Resolve it over REST, which does
+# not draw on the GraphQL quota; `item-add` below still takes $OWNER as given.
+OWNER_LOGIN="$OWNER"
+if [ "$OWNER" = "@me" ]; then
+  if ! OWNER_LOGIN=$(ghp_gh api user --jq .login) || [ -z "$OWNER_LOGIN" ]; then
+    echo "failed to resolve OWNER=@me to the token's login" >&2
+    exit 1
+  fi
+fi
+
 # One query resolves everything the edit needs. The Status field is matched by
 # exact name over the board's fields (not `field(name:)`), and the option by
 # exact name, so the matching rules are the ones `field-list` gave before.
@@ -131,7 +157,7 @@ query($owner: String!, $repoOwner: String!, $repoName: String!, $number: Int!, $
 # project, repository, or issue does not resolve; that message is the error.
 if ! RESOLVED_JSON=$(ghp_gh api graphql \
     -f query="$QUERY" \
-    -f owner="$OWNER" \
+    -f owner="$OWNER_LOGIN" \
     -f repoOwner="${REPO%%/*}" \
     -f repoName="${REPO#*/}" \
     -F number="$ISSUE_NUM" \

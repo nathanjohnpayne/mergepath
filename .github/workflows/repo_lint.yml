@@ -585,8 +585,9 @@ jobs:
 
       # scripts/gh-projects/move-item.sh resolves the item through the
       # issue's projectItems in one GraphQL query, never by paging the board.
+      # Structural assertions here; the stubbed-gh suite runs in deep CI.
       - name: check_gh_projects_move_item
-        run: ./scripts/ci/check_gh_projects_move_item || { rc=$?; if [ ! -f scripts/ci/check_gh_projects_move_item ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_gh_projects_move_item not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+        run: ./scripts/ci/check_gh_projects_move_item --check || { rc=$?; if [ ! -f scripts/ci/check_gh_projects_move_item ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_gh_projects_move_item not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_no_token_in_output
         # Canonical rule, oracle, safety and exemption contracts live in
@@ -897,6 +898,10 @@ jobs:
       - name: check_pr_review_policy_nudge --self-test
         if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_pr_review_policy_nudge'))
         run: ./scripts/ci/check_pr_review_policy_nudge --self-test || { rc=$?; if [ ! -f scripts/ci/check_pr_review_policy_nudge ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_pr_review_policy_nudge not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_gh_projects_move_item --self-test
+        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_gh_projects_move_item'))
+        run: ./scripts/ci/check_gh_projects_move_item --self-test || { rc=$?; if [ ! -f scripts/ci/check_gh_projects_move_item ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_gh_projects_move_item not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_phase_4b_automation --self-test
         if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_phase_4b_automation'))

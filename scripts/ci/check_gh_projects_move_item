@@ -13,13 +13,20 @@
 #   1. Structural: no board-wide `gh project item-list` / `project view` /
 #      `project field-list` call remains, the query reads `projectItems`,
 #      and the token-identity check is still there.
-#   2. Behavioral: the script runs against a PATH-shimmed `gh` that answers
+#   2. Behavioral (self-test): the script runs against a PATH-shimmed `gh` that answers
 #      the GraphQL query from fixtures and exits 99 on any board-listing
 #      call. Covers the single-query happy path, an item on a same-numbered
 #      board of another owner (matched by project node ID, not number), the
 #      not-on-board failure and its --add-if-missing path, exact-name Status
 #      matching, archived and truncated items, a GraphQL failure, the usage
-#      contract, and that a failed identity check stops before any gh call.
+#      contract (including dash-prefixed Status names and `--`), OWNER=@me,
+#      and that a failed identity check stops before any gh call.
+#
+# Modes (docs/agents/testing-requirements.md § Repo-lint execution, shared
+# selector scripts/lib/ci-check-modes.sh): --check runs only the structural
+# assertions (repo-lint's fast lane), --self-test runs both (deep CI), and the
+# no-argument form runs both so a consumer whose repo_lint.yml lags this
+# wrapper is unaffected.
 #
 # Hermetic: no token, no network. Runs the script from a temp copy beside a
 # stub identity-check.sh so the identity gate is exercised, not skipped.
@@ -32,6 +39,18 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SUBJECT="$REPO_ROOT/scripts/gh-projects/move-item.sh"
 NAME="check_gh_projects_move_item"
+
+MODE_HELPER="$REPO_ROOT/scripts/lib/ci-check-modes.sh"
+if [ ! -f "$MODE_HELPER" ]; then
+  echo "$NAME: ERROR scripts/lib/ci-check-modes.sh missing" >&2
+  exit 1
+fi
+# shellcheck source=../lib/ci-check-modes.sh
+. "$MODE_HELPER"
+if ! ci_check_select_mode "$@"; then
+  echo "usage: $NAME [--check | --self-test]" >&2
+  exit 2
+fi
 
 if [ ! -f "$SUBJECT" ]; then
   echo "$NAME: ERROR (missing scripts/gh-projects/move-item.sh)" >&2
@@ -67,6 +86,16 @@ ok "move-item.sh no longer resolves the item through the issue's projectItems" \
 ok "move-item.sh no longer runs identity-check.sh --expect-write-identity before mutating" \
   grep -qF -- '--expect-write-identity' <<<"$CODE"
 
+if [ "$CI_CHECK_RUN_SELF_TEST" != "1" ]; then
+  echo "$NAME: $PASS passed, $FAIL failed (--check: structural only)"
+  if [ "$FAIL" -ne 0 ]; then
+    echo "$NAME: FAIL"
+    exit 1
+  fi
+  echo "$NAME: PASS"
+  exit 0
+fi
+
 # ---------------------------------------------------------------------------
 # 2. Behavioral assertions against a stubbed gh.
 # ---------------------------------------------------------------------------
@@ -100,6 +129,7 @@ case "$1 $2" in
     fi
     cat "$STUB_FIXTURE"
     ;;
+  "api user") echo "stub-login" ;;
   "project item-add") echo '{"id":"PVTI_added"}' ;;
   "project item-edit") ;;
   *) echo "stub gh: unexpected call: $*" >&2; exit 99 ;;
@@ -117,6 +147,8 @@ fixture() {
     {"id":"PVTSSF_status","name":"Status","options":[
       {"id":"opt_backlog","name":"Backlog"},
       {"id":"opt_inprog","name":"In progress"},
+      {"id":"opt_blocked","name":"-Blocked"},
+      {"id":"opt_addflag","name":"--add-if-missing"},
       {"id":"opt_done","name":"Done"}]}]}}},
   "repository":{"issue":{"url":"https://github.com/nathanjohnpayne/example/issues/211",
     "projectItems":{"pageInfo":{"hasNextPage":${3:-false}},"nodes":$2}}}}}
@@ -142,7 +174,7 @@ run() {
   set +e
   OUT="$(env -u GITHUB_TOKEN PATH="$WORK/bin:$PATH" \
     STUB_LOG="$LOG" STUB_FIXTURE="$WORK/$fx" \
-    REPO=nathanjohnpayne/example OWNER=nathanjohnpayne PROJECT=4 GH_TOKEN=stub-token \
+    REPO=nathanjohnpayne/example OWNER="${RUN_OWNER:-nathanjohnpayne}" PROJECT=4 GH_TOKEN=stub-token \
     "$WORK/scripts/gh-projects/move-item.sh" "$@" 2>&1)"
   RC=$?
   set -e
@@ -223,6 +255,28 @@ expect_rc "emptystatus" 2
 for c in badopt extra notnum noargs onearg emptystatus; do
   ok "$c: gh was called on a usage error; log: $(cat "$WORK/$c.log")" [ ! -s "$WORK/$c.log" ]
 done
+
+# A Status name that begins with a dash is a positional once the issue number
+# is in, and `--` ends option parsing (Codex on #1608).
+run dashstatus found.json 211 "-Blocked"
+expect_rc "dashstatus" 0
+expect_log "dashstatus" '--single-select-option-id opt_blocked'
+run dashsep found.json --add-if-missing -- 211 "-Blocked"
+expect_rc "dashsep" 0
+expect_log "dashsep" '--single-select-option-id opt_blocked'
+run literalflag found.json -- 211 --add-if-missing
+expect_rc "literalflag" 0
+expect_log "literalflag" '--single-select-option-id opt_addflag'
+
+# OWNER=@me resolves to the token's login over REST for the query, and
+# item-add keeps the @me shorthand gh project accepts (Codex on #1608).
+RUN_OWNER=@me run atme missing.json 211 "Done" --add-if-missing
+expect_rc "atme" 0
+expect_calls "atme" '^api user' 1
+expect_log "atme" '-f owner=stub-login'
+expect_calls "atme" '^project item-add 4 --owner @me ' 1
+RUN_OWNER=someone run notme found.json 211 "Done"
+expect_calls "notme" '^api user' 0
 
 # A failed identity check stops before any gh call.
 STUB_IDENTITY_RC=2 run identity found.json 211 "Done"

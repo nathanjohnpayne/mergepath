@@ -116,6 +116,10 @@
       "tests/test_approval_merge_continuation.sh",
       "tests/test_merge_clearance_gate.sh"
     ],
+    "check_gh_projects_move_item": [
+      "scripts/gh-projects/move-item.sh",
+      "scripts/lib/ci-check-modes.sh"
+    ],
     "check_pr_review_policy_nudge": [
       "scripts/pr-review-policy-nudge.sh",
       "tests/test_pr_review_policy_nudge.sh",
