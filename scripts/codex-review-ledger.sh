@@ -122,6 +122,20 @@ REQUIRED_TIERS=$(resolve_required_tiers "$POLICY_FILE") || tiers_rc=$?
 # disagree, rather than add a second tier reader the requester and gate
 # would not share.
 READER_TIERS=$(printf '%s\n' "$REQUIRED_TIERS" | jq -Rsc 'split("\n") | map(select(length > 0)) | sort')
+# Validate what the parsed policy says before comparing: the shared reader
+# ignores values it cannot place, so an invalid mode or priority would
+# otherwise read as "nothing required" on both sides and pass (#1574). The
+# accepted values are exactly the ones resolve_required_tiers accepts.
+printf '%s' "$POLICY_JSON" | jq -e '
+  if (has("feedback_policy") | not) then true
+  elif (.feedback_policy | type) != "object" then false
+  else .feedback_policy as $fp
+    | (($fp.mode == null) or ($fp.mode == "by-priority") or ($fp.mode == "address-all"))
+      and (($fp.priorities == null) or (($fp.priorities | type) == "object"
+           and ($fp.priorities | to_entries
+                | all(.value == "required" or .value == "discretionary" or .value == "ignore"))))
+  end' >/dev/null 2>&1 \
+  || die "governing feedback_policy has an invalid mode or priority value (accepted: mode by-priority|address-all; priorities required|discretionary|ignore)"
 PARSED_TIERS=$(printf '%s' "$POLICY_JSON" | jq -c '
   ["p0","p1","p2","p3","nitpick"] as $all
   | if (has("feedback_policy") | not) then ["p1"]

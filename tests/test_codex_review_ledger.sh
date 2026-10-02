@@ -21,6 +21,7 @@ command -v jq >/dev/null 2>&1 || { echo "FAIL: jq is required" >&2; exit 1; }
 
 HEAD_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 HEAD_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+HEAD_C=cccccccccccccccccccccccccccccccccccccccc
 
 # inputs <requests> <reviews> <verdicts> <reactions> <blocks> [required]
 inputs() {
@@ -91,6 +92,28 @@ L=$(ledger "$( { req 1 $T0; req 2 2026-09-25T00:01:00Z; req 3 $T4; } | arr)" \
 check "after an ambiguous window that may still owe a response, the next response is ambiguous too" "$L" \
   '.requests[2].outcome == "ambiguous" and (.requests[2].candidates | index(1) != null and index(2) != null)
    and (.requests[2].reasons | join(" ") | test("may still owe"))'
+
+# #1572: two responses with two requests outstanding may both answer the
+# first, so the window pays nothing and both stay candidates afterwards.
+L=$(ledger "$( { req 1 $T0; req 2 2026-09-25T00:01:00Z; req 3 $T4; } | arr)" \
+  "$( { review 10 $T2 $HEAD_A '["p2"]'; review 11 $T3 $HEAD_B '["p2"]'; review 12 $T5 $HEAD_C '["p2"]'; } | arr)" '[]' '[]' '[]')
+check "#1572: an ambiguous window with two candidates settles nothing, even with two responses" "$L" \
+  '.requests[2].outcome == "ambiguous" and (.requests[2].candidates | index(1) != null and index(2) != null)'
+
+# #1573: an ambiguous window still records the heads its request may have
+# been answered on, so a later same-head response may be a second answer.
+L=$(ledger "$( { req 1 $T0; req 2 $T3; } | arr)" \
+  "$( { review 10 $T1 $HEAD_A '["p2"]'; review 11 $T2 $HEAD_A '["p3"]'; review 12 $T4 $HEAD_A '["p2"]'; } | arr)" '[]' '[]' '[]')
+check "#1573: anchors from an ambiguous window make a later same-head response a possible second answer" "$L" \
+  '.requests[1].outcome == "ambiguous" and (.requests[1].candidates | index(1) != null)
+   and (.requests[0].possible_second_response | length) == 1'
+
+# A window whose only candidate is its own request settles it, even with two
+# responses, so a later response on a new head is attributed.
+L=$(ledger "$( { req 1 $T0; req 2 $T3; } | arr)" \
+  "$( { review 10 $T1 $HEAD_A '["p2"]'; review 11 $T2 $HEAD_B '["p3"]'; review 12 $T4 $HEAD_C '["p2"]'; } | arr)" '[]' '[]' '[]')
+check "a several-response window with one candidate settles it; a later new-head response is attributed" "$L" \
+  '.requests[0].outcome == "ambiguous" and .requests[1].outcome == "attributed" and .summary.open_debt == 0'
 
 L=$(ledger "$( { req 1 $T0; req 2 $T3; } | arr)" "$( { review 10 $T1 $HEAD_A '["p2"]'; review 11 $T4 $HEAD_B '["p1"]'; } | arr)" '[]' '[]' '[]')
 check "responses on different heads in successive windows are each attributed" "$L" \
@@ -374,6 +397,20 @@ if [ "$RC" = 3 ] && [ ! -s "$D/out" ] && grep -q 'refusing to guess' "$D/err"; t
 else
   fail "CLI flow-style policy: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
 fi
+
+# #1574: values the shared reader ignores must not pass the cross-check.
+for bad in 'feedback_policy: {mode: typo}' 'feedback_policy: {priorities: {p1: requird}}' \
+           'feedback_policy: {mode: by-priority, priorities: [p1]}' 'feedback_policy: {mode: 3}'; do
+  D="$WORK/badpolicy-$(printf '%s' "$bad" | cksum | cut -d' ' -f1)"; make_cli_case "$D"
+  printf '%s\n' 'author_identity: nathanjohnpayne' "$bad" >"$D/policy.yml"
+  printf '[]\n' >"$D/issue_comments.json"
+  RC=$(run_cli "$D")
+  if [ "$RC" = 3 ] && [ ! -s "$D/out" ] && grep -q 'feedback_policy' "$D/err"; then
+    pass "#1574: an invalid feedback_policy value fails closed ($bad)"
+  else
+    fail "#1574 invalid policy ($bad): rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+  fi
+done
 
 D="$WORK/blockpolicy"; make_cli_case "$D"
 printf '%s\n' 'author_identity: nathanjohnpayne' 'feedback_policy:' '  mode: address-all' >"$D/policy.yml"
