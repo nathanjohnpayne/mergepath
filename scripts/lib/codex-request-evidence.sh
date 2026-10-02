@@ -30,6 +30,24 @@ crqe_trigger_generation() { # comments-json author
   '
 }
 
+# The latest qualifying Codex request time by the configured author, or empty
+# when there is none (#1598). The substitute merge gate uses it to refuse a
+# Phase 4b approval that a newer request has superseded. A qualifying command
+# without a timestamp fails closed.
+crqe_latest_trigger_time() { # comments-json author
+  printf '%s\n' "$1" | jq -er --arg author "$2" '
+    [ .[]
+      | select((.user.login // "") == $author)
+      | select((.body // "") | test("\\A@codex review\\z"; "i"))
+      | .created_at
+    ] as $times
+    | if all($times[]; type == "string" and length > 0)
+      then ($times | max // "")
+      else error("qualifying Codex request comment lacks created_at")
+      end
+  '
+}
+
 crqe_count_triggers() { # comments-json author
   local generation
   generation=$(crqe_trigger_generation "$1" "$2") || return 1

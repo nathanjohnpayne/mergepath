@@ -652,25 +652,6 @@ p4b_codex_request_budget_state() {
   fi
 }
 
-# p4b_request_generation_unchanged <repo> <pr> <snapshot>
-# The cheap final fence at the approval writer boundary (#1598): re-read only
-# the issue comments and compare the configured author's trigger generation
-# with the snapshot's, without the slow ledger or policy reads. Returns 0 when
-# unchanged, 1 when a request was added, edited or removed, and 2 when the
-# snapshot or the live read is unusable.
-p4b_request_generation_unchanged() {
-  local repo="$1" pr="$2" snapshot="$3" author expected comments live
-  expected=$(printf '%s' "$snapshot" | jq -ce '.request_generation | select(type == "array")' 2>/dev/null) \
-    || return 2
-  author="$(p4b_top_field author_identity)"
-  author="${author:-nathanjohnpayne}"
-  comments=$(gh_api_array "repos/$repo/issues/$pr/comments" "Codex request generation final fence") \
-    || return 2
-  live=$(crqe_trigger_generation "$comments" "$author" 2>/dev/null) || return 2
-  live=$(printf '%s' "$live" | jq -ce 'select(type == "array")' 2>/dev/null) || return 2
-  [ "$live" = "$expected" ] || return 1
-}
-
 # Revalidate the complete authority carried by an `available` request-budget
 # result without re-probing either review provider. The stable PR tuple binds
 # the policy lookup to the reviewed head/base/default-ref generation; the

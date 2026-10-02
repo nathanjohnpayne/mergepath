@@ -174,4 +174,40 @@ GENERATION_FIXTURE='[
 ! crqe_trigger_generation '[{"id":"bad","user":{"login":"nathanjohnpayne"},"body":"@codex review"}]' nathanjohnpayne >/dev/null 2>&1
 echo "PASS: shared exact-request generation selector"
 
+# #1598: a Codex request the configured author posts AFTER a Phase 4b
+# substitute approval supersedes it, so gate (c) does not clear on that
+# approval until Codex answers. An older request, a newer request from another
+# login and a newer mention all leave the approval effective; a qualifying
+# request without a timestamp fails closed.
+_latest=$(crqe_latest_trigger_time '[{"id":1,"user":{"login":"someone-else"},"created_at":"2026-09-14T00:09:00Z","body":"@codex review"}]' nathanjohnpayne) \
+  && [ "$_latest" = "" ] || { echo 'FAIL: no qualifying author request must read as empty, not fail'; exit 1; }
+_latest=$(crqe_latest_trigger_time '[{"id":1,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:01:00Z","body":"@CODEX REVIEW"},{"id":2,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:03:00Z","body":"@codex review"}]' nathanjohnpayne) \
+  && [ "$_latest" = 2026-09-14T00:03:00Z ] || { echo "FAIL: latest author request time was '$_latest'"; exit 1; }
+! crqe_latest_trigger_time '[{"id":1,"user":{"login":"nathanjohnpayne"},"body":"@codex review"}]' nathanjohnpayne >/dev/null 2>&1 \
+  || { echo 'FAIL: a qualifying request without created_at did not fail closed'; exit 1; }
+sed 's/allow_phase_4b_substitute: false/allow_phase_4b_substitute: true/' "$DIR/default-policy.yml" >"$DIR/substitute-policy.yml"
+SUB_APPROVAL='[{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:05:00Z"}]'
+while IFS='|' read -r name comments expected pattern; do
+  printf '%s\n' "$comments" >"$DIR/comments"
+  printf '%s\n' "$SUB_APPROVAL" >"$DIR/reviews"
+  printf '[]\n' >"$DIR/ack"
+  : >"$DIR/calls"
+  rc=0
+  PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ="$name" \
+    PR_BODY='Authoring-Agent: claude' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+    MERGEPATH_REVIEW_POLICY_PATH="$DIR/substitute-policy.yml" \
+    bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/out" 2>&1 || rc=$?
+  if [ "$rc" != "$expected" ] || ! grep -q "$pattern" "$DIR/out"; then
+    cat "$DIR/out"; echo "FAIL #1598 $name rc=$rc"; exit 1
+  fi
+  PASS=$((PASS + 1))
+  echo "PASS: #1598 $name"
+done <<'CASES'
+older-request|[{"id":123,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:01:00Z","body":"@codex review"}]|0|cleared — Phase 4b substitute
+newer-request|[{"id":123,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:09:00Z","body":"@codex review"}]|1|a Codex request by nathanjohnpayne @ 2026-09-14T00:09:00Z is newer than it (#1598)
+newer-foreign-request|[{"id":123,"user":{"login":"someone-else"},"created_at":"2026-09-14T00:09:00Z","body":"@codex review"}]|0|cleared — Phase 4b substitute
+newer-mention|[{"id":123,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:09:00Z","body":"status: @codex review was requested"}]|0|cleared — Phase 4b substitute
+malformed-request|[{"id":123,"user":{"login":"nathanjohnpayne"},"body":"@codex review"}]|1|Codex request evidence unreadable (#1598)
+CASES
+
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"

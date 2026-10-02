@@ -65,6 +65,8 @@
 #           for repos that genuinely require Codex bot clearance and
 #           not a substitute Phase 4b reviewer. Mirrors gate (b)
 #           branch 1's filter shape, scoped to HEAD via commit_id.
+#           A Codex request the configured author posted after the
+#           approval supersedes it until Codex answers (#1598).
 #
 #       The merge gate explicitly does NOT require an APPROVED review
 #       state from the Codex bot. The ChatGPT Codex Connector GitHub
@@ -2980,7 +2982,24 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
     if [ -n "$CODEX_HEAD_VERDICT_ANY_TIME" ] && { [ -z "$LATEST_CODEX_SIGNAL_TIME" ] || [[ "$CODEX_HEAD_VERDICT_ANY_TIME" > "$LATEST_CODEX_SIGNAL_TIME" ]]; }; then
       LATEST_CODEX_SIGNAL_TIME="$CODEX_HEAD_VERDICT_ANY_TIME"
     fi
-    if [ -z "$LATEST_CODEX_SIGNAL_TIME" ] || [[ "$PHASE_4B_TIME" > "$LATEST_CODEX_SIGNAL_TIME" ]]; then
+    # #1598: a Codex request the configured author posted AFTER the Phase 4b
+    # approval supersedes it. Until Codex answers, the approval must not clear:
+    # the run that posted it cannot have seen that request, and no ordering of
+    # its pre-POST reads can rule one out. Once Codex answers, its newer signal
+    # decides through the latest-signal-wins guard above. A rerun of Phase 4b
+    # after the request posts a newer approval. Request evidence that cannot be
+    # read fails closed.
+    PHASE_4B_SUPERSEDED=""
+    if ! declare -F crqe_latest_trigger_time >/dev/null 2>&1; then
+      PHASE_4B_SUPERSEDED="request evidence helper unavailable"
+    elif ! LATEST_AUTHOR_REQUEST_TIME=$(crqe_latest_trigger_time "$ISSUE_COMMENTS_JSON" "$AUTHOR_IDENTITY" 2>/dev/null); then
+      PHASE_4B_SUPERSEDED="Codex request evidence unreadable"
+    elif [ -n "$LATEST_AUTHOR_REQUEST_TIME" ] && [[ "$LATEST_AUTHOR_REQUEST_TIME" > "$PHASE_4B_TIME" ]]; then
+      PHASE_4B_SUPERSEDED="a Codex request by $AUTHOR_IDENTITY @ $LATEST_AUTHOR_REQUEST_TIME is newer than it"
+    fi
+    if [ -n "$PHASE_4B_SUPERSEDED" ]; then
+      log "gate (c): Phase 4b substitute candidate $PHASE_4B_LOGIN @ $PHASE_4B_TIME is not accepted: $PHASE_4B_SUPERSEDED (#1598)"
+    elif [ -z "$LATEST_CODEX_SIGNAL_TIME" ] || [[ "$PHASE_4B_TIME" > "$LATEST_CODEX_SIGNAL_TIME" ]]; then
       CLEARED=true
       CLEARANCE_REASON="Phase 4b substitute: latest-state APPROVED on HEAD from $PHASE_4B_LOGIN @ $PHASE_4B_TIME (codex.allow_phase_4b_substitute=true; newer than any Codex bot signal on HEAD: ${LATEST_CODEX_SIGNAL_TIME:-none})"
     else
