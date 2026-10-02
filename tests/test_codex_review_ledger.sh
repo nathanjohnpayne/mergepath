@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Fixture coverage for the report-only Codex review ledger (#1560, slice 2).
+# Fixture coverage for the Codex review ledger (#1560): built report-only in
+# slice 2; since slice 3 the requester reads its blocking-review count.
 #
 # Part 1 drives the pure attribution library (scripts/lib/codex-review-ledger.sh)
 # with synthetic timelines, one rule per case. Part 2 runs the real CLI against
@@ -229,7 +230,7 @@ check "a top-level review-body P1 finding is blocking" "$L" '.responses[0].class
 
 L=$(ledger "$(req 1 $T0 | arr)" "$(review 10 $T1 $HEAD_A '["p1"]' | arr)" '[]' '[]' '[]')
 check "the ledger states its limits and has no clearance field" "$L" \
-  '(.limits | length) == 4 and ([.. | objects | keys[] | select(test("clear"; "i"))] | length) == 0'
+  '(.limits | length) == 5 and any(.limits[]; test("edited or deleted request")) and ([.. | objects | keys[] | select(test("clear"; "i"))] | length) == 0'
 
 # ---- Part 2: CLI contract (stubbed gh, real libs) ---------------------------
 
@@ -271,7 +272,15 @@ if [ -n "${LEDGER_TEST_FAIL_ENDPOINT:-}" ] && [ "$1" = "$LEDGER_TEST_FAIL_ENDPOI
   exit 1
 fi
 case "$1" in
-  repos/o/r/pulls/7) printf '{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}\n' ;;
+  repos/o/r/pulls/7)
+    # LEDGER_TEST_HEAD_MOVES=1: the second head read sees a new head.
+    n=0; [ ! -f "$LEDGER_TEST_DIR/head-reads" ] || n=$(cat "$LEDGER_TEST_DIR/head-reads")
+    printf '%s\n' "$((n + 1))" >"$LEDGER_TEST_DIR/head-reads"
+    if [ "${LEDGER_TEST_HEAD_MOVES:-0}" = 1 ] && [ "$n" -ge 1 ]; then
+      case " $* " in *' --jq '*) printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' ;; *) printf '{"head":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}\n' ;; esac
+    else
+      case " $* " in *' --jq '*) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' ;; *) printf '{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}\n' ;; esac
+    fi ;;
   repos/o/r/issues/7/comments) cat "$LEDGER_TEST_DIR/issue_comments.json" ;;
   repos/o/r/pulls/7/reviews) cat "$LEDGER_TEST_DIR/reviews.json" ;;
   repos/o/r/pulls/7/comments) cat "$LEDGER_TEST_DIR/review_comments.json" ;;
@@ -315,6 +324,102 @@ if ! grep -qvE '^repos/o/r/(pulls/7|issues/7/comments|pulls/7/reviews|pulls/7/co
   pass "CLI: reads only the PR's own records"
 else
   fail "CLI read an unexpected endpoint: $(cat "$D/calls")"
+fi
+
+# --expect-head (#1560 slice 3): the requester's blocking-review count must be
+# taken at the head it is about to request a review of.
+D="$WORK/expect-head"; make_cli_case "$D"
+printf '[]\n' >"$D/issue_comments.json"
+RC=$(run_cli "$D" --expect-head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)
+if [ "$RC" = 0 ] && jq -e '.head_sha == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$D/out" >/dev/null; then
+  pass "CLI: --expect-head matching the PR head prints the ledger"
+else
+  fail "CLI expect-head match: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+RC=$(run_cli "$D" --expect-head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)
+if [ "$RC" = 3 ] && [ ! -s "$D/out" ] && grep -q 'not the expected' "$D/err"; then
+  pass "CLI: --expect-head naming another head fails closed (exit 3, nothing printed)"
+else
+  fail "CLI expect-head mismatch: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+rm -f "$D/head-reads"
+RC=$(LEDGER_TEST_HEAD_MOVES=1 run_cli "$D" --expect-head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)
+if [ "$RC" = 3 ] && [ ! -s "$D/out" ] && grep -q 'head moved' "$D/err"; then
+  pass "CLI: a head that moves during the evidence reads fails closed (#1576 round 6)"
+else
+  fail "CLI head moved mid-read: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+RC=$(run_cli "$D" --expect-head not-a-sha)
+if [ "$RC" = 2 ] && [ ! -s "$D/out" ]; then
+  pass "CLI: --expect-head with a malformed sha is a usage error"
+else
+  fail "CLI expect-head malformed: rc=$RC out=$(cat "$D/out")"
+fi
+
+# The ledger reports the blocking-review budget of the policy snapshot it read
+# (#1576 round 5): absent is 10, a valid value is a number, an invalid one null.
+for _mb in absent 3 false; do
+  D="$WORK/maxblocking-$_mb"; make_cli_case "$D"
+  printf '[]\n' >"$D/issue_comments.json"
+  [ "$_mb" = absent ] || printf '  max_blocking_reviews: %s\n' "$_mb" >>"$D/policy.yml"
+  case "$_mb" in absent) _want=10 ;; 3) _want=3 ;; *) _want=null ;; esac
+  RC=$(run_cli "$D")
+  if [ "$RC" = 0 ] && [ "$(jq -c '.max_blocking_reviews' "$D/out")" = "$_want" ]; then
+    pass "CLI: a governing max_blocking_reviews of $_mb is reported as $_want"
+  else
+    fail "CLI max_blocking_reviews $_mb: rc=$RC got=$(jq -c '.max_blocking_reviews' "$D/out" 2>/dev/null) err=$(cat "$D/err")"
+  fi
+done
+
+# --expect-policy (#1576): one policy snapshot for the caller and the ledger.
+# The fingerprint ignores key order and formatting, and changes with content.
+(
+  . "$ROOT/scripts/lib/codex-request-evidence.sh"
+  fp1=$(crqe_policy_fingerprint '{"a":1,"codex":{"bot_login":"x","max_review_rounds":3}}')
+  fp2=$(crqe_policy_fingerprint '{"codex":{"max_review_rounds":3,"bot_login":"x"},  "a":1}')
+  fp3=$(crqe_policy_fingerprint '{"a":1,"codex":{"bot_login":"y","max_review_rounds":3}}')
+  [ -n "$fp1" ] && [ "$fp1" = "$fp2" ] && [ "$fp1" != "$fp3" ] && ! crqe_policy_fingerprint 'not json' >/dev/null
+) && pass "fingerprint: stable across key order, different for different content, fails on malformed input" \
+  || fail "fingerprint: crqe_policy_fingerprint is not a stable content identity"
+D="$WORK/expect-policy"; make_cli_case "$D"
+printf '[]\n' >"$D/issue_comments.json"
+RC=$(run_cli "$D")
+_fp=$(jq -r '.policy_fingerprint // empty' "$D/out" 2>/dev/null)
+RC2=$(run_cli "$D" --expect-policy "$_fp")
+_out2=$(cat "$D/out")
+RC3=$(run_cli "$D" --expect-policy 1-1)
+if [ "$RC" = 0 ] && [[ "$_fp" =~ ^[0-9]+-[0-9]+$ ]] && [ "$RC2" = 0 ] \
+   && [ "$(printf '%s' "$_out2" | jq -r .policy_fingerprint)" = "$_fp" ] \
+   && [ "$RC3" = 3 ] && [ ! -s "$D/out" ] && grep -q 'policy changed' "$D/err"; then
+  pass "CLI: --expect-policy accepts its own snapshot's fingerprint and refuses another (exit 3, nothing printed)"
+else
+  fail "CLI expect-policy: rc=$RC/$RC2/$RC3 fp=$_fp err=$(cat "$D/err")"
+fi
+
+# A non-string governing bot login is malformed, never coerced (#1576 round 4).
+for _bot in 42 '["chatgpt-codex-connector[bot]"]' '{x: 1}' codex-false; do
+  D="$WORK/bot-$RANDOM"; make_cli_case "$D"
+  printf '[]\n' >"$D/issue_comments.json"
+  printf 'author_identity: nathanjohnpayne\ncodex:\n  bot_login: %s\n' "$_bot" >"$D/policy.yml"
+  # A boolean codex block is malformed too, not an empty one (CodeRabbit on #1576).
+  [ "$_bot" != codex-false ] || printf 'author_identity: nathanjohnpayne\ncodex: false\n' >"$D/policy.yml"
+  RC=$(run_cli "$D")
+  if [ "$RC" = 3 ] && [ ! -s "$D/out" ] && grep -q 'bot_login is malformed' "$D/err"; then
+    pass "CLI: a governing bot_login of $_bot fails closed"
+  else
+    fail "CLI bot_login $_bot: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+  fi
+done
+
+# A Codex review with no submitted_at cannot be windowed (#1576 round 10).
+D="$WORK/no-submitted-at"; make_cli_case "$D"
+jq -n '[{id: 101, user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"}]' >"$D/issue_comments.json"
+jq -n '[{id: 50, user: {login: "chatgpt-codex-connector[bot]"}, submitted_at: null, commit_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", body: ""}]' >"$D/reviews.json"
+RC=$(run_cli "$D")
+if [ "$RC" = 3 ] && [ ! -s "$D/out" ] && grep -q 'no submitted_at' "$D/err"; then
+  pass "CLI: a Codex review with no submitted_at fails closed"
+else
+  fail "CLI null submitted_at: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
 fi
 
 D="$WORK/malformed"; make_cli_case "$D"

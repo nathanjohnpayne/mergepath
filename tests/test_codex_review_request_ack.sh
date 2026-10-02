@@ -11,6 +11,27 @@ export MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD=true
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-review-request-ack.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
+# The requester counts solicited blocking reviews from the Codex review ledger
+# before every new request (#1560 slice 3). This stub reports a ledger with no
+# responses for whatever head the requester expects, so the blocking-review
+# budget never stops these cases; test_codex_review_request_trigger_only.sh
+# covers the budget itself.
+LEDGER_STUB="$WORKDIR/codex-ledger-stub.sh"
+cat >"$LEDGER_STUB" <<'LEDGER_EOF'
+#!/usr/bin/env bash
+[ -z "${CODEX_LEDGER_STUB_LOG:-}" ] || printf '%s\n' "$*" >>"$CODEX_LEDGER_STUB_LOG"
+# Simulates the governed budget turning malformed after the initial request.
+[ -z "${CODEX_LEDGER_STUB_BREAK_POLICY:-}" ] \
+  || printf '  max_blocking_reviews: false\n' >>"$CODEX_LEDGER_STUB_BREAK_POLICY"
+head=""
+while [ $# -gt 0 ]; do
+  case "$1" in --expect-head) head=$2; shift 2 ;; --expect-policy) fp=$2; shift 2 ;; *) shift ;; esac
+done
+jq -nc --arg h "$head" --arg fp "${fp:-}" --arg a "${CODEX_LEDGER_STUB_AUTHOR:-nathanjohnpayne}" \
+  '{head_sha: $h, author: $a, max_blocking_reviews: 10, policy_fingerprint: $fp, responses: []}'
+LEDGER_EOF
+chmod +x "$LEDGER_STUB"
+export MERGEPATH_CODEX_LEDGER_CMD="$LEDGER_STUB"
 
 PASS=0
 FAIL=0
@@ -480,16 +501,37 @@ test_eyes_ack_does_not_retrigger_or_clear() {
   fi
 }
 
+# #1560 slice 3 (Codex P2 on #1576): an acknowledgement retry does not re-check
+# the blocking-review budget, so a governed max_blocking_reviews that turns
+# malformed after the initial request must not fail the retry.
+test_ack_retry_ignores_blocking_budget_value() {
+  local dir rc count
+  dir=$(make_case "retry-blocking-malformed" 0 1)
+  rc=$(CODEX_LEDGER_STUB_BREAK_POLICY="$dir/state/base-review-policy.yml" run_case "$dir" absent)
+  count=$(trigger_count "$dir")
+  if ! grep -q 'max_blocking_reviews: false' "$dir/state/base-review-policy.yml"; then
+    fail "ack retry blocking budget: the stub did not break the governed value"
+  elif [ "$rc" != "4" ] || [ "$count" != "2" ]; then
+    fail "ack retry blocking budget: exit $rc with $count triggers, expected 4 with the retry posted; stderr=$(cat "$dir/err.log")"
+  else
+    pass "ack retry: a governed blocking budget that turns malformed after the initial request does not fail the retry"
+  fi
+}
+
 test_missing_ack_retriggers_once() {
   local dir rc count
   dir=$(make_case "missing-one-retry" 0 1)
-  rc=$(run_case "$dir" absent)
+  rc=$(CODEX_LEDGER_STUB_LOG="$dir/ledger-calls" run_case "$dir" absent)
   count=$(trigger_count "$dir")
 
   if [ "$rc" != "4" ]; then
     fail "missing ack one retry: exit $rc, expected 4; stderr=$(cat "$dir/err.log")"
   elif [ "$count" != "2" ]; then
     fail "missing ack one retry: trigger count $count, expected original + one retry"
+  elif [ "$(wc -l <"$dir/ledger-calls" | tr -d ' ')" != 1 ]; then
+    # #1560 slice 3: the blocking-review budget gates the new request only;
+    # the acknowledgement retry re-asks for that same request.
+    fail "missing ack one retry: blocking-review ledger ran $(wc -l <"$dir/ledger-calls" | tr -d ' ') times, expected once (initial request only)"
   elif ! grep -q "re-posting '@codex review'" "$dir/err.log"; then
     fail "missing ack one retry: missing re-trigger log; stderr=$(cat "$dir/err.log")"
   else
@@ -878,7 +920,7 @@ set -euo pipefail
 exit 0
 EOF
   chmod +x "$dir/scripts/identity-check.sh"
-  rc=$(run_case "$dir" absent 0 author-pat-123)
+  rc=$(CODEX_LEDGER_STUB_AUTHOR=custom-owner run_case "$dir" absent 0 author-pat-123)
   pat=$(bridged_pat "$dir")
   identity=$(head -1 "$dir/state/author-identity-env" 2>/dev/null || printf '')
 
@@ -962,7 +1004,7 @@ test_non_bridge_path_passes_configured_identity() {
   # styles (Codex P2 r9).
   printf "author_identity: 'custom-owner'\n" >>"$dir/.github/review-policy.yml"
   printf "author_identity: 'custom-owner'\n" >>"$dir/state/base-review-policy.yml"
-  rc=$(run_case "$dir" absent 0 reviewer-pat-456)
+  rc=$(CODEX_LEDGER_STUB_AUTHOR=custom-owner run_case "$dir" absent 0 reviewer-pat-456)
   identity=$(head -1 "$dir/state/author-identity-env" 2>/dev/null || printf '')
 
   if [ "$(trigger_count "$dir")" -lt 1 ]; then
@@ -1409,6 +1451,7 @@ test_default_reply_deadline_is_1800() {
 
 test_eyes_ack_does_not_retrigger_or_clear
 test_missing_ack_retriggers_once
+test_ack_retry_ignores_blocking_budget_value
 test_retry_cap_respected
 test_request_attempt_cap_suppresses_ack_retry_but_polls
 test_reused_final_slot_trigger_polls_arriving_response

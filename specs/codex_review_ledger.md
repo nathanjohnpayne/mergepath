@@ -1,6 +1,6 @@
-# Report-only Codex review ledger (#1560, slice 2)
+# Codex review ledger (#1560)
 
-`scripts/codex-review-ledger.sh <PR>` reconstructs which Codex responses a pull request's Codex requests drew, from records GitHub already holds, and prints the result. The attribution logic lives in `scripts/lib/codex-review-ledger.sh`, a pure function over evidence the command reads first. The ledger is report-only: it writes nothing to GitHub, and no requester, Phase 4b barrier or merge-gate path reads it. It exists so the counting and routing decision recorded on #1560 is made from measured evidence. Where the record cannot prove an attribution, the ledger says so and lists the candidates; it never picks one.
+`scripts/codex-review-ledger.sh <PR>` reconstructs which Codex responses a pull request's Codex requests drew, from records GitHub already holds, and prints the result. The attribution logic lives in `scripts/lib/codex-review-ledger.sh`, a pure function over evidence the command reads first. The ledger writes nothing to GitHub. It was built report-only (slice 2) so the counting and routing decision recorded on #1560 would be made from measured evidence. Since slice 3 it has one consumer, described under [Consumer: the blocking-review budget](#consumer-the-blocking-review-budget); nothing reads its attribution to decide anything. Where the record cannot prove an attribution, the ledger says so and lists the candidates; it never picks one.
 
 ## Inputs and authority
 
@@ -19,8 +19,9 @@ Every comment body is parsed by an existing shared helper: requests by `crqe_tri
 - Codex reacts with eyes while a review runs and usually removes the reaction when it finishes. Each counted request reports `eyes_at`, the reaction's timestamp if it is still present, and nothing else about acknowledgement.
 - The pull-request thumbs-up is one reaction per user, so only its latest creation survives: earlier reaction-only clean passes leave no record, and the requests they answered may read as unanswered.
 - The Review Summary is edited in place. It is reported as `current_summary` and never used as history.
+- Request comments are read as they stand now. An edited or deleted request comment changes the reconstructed windows, so the ledger, like the request cap it shares a grammar with, bounds the observed history rather than an immutable one (`specs/codex_request_evidence.md`). The configured author's comments are trusted on that basis.
 
-Each ledger repeats these four limits in `limits`.
+Each ledger repeats these five limits in `limits`.
 
 ## Responses
 
@@ -57,4 +58,10 @@ A request followed by another with no response in between is `reposted_without_r
 
 The `summary` object reports counted and foreign request counts and outcomes, `open_debt`, eyes and re-post counts, response counts by class, `blocking_responses` and `blocking_responses_solicited` (unsolicited responses excluded), and the counts of mixed-head windows, multi-response windows, ties, conflicting responses, anchor conflicts and thread-reply wrappers. `--summary` prints the same counts and lists every request that is not cleanly attributed, was re-posted without a response, or may have received a second response.
 
-Coverage: `tests/test_codex_review_ledger.sh`.
+## Consumer: the blocking-review budget
+
+`scripts/codex-review-request.sh` runs the ledger before every new request, as `codex-review-ledger.sh --repo <repo> --expect-head <sha> <PR>`, and counts the responses that have `unsolicited: false` and either a `class` of `blocking` or `unknown_tier`, or `conflicting: true`. It refuses the request once that count reaches `codex.max_blocking_reviews` (REVIEW_POLICY.md § Disagreements and Tiebreaking, signal 3). The count reads only response classes, which never depend on which request a response answered, so ambiguous attribution cannot change it.
+
+The requester also passes `--expect-policy <fp>`, the `crqe_policy_fingerprint` of the governing base-policy snapshot it read (the POSIX checksum and size of its canonical JSON). The ledger fingerprints its own snapshot, exits `3` on a mismatch, and reports `policy_fingerprint` and `max_blocking_reviews` (null when invalid). The requester requires both to match its own read. Author, bot login, required tiers and budget therefore all come from one base revision, and a base that moved between the two reads is refused as conflicting evidence. The requester accepts exactly one ledger document. The ledger also re-reads the PR head after its evidence reads, and exits `3` if it moved. The governing `codex.bot_login` must be a string or absent; any other type exits `3`, because a coerced login would match no Codex activity and read as zero blocking reviews. `--expect-head <sha>` makes the ledger exit `3`, printing nothing, unless the PR head is exactly `<sha>`, so the count is taken at the head the requester is about to request a review of. The requester also refuses output whose `head_sha` or `author` differs from its own, or whose responses lack a boolean `unsolicited`, a boolean `conflicting`, or a `class` from the set above (`blocking`, `discretionary`, `no_findings`, `clean`, `unknown_tier`, `provider_blocked`): an unknown class is refused, never read as non-blocking. Every failure exits `3` with no request posted.
+
+Coverage: `tests/test_codex_review_ledger.sh`; the consumer is covered by `tests/test_codex_review_request_trigger_only.sh`.
