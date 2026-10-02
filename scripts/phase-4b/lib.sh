@@ -1717,7 +1717,7 @@ p4b_barrier_maybe_resume() {
 #
 # The human-stop conditions a spent request ceiling must clear before it may
 # dispatch the automated adapter (#1560 slice 3, S3-4): the blocking-review
-# budget, an untested rebuttal, and a disagreement, as crl_human_stops defines
+# budget, a runaway, an untested rebuttal, and a disagreement, as crl_human_stops defines
 # them over the Codex review ledger. Prints {state: "clear"|"stop", stops,
 # blocking_reviews, max_blocking_reviews, untested_rebuttals, disagreements,
 # governing_tuple} and returns 0, or {state: "unsafe", reason} and returns 2
@@ -1725,7 +1725,7 @@ p4b_barrier_maybe_resume() {
 # Missing or conflicting evidence never reads as "clear".
 p4b_codex_human_stops() {
   local repo="$1" pr="$2" head="$3" config author resolver tuple final_tuple budget max
-  local ledger_cmd ledger stops base_ref base_sha default_branch fp
+  local ledger_cmd ledger stops base_ref base_sha default_branch fp ceiling
   if [ "$P4B_CODEX_REQUEST_BUDGET_OK" != true ] || [ "$P4B_CODEX_LEDGER_OK" != true ] \
      || ! command -v crqe_governing_budget crl_human_stops >/dev/null 2>&1; then
     jq -nc '{state:"unsafe",reason:"human-stop-helper-unavailable"}'
@@ -1764,7 +1764,11 @@ p4b_codex_human_stops() {
     || { jq -nc '{state:"unsafe",reason:"ledger-failed"}'; return 2; }
   printf '%s' "$ledger" | jq -se --arg fp "$fp" 'length == 1 and .[0].policy_fingerprint == $fp' >/dev/null 2>&1 \
     || { jq -nc '{state:"unsafe",reason:"ledger-policy-snapshot-mismatch"}'; return 2; }
-  stops=$(crl_human_stops "$ledger" "$head" "$author" "$max") \
+  # The request ceiling rides along so a ceiling below the blocking budget
+  # still reads a ceiling of blocking reviews as a runaway (#1560 canary).
+  ceiling=$(printf '%s' "$budget" | jq -r '.max_request_attempts // empty')
+  case "$ceiling" in ''|*[!0-9]*) jq -nc '{state:"unsafe",reason:"request-ceiling-invalid"}'; return 2 ;; esac
+  stops=$(crl_human_stops "$ledger" "$head" "$author" "$max" "$ceiling") \
     || { jq -nc '{state:"unsafe",reason:"ledger-malformed"}'; return 2; }
   final_tuple=$(p4b_pr_policy_tuple "$repo" "$pr") \
     || { jq -nc '{state:"unsafe",reason:"pr-policy-tuple-reread-failed"}'; return 2; }
@@ -1865,7 +1869,7 @@ p4b_barrier_ceiling_route() { # <repo> <pr> <head> <clear-evidence> <stop-eviden
 #   1  pending   — at least one is not yet, still inside the bound
 #   2  escalate  — a provider needs the ordinary manual Phase 4b fallback
 #   3  tiebreak  — Codex request ceiling spent and a human stop holds
-#                  (blocking-review budget, untested rebuttal or disagreement;
+#                  (blocking-review budget, runaway, untested rebuttal or disagreement;
 #                  #1560 slice 3); explicit human decision needed. A spent
 #                  ceiling with no human stop waives the Codex arm instead.
 #   4  error     — request-budget evidence failed; no review authority follows

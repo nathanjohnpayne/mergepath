@@ -8,10 +8,11 @@
 # --summary). The attribution and classification rules are documented in
 # scripts/lib/codex-review-ledger.sh.
 #
-# Read only: it posts nothing and changes no label. One consumer reads it:
-# scripts/codex-review-request.sh counts the PR's solicited blocking responses
-# from it for the blocking-review budget (#1560 slice 3). That count needs no
-# request attribution; nothing reads the attribution to decide anything.
+# Read only: it posts nothing and changes no label. Two consumers read it
+# (#1560 slice 3): scripts/codex-review-request.sh counts the PR's solicited
+# blocking responses for the blocking-review budget, which needs no
+# attribution; the Phase 4b barrier's human stops use attribution to decide
+# whether a rebuttal was tested (crl_human_stops).
 #
 # Usage:
 #   scripts/codex-review-ledger.sh [--repo owner/name] [--summary]
@@ -282,8 +283,8 @@ done <<<"$(jqx "reviews" -c '.[]' <<<"$BOT_REVIEWS")"
 # earlier question or fix note would date the rebuttal too early, and a Codex
 # response in between would then read as having tested it. Dating late errs
 # toward "untested", which stops for the human. A thumbs-down is read only for roots whose
-# reaction rollup does not rule one out. Rebuttals of review-body findings
-# leave no per-finding record and are not seen.
+# reaction rollup does not rule one out. Review-body findings are handled
+# below, from their review-ack acknowledgements.
 REBUTTALS='[]'
 while IFS= read -r root; do
   [ -n "$root" ] || continue
@@ -295,7 +296,15 @@ while IFS= read -r root; do
         # creation time could predate a Codex review that never saw the tag.
         | ([.created_at, .updated_at] | map(select(type == "string")) | max) ]' <<<"$REVIEW_COMMENTS")
   sources=$(jqx "thread $rid" -c 'if length > 0 then ["tag"] else [] end' <<<"$times")
-  if [ "$(jqx "root $rid reactions rollup" -r '((.reactions // {})["-1"] // 1) > 0' <<<"$root")" = true ]; then
+  # Assigned in a plain statement, not inside the test: a failure inside a
+  # command substitution used as an `if` operand escapes set -e, and a
+  # malformed rollup would then read as "no thumbs-down" (#1582).
+  rollup_says_down=$(jqx "root $rid reactions rollup" -r '
+    # Default only an ABSENT rollup: `// {}` would also turn a present false
+    # or null into {} and skip the fail-closed path (#1584).
+    (if has("reactions") then .reactions else {} end)
+    | if type != "object" then error("reactions") else (.["-1"] // 1) > 0 end' <<<"$root")
+  if [ "$rollup_says_down" = true ]; then
     down=$(read_array "repos/$REPO/pulls/comments/$rid/reactions" "finding $rid reactions")
     down=$(jqx "finding $rid reactions" -c --arg bot "$BOT" \
       '[ .[] | select(.content == "-1" and (.user.login // "") != $bot) | .created_at ]' <<<"$down")
@@ -309,6 +318,28 @@ while IFS= read -r root; do
       '. + [{finding: $r.id, path: ($r.path // null), at: ($t | max), sources: $s}]' <<<"$REBUTTALS")
   fi
 done <<<"$(jqx "review comments" -c '.[] | select(.in_reply_to_id == null)' <<<"$BOT_REVIEW_COMMENTS")"
+
+# Review-body findings have no thread, so their disposition is an issue-comment
+# acknowledgement, `[mergepath-review-ack: <review-id> <fingerprint>]`
+# (review-feedback-accounting.sh). The ack does not say whether the finding was
+# fixed or rebutted, so an ack of a Codex review with a BLOCKING body finding is
+# read as a rebuttal of that review (path null, dated by the ack's later of
+# creation and edit). Over-reading errs toward a human stop, never toward a
+# waiver (#1560 canary: body rebuttals never reached the ledger).
+printf '%s\n' "$LEDGER_REVIEWS" >"$LEDGER_TMP/ack_reviews.json"
+BODY_REBUTTALS=$(jqx "review acks" -c --slurpfile rv "$LEDGER_TMP/ack_reviews.json" --arg bot "$BOT" \
+  --argjson required "$REQUIRED_JSON" '
+  def blocking_tier($t): $t == "p0" or ($required | index($t)) != null;
+  ([ $rv[0][] | select(any(.body_tiers[]; blocking_tier(.))) | .id ]) as $blocking
+  | [ .[] | select((.user.login // "") != $bot and ((.user.type // "") != "Bot"))
+      | . as $c
+      | ((.body // "") | [ scan("\\[mergepath-review-ack:\\s*([0-9]+)\\s+[0-9a-f]+\\]") | .[0] | tonumber ]) as $ids
+      | $ids[] | select(. as $i | $blocking | index($i))
+      | {finding: ., path: null,
+         at: ([$c.created_at, $c.updated_at] | map(select(type == "string")) | max),
+         sources: ["review-ack"]} ]
+  | group_by(.finding) | map({finding: .[0].finding, path: null, at: (map(.at) | max), sources: ["review-ack"]})' <<<"$ISSUE_COMMENTS")
+REBUTTALS=$(jqx "rebuttals" -c --argjson b "$BODY_REBUTTALS" '. + $b' <<<"$REBUTTALS")
 
 # ---- verdicts, reactions, provider blocks, summary ------------------------------
 VERDICTS=$(crqe_verdicts "$ISSUE_COMMENTS" "$BOT") || die "cannot parse Codex verdict comments"
