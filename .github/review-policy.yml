@@ -430,8 +430,10 @@ coderabbit:
 # review as `chatgpt-codex-connector[bot]`.
 #
 # This replaces the human-shuttled Phase 4 external review on the happy path.
-# On timeout, disagreement, or runaway, the flow falls back to the manual
-# CLI path described in REVIEW_POLICY.md § Phase 4b.
+# On timeout, the flow falls back to Phase 4b (REVIEW_POLICY.md § Phase 4b).
+# Disagreement and runaway do not fall back: they stop for the human
+# tiebreaker (the Phase 4b barrier exits 8 and renders no handoff), per
+# REVIEW_POLICY.md § Disagreements and Tiebreaking.
 #
 # Prerequisite: the ChatGPT Codex Connector GitHub App must be installed on
 # the repository with Code Review enabled at

@@ -300,7 +300,10 @@ while IFS= read -r root; do
   # command substitution used as an `if` operand escapes set -e, and a
   # malformed rollup would then read as "no thumbs-down" (#1582).
   rollup_says_down=$(jqx "root $rid reactions rollup" -r '
-    (.reactions // {}) | if type != "object" then error("reactions") else (.["-1"] // 1) > 0 end' <<<"$root")
+    # Default only an ABSENT rollup: `// {}` would also turn a present false
+    # or null into {} and skip the fail-closed path (#1584).
+    (if has("reactions") then .reactions else {} end)
+    | if type != "object" then error("reactions") else (.["-1"] // 1) > 0 end' <<<"$root")
   if [ "$rollup_says_down" = true ]; then
     down=$(read_array "repos/$REPO/pulls/comments/$rid/reactions" "finding $rid reactions")
     down=$(jqx "finding $rid reactions" -c --arg bot "$BOT" \

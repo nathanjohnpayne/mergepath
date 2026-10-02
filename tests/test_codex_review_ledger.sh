@@ -648,17 +648,20 @@ else
   fail "CLI body rebuttal: rc=$RC rebuttals=$(jq -c .rebuttals "$D/out" 2>/dev/null) err=$(cat "$D/err")"
 fi
 
-# A malformed reaction rollup fails closed instead of reading as "no thumbs-down" (#1582).
-D="$WORK/bad-rollup"; make_cli_case "$D"
-jq -n '[{id: 101, user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"}]' >"$D/issue_comments.json"
-jq -n '[{id: 50, user: {login: "chatgpt-codex-connector[bot]"}, submitted_at: "2026-09-25T00:10:00Z", commit_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", body: ""}]' >"$D/reviews.json"
-jq -n '[{id: 60, pull_request_review_id: 50, in_reply_to_id: null, path: "x.sh", user: {login: "chatgpt-codex-connector[bot]"}, body: "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>** thing", created_at: "2026-09-25T00:10:00Z", reactions: "x"}]' >"$D/review_comments.json"
-RC=$(run_cli "$D")
-if [ "$RC" = 3 ] && [ ! -s "$D/out" ]; then
-  pass "CLI: a malformed reaction rollup fails closed (#1582)"
-else
-  fail "CLI malformed rollup: rc=$RC out=$(head -c 200 "$D/out")"
-fi
+# A malformed reaction rollup fails closed instead of reading as "no thumbs-down"
+# (#1582), including a present false or null, which `// {}` used to default (#1584).
+for _rollup in '"x"' false null; do
+  D="$WORK/bad-rollup-$_rollup"; make_cli_case "$D"
+  jq -n '[{id: 101, user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"}]' >"$D/issue_comments.json"
+  jq -n '[{id: 50, user: {login: "chatgpt-codex-connector[bot]"}, submitted_at: "2026-09-25T00:10:00Z", commit_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", body: ""}]' >"$D/reviews.json"
+  jq -n --argjson r "$_rollup" '[{id: 60, pull_request_review_id: 50, in_reply_to_id: null, path: "x.sh", user: {login: "chatgpt-codex-connector[bot]"}, body: "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>** thing", created_at: "2026-09-25T00:10:00Z", reactions: $r}]' >"$D/review_comments.json"
+  RC=$(run_cli "$D")
+  if [ "$RC" = 3 ] && [ ! -s "$D/out" ]; then
+    pass "CLI: a malformed reaction rollup ($_rollup) fails closed (#1582)"
+  else
+    fail "CLI malformed rollup $_rollup: rc=$RC out=$(head -c 200 "$D/out")"
+  fi
+done
 
 D="$WORK/malformed"; make_cli_case "$D"
 jq -n '[{id: "x", user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"}]' >"$D/issue_comments.json"
