@@ -1717,7 +1717,7 @@ p4b_barrier_maybe_resume() {
 #
 # The human-stop conditions a spent request ceiling must clear before it may
 # dispatch the automated adapter (#1560 slice 3, S3-4): the blocking-review
-# budget, an untested rebuttal, and a disagreement, as crl_human_stops defines
+# budget, a runaway, an untested rebuttal, and a disagreement, as crl_human_stops defines
 # them over the Codex review ledger. Prints {state: "clear"|"stop", stops,
 # blocking_reviews, max_blocking_reviews, untested_rebuttals, disagreements,
 # governing_tuple} and returns 0, or {state: "unsafe", reason} and returns 2
@@ -1869,7 +1869,7 @@ p4b_barrier_ceiling_route() { # <repo> <pr> <head> <clear-evidence> <stop-eviden
 #   1  pending   — at least one is not yet, still inside the bound
 #   2  escalate  — a provider needs the ordinary manual Phase 4b fallback
 #   3  tiebreak  — Codex request ceiling spent and a human stop holds
-#                  (blocking-review budget, untested rebuttal or disagreement;
+#                  (blocking-review budget, runaway, untested rebuttal or disagreement;
 #                  #1560 slice 3); explicit human decision needed. A spent
 #                  ceiling with no human stop waives the Codex arm instead.
 #   4  error     — request-budget evidence failed; no review authority follows

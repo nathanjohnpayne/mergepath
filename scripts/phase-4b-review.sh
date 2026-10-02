@@ -645,7 +645,7 @@ hold_for_external_review() {
 
 stop_for_human_tiebreaker() {
   local payload="$1"
-  p4b_warn "Codex human stop holds (spent blocking-review budget, untested rebuttal or disagreement at a spent request ceiling); stopping for a human tiebreaker without adapter dispatch or Phase 4b handoff"
+  p4b_warn "Codex human stop holds (spent blocking-review budget, runaway, untested rebuttal or disagreement at a spent request ceiling); stopping for a human tiebreaker without adapter dispatch or Phase 4b handoff"
   jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
         --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" '
@@ -1422,7 +1422,7 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
   # without a Codex report on this head. Say so, and that no human stop held.
   case "$P4B_PRE_ADAPTER_CODEX_EVIDENCE" in
     request-ceiling*)
-      printf -- '- Provider ordering: the Codex request ceiling was spent on this head, so this review ran without a Codex report here; no human stop held (blocking-review budget, untested rebuttal, disagreement) (#1560)\n'
+      printf -- '- Provider ordering: the Codex request ceiling was spent on this head, so this review ran without a Codex report here; no human stop held (blocking-review budget, runaway, untested rebuttal, disagreement) (#1560)\n'
       ;;
   esac
   # #1335: likewise for a CodeRabbit review carried from identical content.
