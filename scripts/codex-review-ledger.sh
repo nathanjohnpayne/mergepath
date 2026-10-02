@@ -125,7 +125,8 @@ READER_TIERS=$(printf '%s\n' "$REQUIRED_TIERS" | jq -Rsc 'split("\n") | map(sele
 # Validate what the parsed policy says before comparing: the shared reader
 # ignores values it cannot place, so an invalid mode or priority would
 # otherwise read as "nothing required" on both sides and pass (#1574). The
-# accepted values are exactly the ones resolve_required_tiers accepts.
+# accepted values are exactly the ones resolve_required_tiers accepts, including
+# an empty value (`p1:`), which both read as unset.
 printf '%s' "$POLICY_JSON" | jq -e '
   if (has("feedback_policy") | not) then true
   elif (.feedback_policy | type) != "object" then false
@@ -133,7 +134,7 @@ printf '%s' "$POLICY_JSON" | jq -e '
     | (($fp.mode == null) or ($fp.mode == "by-priority") or ($fp.mode == "address-all"))
       and (($fp.priorities == null) or (($fp.priorities | type) == "object"
            and ($fp.priorities | to_entries
-                | all(.value == "required" or .value == "discretionary" or .value == "ignore"))))
+                | all(.value == null or .value == "required" or .value == "discretionary" or .value == "ignore"))))
   end' >/dev/null 2>&1 \
   || die "governing feedback_policy has an invalid mode or priority value (accepted: mode by-priority|address-all; priorities required|discretionary|ignore)"
 PARSED_TIERS=$(printf '%s' "$POLICY_JSON" | jq -c '

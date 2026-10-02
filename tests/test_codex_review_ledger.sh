@@ -412,6 +412,16 @@ for bad in 'feedback_policy: {mode: typo}' 'feedback_policy: {priorities: {p1: r
   fi
 done
 
+D="$WORK/emptypriority"; make_cli_case "$D"
+printf '%s\n' 'author_identity: nathanjohnpayne' 'feedback_policy:' '  mode: by-priority' '  priorities:' '    p0: required' '    p1:' >"$D/policy.yml"
+printf '[]\n' >"$D/issue_comments.json"
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e '.required_tiers == ["p0"]' "$D/out" >/dev/null; then
+  pass "an empty priority value means unset, as in the shared reader"
+else
+  fail "empty priority: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+
 D="$WORK/blockpolicy"; make_cli_case "$D"
 printf '%s\n' 'author_identity: nathanjohnpayne' 'feedback_policy:' '  mode: address-all' >"$D/policy.yml"
 jq -n '[{id: 101, user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"}]' >"$D/issue_comments.json"
