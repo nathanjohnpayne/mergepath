@@ -155,22 +155,28 @@ crl_ledger() {
               provider_blocked: ([$grp.sigs[] | select(.kind == "block") | .reason] | unique) } ] ) as $responses
 
     # ---- attribution sweep -----------------------------------------------------
-    # unresolved: requests not yet attributed; debt: how many of them may still
-    # be owed a response. A response is attributed only when it is the window''s
-    # only response, its own request is the only unresolved one, nothing earlier
-    # is still owed, it is not a same-second tie, and nothing makes it a
-    # plausible second answer to an earlier request (same head anchor as an
-    # earlier attributed response, or no anchor at all after the first window).
+    # unresolved: requests that may still be owed a response. A response is
+    # attributed only when it is the window''s only response, its own request
+    # is the only unresolved one, it is not a same-second tie, and nothing makes
+    # it a plausible second answer to an earlier request (an earlier request
+    # holding a response on the same head, or an anchorless response after the
+    # first window). Responses never name the request they answer, so an
+    # ambiguous window settles its requests only when that coverage is proven:
+    # its own request is the only candidate (#1572). Otherwise every candidate
+    # stays unresolved, because several responses can all answer one request.
+    # anchors: every head a request may have been answered on, recorded for
+    # each candidate of an ambiguous window too (#1573).
     | ( reduce range(1; $n + 1) as $k
-          ( {unresolved: [], debt: 0, att: {}, amb: {}, second: {}, anchors: {}};
-            .unresolved += [$k] | .debt += 1
+          ( {unresolved: [], att: {}, amb: {}, second: {}, anchors: {}};
+            .unresolved += [$k]
             | [ $responses[] | select(.window == $k) ] as $rs
             | if ($rs | length) == 0 then .
               else
                 . as $st
+                | ( [ $rs[] | .anchor | select(. != null) ] ) as $ranchors
                 | ( [ $rs[] | .anchor as $a
                       | if $a == null then (if $k > 1 then [$k - 1] else [] end)
-                        else [ $st.anchors | to_entries[] | select(.value != null and same_head(.value; $a))
+                        else [ $st.anchors | to_entries[] | select(any(.value[]; same_head(.; $a)))
                                | .key | tonumber ] end ]
                     | add | unique | map(select(. < $k)) ) as $extra
                 # A response in the same second as a request may precede every
@@ -180,13 +186,12 @@ crl_ledger() {
                       | ( [ $reqs[] | select(.created_at == $tt and .k != $k) | .k ]
                           + ([ $reqs[] | select(.created_at < $tt) | .k ] | if length > 0 then [max] else [] end) ) ]
                     | add // [] | unique ) as $tieprev
-                | ( ($rs | length) == 1 and $st.unresolved == [$k] and $st.debt == 1
-                    and ($tieprev | length) == 0 and (any($rs[]; .tie) | not)
-                    and ($extra | length) == 0 ) as $clean
-                | if $clean then
+                | ( $st.unresolved == [$k] and ($tieprev | length) == 0
+                    and (any($rs[]; .tie) | not) and ($extra | length) == 0 ) as $covered
+                | if $covered and ($rs | length) == 1 then
                     .att[($k | tostring)] = [$rs[0].rid]
-                    | .anchors[($k | tostring)] = $rs[0].anchor
-                    | .unresolved = [] | .debt = 0
+                    | .anchors[($k | tostring)] = $ranchors
+                    | .unresolved = []
                   else
                     ( [ $tieprev, $st.unresolved, $extra ] | add | unique ) as $cand
                     | ( [ (if ($rs | length) > 1 then "several responses in one window" else empty end),
@@ -205,11 +210,10 @@ crl_ledger() {
                     # have received this response (second/late answer or tie).
                     | reduce ([ $extra[], $tieprev[] ] | unique | map(select(. as $x | $st.unresolved | index($x) | not)))[] as $x
                         (.; .second[($x | tostring)] = ((.second[($x | tostring)] // []) + [$rs[].rid] | unique))
-                    # An earlier request may have taken the response, so it
-                    # pays the debt only when no earlier request competes.
-                    | .debt = (if ($extra | length) > 0 or ($tieprev | length) > 0 then $st.debt
-                               else ([$st.debt - ($rs | length), 0] | max) end)
-                    | if .debt == 0 then .unresolved = [] else . end
+                    # Any candidate may have been answered on these heads.
+                    | reduce $cand[] as $c (.;
+                        .anchors[($c | tostring)] = ((.anchors[($c | tostring)] // []) + $ranchors | unique))
+                    | if $covered then .unresolved = [] else . end
                   end
               end ) ) as $sweep
 
@@ -256,7 +260,7 @@ crl_ledger() {
         foreign_requests: ([ $requests[] | select(.counted | not) ] | length),
         outcomes: outcomes([ $requests[] | select(.counted) ]),
         foreign_outcomes: outcomes([ $requests[] | select(.counted | not) ]),
-        open_debt: $sweep.debt,
+        open_debt: ([ $sweep.unresolved[] | select($sweep.amb[(. | tostring)] != null) ] | length),
         eyes_now: ([ $requests[] | select(.eyes_at != null) ] | length),
         reposted_without_response: ([ $requests[] | select(.counted and .reposted_without_response) ] | length),
         reposted_after_eyes: ([ $requests[] | select(.counted and .eyes_before_repost == true) ] | length),

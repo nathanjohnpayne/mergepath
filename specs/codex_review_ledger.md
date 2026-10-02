@@ -4,7 +4,7 @@
 
 ## Inputs and authority
 
-The configured author, the Codex bot login (an absent or empty value defaults to `chatgpt-codex-connector[bot]`) and the required feedback tiers come from the pull request's governing base policy (`scripts/workflow/resolve_base_policy.sh`), the same authority the request cap reads. A policy that is not an object, or a malformed `author_identity` or `feedback_policy`, fails closed. Required tiers come from the shared line-oriented reader `resolve_required_tiers`, the one the requester and the merge gate use; the ledger cross-checks its result against the parsed policy and fails closed when they disagree (for example a flow-style `feedback_policy: {...}`), rather than adding a second tier reader.
+The configured author, the Codex bot login (an absent or empty value defaults to `chatgpt-codex-connector[bot]`) and the required feedback tiers come from the pull request's governing base policy (`scripts/workflow/resolve_base_policy.sh`), the same authority the request cap reads. A policy that is not an object, or a malformed `author_identity` or `feedback_policy` (including a `mode` other than `by-priority` or `address-all`, or a priority value other than `required`, `discretionary`, `ignore` or empty, in any YAML style; #1574), fails closed. Required tiers come from the shared line-oriented reader `resolve_required_tiers`, the one the requester and the merge gate use; the ledger cross-checks its result against the parsed policy and fails closed when they disagree (for example a flow-style `feedback_policy: {...}`), rather than adding a second tier reader.
 
 Every comment body is parsed by an existing shared helper: requests by `crqe_trigger_generation`, finding tiers by `codex_tiers_of` / `codex_tier_of`, provider blocks by `codex_failure_marker_of`, verdicts by `crqe_verdicts`, and the current Review Summary by `crqe_select_codex_review_summary`. `crqe_verdicts` uses the exact anchor and affirmative expressions `codex-review-request.sh` and `codex-review-check.sh` carry (the test pins all three copies); it differs from them only in selection, reporting every verdict instead of the latest one on the current head. A failed read, or malformed evidence anywhere (a qualifying request without a positive integer id, a review that does not parse), exits `3` and prints nothing. Repeated pagination items are de-duplicated by id.
 
@@ -38,14 +38,16 @@ A response class says what Codex answered and nothing about merge clearance, whi
 
 ## Attribution
 
-Requests are swept in order. `unresolved` holds requests not yet attributed and `debt` how many of them may still be owed a response. A window's response is **attributed** to its request only when all of these hold:
+Requests are swept in order. `unresolved` holds the requests that may still be owed a response. A window's response is **attributed** to its request only when all of these hold:
 
 - it is the window's only response;
-- its request is the only unresolved one and nothing earlier is still owed;
+- its request is the only unresolved one;
 - it is not a same-second tie;
-- it cannot be a second or late answer to an earlier request. That rules out a response on the same head as an earlier attributed response, and an anchorless response after the first window.
+- it cannot be a second or late answer to an earlier request. That rules out a response on a head any earlier request may have been answered on, and an anchorless response after the first window.
 
-Otherwise every unresolved request becomes **ambiguous**, with the candidates and the reasons listed. A tie adds every other request in that second and the last request strictly before it as candidates, because the response may precede all of them. An earlier attributed request that the response may also answer is flagged `possible_second_response`. The ambiguous window pays down the debt by its number of responses, unless an earlier request competes for them, and unresolved requests stay candidates while any debt remains (`open_debt`). A request with no response and nothing resolving it is `unanswered`, or `no_response_yet` when it is the last request.
+Otherwise every unresolved request becomes **ambiguous**, with the candidates and the reasons listed. A tie adds every other request in that second and the last request strictly before it as candidates, because the response may precede all of them. An earlier request outside the unresolved set that the response may also answer is flagged `possible_second_response`.
+
+Responses never name the request they answer, so an ambiguous window settles its requests only when that coverage is proven: its own request is the only candidate (several responses in such a window still answer only that request). When two or more requests are candidates, nothing is settled, however many responses arrived, because they may all answer the same request; every candidate stays unresolved for later windows (#1572). An ambiguous window also records each response's head against every candidate, so a later response on one of those heads is a possible second answer to them (#1573). `open_debt` counts the ambiguous requests still unresolved at the end. A request with no response and nothing resolving it is `unanswered`, or `no_response_yet` when it is the last request.
 
 ## Re-posts
 
