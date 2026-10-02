@@ -7,7 +7,7 @@ The MUX Video Integration initiative ([Project #5](https://github.com/users/nath
 ## What this gives you
 
 - **`lib.sh`** — a sourceable library of functions: `create_parent`, `create_child`, `link_sub_issue`, `add_to_project`, `set_project_readme`, `ensure_label`, `prep_body` (placeholder substitution). Source it from a short per-initiative driver script.
-- **`move-item.sh`** — a standalone CLI that moves one issue to a named Status swimlane by discovering the project's field/option IDs at runtime. Works against any Project v2 with a `Status` single-select field.
+- **`move-item.sh`** — a standalone CLI that moves one issue to a named Status swimlane by discovering the project's field/option IDs at runtime. Works against any Project v2 with a `Status` single-select field. One GraphQL query per move, whatever the board's size.
 - **`examples/mux-video-integration/`** — a complete worked example: the driver script, body-file templates, and the output that produced issues #210–#230.
 
 ## Prerequisites
@@ -70,6 +70,13 @@ PROJECT=5 OWNER=nathanjohnpayne REPO=nathanjohnpayne/nathanpaynedotcom \
   scripts/gh-projects/move-item.sh 211 "In progress"
 ```
 
+The issue must already be on the board; otherwise the script fails and says so. Pass `--add-if-missing` to add it first (`gh project item-add`, idempotent) and then move it:
+
+```bash
+PROJECT=5 OWNER=nathanjohnpayne REPO=nathanjohnpayne/nathanpaynedotcom \
+  scripts/gh-projects/move-item.sh --add-if-missing 211 "In progress"
+```
+
 Valid status names are the options on the Project's `Status` field. The canonical set is `Backlog`, `Ready`, `In progress`, `In review`, `Done` (see [Prerequisites](#prerequisites)). `move-item.sh` matches the name exactly, including case, so `"In Progress"` does not select `In progress`.
 
 ### Set the Project README
@@ -116,7 +123,7 @@ Note the `sub_issue_id` is the **integer database ID** of the child (from `gh ap
 - **Hook blocks heredoc in inline `gh issue create`.** The repo's `scripts/hooks/gh-pr-guard.sh` tokenizes the command with shlex and rejects heredocs. Always write body content to a file and use `--body-file`.
 - **`gh api` integer fields need `-F`.** `-f` coerces to string → 422 Invalid request.
 - **Env vars don't persist across `Bash` tool calls.** Always re-eval preflight or re-read the PAT inline at the start of each shell invocation.
-- **Project-item ID ≠ issue number.** The `Status` edit endpoint takes the project-level item ID (`PVTI_...`), which you look up via `gh project item-list --format json` and match by content URL. `move-item.sh` does this for you.
+- **Project-item ID ≠ issue number.** The `Status` edit endpoint takes the project-level item ID (`PVTI_...`). Resolve it through the issue (`repository { issue(number:) { projectItems { nodes { id project { id } } } } }`) and pick the node whose project is the board you want. `move-item.sh` does this for you. Don't page the board with `gh project item-list` to find one item: on a board of several hundred items each lookup costs a large share of the account's hourly GraphQL quota, and a batch of moves exhausts it.
 - **Project v2 `readme` field.** `gh project edit <N> --owner <owner> --readme <string>` overwrites the entire README. Pass the full rendered Markdown.
 
 ## Worked example

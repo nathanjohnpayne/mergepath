@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# check_gh_projects_move_item — structural and stubbed-behavior guard for
+# scripts/gh-projects/move-item.sh.
+#
+# move-item.sh used to resolve the project item by paging the WHOLE board
+# (`gh project item-list --limit 2000`, plus `project view` and `project
+# field-list`) on every call. On Project #4 (~950 items) and #7 (~760) a
+# batch of lane moves spent the nathanjohnpayne account's 5,000-point/hour
+# GraphQL quota (2026-10-02: "API rate limit already exceeded for user ID
+# 23488723"). It now resolves the item through the issue's own projectItems
+# in ONE GraphQL query. This check is the anti-regression canary for that:
+#
+#   1. Structural: no board-wide `gh project item-list` / `project view` /
+#      `project field-list` call remains, the query reads `projectItems`,
+#      and the token-identity check is still there.
+#   2. Behavioral (self-test): the script runs against a PATH-shimmed `gh` that answers
+#      the GraphQL query from fixtures and exits 99 on any board-listing
+#      call. Covers the single-query happy path, an item on a same-numbered
+#      board of another owner (matched by project node ID, not number), the
+#      not-on-board failure and its --add-if-missing path, exact-name Status
+#      matching, archived and truncated items, a GraphQL failure, the usage
+#      contract (including dash-prefixed Status names and `--`), OWNER=@me,
+#      and that a failed identity check stops before any gh call.
+#
+# Modes (docs/agents/testing-requirements.md § Repo-lint execution, shared
+# selector scripts/lib/ci-check-modes.sh): --check runs only the structural
+# assertions (repo-lint's fast lane), --self-test runs both (deep CI), and the
+# no-argument form runs both so a consumer whose repo_lint.yml lags this
+# wrapper is unaffected.
+#
+# Hermetic: no token, no network. Runs the script from a temp copy beside a
+# stub identity-check.sh so the identity gate is exercised, not skipped.
+# Consumer-safe: scripts/gh-projects/ is a consumers: all kit, and the
+# scripts/ci/ kit declares move-item.sh in its requires:, so a consumer never
+# has this check without the subject it asserts.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SUBJECT="$REPO_ROOT/scripts/gh-projects/move-item.sh"
+NAME="check_gh_projects_move_item"
+
+MODE_HELPER="$REPO_ROOT/scripts/lib/ci-check-modes.sh"
+if [ ! -f "$MODE_HELPER" ]; then
+  echo "$NAME: ERROR scripts/lib/ci-check-modes.sh missing" >&2
+  exit 1
+fi
+# shellcheck source=../lib/ci-check-modes.sh
+. "$MODE_HELPER"
+if ! ci_check_select_mode "$@"; then
+  echo "usage: $NAME [--check | --self-test]" >&2
+  exit 2
+fi
+
+if [ ! -f "$SUBJECT" ]; then
+  echo "$NAME: ERROR (missing scripts/gh-projects/move-item.sh)" >&2
+  exit 1
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "$NAME: ERROR (python3 is required; move-item.sh parses gh's JSON with it)" >&2
+  exit 1
+fi
+
+PASS=0
+FAIL=0
+pass() { PASS=$((PASS + 1)); }
+fail() { FAIL=$((FAIL + 1)); echo "$NAME: FAIL: $1" >&2; }
+# ok <failure message> <command...> — pass when the command succeeds.
+ok() { local msg="$1"; shift; if "$@"; then pass; else fail "$msg"; fi; }
+
+# ---------------------------------------------------------------------------
+# 1. Structural assertions (comment lines stripped first, so the history in
+#    the header comment cannot satisfy or trip them).
+# ---------------------------------------------------------------------------
+CODE="$(grep -v '^[[:space:]]*#' "$SUBJECT")"
+
+for verb in item-list view field-list; do
+  if grep -Eq "project[[:space:]]+$verb([[:space:]]|$)" <<<"$CODE"; then
+    fail "move-item.sh calls 'gh project $verb' again (pages the whole board; resolve through the issue's projectItems)"
+  else
+    pass
+  fi
+done
+ok "move-item.sh no longer resolves the item through the issue's projectItems" \
+  grep -qF 'projectItems(' <<<"$CODE"
+ok "move-item.sh no longer runs identity-check.sh --expect-write-identity before mutating" \
+  grep -qF -- '--expect-write-identity' <<<"$CODE"
+
+if [ "$CI_CHECK_RUN_SELF_TEST" != "1" ]; then
+  echo "$NAME: $PASS passed, $FAIL failed (--check: structural only)"
+  if [ "$FAIL" -ne 0 ]; then
+    echo "$NAME: FAIL"
+    exit 1
+  fi
+  echo "$NAME: PASS"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Behavioral assertions against a stubbed gh.
+# ---------------------------------------------------------------------------
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/mergepath-move-item.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+
+mkdir -p "$WORK/scripts/gh-projects" "$WORK/bin"
+cp "$SUBJECT" "$WORK/scripts/gh-projects/move-item.sh"
+chmod +x "$WORK/scripts/gh-projects/move-item.sh"
+
+# Stub identity checker: records its arguments, exits STUB_IDENTITY_RC.
+cat >"$WORK/scripts/identity-check.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$STUB_LOG.identity"
+exit "${STUB_IDENTITY_RC:-0}"
+EOF
+chmod +x "$WORK/scripts/identity-check.sh"
+
+# Stub gh: one log line per call; GraphQL answers from $STUB_FIXTURE; a
+# board-listing call exits 99 so it can never pass silently.
+cat >"$WORK/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+# One line per call: the GraphQL query argument spans several lines.
+printf '%s\n' "$*" | tr '\n' ' ' >>"$STUB_LOG"
+echo >>"$STUB_LOG"
+case "$1 $2" in
+  "api graphql")
+    if [ "${STUB_GRAPHQL_RC:-0}" != "0" ]; then
+      echo "gh: Could not resolve to an Issue with the number of 211." >&2
+      exit "$STUB_GRAPHQL_RC"
+    fi
+    cat "$STUB_FIXTURE"
+    ;;
+  "api user") echo "stub-login" ;;
+  "project item-add") echo '{"id":"PVTI_added"}' ;;
+  "project item-edit") ;;
+  *) echo "stub gh: unexpected call: $*" >&2; exit 99 ;;
+esac
+EOF
+chmod +x "$WORK/bin/gh"
+
+# fixture <file> <items-json> [hasNextPage]
+fixture() {
+  cat >"$1" <<EOF
+{"data":{
+  "repositoryOwner":{"projectV2":{"id":"PVT_target","fields":{"nodes":[
+    {"id":"PVTF_title","name":"Title"},
+    {},
+    {"id":"PVTSSF_status","name":"Status","options":[
+      {"id":"opt_backlog","name":"Backlog"},
+      {"id":"opt_inprog","name":"In progress"},
+      {"id":"opt_blocked","name":"-Blocked"},
+      {"id":"opt_addflag","name":"--add-if-missing"},
+      {"id":"opt_done","name":"Done"}]}]}}},
+  "repository":{"issue":{"url":"https://github.com/nathanjohnpayne/example/issues/211",
+    "projectItems":{"pageInfo":{"hasNextPage":${3:-false}},"nodes":$2}}}}}
+EOF
+}
+OTHER='{"id":"PVTI_other","isArchived":false,"project":{"id":"PVT_other_owner_same_number"}}'
+TARGET='{"id":"PVTI_target","isArchived":false,"project":{"id":"PVT_target"}}'
+ARCHIVED='{"id":"PVTI_target","isArchived":true,"project":{"id":"PVT_target"}}'
+fixture "$WORK/found.json" "[$OTHER,$TARGET]"
+fixture "$WORK/missing.json" "[$OTHER]"
+fixture "$WORK/archived.json" "[$ARCHIVED]"
+fixture "$WORK/truncated.json" "[$OTHER]" true
+
+RC=0
+OUT=""
+LOG=""
+# run <case> <fixture> [args...] — runs the copy, captures rc/combined output.
+run() {
+  local name="$1" fx="$2"
+  shift 2
+  LOG="$WORK/$name.log"
+  : >"$LOG"
+  set +e
+  OUT="$(env -u GITHUB_TOKEN PATH="$WORK/bin:$PATH" \
+    STUB_LOG="$LOG" STUB_FIXTURE="$WORK/$fx" \
+    REPO=nathanjohnpayne/example OWNER="${RUN_OWNER:-nathanjohnpayne}" PROJECT=4 GH_TOKEN=stub-token \
+    "$WORK/scripts/gh-projects/move-item.sh" "$@" 2>&1)"
+  RC=$?
+  set -e
+}
+calls() { grep -c "$1" "$LOG" || true; }
+expect_rc() { ok "$1: expected exit $2, got $RC; output: $OUT" [ "$RC" -eq "$2" ]; }
+expect_out() { case "$OUT" in *"$2"*) pass ;; *) fail "$1: output lacks '$2'; output: $OUT" ;; esac; }
+expect_calls() { local n; n="$(calls "$2")"; ok "$1: expected $3 '$2' call(s), saw $n; log: $(cat "$LOG")" [ "$n" -eq "$3" ]; }
+expect_log() { ok "$1: gh log lacks '$2'; log: $(cat "$LOG")" grep -qF -- "$2" "$LOG"; }
+
+# Happy path: one GraphQL query, then exactly the edit, on the item whose
+# project NODE ID matches (PVTI_other sits on another owner's board).
+run found found.json 211 "In progress"
+expect_rc "found" 0
+expect_out "found" "moved #211 to 'In progress'"
+expect_calls "found" '^api graphql' 1
+expect_calls "found" '^project item-edit' 1
+expect_calls "found" '^project item-add' 0
+ok "found: expected exactly 2 gh calls; log: $(cat "$LOG")" [ "$(wc -l <"$LOG" | tr -d ' ')" -eq 2 ]
+expect_log "found" 'item-edit --id PVTI_target --project-id PVT_target --field-id PVTSSF_status --single-select-option-id opt_inprog'
+for v in '-f owner=nathanjohnpayne' '-f repoOwner=nathanjohnpayne' '-f repoName=example' '-F number=211' '-F project=4'; do
+  expect_log "found" "$v"
+done
+ok "found: identity check not run with --expect-write-identity nathanjohnpayne" \
+  grep -qF -- '--expect-write-identity nathanjohnpayne' "$LOG.identity"
+
+# Not on the board (only on a same-numbered board of another owner): fail
+# clearly, add nothing, edit nothing.
+run missing missing.json 211 "In progress"
+expect_rc "missing" 1
+expect_out "missing" "is not on nathanjohnpayne's Project #4"
+expect_out "missing" "--add-if-missing"
+expect_calls "missing" '^project item-add' 0
+expect_calls "missing" '^project item-edit' 0
+
+# --add-if-missing (accepted after the positionals too): add, then edit the
+# item ID item-add returned.
+run add missing.json 211 "Done" --add-if-missing
+expect_rc "add" 0
+expect_calls "add" '^project item-add 4 --owner nathanjohnpayne --url https://github.com/nathanjohnpayne/example/issues/211' 1
+expect_log "add" 'item-edit --id PVTI_added --project-id PVT_target --field-id PVTSSF_status --single-select-option-id opt_done'
+
+# Status option names match exactly, case included.
+run case found.json 211 "In Progress"
+expect_rc "case" 1
+expect_out "case" "failed to resolve project/field/option IDs"
+expect_calls "case" '^project item-edit' 0
+
+run archived archived.json 211 "Done"
+expect_rc "archived" 1
+expect_out "archived" "is archived"
+expect_calls "archived" '^project item-edit' 0
+
+run truncated truncated.json 211 "Done" --add-if-missing
+expect_rc "truncated" 1
+expect_out "truncated" "more than 20 projects"
+expect_calls "truncated" '^project item-add' 0
+expect_calls "truncated" '^project item-edit' 0
+
+STUB_GRAPHQL_RC=1 run gqlfail found.json 211 "Done"
+expect_rc "gqlfail" 1
+expect_out "gqlfail" "Could not resolve to an Issue"
+expect_calls "gqlfail" '^project item-edit' 0
+
+# Usage contract: bad arguments exit 2 before any gh call.
+run badopt found.json --bogus 211 "Done"
+expect_rc "badopt" 2
+run extra found.json 211 "Done" stray
+expect_rc "extra" 2
+run notnum found.json abc "Done"
+expect_rc "notnum" 2
+run noargs found.json
+expect_rc "noargs" 2
+run onearg found.json 211
+expect_rc "onearg" 2
+run emptystatus found.json 211 ""
+expect_rc "emptystatus" 2
+for c in badopt extra notnum noargs onearg emptystatus; do
+  ok "$c: gh was called on a usage error; log: $(cat "$WORK/$c.log")" [ ! -s "$WORK/$c.log" ]
+done
+
+# A Status name that begins with a dash is a positional once the issue number
+# is in, and `--` ends option parsing (Codex on #1608).
+run dashstatus found.json 211 "-Blocked"
+expect_rc "dashstatus" 0
+expect_log "dashstatus" '--single-select-option-id opt_blocked'
+run dashsep found.json --add-if-missing -- 211 "-Blocked"
+expect_rc "dashsep" 0
+expect_log "dashsep" '--single-select-option-id opt_blocked'
+run literalflag found.json -- 211 --add-if-missing
+expect_rc "literalflag" 0
+expect_log "literalflag" '--single-select-option-id opt_addflag'
+
+# OWNER=@me resolves to the token's login over REST for the query, and
+# item-add keeps the @me shorthand gh project accepts (Codex on #1608).
+RUN_OWNER=@me run atme missing.json 211 "Done" --add-if-missing
+expect_rc "atme" 0
+expect_calls "atme" '^api user' 1
+expect_log "atme" '-f owner=stub-login'
+expect_calls "atme" '^project item-add 4 --owner @me ' 1
+RUN_OWNER=someone run notme found.json 211 "Done"
+expect_calls "notme" '^api user' 0
+
+# A failed identity check stops before any gh call.
+STUB_IDENTITY_RC=2 run identity found.json 211 "Done"
+expect_rc "identity" 2
+ok "identity: gh was called after a failed identity check; log: $(cat "$LOG")" [ ! -s "$LOG" ]
+
+echo "$NAME: $PASS passed, $FAIL failed"
+if [ "$FAIL" -ne 0 ]; then
+  echo "$NAME: FAIL"
+  exit 1
+fi
+echo "$NAME: PASS"
