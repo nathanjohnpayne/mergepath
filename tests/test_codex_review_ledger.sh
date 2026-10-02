@@ -307,6 +307,10 @@ stop_check "stops: a rebuttal with no Codex response after it is untested" "$(st
   '.stops == ["untested-rebuttal"] and .untested_rebuttals[0].finding == 100'
 IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" | arr)" '[]' "$(reaction 900 2026-09-25T02:10:00Z | arr)" '[]')
 stop_check "stops: a rebuttal Codex answered clean is settled" "$(stops "$IN" "$RB" 10)" '.stops == []'
+# A response that lands after the rebuttal but answers a request posted before
+# it cannot have read the rebuttal (#1579): the only request predates it.
+IN=$(inputs "$(req 1 2026-09-25T00:00:00Z | arr)" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T01:30:00Z '[]')" | arr)" '[]' '[]' '[]')
+stop_check "stops: a response to a request already in flight before the rebuttal leaves it untested" "$(stops "$IN" "$RB" 10)" '.stops == ["untested-rebuttal"]'
 # A provider-block notice after the rebuttal is not Codex re-reading it (#1579).
 IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" | arr)" '[]' '[]' "$(block 901 2026-09-25T02:10:00Z usage_limit | arr)")
 stop_check "stops: a provider-block notice after a rebuttal leaves it untested" "$(stops "$IN" "$RB" 10)" '.stops == ["untested-rebuttal"]'

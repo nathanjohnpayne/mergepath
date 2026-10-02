@@ -641,10 +641,12 @@ p4b_codex_request_budget_state() {
   # human-stop read can prove it judged the same policy generation.
   if [ "$selected" != null ]; then
     jq -nc --argjson n "$count" --argjson cap "$cap" --arg t "$threshold" --argjson tuple "$initial_tuple" \
-      '{state:"final-request-pending",request_attempts:$n,max_request_attempts:$cap,threshold:$t,governing_tuple:$tuple}'
+      --argjson g "$generation" \
+      '{state:"final-request-pending",request_attempts:$n,max_request_attempts:$cap,threshold:$t,governing_tuple:$tuple,request_generation:$g}'
   else
     jq -nc --argjson n "$count" --argjson cap "$cap" --arg t "$threshold" --argjson tuple "$initial_tuple" \
-      '{state:"exhausted",request_attempts:$n,max_request_attempts:$cap,threshold:$t,governing_tuple:$tuple}'
+      --argjson g "$generation" \
+      '{state:"exhausted",request_attempts:$n,max_request_attempts:$cap,threshold:$t,governing_tuple:$tuple,request_generation:$g}'
   fi
 }
 
@@ -1771,6 +1773,16 @@ p4b_codex_human_stops() {
   fi
   printf '%s' "$stops" | jq -c --argjson t "$tuple" \
     '. + {state: (if (.stops | length) > 0 then "stop" else "clear" end), governing_tuple: $t}'
+}
+
+# p4b_same_request_generation <json-a> <json-b>: both carry a request_generation
+# array and the two are identical. A request posted after the first read (a new
+# final request during the adapter run) changes it (#1579).
+p4b_same_request_generation() {
+  local a b
+  a=$(printf '%s' "$1" | jq -ce '.request_generation | select(type == "array")' 2>/dev/null) || return 1
+  b=$(printf '%s' "$2" | jq -ce '.request_generation | select(type == "array")' 2>/dev/null) || return 1
+  [ "$a" = "$b" ]
 }
 
 # p4b_same_governing_tuple <json-a> <json-b>: both carry a governing_tuple and

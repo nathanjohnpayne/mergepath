@@ -342,17 +342,26 @@ crl_human_stops() {
     | if (($__CRL_VALID) and .head_sha == \$head and .author == \$author
         and .max_blocking_reviews == \$max
         and (.rebuttals | type) == \"array\"
-        and all(.responses[]; (.first_at | type) == \"string\"
+        and (.requests | type) == \"array\"
+        and all(.requests[]; (.created_at | type) == \"string\")
+        and all(.responses[]; (.first_at | type) == \"string\" and (.window | type) == \"number\"
                               and (.blocking_paths | type) == \"array\"
                               and (.blocking_unlocated | type) == \"boolean\")
         and all(.rebuttals[]; (.at | type) == \"string\" and (.finding | type) == \"number\"
                               and ((.path | type) == \"string\" or .path == null))) | not
     then error(\"ledger\") else . end
     | .responses as \$rs
+    | .requests as \$reqs
     | ([ \$rs[] | select($__CRL_COUNTS) ] | length) as \$n
     | [ .rebuttals[] | . as \$r
-        # A provider-block notice is not Codex re-reading the dispute.
-        | [ \$rs[] | select(.first_at > \$r.at and .class != \"provider_blocked\") ] as \$after
+        # Only a response to a request posted AFTER the rebuttal can have read
+        # it: a request already in flight may be answered later without
+        # seeing it (#1579). Windows are numbered by request in time order, so
+        # those are the windows from the first later request on. A
+        # provider-block notice is not Codex re-reading the dispute.
+        | ([ \$reqs | to_entries[] | select(.value.created_at > \$r.at) | .key + 1 ] | min) as \$k0
+        | [ \$rs[] | select(\$k0 != null and .window >= \$k0 and .first_at > \$r.at
+                            and .class != \"provider_blocked\") ] as \$after
         | if (\$after | length) == 0 then {kind: \"untested\", finding: \$r.finding, path: \$r.path, at: \$r.at}
           else ( [ \$after[] | select(($__CRL_COUNTS)
                                      and (.blocking_unlocated or \$r.path == null

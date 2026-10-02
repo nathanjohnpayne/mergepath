@@ -4085,25 +4085,29 @@ if [ "$mode" = flip ]; then
   printf '%s\n' "$((n + 1))" >"$P4B_TEST_LEDGER_COUNT"
   if [ "$n" -eq 0 ]; then mode=clear; else mode=untested; fi
 fi
-resp() { # n class unsolicited path first_at
-  jq -nc --argjson n "$1" --arg c "$2" --argjson u "$3" --arg p "$4" --arg t "$5" \
-    '[range($n) | {rid: ("w" + (. | tostring)), class: $c, unsolicited: $u, conflicting: false,
+resp() { # n class unsolicited path first_at [window]
+  jq -nc --argjson n "$1" --arg c "$2" --argjson u "$3" --arg p "$4" --arg t "$5" --argjson w "${6:-1}" \
+    '[range($n) | {rid: ("w" + (. | tostring)), window: $w, class: $c, unsolicited: $u, conflicting: false,
       first_at: $t, blocking_paths: (if $c == "blocking" then [$p] else [] end), blocking_unlocated: false}]'
 }
+# Requests: one before every rebuttal; disagreement adds one after it.
+reqs='[{"id":1,"created_at":"2026-08-01T00:00:00Z"}]'
 case "$mode" in
   blocking) r=$(resp 10 blocking false x.sh 2026-08-01T00:10:00Z); rb='[]' ;;
   clear) r=$(resp 9 blocking false x.sh 2026-08-01T00:10:00Z); rb='[]' ;;
   untested) r=$(resp 1 blocking false x.sh 2026-08-01T00:10:00Z)
             rb='[{"finding":1,"path":"x.sh","at":"2026-08-01T01:00:00Z","sources":["tag"]}]' ;;
-  disagreement) r=$(jq -nc --argjson a "$(resp 1 blocking false x.sh 2026-08-01T00:10:00Z)" \
-                     --argjson b "$(resp 1 blocking false x.sh 2026-08-01T02:00:00Z)" '$a + $b')
+  disagreement) r=$(jq -nc --argjson a "$(resp 1 blocking false x.sh 2026-08-01T00:10:00Z 1)" \
+                     --argjson b "$(resp 1 blocking false x.sh 2026-08-01T02:00:00Z 2)" '$a + $b')
+                reqs='[{"id":1,"created_at":"2026-08-01T00:00:00Z"},{"id":2,"created_at":"2026-08-01T01:30:00Z"}]'
                 rb='[{"finding":1,"path":"x.sh","at":"2026-08-01T01:00:00Z","sources":["thumbs-down"]}]' ;;
   fail) exit 3 ;;
   garbage) printf 'not a ledger\n'; exit 0 ;;
   other-head) head=0000000000000000000000000000000000000000; r='[]'; rb='[]' ;;
 esac
 jq -nc --arg h "$head" --argjson r "$r" --argjson rb "$rb" --argjson m "${P4B_TEST_LEDGER_MAX:-10}" --arg fp "${fp:-}" \
-  '{head_sha: $h, author: "nathanjohnpayne", max_blocking_reviews: $m, policy_fingerprint: $fp, responses: $r, rebuttals: $rb}'
+  --argjson q "$reqs" \
+  '{head_sha: $h, author: "nathanjohnpayne", max_blocking_reviews: $m, policy_fingerprint: $fp, requests: $q, responses: $r, rebuttals: $rb}'
 EOF
 chmod +x "$WORK/stub-ledger.sh"
 export P4B_CODEX_LEDGER="$WORK/stub-ledger.sh"
@@ -5517,6 +5521,39 @@ if [ "$rc" = 8 ] && [ ! -s "$HANDOFF_LOG" ] && [ "$(cat "$_ceiling_count")" -ge 
   pass "#1560 S3-4: with no adapter, a stop that appears before the handoff is rendered exits 8 instead"
 else
   fail "#1560 S3-4: no-adapter fallback ceiling recheck (rc=$rc ledger-calls=$(cat "$_ceiling_count" 2>/dev/null) handoff='$(cat "$HANDOFF_LOG" 2>/dev/null)'): $out"
+fi
+
+# A new exact author request posted while the adapter runs changes the request
+# generation; the post-adapter recheck refuses the stale ceiling authority with
+# exit 10 so the next run enters the bounded final-request wait (#1579). The
+# fake adapter moves the comments counter past the switch point, so every read
+# after it sees the new request.
+_gen_race="$WORK/ceiling-generation-race.count"
+cat >"$BIN/fake-codex-ceiling-new-request" <<EOF
+#!/usr/bin/env bash
+cat >/dev/null 2>&1 || true
+printf '1000\n' >"$_gen_race"
+printf '%s' '{"verdict":"APPROVED","summary":"ceiling review","findings":[]}'
+EOF
+chmod +x "$BIN/fake-codex-ceiling-new-request"
+_gen_after=$(jq -nc --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '[{id:9301,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:$now}]')
+rm -f "$_gen_race"
+: >"$HANDOFF_LOG"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+set +e
+out="$(P4B_TEST_LEDGER_MODE=clear MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-stop.yml" CODEX_BIN="$BIN/fake-codex-ceiling-new-request" \
+  P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_COMMENTS_RACE_FILE="$_gen_race" P4B_TEST_COMMENTS_CHANGE_AFTER=1000 P4B_TEST_COMMENTS_JSON_AFTER="$_gen_after" \
+  P4B_TEST_LIVE_HEAD="$_p4a_head" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+  P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
+  P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" PATH="$WORK/barrier-bin:$PATH" \
+  bash "$ORCH" 7 --repo owner/repo --author claude --head "$_p4a_head" --diff-file "$DIFF" 2>"$WORK/ceiling-gen.err" </dev/null)"; rc=$?
+set -e
+if [ "$rc" = 10 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = false ] \
+   && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = request-ceiling-authority-changed ] \
+   && [ ! -s "$HANDOFF_LOG" ]; then
+  pass "#1560 S3-4: a new final request posted during the adapter run voids the ceiling authority (exit 10, nothing posted)"
+else
+  fail "#1560 S3-4: request generation change during the adapter run (rc=$rc reads=$(cat "$_gen_race" 2>/dev/null)): $out $(tail -3 "$WORK/ceiling-gen.err")"
 fi
 
 _ceiling_count="$WORK/ceiling-flip.count"

@@ -780,6 +780,14 @@ revalidate_request_ceiling_authority() {
   case "$P4B_PRE_ADAPTER_CODEX_EVIDENCE" in request-ceiling*) ;; *) return 0 ;; esac
   budget_json="$(p4b_codex_request_budget_state "$REPO" "$PR" "$HEAD")" || budget_rc=$?
   budget_state="$(printf '%s' "$budget_json" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
+  # Still spent, and spent by the same request generation the barrier saw: an
+  # exact author request posted while the adapter ran (a new final request)
+  # voids this run's authority, so the next run enters the bounded final-request
+  # wait (#1579).
+  if [ "$budget_rc" -eq 0 ] \
+     && ! p4b_same_request_generation "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" "$budget_json"; then
+    budget_state=generation-changed
+  fi
   case "$budget_rc:$budget_state" in
     0:exhausted|0:final-request-pending) ;;
     *)
