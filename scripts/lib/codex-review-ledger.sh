@@ -326,8 +326,9 @@ crl_blocking_count() {
 # The human-stop conditions the Phase 4b barrier re-evaluates before it lets a
 # spent request ceiling dispatch the automated adapter (#1560 slice 3, S3-4):
 #   blocking-budget    the counted responses reach the budget;
-#   runaway            the counted responses reach the request ceiling before
-#                      the budget: every request the ceiling allowed drew a
+#   runaway            the request windows with a counted response reach the
+#                      request ceiling before the budget: every request the
+#                      ceiling allowed drew a
 #                      blocking review, so a ceiling below the budget (for
 #                      example max_review_rounds 2 against the default budget
 #                      of 10) never reads as cost exhaustion (#1560 canary);
@@ -360,6 +361,9 @@ crl_human_stops() {
     | .responses as \$rs
     | .requests as \$reqs
     | ([ \$rs[] | select($__CRL_COUNTS) ] | length) as \$n
+    # Runaway compares the ceiling with REQUEST WINDOWS that drew a counted
+    # response, not with responses: a window can hold several (#1584).
+    | ([ \$rs[] | select($__CRL_COUNTS) | .window ] | unique | length) as \$nw
     | [ .rebuttals[] | . as \$r
         # Only a response to a request posted AFTER the rebuttal can have read
         # it: a request already in flight may be answered later without
@@ -389,8 +393,9 @@ crl_human_stops() {
         untested_rebuttals: [ \$disputes[] | select(.kind == \"untested\") | del(.kind) ],
         disagreements: [ \$disputes[] | select(.kind == \"disagreement\") | del(.kind) ] }
     | .request_ceiling = \$ceiling
+    | .blocking_windows = \$nw
     | .stops = ( [ (if \$n >= \$max then \"blocking-budget\" else empty end),
-                   (if \$n < \$max and \$ceiling != null and \$ceiling > 0 and \$n >= \$ceiling then \"runaway\" else empty end),
+                   (if \$n < \$max and \$ceiling != null and \$ceiling > 0 and \$nw >= \$ceiling then \"runaway\" else empty end),
                    (if (.disagreements | length) > 0 then \"disagreement\" else empty end),
                    (if (.untested_rebuttals | length) > 0 then \"untested-rebuttal\" else empty end) ] )" 2>/dev/null
 }
