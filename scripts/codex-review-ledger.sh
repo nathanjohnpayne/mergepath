@@ -236,6 +236,10 @@ REQUESTS=$(jqx "requests" -c --slurpfile f "$LEDGER_TMP/foreign.json" --argjson 
 
 # ---- Codex reviews -------------------------------------------------------------
 BOT_REVIEWS=$(jqx "reviews" -c --arg bot "$BOT" '[.[] | select(.user.login == $bot)] | unique_by(.id)' <<<"$REVIEWS")
+# A Codex review with no submission time cannot be placed in a window; read as
+# window 0 it would count as unsolicited and drop out of the blocking budget.
+jq -e 'all(.[]; (.submitted_at | type) == "string" and (.submitted_at | length) > 0)' <<<"$BOT_REVIEWS" >/dev/null 2>&1 \
+  || die "malformed evidence: a Codex review has no submitted_at"
 BOT_REVIEW_COMMENTS=$(jqx "review comments" -c --arg bot "$BOT" \
   '[.[] | select(.user.login == $bot)] | unique_by(.id)' <<<"$REVIEW_COMMENTS")
 LEDGER_REVIEWS='[]'

@@ -411,6 +411,17 @@ for _bot in 42 '["chatgpt-codex-connector[bot]"]' '{x: 1}' codex-false; do
   fi
 done
 
+# A Codex review with no submitted_at cannot be windowed (#1576 round 10).
+D="$WORK/no-submitted-at"; make_cli_case "$D"
+jq -n '[{id: 101, user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"}]' >"$D/issue_comments.json"
+jq -n '[{id: 50, user: {login: "chatgpt-codex-connector[bot]"}, submitted_at: null, commit_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", body: ""}]' >"$D/reviews.json"
+RC=$(run_cli "$D")
+if [ "$RC" = 3 ] && [ ! -s "$D/out" ] && grep -q 'no submitted_at' "$D/err"; then
+  pass "CLI: a Codex review with no submitted_at fails closed"
+else
+  fail "CLI null submitted_at: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+
 D="$WORK/malformed"; make_cli_case "$D"
 jq -n '[{id: "x", user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"}]' >"$D/issue_comments.json"
 RC=$(run_cli "$D")

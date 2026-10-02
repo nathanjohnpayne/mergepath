@@ -1512,6 +1512,7 @@ count_blocking_reviews() {
        and .max_blocking_reviews == $limit and .policy_fingerprint == $fp
        and (.responses | type) == "array"
        and all(.responses[]; (.unsolicited | type) == "boolean"
+                             and ((.first_at | type) == "string" and (.first_at | length) > 0)
                              and (.class as $c | ["blocking", "discretionary", "no_findings", "clean",
                                                   "unknown_tier", "provider_blocked"] | index($c)) != null
                              and (.conflicting | type) == "boolean")
