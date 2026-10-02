@@ -583,6 +583,11 @@ jobs:
       - name: check_no_bare_gh_writes
         run: ./scripts/ci/check_no_bare_gh_writes || { rc=$?; if [ ! -f scripts/ci/check_no_bare_gh_writes ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_no_bare_gh_writes not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
+      # scripts/gh-projects/move-item.sh resolves the item through the
+      # issue's projectItems in one GraphQL query, never by paging the board.
+      - name: check_gh_projects_move_item
+        run: ./scripts/ci/check_gh_projects_move_item || { rc=$?; if [ ! -f scripts/ci/check_gh_projects_move_item ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_gh_projects_move_item not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
       - name: check_no_token_in_output
         # Canonical rule, oracle, safety and exemption contracts live in
         # scripts/ci/token_output_gate.py. This wire runs that file's self-test

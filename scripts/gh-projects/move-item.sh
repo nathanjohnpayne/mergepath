@@ -7,6 +7,9 @@
 #   PROJECT=5 OWNER=nathanjohnpayne REPO=nathanjohnpayne/nathanpaynedotcom \
 #     GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT" ./move-item.sh <issue_number> <status_name>
 #
+#   # Same, but add the issue to the board first if it is not on it yet.
+#   ... ./move-item.sh --add-if-missing <issue_number> <status_name>
+#
 # (The earlier example showed `GH_TOKEN="$(op read ...)"`, which is the
 # disallowed inline-secret-read pattern — caught by CodeRabbit on the
 # 024e0da propagation wave, #272.)
@@ -18,16 +21,55 @@
 #
 # The script discovers the project's node ID, Status field ID, and option IDs
 # at runtime, so it works with any Project v2 that has a Status field.
+#
+# The item is resolved through the issue, not the board: ONE GraphQL query
+# returns the project's ID and Status options together with the issue's own
+# projectItems, and the item whose project is $OWNER's #$PROJECT is the one
+# edited. The earlier form ran `gh project item-list --limit 2000` (plus
+# `project view` and `project field-list`) on every call, which pages the
+# whole board: ~950 items on Project #4, so a batch of lane moves spent the
+# account's 5,000-point/hour GraphQL quota (2026-10-02). The query now costs
+# one point whatever the board's size.
+#
+# An issue that is not on the board fails with a clear message, unless
+# --add-if-missing is passed, in which case it is added (`gh project
+# item-add`, which is idempotent) and then moved.
 
 set -euo pipefail
 
-ISSUE_NUM="${1:?issue number required}"
-STATUS_NAME="${2:?status name required}"
+usage() {
+  echo "usage: move-item.sh [--add-if-missing] <issue_number> <status_name>" >&2
+}
+
+ADD_IF_MISSING=0
+POSITIONAL=()
+for arg in "$@"; do
+  case "$arg" in
+    --add-if-missing) ADD_IF_MISSING=1 ;;
+    -h|--help) usage; exit 0 ;;
+    -?*) echo "Error: unknown option: $arg" >&2; usage; exit 2 ;;
+    *) POSITIONAL+=("$arg") ;;
+  esac
+done
+if [ "${#POSITIONAL[@]}" -gt 2 ]; then
+  echo "Error: expected 2 arguments, got ${#POSITIONAL[@]}" >&2
+  usage
+  exit 2
+fi
+
+ISSUE_NUM="${POSITIONAL[0]:-}"
+STATUS_NAME="${POSITIONAL[1]:-}"
+: "${ISSUE_NUM:?issue number required}"
+: "${STATUS_NAME:?status name required}"
 
 : "${REPO:?REPO must be set (owner/repo)}"
 : "${OWNER:?OWNER must be set}"
 : "${PROJECT:?PROJECT must be set}"
 : "${GH_TOKEN:?GH_TOKEN must be set to the author PAT with project scope (this script mutates project items)}"
+
+case "$ISSUE_NUM" in ''|*[!0-9]*) echo "Error: issue number must be a positive integer, got '$ISSUE_NUM'" >&2; exit 2 ;; esac
+case "$PROJECT" in ''|*[!0-9]*) echo "Error: PROJECT must be a project number, got '$PROJECT'" >&2; exit 2 ;; esac
+case "$REPO" in */*) ;; *) echo "Error: REPO must be owner/repo, got '$REPO'" >&2; exit 2 ;; esac
 
 # Required tooling: gh and python3 (used for parsing gh's JSON output below).
 # CodeRabbit on PR #180 caught the missing python3 check — fail fast with a
@@ -56,29 +98,82 @@ ghp_gh() (
   GH_HOST=github.com gh "$@"
 )
 
+# One query resolves everything the edit needs. The Status field is matched by
+# exact name over the board's fields (not `field(name:)`), and the option by
+# exact name, so the matching rules are the ones `field-list` gave before.
+# projectItems is the issue's own membership list, so its size is the number
+# of boards the issue is on, not the number of items on the board.
+# shellcheck disable=SC2016 # $vars are GraphQL variables, not shell expansions
+QUERY='
+query($owner: String!, $repoOwner: String!, $repoName: String!, $number: Int!, $project: Int!) {
+  repositoryOwner(login: $owner) {
+    ... on ProjectV2Owner {
+      projectV2(number: $project) {
+        id
+        fields(first: 100) {
+          nodes {
+            ... on ProjectV2FieldCommon { id name }
+            ... on ProjectV2SingleSelectField { options { id name } }
+          }
+        }
+      }
+    }
+  }
+  repository(owner: $repoOwner, name: $repoName) {
+    issue(number: $number) {
+      url
+      projectItems(first: 20) {
+        pageInfo { hasNextPage }
+        nodes { id isArchived project { id } }
+      }
+    }
+  }
+}'
+
+# gh exits non-zero, with GitHub's own message on stderr, when the owner,
+# project, repository, or issue does not resolve; that message is the error.
+if ! RESOLVED_JSON=$(ghp_gh api graphql \
+    -f query="$QUERY" \
+    -f owner="$OWNER" \
+    -f repoOwner="${REPO%%/*}" \
+    -f repoName="${REPO#*/}" \
+    -F number="$ISSUE_NUM" \
+    -F project="$PROJECT"); then
+  echo "failed to resolve issue #$ISSUE_NUM in $REPO on $OWNER's Project #$PROJECT (see the GraphQL error above)" >&2
+  exit 1
+fi
+
 export STATUS_NAME
-
-# Resolve the project's node ID.
-PROJECT_ID=$(ghp_gh project view "$PROJECT" --owner "$OWNER" --format json \
-  | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
-
-# Resolve the Status field ID + the option ID for the requested status in a
-# single pass over field-list output.
-read -r STATUS_FIELD_ID OPT_ID <<<"$(ghp_gh project field-list "$PROJECT" --owner "$OWNER" --limit 100 --format json | python3 -c "
+IFS='|' read -r PROJECT_ID STATUS_FIELD_ID OPT_ID ISSUE_URL ITEM_ID ITEM_STATE <<<"$(printf '%s' "$RESOLVED_JSON" | python3 -c "
 import json, os, sys
 name = os.environ['STATUS_NAME']
-d = json.load(sys.stdin)
+d = json.load(sys.stdin).get('data') or {}
+project = (d.get('repositoryOwner') or {}).get('projectV2') or {}
+project_id = project.get('id') or ''
 field_id = ''
 opt_id = ''
-for f in d.get('fields', []):
-    if f.get('name') == 'Status':
+for f in (project.get('fields') or {}).get('nodes') or []:
+    if (f or {}).get('name') == 'Status':
         field_id = f.get('id', '')
-        for o in f.get('options', []):
+        for o in f.get('options') or []:
             if o.get('name') == name:
                 opt_id = o.get('id', '')
                 break
         break
-print(field_id, opt_id)
+issue = (d.get('repository') or {}).get('issue') or {}
+items = issue.get('projectItems') or {}
+item_id = ''
+state = 'missing'
+for it in items.get('nodes') or []:
+    # Match on the project's node ID, not its number: another owner's board
+    # can carry the same number.
+    if project_id and ((it or {}).get('project') or {}).get('id') == project_id:
+        item_id = it.get('id', '')
+        state = 'archived' if it.get('isArchived') else 'found'
+        break
+if not item_id and (items.get('pageInfo') or {}).get('hasNextPage'):
+    state = 'truncated'
+print('|'.join([project_id, field_id, opt_id, issue.get('url') or '', item_id, state]))
 ")"
 
 if [ -z "$PROJECT_ID" ] || [ -z "$STATUS_FIELD_ID" ] || [ -z "$OPT_ID" ]; then
@@ -87,22 +182,36 @@ if [ -z "$PROJECT_ID" ] || [ -z "$STATUS_FIELD_ID" ] || [ -z "$OPT_ID" ]; then
   exit 1
 fi
 
-# Resolve the project-level item ID for this issue.
-export ISSUE_URL="https://github.com/$REPO/issues/$ISSUE_NUM"
-ITEM_ID=$(ghp_gh project item-list "$PROJECT" --owner "$OWNER" --format json --limit 2000 | python3 -c "
-import json, os, sys
-url = os.environ['ISSUE_URL']
-d = json.load(sys.stdin)
-for it in d.get('items', []):
-    content = it.get('content') or {}
-    if content.get('url') == url:
-        print(it['id']); break
-")
+ISSUE_URL="${ISSUE_URL:-https://github.com/$REPO/issues/$ISSUE_NUM}"
 
-if [ -z "$ITEM_ID" ]; then
-  echo "could not find project item for $ISSUE_URL (is the issue in Project #$PROJECT?)" >&2
-  exit 1
-fi
+case "$ITEM_STATE" in
+  found) ;;
+  archived)
+    echo "$ISSUE_URL is archived on $OWNER's Project #$PROJECT; unarchive it on the board before moving it." >&2
+    exit 1
+    ;;
+  truncated)
+    echo "$ISSUE_URL is on more than 20 projects and $OWNER's Project #$PROJECT is not among the first 20 returned; move it on the board by hand." >&2
+    exit 1
+    ;;
+  missing)
+    if [ "$ADD_IF_MISSING" != "1" ]; then
+      echo "$ISSUE_URL is not on $OWNER's Project #$PROJECT. Add it first, or rerun with --add-if-missing." >&2
+      exit 1
+    fi
+    if ! ITEM_ID=$(ghp_gh project item-add "$PROJECT" --owner "$OWNER" --url "$ISSUE_URL" --format json \
+        | python3 -c "import json,sys; print(json.load(sys.stdin).get('id') or '')") \
+       || [ -z "$ITEM_ID" ]; then
+      echo "failed to add $ISSUE_URL to $OWNER's Project #$PROJECT" >&2
+      exit 1
+    fi
+    echo "added #$ISSUE_NUM to Project #$PROJECT"
+    ;;
+  *)
+    echo "failed to resolve the project item for $ISSUE_URL (unexpected state '$ITEM_STATE')" >&2
+    exit 1
+    ;;
+esac
 
 ghp_gh project item-edit \
   --id "$ITEM_ID" \
