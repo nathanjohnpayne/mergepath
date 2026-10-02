@@ -283,8 +283,8 @@ done <<<"$(jqx "reviews" -c '.[]' <<<"$BOT_REVIEWS")"
 # earlier question or fix note would date the rebuttal too early, and a Codex
 # response in between would then read as having tested it. Dating late errs
 # toward "untested", which stops for the human. A thumbs-down is read only for roots whose
-# reaction rollup does not rule one out. Rebuttals of review-body findings
-# leave no per-finding record and are not seen.
+# reaction rollup does not rule one out. Review-body findings are handled
+# below, from their review-ack acknowledgements.
 REBUTTALS='[]'
 while IFS= read -r root; do
   [ -n "$root" ] || continue
