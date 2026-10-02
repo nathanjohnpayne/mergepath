@@ -35,10 +35,10 @@ cat >"$LEDGER_STUB" <<'LEDGER_EOF'
 #!/usr/bin/env bash
 head=""
 while [ $# -gt 0 ]; do
-  case "$1" in --expect-head) head=$2; shift 2 ;; *) shift ;; esac
+  case "$1" in --expect-head) head=$2; shift 2 ;; --expect-policy) fp=$2; shift 2 ;; *) shift ;; esac
 done
-jq -nc --arg h "$head" --arg a "${CODEX_LEDGER_STUB_AUTHOR:-nathanjohnpayne}" \
-  '{head_sha: $h, author: $a, max_blocking_reviews: 10, responses: []}'
+jq -nc --arg h "$head" --arg fp "${fp:-}" --arg a "${CODEX_LEDGER_STUB_AUTHOR:-nathanjohnpayne}" \
+  '{head_sha: $h, author: $a, max_blocking_reviews: 10, policy_fingerprint: $fp, responses: []}'
 LEDGER_EOF
 chmod +x "$LEDGER_STUB"
 export MERGEPATH_CODEX_LEDGER_CMD="$LEDGER_STUB"

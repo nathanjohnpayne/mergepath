@@ -37,10 +37,10 @@ cat >"$LEDGER_STUB" <<'LEDGER_EOF'
 #!/usr/bin/env bash
 head=""
 while [ $# -gt 0 ]; do
-  case "$1" in --expect-head) head=$2; shift 2 ;; *) shift ;; esac
+  case "$1" in --expect-head) head=$2; shift 2 ;; --expect-policy) fp=$2; shift 2 ;; *) shift ;; esac
 done
-jq -nc --arg h "$head" --arg a "${CODEX_LEDGER_STUB_AUTHOR:-nathanjohnpayne}" \
-  '{head_sha: $h, author: $a, max_blocking_reviews: 10, responses: []}'
+jq -nc --arg h "$head" --arg fp "${fp:-}" --arg a "${CODEX_LEDGER_STUB_AUTHOR:-nathanjohnpayne}" \
+  '{head_sha: $h, author: $a, max_blocking_reviews: 10, policy_fingerprint: $fp, responses: []}'
 LEDGER_EOF
 chmod +x "$LEDGER_STUB"
 export MERGEPATH_CODEX_LEDGER_CMD="$LEDGER_STUB"
@@ -427,8 +427,9 @@ state=${CODEX_TEST_STATE_DIR:?}
 printf '%s\n' "$*" >>"$state/ledger-calls"
 head=""
 while [ $# -gt 0 ]; do
-  case "$1" in --expect-head) head=$2; shift 2 ;; *) shift ;; esac
+  case "$1" in --expect-head) head=$2; shift 2 ;; --expect-policy) fp=$2; shift 2 ;; *) shift ;; esac
 done
+[ ! -f "$state/ledger-policy" ] || fp=$(cat "$state/ledger-policy")
 [ ! -f "$state/ledger-rc" ] || exit "$(cat "$state/ledger-rc")"
 if [ -f "$state/ledger-raw" ]; then cat "$state/ledger-raw"; exit 0; fi
 [ ! -f "$state/ledger-head" ] || head=$(cat "$state/ledger-head")
@@ -436,8 +437,10 @@ author=nathanjohnpayne
 [ ! -f "$state/ledger-author" ] || author=$(cat "$state/ledger-author")
 max=10
 [ ! -f "$state/ledger-max" ] || max=$(cat "$state/ledger-max")
-jq -nc --arg h "$head" --arg a "$author" --argjson m "$max" --slurpfile r "$state/ledger-responses.json" \
-  '{head_sha: $h, author: $a, max_blocking_reviews: $m, responses: $r[0]}'
+doc=$(jq -nc --arg h "$head" --arg a "$author" --argjson m "$max" --arg fp "${fp:-}" --slurpfile r "$state/ledger-responses.json" \
+  '{head_sha: $h, author: $a, max_blocking_reviews: $m, policy_fingerprint: $fp, responses: $r[0]}')
+printf '%s\n' "$doc"
+[ ! -f "$state/ledger-twice" ] || printf '%s\n' "$doc"
 EOF
   chmod +x "$dir/ledger-stub.sh"
   printf '%s\n' "$dir"
@@ -473,7 +476,7 @@ test_blocking_budget_boundary() {
       || fail "#1560 budget $n/10: expected $expected_posts posts, got $(trig_count "$dir")"
     [ "$(ledger_calls "$dir")" = 1 ] \
       || fail "#1560 budget $n/10: ledger ran $(ledger_calls "$dir") times, expected once"
-    grep -qx -- '--repo owner/repo --expect-head head-sha 999' "$dir/state/ledger-calls" \
+    grep -qE -- '^--repo owner/repo --expect-head head-sha --expect-policy [0-9]+-[0-9]+ 999$' "$dir/state/ledger-calls" \
       || fail "#1560 budget $n/10: ledger was not asked for this PR at the requester's head: $(cat "$dir/state/ledger-calls" 2>/dev/null)"
     if [ "$expected_rc" = 7 ]; then
       [ "$(jqf "$dir" '.cap_exhausted.kind')" = blocking-reviews ] \
@@ -570,7 +573,7 @@ test_blocking_budget_governing_value() {
 # available budget: each exits 3 before any request is posted.
 test_blocking_budget_fails_closed() {
   local name dir rc before
-  for name in missing nonzero garbage not-object head-mismatch author-mismatch bad-response-shape unknown-class two-documents budget-mismatch; do
+  for name in missing nonzero garbage not-object head-mismatch author-mismatch bad-response-shape unknown-class two-documents budget-mismatch policy-mismatch; do
     before=$FAIL
     dir=$(make_budget_case "blocking-fail-$name" '[]')
     case "$name" in
@@ -582,9 +585,9 @@ test_blocking_budget_fails_closed() {
       author-mismatch) printf 'someone-else\n' >"$dir/state/ledger-author" ;;
       bad-response-shape) printf '[{"class":"blocking"}]\n' >"$dir/state/ledger-responses.json" ;;
       unknown-class) printf '[{"class":"severe","unsolicited":false,"conflicting":false}]\n' >"$dir/state/ledger-responses.json" ;;
-      two-documents)
-        printf '{"head_sha":"head-sha","author":"nathanjohnpayne","max_blocking_reviews":10,"responses":[]}\n%.0s' 1 2 >"$dir/state/ledger-raw" ;;
+      two-documents) : >"$dir/state/ledger-twice" ;;
       budget-mismatch) printf '3\n' >"$dir/state/ledger-max" ;;
+      policy-mismatch) printf '1-1\n' >"$dir/state/ledger-policy" ;;
     esac
     rc=$(run_budget_case "$dir" fresh)
     [ "$rc" = 3 ] || fail "#1560 fail-closed $name: expected exit 3, got $rc; err=$(cat "$dir/err.log")"

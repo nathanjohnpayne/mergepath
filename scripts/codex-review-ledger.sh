@@ -15,10 +15,13 @@
 #
 # Usage:
 #   scripts/codex-review-ledger.sh [--repo owner/name] [--summary]
-#                                  [--expect-head <sha>] <PR_NUMBER>
+#                                  [--expect-head <sha>] [--expect-policy <fp>]
+#                                  <PR_NUMBER>
 #
 #   --summary            Print a short human-readable report instead of JSON.
 #   --expect-head <sha>  Exit 3 unless the PR head is exactly <sha>.
+#   --expect-policy <fp> Exit 3 unless the governing policy snapshot this run
+#                        reads has fingerprint <fp> (crqe_policy_fingerprint).
 #
 # The configured author, bot login and required feedback tiers come from the
 # PR's governing base policy (scripts/workflow/resolve_base_policy.sh), the
@@ -51,17 +54,19 @@ for __lib in gh-api-array.sh codex-request-evidence.sh codex-failure-markers.sh 
 done
 
 die() { echo "[codex-review-ledger] ERROR: $*" >&2; exit 3; }
-usage() { sed -n '16,21p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '16,24p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 REPO=""
 SUMMARY=false
 EXPECT_HEAD=""
+EXPECT_POLICY=""
 PR_NUMBER=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) [ $# -ge 2 ] || usage; REPO=$2; shift 2 ;;
     --summary) SUMMARY=true; shift ;;
     --expect-head) [ $# -ge 2 ] && [[ "$2" =~ ^[0-9a-f]{40}$ ]] || usage; EXPECT_HEAD=$2; shift 2 ;;
+    --expect-policy) [ $# -ge 2 ] && [[ "$2" =~ ^[0-9]+-[0-9]+$ ]] || usage; EXPECT_POLICY=$2; shift 2 ;;
     -h|--help) usage ;;
     -*) usage ;;
     *) [ -z "$PR_NUMBER" ] || usage; PR_NUMBER=$1; shift ;;
@@ -107,6 +112,12 @@ cleanup() {
 trap cleanup EXIT
 
 POLICY_JSON=$(policy_yaml_to_json "$POLICY_FILE" 2>/dev/null) || die "governing base policy does not parse"
+# One snapshot for every policy-derived input (author, bot, tiers, budget): a
+# caller that read its own snapshot passes its fingerprint, and a base that
+# moved between the two reads is refused rather than mixed.
+POLICY_FP=$(crqe_policy_fingerprint "$POLICY_JSON") || die "cannot fingerprint the governing base policy"
+[ -z "$EXPECT_POLICY" ] || [ "$POLICY_FP" = "$EXPECT_POLICY" ] \
+  || die "the governing base policy changed between the caller's read and this one ($EXPECT_POLICY, now $POLICY_FP)"
 # Same rules as crqe_governing_budget: the policy must be an object, and an
 # absent author_identity defaults to the shared author.
 AUTHOR=$(printf '%s' "$POLICY_JSON" | jq -er '
@@ -313,7 +324,8 @@ MAX_BLOCKING=$(printf '%s' "$POLICY_JSON" | jq -c '
    else "10" end)
   | if type == "string" and test("^[0-9]{1,9}$") then tonumber else null end') \
   || die "governing codex.max_blocking_reviews does not parse"
-LEDGER=$(jqx "ledger" -c --argjson m "$MAX_BLOCKING" '. + {max_blocking_reviews: $m}' <<<"$LEDGER")
+LEDGER=$(jqx "ledger" -c --argjson m "$MAX_BLOCKING" --arg fp "$POLICY_FP" \
+  '. + {max_blocking_reviews: $m, policy_fingerprint: $fp}' <<<"$LEDGER")
 
 if [ "$SUMMARY" != true ]; then
   printf '%s\n' "$LEDGER"

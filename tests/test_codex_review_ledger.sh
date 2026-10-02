@@ -370,6 +370,31 @@ for _mb in absent 3 false; do
   fi
 done
 
+# --expect-policy (#1576): one policy snapshot for the caller and the ledger.
+# The fingerprint ignores key order and formatting, and changes with content.
+(
+  . "$ROOT/scripts/lib/codex-request-evidence.sh"
+  fp1=$(crqe_policy_fingerprint '{"a":1,"codex":{"bot_login":"x","max_review_rounds":3}}')
+  fp2=$(crqe_policy_fingerprint '{"codex":{"max_review_rounds":3,"bot_login":"x"},  "a":1}')
+  fp3=$(crqe_policy_fingerprint '{"a":1,"codex":{"bot_login":"y","max_review_rounds":3}}')
+  [ -n "$fp1" ] && [ "$fp1" = "$fp2" ] && [ "$fp1" != "$fp3" ] && ! crqe_policy_fingerprint 'not json' >/dev/null
+) && pass "fingerprint: stable across key order, different for different content, fails on malformed input" \
+  || fail "fingerprint: crqe_policy_fingerprint is not a stable content identity"
+D="$WORK/expect-policy"; make_cli_case "$D"
+printf '[]\n' >"$D/issue_comments.json"
+RC=$(run_cli "$D")
+_fp=$(jq -r '.policy_fingerprint // empty' "$D/out" 2>/dev/null)
+RC2=$(run_cli "$D" --expect-policy "$_fp")
+_out2=$(cat "$D/out")
+RC3=$(run_cli "$D" --expect-policy 1-1)
+if [ "$RC" = 0 ] && [[ "$_fp" =~ ^[0-9]+-[0-9]+$ ]] && [ "$RC2" = 0 ] \
+   && [ "$(printf '%s' "$_out2" | jq -r .policy_fingerprint)" = "$_fp" ] \
+   && [ "$RC3" = 3 ] && [ ! -s "$D/out" ] && grep -q 'policy changed' "$D/err"; then
+  pass "CLI: --expect-policy accepts its own snapshot's fingerprint and refuses another (exit 3, nothing printed)"
+else
+  fail "CLI expect-policy: rc=$RC/$RC2/$RC3 fp=$_fp err=$(cat "$D/err")"
+fi
+
 # A non-string governing bot login is malformed, never coerced (#1576 round 4).
 for _bot in 42 '["chatgpt-codex-connector[bot]"]' '{x: 1}' codex-false; do
   D="$WORK/bot-$RANDOM"; make_cli_case "$D"

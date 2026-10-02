@@ -1471,6 +1471,7 @@ governing_request_attempt_cap() {
   # Validated only where it is used (a new request): an acknowledgement retry
   # does not re-check the blocking budget, so it must not fail on it either.
   GOVERNING_BLOCKING_REVIEW_BUDGET=$(printf '%s' "$budget_json" | jq -r '.max_blocking_reviews')
+  GOVERNING_POLICY_FINGERPRINT=$(printf '%s' "$budget_json" | jq -r '.policy_fingerprint // empty')
 }
 
 # The blocking-review budget (#1560 slice 3). Counts, across the whole PR, the
@@ -1492,20 +1493,23 @@ count_blocking_reviews() {
   ledger_cmd="${MERGEPATH_CODEX_LEDGER_CMD:-$__CODEX_REQUEST_DIR/codex-review-ledger.sh}"
   command -v "$ledger_cmd" >/dev/null 2>&1 \
     || die 3 "Codex review ledger unavailable: $ledger_cmd; refusing a new '@codex review' trigger"
+  [[ "${GOVERNING_POLICY_FINGERPRINT:-}" =~ ^[0-9]+-[0-9]+$ ]] \
+    || die 3 "the governing policy snapshot has no fingerprint; refusing a new '@codex review' trigger"
   ledger=$(MERGEPATH_REVIEW_POLICY_PATH="$CONFIG" "$ledger_cmd" --repo "$REPO" \
-    --expect-head "$HEAD_SHA" "$PR_NUMBER") || rc=$?
+    --expect-head "$HEAD_SHA" --expect-policy "$GOVERNING_POLICY_FINGERPRINT" "$PR_NUMBER") || rc=$?
   [ "$rc" -eq 0 ] \
     || die 3 "Codex review ledger failed (exit $rc); cannot count blocking reviews; refusing a new '@codex review' trigger"
   # Exactly one ledger document (-s), read under the same policy snapshot as
-  # the limit: the ledger reports the max_blocking_reviews of the base policy
-  # it resolved, and a base that moved between the two resolutions makes them
-  # disagree, which is conflicting evidence rather than a value to pick.
+  # the limit: the ledger refuses a fingerprint other than ours and echoes its
+  # own, so author, bot, tiers and budget all come from one base revision. A
+  # base that moved between the two resolutions is conflicting evidence, never
+  # a value to pick.
   BLOCKING_REVIEW_COUNT=$(printf '%s' "$ledger" | jq -ser \
     --arg head "$HEAD_SHA" --arg author "$AUTHOR_IDENTITY" \
-    --argjson limit "$BLOCKING_REVIEW_LIMIT" '
+    --argjson limit "$BLOCKING_REVIEW_LIMIT" --arg fp "$GOVERNING_POLICY_FINGERPRINT" '
     if length != 1 then error("documents") else .[0] end
     | if type == "object" and .head_sha == $head and .author == $author
-       and .max_blocking_reviews == $limit
+       and .max_blocking_reviews == $limit and .policy_fingerprint == $fp
        and (.responses | type) == "array"
        and all(.responses[]; (.unsolicited | type) == "boolean"
                              and (.class as $c | ["blocking", "discretionary", "no_findings", "clean",
@@ -1516,7 +1520,7 @@ count_blocking_reviews() {
                     and (.class == "blocking" or .class == "unknown_tier" or .conflicting)) ]
          | length
     else error("ledger") end' 2>/dev/null) \
-    || die 3 "Codex review ledger output is malformed, or names another head, author or blocking-review budget; refusing a new '@codex review' trigger"
+    || die 3 "Codex review ledger output is malformed, or names another head, author, budget or policy snapshot; refusing a new '@codex review' trigger"
   [[ "$BLOCKING_REVIEW_COUNT" =~ ^[0-9]+$ ]] \
     || die 3 "Codex review ledger produced no single blocking-review count; refusing a new '@codex review' trigger"
 }
@@ -2054,6 +2058,7 @@ ACK_RETRY_REFUSED_BY_CAP=false
 CAP_REUSED_TRIGGER=false
 CAP_REQUEST_COUNT=0
 CAP_REQUEST_LIMIT=0
+GOVERNING_POLICY_FINGERPRINT=""
 BLOCKING_REVIEW_COUNT=""
 BLOCKING_REVIEW_LIMIT=""
 RESUMED_TRIGGER=false

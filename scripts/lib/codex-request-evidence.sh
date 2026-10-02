@@ -155,10 +155,26 @@ crqe_governing_budget() { # repo pr default-config candidate-author [resolver [b
   [ "${#freshness}" -le 9 ] || return 1
   freshness=$(printf '%s' "$freshness" | sed 's/^0*//')
   [ -n "$freshness" ] || freshness=0
+  local fingerprint
+  fingerprint=$(crqe_policy_fingerprint "$base_json") || return 1
   jq -nc --arg author "$author" --argjson cap "$cap" --argjson blocking "$blocking" \
-    --argjson freshness "$freshness" \
+    --argjson freshness "$freshness" --arg fp "$fingerprint" \
     '{author_identity:$author,max_request_attempts:$cap,max_blocking_reviews:$blocking,
-      reaction_freshness_window_seconds:$freshness}'
+      reaction_freshness_window_seconds:$freshness,policy_fingerprint:$fp}'
+}
+
+# crqe_policy_fingerprint <policy-json>
+# A short identity for one parsed base-policy snapshot: the POSIX checksum and
+# size of its canonical JSON (sorted keys, compact). Two reads of the same base
+# revision agree; a base that moved between two reads almost always does not.
+# It detects change, it is not a security hash: the base policy is the target
+# branch's own file, not candidate-controlled input.
+crqe_policy_fingerprint() {
+  local canonical sum
+  canonical=$(printf '%s' "$1" | jq -S -c . 2>/dev/null) || return 1
+  [ -n "$canonical" ] || return 1
+  sum=$(printf '%s' "$canonical" | cksum) || return 1
+  printf '%s\n' "$sum" | awk 'NF == 2 { print $1 "-" $2; ok = 1 } END { exit !ok }'
 }
 
 crqe_ack_present() { # reactions-json bot trigger-time; caller binds comment ID
