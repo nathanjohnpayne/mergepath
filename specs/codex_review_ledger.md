@@ -26,10 +26,10 @@ Each ledger repeats these four limits in `limits`.
 
 Signals belong to the window of the latest request posted at or before them; signals before the first request are `unsolicited`. Within a window:
 
-- each review (root inline findings plus top-level body findings) is its own response, so two reviews in one window are two responses (`multiple_in_window`);
+- each review (root inline findings plus top-level body findings) is its own response, including a review without a `commit_id`, so two reviews in one window are two responses (`multiple_in_window`);
 - a verdict joins the latest review on the same head at or before it, else the earliest later one; a verdict with no matching review stands alone;
 - signals without an anchor (reactions, block notices, verdicts without a sha) join the window's single response, or form their own when the window has none or several;
-- a window whose responses sit on more than one head is `mixed_heads`;
+- a window whose responses sit on more than one head is `mixed_heads`; heads are the anchors that are not a prefix of another, so a short sha and its full sha are one head, but a short sha matching two different full shas leaves two;
 - a response in the same second as a request is a `tie`.
 
 Review objects whose inline comments are all thread replies are not responses. They are listed under `thread_reply_reviews` with any provider marker in the replies, because a connector reply in a review thread lands as one.

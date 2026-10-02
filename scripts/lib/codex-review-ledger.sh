@@ -107,7 +107,8 @@ crl_ledger() {
                   // ($m | first) ) as $hit
               | if $hit == null then . + [{anchor: $v.anchor, sigs: [$v]}]
                 else .[$hit.key].sigs += [$v] end ) ) as $g1
-        | ( [ $ws[] | select(.anchor == null) ] ) as $free
+        # Anchorless reviews are already their own responses in $g0.
+        | ( [ $ws[] | select(.anchor == null and .kind != "review") ] ) as $free
         | if ($g1 | length) == 0 then
             (if ($free | length) == 0 then [] else [{anchor: null, sigs: $free}] end)
           elif ($g1 | length) == 1 then [ $g1[0] | .sigs += $free ]
@@ -130,10 +131,11 @@ crl_ledger() {
           else { class: "no_findings", conflicting: false } end;
       ( [ range(0; $n + 1) as $w
           | responses_of($w) as $g
-          # Distinct heads by prefix equivalence (a short sha and its full
-          # sha are one head), the same rule same_head applies everywhere.
-          | ( reduce ([ $g[] | .anchor | select(. != null) ][]) as $a ([];
-                if any(.[]; same_head(.; $a)) then . else . + [$a] end) | length ) as $heads
+          # Distinct heads: the anchors that are not a proper prefix of another
+          # anchor. A short sha and its full sha are one head, but a short sha
+          # matching two different full shas does not merge them.
+          | ( [ $g[] | .anchor | select(. != null) | ascii_downcase ] | unique ) as $anch
+          | ( [ $anch[] as $a | select(all($anch[]; . == $a or (startswith($a) | not))) ] | length ) as $heads
           | $g | to_entries[]
           | .value as $grp
           | ($grp | classify) as $c
