@@ -806,6 +806,7 @@ revalidate_request_ceiling_authority() {
   stops_state="$(printf '%s' "$stops_json" | jq -r '.state // "unsafe"' 2>/dev/null || printf unsafe)"
   budget_json="$(p4b_codex_request_budget_state "$REPO" "$PR" "$HEAD")" || budget_rc=$?
   budget_state="$(printf '%s' "$budget_json" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
+  local fresh_state="$budget_state"
   # Still spent, and spent by the same request generation the barrier saw: an
   # exact author request posted while the adapter ran (a new final request)
   # voids this run's authority, so the next run enters the bounded final-request
@@ -821,9 +822,12 @@ revalidate_request_ceiling_authority() {
      && ! p4b_same_governing_tuple "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" "$budget_json"; then
     budget_state=snapshot-changed
   fi
-  # Before dispatch, a new request is not an error: hold so the next run
-  # enters that request's bounded wait (#1583).
-  if [ "$where" = pre-dispatch ] && [ "$budget_rc:$budget_state" = 0:generation-changed ]; then
+  # Before dispatch, a NEW pending final request is not an error: hold so the
+  # next run enters its bounded wait (#1583). Only that: a generation changed
+  # by an edited or deleted request (budget available again) or by a request
+  # already answered (exhausted) takes the authority-error path below.
+  if [ "$where" = pre-dispatch ] && [ "$budget_rc:$budget_state" = 0:generation-changed ] \
+     && [ "$fresh_state" = final-request-pending ]; then
     hold_for_external_review "$(jq -nc '{decision:"pending",retry_after:0,coderabbit:"unchanged",codex:"not-yet",codex_evidence:"request-cap-final-pending",trigger:"skipped",resume:"skipped"}')"
   fi
   case "$budget_rc:$budget_state" in

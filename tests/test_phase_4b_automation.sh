@@ -5625,6 +5625,29 @@ else
   fail "#1583: pre-dispatch generation change (rc=$rc adapter=$(cat "$_ceiling_adapter" 2>/dev/null) ledger-calls=$(cat "$_bump_count" 2>/dev/null)): $(printf '%s' "$out" | jq -c . 2>/dev/null) $(tail -8 "$WORK/ceiling-bump.err" | tr '\n' ' ')"
 fi
 
+# ...but only a genuinely pending replacement holds (#1584 Codex P2). A
+# generation change whose fresh state is NOT final-request-pending (here an
+# old request outside the freshness window: exhausted, nothing to wait on)
+# takes the authority-error path, exit 10, still before any adapter run.
+_gen_after_old=$(jq -nc '[{id:9302,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:"2026-07-01T00:00:00Z"}]')
+rm -f "$_gen_race" "$_bump_count" "$_ceiling_adapter"
+: >"$HANDOFF_LOG"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+set +e
+out="$(P4B_TEST_LEDGER_MODE=bump P4B_TEST_LEDGER_BUMP_AT=2 P4B_TEST_LEDGER_COUNT="$_bump_count" MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-stop.yml" CODEX_BIN="$BIN/fake-codex-ceiling-approve" \
+  P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_COMMENTS_RACE_FILE="$_gen_race" P4B_TEST_COMMENTS_CHANGE_AFTER=1000 P4B_TEST_COMMENTS_FAIL_AFTER=1000000 P4B_TEST_COMMENTS_JSON_AFTER="$_gen_after_old" \
+  P4B_TEST_LIVE_HEAD="$_p4a_head" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+  P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
+  P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" PATH="$WORK/barrier-bin:$PATH" \
+  bash "$ORCH" 7 --repo owner/repo --author claude --head "$_p4a_head" --diff-file "$DIFF" 2>"$WORK/ceiling-bump.err" </dev/null)"; rc=$?
+set -e
+if [ "$rc" = 10 ] && [ ! -s "$_ceiling_adapter" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.barrier.request_budget.state')" = exhausted ]; then
+  pass "#1583: a generation change with nothing pending (exhausted) exits 10 before dispatch, not a hold"
+else
+  fail "#1583: non-pending generation change before dispatch (rc=$rc adapter=$(cat "$_ceiling_adapter" 2>/dev/null)): $(printf '%s' "$out" | jq -c . 2>/dev/null) $(tail -4 "$WORK/ceiling-bump.err" | tr '\n' ' ')"
+fi
+
 # The request lands during the Nth ledger read, i.e. the stop read of each
 # recheck in turn. Every recheck reads stops first and the budget last, so
 # every placement must exit 10; under a budget-first order the bump during the
