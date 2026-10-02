@@ -530,6 +530,21 @@ require_feedback_accounted() {
   esac
 }
 
+# The approval writer-boundary accounting fence (#1581). This run has already
+# recorded its loop and may have filed follow-ups, so refuse through the
+# pre-post cleanup first: exit 7 for unaccounted feedback, 3 when the gate
+# itself fails.
+refuse_approval_if_feedback_unaccounted() {
+  local acct_rc=0 acct_reason
+  feedback_accounting_status || acct_rc=$?
+  [ "$acct_rc" -ne 0 ] || return 0
+  acct_reason="review feedback became unaccounted during the Phase 4b run; refusing the approval"
+  [ "$acct_rc" -eq 1 ] || acct_reason="review feedback accounting failed at the approval writer boundary; refusing the approval"
+  cleanup_pre_post_refusal_side_effects "$acct_reason" true \
+    "Review feedback accounting" "the review feedback on ${REPO}#${PR}"
+  if [ "$acct_rc" -eq 1 ]; then p4b_die 7 "$acct_reason"; else p4b_die 3 "$acct_reason"; fi
+}
+
 # --- manual-handoff fallback -----------------------------------------------
 fall_back_to_manual() {
   local why="$1"
@@ -1670,22 +1685,9 @@ post_review() {
   # #1581: an approval is the one write a late finding must not slip past.
   # A required-tier finding can land while the adapter runs, so account for
   # feedback once more here, at the writer boundary, after every other
-  # preparation read. (The manual fallback already runs the gate itself, and a
-  # CHANGES_REQUESTED review asks for changes either way.) this run has already
-  # recorded its loop and may have filed follow-ups, so refuse through the
-  # pre-post cleanup first. A CHANGES_REQUESTED review is not gated: it asks
-  # for changes either way.
-  if [ "$event" = "APPROVE" ]; then
-    local acct_rc=0
-    feedback_accounting_status || acct_rc=$?
-    if [ "$acct_rc" -ne 0 ]; then
-      local acct_reason="review feedback became unaccounted during the Phase 4b run; refusing the approval"
-      [ "$acct_rc" -eq 1 ] || acct_reason="review feedback accounting failed at the approval writer boundary; refusing the approval"
-      cleanup_pre_post_refusal_side_effects "$acct_reason" true \
-        "Review feedback accounting" "the review feedback on ${REPO}#${PR}"
-      if [ "$acct_rc" -eq 1 ]; then p4b_die 7 "$acct_reason"; else p4b_die 3 "$acct_reason"; fi
-    fi
-  fi
+  # preparation read. A CHANGES_REQUESTED review is not gated: it asks for
+  # changes either way.
+  [ "$event" != "APPROVE" ] || refuse_approval_if_feedback_unaccounted
   # The timeout/head/body/base reads above prepare the final review material
   # and may outlive the earlier budget check. Revalidate the coherent governing
   # tuple, resolved request budget, and request generation once more after
@@ -1693,6 +1695,12 @@ post_review() {
   # This is a bounded consumer fence, not an atomic GitHub read/write protocol;
   # a residual network interval remains between this observation and the POST.
   revalidate_codex_request_budget_authority pre-post
+  # That revalidation rebuilds the Codex ledger, a slow read, so a finding can
+  # land during it. Account once more after it so the window left for a late
+  # finding is only the POST itself (#1584 Phase 4b P1). The accounting read
+  # in turn leaves a short window for a new request, which the merge gates
+  # still hold.
+  [ "$event" != "APPROVE" ] || refuse_approval_if_feedback_unaccounted
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \
     '{commit_id:$commit_id,event:$event,body:$body}' > "$payload_file"

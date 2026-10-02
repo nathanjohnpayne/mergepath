@@ -300,6 +300,16 @@ BBB=$(printf '%s\n' "$(preview 10 2026-09-25T00:10:00Z '[["c.sh","p1"]]')" "$(pr
      "$(preview 12 2026-09-25T02:10:00Z '[["b.sh","p1"]]' '[]' "$HEAD_B")" | arr)
 stop_check "stops: every one of three requests blocking past a ceiling of 2 is a runaway" \
   "$(stops "$(inputs "$R3" "$BBB" '[]' '[]' '[]')" '[]' 10 2)" '.stops == ["runaway"] and .blocking_windows == 3 and .counted_requests == 3'
+# A request without a boolean counted fails the ledger rather than reading as
+# foreign, which would hide a runaway (#1584 Phase 4b P2).
+for _bad in 'del(.requests[0].counted)' '.requests[1].counted = "yes"' '.requests[0].counted = null'; do
+  _bl=$(crl_ledger "$(inputs "$R2B" "$BB" '[]' '[]' '[]')" | jq -c '.max_blocking_reviews = 10')
+  if crl_human_stops "$(printf '%s' "$_bl" | jq -c "$_bad")" "$HEAD_A" nathanjohnpayne 10 2 >/dev/null; then
+    fail "stops: a request with a malformed counted ($_bad) was accepted"
+  else
+    pass "stops: a request with a malformed counted ($_bad) fails the ledger"
+  fi
+done
 
 L=$(crl_ledger "$(printf '%s' "$IN" | jq -c '.rebuttals = []')")
 [ "$(crl_blocking_count "$L" "$HEAD_A" nathanjohnpayne)" = 2 ] \

@@ -351,7 +351,10 @@ crl_human_stops() {
         and (.rebuttals | type) == \"array\"
         and (.requests | type) == \"array\"
         and all(.requests[]; (.created_at | type) == \"string\" and (.outcome | type) == \"string\"
-                             and (.responses | type) == \"array\")
+                             and (.responses | type) == \"array\"
+                             # counted decides which windows a runaway counts;
+                             # absent or malformed must fail, not read as foreign.
+                             and (.counted | type) == \"boolean\")
         and all(.responses[]; (.first_at | type) == \"string\" and (.window | type) == \"number\"
                               and (.blocking_paths | type) == \"array\"
                               and (.blocking_unlocated | type) == \"boolean\")
