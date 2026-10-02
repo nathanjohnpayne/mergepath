@@ -12,8 +12,9 @@
 # 024e0da propagation wave, #272.)
 #
 # <status_name> is the human-readable option name, matched exactly (including
-# case): Backlog, Ready, In progress, In review, Done (the canonical set the
-# bootstrap creates), or whatever options exist on the project's Status field.
+# case): Backlog, Ready, In progress, In review, Done (the canonical set
+# mergepath's new-repo bootstrap creates), or whatever options exist on the
+# project's Status field.
 #
 # The script discovers the project's node ID, Status field ID, and option IDs
 # at runtime, so it works with any Project v2 that has a Status field.
