@@ -232,6 +232,104 @@ L=$(ledger "$(req 1 $T0 | arr)" "$(review 10 $T1 $HEAD_A '["p1"]' | arr)" '[]' '
 check "the ledger states its limits and has no clearance field" "$L" \
   '(.limits | length) == 5 and any(.limits[]; test("edited or deleted request")) and ([.. | objects | keys[] | select(test("clear"; "i"))] | length) == 0'
 
+# ---- Part 1b: blocking-review count and human stops (#1560 slice 3) ---------
+
+# preview <id> <time> <path-tier-pairs-json> [body-tiers-json]: a review whose
+# root findings carry paths, e.g. '[["x.sh","p1"]]'.
+preview() {
+  jq -nc --argjson id "$1" --arg t "$2" --argjson f "$3" --argjson bt "${4:-[]}" --arg h "$HEAD_A" '
+    {id: $id, submitted_at: $t, commit_id: $h, body_tiers: $bt,
+     root_findings: [$f | to_entries[] | {comment_id: ($id * 10 + .key), path: .value[0], tier: .value[1]}],
+     reply_comments: 0, reply_markers: []}'
+}
+rebut() { jq -nc --argjson f "$1" --arg p "$2" --arg t "$3" '{finding: $f, path: (if $p == "null" then null else $p end), at: $t, sources: ["tag"]}'; }
+# stops <ledger-inputs> <rebuttals-json> <max>
+stops() {
+  local l
+  l=$(crl_ledger "$(printf '%s' "$1" | jq -c --argjson rb "$2" '.rebuttals = $rb')") || return 1
+  l=$(printf '%s' "$l" | jq -c --argjson m "$3" '.max_blocking_reviews = $m') || return 1
+  crl_human_stops "$l" "$HEAD_A" nathanjohnpayne "$3"
+}
+stop_check() { # <name> <stops-json> <predicate>
+  if printf '%s' "$2" | jq -e "$3" >/dev/null 2>&1; then pass "$1"; else fail "$1: $3 failed on $2"; fi
+}
+
+R4=$(printf '%s\n' "$(req 1 2026-09-25T00:00:00Z)" "$(req 2 2026-09-25T01:00:00Z)" \
+     "$(req 3 2026-09-25T02:00:00Z)" "$(req 4 2026-09-25T03:00:00Z)" | arr)
+CCBB=$(printf '%s\n' "$(preview 10 2026-09-25T00:10:00Z '[]')" "$(preview 11 2026-09-25T01:10:00Z '[]')" \
+     "$(preview 12 2026-09-25T02:10:00Z '[["a.sh","p1"]]')" "$(preview 13 2026-09-25T03:10:00Z '[["b.sh","p1"]]')" | arr)
+IN=$(inputs "$R4" "$CCBB" '[]' '[]' '[]')
+OUT=$(stops "$IN" '[]' 2)
+stop_check "stops: clean, clean, blocking, blocking with a budget of 2 spends the blocking budget" "$OUT" \
+  '.blocking_reviews == 2 and .stops == ["blocking-budget"]'
+OUT=$(stops "$IN" '[]' 3)
+stop_check "stops: the same history with a budget of 3 has no human stop" "$OUT" '.blocking_reviews == 2 and .stops == []'
+L=$(crl_ledger "$(printf '%s' "$IN" | jq -c '.rebuttals = []')")
+[ "$(crl_blocking_count "$L" "$HEAD_A" nathanjohnpayne)" = 2 ] \
+  && pass "count: crl_blocking_count agrees with the human-stop count" \
+  || fail "count: crl_blocking_count gave $(crl_blocking_count "$L" "$HEAD_A" nathanjohnpayne)"
+if ! crl_blocking_count "$L" "$HEAD_B" nathanjohnpayne >/dev/null && ! crl_blocking_count "$L" "$HEAD_A" someone >/dev/null \
+   && ! crl_human_stops "$(printf '%s' "$L" | jq -c '.max_blocking_reviews = 10')" "$HEAD_B" nathanjohnpayne 10 >/dev/null; then
+  pass "count: a ledger for another head or author fails"
+else
+  fail "count: a ledger for another head or author was accepted"
+fi
+L10=$(printf '%s' "$L" | jq -c '.max_blocking_reviews = 10')
+if crl_human_stops "$L10" "$HEAD_A" nathanjohnpayne 10 >/dev/null \
+   && ! crl_human_stops "$L10" "$HEAD_A" nathanjohnpayne 9 >/dev/null \
+   && ! crl_human_stops "$L" "$HEAD_A" nathanjohnpayne 10 >/dev/null \
+   && ! crl_human_stops "$(printf '%s\n%s\n' "$L10" "$L10")" "$HEAD_A" nathanjohnpayne 10 >/dev/null \
+   && ! crl_blocking_count "$(printf '%s\n%s\n' "$L" "$L")" "$HEAD_A" nathanjohnpayne >/dev/null; then
+  pass "count: two ledger documents, or a budget from another policy snapshot (or none), fail"
+else
+  fail "count: a second document or a mismatched snapshot budget was accepted"
+fi
+if ! crl_human_stops "$(printf '%s' "$L10" | jq -c '.rebuttals = [{finding: "x", path: null, at: "t"}]')" "$HEAD_A" nathanjohnpayne 10 >/dev/null \
+   && ! crl_human_stops "$(printf '%s' "$L10" | jq -c 'del(.rebuttals)')" "$HEAD_A" nathanjohnpayne 10 >/dev/null \
+   && ! crl_blocking_count "$(printf '%s' "$L" | jq -c '.responses[0].class = null')" "$HEAD_A" nathanjohnpayne >/dev/null \
+   && ! crl_blocking_count "$(printf '%s' "$L" | jq -c '.responses[0].class = "severe"')" "$HEAD_A" nathanjohnpayne >/dev/null; then
+  pass "count: malformed rebuttals or responses fail"
+else
+  fail "count: malformed rebuttals or responses were accepted"
+fi
+
+# Unsolicited blocking review (before any request) is not counted.
+IN=$(inputs "$(req 1 2026-09-25T01:00:00Z | arr)" \
+  "$(printf '%s\n' "$(preview 10 2026-09-25T00:10:00Z '[["a.sh","p1"]]')" "$(preview 11 2026-09-25T01:10:00Z '[["a.sh","p1"]]')" | arr)" '[]' '[]' '[]')
+stop_check "stops: an unsolicited blocking review is not counted" "$(stops "$IN" '[]' 2)" '.blocking_reviews == 1 and .stops == []'
+
+# Rebuttals. One request drew a blocking finding on x.sh; it was rebutted.
+R2=$(printf '%s\n' "$(req 1 2026-09-25T00:00:00Z)" "$(req 2 2026-09-25T02:00:00Z)" | arr)
+FIRST=$(preview 10 2026-09-25T00:10:00Z '[["x.sh","p1"]]')
+RB=$(rebut 100 x.sh 2026-09-25T01:00:00Z | arr)
+IN=$(inputs "$(req 1 2026-09-25T00:00:00Z | arr)" "$(printf '%s\n' "$FIRST" | arr)" '[]' '[]' '[]')
+stop_check "stops: a rebuttal with no Codex response after it is untested" "$(stops "$IN" "$RB" 10)" \
+  '.stops == ["untested-rebuttal"] and .untested_rebuttals[0].finding == 100'
+IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" | arr)" '[]' "$(reaction 900 2026-09-25T02:10:00Z | arr)" '[]')
+stop_check "stops: a rebuttal Codex answered clean is settled" "$(stops "$IN" "$RB" 10)" '.stops == []'
+# A response in the same second as the rebuttal cannot be shown to have read
+# it, so the rebuttal stays untested.
+IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" | arr)" '[]' "$(reaction 900 2026-09-25T02:10:00Z | arr)" '[]')
+stop_check "stops: a response in the same second as the rebuttal leaves it untested" \
+  "$(stops "$IN" "$(rebut 100 x.sh 2026-09-25T02:10:00Z | arr)" 10)" '.stops == ["untested-rebuttal"]'
+IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[["x.sh","p1"]]')" | arr)" '[]' '[]' '[]')
+stop_check "stops: a later blocking finding on the rebutted path is a disagreement" "$(stops "$IN" "$RB" 10)" \
+  '.stops == ["disagreement"] and .disagreements[0].finding == 100'
+IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[["y.sh","p1"]]')" | arr)" '[]' '[]' '[]')
+stop_check "stops: a later blocking finding on another path is not a disagreement" "$(stops "$IN" "$RB" 10)" '.stops == []'
+IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[["x.sh","p2"]]')" | arr)" '[]' '[]' '[]')
+stop_check "stops: a later discretionary finding on the rebutted path is not a disagreement" "$(stops "$IN" "$RB" 10)" '.stops == []'
+IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[]' '["p1"]')" | arr)" '[]' '[]' '[]')
+stop_check "stops: a later blocking body finding cannot be located, so it is a disagreement" "$(stops "$IN" "$RB" 10)" '.stops == ["disagreement"]'
+IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" | arr)" "$(verdict 901 2026-09-25T02:10:00Z '[]' false | arr)" '[]' '[]')
+stop_check "stops: a later unknown-tier response is a disagreement" "$(stops "$IN" "$RB" 10)" '.stops == ["disagreement"]'
+IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[["y.sh","p1"]]')" | arr)" '[]' '[]' '[]')
+stop_check "stops: a rebuttal with no path matches any later blocking response" \
+  "$(stops "$IN" "$(rebut 100 null 2026-09-25T01:00:00Z | arr)" 10)" '.stops == ["disagreement"]'
+IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[["x.sh","p1"]]')" | arr)" '[]' '[]' '[]')
+stop_check "stops: every stop that holds is reported, blocking budget first" "$(stops "$IN" "$RB" 2)" \
+  '.stops == ["blocking-budget", "disagreement"]'
+
 # ---- Part 2: CLI contract (stubbed gh, real libs) ---------------------------
 
 make_cli_case() {
@@ -286,6 +384,9 @@ case "$1" in
   repos/o/r/pulls/7/comments) cat "$LEDGER_TEST_DIR/review_comments.json" ;;
   repos/o/r/issues/7/reactions) cat "$LEDGER_TEST_DIR/issue_reactions.json" ;;
   repos/o/r/issues/comments/*/reactions) printf '[]\n' ;;
+  repos/o/r/pulls/comments/*/reactions)
+    id=${1#repos/o/r/pulls/comments/}; id=${id%/reactions}
+    if [ -f "$LEDGER_TEST_DIR/finding_reactions_$id.json" ]; then cat "$LEDGER_TEST_DIR/finding_reactions_$id.json"; else printf '[]\n'; fi ;;
   *) echo "unexpected endpoint $1" >&2; exit 99 ;;
 esac
 EOF
@@ -320,7 +421,7 @@ if [ "$RC" = 0 ] && jq -e '.summary.requests == 1 and .summary.foreign_requests 
 else
   fail "CLI ok case: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
 fi
-if ! grep -qvE '^repos/o/r/(pulls/7|issues/7/comments|pulls/7/reviews|pulls/7/comments|issues/7/reactions|issues/comments/[0-9]+/reactions)$' "$D/calls"; then
+if ! grep -qvE '^repos/o/r/(pulls/7|issues/7/comments|pulls/7/reviews|pulls/7/comments|issues/7/reactions|issues/comments/[0-9]+/reactions|pulls/comments/[0-9]+/reactions)$' "$D/calls"; then
   pass "CLI: reads only the PR's own records"
 else
   fail "CLI read an unexpected endpoint: $(cat "$D/calls")"
@@ -420,6 +521,38 @@ if [ "$RC" = 3 ] && [ ! -s "$D/out" ] && grep -q 'no submitted_at' "$D/err"; the
   pass "CLI: a Codex review with no submitted_at fails closed"
 else
   fail "CLI null submitted_at: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+
+# Rebuttal collection (#1560 slice 3): a tagged thread, and a thumbs-down on
+# the root, are rebuttals; the bot's own thumbs-down and a rollup that rules
+# one out are not read as one.
+D="$WORK/rebuttals"; make_cli_case "$D"
+jq -n '[{id: 101, user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"}]' >"$D/issue_comments.json"
+jq -n '[{id: 50, user: {login: "chatgpt-codex-connector[bot]"}, submitted_at: "2026-09-25T00:10:00Z", commit_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", body: ""}]' >"$D/reviews.json"
+jq -n '[{id: 60, pull_request_review_id: 50, in_reply_to_id: null, path: "x.sh", user: {login: "chatgpt-codex-connector[bot]"}, body: "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>** thing", created_at: "2026-09-25T00:10:00Z", reactions: {"-1": 0}},
+        {id: 61, pull_request_review_id: 51, in_reply_to_id: 60, path: "x.sh", user: {login: "nathanjohnpayne"}, body: "This does not apply because the caller already validates it.", created_at: "2026-09-25T00:20:00Z"},
+        {id: 62, pull_request_review_id: 52, in_reply_to_id: 60, path: "x.sh", user: {login: "nathanjohnpayne"}, body: "[mergepath-resolve: rebuttal-recorded] rebutted", created_at: "2026-09-25T00:40:00Z"},
+        {id: 70, pull_request_review_id: 50, in_reply_to_id: null, path: "y.sh", user: {login: "chatgpt-codex-connector[bot]"}, body: "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>** other", created_at: "2026-09-25T00:10:00Z", reactions: {"-1": 2}},
+        {id: 80, pull_request_review_id: 50, in_reply_to_id: null, path: "z.sh", user: {login: "chatgpt-codex-connector[bot]"}, body: "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>** third", created_at: "2026-09-25T00:10:00Z", reactions: {"-1": 1}}]' >"$D/review_comments.json"
+jq -n '[{content: "-1", user: {login: "nathanpayne-claude"}, created_at: "2026-09-25T00:30:00Z"},
+        {content: "-1", user: {login: "chatgpt-codex-connector[bot]"}, created_at: "2026-09-25T00:15:00Z"}]' >"$D/finding_reactions_70.json"
+jq -n '[{content: "-1", user: {login: "chatgpt-codex-connector[bot]"}, created_at: "2026-09-25T00:15:00Z"}]' >"$D/finding_reactions_80.json"
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e '
+     (.rebuttals | map({finding, path, at, sources})) == [
+       {finding: 60, path: "x.sh", at: "2026-09-25T00:20:00Z", sources: ["tag"]},
+       {finding: 70, path: "y.sh", at: "2026-09-25T00:30:00Z", sources: ["thumbs-down"]}]
+     and (.responses[0].blocking_paths == ["x.sh", "y.sh", "z.sh"])' "$D/out" >/dev/null \
+   && ! grep -q 'pulls/comments/60/reactions' "$D/calls"; then
+  pass "CLI: a tagged thread and a reviewer thumbs-down are rebuttals, dated from the earliest reply; the bot's own thumbs-down is not"
+else
+  fail "CLI rebuttals: rc=$RC out=$(jq -c '{rebuttals, paths: [.responses[].blocking_paths]}' "$D/out" 2>/dev/null) calls=$(tr '\n' ' ' <"$D/calls") err=$(cat "$D/err")"
+fi
+RC=$(LEDGER_TEST_FAIL_ENDPOINT=repos/o/r/pulls/comments/70/reactions run_cli "$D")
+if [ "$RC" = 3 ] && [ ! -s "$D/out" ]; then
+  pass "CLI: a failed thumbs-down read fails closed"
+else
+  fail "CLI rebuttal read failure: rc=$RC"
 fi
 
 D="$WORK/malformed"; make_cli_case "$D"

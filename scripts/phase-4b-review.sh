@@ -621,7 +621,7 @@ hold_for_external_review() {
 
 stop_for_human_tiebreaker() {
   local payload="$1"
-  p4b_warn "Codex request budget exhausted; stopping for a human tiebreaker without adapter dispatch or Phase 4b handoff"
+  p4b_warn "Codex human stop holds (spent blocking-review budget, untested rebuttal or disagreement at a spent request ceiling); stopping for a human tiebreaker without adapter dispatch or Phase 4b handoff"
   jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
         --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" '
@@ -765,9 +765,57 @@ cleanup_pre_post_refusal_side_effects() {
 # Changed or unreadable evidence exits 10 directly. A clean rerun then observes
 # the new final request and enters the ordinary bounded wait; this invocation
 # must not convert stale budget authority into either a review or manual handoff.
+# #1560 slice 3: a barrier that opened on a spent request ceiling (codex
+# evidence request-ceiling*) carries authority only while the ceiling is still
+# spent and no human stop holds. The adapter run can take the whole adapter
+# timeout, in which a late Codex response, a rebuttal or a policy change can
+# appear, so re-read both at every authority-bearing exit, like the
+# below-cap snapshot below. A human stop exits 8; anything else that changed
+# or cannot be read exits 10.
+revalidate_request_ceiling_authority() {
+  local where="${1:-post-adapter}" budget_json budget_rc=0 budget_state
+  local stops_json stops_rc=0 stops_state reason payload
+  case "$P4B_PRE_ADAPTER_CODEX_EVIDENCE" in request-ceiling*) ;; *) return 0 ;; esac
+  budget_json="$(p4b_codex_request_budget_state "$REPO" "$PR" "$HEAD")" || budget_rc=$?
+  budget_state="$(printf '%s' "$budget_json" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
+  case "$budget_rc:$budget_state" in
+    0:exhausted|0:final-request-pending) ;;
+    *)
+      reason="The Codex request ceiling is no longer spent, or its evidence is unreadable, after external review began; refusing stale Phase 4b authority"
+      [ "$where" != pre-post ] || cleanup_pre_post_refusal_side_effects "$reason" true \
+        "Codex request authority" "the spent Codex request ceiling for ${REPO}#${PR}"
+      payload="$(jq -nc --arg r "$reason" --argjson b "${budget_json:-null}" \
+        '{decision:"error",reason:$r,coderabbit:"unchanged",codex:"escalate",codex_evidence:"request-ceiling-authority-changed",request_budget:$b}')"
+      stop_for_barrier_error "$payload"
+      ;;
+  esac
+  stops_json="$(p4b_codex_human_stops "$REPO" "$PR" "$HEAD")" || stops_rc=$?
+  stops_state="$(printf '%s' "$stops_json" | jq -r '.state // "unsafe"' 2>/dev/null || printf unsafe)"
+  case "$stops_rc:$stops_state" in
+    0:clear) return 0 ;;
+    0:stop)
+      reason="A human stop appeared during external review at the spent Codex request ceiling ($(printf '%s' "$stops_json" | jq -r '.stops | join(", ")')); human tiebreaker required"
+      [ "$where" != pre-post ] || cleanup_pre_post_refusal_side_effects "$reason" true \
+        "Codex human stop" "the spent Codex request ceiling for ${REPO}#${PR}"
+      payload="$(jq -nc --arg r "$reason" --argjson b "$budget_json" --argjson hs "$stops_json" \
+        '{decision:"human-tiebreaker",reason:$r,coderabbit:"unchanged",codex:"cap-exhausted",codex_evidence:"request-ceiling-human-stop",request_budget:$b,human_stops:$hs}')"
+      stop_for_human_tiebreaker "$payload"
+      ;;
+    *)
+      reason="Codex human-stop evidence became unreadable or moved during external review; refusing stale Phase 4b authority"
+      [ "$where" != pre-post ] || cleanup_pre_post_refusal_side_effects "$reason" true \
+        "Codex request authority" "the spent Codex request ceiling for ${REPO}#${PR}"
+      payload="$(jq -nc --arg r "$reason" --argjson hs "${stops_json:-null}" \
+        '{decision:"error",reason:$r,coderabbit:"unchanged",codex:"escalate",codex_evidence:"request-ceiling-human-stop-unreadable",request_budget:null,human_stops:$hs}')"
+      stop_for_barrier_error "$payload"
+      ;;
+  esac
+}
+
 revalidate_codex_request_budget_authority() {
   local where="${1:-post-adapter}"
   local unsafe_budget="" recheck_rc=0 reason evidence payload
+  revalidate_request_ceiling_authority "$where"
   [ -n "$P4B_PRE_ADAPTER_REQUEST_GENERATION" ] || return 0
 
   unsafe_budget="$(p4b_codex_available_authority_revalidate \
@@ -1290,6 +1338,13 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
   if [ "$BARRIER_CODERABBIT_RATE_LIMITED" = true ]; then
     printf -- '- Provider ordering: CodeRabbit was **rate limited** on this head and could not be re-asked, so the same-head barrier opened on Codex'"'"'s head-pinned report alone (#1178)\n'
   fi
+  # #1560 slice 3: a review dispatched over a spent Codex request ceiling ran
+  # without a Codex report on this head. Say so, and that no human stop held.
+  case "$P4B_PRE_ADAPTER_CODEX_EVIDENCE" in
+    request-ceiling*)
+      printf -- '- Provider ordering: the Codex request ceiling was spent on this head, so this review ran without a Codex report here; no human stop held (blocking-review budget, untested rebuttal, disagreement) (#1560)\n'
+      ;;
+  esac
   # #1335: likewise for a CodeRabbit review carried from identical content.
   if [ -n "$BARRIER_CODERABBIT_CARRIED" ]; then
     printf -- '- Provider ordering: CodeRabbit did not re-review this head (a base-only update); its review of `%s` carries forward because the external-review fingerprint is unchanged (`%s`) (#1335)\n' \

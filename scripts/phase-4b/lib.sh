@@ -60,6 +60,16 @@ if [ -r "$P4B_LIB_DIR/../lib/feedback-policy-helpers.sh" ] \
   P4B_CODEX_REQUEST_BUDGET_OK=true
 fi
 
+# #1560 slice 3: the Codex review ledger's human-stop rules, read when a spent
+# request ceiling would otherwise dispatch the automated adapter. Absent, that
+# route fails closed (exit 10); nothing else reads it.
+P4B_CODEX_LEDGER_OK=false
+if [ -r "$P4B_LIB_DIR/../lib/codex-review-ledger.sh" ]; then
+  # shellcheck source=../lib/codex-review-ledger.sh
+  . "$P4B_LIB_DIR/../lib/codex-review-ledger.sh"
+  P4B_CODEX_LEDGER_OK=true
+fi
+
 # Resolve the repo root from this library's own location (follow symlinks),
 # NOT $PWD — the same posture scripts/phase-4b-classifier.sh uses so a
 # PATH-symlinked or subdir invocation still finds the policy file.
@@ -1697,6 +1707,102 @@ p4b_barrier_maybe_resume() {
   return 0
 }
 
+# p4b_codex_human_stops <repo> <pr> <reviewed-head>
+#
+# The human-stop conditions a spent request ceiling must clear before it may
+# dispatch the automated adapter (#1560 slice 3, S3-4): the blocking-review
+# budget, an untested rebuttal, and a disagreement, as crl_human_stops defines
+# them over the Codex review ledger. Prints {state: "clear"|"stop", stops,
+# blocking_reviews, max_blocking_reviews, untested_rebuttals, disagreements,
+# governing_tuple} and returns 0, or {state: "unsafe", reason} and returns 2
+# when any input is missing, unreadable, malformed, or moved during the read.
+# Missing or conflicting evidence never reads as "clear".
+p4b_codex_human_stops() {
+  local repo="$1" pr="$2" head="$3" config author resolver tuple final_tuple budget max
+  local ledger_cmd ledger stops base_ref base_sha default_branch fp
+  if [ "$P4B_CODEX_REQUEST_BUDGET_OK" != true ] || [ "$P4B_CODEX_LEDGER_OK" != true ] \
+     || ! command -v crqe_governing_budget crl_human_stops >/dev/null 2>&1; then
+    jq -nc '{state:"unsafe",reason:"human-stop-helper-unavailable"}'
+    return 2
+  fi
+  config="$(p4b_config)"
+  author="$(p4b_top_field author_identity)"
+  author="${author:-nathanjohnpayne}"
+  resolver="${P4B_RESOLVE_BASE_POLICY:-$P4B_LIB_DIR/../workflow/resolve_base_policy.sh}"
+  tuple=$(p4b_pr_policy_tuple "$repo" "$pr") \
+    || { jq -nc '{state:"unsafe",reason:"pr-policy-tuple-read-failed"}'; return 2; }
+  if [ "$(printf '%s' "$tuple" | jq -r .head_sha)" != "$head" ]; then
+    jq -nc --arg h "$head" --argjson t "$tuple" \
+      '{state:"unsafe",reason:"head-moved",reviewed_head:$h,live_head:$t.head_sha}'
+    return 2
+  fi
+  base_ref=$(printf '%s' "$tuple" | jq -r .base_ref)
+  base_sha=$(printf '%s' "$tuple" | jq -r .base_sha)
+  default_branch=$(printf '%s' "$tuple" | jq -r .default_branch)
+  budget=$(crqe_governing_budget "$repo" "$pr" "$config" "$author" "$resolver" \
+    "$base_ref" "$base_sha" "$default_branch") \
+    || { jq -nc '{state:"unsafe",reason:"governing-policy-unreadable"}'; return 2; }
+  max=$(printf '%s' "$budget" | jq -r '.max_blocking_reviews // empty')
+  case "$max" in ''|*[!0-9]*) jq -nc '{state:"unsafe",reason:"blocking-budget-invalid"}'; return 2 ;; esac
+  # The ledger must read the same base-policy snapshot (author, bot, tiers,
+  # budget) as this budget read: it refuses another fingerprint and echoes its
+  # own, which crl_human_stops' caller checks below.
+  fp=$(printf '%s' "$budget" | jq -r '.policy_fingerprint // empty')
+  [[ "$fp" =~ ^[0-9]+-[0-9]+$ ]] \
+    || { jq -nc '{state:"unsafe",reason:"policy-fingerprint-missing"}'; return 2; }
+  ledger_cmd="${P4B_CODEX_LEDGER:-$P4B_LIB_DIR/../codex-review-ledger.sh}"
+  command -v "$ledger_cmd" >/dev/null 2>&1 \
+    || { jq -nc '{state:"unsafe",reason:"ledger-unavailable"}'; return 2; }
+  ledger=$(MERGEPATH_REVIEW_POLICY_PATH="$config" "$ledger_cmd" --repo "$repo" \
+    --expect-head "$head" --expect-policy "$fp" "$pr" 2>/dev/null) \
+    || { jq -nc '{state:"unsafe",reason:"ledger-failed"}'; return 2; }
+  printf '%s' "$ledger" | jq -se --arg fp "$fp" 'length == 1 and .[0].policy_fingerprint == $fp' >/dev/null 2>&1 \
+    || { jq -nc '{state:"unsafe",reason:"ledger-policy-snapshot-mismatch"}'; return 2; }
+  stops=$(crl_human_stops "$ledger" "$head" "$author" "$max") \
+    || { jq -nc '{state:"unsafe",reason:"ledger-malformed"}'; return 2; }
+  final_tuple=$(p4b_pr_policy_tuple "$repo" "$pr") \
+    || { jq -nc '{state:"unsafe",reason:"pr-policy-tuple-reread-failed"}'; return 2; }
+  if [ "$final_tuple" != "$tuple" ]; then
+    jq -nc --argjson before "$tuple" --argjson after "$final_tuple" \
+      '{state:"unsafe",reason:"pr-policy-tuple-changed",live_head:$after.head_sha,before:$before,after:$after}'
+    return 2
+  fi
+  printf '%s' "$stops" | jq -c --argjson t "$tuple" \
+    '. + {state: (if (.stops | length) > 0 then "stop" else "clear" end), governing_tuple: $t}'
+}
+
+# Route a spent request ceiling with no eligible final request left to poll
+# (#1560 slice 3, S3-4). Called only from p4b_same_head_barrier, whose locals
+# it sets through bash's dynamic scoping. A clear result waives the Codex arm
+# so the automated adapter can run; any human stop takes exit 8; unreadable
+# evidence takes exit 10. <stop-evidence> keeps the pre-slice-3 evidence names
+# for the human stop so existing readers see the same value.
+p4b_barrier_ceiling_route() { # <repo> <pr> <head> <clear-evidence> <stop-evidence> <wait-note>
+  local hs_rc=0 hs_state hs_list
+  cx_human_stops_json="$(p4b_codex_human_stops "$1" "$2" "$3")" || hs_rc=$?
+  hs_state="$(printf '%s' "$cx_human_stops_json" | jq -r '.state // "unsafe"' 2>/dev/null || printf unsafe)"
+  case "$hs_rc:$hs_state" in
+    0:clear)
+      cls_cx="waived"
+      cx_evidence="$4"
+      ;;
+    0:stop)
+      hs_list="$(printf '%s' "$cx_human_stops_json" | jq -r '.stops | join(", ")')"
+      human_tiebreaker=true
+      cls_cx="cap-exhausted"
+      cx_evidence="$5"
+      why="Codex request ceiling spent$6 and a human stop holds ($hs_list); human tiebreaker required"
+      ;;
+    *)
+      cls_cx="escalate"
+      budget_unsafe=true
+      cx_budget_json="$cx_human_stops_json"
+      cx_evidence="$(printf '%s' "$cx_human_stops_json" | jq -r '.reason // "human-stop-evidence-unreadable"' 2>/dev/null || printf human-stop-evidence-unreadable)"
+      why="Codex human-stop evidence (blocking-review budget, rebuttals) is unreadable or moved; refusing to route the spent request ceiling"
+      ;;
+  esac
+}
+
 # --- the barrier itself (#814) ----------------------------------------------
 #
 # p4b_same_head_barrier <repo> <pr> <head> <reviewer> [dry_run]
@@ -1705,7 +1811,10 @@ p4b_barrier_maybe_resume() {
 #   0  open      — every ENABLED provider is terminal on this exact head
 #   1  pending   — at least one is not yet, still inside the bound
 #   2  escalate  — a provider needs the ordinary manual Phase 4b fallback
-#   3  tiebreak  — Codex request cap exhausted; explicit human decision needed
+#   3  tiebreak  — Codex request ceiling spent and a human stop holds
+#                  (blocking-review budget, untested rebuttal or disagreement;
+#                  #1560 slice 3); explicit human decision needed. A spent
+#                  ceiling with no human stop waives the Codex arm instead.
 #   4  error     — request-budget evidence failed; no review authority follows
 #
 # Guarded only on the existing codex.enabled / coderabbit.enabled switches;
@@ -1726,6 +1835,7 @@ p4b_same_head_barrier() {
   local pending=false why="" coderabbit_cause="" trigger="skipped" resume="skipped" cls_cr="disabled" cls_cx="disabled"
   local cx_evidence="disabled" cr_carry="" cr_carry_json="null"
   local cap_exhausted=false final_request_pending=false human_tiebreaker=false
+  local cx_human_stops_json="null"
   local budget_unsafe=false
   local elapsed budget remaining=0
   root="$(p4b_repo_root)"
@@ -1838,10 +1948,11 @@ p4b_same_head_barrier() {
                 0:reported) cls_cx="reported"; cx_evidence="signal" ;;
                 0:timeout) cls_cx="waived"; cx_evidence="timeout" ;;
                 0:none)
-                  human_tiebreaker=true
-                  cls_cx="cap-exhausted"
-                  cx_evidence="request-cap"
-                  why="Codex request cap exhausted with no eligible final request left to poll; human tiebreaker required"
+                  # #1560 slice 3: a spent ceiling is cost exhaustion, not
+                  # non-convergence. It goes to the human only when a human
+                  # stop holds; otherwise the adapter reviews this head.
+                  p4b_barrier_ceiling_route "$repo" "$pr" "$head" \
+                    request-ceiling request-cap ""
                   ;;
                 *)
                   cls_cx="escalate"
@@ -1882,6 +1993,8 @@ p4b_same_head_barrier() {
       cls_cx="escalate"
       if [ "$cx_evidence" = timeout ]; then
         why="Phase 4a timed out on $head, but codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c)"
+      elif [ "$cx_evidence" = request-ceiling ]; then
+        why="The Codex request ceiling is spent on $head, but codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c); a human must decide"
       else
         why="Codex is account-blocked and codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c) — a human must resolve the block"
       fi
@@ -2089,11 +2202,24 @@ p4b_same_head_barrier() {
             fi
             ;;
           0:none)
-            human_tiebreaker=true
-            cls_cx="cap-exhausted"
-            cx_evidence="request-cap-final-wait-exhausted"
-            why="Codex request cap exhausted and its eligible final request did not report within ${budget}s; human tiebreaker required"
-            [ -z "$coderabbit_cause" ] || why="$why (CodeRabbit state retained: $coderabbit_cause)"
+            # #1560 slice 3, acceptance condition 2: the human stops are
+            # re-evaluated here, after the final-request wait and before the
+            # adapter can be dispatched, from fresh reads.
+            pending=false
+            p4b_barrier_ceiling_route "$repo" "$pr" "$head" \
+              request-ceiling-final-wait request-cap-final-wait-exhausted \
+              " and its eligible final request did not report within ${budget}s"
+            if [ "$human_tiebreaker" = true ]; then
+              [ -z "$coderabbit_cause" ] || why="$why (CodeRabbit state retained: $coderabbit_cause)"
+            elif [ "$cls_cx" = waived ]; then
+              if [ -n "$coderabbit_cause" ]; then
+                why="$coderabbit_cause"
+              else
+                case "$cls_cr" in
+                  not-yet|rate-limited) why="external review did not reach the current head within ${budget}s" ;;
+                esac
+              fi
+            fi
             ;;
           *)
             pending=false
@@ -2138,7 +2264,10 @@ p4b_same_head_barrier() {
   if [ -z "$why" ] && [ "$cls_cx" = waived ] \
      && [ "$(p4b_policy_block_field codex allow_phase_4b_substitute)" = "false" ]; then
     cls_cx="escalate"
-    why="Phase 4a timed out on $head, but codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c)"
+    case "$cx_evidence" in
+      request-ceiling*) why="The Codex request ceiling is spent on $head, but codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c); a human must decide" ;;
+      *) why="Phase 4a timed out on $head, but codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c)" ;;
+    esac
   fi
 
   # An `available` budget is authority to continue into Phase 4b. Fence its
@@ -2181,8 +2310,9 @@ p4b_same_head_barrier() {
     if [ "$human_tiebreaker" = true ]; then
       jq -nc --arg r "$why" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" \
         --arg cc "$coderabbit_cause" --arg t "$trigger" --arg rs "$resume" --argjson b "${cx_budget_json:-null}" \
+        --argjson hs "${cx_human_stops_json:-null}" \
         '{decision:"human-tiebreaker",reason:$r,coderabbit:$cr,codex:$cx,codex_evidence:$ce,
-          coderabbit_cause:$cc,trigger:$t,resume:$rs,request_budget:$b}'
+          coderabbit_cause:$cc,trigger:$t,resume:$rs,request_budget:$b,human_stops:$hs}'
       return 3
     fi
     if [ "$budget_unsafe" = true ]; then
@@ -2204,8 +2334,8 @@ p4b_same_head_barrier() {
   # unless the CodeRabbit arm carried (#1335): the orchestrator records the
   # source commit and fingerprint in the approval it posts.
   jq -nc --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" --argjson cf "$cr_carry_json" \
-    --argjson b "${cx_budget_json:-null}" \
-    '{decision:"open", coderabbit:$cr, codex:$cx, codex_evidence:$ce, coderabbit_carryforward:$cf,request_budget:$b}'
+    --argjson b "${cx_budget_json:-null}" --argjson hs "${cx_human_stops_json:-null}" \
+    '{decision:"open", coderabbit:$cr, codex:$cx, codex_evidence:$ce, coderabbit_carryforward:$cf,request_budget:$b,human_stops:$hs}'
   return 0
 }
 
