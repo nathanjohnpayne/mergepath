@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/codex-review-ledger.sh — report-only Codex review ledger for one PR
+# scripts/codex-review-ledger.sh — Codex review ledger for one PR
 # (#1560, slice 2).
 #
 # Reads the PR's configured-author Codex requests and every Codex response

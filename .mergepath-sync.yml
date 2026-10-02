@@ -349,8 +349,10 @@ paths:
   - path: scripts/lib/codex-request-evidence.sh
     type: canonical
     consumers: all
-  # Report-only Codex review ledger (#1560): pure attribution over evidence the
-  # caller reads with the shared parsers. Nothing decides on it.
+  # Codex review ledger (#1560): pure attribution over evidence the caller
+  # reads with the shared parsers. Load-bearing since slice 3: the requester's
+  # blocking-review budget refuses a request from its count, and fails closed
+  # when it is absent. Nothing decides on its attribution.
   - path: scripts/lib/codex-review-ledger.sh
     type: canonical
     consumers: all
@@ -1338,7 +1340,7 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/codex-request-evidence.sh"
-  # #1560 report-only ledger: attribution fixtures, CLI contract, and the
+  # #1560 Codex review ledger: attribution fixtures, CLI contract, and the
   # verdict-expression pin across the three copies. Run by check_codex_scripts.
   - path: tests/test_codex_review_ledger.sh
     type: canonical
@@ -2202,7 +2204,7 @@ paths:
       - "tests/test_codex_review_request_token_fallback.sh"  # check_codex_scripts (#737)
       - "tests/test_codex_review_check_resolution.sh"  # check_codex_scripts (#460 Option B)
       - "tests/test_codex_request_evidence.sh"   # #1276, blocked evidence
-      - "tests/test_codex_review_ledger.sh"      # #1560, report-only ledger
+      - "tests/test_codex_review_ledger.sh"      # #1560, Codex review ledger
       - "tests/test_codex_review_check_verdict.sh"  # check_codex_scripts (#600/#567)
       - "tests/test_codex_review_check_required_checks.sh"  # check_codex_scripts (#655)
       - "tests/test_branch_requirements.sh"    # check_codex_scripts (#1064)

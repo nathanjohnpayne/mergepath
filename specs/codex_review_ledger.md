@@ -21,7 +21,7 @@ Every comment body is parsed by an existing shared helper: requests by `crqe_tri
 - The Review Summary is edited in place. It is reported as `current_summary` and never used as history.
 - Request comments are read as they stand now. An edited or deleted request comment changes the reconstructed windows, so the ledger, like the request cap it shares a grammar with, bounds the observed history rather than an immutable one (`specs/codex_request_evidence.md`). The configured author's comments are trusted on that basis.
 
-Each ledger repeats these four limits in `limits`.
+Each ledger repeats these five limits in `limits`.
 
 ## Responses
 

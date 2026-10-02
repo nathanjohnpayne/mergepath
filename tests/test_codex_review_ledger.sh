@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Fixture coverage for the report-only Codex review ledger (#1560, slice 2).
+# Fixture coverage for the Codex review ledger (#1560): built report-only in
+# slice 2; since slice 3 the requester reads its blocking-review count.
 #
 # Part 1 drives the pure attribution library (scripts/lib/codex-review-ledger.sh)
 # with synthetic timelines, one rule per case. Part 2 runs the real CLI against
@@ -229,7 +230,7 @@ check "a top-level review-body P1 finding is blocking" "$L" '.responses[0].class
 
 L=$(ledger "$(req 1 $T0 | arr)" "$(review 10 $T1 $HEAD_A '["p1"]' | arr)" '[]' '[]' '[]')
 check "the ledger states its limits and has no clearance field" "$L" \
-  '(.limits | length) == 4 and ([.. | objects | keys[] | select(test("clear"; "i"))] | length) == 0'
+  '(.limits | length) == 5 and any(.limits[]; test("edited or deleted request")) and ([.. | objects | keys[] | select(test("clear"; "i"))] | length) == 0'
 
 # ---- Part 2: CLI contract (stubbed gh, real libs) ---------------------------
 

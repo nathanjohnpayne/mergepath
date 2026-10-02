@@ -254,7 +254,8 @@ crl_ledger() {
         "a request comment names no commit; request heads are never inferred",
         "eyes are current state: Codex removes them when a review finishes",
         "the pull-request thumbs-up keeps only its latest creation; earlier reaction-only clean passes leave no record",
-        "the Review Summary is edited in place; only its current state is visible"
+        "the Review Summary is edited in place; only its current state is visible",
+        "request comments are read as they stand now; an edited or deleted request changes the reconstructed windows"
       ],
       summary: {
         requests: ([ $requests[] | select(.counted) ] | length),
