@@ -545,6 +545,28 @@ refuse_approval_if_feedback_unaccounted() {
   if [ "$acct_rc" -eq 1 ]; then p4b_die 7 "$acct_reason"; else p4b_die 3 "$acct_reason"; fi
 }
 
+# Append the reviewed request generation to the approval body (#1598). A run
+# with a request-budget snapshot records the snapshot's generation, which the
+# authority fence just proved is still live; a run without one (the Phase 4a
+# timeout route) reads it now. An unreadable generation refuses the approval:
+# without the record the gate could not tell which requests it covers.
+record_reviewed_request_generation() {
+  local reviewed_gen="" reason payload
+  reviewed_gen="$(printf '%s' "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" \
+    | jq -ce '.request_generation | select(type == "array")' 2>/dev/null)" || reviewed_gen=""
+  [ -n "$reviewed_gen" ] || reviewed_gen="$(p4b_live_request_generation "$REPO" "$PR")" || reviewed_gen=""
+  if [ -n "$reviewed_gen" ] \
+     && printf '\n<!-- mergepath-p4b-request-generation: %s -->\n' "$reviewed_gen" >>"$BODY_FILE"; then
+    return 0
+  fi
+  reason="Codex request generation could not be recorded in the approval; refusing the approval"
+  cleanup_pre_post_refusal_side_effects "$reason" true \
+    "Codex request authority" "the Codex request generation for ${REPO}#${PR}"
+  payload="$(jq -nc --arg r "$reason" \
+    '{decision:"error",reason:$r,coderabbit:"unchanged",codex:"escalate",codex_evidence:"request-generation-unrecorded",request_budget:null}')"
+  stop_for_barrier_error "$payload"
+}
+
 # --- manual-handoff fallback -----------------------------------------------
 fall_back_to_manual() {
   local why="$1"
@@ -1695,11 +1717,17 @@ post_review() {
   # This is a bounded consumer fence, not an atomic GitHub read/write protocol;
   # a residual network interval remains between this observation and the POST.
   revalidate_codex_request_budget_authority pre-post
+  # #1598: record in the approval the Codex request generation it was
+  # authorized under, so the substitute merge gate can refuse it once a request
+  # outside that generation exists, including one that lands during the final
+  # accounting read below and so predates the approval. Recorded here, BEFORE
+  # that read, which stays the last one before the POST.
+  [ "$event" != "APPROVE" ] || record_reviewed_request_generation
   # That revalidation rebuilds the Codex ledger, a slow read, so a finding can
   # land during it. Account once more after it so the window left for a late
-  # finding is only the POST itself (#1584 Phase 4b P1). The accounting read
-  # in turn leaves a short window for a new request, which the merge gates
-  # still hold.
+  # finding is only the POST itself (#1584 Phase 4b P1). A request that lands
+  # during this read is outside the recorded generation, and the merge gate
+  # holds the approval until Codex answers it or Phase 4b reruns (#1598).
   [ "$event" != "APPROVE" ] || refuse_approval_if_feedback_unaccounted
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \

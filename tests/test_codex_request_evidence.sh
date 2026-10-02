@@ -204,10 +204,57 @@ while IFS='|' read -r name comments expected pattern; do
   echo "PASS: #1598 $name"
 done <<'CASES'
 older-request|[{"id":123,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:01:00Z","body":"@codex review"}]|0|cleared — Phase 4b substitute
-newer-request|[{"id":123,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:09:00Z","body":"@codex review"}]|1|a Codex request by nathanjohnpayne @ 2026-09-14T00:09:00Z is newer than it (#1598)
+newer-request|[{"id":123,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:09:00Z","body":"@codex review"}]|1|a Codex request by nathanjohnpayne @ 2026-09-14T00:09:00Z is not older than it (no recorded request generation)
+same-second-request|[{"id":123,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:05:00Z","body":"@codex review"}]|1|a Codex request by nathanjohnpayne @ 2026-09-14T00:05:00Z is not older than it (no recorded request generation)
 newer-foreign-request|[{"id":123,"user":{"login":"someone-else"},"created_at":"2026-09-14T00:09:00Z","body":"@codex review"}]|0|cleared — Phase 4b substitute
 newer-mention|[{"id":123,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:09:00Z","body":"status: @codex review was requested"}]|0|cleared — Phase 4b substitute
 malformed-request|[{"id":123,"user":{"login":"nathanjohnpayne"},"body":"@codex review"}]|1|Codex request evidence unreadable (#1598)
 CASES
+# #1598's exact acceptance case: a request (#124, 00:04) lands during the
+# final feedback-accounting read, BEFORE the approval is posted (00:05), and
+# Codex has not answered it. The approval records the request generation it
+# was authorized under ([123]); #124 is outside it, so the approval must not
+# clear gate (c) although the request is OLDER than the approval.
+RACE_COMMENTS='[{"id":123,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:01:00Z","body":"@codex review"},{"id":124,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:04:00Z","body":"@codex review"}]'
+RACE_APPROVAL='[{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:05:00Z","body":"Automated Phase 4b review\n<!-- mergepath-p4b-request-generation: [123] -->"}]'
+COVERED_APPROVAL='[{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:05:00Z","body":"Automated Phase 4b review\n<!-- mergepath-p4b-request-generation: [123,124] -->"}]'
+INVALID_RECORD_APPROVAL='[{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:05:00Z","body":"Automated Phase 4b review\n<!-- mergepath-p4b-request-generation: [123,\"x\"] -->"}]'
+while IFS='|' read -r name reviews expected pattern; do
+  printf '%s\n' "$RACE_COMMENTS" >"$DIR/comments"
+  printf '%s\n' "$reviews" >"$DIR/reviews"
+  printf '[]\n' >"$DIR/ack"
+  : >"$DIR/calls"
+  rc=0
+  PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ="$name" \
+    PR_BODY='Authoring-Agent: claude' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+    MERGEPATH_REVIEW_POLICY_PATH="$DIR/substitute-policy.yml" \
+    bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/out" 2>&1 || rc=$?
+  if [ "$rc" != "$expected" ] || ! grep -q "$pattern" "$DIR/out"; then
+    cat "$DIR/out"; echo "FAIL #1598 $name rc=$rc"; exit 1
+  fi
+  PASS=$((PASS + 1))
+  echo "PASS: #1598 $name"
+done <<CASES
+request-during-final-accounting|$RACE_APPROVAL|1|outside the request generation the approval reviewed
+reviewed-generation-covers-request|$COVERED_APPROVAL|0|cleared — Phase 4b substitute
+invalid-generation-record|$INVALID_RECORD_APPROVAL|1|its recorded request generation is unreadable
+CASES
+# With Codex disabled the substitute is the only gate-(c) path, and a newer
+# Codex request supersedes nothing: the checker must clear on the approval
+# rather than abort on comments it never read (#1599 round 2).
+sed 's/enabled: true/enabled: false/' "$DIR/substitute-policy.yml" >"$DIR/substitute-disabled-policy.yml"
+printf '%s\n' '[{"id":123,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:09:00Z","body":"@codex review"}]' >"$DIR/comments"
+printf '%s\n' "$SUB_APPROVAL" >"$DIR/reviews"
+: >"$DIR/calls"
+rc=0
+PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=codex-disabled \
+  PR_BODY='Authoring-Agent: claude' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+  MERGEPATH_REVIEW_POLICY_PATH="$DIR/substitute-disabled-policy.yml" \
+  bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/out" 2>&1 || rc=$?
+if [ "$rc" != 0 ] || ! grep -q 'cleared — Phase 4b substitute' "$DIR/out"; then
+  cat "$DIR/out"; echo "FAIL #1598 codex-disabled rc=$rc"; exit 1
+fi
+PASS=$((PASS + 1))
+echo "PASS: #1598 codex-disabled"
 
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"

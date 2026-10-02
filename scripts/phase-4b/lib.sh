@@ -652,6 +652,23 @@ p4b_codex_request_budget_state() {
   fi
 }
 
+# p4b_live_request_generation <repo> <pr>
+# The configured author's Codex request generation as it stands now: a sorted
+# array of request comment ids (#1598). An approval records the generation it
+# was authorized under, and the substitute merge gate refuses it once the live
+# generation holds a request outside that record. Returns 2 when the read or
+# the selector fails.
+p4b_live_request_generation() {
+  local repo="$1" pr="$2" author comments
+  command -v crqe_trigger_generation gh_api_array >/dev/null 2>&1 || return 2
+  author="$(p4b_top_field author_identity)"
+  author="${author:-nathanjohnpayne}"
+  comments=$(gh_api_array "repos/$repo/issues/$pr/comments" "Codex request generation for the approval record") \
+    || return 2
+  crqe_trigger_generation "$comments" "$author" 2>/dev/null | jq -ce 'select(type == "array")' 2>/dev/null \
+    || return 2
+}
+
 # Revalidate the complete authority carried by an `available` request-budget
 # result without re-probing either review provider. The stable PR tuple binds
 # the policy lookup to the reviewed head/base/default-ref generation; the
