@@ -2997,6 +2997,12 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
     # evidence fails closed; with Codex disabled a request supersedes nothing.
     PHASE_4B_SUPERSEDED=""
     if [ "$CODEX_ENABLED" = "true" ]; then
+      # Re-read the comments now, after the reviews: the earlier read predates
+      # the reviews read, so a request posted between the two would be missed.
+      # A failed re-read rejects the candidate.
+      if ! REQUEST_COMMENTS_JSON=$(gh_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments (Phase 4b request freshness)" 2>/dev/null); then
+        REQUEST_COMMENTS_JSON=""
+      fi
       PHASE_4B_RECORD=$(echo "$REVIEWS_JSON" | jq -r \
         --arg login "$PHASE_4B_LOGIN" --arg at "$PHASE_4B_TIME" --arg sha "$HEAD_SHA" '
           [ .[] | select(.user.login == $login and .submitted_at == $at and .commit_id == $sha) ]
@@ -3008,10 +3014,12 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
             end' 2>/dev/null || printf invalid)
       if ! declare -F crqe_trigger_generation >/dev/null 2>&1 || ! declare -F crqe_latest_trigger_time >/dev/null 2>&1; then
         PHASE_4B_SUPERSEDED="request evidence helper unavailable"
+      elif [ -z "$REQUEST_COMMENTS_JSON" ]; then
+        PHASE_4B_SUPERSEDED="Codex request evidence could not be re-read"
       elif [ "$PHASE_4B_RECORD" = invalid ]; then
         PHASE_4B_SUPERSEDED="its recorded request generation is unreadable"
       elif [ "$PHASE_4B_RECORD" != none ]; then
-        if ! LIVE_REQUEST_GENERATION=$(crqe_trigger_generation "$ISSUE_COMMENTS_JSON" "$AUTHOR_IDENTITY" 2>/dev/null); then
+        if ! LIVE_REQUEST_GENERATION=$(crqe_trigger_generation "$REQUEST_COMMENTS_JSON" "$AUTHOR_IDENTITY" 2>/dev/null); then
           PHASE_4B_SUPERSEDED="Codex request evidence unreadable"
         else
           UNREVIEWED_REQUESTS=$(jq -nc --argjson live "$LIVE_REQUEST_GENERATION" --argjson rec "$PHASE_4B_RECORD" '$live - $rec')
@@ -3019,7 +3027,7 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
             PHASE_4B_SUPERSEDED="Codex request(s) $UNREVIEWED_REQUESTS by $AUTHOR_IDENTITY are outside the request generation the approval reviewed ($PHASE_4B_RECORD)"
           fi
         fi
-      elif ! LATEST_AUTHOR_REQUEST_TIME=$(crqe_latest_trigger_time "$ISSUE_COMMENTS_JSON" "$AUTHOR_IDENTITY" 2>/dev/null); then
+      elif ! LATEST_AUTHOR_REQUEST_TIME=$(crqe_latest_trigger_time "$REQUEST_COMMENTS_JSON" "$AUTHOR_IDENTITY" 2>/dev/null); then
         PHASE_4B_SUPERSEDED="Codex request evidence unreadable"
       elif [ -n "$LATEST_AUTHOR_REQUEST_TIME" ] && ! [[ "$PHASE_4B_TIME" > "$LATEST_AUTHOR_REQUEST_TIME" ]]; then
         PHASE_4B_SUPERSEDED="a Codex request by $AUTHOR_IDENTITY @ $LATEST_AUTHOR_REQUEST_TIME is not older than it (no recorded request generation)"

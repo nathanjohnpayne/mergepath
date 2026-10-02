@@ -37,7 +37,12 @@ printf '%s\n' "$1" >>"$CALLS"
 case "$1" in
   repos/owner/repo/pulls/99) jq -cn --arg body "$PR_BODY" --arg author "$PR_AUTHOR" '{head:{sha:"abcdef0123456789"},user:{login:$author},body:$body,labels:[]}' ;;
   repos/owner/repo/commits/*) echo '2026-09-14T00:00:00Z' ;;
-  repos/owner/repo/issues/99/comments) cat "$FIXTURES/comments" ;;
+  repos/owner/repo/issues/99/comments)
+    if [ -n "${COMMENTS_FAIL_FROM:-}" ] \
+       && [ "$(grep -c '^repos/owner/repo/issues/99/comments$' "$CALLS")" -ge "$COMMENTS_FAIL_FROM" ]; then
+      exit 1
+    fi
+    cat "$FIXTURES/comments" ;;
   repos/owner/repo/pulls/99/reviews) cat "$FIXTURES/reviews" ;;
   repos/owner/repo/issues/comments/123/reactions) [ "$ACK_READ" != error ] || exit 1; cat "$FIXTURES/ack" ;;
   repos/owner/repo/issues/comments/124/reactions) echo '[]' ;;
@@ -232,6 +237,9 @@ while IFS='|' read -r name reviews expected pattern; do
   if [ "$rc" != "$expected" ] || ! grep -q "$pattern" "$DIR/out"; then
     cat "$DIR/out"; echo "FAIL #1598 $name rc=$rc"; exit 1
   fi
+  # The supersession check re-reads the comments after the reviews read.
+  _comment_reads=$(grep -c '^repos/owner/repo/issues/99/comments$' "$DIR/calls" || true)
+  [ "$_comment_reads" -ge 2 ] || { cat "$DIR/calls"; echo "FAIL #1598 $name read comments $_comment_reads time(s)"; exit 1; }
   PASS=$((PASS + 1))
   echo "PASS: #1598 $name"
 done <<CASES
@@ -239,6 +247,20 @@ request-during-final-accounting|$RACE_APPROVAL|1|outside the request generation 
 reviewed-generation-covers-request|$COVERED_APPROVAL|0|cleared — Phase 4b substitute
 invalid-generation-record|$INVALID_RECORD_APPROVAL|1|its recorded request generation is unreadable
 CASES
+# The supersession re-read failing rejects the candidate (fails closed).
+printf '%s\n' "$RACE_COMMENTS" >"$DIR/comments"
+printf '%s\n' "$COVERED_APPROVAL" >"$DIR/reviews"
+: >"$DIR/calls"
+rc=0
+PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=reread-fails COMMENTS_FAIL_FROM=2 \
+  PR_BODY='Authoring-Agent: claude' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+  MERGEPATH_REVIEW_POLICY_PATH="$DIR/substitute-policy.yml" \
+  bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/out" 2>&1 || rc=$?
+if [ "$rc" = 0 ] || ! grep -q 'Codex request evidence could not be re-read' "$DIR/out"; then
+  cat "$DIR/out"; echo "FAIL #1598 reread-fails rc=$rc"; exit 1
+fi
+PASS=$((PASS + 1))
+echo "PASS: #1598 reread-fails"
 # With Codex disabled the substitute is the only gate-(c) path, and a newer
 # Codex request supersedes nothing: the checker must clear on the approval
 # rather than abort on comments it never read (#1599 round 2).
