@@ -15,7 +15,7 @@ The MUX Video Integration initiative ([Project #5](https://github.com/users/nath
 - `gh` installed (via Homebrew on this machine).
 - An author PAT with `repo` + `project` scopes. Use the cached `OP_PREFLIGHT_AUTHOR_PAT` from [REVIEW_POLICY.md § PAT lookup table](../../REVIEW_POLICY.md#pat-lookup-table); these helpers verify that `GH_TOKEN` resolves to `nathanjohnpayne` before mutating issues or Project v2 items.
 - Run [scripts/op-preflight.sh](../op-preflight.sh) once per session to cache credentials.
-- The target Project v2 board must have a `Status` single-select field (the default template does). `move-item.sh` discovers the field by that exact name.
+- The target Project v2 board must have a `Status` single-select field with the canonical options `Backlog`, `Ready`, `In progress`, `In review`, `Done`. `move-item.sh` discovers the field by that exact name. GitHub's default board template does not provide these options, so edit the board's `Status` field by hand to have exactly these five. The set is the one mergepath's new-repo bootstrap gives the board it provisions with a new repo ([`scripts/bootstrap/board-and-summary.sh`](https://github.com/nathanjohnpayne/mergepath/blob/main/scripts/bootstrap/board-and-summary.sh); hub-only, so the link is absolute). That bootstrap scaffolds a whole repo, so it is not a way to create a board for an initiative.
 
 ```bash
 # Session setup — preflight populates OP_PREFLIGHT_AUTHOR_PAT in env.
@@ -27,7 +27,7 @@ export GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT"
 
 For every initiative you want to track:
 
-1. **Create the Project v2 board** in the GitHub UI. Note its owner + number (e.g. `nathanjohnpayne / 5`). Ensure it has a `Status` single-select field — the default template does.
+1. **Create the Project v2 board** in the GitHub UI. Note its owner + number (e.g. `nathanjohnpayne / 5`). Ensure its `Status` single-select field has the canonical options (see [Prerequisites](#prerequisites)); the default template's options don't match.
 2. **Write the plan** somewhere durable (e.g. `~/.claude/plans/<name>.md`). This becomes the Project README.
 3. **Draft parent + child issue bodies** as Markdown files, using placeholders (`__PARENT_NUM__`, `__C1_NUM__`, etc.) for cross-references.
 4. **Write a one-shot driver script** that sources `lib.sh` and creates everything. See [`examples/mux-video-integration/create-issues.sh`](./examples/mux-video-integration/create-issues.sh).
@@ -67,10 +67,10 @@ read C1_URL C1_NUM _ <<<"$(create_child "Do the first thing" "$F" "myproj,phase-
 
 ```bash
 PROJECT=5 OWNER=nathanjohnpayne REPO=nathanjohnpayne/nathanpaynedotcom \
-  scripts/gh-projects/move-item.sh 211 "In Progress"
+  scripts/gh-projects/move-item.sh 211 "In progress"
 ```
 
-Valid status names are whatever options the Project's `Status` field has — typically `Todo`, `In Progress`, `In Review`, `Human`, `Done`.
+Valid status names are the options on the Project's `Status` field. The canonical set is `Backlog`, `Ready`, `In progress`, `In review`, `Done` (see [Prerequisites](#prerequisites)). `move-item.sh` matches the name exactly, including case, so `"In Progress"` does not select `In progress`.
 
 ### Set the Project README
 
