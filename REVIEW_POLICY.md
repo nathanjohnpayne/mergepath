@@ -940,7 +940,7 @@ When any of the signals above fires, the agent:
    - The current round counter and a link to the `scripts/codex-review-request.sh` output from the terminating round
 3. **Alerts the human via chat** and waits for an explicit decision before taking any further action on the PR.
 
-For request-cap exhaustion, step 2 instead reports exit `7`, configured and consumed request counts, any provider-block diagnostic, and the observed final-request/response state (or that it is unknown). No opposing positions or rebuttal links are required for a cap stop.
+For request-cap or blocking-review-budget exhaustion, step 2 instead reports exit `7` with its `cap_exhausted.kind`, the configured and consumed counts of both budgets (requests and blocking reviews), any provider-block diagnostic, and the observed final-request/response state (or that it is unknown). For a blocking-budget stop, it also links the Codex reviews that spent the budget. No opposing positions or rebuttal links are required for either stop.
 
 Note that timeout does NOT go through this escalation procedure. On a timeout (exit code `4` from `codex-review-request.sh`), the agent posts the handoff message per [Handoff Message Format](#handoff-message-format) and routes to Phase 4b directly from step 15a — no in-place tiebreaker.
 
