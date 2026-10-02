@@ -3,7 +3,7 @@ generated_by: scripts/project-doc-sync.sh
 do_not_edit: true
 source_repo: nathanjohnpayne/docs
 source_path: projects/mergepath/prds/mergepath.md
-source_ref: 5b5452f
+source_ref: 4d6a0a5
 project: mergepath
 document_class: prd
 document_slug: mergepath
@@ -747,7 +747,8 @@ codex:
   enabled: true
   bot_login: "chatgpt-codex-connector[bot]"
   cli_login: nathanpayne-codex
-  max_review_rounds: 2
+  max_review_rounds: 20                  # request ceiling (#1560 slice 3); a spent ceiling routes through the Phase 4b barrier
+  max_blocking_reviews: 10               # blocking-review budget; spending it escalates to the human
   review_timeout_seconds: 600
   ack_wait_seconds: 60                   # Codex 👀 eyes-ack window before the review wait (#419)
   max_ack_retries: 1
@@ -1744,7 +1745,7 @@ Phase 4 splits into an automated path (4a) and a manual fallback (4b). `REVIEW_P
 
 12a. `scripts/codex-review-request.sh` posts `@codex review` (or relies on the auto-review) and polls for a response from `chatgpt-codex-connector[bot]`.
 13a. The agent addresses each finding required by `feedback_policy` (#574) — fix + push, or post a rebuttal reply. With the absent-block default, P0/P1 are required and P2/P3 are discretionary; `mode: address-all` requires a disposition for every finding.
-14a. The loop re-runs until Codex clears (a `COMMENTED` review with no unaddressed policy-required findings on the current HEAD, or a 👍 reaction on the PR issue). Disagreement (repeat-after-rebuttal) or runaway (round counter exceeds `codex.max_review_rounds`) escalates to the human; a response timeout (exit code 4) drops to Phase 4b.
+14a. The loop re-runs until Codex clears (a `COMMENTED` review with no unaddressed policy-required findings on the current HEAD, or a 👍 reaction on the PR issue). Disagreement (repeat-after-rebuttal) or a spent blocking-review budget (`codex.max_blocking_reviews`, solicited blocking Codex reviews) escalates to the human. `codex.max_review_rounds` is a request ceiling, not a runaway threshold: a spent ceiling runs automated Phase 4b, whose barrier stops for the human only when a human stop holds, which is a spent blocking budget, a runaway (every request the ceiling allowed drew a blocking review), an untested rebuttal, or a disagreement. A response timeout (exit code 4) drops to Phase 4b.
 15a. `scripts/codex-review-check.sh` verifies the merge gate: CI green, gate (b) — a cross-agent internal `APPROVED` *or* the same-agent fallback (Codex 👍 substituting for the no-self-approve case), and gate (c) — Codex cleared on the current HEAD *or* a Phase 4b substitute `APPROVED`. The gate never requires an `APPROVED` review *state* from the Codex bot — the App never emits one.
 16a. The `phase_4b_default` config field (`fallback-only` / `complex-changes` / `always`) drives whether `scripts/phase-4b-classifier.sh` runs as a checkpoint before merge.
 17a. On a clean gate, `nathanjohnpayne` merges via `scripts/gh-as-author.sh -- gh pr merge …`.

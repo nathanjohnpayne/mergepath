@@ -545,6 +545,31 @@ refuse_approval_if_feedback_unaccounted() {
   if [ "$acct_rc" -eq 1 ]; then p4b_die 7 "$acct_reason"; else p4b_die 3 "$acct_reason"; fi
 }
 
+# The final request-generation fence at the approval writer boundary (#1598).
+# Only a run that carries a request-budget snapshot has a generation to
+# protect; the authority fence above is a no-op without one too. A changed or
+# unreadable generation refuses the approval with exit 10 after the pre-post
+# cleanup, like the authority fence.
+refuse_approval_if_request_generation_moved() {
+  local gen_rc=0 reason evidence payload
+  [ "$(printf '%s' "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" | jq -r '.request_generation | type' 2>/dev/null)" = array ] \
+    || return 0
+  p4b_request_generation_unchanged "$REPO" "$PR" "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" || gen_rc=$?
+  [ "$gen_rc" -ne 0 ] || return 0
+  if [ "$gen_rc" -eq 1 ]; then
+    evidence=request-generation-changed
+    reason="Codex request generation changed during the final feedback-accounting read; refusing the approval"
+  else
+    evidence=request-generation-reread-failed
+    reason="Codex request generation could not be re-read at the approval writer boundary; refusing the approval"
+  fi
+  cleanup_pre_post_refusal_side_effects "$reason" true \
+    "Codex request authority" "the governing Codex request-budget snapshot for ${REPO}#${PR}"
+  payload="$(jq -nc --arg r "$reason" --arg ce "$evidence" --argjson b "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" \
+    '{decision:"error",reason:$r,coderabbit:"unchanged",codex:"escalate",codex_evidence:$ce,request_budget:$b}')"
+  stop_for_barrier_error "$payload"
+}
+
 # --- manual-handoff fallback -----------------------------------------------
 fall_back_to_manual() {
   local why="$1"
@@ -1697,10 +1722,13 @@ post_review() {
   revalidate_codex_request_budget_authority pre-post
   # That revalidation rebuilds the Codex ledger, a slow read, so a finding can
   # land during it. Account once more after it so the window left for a late
-  # finding is only the POST itself (#1584 Phase 4b P1). The accounting read
-  # in turn leaves a short window for a new request, which the merge gates
-  # still hold.
+  # finding is only the POST itself (#1584 Phase 4b P1).
   [ "$event" != "APPROVE" ] || refuse_approval_if_feedback_unaccounted
+  # The accounting read in turn leaves a window for a new Codex request, which
+  # the substitute gate would not catch before the approval clears (#1598).
+  # Close it with a cheap comments-only generation read: both windows are then
+  # about the length of the POST. No conditional POST exists to close them.
+  [ "$event" != "APPROVE" ] || refuse_approval_if_request_generation_moved
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \
     '{commit_id:$commit_id,event:$event,body:$body}' > "$payload_file"

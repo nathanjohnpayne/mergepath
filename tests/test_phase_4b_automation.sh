@@ -5803,6 +5803,53 @@ for _acct_at in 2 3; do
   fi
 done
 
+# #1598: a Codex request that lands DURING the final accounting read (call 3)
+# changes the request generation after the last authority fence. The cheap
+# comments-only generation fence that follows refuses the approval with exit 10
+# and posts nothing; an unreadable re-read refuses the same way. The stub
+# accounting script moves the comments counter past the switch point on call 3,
+# so only reads after it see the new request (or fail).
+_gen_final_race="$WORK/final-generation-race.count"
+cat >"$WORK/acct-final-race.sh" <<'EOF'
+#!/usr/bin/env bash
+n=0
+[ ! -f "$P4B_TEST_ACCT_COUNT" ] || n=$(cat "$P4B_TEST_ACCT_COUNT")
+n=$((n + 1)); printf '%s\n' "$n" >"$P4B_TEST_ACCT_COUNT"
+[ "$n" -ne 3 ] || printf '5000\n' >"$P4B_TEST_COMMENTS_RACE_FILE"
+printf '{"feedback_policy":{},"findings":[],"missing":[]}\n'
+EOF
+chmod +x "$WORK/acct-final-race.sh"
+_gen_final_after=$(jq -nc --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '[{id:9311,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:$now}]')
+for _final_case in changed unreadable; do
+  case "$_final_case" in
+    changed) _fail_after=1000000; _want=request-generation-changed ;;
+    *) _fail_after=5000; _want=request-generation-reread-failed ;;
+  esac
+  rm -f "$_acct_count" "$_ceiling_adapter" "$_gen_final_race"
+  : >"$HANDOFF_LOG"
+  rm -rf "$WORK/barrier-state/phase-4b-barrier"
+  set +e
+  out="$(P4B_TEST_LEDGER_MODE=clear MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$WORK/acct-final-race.sh" \
+    P4B_TEST_ACCT_COUNT="$_acct_count" \
+    MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-stop.yml" CODEX_BIN="$BIN/fake-codex-ceiling-approve" \
+    P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_COMMENTS_RACE_FILE="$_gen_final_race" P4B_TEST_COMMENTS_CHANGE_AFTER=5000 \
+    P4B_TEST_COMMENTS_FAIL_AFTER="$_fail_after" P4B_TEST_COMMENTS_JSON_AFTER="$_gen_final_after" \
+    P4B_TEST_LIVE_HEAD="$_p4a_head" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+    P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
+    P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" PATH="$WORK/barrier-bin:$PATH" \
+    bash "$ORCH" 7 --repo owner/repo --author claude --head "$_p4a_head" --diff-file "$DIFF" 2>"$WORK/final-gen.err" </dev/null)"; rc=$?
+  set -e
+  if [ "$rc" = 10 ] && [ -s "$_ceiling_adapter" ] && [ ! -s "$HANDOFF_LOG" ] \
+     && [ "$(cat "$_acct_count")" = 3 ] \
+     && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = false ] \
+     && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = "$_want" ] \
+     && ! grep -q 'REGRESSION: reviewer wrapper invoked' "$WORK/final-gen.err"; then
+    pass "#1598: a request generation $_final_case during the final accounting read refuses the approval (exit 10, nothing posted)"
+  else
+    fail "#1598: final generation $_final_case (rc=$rc calls=$(cat "$_acct_count" 2>/dev/null) reads=$(cat "$_gen_final_race" 2>/dev/null)): $out $(tail -4 "$WORK/final-gen.err")"
+  fi
+done
+
 # A pre-side-effect hold must leave NO accounting trace. Evaluate the full
 # barrier once before the adapter, then revalidate only a timeout-derived Codex
 # waiver immediately afterward. A second targeted recheck belongs immediately
@@ -6391,10 +6438,12 @@ else
 fi
 
 # Mutation control for the exact writer-boundary seam above. Run a private
-# orchestrator copy with only the final authority call removed; pin its ROOT to
+# orchestrator copy with only the final writer-boundary request fences removed:
+# the authority fence and, since #1598, the generation fence after the final
+# accounting read (it would otherwise catch the same change). Pin its ROOT to
 # this checkout so it uses the same trusted libraries and fakes. The prepared
 # request change must then reach the fake reviewer wrapper, proving the
-# production refusal came from the final fence rather than the early one.
+# production refusal came from the final fences rather than the early one.
 _prep_mutant="$WORK/phase-4b-review-no-final-authority.sh"
 awk -v actual_root="$ROOT/scripts" '
   /^ROOT=/ { printf "ROOT=\"%s\"\n", actual_root; next }
@@ -6403,8 +6452,12 @@ awk -v actual_root="$ROOT/scripts" '
     removed += 1
     next
   }
+  final_block && /^  \[ "\$event" != "APPROVE" \] \|\| refuse_approval_if_request_generation_moved$/ {
+    removed += 1
+    next
+  }
   { print }
-  END { if (removed != 1) exit 2 }
+  END { if (removed != 2) exit 2 }
 ' "$ORCH" >"$_prep_mutant"
 chmod +x "$_prep_mutant"
 cp "$_budget_before" "$_prep_before"
@@ -6433,10 +6486,105 @@ if [ "$rc" != 10 ] \
    && [ "$(cat "$_prep_adapter_log" 2>/dev/null || true)" = adapter-ran ] \
    && [ "$(cat "$_prep_flip_log" 2>/dev/null || true)" = preparation-read-flipped-after-comments-5 ] \
    && [ "$(cat "$_prep_reviewer" 2>/dev/null || true)" = invoked ]; then
-  pass "#1474 mutation: removing only the final authority fence leaks the prepared request change to review POST"
+  pass "#1474 mutation: removing only the final request fences leaks the prepared request change to review POST"
 else
   fail "#1474 mutation control did not isolate final writer fence (rc=$rc reads=$(cat "$_prep_count" 2>/dev/null || true) flip=$(cat "$_prep_flip_log" 2>/dev/null || true) adapter=$(cat "$_prep_adapter_log" 2>/dev/null || true) reviewer=$(cat "$_prep_reviewer" 2>/dev/null || true)): $out"
 fi
+
+# #1598: a request that lands DURING the final feedback-accounting read (the
+# 3rd accounting call, after the final authority fence) is refused by the cheap
+# generation fence that follows it: exit 10, no review POST, the provisional
+# loop record corrected to not-posted/fail-closed, this run's follow-up issue
+# closed, nothing left pending. An unreadable re-read refuses the same way. An
+# unchanged generation still reaches the review POST (the reviewer wrapper).
+# The accounting stub moves the comments counter past the switch point on its
+# 3rd call, so only reads after it see the new request; the adapter does not
+# arm the preparation flip, so no earlier fence can see it.
+_fg_adapter="$WORK/final-gen-adapter.sh"
+_fg_adapter_log="$WORK/final-gen-adapter.log"
+cat >"$_fg_adapter" <<EOF
+#!/usr/bin/env bash
+cat >/dev/null 2>&1 || true
+printf 'adapter-ran\n' >'$_fg_adapter_log'
+printf '%s' '{"verdict":"APPROVED","summary":"final accounting race","findings":[{"severity":"P2","path":"x.js","line":2,"body":"follow-up must be cleaned if the generation changes"}]}'
+EOF
+chmod +x "$_fg_adapter"
+cat >"$WORK/acct-final-gen.sh" <<'EOF'
+#!/usr/bin/env bash
+n=0
+[ ! -f "$P4B_TEST_ACCT_COUNT" ] || n=$(cat "$P4B_TEST_ACCT_COUNT")
+n=$((n + 1)); printf '%s\n' "$n" >"$P4B_TEST_ACCT_COUNT"
+if [ "$n" -eq 3 ] && [ "${P4B_TEST_FINAL_GEN_MODE:-}" != unchanged ]; then
+  printf '%s\n' "${P4B_TEST_FINAL_GEN_SET_COUNT:-99}" >"$P4B_FAKE_COMMENTS_COUNT"
+fi
+printf '{"feedback_policy":{},"findings":[],"missing":[]}\n'
+EOF
+chmod +x "$WORK/acct-final-gen.sh"
+_fg_acct_count="$WORK/final-gen-acct.count"
+_fg_count="$WORK/final-gen-comments.count"
+_fg_reviewer="$WORK/final-gen-reviewer.log"
+_fg_handoff="$WORK/final-gen-handoff.log"
+_fg_issue="$WORK/final-gen-issue.log"
+_fg_acct="$WORK/final-gen-acct"
+_fg_loop="$_fg_acct/phase-4b-loops/o-r-pr131.jsonl"
+_fg_pending="$_fg_acct/phase-4b-pending/o-r-pr131.json"
+_fg_after_bad="$WORK/final-gen-comments-unreadable.json"
+printf 'not json\n' >"$_fg_after_bad"
+for _fg_mode in changed unreadable unchanged; do
+  case "$_fg_mode" in
+    unreadable) _fg_after="$_fg_after_bad" ;;
+    *) _fg_after="$_budget_after" ;;
+  esac
+  rm -rf "$_fg_acct"
+  rm -f "$_fg_acct_count" "$_fg_count" "$_fg_adapter_log" "$_fg_reviewer" "$_fg_handoff" "$_fg_issue" "$_fg_issue.headreads"
+  : >"$_fg_issue"
+  set +e
+  out="$(PATH="$WORK/budget-bin:$BIN:$PATH" \
+    MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-adapter-race.yml" \
+    MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$WORK/acct-final-gen.sh" \
+    P4B_TEST_ACCT_COUNT="$_fg_acct_count" P4B_TEST_FINAL_GEN_MODE="$_fg_mode" \
+    CODEX_BIN="$_fg_adapter" P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-blocked.sh" \
+    P4B_GH_AS_REVIEWER="$WORK/stub-budget-reviewer-guard.sh" \
+    P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat \
+    P4B_BUDGET_REVIEWER_LOG="$_fg_reviewer" \
+    P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$_fg_handoff" \
+    P4B_FAKE_LIVE_HEAD="$_race_head" \
+    P4B_FAKE_COMMENTS_BEFORE="$_budget_before" P4B_FAKE_COMMENTS_AFTER="$_fg_after" \
+    P4B_FAKE_COMMENTS_COUNT="$_fg_count" P4B_FAKE_COMMENTS_SWITCH_AFTER=99 \
+    P4B_ISSUE_LOG="$_fg_issue" P4B_ACCT_STATE_DIR="$_fg_acct" \
+    bash "$ORCH" 131 --repo o/r --author claude --head "$_race_head" --diff-file "$DIFF" \
+      2>"$WORK/final-gen-full.err")"; rc=$?
+  set -e
+  _fg_diag="rc=$rc acct=$(cat "$_fg_acct_count" 2>/dev/null || true) reads=$(cat "$_fg_count" 2>/dev/null || true) adapter=$(cat "$_fg_adapter_log" 2>/dev/null || true) reviewer=$(cat "$_fg_reviewer" 2>/dev/null || true) issue=$(tr '\n' ' ' <"$_fg_issue" 2>/dev/null || true) loop=$(cat "$_fg_loop" 2>/dev/null || true): $out $(tail -3 "$WORK/final-gen-full.err")"
+  if [ "$_fg_mode" = unchanged ]; then
+    if [ "$(cat "$_fg_acct_count" 2>/dev/null || true)" = 3 ] \
+       && [ "$(cat "$_fg_adapter_log" 2>/dev/null || true)" = adapter-ran ] \
+       && [ "$(cat "$_fg_reviewer" 2>/dev/null || true)" = invoked ] \
+       && [ ! -e "$_fg_handoff" ]; then
+      pass "#1598: an unchanged request generation after the final accounting read still reaches the review POST"
+    else
+      fail "#1598: unchanged generation did not reach the review POST ($_fg_diag)"
+    fi
+    continue
+  fi
+  case "$_fg_mode" in changed) _fg_want=request-generation-changed ;; *) _fg_want=request-generation-reread-failed ;; esac
+  if [ "$rc" = 10 ] \
+     && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = "$_fg_want" ] \
+     && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = false ] \
+     && [ "$(cat "$_fg_acct_count" 2>/dev/null || true)" = 3 ] \
+     && [ "$(cat "$_fg_adapter_log" 2>/dev/null || true)" = adapter-ran ] \
+     && grep -q '^ARGV ' "$_fg_issue" \
+     && grep -q '^CLOSE #901$' "$_fg_issue" \
+     && [ "$(jq -sr 'last.loop.posted' "$_fg_loop" 2>/dev/null)" = not-posted ] \
+     && [ "$(jq -sr 'last.loop.fail_closed.happened' "$_fg_loop" 2>/dev/null)" = true ] \
+     && [ ! -e "$_fg_pending" ] \
+     && [ ! -e "$_fg_reviewer" ] \
+     && [ ! -e "$_fg_handoff" ]; then
+    pass "#1598: a request generation $_fg_mode during the final accounting read refuses publication (exit 10), corrects accounting and closes this run's follow-up"
+  else
+    fail "#1598: final accounting generation $_fg_mode leaked or left state ($_fg_diag)"
+  fi
+done
 
 # Unsafe evidence takes the manual-fallback route rather than a hold. Make the
 # fallback's own accounting gate fail on its second invocation to prove the
