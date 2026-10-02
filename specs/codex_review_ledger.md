@@ -1,6 +1,6 @@
 # Codex review ledger (#1560)
 
-`scripts/codex-review-ledger.sh <PR>` reconstructs which Codex responses a pull request's Codex requests drew, from records GitHub already holds, and prints the result. The attribution logic lives in `scripts/lib/codex-review-ledger.sh`, a pure function over evidence the command reads first. The ledger writes nothing to GitHub. It was built report-only (slice 2) so the counting and routing decision recorded on #1560 would be made from measured evidence. Since slice 3 it has two consumers, described under [Consumer: the blocking-review budget](#consumer-the-blocking-review-budget) and [Consumer: the Phase 4b human stops](#consumer-the-phase-4b-human-stops); nothing reads its attribution to decide anything. Where the record cannot prove an attribution, the ledger says so and lists the candidates; it never picks one.
+`scripts/codex-review-ledger.sh <PR>` reconstructs which Codex responses a pull request's Codex requests drew, from records GitHub already holds, and prints the result. The attribution logic lives in `scripts/lib/codex-review-ledger.sh`, a pure function over evidence the command reads first. The ledger writes nothing to GitHub. It was built report-only (slice 2) so the counting and routing decision recorded on #1560 would be made from measured evidence. Since slice 3 it has two consumers, described under [Consumer: the blocking-review budget](#consumer-the-blocking-review-budget) and [Consumer: the Phase 4b human stops](#consumer-the-phase-4b-human-stops). The blocking count reads only response classes and does not depend on attribution. The human stops do: whether a rebuttal was tested depends on a response being proven attributed to a later request (#1582). Where the record cannot prove an attribution, the ledger says so and lists the candidates; it never picks one.
 
 ## Inputs and authority
 
@@ -56,6 +56,8 @@ A Codex inline finding (a root review comment by the bot) is rebutted when its t
 
 Each response also carries `blocking_paths`, the files of its blocking inline findings, and `blocking_unlocated`, true when it has blocking feedback with no file: a blocking body finding, an `unknown_tier` class or a conflicting response.
 
+Review-body findings have no thread, so their disposition is an issue-comment acknowledgement, `[mergepath-review-ack: <review-id> <fingerprint>]`. A non-bot ack of a Codex review whose body carries a blocking finding is a rebuttal with `path` null, `sources: ["review-ack"]`, dated by the ack's later of creation and edit. The ack does not say whether the finding was fixed or rebutted, so reading it as a rebuttal errs toward a human stop. A root review comment whose reaction rollup is present but not an object exits `3` (#1582).
+
 ## Re-posts
 
 A request followed by another with no response in between is `reposted_without_response`, with `repost_gap_seconds`. `eyes_before_repost` is `true` only when the eyes reaction's own timestamp precedes the next request, `false` when it follows it, and `unknown` when no eyes reaction remains. The ledger never folds requests or calls one an acknowledgement retry: whether to fold is a counting rule for #1560 to choose.
@@ -75,8 +77,9 @@ The requester also passes `--expect-policy <fp>`, the `crqe_policy_fingerprint` 
 When the request ceiling is spent, the Phase 4b barrier runs the ledger with `--expect-head` and evaluates `crl_human_stops` (REVIEW_POLICY.md § Disagreements and Tiebreaking, signal 4):
 
 - `blocking-budget`: the blocking count above reaches the governed `codex.max_blocking_reviews`;
+- `runaway`: the blocking count reaches the request ceiling (`max_request_attempts`, passed as `crl_human_stops`' fifth argument) while still below the budget, so every request the ceiling allowed drew a blocking review. A ceiling of 0 has no runaway;
 - `untested-rebuttal`: a rebuttal that no response proven to answer a later request has tested. The response must be in a window from the first request whose `created_at` is later than the rebuttal's `at`, come after the rebuttal, and not be `provider_blocked`. It must also be listed in the `responses` of an `attributed` request posted after the rebuttal. An answer to a request already in flight, or a response whose attribution is ambiguous (it may be a late answer to the earlier request), does not test the rebuttal. Ambiguity keeps the stop;
-- `disagreement`: a response in those later windows (attributed or not, since counting more is the safe side) that counts toward the budget and either lists the rebutted path in `blocking_paths`, is `blocking_unlocated`, or follows a rebuttal with no path.
+- `disagreement`: a response in those later windows (attributed or not, since counting more is the safe side) that counts toward the budget, on any path. A re-raise can move with a rename, so the path cannot rule a repeat out.
 
 Any stop sends the PR to the human tiebreaker; none lets the automated adapter review the head. The same rule that counts blocking reviews is shared as `crl_blocking_count`, and a ledger for another head or author, or with a malformed response or rebuttal, fails both functions.
 

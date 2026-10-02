@@ -248,7 +248,7 @@ stops() {
   local l
   l=$(crl_ledger "$(printf '%s' "$1" | jq -c --argjson rb "$2" '.rebuttals = $rb')") || return 1
   l=$(printf '%s' "$l" | jq -c --argjson m "$3" '.max_blocking_reviews = $m') || return 1
-  crl_human_stops "$l" "$HEAD_A" nathanjohnpayne "$3"
+  crl_human_stops "$l" "$HEAD_A" nathanjohnpayne "$3" "${4:-}"
 }
 stop_check() { # <name> <stops-json> <predicate>
   if printf '%s' "$2" | jq -e "$3" >/dev/null 2>&1; then pass "$1"; else fail "$1: $3 failed on $2"; fi
@@ -264,6 +264,18 @@ stop_check "stops: clean, clean, blocking, blocking with a budget of 2 spends th
   '.blocking_reviews == 2 and .stops == ["blocking-budget"]'
 OUT=$(stops "$IN" '[]' 3)
 stop_check "stops: the same history with a budget of 3 has no human stop" "$OUT" '.blocking_reviews == 2 and .stops == []'
+# Runaway (#1560 canary, finding 1): a request ceiling below the budget is
+# reached with every allowed request drawing a blocking review. Ceiling 2 with
+# the default budget of 10 and two blocking reviews is a runaway, not cost
+# exhaustion; ceiling 3 with the same two is not.
+R2B=$(printf '%s\n' "$(req 1 2026-09-25T00:00:00Z)" "$(req 2 2026-09-25T01:00:00Z)" | arr)
+BB=$(printf '%s\n' "$(preview 10 2026-09-25T00:10:00Z '[["a.sh","p1"]]')" "$(preview 11 2026-09-25T01:10:00Z '[["b.sh","p1"]]' '[]' "$HEAD_B")" | arr)
+IN2=$(inputs "$R2B" "$BB" '[]' '[]' '[]')
+stop_check "stops: two blocking reviews at a request ceiling of 2 under a budget of 10 are a runaway" \
+  "$(stops "$IN2" '[]' 10 2)" '.stops == ["runaway"] and .request_ceiling == 2'
+stop_check "stops: the same two at a ceiling of 3 are no runaway" "$(stops "$IN2" '[]' 10 3)" '.stops == []'
+stop_check "stops: a spent blocking budget names blocking-budget, not runaway" "$(stops "$IN2" '[]' 2 2)" '.stops == ["blocking-budget"]'
+
 L=$(crl_ledger "$(printf '%s' "$IN" | jq -c '.rebuttals = []')")
 [ "$(crl_blocking_count "$L" "$HEAD_A" nathanjohnpayne)" = 2 ] \
   && pass "count: crl_blocking_count agrees with the human-stop count" \
@@ -287,7 +299,8 @@ fi
 if ! crl_human_stops "$(printf '%s' "$L10" | jq -c '.rebuttals = [{finding: "x", path: null, at: "t"}]')" "$HEAD_A" nathanjohnpayne 10 >/dev/null \
    && ! crl_human_stops "$(printf '%s' "$L10" | jq -c 'del(.rebuttals)')" "$HEAD_A" nathanjohnpayne 10 >/dev/null \
    && ! crl_blocking_count "$(printf '%s' "$L" | jq -c '.responses[0].class = null')" "$HEAD_A" nathanjohnpayne >/dev/null \
-   && ! crl_blocking_count "$(printf '%s' "$L" | jq -c '.responses[0].class = "severe"')" "$HEAD_A" nathanjohnpayne >/dev/null; then
+   && ! crl_blocking_count "$(printf '%s' "$L" | jq -c '.responses[0].class = "severe"')" "$HEAD_A" nathanjohnpayne >/dev/null \
+   && ! crl_blocking_count "$(printf '%s' "$L" | jq -c '.responses[0].first_at = null')" "$HEAD_A" nathanjohnpayne >/dev/null; then
   pass "count: malformed rebuttals or responses fail"
 else
   fail "count: malformed rebuttals or responses were accepted"
@@ -328,7 +341,10 @@ IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '
 stop_check "stops: a later blocking finding on the rebutted path is a disagreement" "$(stops "$IN" "$RB" 10)" \
   '.stops == ["disagreement"] and .disagreements[0].finding == 100'
 IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[["y.sh","p1"]]' '[]' "$HEAD_B")" | arr)" '[]' '[]' '[]')
-stop_check "stops: a later blocking finding on another path is not a disagreement" "$(stops "$IN" "$RB" 10)" '.stops == []'
+# A re-raise can move with a rename, so path cannot rule a repeat out: any
+# counted response to a later request after a rebuttal is a disagreement
+# (#1560 canary, finding 3; this case asserted the opposite before).
+stop_check "stops: a later blocking finding on another path is still a disagreement" "$(stops "$IN" "$RB" 10)" '.stops == ["disagreement"]'
 IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[["x.sh","p2"]]' '[]' "$HEAD_B")" | arr)" '[]' '[]' '[]')
 stop_check "stops: a later discretionary finding on the rebutted path is not a disagreement" "$(stops "$IN" "$RB" 10)" '.stops == []'
 IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[]' '["p1"]')" | arr)" '[]' '[]' '[]')
@@ -576,6 +592,37 @@ if [ "$RC" = 3 ] && [ ! -s "$D/out" ]; then
   pass "CLI: a failed thumbs-down read fails closed"
 else
   fail "CLI rebuttal read failure: rc=$RC"
+fi
+
+# Review-body rebuttals (#1560 canary, finding 2): an author ack of a Codex
+# review with a blocking BODY finding is a path-null rebuttal, dated by the
+# ack's edit; an ack of a non-blocking body, or by the bot, is not.
+D="$WORK/body-rebuttal"; make_cli_case "$D"
+jq -n '[{id: 101, user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"},
+        {id: 102, user: {login: "nathanpayne-claude"}, body: "[mergepath-review-ack: 50 0123456789ab]\n\nDeclined: not applicable.", created_at: "2026-09-25T00:20:00Z", updated_at: "2026-09-25T00:25:00Z"},
+        {id: 103, user: {login: "nathanpayne-claude"}, body: "[mergepath-review-ack: 51 0123456789ab]", created_at: "2026-09-25T00:30:00Z"},
+        {id: 104, user: {login: "chatgpt-codex-connector[bot]"}, body: "[mergepath-review-ack: 50 0123456789ab]", created_at: "2026-09-25T00:40:00Z"}]' >"$D/issue_comments.json"
+jq -n '[{id: 50, user: {login: "chatgpt-codex-connector[bot]"}, submitted_at: "2026-09-25T00:10:00Z", commit_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+         body: "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>** body finding"},
+        {id: 51, user: {login: "chatgpt-codex-connector[bot]"}, submitted_at: "2026-09-25T00:11:00Z", commit_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+         body: "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>** minor body finding"}]' >"$D/reviews.json"
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e '.rebuttals == [{finding: 50, path: null, at: "2026-09-25T00:25:00Z", sources: ["review-ack"]}]' "$D/out" >/dev/null; then
+  pass "CLI: an ack of a blocking review-body finding is a path-null rebuttal; non-blocking and bot acks are not"
+else
+  fail "CLI body rebuttal: rc=$RC rebuttals=$(jq -c .rebuttals "$D/out" 2>/dev/null) err=$(cat "$D/err")"
+fi
+
+# A malformed reaction rollup fails closed instead of reading as "no thumbs-down" (#1582).
+D="$WORK/bad-rollup"; make_cli_case "$D"
+jq -n '[{id: 101, user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"}]' >"$D/issue_comments.json"
+jq -n '[{id: 50, user: {login: "chatgpt-codex-connector[bot]"}, submitted_at: "2026-09-25T00:10:00Z", commit_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", body: ""}]' >"$D/reviews.json"
+jq -n '[{id: 60, pull_request_review_id: 50, in_reply_to_id: null, path: "x.sh", user: {login: "chatgpt-codex-connector[bot]"}, body: "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>** thing", created_at: "2026-09-25T00:10:00Z", reactions: "x"}]' >"$D/review_comments.json"
+RC=$(run_cli "$D")
+if [ "$RC" = 3 ] && [ ! -s "$D/out" ]; then
+  pass "CLI: a malformed reaction rollup fails closed (#1582)"
+else
+  fail "CLI malformed rollup: rc=$RC out=$(head -c 200 "$D/out")"
 fi
 
 D="$WORK/malformed"; make_cli_case "$D"

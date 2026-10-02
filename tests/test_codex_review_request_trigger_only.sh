@@ -573,7 +573,7 @@ test_blocking_budget_governing_value() {
 # available budget: each exits 3 before any request is posted.
 test_blocking_budget_fails_closed() {
   local name dir rc before
-  for name in missing nonzero garbage not-object head-mismatch author-mismatch bad-response-shape unknown-class two-documents budget-mismatch policy-mismatch null-timestamp; do
+  for name in missing nonzero garbage not-object head-mismatch author-mismatch class-missing unsolicited-not-bool conflicting-not-bool unknown-class two-documents budget-mismatch policy-mismatch null-timestamp; do
     before=$FAIL
     dir=$(make_budget_case "blocking-fail-$name" '[]')
     case "$name" in
@@ -583,8 +583,13 @@ test_blocking_budget_fails_closed() {
       not-object) printf '[]\n' >"$dir/state/ledger-raw" ;;
       head-mismatch) printf 'other-sha\n' >"$dir/state/ledger-head" ;;
       author-mismatch) printf 'someone-else\n' >"$dir/state/ledger-author" ;;
-      bad-response-shape) printf '[{"class":"blocking"}]\n' >"$dir/state/ledger-responses.json" ;;
-      unknown-class) printf '[{"class":"severe","unsolicited":false,"conflicting":false}]\n' >"$dir/state/ledger-responses.json" ;;
+      # One broken field each, on an otherwise valid response that would NOT
+      # count (unsolicited), so accepting it would post: each case fails only
+      # if its own check is missing (#1560 canary, finding 6).
+      class-missing) printf '[{"unsolicited":true,"conflicting":false,"first_at":"2026-06-04T00:00:00Z"}]\n' >"$dir/state/ledger-responses.json" ;;
+      unsolicited-not-bool) printf '[{"class":"blocking","unsolicited":"no","conflicting":false,"first_at":"2026-06-04T00:00:00Z"}]\n' >"$dir/state/ledger-responses.json" ;;
+      conflicting-not-bool) printf '[{"class":"blocking","unsolicited":true,"conflicting":"no","first_at":"2026-06-04T00:00:00Z"}]\n' >"$dir/state/ledger-responses.json" ;;
+      unknown-class) printf '[{"class":"severe","unsolicited":true,"conflicting":false,"first_at":"2026-06-04T00:00:00Z"}]\n' >"$dir/state/ledger-responses.json" ;;
       two-documents) : >"$dir/state/ledger-twice" ;;
       budget-mismatch) printf '3\n' >"$dir/state/ledger-max" ;;
       policy-mismatch) printf '1-1\n' >"$dir/state/ledger-policy" ;;

@@ -502,22 +502,31 @@ esac
 
 p4b_log "PR $REPO#$PR  HEAD=${HEAD:-?}  direction=$DIRECTION  reviewer=$REVIEWER  adapter=$ADAPTER  timeout=${ADAPTER_TIMEOUT}s  effort=${EFFECTIVE_EFFORT:-cli-default}  dry_run=$DRY_RUN"
 
-require_feedback_accounted() {
+# feedback_accounting_status: run the accounting gate once. Returns 0 when
+# clear, 1 when a finding is unaccounted, 2 when the gate failed or is
+# missing; prints the gate's JSON to stderr on anything but clear.
+feedback_accounting_status() {
   local accounting_json="" accounting_rc=0
-  command -v "$FEEDBACK_ACCOUNTING_GATE" >/dev/null 2>&1 \
-    || p4b_die 3 "review feedback accounting gate unavailable: $FEEDBACK_ACCOUNTING_GATE"
+  command -v "$FEEDBACK_ACCOUNTING_GATE" >/dev/null 2>&1 || {
+    p4b_warn "review feedback accounting gate unavailable: $FEEDBACK_ACCOUNTING_GATE"
+    return 2
+  }
   accounting_json=$("$FEEDBACK_ACCOUNTING_GATE" "$PR" "$REPO") \
     || accounting_rc=$?
   case "$accounting_rc" in
-    0) p4b_log "review feedback accounting clear" ;;
-    1)
-      printf '%s\n' "$accounting_json" >&2
-      p4b_die 7 "review feedback is unaccounted; disposition every finding before Phase 4b dispatch"
-      ;;
-    *)
-      printf '%s\n' "$accounting_json" >&2
-      p4b_die 3 "review feedback accounting gate failed with exit $accounting_rc"
-      ;;
+    0) p4b_log "review feedback accounting clear"; return 0 ;;
+    1) printf '%s\n' "$accounting_json" >&2; return 1 ;;
+    *) printf '%s\n' "$accounting_json" >&2; p4b_warn "review feedback accounting gate failed with exit $accounting_rc"; return 2 ;;
+  esac
+}
+
+require_feedback_accounted() { # [stage]
+  local stage="${1:-before Phase 4b dispatch}" rc=0
+  feedback_accounting_status || rc=$?
+  case "$rc" in
+    0) ;;
+    1) p4b_die 7 "review feedback is unaccounted; disposition every finding $stage" ;;
+    *) p4b_die 3 "review feedback accounting gate failed or is unavailable" ;;
   esac
 }
 
@@ -812,6 +821,11 @@ revalidate_request_ceiling_authority() {
      && ! p4b_same_governing_tuple "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" "$budget_json"; then
     budget_state=snapshot-changed
   fi
+  # Before dispatch, a new request is not an error: hold so the next run
+  # enters that request's bounded wait (#1583).
+  if [ "$where" = pre-dispatch ] && [ "$budget_rc:$budget_state" = 0:generation-changed ]; then
+    hold_for_external_review "$(jq -nc '{decision:"pending",retry_after:0,coderabbit:"unchanged",codex:"not-yet",codex_evidence:"request-cap-final-pending",trigger:"skipped",resume:"skipped"}')"
+  fi
   case "$budget_rc:$budget_state" in
     0:exhausted|0:final-request-pending) ;;
     *)
@@ -1053,6 +1067,14 @@ fi
 # applies to dry-runs: invoking the reasoning adapter is the scarce action the
 # gate protects. The command override keeps the orchestrator hermetic in tests.
 require_feedback_accounted
+
+# #1583: the barrier's spent-ceiling decision can predate the CodeRabbit probe
+# and the accounting read above. Recheck it at the dispatch boundary so a new
+# final request holds (exit 6, its bounded wait) instead of spending an
+# adapter run that the post-adapter fence would only discard.
+if [ "$DRY_RUN" != true ]; then
+  revalidate_request_ceiling_authority pre-dispatch
+fi
 
 # --- run the adapter (reasoning plane; never posts) ------------------------
 ADAPTER_ARGS=( --pr "$PR" )
@@ -1639,6 +1661,25 @@ post_review() {
     cleanup_pre_post_refusal_side_effects "$P4B_BASE_FENCE_REASON" true \
       "The PR base" "the base of ${REPO}#${PR}"
     fall_back_to_manual "$P4B_BASE_FENCE_REASON"
+  fi
+  # #1581: an approval is the one write a late finding must not slip past.
+  # A required-tier finding can land while the adapter runs, so account for
+  # feedback once more here, at the writer boundary, after every other
+  # preparation read. (The manual fallback already runs the gate itself, and a
+  # CHANGES_REQUESTED review asks for changes either way.) this run has already
+  # recorded its loop and may have filed follow-ups, so refuse through the
+  # pre-post cleanup first. A CHANGES_REQUESTED review is not gated: it asks
+  # for changes either way.
+  if [ "$event" = "APPROVE" ]; then
+    local acct_rc=0
+    feedback_accounting_status || acct_rc=$?
+    if [ "$acct_rc" -ne 0 ]; then
+      local acct_reason="review feedback became unaccounted during the Phase 4b run; refusing the approval"
+      [ "$acct_rc" -eq 1 ] || acct_reason="review feedback accounting failed at the approval writer boundary; refusing the approval"
+      cleanup_pre_post_refusal_side_effects "$acct_reason" true \
+        "Review feedback accounting" "the review feedback on ${REPO}#${PR}"
+      if [ "$acct_rc" -eq 1 ]; then p4b_die 7 "$acct_reason"; else p4b_die 3 "$acct_reason"; fi
+    fi
   fi
   # The timeout/head/body/base reads above prepare the final review material
   # and may outlive the earlier budget check. Revalidate the coherent governing

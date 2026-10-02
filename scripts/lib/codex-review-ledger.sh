@@ -6,8 +6,8 @@
 # reports every case whose attribution the record cannot prove as ambiguous
 # instead of guessing. Its one decision input is the per-PR count of
 # solicited blocking responses, which the requester's blocking-review budget
-# reads (slice 3); that count does not depend on attribution, and nothing
-# reads the attribution to decide anything. The contract, including every
+# reads (slice 3) and which does not depend on attribution; the Phase 4b human
+# stops (crl_human_stops) do depend on it, to decide a tested rebuttal. The contract, including every
 # rule below, is specs/codex_review_ledger.md.
 #
 # What the record does not prove, and how the ledger treats it:
@@ -306,6 +306,7 @@ __CRL_COUNTS='(.unsolicited | not) and (.class == "blocking" or .class == "unkno
 # never read as non-blocking.
 __CRL_VALID='type == "object" and (.responses | type) == "array"
   and all(.responses[]; (.unsolicited | type) == "boolean" and (.conflicting | type) == "boolean"
+                        and (.first_at | type) == "string" and (.first_at | length) > 0
                         and (.class as $c | ["blocking", "discretionary", "no_findings", "clean",
                                              "unknown_tier", "provider_blocked"] | index($c)) != null)'
 
@@ -320,24 +321,29 @@ crl_blocking_count() {
     else error(\"ledger\") end" 2>/dev/null
 }
 
-# crl_human_stops <ledger-json> <head> <author> <max-blocking-reviews>
+# crl_human_stops <ledger-json> <head> <author> <max-blocking-reviews> [request-ceiling]
 #
 # The human-stop conditions the Phase 4b barrier re-evaluates before it lets a
 # spent request ceiling dispatch the automated adapter (#1560 slice 3, S3-4):
 #   blocking-budget    the counted responses reach the budget;
+#   runaway            the counted responses reach the request ceiling before
+#                      the budget: every request the ceiling allowed drew a
+#                      blocking review, so a ceiling below the budget (for
+#                      example max_review_rounds 2 against the default budget
+#                      of 10) never reads as cost exhaustion (#1560 canary);
 #   untested-rebuttal  a rebutted Codex finding has no Codex response after
 #                      its rebuttal, so Codex never re-read the dispute;
-#   disagreement       a response after a rebuttal re-flags blocking feedback
-#                      on the rebutted finding's path, or blocking feedback
-#                      it cannot locate (a body finding, an unknown tier, a
-#                      conflicting response), which cannot be ruled out as a
-#                      repeat of the rebutted finding.
+#   disagreement       a counted (blocking, unknown-tier or conflicting)
+#                      response to a request posted after a rebuttal. Any
+#                      path counts: a re-raise can move with a rename, so the
+#                      path cannot rule a repeat out (#1560 canary).
 # Prints {blocking_reviews, max_blocking_reviews, stops: [...],
 # untested_rebuttals: [...], disagreements: [...]}. Returns nonzero unless the
 # input is exactly one well-formed ledger for this head and author, read under
 # a policy snapshot with the same max_blocking_reviews.
 crl_human_stops() {
-  printf '%s\n' "$1" | jq -sec --arg head "$2" --arg author "$3" --argjson max "$4" "
+  printf '%s\n' "$1" | jq -sec --arg head "$2" --arg author "$3" --argjson max "$4" \
+    --argjson ceiling "${5:-null}" "
     if length != 1 then error(\"documents\") else .[0] end
     | if (($__CRL_VALID) and .head_sha == \$head and .author == \$author
         and .max_blocking_reviews == \$max
@@ -370,13 +376,10 @@ crl_human_stops() {
         # broader window set, where counting more responses is the safe side.
         | ([ \$reqs[] | select(.created_at > \$r.at and .outcome == \"attributed\") | .responses[] ]) as \$proven
         | [ \$after[] | select(.rid as \$id | \$proven | index(\$id)) ] as \$tested
-        | if (\$tested | length) == 0 and ([ \$after[] | select(($__CRL_COUNTS)
-                                     and (.blocking_unlocated or \$r.path == null
-                                          or (.blocking_paths | index(\$r.path)) != null)) ] | length) == 0
+        | ( [ \$after[] | select($__CRL_COUNTS) ] ) as \$again
+        | if (\$tested | length) == 0 and (\$again | length) == 0
           then {kind: \"untested\", finding: \$r.finding, path: \$r.path, at: \$r.at}
-          else ( [ \$after[] | select(($__CRL_COUNTS)
-                                     and (.blocking_unlocated or \$r.path == null
-                                          or (.blocking_paths | index(\$r.path)) != null)) ] ) as \$again
+          else .
                | if (\$again | length) > 0
                  then {kind: \"disagreement\", finding: \$r.finding, path: \$r.path, at: \$r.at,
                        responses: [ \$again[].rid ]}
@@ -385,7 +388,9 @@ crl_human_stops() {
     | { blocking_reviews: \$n, max_blocking_reviews: \$max,
         untested_rebuttals: [ \$disputes[] | select(.kind == \"untested\") | del(.kind) ],
         disagreements: [ \$disputes[] | select(.kind == \"disagreement\") | del(.kind) ] }
+    | .request_ceiling = \$ceiling
     | .stops = ( [ (if \$n >= \$max then \"blocking-budget\" else empty end),
+                   (if \$n < \$max and \$ceiling != null and \$ceiling > 0 and \$n >= \$ceiling then \"runaway\" else empty end),
                    (if (.disagreements | length) > 0 then \"disagreement\" else empty end),
                    (if (.untested_rebuttals | length) > 0 then \"untested-rebuttal\" else empty end) ] )" 2>/dev/null
 }

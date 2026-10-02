@@ -1565,6 +1565,25 @@ preserve_final_request_timeout() { # <comments-json> <selected-trigger-json>
   exit 4
 }
 
+# The blocking-review budget (#1560 slice 3). Checked before any new request
+# write and before every request-ceiling stop, so it takes precedence when both
+# budgets are spent: a PR that has drawn max_blocking_reviews solicited blocking
+# reviews stops for the human whatever its request count. The boundary is
+# explicit: with a budget of 10, a request is refused once 10 such reviews
+# exist. An acknowledgement retry re-asks for a request that already passed
+# this check, and reusing the final pending request posts nothing, so neither
+# runs it.
+check_blocking_budget() { # <request_count> <max_review_rounds>
+  [[ "$GOVERNING_BLOCKING_REVIEW_BUDGET" =~ ^[0-9]+$ ]] \
+    || die 3 "the governing codex.max_blocking_reviews is invalid; refusing a new '@codex review' trigger"
+  BLOCKING_REVIEW_LIMIT="$GOVERNING_BLOCKING_REVIEW_BUDGET"
+  count_blocking_reviews
+  if [ "$BLOCKING_REVIEW_COUNT" -ge "$BLOCKING_REVIEW_LIMIT" ]; then
+    log "Codex blocking-review budget spent for $REPO#$PR_NUMBER ($BLOCKING_REVIEW_COUNT/$BLOCKING_REVIEW_LIMIT solicited blocking reviews); refusing additional '@codex review' requests"
+    emit_cap_exhausted blocking-reviews "$1" "$2"
+  fi
+}
+
 post_codex_trigger() {
   # Check immediately before every author-attributed trigger write, including
   # an acknowledgement retry. Current-head clearance and idempotency return
@@ -1581,22 +1600,12 @@ post_codex_trigger() {
     || die 3 "cannot read Codex request-attempt evidence; refusing a new '@codex review' trigger"
   request_count=$(crqe_count_triggers "$request_comments" "$AUTHOR_IDENTITY") \
     || die 3 "cannot count Codex request attempts; refusing a new '@codex review' trigger"
-  # Blocking-review budget first, so it takes precedence when both budgets
-  # are spent: a PR that has drawn max_blocking_reviews solicited blocking
-  # reviews stops for the human whatever its request count. The boundary is
-  # explicit: with a budget of 10, a request is refused once 10 such reviews
-  # exist, so the 10th blocking review is the last one a PR can draw. An
-  # acknowledgement retry re-asks for the request already posted after this
-  # check passed, so it is not re-checked here.
-  if [ "$TRIGGER_POSTED" != "true" ]; then
-    [[ "$GOVERNING_BLOCKING_REVIEW_BUDGET" =~ ^[0-9]+$ ]] \
-      || die 3 "the governing codex.max_blocking_reviews is invalid; refusing a new '@codex review' trigger"
-    BLOCKING_REVIEW_LIMIT="$GOVERNING_BLOCKING_REVIEW_BUDGET"
-    count_blocking_reviews
-    if [ "$BLOCKING_REVIEW_COUNT" -ge "$BLOCKING_REVIEW_LIMIT" ]; then
-      log "Codex blocking-review budget spent for $REPO#$PR_NUMBER ($BLOCKING_REVIEW_COUNT/$BLOCKING_REVIEW_LIMIT solicited blocking reviews); refusing additional '@codex review' requests"
-      emit_cap_exhausted blocking-reviews "$request_count" "$max_review_rounds"
-    fi
+  # Below the ceiling, a new request is about to be written: the blocking
+  # budget gates it. At the ceiling, the check runs only where a stop is about
+  # to be reported (check_blocking_budget), never on the reuse branch, which
+  # posts nothing and only polls the existing final request (#1560 canary).
+  if [ "$request_count" -lt "$max_review_rounds" ] && [ "$TRIGGER_POSTED" != "true" ]; then
+    check_blocking_budget "$request_count" "$max_review_rounds"
   fi
   if [ "$request_count" -ge "$max_review_rounds" ]; then
     # The initial request may consume the final slot. Its missing eyes
@@ -1627,6 +1636,8 @@ post_codex_trigger() {
       fi
       CAP_REUSED_TRIGGER=false
     fi
+    # Blocking before the ceiling: when both are spent, the blocking stop wins.
+    check_blocking_budget "$request_count" "$max_review_rounds"
     log "Codex request-attempt cap reached for $REPO#$PR_NUMBER ($request_count/$max_review_rounds); refusing additional '@codex review' requests"
     emit_cap_exhausted request-ceiling "$request_count" "$max_review_rounds"
   fi
@@ -2203,6 +2214,9 @@ fi
 # this invocation's own confirmed trigger may mint a timeout determination.
 if [ "$CAP_REUSED_TRIGGER" = true ] && ! has_post_trigger_signal "$FINAL_SCAN"; then
   INITIAL_SCAN=$FINAL_SCAN
+  # The reuse branch skipped the blocking check; take it now, before the
+  # ceiling stop is reported, so a spent blocking budget still names the stop.
+  check_blocking_budget "$CAP_REQUEST_COUNT" "$CAP_REQUEST_LIMIT"
   emit_cap_exhausted request-ceiling "$CAP_REQUEST_COUNT" "$CAP_REQUEST_LIMIT"
 fi
 

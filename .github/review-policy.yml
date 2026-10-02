@@ -530,13 +530,14 @@ codex:
   # Previously raised 2 -> 10 (#1084). Codex is the primary reviewer on every PR,
   # so the budget has to cover a real convergence run rather than two
   # courtesy rounds: #1080 took four rounds, and rounds 2 and 3 each found a
-  # defect the previous round's fix introduced. Exhausting the budget takes the
-  # HUMAN-TIEBREAKER route, not the automated Phase 4b leg: stop the loop, post
-  # a comment summarizing both positions with links to the rounds, alert the
-  # human, do not merge (AGENTS.md, Disagreements and Tiebreaking). Automated
-  # 4b is the wrong destination for THIS trigger because that leg can post an
-  # APPROVED, which would let a review that never converged merge with nobody
-  # adjudicating it.
+  # defect the previous round's fix introduced. Since #1560 slice 3 this is the
+  # request CEILING (cost), not the runaway meter: a spent ceiling runs
+  # automated Phase 4b, whose barrier stops for the human (exit 8) when a human
+  # stop holds. One of those stops is a runaway: every request the ceiling
+  # allowed drew a blocking review (a ceiling of blocking reviews below
+  # max_blocking_reviews), which is non-convergence and must never reach an
+  # automated APPROVED. The others are the blocking budget, an untested
+  # rebuttal and a disagreement (REVIEW_POLICY.md, Disagreements signal 4).
   max_review_rounds: 20
 
   # Blocking-review budget (#1560 slice 3). Before every new request the
@@ -550,7 +551,8 @@ codex:
   # are spent. Read from the governing base policy; absent defaults to 10.
   # 10 is PROVISIONAL, chosen from the #1560 calibration (one PR of 91 sampled
   # exceeded it) and open to revision on new evidence. Exhaustion takes the
-  # human-tiebreaker route, as max_review_rounds does.
+  # human-tiebreaker route. At a spent request ceiling the effective budget is
+  # the lower of this and max_review_rounds (the runaway stop).
   max_blocking_reviews: 10
 
   # Poll timeout per round, in seconds, for `codex-review-request.sh`.

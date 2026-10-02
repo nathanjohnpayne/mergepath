@@ -4092,7 +4092,8 @@ if [ "$mode" = flip ]; then
   n=0
   [ ! -f "$P4B_TEST_LEDGER_COUNT" ] || n=$(cat "$P4B_TEST_LEDGER_COUNT")
   printf '%s\n' "$((n + 1))" >"$P4B_TEST_LEDGER_COUNT"
-  if [ "$n" -eq 0 ]; then mode=clear; else mode=untested; fi
+  # Reads before P4B_TEST_LEDGER_FLIP_AT (default 2) are clear, later ones stop.
+  if [ "$((n + 1))" -lt "${P4B_TEST_LEDGER_FLIP_AT:-2}" ]; then mode=clear; else mode=untested; fi
 fi
 resp() { # n class unsolicited path first_at [window]
   jq -nc --argjson n "$1" --arg c "$2" --argjson u "$3" --arg p "$4" --arg t "$5" --argjson w "${6:-1}" \
@@ -4103,7 +4104,9 @@ resp() { # n class unsolicited path first_at [window]
 reqs='[{"id":1,"created_at":"2026-08-01T00:00:00Z","outcome":"attributed","responses":["w0"]}]'
 case "$mode" in
   blocking) r=$(resp 10 blocking false x.sh 2026-08-01T00:10:00Z); rb='[]' ;;
-  clear) r=$(resp 9 blocking false x.sh 2026-08-01T00:10:00Z); rb='[]' ;;
+  clear) r=$(resp 1 blocking false x.sh 2026-08-01T00:10:00Z); rb='[]' ;;
+  nine) r=$(resp 9 blocking false x.sh 2026-08-01T00:10:00Z); rb='[]' ;;
+  two) r=$(resp 2 blocking false x.sh 2026-08-01T00:10:00Z); rb='[]' ;;
   untested) r=$(resp 1 blocking false x.sh 2026-08-01T00:10:00Z)
             rb='[{"finding":1,"path":"x.sh","at":"2026-08-01T01:00:00Z","sources":["tag"]}]' ;;
   disagreement) r=$(jq -nc --argjson a "$(resp 1 blocking false x.sh 2026-08-01T00:10:00Z 1)" \
@@ -4656,12 +4659,12 @@ for _mode in clear blocking untested disagreement fail garbage other-head; do
   case "$_mode" in
     clear)
       [ "$rc" = 0 ] && printf '%s' "$out" | jq -e '.decision == "open" and .codex == "waived" and .codex_evidence == "request-ceiling"
-          and .human_stops.state == "clear" and .human_stops.blocking_reviews == 9 and .human_stops.max_blocking_reviews == 10' >/dev/null 2>&1 \
+          and .human_stops.state == "clear" and .human_stops.blocking_reviews == 1 and .human_stops.max_blocking_reviews == 10' >/dev/null 2>&1 \
         || bad="$bad ceiling-clear-not-waived(rc=$rc,out=$out)" ;;
     blocking|untested|disagreement)
       case "$_mode" in blocking) _stop=blocking-budget ;; untested) _stop=untested-rebuttal ;; *) _stop=disagreement ;; esac
       [ "$rc" = 3 ] && printf '%s' "$out" | jq -e --arg s "$_stop" '.decision == "human-tiebreaker" and .codex_evidence == "request-cap"
-          and .human_stops.stops == [$s] and (.reason | contains($s))' >/dev/null 2>&1 \
+          and (.human_stops.stops | index($s)) != null and (.reason | contains($s))' >/dev/null 2>&1 \
         || bad="$bad ceiling-$_mode-not-exit8(rc=$rc,out=$out)" ;;
     *)
       [ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = error ] \
@@ -4700,11 +4703,20 @@ out="$(P4B_TEST_LEDGER_MODE=clear P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base-nosu
 [ "$rc" = 2 ] && printf '%s' "$out" | jq -e '.decision == "escalate" and (.reason | contains("request ceiling is spent"))' >/dev/null 2>&1 \
   || bad="$bad ceiling-waived-without-substitute(rc=$rc,out=$out)"
 
+# Runaway (#1560 canary, finding 1): the request ceiling (cap-base: 2) is
+# reached with both requests drawing a blocking review, under the default
+# budget of 10. That is non-convergence, not cost exhaustion: exit 8.
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_LEDGER_MODE=two P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_old" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 3 ] && printf '%s' "$out" | jq -e '.decision == "human-tiebreaker" and .human_stops.stops == ["runaway"]
+    and .human_stops.request_ceiling == 2 and (.reason | contains("runaway"))' >/dev/null 2>&1 \
+  || bad="$bad runaway-at-ceiling-waived(rc=$rc,out=$out)"
+
 # The governed blocking budget is the base policy's, and an invalid one fails
 # closed rather than reading as room.
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
 cp "$WORK/cap-base.yml" "$WORK/cap-base-blocking9.yml"; printf '  max_blocking_reviews: 9\n' >>"$WORK/cap-base-blocking9.yml"
-out="$(P4B_TEST_LEDGER_MAX=9 P4B_TEST_LEDGER_MODE=clear P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base-blocking9.yml" P4B_TEST_COMMENTS_JSON="$_cap_old" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+out="$(P4B_TEST_LEDGER_MAX=9 P4B_TEST_LEDGER_MODE=nine P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base-blocking9.yml" P4B_TEST_COMMENTS_JSON="$_cap_old" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
 [ "$rc" = 3 ] && printf '%s' "$out" | jq -e '.human_stops.stops == ["blocking-budget"] and .human_stops.max_blocking_reviews == 9' >/dev/null 2>&1 \
   || bad="$bad governing-blocking-budget-ignored(rc=$rc,out=$out)"
 cp "$WORK/cap-base.yml" "$WORK/cap-base-blocking-bad.yml"; printf '  max_blocking_reviews: false\n' >>"$WORK/cap-base-blocking-bad.yml"
@@ -5562,7 +5574,7 @@ rm -f "$_gen_race"
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
 set +e
 out="$(P4B_TEST_LEDGER_MODE=clear MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-stop.yml" CODEX_BIN="$BIN/fake-codex-ceiling-new-request" \
-  P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_COMMENTS_RACE_FILE="$_gen_race" P4B_TEST_COMMENTS_CHANGE_AFTER=1000 P4B_TEST_COMMENTS_JSON_AFTER="$_gen_after" \
+  P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_COMMENTS_RACE_FILE="$_gen_race" P4B_TEST_COMMENTS_CHANGE_AFTER=1000 P4B_TEST_COMMENTS_FAIL_AFTER=1000000 P4B_TEST_COMMENTS_JSON_AFTER="$_gen_after" \
   P4B_TEST_LIVE_HEAD="$_p4a_head" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
   P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
   P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" PATH="$WORK/barrier-bin:$PATH" \
@@ -5570,6 +5582,7 @@ out="$(P4B_TEST_LEDGER_MODE=clear MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap
 set -e
 if [ "$rc" = 10 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = false ] \
    && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = request-ceiling-authority-changed ] \
+   && [ "$(printf '%s' "$out" | jq -r '.barrier.request_budget.state')" = final-request-pending ] \
    && [ ! -s "$HANDOFF_LOG" ]; then
   pass "#1560 S3-4: a new final request posted during the adapter run voids the ceiling authority (exit 10, nothing posted)"
 else
@@ -5590,6 +5603,28 @@ printf '%s' '{"verdict":"APPROVED","summary":"ceiling review","findings":[]}'
 EOF
 chmod +x "$BIN/fake-codex-ceiling-approve"
 
+# #1583: a request landing during the PRE-DISPATCH recheck's stop read (the
+# 2nd ledger read, after the barrier's) holds with exit 6 and spends no
+# adapter run; the next run enters that request's bounded wait.
+_bump_count="$WORK/ceiling-bump.count"
+rm -f "$_gen_race" "$_bump_count" "$_ceiling_adapter"
+: >"$HANDOFF_LOG"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+set +e
+out="$(P4B_TEST_LEDGER_MODE=bump P4B_TEST_LEDGER_BUMP_AT=2 P4B_TEST_LEDGER_COUNT="$_bump_count" MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-stop.yml" CODEX_BIN="$BIN/fake-codex-ceiling-approve" \
+  P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_COMMENTS_RACE_FILE="$_gen_race" P4B_TEST_COMMENTS_CHANGE_AFTER=1000 P4B_TEST_COMMENTS_FAIL_AFTER=1000000 P4B_TEST_COMMENTS_JSON_AFTER="$_gen_after" \
+  P4B_TEST_LIVE_HEAD="$_p4a_head" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+  P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
+  P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" PATH="$WORK/barrier-bin:$PATH" \
+  bash "$ORCH" 7 --repo owner/repo --author claude --head "$_p4a_head" --diff-file "$DIFF" 2>"$WORK/ceiling-bump.err" </dev/null)"; rc=$?
+set -e
+if [ "$rc" = 6 ] && [ ! -s "$_ceiling_adapter" ] && [ ! -s "$HANDOFF_LOG" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.barrier_pending')" = true ]; then
+  pass "#1583: a request that lands before adapter dispatch holds (exit 6) and spends no adapter run"
+else
+  fail "#1583: pre-dispatch generation change (rc=$rc adapter=$(cat "$_ceiling_adapter" 2>/dev/null) ledger-calls=$(cat "$_bump_count" 2>/dev/null)): $(printf '%s' "$out" | jq -c . 2>/dev/null) $(tail -8 "$WORK/ceiling-bump.err" | tr '\n' ' ')"
+fi
+
 # The request lands during the Nth ledger read, i.e. the stop read of each
 # recheck in turn. Every recheck reads stops first and the budget last, so
 # every placement must exit 10; under a budget-first order the bump during the
@@ -5597,13 +5632,13 @@ chmod +x "$BIN/fake-codex-ceiling-approve"
 # ledger read (the bump never fires).
 _bump_count="$WORK/ceiling-bump.count"
 _bump_bad=""; _bump_fired=0
-for _bump_at in 2 3 4 5 6 7 8; do
+for _bump_at in 3 4 5 6 7 8 9; do
   rm -f "$_gen_race" "$_bump_count"
   : >"$HANDOFF_LOG"
   rm -rf "$WORK/barrier-state/phase-4b-barrier"
   set +e
   out="$(P4B_TEST_LEDGER_MODE=bump P4B_TEST_LEDGER_BUMP_AT="$_bump_at" P4B_TEST_LEDGER_COUNT="$_bump_count" MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-stop.yml" CODEX_BIN="$BIN/fake-codex-ceiling-approve" \
-    P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_COMMENTS_RACE_FILE="$_gen_race" P4B_TEST_COMMENTS_CHANGE_AFTER=1000 P4B_TEST_COMMENTS_JSON_AFTER="$_gen_after" \
+    P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_COMMENTS_RACE_FILE="$_gen_race" P4B_TEST_COMMENTS_CHANGE_AFTER=1000 P4B_TEST_COMMENTS_FAIL_AFTER=1000000 P4B_TEST_COMMENTS_JSON_AFTER="$_gen_after" \
     P4B_TEST_LIVE_HEAD="$_p4a_head" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
     P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
     P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" PATH="$WORK/barrier-bin:$PATH" \
@@ -5615,7 +5650,8 @@ for _bump_at in 2 3 4 5 6 7 8; do
   [ -s "$_ceiling_adapter" ] && rm -f "$_ceiling_adapter" || _bump_bad="$_bump_bad at-read-$_bump_at(adapter-did-not-run)"
   [ "$rc" = 10 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = false ] \
     && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = request-ceiling-authority-changed ] \
-    || _bump_bad="$_bump_bad at-read-$_bump_at(rc=$rc)"
+    && [ "$(printf '%s' "$out" | jq -r '.barrier.request_budget.state')" = final-request-pending ] \
+    || _bump_bad="$_bump_bad at-read-$_bump_at(rc=$rc,budget=$(printf '%s' "$out" | jq -r '.barrier.request_budget.state // "?"' 2>/dev/null))"
 done
 # Three rechecks follow the adapter (post-adapter, and the early and final
 # pre-post fences); each must have been swept.
@@ -5685,7 +5721,7 @@ rm -f "$_ceiling_count" "$_ceiling_adapter"
 : >"$HANDOFF_LOG"
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
 set +e
-out="$(P4B_TEST_LEDGER_MODE=flip P4B_TEST_LEDGER_COUNT="$_ceiling_count" \
+out="$(P4B_TEST_LEDGER_MODE=flip P4B_TEST_LEDGER_FLIP_AT=3 P4B_TEST_LEDGER_COUNT="$_ceiling_count" \
   MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-stop.yml" CODEX_BIN="$BIN/fake-codex-ceiling-approve" \
   P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HEAD="$_p4a_head" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
   P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
@@ -5693,13 +5729,51 @@ out="$(P4B_TEST_LEDGER_MODE=flip P4B_TEST_LEDGER_COUNT="$_ceiling_count" \
   bash "$ORCH" 7 --repo owner/repo --author claude --head "$_p4a_head" --diff-file "$DIFF" 2>"$WORK/ceiling-flip.err" </dev/null)"; rc=$?
 set -e
 if [ "$rc" = 8 ] && [ -s "$_ceiling_adapter" ] && [ ! -s "$HANDOFF_LOG" ] \
-   && [ "$(cat "$_ceiling_count")" = 2 ] \
+   && [ "$(cat "$_ceiling_count")" = 3 ] \
    && printf '%s' "$out" | jq -e '.human_tiebreaker_required == true and .review_posted == false
         and .barrier.codex_evidence == "request-ceiling-human-stop" and .barrier.human_stops.stops == ["untested-rebuttal"]' >/dev/null 2>&1; then
   pass "#1560 S3-4: a human stop that appears during the adapter run is caught after the adapter and exits 8 with nothing posted"
 else
   fail "#1560 S3-4: post-adapter ceiling recheck (rc=$rc adapter=$(cat "$_ceiling_adapter" 2>/dev/null) ledger-calls=$(cat "$_ceiling_count" 2>/dev/null) handoff='$(cat "$HANDOFF_LOG" 2>/dev/null)'): $out $(tail -3 "$WORK/ceiling-flip.err")"
 fi
+
+# #1581: feedback that becomes unaccounted while the adapter runs refuses the
+# approval at the writer boundary (the 2nd accounting call, after the one
+# before dispatch): exit 7, adapter ran, nothing posted.
+_acct_count="$WORK/acct-late.count"
+cat >"$WORK/acct-late.sh" <<'EOF'
+#!/usr/bin/env bash
+n=0
+[ ! -f "$P4B_TEST_ACCT_COUNT" ] || n=$(cat "$P4B_TEST_ACCT_COUNT")
+n=$((n + 1)); printf '%s\n' "$n" >"$P4B_TEST_ACCT_COUNT"
+if [ "$n" -ge "${P4B_TEST_ACCT_FAIL_AT:-999}" ]; then
+  printf '{"feedback_policy":{},"findings":[],"missing":[{"kind":"inline","finding_id":1}]}\n'
+  exit 1
+fi
+printf '{"feedback_policy":{},"findings":[],"missing":[]}\n'
+EOF
+chmod +x "$WORK/acct-late.sh"
+for _acct_at in 2; do
+  rm -f "$_acct_count" "$_ceiling_adapter"
+  : >"$HANDOFF_LOG"
+  rm -rf "$WORK/barrier-state/phase-4b-barrier"
+  set +e
+  out="$(P4B_TEST_LEDGER_MODE=clear MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$WORK/acct-late.sh" \
+    P4B_TEST_ACCT_COUNT="$_acct_count" P4B_TEST_ACCT_FAIL_AT="$_acct_at" \
+    MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-stop.yml" CODEX_BIN="$BIN/fake-codex-ceiling-approve" \
+    P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HEAD="$_p4a_head" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+    P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
+    P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" PATH="$WORK/barrier-bin:$PATH" \
+    bash "$ORCH" 7 --repo owner/repo --author claude --head "$_p4a_head" --diff-file "$DIFF" 2>"$WORK/acct-late.err" </dev/null)"; rc=$?
+  set -e
+  if [ "$rc" = 7 ] && [ -s "$_ceiling_adapter" ] && [ ! -s "$HANDOFF_LOG" ] \
+     && [ "$(cat "$_acct_count")" = "$_acct_at" ] \
+     && ! grep -q 'REGRESSION: reviewer wrapper invoked' "$WORK/acct-late.err"; then
+    pass "#1581: feedback unaccounted at accounting call $_acct_at (after the adapter ran) refuses the approval with exit 7, nothing posted"
+  else
+    fail "#1581: late feedback at accounting call $_acct_at (rc=$rc calls=$(cat "$_acct_count" 2>/dev/null) adapter=$(cat "$_ceiling_adapter" 2>/dev/null)): $(tail -4 "$WORK/acct-late.err")"
+  fi
+done
 
 # A pre-side-effect hold must leave NO accounting trace. Evaluate the full
 # barrier once before the adapter, then revalidate only a timeout-derived Codex

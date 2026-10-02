@@ -20,6 +20,8 @@ LEDGER_STUB="$WORKDIR/codex-ledger-stub.sh"
 cat >"$LEDGER_STUB" <<'LEDGER_EOF'
 #!/usr/bin/env bash
 [ -z "${CODEX_LEDGER_STUB_LOG:-}" ] || printf '%s\n' "$*" >>"$CODEX_LEDGER_STUB_LOG"
+# Simulates an unreadable ledger.
+[ -z "${CODEX_LEDGER_STUB_FAIL:-}" ] || exit 3
 # Simulates the governed budget turning malformed after the initial request.
 [ -z "${CODEX_LEDGER_STUB_BREAK_POLICY:-}" ] \
   || printf '  max_blocking_reviews: false\n' >>"$CODEX_LEDGER_STUB_BREAK_POLICY"
@@ -589,6 +591,22 @@ test_reused_final_slot_trigger_polls_arriving_response() {
   [ "$(jq -r '.trigger_posted' "$dir/out.json")" = false ] || fail "#813 reused final slot: trigger_posted must remain false for a reused command"
   [ "$review_body" = "reused final-slot response" ] || fail "#813 reused final slot: did not report the reused request response"
   [ "$FAIL" -ne "$before" ] || pass "#813: normal mode polls a final-slot trigger-only request without another write"
+}
+
+# #1560 canary (finding 4): reusing the final pending request posts nothing,
+# so the blocking-review check does not run there, and an unreadable ledger
+# cannot turn that poll into an exit 3.
+test_reused_final_slot_polls_despite_unreadable_ledger() {
+  local dir rc count before=$FAIL
+  dir=$(make_case "reused-final-slot-ledger-down" 0 1)
+  printf '  max_review_rounds: 1\n' >>"$dir/state/base-review-policy.yml"
+  seed_author_trigger "$dir" 9901 "2026-06-04T00:00:00Z"
+  rc=$(CODEX_LEDGER_STUB_FAIL=1 CODEX_LEDGER_STUB_LOG="$dir/ledger-calls" run_case "$dir" reused-final-slot-arrival)
+  count=$(trigger_count "$dir")
+  [ "$rc" = 0 ] || fail "reuse with ledger down: exit $rc, expected 0 (the in-flight request responded); stderr=$(cat "$dir/err.log")"
+  [ "$count" = 0 ] || fail "reuse with ledger down: posted $count trigger(s)"
+  [ ! -s "$dir/ledger-calls" ] || fail "reuse with ledger down: ran the ledger on the reuse path"
+  [ "$FAIL" -ne "$before" ] || pass "#1560 canary: the reused final request is polled without a blocking-review read, even with the ledger unreadable"
 }
 
 test_reused_final_slot_pending_stops_without_timeout_authority() {
@@ -1455,6 +1473,7 @@ test_ack_retry_ignores_blocking_budget_value
 test_retry_cap_respected
 test_request_attempt_cap_suppresses_ack_retry_but_polls
 test_reused_final_slot_trigger_polls_arriving_response
+test_reused_final_slot_polls_despite_unreadable_ledger
 test_reused_final_slot_pending_stops_without_timeout_authority
 test_reused_final_slot_preserves_recorded_timeout
 test_reused_final_slot_timeout_marker_controls
