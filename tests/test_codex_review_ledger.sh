@@ -561,6 +561,16 @@ if [ "$RC" = 0 ] && jq -e '
 else
   fail "CLI rebuttals: rc=$RC out=$(jq -c '{rebuttals, paths: [.responses[].blocking_paths]}' "$D/out" 2>/dev/null) calls=$(tr '\n' ' ' <"$D/calls") err=$(cat "$D/err")"
 fi
+# A reply edited to carry the tag dates from its edit, not its creation (#1579
+# Phase 4b): otherwise a Codex review between the two would read as testing it.
+jq '(.[] | select(.id == 62)) |= (.created_at = "2026-09-25T00:12:00Z" | .updated_at = "2026-09-25T00:45:00Z")' \
+  "$D/review_comments.json" >"$D/rc.tmp" && mv "$D/rc.tmp" "$D/review_comments.json"
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e '.rebuttals | map(select(.finding == 60)) | .[0].at == "2026-09-25T00:45:00Z"' "$D/out" >/dev/null; then
+  pass "CLI: a reply edited to carry the rebuttal tag is dated from its edit"
+else
+  fail "CLI edited tag reply: rc=$RC rebuttals=$(jq -c .rebuttals "$D/out" 2>/dev/null)"
+fi
 RC=$(LEDGER_TEST_FAIL_ENDPOINT=repos/o/r/pulls/comments/70/reactions run_cli "$D")
 if [ "$RC" = 3 ] && [ ! -s "$D/out" ]; then
   pass "CLI: a failed thumbs-down read fails closed"

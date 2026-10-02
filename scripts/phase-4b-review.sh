@@ -701,7 +701,17 @@ run_same_head_barrier() {
     1) hold_for_external_review "$out" ;;
     3) stop_for_human_tiebreaker "$out" ;;
     4) stop_for_barrier_error "$out" ;;
-    *) fall_back_to_manual "external review barrier ($where): $(printf '%s' "$out" | jq -r '.reason // "escalated"')" ;;
+    *)
+      # A spent-ceiling waiver that escalated still carries its authority
+      # snapshot (#1579); keep it so the handoff rechecks the ceiling first.
+      case "$where:$(printf '%s' "$out" | jq -r '.codex_evidence // empty' 2>/dev/null)" in
+        pre-adapter:request-ceiling*|pre-fallback:request-ceiling*)
+          P4B_PRE_ADAPTER_CODEX_EVIDENCE="$(printf '%s' "$out" | jq -r '.codex_evidence')"
+          P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON="$(printf '%s' "$out" | jq -c '.request_budget // null')"
+          ;;
+      esac
+      fall_back_to_manual "external review barrier ($where): $(printf '%s' "$out" | jq -r '.reason // "escalated"')"
+      ;;
   esac
 }
 
@@ -794,6 +804,13 @@ revalidate_request_ceiling_authority() {
   if [ "$budget_rc" -eq 0 ] \
      && ! p4b_same_request_generation "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" "$budget_json"; then
     budget_state=generation-changed
+  fi
+  # Also the same tuple and policy as the barrier's snapshot (#1579): a PR
+  # retargeted during the adapter run makes both fresh reads agree with each
+  # other but not with the base the head was reviewed against.
+  if [ "$budget_rc" -eq 0 ] \
+     && ! p4b_same_governing_tuple "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" "$budget_json"; then
+    budget_state=snapshot-changed
   fi
   case "$budget_rc:$budget_state" in
     0:exhausted|0:final-request-pending) ;;

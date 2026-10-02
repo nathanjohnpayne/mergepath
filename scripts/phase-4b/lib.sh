@@ -1819,6 +1819,21 @@ p4b_barrier_ceiling_route() { # <repo> <pr> <head> <clear-evidence> <stop-eviden
     cx_human_stops_json='{"state":"unsafe","reason":"pr-policy-tuple-changed-between-ceiling-and-stops"}'
     hs_state=unsafe
   fi
+  # The dispatch boundary (#1580): the ledger read can be long, so re-read the
+  # budget after a clear one. A request posted meanwhile (a new generation) or
+  # a moved snapshot refuses the waiver before any adapter runs; the next run
+  # enters the bounded final-request wait.
+  if [ "$hs_rc:$hs_state" = 0:clear ]; then
+    local recheck recheck_rc=0
+    recheck="$(p4b_codex_request_budget_state "$1" "$2" "$3")" || recheck_rc=$?
+    if [ "$recheck_rc" -ne 0 ] \
+       || ! p4b_same_request_generation "${cx_budget_json:-null}" "$recheck" \
+       || ! p4b_same_governing_tuple "${cx_budget_json:-null}" "$recheck"; then
+      hs_rc=2
+      cx_human_stops_json='{"state":"unsafe","reason":"request-generation-or-snapshot-changed-before-dispatch"}'
+      hs_state=unsafe
+    fi
+  fi
   case "$hs_rc:$hs_state" in
     0:clear)
       cls_cx="waived"
@@ -2359,8 +2374,13 @@ p4b_same_head_barrier() {
         '{decision:"error",reason:$r,coderabbit:$cr,codex:$cx,codex_evidence:$ce,coderabbit_cause:$cc,request_budget:$b}'
       return 4
     fi
+    # The request budget and human stops travel on an escalation too (#1579):
+    # a spent-ceiling waiver that escalates (CodeRabbit refusal, no substitute)
+    # still needs its recheck before the manual handoff is rendered.
     jq -nc --arg r "$why" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" --arg cc "$coderabbit_cause" --arg t "$trigger" --arg rs "$resume" \
-      '{decision:"escalate", reason:$r, coderabbit:$cr, codex:$cx, codex_evidence:$ce, coderabbit_cause:$cc, trigger:$t, resume:$rs}'
+      --argjson b "${cx_budget_json:-null}" --argjson hs "${cx_human_stops_json:-null}" \
+      '{decision:"escalate", reason:$r, coderabbit:$cr, codex:$cx, codex_evidence:$ce, coderabbit_cause:$cc, trigger:$t, resume:$rs,
+        request_budget:$b, human_stops:$hs}'
     return 2
   fi
   if [ "$pending" = true ]; then

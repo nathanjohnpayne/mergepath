@@ -4729,11 +4729,13 @@ out="$(P4B_TEST_LEDGER_FP=1-1 P4B_TEST_LEDGER_MODE=clear P4B_TEST_BASE_POLICY_PA
 # (#1579): a base that moved between the two reads is an authority error.
 # The route reads and sets these through bash dynamic scoping.
 # shellcheck disable=SC2034
-_route() { # <budget-json> <stops-json>
+_route() { # <budget-json> <stops-json> [budget-reread-json]
   (
     cx_budget_json=$1
     _stops_json=$2
+    _reread_json=${3:-$1}
     p4b_codex_human_stops() { printf '%s' "$_stops_json"; }
+    p4b_codex_request_budget_state() { printf '%s' "$_reread_json"; }
     cls_cx=""; budget_unsafe=false; why=""; human_tiebreaker=false; cx_evidence=""; cx_human_stops_json=null
     p4b_barrier_ceiling_route o/r 7 head request-ceiling request-cap ""
     printf '%s|%s|%s' "$cls_cx" "$budget_unsafe" "$cx_evidence"
@@ -4741,7 +4743,7 @@ _route() { # <budget-json> <stops-json>
 }
 _t1='{"head_sha":"h","base_ref":"main","base_sha":"1","default_branch":"main"}'
 _t2='{"head_sha":"h","base_ref":"main","base_sha":"2","default_branch":"main"}'
-_snap() { printf '{"state":"%s","stops":[],"governing_tuple":%s,"policy_fingerprint":"%s"}' "$1" "$2" "$3"; }
+_snap() { printf '{"state":"%s","stops":[],"governing_tuple":%s,"policy_fingerprint":"%s","request_generation":%s}' "$1" "$2" "$3" "${4:-[1]}"; }
 [ "$(_route "$(_snap exhausted "$_t1" 1-1)" "$(_snap clear "$_t1" 1-1)")" = "waived|false|request-ceiling" ] \
   || bad="$bad same-snapshot-not-waived($(_route "$(_snap exhausted "$_t1" 1-1)" "$(_snap clear "$_t1" 1-1)"))"
 [ "$(_route "$(_snap exhausted "$_t1" 1-1)" "$(_snap clear "$_t2" 1-1)")" = "escalate|true|pr-policy-tuple-changed-between-ceiling-and-stops" ] \
@@ -4752,6 +4754,10 @@ _snap() { printf '{"state":"%s","stops":[],"governing_tuple":%s,"policy_fingerpr
   || bad="$bad fingerprint-drift-under-same-tuple-read-as-clear"
 [ "$(_route '{"state":"exhausted"}' "$(_snap clear "$_t1" 1-1)")" = "escalate|true|pr-policy-tuple-changed-between-ceiling-and-stops" ] \
   || bad="$bad missing-ceiling-snapshot-read-as-clear"
+# The dispatch boundary (#1580): a request posted during the stop read (a new
+# generation in the re-read) refuses the waiver before the adapter runs.
+[ "$(_route "$(_snap exhausted "$_t1" 1-1)" "$(_snap clear "$_t1" 1-1)" "$(_snap final-request-pending "$_t1" 1-1 '[1,2]')")" = "escalate|true|request-generation-or-snapshot-changed-before-dispatch" ] \
+  || bad="$bad generation-change-before-dispatch-waived"
 p4b_same_governing_tuple "$(_snap exhausted "$_t1" 1-1)" "$(_snap clear "$(printf '%s' "$_t1" | jq -cS .)" 1-1)" \
   && ! p4b_same_governing_tuple "{\"governing_tuple\":$_t1}" "$(_snap clear "$_t1" 1-1)" \
   || bad="$bad same-snapshot-helper"
@@ -5617,6 +5623,60 @@ if [ -z "$_bump_bad" ] && [ "$_bump_fired" -ge 3 ]; then
   pass "#1560 S3-4: a request that lands during any recheck's stop read is caught by the budget read after it (exit 10; $_bump_fired placements)"
 else
   fail "#1560 S3-4: request during a recheck's stop read slipped through or the sweep was partial (fired=$_bump_fired):${_bump_bad:- none}"
+fi
+
+# P1a (#1579 Phase 4b): the PR is retargeted while the adapter runs. Both
+# fresh reads agree with each other (new base), so only the comparison with
+# the barrier's saved snapshot catches it: exit 10, nothing posted.
+_base_race="$WORK/ceiling-base-race.count"
+cat >"$BIN/fake-codex-ceiling-retarget" <<EOF
+#!/usr/bin/env bash
+cat >/dev/null 2>&1 || true
+printf '1000\n' >"$_base_race"
+printf '%s' '{"verdict":"APPROVED","summary":"ceiling review","findings":[]}'
+EOF
+chmod +x "$BIN/fake-codex-ceiling-retarget"
+rm -f "$_base_race"
+: >"$HANDOFF_LOG"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+set +e
+out="$(P4B_TEST_LEDGER_MODE=clear MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-stop.yml" CODEX_BIN="$BIN/fake-codex-ceiling-retarget" \
+  P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_BASE_RACE_FILE="$_base_race" P4B_TEST_BASE_RACE_AFTER=1000 \
+  P4B_TEST_LIVE_HEAD="$_p4a_head" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+  P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
+  P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" PATH="$WORK/barrier-bin:$PATH" \
+  bash "$ORCH" 7 --repo owner/repo --author claude --head "$_p4a_head" --diff-file "$DIFF" 2>"$WORK/ceiling-retarget.err" </dev/null)"; rc=$?
+set -e
+if [ "$rc" = 10 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = false ] \
+   && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = request-ceiling-authority-changed ]; then
+  pass "#1560 S3-4: a PR retargeted during the adapter run voids the ceiling authority against the barrier snapshot (exit 10)"
+else
+  fail "#1560 S3-4: retarget during the adapter run (rc=$rc base-reads=$(cat "$_base_race" 2>/dev/null)): $out $(tail -3 "$WORK/ceiling-retarget.err")"
+fi
+
+# P1c (#1579 Phase 4b): a waived spent ceiling that ESCALATES (here because
+# allow_phase_4b_substitute=false) still rechecks the ceiling before the
+# manual handoff: a stop that appears meanwhile exits 8, not 4.
+sed 's/^  max_review_rounds: 0$/  max_review_rounds: 0\
+  allow_phase_4b_substitute: false/' "$WORK/policy-cap-stop.yml" >"$WORK/policy-cap-stop-nosub.yml"
+grep -q '^  allow_phase_4b_substitute: false$' "$WORK/policy-cap-stop-nosub.yml" \
+  || fail "#1560 S3-4: nosub orchestrator fixture is malformed"
+_esc_count="$WORK/ceiling-escalate.count"
+rm -f "$_esc_count"
+: >"$HANDOFF_LOG"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+set +e
+out="$(P4B_TEST_LEDGER_MODE=flip P4B_TEST_LEDGER_COUNT="$_esc_count" MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-stop-nosub.yml" CODEX_BIN="$BIN/fake-codex-ceiling-approve" \
+  P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HEAD="$_p4a_head" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+  P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
+  P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" PATH="$WORK/barrier-bin:$PATH" \
+  bash "$ORCH" 7 --repo owner/repo --author claude --head "$_p4a_head" --diff-file "$DIFF" 2>"$WORK/ceiling-escalate.err" </dev/null)"; rc=$?
+set -e
+if [ "$rc" = 8 ] && [ ! -s "$HANDOFF_LOG" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = request-ceiling-human-stop ]; then
+  pass "#1560 S3-4: an escalated spent-ceiling waiver rechecks before the manual handoff; a new stop exits 8, not 4"
+else
+  fail "#1560 S3-4: escalated waiver handoff recheck (rc=$rc ledger-calls=$(cat "$_esc_count" 2>/dev/null) handoff='$(cat "$HANDOFF_LOG" 2>/dev/null)'): $out $(tail -3 "$WORK/ceiling-escalate.err")"
 fi
 
 _ceiling_count="$WORK/ceiling-flip.count"
