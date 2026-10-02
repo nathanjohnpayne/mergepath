@@ -317,6 +317,19 @@ fi
 
 # A busy PR's comment history is larger than the OS argument limit; it must
 # reach jq through files, not argv (8 PRs failed this way in calibration).
+D="$WORK/botquote"; make_cli_case "$D"
+jq -n '[{id: 101, user: {login: "nathanjohnpayne", type: "User"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"},
+        {id: 102, user: {login: "coderabbitai[bot]", type: "Bot"}, body: "> @codex review\nQuoted for context.", created_at: "2026-09-25T00:01:00Z"},
+        {id: 103, user: {login: "chatgpt-codex-connector[bot]", type: "Bot"}, created_at: "2026-09-25T00:05:00Z",
+         body: "Codex Review: No major issues.\n**Reviewed commit:** `aaaaaaa`"}]' >"$D/issue_comments.json"
+RC=$(run_cli "$D" --summary)
+if [ "$RC" = 0 ] && grep -q '^requests: 1 counted, 0 foreign' "$D/out" && grep -q '^counted outcomes: attributed 1,' "$D/out" \
+   && grep -q '^foreign outcomes: attributed 0, ambiguous 0' "$D/out"; then
+  pass "CLI: a bot quoting a request is not a requester; --summary prints foreign outcomes"
+else
+  fail "CLI bot quote: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+
 D="$WORK/large"; make_cli_case "$D"
 jq -n --arg pad "$(head -c 4000 /dev/zero | tr '\0' 'x')" '
   [{id: 101, user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"}]

@@ -143,13 +143,17 @@ FOREIGN=$(jqx "request mentions" -nc --slurpfile ic "$LEDGER_TMP/issue_comments.
   --slurpfile rc "$LEDGER_TMP/review_comments.json" --slurpfile rv "$LEDGER_TMP/reviews.json" \
   --argjson ids "$REQUEST_IDS" --arg bot "$BOT" '
   def mentions: (.body // "") | test("@codex review"; "i");
+  # Any bot account (CodeRabbit quoting a request, Dependabot, the Codex bot
+  # itself) is not a requester.
+  def human: ((.user.type // "") != "Bot") and (((.user.login // "") | endswith("[bot]")) | not)
+             and ((.user.login // "") != $bot);
   ($ic[0]) as $ic | ($rc[0]) as $rc | ($rv[0]) as $rv
   | [ ($ic[] | select((.id as $i | $ids | index($i)) | not)
-            | select((.user.login // "") != $bot and mentions)
+            | select(human and mentions)
             | {id, created_at, source: "issue_comment"}),
-    ($rc[] | select((.user.login // "") != $bot and mentions)
+    ($rc[] | select(human and mentions)
            | {id, created_at, source: "review_comment"}),
-    ($rv[] | select((.user.login // "") != $bot and mentions)
+    ($rv[] | select(human and mentions)
            | {id, created_at: .submitted_at, source: "review"}) ]
   | map(. + {counted: false, author: null})
   | unique_by([.source, .id])')
@@ -261,6 +265,7 @@ printf '%s\n' "$LEDGER" | jq -r '
   | "\(.repo)#\(.pr)  head \(.head_sha[0:8])  author \(.author)  required tiers \(.required_tiers | join(","))",
     "requests: \($s.requests) counted, \($s.foreign_requests) foreign  (eyes now \($s.eyes_now); re-posted without a response \($s.reposted_without_response): after eyes \($s.reposted_after_eyes), eyes unknown \($s.reposted_eyes_unknown))",
     "counted outcomes: attributed \($s.outcomes.attributed), ambiguous \($s.outcomes.ambiguous), unanswered \($s.outcomes.unanswered), no response yet \($s.outcomes.no_response_yet); open debt \($s.open_debt)",
+    "foreign outcomes: attributed \($s.foreign_outcomes.attributed), ambiguous \($s.foreign_outcomes.ambiguous), unanswered \($s.foreign_outcomes.unanswered), no response yet \($s.foreign_outcomes.no_response_yet)",
     "responses: \($s.responses)  (unsolicited \($s.unsolicited_responses), mixed-head windows \($s.mixed_head_windows), multi-response windows \($s.multiple_response_windows), ties \($s.tie_responses), conflicting \($s.conflicting_responses), anchor conflicts \($s.anchor_conflicts))",
     "responses by class: \($s.responses_by_class | to_entries | map("\(.key)=\(.value)") | join(", "))",
     "blocking responses: \($s.blocking_responses)  (solicited \($s.blocking_responses_solicited))",
