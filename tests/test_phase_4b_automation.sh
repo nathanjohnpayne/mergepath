@@ -5778,27 +5778,26 @@ fi
 printf '{"feedback_policy":{},"findings":[],"missing":[]}\n'
 EOF
 chmod +x "$WORK/acct-late.sh"
-for _acct_at in 2; do
-  rm -f "$_acct_count" "$_ceiling_adapter"
-  : >"$HANDOFF_LOG"
-  rm -rf "$WORK/barrier-state/phase-4b-barrier"
-  set +e
-  out="$(P4B_TEST_LEDGER_MODE=clear MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$WORK/acct-late.sh" \
-    P4B_TEST_ACCT_COUNT="$_acct_count" P4B_TEST_ACCT_FAIL_AT="$_acct_at" \
-    MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-stop.yml" CODEX_BIN="$BIN/fake-codex-ceiling-approve" \
-    P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HEAD="$_p4a_head" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
-    P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
-    P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" PATH="$WORK/barrier-bin:$PATH" \
-    bash "$ORCH" 7 --repo owner/repo --author claude --head "$_p4a_head" --diff-file "$DIFF" 2>"$WORK/acct-late.err" </dev/null)"; rc=$?
-  set -e
-  if [ "$rc" = 7 ] && [ -s "$_ceiling_adapter" ] && [ ! -s "$HANDOFF_LOG" ] \
-     && [ "$(cat "$_acct_count")" = "$_acct_at" ] \
-     && ! grep -q 'REGRESSION: reviewer wrapper invoked' "$WORK/acct-late.err"; then
-    pass "#1581: feedback unaccounted at accounting call $_acct_at (after the adapter ran) refuses the approval with exit 7, nothing posted"
-  else
-    fail "#1581: late feedback at accounting call $_acct_at (rc=$rc calls=$(cat "$_acct_count" 2>/dev/null) adapter=$(cat "$_ceiling_adapter" 2>/dev/null)): $(tail -4 "$WORK/acct-late.err")"
-  fi
-done
+_acct_at=2
+rm -f "$_acct_count" "$_ceiling_adapter"
+: >"$HANDOFF_LOG"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+set +e
+out="$(P4B_TEST_LEDGER_MODE=clear MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$WORK/acct-late.sh" \
+  P4B_TEST_ACCT_COUNT="$_acct_count" P4B_TEST_ACCT_FAIL_AT="$_acct_at" \
+  MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-stop.yml" CODEX_BIN="$BIN/fake-codex-ceiling-approve" \
+  P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HEAD="$_p4a_head" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+  P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
+  P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" PATH="$WORK/barrier-bin:$PATH" \
+  bash "$ORCH" 7 --repo owner/repo --author claude --head "$_p4a_head" --diff-file "$DIFF" 2>"$WORK/acct-late.err" </dev/null)"; rc=$?
+set -e
+if [ "$rc" = 7 ] && [ -s "$_ceiling_adapter" ] && [ ! -s "$HANDOFF_LOG" ] \
+   && [ "$(cat "$_acct_count")" = "$_acct_at" ] \
+   && ! grep -q 'REGRESSION: reviewer wrapper invoked' "$WORK/acct-late.err"; then
+  pass "#1581: feedback unaccounted at accounting call $_acct_at (after the adapter ran) refuses the approval with exit 7, nothing posted"
+else
+  fail "#1581: late feedback at accounting call $_acct_at (rc=$rc calls=$(cat "$_acct_count" 2>/dev/null) adapter=$(cat "$_ceiling_adapter" 2>/dev/null)): $(tail -4 "$WORK/acct-late.err")"
+fi
 
 # A pre-side-effect hold must leave NO accounting trace. Evaluate the full
 # barrier once before the adapter, then revalidate only a timeout-derived Codex

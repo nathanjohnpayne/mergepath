@@ -520,12 +520,12 @@ feedback_accounting_status() {
   esac
 }
 
-require_feedback_accounted() { # [stage]
-  local stage="${1:-before Phase 4b dispatch}" rc=0
+require_feedback_accounted() {
+  local rc=0
   feedback_accounting_status || rc=$?
   case "$rc" in
     0) ;;
-    1) p4b_die 7 "review feedback is unaccounted; disposition every finding $stage" ;;
+    1) p4b_die 7 "review feedback is unaccounted; disposition every finding before Phase 4b dispatch" ;;
     *) p4b_die 3 "review feedback accounting gate failed or is unavailable" ;;
   esac
 }
