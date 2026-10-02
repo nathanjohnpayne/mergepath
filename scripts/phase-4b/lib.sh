@@ -641,12 +641,14 @@ p4b_codex_request_budget_state() {
   # human-stop read can prove it judged the same policy generation.
   if [ "$selected" != null ]; then
     jq -nc --argjson n "$count" --argjson cap "$cap" --arg t "$threshold" --argjson tuple "$initial_tuple" \
-      --argjson g "$generation" \
-      '{state:"final-request-pending",request_attempts:$n,max_request_attempts:$cap,threshold:$t,governing_tuple:$tuple,request_generation:$g}'
+      --argjson g "$generation" --argjson budget "$budget" \
+      '{state:"final-request-pending",request_attempts:$n,max_request_attempts:$cap,threshold:$t,governing_tuple:$tuple,request_generation:$g,
+        policy_fingerprint:$budget.policy_fingerprint}'
   else
     jq -nc --argjson n "$count" --argjson cap "$cap" --arg t "$threshold" --argjson tuple "$initial_tuple" \
-      --argjson g "$generation" \
-      '{state:"exhausted",request_attempts:$n,max_request_attempts:$cap,threshold:$t,governing_tuple:$tuple,request_generation:$g}'
+      --argjson g "$generation" --argjson budget "$budget" \
+      '{state:"exhausted",request_attempts:$n,max_request_attempts:$cap,threshold:$t,governing_tuple:$tuple,request_generation:$g,
+        policy_fingerprint:$budget.policy_fingerprint}'
   fi
 }
 
@@ -1771,8 +1773,8 @@ p4b_codex_human_stops() {
       '{state:"unsafe",reason:"pr-policy-tuple-changed",live_head:$after.head_sha,before:$before,after:$after}'
     return 2
   fi
-  printf '%s' "$stops" | jq -c --argjson t "$tuple" \
-    '. + {state: (if (.stops | length) > 0 then "stop" else "clear" end), governing_tuple: $t}'
+  printf '%s' "$stops" | jq -c --argjson t "$tuple" --arg fp "$fp" \
+    '. + {state: (if (.stops | length) > 0 then "stop" else "clear" end), governing_tuple: $t, policy_fingerprint: $fp}'
 }
 
 # p4b_same_request_generation <json-a> <json-b>: both carry a request_generation
@@ -1785,12 +1787,17 @@ p4b_same_request_generation() {
   [ "$a" = "$b" ]
 }
 
-# p4b_same_governing_tuple <json-a> <json-b>: both carry a governing_tuple and
-# the two are identical (key order ignored). Absent on either side is false.
+# p4b_same_governing_tuple <json-a> <json-b>: both carry the same
+# governing_tuple (key order ignored) AND the same policy_fingerprint. The
+# tuple alone is not enough: a base without a policy file resolves to the
+# mutable default branch, which can change under an unchanged tuple (#1579).
+# Absent on either side is false.
 p4b_same_governing_tuple() {
   local a b
-  a=$(printf '%s' "$1" | jq -cSe '.governing_tuple | select(type == "object")' 2>/dev/null) || return 1
-  b=$(printf '%s' "$2" | jq -cSe '.governing_tuple | select(type == "object")' 2>/dev/null) || return 1
+  a=$(printf '%s' "$1" | jq -cSe '{t: (.governing_tuple | select(type == "object")),
+    f: (.policy_fingerprint | select(type == "string" and test("^[0-9]+-[0-9]+$")))}' 2>/dev/null) || return 1
+  b=$(printf '%s' "$2" | jq -cSe '{t: (.governing_tuple | select(type == "object")),
+    f: (.policy_fingerprint | select(type == "string" and test("^[0-9]+-[0-9]+$")))}' 2>/dev/null) || return 1
   [ "$a" = "$b" ]
 }
 

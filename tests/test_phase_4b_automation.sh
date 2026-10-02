@@ -4741,15 +4741,20 @@ _route() { # <budget-json> <stops-json>
 }
 _t1='{"head_sha":"h","base_ref":"main","base_sha":"1","default_branch":"main"}'
 _t2='{"head_sha":"h","base_ref":"main","base_sha":"2","default_branch":"main"}'
-[ "$(_route "{\"state\":\"exhausted\",\"governing_tuple\":$_t1}" "{\"state\":\"clear\",\"stops\":[],\"governing_tuple\":$_t1}")" = "waived|false|request-ceiling" ] \
-  || bad="$bad same-tuple-not-waived($(_route "{\"state\":\"exhausted\",\"governing_tuple\":$_t1}" "{\"state\":\"clear\",\"stops\":[],\"governing_tuple\":$_t1}"))"
-[ "$(_route "{\"state\":\"exhausted\",\"governing_tuple\":$_t1}" "{\"state\":\"clear\",\"stops\":[],\"governing_tuple\":$_t2}")" = "escalate|true|pr-policy-tuple-changed-between-ceiling-and-stops" ] \
+_snap() { printf '{"state":"%s","stops":[],"governing_tuple":%s,"policy_fingerprint":"%s"}' "$1" "$2" "$3"; }
+[ "$(_route "$(_snap exhausted "$_t1" 1-1)" "$(_snap clear "$_t1" 1-1)")" = "waived|false|request-ceiling" ] \
+  || bad="$bad same-snapshot-not-waived($(_route "$(_snap exhausted "$_t1" 1-1)" "$(_snap clear "$_t1" 1-1)"))"
+[ "$(_route "$(_snap exhausted "$_t1" 1-1)" "$(_snap clear "$_t2" 1-1)")" = "escalate|true|pr-policy-tuple-changed-between-ceiling-and-stops" ] \
   || bad="$bad tuple-drift-between-ceiling-and-stops-read-as-clear"
-[ "$(_route '{"state":"exhausted"}' "{\"state\":\"clear\",\"stops\":[],\"governing_tuple\":$_t1}")" = "escalate|true|pr-policy-tuple-changed-between-ceiling-and-stops" ] \
-  || bad="$bad missing-ceiling-tuple-read-as-clear"
-p4b_same_governing_tuple "{\"governing_tuple\":$_t1}" "{\"governing_tuple\":$(printf '%s' "$_t1" | jq -cS .)}" \
-  && ! p4b_same_governing_tuple '{}' "{\"governing_tuple\":$_t1}" \
-  || bad="$bad same-tuple-helper"
+# Same tuple, different policy: a base without a policy file resolves to the
+# mutable default branch, which can change under an unchanged tuple.
+[ "$(_route "$(_snap exhausted "$_t1" 1-1)" "$(_snap clear "$_t1" 2-2)")" = "escalate|true|pr-policy-tuple-changed-between-ceiling-and-stops" ] \
+  || bad="$bad fingerprint-drift-under-same-tuple-read-as-clear"
+[ "$(_route '{"state":"exhausted"}' "$(_snap clear "$_t1" 1-1)")" = "escalate|true|pr-policy-tuple-changed-between-ceiling-and-stops" ] \
+  || bad="$bad missing-ceiling-snapshot-read-as-clear"
+p4b_same_governing_tuple "$(_snap exhausted "$_t1" 1-1)" "$(_snap clear "$(printf '%s' "$_t1" | jq -cS .)" 1-1)" \
+  && ! p4b_same_governing_tuple "{\"governing_tuple\":$_t1}" "$(_snap clear "$_t1" 1-1)" \
+  || bad="$bad same-snapshot-helper"
 
 if [ -z "$bad" ]; then
   pass "#1560 S3-4: a spent ceiling waives Codex only with no human stop; blocking budget, untested rebuttal and disagreement exit 8; unreadable evidence exits 10; the final-request wait re-evaluates before dispatch"
