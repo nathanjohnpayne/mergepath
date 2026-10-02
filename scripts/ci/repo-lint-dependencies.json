@@ -53,7 +53,10 @@
     ],
     "check_codex_scripts": [
       "scripts/lib/codex-request-evidence.sh",
-      "tests/test_codex_request_evidence.sh"
+      "tests/test_codex_request_evidence.sh",
+      "scripts/codex-review-ledger.sh",
+      "scripts/lib/codex-review-ledger.sh",
+      "tests/test_codex_review_ledger.sh"
     ],
     "check_coderabbit_wait": [
       "scripts/lib/ci-check-modes.sh",

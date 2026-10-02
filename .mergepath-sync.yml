@@ -2200,6 +2200,7 @@ paths:
       - "tests/test_codex_review_request_token_fallback.sh"  # check_codex_scripts (#737)
       - "tests/test_codex_review_check_resolution.sh"  # check_codex_scripts (#460 Option B)
       - "tests/test_codex_request_evidence.sh"   # #1276, blocked evidence
+      - "tests/test_codex_review_ledger.sh"      # #1560, report-only ledger
       - "tests/test_codex_review_check_verdict.sh"  # check_codex_scripts (#600/#567)
       - "tests/test_codex_review_check_required_checks.sh"  # check_codex_scripts (#655)
       - "tests/test_branch_requirements.sh"    # check_codex_scripts (#1064)
