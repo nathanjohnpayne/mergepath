@@ -1066,19 +1066,20 @@ else
   run_same_head_barrier "pre-adapter"
 fi
 
+# #1583: the barrier's spent-ceiling decision can predate the CodeRabbit probe.
+# Recheck it at the dispatch boundary so a new final request holds (exit 6,
+# its bounded wait) instead of spending an adapter run that the post-adapter
+# fence would only discard. It runs before the accounting gate below, so that
+# gate stays the last read before dispatch.
+if [ "$DRY_RUN" != true ]; then
+  revalidate_request_ceiling_authority pre-dispatch
+fi
+
 # Do not spend an external reviewer round while an earlier finding remains
 # unread or undispositioned. Unlike the provider-ordering barrier, this also
 # applies to dry-runs: invoking the reasoning adapter is the scarce action the
 # gate protects. The command override keeps the orchestrator hermetic in tests.
 require_feedback_accounted
-
-# #1583: the barrier's spent-ceiling decision can predate the CodeRabbit probe
-# and the accounting read above. Recheck it at the dispatch boundary so a new
-# final request holds (exit 6, its bounded wait) instead of spending an
-# adapter run that the post-adapter fence would only discard.
-if [ "$DRY_RUN" != true ]; then
-  revalidate_request_ceiling_authority pre-dispatch
-fi
 
 # --- run the adapter (reasoning plane; never posts) ------------------------
 ADAPTER_ARGS=( --pr "$PR" )

@@ -523,8 +523,8 @@ codex:
   # Phase 4b handoff. Must be a member of `available_reviewers` above.
   cli_login: nathanpayne-codex
 
-  # Maximum number of `@codex review` rounds before escalating as runaway.
-  # The 21st round trips the guard. Normal termination is either approval,
+  # The per-PR Codex request ceiling: the 21st request is refused (exit 7,
+  # kind "request-ceiling"). Normal termination is either approval,
   # disagreement (repeat-after-rebuttal), or timeout → Phase 4b fallback.
   # Raised 10 -> 20 by the owner on 2026-09-28 after #1474 exhausted 10 requests.
   # Previously raised 2 -> 10 (#1084). Codex is the primary reviewer on every PR,
