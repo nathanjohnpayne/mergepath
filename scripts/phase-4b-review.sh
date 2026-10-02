@@ -778,6 +778,13 @@ revalidate_request_ceiling_authority() {
   local where="${1:-post-adapter}" budget_json budget_rc=0 budget_state
   local stops_json stops_rc=0 stops_state reason payload
   case "$P4B_PRE_ADAPTER_CODEX_EVIDENCE" in request-ceiling*) ;; *) return 0 ;; esac
+  # The human-stop read (a multi-request ledger) runs FIRST, and the budget read
+  # with its generation and spent-ceiling checks runs LAST, so a request posted
+  # during the slower stop read is still caught (#1579). What remains is the
+  # window between this last read and the POST, the same window every other
+  # fence in this script accepts.
+  stops_json="$(p4b_codex_human_stops "$REPO" "$PR" "$HEAD")" || stops_rc=$?
+  stops_state="$(printf '%s' "$stops_json" | jq -r '.state // "unsafe"' 2>/dev/null || printf unsafe)"
   budget_json="$(p4b_codex_request_budget_state "$REPO" "$PR" "$HEAD")" || budget_rc=$?
   budget_state="$(printf '%s' "$budget_json" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
   # Still spent, and spent by the same request generation the barrier saw: an
@@ -799,8 +806,6 @@ revalidate_request_ceiling_authority() {
       stop_for_barrier_error "$payload"
       ;;
   esac
-  stops_json="$(p4b_codex_human_stops "$REPO" "$PR" "$HEAD")" || stops_rc=$?
-  stops_state="$(printf '%s' "$stops_json" | jq -r '.state // "unsafe"' 2>/dev/null || printf unsafe)"
   # One policy generation for the ceiling and the stops (#1579).
   if [ "$stops_rc" -eq 0 ] && ! p4b_same_governing_tuple "$budget_json" "$stops_json"; then
     stops_rc=2

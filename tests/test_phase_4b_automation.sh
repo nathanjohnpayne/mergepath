@@ -4079,6 +4079,15 @@ while [ $# -gt 0 ]; do
 done
 [ -z "${P4B_TEST_LEDGER_FP:-}" ] || fp=$P4B_TEST_LEDGER_FP
 mode=${P4B_TEST_LEDGER_MODE:-blocking}
+# bump: stays clear, but from its second read on it moves the comments
+# counter past the switch point, as if a request landed during that read.
+if [ "$mode" = bump ]; then
+  n=0
+  [ ! -f "$P4B_TEST_LEDGER_COUNT" ] || n=$(cat "$P4B_TEST_LEDGER_COUNT")
+  printf '%s\n' "$((n + 1))" >"$P4B_TEST_LEDGER_COUNT"
+  [ "$((n + 1))" -ne "${P4B_TEST_LEDGER_BUMP_AT:-2}" ] || printf '1000\n' >"$P4B_TEST_COMMENTS_RACE_FILE"
+  mode=clear
+fi
 if [ "$mode" = flip ]; then
   n=0
   [ ! -f "$P4B_TEST_LEDGER_COUNT" ] || n=$(cat "$P4B_TEST_LEDGER_COUNT")
@@ -5554,6 +5563,39 @@ if [ "$rc" = 10 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = false 
   pass "#1560 S3-4: a new final request posted during the adapter run voids the ceiling authority (exit 10, nothing posted)"
 else
   fail "#1560 S3-4: request generation change during the adapter run (rc=$rc reads=$(cat "$_gen_race" 2>/dev/null)): $out $(tail -3 "$WORK/ceiling-gen.err")"
+fi
+
+# A request that lands DURING the recheck's human-stop read is caught by the
+# budget read that follows it (#1579): the recheck reads stops first, budget last.
+# The request lands during the Nth ledger read, i.e. the stop read of each
+# recheck in turn. Every recheck reads stops first and the budget last, so
+# every placement must exit 10; under a budget-first order the bump during the
+# final recheck slips past it. The sweep ends when N passes the run's last
+# ledger read (the bump never fires).
+_bump_count="$WORK/ceiling-bump.count"
+_bump_bad=""; _bump_fired=0
+for _bump_at in 2 3 4 5 6 7 8; do
+  rm -f "$_gen_race" "$_bump_count"
+  : >"$HANDOFF_LOG"
+  rm -rf "$WORK/barrier-state/phase-4b-barrier"
+  set +e
+  out="$(P4B_TEST_LEDGER_MODE=bump P4B_TEST_LEDGER_BUMP_AT="$_bump_at" P4B_TEST_LEDGER_COUNT="$_bump_count" MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-stop.yml" CODEX_BIN="$BIN/fake-codex-ceiling-approve" \
+    P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_COMMENTS_RACE_FILE="$_gen_race" P4B_TEST_COMMENTS_CHANGE_AFTER=1000 P4B_TEST_COMMENTS_JSON_AFTER="$_gen_after" \
+    P4B_TEST_LIVE_HEAD="$_p4a_head" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+    P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
+    P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" PATH="$WORK/barrier-bin:$PATH" \
+    bash "$ORCH" 7 --repo owner/repo --author claude --head "$_p4a_head" --diff-file "$DIFF" 2>"$WORK/ceiling-bump.err" </dev/null)"; rc=$?
+  set -e
+  [ "$(cat "$_bump_count" 2>/dev/null || printf 0)" -ge "$_bump_at" ] || break
+  _bump_fired=$((_bump_fired + 1))
+  [ "$rc" = 10 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = false ] \
+    && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = request-ceiling-authority-changed ] \
+    || _bump_bad="$_bump_bad at-read-$_bump_at(rc=$rc)"
+done
+if [ -z "$_bump_bad" ] && [ "$_bump_fired" -ge 1 ]; then
+  pass "#1560 S3-4: a request that lands during any recheck's stop read is caught by the budget read after it (exit 10; $_bump_fired placements)"
+else
+  fail "#1560 S3-4: request during a recheck's stop read slipped through:${_bump_bad:- no placement fired}"
 fi
 
 _ceiling_count="$WORK/ceiling-flip.count"

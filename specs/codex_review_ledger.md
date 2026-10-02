@@ -75,8 +75,8 @@ The requester also passes `--expect-policy <fp>`, the `crqe_policy_fingerprint` 
 When the request ceiling is spent, the Phase 4b barrier runs the ledger with `--expect-head` and evaluates `crl_human_stops` (REVIEW_POLICY.md § Disagreements and Tiebreaking, signal 4):
 
 - `blocking-budget`: the blocking count above reaches the governed `codex.max_blocking_reviews`;
-- `untested-rebuttal`: a rebuttal with no response whose `first_at` is later than the rebuttal's `at`;
-- `disagreement`: a later response that counts toward the budget and either lists the rebutted path in `blocking_paths`, is `blocking_unlocated`, or follows a rebuttal with no path.
+- `untested-rebuttal`: a rebuttal with no response that answers a request posted after it. Windows are numbered by request in time order, so only responses in the windows from the first request whose `created_at` is later than the rebuttal's `at` count. Those responses must also come after the rebuttal and not be `provider_blocked`. An answer to a request already in flight before the rebuttal cannot have read it;
+- `disagreement`: such a response that counts toward the budget and either lists the rebutted path in `blocking_paths`, is `blocking_unlocated`, or follows a rebuttal with no path.
 
 Any stop sends the PR to the human tiebreaker; none lets the automated adapter review the head. The same rule that counts blocking reviews is shared as `crl_blocking_count`, and a ledger for another head or author, or with a malformed response or rebuttal, fails both functions.
 
