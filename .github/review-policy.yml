@@ -539,6 +539,20 @@ codex:
   # adjudicating it.
   max_review_rounds: 20
 
+  # Blocking-review budget (#1560 slice 3). Before every new request the
+  # requester counts the PR's SOLICITED Codex responses that are blocking (a
+  # finding at p0 or a feedback_policy-required tier), unknown-tier, or
+  # conflicting, across every head, and refuses the request once that count
+  # reaches this budget: with 10, nine permit one more request and ten refuse
+  # it. Clean and discretionary-only rounds spend nothing; responses posted
+  # before any request do not count. Checked BEFORE max_review_rounds, so it
+  # names the stop (exit 7, cap_exhausted.kind "blocking-reviews") when both
+  # are spent. Read from the governing base policy; absent defaults to 10.
+  # 10 is PROVISIONAL, chosen from the #1560 calibration (one PR of 91 sampled
+  # exceeded it) and open to revision on new evidence. Exhaustion takes the
+  # human-tiebreaker route, as max_review_rounds does.
+  max_blocking_reviews: 10
+
   # Poll timeout per round, in seconds, for `codex-review-request.sh`.
   # If Codex has not posted a review within this window, treat as timeout
   # and exit with code 4. Silence is NEVER treated as implicit approval;

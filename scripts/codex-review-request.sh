@@ -214,13 +214,17 @@
 #   6   FEEDBACK_UNACCOUNTED — at least one earlier reviewer finding has no
 #       durable disposition evidence. No new trigger is posted. Account for
 #       every reported finding, then rerun this script (#1000).
-#   7   CAP_EXHAUSTED — the configured per-PR request-attempt cap has already
-#       been reached before an initial request. JSON on stdout names the
-#       consumed and configured counts; the caller retains its existing review
-#       policy. Exhaustion adds no routing or merge authority. Any
-#       observed provider block is diagnostic-only and never grants Phase 4b
-#       routing authority. This requester-specific status is not Phase 4b's
-#       exit-7 contract.
+#   7   CAP_EXHAUSTED — no new request is permitted, for one of two reasons
+#       named by `cap_exhausted.kind` (#1560 slice 3):
+#         blocking-reviews  the PR already holds max_blocking_reviews (default
+#                           10) solicited blocking Codex reviews. Checked
+#                           first, so it wins when both budgets are spent.
+#         request-ceiling   the per-PR request-attempt cap is reached.
+#       JSON on stdout names both consumed and configured counts; the caller
+#       retains its existing review policy. Exhaustion adds no routing or
+#       merge authority. Any observed provider block is diagnostic-only and
+#       never grants Phase 4b routing authority. This requester-specific
+#       status is not Phase 4b's exit-7 contract.
 #
 # Design notes:
 #   - Writes only author-attributed PR comments: the `@codex review` trigger,
@@ -1402,9 +1406,12 @@ post_author_pr_comment() { # <body> <purpose> [body-file|inline]
 # Malformed policy or unreadable request
 # evidence never reaches this function; those remain exit 3 infrastructure
 # failures.
-emit_cap_exhausted() { # <request_attempts> <max_request_attempts>
-  local request_attempts="$1" max_request_attempts="$2"
+emit_cap_exhausted() { # <kind> <request_attempts> <max_request_attempts>
+  local kind="$1" request_attempts="$2" max_request_attempts="$3"
   jq -n \
+    --arg kind "$kind" \
+    --argjson blocking_reviews "${BLOCKING_REVIEW_COUNT:-null}" \
+    --argjson max_blocking_reviews "${BLOCKING_REVIEW_LIMIT:-null}" \
     --argjson pr_number "$PR_NUMBER" \
     --arg repo "$REPO" \
     --arg head_sha "$HEAD_SHA" \
@@ -1427,8 +1434,11 @@ emit_cap_exhausted() { # <request_attempts> <max_request_attempts>
       blocked_reason: null,
       terminal_determination: null,
       cap_exhausted: {
+        kind: $kind,
         request_attempts: $request_attempts,
         max_request_attempts: $max_request_attempts,
+        blocking_reviews: $blocking_reviews,
+        max_blocking_reviews: $max_blocking_reviews,
         observed_provider_block: $scan.blocked
       },
       trigger_posted: false,
@@ -1445,6 +1455,7 @@ governing_request_attempt_cap() {
   # raise its own budget before asking for another scarce provider review.
   local budget_json base_cap resolver
   GOVERNING_REQUEST_ATTEMPT_CAP=""
+  GOVERNING_BLOCKING_REVIEW_BUDGET=""
 
   resolver="$__CODEX_REQUEST_DIR/workflow/resolve_base_policy.sh"
   [ -x "$resolver" ] \
@@ -1457,6 +1468,45 @@ governing_request_attempt_cap() {
   base_cap=$(printf '%s' "$budget_json" | jq -r '.max_request_attempts')
 
   GOVERNING_REQUEST_ATTEMPT_CAP="$base_cap"
+  GOVERNING_BLOCKING_REVIEW_BUDGET=$(printf '%s' "$budget_json" | jq -r '.max_blocking_reviews')
+  [[ "$GOVERNING_BLOCKING_REVIEW_BUDGET" =~ ^[0-9]+$ ]] \
+    || die 3 "cannot read the governing blocking-review budget; refusing a new '@codex review' trigger"
+}
+
+# The blocking-review budget (#1560 slice 3). Counts, across the whole PR, the
+# solicited Codex responses the review ledger (specs/codex_review_ledger.md)
+# classifies as blocking. A response counts when it came after at least one
+# request (unsolicited == false) and any of:
+#   - class "blocking": a finding at p0 or a required tier;
+#   - class "unknown_tier": a non-affirmative verdict whose tier is unknown;
+#   - conflicting: its own signals disagree (a blocking review beside a clean
+#     signal, or verdicts that disagree).
+# Unknown and conflicting evidence counts against the budget, never for it.
+# The count needs no request attribution, so the ledger's ambiguous windows
+# do not affect it. Sets BLOCKING_REVIEW_COUNT; any failure to produce an
+# exact count is exit 3 with no trigger posted.
+count_blocking_reviews() {
+  local ledger_cmd ledger rc=0
+  ledger_cmd="${MERGEPATH_CODEX_LEDGER_CMD:-$__CODEX_REQUEST_DIR/codex-review-ledger.sh}"
+  command -v "$ledger_cmd" >/dev/null 2>&1 \
+    || die 3 "Codex review ledger unavailable: $ledger_cmd; refusing a new '@codex review' trigger"
+  ledger=$(MERGEPATH_REVIEW_POLICY_PATH="$CONFIG" "$ledger_cmd" --repo "$REPO" \
+    --expect-head "$HEAD_SHA" "$PR_NUMBER") || rc=$?
+  [ "$rc" -eq 0 ] \
+    || die 3 "Codex review ledger failed (exit $rc); cannot count blocking reviews; refusing a new '@codex review' trigger"
+  BLOCKING_REVIEW_COUNT=$(printf '%s' "$ledger" | jq -er \
+    --arg head "$HEAD_SHA" --arg author "$AUTHOR_IDENTITY" '
+    if type == "object" and .head_sha == $head and .author == $author
+       and (.responses | type) == "array"
+       and all(.responses[]; (.unsolicited | type) == "boolean"
+                             and (.class | type) == "string"
+                             and (.conflicting | type) == "boolean")
+    then [ .responses[]
+           | select((.unsolicited | not)
+                    and (.class == "blocking" or .class == "unknown_tier" or .conflicting)) ]
+         | length
+    else error("ledger") end' 2>/dev/null) \
+    || die 3 "Codex review ledger output is malformed or names another head or author; refusing a new '@codex review' trigger"
 }
 
 preserve_final_request_timeout() { # <comments-json> <selected-trigger-json>
@@ -1514,6 +1564,21 @@ post_codex_trigger() {
     || die 3 "cannot read Codex request-attempt evidence; refusing a new '@codex review' trigger"
   request_count=$(crqe_count_triggers "$request_comments" "$AUTHOR_IDENTITY") \
     || die 3 "cannot count Codex request attempts; refusing a new '@codex review' trigger"
+  # Blocking-review budget first, so it takes precedence when both budgets
+  # are spent: a PR that has drawn max_blocking_reviews solicited blocking
+  # reviews stops for the human whatever its request count. The boundary is
+  # explicit: with a budget of 10, a request is refused once 10 such reviews
+  # exist, so the 10th blocking review is the last one a PR can draw. An
+  # acknowledgement retry re-asks for the request already posted after this
+  # check passed, so it is not re-checked here.
+  if [ "$TRIGGER_POSTED" != "true" ]; then
+    BLOCKING_REVIEW_LIMIT="$GOVERNING_BLOCKING_REVIEW_BUDGET"
+    count_blocking_reviews
+    if [ "$BLOCKING_REVIEW_COUNT" -ge "$BLOCKING_REVIEW_LIMIT" ]; then
+      log "Codex blocking-review budget spent for $REPO#$PR_NUMBER ($BLOCKING_REVIEW_COUNT/$BLOCKING_REVIEW_LIMIT solicited blocking reviews); refusing additional '@codex review' requests"
+      emit_cap_exhausted blocking-reviews "$request_count" "$max_review_rounds"
+    fi
+  fi
   if [ "$request_count" -ge "$max_review_rounds" ]; then
     # The initial request may consume the final slot. Its missing eyes
     # acknowledgement must suppress only the retry: the already-confirmed
@@ -1544,7 +1609,7 @@ post_codex_trigger() {
       CAP_REUSED_TRIGGER=false
     fi
     log "Codex request-attempt cap reached for $REPO#$PR_NUMBER ($request_count/$max_review_rounds); refusing additional '@codex review' requests"
-    emit_cap_exhausted "$request_count" "$max_review_rounds"
+    emit_cap_exhausted request-ceiling "$request_count" "$max_review_rounds"
   fi
 
   # Accounting protects new review requests. An exhausted cap performs no
@@ -1975,6 +2040,8 @@ ACK_RETRY_REFUSED_BY_CAP=false
 CAP_REUSED_TRIGGER=false
 CAP_REQUEST_COUNT=0
 CAP_REQUEST_LIMIT=0
+BLOCKING_REVIEW_COUNT=""
+BLOCKING_REVIEW_LIMIT=""
 RESUMED_TRIGGER=false
 # A run re-executed after a resumed request expired (#1550) reports that the
 # invocation resumed first, although this process posts normally.
@@ -2116,7 +2183,7 @@ fi
 # this invocation's own confirmed trigger may mint a timeout determination.
 if [ "$CAP_REUSED_TRIGGER" = true ] && ! has_post_trigger_signal "$FINAL_SCAN"; then
   INITIAL_SCAN=$FINAL_SCAN
-  emit_cap_exhausted "$CAP_REQUEST_COUNT" "$CAP_REQUEST_LIMIT"
+  emit_cap_exhausted request-ceiling "$CAP_REQUEST_COUNT" "$CAP_REQUEST_LIMIT"
 fi
 
 # --- emit final JSON --------------------------------------------------------

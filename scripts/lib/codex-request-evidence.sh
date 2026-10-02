@@ -70,14 +70,15 @@ crqe_request_threshold() { # head-committer-date timeline-json freshness-seconds
 
 # Resolve the request budget from the PR's governing base policy. The caller
 # must already have sourced feedback-policy-helpers.sh (policy_yaml_to_json).
-# Prints {author_identity,max_request_attempts,reaction_freshness_window_seconds};
+# Prints {author_identity,max_request_attempts,max_blocking_reviews,
+# reaction_freshness_window_seconds};
 # returns non-zero on every
 # unreadable or malformed input. A materialized policy is removed here.
 crqe_governing_budget() { # repo pr default-config candidate-author [resolver [base-ref base-sha default-branch]]
   local repo="$1" pr="$2" config="$3" candidate="$4"
   local resolver="${5:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/workflow/resolve_base_policy.sh}"
   local base_ref="${6:-}" base_sha="${7:-}" default_branch="${8:-}"
-  local base_cfg="" base_json="" author="" cap="" freshness="" rc=0
+  local base_cfg="" base_json="" author="" cap="" blocking="" freshness="" rc=0
   command -v policy_yaml_to_json >/dev/null 2>&1 || return 1
   [ -x "$resolver" ] || return 1
   if [ -n "$base_ref$base_sha$default_branch" ]; then
@@ -115,6 +116,22 @@ crqe_governing_budget() { # repo pr default-config candidate-author [resolver [b
   [ "${#cap}" -le 9 ] || return 1
   cap=$(printf '%s' "$cap" | sed 's/^0*//')
   [ -n "$cap" ] || cap=0
+  # The blocking-review budget (#1560 slice 3): solicited blocking Codex
+  # reviews a PR may accumulate before further requests stop for the human.
+  # Same governing source, absent default and validation as the request cap.
+  # 10 is a provisional policy choice recorded on #1560.
+  blocking=$(printf '%s' "$base_json" | jq -r '
+    if type != "object" then "__invalid__"
+    elif (has("codex") | not) then "10"
+    elif ((.codex | type) != "object") then "__invalid__"
+    elif (.codex | has("max_blocking_reviews")) then
+      .codex.max_blocking_reviews
+      | if (type == "string" or type == "number") then tostring else "__invalid__" end
+    else "10" end') || return 1
+  case "$blocking" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#blocking}" -le 9 ] || return 1
+  blocking=$(printf '%s' "$blocking" | sed 's/^0*//')
+  [ -n "$blocking" ] || blocking=0
   freshness=$(printf '%s' "$base_json" | jq -r '
     if type != "object" then "__invalid__"
     elif (has("codex") | not) then "1800"
@@ -127,8 +144,9 @@ crqe_governing_budget() { # repo pr default-config candidate-author [resolver [b
   [ "${#freshness}" -le 9 ] || return 1
   freshness=$(printf '%s' "$freshness" | sed 's/^0*//')
   [ -n "$freshness" ] || freshness=0
-  jq -nc --arg author "$author" --argjson cap "$cap" --argjson freshness "$freshness" \
-    '{author_identity:$author,max_request_attempts:$cap,
+  jq -nc --arg author "$author" --argjson cap "$cap" --argjson blocking "$blocking" \
+    --argjson freshness "$freshness" \
+    '{author_identity:$author,max_request_attempts:$cap,max_blocking_reviews:$blocking,
       reaction_freshness_window_seconds:$freshness}'
 }
 

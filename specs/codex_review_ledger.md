@@ -1,6 +1,6 @@
-# Report-only Codex review ledger (#1560, slice 2)
+# Codex review ledger (#1560)
 
-`scripts/codex-review-ledger.sh <PR>` reconstructs which Codex responses a pull request's Codex requests drew, from records GitHub already holds, and prints the result. The attribution logic lives in `scripts/lib/codex-review-ledger.sh`, a pure function over evidence the command reads first. The ledger is report-only: it writes nothing to GitHub, and no requester, Phase 4b barrier or merge-gate path reads it. It exists so the counting and routing decision recorded on #1560 is made from measured evidence. Where the record cannot prove an attribution, the ledger says so and lists the candidates; it never picks one.
+`scripts/codex-review-ledger.sh <PR>` reconstructs which Codex responses a pull request's Codex requests drew, from records GitHub already holds, and prints the result. The attribution logic lives in `scripts/lib/codex-review-ledger.sh`, a pure function over evidence the command reads first. The ledger writes nothing to GitHub. It was built report-only (slice 2) so the counting and routing decision recorded on #1560 would be made from measured evidence. Since slice 3 it has one consumer, described under [Consumer: the blocking-review budget](#consumer-the-blocking-review-budget); nothing reads its attribution to decide anything. Where the record cannot prove an attribution, the ledger says so and lists the candidates; it never picks one.
 
 ## Inputs and authority
 
@@ -57,4 +57,10 @@ A request followed by another with no response in between is `reposted_without_r
 
 The `summary` object reports counted and foreign request counts and outcomes, `open_debt`, eyes and re-post counts, response counts by class, `blocking_responses` and `blocking_responses_solicited` (unsolicited responses excluded), and the counts of mixed-head windows, multi-response windows, ties, conflicting responses, anchor conflicts and thread-reply wrappers. `--summary` prints the same counts and lists every request that is not cleanly attributed, was re-posted without a response, or may have received a second response.
 
-Coverage: `tests/test_codex_review_ledger.sh`.
+## Consumer: the blocking-review budget
+
+`scripts/codex-review-request.sh` runs the ledger before every new request, as `codex-review-ledger.sh --repo <repo> --expect-head <sha> <PR>`, and counts the responses that have `unsolicited: false` and either a `class` of `blocking` or `unknown_tier`, or `conflicting: true`. It refuses the request once that count reaches `codex.max_blocking_reviews` (REVIEW_POLICY.md § Disagreements and Tiebreaking, signal 3). The count reads only response classes, which never depend on which request a response answered, so ambiguous attribution cannot change it.
+
+`--expect-head <sha>` makes the ledger exit `3`, printing nothing, unless the PR head is exactly `<sha>`, so the count is taken at the head the requester is about to request a review of. The requester also refuses output whose `head_sha` or `author` differs from its own, or whose responses lack a boolean `unsolicited`, a string `class` or a boolean `conflicting`. Every failure exits `3` with no request posted.
+
+Coverage: `tests/test_codex_review_ledger.sh`; the consumer is covered by `tests/test_codex_review_request_trigger_only.sh`.

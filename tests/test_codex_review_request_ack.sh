@@ -11,6 +11,24 @@ export MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD=true
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-review-request-ack.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
+# The requester counts solicited blocking reviews from the Codex review ledger
+# before every new request (#1560 slice 3). This stub reports a ledger with no
+# responses for whatever head the requester expects, so the blocking-review
+# budget never stops these cases; test_codex_review_request_trigger_only.sh
+# covers the budget itself.
+LEDGER_STUB="$WORKDIR/codex-ledger-stub.sh"
+cat >"$LEDGER_STUB" <<'LEDGER_EOF'
+#!/usr/bin/env bash
+[ -z "${CODEX_LEDGER_STUB_LOG:-}" ] || printf '%s\n' "$*" >>"$CODEX_LEDGER_STUB_LOG"
+head=""
+while [ $# -gt 0 ]; do
+  case "$1" in --expect-head) head=$2; shift 2 ;; *) shift ;; esac
+done
+jq -nc --arg h "$head" --arg a "${CODEX_LEDGER_STUB_AUTHOR:-nathanjohnpayne}" \
+  '{head_sha: $h, author: $a, responses: []}'
+LEDGER_EOF
+chmod +x "$LEDGER_STUB"
+export MERGEPATH_CODEX_LEDGER_CMD="$LEDGER_STUB"
 
 PASS=0
 FAIL=0
@@ -483,13 +501,17 @@ test_eyes_ack_does_not_retrigger_or_clear() {
 test_missing_ack_retriggers_once() {
   local dir rc count
   dir=$(make_case "missing-one-retry" 0 1)
-  rc=$(run_case "$dir" absent)
+  rc=$(CODEX_LEDGER_STUB_LOG="$dir/ledger-calls" run_case "$dir" absent)
   count=$(trigger_count "$dir")
 
   if [ "$rc" != "4" ]; then
     fail "missing ack one retry: exit $rc, expected 4; stderr=$(cat "$dir/err.log")"
   elif [ "$count" != "2" ]; then
     fail "missing ack one retry: trigger count $count, expected original + one retry"
+  elif [ "$(wc -l <"$dir/ledger-calls" | tr -d ' ')" != 1 ]; then
+    # #1560 slice 3: the blocking-review budget gates the new request only;
+    # the acknowledgement retry re-asks for that same request.
+    fail "missing ack one retry: blocking-review ledger ran $(wc -l <"$dir/ledger-calls" | tr -d ' ') times, expected once (initial request only)"
   elif ! grep -q "re-posting '@codex review'" "$dir/err.log"; then
     fail "missing ack one retry: missing re-trigger log; stderr=$(cat "$dir/err.log")"
   else
@@ -878,7 +900,7 @@ set -euo pipefail
 exit 0
 EOF
   chmod +x "$dir/scripts/identity-check.sh"
-  rc=$(run_case "$dir" absent 0 author-pat-123)
+  rc=$(CODEX_LEDGER_STUB_AUTHOR=custom-owner run_case "$dir" absent 0 author-pat-123)
   pat=$(bridged_pat "$dir")
   identity=$(head -1 "$dir/state/author-identity-env" 2>/dev/null || printf '')
 
@@ -962,7 +984,7 @@ test_non_bridge_path_passes_configured_identity() {
   # styles (Codex P2 r9).
   printf "author_identity: 'custom-owner'\n" >>"$dir/.github/review-policy.yml"
   printf "author_identity: 'custom-owner'\n" >>"$dir/state/base-review-policy.yml"
-  rc=$(run_case "$dir" absent 0 reviewer-pat-456)
+  rc=$(CODEX_LEDGER_STUB_AUTHOR=custom-owner run_case "$dir" absent 0 reviewer-pat-456)
   identity=$(head -1 "$dir/state/author-identity-env" 2>/dev/null || printf '')
 
   if [ "$(trigger_count "$dir")" -lt 1 ]; then

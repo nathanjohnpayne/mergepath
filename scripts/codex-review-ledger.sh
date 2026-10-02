@@ -8,15 +8,17 @@
 # --summary). The attribution and classification rules are documented in
 # scripts/lib/codex-review-ledger.sh.
 #
-# REPORT ONLY. Nothing reads this ledger to decide anything: it posts nothing,
-# changes no label, and no requester, barrier or merge-gate path consults it.
-# It exists to produce the evidence the counting and routing decision on
-# #1560 is made from.
+# Read only: it posts nothing and changes no label. One consumer reads it:
+# scripts/codex-review-request.sh counts the PR's solicited blocking responses
+# from it for the blocking-review budget (#1560 slice 3). That count needs no
+# request attribution; nothing reads the attribution to decide anything.
 #
 # Usage:
-#   scripts/codex-review-ledger.sh [--repo owner/name] [--summary] <PR_NUMBER>
+#   scripts/codex-review-ledger.sh [--repo owner/name] [--summary]
+#                                  [--expect-head <sha>] <PR_NUMBER>
 #
-#   --summary        Print a short human-readable report instead of JSON.
+#   --summary            Print a short human-readable report instead of JSON.
+#   --expect-head <sha>  Exit 3 unless the PR head is exactly <sha>.
 #
 # The configured author, bot login and required feedback tiers come from the
 # PR's governing base policy (scripts/workflow/resolve_base_policy.sh), the
@@ -49,15 +51,17 @@ for __lib in gh-api-array.sh codex-request-evidence.sh codex-failure-markers.sh 
 done
 
 die() { echo "[codex-review-ledger] ERROR: $*" >&2; exit 3; }
-usage() { sed -n '16,19p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '16,21p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 REPO=""
 SUMMARY=false
+EXPECT_HEAD=""
 PR_NUMBER=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) [ $# -ge 2 ] || usage; REPO=$2; shift 2 ;;
     --summary) SUMMARY=true; shift ;;
+    --expect-head) [ $# -ge 2 ] && [[ "$2" =~ ^[0-9a-f]{40}$ ]] || usage; EXPECT_HEAD=$2; shift 2 ;;
     -h|--help) usage ;;
     -*) usage ;;
     *) [ -z "$PR_NUMBER" ] || usage; PR_NUMBER=$1; shift ;;
@@ -83,6 +87,8 @@ jqx() { # <what> <jq-args...>
 # ---- governing policy --------------------------------------------------------
 PR_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>/dev/null) || die "cannot read PR #$PR_NUMBER"
 HEAD_SHA=$(printf '%s' "$PR_JSON" | jq -er '.head.sha') || die "PR #$PR_NUMBER has no head sha"
+[ -z "$EXPECT_HEAD" ] || [ "$HEAD_SHA" = "$EXPECT_HEAD" ] \
+  || die "PR #$PR_NUMBER head is $HEAD_SHA, not the expected $EXPECT_HEAD"
 
 RESOLVER="$__LEDGER_DIR/workflow/resolve_base_policy.sh"
 [ -x "$RESOLVER" ] || die "governing-policy resolver missing: $RESOLVER"

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # scripts/lib/codex-review-ledger.sh
 #
-# Report-only Codex review ledger (#1560, slice 2). Reconstructs, from records
-# GitHub already holds, which Codex responses a PR's Codex requests drew, and
+# Codex review ledger (#1560, slice 2). Reconstructs, from records GitHub
+# already holds, which Codex responses a PR's Codex requests drew, and
 # reports every case whose attribution the record cannot prove as ambiguous
-# instead of guessing. It decides nothing: no requester, barrier or
-# merge-gate path reads it. Its job is to produce the evidence the counting
-# and routing decision on #1560 is made from. The contract, including every
+# instead of guessing. Its one decision input is the per-PR count of
+# solicited blocking responses, which the requester's blocking-review budget
+# reads (slice 3); that count does not depend on attribution, and nothing
+# reads the attribution to decide anything. The contract, including every
 # rule below, is specs/codex_review_ledger.md.
 #
 # What the record does not prove, and how the ledger treats it:

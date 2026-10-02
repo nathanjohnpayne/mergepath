@@ -317,6 +317,29 @@ else
   fail "CLI read an unexpected endpoint: $(cat "$D/calls")"
 fi
 
+# --expect-head (#1560 slice 3): the requester's blocking-review count must be
+# taken at the head it is about to request a review of.
+D="$WORK/expect-head"; make_cli_case "$D"
+printf '[]\n' >"$D/issue_comments.json"
+RC=$(run_cli "$D" --expect-head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)
+if [ "$RC" = 0 ] && jq -e '.head_sha == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$D/out" >/dev/null; then
+  pass "CLI: --expect-head matching the PR head prints the ledger"
+else
+  fail "CLI expect-head match: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+RC=$(run_cli "$D" --expect-head bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)
+if [ "$RC" = 3 ] && [ ! -s "$D/out" ] && grep -q 'not the expected' "$D/err"; then
+  pass "CLI: --expect-head naming another head fails closed (exit 3, nothing printed)"
+else
+  fail "CLI expect-head mismatch: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+RC=$(run_cli "$D" --expect-head not-a-sha)
+if [ "$RC" = 2 ] && [ ! -s "$D/out" ]; then
+  pass "CLI: --expect-head with a malformed sha is a usage error"
+else
+  fail "CLI expect-head malformed: rc=$RC out=$(cat "$D/out")"
+fi
+
 D="$WORK/malformed"; make_cli_case "$D"
 jq -n '[{id: "x", user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"}]' >"$D/issue_comments.json"
 RC=$(run_cli "$D")
