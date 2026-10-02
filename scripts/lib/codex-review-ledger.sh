@@ -130,7 +130,10 @@ crl_ledger() {
           else { class: "no_findings", conflicting: false } end;
       ( [ range(0; $n + 1) as $w
           | responses_of($w) as $g
-          | ([ $g[] | .anchor | select(. != null) ] | unique_by(ascii_downcase) | length) as $heads
+          # Distinct heads by prefix equivalence (a short sha and its full
+          # sha are one head), the same rule same_head applies everywhere.
+          | ( reduce ([ $g[] | .anchor | select(. != null) ][]) as $a ([];
+                if any(.[]; same_head(.; $a)) then . else . + [$a] end) | length ) as $heads
           | $g | to_entries[]
           | .value as $grp
           | ($grp | classify) as $c

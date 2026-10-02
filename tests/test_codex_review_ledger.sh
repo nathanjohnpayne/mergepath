@@ -140,6 +140,10 @@ check "a non-affirmative verdict joins its review and takes the review's class" 
 L=$(ledger "$(req 1 $T0 | arr)" '[]' "$(verdict 20 $T1 '["aaaaaaa"]' false | arr)" '[]' '[]')
 check "a non-affirmative verdict with no review to grade is unknown_tier" "$L" '.responses[0].class == "unknown_tier"'
 
+L=$(ledger "$(req 1 $T0 | arr)" '[]' "$( { verdict 20 $T1 '["aaaaaaa"]' true; verdict 21 $T2 '["'"$HEAD_A"'"]' true; } | arr)" '[]' '[]')
+check "standalone verdicts on one head at different sha lengths are not a mixed-head window" "$L" \
+  '.summary.responses == 2 and .summary.mixed_head_windows == 0 and .summary.multiple_response_windows == 1'
+
 L=$(ledger "$(req 1 $T0 | arr)" '[]' "$(verdict 20 $T1 '[]' true | arr)" '[]' '[]')
 check "a verdict without a sha is an anchorless response, not dropped" "$L" \
   '.summary.responses == 1 and .responses[0].anchor == null and .responses[0].class == "clean"'
