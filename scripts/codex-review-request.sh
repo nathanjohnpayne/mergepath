@@ -1468,9 +1468,9 @@ governing_request_attempt_cap() {
   base_cap=$(printf '%s' "$budget_json" | jq -r '.max_request_attempts')
 
   GOVERNING_REQUEST_ATTEMPT_CAP="$base_cap"
+  # Validated only where it is used (a new request): an acknowledgement retry
+  # does not re-check the blocking budget, so it must not fail on it either.
   GOVERNING_BLOCKING_REVIEW_BUDGET=$(printf '%s' "$budget_json" | jq -r '.max_blocking_reviews')
-  [[ "$GOVERNING_BLOCKING_REVIEW_BUDGET" =~ ^[0-9]+$ ]] \
-    || die 3 "cannot read the governing blocking-review budget; refusing a new '@codex review' trigger"
 }
 
 # The blocking-review budget (#1560 slice 3). Counts, across the whole PR, the
@@ -1572,6 +1572,8 @@ post_codex_trigger() {
   # acknowledgement retry re-asks for the request already posted after this
   # check passed, so it is not re-checked here.
   if [ "$TRIGGER_POSTED" != "true" ]; then
+    [[ "$GOVERNING_BLOCKING_REVIEW_BUDGET" =~ ^[0-9]+$ ]] \
+      || die 3 "the governing codex.max_blocking_reviews is invalid; refusing a new '@codex review' trigger"
     BLOCKING_REVIEW_LIMIT="$GOVERNING_BLOCKING_REVIEW_BUDGET"
     count_blocking_reviews
     if [ "$BLOCKING_REVIEW_COUNT" -ge "$BLOCKING_REVIEW_LIMIT" ]; then

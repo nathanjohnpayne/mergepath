@@ -20,6 +20,9 @@ LEDGER_STUB="$WORKDIR/codex-ledger-stub.sh"
 cat >"$LEDGER_STUB" <<'LEDGER_EOF'
 #!/usr/bin/env bash
 [ -z "${CODEX_LEDGER_STUB_LOG:-}" ] || printf '%s\n' "$*" >>"$CODEX_LEDGER_STUB_LOG"
+# Simulates the governed budget turning malformed after the initial request.
+[ -z "${CODEX_LEDGER_STUB_BREAK_POLICY:-}" ] \
+  || printf '  max_blocking_reviews: false\n' >>"$CODEX_LEDGER_STUB_BREAK_POLICY"
 head=""
 while [ $# -gt 0 ]; do
   case "$1" in --expect-head) head=$2; shift 2 ;; *) shift ;; esac
@@ -495,6 +498,23 @@ test_eyes_ack_does_not_retrigger_or_clear() {
     fail "eyes ack: JSON reaction was $reaction, expected null (+1-only contract)"
   else
     pass "eyes ack present: no re-trigger and eyes-only state does not clear"
+  fi
+}
+
+# #1560 slice 3 (Codex P2 on #1576): an acknowledgement retry does not re-check
+# the blocking-review budget, so a governed max_blocking_reviews that turns
+# malformed after the initial request must not fail the retry.
+test_ack_retry_ignores_blocking_budget_value() {
+  local dir rc count
+  dir=$(make_case "retry-blocking-malformed" 0 1)
+  rc=$(CODEX_LEDGER_STUB_BREAK_POLICY="$dir/state/base-review-policy.yml" run_case "$dir" absent)
+  count=$(trigger_count "$dir")
+  if ! grep -q 'max_blocking_reviews: false' "$dir/state/base-review-policy.yml"; then
+    fail "ack retry blocking budget: the stub did not break the governed value"
+  elif [ "$rc" != "4" ] || [ "$count" != "2" ]; then
+    fail "ack retry blocking budget: exit $rc with $count triggers, expected 4 with the retry posted; stderr=$(cat "$dir/err.log")"
+  else
+    pass "ack retry: a governed blocking budget that turns malformed after the initial request does not fail the retry"
   fi
 }
 
@@ -1431,6 +1451,7 @@ test_default_reply_deadline_is_1800() {
 
 test_eyes_ack_does_not_retrigger_or_clear
 test_missing_ack_retriggers_once
+test_ack_retry_ignores_blocking_budget_value
 test_retry_cap_respected
 test_request_attempt_cap_suppresses_ack_retry_but_polls
 test_reused_final_slot_trigger_polls_arriving_response

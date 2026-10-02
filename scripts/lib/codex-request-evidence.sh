@@ -71,7 +71,8 @@ crqe_request_threshold() { # head-committer-date timeline-json freshness-seconds
 # Resolve the request budget from the PR's governing base policy. The caller
 # must already have sourced feedback-policy-helpers.sh (policy_yaml_to_json).
 # Prints {author_identity,max_request_attempts,max_blocking_reviews,
-# reaction_freshness_window_seconds};
+# reaction_freshness_window_seconds}, with max_blocking_reviews null when its
+# governed value is invalid;
 # returns non-zero on every
 # unreadable or malformed input. A materialized policy is removed here.
 crqe_governing_budget() { # repo pr default-config candidate-author [resolver [base-ref base-sha default-branch]]
@@ -119,7 +120,10 @@ crqe_governing_budget() { # repo pr default-config candidate-author [resolver [b
   # The blocking-review budget (#1560 slice 3): solicited blocking Codex
   # reviews a PR may accumulate before further requests stop for the human.
   # Same governing source, absent default and validation as the request cap.
-  # 10 is a provisional policy choice recorded on #1560.
+  # 10 is a provisional policy choice recorded on #1560. An invalid value is
+  # reported as null rather than failing the whole read, so a path that does
+  # not use the budget (an acknowledgement retry, a request-ceiling read) keeps
+  # its behaviour; every reader that uses it must refuse null.
   blocking=$(printf '%s' "$base_json" | jq -r '
     if type != "object" then "__invalid__"
     elif (has("codex") | not) then "10"
@@ -128,10 +132,17 @@ crqe_governing_budget() { # repo pr default-config candidate-author [resolver [b
       .codex.max_blocking_reviews
       | if (type == "string" or type == "number") then tostring else "__invalid__" end
     else "10" end') || return 1
-  case "$blocking" in ''|*[!0-9]*) return 1 ;; esac
-  [ "${#blocking}" -le 9 ] || return 1
-  blocking=$(printf '%s' "$blocking" | sed 's/^0*//')
-  [ -n "$blocking" ] || blocking=0
+  case "$blocking" in
+    ''|*[!0-9]*) blocking=null ;;
+    *)
+      if [ "${#blocking}" -le 9 ]; then
+        blocking=$(printf '%s' "$blocking" | sed 's/^0*//')
+        [ -n "$blocking" ] || blocking=0
+      else
+        blocking=null
+      fi
+      ;;
+  esac
   freshness=$(printf '%s' "$base_json" | jq -r '
     if type != "object" then "__invalid__"
     elif (has("codex") | not) then "1800"
