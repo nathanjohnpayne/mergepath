@@ -252,8 +252,8 @@ while IFS= read -r review; do
   while IFS= read -r c; do
     [ -n "$c" ] || continue
     tier=$(codex_tier_of "$(jqx "review comment" -r '.body // ""' <<<"$c")")
-    roots=$(jqx "review comment" -c --argjson id "$(jqx "review comment" '.id' <<<"$c")" \
-      --arg tier "${tier:-unmarked}" '. + [{comment_id: $id, tier: $tier}]' <<<"$roots")
+    roots=$(jqx "review comment" -c --argjson c "$c" \
+      --arg tier "${tier:-unmarked}" '. + [{comment_id: $c.id, tier: $tier, path: ($c.path // null)}]' <<<"$roots")
   done <<<"$(jqx "review $rid comments" -c --argjson rid "$rid" \
                '.[] | select(.pull_request_review_id == $rid and .in_reply_to_id == null)' <<<"$BOT_REVIEW_COMMENTS")"
   replies=$(jqx "review $rid replies" -c --argjson rid "$rid" \
@@ -271,6 +271,44 @@ while IFS= read -r review; do
            body_tiers: $bt, root_findings: $roots, reply_comments: $nreplies,
            reply_markers: $markers}]' <<<"$LEDGER_REVIEWS")
 done <<<"$(jqx "reviews" -c '.[]' <<<"$BOT_REVIEWS")"
+
+# ---- rebuttals (#1560 slice 3) ---------------------------------------------------
+# A Codex inline finding is rebutted when its thread carries a
+# `[mergepath-resolve: rebuttal-recorded]` reply, or its root carries a thumbs-
+# down from anyone but the bot (codex-record-feedback.sh's rebutted verdict).
+# The rebuttal's time is the LATEST of its proven evidence: the tag replies
+# (each at the later of its creation and last edit)
+# and the non-bot thumbs-downs. Other replies in the thread are not used: an
+# earlier question or fix note would date the rebuttal too early, and a Codex
+# response in between would then read as having tested it. Dating late errs
+# toward "untested", which stops for the human. A thumbs-down is read only for roots whose
+# reaction rollup does not rule one out. Rebuttals of review-body findings
+# leave no per-finding record and are not seen.
+REBUTTALS='[]'
+while IFS= read -r root; do
+  [ -n "$root" ] || continue
+  rid=$(jqx "rebuttal root" -r '.id' <<<"$root")
+  times=$(jqx "thread $rid replies" -c --argjson rid "$rid" --arg bot "$BOT" '
+    [ .[] | select(.in_reply_to_id == $rid and (.user.login // "") != $bot) ] as $replies
+    | [ $replies[] | select((.body // "") | test("\\[mergepath-resolve:\\s*rebuttal-recorded\\]"))
+        # An existing reply edited to carry the tag dates from the edit: its
+        # creation time could predate a Codex review that never saw the tag.
+        | ([.created_at, .updated_at] | map(select(type == "string")) | max) ]' <<<"$REVIEW_COMMENTS")
+  sources=$(jqx "thread $rid" -c 'if length > 0 then ["tag"] else [] end' <<<"$times")
+  if [ "$(jqx "root $rid reactions rollup" -r '((.reactions // {})["-1"] // 1) > 0' <<<"$root")" = true ]; then
+    down=$(read_array "repos/$REPO/pulls/comments/$rid/reactions" "finding $rid reactions")
+    down=$(jqx "finding $rid reactions" -c --arg bot "$BOT" \
+      '[ .[] | select(.content == "-1" and (.user.login // "") != $bot) | .created_at ]' <<<"$down")
+    if [ "$(jqx "finding $rid reactions" 'length' <<<"$down")" -gt 0 ]; then
+      times=$(jqx "finding $rid" -c --argjson d "$down" '. + $d' <<<"$times")
+      sources=$(jqx "finding $rid" -c '. + ["thumbs-down"]' <<<"$sources")
+    fi
+  fi
+  if [ "$(jqx "finding $rid" 'length' <<<"$times")" -gt 0 ]; then
+    REBUTTALS=$(jqx "rebuttals" -c --argjson r "$root" --argjson t "$times" --argjson s "$sources" \
+      '. + [{finding: $r.id, path: ($r.path // null), at: ($t | max), sources: $s}]' <<<"$REBUTTALS")
+  fi
+done <<<"$(jqx "review comments" -c '.[] | select(.in_reply_to_id == null)' <<<"$BOT_REVIEW_COMMENTS")"
 
 # ---- verdicts, reactions, provider blocks, summary ------------------------------
 VERDICTS=$(crqe_verdicts "$ISSUE_COMMENTS" "$BOT") || die "cannot parse Codex verdict comments"
@@ -299,16 +337,18 @@ printf '%s\n' "$VERDICTS" >"$LEDGER_TMP/in_verdicts.json"
 printf '%s\n' "$REACTIONS" >"$LEDGER_TMP/in_reactions.json"
 printf '%s\n' "$BLOCKS" >"$LEDGER_TMP/in_blocks.json"
 printf '%s\n' "$SUMMARY_JSON" >"$LEDGER_TMP/in_summary.json"
+printf '%s\n' "$REBUTTALS" >"$LEDGER_TMP/in_rebuttals.json"
 INPUTS=$(jqx "ledger inputs" -n \
   --argjson pr "$PR_NUMBER" --arg repo "$REPO" --arg head "$HEAD_SHA" \
   --arg author "$AUTHOR" --arg bot "$BOT" --argjson required "$REQUIRED_JSON" \
   --slurpfile requests "$LEDGER_TMP/in_requests.json" --slurpfile reviews "$LEDGER_TMP/in_reviews.json" \
   --slurpfile verdicts "$LEDGER_TMP/in_verdicts.json" --slurpfile reactions "$LEDGER_TMP/in_reactions.json" \
   --slurpfile blocks "$LEDGER_TMP/in_blocks.json" --slurpfile summary "$LEDGER_TMP/in_summary.json" \
+  --slurpfile rebuttals "$LEDGER_TMP/in_rebuttals.json" \
   '{pr: $pr, repo: $repo, head_sha: $head, author: $author, bot: $bot,
     required_tiers: $required, requests: $requests[0], reviews: $reviews[0],
     verdicts: $verdicts[0], reactions: $reactions[0], blocks: $blocks[0],
-    summary: $summary[0]}')
+    summary: $summary[0], rebuttals: $rebuttals[0]}')
 LEDGER=$(crl_ledger "$INPUTS") || die "ledger computation failed"
 # The evidence reads above take time; a push that lands during them would
 # leave this ledger describing a head the PR no longer has. Re-read the live
