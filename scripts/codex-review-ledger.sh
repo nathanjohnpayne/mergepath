@@ -116,6 +116,20 @@ BOT=${BOT:-chatgpt-codex-connector[bot]}
 tiers_rc=0
 REQUIRED_TIERS=$(resolve_required_tiers "$POLICY_FILE") || tiers_rc=$?
 [ "$tiers_rc" -ne 2 ] || die "governing feedback_policy is malformed"
+# The shared tier reader is line-oriented, so a flow-style block
+# (`feedback_policy: {mode: address-all}`) reads as no required tiers.
+# Cross-check it against the parsed policy and refuse to guess when they
+# disagree, rather than add a second tier reader the requester and gate
+# would not share.
+READER_TIERS=$(printf '%s\n' "$REQUIRED_TIERS" | jq -Rsc 'split("\n") | map(select(length > 0)) | sort')
+PARSED_TIERS=$(printf '%s' "$POLICY_JSON" | jq -c '
+  ["p0","p1","p2","p3","nitpick"] as $all
+  | if (has("feedback_policy") | not) then ["p1"]
+    elif (.feedback_policy | type) != "object" then ["__unreadable__"]
+    elif (.feedback_policy.mode // "by-priority") == "address-all" then $all
+    else .feedback_policy as $fp | [ $all[] | select(($fp.priorities // {})[.] == "required") ] end
+  | sort') || die "governing feedback_policy does not parse"
+[ "$READER_TIERS" = "$PARSED_TIERS" ] || die "governing feedback_policy reads as $READER_TIERS through the shared tier reader but $PARSED_TIERS when parsed (flow-style YAML?); refusing to guess"
 REQUIRED_JSON=$(printf '%s\n' "$REQUIRED_TIERS" | jq -Rsc 'split("\n") | map(select(length > 0))')
 
 # ---- reads -------------------------------------------------------------------

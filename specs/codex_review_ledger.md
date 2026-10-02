@@ -4,7 +4,7 @@
 
 ## Inputs and authority
 
-The configured author, the Codex bot login (an absent or empty value defaults to `chatgpt-codex-connector[bot]`) and the required feedback tiers come from the pull request's governing base policy (`scripts/workflow/resolve_base_policy.sh`), the same authority the request cap reads. A policy that is not an object, or a malformed `author_identity` or `feedback_policy`, fails closed.
+The configured author, the Codex bot login (an absent or empty value defaults to `chatgpt-codex-connector[bot]`) and the required feedback tiers come from the pull request's governing base policy (`scripts/workflow/resolve_base_policy.sh`), the same authority the request cap reads. A policy that is not an object, or a malformed `author_identity` or `feedback_policy`, fails closed. Required tiers come from the shared line-oriented reader `resolve_required_tiers`, the one the requester and the merge gate use; the ledger cross-checks its result against the parsed policy and fails closed when they disagree (for example a flow-style `feedback_policy: {...}`), rather than adding a second tier reader.
 
 Every comment body is parsed by an existing shared helper: requests by `crqe_trigger_generation`, finding tiers by `codex_tiers_of` / `codex_tier_of`, provider blocks by `codex_failure_marker_of`, verdicts by `crqe_verdicts`, and the current Review Summary by `crqe_select_codex_review_summary`. `crqe_verdicts` uses the exact anchor and affirmative expressions `codex-review-request.sh` and `codex-review-check.sh` carry (the test pins all three copies); it differs from them only in selection, reporting every verdict instead of the latest one on the current head. A failed read, or malformed evidence anywhere (a qualifying request without a positive integer id, a review that does not parse), exits `3` and prints nothing. Repeated pagination items are de-duplicated by id.
 
@@ -34,7 +34,7 @@ Signals belong to the window of the latest request posted at or before them; sig
 
 Review objects whose inline comments are all thread replies are not responses. They are listed under `thread_reply_reviews` with any provider marker in the replies, because a connector reply in a review thread lands as one.
 
-A response class says what Codex answered and nothing about merge clearance, which stays with `codex-review-check.sh`. A response with a review takes the review's grade: `blocking` (a finding in a required tier, with P0 always blocking), `discretionary` (findings, none required, including unmarked ones), or `no_findings`. Without a review, verdicts decide (`clean` when all are affirmative, otherwise `unknown_tier`), then a thumbs-up (`clean`), then a block notice (`provider_blocked`). A blocking review alongside a clean signal, or affirmative and non-affirmative verdicts together, is `conflicting`.
+A response class says what Codex answered and nothing about merge clearance, which stays with `codex-review-check.sh`. A response with a review takes the review's grade: `blocking` (a finding in a required tier, with P0 always blocking), `discretionary` (findings, none required, including unmarked ones), or `no_findings`. Without a review, verdicts decide (`clean` when all are affirmative, otherwise `unknown_tier`), then a thumbs-up (`clean`), then a block notice (`provider_blocked`). A blocking review alongside a clean signal, or affirmative and non-affirmative verdicts together (whether or not a review is present), is `conflicting`.
 
 ## Attribution
 

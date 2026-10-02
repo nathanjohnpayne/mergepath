@@ -137,6 +137,10 @@ L=$(ledger "$(req 1 $T0 | arr)" "$(review 10 $T1 $HEAD_A '["p2"]' | arr)" "$(ver
 check "a non-affirmative verdict joins its review and takes the review's class" "$L" \
   '.summary.responses == 1 and .responses[0].anchor == "'"$HEAD_A"'" and .responses[0].class == "discretionary"'
 
+L=$(ledger "$(req 1 $T0 | arr)" "$(review 10 $T1 $HEAD_A '["p2"]' | arr)" "$( { verdict 20 $T2 '["aaaaaaa"]' true; verdict 21 $T3 '["aaaaaaa"]' false; } | arr)" '[]' '[]')
+check "contradictory verdicts beside a review keep the review class and are flagged conflicting" "$L" \
+  '.responses[0].class == "discretionary" and .responses[0].conflicting == true'
+
 L=$(ledger "$(req 1 $T0 | arr)" '[]' "$(verdict 20 $T1 '["aaaaaaa"]' false | arr)" '[]' '[]')
 check "a non-affirmative verdict with no review to grade is unknown_tier" "$L" '.responses[0].class == "unknown_tier"'
 
@@ -359,6 +363,28 @@ if [ "$RC" = 0 ] && [ "$(wc -c <"$D/issue_comments.json")" -gt 2000000 ] && jq -
   pass "CLI: a comment history larger than the argument limit is read through files"
 else
   fail "CLI large input: rc=$RC size=$(wc -c <"$D/issue_comments.json") err=$(tail -2 "$D/err")"
+fi
+
+D="$WORK/flowpolicy"; make_cli_case "$D"
+printf '%s\n' 'author_identity: nathanjohnpayne' 'feedback_policy: {mode: address-all}' >"$D/policy.yml"
+printf '[]\n' >"$D/issue_comments.json"
+RC=$(run_cli "$D")
+if [ "$RC" = 3 ] && [ ! -s "$D/out" ] && grep -q 'refusing to guess' "$D/err"; then
+  pass "CLI: a feedback_policy the shared tier reader cannot read fails closed"
+else
+  fail "CLI flow-style policy: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
+fi
+
+D="$WORK/blockpolicy"; make_cli_case "$D"
+printf '%s\n' 'author_identity: nathanjohnpayne' 'feedback_policy:' '  mode: address-all' >"$D/policy.yml"
+jq -n '[{id: 101, user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"}]' >"$D/issue_comments.json"
+jq -n '[{id: 50, user: {login: "chatgpt-codex-connector[bot]"}, submitted_at: "2026-09-25T00:05:00Z", commit_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", body: ""}]' >"$D/reviews.json"
+jq -n '[{id: 60, user: {login: "chatgpt-codex-connector[bot]"}, pull_request_review_id: 50, in_reply_to_id: null, body: "![P2 Badge] minor", created_at: "2026-09-25T00:05:00Z"}]' >"$D/review_comments.json"
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && jq -e '(.required_tiers | index("p2") != null) and .responses[0].class == "blocking"' "$D/out" >/dev/null; then
+  pass "CLI: a block-style address-all policy makes a P2 blocking"
+else
+  fail "CLI block-style policy: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
 fi
 
 D="$WORK/readfail"; make_cli_case "$D"

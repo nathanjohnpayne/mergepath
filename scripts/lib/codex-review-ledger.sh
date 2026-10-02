@@ -121,8 +121,10 @@ crl_ledger() {
         | ([ $g.sigs[] | select(.kind == "reaction") ]) as $rea
         | ([ $g.sigs[] | select(.kind == "block") ]) as $blk
         | (($ver | any(.affirmative)) or ($rea | length) > 0) as $clean_signal
+        | (($ver | any(.affirmative)) and ($ver | any(.affirmative | not))) as $verdicts_disagree
         | if $rev != null then
-            { class: $rev.grade, conflicting: ($rev.grade == "blocking" and $clean_signal) }
+            { class: $rev.grade,
+              conflicting: (($rev.grade == "blocking" and $clean_signal) or $verdicts_disagree) }
           elif ($ver | length) > 0 then
             { class: (if ($ver | all(.affirmative)) then "clean" else "unknown_tier" end),
               conflicting: (($ver | any(.affirmative)) and ($ver | any(.affirmative | not))) }
