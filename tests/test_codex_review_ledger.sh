@@ -315,6 +315,20 @@ else
   fail "CLI empty bot_login: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
 fi
 
+# A busy PR's comment history is larger than the OS argument limit; it must
+# reach jq through files, not argv (8 PRs failed this way in calibration).
+D="$WORK/large"; make_cli_case "$D"
+jq -n --arg pad "$(head -c 4000 /dev/zero | tr '\0' 'x')" '
+  [{id: 101, user: {login: "nathanjohnpayne"}, body: "@codex review", created_at: "2026-09-25T00:00:00Z"}]
+  + [range(1; 600) | {id: (1000 + .), user: {login: "someone"}, body: ("note " + $pad), created_at: "2026-09-25T00:01:00Z"}]' \
+  >"$D/issue_comments.json"
+RC=$(run_cli "$D")
+if [ "$RC" = 0 ] && [ "$(wc -c <"$D/issue_comments.json")" -gt 2000000 ] && jq -e '.summary.requests == 1' "$D/out" >/dev/null; then
+  pass "CLI: a comment history larger than the argument limit is read through files"
+else
+  fail "CLI large input: rc=$RC size=$(wc -c <"$D/issue_comments.json") err=$(tail -2 "$D/err")"
+fi
+
 D="$WORK/readfail"; make_cli_case "$D"
 printf '[]\n' >"$D/issue_comments.json"
 RC=$(LEDGER_TEST_FAIL_ENDPOINT=repos/o/r/pulls/7/reviews run_cli "$D")

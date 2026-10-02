@@ -90,8 +90,15 @@ DEFAULT_CONFIG="${MERGEPATH_REVIEW_POLICY_PATH:-.github/review-policy.yml}"
 POLICY_FILE=$("$RESOLVER" --repo "$REPO" --pr "$PR_NUMBER" --default-config "$DEFAULT_CONFIG" \
   --materialize-default 2>/dev/null) || die "cannot resolve the governing base policy"
 [ -n "$POLICY_FILE" ] && [ -r "$POLICY_FILE" ] || die "governing base policy is unreadable"
-cleanup_policy() { [ "$POLICY_FILE" = "$DEFAULT_CONFIG" ] || rm -f "$POLICY_FILE" 2>/dev/null || true; }
-trap cleanup_policy EXIT
+# Large evidence travels to jq through files, never argv: a busy PR's comment
+# history exceeds the OS argument-size limit (observed on #1541 and
+# nathanpaynedotcom#1037 in the #1560 calibration).
+LEDGER_TMP=$(mktemp -d "${TMPDIR:-/tmp}/codex-review-ledger.XXXXXX") || die "cannot create a temporary directory"
+cleanup() {
+  [ "$POLICY_FILE" = "$DEFAULT_CONFIG" ] || rm -f "$POLICY_FILE" 2>/dev/null || true
+  rm -rf "$LEDGER_TMP" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 POLICY_JSON=$(policy_yaml_to_json "$POLICY_FILE" 2>/dev/null) || die "governing base policy does not parse"
 # Same rules as crqe_governing_budget: the policy must be an object, and an
@@ -116,6 +123,9 @@ ISSUE_COMMENTS=$(read_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comm
 REVIEWS=$(read_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
 REVIEW_COMMENTS=$(read_array "repos/$REPO/pulls/$PR_NUMBER/comments" "review comments")
 ISSUE_REACTIONS=$(read_array "repos/$REPO/issues/$PR_NUMBER/reactions" "issue reactions")
+printf '%s\n' "$ISSUE_COMMENTS" >"$LEDGER_TMP/issue_comments.json"
+printf '%s\n' "$REVIEW_COMMENTS" >"$LEDGER_TMP/review_comments.json"
+printf '%s\n' "$REVIEWS" >"$LEDGER_TMP/reviews.json"
 
 # ---- requests ------------------------------------------------------------------
 # Counted requests are the configured author's exact commands, by the shared
@@ -129,10 +139,12 @@ REQUESTS=$(jqx "issue comments" -c --argjson ids "$REQUEST_IDS" '
   [ .[] | select(.id as $i | $ids | index($i))
     | {id, created_at, counted: true, source: "issue_comment", author: .user.login} ]
   | unique_by(.id)' <<<"$ISSUE_COMMENTS")
-FOREIGN=$(jqx "request mentions" -nc --argjson ic "$ISSUE_COMMENTS" --argjson rc "$REVIEW_COMMENTS" \
-  --argjson rv "$REVIEWS" --argjson ids "$REQUEST_IDS" --arg bot "$BOT" '
+FOREIGN=$(jqx "request mentions" -nc --slurpfile ic "$LEDGER_TMP/issue_comments.json" \
+  --slurpfile rc "$LEDGER_TMP/review_comments.json" --slurpfile rv "$LEDGER_TMP/reviews.json" \
+  --argjson ids "$REQUEST_IDS" --arg bot "$BOT" '
   def mentions: (.body // "") | test("@codex review"; "i");
-  [ ($ic[] | select((.id as $i | $ids | index($i)) | not)
+  ($ic[0]) as $ic | ($rc[0]) as $rc | ($rv[0]) as $rv
+  | [ ($ic[] | select((.id as $i | $ids | index($i)) | not)
             | select((.user.login // "") != $bot and mentions)
             | {id, created_at, source: "issue_comment"}),
     ($rc[] | select((.user.login // "") != $bot and mentions)
@@ -141,8 +153,10 @@ FOREIGN=$(jqx "request mentions" -nc --argjson ic "$ISSUE_COMMENTS" --argjson rc
            | {id, created_at: .submitted_at, source: "review"}) ]
   | map(. + {counted: false, author: null})
   | unique_by([.source, .id])')
-FOREIGN=$(jqx "request mentions" -c --argjson ic "$ISSUE_COMMENTS" --argjson rc "$REVIEW_COMMENTS" --argjson rv "$REVIEWS" '
-  map(. as $f | .author = (
+FOREIGN=$(jqx "request mentions" -c --slurpfile ic "$LEDGER_TMP/issue_comments.json" \
+  --slurpfile rc "$LEDGER_TMP/review_comments.json" --slurpfile rv "$LEDGER_TMP/reviews.json" '
+  ($ic[0]) as $ic | ($rc[0]) as $rc | ($rv[0]) as $rv
+  | map(. as $f | .author = (
         if $f.source == "issue_comment" then ($ic | map(select(.id == $f.id)) | first | .user.login)
         elif $f.source == "review_comment" then ($rc | map(select(.id == $f.id)) | first | .user.login)
         else ($rv | map(select(.id == $f.id)) | first | .user.login) end))' <<<"$FOREIGN")
@@ -159,8 +173,10 @@ while IFS= read -r rid; do
     | min' <<<"$reactions")
   EYES=$(jqx "eyes" -c --arg id "$rid" --argjson at "$eyes_at" '.[$id] = $at' <<<"$EYES")
 done <<<"$(jqx "request ids" -r '.[]' <<<"$REQUEST_IDS")"
-REQUESTS=$(jqx "requests" -nc --argjson c "$REQUESTS" --argjson f "$FOREIGN" --argjson eyes "$EYES" '
-  ($c | map(.eyes_at = $eyes[(.id | tostring)])) + ($f | map(.eyes_at = null))')
+printf '%s\n' "$REQUESTS" >"$LEDGER_TMP/counted.json"
+printf '%s\n' "$FOREIGN" >"$LEDGER_TMP/foreign.json"
+REQUESTS=$(jqx "requests" -c --slurpfile f "$LEDGER_TMP/foreign.json" --argjson eyes "$EYES" '
+  map(.eyes_at = $eyes[(.id | tostring)]) + ($f[0] | map(.eyes_at = null))' <"$LEDGER_TMP/counted.json")
 
 # ---- Codex reviews -------------------------------------------------------------
 BOT_REVIEWS=$(jqx "reviews" -c --arg bot "$BOT" '[.[] | select(.user.login == $bot)] | unique_by(.id)' <<<"$REVIEWS")
@@ -217,16 +233,22 @@ done <<<"$(jqx "bot comments" -c --arg bot "$BOT" --argjson verdict_ids "$(jqx "
 SUMMARY_JSON=$(crqe_select_codex_review_summary "$ISSUE_COMMENTS" "$BOT" "$HEAD_SHA") \
   || die "cannot read the Codex Review Summary"
 
+printf '%s\n' "$REQUESTS" >"$LEDGER_TMP/in_requests.json"
+printf '%s\n' "$LEDGER_REVIEWS" >"$LEDGER_TMP/in_reviews.json"
+printf '%s\n' "$VERDICTS" >"$LEDGER_TMP/in_verdicts.json"
+printf '%s\n' "$REACTIONS" >"$LEDGER_TMP/in_reactions.json"
+printf '%s\n' "$BLOCKS" >"$LEDGER_TMP/in_blocks.json"
+printf '%s\n' "$SUMMARY_JSON" >"$LEDGER_TMP/in_summary.json"
 INPUTS=$(jqx "ledger inputs" -n \
   --argjson pr "$PR_NUMBER" --arg repo "$REPO" --arg head "$HEAD_SHA" \
   --arg author "$AUTHOR" --arg bot "$BOT" --argjson required "$REQUIRED_JSON" \
-  --argjson requests "$REQUESTS" \
-  --argjson reviews "$LEDGER_REVIEWS" --argjson verdicts "$VERDICTS" \
-  --argjson reactions "$REACTIONS" --argjson blocks "$BLOCKS" --argjson summary "$SUMMARY_JSON" \
+  --slurpfile requests "$LEDGER_TMP/in_requests.json" --slurpfile reviews "$LEDGER_TMP/in_reviews.json" \
+  --slurpfile verdicts "$LEDGER_TMP/in_verdicts.json" --slurpfile reactions "$LEDGER_TMP/in_reactions.json" \
+  --slurpfile blocks "$LEDGER_TMP/in_blocks.json" --slurpfile summary "$LEDGER_TMP/in_summary.json" \
   '{pr: $pr, repo: $repo, head_sha: $head, author: $author, bot: $bot,
-    required_tiers: $required, requests: $requests,
-    reviews: $reviews, verdicts: $verdicts, reactions: $reactions, blocks: $blocks,
-    summary: $summary}')
+    required_tiers: $required, requests: $requests[0], reviews: $reviews[0],
+    verdicts: $verdicts[0], reactions: $reactions[0], blocks: $blocks[0],
+    summary: $summary[0]}')
 LEDGER=$(crl_ledger "$INPUTS") || die "ledger computation failed"
 
 if [ "$SUMMARY" != true ]; then
