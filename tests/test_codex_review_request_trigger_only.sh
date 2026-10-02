@@ -566,7 +566,7 @@ test_blocking_budget_governing_value() {
 # available budget: each exits 3 before any request is posted.
 test_blocking_budget_fails_closed() {
   local name dir rc before
-  for name in missing nonzero garbage not-object head-mismatch author-mismatch bad-response-shape; do
+  for name in missing nonzero garbage not-object head-mismatch author-mismatch bad-response-shape unknown-class; do
     before=$FAIL
     dir=$(make_budget_case "blocking-fail-$name" '[]')
     case "$name" in
@@ -577,6 +577,7 @@ test_blocking_budget_fails_closed() {
       head-mismatch) printf 'other-sha\n' >"$dir/state/ledger-head" ;;
       author-mismatch) printf 'someone-else\n' >"$dir/state/ledger-author" ;;
       bad-response-shape) printf '[{"class":"blocking"}]\n' >"$dir/state/ledger-responses.json" ;;
+      unknown-class) printf '[{"class":"severe","unsolicited":false,"conflicting":false}]\n' >"$dir/state/ledger-responses.json" ;;
     esac
     rc=$(run_budget_case "$dir" fresh)
     [ "$rc" = 3 ] || fail "#1560 fail-closed $name: expected exit 3, got $rc; err=$(cat "$dir/err.log")"

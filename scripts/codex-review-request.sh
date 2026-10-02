@@ -1483,8 +1483,10 @@ governing_request_attempt_cap() {
 #     signal, or verdicts that disagree).
 # Unknown and conflicting evidence counts against the budget, never for it.
 # The count needs no request attribution, so the ledger's ambiguous windows
-# do not affect it. Sets BLOCKING_REVIEW_COUNT; any failure to produce an
-# exact count is exit 3 with no trigger posted.
+# do not affect it. A class outside the ledger's known set (version skew,
+# malformed output) is refused rather than read as non-blocking. Sets
+# BLOCKING_REVIEW_COUNT; any failure to produce an exact count is exit 3 with
+# no trigger posted.
 count_blocking_reviews() {
   local ledger_cmd ledger rc=0
   ledger_cmd="${MERGEPATH_CODEX_LEDGER_CMD:-$__CODEX_REQUEST_DIR/codex-review-ledger.sh}"
@@ -1499,7 +1501,8 @@ count_blocking_reviews() {
     if type == "object" and .head_sha == $head and .author == $author
        and (.responses | type) == "array"
        and all(.responses[]; (.unsolicited | type) == "boolean"
-                             and (.class | type) == "string"
+                             and (.class as $c | ["blocking", "discretionary", "no_findings", "clean",
+                                                  "unknown_tier", "provider_blocked"] | index($c)) != null
                              and (.conflicting | type) == "boolean")
     then [ .responses[]
            | select((.unsolicited | not)
