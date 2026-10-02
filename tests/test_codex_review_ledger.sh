@@ -356,10 +356,12 @@ for _mb in absent 3 false; do
 done
 
 # A non-string governing bot login is malformed, never coerced (#1576 round 4).
-for _bot in 42 '["chatgpt-codex-connector[bot]"]' '{x: 1}'; do
+for _bot in 42 '["chatgpt-codex-connector[bot]"]' '{x: 1}' codex-false; do
   D="$WORK/bot-$RANDOM"; make_cli_case "$D"
   printf '[]\n' >"$D/issue_comments.json"
   printf 'author_identity: nathanjohnpayne\ncodex:\n  bot_login: %s\n' "$_bot" >"$D/policy.yml"
+  # A boolean codex block is malformed too, not an empty one (CodeRabbit on #1576).
+  [ "$_bot" != codex-false ] || printf 'author_identity: nathanjohnpayne\ncodex: false\n' >"$D/policy.yml"
   RC=$(run_cli "$D")
   if [ "$RC" = 3 ] && [ ! -s "$D/out" ] && grep -q 'bot_login is malformed' "$D/err"; then
     pass "CLI: a governing bot_login of $_bot fails closed"

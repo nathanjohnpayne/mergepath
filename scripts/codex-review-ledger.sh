@@ -118,7 +118,7 @@ AUTHOR=$(printf '%s' "$POLICY_JSON" | jq -er '
 # A non-string bot login would be coerced to text that matches no Codex
 # activity, and an empty ledger would read as zero blocking reviews.
 BOT=$(printf '%s' "$POLICY_JSON" | jq -er '
-  (.codex // {}) | if type != "object" then error("codex")
+  (if .codex == null then {} else .codex end) | if type != "object" then error("codex")
   elif (.bot_login == null) then ""
   elif (.bot_login | type) == "string" then .bot_login
   else error("bot_login") end') || die "governing codex.bot_login is malformed (must be a string)"
