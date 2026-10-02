@@ -5470,6 +5470,26 @@ else
   fail "#1560 S3-4: no-adapter clear ceiling (rc=$rc handoff='$(cat "$HANDOFF_LOG" 2>/dev/null)'): $out"
 fi
 
+# The no-adapter fallback rechecks the waived ceiling before rendering the
+# handoff (#1579): a stop that appears after the cap-only barrier exits 8.
+_ceiling_count="$WORK/ceiling-flip-fallback.count"
+rm -f "$_ceiling_count"
+: >"$HANDOFF_LOG"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+set +e
+out="$(P4B_TEST_LEDGER_MODE=flip P4B_TEST_LEDGER_COUNT="$_ceiling_count" MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-stop.yml" P4B_ADAPTER_DIR="$WORK/cap-no-adapter" \
+  P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HEAD="$_p4a_head" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+  P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
+  P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" PATH="$WORK/barrier-bin:$PATH" \
+  bash "$ORCH" 7 --repo owner/repo --author claude --reviewer nathanpayne-codex --head "$_p4a_head" --diff-file "$DIFF" 2>/dev/null </dev/null)"; rc=$?
+set -e
+if [ "$rc" = 8 ] && [ ! -s "$HANDOFF_LOG" ] && [ "$(cat "$_ceiling_count")" -ge 2 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = request-ceiling-human-stop ]; then
+  pass "#1560 S3-4: with no adapter, a stop that appears before the handoff is rendered exits 8 instead"
+else
+  fail "#1560 S3-4: no-adapter fallback ceiling recheck (rc=$rc ledger-calls=$(cat "$_ceiling_count" 2>/dev/null) handoff='$(cat "$HANDOFF_LOG" 2>/dev/null)'): $out"
+fi
+
 _ceiling_count="$WORK/ceiling-flip.count"
 _ceiling_adapter="$WORK/ceiling-adapter.log"
 cat >"$BIN/fake-codex-ceiling-approve" <<EOF

@@ -307,6 +307,9 @@ stop_check "stops: a rebuttal with no Codex response after it is untested" "$(st
   '.stops == ["untested-rebuttal"] and .untested_rebuttals[0].finding == 100'
 IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" | arr)" '[]' "$(reaction 900 2026-09-25T02:10:00Z | arr)" '[]')
 stop_check "stops: a rebuttal Codex answered clean is settled" "$(stops "$IN" "$RB" 10)" '.stops == []'
+# A provider-block notice after the rebuttal is not Codex re-reading it (#1579).
+IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" | arr)" '[]' '[]' "$(block 901 2026-09-25T02:10:00Z usage_limit | arr)")
+stop_check "stops: a provider-block notice after a rebuttal leaves it untested" "$(stops "$IN" "$RB" 10)" '.stops == ["untested-rebuttal"]'
 # A response in the same second as the rebuttal cannot be shown to have read
 # it, so the rebuttal stays untested.
 IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" | arr)" '[]' "$(reaction 900 2026-09-25T02:10:00Z | arr)" '[]')
@@ -533,6 +536,7 @@ jq -n '[{id: 60, pull_request_review_id: 50, in_reply_to_id: null, path: "x.sh",
         {id: 61, pull_request_review_id: 51, in_reply_to_id: 60, path: "x.sh", user: {login: "nathanjohnpayne"}, body: "This does not apply because the caller already validates it.", created_at: "2026-09-25T00:20:00Z"},
         {id: 62, pull_request_review_id: 52, in_reply_to_id: 60, path: "x.sh", user: {login: "nathanjohnpayne"}, body: "[mergepath-resolve: rebuttal-recorded] rebutted", created_at: "2026-09-25T00:40:00Z"},
         {id: 70, pull_request_review_id: 50, in_reply_to_id: null, path: "y.sh", user: {login: "chatgpt-codex-connector[bot]"}, body: "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>** other", created_at: "2026-09-25T00:10:00Z", reactions: {"-1": 2}},
+        {id: 71, pull_request_review_id: 53, in_reply_to_id: 70, path: "y.sh", user: {login: "nathanjohnpayne"}, body: "[mergepath-resolve: rebuttal-recorded] rebutted", created_at: "2026-09-25T00:50:00Z"},
         {id: 80, pull_request_review_id: 50, in_reply_to_id: null, path: "z.sh", user: {login: "chatgpt-codex-connector[bot]"}, body: "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>** third", created_at: "2026-09-25T00:10:00Z", reactions: {"-1": 1}}]' >"$D/review_comments.json"
 jq -n '[{content: "-1", user: {login: "nathanpayne-claude"}, created_at: "2026-09-25T00:30:00Z"},
         {content: "-1", user: {login: "chatgpt-codex-connector[bot]"}, created_at: "2026-09-25T00:15:00Z"}]' >"$D/finding_reactions_70.json"
@@ -540,11 +544,11 @@ jq -n '[{content: "-1", user: {login: "chatgpt-codex-connector[bot]"}, created_a
 RC=$(run_cli "$D")
 if [ "$RC" = 0 ] && jq -e '
      (.rebuttals | map({finding, path, at, sources})) == [
-       {finding: 60, path: "x.sh", at: "2026-09-25T00:20:00Z", sources: ["tag"]},
-       {finding: 70, path: "y.sh", at: "2026-09-25T00:30:00Z", sources: ["thumbs-down"]}]
+       {finding: 60, path: "x.sh", at: "2026-09-25T00:40:00Z", sources: ["tag"]},
+       {finding: 70, path: "y.sh", at: "2026-09-25T00:50:00Z", sources: ["tag", "thumbs-down"]}]
      and (.responses[0].blocking_paths == ["x.sh", "y.sh", "z.sh"])' "$D/out" >/dev/null \
    && ! grep -q 'pulls/comments/60/reactions' "$D/calls"; then
-  pass "CLI: a tagged thread and a reviewer thumbs-down are rebuttals, dated from the earliest reply; the bot's own thumbs-down is not"
+  pass "CLI: a tagged thread and a reviewer thumbs-down are rebuttals, dated by the rebuttal evidence itself (not earlier replies); the bot's own thumbs-down is not"
 else
   fail "CLI rebuttals: rc=$RC out=$(jq -c '{rebuttals, paths: [.responses[].blocking_paths]}' "$D/out" 2>/dev/null) calls=$(tr '\n' ' ' <"$D/calls") err=$(cat "$D/err")"
 fi

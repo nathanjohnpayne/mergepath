@@ -666,7 +666,9 @@ run_same_head_barrier() {
   out="$(p4b_same_head_barrier "$REPO" "$PR" "$HEAD" "$REVIEWER" "$DRY_RUN" "$scope")" || rc=$?
   case "$rc" in
     0)
-      if [ "$where" = "pre-adapter" ]; then
+      # pre-fallback too (#1579): the no-adapter fallback revalidates a waived
+      # spent ceiling before it renders the handoff, and needs the evidence.
+      if [ "$where" = "pre-adapter" ] || [ "$where" = "pre-fallback" ]; then
         P4B_PRE_ADAPTER_CODEX_EVIDENCE="$(printf '%s' "$out" | jq -r '.codex_evidence // "unreadable"')"
       fi
       case "$where" in

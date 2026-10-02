@@ -276,9 +276,11 @@ done <<<"$(jqx "reviews" -c '.[]' <<<"$BOT_REVIEWS")"
 # A Codex inline finding is rebutted when its thread carries a
 # `[mergepath-resolve: rebuttal-recorded]` reply, or its root carries a thumbs-
 # down from anyone but the bot (codex-record-feedback.sh's rebutted verdict).
-# The rebuttal's time is the earliest of: the thumbs-down, the tag, and the
-# first non-bot reply in a tagged thread (the tag is posted at resolve time,
-# often after the rebuttal itself). A thumbs-down is read only for roots whose
+# The rebuttal's time is the LATEST of its proven evidence: the tag replies
+# and the non-bot thumbs-downs. Other replies in the thread are not used: an
+# earlier question or fix note would date the rebuttal too early, and a Codex
+# response in between would then read as having tested it. Dating late errs
+# toward "untested", which stops for the human. A thumbs-down is read only for roots whose
 # reaction rollup does not rule one out. Rebuttals of review-body findings
 # leave no per-finding record and are not seen.
 REBUTTALS='[]'
@@ -287,8 +289,7 @@ while IFS= read -r root; do
   rid=$(jqx "rebuttal root" -r '.id' <<<"$root")
   times=$(jqx "thread $rid replies" -c --argjson rid "$rid" --arg bot "$BOT" '
     [ .[] | select(.in_reply_to_id == $rid and (.user.login // "") != $bot) ] as $replies
-    | if any($replies[]; (.body // "") | test("\\[mergepath-resolve:\\s*rebuttal-recorded\\]"))
-      then [ $replies[].created_at ] else [] end' <<<"$REVIEW_COMMENTS")
+    | [ $replies[] | select((.body // "") | test("\\[mergepath-resolve:\\s*rebuttal-recorded\\]")) | .created_at ]' <<<"$REVIEW_COMMENTS")
   sources=$(jqx "thread $rid" -c 'if length > 0 then ["tag"] else [] end' <<<"$times")
   if [ "$(jqx "root $rid reactions rollup" -r '((.reactions // {})["-1"] // 1) > 0' <<<"$root")" = true ]; then
     down=$(read_array "repos/$REPO/pulls/comments/$rid/reactions" "finding $rid reactions")
@@ -301,7 +302,7 @@ while IFS= read -r root; do
   fi
   if [ "$(jqx "finding $rid" 'length' <<<"$times")" -gt 0 ]; then
     REBUTTALS=$(jqx "rebuttals" -c --argjson r "$root" --argjson t "$times" --argjson s "$sources" \
-      '. + [{finding: $r.id, path: ($r.path // null), at: ($t | min), sources: $s}]' <<<"$REBUTTALS")
+      '. + [{finding: $r.id, path: ($r.path // null), at: ($t | max), sources: $s}]' <<<"$REBUTTALS")
   fi
 done <<<"$(jqx "review comments" -c '.[] | select(.in_reply_to_id == null)' <<<"$BOT_REVIEW_COMMENTS")"
 

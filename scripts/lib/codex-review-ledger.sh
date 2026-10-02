@@ -351,7 +351,8 @@ crl_human_stops() {
     | .responses as \$rs
     | ([ \$rs[] | select($__CRL_COUNTS) ] | length) as \$n
     | [ .rebuttals[] | . as \$r
-        | [ \$rs[] | select(.first_at > \$r.at) ] as \$after
+        # A provider-block notice is not Codex re-reading the dispute.
+        | [ \$rs[] | select(.first_at > \$r.at and .class != \"provider_blocked\") ] as \$after
         | if (\$after | length) == 0 then {kind: \"untested\", finding: \$r.finding, path: \$r.path, at: \$r.at}
           else ( [ \$after[] | select(($__CRL_COUNTS)
                                      and (.blocking_unlocated or \$r.path == null
