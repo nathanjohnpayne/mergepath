@@ -5572,6 +5572,18 @@ fi
 
 # A request that lands DURING the recheck's human-stop read is caught by the
 # budget read that follows it (#1579): the recheck reads stops first, budget last.
+# The approving fake adapter is defined BEFORE the sweep (CodeRabbit on #1579):
+# with it missing, every placement would exercise the adapter-failure path
+# instead of a review that would otherwise post.
+_ceiling_adapter="$WORK/ceiling-adapter.log"
+cat >"$BIN/fake-codex-ceiling-approve" <<EOF
+#!/usr/bin/env bash
+cat >/dev/null 2>&1 || true
+printf 'adapter-ran\n' >"$_ceiling_adapter"
+printf '%s' '{"verdict":"APPROVED","summary":"ceiling review","findings":[]}'
+EOF
+chmod +x "$BIN/fake-codex-ceiling-approve"
+
 # The request lands during the Nth ledger read, i.e. the stop read of each
 # recheck in turn. Every recheck reads stops first and the budget last, so
 # every placement must exit 10; under a budget-first order the bump during the
@@ -5593,25 +5605,22 @@ for _bump_at in 2 3 4 5 6 7 8; do
   set -e
   [ "$(cat "$_bump_count" 2>/dev/null || printf 0)" -ge "$_bump_at" ] || break
   _bump_fired=$((_bump_fired + 1))
+  # The adapter ran: this placement is a real approve path, not a failure.
+  [ -s "$_ceiling_adapter" ] && rm -f "$_ceiling_adapter" || _bump_bad="$_bump_bad at-read-$_bump_at(adapter-did-not-run)"
   [ "$rc" = 10 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = false ] \
     && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = request-ceiling-authority-changed ] \
     || _bump_bad="$_bump_bad at-read-$_bump_at(rc=$rc)"
 done
-if [ -z "$_bump_bad" ] && [ "$_bump_fired" -ge 1 ]; then
+# Three rechecks follow the adapter (post-adapter, and the early and final
+# pre-post fences); each must have been swept.
+if [ -z "$_bump_bad" ] && [ "$_bump_fired" -ge 3 ]; then
   pass "#1560 S3-4: a request that lands during any recheck's stop read is caught by the budget read after it (exit 10; $_bump_fired placements)"
 else
-  fail "#1560 S3-4: request during a recheck's stop read slipped through:${_bump_bad:- no placement fired}"
+  fail "#1560 S3-4: request during a recheck's stop read slipped through or the sweep was partial (fired=$_bump_fired):${_bump_bad:- none}"
 fi
 
 _ceiling_count="$WORK/ceiling-flip.count"
 _ceiling_adapter="$WORK/ceiling-adapter.log"
-cat >"$BIN/fake-codex-ceiling-approve" <<EOF
-#!/usr/bin/env bash
-cat >/dev/null 2>&1 || true
-printf 'adapter-ran\n' >"$_ceiling_adapter"
-printf '%s' '{"verdict":"APPROVED","summary":"ceiling review","findings":[]}'
-EOF
-chmod +x "$BIN/fake-codex-ceiling-approve"
 rm -f "$_ceiling_count" "$_ceiling_adapter"
 : >"$HANDOFF_LOG"
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
