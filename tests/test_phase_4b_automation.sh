@@ -4714,6 +4714,8 @@ out="$(P4B_TEST_LEDGER_FP=1-1 P4B_TEST_LEDGER_MODE=clear P4B_TEST_BASE_POLICY_PA
 
 # The spent ceiling and the stops must be judged under one governing tuple
 # (#1579): a base that moved between the two reads is an authority error.
+# The route reads and sets these through bash dynamic scoping.
+# shellcheck disable=SC2034
 _route() { # <budget-json> <stops-json>
   (
     cx_budget_json=$1
