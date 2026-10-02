@@ -340,6 +340,21 @@ else
   fail "CLI expect-head malformed: rc=$RC out=$(cat "$D/out")"
 fi
 
+# The ledger reports the blocking-review budget of the policy snapshot it read
+# (#1576 round 5): absent is 10, a valid value is a number, an invalid one null.
+for _mb in absent 3 false; do
+  D="$WORK/maxblocking-$_mb"; make_cli_case "$D"
+  printf '[]\n' >"$D/issue_comments.json"
+  [ "$_mb" = absent ] || printf '  max_blocking_reviews: %s\n' "$_mb" >>"$D/policy.yml"
+  case "$_mb" in absent) _want=10 ;; 3) _want=3 ;; *) _want=null ;; esac
+  RC=$(run_cli "$D")
+  if [ "$RC" = 0 ] && [ "$(jq -c '.max_blocking_reviews' "$D/out")" = "$_want" ]; then
+    pass "CLI: a governing max_blocking_reviews of $_mb is reported as $_want"
+  else
+    fail "CLI max_blocking_reviews $_mb: rc=$RC got=$(jq -c '.max_blocking_reviews' "$D/out" 2>/dev/null) err=$(cat "$D/err")"
+  fi
+done
+
 # A non-string governing bot login is malformed, never coerced (#1576 round 4).
 for _bot in 42 '["chatgpt-codex-connector[bot]"]' '{x: 1}'; do
   D="$WORK/bot-$RANDOM"; make_cli_case "$D"

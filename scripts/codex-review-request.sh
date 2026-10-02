@@ -1496,9 +1496,16 @@ count_blocking_reviews() {
     --expect-head "$HEAD_SHA" "$PR_NUMBER") || rc=$?
   [ "$rc" -eq 0 ] \
     || die 3 "Codex review ledger failed (exit $rc); cannot count blocking reviews; refusing a new '@codex review' trigger"
-  BLOCKING_REVIEW_COUNT=$(printf '%s' "$ledger" | jq -er \
-    --arg head "$HEAD_SHA" --arg author "$AUTHOR_IDENTITY" '
-    if type == "object" and .head_sha == $head and .author == $author
+  # Exactly one ledger document (-s), read under the same policy snapshot as
+  # the limit: the ledger reports the max_blocking_reviews of the base policy
+  # it resolved, and a base that moved between the two resolutions makes them
+  # disagree, which is conflicting evidence rather than a value to pick.
+  BLOCKING_REVIEW_COUNT=$(printf '%s' "$ledger" | jq -ser \
+    --arg head "$HEAD_SHA" --arg author "$AUTHOR_IDENTITY" \
+    --argjson limit "$BLOCKING_REVIEW_LIMIT" '
+    if length != 1 then error("documents") else .[0] end
+    | if type == "object" and .head_sha == $head and .author == $author
+       and .max_blocking_reviews == $limit
        and (.responses | type) == "array"
        and all(.responses[]; (.unsolicited | type) == "boolean"
                              and (.class as $c | ["blocking", "discretionary", "no_findings", "clean",
@@ -1509,7 +1516,9 @@ count_blocking_reviews() {
                     and (.class == "blocking" or .class == "unknown_tier" or .conflicting)) ]
          | length
     else error("ledger") end' 2>/dev/null) \
-    || die 3 "Codex review ledger output is malformed or names another head or author; refusing a new '@codex review' trigger"
+    || die 3 "Codex review ledger output is malformed, or names another head, author or blocking-review budget; refusing a new '@codex review' trigger"
+  [[ "$BLOCKING_REVIEW_COUNT" =~ ^[0-9]+$ ]] \
+    || die 3 "Codex review ledger produced no single blocking-review count; refusing a new '@codex review' trigger"
 }
 
 preserve_final_request_timeout() { # <comments-json> <selected-trigger-json>

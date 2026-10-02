@@ -40,7 +40,7 @@ while [ $# -gt 0 ]; do
   case "$1" in --expect-head) head=$2; shift 2 ;; *) shift ;; esac
 done
 jq -nc --arg h "$head" --arg a "${CODEX_LEDGER_STUB_AUTHOR:-nathanjohnpayne}" \
-  '{head_sha: $h, author: $a, responses: []}'
+  '{head_sha: $h, author: $a, max_blocking_reviews: 10, responses: []}'
 LEDGER_EOF
 chmod +x "$LEDGER_STUB"
 export MERGEPATH_CODEX_LEDGER_CMD="$LEDGER_STUB"
@@ -434,8 +434,10 @@ if [ -f "$state/ledger-raw" ]; then cat "$state/ledger-raw"; exit 0; fi
 [ ! -f "$state/ledger-head" ] || head=$(cat "$state/ledger-head")
 author=nathanjohnpayne
 [ ! -f "$state/ledger-author" ] || author=$(cat "$state/ledger-author")
-jq -nc --arg h "$head" --arg a "$author" --slurpfile r "$state/ledger-responses.json" \
-  '{head_sha: $h, author: $a, responses: $r[0]}'
+max=10
+[ ! -f "$state/ledger-max" ] || max=$(cat "$state/ledger-max")
+jq -nc --arg h "$head" --arg a "$author" --argjson m "$max" --slurpfile r "$state/ledger-responses.json" \
+  '{head_sha: $h, author: $a, max_blocking_reviews: $m, responses: $r[0]}'
 EOF
   chmod +x "$dir/ledger-stub.sh"
   printf '%s\n' "$dir"
@@ -536,6 +538,7 @@ test_blocking_budget_governing_value() {
   local dir rc before=$FAIL value
   dir=$(make_budget_case "blocking-budget-three" "$(responses 3 blocking)")
   printf '  max_blocking_reviews: 3\n' >> "$dir/state/base-review-policy.yml"
+  printf '3\n' >"$dir/state/ledger-max"
   rc=$(run_budget_case "$dir" fresh)
   [ "$rc" = 7 ] || fail "#1560 budget 3: expected exit 7, got $rc; err=$(cat "$dir/err.log")"
   [ "$(jqf "$dir" '.cap_exhausted.max_blocking_reviews')" = 3 ] \
@@ -546,6 +549,7 @@ test_blocking_budget_governing_value() {
   dir=$(make_budget_case "blocking-budget-candidate" "$(responses 3 blocking)")
   printf '  max_blocking_reviews: 999\n' >> "$dir/.github/review-policy.yml"
   printf '  max_blocking_reviews: 3\n' >> "$dir/state/base-review-policy.yml"
+  printf '3\n' >"$dir/state/ledger-max"
   rc=$(run_budget_case "$dir" fresh)
   [ "$rc" = 7 ] || fail "#1560 candidate budget: expected exit 7, got $rc; err=$(cat "$dir/err.log")"
   [ "$(trig_count "$dir")" = 0 ] || fail "#1560 candidate budget: candidate raised its own budget"
@@ -566,7 +570,7 @@ test_blocking_budget_governing_value() {
 # available budget: each exits 3 before any request is posted.
 test_blocking_budget_fails_closed() {
   local name dir rc before
-  for name in missing nonzero garbage not-object head-mismatch author-mismatch bad-response-shape unknown-class; do
+  for name in missing nonzero garbage not-object head-mismatch author-mismatch bad-response-shape unknown-class two-documents budget-mismatch; do
     before=$FAIL
     dir=$(make_budget_case "blocking-fail-$name" '[]')
     case "$name" in
@@ -578,6 +582,9 @@ test_blocking_budget_fails_closed() {
       author-mismatch) printf 'someone-else\n' >"$dir/state/ledger-author" ;;
       bad-response-shape) printf '[{"class":"blocking"}]\n' >"$dir/state/ledger-responses.json" ;;
       unknown-class) printf '[{"class":"severe","unsolicited":false,"conflicting":false}]\n' >"$dir/state/ledger-responses.json" ;;
+      two-documents)
+        printf '{"head_sha":"head-sha","author":"nathanjohnpayne","max_blocking_reviews":10,"responses":[]}\n%.0s' 1 2 >"$dir/state/ledger-raw" ;;
+      budget-mismatch) printf '3\n' >"$dir/state/ledger-max" ;;
     esac
     rc=$(run_budget_case "$dir" fresh)
     [ "$rc" = 3 ] || fail "#1560 fail-closed $name: expected exit 3, got $rc; err=$(cat "$dir/err.log")"

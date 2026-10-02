@@ -295,6 +295,18 @@ INPUTS=$(jqx "ledger inputs" -n \
     verdicts: $verdicts[0], reactions: $reactions[0], blocks: $blocks[0],
     summary: $summary[0]}')
 LEDGER=$(crl_ledger "$INPUTS") || die "ledger computation failed"
+# The blocking-review budget of the policy snapshot this ledger was read
+# under, by crqe_governing_budget's rule (absent: 10; not one to nine digits:
+# null), so a consumer can refuse a limit read from a different snapshot.
+MAX_BLOCKING=$(printf '%s' "$POLICY_JSON" | jq -c '
+  (if (has("codex") | not) then "10"
+   elif ((.codex | type) != "object") then null
+   elif (.codex | has("max_blocking_reviews")) then
+     (.codex.max_blocking_reviews | if (type == "string" or type == "number") then tostring else null end)
+   else "10" end)
+  | if type == "string" and test("^[0-9]{1,9}$") then tonumber else null end') \
+  || die "governing codex.max_blocking_reviews does not parse"
+LEDGER=$(jqx "ledger" -c --argjson m "$MAX_BLOCKING" '. + {max_blocking_reviews: $m}' <<<"$LEDGER")
 
 if [ "$SUMMARY" != true ]; then
   printf '%s\n' "$LEDGER"
