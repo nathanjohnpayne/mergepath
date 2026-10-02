@@ -793,6 +793,12 @@ revalidate_request_ceiling_authority() {
   esac
   stops_json="$(p4b_codex_human_stops "$REPO" "$PR" "$HEAD")" || stops_rc=$?
   stops_state="$(printf '%s' "$stops_json" | jq -r '.state // "unsafe"' 2>/dev/null || printf unsafe)"
+  # One policy generation for the ceiling and the stops (#1579).
+  if [ "$stops_rc" -eq 0 ] && ! p4b_same_governing_tuple "$budget_json" "$stops_json"; then
+    stops_rc=2
+    stops_json='{"state":"unsafe","reason":"pr-policy-tuple-changed-between-ceiling-and-stops"}'
+    stops_state=unsafe
+  fi
   case "$stops_rc:$stops_state" in
     0:clear) return 0 ;;
     0:stop)

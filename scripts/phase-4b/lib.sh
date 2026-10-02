@@ -637,12 +637,14 @@ p4b_codex_request_budget_state() {
       '{state:"drift",reason:"pr-policy-tuple-changed",live_head:$after.head_sha,before:$before,after:$after}'
     return 2
   fi
+  # The governing tuple travels with a spent budget too (#1579), so a later
+  # human-stop read can prove it judged the same policy generation.
   if [ "$selected" != null ]; then
-    jq -nc --argjson n "$count" --argjson cap "$cap" --arg t "$threshold" \
-      '{state:"final-request-pending",request_attempts:$n,max_request_attempts:$cap,threshold:$t}'
+    jq -nc --argjson n "$count" --argjson cap "$cap" --arg t "$threshold" --argjson tuple "$initial_tuple" \
+      '{state:"final-request-pending",request_attempts:$n,max_request_attempts:$cap,threshold:$t,governing_tuple:$tuple}'
   else
-    jq -nc --argjson n "$count" --argjson cap "$cap" --arg t "$threshold" \
-      '{state:"exhausted",request_attempts:$n,max_request_attempts:$cap,threshold:$t}'
+    jq -nc --argjson n "$count" --argjson cap "$cap" --arg t "$threshold" --argjson tuple "$initial_tuple" \
+      '{state:"exhausted",request_attempts:$n,max_request_attempts:$cap,threshold:$t,governing_tuple:$tuple}'
   fi
 }
 
@@ -1771,6 +1773,15 @@ p4b_codex_human_stops() {
     '. + {state: (if (.stops | length) > 0 then "stop" else "clear" end), governing_tuple: $t}'
 }
 
+# p4b_same_governing_tuple <json-a> <json-b>: both carry a governing_tuple and
+# the two are identical (key order ignored). Absent on either side is false.
+p4b_same_governing_tuple() {
+  local a b
+  a=$(printf '%s' "$1" | jq -cSe '.governing_tuple | select(type == "object")' 2>/dev/null) || return 1
+  b=$(printf '%s' "$2" | jq -cSe '.governing_tuple | select(type == "object")' 2>/dev/null) || return 1
+  [ "$a" = "$b" ]
+}
+
 # Route a spent request ceiling with no eligible final request left to poll
 # (#1560 slice 3, S3-4). Called only from p4b_same_head_barrier, whose locals
 # it sets through bash's dynamic scoping. A clear result waives the Codex arm
@@ -1781,6 +1792,14 @@ p4b_barrier_ceiling_route() { # <repo> <pr> <head> <clear-evidence> <stop-eviden
   local hs_rc=0 hs_state hs_list
   cx_human_stops_json="$(p4b_codex_human_stops "$1" "$2" "$3")" || hs_rc=$?
   hs_state="$(printf '%s' "$cx_human_stops_json" | jq -r '.state // "unsafe"' 2>/dev/null || printf unsafe)"
+  # The spent ceiling and the stops must come from one policy generation: a
+  # base that moved between the two reads could pair an old ceiling with a
+  # new clear (#1579).
+  if [ "$hs_rc" -eq 0 ] && ! p4b_same_governing_tuple "${cx_budget_json:-null}" "$cx_human_stops_json"; then
+    hs_rc=2
+    cx_human_stops_json='{"state":"unsafe","reason":"pr-policy-tuple-changed-between-ceiling-and-stops"}'
+    hs_state=unsafe
+  fi
   case "$hs_rc:$hs_state" in
     0:clear)
       cls_cx="waived"

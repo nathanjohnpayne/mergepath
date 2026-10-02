@@ -4712,6 +4712,30 @@ out="$(P4B_TEST_LEDGER_FP=1-1 P4B_TEST_LEDGER_MODE=clear P4B_TEST_BASE_POLICY_PA
 [ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r .request_budget.reason)" = ledger-policy-snapshot-mismatch ] \
   || bad="$bad snapshot-fingerprint-mismatch-read-as-room(rc=$rc,out=$out)"
 
+# The spent ceiling and the stops must be judged under one governing tuple
+# (#1579): a base that moved between the two reads is an authority error.
+_route() { # <budget-json> <stops-json>
+  (
+    cx_budget_json=$1
+    _stops_json=$2
+    p4b_codex_human_stops() { printf '%s' "$_stops_json"; }
+    cls_cx=""; budget_unsafe=false; why=""; human_tiebreaker=false; cx_evidence=""; cx_human_stops_json=null
+    p4b_barrier_ceiling_route o/r 7 head request-ceiling request-cap ""
+    printf '%s|%s|%s' "$cls_cx" "$budget_unsafe" "$cx_evidence"
+  )
+}
+_t1='{"head_sha":"h","base_ref":"main","base_sha":"1","default_branch":"main"}'
+_t2='{"head_sha":"h","base_ref":"main","base_sha":"2","default_branch":"main"}'
+[ "$(_route "{\"state\":\"exhausted\",\"governing_tuple\":$_t1}" "{\"state\":\"clear\",\"stops\":[],\"governing_tuple\":$_t1}")" = "waived|false|request-ceiling" ] \
+  || bad="$bad same-tuple-not-waived($(_route "{\"state\":\"exhausted\",\"governing_tuple\":$_t1}" "{\"state\":\"clear\",\"stops\":[],\"governing_tuple\":$_t1}"))"
+[ "$(_route "{\"state\":\"exhausted\",\"governing_tuple\":$_t1}" "{\"state\":\"clear\",\"stops\":[],\"governing_tuple\":$_t2}")" = "escalate|true|pr-policy-tuple-changed-between-ceiling-and-stops" ] \
+  || bad="$bad tuple-drift-between-ceiling-and-stops-read-as-clear"
+[ "$(_route '{"state":"exhausted"}' "{\"state\":\"clear\",\"stops\":[],\"governing_tuple\":$_t1}")" = "escalate|true|pr-policy-tuple-changed-between-ceiling-and-stops" ] \
+  || bad="$bad missing-ceiling-tuple-read-as-clear"
+p4b_same_governing_tuple "{\"governing_tuple\":$_t1}" "{\"governing_tuple\":$(printf '%s' "$_t1" | jq -cS .)}" \
+  && ! p4b_same_governing_tuple '{}' "{\"governing_tuple\":$_t1}" \
+  || bad="$bad same-tuple-helper"
+
 if [ -z "$bad" ]; then
   pass "#1560 S3-4: a spent ceiling waives Codex only with no human stop; blocking budget, untested rebuttal and disagreement exit 8; unreadable evidence exits 10; the final-request wait re-evaluates before dispatch"
 else
