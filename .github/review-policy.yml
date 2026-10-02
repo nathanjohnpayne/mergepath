@@ -430,8 +430,10 @@ coderabbit:
 # review as `chatgpt-codex-connector[bot]`.
 #
 # This replaces the human-shuttled Phase 4 external review on the happy path.
-# On timeout, disagreement, or runaway, the flow falls back to the manual
-# CLI path described in REVIEW_POLICY.md § Phase 4b.
+# On timeout, the flow falls back to Phase 4b (REVIEW_POLICY.md § Phase 4b).
+# Disagreement and runaway do not fall back: they stop for the human
+# tiebreaker (the Phase 4b barrier exits 8 and renders no handoff), per
+# REVIEW_POLICY.md § Disagreements and Tiebreaking.
 #
 # Prerequisite: the ChatGPT Codex Connector GitHub App must be installed on
 # the repository with Code Review enabled at
@@ -447,8 +449,11 @@ coderabbit:
 #      `scripts/review-feedback-accounting.sh`.
 #      The request helper runs this automatically before its trigger write;
 #      exit 6 means feedback remains unaccounted and no trigger was posted.
-#   3. Repeat up to `max_review_rounds`. On runaway (round > max), escalate
-#      to the human per REVIEW_POLICY.md § Disagreements and Tiebreaking.
+#   3. Repeat while the request ceiling (`max_review_rounds`) and the
+#      blocking-review budget allow. A spent blocking budget escalates to the
+#      human; a spent ceiling runs automated Phase 4b, which stops for the
+#      human on a runaway, untested rebuttal or disagreement (REVIEW_POLICY.md
+#      § Disagreements and Tiebreaking).
 #   4. On timeout (silence within `review_timeout_seconds`), the script
 #      exits with code 4 (FALLBACK_REQUIRED). The agent then falls back
 #      to the manual handoff in REVIEW_POLICY.md § Phase 4b, targeting
@@ -523,20 +528,21 @@ codex:
   # Phase 4b handoff. Must be a member of `available_reviewers` above.
   cli_login: nathanpayne-codex
 
-  # Maximum number of `@codex review` rounds before escalating as runaway.
-  # The 21st round trips the guard. Normal termination is either approval,
+  # The per-PR Codex request ceiling: the 21st request is refused (exit 7,
+  # kind "request-ceiling"). Normal termination is either approval,
   # disagreement (repeat-after-rebuttal), or timeout → Phase 4b fallback.
   # Raised 10 -> 20 by the owner on 2026-09-28 after #1474 exhausted 10 requests.
   # Previously raised 2 -> 10 (#1084). Codex is the primary reviewer on every PR,
   # so the budget has to cover a real convergence run rather than two
   # courtesy rounds: #1080 took four rounds, and rounds 2 and 3 each found a
-  # defect the previous round's fix introduced. Exhausting the budget takes the
-  # HUMAN-TIEBREAKER route, not the automated Phase 4b leg: stop the loop, post
-  # a comment summarizing both positions with links to the rounds, alert the
-  # human, do not merge (AGENTS.md, Disagreements and Tiebreaking). Automated
-  # 4b is the wrong destination for THIS trigger because that leg can post an
-  # APPROVED, which would let a review that never converged merge with nobody
-  # adjudicating it.
+  # defect the previous round's fix introduced. Since #1560 slice 3 this is the
+  # request CEILING (cost), not the runaway meter: a spent ceiling runs
+  # automated Phase 4b, whose barrier stops for the human (exit 8) when a human
+  # stop holds. One of those stops is a runaway: every request the ceiling
+  # allowed drew a blocking review (a ceiling of blocking reviews below
+  # max_blocking_reviews), which is non-convergence and must never reach an
+  # automated APPROVED. The others are the blocking budget, an untested
+  # rebuttal and a disagreement (REVIEW_POLICY.md, Disagreements signal 4).
   max_review_rounds: 20
 
   # Blocking-review budget (#1560 slice 3). Before every new request the
@@ -550,7 +556,8 @@ codex:
   # are spent. Read from the governing base policy; absent defaults to 10.
   # 10 is PROVISIONAL, chosen from the #1560 calibration (one PR of 91 sampled
   # exceeded it) and open to revision on new evidence. Exhaustion takes the
-  # human-tiebreaker route, as max_review_rounds does.
+  # human-tiebreaker route. At a spent request ceiling the effective budget is
+  # the lower of this and max_review_rounds (the runaway stop).
   max_blocking_reviews: 10
 
   # Poll timeout per round, in seconds, for `codex-review-request.sh`.
@@ -917,7 +924,7 @@ phase_4b_automation:
   # through 2026-10-15. 999 = effectively uncapped; keep looping automated
   # Phase 4b after CHANGES_REQUESTED until APPROVED. On 2026-10-15 restore
   # `max_review_rounds: 20` and delete this note. Phase 4a's
-  # codex.max_review_rounds runaway guard is NOT waived.
+  # codex.max_review_rounds request ceiling is NOT waived.
   max_review_rounds: 999
 
   # Fail closed: an ambiguous / non-schema-conformant adapter verdict must

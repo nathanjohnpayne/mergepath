@@ -502,23 +502,47 @@ esac
 
 p4b_log "PR $REPO#$PR  HEAD=${HEAD:-?}  direction=$DIRECTION  reviewer=$REVIEWER  adapter=$ADAPTER  timeout=${ADAPTER_TIMEOUT}s  effort=${EFFECTIVE_EFFORT:-cli-default}  dry_run=$DRY_RUN"
 
-require_feedback_accounted() {
+# feedback_accounting_status: run the accounting gate once. Returns 0 when
+# clear, 1 when a finding is unaccounted, 2 when the gate failed or is
+# missing; prints the gate's JSON to stderr on anything but clear.
+feedback_accounting_status() {
   local accounting_json="" accounting_rc=0
-  command -v "$FEEDBACK_ACCOUNTING_GATE" >/dev/null 2>&1 \
-    || p4b_die 3 "review feedback accounting gate unavailable: $FEEDBACK_ACCOUNTING_GATE"
+  command -v "$FEEDBACK_ACCOUNTING_GATE" >/dev/null 2>&1 || {
+    p4b_warn "review feedback accounting gate unavailable: $FEEDBACK_ACCOUNTING_GATE"
+    return 2
+  }
   accounting_json=$("$FEEDBACK_ACCOUNTING_GATE" "$PR" "$REPO") \
     || accounting_rc=$?
   case "$accounting_rc" in
-    0) p4b_log "review feedback accounting clear" ;;
-    1)
-      printf '%s\n' "$accounting_json" >&2
-      p4b_die 7 "review feedback is unaccounted; disposition every finding before Phase 4b dispatch"
-      ;;
-    *)
-      printf '%s\n' "$accounting_json" >&2
-      p4b_die 3 "review feedback accounting gate failed with exit $accounting_rc"
-      ;;
+    0) p4b_log "review feedback accounting clear"; return 0 ;;
+    1) printf '%s\n' "$accounting_json" >&2; return 1 ;;
+    *) printf '%s\n' "$accounting_json" >&2; p4b_warn "review feedback accounting gate failed with exit $accounting_rc"; return 2 ;;
   esac
+}
+
+require_feedback_accounted() {
+  local rc=0
+  feedback_accounting_status || rc=$?
+  case "$rc" in
+    0) ;;
+    1) p4b_die 7 "review feedback is unaccounted; disposition every finding before Phase 4b dispatch" ;;
+    *) p4b_die 3 "review feedback accounting gate failed or is unavailable" ;;
+  esac
+}
+
+# The approval writer-boundary accounting fence (#1581). This run has already
+# recorded its loop and may have filed follow-ups, so refuse through the
+# pre-post cleanup first: exit 7 for unaccounted feedback, 3 when the gate
+# itself fails.
+refuse_approval_if_feedback_unaccounted() {
+  local acct_rc=0 acct_reason
+  feedback_accounting_status || acct_rc=$?
+  [ "$acct_rc" -ne 0 ] || return 0
+  acct_reason="review feedback became unaccounted during the Phase 4b run; refusing the approval"
+  [ "$acct_rc" -eq 1 ] || acct_reason="review feedback accounting failed at the approval writer boundary; refusing the approval"
+  cleanup_pre_post_refusal_side_effects "$acct_reason" true \
+    "Review feedback accounting" "the review feedback on ${REPO}#${PR}"
+  if [ "$acct_rc" -eq 1 ]; then p4b_die 7 "$acct_reason"; else p4b_die 3 "$acct_reason"; fi
 }
 
 # --- manual-handoff fallback -----------------------------------------------
@@ -621,7 +645,7 @@ hold_for_external_review() {
 
 stop_for_human_tiebreaker() {
   local payload="$1"
-  p4b_warn "Codex human stop holds (spent blocking-review budget, untested rebuttal or disagreement at a spent request ceiling); stopping for a human tiebreaker without adapter dispatch or Phase 4b handoff"
+  p4b_warn "Codex human stop holds (spent blocking-review budget, runaway, untested rebuttal or disagreement at a spent request ceiling); stopping for a human tiebreaker without adapter dispatch or Phase 4b handoff"
   jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
         --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" '
@@ -797,6 +821,7 @@ revalidate_request_ceiling_authority() {
   stops_state="$(printf '%s' "$stops_json" | jq -r '.state // "unsafe"' 2>/dev/null || printf unsafe)"
   budget_json="$(p4b_codex_request_budget_state "$REPO" "$PR" "$HEAD")" || budget_rc=$?
   budget_state="$(printf '%s' "$budget_json" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
+  local fresh_state="$budget_state"
   # Still spent, and spent by the same request generation the barrier saw: an
   # exact author request posted while the adapter ran (a new final request)
   # voids this run's authority, so the next run enters the bounded final-request
@@ -811,6 +836,14 @@ revalidate_request_ceiling_authority() {
   if [ "$budget_rc" -eq 0 ] \
      && ! p4b_same_governing_tuple "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" "$budget_json"; then
     budget_state=snapshot-changed
+  fi
+  # Before dispatch, a NEW pending final request is not an error: hold so the
+  # next run enters its bounded wait (#1583). Only that: a generation changed
+  # by an edited or deleted request (budget available again) or by a request
+  # already answered (exhausted) takes the authority-error path below.
+  if [ "$where" = pre-dispatch ] && [ "$budget_rc:$budget_state" = 0:generation-changed ] \
+     && [ "$fresh_state" = final-request-pending ]; then
+    hold_for_external_review "$(jq -nc '{decision:"pending",retry_after:0,coderabbit:"unchanged",codex:"not-yet",codex_evidence:"request-cap-final-pending",trigger:"skipped",resume:"skipped"}')"
   fi
   case "$budget_rc:$budget_state" in
     0:exhausted|0:final-request-pending) ;;
@@ -1046,6 +1079,15 @@ if [ "$DRY_RUN" = true ]; then
   p4b_warn "dry-run: skipping the same-head barrier — it guards the review POST, and a dry-run posts nothing (offline dry-runs stay offline)"
 else
   run_same_head_barrier "pre-adapter"
+fi
+
+# #1583: the barrier's spent-ceiling decision can predate the CodeRabbit probe.
+# Recheck it at the dispatch boundary so a new final request holds (exit 6,
+# its bounded wait) instead of spending an adapter run that the post-adapter
+# fence would only discard. It runs before the accounting gate below, so that
+# gate stays the last read before dispatch.
+if [ "$DRY_RUN" != true ]; then
+  revalidate_request_ceiling_authority pre-dispatch
 fi
 
 # Do not spend an external reviewer round while an earlier finding remains
@@ -1380,7 +1422,7 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
   # without a Codex report on this head. Say so, and that no human stop held.
   case "$P4B_PRE_ADAPTER_CODEX_EVIDENCE" in
     request-ceiling*)
-      printf -- '- Provider ordering: the Codex request ceiling was spent on this head, so this review ran without a Codex report here; no human stop held (blocking-review budget, untested rebuttal, disagreement) (#1560)\n'
+      printf -- '- Provider ordering: the Codex request ceiling was spent on this head, so this review ran without a Codex report here; no human stop held (blocking-review budget, runaway, untested rebuttal, disagreement) (#1560)\n'
       ;;
   esac
   # #1335: likewise for a CodeRabbit review carried from identical content.
@@ -1640,6 +1682,12 @@ post_review() {
       "The PR base" "the base of ${REPO}#${PR}"
     fall_back_to_manual "$P4B_BASE_FENCE_REASON"
   fi
+  # #1581: an approval is the one write a late finding must not slip past.
+  # A required-tier finding can land while the adapter runs, so account for
+  # feedback once more here, at the writer boundary, after every other
+  # preparation read. A CHANGES_REQUESTED review is not gated: it asks for
+  # changes either way.
+  [ "$event" != "APPROVE" ] || refuse_approval_if_feedback_unaccounted
   # The timeout/head/body/base reads above prepare the final review material
   # and may outlive the earlier budget check. Revalidate the coherent governing
   # tuple, resolved request budget, and request generation once more after
@@ -1647,6 +1695,12 @@ post_review() {
   # This is a bounded consumer fence, not an atomic GitHub read/write protocol;
   # a residual network interval remains between this observation and the POST.
   revalidate_codex_request_budget_authority pre-post
+  # That revalidation rebuilds the Codex ledger, a slow read, so a finding can
+  # land during it. Account once more after it so the window left for a late
+  # finding is only the POST itself (#1584 Phase 4b P1). The accounting read
+  # in turn leaves a short window for a new request, which the merge gates
+  # still hold.
+  [ "$event" != "APPROVE" ] || refuse_approval_if_feedback_unaccounted
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \
     '{commit_id:$commit_id,event:$event,body:$body}' > "$payload_file"
