@@ -45,7 +45,7 @@ Requests are swept in order. `unresolved` holds requests not yet attributed and 
 - it is not a same-second tie;
 - it cannot be a second or late answer to an earlier request. That rules out a response on the same head as an earlier attributed response, and an anchorless response after the first window.
 
-Otherwise every unresolved request becomes **ambiguous**, with the candidates and the reasons listed. A tie adds the previous request as a candidate. An earlier attributed request that the response may also answer is flagged `possible_second_response`. The ambiguous window pays down the debt by its number of responses, unless an earlier request competes for them, and unresolved requests stay candidates while any debt remains (`open_debt`). A request with no response and nothing resolving it is `unanswered`, or `no_response_yet` when it is the last request.
+Otherwise every unresolved request becomes **ambiguous**, with the candidates and the reasons listed. A tie adds every other request in that second and the last request strictly before it as candidates, because the response may precede all of them. An earlier attributed request that the response may also answer is flagged `possible_second_response`. The ambiguous window pays down the debt by its number of responses, unless an earlier request competes for them, and unresolved requests stay candidates while any debt remains (`open_debt`). A request with no response and nothing resolving it is `unanswered`, or `no_response_yet` when it is the last request.
 
 ## Re-posts
 

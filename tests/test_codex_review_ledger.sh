@@ -168,6 +168,13 @@ check "a response in the same second as a request is a tie: ambiguous with the p
    and (.requests[1].candidates | index(1) != null) and (.requests[1].reasons | join(" ") | test("same second"))
    and .requests[0].possible_second_response == ["w2.0"]'
 
+# Requests 2 and 3 share a second, and a response lands in it: the response
+# may precede both, so request 1 (the last one strictly before) is a candidate.
+L=$(ledger "$( { req 1 $T0; req 2 $T3; req 3 $T3; } | arr)" "$( { review 10 $T1 $HEAD_A '["p2"]'; review 11 $T3 $HEAD_B '["p2"]'; } | arr)" '[]' '[]' '[]')
+check "a tie in a second shared by several requests includes the request before that second" "$L" \
+  '.requests[0].outcome == "attributed" and (.requests[0].possible_second_response | length) == 1
+   and ([.requests[1:][] | .candidates | (index(1) != null and index(2) != null and index(3) != null)] | all)'
+
 L=$(ledger '[]' "$(review 10 $T1 $HEAD_A '["p1"]' | arr)" '[]' '[]' '[]')
 check "with no requests every response is unsolicited" "$L" \
   '.summary.requests == 0 and .summary.unsolicited_responses == 1 and .summary.blocking_responses_solicited == 0'

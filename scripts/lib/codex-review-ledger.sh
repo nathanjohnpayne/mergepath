@@ -143,6 +143,7 @@ crl_ledger() {
               mixed_heads: ($heads > 1),
               multiple_in_window: (($g | length) > 1),
               tie: ($grp.sigs | any(.tie)),
+              tie_times: ([ $grp.sigs[] | select(.tie) | .t ] | unique),
               anchor_conflict: ($grp.sigs | any(.anchor_conflict // false)),
               provider_blocked: ([$grp.sigs[] | select(.kind == "block") | .reason] | unique) } ] ) as $responses
 
@@ -165,8 +166,13 @@ crl_ledger() {
                         else [ $st.anchors | to_entries[] | select(.value != null and same_head(.value; $a))
                                | .key | tonumber ] end ]
                     | add | unique | map(select(. < $k)) ) as $extra
-                # A same-second tie could belong to the previous request.
-                | ( if any($rs[]; .tie) and $k > 1 then [$k - 1] else [] end ) as $tieprev
+                # A response in the same second as a request may precede every
+                # request of that second, so it could answer any of them or the
+                # last request strictly before that second.
+                | ( [ $rs[].tie_times[] as $tt
+                      | ( [ $reqs[] | select(.created_at == $tt and .k != $k) | .k ]
+                          + ([ $reqs[] | select(.created_at < $tt) | .k ] | if length > 0 then [max] else [] end) ) ]
+                    | add // [] | unique ) as $tieprev
                 | ( ($rs | length) == 1 and $st.unresolved == [$k] and $st.debt == 1
                     and ($tieprev | length) == 0 and (any($rs[]; .tie) | not)
                     and ($extra | length) == 0 ) as $clean
