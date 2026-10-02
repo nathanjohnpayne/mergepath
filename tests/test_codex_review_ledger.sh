@@ -165,7 +165,8 @@ check "requests with no responses: earlier unanswered, last no_response_yet" "$L
 L=$(ledger "$( { req 1 $T0; req 2 $T3; } | arr)" "$( { review 10 $T1 $HEAD_A '["p2"]'; review 11 $T3 $HEAD_B '["p2"]'; } | arr)" '[]' '[]' '[]')
 check "a response in the same second as a request is a tie: ambiguous with the previous request" "$L" \
   '.responses[1].tie == true and .requests[0].outcome == "attributed" and .requests[1].outcome == "ambiguous"
-   and (.requests[1].candidates | index(1) != null) and (.requests[1].reasons | join(" ") | test("same second"))'
+   and (.requests[1].candidates | index(1) != null) and (.requests[1].reasons | join(" ") | test("same second"))
+   and .requests[0].possible_second_response == ["w2.0"]'
 
 L=$(ledger '[]' "$(review 10 $T1 $HEAD_A '["p1"]' | arr)" '[]' '[]' '[]')
 check "with no requests every response is unsolicited" "$L" \

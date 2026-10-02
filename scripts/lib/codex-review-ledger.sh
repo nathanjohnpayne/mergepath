@@ -165,15 +165,17 @@ crl_ledger() {
                         else [ $st.anchors | to_entries[] | select(.value != null and same_head(.value; $a))
                                | .key | tonumber ] end ]
                     | add | unique | map(select(. < $k)) ) as $extra
+                # A same-second tie could belong to the previous request.
+                | ( if any($rs[]; .tie) and $k > 1 then [$k - 1] else [] end ) as $tieprev
                 | ( ($rs | length) == 1 and $st.unresolved == [$k] and $st.debt == 1
-                    and ($rs[0].tie | not) and ($extra | length) == 0 ) as $clean
+                    and ($tieprev | length) == 0 and (any($rs[]; .tie) | not)
+                    and ($extra | length) == 0 ) as $clean
                 | if $clean then
                     .att[($k | tostring)] = [$rs[0].rid]
                     | .anchors[($k | tostring)] = $rs[0].anchor
                     | .unresolved = [] | .debt = 0
                   else
-                    ( [ (if $rs[0].tie and $k > 1 then [$k - 1] else [] end), $st.unresolved, $extra ]
-                      | add | unique ) as $cand
+                    ( [ $tieprev, $st.unresolved, $extra ] | add | unique ) as $cand
                     | ( [ (if ($rs | length) > 1 then "several responses in one window" else empty end),
                           (if ([ $st.unresolved[] | select(. != $k and ($st.amb[(. | tostring)] | not)) ] | length) > 0
                            then "more than one request unresolved" else empty end),
@@ -186,10 +188,13 @@ crl_ledger() {
                         .amb[($u | tostring)] = { responses: ((.amb[($u | tostring)].responses // []) + [$rs[].rid]),
                                                   candidates: ((.amb[($u | tostring)].candidates // []) + $cand | unique),
                                                   reasons: ((.amb[($u | tostring)].reasons // []) + [$why] | unique) })
-                    | reduce $extra[] as $x (.; .second[($x | tostring)] = ((.second[($x | tostring)] // []) + [$rs[].rid]))
+                    # Earlier requests outside the unresolved set that may also
+                    # have received this response (second/late answer or tie).
+                    | reduce ([ $extra[], $tieprev[] ] | unique | map(select(. as $x | $st.unresolved | index($x) | not)))[] as $x
+                        (.; .second[($x | tostring)] = ((.second[($x | tostring)] // []) + [$rs[].rid] | unique))
                     # An earlier request may have taken the response, so it
                     # pays the debt only when no earlier request competes.
-                    | .debt = (if ($extra | length) > 0 or ($rs[0].tie and $k > 1) then $st.debt
+                    | .debt = (if ($extra | length) > 0 or ($tieprev | length) > 0 then $st.debt
                                else ([$st.debt - ($rs | length), 0] | max) end)
                     | if .debt == 0 then .unresolved = [] else . end
                   end
