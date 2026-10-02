@@ -15,7 +15,7 @@ The MUX Video Integration initiative ([Project #5](https://github.com/users/nath
 - `gh` installed (via Homebrew on this machine).
 - An author PAT with `repo` + `project` scopes. Use the cached `OP_PREFLIGHT_AUTHOR_PAT` from [REVIEW_POLICY.md § PAT lookup table](../../REVIEW_POLICY.md#pat-lookup-table); these helpers verify that `GH_TOKEN` resolves to `nathanjohnpayne` before mutating issues or Project v2 items.
 - Run [scripts/op-preflight.sh](../op-preflight.sh) once per session to cache credentials.
-- The target Project v2 board must have a `Status` single-select field with the canonical options `Backlog`, `Ready`, `In progress`, `In review`, `Done`. `move-item.sh` discovers the field by that exact name. GitHub's default board template does not provide these options. Add the five to the board's `Status` field by hand, or create the board with mergepath's new-repo bootstrap, which sets them up ([`scripts/bootstrap/board-and-summary.sh`](https://github.com/nathanjohnpayne/mergepath/blob/main/scripts/bootstrap/board-and-summary.sh), run from a mergepath checkout via `scripts/bootstrap-new-repo.sh --project new`). The bootstrap lives only in mergepath and is not propagated to consumer repos, so the link is absolute.
+- The target Project v2 board must have a `Status` single-select field with the canonical options `Backlog`, `Ready`, `In progress`, `In review`, `Done`. `move-item.sh` discovers the field by that exact name. GitHub's default board template does not provide these options, so edit the board's `Status` field by hand to have exactly these five. The set is the one mergepath's new-repo bootstrap gives the board it provisions with a new repo ([`scripts/bootstrap/board-and-summary.sh`](https://github.com/nathanjohnpayne/mergepath/blob/main/scripts/bootstrap/board-and-summary.sh); hub-only, so the link is absolute). That bootstrap scaffolds a whole repo, so it is not a way to create a board for an initiative.
 
 ```bash
 # Session setup — preflight populates OP_PREFLIGHT_AUTHOR_PAT in env.
@@ -70,7 +70,7 @@ PROJECT=5 OWNER=nathanjohnpayne REPO=nathanjohnpayne/nathanpaynedotcom \
   scripts/gh-projects/move-item.sh 211 "In progress"
 ```
 
-Valid status names are the options on the Project's `Status` field. Mergepath's new-repo bootstrap creates `Backlog`, `Ready`, `In progress`, `In review`, `Done`. `move-item.sh` matches the name exactly, including case, so `"In Progress"` does not select `In progress`.
+Valid status names are the options on the Project's `Status` field. The canonical set is `Backlog`, `Ready`, `In progress`, `In review`, `Done` (see [Prerequisites](#prerequisites)). `move-item.sh` matches the name exactly, including case, so `"In Progress"` does not select `In progress`.
 
 ### Set the Project README
 
