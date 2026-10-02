@@ -4678,8 +4678,11 @@ out="$(P4B_TEST_LEDGER_MODE=fail P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" 
 
 # allow_phase_4b_substitute=false: a waived ceiling could never clear gate (c).
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
-sed 's/  max_review_rounds: 2/  allow_phase_4b_substitute: false\n  max_review_rounds: 2/' "$WORK/cap-base.yml" >"$WORK/cap-base-nosub.yml"
+cp "$WORK/cap-base.yml" "$WORK/cap-base-nosub.yml"
 printf '  allow_phase_4b_substitute: false\n' >>"$WORK/cap-base-nosub.yml"
+grep -q '^  max_review_rounds: 2$' "$WORK/cap-base-nosub.yml" \
+  && [ "$(grep -c 'allow_phase_4b_substitute' "$WORK/cap-base-nosub.yml")" = 1 ] \
+  || bad="$bad nosub-fixture-malformed"
 out="$(P4B_TEST_LEDGER_MODE=clear P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base-nosub.yml" P4B_TEST_COMMENTS_JSON="$_cap_old" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-base-nosub.yml" "$_p4a_head")" && rc=0 || rc=$?
 [ "$rc" = 2 ] && printf '%s' "$out" | jq -e '.decision == "escalate" and (.reason | contains("request ceiling is spent"))' >/dev/null 2>&1 \
   || bad="$bad ceiling-waived-without-substitute(rc=$rc,out=$out)"
