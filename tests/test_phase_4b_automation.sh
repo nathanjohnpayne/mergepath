@@ -4065,6 +4065,48 @@ chmod +x "$WORK/barrier-bin/resolve-policy"
 # base policy, matching the production resolver's ownership contract.
 export P4B_RESOLVE_BASE_POLICY="$WORK/barrier-bin/resolve-policy"
 
+# #1560 slice 3: the barrier reads the Codex review ledger only when a spent
+# request ceiling would dispatch the adapter. This stub prints a ledger for the
+# expected head; P4B_TEST_LEDGER_MODE picks its evidence. The suite default,
+# `blocking`, spends the default blocking-review budget, so the pre-slice-3
+# ceiling cases keep their human-tiebreaker meaning; the S3-4 cases below set
+# the other modes.
+cat >"$WORK/stub-ledger.sh" <<'EOF'
+#!/usr/bin/env bash
+head=""
+while [ $# -gt 0 ]; do
+  case "$1" in --expect-head) head=$2; shift 2 ;; *) shift ;; esac
+done
+mode=${P4B_TEST_LEDGER_MODE:-blocking}
+if [ "$mode" = flip ]; then
+  n=0
+  [ ! -f "$P4B_TEST_LEDGER_COUNT" ] || n=$(cat "$P4B_TEST_LEDGER_COUNT")
+  printf '%s\n' "$((n + 1))" >"$P4B_TEST_LEDGER_COUNT"
+  if [ "$n" -eq 0 ]; then mode=clear; else mode=untested; fi
+fi
+resp() { # n class unsolicited path first_at
+  jq -nc --argjson n "$1" --arg c "$2" --argjson u "$3" --arg p "$4" --arg t "$5" \
+    '[range($n) | {rid: ("w" + (. | tostring)), class: $c, unsolicited: $u, conflicting: false,
+      first_at: $t, blocking_paths: (if $c == "blocking" then [$p] else [] end), blocking_unlocated: false}]'
+}
+case "$mode" in
+  blocking) r=$(resp 10 blocking false x.sh 2026-08-01T00:10:00Z); rb='[]' ;;
+  clear) r=$(resp 9 blocking false x.sh 2026-08-01T00:10:00Z); rb='[]' ;;
+  untested) r=$(resp 1 blocking false x.sh 2026-08-01T00:10:00Z)
+            rb='[{"finding":1,"path":"x.sh","at":"2026-08-01T01:00:00Z","sources":["tag"]}]' ;;
+  disagreement) r=$(jq -nc --argjson a "$(resp 1 blocking false x.sh 2026-08-01T00:10:00Z)" \
+                     --argjson b "$(resp 1 blocking false x.sh 2026-08-01T02:00:00Z)" '$a + $b')
+                rb='[{"finding":1,"path":"x.sh","at":"2026-08-01T01:00:00Z","sources":["thumbs-down"]}]' ;;
+  fail) exit 3 ;;
+  garbage) printf 'not a ledger\n'; exit 0 ;;
+  other-head) head=0000000000000000000000000000000000000000; r='[]'; rb='[]' ;;
+esac
+jq -nc --arg h "$head" --argjson r "$r" --argjson rb "$rb" \
+  '{head_sha: $h, author: "nathanjohnpayne", responses: $r, rebuttals: $rb}'
+EOF
+chmod +x "$WORK/stub-ledger.sh"
+export P4B_CODEX_LEDGER="$WORK/stub-ledger.sh"
+
 _barrier() { # <cx_rc> <cr_rc> <cr_json> [policy] [head]
   printf '#!/bin/sh\nexit %s\n' "$1" >"$WORK/stub-cx.sh"
   printf "#!/bin/sh\nprintf '%%s' '%s'\nexit %s\n" "$3" "$2" >"$WORK/stub-cr.sh"
@@ -4306,7 +4348,7 @@ _governing_budget="$({
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
 out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_old" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
 [ "$rc" = 3 ] || bad="$bad exhausted-not-tiebreak"
-printf '%s' "$out" | jq -e '.decision == "human-tiebreaker" and .request_budget.request_attempts == 2 and .request_budget.max_request_attempts == 2 and (.reason | contains("request cap exhausted"))' >/dev/null 2>&1 || bad="$bad exhausted-payload"
+printf '%s' "$out" | jq -e '.decision == "human-tiebreaker" and .request_budget.request_attempts == 2 and .request_budget.max_request_attempts == 2 and (.reason | contains("request ceiling spent and a human stop holds (blocking-budget)"))' >/dev/null 2>&1 || bad="$bad exhausted-payload"
 
 out="$(
   export MERGEPATH_REVIEW_POLICY_PATH="$WORK/cap-noauthor.yml"
@@ -4585,6 +4627,79 @@ if [ -z "$bad" ]; then
   pass "#1305: governing request-cap exhaustion stops for a human while final-request polling, old timeout, and current report retain precedence"
 else
   fail "#1305: request-cap barrier routing wrong:$bad"
+fi
+
+# #1560 slice 3, S3-4: a spent request ceiling is cost exhaustion, not
+# non-convergence. With no human stop it waives the Codex arm so the adapter
+# reviews the head; a spent blocking-review budget, an untested rebuttal or a
+# disagreement stops for the human (exit 8); unreadable human-stop evidence is
+# an authority error (exit 10). Condition 2: after the final-request wait the
+# stops are re-evaluated before anything is dispatched.
+bad=""
+for _mode in clear blocking untested disagreement fail garbage other-head; do
+  rm -rf "$WORK/barrier-state/phase-4b-barrier"
+  out="$(P4B_TEST_LEDGER_MODE="$_mode" P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_old" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+  case "$_mode" in
+    clear)
+      [ "$rc" = 0 ] && printf '%s' "$out" | jq -e '.decision == "open" and .codex == "waived" and .codex_evidence == "request-ceiling"
+          and .human_stops.state == "clear" and .human_stops.blocking_reviews == 9 and .human_stops.max_blocking_reviews == 10' >/dev/null 2>&1 \
+        || bad="$bad ceiling-clear-not-waived(rc=$rc,out=$out)" ;;
+    blocking|untested|disagreement)
+      case "$_mode" in blocking) _stop=blocking-budget ;; untested) _stop=untested-rebuttal ;; *) _stop=disagreement ;; esac
+      [ "$rc" = 3 ] && printf '%s' "$out" | jq -e --arg s "$_stop" '.decision == "human-tiebreaker" and .codex_evidence == "request-cap"
+          and .human_stops.stops == [$s] and (.reason | contains($s))' >/dev/null 2>&1 \
+        || bad="$bad ceiling-$_mode-not-exit8(rc=$rc,out=$out)" ;;
+    *)
+      [ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = error ] \
+        || bad="$bad ceiling-$_mode-not-fail-closed(rc=$rc,out=$out)" ;;
+  esac
+done
+
+# Condition 2: the final-request wait expires with no report; the stops are
+# evaluated then, from fresh reads, and decide the route.
+for _mode in clear untested fail; do
+  rm -rf "$WORK/barrier-state/phase-4b-barrier"
+  out="$(P4B_TEST_LEDGER_MODE="$_mode" P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base-zero-wait.yml" P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-base-zero-wait.yml" "$_p4a_head")" && rc=0 || rc=$?
+  case "$_mode" in
+    clear) [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r .codex_evidence)" = request-ceiling-final-wait ] \
+             || bad="$bad final-wait-clear-not-waived(rc=$rc,out=$out)" ;;
+    untested) [ "$rc" = 3 ] && printf '%s' "$out" | jq -e '.codex_evidence == "request-cap-final-wait-exhausted" and .human_stops.stops == ["untested-rebuttal"]' >/dev/null 2>&1 \
+             || bad="$bad final-wait-untested-not-exit8(rc=$rc,out=$out)" ;;
+    fail) [ "$rc" = 4 ] || bad="$bad final-wait-ledger-failure-not-fail-closed(rc=$rc)" ;;
+  esac
+done
+# While the final request is still pending, the stops are not consulted: the
+# wait owns the decision until it ends.
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_LEDGER_MODE=fail P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 1 ] && [ "$(printf '%s' "$out" | jq -r .codex_evidence)" = request-cap-final-pending ] \
+  || bad="$bad pending-final-request-read-stops(rc=$rc)"
+
+# allow_phase_4b_substitute=false: a waived ceiling could never clear gate (c).
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+sed 's/  max_review_rounds: 2/  allow_phase_4b_substitute: false\n  max_review_rounds: 2/' "$WORK/cap-base.yml" >"$WORK/cap-base-nosub.yml"
+printf '  allow_phase_4b_substitute: false\n' >>"$WORK/cap-base-nosub.yml"
+out="$(P4B_TEST_LEDGER_MODE=clear P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base-nosub.yml" P4B_TEST_COMMENTS_JSON="$_cap_old" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-base-nosub.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 2 ] && printf '%s' "$out" | jq -e '.decision == "escalate" and (.reason | contains("request ceiling is spent"))' >/dev/null 2>&1 \
+  || bad="$bad ceiling-waived-without-substitute(rc=$rc,out=$out)"
+
+# The governed blocking budget is the base policy's, and an invalid one fails
+# closed rather than reading as room.
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+cp "$WORK/cap-base.yml" "$WORK/cap-base-blocking9.yml"; printf '  max_blocking_reviews: 9\n' >>"$WORK/cap-base-blocking9.yml"
+out="$(P4B_TEST_LEDGER_MODE=clear P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base-blocking9.yml" P4B_TEST_COMMENTS_JSON="$_cap_old" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 3 ] && printf '%s' "$out" | jq -e '.human_stops.stops == ["blocking-budget"] and .human_stops.max_blocking_reviews == 9' >/dev/null 2>&1 \
+  || bad="$bad governing-blocking-budget-ignored(rc=$rc,out=$out)"
+cp "$WORK/cap-base.yml" "$WORK/cap-base-blocking-bad.yml"; printf '  max_blocking_reviews: false\n' >>"$WORK/cap-base-blocking-bad.yml"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_LEDGER_MODE=clear P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base-blocking-bad.yml" P4B_TEST_COMMENTS_JSON="$_cap_old" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r .request_budget.reason)" = blocking-budget-invalid ] \
+  || bad="$bad invalid-blocking-budget-read-as-room(rc=$rc,out=$out)"
+
+if [ -z "$bad" ]; then
+  pass "#1560 S3-4: a spent ceiling waives Codex only with no human stop; blocking budget, untested rebuttal and disagreement exit 8; unreadable evidence exits 10; the final-request wait re-evaluates before dispatch"
+else
+  fail "#1560 S3-4: ceiling routing wrong:$bad"
 fi
 
 # A below-cap comments snapshot cannot grant fallback authority after its
@@ -5322,6 +5437,54 @@ for _case in exhausted pending expired available; do
     fail "#1305: unavailable adapter $_case (rc=$rc expected=$_expected): $out $(cat "$WORK/cap-fallback-stderr.log")"
   fi
 done
+
+# #1560 slice 3 at the orchestrator. With no adapter, a spent ceiling with no
+# human stop renders the manual handoff (exit 4) instead of exit 8. With an
+# adapter, a human stop that appears while the adapter runs is caught by the
+# post-adapter recheck (acceptance condition 2): exit 8, nothing posted.
+: >"$HANDOFF_LOG"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+set +e
+out="$(P4B_TEST_LEDGER_MODE=clear MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-stop.yml" P4B_ADAPTER_DIR="$WORK/cap-no-adapter" \
+  P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HEAD="$_p4a_head" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+  P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
+  P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" PATH="$WORK/barrier-bin:$PATH" \
+  bash "$ORCH" 7 --repo owner/repo --author claude --reviewer nathanpayne-codex --head "$_p4a_head" --diff-file "$DIFF" 2>/dev/null </dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] && [ -s "$HANDOFF_LOG" ] && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = true ]; then
+  pass "#1560 S3-4: with no adapter, a spent ceiling with no human stop renders the manual handoff, not exit 8"
+else
+  fail "#1560 S3-4: no-adapter clear ceiling (rc=$rc handoff='$(cat "$HANDOFF_LOG" 2>/dev/null)'): $out"
+fi
+
+_ceiling_count="$WORK/ceiling-flip.count"
+_ceiling_adapter="$WORK/ceiling-adapter.log"
+cat >"$BIN/fake-codex-ceiling-approve" <<EOF
+#!/usr/bin/env bash
+cat >/dev/null 2>&1 || true
+printf 'adapter-ran\n' >"$_ceiling_adapter"
+printf '%s' '{"verdict":"APPROVED","summary":"ceiling review","findings":[]}'
+EOF
+chmod +x "$BIN/fake-codex-ceiling-approve"
+rm -f "$_ceiling_count" "$_ceiling_adapter"
+: >"$HANDOFF_LOG"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+set +e
+out="$(P4B_TEST_LEDGER_MODE=flip P4B_TEST_LEDGER_COUNT="$_ceiling_count" \
+  MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-stop.yml" CODEX_BIN="$BIN/fake-codex-ceiling-approve" \
+  P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HEAD="$_p4a_head" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+  P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
+  P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" PATH="$WORK/barrier-bin:$PATH" \
+  bash "$ORCH" 7 --repo owner/repo --author claude --head "$_p4a_head" --diff-file "$DIFF" 2>"$WORK/ceiling-flip.err" </dev/null)"; rc=$?
+set -e
+if [ "$rc" = 8 ] && [ -s "$_ceiling_adapter" ] && [ ! -s "$HANDOFF_LOG" ] \
+   && [ "$(cat "$_ceiling_count")" = 2 ] \
+   && printf '%s' "$out" | jq -e '.human_tiebreaker_required == true and .review_posted == false
+        and .barrier.codex_evidence == "request-ceiling-human-stop" and .barrier.human_stops.stops == ["untested-rebuttal"]' >/dev/null 2>&1; then
+  pass "#1560 S3-4: a human stop that appears during the adapter run is caught after the adapter and exits 8 with nothing posted"
+else
+  fail "#1560 S3-4: post-adapter ceiling recheck (rc=$rc adapter=$(cat "$_ceiling_adapter" 2>/dev/null) ledger-calls=$(cat "$_ceiling_count" 2>/dev/null) handoff='$(cat "$HANDOFF_LOG" 2>/dev/null)'): $out $(tail -3 "$WORK/ceiling-flip.err")"
+fi
 
 # A pre-side-effect hold must leave NO accounting trace. Evaluate the full
 # barrier once before the adapter, then revalidate only a timeout-derived Codex

@@ -2126,6 +2126,8 @@ paths:
       - "scripts/lib/codex-failure-markers.sh"   # #1085, durable timeout grammar/parser sourced by lib.sh
       - "scripts/lib/gh-api-array.sh"   # #1008/#1085, strict paginated timeout-evidence read
       - "scripts/lib/gh-api-scalar.sh"  # #799/#1085, shaped live-head fence before timeout consumption
+      - "scripts/codex-review-ledger.sh"       # #1560 slice 3, human stops at a spent request ceiling (fails closed when absent)
+      - "scripts/lib/codex-review-ledger.sh"   # crl_human_stops, sourced by lib.sh
     # Automated Phase 4b handoff package (#579): adapters, schema, shared
     # shell helpers, and README — plus the approval-loop accounting module
     # (#602: accounting.sh, accounting.schema.json, prices.json) rendered

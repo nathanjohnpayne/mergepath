@@ -42,8 +42,9 @@
 #     requests:  [{id, created_at, counted: true|false, source, author,
 #                  eyes_at: iso|null}],
 #     reviews:   [{id, submitted_at, commit_id|null, body_tiers: [...],
-#                  root_findings: [{comment_id, tier}], reply_comments: N,
+#                  root_findings: [{comment_id, tier, path}], reply_comments: N,
 #                  reply_markers: [...]}],
+#     rebuttals: [{finding, path, at, sources: [...]}],  # optional (slice 3)
 #     verdicts:  [{comment_id, created_at, reviewed_shas: [...], affirmative}],
 #     reactions: [{id, created_at}],             # bot +1 on the PR issue
 #     blocks:    [{comment_id, created_at, reason}],
@@ -80,7 +81,13 @@ crl_ledger() {
               anchor: .commit_id,
               grade: (if ($tiers | any(. as $x | blocking_tier($x))) then "blocking"
                       elif ($tiers | length) > 0 then "discretionary"
-                      else "no_findings" end) } ]
+                      else "no_findings" end),
+              # Where the blocking findings sit, for the disagreement check:
+              # inline findings carry a path; body findings and inline findings
+              # without one cannot be located.
+              blocking_paths: ([ .root_findings[] | select(blocking_tier(.tier)) | .path | select(type == "string") ] | unique),
+              blocking_unlocated: ((.body_tiers | any(. as $x | blocking_tier($x)))
+                                   or any(.root_findings[]; blocking_tier(.tier) and ((.path | type) != "string"))) } ]
         + [ $in.verdicts[]
             | (.reviewed_shas | consistent_anchor) as $anchor
             | { sid: ("verdict:" + (.comment_id | tostring)), kind: "verdict", t: .created_at,
@@ -146,6 +153,9 @@ crl_ledger() {
               window: $w, unsolicited: ($w == 0),
               anchor: $grp.anchor,
               first_at: ([$grp.sigs[].t] | min),
+              blocking_paths: ([ $grp.sigs[] | select(.kind == "review") | .blocking_paths[] ] | unique),
+              blocking_unlocated: ($c.class == "unknown_tier" or $c.conflicting
+                                   or any($grp.sigs[]; .kind == "review" and .blocking_unlocated)),
               signals: [$grp.sigs[].sid],
               class: $c.class, conflicting: $c.conflicting,
               mixed_heads: ($heads > 1),
@@ -249,6 +259,7 @@ crl_ledger() {
       requests: $requests,
       responses: $responses,
       thread_reply_reviews: [ $wrappers[] | {id, submitted_at, commit_id, reply_markers} ],
+      rebuttals: ($in.rebuttals // [] | sort_by(.at, (.finding | tostring))),
       current_summary: $in.summary,
       limits: [
         "a request comment names no commit; request heads are never inferred",
@@ -280,4 +291,76 @@ crl_ledger() {
       }
     }
   '
+}
+
+# The blocking-review budget's counting rule (#1560 slice 3), shared by the
+# requester and the Phase 4b barrier. A response counts when it came after at
+# least one request and is classed blocking or unknown_tier, or is
+# conflicting: unknown and conflicting evidence counts against the budget,
+# never for it.
+__CRL_COUNTS='(.unsolicited | not) and (.class == "blocking" or .class == "unknown_tier" or .conflicting)'
+# A ledger is usable for a decision only when every response carries the
+# fields the rule reads, and every rebuttal the fields the stop check reads.
+# A class outside the known set (version skew, malformed output) is refused,
+# never read as non-blocking.
+__CRL_VALID='type == "object" and (.responses | type) == "array"
+  and all(.responses[]; (.unsolicited | type) == "boolean" and (.conflicting | type) == "boolean"
+                        and (.class as $c | ["blocking", "discretionary", "no_findings", "clean",
+                                             "unknown_tier", "provider_blocked"] | index($c)) != null)'
+
+# crl_blocking_count <ledger-json> <head> <author>
+# Prints the count. Returns nonzero when the ledger is malformed or names
+# another head or author.
+crl_blocking_count() {
+  printf '%s\n' "$1" | jq -er --arg head "$2" --arg author "$3" "
+    if ($__CRL_VALID) and .head_sha == \$head and .author == \$author
+    then [ .responses[] | select($__CRL_COUNTS) ] | length
+    else error(\"ledger\") end" 2>/dev/null
+}
+
+# crl_human_stops <ledger-json> <head> <author> <max-blocking-reviews>
+#
+# The human-stop conditions the Phase 4b barrier re-evaluates before it lets a
+# spent request ceiling dispatch the automated adapter (#1560 slice 3, S3-4):
+#   blocking-budget    the counted responses reach the budget;
+#   untested-rebuttal  a rebutted Codex finding has no Codex response after
+#                      its rebuttal, so Codex never re-read the dispute;
+#   disagreement       a response after a rebuttal re-flags blocking feedback
+#                      on the rebutted finding's path, or blocking feedback
+#                      it cannot locate (a body finding, an unknown tier, a
+#                      conflicting response), which cannot be ruled out as a
+#                      repeat of the rebutted finding.
+# Prints {blocking_reviews, max_blocking_reviews, stops: [...],
+# untested_rebuttals: [...], disagreements: [...]}. Returns nonzero when the
+# ledger is malformed, names another head or author, or carries a malformed
+# rebuttal.
+crl_human_stops() {
+  printf '%s\n' "$1" | jq -ec --arg head "$2" --arg author "$3" --argjson max "$4" "
+    if (($__CRL_VALID) and .head_sha == \$head and .author == \$author
+        and (.rebuttals | type) == \"array\"
+        and all(.responses[]; (.first_at | type) == \"string\"
+                              and (.blocking_paths | type) == \"array\"
+                              and (.blocking_unlocated | type) == \"boolean\")
+        and all(.rebuttals[]; (.at | type) == \"string\" and (.finding | type) == \"number\"
+                              and ((.path | type) == \"string\" or .path == null))) | not
+    then error(\"ledger\") else . end
+    | .responses as \$rs
+    | ([ \$rs[] | select($__CRL_COUNTS) ] | length) as \$n
+    | [ .rebuttals[] | . as \$r
+        | [ \$rs[] | select(.first_at > \$r.at) ] as \$after
+        | if (\$after | length) == 0 then {kind: \"untested\", finding: \$r.finding, path: \$r.path, at: \$r.at}
+          else ( [ \$after[] | select(($__CRL_COUNTS)
+                                     and (.blocking_unlocated or \$r.path == null
+                                          or (.blocking_paths | index(\$r.path)) != null)) ] ) as \$again
+               | if (\$again | length) > 0
+                 then {kind: \"disagreement\", finding: \$r.finding, path: \$r.path, at: \$r.at,
+                       responses: [ \$again[].rid ]}
+                 else empty end
+          end ] as \$disputes
+    | { blocking_reviews: \$n, max_blocking_reviews: \$max,
+        untested_rebuttals: [ \$disputes[] | select(.kind == \"untested\") | del(.kind) ],
+        disagreements: [ \$disputes[] | select(.kind == \"disagreement\") | del(.kind) ] }
+    | .stops = ( [ (if \$n >= \$max then \"blocking-budget\" else empty end),
+                   (if (.disagreements | length) > 0 then \"disagreement\" else empty end),
+                   (if (.untested_rebuttals | length) > 0 then \"untested-rebuttal\" else empty end) ] )" 2>/dev/null
 }

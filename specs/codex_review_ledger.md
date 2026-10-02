@@ -1,6 +1,6 @@
 # Codex review ledger (#1560)
 
-`scripts/codex-review-ledger.sh <PR>` reconstructs which Codex responses a pull request's Codex requests drew, from records GitHub already holds, and prints the result. The attribution logic lives in `scripts/lib/codex-review-ledger.sh`, a pure function over evidence the command reads first. The ledger writes nothing to GitHub. It was built report-only (slice 2) so the counting and routing decision recorded on #1560 would be made from measured evidence. Since slice 3 it has one consumer, described under [Consumer: the blocking-review budget](#consumer-the-blocking-review-budget); nothing reads its attribution to decide anything. Where the record cannot prove an attribution, the ledger says so and lists the candidates; it never picks one.
+`scripts/codex-review-ledger.sh <PR>` reconstructs which Codex responses a pull request's Codex requests drew, from records GitHub already holds, and prints the result. The attribution logic lives in `scripts/lib/codex-review-ledger.sh`, a pure function over evidence the command reads first. The ledger writes nothing to GitHub. It was built report-only (slice 2) so the counting and routing decision recorded on #1560 would be made from measured evidence. Since slice 3 it has two consumers, described under [Consumer: the blocking-review budget](#consumer-the-blocking-review-budget) and [Consumer: the Phase 4b human stops](#consumer-the-phase-4b-human-stops); nothing reads its attribution to decide anything. Where the record cannot prove an attribution, the ledger says so and lists the candidates; it never picks one.
 
 ## Inputs and authority
 
@@ -50,6 +50,12 @@ Otherwise every unresolved request becomes **ambiguous**, with the candidates an
 
 Responses never name the request they answer, so an ambiguous window settles its requests only when that coverage is proven: its own request is the only candidate (several responses in such a window still answer only that request). When two or more requests are candidates, nothing is settled, however many responses arrived, because they may all answer the same request; every candidate stays unresolved for later windows (#1572). An ambiguous window also records each response's head against every candidate, so a later response on one of those heads is a possible second answer to them (#1573). `open_debt` counts the ambiguous requests still unresolved at the end. A request with no response and nothing resolving it is `unanswered`, or `no_response_yet` when it is the last request.
 
+## Rebuttals
+
+A Codex inline finding (a root review comment by the bot) is rebutted when its thread carries a reply containing `[mergepath-resolve: rebuttal-recorded]`, or the root carries a thumbs-down from anyone but the bot (`codex-record-feedback.sh`'s rebutted verdict). Each entry in `rebuttals` names the finding, its `path`, its `sources` and its `at`: the earliest of the thumbs-down, the tag, and the first non-bot reply in a tagged thread, because the tag is usually posted at resolve time, after the rebuttal itself. A thumbs-down is read only for roots whose reaction rollup does not rule one out, and a failed read exits `3`. Rebuttals of review-body findings leave no per-finding record and are not seen.
+
+Each response also carries `blocking_paths`, the files of its blocking inline findings, and `blocking_unlocated`, true when it has blocking feedback with no file: a blocking body finding, an `unknown_tier` class or a conflicting response.
+
 ## Re-posts
 
 A request followed by another with no response in between is `reposted_without_response`, with `repost_gap_seconds`. `eyes_before_repost` is `true` only when the eyes reaction's own timestamp precedes the next request, `false` when it follows it, and `unknown` when no eyes reaction remains. The ledger never folds requests or calls one an acknowledgement retry: whether to fold is a counting rule for #1560 to choose.
@@ -64,4 +70,14 @@ The `summary` object reports counted and foreign request counts and outcomes, `o
 
 The governing `codex.bot_login` must be a string or absent; any other type exits `3`, because a coerced login would match no Codex activity and read as zero blocking reviews. `--expect-head <sha>` makes the ledger exit `3`, printing nothing, unless the PR head is exactly `<sha>`, so the count is taken at the head the requester is about to request a review of. The requester also refuses output whose `head_sha` or `author` differs from its own, or whose responses lack a boolean `unsolicited`, a boolean `conflicting`, or a `class` from the set above (`blocking`, `discretionary`, `no_findings`, `clean`, `unknown_tier`, `provider_blocked`): an unknown class is refused, never read as non-blocking. Every failure exits `3` with no request posted.
 
-Coverage: `tests/test_codex_review_ledger.sh`; the consumer is covered by `tests/test_codex_review_request_trigger_only.sh`.
+## Consumer: the Phase 4b human stops
+
+When the request ceiling is spent, the Phase 4b barrier runs the ledger with `--expect-head` and evaluates `crl_human_stops` (REVIEW_POLICY.md § Disagreements and Tiebreaking, signal 4):
+
+- `blocking-budget`: the blocking count above reaches the governed `codex.max_blocking_reviews`;
+- `untested-rebuttal`: a rebuttal with no response whose `first_at` is later than the rebuttal's `at`;
+- `disagreement`: a later response that counts toward the budget and either lists the rebutted path in `blocking_paths`, is `blocking_unlocated`, or follows a rebuttal with no path.
+
+Any stop sends the PR to the human tiebreaker; none lets the automated adapter review the head. The same rule that counts blocking reviews is shared as `crl_blocking_count`, and a ledger for another head or author, or with a malformed response or rebuttal, fails both functions.
+
+Coverage: `tests/test_codex_review_ledger.sh`; the consumers are covered by `tests/test_codex_review_request_trigger_only.sh` and `tests/test_phase_4b_automation.sh`.
