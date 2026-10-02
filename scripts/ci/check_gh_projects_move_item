@@ -215,8 +215,12 @@ expect_rc "extra" 2
 run notnum found.json abc "Done"
 expect_rc "notnum" 2
 run noargs found.json
-ok "noargs: expected a non-zero exit" [ "$RC" -ne 0 ]
-for c in badopt extra notnum noargs; do
+expect_rc "noargs" 2
+run onearg found.json 211
+expect_rc "onearg" 2
+run emptystatus found.json 211 ""
+expect_rc "emptystatus" 2
+for c in badopt extra notnum noargs onearg emptystatus; do
   ok "$c: gh was called on a usage error; log: $(cat "$WORK/$c.log")" [ ! -s "$WORK/$c.log" ]
 done
 

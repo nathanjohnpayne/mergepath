@@ -51,16 +51,13 @@ for arg in "$@"; do
     *) POSITIONAL+=("$arg") ;;
   esac
 done
-if [ "${#POSITIONAL[@]}" -gt 2 ]; then
-  echo "Error: expected 2 arguments, got ${#POSITIONAL[@]}" >&2
+ISSUE_NUM="${POSITIONAL[0]:-}"
+STATUS_NAME="${POSITIONAL[1]:-}"
+if [ "${#POSITIONAL[@]}" -ne 2 ] || [ -z "$STATUS_NAME" ]; then
+  echo "Error: expected <issue_number> and <status_name>, got ${#POSITIONAL[@]} argument(s)" >&2
   usage
   exit 2
 fi
-
-ISSUE_NUM="${POSITIONAL[0]:-}"
-STATUS_NAME="${POSITIONAL[1]:-}"
-: "${ISSUE_NUM:?issue number required}"
-: "${STATUS_NAME:?status name required}"
 
 : "${REPO:?REPO must be set (owner/repo)}"
 : "${OWNER:?OWNER must be set}"
