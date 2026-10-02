@@ -363,7 +363,10 @@ crl_human_stops() {
     | ([ \$rs[] | select($__CRL_COUNTS) ] | length) as \$n
     # Runaway compares the ceiling with REQUEST WINDOWS that drew a counted
     # response, not with responses: a window can hold several (#1584).
-    | ([ \$rs[] | select($__CRL_COUNTS) | .window ] | unique | length) as \$nw
+    # Only windows opened by COUNTED (configured-author) requests, which is
+    # what the ceiling counts; a foreign mention opens a window too (#1584).
+    | ([ \$rs[] | select($__CRL_COUNTS) | .window
+         | select(. > 0 and (\$reqs[. - 1].counted == true)) ] | unique | length) as \$nw
     | [ .rebuttals[] | . as \$r
         # Only a response to a request posted AFTER the rebuttal can have read
         # it: a request already in flight may be answered later without

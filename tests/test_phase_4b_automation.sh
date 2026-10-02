@@ -4101,19 +4101,19 @@ resp() { # n class unsolicited path first_at [window]
       first_at: $t, blocking_paths: (if $c == "blocking" then [$p] else [] end), blocking_unlocated: false}]'
 }
 # Requests: one before every rebuttal; disagreement adds one after it.
-reqs='[{"id":1,"created_at":"2026-08-01T00:00:00Z","outcome":"attributed","responses":["w0"]}]'
+reqs='[{"id":1,"created_at":"2026-08-01T00:00:00Z","outcome":"attributed","responses":["w0"],"counted":true}]'
 case "$mode" in
   blocking) r=$(resp 10 blocking false x.sh 2026-08-01T00:10:00Z); rb='[]' ;;
   clear) r=$(resp 1 blocking false x.sh 2026-08-01T00:10:00Z); rb='[]' ;;
   nine) r=$(resp 9 blocking false x.sh 2026-08-01T00:10:00Z); rb='[]' ;;
   two) r=$(jq -nc --argjson a "$(resp 1 blocking false x.sh 2026-08-01T00:10:00Z 1)" \
             --argjson b "$(resp 1 blocking false y.sh 2026-08-01T01:10:00Z 2)" '$a + $b'); rb='[]'
-       reqs='[{"id":1,"created_at":"2026-08-01T00:00:00Z","outcome":"attributed","responses":["w0"]},{"id":2,"created_at":"2026-08-01T01:00:00Z","outcome":"attributed","responses":["w0"]}]' ;;
+       reqs='[{"id":1,"created_at":"2026-08-01T00:00:00Z","outcome":"attributed","responses":["w0"],"counted":true},{"id":2,"created_at":"2026-08-01T01:00:00Z","outcome":"attributed","responses":["w0"],"counted":true}]' ;;
   untested) r=$(resp 1 blocking false x.sh 2026-08-01T00:10:00Z)
             rb='[{"finding":1,"path":"x.sh","at":"2026-08-01T01:00:00Z","sources":["tag"]}]' ;;
   disagreement) r=$(jq -nc --argjson a "$(resp 1 blocking false x.sh 2026-08-01T00:10:00Z 1)" \
                      --argjson b "$(resp 1 blocking false x.sh 2026-08-01T02:00:00Z 2)" '$a + $b')
-                reqs='[{"id":1,"created_at":"2026-08-01T00:00:00Z","outcome":"attributed","responses":["w0"]},{"id":2,"created_at":"2026-08-01T01:30:00Z","outcome":"attributed","responses":["w0"]}]'
+                reqs='[{"id":1,"created_at":"2026-08-01T00:00:00Z","outcome":"attributed","responses":["w0"],"counted":true},{"id":2,"created_at":"2026-08-01T01:30:00Z","outcome":"attributed","responses":["w0"],"counted":true}]'
                 rb='[{"finding":1,"path":"x.sh","at":"2026-08-01T01:00:00Z","sources":["thumbs-down"]}]' ;;
   fail) exit 3 ;;
   garbage) printf 'not a ledger\n'; exit 0 ;;

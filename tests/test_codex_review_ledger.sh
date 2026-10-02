@@ -279,6 +279,12 @@ stop_check "stops: a spent blocking budget names blocking-budget, not runaway" "
 # both answering the FIRST request, with a second request that drew nothing,
 # is one blocking window out of a ceiling of 2, so no runaway.
 BB1=$(printf '%s\n' "$(preview 10 2026-09-25T00:10:00Z '[["a.sh","p1"]]')" "$(preview 12 2026-09-25T00:20:00Z '[["b.sh","p1"]]' '[]' "$HEAD_B")" | arr)
+# ...and only windows opened by counted (author) requests (#1584): a blocking
+# response to a FOREIGN request does not make the author's ceiling a runaway.
+R2F=$(printf '%s\n' "$(req 1 2026-09-25T00:00:00Z)" "$(req 3 2026-09-25T00:30:00Z null false)" "$(req 2 2026-09-25T01:00:00Z)" | arr)
+BBF=$(printf '%s\n' "$(preview 10 2026-09-25T00:10:00Z '[["a.sh","p1"]]')" "$(preview 12 2026-09-25T00:40:00Z '[["b.sh","p1"]]' '[]' "$HEAD_B")" | arr)
+stop_check "stops: a blocking response to a foreign request is no runaway window" \
+  "$(stops "$(inputs "$R2F" "$BBF" '[]' '[]' '[]')" '[]' 10 2)" '.stops == [] and .blocking_windows == 1'
 stop_check "stops: two blocking responses in one request window are no runaway at a ceiling of 2" \
   "$(stops "$(inputs "$R2B" "$BB1" '[]' '[]' '[]')" '[]' 10 2)" '.stops == [] and .blocking_reviews == 2 and .blocking_windows == 1'
 
