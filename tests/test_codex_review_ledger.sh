@@ -236,8 +236,8 @@ check "the ledger states its limits and has no clearance field" "$L" \
 
 # preview <id> <time> <path-tier-pairs-json> [body-tiers-json]: a review whose
 # root findings carry paths, e.g. '[["x.sh","p1"]]'.
-preview() {
-  jq -nc --argjson id "$1" --arg t "$2" --argjson f "$3" --argjson bt "${4:-[]}" --arg h "$HEAD_A" '
+preview() { # ... [body-tiers] [head]
+  jq -nc --argjson id "$1" --arg t "$2" --argjson f "$3" --argjson bt "${4:-[]}" --arg h "${5:-$HEAD_A}" '
     {id: $id, submitted_at: $t, commit_id: $h, body_tiers: $bt,
      root_findings: [$f | to_entries[] | {comment_id: ($id * 10 + .key), path: .value[0], tier: .value[1]}],
      reply_comments: 0, reply_markers: []}'
@@ -305,8 +305,13 @@ RB=$(rebut 100 x.sh 2026-09-25T01:00:00Z | arr)
 IN=$(inputs "$(req 1 2026-09-25T00:00:00Z | arr)" "$(printf '%s\n' "$FIRST" | arr)" '[]' '[]' '[]')
 stop_check "stops: a rebuttal with no Codex response after it is untested" "$(stops "$IN" "$RB" 10)" \
   '.stops == ["untested-rebuttal"] and .untested_rebuttals[0].finding == 100'
+IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[]' '[]' "$HEAD_B")" | arr)" '[]' '[]' '[]')
+stop_check "stops: a rebuttal Codex answered clean, provably to the later request, is settled" "$(stops "$IN" "$RB" 10)" '.stops == []'
+# A reaction-only clean pass has no anchor, so after the first window its
+# attribution is ambiguous: it may be a late answer to the earlier request.
+# Ambiguity never clears the stop (#1579).
 IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" | arr)" '[]' "$(reaction 900 2026-09-25T02:10:00Z | arr)" '[]')
-stop_check "stops: a rebuttal Codex answered clean is settled" "$(stops "$IN" "$RB" 10)" '.stops == []'
+stop_check "stops: an ambiguously attributed clean pass leaves the rebuttal untested" "$(stops "$IN" "$RB" 10)" '.stops == ["untested-rebuttal"]'
 # A response that lands after the rebuttal but answers a request posted before
 # it cannot have read the rebuttal (#1579): the only request predates it.
 IN=$(inputs "$(req 1 2026-09-25T00:00:00Z | arr)" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T01:30:00Z '[]')" | arr)" '[]' '[]' '[]')
@@ -322,9 +327,9 @@ stop_check "stops: a response in the same second as the rebuttal leaves it untes
 IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[["x.sh","p1"]]')" | arr)" '[]' '[]' '[]')
 stop_check "stops: a later blocking finding on the rebutted path is a disagreement" "$(stops "$IN" "$RB" 10)" \
   '.stops == ["disagreement"] and .disagreements[0].finding == 100'
-IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[["y.sh","p1"]]')" | arr)" '[]' '[]' '[]')
+IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[["y.sh","p1"]]' '[]' "$HEAD_B")" | arr)" '[]' '[]' '[]')
 stop_check "stops: a later blocking finding on another path is not a disagreement" "$(stops "$IN" "$RB" 10)" '.stops == []'
-IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[["x.sh","p2"]]')" | arr)" '[]' '[]' '[]')
+IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[["x.sh","p2"]]' '[]' "$HEAD_B")" | arr)" '[]' '[]' '[]')
 stop_check "stops: a later discretionary finding on the rebutted path is not a disagreement" "$(stops "$IN" "$RB" 10)" '.stops == []'
 IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[]' '["p1"]')" | arr)" '[]' '[]' '[]')
 stop_check "stops: a later blocking body finding cannot be located, so it is a disagreement" "$(stops "$IN" "$RB" 10)" '.stops == ["disagreement"]'

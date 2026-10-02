@@ -343,7 +343,8 @@ crl_human_stops() {
         and .max_blocking_reviews == \$max
         and (.rebuttals | type) == \"array\"
         and (.requests | type) == \"array\"
-        and all(.requests[]; (.created_at | type) == \"string\")
+        and all(.requests[]; (.created_at | type) == \"string\" and (.outcome | type) == \"string\"
+                             and (.responses | type) == \"array\")
         and all(.responses[]; (.first_at | type) == \"string\" and (.window | type) == \"number\"
                               and (.blocking_paths | type) == \"array\"
                               and (.blocking_unlocated | type) == \"boolean\")
@@ -362,7 +363,17 @@ crl_human_stops() {
         | ([ \$reqs | to_entries[] | select(.value.created_at > \$r.at) | .key + 1 ] | min) as \$k0
         | [ \$rs[] | select(\$k0 != null and .window >= \$k0 and .first_at > \$r.at
                             and .class != \"provider_blocked\") ] as \$after
-        | if (\$after | length) == 0 then {kind: \"untested\", finding: \$r.finding, path: \$r.path, at: \$r.at}
+        # Tested needs PROOF: a response the ledger attributes to a request
+        # posted after the rebuttal. A later-window response whose attribution
+        # is ambiguous may be a late answer to an earlier request, so it does
+        # not clear the stop (fail closed on ambiguity). Disagreement keeps the
+        # broader window set, where counting more responses is the safe side.
+        | ([ \$reqs[] | select(.created_at > \$r.at and .outcome == \"attributed\") | .responses[] ]) as \$proven
+        | [ \$after[] | select(.rid as \$id | \$proven | index(\$id)) ] as \$tested
+        | if (\$tested | length) == 0 and ([ \$after[] | select(($__CRL_COUNTS)
+                                     and (.blocking_unlocated or \$r.path == null
+                                          or (.blocking_paths | index(\$r.path)) != null)) ] | length) == 0
+          then {kind: \"untested\", finding: \$r.finding, path: \$r.path, at: \$r.at}
           else ( [ \$after[] | select(($__CRL_COUNTS)
                                      and (.blocking_unlocated or \$r.path == null
                                           or (.blocking_paths | index(\$r.path)) != null)) ] ) as \$again
