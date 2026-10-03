@@ -554,24 +554,32 @@ refuse_approval_if_feedback_unaccounted() {
 # precedes every side effect, so an unreadable generation just stops (exit 10).
 capture_authorized_request_generation() {
   local payload
-  # With Codex disabled, Codex requests carry no authority and the substitute
-  # merge gate ignores them, so there is nothing to capture or record. Skip
-  # only when the PR's GOVERNING base policy, the one the gate applies, also
-  # disables Codex: a local checkout that disables it is not enough, and an
-  # unresolvable governing policy counts as enabled (fail closed). The
-  # governing policy is consulted only on that path, so the common path makes
-  # no extra reads.
-  if [ "$(p4b_policy_block_field codex enabled)" = "false" ] \
-     && [ "$(p4b_governing_codex_enabled "$REPO" "$PR" 2>/dev/null)" = "false" ]; then
-    P4B_CODEX_REQUESTS_GOVERN=false
-    return 0
-  fi
   P4B_AUTHORIZED_REQUEST_GENERATION="$(printf '%s' "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" \
     | jq -ce '.request_generation | select(type == "array")' 2>/dev/null)" && return 0
   P4B_AUTHORIZED_REQUEST_GENERATION="$(p4b_live_request_generation "$REPO" "$PR")" && return 0
   P4B_AUTHORIZED_REQUEST_GENERATION=""
+  # The read failed. When the PR's GOVERNING base policy (the one the merge
+  # gate applies) disables Codex, Codex requests carry no authority and the
+  # gate ignores them: proceed without a record. Consulted only on this
+  # failure path, so the common path makes no extra reads; an unresolvable
+  # governing policy counts as enabled (fail closed).
+  if codex_requests_ungoverned; then
+    return 0
+  fi
   payload="$(jq -nc '{decision:"error",reason:"Codex request generation could not be read when the run was authorized",coderabbit:"unchanged",codex:"escalate",codex_evidence:"request-generation-unreadable",request_budget:null}')"
   stop_for_barrier_error "$payload"
+}
+
+# True when the PR's governing base policy disables Codex (#1598). Resolved
+# once, on demand; afterwards the run neither records nor enforces a request
+# generation.
+codex_requests_ungoverned() {
+  [ "$P4B_CODEX_REQUESTS_GOVERN" = true ] || return 0
+  if [ "$(p4b_governing_codex_enabled "$REPO" "$PR" 2>/dev/null)" = "false" ]; then
+    P4B_CODEX_REQUESTS_GOVERN=false
+    return 0
+  fi
+  return 1
 }
 
 # Verify, at the writer boundary, the request generation the approval body
@@ -596,6 +604,11 @@ refuse_approval_if_request_generation_moved() {
     evidence=request-generation-changed
     reason="Codex request generation changed since the run was authorized; refusing the approval"
   else
+    return 0
+  fi
+  # A request generation that moved or cannot be re-read matters only when
+  # the governing policy enables Codex.
+  if codex_requests_ungoverned; then
     return 0
   fi
   cleanup_pre_post_refusal_side_effects "$reason" true \

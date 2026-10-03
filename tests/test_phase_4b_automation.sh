@@ -2742,6 +2742,58 @@ if [ "$rc" = 0 ] && grep -qxF '<!-- mergepath-p4b-request-generation: [7201] -->
 else
   fail "#1598: governing-enabled, local-disabled (rc=$rc record=$(grep -o 'mergepath-p4b-request-generation: [^ ]*' "$P1598_BODY" 2>/dev/null)): $out"
 fi
+# The reverse split (Codex on #1599, round 5): the local checkout enables
+# Codex, the governing policy disables it. A failing comments read must not
+# block the run, because the gate ignores Codex requests there.
+: >"$P1598_LOG"; rm -f "$P1598_BODY"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  P4B_RESOLVE_BASE_POLICY="$P1598_RESOLVER" P1598_GOVERNING_POLICY="$P1598_CODEX_OFF" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_FAKE_ISSUE_COMMENTS_FAIL=1 \
+  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = true ] \
+   && [ -s "$P1598_BODY" ] && ! grep -q 'mergepath-p4b-request-generation' "$P1598_BODY"; then
+  pass "#1598: a governing policy that disables Codex is followed even when the local checkout enables it"
+else
+  fail "#1598: governing-disabled, local-enabled (rc=$rc): $out"
+fi
+# The full local x governing matrix, each with the comments read failing: the
+# GOVERNING policy alone decides. Governing-disabled posts with no record,
+# and governing-enabled refuses (exit 10) whatever the local checkout says.
+for _gm in on:on on:off off:on off:off; do
+  _gm_local=${_gm%%:*}; _gm_gov=${_gm#*:}
+  [ "$_gm_local" = on ] && _gm_local_policy="$POLICY_ON" || _gm_local_policy="$P1598_CODEX_OFF"
+  [ "$_gm_gov" = on ] && _gm_gov_policy="$POLICY_ON" || _gm_gov_policy="$P1598_CODEX_OFF"
+  : >"$P1598_LOG"; rm -f "$P1598_BODY"
+  set +e
+  out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$_gm_local_policy" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+    P4B_RESOLVE_BASE_POLICY="$P1598_RESOLVER" P1598_GOVERNING_POLICY="$_gm_gov_policy" \
+    OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
+    P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
+    P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+    P4B_FAKE_ISSUE_COMMENTS_FAIL=1 \
+    bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  set -e
+  if [ "$_gm_gov" = off ]; then
+    if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = true ] \
+       && [ -s "$P1598_BODY" ] && ! grep -q 'mergepath-p4b-request-generation' "$P1598_BODY"; then
+      pass "#1598 matrix local=$_gm_local governing=$_gm_gov: posts with no record despite the failed read"
+    else
+      fail "#1598 matrix local=$_gm_local governing=$_gm_gov (rc=$rc): $out"
+    fi
+  else
+    if [ "$rc" = 10 ] && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = request-generation-unreadable ] \
+       && [ ! -e "$P1598_BODY" ]; then
+      pass "#1598 matrix local=$_gm_local governing=$_gm_gov: refuses (exit 10) on the failed read"
+    else
+      fail "#1598 matrix local=$_gm_local governing=$_gm_gov (rc=$rc): $out"
+    fi
+  fi
+done
 # A request that arrives AFTER authorization but before the writer boundary
 # (here: while the adapter runs) was never reviewed. The writer's re-read sees
 # the generation moved and refuses the approval (exit 10) after closing this
@@ -2770,6 +2822,25 @@ if [ "$rc" = 10 ] && [ -e "$P1598_SENTINEL" ] && [ "$(printf '%s' "$out" | jq -r
   pass "#1598: a request arriving after authorization refuses the approval (exit 10), closing this run's follow-up"
 else
   fail "#1598: request after authorization (rc=$rc adapter=$([ -e "$P1598_SENTINEL" ] && echo ran) issues=$(tr '\n' ' ' <"$P1598_LOG")): $out"
+fi
+# The same moved generation under a governing policy that disables Codex is
+# not a refusal: the gate ignores Codex requests there.
+rm -f "$P1598_SENTINEL"; : >"$P1598_LOG"; rm -f "$P1598_BODY"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$WORK/p1598-adapter.sh" \
+  P4B_RESOLVE_BASE_POLICY="$P1598_RESOLVER" P1598_GOVERNING_POLICY="$P1598_CODEX_OFF" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_FAKE_ISSUE_COMMENTS='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' \
+  P4B_FAKE_ISSUE_COMMENTS_AFTER='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"},{"id":7204,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:01:00Z","body":"@codex review"}]' \
+  P4B_FAKE_ISSUE_COMMENTS_SENTINEL="$P1598_SENTINEL" \
+  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ -e "$P1598_SENTINEL" ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = true ]; then
+  pass "#1598: a moved request generation is not a refusal when the governing policy disables Codex"
+else
+  fail "#1598: moved generation under governing-disabled Codex (rc=$rc): $out"
 fi
 P2_FP="$(printf '%s|%s|%s|%s' P2 x.js 2 "should be handled under stricter policy" | cksum | cut -d' ' -f1)"
 grep -q "p4b-post-review o/r#134 head=abc123 finding=${P2_FP}" "${ISSUE_LOG}.body.1" \
