@@ -205,6 +205,9 @@ class ActionsProvider:
         # An injected snapshot must certify complete queue and hour coverage.
         if self.ci_snapshot is not None:
             value = self.ci_snapshot(repo, now)
+            # Validate after the callback has copied its observation. A CI
+            # publication after fetch start must not look future or expire late.
+            now = self.clock()
             if (type(value) is not dict or value.get("complete") is not True
                     or value.get("stale") is not False or not number(value.get("observed_at"))
                     or not 0 <= now - value["observed_at"] <= 120):
