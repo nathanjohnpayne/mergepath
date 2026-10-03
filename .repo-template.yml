@@ -10,6 +10,7 @@
 # Used by check_spec_test_alignment when the default filename search
 # wouldn't find the test.
 spec_test_map:
+  sync_audit_json: tests/test_sync_audit_json.sh
   phase_4b_heartbeat:
     - tests/test_phase_4b_heartbeat.sh
     - tests/test_phase_4b_accounting.sh
