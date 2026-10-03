@@ -467,6 +467,8 @@ jq -r --argjson trusted "$trusted" '.[] | (.user.login // "") as $login | select
         loops = []
         # Latest posted record is cumulative within its segment; use complete archived record segments.
         for record in records:
+            if type(record.get("loops")) is not list:
+                raise ClientError("source_failed")
             loops.extend(record["loops"])
         if checkout is not None:
             slug = repo.replace("/", "-")
@@ -478,8 +480,10 @@ jq -r --argjson trusted "$trusted" '.[] | (.user.login // "") as $login | select
                     loops.append(json.loads(line)["loop"])
         if not loops:
             raise ClientError("source_failed")
-        seen, distinct = {}, []
+        seen, unidentified, distinct = {}, set(), []
         for loop in loops:
+            if type(loop) is not dict or loop.get("tokens") is not None and type(loop["tokens"]) is not dict:
+                raise ClientError("source_failed")
             identity = loop.get("run_id")
             if type(identity) is str and identity and not identity.startswith("pid-"):
                 if identity in seen:
@@ -487,6 +491,13 @@ jq -r --argjson trusted "$trusted" '.[] | (.user.login // "") as $login | select
                         raise ClientError("source_failed")
                     continue
                 seen[identity] = loop
+            else:
+                # Posted/live overlap has no reliable identity in older producer records.
+                # Equal unidentified observations cannot prove one invocation or two.
+                fingerprint = json.dumps(loop, sort_keys=True, separators=(",", ":"))
+                if fingerprint in unidentified:
+                    raise ClientError("source_failed")
+                unidentified.add(fingerprint)
             distinct.append(loop)
         command = r'''set -euo pipefail
 . "$1/phase-4b/accounting.sh"
@@ -531,12 +542,18 @@ class PRProvider:
             raise ClientError("incomplete_graphql_connection")
         return self.client.next_cursor(connection)
 
+    def _repository_data(self, data):
+        repository = data.get("repository") if type(data) is dict else None
+        if type(repository) is not dict:
+            raise ClientError("incomplete_graphql")
+        return repository
+
     def _repository(self, repo, deadline):
         owner, name = repo.split("/")
         cursor, seen, rows = None, set(), []
         for _ in range(self.max_pages):
             data = self.client.query(QUERY, {"owner": owner, "name": name, "cursor": cursor}, deadline=deadline)
-            connection = data.get("repository", {}).get("pullRequests")
+            connection = self._repository_data(data).get("pullRequests")
             cursor = self._connection(connection)
             rows.extend(connection["nodes"])
             if cursor is None:
@@ -556,8 +573,9 @@ class PRProvider:
         if missing:
             aliases = " ".join(f'p{i}:pullRequest(number:{row["number"]}) {{ {FIELDS} }}' for i, row in enumerate(missing))
             data = self.client.query("query CockpitPRTransitions($owner:String!,$name:String!) { repository(owner:$owner,name:$name) { " + aliases + " } }", {"owner": owner, "name": name}, deadline=deadline)
+            data = self._repository_data(data)
             for i in range(len(missing)):
-                raw = data.get("repository", {}).get(f"p{i}")
+                raw = data.get(f"p{i}")
                 if not isinstance(raw, dict) or raw.get("state") not in {"MERGED", "CLOSED"}:
                     raise ClientError("incomplete_graphql")
                 rows.append(raw)
@@ -573,7 +591,7 @@ class PRProvider:
         for start in range(0, len(rows), 50):
             chunk = rows[start:start + 50]
             query = required_query(chunk)
-            data = self.client.query(query, {"owner": owner, "name": name}, deadline=deadline).get("repository", {})
+            data = self._repository_data(self.client.query(query, {"owner": owner, "name": name}, deadline=deadline))
             for i, raw in enumerate(chunk):
                 value = data.get(f"p{i}")
                 if not isinstance(value, dict) or value.get("headRefOid") != raw.get("headRefOid"):
@@ -609,8 +627,9 @@ class PRProvider:
             seen.add(cursor)
             selection, kind = field(cursor)
             query = 'query CockpitPRPage($owner:String!,$name:String!,$number:Int!,$cursor:String!) { repository(owner:$owner,name:$name) { pullRequest(number:$number) { headRefOid ' + selection + ' } } }'
-            value = self.client.query(query, {"owner": owner, "name": name, "number": raw["number"], "cursor": cursor}, deadline=deadline)["repository"]["pullRequest"]
-            if value.get("headRefOid") != raw["headRefOid"]:
+            data = self.client.query(query, {"owner": owner, "name": name, "number": raw["number"], "cursor": cursor}, deadline=deadline)
+            value = self._repository_data(data).get("pullRequest")
+            if type(value) is not dict or value.get("headRefOid") != raw["headRefOid"]:
                 raise ClientError("incomplete_graphql")
             if kind == "labels":
                 page = value["labels"]
@@ -650,6 +669,10 @@ class PRProvider:
             except (ClientError, KeyError, TypeError, ValueError) as error:
                 entry = copy.deepcopy(self.previous.get(repo, {"repo": repo, "rows": [], "observed_at": None}))
                 entry.update(stale=True, error=error.category if isinstance(error, ClientError) else "invalid_upstream_json")
+                for row in entry["rows"]:
+                    row["stale"] = True
+                    for hazard in row["hazards"]:
+                        hazard["stale"] = True
                 observations.append(entry)
         for _ in range(min(self.max_enrichments, len(self.queue))):
             if request_deadline - self.monotonic() < .1:

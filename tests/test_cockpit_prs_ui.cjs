@@ -127,6 +127,28 @@ test('five disclosure meters use remaining headlines, exact used fill, near tick
   r.budgets[0]={...r.budgets[0],used:10,remaining:0,ratio:1,state:'boulder'};list.update([r]);assert.equal(view.budgets[0].cap.hidden,false);assert.equal(view.budgets[0].card.classList.contains('landing'),true);
   const unknown=clone(fixtures.partial);const partial=new Rows.RowView(unknown);assert.equal(partial.budgets[0].fill.hidden,true);assert.equal(partial.budgets[0].tick.hidden,true);assert.match(partial.budgets[0].note.textContent,/not observed/);partial.destroy();list.destroy();
 });
+test('CodeRabbit findings and skipped probes render terminal badges with stale context',()=>{
+  const r=row(),view=new Rows.RowView(r);
+  const cases=[
+    ['reported',null,'Reviewed on HEAD','clear'],
+    ['findings',null,'Findings on HEAD','bump'],
+    ['skipped','draft','Skipped','idle'],
+    ['skipped','non-base-branch','Skipped','idle'],
+    ['skipped','paused','Paused','bump'],
+    ['paused',null,'Paused','bump'],
+    ['rate_limit_stalled',null,'Rate-limited','bump'],
+    ['no_review_yet',null,'No review on HEAD','run'],
+    ['unknown',null,'Unknown','idle'],
+  ];
+  for(const [status,skipReason,label,tone] of cases){
+    r.coderabbit={...r.coderabbit,status,skip_reason:skipReason,stale:true};view.update(r,{now:1100});
+    assert.match(view.cr.textContent,new RegExp(label),status+':'+skipReason);
+    assert.equal(view.cr.className,'b b-'+tone,status+':'+skipReason);
+    assert.match(view.crNote.textContent,/Last-known · stale · observed 1m ago/);
+    if(status==='skipped'&&skipReason!=='paused')assert.match(view.crNote.textContent,new RegExp(skipReason));
+  }
+  view.destroy();
+});
 test('assets remain fetch-free and scoped; shared motion tokens include normal and reduced-motion resting states',()=>{
   for(const file of ['prs.js','pr_rows.js'])assert.doesNotMatch(fs.readFileSync(path.join(root,'mergepath/cockpit/assets',file),'utf8'),/\bfetch\s*\(|new EventSource|setInterval/);
   const css=fs.readFileSync(path.join(root,'mergepath/cockpit/assets/prs.css'),'utf8');assert.match(css,/var\(--t-pop\)/);assert.match(css,/var\(--t-glow\)/);assert.match(css,/prefers-reduced-motion:reduce/);assert.match(css,/\.ck\.rm/);assert.match(css,/max-width:720px/);

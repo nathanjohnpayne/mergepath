@@ -240,6 +240,95 @@ class PRTests(unittest.TestCase):
             with self.assertRaises(ClientError):reader._accounting(REPO,'1',reviews,time.monotonic()+10,policy=policy)
             with self.assertRaises(ClientError):reader._accounting(REPO,'1',reviews,time.monotonic()+10)
 
+    def test_accounting_rejects_malformed_loop_and_tokens_shapes(self):
+        reader=HelperReader(None,ROOT);policy=(ROOT/'.github/review-policy.yml').read_text()
+        for malformed in [None,1,'truncated',[],{'tokens':'truncated'}]:
+            with self.subTest(loop=malformed):
+                record={'schema':'p4b-accounting/v1','pr':1,'automation_state':'posted','loops':[malformed]}
+                reviews=[{'user':{'login':'nathanpayne-codex'},'body':'<!-- p4b-accounting:v1\n'+json.dumps(record)+'\n-->'}]
+                with self.assertRaises(ClientError):reader._accounting(REPO,'1',reviews,time.monotonic()+5,policy=policy)
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'.mergepath/phase-4b-loops';path.mkdir(parents=True)
+            (path/'owner-hub-pr1.jsonl').write_text(json.dumps({'loop':None})+'\n')
+            with self.assertRaises(ClientError):
+                HelperReader(None,ROOT,checkout_roots={REPO:directory})._accounting(REPO,'1',[],time.monotonic()+5,policy=policy)
+
+    def test_malformed_accounting_preserves_other_helpers_and_fresh_pr_rows(self):
+        malformed={'schema':'p4b-accounting/v1','pr':1,'automation_state':'posted','loops':[None]}
+        body='<!-- p4b-accounting:v1\n'+json.dumps(malformed)+'\n-->'
+        class Reads(Client):
+            def get(self,path,*,deadline):
+                if 'contents/' in path:return {'encoding':'base64','content':base64.b64encode((ROOT/'.github/review-policy.yml').read_bytes()).decode()}
+                if '/pulls/' in path:return {'number':1,'head':{'sha':HEAD,'repo':{'id':1}},'base':{'sha':'b'*40,'ref':'main','repo':{'id':1,'default_branch':'main'}},'draft':False}
+                if '/commits/' in path:return {'sha':HEAD,'commit':{'committer':{'date':'2026-10-03T00:00:00Z'}}}
+                return {}
+            def pages(self,path,*,deadline):
+                if '/reviews' in path:return [{'user':{'login':'nathanpayne-codex'},'body':body},
+                    {'user':{'login':'coderabbitai[bot]'},'body':'Completed review','commit_id':HEAD,'submitted_at':'2026-10-03T01:00:00Z'}]
+                if path.endswith('/commits?per_page=100'):return [{'sha':HEAD}]
+                return []
+        client=Reads();provider=PRProvider(client,[Repository('hub',REPO)],ROOT)
+        entry=provider(time.monotonic()+15).data['repositories'][0]
+        self.assertFalse(entry['stale']);self.assertIsNone(entry['error']);self.assertEqual(len(entry['rows']),1)
+        row=entry['rows'][0];self.assertFalse(row['stale']);self.assertEqual(row['head'],HEAD)
+        self.assertIsNone(row['spend']['totals']);self.assertEqual(row['spend']['error'],'source_failed')
+        self.assertIsNone(row['budgets'][3]['used']);self.assertEqual(row['checks'][0]['name'],'Required lint')
+        for source in ['ledger','feedback','coderabbit','commits']:
+            self.assertIsNotNone(provider.enrichment[REPO+'#1']['receipts'][source]['data'],source)
+
+    def test_accounting_unidentified_duplicates_are_unavailable_without_pid_dedup(self):
+        policy=(ROOT/'.github/review-policy.yml').read_text()
+        for run_id in [None,'pid-123']:
+            with self.subTest(run_id=run_id),tempfile.TemporaryDirectory() as directory:
+                loop={'loop':1,'verdict':'CHANGES_REQUESTED','tokens':{'total':7,'cost_usd':1}}
+                if run_id is not None:loop['run_id']=run_id
+                record={'schema':'p4b-accounting/v1','pr':1,'automation_state':'posted','loops':[loop]}
+                body='<!-- p4b-accounting:v1\n'+json.dumps(record)+'\n-->'
+                reviews=[{'user':{'login':'nathanpayne-codex'},'body':body}]
+                path=Path(directory)/'.mergepath/phase-4b-loops';path.mkdir(parents=True)
+                live=path/'owner-hub-pr1.jsonl';live.write_text(json.dumps({'loop':loop})+'\n')
+                reader=HelperReader(None,ROOT,checkout_roots={REPO:directory})
+                with self.assertRaises(ClientError):reader._accounting(REPO,'1',reviews,time.monotonic()+5,policy=policy)
+                second={**loop,'loop':2,'verdict':'APPROVED','tokens':{'total':3,'cost_usd':.5}}
+                live.write_text(json.dumps({'loop':second})+'\n')
+                result=reader._accounting(REPO,'1',reviews,time.monotonic()+5,policy=policy)
+                self.assertEqual(result['totals']['tokens_total'],10);self.assertEqual(result['totals']['adapter_invocations'],2)
+                self.assertEqual(result['reruns'],1)
+
+    def test_null_repository_responses_retain_stale_rows_and_other_repositories(self):
+        class NullRepository(Client):
+            phase=None;shape=None
+            def query(self,document,variables,*,deadline):
+                if variables['name']=='hub' and self.phase and self.phase in document:return {'repository':self.shape}
+                return super().query(document,variables,deadline=deadline)
+        for phase in ['CockpitPRs','CockpitPRRequired','CockpitPRTransitions','CockpitPRPage']:
+            for shape in [None,[], 'invalid']:
+                with self.subTest(phase=phase,shape=shape):
+                    client=NullRepository();client.rows[0]['mergeStateStatus']='DIRTY'
+                    provider=PRProvider(client,[Repository('hub',REPO),Repository('peer','owner/peer')],ROOT,helper=Helpers(),max_enrichments=2)
+                    first=provider(time.monotonic()+5).data['repositories'][0]
+                    client.phase=phase;client.shape=shape
+                    if phase=='CockpitPRTransitions':client.rows=[]
+                    if phase=='CockpitPRPage':client.rows[0]['labels']=connection([],'next')
+                    entries=provider(time.monotonic()+5).data['repositories']
+                    retained,peer=entries
+                    self.assertTrue(retained['stale']);self.assertEqual(retained['error'],'incomplete_graphql')
+                    self.assertEqual(retained['observed_at'],first['observed_at']);self.assertEqual(retained['rows'][0]['head'],HEAD)
+                    self.assertFalse(peer['stale']);self.assertIsNone(peer['error'])
+
+    def test_repository_failure_marks_retained_rows_and_road_hazards_stale_until_recovery(self):
+        client=Client();client.rows[0]['mergeStateStatus']='DIRTY'
+        provider=PRProvider(client,[Repository('hub',REPO)],ROOT,helper=Helpers())
+        first=provider(time.monotonic()+5).data['repositories'][0]
+        self.assertFalse(first['rows'][0]['stale']);self.assertFalse(first['rows'][0]['hazards'][0]['stale'])
+        client.failed=True;retained=provider(time.monotonic()+5).data['repositories'][0]
+        self.assertTrue(retained['stale']);self.assertTrue(retained['rows'][0]['stale'])
+        self.assertTrue(retained['rows'][0]['hazards'][0]['stale'])
+        self.assertEqual(retained['rows'][0]['hazards'][0]['observed_at'],first['rows'][0]['hazards'][0]['observed_at'])
+        self.assertFalse(first['rows'][0]['hazards'][0]['stale'])
+        client.failed=False;recovered=provider(time.monotonic()+5).data['repositories'][0]
+        self.assertFalse(recovered['rows'][0]['stale']);self.assertFalse(recovered['rows'][0]['hazards'][0]['stale'])
+
     def test_consumer_code_rabbit_and_accounting_use_governing_target_config(self):
         policy=(ROOT/'.github/review-policy.yml').read_text().replace('  - nathanpayne-claude','  - consumer-reviewer').replace('  - nathanpayne-cursor\n','').replace('  - nathanpayne-codex\n','')
         cr='reviews:\n  auto_review:\n    drafts: true\n    base_branches:\n      - main\n'
