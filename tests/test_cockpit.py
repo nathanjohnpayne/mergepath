@@ -970,6 +970,71 @@ class ServerTests(unittest.TestCase):
                                   ([("Content-Length", "n/a")], 400), ([("Content-Length", "4097")], 413)]:
             self.assertEqual(self.request("POST", headers=[("Host", self.host)] + headers)[0], expected)
 
+    def test_fleet_refresh_is_bodyless_fixed_source_and_requires_full_session_boundary(self):
+        route = "/api/fleet/refresh"
+        self.assertEqual(self.request("POST", route)[0], 401)
+        self.bootstrap()
+        headers = [("Host", self.host), ("Origin", "http://" + self.host), ("X-Cockpit-CSRF", self.app._csrf)]
+        self.assertEqual(self.request("POST", route, headers=headers)[0], 503)
+        self.app.scheduler.register("audit_only", lambda deadline: Sample({"fixture": True}))
+        self.app.register_panel("fleet", "audit_only")
+        with patch.object(self.app.scheduler, "refresh", wraps=self.app.scheduler.refresh) as refresh:
+            for supplied, status in [([], 403), (headers[1:], 403), (headers[:-1], 403),
+                                     (headers + [("Origin", "http://foreign.invalid")], 403),
+                                     (headers + [("X-Cockpit-CSRF", self.app._csrf)], 403),
+                                     (headers + [("Content-Length", "1")], 400)]:
+                self.assertEqual(self.request("POST", route, headers=supplied)[0], status)
+            self.assertEqual(self.request("POST", route + "?repo=other/repo", headers=headers)[0], 400)
+            self.assertEqual(self.request("PUT", route, headers=headers)[0], 405)
+            self.assertEqual(self.request("GET", route, headers=headers)[0], 404)
+            refresh.assert_not_called()
+            self.assertEqual(self.request("POST", route, headers=headers)[0], 202)
+            refresh.assert_called_once_with("audit_only")
+
+    def test_fleet_initial_dispatch_refresh_coalescing_failure_backoff_and_recovery_over_http(self):
+        self.bootstrap()
+        clock, release, calls = Clock(), threading.Event(), []
+        self.addCleanup(release.set)
+        self.app.scheduler.close()
+        self.app.scheduler = Scheduler(workers=1, clock=clock, monotonic=clock, changed=self.app.publish)
+        def fetch(deadline):
+            calls.append(deadline)
+            if len(calls) == 1:
+                release.wait(2)
+                raise ClientError("source_failed")
+            return Sample({"fixture": "recovered"})
+        self.app.scheduler.register("fleet", fetch, hot_interval=1800, idle_interval=1800, timeout=180, max_backoff=7200)
+        self.app.register_panel("fleet", "fleet")
+        self.app.scheduler.tick()
+        wait_until(lambda: len(calls) == 1)
+        envelope = json.loads(self.request(path="/api/panels/fleet")[2])["envelope"]
+        self.assertTrue(envelope["in_flight"])
+        self.assertIsNone(envelope["data"])
+        self.assertIsNone(envelope["observed_at"])
+        headers = [("Host", self.host), ("Origin", "http://" + self.host), ("X-Cockpit-CSRF", self.app._csrf)]
+        for _ in range(4):
+            self.assertEqual(self.request("POST", "/api/fleet/refresh", headers=headers)[0], 202)
+            self.app.scheduler.tick()
+        self.assertEqual(len(calls), 1)
+        release.set()
+        wait_until(lambda: not self.app.scheduler.snapshot()["fleet"]["in_flight"])
+        failed = json.loads(self.request(path="/api/panels/fleet")[2])["envelope"]
+        self.assertTrue(failed["stale"])
+        self.assertEqual(failed["retry_at"], 2800)
+        self.assertIsNone(failed["observed_at"])
+        self.assertEqual(self.request("POST", "/api/fleet/refresh", headers=headers)[0], 202)
+        self.app.scheduler.tick()
+        self.assertEqual(len(calls), 1)
+        clock.now = 2800
+        self.app.scheduler.tick()
+        wait_until(lambda: not self.app.scheduler.snapshot()["fleet"]["in_flight"])
+        restored = json.loads(self.request(path="/api/panels/fleet")[2])["envelope"]
+        self.assertFalse(restored["stale"])
+        self.assertEqual(restored["observed_at"], 2800)
+        self.assertEqual(restored["data"], {"fixture": "recovered"})
+        self.app.scheduler.tick()
+        self.assertEqual(len(calls), 2)
+
     def test_real_shell_and_local_assets_require_session_and_keep_csp(self):
         self.app.static_root = ROOT / "mergepath/cockpit"
         for route in ["/", "/assets/app.js", "/assets/components.js", "/assets/cockpit.css",
@@ -1242,6 +1307,7 @@ class InventoryAndLauncherTests(unittest.TestCase):
         client = GitHubClient(TOKEN, transport=HTTPFixture())
         with patch.object(main.GitHubClient, "from_environment", return_value=client), \
              patch.object(main, "load_inventory", return_value=(Repository("mergepath", HUB, True),)), \
+             patch.object(main, "FleetProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}), close=lambda: None)), \
              patch.object(main, "open_browser", return_value=False) as opener, \
              patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             self.assertEqual(main.main([]), 1)
@@ -1312,6 +1378,7 @@ class InventoryAndLauncherTests(unittest.TestCase):
             return real_join(thread, timeout)
         with patch.object(main.GitHubClient, "from_environment", return_value=client), \
              patch.object(main, "load_inventory", return_value=(Repository("mergepath", HUB, True),)), \
+             patch.object(main, "FleetProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}), close=lambda: None)), \
              patch.object(main.shutil, "which", return_value="/fixture/xdg-open"), \
              patch.object(main.subprocess, "Popen", side_effect=opener), \
              patch.object(threading.Thread, "join", interrupt_after_launch), \

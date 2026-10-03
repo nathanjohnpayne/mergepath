@@ -73,7 +73,7 @@
     if (!finite(minutes) || minutes < 0 || !finite(horizonMinutes) || horizonMinutes <= 0) return null;
     return 4 + 90 * Math.min(1, Math.log1p(minutes) / Math.log1p(horizonMinutes));
   }
-  function roadModel(hazards, {now, horizonMinutes = null, horizonLabel = "Horizon unavailable", width = 1000, observed = false, staleCoverage = false, invalidCoverage = false} = {}) {
+  function roadModel(hazards, {now, horizonMinutes = null, horizonLabel = "Horizon unavailable", width = 1000, observed = false, staleCoverage = false, invalidCoverage = false, partialCoverage = false} = {}) {
     const validHorizon = finite(horizonMinutes) && horizonMinutes > 0;
     const items = hazards.map(hazard => {
       const minutes = hazardMinutes(hazard, now);
@@ -91,9 +91,9 @@
       previousTick = x; return [{...tick, position}];
     }) : [];
     return {items, ticks, strip: items.filter(item => selected.has(item.id)), deferred: items.filter(item => item.position === null).length,
-      overflow: items.length - selected.size, observed, staleCoverage, invalidCoverage,
+      overflow: items.length - selected.size, observed, staleCoverage, invalidCoverage, partialCoverage,
       emptyState: observed && !items.length ? "clear" : "idle",
-      emptyText: items.length ? "See the full list for timing" : observed ? "Road is clear for fresh observed sources" : invalidCoverage ? "Observations unavailable" : staleCoverage ? "Last-known observations are stale" : "No observations yet",
+      emptyText: items.length ? "See the full list for timing" : observed ? "Road is clear for fresh observed sources" : invalidCoverage ? "Observations unavailable" : staleCoverage ? "Last-known observations are stale" : partialCoverage ? "Observations incomplete" : "No observations yet",
       horizonLabel: validHorizon ? horizonLabel : "Horizon unavailable", validHorizon};
   }
   function packRoad(markers, width, measure = text => text.length * 6) {
