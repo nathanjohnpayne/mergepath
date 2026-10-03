@@ -1501,6 +1501,14 @@ paths:
       - "scripts/lib/preflight-helpers.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "tests/fixtures/phase_4b_verdicts.jsonl"
+  # Advisory heartbeat tests execute the real orchestrator with fake boundaries.
+  - path: tests/test_phase_4b_heartbeat.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/phase-4b-review.sh"
+      - "scripts/phase-4b/"
+      - "tests/test_phase_4b_automation.sh"
   # Pairs with scripts/phase-4b/accounting.sh (+ accounting.schema.json and
   # prices.json, all carried by the scripts/phase-4b/ kit) and is
   # hard-required by scripts/ci/check_phase_4b_accounting (#602). Offline:

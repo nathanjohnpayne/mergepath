@@ -1,0 +1,47 @@
+---
+spec_id: phase_4b_heartbeat
+---
+
+# Phase 4b advisory invocation heartbeat
+
+Ticket #1589 provides machine-local evidence for the future Cockpit agents/history provider (#1590). It introduces no panel, provider, request authority or GitHub operation. The producer lives in `scripts/phase-4b/heartbeat.sh`; the orchestrator invokes it only after repository, head, author/reviewer identity and effective runtime bounds have been resolved. Earlier usage/configuration failures remain outside this observation lifecycle.
+
+## Storage and identity
+
+The default directory is `~/.local/state/mergepath/phase-4b-runs`, independent of the checkout. `P4B_HEARTBEAT_DIR` can override it. One `p4b-heartbeat/v1` JSON file is named with the genuine exported `P4B_ACCT_RUN_ID`, generated once by the existing orchestrator and reused without changes. That identity is distinct from Codex request-generation authority. Neither heartbeat identity nor a prior posted approval proves current merge clearance.
+
+Every publication creates a temporary file in the same directory, builds JSON from this invocation's memory and renames it over the observation atomically. It never consumes a previous observation as input. An unwritable directory, malformed prior record, failed encoding/rename, missing process probe or retention error cannot change flow, output summary, verdict, exit code, timeout, fence or GitHub writes. Producer entry points return zero. Absence/invalidity means unavailable evidence, not a healthy run or authorization to proceed.
+
+The record includes `run_id`, `pid`, nullable `process_started_at` from local `ps`, `repo`, opaque string `pr`, `head`, `direction`, `reviewer`, absolute `checkout`, `dry_run`, UTC `started_at`, `started_at_epoch`, current `stage`, UTC `stage_at`, `stage_at_epoch` and an ordered `stages[]` transition history. These are observed local facts; strings are JSON encoded, not executed. The machine path may hold records from several checkouts of the same repository.
+
+## Lifecycle and terminal evidence
+
+`barrier` begins before feedback/external-review/request-generation checks. `adapter` begins at the existing adapter-only accounting start immediately before dispatch; updating its measured elapsed value does not add a duplicate transition. `posting` begins after a valid normalized adapter verdict and timeout fence, before approval side effects/final writer fences. `done` is written by the composed EXIT handler with the original exit status, after the original temporary-file cleanup has retained ownership of its paths. Stages absent from the history were never reached.
+
+`adapter_timeout_seconds` is the effective outer bound resolved from policy/environment, including overrides. `adapter_started_at_epoch`, `adapter_elapsed_seconds` and `adapter_exit_code` are nullable actual adapter evidence. They stay null for pre-dispatch refusals. A client can tick live adapter elapsed from `adapter_started_at_epoch`; near timeout means at least 80 percent of the actual bound while the adapter is running. Barrier/invocation elapsed and the design's illustrative 840/1,245-second values cannot establish near timeout. Exit `4` covers several manual fallbacks, so a timed-out label needs the actual adapter timeout evidence.
+
+`adapter_verdict` is only the parsed adapter result. `exit_code` is the final orchestrator code. `summary_emitted` is true only after the final summary JSON succeeds; only then do final `verdict`, `token_count` and `findings_count` carry its values. Before that they are null. `review_posted` follows the existing confirmed POST result and `review_acknowledgment` follows existing acknowledgment evidence; an adapter's APPROVED output never fabricates a POST. A posted approval with acknowledgment failure can legitimately carry exit `7` and `review_posted: true`.
+
+The producer preserves exits `0` (approval), `1` (changes requested), `4` (manual fallback), `6` (held), `7` (feedback unaccounted), `8` (human tiebreaker) and `10` (request-budget/generation evidence error), as well as other existing exits/signals. A pre-adapter hold/refusal records `barrier,done` and no adapter work. A timeout records `barrier,adapter,done`. A writer-boundary refusal after a valid verdict can record `barrier,adapter,posting,done` without a posted review or final summary.
+
+The #1599 authorization sequence remains unchanged: capture the governing request generation immediately after the barrier, preserve every final authority/fence read, correct provisional accounting before this run's follow-up issue cleanup, retain writer-owned marker neutralization, and keep final feedback accounting as the last authority/feedback read before payload/POST. A request arriving during that final feedback read can still allow a POST under the original generation; the merge gate must reject its superseded clearance. Telemetry does not add a read that silently changes that owner contract. Existing pending-record ownership and cleanup retries remain intact.
+
+## Process status and retention
+
+`p4b_heartbeat_status <record>` is a local reader seam, returning `done`, `running`, `crashed` or `unknown`. A non-done record whose PID has disappeared is crashed. A matching live PID and `ps` start time establish running; a reused PID with a different start time establishes that the recorded owner is gone. An unreadable schema/stage/probe or missing live process-start evidence remains unknown. SIGKILL leaves the last reached stage, because it cannot run EXIT. This status is not review authority.
+
+At invocation start, `P4B_HEARTBEAT_RETENTION_DAYS` defaults to `7`. Integer days `1..3650` prune completed/crashed matching JSON records whose last-publication mtime is older than that duration at minute resolution. Invalid configuration disables pruning. The current record, live owners, unreadable records and indeterminate process evidence are retained. Runtime observation storage is independent from permanent accounting history; no accounting archive is deleted or migrated.
+
+## Optional accounting identity and future consumer contract
+
+The loop producer/schema add optional nullable `run_id` and `started_at_epoch` while retaining `p4b-accounting/v1`, all existing required keys and old records. Only a genuine exported ID matching `^p4b-[a-zA-Z0-9._-]+$` is persisted. Direct-hook callers lacking that ID record null; the existing `pid-$$` fallback remains solely a pending-record staging token. The unchanged log-envelope `started_at_epoch` is copied into each loop and naturally reaches approval `loops[]`. Unknown adapter time stays null; approval `generated_at` is never loop start.
+
+Totals, reported-versus-notional cost, missing coverage, unavailable Codex splits, ledger rotation, provisional correction and pending ownership keep their existing semantics. Metadata does not change totals or archive bytes. Historical records are neither rewritten nor assigned synthetic cross-checkout identities.
+
+#1590 must flatten live and archived loop logs, approval `loops[]` and heartbeat observations with repository plus genuine run ID. Compatible observations of an invocation's posting/done lifecycle merge into one run; conflicting terminal values require a visible diagnostic. Legacy rows retain source/record locator identities and cannot claim exact cross-checkout deduplication. Approval totals cross-check loop aggregation; they never add adapter invocations, tokens or spend a second time. This ticket supplies fixtures without implementing that consumer.
+
+## Verification
+
+`tests/test_phase_4b_heartbeat.sh`, also available as `tests/test_phase_4b_automation.sh --heartbeat-only`, exercises the actual orchestrator with fake boundaries and an unchanged `phase-4b/lib.sh`. Expected duration is under 60 seconds; individual orchestrator calls have a 30-second outer bound and three-second adapters (one second in the timeout case). It proves reached/terminal stages for approval, changes requested and exits `4/6/7/8/10`, repeats each with a regular file blocking the heartbeat directory, observes live adapter/posting stages, detects a SIGKILL owner and PID reuse, preserves complete JSON under encoding/storage failure, tests retention, and locks the request-generation/last-feedback-read races. It invokes no real model, credentials or GitHub API.
+
+`tests/test_phase_4b_accounting.sh --identity-only` runs producer, required-schema compatibility, genuine/legacy identity, equal totals, actual approval threading, provisional correction, archive preservation and latency event projection assertions; expected duration is under two seconds. `--fixtures /absolute/1589-identity-fixtures.json` exports one reusable `p4b-history-fixtures/v1` bundle with mixed old/new records, duplicate roots/archive copies, compatible lifecycle updates, terminal conflicts and approval totals. The full accounting suite includes it. Existing full automation/accounting/request-evidence/latency suites remain aggregate compatibility targets, with no lib mutation or paid/live work.

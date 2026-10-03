@@ -500,6 +500,26 @@ case "$ADAPTER" in
   *)      EFFECTIVE_EFFORT="$RESOLVED_EFFORT" ;;
 esac
 
+# Machine-level telemetry is advisory and has no authority reads. Install its
+# EXIT composition before the first barrier/refusal, which precedes the temp
+# cleanup definition. The original cleanup runs when present and remains owner
+# of its paths; the exit status is captured before any telemetry operation.
+p4b_heartbeat_start() { return 0; }
+p4b_heartbeat_stage() { return 0; }
+p4b_heartbeat_finish() { return 0; }
+if [ -r "$ROOT/phase-4b/heartbeat.sh" ]; then
+  # shellcheck source=phase-4b/heartbeat.sh
+  . "$ROOT/phase-4b/heartbeat.sh" || true
+fi
+_p4b_on_exit() {
+  local rc="$1"
+  if declare -F _p4b_cleanup_tmp >/dev/null 2>&1; then _p4b_cleanup_tmp || true; fi
+  p4b_heartbeat_finish "$rc" || true
+  return "$rc"
+}
+trap '_p4b_on_exit "$?"' EXIT
+p4b_heartbeat_start || true
+
 p4b_log "PR $REPO#$PR  HEAD=${HEAD:-?}  direction=$DIRECTION  reviewer=$REVIEWER  adapter=$ADAPTER  timeout=${ADAPTER_TIMEOUT}s  effort=${EFFECTIVE_EFFORT:-cli-default}  dry_run=$DRY_RUN"
 
 # feedback_accounting_status: run the accounting gate once. Returns 0 when
@@ -1074,7 +1094,7 @@ _p4b_cleanup_tmp() {
   if [ -n "${BODY_FILE:-}" ]; then rm -f "$BODY_FILE" 2>/dev/null || true; fi
   if [ -n "${_P4B_ACCT_DRY_STATE:-}" ]; then rm -rf "$_P4B_ACCT_DRY_STATE" 2>/dev/null || true; fi
 }
-trap _p4b_cleanup_tmp EXIT
+# _p4b_on_exit composes this cleanup with advisory terminal recording.
 
 # Dry-run accounting isolation (#615 Codex round 11, P2): a dry-run must not
 # mutate persistent accounting state. It used to append its simulated loop to
@@ -1181,12 +1201,14 @@ ADAPTER_ARGS=( --pr "$PR" )
 # Accounting (#602): per-loop timing signals, captured whether or not the
 # adapter succeeds so fail-closed loops carry their duration too.
 P4B_ACCT_LOOP_STARTED_EPOCH="$(date +%s)"
+p4b_heartbeat_stage adapter "$P4B_ACCT_LOOP_STARTED_EPOCH" || true
 set +e
 VERDICT_JSON="$(p4b_run_with_timeout "$ADAPTER_TIMEOUT" "$ADAPTER_SCRIPT" "${ADAPTER_ARGS[@]}")"
 ADAPTER_RC=$?
 set -e
 P4B_ACCT_LOOP_ELAPSED_SECONDS=$(( $(date +%s) - P4B_ACCT_LOOP_STARTED_EPOCH ))
 export P4B_ACCT_LOOP_STARTED_EPOCH P4B_ACCT_LOOP_ELAPSED_SECONDS
+p4b_heartbeat_stage adapter || true
 if [ "$DRY_RUN" != true ]; then
   # This fence precedes adapter rc/schema branching so a failed or malformed
   # adapter cannot turn a newly occupied final request into a manual handoff.
@@ -1225,6 +1247,8 @@ FINDINGS_COUNT="$(printf '%s' "$VERDICT_JSON" | jq -r '.findings | length')"
 TOKEN_COUNT="$(printf '%s' "$VERDICT_JSON" | jq -r '.usage.token_count // empty')"
 USAGE_SOURCE="$(printf '%s' "$VERDICT_JSON" | jq -r '.usage.source // empty')"
 ADAPTER_RUNS=1
+# Posting covers preparation and its side effects; it never asserts a POST.
+p4b_heartbeat_stage posting || true
 
 # p4b_file_post_review_issues <verdict-json>
 # Policy step 9 executor (#672): one `post-review` + `observation` issue per
@@ -1985,4 +2009,7 @@ jq -n \
   }
   | if $dry_run then . + {validated_verdict: $validated_verdict} else . end'
 
+# Read by the optional sourced heartbeat module during the composed EXIT.
+# shellcheck disable=SC2034
+P4B_HB_SUMMARY_EMITTED=true
 exit "$EXIT_CODE"
