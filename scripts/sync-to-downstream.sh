@@ -38,7 +38,7 @@
 # consumer-side dest using each consumer's manifest facts.
 #
 # Usage:
-#   scripts/sync-to-downstream.sh --audit [--use-local-tree] [--repos r1,r2] [--paths glob]
+#   scripts/sync-to-downstream.sh --audit [--json] [--use-local-tree] [--repos r1,r2] [--paths glob]
 #   scripts/sync-to-downstream.sh <commit-ish> [--dry-run] [--repos r1,r2] [--paths glob]
 #                                 [--no-pr] [--skip-existing|--recreate-existing] [--verbose]
 #                                 [--coderabbit-ignore]
@@ -57,6 +57,9 @@
 #                        ref@sha per consumer so the comparison basis is
 #                        never ambiguous (#439). To audit a local sibling
 #                        working tree instead, see --use-local-tree.
+#   --json               Audit only: emit NDJSON, one object per consumer.
+#                        See specs/sync_audit_json.md for fields, evidence,
+#                        unknown-source behavior, and status precedence.
 #   --sync-all           Bulk steady-state reconcile. Propagate the current
 #                        HEAD state of EVERY canonical + kit path in the
 #                        manifest to every consumer, ignoring the
@@ -1087,7 +1090,11 @@ run_audit() {
       continue
     fi
 
-    echo "$consumer_name ($consumer_repo)"
+    if [ "${AUDIT_JSON:-0}" = "1" ]; then
+      audit_json_begin "$consumer_name" "$consumer_repo" "$manifest"
+    else
+      echo "$consumer_name ($consumer_repo)"
+    fi
 
     local consumer_root
     if [ "${AUDIT_USE_LOCAL_TREE:-0}" = "1" ]; then
@@ -1096,12 +1103,20 @@ run_audit() {
       # + staleness warnings below make that basis explicit.
       if ! consumer_root=$(resolve_consumer_worktree "$consumer_name"); then
         if [ "${AUDIT_NO_CLONE:-0}" = "1" ]; then
-          echo "  ! no local worktree for $consumer_name (set MERGEPATH_SIBLINGS_DIR or drop --no-clone)"
+          if [ "${AUDIT_JSON:-0}" = "1" ]; then
+            audit_json_failure "no local worktree"
+          else
+            echo "  ! no local worktree for $consumer_name (set MERGEPATH_SIBLINGS_DIR or drop --no-clone)"
+          fi
           AUDIT_FETCH_ERROR=1
           continue
         fi
         if ! consumer_root=$(clone_consumer_to_cache "$consumer_name" "$consumer_repo"); then
-          echo "  ! could not fetch $consumer_repo"
+          if [ "${AUDIT_JSON:-0}" = "1" ]; then
+            audit_json_failure "consumer clone failed"
+          else
+            echo "  ! could not fetch $consumer_repo"
+          fi
           AUDIT_FETCH_ERROR=1
           continue
         fi
@@ -1114,12 +1129,20 @@ run_audit() {
       # false drift with no hint the baseline was stale.
       if ! consumer_root=$(resolve_consumer_cache_clone "$consumer_name"); then
         if [ "${AUDIT_NO_CLONE:-0}" = "1" ]; then
-          echo "  ! no cached clone for $consumer_name (drop --no-clone, or pass --use-local-tree to audit a local sibling worktree)"
+          if [ "${AUDIT_JSON:-0}" = "1" ]; then
+            audit_json_failure "no cached clone"
+          else
+            echo "  ! no cached clone for $consumer_name (drop --no-clone, or pass --use-local-tree to audit a local sibling worktree)"
+          fi
           AUDIT_FETCH_ERROR=1
           continue
         fi
         if ! consumer_root=$(clone_consumer_to_cache "$consumer_name" "$consumer_repo"); then
-          echo "  ! could not fetch $consumer_repo"
+          if [ "${AUDIT_JSON:-0}" = "1" ]; then
+            audit_json_failure "consumer clone failed"
+          else
+            echo "  ! could not fetch $consumer_repo"
+          fi
           AUDIT_FETCH_ERROR=1
           continue
         fi
@@ -1131,12 +1154,20 @@ run_audit() {
     # be auto-reset. Honors --no-refresh for offline / sandboxed runs.
     if path_is_in_cache "$consumer_root" && [ "${AUDIT_NO_REFRESH:-0}" != "1" ]; then
       if ! refresh_cached_clone "$consumer_root"; then
-        echo "  ! could not refresh cached clone for $consumer_name"
+        if [ "${AUDIT_JSON:-0}" = "1" ]; then
+          audit_json_failure "consumer default-branch refresh failed"
+        else
+          echo "  ! could not refresh cached clone for $consumer_name"
+        fi
         AUDIT_FETCH_ERROR=1
         continue
       fi
     fi
-    print_audit_baseline "$consumer_root"
+    if [ "${AUDIT_JSON:-0}" = "1" ]; then
+      audit_json_baseline "$consumer_root"
+    else
+      print_audit_baseline "$consumer_root"
+    fi
     local consumer_overrides=""
     if [ -f "$consumer_root/$OVERRIDES_PATH" ]; then
       consumer_overrides="$consumer_root/$OVERRIDES_PATH"
@@ -1182,6 +1213,11 @@ run_audit() {
       if [ "$mp_type" = "templated" ]; then
         consumer_path_for_override="$mp_dest"
       fi
+      if [ "${AUDIT_JSON:-0}" = "1" ]; then
+        audit_json_compare_entry "$mp_path" "$mp_type" "$mp_source" "$mp_dest" \
+                                 "$consumer_name" "$consumer_root" "$consumer_overrides"
+        continue
+      fi
       if override_should_skip_path "$consumer_overrides" "$consumer_path_for_override"; then
         emit_skip_line "$consumer_path_for_override" "$OVERRIDE_SKIP_REASON"
         continue
@@ -1213,7 +1249,11 @@ run_audit() {
           ;;
       esac
     done <<< "$paths"
-    echo
+    if [ "${AUDIT_JSON:-0}" = "1" ]; then
+      audit_json_finish
+    else
+      echo
+    fi
   done <<< "$consumers"
 }
 
@@ -3150,12 +3190,17 @@ SYNC_RECREATE_EXISTING=0
 SYNC_VERBOSE=0
 FILTER_REPOS=""
 FILTER_PATHS=""
+AUDIT_JSON=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --audit)
       MODE="audit"
       SAW_AUDIT=1
+      shift
+      ;;
+    --json)
+      AUDIT_JSON=1
       shift
       ;;
     --sync-all)
@@ -3307,6 +3352,10 @@ if [ "$SAW_AUDIT" = "1" ] && [ "$SAW_COMMIT_ISH" = "1" ]; then
 fi
 
 # Validate flag combinations before doing any I/O.
+if [ "$AUDIT_JSON" = "1" ] && [ "$MODE" != "audit" ]; then
+  err "--json is an audit-mode-only flag; use --audit --json"
+  exit 2
+fi
 if [ "$SYNC_NO_PR" = "1" ] && [ "$SYNC_RECREATE_EXISTING" = "1" ]; then
   err "--no-pr is incompatible with --recreate-existing (one stops at push, the other closes-and-recreates a PR)"
   exit 2
@@ -3352,6 +3401,16 @@ validate_filters "$MERGEPATH_ROOT/$MANIFEST_PATH" || exit $?
 
 case "$MODE" in
   audit)
+    if [ "$AUDIT_JSON" = "1" ]; then
+      command -v jq >/dev/null 2>&1 || { err "jq is required for --audit --json"; exit 2; }
+      # Load from this engine's directory, including synthetic-root tests.
+      # shellcheck source=scripts/lib/sync-audit-json.sh
+      if [ ! -r "$(dirname "${BASH_SOURCE[0]}")/lib/sync-audit-json.sh" ]; then
+        err "audit JSON helper is missing or unreadable"
+        exit 2
+      fi
+      source "$(dirname "${BASH_SOURCE[0]}")/lib/sync-audit-json.sh"
+    fi
     run_audit
     if [ "${AUDIT_FETCH_ERROR:-0}" = "1" ]; then
       exit 3
