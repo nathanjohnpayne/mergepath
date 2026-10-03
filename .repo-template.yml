@@ -20,6 +20,10 @@ spec_test_map:
   cockpit_prs:
     - tests/test_cockpit_prs.py
     - tests/test_cockpit_prs_ui.cjs
+  sync_audit_json: tests/test_sync_audit_json.sh
+  phase_4b_heartbeat:
+    - tests/test_phase_4b_heartbeat.sh
+    - tests/test_phase_4b_accounting.sh
   cockpit:
     - tests/test_cockpit.sh
   pr_body_contract:

@@ -29,7 +29,7 @@ BUDGETS = (
     ("reruns", "4b", "Phase 4b reruns after CHANGES_REQUESTED", "Cockpit advisory setting · phase-4b-loops", True),
     ("commits", "CR", "CodeRabbit commits · advisory threshold", "reviewed-commit anchor · Cockpit 5-commit display threshold", True),
 )
-CHECK_RUN_FIELDS = "id name status conclusion detailsUrl startedAt checkSuite { app { id slug } workflowRun { workflow { id } } }"
+CHECK_RUN_FIELDS = "id name status conclusion detailsUrl startedAt checkSuite { app { id slug } workflowRun { id workflow { id } } }"
 FIELDS = """id number title url state isDraft headRefOid createdAt updatedAt mergedAt closedAt
  author { login } mergeStateStatus reviewDecision
  labels(first:100) { nodes { name } pageInfo { hasNextPage endCursor } }
@@ -132,13 +132,15 @@ def _check_producer(node):
     app = suite.get("app") if type(suite) is dict else None
     if type(app) is not dict or type(app.get("id")) is not str or not app["id"] or type(app.get("slug")) is not str or not app["slug"]:
         return None
-    run, workflow_id = suite.get("workflowRun"), None
+    run, workflow_id, run_id = suite.get("workflowRun"), None, None
     if app["slug"] == "github-actions" or run is not None:
         workflow = run.get("workflow") if type(run) is dict else None
         if type(workflow) is not dict or type(workflow.get("id")) is not str or not workflow["id"]:
             return None
-        workflow_id = workflow["id"]
-    return app["id"], workflow_id, node["name"]
+        if type(run.get("id")) is not str or not run["id"]:
+            return None
+        workflow_id, run_id = workflow["id"], run["id"]
+    return app["id"], workflow_id, run_id, node["name"]
 
 
 def _current_required_contexts(contexts):

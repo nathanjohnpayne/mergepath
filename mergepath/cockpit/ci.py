@@ -70,20 +70,22 @@ def _conclusion(value):
 def normalize_check(repo, value, workflows):
     value = _row(value)
     app = value.get('app')
-    producer = None
+    producer, workflow_run_id = None, None
     if type(app) is dict and app.get('id') is not None:
         app_id = identity(app['id'])
         if app.get('slug') == 'github-actions':
             suite = value.get('check_suite')
-            workflow = workflows.get(identity(suite['id'])) if type(suite) is dict and suite.get('id') is not None else None
-            if workflow is not None:
-                producer = 'app:' + app_id + ':workflow:' + workflow
+            lineage = workflows.get(identity(suite['id'])) if type(suite) is dict and suite.get('id') is not None else None
+            if type(lineage) is dict and lineage.get('workflow_id') is not None:
+                producer = 'app:' + app_id + ':workflow:' + identity(lineage['workflow_id'])
+                if lineage.get('run_id') is not None:
+                    workflow_run_id = identity(lineage['run_id'])
         else:
             producer = 'app:' + app_id
     output = value.get('output') if type(value.get('output')) is dict else {}
     diagnostic = text('\n'.join(v for v in (output.get('title'), output.get('summary'), output.get('text')) if type(v) is str), 4000)
     return {'id': identity(value.get('id')), 'repo': repo, 'sha': _sha(value.get('head_sha')),
-            'name': text(value.get('name')), 'producer': producer,
+            'name': text(value.get('name')), 'producer': producer, 'workflow_run_id': workflow_run_id,
             'status': _status(value.get('status')), 'conclusion': _conclusion(value.get('conclusion')),
             'started_at': stamp(value.get('started_at')), 'completed_at': stamp(value.get('completed_at')),
             'diagnostic': diagnostic, 'diagnostic_source': 'check-run output', 'superseded_by': None}
@@ -94,10 +96,13 @@ def supersede(checks):
     for failed in checks:
         if failed['conclusion'] not in FAILURES or failed['producer'] is None or failed['started_at'] is None:
             continue
+        if ':workflow:' in failed['producer'] and failed.get('workflow_run_id') is None:
+            continue
         candidates = [passed for passed in checks if passed['status'] == 'completed'
                       and passed['conclusion'] == 'success' and passed['started_at'] is not None
                       and passed['started_at'] > failed['started_at']
-                      and all(passed[k] == failed[k] for k in ('repo', 'sha', 'name', 'producer'))]
+                      and all(passed[k] == failed[k] for k in ('repo', 'sha', 'name', 'producer'))
+                      and passed.get('workflow_run_id') == failed.get('workflow_run_id')]
         if candidates:
             failed['superseded_by'] = min(candidates, key=lambda row: row['started_at'])['id']
     return checks
@@ -203,7 +208,10 @@ class CIProvider:
             run_id = identity(raw.get('id'))
             suite_id = raw.get('check_suite_id')
             if suite_id is not None:
-                workflows[identity(suite_id)] = identity(raw.get('workflow_id'))
+                suite = identity(suite_id)
+                lineage = {'workflow_id': identity(raw.get('workflow_id')), 'run_id': run_id}
+                # Conflicting suite/run observations never choose a convenient lineage.
+                workflows[suite] = lineage if suite not in workflows or workflows[suite] == lineage else None
             job_key = (repo, run_id, identity(raw.get('run_attempt', 1)))
             if raw.get('status') == 'completed' and job_key in self._jobs_cache:
                 jobs[run_id] = copy.deepcopy(self._jobs_cache[job_key])
