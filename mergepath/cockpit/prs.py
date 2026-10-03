@@ -22,6 +22,14 @@ from .scheduler import Sample
 SAFE_INTEGER = 2**53 - 1
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 GATE_LABELS = ("needs-external-review", "needs-human-review", "human-hold", "policy-violation")
+HELPER_FAILURES = (ClientError, OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError)
+
+
+def helper_failure(error):
+    category = error.category if isinstance(error, ClientError) else "deadline_exceeded" if isinstance(error, subprocess.TimeoutExpired) else "source_failed"
+    return {"data": None, "error": category}
+
+
 BUDGETS = (
     ("blocking", "blk", "Codex blocking reviews", "codex-review-ledger.sh", False),
     ("requests", "req", "Codex requests (ceiling)", "codex-review-ledger.sh", False),
@@ -401,8 +409,10 @@ class HelperReader:
                 finally:
                     if process.poll() is None:
                         os.killpg(process.pid, signal.SIGKILL)
-                    process.wait(timeout=1)
-                    listener.close()
+                    try:
+                        process.wait(timeout=1)
+                    finally:
+                        listener.close()
 
     def read(self, repo, number, head, deadline):
         script = str(self.root / "scripts")
@@ -448,42 +458,48 @@ printf '%s' "$ledger" | jq --arg policy_yaml "$(cat "$p")" --arg base "$base" --
                     data = self._run(args, repo, deadline, allowed=allowed, policy=target_policy, coderabbit=cr_config)
                 else:
                     data = self._run(args, repo, deadline, allowed=allowed)
+                if type(data) is not dict:
+                    raise ClientError("source_failed")
                 if source == "ledger":
                     target_policy = data.pop("policy_yaml", None)
                 if source == "coderabbit" and data.get("head_sha") != head:
                     raise ClientError("source_failed")
                 result[source] = {"data": data, "error": None}
-            except (ClientError, OSError, ValueError):
-                result[source] = {"data": None, "error": "source_failed"}
+            except HELPER_FAILURES as error:
+                result[source] = helper_failure(error)
         # Count CR commits only from a proven anchor. Never assume zero.
         try:
             reviews = self.client.pages(f"/repos/{repo}/pulls/{number}/reviews?per_page=100", deadline=deadline)
             comments = self.client.pages(f"/repos/{repo}/issues/{number}/comments?per_page=100", deadline=deadline)
             commits = self.client.pages(f"/repos/{repo}/pulls/{number}/commits?per_page=100", deadline=deadline)
             result["commits"] = {"data": {"used": commits_since_review(reviews, comments, commits, head)}, "error": None}
-        except (ClientError, OSError, ValueError):
-            result.setdefault("commits", {"data": None, "error": "source_failed"})
+        except HELPER_FAILURES as error:
+            result.setdefault("commits", helper_failure(error))
         try:
             if "reviews" not in locals():
                 raise ClientError("source_failed")
             result["accounting"] = {"data": self._accounting(repo, number, reviews, deadline, policy=target_policy), "error": None}
-        except (ClientError, OSError, ValueError, KeyError, TypeError):
-            result["accounting"] = {"data": None, "error": "source_failed"}
+        except HELPER_FAILURES as error:
+            result["accounting"] = helper_failure(error)
         try:
             if target_policy is None:
                 raise ClientError("source_failed")
             self._same_tuple(repo, number, result["ledger"]["data"].get("tuple"), deadline)
-        except (ClientError, OSError, ValueError, KeyError, TypeError):
-            return {source: {"data": None, "error": "source_failed"} for source in result}
+        except HELPER_FAILURES as error:
+            return {source: helper_failure(error) for source in result}
         return result
 
     def _same_tuple(self, repo, number, expected, deadline):
         if type(expected) is not dict:
             raise ClientError("source_failed")
         metadata = self.client.get(f"/repos/{repo}/pulls/{number}", deadline=deadline)
-        base = metadata.get("base", {})
-        observed = {"head": metadata.get("head", {}).get("sha"), "base": base.get("sha"),
-                    "ref": base.get("ref"), "repository": base.get("repo", {}).get("id")}
+        if type(metadata) is not dict or type(metadata.get("base")) is not dict or type(metadata.get("head")) is not dict:
+            raise ClientError("source_failed")
+        base = metadata["base"]
+        if type(base.get("repo")) is not dict:
+            raise ClientError("source_failed")
+        observed = {"head": metadata["head"].get("sha"), "base": base.get("sha"),
+                    "ref": base.get("ref"), "repository": base["repo"].get("id")}
         if observed != expected:
             raise ClientError("source_failed")
 
@@ -500,6 +516,8 @@ jq -r --argjson trusted "$trusted" '.[] | (.user.login // "") as $login | select
 '''
         extracted = self._run(["bash", "-c", extraction, "cockpit-pr-records", str(self.root / "scripts")],
                               repo, deadline, payload=reviews, policy=policy)
+        if type(extracted) is not list or any(type(record) is not dict for record in extracted):
+            raise ClientError("source_failed")
         records = []
         for record in extracted:
             if str(record.get("pr")) == number and record.get("automation_state") == "posted":
@@ -722,10 +740,18 @@ class PRProvider:
                 continue
             repo, raw = raw_by_id[key]
             old = self.enrichment.get(key, {}).get("receipts", {})
-            results = self.helper.read(repo, str(raw["number"]), raw["headRefOid"], request_deadline)
+            failure = {"data": None, "error": "unavailable"}
+            try:
+                results = self.helper.read(repo, str(raw["number"]), raw["headRefOid"], request_deadline)
+                if type(results) is not dict:
+                    raise ClientError("source_failed")
+            except HELPER_FAILURES as error:
+                results, failure = {}, helper_failure(error)
             receipts = {}
             for source in ("ledger", "feedback", "coderabbit", "accounting", "commits"):
-                value = results.get(source, {"data": None, "error": "unavailable"})
+                value = results.get(source, failure)
+                if type(value) is not dict or value.get("data") is not None and type(value["data"]) is not dict:
+                    value = {"data": None, "error": "source_failed"}
                 if value.get("data") is None and source in old:
                     receipt = copy.deepcopy(old[source]); receipt.update(stale=True, error=value.get("error", "source_failed"))
                 else:

@@ -78,6 +78,85 @@ class Helpers:
 
 
 class PRTests(unittest.TestCase):
+    def test_helper_shape_and_process_failures_are_source_local(self):
+        metadata={'head':{'sha':HEAD},'base':{'sha':'b'*40,'ref':'main','repo':{'id':1}}}
+        expected={'head':HEAD,'base':'b'*40,'ref':'main','repository':1}
+        class Reads:
+            def get(self,path,*,deadline):return copy.deepcopy(self.metadata)
+            def pages(self,path,*,deadline):return []
+        class Reader(HelperReader):
+            def _api(self,*args):return 'reviews: {}'
+            def _run(self,args,*rest,**kwargs):
+                if 'cockpit-pr-ledger' in args:
+                    if self.mode=='ledger':return []
+                    return {'policy_yaml':'codex: {}','tuple':expected,'base_sha':'b'*40}
+                if 'cockpit-pr-records' in args:
+                    return {'record':None} if self.mode=='extract-object' else [None]
+                if 'coderabbit-wait.sh' in args[0]:
+                    if self.mode=='timeout':raise subprocess.TimeoutExpired(args,1)
+                    return {'head_sha':HEAD}
+                return {}
+        for mode in ['ledger','extract-object','extract-record','timeout','null-base','null-head','null-repo','null-metadata']:
+            with self.subTest(mode=mode):
+                client=Reads();client.metadata=copy.deepcopy(metadata)
+                if mode=='null-metadata':client.metadata=None
+                elif mode.startswith('null-'):
+                    if mode=='null-repo':client.metadata['base']['repo']=None
+                    else:client.metadata[mode[5:]]=None
+                reader=Reader(client,ROOT);reader.mode=mode
+                result=reader.read(REPO,'1',HEAD,time.monotonic()+5)
+                self.assertIsNone(result['accounting']['data'])
+                if mode in ['ledger','null-base','null-head','null-repo','null-metadata']:
+                    self.assertTrue(all(value['data'] is None for value in result.values()))
+                else:
+                    self.assertIsNotNone(result['ledger']['data'])
+                    self.assertIsNotNone(result['feedback']['data'])
+                    if mode=='timeout':self.assertEqual(result['coderabbit']['error'],'deadline_exceeded')
+                    else:self.assertIsNotNone(result['coderabbit']['data'])
+
+    def test_unexpected_helper_failure_retains_receipts_and_other_fresh_prs(self):
+        for failure in [AttributeError('private detail'),subprocess.TimeoutExpired(['private'],1),
+                        ClientError('deadline_exceeded'),[],{'ledger':None}]:
+            with self.subTest(failure=type(failure).__name__):
+                clock=[0]
+                class Broken(Helpers):
+                    def read(self,repo,number,head,deadline):
+                        if clock[0] and repo==REPO and number=='1':
+                            if isinstance(failure,Exception):raise failure
+                            return failure
+                        return super().read(repo,number,head,deadline)
+                client=Client();client.rows=[raw(1),raw(2)]
+                helper=Broken()
+                provider=PRProvider(client,[Repository('hub',REPO),Repository('peer','owner/peer')],ROOT,
+                    helper=helper,max_enrichments=4,monotonic=lambda:clock[0],clock=lambda:1000+clock[0])
+                provider(100);clock[0]=120
+                observations=provider(200).data['repositories']
+                self.assertTrue(all(not entry['stale'] and entry['observed_at']==1120 for entry in observations))
+                failed=observations[0]['rows'][0];healthy=observations[0]['rows'][1]
+                self.assertEqual(failed['checks'][0]['name'],'Required lint')
+                self.assertTrue(failed['stale']);self.assertFalse(healthy['stale'])
+                self.assertTrue(all(not row['stale'] for row in observations[1]['rows']))
+                retained=provider.enrichment[REPO+'#1']['receipts']['ledger']
+                self.assertEqual(retained['observed_at'],1000);self.assertTrue(retained['stale'])
+                category='deadline_exceeded' if isinstance(failure,(subprocess.TimeoutExpired,ClientError)) else 'source_failed'
+                self.assertEqual(retained['error'],category)
+                calls=len(helper.calls);clock[0]=130;provider(200)
+                self.assertEqual(len(helper.calls),calls)
+
+    def test_helper_deadline_failure_stops_later_enrichments_but_publishes_fast_rows(self):
+        clock=[0];calls=[]
+        class Exhausted:
+            def read(self,repo,number,head,deadline):
+                calls.append(number);clock[0]=deadline
+                raise ClientError('deadline_exceeded')
+        client=Client();client.rows=[raw(1),raw(2)]
+        provider=PRProvider(client,[Repository('hub',REPO)],ROOT,helper=Exhausted(),
+            max_enrichments=2,monotonic=lambda:clock[0])
+        rows=provider(5).data['repositories'][0]['rows']
+        self.assertEqual(calls,['1']);self.assertEqual(len(rows),2)
+        self.assertEqual(provider.enrichment[REPO+'#1']['receipts']['ledger']['error'],'deadline_exceeded')
+        self.assertEqual(provider.queue,[REPO+'#2'])
+
     def test_all_budget_boundaries_and_small_limit(self):
         for key in ['blocking', 'requests', 'rounds', 'reruns', 'commits']:
             for used, left, state in [(0, 10, 'clear'), (8, 2, 'bump'), (9, 1, 'bump'), (10, 0, 'boulder'), (11, 0, 'boulder')]:
