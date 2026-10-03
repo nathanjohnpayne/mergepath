@@ -29,12 +29,13 @@ BUDGETS = (
     ("reruns", "4b", "Phase 4b reruns after CHANGES_REQUESTED", "Cockpit advisory setting · phase-4b-loops", True),
     ("commits", "CR", "CodeRabbit commits · advisory threshold", "reviewed-commit anchor · Cockpit 5-commit display threshold", True),
 )
+CHECK_RUN_FIELDS = "id name status conclusion detailsUrl startedAt checkSuite { app { id slug } workflowRun { workflow { id } } }"
 FIELDS = """id number title url state isDraft headRefOid createdAt updatedAt mergedAt closedAt
  author { login } mergeStateStatus reviewDecision
  labels(first:100) { nodes { name } pageInfo { hasNextPage endCursor } }
  commits(last:1) { nodes { commit { oid pushedDate committedDate
   statusCheckRollup { contexts(first:100) { nodes {
-   __typename ... on CheckRun { id name status conclusion detailsUrl }
+   __typename ... on CheckRun { """ + CHECK_RUN_FIELDS + """ }
    ... on StatusContext { id context state targetUrl }
   } pageInfo { hasNextPage endCursor } } }
  } } }
@@ -50,7 +51,7 @@ def required_query(rows):
             raise ClientError("invalid_upstream_json")
         fields = f'''headRefOid commits(last:1) {{ nodes {{ commit {{ oid statusCheckRollup {{
           contexts(first:100) {{ nodes {{ __typename
-            ... on CheckRun {{ id name status conclusion detailsUrl isRequired(pullRequestNumber:{number}) }}
+            ... on CheckRun {{ {CHECK_RUN_FIELDS} isRequired(pullRequestNumber:{number}) }}
             ... on StatusContext {{ id context state targetUrl isRequired(pullRequestNumber:{number}) }}
           }} pageInfo {{ hasNextPage endCursor }} }}
         }} }} }} }}'''
@@ -118,9 +119,46 @@ def _check(node):
         return None
     status = node.get("status", node.get("state"))
     conclusion = node.get("conclusion")
-    tone = "running" if status in {"IN_PROGRESS", "PENDING", "QUEUED", "WAITING", "REQUESTED"} else "clear" if conclusion in {"SUCCESS", "NEUTRAL", "SKIPPED"} or status == "SUCCESS" else "boulder" if conclusion in {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"} or status in {"FAILURE", "ERROR"} else "idle"
+    tone = "running" if status in {"IN_PROGRESS", "PENDING", "EXPECTED", "QUEUED", "WAITING", "REQUESTED"} else "clear" if conclusion in {"SUCCESS", "NEUTRAL", "SKIPPED"} or status == "SUCCESS" else "boulder" if conclusion in {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"} or status in {"FAILURE", "ERROR"} else "idle"
     return {"id": str(node["id"]), "name": node.get("name", node.get("context", "Check")),
             "state": tone, "url": node.get("detailsUrl", node.get("targetUrl"))}
+
+
+def _check_producer(node):
+    # Display names alone never establish a producing app or Actions workflow.
+    if node.get("__typename") != "CheckRun" or type(node.get("name")) is not str or not node["name"]:
+        return None
+    suite = node.get("checkSuite")
+    app = suite.get("app") if type(suite) is dict else None
+    if type(app) is not dict or type(app.get("id")) is not str or not app["id"] or type(app.get("slug")) is not str or not app["slug"]:
+        return None
+    run, workflow_id = suite.get("workflowRun"), None
+    if app["slug"] == "github-actions" or run is not None:
+        workflow = run.get("workflow") if type(run) is dict else None
+        if type(workflow) is not dict or type(workflow.get("id")) is not str or not workflow["id"]:
+            return None
+        workflow_id = workflow["id"]
+    return app["id"], workflow_id, node["name"]
+
+
+def _current_required_contexts(contexts):
+    required = [node for node in contexts if type(node) is dict and node.get("isRequired") is True]
+    groups, selected = {}, set(range(len(required)))
+    for index, node in enumerate(required):
+        producer = _check_producer(node)
+        if producer is not None:
+            groups.setdefault(producer, []).append(index)
+    for indices in groups.values():
+        times = [epoch(required[index].get("startedAt")) if type(required[index].get("startedAt")) is str else None for index in indices]
+        # Unknown or tied ordering cannot erase a failure or an unstarted rerun.
+        if any(value is None for value in times):
+            continue
+        newest = max(times)
+        if times.count(newest) != 1:
+            continue
+        winner = indices[times.index(newest)]
+        selected.difference_update(index for index in indices if index != winner)
+    return [node for index, node in enumerate(required) if index in selected]
 
 
 def commits_since_review(reviews, comments, commits, head):
@@ -165,8 +203,8 @@ def build_row(repo, raw, enrichment=None, settings=None, observed_at=None):
     commit = commits[-1].get("commit", {}) if commits else {}
     rollup = commit.get("statusCheckRollup")
     contexts = rollup.get("contexts", {}).get("nodes", []) if isinstance(rollup, dict) else []
-    checks = [item for node in contexts if (item := _check(node)) is not None]
-    checks_known = isinstance(rollup, dict) and all(type(node.get("isRequired")) is bool for node in contexts)
+    checks = [_check(node) for node in _current_required_contexts(contexts)]
+    checks_known = isinstance(rollup, dict) and all(type(node) is dict and type(node.get("isRequired")) is bool for node in contexts)
     labels = [node["name"] for node in raw.get("labels", {}).get("nodes", []) if node.get("name") in GATE_LABELS]
     feedback = receipts["feedback"]["data"] or {}
     cr = receipts["coderabbit"]["data"] or {}
@@ -614,7 +652,7 @@ class PRProvider:
         commit = commits[-1].get("commit", {}) if commits else {}
         rollup = commit.get("statusCheckRollup")
         if isinstance(rollup, dict):
-            self._extend(rollup.get("contexts"), lambda cursor: ('commits(last:1) { nodes { commit { oid statusCheckRollup { contexts(first:100,after:$cursor) { nodes { __typename ... on CheckRun { id name status conclusion detailsUrl isRequired(pullRequestNumber:$number) } ... on StatusContext { id context state targetUrl isRequired(pullRequestNumber:$number) } } pageInfo { hasNextPage endCursor } } } } } }', "checks"), repo, raw, deadline)
+            self._extend(rollup.get("contexts"), lambda cursor: ('commits(last:1) { nodes { commit { oid statusCheckRollup { contexts(first:100,after:$cursor) { nodes { __typename ... on CheckRun { ' + CHECK_RUN_FIELDS + ' isRequired(pullRequestNumber:$number) } ... on StatusContext { id context state targetUrl isRequired(pullRequestNumber:$number) } } pageInfo { hasNextPage endCursor } } } } } }', "checks"), repo, raw, deadline)
 
     def _extend(self, connection, field, repo, raw, deadline):
         cursor, seen = self._connection(connection), set()
