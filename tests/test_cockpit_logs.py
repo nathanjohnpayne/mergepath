@@ -155,6 +155,11 @@ class ExcerptHTTPTests(unittest.TestCase):
         reads = []
         def read_log(repo, job, deadline):
             reads.append((repo, job, deadline))
+            if len(reads) == 1:
+                # Reproduce contention on the real shared transport fence.
+                # The next authenticated GET is an explicit retry.
+                with client._transport_lock:
+                    return client.read_job_log(repo, job, deadline=min(deadline, time.monotonic() + 0.005))
             return ("FAIL: " + TOKEN + app._session + " <script>literal</script>\n").encode()
         app.ci_excerpts = LogExcerptCache(inventory, read_log)
         step = {"number": "2", "conclusion": "failure", "started_at": None, "completed_at": None}
@@ -188,6 +193,9 @@ class ExcerptHTTPTests(unittest.TestCase):
                         path.replace("owner%2Frepo", "other%2Frepo")]:
                 self.assertEqual(request(bad, cookie)[0], 400)
             self.assertEqual(reads, [])
+            status, payload = request(path, cookie)
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["error"], "deadline_exceeded")
             for _ in range(2):
                 status, payload = request(path, cookie)
                 self.assertEqual(status, 200)
@@ -195,7 +203,7 @@ class ExcerptHTTPTests(unittest.TestCase):
                 self.assertEqual(payload["scope"], "job")
                 self.assertNotIn(TOKEN, str(payload)); self.assertNotIn(app._session, str(payload))
                 self.assertIn("<script>literal</script>", payload["lines"][0])
-            self.assertEqual(len(reads), 1)
+            self.assertEqual(len(reads), 2)
             self.assertEqual(reads[0][:2], ("owner/repo", "123"))
         finally:
             connection.close(); app.close(); server.shutdown(); server.server_close(); thread.join(1)

@@ -65,7 +65,23 @@ def params(**updates):
     return value
 
 
+def unicode_model_and_excerpt():
+    run = raw_run(); run['name'] = '🚀' * 1001
+    check = raw_check(); check['output'] = {'summary': '🚀' * 4001}
+    rows, groups = group_runs(REPO, [run], {'10': [normalize_job(raw_job())]},
+                              [normalize_check(REPO, check, {})], {'7': SHA})
+    data = model(); data.update(runs=rows, groups=groups)
+    return {'data': data, 'excerpt': extract_fail_lines(('FAIL:' + '🚀' * 1000).encode(), {})}
+
+
 class SupersessionTests(unittest.TestCase):
+    def test_unicode_producer_limits_preserve_complete_code_points(self):
+        fixture = unicode_model_and_excerpt()
+        self.assertEqual(fixture['data']['runs'][0]['name'], '🚀' * 1000)
+        self.assertEqual(fixture['data']['runs'][0]['diagnostics'][0]['text'], '🚀' * 4000)
+        self.assertEqual(fixture['excerpt']['lines'], ['FAIL:' + '🚀' * 995])
+        self.assertTrue(fixture['excerpt']['truncated'])
+
     def test_same_sha_producer_and_check_later_pass_supersedes(self):
         checks = [normalize_check(REPO, raw_check(), {'50': {'workflow_id': '9', 'run_id': '10'}}),
                   normalize_check(REPO, raw_check(101, 'success', LATER), {'50': {'workflow_id': '9', 'run_id': '10'}})]
@@ -132,6 +148,40 @@ class SupersessionTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_provider_accepts_check_url_repository_casing_and_keeps_enrolled_identity(self):
+        job = raw_job(); job['check_run_url'] = job['check_run_url'].replace(REPO, 'OwNeR/RePo')
+        class Client:
+            def pages(self, route, **kwargs):
+                if '/pulls?' in route: return [{'number': 7, 'head': {'sha': SHA}}]
+                if '/actions/runs?' in route: return [raw_run()] if 'created=' in route else []
+                if '/jobs?' in route: return [job]
+                return [raw_check()]
+        data = CIProvider(Client(), INVENTORY)(time.monotonic() + 5).data
+        self.assertFalse(data['repositories'][0]['stale'])
+        self.assertEqual(data['runs'][0]['repo'], REPO)
+        self.assertEqual(data['runs'][0]['jobs'][0]['check_id'], '100')
+        self.assertTrue(data['runs'][0]['actionable'])
+
+    def test_check_url_casing_does_not_relax_authority_path_or_identity(self):
+        base = raw_job()['check_run_url']
+        for url in [base.replace(REPO, 'other/repo'), base.replace(REPO, 'owner/other'),
+                    base.replace(REPO, 'owner/repo-extra'), base.replace(REPO, 'owner/repo%2Fextra')]:
+            with self.subTest(url=url), self.assertRaisesRegex(ClientError, 'invalid_upstream_json'):
+                normalize_job({**raw_job(), 'check_run_url': url}, REPO)
+        for observed, enrolled in [('owner/Straße', 'owner/strasse'), ('owner/K', 'owner/k'),
+                                   ('owner/ſ', 'owner/s')]:
+            with self.subTest(observed=observed), self.assertRaisesRegex(ClientError, 'invalid_upstream_json'):
+                normalize_job({**raw_job(), 'check_run_url': base.replace(REPO, observed)}, enrolled)
+        for url in [base.replace('https:', 'http:'), base.replace('api.github.com', 'API.GITHUB.COM'),
+                    base.replace('api.github.com', 'api.github.com:443'),
+                    base.replace('api.github.com', 'user@api.github.com'),
+                    base.replace('/check-runs/', '/CHECK-RUNS/'), base + '?x=1', base + '#fragment',
+                    base.replace('/100', '/0100')]:
+            with self.subTest(url=url):
+                self.assertIsNone(normalize_job({**raw_job(), 'check_run_url': url}, REPO)['check_id'])
+        huge = '900719925474099312345'
+        self.assertEqual(normalize_job(raw_job(check_id=huge), REPO)['check_id'], huge)
+
     def test_real_client_paginates_runs_jobs_and_checks_under_same_deadline(self):
         calls = []
         def transport(method, url, headers, body, timeout):
@@ -244,6 +294,62 @@ class ProviderTests(unittest.TestCase):
 
 
 class ExcerptTests(unittest.TestCase):
+    def test_excerpt_retry_honors_shared_client_backoff_then_observes_recovery(self):
+        now, calls = [1000], []
+        def transport(*args):
+            calls.append(args)
+            if len(calls) == 1:
+                return Response(403, {'Retry-After': '60'}, b'secondary rate limit')
+            return Response(302, {'Location': 'https://productionresultssa19.blob.core.windows.net/logs/job.txt?sig=fixture'}, b'')
+        client = GitHubClient('fixture', transport=transport, clock=lambda: now[0],
+                              log_transport=lambda *args: Response(200, {}, b'FAIL: recovered'))
+        cache = LogExcerptCache(INVENTORY, lambda repo, job, deadline: client.read_job_log(repo, job, deadline=deadline))
+        self.assertEqual(cache.handle(params(), envelope(), deadline=time.monotonic()+1)['error'], 'secondary_limit')
+        self.assertEqual(cache.handle(params(), envelope(), deadline=time.monotonic()+1)['error'], 'upstream_backoff')
+        self.assertEqual(len(calls), 1)
+        now[0] += 60
+        self.assertEqual(cache.handle(params(), envelope(), deadline=time.monotonic()+1)['lines'], ['FAIL: recovered'])
+        self.assertEqual(len(calls), 2)
+
+    def test_explicit_retry_after_transient_failure_can_observe_log_immediately(self):
+        for error in ['deadline_exceeded', 'upstream_backoff', 'secondary_limit', 'primary_reserve',
+                      'primary_exhausted', 'upstream_unavailable', 'upstream_http_error']:
+            calls = []
+            def read(*args):
+                calls.append(args)
+                if len(calls) == 1: raise ClientError(error)
+                return b'FAIL: retry observed'
+            cache = LogExcerptCache(INVENTORY, read)
+            with self.subTest(error=error):
+                self.assertEqual(cache.handle(params(), envelope(), deadline=time.monotonic()+1)['error'], error)
+                retry = cache.handle(params(), envelope(), deadline=time.monotonic()+1)
+                self.assertEqual(retry['lines'], ['FAIL: retry observed'])
+                self.assertEqual(len(calls), 2)
+
+    def test_expired_request_before_read_does_not_poison_next_retry(self):
+        calls = []
+        def read(*args):
+            calls.append(args); return b'FAIL: new request'
+        cache = LogExcerptCache(INVENTORY, read)
+        self.assertEqual(cache.handle(params(), envelope(), deadline=time.monotonic()-1)['error'], 'deadline_exceeded')
+        self.assertEqual(calls, [])
+        self.assertEqual(cache.handle(params(), envelope(), deadline=time.monotonic()+1)['lines'], ['FAIL: new request'])
+        self.assertEqual(len(calls), 1)
+
+    def test_deterministic_denial_and_oversize_remain_cached_for_ttl(self):
+        for error in ['permission_denied', 'response_too_large']:
+            now, calls = [0], []
+            def read(*args):
+                calls.append(args); raise ClientError(error)
+            cache = LogExcerptCache(INVENTORY, read, clock=lambda: now[0])
+            for at in [0, 119]:
+                now[0] = at
+                self.assertEqual(cache.handle(params(), envelope(), deadline=at+1)['error'], error)
+            self.assertEqual(len(calls), 1)
+            now[0] = 120
+            self.assertEqual(cache.handle(params(), envelope(), deadline=121)['error'], error)
+            self.assertEqual(len(calls), 2)
+
     def test_timestamp_window_excludes_other_steps(self):
         step = normalize_job(raw_job())['steps'][0]
         result = extract_fail_lines(b'2026-10-02T23:59:00Z FAIL: before\n2026-10-03T00:00:10Z FAIL: wanted\n2026-10-03T00:02:00Z FAIL: after', step)
