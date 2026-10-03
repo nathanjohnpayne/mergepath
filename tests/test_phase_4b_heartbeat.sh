@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # #1589 lifecycle regressions: real orchestrator, hermetic adapter/GitHub
-# boundaries, no lib.sh mutation. Expected ~40s; each invocation bounded 30s,
+# boundaries, no lib.sh mutation. Expected ~80s; each invocation bounded 30s,
 # adapter capped at 3s (timeout fixture 1s). History fixtures emit on request
 # for #1590 without implementing its aggregator/provider.
 set -euo pipefail
@@ -21,7 +21,27 @@ export P4B_HANDOFF="$BIN/handoff" P4B_GH_AS_REVIEWER="$BIN/reviewer"
 export MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$BIN/feedback"
 export P4B_ACCT_PRIOR_RECORDS_JSONL="$WORK/empty.jsonl"
 : > "$P4B_ACCT_PRIOR_RECORDS_JSONL"
+HB_REAL_NODE="$(command -v node)"
+export HB_REAL_NODE
 export PATH="$BIN:$PATH"
+cat > "$BIN/node" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+printf '%s\n' "${1:-}" >> "$HB_CASE/node-calls"
+[ "${HB_ENTROPY:-good}" != unavailable ] || exit 90
+# Intercept the crypto draw only; version and shared PR-body parser calls use
+# the real runtime. Failures therefore exercise the enabled caller rather than
+# replacing its existing hard dependency check with a permissive fake.
+if [ "${1:-}" = -e ] && [[ "${2:-}" == *'randomBytes(16)'* ]]; then
+  printf 'entropy\n' >> "$HB_CASE/entropy-calls"
+  case "${HB_ENTROPY:-good}" in
+    error) printf '0123456789abcdef0123456789abcdef'; printf 'injected entropy error\n' >&2; exit 1 ;;
+    malformed) printf 'ABCDEF0123456789ABCDEF0123456789AB'; exit 0 ;;
+    timeout) exec sleep 20 ;;
+  esac
+fi
+exec "$HB_REAL_NODE" "$@"
+EOF
 cat > "$BIN/gh" <<'EOF'
 #!/usr/bin/env bash
 set -eu
@@ -65,6 +85,7 @@ cat > "$BIN/codex-check" <<'EOF'
 set -eu
 # Observe that the barrier stage was published before external-boundary reads.
 jq -r '.stage' "$P4B_HEARTBEAT_DIR"/p4b-*.json >> "$HB_CASE/observed" 2>/dev/null || true
+jq -r '.run_id' "$P4B_HEARTBEAT_DIR"/p4b-*.json >> "$HB_CASE/observed-ids" 2>/dev/null || true
 cp "$P4B_HEARTBEAT_DIR"/p4b-*.json "$HB_CASE/barrier.json" 2>/dev/null || true
 case "$HB_MODE" in hold|ceiling-stop) exit 1 ;; *) exit 0 ;; esac
 EOF
@@ -92,6 +113,8 @@ cat > "$BIN/reviewer" <<'EOF'
 #!/usr/bin/env bash
 set -eu
 jq -r '.stage' "$P4B_HEARTBEAT_DIR"/p4b-*.json >> "$HB_CASE/observed" 2>/dev/null || true
+jq -r '.run_id' "$P4B_HEARTBEAT_DIR"/p4b-*.json >> "$HB_CASE/observed-ids" 2>/dev/null || true
+cp "$P4B_ACCT_STATE_DIR/phase-4b-pending/fixture-repo-pr1589.json.runid" "$HB_CASE/staged-runid" 2>/dev/null || true
 printf 'post\n' >> "$HB_CASE/events"
 while [ $# -gt 0 ]; do
  if [ "$1" = --input ]; then cp "$2" "$HB_CASE/posted.json"; break; fi
@@ -108,6 +131,7 @@ cat > "$WORK/adapters/review-via-codex.sh" <<'EOF'
 #!/usr/bin/env bash
 set -eu
 jq -r '.stage' "$P4B_HEARTBEAT_DIR"/p4b-*.json >> "$HB_CASE/observed" 2>/dev/null || true
+jq -r '.run_id' "$P4B_HEARTBEAT_DIR"/p4b-*.json >> "$HB_CASE/observed-ids" 2>/dev/null || true
 printf 'adapter\n' >> "$HB_CASE/events"
 case "$HB_MODE" in
  timeout|killed) sleep 20 ;;
@@ -139,9 +163,11 @@ codex:
   max_review_rounds: 10
 EOF
 run_case() {
-  local mode="$1" expected="$2" stages="$3" storage="${4:-good}" rc=0 record
+  local mode="$1" expected="$2" stages="$3" storage="${4:-good}" rc=0 record id log
   export HB_MODE="$mode" HB_CASE="$WORK/$mode-$storage"
   mkdir -p "$HB_CASE"; : > "$HB_CASE/events"
+  export HB_ENTROPY=good
+  case "$storage" in entropy-*) export HB_ENTROPY="${storage#entropy-}" ;; esac
   export P4B_HEARTBEAT_DIR="$HB_CASE/heartbeats" P4B_ACCT_STATE_DIR="$HB_CASE/accounting"
   export MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy"
   if [ "$mode" = ceiling-stop ]; then
@@ -159,6 +185,8 @@ run_case() {
       bash "$ROOT/scripts/phase-4b-review.sh" 1589 --repo fixture/repo --head "$HB_HEAD" --diff-file "$WORK/diff" > "$HB_CASE/out" 2> "$HB_CASE/err" || rc=$?
   fi
   if [ "$rc" = "$expected" ]; then pass "$mode/$storage exit $expected"; else fail "$mode/$storage exit $rc expected $expected: $(tail -3 "$HB_CASE/err")"; fi
+  [ "$(cat "$HB_CASE/entropy-calls" 2>/dev/null)" = entropy ] \
+    && pass "$mode/$storage draws entropy exactly once" || fail "$mode/$storage entropy count"
   if [ "$storage" = blocked ]; then
     [ -f "$P4B_HEARTBEAT_DIR" ] && pass "$mode storage failure ignored" || fail "$mode changed blocked storage"
     # Compare the complete boundary trace, including every mocked API read,
@@ -168,22 +196,65 @@ run_case() {
       && pass "$mode blocked storage preserves boundary operations and order" || fail "$mode blocked storage changed boundary trace"
     return 0
   fi
+  case "$storage" in entropy-*)
+    [ ! -e "$P4B_HEARTBEAT_DIR" ] && pass "$mode/$storage publishes no unavailable identity" || fail "$mode/$storage advertised heartbeat identity"
+    cmp -s "$WORK/$mode-good/events" "$HB_CASE/events" \
+      && cmp -s "$WORK/$mode-good/out" "$HB_CASE/out" \
+      && pass "$mode/$storage preserves boundary operations, order and summary" || fail "$mode/$storage changed review flow"
+    log="$P4B_ACCT_STATE_DIR/phase-4b-loops/fixture-repo-pr1589.jsonl"
+    [ "$mode" != approve ] || log="$log.archive"
+    jq -e --arg posted "$([ "$mode" = approve ] && printf posted || printf not-posted)" '
+      .loop.run_id == null and .loop.verdict == "APPROVED" and .loop.posted == $posted
+      and .loop.tokens.total == 123 and .loop.elapsed_seconds != null' "$log" >/dev/null \
+      && pass "$mode/$storage preserves loop accounting with null identity" || fail "$mode/$storage missing/corrupt loop accounting"
+    [ ! -e "$P4B_ACCT_STATE_DIR/phase-4b-pending/fixture-repo-pr1589.json" ] \
+      && [ ! -e "$P4B_ACCT_STATE_DIR/phase-4b-pending/fixture-repo-pr1589.json.runid" ] \
+      && pass "$mode/$storage clears this invocation's pending staging" || fail "$mode/$storage stranded pending staging"
+    if [ "$mode" = approve ]; then
+      [[ "$(cat "$HB_CASE/staged-runid")" =~ ^local-[0-9]+-[0-9]+-[0-9]+$ ]] \
+        && pass "$storage preserves the prior staging tuple without genuine identity" || fail "$storage weakened staging ownership"
+      jq -e '.loops[0].run_id == null and .totals.adapter_invocations == 1 and .totals.tokens_total == 123' \
+        "$P4B_ACCT_STATE_DIR/phase-4b-ledger.jsonl" >/dev/null \
+        && [ ! -s "$P4B_ACCT_STATE_DIR/phase-4b-loops/fixture-repo-pr1589.jsonl" ] \
+        && pass "$storage fallback staging commits approval and rotates its loop" || fail "$storage fallback staging ownership failed"
+      jq -cS '.totals | del(.elapsed_seconds_total)' "$WORK/approve-good/accounting/phase-4b-ledger.jsonl" > "$HB_CASE/expected-totals"
+      jq -cS '.totals | del(.elapsed_seconds_total)' "$P4B_ACCT_STATE_DIR/phase-4b-ledger.jsonl" > "$HB_CASE/actual-totals"
+      cmp -s "$HB_CASE/expected-totals" "$HB_CASE/actual-totals" \
+        && pass "$storage preserves approval totals" || fail "$storage changed approval totals"
+    else
+      jq -e '.loop.fail_closed.happened == true' "$log" >/dev/null \
+        && ! grep -qx post "$HB_CASE/events" \
+        && pass "$storage refusal corrects provisional accounting without posting" || fail "$storage refusal accounting/post"
+    fi
+    return 0 ;;
+  esac
   record=$(printf '%s\n' "$P4B_HEARTBEAT_DIR"/p4b-*.json)
   if jq -e --arg stages "$stages" --argjson rc "$expected" --arg h "$HB_HEAD" '
     .schema == "p4b-heartbeat/v1" and .stage == "done" and .exit_code == $rc
     and ([.stages[].stage]|join(",")) == $stages and .head == $h
-    and .run_id != null and .repo == "fixture/repo" and .pr == "1589"
+    and (.run_id|test("^p4b-[0-9a-f]{32}$")) and .repo == "fixture/repo" and .pr == "1589"
     and .adapter_timeout_seconds == (if $rc == 4 then 1 else 3 end)
     and (.stages|all(.stage_at_epoch != null and (.stage_at|length)>0))
     and .process_started_at != null and (.checkout|length)>0' "$record" >/dev/null 2>&1; then
     pass "$mode records reached stages and terminal identity"
   else fail "$mode heartbeat: $(cat "$record" 2>/dev/null)"; fi
+  id="$(jq -r .run_id "$record")"
+  [ "$(sort -u "$HB_CASE/observed-ids")" = "$id" ] \
+    && pass "$mode keeps one identity across live and terminal stages" || fail "$mode changed stage identity"
   case "$mode" in
     approve|changes|final-accounting-request)
       jq -e '.summary_emitted and .review_posted and .token_count == 123 and .adapter_elapsed_seconds != null and .adapter_started_at_epoch != null' "$record" >/dev/null \
         && pass "$mode final summary and measured adapter timing" || fail "$mode final summary/timing"
       grep -qx posting "$HB_CASE/observed" && grep -qx adapter "$HB_CASE/observed" \
         && pass "$mode published live adapter/posting stages" || fail "$mode live stage publication"
+      log="$P4B_ACCT_STATE_DIR/phase-4b-loops/fixture-repo-pr1589.jsonl"
+      [ "$mode" = changes ] || log="$log.archive"
+      jq -e --arg id "$id" '.loop.run_id == $id' "$log" >/dev/null \
+        && pass "$mode shares the generated identity with its loop" || fail "$mode loop identity mismatch"
+      if [ "$mode" != changes ]; then
+        jq -e --arg id "$id" '.loops[0].run_id == $id' "$P4B_ACCT_STATE_DIR/phase-4b-ledger.jsonl" >/dev/null \
+          && pass "$mode shares the generated identity with its approval" || fail "$mode approval identity mismatch"
+      fi
       ;;
     hold|feedback|ceiling-stop|auth-unreadable)
       jq -e '.adapter_started_at_epoch == null and .adapter_elapsed_seconds == null and .adapter_exit_code == null and .adapter_verdict == null and .verdict == null and .review_posted == false and .review_acknowledgment == null' "$record" >/dev/null \
@@ -216,6 +287,40 @@ if [ "$(sed -n '/^post$/{x;p;};h' "$HB_CASE/events")" = feedback:3 ] \
    && jq -er '.body' "$HB_CASE/posted.json" | grep -qxF '<!-- mergepath-p4b-request-generation: [1] -->'; then
   pass 'late request remains outside original approval generation; feedback is last pre-POST read'
 else fail 'request-generation race/read order changed'; fi
+
+# Entropy failures preserve both the successful POST/accounting transaction
+# and a writer-boundary refusal with provisional-loop correction. A valid
+# inherited ID must not turn failed generation into genuine persisted identity.
+for entropy in error malformed timeout; do
+  P4B_ACCT_RUN_ID=p4b-00000000000000000000000000000000 run_case approve 0 '' "entropy-$entropy"
+  P4B_ACCT_RUN_ID=p4b-00000000000000000000000000000000 run_case late-feedback 7 '' "entropy-$entropy"
+done
+P4B_ACCT_RUN_ID=p4b-00000000000000000000000000000000 run_case approve 0 barrier,adapter,posting,done inherited-id
+[ "$(jq -r .run_id "$P4B_HEARTBEAT_DIR"/p4b-*.json)" != p4b-00000000000000000000000000000000 ] \
+  && pass 'enabled invocation replaces inherited genuine identity' || fail 'inherited identity reused'
+
+# Disabled/non-local gates must not reach either Node's dependency probe or
+# entropy source. The shim would fail every Node call on these paths.
+for gate in disabled non-local; do
+  export HB_MODE=approve HB_CASE="$WORK/$gate" HB_ENTROPY=unavailable
+  mkdir -p "$HB_CASE"; : > "$HB_CASE/events"
+  export P4B_HEARTBEAT_DIR="$HB_CASE/heartbeats" P4B_ACCT_STATE_DIR="$HB_CASE/accounting"
+  if [ "$gate" = disabled ]; then sed 's/enabled: true/enabled: false/' "$WORK/policy" > "$HB_CASE/policy"
+  else sed 's/mode: local/mode: manual/' "$WORK/policy" > "$HB_CASE/policy"; fi
+  export MERGEPATH_REVIEW_POLICY_PATH="$HB_CASE/policy"
+  rc=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 30 bash "$ROOT/scripts/phase-4b-review.sh" 1589 --repo fixture/repo \
+      --head "$HB_HEAD" --diff-file "$WORK/diff" > "$HB_CASE/out" 2> "$HB_CASE/err" || rc=$?
+  else
+    perl -e 'alarm shift @ARGV; exec @ARGV' 30 bash "$ROOT/scripts/phase-4b-review.sh" 1589 --repo fixture/repo \
+      --head "$HB_HEAD" --diff-file "$WORK/diff" > "$HB_CASE/out" 2> "$HB_CASE/err" || rc=$?
+  fi
+  [ "$rc" = 5 ] && [ ! -e "$HB_CASE/node-calls" ] && [ ! -e "$P4B_HEARTBEAT_DIR" ] \
+    && [ ! -e "$P4B_ACCT_STATE_DIR" ] && [ ! -s "$HB_CASE/events" ] \
+    && pass "$gate stays dependency-free without entropy or review operations" || fail "$gate ran enabled dependencies"
+done
+export HB_ENTROPY=good
 
 # An inherited value is present before REVIEW_POSTED is initialized near the
 # POST. Early refusals still publish startup and terminal boolean evidence.

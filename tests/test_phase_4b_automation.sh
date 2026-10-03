@@ -20,7 +20,7 @@ ORCH="$ROOT/scripts/phase-4b-review.sh"
 AD_CODEX="$ROOT/scripts/phase-4b/adapters/review-via-codex.sh"
 AD_CLAUDE="$ROOT/scripts/phase-4b/adapters/review-via-claude.sh"
 
-# Focused lifecycle coverage (expected under 60s; adapter calls capped at 3s).
+# Focused lifecycle coverage (expected about 80s; adapter calls capped at 3s).
 # This mode never mutation-tests lib.sh or enters the long legacy suite.
 if [ "${1:-}" = --heartbeat-only ]; then
   exec bash "$ROOT/tests/test_phase_4b_heartbeat.sh"

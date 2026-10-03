@@ -165,13 +165,11 @@ P4B_PRE_POST_ACCT_CLEANED=false
 # which is the defect this whole variable exists to prevent).
 P4B_ACCT_LAST_CORRECTION_OK=true
 
-# Per-invocation ledger-staging token (#615 Codex round 6). Exported so the
-# render subshell (which stages the pending record on disk) and this process's
-# later commit call agree on ownership: the two-phase commit only appends a
-# pending record whose sidecar run id matches this value, so a stale record
-# left by a prior crashed run is discarded instead of committed on the
-# fail-open path. Generated once here; NEVER regenerated per hook call.
-P4B_ACCT_RUN_ID="p4b-$$-$(date +%s 2>/dev/null || echo 0)-${RANDOM:-0}"
+# Identity belongs to this invocation, never its parent. Preserve the existing
+# staging tuple under a non-p4b prefix so entropy failure cannot weaken pending
+# ownership or advertise it as genuine history identity. Generate the genuine
+# identity only after the enabled-path runtime checks below.
+P4B_ACCT_RUN_ID="local-$$-$(date +%s 2>/dev/null || echo 0)-${RANDOM:-0}"
 export P4B_ACCT_RUN_ID
 
 # p4b_acct_mark_unposted <why>
@@ -334,6 +332,19 @@ command -v jq >/dev/null 2>&1 || p4b_die 3 "jq is required"
 # proves nothing — `command -v` would still find the shim.
 node --version >/dev/null 2>&1 \
   || p4b_die 3 "node is required and must be runnable (the shared PR-body contract parser runs under it)"
+
+# Draw once for heartbeat/history identity and pending-record ownership.
+# A host-independent 128-bit value survives cross-checkout/root aggregation;
+# PID/time/RANDOM cannot provide that identity. Entropy is advisory: a failed,
+# malformed or stalled draw leaves accounting's local staging fallback intact
+# without persisting a weak identity or producing a heartbeat. The guarded
+# subshell also contains the timeout helper's dependency/error exits.
+if _p4b_run_entropy="$(p4b_run_with_timeout 2 node -e 'process.stdout.write(require("node:crypto").randomBytes(16).toString("hex"))' 2>/dev/null)" \
+   && [[ "$_p4b_run_entropy" =~ ^[0-9a-f]{32}$ ]]; then
+  P4B_ACCT_RUN_ID="p4b-$_p4b_run_entropy"
+  export P4B_ACCT_RUN_ID
+fi
+unset _p4b_run_entropy
 
 # Hard-required (#799). Every documented fallback in this script keyed off an
 # empty head sha, and an unreadable read never produced one — see the call
