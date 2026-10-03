@@ -99,6 +99,13 @@ def load_reviewers(root, run=subprocess.run):
         raise ValueError("invalid_reviewer_configuration") from None
 
 
+def shared_ci_snapshot(app, repo, _fetch_now):
+    # Another source can publish while Actions is fetching. Read the copied
+    # receipt before the validation clock, so a new observation is not future.
+    envelope = app.panel_snapshot("ci")["envelope"]
+    return ci_observation(envelope, repo, app.clock())
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Local Mergepath Cockpit")
     parser.add_argument("--agent", choices=("codex", "claude", "cursor"), default="codex",
@@ -144,7 +151,7 @@ def main(argv=None):
         app.sync = SyncProvider(inventory, ROOT, fleet.fetch, cache_dir=cache_dir, agent=args.agent,
                                 changed=app.publish, completed=completed)
         actions_provider = ActionsProvider(github, inventory, settings=actions_settings,
-                                           ci_snapshot=lambda repo, now: ci_observation(app.panel_snapshot("ci")["envelope"], repo, now))
+                                           ci_snapshot=lambda repo, now: shared_ci_snapshot(app, repo, now))
         app.scheduler.register("actions", actions_provider.fetch, hot_interval=15, idle_interval=120, timeout=30)
         app.register_panel("budget", "actions")
         agents_provider = AgentsProvider(inventory, checkouts, ROOT, price_keys=price_keys, github=github, reviewers=reviewers)
