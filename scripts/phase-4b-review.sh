@@ -555,8 +555,14 @@ refuse_approval_if_feedback_unaccounted() {
 capture_authorized_request_generation() {
   local payload
   # With Codex disabled, Codex requests carry no authority and the substitute
-  # merge gate ignores them, so there is nothing to capture or record.
-  if [ "$(p4b_policy_block_field codex enabled)" = "false" ]; then
+  # merge gate ignores them, so there is nothing to capture or record. Skip
+  # only when the PR's GOVERNING base policy, the one the gate applies, also
+  # disables Codex: a local checkout that disables it is not enough, and an
+  # unresolvable governing policy counts as enabled (fail closed). The
+  # governing policy is consulted only on that path, so the common path makes
+  # no extra reads.
+  if [ "$(p4b_policy_block_field codex enabled)" = "false" ] \
+     && [ "$(p4b_governing_codex_enabled "$REPO" "$PR" 2>/dev/null)" = "false" ]; then
     P4B_CODEX_REQUESTS_GOVERN=false
     return 0
   fi

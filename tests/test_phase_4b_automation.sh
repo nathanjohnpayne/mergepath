@@ -2693,14 +2693,25 @@ if [ "$rc" = 0 ] && [ "$_p1598_records" = '<!-- mergepath-p4b-request-generation
 else
   fail "#1598: adapter marker copy (rc=$rc records=$_p1598_records): $out"
 fi
-# With codex.enabled: false, Codex requests carry no authority: the run
-# neither reads nor records a request generation, so a failing comments read
-# cannot block the substitute path (Codex on #1599, round 3).
+# With codex.enabled: false in the PR's GOVERNING base policy (the one the
+# merge gate applies), Codex requests carry no authority: the run neither
+# reads nor records a request generation, so a failing comments read cannot
+# block the substitute path (Codex on #1599, round 3). The switch is read from
+# the governing policy, not the local checkout's (CodeRabbit on #1599).
 P1598_CODEX_OFF="$WORK/policy-on-codex-off.yml"
 { cat "$POLICY_ON"; printf 'codex:\n  enabled: false\n'; } >"$P1598_CODEX_OFF"
+P1598_RESOLVER="$WORK/p1598-resolve-policy"
+cat >"$P1598_RESOLVER" <<'EOF'
+#!/bin/sh
+tmp=$(mktemp "${TMPDIR:-/tmp}/p1598-policy.XXXXXX") || exit 2
+cp "${P1598_GOVERNING_POLICY:?}" "$tmp" || exit 2
+printf '%s\n' "$tmp"
+EOF
+chmod +x "$P1598_RESOLVER"
 : >"$P1598_LOG"; rm -f "$P1598_BODY"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$P1598_CODEX_OFF" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  P4B_RESOLVE_BASE_POLICY="$P1598_RESOLVER" P1598_GOVERNING_POLICY="$P1598_CODEX_OFF" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
   P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
@@ -2712,6 +2723,24 @@ if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = true ] 
   pass "#1598: with Codex disabled the approval neither reads nor records a request generation"
 else
   fail "#1598: Codex-disabled approval (rc=$rc record=$(grep -c 'mergepath-p4b-request-generation' "$P1598_BODY" 2>/dev/null)): $out"
+fi
+# The local checkout says Codex is disabled, but the governing base policy
+# enables it: the gate will treat Codex requests as binding, so the run must
+# still capture and record the request generation.
+: >"$P1598_LOG"; rm -f "$P1598_BODY"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$P1598_CODEX_OFF" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  P4B_RESOLVE_BASE_POLICY="$P1598_RESOLVER" P1598_GOVERNING_POLICY="$POLICY_ON" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_FAKE_ISSUE_COMMENTS='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' \
+  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && grep -qxF '<!-- mergepath-p4b-request-generation: [7201] -->' "$P1598_BODY"; then
+  pass "#1598: a governing policy that enables Codex is followed even when the local checkout disables it"
+else
+  fail "#1598: governing-enabled, local-disabled (rc=$rc record=$(grep -o 'mergepath-p4b-request-generation: [^ ]*' "$P1598_BODY" 2>/dev/null)): $out"
 fi
 # A request that arrives AFTER authorization but before the writer boundary
 # (here: while the adapter runs) was never reviewed. The writer's re-read sees

@@ -652,6 +652,28 @@ p4b_codex_request_budget_state() {
   fi
 }
 
+# p4b_governing_codex_enabled <repo> <pr>
+# Prints true or false for codex.enabled in the PR's GOVERNING base policy,
+# the policy the substitute merge gate applies, rather than the local
+# checkout's (#1598). Returns 2 when the policy cannot be resolved.
+p4b_governing_codex_enabled() {
+  local repo="$1" pr="$2" config resolver base_cfg base_json rc=0
+  command -v policy_yaml_to_json >/dev/null 2>&1 || return 2
+  config="$(p4b_config)"
+  resolver="${P4B_RESOLVE_BASE_POLICY:-$P4B_LIB_DIR/../workflow/resolve_base_policy.sh}"
+  [ -x "$resolver" ] || return 2
+  base_cfg=$("$resolver" --repo "$repo" --pr "$pr" --default-config "$config" --materialize-default 2>/dev/null) \
+    || return 2
+  [ -n "$base_cfg" ] && [ -r "$base_cfg" ] || return 2
+  base_json=$(policy_yaml_to_json "$base_cfg" 2>/dev/null) || rc=$?
+  [ "$base_cfg" = "$config" ] || rm -f "$base_cfg" 2>/dev/null || true
+  [ "$rc" -eq 0 ] && [ -n "$base_json" ] || return 2
+  printf '%s' "$base_json" | jq -er '
+    if type != "object" then error("policy")
+    elif ((.codex | type) == "object") and (.codex.enabled == false) then "false"
+    else "true" end' 2>/dev/null || return 2
+}
+
 # p4b_live_request_generation <repo> <pr>
 # The configured author's Codex request generation as it stands now: a sorted
 # array of request comment ids (#1598). An approval records the generation it
