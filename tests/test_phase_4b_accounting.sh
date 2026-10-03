@@ -30,6 +30,8 @@ done
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/p4b-acct-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
+# Machine-local advisory telemetry must stay inside this hermetic fixture.
+export P4B_HEARTBEAT_DIR="$WORK/heartbeat-state"
 
 export P4B_TEST_POSTED_REVIEW="$WORK/posted-review.json"
 cat > "$WORK/clear-feedback.sh" <<'SH'
@@ -48,6 +50,175 @@ SKIP=0
 pass() { echo "  PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 skip() { echo "  SKIP: $*" >&2; SKIP=$((SKIP + 1)); }
+
+# Optional loop identity is deliberately separate from totals and pending
+# ownership. This bounded pure/hook suite also exports the #1590 consumer
+# contract as one fixture bundle when passed --fixtures <absolute-json-path>.
+# No provider, historical migration, network, CLI or orchestration mutation.
+identity_contract() (
+  PASS=0; FAIL=0
+  # shellcheck source=../scripts/phase-4b/accounting.sh
+  . "$ACCT"
+  export P4B_ACCT_STATE_DIR="$WORK/identity-state"
+  REPO=fixture/repo; PR=1589; HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  REVIEWER=nathanpayne-codex; ADAPTER=codex; DIRECTION='claude->codex'
+  # These runtime globals are inputs to the sourced accounting hook.
+  # shellcheck disable=SC2034
+  ADAPTER_TIMEOUT=1245
+  # shellcheck disable=SC2034
+  EFFECTIVE_EFFORT=xhigh
+  # shellcheck disable=SC2034
+  P4B_ACCT_LOOP_STARTED_EPOCH=1700000020
+  # shellcheck disable=SC2034
+  P4B_ACCT_LOOP_ELAPSED_SECONDS=7
+  VERDICT_JSON='{"verdict":"APPROVED","summary":"fixture","findings":[],"usage":{"token_count":123,"input_tokens":null,"output_tokens":null,"cache_creation_input_tokens":null,"cache_read_input_tokens":null,"reasoning_tokens":null,"total_cost_usd":null,"source":"fixture"},"cli_version":null}'
+  P4B_ACCT_RUN_ID=p4b-1589-identity-fixture
+  p4b_acct_hook_record_loop APPROVED posted false ""
+  log="$(p4b_acct_hook_loop_log)"
+  new="$(cat "$log")"
+  jq -e --arg id "$P4B_ACCT_RUN_ID" '
+    .schema == "p4b-loop-log/v1" and .started_at_epoch == 1700000020
+    and .loop.started_at_epoch == .started_at_epoch and .loop.run_id == $id
+    and .loop.timeout_seconds == 1245 and .loop.elapsed_seconds == 7
+    and .loop.tokens.input == null and .loop.tokens.output == null
+    and .loop.tokens.cost_usd == null' "$log" >/dev/null \
+    && pass 'producer shares genuine run ID and unchanged adapter-only envelope time' || fail 'loop identity producer'
+  legacy="$(printf '%s' "$new" | jq -c 'del(.loop.run_id,.loop.started_at_epoch)')"
+  for object in "$new" "$legacy"; do
+    if printf '%s' "$object" | jq -e --slurpfile s "$ACCT_SCHEMA" '
+      .loop as $l | $s[0]."$defs".loop as $sch
+      | (($sch.required - ($l|keys)) == [])
+      and ((($l|keys) - ($sch.properties|keys)) == [])
+      and (($sch.required|index("run_id")) == null)
+      and (($sch.required|index("started_at_epoch")) == null)' >/dev/null; then
+      pass 'v1 required loop contract accepts both old and new records'
+    else fail 'optional extension changed required fields'; fi
+  done
+  new_loops="$(printf '%s' "$new" | jq -c '[.loop]')"
+  old_loops="$(printf '%s' "$legacy" | jq -c '[.loop]')"
+  new_totals="$(p4b_acct_compute_totals "$new_loops" fixture-prices null '[]' '[]')"
+  old_totals="$(p4b_acct_compute_totals "$old_loops" fixture-prices null '[]' '[]')"
+  [ "$new_totals" = "$old_totals" ] && pass 'old/new identity metadata leaves totals byte-identical' || fail 'identity altered totals'
+  printf '%s' "$new_totals" | jq -e '
+    .adapter_invocations == 1 and .tokens_total == 123 and .elapsed_seconds_total == 7
+    and .reported_cost_usd == null and .notional_usd == null and .billed_usd == 0' >/dev/null \
+    && pass 'missing reported/estimated costs remain null and billed spend remains zero' || fail 'cost/missing coverage semantics'
+  # Exercise the actual approval renderer with an injected empty prior ledger:
+  # the producer metadata must survive the body, extraction and staged record.
+  : > "$WORK/identity-prior.jsonl"
+  export P4B_ACCT_PRIOR_RECORDS_JSONL="$WORK/identity-prior.jsonl"
+  export MERGEPATH_REVIEW_POLICY_PATH="$WORK/identity-policy"
+  printf 'phase_4b_automation:\n  enabled: true\n  mode: local\n' > "$MERGEPATH_REVIEW_POLICY_PATH"
+  # Read by the sourced approval renderer.
+  # shellcheck disable=SC2034
+  DRY_RUN=false
+  block="$(p4b_acct_hook_render_approval_block)"
+  approval="$(printf '%s' "$block" | p4b_acct_extract_records)"
+  printf '%s' "$approval" | jq -e --arg id "$P4B_ACCT_RUN_ID" '
+    .schema == "p4b-accounting/v1" and .loops[0].run_id == $id
+    and .loops[0].started_at_epoch == 1700000020
+    and .totals.adapter_invocations == 1 and .totals.tokens_total == 123
+    and .generated_at != null' >/dev/null \
+    && pass 'approval loops carry identity without treating approval time as loop start' || fail 'approval identity threading'
+  printf '%s\n' "$approval" > "$WORK/identity-approval.json"
+  if command -v check-jsonschema >/dev/null 2>&1; then
+    check-jsonschema --schemafile "$ACCT_SCHEMA" "$WORK/identity-approval.json" >/dev/null 2>&1 \
+      && pass 'external schema validator accepts new producer approval' || fail 'new record JSON Schema validation'
+  elif command -v ajv >/dev/null 2>&1; then
+    ajv validate -s "$ACCT_SCHEMA" -d "$WORK/identity-approval.json" >/dev/null 2>&1 \
+      && pass 'external schema validator accepts new producer approval' || fail 'new record JSON Schema validation'
+  else
+    printf '  SKIP: no external JSON Schema validator; structural old/new checks ran\n'
+  fi
+  # Archive and provisional correction retain exactly the producer metadata;
+  # identity never changes the existing two-phase commit ownership mechanism.
+  p4b_acct_hook_mark_last_loop_unposted 'fixture refusal'
+  jq -e --arg id "$P4B_ACCT_RUN_ID" '.loop.run_id == $id
+    and .loop.started_at_epoch == 1700000020 and .loop.posted == "not-posted"' "$log" >/dev/null \
+    && pass 'provisional refusal correction preserves identity' || fail 'correction dropped identity'
+  cp "$log" "$WORK/pre-archive.jsonl"
+  p4b_acct_hook_rotate_loop_log_after_approval
+  cmp -s "$WORK/pre-archive.jsonl" "$log.archive" && [ ! -s "$log" ] \
+    && pass 'rotation retains bytes and clears only the live segment' || fail 'archive semantics changed'
+  unset P4B_ACCT_RUN_ID
+  p4b_acct_hook_record_loop UNAVAILABLE not-posted true 'direct hook'
+  [ "$(p4b_acct_run_id)" = "pid-$$" ] && jq -e '.loop.run_id == null' "$log" >/dev/null \
+    && pass 'direct-hook pid ownership fallback is not promoted into global history' || fail 'PID fallback promotion'
+  P4B_ACCT_RUN_ID=pid-999
+  p4b_acct_hook_record_loop UNAVAILABLE not-posted true 'explicit local ownership'
+  tail -1 "$log" | jq -e '.loop.run_id == null' >/dev/null \
+    && pass 'explicit pid-only staging token remains non-global' || fail 'explicit PID promotion'
+
+  # Reusable #1590 input contract: duplicate roots/archive/approval refer to
+  # ONE genuine invocation. Two legacy locator rows are deliberately separate.
+  # Lifecycle updates are compatible; the last source is an explicit terminal
+  # conflict to diagnose instead of silently choosing or summing values.
+  heartbeat="$(jq -nc --arg id p4b-1589-identity-fixture --arg head "$HEAD" '
+    {schema:"p4b-heartbeat/v1",run_id:$id,pid:999999,process_started_at:null,
+     repo:"fixture/repo",pr:"1589",head:$head,direction:"claude->codex",
+     reviewer:"nathanpayne-codex",checkout:"/fixture/trusted-main",dry_run:false,
+     started_at:"2023-11-14T22:13:20Z",started_at_epoch:1700000000,
+     stage:"done",stage_at:"2023-11-14T22:13:47Z",stage_at_epoch:1700000027,
+     stages:[{stage:"barrier",stage_at:"2023-11-14T22:13:20Z",stage_at_epoch:1700000000},
+             {stage:"adapter",stage_at:"2023-11-14T22:13:40Z",stage_at_epoch:1700000020},
+             {stage:"posting",stage_at:"2023-11-14T22:13:47Z",stage_at_epoch:1700000027},
+             {stage:"done",stage_at:"2023-11-14T22:13:47Z",stage_at_epoch:1700000027}],
+     adapter_timeout_seconds:1245,adapter_started_at_epoch:1700000020,adapter_elapsed_seconds:7,
+     adapter_exit_code:0,adapter_verdict:"APPROVED",exit_code:0,summary_emitted:true,
+     verdict:"APPROVED",token_count:123,findings_count:0,review_posted:true,review_acknowledgment:"not-needed"}')"
+  posting="$(printf '%s' "$heartbeat" | jq -c '.stage="posting"|.stages=.stages[0:3]
+    |.summary_emitted=false|.verdict=null|.token_count=null|.findings_count=null
+    |.exit_code=null|.review_posted=false')"
+  conflict="$(printf '%s' "$heartbeat" | jq -c '.verdict="CHANGES_REQUESTED"
+    |.adapter_verdict="CHANGES_REQUESTED"|.exit_code=1|.token_count=999|.findings_count=1')"
+  bundle="$WORK/identity-contract.json"
+  jq -n --argjson new "$new" --argjson legacy "$legacy" --argjson approval "$approval" \
+    --argjson posting "$posting" --argjson 'done' "$heartbeat" --argjson conflict "$conflict" '
+    {schema:"p4b-history-fixtures/v1",repo:"fixture/repo",
+     sources:[
+      {kind:"loop-log",root:"trusted-main",locator:".mergepath/phase-4b-loops/fixture-repo-pr1589.jsonl",records:[$legacy,$new]},
+      {kind:"loop-log",root:"worktree-b",locator:".mergepath/phase-4b-loops/fixture-repo-pr1589.jsonl",records:[$legacy,$new]},
+      {kind:"loop-log",root:"trusted-main",locator:".mergepath/phase-4b-loops/fixture-repo-pr1589.jsonl.archive",records:[$new]},
+      {kind:"approval",root:"github",locator:"review:42",records:[$approval]},
+      {kind:"heartbeat",root:"machine",locator:"p4b-1589-identity-fixture.json",records:[$posting,$done]},
+      {kind:"heartbeat",root:"terminal-conflict",locator:"p4b-1589-identity-fixture.json",records:[$conflict]}],
+     expected:{genuine_identity_count:1,legacy_locator_count:2,
+       compatible_adapter_invocations:1,compatible_tokens_total:123,
+       terminal_conflict_source:"terminal-conflict",conflict_fields:["verdict","exit_code","token_count","findings_count"],
+       approval_totals_are_cross_checks:true,approval_generated_at_is_not_loop_start:true}}' > "$bundle"
+  # Assert fixture meaning only; #1590 owns flattening/merging. This fixture
+  # deliberately does not introduce another historical aggregation algorithm.
+  jq -e '
+    [.sources[]|select(.kind=="loop-log")|.records[]|.loop.run_id|select(.!=null)]|unique|length==1' "$bundle" >/dev/null \
+    && pass 'mixed old/new duplicate-root/archive fixture has one genuine run identity' || fail 'duplicate fixture identity'
+  jq -e '[.sources[]|select(.kind=="loop-log")|.records[]|select(.loop.run_id==null)]|length==2' "$bundle" >/dev/null \
+    && pass 'legacy duplicate-looking records retain two separate source locators' || fail 'legacy fixture coverage'
+  jq -e '.sources[4].records[0].stage=="posting" and .sources[4].records[1].stage=="done"
+    and .sources[4].records[0].run_id==.sources[4].records[1].run_id
+    and .sources[5].records[0].run_id==.sources[4].records[1].run_id
+    and .sources[5].records[0].token_count!=.sources[4].records[1].token_count
+    and .sources[3].records[0].totals.adapter_invocations==1' "$bundle" >/dev/null \
+    && pass 'lifecycle/conflict and approval-cross-check fixtures preserve distinct evidence' || fail 'lifecycle fixtures'
+  # Existing latency reader projects this fixed field set; optional metadata
+  # must produce exactly the same body-free event for old and new loops.
+  projection='select(.schema=="p4b-loop-log/v1")|.loop|{kind:"p4b_round",reviewer,adapter,direction,loop,verdict,fell_back,elapsed_seconds,timeout_seconds,effort}'
+  [ "$(printf '%s' "$new"|jq -c "$projection")" = "$(printf '%s' "$legacy"|jq -c "$projection")" ] \
+    && pass 'existing latency event projection ignores optional metadata' || fail 'latency compatibility'
+  if [ -n "${IDENTITY_FIXTURE_OUTPUT:-}" ]; then
+    cp "$bundle" "$IDENTITY_FIXTURE_OUTPUT"
+    printf '  Fixtures: %s\n' "$IDENTITY_FIXTURE_OUTPUT"
+  fi
+  printf 'Identity contract: %s passed, %s failed\n' "$PASS" "$FAIL"
+  [ "$FAIL" = 0 ]
+)
+
+if [ "${1:-}" = --identity-only ]; then
+  if [ "${2:-}" = --fixtures ] && [ -n "${3:-}" ]; then
+    case "$3" in /*) IDENTITY_FIXTURE_OUTPUT="$3" ;; *) echo 'fixture output must be an absolute path' >&2; exit 2 ;; esac
+  fi
+  identity_contract
+  exit "$?"
+fi
 
 # make_file_unappendable / restore_file — a ROOT-ROBUST unwritable seam
 # (#615 Codex round 6). `chmod 0444` does NOT stop root from appending (the CI
@@ -2793,5 +2964,7 @@ if [ "$rc" = 0 ] && [ -n "$REC_M" ] \
 else fail "reported-cost e2e (rc=$rc, rec=$REC_M)"; fi
 
 echo
+identity_contract && pass 'optional identity/history contract suite' || fail 'optional identity/history contract suite'
+
 echo "Summary: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]
