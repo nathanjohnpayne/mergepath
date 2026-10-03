@@ -7,6 +7,11 @@ PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
 import subprocess
 import sys
 for command in ([sys.executable, '-B', 'tests/test_cockpit.py'], ['node', '--test', 'tests/test_cockpit_ui.cjs'],
+                [sys.executable, '-B', 'tests/test_cockpit_ci.py'],
+                ['node', '--test', 'tests/test_cockpit_ci_ui.cjs'],
+                [sys.executable, '-B', 'tests/test_cockpit_logs.py'],
+                [sys.executable, '-B', 'tests/test_cockpit_prs.py'],
+                ['node', '--test', 'tests/test_cockpit_prs_ui.cjs'],
                 [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_cockpit_actions.py'],
                 ['node', '--test', 'tests/test_cockpit_actions_ui.cjs']):
     result = subprocess.run(command, timeout=60)

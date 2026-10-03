@@ -22,13 +22,13 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Central docs repo**: The `nathanjohnpayne/docs` vault holding canonical PRDs, a separate source graph from the hub. _Avoid_: conflating with the hub.
 
-**Surface**: A named Mergepath product UI under the umbrella brand: Playground (current), Cockpit (local shared shell and Actions budgets; remaining panels in development), Tiebreaker and Checks (reserved).
+**Surface**: A named Mergepath product UI under the umbrella brand: Playground (current), Cockpit (local shared shell, PR, CI and Actions-budget observations; remaining panels in development), Tiebreaker and Checks (reserved).
 
 **Reserved name**: A brand name claimed in `BRAND.md` ahead of the surface existing, so a future agent does not pick it for the wrong thing; no files are scaffolded until the surface is designed.
 
 **Playground**: A static review-policy prototyping UI: tune the policy knobs, replay recent PRs against the draft, copy the resulting YAML. _Avoid_: "Rubric" (retired name), "dashboard", "policy editor" (an explicit non-goal, earmarked for Cockpit).
 
-**Cockpit**: The local operator console for in-progress reviews, with an authenticated stdlib server and shared shell under `mergepath/cockpit/`. Connection health, observed API-resource meters, repository filtering, Road components and Actions-budget observations are available. Actions shows reported net spend, explicitly measured token estimates, independent robot-pool evidence when configured, and queue pressure. Other panels show unavailable until connected. This foundation does not change review policy or execute syncs. _Avoid_: calling unavailable panels operational.
+**Cockpit**: The local operator console for in-progress reviews, with an authenticated stdlib server and shared shell under `mergepath/cockpit/`. Connection health, observed API-resource meters, repository filtering, Road components, PR/review-budget evidence, CI run/step observations and Actions budgets are available. Failure excerpts are bounded on-demand reads, and displayed rerun commands are instructions for the operator. Other panels show unavailable until connected. Cockpit display defaults do not change review policy or trigger reviews; sync actions are not connected. _Avoid_: calling unavailable panels operational.
 
 **Replay**: Running a set of real merged PRs through a draft policy to see routing before committing the YAML. _Avoid_: "backtest".
 
