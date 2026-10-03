@@ -22,13 +22,13 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Central docs repo**: The `nathanjohnpayne/docs` vault holding canonical PRDs, a separate source graph from the hub. _Avoid_: conflating with the hub.
 
-**Surface**: A named Mergepath product UI under the umbrella brand: Playground (current), Cockpit (local shared shell; panel sources in development), Tiebreaker and Checks (reserved).
+**Surface**: A named Mergepath product UI under the umbrella brand: Playground (current), Cockpit (local review observations; remaining panels in development), Tiebreaker and Checks (reserved).
 
 **Reserved name**: A brand name claimed in `BRAND.md` ahead of the surface existing, so a future agent does not pick it for the wrong thing; no files are scaffolded until the surface is designed.
 
 **Playground**: A static review-policy prototyping UI: tune the policy knobs, replay recent PRs against the draft, copy the resulting YAML. _Avoid_: "Rubric" (retired name), "dashboard", "policy editor" (an explicit non-goal, earmarked for Cockpit).
 
-**Cockpit**: The local operator console for in-progress reviews, with an authenticated stdlib server and shared shell under `mergepath/cockpit/`. Connection health, observed API-resource meters, repository filtering and Road components are available; six panel sources remain in development and honestly show unavailable. This foundation does not change review policy or execute syncs. _Avoid_: calling unavailable panels operational.
+**Cockpit**: The local operator console for in-progress reviews, with an authenticated stdlib server and shared shell under `mergepath/cockpit/`. Connection health, observed API-resource meters, repository filtering and Road components are available; PR rows and review-budget evidence are connected, with unknown or stale data explicitly marked. Remaining panel sources show unavailable until connected. Cockpit display defaults do not change review policy or trigger reviews; sync actions are not connected. _Avoid_: calling unavailable panels operational.
 
 **Replay**: Running a set of real merged PRs through a draft policy to see routing before committing the YAML. _Avoid_: "backtest".
 

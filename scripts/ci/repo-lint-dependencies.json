@@ -28,7 +28,10 @@
       "tests/test_cockpit.sh",
       "tests/test_cockpit.py",
       "tests/test_cockpit_ui.cjs",
-      "specs/cockpit_foundation.md"
+      "specs/cockpit_foundation.md",
+      "tests/test_cockpit_prs.py",
+      "tests/test_cockpit_prs_ui.cjs",
+      "specs/cockpit_prs.md"
     ],
     "check_no_token_in_output": [
       "scripts/ci/token_output_gate.py"

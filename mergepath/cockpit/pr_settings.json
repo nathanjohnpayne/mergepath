@@ -1,0 +1,6 @@
+{
+  "schema": "cockpit-pr-settings/v1",
+  "advisory": true,
+  "rounds_before_phase_4b": 10,
+  "phase_4b_reruns": 1
+}
