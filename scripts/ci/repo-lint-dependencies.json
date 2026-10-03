@@ -20,6 +20,16 @@
     "docs/architecture/*"
   ],
   "wrappers": {
+    "check_cockpit": [
+      "scripts/cockpit.sh",
+      "scripts/op-preflight.sh",
+      "scripts/lib/ci-check-modes.sh",
+      "mergepath/cockpit/*",
+      "tests/test_cockpit.sh",
+      "tests/test_cockpit.py",
+      "tests/test_cockpit_ui.cjs",
+      "specs/cockpit_foundation.md"
+    ],
     "check_no_token_in_output": [
       "scripts/ci/token_output_gate.py"
     ],

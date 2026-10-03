@@ -183,6 +183,14 @@ is_covered() {
 # Keep entries SPECIFIC. A pattern broad enough to swallow a real
 # consumer-wired dependency would re-open the #519/#521 gap.
 ALLOW_LIST=(
+  # Cockpit runtime and fixture suite are local hub-only tooling (#1586).
+  # check_cockpit ships in the CI kit and marker-first SKIPs on consumers.
+  "scripts/cockpit.sh"
+  "mergepath/cockpit/*"
+  "specs/cockpit_foundation.md"
+  "tests/test_cockpit.sh"
+  "tests/test_cockpit.py"
+  "tests/test_cockpit_ui.cjs"
   # The propagation engine itself + its project-doc-mirror sibling.
   # scripts/sync-to-downstream.sh is the orchestrator — explicitly NEVER
   # propagated (see the manifest's "NOT propagated" note). Referenced

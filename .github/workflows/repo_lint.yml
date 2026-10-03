@@ -664,6 +664,9 @@ jobs:
       - name: check_agent_review_triage_defers
         run: ./scripts/ci/check_agent_review_triage_defers || { rc=$?; if [ ! -f scripts/ci/check_agent_review_triage_defers ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_agent_review_triage_defers not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
+      - name: check_cockpit
+        run: ./scripts/ci/check_cockpit --check || { rc=$?; if [ ! -f scripts/ci/check_cockpit ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_cockpit not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
       - name: check_sync_manifest
         # Requires mikefarah/yq — installed by install_yq_for_sync_manifest,
         # which now runs earlier (before check_resolve_pr_threads, the
@@ -902,6 +905,10 @@ jobs:
       - name: check_gh_projects_move_item --self-test
         if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_gh_projects_move_item'))
         run: ./scripts/ci/check_gh_projects_move_item --self-test || { rc=$?; if [ ! -f scripts/ci/check_gh_projects_move_item ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_gh_projects_move_item not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_cockpit --self-test
+        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_cockpit'))
+        run: ./scripts/ci/check_cockpit --self-test || { rc=$?; if [ ! -f scripts/ci/check_cockpit ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_cockpit not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_phase_4b_automation --self-test
         if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_phase_4b_automation'))

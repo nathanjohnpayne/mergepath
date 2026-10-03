@@ -1,0 +1,786 @@
+"""Hermetic foundation coverage; remote sockets and real credentials are forbidden."""
+
+import contextlib
+import http.client
+import hashlib
+import importlib
+import io
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from mergepath.cockpit.github import ClientError, GitHubClient, MAX_BODY, ORIGIN, Response, http_transport
+from mergepath.cockpit.inventory import HUB, Repository, load_inventory
+from mergepath.cockpit.scheduler import Sample, Scheduler
+from mergepath.cockpit.server import Application, COOKIE, CSP, CockpitServer
+
+
+TOKEN = "fixture-reviewer-credential"
+
+
+class Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+class HTTPFixture:
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def __call__(self, method, url, headers, body, timeout):
+        self.calls.append((method, url, headers.copy(), body, timeout))
+        if not self.responses:
+            raise AssertionError("fixture exhausted; no remote fallback permitted")
+        reply = self.responses.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+def reply(status=200, data=None, **headers):
+    return Response(status, headers, json.dumps(data).encode() if data is not None else b"")
+
+
+def wait_until(predicate, timeout=1):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.002)
+    raise AssertionError("bounded fixture wait expired")
+
+
+class ClientTests(unittest.TestCase):
+    def client(self, fixture, clock=None, **kwargs):
+        clock = clock or Clock()
+        return GitHubClient(TOKEN, transport=fixture, clock=clock, monotonic=clock, **kwargs)
+
+    def test_etag_reuse_and_real_304_budget(self):
+        fixture = HTTPFixture(
+            reply(data=[{"id": 1}], ETag='"first"', **{
+                "X-RateLimit-Limit": "5000", "X-RateLimit-Remaining": "4997", "X-RateLimit-Used": "3",
+                "X-RateLimit-Reset": "2000", "X-RateLimit-Resource": "core"}),
+            reply(304, **{"x-ratelimit-limit": "5000", "x-ratelimit-remaining": "4996",
+                         "x-ratelimit-used": "4", "x-ratelimit-reset": "2000"}),
+        )
+        client = self.client(fixture)
+        self.assertEqual(client.get("/repos/a/b/pulls"), [{"id": 1}])
+        self.assertEqual(client.get("/repos/a/b/pulls"), [{"id": 1}])
+        self.assertEqual(fixture.calls[1][2]["If-None-Match"], '"first"')
+        self.assertEqual(client.budget()["core"]["remaining"], 4996)
+        self.assertEqual(client.budget()["core"]["status"], 304)
+        self.assertEqual(fixture.calls[0][2]["Authorization"], "Bearer " + TOKEN)
+
+    def test_pagination_reuses_each_cached_link_and_page(self):
+        next_link = '<https://api.github.com/repos/a/b/pulls?page=2>; rel="next"'
+        fixture = HTTPFixture(reply(data=[1], ETag="one", Link=next_link), reply(data=[2], ETag="two"),
+                              reply(304), reply(304))
+        client = self.client(fixture)
+        self.assertEqual(client.pages("/repos/a/b/pulls"), [1, 2])
+        self.assertEqual(client.pages("/repos/a/b/pulls"), [1, 2])
+        self.assertEqual([call[2].get("If-None-Match") for call in fixture.calls], [None, None, "one", "two"])
+
+    def test_pagination_refuses_escape_cycle_and_truncation(self):
+        for url, category in [("https://evil.example/repos/a/b/pulls?page=2", "invalid_next_link"),
+                              ("https://api.github.com/repos/a/b/issues?page=2", "invalid_next_link"),
+                              ("https://api.github.com/repos/a/b/pulls", "pagination_cycle")]:
+            with self.subTest(url=url):
+                client = self.client(HTTPFixture(reply(data=[], Link=f'<{url}>; rel="next"')))
+                with self.assertRaisesRegex(ClientError, category):
+                    client.pages("/repos/a/b/pulls")
+        client = self.client(HTTPFixture(reply(data=[], Link='<https://api.github.com/repos/a/b/pulls?page=2>; rel="next"')))
+        with self.assertRaisesRegex(ClientError, "page_limit"):
+            client.pages("/repos/a/b/pulls", max_pages=1)
+
+    def test_object_collection_pagination(self):
+        client = self.client(HTTPFixture(reply(data={"workflow_runs": [{"id": 7}], "total_count": 1})))
+        self.assertEqual(client.pages("/repos/a/b/actions/runs", collection="workflow_runs"), [{"id": 7}])
+
+    def test_malformed_next_link_does_not_silently_truncate(self):
+        for link in ['garbage; rel="next"', '<https://api.github.com/repos/a/b/pulls?page=2>; rel="next"; rel="last"',
+                     '<https://api.github.com/repos/a/b/pulls?page=2>; rel="next", garbage']:
+            with self.subTest(link=link), self.assertRaisesRegex(ClientError, "invalid_next_link"):
+                self.client(HTTPFixture(reply(data=[], Link=link))).pages("/repos/a/b/pulls")
+
+    def test_uncached_304_and_bad_json_are_unavailable(self):
+        for response, category in [(reply(304), "uncached_not_modified"),
+                                   (Response(200, {}, b"not json"), "invalid_upstream_json")]:
+            with self.subTest(category=category), self.assertRaisesRegex(ClientError, category):
+                self.client(HTTPFixture(response)).get("/repos/a/b/pulls")
+
+    def test_bounded_cache_evicts_old_page(self):
+        fixture = HTTPFixture(reply(data=1, ETag="a"), reply(data=2, ETag="b"), reply(data=3))
+        client = self.client(fixture, cache_pages=1)
+        client.get("/repos/a/b/pulls/1")
+        client.get("/repos/a/b/pulls/2")
+        client.get("/repos/a/b/pulls/1")
+        self.assertNotIn("If-None-Match", fixture.calls[-1][2])
+
+    def test_budget_denial_unknown_and_primary_reserve(self):
+        fixture = HTTPFixture(reply(403, {"message": TOKEN}, **{
+            "X-RateLimit-Limit": "5000", "X-RateLimit-Remaining": "4100", "X-RateLimit-Reset": "2000"}),
+            reply(data=[], **{"X-RateLimit-Limit": "n/a", "X-RateLimit-Remaining": "-1"}),
+            reply(data=[], **{"X-RateLimit-Limit": "5000", "X-RateLimit-Remaining": "90", "X-RateLimit-Reset": "2000"}))
+        client = self.client(fixture)
+        with self.assertRaisesRegex(ClientError, "permission_denied") as error:
+            client.get("/repos/a/b/pulls")
+        self.assertNotIn(TOKEN, str(error.exception))
+        self.assertFalse(client.budget()["core"]["primary_exhausted"])
+        self.assertFalse(client.budget()["core"]["secondary_limited"])
+        client.get("/repos/a/b/pulls")
+        self.assertIsNone(client.budget()["core"]["remaining"])
+        client.get("/repos/a/b/pulls")
+        with self.assertRaisesRegex(ClientError, "primary_reserve"):
+            client.get("/repos/a/b/pulls")
+        self.assertEqual(len(fixture.calls), 3)
+
+    def test_primary_and_secondary_limits_are_distinct(self):
+        for status, data, headers, category, flag in [
+            (403, {}, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "2000"}, "primary_exhausted", "primary_exhausted"),
+            (403, {"message": "secondary rate limit"}, {"X-RateLimit-Remaining": "4900"}, "secondary_limit", "secondary_limited"),
+            (429, {}, {"Retry-After": "120"}, "secondary_limit", "secondary_limited"),
+        ]:
+            with self.subTest(category=category):
+                client = self.client(HTTPFixture(reply(status, data, **headers)))
+                with self.assertRaisesRegex(ClientError, category):
+                    client.get("/repos/a/b/pulls")
+                self.assertTrue(client.budget()["core"][flag])
+        clock = Clock()
+        fixture = HTTPFixture(reply(429, {}, **{"Retry-After": "120"}), reply(data=[]))
+        client = self.client(fixture, clock)
+        with self.assertRaises(ClientError):
+            client.get("/repos/a/b/pulls")
+        with self.assertRaisesRegex(ClientError, "upstream_backoff"):
+            client.query("{ viewer { login } }")
+        self.assertEqual(len(fixture.calls), 1)
+        clock.now += 121
+        self.assertEqual(client.get("/repos/a/b/pulls"), [])
+
+    def test_graphql_http200_secondary_limit_keeps_headers_and_gates_all_reads(self):
+        clock = Clock()
+        fixture = HTTPFixture(reply(data={"errors": [{"message": "You have exceeded a secondary rate limit. " + TOKEN}]}, **{
+            "Retry-After": "120", "X-RateLimit-Resource": "graphql", "X-RateLimit-Limit": "5000",
+            "X-RateLimit-Remaining": "4900", "X-RateLimit-Reset": "2000"}), reply(data=[]))
+        client = self.client(fixture, clock)
+        with self.assertRaisesRegex(ClientError, "secondary_limit") as error:
+            client.query("{ viewer { login } }")
+        self.assertEqual(error.exception.retry_after, 120)
+        self.assertNotIn(TOKEN, str(error.exception))
+        budget = client.budget()["graphql"]
+        self.assertTrue(budget["secondary_limited"])
+        self.assertFalse(budget["primary_exhausted"])
+        self.assertEqual((budget["remaining"], budget["limit"], budget["status"]), (4900, 5000, 200))
+        with self.assertRaisesRegex(ClientError, "upstream_backoff"):
+            client.get("/repos/a/b/pulls")
+        self.assertEqual(len(fixture.calls), 1)
+        clock.now += 121
+        self.assertEqual(client.get("/repos/a/b/pulls"), [])
+
+    def test_graphql_success_text_and_generic_errors_are_not_secondary_limits(self):
+        for payload, expected in [
+            ({"errors": [{"message": "generic error " + TOKEN}]}, "incomplete_graphql"),
+            ({"data": {"message": "secondary rate limit"}}, None),
+        ]:
+            fixture = HTTPFixture(reply(data=payload, **{"Retry-After": "120", "X-RateLimit-Resource": "graphql"}), reply(data=[]))
+            client = self.client(fixture)
+            if expected:
+                with self.assertRaisesRegex(ClientError, expected): client.query("{ viewer { login } }")
+            else:
+                self.assertEqual(client.query("{ viewer { login } }"), payload["data"])
+            self.assertFalse(client.budget()["graphql"]["secondary_limited"])
+            self.assertEqual(client.get("/repos/a/b/pulls"), [])
+            self.assertEqual(len(fixture.calls), 2)
+        client = self.client(HTTPFixture(reply(data={"errors": [{"message": "secondary rate limit"}]})))
+        client.get("/repos/a/b/pulls")
+        self.assertFalse(client.budget()["core"]["secondary_limited"])
+
+    def test_query_batches_aliases_and_rejects_every_write(self):
+        fixture = HTTPFixture(reply(data={"data": {"first": 1, "second": 2}}, **{
+            "X-RateLimit-Resource": "graphql", "X-RateLimit-Remaining": "4900"}))
+        client = self.client(fixture)
+        self.assertEqual(client.query('query Batch { first: viewer { login } second: repository(owner:"mutation", name:"b") { id } }'),
+                         {"first": 1, "second": 2})
+        self.assertEqual(fixture.calls[0][0:2], ("POST", ORIGIN + "/graphql"))
+        for query in ["mutation { addComment(input:{body:\"x\"}) { clientMutationId } }",
+                      "subscription { viewer { login } }",
+                      "{ viewer { login } } mutation { deleteIssue(input:{id:\"x\"}) { clientMutationId } }",
+                      "query { viewer { login } } # query\n mutation { x }",
+                      'query { viewer { login } } mutation { x(body:"query") }']:
+            with self.subTest(query=query), self.assertRaises(ClientError):
+                client.query(query)
+        self.assertEqual(len(fixture.calls), 1)
+
+    def test_query_errors_and_cursor_incompleteness_fail_closed(self):
+        client = self.client(HTTPFixture(reply(data={"data": {"viewer": None}, "errors": [{"message": TOKEN}]})))
+        with self.assertRaisesRegex(ClientError, "incomplete_graphql"):
+            client.query("{ viewer { login } }")
+        self.assertIsNone(client.next_cursor({"pageInfo": {"hasNextPage": False}}))
+        self.assertEqual(client.next_cursor({"pageInfo": {"hasNextPage": True, "endCursor": "next"}}), "next")
+        for connection in [{}, {"pageInfo": {}}, {"pageInfo": {"hasNextPage": True, "endCursor": None}}]:
+            with self.assertRaises(ClientError):
+                client.next_cursor(connection)
+
+    def test_deadline_and_fixed_origin_no_ambient_fallback(self):
+        fixture = HTTPFixture()
+        client = self.client(fixture)
+        for path in ["https://evil.example/repos/a/b", "//evil.example/repos/a/b", "/rate_limit", "/repos/a/../b", "/repos/a/b#fragment"]:
+            with self.subTest(path=path), self.assertRaises(ClientError):
+                client.get(path)
+        with self.assertRaisesRegex(ClientError, "deadline_exceeded"):
+            client.pages("/repos/a/b/pulls", deadline=999)
+        with self.assertRaisesRegex(ClientError, "cached_reviewer_credential_required"):
+            GitHubClient.from_environment({"GH_TOKEN": TOKEN, "OP_PREFLIGHT_AUTHOR_PAT": TOKEN})
+        self.assertFalse(fixture.calls)
+
+    def test_budget_credential_identity_is_configured_not_live_observed(self):
+        fixture = HTTPFixture(reply(data=[]))
+        client = GitHubClient.from_environment({"OP_PREFLIGHT_REVIEWER_PAT": TOKEN,
+            "OP_PREFLIGHT_AGENT": "codex"}, transport=fixture)
+        client.get("/repos/a/b/pulls")
+        evidence = client.budget()["core"]
+        self.assertEqual(evidence["credential_source"], "OP_PREFLIGHT_REVIEWER_PAT")
+        self.assertEqual(evidence["configured_identity"], "nathanpayne-codex")
+        self.assertEqual(evidence["identity_evidence"], "preflight_configured")
+        self.assertEqual(evidence["resource"], "core")
+        self.assertEqual(len(fixture.calls), 1)
+
+    def test_snapshot_budget_does_not_wait_for_upstream(self):
+        entered, release = threading.Event(), threading.Event()
+        def transport(*args):
+            entered.set()
+            release.wait(1)
+            return reply(data=[])
+        client = self.client(transport)
+        thread = threading.Thread(target=client.get, args=("/repos/a/b/pulls",), daemon=True)
+        thread.start()
+        self.assertTrue(entered.wait(1))
+        start = time.monotonic()
+        self.assertEqual(client.budget(), {})
+        self.assertLess(time.monotonic() - start, 0.1)
+        release.set()
+        thread.join(1)
+
+    def test_waiting_transport_lock_honors_caller_deadline(self):
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+        def transport(*args):
+            calls.append(args); entered.set(); release.wait(1)
+            return reply(data=[])
+        client = GitHubClient(TOKEN, transport=transport)
+        thread = threading.Thread(target=client.get, args=("/repos/a/b/pulls",), daemon=True)
+        thread.start(); self.assertTrue(entered.wait(1))
+        started = time.monotonic()
+        with self.assertRaisesRegex(ClientError, "deadline_exceeded"):
+            client.get("/repos/a/b/issues", deadline=started + 0.025)
+        self.assertLess(time.monotonic() - started, 0.1)
+        self.assertEqual(len(calls), 1)
+        release.set(); thread.join(1)
+
+    def test_late_reply_is_discarded_but_headers_remain_observed(self):
+        def transport(*args):
+            time.sleep(0.025)
+            return reply(data=["late"], **{"X-RateLimit-Remaining": "4900"})
+        client = GitHubClient(TOKEN, transport=transport)
+        with self.assertRaisesRegex(ClientError, "deadline_exceeded"):
+            client.get("/repos/a/b/pulls", deadline=time.monotonic() + 0.005)
+        self.assertEqual(client.budget()["core"]["remaining"], 4900)
+        self.assertEqual(len(client._cache), 0)
+
+    def test_search_checks_its_own_resource_reserve(self):
+        fixture = HTTPFixture(reply(data=[], **{"X-RateLimit-Resource": "search",
+            "X-RateLimit-Limit": "30", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "2000"}))
+        client = self.client(fixture)
+        client.get("/search/issues?q=repo:a/b")
+        with self.assertRaisesRegex(ClientError, "primary_exhausted"):
+            client.get("/search/issues?q=repo:a/b")
+        self.assertEqual(len(fixture.calls), 1)
+
+    def test_small_search_pools_remain_usable(self):
+        for path, resource, limit, remaining in [
+            ("/search/issues?q=repo:a/b", "search", 30, 29),
+            ("/search/code?q=repo:a/b", "code_search", 10, 9),
+        ]:
+            with self.subTest(resource=resource):
+                headers = {"X-RateLimit-Resource": resource, "X-RateLimit-Limit": str(limit),
+                           "X-RateLimit-Remaining": str(remaining), "X-RateLimit-Reset": "2000"}
+                fixture = HTTPFixture(reply(data=[], **headers), reply(data=[], **headers))
+                client = self.client(fixture)
+                client.get(path); client.get(path)
+                self.assertEqual(len(fixture.calls), 2)
+                self.assertFalse(client.budget()[resource]["primary_exhausted"])
+
+    def test_code_search_exhaustion_is_not_search_or_core_exhaustion(self):
+        fixture = HTTPFixture(reply(data=[], **{"X-RateLimit-Resource": "code_search",
+            "X-RateLimit-Limit": "10", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "2000"}),
+            reply(data=[]), reply(data=[]))
+        client = self.client(fixture)
+        client.get("/search/code?q=repo:a/b")
+        with self.assertRaisesRegex(ClientError, "primary_exhausted"):
+            client.get("/search/code?q=repo:a/b&page=2")
+        client.get("/search/issues?q=repo:a/b")
+        client.get("/repos/a/b/pulls")
+        self.assertEqual(len(fixture.calls), 3)
+
+    def test_response_resource_is_learned_for_get_and_pagination(self):
+        for paginate in [False, True]:
+            with self.subTest(paginate=paginate):
+                link = '<https://api.github.com/repos/a/b/pulls?page=2>; rel="next"' if paginate else ""
+                fixture = HTTPFixture(reply(data=[1], Link=link, **{
+                    "X-RateLimit-Resource": "search", "X-RateLimit-Limit": "30",
+                    "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "2000"}))
+                client = self.client(fixture)
+                with self.assertRaisesRegex(ClientError, "primary_exhausted"):
+                    if paginate:
+                        client.pages("/repos/a/b/pulls")
+                    else:
+                        client.get("/repos/a/b/pulls")
+                        client.get("/repos/a/b/pulls?page=2")
+                self.assertEqual(len(fixture.calls), 1)
+
+    def test_reserve_uses_observed_limit_and_never_invents_one(self):
+        for limit, remaining, blocked in [("5000", "100", True), ("5000", "101", False),
+                                           (None, "1", False), ("n/a", "1", False), ("0", "1", False)]:
+            with self.subTest(limit=limit, remaining=remaining):
+                headers = {"X-RateLimit-Remaining": remaining, "X-RateLimit-Reset": "2000"}
+                if limit is not None:
+                    headers["X-RateLimit-Limit"] = limit
+                fixture = HTTPFixture(reply(data=[], **headers), reply(data=[]))
+                client = self.client(fixture)
+                client.get("/repos/a/b/pulls")
+                evidence = client.budget()["core"]
+                self.assertFalse(evidence["primary_exhausted"])
+                self.assertEqual(evidence["limit"], 5000 if limit == "5000" else 0 if limit == "0" else None)
+                if blocked:
+                    with self.assertRaisesRegex(ClientError, "primary_reserve"):
+                        client.get("/repos/a/b/pulls")
+                else:
+                    client.get("/repos/a/b/pulls")
+                self.assertEqual(len(fixture.calls), 1 if blocked else 2)
+
+    def test_learned_resource_map_is_bounded(self):
+        fixture = HTTPFixture(reply(data=[], **{"X-RateLimit-Resource": "search"}), reply(data=[]))
+        client = self.client(fixture, cache_pages=1)
+        client.get("/repos/a/b/pulls"); client.get("/repos/a/b/issues")
+        self.assertEqual(len(client._endpoint_resources), 1)
+        self.assertEqual(client._resource("/repos/a/b/pulls"), "core")
+
+    def test_oversized_denial_still_accounts_throttle_headers(self):
+        fixture = HTTPFixture(Response(403, {"Retry-After": "120", "X-RateLimit-Remaining": "0",
+            "X-RateLimit-Reset": "2000"}, b"x" * (MAX_BODY + 1)))
+        client = self.client(fixture)
+        with self.assertRaisesRegex(ClientError, "secondary_limit"):
+            client.get("/repos/a/b/pulls")
+        self.assertTrue(client.budget()["core"]["secondary_limited"])
+        with self.assertRaisesRegex(ClientError, "upstream_backoff"):
+            client.get("/repos/a/b/pulls")
+        self.assertEqual(len(fixture.calls), 1)
+
+    def test_real_transport_uses_fixed_https_and_does_not_redirect(self):
+        class FakeReply:
+            status = 302
+            def getheaders(self): return [("Location", "https://evil.example/")]
+            def read1(self, amount): return b""
+        connection = SimpleNamespace(connect=lambda: None, close=lambda: None,
+            sock=SimpleNamespace(settimeout=lambda value: None, shutdown=lambda how: None),
+            request=lambda *args, **kwargs: None, getresponse=lambda: FakeReply())
+        with patch("http.client.HTTPSConnection", return_value=connection) as factory:
+            result = http_transport("GET", ORIGIN + "/repos/a/b/pulls", {}, None, 1)
+        self.assertEqual(result.status, 302)
+        factory.assert_called_once_with("api.github.com", timeout=1)
+
+    def test_real_transport_slow_drip_body_is_bounded(self):
+        listener = socket.socket(); listener.bind(("127.0.0.1", 0)); listener.listen()
+        self.addCleanup(listener.close)
+        port = listener.getsockname()[1]
+        def drip():
+            connection, _ = listener.accept()
+            with connection:
+                connection.recv(4096)
+                connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nX-RateLimit-Remaining: 4900\r\n\r\n")
+                try:
+                    for _ in range(100):
+                        connection.sendall(b"x"); time.sleep(0.005)
+                except OSError:
+                    pass
+        thread = threading.Thread(target=drip, daemon=True); thread.start()
+        plain_http = http.client.HTTPConnection
+        with patch("http.client.HTTPSConnection", side_effect=lambda host, timeout: plain_http("127.0.0.1", port, timeout=timeout)):
+            started = time.monotonic()
+            with self.assertRaisesRegex(ClientError, "deadline_exceeded") as error:
+                http_transport("GET", ORIGIN + "/repos/a/b/pulls", {}, None, 0.025)
+            self.assertLess(time.monotonic() - started, 0.15)
+            self.assertEqual(error.exception.response.headers["X-RateLimit-Remaining"], "4900")
+        thread.join(0.2)
+
+
+class SchedulerTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.scheduler = Scheduler(workers=1, clock=self.clock, monotonic=self.clock)
+        self.addCleanup(self.scheduler.close)
+
+    def settle(self, name):
+        wait_until(lambda: not self.scheduler.snapshot()[name]["in_flight"])
+
+    def test_hot_idle_and_stale_last_good(self):
+        results = [Sample({"value": 1}, True), ClientError("permission_denied"), Sample({"value": 2})]
+        def fetch(deadline):
+            result = results.pop(0)
+            if isinstance(result, Exception): raise result
+            return result
+        self.scheduler.register("prs", fetch)
+        self.assertEqual(self.scheduler.snapshot()["prs"]["error"], "unavailable")
+        self.scheduler.tick(); self.settle("prs")
+        first = self.scheduler.snapshot()["prs"]
+        self.assertEqual(first["retry_at"], 1015)
+        first["data"]["value"] = 99
+        self.clock.now = 1015
+        self.scheduler.tick(); self.settle("prs")
+        failed = self.scheduler.snapshot()["prs"]
+        self.assertEqual(failed["data"], {"value": 1})
+        self.assertEqual(failed["observed_at"], 1000)
+        self.assertTrue(failed["stale"])
+        self.assertEqual(failed["retry_at"], 1030)
+        self.clock.now = 1030
+        self.scheduler.tick(); self.settle("prs")
+        self.assertEqual(self.scheduler.snapshot()["prs"]["retry_at"], 1150)
+
+    def test_refresh_cannot_bypass_single_flight_backoff_or_worker_bound(self):
+        release, entered = threading.Event(), threading.Event()
+        calls = []
+        def fetch(deadline):
+            calls.append(deadline); entered.set(); release.wait(1)
+            raise ClientError("secondary_limit", 120)
+        self.scheduler.register("first", fetch)
+        self.scheduler.register("second", lambda deadline: Sample(2))
+        self.scheduler.tick()
+        self.assertTrue(entered.wait(1))
+        for _ in range(5):
+            self.scheduler.refresh("first"); self.scheduler.tick()
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(self.scheduler.snapshot()["second"]["in_flight"])
+        release.set(); self.settle("first")
+        self.scheduler.refresh("first"); self.scheduler.tick(); self.settle("second")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.scheduler.snapshot()["first"]["retry_at"], 1120)
+
+    def test_expired_callback_is_stale_discards_late_result_and_retains_fence(self):
+        entered, release = threading.Event(), threading.Event()
+        def fetch(deadline):
+            entered.set(); release.wait(1); return Sample("late")
+        self.scheduler.register("hung", fetch, timeout=10)
+        self.scheduler.tick()
+        self.assertTrue(entered.wait(1))
+        self.clock.now += 11
+        self.scheduler.tick()
+        self.assertEqual(self.scheduler.snapshot()["hung"]["error"], "deadline_exceeded")
+        self.assertTrue(self.scheduler.snapshot()["hung"]["in_flight"])
+        release.set(); self.settle("hung")
+        self.assertIsNone(self.scheduler.snapshot()["hung"]["data"])
+
+    def test_errors_are_sanitized_and_invalid_json_is_unavailable(self):
+        for name, fetch in [("secret", lambda deadline: (_ for _ in ()).throw(ValueError(TOKEN))),
+                            ("invalid", lambda deadline: Sample(float("nan")))]:
+            self.scheduler.register(name, fetch)
+            self.scheduler.tick(); self.settle(name)
+            self.assertEqual(self.scheduler.snapshot()[name]["error"], "source_failed")
+        self.assertNotIn(TOKEN, json.dumps(self.scheduler.snapshot()))
+
+
+class ServerTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "assets").mkdir()
+        (self.root / "index.html").write_text("<!doctype html><p>HTTP fixture only</p>")
+        (self.root / "assets" / "fixture.js").write_text('document.body.textContent = "fixture";')
+        (self.root / "assets" / "secret.py").write_text(TOKEN)
+        self.logs = []
+        self.github = GitHubClient(TOKEN, transport=HTTPFixture())
+        self.app = Application((Repository("mergepath", HUB, True), Repository("consumer", "a/b")),
+                               self.github, static_root=self.root, heartbeat=0.025, logger=self.logs.append)
+        self.server = CockpitServer(self.app)
+        self.port = self.server.server_address[1]
+        self.host = f"127.0.0.1:{self.port}"
+        self.thread = threading.Thread(target=lambda: self.server.serve_forever(poll_interval=0.01), daemon=True)
+        self.thread.start()
+        self.connections = []
+        self.addCleanup(self.close)
+        self.cookie = None
+
+    def close(self):
+        for connection in self.connections:
+            connection.close()
+        self.app.close(); self.server.shutdown(); self.server.server_close(); self.thread.join(1)
+
+    def request(self, method="GET", path="/api/snapshot", *, headers=None, authenticated=True, stream=False):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=1)
+        self.connections.append(connection)
+        connection.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+        pairs = [("Host", self.host)] if headers is None else list(headers)
+        if authenticated and self.cookie:
+            pairs.append(("Cookie", self.cookie))
+        for key, value in pairs: connection.putheader(key, value)
+        connection.endheaders()
+        response = connection.getresponse()
+        if stream:
+            return response
+        data, response_headers, status = response.read(), dict(response.getheaders()), response.status
+        connection.close()
+        return status, response_headers, data
+
+    def bootstrap(self):
+        status, headers, body = self.request("POST", "/api/bootstrap", authenticated=False, headers=[
+            ("Host", self.host), ("Origin", "http://" + self.host),
+            ("X-Cockpit-Bootstrap", self.app._nonce), ("X-Cockpit-CSRF", self.app._nonce)])
+        self.assertEqual(status, 204)
+        self.cookie = headers["Set-Cookie"].split(";")[0]
+        self.assertIn("HttpOnly", headers["Set-Cookie"])
+        self.assertIn("SameSite=Strict", headers["Set-Cookie"])
+        self.assertNotEqual(self.cookie.split("=", 1)[1], self.app._nonce)
+
+    def test_loopback_exact_host_duplicate_and_foreign_origin_refusals(self):
+        self.assertEqual(self.server.server_address[0], "127.0.0.1")
+        self.bootstrap()
+        for headers in [[], [("Host", "evil.example")], [("Host", self.host), ("Host", self.host)],
+                        [("Host", self.host), ("Origin", "https://evil.example")],
+                        [("Host", self.host), ("Sec-Fetch-Site", "same-site")]]:
+            with self.subTest(headers=headers):
+                self.assertEqual(self.request(headers=headers)[0], 403)
+        self.assertEqual(self.request(headers=[("Host", f"localhost:{self.port}")])[0], 200)
+
+    def test_session_required_on_all_ordinary_routes(self):
+        for route in ["/", "/api/session", "/api/snapshot", "/events", "/assets/fixture.js", "/bootstrap?launch=x"]:
+            with self.subTest(route=route):
+                self.assertEqual(self.request(path=route)[0], 401)
+        for route in ["/bootstrap", "/bootstrap.js"]:
+            status, headers, body = self.request(path=route)
+            self.assertEqual(status, 200)
+            self.assertNotIn(self.app._nonce.encode(), body)
+            self.assertEqual(headers["Content-Security-Policy"], CSP)
+            self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_bootstrap_csrf_origin_replay_and_expiry(self):
+        for extra in [[], [("Origin", "http://" + self.host)], [("Origin", "http://evil.example"),
+                       ("X-Cockpit-CSRF", self.app._nonce)], [("Origin", "http://" + self.host), ("X-Cockpit-CSRF", "é")]]:
+            self.assertEqual(self.request("POST", "/api/bootstrap", authenticated=False, headers=[
+                ("Host", self.host), ("X-Cockpit-Bootstrap", self.app._nonce)] + extra)[0], 403)
+        self.bootstrap()
+        self.assertEqual(self.request("POST", "/api/bootstrap", headers=[("Host", self.host),
+            ("Origin", "http://" + self.host), ("X-Cockpit-Bootstrap", self.app._nonce),
+            ("X-Cockpit-CSRF", self.app._nonce)])[0], 403)
+        self.app._nonce_used = False; self.app._nonce_expires = 0
+        self.assertFalse(self.app.bootstrap(self.app._nonce, self.app._nonce))
+
+    def test_concurrent_bootstrap_consumes_nonce_once(self):
+        barrier = threading.Barrier(2)
+        outcomes = []
+        def run():
+            barrier.wait()
+            outcomes.append(self.request("POST", "/api/bootstrap", authenticated=False, headers=[
+                ("Host", self.host), ("Origin", "http://" + self.host),
+                ("X-Cockpit-Bootstrap", self.app._nonce), ("X-Cockpit-CSRF", self.app._nonce)])[0])
+        threads = [threading.Thread(target=run) for _ in range(2)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(1)
+        self.assertEqual(sorted(outcomes), [204, 403])
+
+    def test_every_non_get_including_unknown_methods_needs_csrf(self):
+        self.bootstrap()
+        for method in ["POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE", "MADEUP"]:
+            with self.subTest(method=method):
+                self.assertEqual(self.request(method)[0], 403)
+                self.assertEqual(self.request(method, headers=[("Host", self.host), ("Origin", "http://" + self.host),
+                                  ("X-Cockpit-CSRF", "é")])[0], 403)
+                self.assertEqual(self.request(method, headers=[("Host", self.host), ("Origin", "http://" + self.host),
+                                  ("X-Cockpit-CSRF", self.app._csrf)])[0], 405)
+        status, _, body = self.request(path="/api/session")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"csrf": self.app._csrf})
+        self.assertNotIn(self.app._session.encode(), body)
+
+    def test_framing_and_body_limits(self):
+        self.bootstrap()
+        for headers, expected in [([("Content-Length", "1"), ("Content-Length", "1")], 400),
+                                  ([("Transfer-Encoding", "chunked")], 400),
+                                  ([("Content-Length", "n/a")], 400), ([("Content-Length", "4097")], 413)]:
+            self.assertEqual(self.request("POST", headers=[("Host", self.host)] + headers)[0], expected)
+
+    def test_real_shell_and_local_assets_require_session_and_keep_csp(self):
+        self.app.static_root = ROOT / "mergepath/cockpit"
+        for route in ["/", "/assets/app.js", "/assets/components.js", "/assets/cockpit.css",
+                      "/assets/fonts/local-fonts.css", "/assets/fonts/2c32b9b3ee358c11.woff2"]:
+            self.assertEqual(self.request(path=route, authenticated=False)[0], 401)
+        self.bootstrap()
+        for route in ["/", "/assets/app.js", "/assets/components.js", "/assets/cockpit.css",
+                      "/assets/fonts/local-fonts.css", "/assets/fonts/2c32b9b3ee358c11.woff2"]:
+            status, headers, body = self.request(path=route)
+            self.assertEqual(status, 200)
+            self.assertEqual(headers["Content-Security-Policy"], CSP)
+            self.assertTrue(body)
+            self.assertNotIn(TOKEN.encode(), body)
+        self.assertEqual(self.request(path="/assets/fonts/manifest.json")[0], 404)
+        self.assertEqual(self.request(path="/assets/fonts/instrumentsans-OFL.txt")[0], 404)
+        self.assertEqual(self.github.budget(), {})
+
+    def test_font_binaries_and_licenses_match_supplied_provenance(self):
+        fonts = ROOT / "mergepath/cockpit/assets/fonts"
+        manifest = json.loads((fonts / "manifest.json").read_text())
+        for asset in manifest["assets"] + manifest["licenses"]:
+            path = fonts / asset["file"]
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), asset["sha256"])
+        css = (fonts / "local-fonts.css").read_text()
+        self.assertNotIn("https:", css)
+        self.assertNotIn("http:", css)
+        for asset in manifest["assets"]:
+            self.assertIn("/assets/fonts/" + asset["file"], css)
+
+    def test_safe_static_refuses_sources_traversal_and_symlink_escape(self):
+        self.bootstrap()
+        (self.root / "assets" / "escape.html").symlink_to(ROOT / "README.md")
+        for route in ["/assets/secret.py", "/server.py", "/assets/../index.html", "/assets/%2e%2e/index.html",
+                      "/assets/%252e%252e/index.html", "/assets/escape.html", "/assets/", "/assets/%00.js"]:
+            with self.subTest(route=route): self.assertEqual(self.request(path=route)[0], 404)
+        self.assertEqual(self.request(path="/")[0], 200)
+        self.assertEqual(self.request(path="/assets/fixture.js")[0], 200)
+        (self.root / "index.html").unlink()
+        self.assertEqual(json.loads(self.request(path="/")[2]), {"error": "visual_shell_unavailable"})
+
+    def test_snapshot_filter_and_credentials_redaction(self):
+        self.bootstrap()
+        self.app.scheduler.register("fixture", lambda deadline: Sample({"message": TOKEN + self.app._session + self.app._nonce}))
+        self.app.scheduler.tick()
+        wait_until(lambda: not self.app.scheduler.snapshot()["fixture"]["in_flight"])
+        status, _, body = self.request(path="/api/snapshot?repo=a%2Fb")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual([item["repo"] for item in payload["repositories"]], ["a/b"])
+        self.assertEqual(payload["sources"]["fixture"]["data"]["message"], "[redacted]" * 3)
+        for route in ["/api/snapshot?repo=evil/repo", "/api/snapshot?repo=a/b&repo=a/b", "/api/snapshot?token=x"]:
+            self.assertEqual(self.request(path=route)[0], 400)
+
+    def test_sse_snapshot_heartbeat_reconnect_and_update(self):
+        self.bootstrap()
+        response = self.request(path="/events", stream=True)
+        lines = []
+        while len(lines) < 20:
+            line = response.readline().decode(); lines.append(line)
+            if line == "event: heartbeat\n": break
+        self.assertIn("retry: 2000\n", lines)
+        self.assertIn("event: snapshot\n", lines)
+        self.assertIn("event: heartbeat\n", lines)
+        response.close()
+        self.app.publish()
+        response = self.request(path="/events", headers=[("Host", self.host), ("Last-Event-ID", "9999")], stream=True)
+        text = "".join(response.readline().decode() for _ in range(6))
+        self.assertIn("id: 1\n", text)
+        self.assertIn('"schema":"cockpit/v1"', text)
+        response.close()
+        self.assertEqual(self.github.budget(), {})
+
+    def test_sse_connection_bound_and_shutdown(self):
+        self.bootstrap()
+        streams = [self.request(path="/events", stream=True) for _ in range(2)]
+        self.assertEqual(self.request(path="/events")[0], 503)
+        self.app.close()
+        for stream in streams: stream.close()
+
+    def test_logs_and_errors_never_echo_secrets_paths_or_headers(self):
+        self.bootstrap()
+        self.request(path="/" + self.app._session + "?credential=" + TOKEN)
+        self.request(headers=[("Host", self.app._nonce)])
+        log = "\n".join(self.logs)
+        for secret in [TOKEN, self.app._nonce, self.app._session, self.app._csrf]:
+            self.assertNotIn(secret, log)
+        self.assertTrue(all(line.startswith("request status=") for line in self.logs))
+
+
+class InventoryAndLauncherTests(unittest.TestCase):
+    def test_inventory_uses_fixed_existing_yq_and_freezes_hub_plus_consumers(self):
+        calls = []
+        def run(*args, **kwargs):
+            calls.append((args, kwargs))
+            return SimpleNamespace(stdout='[{"name":"one", "repo":"owner/one"}]')
+        inventory = load_inventory(Path("/fixture"), run)
+        self.assertIsInstance(inventory, tuple)
+        self.assertEqual(inventory[0].repo, HUB)
+        self.assertEqual(calls[0][0][0], ["yq", "-o=json", ".consumers", "/fixture/.mergepath-sync.yml"])
+        self.assertEqual(calls[0][1]["timeout"], 10)
+        with self.assertRaises(Exception): inventory[0].repo = "changed"
+
+    def test_invalid_inventory_never_reports_empty_fleet(self):
+        for data in [None, [], [{"name": "x", "repo": "../secret"}], [{"name":"x","repo":"owner/x"}]*2,
+                     [{"name":"mergepath","repo":HUB}], [{"name":"x","repo":"OWNER/X"}, {"name":"y","repo":"owner/x"}]]:
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                load_inventory(Path("/fixture"), lambda *args, **kwargs: SimpleNamespace(stdout=json.dumps(data)))
+        with self.assertRaisesRegex(ValueError, "manifest_inventory_unavailable"):
+            load_inventory(Path("/fixture"), lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired("yq", 10)))
+
+    def test_launcher_calls_cache_check_only_and_scrubs_author_and_ambient(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); (root / "scripts").mkdir(); (root / "mergepath" / "cockpit").mkdir(parents=True)
+            launcher = root / "scripts" / "cockpit.sh"
+            launcher.write_bytes((ROOT / "scripts" / "cockpit.sh").read_bytes())
+            (root / "scripts" / "op-preflight.sh").write_text(
+                '#!/bin/bash\nprintf "%s\\n" "$*" > "$COCKPIT_TEST_CALLS"\n'
+                'if [ "${COCKPIT_TEST_CACHE_FAIL:-0}" = 1 ]; then exit 1; fi\n'
+                'printf "export OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-credential\\nexport OP_PREFLIGHT_AUTHOR_PAT=fixture-author-credential\\n"\n')
+            (root / "scripts" / "op-preflight.sh").chmod(0o755)
+            (root / "mergepath" / "cockpit" / "__main__.py").write_text(
+                'import os\nassert os.environ["OP_PREFLIGHT_REVIEWER_PAT"] == "fixture-reviewer-credential"\n'
+                'assert not any(name in os.environ for name in ["OP_PREFLIGHT_AUTHOR_PAT", "GH_TOKEN", "GITHUB_TOKEN"])\n'
+                'print("fixture server launched")\n')
+            calls = root / "calls"
+            env = {**os.environ, "COCKPIT_TEST_CALLS": str(calls), "GH_TOKEN": "fixture-ambient", "GITHUB_TOKEN": "fixture-ambient"}
+            result = subprocess.run(["bash", "-x", str(launcher), "--port", "0"], env=env, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(calls.read_text().strip(), "--agent codex --check --print-exports")
+            self.assertNotIn(TOKEN, result.stdout + result.stderr)
+            self.assertNotIn("fixture-author-credential", result.stdout + result.stderr)
+            env["COCKPIT_TEST_CACHE_FAIL"] = "1"
+            result = subprocess.run(["bash", str(launcher)], env=env, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 1)
+            self.assertNotIn("fixture server launched", result.stdout)
+
+    def test_browser_failure_never_exposes_fragment(self):
+        main = importlib.import_module("mergepath.cockpit.__main__")
+        output = io.StringIO()
+        client = GitHubClient(TOKEN, transport=HTTPFixture())
+        with patch.object(main.GitHubClient, "from_environment", return_value=client), \
+             patch.object(main, "load_inventory", return_value=(Repository("mergepath", HUB, True),)), \
+             patch.object(main, "open_browser", return_value=False) as opener, \
+             patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            self.assertEqual(main.main([]), 1)
+        nonce = opener.call_args.args[0].split("#launch=", 1)[1]
+        self.assertNotIn(nonce, output.getvalue())
+        self.assertNotIn(TOKEN, output.getvalue())
+        self.assertIn("Browser opening failed", output.getvalue())
+
+
+if __name__ == "__main__":
+    # Network safety net for the whole fixture process. The real localhost
+    # server is exercised, but even an accidental HTTP fallback cannot escape.
+    real_connect = socket.create_connection
+    def loopback_only(address, *args, **kwargs):
+        if address[0] != "127.0.0.1":
+            raise AssertionError("remote network forbidden in Cockpit fixtures")
+        return real_connect(address, *args, **kwargs)
+    with patch("socket.create_connection", loopback_only):
+        unittest.main(verbosity=2)
