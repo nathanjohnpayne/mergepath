@@ -279,11 +279,17 @@ refute_grep "D13: rollup does not interpolate dispatch inputs into run:" \
   "$W/daily-feedback-rollup.yml" '"${{ github.event.inputs.'
 assert_grep "D13: rollup passes the since input through env" \
   "$W/daily-feedback-rollup.yml" 'INPUT_SINCE: ${{ github.event.inputs.since }}'
+assert_grep "D13: rollup passes the until input through env" \
+  "$W/daily-feedback-rollup.yml" 'INPUT_UNTIL: ${{ github.event.inputs.until }}'
+assert_grep "D13: rollup passes the dry_run input through env" \
+  "$W/daily-feedback-rollup.yml" 'INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}'
 if [ -f "$W/daily-feedback-rollup.yml" ]; then
   D13="$(mktemp -d "${TMPDIR:-/tmp}/test465-d13.XXXXXX")"
   mkdir -p "$D13/scripts"
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" >"%s/args"\n' "$D13" >"$D13/scripts/daily-feedback-rollup.sh"
   extract_step_run "$W/daily-feedback-rollup.yml" "Run rollup" >"$D13/step.sh"
+  refute_grep "D13: extracted rollup shell does not interpolate dispatch inputs" \
+    "$D13/step.sh" '${{ github.event.inputs.'
   run_rollup_step() {  # <since> <until> <dry_run>
     rm -f "$D13/args" "$D13/pwned"
     ( cd "$D13" && GH_TOKEN=fixture-token REPO=o/r INPUT_SINCE="$1" INPUT_UNTIL="$2" \
@@ -295,6 +301,12 @@ if [ -f "$W/daily-feedback-rollup.yml" ]; then
   else
     fail "D13 runtime: valid inputs did not reach the rollup ($(cat "$D13/args" 2>/dev/null))"
   fi
+  if run_rollup_step 2026-09-01 2026-09-02 false \
+     && [ "$(tr '\n' ' ' <"$D13/args")" = "--since 2026-09-01 --until 2026-09-02 " ]; then
+    pass "D13 runtime: explicit dry_run=false preserves dates without --dry-run"
+  else
+    fail "D13 runtime: dry_run=false incorrectly changed the arguments"
+  fi
   if ! run_rollup_step "2026-09-01\"; touch $D13/pwned; \"" "" "" \
      && [ ! -e "$D13/pwned" ] && [ ! -e "$D13/args" ]; then
     pass "D13 runtime: a shell-bearing since input is rejected before anything runs"
@@ -305,6 +317,26 @@ if [ -f "$W/daily-feedback-rollup.yml" ]; then
     pass "D13 runtime: a non-boolean dry_run input is rejected"
   else
     fail "D13 runtime: non-boolean dry_run input was not rejected"
+  fi
+  while IFS='|' read -r label since until dry_run; do
+    if ! run_rollup_step "$since" "$until" "$dry_run" \
+       && [ ! -e "$D13/pwned" ] && [ ! -e "$D13/args" ]; then
+      pass "D13 runtime: $label rejected before payload or rollup execution"
+    else
+      fail "D13 runtime: $label was not rejected"
+    fi
+  done <<'INPUTS'
+since command substitution|$(touch pwned)||
+until command substitution||$(touch pwned)|false
+until backticks||`touch pwned`|
+dry_run command substitution|||$(touch pwned)
+invalid date shape|2026-1-1||
+INPUTS
+  if ! run_rollup_step $'2026-09-01\ntouch pwned' "" "" \
+     && [ ! -e "$D13/pwned" ] && [ ! -e "$D13/args" ]; then
+    pass "D13 runtime: a multiline since input is rejected before anything runs"
+  else
+    fail "D13 runtime: multiline since input was not rejected"
   fi
   if run_rollup_step "" "" "" && [ -e "$D13/args" ] && [ -z "$(tr -d '\n' <"$D13/args")" ]; then
     pass "D13 runtime: scheduled run (no inputs) calls the rollup with no arguments"
