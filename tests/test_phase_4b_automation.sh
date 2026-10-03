@@ -407,6 +407,7 @@ if [ "${1:-}" = "api" ]; then
       repos/o/r/issues/*/comments)
         [ -z "${P4B_FAKE_ISSUE_COMMENTS_FAIL:-}" ] || exit 1
         if [ -n "${P4B_FAKE_ISSUE_COMMENTS_SENTINEL:-}" ] && [ -e "$P4B_FAKE_ISSUE_COMMENTS_SENTINEL" ]; then
+          [ -z "${P4B_FAKE_ISSUE_COMMENTS_FAIL_AFTER_SENTINEL:-}" ] || exit 1
           printf '%s\n' "${P4B_FAKE_ISSUE_COMMENTS_AFTER:-[]}"
           exit 0
         fi
@@ -2842,6 +2843,78 @@ if [ "$rc" = 0 ] && [ -e "$P1598_SENTINEL" ] && [ "$(printf '%s' "$out" | jq -r 
 else
   fail "#1598: moved generation under governing-disabled Codex (rc=$rc): $out"
 fi
+# G2 (already-cleared route): a request that lands DURING the final
+# accounting read (accounting call 3) is not seen by the run, which posts.
+# The posted record excludes it ([7201], not 7204), so the merge gate holds
+# the approval (tests/test_codex_request_evidence.sh,
+# request-during-final-accounting). This is the revised contract: the run
+# publishes, and a fresh gate evaluation rejects the stale approval.
+cat >"$WORK/p1598-acct-touch.sh" <<'EOF'
+#!/usr/bin/env bash
+n=0
+[ ! -f "$P4B_TEST_ACCT_COUNT" ] || n=$(cat "$P4B_TEST_ACCT_COUNT")
+n=$((n + 1)); printf '%s\n' "$n" >"$P4B_TEST_ACCT_COUNT"
+[ "$n" -ne 3 ] || : >"$P4B_FAKE_ISSUE_COMMENTS_SENTINEL"
+# Report like the default stub, so the post-POST acknowledgment (#1261) sees
+# the posted review body as accounted.
+if [ -s "${P4B_TEST_POSTED_REVIEW:-}" ]; then
+  jq '{feedback_policy:{},findings:[{kind:"review-body",review_id:1,body:.body,accounted:true}],missing:[]}' "$P4B_TEST_POSTED_REVIEW"
+else
+  printf '{"feedback_policy":{},"findings":[],"missing":[]}\n'
+fi
+EOF
+chmod +x "$WORK/p1598-acct-touch.sh"
+rm -f "$P1598_SENTINEL" "$WORK/p1598-acct.count"; : >"$P1598_LOG"; rm -f "$P1598_BODY"; rm -f "$P4B_TEST_POSTED_REVIEW"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$WORK/p1598-acct-touch.sh" P4B_TEST_ACCT_COUNT="$WORK/p1598-acct.count" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_FAKE_ISSUE_COMMENTS='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' \
+  P4B_FAKE_ISSUE_COMMENTS_AFTER='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"},{"id":7204,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:01:00Z","body":"@codex review"}]' \
+  P4B_FAKE_ISSUE_COMMENTS_SENTINEL="$P1598_SENTINEL" \
+  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ -e "$P1598_SENTINEL" ] && [ "$(cat "$WORK/p1598-acct.count" 2>/dev/null || echo 0)" -ge 3 ] \
+   && [ "$(grep -o '<!-- mergepath-p4b-request-generation: [^>]*-->' "$P1598_BODY" 2>/dev/null)" = '<!-- mergepath-p4b-request-generation: [7201] -->' ]; then
+  pass "#1598 G2: on the already-cleared route a request during final accounting is posted outside the record [7201]"
+else
+  fail "#1598 G2: already-cleared route, request during final accounting (rc=$rc record=$(grep -o 'mergepath-p4b-request-generation: [^ ]*' "$P1598_BODY" 2>/dev/null)): $out"
+fi
+# G3: the authorization read succeeds but the writer's re-read fails. With
+# the governing policy enabling Codex (unresolvable here, which counts as
+# enabled) the approval is refused (exit 10) after cleanup; with it disabling
+# Codex the run posts.
+for _g3 in enabled disabled; do
+  rm -f "$P1598_SENTINEL"; : >"$P1598_LOG"; rm -f "$P1598_BODY"
+  if [ "$_g3" = disabled ]; then _g3_resolver="$P1598_RESOLVER"; else _g3_resolver="$WORK/p1598-no-resolver"; fi
+  set +e
+  out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$WORK/p1598-adapter.sh" \
+    P4B_RESOLVE_BASE_POLICY="$_g3_resolver" P1598_GOVERNING_POLICY="$P1598_CODEX_OFF" \
+    OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
+    P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
+    P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+    P4B_FAKE_ISSUE_COMMENTS='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' \
+    P4B_FAKE_ISSUE_COMMENTS_SENTINEL="$P1598_SENTINEL" P4B_FAKE_ISSUE_COMMENTS_FAIL_AFTER_SENTINEL=1 \
+    bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  set -e
+  if [ "$_g3" = enabled ]; then
+    if [ "$rc" = 10 ] && [ -e "$P1598_SENTINEL" ] \
+       && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = request-generation-unrecorded ] \
+       && grep -q '^CLOSE #901$' "$P1598_LOG" && [ ! -e "$P1598_BODY" ]; then
+      pass "#1598 G3: an unreadable writer re-read refuses the approval (exit 10) after cleanup when Codex governs"
+    else
+      fail "#1598 G3 governing-enabled (rc=$rc issues=$(tr '\n' ' ' <"$P1598_LOG")): $out"
+    fi
+  else
+    if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = true ]; then
+      pass "#1598 G3: an unreadable writer re-read does not refuse when the governing policy disables Codex"
+    else
+      fail "#1598 G3 governing-disabled (rc=$rc): $out"
+    fi
+  fi
+done
 P2_FP="$(printf '%s|%s|%s|%s' P2 x.js 2 "should be handled under stricter policy" | cksum | cut -d' ' -f1)"
 grep -q "p4b-post-review o/r#134 head=abc123 finding=${P2_FP}" "${ISSUE_LOG}.body.1" \
   && pass "#674: filed issue body embeds the content-fingerprinted dedup marker" || fail "#674: content-fingerprint marker missing from issue body"
@@ -6253,6 +6326,50 @@ for _tr_case in moved unchanged; do
     fail "#1598: timeout-route request after authorization ($_tr_diag): $out"
   fi
 done
+# G1 (timeout route): a request that lands DURING the final accounting read
+# (accounting call 3, after the writer's generation verification at read 5)
+# is not seen by the run, which posts. The record excludes it ([4101], not
+# 4103), so the merge gate holds the approval (revised contract).
+cat >"$WORK/acct-timeout-final.sh" <<'EOF'
+#!/usr/bin/env bash
+n=0
+[ ! -f "$P4B_TEST_ACCT_COUNT" ] || n=$(cat "$P4B_TEST_ACCT_COUNT")
+n=$((n + 1)); printf '%s\n' "$n" >"$P4B_TEST_ACCT_COUNT"
+[ "$n" -ne 3 ] || printf '99\n' >"$P4B_FAKE_COMMENTS_COUNT"
+# Report like the default stub, so the post-POST acknowledgment (#1261) sees
+# the posted review body as accounted.
+if [ -s "${P4B_TEST_POSTED_REVIEW:-}" ]; then
+  jq '{feedback_policy:{},findings:[{kind:"review-body",review_id:1,body:.body,accounted:true}],missing:[]}' "$P4B_TEST_POSTED_REVIEW"
+else
+  printf '{"feedback_policy":{},"findings":[],"missing":[]}\n'
+fi
+EOF
+chmod +x "$WORK/acct-timeout-final.sh"
+_g1_body="$WORK/timeout-final-body.txt"; _g1_acct_count="$WORK/timeout-final-acct.count"
+rm -rf "$_race_acct"
+rm -f "$_race_count" "$_race_wrapper" "$_race_adapter" "$_race_issue_log" "$_race_issue_log.headreads" "$_g1_body" "$_g1_acct_count"
+: >"$_race_issue_log"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+  MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$WORK/acct-timeout-final.sh" P4B_TEST_ACCT_COUNT="$_g1_acct_count" \
+  CODEX_BIN="$BIN/fake-codex-race-approve-p2" \
+  P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" \
+  P4B_CODERABBIT_WAIT="$WORK/stub-race-coderabbit.sh" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_BODY="$_g1_body" \
+  P4B_TEST_POSTED_REVIEW="$WORK/timeout-final-posted.json" P4B_FAKE_CREATED_REVIEW_HEAD="$_race_head" \
+  P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat \
+  P4B_WRAPPER_LOG="$_race_wrapper" P4B_FAKE_LIVE_HEAD="$_race_head" \
+  P4B_FAKE_COMMENTS_BEFORE="$_race_before" P4B_FAKE_COMMENTS_AFTER="$_race_after" \
+  P4B_FAKE_COMMENTS_COUNT="$_race_count" P4B_FAKE_COMMENTS_SWITCH_AFTER=6 \
+  P4B_ISSUE_LOG="$_race_issue_log" P4B_ACCT_STATE_DIR="$_race_acct" \
+  bash "$ORCH" 131 --repo o/r --author claude --head "$_race_head" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ -e "$_race_wrapper" ] && [ "$(cat "$_g1_acct_count" 2>/dev/null || echo 0)" -ge 3 ] \
+   && [ "$(grep -o '<!-- mergepath-p4b-request-generation: [^>]*-->' "$_g1_body" 2>/dev/null)" = '<!-- mergepath-p4b-request-generation: [4101] -->' ]; then
+  pass "#1598 G1: on the timeout route a request during final accounting is posted outside the record [4101]"
+else
+  fail "#1598 G1: timeout route, request during final accounting (rc=$rc acct=$(cat "$_g1_acct_count" 2>/dev/null) record=$(grep -o 'mergepath-p4b-request-generation: [^ ]*' "$_g1_body" 2>/dev/null)): $out"
+fi
 
 # #1305/#1474: an account-blocked Codex with budget remaining may dispatch the
 # adapter, but that below-cap snapshot is not permanent authority. A final

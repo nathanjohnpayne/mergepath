@@ -283,6 +283,9 @@ SUP_STALE_4B='{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_i
 SUP_CODEX_REVIEW='{"id":789,"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:02:00Z","state":"COMMENTED","body":""}'
 SUP_CODEX_REVIEW_LATER='{"id":790,"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:07:00Z","state":"COMMENTED","body":""}'
 SUP_THUMBS='[{"user":{"login":"chatgpt-codex-connector[bot]"},"content":"+1","created_at":"2026-09-14T00:02:00Z"}]'
+SUP_THUMBS_LATER='[{"user":{"login":"chatgpt-codex-connector[bot]"},"content":"+1","created_at":"2026-09-14T00:02:00Z"},{"user":{"login":"chatgpt-codex-connector[bot]"},"content":"+1","created_at":"2026-09-14T00:07:00Z"}]'
+SUP_VERDICT_LATER='{"id":131,"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-09-14T00:07:00Z","body":"Codex Review: Didn'"'"'t find any major issues.\n\nReviewed commit: `abcdef0`"}'
+SUP_REQ_NO_TIME='{"id":125,"user":{"login":"nathanjohnpayne"},"body":"@codex review"}'
 while IFS='|' read -r name comments reviews reactions carry expected pattern; do
   printf '%s\n' "$comments" >"$DIR/comments"
   printf '%s\n' "$reviews" >"$DIR/reviews"
@@ -305,7 +308,27 @@ verdict-then-newer-request|[$SUP_REQ123,$SUP_VERDICT,$SUP_REQ124]|[$SUP_STALE_4B
 carry-then-newer-request|[$SUP_REQ123,$SUP_REQ124]|[$SUP_STALE_4B]|[]|{"carried":true,"source_time":"2026-09-14T00:02:00Z","source_commit":"oldhead","fingerprint":"same"}|1|Codex clearance @ 2026-09-14T00:02:00Z is superseded
 review-older-request-still-clears|[$SUP_REQ123]|[$SUP_CODEX_REVIEW,$SUP_STALE_4B]|[]||0|latest Codex signal is COMMENTED review @ 2026-09-14T00:02:00Z
 codex-answers-newer-request|[$SUP_REQ123,$SUP_REQ124]|[$SUP_CODEX_REVIEW,$SUP_STALE_4B,$SUP_CODEX_REVIEW_LATER]|[]||0|latest Codex signal is COMMENTED review @ 2026-09-14T00:07:00Z
+thumbs-older-request-still-clears|[$SUP_REQ123]|[$SUP_STALE_4B]|$SUP_THUMBS||0|latest Codex signal is 👍 reaction @ 2026-09-14T00:02:00Z
+verdict-older-request-still-clears|[$SUP_REQ123,$SUP_VERDICT]|[$SUP_STALE_4B]|[]||0|AFFIRMATIVE verdict comment @ 2026-09-14T00:02:00Z
+codex-thumbs-answers-newer-request|[$SUP_REQ123,$SUP_REQ124]|[$SUP_STALE_4B]|$SUP_THUMBS_LATER||0|latest Codex signal is 👍 reaction @ 2026-09-14T00:07:00Z
+codex-verdict-answers-newer-request|[$SUP_REQ123,$SUP_VERDICT,$SUP_REQ124,$SUP_VERDICT_LATER]|[$SUP_STALE_4B]|[]||0|AFFIRMATIVE verdict comment @ 2026-09-14T00:07:00Z
+codex-clearance-request-without-timestamp|[$SUP_REQ123,$SUP_REQ_NO_TIME]|[$SUP_CODEX_REVIEW,$SUP_STALE_4B]|[]||1|Codex clearance @ 2026-09-14T00:02:00Z is superseded: Codex request evidence unreadable
 CASES
+# A Codex clearance whose request re-read fails is superseded (fails closed):
+# the first comments read succeeds, every later one fails.
+printf '%s\n' "[$SUP_REQ123]" >"$DIR/comments"
+printf '%s\n' "[$SUP_CODEX_REVIEW,$SUP_STALE_4B]" >"$DIR/reviews"
+: >"$DIR/calls"
+rc=0
+PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=clearance-reread-fails COMMENTS_FAIL_FROM=2 \
+  PR_BODY='Authoring-Agent: claude' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+  MERGEPATH_REVIEW_POLICY_PATH="$DIR/substitute-policy.yml" \
+  bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/out" 2>&1 || rc=$?
+if [ "$rc" = 0 ] || ! grep -q 'Codex clearance @ 2026-09-14T00:02:00Z is superseded: Codex request evidence could not be re-read' "$DIR/out"; then
+  cat "$DIR/out"; echo "FAIL #1598 codex-clearance-reread-fails rc=$rc"; exit 1
+fi
+PASS=$((PASS + 1))
+echo "PASS: #1598 codex-clearance-reread-fails"
 # With Codex disabled the substitute is the only gate-(c) path, and a newer
 # Codex request supersedes nothing: the checker must clear on the approval
 # rather than abort on comments it never read (#1599 round 2).
