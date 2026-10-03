@@ -5,9 +5,9 @@
 # the assert_grep/refute_grep SKIP-if-absent contract).
 #
 # The six defects span four YAML workflows and two shell scripts; the
-# workflow ones cannot be unit-executed without a full Actions runner, so
-# this suite asserts each fail-closed invariant is present in source. The
-# scripts' overall behavior stays covered by the existing execution suites
+# suite checks workflow structure and executes selected YAML-decoded shell
+# with local stubs; it does not emulate a full Actions runner. The scripts'
+# overall behavior stays covered by the existing execution suites
 # (test_merge_clearance_gate.sh, test_codex_review_check_resolution.sh,
 # test_codex_review_request_ack.sh).
 
@@ -255,130 +255,226 @@ refute_grep "D10: auto-clear no longer removes via the unattributable gh pr edit
 assert_grep "D10: the scheduled sweep re-verifies the label against live state, not the search index (#827)" \
   "$W/auto-clear-blocking-labels.yml" 'stale search-index hit'
 
-# Extract one named step, including its env bindings, without including a
-# sibling step's bindings. Run-block lines have deeper indentation.
-extract_step() {  # <workflow> <step name>
-  awk -v name="$2" '
-    index($0, "- name: " name) && !found {
-      found=1; match($0, /^[[:space:]]*/); step_indent=RLENGTH; print; next
-    }
-    found && /[^[:space:]]/ && !/^[[:space:]]*#/ {
-      match($0, /^[[:space:]]*/); if (RLENGTH <= step_indent) exit
-    }
-    found { print }
-  ' "$1"
+# Read direct YAML nodes, not active-looking text inside scalar values or
+# another step. Psych is Ruby's standard-library YAML parser (already used by
+# Hub CI); no objects are loaded and aliases/merge keys are unsupported here.
+# Write decoded scalar bytes directly to files: command substitution would
+# discard trailing newlines, and line-oriented extraction changes folded runs.
+extract_step_data() {  # <workflow> <job id> <exact step name> <output dir> [inputs]
+  if ! command -v ruby >/dev/null 2>&1; then
+    echo "workflow step extraction: Ruby/Psych is required for a present workflow" >&2
+    return 1
+  fi
+  ruby -rpsych - "$@" <<'RUBY'
+workflow, job_id, step_name, output, inputs = ARGV
+begin
+  def mapping(node, path)
+    raise "#{path} must be a direct mapping" unless node.is_a?(Psych::Nodes::Mapping)
+    raise "#{path} has an unsupported mapping tag" unless [nil, 'tag:yaml.org,2002:map'].include?(node.tag)
+    node.children.each_slice(2).each_with_object({}) do |(key, value), result|
+      raise "#{path} has a non-scalar key" unless key.is_a?(Psych::Nodes::Scalar)
+      raise "#{path} has an unsupported merge/tagged key" if key.value == '<<' || key.tag
+      raise "#{path} has duplicate key #{key.value}" if result.key?(key.value)
+      result[key.value] = value
+    end
+  end
+  def string(node, path)
+    raise "#{path} must be a direct string scalar" unless node.is_a?(Psych::Nodes::Scalar)
+    raise "#{path} has an unsupported scalar tag" unless [nil, 'tag:yaml.org,2002:str'].include?(node.tag)
+    if node.plain && !node.tag
+      scanner = Psych::ScalarScanner.new(Psych::ClassLoader::Restricted.new([], []))
+      raise "#{path} must be a string" unless scanner.tokenize(node.value).is_a?(String)
+    end
+    node.value
+  end
+  stream = Psych.parse_stream(File.read(workflow))
+  raise 'workflow must contain exactly one document' unless stream.children.length == 1
+  root = mapping(stream.children.first.root, 'workflow')
+  jobs = mapping(root['jobs'], 'jobs')
+  job = mapping(jobs[job_id], "jobs.#{job_id}")
+  steps = job['steps']
+  raise "jobs.#{job_id}.steps must be a direct sequence" unless steps.is_a?(Psych::Nodes::Sequence)
+  raise 'steps has an unsupported sequence tag' unless [nil, 'tag:yaml.org,2002:seq'].include?(steps.tag)
+  candidates = steps.children.map do |node|
+    step = mapping(node, "jobs.#{job_id}.steps entry")
+    step if step.key?('name') && string(step['name'], 'step.name') == step_name
+  end
+  candidates.compact!
+  raise "expected exactly one #{step_name.inspect} step in #{job_id}" unless candidates.length == 1
+  step = candidates.first
+  values = { 'step.sh' => string(step['run'], 'step.run') }
+  if inputs == 'inputs'
+    env = mapping(step['env'], 'step.env')
+    %w[INPUT_SINCE INPUT_UNTIL INPUT_DRY_RUN].each do |key|
+      values[key] = string(env[key], "step.env.#{key}")
+    end
+  end
+  values.each { |name, value| File.binwrite(File.join(output, name), value) }
+rescue StandardError => error
+  warn "workflow step extraction: #{error.message}"
+  exit 1
+end
+RUBY
 }
 
-# Extract the step's `run: |` body (dedented by its own indentation) so the
-# vectors below execute the shipped shell, without metadata or env YAML.
-extract_step_run() {  # <workflow> <step name>
-  extract_step "$1" "$2" | awk '
-    /^[[:space:]]*run: \|[[:space:]]*$/ { in_run=1; indent=-1; next }
-    in_run {
-      if ($0 ~ /[^[:space:]]/) {
-        match($0, /^[[:space:]]*/)
-        if (indent < 0) indent=RLENGTH
-        else if (RLENGTH < indent) exit
-      }
-      print (length($0) >= indent ? substr($0, indent + 1) : "")
-    }
-  '
+# Selection controls are self-contained, so consumers with either workflow
+# absent retain their source SKIPs while still checking the YAML boundary.
+YAML_FIXTURES="$(mktemp -d "${TMPDIR:-/tmp}/test465-yaml.XXXXXX")"
+if command -v ruby >/dev/null 2>&1; then
+  ruby - "$YAML_FIXTURES" <<'RUBY'
+dir = ARGV.fetch(0)
+prefix = "jobs:\n  rollup:\n    steps:\n"
+bindings = <<'YAML'
+        env:
+          INPUT_SINCE: ${{ github.event.inputs.since }}
+          INPUT_UNTIL: ${{ github.event.inputs.until }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+YAML
+step = "      - name: Run rollup\n" + bindings + "        run: |\n          printf '%s\\n' 'actual'\n"
+fixtures = {
+  'quoted-name' => step.sub('name: Run rollup', 'name: "Run rollup" # annotation'),
+  'near-match' => step.sub('Run rollup', 'Run rollup preparation') + "      - name: Run rollup\n        run: exit 0\n",
+  'working-directory-env' => step.sub(bindings, "        working-directory: |\n" + bindings.lines.map { |line| "  " + line }.join),
+  'scalar-env' => step.sub(bindings, "        env: |\n" + bindings.lines.drop(1).join),
+  'tagged-job' => step,
+  'tagged-env' => step.sub('env:', 'env: !custom'),
+  'tagged-steps' => step,
+  'duplicate-run' => step + "        run: exit 0\n",
+  'duplicate-env-input' => step.sub('        run:', "          INPUT_SINCE: forged\n        run:"),
+  'duplicate-name' => step.sub('        env:', "        name: Run rollup\n        env:"),
+  'ambiguous-step' => step + step,
+  'alias-run' => step.sub("        run: |\n          printf '%s\\n' 'actual'\n", "        run: *body\n"),
+  'merge-env' => step.sub('          INPUT_SINCE:', "          <<: *bindings\n          INPUT_SINCE:"),
+  'boolean-input' => step.sub('${{ github.event.inputs.since }}', 'true'),
+  'nested-quoted-input' => step.sub('          INPUT_SINCE: ${{ github.event.inputs.since }}', "          UNUSED: 'INPUT_SINCE: ${{ github.event.inputs.since }}'"),
+  'comment-input' => step.sub('          INPUT_SINCE:', '          # INPUT_SINCE:'),
+  'unnamed-sibling-env' => "      - name: Run rollup\n        run: exit 0\n      - id: decoy\n" + bindings + "        run: exit 0\n",
+  'scalar-run-decoy' => step.sub('        run:', "          UNUSED: |\n            run: |\n              exit 99\n        run:"),
+  'other-job' => step.sub('Run rollup', 'Unrelated') + "  decoy:\n    steps:\n" + step,
+  'folded-run' => "      - name: Run rollup\n" + bindings + "        run: >-\n          printf '%s'\n          'line\\slash'\n",
+  'quoted-run' => "      - name: Run rollup\n" + bindings + "        run: " + "printf '%s' 'quoted\\slash'\n".dump + "\n",
+  'literal-run' => "      - name: Run rollup\n" + bindings + "        run: |+\n          printf '%s' 'literal\\slash'\n\n",
+  'quoted-inputs' => step.gsub(/(INPUT_\w+: )(.+)/, '\\1"\\2" # annotation')
 }
+fixtures.each do |name, text|
+  yaml = prefix + text
+  yaml = yaml.sub('  rollup:', '  rollup: !custom') if name == 'tagged-job'
+  yaml = yaml.sub('    steps:', '    steps: !custom') if name == 'tagged-steps'
+  File.binwrite(File.join(dir, "#{name}.yml"), yaml)
+end
+File.binwrite(File.join(dir, 'since.expected'), '${{ github.event.inputs.since }}')
+File.binwrite(File.join(dir, 'actual.expected'), "printf '%s\\n' 'actual'\n")
+File.binwrite(File.join(dir, 'folded-run.expected'), "printf '%s' 'line\\slash'")
+File.binwrite(File.join(dir, 'quoted-run.expected'), "printf '%s' 'quoted\\slash'\n")
+File.binwrite(File.join(dir, 'literal-run.expected'), "printf '%s' 'literal\\slash'\n\n")
+RUBY
+  mkdir "$YAML_FIXTURES/out"
+  for _yaml_case in near-match working-directory-env scalar-env tagged-job tagged-env tagged-steps duplicate-run duplicate-env-input \
+      duplicate-name ambiguous-step alias-run merge-env boolean-input nested-quoted-input \
+      comment-input unnamed-sibling-env other-job; do
+    if extract_step_data "$YAML_FIXTURES/$_yaml_case.yml" rollup "Run rollup" "$YAML_FIXTURES/out" inputs \
+        >"$YAML_FIXTURES/diagnostic" 2>&1; then
+      fail "YAML selection: $_yaml_case supplied an ambiguous or absent direct property"
+    else
+      pass "YAML selection: $_yaml_case fails closed"
+    fi
+  done
+  for _yaml_case in quoted-name quoted-inputs scalar-run-decoy folded-run quoted-run literal-run; do
+    _yaml_expected=actual
+    case "$_yaml_case" in *-run) _yaml_expected="$_yaml_case";; esac
+    if extract_step_data "$YAML_FIXTURES/$_yaml_case.yml" rollup "Run rollup" "$YAML_FIXTURES/out" inputs \
+        && cmp -s "$YAML_FIXTURES/out/step.sh" "$YAML_FIXTURES/$_yaml_expected.expected" \
+        && cmp -s "$YAML_FIXTURES/out/INPUT_SINCE" "$YAML_FIXTURES/since.expected"; then
+      pass "YAML selection: $_yaml_case preserves decoded scalar bytes and direct bindings"
+    else
+      fail "YAML selection: $_yaml_case changed the selected run or binding"
+    fi
+  done
+else
+  fail "YAML selection: Ruby/Psych is required for structural controls"
+fi
+rm -rf "$YAML_FIXTURES"
 
 # D13: workflow_dispatch inputs reach the rollup shell only through env and
 # are validated, never spliced into the script text next to the reviewer PAT.
-refute_grep "D13: rollup does not interpolate dispatch inputs into run:" \
-  "$W/daily-feedback-rollup.yml" '"${{ github.event.inputs.'
 if [ -f "$W/daily-feedback-rollup.yml" ]; then
   D13="$(mktemp -d "${TMPDIR:-/tmp}/test465-d13.XXXXXX")"
   mkdir -p "$D13/scripts"
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" >"%s/args"\n' "$D13" >"$D13/scripts/daily-feedback-rollup.sh"
-  extract_step "$W/daily-feedback-rollup.yml" "Run rollup" >"$D13/step.yml"
-  # Require direct env entries: comments, quoted text or nested scalar content
-  # cannot supply a binding while the runtime fixture injects its own env.
-  for _d13_input in SINCE UNTIL DRY_RUN; do
-    _d13_field=$(printf '%s' "$_d13_input" | tr '[:upper:]' '[:lower:]')
-    printf -v _d13_binding 'INPUT_%s: ${{ github.event.inputs.%s }}' "$_d13_input" "$_d13_field"
-    if awk -v binding="$_d13_binding" '
-      !seen_env && /^[[:space:]]*env:[[:space:]]*(#.*)?$/ {
-        match($0, /^[[:space:]]*/); env_indent = RLENGTH
-        in_env = 1; seen_env = 1; next
-      }
-      in_env {
-        match($0, /^[[:space:]]*/); indent = RLENGTH
-        line = substr($0, indent + 1)
-        if (line ~ /^(#|$)/) next
-        if (indent <= env_indent) { in_env = 0; next }
-        if (!entry_indent) entry_indent = indent
-        if (indent == entry_indent) {
-          sub(/[[:space:]]+#.*$/, "", line); sub(/[[:space:]]*$/, "", line)
-          if (line == binding) found = 1
-        }
-      }
-      END { exit !found }
-    ' "$D13/step.yml"; then
-      pass "D13: rollup step passes the $_d13_field input through env"
+  if extract_step_data "$W/daily-feedback-rollup.yml" rollup "Run rollup" "$D13" inputs; then
+    refute_grep "D13: rollup does not interpolate dispatch inputs into run:" \
+      "$D13/step.sh" '"${{ github.event.inputs.'
+    # Comparing files keeps string bindings exact, including decoded newlines.
+    for _d13_input in SINCE UNTIL DRY_RUN; do
+      _d13_field=$(printf '%s' "$_d13_input" | tr '[:upper:]' '[:lower:]')
+      printf '${{ github.event.inputs.%s }}' "$_d13_field" >"$D13/expected"
+      if cmp -s "$D13/expected" "$D13/INPUT_$_d13_input"; then
+        pass "D13: rollup step passes the $_d13_field input through env"
+      else
+        fail "D13: rollup step passes the $_d13_field input through env (active string binding missing)"
+      fi
+    done
+    refute_grep "D13: extracted rollup shell does not interpolate dispatch inputs" \
+      "$D13/step.sh" '${{ github.event.inputs.'
+    run_rollup_step() {  # <since> <until> <dry_run>
+      rm -f "$D13/args" "$D13/pwned"
+      ( cd "$D13" && GH_TOKEN=fixture-token REPO=o/r INPUT_SINCE="$1" INPUT_UNTIL="$2" \
+          INPUT_DRY_RUN="$3" bash step.sh >/dev/null 2>&1 )
+    }
+    if run_rollup_step 2026-09-01 2026-09-02 true \
+       && [ "$(tr '\n' ' ' <"$D13/args")" = "--since 2026-09-01 --until 2026-09-02 --dry-run " ]; then
+      pass "D13 runtime: valid dates and dry_run reach the rollup as arguments"
     else
-      fail "D13: rollup step passes the $_d13_field input through env (active mapping missing)"
+      fail "D13 runtime: valid inputs did not reach the rollup ($(cat "$D13/args" 2>/dev/null))"
     fi
-  done
-  extract_step_run "$W/daily-feedback-rollup.yml" "Run rollup" >"$D13/step.sh"
-  refute_grep "D13: extracted rollup shell does not interpolate dispatch inputs" \
-    "$D13/step.sh" '${{ github.event.inputs.'
-  run_rollup_step() {  # <since> <until> <dry_run>
-    rm -f "$D13/args" "$D13/pwned"
-    ( cd "$D13" && GH_TOKEN=fixture-token REPO=o/r INPUT_SINCE="$1" INPUT_UNTIL="$2" \
-        INPUT_DRY_RUN="$3" bash step.sh >/dev/null 2>&1 )
-  }
-  if run_rollup_step 2026-09-01 2026-09-02 true \
-     && [ "$(tr '\n' ' ' <"$D13/args")" = "--since 2026-09-01 --until 2026-09-02 --dry-run " ]; then
-    pass "D13 runtime: valid dates and dry_run reach the rollup as arguments"
-  else
-    fail "D13 runtime: valid inputs did not reach the rollup ($(cat "$D13/args" 2>/dev/null))"
-  fi
-  if run_rollup_step 2026-09-01 2026-09-02 false \
-     && [ "$(tr '\n' ' ' <"$D13/args")" = "--since 2026-09-01 --until 2026-09-02 " ]; then
-    pass "D13 runtime: explicit dry_run=false preserves dates without --dry-run"
-  else
-    fail "D13 runtime: dry_run=false incorrectly changed the arguments"
-  fi
-  if ! run_rollup_step "2026-09-01\"; touch $D13/pwned; \"" "" "" \
-     && [ ! -e "$D13/pwned" ] && [ ! -e "$D13/args" ]; then
-    pass "D13 runtime: a shell-bearing since input is rejected before anything runs"
-  else
-    fail "D13 runtime: malformed since input was not rejected"
-  fi
-  if ! run_rollup_step "" "" "yes" && [ ! -e "$D13/args" ]; then
-    pass "D13 runtime: a non-boolean dry_run input is rejected"
-  else
-    fail "D13 runtime: non-boolean dry_run input was not rejected"
-  fi
-  while IFS='|' read -r label since until dry_run; do
-    if ! run_rollup_step "$since" "$until" "$dry_run" \
+    if run_rollup_step 2026-09-01 2026-09-02 false \
+       && [ "$(tr '\n' ' ' <"$D13/args")" = "--since 2026-09-01 --until 2026-09-02 " ]; then
+      pass "D13 runtime: explicit dry_run=false preserves dates without --dry-run"
+    else
+      fail "D13 runtime: dry_run=false incorrectly changed the arguments"
+    fi
+    if ! run_rollup_step "2026-09-01\"; touch $D13/pwned; \"" "" "" \
        && [ ! -e "$D13/pwned" ] && [ ! -e "$D13/args" ]; then
-      pass "D13 runtime: $label rejected before payload or rollup execution"
+      pass "D13 runtime: a shell-bearing since input is rejected before anything runs"
     else
-      fail "D13 runtime: $label was not rejected"
+      fail "D13 runtime: malformed since input was not rejected"
     fi
-  done <<'INPUTS'
+    if ! run_rollup_step "" "" "yes" && [ ! -e "$D13/args" ]; then
+      pass "D13 runtime: a non-boolean dry_run input is rejected"
+    else
+      fail "D13 runtime: non-boolean dry_run input was not rejected"
+    fi
+    while IFS='|' read -r label since until dry_run; do
+      if ! run_rollup_step "$since" "$until" "$dry_run" \
+         && [ ! -e "$D13/pwned" ] && [ ! -e "$D13/args" ]; then
+        pass "D13 runtime: $label rejected before payload or rollup execution"
+      else
+        fail "D13 runtime: $label was not rejected"
+      fi
+    done <<'INPUTS'
 since command substitution|$(touch pwned)||
 until command substitution||$(touch pwned)|false
 until backticks||`touch pwned`|
 dry_run command substitution|||$(touch pwned)
 invalid date shape|2026-1-1||
 INPUTS
-  if ! run_rollup_step $'2026-09-01\ntouch pwned' "" "" \
-     && [ ! -e "$D13/pwned" ] && [ ! -e "$D13/args" ]; then
-    pass "D13 runtime: a multiline since input is rejected before anything runs"
+    if ! run_rollup_step $'2026-09-01\ntouch pwned' "" "" \
+       && [ ! -e "$D13/pwned" ] && [ ! -e "$D13/args" ]; then
+      pass "D13 runtime: a multiline since input is rejected before anything runs"
+    else
+      fail "D13 runtime: multiline since input was not rejected"
+    fi
+    if run_rollup_step "" "" "" && [ -e "$D13/args" ] && [ -z "$(tr -d '\n' <"$D13/args")" ]; then
+      pass "D13 runtime: scheduled run (no inputs) calls the rollup with no arguments"
+    else
+      fail "D13 runtime: empty inputs did not produce a bare rollup call"
+    fi
   else
-    fail "D13 runtime: multiline since input was not rejected"
-  fi
-  if run_rollup_step "" "" "" && [ -e "$D13/args" ] && [ -z "$(tr -d '\n' <"$D13/args")" ]; then
-    pass "D13 runtime: scheduled run (no inputs) calls the rollup with no arguments"
-  else
-    fail "D13 runtime: empty inputs did not produce a bare rollup call"
+    fail "D13: cannot structurally extract the rollup step and its direct env/run"
   fi
   rm -rf "$D13"
+else
+  echo "SKIP: D13 rollup workflow absent"; SKIP=$((SKIP + 1))
 fi
 
 # D14: the CodeRabbit severity sweep's open-PR listing survives a transient
@@ -395,21 +491,24 @@ printf '%s\n' 11 12
 SHIM
   printf '#!/usr/bin/env bash\nexit 0\n' >"$D14/bin/sleep"
   chmod +x "$D14/bin/gh" "$D14/bin/sleep"
-  extract_step_run "$W/coderabbit-severity-gate.yml" "Find open PRs" >"$D14/step.sh"
-  run_find_step() {  # <fails>
-    rm -f "$D14/count"; : >"$D14/out"
-    ( PATH="$D14/bin:$PATH" D14_COUNT="$D14/count" D14_FAILS="$1" EVENT_NAME=schedule \
-        REPO=o/r GITHUB_OUTPUT="$D14/out" bash "$D14/step.sh" >/dev/null 2>&1 )
-  }
-  if run_find_step 2 && [ "$(cat "$D14/count")" = 3 ] && grep -qx 12 "$D14/out"; then
-    pass "D14 runtime: open-PR listing retries two transient failures"
+  if extract_step_data "$W/coderabbit-severity-gate.yml" scheduled-sweep "Find open PRs" "$D14"; then
+    run_find_step() {  # <fails>
+      rm -f "$D14/count"; : >"$D14/out"
+      ( PATH="$D14/bin:$PATH" D14_COUNT="$D14/count" D14_FAILS="$1" EVENT_NAME=schedule \
+          REPO=o/r GITHUB_OUTPUT="$D14/out" bash "$D14/step.sh" >/dev/null 2>&1 )
+    }
+    if run_find_step 2 && [ "$(cat "$D14/count")" = 3 ] && grep -qx 12 "$D14/out"; then
+      pass "D14 runtime: open-PR listing retries two transient failures"
+    else
+      fail "D14 runtime: open-PR listing did not recover from two transient failures"
+    fi
+    if ! run_find_step 3 && [ "$(cat "$D14/count")" = 3 ]; then
+      pass "D14 runtime: open-PR listing fails after three attempts"
+    else
+      fail "D14 runtime: open-PR listing must fail after exactly three attempts"
+    fi
   else
-    fail "D14 runtime: open-PR listing did not recover from two transient failures"
-  fi
-  if ! run_find_step 3 && [ "$(cat "$D14/count")" = 3 ]; then
-    pass "D14 runtime: open-PR listing fails after three attempts"
-  else
-    fail "D14 runtime: open-PR listing must fail after exactly three attempts"
+    fail "D14: cannot structurally extract the scheduled-sweep run"
   fi
   rm -rf "$D14"
 fi
