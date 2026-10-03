@@ -60,10 +60,10 @@ class LogTests(unittest.TestCase):
         self.assertEqual(self.api, [])
 
     def test_signed_destination_allowlist_rejects_authority_escapes_before_download(self):
-        for location in [None, "", "http://productionresultssa19.blob.core.windows.net/a", 
+        for location in [None, "", "http://productionresultssa19.blob.core.windows.net/a",
                          "https://evil.example/a", LOCATION.replace(".net", ".net.evil.example"),
                          LOCATION.replace("https://", "https://user@"), LOCATION.replace(".net", ".net:443"),
-                         LOCATION + "#fragment", LOCATION + "\n", "https://[invalid", 
+                         LOCATION + "#fragment", LOCATION + "\n", "https://[invalid",
                          "https://127.0.0.1/a", "https://productionresultssa.blob.core.windows.net/a"]:
             client = self.client(location=location)
             with self.subTest(location=location), self.assertRaises(ClientError) as caught:
@@ -96,7 +96,7 @@ class LogTests(unittest.TestCase):
 
     def test_shared_throttle_and_reserve_prevent_log_dispatch(self):
         for headers, expected in [({"Retry-After": "60"}, "upstream_backoff"),
-                ({"X-RateLimit-Limit": "5000", "X-RateLimit-Remaining": "99", 
+                ({"X-RateLimit-Limit": "5000", "X-RateLimit-Remaining": "99",
                   "X-RateLimit-Reset": str(int(time.time()) + 300)}, "primary_reserve")]:
             client = self.client(status=403 if "Retry-After" in headers else 302, headers=headers)
             try:
