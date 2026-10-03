@@ -285,21 +285,78 @@ jq '.process_started_at="different process start"' "$WORK/live.json" > "$WORK/re
 [ "$(p4b_heartbeat_status "$WORK/reused.json")" = crashed ] && pass 'reused PID is not the original process instance' || fail 'PID reuse'
 jq '.process_started_at=null' "$WORK/live.json" > "$WORK/unknown.json"
 [ "$(p4b_heartbeat_status "$WORK/unknown.json")" = unknown ] && pass 'missing process identity remains unknown' || fail 'unknown identity'
+# A representable but absent process remains a genuine crash control.
+jq '.pid=2147483647' "$WORK/live.json" > "$WORK/dead.json"
+[ "$(p4b_heartbeat_status "$WORK/dead.json")" = crashed ] \
+  && pass 'absent bounded PID remains crashed' || fail 'absent PID identity'
 # Retention prunes old completed evidence while retaining live/unknown records.
 cp "$WORK/approve-good/heartbeats/"*.json "$WORK/helper/p4b-old.json"
 cp "$WORK/live.json" "$WORK/helper/p4b-live.json"
 cp "$WORK/reused.json" "$WORK/helper/p4b-reused.json"
+cp "$WORK/dead.json" "$WORK/helper/p4b-dead.json"
 cp "$WORK/unknown.json" "$WORK/helper/p4b-unknown.json"
 # Corrupted/incompatible process identity must not become a confident crash,
 # which would allow retention to erase the evidence. Exercise every non-string
 # JSON type and empty text against the same genuinely live process control.
-IDENTITY_CASES=('number:123' 'true:true' 'false:false' 'array:[]' 'object:{}' 'null:null' 'empty:""')
+IDENTITY_CASES=('number:123' 'true:true' 'false:false' 'array:[]' 'object:{}' 'null:null' 'empty:""' 'missing:missing')
 for identity_case in "${IDENTITY_CASES[@]}"; do
   identity_label=${identity_case%%:*}; identity_json=${identity_case#*:}
   identity_record="$WORK/helper/p4b-invalid-$identity_label.json"
-  jq --argjson value "$identity_json" '.process_started_at=$value' "$WORK/live.json" > "$identity_record"
+  if [ "$identity_label" = missing ]; then
+    jq 'del(.process_started_at)' "$WORK/live.json" > "$identity_record"
+  else
+    jq --argjson value "$identity_json" '.process_started_at=$value' "$WORK/live.json" > "$identity_record"
+  fi
   [ "$(p4b_heartbeat_status "$identity_record")" = unknown ] \
     && pass "$identity_label process identity remains unknown" || fail "$identity_label process identity"
+  jq '.stage="done"' "$identity_record" > "$WORK/helper/p4b-terminal-start-$identity_label.json"
+  terminal_status=unknown
+  [ "$identity_label" != null ] || terminal_status='done'
+  [ "$(p4b_heartbeat_status "$WORK/helper/p4b-terminal-start-$identity_label.json")" = "$terminal_status" ] \
+    && pass "done/$identity_label process identity is $terminal_status" || fail "done/$identity_label process identity"
+done
+# A completed observation can legitimately lack ps start evidence. Its valid
+# nullable identity is classified without consulting the process probe.
+(
+  ps() { : > "$WORK/terminal-ps-probe"; return 2; }
+  [ "$(p4b_heartbeat_status "$WORK/helper/p4b-terminal-start-null.json")" = 'done' ] \
+    && [ ! -e "$WORK/terminal-ps-probe" ]
+) && pass 'done with explicit null start needs no ps probe' || fail 'done/null process probe'
+# Numeric shape alone does not prove ps can parse a PID. Keep invalid and
+# oversized values unknown rather than treating ps argument failure as death.
+PID_CASES=('oversize:2147483648' 'huge:1e20' 'scientific:1e50' 'bool:true'
+  'fraction:1.5' 'zero:0' 'negative:-1' 'string:"123"' 'null:null'
+  'array:[]' 'object:{}' 'missing:missing')
+for pid_case in "${PID_CASES[@]}"; do
+  pid_label=${pid_case%%:*}; pid_json=${pid_case#*:}
+  pid_record="$WORK/helper/p4b-invalid-pid-$pid_label.json"
+  if [ "$pid_label" = missing ]; then
+    jq 'del(.pid)' "$WORK/live.json" > "$pid_record"
+  else
+    jq --argjson value "$pid_json" '.pid=$value' "$WORK/live.json" > "$pid_record"
+  fi
+  [ "$(p4b_heartbeat_status "$pid_record")" = unknown ] \
+    && pass "$pid_label PID remains unknown" || fail "$pid_label PID identity"
+  jq '.stage="done"' "$pid_record" > "$WORK/helper/p4b-terminal-pid-$pid_label.json"
+  [ "$(p4b_heartbeat_status "$WORK/helper/p4b-terminal-pid-$pid_label.json")" = unknown ] \
+    && pass "done/$pid_label PID remains unknown" || fail "done/$pid_label PID identity"
+done
+# The reader consumes one observation object; an empty/compound/non-object
+# file or invalid schema/stage cannot establish terminal process evidence.
+READER_CASES=(empty multiple array null scalar schema stage)
+for reader_case in "${READER_CASES[@]}"; do
+  reader_record="$WORK/helper/p4b-invalid-reader-$reader_case.json"
+  case "$reader_case" in
+    empty) : > "$reader_record" ;;
+    multiple) cat "$WORK/live.json" "$WORK/live.json" > "$reader_record" ;;
+    array) printf '[]\n' > "$reader_record" ;;
+    null) printf 'null\n' > "$reader_record" ;;
+    scalar) printf '42\n' > "$reader_record" ;;
+    schema) jq '.schema={}' "$WORK/live.json" > "$reader_record" ;;
+    stage) jq '.stage=[]' "$WORK/live.json" > "$reader_record" ;;
+  esac
+  [ "$(p4b_heartbeat_status "$reader_record")" = unknown ] \
+    && pass "$reader_case observation remains unknown" || fail "$reader_case reader identity"
 done
 touch -t 200001010000 "$WORK/helper/"*.json
 # Invalid retention cannot unexpectedly erase old evidence.
@@ -309,13 +366,31 @@ P4B_HEARTBEAT_RETENTION_DAYS=0; p4b_heartbeat_prune
 # Read by the sourced heartbeat helper.
 # shellcheck disable=SC2034
 P4B_HEARTBEAT_RETENTION_DAYS=7; p4b_heartbeat_prune
-[ ! -e "$WORK/helper/p4b-old.json" ] && [ ! -e "$WORK/helper/p4b-reused.json" ] \
+[ ! -e "$WORK/helper/p4b-old.json" ] && [ ! -e "$WORK/helper/p4b-reused.json" ] && [ ! -e "$WORK/helper/p4b-dead.json" ] \
   && [ -e "$WORK/helper/p4b-live.json" ] && [ -e "$WORK/helper/p4b-unknown.json" ] \
   && pass 'retention removes old done/crashed but preserves live/unknown evidence' || fail 'retention'
 for identity_case in "${IDENTITY_CASES[@]}"; do
   identity_label=${identity_case%%:*}
   [ -e "$WORK/helper/p4b-invalid-$identity_label.json" ] \
     && pass "retention preserves $identity_label process identity" || fail "retention removed $identity_label process identity"
+  if [ "$identity_label" = null ]; then
+    [ ! -e "$WORK/helper/p4b-terminal-start-null.json" ] \
+      && pass 'retention prunes valid done with explicit null start' || fail 'done/null retention'
+  else
+    [ -e "$WORK/helper/p4b-terminal-start-$identity_label.json" ] \
+      && pass "retention preserves done/$identity_label process identity" || fail "retention removed done/$identity_label identity"
+  fi
+done
+for pid_case in "${PID_CASES[@]}"; do
+  pid_label=${pid_case%%:*}
+  [ -e "$WORK/helper/p4b-invalid-pid-$pid_label.json" ] \
+    && pass "retention preserves $pid_label PID" || fail "retention removed $pid_label PID"
+  [ -e "$WORK/helper/p4b-terminal-pid-$pid_label.json" ] \
+    && pass "retention preserves done/$pid_label PID" || fail "retention removed done/$pid_label PID"
+done
+for reader_case in "${READER_CASES[@]}"; do
+  [ -e "$WORK/helper/p4b-invalid-reader-$reader_case.json" ] \
+    && pass "retention preserves $reader_case observation" || fail "retention removed $reader_case observation"
 done
 
 printf 'Heartbeat: %s passed, %s failed\n' "$PASS" "$FAIL"

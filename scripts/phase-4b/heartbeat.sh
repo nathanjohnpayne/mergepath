@@ -61,12 +61,18 @@ p4b_heartbeat_write() {
 # ps absence/indeterminate evidence is unknown, never a confident live/crashed.
 p4b_heartbeat_status() {
   local record="$1" stage pid expected observed rc=0
-  stage="$(jq -er 'select(.schema == "p4b-heartbeat/v1") | .stage |
+  stage="$(jq -ser 'select(length == 1) | .[0] |
+    select(type == "object" and .schema == "p4b-heartbeat/v1") |
+    select(has("process_started_at")) |
+    select(.process_started_at == null or (.process_started_at | type == "string" and length > 0)) | .stage |
     select(. == "barrier" or . == "adapter" or . == "posting" or . == "done")' "$record" 2>/dev/null)" \
     || { printf 'unknown\n'; return 0; }
-  [ "$stage" != 'done' ] || { printf 'done\n'; return 0; }
-  pid="$(jq -er '.pid | select(type == "number" and . > 0 and . == floor)' "$record" 2>/dev/null)" \
+  # ps accepts positive decimal pid_t values, not jq's scientific notation
+  # for oversized numbers. Use the portable signed 32-bit bound before ps.
+  pid="$(jq -er '.pid | select(type == "number" and . > 0 and . <= 2147483647 and . == floor)' "$record" 2>/dev/null)" \
     || { printf 'unknown\n'; return 0; }
+  case "$pid" in ''|*[!0-9]*) printf 'unknown\n'; return 0 ;; esac
+  [ "$stage" != 'done' ] || { printf 'done\n'; return 0; }
   command -v ps >/dev/null 2>&1 || { printf 'unknown\n'; return 0; }
   expected="$(jq -er '.process_started_at | select(type == "string" and length > 0)' "$record" 2>/dev/null)" \
     || { printf 'unknown\n'; return 0; }
