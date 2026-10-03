@@ -41,6 +41,13 @@ def receipts(head=HEAD, used=0, **overrides):
     return {key: {'head': head, 'data': value, 'observed_at': 1000, 'stale': False, 'error': None} for key, value in values.items()}
 
 
+def required_check(identity, started, *, conclusion='SUCCESS', app='actions-app', slug='github-actions', workflow='lint-workflow'):
+    return {'__typename':'CheckRun','id':identity,'name':'Required lint','isRequired':True,
+            'status':'COMPLETED','conclusion':conclusion,'detailsUrl':'https://github.com/owner/hub/checks/'+identity,
+            'startedAt':started,'checkSuite':{'app':{'id':app,'slug':slug},
+                'workflowRun':{'workflow':{'id':workflow}} if workflow is not None else None}}
+
+
 class Client:
     next_cursor = staticmethod(GitHubClient.next_cursor)
     def __init__(self):
@@ -116,6 +123,64 @@ class PRTests(unittest.TestCase):
             item=raw();item['mergeStateStatus']=merge; self.assertEqual(build_row(REPO,item,None)['label'],label)
         row=build_row(REPO,raw(isDraft=True),receipts(used=10));self.assertEqual(row['label'],'Budget spent')
         self.assertTrue(row['hazards']);self.assertTrue(row['hazards'][0]['id'].startswith('prs-'))
+
+    def test_expected_legacy_required_context_is_running(self):
+        item=raw();contexts=item['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts']
+        contexts['nodes']=[{'__typename':'StatusContext','id':'expected','context':'Legacy lint','state':'EXPECTED','isRequired':True}]
+        row=build_row(REPO,item)
+        self.assertEqual(row['checks'][0]['state'],'running');self.assertEqual(row['label'],'In progress')
+        self.assertEqual(row['reason'],'Legacy lint in progress')
+        contexts['nodes'][0]['isRequired']=False
+        row=build_row(REPO,item);self.assertEqual(row['checks'],[]);self.assertEqual(row['label'],'Waiting')
+
+    def test_required_check_attempts_collapse_only_known_same_producer_latest(self):
+        older=required_check('old','2026-10-03T01:00:00Z',conclusion='FAILURE')
+        newer=required_check('new','2026-10-03T02:00:00Z')
+        cases=[([older,newer],['new']),([newer,older],['new']),
+               ([older,{**newer,'status':'IN_PROGRESS','conclusion':None}],['new']),
+               ([newer,{**older,'startedAt':'2026-10-03T03:00:00Z'}],['old']),
+               ([older,{**newer,'conclusion':'NEUTRAL'}],['new']),
+               ([older,{**newer,'conclusion':'SKIPPED'}],['new']),
+               ([older,required_check('peer','2026-10-03T02:00:00Z',app='peer-app')],['old','peer']),
+               ([older,required_check('peer','2026-10-03T02:00:00Z',workflow='peer-workflow')],['old','peer']),
+               ([older,{**newer,'startedAt':None}],['old','new']),
+               ([older,{**newer,'startedAt':'invalid'}],['old','new']),
+               ([older,{**newer,'startedAt':older['startedAt']}],['old','new']),
+               ([older,{**newer,'checkSuite':None}],['old','new']),
+               ([older,required_check('unknown','2026-10-03T02:00:00Z',workflow=None)],['old','unknown']),
+               ([older,{**newer,'name':'another job'}],['old','new'])]
+        for nodes,expected in cases:
+            with self.subTest(expected=expected,nodes=nodes):
+                item=raw();item['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts']['nodes']=nodes
+                checks=build_row(REPO,item)['checks'];self.assertEqual([c['id'] for c in checks],expected)
+                self.assertTrue(all(c['url'].endswith(c['id']) for c in checks))
+        first=required_check('vendor-old',older['startedAt'],app='vendor',slug='vendor',workflow=None,conclusion='FAILURE')
+        last=required_check('vendor-new',newer['startedAt'],app='vendor',slug='vendor',workflow=None)
+        item=raw();item['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts']['nodes']=[first,last]
+        self.assertEqual([c['id'] for c in build_row(REPO,item)['checks']],['vendor-new'])
+
+    def test_required_checks_never_supersede_legacy_surface_or_optional_evidence(self):
+        old=required_check('old','2026-10-03T01:00:00Z',conclusion='FAILURE')
+        optional={**required_check('new','2026-10-03T02:00:00Z'),'isRequired':False}
+        legacy={'__typename':'StatusContext','id':'legacy','context':old['name'],'state':'SUCCESS','isRequired':True}
+        item=raw();item['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts']['nodes']=[old,optional,legacy]
+        checks=build_row(REPO,item)['checks'];self.assertEqual([c['id'] for c in checks],['old','legacy'])
+        self.assertEqual(checks[0]['state'],'boulder')
+
+    def test_required_attempt_projection_and_supersession_span_paginated_contexts(self):
+        client=Client();old=required_check('old','2026-10-03T01:00:00Z',conclusion='FAILURE')
+        new=required_check('new','2026-10-03T02:00:00Z')
+        client.rows[0]['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts']=connection([old],'next')
+        client.check_page=[new]
+        row=PRProvider(client,[Repository('hub',REPO)],ROOT,helper=Helpers())(time.monotonic()+5).data['repositories'][0]['rows'][0]
+        self.assertEqual([c['id'] for c in row['checks']],['new']);self.assertEqual(row['checks'][0]['state'],'clear')
+        self.assertTrue(row['checks_known'])
+        documents=[call[0] for call in client.calls]
+        self.assertEqual(len(documents),3)
+        for query in documents:
+            self.assertIn('startedAt',query);self.assertIn('app { id slug }',query)
+            self.assertIn('workflowRun { workflow { id } }',query)
+        for query in documents[1:]:self.assertIn('isRequired(pullRequestNumber:',query)
 
     def test_same_head_cadence_and_activity_refresh_head_invalidation(self):
         client,helper=Client(),Helpers(); clock=[0]
