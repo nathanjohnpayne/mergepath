@@ -171,19 +171,26 @@ def _current_required_contexts(contexts):
     return [node for index, node in enumerate(required) if index in selected]
 
 
-def commits_since_review(reviews, comments, commits, head):
+def commits_since_review(reviews, comments, commits, head, *, trusted_reviewers=(), bot_login="coderabbitai[bot]"):
     """Count identities after the reviewed commit, never commit author/committer timestamps."""
+    if (type(trusted_reviewers) not in (list, tuple) or any(type(login) is not str or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", login) for login in trusted_reviewers)
+            or type(bot_login) is not str or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*(?:\[bot\])?", bot_login)):
+        raise ClientError("source_failed")
+    resume_authors = {"nathanjohnpayne", *trusted_reviewers}
+    command = "@" + bot_login.removesuffix("[bot]") + " resume"
     events = [(epoch(item.get("submitted_at")), item.get("commit_id")) for item in reviews
-              if (item.get("user") or {}).get("login") == "coderabbitai[bot]" and item.get("body")]
+              if (item.get("user") or {}).get("login") == bot_login and item.get("body")]
     # A resume comment has no commit anchor; if it is newest, the exact count is unavailable.
     events += [(epoch(item.get("created_at")), None) for item in comments
-               if (item.get("user") or {}).get("login") == "nathanjohnpayne"
-               and (item.get("body") or "").strip() == "@coderabbitai resume"]
+               if (item.get("user") or {}).get("login") in resume_authors
+               and (item.get("body") or "").partition("\n")[0] == command]
     if not events or any(date is None for date, _ in events):
         raise ClientError("source_failed")
     newest = max(date for date, _ in events)
     anchors = {anchor for date, anchor in events if date == newest}
-    if len(anchors) != 1 or None in anchors:
+    if None in anchors:
+        return None  # Successfully observed resume; do not retain an obsolete numeric count.
+    if len(anchors) != 1:
         raise ClientError("source_failed")
     anchor = anchors.pop()
     identities = [item.get("sha") for item in commits]
@@ -438,10 +445,11 @@ author=$(printf '%s' "$ledger" | jq -r '.author')
 stops=$(crl_human_stops "$ledger" "$head" "$author" "$max" "$ceiling")
 metadata=$(gh api "repos/$repo/pulls/$pr")
 [ "$(printf '%s' "$metadata" | jq -ce '{head:.head.sha,base:.base.sha,ref:.base.ref,repository:.base.repo.id}')" = "$tuple" ]
-printf '%s' "$ledger" | jq --arg policy_yaml "$(cat "$p")" --arg base "$base" --argjson tuple "$tuple" --argjson stops "$stops" --argjson ceiling "$ceiling" '{policy_yaml:$policy_yaml,base_sha:$base,tuple:$tuple,summary:.summary, limits:{max_blocking_reviews:.max_blocking_reviews,max_review_rounds:$ceiling},human_stops:$stops.stops,outstanding:.summary.outcomes.no_response_yet,in_flight_on_head:(if .current_summary.status == "running" and (.current_summary.commit as $commit | .head_sha | startswith($commit // "impossible")) then true else null end),url:(if .current_summary.comment_id then "https://github.com/" + .repo + "/pull/" + (.pr|tostring) + "#issuecomment-" + (.current_summary.comment_id|tostring) elif (.requests|length)>0 then "https://github.com/" + .repo + "/pull/" + (.pr|tostring) + "#issuecomment-" + (.requests[-1].id|tostring) else null end)}'
+printf '%s' "$ledger" | jq --argjson policy "$policy" --arg policy_yaml "$(cat "$p")" --arg base "$base" --argjson tuple "$tuple" --argjson stops "$stops" --argjson ceiling "$ceiling" '{policy_yaml:$policy_yaml,commit_context:{reviewers:($policy.available_reviewers // []),bot_login:($policy.coderabbit.bot_login // "coderabbitai[bot]")},base_sha:$base,tuple:$tuple,summary:.summary, limits:{max_blocking_reviews:.max_blocking_reviews,max_review_rounds:$ceiling},human_stops:$stops.stops,outstanding:.summary.outcomes.no_response_yet,in_flight_on_head:(if .current_summary.status == "running" and (.current_summary.commit as $commit | .head_sha | startswith($commit // "impossible")) then true else null end),url:(if .current_summary.comment_id then "https://github.com/" + .repo + "/pull/" + (.pr|tostring) + "#issuecomment-" + (.current_summary.comment_id|tostring) elif (.requests|length)>0 then "https://github.com/" + .repo + "/pull/" + (.pr|tostring) + "#issuecomment-" + (.requests[-1].id|tostring) else null end)}'
 '''
         result = {}
         target_policy = None
+        commit_context = None
         calls = {"ledger": (["bash", "-c", command, "cockpit-pr-ledger", script, repo, number, head], (0,)),
                  "feedback": ([str(self.root / "scripts/review-feedback-accounting.sh"), number, repo], (0, 1)),
                  "coderabbit": ([str(self.root / "scripts/coderabbit-wait.sh"), "--probe", number, repo], (0, 2, 4, 5, 6, 7))}
@@ -462,6 +470,7 @@ printf '%s' "$ledger" | jq --arg policy_yaml "$(cat "$p")" --arg base "$base" --
                     raise ClientError("source_failed")
                 if source == "ledger":
                     target_policy = data.pop("policy_yaml", None)
+                    commit_context = data.pop("commit_context", None)
                 if source == "coderabbit" and data.get("head_sha") != head:
                     raise ClientError("source_failed")
                 result[source] = {"data": data, "error": None}
@@ -472,7 +481,10 @@ printf '%s' "$ledger" | jq --arg policy_yaml "$(cat "$p")" --arg base "$base" --
             reviews = self.client.pages(f"/repos/{repo}/pulls/{number}/reviews?per_page=100", deadline=deadline)
             comments = self.client.pages(f"/repos/{repo}/issues/{number}/comments?per_page=100", deadline=deadline)
             commits = self.client.pages(f"/repos/{repo}/pulls/{number}/commits?per_page=100", deadline=deadline)
-            result["commits"] = {"data": {"used": commits_since_review(reviews, comments, commits, head)}, "error": None}
+            if type(commit_context) is not dict:
+                raise ClientError("source_failed")
+            result["commits"] = {"data": {"used": commits_since_review(reviews, comments, commits, head,
+                trusted_reviewers=commit_context.get("reviewers"), bot_login=commit_context.get("bot_login"))}, "error": None}
         except HELPER_FAILURES as error:
             result.setdefault("commits", helper_failure(error))
         try:

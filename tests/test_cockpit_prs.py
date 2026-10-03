@@ -1,4 +1,4 @@
-"""Hermetic #1587 provider/bridge regression fixtures. Expected <10s; bound60s."""
+"""Hermetic #1587 provider/bridge regression fixtures. Expected <20s; bound60s."""
 import base64
 import copy
 import json
@@ -175,9 +175,102 @@ class PRTests(unittest.TestCase):
         current=copy.deepcopy(review);current['commit_id']=HEAD
         self.assertEqual(commits_since_review([current],[],commits,HEAD),0)
         resumed={'user':{'login':'nathanjohnpayne'},'body':'@coderabbitai resume','created_at':'2026-10-03T02:00:00Z'}
-        with self.assertRaises(ClientError):commits_since_review([review],[resumed],commits,HEAD)
+        self.assertIsNone(commits_since_review([review],[resumed],commits,HEAD))
         with self.assertRaises(ClientError):commits_since_review([review],[],commits[1:],HEAD)
         with self.assertRaises(ClientError):commits_since_review([review],[],commits,'c'*40)
+
+    def test_supported_reviewer_resumes_withdraw_old_commit_anchor(self):
+        previous='b'*40
+        review={'user':{'login':'coderabbitai[bot]'},'body':'Completed review','commit_id':previous,'submitted_at':'2026-10-03T01:00:00Z'}
+        commits=[{'sha':previous},{'sha':HEAD}]
+        class Reads:
+            def get(self,path,*,deadline):return {'head':{'sha':HEAD},'base':{'sha':previous,'ref':'main','repo':{'id':1}}}
+            def pages(self,path,*,deadline):
+                if '/reviews?' in path:return [review]
+                if '/comments?' in path:return self.comments
+                return commits
+        class Reader(HelperReader):
+            def _api(self,*args):return 'reviews: {}'
+            def _run(self,args,*rest,**kwargs):
+                if 'cockpit-pr-ledger' in args:return {'policy_yaml':'codex: {}','base_sha':previous,
+                    'tuple':{'head':HEAD,'base':previous,'ref':'main','repository':1},
+                    'commit_context':{'reviewers':['consumer-reviewer'],'bot_login':'coderabbitai[bot]'}}
+                if 'coderabbit-wait.sh' in args[0]:return {'head_sha':HEAD}
+                raise ClientError('source_failed')
+        for login,body,unknown in [('consumer-reviewer','@coderabbitai resume',True),
+                ('consumer-reviewer','@coderabbitai resume\n\n<!-- mergepath-p4b-resume: fixture -->',True),
+                ('nathanjohnpayne','@coderabbitai resume\n\n<!-- mergepath-p4b-resume: fixture -->',True),
+                ('nathanpayne-codex','@coderabbitai resume',False),
+                ('untrusted','@coderabbitai resume',False),
+                ('consumer-reviewer','@coderabbitai resumed something',False),
+                ('consumer-reviewer','Quoted command\n@coderabbitai resume',False)]:
+            with self.subTest(login=login,body=body):
+                client=Reads();client.comments=[{'user':{'login':login},'body':body,'created_at':'2026-10-03T02:00:00Z'}]
+                result=Reader(client,ROOT).read(REPO,'1',HEAD,time.monotonic()+5)
+                if unknown:self.assertIsNone(result['commits']['data']['used'])
+                else:self.assertEqual(result['commits']['data']['used'],1)
+                self.assertNotIn('commit_context',result['ledger']['data'])
+
+    def test_actual_target_policy_controls_resume_authors_and_bot(self):
+        previous='b'*40
+        policy=(ROOT/'.github/review-policy.yml').read_text().replace('  - nathanpayne-claude','  - consumer-reviewer').replace('  - nathanpayne-cursor\n','').replace('  - nathanpayne-codex\n','').replace('coderabbitai[bot]','consumer-rabbit[bot]')
+        review={'user':{'login':'consumer-rabbit[bot]'},'body':'Completed review','commit_id':previous,'submitted_at':'2026-10-03T01:00:00Z'}
+        class Reads:
+            def get(self,path,*,deadline):
+                if 'contents/' in path:return {'encoding':'base64','content':base64.b64encode(policy.encode()).decode()}
+                if '/commits/' in path:return {'sha':HEAD,'commit':{'committer':{'date':'2026-10-03T00:00:00Z'}}}
+                return {'number':1,'head':{'sha':HEAD,'repo':{'id':1}},'base':{'sha':previous,'ref':'main','repo':{'id':1,'default_branch':'main'}},'draft':False}
+            def pages(self,path,*,deadline):
+                if '/reviews?' in path:return [review]
+                if '/comments?' in path:return self.comments
+                return [{'sha':previous},{'sha':HEAD}]
+        class Reader(HelperReader):
+            def _run(self,args,*rest,**kwargs):
+                if 'cockpit-pr-ledger' in args:return super()._run(args,*rest,**kwargs)
+                if 'coderabbit-wait.sh' in args[0]:return {'head_sha':HEAD}
+                raise ClientError('source_failed')
+        for login,body,unknown in [('consumer-reviewer','@consumer-rabbit resume\n\n<!-- mergepath-p4b-resume: fixture -->',True),
+                                 ('nathanpayne-codex','@consumer-rabbit resume',False),
+                                 ('consumer-reviewer','@coderabbitai resume',False)]:
+            with self.subTest(login=login,body=body):
+                client=Reads();client.comments=[{'id':7,'user':{'login':login},'body':body,'created_at':'2026-10-03T02:00:00Z'}]
+                result=Reader(client,ROOT).read('owner/consumer','1',HEAD,time.monotonic()+15)
+                self.assertIsNotNone(result['ledger']['data'],result)
+                if unknown:self.assertIsNone(result['commits']['data']['used'])
+                else:self.assertEqual(result['commits']['data']['used'],1)
+
+    def test_later_trusted_review_restores_commit_identity_count_after_resume(self):
+        previous='b'*40;middle='c'*40
+        early={'user':{'login':'coderabbitai[bot]'},'body':'Completed review','commit_id':previous,'submitted_at':'2026-10-03T01:00:00Z'}
+        late={**early,'commit_id':middle,'submitted_at':'2026-10-03T03:00:00Z'}
+        resume={'user':{'login':'consumer-reviewer'},'body':'@coderabbitai resume\n\n<!-- mergepath-p4b-resume: fixture -->','created_at':'2026-10-03T02:00:00Z'}
+        commits=[{'sha':previous},{'sha':middle},{'sha':HEAD}]
+        self.assertIsNone(commits_since_review([early],[resume],commits,HEAD,trusted_reviewers=['consumer-reviewer']))
+        self.assertEqual(commits_since_review([early,late],[resume],commits,HEAD,trusted_reviewers=['consumer-reviewer']),1)
+        self.assertIsNone(commits_since_review([early,{**late,'body':''}],[resume],commits,HEAD,trusted_reviewers=['consumer-reviewer']))
+
+    def test_observed_resume_replaces_cached_numeric_commit_hazard_with_unknown(self):
+        commits=[{'sha':letter*40} for letter in 'bcdef']+[{'sha':HEAD}]
+        review={'user':{'login':'coderabbitai[bot]'},'body':'Completed review','commit_id':commits[0]['sha'],'submitted_at':'2026-10-03T01:00:00Z'}
+        comments=[];reviews=[review];clock=[0]
+        class Helper(Helpers):
+            def read(self,repo,number,head,deadline):
+                result=super().read(repo,number,head,deadline)
+                result['commits']={'data':{'used':commits_since_review(reviews,comments,commits,head,trusted_reviewers=['consumer-reviewer'])},'error':None}
+                return result
+        provider=PRProvider(Client(),[Repository('hub',REPO)],ROOT,helper=Helper(),monotonic=lambda:clock[0],clock=lambda:1000+clock[0])
+        first=provider(100).data['repositories'][0]['rows'][0]
+        self.assertEqual(first['budgets'][4]['used'],5);self.assertEqual(first['budgets'][4]['state'],'boulder')
+        comments.append({'user':{'login':'consumer-reviewer'},'body':'@coderabbitai resume\n\n<!-- mergepath-p4b-resume: fixture -->','created_at':'2026-10-03T02:00:00Z'})
+        clock[0]=120
+        resumed=provider(200).data['repositories'][0]['rows'][0]
+        self.assertIsNone(resumed['budgets'][4]['used']);self.assertEqual(resumed['budgets'][4]['state'],'idle')
+        self.assertFalse(resumed['stale']);self.assertFalse(resumed['budgets'][4]['stale'])
+        self.assertEqual(resumed['budgets'][4]['observed_at'],1120)
+        self.assertFalse(any(hazard['id'].endswith(':commits') for hazard in resumed['hazards']))
+        reviews.append({**review,'commit_id':commits[-2]['sha'],'submitted_at':'2026-10-03T03:00:00Z'});clock[0]=240
+        restored=provider(300).data['repositories'][0]['rows'][0]
+        self.assertEqual(restored['budgets'][4]['used'],1);self.assertEqual(restored['budgets'][4]['state'],'clear')
 
     def test_required_running_gate_labels_and_clean_fact(self):
         row=build_row(REPO,raw(),receipts(),observed_at=1000)
