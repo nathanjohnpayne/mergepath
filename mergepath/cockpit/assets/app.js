@@ -31,7 +31,9 @@
         if (!envelope || C.epoch(envelope.observed_at) === null || envelope.data === null || envelope.data === undefined) continue;
         try {
           const projected = adapter.project(envelope, selectedRepo, now);
-          if (!projected || !C.STATES.includes(projected.state) || typeof projected.label !== "string") throw new Error("invalid_projection");
+          if (!projected || !C.STATES.includes(projected.state) || typeof projected.label !== "string"
+              || (projected.coverageValid !== undefined && typeof projected.coverageValid !== "boolean")
+              || (projected.hasObservations !== undefined && typeof projected.hasObservations !== "boolean")) throw new Error("invalid_projection");
           const normalized = C.normalizeHazards(projected.hazards, repositories);
           diagnostics.push(...normalized.diagnostics.map(text => `${id}: ${text}`));
           const ownedSource = normalized.hazards.filter(hazard => hazard.source === id);
@@ -41,9 +43,11 @@
           const missingHazard = ["bump", "boulder"].includes(projected.state) && owned.length === 0;
           if (missingHazard) diagnostics.push(`${id}: A blocking projection has no usable owned hazard.`);
           const visible = C.filterHazards(owned, selectedRepo).map(hazard => ({...hazard, stale: hazard.stale || envelope.stale === true}));
+          const validationValid = normalized.diagnostics.length === 0 && owned.length === normalized.hazards.length && !missingHazard;
           models[id] = {...projected, hazards: visible, count: C.count(projected.count), observed: true,
-            stale: envelope.stale === true, observed_at: envelope.observed_at,
-            coverageValid: normalized.diagnostics.length === 0 && owned.length === normalized.hazards.length && !missingHazard};
+            hasObservations: projected.hasObservations !== false,
+            stale: envelope.stale === true || projected.stale === true, observed_at: envelope.observed_at,
+            validationValid, coverageValid: validationValid && projected.coverageValid !== false};
           if (id === "budget") {
             models[id].horizon = null;
             if (projected.horizon !== undefined && projected.horizon !== null) {
@@ -61,15 +65,19 @@
       for (const hazard of hazards) {
         if (identities.has(hazard.id)) {
           models[identities.get(hazard.id)].coverageValid = false;
+          models[identities.get(hazard.id)].validationValid = false;
           models[hazard.source].coverageValid = false;
+          models[hazard.source].validationValid = false;
         } else identities.set(hazard.id, hazard.source);
       }
       const observedModels = Object.values(models).filter(model => model.observed);
+      const coverageModels = observedModels.filter(model => model.hasObservations);
       return {models, hazards: normalized.hazards, diagnostics: [...diagnostics, ...normalized.diagnostics],
-        observed: observedModels.length > 0, observedPanels: observedModels.length,
-        freshPanels: observedModels.filter(model => !model.stale && model.coverageValid).length,
-        stalePanels: observedModels.filter(model => model.stale).length,
-        invalidPanels: observedModels.filter(model => !model.coverageValid).length};
+        observed: coverageModels.length > 0, observedPanels: coverageModels.length,
+        freshPanels: coverageModels.filter(model => !model.stale && model.coverageValid).length,
+        stalePanels: coverageModels.filter(model => model.stale).length,
+        partialPanels: coverageModels.filter(model => model.validationValid && !model.coverageValid).length,
+        invalidPanels: observedModels.filter(model => !model.validationValid).length};
     }
     counts(snapshot, now) {
       const adapter = this.adapters.get("prs"), envelope = adapter ? snapshot.sources[adapter.source] : null;
@@ -258,11 +266,12 @@
       const horizon = projection.models.budget.horizon;
       const freshPanels = stale ? 0 : projection.freshPanels, stalePanels = stale ? projection.observedPanels : projection.stalePanels;
       const model = road.update(hazards, {now, horizonMinutes: horizon ? (horizon.cycleEnd - now) / 60 : null, horizonLabel: horizon?.label,
-        observed: freshPanels > 0, staleCoverage: stalePanels > 0, invalidCoverage: projection.invalidPanels > 0});
+        observed: freshPanels > 0, staleCoverage: stalePanels > 0, invalidCoverage: projection.invalidPanels > 0, partialCoverage: projection.partialPanels > 0});
       const boulders = hazards.filter(hazard => hazard.state === "boulder").length, bumps = hazards.length - boulders;
-      $("road-summary").textContent = hazards.length ? `${boulders} boulders · ${bumps} speed bumps` : model.observed ? "Clear for fresh observed sources" : model.invalidCoverage ? "Observations unavailable" : model.staleCoverage ? "Observations stale" : "No observations yet";
+      $("road-summary").textContent = hazards.length ? `${boulders} boulders · ${bumps} speed bumps` : model.observed ? "Clear for fresh observed sources" : model.invalidCoverage ? "Observations unavailable" : model.staleCoverage ? "Observations stale" : model.partialCoverage ? "Observations incomplete" : "No observations yet";
       const invalidText = projection.invalidPanels ? ` · ${projection.invalidPanels} ${projection.invalidPanels === 1 ? "source" : "sources"} reporting invalid data` : "";
-      $("coverage").textContent = `${freshPanels} of 6 panel sources fresh · ${stalePanels} stale${invalidText}${stale && snapshot ? " · stream stale" : ""}. ${model.horizonLabel}. Account and connection evidence is shared.`;
+      const partialText = projection.partialPanels ? ` · ${projection.partialPanels} incomplete` : "";
+      $("coverage").textContent = `${freshPanels} of 6 panel sources fresh · ${stalePanels} stale${partialText}${invalidText}${stale && snapshot ? " · stream stale" : ""}. ${model.horizonLabel}. Account and connection evidence is shared.`;
       let diagnostic = $("adapter-diagnostics");
       if (!diagnostic) {diagnostic = C.element("p", "adapter-diagnostic"); diagnostic.id = "adapter-diagnostics"; $("road-view").append(diagnostic);}
       diagnostic.textContent = [...projection.diagnostics, ...valid.diagnostics].join(" "); diagnostic.hidden = !diagnostic.textContent;
