@@ -328,6 +328,89 @@ class ActionsTests(unittest.TestCase):
         self.assertEqual(retained['observed_at'], reused['observed_at'])
         self.assertEqual(len(calls), before)
 
+    def test_shared_ci_publication_after_fetch_clock_retains_jam(self):
+        from mergepath.cockpit.__main__ import shared_ci_snapshot
+        from mergepath.cockpit.ci import CIProvider
+        from mergepath.cockpit.inventory import Repository
+        from mergepath.cockpit.server import Application
+        current, interleave, reads = [NOW], [False], []
+        def transport(method, url, headers, body, timeout):
+            reads.append(url)
+            self.assertIn('/settings/billing/', url)  # No duplicate Actions poll.
+            return Response(200, {}, b'{"usageItems":[]}')
+        inventory = (Repository('mergepath', REPO, True),)
+        client = GitHubClient('synthetic-integration-token', transport=transport, clock=lambda: current[0])
+        app = Application(inventory, client, clock=lambda: current[0])
+        self.addCleanup(app.close)
+        ci = CIProvider(client, inventory, clock=lambda: current[0])
+        rows = [{'id': str(i), 'repo': REPO, 'created_at': NOW - 30, 'status': 'queued',
+                 'conclusion': None, 'checks': []} for i in range(1, 41)]
+        # Only remote acquisition is replaced. Real CIProvider stamps times;
+        # real scheduler publication and Application snapshot copying are used.
+        ci._repo = lambda repo, deadline: (rows, [])
+        app.scheduler.register('ci', ci, hot_interval=1, idle_interval=1, timeout=5)
+        app.register_panel('ci', 'ci')
+        original_snapshot = app.panel_snapshot
+        def publish_ci():
+            app.scheduler.refresh('ci'); app.scheduler.tick()
+            bound = time.monotonic() + 2
+            while time.monotonic() < bound:
+                envelope = original_snapshot('ci')['envelope']
+                if not envelope['in_flight'] and envelope['observed_at'] == current[0]:
+                    return
+                time.sleep(.001)
+            self.fail('bounded CI publication did not complete')
+        def snapshot(panel):
+            if interleave[0]:
+                interleave[0] = False
+                current[0] += .01
+                publish_ci()  # After fetch-clock capture, before snapshot copy.
+            return original_snapshot(panel)
+        app.panel_snapshot = snapshot
+        actions = ActionsProvider(client, inventory, clock=lambda: current[0],
+            ci_snapshot=lambda repo, now: shared_ci_snapshot(app, repo, now))
+        def fetch():
+            return actions.fetch(time.monotonic() + 5).data['repositories'][0]
+        for offset in range(0, 1861, 60):
+            current[0] = NOW + offset
+            publish_ci(); proven = fetch()
+        self.assertTrue(proven['jammed'])
+        interleave[0] = True
+        raced = fetch()
+        self.assertTrue(raced['available']); self.assertFalse(raced['stale'])
+        self.assertEqual(raced['observed_at'], current[0])
+        self.assertGreater(raced['observed_at'], proven['observed_at'])
+        self.assertTrue(raced['jammed']); self.assertEqual(raced['jam_since'], proven['jam_since'])
+        # Reusing the same receipt preserves proof but cannot age the interval.
+        current[0] += 1
+        repeated = fetch()
+        self.assertTrue(repeated['jammed']); self.assertEqual(repeated['observed_at'], raced['observed_at'])
+        self.assertEqual(actions._jam[REPO]['last'], raced['observed_at'])
+        publish_ci(); following = fetch()
+        self.assertTrue(following['jammed']); self.assertEqual(following['jam_since'], proven['jam_since'])
+        self.assertTrue(all('/settings/billing/' in url for url in reads))
+
+    def test_shared_ci_postcopy_clock_preserves_strict_refusals(self):
+        from mergepath.cockpit.__main__ import shared_ci_snapshot
+        for case, observed, stale, coverage in [('future', NOW + .01, False, 86400),
+                ('expired', NOW - 121, False, 86400), ('stale', NOW, True, 86400),
+                ('incomplete', NOW, False, 300)]:
+            with self.subTest(case=case):
+                envelope = {'stale': False, 'data': {'schema': 'ci/v1', 'recent_seconds': coverage,
+                    'repositories': [{'repo': REPO, 'stale': stale, 'observed_at': observed}], 'runs': []}}
+                app = SimpleNamespace(clock=lambda: NOW, panel_snapshot=lambda panel: {'envelope': envelope})
+                self.assertIsNone(shared_ci_snapshot(app, REPO, NOW - 1))
+                actions = self.provider(ci_snapshot=lambda repo, now: shared_ci_snapshot(app, repo, now))
+                row = actions.fetch(30).data['repositories'][0]
+                self.assertFalse(row['available']); self.assertEqual(row['error'], 'source_failed')
+                self.assertTrue(all('/settings/billing/' in path for path, _ in actions.client.calls))
+        # The provider's independent second guard must also refuse genuinely
+        # future or expired normalized callbacks, rather than clamping their time.
+        for observed in (NOW + .01, NOW - 121):
+            actions = self.provider(ci_snapshot=lambda repo, now: {'complete': True, 'stale': False,
+                'observed_at': observed, 'queued': [], 'running': [], 'hour': []})
+            self.assertFalse(actions.fetch(30).data['repositories'][0]['available'])
+
     def test_cycle_configuration_must_match_api_period(self):
         now=dt.datetime.fromtimestamp(NOW,dt.timezone.utc)
         start=now.replace(day=1,hour=0,minute=0,second=0).timestamp();end=(now.replace(day=28)+dt.timedelta(days=4)).replace(day=1,hour=0,minute=0,second=0).timestamp()
