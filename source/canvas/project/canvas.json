@@ -1,0 +1,60 @@
+{
+  "v": 3,
+  "attachments": {},
+  "boards": {
+    "Main.dc.html": {
+      "expand": "fill",
+      "h": 4064,
+      "is_interactive": true,
+      "title": "Cockpit — interactive prototype",
+      "w": 1400,
+      "x": 0,
+      "y": 0
+    },
+    "StatusLanguage.dc.html": {
+      "h": 1620,
+      "title": "Status language — light and dark",
+      "w": 1400,
+      "x": 1480,
+      "y": 0
+    }
+  },
+  "createdOnFiles": {
+    "at": "2026-10-02T19:40:00Z",
+    "v": 1
+  },
+  "designSystems": [],
+  "launch": {
+    "view": "canvas"
+  },
+  "notes": {
+    "s1": {
+      "fill": "teal",
+      "text": "Prototype controls (dashed strip under the header) are not part of the product: cycle the four scenarios, simulate a merge, flip the theme and reduced motion. Click a CI run to drill into jobs and steps. Click Sync or Sync all to walk the preview, confirm, streamed run.",
+      "w": 520,
+      "x": 0,
+      "y": 4144
+    },
+    "s2": {
+      "fill": "orange",
+      "text": "One status language for every section: shape plus label plus color. Idle, Running, Clear, Speed bump, Boulder, Done. Meters carry their denominator; the fill stripes at 70% and caps with the boulder glyph at 100%.",
+      "w": 520,
+      "x": 1480,
+      "y": 1700
+    },
+    "t1": {
+      "kind": "title1",
+      "maxW": 2880,
+      "text": "Mergepath Cockpit — operator console for in-progress reviews",
+      "w": 240,
+      "x": 0,
+      "y": -300
+    }
+  },
+  "order": [
+    "Main.dc.html",
+    "StatusLanguage.dc.html"
+  ],
+  "pages": [],
+  "title": "Mergepath Cockpit"
+}

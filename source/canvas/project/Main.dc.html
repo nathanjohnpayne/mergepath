@@ -1,0 +1,1110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Mergepath Cockpit</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:ital,wght@0,400..700;1,400&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+.ck{
+ --page:#f4efe5;--page-deep:#ece3d3;--panel:rgba(255,252,246,.9);--panel-strong:#fffdf9;--inset:rgba(255,255,255,.6);
+ --ink:#1b2426;--muted:#565d58;--soft:#656b63;
+ --line:rgba(67,79,77,.16);--line-strong:rgba(43,68,63,.3);
+ --accent:#1f6257;--accent-soft:rgba(31,98,87,.12);
+ --clear:#1f6257;--clear-ink:#1f6257;--clear-soft:rgba(31,98,87,.13);
+ --run:#2c5282;--run-ink:#2c5282;--run-soft:rgba(44,82,130,.13);
+ --bump:#a0661f;--bump-ink:#7a4d12;--bump-soft:rgba(183,119,48,.18);
+ --boulder:#7b2d26;--boulder-ink:#7b2d26;--boulder-soft:rgba(123,45,38,.13);
+ --idle:#8a8f87;--idle-ink:#5d655f;--idle-soft:rgba(93,101,95,.12);
+ --done:#1b2426;--done-ink:#1b2426;--done-soft:rgba(27,36,38,.1);--glyph-ink:#fff;
+ --shadow:0 20px 50px rgba(36,43,45,.08);
+ --t-fast:160ms;--t-med:360ms;--t-slow:700ms;--t-pop:900ms;--t-glow:2600ms;--ease:cubic-bezier(.2,.8,.2,1);--loop:running;
+ --sans:"Instrument Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;--mono:"JetBrains Mono","SFMono-Regular",Menlo,Consolas,monospace;
+ font-family:var(--sans);font-size:14px;line-height:1.5;color:var(--ink);
+ background:radial-gradient(circle at 85% 0%,rgba(31,98,87,.08),transparent 30%),linear-gradient(180deg,var(--page),var(--page-deep));
+ min-height:100vh;-webkit-font-smoothing:antialiased;color-scheme:light}
+.ck.dark{color-scheme:dark;--page:#13191a;--page-deep:#0d1213;--panel:rgba(30,38,39,.88);--panel-strong:#202a2b;--inset:rgba(255,255,255,.04);
+ --ink:#ece6da;--muted:#b9b4a9;--soft:#a09c93;--line:rgba(236,230,218,.12);--line-strong:rgba(236,230,218,.26);
+ --accent:#6cc4b0;--accent-soft:rgba(108,196,176,.14);
+ --clear:#2a8273;--clear-ink:#7fd1bd;--clear-soft:rgba(108,196,176,.16);
+ --run:#3d6ea8;--run-ink:#93bbea;--run-soft:rgba(141,181,232,.16);
+ --bump:#b5772a;--bump-ink:#e8b86e;--bump-soft:rgba(224,167,90,.17);
+ --boulder:#9a3d33;--boulder-ink:#f2a393;--boulder-soft:rgba(240,160,144,.15);
+ --idle:#6f766f;--idle-ink:#aab0a8;--idle-soft:rgba(167,173,165,.12);
+ --done:#ece6da;--done-ink:#ece6da;--done-soft:rgba(236,230,218,.1);--glyph-ink:#13191a;
+ --shadow:0 20px 50px rgba(0,0,0,.35);
+ background:radial-gradient(circle at 85% 0%,rgba(108,196,176,.08),transparent 30%),linear-gradient(180deg,var(--page),var(--page-deep))}
+.ck.rm{--t-fast:0ms;--t-med:0ms;--t-slow:0ms;--t-pop:0ms;--t-glow:0ms;--loop:paused}
+@media (prefers-reduced-motion:reduce){ .ck{--t-fast:0ms;--t-med:0ms;--t-slow:0ms;--t-pop:0ms;--t-glow:0ms;--loop:paused} }
+.ck *{box-sizing:border-box}
+.ck button{font:inherit;cursor:pointer;color:inherit}
+.ck button:focus-visible,.ck a:focus-visible,.ck input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.ck a{color:var(--accent)}
+.ck .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.ck .soft{color:var(--soft)}
+.ck .sub{display:block;color:var(--soft);font-size:11px;line-height:1.4}
+.wrap{max-width:1400px;margin:0 auto;padding:20px 24px 56px}
+.top{display:flex;flex-wrap:wrap;justify-content:space-between;gap:20px 32px;padding:26px 30px;border-radius:26px;background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow);backdrop-filter:blur(16px)}
+.eyebrow{margin:0 0 6px;color:var(--accent);text-transform:uppercase;letter-spacing:.2em;font-size:11px;font-weight:700;font-family:var(--mono)}
+.top h1{margin:0;font-size:clamp(1.5rem,2.4vw,2rem);line-height:1.15;letter-spacing:-.02em;font-weight:600;max-width:640px;text-wrap:balance}
+.lede{max-width:640px;margin:10px 0 0;color:var(--muted);font-size:14px}
+.top-r{display:flex;flex-wrap:wrap;gap:10px;align-content:flex-start;align-items:stretch}
+.chip{display:flex;flex-direction:column;gap:2px;min-width:150px;padding:10px 14px;border-radius:14px;border:1px solid var(--line);background:var(--inset);font-size:12px}
+.chip .lbl{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--soft);font-weight:700}
+.chip .sub{font-size:10.5px}
+.conn{flex-direction:row;align-items:center;gap:8px;flex-wrap:wrap}
+.conn .dot{width:10px;height:10px;border-radius:50%;background:var(--clear);animation:breathe 2.4s ease-in-out infinite;animation-play-state:var(--loop)}
+.conn.c-bump .dot{background:transparent;border:2px dashed var(--bump);animation:spin 1.6s linear infinite;animation-play-state:var(--loop)}
+.conn.c-boulder .dot{background:var(--boulder);animation:none}
+.conn .lbl{color:var(--ink);font-weight:600;letter-spacing:0;text-transform:none;font-size:12.5px}
+.mini{position:relative;height:6px;border-radius:999px;background:var(--idle-soft);overflow:hidden;min-width:80px;flex:1}
+.mini-fill{position:absolute;left:0;top:0;bottom:0;border-radius:999px;background:var(--clear);transition:width var(--t-slow) var(--ease),background-color var(--t-med) ease}
+:is(.m-fill,.mini-fill).t-run{background-color:var(--run)}:is(.m-fill,.mini-fill).t-clear{background-color:var(--clear)}:is(.m-fill,.mini-fill).t-bump{background-color:var(--bump)}:is(.m-fill,.mini-fill).t-boulder{background-color:var(--boulder)}:is(.m-fill,.mini-fill).t-idle{background-color:var(--idle)}
+.demo{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:16px 0 0;padding:10px 14px;border:1px dashed var(--line-strong);border-radius:16px;font-size:12px}
+.demo-lbl{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--soft);margin-right:6px}
+.seg{display:inline-flex;flex-wrap:wrap;border:1px solid var(--line-strong);border-radius:999px;overflow:hidden;background:var(--inset)}
+.seg-b{display:inline-flex;align-items:center;gap:7px;padding:7px 13px;border:0;background:transparent;font-size:12.5px;font-weight:500;transition:background var(--t-fast) ease,color var(--t-fast) ease}
+.seg-b.on{background:var(--ink);color:var(--page)}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:7px 14px;border-radius:999px;border:1px solid var(--line-strong);background:var(--inset);font-size:12.5px;font-weight:500;transition:transform var(--t-fast) ease,border-color var(--t-fast) ease,background var(--t-fast) ease}
+.btn:hover{border-color:var(--accent);color:var(--accent);transform:translateY(-1px)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{color:#fff;filter:brightness(1.08)}
+.ck.dark .btn.primary,.ck.dark .btn.primary:hover{color:#0e1314}
+.btn:disabled{opacity:.45;cursor:not-allowed;transform:none}
+.btn.sm{padding:5px 11px;font-size:12px}
+.panel{margin-top:18px;padding:22px 24px;border-radius:22px;background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow);backdrop-filter:blur(12px);min-width:0}
+.sec-head{display:flex;flex-wrap:wrap;justify-content:space-between;gap:10px 20px;align-items:flex-end;margin-bottom:14px}
+.sec-head h2{margin:0;font-size:17px;font-weight:600;letter-spacing:-.01em}
+.sec-meta{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;color:var(--soft);font-size:11.5px;font-family:var(--mono)}
+.poll{display:inline-flex;align-items:center;gap:6px}
+.ring{width:16px;height:16px;transform:rotate(-90deg)}
+.ring-bg{fill:none;stroke:var(--idle-soft);stroke-width:3}
+.ring-fg{fill:none;stroke:var(--accent);stroke-width:3;stroke-dasharray:44;stroke-dashoffset:44;animation:poll 15s linear infinite;animation-play-state:var(--loop)}
+.ring.r20 .ring-fg{animation-duration:20s}.ring.r5 .ring-fg{animation-duration:5s}
+.row2{display:flex;flex-wrap:wrap;gap:18px;align-items:flex-start}
+.stack{display:grid;gap:18px}
+.grow{flex:999 1 560px;min-width:0}
+.side{flex:1 1 380px;min-width:0}
+.g{position:relative;display:inline-block;width:1em;height:1em;font-size:12px;flex:none;vertical-align:-.15em;transition:background-color var(--t-med) ease,border-color var(--t-med) ease}
+.g.lg{font-size:18px}.g.xl{font-size:30px}
+.g-idle,.g-queued,.g-skipped,.g-todo{border:.17em solid var(--idle);border-radius:50%}
+.g-run,.g-cur{border:.17em dashed var(--run);border-radius:50%;animation:spin 1.6s linear infinite;animation-play-state:var(--loop)}
+.g-clear,.g-ok{background:var(--clear);border-radius:50%}
+.g-clear::after,.g-ok::after,.g-done::after{content:"";position:absolute;left:.3em;top:.12em;width:.28em;height:.52em;border:solid #fff;border-width:0 .17em .17em 0;transform:rotate(45deg)}
+.g-done{background:var(--done);border-radius:50%}.g-done::after{border-color:var(--glyph-ink)}
+.g-bump{background:var(--bump);clip-path:ellipse(50% 100% at 50% 100%)}
+.g-boulder{background:var(--boulder);clip-path:polygon(30% 0,70% 0,100% 30%,100% 70%,70% 100%,30% 100%,0 70%,0 30%)}
+.g-boulder::after{content:"";position:absolute;left:.25em;right:.25em;top:.42em;height:.17em;background:#fff}
+.g-fail{background:var(--boulder);border-radius:.25em}
+.g-fail::before,.g-fail::after{content:"";position:absolute;left:.2em;right:.2em;top:.42em;height:.16em;background:#fff;transform:rotate(45deg)}
+.g-fail::after{transform:rotate(-45deg)}
+.b{display:inline-flex;align-items:center;gap:6px;padding:3px 9px 3px 7px;border-radius:999px;font-family:var(--mono);font-size:11px;font-weight:500;white-space:nowrap;line-height:1.5;transition:background-color var(--t-med) ease,color var(--t-med) ease}
+.b-clear,.b-ok{background:var(--clear-soft);color:var(--clear-ink)}
+.b-run{background:var(--run-soft);color:var(--run-ink)}
+.b-bump{background:var(--bump-soft);color:var(--bump-ink)}
+.b-boulder,.b-fail{background:var(--boulder-soft);color:var(--boulder-ink);animation:throb 2.6s ease-in-out infinite;animation-play-state:var(--loop)}
+.b-idle,.b-queued,.b-skipped{background:var(--idle-soft);color:var(--idle-ink)}
+.b-done{background:var(--done-soft);color:var(--done-ink)}
+.ink-clear{color:var(--clear-ink)}.ink-run{color:var(--run-ink)}.ink-bump{color:var(--bump-ink);font-weight:600}.ink-boulder{color:var(--boulder-ink);font-weight:600}.ink-idle{color:var(--idle-ink)}
+.pips,.pips10{display:inline-flex;gap:3px;align-items:center;flex-wrap:wrap}
+.pip{display:inline-block;width:8px;height:8px;border-radius:2px;background:var(--idle-soft);box-shadow:inset 0 0 0 1px var(--line);transition:background-color var(--t-med) ease}
+.pips10 .pip{width:7px;height:11px}
+.pip-ok,.pip-used{background:var(--clear);box-shadow:none}.pip-run,.pip-cur{background:var(--run);box-shadow:none;animation:blink 1.2s ease-in-out infinite;animation-play-state:var(--loop)}.pip-fail{background:var(--boulder);box-shadow:none}.pip-skipped{background:var(--idle);box-shadow:none}
+.pip-bump{background:var(--bump);box-shadow:none}.pip-boulder{background:var(--boulder);box-shadow:none}
+.m{display:grid;gap:5px}
+.m-top{display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-size:12.5px}
+.m-val{font-family:var(--mono);font-variant-numeric:tabular-nums;font-weight:600}
+.m-den{color:var(--soft);font-size:11px;text-align:right}
+.m-track{position:relative;height:10px;border-radius:999px;background:var(--idle-soft);box-shadow:inset 0 0 0 1px var(--line)}
+.m-fill{position:absolute;left:0;top:0;bottom:0;border-radius:999px;background-color:var(--clear);transition:width var(--t-slow) var(--ease),background-color var(--t-med) ease}
+.m-fill.t-bump{background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.3) 0 5px,transparent 5px 10px);background-size:14px 14px;animation:rumble 1s linear infinite;animation-play-state:var(--loop)}
+.m-fill.t-boulder{background-image:none}
+.m-tick{position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--line-strong);transform:translateX(-1px)}
+.m-tick.proj{background:var(--bump-ink)}
+.m-tick-l.end{transform:translateX(-100%)}
+.m-tick-l{position:absolute;top:14px;transform:translateX(-50%);font-family:var(--mono);font-size:10px;color:var(--soft);white-space:nowrap}
+.m-cap{position:absolute;right:-7px;top:50%;transform:translateY(-50%);animation:land var(--t-pop) var(--ease) both}
+.m.t-boulder .m-track{box-shadow:inset 0 0 0 1.5px var(--boulder)}
+.m.t-bump .m-val{color:var(--bump-ink)}.m.t-boulder .m-val{color:var(--boulder-ink)}
+.m.has-l{margin-bottom:14px}
+.road .strip{position:relative;height:166px;margin:6px 0 12px}
+.road .line{position:absolute;left:0;right:0;top:116px;height:4px;border-radius:2px;background:linear-gradient(90deg,var(--accent) 0,var(--line-strong) 40%,var(--line) 100%)}
+.road .now{position:absolute;left:0;top:128px;font-family:var(--mono);font-size:10px;letter-spacing:.12em;font-weight:700;color:var(--accent)}
+.road .hz{position:absolute;top:128px;transform:translateX(-50%);font-family:var(--mono);font-size:10px;color:var(--soft);white-space:nowrap}
+.road .hz.end{transform:translateX(-100%)}
+.road .hz::before{content:"";position:absolute;left:50%;top:-10px;width:1px;height:6px;background:var(--line-strong)}
+.road .hz.end::before{left:auto;right:0}
+@media (max-width:600px){.road .hz-sub{display:none}}
+.mk{position:absolute;top:0;bottom:0;width:0;animation:slidein var(--t-slow) var(--ease) both}
+.mk .g.lg{position:absolute;left:-9px;top:109px;z-index:2;animation:land var(--t-pop) var(--ease) both}
+.mk-stem{position:absolute;left:-.5px;width:1px;background:var(--line-strong);z-index:0}
+.mk-lbl{position:absolute;z-index:1;display:inline-flex;align-items:center;gap:6px;height:20px;box-sizing:border-box;font-size:11px;line-height:1;white-space:nowrap;background:var(--panel-strong);border:1px solid var(--line);padding:0 7px;border-radius:999px}
+.mk-n{font-family:var(--mono);font-size:10px;font-weight:700}
+.mk-boulder .mk-n{color:var(--boulder-ink)}.mk-bump .mk-n{color:var(--bump-ink)}
+.mk-boulder .mk-lbl{border-color:var(--boulder-soft)}
+.road .more{position:absolute;right:0;top:148px;font-family:var(--mono);font-size:10px;color:var(--soft)}
+.road-clear{position:absolute;left:0;right:0;top:12px;display:flex;align-items:center;gap:10px;color:var(--clear-ink);font-weight:500}
+.road-list{list-style:none;margin:0;padding:0;display:grid;gap:6px}
+.ri{display:grid;grid-template-columns:auto auto auto minmax(0,1fr) auto auto;gap:10px;align-items:center;padding:8px 12px;border-radius:12px;border:1px solid var(--line);font-size:12.5px;transition:background-color var(--t-med) ease;animation:enter var(--t-med) var(--ease) both}
+.ri-boulder{background:var(--boulder-soft)}.ri-bump{background:var(--bump-soft)}
+.ri-n{font-family:var(--mono);font-size:10.5px;font-weight:700;color:var(--soft);min-width:1.4em;text-align:right}
+.ri-kind{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;font-weight:700}
+.ri-boulder .ri-kind{color:var(--boulder-ink)}.ri-bump .ri-kind{color:var(--bump-ink)}
+.ri-eta{color:var(--soft);font-size:11.5px;white-space:nowrap}
+.ri-src{font-size:11.5px;white-space:nowrap}
+@media (max-width:720px){.ri{grid-template-columns:auto auto minmax(0,1fr) auto;grid-template-areas:"n g k e" "t t t t" "s s s s";row-gap:4px}.ri-n{grid-area:n}.ri>.g{grid-area:g}.ri-kind{grid-area:k}.ri-text{grid-area:t}.ri-eta{grid-area:e}.ri-src{grid-area:s}}
+.filters{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+.chipb{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;border:1px solid var(--line-strong);background:var(--inset);font-size:12px;font-family:var(--mono);transition:background var(--t-fast) ease,color var(--t-fast) ease}
+.chipb.on{background:var(--ink);color:var(--page);border-color:var(--ink)}
+.chipb .cnt{font-size:10.5px;opacity:.75}
+.tbl-wrap{overflow-x:auto;margin:0 -8px;padding:0 8px}
+.tbl{display:grid;gap:0;font-size:13px;min-width:var(--minw)}
+.trow{display:grid;grid-template-columns:var(--cols);gap:10px;align-items:start;padding:12px 10px;border-bottom:1px solid var(--line);transition:background-color var(--t-med) ease;animation:enter var(--t-med) var(--ease) both;border-radius:10px}
+.trow.th{padding:6px 10px;border-bottom:1px solid var(--line-strong);border-radius:0;animation:none}
+.trow.th span{font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--soft);font-weight:700;white-space:nowrap}
+.tbl > .trow:last-child{border-bottom:0}
+.trow.tone-boulder{background:var(--boulder-soft)}
+.trow.tone-bump{background:var(--bump-soft)}
+.trow.merged{animation:rowglow var(--t-glow) ease-out both}
+.trow.fresh{animation:enter var(--t-slow) var(--ease) both}
+.trow.just{animation:rowglow var(--t-glow) ease-out both}
+.cell{min-width:0}
+.pr-link{display:block;color:inherit;text-decoration:none}
+.pr-link .ttl{display:block;font-weight:500}
+.pr-link:hover .ttl{color:var(--accent)}
+.ms{display:inline-block;font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:.04em}
+.ms-boulder{color:var(--boulder-ink)}.ms-bump{color:var(--bump-ink)}.ms-run{color:var(--run-ink)}.ms-clear{color:var(--clear-ink)}.ms-idle{color:var(--idle-ink)}.ms-done{color:var(--done-ink)}
+.why{display:block;font-size:12px;color:var(--muted)}
+.lab{display:inline-block;margin:0 4px 4px 0;padding:2px 8px;border-radius:6px;font-family:var(--mono);font-size:11px;border:1px solid var(--line-strong)}
+.lab-hold{background:var(--boulder);color:#fff;border-color:var(--boulder)}
+.lab-ext{background:var(--run-soft);color:var(--run-ink)}
+.bstrip{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px 10px}
+.bs{display:grid;grid-template-columns:34px minmax(0,1fr) auto;gap:5px;align-items:center}
+.bs-l{color:var(--soft);text-transform:uppercase;letter-spacing:.04em;font-family:var(--mono);font-size:9.5px}
+.bs .mini{min-width:0;height:5px}
+.bs.t-idle .mini{background:repeating-linear-gradient(90deg,var(--line-strong) 0 3px,transparent 3px 6px)}
+.bs-n{font-size:10.5px;white-space:nowrap}
+.mini-fill.t-bump{background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.3) 0 4px,transparent 4px 8px);background-size:11px 11px;animation:rumble 1s linear infinite;animation-play-state:var(--loop)}
+.bs-llm{font-size:10.5px;margin-top:5px}
+.bud-full{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(190px,100%),1fr));gap:8px;padding:8px 10px 12px;background:var(--inset);border-bottom:1px solid var(--line);animation:enter var(--t-med) var(--ease) both}
+.bcard{display:grid;gap:3px;padding:8px 10px;border-radius:10px;border:1px solid var(--line);background:var(--panel-strong);transition:background-color var(--t-med) ease,border-color var(--t-med) ease}
+.bcard.t-bump{background:var(--bump-soft)}.bcard.t-boulder{background:var(--boulder-soft);border-color:var(--boulder)}
+.bc-name{font-size:11px;color:var(--muted);line-height:1.3}
+.bc-head{font-size:15px;font-weight:600;letter-spacing:-.01em}
+.bcard .m-track{height:7px;margin-top:2px}
+.bcard .m-cap{right:-5px}
+.bcard .m-cap.g{font-size:14px}
+.cx-flags{display:flex;flex-wrap:wrap;gap:6px 10px;margin-top:5px;align-items:center}
+.flag{display:inline-flex;align-items:center;gap:5px;font-size:11px}
+.f-run{color:var(--run-ink)}.f-boulder{color:var(--boulder-ink);font-weight:600}
+.ribbon{position:relative;display:inline-flex;align-items:center;gap:6px;margin-top:6px;padding:3px 10px;border-radius:999px;background:var(--done);color:var(--page);font-family:var(--mono);font-size:11px;font-weight:600;animation:pop var(--t-pop) var(--ease) both}
+.ribbon::before{content:"";width:.5em;height:.5em;border-radius:50%;background:var(--clear-ink)}
+.ribbon .c{position:absolute;left:50%;top:50%;width:6px;height:6px;border-radius:50%;opacity:0;animation:conf var(--t-glow) ease-out both}
+.c1{background:var(--clear);--dx:-34px;--dy:-26px}.c2{background:var(--bump);--dx:30px;--dy:-30px}.c3{background:var(--run);--dx:-22px;--dy:24px}.c4{background:var(--accent);--dx:38px;--dy:14px}.c5{background:var(--bump);--dx:4px;--dy:-40px}
+.runs{display:grid;gap:8px}
+.run{border:1px solid var(--line);border-radius:14px;overflow:hidden;transition:background-color var(--t-med) ease,border-color var(--t-med) ease;animation:enter var(--t-med) var(--ease) both}
+.run.tone-boulder{background:var(--boulder-soft);border-color:var(--boulder)}
+.run.tone-bump{background:var(--bump-soft)}
+.run-head{display:grid;grid-template-columns:auto minmax(0,1.1fr) minmax(0,1.3fr) auto auto auto auto;gap:10px;align-items:center;width:100%;padding:10px 12px;border:0;background:transparent;text-align:left;font-size:12.5px}
+.run-head:hover{background:var(--inset)}
+.run-wf{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.run-ref{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.run-dur{color:var(--soft);font-size:11.5px;white-space:nowrap}
+.chev{color:var(--soft);font-family:var(--mono);width:12px;text-align:center}
+.run-flag{display:grid;gap:3px;padding:8px 14px 10px;border-top:1px dashed var(--line);font-size:12px}
+.run-flag .flag-t{font-weight:600}
+.f-bump .flag-t{color:var(--bump-ink)}.f-boulder .flag-t{color:var(--boulder-ink)}
+.cmd{display:inline-block;margin-top:4px;padding:3px 8px;border-radius:6px;background:var(--ink);color:var(--page);font-family:var(--mono);font-size:11.5px;width:fit-content;max-width:100%;overflow-wrap:anywhere}
+.jobs{display:grid;gap:8px;padding:8px 14px 12px;border-top:1px solid var(--line);animation:enter var(--t-med) var(--ease) both}
+.job{border-left:2px solid var(--line-strong);padding-left:12px}
+.job-h{display:flex;gap:8px;align-items:center;font-size:12.5px;font-weight:600}
+.steps{list-style:none;margin:4px 0 0;padding:0;display:grid;gap:2px}
+.step{display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center;font-size:12px;padding:2px 0}
+.step.st-run .mono{color:var(--run-ink)}.step.st-fail .mono{color:var(--boulder-ink);font-weight:600}
+.logtail{margin:4px 0 0;padding:10px 12px;border-radius:10px;background:#1b2426;color:#f4efe5;font-family:var(--mono);font-size:11.5px;white-space:pre-wrap;overflow-wrap:anywhere}
+.agents{display:grid;gap:10px}
+.agent{border:1px solid var(--line);border-radius:14px;padding:12px 14px;display:grid;gap:10px;transition:background-color var(--t-med) ease,border-color var(--t-med) ease;animation:enter var(--t-med) var(--ease) both}
+.agent.tone-boulder{background:var(--boulder-soft);border-color:var(--boulder)}
+.agent.tone-bump{background:var(--bump-soft)}
+.ag-h{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:12.5px}
+.rev{padding:2px 8px;border-radius:6px;font-family:var(--mono);font-size:11px;font-weight:600;border:1px solid var(--line-strong)}
+.rev-claude{background:var(--clear-soft);color:var(--clear-ink)}.rev-codex{background:var(--run-soft);color:var(--run-ink)}
+.stages{display:flex;align-items:center}
+.stg{position:relative;flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;font-size:10.5px;font-family:var(--mono);color:var(--soft)}
+.stg::before{content:"";position:absolute;left:-50%;right:50%;top:5px;height:2px;background:var(--line)}
+.stg:first-child::before{display:none}
+.stg-dot{width:12px;height:12px;border-radius:50%;background:var(--idle-soft);box-shadow:inset 0 0 0 1px var(--line);z-index:1;transition:background-color var(--t-med) ease}
+.stg-done .stg-dot{background:var(--clear);box-shadow:none}.stg-done::before{background:var(--clear)}
+.stg-cur .stg-dot{background:var(--run);box-shadow:none;animation:pulse 1.4s ease-in-out infinite;animation-play-state:var(--loop)}.stg-cur::before{background:var(--clear)}.stg-cur{color:var(--run-ink);font-weight:600}
+.stg-crash .stg-dot{background:var(--boulder);box-shadow:none}.stg-crash{color:var(--boulder-ink);font-weight:600}.stg-crash::before{background:var(--clear)}
+.ag-f{font-size:11px}
+.empty{padding:14px;border:1px dashed var(--line-strong);border-radius:12px;color:var(--soft);font-size:12.5px;text-align:center}
+.hist-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:18px}
+.chart-h{display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;font-size:12px;color:var(--muted);margin-bottom:8px}
+.legend{display:inline-flex;align-items:center;gap:6px;font-size:11px;flex-wrap:wrap}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-left:8px}
+.sw-claude{background:var(--clear)}.sw-codex{background:var(--run);background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.35) 0 2px,transparent 2px 4px)}
+.bars{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px;align-items:end;padding:0 4px}
+.day{display:flex;flex-direction:column;align-items:center;height:100%;justify-content:flex-end}
+.bar-pair{display:flex;gap:4px;align-items:flex-end;height:130px;width:100%;justify-content:center;border-bottom:1px solid var(--line-strong)}
+.bar{position:relative;width:40%;max-width:30px;border-radius:4px 4px 0 0;transition:height var(--t-slow) var(--ease)}
+.bar-claude{background:var(--clear)}.bar-codex{background:var(--run);background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.35) 0 3px,transparent 3px 6px)}
+.day-v{font-family:var(--mono);font-size:10px;line-height:1.35;white-space:nowrap;font-variant-numeric:tabular-nums}.v-claude{color:var(--clear-ink)}.v-codex{color:var(--run-ink)}
+.day-l{font-family:var(--mono);font-size:10px;color:var(--soft);margin-top:6px}
+.totals{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(200px,100%),1fr));gap:10px;margin-top:14px}
+.tot{padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:var(--inset)}
+.tot-k{display:block;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--soft);font-weight:700}
+.tot-v{display:block;font-size:20px;font-weight:600;letter-spacing:-.02em}
+.est{display:inline-block;font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;padding:1px 5px;border-radius:4px;border:1px solid var(--bump-ink);color:var(--bump-ink);margin-left:4px;vertical-align:1px}
+.na{color:var(--soft);font-style:italic}
+.f-sev{display:inline-flex;gap:3px}
+.sev{font-family:var(--mono);font-size:10.5px;padding:1px 6px;border-radius:4px;background:var(--idle-soft)}
+.sev-1{background:var(--boulder-soft);color:var(--boulder-ink)}.sev-2{background:var(--bump-soft);color:var(--bump-ink)}
+.audit{display:flex;align-items:center;gap:10px;margin-bottom:10px;padding:8px 12px;border-radius:12px;background:var(--run-soft);font-size:12.5px;color:var(--run-ink)}
+.linkb{border:0;background:transparent;padding:0;color:var(--accent);text-decoration:underline;font-size:12.5px;text-align:left}
+.fl-paths{background:var(--inset);padding:8px 14px 12px;border-bottom:1px solid var(--line);animation:enter var(--t-med) var(--ease) both}
+.paths{list-style:none;margin:0;padding:0;display:grid;gap:4px}
+.paths li{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:10px;align-items:center;font-size:12px}
+.cls{font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;padding:1px 6px;border-radius:4px;background:var(--idle-soft)}
+.cls-canonical{background:var(--clear-soft);color:var(--clear-ink)}.cls-kit{background:var(--run-soft);color:var(--run-ink)}.cls-templated{background:var(--bump-soft);color:var(--bump-ink)}
+.stale{color:var(--bump-ink);font-weight:600}
+.meters{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(460px,100%),1fr));gap:14px;align-items:start}
+.mcard{padding:12px 14px;border-radius:14px;border:1px solid var(--line);display:grid;gap:10px;transition:background-color var(--t-med) ease,border-color var(--t-med) ease}
+.mcard.t-bump{background:var(--bump-soft)}.mcard.t-boulder{background:var(--boulder-soft);border-color:var(--boulder)}
+.mcard h3{margin:0;font-size:13px;font-weight:600;display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap}
+.mcard .den{font-size:11px;color:var(--soft);font-weight:400;font-family:var(--mono)}
+.mcard .m-top .m-val{font-size:18px;letter-spacing:-.02em}
+.spenders{list-style:none;margin:0;padding:0;display:grid;gap:3px}
+.spenders li{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:8px;font-size:12px;align-items:center}
+.tok{display:grid;gap:6px}
+.tok-r,.qrow{display:grid;grid-template-columns:200px 1fr auto;gap:8px;align-items:center;font-size:11.5px}
+.tok-r .mini{height:8px}
+.qbar{display:flex;height:10px;border-radius:999px;overflow:hidden;background:var(--idle-soft)}
+.qq{background:var(--bump);transition:width var(--t-slow) var(--ease)}.qr{background:var(--run);transition:width var(--t-slow) var(--ease)}
+.qbar.jam .qq{background:var(--boulder);background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.25) 0 4px,transparent 4px 8px)}
+.qleg{display:flex;gap:12px;font-size:11px;color:var(--soft);flex-wrap:wrap}
+.qleg i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+.note{font-size:11.5px;color:var(--muted)}
+.note.boulder{color:var(--boulder-ink);font-weight:600}
+.overlay{position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(27,36,38,.45);backdrop-filter:blur(4px);animation:fade var(--t-med) ease both}
+.modal{width:660px;max-width:100%;max-height:calc(100vh - 40px);overflow:auto;background:var(--panel-strong);color:var(--ink);border:1px solid var(--line);border-radius:22px;box-shadow:0 24px 60px rgba(0,0,0,.25);padding:22px 24px;display:grid;gap:14px;animation:pop var(--t-pop) var(--ease) both}
+.steps-i{display:flex;gap:6px;font-family:var(--mono);font-size:11px;flex-wrap:wrap}
+.stp{padding:3px 10px;border-radius:999px;background:var(--idle-soft);color:var(--soft)}
+.stp.on{background:var(--ink);color:var(--page)}.stp.ok{background:var(--clear-soft);color:var(--clear-ink)}
+.modal h3{margin:0;font-size:18px;font-weight:600}
+.modal p{margin:0;font-size:13px;color:var(--muted)}
+.modal code{font-family:var(--mono);font-size:12px;background:var(--accent-soft);color:var(--accent);padding:1px 6px;border-radius:4px}
+.checks{list-style:none;margin:0;padding:0;display:grid;gap:5px}
+.chk{display:flex;gap:8px;align-items:center;font-size:12.5px}
+.plan{display:grid;gap:10px}
+.plan-r{border:1px solid var(--line);border-radius:12px;padding:10px 12px;display:grid;gap:8px}
+.plan-h{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:13px;font-weight:600;flex-wrap:wrap}
+.plan-pr,.plan-warn{display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-size:12px}
+.plan-warn{color:var(--bump-ink);font-weight:500;flex-wrap:nowrap;align-items:flex-start}.plan-warn>span:last-child{flex:1 1 0;min-width:0}.plan-warn>.g{margin-top:2px}
+.ack{display:flex;gap:10px;align-items:flex-start;font-size:13px;padding:10px 12px;border-radius:12px;background:var(--bump-soft);color:var(--bump-ink)}
+.ack input{margin-top:3px;accent-color:var(--bump);width:16px;height:16px;flex:none}
+.m-actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.rails{display:grid;gap:8px}
+.rail-r{display:grid;grid-template-columns:200px 1fr;gap:12px;align-items:center;font-size:12px}
+.log{margin:0;padding:12px 14px;border-radius:12px;background:#1b2426;color:#f4efe5;font-family:var(--mono);font-size:11.5px;line-height:1.6;max-height:220px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
+.ll{display:block;animation:enter var(--t-fast) ease both}
+.cursor{display:inline-block;width:7px;height:13px;background:#f4efe5;vertical-align:-2px;animation:blink 1s steps(2) infinite;animation-play-state:var(--loop)}
+.done{display:flex;align-items:center;gap:14px;font-size:14px}
+.done .g{animation:pop var(--t-pop) var(--ease) both,burst var(--t-glow) ease-out both;border-radius:50%}
+.prchips{display:flex;flex-wrap:wrap;gap:6px}
+.prchip{padding:3px 10px;border-radius:999px;background:var(--clear-soft);color:var(--clear-ink);font-size:11.5px;animation:pop var(--t-pop) var(--ease) both}
+@keyframes spin{ to{transform:rotate(360deg)} }
+@keyframes breathe{ 0%,100%{transform:scale(1);box-shadow:0 0 0 0 var(--clear-soft)} 50%{transform:scale(1.15);box-shadow:0 0 0 6px var(--clear-soft)} }
+@keyframes pulse{ 0%,100%{box-shadow:0 0 0 0 var(--run-soft)} 50%{box-shadow:0 0 0 6px var(--run-soft)} }
+@keyframes blink{ 0%,100%{opacity:1} 50%{opacity:.35} }
+@keyframes rumble{ to{background-position:14px 0} }
+@keyframes poll{ to{stroke-dashoffset:0} }
+@keyframes throb{ 0%,100%{box-shadow:0 0 0 0 var(--boulder-soft)} 50%{box-shadow:0 0 0 4px var(--boulder-soft)} }
+@keyframes enter{ from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:none} }
+@keyframes slidein{ from{opacity:0;transform:translateX(40px)} to{opacity:1;transform:none} }
+@keyframes land{ 0%{transform:translateY(-14px) scale(.7);opacity:0} 70%{transform:translateY(2px) scale(1.05);opacity:1} 100%{transform:none} }
+@keyframes pop{ 0%{transform:scale(.6);opacity:0} 60%{transform:scale(1.08);opacity:1} 100%{transform:scale(1);opacity:1} }
+@keyframes burst{ 0%{box-shadow:0 0 0 0 rgba(31,98,87,.5)} 100%{box-shadow:0 0 0 34px rgba(31,98,87,0)} }
+@keyframes rowglow{ 0%{background-color:var(--clear-soft)} 100%{background-color:transparent} }
+@keyframes conf{ 0%{opacity:1;transform:translate(0,0)} 100%{opacity:0;transform:translate(var(--dx),var(--dy))} }
+@keyframes fade{ from{opacity:0} to{opacity:1} }
+@media (max-width:720px){ .wrap{padding:12px 16px 40px} .top,.panel{padding:16px} .rail-r{grid-template-columns:1fr} .tok-r,.qrow{grid-template-columns:110px 1fr auto} .run-head{grid-template-columns:auto minmax(0,1fr) auto auto} .run-ref,.run-jobs,.run-dur{display:none} }
+</style>
+</helmet>
+<div class="ck {{rootCls}}">
+<div class="wrap">
+
+<header class="top">
+  <div>
+    <p class="eyebrow">Mergepath · Cockpit</p>
+    <h1>Everything you are waiting on, in one place.</h1>
+    <p class="lede">Open PRs across the fleet, CI and test runs, Phase 4b agents, fleet sync and the Actions budget. Read-mostly: the only write is a confirmed sync.</p>
+  </div>
+  <div class="top-r">
+    <div class="chip conn c-{{conn.tone}}" role="status"><span class="dot" aria-hidden="true"></span><span class="lbl">{{conn.label}}</span><span class="sub">{{conn.sub}}</span></div>
+    <div class="chip api">
+      <span class="lbl">GitHub API</span>
+      <span class="mono">{{api.used}} / 5,000</span>
+      <span class="sub">per hour · author PAT · 304s are free · resets in {{api.reset}}</span>
+      <div class="mini"><div class="mini-fill t-{{api.tone}}" style="width: {{api.pct}}%"></div></div>
+    </div>
+    <div class="chip">
+      <span class="lbl">Updated</span><span class="mono">{{updated}}</span><span class="sub">hot PR 15 s · idle 2 min · SSE push</span>
+    </div>
+  </div>
+</header>
+
+<section class="demo" aria-label="Prototype controls">
+  <span class="demo-lbl">Prototype controls · not in the product</span>
+  <div class="seg" role="group" aria-label="Scenario">
+    <sc-for list="{{scenarios}}" as="s" hint-placeholder-count="4"><button type="button" class="seg-b {{s.cls}}" onClick="{{s.pick}}" aria-pressed="{{s.on}}"><span class="g g-{{s.g}}" aria-hidden="true"></span>{{s.label}}</button></sc-for>
+  </div>
+  <button type="button" class="btn" onClick="{{cycle}}">Next scenario</button>
+  <button type="button" class="btn" onClick="{{simMerge}}">Simulate a merge</button>
+  <button type="button" class="btn" onClick="{{toggleDark}}" aria-pressed="{{dark}}">{{darkLabel}}</button>
+  <button type="button" class="btn" onClick="{{toggleRm}}" aria-pressed="{{rm}}">{{rmLabel}}</button>
+</section>
+
+<section class="panel road" id="road">
+  <div class="sec-head">
+    <div><p class="eyebrow">Road ahead</p><h2>{{road.title}}</h2></div>
+    <div class="sec-meta">{{road.summary}}</div>
+  </div>
+  <div class="strip">
+    <div class="line" aria-hidden="true"></div>
+    <span class="now">NOW</span>
+    <sc-for list="{{horizon}}" as="h" hint-placeholder-count="4"><span class="hz {{h.cls}}" style="left: {{h.pct}}%">{{h.label}}<span class="hz-sub">{{h.sub}}</span></span></sc-for>
+    <sc-for list="{{road.strip}}" as="it" hint-placeholder-count="3">
+      <div class="mk mk-{{it.kind}}" style="left: {{it.pct}}%; animation-delay: {{it.delay}}">
+        <sc-if value="{{it.show}}" hint-placeholder-val="{{true}}"><span class="mk-stem" aria-hidden="true" style="top: {{it.stemTop}}px; height: {{it.stemH}}px"></span>
+        <span class="mk-lbl" style="left: {{it.lblX}}px; top: {{it.lblY}}px" title="{{it.short}}"><span class="mk-n">{{it.n}}</span><sc-if value="{{it.full}}" hint-placeholder-val="{{true}}"><span class="mk-t">{{it.short}}</span></sc-if></span></sc-if>
+        <span class="g lg g-{{it.kind}}" aria-hidden="true"></span>
+      </div>
+    </sc-for>
+    <sc-if value="{{road.more}}" hint-placeholder-val="{{false}}"><span class="more">{{road.moreText}}</span></sc-if>
+    <sc-if value="{{road.clear}}" hint-placeholder-val="{{false}}"><div class="road-clear"><span class="g lg g-clear" aria-hidden="true"></span>Road is clear. Nothing ahead will slow or stop work.</div></sc-if>
+  </div>
+  <ul class="road-list">
+    <sc-for list="{{road.items}}" as="it" hint-placeholder-count="3">
+      <li class="ri ri-{{it.kind}}"><span class="ri-n">{{it.n}}</span><span class="g g-{{it.kind}}" aria-hidden="true"></span><span class="ri-kind">{{it.kindLabel}}</span><span class="ri-text">{{it.text}}</span><span class="ri-eta mono">{{it.eta}}</span><a class="ri-src" href="#{{it.src}}">{{it.srcLabel}}</a></li>
+    </sc-for>
+  </ul>
+</section>
+
+<section class="panel" id="prs">
+  <div class="sec-head">
+    <div><p class="eyebrow">Open PRs</p><h2>{{prs.summary}}</h2></div>
+    <div class="sec-meta"><span>GraphQL · one batched query per repo · ledger per PR on HEAD change</span><span class="poll"><svg class="ring" viewBox="0 0 20 20" aria-hidden="true"><circle class="ring-bg" cx="10" cy="10" r="7"></circle><circle class="ring-fg" cx="10" cy="10" r="7"></circle></svg>polled {{prs.polled}}</span></div>
+  </div>
+  <div class="filters" role="group" aria-label="Repo filter">
+    <sc-for list="{{filters}}" as="f" hint-placeholder-count="8"><button type="button" class="chipb {{f.cls}}" onClick="{{f.pick}}" aria-pressed="{{f.on}}">{{f.label}}<span class="cnt">{{f.n}}</span></button></sc-for>
+  </div>
+  <div class="tbl-wrap">
+  <div class="tbl" role="table" style="--cols: 118px minmax(220px, 1.4fr) minmax(190px, 1.1fr) 128px 250px 86px 160px 64px; --minw: 1216px">
+   <div class="trow th" role="row"><span role="columnheader">Status</span><span role="columnheader">Pull request</span><span role="columnheader">Merge state · checks</span><span role="columnheader">Gate labels</span><span role="columnheader">Review budgets · remaining</span><span role="columnheader">Feedback</span><span role="columnheader">CodeRabbit</span><span role="columnheader">Age</span></div>
+   <sc-for list="{{prs.rows}}" as="p" hint-placeholder-count="5">
+    <div class="trow tone-{{p.tone}} {{p.cls}}" role="row" style="animation-delay: {{p.delay}}">
+     <div class="cell" role="cell"><span class="b b-{{p.tone}}"><span class="g g-{{p.tone}}" aria-hidden="true"></span>{{p.toneLabel}}</span>
+       <sc-if value="{{p.merged}}" hint-placeholder-val="{{false}}"><span class="ribbon"><i class="c c1"></i><i class="c c2"></i><i class="c c3"></i><i class="c c4"></i><i class="c c5"></i>Merged</span></sc-if>
+     </div>
+     <div class="cell" role="cell"><a class="pr-link" href="https://github.com/nathanjohnpayne/{{p.repo}}/pull/{{p.n}}"><span class="mono soft">{{p.repo}} #{{p.n}}</span><span class="ttl">{{p.title}}</span></a><span class="sub mono">{{p.author}} · {{p.head}}{{p.draftTag}}</span></div>
+     <div class="cell" role="cell"><span class="ms ms-{{p.tone}}">{{p.ms}}</span><span class="why">{{p.why}}</span><div class="pips" aria-label="{{p.checksLabel}}"><sc-for list="{{p.pips}}" as="c" hint-placeholder-count="5"><i class="pip pip-{{c.k}}"></i></sc-for><span class="sub mono">{{p.checksLabel}}</span></div></div>
+     <div class="cell" role="cell"><sc-for list="{{p.labels}}" as="l" hint-placeholder-count="1"><span class="lab lab-{{l.k}}">{{l.name}}</span></sc-for><sc-if value="{{p.noLabels}}" hint-placeholder-val="{{false}}"><span class="soft">none</span></sc-if></div>
+     <div class="cell" role="cell">
+       <div class="bstrip"><sc-for list="{{p.budgets}}" as="b" hint-placeholder-count="5"><div class="bs t-{{b.tone}}" title="{{b.name}}: {{b.headline}}"><span class="bs-l">{{b.abbr}}</span><div class="mini"><div class="mini-fill t-{{b.tone}}" style="width: {{b.usedPct}}%"></div></div><span class="mono bs-n ink-{{b.tone}}">{{b.leftText}}</span></div></sc-for></div>
+       <div class="bs-llm mono soft">{{p.llmText}}</div>
+       <div class="cx-flags"><button type="button" class="linkb" onClick="{{p.toggleBud}}" aria-expanded="{{p.budOpen}}">{{p.budLabel}}</button><sc-if value="{{p.inflight}}" hint-placeholder-val="{{false}}"><span class="flag f-run"><span class="g g-run" aria-hidden="true"></span>request in flight on HEAD</span></sc-if><sc-if value="{{p.stop}}" hint-placeholder-val="{{false}}"><span class="flag f-boulder"><span class="g g-boulder" aria-hidden="true"></span>human stop</span></sc-if></div>
+     </div>
+     <div class="cell" role="cell"><span class="mono {{p.fbCls}}">{{p.fb}}</span><span class="sub">accounted / posted</span></div>
+     <div class="cell" role="cell"><span class="b b-{{p.crTone}}"><span class="g g-{{p.crTone}}" aria-hidden="true"></span>{{p.crLabel}}</span></div>
+     <div class="cell mono soft" role="cell">{{p.age}}<span class="sub">push {{p.push}}</span></div>
+    </div>
+    <sc-if value="{{p.budOpen}}" hint-placeholder-val="{{false}}">
+      <div class="bud-full">
+        <sc-for list="{{p.budgets}}" as="b" hint-placeholder-count="5"><div class="bcard t-{{b.tone}}"><span class="bc-name">{{b.name}}</span><span class="bc-head mono ink-{{b.tone}}">{{b.headline}}</span><div class="m-track"><div class="m-fill t-{{b.tone}}" style="width: {{b.usedPct}}%"></div><i class="m-tick" style="left: {{b.tickPct}}%"></i><sc-if value="{{b.cap}}" hint-placeholder-val="{{false}}"><span class="m-cap g g-boulder" aria-hidden="true"></span></sc-if></div><span class="sub">{{b.usedText}} · {{b.src}}</span></div></sc-for>
+        <div class="bcard"><span class="bc-name">LLM spend on this PR · no cap</span><span class="bc-head mono">{{p.llmHead}}</span><span class="sub">{{p.llmSub}}</span></div>
+      </div>
+    </sc-if>
+   </sc-for>
+  </div>
+  </div>
+</section>
+
+<div class="row2">
+<section class="panel grow" id="ci">
+  <div class="sec-head">
+    <div><p class="eyebrow">CI and test runs</p><h2>{{ci.summary}}</h2></div>
+    <div class="sec-meta"><span>Actions REST · ETag · each check_* suite is a step</span><span class="poll"><svg class="ring r20" viewBox="0 0 20 20" aria-hidden="true"><circle class="ring-bg" cx="10" cy="10" r="7"></circle><circle class="ring-fg" cx="10" cy="10" r="7"></circle></svg>polled {{ci.polled}}</span></div>
+  </div>
+  <div class="runs">
+   <sc-for list="{{runs}}" as="r" hint-placeholder-count="4">
+    <div class="run tone-{{r.tone}}">
+      <button type="button" class="run-head" onClick="{{r.toggle}}" aria-expanded="{{r.open}}">
+        <span class="g g-{{r.tone}}" aria-hidden="true"></span>
+        <span class="run-wf mono">{{r.wf}}</span>
+        <span class="run-ref">{{r.repo}} #{{r.pr}} · {{r.head}}</span>
+        <span class="run-jobs pips"><sc-for list="{{r.jobs}}" as="j" hint-placeholder-count="3"><i class="pip pip-{{j.k}}" title="{{j.name}}"></i></sc-for></span>
+        <span class="run-dur mono">{{r.dur}}</span>
+        <span class="b b-{{r.tone}}">{{r.label}}</span>
+        <span class="chev" aria-hidden="true">{{r.chev}}</span>
+      </button>
+      <sc-if value="{{r.flag}}" hint-placeholder-val="{{false}}">
+        <div class="run-flag f-{{r.tone}}"><span class="flag-t">{{r.flagTitle}}</span><span class="flag-d">{{r.flagDetail}}</span><sc-if value="{{r.hasCmd}}" hint-placeholder-val="{{false}}"><code class="cmd">{{r.cmd}}</code></sc-if></div>
+      </sc-if>
+      <sc-if value="{{r.open}}" hint-placeholder-val="{{false}}">
+        <div class="jobs">
+          <sc-for list="{{r.jobs}}" as="j" hint-placeholder-count="3">
+            <div class="job">
+              <div class="job-h"><span class="g g-{{j.k}}" aria-hidden="true"></span><span class="mono">{{j.name}}</span><span class="mono soft">{{j.dur}}</span></div>
+              <ul class="steps">
+                <sc-for list="{{j.steps}}" as="st" hint-placeholder-count="3"><li class="step st-{{st.k}}"><span class="g g-{{st.k}}" aria-hidden="true"></span><span class="mono">{{st.name}}</span><span class="mono soft">{{st.dur}}</span></li></sc-for>
+              </ul>
+            </div>
+          </sc-for>
+          <sc-if value="{{r.hasFail}}" hint-placeholder-val="{{false}}"><pre class="logtail">{{r.failLine}}</pre></sc-if>
+          <sc-if value="{{r.noJobs}}" hint-placeholder-val="{{false}}"><div class="empty">No job has started. The run is waiting for a runner.</div></sc-if>
+        </div>
+      </sc-if>
+    </div>
+   </sc-for>
+  </div>
+</section>
+
+<section class="panel side" id="agents">
+  <div class="sec-head">
+    <div><p class="eyebrow">Phase 4b agents · live</p><h2>{{ag.summary}}</h2></div>
+    <div class="sec-meta"><span>~/.local/state/mergepath/phase-4b-runs/*.json</span><span class="poll"><svg class="ring r5" viewBox="0 0 20 20" aria-hidden="true"><circle class="ring-bg" cx="10" cy="10" r="7"></circle><circle class="ring-fg" cx="10" cy="10" r="7"></circle></svg>polled {{ag.polled}}</span></div>
+  </div>
+  <div class="agents">
+   <sc-for list="{{agents}}" as="a" hint-placeholder-count="2">
+    <div class="agent tone-{{a.tone}}">
+      <div class="ag-h"><span class="b b-{{a.tone}}"><span class="g g-{{a.tone}}" aria-hidden="true"></span>{{a.label}}</span><span class="rev rev-{{a.revk}}">{{a.rev}}</span><span class="mono soft">{{a.repo}} #{{a.pr}}</span></div>
+      <div class="stages">
+        <sc-for list="{{a.stages}}" as="s" hint-placeholder-count="4"><div class="stg stg-{{s.k}}"><span class="stg-dot" aria-hidden="true"></span><span class="stg-l">{{s.name}}</span></div></sc-for>
+      </div>
+      <div class="m t-{{a.tone}}"><div class="m-top"><span class="m-val">{{a.elapsed}}</span><span class="m-den">of {{a.timeout}} adapter timeout · tick at 80%</span></div><div class="m-track"><div class="m-fill t-{{a.tone}}" style="width: {{a.pct}}%"></div><i class="m-tick" style="left: 80%"></i></div></div>
+      <div class="ag-f mono soft">{{a.id}} · pid {{a.pid}}{{a.noteText}}</div>
+    </div>
+   </sc-for>
+  </div>
+</section>
+</div>
+
+<section class="panel" id="history">
+  <div class="sec-head">
+    <div><p class="eyebrow">Phase 4b history · tokens and cost</p><h2>7 days · 23 runs · $18.47 across both providers</h2></div>
+    <div class="sec-meta"><span>phase-4b-ledger.jsonl + phase-4b-loops/*.jsonl · 2 checkouts · de-duplicated by run_id</span></div>
+  </div>
+  <div class="hist-grid">
+    <div>
+      <div class="chart-h"><span>Per provider, per day</span><span class="legend"><i class="sw sw-claude"></i>Claude · cost reported<i class="sw sw-codex"></i>Codex · cost estimated<span class="est">est</span></span></div>
+      <div class="bars">
+        <sc-for list="{{days}}" as="d" hint-placeholder-count="7">
+          <div class="day"><div class="bar-pair"><div class="bar bar-claude" style="height: {{d.ch}}%" title="Claude {{d.cv}}"></div><div class="bar bar-codex" style="height: {{d.xh}}%" title="Codex {{d.xv}} est"></div></div><span class="day-l">{{d.label}}</span><span class="day-v v-claude">{{d.cv}}</span><span class="day-v v-codex">{{d.xv}}</span></div>
+        </sc-for>
+      </div>
+      <div class="totals">
+        <div class="tot"><span class="tot-k">Claude · 7 days</span><span class="tot-v mono">$8.57</span><span class="sub">1.52M in · 0.11M out · 3.2M cache read · total_cost_usd from the adapter</span></div>
+        <div class="tot"><span class="tot-k">Codex · 7 days</span><span class="tot-v mono">1.65M tokens</span><span class="sub">input/output split unavailable, never imputed · $9.90 <span class="est">est</span> from prices.json</span></div>
+      </div>
+    </div>
+    <div class="tbl-wrap">
+      <div class="tbl" role="table" style="--cols: minmax(150px, 1fr) 190px 70px 150px minmax(200px, 1.2fr) 86px 110px 64px; --minw: 1040px">
+        <div class="trow th" role="row"><span role="columnheader">Run</span><span role="columnheader">PR</span><span role="columnheader">Reviewer</span><span role="columnheader">Verdict</span><span role="columnheader">Tokens</span><span role="columnheader">Cost</span><span role="columnheader">Findings</span><span role="columnheader">Elapsed</span></div>
+        <sc-for list="{{hist}}" as="h" hint-placeholder-count="6">
+          <div class="trow" role="row">
+            <div class="cell mono" role="cell">{{h.id}}<span class="sub">{{h.when}}</span></div>
+            <div class="cell mono soft" role="cell">{{h.repo}} #{{h.pr}}</div>
+            <div class="cell" role="cell"><span class="rev rev-{{h.revk}}">{{h.rev}}</span></div>
+            <div class="cell" role="cell"><span class="b b-{{h.vt}}"><span class="g g-{{h.vt}}" aria-hidden="true"></span>{{h.verdict}}</span></div>
+            <div class="cell mono" role="cell">{{h.tokens}}<sc-if value="{{h.naSplit}}" hint-placeholder-val="{{false}}"><span class="sub na">input/output split unavailable</span></sc-if></div>
+            <div class="cell mono" role="cell">{{h.cost}}<sc-if value="{{h.est}}" hint-placeholder-val="{{false}}"><span class="est">est</span></sc-if></div>
+            <div class="cell" role="cell"><span class="f-sev"><span class="sev sev-1">P1 {{h.p1}}</span><span class="sev sev-2">P2 {{h.p2}}</span><span class="sev">P3 {{h.p3}}</span></span></div>
+            <div class="cell mono soft" role="cell">{{h.el}}</div>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="stack">
+<section class="panel" id="fleet">
+  <div class="sec-head">
+    <div><p class="eyebrow">Fleet sync</p><h2>{{fl.summary}}</h2></div>
+    <div class="sec-meta"><span>sync-to-downstream.sh --audit --json · every 30 min or on demand · hub origin/main 9a8fcdf</span><button type="button" class="btn sm" onClick="{{refreshAudit}}" disabled="{{fl.busy}}">Refresh audit</button><button type="button" class="btn sm primary" onClick="{{syncAll}}" disabled="{{fl.busy}}">Sync all</button></div>
+  </div>
+  <sc-if value="{{audit.on}}" hint-placeholder-val="{{false}}"><div class="audit"><span class="g g-run" aria-hidden="true"></span>Auditing: refreshing 6 consumer caches, slow by design. The last good result stays below until this finishes.<div class="mini"><div class="mini-fill t-run" style="width: {{audit.pct}}%"></div></div></div></sc-if>
+  <div class="tbl-wrap">
+   <div class="tbl" role="table" style="--cols: minmax(210px, 1.4fr) minmax(170px, 1fr) 150px 120px 150px 120px 72px; --minw: 1040px">
+    <div class="trow th" role="row"><span role="columnheader">Consumer</span><span role="columnheader">Status</span><span role="columnheader">Hub → consumer</span><span role="columnheader">Paths</span><span role="columnheader">Open sync PR</span><span role="columnheader">Last audit</span><span role="columnheader"></span></div>
+    <sc-for list="{{fleet}}" as="f" hint-placeholder-count="6">
+     <div class="trow tone-{{f.tone}} {{f.cls}}" role="row">
+       <div class="cell" role="cell"><span class="mono">{{f.repo}}</span><span class="sub">{{f.vis}}</span></div>
+       <div class="cell" role="cell"><span class="b b-{{f.tone}}"><span class="g g-{{f.tone}}" aria-hidden="true"></span>{{f.label}}</span><sc-if value="{{f.hasErr}}" hint-placeholder-val="{{false}}"><span class="sub">{{f.err}}</span></sc-if></div>
+       <div class="cell mono soft" role="cell">{{f.hub}} → {{f.cons}}</div>
+       <div class="cell" role="cell"><sc-if value="{{f.hasPaths}}" hint-placeholder-val="{{false}}"><button type="button" class="linkb" onClick="{{f.toggle}}" aria-expanded="{{f.open}}">{{f.pathsLabel}}</button></sc-if><sc-if value="{{f.noPaths}}" hint-placeholder-val="{{false}}"><span class="soft">none</span></sc-if></div>
+       <div class="cell" role="cell"><sc-if value="{{f.pr}}" hint-placeholder-val="{{false}}"><span class="mono">#{{f.prn}}</span> <span class="ms ms-{{f.prTone}}">{{f.prMs}}</span></sc-if><sc-if value="{{f.noPr}}" hint-placeholder-val="{{false}}"><span class="soft">none</span></sc-if></div>
+       <div class="cell mono soft" role="cell">{{f.audit}}<sc-if value="{{f.stale}}" hint-placeholder-val="{{false}}"><span class="sub stale">stale</span></sc-if></div>
+       <div class="cell" role="cell"><button type="button" class="btn sm" onClick="{{f.sync}}" disabled="{{f.noSync}}">Sync</button></div>
+     </div>
+     <sc-if value="{{f.open}}" hint-placeholder-val="{{false}}">
+       <div class="fl-paths"><ul class="paths"><sc-for list="{{f.paths}}" as="x" hint-placeholder-count="3"><li><span class="mono">{{x.path}}</span><span class="cls cls-{{x.cls}}">{{x.cls}}</span><span class="soft">{{x.dir}}</span></li></sc-for></ul></div>
+     </sc-if>
+    </sc-for>
+   </div>
+  </div>
+</section>
+
+<section class="panel" id="budget">
+  <div class="sec-head">
+    <div><p class="eyebrow">GitHub Actions budget</p><h2>{{bud.summary}}</h2></div>
+    <div class="sec-meta"><span>billing usage hourly · /rate_limit + headers · runs 20 s</span></div>
+  </div>
+  <div class="meters">
+    <div class="mcard t-{{bud.spendTone}}">
+      <h3>Spend this cycle <span class="den">net_amount · per billing cycle</span></h3>
+      <div class="m t-{{bud.spendTone}} has-l"><div class="m-top"><span class="m-val">${{bud.net}}</span><span class="m-den">of $25.00 budget · day 19 of 30</span></div><div class="m-track"><div class="m-fill t-{{bud.spendTone}}" style="width: {{bud.spendPct}}%"></div><i class="m-tick proj" style="left: {{bud.projPct}}%"></i><span class="m-tick-l {{bud.projEnd}}" style="left: {{bud.projPct}}%">proj ${{bud.proj}}</span><sc-if value="{{bud.spendCap}}" hint-placeholder-val="{{false}}"><span class="m-cap g lg g-boulder" aria-hidden="true"></span></sc-if></div></div>
+      <ul class="spenders">
+        <li><span>propagation-drift (cron)</span><span class="mono soft">mergepath</span><span class="mono">$6.10</span></li>
+        <li><span>repo_lint</span><span class="mono soft">matchline</span><span class="mono">$2.90</span></li>
+        <li><span>repo_lint</span><span class="mono soft">mergepath</span><span class="mono">$2.35</span></li>
+        <li><span>codex-review-check</span><span class="mono soft">friends-and-family-billing</span><span class="mono">$1.40</span></li>
+      </ul>
+      <span class="note">{{bud.spendNote}}</span>
+    </div>
+    <div class="mcard t-{{bud.tokTone}}">
+      <h3>GITHUB_TOKEN per repo <span class="den">1,000 per hour · per repository</span></h3>
+      <div class="tok">
+        <sc-for list="{{bud.tok}}" as="t" hint-placeholder-count="7"><div class="tok-r"><span class="mono">{{t.repo}}</span><div class="mini"><div class="mini-fill t-{{t.tone}}" style="width: {{t.pct}}%"></div></div><span class="mono ink-{{t.tone}}">{{t.v}}</span></div></sc-for>
+      </div>
+      <span class="note {{bud.tokNoteCls}}">{{bud.tokNote}}</span>
+    </div>
+    <div class="mcard t-{{bud.patTone}}">
+      <h3>Shared CI PAT pool <span class="den">5,000 per hour · per account · nathanpayne-robot</span></h3>
+      <div class="m t-{{bud.patTone}}"><div class="m-top"><span class="m-val">{{bud.patUsed}}</span><span class="m-den">of 5,000 · resets in {{bud.patReset}}</span></div><div class="m-track"><div class="m-fill t-{{bud.patTone}}" style="width: {{bud.patPct}}%"></div><i class="m-tick" style="left: 70%"></i><sc-if value="{{bud.patCap}}" hint-placeholder-val="{{false}}"><span class="m-cap g lg g-boulder" aria-hidden="true"></span></sc-if></div></div>
+      <span class="note">Drew on it in the last hour: <span class="mono">mergepath {{bud.patDraw0}} · matchline {{bud.patDraw1}} · swipewatch {{bud.patDraw2}}</span>. One pool serves every repo.</span>
+    </div>
+    <div class="mcard t-{{bud.qTone}}">
+      <h3>Queue pressure <span class="den">queued vs running · per repo</span></h3>
+      <div class="m t-{{bud.qTone}}"><div class="m-top"><span class="m-val">{{bud.qTotal}} queued · {{bud.rTotal}} running</span><span class="m-den">{{bud.qDen}}</span></div></div>
+      <div class="tok">
+        <sc-for list="{{bud.queue}}" as="q" hint-placeholder-count="7"><div class="qrow"><span class="mono">{{q.repo}}</span><div class="qbar {{q.jam}}"><div class="qq" style="width: {{q.qw}}"></div><div class="qr" style="width: {{q.rw}}"></div></div><span class="mono">{{q.label}}</span></div></sc-for>
+      </div>
+      <div class="qleg"><span><i style="background: var(--bump)"></i>queued</span><span><i style="background: var(--run)"></i>running</span></div>
+      <span class="note {{bud.qNoteCls}}">{{bud.qNote}}</span>
+    </div>
+  </div>
+</section>
+</div>
+
+</div>
+
+<sc-if value="{{sync.on}}" hint-placeholder-val="{{false}}">
+<div class="overlay"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="syncTitle">
+  <div class="steps-i"><span class="stp {{sync.s1}}">1 · Preview</span><span class="stp {{sync.s2}}">2 · Confirm</span><span class="stp {{sync.s3}}">3 · Run</span></div>
+  <h3 id="syncTitle">{{sync.title}}</h3>
+  <sc-if value="{{sync.preview}}" hint-placeholder-val="{{true}}">
+    <p>Dry run: <code>sync-to-downstream.sh --sync-all --repos {{sync.repoArg}} --dry-run</code></p>
+    <ul class="checks">
+      <sc-for list="{{sync.pre}}" as="c" hint-placeholder-count="3"><li class="chk"><span class="g g-{{c.k}}" aria-hidden="true"></span>{{c.text}}</li></sc-for>
+    </ul>
+    <div class="plan">
+      <sc-for list="{{sync.plan}}" as="p" hint-placeholder-count="2">
+        <div class="plan-r">
+          <div class="plan-h"><span class="mono">{{p.repo}}</span><span class="b b-bump"><span class="g g-bump" aria-hidden="true"></span>{{p.label}}</span></div>
+          <ul class="paths"><sc-for list="{{p.paths}}" as="x" hint-placeholder-count="3"><li><span class="mono">{{x.path}}</span><span class="cls cls-{{x.cls}}">{{x.cls}}</span><span class="soft">{{x.dir}}</span></li></sc-for></ul>
+          <sc-if value="{{p.hasPr}}" hint-placeholder-val="{{false}}"><div class="plan-pr"><span>Open sync PR #{{p.prn}} exists.</span><button type="button" class="chipb {{p.skipCls}}" onClick="{{p.pickSkip}}" aria-pressed="{{p.isSkip}}">Skip</button><button type="button" class="chipb {{p.recCls}}" onClick="{{p.pickRec}}" aria-pressed="{{p.isRec}}">Recreate</button><span class="soft"><span>Recreate leaves #{{p.prn}} open; close it yourself.</span></span></div></sc-if>
+          <sc-if value="{{p.ahead}}" hint-placeholder-val="{{false}}"><div class="plan-warn"><span class="g g-bump" aria-hidden="true"></span><span>Consumer is ahead of the hub. Syncing overwrites {{p.aheadN}} consumer-ahead path. A second confirm is required.</span></div></sc-if>
+        </div>
+      </sc-for>
+    </div>
+    <div class="m-actions"><button type="button" class="btn" onClick="{{sync.cancel}}">Cancel</button><button type="button" class="btn primary" onClick="{{sync.toConfirm}}">Continue to confirm</button></div>
+  </sc-if>
+  <sc-if value="{{sync.confirm}}" hint-placeholder-val="{{false}}">
+    <p>Cut a sync from hub <code>origin/main 9a8fcdf</code> to <strong>{{sync.repoList}}</strong>. It runs as the author identity through <code>scripts/gh-as-author.sh</code>, one sync at a time, and is logged with operator, time, SHA and repos.</p>
+    <sc-if value="{{sync.needAck}}" hint-placeholder-val="{{false}}"><label class="ack"><input type="checkbox" id="syncAck" checked="{{sync.ack}}" onChange="{{sync.toggleAck}}"><span>I understand {{sync.aheadRepos}} is ahead of the hub and this sync overwrites those paths.</span></label></sc-if>
+    <div class="m-actions"><button type="button" class="btn" onClick="{{sync.back}}">Back</button><button type="button" class="btn primary" onClick="{{sync.start}}" disabled="{{sync.startDisabled}}">Start sync</button></div>
+  </sc-if>
+  <sc-if value="{{sync.running}}" hint-placeholder-val="{{false}}">
+    <div class="rails"><sc-for list="{{sync.rails}}" as="r" hint-placeholder-count="2"><div class="rail-r"><span class="mono">{{r.repo}}</span><div class="stages"><sc-for list="{{r.stages}}" as="s" hint-placeholder-count="5"><div class="stg stg-{{s.k}}"><span class="stg-dot" aria-hidden="true"></span><span class="stg-l">{{s.name}}</span></div></sc-for></div></div></sc-for></div>
+    <div class="log" aria-live="polite"><sc-for list="{{sync.lines}}" as="l" hint-placeholder-count="3"><span class="ll">{{l.t}}</span></sc-for><span class="cursor" aria-hidden="true"></span></div>
+  </sc-if>
+  <sc-if value="{{sync.done}}" hint-placeholder-val="{{false}}">
+    <div class="done"><span class="g xl g-clear" aria-hidden="true"></span><div><strong>Sync complete.</strong> {{sync.doneText}}</div></div>
+    <div class="prchips"><sc-for list="{{sync.newPrs}}" as="p" hint-placeholder-count="2"><span class="prchip mono">{{p.repo}} #{{p.n}}</span></sc-for></div>
+    <div class="m-actions"><button type="button" class="btn primary" onClick="{{sync.close}}">Close</button></div>
+  </sc-if>
+</div></div>
+</sc-if>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"scenario":{"editor":"enum","options":["calm","busy","bumps","boulder"],"default":"calm","section":"Prototype"},"dark":{"editor":"boolean","default":false,"section":"Theme"},"reduceMotion":{"editor":"boolean","default":false,"section":"Theme"},"$preview":{"width":1400,"height":4064}}'>
+const REPOS = ['mergepath','matchline','swipewatch','overridebroadway','nathanpaynedotcom','friends-and-family-billing','tadlockpsychiatry'];
+const VIS = {mergepath:'hub · public',matchline:'public',swipewatch:'private',overridebroadway:'private',nathanpaynedotcom:'public','friends-and-family-billing':'private',tadlockpsychiatry:'private'};
+const NEXT_PR = {matchline:213,swipewatch:89,overridebroadway:42,nathanpaynedotcom:138,'friends-and-family-billing':20,tadlockpsychiatry:8};
+const SCN = ['calm','busy','bumps','boulder'];
+const SCN_LABEL = {calm:'Calm',busy:'Busy',bumps:'Speed bumps ahead',boulder:'Boulder hit'};
+const SCN_G = {calm:'clear',busy:'run',bumps:'bump',boulder:'boulder'};
+const KIND_LABEL = {clear:'Clear',run:'Running',bump:'Speed bump',boulder:'Boulder',idle:'Idle',done:'Done'};
+// Road ahead strip layout. Markers keep their time position (pushed right to
+// stay at least 28 px apart when ETAs crowd); labels pack into four lanes above the line,
+// clamped inside the strip. A label with no room shrinks to its number, which
+// matches the numbered list below the strip.
+const ROAD_LANES = [84, 58, 32, 6], ROAD_GLYPH_TOP = 109;
+let roadCtx = null;
+function roadTextW(t, mono){
+  if (!roadCtx) roadCtx = document.createElement('canvas').getContext('2d');
+  roadCtx.font = mono ? '700 10px "JetBrains Mono", Menlo, monospace' : '11px "Instrument Sans", -apple-system, sans-serif';
+  return roadCtx.measureText(t).width;
+}
+function roadLayout(items, strip, tw){
+  const occ = ROAD_LANES.map(() => []);
+  const fits = (l, a, b, gap) => occ[l].every(r => b + gap <= r[0] || a >= r[1] + gap);
+  let prev = -Infinity;
+  items.forEach((it, i) => { it.n = i + 1; it.delay = (i * 70) + 'ms'; });
+  strip.forEach(it => {
+    const x = Math.min(tw - 10, Math.max(it.pct / 100 * tw, prev + 28)); prev = x;
+    it.x = x; it.pct = Math.round(x / tw * 1000) / 10;
+  });
+  // Pass 1: full labels in the three upper lanes, earliest items first. Pass 2:
+  // every marker still unlabelled gets its number in any lane with room, so a
+  // dense cluster still maps glyph to list row.
+  const place = (it, w, lanes, gap) => lanes.some(l => {
+    const a = Math.max(0, Math.min(it.x - w / 2, tw - w));
+    if (!fits(l, a, a + w, gap)) return false;
+    occ[l].push([a, a + w]); it.at = {l:l, a:a}; return true;
+  });
+  strip.forEach(it => { it.at = null; it.full = place(it, Math.ceil(roadTextW(it.short) + roadTextW(String(it.n), true) + 22), [1, 2, 3], 8); });
+  strip.forEach(it => { if (!it.at) place(it, Math.ceil(roadTextW(String(it.n), true) + 14), [0, 1, 2, 3], 3); });
+  strip.forEach(it => {
+    it.show = !!it.at; const at = it.at || {l:0, a:0};
+    it.lblX = Math.round(at.a - it.x); it.lblY = ROAD_LANES[at.l];
+    it.stemTop = it.lblY + 20; it.stemH = ROAD_GLYPH_TOP - it.stemTop; delete it.at;
+  });
+}
+const RANK = {boulder:0,bump:1,run:2,clear:3,done:3,idle:4};
+const MS_TONE = {CLEAN:'clear',BLOCKED:'run',BEHIND:'bump',UNSTABLE:'boulder',DIRTY:'boulder',MERGED:'done'};
+const CR = {reviewed:{tone:'clear',label:'reviewed on HEAD'},commented:{tone:'clear',label:'comment-only'},pending:{tone:'run',label:'review pending'},ratelimited:{tone:'bump',label:'rate-limited'},paused:{tone:'bump',label:'paused after 5 commits'}};
+const API = {calm:412,busy:900,bumps:1460,boulder:1900};
+const STAGES = ['barrier','adapter','posting','done'];
+const BUDGETS = [
+  {k:'b',abbr:'blk',short:'blocking reviews',name:'Codex blocking reviews',limit:10,src:'codex-review-ledger.sh'},
+  {k:'r',abbr:'req',short:'requests',name:'Codex requests (ceiling)',limit:20,src:'codex-review-ledger.sh'},
+  {k:'rounds',abbr:'rnd',short:'Codex rounds',name:'Codex rounds before automated Phase 4b',limit:10,src:'owner directive · ledger'},
+  {k:'reruns',abbr:'4b',short:'Phase 4b reruns',name:'Phase 4b reruns after CHANGES_REQUESTED',limit:1,src:'owner directive · phase-4b-loops'},
+  {k:'cr',abbr:'CR',short:'commits before CodeRabbit pauses',name:'Commits before CodeRabbit auto-pauses',limit:5,src:'commits since its last review'}
+];
+function budgetItems(p){
+  return BUDGETS.map(B => {
+    const used = p.bud[B.k]; const unknown = used === null || used === undefined;
+    const left = unknown ? null : Math.max(0, B.limit - used);
+    const tone = unknown ? 'idle' : left <= 0 ? 'boulder' : (B.limit >= 5 && left <= 2) ? 'bump' : 'clear';
+    return {k:B.k,abbr:B.abbr,short:B.short,name:B.name,limit:B.limit,src:B.src,unknown:unknown,left:left,used:used,tone:tone,
+      usedPct:unknown ? 0 : Math.min(100, used / B.limit * 100),tickPct:B.limit >= 5 ? Math.round((B.limit - 2) / B.limit * 100) : 100,cap:!unknown && left <= 0,
+      leftText:unknown ? 'unknown' : left + ' left',headline:unknown ? 'unknown' : left + ' left of ' + B.limit,usedText:unknown ? 'source unreadable, nothing guessed' : used + ' used'};
+  });
+}
+function budgetTone(p){
+  const items = budgetItems(p);
+  if (items.some(b => b.tone === 'boulder')) return 'boulder';
+  if (items.some(b => b.tone === 'bump')) return 'bump';
+  return 'clear';
+}
+const BUD = {
+  calm:{net:14.20,proj:21.80,tok:[310,120,80,60,40,90,30],pat:{used:1240,reset:'31 min',draw:[640,310,120]},q:[[0,2],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0]],conn:'connected'},
+  busy:{net:14.20,proj:22.10,tok:[560,220,140,90,60,180,40],pat:{used:2600,reset:'31 min',draw:[1420,620,310]},q:[[5,2],[2,1],[1,0],[1,0],[0,0],[0,0],[0,0]],conn:'connected'},
+  bumps:{net:15.90,proj:26.80,tok:[780,300,160,90,60,210,40],pat:{used:3900,reset:'22 min',draw:[1900,820,490]},q:[[14,1],[4,1],[3,0],[1,0],[1,0],[0,0],[0,0]],conn:'reconnecting'},
+  boulder:{net:19.40,proj:31.40,tok:[1000,340,180,90,60,230,40],pat:{used:4720,reset:'9 min',draw:[2600,940,560]},q:[[37,1],[8,0],[4,0],[2,0],[1,0],[1,0],[0,0]],conn:'connected',jam:'1h 12m'}
+};
+const HIST = [
+  {id:'p4b-1002-1358-a0',when:'today 13:58',repo:'mergepath',pr:1596,rev:'Claude',verdict:'APPROVED',vt:'clear',tokens:'in 48.2k · out 4.0k · cache 122k',cost:'$0.41',est:false,p1:0,p2:1,p3:2,el:'7:12'},
+  {id:'p4b-1002-1340-c9',when:'today 13:40',repo:'matchline',pr:211,rev:'Codex',verdict:'CHANGES_REQUESTED',vt:'bump',tokens:'61.2k total',naSplit:true,cost:'$0.37',est:true,p1:1,p2:2,p3:0,el:'18:04'},
+  {id:'p4b-1002-1255-b2',when:'today 12:55',repo:'friends-and-family-billing',pr:19,rev:'Codex',verdict:'CHANGES_REQUESTED',vt:'bump',tokens:'88.9k total',naSplit:true,cost:'$0.53',est:true,p1:0,p2:3,p3:1,el:'21:30'},
+  {id:'p4b-1002-1210-a4',when:'today 12:10',repo:'swipewatch',pr:87,rev:'Claude',verdict:'APPROVED',vt:'clear',tokens:'in 31.0k · out 2.1k · cache 80k',cost:'$0.26',est:false,p1:0,p2:0,p3:1,el:'5:40'},
+  {id:'p4b-1002-1130-d1',when:'today 11:30',repo:'overridebroadway',pr:40,rev:'Claude',verdict:'REFUSED · exit 4',vt:'idle',tokens:'in 2.1k · out 0.3k · cache 0',cost:'$0.02',est:false,p1:0,p2:0,p3:0,el:'0:48'},
+  {id:'p4b-1001-1702-c5',when:'Oct 1 17:02',repo:'mergepath',pr:1595,rev:'Codex',verdict:'Cleared · thumbs-up',vt:'clear',tokens:'44.7k total',naSplit:true,cost:'$0.27',est:true,p1:0,p2:0,p3:0,el:'14:50'},
+  {id:'p4b-1001-1510-a9',when:'Oct 1 15:10',repo:'nathanpaynedotcom',pr:136,rev:'Claude',verdict:'APPROVED',vt:'clear',tokens:'in 72.4k · out 5.6k · cache 210k',cost:'$0.58',est:false,p1:0,p2:2,p3:3,el:'9:05'},
+  {id:'p4b-1001-1122-c2',when:'Oct 1 11:22',repo:'tadlockpsychiatry',pr:6,rev:'Codex',verdict:'CHANGES_REQUESTED',vt:'bump',tokens:'120.3k total',naSplit:true,cost:'$0.72',est:true,p1:2,p2:1,p3:0,el:'24:12'}
+];
+const DAYS = [
+  {label:'Sep 26',c:1.12,x:1.26},{label:'Sep 27',c:0.84,x:1.08},{label:'Sep 28',c:1.90,x:2.04},{label:'Sep 29',c:0.66,x:0.54},{label:'Sep 30',c:2.31,x:2.52},{label:'Oct 1',c:1.05,x:1.56},{label:'Oct 2',c:0.69,x:0.90}
+];
+function pad(n){ return n < 10 ? '0' + n : '' + n; }
+function mmss(s){ s = Math.max(0, Math.floor(s)); return Math.floor(s / 60) + ':' + pad(s % 60); }
+function fmtN(n){ return n.toLocaleString('en-US'); }
+function etaPct(min){ if (min <= 0) return 4; const v = Math.log(1 + min) / Math.log(1 + 16000); return Math.round((4 + 90 * Math.min(1, v)) * 10) / 10; }
+function etaLabel(min){ if (min <= 0) return 'now'; if (min < 60) return 'in ~' + min + ' min'; if (min < 1440) return 'in ~' + Math.round(min / 60) + ' h'; return 'in ~' + Math.round(min / 1440) + ' days'; }
+function pr(o){
+  const base = {author:'nathanjohnpayne',draft:false,labels:[],cx:{b:0,r:0,stop:0,inflight:false},fb:{acc:0,posted:0},cr:'reviewed',checks:{ok:0,run:0,fail:0,total:0}};
+  const out = Object.assign(base, o);
+  out.cx = Object.assign({b:0,r:0,stop:0,inflight:false}, o.cx || {});
+  out.fb = Object.assign({acc:0,posted:0}, o.fb || {});
+  out.bud = Object.assign({b:out.cx.b,r:out.cx.r,rounds:0,reruns:0,cr:0}, o.bud || {});
+  out.llm = o.llm === null ? null : Object.assign({tokens:'0',cost:'$0.00',est:false,codex:false}, o.llm || {});
+  return out;
+}
+function prsFor(s){
+  const L = [];
+  const calm = s === 'calm', busy = s === 'busy', bumps = s === 'bumps', boulder = s === 'boulder';
+  L.push(pr({repo:'mergepath',n:1598,title:'feat(cockpit): server shell, SSE stream and request budget',head:'a3f9c21',age:'2h',push:'14m',ms:'BLOCKED',why:'codex-review-check in progress',checks:{ok:6,run:1,fail:0,total:7},labels:['needs-external-review'],cx:{b:calm?2:3,r:calm?4:7,inflight:true},bud:{rounds:calm?2:3,reruns:0,cr:calm?1:2},llm:{tokens:'96k',cost:'$0.82'},fb:{acc:calm||busy?14:12,posted:14},cr:'reviewed'}));
+  L.push(pr({repo:'matchline',n:212,title:'sync: review policy and ci kit 2026-10-01',head:'5d02e8f',age:'41m',push:'41m',ms:'CLEAN',why:'auto-merge armed · propagation lane',checks:{ok:5,total:5},cx:{b:0,r:1},bud:{rounds:1,cr:0},llm:{tokens:'12k',cost:'$0.07'},cr:'commented'}));
+  L.push(pr({repo:'mergepath',n:1599,title:'test(cockpit): hermetic server suite and check_cockpit',head:'e81b7aa',age:'55m',push:'6m',ms:'BLOCKED',why:'repo_lint in progress',checks:{ok:3,run:2,total:7},cx:{b:1,r:2},bud:{rounds:1,cr:1},llm:{tokens:'40k',cost:'$0.31'},fb:{acc:4,posted:4},cr:'pending'}));
+  L.push(pr({repo:'friends-and-family-billing',n:19,title:'fix(invoice): proration rounds half-even',head:'c7b1d04',age:'3d',push:'1h',ms:'BLOCKED',why:(bumps||boulder)?'one Codex round left before Phase 4b · CodeRabbit pauses on the next commit':'waiting on Codex round ' + (calm?4:7),checks:{ok:7,total:7},labels:['needs-external-review'],cx:{b:calm?3:busy?6:8,r:calm?6:busy?11:16,inflight:true},bud:{rounds:calm?4:busy?7:9,reruns:0,cr:calm?1:busy?2:4},llm:{tokens:'310k',cost:'$2.40',est:true,codex:true},fb:{acc:(calm||busy)?34:31,posted:34},cr:'reviewed'}));
+  L.push(pr({repo:'tadlockpsychiatry',n:7,title:'chore: bump ci kit to hub 9a8fcdf',head:'0f4c9d2',age:'20m',push:'20m',ms:'CLEAN',why:(bumps||boulder)?'auto-merge waits for the CodeRabbit report':'auto-merge armed',checks:{ok:4,total:4},bud:{rounds:0,cr:2},llm:{tokens:'0',cost:'$0.00'},cr:(bumps||boulder)?'ratelimited':'reviewed',crEta:11}));
+  if (bumps || boulder) L.push(pr({repo:'swipewatch',n:88,title:'sync: review policy and ci kit 2026-10-01',head:'b44d1c7',age:'1d',push:'1d',ms:'BEHIND',why:'base moved · update-branch keeps the APPROVED',checks:{ok:4,fail:1,total:5},cx:{b:0,r:1},bud:{rounds:1,cr:null},llm:null,cr:'reviewed'}));
+  if (busy || boulder) L.push(pr({repo:'mergepath',n:1601,title:'docs(agents): cockpit operating notes',head:'77a0e13',age:'3h',push:'3h',draft:true,ms:boulder?'DIRTY':'BLOCKED',why:boulder?'conflicts with main · needs a human rebase':'draft · lint-fast in progress',checks:{ok:2,run:boulder?0:1,total:3},bud:{cr:1},cr:'pending'}));
+  if (busy) {
+    L.push(pr({repo:'overridebroadway',n:41,title:'fix(auth): session cookie SameSite',head:'3e7ab02',age:'6h',push:'2h',ms:'BLOCKED',why:'codeql in progress',checks:{ok:6,run:1,total:7},labels:['needs-external-review'],cx:{b:1,r:3},bud:{rounds:1,cr:1},llm:{tokens:'58k',cost:'$0.44'},fb:{acc:2,posted:2}}));
+    L.push(pr({repo:'nathanpaynedotcom',n:137,title:'feat(blog): reading time and series nav',head:'91c3f50',age:'2d',push:'5h',ms:'BLOCKED',why:'merge-clearance in progress',checks:{ok:4,run:1,total:5},cx:{b:2,r:4},bud:{rounds:2,cr:1},llm:{tokens:'120k',cost:'$0.95'},fb:{acc:6,posted:6}}));
+  }
+  if (boulder) {
+    L.push(pr({repo:'mergepath',n:1584,title:'fix(codex-request): blocking-review budget at the request write boundary',head:'4c0d7e9',age:'1d',push:'3h',ms:'BLOCKED',why:'review budgets spent · waiting on the human',checks:{ok:7,total:7},labels:['needs-human-review'],cx:{b:10,r:18,inflight:false},bud:{rounds:10,reruns:1,cr:3},llm:{tokens:'1.2M',cost:'$9.40',est:true,codex:true},fb:{acc:52,posted:52},cr:'reviewed'}));
+    L.push(pr({repo:'nathanpaynedotcom',n:137,title:'feat(blog): reading time and series nav',head:'91c3f50',age:'2d',push:'5h',ms:'BLOCKED',why:'human-hold · human-remove only',checks:{ok:5,total:5},labels:['human-hold'],cx:{b:2,r:4,stop:1},bud:{rounds:2,cr:1},llm:{tokens:'120k',cost:'$0.95'},fb:{acc:6,posted:6}}));
+    L.push(pr({repo:'overridebroadway',n:41,title:'fix(auth): session cookie SameSite',head:'3e7ab02',age:'6h',push:'2h',ms:'UNSTABLE',why:'CodeQL failed · not retryable',checks:{ok:6,fail:1,total:7},labels:['needs-external-review'],cx:{b:1,r:3},bud:{rounds:1,cr:1},llm:{tokens:'58k',cost:'$0.44'},fb:{acc:2,posted:2}}));
+  }
+  return L;
+}
+function prTone(p){
+  if (p.labels.indexOf('human-hold') >= 0 || p.labels.indexOf('policy-violation') >= 0) return ['boulder','Human stop'];
+  if (p.ms === 'UNSTABLE') return ['boulder','Unstable'];
+  if (p.ms === 'DIRTY') return ['boulder','Conflicts'];
+  const bt = budgetTone(p);
+  if (bt === 'boulder') return ['boulder','Budget spent'];
+  if (bt === 'bump') return ['bump','Budget near'];
+  if (p.cr === 'ratelimited' || p.cr === 'paused') return ['bump','Rate-limited'];
+  if (p.ms === 'BEHIND') return ['bump','Behind main'];
+  if (p.fb.acc < p.fb.posted) return ['bump','Unaccounted'];
+  if (p.draft) return ['idle','Draft'];
+  if (p.ms === 'CLEAN') return ['clear','Clean'];
+  if (p.checks.run > 0 || p.cx.inflight) return ['run','In progress'];
+  return ['idle','Waiting'];
+}
+function runsFor(s){
+  const R = [];
+  const calm = s === 'calm', busy = s === 'busy', bumps = s === 'bumps', boulder = s === 'boulder';
+  R.push({id:9123,repo:'mergepath',pr:1598,head:'a3f9c21',wf:'repo_lint',st:'run',dur:'3m 12s',jobs:[
+    {name:'lint-fast',st:'ok',dur:'48s',steps:[['check_shell','ok','12s'],['check_md_prose_wrap','ok','4s'],['check_yaml','ok','3s'],['check_ci_scripts_wired','ok','2s'],['check_agents_docs','ok','9s']]},
+    {name:'deep-safety',st:'run',dur:'2m 20s',steps:[['check_secrets','ok','41s'],['check_propagated_fixtures','run','1m 02s'],['check_cockpit','queued','']]},
+    {name:'lint',st:'queued',dur:'',steps:[]}]});
+  R.push({id:9124,repo:'mergepath',pr:1598,head:'a3f9c21',wf:'codex-review-check',st:'run',dur:'3m 05s',jobs:[
+    {name:'gate-a-token-reachability',st:'ok',dur:'14s',steps:[['resolve token','ok','3s'],['probe reachability','ok','11s']]},
+    {name:'gate-b-clearance',st:'run',dur:'2m 40s',steps:[['read ledger','ok','6s'],['await verdict','run','2m 30s']]}]});
+  R.push({id:9119,repo:'mergepath',pr:1599,head:'e81b7aa',wf:'repo_lint',st:'run',dur:'1m 02s',jobs:[
+    {name:'lint-fast',st:'run',dur:'1m 02s',steps:[['check_shell','ok','12s'],['check_md_prose_wrap','run','30s'],['check_yaml','queued',''],['check_ci_scripts_wired','queued',''],['check_agents_docs','queued','']]},
+    {name:'deep-safety',st:'queued',dur:'',steps:[]},{name:'lint',st:'queued',dur:'',steps:[]}]});
+  R.push({id:9101,repo:'matchline',pr:212,head:'5d02e8f',wf:'repo_lint',st:'ok',dur:'4m 41s',jobs:[
+    {name:'lint-fast',st:'ok',dur:'52s',steps:[['check_shell','ok','11s'],['check_md_prose_wrap','ok','5s'],['check_yaml','ok','3s'],['check_ci_scripts_wired','ok','2s']]},
+    {name:'deep-safety',st:'ok',dur:'3m 10s',steps:[['check_secrets','ok','40s'],['check_propagated_fixtures','ok','2m 20s']]},
+    {name:'lint',st:'ok',dur:'4s',steps:[['aggregate','ok','4s']]}]});
+  if (bumps || boulder) R.push({id:9088,repo:'swipewatch',pr:88,head:'b44d1c7',wf:'repo_lint',st:'fail',dur:'3m 58s',stale:true,failLine:'FAIL: check_propagated_fixtures: fixtures/sample-token.txt matches the secret scanner (ghp_ prefix)',jobs:[
+    {name:'lint-fast',st:'ok',dur:'50s',steps:[['check_shell','ok','12s'],['check_md_prose_wrap','ok','4s'],['check_yaml','ok','3s']]},
+    {name:'deep-safety',st:'fail',dur:'2m 50s',steps:[['check_secrets','ok','40s'],['check_propagated_fixtures','fail','1m 10s']]},
+    {name:'lint',st:'skipped',dur:'',steps:[]}]});
+  if (busy) {
+    R.push({id:9131,repo:'overridebroadway',pr:41,head:'3e7ab02',wf:'codeql',st:'run',dur:'6m 40s',jobs:[{name:'analyze (javascript)',st:'run',dur:'6m 40s',steps:[['init','ok','40s'],['autobuild','ok','3m 10s'],['analyze','run','2m 50s']]}]});
+    R.push({id:9133,repo:'nathanpaynedotcom',pr:137,head:'91c3f50',wf:'merge-clearance',st:'run',dur:'48s',jobs:[{name:'clearance',st:'run',dur:'48s',steps:[['external-review arm','run','40s'],['dependabot arm','queued','']]}]});
+    R.push({id:9098,repo:'tadlockpsychiatry',pr:7,head:'0f4c9d2',wf:'repo_lint',st:'ok',dur:'3m 02s',jobs:[{name:'lint-fast',st:'ok',dur:'44s',steps:[['check_shell','ok','10s'],['check_yaml','ok','3s']]},{name:'deep-safety',st:'ok',dur:'2m 10s',steps:[['check_secrets','ok','38s']]},{name:'lint',st:'ok',dur:'3s',steps:[['aggregate','ok','3s']]}]});
+  }
+  if (bumps || boulder) R.push({id:9130,repo:'friends-and-family-billing',pr:19,head:'c7b1d04',wf:'merge-clearance',st:'queued',longQ:true,dur:boulder?'queued 1h 12m':'queued 18m',jobs:[]});
+  if (boulder) {
+    R.push({id:9077,repo:'overridebroadway',pr:41,head:'3e7ab02',wf:'codeql',st:'fail',dur:'11m 20s',fatal:true,failLine:'Error: CodeQL analysis failed: database finalize exited 32 (not retryable)',jobs:[{name:'analyze (javascript)',st:'fail',dur:'11m 20s',steps:[['init','ok','40s'],['autobuild','ok','3m 10s'],['analyze','fail','7m 30s']]}]});
+    R.push({id:9140,repo:'mergepath',pr:1601,head:'77a0e13',wf:'repo_lint',st:'fail',dur:'22s',ratelimit:true,failLine:'Error: API rate limit exceeded for installation ID 48812 (GITHUB_TOKEN)',jobs:[{name:'lint-fast',st:'fail',dur:'22s',steps:[['checkout','ok','4s'],['check_shell','fail','18s']]}]});
+  }
+  return R;
+}
+function runTone(r){
+  if (r.fatal) return ['boulder','Not retryable'];
+  if (r.ratelimit) return ['boulder','Token exhausted'];
+  if (r.stale) return ['bump','Stale failure'];
+  if (r.st === 'fail') return ['bump','Failed'];
+  if (r.st === 'queued' && r.longQ) return ['bump','Queued long'];
+  if (r.st === 'queued') return ['idle','Queued'];
+  if (r.st === 'run') return ['run','Running'];
+  return ['clear','Passed'];
+}
+function agentsFor(s){
+  const A = [];
+  A.push({id:'p4b-1002-1412-a1',repo:'mergepath',pr:1598,rev:'Claude',stage:'adapter',ago:s==='calm'?130:s==='busy'?402:700,timeout:840,pid:48119});
+  if (s !== 'calm') A.push({id:'p4b-1002-1419-c3',repo:'friends-and-family-billing',pr:19,rev:'Codex',stage:'barrier',ago:95,timeout:1245,pid:48131,note:'barrier: waiting on the CodeRabbit report for c7b1d04'});
+  if (s === 'busy') A.push({id:'p4b-1002-1421-d2',repo:'nathanpaynedotcom',pr:137,rev:'Claude',stage:'posting',ago:610,timeout:840,pid:48140});
+  if (s === 'boulder') A.push({id:'p4b-1002-1355-b7',repo:'swipewatch',pr:88,rev:'Codex',stage:'posting',ago:1500,timeout:1245,pid:48122,crashed:true,note:'no done stage · last heartbeat 14:03'});
+  return A;
+}
+function fleetFor(s){
+  const err = s === 'bumps' || s === 'boulder';
+  return [
+    {repo:'matchline',st:'in-sync',hub:'9a8fcdf',cons:'3b1e2a0',paths:[],pr:{n:212,ms:'CLEAN'}},
+    {repo:'swipewatch',st:'drift',hub:'9a8fcdf',cons:'b44d1c7',paths:[['scripts/ci/check_shell.sh','kit','hub ahead'],['REVIEW_POLICY.md','canonical','hub ahead'],['.github/workflows/repo_lint.yml','templated','re-render differs']],pr:{n:88,ms:'BEHIND'}},
+    {repo:'overridebroadway',st:'ahead',hub:'9a8fcdf',cons:'3e7ab02',paths:[['scripts/ci/check_yaml.sh','kit','consumer ahead of hub']],pr:null},
+    {repo:'nathanpaynedotcom',st:'override-only',hub:'9a8fcdf',cons:'91c3f50',paths:[['AGENTS.md','templated','covered by .sync-overrides.yml']],pr:null},
+    {repo:'friends-and-family-billing',st:'drift',hub:'9a8fcdf',cons:'c7b1d04',paths:[['scripts/ci/check_shell.sh','kit','hub ahead'],['scripts/ci/check_md_prose_wrap.sh','kit','hub ahead'],['scripts/ci/lib/common.sh','kit','hub ahead'],['REVIEW_POLICY.md','canonical','hub ahead'],['docs/agents/documentation-rules.md','canonical','hub ahead'],['.github/workflows/repo_lint.yml','templated','re-render differs'],['AGENTS.md','templated','re-render differs']],pr:null},
+    {repo:'tadlockpsychiatry',st:err?'fetch-error':'in-sync',hub:'9a8fcdf',cons:'0f4c9d2',paths:[],pr:null,err:err?'git fetch exited 128 · last good audit kept':''}
+  ];
+}
+function fleetTone(f){
+  if (f.st === 'in-sync') return ['clear','In sync'];
+  if (f.st === 'drift') return ['bump','Drift · ' + f.paths.length + ' path' + (f.paths.length === 1 ? '' : 's')];
+  if (f.st === 'ahead') return ['bump','Ahead of hub'];
+  if (f.st === 'override-only') return ['clear','Override-only'];
+  if (f.st === 'synced') return ['run','Sync PR open'];
+  return ['bump','Fetch error'];
+}
+function classSummary(paths){
+  const c = {};
+  paths.forEach(p => { c[p[1]] = (c[p[1]] || 0) + 1; });
+  return Object.keys(c).map(k => c[k] + ' ' + k).join(', ');
+}
+function syncScript(targets){
+  const L = []; let t = 0;
+  const ts = () => { t += 1; const d = new Date(Date.now() + t * 1000); return '[' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()) + '] '; };
+  L.push(ts() + 'preflight: hub checkout clean at origin/main 9a8fcdf');
+  L.push(ts() + 'lock: acquired .mergepath/sync.lock (single-flight)');
+  L.push(ts() + 'identity: gh-as-author.sh verified nathanjohnpayne');
+  targets.forEach(x => {
+    L.push(ts() + x.repo + ': fetch origin/main ' + x.cons);
+    L.push(ts() + x.repo + ': diff ' + x.paths.length + ' path(s) · ' + x.classes);
+    L.push(ts() + x.repo + ': branch mergepath-sync/2026-10-02-9a8fcdf');
+    L.push(ts() + x.repo + ': commit ' + x.paths.length + ' file(s) · signed');
+    L.push(ts() + x.repo + ': PR #' + x.newPr + ' opened' + (x.recreate ? ' (previous #' + x.oldPr + ' left open)' : ''));
+  });
+  L.push(ts() + 'done: ' + targets.length + ' PR(s) opened · lock released');
+  return L;
+}
+class Component extends DCLogic {
+  constructor(props){
+    super(props);
+    const now = Date.now();
+    this.state = {scn:null,dark:null,rm:null,filter:'all',openRun:null,openFleet:null,openBud:null,sync:null,now:now,base:now,merged:{},gone:{},drained:0,audit:null,auditAt:'12 min ago',synced:{},extraPrs:[],justSynced:{}};
+  }
+  componentDidMount(){ this.timer = setInterval(() => this.tick(), 1000); this.onResize = () => this.forceUpdate(); window.addEventListener('resize', this.onResize); }
+  componentWillUnmount(){ clearInterval(this.timer); window.removeEventListener('resize', this.onResize); }
+  trackW(){ const el = document.querySelector('.road .strip'); return (el && el.clientWidth) || Math.max(300, Math.min(window.innerWidth, 1400) - 120); }
+  scnName(){ const s = this.state.scn; if (s !== null) return SCN[s]; const p = this.props.scenario; return SCN.indexOf(p) >= 0 ? p : 'calm'; }
+  isDark(){ return this.state.dark !== null ? this.state.dark : !!this.props.dark; }
+  isRm(){ return this.state.rm !== null ? this.state.rm : !!this.props.reduceMotion; }
+  tick(){
+    const st = this.state; const upd = {now: Date.now()};
+    if (st.sync && st.sync.stage === 'running') {
+      const li = st.sync.li + 1;
+      if (li > st.sync.script.length) {
+        upd.sync = Object.assign({}, st.sync, {stage:'done', li:li});
+        const synced = Object.assign({}, st.synced); const js = {}; const extra = st.extraPrs.slice();
+        st.sync.targets.forEach(t => {
+          synced[t.repo] = t.newPr; js[t.repo] = true;
+          extra.push(pr({repo:t.repo,n:t.newPr,title:'sync: canonical and kit surfaces from hub 9a8fcdf',head:'9a8fcdf',age:'just now',push:'just now',ms:'BLOCKED',why:'repo_lint queued · propagation lane',checks:{run:1,total:5},cr:'pending',fresh:true}));
+        });
+        upd.synced = synced; upd.justSynced = js; upd.extraPrs = extra;
+        setTimeout(() => this.setState({justSynced:{}}), 7000);
+      } else upd.sync = Object.assign({}, st.sync, {li:li});
+    }
+    if (st.audit !== null) { const p = st.audit + 20; if (p >= 100) { upd.audit = null; upd.auditAt = 'just now'; } else upd.audit = p; }
+    if (this.scnName() === 'busy' && Math.floor((Date.now() - st.base) / 1000) % 4 === 0) upd.drained = Math.min(st.drained + 1, 5);
+    this.setState(upd);
+  }
+  pickScn(i){ this.setState({scn:i,openRun:null,openFleet:null,openBud:null,sync:null,merged:{},gone:{},drained:0,synced:{},extraPrs:[],justSynced:{},audit:null,base:Date.now()}); }
+  allPrs(){ const s = this.scnName(); const L = prsFor(s).concat(this.state.extraPrs); L.forEach(p => { p.key = p.repo + '#' + p.n; }); return L; }
+  simMerge(){
+    const st = this.state; const rows = this.allPrs().filter(p => !st.gone[p.key] && !st.merged[p.key]);
+    let t = rows.find(p => prTone(p)[0] === 'clear'); if (!t) t = rows.find(p => p.ms === 'CLEAN'); if (!t) return;
+    const m = Object.assign({}, st.merged); m[t.key] = true; this.setState({merged:m});
+    setTimeout(() => { const g = Object.assign({}, this.state.gone); g[t.key] = true; this.setState({gone:g}); }, 7000);
+  }
+  fleetRows(){
+    const s = this.scnName();
+    return fleetFor(s).map(f => { const sp = this.state.synced[f.repo]; if (sp) return Object.assign({}, f, {st:'synced',pr:{n:sp,ms:'BLOCKED'}}); return f; });
+  }
+  openSync(names){
+    const fleet = this.fleetRows(); const targets = []; const skipped = [];
+    names.forEach(n => {
+      const f = fleet.find(x => x.repo === n); if (!f) return;
+      if (f.st === 'drift' || f.st === 'ahead') targets.push({repo:f.repo,cons:f.cons,paths:f.paths,classes:classSummary(f.paths),ahead:f.st === 'ahead',oldPr:f.pr ? f.pr.n : 0,choice:'skip',newPr:NEXT_PR[f.repo]});
+      else skipped.push(f.repo + ' (' + f.st + ')');
+    });
+    this.setState({sync:{stage:'preview',targets:targets,skipped:skipped,ack:false,li:0,script:[]}});
+  }
+  setChoice(repo, choice){
+    const sy = this.state.sync; if (!sy) return;
+    const targets = sy.targets.map(t => t.repo === repo ? Object.assign({}, t, {choice:choice, recreate:choice === 'recreate'}) : t);
+    this.setState({sync:Object.assign({}, sy, {targets:targets})});
+  }
+  setStage(stage){ this.setState({sync:Object.assign({}, this.state.sync, {stage:stage})}); }
+  startSync(active){ this.setState({sync:Object.assign({}, this.state.sync, {stage:'running',targets:active,li:0,script:syncScript(active)})}); }
+  renderVals(){
+    const st = this.state, s = this.scnName(), dark = this.isDark(), rm = this.isRm();
+    const secs = Math.floor((st.now - st.base) / 1000);
+    const bud = BUD[s];
+    const visible = this.allPrs().filter(p => !st.gone[p.key]);
+    const filters = [{key:'all',label:'All',n:visible.length}].concat(REPOS.map(r => ({key:r,label:r === 'mergepath' ? 'mergepath (hub)' : r,n:visible.filter(p => p.repo === r).length})))
+      .map(f => Object.assign(f, {on:st.filter === f.key,cls:st.filter === f.key ? 'on' : '',pick:() => this.setState({filter:f.key})}));
+    const counts = {boulder:0,bump:0,run:0,clear:0,idle:0,done:0};
+    const rows = visible.filter(p => st.filter === 'all' || p.repo === st.filter)
+      .map(p => { const t = prTone(p); const merged = !!st.merged[p.key]; return {p:p,tone:merged ? 'done' : t[0],toneLabel:merged ? 'Merged' : t[1],merged:merged}; })
+      .sort((a, b) => RANK[a.tone] - RANK[b.tone])
+      .map((x, i) => {
+        const p = x.p; counts[x.tone] += 1; const c = p.checks;
+        const pips = [];
+        for (let j = 0; j < c.ok; j++) pips.push({k:'ok'});
+        for (let j = 0; j < c.run; j++) pips.push({k:'run'});
+        for (let j = 0; j < c.fail; j++) pips.push({k:'fail'});
+        for (let j = 0; j < Math.max(0, c.total - c.ok - c.run - c.fail); j++) pips.push({k:'queued'});
+        const budgets = budgetItems(p); const budOpen = st.openBud === p.key;
+        const llmText = p.llm ? ('LLM ' + p.llm.tokens + ' tokens · ' + p.llm.cost + (p.llm.est ? ' est' : '') + (p.llm.codex ? ' · Codex split n/a' : '')) : 'LLM spend unknown · ledger unreadable';
+        const llmHead = p.llm ? (p.llm.tokens + ' tokens · ' + p.llm.cost + (p.llm.est ? ' est' : '')) : 'unknown';
+        const llmSub = p.llm ? (p.llm.codex ? 'Codex reports totals only; input/output split unavailable, cost estimated from prices.json' : 'Claude adapter: split and total_cost_usd reported') : 'The checkout holding this ledger is not in the server root list. Nothing is guessed.';
+        const cr = CR[p.cr] || CR.reviewed;
+        return {repo:p.repo,n:p.n,title:p.title,author:p.author,head:p.head,draftTag:p.draft ? ' · draft' : '',age:p.age,push:p.push,
+          tone:x.tone,toneLabel:x.toneLabel,cls:(x.merged ? 'merged ' : '') + (p.fresh ? 'fresh' : ''),merged:x.merged,delay:(i * 40) + 'ms',
+          ms:x.merged ? 'MERGED' : p.ms,why:x.merged ? 'auto-merge fired on the exact head' : p.why,pips:pips,
+          checksLabel:c.ok + ' of ' + c.total + ' required passed' + (c.run ? ' · ' + c.run + ' running' : '') + (c.fail ? ' · ' + c.fail + ' failed' : ''),
+          labels:p.labels.map(l => ({name:l,k:(l === 'human-hold' || l === 'policy-violation') ? 'hold' : 'ext'})),noLabels:p.labels.length === 0,
+          budgets:budgets,llmText:llmText,llmHead:llmHead,llmSub:llmSub,budOpen:budOpen,budLabel:budOpen ? 'hide budgets' : 'all budgets',toggleBud:() => this.setState({openBud:budOpen ? null : p.key}),
+          inflight:!!p.cx.inflight && !x.merged,stop:p.cx.stop > 0,
+          fb:p.fb.acc + ' / ' + p.fb.posted,fbCls:p.fb.acc < p.fb.posted ? 'ink-bump' : '',
+          crTone:cr.tone,crLabel:cr.label + (p.cr === 'ratelimited' ? ' · ' + p.crEta + ' min' : '')};
+      });
+    const prs = {rows:rows,polled:(secs % 15) + ' s ago',summary:visible.length + ' open · ' + counts.boulder + ' boulder' + (counts.boulder === 1 ? '' : 's') + ' · ' + counts.bump + ' speed bump' + (counts.bump === 1 ? '' : 's') + ' · ' + counts.run + ' in progress'};
+    const runs = runsFor(s).map(r => {
+      const t = runTone(r); const open = st.openRun === r.id;
+      const jobs = r.jobs.map(j => ({name:j.name,k:j.st,dur:j.dur || '',steps:(j.steps || []).map(x => ({name:x[0],k:x[1],dur:x[2]}))}));
+      let flag = false, flagTitle = '', flagDetail = '', cmd = '';
+      if (r.stale) { flag = true; flagTitle = 'Stale failed check-run on HEAD ' + r.head; flagDetail = 'No later pass of ' + r.wf + ' superseded it, so the merge gate still reads it as failed.'; cmd = 'gh run rerun ' + r.id + ' --failed --repo nathanjohnpayne/' + r.repo; }
+      if (r.fatal) { flag = true; flagTitle = 'Not retryable'; flagDetail = 'CodeQL finalize failed. A rerun will not help; the PR stays UNSTABLE until the analysis is fixed at source.'; }
+      if (r.ratelimit) { flag = true; flagTitle = 'GITHUB_TOKEN exhausted for ' + r.repo; flagDetail = '"API rate limit exceeded for installation" is the hard signal that the 1,000 per hour per-repo budget is spent. Resets in 47 min.'; }
+      if (r.st === 'queued' && r.longQ) { flag = true; flagTitle = 'Waiting for a runner: ' + r.dur; flagDetail = 'A required gate stuck in a full queue. See queue pressure in the Actions budget.'; }
+      return {id:r.id,wf:r.wf,repo:r.repo,pr:r.pr,head:r.head,dur:r.dur,tone:t[0],label:t[1],open:open,chev:open ? '−' : '+',toggle:() => this.setState({openRun:open ? null : r.id}),jobs:jobs,flag:flag,flagTitle:flagTitle,flagDetail:flagDetail,cmd:cmd,hasCmd:!!cmd,failLine:r.failLine || '',hasFail:!!r.failLine,noJobs:jobs.length === 0};
+    });
+    const rc = {run:0,fail:0};
+    runs.forEach(r => { if (r.tone === 'run') rc.run += 1; if (r.tone === 'bump' || r.tone === 'boulder') rc.fail += 1; });
+    const ci = {polled:(secs % 20) + ' s ago',summary:rc.run + ' running · ' + rc.fail + ' need' + (rc.fail === 1 ? 's' : '') + ' attention · ' + runs.length + ' recent'};
+    const agents = agentsFor(s).map(a => {
+      const band = Math.max(1, (a.ago < a.timeout * .8 ? Math.floor(a.timeout * .79) : a.timeout - 1) - a.ago); const elapsedS = a.crashed ? a.ago : a.ago + (secs % band); const pct = Math.min(100, Math.round(elapsedS / a.timeout * 100));
+      const timedOut = !a.crashed && elapsedS >= a.timeout;
+      const tone = (a.crashed || timedOut) ? 'boulder' : pct >= 80 ? 'bump' : 'run'; const label = a.crashed ? 'Crashed · pid dead' : timedOut ? 'Timed out · no verdict' : pct >= 80 ? 'Near timeout' : 'Running';
+      const ci2 = STAGES.indexOf(a.stage);
+      const stages = STAGES.map((n, i) => ({name:n,k:i < ci2 ? 'done' : i === ci2 ? (a.crashed ? 'crash' : 'cur') : 'todo'}));
+      return {id:a.id,repo:a.repo,pr:a.pr,rev:a.rev,revk:a.rev.toLowerCase(),tone:tone,label:label,stages:stages,elapsed:mmss(elapsedS),timeout:mmss(a.timeout),elapsedS:elapsedS,timeoutS:a.timeout,pct:pct,pid:a.pid,noteText:a.note ? ' · ' + a.note : '',crashed:!!a.crashed};
+    });
+    const ag = {polled:(secs % 5) + ' s ago',summary:agents.filter(a => !a.crashed).length + ' running · ' + agents.filter(a => a.crashed).length + ' crashed'};
+    const fleetRaw = this.fleetRows();
+    const fleet = fleetRaw.map(f => {
+      const t = fleetTone(f); const open = st.openFleet === f.repo; const canSync = f.st === 'drift' || f.st === 'ahead';
+      return {repo:f.repo,vis:VIS[f.repo],tone:t[0],label:t[1],cls:(st.justSynced[f.repo] ? 'just ' : '') + (open ? 'open' : ''),hub:f.hub,cons:f.cons,
+        hasPaths:f.paths.length > 0,noPaths:f.paths.length === 0,pathsLabel:f.paths.length + ' path' + (f.paths.length === 1 ? '' : 's') + (open ? ' · hide' : ' · show'),
+        toggle:() => this.setState({openFleet:open ? null : f.repo}),open:open && f.paths.length > 0,paths:f.paths.map(x => ({path:x[0],cls:x[1],dir:x[2]})),
+        pr:!!f.pr,noPr:!f.pr,prn:f.pr ? f.pr.n : 0,prMs:f.pr ? f.pr.ms : '',prTone:f.pr ? MS_TONE[f.pr.ms] : 'idle',
+        audit:f.st === 'fetch-error' ? '42 min ago' : st.auditAt,stale:f.st === 'fetch-error',err:f.err || '',hasErr:!!f.err,
+        sync:() => this.openSync([f.repo]),noSync:!canSync || st.audit !== null || !!st.sync};
+    });
+    const fc = {sync:0,drift:0,ahead:0,err:0,open:0};
+    fleetRaw.forEach(f => { if (f.st === 'in-sync' || f.st === 'override-only') fc.sync += 1; if (f.st === 'drift') fc.drift += 1; if (f.st === 'ahead') fc.ahead += 1; if (f.st === 'fetch-error') fc.err += 1; if (f.st === 'synced') fc.open += 1; });
+    const fl = {summary:fc.sync + ' in sync · ' + fc.drift + ' drifting · ' + fc.ahead + ' ahead' + (fc.open ? ' · ' + fc.open + ' sync PR open' : '') + (fc.err ? ' · ' + fc.err + ' fetch error' : ''),busy:st.audit !== null || !!st.sync};
+    const net = bud.net, proj = bud.proj;
+    const spendTone = net >= 25 ? 'boulder' : net >= 17.5 ? 'bump' : 'clear';
+    const tok = REPOS.map((r, i) => { const v = bud.tok[i]; const tone = v >= 1000 ? 'boulder' : v >= 700 ? 'bump' : 'clear'; return {repo:r,v:v >= 1000 ? 'exhausted' : 'est. ' + fmtN(v),pct:Math.min(100, v / 10),tone:tone}; });
+    const tokTone = tok.some(t => t.tone === 'boulder') ? 'boulder' : tok.some(t => t.tone === 'bump') ? 'bump' : 'clear';
+    const pat = bud.pat; const patTone = pat.used >= 5000 ? 'boulder' : pat.used >= 3500 ? 'bump' : 'clear';
+    const q = bud.q.map((x, i) => ({repo:REPOS[i],q:x[0],r:x[1]}));
+    if (s === 'busy') q[0].q = Math.max(0, q[0].q - st.drained);
+    const qt = q.reduce((a, x) => a + x.q, 0), rt = q.reduce((a, x) => a + x.r, 0);
+    const qmax = Math.max(10, Math.max.apply(null, q.map(x => x.q + x.r)));
+    const qTone = bud.jam ? 'boulder' : qt >= 10 ? 'bump' : 'clear';
+    const queue = q.map(x => ({repo:x.repo,q:x.q,r:x.r,qw:(x.q / qmax * 100) + '%',rw:(x.r / qmax * 100) + '%',label:x.q + ' / ' + x.r,jam:bud.jam && x.q > 20 ? 'jam' : ''}));
+    const budget = {summary:(spendTone === 'clear' && tokTone === 'clear' && patTone === 'clear' && qTone === 'clear') ? 'Headroom on every meter' : [spendTone,tokTone,patTone,qTone].filter(t => t === 'boulder').length + ' at the limit · ' + [spendTone,tokTone,patTone,qTone].filter(t => t === 'bump').length + ' approaching',
+      net:net.toFixed(2),proj:proj.toFixed(2),spendPct:Math.min(100, net / 25 * 100),projPct:Math.min(100, proj / 25 * 100),projEnd:proj / 25 > .85 ? 'end' : '',spendTone:spendTone,spendCap:net >= 25,
+      spendNote:proj > 25 ? 'Projection passes the budget on day 30 at the current burn. Scheduled crons dominate; pause propagation-drift to cut the slope.' : 'Projection from the current burn rate. Public-repo minutes show at list price and bill at $0, so this sums net_amount only.',
+      tok:tok,tokTone:tokTone,tokNote:tokTone === 'boulder' ? 'mergepath hit the installation rate limit in run 9140. Hard signal, not an estimate. Resets in 47 min.' : 'Estimate: runs in the last hour × measured requests per run. This budget cannot be read from outside a run.',tokNoteCls:tokTone === 'boulder' ? 'boulder' : '',
+      patUsed:fmtN(pat.used),patPct:pat.used / 50,patTone:patTone,patReset:pat.reset,patCap:pat.used >= 5000,patDraw0:fmtN(pat.draw[0]),patDraw1:fmtN(pat.draw[1]),patDraw2:fmtN(pat.draw[2]),
+      qTotal:qt,rTotal:rt,qTone:qTone,qDen:bud.jam ? 'stuck for ' + bud.jam : qt ? 'about ' + Math.round(qt * 2.5) + ' min to drain' : 'nothing waiting',queue:queue,
+      qNote:bud.jam ? 'Jammed: required gates sit QUEUED behind one runner. On 2026-09-30 two review loops in parallel did exactly this for over an hour.' : qt >= 10 ? 'Rising queue with few runners is the early sign of a jam. Run one PR review loop at a time.' : 'actions/runs?status=queued and in_progress, with ETags.',qNoteCls:bud.jam ? 'boulder' : ''};
+    const conn = bud.conn === 'reconnecting' ? {tone:'bump',label:'Reconnecting',sub:'SSE dropped · retry in ' + (4 - secs % 4) + ' s · data may be stale'} : {tone:'clear',label:'Live',sub:'SSE · 127.0.0.1:7357 · session token ok'};
+    const api = {used:fmtN(API[s]),pct:API[s] / 50,tone:API[s] >= 4500 ? 'boulder' : API[s] >= 3500 ? 'bump' : 'clear',reset:'23 min'};
+    const items = [];
+    const add = (kind, text, short, eta, src, srcLabel) => items.push({kind:kind,kindLabel:KIND_LABEL[kind],text:text,short:short,etaMin:eta,eta:etaLabel(eta),pct:etaPct(eta),src:src,srcLabel:srcLabel});
+    if (conn.tone === 'bump') add('bump','The SSE stream dropped and is reconnecting with backoff. Every section may be stale until it returns.','SSE reconnecting',0,'road','shell');
+    visible.forEach(p => {
+      if (st.merged[p.key]) return;
+      const t = prTone(p); const ref = p.repo + ' #' + p.n;
+      if (t[0] === 'boulder' && t[1] === 'Budget spent') { const spent = budgetItems(p).filter(b => b.tone === 'boulder'); add('boulder', ref + ': ' + spent.map(b => b.name + ' 0 left of ' + b.limit).join('; ') + '. Automated review has nothing left to try; waiting on the human.', ref + ' · budgets spent', 0, 'prs', 'Open PRs'); }
+      else if (t[0] === 'boulder') add('boulder', ref + ': ' + p.why + '. Work on this PR is stopped until a human acts.', ref + ' · ' + t[1].toLowerCase(), 0, 'prs', 'Open PRs');
+      else if (t[0] === 'bump') {
+        let eta = 0, text = ref + ': ' + p.why;
+        if (p.cr === 'ratelimited') { eta = p.crEta; text = ref + ': CodeRabbit is rate-limited and resumes in ' + p.crEta + ' min. Auto-merge waits for its report.'; }
+        else if (t[1] === 'Budget near') { eta = 25; const near = budgetItems(p).filter(b => b.tone === 'bump'); text = ref + ': ' + near.map(b => b.left + ' of ' + b.limit + ' ' + b.short + ' left').join(', ') + '. The next round or push spends it.'; }
+        else if (p.ms === 'BEHIND') { text = ref + ': behind main. update-branch carries the APPROVED forward; a thumbs-up would not survive it.'; }
+        else if (p.fb.acc < p.fb.posted) { text = ref + ': ' + (p.fb.posted - p.fb.acc) + ' feedback items posted but not accounted. The accounting gate will hold the merge.'; }
+        add('bump', text, ref + ' · ' + t[1].toLowerCase(), eta, 'prs', 'Open PRs');
+      }
+    });
+    runsFor(s).forEach(r => {
+      if (r.fatal) add('boulder','Run ' + r.id + ' (' + r.wf + ') on ' + r.repo + ' #' + r.pr + ' failed and cannot be retried. The PR stays UNSTABLE until CodeQL is fixed at source.', r.repo + ' #' + r.pr + ' · CodeQL', 0, 'ci', 'CI runs');
+      if (r.ratelimit) add('boulder','Run ' + r.id + ' on ' + r.repo + ' failed with "API rate limit exceeded for installation": the per-repo GITHUB_TOKEN is exhausted. Resets in 47 min.', 'mergepath GITHUB_TOKEN exhausted', 0, 'budget', 'Actions budget');
+      if (r.stale) add('bump','Run ' + r.id + ' (' + r.wf + ') failed on ' + r.repo + ' #' + r.pr + ' HEAD ' + r.head + ' and no later pass superseded it. Needs gh run rerun --failed.', r.repo + ' #' + r.pr + ' · stale failure', 0, 'ci', 'CI runs');
+    });
+    agents.forEach(a => {
+      if (a.crashed) add('boulder','Phase 4b run ' + a.id + ' on ' + a.repo + ' #' + a.pr + ': pid ' + a.pid + ' is dead with no done stage. Treat it as crashed; the PR has no verdict.', a.repo + ' #' + a.pr + ' · agent crashed', 0, 'agents', 'Phase 4b agents');
+      else if (a.tone === 'boulder') add('boulder', a.rev + ' adapter on ' + a.repo + ' #' + a.pr + ' passed its ' + a.timeout + ' timeout and exited without a verdict. The PR needs a fresh Phase 4b run.', a.repo + ' #' + a.pr + ' · timed out', 0, 'agents', 'Phase 4b agents');
+      else if (a.pct >= 80) add('bump', a.rev + ' adapter on ' + a.repo + ' #' + a.pr + ' is at ' + a.elapsed + ' of its ' + a.timeout + ' timeout. A timeout exits without a verdict.', a.repo + ' #' + a.pr + ' · near timeout', Math.max(1, Math.round((a.timeoutS - a.elapsedS) / 60)), 'agents', 'Phase 4b agents');
+    });
+    fleetRaw.forEach(f => { if (f.st === 'fetch-error') add('bump', f.repo + ': the audit could not fetch (exit 128). The last good result is 42 min old and marked stale.', f.repo + ' · fetch error', 0, 'fleet', 'Fleet sync'); });
+    if (proj > 25) add('boulder','Projected net spend $' + proj.toFixed(2) + ' passes the $25.00 budget at cycle end, 11 days away. Scheduled crons dominate the bill.', 'spend passes budget', 15840, 'budget', 'Actions budget');
+    else if (proj > 22.5) add('bump','Projected net spend $' + proj.toFixed(2) + ' lands within 10% of the $25.00 budget at cycle end, 11 days away.', 'spend near budget', 15840, 'budget', 'Actions budget');
+    tok.forEach((t, i) => { const v = bud.tok[i]; if (v >= 700 && v < 1000) add('bump', t.repo + ' GITHUB_TOKEN estimate at ' + fmtN(v) + ' of 1,000 per hour. A review-loop burst would exhaust it before the hour resets.', t.repo + ' token at ' + Math.round(v / 10) + '%', Math.max(1, Math.round((1000 - v) / (v / 60))), 'budget', 'Actions budget'); });
+    if (pat.used >= 4500) add('bump','CI PAT pool nearly spent: ' + fmtN(pat.used) + ' of 5,000 per hour for nathanpayne-robot. Every repo shares it; resets in ' + pat.reset + '.', 'CI PAT pool at ' + Math.round(pat.used / 50) + '%', 0, 'budget', 'Actions budget');
+    else if (pat.used >= 3500) add('bump','CI PAT pool at ' + Math.round(pat.used / 50) + '%: reaches 5,000 per hour in about 22 min at this burn, 0 min before it resets.', 'CI PAT pool at ' + Math.round(pat.used / 50) + '%', 22, 'budget', 'Actions budget');
+    if (bud.jam) add('boulder','Queue jammed: ' + qt + ' queued, ' + rt + ' running for ' + bud.jam + '. Required gates are stuck QUEUED; no PR can merge until it drains.', 'queue jammed · ' + qt + ' queued', 0, 'budget', 'Actions budget');
+    else if (qt >= 10) add('bump', qt + ' runs queued against ' + rt + ' running, about ' + Math.round(qt * 2.5) + ' min to drain. Two review loops in parallel caused the 2026-09-30 jam.', 'queue rising · ' + qt + ' queued', 5, 'budget', 'Actions budget');
+    items.sort((a, b) => (a.etaMin - b.etaMin) || (RANK[a.kind] - RANK[b.kind]));
+    // The strip holds nine markers: boulders claim slots before bumps, then ETA order.
+    const keep = items.slice().sort((a, b) => (RANK[a.kind] - RANK[b.kind]) || (a.etaMin - b.etaMin)).slice(0, 9);
+    const strip = items.filter(it => keep.indexOf(it) >= 0); const more = items.length - strip.length;
+    roadLayout(items, strip, this.trackW());
+    const nb = items.filter(i => i.kind === 'boulder').length, ns = items.filter(i => i.kind === 'bump').length;
+    const road = {items:items,strip:strip,more:more > 0,moreText:'+' + more + ' more in the list below',clear:items.length === 0,
+      title:nb > 0 ? nb + ' boulder' + (nb === 1 ? '' : 's') + ' on the road' + (ns ? ', ' + ns + ' speed bump' + (ns === 1 ? '' : 's') + ' ahead' : '') : ns > 0 ? ns + ' speed bump' + (ns === 1 ? '' : 's') + ' ahead' : 'Road is clear',
+      summary:'horizon: now → 15 min → 1 h → today → cycle end'};
+    const horizon = [{label:'15 min',pct:etaPct(15),cls:'',sub:''},{label:'1 h',pct:etaPct(60),cls:'',sub:''},{label:'today',pct:etaPct(720),cls:'',sub:''},{label:'cycle end',pct:etaPct(15840),cls:'end',sub:' · 11 d'}];
+    const maxv = Math.max.apply(null, DAYS.map(d => Math.max(d.c, d.x)));
+    const days = DAYS.map(d => ({label:d.label,ch:Math.round(d.c / maxv * 100),xh:Math.round(d.x / maxv * 100),cv:'$' + d.c.toFixed(2),xv:'$' + d.x.toFixed(2)}));
+    const hist = HIST.map(h => Object.assign({}, h, {revk:h.rev.toLowerCase(),naSplit:!!h.naSplit}));
+    const sy = st.sync; let sync = {on:false};
+    if (sy) {
+      const stage = sy.stage;
+      const active = sy.targets.filter(t => !(t.oldPr && t.choice === 'skip'));
+      const needAck = active.some(t => t.ahead); const names = active.map(t => t.repo);
+      const plan = sy.targets.map(t => ({repo:t.repo,label:t.ahead ? 'ahead of hub · ' + t.paths.length + ' path' : 'drift · ' + t.paths.length + ' path' + (t.paths.length === 1 ? '' : 's'),paths:t.paths.map(x => ({path:x[0],cls:x[1],dir:x[2]})),hasPr:!!t.oldPr,prn:t.oldPr,isSkip:t.choice === 'skip',isRec:t.choice === 'recreate',skipCls:t.choice === 'skip' ? 'on' : '',recCls:t.choice === 'recreate' ? 'on' : '',pickSkip:() => this.setChoice(t.repo,'skip'),pickRec:() => this.setChoice(t.repo,'recreate'),ahead:t.ahead,aheadN:t.paths.length}));
+      const pre = [{k:'clear',text:'Hub checkout is clean and at origin/main 9a8fcdf'},{k:'clear',text:'No other sync is running: the single-flight lock is free'}];
+      sy.targets.forEach(t => { if (t.oldPr) pre.push({k:'bump',text:t.repo + ' already has open sync PR #' + t.oldPr + ': choose skip or recreate below'}); if (t.ahead) pre.push({k:'bump',text:t.repo + ' is ahead of the hub: a second confirm is required'}); });
+      sy.skipped.forEach(x => pre.push({k:'idle',text:'Skipped: ' + x}));
+      if (sy.targets.length === 0) pre.push({k:'idle',text:'Nothing to sync: every selected consumer is in sync or override-only'});
+      const rails = sy.targets.map((t, i) => { const start = 3 + i * 5; const k = Math.max(0, Math.min(5, sy.li - start)); const nm = ['fetch','diff','branch','commit','PR']; return {repo:t.repo,stages:nm.map((n, j) => ({name:n,k:j < k ? 'done' : (j === k && stage === 'running') ? 'cur' : (stage === 'done' ? 'done' : 'todo')}))}; });
+      sync = {on:true,s1:stage === 'preview' ? 'on' : 'ok',s2:stage === 'confirm' ? 'on' : (stage === 'preview' ? '' : 'ok'),s3:(stage === 'running' || stage === 'done') ? 'on' : '',
+        title:stage === 'preview' ? 'Preview the sync' : stage === 'confirm' ? 'Confirm the sync' : stage === 'running' ? 'Syncing ' + names.join(', ') : 'Sync finished',
+        repoArg:sy.targets.map(t => t.repo).join(',') || '(none)',preview:stage === 'preview',confirm:stage === 'confirm',running:stage === 'running',done:stage === 'done',pre:pre,plan:plan,
+        repoList:names.join(', ') || 'nothing (every target was skipped)',needAck:needAck,ack:sy.ack,
+        toggleAck:() => this.setState({sync:Object.assign({}, this.state.sync, {ack:!this.state.sync.ack})}),
+        aheadRepos:active.filter(t => t.ahead).map(t => t.repo).join(', '),startDisabled:(needAck && !sy.ack) || active.length === 0,
+        cancel:() => this.setState({sync:null}),close:() => this.setState({sync:null}),back:() => this.setStage('preview'),toConfirm:() => this.setStage('confirm'),start:() => this.startSync(active),
+        rails:rails,lines:sy.script.slice(0, sy.li).map(t => ({t:t})),
+        doneText:sy.targets.length + ' sync PR' + (sy.targets.length === 1 ? '' : 's') + ' opened as nathanjohnpayne. The fleet rows and the PR table now track them.',newPrs:sy.targets.map(t => ({repo:t.repo,n:t.newPr}))};
+    }
+    return {
+      rootCls:(dark ? 'dark' : '') + (rm ? ' rm' : ''),dark:dark,rm:rm,darkLabel:dark ? 'Theme: dark' : 'Theme: light',rmLabel:rm ? 'Reduced motion: on' : 'Reduced motion: off',
+      toggleDark:() => this.setState({dark:!dark}),toggleRm:() => this.setState({rm:!rm}),
+      scenarios:SCN.map((k, i) => ({label:SCN_LABEL[k],g:SCN_G[k],on:k === s,cls:k === s ? 'on' : '',pick:() => this.pickScn(i)})),
+      cycle:() => this.pickScn((SCN.indexOf(s) + 1) % SCN.length),simMerge:() => this.simMerge(),
+      conn:conn,api:api,updated:(secs % 15) + ' s ago',road:road,horizon:horizon,filters:filters,prs:prs,runs:runs,ci:ci,agents:agents,ag:ag,days:days,hist:hist,
+      fleet:fleet,fl:fl,audit:{on:st.audit !== null,pct:st.audit || 0},refreshAudit:() => this.setState({audit:5}),syncAll:() => this.openSync(REPOS.slice(1)),
+      bud:budget,sync:sync
+    };
+  }
+}
+</script>
+</body>
+</html>

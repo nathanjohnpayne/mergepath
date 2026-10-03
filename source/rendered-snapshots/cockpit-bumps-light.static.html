@@ -1,0 +1,980 @@
+<!doctype html>
+<html lang="en"><head><style>
+    .sc-placeholder{background:color-mix(in srgb,currentColor 8%,transparent);
+      border:1px solid color-mix(in srgb,currentColor 50%,transparent);
+      border-radius:2px;box-sizing:border-box;overflow:hidden}
+    @keyframes sc-shine{0%{background-position:100% 50%}100%{background-position:0% 50%}}
+    html.sc-dc-streaming .sc-placeholder,
+    html.sc-dc-streaming .sc-interp.sc-missing{position:relative;
+      background:color-mix(in srgb,currentColor 5%,transparent);
+      border-color:transparent}
+    html.sc-dc-streaming .sc-placeholder::before,
+    html.sc-dc-streaming .sc-interp.sc-missing::before{content:'';
+      position:absolute;inset:0;pointer-events:none;
+      background:linear-gradient(90deg,rgba(217,119,87,0) 25%,rgba(247,225,211,.95) 37%,rgba(217,119,87,0) 63%);
+      background-size:400% 100%;animation:sc-shine 1.4s ease infinite}
+    html.sc-dc-streaming .sc-placeholder:nth-child(n+9 of .sc-placeholder)::before,
+    html.sc-dc-streaming .sc-interp.sc-missing:nth-child(n+9 of .sc-interp.sc-missing)::before{animation:none;
+      background:color-mix(in srgb,currentColor 8%,transparent)}
+    .sc-placeholder-error{padding:4px 8px;font:11px/1.4 ui-monospace,monospace;
+      color:color-mix(in srgb,currentColor 70%,transparent);word-break:break-word}
+    .sc-interp.sc-missing{display:inline-block;width:2em;height:1em;overflow:hidden;
+      vertical-align:text-bottom;background:rgba(255,255,255,.3);border:1px solid rgba(0,0,0,.5);
+      border-radius:2px;box-sizing:border-box;color:transparent;
+      user-select:none}
+    .sc-interp.sc-unresolved{font-family:ui-monospace,monospace;font-size:.85em;
+      color:color-mix(in srgb,currentColor 50%,transparent);
+      background:color-mix(in srgb,currentColor 10%,transparent);border-radius:3px;
+      padding:0 3px}
+    .sc-host.sc-has-error{position:relative}
+    .sc-logic-error{position:absolute;top:8px;left:8px;z-index:2147483647;max-width:60ch;
+      padding:6px 10px;background:#b00020;color:#fff;font:12px/1.4 ui-monospace,monospace;
+      border-radius:4px;white-space:pre-wrap;pointer-events:none}
+    /* Mirrors PRINT_BASELINE_CSS in apps/web deck-stage-export.ts — keep both
+       in sync until dc-runtime regains a build step. */
+    @media print {
+      @page { margin: 0.5cm; }
+      figure, table { break-inside: avoid; }
+      #dc-root, #dc-root > .sc-host { height: auto; }
+      *, *::before, *::after {
+        print-color-adjust: exact; -webkit-print-color-adjust: exact;
+        backdrop-filter: none !important; -webkit-backdrop-filter: none !important;
+        animation-delay: -99s !important; animation-duration: .001s !important;
+        animation-iteration-count: 1 !important; animation-fill-mode: both !important;
+        animation-play-state: running !important; transition-duration: 0s !important;
+      }
+    }
+  </style>
+<meta charset="utf-8">
+<title>Mergepath Cockpit</title>
+<style>x-dc{display:none!important}</style>
+<link rel="preconnect" href="https://fonts.googleapis.com" data-dc-tpl="1"><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:ital,wght@0,400..700;1,400&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet" data-dc-tpl="2"><style data-dc-tpl="3">
+body{margin:0}
+.ck{
+ --page:#f4efe5;--page-deep:#ece3d3;--panel:rgba(255,252,246,.9);--panel-strong:#fffdf9;--inset:rgba(255,255,255,.6);
+ --ink:#1b2426;--muted:#565d58;--soft:#656b63;
+ --line:rgba(67,79,77,.16);--line-strong:rgba(43,68,63,.3);
+ --accent:#1f6257;--accent-soft:rgba(31,98,87,.12);
+ --clear:#1f6257;--clear-ink:#1f6257;--clear-soft:rgba(31,98,87,.13);
+ --run:#2c5282;--run-ink:#2c5282;--run-soft:rgba(44,82,130,.13);
+ --bump:#a0661f;--bump-ink:#7a4d12;--bump-soft:rgba(183,119,48,.18);
+ --boulder:#7b2d26;--boulder-ink:#7b2d26;--boulder-soft:rgba(123,45,38,.13);
+ --idle:#8a8f87;--idle-ink:#5d655f;--idle-soft:rgba(93,101,95,.12);
+ --done:#1b2426;--done-ink:#1b2426;--done-soft:rgba(27,36,38,.1);--glyph-ink:#fff;
+ --shadow:0 20px 50px rgba(36,43,45,.08);
+ --t-fast:160ms;--t-med:360ms;--t-slow:700ms;--t-pop:900ms;--t-glow:2600ms;--ease:cubic-bezier(.2,.8,.2,1);--loop:running;
+ --sans:"Instrument Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;--mono:"JetBrains Mono","SFMono-Regular",Menlo,Consolas,monospace;
+ font-family:var(--sans);font-size:14px;line-height:1.5;color:var(--ink);
+ background:radial-gradient(circle at 85% 0%,rgba(31,98,87,.08),transparent 30%),linear-gradient(180deg,var(--page),var(--page-deep));
+ min-height:100vh;-webkit-font-smoothing:antialiased;color-scheme:light}
+.ck.dark{color-scheme:dark;--page:#13191a;--page-deep:#0d1213;--panel:rgba(30,38,39,.88);--panel-strong:#202a2b;--inset:rgba(255,255,255,.04);
+ --ink:#ece6da;--muted:#b9b4a9;--soft:#a09c93;--line:rgba(236,230,218,.12);--line-strong:rgba(236,230,218,.26);
+ --accent:#6cc4b0;--accent-soft:rgba(108,196,176,.14);
+ --clear:#2a8273;--clear-ink:#7fd1bd;--clear-soft:rgba(108,196,176,.16);
+ --run:#3d6ea8;--run-ink:#93bbea;--run-soft:rgba(141,181,232,.16);
+ --bump:#b5772a;--bump-ink:#e8b86e;--bump-soft:rgba(224,167,90,.17);
+ --boulder:#9a3d33;--boulder-ink:#f2a393;--boulder-soft:rgba(240,160,144,.15);
+ --idle:#6f766f;--idle-ink:#aab0a8;--idle-soft:rgba(167,173,165,.12);
+ --done:#ece6da;--done-ink:#ece6da;--done-soft:rgba(236,230,218,.1);--glyph-ink:#13191a;
+ --shadow:0 20px 50px rgba(0,0,0,.35);
+ background:radial-gradient(circle at 85% 0%,rgba(108,196,176,.08),transparent 30%),linear-gradient(180deg,var(--page),var(--page-deep))}
+.ck.rm{--t-fast:0ms;--t-med:0ms;--t-slow:0ms;--t-pop:0ms;--t-glow:0ms;--loop:paused}
+@media (prefers-reduced-motion:reduce){ .ck{--t-fast:0ms;--t-med:0ms;--t-slow:0ms;--t-pop:0ms;--t-glow:0ms;--loop:paused} }
+.ck *{box-sizing:border-box}
+.ck button{font:inherit;cursor:pointer;color:inherit}
+.ck button:focus-visible,.ck a:focus-visible,.ck input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.ck a{color:var(--accent)}
+.ck .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.ck .soft{color:var(--soft)}
+.ck .sub{display:block;color:var(--soft);font-size:11px;line-height:1.4}
+.wrap{max-width:1400px;margin:0 auto;padding:20px 24px 56px}
+.top{display:flex;flex-wrap:wrap;justify-content:space-between;gap:20px 32px;padding:26px 30px;border-radius:26px;background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow);backdrop-filter:blur(16px)}
+.eyebrow{margin:0 0 6px;color:var(--accent);text-transform:uppercase;letter-spacing:.2em;font-size:11px;font-weight:700;font-family:var(--mono)}
+.top h1{margin:0;font-size:clamp(1.5rem,2.4vw,2rem);line-height:1.15;letter-spacing:-.02em;font-weight:600;max-width:640px;text-wrap:balance}
+.lede{max-width:640px;margin:10px 0 0;color:var(--muted);font-size:14px}
+.top-r{display:flex;flex-wrap:wrap;gap:10px;align-content:flex-start;align-items:stretch}
+.chip{display:flex;flex-direction:column;gap:2px;min-width:150px;padding:10px 14px;border-radius:14px;border:1px solid var(--line);background:var(--inset);font-size:12px}
+.chip .lbl{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--soft);font-weight:700}
+.chip .sub{font-size:10.5px}
+.conn{flex-direction:row;align-items:center;gap:8px;flex-wrap:wrap}
+.conn .dot{width:10px;height:10px;border-radius:50%;background:var(--clear);animation:breathe 2.4s ease-in-out infinite;animation-play-state:var(--loop)}
+.conn.c-bump .dot{background:transparent;border:2px dashed var(--bump);animation:spin 1.6s linear infinite;animation-play-state:var(--loop)}
+.conn.c-boulder .dot{background:var(--boulder);animation:none}
+.conn .lbl{color:var(--ink);font-weight:600;letter-spacing:0;text-transform:none;font-size:12.5px}
+.mini{position:relative;height:6px;border-radius:999px;background:var(--idle-soft);overflow:hidden;min-width:80px;flex:1}
+.mini-fill{position:absolute;left:0;top:0;bottom:0;border-radius:999px;background:var(--clear);transition:width var(--t-slow) var(--ease),background-color var(--t-med) ease}
+:is(.m-fill,.mini-fill).t-run{background-color:var(--run)}:is(.m-fill,.mini-fill).t-clear{background-color:var(--clear)}:is(.m-fill,.mini-fill).t-bump{background-color:var(--bump)}:is(.m-fill,.mini-fill).t-boulder{background-color:var(--boulder)}:is(.m-fill,.mini-fill).t-idle{background-color:var(--idle)}
+.demo{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:16px 0 0;padding:10px 14px;border:1px dashed var(--line-strong);border-radius:16px;font-size:12px}
+.demo-lbl{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--soft);margin-right:6px}
+.seg{display:inline-flex;flex-wrap:wrap;border:1px solid var(--line-strong);border-radius:999px;overflow:hidden;background:var(--inset)}
+.seg-b{display:inline-flex;align-items:center;gap:7px;padding:7px 13px;border:0;background:transparent;font-size:12.5px;font-weight:500;transition:background var(--t-fast) ease,color var(--t-fast) ease}
+.seg-b.on{background:var(--ink);color:var(--page)}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:7px 14px;border-radius:999px;border:1px solid var(--line-strong);background:var(--inset);font-size:12.5px;font-weight:500;transition:transform var(--t-fast) ease,border-color var(--t-fast) ease,background var(--t-fast) ease}
+.btn:hover{border-color:var(--accent);color:var(--accent);transform:translateY(-1px)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{color:#fff;filter:brightness(1.08)}
+.ck.dark .btn.primary,.ck.dark .btn.primary:hover{color:#0e1314}
+.btn:disabled{opacity:.45;cursor:not-allowed;transform:none}
+.btn.sm{padding:5px 11px;font-size:12px}
+.panel{margin-top:18px;padding:22px 24px;border-radius:22px;background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow);backdrop-filter:blur(12px);min-width:0}
+.sec-head{display:flex;flex-wrap:wrap;justify-content:space-between;gap:10px 20px;align-items:flex-end;margin-bottom:14px}
+.sec-head h2{margin:0;font-size:17px;font-weight:600;letter-spacing:-.01em}
+.sec-meta{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;color:var(--soft);font-size:11.5px;font-family:var(--mono)}
+.poll{display:inline-flex;align-items:center;gap:6px}
+.ring{width:16px;height:16px;transform:rotate(-90deg)}
+.ring-bg{fill:none;stroke:var(--idle-soft);stroke-width:3}
+.ring-fg{fill:none;stroke:var(--accent);stroke-width:3;stroke-dasharray:44;stroke-dashoffset:44;animation:poll 15s linear infinite;animation-play-state:var(--loop)}
+.ring.r20 .ring-fg{animation-duration:20s}.ring.r5 .ring-fg{animation-duration:5s}
+.row2{display:flex;flex-wrap:wrap;gap:18px;align-items:flex-start}
+.stack{display:grid;gap:18px}
+.grow{flex:999 1 560px;min-width:0}
+.side{flex:1 1 380px;min-width:0}
+.g{position:relative;display:inline-block;width:1em;height:1em;font-size:12px;flex:none;vertical-align:-.15em;transition:background-color var(--t-med) ease,border-color var(--t-med) ease}
+.g.lg{font-size:18px}.g.xl{font-size:30px}
+.g-idle,.g-queued,.g-skipped,.g-todo{border:.17em solid var(--idle);border-radius:50%}
+.g-run,.g-cur{border:.17em dashed var(--run);border-radius:50%;animation:spin 1.6s linear infinite;animation-play-state:var(--loop)}
+.g-clear,.g-ok{background:var(--clear);border-radius:50%}
+.g-clear::after,.g-ok::after,.g-done::after{content:"";position:absolute;left:.3em;top:.12em;width:.28em;height:.52em;border:solid #fff;border-width:0 .17em .17em 0;transform:rotate(45deg)}
+.g-done{background:var(--done);border-radius:50%}.g-done::after{border-color:var(--glyph-ink)}
+.g-bump{background:var(--bump);clip-path:ellipse(50% 100% at 50% 100%)}
+.g-boulder{background:var(--boulder);clip-path:polygon(30% 0,70% 0,100% 30%,100% 70%,70% 100%,30% 100%,0 70%,0 30%)}
+.g-boulder::after{content:"";position:absolute;left:.25em;right:.25em;top:.42em;height:.17em;background:#fff}
+.g-fail{background:var(--boulder);border-radius:.25em}
+.g-fail::before,.g-fail::after{content:"";position:absolute;left:.2em;right:.2em;top:.42em;height:.16em;background:#fff;transform:rotate(45deg)}
+.g-fail::after{transform:rotate(-45deg)}
+.b{display:inline-flex;align-items:center;gap:6px;padding:3px 9px 3px 7px;border-radius:999px;font-family:var(--mono);font-size:11px;font-weight:500;white-space:nowrap;line-height:1.5;transition:background-color var(--t-med) ease,color var(--t-med) ease}
+.b-clear,.b-ok{background:var(--clear-soft);color:var(--clear-ink)}
+.b-run{background:var(--run-soft);color:var(--run-ink)}
+.b-bump{background:var(--bump-soft);color:var(--bump-ink)}
+.b-boulder,.b-fail{background:var(--boulder-soft);color:var(--boulder-ink);animation:throb 2.6s ease-in-out infinite;animation-play-state:var(--loop)}
+.b-idle,.b-queued,.b-skipped{background:var(--idle-soft);color:var(--idle-ink)}
+.b-done{background:var(--done-soft);color:var(--done-ink)}
+.ink-clear{color:var(--clear-ink)}.ink-run{color:var(--run-ink)}.ink-bump{color:var(--bump-ink);font-weight:600}.ink-boulder{color:var(--boulder-ink);font-weight:600}.ink-idle{color:var(--idle-ink)}
+.pips,.pips10{display:inline-flex;gap:3px;align-items:center;flex-wrap:wrap}
+.pip{display:inline-block;width:8px;height:8px;border-radius:2px;background:var(--idle-soft);box-shadow:inset 0 0 0 1px var(--line);transition:background-color var(--t-med) ease}
+.pips10 .pip{width:7px;height:11px}
+.pip-ok,.pip-used{background:var(--clear);box-shadow:none}.pip-run,.pip-cur{background:var(--run);box-shadow:none;animation:blink 1.2s ease-in-out infinite;animation-play-state:var(--loop)}.pip-fail{background:var(--boulder);box-shadow:none}.pip-skipped{background:var(--idle);box-shadow:none}
+.pip-bump{background:var(--bump);box-shadow:none}.pip-boulder{background:var(--boulder);box-shadow:none}
+.m{display:grid;gap:5px}
+.m-top{display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-size:12.5px}
+.m-val{font-family:var(--mono);font-variant-numeric:tabular-nums;font-weight:600}
+.m-den{color:var(--soft);font-size:11px;text-align:right}
+.m-track{position:relative;height:10px;border-radius:999px;background:var(--idle-soft);box-shadow:inset 0 0 0 1px var(--line)}
+.m-fill{position:absolute;left:0;top:0;bottom:0;border-radius:999px;background-color:var(--clear);transition:width var(--t-slow) var(--ease),background-color var(--t-med) ease}
+.m-fill.t-bump{background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.3) 0 5px,transparent 5px 10px);background-size:14px 14px;animation:rumble 1s linear infinite;animation-play-state:var(--loop)}
+.m-fill.t-boulder{background-image:none}
+.m-tick{position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--line-strong);transform:translateX(-1px)}
+.m-tick.proj{background:var(--bump-ink)}
+.m-tick-l.end{transform:translateX(-100%)}
+.m-tick-l{position:absolute;top:14px;transform:translateX(-50%);font-family:var(--mono);font-size:10px;color:var(--soft);white-space:nowrap}
+.m-cap{position:absolute;right:-7px;top:50%;transform:translateY(-50%);animation:land var(--t-pop) var(--ease) both}
+.m.t-boulder .m-track{box-shadow:inset 0 0 0 1.5px var(--boulder)}
+.m.t-bump .m-val{color:var(--bump-ink)}.m.t-boulder .m-val{color:var(--boulder-ink)}
+.m.has-l{margin-bottom:14px}
+.road .strip{position:relative;height:166px;margin:6px 0 12px}
+.road .line{position:absolute;left:0;right:0;top:116px;height:4px;border-radius:2px;background:linear-gradient(90deg,var(--accent) 0,var(--line-strong) 40%,var(--line) 100%)}
+.road .now{position:absolute;left:0;top:128px;font-family:var(--mono);font-size:10px;letter-spacing:.12em;font-weight:700;color:var(--accent)}
+.road .hz{position:absolute;top:128px;transform:translateX(-50%);font-family:var(--mono);font-size:10px;color:var(--soft);white-space:nowrap}
+.road .hz.end{transform:translateX(-100%)}
+.road .hz::before{content:"";position:absolute;left:50%;top:-10px;width:1px;height:6px;background:var(--line-strong)}
+.road .hz.end::before{left:auto;right:0}
+@media (max-width:600px){.road .hz-sub{display:none}}
+.mk{position:absolute;top:0;bottom:0;width:0;animation:slidein var(--t-slow) var(--ease) both}
+.mk .g.lg{position:absolute;left:-9px;top:109px;z-index:2;animation:land var(--t-pop) var(--ease) both}
+.mk-stem{position:absolute;left:-.5px;width:1px;background:var(--line-strong);z-index:0}
+.mk-lbl{position:absolute;z-index:1;display:inline-flex;align-items:center;gap:6px;height:20px;box-sizing:border-box;font-size:11px;line-height:1;white-space:nowrap;background:var(--panel-strong);border:1px solid var(--line);padding:0 7px;border-radius:999px}
+.mk-n{font-family:var(--mono);font-size:10px;font-weight:700}
+.mk-boulder .mk-n{color:var(--boulder-ink)}.mk-bump .mk-n{color:var(--bump-ink)}
+.mk-boulder .mk-lbl{border-color:var(--boulder-soft)}
+.road .more{position:absolute;right:0;top:148px;font-family:var(--mono);font-size:10px;color:var(--soft)}
+.road-clear{position:absolute;left:0;right:0;top:12px;display:flex;align-items:center;gap:10px;color:var(--clear-ink);font-weight:500}
+.road-list{list-style:none;margin:0;padding:0;display:grid;gap:6px}
+.ri{display:grid;grid-template-columns:auto auto auto minmax(0,1fr) auto auto;gap:10px;align-items:center;padding:8px 12px;border-radius:12px;border:1px solid var(--line);font-size:12.5px;transition:background-color var(--t-med) ease;animation:enter var(--t-med) var(--ease) both}
+.ri-boulder{background:var(--boulder-soft)}.ri-bump{background:var(--bump-soft)}
+.ri-n{font-family:var(--mono);font-size:10.5px;font-weight:700;color:var(--soft);min-width:1.4em;text-align:right}
+.ri-kind{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;font-weight:700}
+.ri-boulder .ri-kind{color:var(--boulder-ink)}.ri-bump .ri-kind{color:var(--bump-ink)}
+.ri-eta{color:var(--soft);font-size:11.5px;white-space:nowrap}
+.ri-src{font-size:11.5px;white-space:nowrap}
+@media (max-width:720px){.ri{grid-template-columns:auto auto minmax(0,1fr) auto;grid-template-areas:"n g k e" "t t t t" "s s s s";row-gap:4px}.ri-n{grid-area:n}.ri>.g{grid-area:g}.ri-kind{grid-area:k}.ri-text{grid-area:t}.ri-eta{grid-area:e}.ri-src{grid-area:s}}
+.filters{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+.chipb{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;border:1px solid var(--line-strong);background:var(--inset);font-size:12px;font-family:var(--mono);transition:background var(--t-fast) ease,color var(--t-fast) ease}
+.chipb.on{background:var(--ink);color:var(--page);border-color:var(--ink)}
+.chipb .cnt{font-size:10.5px;opacity:.75}
+.tbl-wrap{overflow-x:auto;margin:0 -8px;padding:0 8px}
+.tbl{display:grid;gap:0;font-size:13px;min-width:var(--minw)}
+.trow{display:grid;grid-template-columns:var(--cols);gap:10px;align-items:start;padding:12px 10px;border-bottom:1px solid var(--line);transition:background-color var(--t-med) ease;animation:enter var(--t-med) var(--ease) both;border-radius:10px}
+.trow.th{padding:6px 10px;border-bottom:1px solid var(--line-strong);border-radius:0;animation:none}
+.trow.th span{font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--soft);font-weight:700;white-space:nowrap}
+.tbl > .trow:last-child{border-bottom:0}
+.trow.tone-boulder{background:var(--boulder-soft)}
+.trow.tone-bump{background:var(--bump-soft)}
+.trow.merged{animation:rowglow var(--t-glow) ease-out both}
+.trow.fresh{animation:enter var(--t-slow) var(--ease) both}
+.trow.just{animation:rowglow var(--t-glow) ease-out both}
+.cell{min-width:0}
+.pr-link{display:block;color:inherit;text-decoration:none}
+.pr-link .ttl{display:block;font-weight:500}
+.pr-link:hover .ttl{color:var(--accent)}
+.ms{display:inline-block;font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:.04em}
+.ms-boulder{color:var(--boulder-ink)}.ms-bump{color:var(--bump-ink)}.ms-run{color:var(--run-ink)}.ms-clear{color:var(--clear-ink)}.ms-idle{color:var(--idle-ink)}.ms-done{color:var(--done-ink)}
+.why{display:block;font-size:12px;color:var(--muted)}
+.lab{display:inline-block;margin:0 4px 4px 0;padding:2px 8px;border-radius:6px;font-family:var(--mono);font-size:11px;border:1px solid var(--line-strong)}
+.lab-hold{background:var(--boulder);color:#fff;border-color:var(--boulder)}
+.lab-ext{background:var(--run-soft);color:var(--run-ink)}
+.bstrip{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px 10px}
+.bs{display:grid;grid-template-columns:34px minmax(0,1fr) auto;gap:5px;align-items:center}
+.bs-l{color:var(--soft);text-transform:uppercase;letter-spacing:.04em;font-family:var(--mono);font-size:9.5px}
+.bs .mini{min-width:0;height:5px}
+.bs.t-idle .mini{background:repeating-linear-gradient(90deg,var(--line-strong) 0 3px,transparent 3px 6px)}
+.bs-n{font-size:10.5px;white-space:nowrap}
+.mini-fill.t-bump{background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.3) 0 4px,transparent 4px 8px);background-size:11px 11px;animation:rumble 1s linear infinite;animation-play-state:var(--loop)}
+.bs-llm{font-size:10.5px;margin-top:5px}
+.bud-full{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(190px,100%),1fr));gap:8px;padding:8px 10px 12px;background:var(--inset);border-bottom:1px solid var(--line);animation:enter var(--t-med) var(--ease) both}
+.bcard{display:grid;gap:3px;padding:8px 10px;border-radius:10px;border:1px solid var(--line);background:var(--panel-strong);transition:background-color var(--t-med) ease,border-color var(--t-med) ease}
+.bcard.t-bump{background:var(--bump-soft)}.bcard.t-boulder{background:var(--boulder-soft);border-color:var(--boulder)}
+.bc-name{font-size:11px;color:var(--muted);line-height:1.3}
+.bc-head{font-size:15px;font-weight:600;letter-spacing:-.01em}
+.bcard .m-track{height:7px;margin-top:2px}
+.bcard .m-cap{right:-5px}
+.bcard .m-cap.g{font-size:14px}
+.cx-flags{display:flex;flex-wrap:wrap;gap:6px 10px;margin-top:5px;align-items:center}
+.flag{display:inline-flex;align-items:center;gap:5px;font-size:11px}
+.f-run{color:var(--run-ink)}.f-boulder{color:var(--boulder-ink);font-weight:600}
+.ribbon{position:relative;display:inline-flex;align-items:center;gap:6px;margin-top:6px;padding:3px 10px;border-radius:999px;background:var(--done);color:var(--page);font-family:var(--mono);font-size:11px;font-weight:600;animation:pop var(--t-pop) var(--ease) both}
+.ribbon::before{content:"";width:.5em;height:.5em;border-radius:50%;background:var(--clear-ink)}
+.ribbon .c{position:absolute;left:50%;top:50%;width:6px;height:6px;border-radius:50%;opacity:0;animation:conf var(--t-glow) ease-out both}
+.c1{background:var(--clear);--dx:-34px;--dy:-26px}.c2{background:var(--bump);--dx:30px;--dy:-30px}.c3{background:var(--run);--dx:-22px;--dy:24px}.c4{background:var(--accent);--dx:38px;--dy:14px}.c5{background:var(--bump);--dx:4px;--dy:-40px}
+.runs{display:grid;gap:8px}
+.run{border:1px solid var(--line);border-radius:14px;overflow:hidden;transition:background-color var(--t-med) ease,border-color var(--t-med) ease;animation:enter var(--t-med) var(--ease) both}
+.run.tone-boulder{background:var(--boulder-soft);border-color:var(--boulder)}
+.run.tone-bump{background:var(--bump-soft)}
+.run-head{display:grid;grid-template-columns:auto minmax(0,1.1fr) minmax(0,1.3fr) auto auto auto auto;gap:10px;align-items:center;width:100%;padding:10px 12px;border:0;background:transparent;text-align:left;font-size:12.5px}
+.run-head:hover{background:var(--inset)}
+.run-wf{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.run-ref{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.run-dur{color:var(--soft);font-size:11.5px;white-space:nowrap}
+.chev{color:var(--soft);font-family:var(--mono);width:12px;text-align:center}
+.run-flag{display:grid;gap:3px;padding:8px 14px 10px;border-top:1px dashed var(--line);font-size:12px}
+.run-flag .flag-t{font-weight:600}
+.f-bump .flag-t{color:var(--bump-ink)}.f-boulder .flag-t{color:var(--boulder-ink)}
+.cmd{display:inline-block;margin-top:4px;padding:3px 8px;border-radius:6px;background:var(--ink);color:var(--page);font-family:var(--mono);font-size:11.5px;width:fit-content;max-width:100%;overflow-wrap:anywhere}
+.jobs{display:grid;gap:8px;padding:8px 14px 12px;border-top:1px solid var(--line);animation:enter var(--t-med) var(--ease) both}
+.job{border-left:2px solid var(--line-strong);padding-left:12px}
+.job-h{display:flex;gap:8px;align-items:center;font-size:12.5px;font-weight:600}
+.steps{list-style:none;margin:4px 0 0;padding:0;display:grid;gap:2px}
+.step{display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center;font-size:12px;padding:2px 0}
+.step.st-run .mono{color:var(--run-ink)}.step.st-fail .mono{color:var(--boulder-ink);font-weight:600}
+.logtail{margin:4px 0 0;padding:10px 12px;border-radius:10px;background:#1b2426;color:#f4efe5;font-family:var(--mono);font-size:11.5px;white-space:pre-wrap;overflow-wrap:anywhere}
+.agents{display:grid;gap:10px}
+.agent{border:1px solid var(--line);border-radius:14px;padding:12px 14px;display:grid;gap:10px;transition:background-color var(--t-med) ease,border-color var(--t-med) ease;animation:enter var(--t-med) var(--ease) both}
+.agent.tone-boulder{background:var(--boulder-soft);border-color:var(--boulder)}
+.agent.tone-bump{background:var(--bump-soft)}
+.ag-h{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:12.5px}
+.rev{padding:2px 8px;border-radius:6px;font-family:var(--mono);font-size:11px;font-weight:600;border:1px solid var(--line-strong)}
+.rev-claude{background:var(--clear-soft);color:var(--clear-ink)}.rev-codex{background:var(--run-soft);color:var(--run-ink)}
+.stages{display:flex;align-items:center}
+.stg{position:relative;flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;font-size:10.5px;font-family:var(--mono);color:var(--soft)}
+.stg::before{content:"";position:absolute;left:-50%;right:50%;top:5px;height:2px;background:var(--line)}
+.stg:first-child::before{display:none}
+.stg-dot{width:12px;height:12px;border-radius:50%;background:var(--idle-soft);box-shadow:inset 0 0 0 1px var(--line);z-index:1;transition:background-color var(--t-med) ease}
+.stg-done .stg-dot{background:var(--clear);box-shadow:none}.stg-done::before{background:var(--clear)}
+.stg-cur .stg-dot{background:var(--run);box-shadow:none;animation:pulse 1.4s ease-in-out infinite;animation-play-state:var(--loop)}.stg-cur::before{background:var(--clear)}.stg-cur{color:var(--run-ink);font-weight:600}
+.stg-crash .stg-dot{background:var(--boulder);box-shadow:none}.stg-crash{color:var(--boulder-ink);font-weight:600}.stg-crash::before{background:var(--clear)}
+.ag-f{font-size:11px}
+.empty{padding:14px;border:1px dashed var(--line-strong);border-radius:12px;color:var(--soft);font-size:12.5px;text-align:center}
+.hist-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:18px}
+.chart-h{display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;font-size:12px;color:var(--muted);margin-bottom:8px}
+.legend{display:inline-flex;align-items:center;gap:6px;font-size:11px;flex-wrap:wrap}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-left:8px}
+.sw-claude{background:var(--clear)}.sw-codex{background:var(--run);background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.35) 0 2px,transparent 2px 4px)}
+.bars{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px;align-items:end;padding:0 4px}
+.day{display:flex;flex-direction:column;align-items:center;height:100%;justify-content:flex-end}
+.bar-pair{display:flex;gap:4px;align-items:flex-end;height:130px;width:100%;justify-content:center;border-bottom:1px solid var(--line-strong)}
+.bar{position:relative;width:40%;max-width:30px;border-radius:4px 4px 0 0;transition:height var(--t-slow) var(--ease)}
+.bar-claude{background:var(--clear)}.bar-codex{background:var(--run);background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.35) 0 3px,transparent 3px 6px)}
+.day-v{font-family:var(--mono);font-size:10px;line-height:1.35;white-space:nowrap;font-variant-numeric:tabular-nums}.v-claude{color:var(--clear-ink)}.v-codex{color:var(--run-ink)}
+.day-l{font-family:var(--mono);font-size:10px;color:var(--soft);margin-top:6px}
+.totals{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(200px,100%),1fr));gap:10px;margin-top:14px}
+.tot{padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:var(--inset)}
+.tot-k{display:block;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--soft);font-weight:700}
+.tot-v{display:block;font-size:20px;font-weight:600;letter-spacing:-.02em}
+.est{display:inline-block;font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;padding:1px 5px;border-radius:4px;border:1px solid var(--bump-ink);color:var(--bump-ink);margin-left:4px;vertical-align:1px}
+.na{color:var(--soft);font-style:italic}
+.f-sev{display:inline-flex;gap:3px}
+.sev{font-family:var(--mono);font-size:10.5px;padding:1px 6px;border-radius:4px;background:var(--idle-soft)}
+.sev-1{background:var(--boulder-soft);color:var(--boulder-ink)}.sev-2{background:var(--bump-soft);color:var(--bump-ink)}
+.audit{display:flex;align-items:center;gap:10px;margin-bottom:10px;padding:8px 12px;border-radius:12px;background:var(--run-soft);font-size:12.5px;color:var(--run-ink)}
+.linkb{border:0;background:transparent;padding:0;color:var(--accent);text-decoration:underline;font-size:12.5px;text-align:left}
+.fl-paths{background:var(--inset);padding:8px 14px 12px;border-bottom:1px solid var(--line);animation:enter var(--t-med) var(--ease) both}
+.paths{list-style:none;margin:0;padding:0;display:grid;gap:4px}
+.paths li{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:10px;align-items:center;font-size:12px}
+.cls{font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;padding:1px 6px;border-radius:4px;background:var(--idle-soft)}
+.cls-canonical{background:var(--clear-soft);color:var(--clear-ink)}.cls-kit{background:var(--run-soft);color:var(--run-ink)}.cls-templated{background:var(--bump-soft);color:var(--bump-ink)}
+.stale{color:var(--bump-ink);font-weight:600}
+.meters{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(460px,100%),1fr));gap:14px;align-items:start}
+.mcard{padding:12px 14px;border-radius:14px;border:1px solid var(--line);display:grid;gap:10px;transition:background-color var(--t-med) ease,border-color var(--t-med) ease}
+.mcard.t-bump{background:var(--bump-soft)}.mcard.t-boulder{background:var(--boulder-soft);border-color:var(--boulder)}
+.mcard h3{margin:0;font-size:13px;font-weight:600;display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap}
+.mcard .den{font-size:11px;color:var(--soft);font-weight:400;font-family:var(--mono)}
+.mcard .m-top .m-val{font-size:18px;letter-spacing:-.02em}
+.spenders{list-style:none;margin:0;padding:0;display:grid;gap:3px}
+.spenders li{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:8px;font-size:12px;align-items:center}
+.tok{display:grid;gap:6px}
+.tok-r,.qrow{display:grid;grid-template-columns:200px 1fr auto;gap:8px;align-items:center;font-size:11.5px}
+.tok-r .mini{height:8px}
+.qbar{display:flex;height:10px;border-radius:999px;overflow:hidden;background:var(--idle-soft)}
+.qq{background:var(--bump);transition:width var(--t-slow) var(--ease)}.qr{background:var(--run);transition:width var(--t-slow) var(--ease)}
+.qbar.jam .qq{background:var(--boulder);background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.25) 0 4px,transparent 4px 8px)}
+.qleg{display:flex;gap:12px;font-size:11px;color:var(--soft);flex-wrap:wrap}
+.qleg i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+.note{font-size:11.5px;color:var(--muted)}
+.note.boulder{color:var(--boulder-ink);font-weight:600}
+.overlay{position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(27,36,38,.45);backdrop-filter:blur(4px);animation:fade var(--t-med) ease both}
+.modal{width:660px;max-width:100%;max-height:calc(100vh - 40px);overflow:auto;background:var(--panel-strong);color:var(--ink);border:1px solid var(--line);border-radius:22px;box-shadow:0 24px 60px rgba(0,0,0,.25);padding:22px 24px;display:grid;gap:14px;animation:pop var(--t-pop) var(--ease) both}
+.steps-i{display:flex;gap:6px;font-family:var(--mono);font-size:11px;flex-wrap:wrap}
+.stp{padding:3px 10px;border-radius:999px;background:var(--idle-soft);color:var(--soft)}
+.stp.on{background:var(--ink);color:var(--page)}.stp.ok{background:var(--clear-soft);color:var(--clear-ink)}
+.modal h3{margin:0;font-size:18px;font-weight:600}
+.modal p{margin:0;font-size:13px;color:var(--muted)}
+.modal code{font-family:var(--mono);font-size:12px;background:var(--accent-soft);color:var(--accent);padding:1px 6px;border-radius:4px}
+.checks{list-style:none;margin:0;padding:0;display:grid;gap:5px}
+.chk{display:flex;gap:8px;align-items:center;font-size:12.5px}
+.plan{display:grid;gap:10px}
+.plan-r{border:1px solid var(--line);border-radius:12px;padding:10px 12px;display:grid;gap:8px}
+.plan-h{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:13px;font-weight:600;flex-wrap:wrap}
+.plan-pr,.plan-warn{display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-size:12px}
+.plan-warn{color:var(--bump-ink);font-weight:500}
+.ack{display:flex;gap:10px;align-items:flex-start;font-size:13px;padding:10px 12px;border-radius:12px;background:var(--bump-soft);color:var(--bump-ink)}
+.ack input{margin-top:3px;accent-color:var(--bump);width:16px;height:16px;flex:none}
+.m-actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.rails{display:grid;gap:8px}
+.rail-r{display:grid;grid-template-columns:200px 1fr;gap:12px;align-items:center;font-size:12px}
+.log{margin:0;padding:12px 14px;border-radius:12px;background:#1b2426;color:#f4efe5;font-family:var(--mono);font-size:11.5px;line-height:1.6;max-height:220px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
+.ll{display:block;animation:enter var(--t-fast) ease both}
+.cursor{display:inline-block;width:7px;height:13px;background:#f4efe5;vertical-align:-2px;animation:blink 1s steps(2) infinite;animation-play-state:var(--loop)}
+.done{display:flex;align-items:center;gap:14px;font-size:14px}
+.done .g{animation:pop var(--t-pop) var(--ease) both,burst var(--t-glow) ease-out both;border-radius:50%}
+.prchips{display:flex;flex-wrap:wrap;gap:6px}
+.prchip{padding:3px 10px;border-radius:999px;background:var(--clear-soft);color:var(--clear-ink);font-size:11.5px;animation:pop var(--t-pop) var(--ease) both}
+@keyframes spin{ to{transform:rotate(360deg)} }
+@keyframes breathe{ 0%,100%{transform:scale(1);box-shadow:0 0 0 0 var(--clear-soft)} 50%{transform:scale(1.15);box-shadow:0 0 0 6px var(--clear-soft)} }
+@keyframes pulse{ 0%,100%{box-shadow:0 0 0 0 var(--run-soft)} 50%{box-shadow:0 0 0 6px var(--run-soft)} }
+@keyframes blink{ 0%,100%{opacity:1} 50%{opacity:.35} }
+@keyframes rumble{ to{background-position:14px 0} }
+@keyframes poll{ to{stroke-dashoffset:0} }
+@keyframes throb{ 0%,100%{box-shadow:0 0 0 0 var(--boulder-soft)} 50%{box-shadow:0 0 0 4px var(--boulder-soft)} }
+@keyframes enter{ from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:none} }
+@keyframes slidein{ from{opacity:0;transform:translateX(40px)} to{opacity:1;transform:none} }
+@keyframes land{ 0%{transform:translateY(-14px) scale(.7);opacity:0} 70%{transform:translateY(2px) scale(1.05);opacity:1} 100%{transform:none} }
+@keyframes pop{ 0%{transform:scale(.6);opacity:0} 60%{transform:scale(1.08);opacity:1} 100%{transform:scale(1);opacity:1} }
+@keyframes burst{ 0%{box-shadow:0 0 0 0 rgba(31,98,87,.5)} 100%{box-shadow:0 0 0 34px rgba(31,98,87,0)} }
+@keyframes rowglow{ 0%{background-color:var(--clear-soft)} 100%{background-color:transparent} }
+@keyframes conf{ 0%{opacity:1;transform:translate(0,0)} 100%{opacity:0;transform:translate(var(--dx),var(--dy))} }
+@keyframes fade{ from{opacity:0} to{opacity:1} }
+@media (max-width:720px){ .wrap{padding:12px 16px 40px} .top,.panel{padding:16px} .rail-r{grid-template-columns:1fr} .tok-r,.qrow{grid-template-columns:110px 1fr auto} .run-head{grid-template-columns:auto minmax(0,1fr) auto auto} .run-ref,.run-jobs,.run-dur{display:none} }
+</style></head>
+<body>
+<div id="dc-root"><div class="sc-host" data-sc-name="Main"><div data-dc-tpl="4" class="ck "><div data-dc-tpl="5" class="wrap"><header data-dc-tpl="6" class="top">
+  <div data-dc-tpl="7">
+    <p data-dc-tpl="8" class="eyebrow">Mergepath · Cockpit</p>
+    <h1 data-dc-tpl="9">Everything you are waiting on, in one place.</h1>
+    <p data-dc-tpl="10" class="lede">Open PRs across the fleet, CI and test runs, Phase 4b agents, fleet sync and the Actions budget. Read-mostly: the only write is a confirmed sync.</p>
+  </div>
+  <div data-dc-tpl="11" class="top-r">
+    <div data-dc-tpl="12" class="chip conn c-bump" role="status"><span data-dc-tpl="13" class="dot" aria-hidden="true"></span><span data-dc-tpl="14" class="lbl"><span class="sc-interp">Reconnecting</span></span><span data-dc-tpl="15" class="sub"><span class="sc-interp">SSE dropped · retry in 3 s · data may be stale</span></span></div>
+    <div data-dc-tpl="16" class="chip api">
+      <span data-dc-tpl="17" class="lbl">GitHub API</span>
+      <span data-dc-tpl="18" class="mono"><span class="sc-interp">1,460</span> / 5,000</span>
+      <span data-dc-tpl="19" class="sub">per hour · author PAT · 304s are free · resets in <span class="sc-interp">23 min</span></span>
+      <div data-dc-tpl="20" class="mini"><div data-dc-tpl="21" class="mini-fill t-clear" style="width: 29.2%;"></div></div>
+    </div>
+    <div data-dc-tpl="22" class="chip">
+      <span data-dc-tpl="23" class="lbl">Updated</span><span data-dc-tpl="24" class="mono"><span class="sc-interp">1 s ago</span></span><span data-dc-tpl="25" class="sub">hot PR 15 s · idle 2 min · SSE push</span>
+    </div>
+  </div></header><section data-dc-tpl="26" class="demo" aria-label="Prototype controls">
+  <span data-dc-tpl="27" class="demo-lbl">Prototype controls · not in the product</span>
+  <div data-dc-tpl="28" class="seg" role="group" aria-label="Scenario">
+    <button data-dc-tpl="30" type="button" class="seg-b " aria-pressed="false"><span data-dc-tpl="31" class="g g-clear" aria-hidden="true"></span><span class="sc-interp">Calm</span></button><button data-dc-tpl="30" type="button" class="seg-b " aria-pressed="false"><span data-dc-tpl="31" class="g g-run" aria-hidden="true"></span><span class="sc-interp">Busy</span></button><button data-dc-tpl="30" type="button" class="seg-b on" aria-pressed="true"><span data-dc-tpl="31" class="g g-bump" aria-hidden="true"></span><span class="sc-interp">Speed bumps ahead</span></button><button data-dc-tpl="30" type="button" class="seg-b " aria-pressed="false"><span data-dc-tpl="31" class="g g-boulder" aria-hidden="true"></span><span class="sc-interp">Boulder hit</span></button>
+  </div>
+  <button data-dc-tpl="32" type="button" class="btn">Next scenario</button>
+  <button data-dc-tpl="33" type="button" class="btn">Simulate a merge</button>
+  <button data-dc-tpl="34" type="button" class="btn" aria-pressed="false"><span class="sc-interp">Theme: light</span></button>
+  <button data-dc-tpl="35" type="button" class="btn" aria-pressed="false"><span class="sc-interp">Reduced motion: off</span></button></section><section data-dc-tpl="36" class="panel road" id="road">
+  <div data-dc-tpl="37" class="sec-head">
+    <div data-dc-tpl="38"><p data-dc-tpl="39" class="eyebrow">Road ahead</p><h2 data-dc-tpl="40"><span class="sc-interp">1 boulder on the road, 11 speed bumps ahead</span></h2></div>
+    <div data-dc-tpl="41" class="sec-meta"><span class="sc-interp">horizon: now → 15 min → 1 h → today → cycle end</span></div>
+  </div>
+  <div data-dc-tpl="42" class="strip">
+    <div data-dc-tpl="43" class="line" aria-hidden="true"></div>
+    <span data-dc-tpl="44" class="now">NOW</span>
+    <span data-dc-tpl="46" class="hz " style="left: 29.8%;"><span class="sc-interp">15 min</span><span data-dc-tpl="47" class="hz-sub"><span class="sc-interp"></span></span></span><span data-dc-tpl="46" class="hz " style="left: 42.2%;"><span class="sc-interp">1 h</span><span data-dc-tpl="47" class="hz-sub"><span class="sc-interp"></span></span></span><span data-dc-tpl="46" class="hz " style="left: 65.2%;"><span class="sc-interp">today</span><span data-dc-tpl="47" class="hz-sub"><span class="sc-interp"></span></span></span><span data-dc-tpl="46" class="hz end" style="left: 93.9%;"><span class="sc-interp">cycle end</span><span data-dc-tpl="47" class="hz-sub"><span class="sc-interp"> · 11 d</span></span></span>
+    
+      <div data-dc-tpl="49" class="mk mk-bump" style="left: 4%; animation-delay: 0ms;">
+        <span data-dc-tpl="51" class="mk-stem" aria-hidden="true" style="top: 78px; height: 31px;"></span>
+        <span data-dc-tpl="52" class="mk-lbl" title="SSE reconnecting" style="left: -52px; top: 58px;"><span data-dc-tpl="53" class="mk-n"><span class="sc-interp">1</span></span><span data-dc-tpl="55" class="mk-t"><span class="sc-interp">SSE reconnecting</span></span></span>
+        <span data-dc-tpl="56" class="g lg g-bump" aria-hidden="true"></span>
+      </div>
+    
+      <div data-dc-tpl="49" class="mk mk-bump" style="left: 6.2%; animation-delay: 70ms;">
+        <span data-dc-tpl="51" class="mk-stem" aria-hidden="true" style="top: 52px; height: 57px;"></span>
+        <span data-dc-tpl="52" class="mk-lbl" title="mergepath #1598 · unaccounted" style="left: -80px; top: 32px;"><span data-dc-tpl="53" class="mk-n"><span class="sc-interp">2</span></span><span data-dc-tpl="55" class="mk-t"><span class="sc-interp">mergepath #1598 · unaccounted</span></span></span>
+        <span data-dc-tpl="56" class="g lg g-bump" aria-hidden="true"></span>
+      </div>
+    
+      <div data-dc-tpl="49" class="mk mk-bump" style="left: 8.3%; animation-delay: 140ms;">
+        <span data-dc-tpl="51" class="mk-stem" aria-hidden="true" style="top: 26px; height: 83px;"></span>
+        <span data-dc-tpl="52" class="mk-lbl" title="swipewatch #88 · behind main" style="left: -89px; top: 6px;"><span data-dc-tpl="53" class="mk-n"><span class="sc-interp">3</span></span><span data-dc-tpl="55" class="mk-t"><span class="sc-interp">swipewatch #88 · behind main</span></span></span>
+        <span data-dc-tpl="56" class="g lg g-bump" aria-hidden="true"></span>
+      </div>
+    
+      <div data-dc-tpl="49" class="mk mk-bump" style="left: 10.5%; animation-delay: 210ms;">
+        <span data-dc-tpl="51" class="mk-stem" aria-hidden="true" style="top: 104px; height: 5px;"></span>
+        <span data-dc-tpl="52" class="mk-lbl" title="swipewatch #88 · stale failure" style="left: -10px; top: 84px;"><span data-dc-tpl="53" class="mk-n"><span class="sc-interp">4</span></span></span>
+        <span data-dc-tpl="56" class="g lg g-bump" aria-hidden="true"></span>
+      </div>
+    
+      <div data-dc-tpl="49" class="mk mk-bump" style="left: 12.6%; animation-delay: 280ms;">
+        <span data-dc-tpl="51" class="mk-stem" aria-hidden="true" style="top: 104px; height: 5px;"></span>
+        <span data-dc-tpl="52" class="mk-lbl" title="tadlockpsychiatry · fetch error" style="left: -10px; top: 84px;"><span data-dc-tpl="53" class="mk-n"><span class="sc-interp">5</span></span></span>
+        <span data-dc-tpl="56" class="g lg g-bump" aria-hidden="true"></span>
+      </div>
+    
+      <div data-dc-tpl="49" class="mk mk-bump" style="left: 14.8%; animation-delay: 350ms;">
+        <span data-dc-tpl="51" class="mk-stem" aria-hidden="true" style="top: 104px; height: 5px;"></span>
+        <span data-dc-tpl="52" class="mk-lbl" title="mergepath #1598 · near timeout" style="left: -10px; top: 84px;"><span data-dc-tpl="53" class="mk-n"><span class="sc-interp">6</span></span></span>
+        <span data-dc-tpl="56" class="g lg g-bump" aria-hidden="true"></span>
+      </div>
+    
+      <div data-dc-tpl="49" class="mk mk-bump" style="left: 20.7%; animation-delay: 420ms;">
+        <span data-dc-tpl="51" class="mk-stem" aria-hidden="true" style="top: 78px; height: 31px;"></span>
+        <span data-dc-tpl="52" class="mk-lbl" title="queue rising · 23 queued" style="left: -74px; top: 58px;"><span data-dc-tpl="53" class="mk-n"><span class="sc-interp">7</span></span><span data-dc-tpl="55" class="mk-t"><span class="sc-interp">queue rising · 23 queued</span></span></span>
+        <span data-dc-tpl="56" class="g lg g-bump" aria-hidden="true"></span>
+      </div>
+    
+      <div data-dc-tpl="49" class="mk mk-bump" style="left: 27.1%; animation-delay: 490ms;">
+        <span data-dc-tpl="51" class="mk-stem" aria-hidden="true" style="top: 52px; height: 57px;"></span>
+        <span data-dc-tpl="52" class="mk-lbl" title="tadlockpsychiatry #7 · rate-limited" style="left: -99px; top: 32px;"><span data-dc-tpl="53" class="mk-n"><span class="sc-interp">8</span></span><span data-dc-tpl="55" class="mk-t"><span class="sc-interp">tadlockpsychiatry #7 · rate-limited</span></span></span>
+        <span data-dc-tpl="56" class="g lg g-bump" aria-hidden="true"></span>
+      </div>
+    
+      <div data-dc-tpl="49" class="mk mk-boulder" style="left: 93.9%; animation-delay: 770ms;">
+        <span data-dc-tpl="51" class="mk-stem" aria-hidden="true" style="top: 78px; height: 31px;"></span>
+        <span data-dc-tpl="52" class="mk-lbl" title="spend passes budget" style="left: -71px; top: 58px;"><span data-dc-tpl="53" class="mk-n"><span class="sc-interp">12</span></span><span data-dc-tpl="55" class="mk-t"><span class="sc-interp">spend passes budget</span></span></span>
+        <span data-dc-tpl="56" class="g lg g-boulder" aria-hidden="true"></span>
+      </div>
+    
+    <span data-dc-tpl="58" class="more"><span class="sc-interp">+3 more in the list below</span></span>
+    
+  </div>
+  <ul data-dc-tpl="62" class="road-list">
+    
+      <li data-dc-tpl="64" class="ri ri-bump"><span data-dc-tpl="65" class="ri-n"><span class="sc-interp">1</span></span><span data-dc-tpl="66" class="g g-bump" aria-hidden="true"></span><span data-dc-tpl="67" class="ri-kind"><span class="sc-interp">Speed bump</span></span><span data-dc-tpl="68" class="ri-text"><span class="sc-interp">The SSE stream dropped and is reconnecting with backoff. Every section may be stale until it returns.</span></span><span data-dc-tpl="69" class="ri-eta mono"><span class="sc-interp">now</span></span><a data-dc-tpl="70" class="ri-src" href="#road"><span class="sc-interp">shell</span></a></li>
+    
+      <li data-dc-tpl="64" class="ri ri-bump"><span data-dc-tpl="65" class="ri-n"><span class="sc-interp">2</span></span><span data-dc-tpl="66" class="g g-bump" aria-hidden="true"></span><span data-dc-tpl="67" class="ri-kind"><span class="sc-interp">Speed bump</span></span><span data-dc-tpl="68" class="ri-text"><span class="sc-interp">mergepath #1598: 2 feedback items posted but not accounted. The accounting gate will hold the merge.</span></span><span data-dc-tpl="69" class="ri-eta mono"><span class="sc-interp">now</span></span><a data-dc-tpl="70" class="ri-src" href="#prs"><span class="sc-interp">Open PRs</span></a></li>
+    
+      <li data-dc-tpl="64" class="ri ri-bump"><span data-dc-tpl="65" class="ri-n"><span class="sc-interp">3</span></span><span data-dc-tpl="66" class="g g-bump" aria-hidden="true"></span><span data-dc-tpl="67" class="ri-kind"><span class="sc-interp">Speed bump</span></span><span data-dc-tpl="68" class="ri-text"><span class="sc-interp">swipewatch #88: behind main. update-branch carries the APPROVED forward; a thumbs-up would not survive it.</span></span><span data-dc-tpl="69" class="ri-eta mono"><span class="sc-interp">now</span></span><a data-dc-tpl="70" class="ri-src" href="#prs"><span class="sc-interp">Open PRs</span></a></li>
+    
+      <li data-dc-tpl="64" class="ri ri-bump"><span data-dc-tpl="65" class="ri-n"><span class="sc-interp">4</span></span><span data-dc-tpl="66" class="g g-bump" aria-hidden="true"></span><span data-dc-tpl="67" class="ri-kind"><span class="sc-interp">Speed bump</span></span><span data-dc-tpl="68" class="ri-text"><span class="sc-interp">Run 9088 (repo_lint) failed on swipewatch #88 HEAD b44d1c7 and no later pass superseded it. Needs gh run rerun --failed.</span></span><span data-dc-tpl="69" class="ri-eta mono"><span class="sc-interp">now</span></span><a data-dc-tpl="70" class="ri-src" href="#ci"><span class="sc-interp">CI runs</span></a></li>
+    
+      <li data-dc-tpl="64" class="ri ri-bump"><span data-dc-tpl="65" class="ri-n"><span class="sc-interp">5</span></span><span data-dc-tpl="66" class="g g-bump" aria-hidden="true"></span><span data-dc-tpl="67" class="ri-kind"><span class="sc-interp">Speed bump</span></span><span data-dc-tpl="68" class="ri-text"><span class="sc-interp">tadlockpsychiatry: the audit could not fetch (exit 128). The last good result is 42 min old and marked stale.</span></span><span data-dc-tpl="69" class="ri-eta mono"><span class="sc-interp">now</span></span><a data-dc-tpl="70" class="ri-src" href="#fleet"><span class="sc-interp">Fleet sync</span></a></li>
+    
+      <li data-dc-tpl="64" class="ri ri-bump"><span data-dc-tpl="65" class="ri-n"><span class="sc-interp">6</span></span><span data-dc-tpl="66" class="g g-bump" aria-hidden="true"></span><span data-dc-tpl="67" class="ri-kind"><span class="sc-interp">Speed bump</span></span><span data-dc-tpl="68" class="ri-text"><span class="sc-interp">Claude adapter on mergepath #1598 is at 11:41 of its 14:00 timeout. A timeout exits without a verdict.</span></span><span data-dc-tpl="69" class="ri-eta mono"><span class="sc-interp">in ~2 min</span></span><a data-dc-tpl="70" class="ri-src" href="#agents"><span class="sc-interp">Phase 4b agents</span></a></li>
+    
+      <li data-dc-tpl="64" class="ri ri-bump"><span data-dc-tpl="65" class="ri-n"><span class="sc-interp">7</span></span><span data-dc-tpl="66" class="g g-bump" aria-hidden="true"></span><span data-dc-tpl="67" class="ri-kind"><span class="sc-interp">Speed bump</span></span><span data-dc-tpl="68" class="ri-text"><span class="sc-interp">23 runs queued against 2 running, about 58 min to drain. Two review loops in parallel caused the 2026-09-30 jam.</span></span><span data-dc-tpl="69" class="ri-eta mono"><span class="sc-interp">in ~5 min</span></span><a data-dc-tpl="70" class="ri-src" href="#budget"><span class="sc-interp">Actions budget</span></a></li>
+    
+      <li data-dc-tpl="64" class="ri ri-bump"><span data-dc-tpl="65" class="ri-n"><span class="sc-interp">8</span></span><span data-dc-tpl="66" class="g g-bump" aria-hidden="true"></span><span data-dc-tpl="67" class="ri-kind"><span class="sc-interp">Speed bump</span></span><span data-dc-tpl="68" class="ri-text"><span class="sc-interp">tadlockpsychiatry #7: CodeRabbit is rate-limited and resumes in 11 min. Auto-merge waits for its report.</span></span><span data-dc-tpl="69" class="ri-eta mono"><span class="sc-interp">in ~11 min</span></span><a data-dc-tpl="70" class="ri-src" href="#prs"><span class="sc-interp">Open PRs</span></a></li>
+    
+      <li data-dc-tpl="64" class="ri ri-bump"><span data-dc-tpl="65" class="ri-n"><span class="sc-interp">9</span></span><span data-dc-tpl="66" class="g g-bump" aria-hidden="true"></span><span data-dc-tpl="67" class="ri-kind"><span class="sc-interp">Speed bump</span></span><span data-dc-tpl="68" class="ri-text"><span class="sc-interp">mergepath GITHUB_TOKEN estimate at 780 of 1,000 per hour. A review-loop burst would exhaust it before the hour resets.</span></span><span data-dc-tpl="69" class="ri-eta mono"><span class="sc-interp">in ~17 min</span></span><a data-dc-tpl="70" class="ri-src" href="#budget"><span class="sc-interp">Actions budget</span></a></li>
+    
+      <li data-dc-tpl="64" class="ri ri-bump"><span data-dc-tpl="65" class="ri-n"><span class="sc-interp">10</span></span><span data-dc-tpl="66" class="g g-bump" aria-hidden="true"></span><span data-dc-tpl="67" class="ri-kind"><span class="sc-interp">Speed bump</span></span><span data-dc-tpl="68" class="ri-text"><span class="sc-interp">CI PAT pool at 78%: reaches 5,000 per hour in about 22 min at this burn, 0 min before it resets.</span></span><span data-dc-tpl="69" class="ri-eta mono"><span class="sc-interp">in ~22 min</span></span><a data-dc-tpl="70" class="ri-src" href="#budget"><span class="sc-interp">Actions budget</span></a></li>
+    
+      <li data-dc-tpl="64" class="ri ri-bump"><span data-dc-tpl="65" class="ri-n"><span class="sc-interp">11</span></span><span data-dc-tpl="66" class="g g-bump" aria-hidden="true"></span><span data-dc-tpl="67" class="ri-kind"><span class="sc-interp">Speed bump</span></span><span data-dc-tpl="68" class="ri-text"><span class="sc-interp">friends-and-family-billing #19: 2 of 10 blocking reviews left, 1 of 10 Codex rounds left, 1 of 5 commits before CodeRabbit pauses left. The next round or push spends it.</span></span><span data-dc-tpl="69" class="ri-eta mono"><span class="sc-interp">in ~25 min</span></span><a data-dc-tpl="70" class="ri-src" href="#prs"><span class="sc-interp">Open PRs</span></a></li>
+    
+      <li data-dc-tpl="64" class="ri ri-boulder"><span data-dc-tpl="65" class="ri-n"><span class="sc-interp">12</span></span><span data-dc-tpl="66" class="g g-boulder" aria-hidden="true"></span><span data-dc-tpl="67" class="ri-kind"><span class="sc-interp">Boulder</span></span><span data-dc-tpl="68" class="ri-text"><span class="sc-interp">Projected net spend $26.80 passes the $25.00 budget at cycle end, 11 days away. Scheduled crons dominate the bill.</span></span><span data-dc-tpl="69" class="ri-eta mono"><span class="sc-interp">in ~11 days</span></span><a data-dc-tpl="70" class="ri-src" href="#budget"><span class="sc-interp">Actions budget</span></a></li>
+    
+  </ul></section><section data-dc-tpl="71" class="panel" id="prs">
+  <div data-dc-tpl="72" class="sec-head">
+    <div data-dc-tpl="73"><p data-dc-tpl="74" class="eyebrow">Open PRs</p><h2 data-dc-tpl="75"><span class="sc-interp">6 open · 0 boulders · 4 speed bumps · 1 in progress</span></h2></div>
+    <div data-dc-tpl="76" class="sec-meta"><span data-dc-tpl="77">GraphQL · one batched query per repo · ledger per PR on HEAD change</span><span data-dc-tpl="78" class="poll"><svg data-dc-tpl="79" class="ring" viewBox="0 0 20 20" aria-hidden="true"><circle data-dc-tpl="80" class="ring-bg" cx="10" cy="10" r="7"></circle><circle data-dc-tpl="81" class="ring-fg" cx="10" cy="10" r="7"></circle></svg>polled <span class="sc-interp">1 s ago</span></span></div>
+  </div>
+  <div data-dc-tpl="82" class="filters" role="group" aria-label="Repo filter">
+    <button data-dc-tpl="84" type="button" class="chipb on" aria-pressed="true"><span class="sc-interp">All</span><span data-dc-tpl="85" class="cnt"><span class="sc-interp">6</span></span></button><button data-dc-tpl="84" type="button" class="chipb " aria-pressed="false"><span class="sc-interp">mergepath (hub)</span><span data-dc-tpl="85" class="cnt"><span class="sc-interp">2</span></span></button><button data-dc-tpl="84" type="button" class="chipb " aria-pressed="false"><span class="sc-interp">matchline</span><span data-dc-tpl="85" class="cnt"><span class="sc-interp">1</span></span></button><button data-dc-tpl="84" type="button" class="chipb " aria-pressed="false"><span class="sc-interp">swipewatch</span><span data-dc-tpl="85" class="cnt"><span class="sc-interp">1</span></span></button><button data-dc-tpl="84" type="button" class="chipb " aria-pressed="false"><span class="sc-interp">overridebroadway</span><span data-dc-tpl="85" class="cnt"><span class="sc-interp">0</span></span></button><button data-dc-tpl="84" type="button" class="chipb " aria-pressed="false"><span class="sc-interp">nathanpaynedotcom</span><span data-dc-tpl="85" class="cnt"><span class="sc-interp">0</span></span></button><button data-dc-tpl="84" type="button" class="chipb " aria-pressed="false"><span class="sc-interp">friends-and-family-billing</span><span data-dc-tpl="85" class="cnt"><span class="sc-interp">1</span></span></button><button data-dc-tpl="84" type="button" class="chipb " aria-pressed="false"><span class="sc-interp">tadlockpsychiatry</span><span data-dc-tpl="85" class="cnt"><span class="sc-interp">1</span></span></button>
+  </div>
+  <div data-dc-tpl="86" class="tbl-wrap">
+  <div data-dc-tpl="87" class="tbl" role="table" style="--cols: 118px minmax(220px, 1.4fr) minmax(190px, 1.1fr) 128px 250px 86px 160px 64px; --minw: 1216px;">
+   <div data-dc-tpl="88" class="trow th" role="row"><span data-dc-tpl="89" role="columnheader">Status</span><span data-dc-tpl="90" role="columnheader">Pull request</span><span data-dc-tpl="91" role="columnheader">Merge state · checks</span><span data-dc-tpl="92" role="columnheader">Gate labels</span><span data-dc-tpl="93" role="columnheader">Review budgets · remaining</span><span data-dc-tpl="94" role="columnheader">Feedback</span><span data-dc-tpl="95" role="columnheader">CodeRabbit</span><span data-dc-tpl="96" role="columnheader">Age</span></div>
+   
+    <div data-dc-tpl="98" class="trow tone-bump " role="row" style="animation-delay: 0ms;">
+     <div data-dc-tpl="99" class="cell" role="cell"><span data-dc-tpl="100" class="b b-bump"><span data-dc-tpl="101" class="g g-bump" aria-hidden="true"></span><span class="sc-interp">Unaccounted</span></span>
+       
+     </div>
+     <div data-dc-tpl="109" class="cell" role="cell"><a data-dc-tpl="110" class="pr-link" href="https://github.com/nathanjohnpayne/mergepath/pull/1598"><span data-dc-tpl="111" class="mono soft"><span class="sc-interp">mergepath</span> #<span class="sc-interp">1598</span></span><span data-dc-tpl="112" class="ttl"><span class="sc-interp">feat(cockpit): server shell, SSE stream and request budget</span></span></a><span data-dc-tpl="113" class="sub mono"><span class="sc-interp">nathanjohnpayne</span> · <span class="sc-interp">a3f9c21</span><span class="sc-interp"></span></span></div>
+     <div data-dc-tpl="114" class="cell" role="cell"><span data-dc-tpl="115" class="ms ms-bump"><span class="sc-interp">BLOCKED</span></span><span data-dc-tpl="116" class="why"><span class="sc-interp">codex-review-check in progress</span></span><div data-dc-tpl="117" class="pips" aria-label="6 of 7 required passed · 1 running"><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-run"></i><span data-dc-tpl="120" class="sub mono"><span class="sc-interp">6 of 7 required passed · 1 running</span></span></div></div>
+     <div data-dc-tpl="121" class="cell" role="cell"><span data-dc-tpl="123" class="lab lab-ext"><span class="sc-interp">needs-external-review</span></span></div>
+     <div data-dc-tpl="126" class="cell" role="cell">
+       <div data-dc-tpl="127" class="bstrip"><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">blk</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 30%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">7 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">req</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 35%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">13 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">rnd</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 30%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">7 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">4b</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 0%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">1 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">CR</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 40%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">3 left</span></span></div></div>
+       <div data-dc-tpl="134" class="bs-llm mono soft"><span class="sc-interp">LLM 96k tokens · $0.82</span></div>
+       <div data-dc-tpl="135" class="cx-flags"><button data-dc-tpl="136" type="button" class="linkb" aria-expanded="false"><span class="sc-interp">all budgets</span></button><span data-dc-tpl="138" class="flag f-run"><span data-dc-tpl="139" class="g g-run" aria-hidden="true"></span>request in flight on HEAD</span></div>
+     </div>
+     <div data-dc-tpl="143" class="cell" role="cell"><span data-dc-tpl="144" class="mono ink-bump"><span class="sc-interp">12 / 14</span></span><span data-dc-tpl="145" class="sub">accounted / posted</span></div>
+     <div data-dc-tpl="146" class="cell" role="cell"><span data-dc-tpl="147" class="b b-clear"><span data-dc-tpl="148" class="g g-clear" aria-hidden="true"></span><span class="sc-interp">reviewed on HEAD</span></span></div>
+     <div data-dc-tpl="149" class="cell mono soft" role="cell"><span class="sc-interp">2h</span><span data-dc-tpl="150" class="sub">push <span class="sc-interp">14m</span></span></div>
+    </div>
+    
+   
+    <div data-dc-tpl="98" class="trow tone-bump " role="row" style="animation-delay: 40ms;">
+     <div data-dc-tpl="99" class="cell" role="cell"><span data-dc-tpl="100" class="b b-bump"><span data-dc-tpl="101" class="g g-bump" aria-hidden="true"></span><span class="sc-interp">Budget near</span></span>
+       
+     </div>
+     <div data-dc-tpl="109" class="cell" role="cell"><a data-dc-tpl="110" class="pr-link" href="https://github.com/nathanjohnpayne/friends-and-family-billing/pull/19"><span data-dc-tpl="111" class="mono soft"><span class="sc-interp">friends-and-family-billing</span> #<span class="sc-interp">19</span></span><span data-dc-tpl="112" class="ttl"><span class="sc-interp">fix(invoice): proration rounds half-even</span></span></a><span data-dc-tpl="113" class="sub mono"><span class="sc-interp">nathanjohnpayne</span> · <span class="sc-interp">c7b1d04</span><span class="sc-interp"></span></span></div>
+     <div data-dc-tpl="114" class="cell" role="cell"><span data-dc-tpl="115" class="ms ms-bump"><span class="sc-interp">BLOCKED</span></span><span data-dc-tpl="116" class="why"><span class="sc-interp">one Codex round left before Phase 4b · CodeRabbit pauses on the next commit</span></span><div data-dc-tpl="117" class="pips" aria-label="7 of 7 required passed"><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><span data-dc-tpl="120" class="sub mono"><span class="sc-interp">7 of 7 required passed</span></span></div></div>
+     <div data-dc-tpl="121" class="cell" role="cell"><span data-dc-tpl="123" class="lab lab-ext"><span class="sc-interp">needs-external-review</span></span></div>
+     <div data-dc-tpl="126" class="cell" role="cell">
+       <div data-dc-tpl="127" class="bstrip"><div data-dc-tpl="129" class="bs t-bump"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">blk</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-bump" style="width: 80%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-bump"><span class="sc-interp">2 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">req</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 80%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">4 left</span></span></div><div data-dc-tpl="129" class="bs t-bump"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">rnd</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-bump" style="width: 90%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-bump"><span class="sc-interp">1 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">4b</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 0%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">1 left</span></span></div><div data-dc-tpl="129" class="bs t-bump"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">CR</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-bump" style="width: 80%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-bump"><span class="sc-interp">1 left</span></span></div></div>
+       <div data-dc-tpl="134" class="bs-llm mono soft"><span class="sc-interp">LLM 310k tokens · $2.40 est · Codex split n/a</span></div>
+       <div data-dc-tpl="135" class="cx-flags"><button data-dc-tpl="136" type="button" class="linkb" aria-expanded="false"><span class="sc-interp">all budgets</span></button><span data-dc-tpl="138" class="flag f-run"><span data-dc-tpl="139" class="g g-run" aria-hidden="true"></span>request in flight on HEAD</span></div>
+     </div>
+     <div data-dc-tpl="143" class="cell" role="cell"><span data-dc-tpl="144" class="mono ink-bump"><span class="sc-interp">31 / 34</span></span><span data-dc-tpl="145" class="sub">accounted / posted</span></div>
+     <div data-dc-tpl="146" class="cell" role="cell"><span data-dc-tpl="147" class="b b-clear"><span data-dc-tpl="148" class="g g-clear" aria-hidden="true"></span><span class="sc-interp">reviewed on HEAD</span></span></div>
+     <div data-dc-tpl="149" class="cell mono soft" role="cell"><span class="sc-interp">3d</span><span data-dc-tpl="150" class="sub">push <span class="sc-interp">1h</span></span></div>
+    </div>
+    
+   
+    <div data-dc-tpl="98" class="trow tone-bump " role="row" style="animation-delay: 80ms;">
+     <div data-dc-tpl="99" class="cell" role="cell"><span data-dc-tpl="100" class="b b-bump"><span data-dc-tpl="101" class="g g-bump" aria-hidden="true"></span><span class="sc-interp">Rate-limited</span></span>
+       
+     </div>
+     <div data-dc-tpl="109" class="cell" role="cell"><a data-dc-tpl="110" class="pr-link" href="https://github.com/nathanjohnpayne/tadlockpsychiatry/pull/7"><span data-dc-tpl="111" class="mono soft"><span class="sc-interp">tadlockpsychiatry</span> #<span class="sc-interp">7</span></span><span data-dc-tpl="112" class="ttl"><span class="sc-interp">chore: bump ci kit to hub 9a8fcdf</span></span></a><span data-dc-tpl="113" class="sub mono"><span class="sc-interp">nathanjohnpayne</span> · <span class="sc-interp">0f4c9d2</span><span class="sc-interp"></span></span></div>
+     <div data-dc-tpl="114" class="cell" role="cell"><span data-dc-tpl="115" class="ms ms-bump"><span class="sc-interp">CLEAN</span></span><span data-dc-tpl="116" class="why"><span class="sc-interp">auto-merge waits for the CodeRabbit report</span></span><div data-dc-tpl="117" class="pips" aria-label="4 of 4 required passed"><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><span data-dc-tpl="120" class="sub mono"><span class="sc-interp">4 of 4 required passed</span></span></div></div>
+     <div data-dc-tpl="121" class="cell" role="cell"><span data-dc-tpl="125" class="soft">none</span></div>
+     <div data-dc-tpl="126" class="cell" role="cell">
+       <div data-dc-tpl="127" class="bstrip"><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">blk</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 0%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">10 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">req</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 0%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">20 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">rnd</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 0%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">10 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">4b</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 0%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">1 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">CR</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 40%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">3 left</span></span></div></div>
+       <div data-dc-tpl="134" class="bs-llm mono soft"><span class="sc-interp">LLM 0 tokens · $0.00</span></div>
+       <div data-dc-tpl="135" class="cx-flags"><button data-dc-tpl="136" type="button" class="linkb" aria-expanded="false"><span class="sc-interp">all budgets</span></button></div>
+     </div>
+     <div data-dc-tpl="143" class="cell" role="cell"><span data-dc-tpl="144" class="mono "><span class="sc-interp">0 / 0</span></span><span data-dc-tpl="145" class="sub">accounted / posted</span></div>
+     <div data-dc-tpl="146" class="cell" role="cell"><span data-dc-tpl="147" class="b b-bump"><span data-dc-tpl="148" class="g g-bump" aria-hidden="true"></span><span class="sc-interp">rate-limited · 11 min</span></span></div>
+     <div data-dc-tpl="149" class="cell mono soft" role="cell"><span class="sc-interp">20m</span><span data-dc-tpl="150" class="sub">push <span class="sc-interp">20m</span></span></div>
+    </div>
+    
+   
+    <div data-dc-tpl="98" class="trow tone-bump " role="row" style="animation-delay: 120ms;">
+     <div data-dc-tpl="99" class="cell" role="cell"><span data-dc-tpl="100" class="b b-bump"><span data-dc-tpl="101" class="g g-bump" aria-hidden="true"></span><span class="sc-interp">Behind main</span></span>
+       
+     </div>
+     <div data-dc-tpl="109" class="cell" role="cell"><a data-dc-tpl="110" class="pr-link" href="https://github.com/nathanjohnpayne/swipewatch/pull/88"><span data-dc-tpl="111" class="mono soft"><span class="sc-interp">swipewatch</span> #<span class="sc-interp">88</span></span><span data-dc-tpl="112" class="ttl"><span class="sc-interp">sync: review policy and ci kit 2026-10-01</span></span></a><span data-dc-tpl="113" class="sub mono"><span class="sc-interp">nathanjohnpayne</span> · <span class="sc-interp">b44d1c7</span><span class="sc-interp"></span></span></div>
+     <div data-dc-tpl="114" class="cell" role="cell"><span data-dc-tpl="115" class="ms ms-bump"><span class="sc-interp">BEHIND</span></span><span data-dc-tpl="116" class="why"><span class="sc-interp">base moved · update-branch keeps the APPROVED</span></span><div data-dc-tpl="117" class="pips" aria-label="4 of 5 required passed · 1 failed"><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-fail"></i><span data-dc-tpl="120" class="sub mono"><span class="sc-interp">4 of 5 required passed · 1 failed</span></span></div></div>
+     <div data-dc-tpl="121" class="cell" role="cell"><span data-dc-tpl="125" class="soft">none</span></div>
+     <div data-dc-tpl="126" class="cell" role="cell">
+       <div data-dc-tpl="127" class="bstrip"><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">blk</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 0%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">10 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">req</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 5%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">19 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">rnd</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 10%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">9 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">4b</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 0%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">1 left</span></span></div><div data-dc-tpl="129" class="bs t-idle"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">CR</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-idle" style="width: 0%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-idle"><span class="sc-interp">unknown</span></span></div></div>
+       <div data-dc-tpl="134" class="bs-llm mono soft"><span class="sc-interp">LLM spend unknown · ledger unreadable</span></div>
+       <div data-dc-tpl="135" class="cx-flags"><button data-dc-tpl="136" type="button" class="linkb" aria-expanded="false"><span class="sc-interp">all budgets</span></button></div>
+     </div>
+     <div data-dc-tpl="143" class="cell" role="cell"><span data-dc-tpl="144" class="mono "><span class="sc-interp">0 / 0</span></span><span data-dc-tpl="145" class="sub">accounted / posted</span></div>
+     <div data-dc-tpl="146" class="cell" role="cell"><span data-dc-tpl="147" class="b b-clear"><span data-dc-tpl="148" class="g g-clear" aria-hidden="true"></span><span class="sc-interp">reviewed on HEAD</span></span></div>
+     <div data-dc-tpl="149" class="cell mono soft" role="cell"><span class="sc-interp">1d</span><span data-dc-tpl="150" class="sub">push <span class="sc-interp">1d</span></span></div>
+    </div>
+    
+   
+    <div data-dc-tpl="98" class="trow tone-run " role="row" style="animation-delay: 160ms;">
+     <div data-dc-tpl="99" class="cell" role="cell"><span data-dc-tpl="100" class="b b-run"><span data-dc-tpl="101" class="g g-run" aria-hidden="true"></span><span class="sc-interp">In progress</span></span>
+       
+     </div>
+     <div data-dc-tpl="109" class="cell" role="cell"><a data-dc-tpl="110" class="pr-link" href="https://github.com/nathanjohnpayne/mergepath/pull/1599"><span data-dc-tpl="111" class="mono soft"><span class="sc-interp">mergepath</span> #<span class="sc-interp">1599</span></span><span data-dc-tpl="112" class="ttl"><span class="sc-interp">test(cockpit): hermetic server suite and check_cockpit</span></span></a><span data-dc-tpl="113" class="sub mono"><span class="sc-interp">nathanjohnpayne</span> · <span class="sc-interp">e81b7aa</span><span class="sc-interp"></span></span></div>
+     <div data-dc-tpl="114" class="cell" role="cell"><span data-dc-tpl="115" class="ms ms-run"><span class="sc-interp">BLOCKED</span></span><span data-dc-tpl="116" class="why"><span class="sc-interp">repo_lint in progress</span></span><div data-dc-tpl="117" class="pips" aria-label="3 of 7 required passed · 2 running"><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-run"></i><i data-dc-tpl="119" class="pip pip-run"></i><span data-dc-tpl="120" class="sub mono"><span class="sc-interp">3 of 7 required passed · 2 running</span></span></div></div>
+     <div data-dc-tpl="121" class="cell" role="cell"><span data-dc-tpl="125" class="soft">none</span></div>
+     <div data-dc-tpl="126" class="cell" role="cell">
+       <div data-dc-tpl="127" class="bstrip"><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">blk</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 10%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">9 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">req</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 10%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">18 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">rnd</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 10%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">9 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">4b</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 0%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">1 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">CR</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 20%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">4 left</span></span></div></div>
+       <div data-dc-tpl="134" class="bs-llm mono soft"><span class="sc-interp">LLM 40k tokens · $0.31</span></div>
+       <div data-dc-tpl="135" class="cx-flags"><button data-dc-tpl="136" type="button" class="linkb" aria-expanded="false"><span class="sc-interp">all budgets</span></button></div>
+     </div>
+     <div data-dc-tpl="143" class="cell" role="cell"><span data-dc-tpl="144" class="mono "><span class="sc-interp">4 / 4</span></span><span data-dc-tpl="145" class="sub">accounted / posted</span></div>
+     <div data-dc-tpl="146" class="cell" role="cell"><span data-dc-tpl="147" class="b b-run"><span data-dc-tpl="148" class="g g-run" aria-hidden="true"></span><span class="sc-interp">review pending</span></span></div>
+     <div data-dc-tpl="149" class="cell mono soft" role="cell"><span class="sc-interp">55m</span><span data-dc-tpl="150" class="sub">push <span class="sc-interp">6m</span></span></div>
+    </div>
+    
+   
+    <div data-dc-tpl="98" class="trow tone-clear " role="row" style="animation-delay: 200ms;">
+     <div data-dc-tpl="99" class="cell" role="cell"><span data-dc-tpl="100" class="b b-clear"><span data-dc-tpl="101" class="g g-clear" aria-hidden="true"></span><span class="sc-interp">Clean</span></span>
+       
+     </div>
+     <div data-dc-tpl="109" class="cell" role="cell"><a data-dc-tpl="110" class="pr-link" href="https://github.com/nathanjohnpayne/matchline/pull/212"><span data-dc-tpl="111" class="mono soft"><span class="sc-interp">matchline</span> #<span class="sc-interp">212</span></span><span data-dc-tpl="112" class="ttl"><span class="sc-interp">sync: review policy and ci kit 2026-10-01</span></span></a><span data-dc-tpl="113" class="sub mono"><span class="sc-interp">nathanjohnpayne</span> · <span class="sc-interp">5d02e8f</span><span class="sc-interp"></span></span></div>
+     <div data-dc-tpl="114" class="cell" role="cell"><span data-dc-tpl="115" class="ms ms-clear"><span class="sc-interp">CLEAN</span></span><span data-dc-tpl="116" class="why"><span class="sc-interp">auto-merge armed · propagation lane</span></span><div data-dc-tpl="117" class="pips" aria-label="5 of 5 required passed"><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><i data-dc-tpl="119" class="pip pip-ok"></i><span data-dc-tpl="120" class="sub mono"><span class="sc-interp">5 of 5 required passed</span></span></div></div>
+     <div data-dc-tpl="121" class="cell" role="cell"><span data-dc-tpl="125" class="soft">none</span></div>
+     <div data-dc-tpl="126" class="cell" role="cell">
+       <div data-dc-tpl="127" class="bstrip"><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">blk</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 0%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">10 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">req</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 5%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">19 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">rnd</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 10%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">9 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">4b</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 0%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">1 left</span></span></div><div data-dc-tpl="129" class="bs t-clear"><span data-dc-tpl="130" class="bs-l"><span class="sc-interp">CR</span></span><div data-dc-tpl="131" class="mini"><div data-dc-tpl="132" class="mini-fill t-clear" style="width: 0%;"></div></div><span data-dc-tpl="133" class="mono bs-n ink-clear"><span class="sc-interp">5 left</span></span></div></div>
+       <div data-dc-tpl="134" class="bs-llm mono soft"><span class="sc-interp">LLM 12k tokens · $0.07</span></div>
+       <div data-dc-tpl="135" class="cx-flags"><button data-dc-tpl="136" type="button" class="linkb" aria-expanded="false"><span class="sc-interp">all budgets</span></button></div>
+     </div>
+     <div data-dc-tpl="143" class="cell" role="cell"><span data-dc-tpl="144" class="mono "><span class="sc-interp">0 / 0</span></span><span data-dc-tpl="145" class="sub">accounted / posted</span></div>
+     <div data-dc-tpl="146" class="cell" role="cell"><span data-dc-tpl="147" class="b b-clear"><span data-dc-tpl="148" class="g g-clear" aria-hidden="true"></span><span class="sc-interp">comment-only</span></span></div>
+     <div data-dc-tpl="149" class="cell mono soft" role="cell"><span class="sc-interp">41m</span><span data-dc-tpl="150" class="sub">push <span class="sc-interp">41m</span></span></div>
+    </div>
+    
+   
+  </div>
+  </div></section><div data-dc-tpl="167" class="row2"><section data-dc-tpl="168" class="panel grow" id="ci">
+  <div data-dc-tpl="169" class="sec-head">
+    <div data-dc-tpl="170"><p data-dc-tpl="171" class="eyebrow">CI and test runs</p><h2 data-dc-tpl="172"><span class="sc-interp">3 running · 2 need attention · 6 recent</span></h2></div>
+    <div data-dc-tpl="173" class="sec-meta"><span data-dc-tpl="174">Actions REST · ETag · each check_* suite is a step</span><span data-dc-tpl="175" class="poll"><svg data-dc-tpl="176" class="ring r20" viewBox="0 0 20 20" aria-hidden="true"><circle data-dc-tpl="177" class="ring-bg" cx="10" cy="10" r="7"></circle><circle data-dc-tpl="178" class="ring-fg" cx="10" cy="10" r="7"></circle></svg>polled <span class="sc-interp">1 s ago</span></span></div>
+  </div>
+  <div data-dc-tpl="179" class="runs">
+   
+    <div data-dc-tpl="181" class="run tone-run">
+      <button data-dc-tpl="182" type="button" class="run-head" aria-expanded="false">
+        <span data-dc-tpl="183" class="g g-run" aria-hidden="true"></span>
+        <span data-dc-tpl="184" class="run-wf mono"><span class="sc-interp">repo_lint</span></span>
+        <span data-dc-tpl="185" class="run-ref"><span class="sc-interp">mergepath</span> #<span class="sc-interp">1598</span> · <span class="sc-interp">a3f9c21</span></span>
+        <span data-dc-tpl="186" class="run-jobs pips"><i data-dc-tpl="188" class="pip pip-ok" title="lint-fast"></i><i data-dc-tpl="188" class="pip pip-run" title="deep-safety"></i><i data-dc-tpl="188" class="pip pip-queued" title="lint"></i></span>
+        <span data-dc-tpl="189" class="run-dur mono"><span class="sc-interp">3m 12s</span></span>
+        <span data-dc-tpl="190" class="b b-run"><span class="sc-interp">Running</span></span>
+        <span data-dc-tpl="191" class="chev" aria-hidden="true"><span class="sc-interp">+</span></span>
+      </button>
+      
+      
+    </div>
+   
+    <div data-dc-tpl="181" class="run tone-run">
+      <button data-dc-tpl="182" type="button" class="run-head" aria-expanded="false">
+        <span data-dc-tpl="183" class="g g-run" aria-hidden="true"></span>
+        <span data-dc-tpl="184" class="run-wf mono"><span class="sc-interp">codex-review-check</span></span>
+        <span data-dc-tpl="185" class="run-ref"><span class="sc-interp">mergepath</span> #<span class="sc-interp">1598</span> · <span class="sc-interp">a3f9c21</span></span>
+        <span data-dc-tpl="186" class="run-jobs pips"><i data-dc-tpl="188" class="pip pip-ok" title="gate-a-token-reachability"></i><i data-dc-tpl="188" class="pip pip-run" title="gate-b-clearance"></i></span>
+        <span data-dc-tpl="189" class="run-dur mono"><span class="sc-interp">3m 05s</span></span>
+        <span data-dc-tpl="190" class="b b-run"><span class="sc-interp">Running</span></span>
+        <span data-dc-tpl="191" class="chev" aria-hidden="true"><span class="sc-interp">+</span></span>
+      </button>
+      
+      
+    </div>
+   
+    <div data-dc-tpl="181" class="run tone-run">
+      <button data-dc-tpl="182" type="button" class="run-head" aria-expanded="false">
+        <span data-dc-tpl="183" class="g g-run" aria-hidden="true"></span>
+        <span data-dc-tpl="184" class="run-wf mono"><span class="sc-interp">repo_lint</span></span>
+        <span data-dc-tpl="185" class="run-ref"><span class="sc-interp">mergepath</span> #<span class="sc-interp">1599</span> · <span class="sc-interp">e81b7aa</span></span>
+        <span data-dc-tpl="186" class="run-jobs pips"><i data-dc-tpl="188" class="pip pip-run" title="lint-fast"></i><i data-dc-tpl="188" class="pip pip-queued" title="deep-safety"></i><i data-dc-tpl="188" class="pip pip-queued" title="lint"></i></span>
+        <span data-dc-tpl="189" class="run-dur mono"><span class="sc-interp">1m 02s</span></span>
+        <span data-dc-tpl="190" class="b b-run"><span class="sc-interp">Running</span></span>
+        <span data-dc-tpl="191" class="chev" aria-hidden="true"><span class="sc-interp">+</span></span>
+      </button>
+      
+      
+    </div>
+   
+    <div data-dc-tpl="181" class="run tone-clear">
+      <button data-dc-tpl="182" type="button" class="run-head" aria-expanded="false">
+        <span data-dc-tpl="183" class="g g-clear" aria-hidden="true"></span>
+        <span data-dc-tpl="184" class="run-wf mono"><span class="sc-interp">repo_lint</span></span>
+        <span data-dc-tpl="185" class="run-ref"><span class="sc-interp">matchline</span> #<span class="sc-interp">212</span> · <span class="sc-interp">5d02e8f</span></span>
+        <span data-dc-tpl="186" class="run-jobs pips"><i data-dc-tpl="188" class="pip pip-ok" title="lint-fast"></i><i data-dc-tpl="188" class="pip pip-ok" title="deep-safety"></i><i data-dc-tpl="188" class="pip pip-ok" title="lint"></i></span>
+        <span data-dc-tpl="189" class="run-dur mono"><span class="sc-interp">4m 41s</span></span>
+        <span data-dc-tpl="190" class="b b-clear"><span class="sc-interp">Passed</span></span>
+        <span data-dc-tpl="191" class="chev" aria-hidden="true"><span class="sc-interp">+</span></span>
+      </button>
+      
+      
+    </div>
+   
+    <div data-dc-tpl="181" class="run tone-bump">
+      <button data-dc-tpl="182" type="button" class="run-head" aria-expanded="false">
+        <span data-dc-tpl="183" class="g g-bump" aria-hidden="true"></span>
+        <span data-dc-tpl="184" class="run-wf mono"><span class="sc-interp">repo_lint</span></span>
+        <span data-dc-tpl="185" class="run-ref"><span class="sc-interp">swipewatch</span> #<span class="sc-interp">88</span> · <span class="sc-interp">b44d1c7</span></span>
+        <span data-dc-tpl="186" class="run-jobs pips"><i data-dc-tpl="188" class="pip pip-ok" title="lint-fast"></i><i data-dc-tpl="188" class="pip pip-fail" title="deep-safety"></i><i data-dc-tpl="188" class="pip pip-skipped" title="lint"></i></span>
+        <span data-dc-tpl="189" class="run-dur mono"><span class="sc-interp">3m 58s</span></span>
+        <span data-dc-tpl="190" class="b b-bump"><span class="sc-interp">Stale failure</span></span>
+        <span data-dc-tpl="191" class="chev" aria-hidden="true"><span class="sc-interp">+</span></span>
+      </button>
+      
+        <div data-dc-tpl="193" class="run-flag f-bump"><span data-dc-tpl="194" class="flag-t"><span class="sc-interp">Stale failed check-run on HEAD b44d1c7</span></span><span data-dc-tpl="195" class="flag-d"><span class="sc-interp">No later pass of repo_lint superseded it, so the merge gate still reads it as failed.</span></span><code data-dc-tpl="197" class="cmd"><span class="sc-interp">gh run rerun 9088 --failed --repo nathanjohnpayne/swipewatch</span></code></div>
+      
+      
+    </div>
+   
+    <div data-dc-tpl="181" class="run tone-bump">
+      <button data-dc-tpl="182" type="button" class="run-head" aria-expanded="false">
+        <span data-dc-tpl="183" class="g g-bump" aria-hidden="true"></span>
+        <span data-dc-tpl="184" class="run-wf mono"><span class="sc-interp">merge-clearance</span></span>
+        <span data-dc-tpl="185" class="run-ref"><span class="sc-interp">friends-and-family-billing</span> #<span class="sc-interp">19</span> · <span class="sc-interp">c7b1d04</span></span>
+        <span data-dc-tpl="186" class="run-jobs pips"></span>
+        <span data-dc-tpl="189" class="run-dur mono"><span class="sc-interp">queued 18m</span></span>
+        <span data-dc-tpl="190" class="b b-bump"><span class="sc-interp">Queued long</span></span>
+        <span data-dc-tpl="191" class="chev" aria-hidden="true"><span class="sc-interp">+</span></span>
+      </button>
+      
+        <div data-dc-tpl="193" class="run-flag f-bump"><span data-dc-tpl="194" class="flag-t"><span class="sc-interp">Waiting for a runner: queued 18m</span></span><span data-dc-tpl="195" class="flag-d"><span class="sc-interp">A required gate stuck in a full queue. See queue pressure in the Actions budget.</span></span></div>
+      
+      
+    </div>
+   
+  </div></section><section data-dc-tpl="216" class="panel side" id="agents">
+  <div data-dc-tpl="217" class="sec-head">
+    <div data-dc-tpl="218"><p data-dc-tpl="219" class="eyebrow">Phase 4b agents · live</p><h2 data-dc-tpl="220"><span class="sc-interp">2 running · 0 crashed</span></h2></div>
+    <div data-dc-tpl="221" class="sec-meta"><span data-dc-tpl="222">~/.local/state/mergepath/phase-4b-runs/*.json</span><span data-dc-tpl="223" class="poll"><svg data-dc-tpl="224" class="ring r5" viewBox="0 0 20 20" aria-hidden="true"><circle data-dc-tpl="225" class="ring-bg" cx="10" cy="10" r="7"></circle><circle data-dc-tpl="226" class="ring-fg" cx="10" cy="10" r="7"></circle></svg>polled <span class="sc-interp">1 s ago</span></span></div>
+  </div>
+  <div data-dc-tpl="227" class="agents">
+   
+    <div data-dc-tpl="229" class="agent tone-bump">
+      <div data-dc-tpl="230" class="ag-h"><span data-dc-tpl="231" class="b b-bump"><span data-dc-tpl="232" class="g g-bump" aria-hidden="true"></span><span class="sc-interp">Near timeout</span></span><span data-dc-tpl="233" class="rev rev-claude"><span class="sc-interp">Claude</span></span><span data-dc-tpl="234" class="mono soft"><span class="sc-interp">mergepath</span> #<span class="sc-interp">1598</span></span></div>
+      <div data-dc-tpl="235" class="stages">
+        <div data-dc-tpl="237" class="stg stg-done"><span data-dc-tpl="238" class="stg-dot" aria-hidden="true"></span><span data-dc-tpl="239" class="stg-l"><span class="sc-interp">barrier</span></span></div><div data-dc-tpl="237" class="stg stg-cur"><span data-dc-tpl="238" class="stg-dot" aria-hidden="true"></span><span data-dc-tpl="239" class="stg-l"><span class="sc-interp">adapter</span></span></div><div data-dc-tpl="237" class="stg stg-todo"><span data-dc-tpl="238" class="stg-dot" aria-hidden="true"></span><span data-dc-tpl="239" class="stg-l"><span class="sc-interp">posting</span></span></div><div data-dc-tpl="237" class="stg stg-todo"><span data-dc-tpl="238" class="stg-dot" aria-hidden="true"></span><span data-dc-tpl="239" class="stg-l"><span class="sc-interp">done</span></span></div>
+      </div>
+      <div data-dc-tpl="240" class="m t-bump"><div data-dc-tpl="241" class="m-top"><span data-dc-tpl="242" class="m-val"><span class="sc-interp">11:41</span></span><span data-dc-tpl="243" class="m-den">of <span class="sc-interp">14:00</span> adapter timeout · tick at 80%</span></div><div data-dc-tpl="244" class="m-track"><div data-dc-tpl="245" class="m-fill t-bump" style="width: 83%;"></div><i data-dc-tpl="246" class="m-tick" style="left: 80%;"></i></div></div>
+      <div data-dc-tpl="247" class="ag-f mono soft"><span class="sc-interp">p4b-1002-1412-a1</span> · pid <span class="sc-interp">48119</span><span class="sc-interp"></span></div>
+    </div>
+   
+    <div data-dc-tpl="229" class="agent tone-run">
+      <div data-dc-tpl="230" class="ag-h"><span data-dc-tpl="231" class="b b-run"><span data-dc-tpl="232" class="g g-run" aria-hidden="true"></span><span class="sc-interp">Running</span></span><span data-dc-tpl="233" class="rev rev-codex"><span class="sc-interp">Codex</span></span><span data-dc-tpl="234" class="mono soft"><span class="sc-interp">friends-and-family-billing</span> #<span class="sc-interp">19</span></span></div>
+      <div data-dc-tpl="235" class="stages">
+        <div data-dc-tpl="237" class="stg stg-cur"><span data-dc-tpl="238" class="stg-dot" aria-hidden="true"></span><span data-dc-tpl="239" class="stg-l"><span class="sc-interp">barrier</span></span></div><div data-dc-tpl="237" class="stg stg-todo"><span data-dc-tpl="238" class="stg-dot" aria-hidden="true"></span><span data-dc-tpl="239" class="stg-l"><span class="sc-interp">adapter</span></span></div><div data-dc-tpl="237" class="stg stg-todo"><span data-dc-tpl="238" class="stg-dot" aria-hidden="true"></span><span data-dc-tpl="239" class="stg-l"><span class="sc-interp">posting</span></span></div><div data-dc-tpl="237" class="stg stg-todo"><span data-dc-tpl="238" class="stg-dot" aria-hidden="true"></span><span data-dc-tpl="239" class="stg-l"><span class="sc-interp">done</span></span></div>
+      </div>
+      <div data-dc-tpl="240" class="m t-run"><div data-dc-tpl="241" class="m-top"><span data-dc-tpl="242" class="m-val"><span class="sc-interp">1:36</span></span><span data-dc-tpl="243" class="m-den">of <span class="sc-interp">20:45</span> adapter timeout · tick at 80%</span></div><div data-dc-tpl="244" class="m-track"><div data-dc-tpl="245" class="m-fill t-run" style="width: 8%;"></div><i data-dc-tpl="246" class="m-tick" style="left: 80%;"></i></div></div>
+      <div data-dc-tpl="247" class="ag-f mono soft"><span class="sc-interp">p4b-1002-1419-c3</span> · pid <span class="sc-interp">48131</span><span class="sc-interp"> · barrier: waiting on the CodeRabbit report for c7b1d04</span></div>
+    </div>
+   
+  </div></section></div><section data-dc-tpl="248" class="panel" id="history">
+  <div data-dc-tpl="249" class="sec-head">
+    <div data-dc-tpl="250"><p data-dc-tpl="251" class="eyebrow">Phase 4b history · tokens and cost</p><h2 data-dc-tpl="252">7 days · 23 runs · $18.47 across both providers</h2></div>
+    <div data-dc-tpl="253" class="sec-meta"><span data-dc-tpl="254">phase-4b-ledger.jsonl + phase-4b-loops/*.jsonl · 2 checkouts · de-duplicated by run_id</span></div>
+  </div>
+  <div data-dc-tpl="255" class="hist-grid">
+    <div data-dc-tpl="256">
+      <div data-dc-tpl="257" class="chart-h"><span data-dc-tpl="258">Per provider, per day</span><span data-dc-tpl="259" class="legend"><i data-dc-tpl="260" class="sw sw-claude"></i>Claude · cost reported<i data-dc-tpl="261" class="sw sw-codex"></i>Codex · cost estimated<span data-dc-tpl="262" class="est">est</span></span></div>
+      <div data-dc-tpl="263" class="bars">
+        
+          <div data-dc-tpl="265" class="day"><div data-dc-tpl="266" class="bar-pair"><div data-dc-tpl="267" class="bar bar-claude" title="Claude $1.12" style="height: 44%;"></div><div data-dc-tpl="268" class="bar bar-codex" title="Codex $1.26 est" style="height: 50%;"></div></div><span data-dc-tpl="269" class="day-l"><span class="sc-interp">Sep 26</span></span><span data-dc-tpl="270" class="day-v v-claude"><span class="sc-interp">$1.12</span></span><span data-dc-tpl="271" class="day-v v-codex"><span class="sc-interp">$1.26</span></span></div>
+        
+          <div data-dc-tpl="265" class="day"><div data-dc-tpl="266" class="bar-pair"><div data-dc-tpl="267" class="bar bar-claude" title="Claude $0.84" style="height: 33%;"></div><div data-dc-tpl="268" class="bar bar-codex" title="Codex $1.08 est" style="height: 43%;"></div></div><span data-dc-tpl="269" class="day-l"><span class="sc-interp">Sep 27</span></span><span data-dc-tpl="270" class="day-v v-claude"><span class="sc-interp">$0.84</span></span><span data-dc-tpl="271" class="day-v v-codex"><span class="sc-interp">$1.08</span></span></div>
+        
+          <div data-dc-tpl="265" class="day"><div data-dc-tpl="266" class="bar-pair"><div data-dc-tpl="267" class="bar bar-claude" title="Claude $1.90" style="height: 75%;"></div><div data-dc-tpl="268" class="bar bar-codex" title="Codex $2.04 est" style="height: 81%;"></div></div><span data-dc-tpl="269" class="day-l"><span class="sc-interp">Sep 28</span></span><span data-dc-tpl="270" class="day-v v-claude"><span class="sc-interp">$1.90</span></span><span data-dc-tpl="271" class="day-v v-codex"><span class="sc-interp">$2.04</span></span></div>
+        
+          <div data-dc-tpl="265" class="day"><div data-dc-tpl="266" class="bar-pair"><div data-dc-tpl="267" class="bar bar-claude" title="Claude $0.66" style="height: 26%;"></div><div data-dc-tpl="268" class="bar bar-codex" title="Codex $0.54 est" style="height: 21%;"></div></div><span data-dc-tpl="269" class="day-l"><span class="sc-interp">Sep 29</span></span><span data-dc-tpl="270" class="day-v v-claude"><span class="sc-interp">$0.66</span></span><span data-dc-tpl="271" class="day-v v-codex"><span class="sc-interp">$0.54</span></span></div>
+        
+          <div data-dc-tpl="265" class="day"><div data-dc-tpl="266" class="bar-pair"><div data-dc-tpl="267" class="bar bar-claude" title="Claude $2.31" style="height: 92%;"></div><div data-dc-tpl="268" class="bar bar-codex" title="Codex $2.52 est" style="height: 100%;"></div></div><span data-dc-tpl="269" class="day-l"><span class="sc-interp">Sep 30</span></span><span data-dc-tpl="270" class="day-v v-claude"><span class="sc-interp">$2.31</span></span><span data-dc-tpl="271" class="day-v v-codex"><span class="sc-interp">$2.52</span></span></div>
+        
+          <div data-dc-tpl="265" class="day"><div data-dc-tpl="266" class="bar-pair"><div data-dc-tpl="267" class="bar bar-claude" title="Claude $1.05" style="height: 42%;"></div><div data-dc-tpl="268" class="bar bar-codex" title="Codex $1.56 est" style="height: 62%;"></div></div><span data-dc-tpl="269" class="day-l"><span class="sc-interp">Oct 1</span></span><span data-dc-tpl="270" class="day-v v-claude"><span class="sc-interp">$1.05</span></span><span data-dc-tpl="271" class="day-v v-codex"><span class="sc-interp">$1.56</span></span></div>
+        
+          <div data-dc-tpl="265" class="day"><div data-dc-tpl="266" class="bar-pair"><div data-dc-tpl="267" class="bar bar-claude" title="Claude $0.69" style="height: 27%;"></div><div data-dc-tpl="268" class="bar bar-codex" title="Codex $0.90 est" style="height: 36%;"></div></div><span data-dc-tpl="269" class="day-l"><span class="sc-interp">Oct 2</span></span><span data-dc-tpl="270" class="day-v v-claude"><span class="sc-interp">$0.69</span></span><span data-dc-tpl="271" class="day-v v-codex"><span class="sc-interp">$0.90</span></span></div>
+        
+      </div>
+      <div data-dc-tpl="272" class="totals">
+        <div data-dc-tpl="273" class="tot"><span data-dc-tpl="274" class="tot-k">Claude · 7 days</span><span data-dc-tpl="275" class="tot-v mono">$8.57</span><span data-dc-tpl="276" class="sub">1.52M in · 0.11M out · 3.2M cache read · total_cost_usd from the adapter</span></div>
+        <div data-dc-tpl="277" class="tot"><span data-dc-tpl="278" class="tot-k">Codex · 7 days</span><span data-dc-tpl="279" class="tot-v mono">1.65M tokens</span><span data-dc-tpl="280" class="sub">input/output split unavailable, never imputed · $9.90 <span data-dc-tpl="281" class="est">est</span> from prices.json</span></div>
+      </div>
+    </div>
+    <div data-dc-tpl="282" class="tbl-wrap">
+      <div data-dc-tpl="283" class="tbl" role="table" style="--cols: minmax(150px, 1fr) 190px 70px 150px minmax(200px, 1.2fr) 86px 110px 64px; --minw: 1040px;">
+        <div data-dc-tpl="284" class="trow th" role="row"><span data-dc-tpl="285" role="columnheader">Run</span><span data-dc-tpl="286" role="columnheader">PR</span><span data-dc-tpl="287" role="columnheader">Reviewer</span><span data-dc-tpl="288" role="columnheader">Verdict</span><span data-dc-tpl="289" role="columnheader">Tokens</span><span data-dc-tpl="290" role="columnheader">Cost</span><span data-dc-tpl="291" role="columnheader">Findings</span><span data-dc-tpl="292" role="columnheader">Elapsed</span></div>
+        
+          <div data-dc-tpl="294" class="trow" role="row">
+            <div data-dc-tpl="295" class="cell mono" role="cell"><span class="sc-interp">p4b-1002-1358-a0</span><span data-dc-tpl="296" class="sub"><span class="sc-interp">today 13:58</span></span></div>
+            <div data-dc-tpl="297" class="cell mono soft" role="cell"><span class="sc-interp">mergepath</span> #<span class="sc-interp">1596</span></div>
+            <div data-dc-tpl="298" class="cell" role="cell"><span data-dc-tpl="299" class="rev rev-claude"><span class="sc-interp">Claude</span></span></div>
+            <div data-dc-tpl="300" class="cell" role="cell"><span data-dc-tpl="301" class="b b-clear"><span data-dc-tpl="302" class="g g-clear" aria-hidden="true"></span><span class="sc-interp">APPROVED</span></span></div>
+            <div data-dc-tpl="303" class="cell mono" role="cell"><span class="sc-interp">in 48.2k · out 4.0k · cache 122k</span></div>
+            <div data-dc-tpl="306" class="cell mono" role="cell"><span class="sc-interp">$0.41</span></div>
+            <div data-dc-tpl="309" class="cell" role="cell"><span data-dc-tpl="310" class="f-sev"><span data-dc-tpl="311" class="sev sev-1">P1 <span class="sc-interp">0</span></span><span data-dc-tpl="312" class="sev sev-2">P2 <span class="sc-interp">1</span></span><span data-dc-tpl="313" class="sev">P3 <span class="sc-interp">2</span></span></span></div>
+            <div data-dc-tpl="314" class="cell mono soft" role="cell"><span class="sc-interp">7:12</span></div>
+          </div>
+        
+          <div data-dc-tpl="294" class="trow" role="row">
+            <div data-dc-tpl="295" class="cell mono" role="cell"><span class="sc-interp">p4b-1002-1340-c9</span><span data-dc-tpl="296" class="sub"><span class="sc-interp">today 13:40</span></span></div>
+            <div data-dc-tpl="297" class="cell mono soft" role="cell"><span class="sc-interp">matchline</span> #<span class="sc-interp">211</span></div>
+            <div data-dc-tpl="298" class="cell" role="cell"><span data-dc-tpl="299" class="rev rev-codex"><span class="sc-interp">Codex</span></span></div>
+            <div data-dc-tpl="300" class="cell" role="cell"><span data-dc-tpl="301" class="b b-bump"><span data-dc-tpl="302" class="g g-bump" aria-hidden="true"></span><span class="sc-interp">CHANGES_REQUESTED</span></span></div>
+            <div data-dc-tpl="303" class="cell mono" role="cell"><span class="sc-interp">61.2k total</span><span data-dc-tpl="305" class="sub na">input/output split unavailable</span></div>
+            <div data-dc-tpl="306" class="cell mono" role="cell"><span class="sc-interp">$0.37</span><span data-dc-tpl="308" class="est">est</span></div>
+            <div data-dc-tpl="309" class="cell" role="cell"><span data-dc-tpl="310" class="f-sev"><span data-dc-tpl="311" class="sev sev-1">P1 <span class="sc-interp">1</span></span><span data-dc-tpl="312" class="sev sev-2">P2 <span class="sc-interp">2</span></span><span data-dc-tpl="313" class="sev">P3 <span class="sc-interp">0</span></span></span></div>
+            <div data-dc-tpl="314" class="cell mono soft" role="cell"><span class="sc-interp">18:04</span></div>
+          </div>
+        
+          <div data-dc-tpl="294" class="trow" role="row">
+            <div data-dc-tpl="295" class="cell mono" role="cell"><span class="sc-interp">p4b-1002-1255-b2</span><span data-dc-tpl="296" class="sub"><span class="sc-interp">today 12:55</span></span></div>
+            <div data-dc-tpl="297" class="cell mono soft" role="cell"><span class="sc-interp">friends-and-family-billing</span> #<span class="sc-interp">19</span></div>
+            <div data-dc-tpl="298" class="cell" role="cell"><span data-dc-tpl="299" class="rev rev-codex"><span class="sc-interp">Codex</span></span></div>
+            <div data-dc-tpl="300" class="cell" role="cell"><span data-dc-tpl="301" class="b b-bump"><span data-dc-tpl="302" class="g g-bump" aria-hidden="true"></span><span class="sc-interp">CHANGES_REQUESTED</span></span></div>
+            <div data-dc-tpl="303" class="cell mono" role="cell"><span class="sc-interp">88.9k total</span><span data-dc-tpl="305" class="sub na">input/output split unavailable</span></div>
+            <div data-dc-tpl="306" class="cell mono" role="cell"><span class="sc-interp">$0.53</span><span data-dc-tpl="308" class="est">est</span></div>
+            <div data-dc-tpl="309" class="cell" role="cell"><span data-dc-tpl="310" class="f-sev"><span data-dc-tpl="311" class="sev sev-1">P1 <span class="sc-interp">0</span></span><span data-dc-tpl="312" class="sev sev-2">P2 <span class="sc-interp">3</span></span><span data-dc-tpl="313" class="sev">P3 <span class="sc-interp">1</span></span></span></div>
+            <div data-dc-tpl="314" class="cell mono soft" role="cell"><span class="sc-interp">21:30</span></div>
+          </div>
+        
+          <div data-dc-tpl="294" class="trow" role="row">
+            <div data-dc-tpl="295" class="cell mono" role="cell"><span class="sc-interp">p4b-1002-1210-a4</span><span data-dc-tpl="296" class="sub"><span class="sc-interp">today 12:10</span></span></div>
+            <div data-dc-tpl="297" class="cell mono soft" role="cell"><span class="sc-interp">swipewatch</span> #<span class="sc-interp">87</span></div>
+            <div data-dc-tpl="298" class="cell" role="cell"><span data-dc-tpl="299" class="rev rev-claude"><span class="sc-interp">Claude</span></span></div>
+            <div data-dc-tpl="300" class="cell" role="cell"><span data-dc-tpl="301" class="b b-clear"><span data-dc-tpl="302" class="g g-clear" aria-hidden="true"></span><span class="sc-interp">APPROVED</span></span></div>
+            <div data-dc-tpl="303" class="cell mono" role="cell"><span class="sc-interp">in 31.0k · out 2.1k · cache 80k</span></div>
+            <div data-dc-tpl="306" class="cell mono" role="cell"><span class="sc-interp">$0.26</span></div>
+            <div data-dc-tpl="309" class="cell" role="cell"><span data-dc-tpl="310" class="f-sev"><span data-dc-tpl="311" class="sev sev-1">P1 <span class="sc-interp">0</span></span><span data-dc-tpl="312" class="sev sev-2">P2 <span class="sc-interp">0</span></span><span data-dc-tpl="313" class="sev">P3 <span class="sc-interp">1</span></span></span></div>
+            <div data-dc-tpl="314" class="cell mono soft" role="cell"><span class="sc-interp">5:40</span></div>
+          </div>
+        
+          <div data-dc-tpl="294" class="trow" role="row">
+            <div data-dc-tpl="295" class="cell mono" role="cell"><span class="sc-interp">p4b-1002-1130-d1</span><span data-dc-tpl="296" class="sub"><span class="sc-interp">today 11:30</span></span></div>
+            <div data-dc-tpl="297" class="cell mono soft" role="cell"><span class="sc-interp">overridebroadway</span> #<span class="sc-interp">40</span></div>
+            <div data-dc-tpl="298" class="cell" role="cell"><span data-dc-tpl="299" class="rev rev-claude"><span class="sc-interp">Claude</span></span></div>
+            <div data-dc-tpl="300" class="cell" role="cell"><span data-dc-tpl="301" class="b b-idle"><span data-dc-tpl="302" class="g g-idle" aria-hidden="true"></span><span class="sc-interp">REFUSED · exit 4</span></span></div>
+            <div data-dc-tpl="303" class="cell mono" role="cell"><span class="sc-interp">in 2.1k · out 0.3k · cache 0</span></div>
+            <div data-dc-tpl="306" class="cell mono" role="cell"><span class="sc-interp">$0.02</span></div>
+            <div data-dc-tpl="309" class="cell" role="cell"><span data-dc-tpl="310" class="f-sev"><span data-dc-tpl="311" class="sev sev-1">P1 <span class="sc-interp">0</span></span><span data-dc-tpl="312" class="sev sev-2">P2 <span class="sc-interp">0</span></span><span data-dc-tpl="313" class="sev">P3 <span class="sc-interp">0</span></span></span></div>
+            <div data-dc-tpl="314" class="cell mono soft" role="cell"><span class="sc-interp">0:48</span></div>
+          </div>
+        
+          <div data-dc-tpl="294" class="trow" role="row">
+            <div data-dc-tpl="295" class="cell mono" role="cell"><span class="sc-interp">p4b-1001-1702-c5</span><span data-dc-tpl="296" class="sub"><span class="sc-interp">Oct 1 17:02</span></span></div>
+            <div data-dc-tpl="297" class="cell mono soft" role="cell"><span class="sc-interp">mergepath</span> #<span class="sc-interp">1595</span></div>
+            <div data-dc-tpl="298" class="cell" role="cell"><span data-dc-tpl="299" class="rev rev-codex"><span class="sc-interp">Codex</span></span></div>
+            <div data-dc-tpl="300" class="cell" role="cell"><span data-dc-tpl="301" class="b b-clear"><span data-dc-tpl="302" class="g g-clear" aria-hidden="true"></span><span class="sc-interp">Cleared · thumbs-up</span></span></div>
+            <div data-dc-tpl="303" class="cell mono" role="cell"><span class="sc-interp">44.7k total</span><span data-dc-tpl="305" class="sub na">input/output split unavailable</span></div>
+            <div data-dc-tpl="306" class="cell mono" role="cell"><span class="sc-interp">$0.27</span><span data-dc-tpl="308" class="est">est</span></div>
+            <div data-dc-tpl="309" class="cell" role="cell"><span data-dc-tpl="310" class="f-sev"><span data-dc-tpl="311" class="sev sev-1">P1 <span class="sc-interp">0</span></span><span data-dc-tpl="312" class="sev sev-2">P2 <span class="sc-interp">0</span></span><span data-dc-tpl="313" class="sev">P3 <span class="sc-interp">0</span></span></span></div>
+            <div data-dc-tpl="314" class="cell mono soft" role="cell"><span class="sc-interp">14:50</span></div>
+          </div>
+        
+          <div data-dc-tpl="294" class="trow" role="row">
+            <div data-dc-tpl="295" class="cell mono" role="cell"><span class="sc-interp">p4b-1001-1510-a9</span><span data-dc-tpl="296" class="sub"><span class="sc-interp">Oct 1 15:10</span></span></div>
+            <div data-dc-tpl="297" class="cell mono soft" role="cell"><span class="sc-interp">nathanpaynedotcom</span> #<span class="sc-interp">136</span></div>
+            <div data-dc-tpl="298" class="cell" role="cell"><span data-dc-tpl="299" class="rev rev-claude"><span class="sc-interp">Claude</span></span></div>
+            <div data-dc-tpl="300" class="cell" role="cell"><span data-dc-tpl="301" class="b b-clear"><span data-dc-tpl="302" class="g g-clear" aria-hidden="true"></span><span class="sc-interp">APPROVED</span></span></div>
+            <div data-dc-tpl="303" class="cell mono" role="cell"><span class="sc-interp">in 72.4k · out 5.6k · cache 210k</span></div>
+            <div data-dc-tpl="306" class="cell mono" role="cell"><span class="sc-interp">$0.58</span></div>
+            <div data-dc-tpl="309" class="cell" role="cell"><span data-dc-tpl="310" class="f-sev"><span data-dc-tpl="311" class="sev sev-1">P1 <span class="sc-interp">0</span></span><span data-dc-tpl="312" class="sev sev-2">P2 <span class="sc-interp">2</span></span><span data-dc-tpl="313" class="sev">P3 <span class="sc-interp">3</span></span></span></div>
+            <div data-dc-tpl="314" class="cell mono soft" role="cell"><span class="sc-interp">9:05</span></div>
+          </div>
+        
+          <div data-dc-tpl="294" class="trow" role="row">
+            <div data-dc-tpl="295" class="cell mono" role="cell"><span class="sc-interp">p4b-1001-1122-c2</span><span data-dc-tpl="296" class="sub"><span class="sc-interp">Oct 1 11:22</span></span></div>
+            <div data-dc-tpl="297" class="cell mono soft" role="cell"><span class="sc-interp">tadlockpsychiatry</span> #<span class="sc-interp">6</span></div>
+            <div data-dc-tpl="298" class="cell" role="cell"><span data-dc-tpl="299" class="rev rev-codex"><span class="sc-interp">Codex</span></span></div>
+            <div data-dc-tpl="300" class="cell" role="cell"><span data-dc-tpl="301" class="b b-bump"><span data-dc-tpl="302" class="g g-bump" aria-hidden="true"></span><span class="sc-interp">CHANGES_REQUESTED</span></span></div>
+            <div data-dc-tpl="303" class="cell mono" role="cell"><span class="sc-interp">120.3k total</span><span data-dc-tpl="305" class="sub na">input/output split unavailable</span></div>
+            <div data-dc-tpl="306" class="cell mono" role="cell"><span class="sc-interp">$0.72</span><span data-dc-tpl="308" class="est">est</span></div>
+            <div data-dc-tpl="309" class="cell" role="cell"><span data-dc-tpl="310" class="f-sev"><span data-dc-tpl="311" class="sev sev-1">P1 <span class="sc-interp">2</span></span><span data-dc-tpl="312" class="sev sev-2">P2 <span class="sc-interp">1</span></span><span data-dc-tpl="313" class="sev">P3 <span class="sc-interp">0</span></span></span></div>
+            <div data-dc-tpl="314" class="cell mono soft" role="cell"><span class="sc-interp">24:12</span></div>
+          </div>
+        
+      </div>
+    </div>
+  </div></section><div data-dc-tpl="315" class="stack"><section data-dc-tpl="316" class="panel" id="fleet">
+  <div data-dc-tpl="317" class="sec-head">
+    <div data-dc-tpl="318"><p data-dc-tpl="319" class="eyebrow">Fleet sync</p><h2 data-dc-tpl="320"><span class="sc-interp">2 in sync · 2 drifting · 1 ahead · 1 fetch error</span></h2></div>
+    <div data-dc-tpl="321" class="sec-meta"><span data-dc-tpl="322">sync-to-downstream.sh --audit --json · every 30 min or on demand · hub origin/main 9a8fcdf</span><button data-dc-tpl="323" type="button" class="btn sm">Refresh audit</button><button data-dc-tpl="324" type="button" class="btn sm primary">Sync all</button></div>
+  </div>
+  
+  <div data-dc-tpl="330" class="tbl-wrap">
+   <div data-dc-tpl="331" class="tbl" role="table" style="--cols: minmax(210px, 1.4fr) minmax(170px, 1fr) 150px 120px 150px 120px 72px; --minw: 1040px;">
+    <div data-dc-tpl="332" class="trow th" role="row"><span data-dc-tpl="333" role="columnheader">Consumer</span><span data-dc-tpl="334" role="columnheader">Status</span><span data-dc-tpl="335" role="columnheader">Hub → consumer</span><span data-dc-tpl="336" role="columnheader">Paths</span><span data-dc-tpl="337" role="columnheader">Open sync PR</span><span data-dc-tpl="338" role="columnheader">Last audit</span><span data-dc-tpl="339" role="columnheader"></span></div>
+    
+     <div data-dc-tpl="341" class="trow tone-clear " role="row">
+       <div data-dc-tpl="342" class="cell" role="cell"><span data-dc-tpl="343" class="mono"><span class="sc-interp">matchline</span></span><span data-dc-tpl="344" class="sub"><span class="sc-interp">public</span></span></div>
+       <div data-dc-tpl="345" class="cell" role="cell"><span data-dc-tpl="346" class="b b-clear"><span data-dc-tpl="347" class="g g-clear" aria-hidden="true"></span><span class="sc-interp">In sync</span></span></div>
+       <div data-dc-tpl="350" class="cell mono soft" role="cell"><span class="sc-interp">9a8fcdf</span> → <span class="sc-interp">3b1e2a0</span></div>
+       <div data-dc-tpl="351" class="cell" role="cell"><span data-dc-tpl="355" class="soft">none</span></div>
+       <div data-dc-tpl="356" class="cell" role="cell"><span data-dc-tpl="358" class="mono">#<span class="sc-interp">212</span></span> <span data-dc-tpl="359" class="ms ms-clear"><span class="sc-interp">CLEAN</span></span></div>
+       <div data-dc-tpl="362" class="cell mono soft" role="cell"><span class="sc-interp">12 min ago</span></div>
+       <div data-dc-tpl="365" class="cell" role="cell"><button data-dc-tpl="366" type="button" class="btn sm" disabled="">Sync</button></div>
+     </div>
+     
+    
+     <div data-dc-tpl="341" class="trow tone-bump " role="row">
+       <div data-dc-tpl="342" class="cell" role="cell"><span data-dc-tpl="343" class="mono"><span class="sc-interp">swipewatch</span></span><span data-dc-tpl="344" class="sub"><span class="sc-interp">private</span></span></div>
+       <div data-dc-tpl="345" class="cell" role="cell"><span data-dc-tpl="346" class="b b-bump"><span data-dc-tpl="347" class="g g-bump" aria-hidden="true"></span><span class="sc-interp">Drift · 3 paths</span></span></div>
+       <div data-dc-tpl="350" class="cell mono soft" role="cell"><span class="sc-interp">9a8fcdf</span> → <span class="sc-interp">b44d1c7</span></div>
+       <div data-dc-tpl="351" class="cell" role="cell"><button data-dc-tpl="353" type="button" class="linkb" aria-expanded="false"><span class="sc-interp">3 paths · show</span></button></div>
+       <div data-dc-tpl="356" class="cell" role="cell"><span data-dc-tpl="358" class="mono">#<span class="sc-interp">88</span></span> <span data-dc-tpl="359" class="ms ms-bump"><span class="sc-interp">BEHIND</span></span></div>
+       <div data-dc-tpl="362" class="cell mono soft" role="cell"><span class="sc-interp">12 min ago</span></div>
+       <div data-dc-tpl="365" class="cell" role="cell"><button data-dc-tpl="366" type="button" class="btn sm">Sync</button></div>
+     </div>
+     
+    
+     <div data-dc-tpl="341" class="trow tone-bump " role="row">
+       <div data-dc-tpl="342" class="cell" role="cell"><span data-dc-tpl="343" class="mono"><span class="sc-interp">overridebroadway</span></span><span data-dc-tpl="344" class="sub"><span class="sc-interp">private</span></span></div>
+       <div data-dc-tpl="345" class="cell" role="cell"><span data-dc-tpl="346" class="b b-bump"><span data-dc-tpl="347" class="g g-bump" aria-hidden="true"></span><span class="sc-interp">Ahead of hub</span></span></div>
+       <div data-dc-tpl="350" class="cell mono soft" role="cell"><span class="sc-interp">9a8fcdf</span> → <span class="sc-interp">3e7ab02</span></div>
+       <div data-dc-tpl="351" class="cell" role="cell"><button data-dc-tpl="353" type="button" class="linkb" aria-expanded="false"><span class="sc-interp">1 path · show</span></button></div>
+       <div data-dc-tpl="356" class="cell" role="cell"><span data-dc-tpl="361" class="soft">none</span></div>
+       <div data-dc-tpl="362" class="cell mono soft" role="cell"><span class="sc-interp">12 min ago</span></div>
+       <div data-dc-tpl="365" class="cell" role="cell"><button data-dc-tpl="366" type="button" class="btn sm">Sync</button></div>
+     </div>
+     
+    
+     <div data-dc-tpl="341" class="trow tone-clear " role="row">
+       <div data-dc-tpl="342" class="cell" role="cell"><span data-dc-tpl="343" class="mono"><span class="sc-interp">nathanpaynedotcom</span></span><span data-dc-tpl="344" class="sub"><span class="sc-interp">public</span></span></div>
+       <div data-dc-tpl="345" class="cell" role="cell"><span data-dc-tpl="346" class="b b-clear"><span data-dc-tpl="347" class="g g-clear" aria-hidden="true"></span><span class="sc-interp">Override-only</span></span></div>
+       <div data-dc-tpl="350" class="cell mono soft" role="cell"><span class="sc-interp">9a8fcdf</span> → <span class="sc-interp">91c3f50</span></div>
+       <div data-dc-tpl="351" class="cell" role="cell"><button data-dc-tpl="353" type="button" class="linkb" aria-expanded="false"><span class="sc-interp">1 path · show</span></button></div>
+       <div data-dc-tpl="356" class="cell" role="cell"><span data-dc-tpl="361" class="soft">none</span></div>
+       <div data-dc-tpl="362" class="cell mono soft" role="cell"><span class="sc-interp">12 min ago</span></div>
+       <div data-dc-tpl="365" class="cell" role="cell"><button data-dc-tpl="366" type="button" class="btn sm" disabled="">Sync</button></div>
+     </div>
+     
+    
+     <div data-dc-tpl="341" class="trow tone-bump " role="row">
+       <div data-dc-tpl="342" class="cell" role="cell"><span data-dc-tpl="343" class="mono"><span class="sc-interp">friends-and-family-billing</span></span><span data-dc-tpl="344" class="sub"><span class="sc-interp">private</span></span></div>
+       <div data-dc-tpl="345" class="cell" role="cell"><span data-dc-tpl="346" class="b b-bump"><span data-dc-tpl="347" class="g g-bump" aria-hidden="true"></span><span class="sc-interp">Drift · 7 paths</span></span></div>
+       <div data-dc-tpl="350" class="cell mono soft" role="cell"><span class="sc-interp">9a8fcdf</span> → <span class="sc-interp">c7b1d04</span></div>
+       <div data-dc-tpl="351" class="cell" role="cell"><button data-dc-tpl="353" type="button" class="linkb" aria-expanded="false"><span class="sc-interp">7 paths · show</span></button></div>
+       <div data-dc-tpl="356" class="cell" role="cell"><span data-dc-tpl="361" class="soft">none</span></div>
+       <div data-dc-tpl="362" class="cell mono soft" role="cell"><span class="sc-interp">12 min ago</span></div>
+       <div data-dc-tpl="365" class="cell" role="cell"><button data-dc-tpl="366" type="button" class="btn sm">Sync</button></div>
+     </div>
+     
+    
+     <div data-dc-tpl="341" class="trow tone-bump " role="row">
+       <div data-dc-tpl="342" class="cell" role="cell"><span data-dc-tpl="343" class="mono"><span class="sc-interp">tadlockpsychiatry</span></span><span data-dc-tpl="344" class="sub"><span class="sc-interp">private</span></span></div>
+       <div data-dc-tpl="345" class="cell" role="cell"><span data-dc-tpl="346" class="b b-bump"><span data-dc-tpl="347" class="g g-bump" aria-hidden="true"></span><span class="sc-interp">Fetch error</span></span><span data-dc-tpl="349" class="sub"><span class="sc-interp">git fetch exited 128 · last good audit kept</span></span></div>
+       <div data-dc-tpl="350" class="cell mono soft" role="cell"><span class="sc-interp">9a8fcdf</span> → <span class="sc-interp">0f4c9d2</span></div>
+       <div data-dc-tpl="351" class="cell" role="cell"><span data-dc-tpl="355" class="soft">none</span></div>
+       <div data-dc-tpl="356" class="cell" role="cell"><span data-dc-tpl="361" class="soft">none</span></div>
+       <div data-dc-tpl="362" class="cell mono soft" role="cell"><span class="sc-interp">42 min ago</span><span data-dc-tpl="364" class="sub stale">stale</span></div>
+       <div data-dc-tpl="365" class="cell" role="cell"><button data-dc-tpl="366" type="button" class="btn sm" disabled="">Sync</button></div>
+     </div>
+     
+    
+   </div>
+  </div></section><section data-dc-tpl="375" class="panel" id="budget">
+  <div data-dc-tpl="376" class="sec-head">
+    <div data-dc-tpl="377"><p data-dc-tpl="378" class="eyebrow">GitHub Actions budget</p><h2 data-dc-tpl="379"><span class="sc-interp">0 at the limit · 3 approaching</span></h2></div>
+    <div data-dc-tpl="380" class="sec-meta"><span data-dc-tpl="381">billing usage hourly · /rate_limit + headers · runs 20 s</span></div>
+  </div>
+  <div data-dc-tpl="382" class="meters">
+    <div data-dc-tpl="383" class="mcard t-clear">
+      <h3 data-dc-tpl="384">Spend this cycle <span data-dc-tpl="385" class="den">net_amount · per billing cycle</span></h3>
+      <div data-dc-tpl="386" class="m t-clear has-l"><div data-dc-tpl="387" class="m-top"><span data-dc-tpl="388" class="m-val">$<span class="sc-interp">15.90</span></span><span data-dc-tpl="389" class="m-den">of $25.00 budget · day 19 of 30</span></div><div data-dc-tpl="390" class="m-track"><div data-dc-tpl="391" class="m-fill t-clear" style="width: 63.6%;"></div><i data-dc-tpl="392" class="m-tick proj" style="left: 100%;"></i><span data-dc-tpl="393" class="m-tick-l end" style="left: 100%;">proj $<span class="sc-interp">26.80</span></span></div></div>
+      <ul data-dc-tpl="396" class="spenders">
+        <li data-dc-tpl="397"><span data-dc-tpl="398">propagation-drift (cron)</span><span data-dc-tpl="399" class="mono soft">mergepath</span><span data-dc-tpl="400" class="mono">$6.10</span></li>
+        <li data-dc-tpl="401"><span data-dc-tpl="402">repo_lint</span><span data-dc-tpl="403" class="mono soft">matchline</span><span data-dc-tpl="404" class="mono">$2.90</span></li>
+        <li data-dc-tpl="405"><span data-dc-tpl="406">repo_lint</span><span data-dc-tpl="407" class="mono soft">mergepath</span><span data-dc-tpl="408" class="mono">$2.35</span></li>
+        <li data-dc-tpl="409"><span data-dc-tpl="410">codex-review-check</span><span data-dc-tpl="411" class="mono soft">friends-and-family-billing</span><span data-dc-tpl="412" class="mono">$1.40</span></li>
+      </ul>
+      <span data-dc-tpl="413" class="note"><span class="sc-interp">Projection passes the budget on day 30 at the current burn. Scheduled crons dominate; pause propagation-drift to cut the slope.</span></span>
+    </div>
+    <div data-dc-tpl="414" class="mcard t-bump">
+      <h3 data-dc-tpl="415">GITHUB_TOKEN per repo <span data-dc-tpl="416" class="den">1,000 per hour · per repository</span></h3>
+      <div data-dc-tpl="417" class="tok">
+        <div data-dc-tpl="419" class="tok-r"><span data-dc-tpl="420" class="mono"><span class="sc-interp">mergepath</span></span><div data-dc-tpl="421" class="mini"><div data-dc-tpl="422" class="mini-fill t-bump" style="width: 78%;"></div></div><span data-dc-tpl="423" class="mono ink-bump"><span class="sc-interp">est. 780</span></span></div><div data-dc-tpl="419" class="tok-r"><span data-dc-tpl="420" class="mono"><span class="sc-interp">matchline</span></span><div data-dc-tpl="421" class="mini"><div data-dc-tpl="422" class="mini-fill t-clear" style="width: 30%;"></div></div><span data-dc-tpl="423" class="mono ink-clear"><span class="sc-interp">est. 300</span></span></div><div data-dc-tpl="419" class="tok-r"><span data-dc-tpl="420" class="mono"><span class="sc-interp">swipewatch</span></span><div data-dc-tpl="421" class="mini"><div data-dc-tpl="422" class="mini-fill t-clear" style="width: 16%;"></div></div><span data-dc-tpl="423" class="mono ink-clear"><span class="sc-interp">est. 160</span></span></div><div data-dc-tpl="419" class="tok-r"><span data-dc-tpl="420" class="mono"><span class="sc-interp">overridebroadway</span></span><div data-dc-tpl="421" class="mini"><div data-dc-tpl="422" class="mini-fill t-clear" style="width: 9%;"></div></div><span data-dc-tpl="423" class="mono ink-clear"><span class="sc-interp">est. 90</span></span></div><div data-dc-tpl="419" class="tok-r"><span data-dc-tpl="420" class="mono"><span class="sc-interp">nathanpaynedotcom</span></span><div data-dc-tpl="421" class="mini"><div data-dc-tpl="422" class="mini-fill t-clear" style="width: 6%;"></div></div><span data-dc-tpl="423" class="mono ink-clear"><span class="sc-interp">est. 60</span></span></div><div data-dc-tpl="419" class="tok-r"><span data-dc-tpl="420" class="mono"><span class="sc-interp">friends-and-family-billing</span></span><div data-dc-tpl="421" class="mini"><div data-dc-tpl="422" class="mini-fill t-clear" style="width: 21%;"></div></div><span data-dc-tpl="423" class="mono ink-clear"><span class="sc-interp">est. 210</span></span></div><div data-dc-tpl="419" class="tok-r"><span data-dc-tpl="420" class="mono"><span class="sc-interp">tadlockpsychiatry</span></span><div data-dc-tpl="421" class="mini"><div data-dc-tpl="422" class="mini-fill t-clear" style="width: 4%;"></div></div><span data-dc-tpl="423" class="mono ink-clear"><span class="sc-interp">est. 40</span></span></div>
+      </div>
+      <span data-dc-tpl="424" class="note "><span class="sc-interp">Estimate: runs in the last hour × measured requests per run. This budget cannot be read from outside a run.</span></span>
+    </div>
+    <div data-dc-tpl="425" class="mcard t-bump">
+      <h3 data-dc-tpl="426">Shared CI PAT pool <span data-dc-tpl="427" class="den">5,000 per hour · per account · nathanpayne-robot</span></h3>
+      <div data-dc-tpl="428" class="m t-bump"><div data-dc-tpl="429" class="m-top"><span data-dc-tpl="430" class="m-val"><span class="sc-interp">3,900</span></span><span data-dc-tpl="431" class="m-den">of 5,000 · resets in <span class="sc-interp">22 min</span></span></div><div data-dc-tpl="432" class="m-track"><div data-dc-tpl="433" class="m-fill t-bump" style="width: 78%;"></div><i data-dc-tpl="434" class="m-tick" style="left: 70%;"></i></div></div>
+      <span data-dc-tpl="437" class="note">Drew on it in the last hour: <span data-dc-tpl="438" class="mono">mergepath <span class="sc-interp">1,900</span> · matchline <span class="sc-interp">820</span> · swipewatch <span class="sc-interp">490</span></span>. One pool serves every repo.</span>
+    </div>
+    <div data-dc-tpl="439" class="mcard t-bump">
+      <h3 data-dc-tpl="440">Queue pressure <span data-dc-tpl="441" class="den">queued vs running · per repo</span></h3>
+      <div data-dc-tpl="442" class="m t-bump"><div data-dc-tpl="443" class="m-top"><span data-dc-tpl="444" class="m-val"><span class="sc-interp">23</span> queued · <span class="sc-interp">2</span> running</span><span data-dc-tpl="445" class="m-den"><span class="sc-interp">about 58 min to drain</span></span></div></div>
+      <div data-dc-tpl="446" class="tok">
+        <div data-dc-tpl="448" class="qrow"><span data-dc-tpl="449" class="mono"><span class="sc-interp">mergepath</span></span><div data-dc-tpl="450" class="qbar "><div data-dc-tpl="451" class="qq" style="width: 93.3333%;"></div><div data-dc-tpl="452" class="qr" style="width: 6.66667%;"></div></div><span data-dc-tpl="453" class="mono"><span class="sc-interp">14 / 1</span></span></div><div data-dc-tpl="448" class="qrow"><span data-dc-tpl="449" class="mono"><span class="sc-interp">matchline</span></span><div data-dc-tpl="450" class="qbar "><div data-dc-tpl="451" class="qq" style="width: 26.6667%;"></div><div data-dc-tpl="452" class="qr" style="width: 6.66667%;"></div></div><span data-dc-tpl="453" class="mono"><span class="sc-interp">4 / 1</span></span></div><div data-dc-tpl="448" class="qrow"><span data-dc-tpl="449" class="mono"><span class="sc-interp">swipewatch</span></span><div data-dc-tpl="450" class="qbar "><div data-dc-tpl="451" class="qq" style="width: 20%;"></div><div data-dc-tpl="452" class="qr" style="width: 0%;"></div></div><span data-dc-tpl="453" class="mono"><span class="sc-interp">3 / 0</span></span></div><div data-dc-tpl="448" class="qrow"><span data-dc-tpl="449" class="mono"><span class="sc-interp">overridebroadway</span></span><div data-dc-tpl="450" class="qbar "><div data-dc-tpl="451" class="qq" style="width: 6.66667%;"></div><div data-dc-tpl="452" class="qr" style="width: 0%;"></div></div><span data-dc-tpl="453" class="mono"><span class="sc-interp">1 / 0</span></span></div><div data-dc-tpl="448" class="qrow"><span data-dc-tpl="449" class="mono"><span class="sc-interp">nathanpaynedotcom</span></span><div data-dc-tpl="450" class="qbar "><div data-dc-tpl="451" class="qq" style="width: 6.66667%;"></div><div data-dc-tpl="452" class="qr" style="width: 0%;"></div></div><span data-dc-tpl="453" class="mono"><span class="sc-interp">1 / 0</span></span></div><div data-dc-tpl="448" class="qrow"><span data-dc-tpl="449" class="mono"><span class="sc-interp">friends-and-family-billing</span></span><div data-dc-tpl="450" class="qbar "><div data-dc-tpl="451" class="qq" style="width: 0%;"></div><div data-dc-tpl="452" class="qr" style="width: 0%;"></div></div><span data-dc-tpl="453" class="mono"><span class="sc-interp">0 / 0</span></span></div><div data-dc-tpl="448" class="qrow"><span data-dc-tpl="449" class="mono"><span class="sc-interp">tadlockpsychiatry</span></span><div data-dc-tpl="450" class="qbar "><div data-dc-tpl="451" class="qq" style="width: 0%;"></div><div data-dc-tpl="452" class="qr" style="width: 0%;"></div></div><span data-dc-tpl="453" class="mono"><span class="sc-interp">0 / 0</span></span></div>
+      </div>
+      <div data-dc-tpl="454" class="qleg"><span data-dc-tpl="455"><i data-dc-tpl="456" style="background: var(--bump);"></i>queued</span><span data-dc-tpl="457"><i data-dc-tpl="458" style="background: var(--run);"></i>running</span></div>
+      <span data-dc-tpl="459" class="note "><span class="sc-interp">Rising queue with few runners is the early sign of a jam. Run one PR review loop at a time.</span></span>
+    </div>
+  </div></section></div></div></div></div></div>
+
+
+
+</body></html>

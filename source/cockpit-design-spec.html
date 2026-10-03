@@ -1,0 +1,454 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>Cockpit Design Spec</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:ital,wght@0,400..700;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* Layout: one reading column with a sticky section index on wide screens; tables scroll in their own boxes. */
+:root{
+  --bg:#f4efe5;--bg-deep:#ece3d3;--panel:#fffdf9;--inset:rgba(255,255,255,.6);
+  --fg:#1b2426;--muted:#565d58;--soft:#656b63;--line:rgba(67,79,77,.18);--line-strong:rgba(43,68,63,.32);
+  --accent:#1f6257;--accent-soft:rgba(31,98,87,.12);
+  --clear:#1f6257;--clear-ink:#1f6257;--clear-soft:rgba(31,98,87,.13);
+  --run:#2c5282;--run-ink:#2c5282;--run-soft:rgba(44,82,130,.13);
+  --bump:#a0661f;--bump-ink:#7a4d12;--bump-soft:rgba(183,119,48,.18);
+  --boulder:#7b2d26;--boulder-ink:#7b2d26;--boulder-soft:rgba(123,45,38,.13);
+  --idle:#8a8f87;--idle-ink:#5d655f;--idle-soft:rgba(93,101,95,.12);
+  --done:#1b2426;--glyph-ink:#fff;--code-bg:#1b2426;--code-fg:#f4efe5;
+  --sans:"Instrument Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+  --mono:"JetBrains Mono","SFMono-Regular",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --bg:#13191a;--bg-deep:#0d1213;--panel:#1f2829;--inset:rgba(255,255,255,.04);
+  --fg:#ece6da;--muted:#b9b4a9;--soft:#a09c93;--line:rgba(236,230,218,.12);--line-strong:rgba(236,230,218,.26);
+  --accent:#6cc4b0;--accent-soft:rgba(108,196,176,.14);
+  --clear:#2a8273;--clear-ink:#7fd1bd;--clear-soft:rgba(108,196,176,.16);
+  --run:#3d6ea8;--run-ink:#93bbea;--run-soft:rgba(141,181,232,.16);
+  --bump:#b5772a;--bump-ink:#e8b86e;--bump-soft:rgba(224,167,90,.17);
+  --boulder:#9a3d33;--boulder-ink:#f2a393;--boulder-soft:rgba(240,160,144,.15);
+  --idle:#6f766f;--idle-ink:#aab0a8;--idle-soft:rgba(167,173,165,.12);
+  --done:#ece6da;--glyph-ink:#13191a;--code-bg:#0d1213;--code-fg:#ece6da;color-scheme:dark } }
+:root[data-theme="dark"]{
+  --bg:#13191a;--bg-deep:#0d1213;--panel:#1f2829;--inset:rgba(255,255,255,.04);
+  --fg:#ece6da;--muted:#b9b4a9;--soft:#a09c93;--line:rgba(236,230,218,.12);--line-strong:rgba(236,230,218,.26);
+  --accent:#6cc4b0;--accent-soft:rgba(108,196,176,.14);
+  --clear:#2a8273;--clear-ink:#7fd1bd;--clear-soft:rgba(108,196,176,.16);
+  --run:#3d6ea8;--run-ink:#93bbea;--run-soft:rgba(141,181,232,.16);
+  --bump:#b5772a;--bump-ink:#e8b86e;--bump-soft:rgba(224,167,90,.17);
+  --boulder:#9a3d33;--boulder-ink:#f2a393;--boulder-soft:rgba(240,160,144,.15);
+  --idle:#6f766f;--idle-ink:#aab0a8;--idle-soft:rgba(167,173,165,.12);
+  --done:#ece6da;--glyph-ink:#13191a;--code-bg:#0d1213;--code-fg:#ece6da;color-scheme:dark }
+*{box-sizing:border-box}
+body{margin:0;background:linear-gradient(180deg,var(--bg),var(--bg-deep)) fixed;color:var(--fg);font-family:var(--sans);font-size:15px;line-height:1.55;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1180px;margin:0 auto;padding-block:28px 72px;padding-inline:20px;display:grid;grid-template-columns:minmax(0,1fr);gap:28px}
+@media (min-width:980px){.wrap{grid-template-columns:220px minmax(0,1fr)}}
+nav.idx{position:sticky;top:env(safe-area-inset-top,0px);align-self:start;font-size:12.5px;display:none}
+@media (min-width:980px){nav.idx{display:block}}
+nav.idx a{display:block;color:var(--muted);text-decoration:none;padding:4px 0;border-left:2px solid var(--line);padding-left:10px}
+nav.idx a:hover{color:var(--accent);border-color:var(--accent)}
+main{min-width:0;display:grid;gap:36px}
+.eyebrow{margin:0 0 6px;color:var(--accent);text-transform:uppercase;letter-spacing:.2em;font-size:11px;font-weight:700;font-family:var(--mono)}
+h1{margin:0;font-size:clamp(1.7rem,3vw,2.3rem);line-height:1.12;letter-spacing:-.02em;font-weight:600;text-wrap:balance;max-width:720px}
+h2{margin:0 0 12px;font-size:1.35rem;letter-spacing:-.01em;font-weight:600;text-wrap:balance}
+h3{margin:22px 0 8px;font-size:1rem;font-weight:600}
+h4{margin:14px 0 4px;font-size:.9rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+p{margin:0 0 10px;max-width:72ch;color:var(--fg)}
+p.lede{color:var(--muted);font-size:16px;max-width:66ch}
+section{scroll-margin-top:12px}
+a{color:var(--accent)}
+code,.mono{font-family:var(--mono);font-size:.88em}
+code{background:var(--accent-soft);color:var(--accent);padding:1px 5px;border-radius:4px}
+pre{margin:8px 0 12px;padding:12px 14px;border-radius:10px;background:var(--code-bg);color:var(--code-fg);font-family:var(--mono);font-size:12.5px;line-height:1.55;overflow-x:auto}
+pre code{background:transparent;color:inherit;padding:0}
+ul,ol{margin:0 0 10px;padding-left:22px;max-width:76ch}
+li{margin:3px 0}
+.links{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+.pill{display:inline-flex;align-items:center;gap:8px;padding:7px 14px;border-radius:999px;border:1px solid var(--line-strong);background:var(--inset);text-decoration:none;color:var(--fg);font-size:13px;font-weight:500}
+.pill:hover{border-color:var(--accent);color:var(--accent)}
+.tblw{overflow-x:auto;margin:8px 0 14px}
+table{border-collapse:collapse;width:100%;font-size:13.5px;min-width:620px}
+th{text-align:left;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--soft);font-weight:700;padding:6px 10px;border-bottom:1px solid var(--line-strong);white-space:nowrap}
+td{padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+td.mono,th.mono{font-family:var(--mono);font-size:12.5px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.card{padding:18px 20px;border-radius:16px;background:var(--panel);border:1px solid var(--line)}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr));gap:14px}
+.g{position:relative;display:inline-block;width:1em;height:1em;font-size:14px;flex:none;vertical-align:-.15em}
+.g.lg{font-size:22px}
+.g-idle{border:.17em solid var(--idle);border-radius:50%}
+.g-run{border:.17em dashed var(--run);border-radius:50%;animation:spin 1.6s linear infinite}
+.g-clear{background:var(--clear);border-radius:50%}
+.g-clear::after,.g-done::after{content:"";position:absolute;left:.3em;top:.12em;width:.28em;height:.52em;border:solid #fff;border-width:0 .17em .17em 0;transform:rotate(45deg)}
+.g-done{background:var(--done);border-radius:50%}.g-done::after{border-color:var(--glyph-ink)}
+.g-bump{background:var(--bump);clip-path:ellipse(50% 100% at 50% 100%)}
+.g-boulder{background:var(--boulder);clip-path:polygon(30% 0,70% 0,100% 30%,100% 70%,70% 100%,30% 100%,0 70%,0 30%)}
+.g-boulder::after{content:"";position:absolute;left:.25em;right:.25em;top:.42em;height:.17em;background:#fff}
+.g-fail{background:var(--boulder);border-radius:.25em}
+.g-fail::before,.g-fail::after{content:"";position:absolute;left:.2em;right:.2em;top:.42em;height:.16em;background:#fff;transform:rotate(45deg)}
+.g-fail::after{transform:rotate(-45deg)}
+.sw{display:inline-block;width:14px;height:14px;border-radius:4px;vertical-align:-2px;margin-right:6px;border:1px solid var(--line)}
+.b{display:inline-flex;align-items:center;gap:6px;padding:3px 9px 3px 7px;border-radius:999px;font-family:var(--mono);font-size:11px;font-weight:500;white-space:nowrap}
+.b-clear{background:var(--clear-soft);color:var(--clear-ink)}.b-run{background:var(--run-soft);color:var(--run-ink)}.b-bump{background:var(--bump-soft);color:var(--bump-ink)}.b-boulder{background:var(--boulder-soft);color:var(--boulder-ink)}.b-idle{background:var(--idle-soft);color:var(--idle-ink)}
+.m-track{position:relative;height:10px;border-radius:999px;background:var(--idle-soft);box-shadow:inset 0 0 0 1px var(--line);margin:6px 0 4px}
+.m-fill{position:absolute;left:0;top:0;bottom:0;border-radius:999px;background-color:var(--clear)}
+.m-fill.bump{background-color:var(--bump);background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.3) 0 5px,transparent 5px 10px);background-size:14px 14px;animation:rumble 1s linear infinite}
+.m-fill.boulder{background-color:var(--boulder)}
+.m-tick{position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--line-strong)}
+.m-cap{position:absolute;right:-7px;top:50%;transform:translateY(-50%)}
+.issue{border-left:3px solid var(--accent);padding-left:14px}
+.issue h3{margin-top:0}
+.kv{display:grid;grid-template-columns:160px minmax(0,1fr);gap:4px 14px;font-size:13.5px;margin:6px 0 10px}
+.kv dt{font-family:var(--mono);font-size:12px;color:var(--accent)}
+.kv dd{margin:0;color:var(--fg)}
+.note{font-size:13px;color:var(--muted)}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes rumble{to{background-position:14px 0}}
+@media (prefers-reduced-motion:reduce){.g-run,.m-fill.bump{animation:none}}
+</style>
+
+<div class="wrap">
+<nav class="idx" aria-label="Sections">
+  <a href="#overview">Overview</a>
+  <a href="#decisions">Decisions made</a>
+  <a href="#language">Status language</a>
+  <a href="#color">Color tokens</a>
+  <a href="#motion">Motion tokens</a>
+  <a href="#components">Component inventory</a>
+  <a href="#precedence">Tone precedence</a>
+  <a href="#i1586">#1586 Server and shell</a>
+  <a href="#i1587">#1587 Open PRs</a>
+  <a href="#i1588">#1588 CI and tests</a>
+  <a href="#i1589">#1589 Heartbeat</a>
+  <a href="#i1590">#1590 Agents and tokens</a>
+  <a href="#i1591">#1591 Audit JSON</a>
+  <a href="#i1592">#1592 Fleet panel</a>
+  <a href="#i1593">#1593 Start sync</a>
+  <a href="#i1594">#1594 Actions budget</a>
+  <a href="#a11y">Accessibility</a>
+</nav>
+<main>
+
+<section id="overview">
+  <p class="eyebrow">Mergepath · Cockpit · design spec</p>
+  <h1>Cockpit Design Spec</h1>
+  <p class="lede">The build reference for the Mergepath Cockpit (epic #1585): one status language, the color and motion tokens, the component inventory, and what each subtask (#1586 to #1594) needs from it. The interactive prototype on the design canvas is the source of truth for look and behavior; this page is the source of truth for names, thresholds and rules.</p>
+  <div class="links">
+    <a class="pill" href="https://claude.ai/artifact/LMrtkUuL2tGMSzrsKwSXTS">Design canvas: interactive prototype and status sheet</a>
+  </div>
+  <p class="note" style="margin-top:12px">Everything in the prototype is mock data. Repo names come from the propagation manifest; PR numbers, SHAs, run ids, dollar figures and token counts are invented and chosen to be plausible.</p>
+</section>
+
+<section id="decisions" class="card">
+  <h2>Decisions made without the owner</h2>
+  <p>The brief said to decide rather than ask. These are the calls that shape the design; each is reversible.</p>
+  <ol>
+    <li><strong>Four tones, two of them "road" tones.</strong> Idle, Running, Clear, Speed bump, Boulder, plus Done for rewards. Speed bump and Boulder are the only two tones that appear in the Road ahead. Everything else in the product maps onto these six; no section invents its own.</li>
+    <li><strong>Shape carries the state, color seconds it.</strong> Hollow ring, dashed ring, filled circle with a check, amber hump, dark octagon with a bar, ink circle with a check. Every badge also carries a text label. A color-blind operator or a greyscale print still reads the page.</li>
+    <li><strong>Amber and oxblood, not yellow and red.</strong> The Playground's warm accent (#b77730) is darkened to #a0661f for fills and #7a4d12 for text so it clears 4.5:1 on cream. Boulder uses a deep oxblood (#7b2d26) rather than a saturated red: it reads as heavy, not alarming, and sits far from the teal in lightness as well as hue.</li>
+    <li><strong>Thresholds are 70% and 100%.</strong> Every meter turns Speed bump at 70% of its denominator and Boulder at 100%. Issue #1594 asks for ok, approaching and at-the-limit; these are those three. The 70% tick is drawn on every track so the operator sees the threshold before the fill reaches it.</li>
+    <li><strong>The Road ahead is time-scaled, not severity-scaled.</strong> Markers sit where they will bite: NOW at the left, then 15 min, 1 h, today, cycle end, on a log scale. A boulder at NOW is already stopping work; a boulder at cycle end is a projection. Severity shows in the glyph, timing in the position.</li>
+    <li><strong>The sync dialog is one component with four stages</strong> (preview, confirm, run, done) rather than four screens, so a reviewer can walk it and an engineer can keep its state in one place. Open sync PRs default to <em>skip</em>; an ahead consumer adds a checkbox gate to the confirm step.</li>
+    <li><strong>Rewards are short and local.</strong> A merge shows a Merged ribbon with a 2.6 s row glow and five drifting dots, then the row leaves the list after 7 s. A finished sync shows a Done check with a burst ring and PR chips. No full-screen confetti.</li>
+    <li><strong>Reduced motion is the same page with durations at zero.</strong> One class and one media query set every duration token to 0 ms and pause every loop. State changes still happen, tone colors still change, the ribbon still appears. Nothing is hidden from reduced-motion users; only movement is removed.</li>
+    <li><strong>Prototype controls live in a dashed strip under the header and are not product.</strong> Scenario cycling, simulate-a-merge, theme and reduced-motion toggles exist so reviewers see every state animate.</li>
+    <li><strong>Estimates say so in the value.</strong> The per-repo GITHUB_TOKEN meter reads "est. 640", the Codex cost reads "$0.37 est". A number that is not measured never looks like one that is.</li>
+    <li><strong>Per-PR budgets headline what is left, and small budgets skip the bump stage.</strong> "3 left of 10" is the number the operator acts on; the used count is secondary. The rule "two or fewer left is a Speed bump" applies to budgets of five or more; the single Phase 4b rerun goes straight from Clear (1 left) to Boulder (0 left). An unreadable source reads "unknown" on a dashed track.</li>
+  </ol>
+</section>
+
+<section id="language">
+  <h2>Status language</h2>
+  <p>Six states. Each has a glyph (built in CSS, no icon font), a badge (soft tint plus ink text plus the glyph), a meaning, and what the operator does about it. Use them in every section; the prototype's status sheet shows all six in both themes.</p>
+  <div class="tblw"><table>
+    <thead><tr><th>State</th><th>Glyph</th><th>Construction</th><th>Meaning</th><th>Operator does</th><th>Motion</th></tr></thead>
+    <tbody>
+      <tr><td><span class="b b-idle"><span class="g g-idle"></span>Waiting</span></td><td><span class="g lg g-idle"></span></td><td>Hollow ring, 0.17em border, <code>--idle</code></td><td>Nothing happening, nothing wrong. Drafts, queued steps, unused budget.</td><td>Nothing.</td><td>None.</td></tr>
+      <tr><td><span class="b b-run"><span class="g g-run"></span>Running</span></td><td><span class="g lg g-run"></span></td><td>Dashed ring, <code>--run</code>, rotating</td><td>Work in flight: a check, a Codex request, an agent stage, a sync stage.</td><td>Wait. Watch elapsed against the timeout.</td><td><code>spin</code> 1.6 s linear, looped.</td></tr>
+      <tr><td><span class="b b-clear"><span class="g g-clear"></span>Clean</span></td><td><span class="g lg g-clear"></span></td><td>Filled circle, white check (rotated border pseudo-element), <code>--clear</code></td><td>Passed, in sync, armed, within budget.</td><td>Nothing. It finishes on its own.</td><td>Tone transition 360 ms.</td></tr>
+      <tr><td><span class="b b-bump"><span class="g g-bump"></span>Budget near</span></td><td><span class="g lg g-bump"></span></td><td>Half-dome via <code>clip-path: ellipse(50% 100% at 50% 100%)</code>, <code>--bump</code></td><td>Will slow work: a limit above 70%, a rising queue, a rate limit, a stale failure, behind main, an agent near timeout, a fetch error.</td><td>Act soon, or accept the delay.</td><td>Meter fill gains rumble stripes. Marker slides in on the road.</td></tr>
+      <tr><td><span class="b b-boulder"><span class="g g-boulder"></span>Human stop</span></td><td><span class="g lg g-boulder"></span></td><td>Octagon via <code>clip-path: polygon(...)</code> with a white bar, <code>--boulder</code></td><td>Stops work outright: human-hold or policy-violation, UNSTABLE from a non-retryable CodeQL failure, conflicts, a spent Codex budget, an exhausted token, a jammed queue, spend past budget, a crashed or timed-out agent.</td><td>Act now. Nothing moves until you do.</td><td>Badge throbs (box-shadow ring, 2.6 s). Boulder glyph lands on a meter's end cap at 100%.</td></tr>
+      <tr><td><span class="b" style="background:var(--done);color:var(--bg)"><span class="g g-done" style="font-size:10px"></span>Merged</span></td><td><span class="g lg g-done"></span></td><td>Ink circle, check in page color, <code>--done</code> / <code>--glyph-ink</code></td><td>Finished and rewarded: a merge, a sync, an approval.</td><td>Enjoy it. The row leaves after 7 s.</td><td><code>pop</code> 900 ms, row glow 2.6 s, confetti drift 2.6 s, then removal.</td></tr>
+    </tbody>
+  </table></div>
+  <p>A seventh glyph, the failed step (<span class="g g-fail"></span>, a rounded square with a cross), is used only inside CI step lists where "failed" is a fact about a step and not yet a verdict about the PR. The run that contains it carries the Speed bump or Boulder tone according to the precedence rules below.</p>
+
+  <h3>Limits: the meter</h3>
+  <p>Every limit is a meter with its denominator written out: <em>per hour</em>, <em>per repository</em>, <em>per account</em>, <em>per billing cycle</em>. A number without its denominator is never shown.</p>
+  <div class="grid2">
+    <div class="card"><strong class="mono">1,240</strong> <span class="note">of 5,000 · per hour · per account</span><div class="m-track"><div class="m-fill" style="width:25%"></div><i class="m-tick" style="left:70%"></i></div><span class="note">Clear. Solid fill. The tick at 70% is always drawn.</span></div>
+    <div class="card"><strong class="mono" style="color:var(--bump-ink)">3,900</strong> <span class="note">of 5,000 · per hour · per account</span><div class="m-track"><div class="m-fill bump" style="width:78%"></div><i class="m-tick" style="left:70%"></i></div><span class="note">Speed bump from 70%. Stripes crawl (rumble, 1 s), the value turns amber and bold, the card tints.</span></div>
+    <div class="card"><strong class="mono" style="color:var(--boulder-ink)">5,000</strong> <span class="note">of 5,000 · per hour · per account</span><div class="m-track" style="box-shadow:inset 0 0 0 1.5px var(--boulder)"><div class="m-fill boulder" style="width:100%"></div><i class="m-tick" style="left:70%"></i><span class="m-cap g lg g-boulder"></span></div><span class="note">Boulder at 100%. The track hardens (1.5px boulder inset), the glyph lands on the end cap (land, 900 ms).</span></div>
+  </div>
+  <p style="margin-top:12px">Width changes animate over 700 ms with <code>--ease</code>; color over 360 ms. A second tick in <code>--bump-ink</code> marks a projection (the spend meter's end-of-cycle estimate) with a label beneath the track, right-anchored once the projection passes 85% so the label stays inside its card. The 5 px mini variant (budget strips, per-repo token bars) keeps the same tones and the same rumble stripes at the bump stage; an unknown value draws a dashed track (<code>repeating-linear-gradient(90deg, var(--line-strong) 0 3px, transparent 3px 6px)</code>) with no fill.</p>
+
+  <h3>Road ahead</h3>
+  <p>A strip and a list. The strip is a horizontal line from NOW (left) to the end of the billing cycle (right) with horizon labels at 15 min, 1 h, today and cycle end on a log scale: <code>pct = 4 + 90 × log(1 + minutes) / log(16001)</code>, so NOW is at 4% and 11 days is at 94%. Each marker is a Speed bump or Boulder glyph sitting on the line, numbered in list order. Markers whose ETAs crowd are pushed right so they stay at least 28 px apart. Labels never sit on the line or the horizon labels: they pack into four lanes above it, joined to their glyph by a thin stem, earliest item first, and are clamped inside the strip (a label near NOW or cycle end anchors to the edge instead of centering). The three upper lanes take full labels ("1 · mergepath #1601 · conflicts"); a marker with no room for its full label keeps just its number, which matches the numbered list row. Lane packing measures real text widths and reruns on resize, so it holds from phone width to desktop. The strip shows at most nine markers, boulders claiming slots before bumps (a boulder is never hidden behind "+N more"), and says "+N more in the list below". The list repeats every item in full: number, glyph, kind, sentence, ETA, and a link to the section it came from; under 720 px each row stacks (number, glyph, kind and ETA, then the sentence, then the link).</p>
+  <p>The section headline is the count: "2 boulders on the road, 5 speed bumps ahead", "3 speed bumps ahead", or "Road is clear". Items are sorted by ETA, then boulders before bumps.</p>
+</section>
+
+<section id="color">
+  <h2>Color tokens</h2>
+  <p>Kinship with the Playground: cream ground, teal accent, warm amber. Each tone has three tokens: the fill (glyphs, meter fills, pips), the ink (text on the page or on a soft tint) and the soft tint (badge and row backgrounds). Text never sits on a fill except the white check and bar inside glyphs, and the ink-on-page ribbon. Implementation rule: a tone class (<code>t-clear</code>, <code>t-bump</code> and so on) paints a background only on fill elements (meter and mini-bar fills). Containers that carry a tone class (meters, budget strips, cards) tint through their own soft rules; a generic tone rule that also matches containers paints whole cards solid and hides their text.</p>
+  <div class="tblw"><table>
+    <thead><tr><th>Token</th><th>Light</th><th>Dark</th><th>Used for</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">--page / --page-deep</td><td class="mono"><span class="sw" style="background:#f4efe5"></span>#f4efe5 / #ece3d3</td><td class="mono"><span class="sw" style="background:#13191a"></span>#13191a / #0d1213</td><td>Page gradient, top to bottom</td></tr>
+      <tr><td class="mono">--panel / --panel-strong</td><td class="mono">rgba(255,252,246,.9) / #fffdf9</td><td class="mono">rgba(30,38,39,.88) / #202a2b</td><td>Section panels (blurred), dialogs and marker labels (solid)</td></tr>
+      <tr><td class="mono">--ink / --muted / --soft</td><td class="mono">#1b2426 / #565d58 / #656b63</td><td class="mono">#ece6da / #b9b4a9 / #a09c93</td><td>Body, secondary, captions. Soft clears 4.5:1 on both grounds.</td></tr>
+      <tr><td class="mono">--line / --line-strong</td><td class="mono">rgba(67,79,77,.16) / .3</td><td class="mono">rgba(236,230,218,.12) / .26</td><td>Dividers, tracks, chip borders</td></tr>
+      <tr><td class="mono">--accent / --accent-soft</td><td class="mono"><span class="sw" style="background:#1f6257"></span>#1f6257</td><td class="mono"><span class="sw" style="background:#6cc4b0"></span>#6cc4b0</td><td>Eyebrows, links, primary button, poll ring, NOW label</td></tr>
+      <tr><td class="mono">--clear / -ink / -soft</td><td class="mono"><span class="sw" style="background:#1f6257"></span>#1f6257 / #1f6257 / rgba(31,98,87,.13)</td><td class="mono"><span class="sw" style="background:#2a8273"></span>#2a8273 / #7fd1bd / rgba(108,196,176,.16)</td><td>Clear tone. Shares the accent hue on purpose: "clear" is the house color.</td></tr>
+      <tr><td class="mono">--run / -ink / -soft</td><td class="mono"><span class="sw" style="background:#2c5282"></span>#2c5282 / #2c5282 / rgba(44,82,130,.13)</td><td class="mono"><span class="sw" style="background:#3d6ea8"></span>#3d6ea8 / #93bbea / rgba(141,181,232,.16)</td><td>Running tone. Blue, distinct from teal in hue and from amber in lightness.</td></tr>
+      <tr><td class="mono">--bump / -ink / -soft</td><td class="mono"><span class="sw" style="background:#a0661f"></span>#a0661f / #7a4d12 / rgba(183,119,48,.18)</td><td class="mono"><span class="sw" style="background:#b5772a"></span>#b5772a / #e8b86e / rgba(224,167,90,.17)</td><td>Speed bump tone. Also the projection tick and the "est" tag.</td></tr>
+      <tr><td class="mono">--boulder / -ink / -soft</td><td class="mono"><span class="sw" style="background:#7b2d26"></span>#7b2d26 / #7b2d26 / rgba(123,45,38,.13)</td><td class="mono"><span class="sw" style="background:#9a3d33"></span>#9a3d33 / #f2a393 / rgba(240,160,144,.15)</td><td>Boulder tone. Also the human-hold label fill and the failed-step glyph.</td></tr>
+      <tr><td class="mono">--idle / -ink / -soft</td><td class="mono"><span class="sw" style="background:#8a8f87"></span>#8a8f87 / #5d655f / rgba(93,101,95,.12)</td><td class="mono"><span class="sw" style="background:#6f766f"></span>#6f766f / #aab0a8 / rgba(167,173,165,.12)</td><td>Idle tone, empty pips, meter tracks</td></tr>
+      <tr><td class="mono">--done / --glyph-ink</td><td class="mono"><span class="sw" style="background:#1b2426"></span>#1b2426 / #fff</td><td class="mono"><span class="sw" style="background:#ece6da"></span>#ece6da / #13191a</td><td>Done tone: the ribbon and the Merged check. Inverts with the theme.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Contrast: every ink token is at least 4.5:1 on its page and on its soft tint; white on <code>--bump</code> light (#a0661f) is 4.7:1 and is used only inside glyphs. Semantic tones are separate from the accent; teal does double duty as accent and Clear because that is the brand's reassurance color.</p>
+  <p>Typography: Instrument Sans for UI text, JetBrains Mono (as in the Playground) for ids, SHAs, counts, denominators and eyebrows, with <code>font-variant-numeric: tabular-nums</code>. Type scale: 11 / 12.5 / 13 / 14 / 17 / 20 / 32 px.</p>
+</section>
+
+<section id="motion">
+  <h2>Motion tokens</h2>
+  <div class="tblw"><table>
+    <thead><tr><th>Token</th><th>Value</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">--t-fast</td><td class="mono">160 ms</td><td>Hover, press, chip and segmented-control toggles, log line entry</td></tr>
+      <tr><td class="mono">--t-med</td><td class="mono">360 ms</td><td>Tone changes: badge color, row and card background, glyph color, pip color, stage dot; row and card enter (6 px rise plus fade); dialog backdrop fade</td></tr>
+      <tr><td class="mono">--t-slow</td><td class="mono">700 ms</td><td>Meter fill width, mini-bar width, chart bar height, queue bar widths, road marker slide-in (40 px from the right); fresh rows after a sync</td></tr>
+      <tr><td class="mono">--t-pop</td><td class="mono">900 ms</td><td>Reward pop (scale .6 → 1.08 → 1): Merged ribbon, Done check, PR chips, dialog open; boulder landing on a cap (drop from −14 px with a 1.05 overshoot)</td></tr>
+      <tr><td class="mono">--t-glow</td><td class="mono">2,600 ms</td><td>Row glow after a merge or a sync (clear-soft to transparent), confetti drift (five dots, 26 to 40 px), Done burst ring (0 to 34 px)</td></tr>
+      <tr><td class="mono">--ease</td><td class="mono">cubic-bezier(.2,.8,.2,1)</td><td>Every one-shot transition. Loops use linear or ease-in-out.</td></tr>
+    </tbody>
+  </table></div>
+  <h3>Loops</h3>
+  <div class="tblw"><table>
+    <thead><tr><th>Name</th><th>Timing</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">spin</td><td class="mono">1.6 s linear</td><td>Running glyph, Reconnecting dot</td></tr>
+      <tr><td class="mono">breathe</td><td class="mono">2.4 s ease-in-out</td><td>Live connection dot: scale 1 → 1.15 with a 6 px clear-soft ring</td></tr>
+      <tr><td class="mono">pulse</td><td class="mono">1.4 s ease-in-out</td><td>Current pipeline stage dot: 6 px run-soft ring</td></tr>
+      <tr><td class="mono">blink</td><td class="mono">1.2 s ease-in-out</td><td>Running pip (opacity 1 → .35); log cursor at 1 s stepped</td></tr>
+      <tr><td class="mono">rumble</td><td class="mono">1 s linear</td><td>Meter stripes above 70%, background-position 0 → 14 px</td></tr>
+      <tr><td class="mono">throb</td><td class="mono">2.6 s ease-in-out</td><td>Boulder badge: 4 px boulder-soft ring</td></tr>
+      <tr><td class="mono">poll</td><td class="mono">= poll interval</td><td>Section poll ring (SVG stroke-dashoffset 44 → 0) drains over 15 s (PRs), 20 s (CI), 5 s (agents); restart it on each successful poll</td></tr>
+    </tbody>
+  </table></div>
+  <h3>Reduced motion</h3>
+  <p>Both <code>@media (prefers-reduced-motion: reduce)</code> and the in-page <code>.rm</code> class set every duration token to 0 ms and <code>--loop: paused</code>. Loops use <code>animation-play-state: var(--loop)</code> so they freeze at their rest frame; one-shots use <code>animation-duration: var(--t-*)</code> so they jump to their end frame and never leave an element at opacity 0. Opacity cross-fades are allowed to stay at 160 ms if an implementer prefers; nothing else moves.</p>
+  <pre><code>.ck{--t-fast:160ms;--t-med:360ms;--t-slow:700ms;--t-pop:900ms;--t-glow:2600ms;--loop:running}
+.ck.rm{--t-fast:0ms;--t-med:0ms;--t-slow:0ms;--t-pop:0ms;--t-glow:0ms;--loop:paused}
+@media (prefers-reduced-motion:reduce){ .ck{ /* same values as .rm */ } }
+.g-run{animation:spin 1.6s linear infinite;animation-play-state:var(--loop)}
+.ribbon{animation:pop var(--t-pop) var(--ease) both}</code></pre>
+</section>
+
+<section id="components">
+  <h2>Component inventory</h2>
+  <div class="tblw"><table>
+    <thead><tr><th>Component</th><th>Parts</th><th>States</th><th>Used by</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Shell header</strong></td><td>Eyebrow, headline, lede; connection chip; GitHub API meter chip; Updated chip</td><td>Connection: Live (breathing dot), Reconnecting (dashed amber, retry countdown), Offline (boulder dot). API chip: Clear / Speed bump / Boulder by the same 70 / 100% rule</td><td>#1586</td></tr>
+      <tr><td><strong>Section head</strong></td><td>Eyebrow, h2 summary sentence, meta line (source, cadence), poll ring with "polled N s ago", optional action buttons</td><td>Summary counts recompute on every render</td><td>every panel</td></tr>
+      <tr><td><strong>Glyph</strong></td><td>CSS-only shape at 12 / 18 / 30 px (<code>.g</code>, <code>.lg</code>, <code>.xl</code>)</td><td>idle, run, clear, bump, boulder, done, fail</td><td>everywhere</td></tr>
+      <tr><td><strong>Badge</strong></td><td>Soft tint, ink text, leading glyph, mono 11 px</td><td>one per tone; boulder throbs</td><td>rows, cards, dialog</td></tr>
+      <tr><td><strong>Meter</strong></td><td>Value, denominator, track, fill, 70% tick, optional projection tick with label, optional end cap</td><td>Clear, Speed bump (stripes), Boulder (hardened track, cap)</td><td>#1586 API, #1587 requests, #1590 timeout, #1594 all four</td></tr>
+      <tr><td><strong>Mini bar</strong></td><td>6 to 8 px track and fill, no labels</td><td>same tones</td><td>#1587, #1594 per-repo, audit progress</td></tr>
+      <tr><td><strong>Pips</strong></td><td>8 px squares; 7 × 11 px tall for the Codex 10-pip budget</td><td>ok, run (blinks), fail, queued (hollow), skipped, used, bump, boulder, empty</td><td>#1587 checks and Codex budget, #1588 jobs</td></tr>
+      <tr><td><strong>Road ahead</strong></td><td>Strip (line, NOW, horizon labels, numbered markers with lane-packed labels and stems, "+N more"), list (number, glyph, kind, sentence, ETA, source link)</td><td>Clear (single reassurance line), bumps only (amber headline), boulders (count first)</td><td>#1586 shell, fed by every panel</td></tr>
+      <tr><td><strong>Filter chips</strong></td><td>Mono chip with count; "All", hub, each consumer</td><td>on / off</td><td>#1587</td></tr>
+      <tr><td><strong>PR row</strong></td><td>Status badge (+ Merged ribbon), repo #n and title link, author · SHA · draft, merge state and reason, required-check pips with caption, gate labels, per-PR budget strip (in-flight and human-stop flags, "all budgets" disclosure), feedback accounted / posted, CodeRabbit badge, age and last push</td><td>tone by precedence; merged; fresh (slow enter); budgets expanded</td><td>#1587, reused by #1592 for open sync PRs</td></tr>
+      <tr><td><strong>Budget strip</strong></td><td>Five <code>abbr · mini bar · "N left"</code> lines in two columns (blk, req, rnd, 4b, CR), LLM total line, disclosure button</td><td>per budget: Clear, Speed bump (≤ 2 left, striped), Boulder (0 left), Unknown (dashed track, Idle)</td><td>#1587</td></tr>
+      <tr><td><strong>Budget card</strong></td><td>Full budget name, remaining headline ("3 left of 10"), meter with threshold tick and boulder cap, "N used · source"; LLM variant has no track and reads "no cap"</td><td>same tones; card tints with its tone</td><td>#1587 expanded row; the same card can serve a per-PR drawer in #1590</td></tr>
+      <tr><td><strong>Run row</strong></td><td>Toggle button (glyph, workflow, repo #n · SHA, job pips, duration, badge, chevron), flag strip (title, detail, command), drill-down (jobs with step lists, log tail, empty notice)</td><td>Passed, Running, Queued, Queued long, Failed, Stale failure, Not retryable, Token exhausted; open / closed</td><td>#1588</td></tr>
+      <tr><td><strong>Agent card</strong></td><td>Badge, reviewer chip (Claude teal, Codex blue), repo #n, stage pipeline, elapsed-vs-timeout meter with 80% tick, run id · pid · note</td><td>Running, Near timeout (≥ 80%), Timed out, Crashed (pid dead)</td><td>#1590 live, #1589 supplies the data</td></tr>
+      <tr><td><strong>Stage pipeline</strong></td><td>Equal-width stages, dot, connector, label</td><td>done (teal), current (blue, pulsing), todo, crash (boulder)</td><td>#1590 (barrier, adapter, posting, done), #1593 (fetch, diff, branch, commit, PR)</td></tr>
+      <tr><td><strong>History chart and table</strong></td><td>Paired bars per day (Claude solid, Codex striped), per-day values printed under the date (one line per series, in that series' ink, so they never collide with the bars or each other), legend with "est" tag, two totals tiles; table with run, PR, reviewer, verdict badge, tokens, cost, P1 / P2 / P3 chips, elapsed</td><td>Codex rows show "input/output split unavailable" and an est tag; refusals show the exit code</td><td>#1590</td></tr>
+      <tr><td><strong>Fleet row</strong></td><td>Consumer and visibility, status badge (+ error line), hub → consumer SHAs, paths toggle, open sync PR with merge state, last audit (+ stale), Sync button; expandable path list with class chips (canonical, kit, templated) and direction</td><td>In sync, Drift · N paths, Ahead of hub, Override-only, Fetch error, Sync PR open; just-synced glow</td><td>#1592, #1593</td></tr>
+      <tr><td><strong>Audit banner</strong></td><td>Running glyph, sentence, progress mini bar</td><td>shown while the audit runs; disables Sync buttons</td><td>#1592</td></tr>
+      <tr><td><strong>Budget meter card</strong></td><td>Title with denominator, meter or per-repo list, note line</td><td>card tints with its worst tone</td><td>#1594 (spend, GITHUB_TOKEN per repo, CI PAT pool, queue pressure)</td></tr>
+      <tr><td><strong>Queue bar</strong></td><td>Stacked queued (amber) and running (blue) segments scaled to the busiest repo; legend</td><td>jam variant (boulder stripes)</td><td>#1594</td></tr>
+      <tr><td><strong>Sync dialog</strong></td><td>Step indicator, title, stage body, actions</td><td>Preview, Confirm (with ahead checkbox), Running (rails plus streamed log), Done (check burst, PR chips)</td><td>#1593</td></tr>
+      <tr><td><strong>Empty state</strong></td><td>Dashed box, one sentence</td><td>"No Phase 4b run in flight", "No job has started"</td><td>#1588, #1590</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="precedence">
+  <h2>Tone precedence</h2>
+  <p>Each row or card takes the first rule that matches, top to bottom. Sort order inside a list is Boulder, Speed bump, Running, Clear, Idle.</p>
+  <div class="grid2">
+    <div class="card"><h4>PR row</h4><ol>
+      <li>human-hold or policy-violation → Boulder "Human stop"</li>
+      <li>UNSTABLE → Boulder "Unstable"</li>
+      <li>DIRTY → Boulder "Conflicts"</li>
+      <li>any per-PR budget with 0 left → Boulder "Budget spent"</li>
+      <li>any per-PR budget with ≤ 2 left (limits ≥ 5 only) → Speed bump "Budget near"</li>
+      <li>CodeRabbit rate-limited or paused → Speed bump "Rate-limited"</li>
+      <li>BEHIND → Speed bump "Behind main"</li>
+      <li>accounted &lt; posted → Speed bump "Unaccounted"</li>
+      <li>draft → Idle "Draft"</li>
+      <li>CLEAN → Clear "Clean"</li>
+      <li>a required check running or a Codex request in flight → Running</li>
+      <li>otherwise Idle "Waiting"</li>
+    </ol></div>
+    <div class="card"><h4>Run row</h4><ol>
+      <li>failed and not retryable (CodeQL finalize) → Boulder "Not retryable"</li>
+      <li>failed with "API rate limit exceeded for installation" → Boulder "Token exhausted"</li>
+      <li>failed on current HEAD with no later pass → Speed bump "Stale failure" (+ rerun command)</li>
+      <li>failed, superseded → Speed bump "Failed"</li>
+      <li>queued longer than the queue threshold → Speed bump "Queued long"</li>
+      <li>queued → Idle; in progress → Running; success → Clear</li>
+    </ol>
+    <h4>Agent card</h4><ol>
+      <li>pid dead, no done stage → Boulder "Crashed"</li>
+      <li>elapsed ≥ timeout → Boulder "Timed out"</li>
+      <li>elapsed ≥ 80% → Speed bump "Near timeout"</li>
+      <li>otherwise Running</li>
+    </ol></div>
+    <div class="card"><h4>Fleet row</h4><ol>
+      <li>fetch-error → Speed bump, keep the last good result, mark it stale</li>
+      <li>ahead → Speed bump "Ahead of hub"</li>
+      <li>drift → Speed bump "Drift · N paths"</li>
+      <li>open sync PR from this Cockpit → Running "Sync PR open"</li>
+      <li>in-sync, override-only → Clear</li>
+    </ol>
+    <h4>Meters</h4><ol>
+      <li>≥ 100% of the denominator → Boulder</li>
+      <li>≥ 70% → Speed bump</li>
+      <li>otherwise Clear</li>
+      <li>A hard signal (installation rate-limit failure) overrides an estimate and reads "exhausted"</li>
+    </ol>
+    <h4>Queue</h4><ol>
+      <li>stuck (queued ≥ 40 and running ≤ 1 for over 30 min) → Boulder "jammed"</li>
+      <li>queued ≥ 10 → Speed bump</li>
+    </ol></div>
+  </div>
+</section>
+
+<section id="i1586" class="issue">
+  <h3>#1586 Cockpit server and page shell</h3>
+  <dl class="kv">
+    <dt>Components</dt><dd>Shell header (eyebrow, headline, lede), connection chip, GitHub API meter chip, Updated chip, Road ahead (strip and list), five section placeholders with section heads, theme tokens (light and dark), motion tokens, reduced-motion switch.</dd>
+    <dt>States</dt><dd>Connection: Live, Reconnecting (with retry countdown and "data may be stale"), Offline. API meter: Clear / Speed bump / Boulder from <code>X-RateLimit-Remaining</code> and <code>-Limit</code> headers, with the reset time; the chip says "304s are free" so the operator understands why the number moves slowly. Updated: seconds since the last SSE event; cadence caption "hot PR 15 s · idle 2 min".</dd>
+    <dt>Behavior</dt><dd>The page is one root element with class <code>ck</code>; <code>dark</code> and <code>rm</code> toggle on it. Render with <code>textContent</code> only. Every panel registers its road items; the shell merges, sorts and positions them. Panels mount in the order shown in the prototype: Road ahead, Open PRs, CI with Agents beside it, History, Fleet, Actions budget. Fleet and Actions budget are full-width rows (the budget cards sit two per row); at 1400 px no table needs to scroll sideways.</dd>
+    <dt>Prototype note</dt><dd>The dashed "Prototype controls" strip is not product. A theme toggle may ship in the real shell; keep it as a button with <code>aria-pressed</code>.</dd>
+  </dl>
+</section>
+
+<section id="i1587" class="issue">
+  <h3>#1587 Open PRs panel</h3>
+  <dl class="kv">
+    <dt>Components</dt><dd>Section head with summary ("N open · B boulders · S speed bumps · R in progress"), filter chips (All, hub, each consumer, with counts), PR row.</dd>
+    <dt>Row fields</dt><dd>Status badge; repo #n (link), title, author · head SHA · draft; <code>mergeStateStatus</code> in mono caps plus a one-line reason ("BLOCKED · codex-review-check in progress" is the reminder that BLOCKED with an empty reviewDecision usually means a check is still running); required checks as pips (ok, run, fail, queued) with "6 of 7 required passed · 1 running"; gate labels as chips (human-hold and policy-violation in boulder fill, the other two in run tint); the per-PR budget strip (below) with a "request in flight on HEAD" flag and a "human stop" flag; feedback "12 / 14 accounted / posted" in amber when short; CodeRabbit badge (reviewed on HEAD, comment-only, review pending, rate-limited · N min, paused after 5 commits); age and last push.</dd>
+    <dt>Per-PR budgets</dt><dd>Five capped budgets plus an uncapped LLM total, each with the Cockpit's meter-with-denominator pattern. The <strong>remaining</strong> amount is the headline ("3 left of 10"); the used count sits underneath. The fill shows the used share, so a budget fills up as it drains, the same direction as every other meter.
+      <div class="tblw"><table>
+        <thead><tr><th>Budget</th><th>Limit</th><th>Strip label</th><th>Source</th></tr></thead>
+        <tbody>
+          <tr><td>Codex blocking reviews</td><td class="mono">10</td><td class="mono">blk</td><td><code>codex-review-ledger.sh</code></td></tr>
+          <tr><td>Codex requests (the request ceiling)</td><td class="mono">20</td><td class="mono">req</td><td><code>codex-review-ledger.sh</code></td></tr>
+          <tr><td>Codex rounds before automated Phase 4b</td><td class="mono">10</td><td class="mono">rnd</td><td>owner directive · ledger</td></tr>
+          <tr><td>Phase 4b reruns after CHANGES_REQUESTED</td><td class="mono">1</td><td class="mono">4b</td><td>owner directive · <code>phase-4b-loops</code></td></tr>
+          <tr><td>Commits before CodeRabbit auto-pauses</td><td class="mono">5</td><td class="mono">CR</td><td>commits since its last review</td></tr>
+          <tr><td>LLM spend on the PR</td><td>no cap</td><td class="mono">LLM</td><td>ledger totals in tokens and cost; Codex split unavailable, cost estimated and tagged <code>est</code></td></tr>
+        </tbody>
+      </table></div>
+      <strong>Compact strip</strong> (in the row): a two-column grid of five mini meters, each <code>abbr · mini bar · "N left"</code>, with the LLM line beneath ("LLM 310k tokens · $2.40 est · Codex split n/a") and an "all budgets" disclosure button. The strip stays five short lines so the row scans. <strong>Full set</strong> (expanded under the row, on click or keyboard; hover is an acceptable progressive enhancement if it does not shift layout): one budget card per budget with the full name, the remaining headline, the meter with its threshold tick and a boulder cap at zero, "N used · source"; plus an LLM card with no track, marked "no cap".
+      <br><strong>Thresholds</strong>: two or fewer remaining is a Speed bump; zero remaining is a Boulder. For a budget whose limit is below five (the single Phase 4b rerun) the bump stage is skipped, since "two or fewer" would always be true: one left is Clear, zero is Boulder. The threshold tick sits at <code>(limit − 2) / limit</code>, or at 100% for small limits.
+      <br><strong>Unknown</strong>: an unreadable source renders "unknown" in the headline, a dashed empty track, and "source unreadable, nothing guessed" beneath. It carries the Idle tone and never raises a road item.
+      <br><strong>Drain</strong>: fills animate over <code>--t-slow</code>; at the bump stage the mini fill picks up the rumble stripes; at zero the boulder lands on the cap (<code>land</code>, 900 ms). Reduced motion zeroes all of it.</dd>
+    <dt>States</dt><dd>Tone precedence above. Merged: ribbon, glow, confetti, removal after 7 s. Fresh (a PR this session opened): slow enter. Budgets expanded (one row at a time).</dd>
+    <dt>Road items</dt><dd>Boulder rows at NOW. Budgets spent → boulder at NOW naming each spent budget ("Codex rounds before automated Phase 4b 0 left of 10; Phase 4b reruns 0 left of 1. Waiting on the human"). Budget near → bump at ~25 min naming each near budget ("1 of 10 Codex rounds left, 1 of 5 commits before CodeRabbit pauses left"). Rate-limited → bump at the resume time. Behind main → bump at NOW with the update-branch note. Unaccounted → bump at NOW.</dd>
+    <dt>Scenario coverage</dt><dd>Calm: every PR has three or more left on every budget. Speed bumps ahead: friends-and-family-billing #19 has 1 Codex round left and 1 commit before CodeRabbit pauses; swipewatch #88 shows CodeRabbit commits and LLM spend as unknown. Boulder hit: mergepath #1584 has spent its 10 Codex rounds and its single Phase 4b rerun, carries needs-human-review, and waits on the human.</dd>
+    <dt>Links</dt><dd>Row title to the PR; failing check pip to the check; Codex cell to the review thread.</dd>
+  </dl>
+</section>
+
+<section id="i1588" class="issue">
+  <h3>#1588 CI and test runs panel</h3>
+  <dl class="kv">
+    <dt>Components</dt><dd>Section head ("R running · F need attention · N recent", 20 s poll ring), run row with job pips in the header, flag strip, drill-down with job lists, step lists (each <code>check_*</code> is a step: glyph, name, duration), failed-step log tail (<code>FAIL:</code> lines only), empty notice for a run with no jobs yet.</dd>
+    <dt>States</dt><dd>Passed, Running, Queued, Queued long, Failed, Stale failure, Not retryable, Token exhausted. Stale failure shows the exact command: <code>gh run rerun 9088 --failed --repo nathanjohnpayne/swipewatch</code> as copyable text (the Cockpit does not run it; it is read-mostly).</dd>
+    <dt>Motion</dt><dd>A running job pip blinks; when the run concludes the pip and the badge cross-fade in 360 ms; the drill-down enters in 360 ms. Nothing reloads.</dd>
+    <dt>Road items</dt><dd>Not retryable → boulder at NOW ("the PR stays UNSTABLE until CodeQL is fixed at source"). Token exhausted → boulder at NOW, sourced to the Actions budget. Stale failure → bump at NOW.</dd>
+  </dl>
+</section>
+
+<section id="i1589" class="issue">
+  <h3>#1589 Phase 4b run heartbeat</h3>
+  <dl class="kv">
+    <dt>No UI of its own</dt><dd>The heartbeat feeds the agent card. The fields the card reads: <code>run_id</code>, <code>pid</code>, <code>repo</code>, <code>pr</code>, <code>head</code>, <code>reviewer</code>, <code>stage</code> and <code>stage_at</code>, <code>started_at</code>, and on exit <code>exit_code</code>, <code>verdict</code>, <code>token_count</code>, <code>findings_count</code>.</dd>
+    <dt>Derived states</dt><dd>Running (stage not done, pid alive), Crashed (pid dead, no done stage: boulder, the stage it died in is marked), Timed out (elapsed past the adapter timeout: boulder), Done (leaves the live list and appears in history).</dd>
+    <dt>Display</dt><dd>Elapsed is computed client-side from <code>started_at</code> and ticks every second; the timeout denominator comes from the adapter config (840 s shown for Claude, 1,245 s for the Codex max wait). The footer shows run id, pid and the last stage note ("barrier: waiting on the CodeRabbit report for c7b1d04").</dd>
+  </dl>
+</section>
+
+<section id="i1590" class="issue">
+  <h3>#1590 Phase 4b agents and token usage panel</h3>
+  <dl class="kv">
+    <dt>Live</dt><dd>Agent card: badge, reviewer chip, repo #n, four-stage pipeline (barrier, adapter, posting, done), elapsed-vs-timeout meter with the 80% tick, footer. Empty state "No Phase 4b run in flight." Summary "N running · M crashed". 5 s poll ring.</dd>
+    <dt>History</dt><dd>Headline "7 days · N runs · $X across both providers". Paired-bar chart per day, full width above the table: Claude cost (reported, solid teal) beside Codex cost (estimated from prices.json, striped blue, legend carries the <code>est</code> tag), with both values printed under each date. Two totals tiles: Claude with the in / out / cache split and "total_cost_usd from the adapter"; Codex with total tokens, "input/output split unavailable, never imputed", and the estimated cost. Table: run id and time, PR, reviewer chip, verdict badge (APPROVED clear, CHANGES_REQUESTED bump, Cleared · thumbs-up clear, REFUSED · exit N idle), tokens (Codex rows: "61.2k total" plus the unavailable-split caption), cost with <code>est</code> where estimated, P1 / P2 / P3 chips, elapsed.</dd>
+    <dt>Views to add</dt><dd>Per PR (loops and totals) is a filter on the same table: clicking a repo #n in the table narrows it. Per provider and per day is the chart; a provider toggle hides one series.</dd>
+    <dt>Rules</dt><dd>Duplicate <code>run_id</code> across checkouts counts once. An estimated cost always carries the tag. A Codex split is never drawn as 50 / 50 or any other guess.</dd>
+  </dl>
+</section>
+
+<section id="i1591" class="issue">
+  <h3>#1591 sync-to-downstream.sh --audit --json</h3>
+  <dl class="kv">
+    <dt>No UI of its own</dt><dd>The fleet panel consumes exactly the proposed object: <code>name</code>, <code>repo</code>, <code>visibility</code>, baseline <code>ref@sha</code>, <code>status</code> (in-sync, drift, ahead, override-only, fetch-error), <code>paths[]</code> with class (canonical, kit, templated) and direction, <code>open_sync_prs[]</code>.</dd>
+    <dt>Design-facing asks</dt><dd>Direction strings the UI shows verbatim: "hub ahead", "consumer ahead of hub", "re-render differs", "covered by .sync-overrides.yml". A fetch error should carry a short reason ("git fetch exited 128") and the age of the last good result so the row can say "42 min ago · stale".</dd>
+  </dl>
+</section>
+
+<section id="i1592" class="issue">
+  <h3>#1592 Fleet sync status panel</h3>
+  <dl class="kv">
+    <dt>Components</dt><dd>Section head with summary ("S in sync · D drifting · A ahead · P sync PR open · E fetch error"), meta line with source, cadence and the hub SHA, Refresh audit button, Sync all button; audit banner with progress; fleet row; expandable path list with class chips.</dd>
+    <dt>States</dt><dd>In sync, Drift · N paths, Ahead of hub, Override-only, Fetch error (keeps the last good result, "stale" under the audit time), Sync PR open. Audit running: banner shown, Sync buttons disabled, last good rows stay. Audit failed: rows stay, each marked stale.</dd>
+    <dt>Open sync PR cell</dt><dd>Reuses the PR row's merge-state treatment: "#88 BEHIND" in the bump ink. Clicking it filters the PR panel to that repo.</dd>
+    <dt>Road items</dt><dd>Fetch error → bump at NOW. Drift and ahead do not go on the road by themselves; they are work, not obstacles. An ahead consumer becomes a bump inside the sync preview instead.</dd>
+  </dl>
+</section>
+
+<section id="i1593" class="issue">
+  <h3>#1593 Start-sync action</h3>
+  <dl class="kv">
+    <dt>Entry points</dt><dd>Sync button per row (enabled only for drift and ahead; disabled during an audit or another sync) and Sync all (every drift and ahead consumer; in-sync, override-only and fetch-error are listed as skipped in the preview).</dd>
+    <dt>1 · Preview</dt><dd>Shows the dry-run command. A checklist of preconditions with glyphs: hub clean at origin/main (clear), single-flight lock free (clear), an open sync PR exists (bump: Skip or Recreate buttons, default Skip, with "Recreate leaves #88 open; close it yourself"), consumer ahead (bump: "a second confirm is required"), skipped repos (idle). One plan card per target: repo, badge, path list with class chips and direction.</dd>
+    <dt>2 · Confirm</dt><dd>Names the hub SHA and the target repos, says it runs as the author identity through the wrapper, one at a time, logged with operator, time, SHA and repos. If any target is ahead, a checkbox in bump tint must be ticked before Start sync enables. Start is also disabled when every target was skipped.</dd>
+    <dt>3 · Run</dt><dd>One five-stage rail per repo (fetch, diff, branch, commit, PR) driven by the streamed log, plus the log itself in a dark mono box with a blinking cursor and <code>aria-live="polite"</code>. Lines enter in 160 ms.</dd>
+    <dt>Done</dt><dd>Done check with the burst ring, "N sync PRs opened as nathanjohnpayne", PR chips that pop in. Behind the dialog the fleet rows flip to "Sync PR open" with a 2.6 s glow and the PR panel gains fresh rows.</dd>
+    <dt>Refusals</dt><dd>A dirty or non-main hub, a running sync, or a missing CSRF token render in the preview checklist as a boulder line with the reason, and Continue is disabled. They never throw the operator out of the dialog without saying why.</dd>
+  </dl>
+</section>
+
+<section id="i1594" class="issue">
+  <h3>#1594 GitHub Actions budget panel</h3>
+  <dl class="kv">
+    <dt>Components</dt><dd>Section head with summary ("Headroom on every meter" or "B at the limit · S approaching"). Four meter cards, each tinted by its worst tone.</dd>
+    <dt>Spend</dt><dd>"$14.20" of "$25.00 budget · day 19 of 30", net_amount only. Fill at the current spend; a projection tick in bump ink with "proj $22.60" beneath; boulder cap when spend passes the budget. Top spenders list (workflow, repo, dollars). Note line explains the projection or warns that crons dominate. If billing cannot be read, the card says so in one line and the other three cards work.</dd>
+    <dt>GITHUB_TOKEN per repo</dt><dd>One mini bar per repo with "est. 640" (estimate: runs in the last hour × measured requests per run). A run that failed with "API rate limit exceeded for installation" flips that repo to "exhausted", boulder, and the note names the run and the reset time. The denominator reads "1,000 per hour · per repository".</dd>
+    <dt>Shared CI PAT pool</dt><dd>One meter, "3,900 of 5,000 · resets in 22 min", denominator "5,000 per hour · per account · nathanpayne-robot", a note listing which repos drew on it in the last hour. Read from <code>/rate_limit</code> plus the headers on real calls; the note should say when the two disagree.</dd>
+    <dt>Queue pressure</dt><dd>Headline "23 queued · 2 running" with "about 58 min to drain"; stacked bar per repo scaled to the busiest; legend; note. Jam state: "stuck for 1h 12m", boulder stripes, and the 2026-09-30 reminder.</dd>
+    <dt>Road items</dt><dd>Spend projection past budget → boulder at cycle end; within 10% → bump at cycle end. Per-repo token ≥ 70% → bump at the minutes until exhaustion at the current rate; exhausted → boulder at NOW. PAT pool ≥ 70% → bump at the minutes until the limit; ≥ 90% → bump at NOW. Queue ≥ 10 → bump soon; jammed → boulder at NOW.</dd>
+  </dl>
+</section>
+
+<section id="a11y" class="card">
+  <h2>Accessibility checklist</h2>
+  <ul>
+    <li>Every state has a shape and a text label; color is never the only signal. Glyphs are <code>aria-hidden</code>; the label carries the meaning.</li>
+    <li>Ink tokens clear 4.5:1 on the page and on their soft tints in both themes. Caption grey is #656b63 light and #a09c93 dark.</li>
+    <li>Controls are real <code>&lt;button&gt;</code>, <code>&lt;a href&gt;</code> and <code>&lt;input&gt;</code> with <code>&lt;label&gt;</code>; toggles carry <code>aria-pressed</code>, disclosures <code>aria-expanded</code>, the dialog <code>role="dialog" aria-modal="true" aria-labelledby</code>, the connection chip <code>role="status"</code>, the streamed log <code>aria-live="polite"</code>.</li>
+    <li>Focus is visible: 2 px accent outline with 2 px offset.</li>
+    <li>Tables are CSS grids with <code>role="table"</code>, <code>role="row"</code>, <code>role="cell"</code> inside an <code>overflow-x: auto</code> box; the page itself never scrolls sideways.</li>
+    <li>Hit targets in rows are at least 28 px tall and buttons at least 32 px; the sync dialog's primary actions are 36 px.</li>
+    <li>Reduced motion removes all movement and keeps every state change visible. Loops pause at their rest frame; one-shots end at their final frame.</li>
+    <li>Numbers use tabular figures so meters and counts do not jitter as they tick.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+
+</body></html>

@@ -1,0 +1,1535 @@
+{
+ "epic": 1585,
+ "canvas": "https://claude.ai/artifact/LMrtkUuL2tGMSzrsKwSXTS",
+ "spec": "https://claude.ai/artifact/6dPeaYr8mxiwRoR7ARvJiD",
+ "images": [
+  {
+   "path": "images/agents/agents-live-boulder-dark.png",
+   "caption": "Phase 4b agents (live) panel: Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/agents/agents-live-boulder-light.png",
+   "caption": "Phase 4b agents (live) panel: Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/agents/agents-live-bumps-dark.png",
+   "caption": "Phase 4b agents (live) panel: Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/agents/agents-live-bumps-light.png",
+   "caption": "Phase 4b agents (live) panel: Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/agents/agents-live-busy-dark.png",
+   "caption": "Phase 4b agents (live) panel: Busy scenario, dark theme"
+  },
+  {
+   "path": "images/agents/agents-live-busy-light.png",
+   "caption": "Phase 4b agents (live) panel: Busy scenario, light theme"
+  },
+  {
+   "path": "images/agents/agents-live-calm-dark.png",
+   "caption": "Phase 4b agents (live) panel: Calm scenario, dark theme"
+  },
+  {
+   "path": "images/agents/agents-live-calm-light.png",
+   "caption": "Phase 4b agents (live) panel: Calm scenario, light theme"
+  },
+  {
+   "path": "images/agents/history-boulder-dark.png",
+   "caption": "Phase 4b history: chart, totals and run table: Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/agents/history-boulder-light.png",
+   "caption": "Phase 4b history: chart, totals and run table: Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/agents/history-bumps-dark.png",
+   "caption": "Phase 4b history: chart, totals and run table: Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/agents/history-bumps-light.png",
+   "caption": "Phase 4b history: chart, totals and run table: Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/agents/history-busy-dark.png",
+   "caption": "Phase 4b history: chart, totals and run table: Busy scenario, dark theme"
+  },
+  {
+   "path": "images/agents/history-busy-light.png",
+   "caption": "Phase 4b history: chart, totals and run table: Busy scenario, light theme"
+  },
+  {
+   "path": "images/agents/history-calm-dark.png",
+   "caption": "Phase 4b history: chart, totals and run table: Calm scenario, dark theme"
+  },
+  {
+   "path": "images/agents/history-calm-light.png",
+   "caption": "Phase 4b history: chart, totals and run table: Calm scenario, light theme"
+  },
+  {
+   "path": "images/budget/actions-budget-boulder-dark.png",
+   "caption": "GitHub Actions budget panel: Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/budget/actions-budget-boulder-light.png",
+   "caption": "GitHub Actions budget panel: Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/budget/actions-budget-bumps-dark.png",
+   "caption": "GitHub Actions budget panel: Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/budget/actions-budget-bumps-light.png",
+   "caption": "GitHub Actions budget panel: Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/budget/actions-budget-busy-dark.png",
+   "caption": "GitHub Actions budget panel: Busy scenario, dark theme"
+  },
+  {
+   "path": "images/budget/actions-budget-busy-light.png",
+   "caption": "GitHub Actions budget panel: Busy scenario, light theme"
+  },
+  {
+   "path": "images/budget/actions-budget-calm-dark.png",
+   "caption": "GitHub Actions budget panel: Calm scenario, dark theme"
+  },
+  {
+   "path": "images/budget/actions-budget-calm-light.png",
+   "caption": "GitHub Actions budget panel: Calm scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-boulder-run1-dark.png",
+   "caption": "CI drill-down open on \"repo_lint mergepath #1598 · a3f9c21 3m 12s Running\": Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-boulder-run1-light.png",
+   "caption": "CI drill-down open on \"repo_lint mergepath #1598 · a3f9c21 3m 12s Running\": Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-boulder-run2-dark.png",
+   "caption": "CI drill-down open on \"codex-review-check mergepath #1598 · a3f9c21 3m 05s Running\": Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-boulder-run2-light.png",
+   "caption": "CI drill-down open on \"codex-review-check mergepath #1598 · a3f9c21 3m 05s Running\": Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-boulder-run3-dark.png",
+   "caption": "CI drill-down open on \"repo_lint mergepath #1599 · e81b7aa 1m 02s Running\": Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-boulder-run3-light.png",
+   "caption": "CI drill-down open on \"repo_lint mergepath #1599 · e81b7aa 1m 02s Running\": Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-boulder-run4-dark.png",
+   "caption": "CI drill-down open on \"repo_lint matchline #212 · 5d02e8f 4m 41s Passed\": Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-boulder-run4-light.png",
+   "caption": "CI drill-down open on \"repo_lint matchline #212 · 5d02e8f 4m 41s Passed\": Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-boulder-run5-dark.png",
+   "caption": "CI drill-down open on \"repo_lint swipewatch #88 · b44d1c7 3m 58s Stale failure\": Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-boulder-run5-light.png",
+   "caption": "CI drill-down open on \"repo_lint swipewatch #88 · b44d1c7 3m 58s Stale failure\": Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-boulder-run6-dark.png",
+   "caption": "CI drill-down open on \"merge-clearance friends-and-family-billing #19 · c7b1d04 queued 1h 12m Queued long\": Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-boulder-run6-light.png",
+   "caption": "CI drill-down open on \"merge-clearance friends-and-family-billing #19 · c7b1d04 queued 1h 12m Queued long\": Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-boulder-run7-dark.png",
+   "caption": "CI drill-down open on \"codeql overridebroadway #41 · 3e7ab02 11m 20s Not retryable\": Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-boulder-run7-light.png",
+   "caption": "CI drill-down open on \"codeql overridebroadway #41 · 3e7ab02 11m 20s Not retryable\": Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-boulder-run8-dark.png",
+   "caption": "CI drill-down open on \"repo_lint mergepath #1601 · 77a0e13 22s Token exhausted\": Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-boulder-run8-light.png",
+   "caption": "CI drill-down open on \"repo_lint mergepath #1601 · 77a0e13 22s Token exhausted\": Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-bumps-run1-dark.png",
+   "caption": "CI drill-down open on \"repo_lint mergepath #1598 · a3f9c21 3m 12s Running\": Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-bumps-run1-light.png",
+   "caption": "CI drill-down open on \"repo_lint mergepath #1598 · a3f9c21 3m 12s Running\": Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-bumps-run2-dark.png",
+   "caption": "CI drill-down open on \"codex-review-check mergepath #1598 · a3f9c21 3m 05s Running\": Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-bumps-run2-light.png",
+   "caption": "CI drill-down open on \"codex-review-check mergepath #1598 · a3f9c21 3m 05s Running\": Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-bumps-run3-dark.png",
+   "caption": "CI drill-down open on \"repo_lint mergepath #1599 · e81b7aa 1m 02s Running\": Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-bumps-run3-light.png",
+   "caption": "CI drill-down open on \"repo_lint mergepath #1599 · e81b7aa 1m 02s Running\": Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-bumps-run4-dark.png",
+   "caption": "CI drill-down open on \"repo_lint matchline #212 · 5d02e8f 4m 41s Passed\": Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-bumps-run4-light.png",
+   "caption": "CI drill-down open on \"repo_lint matchline #212 · 5d02e8f 4m 41s Passed\": Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-bumps-run5-dark.png",
+   "caption": "CI drill-down open on \"repo_lint swipewatch #88 · b44d1c7 3m 58s Stale failure\": Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-bumps-run5-light.png",
+   "caption": "CI drill-down open on \"repo_lint swipewatch #88 · b44d1c7 3m 58s Stale failure\": Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-bumps-run6-dark.png",
+   "caption": "CI drill-down open on \"merge-clearance friends-and-family-billing #19 · c7b1d04 queued 18m Queued long\": Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-bumps-run6-light.png",
+   "caption": "CI drill-down open on \"merge-clearance friends-and-family-billing #19 · c7b1d04 queued 18m Queued long\": Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-busy-run1-dark.png",
+   "caption": "CI drill-down open on \"repo_lint mergepath #1598 · a3f9c21 3m 12s Running\": Busy scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-busy-run1-light.png",
+   "caption": "CI drill-down open on \"repo_lint mergepath #1598 · a3f9c21 3m 12s Running\": Busy scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-busy-run2-dark.png",
+   "caption": "CI drill-down open on \"codex-review-check mergepath #1598 · a3f9c21 3m 05s Running\": Busy scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-busy-run2-light.png",
+   "caption": "CI drill-down open on \"codex-review-check mergepath #1598 · a3f9c21 3m 05s Running\": Busy scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-busy-run3-dark.png",
+   "caption": "CI drill-down open on \"repo_lint mergepath #1599 · e81b7aa 1m 02s Running\": Busy scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-busy-run3-light.png",
+   "caption": "CI drill-down open on \"repo_lint mergepath #1599 · e81b7aa 1m 02s Running\": Busy scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-busy-run4-dark.png",
+   "caption": "CI drill-down open on \"repo_lint matchline #212 · 5d02e8f 4m 41s Passed\": Busy scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-busy-run4-light.png",
+   "caption": "CI drill-down open on \"repo_lint matchline #212 · 5d02e8f 4m 41s Passed\": Busy scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-busy-run5-dark.png",
+   "caption": "CI drill-down open on \"codeql overridebroadway #41 · 3e7ab02 6m 40s Running\": Busy scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-busy-run5-light.png",
+   "caption": "CI drill-down open on \"codeql overridebroadway #41 · 3e7ab02 6m 40s Running\": Busy scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-busy-run6-dark.png",
+   "caption": "CI drill-down open on \"merge-clearance nathanpaynedotcom #137 · 91c3f50 48s Running\": Busy scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-busy-run6-light.png",
+   "caption": "CI drill-down open on \"merge-clearance nathanpaynedotcom #137 · 91c3f50 48s Running\": Busy scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-busy-run7-dark.png",
+   "caption": "CI drill-down open on \"repo_lint tadlockpsychiatry #7 · 0f4c9d2 3m 02s Passed\": Busy scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-busy-run7-light.png",
+   "caption": "CI drill-down open on \"repo_lint tadlockpsychiatry #7 · 0f4c9d2 3m 02s Passed\": Busy scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-calm-run1-dark.png",
+   "caption": "CI drill-down open on \"repo_lint mergepath #1598 · a3f9c21 3m 12s Running\": Calm scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-calm-run1-light.png",
+   "caption": "CI drill-down open on \"repo_lint mergepath #1598 · a3f9c21 3m 12s Running\": Calm scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-calm-run2-dark.png",
+   "caption": "CI drill-down open on \"codex-review-check mergepath #1598 · a3f9c21 3m 05s Running\": Calm scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-calm-run2-light.png",
+   "caption": "CI drill-down open on \"codex-review-check mergepath #1598 · a3f9c21 3m 05s Running\": Calm scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-calm-run3-dark.png",
+   "caption": "CI drill-down open on \"repo_lint mergepath #1599 · e81b7aa 1m 02s Running\": Calm scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-calm-run3-light.png",
+   "caption": "CI drill-down open on \"repo_lint mergepath #1599 · e81b7aa 1m 02s Running\": Calm scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-calm-run4-dark.png",
+   "caption": "CI drill-down open on \"repo_lint matchline #212 · 5d02e8f 4m 41s Passed\": Calm scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-drilldown-calm-run4-light.png",
+   "caption": "CI drill-down open on \"repo_lint matchline #212 · 5d02e8f 4m 41s Passed\": Calm scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-runs-boulder-dark.png",
+   "caption": "CI and test runs panel, all rows collapsed: Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-runs-boulder-light.png",
+   "caption": "CI and test runs panel, all rows collapsed: Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-runs-bumps-dark.png",
+   "caption": "CI and test runs panel, all rows collapsed: Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-runs-bumps-light.png",
+   "caption": "CI and test runs panel, all rows collapsed: Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-runs-busy-dark.png",
+   "caption": "CI and test runs panel, all rows collapsed: Busy scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-runs-busy-light.png",
+   "caption": "CI and test runs panel, all rows collapsed: Busy scenario, light theme"
+  },
+  {
+   "path": "images/ci/ci-runs-calm-dark.png",
+   "caption": "CI and test runs panel, all rows collapsed: Calm scenario, dark theme"
+  },
+  {
+   "path": "images/ci/ci-runs-calm-light.png",
+   "caption": "CI and test runs panel, all rows collapsed: Calm scenario, light theme"
+  },
+  {
+   "path": "images/fleet/audit-finished-bumps-dark.png",
+   "caption": "Audit finished: banner gone, last-audit column reads \"just now\" (Speed bumps ahead, dark)"
+  },
+  {
+   "path": "images/fleet/audit-finished-bumps-light.png",
+   "caption": "Audit finished: banner gone, last-audit column reads \"just now\" (Speed bumps ahead, light)"
+  },
+  {
+   "path": "images/fleet/audit-running-bumps-dark.png",
+   "caption": "Refresh audit in progress: audit banner with progress bar, Sync buttons disabled, last good result kept (Speed bumps ahead, dark)"
+  },
+  {
+   "path": "images/fleet/audit-running-bumps-light.png",
+   "caption": "Refresh audit in progress: audit banner with progress bar, Sync buttons disabled, last good result kept (Speed bumps ahead, light)"
+  },
+  {
+   "path": "images/fleet/fleet-boulder-dark.png",
+   "caption": "Fleet sync status panel: Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-boulder-light.png",
+   "caption": "Fleet sync status panel: Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/fleet/fleet-bumps-dark.png",
+   "caption": "Fleet sync status panel: Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-bumps-light.png",
+   "caption": "Fleet sync status panel: Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/fleet/fleet-busy-dark.png",
+   "caption": "Fleet sync status panel: Busy scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-busy-light.png",
+   "caption": "Fleet sync status panel: Busy scenario, light theme"
+  },
+  {
+   "path": "images/fleet/fleet-calm-dark.png",
+   "caption": "Fleet sync status panel: Calm scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-calm-light.png",
+   "caption": "Fleet sync status panel: Calm scenario, light theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-boulder-row1-dark.png",
+   "caption": "Fleet row path list expanded (swipewatch): Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-boulder-row1-light.png",
+   "caption": "Fleet row path list expanded (swipewatch): Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-boulder-row2-dark.png",
+   "caption": "Fleet row path list expanded (overridebroadway): Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-boulder-row2-light.png",
+   "caption": "Fleet row path list expanded (overridebroadway): Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-boulder-row3-dark.png",
+   "caption": "Fleet row path list expanded (nathanpaynedotcom): Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-boulder-row3-light.png",
+   "caption": "Fleet row path list expanded (nathanpaynedotcom): Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-boulder-row4-dark.png",
+   "caption": "Fleet row path list expanded (friends-and-family-billing): Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-boulder-row4-light.png",
+   "caption": "Fleet row path list expanded (friends-and-family-billing): Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-bumps-row1-dark.png",
+   "caption": "Fleet row path list expanded (swipewatch): Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-bumps-row1-light.png",
+   "caption": "Fleet row path list expanded (swipewatch): Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-bumps-row2-dark.png",
+   "caption": "Fleet row path list expanded (overridebroadway): Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-bumps-row2-light.png",
+   "caption": "Fleet row path list expanded (overridebroadway): Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-bumps-row3-dark.png",
+   "caption": "Fleet row path list expanded (nathanpaynedotcom): Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-bumps-row3-light.png",
+   "caption": "Fleet row path list expanded (nathanpaynedotcom): Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-bumps-row4-dark.png",
+   "caption": "Fleet row path list expanded (friends-and-family-billing): Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-bumps-row4-light.png",
+   "caption": "Fleet row path list expanded (friends-and-family-billing): Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-busy-row1-dark.png",
+   "caption": "Fleet row path list expanded (swipewatch): Busy scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-busy-row1-light.png",
+   "caption": "Fleet row path list expanded (swipewatch): Busy scenario, light theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-busy-row2-dark.png",
+   "caption": "Fleet row path list expanded (overridebroadway): Busy scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-busy-row2-light.png",
+   "caption": "Fleet row path list expanded (overridebroadway): Busy scenario, light theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-busy-row3-dark.png",
+   "caption": "Fleet row path list expanded (nathanpaynedotcom): Busy scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-busy-row3-light.png",
+   "caption": "Fleet row path list expanded (nathanpaynedotcom): Busy scenario, light theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-busy-row4-dark.png",
+   "caption": "Fleet row path list expanded (friends-and-family-billing): Busy scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-busy-row4-light.png",
+   "caption": "Fleet row path list expanded (friends-and-family-billing): Busy scenario, light theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-calm-row1-dark.png",
+   "caption": "Fleet row path list expanded (swipewatch): Calm scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-calm-row1-light.png",
+   "caption": "Fleet row path list expanded (swipewatch): Calm scenario, light theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-calm-row2-dark.png",
+   "caption": "Fleet row path list expanded (overridebroadway): Calm scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-calm-row2-light.png",
+   "caption": "Fleet row path list expanded (overridebroadway): Calm scenario, light theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-calm-row3-dark.png",
+   "caption": "Fleet row path list expanded (nathanpaynedotcom): Calm scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-calm-row3-light.png",
+   "caption": "Fleet row path list expanded (nathanpaynedotcom): Calm scenario, light theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-calm-row4-dark.png",
+   "caption": "Fleet row path list expanded (friends-and-family-billing): Calm scenario, dark theme"
+  },
+  {
+   "path": "images/fleet/fleet-paths-calm-row4-light.png",
+   "caption": "Fleet row path list expanded (friends-and-family-billing): Calm scenario, light theme"
+  },
+  {
+   "path": "images/overview/cockpit-boulder-dark.png",
+   "caption": "Whole Cockpit page at 1x (layout map): Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/overview/cockpit-boulder-light.png",
+   "caption": "Whole Cockpit page at 1x (layout map): Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/overview/cockpit-bumps-dark.png",
+   "caption": "Whole Cockpit page at 1x (layout map): Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/overview/cockpit-bumps-light.png",
+   "caption": "Whole Cockpit page at 1x (layout map): Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/overview/cockpit-busy-dark.png",
+   "caption": "Whole Cockpit page at 1x (layout map): Busy scenario, dark theme"
+  },
+  {
+   "path": "images/overview/cockpit-busy-light.png",
+   "caption": "Whole Cockpit page at 1x (layout map): Busy scenario, light theme"
+  },
+  {
+   "path": "images/overview/cockpit-calm-dark.png",
+   "caption": "Whole Cockpit page at 1x (layout map): Calm scenario, dark theme"
+  },
+  {
+   "path": "images/overview/cockpit-calm-light.png",
+   "caption": "Whole Cockpit page at 1x (layout map): Calm scenario, light theme"
+  },
+  {
+   "path": "images/phone/cockpit-390px-boulder-dark-part01of9.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Boulder hit scenario, dark theme (part 1 of 9, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-boulder-dark-part02of9.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Boulder hit scenario, dark theme (part 2 of 9, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-boulder-dark-part03of9.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Boulder hit scenario, dark theme (part 3 of 9, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-boulder-dark-part04of9.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Boulder hit scenario, dark theme (part 4 of 9, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-boulder-dark-part05of9.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Boulder hit scenario, dark theme (part 5 of 9, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-boulder-dark-part06of9.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Boulder hit scenario, dark theme (part 6 of 9, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-boulder-dark-part07of9.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Boulder hit scenario, dark theme (part 7 of 9, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-boulder-dark-part08of9.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Boulder hit scenario, dark theme (part 8 of 9, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-boulder-dark-part09of9.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Boulder hit scenario, dark theme (part 9 of 9, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-boulder-light-part01of9.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Boulder hit scenario, light theme (part 1 of 9, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-boulder-light-part02of9.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Boulder hit scenario, light theme (part 2 of 9, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-boulder-light-part03of9.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Boulder hit scenario, light theme (part 3 of 9, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-boulder-light-part04of9.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Boulder hit scenario, light theme (part 4 of 9, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-boulder-light-part05of9.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Boulder hit scenario, light theme (part 5 of 9, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-boulder-light-part06of9.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Boulder hit scenario, light theme (part 6 of 9, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-boulder-light-part07of9.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Boulder hit scenario, light theme (part 7 of 9, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-boulder-light-part08of9.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Boulder hit scenario, light theme (part 8 of 9, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-boulder-light-part09of9.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Boulder hit scenario, light theme (part 9 of 9, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-bumps-dark-part01of8.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Speed bumps ahead scenario, dark theme (part 1 of 8, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-bumps-dark-part02of8.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Speed bumps ahead scenario, dark theme (part 2 of 8, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-bumps-dark-part03of8.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Speed bumps ahead scenario, dark theme (part 3 of 8, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-bumps-dark-part04of8.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Speed bumps ahead scenario, dark theme (part 4 of 8, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-bumps-dark-part05of8.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Speed bumps ahead scenario, dark theme (part 5 of 8, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-bumps-dark-part06of8.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Speed bumps ahead scenario, dark theme (part 6 of 8, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-bumps-dark-part07of8.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Speed bumps ahead scenario, dark theme (part 7 of 8, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-bumps-dark-part08of8.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Speed bumps ahead scenario, dark theme (part 8 of 8, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-bumps-light-part01of8.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Speed bumps ahead scenario, light theme (part 1 of 8, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-bumps-light-part02of8.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Speed bumps ahead scenario, light theme (part 2 of 8, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-bumps-light-part03of8.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Speed bumps ahead scenario, light theme (part 3 of 8, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-bumps-light-part04of8.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Speed bumps ahead scenario, light theme (part 4 of 8, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-bumps-light-part05of8.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Speed bumps ahead scenario, light theme (part 5 of 8, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-bumps-light-part06of8.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Speed bumps ahead scenario, light theme (part 6 of 8, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-bumps-light-part07of8.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Speed bumps ahead scenario, light theme (part 7 of 8, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/phone/cockpit-390px-bumps-light-part08of8.png",
+   "caption": "Phone width (390 px): whole Cockpit page, Speed bumps ahead scenario, light theme (part 8 of 8, top to bottom, 40 px overlap)"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row1-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 1 (Conflicts mergepath #1601 docs(agents): cockpit operating notes); other rows hidden for the crop: Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row1-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 1 (Conflicts mergepath #1601 docs(agents): cockpit operating notes); other rows hidden for the crop: Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row10-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 10 (Clean matchline #212 sync: review policy and ci kit 2026-10-01); other rows hidden for the crop: Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row10-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 10 (Clean matchline #212 sync: review policy and ci kit 2026-10-01); other rows hidden for the crop: Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row2-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 2 (Budget spent mergepath #1584 fix(codex-request): blocking-review budge); other rows hidden for the crop: Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row2-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 2 (Budget spent mergepath #1584 fix(codex-request): blocking-review budge); other rows hidden for the crop: Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row3-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 3 (Human stop nathanpaynedotcom #137 feat(blog): reading time and series ); other rows hidden for the crop: Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row3-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 3 (Human stop nathanpaynedotcom #137 feat(blog): reading time and series ); other rows hidden for the crop: Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row4-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 4 (Unstable overridebroadway #41 fix(auth): session cookie SameSite); other rows hidden for the crop: Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row4-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 4 (Unstable overridebroadway #41 fix(auth): session cookie SameSite); other rows hidden for the crop: Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row5-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 5 (Unaccounted mergepath #1598 feat(cockpit): server shell, SSE stream an); other rows hidden for the crop: Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row5-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 5 (Unaccounted mergepath #1598 feat(cockpit): server shell, SSE stream an); other rows hidden for the crop: Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row6-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 6 (Budget near friends-and-family-billing #19 fix(invoice): proration rou); other rows hidden for the crop: Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row6-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 6 (Budget near friends-and-family-billing #19 fix(invoice): proration rou); other rows hidden for the crop: Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row7-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 7 (Rate-limited tadlockpsychiatry #7 chore: bump ci kit to hub 9a8fcdf); other rows hidden for the crop: Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row7-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 7 (Rate-limited tadlockpsychiatry #7 chore: bump ci kit to hub 9a8fcdf); other rows hidden for the crop: Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row8-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 8 (Behind main swipewatch #88 sync: review policy and ci kit 2026-10-01); other rows hidden for the crop: Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row8-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 8 (Behind main swipewatch #88 sync: review policy and ci kit 2026-10-01); other rows hidden for the crop: Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row9-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 9 (In progress mergepath #1599 test(cockpit): hermetic server suite and c); other rows hidden for the crop: Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-boulder-row9-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 9 (In progress mergepath #1599 test(cockpit): hermetic server suite and c); other rows hidden for the crop: Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-bumps-row1-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 1 (Unaccounted mergepath #1598 feat(cockpit): server shell, SSE stream an); other rows hidden for the crop: Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-bumps-row1-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 1 (Unaccounted mergepath #1598 feat(cockpit): server shell, SSE stream an); other rows hidden for the crop: Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-bumps-row2-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 2 (Budget near friends-and-family-billing #19 fix(invoice): proration rou); other rows hidden for the crop: Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-bumps-row2-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 2 (Budget near friends-and-family-billing #19 fix(invoice): proration rou); other rows hidden for the crop: Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-bumps-row3-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 3 (Rate-limited tadlockpsychiatry #7 chore: bump ci kit to hub 9a8fcdf); other rows hidden for the crop: Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-bumps-row3-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 3 (Rate-limited tadlockpsychiatry #7 chore: bump ci kit to hub 9a8fcdf); other rows hidden for the crop: Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-bumps-row4-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 4 (Behind main swipewatch #88 sync: review policy and ci kit 2026-10-01); other rows hidden for the crop: Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-bumps-row4-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 4 (Behind main swipewatch #88 sync: review policy and ci kit 2026-10-01); other rows hidden for the crop: Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-bumps-row5-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 5 (In progress mergepath #1599 test(cockpit): hermetic server suite and c); other rows hidden for the crop: Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-bumps-row5-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 5 (In progress mergepath #1599 test(cockpit): hermetic server suite and c); other rows hidden for the crop: Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-bumps-row6-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 6 (Clean matchline #212 sync: review policy and ci kit 2026-10-01); other rows hidden for the crop: Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-bumps-row6-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 6 (Clean matchline #212 sync: review policy and ci kit 2026-10-01); other rows hidden for the crop: Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-busy-row1-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 1 (In progress mergepath #1598 feat(cockpit): server shell, SSE stream an); other rows hidden for the crop: Busy scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-busy-row1-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 1 (In progress mergepath #1598 feat(cockpit): server shell, SSE stream an); other rows hidden for the crop: Busy scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-busy-row2-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 2 (In progress mergepath #1599 test(cockpit): hermetic server suite and c); other rows hidden for the crop: Busy scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-busy-row2-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 2 (In progress mergepath #1599 test(cockpit): hermetic server suite and c); other rows hidden for the crop: Busy scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-busy-row3-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 3 (In progress friends-and-family-billing #19 fix(invoice): proration rou); other rows hidden for the crop: Busy scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-busy-row3-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 3 (In progress friends-and-family-billing #19 fix(invoice): proration rou); other rows hidden for the crop: Busy scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-busy-row4-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 4 (In progress overridebroadway #41 fix(auth): session cookie SameSite); other rows hidden for the crop: Busy scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-busy-row4-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 4 (In progress overridebroadway #41 fix(auth): session cookie SameSite); other rows hidden for the crop: Busy scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-busy-row5-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 5 (In progress nathanpaynedotcom #137 feat(blog): reading time and series); other rows hidden for the crop: Busy scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-busy-row5-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 5 (In progress nathanpaynedotcom #137 feat(blog): reading time and series); other rows hidden for the crop: Busy scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-busy-row6-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 6 (Clean matchline #212 sync: review policy and ci kit 2026-10-01); other rows hidden for the crop: Busy scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-busy-row6-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 6 (Clean matchline #212 sync: review policy and ci kit 2026-10-01); other rows hidden for the crop: Busy scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-busy-row7-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 7 (Clean tadlockpsychiatry #7 chore: bump ci kit to hub 9a8fcdf); other rows hidden for the crop: Busy scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-busy-row7-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 7 (Clean tadlockpsychiatry #7 chore: bump ci kit to hub 9a8fcdf); other rows hidden for the crop: Busy scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-busy-row8-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 8 (Draft mergepath #1601 docs(agents): cockpit operating notes); other rows hidden for the crop: Busy scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-busy-row8-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 8 (Draft mergepath #1601 docs(agents): cockpit operating notes); other rows hidden for the crop: Busy scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-calm-row1-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 1 (In progress mergepath #1598 feat(cockpit): server shell, SSE stream an); other rows hidden for the crop: Calm scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-calm-row1-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 1 (In progress mergepath #1598 feat(cockpit): server shell, SSE stream an); other rows hidden for the crop: Calm scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-calm-row2-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 2 (In progress mergepath #1599 test(cockpit): hermetic server suite and c); other rows hidden for the crop: Calm scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-calm-row2-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 2 (In progress mergepath #1599 test(cockpit): hermetic server suite and c); other rows hidden for the crop: Calm scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-calm-row3-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 3 (In progress friends-and-family-billing #19 fix(invoice): proration rou); other rows hidden for the crop: Calm scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-calm-row3-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 3 (In progress friends-and-family-billing #19 fix(invoice): proration rou); other rows hidden for the crop: Calm scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-calm-row4-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 4 (Clean matchline #212 sync: review policy and ci kit 2026-10-01); other rows hidden for the crop: Calm scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-calm-row4-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 4 (Clean matchline #212 sync: review policy and ci kit 2026-10-01); other rows hidden for the crop: Calm scenario, light theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-calm-row5-dark.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 5 (Clean tadlockpsychiatry #7 chore: bump ci kit to hub 9a8fcdf); other rows hidden for the crop: Calm scenario, dark theme"
+  },
+  {
+   "path": "images/prs/budgets-expanded-calm-row5-light.png",
+   "caption": "Open PRs, \"all budgets\" expanded on row 5 (Clean tadlockpsychiatry #7 chore: bump ci kit to hub 9a8fcdf); other rows hidden for the crop: Calm scenario, light theme"
+  },
+  {
+   "path": "images/prs/filter-hub-busy-dark.png",
+   "caption": "Open PRs filtered to the hub (filter chip \"mergepath (hub)\" on): Busy scenario, dark theme"
+  },
+  {
+   "path": "images/prs/filter-hub-busy-light.png",
+   "caption": "Open PRs filtered to the hub (filter chip \"mergepath (hub)\" on): Busy scenario, light theme"
+  },
+  {
+   "path": "images/prs/merge-reward-450ms-calm-dark.png",
+   "caption": "Simulate a merge, 450 ms in: Merged ribbon popping, row glow and confetti drift (Calm, dark)"
+  },
+  {
+   "path": "images/prs/merge-reward-450ms-calm-light.png",
+   "caption": "Simulate a merge, 450 ms in: Merged ribbon popping, row glow and confetti drift (Calm, light)"
+  },
+  {
+   "path": "images/prs/merge-reward-settled-calm-dark.png",
+   "caption": "Simulate a merge, 1.6 s in: ribbon settled, glow fading; the row leaves after 7 s (Calm, dark)"
+  },
+  {
+   "path": "images/prs/merge-reward-settled-calm-light.png",
+   "caption": "Simulate a merge, 1.6 s in: ribbon settled, glow fading; the row leaves after 7 s (Calm, light)"
+  },
+  {
+   "path": "images/prs/merge-row-removed-calm-dark.png",
+   "caption": "Simulate a merge, after 8 s: merged row removed and summary recounted (Calm, dark)"
+  },
+  {
+   "path": "images/prs/merge-row-removed-calm-light.png",
+   "caption": "Simulate a merge, after 8 s: merged row removed and summary recounted (Calm, light)"
+  },
+  {
+   "path": "images/prs/open-prs-boulder-dark.png",
+   "caption": "Open PRs panel: Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/prs/open-prs-boulder-light.png",
+   "caption": "Open PRs panel: Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/prs/open-prs-bumps-dark.png",
+   "caption": "Open PRs panel: Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/prs/open-prs-bumps-light.png",
+   "caption": "Open PRs panel: Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/prs/open-prs-busy-dark.png",
+   "caption": "Open PRs panel: Busy scenario, dark theme"
+  },
+  {
+   "path": "images/prs/open-prs-busy-light.png",
+   "caption": "Open PRs panel: Busy scenario, light theme"
+  },
+  {
+   "path": "images/prs/open-prs-calm-dark.png",
+   "caption": "Open PRs panel: Calm scenario, dark theme"
+  },
+  {
+   "path": "images/prs/open-prs-calm-light.png",
+   "caption": "Open PRs panel: Calm scenario, light theme"
+  },
+  {
+   "path": "images/shell/header-boulder-dark.png",
+   "caption": "Shell header (connection, GitHub API meter, Updated chips): Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/shell/header-boulder-light.png",
+   "caption": "Shell header (connection, GitHub API meter, Updated chips): Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/shell/header-bumps-dark.png",
+   "caption": "Shell header (connection, GitHub API meter, Updated chips): Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/shell/header-bumps-light.png",
+   "caption": "Shell header (connection, GitHub API meter, Updated chips): Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/shell/header-busy-dark.png",
+   "caption": "Shell header (connection, GitHub API meter, Updated chips): Busy scenario, dark theme"
+  },
+  {
+   "path": "images/shell/header-busy-light.png",
+   "caption": "Shell header (connection, GitHub API meter, Updated chips): Busy scenario, light theme"
+  },
+  {
+   "path": "images/shell/header-calm-dark.png",
+   "caption": "Shell header (connection, GitHub API meter, Updated chips): Calm scenario, dark theme"
+  },
+  {
+   "path": "images/shell/header-calm-light.png",
+   "caption": "Shell header (connection, GitHub API meter, Updated chips): Calm scenario, light theme"
+  },
+  {
+   "path": "images/shell/prototype-controls-calm-dark.png",
+   "caption": "Prototype controls strip (not product): Calm scenario, dark theme"
+  },
+  {
+   "path": "images/shell/prototype-controls-calm-light.png",
+   "caption": "Prototype controls strip (not product): Calm scenario, light theme"
+  },
+  {
+   "path": "images/shell/road-ahead-boulder-dark.png",
+   "caption": "Road ahead strip and list: Boulder hit scenario, dark theme"
+  },
+  {
+   "path": "images/shell/road-ahead-boulder-light.png",
+   "caption": "Road ahead strip and list: Boulder hit scenario, light theme"
+  },
+  {
+   "path": "images/shell/road-ahead-bumps-dark.png",
+   "caption": "Road ahead strip and list: Speed bumps ahead scenario, dark theme"
+  },
+  {
+   "path": "images/shell/road-ahead-bumps-light.png",
+   "caption": "Road ahead strip and list: Speed bumps ahead scenario, light theme"
+  },
+  {
+   "path": "images/shell/road-ahead-busy-dark.png",
+   "caption": "Road ahead strip and list: Busy scenario, dark theme"
+  },
+  {
+   "path": "images/shell/road-ahead-busy-light.png",
+   "caption": "Road ahead strip and list: Busy scenario, light theme"
+  },
+  {
+   "path": "images/shell/road-ahead-calm-dark.png",
+   "caption": "Road ahead strip and list: Calm scenario, dark theme"
+  },
+  {
+   "path": "images/shell/road-ahead-calm-light.png",
+   "caption": "Road ahead strip and list: Calm scenario, light theme"
+  },
+  {
+   "path": "images/spec/spec-a11y-dark.png",
+   "caption": "Design spec section \"a11y\", dark theme"
+  },
+  {
+   "path": "images/spec/spec-a11y-light.png",
+   "caption": "Design spec section \"a11y\", light theme"
+  },
+  {
+   "path": "images/spec/spec-color-dark-part1of2.png",
+   "caption": "Design spec section \"color\", dark theme (part 1 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/spec/spec-color-dark-part2of2.png",
+   "caption": "Design spec section \"color\", dark theme (part 2 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/spec/spec-color-light-part1of2.png",
+   "caption": "Design spec section \"color\", light theme (part 1 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/spec/spec-color-light-part2of2.png",
+   "caption": "Design spec section \"color\", light theme (part 2 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/spec/spec-components-dark-part1of2.png",
+   "caption": "Design spec section \"components\", dark theme (part 1 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/spec/spec-components-dark-part2of2.png",
+   "caption": "Design spec section \"components\", dark theme (part 2 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/spec/spec-components-light-part1of2.png",
+   "caption": "Design spec section \"components\", light theme (part 1 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/spec/spec-components-light-part2of2.png",
+   "caption": "Design spec section \"components\", light theme (part 2 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/spec/spec-decisions-dark.png",
+   "caption": "Design spec section \"decisions\", dark theme"
+  },
+  {
+   "path": "images/spec/spec-decisions-light.png",
+   "caption": "Design spec section \"decisions\", light theme"
+  },
+  {
+   "path": "images/spec/spec-i1586-dark.png",
+   "caption": "Design spec section \"i1586\", dark theme"
+  },
+  {
+   "path": "images/spec/spec-i1586-light.png",
+   "caption": "Design spec section \"i1586\", light theme"
+  },
+  {
+   "path": "images/spec/spec-i1587-dark.png",
+   "caption": "Design spec section \"i1587\", dark theme"
+  },
+  {
+   "path": "images/spec/spec-i1587-light.png",
+   "caption": "Design spec section \"i1587\", light theme"
+  },
+  {
+   "path": "images/spec/spec-i1588-dark.png",
+   "caption": "Design spec section \"i1588\", dark theme"
+  },
+  {
+   "path": "images/spec/spec-i1588-light.png",
+   "caption": "Design spec section \"i1588\", light theme"
+  },
+  {
+   "path": "images/spec/spec-i1589-dark.png",
+   "caption": "Design spec section \"i1589\", dark theme"
+  },
+  {
+   "path": "images/spec/spec-i1589-light.png",
+   "caption": "Design spec section \"i1589\", light theme"
+  },
+  {
+   "path": "images/spec/spec-i1590-dark.png",
+   "caption": "Design spec section \"i1590\", dark theme"
+  },
+  {
+   "path": "images/spec/spec-i1590-light.png",
+   "caption": "Design spec section \"i1590\", light theme"
+  },
+  {
+   "path": "images/spec/spec-i1591-dark.png",
+   "caption": "Design spec section \"i1591\", dark theme"
+  },
+  {
+   "path": "images/spec/spec-i1591-light.png",
+   "caption": "Design spec section \"i1591\", light theme"
+  },
+  {
+   "path": "images/spec/spec-i1592-dark.png",
+   "caption": "Design spec section \"i1592\", dark theme"
+  },
+  {
+   "path": "images/spec/spec-i1592-light.png",
+   "caption": "Design spec section \"i1592\", light theme"
+  },
+  {
+   "path": "images/spec/spec-i1593-dark.png",
+   "caption": "Design spec section \"i1593\", dark theme"
+  },
+  {
+   "path": "images/spec/spec-i1593-light.png",
+   "caption": "Design spec section \"i1593\", light theme"
+  },
+  {
+   "path": "images/spec/spec-i1594-dark.png",
+   "caption": "Design spec section \"i1594\", dark theme"
+  },
+  {
+   "path": "images/spec/spec-i1594-light.png",
+   "caption": "Design spec section \"i1594\", light theme"
+  },
+  {
+   "path": "images/spec/spec-language-dark-part1of2.png",
+   "caption": "Design spec section \"language\", dark theme (part 1 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/spec/spec-language-dark-part2of2.png",
+   "caption": "Design spec section \"language\", dark theme (part 2 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/spec/spec-language-light-part1of2.png",
+   "caption": "Design spec section \"language\", light theme (part 1 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/spec/spec-language-light-part2of2.png",
+   "caption": "Design spec section \"language\", light theme (part 2 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/spec/spec-motion-dark.png",
+   "caption": "Design spec section \"motion\", dark theme"
+  },
+  {
+   "path": "images/spec/spec-motion-light.png",
+   "caption": "Design spec section \"motion\", light theme"
+  },
+  {
+   "path": "images/spec/spec-overview-dark.png",
+   "caption": "Design spec section \"overview\", dark theme"
+  },
+  {
+   "path": "images/spec/spec-overview-light.png",
+   "caption": "Design spec section \"overview\", light theme"
+  },
+  {
+   "path": "images/spec/spec-precedence-dark.png",
+   "caption": "Design spec section \"precedence\", dark theme"
+  },
+  {
+   "path": "images/spec/spec-precedence-light.png",
+   "caption": "Design spec section \"precedence\", light theme"
+  },
+  {
+   "path": "images/status-language/status-language-sheet-part1of2.png",
+   "caption": "Status language sheet artboard, light half on the left and dark half on the right (part 1 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/status-language/status-language-sheet-part2of2.png",
+   "caption": "Status language sheet artboard, light half on the left and dark half on the right (part 2 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/sync/all-boulder-1-preview-dark.png",
+   "caption": "Sync all: step 1 Preview. Dry-run command, pre-checks, per-repo plan with path classes; a repo with an open sync PR defaults to Skip; an ahead-of-hub repo gets a warning (Boulder hit scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/all-boulder-1-preview-light.png",
+   "caption": "Sync all: step 1 Preview. Dry-run command, pre-checks, per-repo plan with path classes; a repo with an open sync PR defaults to Skip; an ahead-of-hub repo gets a warning (Boulder hit scenario, light theme)"
+  },
+  {
+   "path": "images/sync/all-boulder-1-preview-viewport-dark.png",
+   "caption": "Sync all: step 1 Preview, shown over the dimmed page (Boulder hit scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/all-boulder-1-preview-viewport-light.png",
+   "caption": "Sync all: step 1 Preview, shown over the dimmed page (Boulder hit scenario, light theme)"
+  },
+  {
+   "path": "images/sync/all-boulder-2-confirm-dark.png",
+   "caption": "Sync all: step 2 Confirm. Runs as the author through gh-as-author.sh, one sync at a time, logged; the ahead-of-hub acknowledgement is unchecked, so Start sync is disabled (Boulder hit scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/all-boulder-2-confirm-light.png",
+   "caption": "Sync all: step 2 Confirm. Runs as the author through gh-as-author.sh, one sync at a time, logged; the ahead-of-hub acknowledgement is unchecked, so Start sync is disabled (Boulder hit scenario, light theme)"
+  },
+  {
+   "path": "images/sync/all-boulder-2b-confirm-acked-dark.png",
+   "caption": "Sync all: step 2 Confirm with the ahead-of-hub acknowledgement checked, Start sync enabled (Boulder hit scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/all-boulder-2b-confirm-acked-light.png",
+   "caption": "Sync all: step 2 Confirm with the ahead-of-hub acknowledgement checked, Start sync enabled (Boulder hit scenario, light theme)"
+  },
+  {
+   "path": "images/sync/all-boulder-3-running-early-dark.png",
+   "caption": "Sync all: step 3 Run, early. Per-repo stage rails (fetch, diff, branch, commit, PR) and the streamed log (Boulder hit scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/all-boulder-3-running-early-light.png",
+   "caption": "Sync all: step 3 Run, early. Per-repo stage rails (fetch, diff, branch, commit, PR) and the streamed log (Boulder hit scenario, light theme)"
+  },
+  {
+   "path": "images/sync/all-boulder-3-running-late-dark.png",
+   "caption": "Sync all: step 3 Run, later stages (Boulder hit scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/all-boulder-3-running-late-light.png",
+   "caption": "Sync all: step 3 Run, later stages (Boulder hit scenario, light theme)"
+  },
+  {
+   "path": "images/sync/all-boulder-4-done-dark.png",
+   "caption": "Sync all: Done. Check burst and one PR chip per new sync PR (Boulder hit scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/all-boulder-4-done-light.png",
+   "caption": "Sync all: Done. Check burst and one PR chip per new sync PR (Boulder hit scenario, light theme)"
+  },
+  {
+   "path": "images/sync/all-boulder-5-fleet-after-dark.png",
+   "caption": "Fleet panel right after the sync: just-synced row glow, Sync PR open (Boulder hit scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/all-boulder-5-fleet-after-light.png",
+   "caption": "Fleet panel right after the sync: just-synced row glow, Sync PR open (Boulder hit scenario, light theme)"
+  },
+  {
+   "path": "images/sync/all-boulder-6-prs-after-dark-part1of2.png",
+   "caption": "Open PRs right after the sync: each new sync PR enters as a fresh row (Boulder hit scenario, dark theme) (part 1 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/sync/all-boulder-6-prs-after-dark-part2of2.png",
+   "caption": "Open PRs right after the sync: each new sync PR enters as a fresh row (Boulder hit scenario, dark theme) (part 2 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/sync/all-boulder-6-prs-after-light-part1of2.png",
+   "caption": "Open PRs right after the sync: each new sync PR enters as a fresh row (Boulder hit scenario, light theme) (part 1 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/sync/all-boulder-6-prs-after-light-part2of2.png",
+   "caption": "Open PRs right after the sync: each new sync PR enters as a fresh row (Boulder hit scenario, light theme) (part 2 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/sync/all-bumps-1-preview-dark.png",
+   "caption": "Sync all: step 1 Preview. Dry-run command, pre-checks, per-repo plan with path classes; a repo with an open sync PR defaults to Skip; an ahead-of-hub repo gets a warning (Speed bumps ahead scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/all-bumps-1-preview-light.png",
+   "caption": "Sync all: step 1 Preview. Dry-run command, pre-checks, per-repo plan with path classes; a repo with an open sync PR defaults to Skip; an ahead-of-hub repo gets a warning (Speed bumps ahead scenario, light theme)"
+  },
+  {
+   "path": "images/sync/all-bumps-1-preview-viewport-dark.png",
+   "caption": "Sync all: step 1 Preview, shown over the dimmed page (Speed bumps ahead scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/all-bumps-1-preview-viewport-light.png",
+   "caption": "Sync all: step 1 Preview, shown over the dimmed page (Speed bumps ahead scenario, light theme)"
+  },
+  {
+   "path": "images/sync/all-bumps-2-confirm-dark.png",
+   "caption": "Sync all: step 2 Confirm. Runs as the author through gh-as-author.sh, one sync at a time, logged; the ahead-of-hub acknowledgement is unchecked, so Start sync is disabled (Speed bumps ahead scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/all-bumps-2-confirm-light.png",
+   "caption": "Sync all: step 2 Confirm. Runs as the author through gh-as-author.sh, one sync at a time, logged; the ahead-of-hub acknowledgement is unchecked, so Start sync is disabled (Speed bumps ahead scenario, light theme)"
+  },
+  {
+   "path": "images/sync/all-bumps-2b-confirm-acked-dark.png",
+   "caption": "Sync all: step 2 Confirm with the ahead-of-hub acknowledgement checked, Start sync enabled (Speed bumps ahead scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/all-bumps-2b-confirm-acked-light.png",
+   "caption": "Sync all: step 2 Confirm with the ahead-of-hub acknowledgement checked, Start sync enabled (Speed bumps ahead scenario, light theme)"
+  },
+  {
+   "path": "images/sync/all-bumps-3-running-early-dark.png",
+   "caption": "Sync all: step 3 Run, early. Per-repo stage rails (fetch, diff, branch, commit, PR) and the streamed log (Speed bumps ahead scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/all-bumps-3-running-early-light.png",
+   "caption": "Sync all: step 3 Run, early. Per-repo stage rails (fetch, diff, branch, commit, PR) and the streamed log (Speed bumps ahead scenario, light theme)"
+  },
+  {
+   "path": "images/sync/all-bumps-3-running-late-dark.png",
+   "caption": "Sync all: step 3 Run, later stages (Speed bumps ahead scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/all-bumps-3-running-late-light.png",
+   "caption": "Sync all: step 3 Run, later stages (Speed bumps ahead scenario, light theme)"
+  },
+  {
+   "path": "images/sync/all-bumps-4-done-dark.png",
+   "caption": "Sync all: Done. Check burst and one PR chip per new sync PR (Speed bumps ahead scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/all-bumps-4-done-light.png",
+   "caption": "Sync all: Done. Check burst and one PR chip per new sync PR (Speed bumps ahead scenario, light theme)"
+  },
+  {
+   "path": "images/sync/all-bumps-5-fleet-after-dark.png",
+   "caption": "Fleet panel right after the sync: just-synced row glow, Sync PR open (Speed bumps ahead scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/all-bumps-5-fleet-after-light.png",
+   "caption": "Fleet panel right after the sync: just-synced row glow, Sync PR open (Speed bumps ahead scenario, light theme)"
+  },
+  {
+   "path": "images/sync/all-bumps-6-prs-after-dark.png",
+   "caption": "Open PRs right after the sync: each new sync PR enters as a fresh row (Speed bumps ahead scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/all-bumps-6-prs-after-light.png",
+   "caption": "Open PRs right after the sync: each new sync PR enters as a fresh row (Speed bumps ahead scenario, light theme)"
+  },
+  {
+   "path": "images/sync/single-boulder-1-preview-dark.png",
+   "caption": "Per-repo Sync on swipewatch: step 1 Preview. Dry-run command, pre-checks, per-repo plan with path classes; a repo with an open sync PR defaults to Skip; an ahead-of-hub repo gets a warning (Boulder hit scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/single-boulder-1-preview-light.png",
+   "caption": "Per-repo Sync on swipewatch: step 1 Preview. Dry-run command, pre-checks, per-repo plan with path classes; a repo with an open sync PR defaults to Skip; an ahead-of-hub repo gets a warning (Boulder hit scenario, light theme)"
+  },
+  {
+   "path": "images/sync/single-boulder-1-preview-viewport-dark.png",
+   "caption": "Per-repo Sync on swipewatch: step 1 Preview, shown over the dimmed page (Boulder hit scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/single-boulder-1-preview-viewport-light.png",
+   "caption": "Per-repo Sync on swipewatch: step 1 Preview, shown over the dimmed page (Boulder hit scenario, light theme)"
+  },
+  {
+   "path": "images/sync/single-boulder-1b-preview-recreate-dark.png",
+   "caption": "Per-repo Sync on swipewatch: back on step 1 with Recreate chosen for the repo that already has an open sync PR (Boulder hit scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/single-boulder-1b-preview-recreate-light.png",
+   "caption": "Per-repo Sync on swipewatch: back on step 1 with Recreate chosen for the repo that already has an open sync PR (Boulder hit scenario, light theme)"
+  },
+  {
+   "path": "images/sync/single-boulder-2-confirm-dark.png",
+   "caption": "Per-repo Sync on swipewatch: step 2 Confirm. Runs as the author through gh-as-author.sh, one sync at a time, logged (Boulder hit scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/single-boulder-2-confirm-light.png",
+   "caption": "Per-repo Sync on swipewatch: step 2 Confirm. Runs as the author through gh-as-author.sh, one sync at a time, logged (Boulder hit scenario, light theme)"
+  },
+  {
+   "path": "images/sync/single-boulder-2a-confirm-all-skipped-dark.png",
+   "caption": "Per-repo Sync on swipewatch: step 2 Confirm with every target on Skip, so Start sync stays disabled (Boulder hit scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/single-boulder-2a-confirm-all-skipped-light.png",
+   "caption": "Per-repo Sync on swipewatch: step 2 Confirm with every target on Skip, so Start sync stays disabled (Boulder hit scenario, light theme)"
+  },
+  {
+   "path": "images/sync/single-boulder-3-running-early-dark.png",
+   "caption": "Per-repo Sync on swipewatch: step 3 Run, early. Per-repo stage rails (fetch, diff, branch, commit, PR) and the streamed log (Boulder hit scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/single-boulder-3-running-early-light.png",
+   "caption": "Per-repo Sync on swipewatch: step 3 Run, early. Per-repo stage rails (fetch, diff, branch, commit, PR) and the streamed log (Boulder hit scenario, light theme)"
+  },
+  {
+   "path": "images/sync/single-boulder-3-running-late-dark.png",
+   "caption": "Per-repo Sync on swipewatch: step 3 Run, later stages (Boulder hit scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/single-boulder-3-running-late-light.png",
+   "caption": "Per-repo Sync on swipewatch: step 3 Run, later stages (Boulder hit scenario, light theme)"
+  },
+  {
+   "path": "images/sync/single-boulder-4-done-dark.png",
+   "caption": "Per-repo Sync on swipewatch: Done. Check burst and one PR chip per new sync PR (Boulder hit scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/single-boulder-4-done-light.png",
+   "caption": "Per-repo Sync on swipewatch: Done. Check burst and one PR chip per new sync PR (Boulder hit scenario, light theme)"
+  },
+  {
+   "path": "images/sync/single-boulder-5-fleet-after-dark.png",
+   "caption": "Fleet panel right after the sync: just-synced row glow, Sync PR open (Boulder hit scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/single-boulder-5-fleet-after-light.png",
+   "caption": "Fleet panel right after the sync: just-synced row glow, Sync PR open (Boulder hit scenario, light theme)"
+  },
+  {
+   "path": "images/sync/single-boulder-6-prs-after-dark-part1of2.png",
+   "caption": "Open PRs right after the sync: each new sync PR enters as a fresh row (Boulder hit scenario, dark theme) (part 1 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/sync/single-boulder-6-prs-after-dark-part2of2.png",
+   "caption": "Open PRs right after the sync: each new sync PR enters as a fresh row (Boulder hit scenario, dark theme) (part 2 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/sync/single-boulder-6-prs-after-light-part1of2.png",
+   "caption": "Open PRs right after the sync: each new sync PR enters as a fresh row (Boulder hit scenario, light theme) (part 1 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/sync/single-boulder-6-prs-after-light-part2of2.png",
+   "caption": "Open PRs right after the sync: each new sync PR enters as a fresh row (Boulder hit scenario, light theme) (part 2 of 2, 40 px overlap)"
+  },
+  {
+   "path": "images/sync/single-bumps-1-preview-dark.png",
+   "caption": "Per-repo Sync on swipewatch: step 1 Preview. Dry-run command, pre-checks, per-repo plan with path classes; a repo with an open sync PR defaults to Skip; an ahead-of-hub repo gets a warning (Speed bumps ahead scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/single-bumps-1-preview-light.png",
+   "caption": "Per-repo Sync on swipewatch: step 1 Preview. Dry-run command, pre-checks, per-repo plan with path classes; a repo with an open sync PR defaults to Skip; an ahead-of-hub repo gets a warning (Speed bumps ahead scenario, light theme)"
+  },
+  {
+   "path": "images/sync/single-bumps-1-preview-viewport-dark.png",
+   "caption": "Per-repo Sync on swipewatch: step 1 Preview, shown over the dimmed page (Speed bumps ahead scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/single-bumps-1-preview-viewport-light.png",
+   "caption": "Per-repo Sync on swipewatch: step 1 Preview, shown over the dimmed page (Speed bumps ahead scenario, light theme)"
+  },
+  {
+   "path": "images/sync/single-bumps-1b-preview-recreate-dark.png",
+   "caption": "Per-repo Sync on swipewatch: back on step 1 with Recreate chosen for the repo that already has an open sync PR (Speed bumps ahead scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/single-bumps-1b-preview-recreate-light.png",
+   "caption": "Per-repo Sync on swipewatch: back on step 1 with Recreate chosen for the repo that already has an open sync PR (Speed bumps ahead scenario, light theme)"
+  },
+  {
+   "path": "images/sync/single-bumps-2-confirm-dark.png",
+   "caption": "Per-repo Sync on swipewatch: step 2 Confirm. Runs as the author through gh-as-author.sh, one sync at a time, logged (Speed bumps ahead scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/single-bumps-2-confirm-light.png",
+   "caption": "Per-repo Sync on swipewatch: step 2 Confirm. Runs as the author through gh-as-author.sh, one sync at a time, logged (Speed bumps ahead scenario, light theme)"
+  },
+  {
+   "path": "images/sync/single-bumps-2a-confirm-all-skipped-dark.png",
+   "caption": "Per-repo Sync on swipewatch: step 2 Confirm with every target on Skip, so Start sync stays disabled (Speed bumps ahead scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/single-bumps-2a-confirm-all-skipped-light.png",
+   "caption": "Per-repo Sync on swipewatch: step 2 Confirm with every target on Skip, so Start sync stays disabled (Speed bumps ahead scenario, light theme)"
+  },
+  {
+   "path": "images/sync/single-bumps-3-running-early-dark.png",
+   "caption": "Per-repo Sync on swipewatch: step 3 Run, early. Per-repo stage rails (fetch, diff, branch, commit, PR) and the streamed log (Speed bumps ahead scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/single-bumps-3-running-early-light.png",
+   "caption": "Per-repo Sync on swipewatch: step 3 Run, early. Per-repo stage rails (fetch, diff, branch, commit, PR) and the streamed log (Speed bumps ahead scenario, light theme)"
+  },
+  {
+   "path": "images/sync/single-bumps-3-running-late-dark.png",
+   "caption": "Per-repo Sync on swipewatch: step 3 Run, later stages (Speed bumps ahead scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/single-bumps-3-running-late-light.png",
+   "caption": "Per-repo Sync on swipewatch: step 3 Run, later stages (Speed bumps ahead scenario, light theme)"
+  },
+  {
+   "path": "images/sync/single-bumps-4-done-dark.png",
+   "caption": "Per-repo Sync on swipewatch: Done. Check burst and one PR chip per new sync PR (Speed bumps ahead scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/single-bumps-4-done-light.png",
+   "caption": "Per-repo Sync on swipewatch: Done. Check burst and one PR chip per new sync PR (Speed bumps ahead scenario, light theme)"
+  },
+  {
+   "path": "images/sync/single-bumps-5-fleet-after-dark.png",
+   "caption": "Fleet panel right after the sync: just-synced row glow, Sync PR open (Speed bumps ahead scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/single-bumps-5-fleet-after-light.png",
+   "caption": "Fleet panel right after the sync: just-synced row glow, Sync PR open (Speed bumps ahead scenario, light theme)"
+  },
+  {
+   "path": "images/sync/single-bumps-6-prs-after-dark.png",
+   "caption": "Open PRs right after the sync: each new sync PR enters as a fresh row (Speed bumps ahead scenario, dark theme)"
+  },
+  {
+   "path": "images/sync/single-bumps-6-prs-after-light.png",
+   "caption": "Open PRs right after the sync: each new sync PR enters as a fresh row (Speed bumps ahead scenario, light theme)"
+  }
+ ]
+}
