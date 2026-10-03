@@ -21,8 +21,23 @@ export P4B_HANDOFF="$BIN/handoff" P4B_GH_AS_REVIEWER="$BIN/reviewer"
 export MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$BIN/feedback"
 export P4B_ACCT_PRIOR_RECORDS_JSONL="$WORK/empty.jsonl"
 : > "$P4B_ACCT_PRIOR_RECORDS_JSONL"
-HB_REAL_NODE="$(command -v node)"
+if ! HB_REAL_NODE="$(command -v node)"; then
+  printf 'ERROR: node is required for the Phase 4b heartbeat test suite\n' >&2
+  exit 1
+fi
 export HB_REAL_NODE
+# Invoke the actual suite with only its pre-lookup utilities available. The
+# missing dependency exits before reaching this fixture, so it cannot recurse.
+NODELESS_BIN="$WORK/no-node-bin"
+mkdir -p "$NODELESS_BIN"
+for nodeless_cmd in bash dirname mktemp mkdir rm; do
+  ln -s "$(command -v "$nodeless_cmd")" "$NODELESS_BIN/$nodeless_cmd"
+done
+rc=0
+PATH="$NODELESS_BIN" bash "$ROOT/tests/test_phase_4b_heartbeat.sh" > "$WORK/no-node-out" 2> "$WORK/no-node-err" || rc=$?
+[ "$rc" = 1 ] && [ ! -s "$WORK/no-node-out" ] \
+  && grep -qx 'ERROR: node is required for the Phase 4b heartbeat test suite' "$WORK/no-node-err" \
+  && pass 'missing Node exits explicitly at the real suite boundary' || fail 'missing Node diagnostic/exit'
 export PATH="$BIN:$PATH"
 cat > "$BIN/node" <<'EOF'
 #!/usr/bin/env bash
