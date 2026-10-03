@@ -2207,6 +2207,7 @@ paths:
       - "tests/test_check_coderabbit_config.sh"  # check_coderabbit_config_tests (#481/#482)
       - "tests/test_check_propagation_closure.sh"  # check_propagation_closure (#521)
       - "tests/test_phase_4b_automation.sh"  # check_phase_4b_automation (#579)
+      - "tests/test_phase_4b_heartbeat.sh"  # check_phase_4b_automation (#1589)
       - "tests/test_phase_4b_accounting.sh"  # check_phase_4b_accounting (#602)
       - "tests/test_codex_review_request_ack.sh"  # check_codex_scripts
       - "tests/test_codex_review_request_trigger_only.sh"  # check_codex_scripts (#489)
