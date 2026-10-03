@@ -1301,6 +1301,61 @@ class InventoryAndLauncherTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertNotIn("fixture server launched", result.stdout)
 
+    def test_fleet_constructor_refusal_keeps_unrelated_panels_and_cleans_partial_workspace(self):
+        main = importlib.import_module("mergepath.cockpit.__main__")
+        fleet_module = importlib.import_module("mergepath.cockpit.fleet")
+        for fault in ("missing-tool", "workspace"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temp:
+                applications, workspaces, output = [], [], io.StringIO()
+                client = GitHubClient(TOKEN, transport=HTTPFixture())
+                def application(*args, **kwargs):
+                    app = Application(*args, **kwargs); applications.append(app); return app
+                real_allocate = tempfile.mkdtemp
+                def allocate(*args, **kwargs):
+                    path = real_allocate(prefix="fixture-fleet-", dir=temp)
+                    workspaces.append(Path(path)); return path
+                def which(tool, *, path):
+                    self.assertEqual(path, fleet_module.UTILITY_PATH)
+                    return None if fault == "missing-tool" and tool == "gh" else "/bin/true"
+                def opened(url):
+                    parts = urllib.parse.urlsplit(url); authority = "http://" + parts.netloc
+                    fragment = urllib.parse.parse_qs(parts.fragment); nonce = fragment["launch"][0]
+                    connection = http.client.HTTPConnection("127.0.0.1", int(parts.port), timeout=1)
+                    connection.request("POST", "/api/bootstrap", headers={"Origin": authority,
+                        "X-Cockpit-Bootstrap": nonce, "X-Cockpit-CSRF": nonce})
+                    response = connection.getresponse(); self.assertEqual(response.status, 204)
+                    cookie = [v for k, v in response.getheaders() if k.lower() == "set-cookie"][-1].split(";", 1)[0]
+                    response.read()
+                    connection.request("GET", f"/s/{fragment['scope'][0]}/api/snapshot", headers={"Cookie": cookie})
+                    response = connection.getresponse(); self.assertEqual(response.status, 200)
+                    snapshot = json.loads(response.read()); connection.close()
+                    self.assertIn("prs", snapshot["sources"]); self.assertNotIn("fleet", snapshot["sources"])
+                    self.assertEqual(applications[0].panel_snapshot("prs")["source"], "prs")
+                    missing = applications[0].panel_snapshot("fleet")
+                    self.assertIsNone(missing["source"]); self.assertIsNone(missing["envelope"]["data"])
+                    self.assertTrue(missing["envelope"]["stale"])
+                    raise KeyboardInterrupt  # Stop the actual local server normally.
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(patch.object(main.GitHubClient, "from_environment", return_value=client))
+                    stack.enter_context(patch.object(main, "load_inventory", return_value=(
+                        Repository("mergepath", HUB, True), Repository("one", "fixture/one"))))
+                    stack.enter_context(patch.object(main, "Application", side_effect=application))
+                    stack.enter_context(patch.object(main, "PRProvider", return_value=lambda deadline: Sample({})))
+                    stack.enter_context(patch.object(fleet_module.shutil, "which", side_effect=which))
+                    stack.enter_context(patch.object(fleet_module.tempfile, "mkdtemp", side_effect=allocate))
+                    if fault == "workspace":
+                        stack.enter_context(patch.object(Path, "symlink_to", side_effect=OSError("fixture-private-workspace-failure")))
+                    opener = stack.enter_context(patch.object(main, "open_browser", side_effect=opened))
+                    stack.enter_context(patch.dict(os.environ, {}, clear=True))
+                    stack.enter_context(contextlib.redirect_stdout(output)); stack.enter_context(contextlib.redirect_stderr(output))
+                    self.assertEqual(main.main([]), 0, output.getvalue())
+                    opener.assert_called_once()
+                self.assertTrue(applications[0].stopping.is_set())
+                self.assertTrue(all(not path.exists() for path in workspaces))
+                self.assertEqual(len(workspaces), 0 if fault == "missing-tool" else 1)
+                self.assertIn("Fleet audits unavailable", output.getvalue())
+                self.assertNotIn(TOKEN, output.getvalue())
+
     def test_browser_failure_never_exposes_fragment(self):
         main = importlib.import_module("mergepath.cockpit.__main__")
         output = io.StringIO()

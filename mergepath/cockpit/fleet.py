@@ -135,7 +135,7 @@ def parse_audit(output, code, inventory):
         value = output.decode("utf-8")
         if value and not value.endswith("\n"):
             raise ValueError("incomplete_ndjson")
-        lines = value.splitlines()
+        lines = value[:-1].split("\n") if value else []
         consumers = tuple(entry for entry in inventory if not entry.hub)
         if len(lines) != len(consumers):
             raise ValueError("incomplete_fleet")

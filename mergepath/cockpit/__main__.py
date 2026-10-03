@@ -59,10 +59,15 @@ def main(argv=None):
         provider = PRProvider(github, inventory, ROOT, checkout_roots={"nathanjohnpayne/mergepath": ROOT})
         app.scheduler.register("prs", provider, hot_interval=15, idle_interval=120, timeout=30)
         app.register_panel("prs", "prs")
-        fleet = FleetProvider(inventory, ROOT, github._token)
-        app.scheduler.register("fleet", fleet.fetch, hot_interval=1800, idle_interval=1800,
-                               timeout=180, max_backoff=7200)
-        app.register_panel("fleet", "fleet")
+        try:
+            fleet = FleetProvider(inventory, ROOT, github._token)
+        except (ValueError, OSError):
+            print("Fleet audits unavailable: trusted audit tools or private workspace could not be initialized.",
+                  file=sys.stderr)
+        if fleet is not None:
+            app.scheduler.register("fleet", fleet.fetch, hot_interval=1800, idle_interval=1800,
+                                   timeout=180, max_backoff=7200)
+            app.register_panel("fleet", "fleet")
         server = CockpitServer(app, args.port)
     except (ClientError, ValueError, OSError):
         if app is not None:
@@ -89,7 +94,8 @@ def main(argv=None):
         pass
     finally:
         app.close()
-        fleet.close()
+        if fleet is not None:
+            fleet.close()
         server.shutdown()
         server.server_close()
         thread.join(timeout=1)

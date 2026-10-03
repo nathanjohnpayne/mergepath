@@ -97,6 +97,21 @@ class SourceTests(unittest.TestCase):
             with self.subTest(value=value[:50], code=code), self.assertRaises(ClientError):
                 parse_audit(value, code, INVENTORY)
 
+    def test_ndjson_uses_literal_lf_not_unicode_text_separators(self):
+        for separator in ("\u0085", "\u2028", "\u2029"):
+            with self.subTest(separator=repr(separator)):
+                first = record(status="override-only")
+                first["paths"][0].update(path="docs/a" + separator + "b.md", override_reason="overlay" + separator + "reason")
+                first["open_sync_prs"] = [{"number": 88, "branch": "mergepath-sync/a" + separator + "b",
+                                          "state": "UNKNOWN", "lifecycle_state": "OPEN", "draft": False}]
+                records = [first, record(INVENTORY[2])]
+                output = ("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in records)).encode()
+                self.assertEqual(parse_audit(output, 0, INVENTORY), records)
+        good = ndjson([record(), record(INVENTORY[2])])
+        for output in (good[:-1], good + b"\n", good.replace(b"\n", b"\xe2\x80\xa8")):
+            with self.subTest(output=output[-20:]), self.assertRaises(ClientError):
+                parse_audit(output, 0, INVENTORY)
+
     def test_row_retention_independent_time_recovery_and_unavailable_pr_lookup(self):
         provider = self.provider()
         first = record(); first["open_sync_prs"] = [{"number": 88, "branch": "mergepath-sync/x", "state": "UNKNOWN", "lifecycle_state": "OPEN", "draft": True}]
