@@ -295,6 +295,13 @@ mk_fake fake-claude-cost-only \
 cat > "$BIN/gh" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = "api" ]; then
+  # #1598: an approval run captures and re-reads the Codex request generation
+  # from the issue comments; serve no requests.
+  if [ "${2:-}" = "--paginate" ]; then
+    case "${3:-}" in
+      repos/o/r/issues/*/comments) printf '[]\n'; exit 0 ;;
+    esac
+  fi
   case "${2:-}" in
     repos/o/r/pulls/*)
       # (#1143) The orchestrator reads and validates the PR body on EVERY run,
