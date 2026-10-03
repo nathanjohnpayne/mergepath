@@ -40,6 +40,8 @@ for subject in scripts/cockpit.sh tests/test_cockpit.sh tests/test_cockpit.py sp
   specs/cockpit_prs.md \
   mergepath/cockpit/agents.py mergepath/cockpit/assets/agents.js mergepath/cockpit/assets/agents.css \
   tests/test_cockpit_agents.py tests/test_cockpit_agents_ui.cjs specs/cockpit_agents.md \
+  mergepath/cockpit/live_agents.py mergepath/cockpit/assets/live_agents.js mergepath/cockpit/assets/live_agents.css \
+  tests/test_cockpit_live_agents.py tests/test_cockpit_live_agents_ui.cjs specs/cockpit_live_agents.md \
   mergepath/cockpit/assets/fonts/local-fonts.css mergepath/cockpit/assets/fonts/manifest.json; do
   [ -f "$subject" ] || { echo "check_cockpit: missing $subject" >&2; exit 1; }
 done
@@ -47,7 +49,7 @@ bash -n scripts/cockpit.sh tests/test_cockpit.sh
 python3 - <<'PY'
 import ast
 from pathlib import Path
-for subject in list(Path('mergepath/cockpit').glob('*.py')) + [Path('tests/test_cockpit.py'), Path('tests/test_cockpit_ci.py'), Path('tests/test_cockpit_logs.py'), Path('tests/test_cockpit_prs.py'), Path('tests/test_cockpit_actions.py'), Path('tests/test_cockpit_agents.py')]:
+for subject in list(Path('mergepath/cockpit').glob('*.py')) + [Path('tests/test_cockpit.py'), Path('tests/test_cockpit_ci.py'), Path('tests/test_cockpit_logs.py'), Path('tests/test_cockpit_prs.py'), Path('tests/test_cockpit_actions.py'), Path('tests/test_cockpit_agents.py'), Path('tests/test_cockpit_live_agents.py')]:
     ast.parse(subject.read_text(), filename=str(subject))
 PY
 node --check mergepath/cockpit/bootstrap.js
@@ -64,6 +66,8 @@ node --check mergepath/cockpit/assets/pr_rows.js
 node --check tests/test_cockpit_prs_ui.cjs
 node --check mergepath/cockpit/assets/agents.js
 node --check tests/test_cockpit_agents_ui.cjs
+node --check mergepath/cockpit/assets/live_agents.js
+node --check tests/test_cockpit_live_agents_ui.cjs
 if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ]; then
   bash tests/test_cockpit.sh
 fi

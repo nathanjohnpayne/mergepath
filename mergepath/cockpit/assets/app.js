@@ -15,6 +15,13 @@
       && value.sources !== null && typeof value.sources === "object" && !Array.isArray(value.sources)
       && value.api_budget !== null && typeof value.api_budget === "object" && !Array.isArray(value.api_budget);
   }
+  function liveClockNeedsRender(snapshot, renderedAt, now) {
+    const live = snapshot?.sources?.live_agents;
+    if (!live?.data || C.epoch(live.observed_at) === null) return false;
+    if (Array.isArray(live.data.live) && live.data.live.length > 0) return true;
+    const observed = C.epoch(live.data.observed_at);
+    return observed !== null && renderedAt !== null && renderedAt <= observed + 10 && now > observed + 10;
+  }
   class PanelRegistry {
     constructor() {this.adapters = new Map();}
     register(id, source, project, render = null) {
@@ -282,10 +289,10 @@
       onState: value => {const changed = connection.kind !== value.kind; connection = value; render(); if (changed) $("connection-announcement").textContent = $("connection-label").textContent + ". " + $("connection-note").textContent;}});
     const timer = setInterval(() => {
       const now = epochNow();
-      if (snapshot && Object.values(snapshot.api_budget).some(evidence => {
+      if (liveClockNeedsRender(snapshot, renderedAt, now) || (snapshot && Object.values(snapshot.api_budget).some(evidence => {
         const reset = C.epoch(evidence?.reset);
         return reset !== null && renderedAt !== null && reset > renderedAt && reset <= now;
-      })) render();
+      }))) render();
       else renderConnection();
     }, 1000);
     const resize = new ResizeObserver(() => {if (snapshot) render();}); resize.observe(road.strip);
@@ -297,5 +304,5 @@
     render(); controller.start();
   }
   let registerPanel = (id, source, project, renderer) => registry.register(id, source, project, renderer);
-  return {validSnapshot, PanelRegistry, Connection, accountHazards, renderPanelContent, mount, registerPanel: (...args) => registerPanel(...args)};
+  return {validSnapshot, liveClockNeedsRender, PanelRegistry, Connection, accountHazards, renderPanelContent, mount, registerPanel: (...args) => registerPanel(...args)};
 });

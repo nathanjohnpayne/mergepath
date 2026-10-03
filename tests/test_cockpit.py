@@ -1324,6 +1324,7 @@ class InventoryAndLauncherTests(unittest.TestCase):
              patch.object(main, "resolve_history_settings", return_value=((), {})), \
              patch.object(main, "load_reviewers", return_value=("fixture-reviewer",)), \
              patch.object(main, "AgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))), \
+             patch.object(main, "LiveAgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))), \
              patch.object(main, "open_browser", return_value=False) as opener, \
              patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             self.assertEqual(main.main([]), 1)
@@ -1397,6 +1398,7 @@ class InventoryAndLauncherTests(unittest.TestCase):
              patch.object(main, "resolve_history_settings", return_value=((), {})), \
              patch.object(main, "load_reviewers", return_value=("fixture-reviewer",)), \
              patch.object(main, "AgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))), \
+             patch.object(main, "LiveAgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))), \
              patch.object(main.shutil, "which", return_value="/fixture/xdg-open"), \
              patch.object(main.subprocess, "Popen", side_effect=opener), \
              patch.object(threading.Thread, "join", interrupt_after_launch), \

@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
 const C = require("../mergepath/cockpit/assets/components.js");
-const {Connection, PanelRegistry, validSnapshot, accountHazards, renderPanelContent} = require("../mergepath/cockpit/assets/app.js");
+const {Connection, PanelRegistry, validSnapshot, liveClockNeedsRender, accountHazards, renderPanelContent} = require("../mergepath/cockpit/assets/app.js");
 const repositories = [{name: "mergepath", repo: "owner/mergepath", hub: true}, {name: "consumer", repo: "owner/consumer", hub: false}];
 const snapshot = (overrides = {}) => ({schema: "cockpit/v1", revision: 1, generated_at: 1000, repositories, api_budget: {}, sources: {}, ...overrides});
 const hazard = (id = "one", overrides = {}) => ({id, source: "prs", section: "prs", repo: "owner/mergepath", state: "bump", title: "Review delayed", detail: "Waiting for an observed review.", timing: {kind: "now"}, observed_at: 950, stale: false, ...overrides});
@@ -378,4 +378,16 @@ test("provider partial coverage cannot invent fresh clear or hide invalid hazard
     const invalid=registry.project(value({coverageValid:flag}),null,1000);
     assert.equal(invalid.models.budget.observed,false); assert.ok(invalid.diagnostics.length);
   }
+});
+
+test("live clocks advance between source events and empty coverage expires without polling", () => {
+  const observed = {sources: {live_agents: {observed_at: 1000, data: {observed_at: 1000, live: [{id: "run"}]}}}};
+  assert.equal(liveClockNeedsRender(observed, 1000, 1001), true);
+  observed.sources.live_agents.data.live = [];
+  assert.equal(liveClockNeedsRender(observed, 1000, 1001), false);
+  assert.equal(liveClockNeedsRender(observed, 1010, 1011), true);
+  assert.equal(liveClockNeedsRender(observed, 1011, 1012), false);
+  observed.sources.live_agents.observed_at = null;
+  assert.equal(liveClockNeedsRender(observed, 1010, 1011), false);
+  assert.equal(liveClockNeedsRender(null, null, 1011), false);
 });

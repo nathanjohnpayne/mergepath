@@ -21,6 +21,7 @@ from mergepath.cockpit.actions import ActionsProvider, ci_observation
 from mergepath.cockpit.agents import AgentsProvider, resolve_history_settings
 from mergepath.cockpit.github import ClientError, GitHubClient
 from mergepath.cockpit.inventory import load_inventory
+from mergepath.cockpit.live_agents import LiveAgentsProvider, resolve_live_directory
 from mergepath.cockpit.ci import CIProvider, LogExcerptCache
 from mergepath.cockpit.prs import PRProvider
 from mergepath.cockpit.server import Application, CockpitServer
@@ -118,6 +119,9 @@ def main(argv=None):
         agents_provider = AgentsProvider(inventory, checkouts, ROOT, price_keys=price_keys, github=github, reviewers=reviewers)
         app.scheduler.register("agents", agents_provider.fetch, hot_interval=30, idle_interval=120, timeout=30)
         app.register_panel("history", "agents")
+        live_agents = LiveAgentsProvider(inventory, resolve_live_directory(), ROOT)
+        app.scheduler.register("live_agents", live_agents.fetch, hot_interval=5, idle_interval=5, timeout=10, max_backoff=60)
+        app.register_panel("agents", "live_agents")
         server = CockpitServer(app, args.port)
     except (ClientError, ValueError, OSError):
         print("Cockpit cannot start. Check the cached reviewer credential, installed hub yq, settings JSON and loopback port.",
