@@ -1,6 +1,7 @@
 """Hermetic Actions source coverage; no credential or live GitHub calls."""
 import datetime as dt
 import json
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -261,6 +262,71 @@ class ActionsTests(unittest.TestCase):
         envelope['data']['repositories'][0]['stale']=False
         envelope['data']['recent_seconds']=300
         self.assertIsNone(ci_observation(envelope,REPO,NOW))
+
+    def test_registered_ci_publication_feeds_actions_without_duplicate_reads(self):
+        from mergepath.cockpit.ci import CIProvider
+        from mergepath.cockpit.inventory import Repository
+        from mergepath.cockpit.server import Application
+        calls, denied = [], [False]
+        current = [NOW]
+        observed_run = {**run(21, 'queued', conclusion=None), 'run_attempt': 1,
+                        'head_sha': 'a' * 40, 'name': 'lint', 'workflow_id': 9,
+                        'check_suite_id': 50, 'pull_requests': []}
+        def transport(method, url, headers, body, timeout):
+            calls.append(url)
+            if '/settings/billing/' in url:
+                payload = {'usageItems': []}
+            elif denied[0]:
+                return Response(403, {}, b'{}')
+            elif '/pulls?' in url:
+                payload = []
+            elif '/actions/runs?' in url:
+                payload = {'workflow_runs': [observed_run] if 'status=queued' in url or 'created=' in url else []}
+            elif '/jobs?' in url:
+                payload = {'jobs': []}
+            elif '/check-runs?' in url:
+                payload = {'check_runs': []}
+            else:
+                self.fail('unexpected request: ' + url)
+            return Response(200, {}, json.dumps(payload).encode())
+        inventory = (Repository('mergepath', REPO, True),)
+        client = GitHubClient('synthetic-integration-token', transport=transport, clock=lambda: current[0])
+        app = Application(inventory, client, clock=lambda: current[0])
+        self.addCleanup(app.close)
+        provider = CIProvider(client, inventory, clock=lambda: current[0])
+        app.scheduler.register('ci', provider)
+        app.register_panel('ci', 'ci')
+        actions = ActionsProvider(client, inventory, clock=lambda: current[0],
+            ci_snapshot=lambda repo, now: ci_observation(app.panel_snapshot('ci')['envelope'], repo, now))
+        first = actions.fetch(time.monotonic() + 5).data['repositories'][0]
+        self.assertFalse(first['available'])
+        self.assertTrue(all('/settings/billing/' in url for url in calls))
+        def publish_ci():
+            before = app.snapshot()['revision']
+            app.scheduler.refresh('ci')
+            app.scheduler.tick()
+            bound = time.monotonic() + 3
+            while time.monotonic() < bound:
+                envelope = app.panel_snapshot('ci')['envelope']
+                if app.snapshot()['revision'] > before and not envelope['in_flight']:
+                    return envelope
+                time.sleep(.005)
+            self.fail('CI publication did not complete')
+        fresh = publish_ci()
+        self.assertFalse(fresh['data']['repositories'][0]['stale'])
+        before = len(calls)
+        reused = actions.fetch(time.monotonic() + 5).data['repositories'][0]
+        self.assertTrue(reused['available']); self.assertEqual(reused['queued'], 1)
+        self.assertEqual(len(calls), before)
+        denied[0] = True; current[0] += 1
+        stale = publish_ci()
+        self.assertTrue(stale['data']['repositories'][0]['stale'])
+        before = len(calls)
+        retained = actions.fetch(time.monotonic() + 5).data['repositories'][0]
+        self.assertFalse(retained['available']); self.assertTrue(retained['stale'])
+        self.assertEqual(retained['queued'], 1)
+        self.assertEqual(retained['observed_at'], reused['observed_at'])
+        self.assertEqual(len(calls), before)
 
     def test_cycle_configuration_must_match_api_period(self):
         now=dt.datetime.fromtimestamp(NOW,dt.timezone.utc)
