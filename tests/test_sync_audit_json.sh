@@ -5,6 +5,12 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SCRIPT="$ROOT/scripts/sync-to-downstream.sh"
 for tool in git jq yq; do command -v "$tool" >/dev/null || { echo "SKIP: $tool unavailable"; exit 0; }; done
 yq --version | grep -q mikefarah/yq || { echo 'SKIP: mikefarah/yq unavailable'; exit 0; }
+REAL_FIND=$(command -v find)
+REAL_MKTEMP=$(command -v mktemp)
+REAL_CAT=$(command -v cat)
+REAL_RM=$(command -v rm)
+REAL_YQ=$(command -v yq)
+REAL_JQ=$(command -v jq)
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/sync-audit-json.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 MP="$WORK/hub" SIB="$WORK/siblings" CACHE="$WORK/cache"
@@ -287,7 +293,109 @@ SH
 chmod +x "$WORK/bin/find"
 run 2 --audit --json --use-local-tree --no-clone --repos clean --paths kit/
 [ ! -s "$WORK/out" ] || fail 'failed enumeration emitted a clean record'
+# A later fatal consumer cannot publish an earlier successful record prefix.
+# The real CLI is invoked with two selected consumers in manifest order.
+export REAL_FIND AUDIT_FIND_CALLS="$WORK/find-calls"
+: > "$AUDIT_FIND_CALLS"
+cat > "$WORK/bin/find" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'find\n' >> "$AUDIT_FIND_CALLS"
+[ "$(wc -l < "$AUDIT_FIND_CALLS" | tr -d ' ')" -lt 2 ] || exit 1
+exec "$REAL_FIND" "$@"
+SH
+chmod +x "$WORK/bin/find"
+: > "$AUDIT_CALLS"
+run 2 --audit --json --use-local-tree --no-clone --repos clean,drift --paths kit/
+[ "$(wc -l < "$AUDIT_FIND_CALLS" | tr -d ' ')" = 2 ] || fail 'later enumeration failure not exercised'
+[ "$(wc -l < "$AUDIT_CALLS" | tr -d ' ')" = 1 ] || fail 'first consumer did not complete before fatal second consumer'
+[ ! -s "$WORK/out" ] || fail 'later fatal consumer published incomplete NDJSON prefix'
 rm "$WORK/bin/find"
+# Isolate JSON-owned temp files so success and every abort prove cleanup.
+AUDIT_TMP="$WORK/audit-tmp"
+mkdir -p "$AUDIT_TMP"
+export REAL_MKTEMP REAL_CAT REAL_RM REAL_YQ REAL_JQ
+export AUDIT_FAULT_LOG="$WORK/fault-log"
+cat > "$WORK/bin/mktemp" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  *audit-json-output.*)
+    case "${AUDIT_FAULT:-}" in
+      allocate) exit 7 ;;
+      write)
+        path=$("$REAL_MKTEMP" "$@")
+        "$REAL_RM" -f "$path"
+        mkdir "$path"
+        printf '%s\n' "$path"
+        exit 0 ;;
+    esac ;;
+  *audit-json-kit.*)
+    if [ "${AUDIT_FAULT:-}" = kit_allocate ]; then
+      printf 'kit\n' >> "$AUDIT_FAULT_LOG"
+      [ "$(wc -l < "$AUDIT_FAULT_LOG" | tr -d ' ')" -lt 2 ] || exit 7
+    fi ;;
+esac
+exec "$REAL_MKTEMP" "$@"
+SH
+cat > "$WORK/bin/cat" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${AUDIT_FAULT:-}" = read ] && [[ "$*" == *audit-json-output.* ]]; then exit 8; fi
+exec "$REAL_CAT" "$@"
+SH
+cat > "$WORK/bin/rm" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${AUDIT_FAULT:-}" = cleanup ] && [[ "$*" == *audit-json-output.* ]] && [ ! -s "$AUDIT_FAULT_LOG" ]; then
+  printf 'cleanup\n' >> "$AUDIT_FAULT_LOG"
+  exit 9
+fi
+exec "$REAL_RM" "$@"
+SH
+cat > "$WORK/bin/yq" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${AUDIT_FAULT:-}" = visibility ] && [ "${AUDIT_CONSUMER:-}" = drift ]; then exit 7; fi
+exec "$REAL_YQ" "$@"
+SH
+cat > "$WORK/bin/jq" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${AUDIT_FAULT:-}" = serialize ] && [[ "$*" == '-cn --arg name drift '* ]]; then
+  printf '{"incomplete":'
+  exit 4
+fi
+exec "$REAL_JQ" "$@"
+SH
+chmod +x "$WORK/bin/mktemp" "$WORK/bin/cat" "$WORK/bin/rm" "$WORK/bin/yq" "$WORK/bin/jq"
+for fault in allocate write kit_allocate visibility serialize read cleanup; do
+  export AUDIT_FAULT=$fault
+  : > "$AUDIT_FAULT_LOG"
+  : > "$AUDIT_CALLS"
+  TMPDIR="$AUDIT_TMP" run 2 --audit --json --use-local-tree --no-clone --repos clean,drift --paths kit/
+  [ ! -s "$WORK/out" ] || fail "$fault published incomplete audit output"
+  case "$fault" in
+    allocate|write) [ ! -s "$AUDIT_CALLS" ] || fail "$fault called provider before buffer was usable" ;;
+    kit_allocate|visibility) [ "$(wc -l < "$AUDIT_CALLS" | tr -d ' ')" = 1 ] || fail "$fault did not abort after first completed consumer" ;;
+    serialize|read|cleanup) [ "$(wc -l < "$AUDIT_CALLS" | tr -d ' ')" = 2 ] || fail "$fault did not exercise final serialization/publication" ;;
+  esac
+  if [ "$fault" = write ]; then
+    # The returned directory deliberately makes opening stdout's buffer fail
+    # even under root. The EXIT trap attempted unlink; fixture owns its rmdir.
+    grep -Eq 'Is a directory|is a directory' "$WORK/err" || fail 'buffer open/write failure was not exercised'
+    rmdir "$AUDIT_TMP"/audit-json-output.*
+  fi
+  [ -z "$("$REAL_FIND" "$AUDIT_TMP" -mindepth 1 -print)" ] || fail "$fault leaked JSON temporary state"
+done
+unset AUDIT_FAULT
+rm "$WORK/bin/mktemp" "$WORK/bin/cat" "$WORK/bin/rm" "$WORK/bin/yq" "$WORK/bin/jq"
+for expected_and_repos in '0 clean,drift' '1 clean,ahead' '3 clean,failed'; do
+  read -r expected repos <<< "$expected_and_repos"
+  TMPDIR="$AUDIT_TMP" run "$expected" --audit --json --use-local-tree --no-clone --repos "$repos" --paths kit/
+  assert_json 'length == 2 and .[0].name == "clean"'
+  [ -z "$("$REAL_FIND" "$AUDIT_TMP" -mindepth 1 -print)" ] || fail 'completed audit leaked JSON temporary state'
+done
 yq -i '.paths |= map(select(.path != "empty-kit/"))' "$MP/.mergepath-sync.yml"
 # Default cache baseline remains live, ignores sibling edits, follows rename.
 mkdir -p "$CACHE"

@@ -5,6 +5,44 @@
 # Audit flags are read by the sourcing engine.
 # shellcheck disable=SC2034
 
+# Keep fleet records private until every selected consumer has completed.
+# The engine calls run_audit unconditionally so strict errexit still reaches
+# failures inside its functions. The EXIT trap normalizes aborted JSON runs
+# to script-error status 2, without changing completed 0/1/3 dispositions.
+audit_json_buffer_begin() {
+  AJ_BUFFER='' AJ_COMPLETE=0
+  trap 'audit_json_buffer_cleanup' EXIT
+  AJ_BUFFER=$(mktemp "${TMPDIR:-/tmp}/audit-json-output.XXXXXX") || {
+    err "could not allocate audit JSON output buffer"
+    return 2
+  }
+}
+
+audit_json_buffer_cleanup() {
+  local status=$?
+  [ -z "${AJ_BUFFER:-}" ] || rm -f -- "$AJ_BUFFER" || true
+  if [ "${AJ_COMPLETE:-0}" != 1 ]; then exit 2; fi
+  return "$status"
+}
+
+audit_json_buffer_flush() {
+  local records
+  # Read and remove the private buffer before publishing. Read/cleanup errors
+  # must not expose a syntactically valid but incomplete fleet prefix either.
+  records=$(cat -- "$AJ_BUFFER") || {
+    err "could not read audit JSON output buffer"
+    return 2
+  }
+  rm -f -- "$AJ_BUFFER" || {
+    err "could not remove audit JSON output buffer"
+    return 2
+  }
+  AJ_BUFFER=''
+  if [ -n "$records" ]; then
+    printf '%s\n' "$records" || { err "could not publish audit JSON output"; return 2; }
+  fi
+}
+
 audit_json_begin() {
   AJ_NAME=$1 AJ_REPO=$2
   AJ_VISIBILITY=$(AUDIT_CONSUMER="$1" yq -r '.consumers[] | select(.name == strenv(AUDIT_CONSUMER)) | .visibility // "unknown"' "$3") || {

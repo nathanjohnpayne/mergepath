@@ -3411,7 +3411,18 @@ case "$MODE" in
       fi
       source "$(dirname "${BASH_SOURCE[0]}")/lib/sync-audit-json.sh"
     fi
-    run_audit
+    if [ "$AUDIT_JSON" = "1" ]; then
+      audit_json_buffer_begin
+      # Do not use if/! or || around run_audit: those disable errexit inside
+      # the existing helper stack and can turn fatal reads into valid records.
+      run_audit > "$AJ_BUFFER"
+      audit_json_buffer_flush
+      # Read by the sourced JSON-only EXIT trap.
+      # shellcheck disable=SC2034
+      AJ_COMPLETE=1
+    else
+      run_audit
+    fi
     if [ "${AUDIT_FETCH_ERROR:-0}" = "1" ]; then
       exit 3
     elif [ "${AUDIT_DRIFT_FOUND:-0}" = "1" ]; then
