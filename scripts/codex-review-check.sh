@@ -3009,6 +3009,7 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
           | last
           | [ (.body // "") | scan("<!-- mergepath-p4b-request-generation: ([^>]*) -->") | .[0] ]
           | if length == 0 then "none"
+            elif length > 1 then "invalid"
             else (last | try (fromjson | select(type == "array" and all(.[]; type == "number")) | tojson) catch "invalid")
                  // "invalid"
             end' 2>/dev/null || printf invalid)
@@ -3017,7 +3018,7 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
       elif [ -z "$REQUEST_COMMENTS_JSON" ]; then
         PHASE_4B_SUPERSEDED="Codex request evidence could not be re-read"
       elif [ "$PHASE_4B_RECORD" = invalid ]; then
-        PHASE_4B_SUPERSEDED="its recorded request generation is unreadable"
+        PHASE_4B_SUPERSEDED="its recorded request generation is unreadable or not exactly one record"
       elif [ "$PHASE_4B_RECORD" != none ]; then
         if ! LIVE_REQUEST_GENERATION=$(crqe_trigger_generation "$REQUEST_COMMENTS_JSON" "$AUTHOR_IDENTITY" 2>/dev/null); then
           PHASE_4B_SUPERSEDED="Codex request evidence unreadable"

@@ -223,6 +223,9 @@ CASES
 RACE_COMMENTS='[{"id":123,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:01:00Z","body":"@codex review"},{"id":124,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:04:00Z","body":"@codex review"}]'
 RACE_APPROVAL='[{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:05:00Z","body":"Automated Phase 4b review\n<!-- mergepath-p4b-request-generation: [123] -->"}]'
 COVERED_APPROVAL='[{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:05:00Z","body":"Automated Phase 4b review\n<!-- mergepath-p4b-request-generation: [123,124] -->"}]'
+# Two markers (e.g. a writer record plus a copy in reviewer-controlled text)
+# are ambiguous: fail closed rather than trust either (Codex on #1599 round 4).
+DUP_RECORD_APPROVAL='[{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:05:00Z","body":"<!-- mergepath-p4b-request-generation: [123,124] -->\n<!-- mergepath-p4b-request-generation: [123,124] -->"}]'
 INVALID_RECORD_APPROVAL='[{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:05:00Z","body":"Automated Phase 4b review\n<!-- mergepath-p4b-request-generation: [123,\"x\"] -->"}]'
 while IFS='|' read -r name reviews expected pattern; do
   printf '%s\n' "$RACE_COMMENTS" >"$DIR/comments"
@@ -246,6 +249,7 @@ done <<CASES
 request-during-final-accounting|$RACE_APPROVAL|1|outside the request generation the approval reviewed
 reviewed-generation-covers-request|$COVERED_APPROVAL|0|cleared — Phase 4b substitute
 invalid-generation-record|$INVALID_RECORD_APPROVAL|1|its recorded request generation is unreadable
+duplicate-generation-record|$DUP_RECORD_APPROVAL|1|not exactly one record
 CASES
 # The supersession re-read failing rejects the candidate (fails closed).
 printf '%s\n' "$RACE_COMMENTS" >"$DIR/comments"

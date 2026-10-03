@@ -1183,6 +1183,14 @@ fi
 if ! p4b_validate_verdict "$VERDICT_JSON"; then
   fall_back_to_manual "adapter returned a non-conformant verdict"
 fi
+# #1598: the approval's request-generation record must be writer-owned. The
+# verdict's text (summary, findings) is rendered into the body and echoed by
+# the accounting block, so neutralize any copy of the record marker in it;
+# the substitute merge gate accepts exactly one marker.
+VERDICT_JSON="$(printf '%s' "$VERDICT_JSON" | jq -c '
+  walk(if type == "string"
+       then gsub("<!--(?<s>\\s*)mergepath-p4b-request-generation"; "<!--\(.s)(quoted) mergepath-p4b-request-generation")
+       else . end)')" || fall_back_to_manual "adapter verdict could not be normalized"
 
 # A Codex trigger can arrive without changing the PR head while the external
 # adapter is running. Revalidate a timeout-derived waiver after the adapter's
