@@ -397,6 +397,25 @@ if [ "${1:-}" = "api" ]; then
     fi
     exit 0
   fi
+  # #1598: an approval with no request-budget snapshot reads the request
+  # generation it records. Serve P4B_FAKE_ISSUE_COMMENTS (default: no
+  # requests); P4B_FAKE_ISSUE_COMMENTS_FAIL makes the read fail, and once the
+# file P4B_FAKE_ISSUE_COMMENTS_SENTINEL exists P4B_FAKE_ISSUE_COMMENTS_AFTER
+# is served instead.
+  if [ "${2:-}" = "--paginate" ]; then
+    case "${3:-}" in
+      repos/o/r/issues/*/comments)
+        [ -z "${P4B_FAKE_ISSUE_COMMENTS_FAIL:-}" ] || exit 1
+        if [ -n "${P4B_FAKE_ISSUE_COMMENTS_SENTINEL:-}" ] && [ -e "$P4B_FAKE_ISSUE_COMMENTS_SENTINEL" ]; then
+          [ -z "${P4B_FAKE_ISSUE_COMMENTS_FAIL_AFTER_SENTINEL:-}" ] || exit 1
+          printf '%s\n' "${P4B_FAKE_ISSUE_COMMENTS_AFTER:-[]}"
+          exit 0
+        fi
+        printf '%s\n' "${P4B_FAKE_ISSUE_COMMENTS:-[]}"
+        exit 0
+        ;;
+    esac
+  fi
   case "${2:-}" in
     repos/o/r/pulls/*)
       # #1143: the orchestrator now reads the PR body on EVERY run, not only
@@ -2612,6 +2631,290 @@ grep -q "^VIA gh-as-author$" "$ISSUE_LOG" \
   && pass "#672: issue writes routed through the author wrapper" || fail "#672: issue create not wrapper-routed"
 grep -q "post-review issue" "$P4B672_BODY" && grep -q "#901" "$P4B672_BODY" \
   && pass "#672: posted APPROVED body carries the issue reference" || fail "#672: issue reference missing from review body"
+
+# #1598: an approval records the Codex request generation it was authorized
+# under, so the substitute merge gate can refuse it once a request outside that
+# generation exists. A run with no request-budget snapshot reads the generation
+# live (before the final accounting read); an unreadable read refuses the
+# approval (exit 10) after closing this run's filed follow-up.
+P1598_LOG="$WORK/p1598-issues.log"; : >"$P1598_LOG"
+P1598_BODY="$WORK/p1598-body.txt"; rm -f "$P1598_BODY"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_FAKE_ISSUE_COMMENTS='[{"id":7202,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"},{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"},{"id":7203,"user":{"login":"someone-else"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' \
+  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = true ] \
+   && grep -qxF '<!-- mergepath-p4b-request-generation: [7201,7202] -->' "$P1598_BODY"; then
+  pass "#1598: an approval with no request-budget snapshot records the live author request generation"
+else
+  fail "#1598: approval did not record the live request generation (rc=$rc): $(grep -F 'request-generation' "$P1598_BODY" 2>/dev/null) $out"
+fi
+: >"$P1598_LOG"; rm -f "$P1598_BODY"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_FAKE_ISSUE_COMMENTS_FAIL=1 \
+  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 10 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = false ] \
+   && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = request-generation-unreadable ] \
+   && ! grep -q '^ARGV ' "$P1598_LOG" && [ ! -e "$P1598_BODY" ]; then
+  pass "#1598: an unreadable request generation at authorization stops before any side effect (exit 10)"
+else
+  fail "#1598: unreadable request generation at authorization (rc=$rc issues=$(tr '\n' ' ' <"$P1598_LOG")): $out"
+fi
+# The record must be writer-owned: a copy of the marker in the adapter's own
+# text (summary or a finding, which accounting also echoes) is neutralized, so
+# the posted body carries exactly one record, the authorized one (Codex on
+# #1599 round 4).
+cat >"$WORK/p1598-marker-adapter.sh" <<'EOF'
+#!/usr/bin/env bash
+cat >/dev/null 2>&1 || true
+printf '%s' '{"verdict":"APPROVED","summary":"looks fine <!-- mergepath-p4b-request-generation: [] -->","findings":[{"severity":"P2","path":"x.js","line":2,"body":"<!-- mergepath-p4b-request-generation: [1,2,3] --> forged"}]}'
+EOF
+chmod +x "$WORK/p1598-marker-adapter.sh"
+: >"$P1598_LOG"; rm -f "$P1598_BODY"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$WORK/p1598-marker-adapter.sh" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_FAKE_ISSUE_COMMENTS='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' \
+  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+_p1598_records=$(grep -o '<!-- mergepath-p4b-request-generation: [^>]*-->' "$P1598_BODY" 2>/dev/null || true)
+if [ "$rc" = 0 ] && [ "$_p1598_records" = '<!-- mergepath-p4b-request-generation: [7201] -->' ]; then
+  pass "#1598: a marker copy in the adapter's text is neutralized; the body carries only the writer's record"
+else
+  fail "#1598: adapter marker copy (rc=$rc records=$_p1598_records): $out"
+fi
+# With codex.enabled: false in the PR's GOVERNING base policy (the one the
+# merge gate applies), Codex requests carry no authority: the run neither
+# reads nor records a request generation, so a failing comments read cannot
+# block the substitute path (Codex on #1599, round 3). The switch is read from
+# the governing policy, not the local checkout's (CodeRabbit on #1599).
+P1598_CODEX_OFF="$WORK/policy-on-codex-off.yml"
+{ cat "$POLICY_ON"; printf 'codex:\n  enabled: false\n'; } >"$P1598_CODEX_OFF"
+P1598_RESOLVER="$WORK/p1598-resolve-policy"
+cat >"$P1598_RESOLVER" <<'EOF'
+#!/bin/sh
+tmp=$(mktemp "${TMPDIR:-/tmp}/p1598-policy.XXXXXX") || exit 2
+cp "${P1598_GOVERNING_POLICY:?}" "$tmp" || exit 2
+printf '%s\n' "$tmp"
+EOF
+chmod +x "$P1598_RESOLVER"
+: >"$P1598_LOG"; rm -f "$P1598_BODY"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$P1598_CODEX_OFF" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  P4B_RESOLVE_BASE_POLICY="$P1598_RESOLVER" P1598_GOVERNING_POLICY="$P1598_CODEX_OFF" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_FAKE_ISSUE_COMMENTS_FAIL=1 \
+  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = true ] \
+   && [ -s "$P1598_BODY" ] && ! grep -q 'mergepath-p4b-request-generation' "$P1598_BODY"; then
+  pass "#1598: with Codex disabled the approval neither reads nor records a request generation"
+else
+  fail "#1598: Codex-disabled approval (rc=$rc record=$(grep -c 'mergepath-p4b-request-generation' "$P1598_BODY" 2>/dev/null)): $out"
+fi
+# The local checkout says Codex is disabled, but the governing base policy
+# enables it: the gate will treat Codex requests as binding, so the run must
+# still capture and record the request generation.
+: >"$P1598_LOG"; rm -f "$P1598_BODY"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$P1598_CODEX_OFF" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  P4B_RESOLVE_BASE_POLICY="$P1598_RESOLVER" P1598_GOVERNING_POLICY="$POLICY_ON" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_FAKE_ISSUE_COMMENTS='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' \
+  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && grep -qxF '<!-- mergepath-p4b-request-generation: [7201] -->' "$P1598_BODY"; then
+  pass "#1598: a governing policy that enables Codex is followed even when the local checkout disables it"
+else
+  fail "#1598: governing-enabled, local-disabled (rc=$rc record=$(grep -o 'mergepath-p4b-request-generation: [^ ]*' "$P1598_BODY" 2>/dev/null)): $out"
+fi
+# The reverse split (Codex on #1599, round 5): the local checkout enables
+# Codex, the governing policy disables it. A failing comments read must not
+# block the run, because the gate ignores Codex requests there.
+: >"$P1598_LOG"; rm -f "$P1598_BODY"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  P4B_RESOLVE_BASE_POLICY="$P1598_RESOLVER" P1598_GOVERNING_POLICY="$P1598_CODEX_OFF" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_FAKE_ISSUE_COMMENTS_FAIL=1 \
+  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = true ] \
+   && [ -s "$P1598_BODY" ] && ! grep -q 'mergepath-p4b-request-generation' "$P1598_BODY"; then
+  pass "#1598: a governing policy that disables Codex is followed even when the local checkout enables it"
+else
+  fail "#1598: governing-disabled, local-enabled (rc=$rc): $out"
+fi
+# The full local x governing matrix, each with the comments read failing: the
+# GOVERNING policy alone decides. Governing-disabled posts with no record,
+# and governing-enabled refuses (exit 10) whatever the local checkout says.
+for _gm in on:on on:off off:on off:off; do
+  _gm_local=${_gm%%:*}; _gm_gov=${_gm#*:}
+  [ "$_gm_local" = on ] && _gm_local_policy="$POLICY_ON" || _gm_local_policy="$P1598_CODEX_OFF"
+  [ "$_gm_gov" = on ] && _gm_gov_policy="$POLICY_ON" || _gm_gov_policy="$P1598_CODEX_OFF"
+  : >"$P1598_LOG"; rm -f "$P1598_BODY"
+  set +e
+  out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$_gm_local_policy" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+    P4B_RESOLVE_BASE_POLICY="$P1598_RESOLVER" P1598_GOVERNING_POLICY="$_gm_gov_policy" \
+    OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
+    P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
+    P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+    P4B_FAKE_ISSUE_COMMENTS_FAIL=1 \
+    bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  set -e
+  if [ "$_gm_gov" = off ]; then
+    if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = true ] \
+       && [ -s "$P1598_BODY" ] && ! grep -q 'mergepath-p4b-request-generation' "$P1598_BODY"; then
+      pass "#1598 matrix local=$_gm_local governing=$_gm_gov: posts with no record despite the failed read"
+    else
+      fail "#1598 matrix local=$_gm_local governing=$_gm_gov (rc=$rc): $out"
+    fi
+  else
+    if [ "$rc" = 10 ] && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = request-generation-unreadable ] \
+       && [ ! -e "$P1598_BODY" ]; then
+      pass "#1598 matrix local=$_gm_local governing=$_gm_gov: refuses (exit 10) on the failed read"
+    else
+      fail "#1598 matrix local=$_gm_local governing=$_gm_gov (rc=$rc): $out"
+    fi
+  fi
+done
+# A request that arrives AFTER authorization but before the writer boundary
+# (here: while the adapter runs) was never reviewed. The writer's re-read sees
+# the generation moved and refuses the approval (exit 10) after closing this
+# run's follow-up, instead of recording the new request as covered.
+P1598_SENTINEL="$WORK/p1598-adapter-ran"; rm -f "$P1598_SENTINEL"
+cat >"$WORK/p1598-adapter.sh" <<EOF
+#!/usr/bin/env bash
+: >'$P1598_SENTINEL'
+exec '$BIN/fake-codex-approve-p2' "\$@"
+EOF
+chmod +x "$WORK/p1598-adapter.sh"
+: >"$P1598_LOG"; rm -f "$P1598_BODY"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$WORK/p1598-adapter.sh" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_FAKE_ISSUE_COMMENTS='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' \
+  P4B_FAKE_ISSUE_COMMENTS_AFTER='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"},{"id":7204,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:01:00Z","body":"@codex review"}]' \
+  P4B_FAKE_ISSUE_COMMENTS_SENTINEL="$P1598_SENTINEL" \
+  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 10 ] && [ -e "$P1598_SENTINEL" ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = false ] \
+   && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = request-generation-changed ] \
+   && grep -q '^CLOSE #901$' "$P1598_LOG" && [ ! -e "$P1598_BODY" ]; then
+  pass "#1598: a request arriving after authorization refuses the approval (exit 10), closing this run's follow-up"
+else
+  fail "#1598: request after authorization (rc=$rc adapter=$([ -e "$P1598_SENTINEL" ] && echo ran) issues=$(tr '\n' ' ' <"$P1598_LOG")): $out"
+fi
+# The same moved generation under a governing policy that disables Codex is
+# not a refusal: the gate ignores Codex requests there.
+rm -f "$P1598_SENTINEL"; : >"$P1598_LOG"; rm -f "$P1598_BODY"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$WORK/p1598-adapter.sh" \
+  P4B_RESOLVE_BASE_POLICY="$P1598_RESOLVER" P1598_GOVERNING_POLICY="$P1598_CODEX_OFF" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_FAKE_ISSUE_COMMENTS='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' \
+  P4B_FAKE_ISSUE_COMMENTS_AFTER='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"},{"id":7204,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:01:00Z","body":"@codex review"}]' \
+  P4B_FAKE_ISSUE_COMMENTS_SENTINEL="$P1598_SENTINEL" \
+  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ -e "$P1598_SENTINEL" ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = true ]; then
+  pass "#1598: a moved request generation is not a refusal when the governing policy disables Codex"
+else
+  fail "#1598: moved generation under governing-disabled Codex (rc=$rc): $out"
+fi
+# G2 (already-cleared route): a request that lands DURING the final
+# accounting read (accounting call 3) is not seen by the run, which posts.
+# The posted record excludes it ([7201], not 7204), so the merge gate holds
+# the approval (tests/test_codex_request_evidence.sh,
+# request-during-final-accounting). This is the revised contract: the run
+# publishes, and a fresh gate evaluation rejects the stale approval.
+cat >"$WORK/p1598-acct-touch.sh" <<'EOF'
+#!/usr/bin/env bash
+n=0
+[ ! -f "$P4B_TEST_ACCT_COUNT" ] || n=$(cat "$P4B_TEST_ACCT_COUNT")
+n=$((n + 1)); printf '%s\n' "$n" >"$P4B_TEST_ACCT_COUNT"
+[ "$n" -ne 3 ] || : >"$P4B_FAKE_ISSUE_COMMENTS_SENTINEL"
+# Report like the default stub, so the post-POST acknowledgment (#1261) sees
+# the posted review body as accounted.
+if [ -s "${P4B_TEST_POSTED_REVIEW:-}" ]; then
+  jq '{feedback_policy:{},findings:[{kind:"review-body",review_id:1,body:.body,accounted:true}],missing:[]}' "$P4B_TEST_POSTED_REVIEW"
+else
+  printf '{"feedback_policy":{},"findings":[],"missing":[]}\n'
+fi
+EOF
+chmod +x "$WORK/p1598-acct-touch.sh"
+rm -f "$P1598_SENTINEL" "$WORK/p1598-acct.count"; : >"$P1598_LOG"; rm -f "$P1598_BODY"; rm -f "$P4B_TEST_POSTED_REVIEW"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$WORK/p1598-acct-touch.sh" P4B_TEST_ACCT_COUNT="$WORK/p1598-acct.count" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_FAKE_ISSUE_COMMENTS='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' \
+  P4B_FAKE_ISSUE_COMMENTS_AFTER='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"},{"id":7204,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:01:00Z","body":"@codex review"}]' \
+  P4B_FAKE_ISSUE_COMMENTS_SENTINEL="$P1598_SENTINEL" \
+  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ -e "$P1598_SENTINEL" ] && [ "$(cat "$WORK/p1598-acct.count" 2>/dev/null || echo 0)" -ge 3 ] \
+   && [ "$(grep -o '<!-- mergepath-p4b-request-generation: [^>]*-->' "$P1598_BODY" 2>/dev/null)" = '<!-- mergepath-p4b-request-generation: [7201] -->' ]; then
+  pass "#1598 G2: on the already-cleared route a request during final accounting is posted outside the record [7201]"
+else
+  fail "#1598 G2: already-cleared route, request during final accounting (rc=$rc record=$(grep -o 'mergepath-p4b-request-generation: [^ ]*' "$P1598_BODY" 2>/dev/null)): $out"
+fi
+# G3: the authorization read succeeds but the writer's re-read fails. With
+# the governing policy enabling Codex (unresolvable here, which counts as
+# enabled) the approval is refused (exit 10) after cleanup; with it disabling
+# Codex the run posts.
+for _g3 in enabled disabled; do
+  rm -f "$P1598_SENTINEL"; : >"$P1598_LOG"; rm -f "$P1598_BODY"
+  if [ "$_g3" = disabled ]; then _g3_resolver="$P1598_RESOLVER"; else _g3_resolver="$WORK/p1598-no-resolver"; fi
+  set +e
+  out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$WORK/p1598-adapter.sh" \
+    P4B_RESOLVE_BASE_POLICY="$_g3_resolver" P1598_GOVERNING_POLICY="$P1598_CODEX_OFF" \
+    OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
+    P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
+    P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+    P4B_FAKE_ISSUE_COMMENTS='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' \
+    P4B_FAKE_ISSUE_COMMENTS_SENTINEL="$P1598_SENTINEL" P4B_FAKE_ISSUE_COMMENTS_FAIL_AFTER_SENTINEL=1 \
+    bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  set -e
+  if [ "$_g3" = enabled ]; then
+    if [ "$rc" = 10 ] && [ -e "$P1598_SENTINEL" ] \
+       && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = request-generation-unrecorded ] \
+       && grep -q '^CLOSE #901$' "$P1598_LOG" && [ ! -e "$P1598_BODY" ]; then
+      pass "#1598 G3: an unreadable writer re-read refuses the approval (exit 10) after cleanup when Codex governs"
+    else
+      fail "#1598 G3 governing-enabled (rc=$rc issues=$(tr '\n' ' ' <"$P1598_LOG")): $out"
+    fi
+  else
+    if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = true ]; then
+      pass "#1598 G3: an unreadable writer re-read does not refuse when the governing policy disables Codex"
+    else
+      fail "#1598 G3 governing-disabled (rc=$rc): $out"
+    fi
+  fi
+done
 P2_FP="$(printf '%s|%s|%s|%s' P2 x.js 2 "should be handled under stricter policy" | cksum | cut -d' ' -f1)"
 grep -q "p4b-post-review o/r#134 head=abc123 finding=${P2_FP}" "${ISSUE_LOG}.body.1" \
   && pass "#674: filed issue body embeds the content-fingerprinted dedup marker" || fail "#674: content-fingerprint marker missing from issue body"
@@ -5913,12 +6216,14 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
   P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
   P4B_WRAPPER_LOG="$_race_wrapper" P4B_FAKE_LIVE_HEAD="$_race_head" \
   P4B_FAKE_COMMENTS_BEFORE="$_race_before" P4B_FAKE_COMMENTS_AFTER="$_race_after" \
-  P4B_FAKE_COMMENTS_COUNT="$_race_count" \
+  P4B_FAKE_COMMENTS_COUNT="$_race_count" P4B_FAKE_COMMENTS_SWITCH_AFTER=2 \
   bash "$ORCH" 131 --repo o/r --author claude --head "$_race_head" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
+# Read 1 is the barrier and read 2 the request-generation capture at
+# authorization (#1598); the trigger lands after it, in the adapter window.
 if [ "$rc" = 6 ] \
    && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = superseded ] \
-   && [ "$(cat "$_race_count" 2>/dev/null)" = 2 ] \
+   && [ "$(cat "$_race_count" 2>/dev/null)" = 3 ] \
    && grep -q '^adapter-ran$' "$_race_adapter" \
    && [ ! -e "$_race_wrapper" ]; then
   pass "#1085: a proven adapter-window Codex trigger retracts the old timeout before the first approval-side effect"
@@ -5947,13 +6252,13 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
   P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat \
   P4B_WRAPPER_LOG="$_race_wrapper" P4B_FAKE_LIVE_HEAD="$_race_head" \
   P4B_FAKE_COMMENTS_BEFORE="$_race_before" P4B_FAKE_COMMENTS_AFTER="$_race_after" \
-  P4B_FAKE_COMMENTS_COUNT="$_race_count" P4B_FAKE_COMMENTS_SWITCH_AFTER=2 \
+  P4B_FAKE_COMMENTS_COUNT="$_race_count" P4B_FAKE_COMMENTS_SWITCH_AFTER=3 \
   P4B_ISSUE_LOG="$_race_issue_log" P4B_ACCT_STATE_DIR="$_race_acct" \
   bash "$ORCH" 131 --repo o/r --author claude --head "$_race_head" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 6 ] \
    && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = superseded ] \
-   && [ "$(cat "$_race_count" 2>/dev/null)" = 3 ] \
+   && [ "$(cat "$_race_count" 2>/dev/null)" = 4 ] \
    && grep -q '^adapter-ran$' "$_race_adapter" \
    && grep -q '^ARGV ' "$_race_issue_log" \
    && grep -q '^CLOSE #901$' "$_race_issue_log" \
@@ -5964,6 +6269,106 @@ if [ "$rc" = 6 ] \
   pass "#1085: a pre-POST trigger retracts the old timeout and cleans filed issues plus provisional accounting before holding"
 else
   fail "#1085: pre-POST trigger race did not cleanly hold (rc=$rc reads=$(cat "$_race_count" 2>/dev/null || true) issue-log=$(tr '\n' ' ' <"$_race_issue_log" 2>/dev/null || true) loop=$(cat "$_race_loop" 2>/dev/null || true) wrapper=$(test -e "$_race_wrapper" && cat "$_race_wrapper" || true)): $out"
+fi
+
+# #1598 on the Phase 4a timeout route (no request-budget snapshot): a request
+# that lands AFTER the timeout's last recheck (read 4) but before the writer's
+# generation verification (read 5) was never reviewed. It must not be recorded
+# as covered: the writer sees the generation moved since authorization (read 2)
+# and refuses the approval (exit 10), closing this run's follow-up, correcting
+# the provisional loop and never invoking the reviewer wrapper. Without a new
+# request the same run reaches the reviewer wrapper.
+for _tr_case in moved unchanged; do
+  case "$_tr_case" in
+    moved) _tr_switch=4; _tr_reviewer="$WORK/stub-rev-guard.sh" ;;
+    *) _tr_switch=99; _tr_reviewer="$BIN/fake-gh-as-reviewer" ;;
+  esac
+  _tr_body="$WORK/timeout-record-body.txt"; rm -f "$_tr_body"
+  rm -rf "$_race_acct"
+  rm -f "$_race_count" "$_race_wrapper" "$_race_adapter" "$_race_issue_log" "$_race_issue_log.headreads"
+  : >"$_race_issue_log"
+  set +e
+  out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+    CODEX_BIN="$BIN/fake-codex-race-approve-p2" \
+    P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" \
+    P4B_CODERABBIT_WAIT="$WORK/stub-race-coderabbit.sh" \
+    P4B_GH_AS_REVIEWER="$_tr_reviewer" P4B_WRAPPER_BODY="$_tr_body" \
+    P4B_TEST_POSTED_REVIEW="$WORK/timeout-record-posted.json" P4B_FAKE_CREATED_REVIEW_HEAD="$_race_head" \
+    P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat \
+    P4B_WRAPPER_LOG="$_race_wrapper" P4B_FAKE_LIVE_HEAD="$_race_head" \
+    P4B_FAKE_COMMENTS_BEFORE="$_race_before" P4B_FAKE_COMMENTS_AFTER="$_race_after" \
+    P4B_FAKE_COMMENTS_COUNT="$_race_count" P4B_FAKE_COMMENTS_SWITCH_AFTER="$_tr_switch" \
+    P4B_ISSUE_LOG="$_race_issue_log" P4B_ACCT_STATE_DIR="$_race_acct" \
+    bash "$ORCH" 131 --repo o/r --author claude --head "$_race_head" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  set -e
+  _tr_diag="rc=$rc reads=$(cat "$_race_count" 2>/dev/null || true) issue-log=$(tr '\n' ' ' <"$_race_issue_log" 2>/dev/null || true) wrapper=$(test -e "$_race_wrapper" && echo invoked || true)"
+  if [ "$_tr_case" = unchanged ]; then
+    if [ "$(cat "$_race_count" 2>/dev/null)" = 5 ] && grep -q '^adapter-ran$' "$_race_adapter" && [ -e "$_race_wrapper" ] \
+       && grep -qxF '<!-- mergepath-p4b-request-generation: [4101] -->' "$_tr_body"; then
+      pass "#1598: on the timeout route an unchanged request generation reaches the review POST, recording [4101]"
+    else
+      fail "#1598: timeout-route control did not reach the review POST ($_tr_diag): $out"
+    fi
+    continue
+  fi
+  if [ "$rc" = 10 ] \
+     && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = request-generation-changed ] \
+     && [ "$(cat "$_race_count" 2>/dev/null)" = 5 ] \
+     && grep -q '^adapter-ran$' "$_race_adapter" \
+     && grep -q '^ARGV ' "$_race_issue_log" \
+     && grep -q '^CLOSE #901$' "$_race_issue_log" \
+     && [ "$(jq -sr 'last.loop.posted' "$_race_loop" 2>/dev/null)" = "not-posted" ] \
+     && [ "$(jq -sr 'last.loop.fail_closed.happened' "$_race_loop" 2>/dev/null)" = "true" ] \
+     && [ ! -e "$_race_pending" ] \
+     && [ ! -e "$_race_wrapper" ]; then
+    pass "#1598: on the timeout route a request after the last timeout recheck is refused, never recorded as covered"
+  else
+    fail "#1598: timeout-route request after authorization ($_tr_diag): $out"
+  fi
+done
+# G1 (timeout route): a request that lands DURING the final accounting read
+# (accounting call 3, after the writer's generation verification at read 5)
+# is not seen by the run, which posts. The record excludes it ([4101], not
+# 4103), so the merge gate holds the approval (revised contract).
+cat >"$WORK/acct-timeout-final.sh" <<'EOF'
+#!/usr/bin/env bash
+n=0
+[ ! -f "$P4B_TEST_ACCT_COUNT" ] || n=$(cat "$P4B_TEST_ACCT_COUNT")
+n=$((n + 1)); printf '%s\n' "$n" >"$P4B_TEST_ACCT_COUNT"
+[ "$n" -ne 3 ] || printf '99\n' >"$P4B_FAKE_COMMENTS_COUNT"
+# Report like the default stub, so the post-POST acknowledgment (#1261) sees
+# the posted review body as accounted.
+if [ -s "${P4B_TEST_POSTED_REVIEW:-}" ]; then
+  jq '{feedback_policy:{},findings:[{kind:"review-body",review_id:1,body:.body,accounted:true}],missing:[]}' "$P4B_TEST_POSTED_REVIEW"
+else
+  printf '{"feedback_policy":{},"findings":[],"missing":[]}\n'
+fi
+EOF
+chmod +x "$WORK/acct-timeout-final.sh"
+_g1_body="$WORK/timeout-final-body.txt"; _g1_acct_count="$WORK/timeout-final-acct.count"
+rm -rf "$_race_acct"
+rm -f "$_race_count" "$_race_wrapper" "$_race_adapter" "$_race_issue_log" "$_race_issue_log.headreads" "$_g1_body" "$_g1_acct_count"
+: >"$_race_issue_log"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+  MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$WORK/acct-timeout-final.sh" P4B_TEST_ACCT_COUNT="$_g1_acct_count" \
+  CODEX_BIN="$BIN/fake-codex-race-approve-p2" \
+  P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" \
+  P4B_CODERABBIT_WAIT="$WORK/stub-race-coderabbit.sh" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_BODY="$_g1_body" \
+  P4B_TEST_POSTED_REVIEW="$WORK/timeout-final-posted.json" P4B_FAKE_CREATED_REVIEW_HEAD="$_race_head" \
+  P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat \
+  P4B_WRAPPER_LOG="$_race_wrapper" P4B_FAKE_LIVE_HEAD="$_race_head" \
+  P4B_FAKE_COMMENTS_BEFORE="$_race_before" P4B_FAKE_COMMENTS_AFTER="$_race_after" \
+  P4B_FAKE_COMMENTS_COUNT="$_race_count" P4B_FAKE_COMMENTS_SWITCH_AFTER=6 \
+  P4B_ISSUE_LOG="$_race_issue_log" P4B_ACCT_STATE_DIR="$_race_acct" \
+  bash "$ORCH" 131 --repo o/r --author claude --head "$_race_head" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ -e "$_race_wrapper" ] && [ "$(cat "$_g1_acct_count" 2>/dev/null || echo 0)" -ge 3 ] \
+   && [ "$(grep -o '<!-- mergepath-p4b-request-generation: [^>]*-->' "$_g1_body" 2>/dev/null)" = '<!-- mergepath-p4b-request-generation: [4101] -->' ]; then
+  pass "#1598 G1: on the timeout route a request during final accounting is posted outside the record [4101]"
+else
+  fail "#1598 G1: timeout route, request during final accounting (rc=$rc acct=$(cat "$_g1_acct_count" 2>/dev/null) record=$(grep -o 'mergepath-p4b-request-generation: [^ ]*' "$_g1_body" 2>/dev/null)): $out"
 fi
 
 # #1305/#1474: an account-blocked Codex with budget remaining may dispatch the
@@ -6438,6 +6843,62 @@ else
   fail "#1474 mutation control did not isolate final writer fence (rc=$rc reads=$(cat "$_prep_count" 2>/dev/null || true) flip=$(cat "$_prep_flip_log" 2>/dev/null || true) adapter=$(cat "$_prep_adapter_log" 2>/dev/null || true) reviewer=$(cat "$_prep_reviewer" 2>/dev/null || true)): $out"
 fi
 
+# #1598's exact acceptance case on the writer side: a new author request lands
+# DURING the final feedback-accounting read (the 3rd accounting call), after
+# the last authority fence. The approval still posts (no read follows the final
+# accounting read), but it records the generation it was authorized under,
+# which excludes the new request; the substitute merge gate then refuses it
+# until Codex answers (tests/test_codex_request_evidence.sh covers the gate).
+_rg_count="$WORK/record-gen-comments.count"
+_rg_acct_count="$WORK/record-gen-acct.count"
+_rg_body="$WORK/record-gen-body.txt"
+_rg_issue="$WORK/record-gen-issue.log"
+_rg_acct="$WORK/record-gen-acct"
+cat >"$WORK/acct-record-gen.sh" <<'EOF'
+#!/usr/bin/env bash
+n=0
+[ ! -f "$P4B_TEST_ACCT_COUNT" ] || n=$(cat "$P4B_TEST_ACCT_COUNT")
+n=$((n + 1)); printf '%s\n' "$n" >"$P4B_TEST_ACCT_COUNT"
+[ "$n" -ne 3 ] || printf '99\n' >"$P4B_FAKE_COMMENTS_COUNT"
+printf '{"feedback_policy":{},"findings":[],"missing":[]}\n'
+EOF
+chmod +x "$WORK/acct-record-gen.sh"
+cat >"$WORK/record-gen-adapter.sh" <<'EOF'
+#!/usr/bin/env bash
+cat >/dev/null 2>&1 || true
+printf '%s' '{"verdict":"APPROVED","summary":"final accounting race","findings":[]}'
+EOF
+chmod +x "$WORK/record-gen-adapter.sh"
+rm -rf "$_rg_acct"; rm -f "$_rg_count" "$_rg_acct_count" "$_rg_body" "$_rg_issue" "$_rg_issue.headreads"
+: >"$_rg_issue"
+set +e
+out="$(PATH="$WORK/budget-bin:$BIN:$PATH" \
+  MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-adapter-race.yml" \
+  MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$WORK/acct-record-gen.sh" P4B_TEST_ACCT_COUNT="$_rg_acct_count" \
+  CODEX_BIN="$WORK/record-gen-adapter.sh" P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-blocked.sh" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WORK/record-gen-wrapper.log" \
+  P4B_WRAPPER_BODY="$_rg_body" P4B_TEST_POSTED_REVIEW="$WORK/record-gen-posted.json" \
+  P4B_FAKE_CREATED_REVIEW_HEAD="$_race_head" \
+  P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat \
+  P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$WORK/record-gen-handoff.log" \
+  P4B_FAKE_LIVE_HEAD="$_race_head" \
+  P4B_FAKE_COMMENTS_BEFORE="$_budget_before" P4B_FAKE_COMMENTS_AFTER="$_budget_after" \
+  P4B_FAKE_COMMENTS_COUNT="$_rg_count" P4B_FAKE_COMMENTS_SWITCH_AFTER=99 \
+  P4B_ISSUE_LOG="$_rg_issue" P4B_ACCT_STATE_DIR="$_rg_acct" \
+  bash "$ORCH" 131 --repo o/r --author claude --head "$_race_head" --diff-file "$DIFF" \
+    2>"$WORK/record-gen.err")"; rc=$?
+set -e
+_rg_recorded=$(sed -n 's/^<!-- mergepath-p4b-request-generation: \(.*\) -->$/\1/p' "$_rg_body" 2>/dev/null)
+_rg_live=$(jq -c '[.[] | select(.user.login == "nathanjohnpayne") | .id] | sort' "$_budget_after" 2>/dev/null || true)
+if [ "$(cat "$_rg_acct_count" 2>/dev/null || echo 0)" -ge 3 ] \
+   && [ "$(cat "$_rg_count" 2>/dev/null || true)" = 99 ] \
+   && [ "$rc" = 0 ] && [ -s "$_rg_body" ] \
+   && [ "$_rg_recorded" = '[]' ] && [ "$_rg_live" = '[7101]' ]; then
+  pass "#1598: a request landing during the final accounting read stays outside the approval's recorded generation"
+else
+  fail "#1598: recorded generation under the final-accounting race (rc=$rc acct=$(cat "$_rg_acct_count" 2>/dev/null) reads=$(cat "$_rg_count" 2>/dev/null) recorded=$_rg_recorded live=$_rg_live): $out $(tail -3 "$WORK/record-gen.err")"
+fi
+
 # Unsafe evidence takes the manual-fallback route rather than a hold. Make the
 # fallback's own accounting gate fail on its second invocation to prove the
 # final fence corrected local state BEFORE that fallible read: even exit 7
@@ -6478,13 +6939,13 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
   P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$_race_handoff" \
   P4B_WRAPPER_LOG="$_race_wrapper" P4B_FAKE_LIVE_HEAD="$_race_head" \
   P4B_FAKE_COMMENTS_BEFORE="$_race_before" P4B_FAKE_COMMENTS_AFTER="$_race_malformed_after" \
-  P4B_FAKE_COMMENTS_COUNT="$_race_count" P4B_FAKE_COMMENTS_SWITCH_AFTER=2 \
+  P4B_FAKE_COMMENTS_COUNT="$_race_count" P4B_FAKE_COMMENTS_SWITCH_AFTER=3 \
   P4B_ISSUE_LOG="$_race_issue_log" P4B_ACCT_STATE_DIR="$_race_acct" \
   bash "$ORCH" 131 --repo o/r --author claude --head "$_race_head" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 7 ] \
    && [ "$(cat "$_race_gate_count" 2>/dev/null)" = 2 ] \
-   && [ "$(cat "$_race_count" 2>/dev/null)" = 3 ] \
+   && [ "$(cat "$_race_count" 2>/dev/null)" = 4 ] \
    && grep -q '^CLOSE #901$' "$_race_issue_log" \
    && [ "$(jq -sr 'length' "$_race_loop" 2>/dev/null)" = 1 ] \
    && [ "$(jq -sr 'last.loop.posted' "$_race_loop" 2>/dev/null)" = "not-posted" ] \
