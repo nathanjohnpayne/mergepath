@@ -28,7 +28,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Playground**: A static review-policy prototyping UI: tune the policy knobs, replay recent PRs against the draft, copy the resulting YAML. _Avoid_: "Rubric" (retired name), "dashboard", "policy editor" (an explicit non-goal, earmarked for Cockpit).
 
-**Cockpit**: The local operator console for in-progress reviews, with an authenticated stdlib server and shared shell under `mergepath/cockpit/`. Connection health, observed API-resource meters, repository filtering and Road components are available; PR rows and review-budget evidence are connected, with unknown or stale data explicitly marked. Remaining panel sources show unavailable until connected. Cockpit display defaults do not change review policy or trigger reviews; sync actions are not connected. _Avoid_: calling unavailable panels operational.
+**Cockpit**: The local operator console for in-progress reviews, with an authenticated stdlib server and shared shell under `mergepath/cockpit/`. Connection health, observed API-resource meters, repository filtering and Road components are available; PR rows, review-budget evidence and slow read-only Fleet audits are connected, with unknown or stale data explicitly marked. Fleet refresh preserves last-good rows and shares current PR evidence. Remaining panel sources show unavailable until connected. Cockpit display defaults do not change review policy or trigger reviews; sync actions are not connected. _Avoid_: calling unavailable panels operational.
 
 **Replay**: Running a set of real merged PRs through a draft policy to see routing before committing the YAML. _Avoid_: "backtest".
 
