@@ -99,6 +99,64 @@ run() {
   [ "$rc" = "$expected" ] || fail "expected exit $expected, got $rc: $*"
 }
 assert_json() { jq -es "$1" "$WORK/out" >/dev/null || fail "$1"; }
+# Exercise the propagated wrapper itself, replacing only its suite boundaries.
+# Old engine/test residue must not introduce a JSON dependency without the hub
+# manifest. Preserve the existing legacy/project-doc dispatch and error exits.
+WRAPPER_FIXTURE="$WORK/wrapper"
+export WRAPPER_TRACE="$WORK/wrapper-calls" WRAPPER_LEGACY_RC=0
+wrapper_fixture() { # manifest engine legacy json
+  rm -rf "$WRAPPER_FIXTURE"
+  mkdir -p "$WRAPPER_FIXTURE/scripts/ci" "$WRAPPER_FIXTURE/tests"
+  cp "$ROOT/scripts/ci/check_sync_to_downstream" "$WRAPPER_FIXTURE/scripts/ci/"
+  [ "$1" = no ] || touch "$WRAPPER_FIXTURE/.mergepath-sync.yml"
+  [ "$2" = no ] || touch "$WRAPPER_FIXTURE/scripts/sync-to-downstream.sh"
+  if [ "$3" = yes ]; then
+    cat > "$WRAPPER_FIXTURE/tests/test_sync_to_downstream.sh" <<'SH'
+printf 'legacy\n' >> "$WRAPPER_TRACE"
+exit "${WRAPPER_LEGACY_RC:-0}"
+SH
+  fi
+  if [ "$4" = yes ]; then
+    cat > "$WRAPPER_FIXTURE/tests/test_sync_audit_json.sh" <<'SH'
+printf 'json\n' >> "$WRAPPER_TRACE"
+SH
+  fi
+  cat > "$WRAPPER_FIXTURE/tests/test_project_doc_sync.sh" <<'SH'
+printf 'project-doc\n' >> "$WRAPPER_TRACE"
+SH
+}
+check_wrapper() { # expected exit, exact ordered suite calls
+  local rc=0
+  : > "$WRAPPER_TRACE"
+  bash "$WRAPPER_FIXTURE/scripts/ci/check_sync_to_downstream" > "$WORK/out" 2> "$WORK/err" || rc=$?
+  [ "$rc" = "$1" ] || fail "wrapper expected exit $1, got $rc"
+  [ "$(cat "$WRAPPER_TRACE")" = "$2" ] || fail "wrapper dispatched unexpected suites: $(cat "$WRAPPER_TRACE")"
+}
+wrapper_fixture no no no no
+check_wrapper 0 ''
+grep -q '^check_sync_to_downstream: SKIP (consumer checkout:' "$WORK/out" || fail 'legacy consumer skip changed'
+wrapper_fixture no yes yes no
+check_wrapper 0 $'legacy\nproject-doc'
+wrapper_fixture no yes yes yes
+check_wrapper 0 $'legacy\nproject-doc'
+# The existing integrity gate still catches hub manifest deletion; the new
+# wrapper guard does not turn that malformed checkout into a passing hub.
+manifest_rc=0
+MERGEPATH_REPO_ROOT="$WRAPPER_FIXTURE" MERGEPATH_MANIFEST_PATH="$WRAPPER_FIXTURE/.mergepath-sync.yml" \
+  bash "$ROOT/scripts/ci/check_sync_manifest" > "$WORK/out" 2> "$WORK/err" || manifest_rc=$?
+[ "$manifest_rc" = 1 ] || fail 'missing hub manifest no longer fails its existing gate'
+wrapper_fixture yes yes yes no
+check_wrapper 1 legacy
+grep -q 'missing .*tests/test_sync_audit_json.sh' "$WORK/err" || fail 'hub missing JSON suite did not fail explicitly'
+wrapper_fixture yes yes yes yes
+check_wrapper 0 $'legacy\njson\nproject-doc'
+WRAPPER_LEGACY_RC=7
+check_wrapper 7 legacy
+WRAPPER_LEGACY_RC=0
+wrapper_fixture yes yes no yes
+check_wrapper 1 ''
+grep -q 'missing .*tests/test_sync_to_downstream.sh' "$WORK/err" || fail 'hub missing legacy suite no longer fails'
+unset WRAPPER_TRACE WRAPPER_LEGACY_RC
 # Golden legacy output: complete fixed fixture; independent of checkout history.
 # Byte-compare stdout and stderr, not a reconstructed JSON rendering.
 run 3 --audit --use-local-tree --no-clone

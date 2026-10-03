@@ -51,9 +51,10 @@ fi
 
 bash "$TEST_SCRIPT"
 
-# JSON audit is a hub engine surface. Existing consumer residue must not
-# activate a new dependency on its hub-only suite.
-if [ -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+# Require both hub markers before adding the JSON-only dependency. An old
+# engine/test without the manifest keeps its legacy wrapper behavior; the
+# separate check_sync_manifest still rejects a missing manifest on the hub.
+if [ -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ] && [ -f "$REPO_ROOT/.mergepath-sync.yml" ]; then
   if [ ! -f "$AUDIT_JSON_TEST_SCRIPT" ]; then
     echo "check_sync_to_downstream: ERROR (missing $AUDIT_JSON_TEST_SCRIPT)" >&2
     exit 1
