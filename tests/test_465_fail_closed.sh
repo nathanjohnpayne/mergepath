@@ -262,7 +262,7 @@ extract_step() {  # <workflow> <step name>
     index($0, "- name: " name) && !found {
       found=1; match($0, /^[[:space:]]*/); step_indent=RLENGTH; print; next
     }
-    found && /^[[:space:]]*- name: / {
+    found && /[^[:space:]]/ && !/^[[:space:]]*#/ {
       match($0, /^[[:space:]]*/); if (RLENGTH <= step_indent) exit
     }
     found { print }
@@ -294,12 +294,34 @@ if [ -f "$W/daily-feedback-rollup.yml" ]; then
   mkdir -p "$D13/scripts"
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" >"%s/args"\n' "$D13" >"$D13/scripts/daily-feedback-rollup.sh"
   extract_step "$W/daily-feedback-rollup.yml" "Run rollup" >"$D13/step.yml"
-  assert_grep "D13: rollup step passes the since input through env" \
-    "$D13/step.yml" 'INPUT_SINCE: ${{ github.event.inputs.since }}'
-  assert_grep "D13: rollup step passes the until input through env" \
-    "$D13/step.yml" 'INPUT_UNTIL: ${{ github.event.inputs.until }}'
-  assert_grep "D13: rollup step passes the dry_run input through env" \
-    "$D13/step.yml" 'INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}'
+  # Require direct env entries: comments, quoted text or nested scalar content
+  # cannot supply a binding while the runtime fixture injects its own env.
+  for _d13_input in SINCE UNTIL DRY_RUN; do
+    _d13_field=$(printf '%s' "$_d13_input" | tr '[:upper:]' '[:lower:]')
+    printf -v _d13_binding 'INPUT_%s: ${{ github.event.inputs.%s }}' "$_d13_input" "$_d13_field"
+    if awk -v binding="$_d13_binding" '
+      !seen_env && /^[[:space:]]*env:[[:space:]]*(#.*)?$/ {
+        match($0, /^[[:space:]]*/); env_indent = RLENGTH
+        in_env = 1; seen_env = 1; next
+      }
+      in_env {
+        match($0, /^[[:space:]]*/); indent = RLENGTH
+        line = substr($0, indent + 1)
+        if (line ~ /^(#|$)/) next
+        if (indent <= env_indent) { in_env = 0; next }
+        if (!entry_indent) entry_indent = indent
+        if (indent == entry_indent) {
+          sub(/[[:space:]]+#.*$/, "", line); sub(/[[:space:]]*$/, "", line)
+          if (line == binding) found = 1
+        }
+      }
+      END { exit !found }
+    ' "$D13/step.yml"; then
+      pass "D13: rollup step passes the $_d13_field input through env"
+    else
+      fail "D13: rollup step passes the $_d13_field input through env (active mapping missing)"
+    fi
+  done
   extract_step_run "$W/daily-feedback-rollup.yml" "Run rollup" >"$D13/step.sh"
   refute_grep "D13: extracted rollup shell does not interpolate dispatch inputs" \
     "$D13/step.sh" '${{ github.event.inputs.'
