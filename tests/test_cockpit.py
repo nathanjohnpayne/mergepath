@@ -192,6 +192,62 @@ class ClientTests(unittest.TestCase):
         clock.now += 121
         self.assertEqual(client.get("/repos/a/b/pulls"), [])
 
+    def test_primary_429_only_blocks_its_observed_pool_until_reset(self):
+        for path, resource, limit in [("/search/issues?q=x", "search", "30"),
+                                      ("/search/code?q=x", "code_search", "10")]:
+            with self.subTest(resource=resource):
+                clock = Clock()
+                fixture = HTTPFixture(reply(429, {"message": TOKEN}, **{
+                    "X-RateLimit-Resource": resource, "X-RateLimit-Limit": limit,
+                    "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "2000"}),
+                    reply(data=[]), reply(data={"data": {"viewer": {"login": "fixture"}}}), reply(data=[]))
+                client = self.client(fixture, clock)
+                with self.assertRaisesRegex(ClientError, "primary_exhausted") as error:
+                    client.get(path)
+                self.assertEqual(error.exception.retry_after, 1000)
+                self.assertNotIn(TOKEN, str(error.exception))
+                evidence = client.budget()[resource]
+                self.assertTrue(evidence["primary_exhausted"])
+                self.assertFalse(evidence["secondary_limited"])
+                self.assertEqual((evidence["status"], evidence["remaining"], evidence["reset"]), (429, 0, 2000))
+                with self.assertRaisesRegex(ClientError, "primary_exhausted"):
+                    client.get(path)
+                self.assertEqual(len(fixture.calls), 1)
+                self.assertEqual(client.get("/repos/a/b/pulls"), [])
+                self.assertEqual(client.query("{ viewer { login } }"), {"viewer": {"login": "fixture"}})
+                self.assertEqual(len(fixture.calls), 3)
+                clock.now = 2001
+                self.assertEqual(client.get(path), [])
+                self.assertEqual(len(fixture.calls), 4)
+
+    def test_explicit_secondary_evidence_still_gates_all_pools_when_primary_zero(self):
+        cases = [(429, {"message": "secondary rate limit " + TOKEN}, {}, 60),
+                 (429, {}, {"Retry-After": "120"}, 120),
+                 (403, {"message": "abuse detection " + TOKEN}, {}, 60),
+                 (403, {}, {"Retry-After": "120"}, 120),
+                 (200, {"errors": [{"message": "secondary rate limit " + TOKEN}]}, {}, 60)]
+        for status, body, extra, delay in cases:
+            with self.subTest(status=status, extra=extra):
+                resource = "graphql" if status == 200 else "search"
+                fixture = HTTPFixture(reply(status, body, **{
+                    "X-RateLimit-Resource": resource, "X-RateLimit-Remaining": "0",
+                    "X-RateLimit-Reset": "2000", **extra}))
+                client = self.client(fixture)
+                with self.assertRaisesRegex(ClientError, "secondary_limit") as error:
+                    if status == 200:
+                        client.query("{ viewer { login } }")
+                    else:
+                        client.get("/search/issues?q=x")
+                self.assertEqual(error.exception.retry_after, delay)
+                self.assertNotIn(TOKEN, str(error.exception))
+                self.assertTrue(client.budget()[resource]["primary_exhausted"])
+                self.assertTrue(client.budget()[resource]["secondary_limited"])
+                for read in [lambda: client.get("/repos/a/b/pulls"),
+                             lambda: client.query("{ viewer { login } }")]:
+                    with self.assertRaisesRegex(ClientError, "upstream_backoff"):
+                        read()
+                self.assertEqual(len(fixture.calls), 1)
+
     def test_graphql_success_text_and_generic_errors_are_not_secondary_limits(self):
         for payload, expected in [
             ({"errors": [{"message": "generic error " + TOKEN}]}, "incomplete_graphql"),
@@ -214,9 +270,11 @@ class ClientTests(unittest.TestCase):
         fixture = HTTPFixture(reply(data={"data": {"first": 1, "second": 2}}, **{
             "X-RateLimit-Resource": "graphql", "X-RateLimit-Remaining": "4900"}))
         client = self.client(fixture)
-        self.assertEqual(client.query('query Batch { first: viewer { login } second: repository(owner:"mutation", name:"b") { id } }'),
+        document = 'query Batch { first: viewer { login } second: repository(owner:"mutation", name:"b") { id } }'
+        self.assertEqual(client.query(document),
                          {"first": 1, "second": 2})
         self.assertEqual(fixture.calls[0][0:2], ("POST", ORIGIN + "/graphql"))
+        self.assertEqual(json.loads(fixture.calls[0][3]), {"query": document, "variables": {}})
         for query in ["mutation { addComment(input:{body:\"x\"}) { clientMutationId } }",
                       "subscription { viewer { login } }",
                       "{ viewer { login } } mutation { deleteIssue(input:{id:\"x\"}) { clientMutationId } }",
@@ -567,7 +625,8 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.request(headers=[("Host", f"localhost:{self.port}")])[0], 200)
 
     def test_session_required_on_all_ordinary_routes(self):
-        for route in ["/", "/api/session", "/api/snapshot", "/events", "/assets/fixture.js", "/bootstrap?launch=x"]:
+        for route in ["/", "/api/session", "/api/snapshot", "/api/panels/prs", "/events",
+                      "/assets/fixture.js", "/bootstrap?launch=x"]:
             with self.subTest(route=route):
                 self.assertEqual(self.request(path=route)[0], 401)
         for route in ["/bootstrap", "/bootstrap.js"]:
@@ -676,6 +735,87 @@ class ServerTests(unittest.TestCase):
         for route in ["/api/snapshot?repo=evil/repo", "/api/snapshot?repo=a/b&repo=a/b", "/api/snapshot?token=x"]:
             self.assertEqual(self.request(path=route)[0], 400)
 
+    def test_fixed_panel_routes_initial_unknown_and_http_boundary(self):
+        self.bootstrap()
+        expected = {"data": None, "observed_at": None, "attempted_at": None, "stale": True,
+                    "error": "unavailable", "retry_at": None, "in_flight": False}
+        for panel in ("prs", "ci", "agents", "history", "fleet", "budget"):
+            status, headers, body = self.request(path="/api/panels/" + panel)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body), {"schema": "cockpit-panel/v1", "panel": panel,
+                                              "source": None, "envelope": expected})
+            self.assertEqual(headers["Content-Security-Policy"], CSP)
+        self.assertEqual(self.request(path="/api/panels/prs", authenticated=False)[0], 401)
+        self.assertEqual(self.request(path="/api/panels/prs", headers=[("Host", "evil.example")])[0], 403)
+        self.assertEqual(self.request(path="/api/panels/prs", headers=[("Host", self.host),
+                         ("Origin", "https://evil.example")])[0], 403)
+        for route in ["/api/panels/unknown", "/api/panels/fixture", "/api/panels/prs/", "/api/panels/%70rs"]:
+            self.assertEqual(self.request(path=route)[0], 404)
+        for query in ["source=fixture", "repo=a/b", "token=x", "source=prs&source=ci"]:
+            self.assertEqual(self.request(path="/api/panels/prs?" + query)[0], 400)
+        self.assertEqual(self.github.budget(), {})
+
+    def test_two_panels_share_one_trusted_source_without_endpoint_fetches(self):
+        self.bootstrap()
+        calls = []
+        def fetch(deadline):
+            calls.append(deadline)
+            return Sample({"runs": [1]})
+        self.app.scheduler.register("fixture_agents", fetch)
+        for panel in ("agents", "history"):
+            self.app.register_panel(panel, "fixture_agents")
+            payload = json.loads(self.request(path="/api/panels/" + panel)[2])
+            self.assertEqual(payload["source"], "fixture_agents")
+            self.assertIsNone(payload["envelope"]["observed_at"])
+            self.assertEqual(payload["envelope"]["error"], "unavailable")
+        self.assertEqual(calls, [])
+        for panel, source in [("unknown", "fixture_agents"), ("prs", "missing"), ("prs", None)]:
+            with self.assertRaisesRegex(ValueError, "invalid_panel_source"):
+                self.app.register_panel(panel, source)
+        with self.assertRaisesRegex(ValueError, "duplicate_panel"):
+            self.app.register_panel("agents", "fixture_agents")
+        self.app.scheduler.tick()
+        wait_until(lambda: not self.app.scheduler.snapshot()["fixture_agents"]["in_flight"])
+        envelopes = []
+        for _ in range(2):
+            for panel in ("agents", "history"):
+                envelopes.append(json.loads(self.request(path="/api/panels/" + panel)[2])["envelope"])
+        self.assertTrue(all(item == envelopes[0] for item in envelopes))
+        self.assertEqual(envelopes[0]["data"], {"runs": [1]})
+        self.assertFalse(envelopes[0]["stale"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(list(self.app.snapshot()["sources"]), ["fixture_agents"])
+
+    def test_panel_last_good_stale_envelope_reuses_snapshot_redaction(self):
+        self.bootstrap()
+        calls = []
+        secrets = [TOKEN, self.app._nonce, self.app._session, self.app._csrf]
+        def fetch(deadline):
+            calls.append(deadline)
+            if len(calls) == 2:
+                raise ClientError("fixture_failed", 120)
+            return Sample({"nested": {"message": "".join(secrets)}})
+        self.app.scheduler.register("fixture_prs", fetch)
+        self.app.register_panel("prs", "fixture_prs")
+        self.app.scheduler.tick()
+        wait_until(lambda: not self.app.scheduler.snapshot()["fixture_prs"]["in_flight"])
+        first = json.loads(self.request(path="/api/panels/prs")[2])["envelope"]
+        self.assertEqual(first["data"], {"nested": {"message": "[redacted]" * 4}})
+        self.app.scheduler.refresh("fixture_prs")
+        self.app.scheduler.tick()
+        wait_until(lambda: not self.app.scheduler.snapshot()["fixture_prs"]["in_flight"])
+        status, _, body = self.request(path="/api/panels/prs")
+        self.assertEqual(status, 200)
+        current = json.loads(body)["envelope"]
+        self.assertEqual(current["data"], first["data"])
+        self.assertEqual(current["observed_at"], first["observed_at"])
+        self.assertTrue(current["stale"])
+        self.assertEqual(current["error"], "fixture_failed")
+        for secret in secrets:
+            self.assertNotIn(secret.encode(), body)
+        self.assertEqual(current, self.app.snapshot()["sources"]["fixture_prs"])
+        self.assertEqual(len(calls), 2)
+
     def test_sse_snapshot_heartbeat_reconnect_and_update(self):
         self.bootstrap()
         response = self.request(path="/events", stream=True)
@@ -772,6 +912,74 @@ class InventoryAndLauncherTests(unittest.TestCase):
         self.assertNotIn(nonce, output.getvalue())
         self.assertNotIn(TOKEN, output.getvalue())
         self.assertIn("Browser opening failed", output.getvalue())
+
+    def test_browser_opener_detaches_and_distinguishes_failure_from_running(self):
+        main = importlib.import_module("mergepath.cockpit.__main__")
+        url = "http://127.0.0.1:1234/bootstrap#launch=fixture-only"
+        for exit_code, expected in [(0, True), (7, False), (None, True)]:
+            with self.subTest(exit_code=exit_code):
+                def wait(timeout):
+                    self.assertEqual(timeout, 10)
+                    if exit_code is None:
+                        raise subprocess.TimeoutExpired("fixture-xdg-open", timeout)
+                    return exit_code
+                with patch.object(main.sys, "platform", "linux"), \
+                     patch.object(main.shutil, "which", return_value="/fixture/xdg-open"), \
+                     patch.object(main.subprocess, "Popen", return_value=SimpleNamespace(wait=wait)) as popen:
+                    self.assertEqual(main.open_browser(url), expected)
+                popen.assert_called_once_with(["/fixture/xdg-open", url], stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        with patch.object(main.shutil, "which", return_value=None):
+            self.assertFalse(main.open_browser(url))
+        with patch.object(main.shutil, "which", return_value="/fixture/open"), \
+             patch.object(main.subprocess, "Popen", side_effect=OSError("fixture-only")):
+            self.assertFalse(main.open_browser(url))
+
+    def test_foreground_opener_timeout_keeps_authenticated_server_alive(self):
+        main = importlib.import_module("mergepath.cockpit.__main__")
+        output = io.StringIO()
+        client = GitHubClient(TOKEN, transport=HTTPFixture())
+        seen = {"served": False, "joined": False, "nonce": None}
+        real_join = threading.Thread.join
+        def opener(command, **kwargs):
+            url = command[1]
+            authority, nonce = url.split("/bootstrap#launch=", 1)
+            seen["nonce"] = nonce
+            def wait(timeout):
+                port = int(authority.rsplit(":", 1)[1])
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+                connection.request("POST", "/api/bootstrap", headers={"Origin": authority,
+                    "X-Cockpit-Bootstrap": nonce, "X-Cockpit-CSRF": nonce})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 204)
+                cookie = response.getheader("Set-Cookie").split(";", 1)[0]
+                response.read()
+                connection.request("GET", "/api/snapshot", headers={"Cookie": cookie})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read())["schema"], "cockpit/v1")
+                connection.close()
+                seen["served"] = True
+                raise subprocess.TimeoutExpired(command, timeout)
+            return SimpleNamespace(wait=wait)
+        def interrupt_after_launch(thread, timeout=None):
+            if thread.name == "cockpit-http" and not seen["joined"]:
+                self.assertTrue(thread.is_alive())
+                self.assertTrue(seen["served"])
+                seen["joined"] = True
+                raise KeyboardInterrupt
+            return real_join(thread, timeout)
+        with patch.object(main.GitHubClient, "from_environment", return_value=client), \
+             patch.object(main, "load_inventory", return_value=(Repository("mergepath", HUB, True),)), \
+             patch.object(main.shutil, "which", return_value="/fixture/xdg-open"), \
+             patch.object(main.subprocess, "Popen", side_effect=opener), \
+             patch.object(threading.Thread, "join", interrupt_after_launch), \
+             patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            self.assertEqual(main.main([]), 0)
+        self.assertTrue(seen["served"] and seen["joined"])
+        self.assertNotIn("Browser opening failed", output.getvalue())
+        self.assertNotIn(seen["nonce"], output.getvalue())
+        self.assertNotIn(TOKEN, output.getvalue())
 
 
 if __name__ == "__main__":

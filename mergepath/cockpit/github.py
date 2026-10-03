@@ -337,9 +337,10 @@ class GitHubClient:
                             configured_identity=self._configured_identity,
                             identity_evidence="preflight_configured" if self._configured_identity else "unknown")
             primary = evidence["remaining"] == 0 and evidence["reset"] is not None and evidence["reset"] > observed
-            secondary = reply.status == 429 or (reply.status == 403 and (
-                evidence["retry_after"] > 0 or any(marker in reply.body.lower() for marker in
-                (b"secondary rate limit", b"abuse detection")))) or (
+            explicit_secondary = evidence["retry_after"] > 0 or any(marker in reply.body.lower() for marker in
+                (b"secondary rate limit", b"abuse detection"))
+            secondary = (reply.status in {403, 429} and (
+                explicit_secondary or (reply.status == 429 and not primary))) or (
                 document is not None and reply.status == 200 and _graphql_secondary(reply.body))
             evidence["primary_exhausted"] = primary
             evidence["secondary_limited"] = secondary
@@ -355,7 +356,7 @@ class GitHubClient:
                 delay = max(60, evidence["retry_after"])
                 self._throttle_until = observed + delay
                 raise ClientError("secondary_limit", delay)
-            if reply.status == 403 and primary:
+            if reply.status in {403, 429} and primary:
                 raise ClientError("primary_exhausted", evidence["reset"] - observed)
             if transport_error:
                 raise ClientError(transport_error)

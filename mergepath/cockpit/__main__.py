@@ -25,9 +25,15 @@ def open_browser(url):
     if not executable:
         return False
     try:
-        result = subprocess.run([executable, url], stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, timeout=10, check=False)
-        return result.returncode == 0
+        process = subprocess.Popen([executable, url], stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+        try:
+            return process.wait(timeout=10) == 0
+        except subprocess.TimeoutExpired:
+            # xdg-open may follow the browser until it exits. A live opener is
+            # not a failed launch and must not tear down the healthy server.
+            return True
     except (OSError, subprocess.SubprocessError):
         return False
 

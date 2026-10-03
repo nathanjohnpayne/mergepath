@@ -17,6 +17,9 @@ from .inventory import public_inventory
 from .scheduler import Scheduler
 
 
+PANEL_IDS = ("prs", "ci", "agents", "history", "fleet", "budget")
+
+
 COOKIE = "mergepath_cockpit"
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; "
        "font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; "
@@ -39,6 +42,7 @@ class Application:
         self._nonce, self._session, self._csrf = (secrets.token_urlsafe(32) for _ in range(3))
         self._nonce_expires, self._nonce_used = monotonic() + 120, False
         self._revision = 0
+        self._panel_sources = {}
         self._condition = threading.Condition()
         self.stopping = threading.Event()
         self.stream_slots = threading.BoundedSemaphore(2)
@@ -78,6 +82,30 @@ class Application:
         return {"schema": "cockpit/v1", "revision": revision,
                 "generated_at": self.clock(), "repositories": public_inventory(self.inventory, repo),
                 "api_budget": self.github.budget(), "sources": self.redact(self.scheduler.snapshot())}
+
+    def register_panel(self, panel, source):
+        """Bind a fixed panel once to an existing server-owned source."""
+        with self._condition:
+            if (panel not in PANEL_IDS or not isinstance(source, str)
+                    or source not in self.scheduler.snapshot()):
+                raise ValueError("invalid_panel_source")
+            if panel in self._panel_sources:
+                raise ValueError("duplicate_panel")
+            self._panel_sources[panel] = source
+
+    def panel_snapshot(self, panel):
+        if panel not in PANEL_IDS:
+            raise ValueError("invalid_panel")
+        with self._condition:
+            source = self._panel_sources.get(panel)
+        snapshot = self.snapshot()
+        envelope = snapshot["sources"].get(source) if source else None
+        if envelope is None:
+            envelope = {"data": None, "observed_at": None, "attempted_at": None,
+                        "stale": True, "error": "unavailable", "retry_at": None,
+                        "in_flight": False}
+        return {"schema": "cockpit-panel/v1", "panel": panel,
+                "source": source, "envelope": envelope}
 
     def close(self):
         self.stopping.set()
@@ -247,6 +275,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(200, app.snapshot(query.get("repo", [None])[0]))
             except ValueError:
                 self._respond(400, {"error": "invalid_filter"})
+        elif parts.path.startswith("/api/panels/"):
+            panel = parts.path[len("/api/panels/"):]
+            if panel not in PANEL_IDS:
+                self._respond(404, {"error": "not_found"})
+            elif parts.query:
+                self._respond(400, {"error": "invalid_panel_query"})
+            else:
+                self._respond(200, app.panel_snapshot(panel))
         elif parts.path == "/events" and not parts.query:
             self._events()
         elif not parts.query:
