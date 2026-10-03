@@ -122,6 +122,37 @@ test("one provider-owned projection seam retains stale boulder and missing obser
   assert.equal(registry.counts(value, 1000).get(null), 2);
   assert.equal(envelope.data.hazards[0].stale, false);
 });
+test("partial repository coverage can withdraw freshness but never override a stale envelope", () => {
+  const registry = new PanelRegistry();
+  registry.register("prs", "fixture", (envelope, repo) => ({state: "clear", label: "Observed repositories", hazards: [],
+    count: 0, stale: repo !== "owner/mergepath"}));
+  const value = stale => snapshot({sources: {fixture: {data: {}, observed_at: 950, stale}}});
+  const partial = registry.project(value(false), null, 1000);
+  assert.equal(partial.models.prs.stale, true);
+  assert.equal(partial.models.prs.coverageValid, true);
+  assert.equal(partial.freshPanels, 0); assert.equal(partial.invalidPanels, 0);
+  const readable = registry.project(value(false), "owner/mergepath", 1000);
+  assert.equal(readable.models.prs.stale, false); assert.equal(readable.freshPanels, 1);
+  const failedEnvelope = registry.project(value(true), "owner/mergepath", 1000);
+  assert.equal(failedEnvelope.models.prs.stale, true); assert.equal(failedEnvelope.freshPanels, 0);
+  assert.equal(failedEnvelope.models.prs.observed_at, 950);
+});
+test("provider attempts without observations render diagnostics without inventing last-known coverage", () => {
+  const registry = new PanelRegistry();
+  registry.register("prs", "fixture", envelope => ({state: "clear", label: "Coverage", count: 0,
+    hazards: envelope.data.hazards, hasObservations: envelope.data.observed, stale: envelope.data.stale}));
+  const value = (observed, stale, hazards = []) => snapshot({sources: {fixture: {data: {observed, stale, hazards}, observed_at: 950, stale: false}}});
+  const never = registry.project(value(false, true), null, 1000);
+  assert.equal(never.models.prs.observed, true); // The adapter still owns its error/unknown display.
+  assert.equal(never.observedPanels, 0); assert.equal(never.stalePanels, 0); assert.equal(never.freshPanels, 0);
+  assert.equal(C.roadModel([], {now: 1000, observed: never.freshPanels > 0, staleCoverage: never.stalePanels > 0}).emptyText, "No observations yet");
+  assert.equal(registry.project(value(true, false), null, 1000).freshPanels, 1); // Successful empty observation.
+  assert.equal(registry.project(value(true, true), null, 1000).stalePanels, 1); // Retained partial coverage.
+  const invalid = registry.project(value(false, true, [hazard("kept"), {invalid: true}]), null, 1000);
+  assert.equal(invalid.invalidPanels, 1); assert.equal(invalid.hazards.length, 1); assert.ok(invalid.diagnostics.length);
+  const badFlag = registry.project(value("false", false), null, 1000);
+  assert.equal(badFlag.freshPanels, 0); assert.ok(badFlag.diagnostics.length);
+});
 test("stale-only clear coverage stays idle; fresh restoration and stale boulders remain truthful", () => {
   const registry = new PanelRegistry();
   const project = envelope => ({state: envelope.data.hazards.length ? "boulder" : "clear", label: "Fixture", hazards: envelope.data.hazards, count: 0});
@@ -320,4 +351,31 @@ test("abortable probe deadline and stream watchdog reject late results; invalid 
   assert.equal(watched.streams[0].closed, true); assert.equal(watched.states.at(-1).kind, "reconnecting"); watched.connection.stop();
   const bad = fixture(); bad.connection.start(); await flush(); bad.streams[0].emit("heartbeat", {not: "heartbeat"});
   assert.equal(bad.states.at(-1).kind, "reconnecting"); bad.connection.stop();
+});
+
+test("provider partial coverage cannot invent fresh clear or hide invalid hazards", () => {
+  const registry = new PanelRegistry();
+  registry.register("budget", "actions", e => e.data);
+  const value = data => snapshot({sources:{actions:{data:{state:"idle",label:"Partly unavailable",hazards:[],hasObservations:true,...data},observed_at:950,stale:false}}});
+  const partial = registry.project(value({coverageValid:false}),null,1000);
+  assert.equal(partial.models.budget.observed,true); assert.equal(partial.observedPanels,1);
+  assert.equal(partial.freshPanels,0); assert.equal(partial.stalePanels,0);
+  assert.equal(partial.partialPanels,1); assert.equal(partial.invalidPanels,0);
+  assert.equal(partial.diagnostics.length,0);
+  assert.equal(C.roadModel([], {now:1000,partialCoverage:true}).emptyText,"Observations incomplete");
+  assert.equal(C.roadModel([], {now:1000,partialCoverage:true,observed:true}).emptyText,"Road is clear for fresh observed sources");
+  const usable=hazard("budget-observed",{source:"budget",section:"budget",repo:null});
+  const hazardPartial=registry.project(value({state:"bump",coverageValid:false,hazards:[usable]}),"owner/consumer",1000);
+  assert.equal(hazardPartial.hazards.length,1); assert.equal(hazardPartial.partialPanels,1);
+  for(const flag of [false,true]) {
+    const invalid=registry.project(value({coverageValid:flag,hazards:[usable,{bad:true}]}),null,1000);
+    assert.equal(invalid.hazards.length,1); assert.equal(invalid.freshPanels,0);
+    assert.equal(invalid.invalidPanels,1); assert.equal(invalid.partialPanels,0);
+  }
+  assert.equal(registry.project(value({coverageValid:true}),null,1000).freshPanels,1);
+  assert.equal(registry.project(value({coverageValid:false,hasObservations:false}),null,1000).observedPanels,0);
+  for(const flag of [null,"false",0,{}]) {
+    const invalid=registry.project(value({coverageValid:flag}),null,1000);
+    assert.equal(invalid.models.budget.observed,false); assert.ok(invalid.diagnostics.length);
+  }
 });

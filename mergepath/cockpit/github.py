@@ -86,8 +86,35 @@ def http_transport(method, url, headers, body, timeout):
     parts = urllib.parse.urlsplit(url)
     if parts.scheme != "https" or parts.netloc != "api.github.com" or parts.fragment:
         raise ClientError("invalid_endpoint")
+    return _https_transport(method, parts, headers, body, timeout)
+
+
+def _actions_log_url(url):
+    # This narrowly observed GitHub.com storage family is not a general URL
+    # fetch seam. Unknown storage destinations remain unavailable.
+    if type(url) is not str or len(url) > 16384 or any(ord(c) < 33 or ord(c) > 126 for c in url):
+        raise ClientError("invalid_endpoint")
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        raise ClientError("invalid_endpoint") from None
+    if (parts.scheme != "https" or parts.fragment or not parts.path.startswith("/")
+            or not re.fullmatch(r"productionresultssa[0-9]+\.blob\.core\.windows\.net", parts.netloc)):
+        raise ClientError("invalid_endpoint")
+    return parts
+
+
+def actions_log_transport(url, timeout):
+    # No Authorization, cookies, ambient proxy or redirect following on the
+    # temporary signed download. Never return its URL in an error.
+    parts = _actions_log_url(url)
+    return _https_transport("GET", parts, {"User-Agent": "mergepath-cockpit",
+        "Accept": "text/plain", "Accept-Encoding": "identity"}, None, timeout)
+
+
+def _https_transport(method, parts, headers, body, timeout):
     deadline = time.monotonic() + timeout
-    connection = http.client.HTTPSConnection("api.github.com", timeout=timeout)
+    connection = http.client.HTTPSConnection(parts.netloc, timeout=timeout)
     active_socket = None
     reply = None
 
@@ -271,12 +298,13 @@ def _query_only(document):
 class GitHubClient:
     def __init__(self, token, *, transport=http_transport, clock=time.time,
                  monotonic=time.monotonic, reserve=100, cache_pages=256,
-                 configured_identity=None):
+                 configured_identity=None, log_transport=actions_log_transport):
         if not isinstance(token, str) or not token or any(c.isspace() for c in token):
             raise ClientError("cached_reviewer_credential_required")
         if reserve < 0 or cache_pages < 1:
             raise ValueError("invalid_client_bounds")
         self._token, self._transport = token, transport
+        self._log_transport = log_transport
         self._configured_identity = configured_identity
         self._clock, self._monotonic = clock, monotonic
         self._reserve, self._cache_pages = reserve, cache_pages
@@ -330,7 +358,7 @@ class GitHubClient:
             raise ClientError("invalid_endpoint")
         return path
 
-    def _request(self, path, resource, *, document=None, deadline=None):
+    def _request(self, path, resource, *, document=None, deadline=None, log_download=False):
         # One lock serializes transports across sources and enforces global
         # backoff even when several sources were due at the same instant.
         deadline = self._monotonic() + 15 if deadline is None else deadline
@@ -358,7 +386,7 @@ class GitHubClient:
                        "Accept": "application/vnd.github+json",
                        "X-GitHub-Api-Version": "2022-11-28",
                        "User-Agent": "mergepath-cockpit"}
-            cached = self._cache.get(path) if document is None else None
+            cached = self._cache.get(path) if document is None and not log_download else None
             if cached and cached[1]:
                 headers["If-None-Match"] = cached[1]
             body = None
@@ -415,6 +443,29 @@ class GitHubClient:
                 raise ClientError("deadline_exceeded")
             if len(reply.body) > MAX_BODY:
                 raise ClientError("response_too_large")
+            if log_download:
+                if reply.status != 302:
+                    raise ClientError("permission_denied" if reply.status in {401, 403} else "upstream_http_error")
+                location = lower.get("location")
+                _actions_log_url(location)
+                available = min(15, deadline - self._monotonic())
+                if available <= 0:
+                    raise ClientError("deadline_exceeded")
+                try:
+                    download = self._log_transport(location, available)
+                except ClientError as exc:
+                    # Discard metadata too: it may include a signed Location.
+                    raise ClientError(exc.category) from None
+                except Exception:
+                    raise ClientError("upstream_unavailable") from None
+                if self._monotonic() >= deadline:
+                    raise ClientError("deadline_exceeded")
+                if download.status != 200:
+                    raise ClientError("upstream_http_error")
+                if len(download.body) > MAX_BODY:
+                    # A capped prefix must never be presented as a log tail.
+                    raise ClientError("response_too_large")
+                return download.body
             if reply.status == 304:
                 if cached is None:
                     raise ClientError("uncached_not_modified")
@@ -434,6 +485,19 @@ class GitHubClient:
                 while len(self._cache) > self._cache_pages:
                     self._cache.popitem(last=False)
             return copy.deepcopy(payload), link
+
+    def read_job_log(self, repo, job_id, *, deadline=None):
+        """Read one provider-observed job; providers enforce enrolled inventory.
+
+        The complete body must fit MAX_BODY. No partial bytes are returned or
+        cached, and the signed URL stays inside the serialized transport.
+        """
+        if (type(repo) is not str or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
+                or any(part in {".", ".."} for part in repo.split("/"))
+                or type(job_id) is not str or not re.fullmatch(r"[1-9][0-9]{0,19}", job_id)):
+            raise ClientError("invalid_endpoint")
+        return self._request(f"/repos/{repo}/actions/jobs/{job_id}/logs", "core",
+                             deadline=deadline, log_download=True)
 
     def get(self, path, *, deadline=None):
         path = self._path(path)

@@ -7,8 +7,16 @@
   <title>Mergepath Cockpit</title>
   <link rel="stylesheet" href="assets/fonts/local-fonts.css">
   <link rel="stylesheet" href="assets/cockpit.css">
+  <link rel="stylesheet" href="assets/ci.css">
+  <link rel="stylesheet" href="assets/prs.css">
   <script src="assets/components.js" defer></script>
   <script src="assets/app.js" defer></script>
+  <script src="assets/actions.js" defer></script>
+  <script src="assets/actions_init.js" defer></script>
+  <link rel="stylesheet" href="assets/actions.css">
+  <script src="assets/pr_rows.js" defer></script>
+  <script src="assets/prs.js" defer></script>
+  <script src="assets/ci.js" defer></script>
 </head>
 <body class="ck">
   <a class="skip" href="#road">Skip to Road ahead</a>
@@ -17,7 +25,7 @@
       <div>
         <p class="eyebrow">Mergepath Cockpit</p>
         <h1>Everything you are waiting on, in one place.</h1>
-        <p class="lede">Open PRs across the fleet, CI runs, Phase 4b agents, fleet sync and the Actions budget. Panel sources are not connected yet.</p>
+        <p class="lede">Open PRs across the fleet, CI runs, Phase 4b agents, fleet sync and the Actions budget.</p>
       </div>
       <div class="top-r">
         <div id="connection" class="chip conn">
@@ -52,7 +60,7 @@
     </section>
     <section class="panel" aria-labelledby="prs"><div class="sec-head"><h2 id="prs" tabindex="-1">Open PRs</h2><span class="sec-meta">Review observations</span></div><div id="prs-content" class="panel-content"></div></section>
     <div class="row2">
-      <section class="panel grow" aria-labelledby="ci"><div class="sec-head"><h2 id="ci" tabindex="-1">CI runs</h2><span class="sec-meta">Workflow observations</span></div><div id="ci-content" class="panel-content"></div></section>
+      <section class="panel grow" aria-labelledby="ci"><div class="sec-head"><h2 id="ci" tabindex="-1">CI and test runs</h2><span class="sec-meta">Actions REST · ETag · check_* steps</span></div><div id="ci-content" class="panel-content"></div></section>
       <section class="panel side" aria-labelledby="agents"><div class="sec-head"><h2 id="agents" tabindex="-1">Phase 4b agents</h2><span class="sec-meta">Live agents</span></div><div id="agents-content" class="panel-content"></div></section>
     </div>
     <section class="panel" aria-labelledby="history"><div class="sec-head"><h2 id="history" tabindex="-1">Agent history</h2><span class="sec-meta">Recent completed runs</span></div><div id="history-content" class="panel-content"></div></section>
