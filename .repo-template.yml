@@ -14,6 +14,9 @@ spec_test_map:
     - tests/test_cockpit_ci.py
     - tests/test_cockpit_ci_ui.cjs
     - tests/test_cockpit_logs.py
+  cockpit_prs:
+    - tests/test_cockpit_prs.py
+    - tests/test_cockpit_prs_ui.cjs
   cockpit:
     - tests/test_cockpit.sh
   pr_body_contract:
