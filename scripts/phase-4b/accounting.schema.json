@@ -136,6 +136,16 @@
         "plan_auth", "fail_closed"
       ],
       "properties": {
+        "run_id": {
+          "description": "Optional genuine orchestrator P4B_ACCT_RUN_ID, shared with machine heartbeat. Null/absent for legacy/direct-hook history; pid-only ownership fallback is never promoted to global identity.",
+          "type": ["string", "null"],
+          "pattern": "^p4b-[a-zA-Z0-9._-]+$"
+        },
+        "started_at_epoch": {
+          "description": "Optional adapter-stage start epoch for this invocation, copied from the unchanged loop-log envelope. Null/absent when no adapter timing was captured; approval generation time is not loop start time.",
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
         "loop": { "type": "integer", "minimum": 1 },
         "reviewer": { "type": "string", "minLength": 1 },
         "adapter": { "type": "string", "minLength": 1 },
