@@ -73,12 +73,28 @@ test('persistent rows/disclosures/focus survive progress, filtering, stale failu
  const e=envelope();e.in_flight=true;e.attempted_at=now-20;Fleet.render(p,model(e));assert.equal(v.banner.hidden,false);assert.match(v.progressText.textContent,/20s elapsed/);assert.match(v.progressText.textContent,/indeterminate/);assert.equal(v.refreshButton.disabled,true);assert.equal(v.views.get('fixture/one'),row);
  Fleet.render(p,model(envelope(fixtures.partial),'fixture/two'));assert.equal(row.node.hidden,true);assert.equal(row.pathNodes.get('scripts/a.sh').li,pathNode);assert.equal(row.paths.hidden,false);assert.match(row.reason.textContent,/last good audit kept/);assert.match(row.prNote.textContent,/current lookup unavailable/);
  p.replaceChildren(new Node('placeholder'));assert.equal(row.node.isConnected,false);Fleet.render(p,model());assert.equal(v.views.get('fixture/one'),row);assert.equal(row.node.isConnected,true);assert.equal(row.pathButton.getAttribute('aria-expanded'),'true');assert.equal(row.prButton.getAttribute('aria-expanded'),'true');assert.equal(document.activeElement,button);assert.equal(v.banner.hidden,true);
- const prView=[...row.prList.views.values()][0];assert.match(prView.full.id,/^fleet-budget-one-/);assert.equal(prView.button.getAttribute('aria-controls'),prView.full.id);assert.equal(v.syncAll.disabled,true);assert.equal(row.sync.disabled,true);
+ const prView=[...row.prList.views.values()][0];assert.match(prView.full.id,/^fleet-budget-fixture%2Fone%23/);assert.equal(prView.button.getAttribute('aria-controls'),prView.full.id);assert.equal(v.syncAll.disabled,true);assert.equal(row.sync.disabled,true);
 });
 test('dynamic path text is literal and fallback PR enrichment stays unknown',()=>{
  const e=envelope();e.data.repositories[0].record.paths[0].override_reason='<img onerror=bad>';e.data.repositories[0].attempt.paths[0].override_reason='<img onerror=bad>';
  const v=Fleet.render(parent(),model(e)),r=v.views.get('fixture/one');assert.equal(r.pathNodes.get('scripts/a.sh').detail.children.length,0);assert.match(r.pathList.textContent,/<img onerror=bad>/);
  assert.match(r.prNote.textContent,/enrichment unavailable/);const pr=[...r.prList.views.values()][0];assert.match(pr.meta.textContent,/HEAD unknown/);assert.ok(pr.budgets.every(b=>b.fill.hidden));
+});
+test('disclosure ID references are whitespace-free and preserve distinct identities',()=>{
+ const e=envelope(),names=['one two','one-two'];
+ for(let i=0;i<2;i++){
+  const row=e.data.repositories[i];row.name=names[i];row.record.name=names[i];row.attempt.name=names[i];
+ }
+ const v=Fleet.render(parent(),model(e)),ids=[];
+ for(const row of v.views.values()){
+  for(const [node,button] of [[row.paths,row.pathButton],[row.prs,row.prButton],...[...row.prList.views.values()].map(pr=>[pr.full,pr.button])]){
+   assert.doesNotMatch(node.id,/\s/);assert.equal(button.getAttribute('aria-controls'),node.id);ids.push(node.id);
+  }
+ }
+ assert.equal(new Set(ids).size,ids.length);
+ const first=v.views.get('fixture/one'),pathId=first.paths.id,prId=first.prs.id;
+ first.pathButton.handlers.click();first.pathButton.focus();Fleet.render(v.parent,model(e));
+ assert.equal(first.paths.id,pathId);assert.equal(first.prs.id,prId);assert.equal(first.paths.hidden,false);assert.equal(document.activeElement,first.pathButton);
 });
 test('refresh callback coalesces locally, reports failure, and honors source backoff',async()=>{
  let calls=0,done;const v=Fleet.render(parent(),model(),{refresh:()=>{calls++;return new Promise(resolve=>done=resolve);}});

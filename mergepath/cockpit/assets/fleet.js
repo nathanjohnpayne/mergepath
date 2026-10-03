@@ -128,9 +128,10 @@
       this.prNote = C.element("span", "sub"); this.cells[4].append(this.prButton, this.prNote);
       this.time = C.element("span", "mono soft"); this.timeNote = C.element("span", "sub"); this.cells[5].append(this.time, this.timeNote);
       this.sync = C.element("button", "btn sm", "Sync"); this.sync.type = "button"; this.sync.disabled = true; this.sync.title = "Confirmed sync is unavailable pending its executor"; this.cells[6].append(this.sync);
-      this.paths = C.element("div", "fleet-paths"); this.paths.id = `fleet-paths-${model.name}`; this.pathButton.setAttribute("aria-controls", this.paths.id);
+      const identity = encodeURIComponent(model.repo);
+      this.paths = C.element("div", "fleet-paths"); this.paths.id = `fleet-paths-${identity}`; this.pathButton.setAttribute("aria-controls", this.paths.id);
       this.pathList = C.element("ul", "fleet-path-list"); this.paths.append(this.pathList); this.pathNodes = new Map();
-      this.prs = C.element("div", "fleet-prs"); this.prs.id = `fleet-prs-${model.name}`; this.prButton.setAttribute("aria-controls", this.prs.id);
+      this.prs = C.element("div", "fleet-prs"); this.prs.id = `fleet-prs-${identity}`; this.prButton.setAttribute("aria-controls", this.prs.id);
       this.prs.append(C.element("p", "sub", "PR observations are independent of audit membership. Directive meters are advisory; unknown amounts are never guessed."));
       this.prList = new PRRows.RowList(this.prs); this.node.append(this.row, this.paths, this.prs); this.pathsOpen = this.prsOpen = false;
     }
@@ -160,7 +161,7 @@
       this.prList.update(model.syncPRs, {now, stale: false});
       // The same PR can also be mounted in the PR panel: disclosure IDs are mount-local.
       for (const view of this.prList.views.values()) {
-        const id = `fleet-budget-${model.name}-${view.id.replace(/[^A-Za-z0-9]/g, "-")}`;
+        const id = `fleet-budget-${encodeURIComponent(view.id)}`;
         view.full.id = id; view.button.setAttribute("aria-controls", id);
       }
       if (!model.syncPRs.length) this.prsOpen = false;

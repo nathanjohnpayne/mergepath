@@ -1361,6 +1361,103 @@ class InventoryAndLauncherTests(unittest.TestCase):
         self.assertTrue(app.stopping.is_set())
         self.assertEqual(events, ["scheduler", "fleet", "sync"])
 
+    def test_fleet_constructor_refusal_keeps_unrelated_panels_and_refuses_sync(self):
+        main = importlib.import_module("mergepath.cockpit.__main__")
+        fleet_module = importlib.import_module("mergepath.cockpit.fleet")
+        panels = {"ci": "ci", "prs": "prs", "budget": "actions",
+                  "history": "agents", "agents": "live_agents"}
+        boundaries = {"CIProvider": "ci", "PRProvider": "prs", "ActionsProvider": "actions",
+                      "AgentsProvider": "agents", "LiveAgentsProvider": "live_agents"}
+        for fault in ("missing-tool", "workspace"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temp:
+                applications, workspaces, thread_errors, output = [], [], [], io.StringIO()
+                client = GitHubClient(TOKEN, transport=HTTPFixture())
+                def application(*args, **kwargs):
+                    app = Application(*args, **kwargs); applications.append(app); return app
+                real_allocate = tempfile.mkdtemp
+                def allocate(*args, **kwargs):
+                    path = real_allocate(prefix="fixture-fleet-", dir=temp)
+                    workspaces.append(Path(path)); return path
+                def which(tool, *, path):
+                    self.assertEqual(path, fleet_module.UTILITY_PATH)
+                    return None if fault == "missing-tool" and tool == "gh" else "/bin/true"
+                def opened(url):
+                    app = applications[0]
+                    wait_until(lambda: all(app.panel_snapshot(panel)["envelope"]["data"] is not None
+                                           for panel in panels), timeout=2)
+                    parts = urllib.parse.urlsplit(url); authority = "http://" + parts.netloc
+                    fragment = urllib.parse.parse_qs(parts.fragment); nonce = fragment["launch"][0]
+                    scope = "/s/" + fragment["scope"][0]
+                    connection = http.client.HTTPConnection("127.0.0.1", int(parts.port), timeout=1)
+                    try:
+                        connection.request("POST", "/api/bootstrap", headers={"Origin": authority,
+                            "X-Cockpit-Bootstrap": nonce, "X-Cockpit-CSRF": nonce})
+                        response = connection.getresponse(); self.assertEqual(response.status, 204)
+                        cookie = [v for k, v in response.getheaders() if k.lower() == "set-cookie"][-1].split(";", 1)[0]
+                        response.read()
+                        headers = {"Cookie": cookie}
+                        connection.request("GET", scope + "/api/snapshot", headers=headers)
+                        response = connection.getresponse(); self.assertEqual(response.status, 200)
+                        snapshot = json.loads(response.read())
+                        self.assertEqual(set(snapshot["sources"]), set(panels.values()))
+                        self.assertIsNone(snapshot["sync"]); self.assertIsNone(app.sync)
+                        for panel, source in panels.items():
+                            connection.request("GET", scope + "/api/panels/" + panel, headers=headers)
+                            response = connection.getresponse(); self.assertEqual(response.status, 200)
+                            value = json.loads(response.read())
+                            self.assertEqual(value["source"], source)
+                            self.assertEqual(value["envelope"]["data"], {"fixture_read_boundary": source})
+                            self.assertFalse(value["envelope"]["stale"])
+                        connection.request("GET", scope + "/api/panels/fleet", headers=headers)
+                        response = connection.getresponse(); self.assertEqual(response.status, 200)
+                        missing = json.loads(response.read())
+                        self.assertIsNone(missing["source"]); self.assertIsNone(missing["envelope"]["data"])
+                        self.assertTrue(missing["envelope"]["stale"])
+                        connection.request("GET", scope + "/api/session", headers=headers)
+                        response = connection.getresponse(); self.assertEqual(response.status, 200)
+                        csrf = json.loads(response.read())["csrf"]
+                        connection.request("POST", scope + "/api/sync/preview", body="{}", headers={
+                            **headers, "Origin": authority, "X-Cockpit-CSRF": csrf, "Content-Type": "application/json"})
+                        response = connection.getresponse(); self.assertEqual(response.status, 503)
+                        self.assertEqual(json.loads(response.read()), {"error": "sync_unavailable"})
+                        self.assertNotIn(nonce, output.getvalue()); self.assertNotIn(csrf, output.getvalue())
+                    finally:
+                        connection.close()
+                    raise KeyboardInterrupt  # Stop the actual local server normally.
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(patch.object(main.GitHubClient, "from_environment", return_value=client))
+                    stack.enter_context(patch.object(main, "load_inventory", return_value=(
+                        Repository("mergepath", HUB, True), Repository("one", "fixture/one"))))
+                    stack.enter_context(patch.object(main, "Application", side_effect=application))
+                    # Replace only provider reads; keep real construction refusal,
+                    # Application, Scheduler, authenticated HTTP and shutdown.
+                    for name, source in boundaries.items():
+                        fetch = lambda deadline, source=source: Sample({"fixture_read_boundary": source})
+                        provider = fetch if name in ("CIProvider", "PRProvider") else SimpleNamespace(fetch=fetch)
+                        stack.enter_context(patch.object(main, name, return_value=provider))
+                    stack.enter_context(patch.object(main, "resolve_history_settings", return_value=((), {})))
+                    stack.enter_context(patch.object(main, "load_reviewers", return_value=("fixture-reviewer",)))
+                    stack.enter_context(patch.object(main, "resolve_live_directory", return_value=Path(temp) / "heartbeats"))
+                    sync = stack.enter_context(patch.object(main, "SyncProvider", side_effect=AssertionError("sync must stay unavailable")))
+                    stack.enter_context(patch.object(fleet_module.shutil, "which", side_effect=which))
+                    stack.enter_context(patch.object(fleet_module.tempfile, "mkdtemp", side_effect=allocate))
+                    if fault == "workspace":
+                        stack.enter_context(patch.object(Path, "symlink_to", side_effect=OSError("fixture-private-workspace-failure")))
+                    opener = stack.enter_context(patch.object(main, "open_browser", side_effect=opened))
+                    stack.enter_context(patch.object(threading, "excepthook", side_effect=lambda args: thread_errors.append(args.exc_type.__name__)))
+                    stack.enter_context(patch.dict(os.environ, {"OP_PREFLIGHT_AUTHOR_PAT": "fixture-author-secret",
+                        "OP_PREFLIGHT_REVIEWER_PAT": TOKEN, "GH_TOKEN": "fixture-ambient-secret"}, clear=True))
+                    stack.enter_context(contextlib.redirect_stdout(output)); stack.enter_context(contextlib.redirect_stderr(output))
+                    self.assertEqual(main.main([]), 0, output.getvalue())
+                    opener.assert_called_once(); sync.assert_not_called()
+                    self.assertFalse(any(key in os.environ for key in ("OP_PREFLIGHT_AUTHOR_PAT", "OP_PREFLIGHT_REVIEWER_PAT", "GH_TOKEN")))
+                self.assertTrue(applications[0].stopping.is_set()); self.assertEqual(thread_errors, [])
+                self.assertTrue(all(not path.exists() for path in workspaces))
+                self.assertEqual(len(workspaces), 0 if fault == "missing-tool" else 1)
+                self.assertIn("Fleet audits unavailable", output.getvalue())
+                for private in (TOKEN, temp, "fixture-private-workspace-failure", "fixture-author-secret", "fixture-ambient-secret"):
+                    self.assertNotIn(private, output.getvalue())
+
     def test_launcher_agent_reaches_main_sync_provider_without_credentials(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

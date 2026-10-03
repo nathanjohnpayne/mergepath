@@ -140,16 +140,21 @@ def main(argv=None):
         pr_provider = PRProvider(github, inventory, ROOT, checkout_roots={"nathanjohnpayne/mergepath": ROOT})
         app.scheduler.register("prs", pr_provider, hot_interval=15, idle_interval=120, timeout=30)
         app.register_panel("prs", "prs")
-        fleet = FleetProvider(inventory, ROOT, github._token)
-        app.scheduler.register("fleet", fleet.fetch, hot_interval=1800, idle_interval=1800,
-                               timeout=180, max_backoff=7200)
-        app.register_panel("fleet", "fleet")
-        def completed():
-            if not app.stopping.is_set():
-                app.scheduler.refresh("fleet")
-                app.scheduler.refresh("prs")
-        app.sync = SyncProvider(inventory, ROOT, fleet.fetch, cache_dir=cache_dir, agent=args.agent,
-                                changed=app.publish, completed=completed)
+        try:
+            fleet = FleetProvider(inventory, ROOT, github._token)
+        except (ValueError, OSError):
+            print("Fleet audits unavailable: trusted audit tools or private workspace could not be initialized.",
+                  file=sys.stderr)
+        if fleet is not None:
+            app.scheduler.register("fleet", fleet.fetch, hot_interval=1800, idle_interval=1800,
+                                   timeout=180, max_backoff=7200)
+            app.register_panel("fleet", "fleet")
+            def completed():
+                if not app.stopping.is_set():
+                    app.scheduler.refresh("fleet")
+                    app.scheduler.refresh("prs")
+            app.sync = SyncProvider(inventory, ROOT, fleet.fetch, cache_dir=cache_dir, agent=args.agent,
+                                    changed=app.publish, completed=completed)
         actions_provider = ActionsProvider(github, inventory, settings=actions_settings,
                                            ci_snapshot=lambda repo, now: shared_ci_snapshot(app, repo, now))
         app.scheduler.register("actions", actions_provider.fetch, hot_interval=15, idle_interval=120, timeout=30)

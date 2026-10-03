@@ -1,8 +1,29 @@
 "use strict";
 const test = require("node:test"), assert = require("node:assert/strict"), fs = require("node:fs"), cp = require("node:child_process");
 const CI = require("../mergepath/cockpit/assets/ci.js"), C = require("../mergepath/cockpit/assets/components.js");
-const fixture = () => JSON.parse(cp.execFileSync("python3", ["-c", "import sys,json;sys.path.insert(0,'tests');from test_cockpit_ci import model;print(json.dumps(model()))"], {cwd: require("node:path").resolve(__dirname,".."), timeout: 2000}));
+const pythonFixture = expression => JSON.parse(cp.execFileSync("python3", ["-c", `import sys,json;sys.path.insert(0,'tests');import test_cockpit_ci as ci;print(json.dumps(${expression}))`], {cwd: require("node:path").resolve(__dirname,".."), timeout: 2000}));
+const fixture = () => pythonFixture("ci.model()");
 const envelope = data => ({data, observed_at: 1000, stale: false});
+for (const field of ["name", "diagnostic", "excerpt"]) test(`Python Unicode ${field} limit round-trips through browser validation`, () => {
+  const {data, excerpt} = pythonFixture("ci.unicode_model_and_excerpt()");
+  if (field === "name") {
+    data.runs[0].diagnostics = [];
+    assert.equal(CI.project(envelope(data), null, 1001).rows[0].name, "🚀".repeat(1000));
+    data.runs[0].name += "🚀"; assert.throws(() => CI.validate(data));
+    data.runs[0].name = "a".repeat(1000); assert.doesNotThrow(() => CI.validate(data));
+  } else if (field === "diagnostic") {
+    data.runs[0].name = "repo_lint";
+    assert.doesNotThrow(() => CI.validate(data));
+    assert.equal(data.runs[0].diagnostics[0].text, "🚀".repeat(4000));
+    data.runs[0].diagnostics[0].text += "🚀"; assert.throws(() => CI.validate(data));
+    data.runs[0].diagnostics[0].text = "a".repeat(4000); assert.doesNotThrow(() => CI.validate(data));
+  } else {
+    assert.ok(CI.excerptText(excerpt).includes("FAIL:" + "🚀".repeat(995)));
+    assert.match(CI.excerptText(excerpt), /Excerpt truncated/);
+    excerpt.lines[0] += "🚀"; assert.match(CI.excerptText(excerpt), /invalid response/);
+    excerpt.lines = ["FAIL:" + "a".repeat(995)]; assert.ok(CI.excerptText(excerpt).includes(excerpt.lines[0]));
+  }
+});
 test("Python contract and exact opaque identities survive browser JSON parsing", () => {
   const data = fixture(), row = data.runs[0]; row.id = "900719925474099312345"; row.pr = "900719925474099312346";
   row.workflow_id = "900719925474099312347"; row.key = `${row.repo}:${row.id}:${row.pr}`;
