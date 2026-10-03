@@ -288,7 +288,19 @@ jq '.process_started_at=null' "$WORK/live.json" > "$WORK/unknown.json"
 # Retention prunes old completed evidence while retaining live/unknown records.
 cp "$WORK/approve-good/heartbeats/"*.json "$WORK/helper/p4b-old.json"
 cp "$WORK/live.json" "$WORK/helper/p4b-live.json"
+cp "$WORK/reused.json" "$WORK/helper/p4b-reused.json"
 cp "$WORK/unknown.json" "$WORK/helper/p4b-unknown.json"
+# Corrupted/incompatible process identity must not become a confident crash,
+# which would allow retention to erase the evidence. Exercise every non-string
+# JSON type and empty text against the same genuinely live process control.
+IDENTITY_CASES=('number:123' 'true:true' 'false:false' 'array:[]' 'object:{}' 'null:null' 'empty:""')
+for identity_case in "${IDENTITY_CASES[@]}"; do
+  identity_label=${identity_case%%:*}; identity_json=${identity_case#*:}
+  identity_record="$WORK/helper/p4b-invalid-$identity_label.json"
+  jq --argjson value "$identity_json" '.process_started_at=$value' "$WORK/live.json" > "$identity_record"
+  [ "$(p4b_heartbeat_status "$identity_record")" = unknown ] \
+    && pass "$identity_label process identity remains unknown" || fail "$identity_label process identity"
+done
 touch -t 200001010000 "$WORK/helper/"*.json
 # Invalid retention cannot unexpectedly erase old evidence.
 # shellcheck disable=SC2034
@@ -297,8 +309,14 @@ P4B_HEARTBEAT_RETENTION_DAYS=0; p4b_heartbeat_prune
 # Read by the sourced heartbeat helper.
 # shellcheck disable=SC2034
 P4B_HEARTBEAT_RETENTION_DAYS=7; p4b_heartbeat_prune
-[ ! -e "$WORK/helper/p4b-old.json" ] && [ -e "$WORK/helper/p4b-live.json" ] && [ -e "$WORK/helper/p4b-unknown.json" ] \
-  && pass 'retention removes old done but preserves live/unknown evidence' || fail 'retention'
+[ ! -e "$WORK/helper/p4b-old.json" ] && [ ! -e "$WORK/helper/p4b-reused.json" ] \
+  && [ -e "$WORK/helper/p4b-live.json" ] && [ -e "$WORK/helper/p4b-unknown.json" ] \
+  && pass 'retention removes old done/crashed but preserves live/unknown evidence' || fail 'retention'
+for identity_case in "${IDENTITY_CASES[@]}"; do
+  identity_label=${identity_case%%:*}
+  [ -e "$WORK/helper/p4b-invalid-$identity_label.json" ] \
+    && pass "retention preserves $identity_label process identity" || fail "retention removed $identity_label process identity"
+done
 
 printf 'Heartbeat: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]

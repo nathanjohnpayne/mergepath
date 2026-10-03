@@ -68,7 +68,8 @@ p4b_heartbeat_status() {
   pid="$(jq -er '.pid | select(type == "number" and . > 0 and . == floor)' "$record" 2>/dev/null)" \
     || { printf 'unknown\n'; return 0; }
   command -v ps >/dev/null 2>&1 || { printf 'unknown\n'; return 0; }
-  expected="$(jq -r '.process_started_at // empty' "$record" 2>/dev/null)" || expected=""
+  expected="$(jq -er '.process_started_at | select(type == "string" and length > 0)' "$record" 2>/dev/null)" \
+    || { printf 'unknown\n'; return 0; }
   observed="$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null)" || rc=$?
   if [ "$rc" = 1 ] && [ -z "$observed" ]; then
     printf 'crashed\n'
