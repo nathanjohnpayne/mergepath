@@ -48,7 +48,7 @@ def raw_job(job_id=20, check_id=100):
 
 
 def model(checks=None, head=SHA):
-    checks = checks if checks is not None else [normalize_check(REPO, raw_check(), {'50': '9'})]
+    checks = checks if checks is not None else [normalize_check(REPO, raw_check(), {'50': {'workflow_id': '9', 'run_id': '10'}})]
     rows, groups = group_runs(REPO, [raw_run()], {'10': [normalize_job(raw_job())]}, supersede(checks), {'7': head})
     return {'schema': 'ci/v1', 'recent_seconds': 86400, 'runs': rows, 'groups': groups,
             'repositories': [{'repo': REPO, 'observed_at': 1000, 'attempted_at': 1000,
@@ -67,8 +67,8 @@ def params(**updates):
 
 class SupersessionTests(unittest.TestCase):
     def test_same_sha_producer_and_check_later_pass_supersedes(self):
-        checks = [normalize_check(REPO, raw_check(), {'50': '9'}),
-                  normalize_check(REPO, raw_check(101, 'success', LATER), {'50': '9'})]
+        checks = [normalize_check(REPO, raw_check(), {'50': {'workflow_id': '9', 'run_id': '10'}}),
+                  normalize_check(REPO, raw_check(101, 'success', LATER), {'50': {'workflow_id': '9', 'run_id': '10'}})]
         row = model(checks)['runs'][0]
         self.assertTrue(row['superseded'])
         self.assertFalse(row['actionable'])
@@ -81,19 +81,26 @@ class SupersessionTests(unittest.TestCase):
         self.assertEqual(row['rerun_command'], 'gh run rerun 10 --failed --repo owner/repo')
 
     def test_other_app_workflow_check_sha_or_repo_never_supersedes(self):
-        failed = normalize_check(REPO, raw_check(), {'50': '9'})
-        passed = normalize_check(REPO, raw_check(101, 'success', LATER), {'50': '9'})
+        failed = normalize_check(REPO, raw_check(), {'50': {'workflow_id': '9', 'run_id': '10'}})
+        passed = normalize_check(REPO, raw_check(101, 'success', LATER), {'50': {'workflow_id': '9', 'run_id': '10'}})
         for field, value in [('producer', 'app:2:workflow:9'), ('producer', 'app:1:workflow:10'),
                              ('name', 'other'), ('sha', OTHER_SHA), ('repo', 'owner/other')]:
             other = {**passed, field: value}
             self.assertIsNone(supersede([copy.deepcopy(failed), other])[0]['superseded_by'])
 
     def test_unknown_producer_time_and_earlier_success_do_not_clear(self):
-        failed = normalize_check(REPO, raw_check(), {'50': '9'})
+        failed = normalize_check(REPO, raw_check(), {'50': {'workflow_id': '9', 'run_id': '10'}})
         for producer, start in [(None, LATER), ('app:1:workflow:9', START), ('app:1:workflow:9', None)]:
-            passed = normalize_check(REPO, raw_check(101, 'success', start), {'50': '9'})
+            passed = normalize_check(REPO, raw_check(101, 'success', start), {'50': {'workflow_id': '9', 'run_id': '10'}})
             passed['producer'] = producer
             self.assertIsNone(supersede([copy.deepcopy(failed), passed])[0]['superseded_by'])
+
+    def test_missing_actions_run_lineage_preserves_failure(self):
+        failed = normalize_check(REPO, raw_check(), {'50': {'workflow_id': '9', 'run_id': '10'}})
+        for mapping in ({}, {'50': '9'}, {'50': None}, {'50': {'workflow_id': '9', 'run_id': None}}):
+            passed = normalize_check(REPO, raw_check(101, 'success', LATER), mapping)
+            self.assertIsNone(supersede([copy.deepcopy(failed), passed])[0]['superseded_by'])
+            self.assertTrue(model([copy.deepcopy(failed), passed])['runs'][0]['actionable'])
 
     def test_changed_head_and_missing_head_keep_history(self):
         old = model(head=OTHER_SHA)['runs'][0]
@@ -108,7 +115,7 @@ class SupersessionTests(unittest.TestCase):
                                       ('CodeQL analysis failed: not retryable', 'boulder'),
                                       ('API rate limit exceeded for installation ID 5', 'boulder')]:
             raw = raw_check(); raw['output'] = {'summary': diagnostic}
-            row = model([normalize_check(REPO, raw, {'50': '9'})])['runs'][0]
+            row = model([normalize_check(REPO, raw, {'50': {'workflow_id': '9', 'run_id': '10'}})])['runs'][0]
             self.assertEqual(row['severity'], severity)
             self.assertNotIn('remaining', row)
 
@@ -143,6 +150,38 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(len(calls), 17)
         self.assertTrue(sample.data['runs'][0]['actionable'])
         self.assertTrue(all('filter=all' in u for u in calls if '/jobs?' in u or '/check-runs?' in u))
+
+    def test_independent_actions_run_lineage_preserves_current_head_failure(self):
+        # Observed #1698 run/suite lineage; check/app IDs remain synthetic fixtures.
+        for event in ('pull_request_review', 'pull_request'):
+            failed = raw_run(37148273080); failed['check_suite_id'] = 100623897251; failed['event'] = 'pull_request'
+            passed = raw_run(37149201865, 'success'); passed.update(check_suite_id=100626404220, event=event)
+            checks = [raw_check(suite=failed['check_suite_id']), raw_check(101, 'success', LATER, suite=passed['check_suite_id'])]
+            class Client:
+                def pages(self, route, **kwargs):
+                    if '/pulls?' in route: return [{'number': 7, 'head': {'sha': SHA}}]
+                    if '/actions/runs?' in route: return [failed, passed] if 'created=' in route else []
+                    if '/jobs?' in route: return [raw_job()] if '/37148273080/' in route else [raw_job(21, 101)]
+                    return checks
+            rows = CIProvider(Client(), INVENTORY)(time.monotonic() + 5).data['runs']
+            old = next(row for row in rows if row['id'] == '37148273080')
+            self.assertFalse(old['superseded']); self.assertTrue(old['actionable']); self.assertEqual(old['severity'], 'bump')
+            self.assertIsNone(old['checks'][0]['superseded_by'])
+
+    def test_provider_same_run_retry_and_ambiguous_suite_lineage(self):
+        for ambiguous in (False, True):
+            run = raw_run(conclusion='success'); run['run_attempt'] = 2
+            peer = raw_run(11, 'success')
+            class Client:
+                def pages(self, route, **kwargs):
+                    if '/pulls?' in route: return [{'number': 7, 'head': {'sha': SHA}}]
+                    if '/actions/runs?' in route: return ([run, peer] if ambiguous else [run]) if 'created=' in route else []
+                    if '/jobs?' in route: return [raw_job(), {**raw_job(21, 101), 'run_attempt': 2, 'conclusion': 'success'}]
+                    return [raw_check(), raw_check(101, 'success', LATER)]
+            row = CIProvider(Client(), INVENTORY)(time.monotonic() + 5).data['runs'][0]
+            self.assertEqual(row['superseded'], not ambiguous)
+            self.assertEqual(row['actionable'], ambiguous)
+            self.assertEqual(row['checks'][0]['superseded_by'], None if ambiguous else '101')
 
     def test_denied_repo_preserves_other_repo_and_prior_age(self):
         now = [1000]
