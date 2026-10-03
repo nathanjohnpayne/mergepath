@@ -475,6 +475,9 @@ for excluded in \
   '.mergepath-sync.yml' \
   'scripts/sync-to-downstream.sh' \
   'tests/test_sync_to_downstream.sh' \
+  'scripts/lib/sync-audit-json.sh' \
+  'tests/test_sync_audit_json.sh' \
+  'specs/sync_audit_json.md' \
   '.github/workflows/weekly-drift-audit.yml' \
   '.mergepath-project-docs.yml' \
   'docs/projects' \

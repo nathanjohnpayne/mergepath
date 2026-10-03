@@ -216,6 +216,9 @@ ALLOW_LIST=(
   "scripts/sync-to-downstream.sh"
   "scripts/project-doc-sync.sh"
   "tests/test_sync_to_downstream.sh"
+  "scripts/lib/sync-audit-json.sh"
+  "tests/test_sync_audit_json.sh"
+  "specs/sync_audit_json.md"
   "tests/test_sync_overrides.sh"
   "tests/test_project_doc_sync.sh"
 
