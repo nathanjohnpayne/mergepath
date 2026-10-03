@@ -20,6 +20,12 @@ ORCH="$ROOT/scripts/phase-4b-review.sh"
 AD_CODEX="$ROOT/scripts/phase-4b/adapters/review-via-codex.sh"
 AD_CLAUDE="$ROOT/scripts/phase-4b/adapters/review-via-claude.sh"
 
+# Focused lifecycle coverage (expected about 80s; adapter calls capped at 3s).
+# This mode never mutation-tests lib.sh or enters the long legacy suite.
+if [ "${1:-}" = --heartbeat-only ]; then
+  exec bash "$ROOT/tests/test_phase_4b_heartbeat.sh"
+fi
+
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not available" >&2; exit 0; }
 for f in "$LIB" "$ORCH" "$AD_CODEX" "$AD_CLAUDE"; do
   [ -e "$f" ] || { echo "missing required path: $f" >&2; exit 1; }
@@ -27,6 +33,8 @@ done
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/p4b-auto-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
+# Machine-local advisory telemetry must stay inside this hermetic fixture.
+export P4B_HEARTBEAT_DIR="$WORK/heartbeat-state"
 
 export P4B_TEST_POSTED_REVIEW="$WORK/posted-review.json"
 cat > "$WORK/clear-feedback.sh" <<'SH'
