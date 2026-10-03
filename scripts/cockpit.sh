@@ -3,12 +3,14 @@
 set +x
 set -euo pipefail
 
+COCKPIT_CALLER_DIR="$(pwd -P)"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COCKPIT_AGENT=codex
 COCKPIT_PORT=0
+COCKPIT_EXTRA_ARGS=()
 
 usage() {
-  echo "usage: cockpit.sh [--agent codex|claude|cursor] [--port 0..65535]" >&2
+  echo "usage: cockpit.sh [--agent codex|claude|cursor] [--port 0..65535] [--actions-settings PATH] [--agents-settings PATH]" >&2
   exit 2
 }
 
@@ -16,6 +18,13 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --agent) [ "$#" -ge 2 ] || usage; COCKPIT_AGENT=$2; shift 2 ;;
     --port) [ "$#" -ge 2 ] || usage; COCKPIT_PORT=$2; shift 2 ;;
+    --actions-settings|--agents-settings)
+      [ "$#" -ge 2 ] && [ -n "$2" ] || usage
+      case "$2" in
+        /*) COCKPIT_EXTRA_ARGS+=("$1" "$2") ;;
+        *) COCKPIT_EXTRA_ARGS+=("$1" "$COCKPIT_CALLER_DIR/$2") ;;
+      esac
+      shift 2 ;;
     -h|--help) usage ;;
     *) usage ;;
   esac
@@ -38,4 +47,4 @@ if ! eval "$cockpit_exports" || [ -z "${OP_PREFLIGHT_REVIEWER_PAT:-}" ]; then
 fi
 unset cockpit_exports OP_PREFLIGHT_AUTHOR_PAT GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
 cd "$ROOT"
-exec python3 -I "$ROOT/mergepath/cockpit/__main__.py" --port "$COCKPIT_PORT"
+exec python3 -I "$ROOT/mergepath/cockpit/__main__.py" --agent "$COCKPIT_AGENT" --port "$COCKPIT_PORT" "${COCKPIT_EXTRA_ARGS[@]}"

@@ -1,7 +1,10 @@
 """Launch the local shell without printing any authentication material."""
 
 import argparse
+import json
+import stat
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -14,9 +17,13 @@ if not __package__:
     # The launcher uses -I to ignore ambient Python paths and user site code.
     sys.path.insert(0, str(ROOT))
 
+from mergepath.cockpit.actions import ActionsProvider, ci_observation
+from mergepath.cockpit.agents import AgentsProvider, resolve_history_settings
 from mergepath.cockpit.github import ClientError, GitHubClient
 from mergepath.cockpit.fleet import FleetProvider
 from mergepath.cockpit.inventory import load_inventory
+from mergepath.cockpit.live_agents import LiveAgentsProvider, resolve_live_directory
+from mergepath.cockpit.ci import CIProvider, LogExcerptCache
 from mergepath.cockpit.prs import PRProvider
 from mergepath.cockpit.server import Application, CockpitServer
 from mergepath.cockpit.sync import SyncProvider
@@ -54,14 +61,58 @@ def close_runtime(app, fleet):
             app.close()
 
 
+def load_settings_json(path):
+    if path is None:
+        return {}
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError("invalid_settings_json")
+        raw = stream.read(65537)
+    if len(raw) > 65536:
+        raise ValueError("invalid_settings_json")
+    try:
+        value = json.loads(raw)
+    except (ValueError, RecursionError):
+        raise ValueError("invalid_settings_json") from None
+    if type(value) is not dict:
+        raise ValueError("invalid_settings_json")
+    return value
+
+
+
+def load_reviewers(root, run=subprocess.run):
+    # Registered identities are configuration, never inferred from review authors.
+    env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(Path.home())}
+    try:
+        result = run(["yq", "-o=json", ".available_reviewers", str(root / ".github/review-policy.yml")],
+                     capture_output=True, text=True, check=True, timeout=5, env=env)
+        if len(result.stdout) > 16384:
+            raise ValueError("invalid_reviewer_configuration")
+        reviewers = json.loads(result.stdout)
+        if (type(reviewers) is not list or not 1 <= len(reviewers) <= 64
+                or any(type(name) is not str or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", name)
+                       for name in reviewers)):
+            raise ValueError("invalid_reviewer_configuration")
+        return tuple(dict.fromkeys(reviewers))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise ValueError("invalid_reviewer_configuration") from None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Local Mergepath Cockpit")
+    parser.add_argument("--agent", choices=("codex", "claude", "cursor"), default="codex",
+                        help="agent whose existing credential cache is used for confirmed sync")
     parser.add_argument("--port", type=int, default=0, help="loopback port; 0 chooses an available port")
+    parser.add_argument("--actions-settings", help="local JSON containing explicit budget, cycle and measured coefficients")
+    parser.add_argument("--agents-settings", help="local JSON containing explicit checkout roots and optional price keys")
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error("port must be between 0 and 65535")
     app, fleet = None, None
     try:
+        actions_settings = load_settings_json(args.actions_settings)
+        agents_settings = load_settings_json(args.agents_settings)
         github = GitHubClient.from_environment(os.environ)
         # Resolve the canonical cache once before worker HOME/XDG isolation.
         cache_dir = Path(os.environ.get("OP_PREFLIGHT_CACHE_DIR") or
@@ -72,9 +123,15 @@ def main(argv=None):
                      "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
             os.environ.pop(name, None)
         inventory = load_inventory(ROOT)
+        checkouts, price_keys = resolve_history_settings(agents_settings, inventory, ROOT)
+        reviewers = load_reviewers(ROOT)
         app = Application(inventory, github, logger=lambda message: print(message, file=sys.stderr))
-        provider = PRProvider(github, inventory, ROOT, checkout_roots={"nathanjohnpayne/mergepath": ROOT})
-        app.scheduler.register("prs", provider, hot_interval=15, idle_interval=120, timeout=30)
+        ci_provider = CIProvider(github, inventory)
+        app.scheduler.register("ci", ci_provider, hot_interval=20, idle_interval=120, timeout=60)
+        app.register_panel("ci", "ci")
+        app.ci_excerpts = LogExcerptCache(inventory, lambda repo, job, deadline: github.read_job_log(repo, job, deadline=deadline))
+        pr_provider = PRProvider(github, inventory, ROOT, checkout_roots={"nathanjohnpayne/mergepath": ROOT})
+        app.scheduler.register("prs", pr_provider, hot_interval=15, idle_interval=120, timeout=30)
         app.register_panel("prs", "prs")
         fleet = FleetProvider(inventory, ROOT, github._token)
         app.scheduler.register("fleet", fleet.fetch, hot_interval=1800, idle_interval=1800,
@@ -84,12 +141,22 @@ def main(argv=None):
             if not app.stopping.is_set():
                 app.scheduler.refresh("fleet")
                 app.scheduler.refresh("prs")
-        app.sync = SyncProvider(inventory, ROOT, fleet.fetch, cache_dir=cache_dir,
+        app.sync = SyncProvider(inventory, ROOT, fleet.fetch, cache_dir=cache_dir, agent=args.agent,
                                 changed=app.publish, completed=completed)
+        actions_provider = ActionsProvider(github, inventory, settings=actions_settings,
+                                           ci_snapshot=lambda repo, now: ci_observation(app.panel_snapshot("ci")["envelope"], repo, now))
+        app.scheduler.register("actions", actions_provider.fetch, hot_interval=15, idle_interval=120, timeout=30)
+        app.register_panel("budget", "actions")
+        agents_provider = AgentsProvider(inventory, checkouts, ROOT, price_keys=price_keys, github=github, reviewers=reviewers)
+        app.scheduler.register("agents", agents_provider.fetch, hot_interval=30, idle_interval=120, timeout=30)
+        app.register_panel("history", "agents")
+        live_agents = LiveAgentsProvider(inventory, resolve_live_directory(), ROOT)
+        app.scheduler.register("live_agents", live_agents.fetch, hot_interval=5, idle_interval=5, timeout=10, max_backoff=60)
+        app.register_panel("agents", "live_agents")
         server = CockpitServer(app, args.port)
     except (ClientError, ValueError, OSError):
         close_runtime(app, fleet)
-        print("Cockpit cannot start. Check the cached reviewer credential, installed hub yq and loopback port.",
+        print("Cockpit cannot start. Check the cached reviewer credential, installed hub yq, settings JSON and loopback port.",
               file=sys.stderr)
         return 1
     port = server.server_address[1]

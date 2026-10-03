@@ -17,6 +17,19 @@ spec_test_map:
   cockpit_fleet:
     - tests/test_cockpit_fleet.py
     - tests/test_cockpit_fleet_ui.cjs
+  cockpit_live_agents:
+    - tests/test_cockpit_live_agents.py
+    - tests/test_cockpit_live_agents_ui.cjs
+  cockpit_agents:
+    - tests/test_cockpit_agents.py
+    - tests/test_cockpit_agents_ui.cjs
+  cockpit_actions:
+    - tests/test_cockpit_actions.py
+    - tests/test_cockpit_actions_ui.cjs
+  cockpit_ci:
+    - tests/test_cockpit_ci.py
+    - tests/test_cockpit_ci_ui.cjs
+    - tests/test_cockpit_logs.py
   cockpit_prs:
     - tests/test_cockpit_prs.py
     - tests/test_cockpit_prs_ui.cjs

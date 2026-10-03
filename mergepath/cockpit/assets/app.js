@@ -46,6 +46,13 @@
       && value.sources !== null && typeof value.sources === "object" && !Array.isArray(value.sources)
       && value.api_budget !== null && typeof value.api_budget === "object" && !Array.isArray(value.api_budget);
   }
+  function liveClockNeedsRender(snapshot, renderedAt, now) {
+    const live = snapshot?.sources?.live_agents;
+    if (!live?.data || C.epoch(live.observed_at) === null) return false;
+    if (Array.isArray(live.data.live) && live.data.live.length > 0) return true;
+    const observed = C.epoch(live.data.observed_at);
+    return observed !== null && renderedAt !== null && renderedAt <= observed + 10 && now > observed + 10;
+  }
   class PanelRegistry {
     constructor() {this.adapters = new Map();}
     register(id, source, project, render = null, options = {}) {
@@ -328,7 +335,7 @@
       onState: value => {const changed = connection.kind !== value.kind; connection = value; render(); if (changed) $("connection-announcement").textContent = $("connection-label").textContent + ". " + $("connection-note").textContent;}});
     const timer = setInterval(() => {
       const now = epochNow();
-      if (snapshot && (snapshot.sources.fleet?.in_flight === true || Object.values(snapshot.api_budget).some(evidence => {
+      if (snapshot && (liveClockNeedsRender(snapshot, renderedAt, now) || snapshot.sources.fleet?.in_flight === true || Object.values(snapshot.api_budget).some(evidence => {
         const reset = C.epoch(evidence?.reset);
         return reset !== null && renderedAt !== null && reset > renderedAt && reset <= now;
       }) || Object.values(snapshot.sources).some(envelope => {
@@ -347,5 +354,5 @@
   }
   let openSync = () => {};
   let registerPanel = (id, source, project, renderer, options) => registry.register(id, source, project, renderer, options);
-  return {validSnapshot, PanelRegistry, Connection, accountHazards, renderPanelContent, createFleetRefresh, refreshFleet, mount, openSync: repos => openSync(repos), registerPanel: (...args) => registerPanel(...args)};
+  return {validSnapshot, liveClockNeedsRender, PanelRegistry, Connection, accountHazards, renderPanelContent, createFleetRefresh, refreshFleet, mount, openSync: repos => openSync(repos), registerPanel: (...args) => registerPanel(...args)};
 });

@@ -5,7 +5,7 @@
 ## Surfaces
 
 - **Mergepath Playground** — interactive review-policy prototyping UI. Lives at [`mergepath/playground/`](mergepath/playground/). Tune the policy knobs, replay recent PRs, copy the resulting YAML. Current.
-- **Mergepath Cockpit** — local operator console for in-progress reviews. The authenticated shared shell lives at [`mergepath/cockpit/`](mergepath/cockpit/); PR, review-budget and read-only Fleet audit observations plus confirmed Fleet sync are connected; remaining panel sources show unavailable until connected. Foundation contract: [`specs/cockpit_foundation.md`](specs/cockpit_foundation.md).
+- **Mergepath Cockpit** — local operator console for in-progress reviews. The authenticated shell, PR/review-budget, CI, Actions-budget, live-agent, agent-history and Fleet observations live at [`mergepath/cockpit/`](mergepath/cockpit/). CI includes run/step drill-down and bounded failure excerpts; Fleet includes fresh preview and confirmed sync. Foundation contract: [`specs/cockpit_foundation.md`](specs/cockpit_foundation.md).
 - **Mergepath Tiebreaker** *(reserved)* — disagreement and escalation resolver per [`REVIEW_POLICY.md`](REVIEW_POLICY.md) § Disagreements and Tiebreaking. Future.
 - **Mergepath Checks** *(reserved)* — CI-surface integrations. Future.
 

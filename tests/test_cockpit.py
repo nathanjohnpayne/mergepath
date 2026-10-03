@@ -1361,6 +1361,147 @@ class InventoryAndLauncherTests(unittest.TestCase):
         self.assertTrue(app.stopping.is_set())
         self.assertEqual(events, ["scheduler", "fleet", "sync"])
 
+    def test_launcher_agent_reaches_main_sync_provider_without_credentials(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "scripts").mkdir()
+            (root / "mergepath" / "cockpit").mkdir(parents=True)
+            launcher = root / "scripts" / "cockpit.sh"
+            launcher.write_bytes((ROOT / "scripts" / "cockpit.sh").read_bytes())
+            preflight = root / "scripts" / "op-preflight.sh"
+            preflight.write_text('#!/bin/bash\nprintf "%s\\n" "$*" > "$COCKPIT_TEST_CALLS"\n'
+                                 'printf "export OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-credential\\n"\n')
+            preflight.chmod(0o755)
+            # Execute the actual Python parser/construction path, stopping before
+            # any server, provider worker or credential operation can start.
+            (root / "mergepath" / "cockpit" / "__main__.py").write_text(
+                'import importlib, json, sys, threading\n'
+                'from contextlib import ExitStack\nfrom types import SimpleNamespace\n'
+                'from unittest.mock import patch\n'
+                f'sys.path.insert(0, {str(ROOT)!r})\n'
+                'main = importlib.import_module("mergepath.cockpit.__main__")\n'
+                'def sync(*args, agent="codex", **kwargs):\n'
+                '    print(json.dumps({"agent":agent,"cache_dir":str(kwargs["cache_dir"])}))\n'
+                '    return SimpleNamespace(close=lambda: None)\n'
+                'scheduler = SimpleNamespace(register=lambda *a, **k: None, close=lambda: None)\n'
+                'app = SimpleNamespace(stopping=threading.Event(), scheduler=scheduler,\n'
+                '    register_panel=lambda *a: None, publish=lambda: None, close=lambda: None)\n'
+                'with ExitStack() as stack:\n'
+                '    stack.enter_context(patch.object(main.GitHubClient, "from_environment", return_value=SimpleNamespace(_token="fixture-only")))\n'
+                '    stack.enter_context(patch.object(main, "load_inventory", return_value=()))\n'
+                '    stack.enter_context(patch.object(main, "resolve_history_settings", return_value=((), {})))\n'
+                '    stack.enter_context(patch.object(main, "load_reviewers", return_value=("fixture-reviewer",)))\n'
+                '    stack.enter_context(patch.object(main, "Application", return_value=app))\n'
+                '    for name in ("FleetProvider", "CIProvider", "LogExcerptCache", "PRProvider", "ActionsProvider", "AgentsProvider", "LiveAgentsProvider"):\n'
+                '        stack.enter_context(patch.object(main, name, return_value=SimpleNamespace(fetch=lambda deadline: None, close=lambda: None)))\n'
+                '    stack.enter_context(patch.object(main, "SyncProvider", side_effect=sync))\n'
+                '    stack.enter_context(patch.object(main, "CockpitServer", side_effect=ValueError("fixture-stop-before-server")))\n'
+                '    raise SystemExit(main.main(sys.argv[1:]))\n')
+            calls, cache = root / "calls", root / "cache"
+            env = {**os.environ, "COCKPIT_TEST_CALLS": str(calls), "OP_PREFLIGHT_CACHE_DIR": str(cache),
+                   "OP_PREFLIGHT_AGENT": "cursor"}
+            for agent, arguments in [("codex", []), ("codex", ["--agent", "codex"]),
+                                     ("claude", ["--agent", "claude"]), ("cursor", ["--agent", "cursor"])]:
+                with self.subTest(agent=agent, arguments=arguments):
+                    result = subprocess.run(["bash", str(launcher), *arguments], env=env,
+                                            capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(calls.read_text().strip(), f"--agent {agent} --check --print-exports")
+                    self.assertEqual(json.loads(result.stdout), {"agent": agent, "cache_dir": str(cache.resolve())})
+                    direct = subprocess.run([sys.executable, "-I", str(root / "mergepath" / "cockpit" / "__main__.py"),
+                                             *arguments], env=env, capture_output=True, text=True, timeout=5)
+                    self.assertEqual(direct.returncode, 1, direct.stderr)
+                    self.assertEqual(json.loads(direct.stdout), {"agent": agent, "cache_dir": str(cache.resolve())})
+            calls.unlink()
+            for arguments in (["--agent", "unknown"], ["--agent"]):
+                result = subprocess.run(["bash", str(launcher), *arguments], env=env,
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 2)
+                self.assertFalse(calls.exists())
+            result = subprocess.run([sys.executable, "-I", str(root / "mergepath" / "cockpit" / "__main__.py"),
+                                     "--agent", "unknown"], env=env, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(result.stdout, "")
+
+    def test_launcher_resolves_settings_at_caller_before_changing_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, caller = Path(temp) / "hub", Path(temp) / "caller"
+            (root / "scripts").mkdir(parents=True)
+            (root / "mergepath" / "cockpit").mkdir(parents=True)
+            caller.mkdir()
+            launcher = root / "scripts" / "cockpit.sh"
+            launcher.write_bytes((ROOT / "scripts" / "cockpit.sh").read_bytes())
+            preflight = root / "scripts" / "op-preflight.sh"
+            preflight.write_text('#!/bin/bash\nprintf "called\\n" >> "$COCKPIT_TEST_CALLS"\n'
+                                 'printf "export OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-credential\\n"\n')
+            preflight.chmod(0o755)
+            (root / "mergepath" / "cockpit" / "__main__.py").write_text(
+                'import argparse, json\nfrom pathlib import Path\n'
+                'parser = argparse.ArgumentParser()\nparser.add_argument("--port")\nparser.add_argument("--agent")\n'
+                'parser.add_argument("--actions-settings")\nparser.add_argument("--agents-settings")\nargs = parser.parse_args()\n'
+                'path = Path(args.actions_settings or args.agents_settings)\n'
+                'print(json.dumps({"path":str(path),"data":json.loads(path.read_text())}))\n')
+            # These characters must remain literal argv/file content, not shell code.
+            name = "settings $(touch injected-dollar) `touch injected-backtick` [x]; 'quote'.json"
+            settings = caller / name
+            settings.write_text('{"budget":42}')
+            (root / name).write_text('{"budget":999}')  # Catch reading the wrong cwd, too.
+            calls = Path(temp) / "calls"
+            env = {**os.environ, "COCKPIT_TEST_CALLS": str(calls)}
+            for option, argument in [(option, argument) for option in ("--actions-settings", "--agents-settings") for argument in (name, str(settings))]:
+                with self.subTest(option=option, argument=argument):
+                    result = subprocess.run(["bash", str(launcher), option, argument],
+                                            cwd=caller, env=env, capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    value = json.loads(result.stdout)
+                    self.assertTrue(Path(value["path"]).is_absolute())
+                    self.assertEqual(Path(value["path"]).resolve(), settings.resolve())
+                    self.assertEqual(value["data"]["budget"], 42)
+            self.assertEqual(calls.read_text().splitlines(), ["called"] * 4)
+            for directory in (root, caller):
+                for marker in ("injected-dollar", "injected-backtick"):
+                    self.assertFalse((directory / marker).exists())
+            for arguments in (["--actions-settings", ""], ["--actions-settings"], ["--agents-settings", ""], ["--agents-settings"]):
+                result = subprocess.run(["bash", str(launcher), *arguments], cwd=caller, env=env,
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("usage:", result.stderr)
+            self.assertEqual(calls.read_text().splitlines(), ["called"] * 4)
+
+    def test_settings_are_bounded_regular_json_and_refuse_unsafe_inputs(self):
+        main = importlib.import_module("mergepath.cockpit.__main__")
+        self.assertEqual(main.load_settings_json(None), {})
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "settings with spaces.json"
+            path.write_text('{"budget":42,"measurements":{}}')
+            self.assertEqual(main.load_settings_json(path)["budget"], 42)
+            for raw in [b'[]', b'{broken', b'{}'+b' '*65535, b'\xff', b'['*2000+b']'*2000]:
+                path.write_bytes(raw)
+                with self.subTest(raw=raw[:10]), self.assertRaises((ValueError, UnicodeError)):
+                    main.load_settings_json(path)
+            path.unlink(); os.mkfifo(path)
+            with self.assertRaises(ValueError): main.load_settings_json(path)
+            path.unlink(); path.symlink_to(Path(temp) / "missing")
+            with self.assertRaises(OSError): main.load_settings_json(path)
+
+    def test_history_reviewer_configuration_is_explicit_bounded_and_scrubbed(self):
+        main = importlib.import_module("mergepath.cockpit.__main__")
+        calls = []
+        def read(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return SimpleNamespace(stdout='["fixture-reviewer", "another-reviewer", "fixture-reviewer"]')
+        with patch.dict(os.environ, {"GH_TOKEN": TOKEN, "OP_PREFLIGHT_AUTHOR_PAT": TOKEN}):
+            reviewers = main.load_reviewers(ROOT, run=read)
+        self.assertEqual(reviewers, ("fixture-reviewer", "another-reviewer"))
+        self.assertEqual(calls[0][0][2], ".available_reviewers")
+        self.assertEqual(calls[0][1]["timeout"], 5)
+        self.assertNotIn(TOKEN, json.dumps(calls[0][1]["env"]))
+        for raw in ('null', '{}', '[]', '["bad/name"]', '[true]', 'invalid', 'x'*16385):
+            with self.subTest(raw=raw[:20]), self.assertRaises(ValueError):
+                main.load_reviewers(ROOT, run=lambda *args, **kwargs: SimpleNamespace(stdout=raw))
+        with self.assertRaises(ValueError):
+            main.load_reviewers(ROOT, run=lambda *args, **kwargs: (_ for _ in ()).throw(OSError(TOKEN)))
+
     def test_browser_failure_never_exposes_fragment(self):
         main = importlib.import_module("mergepath.cockpit.__main__")
         output = io.StringIO()
@@ -1369,6 +1510,10 @@ class InventoryAndLauncherTests(unittest.TestCase):
              patch.object(main, "load_inventory", return_value=(Repository("mergepath", HUB, True),)), \
              patch.object(main, "FleetProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}), close=lambda: None)), \
              patch.object(main, "SyncProvider", return_value=SimpleNamespace(snapshot=lambda session: None, close=lambda: None)), \
+             patch.object(main, "resolve_history_settings", return_value=((), {})), \
+             patch.object(main, "load_reviewers", return_value=("fixture-reviewer",)), \
+             patch.object(main, "AgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))), \
+             patch.object(main, "LiveAgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))), \
              patch.object(main, "open_browser", return_value=False) as opener, \
              patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             self.assertEqual(main.main([]), 1)
@@ -1441,6 +1586,10 @@ class InventoryAndLauncherTests(unittest.TestCase):
              patch.object(main, "load_inventory", return_value=(Repository("mergepath", HUB, True),)), \
              patch.object(main, "FleetProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}), close=lambda: None)), \
              patch.object(main, "SyncProvider", return_value=SimpleNamespace(snapshot=lambda session: None, close=lambda: None)), \
+             patch.object(main, "resolve_history_settings", return_value=((), {})), \
+             patch.object(main, "load_reviewers", return_value=("fixture-reviewer",)), \
+             patch.object(main, "AgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))), \
+             patch.object(main, "LiveAgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))), \
              patch.object(main.shutil, "which", return_value="/fixture/xdg-open"), \
              patch.object(main.subprocess, "Popen", side_effect=opener), \
              patch.object(threading.Thread, "join", interrupt_after_launch), \
