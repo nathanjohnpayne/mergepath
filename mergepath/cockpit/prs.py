@@ -22,6 +22,14 @@ from .scheduler import Sample
 SAFE_INTEGER = 2**53 - 1
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 GATE_LABELS = ("needs-external-review", "needs-human-review", "human-hold", "policy-violation")
+HELPER_FAILURES = (ClientError, OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError)
+
+
+def helper_failure(error):
+    category = error.category if isinstance(error, ClientError) else "deadline_exceeded" if isinstance(error, subprocess.TimeoutExpired) else "source_failed"
+    return {"data": None, "error": category}
+
+
 BUDGETS = (
     ("blocking", "blk", "Codex blocking reviews", "codex-review-ledger.sh", False),
     ("requests", "req", "Codex requests (ceiling)", "codex-review-ledger.sh", False),
@@ -29,7 +37,7 @@ BUDGETS = (
     ("reruns", "4b", "Phase 4b reruns after CHANGES_REQUESTED", "Cockpit advisory setting · phase-4b-loops", True),
     ("commits", "CR", "CodeRabbit commits · advisory threshold", "reviewed-commit anchor · Cockpit 5-commit display threshold", True),
 )
-CHECK_RUN_FIELDS = "id name status conclusion detailsUrl startedAt checkSuite { app { id slug } workflowRun { workflow { id } } }"
+CHECK_RUN_FIELDS = "id name status conclusion detailsUrl startedAt checkSuite { app { id slug } workflowRun { id workflow { id } } }"
 FIELDS = """id number title url state isDraft headRefOid createdAt updatedAt mergedAt closedAt
  author { login } mergeStateStatus reviewDecision
  labels(first:100) { nodes { name } pageInfo { hasNextPage endCursor } }
@@ -132,13 +140,15 @@ def _check_producer(node):
     app = suite.get("app") if type(suite) is dict else None
     if type(app) is not dict or type(app.get("id")) is not str or not app["id"] or type(app.get("slug")) is not str or not app["slug"]:
         return None
-    run, workflow_id = suite.get("workflowRun"), None
+    run, workflow_id, run_id = suite.get("workflowRun"), None, None
     if app["slug"] == "github-actions" or run is not None:
         workflow = run.get("workflow") if type(run) is dict else None
         if type(workflow) is not dict or type(workflow.get("id")) is not str or not workflow["id"]:
             return None
-        workflow_id = workflow["id"]
-    return app["id"], workflow_id, node["name"]
+        if type(run.get("id")) is not str or not run["id"]:
+            return None
+        workflow_id, run_id = workflow["id"], run["id"]
+    return app["id"], workflow_id, run_id, node["name"]
 
 
 def _current_required_contexts(contexts):
@@ -161,19 +171,26 @@ def _current_required_contexts(contexts):
     return [node for index, node in enumerate(required) if index in selected]
 
 
-def commits_since_review(reviews, comments, commits, head):
+def commits_since_review(reviews, comments, commits, head, *, trusted_reviewers=(), bot_login="coderabbitai[bot]"):
     """Count identities after the reviewed commit, never commit author/committer timestamps."""
+    if (type(trusted_reviewers) not in (list, tuple) or any(type(login) is not str or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", login) for login in trusted_reviewers)
+            or type(bot_login) is not str or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*(?:\[bot\])?", bot_login)):
+        raise ClientError("source_failed")
+    resume_authors = {"nathanjohnpayne", *trusted_reviewers}
+    command = "@" + bot_login.removesuffix("[bot]") + " resume"
     events = [(epoch(item.get("submitted_at")), item.get("commit_id")) for item in reviews
-              if (item.get("user") or {}).get("login") == "coderabbitai[bot]" and item.get("body")]
+              if (item.get("user") or {}).get("login") == bot_login and item.get("body")]
     # A resume comment has no commit anchor; if it is newest, the exact count is unavailable.
     events += [(epoch(item.get("created_at")), None) for item in comments
-               if (item.get("user") or {}).get("login") == "nathanjohnpayne"
-               and (item.get("body") or "").strip() == "@coderabbitai resume"]
+               if (item.get("user") or {}).get("login") in resume_authors
+               and (item.get("body") or "").partition("\n")[0] == command]
     if not events or any(date is None for date, _ in events):
         raise ClientError("source_failed")
     newest = max(date for date, _ in events)
     anchors = {anchor for date, anchor in events if date == newest}
-    if len(anchors) != 1 or None in anchors:
+    if None in anchors:
+        return None  # Successfully observed resume; do not retain an obsolete numeric count.
+    if len(anchors) != 1:
         raise ClientError("source_failed")
     anchor = anchors.pop()
     identities = [item.get("sha") for item in commits]
@@ -399,8 +416,10 @@ class HelperReader:
                 finally:
                     if process.poll() is None:
                         os.killpg(process.pid, signal.SIGKILL)
-                    process.wait(timeout=1)
-                    listener.close()
+                    try:
+                        process.wait(timeout=1)
+                    finally:
+                        listener.close()
 
     def read(self, repo, number, head, deadline):
         script = str(self.root / "scripts")
@@ -426,10 +445,11 @@ author=$(printf '%s' "$ledger" | jq -r '.author')
 stops=$(crl_human_stops "$ledger" "$head" "$author" "$max" "$ceiling")
 metadata=$(gh api "repos/$repo/pulls/$pr")
 [ "$(printf '%s' "$metadata" | jq -ce '{head:.head.sha,base:.base.sha,ref:.base.ref,repository:.base.repo.id}')" = "$tuple" ]
-printf '%s' "$ledger" | jq --arg policy_yaml "$(cat "$p")" --arg base "$base" --argjson tuple "$tuple" --argjson stops "$stops" --argjson ceiling "$ceiling" '{policy_yaml:$policy_yaml,base_sha:$base,tuple:$tuple,summary:.summary, limits:{max_blocking_reviews:.max_blocking_reviews,max_review_rounds:$ceiling},human_stops:$stops.stops,outstanding:.summary.outcomes.no_response_yet,in_flight_on_head:(if .current_summary.status == "running" and (.current_summary.commit as $commit | .head_sha | startswith($commit // "impossible")) then true else null end),url:(if .current_summary.comment_id then "https://github.com/" + .repo + "/pull/" + (.pr|tostring) + "#issuecomment-" + (.current_summary.comment_id|tostring) elif (.requests|length)>0 then "https://github.com/" + .repo + "/pull/" + (.pr|tostring) + "#issuecomment-" + (.requests[-1].id|tostring) else null end)}'
+printf '%s' "$ledger" | jq --argjson policy "$policy" --arg policy_yaml "$(cat "$p")" --arg base "$base" --argjson tuple "$tuple" --argjson stops "$stops" --argjson ceiling "$ceiling" '{policy_yaml:$policy_yaml,commit_context:{reviewers:($policy.available_reviewers // []),bot_login:($policy.coderabbit.bot_login // "coderabbitai[bot]")},base_sha:$base,tuple:$tuple,summary:.summary, limits:{max_blocking_reviews:.max_blocking_reviews,max_review_rounds:$ceiling},human_stops:$stops.stops,outstanding:.summary.outcomes.no_response_yet,in_flight_on_head:(if .current_summary.status == "running" and (.current_summary.commit as $commit | .head_sha | startswith($commit // "impossible")) then true else null end),url:(if .current_summary.comment_id then "https://github.com/" + .repo + "/pull/" + (.pr|tostring) + "#issuecomment-" + (.current_summary.comment_id|tostring) elif (.requests|length)>0 then "https://github.com/" + .repo + "/pull/" + (.pr|tostring) + "#issuecomment-" + (.requests[-1].id|tostring) else null end)}'
 '''
         result = {}
         target_policy = None
+        commit_context = None
         calls = {"ledger": (["bash", "-c", command, "cockpit-pr-ledger", script, repo, number, head], (0,)),
                  "feedback": ([str(self.root / "scripts/review-feedback-accounting.sh"), number, repo], (0, 1)),
                  "coderabbit": ([str(self.root / "scripts/coderabbit-wait.sh"), "--probe", number, repo], (0, 2, 4, 5, 6, 7))}
@@ -446,42 +466,52 @@ printf '%s' "$ledger" | jq --arg policy_yaml "$(cat "$p")" --arg base "$base" --
                     data = self._run(args, repo, deadline, allowed=allowed, policy=target_policy, coderabbit=cr_config)
                 else:
                     data = self._run(args, repo, deadline, allowed=allowed)
+                if type(data) is not dict:
+                    raise ClientError("source_failed")
                 if source == "ledger":
                     target_policy = data.pop("policy_yaml", None)
+                    commit_context = data.pop("commit_context", None)
                 if source == "coderabbit" and data.get("head_sha") != head:
                     raise ClientError("source_failed")
                 result[source] = {"data": data, "error": None}
-            except (ClientError, OSError, ValueError):
-                result[source] = {"data": None, "error": "source_failed"}
+            except HELPER_FAILURES as error:
+                result[source] = helper_failure(error)
         # Count CR commits only from a proven anchor. Never assume zero.
         try:
             reviews = self.client.pages(f"/repos/{repo}/pulls/{number}/reviews?per_page=100", deadline=deadline)
             comments = self.client.pages(f"/repos/{repo}/issues/{number}/comments?per_page=100", deadline=deadline)
             commits = self.client.pages(f"/repos/{repo}/pulls/{number}/commits?per_page=100", deadline=deadline)
-            result["commits"] = {"data": {"used": commits_since_review(reviews, comments, commits, head)}, "error": None}
-        except (ClientError, OSError, ValueError):
-            result.setdefault("commits", {"data": None, "error": "source_failed"})
+            if type(commit_context) is not dict:
+                raise ClientError("source_failed")
+            result["commits"] = {"data": {"used": commits_since_review(reviews, comments, commits, head,
+                trusted_reviewers=commit_context.get("reviewers"), bot_login=commit_context.get("bot_login"))}, "error": None}
+        except HELPER_FAILURES as error:
+            result.setdefault("commits", helper_failure(error))
         try:
             if "reviews" not in locals():
                 raise ClientError("source_failed")
             result["accounting"] = {"data": self._accounting(repo, number, reviews, deadline, policy=target_policy), "error": None}
-        except (ClientError, OSError, ValueError, KeyError, TypeError):
-            result["accounting"] = {"data": None, "error": "source_failed"}
+        except HELPER_FAILURES as error:
+            result["accounting"] = helper_failure(error)
         try:
             if target_policy is None:
                 raise ClientError("source_failed")
             self._same_tuple(repo, number, result["ledger"]["data"].get("tuple"), deadline)
-        except (ClientError, OSError, ValueError, KeyError, TypeError):
-            return {source: {"data": None, "error": "source_failed"} for source in result}
+        except HELPER_FAILURES as error:
+            return {source: helper_failure(error) for source in result}
         return result
 
     def _same_tuple(self, repo, number, expected, deadline):
         if type(expected) is not dict:
             raise ClientError("source_failed")
         metadata = self.client.get(f"/repos/{repo}/pulls/{number}", deadline=deadline)
-        base = metadata.get("base", {})
-        observed = {"head": metadata.get("head", {}).get("sha"), "base": base.get("sha"),
-                    "ref": base.get("ref"), "repository": base.get("repo", {}).get("id")}
+        if type(metadata) is not dict or type(metadata.get("base")) is not dict or type(metadata.get("head")) is not dict:
+            raise ClientError("source_failed")
+        base = metadata["base"]
+        if type(base.get("repo")) is not dict:
+            raise ClientError("source_failed")
+        observed = {"head": metadata["head"].get("sha"), "base": base.get("sha"),
+                    "ref": base.get("ref"), "repository": base["repo"].get("id")}
         if observed != expected:
             raise ClientError("source_failed")
 
@@ -498,6 +528,8 @@ jq -r --argjson trusted "$trusted" '.[] | (.user.login // "") as $login | select
 '''
         extracted = self._run(["bash", "-c", extraction, "cockpit-pr-records", str(self.root / "scripts")],
                               repo, deadline, payload=reviews, policy=policy)
+        if type(extracted) is not list or any(type(record) is not dict for record in extracted):
+            raise ClientError("source_failed")
         records = []
         for record in extracted:
             if str(record.get("pr")) == number and record.get("automation_state") == "posted":
@@ -720,10 +752,18 @@ class PRProvider:
                 continue
             repo, raw = raw_by_id[key]
             old = self.enrichment.get(key, {}).get("receipts", {})
-            results = self.helper.read(repo, str(raw["number"]), raw["headRefOid"], request_deadline)
+            failure = {"data": None, "error": "unavailable"}
+            try:
+                results = self.helper.read(repo, str(raw["number"]), raw["headRefOid"], request_deadline)
+                if type(results) is not dict:
+                    raise ClientError("source_failed")
+            except HELPER_FAILURES as error:
+                results, failure = {}, helper_failure(error)
             receipts = {}
             for source in ("ledger", "feedback", "coderabbit", "accounting", "commits"):
-                value = results.get(source, {"data": None, "error": "unavailable"})
+                value = results.get(source, failure)
+                if type(value) is not dict or value.get("data") is not None and type(value["data"]) is not dict:
+                    value = {"data": None, "error": "source_failed"}
                 if value.get("data") is None and source in old:
                     receipt = copy.deepcopy(old[source]); receipt.update(stale=True, error=value.get("error", "source_failed"))
                 else:

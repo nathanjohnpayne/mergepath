@@ -1,4 +1,4 @@
-"""Hermetic #1587 provider/bridge regression fixtures. Expected <10s; bound60s."""
+"""Hermetic #1587 provider/bridge regression fixtures. Expected <20s; bound60s."""
 import base64
 import copy
 import json
@@ -41,11 +41,11 @@ def receipts(head=HEAD, used=0, **overrides):
     return {key: {'head': head, 'data': value, 'observed_at': 1000, 'stale': False, 'error': None} for key, value in values.items()}
 
 
-def required_check(identity, started, *, conclusion='SUCCESS', app='actions-app', slug='github-actions', workflow='lint-workflow'):
+def required_check(identity, started, *, conclusion='SUCCESS', app='actions-app', slug='github-actions', workflow='lint-workflow', run='lint-run'):
     return {'__typename':'CheckRun','id':identity,'name':'Required lint','isRequired':True,
             'status':'COMPLETED','conclusion':conclusion,'detailsUrl':'https://github.com/owner/hub/checks/'+identity,
             'startedAt':started,'checkSuite':{'app':{'id':app,'slug':slug},
-                'workflowRun':{'workflow':{'id':workflow}} if workflow is not None else None}}
+                'workflowRun':{'id':run,'workflow':{'id':workflow}} if workflow is not None else None}}
 
 
 class Client:
@@ -78,6 +78,85 @@ class Helpers:
 
 
 class PRTests(unittest.TestCase):
+    def test_helper_shape_and_process_failures_are_source_local(self):
+        metadata={'head':{'sha':HEAD},'base':{'sha':'b'*40,'ref':'main','repo':{'id':1}}}
+        expected={'head':HEAD,'base':'b'*40,'ref':'main','repository':1}
+        class Reads:
+            def get(self,path,*,deadline):return copy.deepcopy(self.metadata)
+            def pages(self,path,*,deadline):return []
+        class Reader(HelperReader):
+            def _api(self,*args):return 'reviews: {}'
+            def _run(self,args,*rest,**kwargs):
+                if 'cockpit-pr-ledger' in args:
+                    if self.mode=='ledger':return []
+                    return {'policy_yaml':'codex: {}','tuple':expected,'base_sha':'b'*40}
+                if 'cockpit-pr-records' in args:
+                    return {'record':None} if self.mode=='extract-object' else [None]
+                if 'coderabbit-wait.sh' in args[0]:
+                    if self.mode=='timeout':raise subprocess.TimeoutExpired(args,1)
+                    return {'head_sha':HEAD}
+                return {}
+        for mode in ['ledger','extract-object','extract-record','timeout','null-base','null-head','null-repo','null-metadata']:
+            with self.subTest(mode=mode):
+                client=Reads();client.metadata=copy.deepcopy(metadata)
+                if mode=='null-metadata':client.metadata=None
+                elif mode.startswith('null-'):
+                    if mode=='null-repo':client.metadata['base']['repo']=None
+                    else:client.metadata[mode[5:]]=None
+                reader=Reader(client,ROOT);reader.mode=mode
+                result=reader.read(REPO,'1',HEAD,time.monotonic()+5)
+                self.assertIsNone(result['accounting']['data'])
+                if mode in ['ledger','null-base','null-head','null-repo','null-metadata']:
+                    self.assertTrue(all(value['data'] is None for value in result.values()))
+                else:
+                    self.assertIsNotNone(result['ledger']['data'])
+                    self.assertIsNotNone(result['feedback']['data'])
+                    if mode=='timeout':self.assertEqual(result['coderabbit']['error'],'deadline_exceeded')
+                    else:self.assertIsNotNone(result['coderabbit']['data'])
+
+    def test_unexpected_helper_failure_retains_receipts_and_other_fresh_prs(self):
+        for failure in [AttributeError('private detail'),subprocess.TimeoutExpired(['private'],1),
+                        ClientError('deadline_exceeded'),[],{'ledger':None}]:
+            with self.subTest(failure=type(failure).__name__):
+                clock=[0]
+                class Broken(Helpers):
+                    def read(self,repo,number,head,deadline):
+                        if clock[0] and repo==REPO and number=='1':
+                            if isinstance(failure,Exception):raise failure
+                            return failure
+                        return super().read(repo,number,head,deadline)
+                client=Client();client.rows=[raw(1),raw(2)]
+                helper=Broken()
+                provider=PRProvider(client,[Repository('hub',REPO),Repository('peer','owner/peer')],ROOT,
+                    helper=helper,max_enrichments=4,monotonic=lambda:clock[0],clock=lambda:1000+clock[0])
+                provider(100);clock[0]=120
+                observations=provider(200).data['repositories']
+                self.assertTrue(all(not entry['stale'] and entry['observed_at']==1120 for entry in observations))
+                failed=observations[0]['rows'][0];healthy=observations[0]['rows'][1]
+                self.assertEqual(failed['checks'][0]['name'],'Required lint')
+                self.assertTrue(failed['stale']);self.assertFalse(healthy['stale'])
+                self.assertTrue(all(not row['stale'] for row in observations[1]['rows']))
+                retained=provider.enrichment[REPO+'#1']['receipts']['ledger']
+                self.assertEqual(retained['observed_at'],1000);self.assertTrue(retained['stale'])
+                category='deadline_exceeded' if isinstance(failure,(subprocess.TimeoutExpired,ClientError)) else 'source_failed'
+                self.assertEqual(retained['error'],category)
+                calls=len(helper.calls);clock[0]=130;provider(200)
+                self.assertEqual(len(helper.calls),calls)
+
+    def test_helper_deadline_failure_stops_later_enrichments_but_publishes_fast_rows(self):
+        clock=[0];calls=[]
+        class Exhausted:
+            def read(self,repo,number,head,deadline):
+                calls.append(number);clock[0]=deadline
+                raise ClientError('deadline_exceeded')
+        client=Client();client.rows=[raw(1),raw(2)]
+        provider=PRProvider(client,[Repository('hub',REPO)],ROOT,helper=Exhausted(),
+            max_enrichments=2,monotonic=lambda:clock[0])
+        rows=provider(5).data['repositories'][0]['rows']
+        self.assertEqual(calls,['1']);self.assertEqual(len(rows),2)
+        self.assertEqual(provider.enrichment[REPO+'#1']['receipts']['ledger']['error'],'deadline_exceeded')
+        self.assertEqual(provider.queue,[REPO+'#2'])
+
     def test_all_budget_boundaries_and_small_limit(self):
         for key in ['blocking', 'requests', 'rounds', 'reruns', 'commits']:
             for used, left, state in [(0, 10, 'clear'), (8, 2, 'bump'), (9, 1, 'bump'), (10, 0, 'boulder'), (11, 0, 'boulder')]:
@@ -96,9 +175,102 @@ class PRTests(unittest.TestCase):
         current=copy.deepcopy(review);current['commit_id']=HEAD
         self.assertEqual(commits_since_review([current],[],commits,HEAD),0)
         resumed={'user':{'login':'nathanjohnpayne'},'body':'@coderabbitai resume','created_at':'2026-10-03T02:00:00Z'}
-        with self.assertRaises(ClientError):commits_since_review([review],[resumed],commits,HEAD)
+        self.assertIsNone(commits_since_review([review],[resumed],commits,HEAD))
         with self.assertRaises(ClientError):commits_since_review([review],[],commits[1:],HEAD)
         with self.assertRaises(ClientError):commits_since_review([review],[],commits,'c'*40)
+
+    def test_supported_reviewer_resumes_withdraw_old_commit_anchor(self):
+        previous='b'*40
+        review={'user':{'login':'coderabbitai[bot]'},'body':'Completed review','commit_id':previous,'submitted_at':'2026-10-03T01:00:00Z'}
+        commits=[{'sha':previous},{'sha':HEAD}]
+        class Reads:
+            def get(self,path,*,deadline):return {'head':{'sha':HEAD},'base':{'sha':previous,'ref':'main','repo':{'id':1}}}
+            def pages(self,path,*,deadline):
+                if '/reviews?' in path:return [review]
+                if '/comments?' in path:return self.comments
+                return commits
+        class Reader(HelperReader):
+            def _api(self,*args):return 'reviews: {}'
+            def _run(self,args,*rest,**kwargs):
+                if 'cockpit-pr-ledger' in args:return {'policy_yaml':'codex: {}','base_sha':previous,
+                    'tuple':{'head':HEAD,'base':previous,'ref':'main','repository':1},
+                    'commit_context':{'reviewers':['consumer-reviewer'],'bot_login':'coderabbitai[bot]'}}
+                if 'coderabbit-wait.sh' in args[0]:return {'head_sha':HEAD}
+                raise ClientError('source_failed')
+        for login,body,unknown in [('consumer-reviewer','@coderabbitai resume',True),
+                ('consumer-reviewer','@coderabbitai resume\n\n<!-- mergepath-p4b-resume: fixture -->',True),
+                ('nathanjohnpayne','@coderabbitai resume\n\n<!-- mergepath-p4b-resume: fixture -->',True),
+                ('nathanpayne-codex','@coderabbitai resume',False),
+                ('untrusted','@coderabbitai resume',False),
+                ('consumer-reviewer','@coderabbitai resumed something',False),
+                ('consumer-reviewer','Quoted command\n@coderabbitai resume',False)]:
+            with self.subTest(login=login,body=body):
+                client=Reads();client.comments=[{'user':{'login':login},'body':body,'created_at':'2026-10-03T02:00:00Z'}]
+                result=Reader(client,ROOT).read(REPO,'1',HEAD,time.monotonic()+5)
+                if unknown:self.assertIsNone(result['commits']['data']['used'])
+                else:self.assertEqual(result['commits']['data']['used'],1)
+                self.assertNotIn('commit_context',result['ledger']['data'])
+
+    def test_actual_target_policy_controls_resume_authors_and_bot(self):
+        previous='b'*40
+        policy=(ROOT/'.github/review-policy.yml').read_text().replace('  - nathanpayne-claude','  - consumer-reviewer').replace('  - nathanpayne-cursor\n','').replace('  - nathanpayne-codex\n','').replace('coderabbitai[bot]','consumer-rabbit[bot]')
+        review={'user':{'login':'consumer-rabbit[bot]'},'body':'Completed review','commit_id':previous,'submitted_at':'2026-10-03T01:00:00Z'}
+        class Reads:
+            def get(self,path,*,deadline):
+                if 'contents/' in path:return {'encoding':'base64','content':base64.b64encode(policy.encode()).decode()}
+                if '/commits/' in path:return {'sha':HEAD,'commit':{'committer':{'date':'2026-10-03T00:00:00Z'}}}
+                return {'number':1,'head':{'sha':HEAD,'repo':{'id':1}},'base':{'sha':previous,'ref':'main','repo':{'id':1,'default_branch':'main'}},'draft':False}
+            def pages(self,path,*,deadline):
+                if '/reviews?' in path:return [review]
+                if '/comments?' in path:return self.comments
+                return [{'sha':previous},{'sha':HEAD}]
+        class Reader(HelperReader):
+            def _run(self,args,*rest,**kwargs):
+                if 'cockpit-pr-ledger' in args:return super()._run(args,*rest,**kwargs)
+                if 'coderabbit-wait.sh' in args[0]:return {'head_sha':HEAD}
+                raise ClientError('source_failed')
+        for login,body,unknown in [('consumer-reviewer','@consumer-rabbit resume\n\n<!-- mergepath-p4b-resume: fixture -->',True),
+                                 ('nathanpayne-codex','@consumer-rabbit resume',False),
+                                 ('consumer-reviewer','@coderabbitai resume',False)]:
+            with self.subTest(login=login,body=body):
+                client=Reads();client.comments=[{'id':7,'user':{'login':login},'body':body,'created_at':'2026-10-03T02:00:00Z'}]
+                result=Reader(client,ROOT).read('owner/consumer','1',HEAD,time.monotonic()+15)
+                self.assertIsNotNone(result['ledger']['data'],result)
+                if unknown:self.assertIsNone(result['commits']['data']['used'])
+                else:self.assertEqual(result['commits']['data']['used'],1)
+
+    def test_later_trusted_review_restores_commit_identity_count_after_resume(self):
+        previous='b'*40;middle='c'*40
+        early={'user':{'login':'coderabbitai[bot]'},'body':'Completed review','commit_id':previous,'submitted_at':'2026-10-03T01:00:00Z'}
+        late={**early,'commit_id':middle,'submitted_at':'2026-10-03T03:00:00Z'}
+        resume={'user':{'login':'consumer-reviewer'},'body':'@coderabbitai resume\n\n<!-- mergepath-p4b-resume: fixture -->','created_at':'2026-10-03T02:00:00Z'}
+        commits=[{'sha':previous},{'sha':middle},{'sha':HEAD}]
+        self.assertIsNone(commits_since_review([early],[resume],commits,HEAD,trusted_reviewers=['consumer-reviewer']))
+        self.assertEqual(commits_since_review([early,late],[resume],commits,HEAD,trusted_reviewers=['consumer-reviewer']),1)
+        self.assertIsNone(commits_since_review([early,{**late,'body':''}],[resume],commits,HEAD,trusted_reviewers=['consumer-reviewer']))
+
+    def test_observed_resume_replaces_cached_numeric_commit_hazard_with_unknown(self):
+        commits=[{'sha':letter*40} for letter in 'bcdef']+[{'sha':HEAD}]
+        review={'user':{'login':'coderabbitai[bot]'},'body':'Completed review','commit_id':commits[0]['sha'],'submitted_at':'2026-10-03T01:00:00Z'}
+        comments=[];reviews=[review];clock=[0]
+        class Helper(Helpers):
+            def read(self,repo,number,head,deadline):
+                result=super().read(repo,number,head,deadline)
+                result['commits']={'data':{'used':commits_since_review(reviews,comments,commits,head,trusted_reviewers=['consumer-reviewer'])},'error':None}
+                return result
+        provider=PRProvider(Client(),[Repository('hub',REPO)],ROOT,helper=Helper(),monotonic=lambda:clock[0],clock=lambda:1000+clock[0])
+        first=provider(100).data['repositories'][0]['rows'][0]
+        self.assertEqual(first['budgets'][4]['used'],5);self.assertEqual(first['budgets'][4]['state'],'boulder')
+        comments.append({'user':{'login':'consumer-reviewer'},'body':'@coderabbitai resume\n\n<!-- mergepath-p4b-resume: fixture -->','created_at':'2026-10-03T02:00:00Z'})
+        clock[0]=120
+        resumed=provider(200).data['repositories'][0]['rows'][0]
+        self.assertIsNone(resumed['budgets'][4]['used']);self.assertEqual(resumed['budgets'][4]['state'],'idle')
+        self.assertFalse(resumed['stale']);self.assertFalse(resumed['budgets'][4]['stale'])
+        self.assertEqual(resumed['budgets'][4]['observed_at'],1120)
+        self.assertFalse(any(hazard['id'].endswith(':commits') for hazard in resumed['hazards']))
+        reviews.append({**review,'commit_id':commits[-2]['sha'],'submitted_at':'2026-10-03T03:00:00Z'});clock[0]=240
+        restored=provider(300).data['repositories'][0]['rows'][0]
+        self.assertEqual(restored['budgets'][4]['used'],1);self.assertEqual(restored['budgets'][4]['state'],'clear')
 
     def test_required_running_gate_labels_and_clean_fact(self):
         row=build_row(REPO,raw(),receipts(),observed_at=1000)
@@ -159,6 +331,25 @@ class PRTests(unittest.TestCase):
         item=raw();item['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts']['nodes']=[first,last]
         self.assertEqual([c['id'] for c in build_row(REPO,item)['checks']],['vendor-new'])
 
+    def test_independent_actions_runs_keep_required_failure_even_same_event(self):
+        # Saved #1698 run lineage; GraphQL IDs below are explicitly synthetic.
+        for event in ('pull_request_review', 'pull_request'):
+            old = required_check('old', '2026-10-03T01:00:00Z', conclusion='FAILURE', run='WR37148273080')
+            new = required_check('new', '2026-10-03T02:00:00Z', run='WR37149201865')
+            old['event'] = 'pull_request'; new['event'] = event
+            item = raw(); item['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts']['nodes'] = [old, new]
+            checks = build_row(REPO, item)['checks']
+            self.assertEqual([check['id'] for check in checks], ['old', 'new'])
+            self.assertEqual(sum(check['state'] == 'clear' for check in checks), 1)
+            self.assertEqual(sum(check['state'] == 'boulder' for check in checks), 1)
+
+    def test_missing_or_ambiguous_actions_run_identity_cannot_hide_required_failure(self):
+        old = required_check('old', '2026-10-03T01:00:00Z', conclusion='FAILURE')
+        for run in (None, '', 123, [], {}):
+            new = required_check('new', '2026-10-03T02:00:00Z', run=run)
+            item = raw(); item['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts']['nodes'] = [old, new]
+            self.assertEqual([c['id'] for c in build_row(REPO, item)['checks']], ['old', 'new'])
+
     def test_required_checks_never_supersede_legacy_surface_or_optional_evidence(self):
         old=required_check('old','2026-10-03T01:00:00Z',conclusion='FAILURE')
         optional={**required_check('new','2026-10-03T02:00:00Z'),'isRequired':False}
@@ -179,8 +370,21 @@ class PRTests(unittest.TestCase):
         self.assertEqual(len(documents),3)
         for query in documents:
             self.assertIn('startedAt',query);self.assertIn('app { id slug }',query)
-            self.assertIn('workflowRun { workflow { id } }',query)
+            self.assertIn('workflowRun { id workflow { id } }',query)
         for query in documents[1:]:self.assertIn('isRequired(pullRequestNumber:',query)
+
+    def test_independent_run_identity_survives_required_context_pagination(self):
+        client = Client()
+        old = required_check('old', '2026-10-03T01:00:00Z', conclusion='FAILURE', run='old-run')
+        new = required_check('new', '2026-10-03T02:00:00Z', run='new-run')
+        client.rows[0]['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts'] = connection([old], 'next')
+        client.check_page = [new]
+        row = PRProvider(client, [Repository('hub', REPO)], ROOT, helper=Helpers())(time.monotonic() + 5).data['repositories'][0]['rows'][0]
+        self.assertEqual([c['id'] for c in row['checks']], ['old', 'new'])
+        self.assertEqual([c['state'] for c in row['checks']], ['boulder', 'clear'])
+        self.assertTrue(row['checks_known'])
+        for query, _, _ in client.calls:
+            self.assertIn('workflowRun { id workflow { id } }', query)
 
     def test_same_head_cadence_and_activity_refresh_head_invalidation(self):
         client,helper=Client(),Helpers(); clock=[0]
