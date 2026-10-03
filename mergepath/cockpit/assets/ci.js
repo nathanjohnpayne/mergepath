@@ -12,6 +12,7 @@
   const live = ["queued", "in_progress", "waiting", "pending", "requested"];
   const status = value => [...live, "completed", "unknown"].includes(value);
   const conclusion = value => value === null || [...failures, "success", "neutral", "cancelled", "skipped", "stale"].includes(value);
+  const codePointLength = value => Array.from(value).length;
   function requireValid(value) {if (!value) throw new Error("invalid_ci_observation");}
   function validate(data) {
     requireValid(data?.schema === "ci/v1" && Array.isArray(data.runs) && Array.isArray(data.repositories) && Array.isArray(data.groups) && data.repositories.length > 0 && Number.isSafeInteger(data.recent_seconds) && data.recent_seconds > 0);
@@ -25,7 +26,7 @@
       requireValid(typeof row?.key === "string" && row.key === `${row.repo}:${row.id}:${row.pr ?? "none"}` && !keys.has(row.key)
         && repositories.has(row.repo) && decimal(row.id) && decimal(row.attempt) && decimal(row.workflow_id)
         && (row.pr === null || decimal(row.pr)) && typeof row.sha === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(row.sha)
-        && typeof row.name === "string" && row.name.length <= 1000 && status(row.status) && conclusion(row.conclusion)
+        && typeof row.name === "string" && codePointLength(row.name) <= 1000 && status(row.status) && conclusion(row.conclusion)
         && [null, true, false].includes(row.current_head) && typeof row.actionable === "boolean" && typeof row.superseded === "boolean"
         && typeof row.check_evidence_unknown === "boolean" && [null, "bump", "boulder"].includes(row.severity)
         && (row.reason === null || typeof row.reason === "string") && [row.created_at, row.started_at, row.updated_at].every(epoch)
@@ -54,7 +55,7 @@
           && (check.superseded_by === null || decimal(check.superseded_by)));
         checkIds.add(check.id);
       }
-      for (const diagnostic of row.diagnostics) requireValid(typeof diagnostic?.text === "string" && diagnostic.text.length <= 4000
+      for (const diagnostic of row.diagnostics) requireValid(typeof diagnostic?.text === "string" && codePointLength(diagnostic.text) <= 4000
         && diagnostic.source === "check-run output" && decimal(diagnostic.check_id));
     }
     return repositories;
@@ -102,7 +103,7 @@
   }
   function excerptText(value) {
     if (!value || !["ok", "empty", "denied", "unavailable", "stale"].includes(value.status) || !Array.isArray(value.lines)
-        || value.lines.length > 80 || value.lines.some(line => typeof line !== "string" || line.length > 1000 || !line.startsWith("FAIL:"))) return "Log excerpt unavailable: invalid response.";
+        || value.lines.length > 80 || value.lines.some(line => typeof line !== "string" || codePointLength(line) > 1000 || !line.startsWith("FAIL:"))) return "Log excerpt unavailable: invalid response.";
     const provenance = value.scope === "step-time-window" ? "Job log · observed step time window; not exact step attribution."
       : value.scope === "job" ? "Whole-job FAIL excerpt · selected-step attribution unavailable." : "Actions job log";
     if (value.status === "unavailable" && value.error === "response_too_large") return "Log excerpt unavailable: complete job log exceeds the 2 MiB read limit; no tail was observed.";

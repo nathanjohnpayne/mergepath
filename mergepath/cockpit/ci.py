@@ -10,6 +10,7 @@ import urllib.parse
 from collections import OrderedDict, deque
 
 from .github import ClientError, MAX_BODY, copy_json_tree, error_category, retry_delay
+from .inventory import REPO as REPO_NAME
 from .scheduler import Sample
 
 FAILURES = frozenset({'failure', 'timed_out', 'action_required', 'startup_failure'})
@@ -116,11 +117,12 @@ def normalize_job(value, repo=None):
     check_url = value.get('check_run_url')
     check_id = None
     if type(check_url) is str:
-        match = re.fullmatch(r'https://api\.github\.com/repos/[^/]+/[^/]+/check-runs/([1-9][0-9]*)', check_url)
+        match = re.fullmatch(r'https://api\.github\.com/repos/([^/]+/[^/]+)/check-runs/([1-9][0-9]*)', check_url)
         if match:
-            if repo is not None and not check_url.startswith('https://api.github.com/repos/' + repo + '/check-runs/'):
+            if repo is not None and (not REPO_NAME.fullmatch(match.group(1))
+                                     or match.group(1).casefold() != repo.casefold()):
                 raise ClientError('invalid_upstream_json')
-            check_id = identity(match.group(1))
+            check_id = identity(match.group(2))
     result = {'id': identity(value.get('id')), 'name': text(value.get('name')), 'check_id': check_id,
               'attempt': identity(value['run_attempt']) if value.get('run_attempt') is not None else None,
               'status': _status(value.get('status')), 'conclusion': _conclusion(value.get('conclusion')),
@@ -361,11 +363,12 @@ class LogExcerptCache:
                     result = self._unavailable(error_category(exc.category))
                 except Exception:
                     result = self._unavailable('upstream_unavailable')
-            with self.condition:
-                self.cache[key] = (self.clock() + self.ttl, result)
-                self.cache.move_to_end(key)
-                while len(self.cache) > self.max_jobs:
-                    self.cache.popitem(last=False)
+            if type(result) is bytes or result['error'] in {'permission_denied', 'response_too_large'}:
+                with self.condition:
+                    self.cache[key] = (self.clock() + self.ttl, result)
+                    self.cache.move_to_end(key)
+                    while len(self.cache) > self.max_jobs:
+                        self.cache.popitem(last=False)
             return self._project(result, step)
         finally:
             with self.condition:
