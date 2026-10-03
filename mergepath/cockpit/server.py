@@ -1,7 +1,8 @@
-"""Authenticated loopback HTTP, SSE and fixed read-only refresh actions."""
+"""Authenticated loopback HTTP, SSE and fixed server-owned actions."""
 
 import hmac
 import json
+import math
 import mimetypes
 import secrets
 import socket
@@ -15,10 +16,13 @@ from pathlib import Path
 
 from .inventory import public_inventory
 from .scheduler import Scheduler
+from .sync import SyncError
 
 
 PANEL_IDS = ("prs", "ci", "agents", "history", "fleet", "budget")
 
+
+SYNC_BODY_SECONDS = 10
 
 COOKIE = "mergepath_cockpit"
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; "
@@ -44,6 +48,7 @@ class Application:
         self._nonce_expires, self._nonce_used = monotonic() + 120, False
         self._revision = 0
         self._panel_sources = {}
+        self.sync = None
         self._condition = threading.Condition()
         self.stopping = threading.Event()
         self.stream_slots = threading.BoundedSemaphore(2)
@@ -86,7 +91,8 @@ class Application:
             revision = self._revision
         return {"schema": "cockpit/v1", "revision": revision,
                 "generated_at": self.clock(), "repositories": public_inventory(self.inventory, repo),
-                "api_budget": self.github.budget(), "sources": self.redact(self.scheduler.snapshot())}
+                "api_budget": self.github.budget(), "sources": self.redact(self.scheduler.snapshot()),
+                "sync": self.redact(self.sync.snapshot(self._session)) if self.sync else None}
 
     def register_panel(self, panel, source):
         """Bind a fixed panel once to an existing server-owned source."""
@@ -120,10 +126,22 @@ class Application:
             raise ValueError("fleet_unavailable")
         self.scheduler.refresh(source)
 
+    def sync_action(self, action, payload):
+        """Dispatch only named operations against the launch-owned provider."""
+        if self.sync is None or self.stopping.is_set():
+            raise SyncError("sync_unavailable")
+        if action not in ("preview", "confirm", "cancel") or type(payload) is not dict:
+            raise SyncError("invalid_request")
+        return self.redact(getattr(self.sync, action)(self._session, payload))
+
     def close(self):
         self.stopping.set()
-        self.scheduler.close()
-        self.publish()
+        try:
+            if self.sync is not None:
+                self.sync.close()
+        finally:
+            self.scheduler.close()
+            self.publish()
 
 
 class CockpitServer(ThreadingHTTPServer):
@@ -281,6 +299,53 @@ class Handler(BaseHTTPRequestHandler):
             if (origin != "http://" + host or not _secret_equal(
                     self._single("X-Cockpit-CSRF"), app._csrf)):
                 self._respond(403, {"error": "csrf_refused"})
+            elif self.command == "POST" and parts.path in {
+                    "/api/sync/preview", "/api/sync/confirm", "/api/sync/cancel"}:
+                if parts.query or not length or self._single("Content-Type") != "application/json":
+                    self._respond(400, {"error": "invalid_request"})
+                    return
+                def expire_body():
+                    try:
+                        self.connection.shutdown(socket.SHUT_RD)
+                    except OSError:
+                        pass
+                body_timer = threading.Timer(SYNC_BODY_SECONDS, expire_body)
+                body_timer.daemon = True
+                body_timer.start()
+                try:
+                    raw = self.rfile.read(length)
+                    if len(raw) != length:
+                        raise ValueError("short_body")
+                    def unique_object(pairs):
+                        result = {}
+                        for key, value in pairs:
+                            if key in result:
+                                raise ValueError("duplicate_key")
+                            result[key] = value
+                        return result
+                    def refuse_constant(value):
+                        raise ValueError("invalid_number")
+                    def finite_float(value):
+                        result = float(value)
+                        if not math.isfinite(result):
+                            raise ValueError("invalid_number")
+                        return result
+                    payload = json.loads(raw, object_pairs_hook=unique_object,
+                                         parse_constant=refuse_constant, parse_float=finite_float)
+                    if type(payload) is not dict:
+                        raise ValueError("invalid_object")
+                except (ValueError, UnicodeError, OSError, RecursionError):
+                    self._respond(400, {"error": "invalid_request"})
+                    return
+                finally:
+                    body_timer.cancel()
+                try:
+                    result = app.sync_action(parts.path.rsplit("/", 1)[1], payload)
+                except SyncError as error:
+                    reason = str(error)
+                    self._respond(503 if reason == "sync_unavailable" else 409, {"error": reason})
+                else:
+                    self._respond(202, result)
             elif self.command == "POST" and parts.path == "/api/fleet/refresh":
                 if parts.query or length:
                     self._respond(400, {"error": "invalid_refresh"})

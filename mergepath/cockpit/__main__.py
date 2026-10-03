@@ -19,6 +19,7 @@ from mergepath.cockpit.fleet import FleetProvider
 from mergepath.cockpit.inventory import load_inventory
 from mergepath.cockpit.prs import PRProvider
 from mergepath.cockpit.server import Application, CockpitServer
+from mergepath.cockpit.sync import SyncProvider
 
 
 def open_browser(url):
@@ -40,6 +41,19 @@ def open_browser(url):
         return False
 
 
+def close_runtime(app, fleet):
+    """Stop audit owners before a preview worker waiting on their result."""
+    if app is not None:
+        app.stopping.set()
+        app.scheduler.close()
+    try:
+        if fleet is not None:
+            fleet.close()
+    finally:
+        if app is not None:
+            app.close()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Local Mergepath Cockpit")
     parser.add_argument("--port", type=int, default=0, help="loopback port; 0 chooses an available port")
@@ -49,8 +63,11 @@ def main(argv=None):
     app, fleet = None, None
     try:
         github = GitHubClient.from_environment(os.environ)
-        # Drop credentials the read-only foundation does not need. Future
-        # owner-only reads/write wrappers have their own explicit contracts.
+        # Resolve the canonical cache once before worker HOME/XDG isolation.
+        cache_dir = Path(os.environ.get("OP_PREFLIGHT_CACHE_DIR") or
+                         str(Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "mergepath")).resolve()
+        # Only the confirmed worker may reacquire author credentials through
+        # the canonical cache-check wrapper; the server keeps reviewer reads.
         for name in ("OP_PREFLIGHT_REVIEWER_PAT", "OP_PREFLIGHT_AUTHOR_PAT", "GH_TOKEN",
                      "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
             os.environ.pop(name, None)
@@ -63,12 +80,15 @@ def main(argv=None):
         app.scheduler.register("fleet", fleet.fetch, hot_interval=1800, idle_interval=1800,
                                timeout=180, max_backoff=7200)
         app.register_panel("fleet", "fleet")
+        def completed():
+            if not app.stopping.is_set():
+                app.scheduler.refresh("fleet")
+                app.scheduler.refresh("prs")
+        app.sync = SyncProvider(inventory, ROOT, fleet.fetch, cache_dir=cache_dir,
+                                changed=app.publish, completed=completed)
         server = CockpitServer(app, args.port)
     except (ClientError, ValueError, OSError):
-        if app is not None:
-            app.close()
-        if fleet is not None:
-            fleet.close()
+        close_runtime(app, fleet)
         print("Cockpit cannot start. Check the cached reviewer credential, installed hub yq and loopback port.",
               file=sys.stderr)
         return 1
@@ -88,8 +108,7 @@ def main(argv=None):
     except KeyboardInterrupt:
         pass
     finally:
-        app.close()
-        fleet.close()
+        close_runtime(app, fleet)
         server.shutdown()
         server.server_close()
         thread.join(timeout=1)

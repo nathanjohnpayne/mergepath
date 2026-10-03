@@ -1,10 +1,11 @@
 "use strict";
 (function (root, factory) {
   const components = typeof module === "object" && module.exports ? require("./components.js") : root.CockpitComponents;
-  const api = factory(components);
+  const sync = typeof module === "object" && module.exports ? require("./sync.js") : root.CockpitSync;
+  const api = factory(components, sync);
   if (typeof module === "object" && module.exports) module.exports = api;
   else {root.CockpitApp = api; api.mount();}
-})(globalThis, function (C) {
+})(globalThis, function (C, Sync) {
   const unavailable = () => ({state: "idle", label: "Unavailable", hazards: [], count: null, observed: false, renderable: false, stale: true, observed_at: null, coverageValid: false});
   function frozenCopy(value) {
     const copy = JSON.parse(JSON.stringify(value));
@@ -248,6 +249,8 @@
     $("theme").addEventListener("click", () => {dark = !dark; savePreference("cockpit-theme", dark ? "dark" : "light"); preferences();});
     $("motion").addEventListener("click", () => {reduced = !reduced; savePreference("cockpit-motion", reduced ? "reduce" : "normal"); preferences();});
     media.addEventListener("change", preferences); preferences();
+    const syncController = Sync.install(null, Sync.createActions((...args) => fetch(...args)));
+    openSync = repos => syncController.open(repos);
     const filterButtons = new Map(), poolOptions = new Map();
     let snapshot = null, selectedRepo = null, pool = "core", receivedAt = null, renderedAt = null, connection = {kind: "connecting", retry_at: null};
     const epochNow = () => Date.now() / 1000;
@@ -321,7 +324,7 @@
     }
     poolSelect.addEventListener("change", () => {pool = poolSelect.value; render();});
     const controller = new Connection({fetchSnapshot: signal => fetch("api/snapshot", {credentials: "same-origin", cache: "no-store", signal}),
-      openStream: () => new EventSource("events"), onSnapshot: value => {snapshot = value; receivedAt = performance.now(); render();},
+      openStream: () => new EventSource("events"), onSnapshot: value => {snapshot = value; receivedAt = performance.now(); syncController.update(value.sync); render();},
       onState: value => {const changed = connection.kind !== value.kind; connection = value; render(); if (changed) $("connection-announcement").textContent = $("connection-label").textContent + ". " + $("connection-note").textContent;}});
     const timer = setInterval(() => {
       const now = epochNow();
@@ -336,12 +339,13 @@
     }, 1000);
     const resize = new ResizeObserver(() => {if (snapshot) render();}); resize.observe(road.strip);
     document.fonts.ready.then(() => {if (snapshot) render();});
-    window.addEventListener("pagehide", () => {controller.stop(); clearInterval(timer); resize.disconnect();});
+    window.addEventListener("pagehide", () => {controller.stop(); syncController.close(); clearInterval(timer); resize.disconnect();});
     window.addEventListener("pageshow", event => {if (event.persisted) window.location.reload();});
     // Later scripts register a pure projection once; the shell remains the sole connection owner.
     registerPanel = (id, source, project, renderer, options) => {registry.register(id, source, project, renderer, options); render();};
     render(); controller.start();
   }
+  let openSync = () => {};
   let registerPanel = (id, source, project, renderer, options) => registry.register(id, source, project, renderer, options);
-  return {validSnapshot, PanelRegistry, Connection, accountHazards, renderPanelContent, createFleetRefresh, refreshFleet, mount, registerPanel: (...args) => registerPanel(...args)};
+  return {validSnapshot, PanelRegistry, Connection, accountHazards, renderPanelContent, createFleetRefresh, refreshFleet, mount, openSync: repos => openSync(repos), registerPanel: (...args) => registerPanel(...args)};
 });

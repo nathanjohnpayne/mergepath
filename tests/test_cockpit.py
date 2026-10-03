@@ -818,7 +818,7 @@ class ServerTests(unittest.TestCase):
             connection.close()
         self.app.close(); self.server.shutdown(); self.server.server_close(); self.thread.join(1)
 
-    def request(self, method="GET", path="/api/snapshot", *, headers=None, authenticated=True, stream=False, scoped=True):
+    def request(self, method="GET", path="/api/snapshot", *, headers=None, authenticated=True, stream=False, scoped=True, body=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=1)
         self.connections.append(connection)
         if scoped and path not in {"/bootstrap", "/bootstrap.js", "/api/bootstrap"}:
@@ -828,7 +828,7 @@ class ServerTests(unittest.TestCase):
         if authenticated and self.cookie:
             pairs.append(("Cookie", self.cookie))
         for key, value in pairs: connection.putheader(key, value)
-        connection.endheaders()
+        connection.endheaders(body)
         response = connection.getresponse()
         if stream:
             return response
@@ -1034,6 +1034,56 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(restored["data"], {"fixture": "recovered"})
         self.app.scheduler.tick()
         self.assertEqual(len(calls), 2)
+
+    def test_sync_routes_bind_server_session_and_preserve_auth_and_csrf(self):
+        self.bootstrap()
+        calls = []
+        state = {"schema": "cockpit-sync/v1", "phase": "previewing", "preview": None, "run": None, "error": None}
+        def action(session, payload):
+            calls.append((session, payload))
+            return state
+        self.app.sync = SimpleNamespace(preview=action, confirm=action, cancel=action,
+                                        snapshot=lambda session: state, close=lambda: None)
+        headers = [("Host", self.host), ("Origin", "http://" + self.host),
+                   ("X-Cockpit-CSRF", self.app._csrf), ("Content-Type", "application/json")]
+        body = b'{"repos":["owner/consumer"]}'
+        for name in ("preview", "confirm", "cancel"):
+            reply = self.request("POST", "/api/sync/" + name,
+                                 headers=headers + [("Content-Length", str(len(body)))], body=body)
+            self.assertEqual(reply[0], 202)
+            self.assertEqual(json.loads(reply[2]), state)
+        self.assertTrue(all(session == self.app._session for session, payload in calls))
+        self.assertEqual(calls[0][1], {"repos": ["owner/consumer"]})
+        self.assertEqual(json.loads(self.request()[2])["sync"], state)
+        for bad_headers, authenticated, expected in [(headers, False, 401), (headers[:2], True, 403),
+                ([("Host", self.host), ("Origin", "https://foreign.invalid")], True, 403)]:
+            self.assertEqual(self.request("POST", "/api/sync/confirm", authenticated=authenticated,
+                headers=bad_headers + [("Content-Length", str(len(body)))], body=body)[0], expected)
+        self.assertEqual(len(calls), 3)
+
+    def test_sync_routes_reject_ambiguous_json_framing_and_arbitrary_commands(self):
+        self.bootstrap()
+        calls = []
+        self.app.sync = SimpleNamespace(preview=lambda *args: calls.append(args),
+                                        snapshot=lambda session: None, close=lambda: None)
+        headers = [("Host", self.host), ("Origin", "http://" + self.host),
+                   ("X-Cockpit-CSRF", self.app._csrf), ("Content-Type", "application/json")]
+        for body in (b'[]', b'{"repos":[],"repos":[]}', b'{"x":NaN}', b'{"x":Infinity}', b'{"x":1e9999}', b'not-json', b'\xff'):
+            self.assertEqual(self.request("POST", "/api/sync/preview", headers=headers +
+                [("Content-Length", str(len(body)))], body=body)[0], 400)
+        for route in ("/api/sync/preview?command=push", "/api/sync/confirm?repo=evil"):
+            self.assertEqual(self.request("POST", route, headers=headers + [("Content-Length", "2")], body=b'{}')[0], 400)
+        self.assertEqual(self.request("POST", "/api/sync/execute", headers=headers)[0], 405)
+        self.assertEqual(self.request("POST", "/api/sync/preview", headers=headers + [("Content-Length", "4097")])[0], 413)
+        self.assertEqual(self.request("POST", "/api/sync/preview", headers=headers + [("Transfer-Encoding", "chunked")])[0], 400)
+        with patch("mergepath.cockpit.server.SYNC_BODY_SECONDS", 0.03):
+            before = time.monotonic()
+            self.assertEqual(self.request("POST", "/api/sync/preview", headers=headers +
+                [("Content-Length", "2")], body=b'{')[0], 400)
+            self.assertLess(time.monotonic() - before, 0.5)
+        self.assertEqual(calls, [])
+        self.app.sync = None
+        self.assertEqual(self.request("POST", "/api/sync/preview", headers=headers + [("Content-Length", "2")], body=b'{}')[0], 503)
 
     def test_real_shell_and_local_assets_require_session_and_keep_csp(self):
         self.app.static_root = ROOT / "mergepath/cockpit"
@@ -1301,6 +1351,16 @@ class InventoryAndLauncherTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertNotIn("fixture server launched", result.stdout)
 
+    def test_shutdown_stops_audit_before_waiting_on_sync_preview(self):
+        main = importlib.import_module("mergepath.cockpit.__main__")
+        events = []
+        app = SimpleNamespace(stopping=threading.Event(), scheduler=SimpleNamespace(close=lambda: events.append("scheduler")),
+                              close=lambda: events.append("sync"))
+        fleet = SimpleNamespace(close=lambda: events.append("fleet"))
+        main.close_runtime(app, fleet)
+        self.assertTrue(app.stopping.is_set())
+        self.assertEqual(events, ["scheduler", "fleet", "sync"])
+
     def test_browser_failure_never_exposes_fragment(self):
         main = importlib.import_module("mergepath.cockpit.__main__")
         output = io.StringIO()
@@ -1308,6 +1368,7 @@ class InventoryAndLauncherTests(unittest.TestCase):
         with patch.object(main.GitHubClient, "from_environment", return_value=client), \
              patch.object(main, "load_inventory", return_value=(Repository("mergepath", HUB, True),)), \
              patch.object(main, "FleetProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}), close=lambda: None)), \
+             patch.object(main, "SyncProvider", return_value=SimpleNamespace(snapshot=lambda session: None, close=lambda: None)), \
              patch.object(main, "open_browser", return_value=False) as opener, \
              patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             self.assertEqual(main.main([]), 1)
@@ -1379,6 +1440,7 @@ class InventoryAndLauncherTests(unittest.TestCase):
         with patch.object(main.GitHubClient, "from_environment", return_value=client), \
              patch.object(main, "load_inventory", return_value=(Repository("mergepath", HUB, True),)), \
              patch.object(main, "FleetProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}), close=lambda: None)), \
+             patch.object(main, "SyncProvider", return_value=SimpleNamespace(snapshot=lambda session: None, close=lambda: None)), \
              patch.object(main.shutil, "which", return_value="/fixture/xdg-open"), \
              patch.object(main.subprocess, "Popen", side_effect=opener), \
              patch.object(threading.Thread, "join", interrupt_after_launch), \

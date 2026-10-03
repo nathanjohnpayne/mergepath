@@ -4,7 +4,7 @@
   const api = factory(common ? require("./components.js") : root.CockpitComponents,
     common ? require("./pr_rows.js") : root.CockpitPRRows);
   if (common) module.exports = api;
-  else {root.CockpitFleet = api; api.install(root.CockpitApp, {refresh: root.CockpitApp.refreshFleet});}
+  else {root.CockpitFleet = api; api.install(root.CockpitApp, {refresh: root.CockpitApp.refreshFleet, onSync: root.CockpitApp.openSync});}
 })(typeof globalThis !== "undefined" ? globalThis : this, function (C, PRRows) {
   "use strict";
   const STATUSES = ["in-sync", "drift", "ahead", "override-only", "fetch-error"];
@@ -172,12 +172,15 @@
     destroy() {this.prList.destroy(); this.node.remove();}
   }
   class FleetView {
-    constructor(parent, {refresh = null} = {}) {
-      this.parent = parent; this.refresh = typeof refresh === "function" ? refresh : null; this.views = new Map();
+    constructor(parent, {refresh = null, onSync = null} = {}) {
+      this.parent = parent; this.refresh = typeof refresh === "function" ? refresh : null; this.onSync = typeof onSync === "function" ? onSync : null; this.views = new Map();
       this.summary = C.element("p", "fleet-summary"); this.controls = C.element("div", "fleet-controls"); this.note = C.element("p", "sub");
       this.refreshButton = C.element("button", "btn sm", "Refresh audit"); this.refreshButton.type = "button";
       this.refreshButton.addEventListener("click", () => this.requestRefresh());
       this.syncAll = C.element("button", "btn sm primary", "Sync all"); this.syncAll.type = "button"; this.syncAll.disabled = true; this.syncAll.title = "Confirmed sync is unavailable pending its executor";
+      this.syncAll.addEventListener("click", () => {
+        if (!this.syncAll.disabled) this.onSync(this.model.rows.filter(row => this.model.selectedRepo === null || row.repo === this.model.selectedRepo).map(row => row.repo));
+      });
       this.controls.append(this.refreshButton, this.syncAll); this.banner = C.element("div", "fleet-audit"); this.banner.setAttribute("role", "status");
       this.spinner = C.glyph("running"); this.progressText = C.element("span"); this.banner.append(this.spinner, this.progressText);
       this.feedback = C.element("p", "sub"); this.feedback.setAttribute("role", "status"); this.empty = C.element("p", "empty");
@@ -196,12 +199,14 @@
     }
     updateControls() {
       const audit = this.model.audit;
+      this.syncAll.disabled = !this.onSync || !this.model.rows.some(row => this.model.selectedRepo === null || row.repo === this.model.selectedRepo);
+      this.syncAll.title = this.onSync ? "Preview the selected consumer scope before confirming" : "Confirmed sync is unavailable";
       this.refreshButton.disabled = Boolean(!this.refresh || this.requesting || audit.running || audit.error && audit.retryAt > this.model.now);
       this.refreshButton.title = !this.refresh ? "Audit refresh is unavailable" : audit.error && audit.retryAt > this.model.now ? "Source failure backoff is active" : "Refresh the shared audit source";
     }
     update(model) {
       this.model = model; if (!this.parent.contains(this.summary)) this.attach();
-      this.summary.textContent = model.label; this.note.textContent = `${model.note ?? "Audit-only source · no observations yet"} · Sync unavailable pending confirmed executor${model.stale && model.hasObservations ? " · last-known rows stale" : ""}`;
+      this.summary.textContent = model.label; this.note.textContent = `${model.note ?? "Audit-only source · no observations yet"}${this.onSync ? " · Sync requires a fresh preview and confirmation" : " · Sync unavailable pending confirmed executor"}${model.stale && model.hasObservations ? " · last-known rows stale" : ""}`;
       this.banner.hidden = !model.audit.running; this.progressText.textContent = `Auditing${model.audit.elapsed === null ? "" : ` · ${model.audit.elapsed}s elapsed`}: last good rows stay until completion. Progress is indeterminate.`;
       this.feedback.hidden = !this.feedback.textContent;
       if (model.audit.error && !model.audit.running && !this.requesting) {this.feedback.textContent = "Audit unavailable · last good rows retained when present"; this.feedback.hidden = false;}
@@ -210,8 +215,12 @@
       const present = new Set(), focus = document.activeElement;
       for (const row of model.rows) {
         present.add(row.repo); let view = this.views.get(row.repo);
-        if (!view) {view = new FleetRow(row); this.views.set(row.repo, view); this.table.append(view.node);}
-        view.update(row, model.now); view.node.hidden = model.selectedRepo !== null && model.selectedRepo !== row.repo;
+        if (!view) {view = new FleetRow(row);
+          view.sync.addEventListener("click", () => {if (!view.sync.disabled) this.onSync([row.repo]);});
+          this.views.set(row.repo, view); this.table.append(view.node);}
+        view.update(row, model.now);
+        view.sync.disabled = !this.onSync; view.sync.title = this.onSync ? "Preview this consumer before confirming" : "Confirmed sync is unavailable";
+        view.node.hidden = model.selectedRepo !== null && model.selectedRepo !== row.repo;
       }
       for (const [id, view] of this.views) if (!present.has(id)) {view.destroy(); this.views.delete(id);}
       this.empty.hidden = model.rows.some(row => model.selectedRepo === null || model.selectedRepo === row.repo);

@@ -89,6 +89,14 @@
 #                        plan may show "would open PR" even when a PR
 #                        already exists, but the live run will catch and
 #                        skip it.
+#   --fresh-branch HEX   Sync-all only: append a 32 lowercase hex nonce to
+#                        the branch. Leaves all old PRs and branches intact.
+#   --expect-hub SHA     Sync-all only: require this full hub commit before
+#                        author verification. Paired with --expect-consumer.
+#   --expect-consumer SHA Sync-all only, exactly one --repos target: require
+#                        its cloned default-branch commit before copying.
+#   --progress-json      Sync-all only: emit tagged operation/result events
+#                        beside normal output. Legacy output stays unchanged.
 #   --repos r1,r2        Restrict to a comma-separated subset of consumer names
 #                        or owner/name repositories. Every selector must match
 #                        a manifest consumer; empty and multiline selectors are
@@ -2436,6 +2444,24 @@ sync_coderabbit_ignore_block() {
 #
 # Returns 0 on success, non-zero on failure (caller increments
 # SYNC_FAILED). Stdout: human-readable progress lines.
+# The Cockpit consumes only fixed, validated fields, never arbitrary log text.
+sync_progress() {
+  [ "${SYNC_PROGRESS_JSON:-0}" = "1" ] || return 0
+  [[ "$2" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 0
+  printf '@@cockpit-sync\t{"kind":"%s","repo":"%s","value":"%s"}\n' "$1" "$2" "$3" || true
+}
+
+sync_confirmed_hub() {
+  [ -n "${SYNC_EXPECT_HUB:-}" ] || return 0
+  if [ "$(git -C "$MERGEPATH_ROOT" rev-parse --verify 'HEAD^{commit}')" != "$SYNC_EXPECT_HUB" ] \
+     || [ "$(git -C "$MERGEPATH_ROOT" symbolic-ref --short HEAD 2>/dev/null)" != main ] \
+     || [ "$(git -C "$MERGEPATH_ROOT" rev-parse --verify 'refs/remotes/origin/main^{commit}' 2>/dev/null)" != "$SYNC_EXPECT_HUB" ] \
+     || [ -n "$(git -C "$MERGEPATH_ROOT" status --porcelain --untracked-files=all)" ]; then
+    err "confirmed hub must remain clean at exactly origin/main"
+    return 1
+  fi
+}
+
 sync_all_open_pr() {
   local consumer_name=$1
   local consumer_repo=$2
@@ -2474,11 +2500,23 @@ sync_all_open_pr() {
   # RETURN, workspace still in scope) still cleans up correctly.
   trap 'rm -rf "${workspace:-}"' RETURN
 
+  sync_progress stage "$consumer_repo" fetch
   printf "  ⤷ %s — cloning %s\n" "$consumer_name" "$consumer_repo"
   if ! gh repo clone "$consumer_repo" "$workspace/repo" -- --depth=10 --quiet >&2; then
     err "$consumer_name: gh repo clone failed for $consumer_repo"
     return 1
   fi
+
+  if [ -n "${SYNC_EXPECT_CONSUMER:-}" ]; then
+    local cloned_sha
+    cloned_sha=$(git -C "$workspace/repo" rev-parse --verify 'HEAD^{commit}') || return 1
+    if [ "$cloned_sha" != "$SYNC_EXPECT_CONSUMER" ]; then
+      err "$consumer_name: consumer moved since preview; refusing before copy"
+      return 1
+    fi
+    sync_confirmed_hub || return 1
+  fi
+  sync_progress stage "$consumer_repo" diff
 
   # Per-repo override filter (#200 integration) — load-bearing for
   # --sync-all. A consumer's .sync-overrides.yml `skip_paths` declares
@@ -2706,11 +2744,13 @@ sync_all_open_pr() {
     :
   else
     printf "  · %s already in sync at HEAD (no diff after copy)\n" "$consumer_name"
+    sync_progress result "$consumer_repo" no-change
     SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
     SYNC_PR_OPENED=$((SYNC_PR_OPENED - 1))  # caller incremented eagerly
     return 0
   fi
 
+  sync_progress stage "$consumer_repo" branch
   if ! git -C "$workspace/repo" checkout -q -b "$branch"; then
     err "$consumer_name: git checkout -b $branch failed"
     return 1
@@ -2747,6 +2787,7 @@ divergences left untouched):
 "
   fi
 
+  sync_progress stage "$consumer_repo" commit
   if ! git -C "$workspace/repo" commit -q -m "$(cat <<EOF
 bulk sync to mergepath@${short_sha} — verbatim canonical/kit mirror + per-consumer templated render per .mergepath-sync.yml
 
@@ -2814,6 +2855,8 @@ EOF
     esac
   fi
 
+  sync_progress stage "$consumer_repo" PR
+  sync_confirmed_hub || return 1
   printf "  ⤷ %s — pushing branch %s\n" "$consumer_name" "$branch"
   if ! git -C "$workspace/repo" push -q -u origin "$branch" 2>&1; then
     err "$consumer_name: git push failed"
@@ -2857,6 +2900,9 @@ EOF
     return 1
   }
   printf "  ✓ %s — opened %s\n" "$consumer_name" "$pr_url"
+  if [[ "$pr_url" =~ ^https://github.com/$consumer_repo/pull/[1-9][0-9]*$ ]]; then
+    sync_progress result "$consumer_repo" "$pr_url"
+  fi
 }
 
 # Per-consumer --sync-all orchestration. Mirrors sync_one_consumer:
@@ -2903,6 +2949,7 @@ sync_all_one_consumer() {
     SYNC_FAILED=$((SYNC_FAILED + 1))
     return 0
   fi
+  [ -z "${SYNC_FRESH_BRANCH:-}" ] || branch="${branch}-${SYNC_FRESH_BRANCH}"
 
   # Idempotency check before any write. Skipped in dry-run (probes the
   # consumer repo via `gh api`; dry-run is meant to be side-effect- and
@@ -2924,6 +2971,7 @@ sync_all_one_consumer() {
           printf "  · %s already in flight (sync-all PR #%s on branch %s; requested scope: %s)\n" \
             "$consumer_name" "$existing_pr_num" "$branch" "$scope_description"
           SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
+          sync_progress result "$consumer_repo" existing
           return 0
         fi
         ;;
@@ -2931,6 +2979,7 @@ sync_all_one_consumer() {
         printf "  · %s already done (sync-all PR #%s closed/merged on branch %s; requested scope: %s)\n" \
           "$consumer_name" "${pr_state#closed:}" "$branch" "$scope_description"
         SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
+        sync_progress result "$consumer_repo" existing
         return 0
         ;;
     esac
@@ -3082,6 +3131,12 @@ run_sync_all() {
   }
   local short_sha=${sha:0:7}
 
+  if [ -n "${SYNC_EXPECT_HUB:-}" ] && [ "$sha" != "$SYNC_EXPECT_HUB" ]; then
+    err "hub moved since preview; refusing before author verification"
+    return 1
+  fi
+  sync_confirmed_hub || return 1
+
   # Author-token guard for LIVE PR-writing mode — identical to
   # run_sync's guard. Without it, a live --sync-all could reach
   # downstream gh writes without proving the author identity that will
@@ -3188,12 +3243,29 @@ SYNC_CODERABBIT_IGNORE=0
 SYNC_SKIP_EXISTING=0
 SYNC_RECREATE_EXISTING=0
 SYNC_VERBOSE=0
+SYNC_FRESH_BRANCH=""
+SYNC_EXPECT_HUB=""
+SYNC_EXPECT_CONSUMER=""
+SYNC_PROGRESS_JSON=0
 FILTER_REPOS=""
 FILTER_PATHS=""
 AUDIT_JSON=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --fresh-branch|--expect-hub|--expect-consumer)
+      [ $# -ge 2 ] || { err "$1 requires a value"; exit 2; }
+      case "$1" in
+        --fresh-branch) SYNC_FRESH_BRANCH=$2 ;;
+        --expect-hub) SYNC_EXPECT_HUB=$2 ;;
+        --expect-consumer) SYNC_EXPECT_CONSUMER=$2 ;;
+      esac
+      shift 2
+      ;;
+    --progress-json)
+      SYNC_PROGRESS_JSON=1
+      shift
+      ;;
     --audit)
       MODE="audit"
       SAW_AUDIT=1
@@ -3352,6 +3424,20 @@ if [ "$SAW_AUDIT" = "1" ] && [ "$SAW_COMMIT_ISH" = "1" ]; then
 fi
 
 # Validate flag combinations before doing any I/O.
+if [ -n "$SYNC_FRESH_BRANCH$SYNC_EXPECT_HUB$SYNC_EXPECT_CONSUMER" ] || [ "$SYNC_PROGRESS_JSON" = 1 ]; then
+  if [ "$MODE" != sync-all ] || [ "$SYNC_NO_PR" = 1 ] || [ "$SYNC_RECREATE_EXISTING" = 1 ]; then
+    err "confirmed sync options require --sync-all and are incompatible with --no-pr/--recreate-existing"
+    exit 2
+  fi
+  if [ -n "$SYNC_FRESH_BRANCH" ] && ! [[ "$SYNC_FRESH_BRANCH" =~ ^[0-9a-f]{32}$ ]]; then
+    err "--fresh-branch requires 32 lowercase hex characters"; exit 2
+  fi
+  if [ -n "$SYNC_EXPECT_HUB$SYNC_EXPECT_CONSUMER" ]; then
+    if ! [[ "$SYNC_EXPECT_HUB" =~ ^[0-9a-f]{40}$ ]] || ! [[ "$SYNC_EXPECT_CONSUMER" =~ ^[0-9a-f]{40}$ ]] || [ -z "$FILTER_REPOS" ] || [[ "$FILTER_REPOS" == *,* ]]; then
+      err "identity fences require paired full SHAs and exactly one --repos target"; exit 2
+    fi
+  fi
+fi
 if [ "$AUDIT_JSON" = "1" ] && [ "$MODE" != "audit" ]; then
   err "--json is an audit-mode-only flag; use --audit --json"
   exit 2
