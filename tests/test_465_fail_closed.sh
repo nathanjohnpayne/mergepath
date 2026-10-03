@@ -262,7 +262,7 @@ extract_step() {  # <workflow> <step name>
     index($0, "- name: " name) && !found {
       found=1; match($0, /^[[:space:]]*/); step_indent=RLENGTH; print; next
     }
-    found && /^[[:space:]]*- name: / {
+    found && /[^[:space:]]/ && !/^[[:space:]]*#/ {
       match($0, /^[[:space:]]*/); if (RLENGTH <= step_indent) exit
     }
     found { print }
