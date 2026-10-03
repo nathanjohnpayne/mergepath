@@ -16,6 +16,7 @@ if not __package__:
 
 from mergepath.cockpit.github import ClientError, GitHubClient
 from mergepath.cockpit.inventory import load_inventory
+from mergepath.cockpit.prs import PRProvider
 from mergepath.cockpit.server import Application, CockpitServer
 
 
@@ -53,6 +54,9 @@ def main(argv=None):
             os.environ.pop(name, None)
         inventory = load_inventory(ROOT)
         app = Application(inventory, github, logger=lambda message: print(message, file=sys.stderr))
+        provider = PRProvider(github, inventory, ROOT, checkout_roots={"nathanjohnpayne/mergepath": ROOT})
+        app.scheduler.register("prs", provider, hot_interval=15, idle_interval=120, timeout=30)
+        app.register_panel("prs", "prs")
         server = CockpitServer(app, args.port)
     except (ClientError, ValueError, OSError):
         print("Cockpit cannot start. Check the cached reviewer credential, installed hub yq and loopback port.",
@@ -60,7 +64,7 @@ def main(argv=None):
         return 1
     port = server.server_address[1]
     print(f"Mergepath Cockpit: http://127.0.0.1:{port}/", flush=True)
-    print("Shared shell ready; panel sources are not connected yet. Ctrl-C stops the local server.", flush=True)
+    print("Shared observations ready. Ctrl-C stops the local server.", flush=True)
     app.scheduler.start()
     thread = threading.Thread(target=server.serve_forever, daemon=True, name="cockpit-http")
     thread.start()
