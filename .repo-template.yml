@@ -10,6 +10,9 @@
 # Used by check_spec_test_alignment when the default filename search
 # wouldn't find the test.
 spec_test_map:
+  phase_4b_heartbeat:
+    - tests/test_phase_4b_heartbeat.sh
+    - tests/test_phase_4b_accounting.sh
   cockpit:
     - tests/test_cockpit.sh
   pr_body_contract:

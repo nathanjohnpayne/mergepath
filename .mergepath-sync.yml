@@ -1501,6 +1501,40 @@ paths:
       - "scripts/lib/preflight-helpers.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "tests/fixtures/phase_4b_verdicts.jsonl"
+  # Advisory heartbeat tests execute the real orchestrator with fake boundaries.
+  - path: tests/test_phase_4b_heartbeat.sh
+    type: canonical
+    consumers: all
+    requires:
+      # Like the automation suite, this real-orchestrator suite needs the
+      # complete package closure directly: partial syncs do not traverse
+      # requirements nested under entrypoints, kits, or another test.
+      - "scripts/phase-4b-review.sh"
+      - "scripts/phase-4b/"
+      - "tests/test_phase_4b_automation.sh"
+      - "scripts/lib/pr-body-contract.sh"
+      - "scripts/lib/pr-body-contract.mjs"
+      - "scripts/lib/reviewers-helpers.sh"
+      - "scripts/lib/codex-request-evidence.sh"
+      - "scripts/workflow/resolve_base_policy.sh"
+      - "scripts/lib/codex-failure-markers.sh"
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/gh-api-scalar.sh"
+      - "scripts/lib/gh-retry-helpers.sh"
+      - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/lib/branch-requirements.sh"
+      - "scripts/lib/coderabbit-fence.sh"
+      - "scripts/gh-as-reviewer.sh"
+      - "scripts/post-phase-4b-handoff.sh"
+      - "scripts/coderabbit-wait.sh"
+      - "scripts/codex-review-check.sh"
+      - "scripts/review-feedback-accounting.sh"
+      - "scripts/lib/ghas-alert-severity.sh"
+      - "scripts/lib/preflight-helpers.sh"
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "tests/fixtures/phase_4b_verdicts.jsonl"
+      - "scripts/codex-review-ledger.sh"
+      - "scripts/lib/codex-review-ledger.sh"
   # Pairs with scripts/phase-4b/accounting.sh (+ accounting.schema.json and
   # prices.json, all carried by the scripts/phase-4b/ kit) and is
   # hard-required by scripts/ci/check_phase_4b_accounting (#602). Offline:
@@ -2199,6 +2233,7 @@ paths:
       - "tests/test_check_coderabbit_config.sh"  # check_coderabbit_config_tests (#481/#482)
       - "tests/test_check_propagation_closure.sh"  # check_propagation_closure (#521)
       - "tests/test_phase_4b_automation.sh"  # check_phase_4b_automation (#579)
+      - "tests/test_phase_4b_heartbeat.sh"  # check_phase_4b_automation (#1589)
       - "tests/test_phase_4b_accounting.sh"  # check_phase_4b_accounting (#602)
       - "tests/test_codex_review_request_ack.sh"  # check_codex_scripts
       - "tests/test_codex_review_request_trigger_only.sh"  # check_codex_scripts (#489)
