@@ -1636,7 +1636,7 @@ p4b_acct_hook_active() { p4b_acct_config_enabled; }
 p4b_acct_hook_record_loop() {
   local vlabel="$1" posted="$2" fell_back="$3" fail_reason="${4:-}"
   local log logdir loopno tokens hist details fc line
-  local elapsed_json started_json timeout_json effort_json plan_auth_json details_json
+  local elapsed_json started_json timeout_json effort_json plan_auth_json details_json run_id_json
   log="$(p4b_acct_hook_loop_log)" || return 1
   logdir="$(dirname "$log")"
   mkdir -p "$logdir" 2>/dev/null || return 1
@@ -1709,7 +1709,15 @@ p4b_acct_hook_record_loop() {
     fc='{"happened":false,"reason":null,"duration_seconds":null}'
   fi
 
+  # Persist genuine invocation identity only. The pid-$$ direct-hook fallback
+  # remains strictly local to pending ownership; old history is never rewritten.
+  run_id_json="null"
+  if [[ "${P4B_ACCT_RUN_ID:-}" =~ ^p4b-[a-zA-Z0-9._-]+$ ]]; then
+    run_id_json="$(jq -nc --arg id "$P4B_ACCT_RUN_ID" '$id')" || return 1
+  fi
+
   line="$(jq -nc \
+    --argjson run_id "$run_id_json" \
     --argjson loopno "$loopno" \
     --arg reviewer "${REVIEWER:-unknown}" \
     --arg adapter "review-via-${ADAPTER:-unknown}.sh" \
@@ -1732,6 +1740,8 @@ p4b_acct_hook_record_loop() {
       schema: "p4b-loop-log/v1",
       started_at_epoch: $started,
       loop: {
+        run_id: $run_id,
+        started_at_epoch: $started,
         loop: $loopno,
         reviewer: $reviewer,
         adapter: $adapter,
