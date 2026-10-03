@@ -69,7 +69,7 @@
     if (!finite(minutes) || minutes < 0 || !finite(horizonMinutes) || horizonMinutes <= 0) return null;
     return 4 + 90 * Math.min(1, Math.log1p(minutes) / Math.log1p(horizonMinutes));
   }
-  function roadModel(hazards, {now, horizonMinutes = null, horizonLabel = "Horizon unavailable", width = 1000, observed = false} = {}) {
+  function roadModel(hazards, {now, horizonMinutes = null, horizonLabel = "Horizon unavailable", width = 1000, observed = false, staleCoverage = false} = {}) {
     const validHorizon = finite(horizonMinutes) && horizonMinutes > 0;
     const items = hazards.map(hazard => {
       const minutes = hazardMinutes(hazard, now);
@@ -87,7 +87,10 @@
       previousTick = x; return [{...tick, position}];
     }) : [];
     return {items, ticks, strip: items.filter(item => selected.has(item.id)), deferred: items.filter(item => item.position === null).length,
-      overflow: items.length - selected.size, observed, horizonLabel: validHorizon ? horizonLabel : "Horizon unavailable", validHorizon};
+      overflow: items.length - selected.size, observed, staleCoverage,
+      emptyState: observed && !items.length ? "clear" : "idle",
+      emptyText: items.length ? "See the full list for timing" : observed ? "Road is clear for fresh observed sources" : staleCoverage ? "Last-known observations are stale" : "No observations yet",
+      horizonLabel: validHorizon ? horizonLabel : "Horizon unavailable", validHorizon};
   }
   function packRoad(markers, width, measure = text => text.length * 6) {
     const bounds = [10, Math.max(10, width - 10)], lanes = [[], [], [], []];
@@ -201,9 +204,8 @@
       this.more.textContent = model.overflow ? `${model.overflow} more in the full list${model.deferred ? ` · ${model.deferred} await timing or horizon` : ""}` : "";
       this.more.hidden = !model.overflow;
       this.empty.hidden = model.strip.length > 0;
-      this.empty.className = `road-empty${model.observed && !model.items.length ? " clear" : ""}`;
-      const emptyText = model.items.length ? "See the full list for timing" : model.observed ? "Road is clear for observed sources" : "No observations yet";
-      this.empty.replaceChildren(glyph(model.observed && !model.items.length ? "clear" : "idle", "lg"), element("span", "", emptyText));
+      this.empty.className = `road-empty${model.emptyState === "clear" ? " clear" : ""}`;
+      this.empty.replaceChildren(glyph(model.emptyState, "lg"), element("span", "", model.emptyText));
       const keepRows = new Set(model.items.map(item => item.id)), keepMarkers = new Set(model.strip.map(item => item.id));
       for (const [id, node] of this.rows) if (!keepRows.has(id)) {node.remove(); this.rows.delete(id);}
       for (const [id, node] of this.markers) if (!keepMarkers.has(id)) {node.remove(); this.markers.delete(id);}

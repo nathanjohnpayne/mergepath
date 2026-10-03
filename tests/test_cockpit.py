@@ -336,6 +336,41 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(json.loads(fixture.calls[0][3])["variables"], expected)
             self.assertEqual(len(fixture.calls), 1)
 
+    def test_query_variables_recursively_refuse_loss_before_transport(self):
+        cycle = []; cycle.append(cycle)
+        mapping_cycle = {}; mapping_cycle["self"] = mapping_cycle
+        deep = None
+        for _ in range(sys.getrecursionlimit() + 1):
+            deep = [deep]
+        invalid = [{1: "first", "1": "second"}, (1, 2), {"nested": (1, 2)},
+                   [{False: 1}], float("nan"), float("inf"), cycle, mapping_cycle, deep, object()]
+        for value in invalid:
+            fixture = HTTPFixture()
+            with self.subTest(kind=type(value).__name__), self.assertRaisesRegex(ClientError, "invalid_query_variables"):
+                self.client(fixture).query("query { viewer { login } }", {"filter": value})
+            self.assertEqual(fixture.calls, [])
+        shared = [None, True, 3, 0.25, "text", {"states": []}]
+        variables = {"filter": {"nested": shared, "also": shared}}
+        fixture = HTTPFixture(reply(data={"data": {"viewer": {"login": "fixture"}}}))
+        self.client(fixture).query("query { viewer { login } }", variables)
+        self.assertEqual(json.loads(fixture.calls[0][3])["variables"], variables)
+        self.assertEqual(len(fixture.calls), 1)
+
+    def test_client_error_only_retains_registered_stable_categories(self):
+        private = "upstream body /private/fixture unrelated-credential-do-not-publish"
+        class UntrustedText(str):
+            def __str__(self):
+                raise AssertionError("untrusted category must never be coerced")
+        for category in [private, "provider_unregistered", "x" * 10000, "", None, {}, object(), UntrustedText("permission_denied")]:
+            with self.subTest(kind=type(category).__name__):
+                error = ClientError(category, 120)
+                self.assertEqual(error.category, "source_failed")
+                self.assertEqual(str(error), "source_failed")
+                self.assertEqual(error.args, ("source_failed",))
+                self.assertEqual(error.retry_after, 120)
+        for category in ["permission_denied", "secondary_limit"]:
+            self.assertEqual(ClientError(category).category, category)
+
     def test_deadline_and_fixed_origin_no_ambient_fallback(self):
         fixture = HTTPFixture()
         client = self.client(fixture)
@@ -631,6 +666,27 @@ class SchedulerTests(unittest.TestCase):
             self.scheduler.tick(); self.settle(name)
             self.assertEqual(self.scheduler.snapshot()[name]["error"], "source_failed")
         self.assertNotIn(TOKEN, json.dumps(self.scheduler.snapshot()))
+
+    def test_mutated_client_error_category_is_sanitized_at_scheduler_boundary(self):
+        error = ClientError("permission_denied", 120)
+        error.category = "private upstream body /private/fixture unrelated-credential-do-not-publish"
+        results = [Sample({"last_good": 1}), error]
+        def fetch(deadline):
+            value = results.pop(0)
+            if isinstance(value, Exception): raise value
+            return value
+        self.scheduler.register("category", fetch)
+        self.scheduler.tick(); self.settle("category")
+        first = self.scheduler.snapshot()["category"]
+        self.clock.now += 1
+        self.scheduler.refresh("category"); self.scheduler.tick(); self.settle("category")
+        current = self.scheduler.snapshot()["category"]
+        self.assertEqual(current["error"], "source_failed")
+        self.assertEqual(current["data"], first["data"])
+        self.assertEqual(current["observed_at"], first["observed_at"])
+        self.assertTrue(current["stale"])
+        self.assertEqual(current["retry_at"], self.clock.now + 120)
+        self.assertNotIn(error.category, json.dumps(current))
 
 
 class ServerTests(unittest.TestCase):
@@ -941,11 +997,31 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(current["data"], first["data"])
         self.assertEqual(current["observed_at"], first["observed_at"])
         self.assertTrue(current["stale"])
-        self.assertEqual(current["error"], "fixture_failed")
+        self.assertEqual(current["error"], "source_failed")
         for secret in secrets:
             self.assertNotIn(secret.encode(), body)
         self.assertEqual(current, self.app.snapshot()["sources"]["fixture_prs"])
         self.assertEqual(len(calls), 2)
+
+    def test_arbitrary_client_error_text_never_enters_http_source_envelopes(self):
+        self.bootstrap()
+        private = "upstream /private/fixture unrelated-credential-do-not-publish"
+        def fetch(deadline):
+            raise ClientError(private, 120)
+        self.app.scheduler.register("fixture_error", fetch)
+        self.app.register_panel("prs", "fixture_error")
+        self.app.scheduler.tick()
+        wait_until(lambda: not self.app.scheduler.snapshot()["fixture_error"]["in_flight"])
+        for route in ["/api/snapshot", "/api/panels/prs"]:
+            status, _, body = self.request(path=route)
+            self.assertEqual(status, 200)
+            self.assertNotIn(private.encode(), body)
+            payload = json.loads(body)
+            envelope = payload["sources"]["fixture_error"] if route == "/api/snapshot" else payload["envelope"]
+            self.assertEqual(envelope["error"], "source_failed")
+            self.assertIsNone(envelope["data"])
+            self.assertTrue(envelope["stale"])
+        self.assertNotIn(private, "".join(self.logs))
 
     def test_sse_snapshot_heartbeat_reconnect_and_update(self):
         self.bootstrap()

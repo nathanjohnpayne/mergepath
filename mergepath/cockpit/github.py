@@ -4,6 +4,7 @@ import copy
 import contextlib
 import http.client
 import json
+import math
 import re
 import socket
 import threading
@@ -16,12 +17,50 @@ from email.utils import parsedate_to_datetime
 
 ORIGIN = "https://api.github.com"
 MAX_BODY = 2 * 1024 * 1024
+ERROR_CATEGORIES = frozenset({
+    "cached_reviewer_credential_required", "deadline_exceeded", "incomplete_graphql",
+    "incomplete_graphql_connection", "invalid_endpoint", "invalid_next_link", "invalid_page",
+    "invalid_query", "invalid_query_variables", "invalid_upstream_json", "page_limit",
+    "pagination_cycle", "permission_denied", "primary_exhausted", "primary_reserve", "query_only",
+    "response_too_large", "secondary_limit", "source_failed", "uncached_not_modified",
+    "upstream_backoff", "upstream_http_error", "upstream_unavailable",
+})
+
+
+def error_category(value):
+    """Normalize to the closed, code-owned vocabulary without string coercion."""
+    return value if type(value) is str and value in ERROR_CATEGORIES else "source_failed"
+
+
+def copy_json_tree(value, active=None):
+    """Copy native JSON trees without coercing types or mapping keys."""
+    kind = type(value)
+    if value is None or kind in (str, bool, int):
+        return value
+    if kind is float and math.isfinite(value):
+        return value
+    if kind not in (dict, list):
+        raise ValueError("invalid_json_tree")
+    active = set() if active is None else active
+    identity = id(value)
+    if identity in active:
+        raise ValueError("invalid_json_tree")
+    active.add(identity)
+    try:
+        if kind is list:
+            return [copy_json_tree(item, active) for item in value]
+        if any(type(key) is not str for key in value):
+            raise ValueError("invalid_json_tree")
+        return {key: copy_json_tree(item, active) for key, item in value.items()}
+    finally:
+        active.remove(identity)
 
 
 class ClientError(Exception):
     """Stable errors only: never expose an upstream body, path or credential."""
 
     def __init__(self, category, retry_after=0, response=None):
+        category = error_category(category)
         super().__init__(category)
         self.category = category
         self.retry_after = max(0, retry_after)
@@ -421,8 +460,12 @@ class GitHubClient:
     def query(self, document, variables=None, *, deadline=None):
         _query_only(document)
         variables = {} if variables is None else variables
-        if type(variables) is not dict or any(type(key) is not str for key in variables):
+        if type(variables) is not dict:
             raise ClientError("invalid_query_variables")
+        try:
+            variables = copy_json_tree(variables)
+        except (ValueError, RecursionError):
+            raise ClientError("invalid_query_variables") from None
         try:
             payload, _ = self._request("/graphql", "graphql", document={
                 "query": document, "variables": variables}, deadline=deadline)

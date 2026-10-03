@@ -105,6 +105,30 @@ test("one provider-owned projection seam retains stale boulder and missing obser
   assert.equal(registry.counts(value, 1000).get(null), 2);
   assert.equal(envelope.data.hazards[0].stale, false);
 });
+test("stale-only clear coverage stays idle; fresh restoration and stale boulders remain truthful", () => {
+  const registry = new PanelRegistry();
+  const project = envelope => ({state: envelope.data.hazards.length ? "boulder" : "clear", label: "Fixture", hazards: envelope.data.hazards, count: 0});
+  registry.register("prs", "fixture_prs", project);
+  registry.register("ci", "fixture_ci", project);
+  const envelope = (stale, hazards = []) => ({data: {hazards}, observed_at: 950, stale});
+  const value = (prs, ci) => snapshot({sources: {fixture_prs: prs, fixture_ci: ci}});
+  const unavailable = registry.project(snapshot(), null, 1000);
+  assert.equal(unavailable.observedPanels, 0); assert.equal(unavailable.freshPanels, 0); assert.equal(unavailable.stalePanels, 0);
+  const stale = registry.project(value(envelope(true)), null, 1000);
+  assert.equal(stale.models.prs.observed, true); assert.equal(stale.models.prs.state, "clear");
+  assert.equal(stale.observedPanels, 1); assert.equal(stale.freshPanels, 0); assert.equal(stale.stalePanels, 1);
+  const road = C.roadModel(stale.hazards, {now: 1000, observed: stale.freshPanels > 0, staleCoverage: stale.stalePanels > 0});
+  assert.equal(road.emptyState, "idle"); assert.match(road.emptyText, /stale/i);
+  const mixed = registry.project(value(envelope(true), envelope(false)), null, 1000);
+  assert.equal(mixed.freshPanels, 1); assert.equal(mixed.stalePanels, 1); assert.equal(mixed.observedPanels, 2);
+  assert.equal(C.roadModel(mixed.hazards, {now: 1000, observed: true, staleCoverage: true}).emptyState, "clear");
+  const blocked = registry.project(value(envelope(true, [hazard("retained", {state: "boulder"})])), null, 1000);
+  assert.equal(blocked.hazards[0].state, "boulder"); assert.equal(blocked.hazards[0].stale, true);
+  assert.equal(C.roadModel(blocked.hazards, {now: 1000, observed: false, staleCoverage: true}).emptyState, "idle");
+  const restored = registry.project(value(envelope(false)), null, 1000);
+  assert.equal(restored.freshPanels, 1); assert.equal(restored.stalePanels, 0);
+  assert.equal(C.roadModel(restored.hazards, {now: 1000, observed: true}).emptyState, "clear");
+});
 test("registry diagnostics refuse wrong-source and malformed output without domain guessing", () => {
   const registry = new PanelRegistry(); registry.register("ci", "fixture", () => ({state: "clear", label: "Clear", hazards: [hazard()], count: 8}));
   const value = snapshot({sources: {fixture: {data: {}, observed_at: 900, stale: false}}});

@@ -52,8 +52,10 @@
       }
       // Duplicate identity across adapters is also refused.
       const normalized = C.normalizeHazards(hazards, repositories);
+      const observedModels = Object.values(models).filter(model => model.observed);
       return {models, hazards: normalized.hazards, diagnostics: [...diagnostics, ...normalized.diagnostics],
-        observed: Object.values(models).some(model => model.observed), observedPanels: Object.values(models).filter(model => model.observed).length};
+        observed: observedModels.length > 0, observedPanels: observedModels.length,
+        freshPanels: observedModels.filter(model => !model.stale).length, stalePanels: observedModels.filter(model => model.stale).length};
     }
     counts(snapshot, now) {
       const adapter = this.adapters.get("prs"), envelope = adapter ? snapshot.sources[adapter.source] : null;
@@ -239,10 +241,12 @@
         detail: connection.kind === "session" ? "Relaunch scripts/cockpit.sh to establish a new session." : "Last-known observations remain visible. Every section may be stale until the stream returns.", timing: {kind: "now"}, observed_at: null, stale: true});
       const valid = C.normalizeHazards(hazards, current.repositories.map(item => item.repo)); hazards = valid.hazards;
       const horizon = projection.models.budget.horizon;
-      const model = road.update(hazards, {now, horizonMinutes: horizon ? (horizon.cycleEnd - now) / 60 : null, horizonLabel: horizon?.label, observed: projection.observed});
+      const freshPanels = stale ? 0 : projection.freshPanels, stalePanels = stale ? projection.observedPanels : projection.stalePanels;
+      const model = road.update(hazards, {now, horizonMinutes: horizon ? (horizon.cycleEnd - now) / 60 : null, horizonLabel: horizon?.label,
+        observed: freshPanels > 0, staleCoverage: stalePanels > 0});
       const boulders = hazards.filter(hazard => hazard.state === "boulder").length, bumps = hazards.length - boulders;
-      $("road-summary").textContent = hazards.length ? `${boulders} boulders · ${bumps} speed bumps` : model.observed ? "Clear for observed sources" : "No observations yet";
-      $("coverage").textContent = `${projection.observedPanels} of 6 panel sources observed${stale && snapshot ? " · stream stale" : ""}. ${model.horizonLabel}. Account and connection evidence is shared.`;
+      $("road-summary").textContent = hazards.length ? `${boulders} boulders · ${bumps} speed bumps` : model.observed ? "Clear for fresh observed sources" : model.staleCoverage ? "Observations stale" : "No observations yet";
+      $("coverage").textContent = `${freshPanels} of 6 panel sources fresh · ${stalePanels} stale${stale && snapshot ? " · stream stale" : ""}. ${model.horizonLabel}. Account and connection evidence is shared.`;
       let diagnostic = $("adapter-diagnostics");
       if (!diagnostic) {diagnostic = C.element("p", "adapter-diagnostic"); diagnostic.id = "adapter-diagnostics"; $("road-view").append(diagnostic);}
       diagnostic.textContent = [...projection.diagnostics, ...valid.diagnostics].join(" "); diagnostic.hidden = !diagnostic.textContent;
