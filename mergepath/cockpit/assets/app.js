@@ -31,7 +31,8 @@
         if (!envelope || C.epoch(envelope.observed_at) === null || envelope.data === null || envelope.data === undefined) continue;
         try {
           const projected = adapter.project(envelope, selectedRepo, now);
-          if (!projected || !C.STATES.includes(projected.state) || typeof projected.label !== "string") throw new Error("invalid_projection");
+          if (!projected || !C.STATES.includes(projected.state) || typeof projected.label !== "string"
+              || (projected.hasObservations !== undefined && typeof projected.hasObservations !== "boolean")) throw new Error("invalid_projection");
           const normalized = C.normalizeHazards(projected.hazards, repositories);
           diagnostics.push(...normalized.diagnostics.map(text => `${id}: ${text}`));
           const ownedSource = normalized.hazards.filter(hazard => hazard.source === id);
@@ -42,7 +43,8 @@
           if (missingHazard) diagnostics.push(`${id}: A blocking projection has no usable owned hazard.`);
           const visible = C.filterHazards(owned, selectedRepo).map(hazard => ({...hazard, stale: hazard.stale || envelope.stale === true}));
           models[id] = {...projected, hazards: visible, count: C.count(projected.count), observed: true,
-            stale: envelope.stale === true, observed_at: envelope.observed_at,
+            hasObservations: projected.hasObservations !== false,
+            stale: envelope.stale === true || projected.stale === true, observed_at: envelope.observed_at,
             coverageValid: normalized.diagnostics.length === 0 && owned.length === normalized.hazards.length && !missingHazard};
           if (id === "budget") {
             models[id].horizon = null;
@@ -65,10 +67,11 @@
         } else identities.set(hazard.id, hazard.source);
       }
       const observedModels = Object.values(models).filter(model => model.observed);
+      const coverageModels = observedModels.filter(model => model.hasObservations);
       return {models, hazards: normalized.hazards, diagnostics: [...diagnostics, ...normalized.diagnostics],
-        observed: observedModels.length > 0, observedPanels: observedModels.length,
-        freshPanels: observedModels.filter(model => !model.stale && model.coverageValid).length,
-        stalePanels: observedModels.filter(model => model.stale).length,
+        observed: coverageModels.length > 0, observedPanels: coverageModels.length,
+        freshPanels: coverageModels.filter(model => !model.stale && model.coverageValid).length,
+        stalePanels: coverageModels.filter(model => model.stale).length,
         invalidPanels: observedModels.filter(model => !model.coverageValid).length};
     }
     counts(snapshot, now) {
