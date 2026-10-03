@@ -41,11 +41,11 @@ def receipts(head=HEAD, used=0, **overrides):
     return {key: {'head': head, 'data': value, 'observed_at': 1000, 'stale': False, 'error': None} for key, value in values.items()}
 
 
-def required_check(identity, started, *, conclusion='SUCCESS', app='actions-app', slug='github-actions', workflow='lint-workflow'):
+def required_check(identity, started, *, conclusion='SUCCESS', app='actions-app', slug='github-actions', workflow='lint-workflow', run='lint-run'):
     return {'__typename':'CheckRun','id':identity,'name':'Required lint','isRequired':True,
             'status':'COMPLETED','conclusion':conclusion,'detailsUrl':'https://github.com/owner/hub/checks/'+identity,
             'startedAt':started,'checkSuite':{'app':{'id':app,'slug':slug},
-                'workflowRun':{'workflow':{'id':workflow}} if workflow is not None else None}}
+                'workflowRun':{'id':run,'workflow':{'id':workflow}} if workflow is not None else None}}
 
 
 class Client:
@@ -159,6 +159,25 @@ class PRTests(unittest.TestCase):
         item=raw();item['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts']['nodes']=[first,last]
         self.assertEqual([c['id'] for c in build_row(REPO,item)['checks']],['vendor-new'])
 
+    def test_independent_actions_runs_keep_required_failure_even_same_event(self):
+        # Saved #1698 run lineage; GraphQL IDs below are explicitly synthetic.
+        for event in ('pull_request_review', 'pull_request'):
+            old = required_check('old', '2026-10-03T01:00:00Z', conclusion='FAILURE', run='WR37148273080')
+            new = required_check('new', '2026-10-03T02:00:00Z', run='WR37149201865')
+            old['event'] = 'pull_request'; new['event'] = event
+            item = raw(); item['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts']['nodes'] = [old, new]
+            checks = build_row(REPO, item)['checks']
+            self.assertEqual([check['id'] for check in checks], ['old', 'new'])
+            self.assertEqual(sum(check['state'] == 'clear' for check in checks), 1)
+            self.assertEqual(sum(check['state'] == 'boulder' for check in checks), 1)
+
+    def test_missing_or_ambiguous_actions_run_identity_cannot_hide_required_failure(self):
+        old = required_check('old', '2026-10-03T01:00:00Z', conclusion='FAILURE')
+        for run in (None, '', 123, [], {}):
+            new = required_check('new', '2026-10-03T02:00:00Z', run=run)
+            item = raw(); item['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts']['nodes'] = [old, new]
+            self.assertEqual([c['id'] for c in build_row(REPO, item)['checks']], ['old', 'new'])
+
     def test_required_checks_never_supersede_legacy_surface_or_optional_evidence(self):
         old=required_check('old','2026-10-03T01:00:00Z',conclusion='FAILURE')
         optional={**required_check('new','2026-10-03T02:00:00Z'),'isRequired':False}
@@ -179,8 +198,21 @@ class PRTests(unittest.TestCase):
         self.assertEqual(len(documents),3)
         for query in documents:
             self.assertIn('startedAt',query);self.assertIn('app { id slug }',query)
-            self.assertIn('workflowRun { workflow { id } }',query)
+            self.assertIn('workflowRun { id workflow { id } }',query)
         for query in documents[1:]:self.assertIn('isRequired(pullRequestNumber:',query)
+
+    def test_independent_run_identity_survives_required_context_pagination(self):
+        client = Client()
+        old = required_check('old', '2026-10-03T01:00:00Z', conclusion='FAILURE', run='old-run')
+        new = required_check('new', '2026-10-03T02:00:00Z', run='new-run')
+        client.rows[0]['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts'] = connection([old], 'next')
+        client.check_page = [new]
+        row = PRProvider(client, [Repository('hub', REPO)], ROOT, helper=Helpers())(time.monotonic() + 5).data['repositories'][0]['rows'][0]
+        self.assertEqual([c['id'] for c in row['checks']], ['old', 'new'])
+        self.assertEqual([c['state'] for c in row['checks']], ['boulder', 'clear'])
+        self.assertTrue(row['checks_known'])
+        for query, _, _ in client.calls:
+            self.assertIn('workflowRun { id workflow { id } }', query)
 
     def test_same_head_cadence_and_activity_refresh_head_invalidation(self):
         client,helper=Client(),Helpers(); clock=[0]
