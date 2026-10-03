@@ -287,10 +287,11 @@ def extract_fail_lines(body, step):
         timestamp = TIMESTAMP.match(clean)
         if scoped:
             when = stamp(timestamp.group(1)) if timestamp else None
-            # REST step boundaries can have only second precision while logs
-            # have fractions. Untimed failures and the completion second's
-            # remainder cannot be assigned safely to this or an adjacent step.
-            if 'FAIL:' in clean and (when is None or (when > end and math.floor(when) == math.floor(end))):
+            # An integral REST start loses subsecond precision; a failure in
+            # that second can precede the actual selected step. Untimed failures
+            # and the completion second's remainder are also ambiguous.
+            ambiguous_start = when is not None and start == math.floor(start) and math.floor(when) == start
+            if 'FAIL:' in clean and (when is None or ambiguous_start or (when > end and math.floor(when) == math.floor(end))):
                 return extract_fail_lines(body, {})
             if when is None or not start <= when <= end:
                 continue
