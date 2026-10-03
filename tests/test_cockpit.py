@@ -2,6 +2,7 @@
 
 import contextlib
 import http.client
+import http.cookiejar
 import hashlib
 import importlib
 import io
@@ -14,6 +15,8 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -294,6 +297,45 @@ class ClientTests(unittest.TestCase):
             with self.assertRaises(ClientError):
                 client.next_cursor(connection)
 
+    def test_query_input_object_defaults_are_one_read_and_trailing_operations_fail(self):
+        documents = [
+            'query Q($filter: Filter = {states: OPEN}) { repository(owner:"a", name:"b") { id } }',
+            'query Q($filter: Filter = {nested: [{states: [OPEN], note: "mutation { x }"}]}) { viewer { login } }',
+            'query Q($mutation: Filter = {subscription: OPEN}) { viewer { login } }',
+        ]
+        for document in documents:
+            fixture = HTTPFixture(reply(data={"data": {"fixture": 1}}))
+            client = self.client(fixture)
+            self.assertEqual(client.query(document), {"fixture": 1})
+            self.assertEqual(len(fixture.calls), 1)
+            self.assertEqual(json.loads(fixture.calls[0][3])["query"], document)
+            for suffix in [" mutation { deleteIssue(input:{id:\"x\"}) { clientMutationId } }",
+                           " subscription { viewer { login } }", " query Other { viewer { login } }",
+                           " fragment F on User { login }"]:
+                with self.assertRaises(ClientError):
+                    client.query(document + suffix)
+            self.assertEqual(len(fixture.calls), 1)
+        for document in ['query Q($x: Input = {nested: [OPEN}) { viewer { login } }',
+                         'query Q($x: Input = {states: OPEN}) { viewer { login }',
+                         'query Q($x: String = "unterminated) { viewer { login } }']:
+            fixture = HTTPFixture()
+            with self.assertRaises(ClientError):
+                self.client(fixture).query(document)
+            self.assertEqual(fixture.calls, [])
+
+    def test_query_variables_default_only_none_and_reject_invalid_objects(self):
+        document = 'query Q($name: String = "default") { viewer { login } }'
+        for variables in [[], False, "", 0, (), [1], "nonempty", {1: "collision", "1": "other"}, {None: 1}]:
+            fixture = HTTPFixture()
+            with self.subTest(variables=variables), self.assertRaisesRegex(ClientError, "invalid_query_variables"):
+                self.client(fixture).query(document, variables)
+            self.assertEqual(fixture.calls, [])
+        for variables, expected in [(None, {}), ({}, {}), ({"name": "fixture"}, {"name": "fixture"})]:
+            fixture = HTTPFixture(reply(data={"data": {"viewer": {"login": "fixture"}}}))
+            self.client(fixture).query(document, variables)
+            self.assertEqual(json.loads(fixture.calls[0][3])["variables"], expected)
+            self.assertEqual(len(fixture.calls), 1)
+
     def test_deadline_and_fixed_origin_no_ambient_fallback(self):
         fixture = HTTPFixture()
         client = self.client(fixture)
@@ -496,6 +538,36 @@ class SchedulerTests(unittest.TestCase):
     def settle(self, name):
         wait_until(lambda: not self.scheduler.snapshot()[name]["in_flight"])
 
+    def test_strict_json_tree_rejects_loss_without_replacing_last_good(self):
+        cycle = []; cycle.append(cycle)
+        invalid = [(1, 2), {"nested": (1, 2)}, {1: "first", "1": "second"}, {"nested": {False: 1}},
+                   float("nan"), float("inf"), cycle, {"object": object()}]
+        for index, value in enumerate(invalid):
+            name = f"source_{index}"
+            results = [Sample({"last_good": [1]}), Sample(value)]
+            self.scheduler.register(name, lambda deadline, results=results: results.pop(0))
+            self.scheduler.tick(); self.settle(name)
+            first = self.scheduler.snapshot()[name]
+            self.clock.now += 1
+            self.scheduler.refresh(name); self.scheduler.tick(); self.settle(name)
+            current = self.scheduler.snapshot()[name]
+            self.assertEqual(current["data"], first["data"])
+            self.assertEqual(current["observed_at"], first["observed_at"])
+            self.assertTrue(current["stale"])
+            self.assertEqual(current["error"], "source_failed")
+
+    def test_native_json_tree_is_copied_without_coercion_or_aliasing(self):
+        shared = [None, True, 3, 0.25, "text", {"nested": []}]
+        data = {"first": shared, "second": shared}
+        self.scheduler.register("native", lambda deadline: Sample(data))
+        self.scheduler.tick(); self.settle("native")
+        current = self.scheduler.snapshot()["native"]
+        self.assertEqual(current["data"], data)
+        self.assertFalse(current["stale"])
+        self.assertIsNone(current["error"])
+        shared.append("provider mutation")
+        self.assertNotIn("provider mutation", self.scheduler.snapshot()["native"]["data"]["first"])
+
     def test_hot_idle_and_stale_last_good(self):
         results = [Sample({"value": 1}, True), ClientError("permission_denied"), Sample({"value": 2})]
         def fetch(deadline):
@@ -588,9 +660,11 @@ class ServerTests(unittest.TestCase):
             connection.close()
         self.app.close(); self.server.shutdown(); self.server.server_close(); self.thread.join(1)
 
-    def request(self, method="GET", path="/api/snapshot", *, headers=None, authenticated=True, stream=False):
+    def request(self, method="GET", path="/api/snapshot", *, headers=None, authenticated=True, stream=False, scoped=True):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=1)
         self.connections.append(connection)
+        if scoped and path not in {"/bootstrap", "/bootstrap.js", "/api/bootstrap"}:
+            path = self.app.scope_path + path.lstrip("/")
         connection.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
         pairs = [("Host", self.host)] if headers is None else list(headers)
         if authenticated and self.cookie:
@@ -612,6 +686,7 @@ class ServerTests(unittest.TestCase):
         self.cookie = headers["Set-Cookie"].split(";")[0]
         self.assertIn("HttpOnly", headers["Set-Cookie"])
         self.assertIn("SameSite=Strict", headers["Set-Cookie"])
+        self.assertIn("Path=" + self.app.scope_path, headers["Set-Cookie"])
         self.assertNotEqual(self.cookie.split("=", 1)[1], self.app._nonce)
 
     def test_loopback_exact_host_duplicate_and_foreign_origin_refusals(self):
@@ -623,6 +698,61 @@ class ServerTests(unittest.TestCase):
             with self.subTest(headers=headers):
                 self.assertEqual(self.request(headers=headers)[0], 403)
         self.assertEqual(self.request(headers=[("Host", f"localhost:{self.port}")])[0], 200)
+
+    def test_namespace_is_required_with_cookie_and_never_disclosed_unscoped(self):
+        self.bootstrap()
+        self.assertEqual(len(self.app._scope), 43)
+        for route in ["/", "/api/session", "/api/snapshot", "/api/panels/prs", "/events", "/assets/fixture.js"]:
+            status, headers, body = self.request(path=route, scoped=False)
+            self.assertEqual(status, 404)
+            self.assertNotIn("Location", headers)
+            for secret in [self.app._scope, self.app._session, self.app._nonce, TOKEN]:
+                self.assertNotIn(secret.encode(), body)
+            self.assertEqual(self.request(path=route, authenticated=False)[0], 401)
+        for prefix in ["/s/" + "x" * 43 + "/", self.app.scope_path.rstrip("/") + "extra/"]:
+            self.assertEqual(self.request(path=prefix + "api/snapshot", scoped=False)[0], 404)
+        self.assertEqual(self.request()[0], 200)
+
+    def test_two_instances_and_sibling_port_cannot_overwrite_or_replay_cookie_alone(self):
+        second = Application(self.app.inventory, self.github, static_root=self.root, logger=self.logs.append)
+        server = CockpitServer(second)
+        thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
+        thread.start()
+        def close_second():
+            second.close(); server.shutdown(); server.server_close(); thread.join(1)
+        self.addCleanup(close_second)
+        jar = http.cookiejar.CookieJar()
+        jar.set_cookie(http.cookiejar.Cookie(0, COOKIE, "legacy-fixture", None, False, "127.0.0.1",
+            False, False, "/", True, False, None, True, None, None, {}, False))
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(jar))
+        origins = ["http://" + self.host, f"http://127.0.0.1:{server.server_address[1]}"]
+        for app, origin in zip((self.app, second), origins):
+            request = urllib.request.Request(origin + "/api/bootstrap", method="POST", headers={
+                "Origin": origin, "X-Cockpit-Bootstrap": app._nonce, "X-Cockpit-CSRF": app._nonce})
+            with opener.open(request, timeout=1) as response:
+                self.assertEqual(response.status, 204)
+        self.assertNotEqual(self.app._scope, second._scope)
+        self.assertEqual({cookie.path for cookie in jar}, {self.app.scope_path, second.scope_path})
+        for app, origin in zip((self.app, second), origins):
+            with opener.open(origin + app.scope_path + "api/snapshot", timeout=1) as response:
+                self.assertEqual(json.loads(response.read())["schema"], "cockpit/v1")
+        ordinary = urllib.request.Request(origins[1] + "/unrelated")
+        jar.add_cookie_header(ordinary)
+        self.assertFalse(ordinary.has_header("Cookie"))
+        # Even when explicitly replayed, the cookie alone never reveals scope.
+        self.cookie = f"{COOKIE}={self.app._session}"
+        self.assertEqual(self.request(scoped=False)[0], 404)
+        wrong_scope = urllib.request.Request(origins[1] + self.app.scope_path + "api/snapshot")
+        jar.add_cookie_header(wrong_scope)
+        self.assertTrue(wrong_scope.has_header("Cookie"))
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            opener.open(wrong_scope, timeout=1)
+        self.assertEqual(error.exception.code, 404)
+        error.exception.close()
+        self.cookie = f"{COOKIE}={second._session}"
+        self.assertEqual(self.request()[0], 401)
+        self.cookie = f"{COOKIE}={self.app._session}"
+        self.assertEqual(self.request()[0], 200)
 
     def test_session_required_on_all_ordinary_routes(self):
         for route in ["/", "/api/session", "/api/snapshot", "/api/panels/prs", "/events",
@@ -709,7 +839,8 @@ class ServerTests(unittest.TestCase):
         self.assertNotIn("https:", css)
         self.assertNotIn("http:", css)
         for asset in manifest["assets"]:
-            self.assertIn("/assets/fonts/" + asset["file"], css)
+            self.assertIn(asset["file"], css)
+        self.assertNotIn("/assets/", css)
 
     def test_safe_static_refuses_sources_traversal_and_symlink_escape(self):
         self.bootstrap()
@@ -724,14 +855,14 @@ class ServerTests(unittest.TestCase):
 
     def test_snapshot_filter_and_credentials_redaction(self):
         self.bootstrap()
-        self.app.scheduler.register("fixture", lambda deadline: Sample({"message": TOKEN + self.app._session + self.app._nonce}))
+        self.app.scheduler.register("fixture", lambda deadline: Sample({"message": TOKEN + self.app._session + self.app._nonce + self.app._scope}))
         self.app.scheduler.tick()
         wait_until(lambda: not self.app.scheduler.snapshot()["fixture"]["in_flight"])
         status, _, body = self.request(path="/api/snapshot?repo=a%2Fb")
         self.assertEqual(status, 200)
         payload = json.loads(body)
         self.assertEqual([item["repo"] for item in payload["repositories"]], ["a/b"])
-        self.assertEqual(payload["sources"]["fixture"]["data"]["message"], "[redacted]" * 3)
+        self.assertEqual(payload["sources"]["fixture"]["data"]["message"], "[redacted]" * 4)
         for route in ["/api/snapshot?repo=evil/repo", "/api/snapshot?repo=a/b&repo=a/b", "/api/snapshot?token=x"]:
             self.assertEqual(self.request(path=route)[0], 400)
 
@@ -789,7 +920,7 @@ class ServerTests(unittest.TestCase):
     def test_panel_last_good_stale_envelope_reuses_snapshot_redaction(self):
         self.bootstrap()
         calls = []
-        secrets = [TOKEN, self.app._nonce, self.app._session, self.app._csrf]
+        secrets = [TOKEN, self.app._nonce, self.app._session, self.app._csrf, self.app._scope]
         def fetch(deadline):
             calls.append(deadline)
             if len(calls) == 2:
@@ -800,7 +931,7 @@ class ServerTests(unittest.TestCase):
         self.app.scheduler.tick()
         wait_until(lambda: not self.app.scheduler.snapshot()["fixture_prs"]["in_flight"])
         first = json.loads(self.request(path="/api/panels/prs")[2])["envelope"]
-        self.assertEqual(first["data"], {"nested": {"message": "[redacted]" * 4}})
+        self.assertEqual(first["data"], {"nested": {"message": "[redacted]" * 5}})
         self.app.scheduler.refresh("fixture_prs")
         self.app.scheduler.tick()
         wait_until(lambda: not self.app.scheduler.snapshot()["fixture_prs"]["in_flight"])
@@ -847,7 +978,7 @@ class ServerTests(unittest.TestCase):
         self.request(path="/" + self.app._session + "?credential=" + TOKEN)
         self.request(headers=[("Host", self.app._nonce)])
         log = "\n".join(self.logs)
-        for secret in [TOKEN, self.app._nonce, self.app._session, self.app._csrf]:
+        for secret in [TOKEN, self.app._nonce, self.app._session, self.app._csrf, self.app._scope]:
             self.assertNotIn(secret, log)
         self.assertTrue(all(line.startswith("request status=") for line in self.logs))
 
@@ -908,7 +1039,7 @@ class InventoryAndLauncherTests(unittest.TestCase):
              patch.object(main, "open_browser", return_value=False) as opener, \
              patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             self.assertEqual(main.main([]), 1)
-        nonce = opener.call_args.args[0].split("#launch=", 1)[1]
+        nonce = urllib.parse.parse_qs(urllib.parse.urlsplit(opener.call_args.args[0]).fragment)["launch"][0]
         self.assertNotIn(nonce, output.getvalue())
         self.assertNotIn(TOKEN, output.getvalue())
         self.assertIn("Browser opening failed", output.getvalue())
@@ -943,7 +1074,10 @@ class InventoryAndLauncherTests(unittest.TestCase):
         real_join = threading.Thread.join
         def opener(command, **kwargs):
             url = command[1]
-            authority, nonce = url.split("/bootstrap#launch=", 1)
+            parts = urllib.parse.urlsplit(url)
+            fragment = urllib.parse.parse_qs(parts.fragment)
+            authority = "http://" + parts.netloc
+            nonce, scope = fragment["launch"][0], fragment["scope"][0]
             seen["nonce"] = nonce
             def wait(timeout):
                 port = int(authority.rsplit(":", 1)[1])
@@ -952,9 +1086,10 @@ class InventoryAndLauncherTests(unittest.TestCase):
                     "X-Cockpit-Bootstrap": nonce, "X-Cockpit-CSRF": nonce})
                 response = connection.getresponse()
                 self.assertEqual(response.status, 204)
-                cookie = response.getheader("Set-Cookie").split(";", 1)[0]
+                cookies = [value for name, value in response.getheaders() if name.lower() == "set-cookie"]
+                cookie = cookies[-1].split(";", 1)[0]
                 response.read()
-                connection.request("GET", "/api/snapshot", headers={"Cookie": cookie})
+                connection.request("GET", f"/s/{scope}/api/snapshot", headers={"Cookie": cookie})
                 response = connection.getresponse()
                 self.assertEqual(response.status, 200)
                 self.assertEqual(json.loads(response.read())["schema"], "cockpit/v1")

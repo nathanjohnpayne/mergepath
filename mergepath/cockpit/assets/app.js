@@ -111,7 +111,7 @@
       try {
         const response = await this.fetchSnapshot(this.abort.signal);
         if (!this.active || generation !== this.generation) return;
-        if (response.status === 401) {
+        if (response.status === 401 || response.status === 404) {
           this.stop(); this.onState({kind: "session", retry_at: null}); return;
         }
         if (!response.ok) throw new Error("snapshot_unavailable");
@@ -248,8 +248,8 @@
       diagnostic.textContent = [...projection.diagnostics, ...valid.diagnostics].join(" "); diagnostic.hidden = !diagnostic.textContent;
     }
     poolSelect.addEventListener("change", () => {pool = poolSelect.value; render();});
-    const controller = new Connection({fetchSnapshot: signal => fetch("/api/snapshot", {credentials: "same-origin", cache: "no-store", signal}),
-      openStream: () => new EventSource("/events"), onSnapshot: value => {snapshot = value; receivedAt = performance.now(); render();},
+    const controller = new Connection({fetchSnapshot: signal => fetch("api/snapshot", {credentials: "same-origin", cache: "no-store", signal}),
+      openStream: () => new EventSource("events"), onSnapshot: value => {snapshot = value; receivedAt = performance.now(); render();},
       onState: value => {const changed = connection.kind !== value.kind; connection = value; render(); if (changed) $("connection-announcement").textContent = $("connection-label").textContent + ". " + $("connection-note").textContent;}});
     const timer = setInterval(renderConnection, 1000);
     const resize = new ResizeObserver(() => {if (snapshot) render();}); resize.observe(road.strip);

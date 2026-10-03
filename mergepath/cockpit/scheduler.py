@@ -1,7 +1,6 @@
 """One bounded scheduler with single-flight sources and last-good envelopes."""
 
 import copy
-import json
 import math
 import re
 import threading
@@ -9,6 +8,30 @@ import time
 from dataclasses import dataclass, field
 
 from .github import ClientError
+
+
+def _json_copy(value, active=None):
+    """Copy native JSON trees without coercing types or mapping keys."""
+    kind = type(value)
+    if value is None or kind in (str, bool, int):
+        return value
+    if kind is float and math.isfinite(value):
+        return value
+    if kind not in (dict, list):
+        raise ValueError("invalid_json_tree")
+    active = set() if active is None else active
+    identity = id(value)
+    if identity in active:
+        raise ValueError("invalid_json_tree")
+    active.add(identity)
+    try:
+        if kind is list:
+            return [_json_copy(item, active) for item in value]
+        if any(type(key) is not str for key in value):
+            raise ValueError("invalid_json_tree")
+        return {key: _json_copy(item, active) for key, item in value.items()}
+    finally:
+        active.remove(identity)
 
 
 @dataclass(frozen=True)
@@ -89,7 +112,7 @@ class Scheduler:
             sample = source.fetch(source.deadline)
             if not isinstance(sample, Sample):
                 raise ValueError("invalid_sample")
-            data = json.loads(json.dumps(sample.data, allow_nan=False))
+            data = _json_copy(sample.data)
         except ClientError as exc:
             # Categories originate in the shared client, not upstream bodies.
             error, retry = exc.category, exc.retry_after

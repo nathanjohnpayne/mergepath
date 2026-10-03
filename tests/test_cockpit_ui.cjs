@@ -1,11 +1,30 @@
 "use strict";
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const vm = require("node:vm");
 const C = require("../mergepath/cockpit/assets/components.js");
 const {Connection, PanelRegistry, validSnapshot, accountHazards, renderPanelContent} = require("../mergepath/cockpit/assets/app.js");
 const repositories = [{name: "mergepath", repo: "owner/mergepath", hub: true}, {name: "consumer", repo: "owner/consumer", hub: false}];
 const snapshot = (overrides = {}) => ({schema: "cockpit/v1", revision: 1, generated_at: 1000, repositories, api_budget: {}, sources: {}, ...overrides});
 const hazard = (id = "one", overrides = {}) => ({id, source: "prs", section: "prs", repo: "owner/mergepath", state: "bump", title: "Review delayed", detail: "Waiting for an observed review.", timing: {kind: "now"}, observed_at: 950, stale: false, ...overrides});
+test("bootstrap scrubs full fragment before I/O and accepts only a fixed scope grammar", async () => {
+  const source = fs.readFileSync(require.resolve("../mergepath/cockpit/bootstrap.js"), "utf8");
+  for (const scope of ["a".repeat(43), "", "../escape", "a".repeat(42), "a".repeat(44), "/".repeat(43)]) {
+    const calls = [], status = {textContent: ""};
+    const context = {URLSearchParams, document: {getElementById: () => status},
+      window: {location: {hash: `#launch=fixture-only&scope=${encodeURIComponent(scope)}&secret=extra`, replace: path => calls.push(["navigate", path])},
+        history: {replaceState: (_state, _title, path) => calls.push(["scrub", path])}},
+      fetch: async (path, options) => {assert.deepEqual(calls, [["scrub", "/bootstrap"]]); calls.push(["fetch", path, options]); return {ok: true};}};
+    vm.runInNewContext(source, context); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(calls[0][0], "scrub");
+    if (scope === "a".repeat(43)) {
+      assert.equal(calls[1][1], "/api/bootstrap"); assert.equal(calls[1][2].method, "POST");
+      assert.equal(calls[1][2].headers["X-Cockpit-Bootstrap"], "fixture-only");
+      assert.deepEqual(calls[2], ["navigate", `/s/${scope}/`]);
+    } else {assert.equal(calls.length, 1); assert.match(status.textContent, /Relaunch/);}
+  }
+});
 test("six states preserve common ordering; unavailable is not clear", () => {
   assert.equal(C.STATES.length, 6);
   assert.equal(C.worstState(["done", "running", "clear", "bump", "boulder"]), "boulder");
@@ -169,13 +188,16 @@ test("reconnect closes stream, bounded backoff becomes offline; stale events can
   f.streams.at(-1).emit("heartbeat", {}); assert.equal(f.states.at(-1).kind, "live");
   f.connection.stop();
 });
-test("initial and reconnect HTTP401 stop with relaunch state and no further retry", async () => {
-  let attempts = 0;
-  const f = fixture(async () => ++attempts === 1 ? {status: 200, ok: true, json: async () => snapshot()} : {status: 401, ok: false});
-  f.connection.start(); await flush(); f.streams[0].emit("error", {}); f.timers.advance(2); await flush();
-  assert.equal(f.states.at(-1).kind, "session"); assert.equal(f.timers.tasks.size, 0); assert.equal(f.connection.active, false);
-  const initial = fixture(async () => ({status: 401, ok: false})); initial.connection.start(); await flush();
-  assert.equal(initial.streams.length, 0); assert.equal(initial.states.at(-1).kind, "session");
+test("initial and reconnect HTTP401 or namespace HTTP404 stop with relaunch and no retry", async () => {
+  for (const status of [401, 404]) {
+    let attempts = 0;
+    const f = fixture(async () => ++attempts === 1 ? {status: 200, ok: true, json: async () => snapshot()} : {status, ok: false});
+    f.connection.start(); await flush(); f.streams[0].emit("error", {}); f.timers.advance(2); await flush();
+    assert.equal(f.states.at(-1).kind, "session"); assert.equal(f.timers.tasks.size, 0); assert.equal(f.connection.active, false);
+    const initial = fixture(async () => ({status, ok: false})); initial.connection.start(); await flush();
+    assert.equal(initial.streams.length, 0); assert.equal(initial.states.at(-1).kind, "session");
+    assert.equal(initial.timers.tasks.size, 0); assert.equal(initial.connection.active, false);
+  }
 });
 test("abortable probe deadline and stream watchdog reject late results; invalid heartbeat fails", async () => {
   let deliver;

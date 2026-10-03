@@ -40,6 +40,7 @@ class Application:
         self.static_root = Path(static_root or Path(__file__).parent)
         self.heartbeat, self.clock, self.monotonic, self.logger = heartbeat, clock, monotonic, logger
         self._nonce, self._session, self._csrf = (secrets.token_urlsafe(32) for _ in range(3))
+        self._scope = secrets.token_urlsafe(32)
         self._nonce_expires, self._nonce_used = monotonic() + 120, False
         self._revision = 0
         self._panel_sources = {}
@@ -49,7 +50,11 @@ class Application:
         self.scheduler = Scheduler(changed=self.publish, clock=clock, monotonic=monotonic)
 
     def launch_url(self, port):
-        return f"http://127.0.0.1:{port}/bootstrap#launch={self._nonce}"
+        return f"http://127.0.0.1:{port}/bootstrap#launch={self._nonce}&scope={self._scope}"
+
+    @property
+    def scope_path(self):
+        return f"/s/{self._scope}/"
 
     def bootstrap(self, nonce, csrf):
         with self._condition:
@@ -67,7 +72,7 @@ class Application:
 
     def redact(self, value):
         if isinstance(value, str):
-            for secret in (self._nonce, self._session, self._csrf, self.github._token):
+            for secret in (self._nonce, self._session, self._csrf, self._scope, self.github._token):
                 value = value.replace(secret, "[redacted]")
             return value
         if isinstance(value, dict):
@@ -175,7 +180,8 @@ class Handler(BaseHTTPRequestHandler):
         self._headers()
         self.send_header("Connection", "close")
         if cookie:
-            self.send_header("Set-Cookie", cookie)
+            for value in cookie if isinstance(cookie, tuple) else (cookie,):
+                self.send_header("Set-Cookie", value)
         self.end_headers()
         self.close_connection = True
         if self.command != "HEAD":
@@ -247,8 +253,19 @@ class Handler(BaseHTTPRequestHandler):
                     self._single("X-Cockpit-Bootstrap"), self._single("X-Cockpit-CSRF"))):
                 self._respond(403, {"error": "bootstrap_refused"})
                 return
-            self._respond(204, raw=b"", cookie=f"{COOKIE}={app._session}; Path=/; HttpOnly; SameSite=Strict")
+            # Remove only an old host-wide cookie. Otherwise browsers send it
+            # alongside the scoped cookie and duplicate-name checks refuse it.
+            self._respond(204, raw=b"", cookie=(
+                f"{COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict",
+                f"{COOKIE}={app._session}; Path={app.scope_path}; HttpOnly; SameSite=Strict"))
             return
+        if not public:
+            # Cookie hosts ignore ports. The independent unguessable scope is
+            # required before every protected route and never disclosed here.
+            if not parts.path.startswith(app.scope_path):
+                self._respond(404, {"error": "not_found"})
+                return
+            parts = parts._replace(path="/" + parts.path[len(app.scope_path):])
         if not public and not self._session_valid():
             self._respond(401, {"error": "session_required"})
             return

@@ -3,12 +3,14 @@
 // Transport only. Remove the credential before any await or network call.
 const fragment = new URLSearchParams(window.location.hash.slice(1));
 let launch = fragment.get("launch");
+let scope = fragment.get("scope");
 window.history.replaceState(null, "", "/bootstrap");
-fragment.delete("launch");
+fragment.delete("launch"); fragment.delete("scope");
 
 async function establishSession() {
   const status = document.getElementById("session-status");
-  if (!launch) {
+  if (!launch || !/^[A-Za-z0-9_-]{43}$/.test(scope || "")) {
+    launch = scope = null;
     status.textContent = "Relaunch scripts/cockpit.sh to establish a new local session.";
     return;
   }
@@ -20,9 +22,10 @@ async function establishSession() {
     });
     launch = null;
     if (!response.ok) throw new Error("session_refused");
-    window.location.replace("/");
+    const path = `/s/${scope}/`; scope = null;
+    window.location.replace(path);
   } catch {
-    launch = null;
+    launch = scope = null;
     status.textContent = "Session unavailable. Relaunch scripts/cockpit.sh to try again.";
   }
 }

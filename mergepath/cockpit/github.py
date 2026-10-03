@@ -198,22 +198,27 @@ def _query_only(document):
             index += 1
     if not tokens or tokens[0] not in {"query", "{"}:
         raise ClientError("query_only")
-    # Track selection-set nesting: operation keywords at root are never reads.
-    depth, operations = 0, 0
+    # Input-object defaults live inside variable parentheses, not a second
+    # operation. Match all delimiters before counting root selection sets.
+    stack, operations, finished = [], 0, False
+    pairs = {"}": "{", ")": "(", "]": "["}
     for token in tokens:
-        if token == "{":
-            if depth == 0:
-                operations += 1
-            depth += 1
-        elif token == "}":
-            depth -= 1
-            if depth < 0:
-                raise ClientError("invalid_query")
-        elif depth == 0 and token in {"mutation", "subscription"}:
+        if not stack and token in {"mutation", "subscription"}:
             raise ClientError("query_only")
+        if finished:
+            raise ClientError("invalid_query")
+        if token in {"{", "(", "["}:
+            if token == "{" and not stack:
+                operations += 1
+            stack.append(token)
+        elif token in pairs:
+            if not stack or stack.pop() != pairs[token]:
+                raise ClientError("invalid_query")
+            if not stack and token == "}":
+                finished = True
     # One query selection set, no fragments/other operations in this small seam.
     # A single document can contain arbitrarily many aliases for batching.
-    if depth or operations != 1 or "fragment" in tokens:
+    if stack or operations != 1 or "fragment" in tokens:
         raise ClientError("invalid_query")
 
 
@@ -415,9 +420,12 @@ class GitHubClient:
 
     def query(self, document, variables=None, *, deadline=None):
         _query_only(document)
+        variables = {} if variables is None else variables
+        if type(variables) is not dict or any(type(key) is not str for key in variables):
+            raise ClientError("invalid_query_variables")
         try:
             payload, _ = self._request("/graphql", "graphql", document={
-                "query": document, "variables": variables or {}}, deadline=deadline)
+                "query": document, "variables": variables}, deadline=deadline)
         except (TypeError, ValueError):
             raise ClientError("invalid_query_variables") from None
         if not isinstance(payload, dict) or payload.get("errors") or not isinstance(payload.get("data"), dict):
