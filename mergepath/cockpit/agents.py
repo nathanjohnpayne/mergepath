@@ -12,6 +12,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 from .github import ClientError
 from .scheduler import Sample
@@ -111,6 +112,71 @@ class LocalReader:
             return b"".join(chunks).decode("utf-8")
         finally:
             os.close(fd)
+
+
+def resolve_history_settings(settings, inventory, root):
+    """Resolve operator-owned launch JSON once; never accept browser paths."""
+    if not isinstance(settings, dict) or set(settings) - {"checkouts", "price_keys"}:
+        raise ValueError("invalid_history_settings")
+    inventory = tuple(inventory)
+    repositories = {item.repo for item in inventory}
+    hubs = [item.repo for item in inventory if item.hub]
+    configured, keys = settings.get("checkouts", {}), settings.get("price_keys", {})
+    if (len(hubs) != 1 or not isinstance(configured, dict) or not isinstance(keys, dict)
+            or set(configured) - repositories or set(keys) - {"claude", "codex"}
+            or any(not text(key) for key in keys.values())):
+        raise ValueError("invalid_history_settings")
+    root = Path(root).resolve()
+    requested = [(hubs[0], root)]
+    for repo, paths in configured.items():
+        if not isinstance(paths, list) or not paths or len(paths) > 64:
+            raise ValueError("invalid_history_settings")
+        for path in paths:
+            if not text(path, 4096) or not Path(path).is_absolute():
+                raise ValueError("invalid_history_settings")
+            resolved = Path(path).resolve()
+            if not resolved.is_dir():
+                raise ValueError("invalid_history_settings")
+            requested.append((repo, resolved))
+    requested = tuple(dict.fromkeys(requested))
+    if len(requested) > 64:
+        raise ValueError("invalid_history_settings")
+    deadline = time.monotonic() + 5
+    if keys:
+        reader = LocalReader(deadline)
+        directory = reader.directory(root / "scripts/phase-4b")
+        try:
+            prices = json.loads(reader.read(directory, "prices.json"))
+        finally:
+            os.close(directory)
+        for name, key in keys.items():
+            if not isinstance(prices, dict) or not isinstance(prices.get("providers"), dict):
+                raise ValueError("invalid_history_settings")
+            source = "anthropic" if name == "claude" else "openai"
+            source_prices = prices["providers"].get(source)
+            if not isinstance(source_prices, dict) or not isinstance(source_prices.get("models"), dict):
+                raise ValueError("invalid_history_settings")
+            models = source_prices["models"]
+            allowed = {f"{source}.{model}.{tier}" for model, tiers in models.items() if isinstance(tiers, dict)
+                       for tier, rates in tiers.items() if isinstance(rates, dict) and number(rates.get("input")) and number(rates.get("output"))}
+            if key not in allowed:
+                raise ValueError("invalid_history_settings")
+    checkouts, owners = {}, {}
+    for repo, path in requested:
+        if time.monotonic() >= deadline:
+            raise ClientError("deadline_exceeded")
+        found = (Checkout(repo, path), *discover_checkouts(path, repo, deadline=deadline))
+        for checkout in found:
+            if not checkout.path.is_absolute():
+                raise ValueError("invalid_history_settings")
+            resolved = checkout.path.resolve()
+            if resolved in owners and owners[resolved] != repo:
+                raise ValueError("invalid_history_settings")
+            owners[resolved] = repo
+            checkouts[(repo, resolved)] = Checkout(repo, resolved)
+            if len(checkouts) > 64:
+                raise ValueError("invalid_history_settings")
+    return tuple(checkouts.values()), MappingProxyType(dict(keys))
 
 
 def normalize_loop(loop):

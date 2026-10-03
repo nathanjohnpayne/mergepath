@@ -38,7 +38,10 @@
       "specs/cockpit_prs.md",
       "tests/test_cockpit_actions.py",
       "tests/test_cockpit_actions_ui.cjs",
-      "specs/cockpit_actions.md"
+      "specs/cockpit_actions.md",
+      "tests/test_cockpit_agents.py",
+      "tests/test_cockpit_agents_ui.cjs",
+      "specs/cockpit_agents.md"
     ],
     "check_no_token_in_output": [
       "scripts/ci/token_output_gate.py"

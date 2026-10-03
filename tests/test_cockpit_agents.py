@@ -10,10 +10,11 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from mergepath.cockpit.agents import (Accounting, AgentsProvider, Checkout, LocalReader, cost_for,
-                                     discover_checkouts, normalize_loop)
+                                     discover_checkouts, normalize_loop, resolve_history_settings)
 from mergepath.cockpit.github import ClientError, GitHubClient
 from mergepath.cockpit.inventory import Repository
 from mergepath.cockpit.server import Application, CockpitServer, COOKIE
@@ -343,6 +344,96 @@ class HistoryTests(unittest.TestCase):
         self.assertNotIn("fixture-token", json.dumps(payload))
 
 
+class SettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.hub, self.consumer = self.root / "hub", self.root / "consumer"
+        self.hub.mkdir(); self.consumer.mkdir()
+
+    def git_checkout(self, path, worktree):
+        env = {"PATH": os.defpath, "HOME": str(self.root), "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+        for args in (["init", "--initial-branch=main"],
+                     ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "fixture"],
+                     ["worktree", "add", "--detach", str(worktree)]):
+            subprocess.run(["git", "-C", str(path), *args], env=env, capture_output=True, check=True, timeout=5)
+
+    def test_default_and_enrolled_consumer_discover_actual_git_worktrees(self):
+        hub_tree, consumer_tree = self.root / "hub-tree", self.root / "consumer-tree"
+        self.git_checkout(self.hub, hub_tree); self.git_checkout(self.consumer, consumer_tree)
+        defaults, prices = resolve_history_settings({}, INVENTORY, self.hub)
+        self.assertEqual(set(defaults), {Checkout(REPO, self.hub), Checkout(REPO, hub_tree)})
+        self.assertEqual(dict(prices), {})
+        with self.assertRaises(TypeError):
+            prices["codex"] = "invented"
+        combined, _ = resolve_history_settings({"checkouts": {"owner/consumer": [str(self.consumer)]}}, INVENTORY, self.hub)
+        self.assertEqual(set(combined), set(defaults) | {Checkout("owner/consumer", self.consumer), Checkout("owner/consumer", consumer_tree)})
+
+    def test_platform_alias_dedup_and_one_bounded_discovery_deadline(self):
+        alias = self.root / "alias"; alias.symlink_to(self.consumer)
+        calls = []
+        def discovery(path, repo, **kwargs):
+            calls.append((path, repo, kwargs))
+            return (Checkout(repo, path), Checkout(repo, path))
+        with patch("mergepath.cockpit.agents.discover_checkouts", side_effect=discovery):
+            checkouts, _ = resolve_history_settings({"checkouts": {"owner/consumer": [str(self.consumer), str(alias), str(self.consumer)]}}, INVENTORY, self.hub)
+        self.assertEqual(len(checkouts), 2)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][2]["deadline"], calls[1][2]["deadline"])
+        self.assertLessEqual(calls[0][2]["deadline"] - time.monotonic(), 5)
+
+    def test_malformed_unknown_relative_and_missing_configuration_refused(self):
+        invalid = [None, [], {"unknown": 1}, {"checkouts": []}, {"checkouts": {"outsider/repo": [str(self.hub)]}},
+                   {"checkouts": {REPO: "path"}}, {"checkouts": {REPO: []}}, {"checkouts": {REPO: [1]}},
+                   {"checkouts": {REPO: ["relative"]}}, {"checkouts": {REPO: [str(self.root / "missing")]}},
+                   {"price_keys": []}, {"price_keys": {"other": "openai.gpt-5.3-codex.standard"}}]
+        with patch("mergepath.cockpit.agents.discover_checkouts") as discovery:
+            for settings in invalid:
+                with self.subTest(settings=settings), self.assertRaises(ValueError):
+                    resolve_history_settings(settings, INVENTORY, self.hub)
+            discovery.assert_not_called()
+
+    def test_ambiguous_physical_checkout_cannot_be_attributed_to_two_repositories(self):
+        with patch("mergepath.cockpit.agents.discover_checkouts", side_effect=lambda path, repo, **kwargs: (Checkout(repo, self.hub),)):
+            with self.assertRaises(ValueError):
+                resolve_history_settings({"checkouts": {"owner/consumer": [str(self.consumer)]}}, INVENTORY, self.hub)
+
+    def test_global_checkout_cap_includes_all_discovered_roots(self):
+        found = tuple(Checkout(REPO, self.root / f"tree-{i}") for i in range(64))
+        with patch("mergepath.cockpit.agents.discover_checkouts", return_value=found), self.assertRaises(ValueError):
+            resolve_history_settings({}, INVENTORY, self.hub)
+        found = (Checkout(REPO, self.hub), *found[:63])
+        with patch("mergepath.cockpit.agents.discover_checkouts", return_value=found):
+            checkouts, _ = resolve_history_settings({}, INVENTORY, self.hub)
+        self.assertEqual(len(checkouts), 64)
+
+    def test_only_explicit_existing_matching_provider_model_tier_prices(self):
+        keys = {"codex": "openai.gpt-5.5.standard_short_context", "claude": "anthropic.claude-sonnet-4.6.standard"}
+        with patch("mergepath.cockpit.agents.discover_checkouts", return_value=(Checkout(REPO, ROOT),)):
+            _, actual = resolve_history_settings({"price_keys": keys}, INVENTORY, ROOT)
+            self.assertEqual(dict(actual), keys)
+            keys["claude"] = "changed"
+            self.assertEqual(actual["claude"], "anthropic.claude-sonnet-4.6.standard")
+            for value in (None, 1, "anthropic.claude-sonnet-4.6.standard", "openai.unknown.standard", "openai.gpt-5.5", "openai.gpt-5.5.standard_short_context.input"):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    resolve_history_settings({"price_keys": {"codex": value}}, INVENTORY, ROOT)
+
+    def test_canonical_prices_read_refuses_symlink_and_malformed_table(self):
+        directory = self.hub / "scripts/phase-4b"; directory.mkdir(parents=True)
+        target = directory / "prices.json"
+        outside = self.root / "outside.json"; outside.write_text("private contents")
+        target.symlink_to(outside)
+        settings = {"price_keys": {"codex": "openai.gpt-5.3-codex.standard"}}
+        with self.assertRaises(OSError):
+            resolve_history_settings(settings, INVENTORY, self.hub)
+        target.unlink()
+        for table in ([], {"providers": []}, {"providers": {"openai": {"models": []}}}):
+            target.write_text(json.dumps(table))
+            with self.subTest(table=table), self.assertRaises(ValueError):
+                resolve_history_settings(settings, INVENTORY, self.hub)
+
+
 def serve_fixture():
     """Temporary real authenticated server for browser QA; all source/upstream data is fake."""
     with tempfile.TemporaryDirectory(prefix="cockpit-agents-fixture-") as directory:
@@ -360,8 +451,10 @@ def serve_fixture():
         static = base / "static"
         shutil.copytree(ROOT / "mergepath/cockpit", static)
         index = static / "index.html"
-        source = index.read_text().replace('</head>', '<link rel="stylesheet" href="assets/agents.css"><script src="assets/agents.js" defer></script></head>')
-        index.write_text(source)
+        source = index.read_text()
+        if 'src="assets/agents.js"' not in source:
+            source = source.replace('</head>', '<link rel="stylesheet" href="assets/agents.css"><script src="assets/agents.js" defer></script></head>')
+            index.write_text(source)
         class DeniedClient:
             def pages(self, *args, **kwargs):
                 raise ClientError("permission_denied")

@@ -107,7 +107,7 @@
       this.diagnostics.textContent = diagnostics.join(" "); this.diagnostics.hidden = !diagnostics.length;
       const keepDays = new Set(view.chart.map(day => day.day));
       for (const [day, item] of this.days) if (!keepDays.has(day)) {item.root.remove(); this.days.delete(day);}
-      for (const day of view.chart) {
+      for (const [index, day] of view.chart.entries()) {
         let item = this.days.get(day.day);
         if (!item) {const root = C.element("div", "day"), pair = C.element("div", "bar-pair"), label = C.element("span", "day-l", day.day.slice(5)); item = {root, pair, label, series: new Map()}; root.append(pair, label); this.days.set(day.day, item);}
         item.root.hidden = false;
@@ -123,7 +123,7 @@
           series.bar.setAttribute("role", "img"); series.bar.setAttribute("aria-label", series.bar.title);
           series.bar.classList.toggle("bounded", cost.low !== cost.high);
         }
-        this.bars.append(item.root);
+        if (this.bars.children[index] !== item.root) this.bars.insertBefore(item.root, this.bars.children[index] || null);
       }
       const keepTiles = new Set(view.totals.map(item => item.provider));
       for (const [name, tile] of this.tiles) tile.root.hidden = !keepTiles.has(name);

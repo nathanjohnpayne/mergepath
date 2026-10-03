@@ -69,10 +69,10 @@ test("invalid numeric, run, cost and duplicate identity output is refused", () =
 // A minimal DOM implements node ownership and moves, so this exercises the real
 // renderer's retention rather than mirroring its date-filtering implementation.
 class Node {
-  constructor(tag) {this.tagName = tag; this.children = []; this.parentNode = null; this.style = {}; this.attributes = {}; this.classList = {toggle() {}};}
+  constructor(tag) {this.tagName = tag; this.children = []; this.parentNode = null; this.detachments = 0; this.style = {}; this.attributes = {}; this.classList = {toggle() {}};}
   setAttribute(key, value) {this.attributes[key] = value;}
   addEventListener() {}
-  remove() {if (this.parentNode) {const siblings = this.parentNode.children; siblings.splice(siblings.indexOf(this), 1); this.parentNode = null;}}
+  remove() {if (this.parentNode) {this.detachments += 1; const siblings = this.parentNode.children; siblings.splice(siblings.indexOf(this), 1); this.parentNode = null;}}
   append(...nodes) {for (const node of nodes) {node.remove(); this.children.push(node); node.parentNode = this;}}
   replaceChildren(...nodes) {for (const node of [...this.children]) node.remove(); this.append(...nodes);}
   insertBefore(node, reference) {node.remove(); const index = reference === null ? this.children.length : this.children.indexOf(reference); assert.ok(index >= 0); this.children.splice(index, 0, node); node.parentNode = this;}
@@ -90,9 +90,30 @@ test("actual HistoryView evicts expired UTC dates while retaining surviving day 
     assert.equal(view.days.size, 7); assert.equal(view.bars.children.length, 7);
     assert.equal(view.days.has("2026-09-27"), false); assert.equal(expired.root.parentNode, null);
     assert.deepEqual([...view.days.keys()], ["2026-09-28", "2026-09-29", "2026-09-30", "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04"]);
-    for (const [day, item] of retained) if (day !== "2026-09-27") assert.equal(view.days.get(day), item);
+    for (const [day, item] of retained) if (day !== "2026-09-27") {assert.equal(view.days.get(day), item); assert.equal(item.root.detachments, 0);}
+    assert.deepEqual(view.bars.children, [...view.days.values()].map(item => item.root));
     view.update(model(midnight + 10 * 86400));
     assert.equal(view.days.size, 7); assert.equal(view.bars.children.length, 7);
     assert.ok([...view.days.keys()].every(day => day >= "2026-10-07"));
+  } finally {global.document = previous;}
+});
+test("actual HistoryView changes bar heights without relocating correctly ordered day nodes", () => {
+  const previous = global.document;
+  global.document = {createElement: tag => new Node(tag)};
+  try {
+    const view = new A.HistoryView(new Node("section"));
+    const values = [row(), row({id: "older", pr: "2", day: "2026-10-02", cost: {kind: "reported", usd: 1, low_usd: null, high_usd: null}})];
+    const model = A.projectHistory(envelope(values, {observed_checkouts: 1, coverage: {checkouts: 1, legacy_runs: 0}, diagnostics: []}), null, now);
+    view.update(model);
+    const ordered = [...view.bars.children], bar = view.days.get("2026-10-03").series.get("codex").bar;
+    assert.equal(bar.style.height, "30%");
+    view.update(model);
+    view.pr = "owner/hub#1"; view.update(model);
+    assert.equal(bar.style.height, "100%");
+    view.pr = null; view.update(model);
+    assert.equal(bar.style.height, "30%");
+    view.provider = "claude"; view.update(model); view.provider = null; view.allDates = true; view.update(model);
+    assert.deepEqual(view.bars.children, ordered);
+    assert.ok(ordered.every(node => node.detachments === 0));
   } finally {global.document = previous;}
 });
