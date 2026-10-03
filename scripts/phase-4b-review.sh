@@ -554,6 +554,12 @@ refuse_approval_if_feedback_unaccounted() {
 # precedes every side effect, so an unreadable generation just stops (exit 10).
 capture_authorized_request_generation() {
   local payload
+  # With Codex disabled, Codex requests carry no authority and the substitute
+  # merge gate ignores them, so there is nothing to capture or record.
+  if [ "$(p4b_policy_block_field codex enabled)" = "false" ]; then
+    P4B_CODEX_REQUESTS_GOVERN=false
+    return 0
+  fi
   P4B_AUTHORIZED_REQUEST_GENERATION="$(printf '%s' "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" \
     | jq -ce '.request_generation | select(type == "array")' 2>/dev/null)" && return 0
   P4B_AUTHORIZED_REQUEST_GENERATION="$(p4b_live_request_generation "$REPO" "$PR")" && return 0
@@ -571,6 +577,7 @@ capture_authorized_request_generation() {
 # which stays the last read before the POST.
 refuse_approval_if_request_generation_moved() {
   local live_gen="" reason evidence payload
+  [ "$P4B_CODEX_REQUESTS_GOVERN" = true ] || return 0
   if [ -z "$P4B_AUTHORIZED_REQUEST_GENERATION" ]; then
     evidence=request-generation-unrecorded
     reason="the approval carries no authorized Codex request generation; refusing the approval"
@@ -732,6 +739,7 @@ BARRIER_CODERABBIT_CARRIED=""
 P4B_PRE_ADAPTER_CODEX_EVIDENCE=""
 P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON="null"
 P4B_AUTHORIZED_REQUEST_GENERATION=""
+P4B_CODEX_REQUESTS_GOVERN=true
 P4B_PRE_ADAPTER_REQUEST_GENERATION=""
 run_same_head_barrier() {
   local where="$1" scope="${2:-all}" out rc=0
