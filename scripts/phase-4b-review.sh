@@ -518,6 +518,14 @@ _p4b_on_exit() {
   return "$rc"
 }
 trap '_p4b_on_exit "$?"' EXIT
+# Invocation results are unknown until this run produces them. Do not publish
+# inherited environment values as adapter output or confirmed POST evidence.
+REVIEW_POSTED=false
+REVIEW_ACKNOWLEDGMENT=""
+ADAPTER_RC=""
+VERDICT=""
+P4B_ACCT_LOOP_STARTED_EPOCH=""
+P4B_ACCT_LOOP_ELAPSED_SECONDS=""
 p4b_heartbeat_start || true
 
 p4b_log "PR $REPO#$PR  HEAD=${HEAD:-?}  direction=$DIRECTION  reviewer=$REVIEWER  adapter=$ADAPTER  timeout=${ADAPTER_TIMEOUT}s  effort=${EFFECTIVE_EFFORT:-cli-default}  dry_run=$DRY_RUN"
@@ -1929,7 +1937,6 @@ acknowledge_approval() {
   REVIEW_ACKNOWLEDGMENT=accounted
 }
 
-REVIEW_POSTED=false
 POSTED_REVIEW_ID=""
 REVIEW_ACKNOWLEDGMENT=not-needed
 EXIT_CODE=0

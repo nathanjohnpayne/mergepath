@@ -65,6 +65,7 @@ cat > "$BIN/codex-check" <<'EOF'
 set -eu
 # Observe that the barrier stage was published before external-boundary reads.
 jq -r '.stage' "$P4B_HEARTBEAT_DIR"/p4b-*.json >> "$HB_CASE/observed" 2>/dev/null || true
+cp "$P4B_HEARTBEAT_DIR"/p4b-*.json "$HB_CASE/barrier.json" 2>/dev/null || true
 case "$HB_MODE" in hold|ceiling-stop) exit 1 ;; *) exit 0 ;; esac
 EOF
 cat > "$BIN/ledger" <<'EOF'
@@ -185,7 +186,7 @@ run_case() {
         && pass "$mode published live adapter/posting stages" || fail "$mode live stage publication"
       ;;
     hold|feedback|ceiling-stop|auth-unreadable)
-      jq -e '.adapter_started_at_epoch == null and .adapter_elapsed_seconds == null and .verdict == null and .review_posted == false' "$record" >/dev/null \
+      jq -e '.adapter_started_at_epoch == null and .adapter_elapsed_seconds == null and .adapter_exit_code == null and .adapter_verdict == null and .verdict == null and .review_posted == false and .review_acknowledgment == null' "$record" >/dev/null \
         && ! grep -qx adapter "$HB_CASE/events" && ! grep -qx post "$HB_CASE/events" \
         && pass "$mode no fabricated adapter/post evidence" || fail "$mode invented adapter/post"
       ;;
@@ -215,6 +216,34 @@ if [ "$(sed -n '/^post$/{x;p;};h' "$HB_CASE/events")" = feedback:3 ] \
    && jq -er '.body' "$HB_CASE/posted.json" | grep -qxF '<!-- mergepath-p4b-request-generation: [1] -->'; then
   pass 'late request remains outside original approval generation; feedback is last pre-POST read'
 else fail 'request-generation race/read order changed'; fi
+
+# An inherited value is present before REVIEW_POSTED is initialized near the
+# POST. Early refusals still publish startup and terminal boolean evidence.
+REVIEW_POSTED=not-json run_case hold 6 barrier,done inherited-not-json
+REVIEW_POSTED=true REVIEW_ACKNOWLEDGMENT=accounted ADAPTER_RC=0 VERDICT=APPROVED \
+  P4B_ACCT_LOOP_STARTED_EPOCH=123 P4B_ACCT_LOOP_ELAPSED_SECONDS=123 P4B_HB_EXIT_CODE=0 \
+  run_case hold 6 barrier,done inherited-results
+jq -e '.stage == "barrier" and .exit_code == null and .review_posted == false
+  and .review_acknowledgment == null and .adapter_exit_code == null
+  and .adapter_verdict == null and .adapter_started_at_epoch == null
+  and .adapter_elapsed_seconds == null' "$HB_CASE/barrier.json" >/dev/null \
+  && pass 'barrier ignores inherited result evidence' || fail 'barrier inherited results'
+cmp -s "$WORK/hold-good/events" "$HB_CASE/events" \
+  && pass 'inherited results preserve refusal boundary trace' || fail 'inherited results changed boundary trace'
+for inherited in '' not-json null 0 '[]' false true; do
+  (
+    export P4B_HEARTBEAT_DIR="$WORK/inherited-$inherited"
+    P4B_ACCT_RUN_ID=p4b-fixture-inherited
+    # Read by the sourced heartbeat producer.
+    # shellcheck disable=SC2034
+    REVIEW_POSTED="$inherited"
+    p4b_heartbeat_start
+    expected=false; [ "$inherited" != true ] || expected=true
+    jq -e --argjson expected "$expected" '.stage == "barrier" and .review_posted == $expected' "$P4B_HB_FILE" >/dev/null || exit 1
+    p4b_heartbeat_finish 6
+    jq -e --argjson expected "$expected" '.stage == "done" and .exit_code == 6 and .review_posted == $expected' "$P4B_HB_FILE" >/dev/null
+  ) && pass "inherited REVIEW_POSTED '$inherited' publishes booleans" || fail "inherited REVIEW_POSTED '$inherited'"
+done
 
 # SIGKILL bypasses EXIT: a non-done observation is retained, and the local
 # process-instance reader identifies the vanished owner. Fake adapter is itself

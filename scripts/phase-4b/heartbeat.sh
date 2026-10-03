@@ -6,7 +6,10 @@
 p4b_heartbeat_write() {
   (
     [ -n "${P4B_HB_FILE:-}" ] || exit 0
-    local tmp
+    local tmp review_posted=false
+    # Early refusals can precede the orchestrator's initialization. Inherited
+    # text must neither break JSON publication nor change this boolean's type.
+    [ "${REVIEW_POSTED:-}" != true ] || review_posted=true
     tmp="$(mktemp "${P4B_HB_DIR}/.heartbeat.XXXXXX")" || exit 0
     # Build from this process's memory, never from a previous on-disk record.
     # A broken/partial old observation cannot shape the next stage or verdict.
@@ -27,7 +30,7 @@ p4b_heartbeat_write() {
       --argjson summary_emitted "${P4B_HB_SUMMARY_EMITTED:-false}" \
       --arg verdict "${VERDICT:-}" --arg token_count "${TOKEN_COUNT:-}" \
       --arg findings_count "${FINDINGS_COUNT:-}" \
-      --argjson review_posted "${REVIEW_POSTED:-false}" \
+      --argjson review_posted "$review_posted" \
       --arg acknowledgment "${REVIEW_ACKNOWLEDGMENT:-}" '
       def number_or_null: if test("^(0|[1-9][0-9]*)$") then tonumber else null end;
       def text_or_null: if . == "" then null else . end;
@@ -127,6 +130,7 @@ p4b_heartbeat_start() {
   P4B_HB_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
   P4B_HB_PROCESS_STARTED_AT="$(LC_ALL=C ps -p "$$" -o lstart= 2>/dev/null || true)"
   P4B_HB_STAGES='[]'; P4B_HB_STAGE=""; P4B_HB_SUMMARY_EMITTED=false
+  P4B_HB_EXIT_CODE=""
   # All local telemetry operations run guarded; no failed mkdir/JSON/mv/ps
   # can interrupt a caller under errexit, including calls inside refusal arms.
   mkdir -p "$P4B_HB_DIR" >/dev/null 2>&1 || true
