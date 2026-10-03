@@ -255,13 +255,25 @@ refute_grep "D10: auto-clear no longer removes via the unattributable gh pr edit
 assert_grep "D10: the scheduled sweep re-verifies the label against live state, not the search index (#827)" \
   "$W/auto-clear-blocking-labels.yml" 'stale search-index hit'
 
-# Extract one step's `run: |` body from a workflow (dedented by its own
-# indentation) so the vectors below execute the shipped shell.
-extract_step_run() {  # <workflow> <step name>
+# Extract one named step, including its env bindings, without including a
+# sibling step's bindings. Run-block lines have deeper indentation.
+extract_step() {  # <workflow> <step name>
   awk -v name="$2" '
-    index($0, "- name: " name) && !found { found=1; next }
-    found && !in_run && /^[[:space:]]*- name: / { exit }
-    found && /^[[:space:]]*run: \|[[:space:]]*$/ { in_run=1; indent=-1; next }
+    index($0, "- name: " name) && !found {
+      found=1; match($0, /^[[:space:]]*/); step_indent=RLENGTH; print; next
+    }
+    found && /^[[:space:]]*- name: / {
+      match($0, /^[[:space:]]*/); if (RLENGTH <= step_indent) exit
+    }
+    found { print }
+  ' "$1"
+}
+
+# Extract the step's `run: |` body (dedented by its own indentation) so the
+# vectors below execute the shipped shell, without metadata or env YAML.
+extract_step_run() {  # <workflow> <step name>
+  extract_step "$1" "$2" | awk '
+    /^[[:space:]]*run: \|[[:space:]]*$/ { in_run=1; indent=-1; next }
     in_run {
       if ($0 ~ /[^[:space:]]/) {
         match($0, /^[[:space:]]*/)
@@ -270,23 +282,24 @@ extract_step_run() {  # <workflow> <step name>
       }
       print (length($0) >= indent ? substr($0, indent + 1) : "")
     }
-  ' "$1"
+  '
 }
 
 # D13: workflow_dispatch inputs reach the rollup shell only through env and
 # are validated, never spliced into the script text next to the reviewer PAT.
 refute_grep "D13: rollup does not interpolate dispatch inputs into run:" \
   "$W/daily-feedback-rollup.yml" '"${{ github.event.inputs.'
-assert_grep "D13: rollup passes the since input through env" \
-  "$W/daily-feedback-rollup.yml" 'INPUT_SINCE: ${{ github.event.inputs.since }}'
-assert_grep "D13: rollup passes the until input through env" \
-  "$W/daily-feedback-rollup.yml" 'INPUT_UNTIL: ${{ github.event.inputs.until }}'
-assert_grep "D13: rollup passes the dry_run input through env" \
-  "$W/daily-feedback-rollup.yml" 'INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}'
 if [ -f "$W/daily-feedback-rollup.yml" ]; then
   D13="$(mktemp -d "${TMPDIR:-/tmp}/test465-d13.XXXXXX")"
   mkdir -p "$D13/scripts"
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" >"%s/args"\n' "$D13" >"$D13/scripts/daily-feedback-rollup.sh"
+  extract_step "$W/daily-feedback-rollup.yml" "Run rollup" >"$D13/step.yml"
+  assert_grep "D13: rollup step passes the since input through env" \
+    "$D13/step.yml" 'INPUT_SINCE: ${{ github.event.inputs.since }}'
+  assert_grep "D13: rollup step passes the until input through env" \
+    "$D13/step.yml" 'INPUT_UNTIL: ${{ github.event.inputs.until }}'
+  assert_grep "D13: rollup step passes the dry_run input through env" \
+    "$D13/step.yml" 'INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}'
   extract_step_run "$W/daily-feedback-rollup.yml" "Run rollup" >"$D13/step.sh"
   refute_grep "D13: extracted rollup shell does not interpolate dispatch inputs" \
     "$D13/step.sh" '${{ github.event.inputs.'
