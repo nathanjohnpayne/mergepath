@@ -27,15 +27,19 @@
     const minutes = Math.ceil((timing.at - now) / 60);
     return minutes < 60 ? `in ${minutes} min` : minutes < 1440 ? `in ${Math.ceil(minutes / 60)} hr` : `in ${Math.ceil(minutes / 1440)} days`;
   }
-  function meterModel(evidence = {}) {
-    const limit = count(evidence.limit), remaining = count(evidence.remaining);
+  function meterModel(evidence = {}, now = Date.now() / 1000) {
+    const limit = count(evidence.limit), lastKnownRemaining = count(evidence.remaining);
     let used = count(evidence.used);
-    if (used === null && limit !== null && remaining !== null && remaining <= limit) used = limit - remaining;
+    if (used === null && limit !== null && lastKnownRemaining !== null && lastKnownRemaining <= limit) used = limit - lastKnownRemaining;
+    const lastKnownUsed = used, reset = epoch(evidence.reset), expired = reset !== null && reset <= now;
+    const remaining = expired ? null : lastKnownRemaining;
+    if (expired) used = null;
     const ratio = limit !== null && limit > 0 && used !== null ? used / limit : null;
-    const state = evidence.secondary_limited === true || evidence.primary_exhausted === true ? "boulder"
+    const primary = evidence.primary_exhausted === true && reset !== null && reset > now;
+    const state = evidence.secondary_limited === true || primary ? "boulder"
       : ratio === null ? "idle" : ratio >= 1 ? "boulder" : ratio >= .7 ? "bump" : "clear";
-    return {limit, remaining, used, ratio, state, percent: ratio === null ? null : Math.min(100, Math.max(0, ratio * 100)),
-      reason: evidence.secondary_limited === true ? "Secondary throttle" : evidence.primary_exhausted === true ? "Primary pool exhausted" : ratio === null ? "Usage unavailable" : `${Math.round(ratio * 100)}% used`};
+    return {limit, remaining, used, lastKnownRemaining, lastKnownUsed, expired, ratio, state, percent: ratio === null ? null : Math.min(100, Math.max(0, ratio * 100)),
+      reason: evidence.secondary_limited === true ? `Secondary throttle${expired ? " · last observed" : ""}` : primary ? "Primary pool exhausted" : expired ? "Usage unavailable after reset" : ratio === null ? "Usage unavailable" : `${Math.round(ratio * 100)}% used`};
   }
   function normalizeHazards(values, repositories) {
     const hazards = [], diagnostics = [], ids = new Set();
@@ -69,7 +73,7 @@
     if (!finite(minutes) || minutes < 0 || !finite(horizonMinutes) || horizonMinutes <= 0) return null;
     return 4 + 90 * Math.min(1, Math.log1p(minutes) / Math.log1p(horizonMinutes));
   }
-  function roadModel(hazards, {now, horizonMinutes = null, horizonLabel = "Horizon unavailable", width = 1000, observed = false, staleCoverage = false} = {}) {
+  function roadModel(hazards, {now, horizonMinutes = null, horizonLabel = "Horizon unavailable", width = 1000, observed = false, staleCoverage = false, invalidCoverage = false} = {}) {
     const validHorizon = finite(horizonMinutes) && horizonMinutes > 0;
     const items = hazards.map(hazard => {
       const minutes = hazardMinutes(hazard, now);
@@ -87,9 +91,9 @@
       previousTick = x; return [{...tick, position}];
     }) : [];
     return {items, ticks, strip: items.filter(item => selected.has(item.id)), deferred: items.filter(item => item.position === null).length,
-      overflow: items.length - selected.size, observed, staleCoverage,
+      overflow: items.length - selected.size, observed, staleCoverage, invalidCoverage,
       emptyState: observed && !items.length ? "clear" : "idle",
-      emptyText: items.length ? "See the full list for timing" : observed ? "Road is clear for fresh observed sources" : staleCoverage ? "Last-known observations are stale" : "No observations yet",
+      emptyText: items.length ? "See the full list for timing" : observed ? "Road is clear for fresh observed sources" : invalidCoverage ? "Observations unavailable" : staleCoverage ? "Last-known observations are stale" : "No observations yet",
       horizonLabel: validHorizon ? horizonLabel : "Horizon unavailable", validHorizon};
   }
   function packRoad(markers, width, measure = text => text.length * 6) {
@@ -149,14 +153,14 @@
       parent.append(this.root);
       this.previous = "idle";
     }
-    update(evidence, {unit = "requests"} = {}) {
-      const model = meterModel(evidence), fmt = value => value === null ? "unknown" : value.toLocaleString("en-US");
+    update(evidence, {unit = "requests", now = Date.now() / 1000} = {}) {
+      const model = meterModel(evidence, now), fmt = value => value === null ? "unknown" : value.toLocaleString("en-US");
       this.root.className = `m t-${tone(model.state)}${model.percent === null ? " unknown" : ""}`;
       this.value.textContent = model.remaining === null ? "Remaining unknown" : `${fmt(model.remaining)} left`;
       this.denominator.textContent = model.limit === null ? "Limit unknown" : `of ${fmt(model.limit)} ${unit}`;
       this.fill.className = `m-fill t-${tone(model.state)}`;
       this.fill.style.width = `${model.percent ?? 0}%`;
-      this.reason.textContent = model.reason;
+      this.reason.textContent = model.reason + (model.expired ? ` · last known ${fmt(model.lastKnownRemaining)} left / ${fmt(model.lastKnownUsed)} used` : "");
       this.track.setAttribute("role", model.percent === null ? "img" : "meter");
       this.track.setAttribute("aria-label", `${model.reason}; ${this.value.textContent}; ${this.denominator.textContent}`);
       if (model.percent !== null) {

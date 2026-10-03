@@ -7,7 +7,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from .github import ClientError, copy_json_tree, error_category
+from .github import ClientError, copy_json_tree, error_category, retry_delay
 
 
 @dataclass(frozen=True)
@@ -40,7 +40,7 @@ class Source:
 class Scheduler:
     def __init__(self, *, workers=2, clock=time.time, monotonic=time.monotonic,
                  changed=lambda: None):
-        if not 1 <= workers <= 8:
+        if type(workers) is not int or not 1 <= workers <= 2:
             raise ValueError("invalid_worker_bound")
         self._workers, self._clock, self._monotonic = workers, clock, monotonic
         self._changed = changed
@@ -75,12 +75,17 @@ class Scheduler:
 
     def _failure(self, source, category, retry_after=0):
         source.failures += 1
-        delay = max(retry_after, min(source.max_backoff,
-                    source.hot_interval * 2 ** min(source.failures - 1, 16)))
-        source.blocked_until = self._monotonic() + delay
+        backoff = min(source.max_backoff, source.hot_interval * 2 ** min(source.failures - 1, 16))
+        delay = max(retry_delay(retry_after), backoff)
+        monotonic, observed = self._monotonic(), self._clock()
+        if not math.isfinite(monotonic + delay) or not math.isfinite(observed + delay):
+            delay = backoff
+            if not math.isfinite(monotonic + delay) or not math.isfinite(observed + delay):
+                delay = 0
+        source.blocked_until = monotonic + delay
         source.due = source.blocked_until
         source.envelope.update(stale=True, error=category,
-                               retry_at=self._clock() + delay)
+                               retry_at=observed + delay)
 
     def _fetch(self, source):
         sample, error, retry = None, None, 0

@@ -5,7 +5,7 @@
   if (typeof module === "object" && module.exports) module.exports = api;
   else {root.CockpitApp = api; api.mount();}
 })(globalThis, function (C) {
-  const unavailable = () => ({state: "idle", label: "Unavailable", hazards: [], count: null, observed: false, stale: true, observed_at: null});
+  const unavailable = () => ({state: "idle", label: "Unavailable", hazards: [], count: null, observed: false, stale: true, observed_at: null, coverageValid: false});
   function validSnapshot(value) {
     return value?.schema === "cockpit/v1" && C.count(value.revision) !== null && C.epoch(value.generated_at) !== null
       && Array.isArray(value.repositories) && value.repositories.length > 0
@@ -34,11 +34,16 @@
           if (!projected || !C.STATES.includes(projected.state) || typeof projected.label !== "string") throw new Error("invalid_projection");
           const normalized = C.normalizeHazards(projected.hazards, repositories);
           diagnostics.push(...normalized.diagnostics.map(text => `${id}: ${text}`));
-          const owned = normalized.hazards.filter(hazard => hazard.source === id);
-          if (owned.length !== normalized.hazards.length) diagnostics.push(`${id}: A hazard used another panel's source identity.`);
+          const ownedSource = normalized.hazards.filter(hazard => hazard.source === id);
+          if (ownedSource.length !== normalized.hazards.length) diagnostics.push(`${id}: A hazard used another panel's source identity.`);
+          const owned = ownedSource.filter(hazard => hazard.id !== "shell-connection" && !hazard.id.startsWith("account-api-"));
+          if (owned.length !== ownedSource.length) diagnostics.push(`${id}: A hazard used a reserved system identity.`);
+          const missingHazard = ["bump", "boulder"].includes(projected.state) && owned.length === 0;
+          if (missingHazard) diagnostics.push(`${id}: A blocking projection has no usable owned hazard.`);
           const visible = C.filterHazards(owned, selectedRepo).map(hazard => ({...hazard, stale: hazard.stale || envelope.stale === true}));
           models[id] = {...projected, hazards: visible, count: C.count(projected.count), observed: true,
-            stale: envelope.stale === true, observed_at: envelope.observed_at};
+            stale: envelope.stale === true, observed_at: envelope.observed_at,
+            coverageValid: normalized.diagnostics.length === 0 && owned.length === normalized.hazards.length && !missingHazard};
           if (id === "budget") {
             models[id].horizon = null;
             if (projected.horizon !== undefined && projected.horizon !== null) {
@@ -52,10 +57,19 @@
       }
       // Duplicate identity across adapters is also refused.
       const normalized = C.normalizeHazards(hazards, repositories);
+      const identities = new Map();
+      for (const hazard of hazards) {
+        if (identities.has(hazard.id)) {
+          models[identities.get(hazard.id)].coverageValid = false;
+          models[hazard.source].coverageValid = false;
+        } else identities.set(hazard.id, hazard.source);
+      }
       const observedModels = Object.values(models).filter(model => model.observed);
       return {models, hazards: normalized.hazards, diagnostics: [...diagnostics, ...normalized.diagnostics],
         observed: observedModels.length > 0, observedPanels: observedModels.length,
-        freshPanels: observedModels.filter(model => !model.stale).length, stalePanels: observedModels.filter(model => model.stale).length};
+        freshPanels: observedModels.filter(model => !model.stale && model.coverageValid).length,
+        stalePanels: observedModels.filter(model => model.stale).length,
+        invalidPanels: observedModels.filter(model => !model.coverageValid).length};
     }
     counts(snapshot, now) {
       const adapter = this.adapters.get("prs"), envelope = adapter ? snapshot.sources[adapter.source] : null;
@@ -143,10 +157,10 @@
   function accountHazards(snapshot, now, stale) {
     return Object.entries(snapshot.api_budget).flatMap(([pool, evidence]) => {
       if (!evidence || typeof evidence !== "object") return [];
-      const meter = C.meterModel(evidence);
+      const meter = C.meterModel(evidence, now);
       if (!["bump", "boulder"].includes(meter.state)) return [];
       return [{id: `account-api-${pool}`, source: "road", section: "road", repo: null, state: meter.state,
-        title: `Reviewer PAT · ${pool}: ${meter.reason}`, detail: `${meter.remaining ?? "Unknown"} ${pool === "graphql" ? "points" : "requests"} left of ${meter.limit ?? "unknown"}. Shared by all enrolled repositories.`,
+        title: `Reviewer PAT · ${pool}: ${meter.reason}`, detail: `${meter.remaining ?? "Unknown"} ${pool === "graphql" ? "points" : "requests"} left of ${meter.limit ?? "unknown"}.${meter.expired ? ` Last known: ${meter.lastKnownRemaining ?? "unknown"} left / ${meter.lastKnownUsed ?? "unknown"} used.` : ""} Shared by all enrolled repositories.`,
         timing: {kind: "now"}, observed_at: C.epoch(evidence.observed_at), stale, now}];
     });
   }
@@ -184,7 +198,7 @@
     $("motion").addEventListener("click", () => {reduced = !reduced; savePreference("cockpit-motion", reduced ? "reduce" : "normal"); preferences();});
     media.addEventListener("change", preferences); preferences();
     const filterButtons = new Map(), poolOptions = new Map();
-    let snapshot = null, selectedRepo = null, pool = "core", receivedAt = null, connection = {kind: "connecting", retry_at: null};
+    let snapshot = null, selectedRepo = null, pool = "core", receivedAt = null, renderedAt = null, connection = {kind: "connecting", retry_at: null};
     const epochNow = () => Date.now() / 1000;
     const poolSelect = $("api-pool"); poolOptions.set("core", poolSelect.options[0]);
     function renderFilters() {
@@ -229,7 +243,8 @@
         const option = C.element("option", "", key); option.value = key; poolSelect.append(option); poolOptions.set(key, option);
       }
       const evidence = current.api_budget[pool] || {}, now = epochNow();
-      meter.update(evidence, {unit: pool === "graphql" ? "points" : "requests"});
+      renderedAt = now;
+      meter.update(evidence, {unit: pool === "graphql" ? "points" : "requests", now});
       const identity = typeof evidence.configured_identity === "string" ? `${evidence.configured_identity} · preflight configured` : "Identity unknown";
       const observed = C.epoch(evidence.observed_at), reset = C.epoch(evidence.reset);
       $("api-note").textContent = `${identity} · ${observed === null ? "no header evidence" : `observed ${C.ageLabel(now - observed)}`} · ${reset === null ? "reset unknown" : `reset ${reset > now ? C.timeLabel({kind: "at", at: reset}, now) : "time passed; awaiting headers"}`}`;
@@ -243,10 +258,11 @@
       const horizon = projection.models.budget.horizon;
       const freshPanels = stale ? 0 : projection.freshPanels, stalePanels = stale ? projection.observedPanels : projection.stalePanels;
       const model = road.update(hazards, {now, horizonMinutes: horizon ? (horizon.cycleEnd - now) / 60 : null, horizonLabel: horizon?.label,
-        observed: freshPanels > 0, staleCoverage: stalePanels > 0});
+        observed: freshPanels > 0, staleCoverage: stalePanels > 0, invalidCoverage: projection.invalidPanels > 0});
       const boulders = hazards.filter(hazard => hazard.state === "boulder").length, bumps = hazards.length - boulders;
-      $("road-summary").textContent = hazards.length ? `${boulders} boulders · ${bumps} speed bumps` : model.observed ? "Clear for fresh observed sources" : model.staleCoverage ? "Observations stale" : "No observations yet";
-      $("coverage").textContent = `${freshPanels} of 6 panel sources fresh · ${stalePanels} stale${stale && snapshot ? " · stream stale" : ""}. ${model.horizonLabel}. Account and connection evidence is shared.`;
+      $("road-summary").textContent = hazards.length ? `${boulders} boulders · ${bumps} speed bumps` : model.observed ? "Clear for fresh observed sources" : model.invalidCoverage ? "Observations unavailable" : model.staleCoverage ? "Observations stale" : "No observations yet";
+      const invalidText = projection.invalidPanels ? ` · ${projection.invalidPanels} ${projection.invalidPanels === 1 ? "source" : "sources"} reporting invalid data` : "";
+      $("coverage").textContent = `${freshPanels} of 6 panel sources fresh · ${stalePanels} stale${invalidText}${stale && snapshot ? " · stream stale" : ""}. ${model.horizonLabel}. Account and connection evidence is shared.`;
       let diagnostic = $("adapter-diagnostics");
       if (!diagnostic) {diagnostic = C.element("p", "adapter-diagnostic"); diagnostic.id = "adapter-diagnostics"; $("road-view").append(diagnostic);}
       diagnostic.textContent = [...projection.diagnostics, ...valid.diagnostics].join(" "); diagnostic.hidden = !diagnostic.textContent;
@@ -255,7 +271,14 @@
     const controller = new Connection({fetchSnapshot: signal => fetch("api/snapshot", {credentials: "same-origin", cache: "no-store", signal}),
       openStream: () => new EventSource("events"), onSnapshot: value => {snapshot = value; receivedAt = performance.now(); render();},
       onState: value => {const changed = connection.kind !== value.kind; connection = value; render(); if (changed) $("connection-announcement").textContent = $("connection-label").textContent + ". " + $("connection-note").textContent;}});
-    const timer = setInterval(renderConnection, 1000);
+    const timer = setInterval(() => {
+      const now = epochNow();
+      if (snapshot && Object.values(snapshot.api_budget).some(evidence => {
+        const reset = C.epoch(evidence?.reset);
+        return reset !== null && renderedAt !== null && reset > renderedAt && reset <= now;
+      })) render();
+      else renderConnection();
+    }, 1000);
     const resize = new ResizeObserver(() => {if (snapshot) render();}); resize.observe(road.strip);
     document.fonts.ready.then(() => {if (snapshot) render();});
     window.addEventListener("pagehide", () => {controller.stop(); clearInterval(timer); resize.disconnect();});

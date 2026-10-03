@@ -44,6 +44,23 @@ test("meters keep observed denominator, unknown usage and distinct throttle sign
   assert.equal(C.meterModel({limit: 0, used: 0}).ratio, null);
   assert.equal(C.meterModel({limit: 10, remaining: 11}).ratio, null);
 });
+test("passed primary reset makes current usage unknown but preserves denominator and independent secondary evidence", () => {
+  const evidence = {limit: 5000, remaining: 0, used: 5000, reset: 1010, observed_at: 950, primary_exhausted: true};
+  const before = C.meterModel(evidence, 1000);
+  assert.equal(before.state, "boulder"); assert.equal(before.percent, 100);
+  const after = C.meterModel(evidence, 1010);
+  assert.equal(after.state, "idle"); assert.equal(after.limit, 5000);
+  assert.equal(after.remaining, null); assert.equal(after.used, null); assert.equal(after.percent, null);
+  assert.equal(after.lastKnownRemaining, 0); assert.equal(after.lastKnownUsed, 5000);
+  assert.match(after.reason, /reset/i);
+  assert.equal(accountHazards(snapshot({api_budget: {core: evidence}}), 1010, false).length, 0);
+  const secondary = {...evidence, secondary_limited: true};
+  const retained = C.meterModel(secondary, 1010);
+  assert.equal(retained.state, "boulder"); assert.equal(retained.percent, null); assert.equal(retained.limit, 5000);
+  assert.match(retained.reason, /Secondary/);
+  assert.match(accountHazards(snapshot({api_budget: {core: secondary}}), 1010, false)[0].detail, /last known/i);
+  assert.equal(evidence.remaining, 0); assert.equal(evidence.used, 5000);
+});
 test("hazards reject malformed adapters, keep literal text and restrict navigation", () => {
   const result = C.normalizeHazards([hazard(), hazard("two", {state: "clear"}), hazard("three", {repo: "outsider/repo"}),
     hazard("four", {timing: {kind: "at", at: NaN}}), hazard("five", {href: "javascript:bad"}), hazard("one"),
@@ -135,6 +152,75 @@ test("registry diagnostics refuse wrong-source and malformed output without doma
   assert.equal(registry.project(value, null, 1000).diagnostics.length, 1);
   assert.equal(registry.counts(value, 1000).get(null), null); // CI counts never become PR badges.
   assert.equal(registry.project(value, null, 1000).hazards.length, 0);
+});
+test("refused projection hazards never become fresh clear coverage or fake staleness", () => {
+  const cases = [[{bad: "fields"}], [hazard("wrong", {source: "ci", section: "ci"})], [hazard(), {bad: "fields"}]];
+  for (const hazards of cases) {
+    const registry = new PanelRegistry();
+    registry.register("prs", "fixture", () => ({state: "clear", label: "Fixture", hazards, count: 0}));
+    const value = snapshot({sources: {fixture: {data: {}, observed_at: 950, stale: false}}});
+    const projection = registry.project(value, null, 1000);
+    assert.equal(projection.models.prs.observed, true); assert.equal(projection.models.prs.observed_at, 950);
+    assert.equal(projection.models.prs.stale, false); assert.equal(projection.models.prs.coverageValid, false);
+    assert.equal(projection.freshPanels, 0); assert.equal(projection.stalePanels, 0); assert.equal(projection.invalidPanels, 1);
+    assert.ok(projection.diagnostics.length > 0);
+    assert.equal(projection.hazards.length, hazards.length === 2 ? 1 : 0);
+    const road = C.roadModel(projection.hazards, {now: 1000, observed: projection.freshPanels > 0, invalidCoverage: projection.invalidPanels > 0});
+    assert.equal(road.emptyState, "idle");
+    if (!projection.hazards.length) assert.equal(road.emptyText, "Observations unavailable");
+  }
+});
+test("repository filtering is valid coverage; mixed invalid data and global identities stay explicit", () => {
+  const registry = new PanelRegistry();
+  registry.register("prs", "fixture_prs", envelope => ({state: "clear", label: "Fixture", hazards: envelope.data.hazards, count: 0}));
+  registry.register("ci", "fixture_ci", envelope => ({state: "clear", label: "Fixture", hazards: envelope.data.hazards, count: 0}));
+  const envelope = hazards => ({data: {hazards}, observed_at: 950, stale: false});
+  const value = snapshot({sources: {fixture_prs: envelope([hazard()]), fixture_ci: envelope([{bad: "fields"}])}});
+  const filtered = registry.project(value, "owner/consumer", 1000);
+  assert.equal(filtered.hazards.length, 0); assert.equal(filtered.models.prs.coverageValid, true);
+  assert.equal(filtered.freshPanels, 1); assert.equal(filtered.invalidPanels, 1);
+  assert.equal(C.roadModel([], {now: 1000, observed: true, invalidCoverage: true}).emptyState, "clear");
+  const staleInvalid = registry.project(snapshot({sources: {fixture_ci: {...envelope([{bad: "fields"}]), stale: true}}}), null, 1000);
+  assert.equal(staleInvalid.freshPanels, 0); assert.equal(staleInvalid.stalePanels, 1); assert.equal(staleInvalid.invalidPanels, 1);
+  assert.equal(staleInvalid.models.ci.observed_at, 950); assert.equal(staleInvalid.models.ci.stale, true);
+  assert.equal(C.roadModel([], {now: 1000, observed: false, staleCoverage: true, invalidCoverage: true}).emptyText, "Observations unavailable");
+  const duplicate = registry.project(snapshot({sources: {fixture_prs: envelope([hazard("same")]), fixture_ci: envelope([hazard("same", {source: "ci", section: "ci"})])}}), null, 1000);
+  assert.equal(duplicate.hazards.length, 1); assert.equal(duplicate.freshPanels, 0); assert.equal(duplicate.invalidPanels, 2);
+  assert.equal(duplicate.models.prs.coverageValid, false); assert.equal(duplicate.models.ci.coverageValid, false);
+  assert.ok(duplicate.diagnostics.length > 0);
+});
+test("system hazard identities are reserved before adapter merge even while shared hazards are absent", () => {
+  const registry = new PanelRegistry();
+  registry.register("prs", "fixture", envelope => ({state: "bump", label: "Fixture", hazards: envelope.data.hazards}));
+  const value = snapshot({sources: {fixture: {data: {hazards: [hazard("account-api-core"), hazard("shell-connection"), hazard("usable")]}, observed_at: 950, stale: false}},
+    api_budget: {core: {limit: 5000, remaining: 0, used: 5000, reset: 2000, primary_exhausted: true}}});
+  const projection = registry.project(value, null, 1000);
+  assert.deepEqual(projection.hazards.map(item => item.id), ["usable"]);
+  assert.equal(projection.models.prs.coverageValid, false); assert.equal(projection.models.prs.stale, false);
+  assert.equal(projection.invalidPanels, 1); assert.equal(projection.freshPanels, 0);
+  assert.ok(projection.diagnostics.some(text => /reserved/i.test(text)));
+  const connectionHazard = hazard("shell-connection", {source: "road", section: "road", repo: null, state: "boulder"});
+  const merged = C.normalizeHazards([...projection.hazards, ...accountHazards(value, 1000, false), connectionHazard], repositories.map(item => item.repo));
+  assert.equal(merged.diagnostics.length, 0);
+  assert.deepEqual(merged.hazards.filter(item => item.source === "road").map(item => item.id), ["account-api-core", "shell-connection"]);
+  assert.ok(merged.hazards.filter(item => item.source === "road").every(item => item.state === "boulder"));
+});
+test("bump and boulder projections need usable owned hazards before repository filtering", () => {
+  for (const state of ["bump", "boulder"]) {
+    const registry = new PanelRegistry();
+    registry.register("prs", "fixture", envelope => ({state, label: "Fixture", hazards: envelope.data.hazards}));
+    const value = hazards => snapshot({sources: {fixture: {data: {hazards}, observed_at: 950, stale: false}}});
+    const absent = registry.project(value([]), null, 1000);
+    assert.equal(absent.models.prs.state, state); assert.equal(absent.models.prs.coverageValid, false);
+    assert.equal(absent.models.prs.observed_at, 950); assert.equal(absent.models.prs.stale, false);
+    assert.equal(absent.freshPanels, 0); assert.equal(absent.invalidPanels, 1);
+    const road = C.roadModel(absent.hazards, {now: 1000, observed: absent.freshPanels > 0, invalidCoverage: absent.invalidPanels > 0});
+    assert.equal(road.emptyState, "idle"); assert.equal(road.emptyText, "Observations unavailable");
+    assert.ok(absent.diagnostics.some(text => /hazard/i.test(text)));
+    const filtered = registry.project(value([hazard("other", {state})]), "owner/consumer", 1000);
+    assert.equal(filtered.hazards.length, 0); assert.equal(filtered.models.prs.coverageValid, true);
+    assert.equal(filtered.freshPanels, 1); assert.equal(filtered.invalidPanels, 0);
+  }
 });
 test("observed/unavailable ownership transitions reattach detached placeholder", () => {
   const parent = {children: [], contains(node) {return this.children.includes(node);}, replaceChildren(...nodes) {for (const node of this.children) node.parentNode = null; this.children = nodes; for (const node of nodes) node.parentNode = this;}};

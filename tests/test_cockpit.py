@@ -7,6 +7,7 @@ import hashlib
 import importlib
 import io
 import json
+import math
 import os
 import socket
 import subprocess
@@ -24,7 +25,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from mergepath.cockpit.github import ClientError, GitHubClient, MAX_BODY, ORIGIN, Response, http_transport
+from mergepath.cockpit.github import ClientError, GitHubClient, MAX_BODY, ORIGIN, Response, copy_json_tree, http_transport
 from mergepath.cockpit.inventory import HUB, Repository, load_inventory
 from mergepath.cockpit.scheduler import Sample, Scheduler
 from mergepath.cockpit.server import Application, COOKIE, CSP, CockpitServer
@@ -349,12 +350,36 @@ class ClientTests(unittest.TestCase):
             with self.subTest(kind=type(value).__name__), self.assertRaisesRegex(ClientError, "invalid_query_variables"):
                 self.client(fixture).query("query { viewer { login } }", {"filter": value})
             self.assertEqual(fixture.calls, [])
-        shared = [None, True, 3, 0.25, "text", {"states": []}]
-        variables = {"filter": {"nested": shared, "also": shared}}
+        def values():
+            return [None, True, 3, 0.25, "text", {"states": []}]
+        variables = {"filter": {"nested": values(), "also": values()}}
         fixture = HTTPFixture(reply(data={"data": {"viewer": {"login": "fixture"}}}))
         self.client(fixture).query("query { viewer { login } }", variables)
         self.assertEqual(json.loads(fixture.calls[0][3])["variables"], variables)
         self.assertEqual(len(fixture.calls), 1)
+
+    def test_query_refuses_shared_container_expansion_before_request(self):
+        shared_list, shared_dict = [], {"value": 1}
+        graph = []
+        for _ in range(8):
+            graph = [graph, graph]
+        for value in [[shared_list, shared_list], {"first": shared_dict, "second": shared_dict}, graph]:
+            fixture = HTTPFixture()
+            with self.assertRaisesRegex(ClientError, "invalid_query_variables"):
+                self.client(fixture).query("query { viewer { login } }", {"value": value})
+            self.assertEqual(fixture.calls, [])
+
+    def test_browser_json_preserves_safe_numbers_and_exact_decimal_strings(self):
+        sample = {"counts": [0, -(2 ** 53 - 1), 2 ** 53 - 1],
+                  "opaque_ids": ["9007199254740993", "-9007199254740993"]}
+        encoded = json.dumps(copy_json_tree(sample), allow_nan=False)
+        result = subprocess.run(
+            ["node", "-e", "const fs = require('node:fs'); const value = JSON.parse(fs.readFileSync(0, 'utf8')); "
+             "if (!value.counts.every(Number.isSafeInteger)) process.exit(1); "
+             "process.stdout.write(JSON.stringify(value));"],
+            input=encoded, text=True, capture_output=True, timeout=5, check=True,
+        )
+        self.assertEqual(json.loads(result.stdout), sample)
 
     def test_client_error_only_retains_registered_stable_categories(self):
         private = "upstream body /private/fixture unrelated-credential-do-not-publish"
@@ -370,6 +395,13 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(error.retry_after, 120)
         for category in ["permission_denied", "secondary_limit"]:
             self.assertEqual(ClientError(category).category, category)
+
+    def test_retry_delay_refuses_invalid_values_without_coercion_or_duration_cap(self):
+        for value in [float("inf"), float("-inf"), float("nan"), -1, True, "120", {}, 10 ** 400]:
+            with self.subTest(kind=type(value).__name__):
+                self.assertEqual(ClientError("secondary_limit", value).retry_after, 0)
+        for value in [0, 120, 1.5, 1000000]:
+            self.assertEqual(ClientError("secondary_limit", value).retry_after, value)
 
     def test_deadline_and_fixed_origin_no_ambient_fallback(self):
         fixture = HTTPFixture()
@@ -573,6 +605,59 @@ class SchedulerTests(unittest.TestCase):
     def settle(self, name):
         wait_until(lambda: not self.scheduler.snapshot()[name]["in_flight"])
 
+    def test_worker_bound_is_native_integer_one_or_two(self):
+        for workers in [0, 3, 8, True, 1.0, "2", None]:
+            with self.subTest(workers=workers), self.assertRaisesRegex(ValueError, "invalid_worker_bound"):
+                Scheduler(workers=workers)
+        for workers in [1, 2]:
+            scheduler = Scheduler(workers=workers)
+            scheduler.close()
+
+    def test_mutated_retry_delay_retains_last_good_and_json_publication(self):
+        for index, delay in enumerate([float("inf"), float("nan"), "120", {}, True, 10 ** 400]):
+            error = ClientError("secondary_limit", 120)
+            error.retry_after = delay
+            results = [Sample({"last_good": [1]}), error]
+            def fetch(deadline, results=results):
+                result = results.pop(0)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+            name = f"retry_{index}"
+            self.scheduler.register(name, fetch)
+            self.scheduler.tick(); self.settle(name)
+            first = self.scheduler.snapshot()[name]
+            self.clock.now += 1
+            self.scheduler.refresh(name); self.scheduler.tick(); self.settle(name)
+            current = self.scheduler.snapshot()[name]
+            self.assertEqual(current["data"], first["data"])
+            self.assertEqual(current["observed_at"], first["observed_at"])
+            self.assertEqual(current["error"], "secondary_limit")
+            self.assertTrue(current["stale"])
+            self.assertTrue(math.isfinite(current["retry_at"]))
+            self.assertEqual(current["retry_at"], self.clock.now + 15)
+            json.dumps(self.scheduler.snapshot(), allow_nan=False)
+
+    def test_retry_timestamp_overflow_falls_back_to_ordinary_backoff(self):
+        scheduler = Scheduler(workers=1, clock=lambda: 1e308, monotonic=self.clock)
+        self.addCleanup(scheduler.close)
+        calls = []
+        def fetch(deadline):
+            calls.append(deadline)
+            raise ClientError("secondary_limit", 1e308)
+        scheduler.register("overflow", fetch)
+        scheduler.tick()
+        wait_until(lambda: not scheduler.snapshot()["overflow"]["in_flight"])
+        self.assertTrue(math.isfinite(scheduler.snapshot()["overflow"]["retry_at"]))
+        json.dumps(scheduler.snapshot(), allow_nan=False)
+        self.clock.now += 1
+        scheduler.tick()
+        self.assertEqual(len(calls), 1)
+        self.clock.now += 14
+        scheduler.tick()
+        wait_until(lambda: not scheduler.snapshot()["overflow"]["in_flight"])
+        self.assertEqual(len(calls), 2)
+
     def test_strict_json_tree_rejects_loss_without_replacing_last_good(self):
         cycle = []; cycle.append(cycle)
         invalid = [(1, 2), {"nested": (1, 2)}, {1: "first", "1": "second"}, {"nested": {False: 1}},
@@ -592,16 +677,33 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(current["error"], "source_failed")
 
     def test_native_json_tree_is_copied_without_coercion_or_aliasing(self):
-        shared = [None, True, 3, 0.25, "text", {"nested": []}]
-        data = {"first": shared, "second": shared}
+        def values():
+            return [None, True, 3, 0.25, "text", {"nested": []}]
+        data = {"first": values(), "second": values()}
         self.scheduler.register("native", lambda deadline: Sample(data))
         self.scheduler.tick(); self.settle("native")
         current = self.scheduler.snapshot()["native"]
         self.assertEqual(current["data"], data)
         self.assertFalse(current["stale"])
         self.assertIsNone(current["error"])
-        shared.append("provider mutation")
+        data["first"].append("provider mutation")
         self.assertNotIn("provider mutation", self.scheduler.snapshot()["native"]["data"]["first"])
+
+    def test_shared_container_sample_is_failed_without_expansion_or_lost_age(self):
+        graph = []
+        for _ in range(8):
+            graph = [graph, graph]
+        results = [Sample({"last_good": [1]}), Sample({"graph": graph})]
+        self.scheduler.register("shared", lambda deadline: results.pop(0))
+        self.scheduler.tick(); self.settle("shared")
+        first = self.scheduler.snapshot()["shared"]
+        self.clock.now += 1
+        self.scheduler.refresh("shared"); self.scheduler.tick(); self.settle("shared")
+        current = self.scheduler.snapshot()["shared"]
+        self.assertEqual(current["error"], "source_failed")
+        self.assertEqual(current["data"], first["data"])
+        self.assertEqual(current["observed_at"], first["observed_at"])
+        self.assertTrue(current["stale"])
 
     def test_hot_idle_and_stale_last_good(self):
         results = [Sample({"value": 1}, True), ClientError("permission_denied"), Sample({"value": 2})]
@@ -908,6 +1010,34 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.request(path="/assets/fixture.js")[0], 200)
         (self.root / "index.html").unlink()
         self.assertEqual(json.loads(self.request(path="/")[2]), {"error": "visual_shell_unavailable"})
+
+    def test_invalid_retry_never_breaks_authenticated_snapshot_or_sse(self):
+        self.bootstrap()
+        error = ClientError("secondary_limit", 120)
+        error.retry_after = float("inf")
+        def failed(deadline):
+            raise error
+        self.app.scheduler.register("bad_retry", failed)
+        self.app.scheduler.register("healthy", lambda deadline: Sample({"visible": True}))
+        self.app.scheduler.tick()
+        wait_until(lambda: all(envelope["attempted_at"] is not None and not envelope["in_flight"]
+                               for envelope in self.app.scheduler.snapshot().values()))
+        status, _, body = self.request()
+        self.assertEqual(status, 200)
+        sources = json.loads(body)["sources"]
+        self.assertEqual(sources["healthy"]["data"], {"visible": True})
+        self.assertEqual(sources["bad_retry"]["error"], "secondary_limit")
+        self.assertTrue(math.isfinite(sources["bad_retry"]["retry_at"]))
+        response = self.request(path="/events", stream=True)
+        self.assertEqual(response.status, 200)
+        for _ in range(6):
+            line = response.readline().decode()
+            if line.startswith("data: "):
+                self.assertEqual(json.loads(line[6:])["sources"], sources)
+                break
+        else:
+            self.fail("SSE initial snapshot unavailable")
+        response.close()
 
     def test_snapshot_filter_and_credentials_redaction(self):
         self.bootstrap()

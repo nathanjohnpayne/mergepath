@@ -32,8 +32,18 @@ def error_category(value):
     return value if type(value) is str and value in ERROR_CATEGORIES else "source_failed"
 
 
-def copy_json_tree(value, active=None):
-    """Copy native JSON trees without coercing types or mapping keys."""
+def retry_delay(value):
+    """Keep finite native delays; invalid values use ordinary caller backoff."""
+    if type(value) not in (int, float):
+        return 0
+    try:
+        return value if math.isfinite(value) and value >= 0 else 0
+    except OverflowError:
+        return 0
+
+
+def copy_json_tree(value, seen=None):
+    """Copy native JSON trees; refuse cycles and shared container aliases."""
     kind = type(value)
     if value is None or kind in (str, bool, int):
         return value
@@ -41,19 +51,16 @@ def copy_json_tree(value, active=None):
         return value
     if kind not in (dict, list):
         raise ValueError("invalid_json_tree")
-    active = set() if active is None else active
+    seen = set() if seen is None else seen
     identity = id(value)
-    if identity in active:
+    if identity in seen:
         raise ValueError("invalid_json_tree")
-    active.add(identity)
-    try:
-        if kind is list:
-            return [copy_json_tree(item, active) for item in value]
-        if any(type(key) is not str for key in value):
-            raise ValueError("invalid_json_tree")
-        return {key: copy_json_tree(item, active) for key, item in value.items()}
-    finally:
-        active.remove(identity)
+    seen.add(identity)
+    if kind is list:
+        return [copy_json_tree(item, seen) for item in value]
+    if any(type(key) is not str for key in value):
+        raise ValueError("invalid_json_tree")
+    return {key: copy_json_tree(item, seen) for key, item in value.items()}
 
 
 class ClientError(Exception):
@@ -63,7 +70,7 @@ class ClientError(Exception):
         category = error_category(category)
         super().__init__(category)
         self.category = category
-        self.retry_after = max(0, retry_after)
+        self.retry_after = retry_delay(retry_after)
         self.response = response
 
 
