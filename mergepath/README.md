@@ -1,6 +1,10 @@
 # Mergepath — surfaces
 
-This directory holds Mergepath's static, single-file surfaces. Currently only the **Playground** lives here; Cockpit, Tiebreaker, and Checks are reserved names for future surfaces — see [`BRAND.md`](../BRAND.md) at repo root. Nothing here is wired to a backend or a build system. Open the HTML in a browser and it works.
+This directory holds Mergepath's surfaces. The **Playground** is a current static UI. **Cockpit** has an authenticated local server and shared shell; panel sources remain in development. Tiebreaker and Checks remain reserved names — see [`BRAND.md`](../BRAND.md) at repo root.
+
+## Mergepath Cockpit
+
+`../scripts/cockpit.sh` starts the authenticated loopback server using an already-warm reviewer credential cache. It uses Python standard library and the hub's existing installed mikefarah/yq; it does not install dependencies or read 1Password. The browser opens through a one-use fragment bootstrap; the printed URL contains no secret. The shell includes connection health, per-resource API evidence, repository filtering, Road components, both themes and live reduced-motion preferences. Open PRs, CI runs, live agents, agent history, fleet sync and Actions budgets show unavailable until their owning providers are connected. There are no fixture records or sync actions in the product. The contract is in [`specs/cockpit_foundation.md`](../specs/cockpit_foundation.md). Run `../tests/test_cockpit.sh` from this directory, or `tests/test_cockpit.sh` from the repository root, for hermetic Python and Node validation.
 
 ## Mergepath Playground
 

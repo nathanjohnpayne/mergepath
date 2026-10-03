@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Hermetic foundation suite: expected <15s; hard process bound 60s.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
+import subprocess
+import sys
+for command in ([sys.executable, '-B', 'tests/test_cockpit.py'], ['node', '--test', 'tests/test_cockpit_ui.cjs']):
+    result = subprocess.run(command, timeout=60)
+    if result.returncode:
+        raise SystemExit(result.returncode)
+PY

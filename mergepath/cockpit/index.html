@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Mergepath Cockpit</title>
+  <link rel="stylesheet" href="assets/fonts/local-fonts.css">
+  <link rel="stylesheet" href="assets/cockpit.css">
+  <script src="assets/components.js" defer></script>
+  <script src="assets/app.js" defer></script>
+</head>
+<body class="ck">
+  <a class="skip" href="#road">Skip to Road ahead</a>
+  <main class="wrap">
+    <header class="top">
+      <div>
+        <p class="eyebrow">Mergepath Cockpit</p>
+        <h1>Everything you are waiting on, in one place.</h1>
+        <p class="lede">Open PRs across the fleet, CI runs, Phase 4b agents, fleet sync and the Actions budget. Panel sources are not connected yet.</p>
+      </div>
+      <div class="top-r">
+        <div id="connection" class="chip conn">
+          <span class="dot" aria-hidden="true"></span>
+          <span><span class="lbl" id="connection-label">Connecting</span><span class="sub" id="connection-note">Local stream · awaiting observation</span></span>
+        </div>
+        <div class="chip api-chip">
+          <label class="lbl" for="api-pool">API · shared reviewer PAT</label>
+          <select id="api-pool" aria-label="API resource pool"><option value="core">core</option></select>
+          <div id="api-meter"></div>
+          <span id="api-note" class="sub">No response-header evidence yet</span>
+        </div>
+        <div class="chip"><span class="lbl">Updated</span><strong class="mono" id="updated-age">Not yet</strong><span class="sub">Latest data snapshot</span></div>
+      </div>
+    </header>
+    <div class="toolbar" aria-label="Display preferences">
+      <span class="sub">Local session · read-only observations</span>
+      <div class="controls">
+        <button class="btn" id="theme" type="button" aria-pressed="false">Dark theme</button>
+        <button class="btn" id="motion" type="button" aria-pressed="false">Reduce motion</button>
+      </div>
+    </div>
+    <section class="panel road" aria-labelledby="road">
+      <div class="sec-head"><h2 id="road" tabindex="-1">Road ahead</h2><span class="sec-meta" id="road-summary">No observations yet</span></div>
+      <p class="sub" id="coverage">Panel observations unavailable</p>
+      <div id="road-view"></div>
+    </section>
+    <section class="panel repository-panel" aria-labelledby="repositories-heading">
+      <div class="sec-head"><h2 id="repositories-heading">Repositories</h2><span class="sec-meta" id="repository-note">Enrolled inventory · loading</span></div>
+      <div class="filters" id="repository-filters" role="group" aria-label="Filter all sections by repository"></div>
+      <p class="sub">Account API pools and connection health apply to every repository.</p>
+    </section>
+    <section class="panel" aria-labelledby="prs"><div class="sec-head"><h2 id="prs" tabindex="-1">Open PRs</h2><span class="sec-meta">Review observations</span></div><div id="prs-content" class="panel-content"></div></section>
+    <div class="row2">
+      <section class="panel grow" aria-labelledby="ci"><div class="sec-head"><h2 id="ci" tabindex="-1">CI runs</h2><span class="sec-meta">Workflow observations</span></div><div id="ci-content" class="panel-content"></div></section>
+      <section class="panel side" aria-labelledby="agents"><div class="sec-head"><h2 id="agents" tabindex="-1">Phase 4b agents</h2><span class="sec-meta">Live agents</span></div><div id="agents-content" class="panel-content"></div></section>
+    </div>
+    <section class="panel" aria-labelledby="history"><div class="sec-head"><h2 id="history" tabindex="-1">Agent history</h2><span class="sec-meta">Recent completed runs</span></div><div id="history-content" class="panel-content"></div></section>
+    <section class="panel" aria-labelledby="fleet"><div class="sec-head"><h2 id="fleet" tabindex="-1">Fleet sync</h2><span class="sec-meta">Propagation observations</span></div><div id="fleet-content" class="panel-content"></div></section>
+    <section class="panel" aria-labelledby="budget"><div class="sec-head"><h2 id="budget" tabindex="-1">Actions budget</h2><span class="sec-meta">Billing · tokens · queue</span></div><div id="budget-content" class="panel-content"></div></section>
+    <footer class="foot">Mergepath Cockpit · authenticated localhost session</footer>
+    <p class="sr-only" id="connection-announcement" role="status" aria-live="polite"></p>
+    <noscript><p class="panel">JavaScript is required for local stream observations. No data has been loaded.</p></noscript>
+  </main>
+</body>
+</html>
