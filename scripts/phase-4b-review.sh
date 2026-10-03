@@ -545,25 +545,50 @@ refuse_approval_if_feedback_unaccounted() {
   if [ "$acct_rc" -eq 1 ]; then p4b_die 7 "$acct_reason"; else p4b_die 3 "$acct_reason"; fi
 }
 
-# Append the reviewed request generation to the approval body (#1598). A run
-# with a request-budget snapshot records the snapshot's generation, which the
-# authority fence just proved is still live; a run without one (the Phase 4a
-# timeout route) reads it now. An unreadable generation refuses the approval:
-# without the record the gate could not tell which requests it covers.
-record_reviewed_request_generation() {
-  local reviewed_gen="" reason payload
-  reviewed_gen="$(printf '%s' "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" \
-    | jq -ce '.request_generation | select(type == "array")' 2>/dev/null)" || reviewed_gen=""
-  [ -n "$reviewed_gen" ] || reviewed_gen="$(p4b_live_request_generation "$REPO" "$PR")" || reviewed_gen=""
-  if [ -n "$reviewed_gen" ] \
-     && printf '\n<!-- mergepath-p4b-request-generation: %s -->\n' "$reviewed_gen" >>"$BODY_FILE"; then
+# The Codex request generation this run is authorized under (#1598). A run
+# whose barrier carries a request-budget snapshot uses the snapshot's
+# generation, which the authority fences keep verifying. A run without one
+# (the Phase 4a timeout route, or a Codex-cleared head) captures the live
+# generation right after the barrier authorizes it, before the adapter runs, so
+# a request that arrives later is never mistaken for one the run covered. This
+# precedes every side effect, so an unreadable generation just stops (exit 10).
+capture_authorized_request_generation() {
+  local payload
+  P4B_AUTHORIZED_REQUEST_GENERATION="$(printf '%s' "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" \
+    | jq -ce '.request_generation | select(type == "array")' 2>/dev/null)" && return 0
+  P4B_AUTHORIZED_REQUEST_GENERATION="$(p4b_live_request_generation "$REPO" "$PR")" && return 0
+  P4B_AUTHORIZED_REQUEST_GENERATION=""
+  payload="$(jq -nc '{decision:"error",reason:"Codex request generation could not be read when the run was authorized",coderabbit:"unchanged",codex:"escalate",codex_evidence:"request-generation-unreadable",request_budget:null}')"
+  stop_for_barrier_error "$payload"
+}
+
+# Verify, at the writer boundary, the request generation the approval body
+# records (#1598). A snapshot route's generation was just re-proved by the
+# authority fence. A route without a snapshot re-reads the live generation and
+# refuses the approval if it moved since authorization: a request that arrived
+# after the barrier (the Phase 4a timeout route included) was never reviewed
+# and must not be recorded as covered. Runs BEFORE the final accounting read,
+# which stays the last read before the POST.
+refuse_approval_if_request_generation_moved() {
+  local live_gen="" reason evidence payload
+  if [ -z "$P4B_AUTHORIZED_REQUEST_GENERATION" ]; then
+    evidence=request-generation-unrecorded
+    reason="the approval carries no authorized Codex request generation; refusing the approval"
+  elif printf '%s' "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" | jq -e '.request_generation | type == "array"' >/dev/null 2>&1; then
+    return 0
+  elif ! live_gen="$(p4b_live_request_generation "$REPO" "$PR")"; then
+    evidence=request-generation-unrecorded
+    reason="Codex request generation could not be re-read before the approval; refusing the approval"
+  elif [ "$live_gen" != "$P4B_AUTHORIZED_REQUEST_GENERATION" ]; then
+    evidence=request-generation-changed
+    reason="Codex request generation changed since the run was authorized; refusing the approval"
+  else
     return 0
   fi
-  reason="Codex request generation could not be recorded in the approval; refusing the approval"
   cleanup_pre_post_refusal_side_effects "$reason" true \
     "Codex request authority" "the Codex request generation for ${REPO}#${PR}"
-  payload="$(jq -nc --arg r "$reason" \
-    '{decision:"error",reason:$r,coderabbit:"unchanged",codex:"escalate",codex_evidence:"request-generation-unrecorded",request_budget:null}')"
+  payload="$(jq -nc --arg r "$reason" --arg ce "$evidence" \
+    '{decision:"error",reason:$r,coderabbit:"unchanged",codex:"escalate",codex_evidence:$ce,request_budget:null}')"
   stop_for_barrier_error "$payload"
 }
 
@@ -706,6 +731,7 @@ BARRIER_CODERABBIT_CARRIED=""
 # manual handoff; only the non-terminal case takes the new hold path.
 P4B_PRE_ADAPTER_CODEX_EVIDENCE=""
 P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON="null"
+P4B_AUTHORIZED_REQUEST_GENERATION=""
 P4B_PRE_ADAPTER_REQUEST_GENERATION=""
 run_same_head_barrier() {
   local where="$1" scope="${2:-all}" out rc=0
@@ -1101,6 +1127,7 @@ if [ "$DRY_RUN" = true ]; then
   p4b_warn "dry-run: skipping the same-head barrier — it guards the review POST, and a dry-run posts nothing (offline dry-runs stay offline)"
 else
   run_same_head_barrier "pre-adapter"
+  capture_authorized_request_generation
 fi
 
 # #1583: the barrier's spent-ceiling decision can predate the CodeRabbit probe.
@@ -1472,6 +1499,12 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
       fi
     fi
   fi
+  # #1598: an approval records the Codex request generation it was authorized
+  # under, so the substitute merge gate can hold it once a request outside
+  # that generation exists. Written here, before accounting sizes the body.
+  if [ "$VERDICT" = "APPROVED" ] && [ -n "$P4B_AUTHORIZED_REQUEST_GENERATION" ]; then
+    printf '\n<!-- mergepath-p4b-request-generation: %s -->\n' "$P4B_AUTHORIZED_REQUEST_GENERATION"
+  fi
   printf '\n\n_Posted by scripts/phase-4b-review.sh under the reviewer identity. See plans/automated-phase-4b-handoff.md._\n'
 } > "$BODY_FILE"
 
@@ -1717,12 +1750,12 @@ post_review() {
   # This is a bounded consumer fence, not an atomic GitHub read/write protocol;
   # a residual network interval remains between this observation and the POST.
   revalidate_codex_request_budget_authority pre-post
-  # #1598: record in the approval the Codex request generation it was
-  # authorized under, so the substitute merge gate can refuse it once a request
-  # outside that generation exists, including one that lands during the final
-  # accounting read below and so predates the approval. Recorded here, BEFORE
-  # that read, which stays the last one before the POST.
-  [ "$event" != "APPROVE" ] || record_reviewed_request_generation
+  # #1598: the approval body records the Codex request generation it was
+  # authorized under; verify it has not moved. A request that lands during the
+  # final accounting read below predates the approval but is outside the
+  # record, so the substitute merge gate holds the approval until Codex
+  # answers it. Verified here, BEFORE that read, which stays the last one.
+  [ "$event" != "APPROVE" ] || refuse_approval_if_request_generation_moved
   # That revalidation rebuilds the Codex ledger, a slow read, so a finding can
   # land during it. Account once more after it so the window left for a late
   # finding is only the POST itself (#1584 Phase 4b P1). A request that lands
