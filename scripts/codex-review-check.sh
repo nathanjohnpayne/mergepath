@@ -2894,6 +2894,34 @@ case "$LATEST_SIGNAL_KIND" in
     ;;
 esac
 
+# #1598 (Codex round 6 on #1599): a Codex clearance answers only the
+# requests made before it. When the configured author has an exact Codex
+# request in or after the clearance signal's second, Codex has not answered
+# it and the earlier clearance is superseded: gate (c) falls through to the
+# Phase 4b substitute, whose recorded request generation must then cover the
+# request. Otherwise an earlier clean signal plus a stale Phase 4b approval
+# would clear a request that landed during the run's final accounting read.
+# Codex answering the newer request is a newer signal and clears again. The
+# comments are re-read now, and unreadable evidence fails closed. Diagnostic
+# mode asks only whether Codex has spoken on HEAD, so it is unaffected.
+if [ "$CLEARED" = "true" ] && [ "$DIAGNOSTIC_SIGNAL_ONLY" != "1" ]; then
+  CODEX_CLEARANCE_SUPERSEDED=""
+  if ! declare -F crqe_latest_trigger_time >/dev/null 2>&1; then
+    CODEX_CLEARANCE_SUPERSEDED="request evidence helper unavailable"
+  elif ! CLEARANCE_REQUEST_COMMENTS=$(gh_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments (Codex clearance request freshness)" 2>/dev/null); then
+    CODEX_CLEARANCE_SUPERSEDED="Codex request evidence could not be re-read"
+  elif ! CLEARANCE_LATEST_REQUEST=$(crqe_latest_trigger_time "$CLEARANCE_REQUEST_COMMENTS" "$AUTHOR_IDENTITY" 2>/dev/null); then
+    CODEX_CLEARANCE_SUPERSEDED="Codex request evidence unreadable"
+  elif [ -n "$CLEARANCE_LATEST_REQUEST" ] && ! [[ "$LATEST_SIGNAL_TIME" > "$CLEARANCE_LATEST_REQUEST" ]]; then
+    CODEX_CLEARANCE_SUPERSEDED="a Codex request by $AUTHOR_IDENTITY @ $CLEARANCE_LATEST_REQUEST is not older than it"
+  fi
+  if [ -n "$CODEX_CLEARANCE_SUPERSEDED" ]; then
+    log "gate (c): Codex clearance @ $LATEST_SIGNAL_TIME is superseded: $CODEX_CLEARANCE_SUPERSEDED (#1598)"
+    CLEARED=false
+    CLEARANCE_REASON=""
+  fi
+fi
+
 else
   log "gate (c): codex.enabled=false — ignoring Codex bot review/reaction signals; requiring Phase 4b substitute clearance when allowed"
 fi
