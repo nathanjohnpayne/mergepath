@@ -133,6 +133,9 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   '.mergepath-sync.yml'
   'scripts/sync-to-downstream.sh'
   'tests/test_sync_to_downstream.sh'
+  'scripts/lib/sync-audit-json.sh'
+  'tests/test_sync_audit_json.sh'
+  'specs/sync_audit_json.md'
   '.github/workflows/weekly-drift-audit.yml'
   # Project-doc-sync surface. The docs/manifest landed in #509:
   # .mergepath-project-docs.yml carries a `path_hint: .` that would resolve a

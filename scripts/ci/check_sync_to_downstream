@@ -29,6 +29,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_SCRIPT="$REPO_ROOT/tests/test_sync_to_downstream.sh"
 PROJECT_DOC_TEST_SCRIPT="$REPO_ROOT/tests/test_project_doc_sync.sh"
+AUDIT_JSON_TEST_SCRIPT="$REPO_ROOT/tests/test_sync_audit_json.sh"
 
 if [ ! -f "$TEST_SCRIPT" ]; then
   # Distinguish a canonical mergepath checkout from a consumer one by the
@@ -49,6 +50,17 @@ if [ ! -f "$TEST_SCRIPT" ]; then
 fi
 
 bash "$TEST_SCRIPT"
+
+# Require both hub markers before adding the JSON-only dependency. An old
+# engine/test without the manifest keeps its legacy wrapper behavior; the
+# separate check_sync_manifest still rejects a missing manifest on the hub.
+if [ -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ] && [ -f "$REPO_ROOT/.mergepath-sync.yml" ]; then
+  if [ ! -f "$AUDIT_JSON_TEST_SCRIPT" ]; then
+    echo "check_sync_to_downstream: ERROR (missing $AUDIT_JSON_TEST_SCRIPT)" >&2
+    exit 1
+  fi
+  bash "$AUDIT_JSON_TEST_SCRIPT"
+fi
 
 if [ -f "$PROJECT_DOC_TEST_SCRIPT" ]; then
   bash "$PROJECT_DOC_TEST_SCRIPT"
