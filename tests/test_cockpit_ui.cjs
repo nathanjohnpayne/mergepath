@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
 const C = require("../mergepath/cockpit/assets/components.js");
-const {Connection, PanelRegistry, validSnapshot, liveClockNeedsRender, accountHazards, renderPanelContent, createFleetRefresh} = require("../mergepath/cockpit/assets/app.js");
+const {authorAccount, renderAuthorBudget, Connection, PanelRegistry, validSnapshot, liveClockNeedsRender, accountHazards, renderPanelContent, createFleetRefresh} = require("../mergepath/cockpit/assets/app.js");
 const repositories = [{name: "mergepath", repo: "owner/mergepath", hub: true}, {name: "consumer", repo: "owner/consumer", hub: false}];
 const snapshot = (overrides = {}) => ({schema: "cockpit/v1", revision: 1, generated_at: 1000, repositories, api_budget: {}, sources: {}, ...overrides});
 const hazard = (id = "one", overrides = {}) => ({id, source: "prs", section: "prs", repo: "owner/mergepath", state: "bump", title: "Review delayed", detail: "Waiting for an observed review.", timing: {kind: "now"}, observed_at: 950, stale: false, ...overrides});
@@ -472,4 +472,90 @@ test("live clocks advance between source events and empty coverage expires witho
   observed.sources.live_agents.observed_at = null;
   assert.equal(liveClockNeedsRender(observed, 1010, 1011), false);
   assert.equal(liveClockNeedsRender(null, null, 1011), false);
+});
+
+const authorSnapshot = (data = {}, envelope = {}) => snapshot({
+  api_budget: {core: {configured_identity: "nathanpayne-codex", limit: 5000, remaining: 4726, used: 274, reset: 2000, observed_at: 950}},
+  sources: {api_author: {observed_at: 950, stale: false, data: {schema: "author-api-budget/v1", configured_identity: "nathanjohnpayne", verified_identity: "nathanjohnpayne", identity_evidence: "viewer_verified", budgets: {graphql: {limit: 5000, remaining: 281, used: 4719, reset: 2000, observed_at: 950}}, error: null, stale: false, retry_at: 1060, ...data}, ...envelope}}
+});
+test("author allowance is separate from reviewer evidence and both produce independently owned hazards", () => {
+  const value = authorSnapshot(), original = structuredClone(value);
+  assert.equal(authorAccount(value).evidence.remaining, 281);
+  const hazards = accountHazards(value, 1000, false);
+  assert.equal(hazards.length, 1); assert.equal(hazards[0].id, "account-api-author-graphql");
+  assert.match(hazards[0].title, /nathanjohnpayne.*author PAT/);
+  assert.match(hazards[0].detail, /281 points left of 5000/);
+  value.api_budget.core = {...value.api_budget.core, remaining: 0, used: 5000, primary_exhausted: true};
+  const both = accountHazards(value, 1000, false);
+  assert.deepEqual(both.map(x => x.id), ["account-api-core", "account-api-author-graphql"]);
+  assert.equal(both[1].state, "bump"); assert.equal(both[0].state, "boulder");
+  assert.deepEqual(authorAccount(value), authorAccount(original));
+});
+test("author display labels failed refresh as last-known, preserves genuine exhaustion and invalidates expired use", () => {
+  const updates = [], meter = {update: (evidence, options) => updates.push({evidence, options})}, note = {};
+  let value = authorSnapshot(); renderAuthorBudget(meter, note, value, 1000);
+  assert.equal(updates.at(-1).evidence.remaining, 281); assert.equal(updates.at(-1).options.unit, "points");
+  assert.match(note.textContent, /Viewer verified.*Author allowance/);
+  value = authorSnapshot({error: "cached_author_required", stale: true, identity_evidence: "last_viewer_verified"});
+  renderAuthorBudget(meter, note, value, 1000);
+  assert.equal(updates.at(-1).evidence.remaining, null); assert.equal(updates.at(-1).evidence.used, null);
+  assert.match(note.textContent, /Author budget unavailable.*last known 281 left.*retry/);
+  assert.doesNotMatch(note.textContent, /cached_author_required/);
+  assert.equal(value.api_budget.core.remaining, 4726);
+  const exhausted = {limit: 5000, remaining: 0, used: 5000, reset: 2000, observed_at: 999, primary_exhausted: true};
+  value = authorSnapshot({budgets: {graphql: exhausted}, error: "primary_exhausted", stale: true});
+  renderAuthorBudget(meter, note, value, 1000);
+  assert.equal(updates.at(-1).evidence.remaining, 0);
+  assert.equal(C.meterModel(updates.at(-1).evidence, 1000).state, "boulder");
+  renderAuthorBudget(meter, note, value, 2001);
+  assert.equal(C.meterModel(updates.at(-1).evidence, 2001).remaining, null);
+  assert.equal(C.meterModel(updates.at(-1).evidence, 2001).lastKnownRemaining, 0);
+  assert.equal(C.meterModel(updates.at(-1).evidence, 2001).lastKnownUsed, 5000);
+  assert.deepEqual(accountHazards(value, 2001, false), []);
+  assert.match(note.textContent, /reset passed; awaiting observation/);
+});
+test("missing or mismatched author source stays unknown, independent stale envelope is visible", () => {
+  const meter = {update: (evidence, options) => {meter.model = C.meterModel(evidence, options.now);}}, note = {};
+  for (const value of [snapshot(), authorSnapshot({configured_identity: "other"}), authorSnapshot({budgets: {}, error: "author_identity_mismatch", verified_identity: null})]) {
+    renderAuthorBudget(meter, note, value, 1000); assert.equal(meter.model.remaining, null);
+    assert.match(note.textContent, /Author budget unavailable/);
+  }
+  renderAuthorBudget(meter, note, authorSnapshot({}, {stale: true}), 1000);
+  assert.equal(meter.model.remaining, null); assert.match(note.textContent, /last known/);
+});
+
+test("scheduler retry supersedes cached author retry without borrowing reviewer state", () => {
+  const value = authorSnapshot({retry_at: 1010}, {stale: true, error: "deadline_exceeded", retry_at: 1120});
+  assert.equal(authorAccount(value).retry, 1120);
+  const note = {}; renderAuthorBudget({update() {}}, note, value, 1000);
+  assert.match(note.textContent, /retry in 2 min/);
+  assert.equal(value.api_budget.core.remaining, 4726);
+});
+test("two real meter DOMs show author first and remain independent across exhaustion and reset", () => {
+  const saved = global.document;
+  class Node {
+    constructor() {this.children = []; this.style = {}; this.attrs = {}; this.classList = {contains: () => true, add() {}, remove() {}};}
+    append(...nodes) {this.children.push(...nodes); for (const node of nodes) node.parent = this;}
+    setAttribute(key, value) {this.attrs[key] = value;}
+    removeAttribute(key) {delete this.attrs[key];}
+    addEventListener() {}
+    replaceWith(node) {const index = this.parent.children.indexOf(this); this.parent.children[index] = node; node.parent = this.parent;}
+  }
+  global.document = {createElement: () => new Node(), body: new Node()};
+  try {
+    const parent = new Node(), authorParent = new Node(), reviewerParent = new Node(); parent.append(authorParent, reviewerParent);
+    const authorMeter = new C.MeterView(authorParent), reviewerMeter = new C.MeterView(reviewerParent), note = {};
+    const value = authorSnapshot(); renderAuthorBudget(authorMeter, note, value, 1000); reviewerMeter.update(value.api_budget.core, {now: 1000});
+    assert.deepEqual(parent.children, [authorParent, reviewerParent]);
+    assert.equal(authorMeter.value.textContent, "281 left"); assert.equal(reviewerMeter.value.textContent, "4,726 left");
+    value.sources.api_author.data.budgets.graphql = {limit: 5000, remaining: 0, used: 5000, reset: 1010, observed_at: 1000, primary_exhausted: true};
+    value.sources.api_author.data.error = "primary_exhausted"; value.sources.api_author.data.stale = true;
+    renderAuthorBudget(authorMeter, note, value, 1001);
+    assert.equal(authorMeter.value.textContent, "0 left"); assert.equal(authorMeter.track.attrs["aria-valuenow"], "100");
+    assert.equal(reviewerMeter.value.textContent, "4,726 left");
+    renderAuthorBudget(authorMeter, note, value, 1011);
+    assert.equal(authorMeter.value.textContent, "Remaining unknown");
+    assert.match(authorMeter.reason.textContent, /last known 0 left \/ 5,000 used/);
+    assert.equal(authorMeter.track.attrs["aria-valuenow"], undefined);
+  } finally {global.document = saved;}
 });

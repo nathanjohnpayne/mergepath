@@ -17,6 +17,7 @@ if not __package__:
     # The launcher uses -I to ignore ambient Python paths and user site code.
     sys.path.insert(0, str(ROOT))
 
+from mergepath.cockpit.author_budget import AuthorBudgetProvider
 from mergepath.cockpit.actions import ActionsProvider, ci_observation
 from mergepath.cockpit.agents import AgentsProvider, resolve_history_settings
 from mergepath.cockpit.github import ClientError, GitHubClient
@@ -109,7 +110,7 @@ def shared_ci_snapshot(app, repo, _fetch_now):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Local Mergepath Cockpit")
     parser.add_argument("--agent", choices=("codex", "claude", "cursor"), default="codex",
-                        help="agent whose existing credential cache is used for confirmed sync")
+                        help="agent whose existing credential cache is used for author telemetry and confirmed sync")
     parser.add_argument("--port", type=int, default=0, help="loopback port; 0 chooses an available port")
     parser.add_argument("--actions-settings", help="local JSON containing explicit budget, cycle and measured coefficients")
     parser.add_argument("--agents-settings", help="local JSON containing explicit checkout roots and optional price keys")
@@ -124,7 +125,7 @@ def main(argv=None):
         # Resolve the canonical cache once before worker HOME/XDG isolation.
         cache_dir = Path(os.environ.get("OP_PREFLIGHT_CACHE_DIR") or
                          str(Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "mergepath")).resolve()
-        # Only the confirmed worker may reacquire author credentials through
+        # Only isolated workers may reacquire author credentials through
         # the canonical cache-check wrapper; the server keeps reviewer reads.
         for name in ("OP_PREFLIGHT_REVIEWER_PAT", "OP_PREFLIGHT_AUTHOR_PAT", "GH_TOKEN",
                      "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
@@ -133,6 +134,8 @@ def main(argv=None):
         checkouts, price_keys = resolve_history_settings(agents_settings, inventory, ROOT)
         reviewers = load_reviewers(ROOT)
         app = Application(inventory, github, logger=lambda message: print(message, file=sys.stderr))
+        app.api_author = AuthorBudgetProvider(ROOT, cache_dir, args.agent)
+        app.scheduler.register("api_author", app.api_author.fetch, hot_interval=60, idle_interval=60, timeout=20)
         ci_provider = CIProvider(github, inventory)
         app.scheduler.register("ci", ci_provider, hot_interval=20, idle_interval=120, timeout=60)
         app.register_panel("ci", "ci")

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Hermetic foundation suite: expected <15s; hard process bound 60s.
+# Hermetic combined Cockpit suite: expected ~60s; each test process bounded60s.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -8,7 +8,7 @@ import subprocess
 import os
 import sys
 os.environ["COCKPIT_SHARED_APP"] = os.path.abspath("mergepath/cockpit/assets/app.js")
-for command in ([sys.executable, '-B', 'tests/test_cockpit.py'], ['node', '--test', 'tests/test_cockpit_ui.cjs'],
+for command in ([sys.executable, '-B', 'tests/test_cockpit.py'], [sys.executable, '-B', 'tests/test_cockpit_author_budget.py'], ['node', '--test', 'tests/test_cockpit_ui.cjs'],
                 [sys.executable, '-B', 'tests/test_cockpit_ci.py'],
                 ['node', '--test', 'tests/test_cockpit_ci_ui.cjs'],
                 [sys.executable, '-B', 'tests/test_cockpit_logs.py'],

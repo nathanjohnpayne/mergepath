@@ -41,10 +41,16 @@
           <span><span class="lbl" id="connection-label">Connecting</span><span class="sub" id="connection-note">Local stream · awaiting observation</span></span>
         </div>
         <div class="chip api-chip">
-          <label class="lbl" for="api-pool">API · shared reviewer PAT</label>
-          <select id="api-pool" aria-label="API resource pool"><option value="core">core</option></select>
+          <span class="lbl">API · author PAT · GraphQL</span>
+          <strong class="mono api-identity">nathanjohnpayne</strong>
           <div id="api-meter"></div>
-          <span id="api-note" class="sub">No response-header evidence yet</span>
+          <span id="api-note" class="sub">Author budget unavailable</span>
+          <div class="api-reviewer">
+            <label class="lbl" for="api-pool">API · active reviewer PAT</label>
+            <select id="api-pool" aria-label="Reviewer API resource pool"><option value="core">core</option></select>
+            <div id="reviewer-api-meter"></div>
+            <span id="reviewer-api-note" class="sub">No response-header evidence yet</span>
+          </div>
         </div>
         <div class="chip"><span class="lbl">Updated</span><strong class="mono" id="updated-age">Not yet</strong><span class="sub">Latest data snapshot</span></div>
       </div>

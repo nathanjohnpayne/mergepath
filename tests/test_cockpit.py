@@ -25,6 +25,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from mergepath.cockpit.author_budget import empty_sample as empty_author_sample
 from mergepath.cockpit.github import ClientError, GitHubClient, MAX_BODY, ORIGIN, Response, copy_json_tree, http_transport
 from mergepath.cockpit.inventory import HUB, Repository, load_inventory
 from mergepath.cockpit.scheduler import Sample, Scheduler
@@ -32,6 +33,10 @@ from mergepath.cockpit.server import Application, COOKIE, CSP, CockpitServer
 
 
 TOKEN = "fixture-reviewer-credential"
+
+
+def author_fixture():
+    return SimpleNamespace(fetch=lambda deadline: Sample(empty_author_sample("cached_author_required")), close=lambda: None)
 
 
 class Clock:
@@ -1529,7 +1534,8 @@ class InventoryAndLauncherTests(unittest.TestCase):
                         connection.request("GET", scope + "/api/snapshot", headers=headers)
                         response = connection.getresponse(); self.assertEqual(response.status, 200)
                         snapshot = json.loads(response.read())
-                        self.assertEqual(set(snapshot["sources"]), set(panels.values()))
+                        self.assertEqual(set(snapshot["sources"]), set(panels.values()) | {"api_author"})
+                        self.assertEqual(snapshot["sources"]["api_author"]["data"]["error"], "cached_author_required")
                         self.assertIsNone(snapshot["sync"]); self.assertIsNone(app.sync)
                         for panel, source in panels.items():
                             connection.request("GET", scope + "/api/panels/" + panel, headers=headers)
@@ -1559,6 +1565,7 @@ class InventoryAndLauncherTests(unittest.TestCase):
                     stack.enter_context(patch.object(main, "load_inventory", return_value=(
                         Repository("mergepath", HUB, True), Repository("one", "fixture/one"))))
                     stack.enter_context(patch.object(main, "Application", side_effect=application))
+                    stack.enter_context(patch.object(main, "AuthorBudgetProvider", return_value=author_fixture()))
                     # Replace only provider reads; keep real construction refusal,
                     # Application, Scheduler, authenticated HTTP and shutdown.
                     for name, source in boundaries.items():
@@ -1619,7 +1626,7 @@ class InventoryAndLauncherTests(unittest.TestCase):
                 '    stack.enter_context(patch.object(main, "resolve_history_settings", return_value=((), {})))\n'
                 '    stack.enter_context(patch.object(main, "load_reviewers", return_value=("fixture-reviewer",)))\n'
                 '    stack.enter_context(patch.object(main, "Application", return_value=app))\n'
-                '    for name in ("FleetProvider", "CIProvider", "LogExcerptCache", "PRProvider", "ActionsProvider", "AgentsProvider", "LiveAgentsProvider"):\n'
+                '    for name in ("FleetProvider", "CIProvider", "LogExcerptCache", "PRProvider", "ActionsProvider", "AgentsProvider", "LiveAgentsProvider", "AuthorBudgetProvider"):\n'
                 '        stack.enter_context(patch.object(main, name, return_value=SimpleNamespace(fetch=lambda deadline: None, close=lambda: None)))\n'
                 '    stack.enter_context(patch.object(main, "SyncProvider", side_effect=sync))\n'
                 '    stack.enter_context(patch.object(main, "CockpitServer", side_effect=ValueError("fixture-stop-before-server")))\n'
@@ -1773,6 +1780,7 @@ class InventoryAndLauncherTests(unittest.TestCase):
                     stack.enter_context(patch.object(main, "load_inventory", return_value=(
                         Repository("mergepath", HUB, True), Repository("one", "fixture/one"))))
                     stack.enter_context(patch.object(main, "Application", side_effect=application))
+                    stack.enter_context(patch.object(main, "AuthorBudgetProvider", return_value=author_fixture()))
                     stack.enter_context(patch.object(main, "resolve_history_settings", return_value=((), {})))
                     stack.enter_context(patch.object(main, "load_reviewers", return_value=("fixture-reviewer",)))
                     stack.enter_context(patch.object(main, "AgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))))
@@ -1799,6 +1807,7 @@ class InventoryAndLauncherTests(unittest.TestCase):
         client = GitHubClient(TOKEN, transport=HTTPFixture())
         with patch.object(main.GitHubClient, "from_environment", return_value=client), \
              patch.object(main, "load_inventory", return_value=(Repository("mergepath", HUB, True),)), \
+             patch.object(main, "AuthorBudgetProvider", return_value=author_fixture()), \
              patch.object(main, "FleetProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}), close=lambda: None)), \
              patch.object(main, "SyncProvider", return_value=SimpleNamespace(snapshot=lambda session: None, close=lambda: None)), \
              patch.object(main, "resolve_history_settings", return_value=((), {})), \
@@ -1875,6 +1884,7 @@ class InventoryAndLauncherTests(unittest.TestCase):
             return real_join(thread, timeout)
         with patch.object(main.GitHubClient, "from_environment", return_value=client), \
              patch.object(main, "load_inventory", return_value=(Repository("mergepath", HUB, True),)), \
+             patch.object(main, "AuthorBudgetProvider", return_value=author_fixture()), \
              patch.object(main, "FleetProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}), close=lambda: None)), \
              patch.object(main, "SyncProvider", return_value=SimpleNamespace(snapshot=lambda session: None, close=lambda: None)), \
              patch.object(main, "resolve_history_settings", return_value=((), {})), \
