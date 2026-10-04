@@ -1,8 +1,11 @@
 """Hermetic fast-source, canonical status, resource bounds and join regressions."""
 import importlib
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 import tempfile
 import time
@@ -231,6 +234,95 @@ class CanonicalTests(unittest.TestCase):
             self.assertLess(time.monotonic() - start, .5)
             helper.write_text("p4b_heartbeat_status(){ printf '%05000d' 1; }\n")
             self.assertEqual(L.CanonicalStatus(root)(record(), time.monotonic() + 1), "unknown")
+
+
+class StartupDirectoryTests(unittest.TestCase):
+    def launch(self, environment, opened):
+        main = importlib.import_module("mergepath.cockpit.__main__")
+        captured, closed = [], []
+        scheduler = SimpleNamespace(register=lambda *args, **kwargs: None, start=lambda: None, close=lambda: None)
+        app = SimpleNamespace(scheduler=scheduler, register_panel=lambda *args: None,
+                              launch_url=lambda port: "http://127.0.0.1:1/fixture",
+                              publish=lambda: None, stopping=SimpleNamespace(set=lambda: None),
+                              close=lambda: closed.append(True))
+        server = SimpleNamespace(server_address=("127.0.0.1", 1), serve_forever=lambda: None,
+                                 shutdown=lambda: None, server_close=lambda: None)
+        thread = SimpleNamespace(start=lambda: None, is_alive=lambda: False, join=lambda **kwargs: None)
+        empty = SimpleNamespace(fetch=lambda deadline: None, close=lambda: None)
+
+        def live(inventory, directory, trusted_root):
+            provider = L.LiveAgentsProvider(inventory, directory, trusted_root, clock=lambda: NOW)
+            captured.append(provider)
+            return provider
+
+        output = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, environment, clear=True))
+            stack.enter_context(patch.object(main.GitHubClient, "from_environment",
+                                            return_value=SimpleNamespace(_token="fixture-only")))
+            stack.enter_context(patch.object(main, "load_inventory", return_value=(Repository("hub", "owner/hub", True),)))
+            stack.enter_context(patch.object(main, "resolve_history_settings", return_value=((), {})))
+            stack.enter_context(patch.object(main, "load_reviewers", return_value=("fixture-reviewer",)))
+            stack.enter_context(patch.object(main, "Application", return_value=app))
+            for name in ("CIProvider", "PRProvider", "FleetProvider", "ActionsProvider", "AgentsProvider", "SyncProvider"):
+                stack.enter_context(patch.object(main, name, return_value=empty))
+            factory = stack.enter_context(patch.object(main, "LiveAgentsProvider", side_effect=live))
+            http = stack.enter_context(patch.object(main, "CockpitServer", return_value=server))
+            stack.enter_context(patch.object(main.threading, "Thread", return_value=thread))
+            opener = stack.enter_context(patch.object(main, "open_browser", side_effect=lambda url: opened(captured)))
+            stack.enter_context(contextlib.redirect_stdout(output))
+            stack.enter_context(contextlib.redirect_stderr(output))
+            result = main.main([])
+        return result, captured, closed, output.getvalue(), factory, http, opener
+
+    def test_startup_default_empty_and_absolute_observe_immutable_directory(self):
+        for override in (None, "", "custom"):
+            with self.subTest(override=override), tempfile.TemporaryDirectory() as temp:
+                home = Path(temp).resolve()
+                default = home / ".local/state/mergepath/phase-4b-runs"
+                custom, other = home / "custom", home / "other"
+                for path in (default, custom, other):
+                    path.mkdir(parents=True)
+                selected = custom if override == "custom" else default
+                value = record(stage="done", stages=[{"stage": stage} for stage in L.STAGES])
+                (selected / (value["run_id"] + ".json")).write_text(json.dumps(value))
+                switched = record(run_id="p4b-different", stage="done", stages=[{"stage": stage} for stage in L.STAGES])
+                (other / (switched["run_id"] + ".json")).write_text(json.dumps(switched))
+                env = {} if override is None else {"P4B_HEARTBEAT_DIR": str(custom) if override == "custom" else ""}
+
+                def opened(providers):
+                    self.assertEqual(len(providers), 1)
+                    provider = providers[0]
+                    self.assertEqual(provider.directory, selected.resolve())
+                    first = provider.fetch(time.monotonic() + 2).data
+                    self.assertEqual([row["run_id"] for row in first["terminal"]], [value["run_id"]])
+                    self.assertTrue(first["coverage_complete"])
+                    os.environ["P4B_HEARTBEAT_DIR"] = str(other)
+                    second = provider.fetch(time.monotonic() + 2).data
+                    self.assertEqual(second["terminal"], first["terminal"])
+                    self.assertEqual(provider.directory, selected.resolve())
+                    return True
+
+                with patch.object(Path, "home", return_value=home), patch.object(L.subprocess, "Popen") as process:
+                    result, providers, closed, output, factory, http, opener = self.launch(env, opened)
+                self.assertEqual(result, 0, output)
+                factory.assert_called_once()
+                self.assertEqual(factory.call_args.args[1], selected.resolve())
+                http.assert_called_once(); opener.assert_called_once()
+                self.assertEqual(closed, [True])
+                process.assert_not_called()
+
+    def test_startup_refuses_relative_and_oversize_override_before_server(self):
+        for value in ("relative/heartbeat", "/" + "a" * 4096):
+            with self.subTest(length=len(value)):
+                result, providers, closed, output, factory, http, opener = self.launch(
+                    {"P4B_HEARTBEAT_DIR": value}, lambda providers: True)
+                self.assertEqual(result, 1)
+                self.assertEqual(providers, [])
+                factory.assert_not_called(); http.assert_not_called(); opener.assert_not_called()
+                self.assertEqual(closed, [True])
+                self.assertIn("Cockpit cannot start", output)
+                self.assertNotIn(value, output)
 
 
 if __name__ == "__main__":

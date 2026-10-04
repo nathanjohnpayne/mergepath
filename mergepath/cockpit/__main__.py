@@ -162,7 +162,7 @@ def main(argv=None):
         agents_provider = AgentsProvider(inventory, checkouts, ROOT, price_keys=price_keys, github=github, reviewers=reviewers)
         app.scheduler.register("agents", agents_provider.fetch, hot_interval=30, idle_interval=120, timeout=30)
         app.register_panel("history", "agents")
-        live_agents = LiveAgentsProvider(inventory, resolve_live_directory(), ROOT)
+        live_agents = LiveAgentsProvider(inventory, resolve_live_directory(os.environ.get("P4B_HEARTBEAT_DIR") or None), ROOT)
         app.scheduler.register("live_agents", live_agents.fetch, hot_interval=5, idle_interval=5, timeout=10, max_backoff=60)
         app.register_panel("agents", "live_agents")
         server = CockpitServer(app, args.port)
