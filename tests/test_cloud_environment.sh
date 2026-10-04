@@ -102,6 +102,42 @@ else
   fail "hook probe failure: rc=$rc out=$out"
 fi
 
+# The hook runs the setup first: it reports what setup installed, reports a
+# setup failure, and probes either way.
+cat >"$HFIX/scripts/cloud-setup.sh" <<'SETUP'
+#!/usr/bin/env bash
+echo "setup ran" >>"$PROBE_LOG"
+echo "cloud-setup: gh present: gh version 9 (fixture)" >&2
+case "${SETUP_MODE:-noop}" in
+  install) echo "cloud-setup: installed yq v4.53.6 to /x/bin/yq (sha256 verified)" >&2 ;;
+  fail) echo "cloud-setup: checksum mismatch for yq; refusing to install" >&2; exit 1 ;;
+esac
+exit 0
+SETUP
+: >"$WORKDIR/probe.log"
+out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=install PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | head -1 | grep -qx 'mergepath cloud session: installed yq v4.53.6 (scripts/cloud-setup.sh).' \
+   && printf '%s' "$out" | grep -q 'capability tier `author-writes`' \
+   && [ "$(head -1 "$WORKDIR/probe.log")" = "setup ran" ] && grep -q '^probe ' "$WORKDIR/probe.log"; then
+  pass "hook, cloud session: runs setup before the probe and reports what it installed"
+else
+  fail "hook setup install: rc=$rc out=$out log=$(cat "$WORKDIR/probe.log")"
+fi
+out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=fail PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'tool setup failed or timed out (bash scripts/cloud-setup.sh to see why): cloud-setup: checksum mismatch for yq' \
+   && printf '%s' "$out" | grep -q 'capability tier `author-writes`'; then
+  pass "hook, setup failure: reported in the summary, the probe still runs, the hook still exits 0"
+else
+  fail "hook setup failure: rc=$rc out=$out"
+fi
+out="$(CLAUDE_CODE_REMOTE=true PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
+if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -q 'cloud-setup\|tool setup'; then
+  pass "hook, setup with nothing to install: adds nothing to the summary"
+else
+  fail "hook setup noop: rc=$rc out=$out"
+fi
+rm -f "$HFIX/scripts/cloud-setup.sh"
+
 rm -f "$HFIX/scripts/agent-capability-probe.sh"
 out="$(CLAUDE_CODE_REMOTE=true bash "$HOOK")"; rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "probe missing"; then
@@ -203,10 +239,23 @@ echo "\$url" >>"$WORKDIR/curl.log"
 case "\$url" in
   *checksums.txt) exit 22 ;;  # never fetched: the expected hash is pinned, not downloaded
   *.tar.gz) f="$REL/\${url##*/}"; [ -f "\$f" ] || f="$REL/gh_${VER}_linux_amd64.tar.gz"; cp "\$f" "\$out" ;;
+  */yq_linux_*) f="$REL/yq/\${url##*/}"; [ -f "\$f" ] || exit 22; cp "\$f" "\$out" ;;
   *) exit 22 ;;
 esac
 C
 chmod +x "$SBIN/uname" "$SBIN/curl"
+# The gh cases above and below are about gh: give them a mikefarah/yq v4 so
+# the setup's yq step finds one present and stays out of their way.
+printf '#!/usr/bin/env bash\necho "yq (https://github.com/mikefarah/yq/) version v4.53.6"\n' >"$SBIN/yq"
+chmod +x "$SBIN/yq"
+# yq release fixtures: a v4 binary for an unpinned version (the server below
+# answers every version with it), and later a binary that runs but is not
+# mikefarah/yq.
+YQVER=v4.99.0
+mkdir -p "$REL/yq"
+printf '#!/usr/bin/env bash\necho "yq (https://github.com/mikefarah/yq/) version %s"\n' "$YQVER" >"$REL/yq/yq_linux_amd64"
+yqsum="$(sha256sum "$REL/yq/yq_linux_amd64" 2>/dev/null | awk '{print $1}')"
+[ -n "$yqsum" ] || yqsum="$(shasum -a 256 "$REL/yq/yq_linux_amd64" | awk '{print $1}')"
 
 run_setup() { # <prefix> [env...]  (MERGEPATH_GH_VERSION defaults to the unpinned fixture version)
   local prefix="$1"; shift
@@ -421,6 +470,71 @@ if [ "$rc" -eq 0 ] && [ ! -s "$WORKDIR/curl.log" ] && grep -q "gh present" "$WOR
   pass "setup, gh present: downloads nothing"
 else
   fail "setup no-op: rc=$rc curl=$(cat "$WORKDIR/curl.log")"
+fi
+
+# ---------------------------------------------------------------------------
+# yq: the guarded tooling reads YAML with mikefarah/yq v4. The Claude cloud
+# image ships the Python jq wrapper under the same name, which rejects v4
+# syntax, so setup installs the pinned mikefarah/yq ahead of it.
+# ---------------------------------------------------------------------------
+NOYQ="$WORKDIR/noyq-bin"
+mkdir -p "$NOYQ"
+for f in "$SBIN"/*; do [ "$(basename "$f")" = yq ] || ln -sf "$f" "$NOYQ/$(basename "$f")"; done
+PYYQ="$WORKDIR/pyyq-bin"
+mkdir -p "$PYYQ"
+printf '#!/usr/bin/env bash\necho "yq 0.0.0"\n' >"$PYYQ/yq"
+chmod +x "$PYYQ/yq"
+
+: >"$WORKDIR/curl.log"
+set +e
+run_setup "$WORKDIR/y-absent" MERGEPATH_YQ_VERSION="$YQVER" MERGEPATH_YQ_SHA256="$yqsum" PATH="$WORKDIR/y-absent/bin:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ -x "$WORKDIR/y-absent/bin/yq" ] && grep -q "installed yq $YQVER" "$WORKDIR/setup.err" \
+   && grep -q "mikefarah/yq/releases/download/$YQVER/yq_linux_amd64" "$WORKDIR/curl.log" && ! grep -q checksums "$WORKDIR/curl.log"; then
+  pass "setup, yq absent: installs mikefarah/yq after verifying the supplied SHA-256, never downloads a checksums file"
+else
+  fail "setup yq absent: rc=$rc err=$(cat "$WORKDIR/setup.err") curl=$(cat "$WORKDIR/curl.log")"
+fi
+
+set +e
+run_setup "$WORKDIR/y-py" MERGEPATH_YQ_VERSION="$YQVER" MERGEPATH_YQ_SHA256="$yqsum" PATH="$WORKDIR/y-py/bin:$PYYQ:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q "is not mikefarah/yq v4 (yq 0.0.0)" "$WORKDIR/setup.err" && [ -x "$WORKDIR/y-py/bin/yq" ]; then
+  pass "setup, the Python yq on PATH: installs mikefarah/yq ahead of it"
+else
+  fail "setup python yq: rc=$rc err=$(cat "$WORKDIR/setup.err")"
+fi
+
+set +e
+run_setup "$WORKDIR/y-shadow" MERGEPATH_YQ_VERSION="$YQVER" MERGEPATH_YQ_SHA256="$yqsum" PATH="$PYYQ:$WORKDIR/y-shadow/bin:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && grep -q "yq still resolves to $PYYQ/yq, ahead of" "$WORKDIR/setup.err"; then
+  pass "setup, the Python yq earlier on PATH than the install: fails and names the shadowing entry"
+else
+  fail "setup shadowed yq: rc=$rc err=$(cat "$WORKDIR/setup.err")"
+fi
+
+set +e
+run_setup "$WORKDIR/y-mismatch" PATH="$WORKDIR/y-mismatch/bin:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+# Default version: the fixture server answers it with the v4.99.0 fixture, whose hash is not the pin.
+if [ "$rc" -eq 1 ] && [ ! -e "$WORKDIR/y-mismatch/bin/yq" ] \
+   && grep -q "checksum mismatch for yq v4.53.6 yq_linux_amd64 (expected c5f056448f973ae7d39b5401949648a78f2dc1947d6a8eb65be60d5c504b9385" "$WORKDIR/setup.err"; then
+  pass "setup, default yq version: verified against the hash pinned in the script, not a downloaded one"
+else
+  fail "setup yq pinned mismatch: rc=$rc err=$(cat "$WORKDIR/setup.err")"
+fi
+
+printf '#!/usr/bin/env bash\necho "yq 0.0.0"\n' >"$REL/yq/yq_linux_amd64"
+badsum="$(sha256sum "$REL/yq/yq_linux_amd64" 2>/dev/null | awk '{print $1}')"
+[ -n "$badsum" ] || badsum="$(shasum -a 256 "$REL/yq/yq_linux_amd64" | awk '{print $1}')"
+set +e
+run_setup "$WORKDIR/y-notv4" MERGEPATH_YQ_VERSION="$YQVER" MERGEPATH_YQ_SHA256="$badsum" PATH="$WORKDIR/y-notv4/bin:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && grep -q "does not run as mikefarah/yq v4" "$WORKDIR/setup.err"; then
+  pass "setup, a verified download that is not mikefarah/yq v4: fails instead of reporting success"
+else
+  fail "setup yq not v4: rc=$rc err=$(cat "$WORKDIR/setup.err")"
 fi
 
 echo
