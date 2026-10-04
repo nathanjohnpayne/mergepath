@@ -194,6 +194,11 @@ UNAVAILABLE_MSG='{"message":"GitHub GraphQL is not available from Claude Code se
   # Anthropic's documentation; GitHub's own errors point at docs.github.com.
   graphql_ceiling_hit '{"message":"Some future proxy wording","documentation_url":"https://docs.anthropic.com/en/docs/claude-code/github-actions"}' || exit 13
   graphql_ceiling_hit '{"message":"Resource not accessible by integration","documentation_url":"https://docs.github.com/graphql"}' && exit 14
+  # Pretty-printed JSON spaces the colon; the provenance match must not depend on it.
+  graphql_ceiling_hit '{"message":"Some future proxy wording", "documentation_url": "https://docs.anthropic.com/en/docs/claude-code/github-actions"}' || exit 15
+  graphql_ceiling_hit "$(printf '{\n  "message": "Some future proxy wording",\n  "documentation_url" :  "https://docs.anthropic.com/x"\n}')" || exit 16
+  graphql_ceiling_hit '{"message":"Nope", "documentation_url": "https://docs.github.com/graphql"}' && exit 17
+  graphql_ceiling_hit '{"documentation_url":"https://docsXanthropicYcom/"}' && exit 18
   exit 0
 )
 cls2_rc=$?

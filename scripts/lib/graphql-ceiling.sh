@@ -63,12 +63,15 @@ GRAPHQL_CEILING_PHRASE_UNAVAILABLE="GraphQL is not available from Claude Code se
 # Provenance, for wordings not seen yet: the proxy's refusal bodies point at
 # Anthropic's documentation. Callers pass only text from a failed GraphQL
 # request, so a refusal from the proxy there is the ceiling.
-GRAPHQL_CEILING_PROXY_DOCS='"documentation_url":"https://docs.anthropic.com/'
+# An ERE, not a literal: a pretty-printed body spaces the colon.
+GRAPHQL_CEILING_PROXY_DOCS='"documentation_url"[[:space:]]*:[[:space:]]*"https://docs[.]anthropic[.]com/'
 
 graphql_ceiling_hit() {
   case "${1:-}" in
-    *"$GRAPHQL_CEILING_PHRASE"*|*"$GRAPHQL_CEILING_PHRASE_UNAVAILABLE"*|*"$GRAPHQL_CEILING_PROXY_DOCS"*) return 0 ;;
+    *"$GRAPHQL_CEILING_PHRASE"*|*"$GRAPHQL_CEILING_PHRASE_UNAVAILABLE"*) return 0 ;;
   esac
+  # Unquoted on purpose: a quoted right-hand side is a literal in Bash 3.2+.
+  [[ "${1:-}" =~ $GRAPHQL_CEILING_PROXY_DOCS ]] && return 0
   return 1
 }
 
