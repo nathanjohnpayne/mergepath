@@ -1608,6 +1608,286 @@ run_gate
 assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "distinct removed summary versions remain separate findings"
 assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing_count')" "acknowledging one archived version cannot erase another"
 
+# #1741 BEGIN: exact UTF-8 serialization and verified duplicate recovery.
+archive_test_sha() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi \
+    | awk '{print $1}'
+}
+archive_test_data() {
+  printf '%s\n' "$1" | sed -E \
+    -e 's/^<!-- mergepath-feedback-archive:v1 ([A-Za-z0-9+\/=]+) -->$/\1/' \
+    -e 's/^<!-- mergepath-feedback-archive:v2 id=[0-9a-f]+ part=[0-9]+\/[0-9]+ data=([A-Za-z0-9+\/=]+) -->$/\1/' \
+    | tr -d '\n' | jq -Rc '@base64d | fromjson'
+}
+archive_test_marker() {
+  printf '<!-- mergepath-feedback-archive:v1 %s -->' "$(printf '%s' "$1" | base64 | tr -d '\n')"
+}
+archive_test_chunks() {
+  local encoded id total part offset=0
+  encoded=$(printf '%s' "$1" | base64 | tr -d '\n')
+  id=$(printf '%s' "$1" | archive_test_sha)
+  total=$(( (${#encoded} + 59999) / 60000 ))
+  for ((part=1; part<=total; part++)); do
+    printf '<!-- mergepath-feedback-archive:v2 id=%s part=%s/%s data=%s -->\n' \
+      "$id" "$part" "$total" "${encoded:$offset:60000}"
+    offset=$((offset + 60000))
+  done
+}
+archive_test_comments() {
+  printf '%s\n' "$1" | jq -Rsc --argjson id "$2" '
+    split("\n") | map(select(length > 0)) | to_entries | map({
+      id: ($id + .key), created_at: "2026-08-19T00:00:00Z",
+      user: {login: "github-actions[bot]"}, body: .value
+    })'
+}
+
+UTF8_BODY="$TMP/utf8-body.txt"
+printf '**P1** ' >"$UTF8_BODY"
+UTF8_CONTROL=$(archive_test_data "$("$RENDER_ARCHIVE" review-body 8800 \
+  nathanpayne-claude '2026-08-18T22:40:00Z' "$UTF8_BODY")")
+UTF8_HEADER=$(printf '%s' "$UTF8_CONTROL" | sed -E 's/"body":.*/"body":"/')
+UTF8_HEADER_BYTES=$(printf '%s' "$UTF8_HEADER" | wc -c | tr -d ' ')
+for seam in body payload; do
+  for char in é — 🚀; do
+    for offset in 4091 4092 4093 4094 4095 4096 4097; do
+      prefix=$offset
+      [ "$seam" != payload ] || prefix=$((offset - UTF8_HEADER_BYTES))
+      {
+        printf '**P1** '
+        awk -v n="$((prefix - 7))" 'BEGIN { for (i=0; i<n; i++) printf "x" }'
+        printf '%s exact bytes.\n\n' "$char"
+      } >"$UTF8_BODY"
+      UTF8_DATA=$(archive_test_data "$("$RENDER_ARCHIVE" review-body 8800 \
+        nathanpayne-claude '2026-08-18T22:40:00Z' "$UTF8_BODY")")
+      printf '%s' "$UTF8_DATA" | jq -j '.body' >"$TMP/utf8-decoded.txt"
+      if cmp -s "$UTF8_BODY" "$TMP/utf8-decoded.txt"; then
+        pass "UTF-8 $seam seam preserves $char at byte $offset and trailing newlines"
+      else
+        fail "UTF-8 $seam seam preserves $char at byte $offset and trailing newlines"
+      fi
+      UTF8_JSON=$(jq -nc --rawfile body "$UTF8_BODY" '$body')
+      UTF8_EXPECTED_FP=$(printf '%s' "$UTF8_JSON" | archive_test_sha | cut -c1-12)
+      assert_eq "$UTF8_EXPECTED_FP" "$(printf '%s' "$UTF8_DATA" | jq -r '.body_fingerprint')" \
+        "UTF-8 $seam seam fingerprint binds $char at byte $offset"
+    done
+  done
+done
+
+printf '**P2** Archived é — 🚀 finding.\nOriginal token and timing.\n\n' >"$UTF8_BODY"
+RECOVERY_GOOD=$(archive_test_data "$("$RENDER_ARCHIVE" review-body 8800 \
+  nathanpayne-claude '2026-08-18T22:40:00Z' "$UTF8_BODY")")
+RECOVERY_BAD=$(printf '%s' "$RECOVERY_GOOD" | jq -c '.body |= gsub("—"; "���")')
+RECOVERY_TOKEN="[mergepath-review-ack: 8800 $(printf '%s' "$RECOVERY_GOOD" | jq -r '.body_fingerprint')]"
+RECOVERY_COMMENTS=$(jq -n \
+  --argjson bad "$(archive_test_comments "$(archive_test_marker "$RECOVERY_BAD")" 88001)" \
+  --argjson good "$(archive_test_comments "$(archive_test_marker "$RECOVERY_GOOD")" 88002)" '$bad + $good')
+reset_fixtures
+RECOVERY_RESULT=""
+for order in original reversed; do
+  printf '%s' "$RECOVERY_COMMENTS" | jq --arg order "$order" \
+    'if $order == "reversed" then reverse else . end' >"$TMP/fixtures/issues.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "verified duplicate recovers corruption in $order order without clearing the finding"
+  assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "recovered duplicate inventory contains one original finding ($order)"
+  assert_eq "$RECOVERY_TOKEN" "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')" "recovery preserves the original acknowledgement token ($order)"
+  assert_eq '2026-08-18T22:40:00Z' "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].updated_at')" "recovery preserves the original archive floor ($order)"
+  if [ -n "$RECOVERY_RESULT" ]; then
+    assert_eq "$RECOVERY_RESULT" "$RUN_JSON" "duplicate recovery is independent of comment order"
+  fi
+  RECOVERY_RESULT="$RUN_JSON"
+done
+for ack_at in '2026-08-18T22:39:59Z' '2026-08-18T22:40:00Z' '2026-08-18T22:40:01Z'; do
+  printf '%s' "$RECOVERY_COMMENTS" | jq --arg token "$RECOVERY_TOKEN" --arg at "$ack_at" '. + [{
+    id:88003, created_at:$at, user:{login:"nathanpayne-codex"},
+    body:($token + "\nDispositioned the original archived finding after inspection.")
+  }]' >"$TMP/fixtures/issues.json"
+  run_gate
+  EXPECTED_RECOVERY_RC=1
+  [ "$ack_at" != '2026-08-18T22:40:01Z' ] || EXPECTED_RECOVERY_RC=0
+  assert_eq "$EXPECTED_RECOVERY_RC" "$RUN_RC" "recovery requires a strictly post-archive acknowledgement ($ack_at)"
+done
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.accounted')" "acknowledgement before duplicate delivery still accounts the original finding"
+printf '%s' "$RUN_JSON" | jq -j '.findings[0].body' >"$TMP/recovered-body.txt"
+if cmp -s "$UTF8_BODY" "$TMP/recovered-body.txt"; then
+  pass "recovery retains the complete original body including trailing newlines"
+else
+  fail "recovery retains the complete original body including trailing newlines"
+fi
+cp "$TMP/fixtures/issues.json" "$TMP/recovery-acknowledged.json"
+
+jq -n '[{id:8800, submitted_at:"2026-08-18T22:35:00Z", state:"DISMISSED",
+  user:{login:"nathanpayne-claude"}, body:"**P1** Distinct live replacement finding."}]' >"$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 1 "$RUN_RC" "recovered history remains accountable after a live rewrite"
+assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "recovery preserves both distinct archived and live finding versions"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.accounted')" "original acknowledgement cannot account a distinct live body"
+printf '[]\n' >"$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 0 "$RUN_RC" "verified duplicate recovery remains durable after source deletion"
+
+for mutation in archive_version source_kind source_comment_id source_login archived_at body_fingerprint codex_tiers coderabbit_tiers ghas_tiers absent_ghas extra_metadata; do
+  case "$mutation" in
+    archive_version) filter='.archive_version = 1' ;;
+    source_kind) filter='.source_kind = "inline"' ;;
+    source_comment_id) filter='.source_comment_id += 1' ;;
+    source_login) filter='.source_login = "nathanpayne-cursor"' ;;
+    archived_at) filter='.archived_at = "2026-08-18T22:40:01Z"' ;;
+    body_fingerprint) filter='.body_fingerprint = "0123456789ab"' ;;
+    codex_tiers) filter='.codex_tiers = ["p1"]' ;;
+    coderabbit_tiers) filter='.coderabbit_tiers = ["p1"]' ;;
+    ghas_tiers) filter='.ghas_tiers = ["p0"]' ;;
+    absent_ghas) filter='del(.ghas_tiers)' ;;
+    extra_metadata) filter='.extra_metadata = "different provenance"' ;;
+  esac
+  RECOVERY_VARIANT=$(printf '%s' "$RECOVERY_GOOD" | jq -c "$filter")
+  jq -n --argjson bad "$(archive_test_comments "$(archive_test_marker "$RECOVERY_BAD")" 88001)" \
+    --argjson variant "$(archive_test_comments "$(archive_test_marker "$RECOVERY_VARIANT")" 88002)" \
+    '$bad + $variant' >"$TMP/fixtures/issues.json"
+  run_gate
+  assert_eq 2 "$RUN_RC" "duplicate recovery refuses mismatched $mutation"
+done
+for malformed in original duplicate; do
+  RECOVERY_MALFORMED=$(printf '%s' "$RECOVERY_GOOD" | jq -c '.codex_tiers = "p2"')
+  if [ "$malformed" = original ]; then RECOVERY_OTHER="$RECOVERY_GOOD"; else RECOVERY_OTHER="$RECOVERY_BAD"; fi
+  jq -n --argjson bad "$(archive_test_comments "$(archive_test_marker "$RECOVERY_MALFORMED")" 88001)" \
+    --argjson good "$(archive_test_comments "$(archive_test_marker "$RECOVERY_OTHER")" 88002)" \
+    '$bad + $good' >"$TMP/fixtures/issues.json"
+  run_gate
+  assert_eq 2 "$RUN_RC" "duplicate recovery cannot mask a malformed $malformed schema"
+done
+# Version-2 provenance is explicit in both transport formats. The legacy v1
+# source-kind default must never normalize malformed v2 metadata before exact
+# duplicate matching (#1741 independent review).
+KIND_GOOD=$(printf '%s' "$RECOVERY_GOOD" | jq -c '
+  .source_kind = "issue-comment" | .source_login = "chatgpt-codex-connector[bot]"')
+for kind_value in missing null false; do
+  case "$kind_value" in
+    missing) kind_filter='del(.source_kind)' ;;
+    null) kind_filter='.source_kind = null' ;;
+    false) kind_filter='.source_kind = false' ;;
+  esac
+  KIND_MALFORMED=$(printf '%s' "$KIND_GOOD" | jq -c "$kind_filter")
+  KIND_CORRUPT=$(printf '%s' "$KIND_MALFORMED" | jq -c '.body |= gsub("—"; "���")')
+  for transport in v1 v2; do
+    if [ "$transport" = v1 ]; then
+      KIND_RECORD=$(archive_test_marker "$KIND_MALFORMED")
+      KIND_CORRUPT_RECORD=$(archive_test_marker "$KIND_CORRUPT")
+    else
+      KIND_RECORD=$(archive_test_chunks "$KIND_MALFORMED")
+      KIND_CORRUPT_RECORD=$(archive_test_chunks "$KIND_CORRUPT")
+    fi
+    archive_test_comments "$KIND_RECORD" 88005 >"$TMP/fixtures/issues.json"
+    run_gate
+    assert_eq 2 "$RUN_RC" "version-2 $kind_value source_kind fails schema validation through $transport transport"
+    jq -n --argjson bad "$(archive_test_comments "$KIND_CORRUPT_RECORD" 88005)" \
+      --argjson good "$(archive_test_comments "$(archive_test_marker "$KIND_GOOD")" 88006)" \
+      '$bad + $good' >"$TMP/fixtures/issues.json"
+    run_gate
+    assert_eq 2 "$RUN_RC" "version-2 $kind_value source_kind cannot recover from an explicit duplicate through $transport transport"
+  done
+done
+LEGACY_KIND_DEFAULT=$(printf '%s' "$KIND_GOOD" | jq -c '.archive_version = 1 | del(.source_kind)')
+archive_test_comments "$(archive_test_marker "$LEGACY_KIND_DEFAULT")" 88005 >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "legacy version-1 absent source_kind still defaults to issue-comment"
+assert_eq issue-comment-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" \
+  "legacy source-kind default retains its original finding obligation"
+printf '%s' "$RECOVERY_COMMENTS" | jq '.[1].user.login = "nathanjohnpayne"' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 2 "$RUN_RC" "a non-Actions valid lookalike cannot recover trusted corruption"
+printf '%s' "$RECOVERY_COMMENTS" | jq '.[0:1]' >"$TMP/fixtures/issues.json"
+jq -n --rawfile body "$UTF8_BODY" '[{id:8800, submitted_at:"2026-08-18T22:35:00Z",
+  user:{login:"nathanpayne-claude"}, body:$body}]' >"$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 2 "$RUN_RC" "an intact live source alone cannot recover unmatched archive corruption"
+printf '%s' "$RECOVERY_COMMENTS" >"$TMP/fixtures/issues.json"
+jq '.[0].user.login = "nathanpayne-cursor"' "$TMP/fixtures/reviews.json" >"$TMP/fixtures/reviews.next"
+mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 2 "$RUN_RC" "duplicate recovery does not bypass surviving source identity binding"
+printf '[]\n' >"$TMP/fixtures/reviews.json"
+# The payloads still agree exactly, but the claimed source is not configured.
+jq -n --argjson bad "$(archive_test_comments "$(archive_test_marker "$(printf '%s' "$RECOVERY_BAD" | jq -c '.source_login = "stranger"')")" 88001)" \
+  --argjson good "$(archive_test_comments "$(archive_test_marker "$(printf '%s' "$RECOVERY_GOOD" | jq -c '.source_login = "stranger"')")" 88002)" \
+  '$bad + $good' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 2 "$RUN_RC" "unconfigured source identities cannot supply duplicate recovery evidence"
+
+# A synthetic short-hash collision exercises the distinct-valid-body fence.
+if REAL_RECOVERY_HASH=$(command -v sha256sum); then
+  REAL_RECOVERY_HASH_IS_SHASUM=false
+else
+  REAL_RECOVERY_HASH=$(command -v shasum)
+  REAL_RECOVERY_HASH_IS_SHASUM=true
+fi
+export REAL_RECOVERY_HASH REAL_RECOVERY_HASH_IS_SHASUM
+export RECOVERY_COLLISION_JSON='"**P2** Different complete body with a colliding short hash."'
+RECOVERY_COLLISION_FP="$(printf '%s' "$RECOVERY_GOOD" | jq -r '.body_fingerprint')"
+export RECOVERY_COLLISION_FP
+cat >"$TMP/bin/sha256sum" <<'SH'
+#!/usr/bin/env bash
+input=$(cat)
+if [ "$input" = "$RECOVERY_COLLISION_JSON" ]; then
+  printf '%s%052d  -\n' "$RECOVERY_COLLISION_FP" 0
+elif [ "$REAL_RECOVERY_HASH_IS_SHASUM" = true ]; then
+  printf '%s' "$input" | "$REAL_RECOVERY_HASH" -a 256
+else
+  printf '%s' "$input" | "$REAL_RECOVERY_HASH"
+fi
+SH
+chmod +x "$TMP/bin/sha256sum"
+RECOVERY_COLLISION=$(printf '%s' "$RECOVERY_GOOD" | jq -c --argjson body "$RECOVERY_COLLISION_JSON" '.body = $body')
+jq -n --argjson originals "$RECOVERY_COMMENTS" \
+  --argjson collision "$(archive_test_comments "$(archive_test_marker "$RECOVERY_COLLISION")" 88004)" \
+  '$originals + $collision' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 2 "$RUN_RC" "conflicting verified bodies cannot recover a short-fingerprint collision"
+rm "$TMP/bin/sha256sum"
+unset REAL_RECOVERY_HASH REAL_RECOVERY_HASH_IS_SHASUM RECOVERY_COLLISION_JSON RECOVERY_COLLISION_FP
+
+{
+  cat "$UTF8_BODY"
+  awk 'BEGIN { for (i=0; i<61000; i++) printf "\\" }'
+  printf 'é — 🚀\n\n'
+} >"$TMP/utf8-chunked-body.txt"
+UTF8_CHUNKS=$("$RENDER_ARCHIVE" review-body 8800 nathanpayne-claude \
+  '2026-08-18T22:40:00Z' "$TMP/utf8-chunked-body.txt")
+assert_match '^<!-- mergepath-feedback-archive:v2 ' "${UTF8_CHUNKS:0:80}" "near-limit UTF-8 body uses chunked records"
+UTF8_CHUNK_DATA=$(archive_test_data "$UTF8_CHUNKS")
+printf '%s' "$UTF8_CHUNK_DATA" | jq -j '.body' >"$TMP/utf8-chunked-decoded.txt"
+if cmp -s "$TMP/utf8-chunked-body.txt" "$TMP/utf8-chunked-decoded.txt"; then
+  pass "chunked records preserve complete UTF-8 body bytes and trailing newlines"
+else
+  fail "chunked records preserve complete UTF-8 body bytes and trailing newlines"
+fi
+UTF8_CHUNK_JSON=$(jq -nc --rawfile body "$TMP/utf8-chunked-body.txt" '$body')
+assert_eq "$(printf '%s' "$UTF8_CHUNK_JSON" | archive_test_sha | cut -c1-12)" \
+  "$(printf '%s' "$UTF8_CHUNK_DATA" | jq -r '.body_fingerprint')" "chunked UTF-8 body retains its exact fingerprint"
+BAD_CHUNK_DATA=$(printf '%s' "$UTF8_CHUNK_DATA" | jq -c '.body |= gsub("—"; "���")')
+BAD_CHUNKS=$(archive_test_chunks "$BAD_CHUNK_DATA")
+archive_test_comments "$UTF8_CHUNKS" 88100 >"$TMP/good-chunk-comments.json"
+archive_test_comments "$BAD_CHUNKS" 88200 >"$TMP/bad-chunk-comments.json"
+jq -n --slurpfile good "$TMP/good-chunk-comments.json" --slurpfile bad "$TMP/bad-chunk-comments.json" \
+  '$bad[0] + $good[0]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "complete chunk sets support verified duplicate recovery"
+printf '%s' "$RUN_JSON" | jq -j '.missing[0].body' >"$TMP/utf8-chunked-recovered.txt"
+if cmp -s "$TMP/utf8-chunked-body.txt" "$TMP/utf8-chunked-recovered.txt"; then
+  pass "recovery retains the full chunked body"
+else
+  fail "recovery retains the full chunked body"
+fi
+jq -n --slurpfile good "$TMP/good-chunk-comments.json" --slurpfile bad "$TMP/bad-chunk-comments.json" \
+  '$bad[0][:-1] + $good[0]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 2 "$RUN_RC" "a complete duplicate cannot hide a missing corrupt chunk"
+jq -n --slurpfile good "$TMP/good-chunk-comments.json" --slurpfile bad "$TMP/bad-chunk-comments.json" '
+  $bad[0] + $good[0] + [($bad[0][0] | .id = 88300 | .body |= sub("data=."; "data=A"))]
+' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 2 "$RUN_RC" "a complete duplicate cannot hide conflicting corrupt chunks"
+# #1741 END.
+
 reset_fixtures
 LARGE_ARCHIVE_BODY="$TMP/large-archive-body.txt"
 {
