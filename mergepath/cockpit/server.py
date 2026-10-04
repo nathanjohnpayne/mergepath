@@ -44,6 +44,7 @@ class Application:
         self._nonce_expires, self._nonce_used = monotonic() + 120, False
         self._revision = 0
         self._panel_sources = {}
+        self.ci_excerpts = None
         self._condition = threading.Condition()
         self.stopping = threading.Event()
         self.stream_slots = threading.BoundedSemaphore(2)
@@ -292,6 +293,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(200, app.snapshot(query.get("repo", [None])[0]))
             except ValueError:
                 self._respond(400, {"error": "invalid_filter"})
+        elif parts.path == "/api/ci/excerpt":
+            query = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
+            if set(query) != {"repo", "run", "attempt", "job", "step"} or any(len(values) != 1 for values in query.values()):
+                self._respond(400, {"error": "invalid_excerpt_request"})
+            elif app.ci_excerpts is None:
+                self._respond(503, {"error": "upstream_unavailable"})
+            else:
+                try:
+                    result = app.ci_excerpts.handle({key: values[0] for key, values in query.items()},
+                        app.panel_snapshot("ci")["envelope"], deadline=app.monotonic() + 15)
+                    self._respond(200, app.redact(result))
+                except ValueError:
+                    self._respond(400, {"error": "invalid_excerpt_request"})
+                except Exception:
+                    self._respond(503, {"error": "upstream_unavailable"})
         elif parts.path.startswith("/api/panels/"):
             panel = parts.path[len("/api/panels/"):]
             if panel not in PANEL_IDS:
