@@ -68,7 +68,10 @@ if [ "$SOURCE_LOGIN" = 'github-actions[bot]' ] && awk '
   exit 0
 fi
 
-BODY_JSON=$(jq -Rs '.' "$PREVIOUS_BODY_FILE") \
+# jq raw-input readers can split a multibyte character at their read boundary
+# (#1741). --rawfile preserves the complete body, including trailing newlines,
+# and emits the same canonical JSON string that accounting fingerprints.
+BODY_JSON=$(jq -nc --rawfile body "$PREVIOUS_BODY_FILE" '$body') \
   || { echo "render-feedback-archive: could not encode previous body" >&2; exit 2; }
 BODY=$(jq -r '.' <<EOF
 $BODY_JSON
@@ -129,7 +132,10 @@ PAYLOAD=$(jq -nc \
       ghas_tiers: $ghas_tiers
     }
   ')
-ENCODED=$(printf '%s' "$PAYLOAD" | jq -Rr '@base64')
+# Encode bytes directly; feeding the Unicode payload to jq's raw-input reader
+# would introduce the same boundary corruption after the body was fingerprinted.
+ENCODED=$(printf '%s' "$PAYLOAD" | base64 | tr -d '\n') \
+  || { echo "render-feedback-archive: could not encode archive payload" >&2; exit 2; }
 if [ "${#ENCODED}" -le 60000 ]; then
   printf '<!-- mergepath-feedback-archive:v1 %s -->\n' "$ENCODED"
   exit 0
