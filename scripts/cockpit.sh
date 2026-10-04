@@ -47,4 +47,4 @@ if ! eval "$cockpit_exports" || [ -z "${OP_PREFLIGHT_REVIEWER_PAT:-}" ]; then
 fi
 unset cockpit_exports OP_PREFLIGHT_AUTHOR_PAT GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
 cd "$ROOT"
-exec python3 -I "$ROOT/mergepath/cockpit/__main__.py" --agent "$COCKPIT_AGENT" --port "$COCKPIT_PORT" "${COCKPIT_EXTRA_ARGS[@]}"
+exec python3 -I "$ROOT/mergepath/cockpit/__main__.py" --agent "$COCKPIT_AGENT" --port "$COCKPIT_PORT" ${COCKPIT_EXTRA_ARGS[@]+"${COCKPIT_EXTRA_ARGS[@]}"}
