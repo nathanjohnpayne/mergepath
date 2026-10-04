@@ -35,7 +35,9 @@
         && typeof row.check_evidence_unknown === "boolean" && [null, "bump", "boulder"].includes(row.severity)
         && (row.reason === null || typeof row.reason === "string") && [row.created_at, row.started_at, row.updated_at].every(epoch)
         && row.jobs_scope === (checksOnly ? "none" : "all-attempts") && Array.isArray(row.jobs) && Array.isArray(row.checks) && Array.isArray(row.diagnostics)
-        && (!checksOnly || row.jobs.length === 0 && row.checks.length > 0)
+        && (!checksOnly || row.jobs.length === 0 && (row.checks.length > 0 || row.current_head === true && row.pr !== null
+          && row.status === "unknown" && row.conclusion === null && row.check_evidence_unknown && !row.actionable
+          && !row.superseded && row.severity === null && row.diagnostics.length === 0))
         && (checksOnly ? row.rerun_command === null : row.rerun_command === null || row.rerun_command === `gh run rerun ${row.id} --failed --repo ${row.repo}`)
         && (!row.actionable || row.current_head === true && row.severity !== null));
       keys.add(row.key);
@@ -66,6 +68,7 @@
     return repositories;
   }
   function runTone(row) {
+    if (row.kind === "checks" && row.checks.length === 0) return {state: "idle", label: "No check observations"};
     if (row.actionable) return {state: row.severity, label: row.severity === "boulder" ? row.reason === "Observed installation rate-limit failure" ? "Token exhausted" : "Not retryable" : "Stale failure"};
     if (row.superseded && !(row.kind === "checks" && live.includes(row.status))) return {state: "idle", label: "Failed · superseded"};
     if (live.includes(row.status)) return {state: "running", label: row.status === "in_progress" ? "Running" : "Queued"};
@@ -91,9 +94,14 @@
     const running = rows.filter(row => live.includes(row.status)).length, attention = rows.filter(row => row.actionable).length;
     const unknown = rows.some(row => row.check_evidence_unknown || failures.includes(row.conclusion) && row.current_head === null || row.kind === "checks" && row.current_head === null)
       || repositories.some(item => item.observed_at === null);
+    const terminalPass = ["success", "neutral", "skipped"];
+    const uncleared = rows.some(row => row.current_head === true && !live.includes(row.status)
+      && (row.checks.some(check => check.conclusion === "cancelled") || !row.superseded && (row.kind === "checks"
+        ? !row.checks.length || row.checks.some(check => check.status !== "completed" || !terminalPass.includes(check.conclusion))
+        : row.status !== "completed" || !terminalPass.includes(row.conclusion))));
     const state = C.worstState(rows.map(row => runTone(row).state));
-    return {state: state === "clear" && unknown ? "idle" : state,
-      label: `${running} running · ${attention} need attention · ${rows.length} recent${stale ? " · coverage stale or unavailable" : ""}${unknown ? " · current-check evidence unavailable" : ""}`,
+    return {state: state === "clear" && (unknown || uncleared) ? "idle" : state,
+      label: `${running} running · ${attention} need attention · ${rows.length} recent${stale ? " · coverage stale or unavailable" : ""}${unknown ? " · current-check evidence unavailable" : ""}${uncleared ? " · current CI success not established" : ""}`,
       hazards, count: null, rows, repositories, stale, hasObservations: repositories.some(item => item.observed_at !== null), sourceStale: envelope.stale === true, recentSeconds: envelope.data.recent_seconds, now};
   }
   function elapsed(start, end, now) {
@@ -189,7 +197,7 @@
         }
       }
       if (!this.empty) {this.empty = element("p", "ci-empty"); this.body.append(this.empty);}
-      this.empty.textContent = row.kind === "checks" ? "No observed Actions job for these checks." : "No jobs observed for this run.";
+      this.empty.textContent = row.kind === "checks" ? row.checks.length === 0 ? "No workflow or check runs observed for this open HEAD." : "No observed Actions job for these checks." : "No jobs observed for this run.";
       this.empty.hidden = row.jobs.length > 0;
       if (!this.checks) {this.checks = element("div", "ci-job ci-diagnostics mono"); this.body.append(this.checks);}
       this.checks.hidden = row.kind !== "checks";

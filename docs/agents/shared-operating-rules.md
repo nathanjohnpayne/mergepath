@@ -60,7 +60,7 @@ This rule applies only to 1Password CLI sign-in and authentication errors. Other
 
 ## Cloud agent sessions
 
-A Claude Code cloud session or a Codex cloud task has no 1Password and no gh keyring, and the Claude cloud GitHub proxy's ambient token writes as `claude[bot]`, not as you. Before writing to GitHub from one, follow [Cloud Agent Environments](cloud-environments.md): provision the dedicated author and reviewer PATs it names, run `scripts/agent-capability-probe.sh` to learn what the session can do, and hand anything it cannot do (merges, GraphQL-only helpers, multi-branch or cross-repo work) to a local session or CI.
+A Claude Code cloud session or a Codex cloud task has no 1Password and no gh keyring, and the Claude cloud GitHub proxy's ambient token writes as `claude[bot]`, not as you. Before writing to GitHub from one, follow [Cloud Agent Environments](cloud-environments.md): provision the dedicated author and reviewer PATs it names, run `scripts/agent-capability-probe.sh` to learn what the session can do, and hand anything it cannot do (GraphQL-only helpers, multi-branch or cross-repo work) to a local session or CI. A cloud session may merge through the same gates as a local session; on Claude cloud that waits on a REST write path, because `gh pr` subcommands are GraphQL there.
 
 ## Secret handling
 
