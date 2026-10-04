@@ -190,11 +190,16 @@ UNAVAILABLE_MSG='{"message":"GitHub GraphQL is not available from Claude Code se
   . "$ROOT/scripts/lib/graphql-ceiling.sh"
   graphql_ceiling_hit "$UNAVAILABLE_MSG" || exit 11
   graphql_ceiling_hit 'gh: GraphQL: Could not resolve to a Repository (HTTP 200)' && exit 12
+  # A wording not seen yet is still the proxy when its body points at
+  # Anthropic's documentation; GitHub's own errors point at docs.github.com.
+  graphql_ceiling_hit '{"message":"Some future proxy wording","documentation_url":"https://docs.anthropic.com/en/docs/claude-code/github-actions"}' || exit 13
+  graphql_ceiling_hit '{"message":"Resource not accessible by integration","documentation_url":"https://docs.github.com/graphql"}' && exit 14
   exit 0
 )
-[ "$?" -eq 0 ] \
-  && ok "graphql_ceiling_hit matches the proxy's no-GraphQL wording too" \
-  || bad "graphql_ceiling_hit missed the no-GraphQL wording"
+cls2_rc=$?
+[ "$cls2_rc" -eq 0 ] \
+  && ok "graphql_ceiling_hit matches the proxy's no-GraphQL wording, and any refusal carrying the proxy's documentation URL, but not GitHub's own errors" \
+  || bad "graphql_ceiling_hit misclassified (case $cls2_rc)"
 u_rc=$(ceiling_run "gh: GitHub GraphQL is not available from Claude Code sessions; use the REST API (gh api repos/{owner}/{repo}/...). (HTTP 403)")
 [ "$u_rc" = "6" ] \
   && ok "--list with the no-GraphQL wording and no proxy thread route: exits 6 (ceiling)" \

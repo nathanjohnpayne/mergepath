@@ -11,8 +11,11 @@
 #
 # (the first while the proxy served a pinned set of operations, the second
 # since it serves none, observed 2026-10-04), and the proxy applies it whatever
-# credential the request carries. Every recognized wording is listed in
-# graphql_ceiling_hit, the one place a caller should match it. So a
+# credential the request carries. Because the wording has already changed
+# once, the refusal is also recognized by where it comes from: the proxy's
+# refusals carry a `documentation_url` on docs.anthropic.com, which GitHub's
+# own errors never do (theirs point at docs.github.com). graphql_ceiling_hit
+# is the one place a caller should match any of this. So a
 # helper that hits it has not met a credential gap, a transient error, or a
 # bug: it has met a property of the session, and retrying, re-authenticating
 # or provisioning a better token cannot change the answer. Before this lib the
@@ -57,10 +60,14 @@ GRAPHQL_CEILING_PHRASE="not enabled for this session"
 # The no-GraphQL wording. Matched on its distinctive clause, not the REST
 # routes it goes on to suggest, which the proxy may reword independently.
 GRAPHQL_CEILING_PHRASE_UNAVAILABLE="GraphQL is not available from Claude Code sessions"
+# Provenance, for wordings not seen yet: the proxy's refusal bodies point at
+# Anthropic's documentation. Callers pass only text from a failed GraphQL
+# request, so a refusal from the proxy there is the ceiling.
+GRAPHQL_CEILING_PROXY_DOCS='"documentation_url":"https://docs.anthropic.com/'
 
 graphql_ceiling_hit() {
   case "${1:-}" in
-    *"$GRAPHQL_CEILING_PHRASE"*|*"$GRAPHQL_CEILING_PHRASE_UNAVAILABLE"*) return 0 ;;
+    *"$GRAPHQL_CEILING_PHRASE"*|*"$GRAPHQL_CEILING_PHRASE_UNAVAILABLE"*|*"$GRAPHQL_CEILING_PROXY_DOCS"*) return 0 ;;
   esac
   return 1
 }

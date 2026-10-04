@@ -149,7 +149,8 @@ elif [ "$path" = "graphql" ]; then
     status=403
     case "${STUB_GRAPHQL_WORDING:-pinned}" in
       unavailable) body='{"message":"GitHub GraphQL is not available from Claude Code sessions; use the REST API (gh api repos/{owner}/{repo}/...). For review threads use the CCR routes on api.github.com.","documentation_url":"https://docs.anthropic.com/en/docs/claude-code/github-actions"}' ;;
-      other) body='{"message":"Resource not accessible by integration"}' ;;
+      other) body='{"message":"Resource not accessible by integration","documentation_url":"https://docs.github.com/graphql"}' ;;
+      reworded) body='{"message":"A wording the proxy has not used before","documentation_url":"https://docs.anthropic.com/en/docs/claude-code/github-actions"}' ;;
       *) body='{"message":"This GraphQL query is not enabled for this session. Use gh api repos/{owner}/{repo}/... instead."}' ;;
     esac
   else
@@ -309,13 +310,13 @@ else
 fi
 # The proxy's later wording (observed 2026-10-04) is the same ceiling; a 403
 # that carries neither wording is not, and stays a fix-first status.
-for wording in unavailable other; do
+for wording in unavailable reworded other; do
   set +e
   run_probe CLAUDE_CODE_REMOTE=true GH_TOKEN=proxy-injected GITHUB_TOKEN=proxy-injected STUB_GRAPHQL_WORDING="$wording" -- --no-cache \
     >"$WORKDIR/cloud-$wording.json" 2>/dev/null
   set -e
   r="$(reason "$WORKDIR/cloud-$wording.json" graphql)"
-  if { [ "$wording" = unavailable ] && printf '%s' "$r" | grep -q 'proxy GraphQL ceiling'; } \
+  if { [ "$wording" != other ] && printf '%s' "$r" | grep -q 'proxy GraphQL ceiling'; } \
      || { [ "$wording" = other ] && [ "$r" = "viewer query returned 403" ]; }; then
     pass "claude-cloud: GraphQL 403 with the '$wording' wording classified correctly ($r)"
   else
