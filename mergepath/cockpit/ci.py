@@ -137,6 +137,24 @@ def normalize_job(value, repo=None):
     return result
 
 
+def _check_evidence(checks, current):
+    failed = [check for check in checks if check['conclusion'] in FAILURES]
+    actionable = current is True and any(check['superseded_by'] is None for check in failed)
+    severity = 'bump' if actionable else None
+    reason = 'Unsuperseded failed check on current HEAD' if actionable else None
+    for check in failed:
+        if current is not True or check['superseded_by'] is not None:
+            continue
+        if re.search(r'API rate limit exceeded for installation', check['diagnostic'], re.I):
+            severity, reason = 'boulder', 'Observed installation rate-limit failure'
+        elif re.search(r'CodeQL[^\n]*(?:not retryable|non[- ]retryable)', check['diagnostic'], re.I):
+            severity, reason = 'boulder', 'Observed nonretryable CodeQL failure'
+    return {'actionable': actionable, 'severity': severity, 'reason': reason,
+            'diagnostics': [{'text': check['diagnostic'], 'source': check['diagnostic_source'], 'check_id': check['id']}
+                            for check in checks if check['diagnostic']],
+            'superseded': bool(failed) and all(check['superseded_by'] is not None for check in failed)}
+
+
 def group_runs(repo, raw_runs, jobs, checks, heads):
     groups, rows, ids = {}, [], set()
     for raw in raw_runs:
@@ -154,33 +172,51 @@ def group_runs(repo, raw_runs, jobs, checks, heads):
         for number in numbers:
             current = None if number not in heads else heads[number] == sha
             owned = copy.deepcopy(related)
-            actionable = current is True and any(c['conclusion'] in FAILURES and c['superseded_by'] is None for c in owned)
-            failed_checks = [c for c in owned if c['conclusion'] in FAILURES]
-            diagnostics = [{'text': c['diagnostic'], 'source': c['diagnostic_source'], 'check_id': c['id']}
-                           for c in owned if c['diagnostic']]
-            severity = 'bump' if actionable else None
-            reason = 'Unsuperseded failed check on current HEAD' if actionable else None
-            for check in failed_checks:
-                if current is not True or check['superseded_by'] is not None:
-                    continue
-                if re.search(r'API rate limit exceeded for installation', check['diagnostic'], re.I):
-                    severity, reason = 'boulder', 'Observed installation rate-limit failure'
-                elif re.search(r'CodeQL[^\n]*(?:not retryable|non[- ]retryable)', check['diagnostic'], re.I):
-                    severity, reason = 'boulder', 'Observed nonretryable CodeQL failure'
             row = {'key': f'{repo}:{run_id}:{number or "none"}', 'id': run_id, 'attempt': attempt, 'repo': repo,
                    'pr': number, 'sha': sha, 'name': text(raw.get('name')), 'workflow_id': identity(raw.get('workflow_id')),
                    'jobs_scope': 'all-attempts', 'status': _status(raw.get('status')), 'conclusion': _conclusion(raw.get('conclusion')),
                    'created_at': stamp(raw.get('created_at')), 'started_at': stamp(raw.get('run_started_at')),
                    'updated_at': stamp(raw.get('updated_at')), 'current_head': current,
-                   'jobs': copy.deepcopy(jobs[run_id]), 'checks': owned, 'actionable': actionable,
-                   'severity': severity, 'reason': reason, 'diagnostics': diagnostics,
-                   'superseded': bool(failed_checks) and all(c['superseded_by'] is not None for c in failed_checks),
-                   'check_evidence_unknown': raw.get('conclusion') in FAILURES and not failed_checks,
+                   'jobs': copy.deepcopy(jobs[run_id]), 'checks': owned, **_check_evidence(owned, current),
+                   'check_evidence_unknown': raw.get('conclusion') in FAILURES and not any(c['conclusion'] in FAILURES for c in owned),
                    'rerun_command': f'gh run rerun {run_id} --failed --repo {repo}' if raw.get('conclusion') in FAILURES else None}
             rows.append(row)
             key = (number, sha)
             groups.setdefault(key, {'repo': repo, 'pr': number, 'sha': sha, 'run_keys': []})['run_keys'].append(row['key'])
     return rows, list(groups.values())
+
+
+def _group_check_rows(repo, checks, heads, runs, groups):
+    claimed = {check['id'] for run in runs for check in run['checks']}
+    rows, by_key = [], {(group['pr'], group['sha']): group for group in groups}
+    unmatched = [check for check in checks if check['id'] not in claimed]
+    for sha in sorted({check['sha'] for check in unmatched}):
+        related = [check for check in unmatched if check['sha'] == sha]
+        # A check is commit-scoped, not an invented Actions run. Open HEADs
+        # establish current PR ownership; observed run groups retain old history.
+        numbers = list(dict.fromkeys([number for number, head in heads.items() if head == sha]
+                                     + [group['pr'] for group in groups if group['sha'] == sha and group['pr'] is not None])) or [None]
+        for number in numbers:
+            current = None if number not in heads else heads[number] == sha
+            owned = copy.deepcopy(related)
+            active = [check for check in owned if check['status'] in LIVE]
+            status = ('in_progress' if any(check['status'] == 'in_progress' for check in active) else active[0]['status']) if active else (
+                'completed' if all(check['status'] == 'completed' for check in owned) else 'unknown')
+            conclusion = 'failure' if any(check['conclusion'] in FAILURES for check in owned) else (
+                'success' if all(check['status'] == 'completed' and check['conclusion'] == 'success' for check in owned) else None)
+            row = {'kind': 'checks', 'key': f'{repo}:checks:{sha}:{number or "none"}', 'repo': repo, 'pr': number, 'sha': sha,
+                   'id': None, 'attempt': None, 'workflow_id': None, 'name': 'Check runs', 'jobs_scope': 'none', 'jobs': [],
+                   'status': status, 'conclusion': conclusion, 'created_at': None, 'started_at': None, 'updated_at': None,
+                   'current_head': current, 'checks': owned, **_check_evidence(owned, current),
+                   'check_evidence_unknown': any(check['status'] == 'unknown' or check['status'] == 'completed' and check['conclusion'] is None for check in owned),
+                   'rerun_command': None}
+            rows.append(row)
+            key = (number, sha)
+            if key not in by_key:
+                by_key[key] = {'repo': repo, 'pr': number, 'sha': sha, 'run_keys': []}
+                groups.append(by_key[key])
+            by_key[key].setdefault('check_keys', []).append(row['key'])
+    return rows
 
 
 class CIProvider:
@@ -233,10 +269,12 @@ class CIProvider:
                 max_pages=self.max_pages, deadline=deadline))
         if len({check['id'] for check in checks}) != len(checks):
             raise ClientError('invalid_upstream_json')
-        return group_runs(repo, runs, jobs, supersede(checks), heads)
+        checks = supersede(checks)
+        rows, groups = group_runs(repo, runs, jobs, checks, heads)
+        return rows, groups, _group_check_rows(repo, checks, heads, rows, groups)
 
     def __call__(self, deadline):
-        rows, groups, observations = [], [], []
+        rows, groups, check_rows, observations = [], [], [], []
         budget_deadline = deadline - .25
         ordered = self.inventory[self._offset:] + self.inventory[:self._offset]
         self._offset = (self._offset + 1) % max(1, len(self.inventory))
@@ -249,10 +287,10 @@ class CIProvider:
                 try:
                     if self.monotonic() >= budget_deadline:
                         raise ClientError('deadline_exceeded')
-                    repo_rows, repo_groups = self._repo(repo, budget_deadline)
+                    repo_rows, repo_groups, repo_checks = self._repo(repo, budget_deadline)
                     record = {'repo': repo, 'observed_at': self.clock(), 'attempted_at': now,
                               'stale': False, 'error': None, 'retry_at': None,
-                              'runs': repo_rows, 'groups': repo_groups}
+                              'runs': repo_rows, 'groups': repo_groups, 'check_rows': repo_checks}
                     self._failures[repo] = 0
                 except Exception as exc:
                     category = error_category(exc.category) if isinstance(exc, ClientError) else 'source_failed'
@@ -264,16 +302,17 @@ class CIProvider:
                     retry = now + delay
                     if not math.isfinite(retry):
                         retry = now + 20
-                    record = copy.deepcopy(old) if old else {'repo': repo, 'observed_at': None, 'runs': [], 'groups': []}
+                    record = copy.deepcopy(old) if old else {'repo': repo, 'observed_at': None, 'runs': [], 'groups': [], 'check_rows': []}
                     record.update(attempted_at=now, stale=True, error=category, retry_at=now if category == 'deadline_exceeded' else retry)
             self._records[repo] = copy.deepcopy(record)
         for item in self.inventory:
             record = self._records[item.repo]
             rows.extend(copy.deepcopy(record['runs']))
             groups.extend(copy.deepcopy(record['groups']))
+            check_rows.extend(copy.deepcopy(record['check_rows']))
             observations.append({k: record[k] for k in ('repo', 'observed_at', 'attempted_at', 'stale', 'error', 'retry_at')})
-        data = {'schema': 'ci/v1', 'runs': rows, 'groups': groups, 'repositories': observations, 'recent_seconds': self.recent_seconds}
-        return Sample(copy_json_tree(data), hot=any(row['status'] in LIVE for row in rows) or any(o['stale'] for o in observations))
+        data = {'schema': 'ci/v1', 'runs': rows, 'groups': groups, 'repositories': observations, 'recent_seconds': self.recent_seconds, 'check_rows': check_rows}
+        return Sample(copy_json_tree(data), hot=any(row['status'] in LIVE for row in rows + check_rows) or any(o['stale'] for o in observations))
 
 
 def extract_fail_lines(body, step):
