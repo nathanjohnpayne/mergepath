@@ -350,6 +350,65 @@ class ExcerptTests(unittest.TestCase):
             self.assertEqual(cache.handle(params(), envelope(), deadline=121)['error'], error)
             self.assertEqual(len(calls), 2)
 
+    def test_cache_truncated_start_second_falls_back_to_whole_job_on_read_and_hit(self):
+        for start in ['2026-10-03T00:00:10Z', '2026-10-03T00:00:10.0000000Z']:
+            for prior in ['2026-10-03T00:00:10Z', '2026-10-03T00:00:10.2500000Z']:
+                with self.subTest(start=start, prior=prior):
+                    job = raw_job(); job['steps'][0]['started_at'] = start
+                    data = model(); data['runs'][0]['jobs'] = [normalize_job(job)]
+                    body = (prior + ' FAIL: prior step before actual start at .800\n'
+                            '2026-10-03T00:00:20.2500000Z FAIL: selected step\n'
+                            '2026-10-03T00:01:01Z FAIL: next step').encode()
+                    reads = []
+                    def read(*args):
+                        reads.append(args); return body
+                    cache = LogExcerptCache(INVENTORY, read)
+                    for _ in range(2):
+                        result = cache.handle(params(), envelope(data), deadline=time.monotonic()+1)
+                        self.assertEqual(result['scope'], 'job')
+                        self.assertEqual(result['lines'], ['FAIL: prior step before actual start at .800',
+                                                          'FAIL: selected step', 'FAIL: next step'])
+                        self.assertEqual(result['source'], 'Actions job log')
+                        self.assertEqual(result['status'], 'ok')
+                    self.assertEqual(len(reads), 1)
+
+    def test_cache_precise_start_and_interior_only_failures_retain_step_window(self):
+        body = (b'2026-10-03T00:00:10.2500000Z FAIL: prior step\n'
+                b'2026-10-03T00:00:10.8000000Z FAIL: exact precise start\n'
+                b'2026-10-03T00:00:20.2500000Z FAIL: selected step\n'
+                b'2026-10-03T00:01:01Z FAIL: next step')
+        job = raw_job(); job['steps'][0]['started_at'] = '2026-10-03T00:00:10.8000000Z'
+        data = model(); data['runs'][0]['jobs'] = [normalize_job(job)]
+        reads = []
+        def read(*args):
+            reads.append(args); return body
+        cache = LogExcerptCache(INVENTORY, read)
+        for _ in range(2):
+            result = cache.handle(params(), envelope(data), deadline=time.monotonic()+1)
+            self.assertEqual(result['scope'], 'step-time-window')
+            self.assertEqual(result['lines'], ['FAIL: exact precise start', 'FAIL: selected step'])
+        # Reproject the same cached job bytes for a whole-second start whose
+        # second has no FAIL lines; unrelated failures remain outside the window.
+        job['steps'][0]['started_at'] = '2026-10-03T00:00:11Z'
+        data['runs'][0]['jobs'] = [normalize_job(job)]
+        result = cache.handle(params(), envelope(data), deadline=time.monotonic()+1)
+        self.assertEqual(result['scope'], 'step-time-window')
+        self.assertEqual(result['lines'], ['FAIL: selected step'])
+        self.assertEqual(len(reads), 1)
+
+    def test_cache_ambiguous_start_fallback_preserves_bounded_chronological_tail(self):
+        body = (b'2026-10-03T00:00:10.2500000Z FAIL: ambiguous prior step\n' +
+                b'\n'.join(('2026-10-03T00:02:00Z FAIL: later ' + str(i)).encode() for i in range(100)))
+        job = raw_job(); job['steps'][0]['started_at'] = '2026-10-03T00:00:10Z'
+        data = model(); data['runs'][0]['jobs'] = [normalize_job(job)]
+        cache = LogExcerptCache(INVENTORY, lambda *args: body)
+        result = cache.handle(params(), envelope(data), deadline=time.monotonic()+1)
+        self.assertEqual(result['scope'], 'job')
+        self.assertEqual(result['source'], 'Actions job log')
+        self.assertTrue(result['truncated'])
+        self.assertEqual(result['lines'], ['FAIL: later ' + str(i) for i in range(20, 100)])
+        self.assertLessEqual(sum(len(line.encode()) for line in result['lines']), 32768)
+
     def test_timestamp_window_excludes_other_steps(self):
         step = normalize_job(raw_job())['steps'][0]
         result = extract_fail_lines(b'2026-10-02T23:59:00Z FAIL: before\n2026-10-03T00:00:10Z FAIL: wanted\n2026-10-03T00:02:00Z FAIL: after', step)
