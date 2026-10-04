@@ -304,9 +304,10 @@ class StartupDirectoryTests(unittest.TestCase):
     def launch(self, environment, opened):
         main = importlib.import_module("mergepath.cockpit.__main__")
         captured, closed = [], []
-        scheduler = SimpleNamespace(register=lambda *args, **kwargs: None, start=lambda: None)
+        scheduler = SimpleNamespace(register=lambda *args, **kwargs: None, start=lambda: None, close=lambda: None)
         app = SimpleNamespace(scheduler=scheduler, register_panel=lambda *args: None,
                               launch_url=lambda port: "http://127.0.0.1:1/fixture",
+                              publish=lambda: None, stopping=SimpleNamespace(set=lambda: None),
                               close=lambda: closed.append(True))
         server = SimpleNamespace(server_address=("127.0.0.1", 1), serve_forever=lambda: None,
                                  shutdown=lambda: None, server_close=lambda: None)
@@ -327,7 +328,7 @@ class StartupDirectoryTests(unittest.TestCase):
             stack.enter_context(patch.object(main, "resolve_history_settings", return_value=((), {})))
             stack.enter_context(patch.object(main, "load_reviewers", return_value=("fixture-reviewer",)))
             stack.enter_context(patch.object(main, "Application", return_value=app))
-            for name in ("CIProvider", "PRProvider", "FleetProvider", "ActionsProvider", "AgentsProvider"):
+            for name in ("CIProvider", "PRProvider", "FleetProvider", "ActionsProvider", "AgentsProvider", "SyncProvider"):
                 stack.enter_context(patch.object(main, name, return_value=empty))
             factory = stack.enter_context(patch.object(main, "LiveAgentsProvider", side_effect=live))
             http = stack.enter_context(patch.object(main, "CockpitServer", return_value=server))

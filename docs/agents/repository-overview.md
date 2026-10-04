@@ -6,7 +6,7 @@ Primary stack: Markdown documentation, shell automation, YAML review-policy conf
 
 The shared pull-request body parser and its standalone generated runtime are specified in [`specs/pr_body_contract.md`](../../specs/pr_body_contract.md).
 
-The hub-only Cockpit includes a read-only Fleet audit source: a thirty-minute schedule and authenticated manual refresh share one bounded subprocess and retain last-good rows on failure. Audit workers use the cached reviewer credential in an isolated cache; no Fleet action invokes propagation. Its contract is [Cockpit Fleet](https://github.com/nathanjohnpayne/mergepath/blob/main/specs/cockpit_fleet.md).
+The hub-only Cockpit includes a read-only Fleet audit source: a thirty-minute schedule and authenticated manual refresh share one bounded subprocess and retain last-good rows on failure. Audit workers use the cached reviewer credential in an isolated cache; refresh does not invoke propagation. The separate confirmed-sync flow previews current hub/consumer evidence, requires explicit confirmation and runs the fixed author-wrapped executor; its contract is [Cockpit confirmed sync](https://github.com/nathanjohnpayne/mergepath/blob/main/specs/cockpit_sync.md). Its contract is [Cockpit Fleet](https://github.com/nathanjohnpayne/mergepath/blob/main/specs/cockpit_fleet.md).
 
 `scripts/ci/check_doc_ownership` is a fail-closed repository-integrity check. It validates the `doc_ownership` inventory and verifies that canonical agent documentation does not contain rendered relative links to hub-only documentation that consumers do not receive. Its Markdown extraction contract is defined in [`specs/doc_ownership_validation.md`](../../specs/doc_ownership_validation.md) and covered by `tests/test_check_doc_ownership.sh`.
 

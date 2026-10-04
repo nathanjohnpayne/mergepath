@@ -791,6 +791,24 @@ class SchedulerTests(unittest.TestCase):
         self.assertNotIn(error.category, json.dumps(current))
 
 
+class AdmissionSlots(threading.BoundedSemaphore):
+    """Expose a saturated accept attempt without scheduling sleeps in the client."""
+    def __init__(self):
+        super().__init__(8)
+        self.saturated = threading.Event()
+        self.admission_finished = threading.Event()
+
+    def acquire(self, *args, **kwargs):
+        with self._cond:
+            saturated = self._value == 0
+        if saturated:
+            self.saturated.set()
+        result = super().acquire(*args, **kwargs)
+        if saturated:
+            self.admission_finished.set()
+        return result
+
+
 class ServerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -818,7 +836,7 @@ class ServerTests(unittest.TestCase):
             connection.close()
         self.app.close(); self.server.shutdown(); self.server.server_close(); self.thread.join(1)
 
-    def request(self, method="GET", path="/api/snapshot", *, headers=None, authenticated=True, stream=False, scoped=True):
+    def request(self, method="GET", path="/api/snapshot", *, headers=None, authenticated=True, stream=False, scoped=True, body=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=1)
         self.connections.append(connection)
         if scoped and path not in {"/bootstrap", "/bootstrap.js", "/api/bootstrap"}:
@@ -828,7 +846,7 @@ class ServerTests(unittest.TestCase):
         if authenticated and self.cookie:
             pairs.append(("Cookie", self.cookie))
         for key, value in pairs: connection.putheader(key, value)
-        connection.endheaders()
+        connection.endheaders(body)
         response = connection.getresponse()
         if stream:
             return response
@@ -1035,6 +1053,56 @@ class ServerTests(unittest.TestCase):
         self.app.scheduler.tick()
         self.assertEqual(len(calls), 2)
 
+    def test_sync_routes_bind_server_session_and_preserve_auth_and_csrf(self):
+        self.bootstrap()
+        calls = []
+        state = {"schema": "cockpit-sync/v1", "phase": "previewing", "preview": None, "run": None, "error": None}
+        def action(session, payload):
+            calls.append((session, payload))
+            return state
+        self.app.sync = SimpleNamespace(preview=action, confirm=action, cancel=action,
+                                        snapshot=lambda session: state, close=lambda: None)
+        headers = [("Host", self.host), ("Origin", "http://" + self.host),
+                   ("X-Cockpit-CSRF", self.app._csrf), ("Content-Type", "application/json")]
+        body = b'{"repos":["owner/consumer"]}'
+        for name in ("preview", "confirm", "cancel"):
+            reply = self.request("POST", "/api/sync/" + name,
+                                 headers=headers + [("Content-Length", str(len(body)))], body=body)
+            self.assertEqual(reply[0], 202)
+            self.assertEqual(json.loads(reply[2]), state)
+        self.assertTrue(all(session == self.app._session for session, payload in calls))
+        self.assertEqual(calls[0][1], {"repos": ["owner/consumer"]})
+        self.assertEqual(json.loads(self.request()[2])["sync"], state)
+        for bad_headers, authenticated, expected in [(headers, False, 401), (headers[:2], True, 403),
+                ([("Host", self.host), ("Origin", "https://foreign.invalid")], True, 403)]:
+            self.assertEqual(self.request("POST", "/api/sync/confirm", authenticated=authenticated,
+                headers=bad_headers + [("Content-Length", str(len(body)))], body=body)[0], expected)
+        self.assertEqual(len(calls), 3)
+
+    def test_sync_routes_reject_ambiguous_json_framing_and_arbitrary_commands(self):
+        self.bootstrap()
+        calls = []
+        self.app.sync = SimpleNamespace(preview=lambda *args: calls.append(args),
+                                        snapshot=lambda session: None, close=lambda: None)
+        headers = [("Host", self.host), ("Origin", "http://" + self.host),
+                   ("X-Cockpit-CSRF", self.app._csrf), ("Content-Type", "application/json")]
+        for body in (b'[]', b'{"repos":[],"repos":[]}', b'{"x":NaN}', b'{"x":Infinity}', b'{"x":1e9999}', b'not-json', b'\xff'):
+            self.assertEqual(self.request("POST", "/api/sync/preview", headers=headers +
+                [("Content-Length", str(len(body)))], body=body)[0], 400)
+        for route in ("/api/sync/preview?command=push", "/api/sync/confirm?repo=evil"):
+            self.assertEqual(self.request("POST", route, headers=headers + [("Content-Length", "2")], body=b'{}')[0], 400)
+        self.assertEqual(self.request("POST", "/api/sync/execute", headers=headers)[0], 405)
+        self.assertEqual(self.request("POST", "/api/sync/preview", headers=headers + [("Content-Length", "4097")])[0], 413)
+        self.assertEqual(self.request("POST", "/api/sync/preview", headers=headers + [("Transfer-Encoding", "chunked")])[0], 400)
+        with patch("mergepath.cockpit.server.SYNC_BODY_SECONDS", 0.03):
+            before = time.monotonic()
+            self.assertEqual(self.request("POST", "/api/sync/preview", headers=headers +
+                [("Content-Length", "2")], body=b'{')[0], 400)
+            self.assertLess(time.monotonic() - before, 0.5)
+        self.assertEqual(calls, [])
+        self.app.sync = None
+        self.assertEqual(self.request("POST", "/api/sync/preview", headers=headers + [("Content-Length", "2")], body=b'{}')[0], 503)
+
     def test_real_shell_and_local_assets_require_session_and_keep_csp(self):
         self.app.static_root = ROOT / "mergepath/cockpit"
         for route in ["/", "/assets/app.js", "/assets/components.js", "/assets/cockpit.css",
@@ -1237,6 +1305,113 @@ class ServerTests(unittest.TestCase):
         response.close()
         self.assertEqual(self.github.budget(), {})
 
+    def test_asset_burst_waits_for_capacity_without_exceeding_eight_handlers(self):
+        self.bootstrap()
+        wait_until(lambda: self.server._request_slots._value == 8)
+        slots = AdmissionSlots()
+        self.server._request_slots = slots
+        entered = [threading.Event() for _ in range(8)]
+        release = [threading.Event() for _ in range(8)]
+        lock = threading.Lock()
+        active, peak, sequence = 0, 0, 0
+        original_handler = self.server.RequestHandlerClass
+        results = [None] * 9
+
+        class BurstHandler(original_handler):
+            def _static(handler, path):
+                nonlocal active, peak, sequence
+                with lock:
+                    index = sequence
+                    sequence += 1
+                    active += 1
+                    peak = max(peak, active)
+                try:
+                    if index < 8:
+                        entered[index].set()
+                        if not release[index].wait(2):
+                            raise AssertionError("fixture asset release expired")
+                    super()._static(path)
+                finally:
+                    with lock:
+                        active -= 1
+
+        self.server.RequestHandlerClass = BurstHandler
+        def read_asset(index):
+            try:
+                results[index] = self.request(path="/assets/fixture.js")
+            except (OSError, http.client.HTTPException) as error:
+                results[index] = type(error).__name__
+        clients = [threading.Thread(target=read_asset, args=(index,), daemon=True) for index in range(9)]
+        try:
+            for index, client in enumerate(clients[:8]):
+                client.start()
+                self.assertTrue(entered[index].wait(1))
+            self.assertTrue(all(event.wait(1) for event in entered))
+            self.assertEqual(peak, 8)
+            clients[8].start()
+            self.assertTrue(slots.saturated.wait(1))
+            self.assertFalse(slots.admission_finished.wait(0.025), "saturated asset was immediately refused")
+            release[0].set()
+            clients[8].join(1)
+            self.assertFalse(clients[8].is_alive())
+            self.assertIsInstance(results[8], tuple)
+            self.assertEqual(results[8][0], 200)
+            self.assertEqual(results[8][2], (self.root / "assets/fixture.js").read_bytes())
+        finally:
+            for event in release: event.set()
+            for client in clients:
+                if client.ident is not None: client.join(1)
+        self.assertTrue(all(isinstance(result, tuple) and result[0] == 200 for result in results))
+        self.assertLessEqual(peak, 8)
+        wait_until(lambda: slots._value == 8)
+
+    def test_saturated_admission_times_out_and_shutdown_remains_bounded(self):
+        self.bootstrap()
+        wait_until(lambda: self.server._request_slots._value == 8)
+        slots = AdmissionSlots()
+        self.server._request_slots = slots
+        for _ in range(8): self.assertTrue(slots.acquire(blocking=False))
+        result = []
+        def read_asset():
+            started = time.monotonic()
+            try:
+                result.append(("response", self.request(path="/assets/fixture.js"), time.monotonic() - started))
+            except (OSError, http.client.HTTPException) as error:
+                result.append((type(error).__name__, None, time.monotonic() - started))
+        client = threading.Thread(target=read_asset, daemon=True)
+        try:
+            client.start()
+            self.assertTrue(slots.saturated.wait(1))
+            shutdown_started = time.monotonic()
+            self.server.shutdown()
+            self.assertLess(time.monotonic() - shutdown_started, 1.25)
+            client.join(1)
+            self.assertFalse(client.is_alive())
+            self.assertEqual(len(result), 1)
+            self.assertIn(result[0][0], ("RemoteDisconnected", "ConnectionResetError"))
+            self.assertGreaterEqual(result[0][2], 0.4)
+            self.assertLess(result[0][2], 1.25)
+            self.assertEqual(slots._value, 0)
+        finally:
+            for _ in range(8): slots.release()
+            client.join(1)
+        self.assertEqual(slots._value, 8)
+
+    def test_admission_slot_returns_after_dispatch_or_handler_failure(self):
+        wait_until(lambda: self.server._request_slots._value == 8)
+        base = CockpitServer.__mro__[1]
+        request = object()
+        with patch.object(base, "process_request", side_effect=RuntimeError("fixture dispatch failure")), \
+             patch.object(self.server, "shutdown_request") as close:
+            self.server.process_request(request, ("127.0.0.1", 1))
+        close.assert_called_once_with(request)
+        self.assertEqual(self.server._request_slots._value, 8)
+        self.assertTrue(self.server._request_slots.acquire(blocking=False))
+        with patch.object(base, "process_request_thread", side_effect=RuntimeError("fixture handler failure")):
+            with self.assertRaises(RuntimeError):
+                self.server.process_request_thread(request, ("127.0.0.1", 1))
+        self.assertEqual(self.server._request_slots._value, 8)
+
     def test_sse_connection_bound_and_shutdown(self):
         self.bootstrap()
         streams = [self.request(path="/events", stream=True) for _ in range(2)]
@@ -1306,6 +1481,175 @@ class InventoryAndLauncherTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertNotIn("fixture server launched", result.stdout)
 
+    def test_shutdown_stops_audit_before_waiting_on_sync_preview(self):
+        main = importlib.import_module("mergepath.cockpit.__main__")
+        events = []
+        app = SimpleNamespace(stopping=threading.Event(), scheduler=SimpleNamespace(close=lambda: events.append("scheduler")),
+                              close=lambda: events.append("sync"))
+        fleet = SimpleNamespace(close=lambda: events.append("fleet"))
+        main.close_runtime(app, fleet)
+        self.assertTrue(app.stopping.is_set())
+        self.assertEqual(events, ["scheduler", "fleet", "sync"])
+
+    def test_fleet_constructor_refusal_keeps_unrelated_panels_and_refuses_sync(self):
+        main = importlib.import_module("mergepath.cockpit.__main__")
+        fleet_module = importlib.import_module("mergepath.cockpit.fleet")
+        panels = {"ci": "ci", "prs": "prs", "budget": "actions",
+                  "history": "agents", "agents": "live_agents"}
+        boundaries = {"CIProvider": "ci", "PRProvider": "prs", "ActionsProvider": "actions",
+                      "AgentsProvider": "agents", "LiveAgentsProvider": "live_agents"}
+        for fault in ("missing-tool", "workspace"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temp:
+                applications, workspaces, thread_errors, output = [], [], [], io.StringIO()
+                client = GitHubClient(TOKEN, transport=HTTPFixture())
+                def application(*args, **kwargs):
+                    app = Application(*args, **kwargs); applications.append(app); return app
+                real_allocate = tempfile.mkdtemp
+                def allocate(*args, **kwargs):
+                    path = real_allocate(prefix="fixture-fleet-", dir=temp)
+                    workspaces.append(Path(path)); return path
+                def which(tool, *, path):
+                    self.assertEqual(path, fleet_module.UTILITY_PATH)
+                    return None if fault == "missing-tool" and tool == "gh" else "/bin/true"
+                def opened(url):
+                    app = applications[0]
+                    wait_until(lambda: all(app.panel_snapshot(panel)["envelope"]["data"] is not None
+                                           for panel in panels), timeout=2)
+                    parts = urllib.parse.urlsplit(url); authority = "http://" + parts.netloc
+                    fragment = urllib.parse.parse_qs(parts.fragment); nonce = fragment["launch"][0]
+                    scope = "/s/" + fragment["scope"][0]
+                    connection = http.client.HTTPConnection("127.0.0.1", int(parts.port), timeout=1)
+                    try:
+                        connection.request("POST", "/api/bootstrap", headers={"Origin": authority,
+                            "X-Cockpit-Bootstrap": nonce, "X-Cockpit-CSRF": nonce})
+                        response = connection.getresponse(); self.assertEqual(response.status, 204)
+                        cookie = [v for k, v in response.getheaders() if k.lower() == "set-cookie"][-1].split(";", 1)[0]
+                        response.read()
+                        headers = {"Cookie": cookie}
+                        connection.request("GET", scope + "/api/snapshot", headers=headers)
+                        response = connection.getresponse(); self.assertEqual(response.status, 200)
+                        snapshot = json.loads(response.read())
+                        self.assertEqual(set(snapshot["sources"]), set(panels.values()))
+                        self.assertIsNone(snapshot["sync"]); self.assertIsNone(app.sync)
+                        for panel, source in panels.items():
+                            connection.request("GET", scope + "/api/panels/" + panel, headers=headers)
+                            response = connection.getresponse(); self.assertEqual(response.status, 200)
+                            value = json.loads(response.read())
+                            self.assertEqual(value["source"], source)
+                            self.assertEqual(value["envelope"]["data"], {"fixture_read_boundary": source})
+                            self.assertFalse(value["envelope"]["stale"])
+                        connection.request("GET", scope + "/api/panels/fleet", headers=headers)
+                        response = connection.getresponse(); self.assertEqual(response.status, 200)
+                        missing = json.loads(response.read())
+                        self.assertIsNone(missing["source"]); self.assertIsNone(missing["envelope"]["data"])
+                        self.assertTrue(missing["envelope"]["stale"])
+                        connection.request("GET", scope + "/api/session", headers=headers)
+                        response = connection.getresponse(); self.assertEqual(response.status, 200)
+                        csrf = json.loads(response.read())["csrf"]
+                        connection.request("POST", scope + "/api/sync/preview", body="{}", headers={
+                            **headers, "Origin": authority, "X-Cockpit-CSRF": csrf, "Content-Type": "application/json"})
+                        response = connection.getresponse(); self.assertEqual(response.status, 503)
+                        self.assertEqual(json.loads(response.read()), {"error": "sync_unavailable"})
+                        self.assertNotIn(nonce, output.getvalue()); self.assertNotIn(csrf, output.getvalue())
+                    finally:
+                        connection.close()
+                    raise KeyboardInterrupt  # Stop the actual local server normally.
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(patch.object(main.GitHubClient, "from_environment", return_value=client))
+                    stack.enter_context(patch.object(main, "load_inventory", return_value=(
+                        Repository("mergepath", HUB, True), Repository("one", "fixture/one"))))
+                    stack.enter_context(patch.object(main, "Application", side_effect=application))
+                    # Replace only provider reads; keep real construction refusal,
+                    # Application, Scheduler, authenticated HTTP and shutdown.
+                    for name, source in boundaries.items():
+                        fetch = lambda deadline, source=source: Sample({"fixture_read_boundary": source})
+                        provider = fetch if name in ("CIProvider", "PRProvider") else SimpleNamespace(fetch=fetch)
+                        stack.enter_context(patch.object(main, name, return_value=provider))
+                    stack.enter_context(patch.object(main, "resolve_history_settings", return_value=((), {})))
+                    stack.enter_context(patch.object(main, "load_reviewers", return_value=("fixture-reviewer",)))
+                    stack.enter_context(patch.object(main, "resolve_live_directory", return_value=Path(temp) / "heartbeats"))
+                    sync = stack.enter_context(patch.object(main, "SyncProvider", side_effect=AssertionError("sync must stay unavailable")))
+                    stack.enter_context(patch.object(fleet_module.shutil, "which", side_effect=which))
+                    stack.enter_context(patch.object(fleet_module.tempfile, "mkdtemp", side_effect=allocate))
+                    if fault == "workspace":
+                        stack.enter_context(patch.object(Path, "symlink_to", side_effect=OSError("fixture-private-workspace-failure")))
+                    opener = stack.enter_context(patch.object(main, "open_browser", side_effect=opened))
+                    stack.enter_context(patch.object(threading, "excepthook", side_effect=lambda args: thread_errors.append(args.exc_type.__name__)))
+                    stack.enter_context(patch.dict(os.environ, {"OP_PREFLIGHT_AUTHOR_PAT": "fixture-author-secret",
+                        "OP_PREFLIGHT_REVIEWER_PAT": TOKEN, "GH_TOKEN": "fixture-ambient-secret"}, clear=True))
+                    stack.enter_context(contextlib.redirect_stdout(output)); stack.enter_context(contextlib.redirect_stderr(output))
+                    self.assertEqual(main.main([]), 0, output.getvalue())
+                    opener.assert_called_once(); sync.assert_not_called()
+                    self.assertFalse(any(key in os.environ for key in ("OP_PREFLIGHT_AUTHOR_PAT", "OP_PREFLIGHT_REVIEWER_PAT", "GH_TOKEN")))
+                self.assertTrue(applications[0].stopping.is_set()); self.assertEqual(thread_errors, [])
+                self.assertTrue(all(not path.exists() for path in workspaces))
+                self.assertEqual(len(workspaces), 0 if fault == "missing-tool" else 1)
+                self.assertIn("Fleet audits unavailable", output.getvalue())
+                for private in (TOKEN, temp, "fixture-private-workspace-failure", "fixture-author-secret", "fixture-ambient-secret"):
+                    self.assertNotIn(private, output.getvalue())
+
+    def test_launcher_agent_reaches_main_sync_provider_without_credentials(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "scripts").mkdir()
+            (root / "mergepath" / "cockpit").mkdir(parents=True)
+            launcher = root / "scripts" / "cockpit.sh"
+            launcher.write_bytes((ROOT / "scripts" / "cockpit.sh").read_bytes())
+            preflight = root / "scripts" / "op-preflight.sh"
+            preflight.write_text('#!/bin/bash\nprintf "%s\\n" "$*" > "$COCKPIT_TEST_CALLS"\n'
+                                 'printf "export OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-credential\\n"\n')
+            preflight.chmod(0o755)
+            # Execute the actual Python parser/construction path, stopping before
+            # any server, provider worker or credential operation can start.
+            (root / "mergepath" / "cockpit" / "__main__.py").write_text(
+                'import importlib, json, sys, threading\n'
+                'from contextlib import ExitStack\nfrom types import SimpleNamespace\n'
+                'from unittest.mock import patch\n'
+                f'sys.path.insert(0, {str(ROOT)!r})\n'
+                'main = importlib.import_module("mergepath.cockpit.__main__")\n'
+                'def sync(*args, agent="codex", **kwargs):\n'
+                '    print(json.dumps({"agent":agent,"cache_dir":str(kwargs["cache_dir"])}))\n'
+                '    return SimpleNamespace(close=lambda: None)\n'
+                'scheduler = SimpleNamespace(register=lambda *a, **k: None, close=lambda: None)\n'
+                'app = SimpleNamespace(stopping=threading.Event(), scheduler=scheduler,\n'
+                '    register_panel=lambda *a: None, publish=lambda: None, close=lambda: None)\n'
+                'with ExitStack() as stack:\n'
+                '    stack.enter_context(patch.object(main.GitHubClient, "from_environment", return_value=SimpleNamespace(_token="fixture-only")))\n'
+                '    stack.enter_context(patch.object(main, "load_inventory", return_value=()))\n'
+                '    stack.enter_context(patch.object(main, "resolve_history_settings", return_value=((), {})))\n'
+                '    stack.enter_context(patch.object(main, "load_reviewers", return_value=("fixture-reviewer",)))\n'
+                '    stack.enter_context(patch.object(main, "Application", return_value=app))\n'
+                '    for name in ("FleetProvider", "CIProvider", "LogExcerptCache", "PRProvider", "ActionsProvider", "AgentsProvider", "LiveAgentsProvider"):\n'
+                '        stack.enter_context(patch.object(main, name, return_value=SimpleNamespace(fetch=lambda deadline: None, close=lambda: None)))\n'
+                '    stack.enter_context(patch.object(main, "SyncProvider", side_effect=sync))\n'
+                '    stack.enter_context(patch.object(main, "CockpitServer", side_effect=ValueError("fixture-stop-before-server")))\n'
+                '    raise SystemExit(main.main(sys.argv[1:]))\n')
+            calls, cache = root / "calls", root / "cache"
+            env = {**os.environ, "COCKPIT_TEST_CALLS": str(calls), "OP_PREFLIGHT_CACHE_DIR": str(cache),
+                   "OP_PREFLIGHT_AGENT": "cursor"}
+            for agent, arguments in [("codex", []), ("codex", ["--agent", "codex"]),
+                                     ("claude", ["--agent", "claude"]), ("cursor", ["--agent", "cursor"])]:
+                with self.subTest(agent=agent, arguments=arguments):
+                    result = subprocess.run(["bash", str(launcher), *arguments], env=env,
+                                            capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(calls.read_text().strip(), f"--agent {agent} --check --print-exports")
+                    self.assertEqual(json.loads(result.stdout), {"agent": agent, "cache_dir": str(cache.resolve())})
+                    direct = subprocess.run([sys.executable, "-I", str(root / "mergepath" / "cockpit" / "__main__.py"),
+                                             *arguments], env=env, capture_output=True, text=True, timeout=5)
+                    self.assertEqual(direct.returncode, 1, direct.stderr)
+                    self.assertEqual(json.loads(direct.stdout), {"agent": agent, "cache_dir": str(cache.resolve())})
+            calls.unlink()
+            for arguments in (["--agent", "unknown"], ["--agent"]):
+                result = subprocess.run(["bash", str(launcher), *arguments], env=env,
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 2)
+                self.assertFalse(calls.exists())
+            result = subprocess.run([sys.executable, "-I", str(root / "mergepath" / "cockpit" / "__main__.py"),
+                                     "--agent", "unknown"], env=env, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(result.stdout, "")
+
     def test_launcher_resolves_settings_at_caller_before_changing_directory(self):
         with tempfile.TemporaryDirectory() as temp:
             root, caller = Path(temp) / "hub", Path(temp) / "caller"
@@ -1320,7 +1664,7 @@ class InventoryAndLauncherTests(unittest.TestCase):
             preflight.chmod(0o755)
             (root / "mergepath" / "cockpit" / "__main__.py").write_text(
                 'import argparse, json\nfrom pathlib import Path\n'
-                'parser = argparse.ArgumentParser()\nparser.add_argument("--port")\n'
+                'parser = argparse.ArgumentParser()\nparser.add_argument("--port")\nparser.add_argument("--agent")\n'
                 'parser.add_argument("--actions-settings")\nparser.add_argument("--agents-settings")\nargs = parser.parse_args()\n'
                 'path = Path(args.actions_settings or args.agents_settings)\n'
                 'print(json.dumps({"path":str(path),"data":json.loads(path.read_text())}))\n')
@@ -1455,11 +1799,12 @@ class InventoryAndLauncherTests(unittest.TestCase):
         client = GitHubClient(TOKEN, transport=HTTPFixture())
         with patch.object(main.GitHubClient, "from_environment", return_value=client), \
              patch.object(main, "load_inventory", return_value=(Repository("mergepath", HUB, True),)), \
+             patch.object(main, "FleetProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}), close=lambda: None)), \
+             patch.object(main, "SyncProvider", return_value=SimpleNamespace(snapshot=lambda session: None, close=lambda: None)), \
              patch.object(main, "resolve_history_settings", return_value=((), {})), \
              patch.object(main, "load_reviewers", return_value=("fixture-reviewer",)), \
              patch.object(main, "AgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))), \
              patch.object(main, "LiveAgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))), \
-             patch.object(main, "FleetProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}), close=lambda: None)), \
              patch.object(main, "open_browser", return_value=False) as opener, \
              patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             self.assertEqual(main.main([]), 1)
@@ -1530,11 +1875,12 @@ class InventoryAndLauncherTests(unittest.TestCase):
             return real_join(thread, timeout)
         with patch.object(main.GitHubClient, "from_environment", return_value=client), \
              patch.object(main, "load_inventory", return_value=(Repository("mergepath", HUB, True),)), \
+             patch.object(main, "FleetProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}), close=lambda: None)), \
+             patch.object(main, "SyncProvider", return_value=SimpleNamespace(snapshot=lambda session: None, close=lambda: None)), \
              patch.object(main, "resolve_history_settings", return_value=((), {})), \
              patch.object(main, "load_reviewers", return_value=("fixture-reviewer",)), \
              patch.object(main, "AgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))), \
              patch.object(main, "LiveAgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))), \
-             patch.object(main, "FleetProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}), close=lambda: None)), \
              patch.object(main.shutil, "which", return_value="/fixture/xdg-open"), \
              patch.object(main.subprocess, "Popen", side_effect=opener), \
              patch.object(threading.Thread, "join", interrupt_after_launch), \

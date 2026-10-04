@@ -26,6 +26,7 @@ from mergepath.cockpit.live_agents import LiveAgentsProvider, resolve_live_direc
 from mergepath.cockpit.ci import CIProvider, LogExcerptCache
 from mergepath.cockpit.prs import PRProvider
 from mergepath.cockpit.server import Application, CockpitServer
+from mergepath.cockpit.sync import SyncProvider
 
 
 def open_browser(url):
@@ -45,6 +46,19 @@ def open_browser(url):
             return True
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def close_runtime(app, fleet):
+    """Stop audit owners before a preview worker waiting on their result."""
+    if app is not None:
+        app.stopping.set()
+        app.scheduler.close()
+    try:
+        if fleet is not None:
+            fleet.close()
+    finally:
+        if app is not None:
+            app.close()
 
 
 def load_settings_json(path):
@@ -94,6 +108,8 @@ def shared_ci_snapshot(app, repo, _fetch_now):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Local Mergepath Cockpit")
+    parser.add_argument("--agent", choices=("codex", "claude", "cursor"), default="codex",
+                        help="agent whose existing credential cache is used for confirmed sync")
     parser.add_argument("--port", type=int, default=0, help="loopback port; 0 chooses an available port")
     parser.add_argument("--actions-settings", help="local JSON containing explicit budget, cycle and measured coefficients")
     parser.add_argument("--agents-settings", help="local JSON containing explicit checkout roots and optional price keys")
@@ -105,8 +121,11 @@ def main(argv=None):
         actions_settings = load_settings_json(args.actions_settings)
         agents_settings = load_settings_json(args.agents_settings)
         github = GitHubClient.from_environment(os.environ)
-        # Drop credentials the read-only foundation does not need. Future
-        # owner-only reads/write wrappers have their own explicit contracts.
+        # Resolve the canonical cache once before worker HOME/XDG isolation.
+        cache_dir = Path(os.environ.get("OP_PREFLIGHT_CACHE_DIR") or
+                         str(Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "mergepath")).resolve()
+        # Only the confirmed worker may reacquire author credentials through
+        # the canonical cache-check wrapper; the server keeps reviewer reads.
         for name in ("OP_PREFLIGHT_REVIEWER_PAT", "OP_PREFLIGHT_AUTHOR_PAT", "GH_TOKEN",
                      "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
             os.environ.pop(name, None)
@@ -130,6 +149,12 @@ def main(argv=None):
             app.scheduler.register("fleet", fleet.fetch, hot_interval=1800, idle_interval=1800,
                                    timeout=180, max_backoff=7200)
             app.register_panel("fleet", "fleet")
+            def completed():
+                if not app.stopping.is_set():
+                    app.scheduler.refresh("fleet")
+                    app.scheduler.refresh("prs")
+            app.sync = SyncProvider(inventory, ROOT, fleet.fetch, cache_dir=cache_dir, agent=args.agent,
+                                    changed=app.publish, completed=completed)
         actions_provider = ActionsProvider(github, inventory, settings=actions_settings,
                                            ci_snapshot=lambda repo, now: shared_ci_snapshot(app, repo, now))
         app.scheduler.register("actions", actions_provider.fetch, hot_interval=15, idle_interval=120, timeout=30)
@@ -142,10 +167,7 @@ def main(argv=None):
         app.register_panel("agents", "live_agents")
         server = CockpitServer(app, args.port)
     except (ClientError, ValueError, OSError):
-        if app is not None:
-            app.close()
-        if fleet is not None:
-            fleet.close()
+        close_runtime(app, fleet)
         print("Cockpit cannot start. Check the cached reviewer credential, installed hub yq, settings JSON and loopback port.",
               file=sys.stderr)
         return 1
@@ -165,9 +187,7 @@ def main(argv=None):
     except KeyboardInterrupt:
         pass
     finally:
-        app.close()
-        if fleet is not None:
-            fleet.close()
+        close_runtime(app, fleet)
         server.shutdown()
         server.server_close()
         thread.join(timeout=1)

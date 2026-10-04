@@ -775,6 +775,7 @@ meta_branch="mergepath-sync/${meta_sha:0:7}"
 cat >"$META_FAKE_BIN/gh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+printf '%s\n' "$*" >>"$MERGEPATH_TEST_CAPTURE_DIR/gh-calls-${MERGEPATH_TEST_RUN}.txt"
 case "${1:-} ${2:-}" in
   "config get")
     printf '%s\n' "nathanjohnpayne"
@@ -784,7 +785,7 @@ case "${1:-} ${2:-}" in
     # every other branch remains unused.
     if [ -n "${MERGEPATH_TEST_EXISTING_BRANCH:-}" ] \
        && [ "${2:-}" = "repos/example/alpha/pulls?state=all&head=example:${MERGEPATH_TEST_EXISTING_BRANCH}" ]; then
-      printf 'closed\t413\n'
+      printf '%s\t413\n' "${MERGEPATH_TEST_EXISTING_STATE:-closed}"
     fi
     exit 0
     ;;
@@ -2419,5 +2420,171 @@ grep -q '::warning::Could not read the consumer list' "$NOMAN/step.out" \
 grep -q '^(per-consumer summary unavailable' "$NOMAN/consumer-summary.txt" \
   || wf_fail "unreadable manifest did not produce the announced fallback: $(cat "$NOMAN/consumer-summary.txt")"
 echo "PASS: an unreadable consumer manifest is warned about and falls back to the summary-unavailable note (#1562)"
+
+# Cockpit's opt-in fresh branch preserves existing open PRs and clone identity.
+# Actual engine → local bare remote; gh is a fixture throughout.
+fresh_remote="$metadata_workdir/fresh.git"
+fresh_seed="$metadata_workdir/fresh-seed"
+setup_metadata_remote "$fresh_remote" "$fresh_seed"
+fresh_consumer_sha=$(git -C "$fresh_seed" rev-parse HEAD)
+git -C "$META_MP" branch -M main
+git -C "$META_MP" update-ref refs/remotes/origin/main "$meta_sha"
+old_branch="mergepath-sync/old-open"
+git --git-dir="$fresh_remote" update-ref "refs/heads/$old_branch" "$fresh_consumer_sha"
+fresh_nonce="0123456789abcdef0123456789abcdef"
+set +e
+fresh_out=$(env PATH="$META_FAKE_BIN:$PATH" MERGEPATH_ROOT_OVERRIDE="$META_MP" \
+  MERGEPATH_TEST_REMOTE_ALPHA="$fresh_remote" MERGEPATH_TEST_CAPTURE_DIR="$META_CAPTURE" MERGEPATH_TEST_RUN=129 \
+  MERGEPATH_TEST_EXISTING_BRANCH="$old_branch" MERGEPATH_TEST_EXISTING_STATE=open MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
+  "$SCRIPT" --sync-all --repos alpha --fresh-branch "$fresh_nonce" --expect-hub "$meta_sha" \
+  --expect-consumer "$fresh_consumer_sha" --progress-json 2>&1)
+fresh_rc=$?
+set -e
+[ "$fresh_rc" -eq 0 ] || fail "fresh branch failed: $fresh_out"
+[ "$(git --git-dir="$fresh_remote" rev-parse "refs/heads/$old_branch")" = "$fresh_consumer_sha" ] || fail "fresh mode altered old branch"
+! grep -Eq 'pr close|git/refs/heads/.*DELETE|api --include -X DELETE' "$META_CAPTURE/gh-calls-129.txt" || fail "fresh mode used destructive recreate"
+fresh_branch=$(git --git-dir="$fresh_remote" for-each-ref --format='%(refname:short)' 'refs/heads/mergepath-sync/sync-all-*')
+[[ "$fresh_branch" =~ ^mergepath-sync/sync-all-${meta_sha:0:7}-[0-9a-f]{12}-${fresh_nonce}$ ]] || fail "fresh branch nonce missing: $fresh_branch"
+stages=$(printf '%s\n' "$fresh_out" | sed -n 's/^@@cockpit-sync.*"kind":"stage".*"value":"\([^"]*\)".*/\1/p' | paste -sd, -)
+[ "$stages" = fetch,diff,branch,commit,PR ] || fail "engine operation events wrong: $stages"
+printf '%s\n' "$fresh_out" | grep -q '"kind":"result".*https://github.com/example/alpha/pull/129' || fail "actual PR result absent"
+echo "PASS: opt-in fresh branch leaves old open PR/branch intact and emits actual stages/results"
+
+for fence in hub consumer; do
+  hub_expect="$meta_sha"; consumer_expect="$fresh_consumer_sha"
+  if [ "$fence" = hub ]; then hub_expect=1111111111111111111111111111111111111111; else consumer_expect=1111111111111111111111111111111111111111; fi
+  set +e
+  fence_out=$(env PATH="$META_FAKE_BIN:$PATH" MERGEPATH_ROOT_OVERRIDE="$META_MP" \
+    MERGEPATH_TEST_REMOTE_ALPHA="$fresh_remote" MERGEPATH_TEST_CAPTURE_DIR="$META_CAPTURE" MERGEPATH_TEST_RUN="fence-$fence" MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
+    "$SCRIPT" --sync-all --repos alpha --fresh-branch aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --expect-hub "$hub_expect" --expect-consumer "$consumer_expect" 2>&1)
+  fence_rc=$?
+  set -e
+  [ "$fence_rc" -ne 0 ] || fail "moved $fence fence accepted"
+  if [ -f "$META_CAPTURE/gh-calls-fence-$fence.txt" ]; then
+    ! grep -q 'pr create' "$META_CAPTURE/gh-calls-fence-$fence.txt" || fail "moved $fence created PR"
+  fi
+done
+for flags in '--audit --fresh-branch 0123456789abcdef0123456789abcdef' '--sync-all --fresh-branch bad' '--sync-all --fresh-branch 0123456789abcdef0123456789abcdef --recreate-existing' '--sync-all --expect-hub 1111111111111111111111111111111111111111'; do
+  set +e
+  # Intentional fixed fixture argument splitting; no user input.
+  MERGEPATH_ROOT_OVERRIDE="$META_MP" "$SCRIPT" $flags >/dev/null 2>&1
+  option_rc=$?
+  set -e
+  [ "$option_rc" -eq 2 ] || fail "invalid confirmed option combination accepted: $flags"
+done
+echo "PASS: full identity fences and confirmed-option validation refuse before writes"
+
+# Reach the actual engine's pre-copy and pre-push checks after its initial
+# clean-hub check. Empty stdout from a failed status must never authorize writes.
+status_bin="$metadata_workdir/status-bin"
+mkdir -p "$status_bin"
+cp "$META_FAKE_BIN/gh" "$status_bin/gh"
+status_real_git=$(command -v git)
+cat >"$status_bin/git" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = -C ] && [ "${2:-}" = "$MERGEPATH_TEST_STATUS_HUB" ] && [ "${3:-}" = status ]; then
+  count=0
+  [ ! -f "$MERGEPATH_TEST_STATUS_COUNT" ] || count=$(cat "$MERGEPATH_TEST_STATUS_COUNT")
+  count=$((count + 1))
+  printf '%s\n' "$count" >"$MERGEPATH_TEST_STATUS_COUNT"
+  if [ "$count" -eq "$MERGEPATH_TEST_STATUS_FAIL_AT" ]; then exit 128; fi
+fi
+case " $* " in *" push "*) printf '%s\n' "$*" >>"$MERGEPATH_TEST_STATUS_PUSHES";; esac
+exec "$MERGEPATH_TEST_REAL_GIT" "$@"
+SH
+chmod +x "$status_bin/git"
+for status_at in 2 3; do
+  status_count="$metadata_workdir/status-count-$status_at"
+  status_pushes="$metadata_workdir/status-pushes-$status_at"
+  status_nonce=$(printf '%032d' "$status_at")
+  set +e
+  status_out=$(env PATH="$status_bin:$PATH" MERGEPATH_ROOT_OVERRIDE="$META_MP" \
+    MERGEPATH_TEST_REMOTE_ALPHA="$fresh_remote" MERGEPATH_TEST_CAPTURE_DIR="$META_CAPTURE" \
+    MERGEPATH_TEST_RUN="status-$status_at" MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
+    MERGEPATH_TEST_REAL_GIT="$status_real_git" MERGEPATH_TEST_STATUS_HUB="$META_MP" \
+    MERGEPATH_TEST_STATUS_COUNT="$status_count" MERGEPATH_TEST_STATUS_FAIL_AT="$status_at" \
+    MERGEPATH_TEST_STATUS_PUSHES="$status_pushes" \
+    "$SCRIPT" --sync-all --repos alpha --fresh-branch "$status_nonce" \
+      --expect-hub "$meta_sha" --expect-consumer "$fresh_consumer_sha" --progress-json 2>&1)
+  status_rc=$?
+  set -e
+  [ "$status_rc" -ne 0 ] || fail "failed hub status authorized actual engine at fence $status_at: $status_out"
+  printf '%s\n' "$status_out" | grep -q 'confirmed hub status unavailable' || fail "hub status failure reason missing at fence $status_at: $status_out"
+  [ "$(cat "$status_count")" -eq "$status_at" ] || fail "status failure did not reach expected actual fence $status_at"
+  [ ! -s "$status_pushes" ] || fail "failed status reached git push at fence $status_at"
+  [ ! -f "$META_CAPTURE/pr-body-status-$status_at.md" ] || fail "failed status reached PR creation at fence $status_at"
+  if [ "$status_at" -eq 2 ]; then
+    ! printf '%s\n' "$status_out" | grep -q '"kind":"stage".*"value":"diff"' || fail "failed pre-copy status reached diff"
+  else
+    printf '%s\n' "$status_out" | grep -q '"kind":"stage".*"value":"commit"' || fail "pre-push status fixture did not reach commit"
+  fi
+done
+echo "PASS: actual engine fails closed on unavailable pre-copy and pre-push hub status"
+
+# Exercise the actual PR-create block with the unchanged verified author
+# wrapper and a closed fake gh; no auth cache/keyring/network can be reached.
+telemetry_bin="$metadata_workdir/telemetry-bin"
+telemetry_home="$metadata_workdir/telemetry-home"
+mkdir -p "$telemetry_bin" "$telemetry_home"
+cat >"$telemetry_bin/gh" <<'SH'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in
+  "api user"|"pr view") printf '%s\n' nathanjohnpayne;;
+  "pr create")
+    case "$MERGEPATH_TEST_TELEMETRY_MODE" in
+      wrong) printf '%s\n' https://github.com/example/other/pull/99;;
+      duplicate) printf '%s\n' https://github.com/example/alpha/pull/99 https://github.com/example/alpha/pull/100;;
+      mixed) printf '%s\n' https://github.com/example/alpha/pull/99 https://github.com/example/other/pull/100;;
+      malformed) printf '%s\n' https://github.com/example/alpha/pull/0;;
+      missing) printf '%s\n' 'No URL';;
+      failed) printf '%s\n' https://github.com/example/alpha/pull/99;exit 7;;
+      *) printf '%s\n' https://github.com/example/alpha/pull/99;;
+    esac;;
+  *) echo 'unexpected closed fake gh call' >&2;exit 91;;
+esac
+SH
+chmod +x "$telemetry_bin/gh"
+python3 - "$SCRIPT" "$metadata_workdir/telemetry-block.sh" <<'PY'
+from pathlib import Path
+import sys
+source=Path(sys.argv[1]).read_text()
+begin=source.index('  local pr_url\n',source.index('sync_all_open_pr()'))
+end=source.index('\n}\n',begin)
+progress=source.index('sync_progress()');progress_end=source.index('\n}\n',progress)+3
+Path(sys.argv[2]).write_text('''set -euo pipefail
+SCRIPT_VERSION=fixture;SYNC_PROGRESS_JSON=1
+consumer_name=alpha;consumer_repo=example/alpha;branch=fixture;sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;short_sha=aaaaaaa
+canonical_lines=README.md;kit_lines=;templated_lines=;override_note=;authoring_agent=codex
+sync_coderabbit_ignore_block(){ :; }
+err(){ printf '%s\\n' "$*" >&2; }
+sync_author_gh(){ /bin/bash "$MERGEPATH_TEST_ACTUAL_WRAPPER" -- gh "$@"; }
+'''+source[progress:progress_end]+'\nprobe(){\n'+source[begin:end]+'\n}\nprobe\n')
+PY
+for telemetry_mode in verified wrong duplicate mixed malformed missing failed; do
+  set +e
+  telemetry_out=$(env -u GH_TOKEN -u GITHUB_TOKEN -u OP_PREFLIGHT_REVIEWER_PAT \
+    -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
+    PATH="$telemetry_bin:$PATH" HOME="$telemetry_home" GH_CONFIG_DIR="$telemetry_home" GH_HOST=github.com \
+    OP_PREFLIGHT_AUTHOR_PAT=ghp_synthetic_fixture \
+    MERGEPATH_TEST_ACTUAL_WRAPPER="$ROOT/scripts/gh-as-author.sh" \
+    MERGEPATH_TEST_TELEMETRY_MODE="$telemetry_mode" \
+    /bin/bash "$metadata_workdir/telemetry-block.sh" 2>&1)
+  telemetry_rc=$?
+  set -e
+  if [ "$telemetry_mode" = verified ]; then
+    [ "$telemetry_rc" -eq 0 ] || fail "actual author wrapper rejected synthetic success: $telemetry_out"
+    printf '%s\n' "$telemetry_out" | grep -Fq 'gh-as-author: verified PR #99 author=nathanjohnpayne' || fail 'actual wrapper verification diagnostic absent'
+    [ "$(printf '%s\n' "$telemetry_out" | grep -c '^@@cockpit-sync')" -eq 1 ] || fail 'expected one verified result event'
+    printf '%s\n' "$telemetry_out" | grep -Fq '"kind":"result","repo":"example/alpha","value":"https://github.com/example/alpha/pull/99"' || fail 'verified wrapper URL was not emitted exactly'
+    printf '%s\n' "$telemetry_out" | grep -Fq 'opened https://github.com/example/alpha/pull/99' || fail 'legacy human output changed'
+  else
+    ! printf '%s\n' "$telemetry_out" | grep -q '^@@cockpit-sync' || fail "unverified/ambiguous URL emitted telemetry: $telemetry_mode"
+    case "$telemetry_mode" in missing|failed)
+      [ "$telemetry_rc" -ne 0 ] || fail "actual wrapper failure lost its return status: $telemetry_mode";;
+    esac
+  fi
+done
+echo "PASS: actual verified author wrapper emits only one exact repository URL result"
 
 echo "test_sync_to_downstream: PASS"

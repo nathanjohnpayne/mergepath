@@ -10,6 +10,13 @@
 # Used by check_spec_test_alignment when the default filename search
 # wouldn't find the test.
 spec_test_map:
+  cockpit_sync:
+    - tests/test_cockpit_sync.py
+    - tests/test_cockpit_sync_ui.cjs
+    - tests/test_cockpit.py
+  cockpit_fleet:
+    - tests/test_cockpit_fleet.py
+    - tests/test_cockpit_fleet_ui.cjs
   cockpit_live_agents:
     - tests/test_cockpit_live_agents.py
     - tests/test_cockpit_live_agents_ui.cjs
@@ -19,9 +26,6 @@ spec_test_map:
   cockpit_actions:
     - tests/test_cockpit_actions.py
     - tests/test_cockpit_actions_ui.cjs
-  cockpit_fleet:
-    - tests/test_cockpit_fleet.py
-    - tests/test_cockpit_fleet_ui.cjs
   cockpit_ci:
     - tests/test_cockpit_ci.py
     - tests/test_cockpit_ci_ui.cjs
