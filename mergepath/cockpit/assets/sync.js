@@ -128,7 +128,7 @@
       this.inert=[];if(this.returnFocus?.isConnected)this.returnFocus.focus();
     }
     focusStep(key) {if(this.visible && this.focusKey!==key){this.focusKey=key;this.title.focus();}}
-    fail(error) {const value=String(error?.message??error??"Sync unavailable");this.error.hidden=false;this.error.textContent=REFUSALS[value]??(/^[a-z][a-z_]+$/.test(value)?"The operation could not complete. Check the Cockpit terminal, then close this dialog and create a new preview.":value.replaceAll("_"," "));}
+    fail(error) {const value=String(error?.message??error??"Sync unavailable");this.previewExpiryWarning=value==="preview_expired";this.error.hidden=false;this.error.textContent=REFUSALS[value]??(/^[a-z][a-z_]+$/.test(value)?"The operation could not complete. Check the Cockpit terminal, then close this dialog and create a new preview.":value.replaceAll("_"," "));}
     async open(repos) {
       if(this.busy)return;
       if(this.state?.phase==="running"){this.reveal();return;}
@@ -146,6 +146,10 @@
       if(!validState(state)){if(this.visible)this.fail("Sync evidence unavailable");this.start && (this.start.disabled=true);return false;}
       if(this.state?.run?.run_id===state.run?.run_id && state.run && this.state.run.events.some((event,index)=>JSON.stringify(event)!==JSON.stringify(state.run.events[index]))){if(this.visible)this.fail("Sync event history changed");return false;}
       this.state=JSON.parse(JSON.stringify(state));
+      if(state.phase!=="preview" || state.run){
+        this.clearTimer(this.expiryTimer);this.expiryTimer=null;
+        if(state.run && this.previewExpiryWarning){this.error.hidden=true;this.previewExpiryWarning=false;}
+      }
       if(state.phase==="running" && !this.visible && state.run.run_id!==this.dismissedRunId)this.reveal();
       if(!this.visible)return true;
       if(state.phase==="preview" && state.preview){
@@ -178,16 +182,17 @@
       }
       const details=C.element("details","sync-dry");details.append(C.element("summary","","Proposed dry-run scope"),C.element("p","soft",p.scope_note),C.element("pre","sync-log",p.dry_run));this.body.append(details);
       this.next=button("Continue to confirm",()=>this.showConfirm(),true);this.footer.replaceChildren(button("Cancel",()=>this.dismiss()),this.next);
-      this.clearTimer(this.expiryTimer);this.expiryTimer=this.setTimer(()=>this.controls(),Math.max(0,(p.expires_at-this.now())*1000));this.controls();
+      this.clearTimer(this.expiryTimer);this.expiryTimer=this.setTimer(()=>{if(this.state?.phase==="preview" && this.state.preview?.preview_id===p.preview_id)this.controls();},Math.max(0,(p.expires_at-this.now())*1000));this.controls();
       this.focusStep(`preview:${p.preview_id}`);
     }
     controls() {
-      const p=this.state?.preview;if(!p)return;
-      const selected=p.targets.filter(t=>this.choices[t.repo]!=="skip");const enabled=p.can_confirm && this.now()<p.expires_at && selected.length>0 && !this.busy;
+      const p=this.state?.preview;if(this.state?.phase!=="preview" || this.state.run || !p)return;
+      const blocked=!this.error.hidden && !this.previewExpiryWarning;
+      const selected=p.targets.filter(t=>this.choices[t.repo]!=="skip");const enabled=p.can_confirm && this.now()<p.expires_at && selected.length>0 && !this.busy && !blocked && !this.state.error;
       for(const t of p.targets)for(const c of t.choices){const b=this.choiceNodes.get(`${t.repo}:${c}`);if(b){b.setAttribute("aria-pressed",String(this.choices[t.repo]===c));b.classList.toggle("on",this.choices[t.repo]===c);}}
       if(this.next)this.next.disabled=!enabled;
       if(this.start)this.start.disabled=!enabled || selected.some(t=>t.ahead) && !this.ack?.checked;
-      if(this.now()>=p.expires_at)this.fail("Preview expired. Close and preview again.");
+      if(this.now()>=p.expires_at && !blocked && !this.state.error)this.fail("preview_expired");
     }
     showConfirm() {
       this.step="confirm";const p=this.state.preview, selected=p.targets.filter(t=>this.choices[t.repo]!=="skip");
@@ -200,7 +205,8 @@
       this.focusStep(`confirm:${p.preview_id}`);
     }
     async begin() {
-      if(this.busy || this.start?.disabled)return;this.busy=true;this.controls();
+      if(this.busy || this.state?.phase!=="preview" || this.state.run)return;
+      this.controls();if(this.start?.disabled)return;this.busy=true;this.controls();
       const p=this.state.preview;
       try{this.update(await this.actions.confirm({preview_id:p.preview_id,hub_sha:p.hub_sha,choices:{...this.choices},ack_ahead:!!this.ack?.checked}));}
       catch(e){this.fail(e);}finally{this.busy=false;this.controls();}

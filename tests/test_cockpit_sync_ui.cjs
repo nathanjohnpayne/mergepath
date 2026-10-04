@@ -144,3 +144,88 @@ test('both reduction paths and responsive dialog preserve pinned motion tokens',
   assert.match(css,/@keyframes sync-blink\{0%,100%\{opacity:1\}50%\{opacity:\.35\}\}/);
   assert.match(css,/@keyframes sync-burst.*34px/);
 });
+
+async function expiryFixture(){
+  const f=fixture();f.clock=now;f.view.now=()=>f.clock;await f.view.open(['owner/one']);
+  f.expiryCallback=[...f.timers.values()][0].fn;f.view.showConfirm();return f;
+}
+function successfulRun(){
+  const result={kind:'result',repo:'owner/one',value:'https://github.com/owner/one/pull/99'};
+  return runState([{id:1,...result}],'success',[result]);
+}
+test('accepted running and done runs retire preview authority, including queued expiry callbacks',async()=>{
+  for(const outcome of ['running','done']){
+    const f=await expiryFixture();
+    try{
+      await f.view.begin();if(outcome==='done')f.view.update(successfulRun());
+      assert.equal(f.timers.size,0);f.clock=now+301;f.expiryCallback();f.view.controls();
+      assert.equal(f.view.state.phase,outcome);assert.equal(f.view.error.hidden,true);
+      assert.equal(f.calls.filter(c=>c[0]==='confirm').length,1);
+      if(outcome==='done'){assert.equal(f.view.title.textContent,'Sync complete');assert.match(f.view.chips.textContent,/owner\/one #99/);}
+    }finally{f.view.close();}
+  }
+});
+test('a delayed accepted confirmation clears only the consumed preview warning through finally',async()=>{
+  const f=await expiryFixture();let release;
+  try{
+    f.view.actions.confirm=async payload=>{f.calls.push(['confirm',payload]);return await new Promise(resolve=>release=resolve);};
+    const pending=f.view.begin();f.clock=now+301;f.expiryCallback();
+    assert.equal(f.view.error.hidden,false);assert.match(f.view.error.textContent,/preview expired/i);
+    release(successfulRun());await pending;f.expiryCallback();
+    assert.equal(f.view.busy,false);assert.equal(f.timers.size,0);assert.equal(f.view.error.hidden,true);
+    assert.equal(f.view.title.textContent,'Sync complete');assert.match(f.view.chips.textContent,/owner\/one #99/);
+    assert.equal(f.calls.filter(c=>c[0]==='confirm').length,1);
+  }finally{f.view.close();}
+});
+test('hidden accepted run transitions retire expiry before returning without rendering',async()=>{
+  for(const outcome of ['running','done']){
+    const f=await expiryFixture();
+    try{
+      await f.view.begin();f.view.hide();f.view.update(outcome==='done'?successfulRun():runState());
+      assert.equal(f.view.visible,false);assert.equal(f.timers.size,0);f.clock=now+301;f.expiryCallback();
+      assert.equal(f.view.error.hidden,true);assert.equal(f.calls.filter(c=>c[0]==='confirm').length,1);
+      f.view.reveal();f.view.update(f.view.state);
+      if(outcome==='done')assert.match(f.view.chips.textContent,/owner\/one #99/);
+    }finally{f.view.close();}
+  }
+});
+test('queued expiry preserves invalid evidence, state errors, runtime refusal and unconsumed server expiry',async()=>{
+  for(const fault of ['invalid','state','cleanup','server-expiry']){
+    const f=await expiryFixture();
+    try{
+      if(fault==='invalid')assert.equal(f.view.update({schema:'invalid'}),false);
+      else if(fault==='state')f.view.update({schema:'cockpit-sync/v1',phase:'error',preview:preview(),run:null,error:'hub_dirty'});
+      else if(fault==='cleanup'){
+        await f.view.begin();const result={kind:'result',repo:'owner/one',value:'https://github.com/owner/one/pull/99'};
+        f.view.update(runState([{id:1,...result},{id:2,kind:'log',text:'cleanup_incomplete'}],'failed',[result]));
+      }else{
+        f.view.actions.confirm=async payload=>{f.calls.push(['confirm',payload]);return {schema:'cockpit-sync/v1',phase:'error',preview:preview(),run:null,error:'preview_expired'};};
+        await f.view.begin();assert.equal(f.view.state.run,null);
+      }
+      const warning=f.view.error.textContent;assert.equal(f.view.error.hidden,false);
+      f.clock=now+301;f.expiryCallback();f.view.controls();
+      assert.equal(f.view.error.textContent,warning);assert.equal(f.view.error.hidden,false);
+      if(fault==='invalid')assert.equal(f.view.start.disabled,true);
+      if(fault==='cleanup'){assert.match(warning,/cleanup could not be verified/i);assert.match(f.view.chips.textContent,/owner\/one #99/);}
+      if(fault==='server-expiry')assert.match(warning,/preview expired/i);
+    }finally{f.view.close();}
+  }
+});
+test('unconsumed expiry refuses before dispatch, and a later preview owns its own timer',async()=>{
+  const expired=await expiryFixture();
+  try{
+    expired.clock=now+301;await expired.view.begin();
+    assert.equal(expired.calls.filter(c=>c[0]==='confirm').length,0);assert.equal(expired.view.start.disabled,true);
+    assert.match(expired.view.error.textContent,/preview expired/i);
+  }finally{expired.view.close();}
+  const f=await expiryFixture();
+  try{
+    await f.view.begin();f.view.update(successfulRun());
+    const fresh={...preview(),preview_id:'q'.repeat(43),expires_at:now+600};
+    f.view.actions.preview=async payload=>{f.calls.push(['preview',payload]);return state(fresh);};
+    await f.view.open(['owner/one']);f.view.showConfirm();assert.equal(f.timers.size,1);
+    const freshCallback=[...f.timers.values()][0].fn;f.clock=fresh.expires_at+1;f.expiryCallback();
+    assert.equal(f.view.error.hidden,true);freshCallback();assert.equal(f.view.start.disabled,true);
+    await f.view.begin();assert.equal(f.calls.filter(c=>c[0]==='confirm').length,1);assert.match(f.view.error.textContent,/preview expired/i);
+  }finally{f.view.close();}
+});
