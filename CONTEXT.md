@@ -22,7 +22,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Central docs repo**: The `nathanjohnpayne/docs` vault holding canonical PRDs, a separate source graph from the hub. _Avoid_: conflating with the hub.
 
-**Surface**: A named Mergepath product UI under the umbrella brand: Playground (current), Cockpit (local shared shell, PR, CI, Actions-budget, live-agent and agent-history observations; remaining panels in development), Tiebreaker and Checks (reserved).
+**Surface**: A named Mergepath product UI under the umbrella brand: Playground (current), Cockpit (local shared shell, PR, CI, Fleet audits, Actions-budget, live-agent and agent-history observations plus confirmed sync), Tiebreaker and Checks (reserved).
 
 **Reserved name**: A brand name claimed in `BRAND.md` ahead of the surface existing, so a future agent does not pick it for the wrong thing; no files are scaffolded until the surface is designed.
 
