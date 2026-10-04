@@ -167,7 +167,8 @@ def group_runs(repo, raw_runs, jobs, checks, heads):
         prs = raw.get('pull_requests')
         if type(prs) is not list:
             raise ClientError('invalid_upstream_json')
-        numbers = list(dict.fromkeys(identity(_row(pr).get('number')) for pr in prs)) or [None]
+        numbers = list(dict.fromkeys([identity(_row(pr).get('number')) for pr in prs]
+                                    + [number for number, head in heads.items() if head == sha])) or [None]
         related = [check for check in checks if check['sha'] == sha and check['id'] in {job['check_id'] for job in jobs[run_id]}]
         for number in numbers:
             current = None if number not in heads else heads[number] == sha
@@ -378,18 +379,25 @@ class LogExcerptCache:
             return {'status': 'stale', 'lines': [], 'truncated': False, 'scope': None, 'source': 'Actions job log', 'error': None}
         key = tuple(params[k] for k in ('repo', 'run', 'attempt', 'job'))
         with self.condition:
-            while key in self.pending:
-                remaining = deadline - self.clock()
-                if remaining <= 0:
+            pending = self.pending.get(key)
+            if pending is not None:
+                while not pending['done']:
+                    remaining = deadline - self.clock()
+                    if remaining <= 0:
+                        return self._unavailable('deadline_exceeded')
+                    self.condition.wait(remaining)
+                if deadline <= self.clock():
                     return self._unavailable('deadline_exceeded')
-                self.condition.wait(remaining)
+                return self._project(pending['result'], step)
             entry = self.cache.get(key)
             if entry and entry[0] > self.clock():
                 self.cache.move_to_end(key)
                 return self._project(entry[1], step)
             if not self.slots.acquire(blocking=False):
                 return self._unavailable('upstream_backoff')
-            self.pending[key] = True
+            pending = {'done': False, 'result': None}
+            self.pending[key] = pending
+        result = self._unavailable('upstream_unavailable')
         try:
             if deadline <= self.clock():
                 result = self._unavailable('deadline_exceeded')
@@ -412,6 +420,7 @@ class LogExcerptCache:
             return self._project(result, step)
         finally:
             with self.condition:
+                pending.update(done=True, result=result)
                 self.pending.pop(key, None)
                 self.slots.release()
                 self.condition.notify_all()

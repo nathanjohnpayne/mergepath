@@ -74,8 +74,11 @@ def unicode_model_and_excerpt():
     return {'data': data, 'excerpt': extract_fail_lines(('FAIL:' + '🚀' * 1000).encode(), {})}
 
 
-def unmatched_checks_fixture(with_actions=True, checks=None, head=SHA, now=1000):
+def unmatched_checks_fixture(with_actions=True, checks=None, head=SHA, now=1000, run_prs=None, heads=None):
     run = raw_run(conclusion='success')
+    if run_prs is not None:
+        run['pull_requests'] = run_prs
+    heads = heads if heads is not None else ({'7': head} if head is not None else {})
     job = raw_job(); job['conclusion'] = 'success'; job['steps'][0]['conclusion'] = 'success'
     external = raw_check(200, app=77, name='external gate')
     external['app']['slug'] = 'external-app'
@@ -85,7 +88,7 @@ def unmatched_checks_fixture(with_actions=True, checks=None, head=SHA, now=1000)
     class Client:
         def pages(self, route, **kwargs):
             calls.append({'route': route, **kwargs})
-            if '/pulls?' in route: return [{'number': 7, 'head': {'sha': head}}] if head is not None else []
+            if '/pulls?' in route: return [{'number': number, 'head': {'sha': sha}} for number, sha in heads.items()]
             if '/actions/runs?' in route: return [run] if with_actions and 'created=' in route else []
             if '/jobs?' in route: return [job]
             if '/check-runs?' in route: return [check for check in checks if '/commits/' + check['head_sha'] + '/' in route]
@@ -169,6 +172,30 @@ class SupersessionTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_workflow_without_pr_metadata_binds_every_matching_observed_head(self):
+        fixture = unmatched_checks_fixture(checks=[raw_check()], run_prs=[],
+                                           heads={'7': SHA, '8': SHA, '9': OTHER_SHA})
+        data = fixture['data']
+        self.assertEqual([row['pr'] for row in data['runs']], ['7', '8'])
+        self.assertTrue(all(row['current_head'] and row['actionable'] for row in data['runs']))
+        self.assertEqual([row['key'] for row in data['runs']], [REPO + ':10:7', REPO + ':10:8'])
+        self.assertEqual([group['pr'] for group in data['groups']], ['7', '8'])
+        self.assertEqual(data['check_rows'], [])
+        self.assertEqual(sum('/jobs?' in call['route'] for call in fixture['calls']), 1)
+        self.assertEqual({row['id'] for row in data['runs']}, {'10'})
+
+    def test_workflow_preserves_old_metadata_owner_and_adds_matching_open_head(self):
+        data = unmatched_checks_fixture(checks=[raw_check()], heads={'7': OTHER_SHA, '8': SHA})['data']
+        self.assertEqual([(row['pr'], row['current_head'], row['actionable']) for row in data['runs']],
+                         [('7', False, False), ('8', True, True)])
+
+    def test_workflow_without_metadata_or_matching_head_keeps_unknown_owner(self):
+        for heads in ({}, {'7': OTHER_SHA}):
+            with self.subTest(heads=heads):
+                row = unmatched_checks_fixture(checks=[raw_check()], run_prs=[], heads=heads)['data']['runs'][0]
+                self.assertIsNone(row['pr']); self.assertIsNone(row['current_head'])
+                self.assertFalse(row['actionable'])
+
     def test_provider_retains_external_failure_on_current_head_with_or_without_actions(self):
         for with_actions in (True, False):
             with self.subTest(with_actions=with_actions):
@@ -411,6 +438,78 @@ class ProviderTests(unittest.TestCase):
 
 
 class ExcerptTests(unittest.TestCase):
+    def test_transient_result_is_shared_by_existing_waiter_but_explicit_retry_reads_again(self):
+        for error in ['deadline_exceeded', 'upstream_backoff', 'secondary_limit', 'primary_reserve',
+                      'primary_exhausted', 'upstream_unavailable', 'upstream_http_error']:
+            with self.subTest(error=error):
+                entered, waiting, release = threading.Event(), threading.Event(), threading.Event()
+                calls, results = [], {}
+                class ObservedCondition(threading.Condition):
+                    def wait(self, timeout=None):
+                        waiting.set()
+                        return super().wait(timeout)
+                def read(*args):
+                    calls.append(args)
+                    if len(calls) == 1:
+                        entered.set(); release.wait(2)
+                        raise ClientError(error)
+                    return b'FAIL: explicit retry'
+                cache = LogExcerptCache(INVENTORY, read)
+                cache.condition = ObservedCondition()
+                def fetch(name):
+                    results[name] = cache.handle(params(), envelope(), deadline=time.monotonic()+3)
+                leader = threading.Thread(target=fetch, args=('leader',))
+                waiter = threading.Thread(target=fetch, args=('waiter',))
+                try:
+                    leader.start(); self.assertTrue(entered.wait(1))
+                    waiter.start(); self.assertTrue(waiting.wait(1))
+                finally:
+                    release.set(); leader.join(2)
+                    if waiter.ident is not None: waiter.join(2)
+                self.assertFalse(leader.is_alive() or waiter.is_alive())
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(results['leader'], results['waiter'])
+                self.assertEqual(results['waiter']['error'], error)
+                self.assertEqual(len(cache.cache), 0); self.assertEqual(len(cache.pending), 0)
+                retry = cache.handle(params(), envelope(), deadline=time.monotonic()+1)
+                self.assertEqual(retry['lines'], ['FAIL: explicit retry'])
+                self.assertEqual(len(calls), 2)
+
+    def test_coalesced_waiter_deadline_does_not_cancel_leader_or_block_retry(self):
+        now = [0]
+        entered, waiting, release = threading.Event(), threading.Event(), threading.Event()
+        calls, results = [], {}
+        class ObservedCondition(threading.Condition):
+            def wait(self, timeout=None):
+                waiting.set()
+                return super().wait(timeout)
+        def read(*args):
+            calls.append(args)
+            if len(calls) == 1:
+                entered.set(); release.wait(2)
+                raise ClientError('upstream_unavailable')
+            return b'FAIL: recovered'
+        cache = LogExcerptCache(INVENTORY, read, clock=lambda: now[0])
+        cache.condition = ObservedCondition()
+        def fetch(name, deadline): results[name] = cache.handle(params(), envelope(), deadline=deadline)
+        leader = threading.Thread(target=fetch, args=('leader', 10))
+        waiter = threading.Thread(target=fetch, args=('waiter', 1))
+        try:
+            leader.start(); self.assertTrue(entered.wait(1))
+            waiter.start(); self.assertTrue(waiting.wait(1))
+            with cache.condition:
+                now[0] = 2; cache.condition.notify_all()
+            waiter.join(1); self.assertFalse(waiter.is_alive())
+            self.assertEqual(results['waiter']['error'], 'deadline_exceeded')
+            self.assertTrue(leader.is_alive()); self.assertEqual(len(calls), 1)
+        finally:
+            release.set(); leader.join(2)
+            if waiter.ident is not None: waiter.join(2)
+        self.assertEqual(results['leader']['error'], 'upstream_unavailable')
+        self.assertEqual(len(cache.pending), 0)
+        self.assertEqual(cache.handle(params(), envelope(), deadline=3)['lines'], ['FAIL: recovered'])
+        self.assertEqual(len(calls), 2)
+
     def test_excerpt_retry_honors_shared_client_backoff_then_observes_recovery(self):
         now, calls = [1000], []
         def transport(*args):
