@@ -1,4 +1,4 @@
-"""Authenticated loopback HTTP and SSE; no panel or write executor yet."""
+"""Authenticated loopback HTTP, SSE and fixed read-only refresh actions."""
 
 import hmac
 import json
@@ -112,6 +112,14 @@ class Application:
                         "in_flight": False}
         return {"schema": "cockpit-panel/v1", "panel": panel,
                 "source": source, "envelope": envelope}
+
+    def refresh_fleet(self):
+        """Refresh only the launch-bound audit source; never accept a command."""
+        with self._condition:
+            source = self._panel_sources.get("fleet")
+        if source is None or self.stopping.is_set():
+            raise ValueError("fleet_unavailable")
+        self.scheduler.refresh(source)
 
     def close(self):
         self.stopping.set()
@@ -274,6 +282,16 @@ class Handler(BaseHTTPRequestHandler):
             if (origin != "http://" + host or not _secret_equal(
                     self._single("X-Cockpit-CSRF"), app._csrf)):
                 self._respond(403, {"error": "csrf_refused"})
+            elif self.command == "POST" and parts.path == "/api/fleet/refresh":
+                if parts.query or length:
+                    self._respond(400, {"error": "invalid_refresh"})
+                    return
+                try:
+                    app.refresh_fleet()
+                except ValueError:
+                    self._respond(503, {"error": "fleet_unavailable"})
+                else:
+                    self._respond(202, {"accepted": True})
             else:
                 self._respond(405, {"error": "method_not_allowed"})
             return

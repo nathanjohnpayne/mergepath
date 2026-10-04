@@ -4,10 +4,92 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
 const C = require("../mergepath/cockpit/assets/components.js");
-const {Connection, PanelRegistry, validSnapshot, liveClockNeedsRender, accountHazards, renderPanelContent} = require("../mergepath/cockpit/assets/app.js");
+const {Connection, PanelRegistry, validSnapshot, liveClockNeedsRender, accountHazards, renderPanelContent, createFleetRefresh} = require("../mergepath/cockpit/assets/app.js");
 const repositories = [{name: "mergepath", repo: "owner/mergepath", hub: true}, {name: "consumer", repo: "owner/consumer", hub: false}];
 const snapshot = (overrides = {}) => ({schema: "cockpit/v1", revision: 1, generated_at: 1000, repositories, api_budget: {}, sources: {}, ...overrides});
 const hazard = (id = "one", overrides = {}) => ({id, source: "prs", section: "prs", repo: "owner/mergepath", state: "bump", title: "Review delayed", detail: "Waiting for an observed review.", timing: {kind: "now"}, observed_at: 950, stale: false, ...overrides});
+test("Fleet cold progress is opt-in, never coverage, and invalid later data withdraws rendered rows", () => {
+  const registry = new PanelRegistry();
+  const pending = {state: "running", label: "Auditing", hazards: [], count: null, hasObservations: false, coverageValid: false};
+  let override = null;
+  registry.register("fleet", "fleet", envelope => {
+    if (override) return override;
+    if (envelope.data === null) return pending;
+    if (envelope.data.ok !== true) throw new Error("invalid_data");
+    return {state: "clear", label: "Audited", hazards: [], count: 0};
+  }, () => {}, {renderPending: true});
+  const cold = {data: null, observed_at: null, attempted_at: 995, retry_at: null, in_flight: true, stale: true, error: "unavailable"};
+  const project = envelope => registry.project(snapshot({sources: {fleet: envelope}}), null, 1000);
+  const initial = project(cold);
+  assert.equal(initial.models.fleet.renderable, true);
+  for (const key of ["observedPanels", "freshPanels", "stalePanels", "partialPanels", "invalidPanels"]) assert.equal(initial[key], 0);
+  assert.equal(initial.models.fleet.observed, false); assert.deepEqual(initial.hazards, []);
+  const parent = {children: [], contains(node) {return this.children.includes(node);}, replaceChildren(...nodes) {for (const node of this.children) node.parentNode = null; this.children = nodes; for (const node of nodes) node.parentNode = this;}};
+  const placeholder = {remove() {this.parentNode.replaceChildren();}}, row = {}, adapter = {render: target => target.replaceChildren(row)};
+  parent.replaceChildren(placeholder);
+  renderPanelContent(parent, initial.models.fleet, adapter, placeholder);
+  assert.deepEqual(parent.children, [row]);
+  const observed = project({...cold, data: {ok: true}, observed_at: 999, stale: false, in_flight: false});
+  assert.equal(observed.freshPanels, 1);
+  renderPanelContent(parent, observed.models.fleet, adapter, placeholder);
+  const invalid = project({...cold, data: {ok: false}, observed_at: 999});
+  assert.equal(invalid.models.fleet.renderable, false);
+  renderPanelContent(parent, invalid.models.fleet, adapter, placeholder);
+  assert.deepEqual(parent.children, [placeholder]);
+  for (const envelope of [{...cold, data: undefined}, {...cold, data: {}}, {...cold, observed_at: "bad"}, {...cold, attempted_at: undefined}, {...cold, retry_at: -1}]) {
+    assert.equal(project(envelope).models.fleet.renderable, false);
+  }
+  for (const bad of [{state: "clear"}, {hazards: [hazard()]}, {count: 0}, {hasObservations: true}, {coverageValid: true}]) {
+    override = {...pending, ...bad, renderable: true};
+    assert.equal(project(cold).models.fleet.renderable, false);
+  }
+  assert.throws(() => new PanelRegistry().register("ci", "ci", () => pending, null, {renderPending: true}));
+  const noOptIn = new PanelRegistry(); noOptIn.register("fleet", "fleet", () => pending);
+  assert.equal(noOptIn.project(snapshot({sources: {fleet: cold}}), null, 1000).models.fleet.renderable, false);
+});
+test("Fleet gets a current immutable PR envelope without mutating the shared snapshot", () => {
+  const registry = new PanelRegistry(), seen = [];
+  registry.register("prs", "shared_prs", () => ({state: "idle", label: "PRs", hazards: []}));
+  registry.register("fleet", "fleet", (_envelope, _repo, _now, context) => {
+    seen.push(context.prs.data.rows[0].state);
+    assert.throws(() => {context.prs.data.rows[0].state = "forged";}, TypeError);
+    return {state: "idle", label: "Fleet", hazards: []};
+  });
+  const value = snapshot({sources: {shared_prs: {data: {rows: [{state: "pending"}]}, observed_at: 900}, fleet: {data: {}, observed_at: 900}}});
+  registry.project(value, null, 1000);
+  assert.equal(value.sources.shared_prs.data.rows[0].state, "pending");
+  value.sources.shared_prs.data.rows[0].state = "approved";
+  registry.project(value, null, 1001);
+  assert.deepEqual(seen, ["pending", "approved"]);
+});
+test("manual Fleet refresh coalesces requests, uses scoped CSRF, and never sends executable input", async () => {
+  const calls = [], timers = []; let release;
+  const refresh = createFleetRefresh(async (url, options) => {
+    calls.push({url, options});
+    if (url === "api/session") return {ok: true, json: async () => ({csrf: "a".repeat(43)})};
+    await new Promise(resolve => {release = resolve;});
+    return {status: 202};
+  }, callback => {timers.push(callback); return 1;}, () => {});
+  const first = refresh(), repeated = refresh(); assert.equal(first, repeated);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls.map(call => call.url), ["api/session", "api/fleet/refresh"]);
+  assert.equal(calls[1].options.method, "POST"); assert.equal(calls[1].options.credentials, "same-origin");
+  assert.equal(calls[1].options.headers["X-Cockpit-CSRF"], "a".repeat(43));
+  assert.equal(calls[1].options.body, undefined);
+  release(); await first;
+  const next = refresh(); assert.notEqual(next, first);
+  await new Promise(resolve => setImmediate(resolve)); release(); await next;
+  for (const value of [null, {csrf: "bad"}]) {
+    let invoked = 0;
+    const refused = createFleetRefresh(async () => {invoked++; return {ok: value !== null, json: async () => value};}, () => 1, () => {});
+    await assert.rejects(refused(), /refresh_unavailable/); assert.equal(invoked, 1);
+  }
+  let signal;
+  const slow = createFleetRefresh((_url, options) => new Promise((_resolve, reject) => {
+    signal = options.signal; signal.addEventListener("abort", () => reject(new Error("aborted")));
+  }), callback => {timers.push(callback); return 1;}, () => {});
+  const timed = slow(); timers.at(-1)(); await assert.rejects(timed, /aborted/); assert.equal(signal.aborted, true);
+});
 test("bootstrap scrubs full fragment before I/O and accepts only a fixed scope grammar", async () => {
   const source = fs.readFileSync(require.resolve("../mergepath/cockpit/bootstrap.js"), "utf8");
   for (const scope of ["a".repeat(43), "", "../escape", "a".repeat(42), "a".repeat(44), "/".repeat(43)]) {
