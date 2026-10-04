@@ -637,7 +637,8 @@ validate_archive_payload() {
   jq -e '
     type == "object"
     and ((.archive_version // 1) == 1 or (.archive_version // 1) == 2)
-    and ((.source_kind // "issue-comment") as $kind
+    and ((if (.archive_version // 1) == 2 then .source_kind
+          else (.source_kind // "issue-comment") end) as $kind
       | $kind == "issue-comment" or $kind == "inline" or $kind == "review-body")
     and (.source_comment_id | type == "number" and . > 0 and floor == .)
     and (.source_login | type == "string" and length > 0)
@@ -661,7 +662,37 @@ archive_payload() {
   [ -n "$encoded" ] || return 1
   payload=$(printf '%s' "$encoded" | jq -Rer '@base64d | fromjson') || return 1
   printf '%s' "$payload" | validate_archive_payload || return 1
-  printf '%s' "$payload" | jq -c '.source_kind = (.source_kind // "issue-comment")'
+  printf '%s' "$payload" | jq -c '
+    if (.archive_version // 1) == 1 then .source_kind = (.source_kind // "issue-comment")
+    else . end'
+}
+
+archive_source_comments() {
+  local source_kind="$1" source_login="$2"
+  case "$source_kind" in
+    issue-comment)
+      case "$source_login" in
+        "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
+        *) return 1 ;;
+      esac
+      printf '%s' "$ISSUE_COMMENTS"
+      ;;
+    inline)
+      case "$source_login" in
+        "$CODEX_BOT"|"$CODERABBIT_BOT"|"$GHAS_BOT") ;;
+        *) registered_reviewer_login "$source_login" || return 1 ;;
+      esac
+      printf '%s' "$INLINE_COMMENTS"
+      ;;
+    review-body)
+      case "$source_login" in
+        "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
+        *) registered_reviewer_login "$source_login" || return 1 ;;
+      esac
+      printf '%s' "$REVIEWS"
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 strongest_nonignored_archive_tier() {
@@ -695,8 +726,13 @@ while IFS= read -r archive_comment; do
   archive_login=$(printf '%s' "$archive_comment" | jq -r '.user.login // ""')
   [ "$archive_login" = 'github-actions[bot]' ] || continue
   archive_body=$(printf '%s' "$archive_comment" | jq -r '.body // ""')
-  payload=$(archive_payload "$archive_body" || true)
-  [ -n "$payload" ] || continue
+  case "$archive_body" in
+    '<!-- mergepath-feedback-archive:v1 '*)
+      payload=$(archive_payload "$archive_body") \
+        || die 2 "feedback archive payload failed schema validation"
+      ;;
+    *) continue ;;
+  esac
   archive_comment_id=$(printf '%s' "$archive_comment" | jq -r '.id')
   # A repaired archive comment is a byte-for-byte restoration of the same
   # history record. Keep its evidence floor tied to the immutable payload,
@@ -759,6 +795,61 @@ printf '%s' "$V2_ARCHIVE_ENTRIES" | jq -e 'all(.[]; .payload | type == "object")
   >/dev/null 2>&1 || die 2 "chunked feedback archive payload is malformed"
 ARCHIVE_ENTRIES=$(printf '%s\n%s\n' "$ARCHIVE_ENTRIES" "$V2_ARCHIVE_ENTRIES" \
   | jq -cs '.[0] + .[1]')
+
+# #1741: reconcile body corruption only after every trusted payload and chunk
+# set has validated. A complete copy with the same entire metadata and a
+# verified body is durable evidence; today's live body alone is not. Do this
+# before any archive consumer, including CodeRabbit's content-floor refinement.
+VALIDATED_ARCHIVE_ENTRIES='[]'
+while IFS= read -r archive_entry; do
+  [ -n "$archive_entry" ] || continue
+  payload=$(printf '%s' "$archive_entry" | jq -c '.payload')
+  printf '%s' "$payload" | validate_archive_payload \
+    || die 2 "feedback archive payload failed schema validation"
+  body_fingerprint_valid=true
+  recovery_source_bound=false
+  if [ "$(printf '%s' "$payload" | jq -r '.archive_version // 1')" -eq 2 ]; then
+    payload_body_json=$(printf '%s' "$payload" | jq -c '.body')
+    if [ "$(fingerprint "$payload_body_json")" != \
+      "$(printf '%s' "$payload" | jq -r '.body_fingerprint')" ]; then
+      body_fingerprint_valid=false
+    elif source_comments=$(archive_source_comments \
+      "$(printf '%s' "$payload" | jq -r '.source_kind')" \
+      "$(printf '%s' "$payload" | jq -r '.source_login')"); then
+      # Preserve the existing configured-source and surviving-object identity
+      # fences. A deleted source remains bound by its trusted archived identity.
+      source_comment=$(printf '%s' "$source_comments" | jq -c \
+        --argjson id "$(printf '%s' "$payload" | jq -r '.source_comment_id')" \
+        'first(.[] | select(.id == $id)) // null')
+      if [ "$source_comment" = null ] || \
+        [ "$(printf '%s' "$source_comment" | jq -r '.user.login // ""')" = \
+          "$(printf '%s' "$payload" | jq -r '.source_login')" ]; then
+        recovery_source_bound=true
+      fi
+    fi
+  fi
+  VALIDATED_ARCHIVE_ENTRIES=$(printf '%s\n%s\n' "$VALIDATED_ARCHIVE_ENTRIES" "$archive_entry" \
+    | jq -cs --argjson valid "$body_fingerprint_valid" --argjson bound "$recovery_source_bound" '
+        .[0] + [(.[1] + {body_fingerprint_valid:$valid,recovery_source_bound:$bound})]
+      ')
+done <<EOF
+$(printf '%s' "$ARCHIVE_ENTRIES" | jq -c '.[]')
+EOF
+ARCHIVE_ENTRIES=$(printf '%s' "$VALIDATED_ARCHIVE_ENTRIES" | jq -c '
+  sort_by(.payload | del(.body))
+  | group_by(.payload | del(.body))
+  | map(
+      [.[] | select(.body_fingerprint_valid and .recovery_source_bound)] as $verified
+      | if ($verified | map(.payload.body) | unique | length) > 1 then
+          error("conflicting verified feedback archive bodies")
+        elif any(.[]; .body_fingerprint_valid | not) then
+          if ($verified | length) == 0 then error("feedback archive body fingerprint mismatch")
+          else map(.payload.body = $verified[0].payload.body) end
+        else . end
+    )
+  | add // []
+  | map(del(.body_fingerprint_valid, .recovery_source_bound))
+') || die 2 "could not verify feedback archive bodies"
 
 # #1167, with the relay's record available: the record decides what the
 # latest edit did. An edit that changed no visible content never raises a
@@ -869,30 +960,7 @@ append_archive_candidate() {
   source_id=$(printf '%s' "$payload" | jq -r '.source_comment_id')
   source_login=$(printf '%s' "$payload" | jq -r '.source_login')
   body_fingerprint=$(printf '%s' "$payload" | jq -r '.body_fingerprint')
-  case "$source_kind" in
-    issue-comment)
-      case "$source_login" in
-        "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
-        *) return 0 ;;
-      esac
-      source_comments="$ISSUE_COMMENTS"
-      ;;
-    inline)
-      case "$source_login" in
-        "$CODEX_BOT"|"$CODERABBIT_BOT"|"$GHAS_BOT") ;;
-        *) registered_reviewer_login "$source_login" || return 0 ;;
-      esac
-      source_comments="$INLINE_COMMENTS"
-      ;;
-    review-body)
-      case "$source_login" in
-        "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
-        *) registered_reviewer_login "$source_login" || return 0 ;;
-      esac
-      source_comments="$REVIEWS"
-      ;;
-    *) return 0 ;;
-  esac
+  source_comments=$(archive_source_comments "$source_kind" "$source_login") || return 0
 
   source_comment=$(printf '%s' "$source_comments" | jq -c \
     --argjson id "$source_id" 'first(.[] | select(.id == $id)) // null')
