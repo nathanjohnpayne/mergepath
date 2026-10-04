@@ -11,7 +11,7 @@
   const DIRECTIONS = ["hub ahead", "consumer ahead of hub", "re-render differs", "covered by .sync-overrides.yml", "unverified divergence"];
   const repo = value => typeof value === "string" && /^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(value);
   const sha = value => typeof value === "string" && /^[0-9a-f]{40}$/.test(value);
-  const text = (value, limit = 4096) => typeof value === "string" && value.length > 0 && value.length <= limit && !/[\x00-\x1f]/.test(value);
+  const text = (value, limit = 4096) => typeof value === "string" && value.length > 0 && [...value].length <= limit && !/[\x00-\x1f]/.test(value);
   const keys = (object, names) => !!object && typeof object === "object" && !Array.isArray(object) && Object.keys(object).length === names.length && names.every(name => Object.hasOwn(object, name));
   const auditTime = value => typeof value === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(value) && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value.replace("Z", ".000Z");
   function validRecord(record, entry) {
@@ -33,7 +33,7 @@
       const p = path.provenance;
       if (p !== null && (!keys(p, ["source_sha", "sync_sha", "hub_sha", "consumer_sha", "source_entry", "hub_entry", "consumer_entry"])
         || !["source_sha", "sync_sha", "hub_sha", "consumer_sha"].every(key => sha(p[key]))
-        || !["source_entry", "hub_entry", "consumer_entry"].every(key => typeof p[key] === "string" && p[key].length <= 8192 && /^100(?:644|755) blob [0-9a-f]{40}\t[^\x00-\x1f]+$/.test(p[key])))) return false;
+        || !["source_entry", "hub_entry", "consumer_entry"].every(key => typeof p[key] === "string" && [...p[key]].length <= 8192 && /^100(?:644|755) blob [0-9a-f]{40}\t[^\x00-\x1f]+$/.test(p[key])))) return false;
     }
     const prs = record.open_sync_prs;
     if (prs !== null && (!Array.isArray(prs) || prs.length > 1000 || new Set(prs.map(pr => pr?.number)).size !== prs.length
@@ -133,7 +133,7 @@
       this.pathList = C.element("ul", "fleet-path-list"); this.paths.append(this.pathList); this.pathNodes = new Map();
       this.prs = C.element("div", "fleet-prs"); this.prs.id = `fleet-prs-${identity}`; this.prButton.setAttribute("aria-controls", this.prs.id);
       this.prs.append(C.element("p", "sub", "PR observations are independent of audit membership. Directive meters are advisory; unknown amounts are never guessed."));
-      this.prList = new PRRows.RowList(this.prs); this.node.append(this.row, this.paths, this.prs); this.pathsOpen = this.prsOpen = false;
+      this.prList = new PRRows.RowList(this.prs, {removeMerged: false}); this.node.append(this.row, this.paths, this.prs); this.pathsOpen = this.prsOpen = false;
     }
     expand() {
       this.paths.hidden = !this.pathsOpen; this.prs.hidden = !this.prsOpen;
@@ -186,6 +186,13 @@
       this.header = C.element("div", "fleet-row fleet-header"); this.header.setAttribute("role", "row");
       for (const label of ["Consumer", "Status", "Hub → consumer", "Paths", "Open sync PR", "Last audit", ""]) {const node = C.element("span", "", label); node.setAttribute("role", "columnheader"); this.header.append(node);}
       this.table.append(this.header); this.wrap.append(this.table); this.attach();
+      this.parent.addEventListener("focusin", event => {if (this.owns(event.target)) this.focused = event.target;});
+    }
+    owns(node) {return !!node && [this.summary, this.controls, this.note, this.banner, this.feedback, this.wrap, this.empty].some(root => root.contains(node));}
+    focusable(node) {
+      if (!this.owns(node) || !node.isConnected || node.disabled || node.getClientRects?.().length === 0) return false;
+      for (let ancestor = node; ancestor && ancestor !== this.parent; ancestor = ancestor.parentNode) if (ancestor.hidden) return false;
+      return true;
     }
     attach() {this.parent.replaceChildren(this.summary, this.controls, this.note, this.banner, this.feedback, this.wrap, this.empty);}
     async requestRefresh() {
@@ -201,14 +208,16 @@
       this.refreshButton.title = !this.refresh ? "Audit refresh is unavailable" : audit.error && audit.retryAt > this.model.now ? "Source failure backoff is active" : "Refresh the shared audit source";
     }
     update(model) {
-      this.model = model; if (!this.parent.contains(this.summary)) this.attach();
+      const reattach = !this.parent.contains(this.summary), active = document.activeElement;
+      const focus = this.owns(active) ? active : reattach ? this.focused : null;
+      this.model = model; if (reattach) this.attach();
       this.summary.textContent = model.label; this.note.textContent = `${model.note ?? "Audit-only source · no observations yet"} · Sync unavailable pending confirmed executor${model.stale && model.hasObservations ? " · last-known rows stale" : ""}`;
       this.banner.hidden = !model.audit.running; this.progressText.textContent = `Auditing${model.audit.elapsed === null ? "" : ` · ${model.audit.elapsed}s elapsed`}: last good rows stay until completion. Progress is indeterminate.`;
       this.feedback.hidden = !this.feedback.textContent;
       if (model.audit.error && !model.audit.running && !this.requesting) {this.feedback.textContent = "Audit unavailable · last good rows retained when present"; this.feedback.hidden = false;}
       else if (this.previousError && !model.audit.error && !this.requesting) {this.feedback.textContent = ""; this.feedback.hidden = true;}
       this.previousError = model.audit.error;
-      const present = new Set(), focus = document.activeElement;
+      const present = new Set();
       for (const row of model.rows) {
         present.add(row.repo); let view = this.views.get(row.repo);
         if (!view) {view = new FleetRow(row); this.views.set(row.repo, view); this.table.append(view.node);}
@@ -217,8 +226,9 @@
       for (const [id, view] of this.views) if (!present.has(id)) {view.destroy(); this.views.delete(id);}
       this.empty.hidden = model.rows.some(row => model.selectedRepo === null || model.selectedRepo === row.repo);
       this.empty.textContent = model.hasObservations ? "No consumers in this scope." : "No audit observations yet.";
-      if (focus?.isConnected && document.activeElement !== focus) focus.focus({preventScroll: true});
       this.updateControls();
+      if (reattach && focus && !this.focusable(focus)) this.focused = null;
+      if (this.focusable(focus) && (!document.activeElement || document.activeElement === document.body)) focus.focus({preventScroll: true});
     }
   }
   const mounted = new WeakMap();

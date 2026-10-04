@@ -73,9 +73,9 @@
     }
   }
   class RowView {
-    constructor(row, {toggle = () => {}, remove = () => {}, setTimer = (fn, delay) => setTimeout(fn, delay), clearTimer = timer => clearTimeout(timer)} = {}) {
+    constructor(row, {toggle = () => {}, remove = () => {}, removeMerged = true, setTimer = (fn, delay) => setTimeout(fn, delay), clearTimer = timer => clearTimeout(timer)} = {}) {
       if (!validRow(row)) throw new Error("invalid_pr_row");
-      Object.assign(this, {toggle, remove, setTimer, clearTimer}); this.id = row.id; this.generation = 0; this.rewarding = false; this.glowing = false;
+      Object.assign(this, {toggle, remove, removeMerged, setTimer, clearTimer}); this.id = row.id; this.generation = 0; this.rewarding = false; this.glowing = false;
       this.node = C.element("div", "pr-entry"); this.row = C.element("div", "pr-row"); this.row.setAttribute("role", "row"); this.node.dataset.pr = row.id;
       this.cells = Array.from({length: 8}, () => {const cell = C.element("div", "pr-cell"); cell.setAttribute("role", "cell"); this.row.append(cell); return cell;});
       this.status = C.badge("idle", "Waiting"); this.ribbon = C.element("span", "pr-ribbon", "Merged"); this.ribbon.hidden = true;
@@ -145,7 +145,7 @@
       if (reward && !this.rewarding) {
         this.rewarding = this.glowing = true; this.row.classList.remove("entering", "fresh"); this.row.style.animationDelay = "0ms"; this.ribbon.hidden = false; const generation = ++this.generation;
         this.glowTimer = this.setTimer(() => {if (generation === this.generation) {this.glowing = false; this.row.classList.remove("pr-reward");}}, 2600);
-        this.removalTimer = this.setTimer(() => {if (generation === this.generation && this.model.lifecycle === "MERGED") {this.cancelReward(); this.remove(this.id);}}, 7000);
+        this.removalTimer = this.setTimer(() => {if (generation === this.generation && this.model.lifecycle === "MERGED") {this.cancelReward(); if (this.removeMerged) this.remove(this.id);}}, 7000);
       }
     }
     destroy() {this.cancelReward(); this.node.remove();}

@@ -142,6 +142,52 @@ class SourceTests(unittest.TestCase):
         self.assertIsNone(unknown["record"])
         self.assertIsNone(unknown["observed_at"])
 
+    def test_fallback_draft_is_classified_before_state_with_existing_priority(self):
+        for state, draft, expected in [("CLEAN", True, ("idle", "Draft")),
+                                        ("UNKNOWN", True, ("idle", "Draft")),
+                                        ("BEHIND", True, ("bump", "Behind main")),
+                                        ("CLEAN", False, ("clear", "Clean · GitHub state"))]:
+            with self.subTest(state=state, draft=draft):
+                first = record()
+                first["open_sync_prs"] = [{"number": 88, "branch": "mergepath-sync/x", "state": state,
+                                          "lifecycle_state": "OPEN", "draft": draft}]
+                row = self.fetch(self.provider(), [first, record(INVENTORY[2])])["repositories"][0]["sync_pr_rows"][0]
+                self.assertEqual((row["state"], row["label"]), expected)
+                self.assertEqual(row["draft"], draft)
+                self.assertTrue(row["partial"])
+                self.assertIsNone(row["head"])
+                self.assertEqual(row["hazards"], [])
+                self.assertTrue(all(b["remaining"] is None for b in row["budgets"]))
+
+    def test_unicode_text_limit_counts_codepoints_not_encoded_units(self):
+        for character in ("a", "é", "😀"):
+            for size in (2048, 3000, 4096, 4097):
+                with self.subTest(character=character, size=size):
+                    first = record(status="override-only")
+                    first["paths"][0]["override_reason"] = character * size
+                    records = [first, record(INVENTORY[2])]
+                    if size <= 4096:
+                        self.assertEqual(parse_audit(ndjson(records), 0, INVENTORY), records)
+                    else:
+                        with self.assertRaises(ClientError):
+                            parse_audit(ndjson(records), 0, INVENTORY)
+
+    def test_provenance_entry_limit_counts_codepoints_at_exact_boundary(self):
+        prefix = "100644 blob " + "a" * 40 + "\t"
+        for character in ("a", "é", "😀"):
+            for size in (8192, 8193):
+                with self.subTest(character=character, size=size):
+                    first = record(status="drift")
+                    entry = prefix + character * (size - len(prefix))
+                    first["paths"][0]["provenance"] = {**{key: "a" * 40 for key in ("source_sha", "sync_sha", "hub_sha", "consumer_sha")},
+                                                       **{key: entry for key in ("source_entry", "hub_entry", "consumer_entry")}}
+                    records = [first, record(INVENTORY[2])]
+                    if size == 8192:
+                        self.assertEqual(parse_audit(ndjson(records), 1, INVENTORY), records)
+                    else:
+                        with self.assertRaises(ClientError):
+                            parse_audit(ndjson(records), 1, INVENTORY)
+
     def test_fatal_attempt_does_not_change_last_good(self):
         provider = self.provider()
         self.fetch(provider, [record(), record(INVENTORY[2])])
