@@ -152,6 +152,70 @@ class HistoryTests(unittest.TestCase):
         ledger.write_text(json.dumps(record) + "\n")
         self.assertIn("disagrees", self.sample()["diagnostics"][0])
 
+    def test_malformed_local_ledger_line_is_atomic_and_helper_gets_valid_groups(self):
+        healthy = loop("p4b-companion")
+        write_loop(self.a, healthy)
+        totals = Accounting(ROOT).totals([[healthy]], time.monotonic() + 5)[0]
+        good = {"schema": "p4b-accounting/v1", "pr": 1, "loops": [healthy], "totals": totals}
+        for invalid in (None, {}, {"tokens": []}):
+            with self.subTest(invalid=invalid):
+                rejected = {**good, "loops": [loop("p4b-rejected-prefix"), invalid]}
+                (self.a / ".mergepath/phase-4b-ledger.jsonl").write_text(json.dumps(rejected) + "\n" + json.dumps(good) + "\n")
+                provider = self.provider()
+                with patch.object(provider.accounting, "totals", wraps=provider.accounting.totals) as helper:
+                    data = provider.fetch(time.monotonic() + 20).data
+                self.assertEqual([row["run_id"] for row in data["history"]], [healthy["run_id"]])
+                self.assertEqual(data["canonical_totals"]["adapter_invocations"], 1)
+                self.assertEqual(data["canonical_totals"]["tokens_total"], 100)
+                self.assertFalse(data["history_complete"])
+                groups = helper.call_args.args[0]
+                self.assertEqual(len(groups), 3)  # history, valid approval, per-PR
+                self.assertEqual(groups[1], [healthy])
+                self.assertTrue(all(isinstance(row, dict) and row.get("run_id") == healthy["run_id"] for group in groups for row in group))
+
+    def test_local_ledger_capacity_refuses_whole_line_not_prefix(self):
+        healthy = loop("p4b-companion")
+        state = self.a / ".mergepath"
+        state.mkdir()
+        totals = Accounting(ROOT).totals([[healthy]], time.monotonic() + 5)[0]
+        good = {"schema": "p4b-accounting/v1", "pr": 1, "loops": [healthy], "totals": totals}
+        too_many = {**good, "loops": [loop("p4b-prefix"), loop("p4b-over-limit")]}
+        (state / "phase-4b-ledger.jsonl").write_text(json.dumps(good) + "\n" + json.dumps(too_many) + "\n")
+        with patch("mergepath.cockpit.agents.MAX_ROWS", 2):
+            data = self.sample()
+        self.assertEqual([row["run_id"] for row in data["history"]], [healthy["run_id"]])
+        self.assertEqual(data["canonical_totals"]["adapter_invocations"], 1)
+        self.assertFalse(data["history_complete"])
+
+    def test_history_noise_does_not_consume_eligible_file_limit(self):
+        write_loop(self.a, loop())
+        directory = self.a / ".mergepath/phase-4b-loops"
+        for index in range(513):
+            (directory / f"noise-{index}").touch()
+        data = self.sample()
+        self.assertEqual(len(data["history"]), 1)
+        self.assertTrue(data["history_complete"])
+
+    def test_history_eligible_truncation_retains_bounded_subset_and_global_budget(self):
+        for index in range(514):
+            write_loop(self.a, loop(f"p4b-{index:04d}"), f"owner-hub-pr1-{index:04d}.jsonl.archive")
+        write_loop(self.b, loop("p4b-other-root"))
+        reads = []
+        actual = LocalReader.read
+        def read(reader, fd, name):
+            reads.append(name)
+            return actual(reader, fd, name)
+        with patch.object(LocalReader, "read", read):
+            data = self.sample(roots=(self.a, self.b))
+        self.assertEqual(len(reads), 512)
+        self.assertEqual(reads[-1], "prices.json")
+        self.assertEqual(len(data["history"]), 510)
+        self.assertEqual({row["run_id"] for row in data["history"]}, {f"p4b-{i:04d}" for i in range(510)})
+        self.assertTrue(data["hasObservations"])
+        self.assertFalse(data["history_complete"])
+        self.assertEqual(data["observed_checkouts"], 1)
+        self.assertIn("History file limit reached; coverage is incomplete.", data["diagnostics"])
+
     def test_legacy_approval_matches_log_occurrences_only_within_checkout(self):
         row = loop(None)
         write_loop(self.a, row); write_loop(self.a, row)

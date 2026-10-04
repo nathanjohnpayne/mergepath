@@ -140,7 +140,7 @@ class LiveAgentsProvider:
         self._elapsed = {}
 
     def fetch(self, deadline):
-        reader, rows, terminals, diagnostics = LocalReader(deadline), [], [], []
+        reader, selected, rows, terminals, diagnostics = LocalReader(deadline), [], [], [], []
         complete, seen, valid, probes = True, 0, 0, 0
         try:
             directory = reader.directory(self.directory)
@@ -158,10 +158,6 @@ class LiveAgentsProvider:
                         break
                     if not entry.name.startswith("p4b-") or not entry.name.endswith(".json"):
                         continue
-                    if len(rows) + len(terminals) >= MAX_RECORDS:
-                        complete = False
-                        diagnostics.append("Heartbeat record limit reached.")
-                        break
                     try:
                         # Inspect size before the shared reader's bounded read.
                         if entry.stat(follow_symlinks=False).st_size > MAX_RECORD_BYTES:
@@ -173,36 +169,16 @@ class LiveAgentsProvider:
                         row = normalize(record, entry.name, self.clock())
                         if row["repo"] not in self.repositories:
                             continue
-                        if row["stage"] == "done":
-                            # Canonical terminal branch returns done before ps.
-                            status = "done"
-                        elif probes < MAX_PROBES:
-                            probes += 1
-                            status = self.status(record, deadline)
-                        else:
-                            status, complete = "unknown", False
-                            diagnostics.append("Process probe limit reached; remaining process identities are unknown.")
                         reader.check()
-                        row.update(process_status=status if status in ("running", "crashed", "unknown", "done") else "unknown", observed_at=self.clock())
-                        # A status seam never overrides the validated lifecycle.
-                        if row["stage"] == "done":
-                            row["process_status"] = "done"
-                            terminals.append(row)
-                        else:
-                            if row["process_status"] == "done":
-                                row["process_status"] = "unknown"
-                            rows.append(row)
-                        identity = (row["id"], row["pid"], record["process_started_at"], row["head"], row["adapter_started_at_epoch"])
-                        seconds, observed = row["adapter_elapsed_seconds"], row["observed_at"]
-                        if "adapter" not in row["reached"]:
-                            seconds = None
-                        elif row["stage"] == "adapter" and row["process_status"] == "running" and row["adapter_started_at_epoch"] is not None:
-                            seconds = max(seconds or 0, row["observed_at"] - row["adapter_started_at_epoch"])
-                        if seconds is not None:
-                            self._elapsed[identity] = (seconds, observed)
-                        else:
-                            seconds, observed = self._elapsed.get(identity, (None, None))
-                        row.update(adapter_elapsed_observed_seconds=seconds, adapter_elapsed_observed_at=observed)
+                        selected.append((row, record))
+                        # Select within the scanned subset before spending process probes.
+                        selected.sort(key=lambda item: (item[0]["stage"] == "done",
+                                                       -(item[0]["stage_at_epoch"] or 0) if item[0]["stage"] == "done" else 0,
+                                                       item[0]["id"]))
+                        if len(selected) > MAX_RECORDS:
+                            selected.pop()
+                            complete = False
+                            diagnostics.append("Heartbeat record limit reached.")
                         valid += 1
                     except (OSError, ValueError, UnicodeError, TypeError, OverflowError):
                         complete = False
@@ -212,6 +188,43 @@ class LiveAgentsProvider:
             raise ClientError("source_failed") from None
         finally:
             os.close(directory)
+        for row, record in selected:
+            reader.check()
+            try:
+                if row["stage"] == "done":
+                    # Canonical terminal branch returns done before ps.
+                    status = "done"
+                elif probes < MAX_PROBES:
+                    probes += 1
+                    status = self.status(record, deadline)
+                else:
+                    status, complete = "unknown", False
+                    diagnostics.append("Process probe limit reached; remaining process identities are unknown.")
+                reader.check()
+                row.update(process_status=status if status in ("running", "crashed", "unknown", "done") else "unknown", observed_at=self.clock())
+                # A status seam never overrides the validated lifecycle.
+                if row["stage"] == "done":
+                    row["process_status"] = "done"
+                    terminals.append(row)
+                else:
+                    if row["process_status"] == "done":
+                        row["process_status"] = "unknown"
+                    rows.append(row)
+                identity = (row["id"], row["pid"], record["process_started_at"], row["head"], row["adapter_started_at_epoch"])
+                seconds, observed = row["adapter_elapsed_seconds"], row["observed_at"]
+                if "adapter" not in row["reached"]:
+                    seconds = None
+                elif row["stage"] == "adapter" and row["process_status"] == "running" and row["adapter_started_at_epoch"] is not None:
+                    seconds = max(seconds or 0, row["observed_at"] - row["adapter_started_at_epoch"])
+                if seconds is not None:
+                    self._elapsed[identity] = (seconds, observed)
+                else:
+                    seconds, observed = self._elapsed.get(identity, (None, None))
+                row.update(adapter_elapsed_observed_seconds=seconds, adapter_elapsed_observed_at=observed)
+            except (OSError, ValueError, UnicodeError, TypeError, OverflowError):
+                complete = False
+                if len(diagnostics) < 8:
+                    diagnostics.append("A heartbeat record was malformed or refused; coverage is incomplete.")
         now = self.clock()
         rows.sort(key=lambda row: row["id"])
         terminals.sort(key=lambda row: row["id"])

@@ -132,6 +132,70 @@ class LiveTests(unittest.TestCase):
         with patch.object(L, "MAX_SCAN", 1):
             self.assertFalse(self.fetch()["coverage_complete"])
 
+    def test_terminal_retention_cannot_hide_later_live_record_within_scan(self):
+        for index in range(70):
+            self.write(record(run_id=f"p4b-terminal-{index:03d}", stage="done", stages=[{"stage": "barrier"}, {"stage": "done"}], stage_at_epoch=NOW - index))
+        self.write(record(run_id="p4b-running"))
+        actual = os.scandir
+        def ordered(fd):
+            with actual(fd) as entries:
+                values = sorted(entries, key=lambda entry: (entry.name == "p4b-running.json", entry.name))
+            return contextlib.nullcontext(values)
+        with patch.object(L.os, "scandir", ordered):
+            data = self.fetch()
+        self.assertEqual([row["run_id"] for row in data["live"]], ["p4b-running"])
+        self.assertEqual(self.calls, ["p4b-running"])
+        self.assertEqual(len(data["live"]) + len(data["terminal"]), 64)
+        self.assertEqual({row["run_id"] for row in data["terminal"]}, {f"p4b-terminal-{i:03d}" for i in range(63)})
+        self.assertFalse(data["coverage_complete"])
+        self.assertTrue(data["hasObservations"])
+        self.assertLessEqual(len(self.provider._elapsed), 64)
+
+    def test_selection_is_deterministic_before_probes_with_total_record_cap(self):
+        for index in range(70):
+            self.write(record(run_id=f"p4b-live-{index:03d}"))
+        self.write(record(run_id="p4b-terminal", stage="done", stages=[{"stage": "barrier"}, {"stage": "done"}]))
+        actual = os.scandir
+        def reversed_entries(fd):
+            with actual(fd) as entries:
+                values = sorted(entries, key=lambda entry: entry.name, reverse=True)
+            return contextlib.nullcontext(values)
+        with patch.object(L.os, "scandir", reversed_entries):
+            data = self.fetch()
+        self.assertEqual([row["run_id"] for row in data["live"]], [f"p4b-live-{i:03d}" for i in range(64)])
+        self.assertEqual(data["terminal"], [])
+        self.assertEqual(self.calls, [f"p4b-live-{i:03d}" for i in range(4)])
+        self.assertEqual(sum(row["process_status"] == "unknown" for row in data["live"]), 60)
+        self.assertFalse(data["coverage_complete"])
+        self.assertLessEqual(len(self.provider._elapsed), 64)
+
+    def test_terminal_selection_newest_stage_then_id_with_no_process_probes(self):
+        for index in range(66):
+            self.write(record(run_id=f"p4b-terminal-{index:03d}", stage="done", stages=[{"stage": "barrier"}, {"stage": "done"}], stage_at_epoch=NOW - min(index, 63)))
+        data = self.fetch()
+        self.assertEqual({row["run_id"] for row in data["terminal"]}, {f"p4b-terminal-{i:03d}" for i in range(64)})
+        self.assertEqual(data["live"], [])
+        self.assertEqual(self.calls, [])
+        self.assertFalse(data["coverage_complete"])
+
+    def test_live_selection_does_not_claim_records_beyond_scan_limit(self):
+        for index in range(512):
+            self.write(record(run_id=f"p4b-terminal-{index:03d}", stage="done", stages=[{"stage": "barrier"}, {"stage": "done"}]))
+        self.write(record(run_id="p4b-unscanned-live"))
+        actual = os.scandir
+        def ordered(fd):
+            with actual(fd) as entries:
+                values = sorted(entries, key=lambda entry: entry.name)
+            return contextlib.nullcontext(values)
+        with patch.object(L.os, "scandir", ordered):
+            data = self.fetch()
+        self.assertEqual(data["live"], [])
+        self.assertEqual(len(data["terminal"]), 64)
+        self.assertEqual(self.calls, [])
+        self.assertFalse(data["coverage_complete"])
+        self.assertIn("Heartbeat directory scan limit reached.", data["diagnostics"])
+        self.assertLessEqual(len(self.provider._elapsed), 64)
+
     def test_probe_limit_keeps_unprobed_rows_unknown_incomplete(self):
         for i in range(6):
             self.write(record(run_id=f"p4b-{i}"))
