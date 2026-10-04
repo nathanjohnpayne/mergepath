@@ -290,11 +290,11 @@ def build_row(repo, raw, enrichment=None, settings=None, observed_at=None):
     return row
 
 
-def partial_row(repo, number, *, head=None, title=None, merge_state=None, observed_at=None):
+def partial_row(repo, number, *, head=None, title=None, merge_state=None, draft=False, observed_at=None):
     """An audit-reported sync PR can use the same view without the panel."""
     if type(number) is str and re.fullmatch(r"[1-9][0-9]*", number):
         number = int(number)
-    row = build_row(repo, {"number": number, "headRefOid": head or "0" * 40, "title": title or "Sync PR · enrichment unavailable", "mergeStateStatus": merge_state}, observed_at=observed_at)
+    row = build_row(repo, {"number": number, "headRefOid": head or "0" * 40, "title": title or "Sync PR · enrichment unavailable", "mergeStateStatus": merge_state, "isDraft": draft}, observed_at=observed_at)
     if head is None:
         row["head"] = None
     row["partial"] = True

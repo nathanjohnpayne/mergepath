@@ -10,6 +10,9 @@
 # Used by check_spec_test_alignment when the default filename search
 # wouldn't find the test.
 spec_test_map:
+  cockpit_fleet:
+    - tests/test_cockpit_fleet.py
+    - tests/test_cockpit_fleet_ui.cjs
   cockpit_ci:
     - tests/test_cockpit_ci.py
     - tests/test_cockpit_ci_ui.cjs
