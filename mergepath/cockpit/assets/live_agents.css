@@ -1,0 +1,32 @@
+.live-agents,.live-agent-list{display:grid;gap:10px;min-width:0}
+.live-summary{margin:0}
+.live-agent{border:1px solid var(--line);border-radius:14px;padding:12px 14px;display:grid;gap:10px;min-width:0;transition:background-color 360ms ease,border-color 360ms ease}
+.live-agent.fresh{animation:live-agent-enter 360ms var(--ease) both}
+.live-agent.tone-boulder{background:var(--boulder-soft);border-color:var(--boulder)}
+.live-agent.tone-bump{background:var(--bump-soft)}
+.live-agent-head{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:12.5px;min-width:0}
+.live-agent .b{max-width:100%;white-space:normal}
+.live-agent .b>span:last-child{min-width:0;overflow-wrap:anywhere}
+.live-agent-head .mono,.live-agent-footer,.live-terminal{overflow-wrap:anywhere}
+.live-agent .rev{padding:2px 8px;border-radius:6px;font-family:var(--mono);font-size:11px;font-weight:600;border:1px solid var(--line-strong)}
+.live-agent .rev-claude{background:var(--clear-soft);color:var(--clear-ink)}
+.live-agent .rev-codex{background:var(--run-soft);color:var(--run-ink)}
+.live-stages{display:flex;align-items:center}
+.live-stage{position:relative;flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;font-size:10.5px;font-family:var(--mono);color:var(--soft)}
+.live-stage::before{content:"";position:absolute;left:-50%;right:50%;top:5px;height:2px;background:var(--line)}
+.live-stage:first-child::before{display:none}
+.live-stage-dot{width:12px;height:12px;border-radius:50%;background:var(--idle-soft);box-shadow:inset 0 0 0 1px var(--line);z-index:1;transition:background-color 360ms ease}
+.live-stage.stg-done .live-stage-dot{background:var(--clear);box-shadow:none}
+.live-stage.stg-done::before{background:var(--clear)}
+.live-stage.stg-cur .live-stage-dot{background:var(--run);box-shadow:none;animation:live-agent-pulse 1.4s ease-in-out infinite}
+.live-stage.stg-cur::before,.live-stage.stg-crash::before{background:var(--clear)}
+.live-stage.stg-cur{color:var(--run-ink);font-weight:600}
+.live-stage.stg-crash .live-stage-dot{background:var(--boulder);box-shadow:none}
+.live-stage.stg-crash{color:var(--boulder-ink);font-weight:600}
+.live-agent-footer{font-size:11px}
+.live-agent .m-fill{transition:width 700ms var(--ease),background-color 360ms ease}
+.live-agent .m-top{flex-wrap:wrap}
+@keyframes live-agent-enter{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+@keyframes live-agent-pulse{0%,100%{box-shadow:0 0 0 0 var(--run-soft)}50%{box-shadow:0 0 0 6px var(--run-soft)}}
+body.rm .live-agent,body.rm .live-agent *,body.rm .live-agent *::before{animation:none!important;transition:none!important;transform:none!important}
+@media(prefers-reduced-motion:reduce){.live-agent,.live-agent *,.live-agent *::before{animation:none!important;transition:none!important;transform:none!important}}

@@ -1321,8 +1321,8 @@ class InventoryAndLauncherTests(unittest.TestCase):
             (root / "mergepath" / "cockpit" / "__main__.py").write_text(
                 'import argparse, json\nfrom pathlib import Path\n'
                 'parser = argparse.ArgumentParser()\nparser.add_argument("--port")\n'
-                'parser.add_argument("--actions-settings")\nargs = parser.parse_args()\n'
-                'path = Path(args.actions_settings)\n'
+                'parser.add_argument("--actions-settings")\nparser.add_argument("--agents-settings")\nargs = parser.parse_args()\n'
+                'path = Path(args.actions_settings or args.agents_settings)\n'
                 'print(json.dumps({"path":str(path),"data":json.loads(path.read_text())}))\n')
             # These characters must remain literal argv/file content, not shell code.
             name = "settings $(touch injected-dollar) `touch injected-backtick` [x]; 'quote'.json"
@@ -1331,41 +1331,60 @@ class InventoryAndLauncherTests(unittest.TestCase):
             (root / name).write_text('{"budget":999}')  # Catch reading the wrong cwd, too.
             calls = Path(temp) / "calls"
             env = {**os.environ, "COCKPIT_TEST_CALLS": str(calls)}
-            for shell, argument in [(shell, argument) for shell in ("bash", "/bin/bash") for argument in (name, str(settings))]:
-                with self.subTest(shell=shell, argument=argument):
-                    result = subprocess.run([shell, str(launcher), "--actions-settings", argument],
+            for shell, option, argument in [(shell, option, argument) for shell in ("bash", "/bin/bash") for option in ("--actions-settings", "--agents-settings") for argument in (name, str(settings))]:
+                with self.subTest(shell=shell, option=option, argument=argument):
+                    result = subprocess.run([shell, str(launcher), option, argument],
                                             cwd=caller, env=env, capture_output=True, text=True, timeout=5)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     value = json.loads(result.stdout)
                     self.assertTrue(Path(value["path"]).is_absolute())
                     self.assertEqual(Path(value["path"]).resolve(), settings.resolve())
                     self.assertEqual(value["data"]["budget"], 42)
-            self.assertEqual(calls.read_text().splitlines(), ["called"] * 4)
+            self.assertEqual(calls.read_text().splitlines(), ["called"] * 8)
             for directory in (root, caller):
                 for marker in ("injected-dollar", "injected-backtick"):
                     self.assertFalse((directory / marker).exists())
-            for arguments in (["--actions-settings", ""], ["--actions-settings"]):
+            for arguments in (["--actions-settings", ""], ["--actions-settings"], ["--agents-settings", ""], ["--agents-settings"]):
                 result = subprocess.run(["bash", str(launcher), *arguments], cwd=caller, env=env,
                                         capture_output=True, text=True, timeout=5)
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("usage:", result.stderr)
-            self.assertEqual(calls.read_text().splitlines(), ["called"] * 4)
+            self.assertEqual(calls.read_text().splitlines(), ["called"] * 8)
 
-    def test_actions_settings_are_bounded_regular_json_and_refuse_unsafe_inputs(self):
+    def test_settings_are_bounded_regular_json_and_refuse_unsafe_inputs(self):
         main = importlib.import_module("mergepath.cockpit.__main__")
-        self.assertEqual(main.load_actions_settings(None), {})
+        self.assertEqual(main.load_settings_json(None), {})
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "settings with spaces.json"
             path.write_text('{"budget":42,"measurements":{}}')
-            self.assertEqual(main.load_actions_settings(path)["budget"], 42)
+            self.assertEqual(main.load_settings_json(path)["budget"], 42)
             for raw in [b'[]', b'{broken', b'{}'+b' '*65535, b'\xff', b'['*2000+b']'*2000]:
                 path.write_bytes(raw)
                 with self.subTest(raw=raw[:10]), self.assertRaises((ValueError, UnicodeError)):
-                    main.load_actions_settings(path)
+                    main.load_settings_json(path)
             path.unlink(); os.mkfifo(path)
-            with self.assertRaises(ValueError): main.load_actions_settings(path)
+            with self.assertRaises(ValueError): main.load_settings_json(path)
             path.unlink(); path.symlink_to(Path(temp) / "missing")
-            with self.assertRaises(OSError): main.load_actions_settings(path)
+            with self.assertRaises(OSError): main.load_settings_json(path)
+
+    def test_history_reviewer_configuration_is_explicit_bounded_and_scrubbed(self):
+        main = importlib.import_module("mergepath.cockpit.__main__")
+        calls = []
+        def read(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return SimpleNamespace(stdout='["fixture-reviewer", "another-reviewer", "fixture-reviewer"]')
+        with patch.dict(os.environ, {"GH_TOKEN": TOKEN, "OP_PREFLIGHT_AUTHOR_PAT": TOKEN}):
+            reviewers = main.load_reviewers(ROOT, run=read)
+        self.assertEqual(reviewers, ("fixture-reviewer", "another-reviewer"))
+        self.assertEqual(calls[0][0][2], ".available_reviewers")
+        self.assertEqual(calls[0][1]["timeout"], 5)
+        self.assertNotIn(TOKEN, json.dumps(calls[0][1]["env"]))
+        for raw in ('null', '{}', '[]', '["bad/name"]', '[true]', 'invalid', 'x'*16385):
+            with self.subTest(raw=raw[:20]), self.assertRaises(ValueError):
+                main.load_reviewers(ROOT, run=lambda *args, **kwargs: SimpleNamespace(stdout=raw))
+        with self.assertRaises(ValueError):
+            main.load_reviewers(ROOT, run=lambda *args, **kwargs: (_ for _ in ()).throw(OSError(TOKEN)))
+
     def test_fleet_constructor_refusal_keeps_unrelated_panels_and_cleans_partial_workspace(self):
         main = importlib.import_module("mergepath.cockpit.__main__")
         fleet_module = importlib.import_module("mergepath.cockpit.fleet")
@@ -1397,6 +1416,9 @@ class InventoryAndLauncherTests(unittest.TestCase):
                     self.assertIn("prs", snapshot["sources"]); self.assertNotIn("fleet", snapshot["sources"])
                     self.assertIn("actions", snapshot["sources"])
                     self.assertEqual(applications[0].panel_snapshot("budget")["source"], "actions")
+                    self.assertIn("agents", snapshot["sources"]); self.assertIn("live_agents", snapshot["sources"])
+                    self.assertEqual(applications[0].panel_snapshot("history")["source"], "agents")
+                    self.assertEqual(applications[0].panel_snapshot("agents")["source"], "live_agents")
                     self.assertEqual(applications[0].panel_snapshot("prs")["source"], "prs")
                     missing = applications[0].panel_snapshot("fleet")
                     self.assertIsNone(missing["source"]); self.assertIsNone(missing["envelope"]["data"])
@@ -1407,6 +1429,10 @@ class InventoryAndLauncherTests(unittest.TestCase):
                     stack.enter_context(patch.object(main, "load_inventory", return_value=(
                         Repository("mergepath", HUB, True), Repository("one", "fixture/one"))))
                     stack.enter_context(patch.object(main, "Application", side_effect=application))
+                    stack.enter_context(patch.object(main, "resolve_history_settings", return_value=((), {})))
+                    stack.enter_context(patch.object(main, "load_reviewers", return_value=("fixture-reviewer",)))
+                    stack.enter_context(patch.object(main, "AgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))))
+                    stack.enter_context(patch.object(main, "LiveAgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))))
                     stack.enter_context(patch.object(main, "PRProvider", return_value=lambda deadline: Sample({})))
                     stack.enter_context(patch.object(fleet_module.shutil, "which", side_effect=which))
                     stack.enter_context(patch.object(fleet_module.tempfile, "mkdtemp", side_effect=allocate))
@@ -1429,6 +1455,10 @@ class InventoryAndLauncherTests(unittest.TestCase):
         client = GitHubClient(TOKEN, transport=HTTPFixture())
         with patch.object(main.GitHubClient, "from_environment", return_value=client), \
              patch.object(main, "load_inventory", return_value=(Repository("mergepath", HUB, True),)), \
+             patch.object(main, "resolve_history_settings", return_value=((), {})), \
+             patch.object(main, "load_reviewers", return_value=("fixture-reviewer",)), \
+             patch.object(main, "AgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))), \
+             patch.object(main, "LiveAgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))), \
              patch.object(main, "FleetProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}), close=lambda: None)), \
              patch.object(main, "open_browser", return_value=False) as opener, \
              patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
@@ -1500,6 +1530,10 @@ class InventoryAndLauncherTests(unittest.TestCase):
             return real_join(thread, timeout)
         with patch.object(main.GitHubClient, "from_environment", return_value=client), \
              patch.object(main, "load_inventory", return_value=(Repository("mergepath", HUB, True),)), \
+             patch.object(main, "resolve_history_settings", return_value=((), {})), \
+             patch.object(main, "load_reviewers", return_value=("fixture-reviewer",)), \
+             patch.object(main, "AgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))), \
+             patch.object(main, "LiveAgentsProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}))), \
              patch.object(main, "FleetProvider", return_value=SimpleNamespace(fetch=lambda deadline: Sample({}), close=lambda: None)), \
              patch.object(main.shutil, "which", return_value="/fixture/xdg-open"), \
              patch.object(main.subprocess, "Popen", side_effect=opener), \

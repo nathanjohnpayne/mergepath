@@ -10,7 +10,7 @@ COCKPIT_PORT=0
 COCKPIT_EXTRA_ARGS=()
 
 usage() {
-  echo "usage: cockpit.sh [--agent codex|claude|cursor] [--port 0..65535] [--actions-settings PATH]" >&2
+  echo "usage: cockpit.sh [--agent codex|claude|cursor] [--port 0..65535] [--actions-settings PATH] [--agents-settings PATH]" >&2
   exit 2
 }
 
@@ -18,11 +18,11 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --agent) [ "$#" -ge 2 ] || usage; COCKPIT_AGENT=$2; shift 2 ;;
     --port) [ "$#" -ge 2 ] || usage; COCKPIT_PORT=$2; shift 2 ;;
-    --actions-settings)
+    --actions-settings|--agents-settings)
       [ "$#" -ge 2 ] && [ -n "$2" ] || usage
       case "$2" in
-        /*) COCKPIT_EXTRA_ARGS+=(--actions-settings "$2") ;;
-        *) COCKPIT_EXTRA_ARGS+=(--actions-settings "$COCKPIT_CALLER_DIR/$2") ;;
+        /*) COCKPIT_EXTRA_ARGS+=("$1" "$2") ;;
+        *) COCKPIT_EXTRA_ARGS+=("$1" "$COCKPIT_CALLER_DIR/$2") ;;
       esac
       shift 2 ;;
     -h|--help) usage ;;

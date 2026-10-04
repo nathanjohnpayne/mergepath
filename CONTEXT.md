@@ -22,13 +22,13 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Central docs repo**: The `nathanjohnpayne/docs` vault holding canonical PRDs, a separate source graph from the hub. _Avoid_: conflating with the hub.
 
-**Surface**: A named Mergepath product UI under the umbrella brand: Playground (current), Cockpit (local shared shell, PR, CI, read-only Fleet and Actions-budget observations; remaining panels in development), Tiebreaker and Checks (reserved).
+**Surface**: A named Mergepath product UI under the umbrella brand: Playground (current), Cockpit (local shared shell, PR, CI, read-only Fleet, Actions-budget, live-agent and agent-history observations), Tiebreaker and Checks (reserved).
 
 **Reserved name**: A brand name claimed in `BRAND.md` ahead of the surface existing, so a future agent does not pick it for the wrong thing; no files are scaffolded until the surface is designed.
 
 **Playground**: A static review-policy prototyping UI: tune the policy knobs, replay recent PRs against the draft, copy the resulting YAML. _Avoid_: "Rubric" (retired name), "dashboard", "policy editor" (an explicit non-goal, earmarked for Cockpit).
 
-**Cockpit**: The local operator console for in-progress reviews, with an authenticated stdlib server and shared shell under `mergepath/cockpit/`. Connection health, observed API-resource meters, repository filtering, Road components, PR/review-budget evidence, CI run/step observations and Actions budgets and slow read-only Fleet audits are connected, with unknown or stale data explicitly marked. Failure excerpts are bounded on-demand reads, and displayed rerun commands are instructions for the operator. Fleet refresh preserves last-good rows and shares current PR evidence. Remaining panel sources show unavailable until connected. Cockpit display defaults do not change review policy or trigger reviews; sync actions are not connected. _Avoid_: calling unavailable panels operational.
+**Cockpit**: The local operator console for in-progress reviews, with an authenticated stdlib server and shared shell under `mergepath/cockpit/`. Connection health, observed API-resource meters, repository filtering, Road components, PR/review-budget evidence, CI run/step observations, Actions budgets, live agents, agent history and slow read-only Fleet audits are connected, with unknown or stale data explicitly marked. Failure excerpts are bounded on-demand reads, and displayed rerun commands are instructions for the operator. Fleet refresh preserves last-good rows and shares current PR evidence. Cockpit display defaults do not change review policy or trigger reviews; sync actions are not connected. _Avoid_: calling unavailable panels operational.
 
 **Replay**: Running a set of real merged PRs through a draft policy to see routing before committing the YAML. _Avoid_: "backtest".
 
