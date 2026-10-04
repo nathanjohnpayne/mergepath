@@ -43,6 +43,14 @@ test("Unknown check producer or Actions lineage remains actionable beside passin
     assert.equal(data.check_rows[0].checks[0].superseded_by, null);
   }
 });
+test("Workflow with empty PR metadata projects current failure from independently observed open HEAD", () => {
+  const {data} = pythonFixture("ci.unmatched_checks_fixture(checks=[ci.raw_check()], run_prs=[])");
+  const model = CI.project(envelope(data), null, 1001);
+  assert.equal(model.state, "bump"); assert.equal(model.hazards.length, 1);
+  assert.equal(model.rows[0].pr, "7"); assert.equal(model.rows[0].current_head, true);
+  assert.equal(model.rows[0].key, "owner/repo:10:7"); assert.equal(data.check_rows.length, 0);
+  assert.ok(model.hazards[0].title.includes("#7"));
+});
 test("Check-only pending or unavailable evidence cannot project a clear state", () => {
   for (const [status, expected] of [["queued","running"],["in_progress","running"],["completed","idle"],["unknown","idle"]]) {
     const {data} = pythonFixture(`ci.unmatched_checks_fixture(checks=[ci.raw_check(conclusion='success'), {**ci.raw_check(200), 'status':'${status}', 'conclusion':None}])`);
