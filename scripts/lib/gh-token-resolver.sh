@@ -293,7 +293,13 @@ gh_resolve_token_for_identity() {
   fi
   if ! token="$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --user "$expected_login" 2>/dev/null)"; then
     echo "$label: could not read a token for $expected_login via gh auth token --user." >&2
-    echo "$label: run gh auth login once for that identity, or warm op-preflight." >&2
+    if [ "${CLAUDE_CODE_REMOTE:-}" = "true" ] || [ "${MERGEPATH_AGENT_SURFACE:-}" = "codex-cloud" ]; then
+      # A cloud session has no keyring to log into and no one to answer the
+      # 1Password prompt op-preflight raises, so the local advice is wrong here.
+      echo "$label: a cloud session has no gh keyring or 1Password: set ${preferred_var:-the OP_PREFLIGHT_*_PAT for this identity} in the cloud environment's settings, then start a new session (docs/agents/cloud-environments.md, Credentials)." >&2
+    else
+      echo "$label: run gh auth login once for that identity, or warm op-preflight." >&2
+    fi
     return 3
   fi
   source="gh auth token --user $expected_login"

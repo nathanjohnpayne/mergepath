@@ -246,7 +246,10 @@ fi
 
 # --- the CI lane that resumes a graphql handback (#1057 G) ---------------------
 LANE="$ROOT/.github/workflows/thread-resolution-lane.yml"
-if [ -r "$LANE" ] && command -v yq >/dev/null 2>&1; then
+# The lane is read with mikefarah/yq v4 syntax. Another program named yq (the
+# Python jq wrapper the Claude cloud image ships) is reported as such, never
+# run into an abort mid-suite.
+if [ -r "$LANE" ] && yq --version 2>/dev/null | grep -q 'mikefarah/yq'; then
   guard="$(yq -r '.jobs.resolve.if' "$LANE")"
   ref="$(yq -r '.jobs.resolve.steps[0].with.ref' "$LANE")"
   persist="$(yq -r '.jobs.resolve.steps[0].with."persist-credentials"' "$LANE")"
@@ -322,7 +325,7 @@ G
     fail "lane identity: codex rc=$c1 '$l1'; author rc=$c2 '$l2'; empty rc=$c3 '$l3'; unlisted rc=$c4 '$l4'"
   fi
 else
-  fail "thread-resolution-lane.yml missing, or yq unavailable to check it"
+  fail "thread-resolution-lane.yml missing, or no mikefarah/yq v4 to check it (yq on PATH: $(yq --version 2>&1 | head -1 || echo none); bash scripts/cloud-setup.sh installs it)"
 fi
 
 # --- dispatch-thread-resolution-lane.sh (#1057 G) -----------------------------
@@ -412,6 +415,28 @@ if [ "$r_none" -eq 6 ] && [ "$r_hang" -eq 9 ] && [ "$r_slow" -eq 9 ] && [ "$t_sl
   pass "dispatch: own run never listed -> exit 6 (the older run is not watched); run failed -> 8; never completes -> 9 (a wall-clock deadline that counts request time); dispatch refused -> 4; --no-wait prints the run id"
 else
   fail "dispatch exits: none=$r_none hang=$r_hang slow=$r_slow/${t_slow}s fail=$r_fail refused=$r_refused nowait=$r_nowait out=$out"
+fi
+
+# Nothing sent is not GitHub refusing: a missing author token is named as
+# such (and, in a cloud session, with the variable to set), and only a refusal
+# from gh itself keeps the permission hint.
+set +e
+drun OP_PREFLIGHT_AUTHOR_PAT= CLAUDE_CODE_REMOTE=true -- >/dev/null 2>"$DFIX/err"; r_notoken=$?
+set -e
+if [ "$r_notoken" -eq 4 ] && grep -q "no author token was found, so nothing was dispatched to o/r" "$DFIX/err" \
+   && grep -q "set OP_PREFLIGHT_AUTHOR_PAT in the cloud environment's settings" "$DFIX/err" \
+   && ! grep -q "needs Contents: write" "$DFIX/err" && ! grep -q $'\t-X\tPOST' "$DFIX/d.log"; then
+  pass "dispatch: no author token -> exit 4 naming the missing token (and the cloud variable to set), nothing dispatched"
+else
+  fail "dispatch no token: rc=$r_notoken err=$(cat "$DFIX/err")"
+fi
+set +e
+drun D_DISPATCH_FAIL=1 -- >/dev/null 2>"$DFIX/err"; r_refused=$?
+set -e
+if [ "$r_refused" -eq 4 ] && grep -q "was refused; the author PAT needs Contents: write" "$DFIX/err"; then
+  pass "dispatch: GitHub refusing the dispatch keeps the permission hint"
+else
+  fail "dispatch refused message: rc=$r_refused err=$(cat "$DFIX/err")"
 fi
 
 echo

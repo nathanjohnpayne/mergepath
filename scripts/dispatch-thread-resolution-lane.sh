@@ -106,10 +106,20 @@ TITLE="Thread resolution lane: PR #$PR [$NONCE]"
 
 AS_AUTHOR="$ROOT/scripts/gh-as-author.sh"
 [ -x "$AS_AUTHOR" ] || die 4 "author wrapper missing ($AS_AUTHOR)"
-if ! "$AS_AUTHOR" -- gh api -X POST "repos/$REPO/dispatches" \
-     -f "event_type=$EVENT_TYPE" -F "client_payload[pr]=$PR" -f "client_payload[nonce]=$NONCE" >/dev/null; then
-  die 4 "the repository_dispatch to $REPO was refused; the author PAT needs Contents: write (fine-grained) or repo (classic)"
-fi
+dispatch_rc=0
+"$AS_AUTHOR" -- gh api -X POST "repos/$REPO/dispatches" \
+  -f "event_type=$EVENT_TYPE" -F "client_payload[pr]=$PR" -f "client_payload[nonce]=$NONCE" >/dev/null || dispatch_rc=$?
+# The wrapper's token exits (scripts/gh-as-author.sh: 3 lookup failed, 2
+# verification failed, 70 trace marker) mean nothing was sent. Any other
+# nonzero, 1 included, is what gh itself returned for the request, which is
+# GitHub refusing the dispatch.
+case "$dispatch_rc" in
+  0) ;;
+  3) die 4 "no author token was found, so nothing was dispatched to $REPO; provision the author PAT (docs/agents/cloud-environments.md, Credentials)" ;;
+  2) die 4 "the author token did not verify as a user-held credential for the author, so nothing was dispatched to $REPO" ;;
+  70) die 4 "the author wrapper refused before dispatching to $REPO (exit 70; its message is above)" ;;
+  *) die 4 "the repository_dispatch to $REPO was refused; the author PAT needs Contents: write (fine-grained) or repo (classic)" ;;
+esac
 echo "dispatch-thread-resolution-lane: dispatched $EVENT_TYPE for $REPO#$PR (nonce $NONCE)" >&2
 
 # Both waits are wall-clock deadlines (bash's SECONDS), so time spent in
