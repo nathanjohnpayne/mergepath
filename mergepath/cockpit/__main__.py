@@ -1,6 +1,8 @@
 """Launch the local shell without printing any authentication material."""
 
 import argparse
+import json
+import stat
 import os
 import shutil
 import subprocess
@@ -14,6 +16,7 @@ if not __package__:
     # The launcher uses -I to ignore ambient Python paths and user site code.
     sys.path.insert(0, str(ROOT))
 
+from mergepath.cockpit.actions import ActionsProvider, ci_observation
 from mergepath.cockpit.github import ClientError, GitHubClient
 from mergepath.cockpit.fleet import FleetProvider
 from mergepath.cockpit.inventory import load_inventory
@@ -41,14 +44,42 @@ def open_browser(url):
         return False
 
 
+def load_actions_settings(path):
+    if path is None:
+        return {}
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError("invalid_actions_settings")
+        raw = stream.read(65537)
+    if len(raw) > 65536:
+        raise ValueError("invalid_actions_settings")
+    try:
+        value = json.loads(raw)
+    except (ValueError, RecursionError):
+        raise ValueError("invalid_actions_settings") from None
+    if type(value) is not dict:
+        raise ValueError("invalid_actions_settings")
+    return value
+
+
+def shared_ci_snapshot(app, repo, _fetch_now):
+    # Another source can publish while Actions is fetching. Read the copied
+    # receipt before the validation clock, so a new observation is not future.
+    envelope = app.panel_snapshot("ci")["envelope"]
+    return ci_observation(envelope, repo, app.clock())
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Local Mergepath Cockpit")
     parser.add_argument("--port", type=int, default=0, help="loopback port; 0 chooses an available port")
+    parser.add_argument("--actions-settings", help="local JSON containing explicit budget, cycle and measured coefficients")
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error("port must be between 0 and 65535")
     app, fleet = None, None
     try:
+        actions_settings = load_actions_settings(args.actions_settings)
         github = GitHubClient.from_environment(os.environ)
         # Drop credentials the read-only foundation does not need. Future
         # owner-only reads/write wrappers have their own explicit contracts.
@@ -73,13 +104,17 @@ def main(argv=None):
             app.scheduler.register("fleet", fleet.fetch, hot_interval=1800, idle_interval=1800,
                                    timeout=180, max_backoff=7200)
             app.register_panel("fleet", "fleet")
+        actions_provider = ActionsProvider(github, inventory, settings=actions_settings,
+                                           ci_snapshot=lambda repo, now: shared_ci_snapshot(app, repo, now))
+        app.scheduler.register("actions", actions_provider.fetch, hot_interval=15, idle_interval=120, timeout=30)
+        app.register_panel("budget", "actions")
         server = CockpitServer(app, args.port)
     except (ClientError, ValueError, OSError):
         if app is not None:
             app.close()
         if fleet is not None:
             fleet.close()
-        print("Cockpit cannot start. Check the cached reviewer credential, installed hub yq and loopback port.",
+        print("Cockpit cannot start. Check the cached reviewer credential, installed hub yq, settings JSON and loopback port.",
               file=sys.stderr)
         return 1
     port = server.server_address[1]

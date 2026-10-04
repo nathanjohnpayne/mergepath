@@ -12,6 +12,8 @@ for command in ([sys.executable, '-B', 'tests/test_cockpit.py'], ['node', '--tes
                 [sys.executable, '-B', 'tests/test_cockpit_logs.py'],
                 [sys.executable, '-B', 'tests/test_cockpit_prs.py'],
                 ['node', '--test', 'tests/test_cockpit_prs_ui.cjs'],
+                [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_cockpit_actions.py'],
+                ['node', '--test', 'tests/test_cockpit_actions_ui.cjs'],
                 [sys.executable, '-B', 'tests/test_cockpit_fleet.py'],
                 ['node', '--test', 'tests/test_cockpit_fleet_ui.cjs']):
     result = subprocess.run(command, timeout=60)

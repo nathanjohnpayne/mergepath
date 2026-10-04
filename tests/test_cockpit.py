@@ -1296,11 +1296,76 @@ class InventoryAndLauncherTests(unittest.TestCase):
             self.assertEqual(calls.read_text().strip(), "--agent codex --check --print-exports")
             self.assertNotIn(TOKEN, result.stdout + result.stderr)
             self.assertNotIn("fixture-author-credential", result.stdout + result.stderr)
+            # Stock macOS /bin/bash is 3.2 and treats empty arrays under nounset differently.
+            result = subprocess.run(["/bin/bash", str(launcher), "--port", "0"], env=env,
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(calls.read_text().strip(), "--agent codex --check --print-exports")
             env["COCKPIT_TEST_CACHE_FAIL"] = "1"
             result = subprocess.run(["bash", str(launcher)], env=env, capture_output=True, text=True, timeout=5)
             self.assertEqual(result.returncode, 1)
             self.assertNotIn("fixture server launched", result.stdout)
 
+    def test_launcher_resolves_settings_at_caller_before_changing_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, caller = Path(temp) / "hub", Path(temp) / "caller"
+            (root / "scripts").mkdir(parents=True)
+            (root / "mergepath" / "cockpit").mkdir(parents=True)
+            caller.mkdir()
+            launcher = root / "scripts" / "cockpit.sh"
+            launcher.write_bytes((ROOT / "scripts" / "cockpit.sh").read_bytes())
+            preflight = root / "scripts" / "op-preflight.sh"
+            preflight.write_text('#!/bin/bash\nprintf "called\\n" >> "$COCKPIT_TEST_CALLS"\n'
+                                 'printf "export OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-credential\\n"\n')
+            preflight.chmod(0o755)
+            (root / "mergepath" / "cockpit" / "__main__.py").write_text(
+                'import argparse, json\nfrom pathlib import Path\n'
+                'parser = argparse.ArgumentParser()\nparser.add_argument("--port")\n'
+                'parser.add_argument("--actions-settings")\nargs = parser.parse_args()\n'
+                'path = Path(args.actions_settings)\n'
+                'print(json.dumps({"path":str(path),"data":json.loads(path.read_text())}))\n')
+            # These characters must remain literal argv/file content, not shell code.
+            name = "settings $(touch injected-dollar) `touch injected-backtick` [x]; 'quote'.json"
+            settings = caller / name
+            settings.write_text('{"budget":42}')
+            (root / name).write_text('{"budget":999}')  # Catch reading the wrong cwd, too.
+            calls = Path(temp) / "calls"
+            env = {**os.environ, "COCKPIT_TEST_CALLS": str(calls)}
+            for shell, argument in [(shell, argument) for shell in ("bash", "/bin/bash") for argument in (name, str(settings))]:
+                with self.subTest(shell=shell, argument=argument):
+                    result = subprocess.run([shell, str(launcher), "--actions-settings", argument],
+                                            cwd=caller, env=env, capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    value = json.loads(result.stdout)
+                    self.assertTrue(Path(value["path"]).is_absolute())
+                    self.assertEqual(Path(value["path"]).resolve(), settings.resolve())
+                    self.assertEqual(value["data"]["budget"], 42)
+            self.assertEqual(calls.read_text().splitlines(), ["called"] * 4)
+            for directory in (root, caller):
+                for marker in ("injected-dollar", "injected-backtick"):
+                    self.assertFalse((directory / marker).exists())
+            for arguments in (["--actions-settings", ""], ["--actions-settings"]):
+                result = subprocess.run(["bash", str(launcher), *arguments], cwd=caller, env=env,
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("usage:", result.stderr)
+            self.assertEqual(calls.read_text().splitlines(), ["called"] * 4)
+
+    def test_actions_settings_are_bounded_regular_json_and_refuse_unsafe_inputs(self):
+        main = importlib.import_module("mergepath.cockpit.__main__")
+        self.assertEqual(main.load_actions_settings(None), {})
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "settings with spaces.json"
+            path.write_text('{"budget":42,"measurements":{}}')
+            self.assertEqual(main.load_actions_settings(path)["budget"], 42)
+            for raw in [b'[]', b'{broken', b'{}'+b' '*65535, b'\xff', b'['*2000+b']'*2000]:
+                path.write_bytes(raw)
+                with self.subTest(raw=raw[:10]), self.assertRaises((ValueError, UnicodeError)):
+                    main.load_actions_settings(path)
+            path.unlink(); os.mkfifo(path)
+            with self.assertRaises(ValueError): main.load_actions_settings(path)
+            path.unlink(); path.symlink_to(Path(temp) / "missing")
+            with self.assertRaises(OSError): main.load_actions_settings(path)
     def test_fleet_constructor_refusal_keeps_unrelated_panels_and_cleans_partial_workspace(self):
         main = importlib.import_module("mergepath.cockpit.__main__")
         fleet_module = importlib.import_module("mergepath.cockpit.fleet")
@@ -1330,6 +1395,8 @@ class InventoryAndLauncherTests(unittest.TestCase):
                     response = connection.getresponse(); self.assertEqual(response.status, 200)
                     snapshot = json.loads(response.read()); connection.close()
                     self.assertIn("prs", snapshot["sources"]); self.assertNotIn("fleet", snapshot["sources"])
+                    self.assertIn("actions", snapshot["sources"])
+                    self.assertEqual(applications[0].panel_snapshot("budget")["source"], "actions")
                     self.assertEqual(applications[0].panel_snapshot("prs")["source"], "prs")
                     missing = applications[0].panel_snapshot("fleet")
                     self.assertIsNone(missing["source"]); self.assertIsNone(missing["envelope"]["data"])

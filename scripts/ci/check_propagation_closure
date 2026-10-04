@@ -201,6 +201,9 @@ ALLOW_LIST=(
   "tests/test_cockpit.sh"
   "tests/test_cockpit.py"
   "tests/test_cockpit_ui.cjs"
+  "tests/test_cockpit_actions.py"
+  "tests/test_cockpit_actions_ui.cjs"
+  "specs/cockpit_actions.md"
   # The propagation engine itself + its project-doc-mirror sibling.
   # scripts/sync-to-downstream.sh is the orchestrator — explicitly NEVER
   # propagated (see the manifest's "NOT propagated" note). Referenced
