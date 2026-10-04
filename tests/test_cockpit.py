@@ -1296,6 +1296,11 @@ class InventoryAndLauncherTests(unittest.TestCase):
             self.assertEqual(calls.read_text().strip(), "--agent codex --check --print-exports")
             self.assertNotIn(TOKEN, result.stdout + result.stderr)
             self.assertNotIn("fixture-author-credential", result.stdout + result.stderr)
+            # Stock macOS /bin/bash is 3.2 and treats empty arrays under nounset differently.
+            result = subprocess.run(["/bin/bash", str(launcher), "--port", "0"], env=env,
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(calls.read_text().strip(), "--agent codex --check --print-exports")
             env["COCKPIT_TEST_CACHE_FAIL"] = "1"
             result = subprocess.run(["bash", str(launcher)], env=env, capture_output=True, text=True, timeout=5)
             self.assertEqual(result.returncode, 1)
@@ -1326,16 +1331,16 @@ class InventoryAndLauncherTests(unittest.TestCase):
             (root / name).write_text('{"budget":999}')  # Catch reading the wrong cwd, too.
             calls = Path(temp) / "calls"
             env = {**os.environ, "COCKPIT_TEST_CALLS": str(calls)}
-            for argument in (name, str(settings)):
-                with self.subTest(argument=argument):
-                    result = subprocess.run(["bash", str(launcher), "--actions-settings", argument],
+            for shell, argument in [(shell, argument) for shell in ("bash", "/bin/bash") for argument in (name, str(settings))]:
+                with self.subTest(shell=shell, argument=argument):
+                    result = subprocess.run([shell, str(launcher), "--actions-settings", argument],
                                             cwd=caller, env=env, capture_output=True, text=True, timeout=5)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     value = json.loads(result.stdout)
                     self.assertTrue(Path(value["path"]).is_absolute())
                     self.assertEqual(Path(value["path"]).resolve(), settings.resolve())
                     self.assertEqual(value["data"]["budget"], 42)
-            self.assertEqual(calls.read_text().splitlines(), ["called", "called"])
+            self.assertEqual(calls.read_text().splitlines(), ["called"] * 4)
             for directory in (root, caller):
                 for marker in ("injected-dollar", "injected-backtick"):
                     self.assertFalse((directory / marker).exists())
@@ -1344,7 +1349,7 @@ class InventoryAndLauncherTests(unittest.TestCase):
                                         capture_output=True, text=True, timeout=5)
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("usage:", result.stderr)
-            self.assertEqual(calls.read_text().splitlines(), ["called", "called"])
+            self.assertEqual(calls.read_text().splitlines(), ["called"] * 4)
 
     def test_actions_settings_are_bounded_regular_json_and_refuse_unsafe_inputs(self):
         main = importlib.import_module("mergepath.cockpit.__main__")

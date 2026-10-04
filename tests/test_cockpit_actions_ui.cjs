@@ -26,6 +26,22 @@ test('estimates label provenance and use 70%/100% thresholds',()=>{
  }
  assert.match(model(data({repositories:[row({estimated_requests:800,measurement:measured()})]}),false,null,now+3601).cards[1].rows[0].value,/unavailable/);
 });
+test('measurement provenance uses the backend Unicode codepoint boundary',()=>{
+ for(const length of [121,240,241]) {
+  const provenance='\u{1f600}'.repeat(length);
+  const m=model(data({repositories:[row({estimated_requests:800,measurement:{...measured(),provenance}})]}));
+  const token=m.cards[1];
+  if(length<=240) {
+   assert.equal(token.available,true);assert.equal(token.state,'bump');
+   assert.match(token.rows[0].value,/^est\./);assert.ok(token.rows[0].detail.includes(provenance));
+   assert.equal(m.hazards.filter(h=>h.id.startsWith('actions-token-')).length,1);
+  } else {
+   assert.equal(token.available,false);assert.equal(token.state,'idle');
+   assert.match(token.rows[0].value,/unavailable/);
+   assert.equal(m.hazards.filter(h=>h.id.startsWith('actions-token-')).length,0);
+  }
+ }
+});
 test('explicit installation run overrides estimate and retains last-known hard signal stale',()=>{
  const d=data({repositories:[row({installation_runs:['41'],estimated_requests:20,measurement:{...measured(),requests_per_run:10}})]});
  for(const stale of [false,true]) {
