@@ -2453,10 +2453,15 @@ sync_progress() {
 
 sync_confirmed_hub() {
   [ -n "${SYNC_EXPECT_HUB:-}" ] || return 0
+  local hub_status
+  if ! hub_status=$(git -C "$MERGEPATH_ROOT" status --porcelain --untracked-files=all); then
+    err "confirmed hub status unavailable"
+    return 1
+  fi
   if [ "$(git -C "$MERGEPATH_ROOT" rev-parse --verify 'HEAD^{commit}')" != "$SYNC_EXPECT_HUB" ] \
      || [ "$(git -C "$MERGEPATH_ROOT" symbolic-ref --short HEAD 2>/dev/null)" != main ] \
      || [ "$(git -C "$MERGEPATH_ROOT" rev-parse --verify 'refs/remotes/origin/main^{commit}' 2>/dev/null)" != "$SYNC_EXPECT_HUB" ] \
-     || [ -n "$(git -C "$MERGEPATH_ROOT" status --porcelain --untracked-files=all)" ]; then
+     || [ -n "$hub_status" ]; then
     err "confirmed hub must remain clean at exactly origin/main"
     return 1
   fi

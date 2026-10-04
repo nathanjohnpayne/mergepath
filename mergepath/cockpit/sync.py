@@ -20,6 +20,7 @@ import threading
 import time
 
 from .fleet import SHA, UTILITY_PATH, validate_record
+from .github import ClientError
 from .inventory import HUB, REPO
 
 PREVIEW_SECONDS = 180
@@ -282,7 +283,10 @@ class SyncProvider:
         return self.snapshot(session_id)
 
     def _records(self, deadline):
-        sample = self.fetch(deadline)
+        try:
+            sample = self.fetch(deadline)
+        except ClientError as error:
+            raise SyncError("audit_busy" if str(error) == "upstream_backoff" else "audit_unavailable") from None
         data = sample.data
         if type(data) is not dict or data.get("schema") != "cockpit-fleet/v1" or data.get("hub_repo") != HUB:
             raise SyncError("audit_unavailable")

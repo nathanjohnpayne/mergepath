@@ -2474,4 +2474,52 @@ for flags in '--audit --fresh-branch 0123456789abcdef0123456789abcdef' '--sync-a
 done
 echo "PASS: full identity fences and confirmed-option validation refuse before writes"
 
+# Reach the actual engine's pre-copy and pre-push checks after its initial
+# clean-hub check. Empty stdout from a failed status must never authorize writes.
+status_bin="$metadata_workdir/status-bin"
+mkdir -p "$status_bin"
+cp "$META_FAKE_BIN/gh" "$status_bin/gh"
+status_real_git=$(command -v git)
+cat >"$status_bin/git" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = -C ] && [ "${2:-}" = "$MERGEPATH_TEST_STATUS_HUB" ] && [ "${3:-}" = status ]; then
+  count=0
+  [ ! -f "$MERGEPATH_TEST_STATUS_COUNT" ] || count=$(cat "$MERGEPATH_TEST_STATUS_COUNT")
+  count=$((count + 1))
+  printf '%s\n' "$count" >"$MERGEPATH_TEST_STATUS_COUNT"
+  if [ "$count" -eq "$MERGEPATH_TEST_STATUS_FAIL_AT" ]; then exit 128; fi
+fi
+case " $* " in *" push "*) printf '%s\n' "$*" >>"$MERGEPATH_TEST_STATUS_PUSHES";; esac
+exec "$MERGEPATH_TEST_REAL_GIT" "$@"
+SH
+chmod +x "$status_bin/git"
+for status_at in 2 3; do
+  status_count="$metadata_workdir/status-count-$status_at"
+  status_pushes="$metadata_workdir/status-pushes-$status_at"
+  status_nonce=$(printf '%032d' "$status_at")
+  set +e
+  status_out=$(env PATH="$status_bin:$PATH" MERGEPATH_ROOT_OVERRIDE="$META_MP" \
+    MERGEPATH_TEST_REMOTE_ALPHA="$fresh_remote" MERGEPATH_TEST_CAPTURE_DIR="$META_CAPTURE" \
+    MERGEPATH_TEST_RUN="status-$status_at" MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
+    MERGEPATH_TEST_REAL_GIT="$status_real_git" MERGEPATH_TEST_STATUS_HUB="$META_MP" \
+    MERGEPATH_TEST_STATUS_COUNT="$status_count" MERGEPATH_TEST_STATUS_FAIL_AT="$status_at" \
+    MERGEPATH_TEST_STATUS_PUSHES="$status_pushes" \
+    "$SCRIPT" --sync-all --repos alpha --fresh-branch "$status_nonce" \
+      --expect-hub "$meta_sha" --expect-consumer "$fresh_consumer_sha" --progress-json 2>&1)
+  status_rc=$?
+  set -e
+  [ "$status_rc" -ne 0 ] || fail "failed hub status authorized actual engine at fence $status_at: $status_out"
+  printf '%s\n' "$status_out" | grep -q 'confirmed hub status unavailable' || fail "hub status failure reason missing at fence $status_at: $status_out"
+  [ "$(cat "$status_count")" -eq "$status_at" ] || fail "status failure did not reach expected actual fence $status_at"
+  [ ! -s "$status_pushes" ] || fail "failed status reached git push at fence $status_at"
+  [ ! -f "$META_CAPTURE/pr-body-status-$status_at.md" ] || fail "failed status reached PR creation at fence $status_at"
+  if [ "$status_at" -eq 2 ]; then
+    ! printf '%s\n' "$status_out" | grep -q '"kind":"stage".*"value":"diff"' || fail "failed pre-copy status reached diff"
+  else
+    printf '%s\n' "$status_out" | grep -q '"kind":"stage".*"value":"commit"' || fail "pre-push status fixture did not reach commit"
+  fi
+done
+echo "PASS: actual engine fails closed on unavailable pre-copy and pre-push hub status"
+
 echo "test_sync_to_downstream: PASS"

@@ -14,6 +14,8 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from mergepath.cockpit.fleet import FleetProvider
+from mergepath.cockpit.github import ClientError
 from mergepath.cockpit.inventory import HUB, Repository
 from mergepath.cockpit.scheduler import Sample
 from mergepath.cockpit.sync import SyncError, SyncProvider, resolve_git_identity
@@ -45,6 +47,7 @@ class SyncTests(unittest.TestCase):
         (self.root / "scripts").mkdir(parents=True)
         self.records = self.base / "records.json"
         self.calls = self.base / "calls.jsonl"
+        self.audits = self.base / "audits.jsonl"
         self.mode = self.base / "mode"
         self.mode.write_text("ok")
         self.cache = self.base / "cache-mode"
@@ -53,10 +56,13 @@ class SyncTests(unittest.TestCase):
         self.gh = self.base / "gh"
         self.gh.write_text('#!/bin/sh\nexit 99\n')
         self.gh.chmod(0o700)
+        canonical = (Path(__file__).resolve().parents[1] / 'scripts/op-preflight.sh').read_text()
+        cleanup = canonical.split("DEPLOY_CLEAR_STMT='", 1)[1].split("'\n", 1)[0] + '; unset CF_API_TOKEN'
         preflight = f'''#!/usr/bin/env bash
 case "$(cat '{self.cache}')" in
  fail) exit 1;; empty) echo 'export OP_PREFLIGHT_AUTHOR_PAT=';; reviewer) echo 'export OP_PREFLIGHT_REVIEWER_PAT=reviewer_secret';;
  malformed) echo 'export OP_PREFLIGHT_AUTHOR_PAT=$(touch /never-execute)' ;;
+ canonical) echo 'export OP_PREFLIGHT_AUTHOR_PAT=github_pat_fixture_AUTHOR_secret'; echo 'export OP_PREFLIGHT_REVIEWER_PAT=reviewer_secret'; echo 'export GH_TOKEN=reviewer_secret'; printf '%s\\n' '{cleanup}'; echo 'export OP_PREFLIGHT_DONE=1'; echo 'export OP_PREFLIGHT_AGENT=codex'; echo 'export OP_PREFLIGHT_MODE=review';;
  *) echo 'export OP_PREFLIGHT_AUTHOR_PAT=github_pat_fixture_AUTHOR_secret'; echo 'export OP_PREFLIGHT_REVIEWER_PAT=reviewer_secret';;
 esac
 '''
@@ -70,8 +76,16 @@ mode=Path({str(self.mode)!r}).read_text()
 if '--dry-run' in args:
  print('Proposed manifest paths; remote overrides require audit');sys.exit(0)
 if '--audit' in args:
- for r in json.loads(Path({str(self.records)!r}).read_text()): print(json.dumps(r))
- sys.exit(1)
+ rows=json.loads(Path({str(self.records)!r}).read_text())
+ if '--repos' in args: rows=[r for r in rows if r['repo']==args[args.index('--repos')+1]]
+ with open({str(self.audits)!r},'a') as f: f.write(json.dumps({{'args':args,'repos':[r['repo'] for r in rows]}})+'\\n')
+ if mode=='audit-missing': rows=[]
+ if mode=='audit-extra': rows=json.loads(Path({str(self.records)!r}).read_text())
+ if mode=='audit-duplicate': rows=rows+rows
+ if mode=='audit-unexpected': rows[0]['repo']='owner/unexpected'
+ if mode=='audit-malformed': print('{{');sys.exit(1)
+ for r in rows: print(json.dumps(r))
+ sys.exit(0 if mode=='audit-exit' else 2 if mode=='audit-failure' else 1)
 with open({str(self.calls)!r},'a') as f: f.write(json.dumps({{'args':args,'env':{{k:v for k,v in os.environ.items() if k in ('GH_TOKEN','OP_PREFLIGHT_AUTHOR_PAT','OP_PREFLIGHT_REVIEWER_PAT','MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK','GITHUB_TOKEN','MERGEPATH_ROOT_OVERRIDE','MERGEPATH_SYNC_AUTHORING_AGENT')}}}})+'\\n')
 repo=args[args.index('--repos')+1]
 print('author='+os.environ.get('GH_TOKEN',''),flush=True)
@@ -198,6 +212,63 @@ PY
         self.assertEqual([json.loads(line)["event"] for line in journal.splitlines()], ["started", "finished"])
         with self.assertRaisesRegex(SyncError, "consumed"):
             p.confirm("session", self.payload(preview))
+
+    def test_canonical_exports_cleanup_is_inert_in_actual_worker(self):
+        self.cache.write_text('canonical')
+        p=self.provider();preview=self.preview(p)
+        p.confirm('session',self.payload(preview));state=self.wait(p)
+        self.assertEqual(state['run']['outcome'],'success',state)
+        self.assertEqual(self.called()[0]['env']['GH_TOKEN'],'github_pat_fixture_AUTHOR_secret')
+        marker=self.base/'must-not-execute'
+        output=(f'export OP_PREFLIGHT_AUTHOR_PAT=valid_token\n'
+                f'touch {marker}\nexport GH_TOKEN=reviewer\nunterminated "\n').encode()
+        self.assertEqual(cached_author(output),'valid_token')
+        self.assertFalse(marker.exists())
+        for assignment in ('export OP_PREFLIGHT_AUTHOR_PAT =token', 'export OP_PREFLIGHT_AUTHOR_PAT',
+                           'export OP_PREFLIGHT_AUTHOR_PAT=ok; touch /never-execute',
+                           'export OP_PREFLIGHT_AUTHOR_PAT=$(evil)'):
+            with self.subTest(assignment=assignment),self.assertRaises(SyncError):
+                cached_author(('export OP_PREFLIGHT_AUTHOR_PAT=valid_token\n'+assignment).encode())
+
+    def test_each_selected_target_has_only_its_own_revalidation_audit(self):
+        p=self.provider();preview=self.preview(p,['owner/two','owner/one'])
+        p.confirm('session',self.payload(preview));state=self.wait(p)
+        self.assertEqual(state['run']['outcome'],'success',state)
+        audits=[json.loads(line) for line in self.audits.read_text().splitlines()]
+        self.assertEqual([a['repos'] for a in audits],[['owner/one'],['owner/two']])
+        self.assertEqual([a['args'] for a in audits],
+                         [['--audit','--json','--repos',repo] for repo in ('owner/one','owner/two')])
+        self.assertEqual([c['args'][c['args'].index('--repos')+1] for c in self.called()],['owner/one','owner/two'])
+
+    def test_target_audit_rejects_missing_extra_duplicate_unexpected_malformed_and_exit(self):
+        p=self.provider()
+        for mode in ('missing','extra','duplicate','unexpected','malformed','exit','failure'):
+            with self.subTest(mode=mode):
+                preview=self.preview(p);self.mode.write_text('audit-'+mode)
+                p.confirm('session',self.payload(preview));state=self.wait(p)
+                self.assertEqual(state['run']['outcome'],'refused',state)
+                self.assertFalse(self.called())
+                self.mode.write_text('ok')
+
+    def test_held_fleet_lock_reports_busy_without_audit_retry(self):
+        p=self.provider()
+        fleet=FleetProvider(INVENTORY,self.root,'synthetic',cache_parent=self.base,
+                            utilities={k:p.tools[k] for k in ('bash','git','gh')})
+        try:
+            p.fetch=fleet.fetch
+            with fleet._lock, mock.patch.object(fleet,'_check_cache') as checked:
+                p.preview('session',{'repos':['owner/one']});state=self.wait(p)
+                self.assertEqual(state['error'],'audit_busy',state)
+                checked.assert_not_called()
+                self.assertFalse(self.called())
+        finally:
+            fleet.close()
+        for reason in ('upstream_timeout','invalid_upstream_json'):
+            with self.subTest(reason=reason):
+                p.fetch=mock.Mock(side_effect=ClientError(reason))
+                p.preview('session',{'repos':['owner/one']});state=self.wait(p)
+                self.assertEqual(state['error'],'audit_unavailable',state)
+                p.fetch.assert_called_once()
 
     def test_dirty_branch_origin_and_inventory_refusals(self):
         for mutate, reason in ((lambda: (self.root / "untracked").write_text("x"), "hub_dirty"),):

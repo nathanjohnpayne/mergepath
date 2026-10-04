@@ -22,6 +22,7 @@
     preview_mismatch:"The confirmation no longer matches the preview. Close this dialog and create a new preview.",
     audit_stale:"Fresh consumer evidence is unavailable. Refresh Fleet, then create a new preview.",
     audit_incomplete:"Consumer evidence is incomplete. Refresh Fleet, then create a new preview.",
+    audit_busy:"A Fleet audit is in progress. Wait for it to finish, then create a new preview.",
     audit_unavailable:"The consumer audit is unavailable. Check the Cockpit terminal and refresh Fleet before previewing again.",
     audit_log_unavailable:"The action log is unavailable. Check the Cockpit terminal before starting another sync.",
     sync_busy:"Another sync or preview is still active. Wait for it to finish before previewing again.",

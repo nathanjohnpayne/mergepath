@@ -229,3 +229,17 @@ test('unconsumed expiry refuses before dispatch, and a later preview owns its ow
     await f.view.begin();assert.equal(f.calls.filter(c=>c[0]==='confirm').length,1);assert.match(f.view.error.textContent,/preview expired/i);
   }finally{f.view.close();}
 });
+
+test('Fleet audit busy has recovery guidance without confirmation or automatic retry',async()=>{
+  const f=fixture();
+  try{
+    f.view.actions.preview=async payload=>{f.calls.push(['preview',payload]);return {schema:'cockpit-sync/v1',phase:'error',preview:null,run:null,error:'audit_busy'};};
+    await f.view.open(['owner/one']);
+    assert.equal(f.view.error.hidden,false);
+    assert.match(f.view.error.textContent,/Fleet audit is in progress/);
+    assert.match(f.view.error.textContent,/Wait for it to finish, then create a new preview/);
+    f.view.update(f.view.state);f.view.controls();
+    assert.deepEqual(f.calls.map(call=>call[0]),['preview']);
+    assert.equal(f.timers.size,0);assert.equal(f.view.next,undefined);assert.equal(f.view.start,undefined);
+  }finally{f.view.close();}
+});

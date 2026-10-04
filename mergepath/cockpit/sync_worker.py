@@ -78,18 +78,19 @@ def cached_author(output):
     author = None
     try:
         for line in output.decode("utf-8").splitlines():
-            if line.startswith("#") or not line.strip():
+            # Canonical output also contains unrelated exports and cleanup
+            # statements. Only the author assignment is data we consume.
+            if not re.match(r"^\s*export\s+OP_PREFLIGHT_AUTHOR_PAT(?:[=\s]|$)", line):
                 continue
             words = shlex.split(line)
             if len(words) != 2 or words[0] != "export" or "=" not in words[1]:
                 raise ValueError()
             key, value = words[1].split("=", 1)
-            if not re.fullmatch(r"OP_PREFLIGHT_[A-Z_]+", key):
+            if key != "OP_PREFLIGHT_AUTHOR_PAT":
                 raise ValueError()
-            if key == "OP_PREFLIGHT_AUTHOR_PAT":
-                if author is not None or not re.fullmatch(r"[A-Za-z0-9_]{1,1024}", value):
-                    raise ValueError()
-                author = value
+            if author is not None or not re.fullmatch(r"[A-Za-z0-9_]{1,1024}", value):
+                raise ValueError()
+            author = value
         if not author:
             raise ValueError()
         return author
@@ -100,6 +101,7 @@ def cached_author(output):
 def execute(root, cache_dir, agent, tools, plan, lock_fd):
     identity = validate_git_identity(plan["git_identity"])
     inventory = tuple(Repository(**entry) for entry in plan["inventory"])
+    entries = {entry.repo: entry for entry in inventory if not entry.hub}
     if next((e.repo for e in inventory if e.hub), None) != HUB:
         raise SyncError("invalid_plan")
     # This private instance never publishes samples or retains a credential in the server.
@@ -162,9 +164,10 @@ def execute(root, cache_dir, agent, tools, plan, lock_fd):
         for target in plan["targets"]:
             guard()
             audit._check_cache(deadline)
-            code, output = runner.run([tools["bash"], str(root / "scripts/sync-to-downstream.sh"), "--audit", "--json"], root, env, limit=MAX_STDOUT)
-            current = {r["repo"]: r for r in parse_audit(output, code, inventory)}
-            if condition(current[target["repo"]]) != target["expected"]:
+            code, output = runner.run([tools["bash"], str(root / "scripts/sync-to-downstream.sh"), "--audit", "--json",
+                                       "--repos", target["repo"]], root, env, limit=MAX_STDOUT)
+            current = parse_audit(output, code, (entries[target["repo"]],))[0]
+            if condition(current) != target["expected"]:
                 raise SyncError("consumer_changed")
             guard()
             command = [tools["bash"], str(root / "scripts/sync-to-downstream.sh"), "--sync-all", "--repos", target["repo"],
