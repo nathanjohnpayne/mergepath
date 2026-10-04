@@ -1343,7 +1343,9 @@ class ServerTests(unittest.TestCase):
                 results[index] = type(error).__name__
         clients = [threading.Thread(target=read_asset, args=(index,), daemon=True) for index in range(9)]
         try:
-            for client in clients[:8]: client.start()
+            for index, client in enumerate(clients[:8]):
+                client.start()
+                self.assertTrue(entered[index].wait(1))
             self.assertTrue(all(event.wait(1) for event in entered))
             self.assertEqual(peak, 8)
             clients[8].start()
