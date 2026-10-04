@@ -22,10 +22,14 @@
 # from a mutable URL, and nothing runs with a failed or missing checksum.
 #
 # `yq` is installed the same way, from the mikefarah/yq release binary, at the
-# version scripts/lib/ensure-yq.sh pins for CI (tests/test_cloud_environment.sh
-# keeps the two pins equal). Its hashes were taken from the release's
-# checksums file and the downloaded binaries; they still need the same GitHub
-# API asset-digest cross-check the gh pins had.
+# version the repo's CI actually runs: the GitHub runner's preinstalled yq
+# (v4.53.6 in repo-lint run 37160023472), which scripts/lib/ensure-yq.sh keeps
+# because it installs only when no mikefarah/yq is present. Its own pin
+# (v4.44.3) is older than the checks need: v4.44.3 does not expand "\t" in a
+# string concatenation, so check_sync_manifest and the
+# resolve-pr-threads/doc-ownership suites fail under it. The hashes below were
+# taken from the release's checksums file and the downloaded binaries; they
+# still need the same GitHub API asset-digest cross-check the gh pins had.
 #
 # Usage:
 #   bash scripts/cloud-setup.sh [--dry-run]
@@ -62,13 +66,13 @@ pinned_sha256() { # <asset>
     *) return 1 ;;
   esac
 }
-YQ_VERSION="${MERGEPATH_YQ_VERSION:-v4.44.3}"
+YQ_VERSION="${MERGEPATH_YQ_VERSION:-v4.53.6}"
 
 # Pinned SHA-256 of each supported mikefarah/yq release binary (yq_linux_<arch>).
 pinned_yq_sha256() { # <version> <asset>
   case "$1/$2" in
-    v4.44.3/yq_linux_amd64) echo a2c097180dd884a8d50c956ee16a9cec070f30a7947cf4ebf87d5f36213e9ed7 ;;
-    v4.44.3/yq_linux_arm64) echo 0e7e1524f68d91b3ff9b089872d185940ab0fa020a5a9052046ef10547023156 ;;
+    v4.53.6/yq_linux_amd64) echo c5f056448f973ae7d39b5401949648a78f2dc1947d6a8eb65be60d5c504b9385 ;;
+    v4.53.6/yq_linux_arm64) echo 88a1016bc1d657375a35864e4f44b6f333df8ff97b559f51bba0adcb2169df09 ;;
     *) return 1 ;;
   esac
 }

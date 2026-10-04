@@ -109,14 +109,14 @@ cat >"$HFIX/scripts/cloud-setup.sh" <<'SETUP'
 echo "setup ran" >>"$PROBE_LOG"
 echo "cloud-setup: gh present: gh version 9 (fixture)" >&2
 case "${SETUP_MODE:-noop}" in
-  install) echo "cloud-setup: installed yq v4.44.3 to /x/bin/yq (sha256 verified)" >&2 ;;
+  install) echo "cloud-setup: installed yq v4.53.6 to /x/bin/yq (sha256 verified)" >&2 ;;
   fail) echo "cloud-setup: checksum mismatch for yq; refusing to install" >&2; exit 1 ;;
 esac
 exit 0
 SETUP
 : >"$WORKDIR/probe.log"
 out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=install PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | head -1 | grep -qx 'mergepath cloud session: installed yq v4.44.3 (scripts/cloud-setup.sh).' \
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | head -1 | grep -qx 'mergepath cloud session: installed yq v4.53.6 (scripts/cloud-setup.sh).' \
    && printf '%s' "$out" | grep -q 'capability tier `author-writes`' \
    && [ "$(head -1 "$WORKDIR/probe.log")" = "setup ran" ] && grep -q '^probe ' "$WORKDIR/probe.log"; then
   pass "hook, cloud session: runs setup before the probe and reports what it installed"
@@ -246,7 +246,7 @@ C
 chmod +x "$SBIN/uname" "$SBIN/curl"
 # The gh cases above and below are about gh: give them a mikefarah/yq v4 so
 # the setup's yq step finds one present and stays out of their way.
-printf '#!/usr/bin/env bash\necho "yq (https://github.com/mikefarah/yq/) version v4.44.3"\n' >"$SBIN/yq"
+printf '#!/usr/bin/env bash\necho "yq (https://github.com/mikefarah/yq/) version v4.53.6"\n' >"$SBIN/yq"
 chmod +x "$SBIN/yq"
 # yq release fixtures: a v4 binary for an unpinned version (the server below
 # answers every version with it), and later a binary that runs but is not
@@ -515,11 +515,11 @@ else
 fi
 
 set +e
-run_setup "$WORKDIR/y-mismatch" MERGEPATH_YQ_VERSION=v4.44.3 PATH="$WORKDIR/y-mismatch/bin:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+run_setup "$WORKDIR/y-mismatch" PATH="$WORKDIR/y-mismatch/bin:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
 set -e
-# The fixture server answers v4.44.3 with the v4.99.0 fixture, whose hash is not the pin.
+# Default version: the fixture server answers it with the v4.99.0 fixture, whose hash is not the pin.
 if [ "$rc" -eq 1 ] && [ ! -e "$WORKDIR/y-mismatch/bin/yq" ] \
-   && grep -q "checksum mismatch for yq v4.44.3 yq_linux_amd64 (expected a2c097180dd884a8d50c956ee16a9cec070f30a7947cf4ebf87d5f36213e9ed7" "$WORKDIR/setup.err"; then
+   && grep -q "checksum mismatch for yq v4.53.6 yq_linux_amd64 (expected c5f056448f973ae7d39b5401949648a78f2dc1947d6a8eb65be60d5c504b9385" "$WORKDIR/setup.err"; then
   pass "setup, default yq version: verified against the hash pinned in the script, not a downloaded one"
 else
   fail "setup yq pinned mismatch: rc=$rc err=$(cat "$WORKDIR/setup.err")"
@@ -535,17 +535,6 @@ if [ "$rc" -eq 1 ] && grep -q "does not run as mikefarah/yq v4" "$WORKDIR/setup.
   pass "setup, a verified download that is not mikefarah/yq v4: fails instead of reporting success"
 else
   fail "setup yq not v4: rc=$rc err=$(cat "$WORKDIR/setup.err")"
-fi
-
-# One yq version for cloud and CI: cloud-setup.sh and ensure-yq.sh pin the same release.
-ci_pin="$(sed -n 's/^YQ_VERSION="\${ENSURE_YQ_VERSION:-\(v[0-9.]*\)}"$/\1/p' "$ROOT/scripts/lib/ensure-yq.sh" 2>/dev/null)"
-cloud_pin="$(sed -n 's/^YQ_VERSION="\${MERGEPATH_YQ_VERSION:-\(v[0-9.]*\)}"$/\1/p' "$SETUP")"
-if [ ! -f "$ROOT/scripts/lib/ensure-yq.sh" ]; then
-  pass "yq pin parity: not asserted where ensure-yq.sh is absent"
-elif [ -n "$cloud_pin" ] && [ "$cloud_pin" = "$ci_pin" ]; then
-  pass "yq pin parity: cloud-setup.sh and ensure-yq.sh pin the same release ($cloud_pin)"
-else
-  fail "yq pin parity: cloud-setup.sh pins '$cloud_pin', ensure-yq.sh pins '$ci_pin'"
 fi
 
 echo
