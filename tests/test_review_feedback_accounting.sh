@@ -1814,8 +1814,13 @@ run_gate
 assert_eq 2 "$RUN_RC" "unconfigured source identities cannot supply duplicate recovery evidence"
 
 # A synthetic short-hash collision exercises the distinct-valid-body fence.
-REAL_RECOVERY_HASH=$(command -v shasum)
-export REAL_RECOVERY_HASH
+if REAL_RECOVERY_HASH=$(command -v sha256sum); then
+  REAL_RECOVERY_HASH_IS_SHASUM=false
+else
+  REAL_RECOVERY_HASH=$(command -v shasum)
+  REAL_RECOVERY_HASH_IS_SHASUM=true
+fi
+export REAL_RECOVERY_HASH REAL_RECOVERY_HASH_IS_SHASUM
 export RECOVERY_COLLISION_JSON='"**P2** Different complete body with a colliding short hash."'
 RECOVERY_COLLISION_FP="$(printf '%s' "$RECOVERY_GOOD" | jq -r '.body_fingerprint')"
 export RECOVERY_COLLISION_FP
@@ -1824,8 +1829,10 @@ cat >"$TMP/bin/sha256sum" <<'SH'
 input=$(cat)
 if [ "$input" = "$RECOVERY_COLLISION_JSON" ]; then
   printf '%s%052d  -\n' "$RECOVERY_COLLISION_FP" 0
-else
+elif [ "$REAL_RECOVERY_HASH_IS_SHASUM" = true ]; then
   printf '%s' "$input" | "$REAL_RECOVERY_HASH" -a 256
+else
+  printf '%s' "$input" | "$REAL_RECOVERY_HASH"
 fi
 SH
 chmod +x "$TMP/bin/sha256sum"
@@ -1836,7 +1843,7 @@ jq -n --argjson originals "$RECOVERY_COMMENTS" \
 run_gate
 assert_eq 2 "$RUN_RC" "conflicting verified bodies cannot recover a short-fingerprint collision"
 rm "$TMP/bin/sha256sum"
-unset REAL_RECOVERY_HASH RECOVERY_COLLISION_JSON RECOVERY_COLLISION_FP
+unset REAL_RECOVERY_HASH REAL_RECOVERY_HASH_IS_SHASUM RECOVERY_COLLISION_JSON RECOVERY_COLLISION_FP
 
 {
   cat "$UTF8_BODY"
@@ -1858,10 +1865,10 @@ assert_eq "$(printf '%s' "$UTF8_CHUNK_JSON" | archive_test_sha | cut -c1-12)" \
   "$(printf '%s' "$UTF8_CHUNK_DATA" | jq -r '.body_fingerprint')" "chunked UTF-8 body retains its exact fingerprint"
 BAD_CHUNK_DATA=$(printf '%s' "$UTF8_CHUNK_DATA" | jq -c '.body |= gsub("—"; "���")')
 BAD_CHUNKS=$(archive_test_chunks "$BAD_CHUNK_DATA")
-GOOD_CHUNK_COMMENTS=$(archive_test_comments "$UTF8_CHUNKS" 88100)
-BAD_CHUNK_COMMENTS=$(archive_test_comments "$BAD_CHUNKS" 88200)
-jq -n --argjson good "$GOOD_CHUNK_COMMENTS" --argjson bad "$BAD_CHUNK_COMMENTS" \
-  '$bad + $good' >"$TMP/fixtures/issues.json"
+archive_test_comments "$UTF8_CHUNKS" 88100 >"$TMP/good-chunk-comments.json"
+archive_test_comments "$BAD_CHUNKS" 88200 >"$TMP/bad-chunk-comments.json"
+jq -n --slurpfile good "$TMP/good-chunk-comments.json" --slurpfile bad "$TMP/bad-chunk-comments.json" \
+  '$bad[0] + $good[0]' >"$TMP/fixtures/issues.json"
 run_gate
 assert_eq 1 "$RUN_RC" "complete chunk sets support verified duplicate recovery"
 printf '%s' "$RUN_JSON" | jq -j '.missing[0].body' >"$TMP/utf8-chunked-recovered.txt"
@@ -1870,12 +1877,12 @@ if cmp -s "$TMP/utf8-chunked-body.txt" "$TMP/utf8-chunked-recovered.txt"; then
 else
   fail "recovery retains the full chunked body"
 fi
-jq -n --argjson good "$GOOD_CHUNK_COMMENTS" --argjson bad "$BAD_CHUNK_COMMENTS" \
-  '$bad[:-1] + $good' >"$TMP/fixtures/issues.json"
+jq -n --slurpfile good "$TMP/good-chunk-comments.json" --slurpfile bad "$TMP/bad-chunk-comments.json" \
+  '$bad[0][:-1] + $good[0]' >"$TMP/fixtures/issues.json"
 run_gate
 assert_eq 2 "$RUN_RC" "a complete duplicate cannot hide a missing corrupt chunk"
-jq -n --argjson good "$GOOD_CHUNK_COMMENTS" --argjson bad "$BAD_CHUNK_COMMENTS" '
-  $bad + $good + [($bad[0] | .id = 88300 | .body |= sub("data=."; "data=A"))]
+jq -n --slurpfile good "$TMP/good-chunk-comments.json" --slurpfile bad "$TMP/bad-chunk-comments.json" '
+  $bad[0] + $good[0] + [($bad[0][0] | .id = 88300 | .body |= sub("data=."; "data=A"))]
 ' >"$TMP/fixtures/issues.json"
 run_gate
 assert_eq 2 "$RUN_RC" "a complete duplicate cannot hide conflicting corrupt chunks"
