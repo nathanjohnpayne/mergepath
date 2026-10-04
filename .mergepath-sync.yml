@@ -297,6 +297,7 @@ paths:
       - "scripts/lib/credential-class.sh"
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/identity-check.sh"
+      - "scripts/lib/graphql-ceiling.sh"   # classifies the proxy's GraphQL refusal
   # Pure credential classifier (#1057): user-held vs brokered vs
   # app-installed, decided from the token's own form, never from GET /user
   # alone (which a brokered credential answers as the user).
@@ -893,10 +894,12 @@ paths:
       - "scripts/lib/graphql-ceiling.sh"   # #1057 A3: proxy GraphQL refusal -> exit 6 (existence-guarded)
       - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
-  # Recognises the Claude cloud proxy's GraphQL refusal ("This GraphQL query
-  # is not enabled for this session") so GraphQL-only helpers exit with a
-  # ceiling (6) instead of a retryable failure (#1057 A3). Its header is the
-  # declared list of GraphQL-only helpers.
+  # Recognises the Claude cloud proxy's GraphQL refusal, in each wording the
+  # proxy has used ("This GraphQL query is not enabled for this session",
+  # "GitHub GraphQL is not available from Claude Code sessions"), so
+  # GraphQL-only helpers exit with a ceiling (6) instead of a retryable failure
+  # (#1057 A3), and the capability probe reports the ceiling rather than a
+  # credential gap. Its header is the declared list of GraphQL-only helpers.
   - path: scripts/lib/graphql-ceiling.sh
     type: canonical
     consumers: all
@@ -1638,13 +1641,15 @@ paths:
     requires:
       - "scripts/resolve-pr-threads.sh"
       - "scripts/lib/reviewers-helpers.sh"   # available_reviewers membership of the lane token
-  # Claude Code SessionStart hook: runs the capability probe in a cloud
-  # session only (CLAUDE_CODE_REMOTE=true) and prints the tier.
+  # Claude Code SessionStart hook: in a cloud session only
+  # (CLAUDE_CODE_REMOTE=true), runs the setup script, then the capability
+  # probe, and prints the tier.
   - path: scripts/hooks/cloud-session-start.sh
     type: canonical
     consumers: all
     requires:
       - "scripts/agent-capability-probe.sh"
+      - "scripts/cloud-setup.sh"   # run first, so a wrong or missing tool is fixed before the probe
   - path: tests/test_agent_capability_probe.sh
     type: canonical
     consumers: all
@@ -1653,6 +1658,7 @@ paths:
       - "scripts/lib/credential-class.sh"
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/identity-check.sh"
+      - "scripts/lib/graphql-ceiling.sh"
   # Pairs with scripts/resolve-pr-threads.sh +
   # scripts/ci/check_resolve_pr_threads (which delegates to this test
   # file after its own in-suite cases). Exercises the mergepath#305

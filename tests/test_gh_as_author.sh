@@ -920,6 +920,27 @@ else
   cat "$WORKDIR/calls.log" >&2
 fi
 
+# With no token anywhere, the remediation fits the surface: a cloud session
+# has no keyring to log into and no one to answer op-preflight's prompt, so it
+# is told which environment variable to set; a local session keeps the local
+# advice.
+set +e
+cloud_err="$(env -u OP_PREFLIGHT_AUTHOR_PAT CLAUDE_CODE_REMOTE=true STUB_NO_KEYRING=1 GITHUB_TOKEN= GH_TOKEN="proxy-injected" \
+  PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" "$WRAPPER" -- gh pr merge 123 --squash 2>&1 >/dev/null)"
+cloud_rc=$?
+local_err="$(env -u OP_PREFLIGHT_AUTHOR_PAT -u CLAUDE_CODE_REMOTE -u MERGEPATH_AGENT_SURFACE STUB_NO_KEYRING=1 GITHUB_TOKEN= GH_TOKEN= \
+  PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" "$WRAPPER" -- gh pr merge 123 --squash 2>&1 >/dev/null)"
+local_rc=$?
+set -e
+if [ "$cloud_rc" -eq 3 ] && grep -q "set OP_PREFLIGHT_AUTHOR_PAT in the cloud environment's settings" <<<"$cloud_err" \
+   && ! grep -q "warm op-preflight" <<<"$cloud_err" \
+   && [ "$local_rc" -eq 3 ] && grep -q "run gh auth login once for that identity, or warm op-preflight" <<<"$local_err" \
+   && ! grep -q "cloud environment" <<<"$local_err"; then
+  pass "no token: a cloud session is told which environment variable to set; a local session keeps the keyring/op-preflight advice"
+else
+  fail "no-token remediation: cloud rc=$cloud_rc err=$cloud_err; local rc=$local_rc err=$local_err"
+fi
+
 # --- #1541: bootstrap's git push and the trace marker, on the REAL wrapper ---
 # The author wrapper accepts one git form, `git [-C <dir>] push [-u] <remote>
 # [<refspec>...]`, and runs it so the only credential git can present to
