@@ -243,3 +243,28 @@ test('Fleet audit busy has recovery guidance without confirmation or automatic r
     assert.equal(f.timers.size,0);assert.equal(f.view.next,undefined);assert.equal(f.view.start,undefined);
   }finally{f.view.close();}
 });
+
+test('new preview state restores its heading after a retained completed snapshot interleaves',async()=>{
+  for(const [reason,responsePhase] of [['audit_busy','previewing'],['audit_unavailable','previewing'],['audit_busy','error'],['audit_unavailable','error']]){
+    const f=fixture();let release;
+    try{
+      await f.view.open(['owner/one']);f.view.showConfirm();await f.view.begin();
+      const done=successfulRun();f.view.update(done);
+      assert.equal(f.view.title.textContent,'Sync complete');assert.match(f.view.chips.textContent,/owner\/one #99/);
+      f.view.hide();
+      f.view.actions.preview=async payload=>{f.calls.push(['preview',payload]);return new Promise(resolve=>release=resolve);};
+      const pending=f.view.open(['owner/one']);assert.equal(f.view.title.textContent,'Preview the sync');
+      f.view.update(done);assert.equal(f.view.title.textContent,'Sync complete');
+      release({schema:'cockpit-sync/v1',phase:responsePhase,preview:null,run:null,error:responsePhase==='error'?reason:null});await pending;
+      assert.equal(f.view.title.textContent,'Preview the sync');
+      f.view.update({schema:'cockpit-sync/v1',phase:'error',preview:null,run:null,error:reason});
+      assert.equal(f.view.title.textContent,'Preview the sync');assert.equal(f.view.error.hidden,false);
+      assert.match(f.view.error.textContent,reason==='audit_busy'?/Fleet audit is in progress/:/consumer audit is unavailable/);
+      assert.equal(f.view.state.run,null);assert.equal(f.calls.filter(c=>c[0]==='confirm').length,1);
+      assert.equal(f.timers.size,0);
+      const fresh={...preview(),preview_id:'q'.repeat(43)};f.view.update(state(fresh));
+      assert.equal(f.view.title.textContent,'Preview the sync');assert.equal(f.view.error.hidden,true);
+      assert.equal(f.calls.filter(c=>c[0]==='confirm').length,1);
+    }finally{f.view.close();}
+  }
+});

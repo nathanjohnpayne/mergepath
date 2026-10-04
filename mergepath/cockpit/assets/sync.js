@@ -157,7 +157,8 @@
         if(this.previewId!==state.preview.preview_id){this.previewId=state.preview.preview_id;this.step="preview";this.choices=Object.fromEntries(state.preview.targets.map(t=>[t.repo,t.default_choice]));this.showPreview();}
         this.controls();
       }else if(state.run){this.showRun();}
-      else if(state.phase==="error"){this.fail(state.error);const key=`error:${state.error}`;if(this.focusKey!==key)this.footer.replaceChildren(button("Close",()=>this.hide()));this.focusStep(key);}
+      else if(state.phase==="previewing"){this.title.textContent="Preview the sync";}
+      else if(state.phase==="error"){this.title.textContent="Preview the sync";this.fail(state.error);const key=`error:${state.error}`;if(this.focusKey!==key)this.footer.replaceChildren(button("Close",()=>this.hide()));this.focusStep(key);}
       else if(state.phase==="canceled"){this.hide();}
       if(state.error){this.fail(state.error);if(this.start)this.start.disabled=true;if(this.next)this.next.disabled=true;}
       return true;
