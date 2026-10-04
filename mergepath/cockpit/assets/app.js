@@ -213,15 +213,38 @@
       } catch {this._fail(generation);}
     }
   }
+  function authorAccount(snapshot) {
+    const envelope = snapshot.sources?.api_author, data = envelope?.data;
+    const valid = data?.schema === "author-api-budget/v1" && data.configured_identity === "nathanjohnpayne"
+      && data.budgets && typeof data.budgets === "object" && !Array.isArray(data.budgets);
+    return {evidence: valid ? data.budgets.graphql || {} : {}, identity: valid ? data.identity_evidence : "preflight_configured",
+      error: valid ? data.error : "unavailable", retry: envelope?.stale === true ? C.epoch(envelope.retry_at) : valid ? C.epoch(data.retry_at) : null,
+      stale: !valid || envelope.stale === true || data.stale === true || data.error !== null};
+  }
   function accountHazards(snapshot, now, stale) {
-    return Object.entries(snapshot.api_budget).flatMap(([pool, evidence]) => {
+    const author = authorAccount(snapshot);
+    const accounts = [{name: "reviewer", title: "Reviewer PAT", budgets: snapshot.api_budget, stale},
+      {name: "author", title: "nathanjohnpayne · author PAT", budgets: {graphql: author.evidence}, stale: stale || author.stale}];
+    return accounts.flatMap(account => Object.entries(account.budgets).flatMap(([pool, evidence]) => {
       if (!evidence || typeof evidence !== "object") return [];
       const meter = C.meterModel(evidence, now);
       if (!["bump", "boulder"].includes(meter.state)) return [];
-      return [{id: `account-api-${pool}`, source: "road", section: "road", repo: null, state: meter.state,
-        title: `Reviewer PAT · ${pool}: ${meter.reason}`, detail: `${meter.remaining ?? "Unknown"} ${pool === "graphql" ? "points" : "requests"} left of ${meter.limit ?? "unknown"}.${meter.expired ? ` Last known: ${meter.lastKnownRemaining ?? "unknown"} left / ${meter.lastKnownUsed ?? "unknown"} used.` : ""} Shared by all enrolled repositories.`,
-        timing: {kind: "now"}, observed_at: C.epoch(evidence.observed_at), stale, now}];
-    });
+      return [{id: account.name === "reviewer" ? `account-api-${pool}` : `account-api-author-${pool}`, source: "road", section: "road", repo: null, state: meter.state,
+        title: `${account.title} · ${pool}: ${meter.reason}`, detail: `${meter.remaining ?? "Unknown"} ${pool === "graphql" ? "points" : "requests"} left of ${meter.limit ?? "unknown"}.${meter.expired ? ` Last known: ${meter.lastKnownRemaining ?? "unknown"} left / ${meter.lastKnownUsed ?? "unknown"} used.` : ""} Shared by all enrolled repositories.`,
+        timing: {kind: "now"}, observed_at: C.epoch(evidence.observed_at), stale: account.stale, now}];
+    }));
+  }
+  function renderAuthorBudget(meter, note, snapshot, now, streamStale = false) {
+    const account = authorAccount(snapshot), evidence = account.evidence;
+    const stale = account.stale || streamStale, model = C.meterModel(evidence, now);
+    // A failed read cannot present old allowances as a current healthy fill.
+    const visible = stale && model.state !== "boulder" && !model.expired ? {...evidence, remaining: null, used: null} : evidence;
+    meter.update(visible, {unit: "points", now});
+    const observed = C.epoch(evidence.observed_at), reset = C.epoch(evidence.reset);
+    const identity = account.identity === "viewer_verified" ? "Viewer verified" : account.identity === "last_viewer_verified" ? "Identity last verified" : "Preflight configured";
+    const state = stale ? `Author budget unavailable${observed === null ? "" : ` · last known ${model.lastKnownRemaining ?? "unknown"} left / ${model.lastKnownUsed ?? "unknown"} used`}` : "Author allowance";
+    note.textContent = `${identity} · ${state} · ${observed === null ? "not observed" : `observed ${C.ageLabel(now - observed)}`} · ${reset === null ? "reset unknown" : reset > now ? `reset ${C.timeLabel({kind: "at", at: reset}, now)}` : "reset passed; awaiting observation"}${account.retry !== null && stale ? ` · retry ${C.timeLabel({kind: "at", at: account.retry}, now)}` : ""}`;
+    return account;
   }
   function renderPanelContent(parent, model, adapter, placeholder) {
     if (adapter?.render && (model.observed || model.renderable === true)) {
@@ -240,7 +263,7 @@
   const registry = new PanelRegistry();
   function mount() {
     const $ = id => document.getElementById(id), body = document.body;
-    const meter = new C.MeterView($("api-meter")), road = new C.RoadView($("road-view"));
+    const authorMeter = new C.MeterView($("api-meter")), meter = new C.MeterView($("reviewer-api-meter")), road = new C.RoadView($("road-view"));
     const media = window.matchMedia("(prefers-reduced-motion: reduce)"), darkMedia = window.matchMedia("(prefers-color-scheme: dark)");
     const readPreference = key => {try {return localStorage.getItem(key);} catch {return null;}};
     const savePreference = (key, value) => {try {localStorage.setItem(key, value);} catch { /* Session preference still applies. */ }};
@@ -308,7 +331,8 @@
       meter.update(evidence, {unit: pool === "graphql" ? "points" : "requests", now});
       const identity = typeof evidence.configured_identity === "string" ? `${evidence.configured_identity} · preflight configured` : "Identity unknown";
       const observed = C.epoch(evidence.observed_at), reset = C.epoch(evidence.reset);
-      $("api-note").textContent = `${identity} · ${observed === null ? "no header evidence" : `observed ${C.ageLabel(now - observed)}`} · ${reset === null ? "reset unknown" : `reset ${reset > now ? C.timeLabel({kind: "at", at: reset}, now) : "time passed; awaiting headers"}`}`;
+      renderAuthorBudget(authorMeter, $("api-note"), current, now, connection.kind !== "live");
+      $("reviewer-api-note").textContent = `${identity} · ${observed === null ? "no header evidence" : `observed ${C.ageLabel(now - observed)}`} · ${reset === null ? "reset unknown" : `reset ${reset > now ? C.timeLabel({kind: "at", at: reset}, now) : "time passed; awaiting headers"}`}`;
       const projection = registry.project(current, selectedRepo, now); renderPanels(projection);
       const stale = connection.kind !== "live";
       let hazards = [...projection.hazards.map(hazard => ({...hazard, stale: hazard.stale || stale})), ...accountHazards(current, now, stale)];
@@ -335,7 +359,7 @@
       onState: value => {const changed = connection.kind !== value.kind; connection = value; render(); if (changed) $("connection-announcement").textContent = $("connection-label").textContent + ". " + $("connection-note").textContent;}});
     const timer = setInterval(() => {
       const now = epochNow();
-      if (snapshot && (liveClockNeedsRender(snapshot, renderedAt, now) || snapshot.sources.fleet?.in_flight === true || Object.values(snapshot.api_budget).some(evidence => {
+      if (snapshot && (liveClockNeedsRender(snapshot, renderedAt, now) || snapshot.sources.fleet?.in_flight === true || [...Object.values(snapshot.api_budget), authorAccount(snapshot).evidence].some(evidence => {
         const reset = C.epoch(evidence?.reset);
         return reset !== null && renderedAt !== null && reset > renderedAt && reset <= now;
       }) || Object.values(snapshot.sources).some(envelope => {
@@ -354,5 +378,5 @@
   }
   let openSync = () => {};
   let registerPanel = (id, source, project, renderer, options) => registry.register(id, source, project, renderer, options);
-  return {validSnapshot, liveClockNeedsRender, PanelRegistry, Connection, accountHazards, renderPanelContent, createFleetRefresh, refreshFleet, mount, openSync: repos => openSync(repos), registerPanel: (...args) => registerPanel(...args)};
+  return {authorAccount, renderAuthorBudget, validSnapshot, liveClockNeedsRender, PanelRegistry, Connection, accountHazards, renderPanelContent, createFleetRefresh, refreshFleet, mount, openSync: repos => openSync(repos), registerPanel: (...args) => registerPanel(...args)};
 });

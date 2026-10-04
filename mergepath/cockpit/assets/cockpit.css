@@ -149,6 +149,8 @@ html{scroll-padding-top:16px}
 .conn>span:last-child{min-width:0}
 .top-r .chip{flex:1 1 150px;min-width:0}
 .top-r .api-chip{flex:2 1 215px;gap:5px}
+.api-reviewer{display:flex;flex-direction:column;gap:5px;border-top:1px solid var(--line);padding-top:10px;margin-top:5px;min-width:0}
+.api-identity{overflow-wrap:anywhere}
 .conn.c-idle .dot{background:transparent;border:2px solid var(--idle);animation:none}
 .toolbar{display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center;margin:16px 0}
 .controls{display:flex;flex-wrap:wrap;gap:8px}

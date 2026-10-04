@@ -328,7 +328,7 @@ class StartupDirectoryTests(unittest.TestCase):
             stack.enter_context(patch.object(main, "resolve_history_settings", return_value=((), {})))
             stack.enter_context(patch.object(main, "load_reviewers", return_value=("fixture-reviewer",)))
             stack.enter_context(patch.object(main, "Application", return_value=app))
-            for name in ("CIProvider", "PRProvider", "FleetProvider", "ActionsProvider", "AgentsProvider", "SyncProvider"):
+            for name in ("CIProvider", "PRProvider", "FleetProvider", "ActionsProvider", "AgentsProvider", "SyncProvider", "AuthorBudgetProvider"):
                 stack.enter_context(patch.object(main, name, return_value=empty))
             factory = stack.enter_context(patch.object(main, "LiveAgentsProvider", side_effect=live))
             http = stack.enter_context(patch.object(main, "CockpitServer", return_value=server))

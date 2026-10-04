@@ -48,6 +48,7 @@ class Application:
         self._nonce_expires, self._nonce_used = monotonic() + 120, False
         self._revision = 0
         self._panel_sources = {}
+        self.api_author = None
         self.sync = None
         self.ci_excerpts = None
         self._condition = threading.Condition()
@@ -141,8 +142,12 @@ class Application:
             if self.sync is not None:
                 self.sync.close()
         finally:
-            self.scheduler.close()
-            self.publish()
+            try:
+                if self.api_author is not None:
+                    self.api_author.close()
+            finally:
+                self.scheduler.close()
+                self.publish()
 
 
 class CockpitServer(ThreadingHTTPServer):

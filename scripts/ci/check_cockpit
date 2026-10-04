@@ -18,6 +18,7 @@ if ! ci_check_select_mode "$@"; then
 fi
 for subject in scripts/cockpit.sh tests/test_cockpit.sh tests/test_cockpit.py specs/cockpit_foundation.md \
   mergepath/cockpit/__main__.py mergepath/cockpit/server.py mergepath/cockpit/github.py \
+  mergepath/cockpit/author_budget.py tests/test_cockpit_author_budget.py \
   mergepath/cockpit/inventory.py mergepath/cockpit/scheduler.py mergepath/cockpit/bootstrap.html \
   mergepath/cockpit/bootstrap.js mergepath/cockpit/index.html mergepath/cockpit/assets/cockpit.css \
   mergepath/cockpit/assets/components.js mergepath/cockpit/assets/app.js tests/test_cockpit_ui.cjs \
@@ -53,7 +54,7 @@ bash -n scripts/cockpit.sh tests/test_cockpit.sh
 python3 - <<'PY'
 import ast
 from pathlib import Path
-for subject in list(Path('mergepath/cockpit').glob('*.py')) + [Path('tests/test_cockpit.py'), Path('tests/test_cockpit_ci.py'), Path('tests/test_cockpit_logs.py'), Path('tests/test_cockpit_prs.py'), Path('tests/test_cockpit_actions.py'), Path('tests/test_cockpit_agents.py'), Path('tests/test_cockpit_live_agents.py'), Path('tests/test_cockpit_fleet.py'), Path('tests/test_cockpit_sync.py')]:
+for subject in list(Path('mergepath/cockpit').glob('*.py')) + [Path('tests/test_cockpit.py'), Path('tests/test_cockpit_author_budget.py'), Path('tests/test_cockpit_ci.py'), Path('tests/test_cockpit_logs.py'), Path('tests/test_cockpit_prs.py'), Path('tests/test_cockpit_actions.py'), Path('tests/test_cockpit_agents.py'), Path('tests/test_cockpit_live_agents.py'), Path('tests/test_cockpit_fleet.py'), Path('tests/test_cockpit_sync.py')]:
     ast.parse(subject.read_text(), filename=str(subject))
 PY
 node --check mergepath/cockpit/bootstrap.js
