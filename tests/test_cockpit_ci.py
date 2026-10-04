@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mergepath.cockpit.ci import (CIProvider, LogExcerptCache, extract_fail_lines,
                                  group_runs, normalize_check, normalize_job, supersede)
-from mergepath.cockpit.github import ClientError, GitHubClient, Response, copy_json_tree
+from mergepath.cockpit.github import ClientError, GitHubClient, MAX_BODY, Response, copy_json_tree
 from mergepath.cockpit.inventory import Repository
 
 REPO = 'owner/repo'
@@ -494,6 +494,43 @@ class ProviderTests(unittest.TestCase):
 
 
 class ExcerptTests(unittest.TestCase):
+    def test_osc_bel_and_st_terminators_preserve_failure_text(self):
+        for terminator in (b'\x07', b'\x1b\\'):
+            opening = b'\x1b]8;;https://example.test/log' + terminator
+            closing = b'\x1b]8;;' + terminator
+            for body, expected in (
+                    (b'\x1b]0;title' + terminator + b'FAIL: wanted', 'FAIL: wanted'),
+                    (opening + closing + b'FAIL: wanted', 'FAIL: wanted'),
+                    (opening + b'FAIL: wanted' + closing + b' suffix', 'FAIL: wanted suffix'),
+                    (b'FAIL: before ' + opening + b'linked' + closing + b' after', 'FAIL: before linked after'),
+                    (b'\x1b[31m' + opening + b'FAIL: colored' + closing + b'\x1b[0m', 'FAIL: colored')):
+                with self.subTest(terminator=terminator, body=body):
+                    result = extract_fail_lines(body, {})
+                    self.assertEqual(result['status'], 'ok')
+                    self.assertEqual(result['lines'], [expected])
+                    self.assertEqual(result['scope'], 'job')
+
+    def test_unterminated_osc_preserves_existing_end_of_line_behavior(self):
+        result = extract_fail_lines(b'FAIL: retained \x1b]8;;unterminated\n'
+                                    b'\x1b]0;title FAIL: hidden\nFAIL: next line', {})
+        self.assertEqual(result['lines'], ['FAIL: retained ', 'FAIL: next line'])
+        self.assertEqual(result['status'], 'ok')
+
+    def test_osc_at_body_cap_retains_failure_and_existing_output_bounds(self):
+        prefix, suffix = b'\x1b]0;', b'\x1b\\FAIL: wanted'
+        body = prefix + b'x' * (MAX_BODY - len(prefix) - len(suffix)) + suffix
+        self.assertEqual(extract_fail_lines(body, {})['lines'], ['FAIL: wanted'])
+        with self.assertRaises(ClientError) as error:
+            extract_fail_lines(body + b'x', {})
+        self.assertEqual(error.exception.category, 'response_too_large')
+        linked = b'\x1b]8;;https://example.test\x1b\\FAIL: ' + b'x' * 2000 + b'\x1b]8;;\x1b\\\n'
+        result = extract_fail_lines(linked * 100, {})
+        self.assertTrue(result['truncated'])
+        self.assertTrue(result['lines'])
+        self.assertTrue(all(line == 'FAIL: ' + 'x' * 994 for line in result['lines']))
+        self.assertLessEqual(len(result['lines']), 80)
+        self.assertLessEqual(sum(len(line.encode()) for line in result['lines']), 32768)
+
     def test_transient_result_is_shared_by_existing_waiter_but_explicit_retry_reads_again(self):
         for error in ['deadline_exceeded', 'upstream_backoff', 'secondary_limit', 'primary_reserve',
                       'primary_exhausted', 'upstream_unavailable', 'upstream_http_error']:
