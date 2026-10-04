@@ -98,6 +98,46 @@ def unmatched_checks_fixture(with_actions=True, checks=None, head=SHA, now=1000,
     return {'data': sample.data, 'calls': calls, 'hot': sample.hot}
 
 
+def coverage_fixture(kind):
+    heads = {'7': SHA}
+    runs, jobs, checks = [raw_run(conclusion='success')], {'10': [raw_job()]}, [raw_check(conclusion='success')]
+    jobs['10'][0]['conclusion'] = jobs['10'][0]['steps'][0]['conclusion'] = 'success'
+    if kind in ('uncovered', 'uncovered-only'):
+        heads['8'] = OTHER_SHA
+        if kind == 'uncovered-only':
+            runs, jobs, checks = [], {}, []
+    else:
+        conclusion = {'all-pass': 'success', 'neutral': 'neutral', 'skipped': 'skipped', 'check-neutral': 'neutral',
+                      'check-skipped': 'skipped', 'stale': 'stale', 'check-stale': 'stale',
+                      'unknown-completion': None, 'check-unknown-completion': None, 'unknown-status': 'success'}.get(kind, 'cancelled')
+        sha = OTHER_SHA if kind == 'old-cancelled' else SHA
+        run = raw_run(11, conclusion, sha); run['check_suite_id'] = 51
+        job = raw_job(21, 101); job['conclusion'] = job['steps'][0]['conclusion'] = conclusion
+        check = raw_check(101, conclusion, suite=51); check['head_sha'] = sha
+        if kind.startswith('check-'):
+            check['app'] = {'id': 77, 'slug': 'external-app'}
+        else:
+            runs.append(run); jobs['11'] = [job]
+        if kind == 'unknown-status':
+            run['status'] = 'unknown'
+        checks.append(check)
+        if kind == 'running-cancelled':
+            runs[0].update(status='in_progress', conclusion=None)
+        if kind == 'failed-cancelled':
+            runs[0]['conclusion'] = jobs['10'][0]['conclusion'] = checks[0]['conclusion'] = 'failure'
+    calls = []
+    class Client:
+        def pages(self, route, **kwargs):
+            calls.append({'route': route, **kwargs})
+            if '/pulls?' in route: return [{'number': number, 'head': {'sha': sha}} for number, sha in heads.items()]
+            if '/actions/runs?' in route: return runs if 'created=' in route else []
+            if '/jobs?' in route: return jobs[route.split('/runs/')[1].split('/')[0]]
+            if '/check-runs?' in route: return [check for check in checks if '/commits/' + check['head_sha'] + '/' in route]
+            raise AssertionError('unexpected route: ' + route)
+    sample = CIProvider(Client(), INVENTORY, clock=lambda: 1000, monotonic=lambda: 0)(5)
+    return {'data': sample.data, 'calls': calls, 'hot': sample.hot}
+
+
 def browser_fixtures():
     fixtures = {'model': model(), 'unicode': unicode_model_and_excerpt(),
                 'workflow-no-pr': unmatched_checks_fixture(checks=[raw_check()], run_prs=[]),
@@ -127,6 +167,10 @@ def browser_fixtures():
                                ('closed', None, None), ('unattached', None, [])):
         fixtures[f'passed:{key}'] = unmatched_checks_fixture(checks=[raw_check(conclusion='success')],
                                                             head=head, run_prs=run_prs)
+    for kind in ('uncovered', 'uncovered-only', 'cancelled', 'old-cancelled', 'all-pass', 'neutral', 'skipped', 'stale', 'unknown-completion',
+                 'check-neutral', 'check-skipped', 'check-stale', 'check-unknown-completion', 'unknown-status',
+                 'check-cancelled', 'running-cancelled', 'failed-cancelled'):
+        fixtures[f'coverage:{kind}'] = coverage_fixture(kind)
     return fixtures
 
 
@@ -204,6 +248,26 @@ class SupersessionTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_open_head_without_workflows_or_checks_retains_explicit_unknown_coverage(self):
+        for kind, expected_prs in (('uncovered', ['8']), ('uncovered-only', ['7', '8'])):
+            with self.subTest(kind=kind):
+                fixture = coverage_fixture(kind); data = fixture['data']
+                self.assertEqual([row['pr'] for row in data['check_rows']], expected_prs)
+                for row in data['check_rows']:
+                    self.assertTrue(row['current_head']); self.assertTrue(row['check_evidence_unknown'])
+                    self.assertEqual(row['status'], 'unknown'); self.assertIsNone(row['conclusion'])
+                    self.assertEqual(row['checks'], []); self.assertEqual(row['jobs'], [])
+                    self.assertFalse(row['actionable']); self.assertFalse(row['superseded'])
+                    for key in ('id', 'attempt', 'workflow_id', 'rerun_command', 'created_at', 'started_at', 'updated_at'):
+                        self.assertIsNone(row[key])
+                    self.assertEqual(row['jobs_scope'], 'none')
+                    self.assertIn('No workflow or check runs observed', row['reason'])
+                    group = next(group for group in data['groups'] if group['pr'] == row['pr'])
+                    self.assertEqual(group['run_keys'], [])
+                    self.assertEqual(group['check_keys'], [row['key']])
+                self.assertEqual(sum('/jobs?' in call['route'] for call in fixture['calls']), int(kind == 'uncovered'))
+                self.assertEqual(sum('/check-runs?' in call['route'] for call in fixture['calls']), 2)
+
     def test_workflow_without_pr_metadata_binds_every_matching_observed_head(self):
         fixture = unmatched_checks_fixture(checks=[raw_check()], run_prs=[],
                                            heads={'7': SHA, '8': SHA, '9': OTHER_SHA})
@@ -211,8 +275,15 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual([row['pr'] for row in data['runs']], ['7', '8'])
         self.assertTrue(all(row['current_head'] and row['actionable'] for row in data['runs']))
         self.assertEqual([row['key'] for row in data['runs']], [REPO + ':10:7', REPO + ':10:8'])
-        self.assertEqual([group['pr'] for group in data['groups']], ['7', '8'])
-        self.assertEqual(data['check_rows'], [])
+        self.assertEqual([group['pr'] for group in data['groups'] if group['run_keys']], ['7', '8'])
+        self.assertEqual([row for row in data['check_rows'] if row['checks']], [])
+        self.assertEqual([row['pr'] for row in data['check_rows']], ['9'])
+        marker = data['check_rows'][0]
+        self.assertEqual(marker['sha'], OTHER_SHA)
+        self.assertTrue(marker['current_head'] and marker['check_evidence_unknown'])
+        marker_group = next(group for group in data['groups'] if group['pr'] == '9')
+        self.assertEqual(marker_group['run_keys'], [])
+        self.assertEqual(marker_group['check_keys'], [marker['key']])
         self.assertEqual(sum('/jobs?' in call['route'] for call in fixture['calls']), 1)
         self.assertEqual({row['id'] for row in data['runs']}, {'10'})
 

@@ -191,7 +191,8 @@ def _group_check_rows(repo, checks, heads, runs, groups):
     claimed = {check['id'] for run in runs for check in run['checks']}
     rows, by_key = [], {(group['pr'], group['sha']): group for group in groups}
     unmatched = [check for check in checks if check['id'] not in claimed]
-    for sha in sorted({check['sha'] for check in unmatched}):
+    unobserved = set(heads.values()) - {run['sha'] for run in runs} - {check['sha'] for check in checks}
+    for sha in sorted({check['sha'] for check in unmatched} | unobserved):
         related = [check for check in unmatched if check['sha'] == sha]
         # A check is commit-scoped, not an invented Actions run. Open HEADs
         # establish current PR ownership; observed run groups retain old history.
@@ -205,12 +206,16 @@ def _group_check_rows(repo, checks, heads, runs, groups):
                 'completed' if all(check['status'] == 'completed' for check in owned) else 'unknown')
             conclusion = 'failure' if any(check['conclusion'] in FAILURES for check in owned) else (
                 'success' if all(check['status'] == 'completed' and check['conclusion'] == 'success' for check in owned) else None)
+            if not owned:
+                status, conclusion = 'unknown', None
             row = {'kind': 'checks', 'key': f'{repo}:checks:{sha}:{number or "none"}', 'repo': repo, 'pr': number, 'sha': sha,
-                   'id': None, 'attempt': None, 'workflow_id': None, 'name': 'Check runs', 'jobs_scope': 'none', 'jobs': [],
+                   'id': None, 'attempt': None, 'workflow_id': None, 'name': 'Check runs' if owned else 'Check observations', 'jobs_scope': 'none', 'jobs': [],
                    'status': status, 'conclusion': conclusion, 'created_at': None, 'started_at': None, 'updated_at': None,
                    'current_head': current, 'checks': owned, **_check_evidence(owned, current),
-                   'check_evidence_unknown': any(check['status'] == 'unknown' or check['status'] == 'completed' and check['conclusion'] is None for check in owned),
+                   'check_evidence_unknown': not owned or any(check['status'] == 'unknown' or check['status'] == 'completed' and check['conclusion'] is None for check in owned),
                    'rerun_command': None}
+            if not owned:
+                row['reason'] = 'No workflow or check runs observed for this open HEAD.'
             rows.append(row)
             key = (number, sha)
             if key not in by_key:
