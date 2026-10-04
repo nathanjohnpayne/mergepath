@@ -206,6 +206,54 @@ class AuthorBudgetTests(unittest.TestCase):
             self.assertFalse(thread.is_alive()); self.assertIsNotNone(process.poll()); self.assertFalse(workspace.exists())
             time.sleep(.55); self.assertFalse(marker.exists())
 
+    def test_read_reap_failure_still_closes_both_pipes_and_releases_slot(self):
+        # Reap the real synthetic child first, then inject the cleanup failure;
+        # this verifies bookkeeping without leaving an orphan or relaxing waits.
+        original_popen = A.subprocess.Popen
+        for error in (subprocess.TimeoutExpired('fixture-reap', 2), RuntimeError('fixture-unrelated')):
+            with self.subTest(error=type(error).__name__):
+                provider = A.AuthorBudgetProvider(ROOT, '/fixture/cache', 'codex')
+                self.addCleanup(provider.close)
+                captured = []
+                def spawn(command, **kwargs):
+                    return original_popen([sys.executable, '-I', '-c', 'print(' + repr(json.dumps(A.empty_sample())) + ')'], **kwargs)
+                def failed_reap(process):
+                    A.AuthorBudgetProvider._kill(process)
+                    captured.append(process)
+                    raise error
+                with patch.object(A.subprocess, 'Popen', side_effect=spawn), patch.object(provider, '_kill', side_effect=failed_reap):
+                    with self.assertRaises(type(error)) as raised:
+                        provider._read(time.monotonic() + 2)
+                self.assertIs(raised.exception, error)
+                process = captured[0]
+                self.assertIsNotNone(process.poll())  # The injection itself is safe.
+                self.assertTrue(process.stdout.closed); self.assertTrue(process.stderr.closed)
+                self.assertIsNone(provider._process)
+
+    def test_close_reap_failure_still_removes_workspace_and_preserves_failure(self):
+        for error in (subprocess.TimeoutExpired('fixture-reap', 2), RuntimeError('fixture-unrelated')):
+            with self.subTest(error=type(error).__name__):
+                provider = A.AuthorBudgetProvider(ROOT, '/fixture/cache', 'codex')
+                self.addCleanup(provider.close)
+                process = subprocess.Popen([sys.executable, '-I', '-c', 'import time; time.sleep(30)'],
+                                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, start_new_session=True)
+                provider._process = process
+                workspace = provider.workspace
+                def failed_reap(child):
+                    A.AuthorBudgetProvider._kill(child)
+                    raise error
+                try:
+                    with patch.object(provider, '_kill', side_effect=failed_reap):
+                        with self.assertRaises(type(error)) as raised:
+                            provider.close()
+                    self.assertIs(raised.exception, error)
+                    self.assertIsNotNone(process.poll())  # Not proof a stuck child can be reaped.
+                    self.assertTrue(provider._closed); self.assertFalse(workspace.exists())
+                finally:
+                    A.AuthorBudgetProvider._kill(process)
+                    process.stdout.close(); process.stderr.close()
+
     def test_workspace_refusal_is_independent_and_shared_scheduler_preserves_sources(self):
         with patch.object(A.tempfile, "mkdtemp", side_effect=PermissionError()):
             provider = A.AuthorBudgetProvider(ROOT, '/fixture/cache', 'codex')

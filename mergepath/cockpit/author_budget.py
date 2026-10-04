@@ -196,11 +196,13 @@ class AuthorBudgetProvider:
         except (OSError, ValueError, TypeError, RecursionError, UnicodeError):
             return empty_sample("worker_protocol_error")
         finally:
-            self._kill(process)
-            process.stdout.close()
-            process.stderr.close()
-            with self._lock:
-                self._process = None
+            try:
+                self._kill(process)
+            finally:
+                process.stdout.close()
+                process.stderr.close()
+                with self._lock:
+                    self._process = None
 
     def fetch(self, deadline):
         with self._lock:
@@ -239,10 +241,12 @@ class AuthorBudgetProvider:
         with self._lock:
             self._closed = True
             process = self._process
-        if process is not None:
-            self._kill(process)
-        if self.workspace is not None:
-            shutil.rmtree(self.workspace, ignore_errors=True)
+        try:
+            if process is not None:
+                self._kill(process)
+        finally:
+            if self.workspace is not None:
+                shutil.rmtree(self.workspace, ignore_errors=True)
 
 
 def main():
