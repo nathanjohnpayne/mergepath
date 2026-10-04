@@ -71,7 +71,8 @@
     if (live.includes(row.status)) return {state: "running", label: row.status === "in_progress" ? "Running" : "Queued"};
     if (failures.includes(row.conclusion)) return {state: "idle", label: row.current_head === false ? "Failed · old HEAD" : row.current_head === null ? "Failed · HEAD unknown" : "Failed"};
     if (row.kind === "checks" && row.current_head !== true) return {state: "idle", label: row.current_head === false ? "Checks · old HEAD" : "Checks · HEAD unknown"};
-    if (row.conclusion === "success") return {state: "clear", label: "Passed"};
+    if (row.conclusion === "success") return row.current_head === true ? {state: "clear", label: "Passed"}
+      : {state: "idle", label: row.current_head === false ? "Passed · old HEAD" : "Passed · HEAD unknown"};
     return {state: "idle", label: row.conclusion ? row.conclusion[0].toUpperCase() + row.conclusion.slice(1) : "Unknown"};
   }
   function project(envelope, selectedRepo, now) {

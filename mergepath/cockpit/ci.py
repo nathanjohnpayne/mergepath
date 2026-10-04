@@ -17,7 +17,7 @@ FAILURES = frozenset({'failure', 'timed_out', 'action_required', 'startup_failur
 LIVE = frozenset({'queued', 'in_progress', 'waiting', 'pending', 'requested'})
 SHA = re.compile(r'[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?\Z')
 DECIMAL = re.compile(r'[1-9][0-9]{0,79}\Z')
-ANSI = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|$))')
+ANSI = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*?(?:\x07|\x1b\\|$))')
 TIMESTAMP = re.compile(r'^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z)\s*')
 
 
@@ -285,9 +285,11 @@ class CIProvider:
             if old and old['stale'] and old['retry_at'] > now:
                 record = copy.deepcopy(old)
             else:
+                scan_started = False
                 try:
                     if self.monotonic() >= budget_deadline:
                         raise ClientError('deadline_exceeded')
+                    scan_started = True
                     repo_rows, repo_groups, repo_checks = self._repo(repo, budget_deadline)
                     record = {'repo': repo, 'observed_at': self.clock(), 'attempted_at': now,
                               'stale': False, 'error': None, 'retry_at': None,
@@ -295,9 +297,11 @@ class CIProvider:
                     self._failures[repo] = 0
                 except Exception as exc:
                     category = error_category(exc.category) if isinstance(exc, ClientError) else 'source_failed'
-                    failures = self._failures.get(repo, 0) + 1
-                    self._failures[repo] = failures
-                    delay = min(900, 20 * 2 ** min(failures - 1, 16))
+                    failures = self._failures.get(repo, 0)
+                    if scan_started:
+                        failures += 1
+                        self._failures[repo] = failures
+                    delay = min(900, 20 * 2 ** min(max(0, failures - 1), 16))
                     if isinstance(exc, ClientError):
                         delay = max(delay, retry_delay(exc.retry_after))
                     retry = now + delay

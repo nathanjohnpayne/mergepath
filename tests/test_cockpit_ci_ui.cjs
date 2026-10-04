@@ -1,11 +1,19 @@
 "use strict";
 const test = require("node:test"), assert = require("node:assert/strict"), fs = require("node:fs"), cp = require("node:child_process");
 const CI = require("../mergepath/cockpit/assets/ci.js"), C = require("../mergepath/cockpit/assets/components.js");
-const pythonFixture = expression => JSON.parse(cp.execFileSync("python3", ["-c", `import sys,json;sys.path.insert(0,'tests');import test_cockpit_ci as ci;print(json.dumps(${expression}))`], {cwd: require("node:path").resolve(__dirname,".."), timeout: 2000}));
-const fixture = () => pythonFixture("ci.model()");
+const fixtures = JSON.parse(cp.execFileSync("python3", ["-B", "-c", "import sys,json;sys.path.insert(0,'tests');import test_cockpit_ci as ci;print(json.dumps(ci.browser_fixtures()))"], {cwd: require("node:path").resolve(__dirname,".."), timeout: 10000}));
+const pythonFixture = key => {assert.ok(Object.hasOwn(fixtures, key), `unknown Python fixture: ${key}`); return structuredClone(fixtures[key]);};
+const fixture = () => pythonFixture("model");
 const envelope = data => ({data, observed_at: 1000, stale: false});
+test("Batched Python fixtures return independent nested payloads for every case", () => {
+  const original = fixture(), changed = fixture();
+  changed.runs[0].name = "mutated"; changed.runs[0].jobs[0].steps.length = 0;
+  assert.deepEqual(fixture(), original);
+  const external = pythonFixture("external:False"); external.data.check_rows[0].checks[0].producer = null;
+  assert.equal(pythonFixture("external:False").data.check_rows[0].checks[0].producer, "app:77");
+});
 for (const field of ["name", "diagnostic", "excerpt"]) test(`Python Unicode ${field} limit round-trips through browser validation`, () => {
-  const {data, excerpt} = pythonFixture("ci.unicode_model_and_excerpt()");
+  const {data, excerpt} = pythonFixture("unicode");
   if (field === "name") {
     data.runs[0].diagnostics = [];
     assert.equal(CI.project(envelope(data), null, 1001).rows[0].name, "🚀".repeat(1000));
@@ -25,7 +33,7 @@ for (const field of ["name", "diagnostic", "excerpt"]) test(`Python Unicode ${fi
   }
 });
 for (const withActions of [true, false]) test(`Provider external check failure reaches browser projection; Actions=${withActions}`, () => {
-  const {data} = pythonFixture(`ci.unmatched_checks_fixture(${withActions ? "True" : "False"})`);
+  const {data} = pythonFixture(`external:${withActions ? "True" : "False"}`);
   const model = CI.project(envelope(data), null, 1001);
   assert.equal(model.state, "bump"); assert.equal(model.hazards.length, 1);
   assert.equal(C.normalizeHazards(model.hazards, ["owner/repo"]).diagnostics.length, 0);
@@ -36,32 +44,50 @@ for (const withActions of [true, false]) test(`Provider external check failure r
   assert.equal(row.checks[0].producer, "app:77"); assert.equal(row.diagnostics[0].source, "check-run output");
 });
 test("Unknown check producer or Actions lineage remains actionable beside passing workflow", () => {
-  for (const app of ["None", "{'id':1,'slug':'github-actions'}"]) {
-    const {data} = pythonFixture(`ci.unmatched_checks_fixture(checks=[ci.raw_check(conclusion='success'), {**ci.raw_check(200,suite=999), 'app':${app}}, {**ci.raw_check(201,'success',ci.LATER,app=77), 'app':{'id':77,'slug':'external-app'}}])`);
+  for (const unknownApp of [true, false]) {
+    const {data} = pythonFixture(`unknown:${unknownApp ? "True" : "False"}`);
     const model = CI.project(envelope(data), null, 1001);
     assert.equal(model.state, "bump"); assert.equal(model.hazards.length, 1);
     assert.equal(data.check_rows[0].checks[0].superseded_by, null);
   }
 });
 test("Workflow with empty PR metadata projects current failure from independently observed open HEAD", () => {
-  const {data} = pythonFixture("ci.unmatched_checks_fixture(checks=[ci.raw_check()], run_prs=[])");
+  const {data} = pythonFixture("workflow-no-pr");
   const model = CI.project(envelope(data), null, 1001);
   assert.equal(model.state, "bump"); assert.equal(model.hazards.length, 1);
   assert.equal(model.rows[0].pr, "7"); assert.equal(model.rows[0].current_head, true);
   assert.equal(model.rows[0].key, "owner/repo:10:7"); assert.equal(data.check_rows.length, 0);
   assert.ok(model.hazards[0].title.includes("#7"));
 });
+test("Successful workflow history clears only with independently observed current HEAD", () => {
+  for (const [key, current, label] of [["current", true, "Passed"],
+    ["old", false, "Passed · old HEAD"], ["closed", null, "Passed · HEAD unknown"],
+    ["unattached", null, "Passed · HEAD unknown"]]) {
+    const {data} = pythonFixture(`passed:${key}`);
+    const model = CI.project(envelope(data), null, 1001);
+    assert.equal(model.rows[0].current_head, current);
+    assert.deepEqual(CI.runTone(model.rows[0]), {state:current === true ? "clear" : "idle", label});
+    assert.equal(model.state, current === true ? "clear" : "idle");
+    assert.equal(model.hazards.length, 0); assert.equal(model.stale, false);
+    assert.equal(model.rows.length, 1);
+    if (current !== true) {
+      const fresh = pythonFixture("passed:current").data.runs[0];
+      fresh.id = "11"; fresh.key = `${fresh.repo}:11:${fresh.pr}`;
+      assert.equal(CI.project(envelope({...data,runs:[...data.runs,fresh]}), null, 1001).state, "clear");
+    }
+  }
+});
 test("Check-only pending or unavailable evidence cannot project a clear state", () => {
   for (const [status, expected] of [["queued","running"],["in_progress","running"],["completed","idle"],["unknown","idle"]]) {
-    const {data} = pythonFixture(`ci.unmatched_checks_fixture(checks=[ci.raw_check(conclusion='success'), {**ci.raw_check(200), 'status':'${status}', 'conclusion':None}])`);
+    const {data} = pythonFixture(`pending:${status}`);
     assert.equal(CI.project(envelope(data), null, 1001).state, expected);
   }
-  const {data} = pythonFixture("ci.unmatched_checks_fixture(head=None)");
+  const {data} = pythonFixture("no-head");
   assert.equal(CI.project(envelope(data), null, 1001).state, "idle");
   assert.equal(CI.project(envelope(data), null, 1001).hazards.length, 0);
 });
 for (const withActions of [true, false]) for (const status of ["queued", "in_progress"]) test(`Superseded external failure retains independent ${status} check tone; Actions=${withActions}`, () => {
-  const {data, hot} = pythonFixture(`ci.unmatched_checks_fixture(${withActions ? "True" : "False"}, checks=${withActions ? "[ci.raw_check(conclusion='success')] + " : ""}[{**ci.raw_check(200, app=77, name='external gate'), 'app':{'id':77,'slug':'external-app'}}, {**ci.raw_check(201, 'success', ci.LATER, app=77, name='external gate'), 'app':{'id':77,'slug':'external-app'}}, {**ci.raw_check(202, None, ci.LATER, app=77, name='independent check'), 'status':'${status}', 'completed_at':None, 'app':{'id':77,'slug':'external-app'}}])`);
+  const {data, hot} = pythonFixture(`mixed:${withActions ? "True" : "False"}:${status}`);
   const model = CI.project(envelope(data), null, 1001), row = data.check_rows[0];
   assert.equal(hot, true); assert.equal(row.status, status); assert.equal(row.superseded, true);
   assert.equal(row.checks[0].superseded_by, "201"); assert.equal(row.checks[2].status, status);
@@ -69,7 +95,7 @@ for (const withActions of [true, false]) for (const status of ["queued", "in_pro
   assert.deepEqual(CI.runTone(row), {state:"running", label:status === "in_progress" ? "Running" : "Queued"});
 });
 test("Check rows reject fabricated Actions identities, jobs and commands", () => {
-  const {data} = pythonFixture("ci.unmatched_checks_fixture(False)");
+  const {data} = pythonFixture("external:False");
   const row = data.check_rows[0];
   for (const mutation of [{id:"200"},{attempt:"1"},{workflow_id:"9"},{jobs_scope:"all-attempts"},
     {rerun_command:"gh run rerun 200 --failed --repo owner/repo"},{jobs:fixture().runs[0].jobs}]) {
@@ -144,7 +170,7 @@ class Node {
 }
 function dom(){global.document={createElement:tag=>new Node(tag),activeElement:null};return new Node("div");}
 test("Unmatched checks render literal names, producer and diagnostic without Actions logs or rerun", () => {
-  const {data} = pythonFixture("ci.unmatched_checks_fixture(False)");
+  const {data} = pythonFixture("external:False");
   const parent = dom(), view = new CI.CIView(parent, () => assert.fail("unexpected fetch"));
   const check = data.check_rows[0].checks[0]; check.name = "<img onerror=evil()>";
   const model = CI.project(envelope(data), null, 1001); view.update(model); view.toggle(model.rows[0].key);

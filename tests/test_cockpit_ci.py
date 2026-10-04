@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mergepath.cockpit.ci import (CIProvider, LogExcerptCache, extract_fail_lines,
                                  group_runs, normalize_check, normalize_job, supersede)
-from mergepath.cockpit.github import ClientError, GitHubClient, Response, copy_json_tree
+from mergepath.cockpit.github import ClientError, GitHubClient, MAX_BODY, Response, copy_json_tree
 from mergepath.cockpit.inventory import Repository
 
 REPO = 'owner/repo'
@@ -96,6 +96,38 @@ def unmatched_checks_fixture(with_actions=True, checks=None, head=SHA, now=1000,
     provider = CIProvider(Client(), INVENTORY, clock=lambda: now, monotonic=lambda: 0)
     sample = provider(5)
     return {'data': sample.data, 'calls': calls, 'hot': sample.hot}
+
+
+def browser_fixtures():
+    fixtures = {'model': model(), 'unicode': unicode_model_and_excerpt(),
+                'workflow-no-pr': unmatched_checks_fixture(checks=[raw_check()], run_prs=[]),
+                'no-head': unmatched_checks_fixture(head=None)}
+    for with_actions in (True, False):
+        fixtures[f'external:{with_actions}'] = unmatched_checks_fixture(with_actions)
+        for status in ('queued', 'in_progress'):
+            checks = [raw_check(conclusion='success')] if with_actions else []
+            for check_id, conclusion, name in ((200, 'failure', 'external gate'),
+                                                (201, 'success', 'external gate'),
+                                                (202, None, 'independent check')):
+                check = raw_check(check_id, conclusion, START if check_id == 200 else LATER, app=77, name=name)
+                check['app']['slug'] = 'external-app'
+                if check_id == 202:
+                    check.update(status=status, completed_at=None)
+                checks.append(check)
+            fixtures[f'mixed:{with_actions}:{status}'] = unmatched_checks_fixture(with_actions, checks=checks)
+    for app in (None, {'id': 1, 'slug': 'github-actions'}):
+        external = raw_check(201, 'success', LATER, app=77)
+        external['app']['slug'] = 'external-app'
+        checks = [raw_check(conclusion='success'), {**raw_check(200, suite=999), 'app': app}, external]
+        fixtures[f'unknown:{app is None}'] = unmatched_checks_fixture(checks=checks)
+    for status in ('queued', 'in_progress', 'completed', 'unknown'):
+        fixtures[f'pending:{status}'] = unmatched_checks_fixture(checks=[raw_check(conclusion='success'),
+            {**raw_check(200), 'status': status, 'conclusion': None}])
+    for key, head, run_prs in (('current', SHA, None), ('old', OTHER_SHA, None),
+                               ('closed', None, None), ('unattached', None, [])):
+        fixtures[f'passed:{key}'] = unmatched_checks_fixture(checks=[raw_check(conclusion='success')],
+                                                            head=head, run_prs=run_prs)
+    return fixtures
 
 
 class SupersessionTests(unittest.TestCase):
@@ -436,8 +468,69 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(rows[0]['key'], final[0]['key'])
         self.assertEqual(final[0]['conclusion'], 'success')
 
+    def test_untouched_deadline_does_not_inflate_or_reset_real_failure_backoff(self):
+        for prior_failures, retry_after in ((0, 0), (1, 0), (2, 0), (0, 60), (1, 60)):
+            with self.subTest(prior_failures=prior_failures, retry_after=retry_after):
+                now, mono, calls = [1000.0], [0.0], []
+                class Client:
+                    def pages(self, route, **kwargs):
+                        calls.append(route)
+                        raise ClientError('upstream_unavailable', retry_after=retry_after)
+                provider = CIProvider(Client(), INVENTORY, clock=lambda: now[0], monotonic=lambda: mono[0])
+                for _ in range(prior_failures):
+                    data = provider(5).data
+                    now[0] = data['repositories'][0]['retry_at'] + 1
+                dispatched = len(calls)
+                for _ in range(6):
+                    mono[0] = 5
+                    record = provider(5).data['repositories'][0]
+                    self.assertEqual(record['error'], 'deadline_exceeded')
+                    self.assertEqual(record['retry_at'], now[0])
+                self.assertEqual(len(calls), dispatched)
+                mono[0] = 0
+                record = provider(5).data['repositories'][0]
+                self.assertEqual(len(calls), dispatched + 1)
+                self.assertEqual(record['retry_at'] - now[0], max(20 * 2 ** prior_failures, retry_after))
+
 
 class ExcerptTests(unittest.TestCase):
+    def test_osc_bel_and_st_terminators_preserve_failure_text(self):
+        for terminator in (b'\x07', b'\x1b\\'):
+            opening = b'\x1b]8;;https://example.test/log' + terminator
+            closing = b'\x1b]8;;' + terminator
+            for body, expected in (
+                    (b'\x1b]0;title' + terminator + b'FAIL: wanted', 'FAIL: wanted'),
+                    (opening + closing + b'FAIL: wanted', 'FAIL: wanted'),
+                    (opening + b'FAIL: wanted' + closing + b' suffix', 'FAIL: wanted suffix'),
+                    (b'FAIL: before ' + opening + b'linked' + closing + b' after', 'FAIL: before linked after'),
+                    (b'\x1b[31m' + opening + b'FAIL: colored' + closing + b'\x1b[0m', 'FAIL: colored')):
+                with self.subTest(terminator=terminator, body=body):
+                    result = extract_fail_lines(body, {})
+                    self.assertEqual(result['status'], 'ok')
+                    self.assertEqual(result['lines'], [expected])
+                    self.assertEqual(result['scope'], 'job')
+
+    def test_unterminated_osc_preserves_existing_end_of_line_behavior(self):
+        result = extract_fail_lines(b'FAIL: retained \x1b]8;;unterminated\n'
+                                    b'\x1b]0;title FAIL: hidden\nFAIL: next line', {})
+        self.assertEqual(result['lines'], ['FAIL: retained ', 'FAIL: next line'])
+        self.assertEqual(result['status'], 'ok')
+
+    def test_osc_at_body_cap_retains_failure_and_existing_output_bounds(self):
+        prefix, suffix = b'\x1b]0;', b'\x1b\\FAIL: wanted'
+        body = prefix + b'x' * (MAX_BODY - len(prefix) - len(suffix)) + suffix
+        self.assertEqual(extract_fail_lines(body, {})['lines'], ['FAIL: wanted'])
+        with self.assertRaises(ClientError) as error:
+            extract_fail_lines(body + b'x', {})
+        self.assertEqual(error.exception.category, 'response_too_large')
+        linked = b'\x1b]8;;https://example.test\x1b\\FAIL: ' + b'x' * 2000 + b'\x1b]8;;\x1b\\\n'
+        result = extract_fail_lines(linked * 100, {})
+        self.assertTrue(result['truncated'])
+        self.assertTrue(result['lines'])
+        self.assertTrue(all(line == 'FAIL: ' + 'x' * 994 for line in result['lines']))
+        self.assertLessEqual(len(result['lines']), 80)
+        self.assertLessEqual(sum(len(line.encode()) for line in result['lines']), 32768)
+
     def test_transient_result_is_shared_by_existing_waiter_but_explicit_retry_reads_again(self):
         for error in ['deadline_exceeded', 'upstream_backoff', 'secondary_limit', 'primary_reserve',
                       'primary_exhausted', 'upstream_unavailable', 'upstream_http_error']:
