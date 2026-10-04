@@ -29,15 +29,15 @@
 # What is measured (never any token material, on any output):
 #   read               GET repos/<repo> succeeds
 #   graphql            `query { viewer { login } }` succeeds; a proxy refusal
-#                      ("This GraphQL query is not enabled for this session")
+#                      (any wording scripts/lib/graphql-ceiling.sh recognizes)
 #                      is reported as the graphql ceiling, not a credential gap
 #   cross-repo         GET repos/<cross-repo> succeeds (default
 #                      octocat/Hello-World: public, so only a repository-scope
 #                      restriction can refuse it)
-#   push-multi-branch  reported false in a Claude cloud session from the
-#                      proxy's documented one-branch push restriction, and
-#                      `not-measured` elsewhere: nothing short of a real push
-#                      proves a push is accepted
+#   push-multi-branch  `not-measured` on every surface: nothing short of a
+#                      real push proves a push is accepted. On Claude cloud
+#                      the reason records what the proxy has been observed to
+#                      do with a second branch
 #   author-writes      the wrapper token resolver finds a token for the
 #                      repo's author_identity AND that token is a user-held
 #                      credential (scripts/lib/credential-class.sh) whose
@@ -88,6 +88,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/scripts/lib/credential-class.sh"
 # shellcheck source=lib/gh-token-resolver.sh
 . "$ROOT/scripts/lib/gh-token-resolver.sh"
+# shellcheck source=lib/graphql-ceiling.sh
+. "$ROOT/scripts/lib/graphql-ceiling.sh"
 
 # 2: records carry a credential fingerprint (#1537). A schema-1 reader would
 # ignore the field and accept a record bound to other credentials, so the
@@ -620,8 +622,8 @@ else
   status="$(api_request "$READ_TOKEN" POST graphql "$WORKDIR/graphql" 'query { viewer { login } }')"
   if [ "$status" = "200" ] && jq -e '.data.viewer.login | type == "string"' "$WORKDIR/graphql.body" >/dev/null 2>&1; then
     cap_json true measured "viewer query returned a login" "$WORKDIR/cap-graphql.json"
-  elif grep -q 'not enabled for this session' "$WORKDIR/graphql.body" 2>/dev/null; then
-    cap_json false measured "proxy GraphQL ceiling: query not enabled for this session" "$WORKDIR/cap-graphql.json"
+  elif graphql_ceiling_hit "$(cat "$WORKDIR/graphql.body" 2>/dev/null)"; then
+    cap_json false measured "proxy GraphQL ceiling: the session's proxy does not serve GraphQL queries" "$WORKDIR/cap-graphql.json"
   else
     cap_json false measured "viewer query returned $status" "$WORKDIR/cap-graphql.json"
   fi
@@ -643,15 +645,21 @@ else
 fi
 
 # push-multi-branch
-# Only the documented Claude cloud restriction is reported. Everywhere else
-# this is NOT measured: a dry-run push never sends the ref update, so it cannot
-# show the server would accept one, and neither can the API permission of a
-# credential that is not necessarily the one `origin` pushes with (SSH remotes
-# authenticate separately). Earlier rounds of #1526 tried to prove it from
-# those pieces; each addition exposed another gap, so the probe states the
+# NOT measured on any surface: a dry-run push never sends the ref update, so it
+# cannot show the server would accept one, and neither can the API permission
+# of a credential that is not necessarily the one `origin` pushes with (SSH
+# remotes authenticate separately). Earlier rounds of #1526 tried to prove it
+# from those pieces; each addition exposed another gap, so the probe states the
 # limit instead of approximating past it.
+#
+# On Claude cloud this was once reported as a documented denial ("pushes only
+# to the session's working branch"). A 2026-10-04 run contradicted that: the
+# proxy accepted creating a second branch in the session's repository and
+# refused (403) deleting it. One observation proves no grant, so the answer is
+# not-measured, and the reason carries what was observed instead of a ceiling
+# that did not hold.
 if [ "$SURFACE" = "claude-cloud" ]; then
-  cap_json false documented "Claude cloud proxy accepts pushes only to the session's working branch" "$WORKDIR/cap-push-multi-branch.json"
+  cap_json false not-measured "not measured: the Claude cloud proxy has been observed to accept creating a branch other than the session's and to refuse deleting one; a dry run cannot prove either" "$WORKDIR/cap-push-multi-branch.json"
 else
   cap_json false not-measured "not measurable without pushing: a dry run never reaches the server's decision, and the API credential need not be the one origin pushes with" "$WORKDIR/cap-push-multi-branch.json"
 fi

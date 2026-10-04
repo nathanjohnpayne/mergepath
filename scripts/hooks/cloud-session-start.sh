@@ -5,9 +5,13 @@
 # Wired in .claude/settings.json. SessionStart hooks run in local and cloud
 # sessions alike, so this exits at once unless CLAUDE_CODE_REMOTE=true: a
 # local session is never probed and never slowed down. In a cloud session it
-# runs scripts/agent-capability-probe.sh (which caches its answer for
-# `--check`) and prints a short summary on stdout, which Claude Code adds to
-# the session's context.
+# first runs scripts/cloud-setup.sh, which installs a missing or wrong tool
+# (the Claude cloud image's `yq` is not mikefarah/yq v4) and does nothing when
+# the tools are right, then runs scripts/agent-capability-probe.sh (which
+# caches its answer for `--check`) and prints a short summary on stdout, which
+# Claude Code adds to the session's context. Setup is bounded to 60 seconds so
+# the probe still fits the hook's 120-second timeout; a setup that fails or
+# times out is reported in the summary, and the probe runs regardless.
 #
 # It never fails the session: every path exits 0. A probe that cannot run is
 # reported in the summary, because a session that silently lacks the answer
@@ -19,6 +23,19 @@
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PROBE="$ROOT/scripts/agent-capability-probe.sh"
+SETUP="$ROOT/scripts/cloud-setup.sh"
+
+if [ -r "$SETUP" ]; then
+  bound=""
+  command -v timeout >/dev/null 2>&1 && bound="timeout ${MERGEPATH_CLOUD_SETUP_TIMEOUT:-60}"
+  # stderr is the setup's whole report; stdout is unused.
+  if setup_log="$($bound bash "$SETUP" 2>&1 >/dev/null)"; then
+    installed="$(printf '%s\n' "$setup_log" | sed -n 's/^cloud-setup: installed \([^ ]* [^ ]*\) .*/\1/p' | paste -sd, - | sed 's/,/, /g')"
+    [ -z "$installed" ] || echo "mergepath cloud session: installed $installed (scripts/cloud-setup.sh)."
+  else
+    echo "mergepath cloud session: tool setup failed or timed out (bash scripts/cloud-setup.sh to see why): $(printf '%s\n' "$setup_log" | tail -1)"
+  fi
+fi
 
 if [ ! -x "$PROBE" ]; then
   echo "mergepath cloud session: capability probe missing ($PROBE); capabilities unknown. See docs/agents/cloud-environments.md."
