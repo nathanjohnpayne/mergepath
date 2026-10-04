@@ -338,8 +338,8 @@ class FleetProvider:
                 for pr in retained["open_sync_prs"] or [] if retained else []:
                     if self.monotonic() >= deadline or self._closed:
                         raise ClientError("deadline_exceeded")
-                    row = partial_row(repo, str(pr["number"]), title="Sync PR · " + pr["branch"], merge_state=pr["state"], observed_at=observed)
-                    row["draft"], row["stale"], row["hazards"] = pr["draft"], failed, []
+                    row = partial_row(repo, str(pr["number"]), title="Sync PR · " + pr["branch"], merge_state=pr["state"], draft=pr["draft"], observed_at=observed)
+                    row["stale"], row["hazards"] = failed, []
                     partial_prs.append(row)
                 rows.append({"name": record["name"], "repo": repo, "status": record["status"],
                              "record": retained, "attempt": copy.deepcopy(record), "observed_at": observed,

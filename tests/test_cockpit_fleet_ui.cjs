@@ -11,8 +11,19 @@ try:
  one['paths'] += [dict(one['paths'][0],path='AGENTS.md',**{'class':'canonical'}),dict(one['paths'][0],path='ci.yml',**{'class':'templated','direction':'re-render differs'})]
  complete=t.fetch(p,[one,n['record'](n['INVENTORY'][2])],1)
  partial=t.fetch(p,[n['record'](status='fetch-error',stamp='2026-10-03T19:01:00Z'),n['record'](n['INVENTORY'][2],stamp='2026-10-03T19:01:00Z')],3)
- print(json.dumps({'complete':complete,'partial':partial}))
-finally:t.tearDown()`],{cwd:root,encoding:'utf8',timeout:5000});
+ unicode=[]
+ for character in ('a','é','😀'):
+  for size in (2048,3000,4096):
+   value=n['record'](status='override-only');value['paths'][0]['override_reason']=character*size
+   unicode.append({'character':character,'size':size,'data':t.fetch(t.provider(),[value,n['record'](n['INVENTORY'][2])])})
+ provenance=n['record'](status='drift');prefix='100644 blob '+'a'*40+'\\t'
+ entry=prefix+'😀'*(8192-len(prefix))
+ provenance['paths'][0]['provenance']={**{key:'a'*40 for key in ('source_sha','sync_sha','hub_sha','consumer_sha')},**{key:entry for key in ('source_entry','hub_entry','consumer_entry')}}
+ provenance=t.fetch(t.provider(),[provenance,n['record'](n['INVENTORY'][2])],1)
+ from mergepath.cockpit.prs import build_row
+ raw={'number':88,'headRefOid':'c'*40,'mergeStateStatus':'CLEAN'}
+ print(json.dumps({'complete':complete,'partial':partial,'unicode':unicode,'provenance':provenance,'current_open':build_row('fixture/one',raw,observed_at=1791054060),'current_merged':build_row('fixture/one',dict(raw,state='MERGED'),observed_at=1791054060)}))
+finally:t.tearDown()`],{cwd:root,encoding:'utf8',timeout:5000,maxBuffer:2*1024*1024});
 assert.equal(fixture.status,0,fixture.stderr);const fixtures=JSON.parse(fixture.stdout);
 class Node {
   constructor(tag='text') {this.tagName=tag;this.children=[];this.parentNode=null;this.style={};this.dataset={};this.attributes={};this.hidden=false;this._text='';this.className='';this.handlers={};
@@ -20,7 +31,7 @@ class Node {
   append(...nodes) {for(const n of nodes){n.remove();n.parentNode=this;this.children.push(n);}}
   replaceChildren(...nodes) {for(const n of [...this.children])n.remove();this._text='';this.append(...nodes);}
   insertBefore(n,next) {n.remove();n.parentNode=this;const i=this.children.indexOf(next);this.children.splice(i<0?this.children.length:i,0,n);}
-  remove() {if(this.parentNode){const a=this.parentNode.children;a.splice(a.indexOf(this),1);this.parentNode=null;}}
+  remove() {if(this.parentNode){if(this.isConnected && this.contains(document.activeElement))document.activeElement=document.body;const a=this.parentNode.children;a.splice(a.indexOf(this),1);this.parentNode=null;}}
   get nextSibling() {return this.parentNode?.children[this.parentNode.children.indexOf(this)+1]??null;}
   get isConnected() {return this===document.body||!!this.parentNode?.isConnected;}
   contains(n) {return n===this||this.children.some(child=>child.contains(n));}
@@ -30,12 +41,13 @@ class Node {
   getAttribute(k) {return this.attributes[k]??null;}
   removeAttribute(k) {delete this.attributes[k];if(k==='href')delete this.href;}
   addEventListener(k,fn) {this.handlers[k]=fn;}
-  focus() {document.activeElement=this;}
+  focus() {document.activeElement=this;for(let node=this;node;node=node.parentNode)node.handlers.focusin?.({target:this});}
 }
 global.document={createElement:t=>new Node(t),createTextNode:t=>{const n=new Node();n.textContent=t;return n;},activeElement:null};
 document.body=new Node('body');
 const Fleet=require('../mergepath/cockpit/assets/fleet.js');
 const Rows=require('../mergepath/cockpit/assets/pr_rows.js');
+const App=require('../mergepath/cockpit/assets/app.js');
 const now=1791054060;
 function parent(){const p=new Node('main');document.body.append(p);return p;}
 function envelope(data=fixtures.complete){return {data:clone(data),observed_at:now,attempted_at:now,in_flight:false,stale:false,error:null,retry_at:null};}
@@ -72,7 +84,7 @@ test('persistent rows/disclosures/focus survive progress, filtering, stale failu
  button.handlers.click();row.prButton.handlers.click();button.focus();assert.equal(row.paths.hidden,false);assert.equal(row.prs.hidden,false);
  const e=envelope();e.in_flight=true;e.attempted_at=now-20;Fleet.render(p,model(e));assert.equal(v.banner.hidden,false);assert.match(v.progressText.textContent,/20s elapsed/);assert.match(v.progressText.textContent,/indeterminate/);assert.equal(v.refreshButton.disabled,true);assert.equal(v.views.get('fixture/one'),row);
  Fleet.render(p,model(envelope(fixtures.partial),'fixture/two'));assert.equal(row.node.hidden,true);assert.equal(row.pathNodes.get('scripts/a.sh').li,pathNode);assert.equal(row.paths.hidden,false);assert.match(row.reason.textContent,/last good audit kept/);assert.match(row.prNote.textContent,/current lookup unavailable/);
- p.replaceChildren(new Node('placeholder'));assert.equal(row.node.isConnected,false);Fleet.render(p,model());assert.equal(v.views.get('fixture/one'),row);assert.equal(row.node.isConnected,true);assert.equal(row.pathButton.getAttribute('aria-expanded'),'true');assert.equal(row.prButton.getAttribute('aria-expanded'),'true');assert.equal(document.activeElement,button);assert.equal(v.banner.hidden,true);
+ p.replaceChildren(new Node('placeholder'));assert.equal(row.node.isConnected,false);Fleet.render(p,model());assert.equal(v.views.get('fixture/one'),row);assert.equal(row.node.isConnected,true);assert.equal(row.pathButton.getAttribute('aria-expanded'),'true');assert.equal(row.prButton.getAttribute('aria-expanded'),'true');assert.ok(document.activeElement===button);assert.equal(v.banner.hidden,true);
  const prView=[...row.prList.views.values()][0];assert.match(prView.full.id,/^fleet-budget-fixture%2Fone%23/);assert.equal(prView.button.getAttribute('aria-controls'),prView.full.id);assert.equal(v.syncAll.disabled,true);assert.equal(row.sync.disabled,true);
 });
 test('dynamic path text is literal and fallback PR enrichment stays unknown',()=>{
@@ -94,7 +106,7 @@ test('disclosure ID references are whitespace-free and preserve distinct identit
  assert.equal(new Set(ids).size,ids.length);
  const first=v.views.get('fixture/one'),pathId=first.paths.id,prId=first.prs.id;
  first.pathButton.handlers.click();first.pathButton.focus();Fleet.render(v.parent,model(e));
- assert.equal(first.paths.id,pathId);assert.equal(first.prs.id,prId);assert.equal(first.paths.hidden,false);assert.equal(document.activeElement,first.pathButton);
+ assert.equal(first.paths.id,pathId);assert.equal(first.prs.id,prId);assert.equal(first.paths.hidden,false);assert.ok(document.activeElement===first.pathButton);
 });
 test('refresh callback coalesces locally, reports failure, and honors source backoff',async()=>{
  let calls=0,done;const v=Fleet.render(parent(),model(),{refresh:()=>{calls++;return new Promise(resolve=>done=resolve);}});
@@ -105,4 +117,56 @@ test('refresh callback coalesces locally, reports failure, and honors source bac
 test('Fleet installs narrow pending seam and keeps networking/motion in shared contracts',()=>{
  let args;Fleet.install({registerPanel:(...a)=>args=a},{refresh:async()=>{}});assert.equal(args[0],'fleet');assert.deepEqual(args[4],{renderPending:true});
  const js=fs.readFileSync(path.join(root,'mergepath/cockpit/assets/fleet.js'),'utf8'),css=fs.readFileSync(path.join(root,'mergepath/cockpit/assets/fleet.css'),'utf8');assert.doesNotMatch(js,/\bfetch\s*\(|new EventSource|setInterval|innerHTML/);assert.match(css,/prefers-reduced-motion:reduce/);assert.match(css,/\.ck\.rm/);assert.match(css,/var\(--t-med\)/);assert.match(css,/overflow-x:auto/);
+});
+
+test('actual provider Unicode reasons retain Python codepoint limits in projection and literal rendering',()=>{
+ for(const sample of fixtures.unicode){
+  const m=model(envelope(sample.data)),reason=sample.character.repeat(sample.size);
+  assert.equal(m.rows[0].record.paths[0].override_reason,reason);
+  const v=Fleet.render(parent(),m);assert.equal(v.views.get('fixture/one').pathNodes.get('scripts/a.sh').detail.children.length,0);
+  assert.ok(v.views.get('fixture/one').pathList.textContent.includes(reason));
+ }
+ const e=envelope(fixtures.unicode.at(-1).data);
+ for(const record of [e.data.repositories[0].record,e.data.repositories[0].attempt])record.paths[0].override_reason='😀'.repeat(4097);
+ assert.throws(()=>model(e),/invalid/);
+});
+function shell(p,m,placeholder=null,options={refresh:async()=>{}}){return App.renderPanelContent(p,{...m,observed:true},{render:(parent,m)=>Fleet.render(parent,m,options)},placeholder);}
+test('shared unavailable shell recovers surviving owned focus without stealing or reviving invalid targets',()=>{
+ for(const kind of ['path','budget','refresh','external','filtered','removed','disabled']){
+  const p=parent();shell(p,model());const v=Fleet.render(p,model(),{refresh:async()=>{}}),r=v.views.get('fixture/one');
+  r.pathButton.handlers.click();r.prButton.handlers.click();const pr=[...r.prList.views.values()][0];pr.button.handlers.click();
+  const target=kind==='refresh'||kind==='disabled'?v.refreshButton:kind==='budget'?pr.button:r.pathButton;
+  target.focus();let placeholder=App.renderPanelContent(p,{observed:false},null,null);
+  assert.ok(document.activeElement===document.body,kind);assert.equal(target.isConnected,false,kind);
+  let recovered=model();if(kind==='filtered')recovered=model(envelope(),'fixture/two');
+  if(kind==='removed')recovered={...recovered,rows:recovered.rows.filter(row=>row.repo!=='fixture/one')};
+  if(kind==='disabled'){const e=envelope();e.in_flight=true;recovered=model(e);}
+  let external;if(kind==='external'){external=new Node('button');document.body.append(external);external.focus();}
+  shell(p,recovered,placeholder);
+  if(['path','budget','refresh'].includes(kind))assert.ok(document.activeElement===target,kind);
+  else assert.ok(document.activeElement===(external??document.body),kind);
+  if(kind!=='removed'){assert.equal(r.pathButton.getAttribute('aria-expanded'),'true');assert.equal(r.prButton.getAttribute('aria-expanded'),'true');}
+ }
+});
+test('Fleet audit membership outlives merge reward clocks and is removed by the next audit membership',()=>{
+ const context=current=>({prs:{observed_at:now,stale:false,data:{schema:'cockpit-prs/v1',repositories:[{repo:'fixture/one',rows:[clone(current)],stale:false}]}}});
+ const p=parent(),v=Fleet.render(p,model(envelope(),null,context(fixtures.current_open))),r=v.views.get('fixture/one'),pr=r.prList.views.get('fixture/one#88');
+ let clock=0,id=0;const queue=new Map();pr.setTimer=(fn,delay)=>{const key=++id;queue.set(key,{fn,at:clock+delay});return key;};pr.clearTimer=key=>queue.delete(key);
+ r.prButton.handlers.click();pr.button.handlers.click();
+ const merged=model(envelope(),null,context(fixtures.current_merged));Fleet.render(p,merged);
+ assert.equal(pr.rewarding,true);assert.equal(pr.merge.textContent,'MERGED');assert.equal(queue.size,2);
+ for(const ms of [2600,4400]){clock+=ms;for(const [key,t]of [...queue])if(t.at<=clock){queue.delete(key);t.fn();}}
+ assert.equal(pr.rewarding,false);assert.equal(pr.ribbon.hidden,true);assert.ok(r.prList.views.get(pr.id)===pr);
+ assert.equal(pr.model.lifecycle,'MERGED');assert.equal(pr.node.isConnected,true);assert.equal(pr.full.hidden,false);assert.equal(r.prButton.disabled,false);
+ Fleet.render(p,merged);assert.ok(r.prList.views.get(pr.id)===pr);assert.equal(queue.size,0);
+ const next=envelope();for(const record of [next.data.repositories[0].record,next.data.repositories[0].attempt])record.open_sync_prs=[];next.data.repositories[0].sync_pr_rows=[];
+ Fleet.render(p,model(next));assert.equal(r.prList.views.size,0);assert.equal(r.prButton.disabled,true);assert.equal(pr.node.isConnected,false);
+});
+
+test('actual provider provenance entries preserve exact8192 codepoint boundary',()=>{
+ const e=envelope(fixtures.provenance),m=model(e),value=m.rows[0].record.paths[0].provenance;
+ for(const key of ['source_entry','hub_entry','consumer_entry'])assert.equal([...value[key]].length,8192);
+ const v=Fleet.render(parent(),m);assert.equal(v.views.get('fixture/one').node.isConnected,true);assert.match(v.views.get('fixture/one').pathNodes.get('scripts/a.sh').li.title,/source a{40}/);
+ for(const record of [e.data.repositories[0].record,e.data.repositories[0].attempt])record.paths[0].provenance.source_entry+='😀';
+ assert.throws(()=>model(e),/invalid/);
 });
