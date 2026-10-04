@@ -24,6 +24,52 @@ for (const field of ["name", "diagnostic", "excerpt"]) test(`Python Unicode ${fi
     excerpt.lines = ["FAIL:" + "a".repeat(995)]; assert.ok(CI.excerptText(excerpt).includes(excerpt.lines[0]));
   }
 });
+for (const withActions of [true, false]) test(`Provider external check failure reaches browser projection; Actions=${withActions}`, () => {
+  const {data} = pythonFixture(`ci.unmatched_checks_fixture(${withActions ? "True" : "False"})`);
+  const model = CI.project(envelope(data), null, 1001);
+  assert.equal(model.state, "bump"); assert.equal(model.hazards.length, 1);
+  assert.equal(C.normalizeHazards(model.hazards, ["owner/repo"]).diagnostics.length, 0);
+  const retained = CI.project({...envelope(data),stale:true}, null, 1010);
+  assert.equal(retained.hazards[0].stale, true); assert.equal(retained.hazards[0].observed_at, 1000);
+  const row = model.rows.find(row => row.checks.some(check => check.id === "200"));
+  assert.equal(row.current_head, true); assert.equal(row.pr, "7"); assert.equal(row.rerun_command, null);
+  assert.equal(row.checks[0].producer, "app:77"); assert.equal(row.diagnostics[0].source, "check-run output");
+});
+test("Unknown check producer or Actions lineage remains actionable beside passing workflow", () => {
+  for (const app of ["None", "{'id':1,'slug':'github-actions'}"]) {
+    const {data} = pythonFixture(`ci.unmatched_checks_fixture(checks=[ci.raw_check(conclusion='success'), {**ci.raw_check(200,suite=999), 'app':${app}}, {**ci.raw_check(201,'success',ci.LATER,app=77), 'app':{'id':77,'slug':'external-app'}}])`);
+    const model = CI.project(envelope(data), null, 1001);
+    assert.equal(model.state, "bump"); assert.equal(model.hazards.length, 1);
+    assert.equal(data.check_rows[0].checks[0].superseded_by, null);
+  }
+});
+test("Check-only pending or unavailable evidence cannot project a clear state", () => {
+  for (const [status, expected] of [["queued","running"],["in_progress","running"],["completed","idle"],["unknown","idle"]]) {
+    const {data} = pythonFixture(`ci.unmatched_checks_fixture(checks=[ci.raw_check(conclusion='success'), {**ci.raw_check(200), 'status':'${status}', 'conclusion':None}])`);
+    assert.equal(CI.project(envelope(data), null, 1001).state, expected);
+  }
+  const {data} = pythonFixture("ci.unmatched_checks_fixture(head=None)");
+  assert.equal(CI.project(envelope(data), null, 1001).state, "idle");
+  assert.equal(CI.project(envelope(data), null, 1001).hazards.length, 0);
+});
+for (const withActions of [true, false]) for (const status of ["queued", "in_progress"]) test(`Superseded external failure retains independent ${status} check tone; Actions=${withActions}`, () => {
+  const {data, hot} = pythonFixture(`ci.unmatched_checks_fixture(${withActions ? "True" : "False"}, checks=${withActions ? "[ci.raw_check(conclusion='success')] + " : ""}[{**ci.raw_check(200, app=77, name='external gate'), 'app':{'id':77,'slug':'external-app'}}, {**ci.raw_check(201, 'success', ci.LATER, app=77, name='external gate'), 'app':{'id':77,'slug':'external-app'}}, {**ci.raw_check(202, None, ci.LATER, app=77, name='independent check'), 'status':'${status}', 'completed_at':None, 'app':{'id':77,'slug':'external-app'}}])`);
+  const model = CI.project(envelope(data), null, 1001), row = data.check_rows[0];
+  assert.equal(hot, true); assert.equal(row.status, status); assert.equal(row.superseded, true);
+  assert.equal(row.checks[0].superseded_by, "201"); assert.equal(row.checks[2].status, status);
+  assert.equal(model.state, "running"); assert.equal(model.hazards.length, 0);
+  assert.deepEqual(CI.runTone(row), {state:"running", label:status === "in_progress" ? "Running" : "Queued"});
+});
+test("Check rows reject fabricated Actions identities, jobs and commands", () => {
+  const {data} = pythonFixture("ci.unmatched_checks_fixture(False)");
+  const row = data.check_rows[0];
+  for (const mutation of [{id:"200"},{attempt:"1"},{workflow_id:"9"},{jobs_scope:"all-attempts"},
+    {rerun_command:"gh run rerun 200 --failed --repo owner/repo"},{jobs:fixture().runs[0].jobs}]) {
+    assert.throws(() => CI.validate({...data, check_rows:[{...row,...mutation}]}));
+  }
+  assert.throws(() => CI.validate({...data,runs:[row],check_rows:[]}));
+  assert.throws(() => CI.validate({...data,check_rows:[fixture().runs[0]]}));
+});
 test("Python contract and exact opaque identities survive browser JSON parsing", () => {
   const data = fixture(), row = data.runs[0]; row.id = "900719925474099312345"; row.pr = "900719925474099312346";
   row.workflow_id = "900719925474099312347"; row.key = `${row.repo}:${row.id}:${row.pr}`;
@@ -89,6 +135,19 @@ class Node {
   focus(){document.activeElement=this;}
 }
 function dom(){global.document={createElement:tag=>new Node(tag),activeElement:null};return new Node("div");}
+test("Unmatched checks render literal names, producer and diagnostic without Actions logs or rerun", () => {
+  const {data} = pythonFixture("ci.unmatched_checks_fixture(False)");
+  const parent = dom(), view = new CI.CIView(parent, () => assert.fail("unexpected fetch"));
+  const check = data.check_rows[0].checks[0]; check.name = "<img onerror=evil()>";
+  const model = CI.project(envelope(data), null, 1001); view.update(model); view.toggle(model.rows[0].key);
+  const rendered = view.rows.get(model.rows[0].key);
+  assert.ok(parent.textContent.includes("<img onerror=evil()>")); assert.ok(parent.textContent.includes("app:77"));
+  assert.ok(parent.textContent.includes("External gate failed; check-run diagnostic"));
+  assert.ok(parent.textContent.includes("check-run output · check 200"));
+  assert.equal(rendered.command.hidden, true); assert.equal(rendered.jobs.size, 0);
+  assert.ok(!parent.textContent.includes("gh run rerun")); assert.ok(!parent.textContent.includes("Show FAIL excerpt"));
+  assert.ok(!model.hazards[0].detail.includes("Run null"));
+});
 test("renderer restores stable disclosed content after the shell replaces it with an invalid-data placeholder", () => {
   const parent=dom(), data=fixture(), render=CI.renderer(()=>assert.fail("unexpected fetch"));
   render(parent,CI.project(envelope(data),null,1001));

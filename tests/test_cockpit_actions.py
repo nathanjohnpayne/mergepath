@@ -347,7 +347,7 @@ class ActionsTests(unittest.TestCase):
                  'conclusion': None, 'checks': []} for i in range(1, 41)]
         # Only remote acquisition is replaced. Real CIProvider stamps times;
         # real scheduler publication and Application snapshot copying are used.
-        ci._repo = lambda repo, deadline: (rows, [])
+        ci._repo = lambda repo, deadline: (rows, [], [])
         app.scheduler.register('ci', ci, hot_interval=1, idle_interval=1, timeout=5)
         app.register_panel('ci', 'ci')
         original_snapshot = app.panel_snapshot
@@ -374,6 +374,9 @@ class ActionsTests(unittest.TestCase):
         for offset in range(0, 1861, 60):
             current[0] = NOW + offset
             publish_ci(); proven = fetch()
+        self.assertTrue(proven['available'])
+        self.assertFalse(proven['stale'])
+        self.assertEqual(proven['queued'], 40)
         self.assertTrue(proven['jammed'])
         interleave[0] = True
         raced = fetch()

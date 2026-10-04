@@ -74,6 +74,27 @@ def unicode_model_and_excerpt():
     return {'data': data, 'excerpt': extract_fail_lines(('FAIL:' + '🚀' * 1000).encode(), {})}
 
 
+def unmatched_checks_fixture(with_actions=True, checks=None, head=SHA, now=1000):
+    run = raw_run(conclusion='success')
+    job = raw_job(); job['conclusion'] = 'success'; job['steps'][0]['conclusion'] = 'success'
+    external = raw_check(200, app=77, name='external gate')
+    external['app']['slug'] = 'external-app'
+    external['output'] = {'summary': 'External gate failed; check-run diagnostic'}
+    checks = checks if checks is not None else ([raw_check(conclusion='success')] if with_actions else []) + [external]
+    calls = []
+    class Client:
+        def pages(self, route, **kwargs):
+            calls.append({'route': route, **kwargs})
+            if '/pulls?' in route: return [{'number': 7, 'head': {'sha': head}}] if head is not None else []
+            if '/actions/runs?' in route: return [run] if with_actions and 'created=' in route else []
+            if '/jobs?' in route: return [job]
+            if '/check-runs?' in route: return [check for check in checks if '/commits/' + check['head_sha'] + '/' in route]
+            raise AssertionError('unexpected route: ' + route)
+    provider = CIProvider(Client(), INVENTORY, clock=lambda: now, monotonic=lambda: 0)
+    sample = provider(5)
+    return {'data': sample.data, 'calls': calls, 'hot': sample.hot}
+
+
 class SupersessionTests(unittest.TestCase):
     def test_unicode_producer_limits_preserve_complete_code_points(self):
         fixture = unicode_model_and_excerpt()
@@ -148,6 +169,102 @@ class SupersessionTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_provider_retains_external_failure_on_current_head_with_or_without_actions(self):
+        for with_actions in (True, False):
+            with self.subTest(with_actions=with_actions):
+                fixture = unmatched_checks_fixture(with_actions)
+                data = fixture['data']
+                self.assertFalse(data['repositories'][0]['stale'])
+                external_rows = [row for row in data.get('check_rows', []) if any(check['id'] == '200' for check in row['checks'])]
+                self.assertEqual(len(external_rows), 1)
+                row = external_rows[0]
+                self.assertEqual(row['pr'], '7'); self.assertEqual(row['sha'], SHA)
+                self.assertTrue(row['current_head']); self.assertTrue(row['actionable'])
+                self.assertEqual(row['checks'][0]['producer'], 'app:77')
+                self.assertEqual(row['diagnostics'][0]['source'], 'check-run output')
+                self.assertIsNone(row['rerun_command'])
+                self.assertEqual(sum('/jobs?' in call['route'] for call in fixture['calls']), int(with_actions))
+                self.assertEqual(sum('/check-runs?' in call['route'] for call in fixture['calls']), 1)
+                self.assertTrue(all(call['deadline'] == 4.75 for call in fixture['calls']))
+
+    def test_unmatched_unknown_producer_and_actions_lineage_cannot_be_cleared_by_peer(self):
+        for app in (None, {'id': 1, 'slug': 'github-actions'}):
+            with self.subTest(app=app):
+                failed = raw_check(200, app=77, suite=999); failed['app'] = app
+                passed = raw_check(201, 'success', LATER, app=77); passed['app']['slug'] = 'external-app'
+                data = unmatched_checks_fixture(checks=[raw_check(conclusion='success'), failed, passed])['data']
+                row = data['check_rows'][0]
+                self.assertTrue(row['actionable']); self.assertFalse(row['superseded'])
+                self.assertIsNone(row['checks'][0]['producer'])
+                self.assertIsNone(row['checks'][0]['superseded_by'])
+                self.assertEqual([check['id'] for check in data['runs'][0]['checks']], ['100'])
+
+    def test_unmatched_other_app_supersession_requires_same_app_name_and_order(self):
+        failed = raw_check(200, app=77); failed['app']['slug'] = 'external-app'
+        passed = raw_check(201, 'success', LATER, app=77); passed['app']['slug'] = 'external-app'
+        for mutation, superseded in [({}, True), ({'app': {'id': 78, 'slug': 'external-app'}}, False),
+                                     ({'name': 'other check'}, False), ({'started_at': START}, False),
+                                     ({'started_at': None}, False)]:
+            with self.subTest(mutation=mutation):
+                data = unmatched_checks_fixture(False, [failed, {**passed, **mutation}])['data']
+                row = data['check_rows'][0]
+                self.assertEqual(row['superseded'], superseded)
+                self.assertEqual(row['actionable'], not superseded)
+                self.assertEqual(row['checks'][0]['superseded_by'], '201' if superseded else None)
+                self.assertEqual(row['checks'][0]['started_at'], normalize_check(REPO, failed, {})['started_at'])
+
+    def test_unmatched_checks_retain_old_or_unknown_head_history_without_hazard(self):
+        for head, current in [(OTHER_SHA, False), (None, None)]:
+            with self.subTest(head=head):
+                data = unmatched_checks_fixture(head=head)['data']
+                row = data['check_rows'][0]
+                self.assertEqual(row['pr'], '7'); self.assertEqual(row['sha'], SHA)
+                self.assertIs(row['current_head'], current); self.assertFalse(row['actionable'])
+                self.assertEqual(row['checks'][0]['id'], '200')
+                self.assertEqual(data['groups'][0]['run_keys'], [data['runs'][0]['key']])
+                self.assertEqual(data['groups'][0]['check_keys'], [row['key']])
+
+    def test_unmatched_live_and_unknown_checks_do_not_invent_completed_success(self):
+        for status, conclusion, hot, unknown in [('queued', None, True, False), ('in_progress', None, True, False),
+                                                ('completed', None, False, True), ('unknown', None, False, True)]:
+            with self.subTest(status=status):
+                check = raw_check(200); check.update(status=status, conclusion=conclusion)
+                fixture = unmatched_checks_fixture(False, [check]); data = fixture['data']
+                self.assertEqual(fixture['hot'], hot)
+                row = data['check_rows'][0]
+                self.assertEqual(row['status'], status); self.assertIsNone(row['conclusion'])
+                self.assertEqual(row['check_evidence_unknown'], unknown)
+                self.assertIsNone(row['id']); self.assertIsNone(row['attempt']); self.assertIsNone(row['workflow_id'])
+                self.assertEqual(row['jobs'], []); self.assertEqual(data['runs'], [])
+                self.assertTrue(all(row[field] is None for field in ('created_at', 'started_at', 'updated_at')))
+
+    def test_unmatched_checks_refresh_while_completed_jobs_cache_and_deny_retains_age(self):
+        now, calls = [1000], []
+        failed = raw_check(200, app=77); failed['app']['slug'] = 'external-app'
+        passed = raw_check(201, 'success', LATER, app=77); passed['app']['slug'] = 'external-app'
+        class Client:
+            denied = False
+            checks = [raw_check(conclusion='success'), failed]
+            def pages(self, route, **kwargs):
+                calls.append(route)
+                if self.denied: raise ClientError('permission_denied')
+                if '/pulls?' in route: return [{'number': 7, 'head': {'sha': SHA}}]
+                if '/actions/runs?' in route: return [raw_run(conclusion='success')] if 'created=' in route else []
+                if '/jobs?' in route: return [raw_job()]
+                return self.checks
+        client = Client(); provider = CIProvider(client, INVENTORY, clock=lambda: now[0])
+        first = provider(time.monotonic()+5).data
+        client.checks.append(passed); now[0] += 20
+        second = provider(time.monotonic()+5).data
+        self.assertTrue(first['check_rows'][0]['actionable']); self.assertFalse(second['check_rows'][0]['actionable'])
+        self.assertEqual(sum('/jobs?' in route for route in calls), 1)
+        self.assertEqual(sum('/check-runs?' in route for route in calls), 2)
+        client.denied = True; now[0] += 20
+        third = provider(time.monotonic()+5).data
+        self.assertTrue(third['repositories'][0]['stale'])
+        self.assertEqual(third['repositories'][0]['observed_at'], 1020)
+        self.assertEqual(third['check_rows'], second['check_rows'])
+
     def test_provider_accepts_check_url_repository_casing_and_keeps_enrolled_identity(self):
         job = raw_job(); job['check_run_url'] = job['check_run_url'].replace(REPO, 'OwNeR/RePo')
         class Client:
