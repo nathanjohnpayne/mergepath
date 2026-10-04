@@ -55,6 +55,9 @@ def billing_usage(payload, owner, now):
         repo = row.get("repositoryName")
         if repo in (None, ""):
             unattributed += amount
+        elif type(repo) is str and len(repo) <= 200 and REPO.fullmatch(repo):
+            key = repo
+            repositories[key] = repositories.get(key, Decimal(0)) + amount
         elif type(repo) is str and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", repo):
             key = owner + "/" + repo
             repositories[key] = repositories.get(key, Decimal(0)) + amount
@@ -81,7 +84,7 @@ def measured_coefficient(value, repo, now):
             or not 1 <= len(provenance.strip()) <= 240 or any(ord(c) < 32 for c in provenance)):
         return None
     return {"requests_per_run": requests / runs, "observed_at": observed,
-            "window_start": start, "window_end": end, "provenance": provenance}
+            "window_start": start, "window_end": end, "provenance": provenance.strip()}
 
 
 def run_rows(rows, repo, now, status=None):

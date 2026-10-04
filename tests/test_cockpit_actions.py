@@ -1,8 +1,10 @@
 """Hermetic Actions source coverage; no credential or live GitHub calls."""
 import datetime as dt
 import json
+import subprocess
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from mergepath.cockpit.actions import ActionsProvider, billing_usage, ci_observation, measured_coefficient, run_rows
@@ -61,6 +63,80 @@ class ActionsTests(unittest.TestCase):
                 billing_usage({'usageItems': [{'product': 'Actions', 'netAmount': 2}, {'product': 'Actions', 'netAmount': amount}]}, 'o', NOW)
         with self.assertRaises(ClientError):
             billing_usage({'usageItems': [{'product': 'Actions', 'net_amount': 2, 'grossAmount': 2}]}, 'o', NOW)
+
+    def test_documented_qualified_billing_identity_and_bare_fallback(self):
+        payload = {'usageItems': [
+            {'product': 'Actions', 'netAmount': 0.8, 'grossAmount': 999, 'repositoryName': 'user/example'},
+            {'product': 'Actions', 'netAmount': 0.2, 'repositoryName': 'example'},
+            {'product': 'Actions', 'netAmount': 0.4, 'repositoryName': 'other-owner/example'},
+            {'product': 'Actions', 'netAmount': 0.3}]}
+        value = billing_usage(payload, 'user', NOW)
+        self.assertEqual(value['net_amount'], 1.7)
+        self.assertEqual(value['unattributed'], 0.3)
+        self.assertEqual(value['repositories'], [
+            {'repo': 'user/example', 'net_amount': 1.0},
+            {'repo': 'other-owner/example', 'net_amount': 0.4}])
+        fake = Fake(); fake.billing = payload
+        sample = self.provider(fake, settings={'billing_owner': 'user'}).fetch(30).data
+        self.assertTrue(sample['billing']['available'])
+        self.assertEqual(sample['billing']['repositories'], value['repositories'])
+        billing_calls = [path for path, _ in fake.calls if '/settings/billing/' in path]
+        self.assertEqual(billing_calls, ['/users/user/settings/billing/usage?year=2026&month=10'])
+        self.assertTrue(all(path.startswith(f'/repos/{REPO}/') for path, _ in fake.calls if path.startswith('/repos/')))
+        self.assertFalse(any('other-owner' in path for path, _ in fake.calls))
+
+    def test_malformed_billing_repository_refuses_whole_observation(self):
+        for repository in ['user/example/extra', '/example', 'user/', 'bad owner/example',
+                           'user/example?secret', 'user/' + 'x' * 201, 17, True]:
+            with self.subTest(repository=repository), self.assertRaises(ClientError):
+                billing_usage({'usageItems': [
+                    {'product': 'Actions', 'netAmount': 2},
+                    {'product': 'Actions', 'netAmount': 1, 'repositoryName': repository}]}, 'user', NOW)
+
+    def test_measurement_provenance_unicode_codepoint_boundary(self):
+        measurement = {'repo': REPO, 'requests': 800, 'runs': 2,
+                       'window_start': NOW-600, 'window_end': NOW-100, 'observed_at': NOW-50}
+        for length in (121, 240, 241):
+            provenance = '\U0001f600' * length
+            with self.subTest(length=length):
+                value = measured_coefficient({**measurement, 'provenance': provenance}, REPO, NOW)
+                if length <= 240:
+                    self.assertEqual(value['requests_per_run'], 400)
+                    self.assertEqual(value['provenance'], provenance)
+                else:
+                    self.assertIsNone(value)
+
+    def test_padded_provenance_survives_provider_to_js_without_accepting_controls(self):
+        content = '\U0001f600' * 240
+        inner_space = '\U0001f600' * 119 + ' ' + '\U0001f600' * 120
+        cases = [(padding + content + padding, content) for padding in (' ', '\u0085', '\u2003')]
+        cases += [(' ' + inner_space + ' ', inner_space), ('\n' + content, None), ('\t' + content, None)]
+        script = ('const input=JSON.parse(require("node:fs").readFileSync(0,"utf8"));'
+                  'const card=require("./mergepath/cockpit/assets/actions.js").project(input,null,input.observed_at).cards[1];'
+                  'console.log(JSON.stringify({available:card.available,value:card.rows[0].value,detail:card.rows[0].detail}));')
+        for provenance, expected in cases:
+            with self.subTest(provenance=repr(provenance[:2])):
+                measurement = {'repo': REPO, 'requests': 800, 'runs': 2,
+                               'window_start': NOW-600, 'window_end': NOW-100,
+                               'observed_at': NOW-50, 'provenance': provenance}
+                fake = Fake(); fake.hour = [run(1), run(2)]
+                provider = self.provider(fake, settings={'measurements': {REPO: measurement}})
+                sample = provider.fetch(30).data
+                self.assertEqual(provider.settings['measurements'][REPO]['provenance'], provenance)
+                row = sample['repositories'][0]
+                output = subprocess.run(['node', '-e', script], cwd=Path(__file__).resolve().parents[1],
+                                        input=json.dumps({'data': sample, 'stale': False, 'observed_at': NOW}),
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(output.returncode, 0, output.stderr)
+                card = json.loads(output.stdout)
+                if expected is None:
+                    self.assertIsNone(row['measurement']); self.assertIsNone(row['estimated_requests'])
+                    self.assertFalse(card['available']); self.assertIn('unavailable', card['value'])
+                else:
+                    self.assertEqual(row['estimated_requests'], 800)
+                    self.assertTrue(card['available']); self.assertTrue(card['value'].startswith('est.'))
+                    self.assertEqual(row['measurement']['provenance'], expected)
+                    self.assertIn(expected, card['detail'])
 
     def test_denied_billing_independent_and_slow(self):
         f = Fake(); f.billing = ClientError('permission_denied'); f.queued = [run(1,'queued')]

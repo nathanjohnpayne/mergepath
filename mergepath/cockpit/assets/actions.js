@@ -82,7 +82,7 @@
       const measurement = row.measurement;
       const measured = measurement && num(measurement.requests_per_run) && num(measurement.observed_at)
         && now >= measurement.observed_at && now - measurement.observed_at <= 3600
-        && typeof measurement.provenance === "string" && measurement.provenance.length <= 240;
+        && typeof measurement.provenance === "string" && [...measurement.provenance].length <= 240;
       const estimate = countsValid && measured && num(row.estimated_requests) && Math.abs(row.estimated_requests-row.runs_last_hour*measurement.requests_per_run)<.001 ? row.estimated_requests : null;
       let ts = hard ? "boulder" : good && estimate !== null ? stateOf(estimate/1000) : "idle";
       const tr = {repo:row.repo, state:ts, percent:hard ? 100 : estimate === null ? null : Math.min(100,estimate/10),
