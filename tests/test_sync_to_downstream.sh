@@ -2522,4 +2522,69 @@ for status_at in 2 3; do
 done
 echo "PASS: actual engine fails closed on unavailable pre-copy and pre-push hub status"
 
+# Exercise the actual PR-create block with the unchanged verified author
+# wrapper and a closed fake gh; no auth cache/keyring/network can be reached.
+telemetry_bin="$metadata_workdir/telemetry-bin"
+telemetry_home="$metadata_workdir/telemetry-home"
+mkdir -p "$telemetry_bin" "$telemetry_home"
+cat >"$telemetry_bin/gh" <<'SH'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in
+  "api user"|"pr view") printf '%s\n' nathanjohnpayne;;
+  "pr create")
+    case "$MERGEPATH_TEST_TELEMETRY_MODE" in
+      wrong) printf '%s\n' https://github.com/example/other/pull/99;;
+      duplicate) printf '%s\n' https://github.com/example/alpha/pull/99 https://github.com/example/alpha/pull/100;;
+      mixed) printf '%s\n' https://github.com/example/alpha/pull/99 https://github.com/example/other/pull/100;;
+      malformed) printf '%s\n' https://github.com/example/alpha/pull/0;;
+      missing) printf '%s\n' 'No URL';;
+      failed) printf '%s\n' https://github.com/example/alpha/pull/99;exit 7;;
+      *) printf '%s\n' https://github.com/example/alpha/pull/99;;
+    esac;;
+  *) echo 'unexpected closed fake gh call' >&2;exit 91;;
+esac
+SH
+chmod +x "$telemetry_bin/gh"
+python3 - "$SCRIPT" "$metadata_workdir/telemetry-block.sh" <<'PY'
+from pathlib import Path
+import sys
+source=Path(sys.argv[1]).read_text()
+begin=source.index('  local pr_url\n',source.index('sync_all_open_pr()'))
+end=source.index('\n}\n',begin)
+progress=source.index('sync_progress()');progress_end=source.index('\n}\n',progress)+3
+Path(sys.argv[2]).write_text('''set -euo pipefail
+SCRIPT_VERSION=fixture;SYNC_PROGRESS_JSON=1
+consumer_name=alpha;consumer_repo=example/alpha;branch=fixture;sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;short_sha=aaaaaaa
+canonical_lines=README.md;kit_lines=;templated_lines=;override_note=;authoring_agent=codex
+sync_coderabbit_ignore_block(){ :; }
+err(){ printf '%s\\n' "$*" >&2; }
+sync_author_gh(){ /bin/bash "$MERGEPATH_TEST_ACTUAL_WRAPPER" -- gh "$@"; }
+'''+source[progress:progress_end]+'\nprobe(){\n'+source[begin:end]+'\n}\nprobe\n')
+PY
+for telemetry_mode in verified wrong duplicate mixed malformed missing failed; do
+  set +e
+  telemetry_out=$(env -u GH_TOKEN -u GITHUB_TOKEN -u OP_PREFLIGHT_REVIEWER_PAT \
+    -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
+    PATH="$telemetry_bin:$PATH" HOME="$telemetry_home" GH_CONFIG_DIR="$telemetry_home" GH_HOST=github.com \
+    OP_PREFLIGHT_AUTHOR_PAT=ghp_synthetic_fixture \
+    MERGEPATH_TEST_ACTUAL_WRAPPER="$ROOT/scripts/gh-as-author.sh" \
+    MERGEPATH_TEST_TELEMETRY_MODE="$telemetry_mode" \
+    /bin/bash "$metadata_workdir/telemetry-block.sh" 2>&1)
+  telemetry_rc=$?
+  set -e
+  if [ "$telemetry_mode" = verified ]; then
+    [ "$telemetry_rc" -eq 0 ] || fail "actual author wrapper rejected synthetic success: $telemetry_out"
+    printf '%s\n' "$telemetry_out" | grep -Fq 'gh-as-author: verified PR #99 author=nathanjohnpayne' || fail 'actual wrapper verification diagnostic absent'
+    [ "$(printf '%s\n' "$telemetry_out" | grep -c '^@@cockpit-sync')" -eq 1 ] || fail 'expected one verified result event'
+    printf '%s\n' "$telemetry_out" | grep -Fq '"kind":"result","repo":"example/alpha","value":"https://github.com/example/alpha/pull/99"' || fail 'verified wrapper URL was not emitted exactly'
+    printf '%s\n' "$telemetry_out" | grep -Fq 'opened https://github.com/example/alpha/pull/99' || fail 'legacy human output changed'
+  else
+    ! printf '%s\n' "$telemetry_out" | grep -q '^@@cockpit-sync' || fail "unverified/ambiguous URL emitted telemetry: $telemetry_mode"
+    case "$telemetry_mode" in missing|failed)
+      [ "$telemetry_rc" -ne 0 ] || fail "actual wrapper failure lost its return status: $telemetry_mode";;
+    esac
+  fi
+done
+echo "PASS: actual verified author wrapper emits only one exact repository URL result"
+
 echo "test_sync_to_downstream: PASS"

@@ -195,7 +195,10 @@ def scrub(value):
     value = re.sub(r"(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]+", "[redacted]", value)
     value = re.sub(r"(?i)(?:authorization|(?:gh|github|op_preflight)[a-z_]*token|op_preflight_[a-z_]*pat)\s*[:=]\s*\S+", "[redacted]", value)
     value = re.sub(r"https?://[^\s/@]+:[^\s/@]+@", "https://[redacted]@", value)
-    return "".join(c for c in value if c in "\t" or ord(c) >= 32)[:MAX_LINE]
+    value = "".join(c for c in value if c in "\t" or ord(c) >= 32)
+    if len(value) > MAX_LINE:
+        raise SyncError("line_limit")
+    return value
 
 
 class SyncProvider:
@@ -377,7 +380,10 @@ class SyncProvider:
             self._reap(process)
 
     def _acquire(self):
-        fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        try:
+            fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        except OSError:
+            raise SyncError("sync_busy") from None
         try:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:

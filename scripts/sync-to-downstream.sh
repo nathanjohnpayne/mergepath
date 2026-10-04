@@ -2905,8 +2905,22 @@ EOF
     return 1
   }
   printf "  ✓ %s — opened %s\n" "$consumer_name" "$pr_url"
-  if [[ "$pr_url" =~ ^https://github.com/$consumer_repo/pull/[1-9][0-9]*$ ]]; then
-    sync_progress result "$consumer_repo" "$pr_url"
+  # The verified author wrapper also writes diagnostics to stderr. Preserve
+  # that human output, but emit only one exact expected-repository URL line.
+  local result_url="" result_line result_number result_count=0
+  while IFS= read -r result_line; do
+    if [[ "$result_line" == https://github.com/*/pull/* ]]; then
+      result_number=${result_line#"https://github.com/$consumer_repo/pull/"}
+      result_count=$((result_count + 1))
+      if [[ "$result_line" == "https://github.com/$consumer_repo/pull/"* && "$result_number" =~ ^[1-9][0-9]*$ ]]; then
+        result_url=$result_line
+      else
+        result_url=""
+      fi
+    fi
+  done <<<"$pr_url"
+  if [ "$result_count" -eq 1 ] && [ -n "$result_url" ]; then
+    sync_progress result "$consumer_repo" "$result_url"
   fi
 }
 

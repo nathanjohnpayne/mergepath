@@ -107,10 +107,20 @@ if mode=='hang':
  Path({str(self.base / 'child.pid')!r}).write_text(str(child.pid))
  time.sleep(60)
 if mode=='flood':print('x'*400000);sys.exit(0)
+line_mode=mode.removeprefix('second-') if repo=='owner/two' or not mode.startswith('second-') else ''
+if line_mode.startswith('line-'):
+ _,length,stream,ending=line_mode.split('-')
+ if ending=='newline':
+  output=sys.stdout if stream=='stdout' else sys.stderr
+  output.write('x'*int(length)+'\\n');output.flush();time.sleep(.03)
 for stage in ('fetch','diff','branch','commit','PR'):
  print('@@cockpit-sync\\t'+json.dumps({{'kind':'stage','repo':repo,'value':stage}}),flush=True)
 if mode=='fail' or mode=='partial' and repo=='owner/two':sys.exit(1)
 print('@@cockpit-sync\\t'+json.dumps({{'kind':'result','repo':repo,'value':'https://github.com/'+repo+'/pull/99'}}),flush=True)
+if line_mode.startswith('line-') and ending=='eof':
+ time.sleep(.03)
+ output=sys.stdout if stream=='stdout' else sys.stderr
+ output.write('x'*int(length));output.flush()
 PY
 '''
         (self.root / "scripts/sync-to-downstream.sh").write_text(engine)
@@ -407,6 +417,44 @@ PY
             p.close()
             other.confirm('session', self.payload(other_preview))
             self.assertEqual(self.wait(other)['phase'], 'done')
+
+    def test_actual_worker_line_boundaries_for_both_streams_and_eof(self):
+        p=self.provider()
+        for stream in ('stdout','stderr'):
+            for ending in ('newline','eof'):
+                for length in (4096,4097):
+                    with self.subTest(stream=stream,ending=ending,length=length):
+                        self.mode.write_text(f'line-{length}-{stream}-{ending}')
+                        preview=self.preview(p);p.confirm('session',self.payload(preview));state=self.wait(p)
+                        if length==4096:
+                            self.assertEqual(state['run']['outcome'],'success',state)
+                            self.assertTrue(any(e.get('text')=='x'*length for e in state['run']['events']))
+                        else:
+                            self.assertNotEqual(state['run']['outcome'],'success',state)
+                            self.assertIn('line_limit',json.dumps(state))
+                            self.assertFalse(any(e.get('text','').startswith('x'*4096) for e in state['run']['events']))
+                        self.assertTrue(all(len(e['text'])<=4096 for e in state['run']['events'] if e['kind']=='log'))
+        self.mode.write_text('second-line-4097-stdout-newline')
+        preview=self.preview(p,['owner/one','owner/two']);p.confirm('session',self.payload(preview));state=self.wait(p)
+        self.assertEqual(state['run']['outcome'],'partial',state)
+        self.assertEqual([r['repo'] for r in state['run']['results']],['owner/one'])
+        self.assertIn('line_limit',json.dumps(state))
+
+    def test_unsafe_lock_open_refuses_without_consuming_or_dispatching(self):
+        p=self.provider();preview=self.preview(p)
+        target=self.base/'untouched-lock-target';target.write_text('untouched')
+        def refused():
+            with self.assertRaisesRegex(SyncError,'^sync_busy$'):p.confirm('session',self.payload(preview))
+            self.assertEqual(p.snapshot('session')['phase'],'preview')
+            self.assertEqual(p._preview['public']['preview_id'],preview['preview_id'])
+            self.assertIsNone(p._lock_fd);self.assertFalse(self.called())
+            self.assertFalse((self.base/'cockpit-sync.jsonl').exists())
+        p.lock_path.symlink_to(target);refused();p.lock_path.unlink()
+        self.assertEqual(target.read_text(),'untouched')
+        p.lock_path.mkdir();refused();p.lock_path.rmdir()
+        with mock.patch('mergepath.cockpit.sync.os.open',side_effect=PermissionError(13,'synthetic private detail')):
+            refused()
+        p.confirm('session',self.payload(preview));self.assertEqual(self.wait(p)['run']['outcome'],'success')
 
     def test_export_parser_is_data_only(self):
         for value in (b"export OP_PREFLIGHT_AUTHOR_PAT=$(evil)", b"export OP_PREFLIGHT_AUTHOR_PAT=", b"export GH_TOKEN=other",
