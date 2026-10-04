@@ -18,6 +18,7 @@ if not __package__:
 
 from mergepath.cockpit.actions import ActionsProvider, ci_observation
 from mergepath.cockpit.github import ClientError, GitHubClient
+from mergepath.cockpit.fleet import FleetProvider
 from mergepath.cockpit.inventory import load_inventory
 from mergepath.cockpit.ci import CIProvider, LogExcerptCache
 from mergepath.cockpit.prs import PRProvider
@@ -76,6 +77,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error("port must be between 0 and 65535")
+    app, fleet = None, None
     try:
         actions_settings = load_actions_settings(args.actions_settings)
         github = GitHubClient.from_environment(os.environ)
@@ -93,12 +95,25 @@ def main(argv=None):
         pr_provider = PRProvider(github, inventory, ROOT, checkout_roots={"nathanjohnpayne/mergepath": ROOT})
         app.scheduler.register("prs", pr_provider, hot_interval=15, idle_interval=120, timeout=30)
         app.register_panel("prs", "prs")
+        try:
+            fleet = FleetProvider(inventory, ROOT, github._token)
+        except (ValueError, OSError):
+            print("Fleet audits unavailable: trusted audit tools or private workspace could not be initialized.",
+                  file=sys.stderr)
+        if fleet is not None:
+            app.scheduler.register("fleet", fleet.fetch, hot_interval=1800, idle_interval=1800,
+                                   timeout=180, max_backoff=7200)
+            app.register_panel("fleet", "fleet")
         actions_provider = ActionsProvider(github, inventory, settings=actions_settings,
                                            ci_snapshot=lambda repo, now: shared_ci_snapshot(app, repo, now))
         app.scheduler.register("actions", actions_provider.fetch, hot_interval=15, idle_interval=120, timeout=30)
         app.register_panel("budget", "actions")
         server = CockpitServer(app, args.port)
     except (ClientError, ValueError, OSError):
+        if app is not None:
+            app.close()
+        if fleet is not None:
+            fleet.close()
         print("Cockpit cannot start. Check the cached reviewer credential, installed hub yq, settings JSON and loopback port.",
               file=sys.stderr)
         return 1
@@ -119,6 +134,8 @@ def main(argv=None):
         pass
     finally:
         app.close()
+        if fleet is not None:
+            fleet.close()
         server.shutdown()
         server.server_close()
         thread.join(timeout=1)

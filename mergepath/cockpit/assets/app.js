@@ -5,7 +5,37 @@
   if (typeof module === "object" && module.exports) module.exports = api;
   else {root.CockpitApp = api; api.mount();}
 })(globalThis, function (C) {
-  const unavailable = () => ({state: "idle", label: "Unavailable", hazards: [], count: null, observed: false, stale: true, observed_at: null, coverageValid: false});
+  const unavailable = () => ({state: "idle", label: "Unavailable", hazards: [], count: null, observed: false, renderable: false, stale: true, observed_at: null, coverageValid: false});
+  function frozenCopy(value) {
+    const copy = JSON.parse(JSON.stringify(value));
+    const freeze = item => {if (item && typeof item === "object") {Object.values(item).forEach(freeze); Object.freeze(item);} return item;};
+    return freeze(copy);
+  }
+  function coldEnvelope(envelope) {
+    return envelope?.data === null && envelope.observed_at === null && envelope.stale === true
+      && typeof envelope.in_flight === "boolean" && (envelope.error === null || typeof envelope.error === "string")
+      && (envelope.attempted_at === null || C.epoch(envelope.attempted_at) !== null)
+      && (envelope.retry_at === null || C.epoch(envelope.retry_at) !== null)
+      && (!envelope.in_flight || C.epoch(envelope.attempted_at) !== null);
+  }
+  function createFleetRefresh(fetcher, setTimer = setTimeout, clearTimer = clearTimeout) {
+    let flight = null;
+    return () => {
+      if (flight) return flight;
+      const abort = new AbortController(), timer = setTimer(() => abort.abort(), 10000);
+      flight = (async () => {
+        const session = await fetcher("api/session", {credentials: "same-origin", cache: "no-store", signal: abort.signal});
+        if (!session.ok) throw new Error("refresh_unavailable");
+        const value = await session.json();
+        if (typeof value?.csrf !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(value.csrf)) throw new Error("refresh_unavailable");
+        const response = await fetcher("api/fleet/refresh", {method: "POST", credentials: "same-origin", cache: "no-store",
+          headers: {"X-Cockpit-CSRF": value.csrf}, signal: abort.signal});
+        if (response.status !== 202) throw new Error("refresh_unavailable");
+      })().finally(() => {clearTimer(timer); flight = null;});
+      return flight;
+    };
+  }
+  const refreshFleet = createFleetRefresh((...args) => fetch(...args));
   function validSnapshot(value) {
     return value?.schema === "cockpit/v1" && C.count(value.revision) !== null && C.epoch(value.generated_at) !== null
       && Array.isArray(value.repositories) && value.repositories.length > 0
@@ -17,23 +47,36 @@
   }
   class PanelRegistry {
     constructor() {this.adapters = new Map();}
-    register(id, source, project, render = null) {
+    register(id, source, project, render = null, options = {}) {
       if (!C.SECTIONS.includes(id) || id === "road" || this.adapters.has(id) || typeof source !== "string" || !/^[a-z][a-z0-9_]{0,63}$/.test(source)
-          || typeof project !== "function" || (render !== null && typeof render !== "function")) throw new Error("invalid_panel_registration");
-      this.adapters.set(id, {source, project, render});
+          || typeof project !== "function" || (render !== null && typeof render !== "function")
+          || !options || typeof options !== "object" || Object.keys(options).some(key => key !== "renderPending")
+          || (options.renderPending !== undefined && typeof options.renderPending !== "boolean")
+          || (options.renderPending === true && id !== "fleet")) throw new Error("invalid_panel_registration");
+      this.adapters.set(id, {source, project, render, renderPending: options.renderPending === true});
     }
     project(snapshot, selectedRepo, now) {
       const models = {}, hazards = [], diagnostics = [], repositories = snapshot.repositories.map(item => item.repo);
+      const prsSource = this.adapters.get("prs")?.source;
+      const context = Object.freeze({prs: frozenCopy((prsSource && snapshot.sources[prsSource]) || null)});
       for (const id of C.SECTIONS.filter(section => section !== "road")) {
         const adapter = this.adapters.get(id), envelope = adapter ? snapshot.sources[adapter.source] : null;
         models[id] = unavailable();
         if (!adapter) continue;
-        if (!envelope || C.epoch(envelope.observed_at) === null || envelope.data === null || envelope.data === undefined) continue;
+        const pending = adapter.renderPending && coldEnvelope(envelope);
+        if (!pending && (!envelope || C.epoch(envelope.observed_at) === null || envelope.data === null || envelope.data === undefined)) continue;
         try {
-          const projected = adapter.project(envelope, selectedRepo, now);
+          const projected = adapter.project(envelope, selectedRepo, now, context);
           if (!projected || !C.STATES.includes(projected.state) || typeof projected.label !== "string"
               || (projected.coverageValid !== undefined && typeof projected.coverageValid !== "boolean")
               || (projected.hasObservations !== undefined && typeof projected.hasObservations !== "boolean")) throw new Error("invalid_projection");
+          if (pending) {
+            if (!["idle", "running"].includes(projected.state) || !Array.isArray(projected.hazards) || projected.hazards.length
+                || projected.count !== null || projected.hasObservations !== false || projected.coverageValid !== false) throw new Error("invalid_pending_projection");
+            models[id] = {...projected, hazards: [], count: null, renderable: true, observed: false, hasObservations: false,
+              stale: true, observed_at: null, validationValid: true, coverageValid: false};
+            continue;
+          }
           const normalized = C.normalizeHazards(projected.hazards, repositories);
           diagnostics.push(...normalized.diagnostics.map(text => `${id}: ${text}`));
           const ownedSource = normalized.hazards.filter(hazard => hazard.source === id);
@@ -44,7 +87,7 @@
           if (missingHazard) diagnostics.push(`${id}: A blocking projection has no usable owned hazard.`);
           const visible = C.filterHazards(owned, selectedRepo).map(hazard => ({...hazard, stale: hazard.stale || envelope.stale === true}));
           const validationValid = normalized.diagnostics.length === 0 && owned.length === normalized.hazards.length && !missingHazard;
-          models[id] = {...projected, hazards: visible, count: C.count(projected.count), observed: true,
+          models[id] = {...projected, hazards: visible, count: C.count(projected.count), observed: true, renderable: true,
             hasObservations: projected.hasObservations !== false,
             stale: envelope.stale === true || projected.stale === true, observed_at: envelope.observed_at,
             validationValid, coverageValid: validationValid && projected.coverageValid !== false};
@@ -173,7 +216,7 @@
     });
   }
   function renderPanelContent(parent, model, adapter, placeholder) {
-    if (adapter?.render && model.observed) {
+    if (adapter?.render && (model.observed || model.renderable === true)) {
       if (placeholder?.parentNode === parent) placeholder.remove();
       adapter.render(parent, model);
       return placeholder;
@@ -282,10 +325,13 @@
       onState: value => {const changed = connection.kind !== value.kind; connection = value; render(); if (changed) $("connection-announcement").textContent = $("connection-label").textContent + ". " + $("connection-note").textContent;}});
     const timer = setInterval(() => {
       const now = epochNow();
-      if (snapshot && Object.values(snapshot.api_budget).some(evidence => {
+      if (snapshot && (snapshot.sources.fleet?.in_flight === true || Object.values(snapshot.api_budget).some(evidence => {
         const reset = C.epoch(evidence?.reset);
         return reset !== null && renderedAt !== null && reset > renderedAt && reset <= now;
-      })) render();
+      }) || Object.values(snapshot.sources).some(envelope => {
+        const retry = C.epoch(envelope?.retry_at);
+        return retry !== null && renderedAt !== null && retry > renderedAt && retry <= now;
+      }))) render();
       else renderConnection();
     }, 1000);
     const resize = new ResizeObserver(() => {if (snapshot) render();}); resize.observe(road.strip);
@@ -293,9 +339,9 @@
     window.addEventListener("pagehide", () => {controller.stop(); clearInterval(timer); resize.disconnect();});
     window.addEventListener("pageshow", event => {if (event.persisted) window.location.reload();});
     // Later scripts register a pure projection once; the shell remains the sole connection owner.
-    registerPanel = (id, source, project, renderer) => {registry.register(id, source, project, renderer); render();};
+    registerPanel = (id, source, project, renderer, options) => {registry.register(id, source, project, renderer, options); render();};
     render(); controller.start();
   }
-  let registerPanel = (id, source, project, renderer) => registry.register(id, source, project, renderer);
-  return {validSnapshot, PanelRegistry, Connection, accountHazards, renderPanelContent, mount, registerPanel: (...args) => registerPanel(...args)};
+  let registerPanel = (id, source, project, renderer, options) => registry.register(id, source, project, renderer, options);
+  return {validSnapshot, PanelRegistry, Connection, accountHazards, renderPanelContent, createFleetRefresh, refreshFleet, mount, registerPanel: (...args) => registerPanel(...args)};
 });
