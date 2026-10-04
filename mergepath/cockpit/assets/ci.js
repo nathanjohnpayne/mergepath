@@ -22,16 +22,23 @@
         && epoch(item.retry_at) && typeof item.stale === "boolean" && (item.error === null || typeof item.error === "string"));
       repositories.set(item.repo, item);
     }
-    for (const row of data.runs) {
-      requireValid(typeof row?.key === "string" && row.key === `${row.repo}:${row.id}:${row.pr ?? "none"}` && !keys.has(row.key)
-        && repositories.has(row.repo) && decimal(row.id) && decimal(row.attempt) && decimal(row.workflow_id)
+    requireValid(data.check_rows === undefined || Array.isArray(data.check_rows));
+    requireValid(data.runs.every(row => row?.kind !== "checks") && (data.check_rows ?? []).every(row => row?.kind === "checks"));
+    for (const row of [...data.runs, ...(data.check_rows ?? [])]) {
+      const checksOnly = row?.kind === "checks";
+      requireValid(checksOnly || row?.kind === undefined || row.kind === "workflow");
+      requireValid(typeof row?.key === "string" && row.key === (checksOnly ? `${row.repo}:checks:${row.sha}:${row.pr ?? "none"}` : `${row.repo}:${row.id}:${row.pr ?? "none"}`) && !keys.has(row.key)
+        && repositories.has(row.repo) && (checksOnly ? row.id === null && row.attempt === null && row.workflow_id === null : decimal(row.id) && decimal(row.attempt) && decimal(row.workflow_id))
         && (row.pr === null || decimal(row.pr)) && typeof row.sha === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(row.sha)
         && typeof row.name === "string" && codePointLength(row.name) <= 1000 && status(row.status) && conclusion(row.conclusion)
         && [null, true, false].includes(row.current_head) && typeof row.actionable === "boolean" && typeof row.superseded === "boolean"
         && typeof row.check_evidence_unknown === "boolean" && [null, "bump", "boulder"].includes(row.severity)
         && (row.reason === null || typeof row.reason === "string") && [row.created_at, row.started_at, row.updated_at].every(epoch)
-        && row.jobs_scope === "all-attempts" && Array.isArray(row.jobs) && Array.isArray(row.checks) && Array.isArray(row.diagnostics)
-        && (row.rerun_command === null || row.rerun_command === `gh run rerun ${row.id} --failed --repo ${row.repo}`)
+        && row.jobs_scope === (checksOnly ? "none" : "all-attempts") && Array.isArray(row.jobs) && Array.isArray(row.checks) && Array.isArray(row.diagnostics)
+        && (!checksOnly || row.jobs.length === 0 && (row.checks.length > 0 || row.current_head === true && row.pr !== null
+          && row.status === "unknown" && row.conclusion === null && row.check_evidence_unknown && !row.actionable
+          && !row.superseded && row.severity === null && row.diagnostics.length === 0))
+        && (checksOnly ? row.rerun_command === null : row.rerun_command === null || row.rerun_command === `gh run rerun ${row.id} --failed --repo ${row.repo}`)
         && (!row.actionable || row.current_head === true && row.severity !== null));
       keys.add(row.key);
       const jobIds = new Set();
@@ -61,31 +68,40 @@
     return repositories;
   }
   function runTone(row) {
+    if (row.kind === "checks" && row.checks.length === 0) return {state: "idle", label: "No check observations"};
     if (row.actionable) return {state: row.severity, label: row.severity === "boulder" ? row.reason === "Observed installation rate-limit failure" ? "Token exhausted" : "Not retryable" : "Stale failure"};
-    if (row.superseded) return {state: "idle", label: "Failed · superseded"};
+    if (row.superseded && !(row.kind === "checks" && live.includes(row.status))) return {state: "idle", label: "Failed · superseded"};
     if (live.includes(row.status)) return {state: "running", label: row.status === "in_progress" ? "Running" : "Queued"};
     if (failures.includes(row.conclusion)) return {state: "idle", label: row.current_head === false ? "Failed · old HEAD" : row.current_head === null ? "Failed · HEAD unknown" : "Failed"};
-    if (row.conclusion === "success") return {state: "clear", label: "Passed"};
+    if (row.kind === "checks" && row.current_head !== true) return {state: "idle", label: row.current_head === false ? "Checks · old HEAD" : "Checks · HEAD unknown"};
+    if (row.conclusion === "success") return row.current_head === true ? {state: "clear", label: "Passed"}
+      : {state: "idle", label: row.current_head === false ? "Passed · old HEAD" : "Passed · HEAD unknown"};
     return {state: "idle", label: row.conclusion ? row.conclusion[0].toUpperCase() + row.conclusion.slice(1) : "Unknown"};
   }
   function project(envelope, selectedRepo, now) {
     if (!envelope?.data) return {state: "idle", label: "CI unavailable", hazards: [], count: null, rows: [], repositories: [], stale: true, now};
     const byRepo = validate(envelope.data), repositories = [...byRepo.values()].filter(item => selectedRepo === null || item.repo === selectedRepo);
     const stale = envelope.stale === true || repositories.some(item => item.stale || item.observed_at === null);
-    const rows = envelope.data.runs.filter(row => selectedRepo === null || row.repo === selectedRepo);
-    const hazards = envelope.data.runs.filter(row => row.actionable).map(row => {
+    const allRows = [...envelope.data.runs, ...(envelope.data.check_rows ?? [])];
+    const rows = allRows.filter(row => selectedRepo === null || row.repo === selectedRepo);
+    const hazards = allRows.filter(row => row.actionable).map(row => {
       const observation = byRepo.get(row.repo);
       return {id: `ci:${row.key}`, source: "ci", section: "ci", repo: row.repo, state: row.severity,
         title: `${row.repo.split("/")[1]}${row.pr ? ` #${row.pr}` : ""}: ${row.reason}`.slice(0, 240),
-        detail: `Run ${row.id} · ${row.sha}. ${row.rerun_command ?? "Rerun command unavailable"}`,
+        detail: row.kind === "checks" ? `Check runs · ${row.sha}. No Actions rerun for these checks.` : `Run ${row.id} · ${row.sha}. ${row.rerun_command ?? "Rerun command unavailable"}`,
         timing: {kind: "now"}, observed_at: observation.observed_at, stale: envelope.stale === true || observation.stale};
     });
     const running = rows.filter(row => live.includes(row.status)).length, attention = rows.filter(row => row.actionable).length;
-    const unknown = rows.some(row => row.check_evidence_unknown || failures.includes(row.conclusion) && row.current_head === null)
+    const unknown = rows.some(row => row.check_evidence_unknown || failures.includes(row.conclusion) && row.current_head === null || row.kind === "checks" && row.current_head === null)
       || repositories.some(item => item.observed_at === null);
+    const terminalPass = ["success", "neutral", "skipped"];
+    const uncleared = rows.some(row => row.current_head === true && !live.includes(row.status)
+      && (row.checks.some(check => check.conclusion === "cancelled") || !row.superseded && (row.kind === "checks"
+        ? !row.checks.length || row.checks.some(check => check.status !== "completed" || !terminalPass.includes(check.conclusion))
+        : row.status !== "completed" || !terminalPass.includes(row.conclusion))));
     const state = C.worstState(rows.map(row => runTone(row).state));
-    return {state: state === "clear" && unknown ? "idle" : state,
-      label: `${running} running · ${attention} need attention · ${rows.length} recent${stale ? " · coverage stale or unavailable" : ""}${unknown ? " · current-check evidence unavailable" : ""}`,
+    return {state: state === "clear" && (unknown || uncleared) ? "idle" : state,
+      label: `${running} running · ${attention} need attention · ${rows.length} recent${stale ? " · coverage stale or unavailable" : ""}${unknown ? " · current-check evidence unavailable" : ""}${uncleared ? " · current CI success not established" : ""}`,
       hazards, count: null, rows, repositories, stale, hasObservations: repositories.some(item => item.observed_at !== null), sourceStale: envelope.stale === true, recentSeconds: envelope.data.recent_seconds, now};
   }
   function elapsed(start, end, now) {
@@ -136,8 +152,8 @@
       this.ref.textContent = `${row.repo.split("/")[1]}${row.pr ? ` #${row.pr}` : " · PR unknown"} · ${row.sha.slice(0, 7)}${this.stale ? " · stale" : ""}`;
       this.badge.className = `b b-${C.tone(tone.state)}`; this.badge.textContent = tone.label;
       const completed = row.status === "completed" ? Math.max(...row.jobs.map(job => job.completed_at ?? -1)) : null;
-      this.duration.textContent = completed === -Infinity || completed === -1 ? "Duration unknown" : elapsed(row.started_at ?? row.created_at, completed, model.now);
-      if (row.status !== "in_progress" && row.status !== "completed") this.duration.textContent = `queued ${elapsed(row.created_at, null, model.now)}`;
+      this.duration.textContent = row.kind === "checks" ? `${row.checks.length} checks` : completed === -Infinity || completed === -1 ? "Duration unknown" : elapsed(row.started_at ?? row.created_at, completed, model.now);
+      if (row.kind !== "checks" && row.status !== "in_progress" && row.status !== "completed") this.duration.textContent = `queued ${elapsed(row.created_at, null, model.now)}`;
       while (this.pips.children.length > row.jobs.length) this.pips.lastChild.remove();
       row.jobs.forEach((job, index) => {
         let pip = this.pips.children[index]; if (!pip) {pip = element("span", "ci-pip"); this.pips.append(pip);}
@@ -180,8 +196,12 @@
           stepView.button.textContent = this.stale ? "Refresh evidence to read logs" : "Show FAIL excerpt";
         }
       }
-      if (!this.empty) {this.empty = element("p", "ci-empty", "No jobs observed for this run."); this.body.append(this.empty);}
+      if (!this.empty) {this.empty = element("p", "ci-empty"); this.body.append(this.empty);}
+      this.empty.textContent = row.kind === "checks" ? row.checks.length === 0 ? "No workflow or check runs observed for this open HEAD." : "No observed Actions job for these checks." : "No jobs observed for this run.";
       this.empty.hidden = row.jobs.length > 0;
+      if (!this.checks) {this.checks = element("div", "ci-job ci-diagnostics mono"); this.body.append(this.checks);}
+      this.checks.hidden = row.kind !== "checks";
+      this.checks.textContent = row.kind === "checks" ? row.checks.map(check => `check ${check.id} · ${check.name} · ${check.conclusion ?? check.status} · ${check.producer ?? "producer unknown"} · ${elapsed(check.started_at, check.completed_at, model.now)}${check.superseded_by ? ` · superseded by check ${check.superseded_by}` : ""}`).join("\n") : "";
       if (!this.diagnostics) {this.diagnostics = element("div", "ci-diagnostics"); this.body.append(this.diagnostics);}
       this.diagnostics.textContent = row.diagnostics.map(d => `${d.source} · check ${d.check_id}: ${d.text}`).join("\n");
       this.disclose(this.owner.open === row.key);

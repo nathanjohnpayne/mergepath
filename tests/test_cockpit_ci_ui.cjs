@@ -1,11 +1,19 @@
 "use strict";
 const test = require("node:test"), assert = require("node:assert/strict"), fs = require("node:fs"), cp = require("node:child_process");
 const CI = require("../mergepath/cockpit/assets/ci.js"), C = require("../mergepath/cockpit/assets/components.js");
-const pythonFixture = expression => JSON.parse(cp.execFileSync("python3", ["-c", `import sys,json;sys.path.insert(0,'tests');import test_cockpit_ci as ci;print(json.dumps(${expression}))`], {cwd: require("node:path").resolve(__dirname,".."), timeout: 2000}));
-const fixture = () => pythonFixture("ci.model()");
+const fixtures = JSON.parse(cp.execFileSync("python3", ["-B", "-c", "import sys,json;sys.path.insert(0,'tests');import test_cockpit_ci as ci;print(json.dumps(ci.browser_fixtures()))"], {cwd: require("node:path").resolve(__dirname,".."), timeout: 10000}));
+const pythonFixture = key => {assert.ok(Object.hasOwn(fixtures, key), `unknown Python fixture: ${key}`); return structuredClone(fixtures[key]);};
+const fixture = () => pythonFixture("model");
 const envelope = data => ({data, observed_at: 1000, stale: false});
+test("Batched Python fixtures return independent nested payloads for every case", () => {
+  const original = fixture(), changed = fixture();
+  changed.runs[0].name = "mutated"; changed.runs[0].jobs[0].steps.length = 0;
+  assert.deepEqual(fixture(), original);
+  const external = pythonFixture("external:False"); external.data.check_rows[0].checks[0].producer = null;
+  assert.equal(pythonFixture("external:False").data.check_rows[0].checks[0].producer, "app:77");
+});
 for (const field of ["name", "diagnostic", "excerpt"]) test(`Python Unicode ${field} limit round-trips through browser validation`, () => {
-  const {data, excerpt} = pythonFixture("ci.unicode_model_and_excerpt()");
+  const {data, excerpt} = pythonFixture("unicode");
   if (field === "name") {
     data.runs[0].diagnostics = [];
     assert.equal(CI.project(envelope(data), null, 1001).rows[0].name, "🚀".repeat(1000));
@@ -23,6 +31,121 @@ for (const field of ["name", "diagnostic", "excerpt"]) test(`Python Unicode ${fi
     excerpt.lines[0] += "🚀"; assert.match(CI.excerptText(excerpt), /invalid response/);
     excerpt.lines = ["FAIL:" + "a".repeat(995)]; assert.ok(CI.excerptText(excerpt).includes(excerpt.lines[0]));
   }
+});
+for (const withActions of [true, false]) test(`Provider external check failure reaches browser projection; Actions=${withActions}`, () => {
+  const {data} = pythonFixture(`external:${withActions ? "True" : "False"}`);
+  const model = CI.project(envelope(data), null, 1001);
+  assert.equal(model.state, "bump"); assert.equal(model.hazards.length, 1);
+  assert.equal(C.normalizeHazards(model.hazards, ["owner/repo"]).diagnostics.length, 0);
+  const retained = CI.project({...envelope(data),stale:true}, null, 1010);
+  assert.equal(retained.hazards[0].stale, true); assert.equal(retained.hazards[0].observed_at, 1000);
+  const row = model.rows.find(row => row.checks.some(check => check.id === "200"));
+  assert.equal(row.current_head, true); assert.equal(row.pr, "7"); assert.equal(row.rerun_command, null);
+  assert.equal(row.checks[0].producer, "app:77"); assert.equal(row.diagnostics[0].source, "check-run output");
+});
+test("Unknown check producer or Actions lineage remains actionable beside passing workflow", () => {
+  for (const unknownApp of [true, false]) {
+    const {data} = pythonFixture(`unknown:${unknownApp ? "True" : "False"}`);
+    const model = CI.project(envelope(data), null, 1001);
+    assert.equal(model.state, "bump"); assert.equal(model.hazards.length, 1);
+    assert.equal(data.check_rows[0].checks[0].superseded_by, null);
+  }
+});
+test("Workflow with empty PR metadata projects current failure from independently observed open HEAD", () => {
+  const {data} = pythonFixture("workflow-no-pr");
+  const model = CI.project(envelope(data), null, 1001);
+  assert.equal(model.state, "bump"); assert.equal(model.hazards.length, 1);
+  assert.equal(model.rows[0].pr, "7"); assert.equal(model.rows[0].current_head, true);
+  assert.equal(model.rows[0].key, "owner/repo:10:7"); assert.equal(data.check_rows.length, 0);
+  assert.ok(model.hazards[0].title.includes("#7"));
+});
+test("Successful workflow history clears only with independently observed current HEAD", () => {
+  for (const [key, current, label] of [["current", true, "Passed"],
+    ["old", false, "Passed · old HEAD"], ["closed", null, "Passed · HEAD unknown"],
+    ["unattached", null, "Passed · HEAD unknown"]]) {
+    const {data} = pythonFixture(`passed:${key}`);
+    const model = CI.project(envelope(data), null, 1001);
+    assert.equal(model.rows[0].current_head, current);
+    assert.deepEqual(CI.runTone(model.rows[0]), {state:current === true ? "clear" : "idle", label});
+    assert.equal(model.state, current === true ? "clear" : "idle");
+    assert.equal(model.hazards.length, 0); assert.equal(model.stale, false);
+    assert.equal(model.rows.filter(row => row.kind !== "checks").length, 1);
+    assert.equal(data.check_rows.length, key === "old" ? 1 : 0);
+    if (current !== true) {
+      const fresh = pythonFixture("passed:current").data.runs[0];
+      fresh.id = "11"; fresh.key = `${fresh.repo}:11:${fresh.pr}`;
+      fresh.sha = data.check_rows[0]?.sha ?? fresh.sha;
+      for (const check of fresh.checks) check.sha = fresh.sha;
+      const check_rows = data.check_rows.filter(row => row.pr !== fresh.pr || row.sha !== fresh.sha);
+      assert.equal(CI.project(envelope({...data,runs:[...data.runs,fresh],check_rows}), null, 1001).state, "clear");
+    }
+  }
+});
+test("Check-only pending or unavailable evidence cannot project a clear state", () => {
+  for (const [status, expected] of [["queued","running"],["in_progress","running"],["completed","idle"],["unknown","idle"]]) {
+    const {data} = pythonFixture(`pending:${status}`);
+    assert.equal(CI.project(envelope(data), null, 1001).state, expected);
+  }
+  const {data} = pythonFixture("no-head");
+  assert.equal(CI.project(envelope(data), null, 1001).state, "idle");
+  assert.equal(CI.project(envelope(data), null, 1001).hazards.length, 0);
+});
+test("Every observed open HEAD retains unknown coverage when no workflows or checks exist", () => {
+  for (const kind of ["uncovered", "uncovered-only"]) {
+    const {data} = pythonFixture(`coverage:${kind}`), model = CI.project(envelope(data), null, 1001);
+    assert.equal(model.state, "idle"); assert.equal(model.hazards.length, 0); assert.equal(model.stale, false);
+    const markers = model.rows.filter(row => row.kind === "checks" && row.checks.length === 0);
+    assert.equal(markers.length, kind === "uncovered" ? 1 : 2);
+    for (const row of markers) {
+      assert.equal(row.current_head, true); assert.equal(row.check_evidence_unknown, true);
+      assert.deepEqual(CI.runTone(row), {state:"idle", label:"No check observations"});
+      assert.equal(row.id, null); assert.equal(row.rerun_command, null); assert.deepEqual(row.jobs, []);
+    }
+  }
+});
+test("Current cancellation blocks only otherwise-clear selected coverage", () => {
+  for (const [kind, expected] of [["cancelled","idle"],["check-cancelled","idle"],["old-cancelled","clear"],
+    ["all-pass","clear"],["neutral","clear"],["skipped","clear"],["stale","idle"],["unknown-completion","idle"],
+    ["check-neutral","clear"],["check-skipped","clear"],["check-stale","idle"],["check-unknown-completion","idle"],
+    ["unknown-status","idle"],
+    ["running-cancelled","running"],["failed-cancelled","bump"]]) {
+    const {data} = pythonFixture(`coverage:${kind}`);
+    assert.equal(CI.project(envelope(data), null, 1001).state, expected, kind);
+  }
+  const {data} = pythonFixture("coverage:cancelled"), cancelled = data.runs[1];
+  cancelled.repo = "owner/other"; cancelled.key = `owner/other:${cancelled.id}:${cancelled.pr}`;
+  for (const check of cancelled.checks) check.repo = cancelled.repo;
+  data.repositories.push({...data.repositories[0],repo:cancelled.repo});
+  assert.equal(CI.project(envelope(data), "owner/repo", 1001).state, "clear");
+  assert.equal(CI.project(envelope(data), "owner/other", 1001).state, "idle");
+  assert.equal(CI.project(envelope(data), null, 1001).state, "idle");
+});
+test("Empty check coverage markers reject invented success or failure evidence", () => {
+  const {data} = pythonFixture("coverage:uncovered-only"), marker = data.check_rows[0];
+  for (const mutation of [{status:"completed"},{conclusion:"success"},{current_head:false},{pr:null},
+    {check_evidence_unknown:false},{actionable:true},{superseded:true},{severity:"bump"},
+    {diagnostics:[{text:"invented failure",source:"check-run output",check_id:"99"}]}]) {
+    const row = {...marker,...mutation}; row.key = `${row.repo}:checks:${row.sha}:${row.pr ?? "none"}`;
+    assert.throws(() => CI.validate({...data,check_rows:[row]}));
+  }
+});
+for (const withActions of [true, false]) for (const status of ["queued", "in_progress"]) test(`Superseded external failure retains independent ${status} check tone; Actions=${withActions}`, () => {
+  const {data, hot} = pythonFixture(`mixed:${withActions ? "True" : "False"}:${status}`);
+  const model = CI.project(envelope(data), null, 1001), row = data.check_rows[0];
+  assert.equal(hot, true); assert.equal(row.status, status); assert.equal(row.superseded, true);
+  assert.equal(row.checks[0].superseded_by, "201"); assert.equal(row.checks[2].status, status);
+  assert.equal(model.state, "running"); assert.equal(model.hazards.length, 0);
+  assert.deepEqual(CI.runTone(row), {state:"running", label:status === "in_progress" ? "Running" : "Queued"});
+});
+test("Check rows reject fabricated Actions identities, jobs and commands", () => {
+  const {data} = pythonFixture("external:False");
+  const row = data.check_rows[0];
+  for (const mutation of [{id:"200"},{attempt:"1"},{workflow_id:"9"},{jobs_scope:"all-attempts"},
+    {rerun_command:"gh run rerun 200 --failed --repo owner/repo"},{jobs:fixture().runs[0].jobs}]) {
+    assert.throws(() => CI.validate({...data, check_rows:[{...row,...mutation}]}));
+  }
+  assert.throws(() => CI.validate({...data,runs:[row],check_rows:[]}));
+  assert.throws(() => CI.validate({...data,check_rows:[fixture().runs[0]]}));
 });
 test("Python contract and exact opaque identities survive browser JSON parsing", () => {
   const data = fixture(), row = data.runs[0]; row.id = "900719925474099312345"; row.pr = "900719925474099312346";
@@ -89,6 +212,33 @@ class Node {
   focus(){document.activeElement=this;}
 }
 function dom(){global.document={createElement:tag=>new Node(tag),activeElement:null};return new Node("div");}
+test("Unknown open-HEAD marker uses honest copy and preserves disclosure when checks arrive", () => {
+  const parent = dom(), {data} = pythonFixture("coverage:uncovered-only");
+  const view = new CI.CIView(parent, () => assert.fail("unknown coverage cannot request logs"));
+  view.update(CI.project(envelope(data), null, 1001));
+  const key = data.check_rows[0].key, row = view.rows.get(key), button = row.button;
+  view.toggle(key); button.focus();
+  assert.ok(parent.textContent.includes("No check observations"));
+  assert.ok(parent.textContent.includes("No workflow or check runs observed for this open HEAD."));
+  assert.ok(!parent.textContent.includes("Failed run")); assert.ok(!parent.textContent.includes("gh run rerun"));
+  assert.equal(row.jobs.size, 0); assert.equal(row.command.hidden, true);
+  view.update(CI.project(envelope(pythonFixture("external:False").data), null, 1002));
+  assert.equal(view.rows.get(key).button, button); assert.equal(document.activeElement, button);
+  assert.equal(row.body.hidden, false); assert.ok(parent.textContent.includes("External gate failed"));
+});
+test("Unmatched checks render literal names, producer and diagnostic without Actions logs or rerun", () => {
+  const {data} = pythonFixture("external:False");
+  const parent = dom(), view = new CI.CIView(parent, () => assert.fail("unexpected fetch"));
+  const check = data.check_rows[0].checks[0]; check.name = "<img onerror=evil()>";
+  const model = CI.project(envelope(data), null, 1001); view.update(model); view.toggle(model.rows[0].key);
+  const rendered = view.rows.get(model.rows[0].key);
+  assert.ok(parent.textContent.includes("<img onerror=evil()>")); assert.ok(parent.textContent.includes("app:77"));
+  assert.ok(parent.textContent.includes("External gate failed; check-run diagnostic"));
+  assert.ok(parent.textContent.includes("check-run output · check 200"));
+  assert.equal(rendered.command.hidden, true); assert.equal(rendered.jobs.size, 0);
+  assert.ok(!parent.textContent.includes("gh run rerun")); assert.ok(!parent.textContent.includes("Show FAIL excerpt"));
+  assert.ok(!model.hazards[0].detail.includes("Run null"));
+});
 test("renderer restores stable disclosed content after the shell replaces it with an invalid-data placeholder", () => {
   const parent=dom(), data=fixture(), render=CI.renderer(()=>assert.fail("unexpected fetch"));
   render(parent,CI.project(envelope(data),null,1001));
