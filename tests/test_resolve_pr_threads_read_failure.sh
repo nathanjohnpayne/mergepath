@@ -184,6 +184,113 @@ cls_rc=$?
   && ok "graphql_ceiling_hit matches the proxy phrase and nothing else" \
   || bad "graphql_ceiling_hit misclassified (case $cls_rc)"
 
+# The proxy's later wording (observed 2026-10-04) is the same ceiling.
+UNAVAILABLE_MSG='{"message":"GitHub GraphQL is not available from Claude Code sessions; use the REST API (gh api repos/{owner}/{repo}/...). For review threads use the CCR routes on api.github.com."}'
+(
+  . "$ROOT/scripts/lib/graphql-ceiling.sh"
+  graphql_ceiling_hit "$UNAVAILABLE_MSG" || exit 11
+  graphql_ceiling_hit 'gh: GraphQL: Could not resolve to a Repository (HTTP 200)' && exit 12
+  # A wording not seen yet is still the proxy when its body points at
+  # Anthropic's documentation; GitHub's own errors point at docs.github.com.
+  graphql_ceiling_hit '{"message":"Some future proxy wording","documentation_url":"https://docs.anthropic.com/en/docs/claude-code/github-actions"}' || exit 13
+  graphql_ceiling_hit '{"message":"Resource not accessible by integration","documentation_url":"https://docs.github.com/graphql"}' && exit 14
+  # Pretty-printed JSON spaces the colon; the provenance match must not depend on it.
+  graphql_ceiling_hit '{"message":"Some future proxy wording", "documentation_url": "https://docs.anthropic.com/en/docs/claude-code/github-actions"}' || exit 15
+  graphql_ceiling_hit "$(printf '{\n  "message": "Some future proxy wording",\n  "documentation_url" :  "https://docs.anthropic.com/x"\n}')" || exit 16
+  graphql_ceiling_hit '{"message":"Nope", "documentation_url": "https://docs.github.com/graphql"}' && exit 17
+  graphql_ceiling_hit '{"documentation_url":"https://docsXanthropicYcom/"}' && exit 18
+  exit 0
+)
+cls2_rc=$?
+[ "$cls2_rc" -eq 0 ] \
+  && ok "graphql_ceiling_hit matches the proxy's no-GraphQL wording, and any refusal carrying the proxy's documentation URL, but not GitHub's own errors" \
+  || bad "graphql_ceiling_hit misclassified (case $cls2_rc)"
+u_rc=$(ceiling_run "gh: GitHub GraphQL is not available from Claude Code sessions; use the REST API (gh api repos/{owner}/{repo}/...). (HTTP 403)")
+[ "$u_rc" = "6" ] \
+  && ok "--list with the no-GraphQL wording and no proxy thread route: exits 6 (ceiling)" \
+  || bad "no-GraphQL wording without a route: exited $u_rc, expected 6; output: $(cat "$STUB_DIR/ceiling.out")"
+
+# --list through the proxy's REST thread route (reads only). The route gives
+# resolution state and comment ids; the REST review-comment list gives author
+# and body, and the two must describe the same threads or nothing is listed.
+route_run() { # <route json> <comments json|FAIL> [args...] -> echoes rc; output in $STUB_DIR/route.out
+  local route="$1" comments="$2"; shift 2
+  printf '%s' "$route" >"$STUB_DIR/route.json"
+  printf '%s' "$comments" >"$STUB_DIR/comments.json"
+  cat >"$STUB_DIR/gh" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$STUB_DIR/route.calls"
+case "\$*" in
+  *graphql*) echo '$UNAVAILABLE_MSG'; echo 'gh: HTTP 403' >&2; exit 1 ;;
+  *"repo view"*) echo 'gh: GraphQL refused (HTTP 403)' >&2; exit 1 ;;
+  *ccr/review_threads*) cat "$STUB_DIR/route.json"; exit 0 ;;
+  *"/comments"*) if grep -qx FAIL "$STUB_DIR/comments.json"; then echo 'gh: HTTP 502' >&2; exit 1; fi; cat "$STUB_DIR/comments.json"; exit 0 ;;
+esac
+echo '{}'
+STUB
+  chmod +x "$STUB_DIR/gh"
+  : >"$STUB_DIR/route.calls"
+  ( cd "${ROUTE_CWD:-$ROOT}" \
+    && PATH="$STUB_DIR:$PATH" GH_RETRY_BACKOFF_SECONDS=0 GH_RETRY_ATTEMPTS=2 \
+       OP_PREFLIGHT_REVIEWER_PAT=stub-token RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+       bounded 60 bash "$SCRIPT" 999 "$@" ) >"$STUB_DIR/route.out" 2>&1
+  echo $?
+}
+ROUTE_TWO='[{"resolved":false,"outdated":false,"path":"a.sh","line":3,"comment_ids":[11,12]},{"resolved":true,"outdated":true,"path":"b.sh","line":null,"comment_ids":[21]}]'
+COMMENTS_TWO='[{"id":11,"in_reply_to_id":null,"user":{"login":"coderabbitai[bot]"},"path":"a.sh","body":"UNIQUEFINDING91c"},{"id":12,"in_reply_to_id":11,"user":{"login":"nathanpayne-claude"},"path":"a.sh","body":"reply"},{"id":21,"in_reply_to_id":null,"user":{"login":"chatgpt-codex-connector[bot]"},"path":"b.sh","body":"resolved one"}]'
+
+r_rc=$(route_run "$ROUTE_TWO" "$COMMENTS_TWO" --repo owner/name --list)
+r_out="$(cat "$STUB_DIR/route.out")"
+if [ "$r_rc" = "3" ] && grep -q "Unresolved threads on owner/name#999: 1 (read through the cloud proxy's REST thread route)" <<<"$r_out" \
+   && grep -q "\[coderabbitai\[bot\]\] a.sh" <<<"$r_out" && grep -q UNIQUEFINDING91c <<<"$r_out" \
+   && ! grep -q "resolved one" <<<"$r_out"; then
+  ok "--list at the ceiling: unresolved threads listed from the proxy's REST route (exit 3), resolved ones omitted"
+else
+  bad "--list via route: rc=$r_rc output: $r_out"
+fi
+if grep -q "ccr/review_threads" "$STUB_DIR/route.calls" \
+   && ! grep -qE -- '(^| )(-X|--method)( |$)|ccr/comments/|resolveReviewThread\(input' "$STUB_DIR/route.calls"; then
+  ok "--list via route: reads only (no resolve call, no write method)"
+else
+  bad "--list via route made an unexpected call: $(cat "$STUB_DIR/route.calls")"
+fi
+
+r_rc=$(route_run '[{"resolved":true,"outdated":false,"path":"a.sh","line":3,"comment_ids":[11,12]},{"resolved":true,"outdated":true,"path":"b.sh","line":null,"comment_ids":[21]}]' "$COMMENTS_TWO" --repo owner/name --list)
+[ "$r_rc" = "0" ] && grep -q "No unresolved threads on PR #999 (read through the cloud proxy's REST thread route)" "$STUB_DIR/route.out" \
+  && ok "--list via route: every thread resolved exits 0" \
+  || bad "--list via route, all resolved: rc=$r_rc output: $(cat "$STUB_DIR/route.out")"
+
+# The route drops the unresolved thread: a root comment no route thread names.
+r_rc=$(route_run '[{"resolved":true,"outdated":true,"path":"b.sh","line":null,"comment_ids":[21]}]' "$COMMENTS_TWO" --repo owner/name --list)
+[ "$r_rc" = "2" ] && grep -q "disagree" "$STUB_DIR/route.out" && ! grep -q "No unresolved threads" "$STUB_DIR/route.out" \
+  && ok "--list via route: a thread missing from the route fails closed (exit 2), never 'no unresolved threads'" \
+  || bad "--list via route, truncated route: rc=$r_rc output: $(cat "$STUB_DIR/route.out")"
+
+r_rc=$(route_run "$ROUTE_TWO" FAIL --repo owner/name --list)
+[ "$r_rc" = "2" ] && ! grep -q "No unresolved threads" "$STUB_DIR/route.out" \
+  && ok "--list via route: unreadable review comments fail closed (exit 2)" \
+  || bad "--list via route, comments unreadable: rc=$r_rc output: $(cat "$STUB_DIR/route.out")"
+
+r_rc=$(route_run "$ROUTE_TWO" "$COMMENTS_TWO" --repo owner/name --auto-resolve-bots)
+[ "$r_rc" = "6" ] && ! grep -q "ccr/review_threads" "$STUB_DIR/route.calls" \
+  && ok "a resolve mode at the ceiling still exits 6 and never uses the proxy route" \
+  || bad "resolve mode with a route available: rc=$r_rc calls: $(cat "$STUB_DIR/route.calls")"
+
+# Without --repo, `gh repo view` is GraphQL and refused; the github.com origin
+# remote names the repository instead.
+ORIGIN_DIR="$STUB_DIR/origin-repo"
+mkdir -p "$ORIGIN_DIR" && git -C "$ORIGIN_DIR" init -q \
+  && git -C "$ORIGIN_DIR" remote add origin https://github.com/acme/widgets.git
+r_rc=$(ROUTE_CWD="$ORIGIN_DIR" route_run "$ROUTE_TWO" "$COMMENTS_TWO" --list)
+[ "$r_rc" = "3" ] && grep -q "repos/acme/widgets/pulls/999/ccr/review_threads" "$STUB_DIR/route.calls" \
+  && ok "no --repo and gh repo view refused: the repository comes from the github.com origin remote" \
+  || bad "origin fallback: rc=$r_rc calls: $(cat "$STUB_DIR/route.calls") output: $(cat "$STUB_DIR/route.out")"
+git -C "$ORIGIN_DIR" remote set-url origin https://example.com/acme/widgets.git
+r_rc=$(ROUTE_CWD="$ORIGIN_DIR" route_run "$ROUTE_TWO" "$COMMENTS_TWO" --list)
+[ "$r_rc" = "2" ] && grep -q "Could not resolve repo" "$STUB_DIR/route.out" \
+  && ok "a non-github.com origin is not read as the repository" \
+  || bad "non-github origin: rc=$r_rc output: $(cat "$STUB_DIR/route.out")"
+
 # A refusal raised inside nested command substitutions (the per-thread
 # comment refetch runs two levels down) must still end the run with 6, not
 # collapse into an ordinary "pagination failed" (Codex P2 on #1529).

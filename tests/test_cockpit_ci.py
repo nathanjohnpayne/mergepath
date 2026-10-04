@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mergepath.cockpit.ci import (CIProvider, LogExcerptCache, extract_fail_lines,
                                  group_runs, normalize_check, normalize_job, supersede)
-from mergepath.cockpit.github import ClientError, GitHubClient, Response, copy_json_tree
+from mergepath.cockpit.github import ClientError, GitHubClient, MAX_BODY, Response, copy_json_tree
 from mergepath.cockpit.inventory import Repository
 
 REPO = 'owner/repo'
@@ -72,6 +72,106 @@ def unicode_model_and_excerpt():
                               [normalize_check(REPO, check, {})], {'7': SHA})
     data = model(); data.update(runs=rows, groups=groups)
     return {'data': data, 'excerpt': extract_fail_lines(('FAIL:' + '🚀' * 1000).encode(), {})}
+
+
+def unmatched_checks_fixture(with_actions=True, checks=None, head=SHA, now=1000, run_prs=None, heads=None):
+    run = raw_run(conclusion='success')
+    if run_prs is not None:
+        run['pull_requests'] = run_prs
+    heads = heads if heads is not None else ({'7': head} if head is not None else {})
+    job = raw_job(); job['conclusion'] = 'success'; job['steps'][0]['conclusion'] = 'success'
+    external = raw_check(200, app=77, name='external gate')
+    external['app']['slug'] = 'external-app'
+    external['output'] = {'summary': 'External gate failed; check-run diagnostic'}
+    checks = checks if checks is not None else ([raw_check(conclusion='success')] if with_actions else []) + [external]
+    calls = []
+    class Client:
+        def pages(self, route, **kwargs):
+            calls.append({'route': route, **kwargs})
+            if '/pulls?' in route: return [{'number': number, 'head': {'sha': sha}} for number, sha in heads.items()]
+            if '/actions/runs?' in route: return [run] if with_actions and 'created=' in route else []
+            if '/jobs?' in route: return [job]
+            if '/check-runs?' in route: return [check for check in checks if '/commits/' + check['head_sha'] + '/' in route]
+            raise AssertionError('unexpected route: ' + route)
+    provider = CIProvider(Client(), INVENTORY, clock=lambda: now, monotonic=lambda: 0)
+    sample = provider(5)
+    return {'data': sample.data, 'calls': calls, 'hot': sample.hot}
+
+
+def coverage_fixture(kind):
+    heads = {'7': SHA}
+    runs, jobs, checks = [raw_run(conclusion='success')], {'10': [raw_job()]}, [raw_check(conclusion='success')]
+    jobs['10'][0]['conclusion'] = jobs['10'][0]['steps'][0]['conclusion'] = 'success'
+    if kind in ('uncovered', 'uncovered-only'):
+        heads['8'] = OTHER_SHA
+        if kind == 'uncovered-only':
+            runs, jobs, checks = [], {}, []
+    else:
+        conclusion = {'all-pass': 'success', 'neutral': 'neutral', 'skipped': 'skipped', 'check-neutral': 'neutral',
+                      'check-skipped': 'skipped', 'stale': 'stale', 'check-stale': 'stale',
+                      'unknown-completion': None, 'check-unknown-completion': None, 'unknown-status': 'success'}.get(kind, 'cancelled')
+        sha = OTHER_SHA if kind == 'old-cancelled' else SHA
+        run = raw_run(11, conclusion, sha); run['check_suite_id'] = 51
+        job = raw_job(21, 101); job['conclusion'] = job['steps'][0]['conclusion'] = conclusion
+        check = raw_check(101, conclusion, suite=51); check['head_sha'] = sha
+        if kind.startswith('check-'):
+            check['app'] = {'id': 77, 'slug': 'external-app'}
+        else:
+            runs.append(run); jobs['11'] = [job]
+        if kind == 'unknown-status':
+            run['status'] = 'unknown'
+        checks.append(check)
+        if kind == 'running-cancelled':
+            runs[0].update(status='in_progress', conclusion=None)
+        if kind == 'failed-cancelled':
+            runs[0]['conclusion'] = jobs['10'][0]['conclusion'] = checks[0]['conclusion'] = 'failure'
+    calls = []
+    class Client:
+        def pages(self, route, **kwargs):
+            calls.append({'route': route, **kwargs})
+            if '/pulls?' in route: return [{'number': number, 'head': {'sha': sha}} for number, sha in heads.items()]
+            if '/actions/runs?' in route: return runs if 'created=' in route else []
+            if '/jobs?' in route: return jobs[route.split('/runs/')[1].split('/')[0]]
+            if '/check-runs?' in route: return [check for check in checks if '/commits/' + check['head_sha'] + '/' in route]
+            raise AssertionError('unexpected route: ' + route)
+    sample = CIProvider(Client(), INVENTORY, clock=lambda: 1000, monotonic=lambda: 0)(5)
+    return {'data': sample.data, 'calls': calls, 'hot': sample.hot}
+
+
+def browser_fixtures():
+    fixtures = {'model': model(), 'unicode': unicode_model_and_excerpt(),
+                'workflow-no-pr': unmatched_checks_fixture(checks=[raw_check()], run_prs=[]),
+                'no-head': unmatched_checks_fixture(head=None)}
+    for with_actions in (True, False):
+        fixtures[f'external:{with_actions}'] = unmatched_checks_fixture(with_actions)
+        for status in ('queued', 'in_progress'):
+            checks = [raw_check(conclusion='success')] if with_actions else []
+            for check_id, conclusion, name in ((200, 'failure', 'external gate'),
+                                                (201, 'success', 'external gate'),
+                                                (202, None, 'independent check')):
+                check = raw_check(check_id, conclusion, START if check_id == 200 else LATER, app=77, name=name)
+                check['app']['slug'] = 'external-app'
+                if check_id == 202:
+                    check.update(status=status, completed_at=None)
+                checks.append(check)
+            fixtures[f'mixed:{with_actions}:{status}'] = unmatched_checks_fixture(with_actions, checks=checks)
+    for app in (None, {'id': 1, 'slug': 'github-actions'}):
+        external = raw_check(201, 'success', LATER, app=77)
+        external['app']['slug'] = 'external-app'
+        checks = [raw_check(conclusion='success'), {**raw_check(200, suite=999), 'app': app}, external]
+        fixtures[f'unknown:{app is None}'] = unmatched_checks_fixture(checks=checks)
+    for status in ('queued', 'in_progress', 'completed', 'unknown'):
+        fixtures[f'pending:{status}'] = unmatched_checks_fixture(checks=[raw_check(conclusion='success'),
+            {**raw_check(200), 'status': status, 'conclusion': None}])
+    for key, head, run_prs in (('current', SHA, None), ('old', OTHER_SHA, None),
+                               ('closed', None, None), ('unattached', None, [])):
+        fixtures[f'passed:{key}'] = unmatched_checks_fixture(checks=[raw_check(conclusion='success')],
+                                                            head=head, run_prs=run_prs)
+    for kind in ('uncovered', 'uncovered-only', 'cancelled', 'old-cancelled', 'all-pass', 'neutral', 'skipped', 'stale', 'unknown-completion',
+                 'check-neutral', 'check-skipped', 'check-stale', 'check-unknown-completion', 'unknown-status',
+                 'check-cancelled', 'running-cancelled', 'failed-cancelled'):
+        fixtures[f'coverage:{kind}'] = coverage_fixture(kind)
+    return fixtures
 
 
 class SupersessionTests(unittest.TestCase):
@@ -148,6 +248,153 @@ class SupersessionTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_open_head_without_workflows_or_checks_retains_explicit_unknown_coverage(self):
+        for kind, expected_prs in (('uncovered', ['8']), ('uncovered-only', ['7', '8'])):
+            with self.subTest(kind=kind):
+                fixture = coverage_fixture(kind); data = fixture['data']
+                self.assertEqual([row['pr'] for row in data['check_rows']], expected_prs)
+                for row in data['check_rows']:
+                    self.assertTrue(row['current_head']); self.assertTrue(row['check_evidence_unknown'])
+                    self.assertEqual(row['status'], 'unknown'); self.assertIsNone(row['conclusion'])
+                    self.assertEqual(row['checks'], []); self.assertEqual(row['jobs'], [])
+                    self.assertFalse(row['actionable']); self.assertFalse(row['superseded'])
+                    for key in ('id', 'attempt', 'workflow_id', 'rerun_command', 'created_at', 'started_at', 'updated_at'):
+                        self.assertIsNone(row[key])
+                    self.assertEqual(row['jobs_scope'], 'none')
+                    self.assertIn('No workflow or check runs observed', row['reason'])
+                    group = next(group for group in data['groups'] if group['pr'] == row['pr'])
+                    self.assertEqual(group['run_keys'], [])
+                    self.assertEqual(group['check_keys'], [row['key']])
+                self.assertEqual(sum('/jobs?' in call['route'] for call in fixture['calls']), int(kind == 'uncovered'))
+                self.assertEqual(sum('/check-runs?' in call['route'] for call in fixture['calls']), 2)
+
+    def test_workflow_without_pr_metadata_binds_every_matching_observed_head(self):
+        fixture = unmatched_checks_fixture(checks=[raw_check()], run_prs=[],
+                                           heads={'7': SHA, '8': SHA, '9': OTHER_SHA})
+        data = fixture['data']
+        self.assertEqual([row['pr'] for row in data['runs']], ['7', '8'])
+        self.assertTrue(all(row['current_head'] and row['actionable'] for row in data['runs']))
+        self.assertEqual([row['key'] for row in data['runs']], [REPO + ':10:7', REPO + ':10:8'])
+        self.assertEqual([group['pr'] for group in data['groups'] if group['run_keys']], ['7', '8'])
+        self.assertEqual([row for row in data['check_rows'] if row['checks']], [])
+        self.assertEqual([row['pr'] for row in data['check_rows']], ['9'])
+        marker = data['check_rows'][0]
+        self.assertEqual(marker['sha'], OTHER_SHA)
+        self.assertTrue(marker['current_head'] and marker['check_evidence_unknown'])
+        marker_group = next(group for group in data['groups'] if group['pr'] == '9')
+        self.assertEqual(marker_group['run_keys'], [])
+        self.assertEqual(marker_group['check_keys'], [marker['key']])
+        self.assertEqual(sum('/jobs?' in call['route'] for call in fixture['calls']), 1)
+        self.assertEqual({row['id'] for row in data['runs']}, {'10'})
+
+    def test_workflow_preserves_old_metadata_owner_and_adds_matching_open_head(self):
+        data = unmatched_checks_fixture(checks=[raw_check()], heads={'7': OTHER_SHA, '8': SHA})['data']
+        self.assertEqual([(row['pr'], row['current_head'], row['actionable']) for row in data['runs']],
+                         [('7', False, False), ('8', True, True)])
+
+    def test_workflow_without_metadata_or_matching_head_keeps_unknown_owner(self):
+        for heads in ({}, {'7': OTHER_SHA}):
+            with self.subTest(heads=heads):
+                row = unmatched_checks_fixture(checks=[raw_check()], run_prs=[], heads=heads)['data']['runs'][0]
+                self.assertIsNone(row['pr']); self.assertIsNone(row['current_head'])
+                self.assertFalse(row['actionable'])
+
+    def test_provider_retains_external_failure_on_current_head_with_or_without_actions(self):
+        for with_actions in (True, False):
+            with self.subTest(with_actions=with_actions):
+                fixture = unmatched_checks_fixture(with_actions)
+                data = fixture['data']
+                self.assertFalse(data['repositories'][0]['stale'])
+                external_rows = [row for row in data.get('check_rows', []) if any(check['id'] == '200' for check in row['checks'])]
+                self.assertEqual(len(external_rows), 1)
+                row = external_rows[0]
+                self.assertEqual(row['pr'], '7'); self.assertEqual(row['sha'], SHA)
+                self.assertTrue(row['current_head']); self.assertTrue(row['actionable'])
+                self.assertEqual(row['checks'][0]['producer'], 'app:77')
+                self.assertEqual(row['diagnostics'][0]['source'], 'check-run output')
+                self.assertIsNone(row['rerun_command'])
+                self.assertEqual(sum('/jobs?' in call['route'] for call in fixture['calls']), int(with_actions))
+                self.assertEqual(sum('/check-runs?' in call['route'] for call in fixture['calls']), 1)
+                self.assertTrue(all(call['deadline'] == 4.75 for call in fixture['calls']))
+
+    def test_unmatched_unknown_producer_and_actions_lineage_cannot_be_cleared_by_peer(self):
+        for app in (None, {'id': 1, 'slug': 'github-actions'}):
+            with self.subTest(app=app):
+                failed = raw_check(200, app=77, suite=999); failed['app'] = app
+                passed = raw_check(201, 'success', LATER, app=77); passed['app']['slug'] = 'external-app'
+                data = unmatched_checks_fixture(checks=[raw_check(conclusion='success'), failed, passed])['data']
+                row = data['check_rows'][0]
+                self.assertTrue(row['actionable']); self.assertFalse(row['superseded'])
+                self.assertIsNone(row['checks'][0]['producer'])
+                self.assertIsNone(row['checks'][0]['superseded_by'])
+                self.assertEqual([check['id'] for check in data['runs'][0]['checks']], ['100'])
+
+    def test_unmatched_other_app_supersession_requires_same_app_name_and_order(self):
+        failed = raw_check(200, app=77); failed['app']['slug'] = 'external-app'
+        passed = raw_check(201, 'success', LATER, app=77); passed['app']['slug'] = 'external-app'
+        for mutation, superseded in [({}, True), ({'app': {'id': 78, 'slug': 'external-app'}}, False),
+                                     ({'name': 'other check'}, False), ({'started_at': START}, False),
+                                     ({'started_at': None}, False)]:
+            with self.subTest(mutation=mutation):
+                data = unmatched_checks_fixture(False, [failed, {**passed, **mutation}])['data']
+                row = data['check_rows'][0]
+                self.assertEqual(row['superseded'], superseded)
+                self.assertEqual(row['actionable'], not superseded)
+                self.assertEqual(row['checks'][0]['superseded_by'], '201' if superseded else None)
+                self.assertEqual(row['checks'][0]['started_at'], normalize_check(REPO, failed, {})['started_at'])
+
+    def test_unmatched_checks_retain_old_or_unknown_head_history_without_hazard(self):
+        for head, current in [(OTHER_SHA, False), (None, None)]:
+            with self.subTest(head=head):
+                data = unmatched_checks_fixture(head=head)['data']
+                row = data['check_rows'][0]
+                self.assertEqual(row['pr'], '7'); self.assertEqual(row['sha'], SHA)
+                self.assertIs(row['current_head'], current); self.assertFalse(row['actionable'])
+                self.assertEqual(row['checks'][0]['id'], '200')
+                self.assertEqual(data['groups'][0]['run_keys'], [data['runs'][0]['key']])
+                self.assertEqual(data['groups'][0]['check_keys'], [row['key']])
+
+    def test_unmatched_live_and_unknown_checks_do_not_invent_completed_success(self):
+        for status, conclusion, hot, unknown in [('queued', None, True, False), ('in_progress', None, True, False),
+                                                ('completed', None, False, True), ('unknown', None, False, True)]:
+            with self.subTest(status=status):
+                check = raw_check(200); check.update(status=status, conclusion=conclusion)
+                fixture = unmatched_checks_fixture(False, [check]); data = fixture['data']
+                self.assertEqual(fixture['hot'], hot)
+                row = data['check_rows'][0]
+                self.assertEqual(row['status'], status); self.assertIsNone(row['conclusion'])
+                self.assertEqual(row['check_evidence_unknown'], unknown)
+                self.assertIsNone(row['id']); self.assertIsNone(row['attempt']); self.assertIsNone(row['workflow_id'])
+                self.assertEqual(row['jobs'], []); self.assertEqual(data['runs'], [])
+                self.assertTrue(all(row[field] is None for field in ('created_at', 'started_at', 'updated_at')))
+
+    def test_unmatched_checks_refresh_while_completed_jobs_cache_and_deny_retains_age(self):
+        now, calls = [1000], []
+        failed = raw_check(200, app=77); failed['app']['slug'] = 'external-app'
+        passed = raw_check(201, 'success', LATER, app=77); passed['app']['slug'] = 'external-app'
+        class Client:
+            denied = False
+            checks = [raw_check(conclusion='success'), failed]
+            def pages(self, route, **kwargs):
+                calls.append(route)
+                if self.denied: raise ClientError('permission_denied')
+                if '/pulls?' in route: return [{'number': 7, 'head': {'sha': SHA}}]
+                if '/actions/runs?' in route: return [raw_run(conclusion='success')] if 'created=' in route else []
+                if '/jobs?' in route: return [raw_job()]
+                return self.checks
+        client = Client(); provider = CIProvider(client, INVENTORY, clock=lambda: now[0])
+        first = provider(time.monotonic()+5).data
+        client.checks.append(passed); now[0] += 20
+        second = provider(time.monotonic()+5).data
+        self.assertTrue(first['check_rows'][0]['actionable']); self.assertFalse(second['check_rows'][0]['actionable'])
+        self.assertEqual(sum('/jobs?' in route for route in calls), 1)
+        self.assertEqual(sum('/check-runs?' in route for route in calls), 2)
+        client.denied = True; now[0] += 20
+        third = provider(time.monotonic()+5).data
+        self.assertTrue(third['repositories'][0]['stale'])
+        self.assertEqual(third['repositories'][0]['observed_at'], 1020)
+        self.assertEqual(third['check_rows'], second['check_rows'])
+
     def test_provider_accepts_check_url_repository_casing_and_keeps_enrolled_identity(self):
         job = raw_job(); job['check_run_url'] = job['check_run_url'].replace(REPO, 'OwNeR/RePo')
         class Client:
@@ -292,8 +539,141 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(rows[0]['key'], final[0]['key'])
         self.assertEqual(final[0]['conclusion'], 'success')
 
+    def test_untouched_deadline_does_not_inflate_or_reset_real_failure_backoff(self):
+        for prior_failures, retry_after in ((0, 0), (1, 0), (2, 0), (0, 60), (1, 60)):
+            with self.subTest(prior_failures=prior_failures, retry_after=retry_after):
+                now, mono, calls = [1000.0], [0.0], []
+                class Client:
+                    def pages(self, route, **kwargs):
+                        calls.append(route)
+                        raise ClientError('upstream_unavailable', retry_after=retry_after)
+                provider = CIProvider(Client(), INVENTORY, clock=lambda: now[0], monotonic=lambda: mono[0])
+                for _ in range(prior_failures):
+                    data = provider(5).data
+                    now[0] = data['repositories'][0]['retry_at'] + 1
+                dispatched = len(calls)
+                for _ in range(6):
+                    mono[0] = 5
+                    record = provider(5).data['repositories'][0]
+                    self.assertEqual(record['error'], 'deadline_exceeded')
+                    self.assertEqual(record['retry_at'], now[0])
+                self.assertEqual(len(calls), dispatched)
+                mono[0] = 0
+                record = provider(5).data['repositories'][0]
+                self.assertEqual(len(calls), dispatched + 1)
+                self.assertEqual(record['retry_at'] - now[0], max(20 * 2 ** prior_failures, retry_after))
+
 
 class ExcerptTests(unittest.TestCase):
+    def test_osc_bel_and_st_terminators_preserve_failure_text(self):
+        for terminator in (b'\x07', b'\x1b\\'):
+            opening = b'\x1b]8;;https://example.test/log' + terminator
+            closing = b'\x1b]8;;' + terminator
+            for body, expected in (
+                    (b'\x1b]0;title' + terminator + b'FAIL: wanted', 'FAIL: wanted'),
+                    (opening + closing + b'FAIL: wanted', 'FAIL: wanted'),
+                    (opening + b'FAIL: wanted' + closing + b' suffix', 'FAIL: wanted suffix'),
+                    (b'FAIL: before ' + opening + b'linked' + closing + b' after', 'FAIL: before linked after'),
+                    (b'\x1b[31m' + opening + b'FAIL: colored' + closing + b'\x1b[0m', 'FAIL: colored')):
+                with self.subTest(terminator=terminator, body=body):
+                    result = extract_fail_lines(body, {})
+                    self.assertEqual(result['status'], 'ok')
+                    self.assertEqual(result['lines'], [expected])
+                    self.assertEqual(result['scope'], 'job')
+
+    def test_unterminated_osc_preserves_existing_end_of_line_behavior(self):
+        result = extract_fail_lines(b'FAIL: retained \x1b]8;;unterminated\n'
+                                    b'\x1b]0;title FAIL: hidden\nFAIL: next line', {})
+        self.assertEqual(result['lines'], ['FAIL: retained ', 'FAIL: next line'])
+        self.assertEqual(result['status'], 'ok')
+
+    def test_osc_at_body_cap_retains_failure_and_existing_output_bounds(self):
+        prefix, suffix = b'\x1b]0;', b'\x1b\\FAIL: wanted'
+        body = prefix + b'x' * (MAX_BODY - len(prefix) - len(suffix)) + suffix
+        self.assertEqual(extract_fail_lines(body, {})['lines'], ['FAIL: wanted'])
+        with self.assertRaises(ClientError) as error:
+            extract_fail_lines(body + b'x', {})
+        self.assertEqual(error.exception.category, 'response_too_large')
+        linked = b'\x1b]8;;https://example.test\x1b\\FAIL: ' + b'x' * 2000 + b'\x1b]8;;\x1b\\\n'
+        result = extract_fail_lines(linked * 100, {})
+        self.assertTrue(result['truncated'])
+        self.assertTrue(result['lines'])
+        self.assertTrue(all(line == 'FAIL: ' + 'x' * 994 for line in result['lines']))
+        self.assertLessEqual(len(result['lines']), 80)
+        self.assertLessEqual(sum(len(line.encode()) for line in result['lines']), 32768)
+
+    def test_transient_result_is_shared_by_existing_waiter_but_explicit_retry_reads_again(self):
+        for error in ['deadline_exceeded', 'upstream_backoff', 'secondary_limit', 'primary_reserve',
+                      'primary_exhausted', 'upstream_unavailable', 'upstream_http_error']:
+            with self.subTest(error=error):
+                entered, waiting, release = threading.Event(), threading.Event(), threading.Event()
+                calls, results = [], {}
+                class ObservedCondition(threading.Condition):
+                    def wait(self, timeout=None):
+                        waiting.set()
+                        return super().wait(timeout)
+                def read(*args):
+                    calls.append(args)
+                    if len(calls) == 1:
+                        entered.set(); release.wait(2)
+                        raise ClientError(error)
+                    return b'FAIL: explicit retry'
+                cache = LogExcerptCache(INVENTORY, read)
+                cache.condition = ObservedCondition()
+                def fetch(name):
+                    results[name] = cache.handle(params(), envelope(), deadline=time.monotonic()+3)
+                leader = threading.Thread(target=fetch, args=('leader',))
+                waiter = threading.Thread(target=fetch, args=('waiter',))
+                try:
+                    leader.start(); self.assertTrue(entered.wait(1))
+                    waiter.start(); self.assertTrue(waiting.wait(1))
+                finally:
+                    release.set(); leader.join(2)
+                    if waiter.ident is not None: waiter.join(2)
+                self.assertFalse(leader.is_alive() or waiter.is_alive())
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(results['leader'], results['waiter'])
+                self.assertEqual(results['waiter']['error'], error)
+                self.assertEqual(len(cache.cache), 0); self.assertEqual(len(cache.pending), 0)
+                retry = cache.handle(params(), envelope(), deadline=time.monotonic()+1)
+                self.assertEqual(retry['lines'], ['FAIL: explicit retry'])
+                self.assertEqual(len(calls), 2)
+
+    def test_coalesced_waiter_deadline_does_not_cancel_leader_or_block_retry(self):
+        now = [0]
+        entered, waiting, release = threading.Event(), threading.Event(), threading.Event()
+        calls, results = [], {}
+        class ObservedCondition(threading.Condition):
+            def wait(self, timeout=None):
+                waiting.set()
+                return super().wait(timeout)
+        def read(*args):
+            calls.append(args)
+            if len(calls) == 1:
+                entered.set(); release.wait(2)
+                raise ClientError('upstream_unavailable')
+            return b'FAIL: recovered'
+        cache = LogExcerptCache(INVENTORY, read, clock=lambda: now[0])
+        cache.condition = ObservedCondition()
+        def fetch(name, deadline): results[name] = cache.handle(params(), envelope(), deadline=deadline)
+        leader = threading.Thread(target=fetch, args=('leader', 10))
+        waiter = threading.Thread(target=fetch, args=('waiter', 1))
+        try:
+            leader.start(); self.assertTrue(entered.wait(1))
+            waiter.start(); self.assertTrue(waiting.wait(1))
+            with cache.condition:
+                now[0] = 2; cache.condition.notify_all()
+            waiter.join(1); self.assertFalse(waiter.is_alive())
+            self.assertEqual(results['waiter']['error'], 'deadline_exceeded')
+            self.assertTrue(leader.is_alive()); self.assertEqual(len(calls), 1)
+        finally:
+            release.set(); leader.join(2)
+            if waiter.ident is not None: waiter.join(2)
+        self.assertEqual(results['leader']['error'], 'upstream_unavailable')
+        self.assertEqual(len(cache.pending), 0)
+        self.assertEqual(cache.handle(params(), envelope(), deadline=3)['lines'], ['FAIL: recovered'])
+        self.assertEqual(len(calls), 2)
+
     def test_excerpt_retry_honors_shared_client_backoff_then_observes_recovery(self):
         now, calls = [1000], []
         def transport(*args):

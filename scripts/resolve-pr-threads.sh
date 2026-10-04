@@ -608,8 +608,25 @@ gh_pat() {
   fi
 }
 
+# `gh repo view` is a GraphQL call, so a session whose proxy refuses GraphQL
+# cannot use it; the origin remote names the same repository without a
+# request. Only a github.com origin is read this way: every call is pinned to
+# github.com (gh_pat above).
+repo_from_origin() {
+  local url
+  url="$(git remote get-url origin 2>/dev/null)" || return 1
+  url="${url%.git}"
+  url="${url%/}"
+  case "$url" in
+    https://github.com/*/*|git@github.com:*/*|ssh://git@github.com/*/*) ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' "$url" | awk -F'[/:]' '{print $(NF-1) "/" $NF}'
+}
+
 if [ -z "$REPO" ]; then
-  REPO=$(gh_pat repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || {
+  REPO=$(gh_pat repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) \
+    || REPO=$(repo_from_origin) || {
     echo "Could not resolve repo. Pass --repo owner/name." >&2
     exit 2
   }
@@ -813,12 +830,81 @@ QUERY='
     }
   }
 '
+# --list through the Claude cloud proxy's REST thread route, for a session whose
+# proxy refuses GraphQL. Reads only: resolution stays on the identity-checked
+# GraphQL path and its CI lane (scripts/dispatch-thread-resolution-lane.sh),
+# because a resolve through the proxy's route would not run as the reviewer PAT.
+#
+# The route (GET repos/<repo>/pulls/<n>/ccr/review_threads) returns each
+# thread's resolved and outdated state and its comment ids, oldest first, with
+# no author, body or count. Those come from the paginated REST review-comment
+# list, where a thread is a comment with no in_reply_to_id. The two must
+# describe the same threads: every root comment is exactly one route thread's
+# first id, and every comment id appears in exactly one thread. Anything else,
+# including a route that silently truncates, fails closed with exit 2, the
+# same as the GraphQL count mismatch below. Exit codes match the GraphQL path:
+# 0 no unresolved threads, 3 unresolved threads listed. A proxy without the
+# route (the call fails or does not answer with a thread array) returns 1, and
+# the caller reports the GraphQL ceiling (6), which is still the fact.
+list_threads_via_proxy_route() {
+  local threads comments unresolved count
+  threads=$(gh_pat api "repos/$REPO/pulls/$PR_NUM/ccr/review_threads" 2>/dev/null) || return 1
+  jq -e 'type == "array"' <<<"$threads" >/dev/null 2>&1 || return 1
+  comments=$(gh_pat api --paginate "repos/$REPO/pulls/$PR_NUM/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null) || comments=""
+  if [ -z "$comments" ]; then
+    echo "resolve-pr-threads: the proxy's thread route answered, but $REPO#$PR_NUM's review comments could not be read over REST; nothing listed." >&2
+    exit 2
+  fi
+  # Both documents reach jq on stdin-like descriptors, never argv: a PR's
+  # comment list easily exceeds the argument-size limit.
+  if ! jq -e -n --slurpfile t <(printf '%s' "$threads") --slurpfile c <(printf '%s' "$comments") '
+      ($t[0]) as $t | ($c[0]) as $c
+      | ([$c[] | select(.in_reply_to_id == null) | .id] | sort) == ([$t[] | .comment_ids[0]] | sort)
+      and ([$t[] | .comment_ids[]] | sort) == ([$c[] | .id] | sort)
+    ' >/dev/null 2>&1; then
+    echo "ERROR: the proxy's thread route and the REST review comments disagree on $REPO#$PR_NUM's threads" >&2
+    echo "       (a thread or comment is missing from one of them). Do NOT trust a \"no unresolved" >&2
+    echo "       threads\" answer; list the threads from a session that can reach GraphQL." >&2
+    exit 2
+  fi
+  unresolved=$(jq -c -n --slurpfile t <(printf '%s' "$threads") --slurpfile c <(printf '%s' "$comments") '
+    ($t[0]) as $t | ($c[0]) as $c
+    | ($c | map({key: (.id | tostring), value: .}) | from_entries) as $byid
+    | $t[] | select(.resolved != true)
+    | $byid[(.comment_ids[0] | tostring)] as $root
+    | {author: ($root.user.login // "unknown"), path: (.path // $root.path // "(no path)"),
+       outdated: (.outdated == true), excerpt: (($root.body // "") | .[0:160])}
+  ') || {
+    # Called under `|| true`, where set -e is off: an empty result from a
+    # failed jq must not read as "no unresolved threads".
+    echo "resolve-pr-threads: could not evaluate $REPO#$PR_NUM's thread states; nothing listed." >&2
+    exit 2
+  }
+  if [ -z "$unresolved" ]; then
+    echo "No unresolved threads on PR #$PR_NUM (read through the cloud proxy's REST thread route)."
+    exit 0
+  fi
+  count=$(printf '%s\n' "$unresolved" | wc -l | tr -d ' ')
+  echo "Unresolved threads on $REPO#$PR_NUM: $count (read through the cloud proxy's REST thread route)"
+  echo ""
+  printf '%s\n' "$unresolved" | jq -r '
+    "  [\(.author)] \(.path)" + (if .outdated then " (outdated)" else "" end) +
+    "\n    " + .excerpt + "\n"
+  '
+  echo "Resolving threads needs GraphQL, which this session's proxy refuses: reply on"
+  echo "each thread, then run scripts/dispatch-thread-resolution-lane.sh $PR_NUM."
+  exit 3
+}
+
 while :; do
   # Read-path: pin to preflight reviewer PAT when available; otherwise
   # let gh use its keyring fallback (no empty-GH_TOKEN trap).
   if [ -z "$CURSOR" ]; then
     PAGE=$(gh_pat api graphql -f query="$QUERY" \
       -F owner="$OWNER" -F repo="$NAME" -F pr="$PR_NUM" -F cursor=null 2>&1) || {
+      if [ "$MODE" = "list" ] && graphql_ceiling_hit "$PAGE"; then
+        list_threads_via_proxy_route || true
+      fi
       graphql_ceiling_hit "$PAGE" && graphql_ceiling_refuse resolve-pr-threads "reading $REPO#$PR_NUM's review threads"
       echo "GraphQL query failed: $PAGE" >&2
       exit 2

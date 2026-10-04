@@ -46,7 +46,7 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 FIX="$WORKDIR/repo"
 mkdir -p "$FIX/scripts/lib" "$FIX/.github"
 cp "$PROBE_SRC" "$FIX/scripts/"
-cp "$ROOT/scripts/lib/credential-class.sh" "$ROOT/scripts/lib/gh-token-resolver.sh" "$FIX/scripts/lib/"
+cp "$ROOT/scripts/lib/credential-class.sh" "$ROOT/scripts/lib/gh-token-resolver.sh" "$ROOT/scripts/lib/graphql-ceiling.sh" "$FIX/scripts/lib/"
 cp "$ROOT/scripts/identity-check.sh" "$FIX/scripts/"
 printf 'author_identity: nathanjohnpayne\n' >"$FIX/.github/review-policy.yml"
 git init -q --bare "$WORKDIR/origin.git"
@@ -146,7 +146,13 @@ elif [ "$path" = "graphql" ] && [ -n "${STUB_GRAPHQL_RATE_LIMITED:-}" ]; then
   body='{"data":null,"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}'
 elif [ "$path" = "graphql" ]; then
   if [ "$tok" = "proxy-injected" ] || [ "${CLAUDE_CODE_REMOTE:-}" = "true" ]; then
-    status=403; body='{"message":"This GraphQL query is not enabled for this session. Use gh api repos/{owner}/{repo}/... instead."}'
+    status=403
+    case "${STUB_GRAPHQL_WORDING:-pinned}" in
+      unavailable) body='{"message":"GitHub GraphQL is not available from Claude Code sessions; use the REST API (gh api repos/{owner}/{repo}/...). For review threads use the CCR routes on api.github.com.","documentation_url":"https://docs.anthropic.com/en/docs/claude-code/github-actions"}' ;;
+      other) body='{"message":"Resource not accessible by integration","documentation_url":"https://docs.github.com/graphql"}' ;;
+      reworded) body='{"message":"A wording the proxy has not used before","documentation_url":"https://docs.anthropic.com/en/docs/claude-code/github-actions"}' ;;
+      *) body='{"message":"This GraphQL query is not enabled for this session. Use gh api repos/{owner}/{repo}/... instead."}' ;;
+    esac
   else
     body="{\"data\":{\"viewer\":{\"login\":\"$login\"}}}"
   fi
@@ -302,10 +308,26 @@ if reason "$WORKDIR/cloud.json" graphql | grep -q 'proxy GraphQL ceiling'; then
 else
   fail "claude-cloud: graphql reason = $(reason "$WORKDIR/cloud.json" graphql)"
 fi
+# The proxy's later wording (observed 2026-10-04) is the same ceiling; a 403
+# that carries neither wording is not, and stays a fix-first status.
+for wording in unavailable reworded other; do
+  set +e
+  run_probe CLAUDE_CODE_REMOTE=true GH_TOKEN=proxy-injected GITHUB_TOKEN=proxy-injected STUB_GRAPHQL_WORDING="$wording" -- --no-cache \
+    >"$WORKDIR/cloud-$wording.json" 2>/dev/null
+  set -e
+  r="$(reason "$WORKDIR/cloud-$wording.json" graphql)"
+  if { [ "$wording" != other ] && printf '%s' "$r" | grep -q 'proxy GraphQL ceiling'; } \
+     || { [ "$wording" = other ] && [ "$r" = "viewer query returned 403" ]; }; then
+    pass "claude-cloud: GraphQL 403 with the '$wording' wording classified correctly ($r)"
+  else
+    fail "claude-cloud: GraphQL '$wording' wording: reason = $r"
+  fi
+done
 if [ "$(cap "$WORKDIR/cloud.json" cross-repo)" = "false" ] \
    && [ "$(cap "$WORKDIR/cloud.json" push-multi-branch)" = "false" ] \
-   && [ "$(jq -r '.capabilities["push-multi-branch"].basis' "$WORKDIR/cloud.json")" = "documented" ]; then
-  pass "claude-cloud: cross-repo refused, multi-branch push false from the documented restriction"
+   && [ "$(jq -r '.capabilities["push-multi-branch"].basis' "$WORKDIR/cloud.json")" = "not-measured" ] \
+   && reason "$WORKDIR/cloud.json" push-multi-branch | grep -q 'refuse deleting'; then
+  pass "claude-cloud: cross-repo refused; multi-branch push not granted and reported as not measured, with the observed proxy behavior"
 else
   fail "claude-cloud: cross-repo=$(cap "$WORKDIR/cloud.json" cross-repo) push=$(jq -c '.capabilities["push-multi-branch"]' "$WORKDIR/cloud.json")"
 fi
