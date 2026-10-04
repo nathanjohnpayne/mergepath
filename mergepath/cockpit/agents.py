@@ -346,11 +346,18 @@ class AgentsProvider:
                     diagnostics.append("A checkout loop directory is unreadable or refused.")
                 try:
                     if logs is not None:
-                        names = sorted(os.listdir(logs))
-                        if len(names) > MAX_FILES:
-                            raise ValueError("file_limit")
-                        sources += [(logs, name, "loop") for name in names if name.endswith((".jsonl", ".jsonl.archive"))]
+                        names = sorted(name for name in os.listdir(logs) if name.endswith((".jsonl", ".jsonl.archive")))
+                        # Ledger attempts and the final price read share this poll's budget.
+                        remaining = max(0, MAX_FILES - 1 - reader.files - len(sources))
+                        if len(names) > remaining:
+                            scan_complete = False
+                            diagnostics.append("History file limit reached; coverage is incomplete.")
+                        sources += [(logs, name, "loop") for name in names[:remaining]]
                     for fd, name, kind in sources:
+                        if reader.files >= MAX_FILES - 1:
+                            scan_complete = False
+                            diagnostics.append("History file limit reached; coverage is incomplete.")
+                            break
                         try:
                             content = reader.read(fd, name)
                         except FileNotFoundError:
@@ -390,18 +397,19 @@ class AgentsProvider:
                                     pr, entries = str(record["pr"]), record["loops"]
                                     if not isinstance(entries, list) or len(entries) > MAX_ROWS:
                                         raise ValueError()
-                                    approval_rows = []
-                                    approvals.append({"repo": None, "pr": pr, "loops": copy.deepcopy(entries), "observations": approval_rows, "totals": record.get("totals"), "source": f"checkout-{root_no + 1}:ledger:{line_no}"})
+                                pending = []
                                 for index, entry in enumerate(entries):
-                                    if len(rows) + len(log_rows) + len(ledger_rows) >= MAX_ROWS:
+                                    if len(rows) + len(log_rows) + len(ledger_rows) + len(pending) >= MAX_ROWS:
                                         raise ValueError("row_limit")
                                     normalized = normalize_loop(entry)
                                     normalized.update(repo=repo, pr=pr, id=f"local-{root_no + 1}-{kind}-{name}-{line_no}-{index}",
                                                       identity="run_id" if normalized["run_id"] else "legacy_locator",
                                                       sources=[f"checkout-{root_no + 1}:{kind}:{line_no}:{index}"], conflict=False)
-                                    (log_rows if kind == "loop" else ledger_rows).append(normalized)
-                                    if kind == "ledger":
-                                        approval_rows.append(normalized)
+                                    pending.append(normalized)
+                                # Admit a ledger line only after every loop and its capacity pass.
+                                (log_rows if kind == "loop" else ledger_rows).extend(pending)
+                                if kind == "ledger":
+                                    approvals.append({"repo": None, "pr": pr, "loops": copy.deepcopy(entries), "observations": pending, "totals": record.get("totals"), "source": f"checkout-{root_no + 1}:ledger:{line_no}"})
                             except (ValueError, KeyError, TypeError, AttributeError):
                                 scan_complete = False
                                 diagnostics.append("An accounting record is malformed or has an unknown repository.")
