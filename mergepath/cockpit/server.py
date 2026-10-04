@@ -162,7 +162,7 @@ class CockpitServer(ThreadingHTTPServer):
         return request, address
 
     def process_request(self, request, client_address):
-        if not self._request_slots.acquire(blocking=False):
+        if not self._request_slots.acquire(timeout=0.5):
             self.shutdown_request(request)
             return
         try:

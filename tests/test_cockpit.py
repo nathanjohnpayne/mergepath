@@ -791,6 +791,24 @@ class SchedulerTests(unittest.TestCase):
         self.assertNotIn(error.category, json.dumps(current))
 
 
+class AdmissionSlots(threading.BoundedSemaphore):
+    """Expose a saturated accept attempt without scheduling sleeps in the client."""
+    def __init__(self):
+        super().__init__(8)
+        self.saturated = threading.Event()
+        self.admission_finished = threading.Event()
+
+    def acquire(self, *args, **kwargs):
+        with self._cond:
+            saturated = self._value == 0
+        if saturated:
+            self.saturated.set()
+        result = super().acquire(*args, **kwargs)
+        if saturated:
+            self.admission_finished.set()
+        return result
+
+
 class ServerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -1286,6 +1304,111 @@ class ServerTests(unittest.TestCase):
         self.assertIn('"schema":"cockpit/v1"', text)
         response.close()
         self.assertEqual(self.github.budget(), {})
+
+    def test_asset_burst_waits_for_capacity_without_exceeding_eight_handlers(self):
+        self.bootstrap()
+        wait_until(lambda: self.server._request_slots._value == 8)
+        slots = AdmissionSlots()
+        self.server._request_slots = slots
+        entered = [threading.Event() for _ in range(8)]
+        release = [threading.Event() for _ in range(8)]
+        lock = threading.Lock()
+        active, peak, sequence = 0, 0, 0
+        original_handler = self.server.RequestHandlerClass
+        results = [None] * 9
+
+        class BurstHandler(original_handler):
+            def _static(handler, path):
+                nonlocal active, peak, sequence
+                with lock:
+                    index = sequence
+                    sequence += 1
+                    active += 1
+                    peak = max(peak, active)
+                try:
+                    if index < 8:
+                        entered[index].set()
+                        if not release[index].wait(2):
+                            raise AssertionError("fixture asset release expired")
+                    super()._static(path)
+                finally:
+                    with lock:
+                        active -= 1
+
+        self.server.RequestHandlerClass = BurstHandler
+        def read_asset(index):
+            try:
+                results[index] = self.request(path="/assets/fixture.js")
+            except (OSError, http.client.HTTPException) as error:
+                results[index] = type(error).__name__
+        clients = [threading.Thread(target=read_asset, args=(index,), daemon=True) for index in range(9)]
+        try:
+            for client in clients[:8]: client.start()
+            self.assertTrue(all(event.wait(1) for event in entered))
+            self.assertEqual(peak, 8)
+            clients[8].start()
+            self.assertTrue(slots.saturated.wait(1))
+            self.assertFalse(slots.admission_finished.wait(0.025), "saturated asset was immediately refused")
+            release[0].set()
+            clients[8].join(1)
+            self.assertFalse(clients[8].is_alive())
+            self.assertIsInstance(results[8], tuple)
+            self.assertEqual(results[8][0], 200)
+            self.assertEqual(results[8][2], (self.root / "assets/fixture.js").read_bytes())
+        finally:
+            for event in release: event.set()
+            for client in clients:
+                if client.ident is not None: client.join(1)
+        self.assertTrue(all(isinstance(result, tuple) and result[0] == 200 for result in results))
+        self.assertLessEqual(peak, 8)
+        wait_until(lambda: slots._value == 8)
+
+    def test_saturated_admission_times_out_and_shutdown_remains_bounded(self):
+        self.bootstrap()
+        wait_until(lambda: self.server._request_slots._value == 8)
+        slots = AdmissionSlots()
+        self.server._request_slots = slots
+        for _ in range(8): self.assertTrue(slots.acquire(blocking=False))
+        result = []
+        def read_asset():
+            started = time.monotonic()
+            try:
+                result.append(("response", self.request(path="/assets/fixture.js"), time.monotonic() - started))
+            except (OSError, http.client.HTTPException) as error:
+                result.append((type(error).__name__, None, time.monotonic() - started))
+        client = threading.Thread(target=read_asset, daemon=True)
+        try:
+            client.start()
+            self.assertTrue(slots.saturated.wait(1))
+            shutdown_started = time.monotonic()
+            self.server.shutdown()
+            self.assertLess(time.monotonic() - shutdown_started, 1.25)
+            client.join(1)
+            self.assertFalse(client.is_alive())
+            self.assertEqual(len(result), 1)
+            self.assertIn(result[0][0], ("RemoteDisconnected", "ConnectionResetError"))
+            self.assertGreaterEqual(result[0][2], 0.4)
+            self.assertLess(result[0][2], 1.25)
+            self.assertEqual(slots._value, 0)
+        finally:
+            for _ in range(8): slots.release()
+            client.join(1)
+        self.assertEqual(slots._value, 8)
+
+    def test_admission_slot_returns_after_dispatch_or_handler_failure(self):
+        wait_until(lambda: self.server._request_slots._value == 8)
+        base = CockpitServer.__mro__[1]
+        request = object()
+        with patch.object(base, "process_request", side_effect=RuntimeError("fixture dispatch failure")), \
+             patch.object(self.server, "shutdown_request") as close:
+            self.server.process_request(request, ("127.0.0.1", 1))
+        close.assert_called_once_with(request)
+        self.assertEqual(self.server._request_slots._value, 8)
+        self.assertTrue(self.server._request_slots.acquire(blocking=False))
+        with patch.object(base, "process_request_thread", side_effect=RuntimeError("fixture handler failure")):
+            with self.assertRaises(RuntimeError):
+                self.server.process_request_thread(request, ("127.0.0.1", 1))
+        self.assertEqual(self.server._request_slots._value, 8)
 
     def test_sse_connection_bound_and_shutdown(self):
         self.bootstrap()
