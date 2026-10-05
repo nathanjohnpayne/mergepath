@@ -112,3 +112,11 @@ projects:
       - slug: gaycruisebingo
         source: projects/gaycruisebingo/prds/gaycruisebingo.md
         mirror: docs/projects/gaycruisebingo/prds/gaycruisebingo.md
+      # Five Across is the platform rebrand built in the same repo; Gay
+      # Cruise Bingo is its first Edition, so both PRDs share this namespace.
+      - slug: fiveacrossbingo
+        source: projects/gaycruisebingo/prds/fiveacrossbingo.md
+        mirror: docs/projects/gaycruisebingo/prds/fiveacrossbingo.md
+      - slug: native-app-expansion
+        source: projects/gaycruisebingo/prds/native-app-expansion.md
+        mirror: docs/projects/gaycruisebingo/prds/native-app-expansion.md
