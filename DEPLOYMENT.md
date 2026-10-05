@@ -40,6 +40,7 @@ gh auth login
 
 ```bash
 # Clone the template repo if not already present
+mkdir -p ~/GitHub
 git clone https://github.com/nathanjohnpayne/mergepath.git ~/GitHub/mergepath
 
 # Install canonical helper scripts
