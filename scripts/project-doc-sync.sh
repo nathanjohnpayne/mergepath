@@ -218,10 +218,34 @@ sync_direction: ${direction}
 EOF
 }
 
+# Print the line number of the closing delimiter (`---` or `...`) of FILE's
+# leading YAML front matter, or nothing when FILE does not open with `---` on
+# line 1 or the block is never closed (a lone `---` is then a thematic break).
+front_matter_end_line() {
+  awk '
+    { line = $0; sub(/\r$/, "", line) }
+    NR == 1 { if (line != "---") exit; next }
+    line == "---" || line == "..." { print NR; exit }
+  ' "$1"
+}
+
+# Mirror layout: when the source opens with YAML front matter, the front matter
+# stays first and the generated header follows it, so front-matter-aware
+# tooling in the mirror's repo (which requires `---` as the first line) still
+# sees it. Otherwise the header comes first. The mirror is otherwise the source
+# byte-for-byte.
 write_expected() {
   local out=$1 source_file=$2 source_repo=$3 source_path=$4 source_ref=$5 project=$6 class=$7 slug=$8 direction=$9
-  render_header "$source_repo" "$source_path" "$source_ref" "$project" "$class" "$slug" "$direction" >"$out"
-  cat "$source_file" >>"$out"
+  local front_end
+  front_end=$(front_matter_end_line "$source_file")
+  if [ -z "$front_end" ]; then
+    render_header "$source_repo" "$source_path" "$source_ref" "$project" "$class" "$slug" "$direction" >"$out"
+    cat "$source_file" >>"$out"
+    return 0
+  fi
+  awk -v n="$front_end" 'NR > n { exit } { print }' "$source_file" >"$out"
+  render_header "$source_repo" "$source_path" "$source_ref" "$project" "$class" "$slug" "$direction" >>"$out"
+  tail -n +"$((front_end + 1))" "$source_file" >>"$out"
 }
 
 compare_or_materialize() {
@@ -253,10 +277,41 @@ compare_or_materialize() {
   fi
 }
 
+# Print the body lines of FILE's generated header comment, or nothing when FILE
+# carries none. The header is recognized only where write_expected places it:
+# on line 1 (a source without front matter, or a mirror written before the
+# header moved below the front matter), or on the line right after a leading
+# YAML front matter block. A comment anywhere else, or one that is never closed
+# within the header's size, is not a generated header.
+generated_header_lines() {
+  awk '
+    { line = $0; sub(/\r$/, "", line) }
+    state == "" {
+      if (line == "<!--") { state = "header"; next }
+      if (NR == 1 && line == "---") { state = "front"; next }
+      exit
+    }
+    state == "front" {
+      if (line == "---" || line == "...") state = "after_front"
+      next
+    }
+    state == "after_front" {
+      if (line == "<!--") { state = "header"; next }
+      exit
+    }
+    state == "header" {
+      if (line == "-->") { printf "%s", buf; exit }
+      if (++n > 20) exit
+      buf = buf line "\n"
+    }
+  ' "$1"
+}
+
 is_generated_mirror() {
   local file=$1 source_repo=$2 project=$3 class=$4
   local head
-  head=$(sed -n '1,14p' "$file")
+  head=$(generated_header_lines "$file")
+  [ -n "$head" ] || return 1
   printf '%s\n' "$head" | grep -Fqx "generated_by: scripts/project-doc-sync.sh" || return 1
   # An empty source_repo skips that field (the whole-project-removal sweep
   # no longer knows the owning repo); the project + class headers still gate it.
