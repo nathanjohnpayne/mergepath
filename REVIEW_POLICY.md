@@ -1257,20 +1257,21 @@ The SSH-remote-switch covers every repo on the operator's machine (template, con
 - mergepath
 - swipewatch
 - nathanpaynedotcom
-- device-platform-reporting
 - device-source-of-truth
 - overridebroadway
 - friends-and-family-billing
 - docs
 - fiveacross
+- matchline
+- tadlockpsychiatry
 <!-- bootstrap-loop-list-end -->
 
 ```bash
 # Explicit path to mergepath/REVIEW_POLICY.md — pwd may not be the
 # mergepath repo when the operator runs this (see #252 Codex P1).
 for repo in $(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end -->/' \
-              ~/Documents/GitHub/mergepath/REVIEW_POLICY.md | grep '^- ' | sed 's/^- //'); do
-  cd ~/Documents/GitHub/$repo
+              ~/GitHub/mergepath/REVIEW_POLICY.md | grep '^- ' | sed 's/^- //'); do
+  cd ~/GitHub/$repo
   CURRENT=$(git remote get-url origin)
   if [[ "$CURRENT" == https* ]]; then
     SLUG=$(echo "$CURRENT" | sed 's|https://github.com/||;s|\.git$||')

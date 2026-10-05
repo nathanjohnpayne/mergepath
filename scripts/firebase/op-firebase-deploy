@@ -1,15 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Non-interactive Firebase deploy via service account impersonation.
+# Non-interactive Firebase deploy as the project's firebase-deployer SA.
 #
-# Resolves a source credential from GOOGLE_APPLICATION_CREDENTIALS, a 1Password
-# ADC item, or the local ADC file; generates a temporary
-# impersonated_service_account credential from it; sets
-# GOOGLE_APPLICATION_CREDENTIALS; and runs firebase deploy.
+# Resolves a source credential in the order documented in DEPLOYMENT.md
+# § Deploy credential precedence (canonical):
+#   1. a human-supplied GOOGLE_APPLICATION_CREDENTIALS override
+#   2. the project Firebase-vault SA key
+#      (op://Firebase/{project-id} — Firebase Deployer SA Key), including
+#      the copy op-preflight.sh caches as OP_PREFLIGHT_FIREBASE_SA_TMPFILE
+#   3. the preflight-cached shared ADC (OP_PREFLIGHT_ADC_TMPFILE)
+#   4. the shared 1Password ADC item (DEFAULT_ADC_OP_URI, by item ID)
+#   5. the local ADC file
+# A deployer SA key is used directly. Any other source is wrapped in a
+# temporary impersonated_service_account credential for the deployer SA.
+# Either way the result is exported as GOOGLE_APPLICATION_CREDENTIALS
+# and firebase deploy runs with an isolated Firebase CLI configstore.
 #
 # First-time setup for a new project:
-#   op-firebase-setup [project-id]
+#   op-firebase-setup [project-id] --provision-sa-key
 #
 # Usage:
 #   op-firebase-deploy              # auto-detect project from .firebaserc
@@ -19,7 +28,9 @@ set -euo pipefail
 
 SA_NAME="${FIREBASE_DEPLOY_SA_NAME:-firebase-deployer}"
 DEFAULT_ADC_FILE="${HOME}/.config/gcloud/application_default_credentials.json"
-DEFAULT_ADC_OP_URI="${FIREBASE_SOURCE_CREDENTIAL_OP_URI:-${GCP_ADC_OP_URI:-op://Private/GCP ADC/credential}}"
+DEFAULT_ADC_OP_URI="${FIREBASE_SOURCE_CREDENTIAL_OP_URI:-${GCP_ADC_OP_URI:-op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential}}"
+# ^ Item ID, not title ("GCP ADC"): a rename must not silently break the
+#   fallback. Matches scripts/op-preflight.sh and DEPLOYMENT.md.
 SOURCE_CRED_FILE=""
 SOURCE_CRED_TMPFILE=""
 FIREBASE_CONFIG_TMPDIR=""
