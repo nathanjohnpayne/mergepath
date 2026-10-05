@@ -108,6 +108,9 @@ grep -q "sync_direction: repo-to-central" "$DOCS/projects/app/specs/feature.md" 
   || fail "spec mirror missing repo-to-central direction"
 grep -q "source_repo: example/app" "$DOCS/projects/app/specs/feature.md" \
   || fail "spec mirror missing owning repo source metadata"
+# A source without YAML front matter keeps the header-first layout.
+[ "$(head -n 1 "$APP/docs/projects/app/prds/app.md")" = "<!--" ] \
+  || fail "PRD mirror of a source without front matter should open with the generated header"
 
 out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --no-clone 2>&1)
 rc=$?
@@ -450,5 +453,213 @@ set -e
 [ "$rc" -eq 2 ] || fail "owner.name with '..' should fail closed (rc=$rc): $out"
 echo "$out" | grep -q "traversal component" || fail "name traversal should be named in the error: $out"
 restore_manifest; resync
+
+# ---------------------------------------------------------------------------
+# YAML front matter: when the source opens with front matter, the mirror keeps
+# it first and places the generated header right after it, so front-matter-aware
+# tooling in the mirror's repo (which requires `---` as the first line) still
+# sees it. Audit, idempotent materialize, and the header-gated orphan sweep must
+# all hold for that layout, and orphan detection must still recognize mirrors
+# written in the earlier header-first layout. Independent fixture: its own
+# central repo, owner, and manifest, so the full-audit removed-project sweep
+# never sees the `app` fixture above.
+# ---------------------------------------------------------------------------
+FM_MP="$WORKDIR/mergepath-fm"
+FM_DOCS="$WORKDIR/fm-docs"
+FM_APP="$WORKDIR/fm-app"
+mkdir -p "$FM_MP/scripts" "$FM_DOCS/projects/fm/prds" "$FM_APP/specs"
+cp "$SCRIPT" "$FM_MP/scripts/project-doc-sync.sh"
+chmod +x "$FM_MP/scripts/project-doc-sync.sh"
+
+cat >"$FM_DOCS/projects/fm/prds/fm.md" <<'EOF'
+---
+tags:
+  - fm
+  - prd
+---
+# FM PRD
+
+Product intent with front matter.
+
+---
+
+A thematic break above must not be mistaken for front matter.
+EOF
+# Opens with `---` but never closes it: a thematic break, not front matter.
+cat >"$FM_DOCS/projects/fm/prds/rule.md" <<'EOF'
+---
+
+# Rule PRD
+
+No front matter here.
+EOF
+cat >"$FM_APP/specs/fm-spec.md" <<'EOF'
+---
+title: FM spec
+...
+# FM Spec
+
+Implementation contract with front matter.
+EOF
+git init -q "$FM_DOCS"
+(cd "$FM_DOCS" && git add -A && git -c user.name=t -c user.email=t@example.com commit -q -m docs)
+git init -q "$FM_APP"
+(cd "$FM_APP" && git add -A && git -c user.name=t -c user.email=t@example.com commit -q -m app)
+
+cat >"$FM_MP/.mergepath-project-docs.yml" <<EOF
+version: 1
+central_repo:
+  name: fm-docs
+  repo: example/fm-docs
+  path_hint: "$FM_DOCS"
+projects:
+  - slug: fm
+    owner:
+      name: fm-app
+      repo: example/fm-app
+      path_hint: "$FM_APP"
+    prds:
+      - slug: fm
+        source: projects/fm/prds/fm.md
+        mirror: docs/projects/fm/prds/fm.md
+      - slug: rule
+        source: projects/fm/prds/rule.md
+        mirror: docs/projects/fm/prds/rule.md
+    specs:
+      - source: specs/
+        mirror: projects/fm/specs/
+EOF
+fm_sync() { MERGEPATH_ROOT_OVERRIDE="$FM_MP" "$FM_MP/scripts/project-doc-sync.sh" "$@"; }
+
+fm_sync --materialize >/dev/null
+FM_PRD="$FM_APP/docs/projects/fm/prds/fm.md"
+FM_SPEC="$FM_DOCS/projects/fm/specs/fm-spec.md"
+[ -f "$FM_PRD" ] || fail "front matter: materialize did not create PRD mirror"
+[ -f "$FM_SPEC" ] || fail "front matter: materialize did not create spec mirror"
+
+# Front matter first, header immediately after it (source lines 1-5 are the
+# front matter; the header is `<!--`, 9 fields, `-->`, and a blank line).
+[ "$(head -n 5 "$FM_PRD")" = "$(head -n 5 "$FM_DOCS/projects/fm/prds/fm.md")" ] \
+  || fail "front matter: PRD mirror should open with the source's front matter: $(head -n 8 "$FM_PRD")"
+[ "$(sed -n '6p' "$FM_PRD")" = "<!--" ] \
+  || fail "front matter: generated header should start right after the front matter: $(head -n 8 "$FM_PRD")"
+[ "$(sed -n '7p' "$FM_PRD")" = "generated_by: scripts/project-doc-sync.sh" ] \
+  || fail "front matter: generated header missing after the front matter"
+grep -Fqx "sync_direction: central-to-repo" "$FM_PRD" \
+  || fail "front matter: PRD mirror missing central-to-repo direction"
+# Lossless: removing the header block yields the source byte-for-byte.
+sed '6,17d' "$FM_PRD" | cmp -s - "$FM_DOCS/projects/fm/prds/fm.md" \
+  || fail "front matter: PRD mirror minus the header should equal the source"
+grep -c "generated_by:" "$FM_PRD" | grep -qx 1 \
+  || fail "front matter: PRD mirror should carry exactly one generated header"
+
+# The `...` closing delimiter is front matter too; the spec direction shares
+# the same layout.
+[ "$(head -n 1 "$FM_SPEC")" = "---" ] && [ "$(sed -n '4p' "$FM_SPEC")" = "<!--" ] \
+  || fail "front matter: spec mirror should keep '...'-closed front matter first: $(head -n 6 "$FM_SPEC")"
+grep -Fqx "sync_direction: repo-to-central" "$FM_SPEC" \
+  || fail "front matter: spec mirror missing repo-to-central direction"
+
+# An unclosed leading `---` is not front matter: header-first layout.
+[ "$(head -n 1 "$FM_APP/docs/projects/fm/prds/rule.md")" = "<!--" ] \
+  || fail "front matter: unclosed leading '---' should keep the header-first layout"
+
+out=$(fm_sync --audit --no-clone 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] || fail "front matter: audit should pass after materialize (rc=$rc): $out"
+
+# Idempotent: a second materialize leaves the mirror byte-identical.
+cp "$FM_PRD" "$WORKDIR/fm-prd.before"
+fm_sync --materialize >/dev/null
+cmp -s "$WORKDIR/fm-prd.before" "$FM_PRD" \
+  || fail "front matter: re-materialize should be idempotent"
+
+# Drift: a manual edit to the body below the header is caught.
+printf '\nlocal edit\n' >>"$FM_PRD"
+set +e
+out=$(fm_sync --audit --no-clone 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "front matter: audit should catch a manual mirror edit (rc=$rc): $out"
+echo "$out" | grep -q "DRIFT fm prd:fm " \
+  || fail "front matter: manual mirror edit should report drift: $out"
+fm_sync --materialize >/dev/null
+
+# Drift: editing the front matter above the header is caught too.
+sed 's/  - prd/  - edited/' "$FM_PRD" >"$WORKDIR/fm-prd.edited" && cp "$WORKDIR/fm-prd.edited" "$FM_PRD"
+set +e
+out=$(fm_sync --audit --no-clone 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "front matter: audit should catch a front matter edit (rc=$rc): $out"
+fm_sync --materialize >/dev/null
+
+# A mirror in the earlier header-first layout is drift against the new layout,
+# and materialize rewrites it in place.
+{
+  sed -n '6,17p' "$FM_PRD"
+  cat "$FM_DOCS/projects/fm/prds/fm.md"
+} >"$WORKDIR/fm-prd.legacy"
+cp "$WORKDIR/fm-prd.legacy" "$FM_PRD"
+set +e
+out=$(fm_sync --audit --no-clone 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "front matter: header-first mirror should be drift (rc=$rc): $out"
+echo "$out" | grep -q "DRIFT fm prd:fm " \
+  || fail "front matter: header-first mirror should report drift, not orphan: $out"
+fm_sync --materialize >/dev/null
+cmp -s "$WORKDIR/fm-prd.before" "$FM_PRD" \
+  || fail "front matter: materialize should rewrite a header-first mirror into the new layout"
+
+# Orphans: an undeclared generated mirror is flagged and removed in either
+# layout — front matter first (new) or header first (earlier).
+cp "$FM_PRD" "$FM_APP/docs/projects/fm/prds/stale.md"
+cp "$WORKDIR/fm-prd.legacy" "$FM_APP/docs/projects/fm/prds/stale-legacy.md"
+set +e
+out=$(fm_sync --audit --no-clone 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "front matter: audit should flag orphan mirrors (rc=$rc): $out"
+echo "$out" | grep -q "DRIFT fm prd:stale orphan" \
+  || fail "front matter: front-matter-first orphan not reported: $out"
+echo "$out" | grep -q "DRIFT fm prd:stale-legacy orphan" \
+  || fail "front matter: header-first orphan not reported: $out"
+fm_sync --materialize >/dev/null
+[ ! -e "$FM_APP/docs/projects/fm/prds/stale.md" ] \
+  || fail "front matter: materialize should remove a front-matter-first orphan"
+[ ! -e "$FM_APP/docs/projects/fm/prds/stale-legacy.md" ] \
+  || fail "front matter: materialize should remove a header-first orphan"
+
+# Spec orphan in the front-matter-first layout (source deleted).
+mv "$FM_APP/specs/fm-spec.md" "$WORKDIR/fm-spec.stash"
+set +e
+out=$(fm_sync --audit --no-clone 2>&1)
+rc=$?
+set -e
+echo "$out" | grep -q "DRIFT fm spec:fm-spec orphan" \
+  || fail "front matter: front-matter-first spec orphan not reported (rc=$rc): $out"
+fm_sync --materialize >/dev/null
+[ ! -e "$FM_SPEC" ] || fail "front matter: materialize should remove the spec orphan"
+mv "$WORKDIR/fm-spec.stash" "$FM_APP/specs/fm-spec.md"
+fm_sync --materialize >/dev/null
+
+# Hand-written files are never orphans, even when they carry front matter and
+# a generated-looking comment that is not where write_expected puts the header.
+{
+  printf -- '---\ntags:\n  - notes\n---\n\n'
+  sed -n '6,16p' "$FM_PRD"
+  printf '\nHand-written; the comment is not directly after the front matter.\n'
+} >"$FM_APP/docs/projects/fm/prds/notes-gap.md"
+{
+  printf -- '---\ntags:\n  - notes\n---\n# Notes\n\n'
+  sed -n '6,16p' "$FM_PRD"
+} >"$FM_APP/docs/projects/fm/prds/notes-body.md"
+out=$(fm_sync --audit --no-clone 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] || fail "front matter: hand-written files must not be flagged as orphans (rc=$rc): $out"
+fm_sync --materialize >/dev/null
+[ -f "$FM_APP/docs/projects/fm/prds/notes-gap.md" ] && [ -f "$FM_APP/docs/projects/fm/prds/notes-body.md" ] \
+  || fail "front matter: materialize must not remove hand-written files"
 
 echo "PASS: project-doc-sync"
