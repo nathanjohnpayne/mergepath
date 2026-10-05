@@ -40,13 +40,13 @@ gh auth login
 
 ```bash
 # Clone the template repo if not already present
-git clone https://github.com/nathanjohnpayne/mergepath.git ~/Documents/GitHub/mergepath
+git clone https://github.com/nathanjohnpayne/mergepath.git ~/GitHub/mergepath
 
 # Install canonical helper scripts
 mkdir -p ~/.local/bin
-cp ~/Documents/GitHub/mergepath/scripts/gcloud/gcloud ~/.local/bin/
-cp ~/Documents/GitHub/mergepath/scripts/firebase/op-firebase-deploy ~/.local/bin/
-cp ~/Documents/GitHub/mergepath/scripts/firebase/op-firebase-setup ~/.local/bin/
+cp ~/GitHub/mergepath/scripts/gcloud/gcloud ~/.local/bin/
+cp ~/GitHub/mergepath/scripts/firebase/op-firebase-deploy ~/.local/bin/
+cp ~/GitHub/mergepath/scripts/firebase/op-firebase-setup ~/.local/bin/
 chmod +x ~/.local/bin/gcloud ~/.local/bin/op-firebase-deploy ~/.local/bin/op-firebase-setup
 
 # Ensure PATH includes ~/.local/bin
@@ -55,16 +55,17 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
 
 ### 4. Clone and bootstrap all repos
 
-The full bootstrap loop runs across each repo the bootstrap wizard has provisioned. This list is maintained by the wizard's cross-repo loop step and is **not** the same population as `.mergepath-sync.yml`'s `consumers:` — a repo appears here once it is bootstrapped, but ongoing propagation requires a separate enrollment as a sync consumer (see mergepath#741; the two lists genuinely differ, e.g. sync consumers `matchline` / `tadlockpsychiatry` are not in this bootstrap loop). Being listed here does **not** mean a repo receives mergepath's post-bootstrap fixes. Bootstrapped repos:
+The full bootstrap loop runs across each repo the bootstrap wizard has provisioned. This list is maintained by the wizard's cross-repo loop step and is **not** the same population as `.mergepath-sync.yml`'s `consumers:` — a repo appears here once it is bootstrapped, but ongoing propagation requires a separate enrollment as a sync consumer (see mergepath#741; the two lists can differ). Archived repos (e.g. `device-platform-reporting`) are removed from this list, since the loop would otherwise clone and bootstrap a read-only repo. Being listed here does **not** mean a repo receives mergepath's post-bootstrap fixes. Bootstrapped repos:
 
 <!-- bootstrap-loop-list-start -->
 - friends-and-family-billing
-- device-platform-reporting
 - device-source-of-truth
 - swipewatch
 - nathanpaynedotcom
 - overridebroadway
 - fiveacross
+- matchline
+- tadlockpsychiatry
 <!-- bootstrap-loop-list-end -->
 
 Run the bootstrap script across all of them:
@@ -72,13 +73,13 @@ Run the bootstrap script across all of them:
 ```bash
 # Resolve the repo list FIRST (while pwd is anywhere), THEN cd. The
 # awk lookup must point at mergepath's DEPLOYMENT.md explicitly —
-# `cd ~/Documents/GitHub` doesn't put us inside mergepath, so a bare
+# `cd ~/GitHub` doesn't put us inside mergepath, so a bare
 # `DEPLOYMENT.md` arg would silently expand to nothing and the loop
 # would no-op. See #252 (Codex P1).
 repos=$(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end -->/' \
-        ~/Documents/GitHub/mergepath/DEPLOYMENT.md | grep '^- ' | sed 's/^- //')
+        ~/GitHub/mergepath/DEPLOYMENT.md | grep '^- ' | sed 's/^- //')
 
-cd ~/Documents/GitHub
+cd ~/GitHub
 for repo in $repos; do
   git clone "https://github.com/nathanjohnpayne/$repo.git" 2>/dev/null || (cd "$repo" && git pull)
   cd "$repo"
@@ -103,9 +104,9 @@ For new runtime application secrets, prefer the current 1Password Environments m
 # Explicit path to mergepath/DEPLOYMENT.md — pwd may not be the
 # mergepath repo (see #252 Codex P1).
 for repo in $(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end -->/' \
-              ~/Documents/GitHub/mergepath/DEPLOYMENT.md | grep '^- ' | sed 's/^- //'); do
+              ~/GitHub/mergepath/DEPLOYMENT.md | grep '^- ' | sed 's/^- //'); do
   echo "=== $repo ==="
-  ls ~/Documents/GitHub/$repo/.env* 2>/dev/null || echo "  (no env files expected)"
+  ls ~/GitHub/$repo/.env* 2>/dev/null || echo "  (no env files expected)"
 done
 ```
 
@@ -122,9 +123,9 @@ When you return from a temporary machine, tell your agent:
 ```bash
 # Resolve repo list before cd-ing away from mergepath (see #252 Codex P1).
 repos=$(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end -->/' \
-        ~/Documents/GitHub/mergepath/DEPLOYMENT.md | grep '^- ' | sed 's/^- //')
+        ~/GitHub/mergepath/DEPLOYMENT.md | grep '^- ' | sed 's/^- //')
 
-cd ~/Documents/GitHub
+cd ~/GitHub
 for repo in $repos; do
   cd "$repo"
   # Do not edit generated env files as the source of truth. If secret
@@ -141,9 +142,9 @@ done
 ```bash
 # Resolve repo list before cd-ing away from mergepath (see #252 Codex P1).
 repos=$(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end -->/' \
-        ~/Documents/GitHub/mergepath/DEPLOYMENT.md | grep '^- ' | sed 's/^- //')
+        ~/GitHub/mergepath/DEPLOYMENT.md | grep '^- ' | sed 's/^- //')
 
-cd ~/Documents/GitHub
+cd ~/GitHub
 for repo in $repos; do
   cd "$repo"
   git pull                          # get code changes from the temp machine
@@ -912,7 +913,7 @@ For routine Firebase deploys, the preferred permanent fix is to provision or rot
 
 ## Changelog
 
-**2026-05-15: Deploy credential precedence updated.** Project Firebase-vault SA keys are now the default for `op-firebase-deploy`. See #154 / #211 for implementation history; live consumer verification on matchline pending (#211 close-out).
+**2026-05-15: Deploy credential precedence updated.** Project Firebase-vault SA keys are now the default for `op-firebase-deploy`. See #154 / #211 for implementation history; live consumer verification closed out with #211 (2026-05-23).
 
 **2026-05-22: Deploy preflight caches the project SA key first.** In Firebase repos, `op-preflight.sh --mode deploy|all` now materializes the project Firebase-vault SA key before trying the shared GCP ADC. This removes the routine stale-ADC/RAPT probe from attended deploy sessions when the durable project key exists.
 
