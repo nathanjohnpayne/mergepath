@@ -355,14 +355,14 @@ class ProviderTests(unittest.TestCase):
                 self.assertFalse(run['actionable']); self.assertFalse(run['superseded']); self.assertEqual(run['conclusion'], 'success')
                 self.assertEqual(sum('/jobs?' in call['route'] for call in fixture['calls']), 0)
                 self.assertEqual([call['route'] for call in fixture['calls'] if '/check-runs?' in call['route']],
-                                 [f'/repos/{REPO}/commits/{OTHER_SHA}/check-runs?filter=latest&per_page=100'] if head else [])
+                                 [f'/repos/{REPO}/commits/{OTHER_SHA}/check-runs?filter=all&per_page=100'] if head else [])
                 self.assertEqual([row['sha'] for row in data['check_rows']], [OTHER_SHA] if head else [])
                 self.assertEqual(data['groups'][0]['run_keys'], [run['key']])
                 self.assertFalse(fixture['hot'])
 
     def test_absent_failed_check_runs_stay_unknown_and_are_never_read_as_superseded(self):
-        # The latest filter can drop an older failed check-run. Absence is never clearance: the
-        # run keeps check_evidence_unknown whatever same-name successes sit on the SHA.
+        # A failed job's check-run can be absent from what was read. Absence is never clearance:
+        # the run keeps check_evidence_unknown whatever same-name successes sit on the SHA.
         peer = raw_run(11, 'success'); peer['check_suite_id'] = 51
         for label, present in (('same-run later success of the same name', [raw_check(101, 'success', LATER, name='lint', suite=50)]),
                                ('another run of the same workflow', [raw_check(101, 'success', LATER, name='lint', suite=51)]),
@@ -374,11 +374,75 @@ class ProviderTests(unittest.TestCase):
                         if '/actions/runs?' in route: return [raw_run(), peer] if 'created=' in route else []
                         if '/jobs?' in route: return [raw_job()] if '/runs/10/' in route else [{**raw_job(21, 102), 'conclusion': 'success'}]
                         if '/check-runs?' in route:
-                            assert 'filter=latest' in route, route; return list(present)
+                            assert 'filter=all' in route, route; return list(present)
                         raise AssertionError('unexpected route: ' + route)
                 row = next(r for r in CIProvider(Client(), INVENTORY, clock=lambda: 1000, monotonic=lambda: 0)(5).data['runs'] if r['id'] == '10')
                 self.assertTrue(row['check_evidence_unknown']); self.assertFalse(row['superseded']); self.assertFalse(row['actionable'])
                 self.assertEqual(row['checks'], []); self.assertEqual(row['jobs_scope'], 'all-attempts'); self.assertIsNone(row['severity'])
+
+    def test_open_head_reads_every_check_run_so_a_later_completing_success_cannot_hide_a_failure(self):
+        # #1815 Phase 4b: the latest filter keeps one run per name by completion time. An external
+        # success that completed later but did not start later must not hide the failure.
+        failed = raw_check(200, 'failure', LATER, app=77, name='external gate'); failed['app']['slug'] = 'external-app'
+        for start, superseded in (('2026-10-03T00:01:30Z', False), (None, False), ('2026-10-03T00:03:00Z', True)):
+            with self.subTest(success_start=start):
+                passed = {**raw_check(201, 'success', start, app=77, name='external gate'), 'completed_at': '2026-10-03T00:04:00Z'}
+                passed['app'] = {'id': 77, 'slug': 'external-app'}
+                routes = []
+                class Client:
+                    def pages(self, route, **kwargs):
+                        routes.append(route)
+                        if '/pulls?' in route: return [{'number': 7, 'head': {'sha': SHA}}]
+                        if '/actions/runs?' in route: return []
+                        if '/check-runs?' in route:
+                            # GitHub's latest filter would return only the later-completing success.
+                            return [passed] if 'filter=latest' in route else [failed, passed]
+                        raise AssertionError('unexpected route: ' + route)
+                row = CIProvider(Client(), INVENTORY, clock=lambda: 1000, monotonic=lambda: 0)(5).data['check_rows'][0]
+                self.assertEqual([r for r in routes if '/check-runs?' in r], [f'/repos/{REPO}/commits/{SHA}/check-runs?filter=all&per_page=100'])
+                self.assertEqual(row['superseded'], superseded); self.assertEqual(row['actionable'], not superseded)
+                self.assertEqual(row['severity'], None if superseded else 'bump')
+
+    def test_failed_run_off_open_heads_keeps_suite_diagnostics_for_the_installation_window(self):
+        # #1815 Phase 4b: the Actions budget reads installation exhaustion from failed runs' check
+        # diagnostics in the last hour, including scheduled and default-branch runs off every open HEAD.
+        from mergepath.cockpit.actions import ActionsProvider, ci_observation
+        now = [1791300000.0]
+        def iso(value): return datetime.datetime.fromtimestamp(value, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        recent = raw_run(31, 'failure', OTHER_SHA); recent.update(created_at=iso(now[0] - 600), pull_requests=[], check_suite_id=61)
+        old = raw_run(32, 'failure', OTHER_SHA); old.update(created_at=iso(now[0] - 3700), pull_requests=[], check_suite_id=62)
+        passed = raw_run(33, 'success', OTHER_SHA); passed.update(created_at=iso(now[0] - 600), pull_requests=[], check_suite_id=63)
+        exhausted = raw_check(131, 'failure', suite=61); exhausted['head_sha'] = OTHER_SHA
+        exhausted['output'] = {'title': 'lint failed', 'summary': 'API rate limit exceeded for installation ID 7'}
+        routes = []
+        class Client:
+            def pages(self, route, **kwargs):
+                routes.append(route)
+                if '/pulls?' in route: return [{'number': 7, 'head': {'sha': SHA}}]
+                if '/actions/runs?' in route: return [recent, old, passed] if 'created=' in route else []
+                if '/jobs?' in route:
+                    run_id = route.split('/runs/')[1].split('/')[0]
+                    return [raw_job(int(run_id) * 10, 131 if run_id == '31' else 132)]
+                if '/commits/' in route and '/check-runs?' in route: return []
+                if '/check-suites/61/check-runs?filter=all&per_page=100' in route: return [exhausted]
+                raise AssertionError('unexpected route: ' + route)
+        provider = CIProvider(Client(), INVENTORY, clock=lambda: now[0], monotonic=lambda: 0)
+        data = provider(5).data; rows = {row['id']: row for row in data['runs']}
+        self.assertEqual([r for r in routes if '/check-suites/' in r], [f'/repos/{REPO}/check-suites/61/check-runs?filter=all&per_page=100'])
+        self.assertEqual([c['id'] for c in rows['31']['checks']], ['131']); self.assertFalse(rows['31']['check_evidence_unknown'])
+        self.assertFalse(rows['31']['actionable']); self.assertIsNone(rows['31']['current_head'])
+        self.assertTrue(rows['32']['check_evidence_unknown']); self.assertEqual(rows['32']['checks'], [])
+        envelope = {'stale': False, 'data': data}
+        observed = ci_observation(envelope, REPO, now[0])
+        self.assertEqual([(r['id'], r['failure_message']) for r in observed['hour'] if r['failure_message']], [(31, 'api rate limit exceeded for installation')])
+        budget = ActionsProvider(None, INVENTORY, clock=lambda: now[0], monotonic=lambda: 0,
+                                 ci_snapshot=lambda repo, at: ci_observation(envelope, repo, at)).fetch(30).data['repositories'][0]
+        self.assertEqual(budget['installation_runs'], ['31'])
+        # A completed attempt's suite is final: the next scan reuses it, a new attempt reads again.
+        routes.clear(); provider(5)
+        self.assertEqual([r for r in routes if '/check-suites/' in r], [])
+        recent['run_attempt'] = 2; routes.clear(); provider(5)
+        self.assertEqual([r for r in routes if '/check-suites/' in r], [f'/repos/{REPO}/check-suites/61/check-runs?filter=all&per_page=100'])
 
     def test_page_shift_repeats_are_deduplicated_instead_of_failing_the_repository(self):
         duplicate = raw_check(); duplicate['output'] = {'summary': 'second copy'}
@@ -515,7 +579,7 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(len(calls), 17)
         self.assertTrue(sample.data['runs'][0]['actionable'])
         self.assertTrue(all('filter=all' in u for u in calls if '/jobs?' in u))
-        self.assertTrue(all('filter=latest' in u for u in calls if '/check-runs?' in u))
+        self.assertTrue(all('filter=all' in u for u in calls if '/check-runs?' in u))
 
     def test_independent_actions_run_lineage_preserves_current_head_failure(self):
         # Observed #1698 run/suite lineage; check/app IDs remain synthetic fixtures.

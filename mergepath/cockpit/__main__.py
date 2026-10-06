@@ -24,7 +24,8 @@ from mergepath.cockpit.github import ClientError, GitHubClient
 from mergepath.cockpit.fleet import FleetProvider
 from mergepath.cockpit.inventory import load_inventory
 from mergepath.cockpit.live_agents import LiveAgentsProvider, resolve_live_directory
-from mergepath.cockpit.ci import CIProvider, LogExcerptCache
+from mergepath.cockpit.ci import (CIProvider, HOT_INTERVAL as CI_HOT_INTERVAL, IDLE_INTERVAL as CI_IDLE_INTERVAL,
+                                  LogExcerptCache, OBSERVATION_GAP as CI_OBSERVATION_GAP, TIMEOUT as CI_TIMEOUT)
 from mergepath.cockpit.prs import PRProvider
 from mergepath.cockpit.server import Application, CockpitServer
 from mergepath.cockpit.sync import SyncProvider
@@ -104,7 +105,7 @@ def shared_ci_snapshot(app, repo, _fetch_now):
     # Another source can publish while Actions is fetching. Read the copied
     # receipt before the validation clock, so a new observation is not future.
     envelope = app.panel_snapshot("ci")["envelope"]
-    return ci_observation(envelope, repo, app.clock())
+    return ci_observation(envelope, repo, app.clock(), max_age=CI_OBSERVATION_GAP)
 
 
 def main(argv=None):
@@ -140,7 +141,8 @@ def main(argv=None):
         ci_provider = CIProvider(github, inventory)
         # A full eight-repository scan costs 30 to 55 paid requests and about a minute even at
         # steady state (measured 2026-10-06), so the hot cadence is a minute, not 20 seconds.
-        app.scheduler.register("ci", ci_provider, hot_interval=60, idle_interval=120, timeout=60)
+        # The Actions budget reads this snapshot within ci.OBSERVATION_GAP, derived from it.
+        app.scheduler.register("ci", ci_provider, hot_interval=CI_HOT_INTERVAL, idle_interval=CI_IDLE_INTERVAL, timeout=CI_TIMEOUT)
         app.register_panel("ci", "ci")
         app.ci_excerpts = LogExcerptCache(inventory, lambda repo, job, deadline: github.read_job_log(repo, job, deadline=deadline))
         pr_provider = PRProvider(github, inventory, ROOT, checkout_roots={"nathanjohnpayne/mergepath": ROOT})
@@ -162,7 +164,8 @@ def main(argv=None):
             app.sync = SyncProvider(inventory, ROOT, fleet.fetch, cache_dir=cache_dir, agent=args.agent,
                                     changed=app.publish, completed=completed)
         actions_provider = ActionsProvider(github, inventory, settings=actions_settings,
-                                           ci_snapshot=lambda repo, now: shared_ci_snapshot(app, repo, now))
+                                           ci_snapshot=lambda repo, now: shared_ci_snapshot(app, repo, now),
+                                           ci_max_gap=CI_OBSERVATION_GAP)
         app.scheduler.register("actions", actions_provider.fetch, hot_interval=15, idle_interval=120, timeout=30)
         app.register_panel("budget", "actions")
         agents_provider = AgentsProvider(inventory, checkouts, ROOT, price_keys=price_keys, github=github, reviewers=reviewers)

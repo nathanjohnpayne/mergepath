@@ -117,8 +117,12 @@ def run_rows(rows, repo, now, status=None):
     return result
 
 
-def ci_observation(envelope, repo, now):
-    """Read a copied ci/v1 snapshot without causing a poll or log request."""
+def ci_observation(envelope, repo, now, max_age=120):
+    """Read a copied ci/v1 snapshot without causing a poll or log request.
+
+    max_age is the CI source's observation gap: the launcher passes ci.OBSERVATION_GAP,
+    derived from that source's registered cadence, so a snapshot between scans stays usable.
+    """
     data = envelope.get("data") if type(envelope) is dict else None
     if (type(data) is not dict or data.get("schema") != "ci/v1"
             or envelope.get("stale") is not False or not count(data.get("recent_seconds"))
@@ -130,7 +134,7 @@ def ci_observation(envelope, repo, now):
     observation = next((row for row in observations if type(row) is dict and row.get("repo") == repo), None)
     if (not observation or observation.get("stale") is not False or observation.get("error") is not None
             or not number(observation.get("observed_at"))
-            or not 0 <= now - observation["observed_at"] <= 120):
+            or not 0 <= now - observation["observed_at"] <= max_age):
         return None
     raw = data.get("runs")
     if type(raw) is not list or len(raw) > 20000:
@@ -171,8 +175,13 @@ def ci_observation(envelope, repo, now):
 
 class ActionsProvider:
     def __init__(self, client, inventory, *, settings=None, ci_snapshot=None,
-                 robot_snapshot=None, clock=time.time, monotonic=time.monotonic):
+                 robot_snapshot=None, clock=time.time, monotonic=time.monotonic, ci_max_gap=120):
         self.client, self.clock, self.monotonic = client, clock, monotonic
+        # An injected CI snapshot is renewed on the CI source's cadence, not on this source's,
+        # so its freshness and jam continuity use that source's observation gap.
+        if type(ci_max_gap) not in (int, float) or not math.isfinite(ci_max_gap) or not 0 < ci_max_gap <= 3600:
+            raise ValueError("invalid_ci_max_gap")
+        self.ci_max_gap = ci_max_gap
         self.repos = tuple(item.repo for item in inventory)
         if not self.repos or len(self.repos) > 100 or any(not REPO.fullmatch(repo) for repo in self.repos):
             raise ValueError("invalid_actions_inventory")
@@ -213,7 +222,7 @@ class ActionsProvider:
             now = self.clock()
             if (type(value) is not dict or value.get("complete") is not True
                     or value.get("stale") is not False or not number(value.get("observed_at"))
-                    or not 0 <= now - value["observed_at"] <= 120):
+                    or not 0 <= now - value["observed_at"] <= self.ci_max_gap):
                 raise ClientError("source_failed")
             queued = run_rows(value.get("queued"), repo, now, "queued")
             running = run_rows(value.get("running"), repo, now, "in_progress")
@@ -234,7 +243,8 @@ class ActionsProvider:
         previous = self._jam.get(repo)
         qualifies = q >= 40 and r <= 1
         # Repeated snapshots, gaps, clock reversals and failed reads cannot age a jam.
-        comparable = previous is not None and 0 < observed - previous["last"] <= 120
+        gap = self.ci_max_gap if self.ci_snapshot is not None else 120
+        comparable = previous is not None and 0 < observed - previous["last"] <= gap
         repeated = previous is not None and observed == previous["last"]
         since = previous["since"] if qualifies and (comparable or repeated) else observed
         self._jam[repo] = {"since": since, "last": observed} if qualifies else None

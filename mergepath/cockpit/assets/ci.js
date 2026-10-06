@@ -283,6 +283,8 @@
         const target = attention(row) ? this.list : this.historyList, index = target === this.list ? primary++ : history++;
         if (target.children[index] !== view.root) target.insertBefore(view.root, target.children[index] || null);
       }
+      // A focused run that moves into collapsed history reveals it: focus cannot return into a hidden list.
+      if (focus && !this.historyOpen && this.historyList.contains(focus)) this.historyOpen = true;
       this.discloseHistory();
       // A browser drops focus when a focused node moves; restore it only then, never over an explicit focus change.
       if (focus && focus !== document.body && focus.isConnected !== false && this.parent.contains(focus) && (document.activeElement === null || document.activeElement === document.body)) focus.focus({preventScroll: true});

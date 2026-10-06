@@ -206,11 +206,12 @@ class Node {
   get lastChild(){return this.children.at(-1);}
   append(...nodes){for(const node of nodes){node.remove();node.parentNode=this;this.children.push(node);}}
   insertBefore(node,reference){node.remove();node.parentNode=this;const index=reference===null?this.children.length:this.children.indexOf(reference);this.children.splice(index<0?this.children.length:index,0,node);}
-  remove(){if(this.parentNode){const p=this.parentNode;p.children.splice(p.children.indexOf(this),1);this.parentNode=null;}}
+  // Like a browser, detaching a node that holds focus drops it, and a hidden subtree cannot take focus.
+  remove(){if(this.parentNode){if(this.contains(document.activeElement))document.activeElement=null;const p=this.parentNode;p.children.splice(p.children.indexOf(this),1);this.parentNode=null;}}
   setAttribute(key,value){this.attrs[key]=value;}
   addEventListener(name,fn){this.listeners[name]=fn;}
   contains(node){return node===this||this.children.some(c=>c.contains(node));}
-  focus(){document.activeElement=this;}
+  focus(){for(let n=this;n;n=n.parentNode)if(n.hidden)return;document.activeElement=this;}
 }
 function dom(){global.document={createElement:tag=>new Node(tag),activeElement:null};return new Node("div");}
 test("Unknown open-HEAD marker uses honest copy and preserves disclosure when checks arrive", () => {
@@ -341,4 +342,26 @@ test("completed runs off open heads sit behind a counted history disclosure whil
   assert.equal(view.historyList.children.length, 0); assert.equal(view.history.hidden, true);
   assert.equal(CI.attention({status: "completed", conclusion: "failure", current_head: null, actionable: false}), true);
   assert.equal(CI.attention({status: "completed", conclusion: "cancelled", current_head: false, actionable: false}), false);
+});
+
+test("a focused run that moves into collapsed history reveals it and keeps keyboard focus", () => {
+  const data = fixture(), base = data.runs[0];
+  const done = {...structuredClone(base), id: "12", key: `${base.repo}:12:${base.pr ?? "none"}`, status: "completed", conclusion: "success", current_head: true,
+    jobs: [], jobs_scope: "all-attempts", checks: [], diagnostics: [], actionable: false, superseded: false, severity: null, reason: null, check_evidence_unknown: false, rerun_command: null};
+  data.runs.push(done);
+  const parent = dom(), view = new CI.CIView(parent, () => assert.fail("unexpected fetch"));
+  view.update(CI.project(envelope(data), null, 1001));
+  const button = view.rows.get(done.key).button;
+  assert.equal(button.parentNode && view.list.contains(button), true); button.focus(); assert.equal(document.activeElement, button);
+  assert.equal(view.historyOpen, false);
+  // A new PR HEAD makes the completed success history while its control holds focus.
+  done.current_head = false;
+  view.update(CI.project(envelope(data), null, 1002));
+  assert.equal(view.historyList.contains(button), true);
+  assert.equal(view.historyOpen, true); assert.equal(view.historyList.hidden, false); assert.equal(view.historyToggle.attrs["aria-expanded"], "true");
+  assert.equal(document.activeElement, button);
+  // Without focus inside it, a run moving into history leaves the disclosure as the operator set it.
+  view.historyOpen = false; view.discloseHistory(); done.current_head = true; view.update(CI.project(envelope(data), null, 1003));
+  view.summary.focus(); done.current_head = false; view.update(CI.project(envelope(data), null, 1004));
+  assert.equal(view.historyOpen, false); assert.equal(view.historyList.hidden, true); assert.equal(document.activeElement, view.summary);
 });

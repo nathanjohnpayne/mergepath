@@ -15,6 +15,15 @@ from .scheduler import Sample
 
 FAILURES = frozenset({'failure', 'timed_out', 'action_required', 'startup_failure'})
 LIVE = frozenset({'queued', 'in_progress', 'waiting', 'pending', 'requested'})
+# Registered cadence of the ci source (seconds). A repository observed early in one scan is
+# next observed late in the following one, so consecutive observations of one repository can
+# sit a timeout, the idle interval and another timeout apart. Consumers of the shared snapshot
+# use OBSERVATION_GAP, which adds scheduler slack, as their freshness and continuity bound.
+HOT_INTERVAL, IDLE_INTERVAL, TIMEOUT = 60, 120, 60
+OBSERVATION_GAP = TIMEOUT + IDLE_INTERVAL + TIMEOUT + 30
+# Diagnostics of a failed run off every open HEAD are read for the last hour, the window
+# the Actions budget derives installation exhaustion from.
+DIAGNOSTIC_SECONDS = 3600
 SHA = re.compile(r'[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?\Z')
 DECIMAL = re.compile(r'[1-9][0-9]{0,79}\Z')
 ANSI = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*?(?:\x07|\x1b\\|$))')
@@ -171,9 +180,9 @@ def group_runs(repo, raw_runs, jobs, checks, heads):
                                     + [number for number, head in heads.items() if head == sha])) or [None]
         fetched = jobs.get(run_id)
         related = [check for check in checks if check['sha'] == sha and check['id'] in {job['check_id'] for job in fetched}] if fetched is not None else []
-        # Under the latest check-run filter an older failed check-run may be absent. Absence is
-        # never read as supersession: without the check the run keeps check_evidence_unknown,
-        # because no partial observation establishes clearance.
+        # A failed job's check-run can be absent (a SHA whose check-runs are not read, or the
+        # page bound). Absence is never read as supersession: without the check the run keeps
+        # check_evidence_unknown, because no partial observation establishes clearance.
         for number in numbers:
             current = None if number not in heads else heads[number] == sha
             owned = copy.deepcopy(related)
@@ -241,7 +250,7 @@ class CIProvider:
         if type(jobs_cache) is not int or jobs_cache < 1:
             raise ValueError('invalid_jobs_cache')
         self.jobs_cache = jobs_cache
-        self._records, self._failures, self._jobs_cache = {}, {}, OrderedDict()
+        self._records, self._failures, self._jobs_cache, self._suite_cache = {}, {}, OrderedDict(), OrderedDict()
 
     def _repo(self, repo, deadline):
         base = '/repos/' + repo
@@ -290,14 +299,32 @@ class CIProvider:
                     self._jobs_cache.move_to_end(job_key)
                     while len(self._jobs_cache) > self.jobs_cache:
                         self._jobs_cache.popitem(last=False)
-        # Check-runs are read only for open-PR HEADs, and only the latest per check.
-        # Scheduled sweeps attach check-runs to default-branch SHAs for days (2,052
-        # observed on one mergepath SHA even with filter=latest), so sweep SHAs
-        # cannot be walked within the page bound or the deadline.
+        # Every check-run of an open-PR HEAD is read. The latest filter keeps one run per name
+        # by completion time, which cannot prove that a success started after the failure it
+        # hides. Scheduled sweeps attach check-runs to default-branch SHAs for days (2,052
+        # observed on one mergepath SHA even with filter=latest), so other SHAs are not walked.
         for sha in sorted(current):
             checks.extend(normalize_check(repo, check, workflows) for check in self.client.pages(
-                base + '/commits/' + sha + '/check-runs?filter=latest&per_page=100', collection='check_runs',
+                base + '/commits/' + sha + '/check-runs?filter=all&per_page=100', collection='check_runs',
                 max_pages=self.max_pages, deadline=deadline))
+        # A failed run off every open HEAD keeps its own check suite's diagnostics when it was
+        # created within DIAGNOSTIC_SECONDS. A completed attempt's suite is final, so each is read once.
+        recent = self.clock() - DIAGNOSTIC_SECONDS
+        for raw in runs:
+            raw = _row(raw)
+            created = stamp(raw.get('created_at'))
+            if (raw.get('status') != 'completed' or raw.get('conclusion') not in FAILURES or raw.get('check_suite_id') is None
+                    or _sha(raw.get('head_sha')) in current or created is None or created < recent):
+                continue
+            key = (repo, identity(raw.get('id')), identity(raw.get('run_attempt', 1)))
+            if key not in self._suite_cache:
+                self._suite_cache[key] = [normalize_check(repo, check, workflows) for check in self.client.pages(
+                    base + '/check-suites/' + identity(raw['check_suite_id']) + '/check-runs?filter=all&per_page=100',
+                    collection='check_runs', max_pages=self.max_pages, deadline=deadline)]
+                while len(self._suite_cache) > self.jobs_cache:
+                    self._suite_cache.popitem(last=False)
+            self._suite_cache.move_to_end(key)
+            checks.extend(copy.deepcopy(self._suite_cache[key]))
         # A list that grows while its pages are walked repeats a row at a page edge;
         # the first observation of an id stands.
         checks = supersede(list({check['id']: check for check in reversed(checks)}.values())[::-1])
