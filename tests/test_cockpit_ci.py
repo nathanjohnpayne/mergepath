@@ -360,13 +360,15 @@ class ProviderTests(unittest.TestCase):
                 self.assertEqual(data['groups'][0]['run_keys'], [run['key']])
                 self.assertFalse(fixture['hot'])
 
-    def test_latest_filter_absent_failed_check_is_superseded_only_by_a_later_same_lineage_success(self):
+    def test_latest_filter_absent_failed_check_is_superseded_only_by_a_later_same_run_success(self):
         # filter=latest drops an older failed check-run once the same check ran again; only a
-        # later completed success of the same name from the same workflow lineage proves it.
-        cases = [('same lineage later success', raw_check(101, 'success', LATER, name='lint', suite=50), True),
+        # later completed success of the same name from the same workflow run proves it.
+        peer = raw_run(11, 'success'); peer['check_suite_id'] = 51  # another run of the same workflow on this SHA
+        cases = [('same run later success', raw_check(101, 'success', LATER, name='lint', suite=50), True),
                  ('other name', raw_check(101, 'success', LATER, name='other', suite=50), False),
                  ('other app', dict(raw_check(101, 'success', LATER, name='lint', app=77), app={'id': 77, 'slug': 'external-app'}), False),
-                 ('unknown lineage', raw_check(101, 'success', LATER, name='lint', suite=51), False),
+                 ('another run of the same workflow', raw_check(101, 'success', LATER, name='lint', suite=51), False),
+                 ('unknown lineage', raw_check(101, 'success', LATER, name='lint', suite=52), False),
                  ('later failure', raw_check(101, 'failure', LATER, name='lint', suite=50), False),
                  ('queued', dict(raw_check(101, None, LATER, name='lint', suite=50), status='queued'), False),
                  ('earlier success', raw_check(101, 'success', '2026-10-02T23:00:00Z', name='lint', suite=50), False)]
@@ -375,12 +377,12 @@ class ProviderTests(unittest.TestCase):
                 class Client:
                     def pages(self, route, **kwargs):
                         if '/pulls?' in route: return [{'number': 7, 'head': {'sha': SHA}}]
-                        if '/actions/runs?' in route: return [raw_run()] if 'created=' in route else []
-                        if '/jobs?' in route: return [raw_job()]
+                        if '/actions/runs?' in route: return [raw_run(), peer] if 'created=' in route else []
+                        if '/jobs?' in route: return [raw_job()] if '/runs/10/' in route else [{**raw_job(21, 102), 'conclusion': 'success'}]
                         if '/check-runs?' in route:
                             assert 'filter=latest' in route, route; return [later]
                         raise AssertionError('unexpected route: ' + route)
-                row = CIProvider(Client(), INVENTORY, clock=lambda: 1000, monotonic=lambda: 0)(5).data['runs'][0]
+                row = next(r for r in CIProvider(Client(), INVENTORY, clock=lambda: 1000, monotonic=lambda: 0)(5).data['runs'] if r['id'] == '10')
                 self.assertEqual(row['superseded'], superseded); self.assertFalse(row['actionable'])
                 self.assertEqual(row['check_evidence_unknown'], not superseded); self.assertEqual(row['checks'], [])
                 self.assertEqual(row['jobs_scope'], 'all-attempts'); self.assertIsNone(row['severity'])
