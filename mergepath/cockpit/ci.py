@@ -176,13 +176,17 @@ def group_runs(repo, raw_runs, jobs, checks, heads):
         # same workflow run on that SHA proves it, the invariant supersede() applies;
         # another run of the same workflow, another app, a queued or failed check, or an
         # earlier one leaves the failure actionable.
-        absent = [job for job in (fetched or []) if job['check_id'] is not None and job['check_id'] not in {check['id'] for check in related}]
+        # Every failed job needs that proof; a failed job without a parseable check-run
+        # identity cannot be proven and keeps the whole run unknown.
+        failed_jobs = [job for job in (fetched or []) if job['conclusion'] in FAILURES]
+        absent = [job for job in failed_jobs if job['check_id'] is not None and job['check_id'] not in {check['id'] for check in related}]
+        unproven = any(job['check_id'] is None for job in failed_jobs)
         run_started = stamp(raw.get('run_started_at'))
         later = {check['name'] for check in checks if check['sha'] == sha and check.get('workflow_run_id') == run_id
                  and check['status'] == 'completed' and check['conclusion'] == 'success' and check['started_at'] is not None
                  and (run_started is None or check['started_at'] > run_started)}
-        requeued = bool(absent) and raw.get('conclusion') in FAILURES and not any(check['conclusion'] in FAILURES for check in related) \
-            and all(job['name'] in later for job in absent)
+        requeued = bool(absent) and not unproven and raw.get('conclusion') in FAILURES \
+            and not any(check['conclusion'] in FAILURES for check in related) and all(job['name'] in later for job in absent)
         for number in numbers:
             current = None if number not in heads else heads[number] == sha
             owned = copy.deepcopy(related)

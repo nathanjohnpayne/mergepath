@@ -387,6 +387,24 @@ class ProviderTests(unittest.TestCase):
                 self.assertEqual(row['check_evidence_unknown'], not superseded); self.assertEqual(row['checks'], [])
                 self.assertEqual(row['jobs_scope'], 'all-attempts'); self.assertIsNone(row['severity'])
 
+    def test_absent_check_supersession_needs_proof_for_every_failed_job(self):
+        # One proven sibling job cannot vouch for a failed job whose check-run identity is missing.
+        later = raw_check(101, 'success', LATER, name='lint', suite=50)
+        for label, other_conclusion, superseded in (('failed job without check url', 'failure', False),
+                                                    ('passed job without check url', 'success', True)):
+            with self.subTest(case=label):
+                other = {**raw_job(21, 102), 'name': 'other', 'conclusion': other_conclusion}; other.pop('check_run_url')
+                class Client:
+                    def pages(self, route, **kwargs):
+                        if '/pulls?' in route: return [{'number': 7, 'head': {'sha': SHA}}]
+                        if '/actions/runs?' in route: return [raw_run()] if 'created=' in route else []
+                        if '/jobs?' in route: return [raw_job(), other]
+                        if '/check-runs?' in route: return [later]
+                        raise AssertionError('unexpected route: ' + route)
+                row = CIProvider(Client(), INVENTORY, clock=lambda: 1000, monotonic=lambda: 0)(5).data['runs'][0]
+                self.assertEqual(row['superseded'], superseded); self.assertEqual(row['check_evidence_unknown'], not superseded)
+                self.assertFalse(row['actionable']); self.assertEqual([job['check_id'] for job in row['jobs']], ['100', None])
+
     def test_page_shift_repeats_are_deduplicated_instead_of_failing_the_repository(self):
         duplicate = raw_check(); duplicate['output'] = {'summary': 'second copy'}
         class Client:
