@@ -6,6 +6,7 @@
   else {root.CockpitLiveAgents = api; api.mount(root.CockpitApp);}
 })(globalThis, function(C) {
   const stages = ["barrier", "adapter", "posting", "done"];
+  let terminalLists = 0;
   const number = value => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER;
   const elapsed = value => number(value) ? `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, "0")}` : "unavailable";
   const safeText = value => typeof value === "string" && value.length > 0 && value.length <= 512 && !/[\x00-\x1f]/.test(value);
@@ -79,7 +80,7 @@
       // observations do not become a wall of prose beside the CI panel.
       this.terminal = C.element("div", "live-terminal"); this.terminal.hidden = true; this.terminalOpen = false; this.terminalNodes = new Map();
       this.terminalToggle = C.element("button", "live-terminal-toggle"); this.terminalToggle.type = "button";
-      this.terminalList = C.element("ul", "live-terminal-list"); this.terminalList.id = "live-terminal-observations"; this.terminalList.hidden = true;
+      this.terminalList = C.element("ul", "live-terminal-list"); this.terminalList.id = `live-terminal-observations-${++terminalLists}`; this.terminalList.hidden = true;
       this.terminalToggle.setAttribute("aria-controls", this.terminalList.id); this.terminalToggle.setAttribute("aria-expanded", "false");
       this.terminalToggle.addEventListener("click", () => {this.terminalOpen = !this.terminalOpen; this.discloseTerminal();});
       this.terminalNote = C.element("span", "sub", "Accounting history updates independently; these observations add no spend.");

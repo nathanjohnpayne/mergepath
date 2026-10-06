@@ -171,12 +171,15 @@ def group_runs(repo, raw_runs, jobs, checks, heads):
                                     + [number for number, head in heads.items() if head == sha])) or [None]
         fetched = jobs.get(run_id)
         related = [check for check in checks if check['sha'] == sha and check['id'] in {job['check_id'] for job in fetched}] if fetched is not None else []
-        # With the latest filter, a failed run whose job check-runs are absent has been
-        # re-evaluated by a later check-run of the same name on that SHA (the later run's
-        # own lineage may sit outside the window); the later run carries the verdict, so
-        # this failure is superseded history rather than unknown evidence.
+        # With the latest filter, a failed run whose job check-runs are absent may have been
+        # re-evaluated. Only a later completed success of the same check name from the same
+        # workflow lineage on that SHA proves it, matching supersede(); another app, a
+        # queued or failed check, or an earlier one leaves the failure actionable.
         absent = [job for job in (fetched or []) if job['check_id'] is not None and job['check_id'] not in {check['id'] for check in related}]
-        later = {check['name'] for check in checks if check['sha'] == sha}
+        lineage, run_started = ':workflow:' + identity(raw.get('workflow_id')), stamp(raw.get('run_started_at'))
+        later = {check['name'] for check in checks if check['sha'] == sha and check['producer'] is not None and check['producer'].endswith(lineage)
+                 and check['status'] == 'completed' and check['conclusion'] == 'success' and check['started_at'] is not None
+                 and (run_started is None or check['started_at'] > run_started)}
         requeued = bool(absent) and raw.get('conclusion') in FAILURES and not any(check['conclusion'] in FAILURES for check in related) \
             and all(job['name'] in later for job in absent)
         for number in numbers:

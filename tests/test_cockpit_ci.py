@@ -360,12 +360,18 @@ class ProviderTests(unittest.TestCase):
                 self.assertEqual(data['groups'][0]['run_keys'], [run['key']])
                 self.assertFalse(fixture['hot'])
 
-    def test_latest_filter_absent_failed_check_is_superseded_only_by_a_later_same_name_check(self):
-        # filter=latest drops an older failed check-run once the same check ran again;
-        # the later run carries the verdict, so the old failure is superseded history.
-        for later_name, superseded in (('lint', True), ('other', False)):
-            with self.subTest(later_name=later_name):
-                later = raw_check(101, 'success', LATER, name=later_name, suite=51)
+    def test_latest_filter_absent_failed_check_is_superseded_only_by_a_later_same_lineage_success(self):
+        # filter=latest drops an older failed check-run once the same check ran again; only a
+        # later completed success of the same name from the same workflow lineage proves it.
+        cases = [('same lineage later success', raw_check(101, 'success', LATER, name='lint', suite=50), True),
+                 ('other name', raw_check(101, 'success', LATER, name='other', suite=50), False),
+                 ('other app', dict(raw_check(101, 'success', LATER, name='lint', app=77), app={'id': 77, 'slug': 'external-app'}), False),
+                 ('unknown lineage', raw_check(101, 'success', LATER, name='lint', suite=51), False),
+                 ('later failure', raw_check(101, 'failure', LATER, name='lint', suite=50), False),
+                 ('queued', dict(raw_check(101, None, LATER, name='lint', suite=50), status='queued'), False),
+                 ('earlier success', raw_check(101, 'success', '2026-10-02T23:00:00Z', name='lint', suite=50), False)]
+        for label, later, superseded in cases:
+            with self.subTest(case=label):
                 class Client:
                     def pages(self, route, **kwargs):
                         if '/pulls?' in route: return [{'number': 7, 'head': {'sha': SHA}}]

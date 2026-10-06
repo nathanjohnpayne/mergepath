@@ -200,7 +200,7 @@
       }
       if (!this.empty) {this.empty = element("p", "ci-empty"); this.body.append(this.empty);}
       this.empty.textContent = row.kind === "checks" ? row.checks.length === 0 ? "No workflow or check runs observed for this open HEAD." : "No observed Actions job for these checks."
-        : row.jobs_scope === "not-fetched" ? "Job detail is read for live runs, unclean runs and open-PR heads; this completed success keeps its workflow result only." : "No jobs observed for this run.";
+        : row.jobs_scope === "not-fetched" ? `Job detail is read for live runs, failed runs and open-PR heads; this completed ${row.conclusion === "success" ? "success" : "run"} keeps its workflow result only.` : "No jobs observed for this run.";
       this.empty.hidden = row.jobs.length > 0;
       if (!this.checks) {this.checks = element("div", "ci-job ci-diagnostics mono"); this.body.append(this.checks);}
       this.checks.hidden = row.kind !== "checks";
@@ -265,7 +265,7 @@
     toggle(key) {this.open = this.open === key ? null : key; for (const [id, view] of this.rows) view.disclose(id === this.open);}
     update(model) {
       this.summary.textContent = model.label;
-      this.notes.textContent = `Last ${elapsed(0, model.recentSeconds, 0)} + all active runs · Job detail for live, unclean and open-HEAD runs · ` + model.repositories.map(o => `${o.repo.split("/")[1]}: ${o.observed_at === null ? "unavailable, never observed" : `${C.ageLabel(model.now - o.observed_at)}${o.stale || model.sourceStale ? " · stale" : ""}`}${o.error ? ` · ${o.error}` : ""}`).join(" · ");
+      this.notes.textContent = `Last ${elapsed(0, model.recentSeconds, 0)} + all active runs · Job detail for live, failed and open-HEAD runs · ` + model.repositories.map(o => `${o.repo.split("/")[1]}: ${o.observed_at === null ? "unavailable, never observed" : `${C.ageLabel(model.now - o.observed_at)}${o.stale || model.sourceStale ? " · stale" : ""}`}${o.error ? ` · ${o.error}` : ""}`).join(" · ");
       const wanted = new Set(model.rows.map(row => row.key));
       for (const [key, view] of this.rows) if (!wanted.has(key)) {
         const focused = view.root.contains(document.activeElement); view.abort(); view.root.remove(); this.rows.delete(key);

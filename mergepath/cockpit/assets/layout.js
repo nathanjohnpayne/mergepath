@@ -225,6 +225,8 @@
     onPointerUp(event) {
       const drag = this.drag;
       if (!drag || event.pointerId !== drag.pointerId) return;
+      // A live snapshot can resize panels after the last move; measure once more at release.
+      if (drag.active) this.track(drag);
       this.endDrag(drag);
       if (!drag.active) return;
       const items = this.order.filter(id => id !== drag.id);

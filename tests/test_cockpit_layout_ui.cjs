@@ -153,7 +153,7 @@ test("mount adds a handle to every panel head, applies the stored order and surv
   for (const raw of ["not json", "[]", '{"order":"x"}', '["bogus","prs","prs"]', "null", '{"v":1}']) {
     const storage = new Storage(); storage.setItem(Layout.STORAGE_KEY, raw);
     const order = fixture({storage}).controller.order;
-    assert.deepEqual(order, raw === '["bogus","prs","prs"]' ? [...Layout.PANELS] : [...Layout.PANELS]);
+    assert.deepEqual(order, [...Layout.PANELS]);
   }
   const denied = new Storage(); denied.failGet = true;
   assert.deepEqual(fixture({storage: denied}).controller.order, [...Layout.PANELS]);
@@ -275,6 +275,12 @@ test("drops follow the panels' current rectangles when the layout narrows or a p
   assert.deepEqual(f.controller.drag.slot, {index: 1, before: null, after: "prs", edge: 900}, "the enlarged first panel is measured as it is now");
   handle.dispatch("pointerup", {pointerId: 1});
   assert.deepEqual(f.controller.order, ["prs", "history", "ci", "agents", "fleet", "budget"]);
+  // A panel that grows after the last pointermove is re-measured at release, so the drop lands where the pointer is.
+  const late = fixture(), lateHandle = drag(late, "budget", 390, {release: false});
+  assert.equal(late.controller.drag.slot.index, 1, "after prs at the last move");
+  late.sections.get("prs").height = 900;
+  lateHandle.dispatch("pointerup", {pointerId: 1});
+  assert.deepEqual(late.controller.order, ["budget", "prs", "ci", "agents", "history", "fleet"]);
 });
 
 test("live snapshot renders during a drag or grab never reset the order, end the interaction or recreate the handle", () => {

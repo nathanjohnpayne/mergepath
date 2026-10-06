@@ -313,10 +313,12 @@ test("a completed success off every open HEAD carries not-fetched job scope, val
   const parent = dom(), view = new CI.CIView(parent, () => assert.fail("unexpected fetch"));
   view.update(CI.project(envelope(data), null, 1001));
   const run = view.rows.get(row.key);
-  assert.equal(run.empty.textContent, "Job detail is read for live runs, unclean runs and open-PR heads; this completed success keeps its workflow result only.");
+  assert.equal(run.empty.textContent, "Job detail is read for live runs, failed runs and open-PR heads; this completed success keeps its workflow result only.");
+  const cancelled = {...row, id: "12", key: `${base.repo}:12:${base.pr ?? "none"}`, conclusion: "cancelled"}; data.runs.push(cancelled); view.update(CI.project(envelope(data), null, 1002));
+  assert.equal(view.rows.get(cancelled.key).empty.textContent, "Job detail is read for live runs, failed runs and open-PR heads; this completed run keeps its workflow result only.");
   assert.equal(run.duration.textContent, "1m 0s");
   assert.equal(run.badge.textContent, "Passed · old HEAD");
-  assert.match(view.notes.textContent, /Job detail for live, unclean and open-HEAD runs/);
+  assert.match(view.notes.textContent, /Job detail for live, failed and open-HEAD runs/);
 });
 
 test("completed runs off open heads sit behind a counted history disclosure while attention rows stay in the main list", () => {
