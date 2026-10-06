@@ -11,11 +11,15 @@
   const PAIR = Object.freeze(["ci", "agents"]);
   const STORAGE_KEY = "cockpit-layout";
   const THRESHOLD = 4, EDGE = 64, STEP = 18, GAP = 18;
+  // A stored order is trusted only whole: every id known and none repeated. Anything else is
+  // corrupt and falls back to the default. A saved order is always the complete panel set of
+  // its day, so a default id it lacks is a panel added since; that one appends in default order.
+  function validOrder(value, defaults = PANELS) {
+    return Array.isArray(value) && value.every(id => typeof id === "string" && defaults.includes(id)) && new Set(value).size === value.length;
+  }
   function normalizeOrder(value, defaults = PANELS) {
-    const order = [];
-    if (Array.isArray(value)) for (const id of value) if (typeof id === "string" && defaults.includes(id) && !order.includes(id)) order.push(id);
-    for (const id of defaults) if (!order.includes(id)) order.push(id);
-    return order;
+    if (!validOrder(value, defaults)) return [...defaults];
+    return [...value, ...defaults.filter(id => !value.includes(id))];
   }
   const sameOrder = (a, b) => a.length === b.length && a.every((id, index) => id === b[index]);
   // The result places `id` at `index`; indexes outside the list clamp to its ends.
@@ -61,7 +65,9 @@
         const raw = this.storage?.getItem(this.key);
         if (typeof raw !== "string") return [...this.defaults];
         const value = JSON.parse(raw);
-        return normalizeOrder(value && typeof value === "object" && !Array.isArray(value) ? value.order : value, this.defaults);
+        // Only the version-1 object this store writes is read; any other shape is corrupt.
+        if (!value || typeof value !== "object" || Array.isArray(value) || value.v !== 1) return [...this.defaults];
+        return normalizeOrder(value.order, this.defaults);
       } catch {return [...this.defaults];}
     }
     save(order) {try {this.storage?.setItem(this.key, JSON.stringify({v: 1, order: [...order]}));} catch { /* The session order still applies. */ }}
@@ -266,5 +272,5 @@
       store: new LayoutStore(storage)});
     return controller.mount();
   }
-  return {PANELS, PAIR, STORAGE_KEY, normalizeOrder, sameOrder, moveTo, rowsFor, dropSlot, LayoutStore, LayoutController, install};
+  return {PANELS, PAIR, STORAGE_KEY, validOrder, normalizeOrder, sameOrder, moveTo, rowsFor, dropSlot, LayoutStore, LayoutController, install};
 });

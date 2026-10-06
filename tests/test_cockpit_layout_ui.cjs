@@ -115,7 +115,11 @@ function drag(f, id, y, {release = true, pointerId = 1} = {}) {
 
 test("order helpers normalize storage, clamp moves, pair only adjacent CI/agents and drop around whole rows", () => {
   assert.deepEqual(Layout.normalizeOrder(null), [...Layout.PANELS]);
-  assert.deepEqual(Layout.normalizeOrder(["budget", "bogus", "prs", "prs", 7]), ["budget", "prs", "ci", "agents", "history", "fleet"]);
+  // An order is trusted whole or not at all: an unknown or repeated id discards the stored order.
+  for (const corrupt of [["budget", "bogus"], ["budget", "budget", "prs"], ["budget", "bogus", "prs", "prs", 7], ["budget", 7], "budget"]) assert.deepEqual(Layout.normalizeOrder(corrupt), [...Layout.PANELS]);
+  assert.equal(Layout.validOrder(["budget", "bogus"]), false); assert.equal(Layout.validOrder(["budget", "prs"]), true);
+  // A saved order lacking a panel added since appends that panel in default order.
+  assert.deepEqual(Layout.normalizeOrder(["budget", "prs"]), ["budget", "prs", "ci", "agents", "history", "fleet"]);
   assert.deepEqual(Layout.normalizeOrder(["fleet"], [...Layout.PANELS, "extra"]), ["fleet", "prs", "ci", "agents", "history", "budget", "extra"]);
   assert.deepEqual(Layout.moveTo(["a", "b", "c"], "c", 0), ["c", "a", "b"]);
   assert.deepEqual(Layout.moveTo(["a", "b", "c"], "a", 99), ["b", "c", "a"]);
@@ -150,10 +154,11 @@ test("mount adds a handle to every panel head, applies the stored order and surv
   assert.deepEqual(stored.controller.order, ["budget", "agents", "ci", "prs", "history", "fleet"]);
   assert.deepEqual(domOrder(stored.container), ["budget", "agents", "ci", "prs", "history", "fleet"]);
   assert.deepEqual(stored.row.children.map(node => node.attributes["data-panel"]), ["agents", "ci"]); assert.equal(stored.resetButton.disabled, false);
-  for (const raw of ["not json", "[]", '{"order":"x"}', '["bogus","prs","prs"]', "null", '{"v":1}']) {
+  for (const raw of ["not json", "[]", '{"order":"x"}', '["bogus","prs","prs"]', "null", '{"v":1}', '{"v":1,"order":["budget","bogus"]}', '{"v":1,"order":["budget","budget","prs"]}',
+    '{"v":2,"order":["budget","prs","ci","agents","history","fleet"]}', '{"order":["budget","prs","ci","agents","history","fleet"]}', '["budget","prs","ci","agents","history","fleet"]']) {
     const storage = new Storage(); storage.setItem(Layout.STORAGE_KEY, raw);
-    const order = fixture({storage}).controller.order;
-    assert.deepEqual(order, [...Layout.PANELS]);
+    const stored = fixture({storage});
+    assert.deepEqual(stored.controller.order, [...Layout.PANELS], raw); assert.equal(stored.resetButton.disabled, true, raw);
   }
   const denied = new Storage(); denied.failGet = true;
   assert.deepEqual(fixture({storage: denied}).controller.order, [...Layout.PANELS]);
@@ -345,7 +350,7 @@ test("the shipped shell wires the module: grid container, six data-panel section
   const reset = new Node("button"), live = new Node("p"); document.body.append(container, reset, live);
   const ids = {"panel-grid": container, "layout-reset": reset, "layout-announcement": live};
   const doc = {body: document.body, createElement: tag => new Node(tag), getElementById: id => ids[id] ?? null};
-  const saved = globalThis.localStorage; const storage = new Storage(); storage.setItem(Layout.STORAGE_KEY, JSON.stringify({order: ["budget"]}));
+  const saved = globalThis.localStorage; const storage = new Storage(); storage.setItem(Layout.STORAGE_KEY, JSON.stringify({v: 1, order: ["budget"]}));
   globalThis.localStorage = storage;
   try {
     const controller = Layout.install(doc);
