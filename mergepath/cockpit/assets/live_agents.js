@@ -146,6 +146,8 @@
         node.textContent = `${row.repo} #${row.pr}: ${row.posted_outcome !== null ? `${row.posted_outcome} review posted` : row.summary_emitted ? `${row.verdict ?? "verdict unavailable"} summary; no posted outcome established` : row.review_posted ? "review POST confirmed; final summary and outcome unavailable" : "finished; final summary unavailable"}${row.dry_run ? " · dry run" : ""} · exit ${row.exit_code ?? "unavailable"} · acknowledgment ${row.review_acknowledgment ?? "unavailable"}`;
         if (this.terminalList.children[index] !== node) this.terminalList.insertBefore(node, this.terminalList.children[index] || null);
       });
+      // Hiding the emptied disclosure must not strand focus on its toggle: move it to the summary first.
+      if (!model.terminal.length && this.terminal.contains(document.activeElement)) {this.summary.tabIndex = -1; this.summary.focus();}
       this.terminal.hidden = !model.terminal.length;
       this.discloseTerminal();
       this.diagnostics.textContent = model.data.diagnostics.join(" "); this.diagnostics.hidden = !model.data.diagnostics.length;

@@ -210,6 +210,19 @@ class SupersessionTests(unittest.TestCase):
         observed = supersede([normalize_check(REPO, c, {}) for c in (early, late, ext(201, 'success', LATER), ext(203, 'success', '2026-10-03T00:03:00Z'))])
         self.assertEqual([c['superseded_by'] for c in observed[:2]], ['201', '203'])
 
+    def test_failed_job_without_an_observed_check_keeps_the_run_unknown_beside_a_superseded_sibling(self):
+        # #1815: one failed job's check is superseded by a later success; another failed job has no
+        # parseable check-run identity. The run must stay unknown, never superseded.
+        lineage = {'50': {'workflow_id': '9', 'run_id': '10'}}
+        checks = supersede([normalize_check(REPO, raw_check(), lineage), normalize_check(REPO, raw_check(101, 'success', LATER), lineage)])
+        orphan = {**raw_job(21, 999), 'name': 'build', 'check_run_url': None}
+        for jobs, unknown in (([raw_job()], False), ([raw_job(), orphan], True), ([raw_job(), raw_job(21, 102)], True)):
+            with self.subTest(jobs=len(jobs), orphan=unknown):
+                rows, _ = group_runs(REPO, [raw_run()], {'10': [normalize_job(job) for job in jobs]}, copy.deepcopy(checks), {'7': SHA})
+                self.assertEqual(rows[0]['check_evidence_unknown'], unknown)
+                self.assertEqual(rows[0]['superseded'], not unknown)
+                self.assertFalse(rows[0]['actionable'])
+
     def test_no_later_pass_keeps_actionable_failure(self):
         row = model()['runs'][0]
         self.assertTrue(row['actionable'])

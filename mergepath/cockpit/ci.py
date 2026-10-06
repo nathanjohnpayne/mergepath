@@ -186,6 +186,10 @@ def group_runs(repo, raw_runs, jobs, checks, heads):
                                     + [number for number, head in heads.items() if head == sha])) or [None]
         fetched = jobs.get(run_id)
         related = [check for check in checks if check['sha'] == sha and check['id'] in {job['check_id'] for job in fetched}] if fetched is not None else []
+        # Every failed job must be tied to an observed check-run; one proven sibling never vouches for another.
+        observed = {check['id'] for check in related}
+        unproven = raw.get('conclusion') in FAILURES and (fetched is None or any(
+            job.get('conclusion') in FAILURES and (job.get('check_id') is None or job['check_id'] not in observed) for job in fetched))
         # A failed job's check-run can be absent (a SHA whose check-runs are not read, or the
         # page bound). Absence is never read as supersession: without the check the run keeps
         # check_evidence_unknown, because no partial observation establishes clearance.
@@ -193,13 +197,16 @@ def group_runs(repo, raw_runs, jobs, checks, heads):
             current = None if number not in heads else heads[number] == sha
             owned = copy.deepcopy(related)
             evidence = _check_evidence(owned, current)
+            if unproven:
+                # A failed job without an observed check cannot be cleared by its siblings.
+                evidence['superseded'] = False
             row = {'key': f'{repo}:{run_id}:{number or "none"}', 'id': run_id, 'attempt': attempt, 'repo': repo,
                    'pr': number, 'sha': sha, 'name': text(raw.get('name')), 'workflow_id': identity(raw.get('workflow_id')),
                    'jobs_scope': 'all-attempts' if fetched is not None else 'not-fetched', 'status': _status(raw.get('status')), 'conclusion': _conclusion(raw.get('conclusion')),
                    'created_at': stamp(raw.get('created_at')), 'started_at': stamp(raw.get('run_started_at')),
                    'updated_at': stamp(raw.get('updated_at')), 'current_head': current,
                    'jobs': copy.deepcopy(fetched or []), 'checks': owned, **evidence,
-                   'check_evidence_unknown': raw.get('conclusion') in FAILURES and not any(c['conclusion'] in FAILURES for c in owned),
+                   'check_evidence_unknown': raw.get('conclusion') in FAILURES and (unproven or not any(c['conclusion'] in FAILURES for c in owned)),
                    'rerun_command': f'gh run rerun {run_id} --failed --repo {repo}' if raw.get('conclusion') in FAILURES else None}
             rows.append(row)
             key = (number, sha)

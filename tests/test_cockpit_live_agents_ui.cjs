@@ -64,6 +64,9 @@ class Node {
   append(...nodes) {for (const node of nodes) {node.remove(); this.children.push(node); node.parentNode = this;}}
   replaceChildren(...nodes) {for (const node of [...this.children]) node.remove(); this.append(...nodes);}
   insertBefore(node, reference) {node.remove(); const index = reference === null ? this.children.length : this.children.indexOf(reference); assert.ok(index >= 0); this.children.splice(index, 0, node); node.parentNode = this;}
+  contains(node) {return node === this || this.children.some(child => child.contains(node));}
+  // Like a browser, a hidden subtree cannot take focus.
+  focus() {for (let node = this; node; node = node.parentNode) if (node.hidden) return; global.document.activeElement = this;}
 }
 function withDOM(fn) {const old = global.document; global.document = {createElement: tag => new Node(tag)}; try {fn();} finally {global.document = old;}}
 test("actual renderer preserves keyed cards/stages/fill through repeats and source interruptions", () => withDOM(() => {
@@ -115,6 +118,11 @@ test("done transition leaves active list and requires summary plus post for post
   assert.equal(view.terminalNodes.get(terminal.id), item); assert.equal(item.detachments, 0); assert.equal(view.terminalList.hidden, false);
   view.update(L.projectLive(envelope([], {terminal: []}), null, now));
   assert.equal(view.terminal.hidden, true); assert.equal(view.terminalNodes.size, 0);
+  // Focus on the disclosure moves to the live summary before the emptied disclosure hides.
+  view.update(L.projectLive(envelope([], {terminal: [terminal]}), null, now));
+  view.terminalToggle.focus(); assert.equal(document.activeElement, view.terminalToggle);
+  view.update(L.projectLive(envelope([], {terminal: []}), null, now));
+  assert.equal(view.terminal.hidden, true); assert.equal(document.activeElement, view.summary);
 }));
 test("both reduced-motion paths stop loops at rest and preserve information", () => {
   const css = fs.readFileSync(require.resolve("../mergepath/cockpit/assets/live_agents.css"), "utf8");
