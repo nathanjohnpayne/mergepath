@@ -138,7 +138,9 @@ def main(argv=None):
         app.api_author = AuthorBudgetProvider(ROOT, cache_dir, args.agent)
         app.scheduler.register("api_author", app.api_author.fetch, hot_interval=60, idle_interval=60, timeout=20)
         ci_provider = CIProvider(github, inventory)
-        app.scheduler.register("ci", ci_provider, hot_interval=20, idle_interval=120, timeout=60)
+        # A full eight-repository scan costs 30 to 55 paid requests and about a minute even at
+        # steady state (measured 2026-10-06), so the hot cadence is a minute, not 20 seconds.
+        app.scheduler.register("ci", ci_provider, hot_interval=60, idle_interval=120, timeout=60)
         app.register_panel("ci", "ci")
         app.ci_excerpts = LogExcerptCache(inventory, lambda repo, job, deadline: github.read_job_log(repo, job, deadline=deadline))
         pr_provider = PRProvider(github, inventory, ROOT, checkout_roots={"nathanjohnpayne/mergepath": ROOT})
