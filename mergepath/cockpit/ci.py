@@ -171,35 +171,20 @@ def group_runs(repo, raw_runs, jobs, checks, heads):
                                     + [number for number, head in heads.items() if head == sha])) or [None]
         fetched = jobs.get(run_id)
         related = [check for check in checks if check['sha'] == sha and check['id'] in {job['check_id'] for job in fetched}] if fetched is not None else []
-        # With the latest filter, a failed run whose job check-runs are absent may have been
-        # re-evaluated. Only a later completed success of the same check name from this
-        # same workflow run on that SHA proves it, the invariant supersede() applies;
-        # another run of the same workflow, another app, a queued or failed check, or an
-        # earlier one leaves the failure actionable.
-        # Every failed job needs that proof; a failed job without a parseable check-run
-        # identity cannot be proven and keeps the whole run unknown.
-        failed_jobs = [job for job in (fetched or []) if job['conclusion'] in FAILURES]
-        absent = [job for job in failed_jobs if job['check_id'] is not None and job['check_id'] not in {check['id'] for check in related}]
-        unproven = any(job['check_id'] is None for job in failed_jobs)
-        run_started = stamp(raw.get('run_started_at'))
-        later = {check['name'] for check in checks if check['sha'] == sha and check.get('workflow_run_id') == run_id
-                 and check['status'] == 'completed' and check['conclusion'] == 'success' and check['started_at'] is not None
-                 and (run_started is None or check['started_at'] > run_started)}
-        requeued = bool(absent) and not unproven and raw.get('conclusion') in FAILURES \
-            and not any(check['conclusion'] in FAILURES for check in related) and all(job['name'] in later for job in absent)
+        # Under the latest check-run filter an older failed check-run may be absent. Absence is
+        # never read as supersession: without the check the run keeps check_evidence_unknown,
+        # because no partial observation establishes clearance.
         for number in numbers:
             current = None if number not in heads else heads[number] == sha
             owned = copy.deepcopy(related)
             evidence = _check_evidence(owned, current)
-            if requeued:
-                evidence.update(actionable=False, severity=None, reason=None, superseded=True)
             row = {'key': f'{repo}:{run_id}:{number or "none"}', 'id': run_id, 'attempt': attempt, 'repo': repo,
                    'pr': number, 'sha': sha, 'name': text(raw.get('name')), 'workflow_id': identity(raw.get('workflow_id')),
                    'jobs_scope': 'all-attempts' if fetched is not None else 'not-fetched', 'status': _status(raw.get('status')), 'conclusion': _conclusion(raw.get('conclusion')),
                    'created_at': stamp(raw.get('created_at')), 'started_at': stamp(raw.get('run_started_at')),
                    'updated_at': stamp(raw.get('updated_at')), 'current_head': current,
                    'jobs': copy.deepcopy(fetched or []), 'checks': owned, **evidence,
-                   'check_evidence_unknown': raw.get('conclusion') in FAILURES and not requeued and not any(c['conclusion'] in FAILURES for c in owned),
+                   'check_evidence_unknown': raw.get('conclusion') in FAILURES and not any(c['conclusion'] in FAILURES for c in owned),
                    'rerun_command': f'gh run rerun {run_id} --failed --repo {repo}' if raw.get('conclusion') in FAILURES else None}
             rows.append(row)
             key = (number, sha)

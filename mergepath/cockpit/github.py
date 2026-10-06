@@ -526,7 +526,8 @@ class GitHubClient:
         path = self._path(path)
         first = urllib.parse.urlsplit(path)
         endpoint, seen, rows, alias_id = first.path, set(), [], None
-        requested = {pair for pair in urllib.parse.parse_qsl(first.query, keep_blank_values=True) if pair[0] != "page"}
+        original = [pair for pair in urllib.parse.parse_qsl(first.query, keep_blank_values=True) if pair[0] != "page"]
+        requested = set(original)
         deadline = self._monotonic() + 30 if deadline is None else deadline
         for _ in range(max_pages):
             if path in seen:
@@ -543,16 +544,21 @@ class GitHubClient:
             parts = urllib.parse.urlsplit(next_link)
             if parts.scheme != "https" or parts.netloc != "api.github.com" or parts.fragment:
                 raise ClientError("invalid_next_link")
+            offered = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
             if parts.path != endpoint:
                 # GitHub hands back /repositories/<id>/... for a /repos/<owner>/<repo>/...
-                # request. Keep walking the endpoint that was asked for, take only the
-                # page cursor, and require the original filters and one stable alias id.
+                # request. Keep walking the endpoint that was asked for and require the
+                # original filters and one stable alias id.
                 alias = _alias_of(parts.path, endpoint)
-                offered = set(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
-                if alias is None or alias_id not in (None, alias) or not requested <= offered:
+                if alias is None or alias_id not in (None, alias) or not requested <= set(offered):
                     raise ClientError("invalid_next_link")
                 alias_id = alias
-            path = self._path(endpoint + ("?" + parts.query if parts.query else ""))
+            # Only the page cursor is taken from the link; the next request is rebuilt from
+            # the original query, so an added or altered filter cannot narrow later pages.
+            pages = [value for key, value in offered if key == "page"]
+            if len(pages) != 1 or not re.fullmatch(r"[1-9][0-9]{0,8}", pages[0]):
+                raise ClientError("invalid_next_link")
+            path = self._path(endpoint + "?" + urllib.parse.urlencode(original + [("page", pages[0])]))
         raise ClientError("page_limit")
 
     def query(self, document, variables=None, *, deadline=None):

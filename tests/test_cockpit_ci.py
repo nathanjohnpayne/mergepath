@@ -360,19 +360,13 @@ class ProviderTests(unittest.TestCase):
                 self.assertEqual(data['groups'][0]['run_keys'], [run['key']])
                 self.assertFalse(fixture['hot'])
 
-    def test_latest_filter_absent_failed_check_is_superseded_only_by_a_later_same_run_success(self):
-        # filter=latest drops an older failed check-run once the same check ran again; only a
-        # later completed success of the same name from the same workflow run proves it.
-        peer = raw_run(11, 'success'); peer['check_suite_id'] = 51  # another run of the same workflow on this SHA
-        cases = [('same run later success', raw_check(101, 'success', LATER, name='lint', suite=50), True),
-                 ('other name', raw_check(101, 'success', LATER, name='other', suite=50), False),
-                 ('other app', dict(raw_check(101, 'success', LATER, name='lint', app=77), app={'id': 77, 'slug': 'external-app'}), False),
-                 ('another run of the same workflow', raw_check(101, 'success', LATER, name='lint', suite=51), False),
-                 ('unknown lineage', raw_check(101, 'success', LATER, name='lint', suite=52), False),
-                 ('later failure', raw_check(101, 'failure', LATER, name='lint', suite=50), False),
-                 ('queued', dict(raw_check(101, None, LATER, name='lint', suite=50), status='queued'), False),
-                 ('earlier success', raw_check(101, 'success', '2026-10-02T23:00:00Z', name='lint', suite=50), False)]
-        for label, later, superseded in cases:
+    def test_absent_failed_check_runs_stay_unknown_and_are_never_read_as_superseded(self):
+        # The latest filter can drop an older failed check-run. Absence is never clearance: the
+        # run keeps check_evidence_unknown whatever same-name successes sit on the SHA.
+        peer = raw_run(11, 'success'); peer['check_suite_id'] = 51
+        for label, present in (('same-run later success of the same name', [raw_check(101, 'success', LATER, name='lint', suite=50)]),
+                               ('another run of the same workflow', [raw_check(101, 'success', LATER, name='lint', suite=51)]),
+                               ('nothing on the SHA', [])):
             with self.subTest(case=label):
                 class Client:
                     def pages(self, route, **kwargs):
@@ -380,30 +374,11 @@ class ProviderTests(unittest.TestCase):
                         if '/actions/runs?' in route: return [raw_run(), peer] if 'created=' in route else []
                         if '/jobs?' in route: return [raw_job()] if '/runs/10/' in route else [{**raw_job(21, 102), 'conclusion': 'success'}]
                         if '/check-runs?' in route:
-                            assert 'filter=latest' in route, route; return [later]
+                            assert 'filter=latest' in route, route; return list(present)
                         raise AssertionError('unexpected route: ' + route)
                 row = next(r for r in CIProvider(Client(), INVENTORY, clock=lambda: 1000, monotonic=lambda: 0)(5).data['runs'] if r['id'] == '10')
-                self.assertEqual(row['superseded'], superseded); self.assertFalse(row['actionable'])
-                self.assertEqual(row['check_evidence_unknown'], not superseded); self.assertEqual(row['checks'], [])
-                self.assertEqual(row['jobs_scope'], 'all-attempts'); self.assertIsNone(row['severity'])
-
-    def test_absent_check_supersession_needs_proof_for_every_failed_job(self):
-        # One proven sibling job cannot vouch for a failed job whose check-run identity is missing.
-        later = raw_check(101, 'success', LATER, name='lint', suite=50)
-        for label, other_conclusion, superseded in (('failed job without check url', 'failure', False),
-                                                    ('passed job without check url', 'success', True)):
-            with self.subTest(case=label):
-                other = {**raw_job(21, 102), 'name': 'other', 'conclusion': other_conclusion}; other.pop('check_run_url')
-                class Client:
-                    def pages(self, route, **kwargs):
-                        if '/pulls?' in route: return [{'number': 7, 'head': {'sha': SHA}}]
-                        if '/actions/runs?' in route: return [raw_run()] if 'created=' in route else []
-                        if '/jobs?' in route: return [raw_job(), other]
-                        if '/check-runs?' in route: return [later]
-                        raise AssertionError('unexpected route: ' + route)
-                row = CIProvider(Client(), INVENTORY, clock=lambda: 1000, monotonic=lambda: 0)(5).data['runs'][0]
-                self.assertEqual(row['superseded'], superseded); self.assertEqual(row['check_evidence_unknown'], not superseded)
-                self.assertFalse(row['actionable']); self.assertEqual([job['check_id'] for job in row['jobs']], ['100', None])
+                self.assertTrue(row['check_evidence_unknown']); self.assertFalse(row['superseded']); self.assertFalse(row['actionable'])
+                self.assertEqual(row['checks'], []); self.assertEqual(row['jobs_scope'], 'all-attempts'); self.assertIsNone(row['severity'])
 
     def test_page_shift_repeats_are_deduplicated_instead_of_failing_the_repository(self):
         duplicate = raw_check(); duplicate['output'] = {'summary': 'second copy'}
