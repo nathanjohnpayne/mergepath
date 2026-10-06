@@ -6,19 +6,24 @@
   else {root.CockpitLayout = api; api.install();}
 })(globalThis, function () {
   const PANELS = Object.freeze(["prs", "ci", "agents", "history", "fleet", "budget"]);
+  // Every panel set a saved order may legitimately hold. When a panel is added, the previous
+  // set is appended here so orders saved before it still load and the new panel appends.
+  const KNOWN_PANEL_SETS = Object.freeze([PANELS]);
   // The shipped design seats CI and the Phase 4b agents side by side; they keep sharing
   // a row whenever they are adjacent, in either order. Every other row is one panel.
   const PAIR = Object.freeze(["ci", "agents"]);
   const STORAGE_KEY = "cockpit-layout";
   const THRESHOLD = 4, EDGE = 64, STEP = 18, GAP = 18;
-  // A stored order is trusted only whole: every id known and none repeated. Anything else is
-  // corrupt and falls back to the default. A saved order is always the complete panel set of
-  // its day, so a default id it lacks is a panel added since; that one appends in default order.
-  function validOrder(value, defaults = PANELS) {
-    return Array.isArray(value) && value.every(id => typeof id === "string" && defaults.includes(id)) && new Set(value).size === value.length;
+  // A stored order is trusted only whole: every id known, none repeated, and the set exactly
+  // one of the panel sets this page has ever saved. Anything else is corrupt and falls back to
+  // the default. A recognized older set lacks only panels added since, which append in default order.
+  const sameSet = (a, b) => a.length === b.length && a.every(id => b.includes(id));
+  function validOrder(value, defaults = PANELS, knownSets = KNOWN_PANEL_SETS) {
+    return Array.isArray(value) && value.every(id => typeof id === "string" && defaults.includes(id)) && new Set(value).size === value.length
+      && (sameSet(value, defaults) || knownSets.some(set => sameSet(value, set)));
   }
-  function normalizeOrder(value, defaults = PANELS) {
-    if (!validOrder(value, defaults)) return [...defaults];
+  function normalizeOrder(value, defaults = PANELS, knownSets = KNOWN_PANEL_SETS) {
+    if (!validOrder(value, defaults, knownSets)) return [...defaults];
     return [...value, ...defaults.filter(id => !value.includes(id))];
   }
   const sameOrder = (a, b) => a.length === b.length && a.every((id, index) => id === b[index]);
@@ -59,7 +64,7 @@
     return {index: items.findIndex(item => item.id === id) + 1, before: null, after: id, edge: row.bottom};
   }
   class LayoutStore {
-    constructor(storage, key = STORAGE_KEY, defaults = PANELS) {Object.assign(this, {storage, key, defaults: [...defaults]});}
+    constructor(storage, key = STORAGE_KEY, defaults = PANELS, knownSets = KNOWN_PANEL_SETS) {Object.assign(this, {storage, key, defaults: [...defaults], knownSets});}
     load() {
       try {
         const raw = this.storage?.getItem(this.key);
@@ -67,19 +72,19 @@
         const value = JSON.parse(raw);
         // Only the version-1 object this store writes is read; any other shape is corrupt.
         if (!value || typeof value !== "object" || Array.isArray(value) || value.v !== 1) return [...this.defaults];
-        return normalizeOrder(value.order, this.defaults);
+        return normalizeOrder(value.order, this.defaults, this.knownSets);
       } catch {return [...this.defaults];}
     }
     save(order) {try {this.storage?.setItem(this.key, JSON.stringify({v: 1, order: [...order]}));} catch { /* The session order still applies. */ }}
     clear() {try {this.storage?.removeItem(this.key);} catch { /* Nothing durable to clear. */ }}
   }
   class LayoutController {
-    constructor({container, sections, row = null, resetButton = null, announcer = null, hintId = null, store, defaults = PANELS, pair = PAIR,
+    constructor({container, sections, row = null, resetButton = null, announcer = null, hintId = null, store, defaults = PANELS, pair = PAIR, knownSets = KNOWN_PANEL_SETS,
       raf = fn => globalThis.requestAnimationFrame?.(fn), caf = id => globalThis.cancelAnimationFrame?.(id),
       scrollBy = (x, y) => globalThis.scrollBy?.(x, y), viewportHeight = () => globalThis.innerHeight ?? Infinity,
       reducedMotion = () => document.body?.classList?.contains("rm") === true || globalThis.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches === true,
       setTimer = (fn, delay) => globalThis.setTimeout(fn, delay)}) {
-      Object.assign(this, {container, sections, resetButton, announcer, hintId, store, defaults: [...defaults], pair: [...pair],
+      Object.assign(this, {container, sections, resetButton, announcer, hintId, store, defaults: [...defaults], pair: [...pair], knownSets,
         raf, caf, scrollBy, viewportHeight, reducedMotion, setTimer});
       this.handles = new Map(); this.order = [...this.defaults]; this.grab = null; this.drag = null;
       this.row = row || document.createElement("div"); if (!row) this.row.className = "row2";
@@ -109,7 +114,7 @@
       return this;
     }
     apply(value, {animate = true} = {}) {
-      const order = normalizeOrder(value, this.defaults);
+      const order = normalizeOrder(value, this.defaults, this.knownSets);
       const before = animate && !this.reducedMotion() ? this.measure() : null;
       const focus = document.activeElement, expected = [];
       for (const ids of rowsFor(order, this.pair)) {
@@ -272,5 +277,5 @@
       store: new LayoutStore(storage)});
     return controller.mount();
   }
-  return {PANELS, PAIR, STORAGE_KEY, validOrder, normalizeOrder, sameOrder, moveTo, rowsFor, dropSlot, LayoutStore, LayoutController, install};
+  return {PANELS, PAIR, KNOWN_PANEL_SETS, STORAGE_KEY, validOrder, normalizeOrder, sameOrder, moveTo, rowsFor, dropSlot, LayoutStore, LayoutController, install};
 });
