@@ -190,6 +190,26 @@ class SupersessionTests(unittest.TestCase):
         self.assertFalse(row['actionable'])
         self.assertEqual(row['checks'][0]['superseded_by'], '101')
 
+    def test_one_success_supersedes_at_most_one_same_name_failure(self):
+        # #1815: with full check history, two failed same-name checks and one later success must
+        # leave one failure unsuperseded and the row actionable; a second success clears both.
+        def ext(check_id, conclusion, start):
+            check = raw_check(check_id, conclusion, start, app=77, name='external gate'); check['app']['slug'] = 'external-app'
+            return check
+        first, second = ext(200, 'failure', START), ext(202, 'failure', END)
+        for successes, cleared in (([ext(201, 'success', LATER)], 1), ([ext(201, 'success', LATER), ext(203, 'success', '2026-10-03T00:03:00Z')], 2)):
+            with self.subTest(successes=len(successes)):
+                observed = supersede([normalize_check(REPO, c, {}) for c in (first, second, *successes)])
+                links = [c['superseded_by'] for c in observed if c['conclusion'] == 'failure']
+                self.assertEqual(sum(link is not None for link in links), cleared)
+                self.assertEqual(len({link for link in links if link}), cleared, 'a success is never reused')
+                row = unmatched_checks_fixture(False, [first, second, *successes])['data']['check_rows'][0]
+                self.assertEqual(row['superseded'], cleared == 2); self.assertEqual(row['actionable'], cleared < 2)
+        # The latest failure takes the earliest later success, so an earlier failure keeps a later one.
+        early, late = ext(200, 'failure', START), ext(202, 'failure', '2026-10-03T00:02:30Z')
+        observed = supersede([normalize_check(REPO, c, {}) for c in (early, late, ext(201, 'success', LATER), ext(203, 'success', '2026-10-03T00:03:00Z'))])
+        self.assertEqual([c['superseded_by'] for c in observed[:2]], ['201', '203'])
+
     def test_no_later_pass_keeps_actionable_failure(self):
         row = model()['runs'][0]
         self.assertTrue(row['actionable'])

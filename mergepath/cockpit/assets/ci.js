@@ -258,6 +258,8 @@
     }
     discloseHistory() {
       const count = this.historyList.children.length;
+      // Hiding an emptied history must not strand focus on its toggle: move it to the summary first.
+      if (count === 0 && this.history.contains(document.activeElement)) {this.summary.tabIndex = -1; this.summary.focus();}
       this.history.hidden = count === 0; this.historyList.hidden = !this.historyOpen;
       this.historyToggle.setAttribute("aria-expanded", String(this.historyOpen));
       this.historyToggle.textContent = `${count} completed ${count === 1 ? "run" : "runs"} off open heads · ${this.historyOpen ? "hide" : "show"}`;

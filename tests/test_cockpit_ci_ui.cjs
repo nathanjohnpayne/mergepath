@@ -344,6 +344,21 @@ test("completed runs off open heads sit behind a counted history disclosure whil
   assert.equal(CI.attention({status: "completed", conclusion: "cancelled", current_head: false, actionable: false}), false);
 });
 
+test("focus on the history toggle moves to the summary when the last history row leaves", () => {
+  const data = fixture(), base = data.runs[0];
+  const done = {...structuredClone(base), id: "13", key: `${base.repo}:13:${base.pr ?? "none"}`, status: "completed", conclusion: "success", current_head: false,
+    jobs: [], jobs_scope: "not-fetched", checks: [], diagnostics: [], actionable: false, superseded: false, severity: null, reason: null, check_evidence_unknown: false, rerun_command: null};
+  data.runs.push(done);
+  const parent = dom(), view = new CI.CIView(parent, () => assert.fail("unexpected fetch"));
+  view.update(CI.project(envelope(data), null, 1001));
+  view.historyToggle.focus(); assert.equal(document.activeElement, view.historyToggle);
+  done.current_head = true; view.update(CI.project(envelope(data), null, 1002));
+  assert.equal(view.history.hidden, true); assert.equal(document.activeElement, view.summary);
+  data.runs.pop(); done.current_head = false; data.runs.push(done); view.update(CI.project(envelope(data), null, 1003));
+  view.historyToggle.focus(); data.runs.pop(); view.update(CI.project(envelope(data), null, 1004));
+  assert.equal(view.history.hidden, true); assert.equal(document.activeElement, view.summary, "a removed last row also releases the toggle");
+});
+
 test("a focused run that moves into collapsed history reveals it and keeps keyboard focus", () => {
   const data = fixture(), base = data.runs[0];
   const done = {...structuredClone(base), id: "12", key: `${base.repo}:12:${base.pr ?? "none"}`, status: "completed", conclusion: "success", current_head: true,

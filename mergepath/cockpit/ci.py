@@ -102,19 +102,25 @@ def normalize_check(repo, value, workflows):
 
 
 def supersede(checks):
-    """Retain history; a different producer or unknown time cannot clear it."""
-    for failed in checks:
-        if failed['conclusion'] not in FAILURES or failed['producer'] is None or failed['started_at'] is None:
-            continue
-        if ':workflow:' in failed['producer'] and failed.get('workflow_run_id') is None:
-            continue
+    """Retain history; a different producer or unknown time cannot clear it.
+
+    Each success supersedes at most one failure, so two same-name failures need two later
+    successes. Failures are matched latest first, each to the earliest unused later success,
+    which pairs as many failures as the observed order allows and never reuses a success.
+    """
+    used = set()
+    eligible = [failed for failed in checks if failed['conclusion'] in FAILURES and failed['producer'] is not None
+                and failed['started_at'] is not None
+                and not (':workflow:' in failed['producer'] and failed.get('workflow_run_id') is None)]
+    for failed in sorted(eligible, key=lambda row: row['started_at'], reverse=True):
         candidates = [passed for passed in checks if passed['status'] == 'completed'
                       and passed['conclusion'] == 'success' and passed['started_at'] is not None
-                      and passed['started_at'] > failed['started_at']
+                      and passed['started_at'] > failed['started_at'] and id(passed) not in used
                       and all(passed[k] == failed[k] for k in ('repo', 'sha', 'name', 'producer'))
                       and passed.get('workflow_run_id') == failed.get('workflow_run_id')]
         if candidates:
-            failed['superseded_by'] = min(candidates, key=lambda row: row['started_at'])['id']
+            chosen = min(candidates, key=lambda row: row['started_at'])
+            used.add(id(chosen)); failed['superseded_by'] = chosen['id']
     return checks
 
 
