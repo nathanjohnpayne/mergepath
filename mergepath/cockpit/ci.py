@@ -169,17 +169,29 @@ def group_runs(repo, raw_runs, jobs, checks, heads):
             raise ClientError('invalid_upstream_json')
         numbers = list(dict.fromkeys([identity(_row(pr).get('number')) for pr in prs]
                                     + [number for number, head in heads.items() if head == sha])) or [None]
-        related = [check for check in checks if check['sha'] == sha and check['id'] in {job['check_id'] for job in jobs[run_id]}]
+        fetched = jobs.get(run_id)
+        related = [check for check in checks if check['sha'] == sha and check['id'] in {job['check_id'] for job in fetched}] if fetched is not None else []
+        # With the latest filter, a failed run whose job check-runs are absent has been
+        # re-evaluated by a later check-run of the same name on that SHA (the later run's
+        # own lineage may sit outside the window); the later run carries the verdict, so
+        # this failure is superseded history rather than unknown evidence.
+        absent = [job for job in (fetched or []) if job['check_id'] is not None and job['check_id'] not in {check['id'] for check in related}]
+        later = {check['name'] for check in checks if check['sha'] == sha}
+        requeued = bool(absent) and raw.get('conclusion') in FAILURES and not any(check['conclusion'] in FAILURES for check in related) \
+            and all(job['name'] in later for job in absent)
         for number in numbers:
             current = None if number not in heads else heads[number] == sha
             owned = copy.deepcopy(related)
+            evidence = _check_evidence(owned, current)
+            if requeued:
+                evidence.update(actionable=False, severity=None, reason=None, superseded=True)
             row = {'key': f'{repo}:{run_id}:{number or "none"}', 'id': run_id, 'attempt': attempt, 'repo': repo,
                    'pr': number, 'sha': sha, 'name': text(raw.get('name')), 'workflow_id': identity(raw.get('workflow_id')),
-                   'jobs_scope': 'all-attempts', 'status': _status(raw.get('status')), 'conclusion': _conclusion(raw.get('conclusion')),
+                   'jobs_scope': 'all-attempts' if fetched is not None else 'not-fetched', 'status': _status(raw.get('status')), 'conclusion': _conclusion(raw.get('conclusion')),
                    'created_at': stamp(raw.get('created_at')), 'started_at': stamp(raw.get('run_started_at')),
                    'updated_at': stamp(raw.get('updated_at')), 'current_head': current,
-                   'jobs': copy.deepcopy(jobs[run_id]), 'checks': owned, **_check_evidence(owned, current),
-                   'check_evidence_unknown': raw.get('conclusion') in FAILURES and not any(c['conclusion'] in FAILURES for c in owned),
+                   'jobs': copy.deepcopy(fetched or []), 'checks': owned, **evidence,
+                   'check_evidence_unknown': raw.get('conclusion') in FAILURES and not requeued and not any(c['conclusion'] in FAILURES for c in owned),
                    'rerun_command': f'gh run rerun {run_id} --failed --repo {repo}' if raw.get('conclusion') in FAILURES else None}
             rows.append(row)
             key = (number, sha)
@@ -226,26 +238,40 @@ def _group_check_rows(repo, checks, heads, runs, groups):
 
 
 class CIProvider:
-    def __init__(self, client, inventory, *, clock=time.time, monotonic=time.monotonic, max_pages=10, recent_seconds=86400):
+    def __init__(self, client, inventory, *, clock=time.time, monotonic=time.monotonic, max_pages=10, recent_seconds=10800, jobs_cache=1024):
         self.client, self.inventory, self.clock = client, tuple(inventory), clock
         self.monotonic, self._offset = monotonic, 0
         self.max_pages = max_pages
         if type(recent_seconds) is not int or not 0 < recent_seconds <= 2**53 - 1:
             raise ValueError('invalid_recent_window')
         self.recent_seconds = recent_seconds
+        if type(jobs_cache) is not int or jobs_cache < 1:
+            raise ValueError('invalid_jobs_cache')
+        self.jobs_cache = jobs_cache
         self._records, self._failures, self._jobs_cache = {}, {}, OrderedDict()
 
     def _repo(self, repo, deadline):
         base = '/repos/' + repo
         pulls = self.client.pages(base + '/pulls?state=open&per_page=100', max_pages=self.max_pages, deadline=deadline)
         heads = {identity(_row(pr).get('number')): _sha(_row(pr.get('head')).get('sha')) for pr in pulls}
-        cutoff = datetime.datetime.fromtimestamp(max(0, self.clock() - self.recent_seconds), datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+        # Floor the cutoff to the hour so the list URL is stable within the hour and
+        # unchanged pages revalidate as free 304s; a sliding cutoff defeats every ETag.
+        floor = math.floor(max(0, self.clock() - self.recent_seconds) / 3600) * 3600
+        cutoff = datetime.datetime.fromtimestamp(floor, datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
         queries = ['created=' + urllib.parse.quote('>=' + cutoff, safe='')] + ['status=' + status for status in sorted(LIVE)]
         run_by_id = OrderedDict()
         for query in queries:
             for raw in self.client.pages(base + '/actions/runs?per_page=100&' + query, collection='workflow_runs', max_pages=self.max_pages, deadline=deadline):
                 run_by_id[identity(_row(raw).get('id'))] = raw
         runs = list(run_by_id.values())
+        # Job detail is read for live runs, failed runs and runs on an open-PR HEAD.
+        # Any other completed run is history that keeps its workflow result only; at
+        # fleet volume detailing every run burns the API budget without informing a
+        # verdict.
+        current = set(heads.values())
+        detailed = {identity(_row(raw).get('id')) for raw in runs
+                    if _row(raw).get('status') != 'completed' or _row(raw).get('conclusion') in FAILURES
+                    or _sha(_row(raw).get('head_sha')) in current}
         workflows, jobs, checks = {}, {}, []
         for raw in runs:
             raw = _row(raw)
@@ -257,7 +283,9 @@ class CIProvider:
                 # Conflicting suite/run observations never choose a convenient lineage.
                 workflows[suite] = lineage if suite not in workflows or workflows[suite] == lineage else None
             job_key = (repo, run_id, identity(raw.get('run_attempt', 1)))
-            if raw.get('status') == 'completed' and job_key in self._jobs_cache:
+            if run_id not in detailed:
+                jobs[run_id] = None
+            elif raw.get('status') == 'completed' and job_key in self._jobs_cache:
                 jobs[run_id] = copy.deepcopy(self._jobs_cache[job_key])
                 self._jobs_cache.move_to_end(job_key)
             else:
@@ -267,15 +295,19 @@ class CIProvider:
                 if raw.get('status') == 'completed':
                     self._jobs_cache[job_key] = copy.deepcopy(jobs[run_id])
                     self._jobs_cache.move_to_end(job_key)
-                    while len(self._jobs_cache) > 256:
+                    while len(self._jobs_cache) > self.jobs_cache:
                         self._jobs_cache.popitem(last=False)
-        for sha in sorted({_sha(_row(run).get('head_sha')) for run in runs} | set(heads.values())):
+        # Check-runs are read only for open-PR HEADs, and only the latest per check.
+        # Scheduled sweeps attach check-runs to default-branch SHAs for days (2,052
+        # observed on one mergepath SHA even with filter=latest), so sweep SHAs
+        # cannot be walked within the page bound or the deadline.
+        for sha in sorted(current):
             checks.extend(normalize_check(repo, check, workflows) for check in self.client.pages(
-                base + '/commits/' + sha + '/check-runs?filter=all&per_page=100', collection='check_runs',
+                base + '/commits/' + sha + '/check-runs?filter=latest&per_page=100', collection='check_runs',
                 max_pages=self.max_pages, deadline=deadline))
-        if len({check['id'] for check in checks}) != len(checks):
-            raise ClientError('invalid_upstream_json')
-        checks = supersede(checks)
+        # A list that grows while its pages are walked repeats a row at a page edge;
+        # the first observation of an id stands.
+        checks = supersede(list({check['id']: check for check in reversed(checks)}.values())[::-1])
         rows, groups = group_runs(repo, runs, jobs, checks, heads)
         return rows, groups, _group_check_rows(repo, checks, heads, rows, groups)
 
@@ -322,7 +354,10 @@ class CIProvider:
             check_rows.extend(copy.deepcopy(record['check_rows']))
             observations.append({k: record[k] for k in ('repo', 'observed_at', 'attempted_at', 'stale', 'error', 'retry_at')})
         data = {'schema': 'ci/v1', 'runs': rows, 'groups': groups, 'repositories': observations, 'recent_seconds': self.recent_seconds, 'check_rows': check_rows}
-        return Sample(copy_json_tree(data), hot=any(row['status'] in LIVE for row in rows + check_rows) or any(o['stale'] for o in observations))
+        # Hot means a live run on an open-PR HEAD, the thing an operator is waiting
+        # on. Scheduled sweeps and failing repositories keep the idle cadence.
+        hot = any(row['status'] in LIVE and row.get('current_head') is True for row in rows + check_rows)
+        return Sample(copy_json_tree(data), hot=hot)
 
 
 def extract_fail_lines(body, step):

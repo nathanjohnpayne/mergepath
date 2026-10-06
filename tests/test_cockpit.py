@@ -117,6 +117,35 @@ class ClientTests(unittest.TestCase):
         with self.assertRaisesRegex(ClientError, "page_limit"):
             client.pages("/repos/a/b/pulls", max_pages=1)
 
+    def test_pagination_follows_the_repository_alias_of_the_same_endpoint(self):
+        # Observed 2026-10-06: GitHub paginates /repos/<owner>/<repo>/actions/runs through
+        # /repositories/<id>/actions/runs, and every enrolled repository has several pages.
+        alias = "https://api.github.com/repositories/1190939344/actions/runs?per_page=100&created=%3E%3D2026-10-05T15%3A15%3A04Z&page="
+        fixture = HTTPFixture(reply(data={"workflow_runs": [1]}, Link=f'<{alias}2>; rel="next", <{alias}9>; rel="last"'),
+                              reply(data={"workflow_runs": [2]}, Link=f'<{alias}3>; rel="next"'),
+                              reply(data={"workflow_runs": [3]}))
+        client = self.client(fixture)
+        self.assertEqual(client.pages("/repos/a/b/actions/runs?per_page=100&created=%3E%3D2026-10-05T15%3A15%3A04Z",
+                                      collection="workflow_runs"), [1, 2, 3])
+        # The alias never leaves the client: later pages still request the enrolled /repos/ endpoint.
+        self.assertEqual([call[1] for call in fixture.calls][1:],
+                         [ORIGIN + "/repos/a/b/actions/runs?per_page=100&created=%3E%3D2026-10-05T15%3A15%3A04Z&page=" + page for page in "23"])
+        dropped = HTTPFixture(reply(data=[], Link='<https://api.github.com/repositories/1190939344/actions/runs?page=2>; rel="next"'))
+        with self.assertRaisesRegex(ClientError, "invalid_next_link"):
+            self.client(dropped).pages("/repos/a/b/actions/runs?per_page=100&status=queued")
+        for url in ["https://api.github.com/repositories/1190939344/pulls?page=2",
+                    "https://api.github.com/repositories/1190939344/actions/runs/7/jobs?page=2",
+                    "https://api.github.com/repositories/abc/actions/runs?page=2",
+                    "https://api.github.com/repositories/01/actions/runs?page=2",
+                    "https://api.github.com/repositories/1190939344/actions/runs?page=2#frag"]:
+            with self.subTest(url=url), self.assertRaisesRegex(ClientError, "invalid_next_link"):
+                self.client(HTTPFixture(reply(data={"workflow_runs": []}, Link=f'<{url}>; rel="next"'))).pages(
+                    "/repos/a/b/actions/runs", collection="workflow_runs")
+        drifting = HTTPFixture(reply(data=[1], Link=f'<{alias}2>; rel="next"'),
+                               reply(data=[2], Link='<https://api.github.com/repositories/2/actions/runs?page=3>; rel="next"'))
+        with self.assertRaisesRegex(ClientError, "invalid_next_link"):
+            self.client(drifting).pages("/repos/a/b/actions/runs")
+
     def test_object_collection_pagination(self):
         client = self.client(HTTPFixture(reply(data={"workflow_runs": [{"id": 7}], "total_count": 1})))
         self.assertEqual(client.pages("/repos/a/b/actions/runs", collection="workflow_runs"), [{"id": 7}])

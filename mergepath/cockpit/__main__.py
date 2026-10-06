@@ -121,7 +121,8 @@ def main(argv=None):
     try:
         actions_settings = load_settings_json(args.actions_settings)
         agents_settings = load_settings_json(args.agents_settings)
-        github = GitHubClient.from_environment(os.environ)
+        # Eight repositories of pulls, runs, status, job and check pages must stay ETag-cached.
+        github = GitHubClient.from_environment(os.environ, cache_pages=768)
         # Resolve the canonical cache once before worker HOME/XDG isolation.
         cache_dir = Path(os.environ.get("OP_PREFLIGHT_CACHE_DIR") or
                          str(Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "mergepath")).resolve()

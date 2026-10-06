@@ -75,8 +75,23 @@
       this.cards = new Map(); this.root = C.element("div", "live-agents");
       this.summary = C.element("h3", "live-summary"); this.note = C.element("p", "sub");
       this.list = C.element("div", "live-agent-list"); this.empty = C.element("p", "empty");
-      this.terminal = C.element("p", "sub live-terminal"); this.diagnostics = C.element("p", "adapter-diagnostic");
+      // Finished runs stay available as text, behind a disclosure with a count, so two dozen
+      // observations do not become a wall of prose beside the CI panel.
+      this.terminal = C.element("div", "live-terminal"); this.terminal.hidden = true; this.terminalOpen = false; this.terminalNodes = new Map();
+      this.terminalToggle = C.element("button", "live-terminal-toggle"); this.terminalToggle.type = "button";
+      this.terminalList = C.element("ul", "live-terminal-list"); this.terminalList.id = "live-terminal-observations"; this.terminalList.hidden = true;
+      this.terminalToggle.setAttribute("aria-controls", this.terminalList.id); this.terminalToggle.setAttribute("aria-expanded", "false");
+      this.terminalToggle.addEventListener("click", () => {this.terminalOpen = !this.terminalOpen; this.discloseTerminal();});
+      this.terminalNote = C.element("span", "sub", "Accounting history updates independently; these observations add no spend.");
+      this.terminal.append(this.terminalToggle, this.terminalList, this.terminalNote);
+      this.diagnostics = C.element("p", "adapter-diagnostic");
       this.root.append(this.summary, this.note, this.list, this.empty, this.terminal, this.diagnostics); parent.replaceChildren(this.root);
+    }
+    discloseTerminal() {
+      const count = this.terminalNodes.size;
+      this.terminalList.hidden = !this.terminalOpen;
+      this.terminalToggle.setAttribute("aria-expanded", String(this.terminalOpen));
+      this.terminalToggle.textContent = `${count} finished ${count === 1 ? "run" : "runs"} observed · ${this.terminalOpen ? "hide" : "show"}`;
     }
     create(row) {
       const root = C.element("article", "live-agent"), header = C.element("div", "live-agent-head"), badge = C.badge(row.state, row.label);
@@ -122,8 +137,16 @@
       }
       this.empty.hidden = model.rows.length > 0;
       this.empty.textContent = model.data.hasObservations && model.data.coverage_complete ? "No Phase 4b run in flight." : "Live coverage incomplete; no runs established.";
+      const keepTerminal = new Set(model.terminal.map(row => row.id));
+      for (const [id, node] of this.terminalNodes) if (!keepTerminal.has(id)) {node.remove(); this.terminalNodes.delete(id);}
+      model.terminal.forEach((row, index) => {
+        let node = this.terminalNodes.get(row.id);
+        if (!node) {node = C.element("li"); this.terminalNodes.set(row.id, node);}
+        node.textContent = `${row.repo} #${row.pr}: ${row.posted_outcome !== null ? `${row.posted_outcome} review posted` : row.summary_emitted ? `${row.verdict ?? "verdict unavailable"} summary; no posted outcome established` : row.review_posted ? "review POST confirmed; final summary and outcome unavailable" : "finished; final summary unavailable"}${row.dry_run ? " · dry run" : ""} · exit ${row.exit_code ?? "unavailable"} · acknowledgment ${row.review_acknowledgment ?? "unavailable"}`;
+        if (this.terminalList.children[index] !== node) this.terminalList.insertBefore(node, this.terminalList.children[index] || null);
+      });
       this.terminal.hidden = !model.terminal.length;
-      this.terminal.textContent = model.terminal.map(row => `${row.repo} #${row.pr}: ${row.posted_outcome !== null ? `${row.posted_outcome} review posted` : row.summary_emitted ? `${row.verdict ?? "verdict unavailable"} summary; no posted outcome established` : row.review_posted ? "review POST confirmed; final summary and outcome unavailable" : "finished; final summary unavailable"}${row.dry_run ? " · dry run" : ""} · exit ${row.exit_code ?? "unavailable"} · acknowledgment ${row.review_acknowledgment ?? "unavailable"}`).join(". ") + ". Accounting history updates independently; these observations add no spend.";
+      this.discloseTerminal();
       this.diagnostics.textContent = model.data.diagnostics.join(" "); this.diagnostics.hidden = !model.data.diagnostics.length;
     }
   }

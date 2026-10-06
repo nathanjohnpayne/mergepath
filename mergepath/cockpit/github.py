@@ -181,6 +181,23 @@ def _retry_delay(value, now):
     return 0
 
 
+_REPOSITORY_ENDPOINT = re.compile(r"/repos/[^/]+/[^/]+(/.*)?")
+_REPOSITORY_ALIAS = re.compile(r"/repositories/([1-9][0-9]{0,18})(/.*)?")
+
+
+def _alias_of(path, endpoint):
+    """Return the numeric repository id when ``path`` is GitHub's alias of ``endpoint``.
+
+    GitHub paginates repository-scoped REST endpoints through
+    ``/repositories/<id>/...`` rather than ``/repos/<owner>/<repo>/...``, so
+    the alias is accepted only when the remainder of the path is identical.
+    """
+    alias, requested = _REPOSITORY_ALIAS.fullmatch(path), _REPOSITORY_ENDPOINT.fullmatch(endpoint)
+    if not alias or not requested or (alias[2] or "") != (requested[1] or ""):
+        return None
+    return alias[1]
+
+
 def _next_link(link):
     if not link:
         return None
@@ -507,7 +524,9 @@ class GitHubClient:
         if not 1 <= max_pages <= 100:
             raise ValueError("invalid_page_bound")
         path = self._path(path)
-        endpoint, seen, rows = urllib.parse.urlsplit(path).path, set(), []
+        first = urllib.parse.urlsplit(path)
+        endpoint, seen, rows, alias_id = first.path, set(), [], None
+        requested = {pair for pair in urllib.parse.parse_qsl(first.query, keep_blank_values=True) if pair[0] != "page"}
         deadline = self._monotonic() + 30 if deadline is None else deadline
         for _ in range(max_pages):
             if path in seen:
@@ -522,10 +541,18 @@ class GitHubClient:
             if next_link is None:
                 return rows
             parts = urllib.parse.urlsplit(next_link)
-            if (parts.scheme != "https" or parts.netloc != "api.github.com"
-                    or parts.path != endpoint or parts.fragment):
+            if parts.scheme != "https" or parts.netloc != "api.github.com" or parts.fragment:
                 raise ClientError("invalid_next_link")
-            path = self._path(parts.path + ("?" + parts.query if parts.query else ""))
+            if parts.path != endpoint:
+                # GitHub hands back /repositories/<id>/... for a /repos/<owner>/<repo>/...
+                # request. Keep walking the endpoint that was asked for, take only the
+                # page cursor, and require the original filters and one stable alias id.
+                alias = _alias_of(parts.path, endpoint)
+                offered = set(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
+                if alias is None or alias_id not in (None, alias) or not requested <= offered:
+                    raise ClientError("invalid_next_link")
+                alias_id = alias
+            path = self._path(endpoint + ("?" + parts.query if parts.query else ""))
         raise ClientError("page_limit")
 
     def query(self, document, variables=None, *, deadline=None):

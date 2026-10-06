@@ -101,10 +101,20 @@ test("done transition leaves active list and requires summary plus post for post
   const terminal = row({stage: "done", reached: ["barrier", "adapter", "posting", "done"], process_status: "done", adapter_verdict: "APPROVED", exit_code: 7});
   view.update(L.projectLive(envelope([], {terminal: [terminal]}), null, now));
   assert.equal(view.cards.size, 0); assert.match(view.empty.textContent, /No Phase 4b run in flight/);
-  assert.match(view.terminal.textContent, /final summary unavailable/); assert.doesNotMatch(view.terminal.textContent, /APPROVED review posted/);
+  const terminalText = () => [...view.terminalNodes.values()].map(node => node.textContent).join(" ");
+  assert.match(terminalText(), /final summary unavailable/); assert.doesNotMatch(terminalText(), /APPROVED review posted/);
+  // Finished runs stay behind a counted disclosure; the list is collapsed until the operator opens it.
+  assert.equal(view.terminal.hidden, false); assert.equal(view.terminalList.hidden, true);
+  assert.equal(view.terminalToggle.textContent, "1 finished run observed · show"); assert.equal(view.terminalToggle.attributes["aria-expanded"], "false");
+  view.terminalOpen = true; view.discloseTerminal();
+  assert.equal(view.terminalList.hidden, false); assert.equal(view.terminalToggle.attributes["aria-expanded"], "true");
+  const item = view.terminalNodes.get(terminal.id);
   terminal.summary_emitted = true; terminal.review_posted = true; terminal.verdict = "APPROVED"; terminal.posted_outcome = "APPROVED"; terminal.review_acknowledgment = "failed";
   view.update(L.projectLive(envelope([], {terminal: [terminal]}), null, now));
-  assert.match(view.terminal.textContent, /APPROVED review posted.*exit 7.*acknowledgment failed/);
+  assert.match(terminalText(), /APPROVED review posted.*exit 7.*acknowledgment failed/);
+  assert.equal(view.terminalNodes.get(terminal.id), item); assert.equal(item.detachments, 0); assert.equal(view.terminalList.hidden, false);
+  view.update(L.projectLive(envelope([], {terminal: []}), null, now));
+  assert.equal(view.terminal.hidden, true); assert.equal(view.terminalNodes.size, 0);
 }));
 test("both reduced-motion paths stop loops at rest and preserve information", () => {
   const css = fs.readFileSync(require.resolve("../mergepath/cockpit/assets/live_agents.css"), "utf8");

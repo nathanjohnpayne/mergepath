@@ -24,6 +24,10 @@
 .live-stage.stg-crash .live-stage-dot{background:var(--boulder);box-shadow:none}
 .live-stage.stg-crash{color:var(--boulder-ink);font-weight:600}
 .live-agent-footer{font-size:11px}
+.live-terminal{display:grid;gap:6px;min-width:0}
+.live-terminal-toggle{justify-self:start;background:transparent;border:0;padding:2px 0;color:var(--ink);text-decoration:underline;text-underline-offset:3px;min-height:32px;font-size:11.5px}
+.live-terminal-list{list-style:none;margin:0;padding:0;display:grid;font-size:11.5px;color:var(--muted);max-height:320px;overflow:auto}
+.live-terminal-list li{padding:5px 0;border-top:1px solid var(--line);overflow-wrap:anywhere}
 .live-agent .m-fill{transition:width 700ms var(--ease),background-color 360ms ease}
 .live-agent .m-top{flex-wrap:wrap}
 @keyframes live-agent-enter{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}

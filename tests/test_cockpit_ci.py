@@ -343,16 +343,83 @@ class ProviderTests(unittest.TestCase):
                 self.assertEqual(row['checks'][0]['superseded_by'], '201' if superseded else None)
                 self.assertEqual(row['checks'][0]['started_at'], normalize_check(REPO, failed, {})['started_at'])
 
-    def test_unmatched_checks_retain_old_or_unknown_head_history_without_hazard(self):
+    def test_successful_history_off_open_heads_keeps_workflow_result_without_detail_reads(self):
+        # A completed success on a SHA that is no open HEAD is history: its workflow result
+        # stays, but no job or check pages are read for it (fleet volume, #1810).
         for head, current in [(OTHER_SHA, False), (None, None)]:
             with self.subTest(head=head):
-                data = unmatched_checks_fixture(head=head)['data']
-                row = data['check_rows'][0]
-                self.assertEqual(row['pr'], '7'); self.assertEqual(row['sha'], SHA)
-                self.assertIs(row['current_head'], current); self.assertFalse(row['actionable'])
-                self.assertEqual(row['checks'][0]['id'], '200')
-                self.assertEqual(data['groups'][0]['run_keys'], [data['runs'][0]['key']])
-                self.assertEqual(data['groups'][0]['check_keys'], [row['key']])
+                fixture = unmatched_checks_fixture(head=head); data = fixture['data']
+                run = data['runs'][0]
+                self.assertEqual((run['pr'], run['sha'], run['current_head']), ('7', SHA, current))
+                self.assertEqual(run['jobs_scope'], 'not-fetched'); self.assertEqual(run['jobs'], []); self.assertEqual(run['checks'], [])
+                self.assertFalse(run['actionable']); self.assertFalse(run['superseded']); self.assertEqual(run['conclusion'], 'success')
+                self.assertEqual(sum('/jobs?' in call['route'] for call in fixture['calls']), 0)
+                self.assertEqual([call['route'] for call in fixture['calls'] if '/check-runs?' in call['route']],
+                                 [f'/repos/{REPO}/commits/{OTHER_SHA}/check-runs?filter=latest&per_page=100'] if head else [])
+                self.assertEqual([row['sha'] for row in data['check_rows']], [OTHER_SHA] if head else [])
+                self.assertEqual(data['groups'][0]['run_keys'], [run['key']])
+                self.assertFalse(fixture['hot'])
+
+    def test_latest_filter_absent_failed_check_is_superseded_only_by_a_later_same_name_check(self):
+        # filter=latest drops an older failed check-run once the same check ran again;
+        # the later run carries the verdict, so the old failure is superseded history.
+        for later_name, superseded in (('lint', True), ('other', False)):
+            with self.subTest(later_name=later_name):
+                later = raw_check(101, 'success', LATER, name=later_name, suite=51)
+                class Client:
+                    def pages(self, route, **kwargs):
+                        if '/pulls?' in route: return [{'number': 7, 'head': {'sha': SHA}}]
+                        if '/actions/runs?' in route: return [raw_run()] if 'created=' in route else []
+                        if '/jobs?' in route: return [raw_job()]
+                        if '/check-runs?' in route:
+                            assert 'filter=latest' in route, route; return [later]
+                        raise AssertionError('unexpected route: ' + route)
+                row = CIProvider(Client(), INVENTORY, clock=lambda: 1000, monotonic=lambda: 0)(5).data['runs'][0]
+                self.assertEqual(row['superseded'], superseded); self.assertFalse(row['actionable'])
+                self.assertEqual(row['check_evidence_unknown'], not superseded); self.assertEqual(row['checks'], [])
+                self.assertEqual(row['jobs_scope'], 'all-attempts'); self.assertIsNone(row['severity'])
+
+    def test_page_shift_repeats_are_deduplicated_instead_of_failing_the_repository(self):
+        duplicate = raw_check(); duplicate['output'] = {'summary': 'second copy'}
+        class Client:
+            def pages(self, route, **kwargs):
+                if '/pulls?' in route: return [{'number': 7, 'head': {'sha': SHA}}]
+                if '/actions/runs?' in route: return [raw_run(), raw_run()] if 'created=' in route else []
+                if '/jobs?' in route: return [raw_job()]
+                return [raw_check(), duplicate]
+        data = CIProvider(Client(), INVENTORY, clock=lambda: 1000, monotonic=lambda: 0)(5).data
+        self.assertFalse(data['repositories'][0]['stale']); self.assertEqual(len(data['runs']), 1)
+        self.assertEqual([check['id'] for check in data['runs'][0]['checks']], ['100'])
+        self.assertEqual(data['runs'][0]['diagnostics'], [])
+
+    def test_detail_scope_floored_cutoff_and_hot_follow_open_heads_not_sweeps(self):
+        live = raw_run(12, None, OTHER_SHA); live.update(status='in_progress', conclusion=None, pull_requests=[])
+        failed = raw_run(13, 'timed_out', OTHER_SHA); failed['pull_requests'] = []
+        cancelled = raw_run(14, 'cancelled', OTHER_SHA); cancelled['pull_requests'] = []
+        on_head = raw_run(15, 'success', SHA)
+        calls, now = [], [1791300000.0]  # 2026-10-06T15:20:00Z
+        class Client:
+            def pages(self, route, **kwargs):
+                calls.append(route)
+                if '/pulls?' in route: return [{'number': 7, 'head': {'sha': SHA}}]
+                if '/actions/runs?' in route: return [live, failed, cancelled, on_head] if 'created=' in route else []
+                if '/jobs?' in route: return [{**raw_job(int(route.split('/runs/')[1].split('/')[0]) * 10, 100), 'conclusion': 'success'}]
+                if '/check-runs?' in route: return []
+                raise AssertionError('unexpected route: ' + route)
+        provider = CIProvider(Client(), INVENTORY, clock=lambda: now[0], monotonic=lambda: 0)
+        sample = provider(5); rows = {row['id']: row for row in sample.data['runs']}
+        self.assertEqual({rid: row['jobs_scope'] for rid, row in rows.items()},
+                         {'12': 'all-attempts', '13': 'all-attempts', '14': 'not-fetched', '15': 'all-attempts'})
+        self.assertEqual(rows['14']['jobs'], []); self.assertEqual(len(rows['15']['jobs']), 1)
+        self.assertEqual(sorted(route.split('/runs/')[1].split('/')[0] for route in calls if '/jobs?' in route), ['12', '13', '15'])
+        self.assertEqual([route.split('/commits/')[1].split('/')[0] for route in calls if '/check-runs?' in route], [SHA], 'check-runs are read for open HEADs only')
+        self.assertEqual(sample.data['recent_seconds'], 10800)
+        self.assertIn('created=%3E%3D2026-10-06T12%3A00%3A00Z', next(route for route in calls if 'created=' in route))
+        self.assertFalse(sample.hot, 'a live sweep off every open HEAD keeps the idle cadence')
+        live['head_sha'] = SHA; now[0] += 20
+        self.assertTrue(provider(5).hot)
+        with self.assertRaises(ValueError):
+            CIProvider(Client(), INVENTORY, jobs_cache=0)
 
     def test_unmatched_live_and_unknown_checks_do_not_invent_completed_success(self):
         for status, conclusion, hot, unknown in [('queued', None, True, False), ('in_progress', None, True, False),
@@ -446,7 +513,8 @@ class ProviderTests(unittest.TestCase):
         sample = provider(time.monotonic() + 5)
         self.assertEqual(len(calls), 17)
         self.assertTrue(sample.data['runs'][0]['actionable'])
-        self.assertTrue(all('filter=all' in u for u in calls if '/jobs?' in u or '/check-runs?' in u))
+        self.assertTrue(all('filter=all' in u for u in calls if '/jobs?' in u))
+        self.assertTrue(all('filter=latest' in u for u in calls if '/check-runs?' in u))
 
     def test_independent_actions_run_lineage_preserves_current_head_failure(self):
         # Observed #1698 run/suite lineage; check/app IDs remain synthetic fixtures.
