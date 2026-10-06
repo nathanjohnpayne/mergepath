@@ -221,6 +221,8 @@ test("Escape and pointercancel restore the original order mid-drag with focus ba
   assert.deepEqual(f.controller.order, [...Layout.PANELS], "a late pointerup after cancel is ignored");
   drag(f, "fleet", 50, {release: false}); f.handle("fleet").dispatch("pointercancel", {pointerId: 1});
   assert.equal(f.controller.drag, null); assert.deepEqual(f.controller.order, [...Layout.PANELS]); assert.equal(f.sections.get("fleet").classList.contains("panel-lifting"), false);
+  assert.match(f.announcer.textContent, /Move cancelled\. Fleet sync stays at position 5 of 6\./, "a browser-cancelled drag announces its cancellation");
+  assert.equal(f.handle("fleet").getAttribute("aria-pressed"), "false"); assert.equal(document.activeElement, f.handle("fleet"));
 });
 
 test("keyboard reordering grabs, moves with arrows, Home and End, drops or cancels, and keeps focus on the handle", () => {

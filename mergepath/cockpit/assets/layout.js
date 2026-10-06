@@ -105,7 +105,8 @@
         handle.addEventListener("pointerdown", event => this.onPointerDown(id, event));
         handle.addEventListener("pointermove", event => this.onPointerMove(event));
         handle.addEventListener("pointerup", event => this.onPointerUp(event));
-        handle.addEventListener("pointercancel", () => this.cancelDrag(false));
+        // A browser-cancelled drag (touch scroll takeover, pen leaving range) is a cancellation the live region must report.
+        handle.addEventListener("pointercancel", () => this.cancelDrag(true));
         this.handles.set(id, handle);
       }
       document.body.append(this.indicator);
