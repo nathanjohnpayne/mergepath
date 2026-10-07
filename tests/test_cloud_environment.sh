@@ -142,6 +142,21 @@ if [ "$rc" -eq 0 ] && printf '%s' "$out" | head -1 | grep -qx 'mergepath cloud s
 else
   fail "hook setup install: rc=$rc out=$out log=$(cat "$WORKDIR/probe.log") timeout=$(cat "$WORKDIR/timeout.log")"
 fi
+# MERGEPATH_CLOUD_SETUP_TIMEOUT may lower the bound to 1..60 seconds; a larger,
+# zero or non-numeric value keeps 60 with a notice, so setup can never outlast the
+# hook's 120-second limit and starve the probe (#1835 review).
+for case_spec in "30:30:no" "500:60:yes" "0:60:yes" "abc:60:yes" "060:60:yes"; do
+  requested="${case_spec%%:*}"; rest="${case_spec#*:}"; expected="${rest%%:*}"; notice="${rest#*:}"
+  : >"$WORKDIR/probe.log"; : >"$WORKDIR/timeout.log"
+  out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=install PROBE_LOG="$WORKDIR/probe.log" MERGEPATH_CLOUD_SETUP_TIMEOUT="$requested" PATH="$HBIN" bash "$HOOK")"; rc=$?
+  noticed=no
+  printf '%s' "$out" | grep -q 'MERGEPATH_CLOUD_SETUP_TIMEOUT must be a whole number of seconds from 1 to 60' && noticed=yes
+  if [ "$rc" -eq 0 ] && [ "$(cat "$WORKDIR/timeout.log")" = "timeout $expected" ] && [ "$noticed" = "$notice" ] && grep -q '^probe ' "$WORKDIR/probe.log"; then
+    pass "hook, MERGEPATH_CLOUD_SETUP_TIMEOUT=$requested: setup bound $expected, notice $notice, the probe still runs"
+  else
+    fail "hook setup bound $requested: rc=$rc out=$out timeout=$(cat "$WORKDIR/timeout.log")"
+  fi
+done
 # Without `timeout` nothing bounds setup, which could outlast the hook's own
 # 120-second limit and lose the summary: setup is skipped with a notice and
 # the probe still runs.

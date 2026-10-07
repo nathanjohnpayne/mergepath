@@ -28,11 +28,24 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PROBE="$ROOT/scripts/agent-capability-probe.sh"
 SETUP="$ROOT/scripts/cloud-setup.sh"
 
+# The setup bound is 60 seconds. MERGEPATH_CLOUD_SETUP_TIMEOUT may lower it to a
+# whole number of seconds from 1 to 60; anything else keeps 60, so setup always
+# leaves the probe time inside the hook's 120-second limit.
+setup_bound=60
+case "${MERGEPATH_CLOUD_SETUP_TIMEOUT:-}" in
+  ''|*[!0-9]*) ;;
+  *) [ "$MERGEPATH_CLOUD_SETUP_TIMEOUT" -ge 1 ] 2>/dev/null && [ "$MERGEPATH_CLOUD_SETUP_TIMEOUT" -le 60 ] 2>/dev/null \
+       && setup_bound=$((10#$MERGEPATH_CLOUD_SETUP_TIMEOUT)) ;;
+esac
+if [ -n "${MERGEPATH_CLOUD_SETUP_TIMEOUT:-}" ] && [ "$setup_bound" != "$MERGEPATH_CLOUD_SETUP_TIMEOUT" ]; then
+  echo "mergepath cloud session: MERGEPATH_CLOUD_SETUP_TIMEOUT must be a whole number of seconds from 1 to 60; using $setup_bound."
+fi
+
 if [ -r "$SETUP" ]; then
   if ! command -v timeout >/dev/null 2>&1; then
     echo "mergepath cloud session: tool setup skipped because timeout is not available to bound it; run bash scripts/cloud-setup.sh by hand."
   # stderr is the setup's whole report; stdout is unused.
-  elif setup_log="$(timeout "${MERGEPATH_CLOUD_SETUP_TIMEOUT:-60}" bash "$SETUP" 2>&1 >/dev/null)"; then
+  elif setup_log="$(timeout "$setup_bound" bash "$SETUP" 2>&1 >/dev/null)"; then
     installed="$(printf '%s\n' "$setup_log" | sed -n 's/^cloud-setup: installed \([^ ]* [^ ]*\) .*/\1/p' | paste -sd, - | sed 's/,/, /g')"
     [ -z "$installed" ] || echo "mergepath cloud session: installed $installed (scripts/cloud-setup.sh)."
   else
