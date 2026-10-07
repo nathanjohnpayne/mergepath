@@ -114,23 +114,55 @@ case "${SETUP_MODE:-noop}" in
 esac
 exit 0
 SETUP
+# A PATH with only the tools the hook and its fixtures run, so whether
+# `timeout` exists is decided here, not by the host: HBIN has a pass-through
+# `timeout` that records its bound, HBIN_NT has none.
+HBIN="$WORKDIR/hook-bin"
+HBIN_NT="$WORKDIR/hook-bin-notimeout"
+mkdir -p "$HBIN" "$HBIN_NT"
+for tool in bash env cat sed paste tail head dirname jq; do
+  real="$(command -v "$tool" 2>/dev/null || true)"
+  case "$real" in /*) ln -sf "$real" "$HBIN/$tool"; ln -sf "$real" "$HBIN_NT/$tool" ;; esac
+done
+cat >"$HBIN/timeout" <<T
+#!/usr/bin/env bash
+echo "timeout \$1" >>"$WORKDIR/timeout.log"
+shift
+exec "\$@"
+T
+chmod +x "$HBIN/timeout"
 : >"$WORKDIR/probe.log"
-out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=install PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
+: >"$WORKDIR/timeout.log"
+out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=install PROBE_LOG="$WORKDIR/probe.log" PATH="$HBIN" bash "$HOOK")"; rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | head -1 | grep -qx 'mergepath cloud session: installed yq v4.53.6 (scripts/cloud-setup.sh).' \
    && printf '%s' "$out" | grep -q 'capability tier `author-writes`' \
-   && [ "$(head -1 "$WORKDIR/probe.log")" = "setup ran" ] && grep -q '^probe ' "$WORKDIR/probe.log"; then
-  pass "hook, cloud session: runs setup before the probe and reports what it installed"
+   && [ "$(head -1 "$WORKDIR/probe.log")" = "setup ran" ] && grep -q '^probe ' "$WORKDIR/probe.log" \
+   && [ "$(cat "$WORKDIR/timeout.log")" = "timeout 60" ]; then
+  pass "hook, cloud session: runs setup under a 60-second timeout before the probe and reports what it installed"
 else
-  fail "hook setup install: rc=$rc out=$out log=$(cat "$WORKDIR/probe.log")"
+  fail "hook setup install: rc=$rc out=$out log=$(cat "$WORKDIR/probe.log") timeout=$(cat "$WORKDIR/timeout.log")"
 fi
-out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=fail PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
+# Without `timeout` nothing bounds setup, which could outlast the hook's own
+# 120-second limit and lose the summary: setup is skipped with a notice and
+# the probe still runs.
+: >"$WORKDIR/probe.log"
+out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=install PROBE_LOG="$WORKDIR/probe.log" PATH="$HBIN_NT" bash "$HOOK")"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | head -1 | grep -qx 'mergepath cloud session: tool setup skipped because timeout is not available to bound it; run bash scripts/cloud-setup.sh by hand.' \
+   && ! printf '%s' "$out" | grep -q 'installed yq' \
+   && printf '%s' "$out" | grep -q 'capability tier `author-writes`' \
+   && ! grep -q 'setup ran' "$WORKDIR/probe.log" && grep -q '^probe ' "$WORKDIR/probe.log"; then
+  pass "hook, no timeout available: skips setup with a one-line notice, the probe still runs, the hook still exits 0"
+else
+  fail "hook no timeout: rc=$rc out=$out log=$(cat "$WORKDIR/probe.log")"
+fi
+out="$(CLAUDE_CODE_REMOTE=true SETUP_MODE=fail PROBE_LOG="$WORKDIR/probe.log" PATH="$HBIN" bash "$HOOK")"; rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'tool setup failed or timed out (bash scripts/cloud-setup.sh to see why): cloud-setup: checksum mismatch for yq' \
    && printf '%s' "$out" | grep -q 'capability tier `author-writes`'; then
   pass "hook, setup failure: reported in the summary, the probe still runs, the hook still exits 0"
 else
   fail "hook setup failure: rc=$rc out=$out"
 fi
-out="$(CLAUDE_CODE_REMOTE=true PROBE_LOG="$WORKDIR/probe.log" bash "$HOOK")"; rc=$?
+out="$(CLAUDE_CODE_REMOTE=true PROBE_LOG="$WORKDIR/probe.log" PATH="$HBIN" bash "$HOOK")"; rc=$?
 if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -q 'cloud-setup\|tool setup'; then
   pass "hook, setup with nothing to install: adds nothing to the summary"
 else
@@ -514,6 +546,41 @@ else
   fail "setup shadowed yq: rc=$rc err=$(cat "$WORKDIR/setup.err")"
 fi
 
+# A mikefarah/yq v4 older than the checks need (v4.44.3, the ensure-yq.sh pin)
+# is not kept: setup installs the pinned one ahead of it. The minimum itself
+# and a newer release, compared as numbers (v4.100.0 > v4.53.6), are kept and
+# nothing is downloaded.
+yq_stub_dir() { # <dir> <version>
+  mkdir -p "$1"
+  printf '#!/usr/bin/env bash\necho "yq (https://github.com/mikefarah/yq/) version %s"\n' "$2" >"$1/yq"
+  chmod +x "$1/yq"
+}
+yq_stub_dir "$WORKDIR/yq-old" v4.44.3
+: >"$WORKDIR/curl.log"
+set +e
+run_setup "$WORKDIR/y-old" MERGEPATH_YQ_VERSION="$YQVER" MERGEPATH_YQ_SHA256="$yqsum" PATH="$WORKDIR/y-old/bin:$WORKDIR/yq-old:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q "is older than mikefarah/yq v4.53.6, which the repository checks need (yq (https://github.com/mikefarah/yq/) version v4.44.3)" "$WORKDIR/setup.err" \
+   && [ -x "$WORKDIR/y-old/bin/yq" ] && grep -q "installed yq $YQVER" "$WORKDIR/setup.err" \
+   && grep -q "mikefarah/yq/releases/download/$YQVER/yq_linux_amd64" "$WORKDIR/curl.log"; then
+  pass "setup, mikefarah/yq v4.44.3 on PATH: older than the minimum, so the pinned yq is installed ahead of it"
+else
+  fail "setup old yq: rc=$rc err=$(cat "$WORKDIR/setup.err") curl=$(cat "$WORKDIR/curl.log")"
+fi
+for keep in v4.53.6 v4.100.0; do
+  yq_stub_dir "$WORKDIR/yq-keep-$keep" "$keep"
+  : >"$WORKDIR/curl.log"
+  set +e
+  run_setup "$WORKDIR/y-keep-$keep" PATH="$WORKDIR/yq-keep-$keep:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+  set -e
+  if [ "$rc" -eq 0 ] && grep -q "yq present: yq (https://github.com/mikefarah/yq/) version $keep" "$WORKDIR/setup.err" \
+     && [ ! -s "$WORKDIR/curl.log" ] && [ ! -e "$WORKDIR/y-keep-$keep/bin/yq" ]; then
+    pass "setup, mikefarah/yq $keep on PATH: at least the minimum, kept, nothing downloaded"
+  else
+    fail "setup keep yq $keep: rc=$rc err=$(cat "$WORKDIR/setup.err") curl=$(cat "$WORKDIR/curl.log")"
+  fi
+done
+
 set +e
 run_setup "$WORKDIR/y-mismatch" PATH="$WORKDIR/y-mismatch/bin:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
 set -e
@@ -523,6 +590,20 @@ if [ "$rc" -eq 1 ] && [ ! -e "$WORKDIR/y-mismatch/bin/yq" ] \
   pass "setup, default yq version: verified against the hash pinned in the script, not a downloaded one"
 else
   fail "setup yq pinned mismatch: rc=$rc err=$(cat "$WORKDIR/setup.err")"
+fi
+
+# An override that installs an older v4 does not report success with a yq the
+# checks cannot use.
+printf '#!/usr/bin/env bash\necho "yq (https://github.com/mikefarah/yq/) version v4.44.3"\n' >"$REL/yq/yq_linux_amd64"
+oldsum="$(sha256sum "$REL/yq/yq_linux_amd64" 2>/dev/null | awk '{print $1}')"
+[ -n "$oldsum" ] || oldsum="$(shasum -a 256 "$REL/yq/yq_linux_amd64" | awk '{print $1}')"
+set +e
+run_setup "$WORKDIR/y-oldinstall" MERGEPATH_YQ_VERSION=v4.44.3 MERGEPATH_YQ_SHA256="$oldsum" PATH="$WORKDIR/y-oldinstall/bin:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && grep -q "does not run as mikefarah/yq v4 at v4.53.6 or later" "$WORKDIR/setup.err" && ! grep -q "installed yq" "$WORKDIR/setup.err"; then
+  pass "setup, an override installing yq v4.44.3: fails instead of reporting a yq older than the minimum"
+else
+  fail "setup yq old install: rc=$rc err=$(cat "$WORKDIR/setup.err")"
 fi
 
 printf '#!/usr/bin/env bash\necho "yq 0.0.0"\n' >"$REL/yq/yq_linux_amd64"
