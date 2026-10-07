@@ -363,22 +363,26 @@ class CIProvider:
         budget_deadline = deadline - .25
         ordered = self.inventory[self._offset:] + self.inventory[:self._offset]
         self._offset = (self._offset + 1) % max(1, len(self.inventory))
-        for index, item in enumerate(ordered):
+        # Pass one gives every repository a fair share; pass two lends the time left over to the
+        # repositories that ran out of their share, in the same rotated order (index None).
+        work, deferred = list(enumerate(ordered)), []
+        while work:
+            index, item = work.pop(0)
             repo, now = item.repo, self.clock()
             old = self._records.get(repo)
             if old and old['stale'] and old['retry_at'] > now:
                 record = copy.deepcopy(old)
             else:
-                scan_started = False
+                scan_started, share = False, budget_deadline
                 try:
                     if self.monotonic() >= budget_deadline:
                         raise ClientError('deadline_exceeded')
                     scan_started = True
-                    # Fair share: a repository may spend an equal share of what remains, so one slow
-                    # repository cannot starve the rest. Time a quick repository leaves unspent carries
-                    # forward to the repositories after it; the last one gets everything left.
+                    # Fair share: a repository may first spend an equal share of what remains, so one
+                    # slow repository cannot starve the rest. Time a quick repository leaves unspent
+                    # carries forward, and the last one gets everything left.
                     started = self.monotonic()
-                    share = started + (budget_deadline - started) / (len(ordered) - index)
+                    share = budget_deadline if index is None else started + (budget_deadline - started) / (len(ordered) - index)
                     repo_rows, repo_groups, repo_checks, history_complete = self._repo(repo, share)
                     record = {'repo': repo, 'observed_at': self.clock(), 'attempted_at': now,
                               'stale': False, 'error': None, 'retry_at': None, 'history_complete': history_complete,
@@ -387,7 +391,7 @@ class CIProvider:
                 except Exception as exc:
                     category = error_category(exc.category) if isinstance(exc, ClientError) else 'source_failed'
                     failures = self._failures.get(repo, 0)
-                    if scan_started:
+                    if scan_started and index is not None:
                         failures += 1
                         self._failures[repo] = failures
                     delay = min(900, 20 * 2 ** min(max(0, failures - 1), 16))
@@ -398,7 +402,12 @@ class CIProvider:
                         retry = now + 20
                     record = copy.deepcopy(old) if old else {'repo': repo, 'observed_at': None, 'history_complete': False, 'runs': [], 'groups': [], 'check_rows': []}
                     record.update(attempted_at=now, stale=True, error=category, retry_at=now if category == 'deadline_exceeded' else retry)
+                    if scan_started and share < budget_deadline and category == 'deadline_exceeded' and self.monotonic() < budget_deadline:
+                        deferred.append(item)
             self._records[repo] = copy.deepcopy(record)
+            if not work:
+                # A deferred repository keeps its completed job lists, suites and pages cached, so its retry repeats less work.
+                work, deferred = [(None, later) for later in deferred], []
         for item in self.inventory:
             record = self._records[item.repo]
             rows.extend(copy.deepcopy(record['runs']))

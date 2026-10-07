@@ -734,8 +734,9 @@ class ProviderTests(unittest.TestCase):
             self.assertNotIn('secret text', json.dumps(data))
 
     def test_deadline_reserves_publication_shares_it_fairly_and_rotates_repository_priority(self):
-        # #1817: one slow repository cannot starve the rest. Each repository may spend an equal share
-        # of what remains; unspent time carries forward and the last one gets everything left.
+        # #1817: one slow repository cannot starve the rest. Each repository may first spend an equal
+        # share of what remains; unspent time carries forward and the last one gets everything left.
+        # A repository that ran out of its share is retried with whatever time the others left.
         mono, calls = [0.0], []
         class Client:
             def pages(self, path, *, deadline, **kwargs):
@@ -748,6 +749,7 @@ class ProviderTests(unittest.TestCase):
         first = provider(1).data
         self.assertEqual(calls[0], ('/repos/owner/repo/pulls?state=open&per_page=100', .375))
         self.assertEqual({deadline for path, deadline in calls if '/owner/other/' in path}, {.75})
+        self.assertEqual([deadline for path, deadline in calls if '/owner/repo/' in path], [.375, .75])
         self.assertEqual([(o['stale'], o['error']) for o in first['repositories']], [(True, 'deadline_exceeded'), (False, None)])
         mono[0] = 1; calls.clear()
         second = provider(2).data
@@ -757,6 +759,51 @@ class ProviderTests(unittest.TestCase):
         self.assertTrue(second['repositories'][0]['stale'])
         self.assertEqual({deadline for path, deadline in calls if '/owner/other/' in path}, {1.375})
         self.assertEqual([deadline for path, deadline in calls if '/owner/repo/' in path], [1.75])
+
+    def test_repository_that_ran_out_of_its_share_completes_with_the_time_others_left(self):
+        # #1817: a plain equal split left 15 to 20 seconds of a calm scan unused while mergepath
+        # and fiveacross, each needing about 12 seconds, stayed stale behind their 7.5-second shares.
+        mono, calls = [0.0], []
+        class Client:
+            def pages(self, path, *, deadline, **kwargs):
+                calls.append((path, deadline))
+                if path.startswith('/repos/owner/repo/pulls'):
+                    if deadline - mono[0] < .5:
+                        mono[0] = deadline
+                        raise ClientError('deadline_exceeded')
+                    mono[0] += .5
+                return []
+        provider = CIProvider(Client(), INVENTORY + (Repository('other', 'owner/other'), Repository('third', 'owner/third')),
+                              monotonic=lambda: mono[0], clock=lambda: 1000)
+        data = provider(1.25).data
+        deadlines = [deadline for path, deadline in calls if path.startswith('/repos/owner/repo/pulls')]
+        self.assertEqual(len(deadlines), 2); self.assertAlmostEqual(deadlines[0], 1 / 3); self.assertEqual(deadlines[1], 1.0)
+        self.assertEqual([(o['stale'], o['error']) for o in data['repositories']], [(False, None)] * 3)
+        # The other repositories were scanned once each, inside their own shares.
+        self.assertEqual(sum(path.startswith('/repos/owner/other/pulls') for path, _ in calls), 1)
+        self.assertEqual(sum(path.startswith('/repos/owner/third/pulls') for path, _ in calls), 1)
+        # A retry that fails again is not deferred twice and does not count a second failure.
+        mono[0] = 10; calls.clear(); provider._offset = 0
+        data = provider(10.6).data
+        self.assertEqual(len([path for path, _ in calls if path.startswith('/repos/owner/repo/pulls')]), 2)
+        self.assertEqual(provider._failures['owner/repo'], 1)
+        self.assertEqual((data['repositories'][0]['stale'], data['repositories'][0]['error']), (True, 'deadline_exceeded'))
+        # A retry is never deferred again, even when its failure leaves budget unspent.
+        attempts = []
+        class Instant:
+            def pages(self, path, *, deadline, **kwargs):
+                if path.startswith('/repos/owner/repo/'):
+                    attempts.append(deadline)
+                    if len(attempts) > 2:
+                        raise AssertionError('deferred twice')
+                    raise ClientError('deadline_exceeded')
+                return []
+        data = CIProvider(Instant(), INVENTORY, monotonic=lambda: 0, clock=lambda: 1000)(5).data
+        self.assertEqual(len(attempts), 1, 'the only repository already had the whole budget')
+        attempts.clear()
+        data = CIProvider(Instant(), INVENTORY + (Repository('other', 'owner/other'),), monotonic=lambda: 0, clock=lambda: 1000)(5).data
+        self.assertEqual(attempts, [2.375, 4.75])
+        self.assertEqual(data['repositories'][0]['error'], 'deadline_exceeded')
 
     def test_running_to_conclusion_on_same_run_identity(self):
         raw = raw_run(); raw['status'] = 'in_progress'; raw['conclusion'] = None
