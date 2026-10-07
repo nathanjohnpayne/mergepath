@@ -4,10 +4,12 @@
 #
 # A cloud session (Claude Code on the web, Codex cloud) used to discover its
 # limits by attempting work and failing: no reviewer credential, writes landing
-# under a brokered bot identity, GraphQL refused by the proxy, pushes confined
-# to one branch, other repositories unreachable. This probe answers each of
-# those by measurement, side-effect free, and caches the answer so later tool
-# calls can read it without probing again.
+# under a brokered bot identity, GraphQL refused by the proxy, other
+# repositories unreachable. This probe answers each of those by measurement,
+# side-effect free, and caches the answer so later tool calls can read it
+# without probing again. Whether a push to a second branch is accepted is not
+# measured on any surface (push-multi-branch below): nothing short of a real
+# push proves it.
 #
 # Usage:
 #   scripts/agent-capability-probe.sh [--repo OWNER/REPO] [--cross-repo OWNER/REPO]
