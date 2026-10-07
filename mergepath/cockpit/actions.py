@@ -100,6 +100,16 @@ def measured_coefficient(value, repo, now):
             "window_start": start, "window_end": end, "provenance": provenance.strip()}
 
 
+def iso_epoch(value):
+    """Epoch seconds of a zoned ISO-8601 timestamp, or None; a zoneless one is never guessed."""
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        stamp = parsed.timestamp() if parsed.tzinfo is not None else None
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    return stamp if number(stamp) else None
+
+
 def run_rows(rows, repo, now, status=None):
     if type(rows) is not list or len(rows) > 10000:
         raise ClientError("invalid_page")
@@ -245,6 +255,12 @@ class ActionsProvider:
                     break
                 if type(raw) is not dict or not count(raw.get("id")) or raw["id"] == 0:
                     raise ClientError("invalid_page")
+                created = iso_epoch(raw.get("created_at"))
+                if created is None or created > now + 60:
+                    raise ClientError("invalid_page")
+                # The coarse cutoff only keeps the URL cacheable; evidence is the exact last hour.
+                if created < now - 3600:
+                    continue
                 attempt = raw.get("run_attempt", 1)
                 if not count(attempt) or attempt == 0:
                     raise ClientError("invalid_page")
@@ -254,10 +270,11 @@ class ActionsProvider:
                     # Every page of the attempt's jobs, bounded: a partial list must never read as clean.
                     rows = self.client.pages(f"/repos/{repo}/actions/runs/{raw['id']}/attempts/{attempt}/jobs?per_page=100",
                                              collection="jobs", max_pages=JOB_PAGES, deadline=deadline)
-                    if type(rows) is not list:
+                    # An unreadable row could be a failed job, so it fails the scan rather than vanishing.
+                    if type(rows) is not list or any(type(job) is not dict or not count(job.get("id")) or job["id"] == 0
+                                                     for job in rows):
                         raise ClientError("invalid_page")
-                    jobs = [str(job["id"]) for job in rows if type(job) is dict and job.get("conclusion") == "failure"
-                            and count(job.get("id")) and job["id"] > 0]
+                    jobs = [str(job["id"]) for job in rows if job.get("conclusion") == "failure"]
                     self._remember(self._scan_jobs, key, jobs)
                 for job in jobs:
                     verdict = self._scan_logs.get((repo, job))
@@ -273,10 +290,10 @@ class ActionsProvider:
                     if verdict:
                         exhausted.append(str(raw["id"]))
                         break
-            state["runs"] = exhausted
             if complete or exhausted:
-                state["observed_at"] = now
+                state["runs"], state["observed_at"] = exhausted, now
             else:
+                # Not clean evidence: the last settled runs stand until a settled scan replaces them.
                 state["error"] = "incomplete"
         except ClientError as exc:
             state["error"] = exc.category
@@ -410,9 +427,9 @@ class ActionsProvider:
         for index, row in enumerate(rows if self.installation_scan else []):
             available = deadline - self.monotonic()
             scan = self._installation_scan(row["repo"], self.monotonic() + max(0, available / (size - index + 1)), now)
-            row["installation_scan"] = {"observed_at": scan["observed_at"], "error": scan["error"]}
-            known = row.get("installation_runs") if type(row.get("installation_runs")) is list else []
-            row["installation_runs"] = sorted(set(known) | set(scan["runs"]), key=int)
+            # Scan runs stay apart from the CI-derived installation_runs, so the page can age each
+            # by its own observation: retained scan runs are last-known once the scan stops settling.
+            row["installation_scan"] = {"observed_at": scan["observed_at"], "error": scan["error"], "runs": list(scan["runs"])}
         billing = self._billing_read(deadline, now)
         try:
             robot = self._robot(now)

@@ -478,7 +478,9 @@ class ActionsTests(unittest.TestCase):
     def test_installation_scan_reads_failed_job_logs_independently_of_the_ci_snapshot(self):
         # nathanpaynedotcom 2026-10-07: gates printed the installation limit only in job logs, and
         # the CI scan could not cover that repository at all.
-        state = {'runs': [{'id': 5, 'run_attempt': 1}, {'id': 6, 'run_attempt': 2}], 'error': None}
+        iso = lambda at: dt.datetime.fromtimestamp(at, dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        R = lambda i, attempt=1, created=NOW: {'id': i, 'run_attempt': attempt, 'created_at': iso(created)}
+        state = {'runs': [R(5), R(6, 2)], 'error': None}
         jobs = {(5, 1): [{'id': 51, 'conclusion': 'failure'}, {'id': 52, 'conclusion': 'success'}],
                 (6, 2): [{'id': 61, 'conclusion': 'failure'}], (7, 1): [{'id': 71, 'conclusion': 'failure'}, {'id': 72, 'conclusion': 'failure'},
                                                                   {'id': 73, 'conclusion': 'failure'}, {'id': 74, 'conclusion': 'failure'}]}
@@ -512,8 +514,9 @@ class ActionsTests(unittest.TestCase):
                             ci_snapshot=stale, installation_scan=True)
         row = p.fetch(30).data['repositories'][0]
         # The CI snapshot is stale, yet the scan still establishes exhaustion for run 5.
-        self.assertFalse(row['available']); self.assertEqual(row['installation_runs'], ['5'])
-        self.assertEqual(row['installation_scan'], {'observed_at': NOW, 'error': None})
+        # Scan runs travel apart from the CI-derived installation_runs, which the stale snapshot lacks.
+        self.assertFalse(row['available']); self.assertIn(row.get('installation_runs'), (None, []))
+        self.assertEqual(row['installation_scan'], {'observed_at': NOW, 'error': None, 'runs': ['5']})
         # The first logged limit settles the scan, so run 6 is never read.
         self.assertEqual(reads, ['51'])
         # Within the interval nothing is read again.
@@ -523,35 +526,52 @@ class ActionsTests(unittest.TestCase):
         current[0] += 61; p.fetch(30)
         self.assertEqual(len(gets), 1); self.assertEqual(reads, [])
         # At most three log reads per scan: the scan is incomplete until the rest are read.
-        state['runs'] = [{'id': 7, 'run_attempt': 1}]; reads.clear(); current[0] += 121
+        state['runs'] = [R(7)]; reads.clear(); current[0] += 121
         partial = p.fetch(30).data['repositories'][0]
         self.assertEqual(reads, ['71', '72', '73']); self.assertEqual(partial['installation_scan']['error'], 'incomplete')
-        self.assertEqual(partial['installation_scan']['observed_at'], NOW + 121)
+        # An incomplete scan is not clean evidence: the last settled runs stand with their time.
+        self.assertEqual(partial['installation_scan']['observed_at'], NOW + 121); self.assertEqual(partial['installation_scan']['runs'], ['5'])
         current[0] += 121; done = p.fetch(30).data['repositories'][0]
-        self.assertEqual(done['installation_runs'], ['7']); self.assertEqual(done['installation_scan'], {'observed_at': current[0], 'error': None})
+        self.assertEqual(done['installation_scan'], {'observed_at': current[0], 'error': None, 'runs': ['7']})
         # A failed read keeps the last runs and their observation time, and names the error.
         state['error'] = 'secondary_limit'; current[0] += 121; failed = p.fetch(30).data['repositories'][0]
-        self.assertEqual(failed['installation_runs'], ['7']); self.assertEqual(failed['installation_scan']['error'], 'secondary_limit')
+        self.assertEqual(failed['installation_scan'], {'observed_at': done['installation_scan']['observed_at'], 'error': 'secondary_limit', 'runs': ['7']})
         # An exhausting repository adds fresh failed runs faster than every job could be read
         # (285 in an hour on nathanpaynedotcom): one proven exhaustion is a complete answer even
         # with unread jobs left, while a clean answer still needs every failed job read.
-        state.update(error=None, runs=[{'id': i, 'run_attempt': 1} for i in (8, 9, 10, 11, 12)])
+        state.update(error=None, runs=[R(i) for i in (8, 9, 10, 11, 12)])
         jobs.update({(i, 1): [{'id': i * 10 + 1, 'conclusion': 'failure'}] for i in (8, 9, 10, 11, 12)})
         logs.update({'81': b'other failure', **{str(i * 10 + 1): b'API rate limit exceeded for installation' for i in (9, 10, 11, 12)}})
         reads.clear(); current[0] += 121; storm = p.fetch(30).data['repositories'][0]
-        self.assertEqual(reads, ['81', '91']); self.assertEqual(storm['installation_runs'], ['9'])
-        self.assertEqual(storm['installation_scan'], {'observed_at': current[0], 'error': None})
+        self.assertEqual(reads, ['81', '91'])
+        self.assertEqual(storm['installation_scan'], {'observed_at': current[0], 'error': None, 'runs': ['9']})
         # The proof settles the scan even when the read cap left earlier jobs unread.
-        state['runs'] = [{'id': 13, 'run_attempt': 1}, {'id': 9, 'run_attempt': 1}]
+        state['runs'] = [R(13), R(9)]
         jobs[(13, 1)] = [{'id': i, 'conclusion': 'failure'} for i in (131, 132, 133, 134)]
         logs.update({str(i): b'x' for i in (131, 132, 133, 134)})
         reads.clear(); current[0] += 121; capped = p.fetch(30).data['repositories'][0]
-        self.assertEqual(reads, ['131', '132', '133']); self.assertEqual(capped['installation_runs'], ['9'])
-        self.assertEqual(capped['installation_scan'], {'observed_at': current[0], 'error': None})
+        self.assertEqual(reads, ['131', '132', '133'])
+        self.assertEqual(capped['installation_scan'], {'observed_at': current[0], 'error': None, 'runs': ['9']})
         # An attempt with more failed jobs than the page bound fails the scan instead of reading as clean.
-        state['runs'] = [{'id': 14, 'run_attempt': 1}]; oversized.add((14, 1)); current[0] += 121
+        state['runs'] = [R(14)]; oversized.add((14, 1)); current[0] += 121
         big = p.fetch(30).data['repositories'][0]
-        self.assertEqual(big['installation_scan'], {'observed_at': capped['installation_scan']['observed_at'], 'error': 'page_limit'})
+        self.assertEqual(big['installation_scan'], {'observed_at': capped['installation_scan']['observed_at'], 'error': 'page_limit', 'runs': ['9']})
+        # A failed run row that cannot be read fails the scan rather than vanishing from it.
+        for bad_jobs in ([{'conclusion': 'failure'}], [{'id': 0, 'conclusion': 'failure'}], ['x'], [{'id': True, 'conclusion': 'failure'}]):
+            jobs[(16, 1)] = bad_jobs; p._scan_jobs.pop((REPO, 16, 1), None)
+            state['runs'] = [R(16)]; current[0] += 121
+            self.assertEqual(p.fetch(30).data['repositories'][0]['installation_scan']['error'], 'invalid_page', bad_jobs)
+        # A listed run needs a zoned creation time.
+        for created in (None, '2026-10-03T00:00:00', 'soon'):
+            state['runs'] = [{'id': 17, 'run_attempt': 1, 'created_at': created}]; current[0] += 121
+            self.assertEqual(p.fetch(30).data['repositories'][0]['installation_scan']['error'], 'invalid_page', created)
+        # The coarse URL cutoff admits up to five extra minutes; evidence is the exact last hour.
+        current[0] += 121; jobs[(18, 1)] = [{'id': 181, 'conclusion': 'failure'}]; logs['181'] = b'API rate limit exceeded for installation'
+        state['runs'] = [R(18, created=current[0] - 3601)]; gets.clear(); reads.clear()
+        old = p.fetch(30).data['repositories'][0]['installation_scan']
+        self.assertEqual(old, {'observed_at': current[0], 'error': None, 'runs': []}); self.assertEqual(reads, []); self.assertEqual(len(gets), 1)
+        state['runs'] = [R(18, created=current[0] + 121 - 3600)]; current[0] += 121
+        self.assertEqual(p.fetch(30).data['repositories'][0]['installation_scan']['runs'], ['18'])
         # Without the launcher flag the provider makes no reads beside the snapshot.
         quiet = ScanFake(); gets.clear()
         ActionsProvider(quiet, [SimpleNamespace(repo=REPO)], clock=lambda: NOW, monotonic=lambda: 0, ci_snapshot=stale).fetch(30)

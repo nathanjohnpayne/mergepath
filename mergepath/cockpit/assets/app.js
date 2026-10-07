@@ -53,6 +53,10 @@
     const observed = C.epoch(live.data.observed_at);
     return observed !== null && renderedAt !== null && renderedAt <= observed + 10 && now > observed + 10;
   }
+  // True once the clock alone has carried a projection across one of its boundaries since the last render.
+  function boundaryCrossed(boundaries, renderedAt, now) {
+    return renderedAt !== null && Array.isArray(boundaries) && boundaries.some(at => typeof at === "number" && renderedAt <= at && at < now);
+  }
   class PanelRegistry {
     constructor() {this.adapters = new Map();}
     register(id, source, project, render = null, options = {}) {
@@ -375,7 +379,8 @@
       onState: value => {const changed = connection.kind !== value.kind; connection = value; render(); if (changed) $("connection-announcement").textContent = $("connection-label").textContent + ". " + $("connection-note").textContent;}});
     const timer = setInterval(() => {
       const now = epochNow();
-      if (snapshot && (liveClockNeedsRender(snapshot, renderedAt, now) || snapshot.sources.fleet?.in_flight === true || [...Object.values(snapshot.api_budget), authorAccount(snapshot).evidence].some(evidence => {
+      if (snapshot && (liveClockNeedsRender(snapshot, renderedAt, now) || snapshot.sources.fleet?.in_flight === true
+        || boundaryCrossed(globalThis.CockpitActions?.tokenBoundaries?.(snapshot.sources.actions?.data) || [], renderedAt, now) || [...Object.values(snapshot.api_budget), authorAccount(snapshot).evidence].some(evidence => {
         const reset = C.epoch(evidence?.reset);
         return reset !== null && renderedAt !== null && reset > renderedAt && reset <= now;
       }) || Object.values(snapshot.sources).some(envelope => {
@@ -394,5 +399,5 @@
   }
   let openSync = () => {};
   let registerPanel = (id, source, project, renderer, options) => registry.register(id, source, project, renderer, options);
-  return {authorAccount, renderAuthorBudget, headerBudget, validSnapshot, liveClockNeedsRender, PanelRegistry, Connection, accountHazards, renderPanelContent, createFleetRefresh, refreshFleet, mount, openSync: repos => openSync(repos), registerPanel: (...args) => registerPanel(...args)};
+  return {authorAccount, renderAuthorBudget, headerBudget, boundaryCrossed, validSnapshot, liveClockNeedsRender, PanelRegistry, Connection, accountHazards, renderPanelContent, createFleetRefresh, refreshFleet, mount, openSync: repos => openSync(repos), registerPanel: (...args) => registerPanel(...args)};
 });

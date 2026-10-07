@@ -82,22 +82,26 @@
       // Repository rows come from the shared CI snapshot, renewed within its observation gap (ci.OBSERVATION_GAP).
       const good = fresh(row, now, CI_OBSERVATION_GAP) && envelope.stale !== true;
       const countsValid = C.count(row.queued) !== null && C.count(row.running) !== null && C.count(row.runs_last_hour) !== null;
-      const hard = Array.isArray(row.installation_runs) && row.installation_runs.length <= 10000
-        && row.installation_runs.every(id => typeof id === "string" && /^[1-9][0-9]{0,15}$/.test(id)) && row.installation_runs.length > 0;
+      const runIds = value => Array.isArray(value) && value.length <= 10000 && value.every(id => typeof id === "string" && /^[1-9][0-9]{0,15}$/.test(id)) ? value : null;
+      // CI-derived runs age with the CI row; scan-proven runs age with their own settled scan.
+      const scan = row.installation_scan, ciRuns = runIds(row.installation_runs) || [], scanRuns = runIds(scan?.runs) || [];
+      const scanned = num(scan?.observed_at) && scan.error === null && runIds(scan.runs) !== null && now >= scan.observed_at && now - scan.observed_at <= SCAN_FRESH;
+      const runs = [...new Set([...ciRuns, ...scanRuns])], hard = runs.length > 0;
+      const hardFresh = (good && ciRuns.length > 0) || (scanned && scanRuns.length > 0);
       const measurement = row.measurement;
       const measured = measurement && num(measurement.requests_per_run) && num(measurement.observed_at)
         && now >= measurement.observed_at && now - measurement.observed_at <= 3600
         && typeof measurement.provenance === "string" && [...measurement.provenance].length <= 240;
       const estimate = countsValid && measured && num(row.estimated_requests) && Math.abs(row.estimated_requests-row.runs_last_hour*measurement.requests_per_run)<.001 ? row.estimated_requests : null;
       let ts = hard ? "boulder" : good && estimate !== null ? stateOf(estimate/1000) : "idle";
-      const scan = row.installation_scan, scanned = num(scan?.observed_at) && scan.error === null && now >= scan.observed_at && now - scan.observed_at <= SCAN_FRESH;
-      const tr = {repo:row.repo, state:ts, exhausted:hard, scanned, runs:hard ? row.installation_runs.slice(0,3) : [], percent:hard ? 100 : estimate === null ? null : Math.min(100,estimate/10),
+      const stale = hard ? !hardFresh : !good;
+      const tr = {repo:row.repo, state:ts, exhausted:hard, stale, scanned, runs:runs.slice(0,3), percent:hard ? 100 : estimate === null ? null : Math.min(100,estimate/10),
         value:hard ? "exhausted" : estimate === null ? "Estimate unavailable" : `est. ${fmt(estimate)}${good ? "" : " · last known"}`,
-        detail: `${countsValid ? fmt(row.runs_last_hour) : "Unknown"} runs in last hour · ${good ? "fresh" : "stale / unavailable"}${hard ? ` · installation limit in run ${row.installation_runs.slice(0,3).join(", ")}; reset unknown` : ""}${measured ? ` · ${measurement.provenance}` : " · measured requests per run unavailable"}`};
+        detail: `${countsValid ? fmt(row.runs_last_hour) : "Unknown"} runs in last hour · ${good ? "fresh" : "stale / unavailable"}${hard ? ` · installation limit in run ${runs.slice(0,3).join(", ")}; reset unknown${hardFresh ? "" : " · last known"}` : ""}${measured ? ` · ${measurement.provenance}` : " · measured requests per run unavailable"}`};
       token.rows.push(tr);
-      if (good && (estimate !== null || hard)) tokenKnown++;
+      if ((good && estimate !== null) || (hard && hardFresh)) tokenKnown++;
       if (!good) anyStale = true;
-      if (["bump","boulder"].includes(ts)) hazard(token,ts,row.repo,hard ? `Observed installation rate-limit failure in run ${row.installation_runs.slice(0,3).join(", ")}; reset unknown.` : `${fmt(estimate)} estimated requests of 1,000 per hour; exhaustion timing unknown.`,hard ? {kind:"now"} : {kind:"unknown"},C.epoch(row.observed_at),!good);
+      if (["bump","boulder"].includes(ts)) hazard(token,ts,row.repo,hard ? `Observed installation rate-limit failure in run ${runs.slice(0,3).join(", ")}; reset unknown.` : `${fmt(estimate)} estimated requests of 1,000 per hour; exhaustion timing unknown.`,hard ? {kind:"now"} : {kind:"unknown"},hard && !(good && ciRuns.length) ? (num(scan?.observed_at) ? scan.observed_at : null) : C.epoch(row.observed_at),stale);
       const jam = row.jammed === true && countsValid && row.queued >= 40 && row.running <= 1
         && num(row.jam_since) && num(row.observed_at) && row.observed_at - row.jam_since > 1800;
       const qs = jam ? "boulder" : countsValid && row.queued >= 10 ? "bump" : good && countsValid ? row.running > 0 ? "running" : "clear" : "idle";
@@ -204,8 +208,9 @@
     const exhausted = rows.filter(row => row.exhausted === true);
     if (exhausted.length) {
       const names = exhausted.map(row => row.repo.split("/")[1]), runs = exhausted.flatMap(row => row.runs || []).slice(0,3);
+      const lastKnown = exhausted.every(row => row.stale === true);
       return {state:"boulder", value:`Exhausted · ${names.join(", ")}`,
-        note:`Installation rate limit in run ${runs.join(", ")} · reset unknown · GITHUB_TOKEN, 1,000 requests per hour per repository`, repos:exhausted.map(row => row.repo)};
+        note:`${lastKnown ? "Last known: installation" : "Installation"} rate limit in run ${runs.join(", ")} · reset unknown · GITHUB_TOKEN, 1,000 requests per hour per repository`, repos:exhausted.map(row => row.repo)};
     }
     const scanned = rows.filter(row => row.scanned === true).length, all = scanned === rows.length;
     const coverage = `${scanned} of ${rows.length} ${rows.length === 1 ? "repository" : "repositories"} scanned`;
@@ -221,6 +226,13 @@
     return {state: all ? "clear" : "idle", value: all ? "No exhaustion seen" : "Not fully observed",
       note:`Failed-job logs of the last hour · ${coverage}`, repos:[]};
   }
+  // Times at which a token row or the header changes on the clock alone: a settled scan leaving
+  // SCAN_FRESH and a CI-derived row leaving the CI observation gap.
+  function tokenBoundaries(data) {
+    const rows = Array.isArray(data?.repositories) ? data.repositories : [];
+    return rows.flatMap(row => [num(row?.installation_scan?.observed_at) ? row.installation_scan.observed_at + SCAN_FRESH : null,
+      C.epoch(row?.observed_at) === null ? null : C.epoch(row.observed_at) + CI_OBSERVATION_GAP]).filter(value => value !== null);
+  }
   function install(app) {app.registerPanel("budget","actions",project,render);}
-  return {project,BudgetView,render,install,tokenSummary};
+  return {project,BudgetView,render,install,tokenSummary,tokenBoundaries};
 });

@@ -2,12 +2,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const {project,BudgetView,render,install,tokenSummary} = require('../mergepath/cockpit/assets/actions.js');
+const {project,BudgetView,render,install,tokenSummary,tokenBoundaries} = require('../mergepath/cockpit/assets/actions.js');
 const C = require('../mergepath/cockpit/assets/components.js');
-const {PanelRegistry,renderPanelContent,headerBudget}=require('../mergepath/cockpit/assets/app.js');
+const {PanelRegistry,renderPanelContent,headerBudget,boundaryCrossed}=require('../mergepath/cockpit/assets/app.js');
 const now=Date.UTC(2026,9,16,12)/1000, repo='owner/mergepath';
 const cycle=()=>({budget:25,cycle_start:Date.UTC(2026,9,1)/1000,cycle_end:Date.UTC(2026,10,1)/1000});
-const row=(overrides={})=>({repo,available:true,stale:false,observed_at:now,installation_scan:{observed_at:now,error:null},queued:0,running:0,runs_last_hour:2,jammed:false,jam_since:null,estimated_requests:null,measurement:null,installation_runs:[],...overrides});
+const row=(overrides={})=>({repo,available:true,stale:false,observed_at:now,installation_scan:{observed_at:now,error:null,runs:[]},queued:0,running:0,runs_last_hour:2,jammed:false,jam_since:null,estimated_requests:null,measurement:null,installation_runs:[],...overrides});
 const data=(overrides={})=>({schema:'actions-budget/v1',billing:{available:false,stale:true,observed_at:null},robot:{available:false,stale:true,observed_at:null},configuration:{budget:null,cycle_start:null,cycle_end:null},repositories:[row()],...overrides});
 const model=(d=data(),stale=false,selected=null,t=now)=>project({data:d,stale,observed_at:now},selected,t);
 const measured=()=>({requests_per_run:400,observed_at:now,provenance:'measured local counter'});
@@ -218,8 +218,8 @@ test('repository rows stay fresh for the CI observation gap, not the old 120 sec
 });
 test('the header needs a fresh complete log scan of every repository before it says no exhaustion',()=>{
  const at=scan=>tokenSummary(model(data({repositories:[row(),row({repo:'owner/fiveacross',installation_scan:scan})]})));
- assert.equal(at({observed_at:now-200,error:null}).value,'No exhaustion seen');
- for(const scan of [{observed_at:now-301,error:null},{observed_at:now,error:'incomplete'},{observed_at:null,error:'secondary_limit'},undefined]) {
+ assert.equal(at({observed_at:now-200,error:null,runs:[]}).value,'No exhaustion seen');
+ for(const scan of [{observed_at:now-200,error:null},{observed_at:now-301,error:null,runs:[]},{observed_at:now,error:'incomplete'},{observed_at:null,error:'secondary_limit'},undefined]) {
   const s=at(scan);assert.equal(s.value,'Not fully observed');assert.match(s.note,/1 of 2 repositories scanned/);
  }
  // Exhaustion is shown even when the CI-derived row is stale.
@@ -229,7 +229,7 @@ test('the header needs a fresh complete log scan of every repository before it s
 
 test('an estimate at the limit stays a warning in the header and does not wait for the log scan',()=>{
  const est=(amount,scan)=>tokenSummary(model(data({repositories:[row({estimated_requests:amount,measurement:{...measured(),requests_per_run:amount/2},installation_scan:scan}),row({repo:'owner/fiveacross'})]})));
- const at=est(1000,{observed_at:now,error:null});
+ const at=est(1000,{observed_at:now,error:null,runs:[]});
  assert.equal(at.state,'boulder');assert.equal(at.value,'At the limit by estimate · mergepath');
  assert.match(at.note,/^Estimated from measured requests per run · exhaustion not observed · 2 of 2 repositories scanned$/);
  const partial=est(800,{observed_at:now,error:'incomplete'});
@@ -249,4 +249,34 @@ test('the header token chip stays fleet-wide while the panels follow the reposit
  assert.equal(header.state,'boulder');assert.equal(header.value,'Exhausted · nathanpaynedotcom');
  const all=registry.project(snapshot,null,now);
  assert.equal(headerBudget(registry,snapshot,null,all,now),all.models.budget);
+});
+
+test('scan-proven runs age with their own settled scan, apart from the CI row',()=>{
+ const at=(scan,t=now)=>model(data({repositories:[row({installation_scan:scan})]}),false,null,t);
+ const fresh=at({observed_at:now,error:null,runs:['9']});
+ assert.equal(fresh.cards[1].rows[0].value,'exhausted');assert.equal(fresh.hazards[0].stale,false);assert.match(fresh.hazards[0].detail,/run 9/);
+ assert.match(tokenSummary(fresh).note,/^Installation rate limit in run 9/);
+ // A later failed scan retains the runs, but they are last known, never fresh.
+ for(const scan of [{observed_at:now,error:'secondary_limit',runs:['9']},{observed_at:now-301,error:null,runs:['9']},{observed_at:now,error:'incomplete',runs:['9']}]) {
+  const m=at(scan);assert.equal(m.state,'boulder');assert.equal(m.hazards[0].stale,true,JSON.stringify(scan));
+  assert.match(m.cards[1].rows[0].detail,/run 9; reset unknown · last known/);
+  const header=tokenSummary(m);assert.equal(header.value,'Exhausted · mergepath');assert.match(header.note,/^Last known: installation rate limit in run 9/);
+ }
+ // A fresh CI-derived run keeps the row fresh whatever the scan says; the runs are combined.
+ const both=model(data({repositories:[row({installation_runs:['4'],installation_scan:{observed_at:now,error:'secondary_limit',runs:['9']}})]}));
+ assert.equal(both.hazards[0].stale,false);assert.deepEqual(both.cards[1].rows[0].runs,['4','9']);
+ // A malformed scan run list is neither evidence nor a settled scan.
+ const bad=at({observed_at:now,error:null,runs:['x']});assert.equal(bad.cards[1].rows[0].exhausted,false);assert.equal(tokenSummary(bad).value,'Not fully observed');
+});
+test('the display clock re-renders when a scan or a CI row ages across its boundary',()=>{
+ const d=data({repositories:[row({observed_at:now-10,installation_scan:{observed_at:now-20,error:null,runs:[]}})]});
+ assert.deepEqual(tokenBoundaries(d),[now-20+300,now-10+270]);
+ assert.deepEqual(tokenBoundaries(undefined),[]);
+ const b=tokenBoundaries(d);
+ assert.equal(boundaryCrossed(b,now,now+259),false);assert.equal(boundaryCrossed(b,now,now+261),true);
+ assert.equal(boundaryCrossed(b,now+261,now+262),false);assert.equal(boundaryCrossed(b,now+279,now+281),true);
+ assert.equal(boundaryCrossed(b,null,now+400),false);
+ // The header flips exactly at the boundary.
+ assert.equal(tokenSummary(model(d,false,null,now+280)).value,'No exhaustion seen');
+ assert.equal(tokenSummary(model(d,false,null,now+281)).value,'Not fully observed');
 });
