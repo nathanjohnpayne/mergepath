@@ -399,8 +399,45 @@ P4B_HB_STAGES='malformed'; p4b_heartbeat_stage posting
 [ "$(jq -r .stage "$P4B_HB_FILE")" = adapter ] && pass 'encoding failure preserves prior complete record and returns zero' || fail 'encoding failure'
 # PID reuse / unknown start evidence: never interpret an unrelated process as
 # the in-flight owner. The actual current process supplies the live control.
-jq --arg ps "$(LC_ALL=C ps -p "$$" -o lstart=)" --argjson pid "$$" '.pid=$pid|.process_started_at=$ps' "$P4B_HB_FILE" > "$WORK/live.json"
+jq --arg ps "$(LC_ALL=C TZ=UTC ps -p "$$" -o lstart=)" --argjson pid "$$" '.pid=$pid|.process_started_at=$ps' "$P4B_HB_FILE" > "$WORK/live.json"
 [ "$(p4b_heartbeat_status "$WORK/live.json")" = running ] && pass 'live process instance matches' || fail 'live process identity'
+# #1830: ps renders lstart in the local zone. A heartbeat written by an
+# orchestrator with a far TZ must still match a reader whose environment is
+# scrubbed of TZ (the Cockpit probe) and a reader in another zone.
+tz_record="$(
+  export P4B_HEARTBEAT_DIR="$WORK/tz" P4B_ACCT_RUN_ID=p4b-fixture-tz
+  TZ=Pacific/Kiritimati p4b_heartbeat_start
+  printf '%s' "$P4B_HB_FILE"
+)"
+tz_scrubbed="$(env -i PATH="$PATH" LC_ALL=C bash -c '. "$1"; p4b_heartbeat_status "$2"' \
+  tz-probe "$ROOT/scripts/phase-4b/heartbeat.sh" "$tz_record")"
+[ "$(jq -r .pid "$tz_record")" = "$$" ] && [ "$tz_scrubbed" = running ] \
+  && pass 'heartbeat written under a non-UTC TZ matches the TZ-scrubbed probe' \
+  || fail "non-UTC writer vs scrubbed probe: $tz_scrubbed"
+[ "$(TZ=Etc/GMT+12 p4b_heartbeat_status "$tz_record")" = running ] \
+  && pass 'heartbeat written under a non-UTC TZ matches a reader in another zone' \
+  || fail 'non-UTC writer vs other-zone reader'
+# #1830: inherited non-boolean DRY_RUN / summary text must neither break JSON
+# publication nor change the published boolean type.
+for bool_case in 'yes:false' '1:false' 'empty:false' 'true:true'; do
+  bool_label=${bool_case%%:*}; bool_want=${bool_case#*:}
+  bool_value=$bool_label; [ "$bool_label" != empty ] || bool_value=''
+  bool_record="$(
+    export P4B_HEARTBEAT_DIR="$WORK/bool-$bool_label" P4B_ACCT_RUN_ID="p4b-fixture-bool-$bool_label"
+    # Read by the sourced heartbeat helper.
+    # shellcheck disable=SC2034
+    DRY_RUN=$bool_value
+    p4b_heartbeat_start
+    # shellcheck disable=SC2034
+    P4B_HB_SUMMARY_EMITTED=$bool_value
+    p4b_heartbeat_stage adapter
+    printf '%s' "$P4B_HB_FILE"
+  )"
+  jq -e --argjson want "$bool_want" '.stage == "adapter" and .dry_run == $want and .summary_emitted == $want' \
+    "$bool_record" >/dev/null 2>&1 \
+    && pass "DRY_RUN/summary text $bool_label publishes boolean $bool_want" \
+    || fail "DRY_RUN/summary text $bool_label boolean normalization"
+done
 jq '.process_started_at="different process start"' "$WORK/live.json" > "$WORK/reused.json"
 [ "$(p4b_heartbeat_status "$WORK/reused.json")" = crashed ] && pass 'reused PID is not the original process instance' || fail 'PID reuse'
 jq '.process_started_at=null' "$WORK/live.json" > "$WORK/unknown.json"

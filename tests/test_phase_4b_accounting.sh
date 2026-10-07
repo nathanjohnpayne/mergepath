@@ -213,9 +213,16 @@ identity_contract() (
 )
 
 if [ "${1:-}" = --identity-only ]; then
-  if [ "${2:-}" = --fixtures ] && [ -n "${3:-}" ]; then
-    case "$3" in /*) IDENTITY_FIXTURE_OUTPUT="$3" ;; *) echo 'fixture output must be an absolute path' >&2; exit 2 ;; esac
-  fi
+  # A second argument must be exactly `--fixtures <absolute path>`; a typo,
+  # missing path or extra argument must not silently skip the bundle export.
+  case "$#:${2:-}" in
+    1:) ;;
+    3:--fixtures)
+      case "$3" in /*) IDENTITY_FIXTURE_OUTPUT="$3" ;; *) echo 'fixture output must be an absolute path' >&2; exit 2 ;; esac ;;
+    *)
+      echo 'usage: tests/test_phase_4b_accounting.sh [--identity-only [--fixtures <absolute-json-path>]]' >&2
+      exit 2 ;;
+  esac
   identity_contract
   exit "$?"
 fi
@@ -2965,6 +2972,42 @@ else fail "reported-cost e2e (rc=$rc, rec=$REC_M)"; fi
 
 echo
 identity_contract && pass 'optional identity/history contract suite' || fail 'optional identity/history contract suite'
+
+# #1830: --identity-only accepts nothing after it, or exactly
+# `--fixtures <absolute path>`. Malformed forms exit 2 before any work instead
+# of exiting 0 without the bundle the caller asked for.
+SELF="$ROOT/tests/test_phase_4b_accounting.sh"
+ARGS_BUNDLE="$WORK/identity-args/bundle.json"
+mkdir -p "$WORK/identity-args"
+for bad_form in 'fixtures-without-path' 'fixture-typo' 'extra-after-path' 'extra-without-fixtures' 'relative-path'; do
+  rm -f "$ARGS_BUNDLE"
+  case "$bad_form" in
+    fixtures-without-path) set -- --identity-only --fixtures ;;
+    fixture-typo) set -- --identity-only --fixture "$ARGS_BUNDLE" ;;
+    extra-after-path) set -- --identity-only --fixtures "$ARGS_BUNDLE" extra ;;
+    extra-without-fixtures) set -- --identity-only extra ;;
+    relative-path) set -- --identity-only --fixtures relative/bundle.json ;;
+  esac
+  rc=0
+  bash "$SELF" "$@" > "$WORK/identity-args/out" 2> "$WORK/identity-args/err" || rc=$?
+  if [ "$rc" = 2 ] && [ ! -e "$ARGS_BUNDLE" ] && [ ! -s "$WORK/identity-args/out" ] \
+     && grep -Eq 'usage: |absolute path' "$WORK/identity-args/err"; then
+    pass "--identity-only $bad_form exits 2 with a usage message and no bundle"
+  else
+    fail "--identity-only $bad_form (rc=$rc, bundle=$([ -e "$ARGS_BUNDLE" ] && echo written || echo absent))"
+  fi
+done
+set --
+rm -f "$ARGS_BUNDLE"
+rc=0
+bash "$SELF" --identity-only --fixtures "$ARGS_BUNDLE" > "$WORK/identity-args/out" 2> "$WORK/identity-args/err" || rc=$?
+if [ "$rc" = 0 ] && jq -e '.schema == "p4b-history-fixtures/v1"' "$ARGS_BUNDLE" >/dev/null 2>&1; then
+  pass '--identity-only --fixtures <absolute path> writes the bundle'
+else fail "--identity-only --fixtures valid form (rc=$rc)"; fi
+rc=0
+bash "$SELF" --identity-only > "$WORK/identity-args/out" 2> "$WORK/identity-args/err" || rc=$?
+[ "$rc" = 0 ] && grep -q '^Identity contract: ' "$WORK/identity-args/out" \
+  && pass '--identity-only alone runs the identity contract' || fail "--identity-only alone (rc=$rc)"
 
 echo "Summary: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]

@@ -6,10 +6,12 @@
 p4b_heartbeat_write() {
   (
     [ -n "${P4B_HB_FILE:-}" ] || exit 0
-    local tmp review_posted=false
+    local tmp review_posted=false dry_run=false summary_emitted=false
     # Early refusals can precede the orchestrator's initialization. Inherited
-    # text must neither break JSON publication nor change this boolean's type.
+    # text must neither break JSON publication nor change a boolean's type.
     [ "${REVIEW_POSTED:-}" != true ] || review_posted=true
+    [ "${DRY_RUN:-}" != true ] || dry_run=true
+    [ "${P4B_HB_SUMMARY_EMITTED:-}" != true ] || summary_emitted=true
     tmp="$(mktemp "${P4B_HB_DIR}/.heartbeat.XXXXXX")" || exit 0
     # Build from this process's memory, never from a previous on-disk record.
     # A broken/partial old observation cannot shape the next stage or verdict.
@@ -21,13 +23,13 @@ p4b_heartbeat_write() {
       --arg checkout "$P4B_HB_CHECKOUT" --arg started "$P4B_HB_STARTED_EPOCH" \
       --arg started_at "$P4B_HB_STARTED_AT" --arg stage "$P4B_HB_STAGE" \
       --arg stage_at "$P4B_HB_STAGE_AT" --arg stage_epoch "$P4B_HB_STAGE_EPOCH" \
-      --argjson stages "$P4B_HB_STAGES" --argjson dry_run "${DRY_RUN:-false}" \
+      --argjson stages "$P4B_HB_STAGES" --argjson dry_run "$dry_run" \
       --arg timeout "${ADAPTER_TIMEOUT:-}" \
       --arg adapter_started "${P4B_ACCT_LOOP_STARTED_EPOCH:-}" \
       --arg elapsed "${P4B_ACCT_LOOP_ELAPSED_SECONDS:-}" \
       --arg adapter_rc "${ADAPTER_RC:-}" --arg exit_code "${P4B_HB_EXIT_CODE:-}" \
       --arg adapter_verdict "${VERDICT:-}" \
-      --argjson summary_emitted "${P4B_HB_SUMMARY_EMITTED:-false}" \
+      --argjson summary_emitted "$summary_emitted" \
       --arg verdict "${VERDICT:-}" --arg token_count "${TOKEN_COUNT:-}" \
       --arg findings_count "${FINDINGS_COUNT:-}" \
       --argjson review_posted "$review_posted" \
@@ -76,7 +78,9 @@ p4b_heartbeat_status() {
   command -v ps >/dev/null 2>&1 || { printf 'unknown\n'; return 0; }
   expected="$(jq -er '.process_started_at | select(type == "string" and length > 0)' "$record" 2>/dev/null)" \
     || { printf 'unknown\n'; return 0; }
-  observed="$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null)" || rc=$?
+  # lstart is rendered in the caller's local zone. Writer and reader pin UTC so
+  # a TZ set (or scrubbed) on either side cannot turn a live run into a crash.
+  observed="$(LC_ALL=C TZ=UTC ps -p "$pid" -o lstart= 2>/dev/null)" || rc=$?
   if [ "$rc" = 1 ] && [ -z "$observed" ]; then
     printf 'crashed\n'
   elif [ "$rc" != 0 ] || [ -z "$observed" ] || [ -z "$expected" ]; then
@@ -135,7 +139,8 @@ p4b_heartbeat_start() {
   P4B_HB_CHECKOUT="$(pwd -P 2>/dev/null || true)"
   P4B_HB_STARTED_EPOCH="$(date +%s 2>/dev/null || true)"
   P4B_HB_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
-  P4B_HB_PROCESS_STARTED_AT="$(LC_ALL=C ps -p "$$" -o lstart= 2>/dev/null || true)"
+  # Same pinned locale and zone as the p4b_heartbeat_status reader.
+  P4B_HB_PROCESS_STARTED_AT="$(LC_ALL=C TZ=UTC ps -p "$$" -o lstart= 2>/dev/null || true)"
   P4B_HB_STAGES='[]'; P4B_HB_STAGE=""; P4B_HB_SUMMARY_EMITTED=false
   P4B_HB_EXIT_CODE=""
   # All local telemetry operations run guarded; no failed mkdir/JSON/mv/ps

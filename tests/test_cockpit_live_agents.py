@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 import sys
 import tempfile
@@ -286,6 +287,28 @@ class CanonicalTests(unittest.TestCase):
                 with patch.object(L.os, "defpath", str(path) + ":" + os.defpath):
                     self.assertEqual(probe(record(), time.monotonic() + 2), expected)
             self.assertEqual(probe(record(process_started_at=None), time.monotonic() + 2), "unknown")
+
+    def test_real_helper_and_ps_match_a_heartbeat_written_under_a_non_utc_zone(self):
+        # #1830: lstart follows the caller zone. The orchestrator may run with
+        # TZ set while the probe scrubs its environment; both must agree.
+        with tempfile.TemporaryDirectory() as directory:
+            run_id = "p4b-" + "b" * 32
+            writer = subprocess.Popen(
+                ["bash", "-c", 'source "$1"; p4b_heartbeat_start; printf "ready\\n"; exec sleep 30',
+                 "tz-writer", str(ROOT / "scripts/phase-4b/heartbeat.sh")],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                env={"PATH": os.environ.get("PATH", os.defpath), "LC_ALL": "C", "TZ": "Pacific/Kiritimati",
+                     "P4B_HEARTBEAT_DIR": directory, "P4B_ACCT_RUN_ID": run_id})
+            try:
+                self.assertEqual(writer.stdout.readline(), b"ready\n")
+                written = json.loads((Path(directory) / (run_id + ".json")).read_text(encoding="utf-8"))
+                self.assertEqual(written["pid"], writer.pid)
+                self.assertTrue(written["process_started_at"])
+                self.assertEqual(L.CanonicalStatus(ROOT)(written, time.monotonic() + 2), "running")
+            finally:
+                writer.kill()
+                writer.wait()
+                writer.stdout.close()
 
     def test_probe_timeout_and_output_bound_fail_unknown(self):
         with tempfile.TemporaryDirectory() as directory:
