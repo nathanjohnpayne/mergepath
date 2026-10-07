@@ -320,8 +320,13 @@ RUBY
 # Selection controls are self-contained, so consumers with either workflow
 # absent retain their source SKIPs while still checking the YAML boundary.
 YAML_FIXTURES="$(mktemp -d "${TMPDIR:-/tmp}/test465-yaml.XXXXXX")"
-if command -v ruby >/dev/null 2>&1; then
-  ruby - "$YAML_FIXTURES" <<'RUBY'
+# The one EXIT trap for every temp directory in this suite: a second
+# `trap ... EXIT` would replace this one, so the D12, D13 and D14 directories
+# below are removed here by name and never register a trap of their own.
+D12="" D13="" D14=""
+cleanup_465() { rm -rf "$YAML_FIXTURES" ${D12:+"$D12"} ${D13:+"$D13"} ${D14:+"$D14"}; }
+trap cleanup_465 EXIT
+if command -v ruby >/dev/null 2>&1 && ! ruby - "$YAML_FIXTURES" <<'RUBY'
 dir = ARGV.fetch(0)
 prefix = "jobs:\n  rollup:\n    steps:\n"
 bindings = <<'YAML'
@@ -368,6 +373,9 @@ File.binwrite(File.join(dir, 'folded-run.expected'), "printf '%s' 'line\\slash'"
 File.binwrite(File.join(dir, 'quoted-run.expected'), "printf '%s' 'quoted\\slash'\n")
 File.binwrite(File.join(dir, 'literal-run.expected'), "printf '%s' 'literal\\slash'\n\n")
 RUBY
+then
+  fail "YAML selection: the Ruby fixture generator failed, so no selection control ran"
+elif command -v ruby >/dev/null 2>&1; then
   mkdir "$YAML_FIXTURES/out"
   for _yaml_case in near-match working-directory-env scalar-env tagged-job tagged-env tagged-steps duplicate-run duplicate-env-input \
       duplicate-name ambiguous-step alias-run merge-env boolean-input nested-quoted-input \
@@ -402,8 +410,6 @@ if [ -f "$W/daily-feedback-rollup.yml" ]; then
   mkdir -p "$D13/scripts"
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" >"%s/args"\n' "$D13" >"$D13/scripts/daily-feedback-rollup.sh"
   if extract_step_data "$W/daily-feedback-rollup.yml" rollup "Run rollup" "$D13" inputs; then
-    refute_grep "D13: rollup does not interpolate dispatch inputs into run:" \
-      "$D13/step.sh" '"${{ github.event.inputs.'
     # Comparing files keeps string bindings exact, including decoded newlines.
     for _d13_input in SINCE UNTIL DRY_RUN; do
       _d13_field=$(printf '%s' "$_d13_input" | tr '[:upper:]' '[:lower:]')

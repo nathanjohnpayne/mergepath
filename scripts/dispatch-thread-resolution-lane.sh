@@ -36,7 +36,7 @@
 # Exit codes:
 #   0  the lane run completed successfully (or, with --no-wait, was found)
 #   1  bad invocation
-#   4  the dispatch was refused
+#   4  the dispatch was not sent, or gh reported it failed
 #   6  no run carrying this dispatch's nonce appeared within the bound
 #   8  the lane run finished unsuccessfully (its log says why)
 #   9  the lane run did not complete within --watch-timeout
@@ -111,14 +111,16 @@ dispatch_rc=0
   -f "event_type=$EVENT_TYPE" -F "client_payload[pr]=$PR" -f "client_payload[nonce]=$NONCE" >/dev/null || dispatch_rc=$?
 # The wrapper's token exits (scripts/gh-as-author.sh: 3 lookup failed, 2
 # verification failed, 70 trace marker) mean nothing was sent. Any other
-# nonzero, 1 included, is what gh itself returned for the request, which is
-# GitHub refusing the dispatch.
+# nonzero, 1 included, is what gh itself returned for the request. That
+# covers more than GitHub refusing the dispatch: a network error or an HTTP
+# 401 also exits 1, so the message points at the error gh printed above and
+# names the token permission only as the likely cause of a 403 or 404.
 case "$dispatch_rc" in
   0) ;;
   3) die 4 "no author token was found, so nothing was dispatched to $REPO; provision the author PAT (docs/agents/cloud-environments.md, Credentials)" ;;
   2) die 4 "the author token did not verify as a user-held credential for the author, so nothing was dispatched to $REPO" ;;
   70) die 4 "the author wrapper refused before dispatching to $REPO (exit 70; its message is above)" ;;
-  *) die 4 "the repository_dispatch to $REPO was refused; the author PAT needs Contents: write (fine-grained) or repo (classic)" ;;
+  *) die 4 "the repository_dispatch to $REPO failed (gh exit $dispatch_rc; gh printed the reason above). If that reason is HTTP 403 or 404, the likely cause is an author PAT without Contents: write (fine-grained) or repo (classic)" ;;
 esac
 echo "dispatch-thread-resolution-lane: dispatched $EVENT_TYPE for $REPO#$PR (nonce $NONCE)" >&2
 

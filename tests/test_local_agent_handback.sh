@@ -356,7 +356,10 @@ case "$1 $2" in
     elif [ -n "${D_RUN_HANGS:-}" ]; then printf '{"status":"queued","conclusion":null}'
     else printf '{"status":"completed","conclusion":"success"}'; fi | jq -r "$jq_expr"; exit 0 ;;
   "api -X")
-    [ -n "${D_DISPATCH_FAIL:-}" ] && exit 1
+    if [ -n "${D_DISPATCH_FAIL:-}" ]; then
+      [ -z "${D_DISPATCH_ERR:-}" ] || echo "$D_DISPATCH_ERR" >&2
+      exit 1
+    fi
     for a in "$@"; do case "$a" in client_payload\[nonce\]=*) echo "${a#*=}" >"$D_NONCE" ;; esac; done
     exit 0 ;;
   "api repos/o/r/actions/workflows/thread-resolution-lane.yml/runs?event=repository_dispatch&per_page=100")
@@ -418,8 +421,9 @@ else
 fi
 
 # Nothing sent is not GitHub refusing: a missing author token is named as
-# such (and, in a cloud session, with the variable to set), and only a refusal
-# from gh itself keeps the permission hint.
+# such (and, in a cloud session, with the variable to set), and only a failure
+# from gh itself carries the permission hint, as the likely cause of a 403 or
+# 404 and never as the diagnosis.
 set +e
 drun OP_PREFLIGHT_AUTHOR_PAT= CLAUDE_CODE_REMOTE=true -- >/dev/null 2>"$DFIX/err"; r_notoken=$?
 set -e
@@ -431,12 +435,26 @@ else
   fail "dispatch no token: rc=$r_notoken err=$(cat "$DFIX/err")"
 fi
 set +e
-drun D_DISPATCH_FAIL=1 -- >/dev/null 2>"$DFIX/err"; r_refused=$?
+drun D_DISPATCH_FAIL=1 D_DISPATCH_ERR="gh: Resource not accessible by personal access token (HTTP 403)" -- >/dev/null 2>"$DFIX/err"; r_refused=$?
 set -e
-if [ "$r_refused" -eq 4 ] && grep -q "was refused; the author PAT needs Contents: write" "$DFIX/err"; then
-  pass "dispatch: GitHub refusing the dispatch keeps the permission hint"
+if [ "$r_refused" -eq 4 ] && grep -q "(HTTP 403)" "$DFIX/err" \
+   && grep -q "If that reason is HTTP 403 or 404, the likely cause is an author PAT without Contents: write" "$DFIX/err"; then
+  pass "dispatch: a gh failure shows gh's own error and names the permission as the likely cause of a 403 or 404"
 else
   fail "dispatch refused message: rc=$r_refused err=$(cat "$DFIX/err")"
+fi
+# A network error (or a 401) also exits 1 from gh: the message must not
+# claim GitHub refused the dispatch or that the PAT lacks a permission.
+set +e
+drun D_DISPATCH_FAIL=1 D_DISPATCH_ERR="error connecting to api.github.com" -- >/dev/null 2>"$DFIX/err"; r_net=$?
+set -e
+if [ "$r_net" -eq 4 ] && grep -q "error connecting to api.github.com" "$DFIX/err" \
+   && grep -q "the repository_dispatch to o/r failed (gh exit 1; gh printed the reason above)" "$DFIX/err" \
+   && grep -q "If that reason is HTTP 403 or 404, the likely cause is" "$DFIX/err" \
+   && ! grep -q "was refused" "$DFIX/err" && ! grep -q "PAT needs Contents: write" "$DFIX/err"; then
+  pass "dispatch: a network failure keeps exit 4 with a neutral message pointing at gh's error, not a permission diagnosis"
+else
+  fail "dispatch network failure message: rc=$r_net err=$(cat "$DFIX/err")"
 fi
 
 echo

@@ -271,6 +271,22 @@ r_rc=$(route_run "$ROUTE_TWO" FAIL --repo owner/name --list)
   && ok "--list via route: unreadable review comments fail closed (exit 2)" \
   || bad "--list via route, comments unreadable: rc=$r_rc output: $(cat "$STUB_DIR/route.out")"
 
+# A wrong empty thread route must not be confirmed by a comments read that
+# is not a list of comment arrays: an empty successful response, or a page
+# that is not an array.
+for _bad_comments in EMPTY '{}' '[] {}' '[{"id":11,"in_reply_to_id":null}] "x"'; do
+  [ "$_bad_comments" = EMPTY ] && _bad_comments=""
+  r_rc=$(route_run '[]' "$_bad_comments" --repo owner/name --list)
+  [ "$r_rc" = "2" ] && grep -q "could not be read over REST" "$STUB_DIR/route.out" \
+    && ! grep -q "No unresolved threads" "$STUB_DIR/route.out" \
+    && ok "--list via route: an empty route with comments '${_bad_comments}' fails closed (exit 2)" \
+    || bad "--list via route, empty route and comments '${_bad_comments}': rc=$r_rc output: $(cat "$STUB_DIR/route.out")"
+done
+r_rc=$(route_run '[]' '[]' --repo owner/name --list)
+[ "$r_rc" = "0" ] && grep -q "No unresolved threads on PR #999" "$STUB_DIR/route.out" \
+  && ok "--list via route: an empty route agreeing with an empty comment array still exits 0" \
+  || bad "--list via route, no threads at all: rc=$r_rc output: $(cat "$STUB_DIR/route.out")"
+
 r_rc=$(route_run "$ROUTE_TWO" "$COMMENTS_TWO" --repo owner/name --auto-resolve-bots)
 [ "$r_rc" = "6" ] && ! grep -q "ccr/review_threads" "$STUB_DIR/route.calls" \
   && ok "a resolve mode at the ceiling still exits 6 and never uses the proxy route" \
