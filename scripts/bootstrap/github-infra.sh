@@ -16,8 +16,9 @@
 #      bootstrap::run_author_git.
 #   2. Seed the 21 canonical labels (needs-external-review,
 #      needs-human-review, policy-violation, human-hold,
-#      human-action, decision-needed, agent-action, phase-0..4,
-#      size:S/M/L, priority:critical/high/normal/low).
+#      needs-local-agent, human-action, decision-needed, agent-action,
+#      phase-0..4, size:S/M/L, priority:critical/high/normal/low,
+#      status:blocked).
 #      Eliminates the first-PR "label not found" friction.
 #   3. Invite reviewer-identity collaborators (claude / cursor /
 #      codex per BOOTSTRAP_INPUT_REVIEWERS). Each invite is async;
