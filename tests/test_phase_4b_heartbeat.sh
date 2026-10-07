@@ -399,9 +399,89 @@ P4B_HB_STAGES='malformed'; p4b_heartbeat_stage posting
 [ "$(jq -r .stage "$P4B_HB_FILE")" = adapter ] && pass 'encoding failure preserves prior complete record and returns zero' || fail 'encoding failure'
 # PID reuse / unknown start evidence: never interpret an unrelated process as
 # the in-flight owner. The actual current process supplies the live control.
-jq --arg ps "$(LC_ALL=C ps -p "$$" -o lstart=)" --argjson pid "$$" '.pid=$pid|.process_started_at=$ps' "$P4B_HB_FILE" > "$WORK/live.json"
+jq --arg ps "$(LC_ALL=C TZ=UTC ps -p "$$" -o lstart=)" --argjson pid "$$" '.pid=$pid|.process_started_at=$ps' "$P4B_HB_FILE" > "$WORK/live.json"
 [ "$(p4b_heartbeat_status "$WORK/live.json")" = running ] && pass 'live process instance matches' || fail 'live process identity'
-jq '.process_started_at="different process start"' "$WORK/live.json" > "$WORK/reused.json"
+# #1830: ps renders lstart in the local zone. A heartbeat written by an
+# orchestrator with a far TZ must still match a reader whose environment is
+# scrubbed of TZ (the Cockpit probe) and a reader in another zone.
+tz_record="$(
+  export P4B_HEARTBEAT_DIR="$WORK/tz" P4B_ACCT_RUN_ID=p4b-fixture-tz
+  TZ=Pacific/Kiritimati p4b_heartbeat_start
+  printf '%s' "$P4B_HB_FILE"
+)"
+tz_scrubbed="$(env -i PATH="$PATH" LC_ALL=C bash -c '. "$1"; p4b_heartbeat_status "$2"' \
+  tz-probe "$ROOT/scripts/phase-4b/heartbeat.sh" "$tz_record")"
+[ "$(jq -r .pid "$tz_record")" = "$$" ] && [ "$tz_scrubbed" = running ] \
+  && pass 'heartbeat written under a non-UTC TZ matches the TZ-scrubbed probe' \
+  || fail "non-UTC writer vs scrubbed probe: $tz_scrubbed"
+[ "$(TZ=Etc/GMT+12 p4b_heartbeat_status "$tz_record")" = running ] \
+  && pass 'heartbeat written under a non-UTC TZ matches a reader in another zone' \
+  || fail 'non-UTC writer vs other-zone reader'
+# #1837 review: a v1 record written before the UTC pin holds the local
+# rendering. The reader still recognises that live run (here from a
+# TZ-scrubbed reader, like the Cockpit probe), and a different start time
+# under either rendering is still a crash.
+legacy_local="$(env -i PATH="$PATH" LC_ALL=C ps -p "$$" -o lstart=)"
+jq --arg ps "$legacy_local" --argjson pid "$$" '.pid=$pid|.process_started_at=$ps' "$P4B_HB_FILE" > "$WORK/legacy.json"
+legacy_status="$(env -i PATH="$PATH" LC_ALL=C bash -c '. "$1"; p4b_heartbeat_status "$2"' \
+  legacy-probe "$ROOT/scripts/phase-4b/heartbeat.sh" "$WORK/legacy.json")"
+[ "$legacy_status" = running ] && pass 'pre-UTC v1 record in local time still matches its live process' \
+  || fail "pre-UTC local record: $legacy_status"
+jq --argjson pid "$$" '.pid=$pid|.process_started_at="Thu Jan  1 00:00:00 1970"' "$P4B_HB_FILE" > "$WORK/stale.json"
+[ "$(p4b_heartbeat_status "$WORK/stale.json")" = crashed ] && pass 'a start time matching neither rendering is still a crash' \
+  || fail 'mismatched start time not reported crashed'
+# #1837 review: a pre-UTC record written under an explicit TZ that is neither
+# UTC nor the reader's zone still matches by whole zone offset (Kiritimati is
+# +14 h, St John's a half-hour zone); seconds that differ are still a crash, an
+# unparseable value is unknown.
+for legacy_zone in Pacific/Kiritimati America/St_Johns; do
+  jq --arg ps "$(LC_ALL=C TZ="$legacy_zone" ps -p "$$" -o lstart=)" --argjson pid "$$" '.pid=$pid|.process_started_at=$ps' "$P4B_HB_FILE" > "$WORK/zone.json"
+  zone_status="$(env -i PATH="$PATH" LC_ALL=C bash -c '. "$1"; p4b_heartbeat_status "$2"' zone-probe "$ROOT/scripts/phase-4b/heartbeat.sh" "$WORK/zone.json")"
+  [ "$zone_status" = running ] && pass "pre-UTC record written under TZ=$legacy_zone matches through the scrubbed probe" \
+    || fail "pre-UTC $legacy_zone record: $zone_status"
+done
+shifted="$(jq -nr --arg ps "$(LC_ALL=C TZ=UTC ps -p "$$" -o lstart=)" '$ps | gsub("^\\s+|\\s+$"; "") | gsub("\\s+"; " ") | strptime("%a %b %d %H:%M:%S %Y") | mktime + 3607 | strftime("%a %b %d %H:%M:%S %Y")')"
+jq --arg ps "$shifted" --argjson pid "$$" '.pid=$pid|.process_started_at=$ps' "$P4B_HB_FILE" > "$WORK/shifted.json"
+[ "$(p4b_heartbeat_status "$WORK/shifted.json")" = crashed ] && pass 'a legacy start time off by more than a zone offset is a crash' \
+  || fail 'shifted legacy start time not reported crashed'
+jq --argjson pid "$$" '.pid=$pid|.process_started_at="not a start time"' "$P4B_HB_FILE" > "$WORK/garbled.json"
+[ "$(p4b_heartbeat_status "$WORK/garbled.json")" = unknown ] && pass 'an unparseable legacy start time is unknown, not a crash' \
+  || fail 'unparseable legacy start time'
+# #1837 review: a reused PID belongs to a process that started after the record
+# was written, so even a start time that differs by an exact zone offset is a
+# crash when the live process is newer than the record.
+aligned="$(jq -nr --arg ps "$(LC_ALL=C TZ=UTC ps -p "$$" -o lstart=)" '$ps | gsub("^\\s+|\\s+$"; "") | gsub("\\s+"; " ") | strptime("%a %b %d %H:%M:%S %Y") | mktime + 900 | strftime("%a %b %d %H:%M:%S %Y")')"
+jq --arg ps "$aligned" --argjson pid "$$" '.pid=$pid|.process_started_at=$ps|.started_at_epoch=1' "$P4B_HB_FILE" > "$WORK/aligned-reuse.json"
+[ "$(p4b_heartbeat_status "$WORK/aligned-reuse.json")" = crashed ] && pass 'a reused PID is a crash even when its start differs by a whole zone offset' \
+  || fail 'aligned PID reuse not reported crashed'
+jq --argjson pid "$$" '.pid=$pid|del(.started_at_epoch)' "$WORK/zone.json" > "$WORK/no-start.json"
+[ "$(p4b_heartbeat_status "$WORK/no-start.json")" = unknown ] && pass 'without the record start time a zone-shifted match stays unknown' \
+  || fail 'zone-shifted match without started_at_epoch'
+[ "$(jq -r .process_started_at "$tz_record")" = "$(LC_ALL=C TZ=Pacific/Kiritimati ps -p "$$" -o lstart=)" ] \
+  && pass 'the writer keeps the v1 rendering in its own zone, so older readers still parse it' \
+  || fail 'writer changed the v1 start-time rendering'
+# #1830: inherited non-boolean DRY_RUN / summary text must neither break JSON
+# publication nor change the published boolean type.
+for bool_case in 'yes:false' '1:false' 'empty:false' 'true:true'; do
+  bool_label=${bool_case%%:*}; bool_want=${bool_case#*:}
+  bool_value=$bool_label; [ "$bool_label" != empty ] || bool_value=''
+  bool_record="$(
+    export P4B_HEARTBEAT_DIR="$WORK/bool-$bool_label" P4B_ACCT_RUN_ID="p4b-fixture-bool-$bool_label"
+    # Read by the sourced heartbeat helper.
+    # shellcheck disable=SC2034
+    DRY_RUN=$bool_value
+    p4b_heartbeat_start
+    # shellcheck disable=SC2034
+    P4B_HB_SUMMARY_EMITTED=$bool_value
+    p4b_heartbeat_stage adapter
+    printf '%s' "$P4B_HB_FILE"
+  )"
+  jq -e --argjson want "$bool_want" '.stage == "adapter" and .dry_run == $want and .summary_emitted == $want' \
+    "$bool_record" >/dev/null 2>&1 \
+    && pass "DRY_RUN/summary text $bool_label publishes boolean $bool_want" \
+    || fail "DRY_RUN/summary text $bool_label boolean normalization"
+done
+jq '.started_at_epoch=1' "$WORK/live.json" > "$WORK/reused.json"
 [ "$(p4b_heartbeat_status "$WORK/reused.json")" = crashed ] && pass 'reused PID is not the original process instance' || fail 'PID reuse'
 jq '.process_started_at=null' "$WORK/live.json" > "$WORK/unknown.json"
 [ "$(p4b_heartbeat_status "$WORK/unknown.json")" = unknown ] && pass 'missing process identity remains unknown' || fail 'unknown identity'

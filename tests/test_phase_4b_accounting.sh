@@ -23,6 +23,23 @@ ACCT_SCHEMA="$ROOT/scripts/phase-4b/accounting.schema.json"
 VERDICT_SCHEMA="$ROOT/scripts/phase-4b/verdict.schema.json"
 PRICES="$ROOT/scripts/phase-4b/prices.json"
 
+# The command line is validated before any dependency or fixture check, so a
+# malformed --identity-only form exits 2 even where jq is missing, instead of
+# reaching a successful skip (#1837 review). A second argument must be exactly
+# `--fixtures <absolute path>`; a typo, missing path or extra argument must
+# not silently skip the bundle export.
+IDENTITY_ONLY=0
+if [ "${1:-}" = --identity-only ]; then
+  IDENTITY_ONLY=1
+  case "$#:${2:-}" in
+    1:) ;;
+    3:--fixtures)
+      case "$3" in /*) IDENTITY_FIXTURE_OUTPUT="$3" ;; *) echo 'fixture output must be an absolute path' >&2; exit 2 ;; esac ;;
+    *)
+      echo 'usage: tests/test_phase_4b_accounting.sh [--identity-only [--fixtures <absolute-json-path>]]' >&2
+      exit 2 ;;
+  esac
+fi
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not available" >&2; exit 0; }
 for f in "$ACCT" "$LIB" "$ORCH" "$AD_CLAUDE" "$ACCT_SCHEMA" "$VERDICT_SCHEMA" "$PRICES"; do
   [ -e "$f" ] || { echo "missing required path: $f" >&2; exit 1; }
@@ -212,10 +229,7 @@ identity_contract() (
   [ "$FAIL" = 0 ]
 )
 
-if [ "${1:-}" = --identity-only ]; then
-  if [ "${2:-}" = --fixtures ] && [ -n "${3:-}" ]; then
-    case "$3" in /*) IDENTITY_FIXTURE_OUTPUT="$3" ;; *) echo 'fixture output must be an absolute path' >&2; exit 2 ;; esac
-  fi
+if [ "$IDENTITY_ONLY" = 1 ]; then
   identity_contract
   exit "$?"
 fi
@@ -2965,6 +2979,51 @@ else fail "reported-cost e2e (rc=$rc, rec=$REC_M)"; fi
 
 echo
 identity_contract && pass 'optional identity/history contract suite' || fail 'optional identity/history contract suite'
+
+# #1830: --identity-only accepts nothing after it, or exactly
+# `--fixtures <absolute path>`. Malformed forms exit 2 before any work instead
+# of exiting 0 without the bundle the caller asked for.
+SELF="$ROOT/tests/test_phase_4b_accounting.sh"
+ARGS_BUNDLE="$WORK/identity-args/bundle.json"
+mkdir -p "$WORK/identity-args"
+for bad_form in 'fixtures-without-path' 'fixture-typo' 'extra-after-path' 'extra-without-fixtures' 'relative-path'; do
+  rm -f "$ARGS_BUNDLE"
+  case "$bad_form" in
+    fixtures-without-path) set -- --identity-only --fixtures ;;
+    fixture-typo) set -- --identity-only --fixture "$ARGS_BUNDLE" ;;
+    extra-after-path) set -- --identity-only --fixtures "$ARGS_BUNDLE" extra ;;
+    extra-without-fixtures) set -- --identity-only extra ;;
+    relative-path) set -- --identity-only --fixtures relative/bundle.json ;;
+  esac
+  rc=0
+  bash "$SELF" "$@" > "$WORK/identity-args/out" 2> "$WORK/identity-args/err" || rc=$?
+  if [ "$rc" = 2 ] && [ ! -e "$ARGS_BUNDLE" ] && [ ! -s "$WORK/identity-args/out" ] \
+     && grep -Eq 'usage: |absolute path' "$WORK/identity-args/err"; then
+    pass "--identity-only $bad_form exits 2 with a usage message and no bundle"
+  else
+    fail "--identity-only $bad_form (rc=$rc, bundle=$([ -e "$ARGS_BUNDLE" ] && echo written || echo absent))"
+  fi
+done
+# The same malformed form exits 2 where jq is missing, before the dependency skip.
+NOJQ="$WORK/identity-args/nojq-bin"
+mkdir -p "$NOJQ"
+ln -sf "$(command -v dirname)" "$NOJQ/dirname"
+rc=0
+env PATH="$NOJQ" /bin/bash "$SELF" --identity-only --fixtures > "$WORK/identity-args/out" 2> "$WORK/identity-args/err" || rc=$?
+[ "$rc" = 2 ] && grep -q 'usage: ' "$WORK/identity-args/err" && ! grep -q 'SKIP: jq' "$WORK/identity-args/err" \
+  && pass '--identity-only --fixtures without a path exits 2 even where jq is missing' \
+  || fail "malformed form without jq (rc=$rc, err=$(cat "$WORK/identity-args/err"))"
+set --
+rm -f "$ARGS_BUNDLE"
+rc=0
+bash "$SELF" --identity-only --fixtures "$ARGS_BUNDLE" > "$WORK/identity-args/out" 2> "$WORK/identity-args/err" || rc=$?
+if [ "$rc" = 0 ] && jq -e '.schema == "p4b-history-fixtures/v1"' "$ARGS_BUNDLE" >/dev/null 2>&1; then
+  pass '--identity-only --fixtures <absolute path> writes the bundle'
+else fail "--identity-only --fixtures valid form (rc=$rc)"; fi
+rc=0
+bash "$SELF" --identity-only > "$WORK/identity-args/out" 2> "$WORK/identity-args/err" || rc=$?
+[ "$rc" = 0 ] && grep -q '^Identity contract: ' "$WORK/identity-args/out" \
+  && pass '--identity-only alone runs the identity contract' || fail "--identity-only alone (rc=$rc)"
 
 echo "Summary: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]

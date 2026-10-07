@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 import sys
 import tempfile
@@ -278,7 +279,7 @@ class CanonicalTests(unittest.TestCase):
             ps = path / "ps"
             probe = L.CanonicalStatus(ROOT)
             for body, expected in [("printf '  Fri Oct  2 00:00:00 2026\\n'", "running"),
-                                   ("printf 'Fri Oct  2 00:00:00 2026\\n'", "crashed"),
+                                   ("printf 'Fri Oct  2 00:00:07 2026\\n'", "crashed"),
                                    ("exit 1", "crashed"), ("exit 2", "unknown"),
                                    ("printf denied; exit 1", "unknown"), ("exit 0", "unknown")]:
                 ps.write_text("#!/bin/sh\n" + body + "\n")
@@ -286,6 +287,39 @@ class CanonicalTests(unittest.TestCase):
                 with patch.object(L.os, "defpath", str(path) + ":" + os.defpath):
                     self.assertEqual(probe(record(), time.monotonic() + 2), expected)
             self.assertEqual(probe(record(process_started_at=None), time.monotonic() + 2), "unknown")
+            # A start time recorded in another zone matches by whole zone offset, and a live process
+            # newer than the record is a reused PID (#1830, #1837 review).
+            for stored, started, expected in [("Fri Oct  2 14:00:00 2026", NOW - 1000, "running"),
+                                              ("Thu Oct  1 13:30:00 2026", NOW - 1000, "running"),
+                                              ("Fri Oct  2 00:00:07 2026", NOW - 1000, "crashed"),
+                                              ("Fri Oct  2 14:00:00 2026", 1790899200 - 60, "crashed"),
+                                              ("not a start time", NOW - 1000, "unknown")]:
+                ps.write_text("#!/bin/sh\nprintf '  Fri Oct  2 00:00:00 2026\\n'\n")
+                ps.chmod(0o700)
+                with patch.object(L.os, "defpath", str(path) + ":" + os.defpath):
+                    self.assertEqual(probe(record(process_started_at=stored, started_at_epoch=started), time.monotonic() + 2), expected, stored)
+
+    def test_real_helper_and_ps_match_a_heartbeat_written_under_a_non_utc_zone(self):
+        # #1830: lstart follows the caller zone. The orchestrator may run with
+        # TZ set while the probe scrubs its environment; both must agree.
+        with tempfile.TemporaryDirectory() as directory:
+            run_id = "p4b-" + "b" * 32
+            writer = subprocess.Popen(
+                ["bash", "-c", 'source "$1"; p4b_heartbeat_start; printf "ready\\n"; exec sleep 30',
+                 "tz-writer", str(ROOT / "scripts/phase-4b/heartbeat.sh")],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                env={"PATH": os.environ.get("PATH", os.defpath), "LC_ALL": "C", "TZ": "Pacific/Kiritimati",
+                     "P4B_HEARTBEAT_DIR": directory, "P4B_ACCT_RUN_ID": run_id})
+            try:
+                self.assertEqual(writer.stdout.readline(), b"ready\n")
+                written = json.loads((Path(directory) / (run_id + ".json")).read_text(encoding="utf-8"))
+                self.assertEqual(written["pid"], writer.pid)
+                self.assertTrue(written["process_started_at"])
+                self.assertEqual(L.CanonicalStatus(ROOT)(written, time.monotonic() + 2), "running")
+            finally:
+                writer.kill()
+                writer.wait()
+                writer.stdout.close()
 
     def test_probe_timeout_and_output_bound_fail_unknown(self):
         with tempfile.TemporaryDirectory() as directory:
