@@ -528,6 +528,8 @@ class GitHubClient:
         endpoint, seen, rows, alias_id = first.path, set(), [], None
         original = [pair for pair in urllib.parse.parse_qsl(first.query, keep_blank_values=True) if pair[0] != "page"]
         requested = set(original)
+        sizes = [value for key, value in original if key == "per_page"]
+        per_page = int(sizes[-1]) if sizes and re.fullmatch(r"[1-9][0-9]{0,2}", sizes[-1]) else 30
         deadline = self._monotonic() + 30 if deadline is None else deadline
         for _ in range(max_pages):
             if path in seen:
@@ -539,7 +541,15 @@ class GitHubClient:
                 raise ClientError("invalid_page")
             rows.extend(page)
             next_link = _next_link(link)
+            total = payload.get("total_count") if collection and isinstance(payload, dict) else None
             if next_link is None:
+                # A full first page that ends the list while its own total reports rows it did not
+                # return lost its next link: it is truncated, never complete (#1821 review). A short
+                # page is not judged, because a busy live-status list can report a total a run or two
+                # off its rows while statuses change; one response decides, so growth between pages
+                # cannot trip it either.
+                if len(seen) == 1 and type(total) is int and len(page) >= per_page and total > len(page):
+                    raise ClientError("invalid_page")
                 return rows
             parts = urllib.parse.urlsplit(next_link)
             if parts.scheme != "https" or parts.netloc != "api.github.com" or parts.fragment:
@@ -558,6 +568,12 @@ class GitHubClient:
             pages = [value for key, value in offered if key == "page"]
             if len(pages) != 1 or not re.fullmatch(r"[1-9][0-9]{0,8}", pages[0]):
                 raise ClientError("invalid_next_link")
+            # The overflow guard runs only after the next link passed every authority, path and
+            # cursor check (#1823), so a malformed link still fails invalid_next_link, never the
+            # recoverable page_limit. A first page whose reported total cannot fit the page bound
+            # then fails page_limit without requesting more; failing early reports no partial walk.
+            if len(seen) == 1 and page and type(total) is int and total > max_pages * len(page):
+                raise ClientError("page_limit")
             path = self._path(endpoint + "?" + urllib.parse.urlencode(original + [("page", pages[0])]))
         raise ClientError("page_limit")
 
