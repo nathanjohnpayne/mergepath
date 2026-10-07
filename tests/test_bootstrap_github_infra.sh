@@ -11,7 +11,7 @@
 #   1. `gh repo create` is invoked with the right flags (visibility,
 #      description, source — and NOT --push, which is now its own
 #      command under the same verified author credential).
-#   2. All 19 canonical labels are seeded with --force (idempotency).
+#   2. All 21 canonical labels are seeded with --force (idempotency).
 #   3. Reviewer invitations land via `gh api -X PUT` to the right
 #      collaborator endpoint for each agent in BOOTSTRAP_INPUT_REVIEWERS.
 #   4. REVIEWER_ASSIGNMENT_TOKEN provisioning uses the inline-PAT
@@ -272,14 +272,14 @@ echo "$out" | grep -q "push bootstrap commit to nathanjohnpayne/test-repo" \
   && pass "the bootstrap commit landed on the remote's main" \
   || fail "remote has no main after the push: $(git -C "$WORKDIR/remotes/test-repo.git" branch -a 2>&1)"
 
-# --- assertion 2: all 19 labels seeded with --force ---
+# --- assertion 2: all 21 labels seeded with --force ---
 # Hard-coded on purpose: this is an INDEPENDENT assertion of the intended
 # set, not a mirror of BOOTSTRAP_LABELS. Deriving it from the array would
 # make the test pass trivially if the array were emptied or mis-parsed.
 # The `size:` / `priority:` names carry a colon, which is exactly what the
 # old `name:color:description` encoding could not express — a regression to
 # ':' would seed a label named `size` and fail these entries.
-expected_labels=(needs-external-review needs-human-review policy-violation human-hold human-action decision-needed agent-action phase-0 phase-1 phase-2 phase-3 phase-4 size:S size:M size:L priority:critical priority:high priority:normal priority:low)
+expected_labels=(needs-external-review needs-human-review policy-violation human-hold needs-local-agent human-action decision-needed agent-action phase-0 phase-1 phase-2 phase-3 phase-4 size:S size:M size:L priority:critical priority:high priority:normal priority:low status:blocked)
 seeded=0
 for label in "${expected_labels[@]}"; do
   if grep -qE "^gh label create $label .* --force\$" "$SHIM_LOG"; then
@@ -288,9 +288,9 @@ for label in "${expected_labels[@]}"; do
     fail "label '$label' not seeded with --force; log: $(grep "label create $label" "$SHIM_LOG")"
   fi
 done
-[ "$seeded" -eq 19 ] \
-  && pass "all 19 canonical labels seeded with --force" \
-  || fail "expected 19 labels, got $seeded"
+[ "$seeded" -eq 21 ] \
+  && pass "all 21 canonical labels seeded with --force" \
+  || fail "expected 21 labels, got $seeded"
 
 # --- assertion 2b: the malformed-spec guard fails CLOSED (Codex P2, #1182) ---
 # The parse uses ${var%%|*} / ${var#*|}, which return the input UNCHANGED
