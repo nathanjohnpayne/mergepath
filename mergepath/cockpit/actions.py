@@ -218,9 +218,12 @@ class ActionsProvider:
     def _installation_scan(self, repo, deadline, now):
         """Exhausted run ids from failed-job logs of the last hour, with when that was observed.
 
-        A scan that could not read every failed job it found reports `incomplete` and keeps the
-        last complete observation time; a failed read keeps the previous runs. Nothing here is
-        estimated: only the logged installation-limit message establishes exhaustion.
+        The first logged installation-limit message settles the scan: one proven exhaustion is a
+        complete answer, and an exhausting repository adds fresh failed runs faster than every
+        job could be read. Only a clean answer needs every failed job read; a scan that could
+        not read them all reports `incomplete` and keeps the last complete observation time. A
+        failed read keeps the previous runs. Nothing here is estimated: only the logged
+        installation-limit message establishes exhaustion.
         """
         last = self._scans.get(repo)
         if last is not None and 0 <= now - last["attempted_at"] < SCAN_INTERVAL:
@@ -237,6 +240,8 @@ class ActionsProvider:
                 raise ClientError("invalid_page")
             exhausted, complete, reads = [], True, 0
             for raw in listed[:SCAN_RUNS]:
+                if exhausted:
+                    break
                 if type(raw) is not dict or not count(raw.get("id")) or raw["id"] == 0:
                     raise ClientError("invalid_page")
                 attempt = raw.get("run_attempt", 1)
@@ -264,10 +269,11 @@ class ActionsProvider:
                         text = body.decode("utf-8", "replace") if type(body) is bytes else body if type(body) is str else ""
                         verdict = INSTALLATION in text.casefold()
                         self._remember(self._scan_logs, (repo, job), verdict)
-                    if verdict and str(raw["id"]) not in exhausted:
+                    if verdict:
                         exhausted.append(str(raw["id"]))
+                        break
             state["runs"] = exhausted
-            if complete:
+            if complete or exhausted:
                 state["observed_at"] = now
             else:
                 state["error"] = "incomplete"

@@ -505,7 +505,9 @@ class ActionsTests(unittest.TestCase):
         row = p.fetch(30).data['repositories'][0]
         # The CI snapshot is stale, yet the scan still establishes exhaustion for run 5.
         self.assertFalse(row['available']); self.assertEqual(row['installation_runs'], ['5'])
-        self.assertEqual(row['installation_scan'], {'observed_at': NOW, 'error': None}); self.assertEqual(sorted(reads), ['51', '61'])
+        self.assertEqual(row['installation_scan'], {'observed_at': NOW, 'error': None})
+        # The first logged limit settles the scan, so run 6 is never read.
+        self.assertEqual(reads, ['51'])
         # Within the interval nothing is read again.
         gets.clear(); reads.clear(); current[0] += 60; p.fetch(30)
         self.assertEqual((gets, reads), ([], []))
@@ -522,6 +524,22 @@ class ActionsTests(unittest.TestCase):
         # A failed read keeps the last runs and their observation time, and names the error.
         state['error'] = 'secondary_limit'; current[0] += 121; failed = p.fetch(30).data['repositories'][0]
         self.assertEqual(failed['installation_runs'], ['7']); self.assertEqual(failed['installation_scan']['error'], 'secondary_limit')
+        # An exhausting repository adds fresh failed runs faster than every job could be read
+        # (285 in an hour on nathanpaynedotcom): one proven exhaustion is a complete answer even
+        # with unread jobs left, while a clean answer still needs every failed job read.
+        state.update(error=None, runs=[{'id': i, 'run_attempt': 1} for i in (8, 9, 10, 11, 12)])
+        jobs.update({(i, 1): [{'id': i * 10 + 1, 'conclusion': 'failure'}] for i in (8, 9, 10, 11, 12)})
+        logs.update({'81': b'other failure', **{str(i * 10 + 1): b'API rate limit exceeded for installation' for i in (9, 10, 11, 12)}})
+        reads.clear(); current[0] += 121; storm = p.fetch(30).data['repositories'][0]
+        self.assertEqual(reads, ['81', '91']); self.assertEqual(storm['installation_runs'], ['9'])
+        self.assertEqual(storm['installation_scan'], {'observed_at': current[0], 'error': None})
+        # The proof settles the scan even when the read cap left earlier jobs unread.
+        state['runs'] = [{'id': 13, 'run_attempt': 1}, {'id': 9, 'run_attempt': 1}]
+        jobs[(13, 1)] = [{'id': i, 'conclusion': 'failure'} for i in (131, 132, 133, 134)]
+        logs.update({str(i): b'x' for i in (131, 132, 133, 134)})
+        reads.clear(); current[0] += 121; capped = p.fetch(30).data['repositories'][0]
+        self.assertEqual(reads, ['131', '132', '133']); self.assertEqual(capped['installation_runs'], ['9'])
+        self.assertEqual(capped['installation_scan'], {'observed_at': current[0], 'error': None})
         # Without the launcher flag the provider makes no reads beside the snapshot.
         quiet = ScanFake(); gets.clear()
         ActionsProvider(quiet, [SimpleNamespace(repo=REPO)], clock=lambda: NOW, monotonic=lambda: 0, ci_snapshot=stale).fetch(30)
