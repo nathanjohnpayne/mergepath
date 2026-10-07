@@ -15,7 +15,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from mergepath.cockpit.fleet import FleetProvider, MAX_STDOUT, parse_audit
 from mergepath.cockpit.inventory import HUB, Repository
-from mergepath.cockpit.sync import (MAX_LINE, MAX_LOG_BYTES, RUN_SECONDS, STAGES, SyncError,
+from mergepath.cockpit.sync import (MAX_LINE, MAX_LOG_BYTES, STAGES, SyncError, run_seconds,
                                    author_environment, condition, fingerprint, hub_identity, scrub, validate_git_identity)
 
 
@@ -111,7 +111,11 @@ def execute(root, cache_dir, agent, tools, plan, lock_fd):
         env.pop("GH_TOKEN")
         env["OP_PREFLIGHT_CACHE_DIR"] = cache_dir
         env["OP_PREFLIGHT_QUIET"] = "1"
-        deadline = time.monotonic() + RUN_SECONDS - 5
+        # The provider sizes the bound to the selected consumers; the worker stops five seconds early.
+        bound = plan.get("run_seconds")
+        if type(bound) not in (int, float) or not 0 < bound <= run_seconds(len(plan["targets"])):
+            raise SyncError("invalid_plan")
+        deadline = time.monotonic() + plan["run_seconds"] - 5
         runner = Runner(deadline, lock_fd)
         # Refuse before even the cache helper if the confirmed immutable identity moved.
         def guard():
