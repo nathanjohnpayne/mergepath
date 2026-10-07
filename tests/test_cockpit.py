@@ -177,6 +177,27 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(self.client(walk).pages("/repos/a/b/actions/runs?per_page=2", collection="workflow_runs", max_pages=3), [1, 2, 3])
         walk = HTTPFixture(reply(data=[1, 2], Link=nxt), reply(data=[3]))
         self.assertEqual(self.client(walk).pages("/repos/a/b/actions/runs?per_page=2", max_pages=3), [1, 2, 3])
+        # #1821 review: a full first page that ends the list while its own total reports rows it did
+        # not return lost its next link and fails invalid_page, at the requested or default page size.
+        for path, total, rows in (("/repos/a/b/actions/runs?per_page=2", 7, [1, 2]), ("/repos/a/b/actions/runs?per_page=2", 3, [1, 2]),
+                                  ("/repos/a/b/actions/runs", 31, list(range(30)))):
+            with self.subTest(truncated=(path, total)):
+                with self.assertRaisesRegex(ClientError, "invalid_page"):
+                    self.client(HTTPFixture(reply(data={"total_count": total, "workflow_runs": rows}))).pages(
+                        path, collection="workflow_runs", max_pages=3)
+        # A short page is not judged: a busy live-status list can report a total a run off its rows.
+        for total, rows in ((3, [1]), (1, [])):
+            with self.subTest(short=total):
+                self.assertEqual(self.client(HTTPFixture(reply(data={"total_count": total, "workflow_runs": rows}))).pages(
+                    "/repos/a/b/actions/runs?per_page=2", collection="workflow_runs", max_pages=3), rows)
+        for total in (2, 1, None, True, "9"):
+            with self.subTest(complete=total):
+                first = {"workflow_runs": [1, 2]} if total is None else {"total_count": total, "workflow_runs": [1, 2]}
+                self.assertEqual(self.client(HTTPFixture(reply(data=first))).pages(
+                    "/repos/a/b/actions/runs?per_page=2", collection="workflow_runs", max_pages=3), [1, 2])
+        # A later page ending the list is not judged against the first page total (the list can move).
+        moved = HTTPFixture(reply(data={"total_count": 9, "workflow_runs": [1, 2]}, Link=nxt), reply(data={"total_count": 9, "workflow_runs": [3]}))
+        self.assertEqual(self.client(moved).pages("/repos/a/b/actions/runs?per_page=2", collection="workflow_runs", max_pages=5), [1, 2, 3])
         # #1823: an overflowing first page with a bad next link still fails invalid_next_link, the
         # unrecoverable category, and requests nothing more.
         for bad in ('<https://evil.example/repos/a/b/actions/runs?per_page=2&page=2>; rel="next"',
