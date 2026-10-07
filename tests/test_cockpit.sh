@@ -76,3 +76,9 @@ check_fixture_case "a new unlisted asset script" mergepath/cockpit/assets/zz_new
 check_fixture_case "a new unlisted UI test" tests/test_cockpit_zz_new_ui.cjs 'function broken( {'
 check_fixture_case "invalid PR settings JSON" mergepath/cockpit/pr_settings.json '{'
 check_fixture_case "invalid asset JSON" mergepath/cockpit/assets/fonts/manifest.json '{'
+# A JSON file with whitespace in its name is read whole: valid passes, invalid fails naming it.
+printf '{}\n' > "$CHECK_FIXTURE/mergepath/cockpit/assets/spaced name.json"
+bash "$CHECK_FIXTURE/scripts/ci/check_cockpit" --check >/dev/null
+echo "PASS: check_cockpit accepts a valid JSON file with whitespace in its name"
+check_fixture_case "invalid JSON with whitespace in its name" "mergepath/cockpit/assets/spaced name.json" '{'
+rm -f "$CHECK_FIXTURE/mergepath/cockpit/assets/spaced name.json"

@@ -80,11 +80,19 @@ for pattern in 'mergepath/cockpit/*.js' 'mergepath/cockpit/assets/*.js' 'tests/t
   [ "$matched" -gt 0 ] || { echo "check_cockpit: no files match $pattern" >&2; exit 1; }
 done
 # Cockpit JSON (pr_settings.json and everything under assets/) must parse.
-cockpit_json=$(find mergepath/cockpit -type f -name '*.json' | LC_ALL=C sort)
-[ -n "$cockpit_json" ] || { echo "check_cockpit: no JSON files under mergepath/cockpit" >&2; exit 1; }
-for subject in $cockpit_json; do
-  python3 -m json.tool "$subject" >/dev/null || { echo "check_cockpit: invalid JSON in $subject" >&2; exit 1; }
-done
+# One Python pass reads every file, so a path with whitespace is never split and a
+# discovery error fails the check instead of being swallowed by a pipeline.
+python3 - <<'PY_JSON' || exit 1
+import json, pathlib, sys
+files = sorted(path for path in pathlib.Path("mergepath/cockpit").rglob("*.json") if path.is_file())
+if not files:
+    sys.exit("check_cockpit: no JSON files under mergepath/cockpit")
+for path in files:
+    try:
+        json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        sys.exit(f"check_cockpit: invalid JSON in {path}: {error}")
+PY_JSON
 if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ]; then
   bash tests/test_cockpit.sh
 fi
