@@ -541,11 +541,6 @@ class GitHubClient:
             next_link = _next_link(link)
             if next_link is None:
                 return rows
-            total = payload.get("total_count") if collection and isinstance(payload, dict) else None
-            if len(seen) == 1 and page and type(total) is int and total > max_pages * len(page):
-                # A first page whose reported total cannot fit the page bound fails page_limit now
-                # rather than after max_pages requests; failing early still reports no partial walk.
-                raise ClientError("page_limit")
             parts = urllib.parse.urlsplit(next_link)
             if parts.scheme != "https" or parts.netloc != "api.github.com" or parts.fragment:
                 raise ClientError("invalid_next_link")
@@ -563,6 +558,13 @@ class GitHubClient:
             pages = [value for key, value in offered if key == "page"]
             if len(pages) != 1 or not re.fullmatch(r"[1-9][0-9]{0,8}", pages[0]):
                 raise ClientError("invalid_next_link")
+            # The overflow guard runs only after the next link passed every authority, path and
+            # cursor check (#1823), so a malformed link still fails invalid_next_link, never the
+            # recoverable page_limit. A first page whose reported total cannot fit the page bound
+            # then fails page_limit without requesting more; failing early reports no partial walk.
+            total = payload.get("total_count") if collection and isinstance(payload, dict) else None
+            if len(seen) == 1 and page and type(total) is int and total > max_pages * len(page):
+                raise ClientError("page_limit")
             path = self._path(endpoint + "?" + urllib.parse.urlencode(original + [("page", pages[0])]))
         raise ClientError("page_limit")
 

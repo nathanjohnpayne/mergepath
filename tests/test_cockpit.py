@@ -177,6 +177,18 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(self.client(walk).pages("/repos/a/b/actions/runs?per_page=2", collection="workflow_runs", max_pages=3), [1, 2, 3])
         walk = HTTPFixture(reply(data=[1, 2], Link=nxt), reply(data=[3]))
         self.assertEqual(self.client(walk).pages("/repos/a/b/actions/runs?per_page=2", max_pages=3), [1, 2, 3])
+        # #1823: an overflowing first page with a bad next link still fails invalid_next_link, the
+        # unrecoverable category, and requests nothing more.
+        for bad in ('<https://evil.example/repos/a/b/actions/runs?per_page=2&page=2>; rel="next"',
+                    '<http://api.github.com/repos/a/b/actions/runs?per_page=2&page=2>; rel="next"',
+                    '<https://api.github.com/repos/a/c/actions/runs?per_page=2&page=2>; rel="next"',
+                    '<https://api.github.com/repos/a/b/actions/runs?per_page=2&page=0>; rel="next"',
+                    '<https://api.github.com/repositories/9/actions/runs?page=2>; rel="next"'):
+            with self.subTest(link=bad):
+                fixture = HTTPFixture(reply(data={"total_count": 7, "workflow_runs": [1, 2]}, Link=bad))
+                with self.assertRaisesRegex(ClientError, "invalid_next_link"):
+                    self.client(fixture).pages("/repos/a/b/actions/runs?per_page=2", collection="workflow_runs", max_pages=3)
+                self.assertEqual(len(fixture.calls), 1)
 
     def test_malformed_next_link_does_not_silently_truncate(self):
         for link in ['garbage; rel="next"', '<https://api.github.com/repos/a/b/pulls?page=2>; rel="next"; rel="last"',
