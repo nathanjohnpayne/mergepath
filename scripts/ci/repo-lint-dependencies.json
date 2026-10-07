@@ -41,7 +41,18 @@
       "specs/cockpit_actions.md",
       "tests/test_cockpit_agents.py",
       "tests/test_cockpit_agents_ui.cjs",
-      "specs/cockpit_agents.md"
+      "specs/cockpit_agents.md",
+      "tests/test_cockpit_author_budget.py",
+      "tests/test_cockpit_layout_ui.cjs",
+      "tests/test_cockpit_fleet.py",
+      "tests/test_cockpit_fleet_ui.cjs",
+      "specs/cockpit_fleet.md",
+      "tests/test_cockpit_sync.py",
+      "tests/test_cockpit_sync_ui.cjs",
+      "specs/cockpit_sync.md",
+      "tests/test_cockpit_live_agents.py",
+      "tests/test_cockpit_live_agents_ui.cjs",
+      "specs/cockpit_live_agents.md"
     ],
     "check_no_token_in_output": [
       "scripts/ci/token_output_gate.py"

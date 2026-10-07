@@ -51,35 +51,48 @@ for subject in scripts/cockpit.sh tests/test_cockpit.sh tests/test_cockpit.py sp
   mergepath/cockpit/assets/fonts/local-fonts.css mergepath/cockpit/assets/fonts/manifest.json; do
   [ -f "$subject" ] || { echo "check_cockpit: missing $subject" >&2; exit 1; }
 done
-bash -n scripts/cockpit.sh tests/test_cockpit.sh
+# One parse per file: `bash -n a.sh b.sh` reads only a.sh and treats b.sh as
+# its first positional argument, so a broken second file passed (#1832).
+for subject in scripts/cockpit.sh tests/test_cockpit.sh; do
+  bash -n "$subject" || { echo "check_cockpit: bash -n failed for $subject" >&2; exit 1; }
+done
+# Parse subjects are discovered by glob so a new Cockpit file is covered
+# without a hand edit here. A glob that matches nothing fails instead of
+# passing vacuously, which would hide a moved or renamed directory.
 python3 - <<'PY'
 import ast
+import sys
 from pathlib import Path
-for subject in list(Path('mergepath/cockpit').glob('*.py')) + [Path('tests/test_cockpit.py'), Path('tests/test_cockpit_author_budget.py'), Path('tests/test_cockpit_ci.py'), Path('tests/test_cockpit_logs.py'), Path('tests/test_cockpit_prs.py'), Path('tests/test_cockpit_actions.py'), Path('tests/test_cockpit_agents.py'), Path('tests/test_cockpit_live_agents.py'), Path('tests/test_cockpit_fleet.py'), Path('tests/test_cockpit_sync.py')]:
-    ast.parse(subject.read_text(), filename=str(subject))
+for pattern in ('mergepath/cockpit/*.py', 'tests/test_cockpit*.py'):
+    subjects = sorted(Path('.').glob(pattern))
+    if not subjects:
+        sys.exit('check_cockpit: no files match ' + pattern)
+    for subject in subjects:
+        ast.parse(subject.read_text(), filename=str(subject))
 PY
-node --check mergepath/cockpit/bootstrap.js
-node --check mergepath/cockpit/assets/components.js
-node --check mergepath/cockpit/assets/app.js
-node --check tests/test_cockpit_ui.cjs
-node --check mergepath/cockpit/assets/layout.js
-node --check tests/test_cockpit_layout_ui.cjs
-node --check mergepath/cockpit/assets/actions.js
-node --check mergepath/cockpit/assets/actions_init.js
-node --check tests/test_cockpit_actions_ui.cjs
-node --check mergepath/cockpit/assets/ci.js
-node --check tests/test_cockpit_ci_ui.cjs
-node --check mergepath/cockpit/assets/prs.js
-node --check mergepath/cockpit/assets/pr_rows.js
-node --check tests/test_cockpit_prs_ui.cjs
-node --check mergepath/cockpit/assets/fleet.js
-node --check tests/test_cockpit_fleet_ui.cjs
-node --check mergepath/cockpit/assets/sync.js
-node --check tests/test_cockpit_sync_ui.cjs
-node --check mergepath/cockpit/assets/agents.js
-node --check tests/test_cockpit_agents_ui.cjs
-node --check mergepath/cockpit/assets/live_agents.js
-node --check tests/test_cockpit_live_agents_ui.cjs
+for pattern in 'mergepath/cockpit/*.js' 'mergepath/cockpit/assets/*.js' 'tests/test_cockpit*.cjs'; do
+  matched=0
+  for subject in $pattern; do
+    [ -f "$subject" ] || continue
+    node --check "$subject" || { echo "check_cockpit: node --check failed for $subject" >&2; exit 1; }
+    matched=$((matched + 1))
+  done
+  [ "$matched" -gt 0 ] || { echo "check_cockpit: no files match $pattern" >&2; exit 1; }
+done
+# Cockpit JSON (pr_settings.json and everything under assets/) must parse.
+# One Python pass reads every file, so a path with whitespace is never split and a
+# discovery error fails the check instead of being swallowed by a pipeline.
+python3 - <<'PY_JSON' || exit 1
+import json, pathlib, sys
+files = sorted(path for path in pathlib.Path("mergepath/cockpit").rglob("*.json") if path.is_file())
+if not files:
+    sys.exit("check_cockpit: no JSON files under mergepath/cockpit")
+for path in files:
+    try:
+        json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        sys.exit(f"check_cockpit: invalid JSON in {path}: {error}")
+PY_JSON
 if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ]; then
   bash tests/test_cockpit.sh
 fi
