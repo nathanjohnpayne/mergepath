@@ -499,13 +499,35 @@ print({{'user.name':'Verified Fixture Author','user.email':'fixture@example.inva
         sleeper.write_text('#!/bin/sh\nsleep 60\n');sleeper.chmod(0o700)
         p.tools['python']=str(sleeper)
         start=time.monotonic()
-        with mock.patch.object(sync_module,'RUN_SECONDS',.25):
+        with mock.patch.object(sync_module,'RUN_SECONDS',.25),mock.patch.object(sync_module,'TARGET_SECONDS',.1):
             p.confirm('session',self.payload(preview));state=self.wait(p)
         self.assertLess(time.monotonic()-start,2)
         self.assertEqual(state['error'],'deadline_exceeded')
         self.assertFalse(self.called())
         p.tools['python']=sys.executable
         preview=self.preview(p);p.confirm('session',self.payload(preview));self.assertEqual(self.wait(p)['phase'],'done')
+
+    def test_run_bound_scales_with_the_selected_consumers(self):
+        # #1827: one fixed 900-second bound cut a seven-consumer Sync all off after five consumers.
+        import mergepath.cockpit.sync as sync_module
+        self.assertEqual([sync_module.run_seconds(n) for n in (1, 3, 4, 7)], [900, 900, 1200, 2100])
+        for bad in (0, -1, True, 1.5, None):
+            with self.assertRaisesRegex(SyncError, 'invalid_plan'):
+                sync_module.run_seconds(bad)
+        p=self.provider();preview=self.preview(p,['owner/one','owner/two'])
+        self.assertEqual(sorted(t['repo'] for t in preview['targets']),['owner/one','owner/two'])
+        captured=self.base/'plan.json';worker=self.base/'capturing-python'
+        worker.write_text(f'#!/bin/sh\ncat > {captured}\nsleep 60\n');worker.chmod(0o700)
+        p.tools['python']=str(worker)
+        start=time.monotonic()
+        with mock.patch.object(sync_module,'RUN_SECONDS',.1),mock.patch.object(sync_module,'TARGET_SECONDS',.4):
+            p.confirm('session',self.payload(preview,choices={'owner/one':'sync','owner/two':'sync'}));state=self.wait(p)
+        elapsed=time.monotonic()-start
+        self.assertEqual(state['error'],'deadline_exceeded')
+        # Two selected consumers get two per-consumer allowances, not the fixed floor, and the
+        # worker receives the same bound in its plan.
+        self.assertGreaterEqual(elapsed,.75);self.assertLess(elapsed,3)
+        self.assertEqual(json.loads(captured.read_text())['run_seconds'],.8)
 
 
 if __name__ == "__main__":

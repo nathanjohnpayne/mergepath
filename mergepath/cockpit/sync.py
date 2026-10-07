@@ -25,7 +25,18 @@ from .inventory import HUB, REPO
 
 PREVIEW_SECONDS = 180
 PREVIEW_TTL = 300
+# A run gets TARGET_SECONDS per selected consumer and never less than RUN_SECONDS (#1827): each
+# consumer is a fresh target audit, clone, copy, push and PR in sequence, measured at about 150
+# seconds, so one fixed 900-second bound cut a seven-consumer Sync all off after five.
 RUN_SECONDS = 900
+TARGET_SECONDS = 300
+
+
+def run_seconds(count):
+    """The total bound for a run that syncs `count` consumers in sequence."""
+    if type(count) is not int or count < 1:
+        raise SyncError("invalid_plan")
+    return max(RUN_SECONDS, TARGET_SECONDS * count)
 MAX_EVENTS = 1500
 MAX_LOG_BYTES = 256 * 1024
 MAX_LINE = 4096
@@ -455,6 +466,7 @@ class SyncProvider:
             self._state.update(phase="running", run=run, error=None)
             self._bytes = 0
             plan = {"hub_sha": public["hub_sha"], "manifest": preview["manifest"], "nonce": preview["nonce"],
+                    "run_seconds": run_seconds(len(selected)),
                     "git_identity": copy.deepcopy(self.git_identity),
                     "targets": [{"repo": t["repo"], "name": t["name"], "choice": choices[t["repo"]],
                                  "expected": condition(preview["records"][t["repo"]])} for t in selected],
@@ -516,7 +528,7 @@ class SyncProvider:
             data = json.dumps(plan).encode()
             if len(data) > 1024 * 1024:
                 raise SyncError("preview_plan_limit")
-            deadline = self.monotonic() + RUN_SECONDS
+            deadline = self.monotonic() + plan["run_seconds"]
             env = plain_environment(self.workspace, self.tools)
             command = [self.tools["python"], "-B", str(Path(__file__).with_name("sync_worker.py")),
                        "--root", str(self.root), "--cache-dir", self.cache_dir, "--agent", self.agent,
