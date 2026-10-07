@@ -529,14 +529,22 @@ bootstrap::_print_summary() {
     echo "     Canonical PRDs live in nathanjohnpayne/docs/projects/$repo_name/prds/"
     echo "  4. Populate Phase 0 / Phase 1 issues via the create-issues.sh"
     echo "     skeleton: $target/scripts/gh-projects/examples/$repo_name/"
-    echo "  5. Set the board's built-in workflow targets (board ... > Workflows):"
-    echo "     Item added -> Backlog, Item reopened -> Ready, Pull request"
-    echo "     linked to issue -> In review, Item closed -> Done. The API"
-    echo "     cannot set these. See scripts/gh-projects/README.md § Status lanes."
-    echo "  6. Set provider-level spend caps before pasting LLM API keys:"
+    local next_step=5
+    # Only when a board was created or attached: with --skip-board there
+    # is no board whose workflows need setting.
+    if [ -n "$project_number" ]; then
+      echo "  $next_step. Set board #$project_number's built-in workflow targets"
+      echo "     (board ... > Workflows): Item added -> Backlog, Item reopened"
+      echo "     -> Ready, Pull request linked to issue -> In review, Item"
+      echo "     closed -> Done. The API cannot set these. See"
+      echo "     scripts/gh-projects/README.md § Status lanes."
+      next_step=$((next_step + 1))
+    fi
+    echo "  $next_step. Set provider-level spend caps before pasting LLM API keys:"
     echo "     - https://platform.openai.com/account/limits"
     echo "     - https://console.anthropic.com/settings/limits"
-    echo "  7. Drive Sprint 0 PR #1 through the Phase 4 review flow."
+    next_step=$((next_step + 1))
+    echo "  $next_step. Drive Sprint 0 PR #1 through the Phase 4 review flow."
     echo
     echo "DOC: docs/agents/bootstrap-runbook.md (in mergepath) explains every"
     echo "     stage above and how to debug or resume on failure."

@@ -32,9 +32,10 @@ Every repository's board uses the same five `Status` options, and each one has a
 | `Backlog` | It is captured but not yet specified well enough to start. | The built-in *Item added to project* workflow. |
 | `Ready` | It is specified well enough that an agent can start without asking questions: the issue states the problem, the expected outcome, and how to verify it. | Whoever triages it, with `move-item.sh`. The built-in *Item reopened* workflow also lands here. |
 | `In progress` | Work has started: a branch exists, but no pull request that resolves it is open. | The agent or human starting the work, with `move-item.sh`. |
-| `In review` | A pull request that resolves it is open and waiting on review or merge gates. | The built-in *Pull request linked to issue* workflow, which fires only when the PR body names the issue with a closing keyword. See [Shared Agent Operating Rules § Link the issue a pull request resolves](../../docs/agents/shared-operating-rules.md#link-the-issue-a-pull-request-resolves). |
+| `In review` | A pull request that resolves it is open and waiting on review or merge gates. | The built-in *Pull request linked to issue* workflow, which fires when a pull request is linked to the issue: by a closing keyword in the PR body (the normal route; see [Shared Agent Operating Rules § Link the issue a pull request resolves](../../docs/agents/shared-operating-rules.md#link-the-issue-a-pull-request-resolves)) or by a manual link from the PR's *Development* sidebar. |
 | `Done` | It is closed. | The built-in *Item closed* workflow. |
 
+- **A parent issue follows its sub-issues.** It moves to `In progress` once any sub-issue is done or in progress, and stays there until the last one closes; it never gets a branch of its own.
 - **Blocked is a label, not a lane.** Add `status:blocked` and name the blocker in the issue; the item stays in the lane it was in.
 - **Order within a lane comes from the `priority:*` labels.** Moving an item to `Ready` says it can be started, not that it should be next.
 - **Two moves have no workflow.** Starting work (`Ready` to `In progress`) and a resolving pull request closed without merging (the issue stays in `In review`; move it back to `In progress` or `Ready`) are both done by hand.

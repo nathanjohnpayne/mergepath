@@ -148,7 +148,7 @@ The rollup is per-repo: the workflow runs in the repository it is installed in a
 
 ## Link the issue a pull request resolves
 
-When a pull request resolves an issue, its body names that issue with a closing keyword: `Closes #N` on its own line, one line per issue. An issue number in the title, a `(#N)` suffix, or `Refs #N` mentions the issue without linking it. GitHub honors a closing keyword only when the pull request targets the repository's default branch; for a pull request into any other branch the keyword links nothing, so move the issue between lanes by hand.
+When a pull request resolves an issue, its body names that issue with a closing keyword: `Closes #N` on its own line, one line per issue, or `Closes OWNER/REPO#N` for an issue in another repository (the same qualification applies to `Refs`). An issue number in the title, a `(#N)` suffix, or `Refs #N` mentions the issue without linking it. GitHub honors a closing keyword only when the pull request targets the repository's default branch; for a pull request into any other branch the keyword links nothing, so move the issue between lanes by hand.
 
 The link is what moves the issue on the repository's Project board. The board's *Pull request linked to issue* workflow moves the issue to `In review` when the pull request opens, and the merge closes it, which moves it to `Done`. Without the link the issue sits in `Ready` or `In progress` through the whole review and has to be closed by hand.
 

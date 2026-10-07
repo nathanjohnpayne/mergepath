@@ -300,6 +300,14 @@ echo "$out" | grep -q "^CROSS-REPO LOOP UPDATE:" \
   || fail "summary missing CROSS-REPO LOOP UPDATE"
 echo "$out" | grep -q "^NEXT STEPS" \
   && pass "summary has NEXT STEPS section" || fail "summary missing NEXT STEPS"
+# A created board needs its built-in workflow targets set by hand (the
+# Projects API cannot set them), so NEXT STEPS names the step, numbered
+# in sequence before the spend-cap and Sprint 0 steps.
+echo "$out" | grep -qE "^  5\. Set board #[0-9]+'s built-in workflow targets" \
+  && echo "$out" | grep -qE "^  6\. Set provider-level spend caps" \
+  && echo "$out" | grep -qE "^  7\. Drive Sprint 0 PR #1" \
+  && pass "NEXT STEPS includes the board workflow-target step, numbered in sequence" \
+  || fail "NEXT STEPS missing or misnumbering the workflow-target step; got: $(echo "$out" | sed -n '/^NEXT STEPS/,/^DOC:/p')"
 # Regression guard for the gaycruisebingo gap (mergepath#741): the
 # summary must steer the operator to enroll the repo as a
 # .mergepath-sync.yml consumer, since the bootstrap does the one-time
@@ -400,6 +408,16 @@ echo "$out3" | grep -q "==> Bootstrap complete: " \
 echo "$out3" | grep -q "PROJECT: *(skipped: --skip-board)" \
   && pass "--skip-board summary shows project skipped with reason" \
   || fail "summary PROJECT line missing skip reason; got: $(echo "$out3" | grep PROJECT)"
+# No board, so no board workflows to set: the step is omitted and the
+# remaining steps renumber without a gap.
+if echo "$out3" | grep -q "built-in workflow targets"; then
+  fail "--skip-board summary still lists the board workflow-target step"
+elif echo "$out3" | grep -qE "^  5\. Set provider-level spend caps" \
+  && echo "$out3" | grep -qE "^  6\. Drive Sprint 0 PR #1"; then
+  pass "--skip-board summary omits the workflow-target step and renumbers"
+else
+  fail "--skip-board NEXT STEPS misnumbered; got: $(echo "$out3" | sed -n '/^NEXT STEPS/,/^DOC:/p')"
+fi
 
 # ---------------------------------------------------------------------------
 # Test 4: dry-run — no gh project invocations; plan tags + summary printed.
