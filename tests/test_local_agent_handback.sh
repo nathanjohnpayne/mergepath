@@ -450,6 +450,7 @@ drun D_DISPATCH_FAIL=1 D_DISPATCH_ERR="error connecting to api.github.com" -- >/
 set -e
 if [ "$r_net" -eq 4 ] && grep -q "error connecting to api.github.com" "$DFIX/err" \
    && grep -q "the repository_dispatch to o/r failed (gh exit 1; gh printed the reason above)" "$DFIX/err" \
+   && grep -q "If that reason is HTTP 403 or 404, the likely cause is" "$DFIX/err" \
    && ! grep -q "was refused" "$DFIX/err" && ! grep -q "PAT needs Contents: write" "$DFIX/err"; then
   pass "dispatch: a network failure keeps exit 4 with a neutral message pointing at gh's error, not a permission diagnosis"
 else
