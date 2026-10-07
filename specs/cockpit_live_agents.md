@@ -22,6 +22,8 @@ Only a proven-running adapter with a recent comparable process observation can t
 
 Near timeout starts at 80 percent of the observed effective budget. Crossing the budget while still running reports “Budget exceeded · no terminal outcome observed”; it does not fabricate an exit/verdict. A real adapter exit124 supports a timed-out label. A canonical crashed process has a distinct boulder label. Runtime hazards are advisory and never establish review or merge clearance. Unknown and stale rows withdraw fresh coverage; retained crash/timeout hazards visibly retain their observation age.
 
+The panel lists finished runs behind a disclosure button whose text carries the count ("N finished runs observed · show"); the list is collapsed by default, keeps one keyed item per run so repeated samples never recreate nodes, scrolls past 320px, and every sentence stays available as text. When the last finished run leaves, focus on the disclosure moves to the live summary before the disclosure hides. The one-sentence empty state uses the shared dashed `p.empty` box.
+
 `adapter_verdict` alone is adapter output. Only `summary_emitted` plus `review_posted` on a non-dry run supports a posted-outcome readout. Final exit, verdict and acknowledgment remain separate: a posted approval with failed acknowledgment and exit7 remains posted with failure disclosed. The terminal readout adds no history rows or spend. The pure `join_history(terminals, history)` can annotate already-published history on compatible repository/run ID and PR/head/reviewer/start fields; conflicts produce diagnostics, unmatched IDs remain pending observation, and all existing rows/amounts are preserved. It never rescans ledgers or refreshes approvals.
 
 ## Rendering and verification

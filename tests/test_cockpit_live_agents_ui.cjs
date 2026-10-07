@@ -64,6 +64,9 @@ class Node {
   append(...nodes) {for (const node of nodes) {node.remove(); this.children.push(node); node.parentNode = this;}}
   replaceChildren(...nodes) {for (const node of [...this.children]) node.remove(); this.append(...nodes);}
   insertBefore(node, reference) {node.remove(); const index = reference === null ? this.children.length : this.children.indexOf(reference); assert.ok(index >= 0); this.children.splice(index, 0, node); node.parentNode = this;}
+  contains(node) {return node === this || this.children.some(child => child.contains(node));}
+  // Like a browser, a hidden subtree cannot take focus.
+  focus() {for (let node = this; node; node = node.parentNode) if (node.hidden) return; global.document.activeElement = this;}
 }
 function withDOM(fn) {const old = global.document; global.document = {createElement: tag => new Node(tag)}; try {fn();} finally {global.document = old;}}
 test("actual renderer preserves keyed cards/stages/fill through repeats and source interruptions", () => withDOM(() => {
@@ -101,10 +104,25 @@ test("done transition leaves active list and requires summary plus post for post
   const terminal = row({stage: "done", reached: ["barrier", "adapter", "posting", "done"], process_status: "done", adapter_verdict: "APPROVED", exit_code: 7});
   view.update(L.projectLive(envelope([], {terminal: [terminal]}), null, now));
   assert.equal(view.cards.size, 0); assert.match(view.empty.textContent, /No Phase 4b run in flight/);
-  assert.match(view.terminal.textContent, /final summary unavailable/); assert.doesNotMatch(view.terminal.textContent, /APPROVED review posted/);
+  const terminalText = () => [...view.terminalNodes.values()].map(node => node.textContent).join(" ");
+  assert.match(terminalText(), /final summary unavailable/); assert.doesNotMatch(terminalText(), /APPROVED review posted/);
+  // Finished runs stay behind a counted disclosure; the list is collapsed until the operator opens it.
+  assert.equal(view.terminal.hidden, false); assert.equal(view.terminalList.hidden, true);
+  assert.equal(view.terminalToggle.textContent, "1 finished run observed · show"); assert.equal(view.terminalToggle.attributes["aria-expanded"], "false");
+  view.terminalOpen = true; view.discloseTerminal();
+  assert.equal(view.terminalList.hidden, false); assert.equal(view.terminalToggle.attributes["aria-expanded"], "true");
+  const item = view.terminalNodes.get(terminal.id);
   terminal.summary_emitted = true; terminal.review_posted = true; terminal.verdict = "APPROVED"; terminal.posted_outcome = "APPROVED"; terminal.review_acknowledgment = "failed";
   view.update(L.projectLive(envelope([], {terminal: [terminal]}), null, now));
-  assert.match(view.terminal.textContent, /APPROVED review posted.*exit 7.*acknowledgment failed/);
+  assert.match(terminalText(), /APPROVED review posted.*exit 7.*acknowledgment failed/);
+  assert.equal(view.terminalNodes.get(terminal.id), item); assert.equal(item.detachments, 0); assert.equal(view.terminalList.hidden, false);
+  view.update(L.projectLive(envelope([], {terminal: []}), null, now));
+  assert.equal(view.terminal.hidden, true); assert.equal(view.terminalNodes.size, 0);
+  // Focus on the disclosure moves to the live summary before the emptied disclosure hides.
+  view.update(L.projectLive(envelope([], {terminal: [terminal]}), null, now));
+  view.terminalToggle.focus(); assert.equal(document.activeElement, view.terminalToggle);
+  view.update(L.projectLive(envelope([], {terminal: []}), null, now));
+  assert.equal(view.terminal.hidden, true); assert.equal(document.activeElement, view.summary);
 }));
 test("both reduced-motion paths stop loops at rest and preserve information", () => {
   const css = fs.readFileSync(require.resolve("../mergepath/cockpit/assets/live_agents.css"), "utf8");

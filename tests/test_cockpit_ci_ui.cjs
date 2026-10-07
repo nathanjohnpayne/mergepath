@@ -205,11 +205,13 @@ class Node {
   get textContent(){return this._text+this.children.map(c=>c.textContent).join("");}
   get lastChild(){return this.children.at(-1);}
   append(...nodes){for(const node of nodes){node.remove();node.parentNode=this;this.children.push(node);}}
-  remove(){if(this.parentNode){const p=this.parentNode;p.children.splice(p.children.indexOf(this),1);this.parentNode=null;}}
+  insertBefore(node,reference){node.remove();node.parentNode=this;const index=reference===null?this.children.length:this.children.indexOf(reference);this.children.splice(index<0?this.children.length:index,0,node);}
+  // Like a browser, detaching a node that holds focus drops it, and a hidden subtree cannot take focus.
+  remove(){if(this.parentNode){if(this.contains(document.activeElement))document.activeElement=null;const p=this.parentNode;p.children.splice(p.children.indexOf(this),1);this.parentNode=null;}}
   setAttribute(key,value){this.attrs[key]=value;}
   addEventListener(name,fn){this.listeners[name]=fn;}
   contains(node){return node===this||this.children.some(c=>c.contains(node));}
-  focus(){document.activeElement=this;}
+  focus(){for(let n=this;n;n=n.parentNode)if(n.hidden)return;document.activeElement=this;}
 }
 function dom(){global.document={createElement:tag=>new Node(tag),activeElement:null};return new Node("div");}
 test("Unknown open-HEAD marker uses honest copy and preserves disclosure when checks arrive", () => {
@@ -252,7 +254,7 @@ test("renderer restores stable disclosed content after the shell replaces it wit
   assert.ok(parent.textContent.includes("check_shell"));
   assert.ok(!parent.textContent.includes("Invalid source observation"));
   render(parent,CI.project(envelope(data),null,1003));
-  assert.equal(parent.children.length,4);
+  assert.equal(parent.children.length,5); // summary, notes, list, history disclosure, empty
 });
 test("stable row, one disclosure and keyboard focus survive repeated live conclusions", () => {
   const parent=dom(), data=fixture(), view=new CI.CIView(parent,()=>assert.fail("unexpected fetch"));
@@ -298,4 +300,83 @@ test("never-observed selected repository withdraws coverage but successful empty
   assert.equal(CI.project(envelope(data),null,1001).hasObservations,false);
   data.repositories[0].observed_at=1000; data.repositories[0].stale=false;
   assert.equal(CI.project(envelope(data),data.repositories[0].repo,1001).hasObservations,true);
+});
+
+test("a completed success off every open HEAD carries not-fetched job scope, validates only with empty jobs and says so when disclosed", () => {
+  const data = fixture(), base = data.runs[0];
+  const row = {...structuredClone(base), id: "11", key: `${base.repo}:11:${base.pr ?? "none"}`, status: "completed", conclusion: "success", current_head: false,
+    jobs: [], jobs_scope: "not-fetched", checks: [], diagnostics: [], actionable: false, superseded: false, severity: null, reason: null, check_evidence_unknown: false, rerun_command: null};
+  data.runs.push(row);
+  assert.doesNotThrow(() => CI.validate(data));
+  assert.throws(() => CI.validate({...data, runs: [base, {...row, jobs: structuredClone(base.jobs)}]}), /invalid_ci_observation/);
+  assert.throws(() => CI.validate({...data, runs: [base, {...row, jobs_scope: "none"}]}), /invalid_ci_observation/);
+  assert.throws(() => CI.validate({...data, runs: [base, {...base, jobs_scope: "not-fetched"}]}), /invalid_ci_observation/);
+  const parent = dom(), view = new CI.CIView(parent, () => assert.fail("unexpected fetch"));
+  view.update(CI.project(envelope(data), null, 1001));
+  const run = view.rows.get(row.key);
+  assert.equal(run.empty.textContent, "Job detail is read for live runs, failed runs and open-PR heads; this completed success keeps its workflow result only.");
+  const cancelled = {...row, id: "12", key: `${base.repo}:12:${base.pr ?? "none"}`, conclusion: "cancelled"}; data.runs.push(cancelled); view.update(CI.project(envelope(data), null, 1002));
+  assert.equal(view.rows.get(cancelled.key).empty.textContent, "Job detail is read for live runs, failed runs and open-PR heads; this completed run keeps its workflow result only.");
+  assert.equal(run.duration.textContent, "1m 0s");
+  assert.equal(run.badge.textContent, "Passed · old HEAD");
+  assert.match(view.notes.textContent, /Job detail for live, failed and open-HEAD runs/);
+});
+
+test("completed runs off open heads sit behind a counted history disclosure while attention rows stay in the main list", () => {
+  const data = fixture(), base = data.runs[0];
+  const history = {...structuredClone(base), id: "11", key: `${base.repo}:11:${base.pr ?? "none"}`, status: "completed", conclusion: "success", current_head: false,
+    jobs: [], jobs_scope: "not-fetched", checks: [], diagnostics: [], actionable: false, superseded: false, severity: null, reason: null, check_evidence_unknown: false, rerun_command: null};
+  data.runs.push(history);
+  const parent = dom(), view = new CI.CIView(parent, () => assert.fail("unexpected fetch"));
+  view.update(CI.project(envelope(data), null, 1001));
+  assert.deepEqual(view.list.children, [view.rows.get(base.key).root]);
+  assert.deepEqual(view.historyList.children, [view.rows.get(history.key).root]);
+  assert.equal(view.history.hidden, false); assert.equal(view.historyList.hidden, true);
+  assert.equal(view.historyToggle.textContent, "1 completed run off open heads · show"); assert.equal(view.historyToggle.attrs["aria-expanded"], "false");
+  view.historyOpen = true; view.discloseHistory();
+  assert.equal(view.historyList.hidden, false); assert.equal(view.historyToggle.attrs["aria-expanded"], "true");
+  // A run that turns live moves back to the main list and keeps its node; an empty history hides its disclosure.
+  const node = view.rows.get(history.key).root; history.status = "in_progress"; history.conclusion = null; history.jobs_scope = "all-attempts";
+  view.update(CI.project(envelope(data), null, 1002));
+  assert.equal(view.rows.get(history.key).root, node); assert.equal(node.parentNode, view.list); assert.equal(view.list.children.length, 2);
+  assert.equal(view.historyList.children.length, 0); assert.equal(view.history.hidden, true);
+  assert.equal(CI.attention({status: "completed", conclusion: "failure", current_head: null, actionable: false}), true);
+  assert.equal(CI.attention({status: "completed", conclusion: "cancelled", current_head: false, actionable: false}), false);
+});
+
+test("focus on the history toggle moves to the summary when the last history row leaves", () => {
+  const data = fixture(), base = data.runs[0];
+  const done = {...structuredClone(base), id: "13", key: `${base.repo}:13:${base.pr ?? "none"}`, status: "completed", conclusion: "success", current_head: false,
+    jobs: [], jobs_scope: "not-fetched", checks: [], diagnostics: [], actionable: false, superseded: false, severity: null, reason: null, check_evidence_unknown: false, rerun_command: null};
+  data.runs.push(done);
+  const parent = dom(), view = new CI.CIView(parent, () => assert.fail("unexpected fetch"));
+  view.update(CI.project(envelope(data), null, 1001));
+  view.historyToggle.focus(); assert.equal(document.activeElement, view.historyToggle);
+  done.current_head = true; view.update(CI.project(envelope(data), null, 1002));
+  assert.equal(view.history.hidden, true); assert.equal(document.activeElement, view.summary);
+  data.runs.pop(); done.current_head = false; data.runs.push(done); view.update(CI.project(envelope(data), null, 1003));
+  view.historyToggle.focus(); data.runs.pop(); view.update(CI.project(envelope(data), null, 1004));
+  assert.equal(view.history.hidden, true); assert.equal(document.activeElement, view.summary, "a removed last row also releases the toggle");
+});
+
+test("a focused run that moves into collapsed history reveals it and keeps keyboard focus", () => {
+  const data = fixture(), base = data.runs[0];
+  const done = {...structuredClone(base), id: "12", key: `${base.repo}:12:${base.pr ?? "none"}`, status: "completed", conclusion: "success", current_head: true,
+    jobs: [], jobs_scope: "all-attempts", checks: [], diagnostics: [], actionable: false, superseded: false, severity: null, reason: null, check_evidence_unknown: false, rerun_command: null};
+  data.runs.push(done);
+  const parent = dom(), view = new CI.CIView(parent, () => assert.fail("unexpected fetch"));
+  view.update(CI.project(envelope(data), null, 1001));
+  const button = view.rows.get(done.key).button;
+  assert.equal(button.parentNode && view.list.contains(button), true); button.focus(); assert.equal(document.activeElement, button);
+  assert.equal(view.historyOpen, false);
+  // A new PR HEAD makes the completed success history while its control holds focus.
+  done.current_head = false;
+  view.update(CI.project(envelope(data), null, 1002));
+  assert.equal(view.historyList.contains(button), true);
+  assert.equal(view.historyOpen, true); assert.equal(view.historyList.hidden, false); assert.equal(view.historyToggle.attrs["aria-expanded"], "true");
+  assert.equal(document.activeElement, button);
+  // Without focus inside it, a run moving into history leaves the disclosure as the operator set it.
+  view.historyOpen = false; view.discloseHistory(); done.current_head = true; view.update(CI.project(envelope(data), null, 1003));
+  view.summary.focus(); done.current_head = false; view.update(CI.project(envelope(data), null, 1004));
+  assert.equal(view.historyOpen, false); assert.equal(view.historyList.hidden, true); assert.equal(document.activeElement, view.summary);
 });

@@ -9,6 +9,7 @@ import os
 import sys
 os.environ["COCKPIT_SHARED_APP"] = os.path.abspath("mergepath/cockpit/assets/app.js")
 for command in ([sys.executable, '-B', 'tests/test_cockpit.py'], [sys.executable, '-B', 'tests/test_cockpit_author_budget.py'], ['node', '--test', 'tests/test_cockpit_ui.cjs'],
+                ['node', '--test', 'tests/test_cockpit_layout_ui.cjs'],
                 [sys.executable, '-B', 'tests/test_cockpit_ci.py'],
                 ['node', '--test', 'tests/test_cockpit_ci_ui.cjs'],
                 [sys.executable, '-B', 'tests/test_cockpit_logs.py'],

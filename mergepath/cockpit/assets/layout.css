@@ -1,0 +1,16 @@
+/* Operator-arranged panel order: handles, lift states and the drop indicator reuse shared tokens. */
+.panel-grid{min-width:0}
+.sec-head h2{margin-right:auto}
+.panel-handle{flex:none;align-self:center;order:-1;width:28px;height:32px;margin:0 -8px 0 -6px;padding:0;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--soft);cursor:grab;touch-action:none;display:inline-grid;place-items:center;transition:background var(--t-fast) ease,border-color var(--t-fast) ease,color var(--t-fast) ease}
+.panel-handle::before{content:"";width:10px;height:16px;background-image:radial-gradient(circle,currentColor 1.4px,transparent 1.7px);background-size:5px 5.4px}
+.panel-handle:hover,.panel-handle[aria-pressed=true]{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.panel-handle:active{cursor:grabbing}
+.layout-dragging,.layout-dragging *{cursor:grabbing!important;user-select:none!important;-webkit-user-select:none!important}
+.panel-lifting{opacity:.76;outline:2px dashed var(--accent);outline-offset:3px;box-shadow:0 24px 60px rgba(36,43,45,.18)}
+.ck.dark .panel-lifting{box-shadow:0 24px 60px rgba(0,0,0,.45)}
+.panel-grabbed{outline:2px dashed var(--accent);outline-offset:3px}
+.panel-flip{transition:transform var(--t-med) var(--ease)}
+.drop-indicator{position:fixed;z-index:40;height:3px;border-radius:999px;background:var(--accent);box-shadow:0 0 0 3px var(--accent-soft);pointer-events:none}
+.drop-indicator::before{content:"";position:absolute;left:-4px;top:-4.5px;width:12px;height:12px;border-radius:50%;background:var(--accent)}
+.toolbar-text{display:grid;gap:2px;min-width:0}
+@media (max-width:720px){.panel-handle{width:32px;height:36px;margin-left:-8px}}

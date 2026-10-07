@@ -22,6 +22,7 @@ for subject in scripts/cockpit.sh tests/test_cockpit.sh tests/test_cockpit.py sp
   mergepath/cockpit/inventory.py mergepath/cockpit/scheduler.py mergepath/cockpit/bootstrap.html \
   mergepath/cockpit/bootstrap.js mergepath/cockpit/index.html mergepath/cockpit/assets/cockpit.css \
   mergepath/cockpit/assets/components.js mergepath/cockpit/assets/app.js tests/test_cockpit_ui.cjs \
+  mergepath/cockpit/assets/layout.js mergepath/cockpit/assets/layout.css tests/test_cockpit_layout_ui.cjs \
   mergepath/cockpit/actions.py mergepath/cockpit/assets/actions.js mergepath/cockpit/assets/actions.css \
   mergepath/cockpit/assets/actions_init.js tests/test_cockpit_actions.py tests/test_cockpit_actions_ui.cjs specs/cockpit_actions.md \
   mergepath/cockpit/ci.py \
@@ -61,6 +62,8 @@ node --check mergepath/cockpit/bootstrap.js
 node --check mergepath/cockpit/assets/components.js
 node --check mergepath/cockpit/assets/app.js
 node --check tests/test_cockpit_ui.cjs
+node --check mergepath/cockpit/assets/layout.js
+node --check tests/test_cockpit_layout_ui.cjs
 node --check mergepath/cockpit/assets/actions.js
 node --check mergepath/cockpit/assets/actions_init.js
 node --check tests/test_cockpit_actions_ui.cjs

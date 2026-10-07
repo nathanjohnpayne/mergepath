@@ -34,7 +34,8 @@
         && [null, true, false].includes(row.current_head) && typeof row.actionable === "boolean" && typeof row.superseded === "boolean"
         && typeof row.check_evidence_unknown === "boolean" && [null, "bump", "boulder"].includes(row.severity)
         && (row.reason === null || typeof row.reason === "string") && [row.created_at, row.started_at, row.updated_at].every(epoch)
-        && row.jobs_scope === (checksOnly ? "none" : "all-attempts") && Array.isArray(row.jobs) && Array.isArray(row.checks) && Array.isArray(row.diagnostics)
+        && (checksOnly ? row.jobs_scope === "none" : row.jobs_scope === "all-attempts" || row.jobs_scope === "not-fetched" && Array.isArray(row.jobs) && row.jobs.length === 0)
+        && Array.isArray(row.jobs) && Array.isArray(row.checks) && Array.isArray(row.diagnostics)
         && (!checksOnly || row.jobs.length === 0 && (row.checks.length > 0 || row.current_head === true && row.pr !== null
           && row.status === "unknown" && row.conclusion === null && row.check_evidence_unknown && !row.actionable
           && !row.superseded && row.severity === null && row.diagnostics.length === 0))
@@ -151,8 +152,9 @@
       this.name.textContent = row.name || "Workflow unknown";
       this.ref.textContent = `${row.repo.split("/")[1]}${row.pr ? ` #${row.pr}` : " · PR unknown"} · ${row.sha.slice(0, 7)}${this.stale ? " · stale" : ""}`;
       this.badge.className = `b b-${C.tone(tone.state)}`; this.badge.textContent = tone.label;
-      const completed = row.status === "completed" ? Math.max(...row.jobs.map(job => job.completed_at ?? -1)) : null;
-      this.duration.textContent = row.kind === "checks" ? `${row.checks.length} checks` : completed === -Infinity || completed === -1 ? "Duration unknown" : elapsed(row.started_at ?? row.created_at, completed, model.now);
+      // A run without fetched job detail ends at its workflow update time.
+      const completed = row.status !== "completed" ? null : row.jobs.length ? Math.max(...row.jobs.map(job => job.completed_at ?? -1)) : row.jobs_scope === "not-fetched" ? row.updated_at ?? -1 : -1;
+      this.duration.textContent = row.kind === "checks" ? `${row.checks.length} checks` : completed === -1 ? "Duration unknown" : elapsed(row.started_at ?? row.created_at, completed, model.now);
       if (row.kind !== "checks" && row.status !== "in_progress" && row.status !== "completed") this.duration.textContent = `queued ${elapsed(row.created_at, null, model.now)}`;
       while (this.pips.children.length > row.jobs.length) this.pips.lastChild.remove();
       row.jobs.forEach((job, index) => {
@@ -160,7 +162,7 @@
         pip.className = `ci-pip ci-pip-${stepTone(job)}`; pip.setAttribute("aria-label", `${job.name}: ${job.conclusion ?? job.status}`);
       });
       this.flag.hidden = !row.actionable && !row.check_evidence_unknown && !row.superseded && !row.diagnostics.length;
-      this.reason.textContent = row.reason ?? (row.superseded ? "Failed history superseded by a matching later pass." : row.check_evidence_unknown ? "Failed run; current-check evidence unavailable." : "Observed diagnostics");
+      this.reason.textContent = row.reason ?? (row.superseded ? "Failed history superseded by a later run of the same checks." : row.check_evidence_unknown ? "Failed run; current-check evidence unavailable." : "Check-run diagnostics observed · expand the run to read them.");
       this.command.hidden = row.rerun_command === null; this.command.textContent = row.rerun_command ?? "";
       const wanted = new Set(row.jobs.map(job => job.id));
       for (const [id, view] of this.jobs) if (!wanted.has(id)) {view.root.remove(); this.jobs.delete(id);}
@@ -197,7 +199,8 @@
         }
       }
       if (!this.empty) {this.empty = element("p", "ci-empty"); this.body.append(this.empty);}
-      this.empty.textContent = row.kind === "checks" ? row.checks.length === 0 ? "No workflow or check runs observed for this open HEAD." : "No observed Actions job for these checks." : "No jobs observed for this run.";
+      this.empty.textContent = row.kind === "checks" ? row.checks.length === 0 ? "No workflow or check runs observed for this open HEAD." : "No observed Actions job for these checks."
+        : row.jobs_scope === "not-fetched" ? `Job detail is read for live runs, failed runs and open-PR heads; this completed ${row.conclusion === "success" ? "success" : "run"} keeps its workflow result only.` : "No jobs observed for this run.";
       this.empty.hidden = row.jobs.length > 0;
       if (!this.checks) {this.checks = element("div", "ci-job ci-diagnostics mono"); this.body.append(this.checks);}
       this.checks.hidden = row.kind !== "checks";
@@ -231,20 +234,40 @@
       finally {if (this.requests.get(key) === request) {this.requests.delete(key); view.button.setAttribute("aria-busy", "false");}}
     }
   }
+  // Runs the operator is waiting on stay in the main list; every other completed run is history.
+  function attention(row) {
+    return live.includes(row.status) || row.actionable === true || row.current_head === true || failures.includes(row.conclusion) || row.kind === "checks";
+  }
   class CIView {
     constructor(parent, fetcher = (...args) => fetch(...args)) {
-      this.parent = parent; this.fetch = fetcher; this.rows = new Map(); this.open = null;
+      this.parent = parent; this.fetch = fetcher; this.rows = new Map(); this.open = null; this.historyOpen = false;
       this.summary = element("p", "ci-summary"); this.notes = element("p", "sub ci-notes"); this.list = element("div", "ci-list"); this.empty = element("p", "ci-empty");
+      // Completed runs off every open head sit behind a counted disclosure, so sweep-heavy
+      // repositories do not turn the panel into hundreds of passed runs.
+      this.history = element("div", "ci-history"); this.history.hidden = true;
+      this.historyToggle = element("button", "ci-history-toggle"); this.historyToggle.type = "button";
+      this.historyList = element("div", "ci-list ci-history-list"); this.historyList.id = "ci-history-runs"; this.historyList.hidden = true;
+      this.historyToggle.setAttribute("aria-controls", this.historyList.id); this.historyToggle.setAttribute("aria-expanded", "false");
+      this.historyToggle.addEventListener("click", () => {this.historyOpen = !this.historyOpen; this.discloseHistory();});
+      this.history.append(this.historyToggle, this.historyList);
       this.mount(parent);
     }
     mount(parent) {
       this.parent = parent; parent.textContent = "";
-      parent.append(this.summary, this.notes, this.list, this.empty);
+      parent.append(this.summary, this.notes, this.list, this.history, this.empty);
+    }
+    discloseHistory() {
+      const count = this.historyList.children.length;
+      // Hiding an emptied history must not strand focus on its toggle: move it to the summary first.
+      if (count === 0 && this.history.contains(document.activeElement)) {this.summary.tabIndex = -1; this.summary.focus();}
+      this.history.hidden = count === 0; this.historyList.hidden = !this.historyOpen;
+      this.historyToggle.setAttribute("aria-expanded", String(this.historyOpen));
+      this.historyToggle.textContent = `${count} completed ${count === 1 ? "run" : "runs"} off open heads · ${this.historyOpen ? "hide" : "show"}`;
     }
     toggle(key) {this.open = this.open === key ? null : key; for (const [id, view] of this.rows) view.disclose(id === this.open);}
     update(model) {
       this.summary.textContent = model.label;
-      this.notes.textContent = `Last ${elapsed(0, model.recentSeconds, 0)} + all active runs · Jobs across observed attempts · ` + model.repositories.map(o => `${o.repo.split("/")[1]}: ${o.observed_at === null ? "unavailable, never observed" : `${C.ageLabel(model.now - o.observed_at)}${o.stale || model.sourceStale ? " · stale" : ""}`}${o.error ? ` · ${o.error}` : ""}`).join(" · ");
+      this.notes.textContent = `Last ${elapsed(0, model.recentSeconds, 0)} + all active runs · Job detail for live, failed and open-HEAD runs · ` + model.repositories.map(o => `${o.repo.split("/")[1]}: ${o.observed_at === null ? "unavailable, never observed" : `${C.ageLabel(model.now - o.observed_at)}${o.stale || model.sourceStale ? " · stale" : ""}`}${o.error ? ` · ${o.error}` : ""}`).join(" · ");
       const wanted = new Set(model.rows.map(row => row.key));
       for (const [key, view] of this.rows) if (!wanted.has(key)) {
         const focused = view.root.contains(document.activeElement); view.abort(); view.root.remove(); this.rows.delete(key);
@@ -252,11 +275,21 @@
         if (focused) this.summary.focus();
       }
       this.summary.tabIndex = -1;
+      const focus = document.activeElement;
+      let primary = 0, history = 0;
       for (const row of model.rows) {
         let view = this.rows.get(row.key);
-        if (!view) {view = new RunView(this, row); this.rows.set(row.key, view); this.list.append(view.root);}
+        if (!view) {view = new RunView(this, row); this.rows.set(row.key, view);}
         view.update(row, model.repositories.find(o => o.repo === row.repo), model);
+        // Keyed nodes keep their disclosure state while they move between the two lists.
+        const target = attention(row) ? this.list : this.historyList, index = target === this.list ? primary++ : history++;
+        if (target.children[index] !== view.root) target.insertBefore(view.root, target.children[index] || null);
       }
+      // A focused run that moves into collapsed history reveals it: focus cannot return into a hidden list.
+      if (focus && !this.historyOpen && this.historyList.contains(focus)) this.historyOpen = true;
+      this.discloseHistory();
+      // A browser drops focus when a focused node moves; restore it only then, never over an explicit focus change.
+      if (focus && focus !== document.body && focus.isConnected !== false && this.parent.contains(focus) && (document.activeElement === null || document.activeElement === document.body)) focus.focus({preventScroll: true});
       this.empty.hidden = model.rows.length > 0;
       this.empty.textContent = model.stale ? "No usable run rows · observations stale or unavailable." : "No recent workflow runs observed.";
     }
@@ -269,5 +302,5 @@
       view.update(model);
     };
   }
-  return {validate, project, runTone, elapsed, excerptURL, excerptText, CIView, renderer};
+  return {validate, project, runTone, attention, elapsed, excerptURL, excerptText, CIView, renderer};
 });

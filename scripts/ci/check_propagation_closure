@@ -212,6 +212,8 @@ ALLOW_LIST=(
   "specs/cockpit_agents.md"
   "tests/test_cockpit_live_agents.py"
   "tests/test_cockpit_live_agents_ui.cjs"
+  # Cockpit panel layout (#1814): reorderable panels (hub-only, like the other Cockpit suites)
+  "tests/test_cockpit_layout_ui.cjs"
   "specs/cockpit_live_agents.md"
   # The propagation engine itself + its project-doc-mirror sibling.
   # scripts/sync-to-downstream.sh is the orchestrator — explicitly NEVER

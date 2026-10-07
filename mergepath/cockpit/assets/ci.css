@@ -25,6 +25,9 @@
 .ci-log{grid-column:1 / -1;max-width:100%;margin:6px 0;padding:12px;border-radius:10px;background:var(--ink);color:var(--panel-strong);font:11.5px var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
 .ci-diagnostics{white-space:pre-wrap;font-size:12px;color:var(--soft);overflow-wrap:anywhere}
 .ci-empty{border:1px dashed var(--line-strong);border-radius:10px;padding:12px;font-size:12px;color:var(--soft)}
+.ci-history{display:grid;gap:8px;margin-top:10px;min-width:0}
+.ci-history-toggle{justify-self:start;background:transparent;border:0;padding:2px 0;color:var(--ink);text-decoration:underline;text-underline-offset:3px;min-height:32px;font-size:11.5px}
+.ci-history-list{max-height:560px;overflow:auto;padding-right:2px}
 .ci-fail{display:inline-block;width:12px;height:12px;border-radius:2px;background:var(--boulder);position:relative}
 .ci-fail::after{content:"×";color:white;position:absolute;inset:0;text-align:center;font:bold 12px/11px var(--sans)}
 .ci-run [hidden]{display:none!important}

@@ -469,25 +469,63 @@ class ActionsTests(unittest.TestCase):
         self.assertTrue(following['jammed']); self.assertEqual(following['jam_since'], proven['jam_since'])
         self.assertTrue(all('/settings/billing/' in url for url in reads))
 
+    def test_ci_cadence_spacing_establishes_jam_within_the_ci_observation_gap(self):
+        # The CI source renews a repository's observation up to OBSERVATION_GAP apart (#1815
+        # Phase 4b): 125-second spacing must still prove continuity for an injected snapshot.
+        from mergepath.cockpit.ci import HOT_INTERVAL, IDLE_INTERVAL, OBSERVATION_GAP, TIMEOUT
+        self.assertGreaterEqual(OBSERVATION_GAP, TIMEOUT + IDLE_INTERVAL + TIMEOUT)
+        self.assertLessEqual(HOT_INTERVAL, IDLE_INTERVAL)
+        for gap, spacing, jammed in ((OBSERVATION_GAP, 125, True), (OBSERVATION_GAP, OBSERVATION_GAP, True),
+                                     (OBSERVATION_GAP, OBSERVATION_GAP + 1, False), (120, 125, False)):
+            with self.subTest(gap=gap, spacing=spacing):
+                current = [NOW]
+                snapshot = lambda repo, now: {'complete': True, 'stale': False, 'observed_at': current[0],
+                    'queued': [run(i, 'queued') for i in range(1, 41)], 'running': [], 'hour': []}
+                p = ActionsProvider(Fake(), [SimpleNamespace(repo=REPO)], clock=lambda: current[0], monotonic=lambda: 0,
+                                    ci_snapshot=snapshot, ci_max_gap=gap)
+                rows = []
+                while current[0] <= NOW + 1800 + spacing:
+                    rows.append(p.fetch(30).data['repositories'][0]); current[0] += spacing
+                self.assertTrue(all(row['available'] for row in rows))
+                self.assertEqual(rows[-1]['jammed'], jammed)
+        # Between scans the injected snapshot ages up to the gap and stays usable; past it, it expires.
+        for age, available in ((OBSERVATION_GAP, True), (OBSERVATION_GAP + 1, False)):
+            p = self.provider(ci_snapshot=lambda repo, now: {'complete': True, 'stale': False, 'observed_at': NOW - age,
+                'queued': [], 'running': [], 'hour': []}, ci_max_gap=OBSERVATION_GAP)
+            self.assertEqual(p.fetch(30).data['repositories'][0]['available'], available)
+        # The launcher's shared reader applies the same gap to the published envelope.
+        from mergepath.cockpit.__main__ import shared_ci_snapshot
+        for age, usable in ((200, True), (OBSERVATION_GAP, True), (OBSERVATION_GAP + 1, False)):
+            envelope = {'stale': False, 'data': {'schema': 'ci/v1', 'recent_seconds': 10800, 'runs': [],
+                'repositories': [{'repo': REPO, 'stale': False, 'error': None, 'observed_at': NOW - age}]}}
+            app = SimpleNamespace(clock=lambda: NOW, panel_snapshot=lambda panel: {'envelope': envelope})
+            self.assertEqual(shared_ci_snapshot(app, REPO, NOW) is not None, usable, age)
+            if age > 120:
+                self.assertIsNone(ci_observation(envelope, REPO, NOW), 'the reader default stays 120 seconds')
+        for bad in (0, -1, True, float('nan'), 3601, '270'):
+            with self.assertRaises(ValueError):
+                self.provider(ci_max_gap=bad)
+
     def test_shared_ci_postcopy_clock_preserves_strict_refusals(self):
         from mergepath.cockpit.__main__ import shared_ci_snapshot
+        from mergepath.cockpit.ci import OBSERVATION_GAP
         for case, observed, stale, coverage in [('future', NOW + .01, False, 86400),
-                ('expired', NOW - 121, False, 86400), ('stale', NOW, True, 86400),
+                ('expired', NOW - OBSERVATION_GAP - 1, False, 86400), ('stale', NOW, True, 86400),
                 ('incomplete', NOW, False, 300)]:
             with self.subTest(case=case):
                 envelope = {'stale': False, 'data': {'schema': 'ci/v1', 'recent_seconds': coverage,
                     'repositories': [{'repo': REPO, 'stale': stale, 'observed_at': observed}], 'runs': []}}
                 app = SimpleNamespace(clock=lambda: NOW, panel_snapshot=lambda panel: {'envelope': envelope})
                 self.assertIsNone(shared_ci_snapshot(app, REPO, NOW - 1))
-                actions = self.provider(ci_snapshot=lambda repo, now: shared_ci_snapshot(app, repo, now))
+                actions = self.provider(ci_snapshot=lambda repo, now: shared_ci_snapshot(app, repo, now), ci_max_gap=OBSERVATION_GAP)
                 row = actions.fetch(30).data['repositories'][0]
                 self.assertFalse(row['available']); self.assertEqual(row['error'], 'source_failed')
                 self.assertTrue(all('/settings/billing/' in path for path, _ in actions.client.calls))
         # The provider's independent second guard must also refuse genuinely
         # future or expired normalized callbacks, rather than clamping their time.
-        for observed in (NOW + .01, NOW - 121):
+        for observed, gap in ((NOW + .01, 120), (NOW - 121, 120), (NOW + .01, OBSERVATION_GAP), (NOW - OBSERVATION_GAP - 1, OBSERVATION_GAP)):
             actions = self.provider(ci_snapshot=lambda repo, now: {'complete': True, 'stale': False,
-                'observed_at': observed, 'queued': [], 'running': [], 'hour': []})
+                'observed_at': observed, 'queued': [], 'running': [], 'hour': []}, ci_max_gap=gap)
             self.assertFalse(actions.fetch(30).data['repositories'][0]['available'])
 
     def test_cycle_configuration_must_match_api_period(self):
