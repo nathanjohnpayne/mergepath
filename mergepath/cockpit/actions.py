@@ -132,10 +132,7 @@ def ci_observation(envelope, repo, now, max_age=120):
     if type(observations) is not list:
         return None
     observation = next((row for row in observations if type(row) is dict and row.get("repo") == repo), None)
-    # The hour's volume needs every run: a repository whose completed history was not listed
-    # cannot certify complete coverage.
     if (not observation or observation.get("stale") is not False or observation.get("error") is not None
-            or observation.get("history_complete") is not True
             or not number(observation.get("observed_at"))
             or not 0 <= now - observation["observed_at"] <= max_age):
         return None

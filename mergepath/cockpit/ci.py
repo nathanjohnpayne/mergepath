@@ -20,8 +20,6 @@ LIVE = frozenset({'queued', 'in_progress', 'waiting', 'pending', 'requested'})
 # sit a timeout, the idle interval and another timeout apart. Consumers of the shared snapshot
 # use OBSERVATION_GAP, which adds scheduler slack, as their freshness and continuity bound.
 HOT_INTERVAL, IDLE_INTERVAL, TIMEOUT = 60, 120, 60
-# Pass-two markers: a repository whose last scan finished (KNOWN) or ran out of time (TAIL).
-KNOWN, TAIL = object(), object()
 OBSERVATION_GAP = TIMEOUT + IDLE_INTERVAL + TIMEOUT + 30
 # Diagnostics of a failed run off every open HEAD are read for the last hour, the window
 # the Actions budget derives installation exhaustion from.
@@ -284,8 +282,6 @@ class CIProvider:
             raise ValueError('invalid_jobs_cache')
         self.jobs_cache = jobs_cache
         self._records, self._failures, self._jobs_cache, self._suite_cache = {}, {}, OrderedDict(), OrderedDict()
-        # Seconds each repository's last scan needed: its duration when it finished, infinity when it ran out.
-        self._needed = {}
 
     def _repo(self, repo, deadline):
         base = '/repos/' + repo
@@ -295,23 +291,8 @@ class CIProvider:
         # unchanged pages revalidate as free 304s; a sliding cutoff defeats every ETag.
         floor = math.floor(max(0, self.clock() - self.recent_seconds) / 3600) * 3600
         cutoff = datetime.datetime.fromtimestamp(floor, datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
-        window = 'created=' + urllib.parse.quote('>=' + cutoff, safe='')
-        queries = ['status=' + status for status in sorted(LIVE)]
-        current = set(heads.values())
-        try:
-            listed, history_complete = self.client.pages(base + '/actions/runs?per_page=100&' + window, collection='workflow_runs',
-                                                         max_pages=self.max_pages, deadline=deadline), True
-        except ClientError as exc:
-            if exc.category != 'page_limit':
-                raise
-            # GitHub returns at most 1,000 runs for a filtered list, and a workflow_run relay cascade
-            # can put more than that in the window. Then only the runs that can inform a verdict are
-            # listed, each completely: failed runs in the window and every run on an open-PR HEAD.
-            # Completed non-failed history off the open heads is not listed and the record says so.
-            listed, history_complete = [], False
-            queries = ([window + '&status=' + status for status in sorted(FAILURES)]
-                       + [window + '&head_sha=' + sha for sha in sorted(current)] + queries)
-        run_by_id = OrderedDict((identity(_row(raw).get('id')), raw) for raw in listed)
+        queries = ['created=' + urllib.parse.quote('>=' + cutoff, safe='')] + ['status=' + status for status in sorted(LIVE)]
+        run_by_id = OrderedDict()
         for query in queries:
             for raw in self.client.pages(base + '/actions/runs?per_page=100&' + query, collection='workflow_runs', max_pages=self.max_pages, deadline=deadline):
                 run_by_id[identity(_row(raw).get('id'))] = raw
@@ -320,6 +301,7 @@ class CIProvider:
         # Any other completed run is history that keeps its workflow result only; at
         # fleet volume detailing every run burns the API budget without informing a
         # verdict.
+        current = set(heads.values())
         detailed = {identity(_row(raw).get('id')) for raw in runs
                     if _row(raw).get('status') != 'completed' or _row(raw).get('conclusion') in FAILURES
                     or _sha(_row(raw).get('head_sha')) in current}
@@ -387,63 +369,33 @@ class CIProvider:
         # the first observation of an id stands.
         checks = supersede(list({check['id']: check for check in reversed(checks)}.values())[::-1])
         rows, groups = group_runs(repo, runs, jobs, checks, heads)
-        return rows, groups, _group_check_rows(repo, checks, heads, rows, groups), history_complete
+        return rows, groups, _group_check_rows(repo, checks, heads, rows, groups)
 
     def __call__(self, deadline):
         rows, groups, check_rows, observations = [], [], [], []
         budget_deadline = deadline - .25
         ordered = self.inventory[self._offset:] + self.inventory[:self._offset]
         self._offset = (self._offset + 1) % max(1, len(self.inventory))
-        # Pass one gives every repository a fair share; pass two lends the time left over to the
-        # repositories that ran out of their share or were known to need more than it, in the same
-        # rotated order. In pass two the repositories whose last scan finished (a known, finite need)
-        # go first, smallest need first, and split what is left evenly among themselves (index
-        # KNOWN); the ones whose last scan ran out of time go last and split what then remains (index
-        # TAIL). Time a repository leaves unspent carries forward, so neither a repository that never
-        # finishes nor one whose cost has grown can starve another (#1821 review).
-        work, deferred, waiting, attempted = list(enumerate(ordered)), [], 0, set()
-        while work:
-            index, item = work.pop(0)
+        for item in ordered:
             repo, now = item.repo, self.clock()
             old = self._records.get(repo)
             if old and old['stale'] and old['retry_at'] > now:
                 record = copy.deepcopy(old)
             else:
-                scan_started, share, record = False, budget_deadline, None
+                scan_started = False
                 try:
                     if self.monotonic() >= budget_deadline:
                         raise ClientError('deadline_exceeded')
-                    # Fair share: a repository may first spend an equal share of what remains, so one
-                    # slow repository cannot starve the rest. Time a quick repository leaves unspent
-                    # carries forward, and the last one gets everything left. A repository waiting
-                    # for pass two without having started still counts, so its share stays reserved.
-                    started = self.monotonic()
-                    if index is KNOWN or index is TAIL:
-                        share = started + (budget_deadline - started) / (1 + sum(1 for later, _ in work if later is index))
-                    else:
-                        share = started + (budget_deadline - started) / (len(ordered) - index + waiting)
-                    # A restarted scan walks every run-list page again at nearly full cost (a 304 still
-                    # takes most of the two seconds a fresh page does), so a repository whose last scan
-                    # needed at least this share goes straight to pass two instead of spending it.
-                    if type(index) is int and share < budget_deadline and self._needed.get(repo, 0) >= share - started:
-                        deferred.append(item)
-                        waiting += 1
-                    else:
-                        scan_started, first_attempt = True, repo not in attempted
-                        attempted.add(repo)
-                        repo_rows, repo_groups, repo_checks, history_complete = self._repo(repo, share)
-                        self._needed[repo] = self.monotonic() - started
-                        record = {'repo': repo, 'observed_at': self.clock(), 'attempted_at': now,
-                                  'stale': False, 'error': None, 'retry_at': None, 'history_complete': history_complete,
-                                  'runs': repo_rows, 'groups': repo_groups, 'check_rows': repo_checks}
-                        self._failures[repo] = 0
+                    scan_started = True
+                    repo_rows, repo_groups, repo_checks = self._repo(repo, budget_deadline)
+                    record = {'repo': repo, 'observed_at': self.clock(), 'attempted_at': now,
+                              'stale': False, 'error': None, 'retry_at': None,
+                              'runs': repo_rows, 'groups': repo_groups, 'check_rows': repo_checks}
+                    self._failures[repo] = 0
                 except Exception as exc:
                     category = error_category(exc.category) if isinstance(exc, ClientError) else 'source_failed'
-                    if scan_started and category == 'deadline_exceeded':
-                        self._needed[repo] = math.inf
                     failures = self._failures.get(repo, 0)
-                    # One failure per callback: a retry after running out of a share does not add a second.
-                    if scan_started and first_attempt:
+                    if scan_started:
                         failures += 1
                         self._failures[repo] = failures
                     delay = min(900, 20 * 2 ** min(max(0, failures - 1), 16))
@@ -452,24 +404,15 @@ class CIProvider:
                     retry = now + delay
                     if not math.isfinite(retry):
                         retry = now + 20
-                    record = copy.deepcopy(old) if old else {'repo': repo, 'observed_at': None, 'history_complete': False, 'runs': [], 'groups': [], 'check_rows': []}
+                    record = copy.deepcopy(old) if old else {'repo': repo, 'observed_at': None, 'runs': [], 'groups': [], 'check_rows': []}
                     record.update(attempted_at=now, stale=True, error=category, retry_at=now if category == 'deadline_exceeded' else retry)
-                    if (scan_started and type(index) is int and share < budget_deadline and category == 'deadline_exceeded'
-                            and self.monotonic() < budget_deadline):
-                        deferred.append(item)
-            if record is not None:
-                self._records[repo] = copy.deepcopy(record)
-            if not work:
-                known = sorted((later for later in deferred if math.isfinite(self._needed.get(later.repo, math.inf))),
-                               key=lambda later: self._needed[later.repo])
-                work = [(KNOWN, later) for later in known] + [(TAIL, later) for later in deferred if later not in known]
-                deferred = []
+            self._records[repo] = copy.deepcopy(record)
         for item in self.inventory:
             record = self._records[item.repo]
             rows.extend(copy.deepcopy(record['runs']))
             groups.extend(copy.deepcopy(record['groups']))
             check_rows.extend(copy.deepcopy(record['check_rows']))
-            observations.append({k: record[k] for k in ('repo', 'observed_at', 'attempted_at', 'stale', 'error', 'retry_at', 'history_complete')})
+            observations.append({k: record[k] for k in ('repo', 'observed_at', 'attempted_at', 'stale', 'error', 'retry_at')})
         data = {'schema': 'ci/v1', 'runs': rows, 'groups': groups, 'repositories': observations, 'recent_seconds': self.recent_seconds, 'check_rows': check_rows}
         # Hot means a live run on an open-PR HEAD, the thing an operator is waiting
         # on. Scheduled sweeps and failing repositories keep the idle cadence.

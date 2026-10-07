@@ -1,7 +1,6 @@
 """Hermetic CI provider, supersession and on-demand log attribution tests."""
 
 import copy
-import math
 import datetime
 import json
 import threading
@@ -53,7 +52,7 @@ def model(checks=None, head=SHA):
     rows, groups = group_runs(REPO, [raw_run()], {'10': [normalize_job(raw_job())]}, supersede(checks), {'7': head})
     return {'schema': 'ci/v1', 'recent_seconds': 86400, 'runs': rows, 'groups': groups,
             'repositories': [{'repo': REPO, 'observed_at': 1000, 'attempted_at': 1000,
-                              'stale': False, 'error': None, 'retry_at': None, 'history_complete': True}]}
+                              'stale': False, 'error': None, 'retry_at': None}]}
 
 
 def envelope(data=None, stale=False):
@@ -520,64 +519,6 @@ class ProviderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             CIProvider(Client(), INVENTORY, jobs_cache=0)
 
-    def test_window_beyond_the_page_bound_lists_verdict_runs_completely_and_says_history_is_unlisted(self):
-        # #1817: nathanpaynedotcom held 1,452 runs in three hours, almost all workflow_run relay
-        # successes off the open heads, and GitHub lists at most 1,000 runs for a filtered query.
-        from mergepath.cockpit.actions import ci_observation
-        live = raw_run(12, None, OTHER_SHA); live.update(status='queued', conclusion=None, pull_requests=[])
-        failed = raw_run(13, 'failure', OTHER_SHA); failed['pull_requests'] = []
-        relay = raw_run(14, 'success', OTHER_SHA); relay['pull_requests'] = []
-        on_head = raw_run(15, 'success', SHA)
-        window = 'created=%3E%3D2026-10-06T12%3A00%3A00Z'
-        calls, state = [], {'window': 'page_limit', 'targeted': None}
-        class Client:
-            def pages(self, route, **kwargs):
-                calls.append(route)
-                if '/pulls?' in route: return [{'number': 7, 'head': {'sha': SHA}}]
-                if '/actions/runs?' in route:
-                    query = route.split('/actions/runs?per_page=100&')[1]
-                    if query == window:
-                        if state['window'] != 'complete': raise ClientError(state['window'])
-                        return [live, failed, relay, on_head]
-                    if state['targeted'] == query: raise ClientError('page_limit')
-                    return {window + '&status=failure': [failed], window + '&head_sha=' + SHA: [on_head],
-                            'status=queued': [live]}.get(query, [])
-                if '/jobs?' in route: return [{**raw_job(int(route.split('/runs/')[1].split('/')[0]) * 10, 100), 'conclusion': 'success'}]
-                if '/check-runs?' in route: return []
-                raise AssertionError('unexpected route: ' + route)
-        provider = CIProvider(Client(), INVENTORY, clock=lambda: 1791300000.0, monotonic=lambda: 0)
-        data = provider(5).data
-        runs = [route.split('/actions/runs?per_page=100&')[1] for route in calls if '/actions/runs?' in route]
-        self.assertEqual(runs, [window] + [window + '&status=' + status for status in
-                                           ('action_required', 'failure', 'startup_failure', 'timed_out')]
-                         + [window + '&head_sha=' + SHA] + ['status=' + status for status in
-                                                            ('in_progress', 'pending', 'queued', 'requested', 'waiting')])
-        # Live, failed and open-HEAD runs stay complete and fresh; the relay success off the heads is not listed.
-        self.assertEqual(sorted(row['id'] for row in data['runs']), ['12', '13', '15'])
-        self.assertEqual({key: data['repositories'][0][key] for key in ('stale', 'error', 'history_complete')},
-                         {'stale': False, 'error': None, 'history_complete': False})
-        self.assertTrue(next(row for row in data['runs'] if row['id'] == '13')['check_evidence_unknown'])
-        # The hour's volume needs every run, so the Actions budget refuses this repository.
-        self.assertIsNone(ci_observation({'stale': False, 'data': data}, REPO, data['repositories'][0]['observed_at']))
-        # A verdict query that cannot be listed completely leaves the repository stale, never partial.
-        for query in (window + '&status=timed_out', window + '&head_sha=' + SHA):
-            with self.subTest(query=query):
-                state['targeted'] = query
-                fresh = CIProvider(Client(), INVENTORY, clock=lambda: 1791300000.0, monotonic=lambda: 0)(5).data
-                self.assertEqual((fresh['runs'], fresh['repositories'][0]['error']), ([], 'page_limit'))
-                self.assertIsNone(fresh['repositories'][0]['observed_at'])
-        # A window that fits keeps listing it whole, with no extra queries.
-        state.update(window='complete', targeted=None); calls.clear()
-        data = CIProvider(Client(), INVENTORY, clock=lambda: 1791300000.0, monotonic=lambda: 0)(5).data
-        self.assertEqual(sorted(row['id'] for row in data['runs']), ['12', '13', '14', '15'])
-        self.assertTrue(data['repositories'][0]['history_complete'])
-        self.assertFalse(any('&status=failure' in route or '&head_sha=' in route for route in calls))
-        self.assertIsNotNone(ci_observation({'stale': False, 'data': data}, REPO, data['repositories'][0]['observed_at']))
-        # Any other window failure still fails the repository.
-        state['window'] = 'invalid_next_link'
-        data = CIProvider(Client(), INVENTORY, clock=lambda: 1791300000.0, monotonic=lambda: 0)(5).data
-        self.assertEqual((data['runs'], data['repositories'][0]['error']), ([], 'invalid_next_link'))
-
     def test_unmatched_live_and_unknown_checks_do_not_invent_completed_success(self):
         for status, conclusion, hot, unknown in [('queued', None, True, False), ('in_progress', None, True, False),
                                                 ('completed', None, False, True), ('unknown', None, False, True)]:
@@ -786,10 +727,7 @@ class ProviderTests(unittest.TestCase):
             self.assertIsNone(data['repositories'][0]['observed_at'])
             self.assertNotIn('secret text', json.dumps(data))
 
-    def test_deadline_reserves_publication_shares_it_fairly_and_rotates_repository_priority(self):
-        # #1817: one slow repository cannot starve the rest. Each repository may first spend an equal
-        # share of what remains; unspent time carries forward and the last one gets everything left.
-        # A repository that ran out of its share is retried with whatever time the others left.
+    def test_deadline_reserves_publication_and_rotates_repository_priority(self):
         mono, calls = [0.0], []
         class Client:
             def pages(self, path, *, deadline, **kwargs):
@@ -800,188 +738,16 @@ class ProviderTests(unittest.TestCase):
                 return []
         provider = CIProvider(Client(), INVENTORY + (Repository('other', 'owner/other'),), monotonic=lambda: mono[0], clock=lambda: 1000)
         first = provider(1).data
-        self.assertEqual(calls[0], ('/repos/owner/repo/pulls?state=open&per_page=100', .375))
-        self.assertEqual({deadline for path, deadline in calls if '/owner/other/' in path}, {.75})
-        self.assertEqual([deadline for path, deadline in calls if '/owner/repo/' in path], [.375, .75])
-        self.assertEqual([(o['stale'], o['error']) for o in first['repositories']], [(True, 'deadline_exceeded'), (False, None)])
+        self.assertEqual(calls[0][1], .75)
+        self.assertFalse(any('/owner/other/' in p for p, _ in calls))
+        self.assertTrue(all(o['stale'] for o in first['repositories']))
         mono[0] = 1; calls.clear()
         second = provider(2).data
         self.assertIn('/owner/other/', calls[0][0])
         self.assertFalse(second['repositories'][1]['stale'])
         self.assertEqual(second['repositories'][1]['observed_at'], 1000)
         self.assertTrue(second['repositories'][0]['stale'])
-        self.assertEqual({deadline for path, deadline in calls if '/owner/other/' in path}, {1.375})
-        self.assertEqual([deadline for path, deadline in calls if '/owner/repo/' in path], [1.75])
-
-    def test_repository_that_ran_out_of_its_share_completes_with_the_time_others_left(self):
-        # #1817: a plain equal split left 15 to 20 seconds of a calm scan unused while mergepath
-        # and fiveacross, each needing about 12 seconds, stayed stale behind their 7.5-second shares.
-        mono, calls = [0.0], []
-        class Client:
-            def pages(self, path, *, deadline, **kwargs):
-                calls.append((path, deadline))
-                if path.startswith('/repos/owner/repo/pulls'):
-                    if deadline - mono[0] < .5:
-                        mono[0] = deadline
-                        raise ClientError('deadline_exceeded')
-                    mono[0] += .5
-                return []
-        provider = CIProvider(Client(), INVENTORY + (Repository('other', 'owner/other'), Repository('third', 'owner/third')),
-                              monotonic=lambda: mono[0], clock=lambda: 1000)
-        data = provider(1.25).data
-        deadlines = [deadline for path, deadline in calls if path.startswith('/repos/owner/repo/pulls')]
-        self.assertEqual(len(deadlines), 2); self.assertAlmostEqual(deadlines[0], 1 / 3); self.assertEqual(deadlines[1], 1.0)
-        self.assertEqual([(o['stale'], o['error']) for o in data['repositories']], [(False, None)] * 3)
-        # The other repositories were scanned once each, inside their own shares.
-        self.assertEqual(sum(path.startswith('/repos/owner/other/pulls') for path, _ in calls), 1)
-        self.assertEqual(sum(path.startswith('/repos/owner/third/pulls') for path, _ in calls), 1)
-        # Its last scan needed .5 seconds, more than its next share, so it waits for pass two without
-        # spending that share; failing there is its one failure this callback, counted once.
-        mono[0] = 10; calls.clear(); provider._offset = 0
-        data = provider(10.6).data
-        self.assertEqual([deadline for path, deadline in calls if path.startswith('/repos/owner/repo/pulls')], [10.35])
-        self.assertEqual(provider._failures['owner/repo'], 1)
-        self.assertEqual((data['repositories'][0]['stale'], data['repositories'][0]['error']), (True, 'deadline_exceeded'))
-        # A retry is never deferred again, even when its failure leaves budget unspent.
-        attempts = []
-        class Instant:
-            def pages(self, path, *, deadline, **kwargs):
-                if path.startswith('/repos/owner/repo/'):
-                    attempts.append(deadline)
-                    if len(attempts) > 2:
-                        raise AssertionError('deferred twice')
-                    raise ClientError('deadline_exceeded')
-                return []
-        data = CIProvider(Instant(), INVENTORY, monotonic=lambda: 0, clock=lambda: 1000)(5).data
-        self.assertEqual(len(attempts), 1, 'the only repository already had the whole budget')
-        attempts.clear()
-        instant = CIProvider(Instant(), INVENTORY + (Repository('other', 'owner/other'),), monotonic=lambda: 0, clock=lambda: 1000)
-        data = instant(5).data
-        self.assertEqual(attempts, [2.375, 4.75])
-        self.assertEqual(data['repositories'][0]['error'], 'deadline_exceeded')
-        # The retry after running out of a share does not count a second failure.
-        self.assertEqual(instant._failures['owner/repo'], 1)
-
-    def test_repository_known_to_need_more_than_its_share_goes_straight_to_pass_two(self):
-        # #1817 review: a restarted scan walks every run-list page again at nearly full cost (a 304
-        # still takes most of the two seconds a fresh page does), so a repository that needs more than
-        # its share and spends it first was stale on every scan that put it early in the rotation,
-        # where one scan of everything in turn kept it fresh. Its last scan's duration now sends it
-        # straight to pass two; only a repository with no such history spends a share it cannot use.
-        mono, walks, cost = [0.0], [], {'repo': 6, 'other': 1}
-        class Client:
-            def pages(self, path, *, deadline, **kwargs):
-                if '/actions/runs?' in path and 'status=' not in path:
-                    repo = path.split('/')[3]
-                    walks.append(repo)
-                    for _ in range(cost[repo]):
-                        if mono[0] + 2 > deadline:
-                            mono[0] = deadline
-                            raise ClientError('deadline_exceeded')
-                        mono[0] += 2
-                return []
-        provider = CIProvider(Client(), INVENTORY + (Repository('other', 'owner/other'),), monotonic=lambda: mono[0], clock=lambda: 1000)
-        stale, spent = [], []
-        for _ in range(6):
-            # The heavy repository comes first every time: the scans where it spent its share.
-            started = mono[0]; walks.clear(); provider._offset = 0
-            data = provider(started + 20.25).data
-            stale.append([o['stale'] for o in data['repositories']]); spent.append(mono[0] - started)
-            if len(stale) > 1:
-                self.assertEqual(walks.count('repo'), 1, 'a repository known to need more than its share never spends it')
-        self.assertEqual(stale, [[True, False]] + [[False, False]] * 5)
-        self.assertEqual(spent, [20.0] + [14.0] * 5)
-        # Once a scan needs less than its share again, the repository takes its share in pass one.
-        cost['repo'] = 1
-        for order in (['other', 'repo'], ['repo', 'other']):
-            walks.clear(); provider._offset = 0
-            data = provider(mono[0] + 20.25).data
-            self.assertEqual(walks, order)
-            self.assertEqual([o['stale'] for o in data['repositories']], [False, False])
-
-    def test_repository_waiting_for_pass_two_keeps_its_share_reserved(self):
-        # A repository sent straight to pass two still counts when later shares are divided, so a
-        # repository that never finishes cannot take the time it was owed.
-        mono, walks = [0.0], []
-        class Client:
-            def pages(self, path, *, deadline, **kwargs):
-                if '/actions/runs?' in path and 'status=' not in path:
-                    repo = path.split('/')[3]
-                    walks.append(repo)
-                    for _ in range({'repo': 9, 'slow': 100, 'third': 0}[repo]):
-                        if mono[0] + 1 > deadline:
-                            mono[0] = deadline
-                            raise ClientError('deadline_exceeded')
-                        mono[0] += 1
-                return []
-        provider = CIProvider(Client(), INVENTORY + (Repository('slow', 'owner/slow'), Repository('third', 'owner/third')),
-                              monotonic=lambda: mono[0], clock=lambda: 1000)
-        provider._needed['owner/repo'] = 9  # as its last scan measured: more than its five-second share
-        data = provider(15.25).data
-        self.assertEqual([(o['repo'], o['stale']) for o in data['repositories']],
-                         [('owner/repo', False), ('owner/slow', True), ('owner/third', False)])
-        self.assertEqual(walks, ['slow', 'third', 'repo', 'slow'])
-
-    def test_pass_two_cannot_let_a_repository_that_never_finishes_starve_the_others(self):
-        # #1821 review (Codex P1): pass two gave each deferred repository everything left, so a
-        # repository that never finishes, first in the rotation, left every later deferred repository
-        # stale. A known finite need now goes first with the remainder; repositories that ran out
-        # last time split what remains evenly, and time one leaves unspent carries forward.
-        mono, walks = [0.0], []
-        cost = {'repo': 9, 'slow': 100, 'third': 0}
-        class Client:
-            def pages(self, path, *, deadline, **kwargs):
-                if '/actions/runs?' in path and 'status=' not in path:
-                    repo = path.split('/')[3]
-                    walks.append(repo)
-                    for _ in range(cost[repo]):
-                        if mono[0] + 1 > deadline:
-                            mono[0] = deadline
-                            raise ClientError('deadline_exceeded')
-                        mono[0] += 1
-                return []
-        inventory = (Repository('slow', 'owner/slow'),) + INVENTORY + (Repository('third', 'owner/third'),)
-        for label, needed, order, end in (('known need', 9, ['third', 'repo', 'slow'], 20.0),
-                                          ('ran out last time', math.inf, ['third', 'slow', 'repo'], 19.0)):
-            with self.subTest(case=label):
-                mono[0] = 0.0; walks.clear()
-                provider = CIProvider(Client(), inventory, monotonic=lambda: mono[0], clock=lambda: 1000)
-                provider._needed.update({'owner/slow': math.inf, 'owner/repo': needed})
-                data = provider(20.25).data
-                stale = {o['repo']: o['stale'] for o in data['repositories']}
-                self.assertEqual(stale, {'owner/slow': True, 'owner/repo': False, 'owner/third': False})
-                # Both wait for pass two. A known need runs first with everything left and the slow
-                # repository gets the rest; two that ran out split it, and the slow one, first in the
-                # rotation, spends only its half (ten seconds) before the other finishes.
-                self.assertEqual(walks, order); self.assertAlmostEqual(mono[0], end)
-
-    def test_pass_two_splits_known_needs_so_a_grown_cost_cannot_starve_a_quicker_repository(self):
-        # #1821 review (second Codex P1): a repository last measured at 9 seconds that now never
-        # finishes, first in the rotation, took the whole second-pass remainder before a repository
-        # that needs 5 seconds. Known needs now run smallest first and split the remainder evenly.
-        mono, walks = [0.0], []
-        cost = {'repo': 100, 'other': 5, 'third': 0}
-        class Client:
-            def pages(self, path, *, deadline, **kwargs):
-                if '/actions/runs?' in path and 'status=' not in path:
-                    repo = path.split('/')[3]
-                    walks.append((repo, mono[0], deadline))
-                    for _ in range(cost[repo]):
-                        if mono[0] + 1 > deadline:
-                            mono[0] = deadline
-                            raise ClientError('deadline_exceeded')
-                        mono[0] += 1
-                return []
-        inventory = INVENTORY + (Repository('other', 'owner/other'), Repository('third', 'owner/third'))
-        provider = CIProvider(Client(), inventory, monotonic=lambda: mono[0], clock=lambda: 1000)
-        provider._needed.update({'owner/repo': 9, 'owner/other': 7})
-        data = provider(20.25).data
-        self.assertEqual({o['repo']: o['stale'] for o in data['repositories']},
-                         {'owner/repo': True, 'owner/other': False, 'owner/third': False})
-        # Both wait for pass two; the smaller known need runs first with half of the twenty seconds
-        # left and finishes, and the grown repository then gets everything it left.
-        self.assertEqual([(repo, start, end) for repo, start, end in walks], [('third', 0.0, 20.0 / 3), ('other', 0.0, 10.0), ('repo', 5.0, 20.0)])
-        self.assertEqual(provider._needed['owner/repo'], math.inf)
+        self.assertTrue(all(deadline == 1.75 for _, deadline in calls))
 
     def test_running_to_conclusion_on_same_run_identity(self):
         raw = raw_run(); raw['status'] = 'in_progress'; raw['conclusion'] = None

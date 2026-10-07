@@ -327,7 +327,7 @@ class ActionsTests(unittest.TestCase):
 
     def test_ci_read_only_all_repo_complete_and_dedup(self):
         row={'id':'2','repo':REPO,'created_at':NOW,'status':'queued','conclusion':None,'checks':[]}
-        envelope={'stale':False,'data':{'schema':'ci/v1','recent_seconds':86400,'repositories':[{'repo':REPO,'stale':False,'observed_at':NOW,'history_complete':True}],'runs':[row,row.copy()]}}
+        envelope={'stale':False,'data':{'schema':'ci/v1','recent_seconds':86400,'repositories':[{'repo':REPO,'stale':False,'observed_at':NOW}],'runs':[row,row.copy()]}}
         value=ci_observation(envelope,REPO,NOW)
         self.assertEqual(len(value['queued']),1);self.assertEqual(len(value['hour']),1)
         row.update(conclusion='failure',checks=[{'conclusion':'failure','diagnostic':'API rate limit exceeded for installation 2'}])
@@ -336,12 +336,6 @@ class ActionsTests(unittest.TestCase):
         envelope['data']['repositories'][0]['stale']=True
         self.assertIsNone(ci_observation(envelope,REPO,NOW))
         envelope['data']['repositories'][0]['stale']=False
-        # #1817: a repository whose completed history was not listed cannot certify the hour's volume.
-        for bounded in (False,None):
-            envelope['data']['repositories'][0]['history_complete']=bounded
-            self.assertIsNone(ci_observation(envelope,REPO,NOW))
-        envelope['data']['repositories'][0]['history_complete']=True
-        self.assertIsNotNone(ci_observation(envelope,REPO,NOW))
         envelope['data']['recent_seconds']=300
         self.assertIsNone(ci_observation(envelope,REPO,NOW))
 
@@ -429,7 +423,7 @@ class ActionsTests(unittest.TestCase):
                  'conclusion': None, 'checks': []} for i in range(1, 41)]
         # Only remote acquisition is replaced. Real CIProvider stamps times;
         # real scheduler publication and Application snapshot copying are used.
-        ci._repo = lambda repo, deadline: (rows, [], [], True)
+        ci._repo = lambda repo, deadline: (rows, [], [])
         app.scheduler.register('ci', ci, hot_interval=1, idle_interval=1, timeout=5)
         app.register_panel('ci', 'ci')
         original_snapshot = app.panel_snapshot
@@ -503,7 +497,7 @@ class ActionsTests(unittest.TestCase):
         from mergepath.cockpit.__main__ import shared_ci_snapshot
         for age, usable in ((200, True), (OBSERVATION_GAP, True), (OBSERVATION_GAP + 1, False)):
             envelope = {'stale': False, 'data': {'schema': 'ci/v1', 'recent_seconds': 10800, 'runs': [],
-                'repositories': [{'repo': REPO, 'stale': False, 'error': None, 'observed_at': NOW - age, 'history_complete': True}]}}
+                'repositories': [{'repo': REPO, 'stale': False, 'error': None, 'observed_at': NOW - age}]}}
             app = SimpleNamespace(clock=lambda: NOW, panel_snapshot=lambda panel: {'envelope': envelope})
             self.assertEqual(shared_ci_snapshot(app, REPO, NOW) is not None, usable, age)
             if age > 120:
@@ -520,7 +514,7 @@ class ActionsTests(unittest.TestCase):
                 ('incomplete', NOW, False, 300)]:
             with self.subTest(case=case):
                 envelope = {'stale': False, 'data': {'schema': 'ci/v1', 'recent_seconds': coverage,
-                    'repositories': [{'repo': REPO, 'stale': stale, 'observed_at': observed, 'history_complete': True}], 'runs': []}}
+                    'repositories': [{'repo': REPO, 'stale': stale, 'observed_at': observed}], 'runs': []}}
                 app = SimpleNamespace(clock=lambda: NOW, panel_snapshot=lambda panel: {'envelope': envelope})
                 self.assertIsNone(shared_ci_snapshot(app, REPO, NOW - 1))
                 actions = self.provider(ci_snapshot=lambda repo, now: shared_ci_snapshot(app, repo, now), ci_max_gap=OBSERVATION_GAP)
