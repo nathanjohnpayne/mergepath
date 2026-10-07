@@ -24,6 +24,7 @@ INSTALLATION = "api rate limit exceeded for installation"
 SCAN_INTERVAL = 120
 SCAN_RUNS = 5
 LOG_READS = 3
+JOB_PAGES = 5
 SCAN_CACHE = 1024
 
 
@@ -250,9 +251,9 @@ class ActionsProvider:
                 key = (repo, raw["id"], attempt)
                 jobs = self._scan_jobs.get(key)
                 if jobs is None:
-                    page = self.client.get(f"/repos/{repo}/actions/runs/{raw['id']}/attempts/{attempt}/jobs?per_page=100",
-                                           deadline=deadline)
-                    rows = page.get("jobs") if type(page) is dict else None
+                    # Every page of the attempt's jobs, bounded: a partial list must never read as clean.
+                    rows = self.client.pages(f"/repos/{repo}/actions/runs/{raw['id']}/attempts/{attempt}/jobs?per_page=100",
+                                             collection="jobs", max_pages=JOB_PAGES, deadline=deadline)
                     if type(rows) is not list:
                         raise ClientError("invalid_page")
                     jobs = [str(job["id"]) for job in rows if type(job) is dict and job.get("conclusion") == "failure"

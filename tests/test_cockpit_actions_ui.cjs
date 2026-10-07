@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const {project,BudgetView,render,install,tokenSummary} = require('../mergepath/cockpit/assets/actions.js');
 const C = require('../mergepath/cockpit/assets/components.js');
-const {PanelRegistry,renderPanelContent}=require('../mergepath/cockpit/assets/app.js');
+const {PanelRegistry,renderPanelContent,headerBudget}=require('../mergepath/cockpit/assets/app.js');
 const now=Date.UTC(2026,9,16,12)/1000, repo='owner/mergepath';
 const cycle=()=>({budget:25,cycle_start:Date.UTC(2026,9,1)/1000,cycle_end:Date.UTC(2026,10,1)/1000});
 const row=(overrides={})=>({repo,available:true,stale:false,observed_at:now,installation_scan:{observed_at:now,error:null},queued:0,running:0,runs_last_hour:2,jammed:false,jam_since:null,estimated_requests:null,measurement:null,installation_runs:[],...overrides});
@@ -206,7 +206,7 @@ test('header token summary names exhausted repositories and never invents exhaus
  const calm=tokenSummary(model(data({repositories:[row(),row({repo:other})]})));
  assert.equal(calm.state,'clear');assert.equal(calm.value,'No exhaustion seen');assert.deepEqual(calm.repos,[]);
  const near=tokenSummary(model(data({repositories:[row({estimated_requests:800,measurement:measured()})]})));
- assert.equal(near.state,'bump');assert.equal(near.value,'Near the limit');
+ assert.equal(near.state,'bump');assert.equal(near.value,'Near the limit · mergepath');assert.match(near.note,/exhaustion not observed/);
  // The log scan does not depend on the CI-derived row: a stale row with a fresh scan is still covered.
  assert.equal(tokenSummary(model(data({repositories:[row({stale:true,available:false})]}))).value,'No exhaustion seen');
  assert.deepEqual(tokenSummary(undefined),{state:'idle',value:'Not observed yet',note:'Actions budget awaiting its first observation'});
@@ -225,4 +225,28 @@ test('the header needs a fresh complete log scan of every repository before it s
  // Exhaustion is shown even when the CI-derived row is stale.
  const hot=tokenSummary(model(data({repositories:[row({stale:true,available:false,installation_runs:['9']})]})));
  assert.equal(hot.state,'boulder');assert.equal(hot.value,'Exhausted · mergepath');
+});
+
+test('an estimate at the limit stays a warning in the header and does not wait for the log scan',()=>{
+ const est=(amount,scan)=>tokenSummary(model(data({repositories:[row({estimated_requests:amount,measurement:{...measured(),requests_per_run:amount/2},installation_scan:scan}),row({repo:'owner/fiveacross'})]})));
+ const at=est(1000,{observed_at:now,error:null});
+ assert.equal(at.state,'boulder');assert.equal(at.value,'At the limit by estimate · mergepath');
+ assert.match(at.note,/^Estimated from measured requests per run · exhaustion not observed · 2 of 2 repositories scanned$/);
+ const partial=est(800,{observed_at:now,error:'incomplete'});
+ assert.equal(partial.state,'bump');assert.equal(partial.value,'Near the limit · mergepath');assert.match(partial.note,/1 of 2 repositories scanned/);
+ // Observed exhaustion still outranks any estimate.
+ const both=tokenSummary(model(data({repositories:[row({estimated_requests:1000,measurement:{...measured(),requests_per_run:500}}),row({repo:'owner/fiveacross',installation_runs:['7']})]})));
+ assert.equal(both.value,'Exhausted · fiveacross');
+});
+test('the header token chip stays fleet-wide while the panels follow the repository filter',()=>{
+ const registry=new PanelRegistry();registry.register('budget','actions',project,render);
+ const other='owner/nathanpaynedotcom';
+ const snapshot={repositories:[{repo},{repo:other}],sources:{actions:{data:data({repositories:[row(),row({repo:other,installation_runs:['9']})]}),stale:false,observed_at:now}}};
+ const filtered=registry.project(snapshot,repo,now);
+ assert.deepEqual(filtered.models.budget.cards.find(card=>card.id==='token').rows.map(r=>r.repo),[repo]);
+ assert.equal(tokenSummary(filtered.models.budget).value,'No exhaustion seen');
+ const header=tokenSummary(headerBudget(registry,snapshot,repo,filtered,now));
+ assert.equal(header.state,'boulder');assert.equal(header.value,'Exhausted · nathanpaynedotcom');
+ const all=registry.project(snapshot,null,now);
+ assert.equal(headerBudget(registry,snapshot,null,all,now),all.models.budget);
 });

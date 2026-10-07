@@ -246,6 +246,11 @@
     note.textContent = `${identity} · ${state} · ${observed === null ? "not observed" : `observed ${C.ageLabel(now - observed)}`} · ${reset === null ? "reset unknown" : reset > now ? `reset ${C.timeLabel({kind: "at", at: reset}, now)}` : "reset passed; awaiting observation"}${account.retry !== null && stale ? ` · retry ${C.timeLabel({kind: "at", at: account.retry}, now)}` : ""}`;
     return account;
   }
+  // The header token chip is fleet-wide: the repository filter narrows panels, never the
+  // exhaustion alarm, so a filtered view re-projects the budget without the filter.
+  function headerBudget(registry, snapshot, selectedRepo, projection, now) {
+    return selectedRepo === null ? projection.models.budget : registry.project(snapshot, null, now).models.budget;
+  }
   function renderPanelContent(parent, model, adapter, placeholder) {
     if (adapter?.render && (model.observed || model.renderable === true)) {
       if (placeholder?.parentNode === parent) placeholder.remove();
@@ -344,7 +349,7 @@
       renderAuthorBudget(authorMeter, $("api-note"), current, now, connection.kind !== "live");
       $("reviewer-api-note").textContent = `${identity} · ${observed === null ? "no header evidence" : `observed ${C.ageLabel(now - observed)}`} · ${reset === null ? "reset unknown" : `reset ${reset > now ? C.timeLabel({kind: "at", at: reset}, now) : "time passed; awaiting headers"}`}`;
       const projection = registry.project(current, selectedRepo, now); renderPanels(projection);
-      renderActionsToken(projection.models.budget);
+      renderActionsToken(headerBudget(registry, current, selectedRepo, projection, now));
       const stale = connection.kind !== "live";
       let hazards = [...projection.hazards.map(hazard => ({...hazard, stale: hazard.stale || stale})), ...accountHazards(current, now, stale)];
       if (["reconnecting", "offline", "session"].includes(connection.kind)) hazards.push({id: "shell-connection", source: "road", section: "road", repo: null,
@@ -389,5 +394,5 @@
   }
   let openSync = () => {};
   let registerPanel = (id, source, project, renderer, options) => registry.register(id, source, project, renderer, options);
-  return {authorAccount, renderAuthorBudget, validSnapshot, liveClockNeedsRender, PanelRegistry, Connection, accountHazards, renderPanelContent, createFleetRefresh, refreshFleet, mount, openSync: repos => openSync(repos), registerPanel: (...args) => registerPanel(...args)};
+  return {authorAccount, renderAuthorBudget, headerBudget, validSnapshot, liveClockNeedsRender, PanelRegistry, Connection, accountHazards, renderPanelContent, createFleetRefresh, refreshFleet, mount, openSync: repos => openSync(repos), registerPanel: (...args) => registerPanel(...args)};
 });

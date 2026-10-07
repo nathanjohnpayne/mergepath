@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from mergepath.cockpit.actions import ActionsProvider, billing_usage, ci_observation, measured_coefficient, run_rows
+from mergepath.cockpit.actions import JOB_PAGES, ActionsProvider, billing_usage, ci_observation, measured_coefficient, run_rows
 from mergepath.cockpit.github import ClientError, GitHubClient, Response, copy_json_tree
 
 NOW = 1791028800  # 2026-10-03 UTC
@@ -484,7 +484,7 @@ class ActionsTests(unittest.TestCase):
                                                                   {'id': 73, 'conclusion': 'failure'}, {'id': 74, 'conclusion': 'failure'}]}
         logs = {'51': b'gh: API rate limit exceeded for installation. If you reach out', '61': b'other failure',
                 '71': b'x', '72': b'x', '73': b'x', '74': b'API rate limit exceeded for installation'}
-        reads, gets, current = [], [], [NOW]
+        reads, gets, current, oversized = [], [], [NOW], set()
         class ScanFake(Fake):
             def get(self, path, *, deadline):
                 if '/settings/billing/' in path:
@@ -492,11 +492,19 @@ class ActionsTests(unittest.TestCase):
                 gets.append(path)
                 if state['error']:
                     raise ClientError(state['error'])
-                if '/jobs?' in path:
-                    run_id, attempt = path.split('/runs/')[1].split('/attempts/')
-                    return {'jobs': jobs[(int(run_id), int(attempt.split('/')[0]))]}
                 assert 'status=failure' in path and 'per_page=5' in path, path
                 return {'workflow_runs': state['runs']}
+            def pages(self, path, *, collection=None, max_pages=10, deadline=None):
+                if '/jobs?' not in path:
+                    return super().pages(path, collection=collection, max_pages=max_pages, deadline=deadline)
+                gets.append(path)
+                # Job lists walk every page under the scan bound; a list past it fails, never truncates.
+                assert (collection, max_pages) == ('jobs', JOB_PAGES), (collection, max_pages)
+                run_id, attempt = path.split('/runs/')[1].split('/attempts/')
+                key = (int(run_id), int(attempt.split('/')[0]))
+                if key in oversized:
+                    raise ClientError('page_limit')
+                return jobs[key]
             def read_job_log(self, repo, job, *, deadline):
                 reads.append(job); return logs[job]
         stale = lambda repo, now: {'complete': True, 'stale': True, 'observed_at': NOW, 'queued': [], 'running': [], 'hour': []}
@@ -540,6 +548,10 @@ class ActionsTests(unittest.TestCase):
         reads.clear(); current[0] += 121; capped = p.fetch(30).data['repositories'][0]
         self.assertEqual(reads, ['131', '132', '133']); self.assertEqual(capped['installation_runs'], ['9'])
         self.assertEqual(capped['installation_scan'], {'observed_at': current[0], 'error': None})
+        # An attempt with more failed jobs than the page bound fails the scan instead of reading as clean.
+        state['runs'] = [{'id': 14, 'run_attempt': 1}]; oversized.add((14, 1)); current[0] += 121
+        big = p.fetch(30).data['repositories'][0]
+        self.assertEqual(big['installation_scan'], {'observed_at': capped['installation_scan']['observed_at'], 'error': 'page_limit'})
         # Without the launcher flag the provider makes no reads beside the snapshot.
         quiet = ScanFake(); gets.clear()
         ActionsProvider(quiet, [SimpleNamespace(repo=REPO)], clock=lambda: NOW, monotonic=lambda: 0, ci_snapshot=stale).fetch(30)

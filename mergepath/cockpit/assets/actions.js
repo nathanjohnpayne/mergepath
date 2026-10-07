@@ -207,11 +207,19 @@
       return {state:"boulder", value:`Exhausted · ${names.join(", ")}`,
         note:`Installation rate limit in run ${runs.join(", ")} · reset unknown · GITHUB_TOKEN, 1,000 requests per hour per repository`, repos:exhausted.map(row => row.repo)};
     }
-    // "No exhaustion seen" needs a fresh, complete failed-job log scan of every repository.
     const scanned = rows.filter(row => row.scanned === true).length, all = scanned === rows.length;
-    const state = !all ? "idle" : token.state === "bump" ? "bump" : "clear";
-    return {state, value: !all ? "Not fully observed" : state === "bump" ? "Near the limit" : "No exhaustion seen",
-      note:`Failed-job logs of the last hour · ${scanned} of ${rows.length} ${rows.length === 1 ? "repository" : "repositories"} scanned`, repos:[]};
+    const coverage = `${scanned} of ${rows.length} ${rows.length === 1 ? "repository" : "repositories"} scanned`;
+    // A fresh measured estimate at the speed bump or the limit is evidence of its own and does
+    // not wait for the log scan; with exhaustion unobserved it stays labelled as an estimate.
+    const estimated = state => rows.filter(row => row.exhausted !== true && row.state === state);
+    const at = estimated("boulder"), near = estimated("bump"), warned = at.length ? at : near;
+    if (warned.length) {
+      return {state: at.length ? "boulder" : "bump", value:`${at.length ? "At the limit by estimate" : "Near the limit"} · ${warned.map(row => row.repo.split("/")[1]).join(", ")}`,
+        note:`Estimated from measured requests per run · exhaustion not observed · ${coverage}`, repos:warned.map(row => row.repo)};
+    }
+    // "No exhaustion seen" needs a fresh, complete failed-job log scan of every repository.
+    return {state: all ? "clear" : "idle", value: all ? "No exhaustion seen" : "Not fully observed",
+      note:`Failed-job logs of the last hour · ${coverage}`, repos:[]};
   }
   function install(app) {app.registerPanel("budget","actions",project,render);}
   return {project,BudgetView,render,install,tokenSummary};
