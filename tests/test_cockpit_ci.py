@@ -646,6 +646,58 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(row['actionable'], ambiguous)
             self.assertEqual(row['checks'][0]['superseded_by'], None if ambiguous else '101')
 
+    def test_open_head_keeps_actions_lineage_after_its_runs_age_past_the_window(self):
+        # #1819: a completed run older than the window leaves the run list while its check-runs stay
+        # on the open HEAD. Lineage comes from the runs listed by head_sha, so a same-run retry still
+        # supersedes the failure; an unrelated failure, another run of the workflow, a run listed on
+        # another SHA and an unlisted run never clear anything.
+        now = [1791300000.0]  # 2026-10-06T15:20:00Z; window cutoff 12:00:00Z
+        def iso(value): return datetime.datetime.fromtimestamp(value, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        aged = now[0] - 5 * 3600
+        retried = raw_run(40, 'success'); retried.update(run_attempt=2, check_suite_id=70, created_at=iso(aged))
+        unrelated = raw_run(41); unrelated.update(workflow_id=8, check_suite_id=71, created_at=iso(aged))
+        independent = raw_run(42, 'success'); independent.update(check_suite_id=72, created_at=iso(aged + 120))
+        elsewhere = {**raw_run(43, 'success', OTHER_SHA), 'check_suite_id': 70, 'created_at': iso(aged)}
+        failed = raw_check(300, 'failure', iso(aged), suite=70)
+        retry = raw_check(301, 'success', iso(aged + 60), suite=70)
+        build = raw_check(302, 'failure', iso(aged), name='build', suite=71)
+        other_run = raw_check(303, 'success', iso(aged + 180), suite=72)
+        cases = (('same-run retry', [retried], [failed, retry], {'300': '301'}, False),
+                 ('retry beside an unrelated failure', [retried, unrelated], [failed, retry, build], {'300': '301', '302': None}, True),
+                 ('another run of the workflow', [retried, independent], [failed, other_run], {'300': None}, True),
+                 ('a run listed on another SHA', [elsewhere], [failed, retry], {'300': None}, True),
+                 ('no run listed for the HEAD', [], [failed, retry], {'300': None}, True))
+        for label, head_runs, head_checks, superseded_by, actionable in cases:
+            with self.subTest(case=label):
+                calls = []
+                class Client:
+                    def pages(self, route, **kwargs):
+                        calls.append({'route': route, **kwargs})
+                        if '/pulls?' in route: return [{'number': 7, 'head': {'sha': SHA}}]
+                        if '/actions/runs?' in route and 'head_sha=' in route: return list(head_runs)
+                        if '/actions/runs?' in route: return []  # every run is older than the window
+                        if '/commits/' + SHA + '/check-runs?filter=all' in route: return [copy.deepcopy(c) for c in head_checks]
+                        raise AssertionError('unexpected route: ' + route)
+                provider = CIProvider(Client(), INVENTORY, clock=lambda: now[0], monotonic=lambda: 0)
+                data = provider(5).data
+                self.assertEqual(data['runs'], [], 'head_sha runs add lineage, not rows')
+                row = next(r for r in data['check_rows'] if r['sha'] == SHA)
+                self.assertEqual({c['id']: c['superseded_by'] for c in row['checks'] if c['conclusion'] == 'failure'}, superseded_by)
+                self.assertEqual(row['actionable'], actionable); self.assertEqual(row['superseded'], not actionable)
+                self.assertEqual(row['severity'], 'bump' if actionable else None)
+                if head_runs == [retried]:
+                    self.assertEqual({c['id']: (c['producer'], c['workflow_run_id']) for c in row['checks']},
+                                     {'300': ('app:1:workflow:9', '40'), '301': ('app:1:workflow:9', '40')})
+                head_reads = [c for c in calls if 'head_sha=' in c['route']]
+                self.assertEqual([c['route'] for c in head_reads], [f'/repos/{REPO}/actions/runs?head_sha={SHA}&per_page=100'])
+                self.assertEqual((head_reads[0]['max_pages'], head_reads[0]['deadline'], head_reads[0]['collection']), (10, 4.75, 'workflow_runs'))
+                # The head_sha URL has no time component, so its ETag survives the hourly cutoff.
+                calls.clear(); now[0] += 3600; provider(5); now[0] -= 3600
+                self.assertEqual([c['route'] for c in calls if 'head_sha=' in c['route']], [f'/repos/{REPO}/actions/runs?head_sha={SHA}&per_page=100'])
+        # A HEAD whose Actions checks are all mapped by the window list reads no head_sha runs.
+        fixture = unmatched_checks_fixture(checks=[raw_check(conclusion='success')])
+        self.assertEqual([c['route'] for c in fixture['calls'] if 'head_sha=' in c['route']], [])
+
     def test_denied_repo_preserves_other_repo_and_prior_age(self):
         now = [1000]
         class Client:
