@@ -146,6 +146,14 @@ Which issue to act on:
 
 The rollup is per-repo: the workflow runs in the repository it is installed in and opens its issues there. Cross-repo aggregation is an explicit non-goal; the per-repo design preserves operator focus on the repo whose context they are currently in.
 
+## Link the issue a pull request resolves
+
+When a pull request resolves an issue, its body names that issue with a closing keyword: `Closes #N` on its own line, one line per issue. An issue number in the title, a `(#N)` suffix, or `Refs #N` mentions the issue without linking it.
+
+The link is what moves the issue on the repository's Project board. The board's *Pull request linked to issue* workflow moves the issue to `In review` when the pull request opens, and the merge closes it, which moves it to `Done`. Without the link the issue sits in `Ready` or `In progress` through the whole review and has to be closed by hand.
+
+Use `Refs #N` instead when the pull request is only part of the work, so the merge does not close an issue that still has work left; move that issue between lanes by hand. What each lane means, and which moves are manual: `scripts/gh-projects/README.md` § Status lanes.
+
 ## PR and issue titles/descriptions: describe the work, not the session
 
 Titles and descriptions — for both pull requests and issues — must describe the final state of the change (what it does and why) for a reader who arrives with no knowledge of the session that produced it.

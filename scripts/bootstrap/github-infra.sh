@@ -14,7 +14,7 @@
 #      both run under the SAME verified author credential, the create
 #      via bootstrap::run_author_gh and the push via
 #      bootstrap::run_author_git.
-#   2. Seed the 19 canonical labels (needs-external-review,
+#   2. Seed the 21 canonical labels (needs-external-review,
 #      needs-human-review, policy-violation, human-hold,
 #      human-action, decision-needed, agent-action, phase-0..4,
 #      size:S/M/L, priority:critical/high/normal/low).
@@ -81,10 +81,15 @@ set -euo pipefail
 # thing. `size:XL` is deliberately absent: it existed in
 # nathanpaynedotcom and was never applied to a single issue.
 #
-# Deliberately NOT seeded: `area:*`, `status:*` and the repo-local
-# `type:*` values. Those are per-repo vocabulary; imposing the hub's
-# nine-area scheme on a repo with four open issues is bureaucracy, not
-# standardization.
+# `status:blocked` is fleet-shared too: blocked is a label, not a board
+# lane, on every repository's board (scripts/gh-projects/README.md §
+# Status lanes), so every repo needs the same label. Byte-identical to
+# mergepath's, like the rest.
+#
+# Deliberately NOT seeded: `area:*`, the other `status:*` values and
+# the repo-local `type:*` values. Those are per-repo vocabulary;
+# imposing the hub's nine-area scheme on a repo with four open issues
+# is bureaucracy, not standardization.
 BOOTSTRAP_LABELS=(
   "needs-external-review|bf0606|External review required before merge"
   "needs-human-review|7057ff|Awaiting human triage or decision"
@@ -106,6 +111,7 @@ BOOTSTRAP_LABELS=(
   "priority:high|D93F0B|Measured live impact, or it blocks a named issue. Cite that evidence in the issue."
   "priority:normal|8B949E|Default. Worth doing; no observed live impact, or it fails in the safe direction."
   "priority:low|D4D8DD|Would not be missed. A candidate for closure at the next audit if still untouched."
+  "status:blocked|6E7781|Cannot proceed until something outside this issue happens. Name what, in the issue."
 )
 
 # 1Password reference for the REVIEWER_ASSIGNMENT_TOKEN PAT (the

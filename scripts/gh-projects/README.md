@@ -23,6 +23,23 @@ eval "$(scripts/op-preflight.sh --agent claude --mode all)"
 export GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT"
 ```
 
+## Status lanes
+
+Every repository's board uses the same five `Status` options, and each one has a single entry rule. The board's built-in workflows make most moves; the rest are the job of whoever is doing the work.
+
+| Status | An item belongs here when | Moved here by |
+|---|---|---|
+| `Backlog` | It is captured but not yet specified well enough to start. | The built-in *Item added to project* workflow. |
+| `Ready` | It is specified well enough that an agent can start without asking questions: the issue states the problem, the expected outcome, and how to verify it. | Whoever triages it, with `move-item.sh`. The built-in *Item reopened* workflow also lands here. |
+| `In progress` | Work has started: a branch exists, but no pull request that resolves it is open. | The agent or human starting the work, with `move-item.sh`. |
+| `In review` | A pull request that resolves it is open and waiting on review or merge gates. | The built-in *Pull request linked to issue* workflow, which fires only when the PR body names the issue with a closing keyword. See [Shared Agent Operating Rules § Link the issue a pull request resolves](../../docs/agents/shared-operating-rules.md#link-the-issue-a-pull-request-resolves). |
+| `Done` | It is closed. | The built-in *Item closed* workflow. |
+
+- **Blocked is a label, not a lane.** Add `status:blocked` and name the blocker in the issue; the item stays in the lane it was in.
+- **Order within a lane comes from the `priority:*` labels.** Moving an item to `Ready` says it can be started, not that it should be next.
+- **Two moves have no workflow.** Starting work (`Ready` to `In progress`) and a resolving pull request closed without merging (the issue stays in `In review`; move it back to `In progress` or `Ready`) are both done by hand.
+- **The workflow targets are set by hand.** The Projects API can neither read nor set which `Status` a built-in workflow assigns, so a new board needs them configured under the board's **⋯ → Workflows**: *Item added to project* → `Backlog`, *Item reopened* → `Ready`, *Pull request linked to issue* → `In review`, *Item closed* → `Done`.
+
 ## Anatomy of a phased initiative
 
 For every initiative you want to track:

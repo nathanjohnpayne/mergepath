@@ -387,7 +387,7 @@ bootstrap::_print_summary() {
         ;;
       github-infra)
         if [ "$in_state" = "1" ]; then
-          done_lines="$done_lines  [done] GitHub repo created ($visibility) + 19 labels attempted + reviewer invites + secrets
+          done_lines="$done_lines  [done] GitHub repo created ($visibility) + 21 labels attempted + reviewer invites + secrets
 "
         else
           skipped_lines="$skipped_lines  [skip] GitHub repo + labels + invites + secrets (not in state file)
@@ -529,10 +529,14 @@ bootstrap::_print_summary() {
     echo "     Canonical PRDs live in nathanjohnpayne/docs/projects/$repo_name/prds/"
     echo "  4. Populate Phase 0 / Phase 1 issues via the create-issues.sh"
     echo "     skeleton: $target/scripts/gh-projects/examples/$repo_name/"
-    echo "  5. Set provider-level spend caps before pasting LLM API keys:"
+    echo "  5. Set the board's built-in workflow targets (board ... > Workflows):"
+    echo "     Item added -> Backlog, Item reopened -> Ready, Pull request"
+    echo "     linked to issue -> In review, Item closed -> Done. The API"
+    echo "     cannot set these. See scripts/gh-projects/README.md § Status lanes."
+    echo "  6. Set provider-level spend caps before pasting LLM API keys:"
     echo "     - https://platform.openai.com/account/limits"
     echo "     - https://console.anthropic.com/settings/limits"
-    echo "  6. Drive Sprint 0 PR #1 through the Phase 4 review flow."
+    echo "  7. Drive Sprint 0 PR #1 through the Phase 4 review flow."
     echo
     echo "DOC: docs/agents/bootstrap-runbook.md (in mergepath) explains every"
     echo "     stage above and how to debug or resume on failure."
