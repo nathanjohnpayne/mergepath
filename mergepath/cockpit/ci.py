@@ -264,6 +264,8 @@ class CIProvider:
             raise ValueError('invalid_jobs_cache')
         self.jobs_cache = jobs_cache
         self._records, self._failures, self._jobs_cache, self._suite_cache = {}, {}, OrderedDict(), OrderedDict()
+        # Seconds each repository's last scan needed: its duration when it finished, infinity when it ran out.
+        self._needed = {}
 
     def _repo(self, repo, deadline):
         base = '/repos/' + repo
@@ -364,8 +366,9 @@ class CIProvider:
         ordered = self.inventory[self._offset:] + self.inventory[:self._offset]
         self._offset = (self._offset + 1) % max(1, len(self.inventory))
         # Pass one gives every repository a fair share; pass two lends the time left over to the
-        # repositories that ran out of their share, in the same rotated order (index None).
-        work, deferred = list(enumerate(ordered)), []
+        # repositories that ran out of their share or were known to need more than it, in the same
+        # rotated order (index None).
+        work, deferred, waiting, attempted = list(enumerate(ordered)), [], 0, set()
         while work:
             index, item = work.pop(0)
             repo, now = item.repo, self.clock()
@@ -373,25 +376,38 @@ class CIProvider:
             if old and old['stale'] and old['retry_at'] > now:
                 record = copy.deepcopy(old)
             else:
-                scan_started, share = False, budget_deadline
+                scan_started, share, record = False, budget_deadline, None
                 try:
                     if self.monotonic() >= budget_deadline:
                         raise ClientError('deadline_exceeded')
-                    scan_started = True
                     # Fair share: a repository may first spend an equal share of what remains, so one
                     # slow repository cannot starve the rest. Time a quick repository leaves unspent
-                    # carries forward, and the last one gets everything left.
+                    # carries forward, and the last one gets everything left. A repository waiting
+                    # for pass two without having started still counts, so its share stays reserved.
                     started = self.monotonic()
-                    share = budget_deadline if index is None else started + (budget_deadline - started) / (len(ordered) - index)
-                    repo_rows, repo_groups, repo_checks, history_complete = self._repo(repo, share)
-                    record = {'repo': repo, 'observed_at': self.clock(), 'attempted_at': now,
-                              'stale': False, 'error': None, 'retry_at': None, 'history_complete': history_complete,
-                              'runs': repo_rows, 'groups': repo_groups, 'check_rows': repo_checks}
-                    self._failures[repo] = 0
+                    share = budget_deadline if index is None else started + (budget_deadline - started) / (len(ordered) - index + waiting)
+                    # A restarted scan walks every run-list page again at nearly full cost (a 304 still
+                    # takes most of the two seconds a fresh page does), so a repository whose last scan
+                    # needed at least this share goes straight to pass two instead of spending it.
+                    if share < budget_deadline and self._needed.get(repo, 0) >= share - started:
+                        deferred.append(item)
+                        waiting += 1
+                    else:
+                        scan_started, first_attempt = True, repo not in attempted
+                        attempted.add(repo)
+                        repo_rows, repo_groups, repo_checks, history_complete = self._repo(repo, share)
+                        self._needed[repo] = self.monotonic() - started
+                        record = {'repo': repo, 'observed_at': self.clock(), 'attempted_at': now,
+                                  'stale': False, 'error': None, 'retry_at': None, 'history_complete': history_complete,
+                                  'runs': repo_rows, 'groups': repo_groups, 'check_rows': repo_checks}
+                        self._failures[repo] = 0
                 except Exception as exc:
                     category = error_category(exc.category) if isinstance(exc, ClientError) else 'source_failed'
+                    if scan_started and category == 'deadline_exceeded':
+                        self._needed[repo] = math.inf
                     failures = self._failures.get(repo, 0)
-                    if scan_started and index is not None:
+                    # One failure per callback: a retry after running out of a share does not add a second.
+                    if scan_started and first_attempt:
                         failures += 1
                         self._failures[repo] = failures
                     delay = min(900, 20 * 2 ** min(max(0, failures - 1), 16))
@@ -404,9 +420,9 @@ class CIProvider:
                     record.update(attempted_at=now, stale=True, error=category, retry_at=now if category == 'deadline_exceeded' else retry)
                     if scan_started and share < budget_deadline and category == 'deadline_exceeded' and self.monotonic() < budget_deadline:
                         deferred.append(item)
-            self._records[repo] = copy.deepcopy(record)
+            if record is not None:
+                self._records[repo] = copy.deepcopy(record)
             if not work:
-                # A deferred repository keeps its completed job lists, suites and pages cached, so its retry repeats less work.
                 work, deferred = [(None, later) for later in deferred], []
         for item in self.inventory:
             record = self._records[item.repo]
