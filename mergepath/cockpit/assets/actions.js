@@ -85,7 +85,8 @@
       const runIds = value => Array.isArray(value) && value.length <= 10000 && value.every(id => typeof id === "string" && /^[1-9][0-9]{0,15}$/.test(id)) ? value : null;
       // CI-derived runs age with the CI row; scan-proven runs age with their own settled scan.
       const scan = row.installation_scan, ciRuns = runIds(row.installation_runs) || [], scanRuns = runIds(scan?.runs) || [];
-      const scanned = num(scan?.observed_at) && scan.error === null && runIds(scan.runs) !== null && now >= scan.observed_at && now - scan.observed_at <= SCAN_FRESH;
+      // A stale scheduler envelope is never fresh coverage, whatever its embedded scan says.
+      const scanned = envelope.stale !== true && num(scan?.observed_at) && scan.error === null && runIds(scan.runs) !== null && now >= scan.observed_at && now - scan.observed_at <= SCAN_FRESH;
       const runs = [...new Set([...ciRuns, ...scanRuns])], hard = runs.length > 0;
       const hardFresh = (good && ciRuns.length > 0) || (scanned && scanRuns.length > 0);
       const measurement = row.measurement;

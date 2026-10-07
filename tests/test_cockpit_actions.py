@@ -481,9 +481,8 @@ class ActionsTests(unittest.TestCase):
         iso = lambda at: dt.datetime.fromtimestamp(at, dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         R = lambda i, attempt=1, created=NOW: {'id': i, 'run_attempt': attempt, 'created_at': iso(created)}
         state = {'runs': [R(5), R(6, 2)], 'error': None}
-        jobs = {(5, 1): [{'id': 51, 'conclusion': 'failure'}, {'id': 52, 'conclusion': 'success'}],
-                (6, 2): [{'id': 61, 'conclusion': 'failure'}], (7, 1): [{'id': 71, 'conclusion': 'failure'}, {'id': 72, 'conclusion': 'failure'},
-                                                                  {'id': 73, 'conclusion': 'failure'}, {'id': 74, 'conclusion': 'failure'}]}
+        jobs = {5: [{'id': 51, 'conclusion': 'failure'}, {'id': 52, 'conclusion': 'success'}],
+                6: [{'id': 61, 'conclusion': 'failure'}], 7: [{'id': i, 'conclusion': 'failure'} for i in (71, 72, 73, 74)]}
         logs = {'51': b'gh: API rate limit exceeded for installation. If you reach out', '61': b'other failure',
                 '71': b'x', '72': b'x', '73': b'x', '74': b'API rate limit exceeded for installation'}
         reads, gets, current, oversized = [], [], [NOW], set()
@@ -500,78 +499,81 @@ class ActionsTests(unittest.TestCase):
                 if '/jobs?' not in path:
                     return super().pages(path, collection=collection, max_pages=max_pages, deadline=deadline)
                 gets.append(path)
-                # Job lists walk every page under the scan bound; a list past it fails, never truncates.
+                # Jobs of every attempt, every page under the scan bound; a longer list fails, never truncates.
+                assert '/attempts/' not in path and 'filter=all' in path, path
                 assert (collection, max_pages) == ('jobs', JOB_PAGES), (collection, max_pages)
-                run_id, attempt = path.split('/runs/')[1].split('/attempts/')
-                key = (int(run_id), int(attempt.split('/')[0]))
-                if key in oversized:
+                run_id = int(path.split('/runs/')[1].split('/')[0])
+                if run_id in oversized:
                     raise ClientError('page_limit')
-                return jobs[key]
+                return jobs[run_id]
             def read_job_log(self, repo, job, *, deadline):
                 reads.append(job); return logs[job]
         stale = lambda repo, now: {'complete': True, 'stale': True, 'observed_at': NOW, 'queued': [], 'running': [], 'hour': []}
         p = ActionsProvider(ScanFake(), [SimpleNamespace(repo=REPO)], clock=lambda: current[0], monotonic=lambda: 0,
                             ci_snapshot=stale, installation_scan=True)
+        scan = lambda: p.fetch(30).data['repositories'][0]['installation_scan']
+        def step(seconds=121):
+            current[0] += seconds; reads.clear(); gets.clear(); return scan()
         row = p.fetch(30).data['repositories'][0]
-        # The CI snapshot is stale, yet the scan still establishes exhaustion for run 5.
-        # Scan runs travel apart from the CI-derived installation_runs, which the stale snapshot lacks.
+        # The CI snapshot is stale, yet the scan still establishes exhaustion for run 5. Scan runs
+        # travel apart from the CI-derived installation_runs, which the stale snapshot lacks.
         self.assertFalse(row['available']); self.assertIn(row.get('installation_runs'), (None, []))
         self.assertEqual(row['installation_scan'], {'observed_at': NOW, 'error': None, 'runs': ['5']})
         # The first logged limit settles the scan, so run 6 is never read.
         self.assertEqual(reads, ['51'])
-        # Within the interval nothing is read again.
-        gets.clear(); reads.clear(); current[0] += 60; p.fetch(30)
-        self.assertEqual((gets, reads), ([], []))
-        # After it, the list is read again but completed jobs and logs come from the cache.
-        current[0] += 61; p.fetch(30)
-        self.assertEqual(len(gets), 1); self.assertEqual(reads, [])
-        # At most three log reads per scan: the scan is incomplete until the rest are read.
-        state['runs'] = [R(7)]; reads.clear(); current[0] += 121
-        partial = p.fetch(30).data['repositories'][0]
-        self.assertEqual(reads, ['71', '72', '73']); self.assertEqual(partial['installation_scan']['error'], 'incomplete')
-        # An incomplete scan is not clean evidence: the last settled runs stand with their time.
-        self.assertEqual(partial['installation_scan']['observed_at'], NOW + 121); self.assertEqual(partial['installation_scan']['runs'], ['5'])
-        current[0] += 121; done = p.fetch(30).data['repositories'][0]
-        self.assertEqual(done['installation_scan'], {'observed_at': current[0], 'error': None, 'runs': ['7']})
+        # Within the interval nothing is read again; after it, jobs and verdicts come from the cache.
+        self.assertEqual((step(60), gets, reads), (row['installation_scan'], [], []))
+        step(61); self.assertEqual((len(gets), reads), (1, []))
+        # At most three log reads per scan. An incomplete scan is not clean evidence: the last
+        # settled runs stand with their time.
+        state['runs'] = [R(7)]; settled = current[0]
+        partial = step()
+        self.assertEqual(reads, ['71', '72', '73']); self.assertEqual(partial, {'observed_at': settled, 'error': 'incomplete', 'runs': ['5']})
+        # A settled scan samples only the newest runs and cannot disprove an earlier proof inside
+        # the hour, so run 5 stands beside run 7, newest first.
+        done = step(); self.assertEqual(done, {'observed_at': current[0], 'error': None, 'runs': ['7', '5']})
         # A failed read keeps the last runs and their observation time, and names the error.
-        state['error'] = 'secondary_limit'; current[0] += 121; failed = p.fetch(30).data['repositories'][0]
-        self.assertEqual(failed['installation_scan'], {'observed_at': done['installation_scan']['observed_at'], 'error': 'secondary_limit', 'runs': ['7']})
+        state['error'] = 'secondary_limit'
+        self.assertEqual(step(), {'observed_at': done['observed_at'], 'error': 'secondary_limit', 'runs': ['7', '5']})
         # An exhausting repository adds fresh failed runs faster than every job could be read
         # (285 in an hour on nathanpaynedotcom): one proven exhaustion is a complete answer even
         # with unread jobs left, while a clean answer still needs every failed job read.
-        state.update(error=None, runs=[R(i) for i in (8, 9, 10, 11, 12)])
-        jobs.update({(i, 1): [{'id': i * 10 + 1, 'conclusion': 'failure'}] for i in (8, 9, 10, 11, 12)})
+        state.update(error=None, runs=[R(i, created=NOW + 600) for i in (8, 9, 10, 11, 12)])
+        jobs.update({i: [{'id': i * 10 + 1, 'conclusion': 'failure'}] for i in (8, 9, 10, 11, 12)})
         logs.update({'81': b'other failure', **{str(i * 10 + 1): b'API rate limit exceeded for installation' for i in (9, 10, 11, 12)}})
-        reads.clear(); current[0] += 121; storm = p.fetch(30).data['repositories'][0]
-        self.assertEqual(reads, ['81', '91'])
-        self.assertEqual(storm['installation_scan'], {'observed_at': current[0], 'error': None, 'runs': ['9']})
-        # The proof settles the scan even when the read cap left earlier jobs unread.
-        state['runs'] = [R(13), R(9)]
-        jobs[(13, 1)] = [{'id': i, 'conclusion': 'failure'} for i in (131, 132, 133, 134)]
+        storm = step(); self.assertEqual(reads, ['81', '91'])
+        self.assertEqual(storm, {'observed_at': current[0], 'error': None, 'runs': ['9', '7', '5']})
+        # A cached proof settles the scan even when the read cap left earlier jobs unread.
+        state['runs'] = [R(13, created=NOW + 600), R(9, created=NOW + 600)]
+        jobs[13] = [{'id': i, 'conclusion': 'failure'} for i in (131, 132, 133, 134)]
         logs.update({str(i): b'x' for i in (131, 132, 133, 134)})
-        reads.clear(); current[0] += 121; capped = p.fetch(30).data['repositories'][0]
-        self.assertEqual(reads, ['131', '132', '133'])
-        self.assertEqual(capped['installation_scan'], {'observed_at': current[0], 'error': None, 'runs': ['9']})
-        # An attempt with more failed jobs than the page bound fails the scan instead of reading as clean.
-        state['runs'] = [R(14)]; oversized.add((14, 1)); current[0] += 121
-        big = p.fetch(30).data['repositories'][0]
-        self.assertEqual(big['installation_scan'], {'observed_at': capped['installation_scan']['observed_at'], 'error': 'page_limit', 'runs': ['9']})
-        # A failed run row that cannot be read fails the scan rather than vanishing from it.
-        for bad_jobs in ([{'conclusion': 'failure'}], [{'id': 0, 'conclusion': 'failure'}], ['x'], [{'id': True, 'conclusion': 'failure'}]):
-            jobs[(16, 1)] = bad_jobs; p._scan_jobs.pop((REPO, 16, 1), None)
-            state['runs'] = [R(16)]; current[0] += 121
-            self.assertEqual(p.fetch(30).data['repositories'][0]['installation_scan']['error'], 'invalid_page', bad_jobs)
+        capped = step(); self.assertEqual(reads, ['131', '132', '133'])
+        self.assertEqual(capped, {'observed_at': current[0], 'error': None, 'runs': ['9', '7', '5']})
+        # The jobs of every attempt are read: an earlier attempt can hold the limit a rerun hides.
+        state['runs'] = [R(19, attempt=2, created=NOW + 600)]
+        jobs[19] = [{'id': 191, 'conclusion': 'failure', 'run_attempt': 1}, {'id': 192, 'conclusion': 'failure', 'run_attempt': 2}]
+        logs.update({'191': b'API rate limit exceeded for installation', '192': b'other failure'})
+        self.assertEqual(step()['runs'][0], '19'); self.assertEqual(reads, ['191'])
+        # An attempt list longer than the page bound fails the scan instead of reading as clean.
+        state['runs'] = [R(14, created=NOW + 600)]; oversized.add(14)
+        big = step(); self.assertEqual(big['error'], 'page_limit'); self.assertEqual(big['runs'][0], '19')
+        # A failed job row that cannot be read fails the scan rather than vanishing from it.
+        for index, bad_jobs in enumerate(([{'conclusion': 'failure'}], [{'id': 0, 'conclusion': 'failure'}], ['x'],
+                                          [{'id': True, 'conclusion': 'failure'}])):
+            jobs[160 + index] = bad_jobs; state['runs'] = [R(160 + index, created=NOW + 600)]
+            self.assertEqual(step()['error'], 'invalid_page', bad_jobs)
         # A listed run needs a zoned creation time.
         for created in (None, '2026-10-03T00:00:00', 'soon'):
-            state['runs'] = [{'id': 17, 'run_attempt': 1, 'created_at': created}]; current[0] += 121
-            self.assertEqual(p.fetch(30).data['repositories'][0]['installation_scan']['error'], 'invalid_page', created)
-        # The coarse URL cutoff admits up to five extra minutes; evidence is the exact last hour.
-        current[0] += 121; jobs[(18, 1)] = [{'id': 181, 'conclusion': 'failure'}]; logs['181'] = b'API rate limit exceeded for installation'
-        state['runs'] = [R(18, created=current[0] - 3601)]; gets.clear(); reads.clear()
-        old = p.fetch(30).data['repositories'][0]['installation_scan']
-        self.assertEqual(old, {'observed_at': current[0], 'error': None, 'runs': []}); self.assertEqual(reads, []); self.assertEqual(len(gets), 1)
-        state['runs'] = [R(18, created=current[0] + 121 - 3600)]; current[0] += 121
-        self.assertEqual(p.fetch(30).data['repositories'][0]['installation_scan']['runs'], ['18'])
+            state['runs'] = [{'id': 17, 'run_attempt': 1, 'created_at': created}]
+            self.assertEqual(step()['error'], 'invalid_page', created)
+        # Evidence is the exact last hour: the coarse URL cutoff admits up to five extra minutes,
+        # and a settled scan drops proofs whose runs have left the hour.
+        jobs[18] = [{'id': 181, 'conclusion': 'failure'}]; logs['181'] = b'API rate limit exceeded for installation'
+        current[0] = NOW + 600 + 3601; state['runs'] = [R(18, created=current[0] + 121 - 3601)]
+        aged = step(); self.assertEqual(reads, []); self.assertEqual(len(gets), 1)
+        self.assertEqual(aged, {'observed_at': current[0], 'error': None, 'runs': []})
+        state['runs'] = [R(18, created=current[0] + 121 - 3600)]
+        self.assertEqual(step()['runs'], ['18']); self.assertEqual(reads, ['181'])
         # Without the launcher flag the provider makes no reads beside the snapshot.
         quiet = ScanFake(); gets.clear()
         ActionsProvider(quiet, [SimpleNamespace(repo=REPO)], clock=lambda: NOW, monotonic=lambda: 0, ci_snapshot=stale).fetch(30)

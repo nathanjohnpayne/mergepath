@@ -280,3 +280,11 @@ test('the display clock re-renders when a scan or a CI row ages across its bound
  assert.equal(tokenSummary(model(d,false,null,now+280)).value,'No exhaustion seen');
  assert.equal(tokenSummary(model(d,false,null,now+281)).value,'Not fully observed');
 });
+test('a stale scheduler envelope is never fresh scan coverage',()=>{
+ const d=data({repositories:[row(),row({repo:'owner/fiveacross'})]});
+ assert.equal(tokenSummary(model(d,false)).value,'No exhaustion seen');
+ const stale=tokenSummary(model(d,true));assert.equal(stale.value,'Not fully observed');assert.match(stale.note,/0 of 2 repositories scanned/);
+ // Retained scan proofs in a stale envelope read last known.
+ const proof=model(data({repositories:[row({installation_scan:{observed_at:now,error:null,runs:['9']}})]}),true);
+ assert.equal(proof.hazards[0].stale,true);assert.match(tokenSummary(proof).note,/^Last known: installation/);
+});

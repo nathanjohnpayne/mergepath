@@ -233,14 +233,17 @@ class ActionsProvider:
         complete answer, and an exhausting repository adds fresh failed runs faster than every
         job could be read. Only a clean answer needs every failed job read; a scan that could
         not read them all reports `incomplete` and keeps the last complete observation time. A
-        failed read keeps the previous runs. Nothing here is estimated: only the logged
+        settled scan samples only the newest runs, so a proof stands until its run leaves the
+        hour. A failed read keeps the previous runs. Nothing here is estimated: only the logged
         installation-limit message establishes exhaustion.
         """
         last = self._scans.get(repo)
         if last is not None and 0 <= now - last["attempted_at"] < SCAN_INTERVAL:
             return last
+        # Proofs map an exhausted run id to its creation time; they hold for the hour after it.
+        proofs = dict(last["proofs"]) if last else {}
         state = {"attempted_at": now, "observed_at": last["observed_at"] if last else None,
-                 "error": None, "runs": list(last["runs"]) if last else []}
+                 "error": None, "runs": list(last["runs"]) if last else [], "proofs": proofs}
         try:
             # The cutoff is floored to five minutes so the list URL revalidates as a free 304.
             cutoff = dt.datetime.fromtimestamp((now - 3600) // 300 * 300, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -267,8 +270,9 @@ class ActionsProvider:
                 key = (repo, raw["id"], attempt)
                 jobs = self._scan_jobs.get(key)
                 if jobs is None:
-                    # Every page of the attempt's jobs, bounded: a partial list must never read as clean.
-                    rows = self.client.pages(f"/repos/{repo}/actions/runs/{raw['id']}/attempts/{attempt}/jobs?per_page=100",
+                    # Every page of the jobs of every attempt so far, bounded: an earlier attempt can hold
+                    # the limit a later rerun hides, and a partial list must never read as clean.
+                    rows = self.client.pages(f"/repos/{repo}/actions/runs/{raw['id']}/jobs?filter=all&per_page=100",
                                              collection="jobs", max_pages=JOB_PAGES, deadline=deadline)
                     # An unreadable row could be a failed job, so it fails the scan rather than vanishing.
                     if type(rows) is not list or any(type(job) is not dict or not count(job.get("id")) or job["id"] == 0
@@ -288,10 +292,15 @@ class ActionsProvider:
                         verdict = INSTALLATION in text.casefold()
                         self._remember(self._scan_logs, (repo, job), verdict)
                     if verdict:
-                        exhausted.append(str(raw["id"]))
+                        exhausted.append((str(raw["id"]), created))
                         break
             if complete or exhausted:
-                state["runs"], state["observed_at"] = exhausted, now
+                # A settled scan samples only the newest runs, so it cannot disprove an earlier proof:
+                # proofs stand until their run leaves the hour, and the newest are listed first.
+                proofs = {run: at for run, at in proofs.items() if at >= now - 3600}
+                proofs.update(exhausted)
+                state["proofs"], state["observed_at"] = proofs, now
+                state["runs"] = sorted(proofs, key=lambda run: (proofs[run], int(run)), reverse=True)
             else:
                 # Not clean evidence: the last settled runs stand until a settled scan replaces them.
                 state["error"] = "incomplete"
