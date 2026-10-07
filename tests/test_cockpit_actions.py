@@ -469,6 +469,64 @@ class ActionsTests(unittest.TestCase):
         self.assertTrue(following['jammed']); self.assertEqual(following['jam_since'], proven['jam_since'])
         self.assertTrue(all('/settings/billing/' in url for url in reads))
 
+    def test_budget_panel_row_freshness_matches_the_ci_observation_gap(self):
+        import re
+        from mergepath.cockpit.ci import OBSERVATION_GAP
+        source = (Path(__file__).resolve().parents[1] / 'mergepath/cockpit/assets/actions.js').read_text()
+        self.assertEqual(int(re.search(r'const CI_OBSERVATION_GAP = (\d+);', source).group(1)), OBSERVATION_GAP)
+
+    def test_installation_scan_reads_failed_job_logs_independently_of_the_ci_snapshot(self):
+        # nathanpaynedotcom 2026-10-07: gates printed the installation limit only in job logs, and
+        # the CI scan could not cover that repository at all.
+        state = {'runs': [{'id': 5, 'run_attempt': 1}, {'id': 6, 'run_attempt': 2}], 'error': None}
+        jobs = {(5, 1): [{'id': 51, 'conclusion': 'failure'}, {'id': 52, 'conclusion': 'success'}],
+                (6, 2): [{'id': 61, 'conclusion': 'failure'}], (7, 1): [{'id': 71, 'conclusion': 'failure'}, {'id': 72, 'conclusion': 'failure'},
+                                                                  {'id': 73, 'conclusion': 'failure'}, {'id': 74, 'conclusion': 'failure'}]}
+        logs = {'51': b'gh: API rate limit exceeded for installation. If you reach out', '61': b'other failure',
+                '71': b'x', '72': b'x', '73': b'x', '74': b'API rate limit exceeded for installation'}
+        reads, gets, current = [], [], [NOW]
+        class ScanFake(Fake):
+            def get(self, path, *, deadline):
+                if '/settings/billing/' in path:
+                    return super().get(path, deadline=deadline)
+                gets.append(path)
+                if state['error']:
+                    raise ClientError(state['error'])
+                if '/jobs?' in path:
+                    run_id, attempt = path.split('/runs/')[1].split('/attempts/')
+                    return {'jobs': jobs[(int(run_id), int(attempt.split('/')[0]))]}
+                assert 'status=failure' in path and 'per_page=5' in path, path
+                return {'workflow_runs': state['runs']}
+            def read_job_log(self, repo, job, *, deadline):
+                reads.append(job); return logs[job]
+        stale = lambda repo, now: {'complete': True, 'stale': True, 'observed_at': NOW, 'queued': [], 'running': [], 'hour': []}
+        p = ActionsProvider(ScanFake(), [SimpleNamespace(repo=REPO)], clock=lambda: current[0], monotonic=lambda: 0,
+                            ci_snapshot=stale, installation_scan=True)
+        row = p.fetch(30).data['repositories'][0]
+        # The CI snapshot is stale, yet the scan still establishes exhaustion for run 5.
+        self.assertFalse(row['available']); self.assertEqual(row['installation_runs'], ['5'])
+        self.assertEqual(row['installation_scan'], {'observed_at': NOW, 'error': None}); self.assertEqual(sorted(reads), ['51', '61'])
+        # Within the interval nothing is read again.
+        gets.clear(); reads.clear(); current[0] += 60; p.fetch(30)
+        self.assertEqual((gets, reads), ([], []))
+        # After it, the list is read again but completed jobs and logs come from the cache.
+        current[0] += 61; p.fetch(30)
+        self.assertEqual(len(gets), 1); self.assertEqual(reads, [])
+        # At most three log reads per scan: the scan is incomplete until the rest are read.
+        state['runs'] = [{'id': 7, 'run_attempt': 1}]; reads.clear(); current[0] += 121
+        partial = p.fetch(30).data['repositories'][0]
+        self.assertEqual(reads, ['71', '72', '73']); self.assertEqual(partial['installation_scan']['error'], 'incomplete')
+        self.assertEqual(partial['installation_scan']['observed_at'], NOW + 121)
+        current[0] += 121; done = p.fetch(30).data['repositories'][0]
+        self.assertEqual(done['installation_runs'], ['7']); self.assertEqual(done['installation_scan'], {'observed_at': current[0], 'error': None})
+        # A failed read keeps the last runs and their observation time, and names the error.
+        state['error'] = 'secondary_limit'; current[0] += 121; failed = p.fetch(30).data['repositories'][0]
+        self.assertEqual(failed['installation_runs'], ['7']); self.assertEqual(failed['installation_scan']['error'], 'secondary_limit')
+        # Without the launcher flag the provider makes no reads beside the snapshot.
+        quiet = ScanFake(); gets.clear()
+        ActionsProvider(quiet, [SimpleNamespace(repo=REPO)], clock=lambda: NOW, monotonic=lambda: 0, ci_snapshot=stale).fetch(30)
+        self.assertEqual(gets, [])
+
     def test_ci_cadence_spacing_establishes_jam_within_the_ci_observation_gap(self):
         # The CI source renews a repository's observation up to OBSERVATION_GAP apart (#1815
         # Phase 4b): 125-second spacing must still prove continuity for an injected snapshot.

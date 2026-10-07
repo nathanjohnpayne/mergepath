@@ -8,6 +8,10 @@
   const num = v => C.finite(v) && v >= 0 && v <= Number.MAX_SAFE_INTEGER;
   const repoOK = v => typeof v === "string" && /^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9_.-]+$/.test(v) && v.length <= 256;
   const fresh = (v, now, ttl) => v?.available === true && v.stale === false && num(v.observed_at) && now >= v.observed_at && now - v.observed_at <= ttl;
+  const CI_OBSERVATION_GAP = 270;
+  // The provider scans each repository's failed-job logs at most every 120 seconds; a scan
+  // older than this missed at least one cycle.
+  const SCAN_FRESH = 300;
   const fmt = n => n.toLocaleString("en-US", {maximumFractionDigits: 1});
   const dollars = n => `$${n.toFixed(2)}`;
   const stateOf = ratio => ratio === null ? "idle" : ratio >= 1 ? "boulder" : ratio >= .7 ? "bump" : "clear";
@@ -75,7 +79,8 @@
     for (const row of repositories) {
       if (!repoOK(row?.repo) || seen.has(row.repo)) throw new Error("invalid_repository");
       seen.add(row.repo);
-      const good = fresh(row, now, 120) && envelope.stale !== true;
+      // Repository rows come from the shared CI snapshot, renewed within its observation gap (ci.OBSERVATION_GAP).
+      const good = fresh(row, now, CI_OBSERVATION_GAP) && envelope.stale !== true;
       const countsValid = C.count(row.queued) !== null && C.count(row.running) !== null && C.count(row.runs_last_hour) !== null;
       const hard = Array.isArray(row.installation_runs) && row.installation_runs.length <= 10000
         && row.installation_runs.every(id => typeof id === "string" && /^[1-9][0-9]{0,15}$/.test(id)) && row.installation_runs.length > 0;
@@ -85,7 +90,8 @@
         && typeof measurement.provenance === "string" && [...measurement.provenance].length <= 240;
       const estimate = countsValid && measured && num(row.estimated_requests) && Math.abs(row.estimated_requests-row.runs_last_hour*measurement.requests_per_run)<.001 ? row.estimated_requests : null;
       let ts = hard ? "boulder" : good && estimate !== null ? stateOf(estimate/1000) : "idle";
-      const tr = {repo:row.repo, state:ts, percent:hard ? 100 : estimate === null ? null : Math.min(100,estimate/10),
+      const scan = row.installation_scan, scanned = num(scan?.observed_at) && scan.error === null && now >= scan.observed_at && now - scan.observed_at <= SCAN_FRESH;
+      const tr = {repo:row.repo, state:ts, exhausted:hard, scanned, runs:hard ? row.installation_runs.slice(0,3) : [], percent:hard ? 100 : estimate === null ? null : Math.min(100,estimate/10),
         value:hard ? "exhausted" : estimate === null ? "Estimate unavailable" : `est. ${fmt(estimate)}${good ? "" : " · last known"}`,
         detail: `${countsValid ? fmt(row.runs_last_hour) : "Unknown"} runs in last hour · ${good ? "fresh" : "stale / unavailable"}${hard ? ` · installation limit in run ${row.installation_runs.slice(0,3).join(", ")}; reset unknown` : ""}${measured ? ` · ${measurement.provenance}` : " · measured requests per run unavailable"}`};
       token.rows.push(tr);
@@ -188,6 +194,25 @@
     }
     view.update(model);
   }
+  // The header chip: which repositories' Actions GITHUB_TOKEN budgets are exhausted now.
+  // Exhaustion is the observed installation rate-limit failure the token card carries;
+  // nothing else establishes it, and reset is never observable.
+  function tokenSummary(model) {
+    const token = Array.isArray(model?.cards) ? model.cards.find(card => card?.id === "token") : null;
+    const rows = Array.isArray(token?.rows) ? token.rows : [];
+    if (!rows.length) return {state:"idle", value:"Not observed yet", note:"Actions budget awaiting its first observation"};
+    const exhausted = rows.filter(row => row.exhausted === true);
+    if (exhausted.length) {
+      const names = exhausted.map(row => row.repo.split("/")[1]), runs = exhausted.flatMap(row => row.runs || []).slice(0,3);
+      return {state:"boulder", value:`Exhausted · ${names.join(", ")}`,
+        note:`Installation rate limit in run ${runs.join(", ")} · reset unknown · GITHUB_TOKEN, 1,000 requests per hour per repository`, repos:exhausted.map(row => row.repo)};
+    }
+    // "No exhaustion seen" needs a fresh, complete failed-job log scan of every repository.
+    const scanned = rows.filter(row => row.scanned === true).length, all = scanned === rows.length;
+    const state = !all ? "idle" : token.state === "bump" ? "bump" : "clear";
+    return {state, value: !all ? "Not fully observed" : state === "bump" ? "Near the limit" : "No exhaustion seen",
+      note:`Failed-job logs of the last hour · ${scanned} of ${rows.length} ${rows.length === 1 ? "repository" : "repositories"} scanned`, repos:[]};
+  }
   function install(app) {app.registerPanel("budget","actions",project,render);}
-  return {project,BudgetView,render,install};
+  return {project,BudgetView,render,install,tokenSummary};
 });

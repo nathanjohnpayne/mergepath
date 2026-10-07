@@ -1,6 +1,7 @@
 """Read-only Actions observations; unavailable inputs never become estimates."""
 
 import copy
+from collections import OrderedDict
 import datetime as dt
 import math
 import re
@@ -13,6 +14,17 @@ from .scheduler import Sample
 
 SAFE = 2 ** 53 - 1
 INSTALLATION = "api rate limit exceeded for installation"
+# A gate that runs out of its repository GITHUB_TOKEN usually prints the limit only in its
+# job log (observed on nathanpaynedotcom on 2026-10-07), never in run or check output, and
+# the busiest repositories are the ones the CI scan covers least. So the installation scan
+# reads each repository itself, independently of the CI snapshot: at most every
+# SCAN_INTERVAL seconds, the newest SCAN_RUNS failed runs of the last hour, their failed
+# jobs, and those jobs' logs, LOG_READS per repository per scan. A completed attempt's jobs
+# and a completed job's verdict never change, so both are cached.
+SCAN_INTERVAL = 120
+SCAN_RUNS = 5
+LOG_READS = 3
+SCAN_CACHE = 1024
 
 
 def number(value, maximum=SAFE):
@@ -175,7 +187,8 @@ def ci_observation(envelope, repo, now, max_age=120):
 
 class ActionsProvider:
     def __init__(self, client, inventory, *, settings=None, ci_snapshot=None,
-                 robot_snapshot=None, clock=time.time, monotonic=time.monotonic, ci_max_gap=120):
+                 robot_snapshot=None, clock=time.time, monotonic=time.monotonic, ci_max_gap=120,
+                 installation_scan=False):
         self.client, self.clock, self.monotonic = client, clock, monotonic
         # An injected CI snapshot is renewed on the CI source's cadence, not on this source's,
         # so its freshness and jam continuity use that source's observation gap.
@@ -190,6 +203,80 @@ class ActionsProvider:
         self._billing, self._billing_due, self._billing_period = None, 0, None
         self._last, self._jam, self._cursor = {}, {}, 0
         self._robot_last = None
+        self._scans, self._scan_jobs, self._scan_logs = {}, OrderedDict(), OrderedDict()
+        # The launcher enables the installation scan; it is the provider's one read beside
+        # the injected CI snapshot.
+        self.installation_scan = installation_scan is True
+
+    @staticmethod
+    def _remember(cache, key, value):
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > SCAN_CACHE:
+            cache.popitem(last=False)
+
+    def _installation_scan(self, repo, deadline, now):
+        """Exhausted run ids from failed-job logs of the last hour, with when that was observed.
+
+        A scan that could not read every failed job it found reports `incomplete` and keeps the
+        last complete observation time; a failed read keeps the previous runs. Nothing here is
+        estimated: only the logged installation-limit message establishes exhaustion.
+        """
+        last = self._scans.get(repo)
+        if last is not None and 0 <= now - last["attempted_at"] < SCAN_INTERVAL:
+            return last
+        state = {"attempted_at": now, "observed_at": last["observed_at"] if last else None,
+                 "error": None, "runs": list(last["runs"]) if last else []}
+        try:
+            # The cutoff is floored to five minutes so the list URL revalidates as a free 304.
+            cutoff = dt.datetime.fromtimestamp((now - 3600) // 300 * 300, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            payload = self.client.get(f"/repos/{repo}/actions/runs?status=failure&created=%3E%3D{cutoff}&per_page={SCAN_RUNS}",
+                                      deadline=deadline)
+            listed = payload.get("workflow_runs") if type(payload) is dict else None
+            if type(listed) is not list:
+                raise ClientError("invalid_page")
+            exhausted, complete, reads = [], True, 0
+            for raw in listed[:SCAN_RUNS]:
+                if type(raw) is not dict or not count(raw.get("id")) or raw["id"] == 0:
+                    raise ClientError("invalid_page")
+                attempt = raw.get("run_attempt", 1)
+                if not count(attempt) or attempt == 0:
+                    raise ClientError("invalid_page")
+                key = (repo, raw["id"], attempt)
+                jobs = self._scan_jobs.get(key)
+                if jobs is None:
+                    page = self.client.get(f"/repos/{repo}/actions/runs/{raw['id']}/attempts/{attempt}/jobs?per_page=100",
+                                           deadline=deadline)
+                    rows = page.get("jobs") if type(page) is dict else None
+                    if type(rows) is not list:
+                        raise ClientError("invalid_page")
+                    jobs = [str(job["id"]) for job in rows if type(job) is dict and job.get("conclusion") == "failure"
+                            and count(job.get("id")) and job["id"] > 0]
+                    self._remember(self._scan_jobs, key, jobs)
+                for job in jobs:
+                    verdict = self._scan_logs.get((repo, job))
+                    if verdict is None:
+                        if reads >= LOG_READS or self.monotonic() >= deadline:
+                            complete = False
+                            continue
+                        reads += 1
+                        body = self.client.read_job_log(repo, job, deadline=deadline)
+                        text = body.decode("utf-8", "replace") if type(body) is bytes else body if type(body) is str else ""
+                        verdict = INSTALLATION in text.casefold()
+                        self._remember(self._scan_logs, (repo, job), verdict)
+                    if verdict and str(raw["id"]) not in exhausted:
+                        exhausted.append(str(raw["id"]))
+            state["runs"] = exhausted
+            if complete:
+                state["observed_at"] = now
+            else:
+                state["error"] = "incomplete"
+        except ClientError as exc:
+            state["error"] = exc.category
+        except Exception:
+            state["error"] = "source_failed"
+        self._scans[repo] = state
+        return state
 
     def _billing_read(self, deadline, now):
         current = dt.datetime.fromtimestamp(now, dt.timezone.utc)
@@ -312,6 +399,13 @@ class ActionsProvider:
                 row = unavailable("source_failed", self._last.get(repo))
                 row["repo"] = repo
             rows.append(row)
+        # The installation scan gets its own fair share after the queue reads, before billing.
+        for index, row in enumerate(rows if self.installation_scan else []):
+            available = deadline - self.monotonic()
+            scan = self._installation_scan(row["repo"], self.monotonic() + max(0, available / (size - index + 1)), now)
+            row["installation_scan"] = {"observed_at": scan["observed_at"], "error": scan["error"]}
+            known = row.get("installation_runs") if type(row.get("installation_runs")) is list else []
+            row["installation_runs"] = sorted(set(known) | set(scan["runs"]), key=int)
         billing = self._billing_read(deadline, now)
         try:
             robot = self._robot(now)

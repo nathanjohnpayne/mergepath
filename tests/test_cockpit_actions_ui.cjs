@@ -2,12 +2,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const {project,BudgetView,render,install} = require('../mergepath/cockpit/assets/actions.js');
+const {project,BudgetView,render,install,tokenSummary} = require('../mergepath/cockpit/assets/actions.js');
 const C = require('../mergepath/cockpit/assets/components.js');
 const {PanelRegistry,renderPanelContent}=require('../mergepath/cockpit/assets/app.js');
 const now=Date.UTC(2026,9,16,12)/1000, repo='owner/mergepath';
 const cycle=()=>({budget:25,cycle_start:Date.UTC(2026,9,1)/1000,cycle_end:Date.UTC(2026,10,1)/1000});
-const row=(overrides={})=>({repo,available:true,stale:false,observed_at:now,queued:0,running:0,runs_last_hour:2,jammed:false,jam_since:null,estimated_requests:null,measurement:null,installation_runs:[],...overrides});
+const row=(overrides={})=>({repo,available:true,stale:false,observed_at:now,installation_scan:{observed_at:now,error:null},queued:0,running:0,runs_last_hour:2,jammed:false,jam_since:null,estimated_requests:null,measurement:null,installation_runs:[],...overrides});
 const data=(overrides={})=>({schema:'actions-budget/v1',billing:{available:false,stale:true,observed_at:null},robot:{available:false,stale:true,observed_at:null},configuration:{budget:null,cycle_start:null,cycle_end:null},repositories:[row()],...overrides});
 const model=(d=data(),stale=false,selected=null,t=now)=>project({data:d,stale,observed_at:now},selected,t);
 const measured=()=>({requests_per_run:400,observed_at:now,provenance:'measured local counter'});
@@ -196,4 +196,33 @@ test('repository filtering preserves current and projected account spend hazards
   assert.equal(stale.hazards.some(h=>h.id==='actions-spend-account-at'),false);
   if(amount===25){assert.equal(stale.hazards.find(h=>h.id==='actions-spend-account-now').stale,true);assert.equal(stale.state,'boulder');}
  }
+});
+
+test('header token summary names exhausted repositories and never invents exhaustion',()=>{
+ const other='owner/fiveacross';
+ const exhausted=tokenSummary(model(data({repositories:[row({installation_runs:['41','42']}),row({repo:other})]})));
+ assert.equal(exhausted.state,'boulder');assert.equal(exhausted.value,'Exhausted · mergepath');
+ assert.match(exhausted.note,/run 41, 42 · reset unknown/);assert.deepEqual(exhausted.repos,[repo]);
+ const calm=tokenSummary(model(data({repositories:[row(),row({repo:other})]})));
+ assert.equal(calm.state,'clear');assert.equal(calm.value,'No exhaustion seen');assert.deepEqual(calm.repos,[]);
+ const near=tokenSummary(model(data({repositories:[row({estimated_requests:800,measurement:measured()})]})));
+ assert.equal(near.state,'bump');assert.equal(near.value,'Near the limit');
+ // The log scan does not depend on the CI-derived row: a stale row with a fresh scan is still covered.
+ assert.equal(tokenSummary(model(data({repositories:[row({stale:true,available:false})]}))).value,'No exhaustion seen');
+ assert.deepEqual(tokenSummary(undefined),{state:'idle',value:'Not observed yet',note:'Actions budget awaiting its first observation'});
+});
+
+test('repository rows stay fresh for the CI observation gap, not the old 120 seconds',()=>{
+ const card=age=>model(data({repositories:[row({observed_at:now-age})]}),false,null,now).cards[1].rows[0].detail;
+ assert.match(card(200),/· fresh/);assert.match(card(271),/stale/);
+});
+test('the header needs a fresh complete log scan of every repository before it says no exhaustion',()=>{
+ const at=scan=>tokenSummary(model(data({repositories:[row(),row({repo:'owner/fiveacross',installation_scan:scan})]})));
+ assert.equal(at({observed_at:now-200,error:null}).value,'No exhaustion seen');
+ for(const scan of [{observed_at:now-301,error:null},{observed_at:now,error:'incomplete'},{observed_at:null,error:'secondary_limit'},undefined]) {
+  const s=at(scan);assert.equal(s.value,'Not fully observed');assert.match(s.note,/1 of 2 repositories scanned/);
+ }
+ // Exhaustion is shown even when the CI-derived row is stale.
+ const hot=tokenSummary(model(data({repositories:[row({stale:true,available:false,installation_runs:['9']})]})));
+ assert.equal(hot.state,'boulder');assert.equal(hot.value,'Exhausted · mergepath');
 });

@@ -318,6 +318,16 @@
         : connection.retry_at ? `Retry in ${Math.max(0, Math.ceil(connection.retry_at - epochNow()))}s · data may be stale` : "Awaiting stream · data may be stale";
       $("updated-age").textContent = receivedAt === null ? "Not yet" : C.ageLabel((performance.now() - receivedAt) / 1000);
     }
+    // The Actions GITHUB_TOKEN chip sits first in the header so an exhausted budget is seen at once.
+    function renderActionsToken(model) {
+      const summary = globalThis.CockpitActions?.tokenSummary ? globalThis.CockpitActions.tokenSummary(model)
+        : {state: "idle", value: "Not observed yet", note: "Actions budget unavailable"};
+      const chip = $("actions-token");
+      if (!chip) return;
+      chip.className = `chip token-chip c-${summary.state}`;
+      if ($("actions-token-value").textContent !== summary.value) $("actions-token-value").textContent = summary.value;
+      if ($("actions-token-note").textContent !== summary.note) $("actions-token-note").textContent = summary.note;
+    }
     function render() {
       renderConnection();
       const current = snapshot || {repositories: [], api_budget: {}, sources: {}};
@@ -334,6 +344,7 @@
       renderAuthorBudget(authorMeter, $("api-note"), current, now, connection.kind !== "live");
       $("reviewer-api-note").textContent = `${identity} · ${observed === null ? "no header evidence" : `observed ${C.ageLabel(now - observed)}`} · ${reset === null ? "reset unknown" : `reset ${reset > now ? C.timeLabel({kind: "at", at: reset}, now) : "time passed; awaiting headers"}`}`;
       const projection = registry.project(current, selectedRepo, now); renderPanels(projection);
+      renderActionsToken(projection.models.budget);
       const stale = connection.kind !== "live";
       let hazards = [...projection.hazards.map(hazard => ({...hazard, stale: hazard.stale || stale})), ...accountHazards(current, now, stale)];
       if (["reconnecting", "offline", "session"].includes(connection.kind)) hazards.push({id: "shell-connection", source: "road", section: "road", repo: null,
