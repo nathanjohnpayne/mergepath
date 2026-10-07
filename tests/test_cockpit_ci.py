@@ -955,6 +955,34 @@ class ProviderTests(unittest.TestCase):
                 # rotation, spends only its half (ten seconds) before the other finishes.
                 self.assertEqual(walks, order); self.assertAlmostEqual(mono[0], end)
 
+    def test_pass_two_splits_known_needs_so_a_grown_cost_cannot_starve_a_quicker_repository(self):
+        # #1821 review (second Codex P1): a repository last measured at 9 seconds that now never
+        # finishes, first in the rotation, took the whole second-pass remainder before a repository
+        # that needs 5 seconds. Known needs now run smallest first and split the remainder evenly.
+        mono, walks = [0.0], []
+        cost = {'repo': 100, 'other': 5, 'third': 0}
+        class Client:
+            def pages(self, path, *, deadline, **kwargs):
+                if '/actions/runs?' in path and 'status=' not in path:
+                    repo = path.split('/')[3]
+                    walks.append((repo, mono[0], deadline))
+                    for _ in range(cost[repo]):
+                        if mono[0] + 1 > deadline:
+                            mono[0] = deadline
+                            raise ClientError('deadline_exceeded')
+                        mono[0] += 1
+                return []
+        inventory = INVENTORY + (Repository('other', 'owner/other'), Repository('third', 'owner/third'))
+        provider = CIProvider(Client(), inventory, monotonic=lambda: mono[0], clock=lambda: 1000)
+        provider._needed.update({'owner/repo': 9, 'owner/other': 7})
+        data = provider(20.25).data
+        self.assertEqual({o['repo']: o['stale'] for o in data['repositories']},
+                         {'owner/repo': True, 'owner/other': False, 'owner/third': False})
+        # Both wait for pass two; the smaller known need runs first with half of the twenty seconds
+        # left and finishes, and the grown repository then gets everything it left.
+        self.assertEqual([(repo, start, end) for repo, start, end in walks], [('third', 0.0, 20.0 / 3), ('other', 0.0, 10.0), ('repo', 5.0, 20.0)])
+        self.assertEqual(provider._needed['owner/repo'], math.inf)
+
     def test_running_to_conclusion_on_same_run_identity(self):
         raw = raw_run(); raw['status'] = 'in_progress'; raw['conclusion'] = None
         rows, _ = group_runs(REPO, [raw], {'10': []}, [], {'7': SHA})

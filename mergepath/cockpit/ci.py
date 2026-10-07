@@ -20,8 +20,8 @@ LIVE = frozenset({'queued', 'in_progress', 'waiting', 'pending', 'requested'})
 # sit a timeout, the idle interval and another timeout apart. Consumers of the shared snapshot
 # use OBSERVATION_GAP, which adds scheduler slack, as their freshness and continuity bound.
 HOT_INTERVAL, IDLE_INTERVAL, TIMEOUT = 60, 120, 60
-# Pass-two marker for a repository whose last scan ran out of time: it shares what remains.
-TAIL = object()
+# Pass-two markers: a repository whose last scan finished (KNOWN) or ran out of time (TAIL).
+KNOWN, TAIL = object(), object()
 OBSERVATION_GAP = TIMEOUT + IDLE_INTERVAL + TIMEOUT + 30
 # Diagnostics of a failed run off every open HEAD are read for the last hour, the window
 # the Actions budget derives installation exhaustion from.
@@ -396,10 +396,11 @@ class CIProvider:
         self._offset = (self._offset + 1) % max(1, len(self.inventory))
         # Pass one gives every repository a fair share; pass two lends the time left over to the
         # repositories that ran out of their share or were known to need more than it, in the same
-        # rotated order. In pass two a repository whose last scan finished (a known, finite need)
-        # goes first with everything left (index None); one whose last scan ran out of time goes
-        # last and splits what remains evenly with the others that did (index TAIL), so a
-        # repository that never finishes cannot starve one that can (#1821 review).
+        # rotated order. In pass two the repositories whose last scan finished (a known, finite need)
+        # go first, smallest need first, and split what is left evenly among themselves (index
+        # KNOWN); the ones whose last scan ran out of time go last and split what then remains (index
+        # TAIL). Time a repository leaves unspent carries forward, so neither a repository that never
+        # finishes nor one whose cost has grown can starve another (#1821 review).
         work, deferred, waiting, attempted = list(enumerate(ordered)), [], 0, set()
         while work:
             index, item = work.pop(0)
@@ -417,10 +418,8 @@ class CIProvider:
                     # carries forward, and the last one gets everything left. A repository waiting
                     # for pass two without having started still counts, so its share stays reserved.
                     started = self.monotonic()
-                    if index is None:
-                        share = budget_deadline
-                    elif index is TAIL:
-                        share = started + (budget_deadline - started) / (1 + sum(1 for later, _ in work if later is TAIL))
+                    if index is KNOWN or index is TAIL:
+                        share = started + (budget_deadline - started) / (1 + sum(1 for later, _ in work if later is index))
                     else:
                         share = started + (budget_deadline - started) / (len(ordered) - index + waiting)
                     # A restarted scan walks every run-list page again at nearly full cost (a 304 still
@@ -461,8 +460,9 @@ class CIProvider:
             if record is not None:
                 self._records[repo] = copy.deepcopy(record)
             if not work:
-                known = [later for later in deferred if math.isfinite(self._needed.get(later.repo, math.inf))]
-                work = [(None, later) for later in known] + [(TAIL, later) for later in deferred if later not in known]
+                known = sorted((later for later in deferred if math.isfinite(self._needed.get(later.repo, math.inf))),
+                               key=lambda later: self._needed[later.repo])
+                work = [(KNOWN, later) for later in known] + [(TAIL, later) for later in deferred if later not in known]
                 deferred = []
         for item in self.inventory:
             record = self._records[item.repo]
