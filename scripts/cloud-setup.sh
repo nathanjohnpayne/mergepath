@@ -49,7 +49,9 @@
 #                          (default /usr/local when writable, else ~/.local)
 #
 # Exit codes:
-#   0  every required tool is present (installed now or already)
+#   0  every required tool is present (installed now or already); with
+#      --dry-run, every missing or too-old tool has a planned install, and
+#      nothing is installed or replaced
 #   1  a tool could not be installed or verified
 #
 # Bash 3.2 portable. Needs curl, tar and a SHA-256 tool (sha256sum or shasum)
@@ -250,7 +252,9 @@ yq_meets_minimum() { # <path>
   is_mikefarah_yq "$1" || return 1
   v="$("$1" --version 2>/dev/null)" || return 1
   v="${v##*version v}"
-  v="${v%%[!0-9.]*}"
+  v="${v%%[[:space:]]*}"
+  # A prerelease or any other suffix (v4.53.6-rc1) is not the stable minimum.
+  case "$v" in ''|*[!0-9.]*) return 1 ;; esac
   version_at_least "$v" "$YQ_MIN_VERSION"
 }
 

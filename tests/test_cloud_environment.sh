@@ -582,6 +582,18 @@ if [ "$rc" -eq 0 ] && grep -q "is older than mikefarah/yq v4.53.6, which the rep
 else
   fail "setup old yq: rc=$rc err=$(cat "$WORKDIR/setup.err") curl=$(cat "$WORKDIR/curl.log")"
 fi
+# A prerelease of the minimum (v4.53.6-rc1) is not the stable minimum: replaced (#1835 review).
+yq_stub_dir "$WORKDIR/yq-rc" v4.53.6-rc1
+: >"$WORKDIR/curl.log"
+set +e
+run_setup "$WORKDIR/y-rc" MERGEPATH_YQ_VERSION="$YQVER" MERGEPATH_YQ_SHA256="$yqsum" PATH="$WORKDIR/y-rc/bin:$WORKDIR/yq-rc:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ -x "$WORKDIR/y-rc/bin/yq" ] && grep -q "installed yq $YQVER" "$WORKDIR/setup.err" \
+   && grep -q "mikefarah/yq/releases/download/$YQVER/yq_linux_amd64" "$WORKDIR/curl.log"; then
+  pass "setup, mikefarah/yq v4.53.6-rc1 on PATH: a prerelease is not the stable minimum, so the pinned yq is installed ahead of it"
+else
+  fail "setup prerelease yq: rc=$rc err=$(cat "$WORKDIR/setup.err") curl=$(cat "$WORKDIR/curl.log")"
+fi
 for keep in v4.53.6 v4.100.0; do
   yq_stub_dir "$WORKDIR/yq-keep-$keep" "$keep"
   : >"$WORKDIR/curl.log"
