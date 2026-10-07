@@ -154,6 +154,49 @@ else
     fail "ci-check-modes.sh must select every sourcing wrapper (sourcing $sourcing, selected $selected)"
   fi
 
+  # #1832: every Cockpit file check_cockpit covers is a declared dependency of
+  # that wrapper. The list is DERIVED from the tree, so a new Cockpit test or
+  # spec cannot drift out of the graph. Cockpit is hub-only: a consumer has no
+  # sync engine and no Cockpit files, so it has nothing to assert here.
+  if [ -f "$ROOT/scripts/sync-to-downstream.sh" ]; then
+    cockpit_paths=""
+    for path in "$ROOT"/scripts/cockpit.sh "$ROOT"/tests/test_cockpit* "$ROOT"/specs/cockpit_*.md; do
+      [ -f "$path" ] && cockpit_paths="${cockpit_paths}${path#"$ROOT"/}
+"
+    done
+    cockpit_tree=$(cd "$ROOT" && find mergepath/cockpit -type f ! -path '*/__pycache__/*' | LC_ALL=C sort)
+    cockpit_paths="${cockpit_paths}${cockpit_tree}"
+    cockpit_patterns=$(jq -r '.wrappers.check_cockpit[]?' "$DEPENDENCIES")
+    cockpit_undeclared=""
+    cockpit_count=0
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      cockpit_count=$((cockpit_count + 1))
+      declared=0
+      while IFS= read -r pattern; do
+        [ -n "$pattern" ] || continue
+        # shellcheck disable=SC2254 # graph entries are case globs by design
+        case "$path" in $pattern) declared=1; break ;; esac
+      done <<<"$cockpit_patterns"
+      [ "$declared" -eq 1 ] || cockpit_undeclared="$cockpit_undeclared $path"
+    done <<<"$cockpit_paths"
+    if [ "$cockpit_count" -gt 0 ] && [ -z "$cockpit_undeclared" ]; then
+      pass "every Cockpit file ($cockpit_count) is a declared check_cockpit dependency"
+    else
+      fail "Cockpit files missing from wrappers.check_cockpit (count $cockpit_count):$cockpit_undeclared"
+    fi
+    # specs/* is a full trigger on its own, so only the other Cockpit paths can
+    # prove the partial selection: together they select check_cockpit alone.
+    cockpit_partial=$(printf '%s\n' "$cockpit_paths" | grep -v '^specs/' || true)
+    cockpit_scope=$(printf '%s\n' "$cockpit_partial" | bash "$SCOPE" --event pull_request)
+    if [ "$(printf '%s\n' "$cockpit_scope" | sed -n 's/^full=//p')" = "false" ] \
+       && [ "$(printf '%s\n' "$cockpit_scope" | sed -n 's/^checks=//p')" = '["check_cockpit"]' ]; then
+      pass "Cockpit runtime and test changes select only check_cockpit"
+    else
+      fail "Cockpit runtime and test changes must select only check_cockpit (got $cockpit_scope)"
+    fi
+  fi
+
   # #931: the nudge wrapper owns two paths and nothing else does, so a change
   # to either selects it alone rather than the full deep net.
   selected=$(scope_value checks pull_request scripts/pr-review-policy-nudge.sh)
