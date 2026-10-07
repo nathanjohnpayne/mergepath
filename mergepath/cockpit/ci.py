@@ -20,6 +20,8 @@ LIVE = frozenset({'queued', 'in_progress', 'waiting', 'pending', 'requested'})
 # sit a timeout, the idle interval and another timeout apart. Consumers of the shared snapshot
 # use OBSERVATION_GAP, which adds scheduler slack, as their freshness and continuity bound.
 HOT_INTERVAL, IDLE_INTERVAL, TIMEOUT = 60, 120, 60
+# Pass-two marker for a repository whose last scan ran out of time: it shares what remains.
+TAIL = object()
 OBSERVATION_GAP = TIMEOUT + IDLE_INTERVAL + TIMEOUT + 30
 # Diagnostics of a failed run off every open HEAD are read for the last hour, the window
 # the Actions budget derives installation exhaustion from.
@@ -394,7 +396,10 @@ class CIProvider:
         self._offset = (self._offset + 1) % max(1, len(self.inventory))
         # Pass one gives every repository a fair share; pass two lends the time left over to the
         # repositories that ran out of their share or were known to need more than it, in the same
-        # rotated order (index None).
+        # rotated order. In pass two a repository whose last scan finished (a known, finite need)
+        # goes first with everything left (index None); one whose last scan ran out of time goes
+        # last and splits what remains evenly with the others that did (index TAIL), so a
+        # repository that never finishes cannot starve one that can (#1821 review).
         work, deferred, waiting, attempted = list(enumerate(ordered)), [], 0, set()
         while work:
             index, item = work.pop(0)
@@ -412,11 +417,16 @@ class CIProvider:
                     # carries forward, and the last one gets everything left. A repository waiting
                     # for pass two without having started still counts, so its share stays reserved.
                     started = self.monotonic()
-                    share = budget_deadline if index is None else started + (budget_deadline - started) / (len(ordered) - index + waiting)
+                    if index is None:
+                        share = budget_deadline
+                    elif index is TAIL:
+                        share = started + (budget_deadline - started) / (1 + sum(1 for later, _ in work if later is TAIL))
+                    else:
+                        share = started + (budget_deadline - started) / (len(ordered) - index + waiting)
                     # A restarted scan walks every run-list page again at nearly full cost (a 304 still
                     # takes most of the two seconds a fresh page does), so a repository whose last scan
                     # needed at least this share goes straight to pass two instead of spending it.
-                    if share < budget_deadline and self._needed.get(repo, 0) >= share - started:
+                    if type(index) is int and share < budget_deadline and self._needed.get(repo, 0) >= share - started:
                         deferred.append(item)
                         waiting += 1
                     else:
@@ -445,12 +455,15 @@ class CIProvider:
                         retry = now + 20
                     record = copy.deepcopy(old) if old else {'repo': repo, 'observed_at': None, 'history_complete': False, 'runs': [], 'groups': [], 'check_rows': []}
                     record.update(attempted_at=now, stale=True, error=category, retry_at=now if category == 'deadline_exceeded' else retry)
-                    if scan_started and share < budget_deadline and category == 'deadline_exceeded' and self.monotonic() < budget_deadline:
+                    if (scan_started and type(index) is int and share < budget_deadline and category == 'deadline_exceeded'
+                            and self.monotonic() < budget_deadline):
                         deferred.append(item)
             if record is not None:
                 self._records[repo] = copy.deepcopy(record)
             if not work:
-                work, deferred = [(None, later) for later in deferred], []
+                known = [later for later in deferred if math.isfinite(self._needed.get(later.repo, math.inf))]
+                work = [(None, later) for later in known] + [(TAIL, later) for later in deferred if later not in known]
+                deferred = []
         for item in self.inventory:
             record = self._records[item.repo]
             rows.extend(copy.deepcopy(record['runs']))

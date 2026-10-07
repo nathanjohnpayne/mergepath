@@ -1,6 +1,7 @@
 """Hermetic CI provider, supersession and on-demand log attribution tests."""
 
 import copy
+import math
 import datetime
 import json
 import threading
@@ -920,6 +921,39 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual([(o['repo'], o['stale']) for o in data['repositories']],
                          [('owner/repo', False), ('owner/slow', True), ('owner/third', False)])
         self.assertEqual(walks, ['slow', 'third', 'repo', 'slow'])
+
+    def test_pass_two_cannot_let_a_repository_that_never_finishes_starve_the_others(self):
+        # #1821 review (Codex P1): pass two gave each deferred repository everything left, so a
+        # repository that never finishes, first in the rotation, left every later deferred repository
+        # stale. A known finite need now goes first with the remainder; repositories that ran out
+        # last time split what remains evenly, and time one leaves unspent carries forward.
+        mono, walks = [0.0], []
+        cost = {'repo': 9, 'slow': 100, 'third': 0}
+        class Client:
+            def pages(self, path, *, deadline, **kwargs):
+                if '/actions/runs?' in path and 'status=' not in path:
+                    repo = path.split('/')[3]
+                    walks.append(repo)
+                    for _ in range(cost[repo]):
+                        if mono[0] + 1 > deadline:
+                            mono[0] = deadline
+                            raise ClientError('deadline_exceeded')
+                        mono[0] += 1
+                return []
+        inventory = (Repository('slow', 'owner/slow'),) + INVENTORY + (Repository('third', 'owner/third'),)
+        for label, needed, order, end in (('known need', 9, ['third', 'repo', 'slow'], 20.0),
+                                          ('ran out last time', math.inf, ['third', 'slow', 'repo'], 19.0)):
+            with self.subTest(case=label):
+                mono[0] = 0.0; walks.clear()
+                provider = CIProvider(Client(), inventory, monotonic=lambda: mono[0], clock=lambda: 1000)
+                provider._needed.update({'owner/slow': math.inf, 'owner/repo': needed})
+                data = provider(20.25).data
+                stale = {o['repo']: o['stale'] for o in data['repositories']}
+                self.assertEqual(stale, {'owner/slow': True, 'owner/repo': False, 'owner/third': False})
+                # Both wait for pass two. A known need runs first with everything left and the slow
+                # repository gets the rest; two that ran out split it, and the slow one, first in the
+                # rotation, spends only its half (ten seconds) before the other finishes.
+                self.assertEqual(walks, order); self.assertAlmostEqual(mono[0], end)
 
     def test_running_to_conclusion_on_same_run_identity(self):
         raw = raw_run(); raw['status'] = 'in_progress'; raw['conclusion'] = None
