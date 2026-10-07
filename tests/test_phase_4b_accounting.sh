@@ -23,6 +23,23 @@ ACCT_SCHEMA="$ROOT/scripts/phase-4b/accounting.schema.json"
 VERDICT_SCHEMA="$ROOT/scripts/phase-4b/verdict.schema.json"
 PRICES="$ROOT/scripts/phase-4b/prices.json"
 
+# The command line is validated before any dependency or fixture check, so a
+# malformed --identity-only form exits 2 even where jq is missing, instead of
+# reaching a successful skip (#1837 review). A second argument must be exactly
+# `--fixtures <absolute path>`; a typo, missing path or extra argument must
+# not silently skip the bundle export.
+IDENTITY_ONLY=0
+if [ "${1:-}" = --identity-only ]; then
+  IDENTITY_ONLY=1
+  case "$#:${2:-}" in
+    1:) ;;
+    3:--fixtures)
+      case "$3" in /*) IDENTITY_FIXTURE_OUTPUT="$3" ;; *) echo 'fixture output must be an absolute path' >&2; exit 2 ;; esac ;;
+    *)
+      echo 'usage: tests/test_phase_4b_accounting.sh [--identity-only [--fixtures <absolute-json-path>]]' >&2
+      exit 2 ;;
+  esac
+fi
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not available" >&2; exit 0; }
 for f in "$ACCT" "$LIB" "$ORCH" "$AD_CLAUDE" "$ACCT_SCHEMA" "$VERDICT_SCHEMA" "$PRICES"; do
   [ -e "$f" ] || { echo "missing required path: $f" >&2; exit 1; }
@@ -212,17 +229,7 @@ identity_contract() (
   [ "$FAIL" = 0 ]
 )
 
-if [ "${1:-}" = --identity-only ]; then
-  # A second argument must be exactly `--fixtures <absolute path>`; a typo,
-  # missing path or extra argument must not silently skip the bundle export.
-  case "$#:${2:-}" in
-    1:) ;;
-    3:--fixtures)
-      case "$3" in /*) IDENTITY_FIXTURE_OUTPUT="$3" ;; *) echo 'fixture output must be an absolute path' >&2; exit 2 ;; esac ;;
-    *)
-      echo 'usage: tests/test_phase_4b_accounting.sh [--identity-only [--fixtures <absolute-json-path>]]' >&2
-      exit 2 ;;
-  esac
+if [ "$IDENTITY_ONLY" = 1 ]; then
   identity_contract
   exit "$?"
 fi
@@ -2997,6 +3004,15 @@ for bad_form in 'fixtures-without-path' 'fixture-typo' 'extra-after-path' 'extra
     fail "--identity-only $bad_form (rc=$rc, bundle=$([ -e "$ARGS_BUNDLE" ] && echo written || echo absent))"
   fi
 done
+# The same malformed form exits 2 where jq is missing, before the dependency skip.
+NOJQ="$WORK/identity-args/nojq-bin"
+mkdir -p "$NOJQ"
+ln -sf "$(command -v dirname)" "$NOJQ/dirname"
+rc=0
+env PATH="$NOJQ" /bin/bash "$SELF" --identity-only --fixtures > "$WORK/identity-args/out" 2> "$WORK/identity-args/err" || rc=$?
+[ "$rc" = 2 ] && grep -q 'usage: ' "$WORK/identity-args/err" && ! grep -q 'SKIP: jq' "$WORK/identity-args/err" \
+  && pass '--identity-only --fixtures without a path exits 2 even where jq is missing' \
+  || fail "malformed form without jq (rc=$rc, err=$(cat "$WORK/identity-args/err"))"
 set --
 rm -f "$ARGS_BUNDLE"
 rc=0

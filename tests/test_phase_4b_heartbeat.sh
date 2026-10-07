@@ -417,6 +417,19 @@ tz_scrubbed="$(env -i PATH="$PATH" LC_ALL=C bash -c '. "$1"; p4b_heartbeat_statu
 [ "$(TZ=Etc/GMT+12 p4b_heartbeat_status "$tz_record")" = running ] \
   && pass 'heartbeat written under a non-UTC TZ matches a reader in another zone' \
   || fail 'non-UTC writer vs other-zone reader'
+# #1837 review: a v1 record written before the UTC pin holds the local
+# rendering. The reader still recognises that live run (here from a
+# TZ-scrubbed reader, like the Cockpit probe), and a different start time
+# under either rendering is still a crash.
+legacy_local="$(env -i PATH="$PATH" LC_ALL=C ps -p "$$" -o lstart=)"
+jq --arg ps "$legacy_local" --argjson pid "$$" '.pid=$pid|.process_started_at=$ps' "$P4B_HB_FILE" > "$WORK/legacy.json"
+legacy_status="$(env -i PATH="$PATH" LC_ALL=C bash -c '. "$1"; p4b_heartbeat_status "$2"' \
+  legacy-probe "$ROOT/scripts/phase-4b/heartbeat.sh" "$WORK/legacy.json")"
+[ "$legacy_status" = running ] && pass 'pre-UTC v1 record in local time still matches its live process' \
+  || fail "pre-UTC local record: $legacy_status"
+jq --argjson pid "$$" '.pid=$pid|.process_started_at="Thu Jan  1 00:00:00 1970"' "$P4B_HB_FILE" > "$WORK/stale.json"
+[ "$(p4b_heartbeat_status "$WORK/stale.json")" = crashed ] && pass 'a start time matching neither rendering is still a crash' \
+  || fail 'mismatched start time not reported crashed'
 # #1830: inherited non-boolean DRY_RUN / summary text must neither break JSON
 # publication nor change the published boolean type.
 for bool_case in 'yes:false' '1:false' 'empty:false' 'true:true'; do

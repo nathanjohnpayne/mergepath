@@ -87,6 +87,11 @@ p4b_heartbeat_status() {
     printf 'unknown\n'
   elif [ "$expected" = "$observed" ]; then
     printf 'running\n'
+  elif [ "$expected" = "$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null)" ]; then
+    # A p4b-heartbeat/v1 record written before the UTC pin holds the writer's
+    # local rendering; the reader's own zone still recognises a run that
+    # started before an upgrade, so it is not reported as crashed.
+    printf 'running\n'
   else
     printf 'crashed\n'
   fi
