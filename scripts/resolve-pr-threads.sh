@@ -850,7 +850,11 @@ list_threads_via_proxy_route() {
   local threads comments unresolved count
   threads=$(gh_pat api "repos/$REPO/pulls/$PR_NUM/ccr/review_threads" 2>/dev/null) || return 1
   jq -e 'type == "array"' <<<"$threads" >/dev/null 2>&1 || return 1
-  comments=$(gh_pat api --paginate "repos/$REPO/pulls/$PR_NUM/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null) || comments=""
+  # Every page must be an array, and there must be at least one: `add // []`
+  # turned an empty successful response into [] and kept a {} page as {},
+  # either of which can agree with a wrong empty thread route.
+  comments=$(gh_pat api --paginate "repos/$REPO/pulls/$PR_NUM/comments" 2>/dev/null \
+    | jq -s 'if length > 0 and all(.[]; type == "array") then add else error("not a list of comment pages") end' 2>/dev/null) || comments=""
   if [ -z "$comments" ]; then
     echo "resolve-pr-threads: the proxy's thread route answered, but $REPO#$PR_NUM's review comments could not be read over REST; nothing listed." >&2
     exit 2
