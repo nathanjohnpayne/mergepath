@@ -273,8 +273,23 @@ class CIProvider:
         # unchanged pages revalidate as free 304s; a sliding cutoff defeats every ETag.
         floor = math.floor(max(0, self.clock() - self.recent_seconds) / 3600) * 3600
         cutoff = datetime.datetime.fromtimestamp(floor, datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
-        queries = ['created=' + urllib.parse.quote('>=' + cutoff, safe='')] + ['status=' + status for status in sorted(LIVE)]
-        run_by_id = OrderedDict()
+        window = 'created=' + urllib.parse.quote('>=' + cutoff, safe='')
+        queries = ['status=' + status for status in sorted(LIVE)]
+        current = set(heads.values())
+        try:
+            listed, history_complete = self.client.pages(base + '/actions/runs?per_page=100&' + window, collection='workflow_runs',
+                                                         max_pages=self.max_pages, deadline=deadline), True
+        except ClientError as exc:
+            if exc.category != 'page_limit':
+                raise
+            # GitHub returns at most 1,000 runs for a filtered list, and a workflow_run relay cascade
+            # can put more than that in the window. Then only the runs that can inform a verdict are
+            # listed, each completely: failed runs in the window and every run on an open-PR HEAD.
+            # Completed non-failed history off the open heads is not listed and the record says so.
+            listed, history_complete = [], False
+            queries = ([window + '&status=' + status for status in sorted(FAILURES)]
+                       + [window + '&head_sha=' + sha for sha in sorted(current)] + queries)
+        run_by_id = OrderedDict((identity(_row(raw).get('id')), raw) for raw in listed)
         for query in queries:
             for raw in self.client.pages(base + '/actions/runs?per_page=100&' + query, collection='workflow_runs', max_pages=self.max_pages, deadline=deadline):
                 run_by_id[identity(_row(raw).get('id'))] = raw
@@ -283,7 +298,6 @@ class CIProvider:
         # Any other completed run is history that keeps its workflow result only; at
         # fleet volume detailing every run burns the API budget without informing a
         # verdict.
-        current = set(heads.values())
         detailed = {identity(_row(raw).get('id')) for raw in runs
                     if _row(raw).get('status') != 'completed' or _row(raw).get('conclusion') in FAILURES
                     or _sha(_row(raw).get('head_sha')) in current}
@@ -342,14 +356,14 @@ class CIProvider:
         # the first observation of an id stands.
         checks = supersede(list({check['id']: check for check in reversed(checks)}.values())[::-1])
         rows, groups = group_runs(repo, runs, jobs, checks, heads)
-        return rows, groups, _group_check_rows(repo, checks, heads, rows, groups)
+        return rows, groups, _group_check_rows(repo, checks, heads, rows, groups), history_complete
 
     def __call__(self, deadline):
         rows, groups, check_rows, observations = [], [], [], []
         budget_deadline = deadline - .25
         ordered = self.inventory[self._offset:] + self.inventory[:self._offset]
         self._offset = (self._offset + 1) % max(1, len(self.inventory))
-        for item in ordered:
+        for index, item in enumerate(ordered):
             repo, now = item.repo, self.clock()
             old = self._records.get(repo)
             if old and old['stale'] and old['retry_at'] > now:
@@ -360,9 +374,14 @@ class CIProvider:
                     if self.monotonic() >= budget_deadline:
                         raise ClientError('deadline_exceeded')
                     scan_started = True
-                    repo_rows, repo_groups, repo_checks = self._repo(repo, budget_deadline)
+                    # Fair share: a repository may spend an equal share of what remains, so one slow
+                    # repository cannot starve the rest. Time a quick repository leaves unspent carries
+                    # forward to the repositories after it; the last one gets everything left.
+                    started = self.monotonic()
+                    share = started + (budget_deadline - started) / (len(ordered) - index)
+                    repo_rows, repo_groups, repo_checks, history_complete = self._repo(repo, share)
                     record = {'repo': repo, 'observed_at': self.clock(), 'attempted_at': now,
-                              'stale': False, 'error': None, 'retry_at': None,
+                              'stale': False, 'error': None, 'retry_at': None, 'history_complete': history_complete,
                               'runs': repo_rows, 'groups': repo_groups, 'check_rows': repo_checks}
                     self._failures[repo] = 0
                 except Exception as exc:
@@ -377,7 +396,7 @@ class CIProvider:
                     retry = now + delay
                     if not math.isfinite(retry):
                         retry = now + 20
-                    record = copy.deepcopy(old) if old else {'repo': repo, 'observed_at': None, 'runs': [], 'groups': [], 'check_rows': []}
+                    record = copy.deepcopy(old) if old else {'repo': repo, 'observed_at': None, 'history_complete': False, 'runs': [], 'groups': [], 'check_rows': []}
                     record.update(attempted_at=now, stale=True, error=category, retry_at=now if category == 'deadline_exceeded' else retry)
             self._records[repo] = copy.deepcopy(record)
         for item in self.inventory:
@@ -385,7 +404,7 @@ class CIProvider:
             rows.extend(copy.deepcopy(record['runs']))
             groups.extend(copy.deepcopy(record['groups']))
             check_rows.extend(copy.deepcopy(record['check_rows']))
-            observations.append({k: record[k] for k in ('repo', 'observed_at', 'attempted_at', 'stale', 'error', 'retry_at')})
+            observations.append({k: record[k] for k in ('repo', 'observed_at', 'attempted_at', 'stale', 'error', 'retry_at', 'history_complete')})
         data = {'schema': 'ci/v1', 'runs': rows, 'groups': groups, 'repositories': observations, 'recent_seconds': self.recent_seconds, 'check_rows': check_rows}
         # Hot means a live run on an open-PR HEAD, the thing an operator is waiting
         # on. Scheduled sweeps and failing repositories keep the idle cadence.

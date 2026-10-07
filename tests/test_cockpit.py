@@ -161,6 +161,23 @@ class ClientTests(unittest.TestCase):
         client = self.client(HTTPFixture(reply(data={"workflow_runs": [{"id": 7}], "total_count": 1})))
         self.assertEqual(client.pages("/repos/a/b/actions/runs", collection="workflow_runs"), [{"id": 7}])
 
+    def test_first_page_total_beyond_the_page_bound_fails_page_limit_without_walking(self):
+        # #1817: a filtered Actions list reported 2,500 runs; walking ten pages of 100 at about two
+        # seconds each only to fail page_limit spent a third of the CI scan on one repository.
+        nxt = '<https://api.github.com/repos/a/b/actions/runs?per_page=2&page=2>; rel="next"'
+        fixture = HTTPFixture(reply(data={"total_count": 7, "workflow_runs": [1, 2]}, Link=nxt))
+        with self.assertRaisesRegex(ClientError, "page_limit"):
+            self.client(fixture).pages("/repos/a/b/actions/runs?per_page=2", collection="workflow_runs", max_pages=3)
+        self.assertEqual(len(fixture.calls), 1)
+        # A total that fits, an absent or non-integer total, or a bare list keeps the ordinary walk.
+        for total in (6, None, True, "99"):
+            with self.subTest(total=total):
+                first = {"workflow_runs": [1, 2]} if total is None else {"total_count": total, "workflow_runs": [1, 2]}
+                walk = HTTPFixture(reply(data=first, Link=nxt), reply(data={"workflow_runs": [3]}))
+                self.assertEqual(self.client(walk).pages("/repos/a/b/actions/runs?per_page=2", collection="workflow_runs", max_pages=3), [1, 2, 3])
+        walk = HTTPFixture(reply(data=[1, 2], Link=nxt), reply(data=[3]))
+        self.assertEqual(self.client(walk).pages("/repos/a/b/actions/runs?per_page=2", max_pages=3), [1, 2, 3])
+
     def test_malformed_next_link_does_not_silently_truncate(self):
         for link in ['garbage; rel="next"', '<https://api.github.com/repos/a/b/pulls?page=2>; rel="next"; rel="last"',
                      '<https://api.github.com/repos/a/b/pulls?page=2>; rel="next", garbage']:

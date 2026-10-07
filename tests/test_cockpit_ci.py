@@ -52,7 +52,7 @@ def model(checks=None, head=SHA):
     rows, groups = group_runs(REPO, [raw_run()], {'10': [normalize_job(raw_job())]}, supersede(checks), {'7': head})
     return {'schema': 'ci/v1', 'recent_seconds': 86400, 'runs': rows, 'groups': groups,
             'repositories': [{'repo': REPO, 'observed_at': 1000, 'attempted_at': 1000,
-                              'stale': False, 'error': None, 'retry_at': None}]}
+                              'stale': False, 'error': None, 'retry_at': None, 'history_complete': True}]}
 
 
 def envelope(data=None, stale=False):
@@ -519,6 +519,64 @@ class ProviderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             CIProvider(Client(), INVENTORY, jobs_cache=0)
 
+    def test_window_beyond_the_page_bound_lists_verdict_runs_completely_and_says_history_is_unlisted(self):
+        # #1817: nathanpaynedotcom held 1,452 runs in three hours, almost all workflow_run relay
+        # successes off the open heads, and GitHub lists at most 1,000 runs for a filtered query.
+        from mergepath.cockpit.actions import ci_observation
+        live = raw_run(12, None, OTHER_SHA); live.update(status='queued', conclusion=None, pull_requests=[])
+        failed = raw_run(13, 'failure', OTHER_SHA); failed['pull_requests'] = []
+        relay = raw_run(14, 'success', OTHER_SHA); relay['pull_requests'] = []
+        on_head = raw_run(15, 'success', SHA)
+        window = 'created=%3E%3D2026-10-06T12%3A00%3A00Z'
+        calls, state = [], {'window': 'page_limit', 'targeted': None}
+        class Client:
+            def pages(self, route, **kwargs):
+                calls.append(route)
+                if '/pulls?' in route: return [{'number': 7, 'head': {'sha': SHA}}]
+                if '/actions/runs?' in route:
+                    query = route.split('/actions/runs?per_page=100&')[1]
+                    if query == window:
+                        if state['window'] != 'complete': raise ClientError(state['window'])
+                        return [live, failed, relay, on_head]
+                    if state['targeted'] == query: raise ClientError('page_limit')
+                    return {window + '&status=failure': [failed], window + '&head_sha=' + SHA: [on_head],
+                            'status=queued': [live]}.get(query, [])
+                if '/jobs?' in route: return [{**raw_job(int(route.split('/runs/')[1].split('/')[0]) * 10, 100), 'conclusion': 'success'}]
+                if '/check-runs?' in route: return []
+                raise AssertionError('unexpected route: ' + route)
+        provider = CIProvider(Client(), INVENTORY, clock=lambda: 1791300000.0, monotonic=lambda: 0)
+        data = provider(5).data
+        runs = [route.split('/actions/runs?per_page=100&')[1] for route in calls if '/actions/runs?' in route]
+        self.assertEqual(runs, [window] + [window + '&status=' + status for status in
+                                           ('action_required', 'failure', 'startup_failure', 'timed_out')]
+                         + [window + '&head_sha=' + SHA] + ['status=' + status for status in
+                                                            ('in_progress', 'pending', 'queued', 'requested', 'waiting')])
+        # Live, failed and open-HEAD runs stay complete and fresh; the relay success off the heads is not listed.
+        self.assertEqual(sorted(row['id'] for row in data['runs']), ['12', '13', '15'])
+        self.assertEqual({key: data['repositories'][0][key] for key in ('stale', 'error', 'history_complete')},
+                         {'stale': False, 'error': None, 'history_complete': False})
+        self.assertTrue(next(row for row in data['runs'] if row['id'] == '13')['check_evidence_unknown'])
+        # The hour's volume needs every run, so the Actions budget refuses this repository.
+        self.assertIsNone(ci_observation({'stale': False, 'data': data}, REPO, data['repositories'][0]['observed_at']))
+        # A verdict query that cannot be listed completely leaves the repository stale, never partial.
+        for query in (window + '&status=timed_out', window + '&head_sha=' + SHA):
+            with self.subTest(query=query):
+                state['targeted'] = query
+                fresh = CIProvider(Client(), INVENTORY, clock=lambda: 1791300000.0, monotonic=lambda: 0)(5).data
+                self.assertEqual((fresh['runs'], fresh['repositories'][0]['error']), ([], 'page_limit'))
+                self.assertIsNone(fresh['repositories'][0]['observed_at'])
+        # A window that fits keeps listing it whole, with no extra queries.
+        state.update(window='complete', targeted=None); calls.clear()
+        data = CIProvider(Client(), INVENTORY, clock=lambda: 1791300000.0, monotonic=lambda: 0)(5).data
+        self.assertEqual(sorted(row['id'] for row in data['runs']), ['12', '13', '14', '15'])
+        self.assertTrue(data['repositories'][0]['history_complete'])
+        self.assertFalse(any('&status=failure' in route or '&head_sha=' in route for route in calls))
+        self.assertIsNotNone(ci_observation({'stale': False, 'data': data}, REPO, data['repositories'][0]['observed_at']))
+        # Any other window failure still fails the repository.
+        state['window'] = 'invalid_next_link'
+        data = CIProvider(Client(), INVENTORY, clock=lambda: 1791300000.0, monotonic=lambda: 0)(5).data
+        self.assertEqual((data['runs'], data['repositories'][0]['error']), ([], 'invalid_next_link'))
+
     def test_unmatched_live_and_unknown_checks_do_not_invent_completed_success(self):
         for status, conclusion, hot, unknown in [('queued', None, True, False), ('in_progress', None, True, False),
                                                 ('completed', None, False, True), ('unknown', None, False, True)]:
@@ -675,7 +733,9 @@ class ProviderTests(unittest.TestCase):
             self.assertIsNone(data['repositories'][0]['observed_at'])
             self.assertNotIn('secret text', json.dumps(data))
 
-    def test_deadline_reserves_publication_and_rotates_repository_priority(self):
+    def test_deadline_reserves_publication_shares_it_fairly_and_rotates_repository_priority(self):
+        # #1817: one slow repository cannot starve the rest. Each repository may spend an equal share
+        # of what remains; unspent time carries forward and the last one gets everything left.
         mono, calls = [0.0], []
         class Client:
             def pages(self, path, *, deadline, **kwargs):
@@ -686,16 +746,17 @@ class ProviderTests(unittest.TestCase):
                 return []
         provider = CIProvider(Client(), INVENTORY + (Repository('other', 'owner/other'),), monotonic=lambda: mono[0], clock=lambda: 1000)
         first = provider(1).data
-        self.assertEqual(calls[0][1], .75)
-        self.assertFalse(any('/owner/other/' in p for p, _ in calls))
-        self.assertTrue(all(o['stale'] for o in first['repositories']))
+        self.assertEqual(calls[0], ('/repos/owner/repo/pulls?state=open&per_page=100', .375))
+        self.assertEqual({deadline for path, deadline in calls if '/owner/other/' in path}, {.75})
+        self.assertEqual([(o['stale'], o['error']) for o in first['repositories']], [(True, 'deadline_exceeded'), (False, None)])
         mono[0] = 1; calls.clear()
         second = provider(2).data
         self.assertIn('/owner/other/', calls[0][0])
         self.assertFalse(second['repositories'][1]['stale'])
         self.assertEqual(second['repositories'][1]['observed_at'], 1000)
         self.assertTrue(second['repositories'][0]['stale'])
-        self.assertTrue(all(deadline == 1.75 for _, deadline in calls))
+        self.assertEqual({deadline for path, deadline in calls if '/owner/other/' in path}, {1.375})
+        self.assertEqual([deadline for path, deadline in calls if '/owner/repo/' in path], [1.75])
 
     def test_running_to_conclusion_on_same_run_identity(self):
         raw = raw_run(); raw['status'] = 'in_progress'; raw['conclusion'] = None

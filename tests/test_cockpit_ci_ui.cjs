@@ -322,6 +322,19 @@ test("a completed success off every open HEAD carries not-fetched job scope, val
   assert.match(view.notes.textContent, /Job detail for live, failed and open-HEAD runs/);
 });
 
+test("a repository whose run window exceeded the page bound stays fresh and says its completed history is not listed", () => {
+  // #1817: live, failed and open-HEAD runs are still listed completely; only completed history off the open heads is not.
+  const data = fixture(); assert.equal(data.repositories[0].history_complete, true);
+  const parent = dom(), view = new CI.CIView(parent, () => assert.fail("unexpected fetch"));
+  view.update(CI.project(envelope(data), null, 1001));
+  assert.doesNotMatch(view.notes.textContent, /not listed/);
+  data.repositories[0].history_complete = false;
+  const model = CI.project(envelope(data), null, 1002);
+  assert.equal(model.stale, false); view.update(model);
+  assert.match(view.notes.textContent, /repo: 2s ago · window over the page bound, completed history off open heads not listed/);
+  delete data.repositories[0].history_complete; assert.doesNotThrow(() => CI.validate(data));
+  for (const bad of [null, "false", 0]) {data.repositories[0].history_complete = bad; assert.throws(() => CI.validate(data), /invalid_ci_observation/);}
+});
 test("completed runs off open heads sit behind a counted history disclosure while attention rows stay in the main list", () => {
   const data = fixture(), base = data.runs[0];
   const history = {...structuredClone(base), id: "11", key: `${base.repo}:11:${base.pr ?? "none"}`, status: "completed", conclusion: "success", current_head: false,

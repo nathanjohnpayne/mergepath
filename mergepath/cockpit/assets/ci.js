@@ -19,7 +19,8 @@
     const repositories = new Map(), keys = new Set();
     for (const item of data.repositories) {
       requireValid(repoName(item?.repo) && !repositories.has(item.repo) && epoch(item.observed_at) && epoch(item.attempted_at)
-        && epoch(item.retry_at) && typeof item.stale === "boolean" && (item.error === null || typeof item.error === "string"));
+        && epoch(item.retry_at) && typeof item.stale === "boolean" && (item.error === null || typeof item.error === "string")
+        && (item.history_complete === undefined || typeof item.history_complete === "boolean"));
       repositories.set(item.repo, item);
     }
     requireValid(data.check_rows === undefined || Array.isArray(data.check_rows));
@@ -267,7 +268,7 @@
     toggle(key) {this.open = this.open === key ? null : key; for (const [id, view] of this.rows) view.disclose(id === this.open);}
     update(model) {
       this.summary.textContent = model.label;
-      this.notes.textContent = `Last ${elapsed(0, model.recentSeconds, 0)} + all active runs · Job detail for live, failed and open-HEAD runs · ` + model.repositories.map(o => `${o.repo.split("/")[1]}: ${o.observed_at === null ? "unavailable, never observed" : `${C.ageLabel(model.now - o.observed_at)}${o.stale || model.sourceStale ? " · stale" : ""}`}${o.error ? ` · ${o.error}` : ""}`).join(" · ");
+      this.notes.textContent = `Last ${elapsed(0, model.recentSeconds, 0)} + all active runs · Job detail for live, failed and open-HEAD runs · ` + model.repositories.map(o => `${o.repo.split("/")[1]}: ${o.observed_at === null ? "unavailable, never observed" : `${C.ageLabel(model.now - o.observed_at)}${o.stale || model.sourceStale ? " · stale" : ""}${o.history_complete === false ? " · window over the page bound, completed history off open heads not listed" : ""}`}${o.error ? ` · ${o.error}` : ""}`).join(" · ");
       const wanted = new Set(model.rows.map(row => row.key));
       for (const [key, view] of this.rows) if (!wanted.has(key)) {
         const focused = view.root.contains(document.activeElement); view.abort(); view.root.remove(); this.rows.delete(key);
