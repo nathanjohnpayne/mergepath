@@ -85,17 +85,33 @@ p4b_heartbeat_status() {
     printf 'crashed\n'
   elif [ "$rc" != 0 ] || [ -z "$observed" ] || [ -z "$expected" ]; then
     printf 'unknown\n'
-  elif [ "$expected" = "$observed" ]; then
-    printf 'running\n'
-  elif [ "$expected" = "$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null)" ]; then
-    # A p4b-heartbeat/v1 record written before the UTC pin holds the writer's
-    # local rendering; the reader's own zone still recognises a run that
-    # started before an upgrade, so it is not reported as crashed.
-    printf 'running\n'
   else
-    printf 'crashed\n'
+    case "$expected" in
+      *' UTC')
+        # Written with the UTC pin: an exact match is the same process.
+        if [ "$expected" = "$observed UTC" ]; then printf 'running\n'; else printf 'crashed\n'; fi ;;
+      *)
+        # A p4b-heartbeat/v1 record written before the UTC pin holds the start
+        # time in the writer's zone, which the reader cannot know. It is the
+        # same process when it differs from the UTC start by a whole zone
+        # offset: a multiple of 15 minutes, at most 14 hours either way.
+        case "$(p4b_heartbeat_zone_offset_match "$expected" "$observed")" in
+          yes) printf 'running\n' ;;
+          no) printf 'crashed\n' ;;
+          *) printf 'unknown\n' ;;
+        esac ;;
+    esac
   fi
   return 0
+}
+
+# Echoes yes when two ps lstart renderings differ by a whole time-zone offset,
+# no when they do not, and nothing when either cannot be parsed.
+p4b_heartbeat_zone_offset_match() { # <legacy lstart> <UTC lstart>
+  jq -nr --arg a "$1" --arg b "$2" '
+    def epoch: gsub("^\\s+|\\s+$"; "") | gsub("\\s+"; " ") | strptime("%a %b %d %H:%M:%S %Y") | mktime;
+    (($a | epoch) - ($b | epoch)) as $d
+    | if ($d % 900) == 0 and ($d | fabs) <= 50400 then "yes" else "no" end' 2>/dev/null || true
 }
 
 # Prune only old terminal/dead observations. Never delete a live long-running
@@ -145,7 +161,10 @@ p4b_heartbeat_start() {
   P4B_HB_STARTED_EPOCH="$(date +%s 2>/dev/null || true)"
   P4B_HB_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
   # Same pinned locale and zone as the p4b_heartbeat_status reader.
+  # The " UTC" suffix marks the pinned rendering, so the reader can tell it from
+  # a record written before the pin.
   P4B_HB_PROCESS_STARTED_AT="$(LC_ALL=C TZ=UTC ps -p "$$" -o lstart= 2>/dev/null || true)"
+  [ -z "$P4B_HB_PROCESS_STARTED_AT" ] || P4B_HB_PROCESS_STARTED_AT="$P4B_HB_PROCESS_STARTED_AT UTC"
   P4B_HB_STAGES='[]'; P4B_HB_STAGE=""; P4B_HB_SUMMARY_EMITTED=false
   P4B_HB_EXIT_CODE=""
   # All local telemetry operations run guarded; no failed mkdir/JSON/mv/ps

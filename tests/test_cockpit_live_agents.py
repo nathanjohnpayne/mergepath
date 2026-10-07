@@ -285,8 +285,16 @@ class CanonicalTests(unittest.TestCase):
                 ps.write_text("#!/bin/sh\n" + body + "\n")
                 ps.chmod(0o700)
                 with patch.object(L.os, "defpath", str(path) + ":" + os.defpath):
-                    self.assertEqual(probe(record(), time.monotonic() + 2), expected)
+                    # A UTC-marked start time (the current writer) must match ps exactly.
+                    self.assertEqual(probe(record(process_started_at="  Fri Oct  2 00:00:00 2026 UTC"), time.monotonic() + 2), expected)
             self.assertEqual(probe(record(process_started_at=None), time.monotonic() + 2), "unknown")
+            # An unmarked record from before the UTC pin matches by whole zone offset (#1837 review).
+            for stored, expected in [("Fri Oct  2 14:00:00 2026", "running"), ("Thu Oct  1 13:30:00 2026", "running"),
+                                     ("Fri Oct  2 00:00:07 2026", "crashed"), ("not a start time", "unknown")]:
+                ps.write_text("#!/bin/sh\nprintf '  Fri Oct  2 00:00:00 2026\\n'\n")
+                ps.chmod(0o700)
+                with patch.object(L.os, "defpath", str(path) + ":" + os.defpath):
+                    self.assertEqual(probe(record(process_started_at=stored), time.monotonic() + 2), expected, stored)
 
     def test_real_helper_and_ps_match_a_heartbeat_written_under_a_non_utc_zone(self):
         # #1830: lstart follows the caller zone. The orchestrator may run with

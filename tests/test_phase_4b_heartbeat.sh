@@ -430,6 +430,28 @@ legacy_status="$(env -i PATH="$PATH" LC_ALL=C bash -c '. "$1"; p4b_heartbeat_sta
 jq --argjson pid "$$" '.pid=$pid|.process_started_at="Thu Jan  1 00:00:00 1970"' "$P4B_HB_FILE" > "$WORK/stale.json"
 [ "$(p4b_heartbeat_status "$WORK/stale.json")" = crashed ] && pass 'a start time matching neither rendering is still a crash' \
   || fail 'mismatched start time not reported crashed'
+# #1837 review: a pre-UTC record written under an explicit TZ that is neither
+# UTC nor the reader's zone still matches by whole zone offset (Kiritimati is
+# +14 h, St John's a half-hour zone); seconds that differ are still a crash, an
+# unparseable legacy value is unknown, and a UTC-marked value matches exactly.
+for legacy_zone in Pacific/Kiritimati America/St_Johns; do
+  jq --arg ps "$(LC_ALL=C TZ="$legacy_zone" ps -p "$$" -o lstart=)" --argjson pid "$$" '.pid=$pid|.process_started_at=$ps' "$P4B_HB_FILE" > "$WORK/zone.json"
+  zone_status="$(env -i PATH="$PATH" LC_ALL=C bash -c '. "$1"; p4b_heartbeat_status "$2"' zone-probe "$ROOT/scripts/phase-4b/heartbeat.sh" "$WORK/zone.json")"
+  [ "$zone_status" = running ] && pass "pre-UTC record written under TZ=$legacy_zone matches through the scrubbed probe" \
+    || fail "pre-UTC $legacy_zone record: $zone_status"
+done
+shifted="$(jq -nr --arg ps "$(LC_ALL=C TZ=UTC ps -p "$$" -o lstart=)" '$ps | gsub("^\\s+|\\s+$"; "") | gsub("\\s+"; " ") | strptime("%a %b %d %H:%M:%S %Y") | mktime + 3607 | strftime("%a %b %d %H:%M:%S %Y")')"
+jq --arg ps "$shifted" --argjson pid "$$" '.pid=$pid|.process_started_at=$ps' "$P4B_HB_FILE" > "$WORK/shifted.json"
+[ "$(p4b_heartbeat_status "$WORK/shifted.json")" = crashed ] && pass 'a legacy start time off by more than a zone offset is a crash' \
+  || fail 'shifted legacy start time not reported crashed'
+jq --argjson pid "$$" '.pid=$pid|.process_started_at="not a start time"' "$P4B_HB_FILE" > "$WORK/garbled.json"
+[ "$(p4b_heartbeat_status "$WORK/garbled.json")" = unknown ] && pass 'an unparseable legacy start time is unknown, not a crash' \
+  || fail 'unparseable legacy start time'
+jq --arg ps "$shifted UTC" --argjson pid "$$" '.pid=$pid|.process_started_at=$ps' "$P4B_HB_FILE" > "$WORK/utc-mismatch.json"
+[ "$(p4b_heartbeat_status "$WORK/utc-mismatch.json")" = crashed ] && pass 'a UTC-marked start time must match exactly' \
+  || fail 'UTC-marked mismatch not reported crashed'
+jq -e '.process_started_at | endswith(" UTC")' "$tz_record" >/dev/null && pass 'the writer marks its start time as UTC' \
+  || fail 'writer start time lacks the UTC marker'
 # #1830: inherited non-boolean DRY_RUN / summary text must neither break JSON
 # publication nor change the published boolean type.
 for bool_case in 'yes:false' '1:false' 'empty:false' 'true:true'; do
@@ -451,7 +473,7 @@ for bool_case in 'yes:false' '1:false' 'empty:false' 'true:true'; do
     && pass "DRY_RUN/summary text $bool_label publishes boolean $bool_want" \
     || fail "DRY_RUN/summary text $bool_label boolean normalization"
 done
-jq '.process_started_at="different process start"' "$WORK/live.json" > "$WORK/reused.json"
+jq '.process_started_at="Thu Jan  1 00:00:00 1970 UTC"' "$WORK/live.json" > "$WORK/reused.json"
 [ "$(p4b_heartbeat_status "$WORK/reused.json")" = crashed ] && pass 'reused PID is not the original process instance' || fail 'PID reuse'
 jq '.process_started_at=null' "$WORK/live.json" > "$WORK/unknown.json"
 [ "$(p4b_heartbeat_status "$WORK/unknown.json")" = unknown ] && pass 'missing process identity remains unknown' || fail 'unknown identity'
