@@ -1,6 +1,6 @@
 # Bootstrap Label Seeding
 
-Feature: the canonical issue-label set a bootstrapped repo starts with, and the serialized format that carries it. Stage C of `scripts/bootstrap-new-repo.sh` (implemented in `scripts/bootstrap/github-infra.sh`, step 2 — `bootstrap::_seed_labels`) seeds every entry of `BOOTSTRAP_LABELS` into the new remote, eliminating the first-PR "label not found" friction. The set was extended from 12 to 19 in #1182 to carry the fleet-shared `size:` / `priority:` subset agreed in the 2026-09-04 backlog audit.
+Feature: the canonical issue-label set a bootstrapped repo starts with, and the serialized format that carries it. Stage C of `scripts/bootstrap-new-repo.sh` (implemented in `scripts/bootstrap/github-infra.sh`, step 2 — `bootstrap::_seed_labels`) seeds every entry of `BOOTSTRAP_LABELS` into the new remote, eliminating the first-PR "label not found" friction. The set was extended from 12 to 19 in #1182 to carry the fleet-shared `size:` / `priority:` subset agreed in the 2026-09-04 backlog audit, to 20 when #1555 added `needs-local-agent`, and to 21 with `status:blocked`, which every repository's board uses in place of a blocked lane.
 
 ## Acceptance criteria
 
@@ -14,18 +14,18 @@ Feature: the canonical issue-label set a bootstrapped repo starts with, and the 
 
 - An entry is rejected, with a warning naming the offending spec, when it does not carry **both** separators, or when the parsed name is empty, the parsed description is empty, or the parsed colour is not exactly six hexadecimal digits.
 - The both-separators check runs **before** any field is trusted, and is a shape test on the whole entry rather than a check on a parsed field. This is load-bearing: `${var%%|*}` and `${var#*|}` return the input UNCHANGED when the separator is absent, so a one-separator entry does not fail on its own — it aliases two fields onto one value. `"future-label|abcdef"` otherwise yields `color=abcdef` AND `desc=abcdef`, passes a colour-only check, and creates a label with its colour copied into its description (#1182, Codex P2).
-- A rejected entry is skipped, not fatal. One malformed spec must not take the other eighteen labels down with it, matching the per-entry failure posture already applied to a failing `gh label create`.
+- A rejected entry is skipped, not fatal. One malformed spec must not take the other labels down with it, matching the per-entry failure posture already applied to a failing `gh label create`.
 
 ### The seeded set
 
-- 19 labels: the four merge-gating blocking labels (`needs-external-review`, `needs-human-review`, `policy-violation`, `human-hold`), `human-action`, `decision-needed`, `agent-action`, `phase-0` through `phase-4`, `size:S`/`size:M`/`size:L`, and `priority:critical`/`priority:high`/`priority:normal`/`priority:low`.
-- The `size:` and `priority:` names, colours and descriptions are byte-identical to mergepath's own live labels. This is the point of the shared subset: a drifted description is what makes a shared label stop meaning one thing, and the observed fleet drift was exactly that — one repo carried all three size colours identically (making S/M/L indistinguishable in the UI), another carried descriptions on a time axis rather than the canonical scope axis.
+- 21 labels: the four merge-gating blocking labels (`needs-external-review`, `needs-human-review`, `policy-violation`, `human-hold`), `needs-local-agent`, `human-action`, `decision-needed`, `agent-action`, `phase-0` through `phase-4`, `size:S`/`size:M`/`size:L`, `priority:critical`/`priority:high`/`priority:normal`/`priority:low`, and `status:blocked`.
+- The `size:`, `priority:` and `status:blocked` names, colours and descriptions are byte-identical to mergepath's own live labels. This is the point of the shared subset: a drifted description is what makes a shared label stop meaning one thing, and the observed fleet drift was exactly that — one repo carried all three size colours identically (making S/M/L indistinguishable in the UI), another carried descriptions on a time axis rather than the canonical scope axis.
 - Seeding is idempotent. Every entry is created with `--force`, so re-running against a repo that already has a label updates its colour and description rather than erroring.
 
 ### Deliberate exclusions
 
 - `size:XL` is not seeded. It existed in `nathanpaynedotcom` and was applied to zero issues, open or closed.
-- `area:*`, `status:*` and repo-local `type:*` values are not seeded. They are per-repo vocabulary; imposing the hub's scheme on a repo with a handful of open issues is bureaucracy rather than standardization.
+- `area:*`, every `status:*` value other than `status:blocked`, and repo-local `type:*` values are not seeded. They are per-repo vocabulary; imposing the hub's scheme on a repo with a handful of open issues is bureaucracy rather than standardization. `status:blocked` is the exception because blocked is a label rather than a lane on every board (`scripts/gh-projects/README.md` § Status lanes), so it must mean the same thing in every repository.
 
 ## Preservation boundaries
 
