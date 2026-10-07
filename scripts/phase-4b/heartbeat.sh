@@ -62,7 +62,7 @@ p4b_heartbeat_write() {
 # Reader seam for #1590: process-instance identity reduces PID-reuse errors.
 # ps absence/indeterminate evidence is unknown, never a confident live/crashed.
 p4b_heartbeat_status() {
-  local record="$1" stage pid expected observed rc=0
+  local record="$1" stage pid expected observed started rc=0
   stage="$(jq -ser 'select(length == 1) | .[0] |
     select(type == "object" and .schema == "p4b-heartbeat/v1") |
     select(has("process_started_at")) |
@@ -78,40 +78,41 @@ p4b_heartbeat_status() {
   command -v ps >/dev/null 2>&1 || { printf 'unknown\n'; return 0; }
   expected="$(jq -er '.process_started_at | select(type == "string" and length > 0)' "$record" 2>/dev/null)" \
     || { printf 'unknown\n'; return 0; }
-  # lstart is rendered in the caller's local zone. Writer and reader pin UTC so
-  # a TZ set (or scrubbed) on either side cannot turn a live run into a crash.
+  started="$(jq -er '.started_at_epoch | select(type == "number" and . > 0)' "$record" 2>/dev/null)" || started=""
+  # lstart follows the zone of whoever runs ps, and the writer's zone is not
+  # recorded. The reader renders the live start in UTC and decides identity
+  # without knowing the writer's zone (p4b_heartbeat_same_process).
   observed="$(LC_ALL=C TZ=UTC ps -p "$pid" -o lstart= 2>/dev/null)" || rc=$?
   if [ "$rc" = 1 ] && [ -z "$observed" ]; then
     printf 'crashed\n'
   elif [ "$rc" != 0 ] || [ -z "$observed" ] || [ -z "$expected" ]; then
     printf 'unknown\n'
   else
-    case "$expected" in
-      *' UTC')
-        # Written with the UTC pin: an exact match is the same process.
-        if [ "$expected" = "$observed UTC" ]; then printf 'running\n'; else printf 'crashed\n'; fi ;;
-      *)
-        # A p4b-heartbeat/v1 record written before the UTC pin holds the start
-        # time in the writer's zone, which the reader cannot know. It is the
-        # same process when it differs from the UTC start by a whole zone
-        # offset: a multiple of 15 minutes, at most 14 hours either way.
-        case "$(p4b_heartbeat_zone_offset_match "$expected" "$observed")" in
-          yes) printf 'running\n' ;;
-          no) printf 'crashed\n' ;;
-          *) printf 'unknown\n' ;;
-        esac ;;
+    case "$(p4b_heartbeat_same_process "$expected" "$observed" "$started")" in
+      yes) printf 'running\n' ;;
+      no) printf 'crashed\n' ;;
+      *) printf 'unknown\n' ;;
     esac
   fi
   return 0
 }
 
-# Echoes yes when two ps lstart renderings differ by a whole time-zone offset,
-# no when they do not, and nothing when either cannot be parsed.
-p4b_heartbeat_zone_offset_match() { # <legacy lstart> <UTC lstart>
-  jq -nr --arg a "$1" --arg b "$2" '
+# Echoes yes when the live process is the record's writer, no when it is not, and
+# nothing when that cannot be decided. <recorded lstart> is in the writer's zone,
+# <observed lstart> in UTC. The writer is the process that owned the PID when it
+# wrote the record, so it started no later than started_at_epoch; a reused PID
+# belongs to a process that started after the writer ended, which is after the
+# record was written. Identity therefore needs both: the recorded start equals
+# the live start up to a whole zone offset (a multiple of 15 minutes, at most 14
+# hours), and the live process started no later than the record (#1830, #1837).
+p4b_heartbeat_same_process() { # <recorded lstart> <observed UTC lstart> <started_at_epoch>
+  jq -nr --arg a "$1" --arg b "$2" --arg started "$3" '
     def epoch: gsub("^\\s+|\\s+$"; "") | gsub("\\s+"; " ") | strptime("%a %b %d %H:%M:%S %Y") | mktime;
-    (($a | epoch) - ($b | epoch)) as $d
-    | if ($d % 900) == 0 and ($d | fabs) <= 50400 then "yes" else "no" end' 2>/dev/null || true
+    ($b | epoch) as $live | (($a | epoch) - $live) as $d
+    | if ($d % 900) != 0 or ($d | fabs) > 50400 then "no"
+      elif ($started | test("^[0-9]+([.][0-9]+)?$") | not) then empty
+      elif $live <= ($started | tonumber) then "yes"
+      else "no" end' 2>/dev/null || true
 }
 
 # Prune only old terminal/dead observations. Never delete a live long-running
@@ -161,10 +162,9 @@ p4b_heartbeat_start() {
   P4B_HB_STARTED_EPOCH="$(date +%s 2>/dev/null || true)"
   P4B_HB_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
   # Same pinned locale and zone as the p4b_heartbeat_status reader.
-  # The " UTC" suffix marks the pinned rendering, so the reader can tell it from
-  # a record written before the pin.
-  P4B_HB_PROCESS_STARTED_AT="$(LC_ALL=C TZ=UTC ps -p "$$" -o lstart= 2>/dev/null || true)"
-  [ -z "$P4B_HB_PROCESS_STARTED_AT" ] || P4B_HB_PROCESS_STARTED_AT="$P4B_HB_PROCESS_STARTED_AT UTC"
+  # The writer keeps the v1 rendering (its own zone), so readers of every version
+  # still parse it; p4b_heartbeat_status decides identity whatever zone it was in.
+  P4B_HB_PROCESS_STARTED_AT="$(LC_ALL=C ps -p "$$" -o lstart= 2>/dev/null || true)"
   P4B_HB_STAGES='[]'; P4B_HB_STAGE=""; P4B_HB_SUMMARY_EMITTED=false
   P4B_HB_EXIT_CODE=""
   # All local telemetry operations run guarded; no failed mkdir/JSON/mv/ps
