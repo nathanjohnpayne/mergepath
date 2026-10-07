@@ -101,6 +101,24 @@ def normalize_check(repo, value, workflows):
             'diagnostic': diagnostic, 'diagnostic_source': 'check-run output', 'superseded_by': None}
 
 
+def record_lineage(workflows, raw):
+    """Map a run's check suite to its workflow and run; conflicting observations map to None."""
+    suite_id = raw.get('check_suite_id')
+    if suite_id is not None:
+        suite = identity(suite_id)
+        lineage = {'workflow_id': identity(raw.get('workflow_id')), 'run_id': identity(raw.get('id'))}
+        # Conflicting suite/run observations never choose a convenient lineage.
+        workflows[suite] = lineage if suite not in workflows or workflows[suite] == lineage else None
+
+
+def _unmapped_suite(value, workflows):
+    """An Actions check-run whose check suite no observed run has mapped yet."""
+    if type(value) is not dict or type(value.get('app')) is not dict or value['app'].get('slug') != 'github-actions':
+        return False
+    suite = value.get('check_suite')
+    return type(suite) is dict and suite.get('id') is not None and identity(suite['id']) not in workflows
+
+
 def supersede(checks):
     """Retain history; a different producer or unknown time cannot clear it.
 
@@ -307,12 +325,7 @@ class CIProvider:
         for raw in runs:
             raw = _row(raw)
             run_id = identity(raw.get('id'))
-            suite_id = raw.get('check_suite_id')
-            if suite_id is not None:
-                suite = identity(suite_id)
-                lineage = {'workflow_id': identity(raw.get('workflow_id')), 'run_id': run_id}
-                # Conflicting suite/run observations never choose a convenient lineage.
-                workflows[suite] = lineage if suite not in workflows or workflows[suite] == lineage else None
+            record_lineage(workflows, raw)
             job_key = (repo, run_id, identity(raw.get('run_attempt', 1)))
             if run_id not in detailed:
                 jobs[run_id] = None
@@ -332,10 +345,24 @@ class CIProvider:
         # by completion time, which cannot prove that a success started after the failure it
         # hides. Scheduled sweeps attach check-runs to default-branch SHAs for days (2,052
         # observed on one mergepath SHA even with filter=latest), so other SHAs are not walked.
+        head_checks = {sha: self.client.pages(base + '/commits/' + sha + '/check-runs?filter=all&per_page=100',
+                                              collection='check_runs', max_pages=self.max_pages, deadline=deadline)
+                       for sha in sorted(current)}
+        # A completed run that ages past the window leaves the run list while its check-runs stay
+        # on the open HEAD. Lineage for those checks comes from the runs listed by head_sha, read
+        # only for a HEAD carrying an Actions check whose suite no listed run maps. The URL is
+        # stable, so an unchanged page revalidates as a free 304. These runs add lineage, not rows:
+        # their checks stay in check_rows, and an unmapped suite keeps no lineage, so absence never
+        # supersedes anything.
         for sha in sorted(current):
-            checks.extend(normalize_check(repo, check, workflows) for check in self.client.pages(
-                base + '/commits/' + sha + '/check-runs?filter=all&per_page=100', collection='check_runs',
-                max_pages=self.max_pages, deadline=deadline))
+            if any(_unmapped_suite(check, workflows) for check in head_checks[sha]):
+                for raw in self.client.pages(base + '/actions/runs?head_sha=' + sha + '&per_page=100', collection='workflow_runs',
+                                             max_pages=self.max_pages, deadline=deadline):
+                    raw = _row(raw)
+                    if _sha(raw.get('head_sha')) == sha:
+                        record_lineage(workflows, raw)
+        for sha in sorted(current):
+            checks.extend(normalize_check(repo, check, workflows) for check in head_checks[sha])
         # A failed run off every open HEAD keeps its own check suite's diagnostics when it was
         # created within DIAGNOSTIC_SECONDS. A completed attempt's suite is final, so each is read once.
         recent = self.clock() - DIAGNOSTIC_SECONDS
