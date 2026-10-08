@@ -17,10 +17,11 @@ SAFE = 2 ** 53 - 1
 INSTALLATION = "api rate limit exceeded for installation"
 # The message where an error line puts it: at the start of the line, after optional error-style
 # prefixes such as `gh: `, `##[error]` or `RequestError [HttpError]: `, or as a JSON `"message"`
-# value; and as GitHub ends it, with a period, `ID`, or the end of the line. Quoted or embedded
+# value anywhere on the line (compact objects too); and as GitHub ends it, with a period, `ID`,
+# the end of the line, or the JSON value's closing quote. Quoted or embedded
 # copies (`expected "API rate limit exceeded for installation." but ...`) do not match.
-EMITTED = re.compile(r"^(?:##\[(?:error|warning)\])?(?:[A-Za-z\[][\w\[\]().\- ]{0,40}:\s+)*(?:\"message\"\s*:\s*\")?"
-                     r"api rate limit exceeded for installation(?:\.|\s+id\b|\s*$)", re.I)
+EMITTED = re.compile(r"(?:^(?:##\[(?:error|warning)\])?(?:[A-Za-z\[][\w\[\]().\- ]{0,40}:\s+)*|\"message\"\s*:\s*\")"
+                     r"api rate limit exceeded for installation(?:\.|\s+id\b|\s*$|(?=\"))", re.I)
 # The runner echoes each run step's script between these markers before running it.
 PREAMBLE_OPEN, PREAMBLE_CLOSE = "##[group]Run ", "##[endgroup]"
 LOG_PREFIX = re.compile(r"^(?:\d{4}-\d\d-\d\dT[0-9:.]+Z )?")
@@ -34,6 +35,7 @@ ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # and a completed job's verdict never change, so both are cached.
 SCAN_INTERVAL = 120
 SCAN_RUNS = 5
+LIST_RUNS = 2 * SCAN_RUNS
 LOG_READS = 3
 JOB_PAGES = 5
 # Failure-class workflow-run conclusions the runs list can filter by (`status=`).
@@ -304,9 +306,9 @@ class ActionsProvider:
             # Every failure-class run conclusion the list filter accepts (#1840, #1841): a run that
             # timed out or awaits approval can hold the limit too. The newest five of each list
             # contain the newest five overall.
-            sample = {}
+            sample, tails = {}, []
             for conclusion in RUN_FAILURES:
-                payload = self.client.get(f"/repos/{repo}/actions/runs?status={conclusion}&created=%3E%3D{cutoff}&per_page={SCAN_RUNS}",
+                payload = self.client.get(f"/repos/{repo}/actions/runs?status={conclusion}&created=%3E%3D{cutoff}&per_page={LIST_RUNS}",
                                           deadline=deadline)
                 listed = payload.get("workflow_runs") if type(payload) is dict else None
                 if type(listed) is not list:
@@ -318,12 +320,18 @@ class ActionsProvider:
                     if created is None or created > now + 60:
                         raise ClientError("invalid_page")
                     sample.setdefault(raw["id"], (created, raw))
+                if len(listed) >= LIST_RUNS:
+                    tails.append(created)
             exhausted, complete = [], True
             # Newest first; the stable sort keeps the API's own order among equal creation times, and
             # every run tied with the fifth is sampled too, so a tie across the lists cannot push a
             # timed-out or approval-held run out of the sample.
             ordered = sorted(sample.values(), key=lambda item: item[0], reverse=True)
             boundary = ordered[SCAN_RUNS - 1][0] if len(ordered) >= SCAN_RUNS else None
+            # Each list reads twice the sample, so its last row sits on the boundary second only when
+            # six or more runs share it; then its next page may hold more tied runs, and the scan
+            # cannot claim it sampled every eligible run.
+            complete = not (boundary is not None and boundary in tails)
             for created, raw in [item for index, item in enumerate(ordered) if index < SCAN_RUNS or item[0] == boundary]:
                 if exhausted:
                     break
