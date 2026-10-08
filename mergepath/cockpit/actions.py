@@ -15,9 +15,12 @@ from .scheduler import Sample
 
 SAFE = 2 ** 53 - 1
 INSTALLATION = "api rate limit exceeded for installation"
-# The message as GitHub emits it: "... for installation. If you reach out ..." or "... for
-# installation ID 123.", or at the end of a line. Quoted command text ends in a quote instead.
-EMITTED = re.compile(r"api rate limit exceeded for installation(?:\.|\s+id\b|\s*$)", re.I)
+# The message where an error line puts it: at the start of the line, after optional error-style
+# prefixes such as `gh: `, `##[error]` or `RequestError [HttpError]: `, or as a JSON `"message"`
+# value; and as GitHub ends it, with a period, `ID`, or the end of the line. Quoted or embedded
+# copies (`expected "API rate limit exceeded for installation." but ...`) do not match.
+EMITTED = re.compile(r"^(?:##\[(?:error|warning)\])?(?:[A-Za-z\[][\w\[\]().\- ]{0,40}:\s+)*(?:\"message\"\s*:\s*\")?"
+                     r"api rate limit exceeded for installation(?:\.|\s+id\b|\s*$)", re.I)
 # The runner echoes each run step's script between these markers before running it.
 PREAMBLE_OPEN, PREAMBLE_CLOSE = "##[group]Run ", "##[endgroup]"
 LOG_PREFIX = re.compile(r"^(?:\d{4}-\d\d-\d\dT[0-9:.]+Z )?")
@@ -128,7 +131,7 @@ def logged_limit(text):
             continue
         if re.match(r"\++ ", line):
             continue
-        if EMITTED.search(line.rstrip()):
+        if EMITTED.search(line.strip()):
             return True
     return False
 
@@ -316,8 +319,12 @@ class ActionsProvider:
                         raise ClientError("invalid_page")
                     sample.setdefault(raw["id"], (created, raw))
             exhausted, complete = [], True
-            # Newest first; the stable sort keeps the API's own order among equal creation times.
-            for created, raw in sorted(sample.values(), key=lambda item: item[0], reverse=True)[:SCAN_RUNS]:
+            # Newest first; the stable sort keeps the API's own order among equal creation times, and
+            # every run tied with the fifth is sampled too, so a tie across the lists cannot push a
+            # timed-out or approval-held run out of the sample.
+            ordered = sorted(sample.values(), key=lambda item: item[0], reverse=True)
+            boundary = ordered[SCAN_RUNS - 1][0] if len(ordered) >= SCAN_RUNS else None
+            for created, raw in [item for index, item in enumerate(ordered) if index < SCAN_RUNS or item[0] == boundary]:
                 if exhausted:
                     break
                 # The coarse cutoff only keeps the URL cacheable; evidence is the exact last hour. A run
@@ -344,7 +351,10 @@ class ActionsProvider:
                         raise ClientError("invalid_page")
                     # Every failure-class conclusion, the CI taxonomy: a timed-out job can carry the limit too.
                     jobs = [str(job["id"]) for job in rows if job["conclusion"] in FAILURES]
-                    self._remember(self._scan_jobs, key, jobs)
+                    # An approval-held run resumes as the same run and attempt, so nothing about it is
+                    # cached: its jobs and logs are read afresh until it settles another way.
+                    if raw.get("conclusion") != "action_required":
+                        self._remember(self._scan_jobs, key, jobs)
                 for job in jobs:
                     verdict = self._scan_logs.get((repo, job))
                     if verdict is None:
@@ -356,7 +366,8 @@ class ActionsProvider:
                         body = self.client.read_job_log(repo, job, deadline=deadline)
                         text = body.decode("utf-8", "replace") if type(body) is bytes else body if type(body) is str else ""
                         verdict = logged_limit(text)
-                        self._remember(self._scan_logs, (repo, job), verdict)
+                        if raw.get("conclusion") != "action_required":
+                            self._remember(self._scan_logs, (repo, job), verdict)
                     if verdict:
                         exhausted.append((str(raw["id"]), created))
                         break

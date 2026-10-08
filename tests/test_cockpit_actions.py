@@ -643,6 +643,23 @@ class ActionsTests(unittest.TestCase):
         state['timed_out'] = []; state['action_required'] = [R(38, created=at + 121 - 5)]
         jobs[38] = [{'id': 381, 'conclusion': 'action_required'}]; logs['381'] = b'API rate limit exceeded for installation ID 77.'
         self.assertEqual(step()['runs'][0], '38'); self.assertEqual(reads, ['381'])
+        # An approval-held run resumes as the same run and attempt, so none of it is cached: once it
+        # fails and logs the limit, the next scan reads it afresh.
+        held = dict(R(36, created=current[0] + 121 - 4), conclusion='action_required')
+        state['runs'] = []; state['action_required'] = [held]; jobs[36] = [{'id': 361, 'conclusion': 'action_required'}]; logs['361'] = b'waiting for approval'
+        self.assertNotIn('36', step()['runs']); self.assertEqual(reads, ['361'])
+        state['action_required'] = []; state['runs'] = [dict(held, conclusion='failure')]
+        jobs[36] = [{'id': 361, 'conclusion': 'failure'}, {'id': 362, 'conclusion': 'failure'}]
+        logs['362'] = b'gh: API rate limit exceeded for installation. If you reach out'
+        self.assertEqual(step()['runs'][0], '36'); self.assertEqual(reads, ['361', '362'])
+        # Runs tied at the fifth slot across the lists are all sampled.
+        tie = current[0] + 121 - 2
+        state['runs'] = [R(60 + i, created=tie) for i in range(5)]
+        jobs.update({60 + i: [] for i in range(5)})
+        state['timed_out'] = [R(59, created=tie)]; jobs[59] = [{'id': 591, 'conclusion': 'timed_out'}]
+        logs['591'] = b'gh: API rate limit exceeded for installation. If you reach out'
+        self.assertEqual(step()['runs'][0], '59'); self.assertEqual(reads, ['591'])
+        state['timed_out'] = []
         state['action_required'] = []
         # Echoed command text in a failed job is not a proof (#1842); the scan reads it and stays clean.
         jobs[37] = [{'id': 371, 'conclusion': 'failure'}]
@@ -674,10 +691,17 @@ class ActionsTests(unittest.TestCase):
         self.assertFalse(logged_limit('\n'.join(preamble + [ts + 'checked status.txt: clean'])))
         for traced in ("+ grep -q 'API rate limit exceeded for installation' status.txt", "++ echo API rate limit exceeded for installation"):
             self.assertFalse(logged_limit(ts + traced), traced)
-        self.assertFalse(logged_limit(ts + "note: searching for 'API rate limit exceeded for installation' found nothing"))
+        # Quoted or embedded copies, even with GitHub's period, are not the emitted message.
+        for quoted in ("note: searching for 'API rate limit exceeded for installation' found nothing",
+                       "note: searching for 'API rate limit exceeded for installation. If you reach out' found nothing",
+                       'AssertionError: expected "API rate limit exceeded for installation." but got success',
+                       'checked: no API rate limit exceeded for installation. All good'):
+            self.assertFalse(logged_limit(ts + quoted), quoted)
         for emitted in ('gh: API rate limit exceeded for installation. If you reach out to GitHub Support for help',
                         '\t"message": "API rate limit exceeded for installation. If you reach out to GitHub Support"',
                         'HttpError: API rate limit exceeded for installation ID 1234567.', 'Error: API rate limit exceeded for installation',
+                        'RequestError [HttpError]: API rate limit exceeded for installation ID 1234567.', '##[error]API rate limit exceeded for installation.',
+                        '[merge-clearance-gate] ERROR: API rate limit exceeded for installation. If you reach out',
                         '\x1b[31mgh: api rate limit exceeded for installation. If you reach out\x1b[0m'):
             self.assertTrue(logged_limit('\n'.join(preamble + [ts + emitted])), emitted)
         # An emission after a preamble group still counts, and one before any group too.
