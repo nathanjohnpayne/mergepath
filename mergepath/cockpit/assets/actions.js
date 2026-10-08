@@ -133,6 +133,7 @@
     const coverage = cards.every(card=>card.available);
     const hasObservations = (num(billing.observed_at) && num(billing.net_amount))
       || repositories.some(row=>num(row.observed_at) && C.count(row.queued)!==null && C.count(row.running)!==null)
+      || repositories.some(row=>num(row?.installation_scan?.observed_at))
       || (num(robotData.observed_at) && robotData.configured_identity==="nathanpayne-robot");
     const bumps = states.filter(state=>state==="bump").length, boulders = states.filter(state=>state==="boulder").length;
     return {state:state==="clear"&&!coverage?"idle":state,label:boulders||bumps?`${boulders} at the limit · ${bumps} approaching${coverage?"":" · incomplete coverage"}`:coverage?"Headroom on every meter":"Headroom partly unavailable",
@@ -202,14 +203,15 @@
   // The header chip: which repositories' Actions GITHUB_TOKEN budgets are exhausted now.
   // Exhaustion is the observed installation rate-limit failure the token card carries;
   // nothing else establishes it, and reset is never observable.
-  function tokenSummary(model) {
+  // `streamStale` is the shell's own state: without a live stream nothing on the page is current.
+  function tokenSummary(model, streamStale = false) {
     const token = Array.isArray(model?.cards) ? model.cards.find(card => card?.id === "token") : null;
     const rows = Array.isArray(token?.rows) ? token.rows : [];
     if (!rows.length) return {state:"idle", value:"Not observed yet", note:"Actions budget awaiting its first observation"};
     const exhausted = rows.filter(row => row.exhausted === true);
     if (exhausted.length) {
       const names = exhausted.map(row => row.repo.split("/")[1]), runs = exhausted.flatMap(row => row.runs || []).slice(0,3);
-      const lastKnown = exhausted.every(row => row.stale === true);
+      const lastKnown = streamStale === true || exhausted.every(row => row.stale === true);
       return {state:"boulder", value:`Exhausted · ${names.join(", ")}`,
         note:`${lastKnown ? "Last known: installation" : "Installation"} rate limit in run ${runs.join(", ")} · reset unknown · GITHUB_TOKEN, 1,000 requests per hour per repository`, repos:exhausted.map(row => row.repo)};
     }
@@ -221,11 +223,12 @@
     const at = estimated("boulder"), near = estimated("bump"), warned = at.length ? at : near;
     if (warned.length) {
       return {state: at.length ? "boulder" : "bump", value:`${at.length ? "At the limit by estimate" : "Near the limit"} · ${warned.map(row => row.repo.split("/")[1]).join(", ")}`,
-        note:`Estimated from measured requests per run · exhaustion not observed · ${coverage}`, repos:warned.map(row => row.repo)};
+        note:`${streamStale === true ? "Last known: estimated" : "Estimated"} from measured requests per run · exhaustion not observed · ${coverage}`, repos:warned.map(row => row.repo)};
     }
-    // "No exhaustion seen" needs a fresh, complete failed-job log scan of every repository.
-    return {state: all ? "clear" : "idle", value: all ? "No exhaustion seen" : "Not fully observed",
-      note:`Failed-job logs of the last hour · ${coverage}`, repos:[]};
+    // "No exhaustion seen" needs a live stream and a fresh, complete failed-job log scan of every repository.
+    const clean = all && streamStale !== true;
+    return {state: clean ? "clear" : "idle", value: clean ? "No exhaustion seen" : "Not fully observed",
+      note:`${streamStale === true ? "Local stream not live · last known: " : ""}Failed-job logs of the last hour · ${coverage}`, repos:[]};
   }
   // Times at which a token row or the header changes on the clock alone: a settled scan leaving
   // SCAN_FRESH and a CI-derived row leaving the CI observation gap.

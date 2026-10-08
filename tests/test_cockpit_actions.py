@@ -559,7 +559,8 @@ class ActionsTests(unittest.TestCase):
         big = step(); self.assertEqual(big['error'], 'page_limit'); self.assertEqual(big['runs'][0], '19')
         # A failed job row that cannot be read fails the scan rather than vanishing from it.
         for index, bad_jobs in enumerate(([{'conclusion': 'failure'}], [{'id': 0, 'conclusion': 'failure'}], ['x'],
-                                          [{'id': True, 'conclusion': 'failure'}])):
+                                          [{'id': True, 'conclusion': 'failure'}], [{'id': 42}], [{'id': 42, 'conclusion': None}],
+                                          [{'id': 42, 'conclusion': 'FAILURE'}])):
             jobs[160 + index] = bad_jobs; state['runs'] = [R(160 + index, created=NOW + 600)]
             self.assertEqual(step()['error'], 'invalid_page', bad_jobs)
         # A listed run needs a zoned creation time.

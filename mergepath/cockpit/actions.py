@@ -25,6 +25,8 @@ SCAN_INTERVAL = 120
 SCAN_RUNS = 5
 LOG_READS = 3
 JOB_PAGES = 5
+# A finished job's documented conclusions; anything else cannot be read as not failed.
+CONCLUSIONS = frozenset({"success", "failure", "neutral", "cancelled", "skipped", "timed_out", "action_required"})
 SCAN_CACHE = 1024
 
 
@@ -276,7 +278,7 @@ class ActionsProvider:
                                              collection="jobs", max_pages=JOB_PAGES, deadline=deadline)
                     # An unreadable row could be a failed job, so it fails the scan rather than vanishing.
                     if type(rows) is not list or any(type(job) is not dict or not count(job.get("id")) or job["id"] == 0
-                                                     for job in rows):
+                                                     or job.get("conclusion") not in CONCLUSIONS for job in rows):
                         raise ClientError("invalid_page")
                     jobs = [str(job["id"]) for job in rows if job.get("conclusion") == "failure"]
                     self._remember(self._scan_jobs, key, jobs)

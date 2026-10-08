@@ -288,3 +288,18 @@ test('a stale scheduler envelope is never fresh scan coverage',()=>{
  const proof=model(data({repositories:[row({installation_scan:{observed_at:now,error:null,runs:['9']}})]}),true);
  assert.equal(proof.hazards[0].stale,true);assert.match(tokenSummary(proof).note,/^Last known: installation/);
 });
+test('an installation scan alone is a budget observation',()=>{
+ const scanOnly=row({observed_at:null,queued:null,running:null,runs_last_hour:null});
+ assert.equal(model(data({repositories:[scanOnly]})).hasObservations,true);
+ assert.equal(model(data({repositories:[{...scanOnly,installation_scan:{observed_at:null,error:'secondary_limit',runs:[]}}]})).hasObservations,false);
+});
+test('without a live stream the header never reads current',()=>{
+ const calm=model(data({repositories:[row(),row({repo:'owner/fiveacross'})]}));
+ assert.equal(tokenSummary(calm).value,'No exhaustion seen');
+ const off=tokenSummary(calm,true);assert.equal(off.state,'idle');assert.equal(off.value,'Not fully observed');
+ assert.match(off.note,/^Local stream not live · last known: Failed-job logs of the last hour · 2 of 2 repositories scanned$/);
+ const hot=tokenSummary(model(data({repositories:[row({installation_runs:['9']})]})),true);
+ assert.equal(hot.value,'Exhausted · mergepath');assert.match(hot.note,/^Last known: installation/);
+ const near=tokenSummary(model(data({repositories:[row({estimated_requests:800,measurement:measured()})]})),true);
+ assert.equal(near.value,'Near the limit · mergepath');assert.match(near.note,/^Last known: estimated/);
+});
