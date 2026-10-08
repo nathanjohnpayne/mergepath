@@ -310,3 +310,14 @@ test('last-known scan proofs age the token card but not the queue card',()=>{
  const live=model(data({repositories:[row({installation_scan:{observed_at:now,error:null,runs:['9']}})]}));
  assert.equal(live.cards.find(card=>card.id==='token').stale,false);
 });
+test('a fresh scan proof keeps the token card fresh beside a stale CI row',()=>{
+ const m=model(data({repositories:[row({observed_at:now-400,installation_scan:{observed_at:now,error:null,runs:['9']}})]}));
+ assert.equal(m.cards.find(card=>card.id==='token').stale,false);assert.equal(m.cards.find(card=>card.id==='queue').stale,true);
+ assert.equal(m.hazards.find(h=>h.id.startsWith('actions-token-')).stale,false);
+ assert.equal(model(data(),true).cards.find(card=>card.id==='token').stale,true);
+});
+test('a measured estimate expiring is a display-clock boundary',()=>{
+ const d=data({repositories:[row({observed_at:now-10,installation_scan:{observed_at:now-20,error:null,runs:[]},estimated_requests:800,measurement:{...measured(),observed_at:now-3000}})]});
+ assert.deepEqual(tokenBoundaries(d),[now-20+300,now-10+270,now-3000+3600]);
+ assert.equal(boundaryCrossed(tokenBoundaries(d),now+599,now+601),true);
+});

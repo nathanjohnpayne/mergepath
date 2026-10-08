@@ -246,14 +246,16 @@ class ActionsProvider:
         last = self._scans.get(repo)
         # A proof leaving its hour inside the interval ends the cached answer: the scan runs again
         # rather than publishing an expired run, or a clean result that run had settled.
-        if (last is not None and 0 <= now - last["attempted_at"] < SCAN_INTERVAL
+        # A scan the deadline cut short retries on the next tick instead: its job lists and log
+        # verdicts are cached, so each attempt advances from where the last one stopped.
+        if (last is not None and 0 <= now - last["attempted_at"] < SCAN_INTERVAL and not last["retry"]
                 and all(at >= now - 3600 for at in last["proofs"].values())):
             return last
         # Proofs map an exhausted run id to its creation time and hold only for the hour after it,
         # pruned before every refresh so a failing or incomplete scan cannot keep an expired one.
         proofs = {run: at for run, at in (last["proofs"] if last else {}).items() if at >= now - 3600}
         state = {"attempted_at": now, "observed_at": last["observed_at"] if last else None,
-                 "error": None, "runs": newest(proofs), "proofs": proofs}
+                 "error": None, "runs": newest(proofs), "proofs": proofs, "retry": False}
         try:
             # The cutoff is floored to five minutes so the list URL revalidates as a free 304.
             cutoff = dt.datetime.fromtimestamp((now - 3600) // 300 * 300, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -296,6 +298,7 @@ class ActionsProvider:
                     if verdict is None:
                         if reads >= LOG_READS or self.monotonic() >= deadline:
                             complete = False
+                            state["retry"] = state["retry"] or self.monotonic() >= deadline
                             continue
                         reads += 1
                         body = self.client.read_job_log(repo, job, deadline=deadline)
@@ -314,7 +317,7 @@ class ActionsProvider:
                 # Not clean evidence: the last settled runs stand until a settled scan replaces them.
                 state["error"] = "incomplete"
         except ClientError as exc:
-            state["error"] = exc.category
+            state["error"], state["retry"] = exc.category, exc.category == "deadline_exceeded"
         except Exception:
             state["error"] = "source_failed"
         self._scans[repo] = state

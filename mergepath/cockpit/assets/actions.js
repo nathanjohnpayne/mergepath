@@ -112,8 +112,9 @@
       if (["bump","boulder"].includes(qs)) hazard(queue,qs,row.repo,jam?`${row.queued} queued, ${row.running} running continuously >30 minutes. Cockpit jam heuristic.`:`${row.queued} queued; warning reference 10, runner capacity unknown.`,jam?{kind:"now"}:{kind:"unknown"},C.epoch(row.observed_at),!good);
     }
     token.state = C.worstState(token.rows.map(row=>row.state)); token.available = repositories.length > 0 && tokenKnown === repositories.length;
-    // Retained scan proofs can be last known while the CI counts are fresh; that ages the token card alone.
-    token.stale = anyStale || token.rows.some(row => row.stale === true); token.note = "Estimates: runs in the last hour × explicitly measured requests per run. Installation failure overrides estimates. Reset and exhaustion ETA unavailable without evidence.";
+    // The token card ages with token evidence alone: a fresh scan proof stays fresh beside a stale CI row,
+    // and a last-known proof ages it beside fresh CI counts. CI-row staleness stays on the queue card.
+    token.stale = envelope.stale === true || token.rows.some(row => row.stale === true); token.note = "Estimates: runs in the last hour × explicitly measured requests per run. Installation failure overrides estimates. Reset and exhaustion ETA unavailable without evidence.";
     queue.state = C.worstState(queue.rows.map(row=>row.state)); queue.available = repositories.length > 0 && queueKnown === repositories.length; queue.stale = anyStale;
     queue.value = `${q} queued · ${r} running${queue.available ? "" : " · partial / unavailable coverage"}`;
     queue.note = "Warning reference: ≥10 queued; jam heuristic: ≥40 queued and ≤1 running continuously >30 min. Runner capacity and drain ETA unavailable.";
@@ -232,11 +233,12 @@
       note:`${streamStale === true ? "Local stream not live · last known: " : ""}Failed-job logs of the last hour · ${coverage}`, repos:[]};
   }
   // Times at which a token row or the header changes on the clock alone: a settled scan leaving
-  // SCAN_FRESH and a CI-derived row leaving the CI observation gap.
+  // SCAN_FRESH, a CI-derived row leaving the CI observation gap, and a measurement leaving its hour.
   function tokenBoundaries(data) {
     const rows = Array.isArray(data?.repositories) ? data.repositories : [];
     return rows.flatMap(row => [num(row?.installation_scan?.observed_at) ? row.installation_scan.observed_at + SCAN_FRESH : null,
-      C.epoch(row?.observed_at) === null ? null : C.epoch(row.observed_at) + CI_OBSERVATION_GAP]).filter(value => value !== null);
+      C.epoch(row?.observed_at) === null ? null : C.epoch(row.observed_at) + CI_OBSERVATION_GAP,
+      num(row?.measurement?.observed_at) ? row.measurement.observed_at + 3600 : null]).filter(value => value !== null);
   }
   function install(app) {app.registerPanel("budget","actions",project,render);}
   return {project,BudgetView,render,install,tokenSummary,tokenBoundaries};

@@ -485,7 +485,7 @@ class ActionsTests(unittest.TestCase):
                 6: [{'id': 61, 'conclusion': 'failure'}], 7: [{'id': i, 'conclusion': 'failure'} for i in (71, 72, 73, 74)]}
         logs = {'51': b'gh: API rate limit exceeded for installation. If you reach out', '61': b'other failure',
                 '71': b'x', '72': b'x', '73': b'x', '74': b'API rate limit exceeded for installation'}
-        reads, gets, current, oversized = [], [], [NOW], set()
+        reads, gets, current, oversized, cut = [], [], [NOW], set(), set()
         class ScanFake(Fake):
             def get(self, path, *, deadline):
                 if '/settings/billing/' in path:
@@ -507,7 +507,10 @@ class ActionsTests(unittest.TestCase):
                     raise ClientError('page_limit')
                 return jobs[run_id]
             def read_job_log(self, repo, job, *, deadline):
-                reads.append(job); return logs[job]
+                reads.append(job)
+                if job in cut:
+                    cut.discard(job); raise ClientError('deadline_exceeded')
+                return logs[job]
         stale = lambda repo, now: {'complete': True, 'stale': True, 'observed_at': NOW, 'queued': [], 'running': [], 'hour': []}
         p = ActionsProvider(ScanFake(), [SimpleNamespace(repo=REPO)], clock=lambda: current[0], monotonic=lambda: 0,
                             ci_snapshot=stale, installation_scan=True)
@@ -579,6 +582,12 @@ class ActionsTests(unittest.TestCase):
         within = step(61); self.assertEqual(len(gets), 1, 'the cache is bypassed once runs 5 and 7 expire')
         self.assertEqual(within, {'observed_at': current[0], 'error': None, 'runs': ['20', '19', '9']})
         self.assertEqual((step(30), gets), (within, []))
+        # A scan the deadline cut short retries on the next tick, advancing from its caches.
+        jobs[21] = [{'id': 211, 'conclusion': 'failure'}]; logs['211'] = b'API rate limit exceeded for installation'
+        state['runs'] = [R(21, created=NOW + 600)]; cut.add('211')
+        self.assertEqual(step()['error'], 'deadline_exceeded')
+        retried = step(15); self.assertEqual((reads, retried['error'], retried['runs'][0]), (['211'], None, '21'))
+        within = retried; self.assertEqual((step(15), gets), (retried, []))
         # Proofs expire with their hour even while every refresh fails.
         state['error'] = 'secondary_limit'; current[0] = NOW + 600 + 3601 - 121
         self.assertEqual(step(), {'observed_at': within['observed_at'], 'error': 'secondary_limit', 'runs': []})
