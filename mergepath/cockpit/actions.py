@@ -249,11 +249,12 @@ class ActionsProvider:
         # A scan the deadline cut short retries on the next tick instead: its job lists and log
         # verdicts are cached, so each attempt advances from where the last one stopped.
         if (last is not None and 0 <= now - last["attempted_at"] < SCAN_INTERVAL and not last["retry"]
-                and all(at >= now - 3600 for at in last["proofs"].values())):
+                and all(now - 3600 <= at <= now for at in last["proofs"].values())):
             return last
         # Proofs map an exhausted run id to its creation time and hold only for the hour after it,
         # pruned before every refresh so a failing or incomplete scan cannot keep an expired one.
-        proofs = {run: at for run, at in (last["proofs"] if last else {}).items() if at >= now - 3600}
+        # Both bounds: a clock that stepped back must not keep a proof dated after it.
+        proofs = {run: at for run, at in (last["proofs"] if last else {}).items() if now - 3600 <= at <= now}
         # A retry stays inside the window it continues: three log reads per repository per window.
         carried = last is not None and last["retry"] and 0 <= now - last["window"] < SCAN_INTERVAL
         state = {"attempted_at": now, "observed_at": last["observed_at"] if last else None,

@@ -612,6 +612,9 @@ class ActionsTests(unittest.TestCase):
         self.assertEqual(aged, {'observed_at': current[0], 'error': None, 'runs': []})
         state['runs'] = [R(18, created=current[0] + 121 - 3600)]
         self.assertEqual(step()['runs'], ['18']); self.assertEqual(reads, ['181'])
+        # A clock that steps back drops a proof dated after it rather than republishing it as current.
+        current[0] -= 3600 + 10; reads.clear(); gets.clear()
+        back = scan(); self.assertEqual((back['error'], back['runs'], len(gets)), (None, [], 1))
         # Without the launcher flag the provider makes no reads beside the snapshot.
         quiet = ScanFake(); gets.clear()
         ActionsProvider(quiet, [SimpleNamespace(repo=REPO)], clock=lambda: NOW, monotonic=lambda: 0, ci_snapshot=stale).fetch(30)
