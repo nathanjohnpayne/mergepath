@@ -15,6 +15,13 @@ from .scheduler import Sample
 
 SAFE = 2 ** 53 - 1
 INSTALLATION = "api rate limit exceeded for installation"
+# The message as GitHub emits it: "... for installation. If you reach out ..." or "... for
+# installation ID 123.", or at the end of a line. Quoted command text ends in a quote instead.
+EMITTED = re.compile(r"api rate limit exceeded for installation(?:\.|\s+id\b|\s*$)", re.I)
+# The runner echoes each run step's script between these markers before running it.
+PREAMBLE_OPEN, PREAMBLE_CLOSE = "##[group]Run ", "##[endgroup]"
+LOG_PREFIX = re.compile(r"^(?:\d{4}-\d\d-\d\dT[0-9:.]+Z )?")
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # A gate that runs out of its repository GITHUB_TOKEN usually prints the limit only in its
 # job log (observed on nathanpaynedotcom on 2026-10-07), never in run or check output, and
 # the busiest repositories are the ones the CI scan covers least. So the installation scan
@@ -26,6 +33,8 @@ SCAN_INTERVAL = 120
 SCAN_RUNS = 5
 LOG_READS = 3
 JOB_PAGES = 5
+# Failure-class workflow-run conclusions the runs list can filter by (`status=`).
+RUN_FAILURES = ("failure", "timed_out", "action_required")
 SCAN_CACHE = 1024
 
 
@@ -99,6 +108,29 @@ def measured_coefficient(value, repo, now):
         return None
     return {"requests_per_run": requests / runs, "observed_at": observed,
             "window_start": start, "window_end": end, "provenance": provenance.strip()}
+
+
+def logged_limit(text):
+    """True when a job log emits the installation-limit message as output.
+
+    Echoed command text is not evidence (#1842): the runner prints each run step's script between
+    `##[group]Run` and `##[endgroup]`, and bash xtrace prints commands behind `+`, so a step that
+    merely greps for the message would otherwise read as exhausted.
+    """
+    preamble = False
+    for raw in text.splitlines():
+        line = LOG_PREFIX.sub("", ANSI.sub("", raw), count=1)
+        if preamble:
+            preamble = not line.startswith(PREAMBLE_CLOSE)
+            continue
+        if line.startswith(PREAMBLE_OPEN):
+            preamble = True
+            continue
+        if re.match(r"\++ ", line):
+            continue
+        if EMITTED.search(line.rstrip()):
+            return True
+    return False
 
 
 def newest(proofs):
@@ -257,27 +289,37 @@ class ActionsProvider:
         proofs = {run: at for run, at in (last["proofs"] if last else {}).items() if now - 3600 <= at <= now}
         # Any rescan inside a window (a deadline retry or a proof-expiry rescan) continues it: three
         # log reads per repository per 120-second window.
-        carried = last is not None and 0 <= now - last["window"] < SCAN_INTERVAL
+        # The window runs on the monotonic clock (#1840): a wall-clock step must not refill it.
+        mono = self.monotonic()
+        carried = last is not None and 0 <= mono - last["window"] < SCAN_INTERVAL
         state = {"attempted_at": now, "observed_at": last["observed_at"] if last else None,
                  "error": None, "runs": newest(proofs), "proofs": proofs, "retry": False,
-                 "window": last["window"] if carried else now, "reads": last["reads"] if carried else 0}
+                 "window": last["window"] if carried else mono, "reads": last["reads"] if carried else 0}
         try:
             # The cutoff is floored to five minutes so the list URL revalidates as a free 304.
             cutoff = dt.datetime.fromtimestamp((now - 3600) // 300 * 300, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            payload = self.client.get(f"/repos/{repo}/actions/runs?status=failure&created=%3E%3D{cutoff}&per_page={SCAN_RUNS}",
-                                      deadline=deadline)
-            listed = payload.get("workflow_runs") if type(payload) is dict else None
-            if type(listed) is not list:
-                raise ClientError("invalid_page")
+            # Every failure-class run conclusion the list filter accepts (#1840, #1841): a run that
+            # timed out or awaits approval can hold the limit too. The newest five of each list
+            # contain the newest five overall.
+            sample = {}
+            for conclusion in RUN_FAILURES:
+                payload = self.client.get(f"/repos/{repo}/actions/runs?status={conclusion}&created=%3E%3D{cutoff}&per_page={SCAN_RUNS}",
+                                          deadline=deadline)
+                listed = payload.get("workflow_runs") if type(payload) is dict else None
+                if type(listed) is not list:
+                    raise ClientError("invalid_page")
+                for raw in listed:
+                    if type(raw) is not dict or not count(raw.get("id")) or raw["id"] == 0:
+                        raise ClientError("invalid_page")
+                    created = iso_epoch(raw.get("created_at"))
+                    if created is None or created > now + 60:
+                        raise ClientError("invalid_page")
+                    sample.setdefault(raw["id"], (created, raw))
             exhausted, complete = [], True
-            for raw in listed[:SCAN_RUNS]:
+            # Newest first; the stable sort keeps the API's own order among equal creation times.
+            for created, raw in sorted(sample.values(), key=lambda item: item[0], reverse=True)[:SCAN_RUNS]:
                 if exhausted:
                     break
-                if type(raw) is not dict or not count(raw.get("id")) or raw["id"] == 0:
-                    raise ClientError("invalid_page")
-                created = iso_epoch(raw.get("created_at"))
-                if created is None or created > now + 60:
-                    raise ClientError("invalid_page")
                 # The coarse cutoff only keeps the URL cacheable; evidence is the exact last hour. A run
                 # dated ahead of this clock waits until it enters it, and since it took a sample slot,
                 # the scan cannot claim it read every eligible run.
@@ -313,7 +355,7 @@ class ActionsProvider:
                         state["reads"] += 1
                         body = self.client.read_job_log(repo, job, deadline=deadline)
                         text = body.decode("utf-8", "replace") if type(body) is bytes else body if type(body) is str else ""
-                        verdict = INSTALLATION in text.casefold()
+                        verdict = logged_limit(text)
                         self._remember(self._scan_logs, (repo, job), verdict)
                     if verdict:
                         exhausted.append((str(raw["id"]), created))
