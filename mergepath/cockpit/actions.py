@@ -15,13 +15,18 @@ from .scheduler import Sample
 
 SAFE = 2 ** 53 - 1
 INSTALLATION = "api rate limit exceeded for installation"
-# The message where an error line puts it: at the start of the line, after optional error-style
-# prefixes such as `gh: `, `##[error]` or `RequestError [HttpError]: `, or as a JSON `"message"`
-# value anywhere on the line (compact objects too); and as GitHub ends it, with a period, `ID`,
-# the end of the line, or the JSON value's closing quote. Quoted or embedded
-# copies (`expected "API rate limit exceeded for installation." but ...`) do not match.
-EMITTED = re.compile(r"(?:^(?:##\[(?:error|warning)\])?(?:[A-Za-z\[][\w\[\]().\- ]{0,40}:\s+)*|\"message\"\s*:\s*\")"
-                     r"api rate limit exceeded for installation(?:\.|\s+id\b|\s*$|(?=\"))", re.I)
+# The message as GitHub ends it: a period, `ID`, the end of the line, or a JSON value's closing quote.
+MESSAGE = re.compile(r"api rate limit exceeded for installation(?:\.|\s+id\b|\s*$|(?=\"))", re.I)
+# What may come before it on an emitted error line (#1842). Bare, after a runner `##[error]`
+# marker; after `label: ` prefixes whose last one names an error (`gh: `, `Error: `,
+# `RequestError [HttpError]: `, `[tool] ERROR: `), so `note: ` is not one; or as the `"message"`
+# value of a JSON response line, where only labels, an opening brace and other fields may precede
+# it. Quoted, embedded or wrapped copies (`expected {"message": ...} but`) match none of these.
+MARKER = r"(?:##\[(?:error|warning)\])?"
+LABEL = r"[A-Za-z\[][\w\[\]().\- ]{0,40}:\s+"
+ERROR_HEAD = re.compile(rf"{MARKER}(?:{LABEL})*", re.I)
+ERROR_WORD = re.compile(r"error|fatal|exception|failed|failure|\bgh\b", re.I)
+JSON_HEAD = re.compile(rf"\s*{MARKER}(?:{LABEL})*\{{?\s*(?:\"[^\"]*\"\s*:\s*(?:\"[^\"]*\"|-?[\d.]+|true|false|null)\s*,\s*)*\"message\"\s*:\s*\"", re.I)
 # The runner echoes each run step's script between these markers before running it.
 PREAMBLE_OPEN, PREAMBLE_CLOSE = "##[group]Run ", "##[endgroup]"
 LOG_PREFIX = re.compile(r"^(?:\d{4}-\d\d-\d\dT[0-9:.]+Z )?")
@@ -133,8 +138,15 @@ def logged_limit(text):
             continue
         if re.match(r"\++ ", line):
             continue
-        if EMITTED.search(line.strip()):
-            return True
+        line = line.strip()
+        for match in MESSAGE.finditer(line):
+            head = line[:match.start()]
+            if JSON_HEAD.fullmatch(head):
+                return True
+            if ERROR_HEAD.fullmatch(head):
+                labels = re.findall(LABEL, head)
+                if not labels or ERROR_WORD.search(labels[-1]):
+                    return True
     return False
 
 

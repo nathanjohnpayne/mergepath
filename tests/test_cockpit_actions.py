@@ -704,7 +704,9 @@ class ActionsTests(unittest.TestCase):
                        "note: searching for 'API rate limit exceeded for installation. If you reach out' found nothing",
                        'AssertionError: expected "API rate limit exceeded for installation." but got success',
                        'checked: no API rate limit exceeded for installation. All good',
-                       '{"note":"API rate limit exceeded for installation."}'):
+                       '{"note":"API rate limit exceeded for installation."}',
+                       'note: API rate limit exceeded for installation. is the text we check for; no limit occurred',
+                       'AssertionError: expected {"message":"API rate limit exceeded for installation."} but got success'):
             self.assertFalse(logged_limit(ts + quoted), quoted)
         for emitted in ('gh: API rate limit exceeded for installation. If you reach out to GitHub Support for help',
                         '\t"message": "API rate limit exceeded for installation. If you reach out to GitHub Support"',
@@ -712,7 +714,7 @@ class ActionsTests(unittest.TestCase):
                         'RequestError [HttpError]: API rate limit exceeded for installation ID 1234567.', '##[error]API rate limit exceeded for installation.',
                         '[merge-clearance-gate] ERROR: API rate limit exceeded for installation. If you reach out',
                         '{"message":"API rate limit exceeded for installation.","documentation_url":"https://docs.github.com"}',
-                        'response: {"message": "API rate limit exceeded for installation ID 9."}', '{"message":"API rate limit exceeded for installation"}',
+                        'response: {"message": "API rate limit exceeded for installation ID 9."}', '{"status":"403","message":"API rate limit exceeded for installation."}', '{"message":"API rate limit exceeded for installation"}',
                         '\x1b[31mgh: api rate limit exceeded for installation. If you reach out\x1b[0m'):
             self.assertTrue(logged_limit('\n'.join(preamble + [ts + emitted])), emitted)
         # An emission after a preamble group still counts, and one before any group too.
