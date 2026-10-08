@@ -278,9 +278,13 @@ class ActionsProvider:
                 created = iso_epoch(raw.get("created_at"))
                 if created is None or created > now + 60:
                     raise ClientError("invalid_page")
-                # The coarse cutoff only keeps the URL cacheable; evidence is the exact last hour, and
-                # a run dated ahead of this clock waits until it enters it.
-                if not now - 3600 <= created <= now:
+                # The coarse cutoff only keeps the URL cacheable; evidence is the exact last hour. A run
+                # dated ahead of this clock waits until it enters it, and since it took a sample slot,
+                # the scan cannot claim it read every eligible run.
+                if created > now:
+                    complete = False
+                    continue
+                if created < now - 3600:
                     continue
                 attempt = raw.get("run_attempt", 1)
                 if not count(attempt) or attempt == 0:

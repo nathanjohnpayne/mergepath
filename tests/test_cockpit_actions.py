@@ -611,7 +611,8 @@ class ActionsTests(unittest.TestCase):
         # A run dated ahead of this clock waits until it enters the window.
         jobs[22] = [{'id': 221, 'conclusion': 'failure'}]; logs['221'] = b'API rate limit exceeded for installation'
         state['runs'] = [R(22, created=current[0] + 121 + 30)]
-        ahead = step(121); self.assertEqual((reads, ahead['error']), ([], None)); self.assertNotIn('22', ahead['runs'])
+        # It took a sample slot, so the scan is incomplete rather than clean.
+        ahead = step(121); self.assertEqual((reads, ahead['error']), ([], 'incomplete')); self.assertNotIn('22', ahead['runs'])
         within = ahead
         # Proofs expire with their hour even while every refresh fails.
         state['error'] = 'secondary_limit'; current[0] = NOW + 600 + 3601 - 121
@@ -625,7 +626,7 @@ class ActionsTests(unittest.TestCase):
         self.assertEqual(step()['runs'], ['18']); self.assertEqual(reads, ['181'])
         # A clock that steps back drops a proof dated after it rather than republishing it as current.
         current[0] -= 3600 + 10; reads.clear(); gets.clear()
-        back = scan(); self.assertEqual((back['error'], back['runs'], len(gets)), (None, [], 1))
+        back = scan(); self.assertEqual((back['error'], back['runs'], len(gets)), ('incomplete', [], 1))
         # Without the launcher flag the provider makes no reads beside the snapshot.
         quiet = ScanFake(); gets.clear()
         ActionsProvider(quiet, [SimpleNamespace(repo=REPO)], clock=lambda: NOW, monotonic=lambda: 0, ci_snapshot=stale).fetch(30)
