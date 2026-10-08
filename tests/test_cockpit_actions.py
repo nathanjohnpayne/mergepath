@@ -520,6 +520,9 @@ class ActionsTests(unittest.TestCase):
         p = ActionsProvider(ScanFake(), [SimpleNamespace(repo=REPO)], clock=lambda: current[0], monotonic=mono,
                             ci_snapshot=stale, installation_scan=True)
         scan = lambda: p.fetch(mono() + 30).data['repositories'][0]['installation_scan']
+        def unproven():
+            # The cases after this call test a scan holding no proof; proofs otherwise stand for their hour.
+            p._scans[REPO]['proofs'] = {}
         def step(seconds=121):
             current[0] += seconds; reads.clear(); gets.clear(); return scan()
         row = p.fetch(mono() + 30).data['repositories'][0]
@@ -532,11 +535,11 @@ class ActionsTests(unittest.TestCase):
         # Within the interval nothing is read again; after it, jobs and verdicts come from the cache.
         self.assertEqual((step(60), gets, reads), (row['installation_scan'], [], []))
         step(61); self.assertEqual((len(gets), reads), (len(RUN_FAILURES), []))
-        # At most three log reads per scan. An incomplete scan is not clean evidence: the last
-        # settled runs stand with their time.
-        state['runs'] = [R(7)]; settled = current[0]
+        # At most three log reads per scan. The read window leaves run 7 unfinished, but run 5's
+        # proof is still inside its hour and answers the scan on its own, so it settles.
+        state['runs'] = [R(7)]
         partial = step()
-        self.assertEqual(reads, ['71', '72', '73']); self.assertEqual(partial, {'observed_at': settled, 'error': 'incomplete', 'runs': ['5']})
+        self.assertEqual(reads, ['71', '72', '73']); self.assertEqual(partial, {'observed_at': current[0], 'error': None, 'runs': ['5']})
         # A settled scan samples only the newest runs and cannot disprove an earlier proof inside
         # the hour, so run 5 stands beside run 7, newest first.
         done = step(); self.assertEqual(done, {'observed_at': current[0], 'error': None, 'runs': ['7', '5']})
@@ -596,7 +599,7 @@ class ActionsTests(unittest.TestCase):
         # A retry stays inside its window's three log reads, and a pending retry keeps the source hot.
         jobs[23] = [{'id': i, 'conclusion': 'failure'} for i in (231, 232, 233, 234)]
         logs.update({str(i): b'x' for i in (231, 232, 233, 234)}); state['runs'] = [R(23, created=NOW + 600)]; cut.add('232')
-        current[0] += 121; reads.clear(); cutting = p.fetch(mono() + 30)
+        unproven(); current[0] += 121; reads.clear(); cutting = p.fetch(mono() + 30)
         self.assertEqual(cutting.data['repositories'][0]['installation_scan']['error'], 'deadline_exceeded'); self.assertEqual(reads, ['231', '232'])
         self.assertTrue(cutting.hot, 'a deadline-cut scan is retried on the hot cadence')
         current[0] += 15; settled = p.fetch(mono() + 30)
@@ -617,7 +620,7 @@ class ActionsTests(unittest.TestCase):
         jobs[22] = [{'id': 221, 'conclusion': 'failure'}]; logs['221'] = b'API rate limit exceeded for installation'
         state['runs'] = [R(22, created=current[0] + 121 + 30)]
         # It took a sample slot, so the scan is incomplete rather than clean.
-        ahead = step(121); self.assertEqual((reads, ahead['error']), ([], 'incomplete')); self.assertNotIn('22', ahead['runs'])
+        unproven(); ahead = step(121); self.assertEqual((reads, ahead['error']), ([], 'incomplete')); self.assertNotIn('22', ahead['runs'])
         within = ahead
         # Proofs expire with their hour even while every refresh fails.
         state['error'] = 'secondary_limit'; current[0] = NOW + 600 + 3601 - 121
@@ -631,7 +634,7 @@ class ActionsTests(unittest.TestCase):
         self.assertEqual(step()['runs'], ['18']); self.assertEqual(reads, ['181'])
         # A clock that steps back drops a proof dated after it rather than republishing it as current.
         current[0] -= 3600 + 10; reads.clear(); gets.clear()
-        back = scan(); self.assertEqual((back['error'], back['runs'], len(gets)), ('incomplete', [], len(RUN_FAILURES)))
+        unproven(); back = scan(); self.assertEqual((back['error'], back['runs'], len(gets)), ('incomplete', [], len(RUN_FAILURES)))
         # Every failure-class run conclusion is listed (#1841): the newest five across the lists are
         # sampled, so a newer timed-out run outranks older failed ones.
         at = current[0] + 121
@@ -658,7 +661,7 @@ class ActionsTests(unittest.TestCase):
         state['runs'] = []; state['action_required'] = [waiting]
         jobs[35] = [{'id': i, 'conclusion': 'action_required'} for i in (351, 352, 353, 354)]
         logs.update({'351': b'x', '352': b'x', '353': b'x', '354': b'gh: API rate limit exceeded for installation. If you reach out'})
-        first = step(); self.assertEqual((reads, first['error']), (['351', '352', '353'], 'incomplete'))
+        unproven(); first = step(); self.assertEqual((reads, first['error']), (['351', '352', '353'], 'incomplete'))
         self.assertEqual(step()['runs'][0], '35'); self.assertEqual(reads, ['354'])
         state['action_required'] = []
         # Runs tied at the fifth slot across the lists are all sampled.
@@ -674,7 +677,11 @@ class ActionsTests(unittest.TestCase):
         # page, so with no proof the scan is incomplete; one second older and it is clean.
         tie = current[0] + 121 - 2
         state['runs'] = [R(70 + i, created=tie) for i in range(10)]; jobs.update({70 + i: [] for i in range(10)})
-        self.assertEqual(step()['error'], 'incomplete')
+        unproven(); self.assertEqual(step()['error'], 'incomplete')
+        # With a proof still inside its hour, the same hidden tie settles: the proof answers the scan.
+        p._scans[REPO]['proofs'] = {'59': current[0] - 60}
+        self.assertEqual(step(), {'observed_at': current[0], 'error': None, 'runs': ['59']})
+        tie = current[0] + 121 - 2
         tie = current[0] + 121 - 2
         state['runs'] = [R(70 + i, created=tie) for i in range(9)] + [R(79, created=tie - 1)]
         self.assertEqual(step()['error'], None)
@@ -688,7 +695,7 @@ class ActionsTests(unittest.TestCase):
         # refills it nor reopens the cached answer's reads.
         jobs[50] = [{'id': i, 'conclusion': 'failure'} for i in (501, 502, 503, 504)]; logs.update({str(i): b'x' for i in (501, 502, 503, 504)})
         state['runs'] = [R(50, created=current[0] + 121 - 20)]
-        capped = step(); self.assertEqual((reads, capped['error']), (['501', '502', '503'], 'incomplete'))
+        unproven(); capped = step(); self.assertEqual((reads, capped['error']), (['501', '502', '503'], 'incomplete'))
         current[0] -= 3600; reads.clear(); gets.clear(); scan()
         self.assertGreater(len(gets), 0, 'the stepped-back clock rescans'); self.assertEqual(reads, [], 'but the window has no reads left')
         # Without the launcher flag the provider makes no reads beside the snapshot.

@@ -393,9 +393,11 @@ class ActionsProvider:
                     if verdict:
                         exhausted.append((str(raw["id"]), created))
                         break
-            if complete or exhausted:
+            if complete or exhausted or proofs:
                 # A settled scan samples only the newest runs, so it cannot disprove an earlier proof:
-                # proofs stand until their run leaves the hour, and the newest are listed first.
+                # proofs stand until their run leaves the hour, and the newest are listed first. A
+                # proof still inside the hour answers the scan on its own, so a scan left incomplete
+                # by the read window or a hidden tie still settles while one holds.
                 proofs.update(exhausted)
                 state["proofs"], state["runs"], state["observed_at"] = proofs, newest(proofs), now
             else:
