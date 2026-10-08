@@ -102,7 +102,7 @@
       token.rows.push(tr);
       if ((good && estimate !== null) || (hard && hardFresh)) tokenKnown++;
       if (!good) anyStale = true;
-      if (["bump","boulder"].includes(ts)) hazard(token,ts,row.repo,hard ? `Observed installation rate-limit failure in run ${runs.slice(0,3).join(", ")}; reset unknown.` : `${fmt(estimate)} estimated requests of 1,000 per hour; exhaustion timing unknown.`,hard ? {kind:"now"} : {kind:"unknown"},hard && !(good && ciRuns.length) ? (num(scan?.observed_at) ? scan.observed_at : null) : C.epoch(row.observed_at),stale);
+      if (["bump","boulder"].includes(ts)) hazard(token,ts,row.repo,hard ? `Observed installation rate-limit failure in run ${runs.slice(0,3).join(", ")}; reset unknown.` : `${fmt(estimate)} estimated requests of 1,000 per hour; exhaustion timing unknown.`,hard ? {kind:"now"} : {kind:"unknown"},hard && scanRuns.length > 0 && !(good && ciRuns.length) ? (num(scan.observed_at) ? scan.observed_at : null) : C.epoch(row.observed_at),stale);
       const jam = row.jammed === true && countsValid && row.queued >= 40 && row.running <= 1
         && num(row.jam_since) && num(row.observed_at) && row.observed_at - row.jam_since > 1800;
       const qs = jam ? "boulder" : countsValid && row.queued >= 10 ? "bump" : good && countsValid ? row.running > 0 ? "running" : "clear" : "idle";

@@ -597,6 +597,17 @@ class ActionsTests(unittest.TestCase):
         current[0] += 15; settled = p.fetch(30)
         self.assertEqual(reads, ['231', '232', '232']); self.assertEqual(settled.data['repositories'][0]['installation_scan']['error'], 'incomplete')
         self.assertFalse(settled.hot)
+        # A rescan forced by a proof expiring inside the window keeps that window's log reads.
+        expiry = ActionsProvider(ScanFake(), [SimpleNamespace(repo=REPO)], clock=lambda: current[0], monotonic=lambda: 0,
+                                 ci_snapshot=stale, installation_scan=True)
+        jobs[24] = [{'id': i, 'conclusion': 'failure'} for i in (241, 242, 243, 244)]
+        logs.update({str(i): b'x' for i in (241, 242, 243, 244)})
+        state['runs'] = [R(24, created=current[0])]; reads.clear()
+        expiry._scans[REPO] = {'attempted_at': current[0] - 10, 'observed_at': current[0] - 10, 'error': None, 'runs': ['99'],
+                               'proofs': {'99': current[0] - 3601}, 'retry': False, 'window': current[0] - 10, 'reads': 3}
+        gets.clear(); rescanned = expiry.fetch(30).data['repositories'][0]['installation_scan']
+        self.assertEqual((len(gets) > 0, reads, rescanned['error'], rescanned['runs']), (True, [], 'incomplete', []), 'the expired proof rescans, but the window has no reads left')
+        current[0] += 10; expiry.fetch(30); self.assertEqual(reads, [])
         # A run dated ahead of this clock waits until it enters the window.
         jobs[22] = [{'id': 221, 'conclusion': 'failure'}]; logs['221'] = b'API rate limit exceeded for installation'
         state['runs'] = [R(22, created=current[0] + 121 + 30)]

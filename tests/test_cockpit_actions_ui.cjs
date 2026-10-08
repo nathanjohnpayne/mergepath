@@ -321,3 +321,9 @@ test('a measured estimate expiring is a display-clock boundary',()=>{
  assert.deepEqual(tokenBoundaries(d),[now-20+300,now-10+270,now-3000+3600]);
  assert.equal(boundaryCrossed(tokenBoundaries(d),now+599,now+601),true);
 });
+test('CI-only exhaustion keeps the CI observation time beside a clean scan',()=>{
+ const m=model(data({repositories:[row({observed_at:now-400,installation_runs:['4'],installation_scan:{observed_at:now-5,error:null,runs:[]}})]}));
+ const h=m.hazards.find(h=>h.id.startsWith('actions-token-'));assert.equal(h.observed_at,now-400);assert.equal(h.stale,true);
+ const s=model(data({repositories:[row({observed_at:now-400,installation_scan:{observed_at:now-5,error:null,runs:['9']}})]}));
+ assert.equal(s.hazards.find(h=>h.id.startsWith('actions-token-')).observed_at,now-5);
+});
