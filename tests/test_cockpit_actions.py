@@ -723,7 +723,17 @@ class ActionsTests(unittest.TestCase):
                        '{"note":"API rate limit exceeded for installation."}',
                        'note: API rate limit exceeded for installation. is the text we check for; no limit occurred',
                        '##[warning]API rate limit exceeded for installation.',
-                       'AssertionError: expected {"message":"API rate limit exceeded for installation."} but got success'):
+                       'AssertionError: expected {"message":"API rate limit exceeded for installation."} but got success',
+                       # #1846: a JSON copy counts only as a whole object or a whole pretty-printed field.
+                       '{"message":"API rate limit exceeded for installation."} but got success',
+                       'response: {"message":"API rate limit exceeded for installation."} {"ok":true}',
+                       '{"message":"API rate limit exceeded for installation."',
+                       '{"error":{"message":"API rate limit exceeded for installation."}}',
+                       '{"message":"note: API rate limit exceeded for installation."}',
+                       '"message": "API rate limit exceeded for installation." but got success',
+                       '"message": "API rate limit exceeded for installation.", "status": "403"',
+                       '"message": "API rate limit exceeded for installation" and more',
+                       'Error: API rate limit exceeded for installation" and more'):
             self.assertFalse(logged_limit(ts + quoted), quoted)
         for emitted in ('gh: API rate limit exceeded for installation. If you reach out to GitHub Support for help',
                         '\t"message": "API rate limit exceeded for installation. If you reach out to GitHub Support"',
@@ -732,6 +742,7 @@ class ActionsTests(unittest.TestCase):
                         '[merge-clearance-gate] ERROR: API rate limit exceeded for installation. If you reach out',
                         '{"message":"API rate limit exceeded for installation.","documentation_url":"https://docs.github.com"}',
                         'response: {"message": "API rate limit exceeded for installation ID 9."}', '{"status":"403","message":"API rate limit exceeded for installation."}', '{"message":"API rate limit exceeded for installation"}',
+                        '"message": "API rate limit exceeded for installation.",', '  {"documentation_url": "https://docs.github.com", "message": "API rate limit exceeded for installation."}  ',
                         '\x1b[31mgh: api rate limit exceeded for installation. If you reach out\x1b[0m'):
             self.assertTrue(logged_limit('\n'.join(preamble + [ts + emitted])), emitted)
         # An emission after a preamble group still counts, and one before any group too.

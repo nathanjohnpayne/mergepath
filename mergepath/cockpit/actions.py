@@ -3,6 +3,7 @@
 import copy
 from collections import OrderedDict
 import datetime as dt
+import json
 import math
 import re
 import time
@@ -15,19 +16,21 @@ from .scheduler import Sample
 
 SAFE = 2 ** 53 - 1
 INSTALLATION = "api rate limit exceeded for installation"
-# The message as GitHub ends it: a period, `ID`, the end of the line, or a JSON value's closing quote.
-MESSAGE = re.compile(r"api rate limit exceeded for installation(?:\.|\s+id\b|\s*$|(?=\"))", re.I)
+# The message as GitHub ends it: a period, `ID`, or the end of the line (or of a JSON value).
+MESSAGE = re.compile(r"api rate limit exceeded for installation(?:\.|\s+id\b|\s*$)", re.I)
 # What may come before it on an emitted error line (#1842). Bare, after a runner `##[error]`
 # marker (not `##[warning]`, which can quote it); after `label: ` prefixes whose last one names an
 # error (`gh: `, `Error: `, `RequestError [HttpError]: `, `[tool] ERROR: `), so `note: ` is not one;
-# or as the `"message"` value of a JSON response line, where only labels, an opening brace and
-# other fields may precede it. Quoted, embedded or wrapped copies (`expected {"message": ...} but`)
-# match none of these.
+# or as the `"message"` value of a JSON response, which is parsed rather than matched (#1846): a
+# line that is exactly one JSON object after those prefixes, or a pretty-printed `"message": "..."`
+# line ending at the value or one comma after it. Quoted, embedded or wrapped copies
+# (`expected {"message": ...} but`, `{"message": ...} but got success`) match none of these.
 MARKER = r"(?:##\[error\])?"
 LABEL = r"[A-Za-z\[][\w\[\]().\- ]{0,40}:\s+"
 ERROR_HEAD = re.compile(rf"{MARKER}(?:{LABEL})*", re.I)
 ERROR_WORD = re.compile(r"error|fatal|exception|failed|failure|\bgh\b", re.I)
-JSON_HEAD = re.compile(rf"\s*{MARKER}(?:{LABEL})*\{{?\s*(?:\"[^\"]*\"\s*:\s*(?:\"[^\"]*\"|-?[\d.]+|true|false|null)\s*,\s*)*\"message\"\s*:\s*\"", re.I)
+JSON_FIELD = re.compile(r"\"message\"\s*:\s*(?=\")")
+JSON_LIMIT = 8192
 # The runner echoes each run step's script between these markers before running it.
 PREAMBLE_OPEN, PREAMBLE_CLOSE = "##[group]Run ", "##[endgroup]"
 LOG_PREFIX = re.compile(r"^(?:\d{4}-\d\d-\d\dT[0-9:.]+Z )?")
@@ -121,6 +124,34 @@ def measured_coefficient(value, repo, now):
             "window_start": start, "window_end": end, "provenance": provenance.strip()}
 
 
+def json_message(line):
+    """True when a log line is a JSON response whose `message` is the installation limit.
+
+    Either the whole line after any marker and `label: ` prefixes is one JSON object, or it is a
+    pretty-printed `"message": "..."` field with nothing after the value but one comma (#1846).
+    """
+    rest = line[ERROR_HEAD.match(line).end():]
+    if rest.startswith("{"):
+        if len(rest) > JSON_LIMIT:
+            return False
+        try:
+            value = json.loads(rest)
+        except (ValueError, RecursionError):
+            return False
+        message = value.get("message") if isinstance(value, dict) else None
+    else:
+        field = JSON_FIELD.match(line)
+        if not field:
+            return False
+        try:
+            message, end = json.JSONDecoder().raw_decode(line, field.end())
+        except ValueError:
+            return False
+        if line[end:].strip() not in ("", ","):
+            return False
+    return isinstance(message, str) and MESSAGE.match(message) is not None
+
+
 def logged_limit(text):
     """True when a job log emits the installation-limit message as output.
 
@@ -140,12 +171,11 @@ def logged_limit(text):
         if re.match(r"\++ ", line):
             continue
         line = line.strip()
+        if json_message(line):
+            return True
         for match in MESSAGE.finditer(line):
-            head = line[:match.start()]
-            if JSON_HEAD.fullmatch(head):
-                return True
-            if ERROR_HEAD.fullmatch(head):
-                labels = re.findall(LABEL, head)
+            if ERROR_HEAD.fullmatch(line[:match.start()]):
+                labels = re.findall(LABEL, line[:match.start()])
                 if not labels or ERROR_WORD.search(labels[-1]):
                     return True
     return False
