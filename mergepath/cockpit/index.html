@@ -38,6 +38,11 @@
         <p class="lede">Open PRs across the fleet, CI runs, Phase 4b agents, fleet sync and the Actions budget.</p>
       </div>
       <div class="top-r">
+        <div id="actions-token" class="chip token-chip c-idle" role="status" aria-live="polite">
+          <span class="lbl">Actions · GITHUB_TOKEN</span>
+          <strong class="mono" id="actions-token-value">Not observed yet</strong>
+          <span id="actions-token-note" class="sub">Actions budget awaiting its first observation</span>
+        </div>
         <div id="connection" class="chip conn">
           <span class="dot" aria-hidden="true"></span>
           <span><span class="lbl" id="connection-label">Connecting</span><span class="sub" id="connection-note">Local stream · awaiting observation</span></span>

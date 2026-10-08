@@ -2,12 +2,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const {project,BudgetView,render,install} = require('../mergepath/cockpit/assets/actions.js');
+const {project,BudgetView,render,install,tokenSummary,tokenBoundaries} = require('../mergepath/cockpit/assets/actions.js');
 const C = require('../mergepath/cockpit/assets/components.js');
-const {PanelRegistry,renderPanelContent}=require('../mergepath/cockpit/assets/app.js');
+const {PanelRegistry,renderPanelContent,headerBudget,boundaryCrossed}=require('../mergepath/cockpit/assets/app.js');
 const now=Date.UTC(2026,9,16,12)/1000, repo='owner/mergepath';
 const cycle=()=>({budget:25,cycle_start:Date.UTC(2026,9,1)/1000,cycle_end:Date.UTC(2026,10,1)/1000});
-const row=(overrides={})=>({repo,available:true,stale:false,observed_at:now,queued:0,running:0,runs_last_hour:2,jammed:false,jam_since:null,estimated_requests:null,measurement:null,installation_runs:[],...overrides});
+const row=(overrides={})=>({repo,available:true,stale:false,observed_at:now,installation_scan:{observed_at:now,error:null,runs:[]},queued:0,running:0,runs_last_hour:2,jammed:false,jam_since:null,estimated_requests:null,measurement:null,installation_runs:[],...overrides});
 const data=(overrides={})=>({schema:'actions-budget/v1',billing:{available:false,stale:true,observed_at:null},robot:{available:false,stale:true,observed_at:null},configuration:{budget:null,cycle_start:null,cycle_end:null},repositories:[row()],...overrides});
 const model=(d=data(),stale=false,selected=null,t=now)=>project({data:d,stale,observed_at:now},selected,t);
 const measured=()=>({requests_per_run:400,observed_at:now,provenance:'measured local counter'});
@@ -196,4 +196,134 @@ test('repository filtering preserves current and projected account spend hazards
   assert.equal(stale.hazards.some(h=>h.id==='actions-spend-account-at'),false);
   if(amount===25){assert.equal(stale.hazards.find(h=>h.id==='actions-spend-account-now').stale,true);assert.equal(stale.state,'boulder');}
  }
+});
+
+test('header token summary names exhausted repositories and never invents exhaustion',()=>{
+ const other='owner/fiveacross';
+ const exhausted=tokenSummary(model(data({repositories:[row({installation_runs:['41','42']}),row({repo:other})]})));
+ assert.equal(exhausted.state,'boulder');assert.equal(exhausted.value,'Exhausted · mergepath');
+ assert.match(exhausted.note,/run 41, 42 · reset unknown/);assert.deepEqual(exhausted.repos,[repo]);
+ const calm=tokenSummary(model(data({repositories:[row(),row({repo:other})]})));
+ assert.equal(calm.state,'clear');assert.equal(calm.value,'No exhaustion seen');assert.deepEqual(calm.repos,[]);
+ const near=tokenSummary(model(data({repositories:[row({estimated_requests:800,measurement:measured()})]})));
+ assert.equal(near.state,'bump');assert.equal(near.value,'Near the limit · mergepath');assert.match(near.note,/exhaustion not observed/);
+ // The log scan does not depend on the CI-derived row: a stale row with a fresh scan is still covered.
+ assert.equal(tokenSummary(model(data({repositories:[row({stale:true,available:false})]}))).value,'No exhaustion seen');
+ assert.deepEqual(tokenSummary(undefined),{state:'idle',value:'Not observed yet',note:'Actions budget awaiting its first observation'});
+});
+
+test('repository rows stay fresh for the CI observation gap, not the old 120 seconds',()=>{
+ const card=age=>model(data({repositories:[row({observed_at:now-age})]}),false,null,now).cards[1].rows[0].detail;
+ assert.match(card(200),/· fresh/);assert.match(card(271),/stale/);
+});
+test('the header needs a fresh complete log scan of every repository before it says no exhaustion',()=>{
+ const at=scan=>tokenSummary(model(data({repositories:[row(),row({repo:'owner/fiveacross',installation_scan:scan})]})));
+ assert.equal(at({observed_at:now-200,error:null,runs:[]}).value,'No exhaustion seen');
+ for(const scan of [{observed_at:now-200,error:null},{observed_at:now-301,error:null,runs:[]},{observed_at:now,error:'incomplete'},{observed_at:null,error:'secondary_limit'},undefined]) {
+  const s=at(scan);assert.equal(s.value,'Not fully observed');assert.match(s.note,/1 of 2 repositories scanned/);
+ }
+ // Exhaustion is shown even when the CI-derived row is stale.
+ const hot=tokenSummary(model(data({repositories:[row({stale:true,available:false,installation_runs:['9']})]})));
+ assert.equal(hot.state,'boulder');assert.equal(hot.value,'Exhausted · mergepath');
+});
+
+test('an estimate at the limit stays a warning in the header and does not wait for the log scan',()=>{
+ const est=(amount,scan)=>tokenSummary(model(data({repositories:[row({estimated_requests:amount,measurement:{...measured(),requests_per_run:amount/2},installation_scan:scan}),row({repo:'owner/fiveacross'})]})));
+ const at=est(1000,{observed_at:now,error:null,runs:[]});
+ assert.equal(at.state,'boulder');assert.equal(at.value,'At the limit by estimate · mergepath');
+ assert.match(at.note,/^Estimated from measured requests per run · exhaustion not observed · 2 of 2 repositories scanned$/);
+ const partial=est(800,{observed_at:now,error:'incomplete'});
+ assert.equal(partial.state,'bump');assert.equal(partial.value,'Near the limit · mergepath');assert.match(partial.note,/1 of 2 repositories scanned/);
+ // Observed exhaustion still outranks any estimate.
+ const both=tokenSummary(model(data({repositories:[row({estimated_requests:1000,measurement:{...measured(),requests_per_run:500}}),row({repo:'owner/fiveacross',installation_runs:['7']})]})));
+ assert.equal(both.value,'Exhausted · fiveacross');
+});
+test('the header token chip stays fleet-wide while the panels follow the repository filter',()=>{
+ const registry=new PanelRegistry();registry.register('budget','actions',project,render);
+ const other='owner/nathanpaynedotcom';
+ const snapshot={repositories:[{repo},{repo:other}],sources:{actions:{data:data({repositories:[row(),row({repo:other,installation_runs:['9']})]}),stale:false,observed_at:now}}};
+ const filtered=registry.project(snapshot,repo,now);
+ assert.deepEqual(filtered.models.budget.cards.find(card=>card.id==='token').rows.map(r=>r.repo),[repo]);
+ assert.equal(tokenSummary(filtered.models.budget).value,'No exhaustion seen');
+ const header=tokenSummary(headerBudget(registry,snapshot,repo,filtered,now));
+ assert.equal(header.state,'boulder');assert.equal(header.value,'Exhausted · nathanpaynedotcom');
+ const all=registry.project(snapshot,null,now);
+ assert.equal(headerBudget(registry,snapshot,null,all,now),all.models.budget);
+});
+
+test('scan-proven runs age with their own settled scan, apart from the CI row',()=>{
+ const at=(scan,t=now)=>model(data({repositories:[row({installation_scan:scan})]}),false,null,t);
+ const fresh=at({observed_at:now,error:null,runs:['9']});
+ assert.equal(fresh.cards[1].rows[0].value,'exhausted');assert.equal(fresh.hazards[0].stale,false);assert.match(fresh.hazards[0].detail,/run 9/);
+ assert.match(tokenSummary(fresh).note,/^Installation rate limit in run 9/);
+ // A later failed scan retains the runs, but they are last known, never fresh.
+ for(const scan of [{observed_at:now,error:'secondary_limit',runs:['9']},{observed_at:now-301,error:null,runs:['9']},{observed_at:now,error:'incomplete',runs:['9']}]) {
+  const m=at(scan);assert.equal(m.state,'boulder');assert.equal(m.hazards[0].stale,true,JSON.stringify(scan));
+  assert.match(m.cards[1].rows[0].detail,/run 9; reset unknown · last known/);
+  const header=tokenSummary(m);assert.equal(header.value,'Exhausted · mergepath');assert.match(header.note,/^Last known: installation rate limit in run 9/);
+ }
+ // A fresh CI-derived run keeps the row fresh whatever the scan says; the runs are combined.
+ const both=model(data({repositories:[row({installation_runs:['4'],installation_scan:{observed_at:now,error:'secondary_limit',runs:['9']}})]}));
+ assert.equal(both.hazards[0].stale,false);assert.deepEqual(both.cards[1].rows[0].runs,['4','9']);
+ // A malformed scan run list is neither evidence nor a settled scan.
+ const bad=at({observed_at:now,error:null,runs:['x']});assert.equal(bad.cards[1].rows[0].exhausted,false);assert.equal(tokenSummary(bad).value,'Not fully observed');
+});
+test('the display clock re-renders when a scan or a CI row ages across its boundary',()=>{
+ const d=data({repositories:[row({observed_at:now-10,installation_scan:{observed_at:now-20,error:null,runs:[]}})]});
+ assert.deepEqual(tokenBoundaries(d),[now-20+300,now-10+270]);
+ assert.deepEqual(tokenBoundaries(undefined),[]);
+ const b=tokenBoundaries(d);
+ assert.equal(boundaryCrossed(b,now,now+259),false);assert.equal(boundaryCrossed(b,now,now+261),true);
+ assert.equal(boundaryCrossed(b,now+261,now+262),false);assert.equal(boundaryCrossed(b,now+279,now+281),true);
+ assert.equal(boundaryCrossed(b,null,now+400),false);
+ // The header flips exactly at the boundary.
+ assert.equal(tokenSummary(model(d,false,null,now+280)).value,'No exhaustion seen');
+ assert.equal(tokenSummary(model(d,false,null,now+281)).value,'Not fully observed');
+});
+test('a stale scheduler envelope is never fresh scan coverage',()=>{
+ const d=data({repositories:[row(),row({repo:'owner/fiveacross'})]});
+ assert.equal(tokenSummary(model(d,false)).value,'No exhaustion seen');
+ const stale=tokenSummary(model(d,true));assert.equal(stale.value,'Not fully observed');assert.match(stale.note,/0 of 2 repositories scanned/);
+ // Retained scan proofs in a stale envelope read last known.
+ const proof=model(data({repositories:[row({installation_scan:{observed_at:now,error:null,runs:['9']}})]}),true);
+ assert.equal(proof.hazards[0].stale,true);assert.match(tokenSummary(proof).note,/^Last known: installation/);
+});
+test('an installation scan alone is a budget observation',()=>{
+ const scanOnly=row({observed_at:null,queued:null,running:null,runs_last_hour:null});
+ assert.equal(model(data({repositories:[scanOnly]})).hasObservations,true);
+ assert.equal(model(data({repositories:[{...scanOnly,installation_scan:{observed_at:null,error:'secondary_limit',runs:[]}}]})).hasObservations,false);
+});
+test('without a live stream the header never reads current',()=>{
+ const calm=model(data({repositories:[row(),row({repo:'owner/fiveacross'})]}));
+ assert.equal(tokenSummary(calm).value,'No exhaustion seen');
+ const off=tokenSummary(calm,true);assert.equal(off.state,'idle');assert.equal(off.value,'Not fully observed');
+ assert.match(off.note,/^Local stream not live · last known: Failed-job logs of the last hour · 2 of 2 repositories scanned$/);
+ const hot=tokenSummary(model(data({repositories:[row({installation_runs:['9']})]})),true);
+ assert.equal(hot.value,'Exhausted · mergepath');assert.match(hot.note,/^Last known: installation/);
+ const near=tokenSummary(model(data({repositories:[row({estimated_requests:800,measurement:measured()})]})),true);
+ assert.equal(near.value,'Near the limit · mergepath');assert.match(near.note,/^Last known: estimated/);
+});
+test('last-known scan proofs age the token card but not the queue card',()=>{
+ const m=model(data({repositories:[row({installation_scan:{observed_at:now,error:'secondary_limit',runs:['9']}})]}));
+ const token=m.cards.find(card=>card.id==='token'),queue=m.cards.find(card=>card.id==='queue');
+ assert.equal(token.stale,true);assert.equal(queue.stale,false);assert.equal(m.stale,true);
+ const live=model(data({repositories:[row({installation_scan:{observed_at:now,error:null,runs:['9']}})]}));
+ assert.equal(live.cards.find(card=>card.id==='token').stale,false);
+});
+test('a fresh scan proof keeps the token card fresh beside a stale CI row',()=>{
+ const m=model(data({repositories:[row({observed_at:now-400,installation_scan:{observed_at:now,error:null,runs:['9']}})]}));
+ assert.equal(m.cards.find(card=>card.id==='token').stale,false);assert.equal(m.cards.find(card=>card.id==='queue').stale,true);
+ assert.equal(m.hazards.find(h=>h.id.startsWith('actions-token-')).stale,false);
+ assert.equal(model(data(),true).cards.find(card=>card.id==='token').stale,true);
+});
+test('a measured estimate expiring is a display-clock boundary',()=>{
+ const d=data({repositories:[row({observed_at:now-10,installation_scan:{observed_at:now-20,error:null,runs:[]},estimated_requests:800,measurement:{...measured(),observed_at:now-3000}})]});
+ assert.deepEqual(tokenBoundaries(d),[now-20+300,now-10+270,now-3000+3600]);
+ assert.equal(boundaryCrossed(tokenBoundaries(d),now+599,now+601),true);
+});
+test('CI-only exhaustion keeps the CI observation time beside a clean scan',()=>{
+ const m=model(data({repositories:[row({observed_at:now-400,installation_runs:['4'],installation_scan:{observed_at:now-5,error:null,runs:[]}})]}));
+ const h=m.hazards.find(h=>h.id.startsWith('actions-token-'));assert.equal(h.observed_at,now-400);assert.equal(h.stale,true);
+ const s=model(data({repositories:[row({observed_at:now-400,installation_scan:{observed_at:now-5,error:null,runs:['9']}})]}));
+ assert.equal(s.hazards.find(h=>h.id.startsWith('actions-token-')).observed_at,now-5);
 });

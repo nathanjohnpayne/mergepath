@@ -14,6 +14,8 @@ from .inventory import REPO as REPO_NAME
 from .scheduler import Sample
 
 FAILURES = frozenset({'failure', 'timed_out', 'action_required', 'startup_failure'})
+# Every finished conclusion: failure-class ones plus those that are not failures.
+TERMINAL = FAILURES | frozenset({'success', 'neutral', 'cancelled', 'skipped', 'stale'})
 LIVE = frozenset({'queued', 'in_progress', 'waiting', 'pending', 'requested'})
 # Registered cadence of the ci source (seconds). A repository observed early in one scan is
 # next observed late in the following one, so consecutive observations of one repository can
@@ -74,7 +76,7 @@ def _status(value):
 
 
 def _conclusion(value):
-    return value if value in FAILURES | {'success', 'neutral', 'cancelled', 'skipped', 'stale'} else None
+    return value if value in TERMINAL else None
 
 
 def normalize_check(repo, value, workflows):

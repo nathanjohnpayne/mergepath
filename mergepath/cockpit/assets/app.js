@@ -53,6 +53,10 @@
     const observed = C.epoch(live.data.observed_at);
     return observed !== null && renderedAt !== null && renderedAt <= observed + 10 && now > observed + 10;
   }
+  // True once the clock alone has carried a projection across one of its boundaries since the last render.
+  function boundaryCrossed(boundaries, renderedAt, now) {
+    return renderedAt !== null && Array.isArray(boundaries) && boundaries.some(at => typeof at === "number" && renderedAt <= at && at < now);
+  }
   class PanelRegistry {
     constructor() {this.adapters = new Map();}
     register(id, source, project, render = null, options = {}) {
@@ -246,6 +250,11 @@
     note.textContent = `${identity} · ${state} · ${observed === null ? "not observed" : `observed ${C.ageLabel(now - observed)}`} · ${reset === null ? "reset unknown" : reset > now ? `reset ${C.timeLabel({kind: "at", at: reset}, now)}` : "reset passed; awaiting observation"}${account.retry !== null && stale ? ` · retry ${C.timeLabel({kind: "at", at: account.retry}, now)}` : ""}`;
     return account;
   }
+  // The header token chip is fleet-wide: the repository filter narrows panels, never the
+  // exhaustion alarm, so a filtered view re-projects the budget without the filter.
+  function headerBudget(registry, snapshot, selectedRepo, projection, now) {
+    return selectedRepo === null ? projection.models.budget : registry.project(snapshot, null, now).models.budget;
+  }
   function renderPanelContent(parent, model, adapter, placeholder) {
     if (adapter?.render && (model.observed || model.renderable === true)) {
       if (placeholder?.parentNode === parent) placeholder.remove();
@@ -318,6 +327,16 @@
         : connection.retry_at ? `Retry in ${Math.max(0, Math.ceil(connection.retry_at - epochNow()))}s · data may be stale` : "Awaiting stream · data may be stale";
       $("updated-age").textContent = receivedAt === null ? "Not yet" : C.ageLabel((performance.now() - receivedAt) / 1000);
     }
+    // The Actions GITHUB_TOKEN chip sits first in the header so an exhausted budget is seen at once.
+    function renderActionsToken(model, streamStale) {
+      const summary = globalThis.CockpitActions?.tokenSummary ? globalThis.CockpitActions.tokenSummary(model, streamStale)
+        : {state: "idle", value: "Not observed yet", note: "Actions budget unavailable"};
+      const chip = $("actions-token");
+      if (!chip) return;
+      chip.className = `chip token-chip c-${summary.state}`;
+      if ($("actions-token-value").textContent !== summary.value) $("actions-token-value").textContent = summary.value;
+      if ($("actions-token-note").textContent !== summary.note) $("actions-token-note").textContent = summary.note;
+    }
     function render() {
       renderConnection();
       const current = snapshot || {repositories: [], api_budget: {}, sources: {}};
@@ -334,6 +353,7 @@
       renderAuthorBudget(authorMeter, $("api-note"), current, now, connection.kind !== "live");
       $("reviewer-api-note").textContent = `${identity} · ${observed === null ? "no header evidence" : `observed ${C.ageLabel(now - observed)}`} · ${reset === null ? "reset unknown" : `reset ${reset > now ? C.timeLabel({kind: "at", at: reset}, now) : "time passed; awaiting headers"}`}`;
       const projection = registry.project(current, selectedRepo, now); renderPanels(projection);
+      renderActionsToken(headerBudget(registry, current, selectedRepo, projection, now), connection.kind !== "live");
       const stale = connection.kind !== "live";
       let hazards = [...projection.hazards.map(hazard => ({...hazard, stale: hazard.stale || stale})), ...accountHazards(current, now, stale)];
       if (["reconnecting", "offline", "session"].includes(connection.kind)) hazards.push({id: "shell-connection", source: "road", section: "road", repo: null,
@@ -359,7 +379,8 @@
       onState: value => {const changed = connection.kind !== value.kind; connection = value; render(); if (changed) $("connection-announcement").textContent = $("connection-label").textContent + ". " + $("connection-note").textContent;}});
     const timer = setInterval(() => {
       const now = epochNow();
-      if (snapshot && (liveClockNeedsRender(snapshot, renderedAt, now) || snapshot.sources.fleet?.in_flight === true || [...Object.values(snapshot.api_budget), authorAccount(snapshot).evidence].some(evidence => {
+      if (snapshot && (liveClockNeedsRender(snapshot, renderedAt, now) || snapshot.sources.fleet?.in_flight === true
+        || boundaryCrossed(globalThis.CockpitActions?.tokenBoundaries?.(snapshot.sources.actions?.data) || [], renderedAt, now) || [...Object.values(snapshot.api_budget), authorAccount(snapshot).evidence].some(evidence => {
         const reset = C.epoch(evidence?.reset);
         return reset !== null && renderedAt !== null && reset > renderedAt && reset <= now;
       }) || Object.values(snapshot.sources).some(envelope => {
@@ -378,5 +399,5 @@
   }
   let openSync = () => {};
   let registerPanel = (id, source, project, renderer, options) => registry.register(id, source, project, renderer, options);
-  return {authorAccount, renderAuthorBudget, validSnapshot, liveClockNeedsRender, PanelRegistry, Connection, accountHazards, renderPanelContent, createFleetRefresh, refreshFleet, mount, openSync: repos => openSync(repos), registerPanel: (...args) => registerPanel(...args)};
+  return {authorAccount, renderAuthorBudget, headerBudget, boundaryCrossed, validSnapshot, liveClockNeedsRender, PanelRegistry, Connection, accountHazards, renderPanelContent, createFleetRefresh, refreshFleet, mount, openSync: repos => openSync(repos), registerPanel: (...args) => registerPanel(...args)};
 });

@@ -203,3 +203,7 @@ html{scroll-padding-top:16px}
  .ck .btn:hover{transform:none}
 }
 @media (max-width:720px){.top-r{flex-basis:100%;width:100%}.controls{width:100%}.ri-src{justify-self:start}}
+.token-chip.c-boulder{border-color:var(--boulder);background:var(--boulder-soft)}
+.token-chip.c-boulder strong{color:var(--boulder-ink)}
+.token-chip.c-bump{border-color:var(--bump)}
+.token-chip.c-clear strong{color:var(--clear-ink, var(--ink))}

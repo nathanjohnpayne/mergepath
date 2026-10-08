@@ -1,18 +1,32 @@
 """Read-only Actions observations; unavailable inputs never become estimates."""
 
 import copy
+from collections import OrderedDict
 import datetime as dt
 import math
 import re
 import time
 from decimal import Decimal, InvalidOperation
 
+from .ci import FAILURES, TERMINAL
 from .github import ClientError
 from .inventory import REPO
 from .scheduler import Sample
 
 SAFE = 2 ** 53 - 1
 INSTALLATION = "api rate limit exceeded for installation"
+# A gate that runs out of its repository GITHUB_TOKEN usually prints the limit only in its
+# job log (observed on nathanpaynedotcom on 2026-10-07), never in run or check output, and
+# the busiest repositories are the ones the CI scan covers least. So the installation scan
+# reads each repository itself, independently of the CI snapshot: at most every
+# SCAN_INTERVAL seconds, the newest SCAN_RUNS failed runs of the last hour, their failed
+# jobs, and those jobs' logs, LOG_READS per repository per scan. A completed attempt's jobs
+# and a completed job's verdict never change, so both are cached.
+SCAN_INTERVAL = 120
+SCAN_RUNS = 5
+LOG_READS = 3
+JOB_PAGES = 5
+SCAN_CACHE = 1024
 
 
 def number(value, maximum=SAFE):
@@ -85,6 +99,21 @@ def measured_coefficient(value, repo, now):
         return None
     return {"requests_per_run": requests / runs, "observed_at": observed,
             "window_start": start, "window_end": end, "provenance": provenance.strip()}
+
+
+def newest(proofs):
+    """Proven run ids, newest run first."""
+    return sorted(proofs, key=lambda run: (proofs[run], int(run)), reverse=True)
+
+
+def iso_epoch(value):
+    """Epoch seconds of a zoned ISO-8601 timestamp, or None; a zoneless one is never guessed."""
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        stamp = parsed.timestamp() if parsed.tzinfo is not None else None
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    return stamp if number(stamp) else None
 
 
 def run_rows(rows, repo, now, status=None):
@@ -175,7 +204,8 @@ def ci_observation(envelope, repo, now, max_age=120):
 
 class ActionsProvider:
     def __init__(self, client, inventory, *, settings=None, ci_snapshot=None,
-                 robot_snapshot=None, clock=time.time, monotonic=time.monotonic, ci_max_gap=120):
+                 robot_snapshot=None, clock=time.time, monotonic=time.monotonic, ci_max_gap=120,
+                 installation_scan=False):
         self.client, self.clock, self.monotonic = client, clock, monotonic
         # An injected CI snapshot is renewed on the CI source's cadence, not on this source's,
         # so its freshness and jam continuity use that source's observation gap.
@@ -190,6 +220,118 @@ class ActionsProvider:
         self._billing, self._billing_due, self._billing_period = None, 0, None
         self._last, self._jam, self._cursor = {}, {}, 0
         self._robot_last = None
+        self._scans, self._scan_jobs, self._scan_logs = {}, OrderedDict(), OrderedDict()
+        # The launcher enables the installation scan; it is the provider's one read beside
+        # the injected CI snapshot.
+        self.installation_scan = installation_scan is True
+
+    @staticmethod
+    def _remember(cache, key, value):
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > SCAN_CACHE:
+            cache.popitem(last=False)
+
+    def _installation_scan(self, repo, deadline, now):
+        """Exhausted run ids from failed-job logs of the last hour, with when that was observed.
+
+        The first logged installation-limit message settles the scan: one proven exhaustion is a
+        complete answer, and an exhausting repository adds fresh failed runs faster than every
+        job could be read. Only a clean answer needs every failed job read; a scan that could
+        not read them all reports `incomplete` and keeps the last complete observation time. A
+        settled scan samples only the newest runs, so a proof stands until its run leaves the
+        hour. A failed read keeps the previous runs. Nothing here is estimated: only the logged
+        installation-limit message establishes exhaustion.
+        """
+        last = self._scans.get(repo)
+        # A proof leaving its hour inside the interval ends the cached answer: the scan runs again
+        # rather than publishing an expired run, or a clean result that run had settled.
+        # A scan the deadline cut short retries on the next tick instead: its job lists and log
+        # verdicts are cached, so each attempt advances from where the last one stopped.
+        if (last is not None and 0 <= now - last["attempted_at"] < SCAN_INTERVAL and not last["retry"]
+                and all(now - 3600 <= at <= now for at in last["proofs"].values())):
+            return last
+        # Proofs map an exhausted run id to its creation time and hold only for the hour after it,
+        # pruned before every refresh so a failing or incomplete scan cannot keep an expired one.
+        # Both bounds: a clock that stepped back must not keep a proof dated after it.
+        proofs = {run: at for run, at in (last["proofs"] if last else {}).items() if now - 3600 <= at <= now}
+        # Any rescan inside a window (a deadline retry or a proof-expiry rescan) continues it: three
+        # log reads per repository per 120-second window.
+        carried = last is not None and 0 <= now - last["window"] < SCAN_INTERVAL
+        state = {"attempted_at": now, "observed_at": last["observed_at"] if last else None,
+                 "error": None, "runs": newest(proofs), "proofs": proofs, "retry": False,
+                 "window": last["window"] if carried else now, "reads": last["reads"] if carried else 0}
+        try:
+            # The cutoff is floored to five minutes so the list URL revalidates as a free 304.
+            cutoff = dt.datetime.fromtimestamp((now - 3600) // 300 * 300, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            payload = self.client.get(f"/repos/{repo}/actions/runs?status=failure&created=%3E%3D{cutoff}&per_page={SCAN_RUNS}",
+                                      deadline=deadline)
+            listed = payload.get("workflow_runs") if type(payload) is dict else None
+            if type(listed) is not list:
+                raise ClientError("invalid_page")
+            exhausted, complete = [], True
+            for raw in listed[:SCAN_RUNS]:
+                if exhausted:
+                    break
+                if type(raw) is not dict or not count(raw.get("id")) or raw["id"] == 0:
+                    raise ClientError("invalid_page")
+                created = iso_epoch(raw.get("created_at"))
+                if created is None or created > now + 60:
+                    raise ClientError("invalid_page")
+                # The coarse cutoff only keeps the URL cacheable; evidence is the exact last hour. A run
+                # dated ahead of this clock waits until it enters it, and since it took a sample slot,
+                # the scan cannot claim it read every eligible run.
+                if created > now:
+                    complete = False
+                    continue
+                if created < now - 3600:
+                    continue
+                attempt = raw.get("run_attempt", 1)
+                if not count(attempt) or attempt == 0:
+                    raise ClientError("invalid_page")
+                key = (repo, raw["id"], attempt)
+                jobs = self._scan_jobs.get(key)
+                if jobs is None:
+                    # Every page of the jobs of every attempt so far, bounded: an earlier attempt can hold
+                    # the limit a later rerun hides, and a partial list must never read as clean.
+                    rows = self.client.pages(f"/repos/{repo}/actions/runs/{raw['id']}/jobs?filter=all&per_page=100",
+                                             collection="jobs", max_pages=JOB_PAGES, deadline=deadline)
+                    # An unreadable row could be a failed job, so it fails the scan rather than vanishing.
+                    if type(rows) is not list or any(type(job) is not dict or not count(job.get("id")) or job["id"] == 0
+                                                     or job.get("conclusion") not in TERMINAL for job in rows):
+                        raise ClientError("invalid_page")
+                    # Every failure-class conclusion, the CI taxonomy: a timed-out job can carry the limit too.
+                    jobs = [str(job["id"]) for job in rows if job["conclusion"] in FAILURES]
+                    self._remember(self._scan_jobs, key, jobs)
+                for job in jobs:
+                    verdict = self._scan_logs.get((repo, job))
+                    if verdict is None:
+                        if state["reads"] >= LOG_READS or self.monotonic() >= deadline:
+                            complete = False
+                            state["retry"] = state["retry"] or self.monotonic() >= deadline
+                            continue
+                        state["reads"] += 1
+                        body = self.client.read_job_log(repo, job, deadline=deadline)
+                        text = body.decode("utf-8", "replace") if type(body) is bytes else body if type(body) is str else ""
+                        verdict = INSTALLATION in text.casefold()
+                        self._remember(self._scan_logs, (repo, job), verdict)
+                    if verdict:
+                        exhausted.append((str(raw["id"]), created))
+                        break
+            if complete or exhausted:
+                # A settled scan samples only the newest runs, so it cannot disprove an earlier proof:
+                # proofs stand until their run leaves the hour, and the newest are listed first.
+                proofs.update(exhausted)
+                state["proofs"], state["runs"], state["observed_at"] = proofs, newest(proofs), now
+            else:
+                # Not clean evidence: the last settled runs stand until a settled scan replaces them.
+                state["error"] = "incomplete"
+        except ClientError as exc:
+            state["error"], state["retry"] = exc.category, exc.category == "deadline_exceeded"
+        except Exception:
+            state["error"] = "source_failed"
+        self._scans[repo] = state
+        return state
 
     def _billing_read(self, deadline, now):
         current = dt.datetime.fromtimestamp(now, dt.timezone.utc)
@@ -312,6 +454,13 @@ class ActionsProvider:
                 row = unavailable("source_failed", self._last.get(repo))
                 row["repo"] = repo
             rows.append(row)
+        # The installation scan gets its own fair share after the queue reads, before billing.
+        for index, row in enumerate(rows if self.installation_scan else []):
+            available = deadline - self.monotonic()
+            scan = self._installation_scan(row["repo"], self.monotonic() + max(0, available / (size - index + 1)), now)
+            # Scan runs stay apart from the CI-derived installation_runs, so the page can age each
+            # by its own observation: retained scan runs are last-known once the scan stops settling.
+            row["installation_scan"] = {"observed_at": scan["observed_at"], "error": scan["error"], "runs": list(scan["runs"])}
         billing = self._billing_read(deadline, now)
         try:
             robot = self._robot(now)
@@ -322,7 +471,9 @@ class ActionsProvider:
         elif self._robot_last is not None:
             robot = unavailable(robot.get("error", "source_failed"), self._robot_last)
         return Sample({"schema": "actions-budget/v1", "billing": billing, "repositories": sorted(rows, key=lambda row: row["repo"]),
-                       "robot": robot, "configuration": self._configuration(now)}, hot=any(row.get("queued") or row.get("running") for row in rows))
+                       "robot": robot, "configuration": self._configuration(now)}, hot=any(row.get("queued") or row.get("running") for row in rows)
+                      # A deadline-cut scan comes back on the hot cadence rather than the idle one.
+                      or any(scan["retry"] for scan in self._scans.values()))
 
     def _configuration(self, now):
         config = {"budget": None, "cycle_start": None, "cycle_end": None}

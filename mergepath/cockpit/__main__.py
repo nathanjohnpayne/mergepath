@@ -165,7 +165,7 @@ def main(argv=None):
                                     changed=app.publish, completed=completed)
         actions_provider = ActionsProvider(github, inventory, settings=actions_settings,
                                            ci_snapshot=lambda repo, now: shared_ci_snapshot(app, repo, now),
-                                           ci_max_gap=CI_OBSERVATION_GAP)
+                                           ci_max_gap=CI_OBSERVATION_GAP, installation_scan=True)
         app.scheduler.register("actions", actions_provider.fetch, hot_interval=15, idle_interval=120, timeout=30)
         app.register_panel("budget", "actions")
         agents_provider = AgentsProvider(inventory, checkouts, ROOT, price_keys=price_keys, github=github, reviewers=reviewers)

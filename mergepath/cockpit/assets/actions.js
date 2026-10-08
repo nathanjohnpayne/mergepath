@@ -8,6 +8,10 @@
   const num = v => C.finite(v) && v >= 0 && v <= Number.MAX_SAFE_INTEGER;
   const repoOK = v => typeof v === "string" && /^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9_.-]+$/.test(v) && v.length <= 256;
   const fresh = (v, now, ttl) => v?.available === true && v.stale === false && num(v.observed_at) && now >= v.observed_at && now - v.observed_at <= ttl;
+  const CI_OBSERVATION_GAP = 270;
+  // The provider scans each repository's failed-job logs at most every 120 seconds; a scan
+  // older than this missed at least one cycle.
+  const SCAN_FRESH = 300;
   const fmt = n => n.toLocaleString("en-US", {maximumFractionDigits: 1});
   const dollars = n => `$${n.toFixed(2)}`;
   const stateOf = ratio => ratio === null ? "idle" : ratio >= 1 ? "boulder" : ratio >= .7 ? "bump" : "clear";
@@ -75,23 +79,30 @@
     for (const row of repositories) {
       if (!repoOK(row?.repo) || seen.has(row.repo)) throw new Error("invalid_repository");
       seen.add(row.repo);
-      const good = fresh(row, now, 120) && envelope.stale !== true;
+      // Repository rows come from the shared CI snapshot, renewed within its observation gap (ci.OBSERVATION_GAP).
+      const good = fresh(row, now, CI_OBSERVATION_GAP) && envelope.stale !== true;
       const countsValid = C.count(row.queued) !== null && C.count(row.running) !== null && C.count(row.runs_last_hour) !== null;
-      const hard = Array.isArray(row.installation_runs) && row.installation_runs.length <= 10000
-        && row.installation_runs.every(id => typeof id === "string" && /^[1-9][0-9]{0,15}$/.test(id)) && row.installation_runs.length > 0;
+      const runIds = value => Array.isArray(value) && value.length <= 10000 && value.every(id => typeof id === "string" && /^[1-9][0-9]{0,15}$/.test(id)) ? value : null;
+      // CI-derived runs age with the CI row; scan-proven runs age with their own settled scan.
+      const scan = row.installation_scan, ciRuns = runIds(row.installation_runs) || [], scanRuns = runIds(scan?.runs) || [];
+      // A stale scheduler envelope is never fresh coverage, whatever its embedded scan says.
+      const scanned = envelope.stale !== true && num(scan?.observed_at) && scan.error === null && runIds(scan.runs) !== null && now >= scan.observed_at && now - scan.observed_at <= SCAN_FRESH;
+      const runs = [...new Set([...ciRuns, ...scanRuns])], hard = runs.length > 0;
+      const hardFresh = (good && ciRuns.length > 0) || (scanned && scanRuns.length > 0);
       const measurement = row.measurement;
       const measured = measurement && num(measurement.requests_per_run) && num(measurement.observed_at)
         && now >= measurement.observed_at && now - measurement.observed_at <= 3600
         && typeof measurement.provenance === "string" && [...measurement.provenance].length <= 240;
       const estimate = countsValid && measured && num(row.estimated_requests) && Math.abs(row.estimated_requests-row.runs_last_hour*measurement.requests_per_run)<.001 ? row.estimated_requests : null;
       let ts = hard ? "boulder" : good && estimate !== null ? stateOf(estimate/1000) : "idle";
-      const tr = {repo:row.repo, state:ts, percent:hard ? 100 : estimate === null ? null : Math.min(100,estimate/10),
+      const stale = hard ? !hardFresh : !good;
+      const tr = {repo:row.repo, state:ts, exhausted:hard, stale, scanned, runs:runs.slice(0,3), percent:hard ? 100 : estimate === null ? null : Math.min(100,estimate/10),
         value:hard ? "exhausted" : estimate === null ? "Estimate unavailable" : `est. ${fmt(estimate)}${good ? "" : " · last known"}`,
-        detail: `${countsValid ? fmt(row.runs_last_hour) : "Unknown"} runs in last hour · ${good ? "fresh" : "stale / unavailable"}${hard ? ` · installation limit in run ${row.installation_runs.slice(0,3).join(", ")}; reset unknown` : ""}${measured ? ` · ${measurement.provenance}` : " · measured requests per run unavailable"}`};
+        detail: `${countsValid ? fmt(row.runs_last_hour) : "Unknown"} runs in last hour · ${good ? "fresh" : "stale / unavailable"}${hard ? ` · installation limit in run ${runs.slice(0,3).join(", ")}; reset unknown${hardFresh ? "" : " · last known"}` : ""}${measured ? ` · ${measurement.provenance}` : " · measured requests per run unavailable"}`};
       token.rows.push(tr);
-      if (good && (estimate !== null || hard)) tokenKnown++;
+      if ((good && estimate !== null) || (hard && hardFresh)) tokenKnown++;
       if (!good) anyStale = true;
-      if (["bump","boulder"].includes(ts)) hazard(token,ts,row.repo,hard ? `Observed installation rate-limit failure in run ${row.installation_runs.slice(0,3).join(", ")}; reset unknown.` : `${fmt(estimate)} estimated requests of 1,000 per hour; exhaustion timing unknown.`,hard ? {kind:"now"} : {kind:"unknown"},C.epoch(row.observed_at),!good);
+      if (["bump","boulder"].includes(ts)) hazard(token,ts,row.repo,hard ? `Observed installation rate-limit failure in run ${runs.slice(0,3).join(", ")}; reset unknown.` : `${fmt(estimate)} estimated requests of 1,000 per hour; exhaustion timing unknown.`,hard ? {kind:"now"} : {kind:"unknown"},hard && scanRuns.length > 0 && !(good && ciRuns.length) ? (num(scan.observed_at) ? scan.observed_at : null) : C.epoch(row.observed_at),stale);
       const jam = row.jammed === true && countsValid && row.queued >= 40 && row.running <= 1
         && num(row.jam_since) && num(row.observed_at) && row.observed_at - row.jam_since > 1800;
       const qs = jam ? "boulder" : countsValid && row.queued >= 10 ? "bump" : good && countsValid ? row.running > 0 ? "running" : "clear" : "idle";
@@ -101,7 +112,9 @@
       if (["bump","boulder"].includes(qs)) hazard(queue,qs,row.repo,jam?`${row.queued} queued, ${row.running} running continuously >30 minutes. Cockpit jam heuristic.`:`${row.queued} queued; warning reference 10, runner capacity unknown.`,jam?{kind:"now"}:{kind:"unknown"},C.epoch(row.observed_at),!good);
     }
     token.state = C.worstState(token.rows.map(row=>row.state)); token.available = repositories.length > 0 && tokenKnown === repositories.length;
-    token.stale = anyStale; token.note = "Estimates: runs in the last hour × explicitly measured requests per run. Installation failure overrides estimates. Reset and exhaustion ETA unavailable without evidence.";
+    // The token card ages with token evidence alone: a fresh scan proof stays fresh beside a stale CI row,
+    // and a last-known proof ages it beside fresh CI counts. CI-row staleness stays on the queue card.
+    token.stale = envelope.stale === true || token.rows.some(row => row.stale === true); token.note = "Estimates: runs in the last hour × explicitly measured requests per run. Installation failure overrides estimates. Reset and exhaustion ETA unavailable without evidence.";
     queue.state = C.worstState(queue.rows.map(row=>row.state)); queue.available = repositories.length > 0 && queueKnown === repositories.length; queue.stale = anyStale;
     queue.value = `${q} queued · ${r} running${queue.available ? "" : " · partial / unavailable coverage"}`;
     queue.note = "Warning reference: ≥10 queued; jam heuristic: ≥40 queued and ≤1 running continuously >30 min. Runner capacity and drain ETA unavailable.";
@@ -122,6 +135,7 @@
     const coverage = cards.every(card=>card.available);
     const hasObservations = (num(billing.observed_at) && num(billing.net_amount))
       || repositories.some(row=>num(row.observed_at) && C.count(row.queued)!==null && C.count(row.running)!==null)
+      || repositories.some(row=>num(row?.installation_scan?.observed_at))
       || (num(robotData.observed_at) && robotData.configured_identity==="nathanpayne-robot");
     const bumps = states.filter(state=>state==="bump").length, boulders = states.filter(state=>state==="boulder").length;
     return {state:state==="clear"&&!coverage?"idle":state,label:boulders||bumps?`${boulders} at the limit · ${bumps} approaching${coverage?"":" · incomplete coverage"}`:coverage?"Headroom on every meter":"Headroom partly unavailable",
@@ -188,6 +202,44 @@
     }
     view.update(model);
   }
+  // The header chip: which repositories' Actions GITHUB_TOKEN budgets are exhausted now.
+  // Exhaustion is the observed installation rate-limit failure the token card carries;
+  // nothing else establishes it, and reset is never observable.
+  // `streamStale` is the shell's own state: without a live stream nothing on the page is current.
+  function tokenSummary(model, streamStale = false) {
+    const token = Array.isArray(model?.cards) ? model.cards.find(card => card?.id === "token") : null;
+    const rows = Array.isArray(token?.rows) ? token.rows : [];
+    if (!rows.length) return {state:"idle", value:"Not observed yet", note:"Actions budget awaiting its first observation"};
+    const exhausted = rows.filter(row => row.exhausted === true);
+    if (exhausted.length) {
+      const names = exhausted.map(row => row.repo.split("/")[1]), runs = exhausted.flatMap(row => row.runs || []).slice(0,3);
+      const lastKnown = streamStale === true || exhausted.every(row => row.stale === true);
+      return {state:"boulder", value:`Exhausted · ${names.join(", ")}`,
+        note:`${lastKnown ? "Last known: installation" : "Installation"} rate limit in run ${runs.join(", ")} · reset unknown · GITHUB_TOKEN, 1,000 requests per hour per repository`, repos:exhausted.map(row => row.repo)};
+    }
+    const scanned = rows.filter(row => row.scanned === true).length, all = scanned === rows.length;
+    const coverage = `${scanned} of ${rows.length} ${rows.length === 1 ? "repository" : "repositories"} scanned`;
+    // A fresh measured estimate at the speed bump or the limit is evidence of its own and does
+    // not wait for the log scan; with exhaustion unobserved it stays labelled as an estimate.
+    const estimated = state => rows.filter(row => row.exhausted !== true && row.state === state);
+    const at = estimated("boulder"), near = estimated("bump"), warned = at.length ? at : near;
+    if (warned.length) {
+      return {state: at.length ? "boulder" : "bump", value:`${at.length ? "At the limit by estimate" : "Near the limit"} · ${warned.map(row => row.repo.split("/")[1]).join(", ")}`,
+        note:`${streamStale === true ? "Last known: estimated" : "Estimated"} from measured requests per run · exhaustion not observed · ${coverage}`, repos:warned.map(row => row.repo)};
+    }
+    // "No exhaustion seen" needs a live stream and a fresh, complete failed-job log scan of every repository.
+    const clean = all && streamStale !== true;
+    return {state: clean ? "clear" : "idle", value: clean ? "No exhaustion seen" : "Not fully observed",
+      note:`${streamStale === true ? "Local stream not live · last known: " : ""}Failed-job logs of the last hour · ${coverage}`, repos:[]};
+  }
+  // Times at which a token row or the header changes on the clock alone: a settled scan leaving
+  // SCAN_FRESH, a CI-derived row leaving the CI observation gap, and a measurement leaving its hour.
+  function tokenBoundaries(data) {
+    const rows = Array.isArray(data?.repositories) ? data.repositories : [];
+    return rows.flatMap(row => [num(row?.installation_scan?.observed_at) ? row.installation_scan.observed_at + SCAN_FRESH : null,
+      C.epoch(row?.observed_at) === null ? null : C.epoch(row.observed_at) + CI_OBSERVATION_GAP,
+      num(row?.measurement?.observed_at) ? row.measurement.observed_at + 3600 : null]).filter(value => value !== null);
+  }
   function install(app) {app.registerPanel("budget","actions",project,render);}
-  return {project,BudgetView,render,install};
+  return {project,BudgetView,render,install,tokenSummary,tokenBoundaries};
 });
