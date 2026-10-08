@@ -140,14 +140,14 @@ def json_message(line):
             return False
         message = value.get("message") if isinstance(value, dict) else None
     else:
-        field = JSON_FIELD.match(line)
+        field = JSON_FIELD.match(rest)
         if not field:
             return False
         try:
-            message, end = json.JSONDecoder().raw_decode(line, field.end())
+            message, end = json.JSONDecoder().raw_decode(rest, field.end())
         except ValueError:
             return False
-        if line[end:].strip() not in ("", ","):
+        if rest[end:].strip() not in ("", ","):
             return False
     return isinstance(message, str) and MESSAGE.match(message) is not None
 
