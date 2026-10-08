@@ -573,9 +573,15 @@ class ActionsTests(unittest.TestCase):
             self.assertEqual(step()['error'], 'invalid_page', created)
         # Evidence is the exact last hour: the coarse URL cutoff admits up to five extra minutes,
         # and a settled scan drops proofs whose runs have left the hour.
+        # A proof leaving its hour inside the scan interval ends the cached answer: the scan runs again.
+        state['runs'] = [R(20, created=NOW + 600)]; current[0] = NOW + 3600 - 60 - 121; before = step()
+        self.assertEqual((before['error'], before['runs']), (None, ['20', '19', '9', '7', '5']))
+        within = step(61); self.assertEqual(len(gets), 1, 'the cache is bypassed once runs 5 and 7 expire')
+        self.assertEqual(within, {'observed_at': current[0], 'error': None, 'runs': ['20', '19', '9']})
+        self.assertEqual((step(30), gets), (within, []))
         # Proofs expire with their hour even while every refresh fails.
         state['error'] = 'secondary_limit'; current[0] = NOW + 600 + 3601 - 121
-        self.assertEqual(step(), {'observed_at': timed['observed_at'], 'error': 'secondary_limit', 'runs': []})
+        self.assertEqual(step(), {'observed_at': within['observed_at'], 'error': 'secondary_limit', 'runs': []})
         state['error'] = None
         jobs[18] = [{'id': 181, 'conclusion': 'failure'}]; logs['181'] = b'API rate limit exceeded for installation'
         current[0] = NOW + 600 + 3601; state['runs'] = [R(18, created=current[0] + 121 - 3601)]

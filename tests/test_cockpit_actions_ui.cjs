@@ -303,3 +303,10 @@ test('without a live stream the header never reads current',()=>{
  const near=tokenSummary(model(data({repositories:[row({estimated_requests:800,measurement:measured()})]})),true);
  assert.equal(near.value,'Near the limit · mergepath');assert.match(near.note,/^Last known: estimated/);
 });
+test('last-known scan proofs age the token card but not the queue card',()=>{
+ const m=model(data({repositories:[row({installation_scan:{observed_at:now,error:'secondary_limit',runs:['9']}})]}));
+ const token=m.cards.find(card=>card.id==='token'),queue=m.cards.find(card=>card.id==='queue');
+ assert.equal(token.stale,true);assert.equal(queue.stale,false);assert.equal(m.stale,true);
+ const live=model(data({repositories:[row({installation_scan:{observed_at:now,error:null,runs:['9']}})]}));
+ assert.equal(live.cards.find(card=>card.id==='token').stale,false);
+});

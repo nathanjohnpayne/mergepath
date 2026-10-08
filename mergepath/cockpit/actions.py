@@ -244,7 +244,10 @@ class ActionsProvider:
         installation-limit message establishes exhaustion.
         """
         last = self._scans.get(repo)
-        if last is not None and 0 <= now - last["attempted_at"] < SCAN_INTERVAL:
+        # A proof leaving its hour inside the interval ends the cached answer: the scan runs again
+        # rather than publishing an expired run, or a clean result that run had settled.
+        if (last is not None and 0 <= now - last["attempted_at"] < SCAN_INTERVAL
+                and all(at >= now - 3600 for at in last["proofs"].values())):
             return last
         # Proofs map an exhausted run id to its creation time and hold only for the hour after it,
         # pruned before every refresh so a failing or incomplete scan cannot keep an expired one.

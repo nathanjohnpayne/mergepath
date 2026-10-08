@@ -112,7 +112,8 @@
       if (["bump","boulder"].includes(qs)) hazard(queue,qs,row.repo,jam?`${row.queued} queued, ${row.running} running continuously >30 minutes. Cockpit jam heuristic.`:`${row.queued} queued; warning reference 10, runner capacity unknown.`,jam?{kind:"now"}:{kind:"unknown"},C.epoch(row.observed_at),!good);
     }
     token.state = C.worstState(token.rows.map(row=>row.state)); token.available = repositories.length > 0 && tokenKnown === repositories.length;
-    token.stale = anyStale; token.note = "Estimates: runs in the last hour × explicitly measured requests per run. Installation failure overrides estimates. Reset and exhaustion ETA unavailable without evidence.";
+    // Retained scan proofs can be last known while the CI counts are fresh; that ages the token card alone.
+    token.stale = anyStale || token.rows.some(row => row.stale === true); token.note = "Estimates: runs in the last hour × explicitly measured requests per run. Installation failure overrides estimates. Reset and exhaustion ETA unavailable without evidence.";
     queue.state = C.worstState(queue.rows.map(row=>row.state)); queue.available = repositories.length > 0 && queueKnown === repositories.length; queue.stale = anyStale;
     queue.value = `${q} queued · ${r} running${queue.available ? "" : " · partial / unavailable coverage"}`;
     queue.note = "Warning reference: ≥10 queued; jam heuristic: ≥40 queued and ≤1 running continuously >30 min. Runner capacity and drain ETA unavailable.";
