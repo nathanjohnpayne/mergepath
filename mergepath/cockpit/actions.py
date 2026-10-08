@@ -18,11 +18,12 @@ INSTALLATION = "api rate limit exceeded for installation"
 # The message as GitHub ends it: a period, `ID`, the end of the line, or a JSON value's closing quote.
 MESSAGE = re.compile(r"api rate limit exceeded for installation(?:\.|\s+id\b|\s*$|(?=\"))", re.I)
 # What may come before it on an emitted error line (#1842). Bare, after a runner `##[error]`
-# marker; after `label: ` prefixes whose last one names an error (`gh: `, `Error: `,
-# `RequestError [HttpError]: `, `[tool] ERROR: `), so `note: ` is not one; or as the `"message"`
-# value of a JSON response line, where only labels, an opening brace and other fields may precede
-# it. Quoted, embedded or wrapped copies (`expected {"message": ...} but`) match none of these.
-MARKER = r"(?:##\[(?:error|warning)\])?"
+# marker (not `##[warning]`, which can quote it); after `label: ` prefixes whose last one names an
+# error (`gh: `, `Error: `, `RequestError [HttpError]: `, `[tool] ERROR: `), so `note: ` is not one;
+# or as the `"message"` value of a JSON response line, where only labels, an opening brace and
+# other fields may precede it. Quoted, embedded or wrapped copies (`expected {"message": ...} but`)
+# match none of these.
+MARKER = r"(?:##\[error\])?"
 LABEL = r"[A-Za-z\[][\w\[\]().\- ]{0,40}:\s+"
 ERROR_HEAD = re.compile(rf"{MARKER}(?:{LABEL})*", re.I)
 ERROR_WORD = re.compile(r"error|fatal|exception|failed|failure|\bgh\b", re.I)
@@ -358,7 +359,11 @@ class ActionsProvider:
                 attempt = raw.get("run_attempt", 1)
                 if not count(attempt) or attempt == 0:
                     raise ClientError("invalid_page")
-                key = (repo, raw["id"], attempt)
+                # Caches are keyed on state that changes when a run moves on: an approval-held run
+                # resumes as the same run and attempt, so its conclusion and update time are part of
+                # the key, and each job's verdict is keyed on the job's own conclusion and completion.
+                # Progress through a held run's jobs is kept while it waits, and dropped when it resumes.
+                key = (repo, raw["id"], attempt, raw.get("conclusion"), raw.get("updated_at"))
                 jobs = self._scan_jobs.get(key)
                 if jobs is None:
                     # Every page of the jobs of every attempt so far, bounded: an earlier attempt can hold
@@ -370,13 +375,11 @@ class ActionsProvider:
                                                      or job.get("conclusion") not in TERMINAL for job in rows):
                         raise ClientError("invalid_page")
                     # Every failure-class conclusion, the CI taxonomy: a timed-out job can carry the limit too.
-                    jobs = [str(job["id"]) for job in rows if job["conclusion"] in FAILURES]
-                    # An approval-held run resumes as the same run and attempt, so nothing about it is
-                    # cached: its jobs and logs are read afresh until it settles another way.
-                    if raw.get("conclusion") != "action_required":
-                        self._remember(self._scan_jobs, key, jobs)
-                for job in jobs:
-                    verdict = self._scan_logs.get((repo, job))
+                    jobs = [(str(job["id"]), job["conclusion"], job.get("completed_at")) for job in rows
+                            if job["conclusion"] in FAILURES]
+                    self._remember(self._scan_jobs, key, jobs)
+                for job, conclusion, completed in jobs:
+                    verdict = self._scan_logs.get((repo, job, conclusion, completed))
                     if verdict is None:
                         if state["reads"] >= LOG_READS or self.monotonic() >= deadline:
                             complete = False
@@ -386,8 +389,7 @@ class ActionsProvider:
                         body = self.client.read_job_log(repo, job, deadline=deadline)
                         text = body.decode("utf-8", "replace") if type(body) is bytes else body if type(body) is str else ""
                         verdict = logged_limit(text)
-                        if raw.get("conclusion") != "action_required":
-                            self._remember(self._scan_logs, (repo, job), verdict)
+                        self._remember(self._scan_logs, (repo, job, conclusion, completed), verdict)
                     if verdict:
                         exhausted.append((str(raw["id"]), created))
                         break

@@ -652,6 +652,15 @@ class ActionsTests(unittest.TestCase):
         jobs[36] = [{'id': 361, 'conclusion': 'failure'}, {'id': 362, 'conclusion': 'failure'}]
         logs['362'] = b'gh: API rate limit exceeded for installation. If you reach out'
         self.assertEqual(step()['runs'][0], '36'); self.assertEqual(reads, ['361', '362'])
+        # Progress through a held run's jobs is kept while it waits: past the three-read window the
+        # next window continues at the fourth job instead of rereading the first three forever.
+        waiting = dict(R(35, created=current[0] + 121 - 5), conclusion='action_required', updated_at='2026-10-07T00:00:00Z')
+        state['runs'] = []; state['action_required'] = [waiting]
+        jobs[35] = [{'id': i, 'conclusion': 'action_required'} for i in (351, 352, 353, 354)]
+        logs.update({'351': b'x', '352': b'x', '353': b'x', '354': b'gh: API rate limit exceeded for installation. If you reach out'})
+        first = step(); self.assertEqual((reads, first['error']), (['351', '352', '353'], 'incomplete'))
+        self.assertEqual(step()['runs'][0], '35'); self.assertEqual(reads, ['354'])
+        state['action_required'] = []
         # Runs tied at the fifth slot across the lists are all sampled.
         tie = current[0] + 121 - 2
         state['runs'] = [R(60 + i, created=tie) for i in range(5)]
@@ -706,6 +715,7 @@ class ActionsTests(unittest.TestCase):
                        'checked: no API rate limit exceeded for installation. All good',
                        '{"note":"API rate limit exceeded for installation."}',
                        'note: API rate limit exceeded for installation. is the text we check for; no limit occurred',
+                       '##[warning]API rate limit exceeded for installation.',
                        'AssertionError: expected {"message":"API rate limit exceeded for installation."} but got success'):
             self.assertFalse(logged_limit(ts + quoted), quoted)
         for emitted in ('gh: API rate limit exceeded for installation. If you reach out to GitHub Support for help',
