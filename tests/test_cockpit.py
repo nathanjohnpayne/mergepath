@@ -956,7 +956,9 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 204)
         self.cookie = headers["Set-Cookie"].split(";")[0]
         self.assertIn("HttpOnly", headers["Set-Cookie"])
-        self.assertIn("SameSite=Strict", headers["Set-Cookie"])
+        # Lax, not Strict: Safari withholds a Strict cookie on the history navigation back to the
+        # page after the tab visited another site, and the Cockpit answered 401 (#1844).
+        self.assertIn("SameSite=Lax", headers["Set-Cookie"]); self.assertNotIn("Strict", headers["Set-Cookie"])
         self.assertIn("Path=" + self.app.scope_path, headers["Set-Cookie"])
         self.assertNotEqual(self.cookie.split("=", 1)[1], self.app._nonce)
 
@@ -1513,6 +1515,27 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.request(path="/events")[0], 503)
         self.app.close()
         for stream in streams: stream.close()
+
+    def test_sse_slot_is_released_when_the_client_closes_between_heartbeats(self):
+        # #1844: a page that went away kept its stream slot until the next heartbeat write failed,
+        # so a quick return found both slots held and sat on Reconnecting. With heartbeats a minute
+        # apart, only noticing the closed peer can free the slot in time.
+        self.app.heartbeat = 60
+        self.bootstrap()
+        streams = [self.request(path="/events", stream=True) for _ in range(2)]
+        for stream in streams:
+            self.assertEqual(stream.status, 200); stream.readline()
+        self.assertEqual(self.request(path="/events")[0], 503)
+        streams[0].close()
+        deadline, status = time.monotonic() + 5, 503
+        while status == 503 and time.monotonic() < deadline:
+            time.sleep(0.2)
+            reopened = self.request(path="/events", stream=True); status = reopened.status
+            if status != 200: reopened.read(); reopened.close()
+        self.assertEqual(status, 200, "a closed stream's slot is released within seconds, not at the heartbeat")
+        # The open stream keeps its slot: a live page is never evicted.
+        self.assertEqual(self.request(path="/events")[0], 503)
+        reopened.close(); streams[1].close()
 
     def test_logs_and_errors_never_echo_secrets_paths_or_headers(self):
         self.bootstrap()
