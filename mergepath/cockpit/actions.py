@@ -254,8 +254,11 @@ class ActionsProvider:
         # Proofs map an exhausted run id to its creation time and hold only for the hour after it,
         # pruned before every refresh so a failing or incomplete scan cannot keep an expired one.
         proofs = {run: at for run, at in (last["proofs"] if last else {}).items() if at >= now - 3600}
+        # A retry stays inside the window it continues: three log reads per repository per window.
+        carried = last is not None and last["retry"] and 0 <= now - last["window"] < SCAN_INTERVAL
         state = {"attempted_at": now, "observed_at": last["observed_at"] if last else None,
-                 "error": None, "runs": newest(proofs), "proofs": proofs, "retry": False}
+                 "error": None, "runs": newest(proofs), "proofs": proofs, "retry": False,
+                 "window": last["window"] if carried else now, "reads": last["reads"] if carried else 0}
         try:
             # The cutoff is floored to five minutes so the list URL revalidates as a free 304.
             cutoff = dt.datetime.fromtimestamp((now - 3600) // 300 * 300, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -264,7 +267,7 @@ class ActionsProvider:
             listed = payload.get("workflow_runs") if type(payload) is dict else None
             if type(listed) is not list:
                 raise ClientError("invalid_page")
-            exhausted, complete, reads = [], True, 0
+            exhausted, complete = [], True
             for raw in listed[:SCAN_RUNS]:
                 if exhausted:
                     break
@@ -273,8 +276,9 @@ class ActionsProvider:
                 created = iso_epoch(raw.get("created_at"))
                 if created is None or created > now + 60:
                     raise ClientError("invalid_page")
-                # The coarse cutoff only keeps the URL cacheable; evidence is the exact last hour.
-                if created < now - 3600:
+                # The coarse cutoff only keeps the URL cacheable; evidence is the exact last hour, and
+                # a run dated ahead of this clock waits until it enters it.
+                if not now - 3600 <= created <= now:
                     continue
                 attempt = raw.get("run_attempt", 1)
                 if not count(attempt) or attempt == 0:
@@ -296,11 +300,11 @@ class ActionsProvider:
                 for job in jobs:
                     verdict = self._scan_logs.get((repo, job))
                     if verdict is None:
-                        if reads >= LOG_READS or self.monotonic() >= deadline:
+                        if state["reads"] >= LOG_READS or self.monotonic() >= deadline:
                             complete = False
                             state["retry"] = state["retry"] or self.monotonic() >= deadline
                             continue
-                        reads += 1
+                        state["reads"] += 1
                         body = self.client.read_job_log(repo, job, deadline=deadline)
                         text = body.decode("utf-8", "replace") if type(body) is bytes else body if type(body) is str else ""
                         verdict = INSTALLATION in text.casefold()
@@ -461,7 +465,9 @@ class ActionsProvider:
         elif self._robot_last is not None:
             robot = unavailable(robot.get("error", "source_failed"), self._robot_last)
         return Sample({"schema": "actions-budget/v1", "billing": billing, "repositories": sorted(rows, key=lambda row: row["repo"]),
-                       "robot": robot, "configuration": self._configuration(now)}, hot=any(row.get("queued") or row.get("running") for row in rows))
+                       "robot": robot, "configuration": self._configuration(now)}, hot=any(row.get("queued") or row.get("running") for row in rows)
+                      # A deadline-cut scan comes back on the hot cadence rather than the idle one.
+                      or any(scan["retry"] for scan in self._scans.values()))
 
     def _configuration(self, now):
         config = {"budget": None, "cycle_start": None, "cycle_end": None}

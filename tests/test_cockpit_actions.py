@@ -588,6 +588,20 @@ class ActionsTests(unittest.TestCase):
         self.assertEqual(step()['error'], 'deadline_exceeded')
         retried = step(15); self.assertEqual((reads, retried['error'], retried['runs'][0]), (['211'], None, '21'))
         within = retried; self.assertEqual((step(15), gets), (retried, []))
+        # A retry stays inside its window's three log reads, and a pending retry keeps the source hot.
+        jobs[23] = [{'id': i, 'conclusion': 'failure'} for i in (231, 232, 233, 234)]
+        logs.update({str(i): b'x' for i in (231, 232, 233, 234)}); state['runs'] = [R(23, created=NOW + 600)]; cut.add('232')
+        current[0] += 121; reads.clear(); cutting = p.fetch(30)
+        self.assertEqual(cutting.data['repositories'][0]['installation_scan']['error'], 'deadline_exceeded'); self.assertEqual(reads, ['231', '232'])
+        self.assertTrue(cutting.hot, 'a deadline-cut scan is retried on the hot cadence')
+        current[0] += 15; settled = p.fetch(30)
+        self.assertEqual(reads, ['231', '232', '232']); self.assertEqual(settled.data['repositories'][0]['installation_scan']['error'], 'incomplete')
+        self.assertFalse(settled.hot)
+        # A run dated ahead of this clock waits until it enters the window.
+        jobs[22] = [{'id': 221, 'conclusion': 'failure'}]; logs['221'] = b'API rate limit exceeded for installation'
+        state['runs'] = [R(22, created=current[0] + 121 + 30)]
+        ahead = step(121); self.assertEqual((reads, ahead['error']), ([], None)); self.assertNotIn('22', ahead['runs'])
+        within = ahead
         # Proofs expire with their hour even while every refresh fails.
         state['error'] = 'secondary_limit'; current[0] = NOW + 600 + 3601 - 121
         self.assertEqual(step(), {'observed_at': within['observed_at'], 'error': 'secondary_limit', 'runs': []})
