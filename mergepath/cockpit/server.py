@@ -5,6 +5,7 @@ import json
 import math
 import mimetypes
 import secrets
+import select
 import socket
 import threading
 import time
@@ -22,6 +23,8 @@ from .sync import SyncError
 PANEL_IDS = ("prs", "ci", "agents", "history", "fleet", "budget")
 
 
+# How often an idle SSE stream checks whether its client has gone (#1844).
+PEER_CHECK_SECONDS = 1.0
 SYNC_BODY_SECONDS = 10
 
 COOKIE = "mergepath_cockpit"
@@ -287,9 +290,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             # Remove only an old host-wide cookie. Otherwise browsers send it
             # alongside the scoped cookie and duplicate-name checks refuse it.
+            # SameSite=Lax, not Strict: Safari withholds a Strict cookie on the
+            # history navigation back to the page after the tab visited another
+            # site, so the Cockpit answered 401 instead of reloading. Lax still
+            # withholds it from every cross-site subresource and non-GET request;
+            # the unguessable scope, Sec-Fetch-Site, Origin and CSRF checks stand.
             self._respond(204, raw=b"", cookie=(
-                f"{COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict",
-                f"{COOKIE}={app._session}; Path={app.scope_path}; HttpOnly; SameSite=Strict"))
+                f"{COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax",
+                f"{COOKIE}={app._session}; Path={app.scope_path}; HttpOnly; SameSite=Lax"))
             return
         if not public:
             # Cookie hosts ignore ports. The independent unguessable scope is
@@ -437,6 +445,15 @@ class Handler(BaseHTTPRequestHandler):
         mime = mimetypes.guess_type(str(resolved))[0] or "application/octet-stream"
         self._respond(200, raw=data, content_type=mime)
 
+    def _peer_closed(self):
+        """True once the stream's client has closed it. An SSE client sends nothing after its
+        request, so a readable socket is end-of-stream (or a reset), never data to keep."""
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b""
+        except (OSError, ValueError):
+            return True
+
     def _events(self):
         app = self.server.app
         if not app.stream_slots.acquire(blocking=False):
@@ -451,7 +468,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"retry: 2000\n\n")
             self.wfile.flush()
             app.logger("request status=200")
-            revision = -1
+            revision, written = -1, time.monotonic()
             while not app.stopping.is_set():
                 snapshot = app.snapshot()
                 if snapshot["revision"] != revision:
@@ -459,12 +476,19 @@ class Handler(BaseHTTPRequestHandler):
                     data = json.dumps(snapshot, allow_nan=False, separators=(",", ":"))
                     self.wfile.write(f"id: {revision}\nevent: snapshot\ndata: {data}\n\n".encode())
                     self.wfile.flush()
+                    written = time.monotonic()
                 with app._condition:
                     updated = app._condition.wait_for(
-                        lambda: app.stopping.is_set() or app._revision != revision, timeout=app.heartbeat)
-                if not updated:
+                        lambda: app.stopping.is_set() or app._revision != revision,
+                        timeout=min(app.heartbeat, PEER_CHECK_SECONDS))
+                # A page that went away closes its stream; release the slot now rather than at the
+                # next failed heartbeat write, or a quick return finds both slots held (#1844).
+                if self._peer_closed():
+                    break
+                if not updated and time.monotonic() - written >= app.heartbeat:
                     self.wfile.write(b"event: heartbeat\ndata: {}\n\n")
                     self.wfile.flush()
+                    written = time.monotonic()
         except (BrokenPipeError, ConnectionResetError, socket.timeout):
             pass
         finally:
