@@ -563,12 +563,20 @@ class ActionsTests(unittest.TestCase):
                                           [{'id': 42, 'conclusion': 'FAILURE'}])):
             jobs[160 + index] = bad_jobs; state['runs'] = [R(160 + index, created=NOW + 600)]
             self.assertEqual(step()['error'], 'invalid_page', bad_jobs)
+        # Every failure-class conclusion is read, and every documented finished one is accepted.
+        jobs[20] = [{'id': 201, 'conclusion': 'stale'}, {'id': 202, 'conclusion': 'cancelled'}, {'id': 203, 'conclusion': 'timed_out'}]
+        logs['203'] = b'API rate limit exceeded for installation'; state['runs'] = [R(20, created=NOW + 600)]
+        timed = step(); self.assertEqual(reads, ['203']); self.assertEqual((timed['error'], timed['runs'][0]), (None, '20'))
         # A listed run needs a zoned creation time.
         for created in (None, '2026-10-03T00:00:00', 'soon'):
             state['runs'] = [{'id': 17, 'run_attempt': 1, 'created_at': created}]
             self.assertEqual(step()['error'], 'invalid_page', created)
         # Evidence is the exact last hour: the coarse URL cutoff admits up to five extra minutes,
         # and a settled scan drops proofs whose runs have left the hour.
+        # Proofs expire with their hour even while every refresh fails.
+        state['error'] = 'secondary_limit'; current[0] = NOW + 600 + 3601 - 121
+        self.assertEqual(step(), {'observed_at': timed['observed_at'], 'error': 'secondary_limit', 'runs': []})
+        state['error'] = None
         jobs[18] = [{'id': 181, 'conclusion': 'failure'}]; logs['181'] = b'API rate limit exceeded for installation'
         current[0] = NOW + 600 + 3601; state['runs'] = [R(18, created=current[0] + 121 - 3601)]
         aged = step(); self.assertEqual(reads, []); self.assertEqual(len(gets), 1)

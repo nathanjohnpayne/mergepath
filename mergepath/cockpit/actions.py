@@ -8,6 +8,7 @@ import re
 import time
 from decimal import Decimal, InvalidOperation
 
+from .ci import FAILURES, TERMINAL
 from .github import ClientError
 from .inventory import REPO
 from .scheduler import Sample
@@ -25,8 +26,6 @@ SCAN_INTERVAL = 120
 SCAN_RUNS = 5
 LOG_READS = 3
 JOB_PAGES = 5
-# A finished job's documented conclusions; anything else cannot be read as not failed.
-CONCLUSIONS = frozenset({"success", "failure", "neutral", "cancelled", "skipped", "timed_out", "action_required"})
 SCAN_CACHE = 1024
 
 
@@ -100,6 +99,11 @@ def measured_coefficient(value, repo, now):
         return None
     return {"requests_per_run": requests / runs, "observed_at": observed,
             "window_start": start, "window_end": end, "provenance": provenance.strip()}
+
+
+def newest(proofs):
+    """Proven run ids, newest run first."""
+    return sorted(proofs, key=lambda run: (proofs[run], int(run)), reverse=True)
 
 
 def iso_epoch(value):
@@ -242,10 +246,11 @@ class ActionsProvider:
         last = self._scans.get(repo)
         if last is not None and 0 <= now - last["attempted_at"] < SCAN_INTERVAL:
             return last
-        # Proofs map an exhausted run id to its creation time; they hold for the hour after it.
-        proofs = dict(last["proofs"]) if last else {}
+        # Proofs map an exhausted run id to its creation time and hold only for the hour after it,
+        # pruned before every refresh so a failing or incomplete scan cannot keep an expired one.
+        proofs = {run: at for run, at in (last["proofs"] if last else {}).items() if at >= now - 3600}
         state = {"attempted_at": now, "observed_at": last["observed_at"] if last else None,
-                 "error": None, "runs": list(last["runs"]) if last else [], "proofs": proofs}
+                 "error": None, "runs": newest(proofs), "proofs": proofs}
         try:
             # The cutoff is floored to five minutes so the list URL revalidates as a free 304.
             cutoff = dt.datetime.fromtimestamp((now - 3600) // 300 * 300, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -278,9 +283,10 @@ class ActionsProvider:
                                              collection="jobs", max_pages=JOB_PAGES, deadline=deadline)
                     # An unreadable row could be a failed job, so it fails the scan rather than vanishing.
                     if type(rows) is not list or any(type(job) is not dict or not count(job.get("id")) or job["id"] == 0
-                                                     or job.get("conclusion") not in CONCLUSIONS for job in rows):
+                                                     or job.get("conclusion") not in TERMINAL for job in rows):
                         raise ClientError("invalid_page")
-                    jobs = [str(job["id"]) for job in rows if job.get("conclusion") == "failure"]
+                    # Every failure-class conclusion, the CI taxonomy: a timed-out job can carry the limit too.
+                    jobs = [str(job["id"]) for job in rows if job["conclusion"] in FAILURES]
                     self._remember(self._scan_jobs, key, jobs)
                 for job in jobs:
                     verdict = self._scan_logs.get((repo, job))
@@ -299,10 +305,8 @@ class ActionsProvider:
             if complete or exhausted:
                 # A settled scan samples only the newest runs, so it cannot disprove an earlier proof:
                 # proofs stand until their run leaves the hour, and the newest are listed first.
-                proofs = {run: at for run, at in proofs.items() if at >= now - 3600}
                 proofs.update(exhausted)
-                state["proofs"], state["observed_at"] = proofs, now
-                state["runs"] = sorted(proofs, key=lambda run: (proofs[run], int(run)), reverse=True)
+                state["proofs"], state["runs"], state["observed_at"] = proofs, newest(proofs), now
             else:
                 # Not clean evidence: the last settled runs stand until a settled scan replaces them.
                 state["error"] = "incomplete"
