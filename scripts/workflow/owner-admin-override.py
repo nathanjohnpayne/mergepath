@@ -91,6 +91,15 @@ def merge_args(argv):
     return (selector, repo, heads) if admin else None
 
 
+def response_anchor(body, head):
+    """Provider response observation; this does not grant review clearance."""
+    fields = [line for line in body.splitlines() if re.search(r'(?i)reviewed commit', line)]
+    if len(fields) != 1:
+        return False
+    match = re.fullmatch(r'\s*(?:\*\*)?Reviewed commit:?(?:\*\*)?:?\s*`?([0-9a-f]{7,40})`?\s*', fields[0], re.I)
+    return bool(match and head.startswith(match[1].lower()))
+
+
 def prepare(argv):
     parsed = merge_args(argv)
     if parsed is None:
@@ -144,7 +153,7 @@ def prepare(argv):
                       or any(comment.get('pull_request_review_id') == review.get('id') and not comment.get('in_reply_to_id')
                              and comment.get('user', {}).get('login') == BOT for comment in inline))]
     for comment in comments:
-        if comment.get('user', {}).get('login') == BOT and re.search(r'(?im)^\s*\*{0,2}Reviewed commit\*{0,2}:?\s*`?' + re.escape(head) + r'`?\s*$', comment.get('body', '')):
+        if comment.get('user', {}).get('login') == BOT and response_anchor(comment.get('body', ''), head):
             responses.append(comment['created_at'])
     inflight = bool(requests and (not responses or max(requests) >= max(responses)))
     for comment in comments:

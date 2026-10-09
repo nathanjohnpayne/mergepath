@@ -327,6 +327,30 @@ else
 fi
 
 echo
+# The actual selector keeps batch authorizations specific to each PR/head.
+eval "$(sed -n '/^select_admin_record()/,/^}/p' "$SCRIPT")"
+AUTHORIZATION_FILE="$SCRATCH/authorizations.json"
+jq -n '[{pr_url:"https://github.com/test/repo/pull/1",head_sha:("a"*40),authorization_quote:"first"},
+        {pr_url:"https://github.com/test/repo/pull/2",head_sha:("b"*40),authorization_quote:"second"}]' > "$AUTHORIZATION_FILE"
+selected=$(select_admin_record https://github.com/test/repo/pull/2 "$(printf '%040d' 0 | tr 0 b)")
+if [ "$(printf '%s' "$selected" | jq -r .authorization_quote)" = second ]; then
+  pass=$((pass + 1)); echo "PASS: batch selects only the exact PR/head owner record"
+else
+  fail=$((fail + 1)); echo "FAIL: batch reused another PR authorization"
+fi
+if select_admin_record https://github.com/test/repo/pull/1 "$(printf '%040d' 0 | tr 0 b)" >/dev/null; then
+  fail=$((fail + 1)); echo "FAIL: stale-head authorization accepted"
+else
+  pass=$((pass + 1)); echo "PASS: stale-head authorization refuses"
+fi
+jq '. + [.[1]]' "$AUTHORIZATION_FILE" > "$SCRATCH/duplicates.json"
+AUTHORIZATION_FILE="$SCRATCH/duplicates.json"
+if select_admin_record https://github.com/test/repo/pull/2 "$(printf '%040d' 0 | tr 0 b)" >/dev/null; then
+  fail=$((fail + 1)); echo "FAIL: duplicate authorization accepted"
+else
+  pass=$((pass + 1)); echo "PASS: ambiguous duplicate authorizations refuse"
+fi
+
 if [ "$fail" -eq 0 ]; then
   echo "test_admin_merge_codeowners_blocked: PASS ($pass tests)"
   exit 0

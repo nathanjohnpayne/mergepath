@@ -93,6 +93,17 @@ print(json.dumps(result))
         self.assertEqual(self.run_prepare().returncode, 2)
         self.assertEqual(self.run_prepare({**AUTH, 'allow_codex_inflight': True}).returncode, 0)
 
+    def test_anchored_issue_comment_is_a_response_observation(self):
+        self.state['comments'] = [
+            {'user': {'login': 'nathanjohnpayne'}, 'body': '@codex review', 'created_at': '2026-01-01T00:00:01Z'},
+            {'user': {'login': override.BOT}, 'body': '**Reviewed commit:** `' + HEAD[:10] + '`',
+             'created_at': '2026-01-01T00:00:02Z'}]
+        self.assertEqual(self.run_prepare().returncode, 0)
+        for body in ('Reviewed commit: ' + 'b'*10, 'Reviewed commit: ' + HEAD[:10] + '.trailing',
+                     'Reviewed commit: ' + HEAD[:10] + '\nReviewed commit: ' + HEAD):
+            self.state['comments'][1]['body'] = body
+            self.assertEqual(self.run_prepare().returncode, 2)
+
     def test_running_summary_without_an_explicit_request_blocks(self):
         self.state['comments'] = [{'user': {'login': override.BOT}, 'created_at': '2026-01-01T00:00:01Z',
                                   'body': '<!-- codex-pull-request-review-summary -->\n| Code Review | Running | `' + HEAD[:8] + '` | Automatic |'}]

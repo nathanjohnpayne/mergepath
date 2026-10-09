@@ -16,12 +16,12 @@
 # deadlock can't be cleared by automation; the human is the
 # tiebreaker. Per REVIEW_POLICY.md § Phase 4 § "Never use --admin
 # unless the human explicitly authorizes it in chat as a break-
-# glass exception" — this script's invocation IS that
-# authorization. The PreToolUse hook on `gh pr merge --admin`
-# treats running this wrapper as the auth signal.
+# glass exception" — every admin merge requires the quoted,
+# per-PR/head authorization record below. Invocation alone grants no
+# authorization, and a batch cannot reuse one PR's record for another.
 #
 # Usage:
-#   scripts/admin-merge-codeowners-blocked.sh <pr-ref> [<pr-ref> ...]
+#   scripts/admin-merge-codeowners-blocked.sh [--authorization-file FILE] <pr-ref> [<pr-ref> ...]
 #
 #   <pr-ref> takes one of two forms:
 #     <num>                  PR in nathanjohnpayne/mergepath (this repo)
@@ -76,19 +76,47 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 usage() {
   cat >&2 <<EOF
-usage: scripts/admin-merge-codeowners-blocked.sh <pr-ref> [<pr-ref> ...]
+usage: scripts/admin-merge-codeowners-blocked.sh [--authorization-file FILE] <pr-ref> [<pr-ref> ...]
 
   <pr-ref>   <num> for this repo, or <owner>/<repo>#<num> cross-repo
 
 Each PR is merged via \`gh pr merge --squash --delete-branch --admin\`
-under the AUTHOR identity (nathanjohnpayne). Running this script is
-the explicit human authorization for the --admin escape hatch per
-REVIEW_POLICY.md § Phase 4.
+under the AUTHOR identity (nathanjohnpayne). Each BLOCKED PR requires a
+matching version-1 owner authorization record. FILE is a JSON array of records;
+a single-PR call may instead supply MERGEPATH_OWNER_ADMIN_AUTHORIZATION.
+CLEAN PRs use the ordinary merge path without an admin authorization.
 EOF
   exit 2
 }
 
 [[ $# -ge 1 ]] || usage
+
+AUTHORIZATION_FILE=""
+PR_REFS=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --authorization-file)
+      [ "$#" -ge 2 ] && [ -r "$2" ] || usage
+      AUTHORIZATION_FILE="$2"; shift 2 ;;
+    -h|--help|--*) usage ;;
+    *) PR_REFS+=("$1"); shift ;;
+  esac
+done
+[ "${#PR_REFS[@]}" -gt 0 ] || usage
+
+select_admin_record() { # canonical-url full-head
+  local records
+  if [ -n "$AUTHORIZATION_FILE" ]; then
+    records=$(cat "$AUTHORIZATION_FILE") || return 1
+  else
+    records=$(printf '%s' "${MERGEPATH_OWNER_ADMIN_AUTHORIZATION:-null}" | jq -c '[.]') || return 1
+  fi
+  printf '%s' "$records" | jq -ce --arg url "$1" --arg head "$2" '
+    select(type == "array")
+    | map(select(type == "object" and .pr_url == $url and .head_sha == $head))
+    | select(length == 1) | .[0]
+  '
+}
 
 command -v gh >/dev/null 2>&1 || {
   echo "admin-merge: gh not on PATH" >&2
@@ -156,7 +184,7 @@ FEEDBACK_ACCOUNTING_GATE="${MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD:-$SCRIPT_DI
 
 OVERALL_RC=0
 
-for ref in "$@"; do
+for ref in "${PR_REFS[@]}"; do
   parsed=$(parse_ref "$ref")
   repo=$(printf '%s\n' "$parsed" | cut -f1)
   num=$(printf '%s\n' "$parsed" | cut -f2)
@@ -476,13 +504,21 @@ for ref in "$@"; do
   # CLEAN PRs normally so those protections still apply; reserve the
   # break-glass --admin for the deadlock it exists for. (PR #340: codex P1)
   admin_flag=()
+  merge_env=()
   if [ "$pr_msstatus" = "BLOCKED" ]; then
+    pr_url="https://github.com/$repo/pull/$num"
+    if ! authorization=$(select_admin_record "$pr_url" "$pr_head"); then
+      printf '  ✗ missing or ambiguous owner authorization for %s@%s — refusing --admin merge\n' "$pr_url" "$pr_head"
+      OVERALL_RC=1
+      continue
+    fi
+    merge_env=("BREAK_GLASS_ADMIN=$pr_url@$pr_head" "MERGEPATH_OWNER_ADMIN_AUTHORIZATION=$authorization")
     admin_flag=(--admin)
     printf '  ⤷ merging with --admin (CODEOWNERS-author deadlock), pinned to %s\n' "${pr_head:0:7}"
   else
     printf '  ⤷ merging without --admin (mergeStateStatus=CLEAN — not a deadlock; merge-queue/branch protections still apply), pinned to %s\n' "${pr_head:0:7}"
   fi
-  if "$GH_AS_AUTHOR" -- gh pr merge "$num" --repo "$repo" --squash --delete-branch ${admin_flag[@]+"${admin_flag[@]}"} --match-head-commit "$pr_head"; then
+  if env ${merge_env[@]+"${merge_env[@]}"} "$GH_AS_AUTHOR" -- gh pr merge "$num" --repo "$repo" --squash --delete-branch ${admin_flag[@]+"${admin_flag[@]}"} --match-head-commit "$pr_head"; then
     new_state=$(gh_ro pr view "$num" --repo "$repo" \
       --json state,mergeCommit --jq '.state + " " + (.mergeCommit.oid // "")[0:7]' 2>&1)
     printf '  ✓ merged: %s\n' "$new_state"
