@@ -3220,6 +3220,8 @@ fi
 PR_SELECTOR=""
 REPO_ARG=""
 ADMIN_REQUESTED=0
+MATCH_HEAD_SHA=""
+MATCH_HEAD_COUNT=0
 SKIP_NEXT_AS=""  # "" | "skip" | "repo"
 merge_walk_start=$((PR_SUBCOMMAND_INDEX + 1))
 for j in "${!TOKENS[@]}"; do
@@ -3236,7 +3238,22 @@ for j in "${!TOKENS[@]}"; do
     SKIP_NEXT_AS=""
     continue
   fi
+  if [ "$SKIP_NEXT_AS" = "match" ]; then
+    MATCH_HEAD_SHA="$tok"
+    MATCH_HEAD_COUNT=$((MATCH_HEAD_COUNT + 1))
+    SKIP_NEXT_AS=""
+    continue
+  fi
   case "$tok" in
+    --match-head-commit)
+      SKIP_NEXT_AS="match"
+      continue
+      ;;
+    --match-head-commit=*)
+      MATCH_HEAD_SHA="${tok#--match-head-commit=}"
+      MATCH_HEAD_COUNT=$((MATCH_HEAD_COUNT + 1))
+      continue
+      ;;
     --admin)
       ADMIN_REQUESTED=1
       continue
@@ -3253,7 +3270,7 @@ for j in "${!TOKENS[@]}"; do
       REPO_ARG="${tok#-R=}"
       continue
       ;;
-    --body|-b|--body-file|-F|--subject|-t|--author-email|-A|--match-head-commit)
+    --body|-b|--body-file|-F|--subject|-t|--author-email|-A)
       SKIP_NEXT_AS="skip"
       continue
       ;;
@@ -3393,22 +3410,28 @@ if ! REVIEW_PAGES=$(gh api --hostname "$PR_HOST" --paginate --slurp "repos/$PR_R
    || ! printf '%s' "$REVIEW_PAGES" | jq -e '
       type == "array" and all(.[]; type == "array" and all(.[];
         type == "object" and (.id | type == "number") and
-        (.user.login | type == "string" and length > 0) and
+        (.user == null or (.user.login | type == "string" and length > 0)) and
         (.commit_id | type == "string" and test("^[0-9a-f]{40}$")) and
         (.state | IN("APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"))))' >/dev/null; then
   echo "BLOCKED: gh-pr-guard could not read complete PR review state; restore gh/auth connectivity and retry." >&2
   exit 2
 fi
 REVIEW_BLOCKERS=$(printf '%s' "$REVIEW_PAGES" | jq -c --arg author "$PR_AUTHOR_LOGIN" '
-  [.[][] | select(.state != "COMMENTED" and .state != "PENDING")]
-  | group_by(.user.login) | map(max_by(.id))
+  [.[][] | select(.state != "COMMENTED" and .state != "PENDING")] as $opinions
+  | (reduce ($opinions[] | select(.user != null)) as $review
+      ({}; .[$review.user.login] = $review) | [.[]])
+    + [$opinions[] | select(.user == null and .state == "CHANGES_REQUESTED")]
   | map(select(.state == "CHANGES_REQUESTED" and .user.login != $author))')
 if [ "$(printf '%s' "$REVIEW_BLOCKERS" | jq length)" -gt 0 ]; then
   if [ "$EFFECTIVE_BREAK_GLASS_REVIEW_DISAGREEMENT" = "$PR_NUMBER@$PR_HEAD_SHA" ]; then
+    if [ "$MATCH_HEAD_COUNT" -ne 1 ] || [ "$MATCH_HEAD_SHA" != "$PR_HEAD_SHA" ]; then
+      echo "BLOCKED: reviewer tiebreak requires exactly one --match-head-commit $PR_HEAD_SHA; a changed head must not inherit the authorization." >&2
+      exit 2
+    fi
     echo "BREAK-GLASS: owner tiebreak authorized for reviewer disagreement on $PR_NUMBER@$PR_HEAD_SHA." >&2
   else
     echo "BLOCKED: outstanding reviewer CHANGES_REQUESTED; REVIEW_POLICY.md reserves the tiebreak for the owner." >&2
-    printf '%s' "$REVIEW_BLOCKERS" | jq -r '.[] | "  Reviewer: \(.user.login); reviewed commit: \(.commit_id)"' >&2
+    printf '%s' "$REVIEW_BLOCKERS" | jq -r '.[] | "  Reviewer: \(.user.login // "<deleted account>"); reviewed commit: \(.commit_id)"' >&2
     echo "  Reviewer approval or dismissal releases this gate. Admin/merge-state overrides do not." >&2
     echo "  Owner-only override: BREAK_GLASS_REVIEW_DISAGREEMENT=$PR_NUMBER@$PR_HEAD_SHA" >&2
     exit 2

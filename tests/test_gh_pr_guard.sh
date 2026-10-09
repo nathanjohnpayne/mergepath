@@ -131,7 +131,7 @@ assert_rc_contains() {
 # page and keep each reviewer's latest opinion, even on an older head.
 change_review='{"id":1,"user":{"login":"nathanpayne-codex"},"state":"CHANGES_REQUESTED","commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}'
 review_pages="[[$change_review]]"
-merge_overrides='BREAK_GLASS_ADMIN=1 BREAK_GLASS_MERGE_STATE=1 scripts/gh-as-author.sh -- gh pr merge 123 --admin --squash'
+merge_overrides='BREAK_GLASS_ADMIN=1 BREAK_GLASS_MERGE_STATE=1 scripts/gh-as-author.sh -- gh pr merge 123 --admin --squash --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "admin and merge-state overrides do not decide a reviewer disagreement" 2 "nathanpayne-codex" "$merge_overrides" BLOCKED
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "ordinary merge blocks an older-head change request" 2 "bbbbbbbb" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash'
 for new_state in APPROVED DISMISSED; do
@@ -155,6 +155,25 @@ STUB_REVIEW_FAILURE=1 assert_rc_contains "unreadable reviews refuse despite merg
 STUB_REVIEW_PAGES='null' assert_rc_contains "malformed reviews refuse despite merge overrides" 2 "complete PR review state" "$merge_overrides" BLOCKED
 STUB_REVIEW_PAGES="[[${change_review/nathanpayne-codex/nathanjohnpayne}]]" assert_rc_contains "PR author's own review does not create a disagreement" 0 "" "$merge_overrides" BLOCKED
 STUB_REVIEW_PAGES="[[${change_review/nathanpayne-codex/coderabbitai[bot]}]]" assert_rc_contains "bot change requests also require an explicit disposition" 2 "CHANGES_REQUESTED" "$merge_overrides" BLOCKED
+
+
+# REST returns reviews in chronological response order; IDs need not order it.
+later_approval="${change_review/CHANGES_REQUESTED/APPROVED}"
+earlier_request="${change_review/\"id\":1/\"id\":999}"
+STUB_REVIEW_PAGES="[[$earlier_request],[$later_approval]]" assert_rc_contains "chronologically later lower-ID approval releases the gate" 0 "" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="[[$later_approval],[$earlier_request]]" assert_rc_contains "chronologically later change request blocks regardless of ID" 2 "CHANGES_REQUESTED" "$merge_overrides" BLOCKED
+for deleted_state in COMMENTED DISMISSED APPROVED; do
+  deleted_review="$(printf '%s' "$change_review" | jq -c --arg state "$deleted_state" '.user=null | .state=$state')"
+  STUB_REVIEW_PAGES="[[$deleted_review]]" assert_rc_contains "deleted account $deleted_state does not block" 0 "" "$merge_overrides" BLOCKED
+done
+deleted_change="$(printf '%s' "$change_review" | jq -c '.user=null')"
+STUB_REVIEW_PAGES="[[$deleted_change]]" assert_rc_contains "deleted-account change request blocks with a diagnostic" 2 "deleted account" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="[[$deleted_change]]" assert_rc_contains "deleted-account change request permits an exact owner tiebreak" 0 "owner tiebreak" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides" BLOCKED
+without_match="${merge_overrides/ --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/}"
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "head-scoped override refuses without the server head precondition" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "head-scoped override refuses a different server head precondition" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match --match-head-commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "head-scoped override accepts the attached exact precondition" 0 "owner tiebreak" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match --match-head-commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "duplicate head preconditions do not authorize a tiebreak" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides --match-head-commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" BLOCKED
 
 assert_rc_contains "direct pr create blocked" 2 "token-verifying wrapper" \
   'gh pr create --title "t" --body "Authoring-Agent: claude
