@@ -36,7 +36,8 @@ printf '%s\n' "$*" >>"$GH_CALL_LOG"
 
 case "$*" in
   *"actions/runs/"*)
-    if [ "$GH_FIXTURE_MODE" = "parent-completed" ]; then
+    reads=$(grep -c 'actions/runs/' "$GH_CALL_LOG" || true)
+    if [ "$GH_FIXTURE_MODE" = "parent-completed" ] || { [ "$GH_FIXTURE_MODE" = "complete-before-burst" ] && [ "$reads" -ge 2 ]; }; then
       printf '%s\n' completed
     else
       printf '%s\n' in_progress
@@ -94,7 +95,7 @@ case "$*" in
       unreadable)
         exit 1
         ;;
-      empty|race|parent-completed)
+      empty|race|parent-completed|complete-before-burst|write-fails)
         ;;
       *)
         echo "unknown fixture mode: $GH_FIXTURE_MODE" >&2
@@ -106,6 +107,9 @@ case "$*" in
     printf '%s\n' "$HEAD_SHA"
     ;;
   *"check-runs"*)
+    if [ "$GH_FIXTURE_MODE" = write-fails ] && [[ "$*" == *'name=Merge clearance gate'* ]]; then
+      exit 1
+    fi
     printf '{}\n'
     ;;
   *)
@@ -115,18 +119,20 @@ case "$*" in
 esac
 SH
 chmod +x "$TMP/gh"
+printf '#!/bin/sh\nexit 0\n' >"$TMP/sleep"
+chmod +x "$TMP/sleep"
 
 pass=0
 fail=0
 
 run_case() {
   local name="$1" action="$2" attempt="$3" mode="$4" want_calls="$5" want_posts="$6" want_probes="$7"
-  local dir="$TMP/$name" calls posts probes summary
+  local dir="$TMP/$name" calls posts probes summary rc=0 want_rc="${8:-0}"
   mkdir -p "$dir"
   : >"$dir/calls"
   summary="Publisher phase 1: evaluation queued for abc123. <!-- required-check-publisher:pending:4242:$attempt -->"
 
-  if ! PATH="$TMP:$PATH" \
+  PATH="$TMP:$PATH" \
       GH_CALL_LOG="$dir/calls" GH_FIXTURE_MODE="$mode" \
       REPO="example/repo" HEAD_SHA="abc123" PARENT_RUN_ID="4242" \
       PARENT_RUN_ATTEMPT="$attempt" EVENT_ACTION="$action" \
@@ -134,8 +140,9 @@ run_case() {
       CODEX_P1_CONTEXT="Codex P1 unresolved threads" \
       CODERABBIT_CONTEXT="CodeRabbit unresolved blocking findings" \
       GITHUB_RUN_ID="9999" \
-      bash "$TMP/open.sh" >"$dir/out" 2>&1; then
-    echo "FAIL: $name: open step exited nonzero"
+      bash "$TMP/open.sh" >"$dir/out" 2>&1 || rc=$?
+  if [ "$rc" -ne "$want_rc" ]; then
+    echo "FAIL: $name: open step exited $rc instead of $want_rc"
     sed -n '1,120p' "$dir/out"
     fail=$((fail + 1))
     return
@@ -173,31 +180,36 @@ run_case() {
 }
 
 # The ordinary duplicate path retains the parent-status guard, then replaces
-# six later requests (PR list, second status read, three writes, final status
-# read) with one check-runs read: 7 -> 2, five requests saved, zero jobs saved.
+# five later requests (PR list, second status read and three writes)
+# with one check-runs read: 6 -> 2, four requests saved, zero jobs saved.
 run_case first-attempt-already-covered in_progress 1 exact 2 0 1
 
 # Any incomplete or untrustworthy evidence falls through to the full open
-# path. The extra probe makes these eight one-page HTTP fixtures instead of
-# the old seven; preserving pending cover is the deliberate failure direction.
-run_case partial-requested-publication in_progress 1 partial 8 3 1
-run_case delayed-or-failed-requested in_progress 1 empty 8 3 1
-run_case both-events-race-before-publication in_progress 1 race 8 3 1
-run_case unreadable-dedup-probe in_progress 1 unreadable 8 3 1
-run_case foreign-same-name-runs in_progress 1 foreign 8 3 1
-run_case foreign-app-exact-marker in_progress 1 foreign-app 8 3 1
-run_case completed-same-marker-runs in_progress 1 completed-markers 8 3 1
-run_case newer-completed-after-exact-pending in_progress 1 newer-completed 8 3 1
-run_case ambiguous-same-time-completed in_progress 1 tied-completed 8 3 1
+# path. The extra probe makes these seven one-page HTTP fixtures instead of
+# the six-call ordinary path; preserving pending cover is the deliberate failure direction.
+run_case partial-requested-publication in_progress 1 partial 7 3 1
+run_case delayed-or-failed-requested in_progress 1 empty 7 3 1
+run_case both-events-race-before-publication in_progress 1 race 7 3 1
+run_case unreadable-dedup-probe in_progress 1 unreadable 7 3 1
+run_case foreign-same-name-runs in_progress 1 foreign 7 3 1
+run_case foreign-app-exact-marker in_progress 1 foreign-app 7 3 1
+run_case completed-same-marker-runs in_progress 1 completed-markers 7 3 1
+run_case newer-completed-after-exact-pending in_progress 1 newer-completed 7 3 1
+run_case ambiguous-same-time-completed in_progress 1 tied-completed 7 3 1
 
 # Reruns receive no requested event. A new attempt therefore bypasses the
 # first-attempt probe and always opens, even if old attempt markers exist.
-run_case rerun-new-attempt in_progress 2 exact 7 3 0
+run_case rerun-new-attempt in_progress 2 exact 6 3 0
 
 # Requested remains the prompt first-attempt path, and a runner that starts
 # after the parent completed retains the old one-read/no-write behavior.
-run_case requested-event requested 1 empty 7 3 0
+run_case requested-event requested 1 empty 6 3 0
 run_case delayed-runner-after-completion in_progress 1 parent-completed 1 0 0
+# Completion between the early optimization and the burst still owns the
+# head: the second status fence prevents late pending entries.
+run_case completion-during-enumeration in_progress 1 complete-before-burst 4 0 1
+# Exhausted retries on one context still open its siblings and fail red.
+run_case partial-pending-write-failure requested 1 write-fails 8 5 0 1
 
 if [ "$fail" -ne 0 ]; then
   echo "$fail failed, $pass passed"

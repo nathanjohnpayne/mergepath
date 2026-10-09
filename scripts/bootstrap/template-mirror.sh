@@ -232,8 +232,11 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   # and gaycruisebingo still carries part of this hub-only set.
   '.github/workflows/branch-protection-audit.yml'
   'scripts/audit-branch-protection.sh'
+  'scripts/audit-credential-isolation.py'
   'tests/test_audit_branch_protection.sh'
   'tests/test_audit_branch_protection_workflow.sh'
+  'tests/test_credential_isolation.py'
+  'specs/credential_isolation.md'
 
   # Hub identity docs — do NOT duplicate mergepath's self-referential
   # hub identity into a consumer (#744).
@@ -1214,6 +1217,8 @@ bootstrap::_yq_clean_repo_template() {
   # Drop the bootstrap source-attribution spec_test_map entry (#1056), for
   # the same reason as the lines above.
   yq -i 'del(.spec_test_map.bootstrap_source_attribution)' "$f"
+  # Credential isolation is audited centrally and its suite is hub-only.
+  yq -i 'del(.spec_test_map.credential_isolation)' "$f"
   # Drop extra_top_level_dirs entirely — the new repo has no
   # mergepath/ or packaging/ dirs.
   yq -i 'del(.extra_top_level_dirs)' "$f"
