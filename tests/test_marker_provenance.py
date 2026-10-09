@@ -67,6 +67,15 @@ print(value if isinstance(value,str) else json.dumps(value))
         self.assertEqual(code, 0, error)
         self.assertEqual(comments[0]['body'], '<!-- mergepath-feedback-archive-relay:v1 run=12345 status=complete -->')
 
+    def test_default_branch_qualified_workflow_path_promotes_completion(self):
+        self.run['path'] += '@main'
+        code, comments, error = self.invoke()
+        self.assertEqual((code, len(comments)), (0, 1), error)
+
+    def test_other_ref_suffix_cannot_borrow_the_default_workflow(self):
+        self.run['path'] += '@codex/forged'
+        self.assertEqual(self.invoke()[:2], (0, []))
+
     def test_pr_controlled_run_cannot_mint_completion_under_same_bot_login(self):
         for key, value in (('event', 'pull_request'), ('head_branch', 'codex/forged'),
                            ('path', '.github/workflows/pr-controlled.yml')):

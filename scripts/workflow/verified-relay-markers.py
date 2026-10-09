@@ -73,7 +73,8 @@ class Evidence:
                 raise ValueError('repository default branch unavailable')
             self.default = repository['default_branch']
         if (run.get('id') != publisher or run.get('event') != 'workflow_run'
-                or run.get('path') != PATH or run.get('head_branch') != self.default
+                or run.get('path') not in (PATH, PATH + '@' + self.default)
+                or run.get('head_branch') != self.default
                 or (run.get('repository') or {}).get('full_name') != self.repo
                 or not re.fullmatch('[0-9a-f]{40}', run.get('head_sha', ''))):
             return False
