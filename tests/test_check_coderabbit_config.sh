@@ -82,6 +82,11 @@ run_case() {
     echo "  output: $out" >&2
     return
   fi
+  if [ "${6:-}" = "exact" ] && [ "$out" != "$want_substr" ]; then
+    fail "$name: stdout changed from the expected consumer output"
+    echo "  output: $out" >&2
+    return
+  fi
   case "$out" in
     *"$want_substr"*) pass "$name (rc=$rc)" ;;
     *)
@@ -95,11 +100,35 @@ run_case() {
 # Cases
 # ---------------------------------------------------------------------------
 
-# Happy path on the template: profile=chill → PASS.
+# Happy path on the template: chill profile and the deliberate pause threshold.
 run_case "template_profile_chill_passes" 0 "reviews.profile=chill; safety floor OK" \
   "force" \
   "reviews:
+  profile: chill
+  auto_review:
+    auto_pause_after_reviewed_commits: 15"
+
+run_case "template_auto_pause_missing_fails" 1 \
+  "reviews.auto_review.auto_pause_after_reviewed_commits is 'null', expected '15'" \
+  "force" \
+  "reviews:
   profile: chill"
+
+run_case "template_auto_pause_wrong_value_fails" 1 \
+  "reviews.auto_review.auto_pause_after_reviewed_commits is '5', expected '15'" \
+  "force" \
+  "reviews:
+  profile: chill
+  auto_review:
+    auto_pause_after_reviewed_commits: 5"
+
+run_case "template_auto_pause_correct_value_reported" 0 \
+  "auto_pause_after_reviewed_commits=15" \
+  "force" \
+  "reviews:
+  profile: chill
+  auto_review:
+    auto_pause_after_reviewed_commits: 15"
 
 # Template with profile=assertive → FAIL with the expected error message.
 run_case "template_profile_assertive_fails" 1 "FAIL: reviews.profile is 'assertive'" \
@@ -124,10 +153,20 @@ run_case "consumer_profile_assertive_passes" 0 \
 # Consumer repo with profile=chill → also PASS for the same reason
 # (consumers may choose either profile; the template gate is skipped).
 run_case "consumer_profile_chill_passes" 0 \
-  "profile gate skipped — not the Mergepath template repo" \
+  "check_coderabbit_config: PASS (parse OK; safety floor OK; profile gate skipped — not the Mergepath template repo)" \
   "skip" \
   "reviews:
-  profile: chill"
+  profile: chill" \
+  "exact"
+
+run_case "consumer_local_auto_pause_passes_unchanged" 0 \
+  "check_coderabbit_config: PASS (parse OK; safety floor OK; profile gate skipped — not the Mergepath template repo)" \
+  "skip" \
+  "reviews:
+  profile: chill
+  auto_review:
+    auto_pause_after_reviewed_commits: 5" \
+  "exact"
 
 # Universal: malformed YAML fails everywhere, even on consumers.
 run_case "consumer_malformed_yaml_fails" 1 "does not parse as YAML" \
@@ -261,7 +300,8 @@ run_case "template_safe_posture_passes" 0 "safety floor OK" \
   profile: chill
   request_changes_workflow: false
   auto_review:
-    enabled: true"
+    enabled: true
+    auto_pause_after_reviewed_commits: 15"
 
 # Absent posture keys are the safe default → floor passes (only profile
 # set; no auto_review / request_changes_workflow block).
@@ -402,7 +442,7 @@ cp "$CHECK" "$case_root/scripts/ci/check_coderabbit_config"
 chmod +x "$case_root/scripts/ci/check_coderabbit_config"
 printf 'reviews:\n  profile: assertive\n' > "$case_root/.coderabbit.yml"
 gr_rc=0
-out=$(MERGEPATH_TEMPLATE_CHECK= GITHUB_REPOSITORY=somebody/mergepath \
+out=$(MERGEPATH_TEMPLATE_CHECK='' GITHUB_REPOSITORY=somebody/mergepath \
   "$case_root/scripts/ci/check_coderabbit_config" 2>&1) || gr_rc=$?
 assert_contains "github_repository_mergepath_enforces_gate" \
   "$gr_rc" 1 "$out" "FAIL: reviews.profile is 'assertive'"
@@ -414,7 +454,7 @@ cp "$CHECK" "$case_root/scripts/ci/check_coderabbit_config"
 chmod +x "$case_root/scripts/ci/check_coderabbit_config"
 printf 'reviews:\n  profile: assertive\n' > "$case_root/.coderabbit.yml"
 gc_rc=0
-out=$(MERGEPATH_TEMPLATE_CHECK= GITHUB_REPOSITORY=somebody/some-consumer-repo \
+out=$(MERGEPATH_TEMPLATE_CHECK='' GITHUB_REPOSITORY=somebody/some-consumer-repo \
   "$case_root/scripts/ci/check_coderabbit_config" 2>&1) || gc_rc=$?
 assert_contains "github_repository_consumer_skips_gate" \
   "$gc_rc" 0 "$out" "profile gate skipped"

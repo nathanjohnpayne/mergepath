@@ -26,7 +26,8 @@
 #
 #   File present:
 #     parse the YAML; if this is the Mergepath template repo,
-#     enforce reviews.profile == "chill".
+#     enforce reviews.profile == "chill" and the deliberate auto-pause
+#     threshold of 15 reviewed commits.
 #
 #   File absent + review-policy.yml's `coderabbit.enabled` is false:
 #     PASS (intentional disable per sub-D's private-repo bootstrap;
@@ -38,7 +39,7 @@
 #     the template itself also lands here when its .coderabbit.yml
 #     has wandered off).
 #
-# The profile gate (`reviews.profile == "chill"`) only fires when
+# The profile and auto-pause gates only fire when
 # .coderabbit.yml exists AND this is the Mergepath template repo.
 #
 # Safety-posture floor (#481): two posture keys ARE load-bearing for
@@ -63,6 +64,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONFIG="$REPO_ROOT/.coderabbit.yml"
 REVIEW_POLICY="$REPO_ROOT/.github/review-policy.yml"
 EXPECTED_PROFILE="chill"
+EXPECTED_AUTO_PAUSE_COMMITS="15"
 
 if ! command -v yq >/dev/null 2>&1; then
   echo "FAIL: yq is required (mikefarah/yq v4+). Install via 'brew install yq' or apt."
@@ -221,7 +223,7 @@ is_mergepath_template() {
 
   # No CI env var, no origin remote. Fail-open: skip the gate. A
   # malformed YAML or missing file still failed the earlier checks;
-  # only the profile-value enforcement is template-scoped.
+  # only the profile and auto-pause enforcement is template-scoped.
   return 1
 }
 
@@ -238,5 +240,12 @@ if [ "$profile" != "$EXPECTED_PROFILE" ]; then
   exit 1
 fi
 
-echo "check_coderabbit_config: PASS (reviews.profile=$profile; safety floor OK)"
+auto_pause_commits=$(yq -r '.reviews.auto_review.auto_pause_after_reviewed_commits' "$CONFIG")
+if [ "$auto_pause_commits" != "$EXPECTED_AUTO_PAUSE_COMMITS" ]; then
+  echo "FAIL: reviews.auto_review.auto_pause_after_reviewed_commits is '$auto_pause_commits', expected '$EXPECTED_AUTO_PAUSE_COMMITS' (#1675 hub review budget)"
+  echo "      Keep the template's deliberate pause threshold; consumer repos retain their local configuration."
+  exit 1
+fi
+
+echo "check_coderabbit_config: PASS (reviews.profile=$profile; safety floor OK; auto_pause_after_reviewed_commits=$auto_pause_commits)"
 exit 0

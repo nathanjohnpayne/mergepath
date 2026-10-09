@@ -22,7 +22,7 @@ Audited: 2026-06-17, against the FAQ, `configuration/auto-review`, `reference/co
 | `reviews.auto_review.enabled` | `true` | `true` | Matches default; floor-enforced (must not be `false` **unless** paired with `coderabbit.enabled: false` in `.github/review-policy.yml` — see the safety-floor section). |
 | `reviews.auto_review.drafts` | `false` | `false` | Matches default. Draft PRs are intentionally skipped. |
 | `reviews.auto_review.auto_incremental_review` | `true` | `true` (now explicit) | Matches default; pinned explicitly so the fix-up-loop posture is legible. See below. |
-| `reviews.auto_review.auto_pause_after_reviewed_commits` | `5` | unset (inherits `5`) | **Owned by #490** — do not pin here. See below. |
+| `reviews.auto_review.auto_pause_after_reviewed_commits` | `5` | `15` | Deliberately raised for agent fix-up loops; enforced on the template by `check_coderabbit_config` (#1675). Consumers retain their local configuration. |
 | `reviews.auto_review.base_branches` | `[]` (default branch only) | `[main]` | Redundant-but-explicit; not harmful. See below. |
 | `knowledge_base.learnings.scope` | `auto` | `auto` | Kept deliberately; privacy consequence documented below. |
 | `reviews.path_instructions` | n/a | `scripts/**`, `docs/**` | Matches doc guidance (minimatch globs). See below. |
@@ -37,11 +37,11 @@ The docs confirm `chill` is the default and that `assertive` is the "more feedba
 
 Default is `true` ("re-run the review on each push"). We previously inherited it implicitly. The audit pins it explicitly because the fix-up-commit loop (reviewer identity posts a fix commit → expects a fresh CodeRabbit pass on the new HEAD) depends on it, and `scripts/coderabbit-wait.sh` anchors clearance on the current HEAD committer date. An accidental `false` (or a future default flip) would mean CodeRabbit reviews only the opening commit and ignores subsequent pushes — `coderabbit-wait.sh` would then time out (exit 4) waiting for a HEAD review that never comes. Explicit `true` removes that ambiguity.
 
-### `auto_pause_after_reviewed_commits` — owned by #490 (no action here)
+### `auto_pause_after_reviewed_commits` — deliberate hub threshold and resume safety net
 
-With the key unset we inherit the default **5**: after 5 reviewed commits since the last pause, CodeRabbit auto-pauses incremental review and posts a "Reviews paused" NOTE carrying the marker `<!-- This is an auto-generated comment: review paused by coderabbit.ai -->`. On a long agent-loop PR (#485 hit this at 10 commits) that reads to `coderabbit-wait.sh` as "no review yet," and the script polls to its `max_wait_seconds` budget and exits 4. The pause is durable: a one-shot `@coderabbitai review` re-pauses after more commits, so the correct response is `@coderabbitai resume` (or raising the threshold).
+The hub explicitly sets **15**, rather than inheriting the audited default of **5**, so ordinary agent fix-up loops can finish before incremental review auto-pauses. `scripts/ci/check_coderabbit_config` requires that value on the template and reports the key when it is absent or changed. The template-scoped check does not impose this threshold on consumers.
 
-**This key is owned by #490** (auto-review re-invocation + a new `paused` state in `coderabbit-wait.sh`). This audit deliberately does NOT pin a value or edit the wait script, to avoid colliding with that work. The `.coderabbit.yml` comment points a future reader at #490 rather than letting them set it blind.
+For a PR that still crosses the threshold, `scripts/coderabbit-wait.sh` detects CodeRabbit's pause marker and posts `@coderabbitai resume`, bounded by `coderabbit.max_resume_retries` in the review policy (#490). The #819 decision of July 30, 2026 is to preserve consumer-local configuration and assert or project only fleet-required settings; it does not authorize propagating the hub's whole `.coderabbit.yml`. Fleet-wide threshold enforcement remains separate from the hub assertion.
 
 ### `base_branches: [main]` — redundant-but-explicit (config comment only)
 
