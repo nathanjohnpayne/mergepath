@@ -39,7 +39,7 @@ class Evidence:
         self.deadline = time.monotonic() + 60
         self.cache = {}
         self.read_cache = {}
-        self.default = None
+        self.workflow = None
 
     def api(self, endpoint, *, pages=False, text=False):
         key = endpoint, pages, text
@@ -67,14 +67,19 @@ class Evidence:
         run = self.api(f'actions/runs/{publisher}')
         if not isinstance(run, dict):
             return False
-        if self.default is None:
-            repository = self.api('')
-            if not isinstance(repository, dict) or not isinstance(repository.get('default_branch'), str):
-                raise ValueError('repository default branch unavailable')
-            self.default = repository['default_branch']
+        if self.workflow is None:
+            self.workflow = self.api('actions/workflows/codex-feedback-archive-relay.yml')
+            if (not isinstance(self.workflow, dict) or type(self.workflow.get('id')) is not int
+                    or self.workflow.get('path') != PATH):
+                raise ValueError('canonical relay workflow identity unavailable')
+        # GitHub runs workflow_run workflows from the default branch. The
+        # stable workflow id and event prove that execution lane even after
+        # a branch rename; old run metadata is not rewritten by the rename.
+        branch = run.get('head_branch')
         if (run.get('id') != publisher or run.get('event') != 'workflow_run'
-                or run.get('path') not in (PATH, PATH + '@' + self.default)
-                or run.get('head_branch') != self.default
+                or run.get('workflow_id') != self.workflow['id']
+                or not isinstance(branch, str) or not branch
+                or run.get('path') not in (PATH, PATH + '@' + branch)
                 or (run.get('repository') or {}).get('full_name') != self.repo
                 or not re.fullmatch('[0-9a-f]{40}', run.get('head_sha', ''))):
             return False

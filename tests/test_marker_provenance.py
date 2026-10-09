@@ -28,12 +28,14 @@ class RelayTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name)
-        self.run = {'id': 900, 'event': 'workflow_run', 'path': '.github/workflows/codex-feedback-archive-relay.yml',
+        self.run = {'id': 900, 'workflow_id': 89, 'event': 'workflow_run', 'path': '.github/workflows/codex-feedback-archive-relay.yml',
                     'head_branch': 'main', 'head_sha': 'a' * 40, 'repository': {'full_name': REPO}}
         self.job = {'id': 901, 'run_id': 900, 'steps': [
             {'name': 'Persist archive and publish the exact-head gate', 'conclusion': 'success'}]}
         self.responses = {
-            'repos/' + REPO: {'default_branch': 'main'},
+            'repos/' + REPO: {'default_branch': 'renamed-main'},
+            'repos/' + REPO + '/actions/workflows/codex-feedback-archive-relay.yml': {
+                'id': 89, 'path': '.github/workflows/codex-feedback-archive-relay.yml'},
             'repos/' + REPO + '/actions/runs/900': self.run,
             'repos/' + REPO + '/actions/runs/900/jobs?filter=all&per_page=100': [{'jobs': [self.job]}],
             'repos/' + REPO + '/actions/jobs/901/logs': LOG,
@@ -72,12 +74,23 @@ print(value if isinstance(value,str) else json.dumps(value))
         code, comments, error = self.invoke()
         self.assertEqual((code, len(comments)), (0, 1), error)
 
+    def test_historical_run_survives_default_branch_rename(self):
+        self.run['head_branch'] = 'previous-default'
+        self.run['path'] += '@previous-default'
+        self.assertEqual(len(self.invoke()[1]), 1)
+
+    def test_unreadable_or_wrong_workflow_identity_never_promotes(self):
+        endpoint = 'repos/' + REPO + '/actions/workflows/codex-feedback-archive-relay.yml'
+        for response in (None, {'id': 89, 'path': '.github/workflows/other.yml'}):
+            self.responses[endpoint] = response
+            self.assertEqual(self.invoke()[0], 2)
+
     def test_other_ref_suffix_cannot_borrow_the_default_workflow(self):
         self.run['path'] += '@codex/forged'
         self.assertEqual(self.invoke()[:2], (0, []))
 
     def test_pr_controlled_run_cannot_mint_completion_under_same_bot_login(self):
-        for key, value in (('event', 'pull_request'), ('head_branch', 'codex/forged'),
+        for key, value in (('event', 'pull_request'), ('workflow_id', 999),
                            ('path', '.github/workflows/pr-controlled.yml')):
             saved = self.run[key]
             self.run[key] = value
