@@ -555,6 +555,30 @@ else
   echo "  PASS: $WORKFLOW no longer checks human-hold via current pr.labels"
 fi
 
+# Exercise the actual workflow call site across Node's default 1 MiB boundary.
+if node - "$WORKFLOW" <<'NODE'
+const fs = require('node:fs');
+const {execFileSync} = require('node:child_process');
+const source = fs.readFileSync(process.argv[2], 'utf8');
+const start = source.indexOf("issueComments = JSON.parse(execFileSync('python3', [");
+const end = source.indexOf('));', start) + 3;
+if (start < 0 || end < start) throw new Error('workflow resolver call missing');
+const body = 'é'.repeat(600000) + '\nReviewed commit: ' + 'a'.repeat(40);
+const comments = [{user: {login: 'chatgpt-codex-connector[bot]'}, body}];
+const invoke = new Function('execFileSync', 'issueComments', 'context', 'codexBotLogin',
+  source.slice(start, end) + '\nreturn issueComments;');
+const result = invoke(execFileSync, comments, {repo: {owner: 'owner', repo: 'repo'}},
+  'chatgpt-codex-connector[bot]');
+if (result.length !== 1 || result[0].body !== body) throw new Error('large resolver output was lost');
+NODE
+then
+  pass=$((pass + 1))
+  echo "  PASS: actual audit resolver preserves comment histories above 1 MiB"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: actual audit resolver lost a comment history above 1 MiB" >&2
+fi
+
 echo
 if [ "$fail" -gt 0 ]; then
   echo "check_pr_audit_codex_clearance: $fail FAIL / $pass PASS" >&2

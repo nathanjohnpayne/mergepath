@@ -18,7 +18,7 @@ class Resolver:
         self.cache = {}
 
     def prefetch(self, prefixes):
-        prefixes = list(dict.fromkeys(value.lower() for value in prefixes if len(value) < 40))[:50]
+        prefixes = list(dict.fromkeys(value.lower() for value in reversed(list(prefixes)) if len(value) < 40))[:50]
         self.cache = dict.fromkeys(prefixes)
         if not self.gh or not prefixes:
             return

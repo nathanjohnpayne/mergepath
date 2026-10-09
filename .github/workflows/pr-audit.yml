@@ -662,7 +662,8 @@ jobs:
                       'scripts/workflow/resolve-codex-verdict-anchors.py',
                       '--repo', `${context.repo.owner}/${context.repo.repo}`,
                       '--bot', codexBotLogin,
-                    ], {input: JSON.stringify(issueComments), encoding: 'utf8', timeout: 35000}));
+                    ], {input: JSON.stringify(issueComments), encoding: 'utf8', timeout: 35000,
+                      maxBuffer: Math.max(1024 * 1024, Buffer.byteLength(JSON.stringify(issueComments), 'utf8') * 6)}));
                   } catch (e) {
                     issueComments = null; // Missing/unreadable resolver cannot grant clearance.
                     console.log(`WARNING: Codex anchor resolution failed for PR #${pr.number}`);

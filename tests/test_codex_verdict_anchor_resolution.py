@@ -116,10 +116,9 @@ sys.exit(int((p/'status').read_text()))
         self.payload['errors'] = [{'message': 'ambiguous', 'path': ['repository', 'c1']}]
         self.payload['data']['repository'].update(b1=None, t1=None, c1=None)
         self.status = 1  # gh returns nonzero for partial GraphQL errors.
-        before, after = self.invoke(['Reviewed commit: '+SHA[:10], 'Reviewed commit: '+SHA[:11]])
-        self.assertNotEqual(before, after)
-        self.assertIn(SHA, after)
-        self.assertEqual(self.output[1]['body'], 'Reviewed commit: '+SHA[:11])
+        self.invoke(['Reviewed commit: '+SHA[:11], 'Reviewed commit: '+SHA[:10]])
+        self.assertEqual(self.output[0]['body'], 'Reviewed commit: '+SHA[:11])
+        self.assertIn(SHA, self.output[1]['body'])
         self.payload['errors'][0]['path'] = ['repository', 'c0']
         self.assertEqual(*self.invoke())
 
@@ -128,6 +127,16 @@ sys.exit(int((p/'status').read_text()))
         self.assertEqual(*self.invoke(body))
         query = json.loads((self.path/'calls').read_text().splitlines()[0])[3]
         self.assertEqual(query.count(':object('), 50)
+
+    def test_recent_repeated_anchor_wins_over_a_long_history(self):
+        bodies = ['Reviewed commit: '+SHA[:10]]
+        bodies += ['Reviewed commit: '+format(n, '010x') for n in range(60)]
+        bodies.append('Reviewed commit: '+SHA[:10])
+        self.invoke(bodies)
+        self.assertEqual(self.output[-1]['body'], 'Reviewed commit: '+SHA)
+        query = json.loads((self.path/'calls').read_text().splitlines()[0])[3]
+        self.assertEqual(query.count(':object('), 50)
+        self.assertIn('c0:object(expression:"'+SHA[:10]+'")', query)
 
 
 if __name__ == '__main__':
