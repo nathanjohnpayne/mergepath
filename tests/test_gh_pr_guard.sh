@@ -244,6 +244,10 @@ for cluster in -sb -dt -sF -sA -sR; do
   assert_rc_contains "short cluster cannot consume the writer's head precondition ($cluster)" 2 "unrecognized merge option or short cluster" "scripts/gh-as-author.sh -- gh pr merge 123 $cluster --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" CLEAN
 done
 assert_rc_contains "attached body value cannot request retraction" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 -b--disable-auto --squash' CLEAN
+for dynamic_merge in 'cluster=-sb; scripts/gh-as-author.sh -- gh pr merge 123 $cluster --disable-auto' 'cluster=-sb; scripts/gh-as-author.sh -- gh pr merge $cluster --disable-auto' 'value_flag=-b; scripts/gh-as-author.sh -- gh pr merge 123 $value_flag --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; do
+  assert_rc_contains "dynamic argument cannot consume authority-bearing options ($dynamic_merge)" 2 "dynamic merge arguments" "$dynamic_merge" CLEAN
+done
+assert_rc_contains "multiple selectors cannot grant retraction exception" 2 "retraction permits only" 'scripts/gh-as-author.sh -- gh pr merge 123 extra --disable-auto' CLEAN
 assert_rc_contains "other merge options cannot grant retraction exception" 2 "retraction permits only" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash --disable-auto' CLEAN
 TEST_UNPINNED_MERGE=1 assert_rc_contains "option-looking branch after separator cannot request retraction" 2 "exactly one --match-head-commit" 'scripts/gh-as-author.sh -- gh pr merge -- --disable-auto' CLEAN
 TEST_UNPINNED_MERGE=1 assert_rc_contains "option-looking branch after separator cannot supply head pinning" 2 "exactly one --match-head-commit" 'scripts/gh-as-author.sh -- gh pr merge 123 -- --match-head-commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' CLEAN

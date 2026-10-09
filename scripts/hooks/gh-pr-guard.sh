@@ -3431,8 +3431,16 @@ for j in "${!TOKENS[@]}"; do
   # First non-flag token after the gh-context `merge` is the
   # selector. Don't break — keep walking so a `--repo`/`-R` flag or
   # `--admin` flag appearing AFTER the selector still gets captured.
+  case "$tok" in
+    *'$'*|*'`'*|__MERGEPATH_CMDSUB__|__MERGEPATH_CMDSUB_LITERAL__)
+      echo "BLOCKED: dynamic merge arguments cannot bind the writer's flags or head precondition; use literal selectors and separate flags." >&2
+      exit 2
+      ;;
+  esac
   if [ -z "$PR_SELECTOR" ]; then
     PR_SELECTOR="$tok"
+  else
+    RETRACTION_ARGS_SAFE=0
   fi
 done
 
