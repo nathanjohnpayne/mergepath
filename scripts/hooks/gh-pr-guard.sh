@@ -3203,7 +3203,7 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
           echo "" >&2
           echo "  REVIEW_POLICY.md § No-self-approve scoping forbids the same agent identity that authored" >&2
           echo "  a Phase 4 (over-threshold) PR from approving it. Post --comment instead, and let the" >&2
-          echo "  cross-agent merge gate (Codex 👍 for Phase 4a, or external CLI APPROVED for Phase 4b)" >&2
+          echo "  cross-agent merge gate (head-anchored Codex review/verdict for Phase 4a, or external CLI APPROVED for Phase 4b)" >&2
           echo "  carry the approval." >&2
           echo "" >&2
           echo "  For a legitimate cross-agent approval, select the other reviewer identity the way" >&2

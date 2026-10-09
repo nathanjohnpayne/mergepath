@@ -769,7 +769,6 @@ run_gate_c_enabled_model() {
   #   $5 = allow_phase_4b_substitute (true|false)
   #   $6 = phase_4b_time
   local codex_enabled="$1"
-  local latest_thumbs_up_time="$2"
   local codex_review_time="$3"
   local unaddressed_count="$4"
   local allow_phase_4b="$5"
@@ -778,22 +777,8 @@ run_gate_c_enabled_model() {
   local latest_codex_signal_time=""
 
   if [ "$codex_enabled" = "true" ]; then
-    if [ -n "$latest_thumbs_up_time" ] && [ -n "$codex_review_time" ]; then
-      if [[ "$latest_thumbs_up_time" > "$codex_review_time" ]]; then
-        cleared=true
-      elif [ "$unaddressed_count" -eq 0 ]; then
-        cleared=true
-      fi
-    elif [ -n "$latest_thumbs_up_time" ]; then
-      cleared=true
-    elif [ -n "$codex_review_time" ] && [ "$unaddressed_count" -eq 0 ]; then
-      cleared=true
-    fi
-
-    latest_codex_signal_time="$latest_thumbs_up_time"
-    if [ -n "$codex_review_time" ] && { [ -z "$latest_codex_signal_time" ] || [[ "$codex_review_time" > "$latest_codex_signal_time" ]]; }; then
-      latest_codex_signal_time="$codex_review_time"
-    fi
+    [ -z "$codex_review_time" ] || [ "$unaddressed_count" -ne 0 ] || cleared=true
+    latest_codex_signal_time="$codex_review_time"
   fi
 
   if [ "$cleared" != "true" ] && [ "$allow_phase_4b" = "true" ] && [ -n "$phase_4b_time" ]; then
@@ -833,17 +818,17 @@ else
 fi
 
 got=$(run_gate_c_enabled_model true "2026-05-21T12:00:00Z" "" 0 true "")
-if [ "$got" = "true" ]; then
+if [ "$got" = "false" ]; then
   pass=$((pass + 1))
-  echo "  PASS: codex.enabled=true still accepts bot 👍 clearance"
+  echo "  PASS: enabled Codex still rejects unanchored PR reaction clearance"
 else
   fail=$((fail + 1))
-  echo "  FAIL: codex.enabled=true stopped accepting bot 👍 clearance" >&2
+  echo "  FAIL: enabled Codex accepted unanchored PR reaction clearance" >&2
 fi
 
 if grep -Fq 'CODEX_ENABLED=$(codex_field enabled)' "$CODEX_CHECK_SCRIPT" && \
    grep -Fq 'codex.enabled=false — ignoring Codex bot review/reaction signals' "$CODEX_CHECK_SCRIPT" && \
-   grep -Fq 'same-agent Codex 👍 fallback unavailable because codex.enabled=false' "$CODEX_CHECK_SCRIPT"; then
+   grep -Fq 'same-agent anchored Codex fallback unavailable because codex.enabled=false' "$CODEX_CHECK_SCRIPT"; then
   pass=$((pass + 1))
   echo "  PASS: production script parses codex.enabled and disables both Codex clearance paths"
 else
@@ -859,7 +844,13 @@ scenario="${CODEX_ENABLED_FIXTURE:-}"
 
 reviews_json() {
   case "$scenario" in
-    disabled_bot_only|enabled_bot)
+    enabled_reply_wrapper)
+      printf '[{"id":901,"user":{"login":"chatgpt-codex-connector[bot]"},"state":"COMMENTED","commit_id":"headsha","body":"","submitted_at":"2026-05-21T12:00:00Z"},{"id":902,"user":{"login":"chatgpt-codex-connector[bot]"},"state":"COMMENTED","commit_id":"headsha","body":"","submitted_at":"2026-05-21T12:01:00Z"},{"user":{"login":"nathanpayne-claude"},"state":"APPROVED","commit_id":"oldsha","submitted_at":"2026-05-21T11:00:00Z"}]\n'
+      ;;
+    enabled_bot)
+      printf '[{"user":{"login":"nathanpayne-claude"},"state":"APPROVED","commit_id":"oldsha","submitted_at":"2026-05-21T11:00:00Z"},{"user":{"login":"chatgpt-codex-connector[bot]"},"state":"COMMENTED","commit_id":"headsha","submitted_at":"2026-05-21T12:00:00Z"}]\n'
+      ;;
+    disabled_bot_only|enabled_reaction)
       cat <<'JSON'
 [
   {"user":{"login":"nathanpayne-claude"},"state":"APPROVED","commit_id":"oldsha","submitted_at":"2026-05-21T11:00:00Z"}
@@ -881,7 +872,7 @@ JSON
 
 reactions_json() {
   case "$scenario" in
-    disabled_bot_only|disabled_4b|enabled_bot)
+    disabled_bot_only|disabled_4b|enabled_bot|enabled_reaction)
       reaction_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
       printf '[{"user":{"login":"chatgpt-codex-connector[bot]"},"content":"+1","created_at":"%s"}]\n' "$reaction_time"
       ;;
@@ -899,7 +890,10 @@ case "$1" in
       case "${1:-}" in
         repos/nathanjohnpayne/mergepath/issues/99999/timeline) printf '[]\n' ;;
         repos/nathanjohnpayne/mergepath/pulls/99999/reviews) reviews_json ;;
-        repos/nathanjohnpayne/mergepath/pulls/99999/comments) printf '[]\n' ;;
+        repos/nathanjohnpayne/mergepath/pulls/99999/comments)
+          if [ "$scenario" = enabled_reply_wrapper ]; then
+            printf '[{"id":910,"pull_request_review_id":901,"user":{"login":"chatgpt-codex-connector[bot]"},"body":"![P1 Badge] root finding","path":"file.sh","line":1},{"id":911,"pull_request_review_id":902,"in_reply_to_id":910,"user":{"login":"chatgpt-codex-connector[bot]"},"body":"reply"}]\n'
+          else printf '[]\n'; fi ;;
         # Issue comments carry Codex's HEAD-anchored verdict (#600). These bug-4
         # cases exercise the 👍 / review clearance paths, so no verdict comment
         # is present — return an empty array (CODEX_HEAD_VERDICT_TIME stays
@@ -1107,16 +1101,35 @@ else
 fi
 
 set +e
+out=$(run_codex_check_fixture true enabled_reaction 2>&1)
+rc=$?
+set -e
+if [ "$rc" = 1 ]; then
+  pass=$((pass+1))
+  echo "  PASS: actual enabled checker rejects reaction-only clearance"
+else
+  fail=$((fail+1)); echo "  FAIL: enabled checker accepted reaction-only clearance" >&2
+fi
+set +e
 out=$(run_codex_check_fixture true enabled_bot 2>&1)
 rc=$?
 set -e
-if [ "$rc" = "0" ] && echo "$out" | grep -q "👍 reaction"; then
+if [ "$rc" = "0" ] && echo "$out" | grep -q "latest Codex signal is COMMENTED review"; then
   pass=$((pass + 1))
-  echo "  PASS: actual codex-review-check still accepts bot 👍 when Codex is enabled"
+  echo "  PASS: actual enabled checker accepts a current-head clean Codex review"
 else
   fail=$((fail + 1))
-  echo "  FAIL: actual codex-review-check rejected enabled-Codex bot clearance (rc=$rc)" >&2
+  echo "  FAIL: enabled checker rejected current-head clean Codex review (rc=$rc)" >&2
   echo "$out" | sed 's/^/    /' >&2
+fi
+
+set +e
+out=$(run_codex_check_fixture true enabled_reply_wrapper 2>&1); rc=$?
+set -e
+if [ "$rc" = 1 ]; then
+  pass=$((pass + 1)); echo "  PASS: actual checker ignores reply wrapper and retains the root finding"
+else
+  fail=$((fail + 1)); echo "  FAIL: reply-only wrapper hid a required root finding (rc=$rc): $out" >&2
 fi
 
 # ── Bug 5 regression: CodeRabbit addressed marker clears finding ─────

@@ -151,7 +151,9 @@ assert_rc_contains() {
 # page and keep each reviewer's latest opinion, even on an older head.
 change_review='{"id":1,"user":{"login":"nathanpayne-codex"},"state":"CHANGES_REQUESTED","commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}'
 review_pages="[[$change_review]]"
-merge_overrides='BREAK_GLASS_ADMIN=1 BREAK_GLASS_MERGE_STATE=1 scripts/gh-as-author.sh -- gh pr merge 123 --admin --squash --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+merge_overrides='BREAK_GLASS_ADMIN=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa BREAK_GLASS_MERGE_STATE=1 scripts/gh-as-author.sh -- gh pr merge 123 --admin --squash --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+assert_rc_contains "boolean admin override no longer authorizes admin merge" 2 "requires explicit human authorization" \
+  'BREAK_GLASS_ADMIN=1 BREAK_GLASS_MERGE_STATE=1 scripts/gh-as-author.sh -- gh pr merge 123 --admin --squash' BLOCKED
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "admin and merge-state overrides do not decide a reviewer disagreement" 2 "nathanpayne-codex" "$merge_overrides" BLOCKED
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "ordinary merge blocks an older-head change request" 2 "bbbbbbbb" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash'
 for compact_merge in 'gh -Rother/repo pr merge 123' 'gh pr -Rother/repo merge 123' 'gh pr merge -Rother/repo 123' 'gh pr merge 123 -Rother/repo'; do

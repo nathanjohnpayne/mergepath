@@ -1,6 +1,6 @@
 {
-  "description": "Resolved P1 bounded by merge plus independent CLI approval clears",
-  "expected_cleared": true,
+  "description": "Blocking text finding cannot supply same-agent approval",
+  "expected_cleared": false,
   "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
   "codex_bot_login": "chatgpt-codex-connector[bot]",
   "merged_at": "2026-05-12T10:30:00Z",
@@ -19,7 +19,7 @@
     {
       "id": 5001,
       "pull_request_review_id": 1001,
-      "body": "![P1 Badge](https://example.com/p1.svg) Author resolved this via the codex-p1-gate override path.",
+      "body": "**P1 blocking finding**",
       "user": {
         "login": "chatgpt-codex-connector[bot]"
       }
@@ -37,6 +37,5 @@
   "authoring_agent": "codex",
   "reviewer_accounts": [
     "nathanpayne-codex"
-  ],
-  "has_cli_approval": true
+  ]
 }

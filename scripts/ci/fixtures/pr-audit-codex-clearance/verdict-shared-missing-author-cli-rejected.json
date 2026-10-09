@@ -1,0 +1,25 @@
+{
+  "description": "Shared-author identity validation with independent CLI approval: verdict-shared-missing-author-cli-rejected",
+  "expected_cleared": false,
+  "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
+  "codex_bot_login": "chatgpt-codex-connector[bot]",
+  "has_cli_approval": true,
+  "merged_at": "2026-05-12T11:00:00Z",
+  "reviews": [],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "id": 9007,
+      "body": "Codex Review: Didn't find any major issues.\nReviewed commit: deadbeefcafe1234567890abcdef1234567890ab",
+      "created_at": "2026-05-12T10:30:00Z",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]"
+      }
+    }
+  ],
+  "native_author": "nathanjohnpayne",
+  "body_contract": {
+    "author": "",
+    "authorCount": 0
+  }
+}

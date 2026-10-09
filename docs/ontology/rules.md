@@ -225,7 +225,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **R-93.** An account- or connection-level block is terminal: short-circuit immediately, route to Phase 4b naming the real cause, never report it as generic latency. ● — REVIEW_POLICY.md § Phase 4a
 
-**R-94.** A Codex thumbs-up clears gate (c) only within the reaction freshness window and at-or-after the HEAD anchor. ● — review-policy.yml § reaction_freshness_window_seconds
+**R-94.** A PR-level Codex thumbs-up has no commit anchor and never clears gate (c) or ends the requester poll. Clearance requires a qualifying commit-anchored review or affirmative verdict. ● — REVIEW_POLICY.md § Phase 4a
 
 **R-95.** The CodeRabbit HEAD anchor is floored by the wallclock freshness window against rewritten committer dates. ● — review-policy.yml § wallclock_freshness_window_seconds
 
@@ -235,9 +235,9 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **R-97.** Gate (b) branch 1: an APPROVED review from a registered reviewer identity different from the authoring agent. ● — REVIEW_POLICY.md § Phase 4a
 
-**R-98.** Gate (b) branch 2 (same-agent fallback): with Codex enabled and the authoring agent registered, a fresh Codex thumbs-up or a HEAD-anchored affirmative verdict substitutes for the approval state. ● — REVIEW_POLICY.md § Phase 4a
+**R-98.** Gate (b) branch 2 (same-agent fallback): with Codex enabled and the authoring agent registered, a Codex COMMENTED review on HEAD with no P0/P1 findings in its body or root bot comments, regardless of later resolution, or a HEAD-anchored affirmative verdict substitutes for the approval state. ● — REVIEW_POLICY.md § Phase 4a
 
-**R-99.** Gate (c): Codex clearance on the current HEAD in one of the three recognized forms, or a same-fingerprint carry-forward, or a Phase 4b substitute approval. ● — REVIEW_POLICY.md § Phase 4a
+**R-99.** Gate (c): Codex clearance on the current HEAD from a qualifying commit-anchored review or affirmative verdict, or a same-fingerprint carry-forward with no newer Codex signal, or a Phase 4b substitute approval covering the current request generation with no newer Codex signal superseding it. A later unanswered Codex request supersedes Codex clearance. ● — REVIEW_POLICY.md § Phase 4a
 
 **R-100.** The fingerprint carry-forward covers base-only churn exclusively; any changed reviewed content invalidates it. ● — REVIEW_POLICY.md § Phase 4a
 

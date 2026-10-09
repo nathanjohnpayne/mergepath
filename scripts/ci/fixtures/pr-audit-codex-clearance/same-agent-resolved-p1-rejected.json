@@ -1,6 +1,6 @@
 {
-  "description": "Resolved P1 bounded by merge plus independent CLI approval clears",
-  "expected_cleared": true,
+  "description": "Resolved P1 review without independent approval cannot supply the same-agent approval substitute",
+  "expected_cleared": false,
   "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
   "codex_bot_login": "chatgpt-codex-connector[bot]",
   "merged_at": "2026-05-12T10:30:00Z",
@@ -37,6 +37,5 @@
   "authoring_agent": "codex",
   "reviewer_accounts": [
     "nathanpayne-codex"
-  ],
-  "has_cli_approval": true
+  ]
 }

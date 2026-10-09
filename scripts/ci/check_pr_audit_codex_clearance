@@ -108,6 +108,18 @@ const issueComments = (fx.issue_comments_fetch_failed === true)
 // boolean directly to exercise the "independent CLI approval already
 // satisfies gate (b)" branch.
 const hasIndependentCliApproval = fx.has_cli_approval === true;
+const reviewerAccounts = fx.available_reviewers ||
+  ['nathanpayne-claude', 'nathanpayne-cursor', 'nathanpayne-codex'];
+const bodyContract = fx.body_contract || {
+  author: fx.authoring_agent || '', authorCount: fx.authoring_agent ? 1 : 0,
+};
+const validAuthorDeclaration = (fx.native_author || 'external-contributor') !==
+  (fx.author_identity || 'nathanjohnpayne') ||
+  (bodyContract.authorCount === 1 && Boolean(bodyContract.author) &&
+    reviewerAccounts.filter(r => String(r).toLowerCase().endsWith(
+      '-' + String(bodyContract.author).toLowerCase()
+    )).length === 1);
+
 const headCommitterDate = fx.head_committer_date || '';
 const mergedAt = fx.merged_at || '';
 // Only force-pushes at or before merged_at are merge-time state; a
@@ -214,30 +226,16 @@ if (codexEnabled && issueComments !== null) {
   }
 }
 
-// Reaction: needs only the reactions array. NOT gated on sameAgentContext
-// for the timestamp (round 4) — a cross-agent thumbs-up still counts as a
-// newer Codex signal even though it cannot itself substitute for gate b
-// alone.
-let latestReactionTime = '';
-if (codexEnabled) {
-  for (const x of reactions) {
-    if (x.user && x.user.login === codexBotLogin &&
-        x.content === '+1' &&
-        reactionLowerBound && x.created_at >= reactionLowerBound &&
-        mergedAt && x.created_at <= mergedAt &&
-        x.created_at > latestReactionTime) {
-      latestReactionTime = x.created_at;
-    }
-  }
-}
-
 // Review: needs only codexCommentedOnHead. NOT gated on inlineComments
 // (round 4) for the timestamp — only the P0/P1 cleanliness check below
 // needs inline comments.
 let latestReviewTime = '';
 let latestCodexReview = null;
-if (codexEnabled && codexCommentedOnHead.length > 0) {
-  latestCodexReview = codexCommentedOnHead.reduce(
+if (codexEnabled && inlineComments !== null && codexCommentedOnHead.length > 0) {
+  latestCodexReview = codexCommentedOnHead.filter(r => {
+    const comments = inlineComments.filter(c => c.pull_request_review_id === r.id);
+    return comments.length === 0 || comments.some(c => !c.in_reply_to_id && c.user && c.user.login === codexBotLogin) || /\S/.test(r.body || '');
+  }).filter(r => mergedAt && r.submitted_at && r.submitted_at <= mergedAt).reduce(
     (latest, r) => (!latest || r.submitted_at > latest.submitted_at) ? r : latest,
     null
   );
@@ -249,12 +247,18 @@ if (codexEnabled && codexCommentedOnHead.length > 0) {
 if (codexEnabled && inlineComments !== null && issueComments !== null) {
   const p01Regex = /!\[P[01] Badge\]/;
   let reviewHasUnresolvedP01 = false;
+  let reviewHasBlockingRoots = false;
   if (latestCodexReview) {
     const p01 = inlineComments.filter(
       c => c.user && c.user.login === codexBotLogin &&
            c.pull_request_review_id === latestCodexReview.id &&
            p01Regex.test(c.body || '')
     );
+    const blockingReviewRegex = /!\[P[01] Badge\]|\*\*P[01]/;
+    reviewHasBlockingRoots = blockingReviewRegex.test(latestCodexReview.body || '') ||
+      inlineComments.some(c => c.user && c.user.login === codexBotLogin &&
+        c.pull_request_review_id === latestCodexReview.id && !c.in_reply_to_id &&
+        blockingReviewRegex.test(c.body || ''));
     if (resolutionByCommentId === null) {
       reviewHasUnresolvedP01 = p01.length > 0; // fail closed
     } else {
@@ -278,8 +282,6 @@ if (codexEnabled && inlineComments !== null && issueComments !== null) {
   // resolves to an available reviewer identity. Mirrors
   // codex-review-check.sh AUTHORING_AGENT to SAME_AGENT_REVIEWER suffix
   // match.
-  const reviewerAccounts = fx.available_reviewers ||
-    ['nathanpayne-claude', 'nathanpayne-cursor', 'nathanpayne-codex'];
   let sameAgentContext = false;
   if (fx.authoring_agent) {
     const authoringAgent = String(fx.authoring_agent).toLowerCase();
@@ -289,12 +291,10 @@ if (codexEnabled && inlineComments !== null && issueComments !== null) {
   }
 
   // Latest-signal-wins among THREE signal types (#612), using the
-  // UNCONDITIONAL timestamps computed above (round 4). Ties resolve
-  // reaction < review < verdict.
+  // Unconditional anchored timestamps computed above. Verdict wins ties.
   let latestKind = '';
   let latestTime = '';
   for (const [kind, time] of [
-    ['reaction', latestReactionTime],
     ['review', latestReviewTime],
     ['verdict', latestVerdictTime],
   ]) {
@@ -303,15 +303,12 @@ if (codexEnabled && inlineComments !== null && issueComments !== null) {
       latestTime = time;
     }
   }
-  // Both reaction and verdict clear only when same-agent OR an
-  // independent CLI approval already exists, round 3, extended to
-  // reaction in round 4. Review clearance has never required
-  // same-agent, pre-existing and out of scope.
-  const gateBSatisfied = sameAgentContext || hasIndependentCliApproval;
-  if (latestKind === 'reaction') {
-    codexCleared = gateBSatisfied;
-  } else if (latestKind === 'review') {
-    codexCleared = !reviewHasUnresolvedP01;
+  // Same-agent approval substitution requires an affirmative review or
+  // verdict; an independent CLI approval supplies its own cross-agent signal.
+  const gateBSatisfied = validAuthorDeclaration && (hasIndependentCliApproval ||
+    (sameAgentContext && (latestKind !== 'review' || !reviewHasBlockingRoots)));
+  if (latestKind === 'review') {
+    codexCleared = gateBSatisfied && !reviewHasUnresolvedP01;
   } else if (latestKind === 'verdict') {
     codexCleared = gateBSatisfied && verdictAffirmative && !reviewHasUnresolvedP01;
   }
@@ -348,6 +345,91 @@ for fixture in "$FIXTURES_DIR"/*.json; do
     echo "  FAIL: $name — $desc (expected=$expected, actual=$actual)" >&2
   fi
 done
+
+# Execute the production timestamp block, including its failure fallback.
+if node - "$WORKFLOW" <<'NODE'
+const fs = require('fs');
+const source = fs.readFileSync(process.argv[2], 'utf8');
+const begin = source.indexOf("                let latestReviewTime = '';");
+const end = source.indexOf('                // ── Clearance decision', begin);
+if (begin < 0 || end < 0) throw new Error('production timestamp block missing');
+const evaluate = new Function('codexCommentedOnHead', 'inlineComments', 'mergedAt', `
+  const codexEnabled = true, codexBotLogin = 'chatgpt-codex-connector[bot]';
+  let latestAnyCodexSignalTime = '', latestVerdictTime = '';
+  ${source.slice(begin, end)}
+  return {time: latestAnyCodexSignalTime, clearanceReview: latestCodexReview};
+`);
+const review = {id: 1, submitted_at: '2026-09-14T00:02:00Z', body: 'Codex Review'};
+const merged = '2026-09-14T00:04:00Z';
+const failed = evaluate([review], null, merged);
+if (failed.time !== review.submitted_at || failed.clearanceReview !== null)
+  throw new Error('inline fetch failure lost staleness evidence or granted review clearance');
+const postmerge = {...review, id: 2, submitted_at: '2026-09-14T00:05:00Z'};
+if (evaluate([review, postmerge], null, merged).time !== review.submitted_at)
+  throw new Error('post-merge review masked the merge-time staleness baseline');
+if (evaluate([postmerge], null, merged).time !== '')
+  throw new Error('post-merge review supplied merge-time evidence');
+if (evaluate([postmerge], [], merged).clearanceReview !== null)
+  throw new Error('post-merge review granted retrospective clearance');
+if (evaluate([review, postmerge], [], merged).clearanceReview.id !== review.id)
+  throw new Error('post-merge review replaced the actual merge-time review');
+if (evaluate([review], [], '').clearanceReview !== null)
+  throw new Error('unknown merge time granted retrospective clearance');
+console.log('  PASS: production audit retains bounded HEAD timestamps when inline fetch fails');
+NODE
+then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "  FAIL: production audit timestamp regression" >&2
+fi
+
+# Execute the real author-validation and clearance blocks together: a CLI
+# approval must not mask an invalid shared-author declaration.
+if node - "$WORKFLOW" "$FIXTURES_DIR" <<'NODE'
+const fs = require('fs'), path = require('path');
+const source = fs.readFileSync(process.argv[2], 'utf8');
+const authorBegin = source.indexOf('              // Shared-author identity must be known');
+const authorEnd = source.indexOf('              // Fetch all reviews', authorBegin);
+const gateBegin = source.indexOf('                // ── Clearance decision');
+const gateEnd = source.indexOf('                // ─────────────────────────────────────────────────', gateBegin);
+const cli = source.match(/const hasFreshCliApproval =[^;]+;/);
+if (authorBegin < 0 || authorEnd < 0 || gateBegin < 0 || gateEnd < 0 || !cli)
+  throw new Error('production author-validation or clearance block missing');
+const evaluate = new Function('fx', `
+  const pr = {user:{login:fx.native_author}}, authorIdentity = 'nathanjohnpayne';
+  const reviewerAccounts = ['nathanpayne-claude','nathanpayne-cursor','nathanpayne-codex'];
+  const bodyContract = fx.body_contract, prViolations = [];
+  ${source.slice(authorBegin, authorEnd)}
+  const cliApprovedReviews = [{}], codexEnabled = true;
+  const inlineComments = [], issueComments = [], resolutionByCommentId = {};
+  const codexBotLogin = 'chatgpt-codex-connector[bot]', mergedAt = fx.merged_at;
+  const latestCodexReview = (fx.reviews || [])[0] || null;
+  const latestReviewTime = latestCodexReview ? latestCodexReview.submitted_at : '';
+  const latestVerdictTime = latestReviewTime ? '' : fx.issue_comments[0].created_at;
+  const verdictAffirmative = true;
+  let codexCleared = false;
+  ${source.slice(gateBegin, gateEnd)}
+  const latestAnyCodexSignalTime = latestReviewTime || latestVerdictTime;
+  const latestCliApprovedTime = '2026-05-12T10:45:00Z';
+  ${cli[0]}
+  return {codexCleared, hasFreshCliApproval, prViolations};
+`);
+for (const name of fs.readdirSync(process.argv[3]).filter(n => /-shared-.*-cli-/.test(n))) {
+  const fx = JSON.parse(fs.readFileSync(path.join(process.argv[3], name), 'utf8'));
+  const result = evaluate(fx);
+  if (result.codexCleared !== fx.expected_cleared ||
+      result.hasFreshCliApproval !== fx.expected_cleared ||
+      Boolean(result.prViolations.length) === fx.expected_cleared)
+    throw new Error(name + ': ' + JSON.stringify(result));
+}
+console.log('  PASS: production audit rejects invalid shared-author declarations despite CLI and Codex approval');
+NODE
+then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1)); echo '  FAIL: production shared-author declaration boundary' >&2
+fi
 
 # Structural assertion: the workflow contains the load-bearing
 # `p01Regex` literal. If someone refactors the workflow to drop the
@@ -400,62 +482,11 @@ else
   echo "  FAIL: $WORKFLOW must bound resolution by merge time (resolvedAtMerge proxy + comment createdAt) — Codex P1 #460" >&2
 fi
 
-# Structural assertion (#450): the workflow reads Codex bot +1
-# reactions and anchors them to merge time (pr.merged_at), not the
-# audit run time. A regression to a NOW-window floor would reject
-# every week-old merge-time +1.
-if grep -qF 'reactions.listForIssue' "$WORKFLOW" && \
-   grep -qF "x.content === '+1'" "$WORKFLOW" && \
-   grep -qF 'pr.merged_at' "$WORKFLOW"; then
-  pass=$((pass + 1))
-  echo "  PASS: $WORKFLOW accepts merge-time-anchored Codex +1 clearance (#450)"
+# Unanchored PR reactions grant no authority in the audit (#1751).
+if ! grep -qF 'latestReactionTime' "$WORKFLOW" && ! grep -qF 'github.rest.reactions.listForIssue' "$WORKFLOW"; then
+  pass=$((pass + 1)); echo "  PASS: audit ignores PR reactions for clearance and staleness"
 else
-  fail=$((fail + 1))
-  echo "  FAIL: $WORKFLOW must read Codex +1 reactions anchored to pr.merged_at (#450)" >&2
-fi
-
-# Structural assertion (Codex P2 on #460): the workflow raises the
-# reaction-window lower bound to the latest head_ref_force_pushed time,
-# mirroring the merge gate. Without it a stale +1 on a PR force-pushed to
-# an old/reused commit could satisfy the window and falsely clear.
-if grep -qF 'head_ref_force_pushed' "$WORKFLOW" && \
-   grep -qF 'listEventsForTimeline' "$WORKFLOW" && \
-   grep -qF 'reactionLowerBound' "$WORKFLOW"; then
-  pass=$((pass + 1))
-  echo "  PASS: $WORKFLOW raises the reaction lower bound to the force-push anchor (Codex P2 #460)"
-else
-  fail=$((fail + 1))
-  echo "  FAIL: $WORKFLOW must anchor reactions to head_ref_force_pushed (max with committer date) — Codex P2 #460" >&2
-fi
-
-# Structural assertion (Codex P2 on #460 round 2): the workflow bounds
-# head_ref_force_pushed events to those at or before merged_at when
-# reconstructing merge-time state. Without it a force-push AFTER merge
-# raises reactionLowerBound past merged_at, empties the [lowerBound,
-# merged_at] reaction window, and falsely flags a PR that legitimately
-# cleared via a pre-merge 👍. Mirrors labelWasPresentAtMerge /
-# resolvedAtMerge. The postmerge-forcepush-plus1-clears fixture exercises
-# the runtime path; this canary guards the workflow source.
-if grep -qF 'ev.created_at <= mergedAt' "$WORKFLOW"; then
-  pass=$((pass + 1))
-  echo "  PASS: $WORKFLOW bounds force-push events to merged_at (merge-time state, Codex P2 #460 r2)"
-else
-  fail=$((fail + 1))
-  echo "  FAIL: $WORKFLOW must exclude post-merge force-pushes (ev.created_at <= mergedAt) from the reaction lower bound — Codex P2 #460 r2" >&2
-fi
-
-# Structural assertion (Codex P2 on #460): the reaction lower bound also
-# carries the merge-time freshness floor (merged_at - reaction_freshness_
-# window_seconds), so a stale prior-HEAD +1 the merge gate would reject
-# cannot clear the retrospective audit on an ordinary-push-to-old-commit PR.
-if grep -qF 'reactionFreshnessWindowSeconds' "$WORKFLOW" && \
-   grep -qF 'mergedAtFloor' "$WORKFLOW" && \
-   grep -qF 'reaction_freshness_window_seconds' "$WORKFLOW"; then
-  pass=$((pass + 1))
-  echo "  PASS: $WORKFLOW applies the merge-time freshness floor (merged_at - window) to the reaction lower bound (Codex P2 #460)"
-else
-  fail=$((fail + 1))
-  echo "  FAIL: $WORKFLOW must add the merged_at - reaction_freshness_window_seconds floor to the reaction lower bound — Codex P2 #460" >&2
+  fail=$((fail + 1)); echo "  FAIL: audit still grants authority to an unanchored PR reaction" >&2
 fi
 
 # Structural assertion (Codex P2 on #460, restructured #612 round 4): the
@@ -476,32 +507,6 @@ if grep -qF 'config.codex.enabled === false' "$WORKFLOW" && \
 else
   fail=$((fail + 1))
   echo "  FAIL: $WORKFLOW must gate Codex clearance on codexEnabled (codex.enabled===false → ignore bot signals) — Codex P2 #460" >&2
-fi
-
-# Structural assertion (Codex P2 on #460 round 3, restructured #612 round
-# 4): the workflow gates +1-reaction and verdict CLEARANCE on same-agent
-# context OR an independent CLI approval, mirroring the merge gate branch-2
-# (#170) rule that a 👍/verdict substitutes for reviewer approval only when
-# the PR Authoring-Agent resolves to an available reviewer identity (unless
-# gate (b) is already independently satisfied via a real reviewer APPROVED).
-# Since round 4 the reaction's TIMESTAMP is scanned unconditionally (for the
-# Phase 4b staleness guard) and only the codexCleared assignment is gated —
-# so the canary now looks for the shared gateBSatisfied gate rather than an
-# `if (sameAgentContext)` wrapper around the reaction scan itself. Without
-# this gate a cross-agent / missing-Authoring-Agent PR merged with only a 👍
-# (which codex-review-check.sh rejects) would pass the audit. The
-# cross-agent-plus1-rejected fixture exercises the runtime path; this canary
-# guards the workflow source.
-if grep -qF 'sameAgentContext' "$WORKFLOW" && \
-   grep -qF 'scripts/lib/pr-body-contract.mjs' "$WORKFLOW" && \
-   ! grep -qE '\.match\([^)]*Authoring-Agent:|match\([[:space:]]*$' "$WORKFLOW" && \
-   grep -qF 'const gateBSatisfied = sameAgentContext || cliApprovedReviews.length > 0;' "$WORKFLOW" && \
-   grep -qF "codexCleared = gateBSatisfied;" "$WORKFLOW"; then
-  pass=$((pass + 1))
-  echo "  PASS: $WORKFLOW gates the +1 reaction path on same-agent context (Codex P2 #460 r3)"
-else
-  fail=$((fail + 1))
-  echo "  FAIL: $WORKFLOW must gate the Codex +1 reaction on sameAgentContext (Authoring-Agent → reviewer) — Codex P2 #460 r3" >&2
 fi
 
 # Structural assertion: the workflow references #449 and #450 for

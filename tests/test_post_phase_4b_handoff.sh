@@ -192,7 +192,9 @@ if printf '%s' "$OUT" | grep -q "PR ready for external review (Phase 4b):" \
    && printf '%s' "$OUT" | grep -q "head 1111111" \
    && printf '%s' "$OUT" | grep -q "(base 2222222)" \
    && printf '%s' "$OUT" | grep -q "Threads: 2 unresolved" \
-   && printf '%s' "$OUT" | grep -q "resolve addressed bot or agent-reviewer"; then
+   && printf '%s' "$OUT" | grep -q "resolve addressed bot or agent-reviewer" \
+   && printf '%s' "$OUT" | grep -q "affirmative verdict anchored to the listed HEAD" \
+   && ! printf '%s' "$OUT" | grep -q "reaction newer"; then
   pass "single-PR mirror render contains expected fields"
 else
   fail "single-PR mirror render missing expected fields"
@@ -293,7 +295,9 @@ if printf '%s' "$OUT" | grep -q "| Repo | PR # | HEAD short SHA | Unresolved thr
    && printf '%s' "$OUT" | grep -q "nathanjohnpayne/swipewatch" \
    && printf '%s' "$OUT" | grep -q "Context: verbatim mirror of mergepath@abcdef123456" \
    && printf '%s' "$OUT" | grep -q "real-human threads automatically" \
-   && ! printf '%s' "$OUT" | grep -q "Context: mixed"; then
+   && ! printf '%s' "$OUT" | grep -q "Context: mixed" \
+   && printf '%s' "$OUT" | grep -q "affirmative verdict anchored to" \
+   && ! printf '%s' "$OUT" | grep -q "reaction newer"; then
   pass "batch all-same-mirror render surfaces shared context"
 else
   fail "batch all-same-mirror render missing expected shared context"

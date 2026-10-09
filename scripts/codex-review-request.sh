@@ -59,24 +59,11 @@
 #      chatgpt-codex-connector[bot]; the 1800s review_timeout (#1550) and
 #      30s ack_wait are measured retunes — see #623 and the per-constant
 #      comments below).
-#   2. Fetches the PR's current HEAD commit SHA and committer date. Any
-#      Codex review is only considered "current" if it is anchored on
-#      this commit (commit_id == HEAD_SHA). Any Codex +1 reaction is
-#      only considered "current" if created_at >= REACTION_THRESHOLD,
-#      where REACTION_THRESHOLD = max(HEAD_PUSHED_AT, freshness floor):
-#        - HEAD_PUSHED_AT is HEAD_COMMITTER_DATE advanced past any
-#          `head_ref_force_pushed` event on this PR's timeline, which
-#          is strictly PR-scoped. This closes the force-push-with-
-#          old-commit false-clear path.
-#        - freshness floor = NOW minus
-#          `codex.reaction_freshness_window_seconds` (default 1800).
-#          This closes the ordinary-push-with-old-committer-date
-#          false-clear path by ensuring a stale 👍 from a prior HEAD
-#          ages out of the window.
-#      See codex-review-check.sh for the iteration history behind this
-#      design and the residual hole it does NOT fully close.
-#   3. Scans existing reviews, inline comments, issue reactions, and issue
-#      comments (for a HEAD-anchored verdict, #609) for a Codex signal
+#   2. Fetches the PR's current HEAD commit SHA. Reviews and verdicts
+#      count only when anchored to that head. PR issue reactions have no
+#      commit attribution and never count as response or clearance (#1751).
+#      Existing timestamp anchors remain for request/provider diagnostics.
+#   3. Scans reviews, inline comments and issue-comment verdicts for a signal
 #      already present on the current HEAD. If found, skips the trigger
 #      comment and goes straight to emitting JSON — re-posting `@codex
 #      review` when Codex has already responded can cause double-processing
@@ -106,8 +93,6 @@
 #      MERGEPATH_CODEX_SCAN_RETRY_ATTEMPTS times before the run exits 3
 #      (#1550); a permanent failure still exits 3 at once.
 #        - a review from the Codex bot on the current HEAD, OR
-#        - a +1 reaction from the Codex bot on the PR issue dated after
-#          the current HEAD committer date, OR
 #        - a HEAD-anchored Codex issue-comment verdict ("Codex Review:
 #          Didn't find any major issues" + "Reviewed commit: <sha>") of
 #          EITHER disposition — a non-affirmative verdict still ends the
@@ -787,20 +772,13 @@ if [ -z "$HEAD_SHA" ] || [ "$HEAD_SHA" = "null" ]; then
   die 3 "could not determine HEAD sha for PR #$PR_NUMBER"
 fi
 
-# committer date, not author date — reactions are compared against commit
-# arrival time at GitHub, not commit authorship
+# Use the committer date for request/provider diagnostics, not the author date.
 HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.committer.date' 2>&1) \
   || die 3 "failed to fetch commit date for $HEAD_SHA: $HEAD_COMMITTER_DATE"
 
-# HEAD_PUSHED_AT + REACTION_THRESHOLD: mirrors codex-review-check.sh so
-# that the pre-flight scan below does NOT treat a stale 👍 from a prior
-# HEAD as a current signal (which would cause the trigger comment to be
-# skipped and the caller to re-run gate (c) against the same stale
-# reaction). See codex-review-check.sh for the full rationale; the short
-# version: committer date is unreliable for force-push-of-old-commit
-# and ordinary-push-of-old-committer-date. Layer 1 advances the anchor
-# via `head_ref_force_pushed` events from the PR-scoped timeline; Layer
-# 2 bounds residual exposure with a freshness floor.
+# Retain the shared timestamp diagnostics used by request evidence and
+# provider-state polling. Clearance below depends on commit anchors; a PR
+# reaction cannot suppress a request or end the polling loop.
 TIMELINE_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/timeline" "PR timeline")
 EPOCH_NOW=$(date +%s)
 REACTION_ANCHOR=$(crqe_request_threshold "$HEAD_COMMITTER_DATE" "$TIMELINE_JSON" \
@@ -821,12 +799,12 @@ log "ack_wait = ${ACK_WAIT_SECONDS}s    max_ack_retries = $MAX_ACK_RETRIES"
 # --- Codex signal scan ------------------------------------------------------
 
 # Scan for (a) a review from the bot on the current HEAD commit, (b) inline
-# findings from the bot on the current HEAD, (c) a +1 reaction on the issue
-# dated after the HEAD committer date. Returns a JSON object to stdout on
+# findings from the bot on the current HEAD, (c) an issue verdict anchored by
+# its Reviewed commit field. Returns a JSON object to stdout on
 # success. Emits empty object { "review": null, "findings": [], "reaction": null }
 # if nothing matches yet.
 scan_codex_state() {
-  local reviews comments reactions issue_comments review findings reaction verdict blocked
+  local reviews comments issue_comments review findings reaction verdict blocked
 
   # Each read must propagate fetch_api_array's status explicitly (#966):
   # scan_codex_state is invoked from every call site as
@@ -840,7 +818,6 @@ scan_codex_state() {
   # read failure returns 4 rather than 3 (#1550); see rescan_codex_state.
   reviews=$(fetch_scan_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") || return $?
   comments=$(fetch_scan_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments") || return $?
-  reactions=$(fetch_scan_array "repos/$REPO/issues/$PR_NUMBER/reactions" "reactions") || return $?
   issue_comments=$(fetch_scan_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || return $?
   issue_comments=$(crqe_resolve_verdict_anchors "$issue_comments" "$REPO" "$BOT_LOGIN") || return 3
 
@@ -849,8 +826,15 @@ scan_codex_state() {
   # capture the review id so the findings filter can scope to THIS
   # review only and not pick up stale findings from an earlier review
   # round on the same HEAD.
-  review=$(echo "$reviews" | jq --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
-    [.[] | select(.user.login == $bot) | select(.commit_id == $sha)]
+  # Provider histories and finding bodies are unbounded; keep them off argv.
+  review=$(printf '%s\n' "$reviews" "$comments" | jq -s --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
+    .[0] as $reviews | .[1] as $comments
+    | [$reviews[] | select(.user.login == $bot) | select(.commit_id == $sha)
+      | . as $r
+      | [$comments[] | select(.pull_request_review_id == $r.id)] as $inline
+      | select(any($inline[]; (.user.login == $bot) and (.in_reply_to_id == null))
+               or (($r.body // "") | test("[^[:space:]]"))
+               or ($inline | length) == 0)]
     | sort_by(.submitted_at) | last
     | if . == null then null
       else { id, state, submitted_at, commit_id, body }
@@ -898,31 +882,14 @@ scan_codex_state() {
     findings='[]'
   fi
 
-  # Most recent +1 reaction from the bot on the issue with created_at
-  # strictly >= REACTION_THRESHOLD. Threshold = max(HEAD_PUSHED_AT,
-  # freshness floor). See the anchor computation above and
-  # codex-review-check.sh for the full rationale. Without the
-  # freshness floor, a stale 👍 from a prior HEAD (where the new HEAD
-  # is a normal push with an old committer date) would read as a
-  # "current" signal here and cause the pre-flight scan to skip the
-  # trigger comment, leaving the caller to re-evaluate gate (c)
-  # against the same stale reaction.
-  reaction=$(echo "$reactions" | jq --arg bot "$BOT_LOGIN" --arg after "$REACTION_THRESHOLD" '
-    [.[]
-      | select(.user.login == $bot)
-      | select(.content == "+1")
-      | select(.created_at >= $after)
-    ]
-    | sort_by(.created_at) | last
-    | if . == null then null
-      else { content, created_at, reaction_id: .id }
-      end
-  ')
+  # #1751: retain the output field for compatibility, without treating a
+  # commit-less reaction as a response or clearance signal.
+  reaction=null
 
   # HEAD-anchored Codex issue-comment verdict (#600/#567/#608, mirrored here
   # per #609). Codex can clear a round purely via this "Codex Review: Didn't
   # find any major issues" + "Reviewed commit: <sha>" ISSUE comment, with no
-  # review object and no fresh reaction — codex-review-check.sh (the merge
+  # review object — codex-review-check.sh (the merge
   # gate) has recognized this since #600, but until #609 this poller did not,
   # so a verdict-only response ran the poll to timeout (exit 4) instead of
   # terminating on it. Select the LATEST HEAD-anchored verdict FIRST (any
@@ -995,8 +962,10 @@ scan_codex_state() {
     blocked='null'
   fi
 
-  jq -n --argjson review "$review" --argjson findings "$findings" --argjson reaction "$reaction" --argjson verdict "$verdict" --argjson blocked "$blocked" '
-    { review: $review, findings: $findings, reaction: $reaction, verdict: $verdict, blocked: $blocked }
+  printf '%s\n' "$review" "$findings" "$reaction" "$verdict" "$blocked" | jq -s '
+    if length != 5 then error("incomplete Codex scan components") else
+      { review: .[0], findings: .[1], reaction: .[2], verdict: .[3], blocked: .[4] }
+    end
   '
 }
 
@@ -1020,7 +989,7 @@ current_blocked_reason() {
   fi
 }
 
-# Returns 0 iff the scan produced ANY signal (review, reaction, or
+# Returns 0 iff the scan produced a commit-anchored signal (review or
 # HEAD-anchored issue-comment verdict). Used by the poll loop, which stops
 # as soon as Codex has produced any response — even a review with P0/P1
 # findings, or a non-affirmative verdict, counts because the caller will
@@ -1028,12 +997,11 @@ current_blocked_reason() {
 # response must end the poll instead of running to timeout).
 has_signal() {
   local scan=$1
-  [ "$(echo "$scan" | jq -r '.review != null or .reaction != null or .verdict != null')" = "true" ]
+  [ "$(echo "$scan" | jq -r '.review != null or .verdict != null')" = "true" ]
 }
 
 # Returns 0 iff the scan produced a signal that should be treated as
 # CLEARED (no further @codex review trigger needed). Cleared means one of:
-#   - any +1 reaction on the PR issue (the no-findings happy path), OR
 #   - a review on HEAD with zero blocking (required-tier) inline findings
 #     (the reviewed-and-clean path; "blocking" reflects the resolved
 #     feedback_policy required set, so this is P0/P1 by default), OR
@@ -1052,20 +1020,11 @@ has_signal() {
 # #73 during dry-run C.
 has_cleared_signal() {
   local scan=$1
-  # Latest-signal-wins among THREE signal types — 👍 reaction, COMMENTED
-  # review, and issue-comment verdict — not whichever this function checks
-  # first (#64, extended for the verdict in #609, mirroring the merge gate's
-  # #600/#608 LATEST_SIGNAL_KIND decision in codex-review-check.sh). An older
-  # 👍 or clean review must not mask a NEWER negative verdict, and a stale
-  # verdict must not override a newer P1-bearing review — nathanpayne-codex
-  # caught the two-way version of this bug on nathanpaynedotcom propagation
-  # PR #180 round 2 (same shape as PR #65 round 1's gate (c) latest-state
-  # rule). Ties resolve reaction < review < verdict (iteration order,
-  # replace-on->=), matching the merge gate's tie-break so an ambiguous
-  # same-second tie fails closed when the verdict is negative.
+  # Latest-signal-wins between commit-anchored reviews and verdicts.
+  # An older clean review cannot mask a newer negative verdict; verdicts
+  # win timestamp ties. Unanchored reactions have no authority (#1751).
   [ "$(echo "$scan" | jq -r '
     def review_time: if .review == null then "" else .review.submitted_at end;
-    def reaction_time: if .reaction == null then "" else .reaction.created_at end;
     def verdict_time: if .verdict == null then "" else .verdict.created_at end;
     # P0 ALWAYS blocks clearance (the absent-policy disposition default is
     # P0/P1), regardless of the resolved gate set — otherwise a consumer with
@@ -1077,12 +1036,11 @@ has_cleared_signal() {
     # which signal is latest, so it gates the verdict path too.
     def review_clean: ([.findings[] | select(.priority == "P0" or .blocking == true)] | length) == 0;
 
-    ( reduce ( [["reaction", reaction_time], ["review", review_time], ["verdict", verdict_time]] | .[] ) as $sig
+    ( reduce ( [["review", review_time], ["verdict", verdict_time]] | .[] ) as $sig
         ({kind: "", time: ""};
          if ($sig[1] != "" and ($sig[1] >= .time)) then {kind: $sig[0], time: $sig[1]} else . end)
     ) as $latest
-    | if $latest.kind == "reaction" then "true"
-      elif $latest.kind == "review" then (review_clean | tostring)
+    | if $latest.kind == "review" then (review_clean | tostring)
       elif $latest.kind == "verdict" then
         ((.verdict.affirmative == true and review_clean) | tostring)
       else "false"
@@ -1105,7 +1063,6 @@ has_post_trigger_signal() {
   local after=${TRIGGER_SIGNAL_THRESHOLD:-$TRIGGER_POST_TIME}
   [ "$(echo "$scan" | jq -r --arg after "$after" '
     ((.review != null and .review.submitted_at >= $after)
-     or (.reaction != null and .reaction.created_at >= $after)
      or (.verdict != null and .verdict.created_at >= $after))
   ')" = "true" ]
 }
@@ -1679,7 +1636,7 @@ post_codex_trigger() {
   # that were already on HEAD before the trigger fired. Without this,
   # `has_signal "$INITIAL_SCAN"` would return true on the very first
   # iteration of the poll loop and the script would exit with the
-  # stale review/reaction without waiting for Codex's actual response
+  # stale review/verdict without waiting for Codex's actual response
   # to the new trigger. Codex caught this on swipewatch propagation
   # PR #33 round 2 — same shape as the round-1 has_cleared_signal
   # bug, just on the post-trigger side.
@@ -2094,7 +2051,7 @@ RESUMED_EVER=false
 RESUMED_TRIGGER_ID=""
 
 if has_cleared_signal "$INITIAL_SCAN"; then
-  log "Codex has already cleared on HEAD (reaction, no-blocking-tier review, or affirmative verdict comment) — skipping trigger comment"
+  log "Codex has already cleared on HEAD (no-blocking-tier review or affirmative verdict comment) — skipping trigger comment"
 elif [ "$TRIGGER_ONLY" = "true" ] && existing_codex_trigger_on_head; then
   log "trigger-only: @codex review already requested on HEAD — skipping duplicate trigger (idempotent, #489)"
 elif [ "$TRIGGER_ONLY" = "true" ] && auto_trigger_content_free; then

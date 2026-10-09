@@ -1420,8 +1420,14 @@ const source = fs.readFileSync(process.argv[2], 'utf8');
 const start = source.indexOf('              let bodyContract = { author:');
 const end = source.indexOf('\n              // Fetch all reviews for this PR once', start);
 if (start < 0 || end < 0) throw new Error('audit parser caller block not found');
-const caller = new Function('pr', 'isDependabot', 'parsePrBodyContract', 'prViolations',
+const callerImpl = new Function('pr', 'isDependabot', 'parsePrBodyContract', 'prViolations',
+  'authorIdentity', 'reviewerAccounts',
   `${source.slice(start, end)}\nreturn { bodyContract, prViolations };`);
+// The extracted caller also validates shared-author context before reviews.
+const caller = (pr, isDependabot, parsePrBodyContract, prViolations) => callerImpl(
+  { ...pr, user: { login: isDependabot ? 'dependabot[bot]' : 'nathanjohnpayne' } },
+  isDependabot, parsePrBodyContract, prViolations,
+  'nathanjohnpayne', ['nathanpayne-codex']);
 const timeout = Object.assign(new Error('parser timed out'), { code: 'ETIMEDOUT' });
 for (const isDependabot of [false, true]) {
   try {

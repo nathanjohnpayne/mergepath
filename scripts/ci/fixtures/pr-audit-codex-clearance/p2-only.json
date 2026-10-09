@@ -1,5 +1,5 @@
 {
-  "description": "Codex COMMENTED on HEAD with only P2/P3 findings (no P0/P1) → cleared (matches merge-gate semantics: P2/P3 are advisory)",
+  "description": "Codex COMMENTED on HEAD with only P2/P3 findings (no P0/P1) \u2192 cleared (matches merge-gate semantics: P2/P3 are advisory)",
   "expected_cleared": true,
   "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
   "codex_bot_login": "chatgpt-codex-connector[bot]",
@@ -9,7 +9,9 @@
       "state": "COMMENTED",
       "commit_id": "deadbeefcafe1234567890abcdef1234567890ab",
       "submitted_at": "2026-05-12T10:00:00Z",
-      "user": { "login": "chatgpt-codex-connector[bot]" }
+      "user": {
+        "login": "chatgpt-codex-connector[bot]"
+      }
     }
   ],
   "inline_comments": [
@@ -17,13 +19,22 @@
       "id": 5001,
       "pull_request_review_id": 1001,
       "body": "![P2 Badge](https://example.com/p2.svg) Consider extracting this into a helper.",
-      "user": { "login": "chatgpt-codex-connector[bot]" }
+      "user": {
+        "login": "chatgpt-codex-connector[bot]"
+      }
     },
     {
       "id": 5002,
       "pull_request_review_id": 1001,
       "body": "![P3 Badge](https://example.com/p3.svg) Nit: trailing whitespace.",
-      "user": { "login": "chatgpt-codex-connector[bot]" }
+      "user": {
+        "login": "chatgpt-codex-connector[bot]"
+      }
     }
-  ]
+  ],
+  "authoring_agent": "codex",
+  "reviewer_accounts": [
+    "nathanpayne-codex"
+  ],
+  "merged_at": "2026-05-12T10:05:00Z"
 }
