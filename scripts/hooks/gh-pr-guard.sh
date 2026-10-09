@@ -3351,11 +3351,23 @@ for j in "${!TOKENS[@]}"; do
       continue
       ;;
     --auto=*)
-      case "${tok#--auto=}" in false|False|FALSE|f|F|0) ;; *) AUTO_REQUESTED=1 ;; esac
+      case "${tok#--auto=}" in
+        false|False|FALSE|f|F|0) AUTO_REQUESTED=0 ;;
+        true|True|TRUE|t|T|1) AUTO_REQUESTED=1 ;;
+        *) echo "BLOCKED: invalid --auto boolean value." >&2; exit 2 ;;
+      esac
       continue
       ;;
-    --disable-auto|--disable-auto=true|--disable-auto=True|--disable-auto=TRUE|--disable-auto=t|--disable-auto=T|--disable-auto=1)
+    --disable-auto)
       DISABLE_AUTO_REQUESTED=1
+      continue
+      ;;
+    --disable-auto=*)
+      case "${tok#--disable-auto=}" in
+        false|False|FALSE|f|F|0) DISABLE_AUTO_REQUESTED=0 ;;
+        true|True|TRUE|t|T|1) DISABLE_AUTO_REQUESTED=1 ;;
+        *) echo "BLOCKED: invalid --disable-auto boolean value." >&2; exit 2 ;;
+      esac
       continue
       ;;
     --match-head-commit)

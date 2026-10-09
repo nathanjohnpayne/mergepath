@@ -224,6 +224,16 @@ for auto_true in true True TRUE t T 1; do
   assert_rc_contains "deferred --auto=$auto_true refuses" 2 "deferred --auto" "scripts/gh-as-author.sh -- gh pr merge 123 --auto=$auto_true --squash" CLEAN
 done
 assert_rc_contains "an explicit false auto flag remains an immediate merge" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 --auto=false --squash' CLEAN
+for auto_false in false False FALSE f F 0; do
+  STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "last false retraction value restores disagreement checks ($auto_false)" 2 "CHANGES_REQUESTED" "scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto --disable-auto=$auto_false --squash" CLEAN
+  TEST_UNPINNED_MERGE=1 assert_rc_contains "last false retraction value restores head pinning ($auto_false)" 2 "exactly one --match-head-commit" "scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto --disable-auto=$auto_false --squash" CLEAN
+  assert_rc_contains "last false auto value selects immediate merge ($auto_false)" 0 "" "scripts/gh-as-author.sh -- gh pr merge 123 --auto --auto=$auto_false --squash" CLEAN
+done
+for auto_true in true True TRUE t T 1; do
+  STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "last true retraction value selects cancellation ($auto_true)" 0 "" "scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto=false --disable-auto=$auto_true" BLOCKED needs-external-review
+done
+assert_rc_contains "invalid retraction boolean refuses" 2 "invalid --disable-auto boolean" 'scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto --disable-auto=invalid' CLEAN
+assert_rc_contains "invalid auto boolean refuses" 2 "invalid --auto boolean" 'scripts/gh-as-author.sh -- gh pr merge 123 --auto=invalid' CLEAN
 assert_rc_contains "deferred auto-merge refuses even before a review blocker arrives" 2 "deferred --auto" 'scripts/gh-as-author.sh -- gh pr merge 123 --auto --squash' CLEAN
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "a later command cannot supply the head precondition" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match ; echo --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" BLOCKED
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "unexported standalone tiebreak grants no authority" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa && $merge_overrides" BLOCKED
