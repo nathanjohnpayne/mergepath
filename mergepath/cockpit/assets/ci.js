@@ -103,8 +103,9 @@
     const unknown = rows.some(row => row.check_evidence_unknown || failures.includes(row.conclusion) && row.current_head === null || row.kind === "checks" && row.current_head === null)
       || repositories.some(item => item.observed_at === null);
     const terminalPass = ["success", "neutral", "skipped"];
+    // An orphaned current attempt never ran, so it is uncleared whatever earlier attempts' history says.
     const uncleared = rows.some(row => row.current_head === true && !active(row)
-      && (row.checks.some(check => check.conclusion === "cancelled") || !row.superseded && (row.kind === "checks"
+      && (row.orphaned === true || row.checks.some(check => check.conclusion === "cancelled") || !row.superseded && (row.kind === "checks"
         ? !row.checks.length || row.checks.some(check => check.status !== "completed" || !terminalPass.includes(check.conclusion))
         : row.status !== "completed" || !terminalPass.includes(row.conclusion))));
     const state = C.worstState(rows.map(row => runTone(row).state));

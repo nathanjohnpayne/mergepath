@@ -251,7 +251,8 @@ def group_runs(repo, raw_runs, jobs, checks, heads, now=None):
                    'check_evidence_unknown': raw.get('conclusion') in FAILURES and (unproven or not any(c['conclusion'] in FAILURES for c in owned)),
                    'rerun_command': f'gh run rerun {run_id} --failed --repo {repo}' if raw.get('conclusion') in FAILURES else None,
                    'orphaned': ghost}
-            if ghost:
+            # An actionable failure from an earlier attempt keeps its own diagnosis.
+            if ghost and not row['actionable']:
                 row['reason'] = 'Queued with no jobs in this attempt for over 6h: GitHub never started it, and it will not run.'
             rows.append(row)
             key = (number, sha)

@@ -417,6 +417,9 @@ test("an orphaned rerun keeps an earlier attempt's current failure as a hazard; 
   assert.equal(row.orphaned, true); assert.equal(row.actionable, true);
   const model = CI.project(envelope(data), null, 1791300000);
   assert.equal(model.hazards.length, 1); assert.equal(CI.runTone(row).state, row.severity);
+  // A superseded orphan on the current HEAD never ran, so it cannot let the panel claim clearance.
+  const current = pythonFixture("orphan:True"); current.runs[0].superseded = true;
+  assert.match(CI.project(envelope(current), null, 1791300000).label, /current CI success not established/);
   const history = pythonFixture("orphan:False"); history.runs[0].superseded = true;
   assert.doesNotThrow(() => CI.validate(history)); assert.deepEqual(CI.runTone(history.runs[0]), {state: "idle", label: "Orphaned"});
 });

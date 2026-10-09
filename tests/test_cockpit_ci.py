@@ -602,6 +602,9 @@ class ProviderTests(unittest.TestCase):
     def test_an_orphaned_rerun_keeps_its_earlier_attempts_unsuperseded_failure_actionable(self):
         row = failed_rerun_orphan()['data']['runs'][0]
         self.assertTrue(row['orphaned']); self.assertTrue(row['actionable']); self.assertEqual(row['current_head'], True)
+        self.assertNotIn('never started', row['reason'] or '', 'an actionable failure keeps its own diagnosis')
+        self.assertEqual(row['reason'], group_runs(REPO, [{**orphan_run(sha=SHA), 'status': 'completed', 'conclusion': 'failure'}],
+                                                   {'30': [normalize_job(raw_job(300, 100))]}, supersede([normalize_check(REPO, raw_check(100), {})]), {'7': SHA})[0][0]['reason'])
         self.assertEqual([job['attempt'] for job in row['jobs']], ['1'])
 
     def test_a_recheck_that_finds_a_job_retires_the_cached_orphan(self):
