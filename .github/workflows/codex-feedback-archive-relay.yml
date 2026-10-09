@@ -329,6 +329,12 @@ jobs:
               published_lease=true
             fi
           fi
+          if ! verified_existing=$(printf '%s' "$existing" \
+            | python3 scripts/workflow/verified-relay-markers.py --repo "$REPO" --pr "$PR_NUMBER"); then
+            echo "::warning::Relay provenance is unavailable; publishing a PR-head failure rather than retaining stale clearance."
+            verified_existing='[]'
+          fi
+          existing="$verified_existing"
           if [ "$published_lease" = true ] && jq -e --arg body "$complete" \
             'any(.[]; (.user.login // "") == "github-actions[bot]" and (.body // "") == $body)' \
             <<<"$existing" >/dev/null; then
@@ -365,6 +371,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.source.outputs.pr }}
           SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
+          PUBLISHER_RUN_ID: ${{ github.run_id }}
           ARTIFACT_ID: ${{ steps.artifact.outputs.id }}
           EXPECTED_IS_FORK: ${{ steps.source.outputs.is_fork }}
           EXPECTED_PR_ACTOR: ${{ steps.source.outputs.pr_actor }}
@@ -398,8 +405,10 @@ jobs:
                   # supposed to restore the record, and the cleanup then wrote a
                   # permanent failure marker instead. The unprivileged handoff can
                   # also manufacture this shape; preserving it is the explicit
-                  # #1053 residual documented in review_feedback_accounting.md.
-                  test("^<!-- mergepath-feedback-archive-relay:v1 run=[0-9]+ status=(complete|failed) -->$")
+                  # retained payload risk documented in review_feedback_accounting.md;
+                  # completion readers independently verify real relay provenance.
+                  test("^<!-- mergepath-feedback-archive-relay:v1 run=[0-9]+ status=(complete|failed) -->$") or
+                  test("^<!-- mergepath-feedback-archive-relay:v2 run=[0-9]+ publisher=[0-9]+ status=complete -->$")
                 ))
             ' "$HANDOFF_FILE" >/dev/null
           # The artifact's head belongs to the historical source event. It is
@@ -496,7 +505,7 @@ jobs:
             fi
           fi
 
-          marker="<!-- mergepath-feedback-archive-relay:v1 run=$SOURCE_RUN_ID status=complete -->"
+          marker="<!-- mergepath-feedback-archive-relay:v2 run=$SOURCE_RUN_ID publisher=$PUBLISHER_RUN_ID status=complete -->"
           existing=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" | jq -s 'add // []')
           if ! jq -e --arg body "$marker" 'any(.[]; (.body // "") == $body)' \
             <<<"$existing" >/dev/null; then
@@ -508,7 +517,15 @@ jobs:
             -f status=completed -f conclusion="$conclusion" \
             -f "output[title]=$title" -f "output[summary]=${output:0:60000}" \
             >/dev/null
-          gh api --method DELETE "repos/$REPO/actions/artifacts/$ARTIFACT_ID" >/dev/null
+
+      - name: Retire the published handoff artifact
+        if: ${{ success() && steps.persist.outputs.check_id != '' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ARTIFACT_ID: ${{ steps.artifact.outputs.id }}
+        run: gh api --method DELETE "repos/$REPO/actions/artifacts/$ARTIFACT_ID" >/dev/null
 
       - name: Close an abandoned read-only relay lease
         if: >-
@@ -532,20 +549,28 @@ jobs:
           fi
           latest_status=""
           if [ "$marker_rc" -eq 0 ]; then
-            latest_status=$(printf '%s' "$comments" | jq -r --argjson run "$SOURCE_RUN_ID" '
+            verified_comments='[]'
+            if ! verified_comments=$(printf '%s' "$comments" \
+              | python3 scripts/workflow/verified-relay-markers.py \
+                --repo "$REPO" --pr "$PR_NUMBER"); then
+              echo "::warning::Relay provenance is unavailable; publishing a PR-head failure rather than retaining stale clearance"
+              marker_rc=1
+            else
+              latest_status=$(printf '%s' "$verified_comments" | jq -r --argjson run "$SOURCE_RUN_ID" '
               [
                 .[]
                 | select(.user.login == "github-actions[bot]")
                 | . as $comment
                 | ((.body // "")
-                  | try capture("^<!-- mergepath-feedback-archive-relay:v1 run=(?<run>[0-9]+) status=(?<status>complete|failed) -->$")
+                  | try capture("^<!-- mergepath-feedback-archive-relay:v(?:1|2) run=(?<run>[0-9]+)(?: publisher=[0-9]+)? status=(?<status>complete|failed) -->$")
                     catch null) as $marker
                 | select($marker != null and ($marker.run | tonumber) == $run)
                 | {status:$marker.status,created_at:($comment.created_at // ""),id:$comment.id}
               ]
               | sort_by(.created_at, .id)
               | (last.status // "")
-            ') || marker_rc=$?
+              ') || marker_rc=$?
+            fi
           fi
           if [ "$marker_rc" -eq 0 ] && [ "$latest_status" != complete ] \
             && [ "$latest_status" != failed ]; then

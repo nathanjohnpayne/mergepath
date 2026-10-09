@@ -10,6 +10,7 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
+  actions: read # review accounting authenticates relay workflow, job and log evidence
   pull-requests: write
   contents: write
   # Required for the immediate-squash fallback's scripts/review-feedback-

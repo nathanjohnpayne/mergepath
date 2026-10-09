@@ -263,10 +263,29 @@ if [ "$endpoint" = --paginate ] && [ "${3:-}" = repos/owner/repo/issues/1/commen
   if [ "${RELAY_MODE:-empty}" = empty ]; then
     echo '[]'
   else
-    echo '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-feedback-archive-relay:v1 run=501 status=complete -->"}]'
+    echo '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-feedback-archive-relay:v2 run=501 publisher=900 status=complete -->"}]'
   fi
   exit 0
 fi
+case "${@: -1}" in
+  repos/owner/repo/actions/workflows/codex-feedback-archive-relay.yml)
+    echo '{"id":89,"path":".github/workflows/codex-feedback-archive-relay.yml"}'; exit 0 ;;
+  repos/owner/repo/actions/runs/900)
+    echo '{"id":900,"workflow_id":89,"event":"workflow_run","path":".github/workflows/codex-feedback-archive-relay.yml","head_branch":"main","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repository":{"full_name":"owner/repo"}}'; exit 0 ;;
+  repos/owner/repo/actions/runs/900/jobs\?filter=all\&per_page=100)
+    echo '[{"jobs":[{"id":901,"run_id":900,"steps":[{"name":"Persist archive and publish the exact-head gate","conclusion":"success"}]}]}]'; exit 0 ;;
+  repos/owner/repo/actions/jobs/901/logs)
+    cat <<'LOG'
+##[group]Run set -euo pipefail
+  shell: /usr/bin/bash -e {0}
+  env:
+    PR_NUMBER: 1
+    SOURCE_RUN_ID: 501
+    HANDOFF_FILE: /tmp/handoff/codex-p1-read-only-handoff.json
+##[endgroup]
+LOG
+    exit 0 ;;
+esac
 if [[ "$endpoint" =~ ^repos/[^/]+/[^/]+/pulls/([0-9]+)$ ]]; then
   pr="${BASH_REMATCH[1]}"
   count_file="$FIXTURE_LOG/pull-$pr.count"
@@ -427,6 +446,7 @@ for relay_mode in empty all-terminal pending; do
   dir="$TMP/sweep-relay-$relay_mode"
   make_sweep_fixture "$dir"
   mkdir -p "$dir/scripts/workflow"
+  cp "$ROOT/scripts/workflow/verified-relay-markers.py" "$dir/scripts/workflow/"
   cat > "$dir/scripts/workflow/feedback-archive-relay-source.sh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail

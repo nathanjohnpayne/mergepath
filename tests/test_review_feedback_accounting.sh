@@ -88,6 +88,20 @@ case "$endpoint" in
 esac
 
 case "$endpoint" in
+  repos/acme/widget)
+    printf '{"default_branch":"main"}\n' ;;
+  repos/acme/widget/actions/runs/12345)
+    printf '{"created_at":"2026-08-18T19:00:00Z","updated_at":"2026-08-18T19:01:00Z"}\n' ;;
+  repos/acme/widget/actions/workflows/codex-feedback-archive-relay.yml)
+    printf '{"id":444,"path":".github/workflows/codex-feedback-archive-relay.yml"}\n' ;;
+  repos/acme/widget/actions/workflows/codex-feedback-archive-relay.yml/runs\?*)
+    printf '[{"workflow_runs":[{"id":9876,"conclusion":"success","created_at":"2026-08-18T19:01:00Z","workflow_id":444,"event":"workflow_run","path":".github/workflows/codex-feedback-archive-relay.yml","head_branch":"main","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repository":{"full_name":"acme/widget"}}]}]\n' ;;
+  repos/acme/widget/actions/runs/9876)
+    printf '{"id":9876,"workflow_id":444,"event":"workflow_run","path":".github/workflows/codex-feedback-archive-relay.yml","head_branch":"main","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repository":{"full_name":"acme/widget"}}\n' ;;
+  repos/acme/widget/actions/runs/9876/jobs\?*)
+    printf '[{"jobs":[{"id":9877,"run_id":9876,"steps":[{"name":"Persist archive and publish the exact-head gate","conclusion":"success"}]}]}]\n' ;;
+  repos/acme/widget/actions/jobs/9877/logs)
+    printf '##[group]Run set -euo pipefail\n  env:\n    PR_NUMBER: 7\n    SOURCE_RUN_ID: 12345\n    HANDOFF_FILE: /tmp/handoff/codex-p1-read-only-handoff.json\n##[endgroup]\n' ;;
   repos/acme/widget*/pulls/7)
     cat "$GH_FIXTURE_DIR/pull.json"
     ;;
@@ -209,6 +223,21 @@ reset_fixtures
 run_gate
 assert_eq 0 "$RUN_RC" "empty review history clears"
 assert_eq clear "$(printf '%s' "$RUN_JSON" | jq -r '.status')" "empty history emits clear status"
+
+# The entrypoint must refuse an unavailable Python runtime before API reads.
+cat >"$TMP/bin/python3" <<'PYTHON'
+#!/usr/bin/env bash
+exit 127
+PYTHON
+chmod +x "$TMP/bin/python3"
+: >"$TMP/gh-calls.log"
+run_gate
+assert_eq 2 "$RUN_RC" "missing Python runtime is a dependency error"
+assert_match 'Python 3 is required' "$RUN_ERR" "runtime error names the required interpreter"
+assert_eq '' "$(cat "$TMP/gh-calls.log")" "missing interpreter performs no GitHub reads"
+rm "$TMP/bin/python3"
+reset_fixtures
+run_gate
 assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "empty history reports zero posted findings"
 
 cat >"$TMP/fixtures/issues.json" <<'JSON'
@@ -231,7 +260,7 @@ assert_match 'runs are rerunnable for 30 days' "$RUN_ERR" "relay recovery states
 assert_match 'PR remains blocked and requires owner intervention' "$RUN_ERR" "unavailable relay recovery preserves the block"
 run_gate ambient override "$SCRIPT" 'acme/widget; touch /tmp/relay-command-injection'
 assert_eq 2 "$RUN_RC" "shell-sensitive repository name still blocks the relay"
-assert_match 'repos/acme/widget\\;\\ touch\\ /tmp/relay-command-injection/actions/runs/12345/rerun' "$RUN_ERR" "relay recovery shell-quotes the repository in its command"
+assert_match 'valid repository and PR required' "$RUN_ERR" "relay provenance rejects shell-sensitive repository selectors before lookup"
 jq '. + [{
   "id": 3,
   "created_at": "2026-08-18T19:01:00Z",
@@ -385,6 +414,7 @@ AUTHOR_CHECKOUT="$TMP/author-checkout"
 mkdir -p "$AUTHOR_CHECKOUT/scripts/workflow" "$AUTHOR_CHECKOUT/.github"
 cp "$SCRIPT" "$AUTHOR_CHECKOUT/scripts/review-feedback-accounting.sh"
 cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$AUTHOR_CHECKOUT/scripts/workflow/resolve_base_policy.sh"
+cp "$ROOT/scripts/workflow/verified-relay-markers.py" "$AUTHOR_CHECKOUT/scripts/workflow/verified-relay-markers.py"
 cp -R "$ROOT/scripts/lib" "$AUTHOR_CHECKOUT/scripts/lib"
 cp "$TMP/review-policy.yml" "$AUTHOR_CHECKOUT/.github/review-policy.yml"
 git -C "$AUTHOR_CHECKOUT" init -q -b feature
@@ -398,6 +428,7 @@ TRUSTED_CHECKOUT="$TMP/trusted-default-checkout"
 mkdir -p "$TRUSTED_CHECKOUT/scripts/workflow" "$TRUSTED_CHECKOUT/.github"
 cp "$SCRIPT" "$TRUSTED_CHECKOUT/scripts/review-feedback-accounting.sh"
 cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$TRUSTED_CHECKOUT/scripts/workflow/resolve_base_policy.sh"
+cp "$ROOT/scripts/workflow/verified-relay-markers.py" "$TRUSTED_CHECKOUT/scripts/workflow/verified-relay-markers.py"
 cp -R "$ROOT/scripts/lib" "$TRUSTED_CHECKOUT/scripts/lib"
 cp "$TMP/review-policy.yml" "$TRUSTED_CHECKOUT/.github/review-policy.yml"
 git -C "$TRUSTED_CHECKOUT" init -q -b main

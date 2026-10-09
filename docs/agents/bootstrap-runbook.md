@@ -18,6 +18,8 @@ Do NOT use the wizard for:
 
 ## Quick start
 
+Install `gh`, `op`, `git`, mikefarah `yq`, `rsync` and Python 3 before running the wizard. Python 3 is also required by the installed review accounting and relay provenance tools, even when `yq` supplies YAML parsing. Preflight rejects a missing dependency before creating the repository.
+
 ```bash
 # From mergepath's worktree root, on main, clean.
 eval "$(scripts/op-preflight.sh --agent claude --mode all)"   # cache PATs
@@ -188,7 +190,7 @@ Per stage, the most common failures and their recovery paths:
 
 ### Preflight
 
-- **Missing dependency** (`gh`, `op`, `git`, `yq`, `rsync`, or `firebase`/`gcloud` when Firebase is enabled): exit 2 with `missing required dependency: <tool>`. Install the tool and re-run.
+- **Missing dependency** (`gh`, `op`, `git`, `yq`, `python3`, `rsync`, or `firebase`/`gcloud` when Firebase is enabled): exit 2 with `missing required dependency: <tool>`. Install the tool and re-run.
 - **Dirty target dir**: exit 2 with `target dir X is not empty`. Wipe the dir or pick a different name; the wizard refuses to overwrite. Relaxed on a `--resume` run whose target already holds a `.bootstrap-state` file — a resume re-enters a tree the earlier stages populated on purpose. A populated dir with no state file is still refused, resume or not.
 - **Existing remote**: exit 2 with `remote already exists`. The repo's already there; the wizard refuses to bootstrap over it. Relaxed on a `--resume` run only when `.bootstrap-state.checkpoints` records that this bootstrap created *that exact* `owner/name` itself; absent a matching checkpoint the check still fails closed (#761).
 - **Mergepath not on main / dirty**: exit 2 with a guidance line. Switch mergepath to main and commit/stash before bootstrapping.

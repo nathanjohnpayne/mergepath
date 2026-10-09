@@ -71,6 +71,8 @@ case "$PR_NUMBER" in
   ''|*[!0-9]*) die 2 "PR_NUMBER must be an integer; got '$PR_NUMBER'" ;;
 esac
 [ -n "${GH_TOKEN:-}" ] || die 2 "GH_TOKEN is required"
+command -v python3 >/dev/null 2>&1 && python3 --version >/dev/null 2>&1 \
+  || die 2 "Python 3 is required for authenticated relay provenance; install it before running review accounting"
 
 REPO="${2:-}"
 if [ -z "$REPO" ]; then
@@ -232,7 +234,9 @@ PR_HEAD_IS_FORK=$(printf '%s' "$PR_OBJECT" | jq -r '
 # stale failure could invent a permanent block). Presence of a completion is the
 # durable fact — the archive it records cannot be un-persisted by a later rerun
 # that no longer finds its artifact — and presence is immune to reordering.
-RELAY_FAILURE_RUN=$(printf '%s' "$ISSUE_COMMENTS" | jq -r '
+RELAY_COMMENTS=$(printf '%s' "$ISSUE_COMMENTS" | python3 "$SCRIPT_DIR/workflow/verified-relay-markers.py" \
+  --repo "$REPO" --pr "$PR_NUMBER") || die 2 "could not verify feedback relay provenance"
+RELAY_FAILURE_RUN=$(printf '%s' "$RELAY_COMMENTS" | jq -r '
   [
     .[]
     | select(.user.login == "github-actions[bot]")

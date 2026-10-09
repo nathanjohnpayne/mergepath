@@ -380,7 +380,7 @@ preflight() {
   #    on macOS and most Linux distros, but we gate explicitly so a
   #    minimal CI image fails preflight instead of failing mid-stage.
   if [ "${BOOTSTRAP_SKIP_TOOL_CHECK:-0}" != "1" ]; then
-    for tool in gh op git yq rsync; do
+    for tool in gh op git yq rsync python3; do
       if ! command -v "$tool" >/dev/null 2>&1; then
         bootstrap::wizard_err "missing required dependency: $tool"
         violations=$((violations + 1))
