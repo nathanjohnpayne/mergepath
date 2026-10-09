@@ -440,7 +440,7 @@ for anchored_kind in none review verdict; do
     review) CODEX_REVIEW_TIME=2026-07-01T10:00:00Z ;;
     verdict) CODEX_HEAD_VERDICT_ANY_TIME=2026-07-01T10:00:00Z ;;
   esac
-  LATEST_THUMBS_TIME=2999-01-01T00:00:00Z
+  LATEST_THUMBS_UP_TIME=2999-01-01T00:00:00Z
   eval "$SIGNAL_BLOCK"
   wanted="$anchored_kind"; [ "$wanted" != none ] || wanted=""
   if [ "$LATEST_SIGNAL_KIND" = "$wanted" ]; then

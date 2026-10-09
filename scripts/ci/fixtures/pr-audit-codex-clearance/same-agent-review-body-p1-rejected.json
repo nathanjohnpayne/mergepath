@@ -1,0 +1,25 @@
+{
+  "description": "Blocking review-body finding cannot supply same-agent approval",
+  "expected_cleared": false,
+  "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
+  "codex_bot_login": "chatgpt-codex-connector[bot]",
+  "merged_at": "2026-05-12T10:30:00Z",
+  "reviews": [
+    {
+      "id": 1001,
+      "state": "COMMENTED",
+      "commit_id": "deadbeefcafe1234567890abcdef1234567890ab",
+      "submitted_at": "2026-05-12T10:00:00Z",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]"
+      },
+      "body": "**P1 blocking finding**"
+    }
+  ],
+  "inline_comments": [],
+  "review_threads": [],
+  "authoring_agent": "codex",
+  "reviewer_accounts": [
+    "nathanpayne-codex"
+  ]
+}

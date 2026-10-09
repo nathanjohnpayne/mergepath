@@ -485,7 +485,7 @@ fi
 # this the composite returns 1 for a gate-(b) reason on essentially every
 # first evaluation, the barrier reads permanent NOT-YET, and it can never
 # open. Where it happens to return 0, that is gate (b) branch 2 clearing on a
-# a Codex verdict or carry-forward, which answers a different question.
+# Codex verdict or carry-forward, which answers a different question.
 #
 # Default behaviour is byte-identical: without the flag, nothing changes.
 # Deliberately NOT combinable with a merge decision — a caller passing it is
@@ -2508,7 +2508,8 @@ if [ -z "$APPROVING_REVIEWER" ]; then
   # gate (b) by branch 1 unless a second agent (cursor / codex CLI)
   # reviews independently. In a single-agent session that's friction
   # with no policy benefit when Codex is enabled — Codex's external
-  # review IS the cross-agent signal. Accept an exact-head review or
+  # review IS the cross-agent signal. Accept an exact-head review with no
+  # root P0/P1 findings (even resolved ones do not make it affirmative), or an
   # affirmative anchored verdict only when codex.enabled=true and the
   # Authoring-Agent matches an available reviewer identity. Gate (c)
   # independently checks required findings from that substantive run.
@@ -2522,8 +2523,18 @@ if [ -z "$APPROVING_REVIEWER" ]; then
     log "gate (b): same-agent anchored Codex fallback unavailable because codex.enabled=false"
   elif [ -n "$SAME_AGENT_REVIEWER" ]; then
     log "gate (b): no reviewer-identity APPROVED, but same-agent author/reviewer detected (Authoring-Agent: $AUTHORING_AGENT → $SAME_AGENT_REVIEWER); checking for anchored Codex fallback per #170"
-    GATE_B_CODEX_REVIEW=$(crc_select_head_review "$REVIEWS_JSON" "$BOT_LOGIN" "$HEAD_SHA" "$COMMENTS_JSON" | jq -r --arg sha "$HEAD_SHA" '
-      if . != null and .state == "COMMENTED" and ($sha | test("^[0-9a-f]{40}$")) then .submitted_at else "" end')
+    GATE_B_CODEX_REVIEW=$({
+      crc_select_head_review "$REVIEWS_JSON" "$BOT_LOGIN" "$HEAD_SHA" "$COMMENTS_JSON"
+      printf '%s\n' "$COMMENTS_JSON"
+    } | jq -s -r --arg sha "$HEAD_SHA" --arg bot "$BOT_LOGIN" '
+      .[0] as $review | .[1] as $comments
+      | if length == 2 and $review != null and $review.state == "COMMENTED"
+          and ($sha | test("^[0-9a-f]{40}$"))
+          and (($review.body // "") | test("!\\[P[01] Badge\\]|\\*\\*P[01]") | not)
+          and ([ $comments[] | select(.user.login == $bot and .in_reply_to_id == null
+            and .pull_request_review_id == $review.id)
+            | select((.body // "") | test("!\\[P[01] Badge\\]|\\*\\*P[01]")) ] | length) == 0
+        then $review.submitted_at else "" end')
     if [ -n "$GATE_B_CODEX_REVIEW" ]; then
       log "gate (b): same-agent + exact-head Codex review @ $GATE_B_CODEX_REVIEW — branch 2 cleared (#1751)"
       APPROVING_REVIEWER="(branch 2: same-agent + exact-head Codex review)"

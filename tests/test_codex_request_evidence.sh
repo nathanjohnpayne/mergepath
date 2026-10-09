@@ -48,7 +48,7 @@ case "$1" in
   repos/owner/repo/issues/comments/124/reactions) echo '[]' ;;
   repos/owner/repo/issues/99/reactions) printf '%s\n' "$ISSUE_REACTIONS" ;;
   repos/owner/repo/issues/99/timeline) [ "${TIMESTAMP_READS_FAIL:-0}" != 1 ] || exit 1; echo '[]' ;;
-  repos/owner/repo/pulls/99/comments) [ "${INLINE_COMMENTS_FAIL:-0}" != 1 ] || exit 1; echo '[]' ;;
+  repos/owner/repo/pulls/99/comments) [ "${INLINE_COMMENTS_FAIL:-0}" != 1 ] || exit 1; printf '%s\n' "${INLINE_COMMENTS_JSON:-[]}" ;;
   graphql) echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}' ;;
   *) echo "unexpected $*" >&2; exit 99 ;;
 esac
@@ -420,6 +420,31 @@ for mode in disabled readiness; do
     cat "$DIR/calls"; echo 'FAIL readiness depends on timestamp-only reads'; exit 1
   fi
   PASS=$((PASS + 1)); echo "PASS: $mode skips irrelevant API reads"
+done
+
+# A findings-bearing review is not an affirmative approval substitute,
+# even after the author replies; discretionary findings still allow it.
+printf '[]\n' >"$DIR/comments"
+for shape in badge text review-body; do
+for tier in P0 P1 P2; do
+  finding="![${tier} Badge] finding"
+  [ "$shape" = badge ] || finding="**$tier finding**"
+  printf '%s\n' "$REVIEW" >"$DIR/reviews"
+  inline=$(jq -cn --arg finding "$finding" '[{id:5001,pull_request_review_id:789,user:{login:"chatgpt-codex-connector[bot]"},body:$finding},{id:5002,pull_request_review_id:789,in_reply_to_id:5001,user:{login:"nathanpayne-codex"},body:"Rebutted and resolved."}]')
+  if [ "$shape" = review-body ]; then
+    printf '%s\n' "$REVIEW" | jq --arg finding "$finding" '.[0].body=$finding' >"$DIR/reviews"
+    inline='[]'
+  fi
+  expected=1; [ "$tier" != P2 ] || expected=0
+  : >"$DIR/calls"; rc=0
+  PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=blocking-roots \
+    INLINE_COMMENTS_JSON="$inline" PR_BODY='Authoring-Agent: codex' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+    MERGEPATH_REVIEW_POLICY_PATH="$DIR/default-policy.yml" \
+    bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/out" 2>&1 || rc=$?
+  if [ "$rc" != "$expected" ]; then cat "$DIR/out"; echo "FAIL $shape $tier approval substitute rc=$rc"; exit 1; fi
+  if [ "$tier" != P2 ] && ! grep -q 'no reviewer identity' "$DIR/out"; then cat "$DIR/out"; exit 1; fi
+  PASS=$((PASS + 1)); echo "PASS: $shape $tier approval-substitute boundary"
+done
 done
 
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"

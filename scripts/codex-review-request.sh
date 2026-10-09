@@ -799,8 +799,8 @@ log "ack_wait = ${ACK_WAIT_SECONDS}s    max_ack_retries = $MAX_ACK_RETRIES"
 # --- Codex signal scan ------------------------------------------------------
 
 # Scan for (a) a review from the bot on the current HEAD commit, (b) inline
-# findings from the bot on the current HEAD, (c) an anchored issue verdict
-# dated after the HEAD committer date. Returns a JSON object to stdout on
+# findings from the bot on the current HEAD, (c) an issue verdict anchored by
+# its Reviewed commit field. Returns a JSON object to stdout on
 # success. Emits empty object { "review": null, "findings": [], "reaction": null }
 # if nothing matches yet.
 scan_codex_state() {
@@ -950,7 +950,9 @@ scan_codex_state() {
   fi
 
   printf '%s\n' "$review" "$findings" "$reaction" "$verdict" "$blocked" | jq -s '
-    { review: .[0], findings: .[1], reaction: .[2], verdict: .[3], blocked: .[4] }
+    if length != 5 then error("incomplete Codex scan components") else
+      { review: .[0], findings: .[1], reaction: .[2], verdict: .[3], blocked: .[4] }
+    end
   '
 }
 

@@ -599,13 +599,6 @@ jobs:
                   }
                 }
 
-                // Reaction: Codex bot 👍/+1 in the merge-time window. Needs
-                // only `reactions` (always fetched, no fail-closed sentinel)
-                // — NOT gated on sameAgentContext (#612 round 4): a
-                // cross-agent PR's 👍 must still count as "a newer Codex
-                // signal exists" for the staleness guard, even though it
-                // cannot itself substitute for gate (b) without an
-                // independent CLI approval (mirrors the verdict fix).
                 // Review: latest Codex COMMENTED review on HEAD. The
                 // review's own existence/timestamp needs only
                 // codexCommentedOnHead (always computed) — NOT inlineComments
@@ -678,12 +671,18 @@ jobs:
                   // (#449 + #460).
                   const p01Regex = /!\[P[01] Badge\]/;
                   let reviewHasUnresolvedP01 = false;
+                  let reviewHasBlockingRoots = false;
                   if (latestCodexReview) {
                     const p01 = inlineComments.filter(
                       c => c.user && c.user.login === codexBotLogin &&
                            c.pull_request_review_id === latestCodexReview.id &&
                            p01Regex.test(c.body || '')
                     );
+                    const blockingReviewRegex = /!\[P[01] Badge\]|\*\*P[01]/;
+                    reviewHasBlockingRoots = blockingReviewRegex.test(latestCodexReview.body || '') ||
+                      inlineComments.some(c => c.user && c.user.login === codexBotLogin &&
+                        c.pull_request_review_id === latestCodexReview.id && !c.in_reply_to_id &&
+                        blockingReviewRegex.test(c.body || ''));
                     if (resolutionByCommentId === null) {
                       reviewHasUnresolvedP01 = p01.length > 0; // fail closed
                     } else {
@@ -740,7 +739,8 @@ jobs:
                   // An anchored review or affirmative verdict substitutes for reviewer
                   // approval only with same-agent context or an existing
                   // independent CLI approval.
-                  const gateBSatisfied = sameAgentContext || cliApprovedReviews.length > 0;
+                  const gateBSatisfied = cliApprovedReviews.length > 0 ||
+                    (sameAgentContext && (latestKind !== 'review' || !reviewHasBlockingRoots));
                   if (latestKind === 'review') {
                     codexCleared = gateBSatisfied && !reviewHasUnresolvedP01;
                   } else if (latestKind === 'verdict') {

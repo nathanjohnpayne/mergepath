@@ -209,10 +209,6 @@ if (codexEnabled && issueComments !== null) {
   }
 }
 
-// Reaction: needs only the reactions array. NOT gated on sameAgentContext
-// for the timestamp (round 4) — a cross-agent thumbs-up still counts as a
-// newer Codex signal even though it cannot itself substitute for gate b
-// alone.
 // Review: needs only codexCommentedOnHead. NOT gated on inlineComments
 // (round 4) for the timestamp — only the P0/P1 cleanliness check below
 // needs inline comments.
@@ -234,12 +230,18 @@ if (codexEnabled && inlineComments !== null && codexCommentedOnHead.length > 0) 
 if (codexEnabled && inlineComments !== null && issueComments !== null) {
   const p01Regex = /!\[P[01] Badge\]/;
   let reviewHasUnresolvedP01 = false;
+  let reviewHasBlockingRoots = false;
   if (latestCodexReview) {
     const p01 = inlineComments.filter(
       c => c.user && c.user.login === codexBotLogin &&
            c.pull_request_review_id === latestCodexReview.id &&
            p01Regex.test(c.body || '')
     );
+    const blockingReviewRegex = /!\[P[01] Badge\]|\*\*P[01]/;
+    reviewHasBlockingRoots = blockingReviewRegex.test(latestCodexReview.body || '') ||
+      inlineComments.some(c => c.user && c.user.login === codexBotLogin &&
+        c.pull_request_review_id === latestCodexReview.id && !c.in_reply_to_id &&
+        blockingReviewRegex.test(c.body || ''));
     if (resolutionByCommentId === null) {
       reviewHasUnresolvedP01 = p01.length > 0; // fail closed
     } else {
@@ -274,8 +276,7 @@ if (codexEnabled && inlineComments !== null && issueComments !== null) {
   }
 
   // Latest-signal-wins among THREE signal types (#612), using the
-  // UNCONDITIONAL timestamps computed above (round 4). Ties resolve
-  // reaction < review < verdict.
+  // Unconditional anchored timestamps computed above. Verdict wins ties.
   let latestKind = '';
   let latestTime = '';
   for (const [kind, time] of [
@@ -287,11 +288,10 @@ if (codexEnabled && inlineComments !== null && issueComments !== null) {
       latestTime = time;
     }
   }
-  // Both reaction and verdict clear only when same-agent OR an
-  // independent CLI approval already exists, round 3, extended to
-  // reaction in round 4. Review clearance has never required
-  // same-agent, pre-existing and out of scope.
-  const gateBSatisfied = sameAgentContext || hasIndependentCliApproval;
+  // Same-agent approval substitution requires an affirmative review or
+  // verdict; an independent CLI approval supplies its own cross-agent signal.
+  const gateBSatisfied = hasIndependentCliApproval ||
+    (sameAgentContext && (latestKind !== 'review' || !reviewHasBlockingRoots));
   if (latestKind === 'review') {
     codexCleared = gateBSatisfied && !reviewHasUnresolvedP01;
   } else if (latestKind === 'verdict') {
@@ -332,7 +332,7 @@ for fixture in "$FIXTURES_DIR"/*.json; do
 done
 
 # Execute the production timestamp block, including its failure fallback.
-node - "$WORKFLOW" <<'NODE'
+if node - "$WORKFLOW" <<'NODE'
 const fs = require('fs');
 const source = fs.readFileSync(process.argv[2], 'utf8');
 const begin = source.indexOf("                let latestReviewTime = '';");
@@ -356,7 +356,12 @@ if (evaluate([postmerge], null, merged).time !== '')
   throw new Error('post-merge review supplied merge-time evidence');
 console.log('  PASS: production audit retains bounded HEAD timestamps when inline fetch fails');
 NODE
-pass=$((pass + 1))
+then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "  FAIL: production audit timestamp regression" >&2
+fi
 
 # Structural assertion: the workflow contains the load-bearing
 # `p01Regex` literal. If someone refactors the workflow to drop the
