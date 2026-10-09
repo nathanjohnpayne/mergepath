@@ -1702,7 +1702,7 @@ for _ci in "${!TOKENS[@]}"; do
       # real command (which may be a synth cmdsub) follows — stay command position.
       continue
       ;;
-    sudo|eval|time|nohup|env|command|exec|nice|ionice)
+    builtin|sudo|eval|time|nohup|env|command|exec|nice|ionice)
       _synth_prefix="$_stok"
       continue
       ;;
@@ -1766,7 +1766,7 @@ for i in "${!TOKENS[@]}"; do
     [A-Za-z_]*=*)
       continue
       ;;
-    sudo|eval|time|nohup|env|command|exec|nice|ionice)
+    builtin|sudo|eval|time|nohup|env|command|exec|nice|ionice)
       SCAN_CURRENT_PREFIX="$tok"
       continue
       ;;
@@ -1913,6 +1913,8 @@ INLINE_OP_PREFLIGHT_AGENT_SET=0
 GLOBAL_REPO=""
 INLINE_REPO_ENV_SET=0
 STANDALONE_REPO_ENV_SET=0
+SHELL_DIRECTORY_CHANGED=0
+INLINE_DIRECTORY_CHANGED=0
 PR_SUBCOMMAND=""
 PR_SUBCOMMAND_INDEX=-1    # index in TOKENS where the gh pr subcommand was found
 WRAPPER_KIND=""           # "" | "author" | "reviewer"
@@ -2135,7 +2137,18 @@ for i in "${!TOKENS[@]}"; do
       # nathanpayne-codex caught the over-clearing on template PR #76
       # round 1 — `CODEX_CLEARED=1 && gh pr merge` was being cleared
       # even though the assignment was standalone.
+      # Only explicit exports or a direct command prefix grant disagreement
+      # authority. A standalone assignment may be unexported, or may overwrite
+      # an already exported value; neither can fall back to ambient authority.
+      if [ "$SEGMENT_HAS_COMMAND" -eq 0 ] && [ "$INLINE_REVIEW_DISAGREEMENT_SET" -eq 1 ]; then
+        EXPORTED_BREAK_GLASS_REVIEW_DISAGREEMENT="unverifiable"
+        EXPORTED_REVIEW_DISAGREEMENT_SET=1
+      fi
+      INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT=""
+      INLINE_REVIEW_DISAGREEMENT_SET=0
       if [ "$SEGMENT_HAS_COMMAND" -eq 1 ]; then
+        IDENTITY_ENV_CLEARED_FOR_WRAPPER=0
+        INLINE_DIRECTORY_CHANGED=0
         INLINE_REPO_ENV_SET=0
         INLINE_CODEX_CLEARED=""
         INLINE_BREAK_GLASS_ADMIN=""
@@ -2465,7 +2478,7 @@ for i in "${!TOKENS[@]}"; do
       esac
       continue
       ;;
-    sudo|eval|time|nohup|env|command|exec|nice|ionice)
+    builtin|sudo|eval|time|nohup|env|command|exec|nice|ionice)
       # Known prefix command. Stay in command position so the
       # next non-flag token is still treated as the command.
       # Track which prefix we're parsing flags for so we can
@@ -2505,6 +2518,16 @@ for i in "${!TOKENS[@]}"; do
       # over-fix from breaking `time -p`. Keep this shared with
       # the #348 compound pre-scan so both walks classify prefixes
       # identically.
+      if [ "$CURRENT_PREFIX" = env ]; then
+        case "$tok" in
+          -C|--chdir)
+            INLINE_DIRECTORY_CHANGED=1
+            SKIP_PREFIX_VALUE=1
+            PENDING_PREFIX_FLAG="env:chdir"
+            continue ;;
+          -C?*|--chdir=*) INLINE_DIRECTORY_CHANGED=1; continue ;;
+        esac
+      fi
       if prefix_flag_takes_value "$CURRENT_PREFIX" "$tok"; then
         SKIP_PREFIX_VALUE=1
         PENDING_PREFIX_FLAG="$CURRENT_PREFIX:$tok"
@@ -2569,6 +2592,11 @@ for i in "${!TOKENS[@]}"; do
       # boolean to avoid eating `gh`). Stay in command position.
       continue
       ;;
+    cd|pushd|popd)
+      SHELL_DIRECTORY_CHANGED=1
+      AT_COMMAND_POSITION=0
+      SEGMENT_HAS_COMMAND=1
+      continue ;;
     *)
       # An unrelated command (echo, printf, cat, find, etc.).
       # gh-as-an-argument should NOT trigger the hook;
@@ -3379,6 +3407,10 @@ done
 
 # Deferred merging outlives this local snapshot and cannot enforce a later
 # disagreement in repositories without review-state branch protection.
+if [ "$SHELL_DIRECTORY_CHANGED" -eq 1 ] || [ "$INLINE_DIRECTORY_CHANGED" -eq 1 ]; then
+  echo "BLOCKED: command-local directory changes cannot bind repository review reads; set the tool's working directory before invoking the guarded merge." >&2
+  exit 2
+fi
 if [ "$INLINE_REPO_ENV_SET" -eq 1 ] || [ "$STANDALONE_REPO_ENV_SET" -eq 1 ] \
    || [ "$IDENTITY_ENV_CLEARED_FOR_WRAPPER" -eq 1 ]; then
   echo "BLOCKED: command-local GH_REPO or Git repository-discovery changes, including environment resets, cannot bind the hook's repository reads; use an explicit --repo or canonical PR URL with the inherited repository environment." >&2
