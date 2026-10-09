@@ -219,6 +219,13 @@ class ActionsTests(unittest.TestCase):
         for key, value in [('runs',0),('requests',True),('repo','other/repo'),('provenance','x\nsecret'),('window_end',NOW+1)]:
             self.assertIsNone(measured_coefficient({**measurement,key:value},REPO,NOW))
 
+    def test_orphaned_ci_runs_do_not_count_as_queued(self):
+        rows = [{'repo': REPO, 'id': str(identity), 'created_at': NOW - 30000, 'status': 'queued', 'conclusion': None,
+                 'checks': [], 'orphaned': identity == 1} for identity in (1, 2)]
+        envelope = {'stale': False, 'data': {'schema': 'ci/v1', 'recent_seconds': 10800, 'runs': rows,
+                    'repositories': [{'repo': REPO, 'observed_at': NOW, 'stale': False, 'error': None}]}}
+        self.assertEqual([row['id'] for row in ci_observation(envelope, REPO, NOW)['queued']], [2])
+
     def test_installation_message_requires_failed_recent_bound_run(self):
         rows = run_rows([run(1,conclusion='failure',message='API rate limit exceeded for installation 7'),run(2,conclusion='failure'),run(3,message='API rate limit exceeded for installation'),run(4,created=NOW-3601,conclusion='failure',message='API rate limit exceeded for installation')],REPO,NOW)
         self.assertEqual([r['id'] for r in rows if r['installation_exhausted']],['1'])
