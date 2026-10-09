@@ -1001,7 +1001,7 @@ jobs:
                     | tonumber
                   ]')
                   if jq -e --argjson terminal "$terminal_runs" \
-                    'any(.[] as $run; ($terminal | index($run)) == null)' \
+                    'any(.[]; . as $run | ($terminal | index($run)) == null)' \
                     <<<"$source_runs" >/dev/null; then
                     relay_pending=true
                   fi
