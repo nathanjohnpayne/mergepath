@@ -154,5 +154,32 @@ printf 'tampered PR bytes\n' >>"$WORK/wave-input/pr.diff"
 if p4b_revalidate_input fixture/repo 1753 "$WORK/wave-input"; then
  fail 'tampered complete PR diff accepted'
 else pass 'curated review also fences the complete canary diff digest'; fi
+# Exercise the real collector's allocation failure without provider access.
+export INPUT_REAL_MKTEMP="$(command -v mktemp)"
+cat > "$WORK/bin/mktemp" <<'SH'
+#!/usr/bin/env bash
+case "$*" in *p4b-evidence-input.*) exit 1 ;; esac
+exec "$INPUT_REAL_MKTEMP" "$@"
+SH
+cat > "$WORK/bin/evidence-codex" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = --version ] || exit 99
+printf 'fixture-codex 1\n'
+SH
+chmod +x "$WORK/bin/mktemp" "$WORK/bin/evidence-codex"
+printf '{"auth_mode":"chatgpt"}\n' > "$WORK/evidence-auth.json"
+printf 'phase_4b_automation: {enabled: true}\n' > "$WORK/evidence-policy.yml"
+cp "$WORK/gh-calls" "$WORK/gh-calls-before-evidence"
+rc=0
+out=$(env -u OPENAI_API_KEY -u CODEX_API_KEY -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
+  MERGEPATH_REVIEW_POLICY_PATH="$WORK/evidence-policy.yml" P4B_CODEX_AUTH_FILE="$WORK/evidence-auth.json" \
+  CODEX_BIN="$WORK/bin/evidence-codex" CLAUDE_BIN="$WORK/missing-claude" \
+  bash "$ROOT/scripts/phase-4b/collect-enablement-evidence.sh" --json --pr 1753 --repo fixture/repo) || rc=$?
+if [ "$rc" = 1 ] && printf '%s' "$out" | jq -e '.ready == false and (.adapters.codex.dry_run | contains("immutable PR input unavailable"))' >/dev/null \
+  && cmp -s "$WORK/gh-calls" "$WORK/gh-calls-before-evidence"; then
+ pass 'collector allocation failure emits BLOCKED without GitHub reads or adapter dispatch'
+else fail "collector allocation failure rc=$rc: $out"; fi
+rm "$WORK/bin/mktemp"
+
 printf '\ntest_phase_4b_immutable_input: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]

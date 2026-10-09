@@ -165,20 +165,23 @@ run_dryrun() { # run_dryrun <adapter> <bin-ok>
 # Capture one coherent immutable input for both supported PR-backed probes.
 if [ "$RUN_DRYRUN" != off ] && [ -z "$DIFF_FILE" ] && [ -n "$PR" ] && [ -n "$REPO" ] \
   && { [ "$CODEX_AUTH_OK" = true ] || [ "$CLAUDE_AUTH_OK" = true ]; }; then
-  INPUT_CAPTURE_DIR="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/p4b-evidence-input.XXXXXX")"
-  pair=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha,.base.sha] | join(" ")') || pair=""
-  IFS=' ' read -r input_head input_base input_extra <<EOF
+  if ! INPUT_CAPTURE_DIR="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/p4b-evidence-input.XXXXXX")"; then
+    INPUT_CAPTURE_FAILED=true
+  else
+    pair=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha,.base.sha] | join(" ")') || pair=""
+    IFS=' ' read -r input_head input_base input_extra <<EOF
 $pair
 EOF
-  if [[ "$input_head" =~ ^[0-9a-f]{40}$ && "$input_base" =~ ^[0-9a-f]{40}$ ]] \
-    && [ -z "$input_extra" ] \
-    && p4b_run_with_timeout 90 "$HERE/immutable-input.sh" capture "$REPO" "$PR" "$input_base" "$input_head" "$INPUT_CAPTURE_DIR" \
-    && [ "$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha,.base.sha] | join(" ")')" = "$pair" ] \
-    && p4b_revalidate_input "$REPO" "$PR" "$INPUT_CAPTURE_DIR"; then
-    DIFF_FILE="$INPUT_CAPTURE_DIR/review.diff"
-    INPUT_METADATA="$INPUT_CAPTURE_DIR/input.json"
-  else
-    INPUT_CAPTURE_FAILED=true
+    if [[ "$input_head" =~ ^[0-9a-f]{40}$ && "$input_base" =~ ^[0-9a-f]{40}$ ]] \
+      && [ -z "$input_extra" ] \
+      && p4b_run_with_timeout 90 "$HERE/immutable-input.sh" capture "$REPO" "$PR" "$input_base" "$input_head" "$INPUT_CAPTURE_DIR" \
+      && [ "$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha,.base.sha] | join(" ")')" = "$pair" ] \
+      && p4b_revalidate_input "$REPO" "$PR" "$INPUT_CAPTURE_DIR"; then
+      DIFF_FILE="$INPUT_CAPTURE_DIR/review.diff"
+      INPUT_METADATA="$INPUT_CAPTURE_DIR/input.json"
+    else
+      INPUT_CAPTURE_FAILED=true
+    fi
   fi
 fi
 
