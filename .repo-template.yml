@@ -12,6 +12,8 @@
 spec_test_map:
   merge_review_disagreement:
     - tests/test_gh_pr_guard.sh
+  bootstrap_git_execution:
+    - tests/test_gh_as_author.sh
   cockpit_sync:
     - tests/test_cockpit_sync.py
     - tests/test_cockpit_sync_ui.cjs

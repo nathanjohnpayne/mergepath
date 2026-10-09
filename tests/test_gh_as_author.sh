@@ -1225,6 +1225,129 @@ else
   fail "repo-shipped gh: out=$path_out captured=$([ -e "$WORKDIR/path-captured" ] && echo yes || echo no)"
 fi
 
+# Relative PATH entries must never select the token-bearing git itself.
+# The guard-removed control uses a temporary copy, never mutates source, and
+# proves that the same fake executable would receive the fixture token.
+mkdir -p "$WORKDIR/relative-bin"
+cat >"$WORKDIR/relative-bin/git" <<'RELATIVE_GIT'
+#!/bin/sh
+# TOKEN_OUTPUT_EXEMPT: this harness scrubs ambient credentials and pins a fake token.
+printf '%s' "${OP_PREFLIGHT_AUTHOR_PAT:-${GH_TOKEN:-}}" >"$AUTHOR_PATH_CAPTURE"
+RELATIVE_GIT
+chmod +x "$WORKDIR/relative-bin/git"
+set +e
+relative_git_out="$(cd "$WORKDIR" && PATH="relative-bin:$CRED_DIR:$PATH" AUTHOR_PATH_CAPTURE="$WORKDIR/git-path-captured" \
+  bash -c '. "$1"; gh_author_git_exec ghp_git-path-fixture --version' _ "$ROOT/scripts/lib/gh-token-resolver.sh" 2>&1)"
+relative_git_rc=$?
+set -e
+if [ "$relative_git_rc" -eq 5 ] && [ ! -e "$WORKDIR/git-path-captured" ]; then
+  pass "relative git refuses before the fixture token reaches a child"
+else
+  fail "relative git guard: rc=$relative_git_rc captured=$([ -e "$WORKDIR/git-path-captured" ] && echo yes || echo no)"
+fi
+
+# Drop only the git path check and restore the old bare invocation. Keep the
+# rest of the isolation machinery intact so the control tests this boundary.
+awk '/^gh_author_resolve_git\(\)/ { print "gh_author_resolve_git() { command -v git; }"; skip=1; next }
+     skip && /^}/ { skip=0; next } !skip { print }' \
+  "$ROOT/scripts/lib/gh-token-resolver.sh" >"$WORKDIR/unguarded-git-resolver.sh"
+rm -f "$WORKDIR/git-path-captured"
+(cd "$WORKDIR" && PATH="relative-bin:$CRED_DIR:$PATH" AUTHOR_PATH_CAPTURE="$WORKDIR/git-path-captured" \
+  bash -c '. "$1"; gh_author_git_exec ghp_git-path-fixture --version' _ "$WORKDIR/unguarded-git-resolver.sh")
+if [ "$(cat "$WORKDIR/git-path-captured" 2>/dev/null)" = ghp_git-path-fixture ]; then
+  pass "positive control: removing the git guard exposes the fixture token"
+else
+  fail "relative git positive control did not execute with the fixture token"
+fi
+
+
+# Exercise the real public wrapper with the preflight token already exported.
+# The former transport-only guard ran after three bare validation probes.
+fresh_pushrepo
+rm -f "$WORKDIR/git-path-captured"
+set +e
+preflight_git_out="$(cd "$WORKDIR" && PATH="relative-bin:$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" \
+  AUTHOR_PATH_CAPTURE="$WORKDIR/git-path-captured" OP_PREFLIGHT_AUTHOR_PAT=ghp_author-token \
+  GH_AS_AUTHOR_PUSH_REPO=example/repo "$WRAPPER" -- git -C "$PUSHREPO" push -u origin HEAD 2>&1)"
+preflight_git_rc=$?
+set -e
+if [ "$preflight_git_rc" -eq 5 ] && [ ! -e "$WORKDIR/git-path-captured" ]; then
+  pass "real wrapper: relative Git never runs a validation probe with the exported preflight token"
+else
+  fail "real wrapper preflight Git guard: rc=$preflight_git_rc captured=$([ -e "$WORKDIR/git-path-captured" ] && echo yes || echo no)"
+fi
+# Restore only the old bare validation probes in a temporary library. This
+# control proves the public-wrapper fixture reaches the earlier exposure.
+sed 's/"\$git_bin" -C "\$top" rev-parse/git -C "\$top" rev-parse/g; s/"\$git_bin" config --file/git config --file/g; /git_bin="$(gh_author_resolve_git)" || return 5/d' \
+  "$ROOT/scripts/lib/gh-token-resolver.sh" >"$WORKDIR/unguarded-preflight-resolver.sh"
+# The copied resolver must still locate the production identity checker.
+printf '\ngh_resolver_repo_root() { printf "%%s\\n" %q; }\n' "$ROOT" >>"$WORKDIR/unguarded-preflight-resolver.sh"
+# Source the production wrapper text with just its resolver include redirected.
+sed "s#\. \"\$ROOT/scripts/lib/gh-token-resolver.sh\"#. \"$WORKDIR/unguarded-preflight-resolver.sh\"#" "$WRAPPER" >"$WORKDIR/unguarded-author-wrapper.sh"
+# Preserve its trusted repository root rather than the temporary file's root.
+sed "s#^ROOT=.*#ROOT=\"$ROOT\"#; /gh_wrapper_validate_path || exit 5/d" "$WORKDIR/unguarded-author-wrapper.sh" >"$WORKDIR/unguarded-author-root.sh"
+rm -f "$WORKDIR/git-path-captured"
+set +e
+(cd "$WORKDIR" && PATH="relative-bin:$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" \
+  AUTHOR_PATH_CAPTURE="$WORKDIR/git-path-captured" OP_PREFLIGHT_AUTHOR_PAT=ghp_author-token \
+  GH_AS_AUTHOR_PUSH_REPO=example/repo bash "$WORKDIR/unguarded-author-root.sh" -- git -C "$PUSHREPO" push -u origin HEAD) >/dev/null 2>&1
+set -e
+if [ "$(cat "$WORKDIR/git-path-captured" 2>/dev/null)" = ghp_author-token ]; then
+  pass "positive control: bare pre-push probes expose the exported preflight fixture token"
+else
+  fail "real wrapper preflight control did not reach the vulnerable validation probe"
+fi
+
+# The entry fence protects every command lookup, including env before Git.
+mkdir -p "$WORKDIR/relative-env-bin"
+cat >"$WORKDIR/relative-env-bin/env" <<'ENV_CANARY'
+#!/bin/sh
+# TOKEN_OUTPUT_EXEMPT: ambient credentials scrubbed; fake token pinned below.
+printf '%s' "${OP_PREFLIGHT_AUTHOR_PAT:-}" >"$AUTHOR_PATH_CAPTURE"
+exit 1
+ENV_CANARY
+chmod +x "$WORKDIR/relative-env-bin/env"
+rm -f "$WORKDIR/env-path-captured"
+set +e
+(cd "$WORKDIR" && PATH="relative-env-bin:$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" \
+  AUTHOR_PATH_CAPTURE="$WORKDIR/env-path-captured" OP_PREFLIGHT_AUTHOR_PAT=ghp_author-token \
+  GH_AS_AUTHOR_PUSH_REPO=example/repo "$WRAPPER" -- git -C "$PUSHREPO" push -u origin HEAD) >/dev/null 2>&1
+relative_env_rc=$?
+set -e
+if [ "$relative_env_rc" -eq 5 ] && [ ! -e "$WORKDIR/env-path-captured" ]; then
+  pass "real wrapper: relative env cannot read the exported preflight fixture token"
+else
+  fail "real wrapper relative env guard: rc=$relative_env_rc"
+fi
+# Restoring the old env probes and removing only the entry fence demonstrates
+# the exposure under the same real-wrapper fixture.
+sed 's/unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR; /env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR /g' \
+  "$ROOT/scripts/lib/gh-token-resolver.sh" >"$WORKDIR/unguarded-env-resolver.sh"
+printf '\ngh_resolver_repo_root() { printf "%%s\\n" %q; }\n' "$ROOT" >>"$WORKDIR/unguarded-env-resolver.sh"
+sed "s#^ROOT=.*#ROOT=\"$ROOT\"#; s#\. \"\$ROOT/scripts/lib/gh-token-resolver.sh\"#. \"$WORKDIR/unguarded-env-resolver.sh\"#; /gh_wrapper_validate_path || exit 5/d" "$WRAPPER" >"$WORKDIR/unguarded-env-wrapper.sh"
+set +e
+(cd "$WORKDIR" && PATH="relative-env-bin:$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" \
+  AUTHOR_PATH_CAPTURE="$WORKDIR/env-path-captured" OP_PREFLIGHT_AUTHOR_PAT=ghp_author-token \
+  GH_AS_AUTHOR_PUSH_REPO=example/repo bash "$WORKDIR/unguarded-env-wrapper.sh" -- git -C "$PUSHREPO" push -u origin HEAD) >/dev/null 2>&1
+set -e
+if [ "$(cat "$WORKDIR/env-path-captured" 2>/dev/null)" = ghp_author-token ]; then
+  pass "positive control: unguarded env probes capture the exported preflight fixture token"
+else
+  fail "relative env positive control did not reach the unsafe probe"
+fi
+# Both public wrapper identities share the fence before credential validation.
+for public_wrapper in "$WRAPPER" "$ROOT/scripts/gh-as-reviewer.sh"; do
+  for unsafe_path in 'relative-env-bin' '.' ''; do
+    set +e
+    (cd "$WORKDIR" && PATH="$unsafe_path:$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" \
+      OP_PREFLIGHT_AUTHOR_PAT=ghp_author-token OP_PREFLIGHT_REVIEWER_PAT=ghp_reviewer-token \
+      "$public_wrapper" -- gh pr view 123) >/dev/null 2>&1
+    wrapper_path_rc=$?
+    set -e
+    if [ "$wrapper_path_rc" -eq 5 ]; then pass "$(basename "$public_wrapper"): unsafe PATH '$unsafe_path' refuses at entry"; else fail "wrapper PATH fence rc=$wrapper_path_rc"; fi
+  done
+done
+
 # The trace marker: written after every check, immediately before the gh
 # write; never on a refusal; exit 70 when unwritable; never inherited.
 MARKER="$WORKDIR/reached-marker"
@@ -1269,6 +1392,19 @@ rc=$?
 set -e
 [ "$rc" -eq 1 ] && pass "trace marker with a git payload: refused (the marker means the gh write ran)" \
   || fail "trace marker with git payload: rc=$rc"
+
+reset_log
+set +e
+(cd "$ROOT/scripts" && PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" \
+  GH_AS_AUTHOR_IDENTITY="nathanjohnpayne" OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" \
+  bash gh-as-author.sh -- gh pr comment 123 --body x) >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q $'gh\tpr\tcomment' "$WORKDIR/calls.log"; then
+  pass "basename-only invocation from scripts directory preserves wrapper attribution"
+else
+  fail "basename-only invocation: rc=$rc"
+fi
 
 echo ""
 echo "test_gh_as_author: $PASS passed, $FAIL failed"

@@ -59,7 +59,7 @@ case "${1:-} ${2:-}" in
         echo "${STUB_MERGE_STATE:-CLEAN}"
         echo "${STUB_MERGEABLE:-MERGEABLE}"
         echo "${STUB_ROLLUP_NONGREEN:-0}"
-        echo "https://github.com/example/repo/pull/123"
+        echo "${STUB_PR_URL:-https://github.com/example/repo/pull/123}"
         echo "${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
         echo "${STUB_PR_AUTHOR-nathanjohnpayne}"
         if [ -n "${STUB_LABELS:-}" ]; then
@@ -70,6 +70,15 @@ case "${1:-} ${2:-}" in
     esac
     ;;
   "api --hostname")
+    if [ "${4:-}" = graphql ]; then
+      [ "${STUB_QUEUE_FAILURE:-0}" = 0 ] || exit 1
+      if [ -n "${STUB_QUEUE_JSON:-}" ]; then printf '%s\n' "$STUB_QUEUE_JSON"; exit 0; fi
+      jq -nc --arg url "${STUB_PR_URL:-https://github.com/example/repo/pull/123}" \
+        --arg head "${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
+        --argjson required "${STUB_QUEUE_REQUIRED:-false}" --argjson queued "${STUB_QUEUE_ENTERED:-false}" \
+        '{data:{repository:{pullRequest:{url:$url,headRefOid:$head,isMergeQueueEnabled:$required,isInMergeQueue:$queued}}}}'
+      exit 0
+    fi
     [ "${STUB_REVIEW_FAILURE:-0}" = 0 ] || exit 1
     case "$*" in *"--paginate --slurp"*) ;; *) exit 1 ;; esac
     if [ -n "${STUB_REVIEW_PAGES:-}" ]; then printf '%s\n' "$STUB_REVIEW_PAGES"; else echo '[[]]'; fi
@@ -83,6 +92,11 @@ chmod +x "$STUB_DIR/gh"
 
 run_hook() {
   local cmd="$1"
+  # Existing merge-state fixtures supply the ordinary exact-head precondition.
+  # Explicit missing/mismatched tests below opt out or provide their own flag.
+  if [[ "$cmd" == *'gh pr merge '* && "$cmd" != *'--match-head-commit'* && "${TEST_UNPINNED_MERGE:-0}" = 0 ]]; then
+    cmd="$cmd --match-head-commit ${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+  fi
   local merge_state="${2:-CLEAN}"
   local labels="${3:-}"
   local expected_reviewer="${4:-nathanpayne-claude}"
@@ -134,23 +148,29 @@ review_pages="[[$change_review]]"
 merge_overrides='BREAK_GLASS_ADMIN=1 BREAK_GLASS_MERGE_STATE=1 scripts/gh-as-author.sh -- gh pr merge 123 --admin --squash --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "admin and merge-state overrides do not decide a reviewer disagreement" 2 "nathanpayne-codex" "$merge_overrides" BLOCKED
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "ordinary merge blocks an older-head change request" 2 "bbbbbbbb" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash'
-for new_state in APPROVED DISMISSED; do
+for new_state in APPROVED; do
   newer_review="${change_review/\"id\":1/\"id\":2}"
   newer_review="${newer_review/CHANGES_REQUESTED/$new_state}"
   STUB_REVIEW_PAGES="[[$change_review],[$newer_review]]" assert_rc_contains "later $new_state releases the review disagreement" 0 "" "$merge_overrides" BLOCKED
 done
+dismissed_review="${change_review/CHANGES_REQUESTED/DISMISSED}"
+STUB_REVIEW_PAGES="[[$dismissed_review]]" assert_rc_contains "dismissed change request no longer blocks" 0 "" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="[[$change_review],[$dismissed_review]]" assert_rc_contains "dismissing a different review does not erase an active change request" 2 "CHANGES_REQUESTED" "$merge_overrides" BLOCKED
+TEST_UNPINNED_MERGE=1 assert_rc_contains "ordinary immediate merge requires a head precondition" 2 "exactly one --match-head-commit" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash'
+assert_rc_contains "ordinary immediate merge refuses a different head precondition" 2 "exactly one --match-head-commit" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash --match-head-commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+assert_rc_contains "quoted separator subject does not conceal later auto flag" 2 "deferred" "scripts/gh-as-author.sh -- gh pr merge --subject ';' 456 --auto"
 comment_review="${change_review/\"id\":1/\"id\":2}"
 comment_review="${comment_review/CHANGES_REQUESTED/COMMENTED}"
 STUB_REVIEW_PAGES="[[$comment_review]]" assert_rc_contains "COMMENTED-only reviewer does not block" 0 "" "$merge_overrides" BLOCKED
 STUB_REVIEW_PAGES="[[$change_review],[$comment_review]]" assert_rc_contains "later COMMENTED does not erase a change request" 2 "CHANGES_REQUESTED" "$merge_overrides" BLOCKED
 STUB_REVIEW_PAGES="[[],[$change_review]]" assert_rc_contains "change request on a later page blocks" 2 "CHANGES_REQUESTED" "$merge_overrides" BLOCKED
-STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "exact PR and head disagreement override releases the separate gate" 0 "owner tiebreak" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides" BLOCKED
-STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "wrong head disagreement override refuses" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb $merge_overrides" BLOCKED
-STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "wrong PR disagreement override refuses" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=124@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides" BLOCKED
-STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "abbreviated head disagreement override refuses" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaa $merge_overrides" BLOCKED
-BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "exported exact disagreement override releases the gate" 0 "owner tiebreak" "$merge_overrides" BLOCKED
-STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "override on an earlier command cannot release a disagreement" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa echo ok ; $merge_overrides" BLOCKED
-STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "exact disagreement override never releases human-hold" 2 "human-hold" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides" BLOCKED human-hold
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "exact PR and head disagreement override releases the separate gate" 0 "owner tiebreak" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "wrong head disagreement override refuses" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "wrong PR disagreement override refuses" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/124@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "abbreviated head disagreement override refuses" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaa $merge_overrides" BLOCKED
+BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "exported exact disagreement override releases the gate" 0 "owner tiebreak" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "override on an earlier command cannot release a disagreement" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa echo ok ; $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "exact disagreement override never releases human-hold" 2 "human-hold" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides" BLOCKED human-hold
 STUB_REVIEW_FAILURE=1 assert_rc_contains "unreadable reviews refuse despite merge overrides" 2 "complete PR review state" "$merge_overrides" BLOCKED
 STUB_REVIEW_PAGES='null' assert_rc_contains "malformed reviews refuse despite merge overrides" 2 "complete PR review state" "$merge_overrides" BLOCKED
 STUB_REVIEW_PAGES="[[${change_review/nathanpayne-codex/nathanjohnpayne}]]" assert_rc_contains "PR author's own review does not create a disagreement" 0 "" "$merge_overrides" BLOCKED
@@ -168,12 +188,12 @@ for deleted_state in COMMENTED DISMISSED APPROVED; do
 done
 deleted_change="$(printf '%s' "$change_review" | jq -c '.user=null')"
 STUB_REVIEW_PAGES="[[$deleted_change]]" assert_rc_contains "deleted-account change request blocks with a diagnostic" 2 "deleted account" "$merge_overrides" BLOCKED
-STUB_REVIEW_PAGES="[[$deleted_change]]" assert_rc_contains "deleted-account change request permits an exact owner tiebreak" 0 "owner tiebreak" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="[[$deleted_change]]" assert_rc_contains "deleted-account change request permits an exact owner tiebreak" 0 "owner tiebreak" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides" BLOCKED
 without_match="${merge_overrides/ --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/}"
-STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "head-scoped override refuses without the server head precondition" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match" BLOCKED
-STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "head-scoped override refuses a different server head precondition" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match --match-head-commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" BLOCKED
-STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "head-scoped override accepts the attached exact precondition" 0 "owner tiebreak" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match --match-head-commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" BLOCKED
-STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "duplicate head preconditions do not authorize a tiebreak" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides --match-head-commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" BLOCKED
+TEST_UNPINNED_MERGE=1 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "head-scoped override refuses without the server head precondition" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "head-scoped override refuses a different server head precondition" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match --match-head-commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "head-scoped override accepts the attached exact precondition" 0 "owner tiebreak" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match --match-head-commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "duplicate head preconditions do not authorize a tiebreak" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides --match-head-commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" BLOCKED
 
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "review blockers never prevent cancelling auto-merge" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto' BLOCKED human-hold
 for auto_true in true True TRUE t T 1; do
@@ -181,12 +201,29 @@ for auto_true in true True TRUE t T 1; do
 done
 assert_rc_contains "an explicit false auto flag remains an immediate merge" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 --auto=false --squash' CLEAN
 assert_rc_contains "deferred auto-merge refuses even before a review blocker arrives" 2 "deferred --auto" 'scripts/gh-as-author.sh -- gh pr merge 123 --auto --squash' CLEAN
-STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "a later command cannot supply the head precondition" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match ; echo --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" BLOCKED
-STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "literal export form preserves a scoped owner tiebreak" 0 "owner tiebreak" "export BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ; $merge_overrides" BLOCKED
-STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "exported dynamic tiebreak is not treated as literal authority" 2 "CHANGES_REQUESTED" "export BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\$(echo x) ; $merge_overrides" BLOCKED
-STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "unset removes the captured export tiebreak" 2 "CHANGES_REQUESTED" "export BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ; unset BREAK_GLASS_REVIEW_DISAGREEMENT ; $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "a later command cannot supply the head precondition" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match ; echo --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "literal export form preserves a scoped owner tiebreak" 0 "owner tiebreak" "export BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ; $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "exported dynamic tiebreak is not treated as literal authority" 2 "CHANGES_REQUESTED" "export BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\$(echo x) ; $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "unset removes the captured export tiebreak" 2 "CHANGES_REQUESTED" "export BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ; unset BREAK_GLASS_REVIEW_DISAGREEMENT ; $merge_overrides" BLOCKED
 assert_rc_contains "a deleted PR author with no reviews remains mergeable" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' CLEAN '' MERGEABLE 0 '' 0 0 '' ''
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "a deleted PR author excludes no named reviewer" 2 "CHANGES_REQUESTED" "$merge_overrides" BLOCKED '' MERGEABLE 0 '' 0 0 '' ''
+
+for historical_state in COMMENTED DISMISSED APPROVED; do
+  collected_review="$(printf '%s' "$change_review" | jq -c --arg state "$historical_state" '.commit_id=null | .state=$state')"
+  STUB_REVIEW_PAGES="[[$collected_review]]" assert_rc_contains "garbage-collected commit $historical_state remains readable" 0 "" "$merge_overrides" BLOCKED
+done
+collected_review="$(printf '%s' "$change_review" | jq -c '.commit_id=null')"
+STUB_REVIEW_PAGES="[[$collected_review]]" assert_rc_contains "garbage-collected change request still blocks" 2 "unknown commit" "$merge_overrides" BLOCKED
+valid_override='https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "invalid inline override supersedes a valid earlier export" 2 "CHANGES_REQUESTED" "export BREAK_GLASS_REVIEW_DISAGREEMENT=$valid_override ; BREAK_GLASS_REVIEW_DISAGREEMENT=invalid $merge_overrides" BLOCKED
+BREAK_GLASS_REVIEW_DISAGREEMENT="$valid_override" STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "empty inline override supersedes ambient authority" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT= $merge_overrides" BLOCKED
+STUB_PR_URL=https://github.com/other/repo/pull/123 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "same PR number and commit in another repository cannot reuse authority" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=$valid_override $merge_overrides" BLOCKED
+STUB_PR_URL=https://enterprise.example/example/repo/pull/123 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "another host cannot reuse authority" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=$valid_override $merge_overrides" BLOCKED
+STUB_QUEUE_REQUIRED=true assert_rc_contains "required merge queue refuses implicit deferral" 2 "native merge-queue deferral" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' CLEAN
+STUB_QUEUE_ENTERED=true assert_rc_contains "already queued PR cannot bypass snapshot enforcement" 2 "native merge-queue deferral" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' CLEAN
+STUB_QUEUE_FAILURE=1 assert_rc_contains "unreadable queue state fails closed" 2 "verify native merge-queue state" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' CLEAN
+STUB_QUEUE_JSON='{}' assert_rc_contains "malformed queue state fails closed" 2 "verify native merge-queue state" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' CLEAN
+STUB_QUEUE_REQUIRED=true assert_rc_contains "required queue does not prevent attributed retraction" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto' BLOCKED human-hold
 
 assert_rc_contains "direct pr create blocked" 2 "token-verifying wrapper" \
   'gh pr create --title "t" --body "Authoring-Agent: claude
@@ -980,9 +1017,9 @@ fi
 # token WITHOUT the merge-state / admin / CODEX gate. The inner write must
 # now surface and face the same checks as a visible "<wrapper> -- gh ...".
 assert_rc_contains "author wrapper hides bash -c merge: state still checked (#546 gap 1)" 2 "mergeStateStatus is BLOCKED" \
-  'scripts/gh-as-author.sh -- bash -c "gh pr merge 123 --squash"' "BLOCKED" ""
+  'scripts/gh-as-author.sh -- bash -c "gh pr merge 123 --squash --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "BLOCKED" ""
 assert_rc_contains "author wrapper bash -c clean merge still allowed (#546 gap 1, no false block)" 0 "" \
-  'scripts/gh-as-author.sh -- bash -c "gh pr merge 123 --squash"' "CLEAN" ""
+  'scripts/gh-as-author.sh -- bash -c "gh pr merge 123 --squash --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "CLEAN" ""
 assert_rc_contains "author wrapper hides eval admin merge: surfaced + blocked (#546 gap 1)" 2 "" \
   'scripts/gh-as-author.sh -- eval "gh pr merge 123 --admin"' "CLEAN" ""
 assert_rc_contains "reviewer wrapper hides bash -c admin merge: surfaced + blocked (#546 gap 1)" 2 "" \

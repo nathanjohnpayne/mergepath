@@ -1862,6 +1862,7 @@ INLINE_CODEX_CLEARED=""
 INLINE_BREAK_GLASS_ADMIN=""
 INLINE_BREAK_GLASS_MERGE_STATE=""
 INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT=""
+INLINE_REVIEW_DISAGREEMENT_SET=0
 EXPORTED_BREAK_GLASS_REVIEW_DISAGREEMENT=""
 EXPORTED_REVIEW_DISAGREEMENT_SET=0
 INLINE_GH_AS_AUTHOR_IDENTITY=""
@@ -2126,6 +2127,7 @@ for i in "${!TOKENS[@]}"; do
         INLINE_BREAK_GLASS_ADMIN=""
         INLINE_BREAK_GLASS_MERGE_STATE=""
         INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT=""
+        INLINE_REVIEW_DISAGREEMENT_SET=0
       fi
       # Identity assignments: their consumer is the WRAPPER process
       # environment, not this hook, and what survives a separator
@@ -2196,6 +2198,7 @@ for i in "${!TOKENS[@]}"; do
         ;;
       BREAK_GLASS_REVIEW_DISAGREEMENT=*)
         INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT="${tok#BREAK_GLASS_REVIEW_DISAGREEMENT=}"
+        INLINE_REVIEW_DISAGREEMENT_SET=1
         case "${TOKENS[$((i+1))]:-}" in
           __MERGEPATH_CMDSUB__|__MERGEPATH_CMDSUB_LITERAL__)
             INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT="unverifiable" ;;
@@ -2554,9 +2557,12 @@ done
 EFFECTIVE_CODEX_CLEARED="${CODEX_CLEARED:-${INLINE_CODEX_CLEARED:-}}"
 EFFECTIVE_BREAK_GLASS_ADMIN="${BREAK_GLASS_ADMIN:-${INLINE_BREAK_GLASS_ADMIN:-}}"
 EFFECTIVE_BREAK_GLASS_MERGE_STATE="${BREAK_GLASS_MERGE_STATE:-${INLINE_BREAK_GLASS_MERGE_STATE:-}}"
-EFFECTIVE_BREAK_GLASS_REVIEW_DISAGREEMENT="${BREAK_GLASS_REVIEW_DISAGREEMENT:-${INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT:-}}"
+EFFECTIVE_BREAK_GLASS_REVIEW_DISAGREEMENT="${BREAK_GLASS_REVIEW_DISAGREEMENT:-}"
 if [ "$EXPORTED_REVIEW_DISAGREEMENT_SET" -eq 1 ]; then
   EFFECTIVE_BREAK_GLASS_REVIEW_DISAGREEMENT="$EXPORTED_BREAK_GLASS_REVIEW_DISAGREEMENT"
+fi
+if [ "$INLINE_REVIEW_DISAGREEMENT_SET" -eq 1 ]; then
+  EFFECTIVE_BREAK_GLASS_REVIEW_DISAGREEMENT="$INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT"
 fi
 
 # Distinguish `gh pr comment` from `gh issue comment` (both share the
@@ -3264,7 +3270,6 @@ for j in "${!TOKENS[@]}"; do
     continue
   fi
   tok="${TOKENS[$j]}"
-  case "$tok" in "&&"|"||"|";"|"|"|"|&"|"&"|"("|")") break ;; esac
   if [ "$SKIP_NEXT_AS" = "skip" ]; then
     SKIP_NEXT_AS=""
     continue
@@ -3280,6 +3285,7 @@ for j in "${!TOKENS[@]}"; do
     SKIP_NEXT_AS=""
     continue
   fi
+  case "$tok" in "&&"|"||"|";"|"|"|"|&"|"&"|"("|")") break ;; esac
   case "$tok" in
     --auto)
       AUTO_REQUESTED=1
@@ -3464,36 +3470,61 @@ fi
 PR_HOST="${BASH_REMATCH[1]}"
 PR_REPO="${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
 PR_NUMBER="${BASH_REMATCH[4]}"
+# gh pr merge implicitly defers to a required native queue even without
+# --auto. Read the same GraphQL fields the CLI uses, bound to this PR/head.
+QUEUE_QUERY='query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){url headRefOid isMergeQueueEnabled isInMergeQueue}}}'
+if ! QUEUE_JSON=$(gh api --hostname "$PR_HOST" graphql -f query="$QUEUE_QUERY" \
+     -f owner="${PR_REPO%/*}" -f repo="${PR_REPO#*/}" -F number="$PR_NUMBER" 2>"$GH_STDERR") \
+   || ! printf '%s' "$QUEUE_JSON" | jq -e --arg url "$PR_URL" --arg head "$PR_HEAD_SHA" '
+      (.errors // [] | length) == 0 and
+      (.data.repository.pullRequest | .url == $url and .headRefOid == $head
+        and (.isMergeQueueEnabled | type == "boolean")
+        and (.isInMergeQueue | type == "boolean"))' >/dev/null; then
+  echo "BLOCKED: could not verify native merge-queue state for the reviewed PR head." >&2
+  exit 2
+fi
+if [ "$ADMIN_REQUESTED" -eq 0 ] && printf '%s' "$QUEUE_JSON" | jq -e '
+     .data.repository.pullRequest | .isMergeQueueEnabled or .isInMergeQueue' >/dev/null; then
+  echo "BLOCKED: native merge-queue deferral outlives the reviewer disagreement snapshot." >&2
+  exit 2
+fi
 if ! REVIEW_PAGES=$(gh api --hostname "$PR_HOST" --paginate --slurp "repos/$PR_REPO/pulls/$PR_NUMBER/reviews" 2>"$GH_STDERR") \
    || ! printf '%s' "$REVIEW_PAGES" | jq -e '
       type == "array" and all(.[]; type == "array" and all(.[];
         type == "object" and (.id | type == "number") and
         (.user == null or (.user.login | type == "string" and length > 0)) and
-        (.commit_id | type == "string" and test("^[0-9a-f]{40}$")) and
+        (.commit_id == null or (.commit_id | type == "string" and test("^[0-9a-f]{40}$"))) and
         (.state | IN("APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"))))' >/dev/null; then
   echo "BLOCKED: gh-pr-guard could not read complete PR review state; restore gh/auth connectivity and retry." >&2
   exit 2
 fi
 REVIEW_BLOCKERS=$(printf '%s' "$REVIEW_PAGES" | jq -c --arg author "$PR_AUTHOR_LOGIN" '
-  [.[][] | select(.state != "COMMENTED" and .state != "PENDING")] as $opinions
+  [.[][] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")] as $opinions
   | (reduce ($opinions[] | select(.user != null)) as $review
       ({}; .[$review.user.login] = $review) | [.[]])
     + [$opinions[] | select(.user == null and .state == "CHANGES_REQUESTED")]
   | map(select(.state == "CHANGES_REQUESTED" and .user.login != $author))')
 if [ "$(printf '%s' "$REVIEW_BLOCKERS" | jq length)" -gt 0 ]; then
-  if [ "$EFFECTIVE_BREAK_GLASS_REVIEW_DISAGREEMENT" = "$PR_NUMBER@$PR_HEAD_SHA" ]; then
+  if [ "$EFFECTIVE_BREAK_GLASS_REVIEW_DISAGREEMENT" = "$PR_URL@$PR_HEAD_SHA" ]; then
     if [ "$MATCH_HEAD_COUNT" -ne 1 ] || [ "$MATCH_HEAD_SHA" != "$PR_HEAD_SHA" ]; then
       echo "BLOCKED: reviewer tiebreak requires exactly one --match-head-commit $PR_HEAD_SHA; a changed head must not inherit the authorization." >&2
       exit 2
     fi
-    echo "BREAK-GLASS: owner tiebreak authorized for reviewer disagreement on $PR_NUMBER@$PR_HEAD_SHA." >&2
+    echo "BREAK-GLASS: owner tiebreak authorized for reviewer disagreement on $PR_URL@$PR_HEAD_SHA." >&2
   else
     echo "BLOCKED: outstanding reviewer CHANGES_REQUESTED; REVIEW_POLICY.md reserves the tiebreak for the owner." >&2
-    printf '%s' "$REVIEW_BLOCKERS" | jq -r '.[] | "  Reviewer: \(.user.login // "<deleted account>"); reviewed commit: \(.commit_id)"' >&2
+    printf '%s' "$REVIEW_BLOCKERS" | jq -r '.[] | "  Reviewer: \(.user.login // "<deleted account>"); reviewed commit: \(.commit_id // "<unknown commit>")"' >&2
     echo "  Reviewer approval or dismissal releases this gate. Admin/merge-state overrides do not." >&2
-    echo "  Owner-only override: BREAK_GLASS_REVIEW_DISAGREEMENT=$PR_NUMBER@$PR_HEAD_SHA" >&2
+    echo "  Owner-only override: BREAK_GLASS_REVIEW_DISAGREEMENT=$PR_URL@$PR_HEAD_SHA" >&2
     exit 2
   fi
+fi
+
+# Bind every immediate write to the head inspected above, including merges
+# without an owner override. GitHub rejects a concurrent push at the writer.
+if [ "$MATCH_HEAD_COUNT" -ne 1 ] || [ "$MATCH_HEAD_SHA" != "$PR_HEAD_SHA" ]; then
+  echo "BLOCKED: immediate merge requires exactly one --match-head-commit $PR_HEAD_SHA." >&2
+  exit 2
 fi
 
 # mergeStateStatus check (#171 layer 2). API enum (full set per
