@@ -32,10 +32,37 @@ fail() {
   FAIL=$((FAIL + 1))
 }
 
+# The classifier changes behaviour with the checkout it sits in (hub vs
+# consumer mode), and this suite also runs on consumers, so its assertions
+# run against explicit fixture roots rather than "$SCOPE" in place:
+# HUB_SCOPE_ROOT carries both hub markers, CONSUMER_SCOPE_ROOT neither.
+SCOPE_FIXTURES="$(mktemp -d "${TMPDIR:-/tmp}/repo-lint-scope.XXXXXX")"
+trap 'rm -rf "$SCOPE_FIXTURES"' EXIT
+HUB_SCOPE_ROOT="$SCOPE_FIXTURES/hub"
+CONSUMER_SCOPE_ROOT="$SCOPE_FIXTURES/consumer"
+for scope_root in "$HUB_SCOPE_ROOT" "$CONSUMER_SCOPE_ROOT"; do
+  mkdir -p "$scope_root/scripts/ci"
+  if [ -f "$SCOPE" ]; then
+    cp "$SCOPE" "$scope_root/scripts/ci/repo-lint-scope.sh"
+  fi
+  if [ -f "$DEPENDENCIES" ]; then
+    cp "$DEPENDENCIES" "$scope_root/scripts/ci/repo-lint-dependencies.json"
+  fi
+done
+touch "$HUB_SCOPE_ROOT/scripts/sync-to-downstream.sh" "$HUB_SCOPE_ROOT/.mergepath-sync.yml"
+
 classify() {
   local event="$1"
   shift
-  printf '%s\n' "$@" | bash "$SCOPE" --event "$event"
+  printf '%s\n' "$@" | bash "$HUB_SCOPE_ROOT/scripts/ci/repo-lint-scope.sh" --event "$event"
+}
+
+consumer_scope_value() {
+  local key="$1" event="$2"
+  shift 2
+  printf '%s\n' "$@" \
+    | bash "$CONSUMER_SCOPE_ROOT/scripts/ci/repo-lint-scope.sh" --event "$event" \
+    | sed -n "s/^${key}=//p"
 }
 
 scope_value() {
@@ -344,6 +371,139 @@ JSON
   else
     fail "dependency graph wrapper keys must match the selector contract (got $invalid_name)"
   fi
+
+  # -------------------------------------------------------------------------
+  # Consumer mode: neither hub marker present.
+  # -------------------------------------------------------------------------
+
+  # A consumer's own product files (specs, app tests, .mjs scripts, its
+  # repository-overview doc, app source) cannot change any deep-lane result
+  # there, so they stay on the fast lane. This set is the shape of the
+  # fiveacross feature PRs that ran the full deep net before consumer mode.
+  consumer_local_ok=1
+  for path in \
+    specs/admin-console-ia.md \
+    docs/agents/repository-overview.md \
+    rules/firestore-notes.md \
+    AGENTS.md \
+    tests/rules/w0-storage-rules.test.ts \
+    tests/functions/proof-media.test.ts \
+    tests/e2e/admin.spec.ts \
+    scripts/bug-reports.mjs \
+    scripts/og/render.mjs \
+    src/admin/AdminConsole.tsx; do
+    if [ "$(consumer_scope_value deep pull_request "$path")" != "false" ]; then
+      consumer_local_ok=0
+      echo "INFO: consumer $path deep=$(consumer_scope_value deep pull_request "$path")" >&2
+    fi
+  done
+  if [ "$consumer_local_ok" -eq 1 ]; then
+    pass "consumer mode keeps consumer-local specs, docs, app tests and app scripts on the fast lane"
+  else
+    fail "consumer-local product files must not request deep CI on a consumer"
+  fi
+
+  # Kit-shaped CI implementation still fails closed on a consumer: a delivered
+  # file could be edited there, and a consumer-local shell script or workflow
+  # is indistinguishable from one by shape. Declared dependencies (the hook,
+  # Phase 4b, the self-approval detector) select their wrappers as on the hub.
+  consumer_ci_ok=1
+  for path in \
+    .github/workflows/app-ci.yml \
+    .github/workflows/repo_lint.yml \
+    scripts/ci/repo-lint-scope.sh \
+    scripts/lib/preflight-helpers.sh \
+    scripts/workflow/example.sh \
+    scripts/hooks/gh-pr-guard.sh \
+    scripts/phase-4b/example.sh \
+    scripts/gh-projects/example.sh \
+    scripts/deploy.sh \
+    scripts/self-approval-detector.cjs \
+    tests/test_example.sh \
+    tests/fixtures/example.json; do
+    if [ "$(consumer_scope_value deep pull_request "$path")" != "true" ]; then
+      consumer_ci_ok=0
+      echo "INFO: consumer $path deep=$(consumer_scope_value deep pull_request "$path")" >&2
+    fi
+  done
+  if [ "$consumer_ci_ok" -eq 1 ]; then
+    pass "consumer mode still sends kit-shaped CI paths to deep CI (declared dependencies partially, the rest in full)"
+  else
+    fail "kit-shaped CI paths must fail closed to deep CI on a consumer"
+  fi
+  if [ "$(consumer_scope_value full pull_request scripts/emulator.sh)" = "true" ] \
+     && [ "$(consumer_scope_value full pull_request .github/workflows/app-ci.yml)" = "true" ]; then
+    pass "unmapped kit-shaped paths on a consumer take the full deep surface"
+  else
+    fail "an unmapped kit-shaped consumer path must fail closed to the full deep surface"
+  fi
+
+  selected=$(consumer_scope_value checks pull_request tests/test_coderabbit_wait_paused.sh)
+  if [ "$(consumer_scope_value full pull_request tests/test_coderabbit_wait_paused.sh)" = "false" ] \
+     && [ "$selected" = '["check_coderabbit_wait"]' ] \
+     && [ "$(consumer_scope_value checks pull_request scripts/ci/check_no_token_in_output)" = '["check_no_token_in_output"]' ]; then
+    pass "consumer mode keeps declared-dependency and direct-wrapper partial selection"
+  else
+    fail "consumer mode must select wrappers exactly as the hub does (got $selected)"
+  fi
+
+  if [ "$(consumer_scope_value full push docs/README.md)" = "true" ] \
+     && [ "$(consumer_scope_value full schedule specs/example.md)" = "true" ]; then
+    pass "consumer mode keeps non-PR events on the full regression surface"
+  else
+    fail "non-PR events must stay full on a consumer"
+  fi
+
+  # Either hub marker alone keeps hub rules, so losing one on the hub (or a
+  # consumer carrying one as bootstrap residue) can only make CI stricter.
+  for marker in scripts/sync-to-downstream.sh .mergepath-sync.yml; do
+    one_marker_root="$SCOPE_FIXTURES/one-marker"
+    rm -rf "$one_marker_root"
+    mkdir -p "$one_marker_root/scripts/ci"
+    cp "$SCOPE" "$DEPENDENCIES" "$one_marker_root/scripts/ci/"
+    touch "$one_marker_root/$marker"
+    one_marker=$(printf '%s\n' specs/example.md | bash "$one_marker_root/scripts/ci/repo-lint-scope.sh" --event pull_request)
+    if grep -Fxq 'full=true' <<<"$one_marker"; then
+      pass "a checkout carrying only $marker keeps the hub rules"
+    else
+      fail "a checkout carrying only $marker must keep the hub rules (got $one_marker)"
+    fi
+  done
+
+  # Completeness, hub only (it needs the manifest): every path the manifest
+  # delivers to consumers that the hub would send to deep CI is still deep in
+  # consumer mode, unless it is one of the governance documents whose only
+  # deep readers are the hub-only harnesses. A new delivered path in a shape
+  # consumer_ci_surface does not cover fails here instead of silently taking
+  # the consumer fast lane.
+  consumer_doc_only_path() {
+    case "$1" in
+      specs/*|rules/*|docs/agents/*|docs/architecture/*|AGENTS.md|REVIEW_POLICY.md|ai_agent_tooling_standard.md|.repo-template.yml) return 0 ;;
+    esac
+    return 1
+  }
+  if [ -f "$ROOT/.mergepath-sync.yml" ] && command -v yq >/dev/null 2>&1; then
+    delivered=$(yq -r '.paths[] | (.dest // .path)' "$ROOT/.mergepath-sync.yml")
+    delivered_count=0
+    weaker=""
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      case "$path" in
+        */) path="${path}repo-lint-scope-probe" ;;
+      esac
+      delivered_count=$((delivered_count + 1))
+      [ "$(scope_value deep pull_request "$path")" = "true" ] || continue
+      consumer_doc_only_path "$path" && continue
+      if [ "$(consumer_scope_value deep pull_request "$path")" != "true" ]; then
+        weaker="$weaker $path"
+      fi
+    done <<<"$delivered"
+    if [ "$delivered_count" -gt 0 ] && [ -z "$weaker" ]; then
+      pass "every manifest-delivered path ($delivered_count) the hub sends to deep CI is still deep in consumer mode"
+    else
+      fail "consumer mode takes the fast lane for delivered CI paths the hub runs deep (extend consumer_ci_surface):$weaker"
+    fi
+  fi
 fi
 
 if ! command -v yq >/dev/null 2>&1; then
@@ -608,7 +768,7 @@ fi
 
 if [ -f "$TOKEN_WRAPPER" ]; then
   TOKEN_FIXTURE="$(mktemp -d "${TMPDIR:-/tmp}/repo-lint-token-wrapper.XXXXXX")"
-  trap 'rm -rf "$TOKEN_FIXTURE"' EXIT
+  trap 'rm -rf "$TOKEN_FIXTURE" "$SCOPE_FIXTURES"' EXIT
   mkdir -p "$TOKEN_FIXTURE/scripts/ci"
   cp "$TOKEN_WRAPPER" "$TOKEN_FIXTURE/scripts/ci/check_no_token_in_output"
   cat > "$TOKEN_FIXTURE/scripts/ci/token_output_gate.py" <<'PY'
