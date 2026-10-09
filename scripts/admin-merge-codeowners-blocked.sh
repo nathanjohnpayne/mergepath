@@ -442,6 +442,14 @@ for ref in "${PR_REFS[@]}"; do
     OVERALL_RC=1
     continue
   fi
+  # The owner record is scoped to the observed head. Bind it again at the
+  # mutation boundary so a push during the read-only gates cannot reuse it.
+  mutation_target=$(gh_ro pr view "$num" --repo "$repo" --json url,headRefOid --jq '[.url,.headRefOid] | join("|")') || mutation_target=""
+  if [ "$mutation_target" != "$pr_url|$pr_head" ]; then
+    printf '  ✗ PR URL/head moved or became unreadable before thread mutation — refusing --admin merge\n'
+    OVERALL_RC=1
+    continue
+  fi
   rt_rc=0
   "$RESOLVE_THREADS" "$num" --repo "$repo" --auto-resolve-bots || rt_rc=$?
   if [ "$rt_rc" -ne 0 ]; then

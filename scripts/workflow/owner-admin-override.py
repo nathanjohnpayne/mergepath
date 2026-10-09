@@ -15,6 +15,15 @@ MARKER = '<!-- mergepath-owner-admin-override:v1 -->'
 BOT = 'chatgpt-codex-connector[bot]'
 FIELDS = {'version', 'pr_url', 'head_sha', 'authorized_at', 'authorization_quote',
           'allow_needs_human_review', 'allow_codex_inflight'}
+# Wrapper payloads must name a built-in command, not machine-local aliases
+# or executable extensions whose expansion can hide an admin merge.
+BUILTIN_COMMANDS = {
+    'agent-task', 'alias', 'api', 'attestation', 'auth', 'browse', 'cache',
+    'codespace', 'completion', 'config', 'gist', 'gpg-key', 'help', 'issue',
+    'label', 'licenses', 'org', 'pr', 'preview', 'project', 'release', 'repo',
+    'ruleset', 'run', 'search', 'secret', 'skill', 'ssh-key', 'status',
+    'variable', 'workflow',
+}
 
 
 def timestamp(value):
@@ -51,6 +60,8 @@ def merge_args(argv):
         elif flag.startswith('-R') and len(flag) > 2:
             repo = flag[2:].lstrip('=')
         else:
+            if flag not in BUILTIN_COMMANDS and flag not in ('--help', '--version'):
+                raise ValueError('author wrapper requires a literal built-in gh command; aliases and extensions cannot authorize an admin merge')
             return None
     if not args or args.pop(0) != 'pr':
         return None

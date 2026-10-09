@@ -92,6 +92,16 @@ case "$1" in
   pr)
     case "$2" in
       view)
+        case "$*" in
+          *'--json url,headRefOid'*)
+            if [ "${STUB_MOVE_BEFORE_RESOLVE:-0}" = 1 ]; then
+              echo 'https://github.com/test/current/pull/99999|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+            else
+              echo 'https://github.com/test/current/pull/99999|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+            fi
+            exit 0
+            ;;
+        esac
         # Gate 1 reads state|mergeable|mergeStateStatus|headRefOid|title via
         # gh's own --jq; the stub returns the already-projected scalar.
         echo "OPEN|MERGEABLE|BLOCKED|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|https://github.com/test/current/pull/99999|Test PR (off-page check)"
@@ -391,6 +401,17 @@ for kind in missing stale duplicate malformed; do
     fail=$((fail + 1)); echo "FAIL: $kind authorization mutated threads or missed the authorization gate: $RUN_OUT"
   fi
 done
+
+cat > "$SCRATCH/current-auth.json" <<'AUTH'
+[{"version":1,"pr_url":"https://github.com/test/current/pull/99999","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","authorized_at":"2026-01-01T00:00:00Z","authorization_quote":"Merge this exact head.","allow_needs_human_review":false,"allow_codex_inflight":false}]
+AUTH
+GH_ARGV_LOG="$SCRATCH/moved-before-resolve.log"; : > "$GH_ARGV_LOG"
+STUB_MOVE_BEFORE_RESOLVE=1 STUB_QUALIFIED_REVIEW=1 STUB_AUTHORIZATION_FILE="$SCRATCH/current-auth.json" run_admin_merge "$SCRATCH/p1_ok.json" "$SCRATCH/p2_ok.json"
+if [ "$RUN_RC" -ne 0 ] && grep -q 'before thread mutation' <<<"$RUN_OUT" && ! grep -q 'THREAD-MUTATION' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1)); echo "PASS: replacement head refuses before thread mutation"
+else
+  fail=$((fail + 1)); echo "FAIL: replacement head crossed the thread mutation boundary: $RUN_OUT"
+fi
 
 if [ "$fail" -eq 0 ]; then
   echo "test_admin_merge_codeowners_blocked: PASS ($pass tests)"

@@ -189,6 +189,15 @@ print(json.dumps(result))
         self.assertIsNone(override.merge_args(['gh', 'pr', 'merge', '123', '--admin=false']))
         self.assertIsNone(override.merge_args(['gh', 'pr', 'create', '--title', '--admin']))
 
+    def test_aliases_and_extensions_cannot_hide_an_admin_merge(self):
+        for command in (['pm', '123', '--admin'], ['pm', '123'], ['image', '--admin'],
+                        ['extension', 'exec', 'pm', '123', '--admin']):
+            with self.subTest(command=command), self.assertRaisesRegex(ValueError, 'literal built-in'):
+                override.prepare(['gh', *command])
+        self.assertFalse((self.path / 'calls').exists())
+        for command in ('api', 'issue', 'run', 'repo', 'alias'):
+            self.assertIsNone(override.merge_args(['gh', command, '--help']))
+
     def test_inherited_repository_options_before_merge_are_recognized(self):
         for flags in (['--repo', 'example/repo'], ['--repo=example/repo'], ['-R', 'example/repo'], ['-Rexample/repo']):
             self.assertEqual(override.merge_args(['gh', 'pr', *flags, 'merge', '123', '--admin']),
