@@ -825,8 +825,13 @@ scan_codex_state() {
   # capture the review id so the findings filter can scope to THIS
   # review only and not pick up stale findings from an earlier review
   # round on the same HEAD.
-  review=$(echo "$reviews" | jq --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
-    [.[] | select(.user.login == $bot) | select(.commit_id == $sha)]
+  review=$(echo "$reviews" | jq --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" --argjson comments "$comments" '
+    [.[] | select(.user.login == $bot) | select(.commit_id == $sha)
+      | . as $r
+      | [$comments[] | select(.pull_request_review_id == $r.id)] as $inline
+      | select(any($inline[]; (.user.login == $bot) and (.in_reply_to_id == null))
+               or (($r.body // "") | test("[^[:space:]]"))
+               or ($inline | length) == 0)]
     | sort_by(.submitted_at) | last
     | if . == null then null
       else { id, state, submitted_at, commit_id, body }

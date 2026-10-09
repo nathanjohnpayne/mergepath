@@ -2361,8 +2361,13 @@ fi
 
 # BEGIN codex_request_diagnostics
 crc_select_head_review() { # reviews-json bot head
-  printf '%s\n' "$1" | jq --arg bot "$2" --arg sha "$3" '
-    [.[] | select(.user.login == $bot) | select(.commit_id == $sha)]
+  printf '%s\n' "$1" | jq --arg bot "$2" --arg sha "$3" --argjson comments "${4:-[]}" '
+    [.[] | select(.user.login == $bot) | select(.commit_id == $sha)
+      | . as $r
+      | [$comments[] | select(.pull_request_review_id == $r.id)] as $inline
+      | select(any($inline[]; (.user.login == $bot) and (.in_reply_to_id == null))
+               or (($r.body // "") | test("[^[:space:]]"))
+               or ($inline | length) == 0)]
     | max_by(.submitted_at) // null
   '
 }
@@ -2389,7 +2394,7 @@ crc_render_request_evidence() {
   # selector that requester deduplication also uses.
   diagnostic_comments=$(printf '%s\n' "$ISSUE_COMMENTS_JSON" | jq -c '[.[] | select((.body // "") == "@codex review")]') || return 1
   trigger=$(crqe_select_trigger "$diagnostic_comments" "$AUTHOR_IDENTITY" "$REACTION_THRESHOLD") || return 1
-  review=$(crc_select_head_review "$REVIEWS_JSON" "$BOT_LOGIN" "$HEAD_SHA") || return 1
+  review=$(crc_select_head_review "$REVIEWS_JSON" "$BOT_LOGIN" "$HEAD_SHA" "$COMMENTS_JSON") || return 1
   log "request evidence (informational; BLOCKED unchanged):"
   # Independent observations: an older terminal artifact must not hide a newer run.
   if [ -n "$CODEX_BLOCKED_REASON" ]; then
@@ -2429,6 +2434,7 @@ crc_render_request_evidence() {
 log "gate (b): checking for latest-state APPROVED review from a reviewer identity"
 
 REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
+COMMENTS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments")
 
 # Build a JSON array of reviewer logins for the filter.
 REVIEWERS_JSON=$(echo "$REVIEWERS" | jq -R . | jq -s .)
@@ -2500,15 +2506,10 @@ if [ -z "$APPROVING_REVIEWER" ]; then
   # gate (b) by branch 1 unless a second agent (cursor / codex CLI)
   # reviews independently. In a single-agent session that's friction
   # with no policy benefit when Codex is enabled — Codex's external
-  # review IS the cross-agent signal. Accept a fresh Codex 👍 reaction
-  # on the PR issue as a substitute for branch 1, BUT ONLY when
-  # codex.enabled=true AND the PR's Authoring-Agent matches an entry in
-  # available_reviewers (otherwise this would weaken gate (b) for
-  # cross-agent PRs that genuinely need a reviewer-identity APPROVED).
-  #
-  # Freshness: same REACTION_THRESHOLD that gate (c) uses, computed
-  # earlier in the script. Reaction must be at-or-after the threshold,
-  # which is max(HEAD_PUSHED_AT, NOW - reaction_freshness_window).
+  # review IS the cross-agent signal. Accept an exact-head review or
+  # affirmative anchored verdict only when codex.enabled=true and the
+  # Authoring-Agent matches an available reviewer identity. Gate (c)
+  # independently checks required findings from that substantive run.
   #
   # If a cross-agent reviewer COULD review (e.g., another agent is in
   # available_reviewers with no opinionated state on this PR), that's
@@ -2519,10 +2520,8 @@ if [ -z "$APPROVING_REVIEWER" ]; then
     log "gate (b): same-agent anchored Codex fallback unavailable because codex.enabled=false"
   elif [ -n "$SAME_AGENT_REVIEWER" ]; then
     log "gate (b): no reviewer-identity APPROVED, but same-agent author/reviewer detected (Authoring-Agent: $AUTHORING_AGENT → $SAME_AGENT_REVIEWER); checking for anchored Codex fallback per #170"
-    GATE_B_CODEX_REVIEW=$(echo "$REVIEWS_JSON" | jq -r --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
-      [.[] | select(.user.login == $bot and .state == "COMMENTED")
-       | select(.commit_id == $sha and ($sha | test("^[0-9a-f]{40}$")))]
-      | max_by(.submitted_at) // null | if . == null then "" else .submitted_at end')
+    GATE_B_CODEX_REVIEW=$(crc_select_head_review "$REVIEWS_JSON" "$BOT_LOGIN" "$HEAD_SHA" "$COMMENTS_JSON" | jq -r --arg sha "$HEAD_SHA" '
+      if . != null and .state == "COMMENTED" and ($sha | test("^[0-9a-f]{40}$")) then .submitted_at else "" end')
     if [ -n "$GATE_B_CODEX_REVIEW" ]; then
       log "gate (b): same-agent + exact-head Codex review @ $GATE_B_CODEX_REVIEW — branch 2 cleared (#1751)"
       APPROVING_REVIEWER="(branch 2: same-agent + exact-head Codex review)"
@@ -2582,7 +2581,6 @@ CLEARED=false
 CLEARANCE_REASON=""
 CODEX_REVIEW='null'
 CODEX_REVIEW_ID=""
-COMMENTS_JSON='[]'
 UNADDRESSED_P01='[]'
 UNADDRESSED_COUNT=0
 CODEX_REVIEW_TIME=""
@@ -2591,7 +2589,7 @@ if [ "$CODEX_ENABLED" = "true" ]; then
 
 # Latest Codex review on the current HEAD commit (if any). Codex always
 # uses COMMENTED state regardless of findings — do NOT filter on state.
-CODEX_REVIEW=$(crc_select_head_review "$REVIEWS_JSON" "$BOT_LOGIN" "$HEAD_SHA")
+CODEX_REVIEW=$(crc_select_head_review "$REVIEWS_JSON" "$BOT_LOGIN" "$HEAD_SHA" "$COMMENTS_JSON")
 
 # If a Codex review on HEAD exists, extract its id for filtering inline
 # comments down to THAT REVIEW ONLY. Older reviews on the same HEAD
@@ -2603,12 +2601,11 @@ CODEX_REVIEW=$(crc_select_head_review "$REVIEWS_JSON" "$BOT_LOGIN" "$HEAD_SHA")
 # scopes the findings to the latest round only.
 CODEX_REVIEW_ID=$(echo "$CODEX_REVIEW" | jq -r 'if . == null then "" else .id end')
 
-COMMENTS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments")
 
 # P0/P1 inline findings from the LATEST Codex review round on HEAD only.
 # P2/P3 don't block clearance per REVIEW_POLICY.md § Phase 4a step 15a.
 # If there's no Codex review on HEAD, UNADDRESSED_P01 is [] — the
-# reaction path is then the only way gate (c) can clear.
+# anchored verdict or Phase 4b substitute must supply clearance.
 #
 # Filter MUST include user.login == BOT_LOGIN. Review-thread replies
 # (e.g., a human quoting a P1 badge from a Codex finding while

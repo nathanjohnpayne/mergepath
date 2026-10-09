@@ -213,26 +213,16 @@ if (codexEnabled && issueComments !== null) {
 // for the timestamp (round 4) — a cross-agent thumbs-up still counts as a
 // newer Codex signal even though it cannot itself substitute for gate b
 // alone.
-let latestReactionTime = '';
-if (codexEnabled) {
-  for (const x of reactions) {
-    if (x.user && x.user.login === codexBotLogin &&
-        x.content === '+1' &&
-        reactionLowerBound && x.created_at >= reactionLowerBound &&
-        mergedAt && x.created_at <= mergedAt &&
-        x.created_at > latestReactionTime) {
-      latestReactionTime = x.created_at;
-    }
-  }
-}
-
 // Review: needs only codexCommentedOnHead. NOT gated on inlineComments
 // (round 4) for the timestamp — only the P0/P1 cleanliness check below
 // needs inline comments.
 let latestReviewTime = '';
 let latestCodexReview = null;
-if (codexEnabled && codexCommentedOnHead.length > 0) {
-  latestCodexReview = codexCommentedOnHead.reduce(
+if (codexEnabled && inlineComments !== null && codexCommentedOnHead.length > 0) {
+  latestCodexReview = codexCommentedOnHead.filter(r => {
+    const comments = inlineComments.filter(c => c.pull_request_review_id === r.id);
+    return comments.length === 0 || comments.some(c => !c.in_reply_to_id && c.user && c.user.login === codexBotLogin) || /\S/.test(r.body || '');
+  }).reduce(
     (latest, r) => (!latest || r.submitted_at > latest.submitted_at) ? r : latest,
     null
   );
@@ -289,7 +279,6 @@ if (codexEnabled && inlineComments !== null && issueComments !== null) {
   let latestKind = '';
   let latestTime = '';
   for (const [kind, time] of [
-    ['reaction', latestReactionTime],
     ['review', latestReviewTime],
     ['verdict', latestVerdictTime],
   ]) {
@@ -303,9 +292,7 @@ if (codexEnabled && inlineComments !== null && issueComments !== null) {
   // reaction in round 4. Review clearance has never required
   // same-agent, pre-existing and out of scope.
   const gateBSatisfied = sameAgentContext || hasIndependentCliApproval;
-  if (latestKind === 'reaction') {
-    codexCleared = gateBSatisfied;
-  } else if (latestKind === 'review') {
+  if (latestKind === 'review') {
     codexCleared = !reviewHasUnresolvedP01;
   } else if (latestKind === 'verdict') {
     codexCleared = gateBSatisfied && verdictAffirmative && !reviewHasUnresolvedP01;
@@ -395,62 +382,11 @@ else
   echo "  FAIL: $WORKFLOW must bound resolution by merge time (resolvedAtMerge proxy + comment createdAt) — Codex P1 #460" >&2
 fi
 
-# Structural assertion (#450): the workflow reads Codex bot +1
-# reactions and anchors them to merge time (pr.merged_at), not the
-# audit run time. A regression to a NOW-window floor would reject
-# every week-old merge-time +1.
-if grep -qF 'reactions.listForIssue' "$WORKFLOW" && \
-   grep -qF "x.content === '+1'" "$WORKFLOW" && \
-   grep -qF 'pr.merged_at' "$WORKFLOW"; then
-  pass=$((pass + 1))
-  echo "  PASS: $WORKFLOW accepts merge-time-anchored Codex +1 clearance (#450)"
+# Unanchored PR reactions grant no authority in the audit (#1751).
+if ! grep -qF 'latestReactionTime' "$WORKFLOW" && ! grep -qF 'github.rest.reactions.listForIssue' "$WORKFLOW"; then
+  pass=$((pass + 1)); echo "  PASS: audit ignores PR reactions for clearance and staleness"
 else
-  fail=$((fail + 1))
-  echo "  FAIL: $WORKFLOW must read Codex +1 reactions anchored to pr.merged_at (#450)" >&2
-fi
-
-# Structural assertion (Codex P2 on #460): the workflow raises the
-# reaction-window lower bound to the latest head_ref_force_pushed time,
-# mirroring the merge gate. Without it a stale +1 on a PR force-pushed to
-# an old/reused commit could satisfy the window and falsely clear.
-if grep -qF 'head_ref_force_pushed' "$WORKFLOW" && \
-   grep -qF 'listEventsForTimeline' "$WORKFLOW" && \
-   grep -qF 'reactionLowerBound' "$WORKFLOW"; then
-  pass=$((pass + 1))
-  echo "  PASS: $WORKFLOW raises the reaction lower bound to the force-push anchor (Codex P2 #460)"
-else
-  fail=$((fail + 1))
-  echo "  FAIL: $WORKFLOW must anchor reactions to head_ref_force_pushed (max with committer date) — Codex P2 #460" >&2
-fi
-
-# Structural assertion (Codex P2 on #460 round 2): the workflow bounds
-# head_ref_force_pushed events to those at or before merged_at when
-# reconstructing merge-time state. Without it a force-push AFTER merge
-# raises reactionLowerBound past merged_at, empties the [lowerBound,
-# merged_at] reaction window, and falsely flags a PR that legitimately
-# cleared via a pre-merge 👍. Mirrors labelWasPresentAtMerge /
-# resolvedAtMerge. The postmerge-forcepush-plus1-clears fixture exercises
-# the runtime path; this canary guards the workflow source.
-if grep -qF 'ev.created_at <= mergedAt' "$WORKFLOW"; then
-  pass=$((pass + 1))
-  echo "  PASS: $WORKFLOW bounds force-push events to merged_at (merge-time state, Codex P2 #460 r2)"
-else
-  fail=$((fail + 1))
-  echo "  FAIL: $WORKFLOW must exclude post-merge force-pushes (ev.created_at <= mergedAt) from the reaction lower bound — Codex P2 #460 r2" >&2
-fi
-
-# Structural assertion (Codex P2 on #460): the reaction lower bound also
-# carries the merge-time freshness floor (merged_at - reaction_freshness_
-# window_seconds), so a stale prior-HEAD +1 the merge gate would reject
-# cannot clear the retrospective audit on an ordinary-push-to-old-commit PR.
-if grep -qF 'reactionFreshnessWindowSeconds' "$WORKFLOW" && \
-   grep -qF 'mergedAtFloor' "$WORKFLOW" && \
-   grep -qF 'reaction_freshness_window_seconds' "$WORKFLOW"; then
-  pass=$((pass + 1))
-  echo "  PASS: $WORKFLOW applies the merge-time freshness floor (merged_at - window) to the reaction lower bound (Codex P2 #460)"
-else
-  fail=$((fail + 1))
-  echo "  FAIL: $WORKFLOW must add the merged_at - reaction_freshness_window_seconds floor to the reaction lower bound — Codex P2 #460" >&2
+  fail=$((fail + 1)); echo "  FAIL: audit still grants authority to an unanchored PR reaction" >&2
 fi
 
 # Structural assertion (Codex P2 on #460, restructured #612 round 4): the
@@ -471,32 +407,6 @@ if grep -qF 'config.codex.enabled === false' "$WORKFLOW" && \
 else
   fail=$((fail + 1))
   echo "  FAIL: $WORKFLOW must gate Codex clearance on codexEnabled (codex.enabled===false → ignore bot signals) — Codex P2 #460" >&2
-fi
-
-# Structural assertion (Codex P2 on #460 round 3, restructured #612 round
-# 4): the workflow gates +1-reaction and verdict CLEARANCE on same-agent
-# context OR an independent CLI approval, mirroring the merge gate branch-2
-# (#170) rule that a 👍/verdict substitutes for reviewer approval only when
-# the PR Authoring-Agent resolves to an available reviewer identity (unless
-# gate (b) is already independently satisfied via a real reviewer APPROVED).
-# Since round 4 the reaction's TIMESTAMP is scanned unconditionally (for the
-# Phase 4b staleness guard) and only the codexCleared assignment is gated —
-# so the canary now looks for the shared gateBSatisfied gate rather than an
-# `if (sameAgentContext)` wrapper around the reaction scan itself. Without
-# this gate a cross-agent / missing-Authoring-Agent PR merged with only a 👍
-# (which codex-review-check.sh rejects) would pass the audit. The
-# cross-agent-plus1-rejected fixture exercises the runtime path; this canary
-# guards the workflow source.
-if grep -qF 'sameAgentContext' "$WORKFLOW" && \
-   grep -qF 'scripts/lib/pr-body-contract.mjs' "$WORKFLOW" && \
-   ! grep -qE '\.match\([^)]*Authoring-Agent:|match\([[:space:]]*$' "$WORKFLOW" && \
-   grep -qF 'const gateBSatisfied = sameAgentContext || cliApprovedReviews.length > 0;' "$WORKFLOW" && \
-   grep -qF "codexCleared = gateBSatisfied;" "$WORKFLOW"; then
-  pass=$((pass + 1))
-  echo "  PASS: $WORKFLOW gates the +1 reaction path on same-agent context (Codex P2 #460 r3)"
-else
-  fail=$((fail + 1))
-  echo "  FAIL: $WORKFLOW must gate the Codex +1 reaction on sameAgentContext (Authoring-Agent → reviewer) — Codex P2 #460 r3" >&2
 fi
 
 # Structural assertion: the workflow references #449 and #450 for
