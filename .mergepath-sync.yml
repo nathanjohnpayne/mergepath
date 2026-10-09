@@ -76,6 +76,8 @@
 #     type: kit
 #     consumers: all
 #     requires:
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/workflow/owner-admin-override.py"
 #       - "tests/test_gh_pr_guard.sh"       # check_gh_as_author
 #       - "tests/test_gh_as_author.sh"      # check_gh_as_author
 #       - "scripts/ci/fixtures/"            # check_disagreement_detector
@@ -1951,6 +1953,8 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/workflow/owner-admin-override.py"
       - "scripts/workflow/record-merge-queue-authorization.sh"
       - "scripts/lib/merge-queue-protection.sh"
       - "scripts/lib/merge-queue-authorization.sh"
@@ -1975,6 +1979,8 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/workflow/owner-admin-override.py"
       - "scripts/workflow/record-merge-queue-final-audit.sh"
       - "scripts/lib/merge-queue-authorization.sh"
       - "scripts/lib/merge-queue-protection.sh"
@@ -1993,6 +1999,8 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/workflow/owner-admin-override.py"
       - "scripts/lib/merge-queue-authorization.sh"
       - "scripts/lib/merge-queue-protection.sh"
       - "scripts/lib/blocking-labels.sh"
@@ -2350,6 +2358,8 @@ paths:
     # helpers (parse_manifest_paths.sh, match_protected_paths.sh) are
     # already inside this kit; the two scripts/lib/ deps are declared here.
     requires:
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/workflow/owner-admin-override.py"
       - "scripts/lib/template-substitution.sh"   # verify-propagation-pr.sh templated render (#531)
       - "scripts/lib/manifest-fact-helpers.sh"   # verify-propagation-pr.sh consumer-facts load (#531)
       # external_review_fingerprint.sh + external_review_carryforward.sh (both
