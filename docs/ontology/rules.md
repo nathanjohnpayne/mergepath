@@ -225,7 +225,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **R-93.** An account- or connection-level block is terminal: short-circuit immediately, route to Phase 4b naming the real cause, never report it as generic latency. ● — REVIEW_POLICY.md § Phase 4a
 
-**R-94.** A Codex thumbs-up clears gate (c) only within the reaction freshness window and at-or-after the HEAD anchor. ● — review-policy.yml § reaction_freshness_window_seconds
+**R-94.** A PR-level Codex thumbs-up has no commit anchor and never clears gate (c) or ends the requester poll. Clearance requires a qualifying commit-anchored review or affirmative verdict. ● — REVIEW_POLICY.md § Phase 4a
 
 **R-95.** The CodeRabbit HEAD anchor is floored by the wallclock freshness window against rewritten committer dates. ● — review-policy.yml § wallclock_freshness_window_seconds
 
