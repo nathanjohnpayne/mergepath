@@ -10,6 +10,11 @@ PASS=0; FAIL=0
 pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS+1)); }
 fail() { printf 'FAIL: %s\n' "$*" >&2; FAIL=$((FAIL+1)); }
 unset GH_TOKEN GITHUB_TOKEN OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT
+# Hooks may export redirects to their own repository. Fixture writes must not.
+for input_variable in $(compgen -e); do
+  case "$input_variable" in GIT_*) unset "$input_variable" ;; esac
+done
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 INPUT_REAL_GIT="$(command -v git)"
 export INPUT_REAL_GIT INPUT_FIXTURE="$WORK/repo" INPUT_WORK="$WORK"
 mkdir -p "$WORK/bin" "$INPUT_FIXTURE"
@@ -45,6 +50,10 @@ if [ "$1" = api ] && [ "$2" = --paginate ] && [ "$3" = --slurp ]; then
  else printf '[[]]\n'; fi
  exit 0
 fi
+if [ "$1" = api ] && [ "$2" = repos/fixture/repo/pulls/1753 ]; then
+ printf '{}\n'
+ exit 0
+fi
 # A mutable PR diff read would violate the production capture contract.
 exit 99
 SH
@@ -78,5 +87,72 @@ chmod 600 "$WORK/input/review.diff"
 printf '+changed after capture\n' >> "$WORK/input/review.diff"
 if p4b_validate_bound_input "$BOUND" "$WORK/input/input.json" "$WORK/input/review.diff"; then fail 'changed input accepted'; else pass 'changed diff cannot retain bound approval'; fi
 if p4b_capture_input fixture/repo 1753 "${BASE:0:7}" "$HEAD_A" "$WORK/input"; then fail 'abbreviated base accepted'; else pass 'abbreviated capture IDs are rejected'; fi
+
+# Curated-wave input deliberately differs from the complete consumer PR diff.
+# Execute real trusted wave regeneration over a separate committed canonical
+# range; only the external live-byte provider is replaced with a fixed proof.
+CANON="$WORK/canonical"
+mkdir -p "$CANON/scripts/phase-4b" "$CANON/scripts/workflow" "$CANON/docs" "$CANON/.github"
+"$INPUT_REAL_GIT" -C "$CANON" init -q
+printf 'canonical base\n' >"$CANON/file"
+printf 'excluded base\n' >"$CANON/docs/excluded"
+printf 'paths:\n  - path: file\n  - path: docs/\n' >"$CANON/.mergepath-sync.yml"
+printf 'propagation_audit:\n  scope_exclude_prefixes:\n    - docs/\n' >"$CANON/.github/review-policy.yml"
+"$INPUT_REAL_GIT" -C "$CANON" add file docs .mergepath-sync.yml
+"$INPUT_REAL_GIT" -C "$CANON" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm canonical-base
+SOURCE_BASE="$("$INPUT_REAL_GIT" -C "$CANON" rev-parse HEAD)"
+printf 'canonical head\n' >"$CANON/file"
+printf 'excluded head\n' >"$CANON/docs/excluded"
+"$INPUT_REAL_GIT" -C "$CANON" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qam canonical-head
+SOURCE_HEAD="$("$INPUT_REAL_GIT" -C "$CANON" rev-parse HEAD)"
+export SOURCE_HEAD HEAD_A BASE
+cp "$ROOT/scripts/phase-4b/immutable-input.sh" "$CANON/scripts/phase-4b/"
+cp "$ROOT/scripts/wave-audit.sh" "$CANON/scripts/"
+printf '#!/usr/bin/env bash\nexit 99\n' >"$CANON/scripts/phase-4b-review.sh"
+cat >"$CANON/scripts/workflow/verify-live-propagation.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+[ ! -e "$INPUT_WORK/proof-fails" ] || exit 2
+jq -cn --arg source "$SOURCE_HEAD" --arg head "$HEAD_A" --arg base "$BASE" \
+ '{source_sha:$source,head_sha:$head,base_sha:$base}'
+SH
+printf 'propagation_audit:\n  scope_exclude_prefixes:\n    - docs/\n' >"$WORK/wave-policy.yml"
+jq -n --arg base "$SOURCE_BASE" --arg head "$SOURCE_HEAD" \
+ '{version:1,canonical_base_sha:$base,canonical_head_sha:$head,historical_end_sha:"",finalize_historical:false}' >"$WORK/scope-request.json"
+mkdir "$WORK/wave-input"
+# Function source paths now point at the separate trusted fixture checkout.
+. "$CANON/scripts/phase-4b/immutable-input.sh"
+p4b_capture_input fixture/repo 1753 "$BASE" "$HEAD_A" "$WORK/wave-input"
+# Caller overrides and dirty source files must not alter pinned scope or bytes.
+printf 'dirty canonical bytes MUST NOT BE REVIEWED\n' >"$CANON/file"
+export WAVE_AUDIT_MANIFEST_RELPATH=attacker.yml WAVE_AUDIT_REPO_DIR=/nonexistent
+if p4b_capture_wave_input fixture/repo 1753 "$BASE" "$HEAD_A" "$WORK/scope-request.json" "$WORK/wave-input" "$WORK/wave-policy.yml"; then
+ pass 'curated canonical range is regenerated independently of the canary diff'
+else fail 'trusted curated regeneration'; fi
+unset WAVE_AUDIT_MANIFEST_RELPATH WAVE_AUDIT_REPO_DIR
+"$INPUT_REAL_GIT" -C "$CANON" diff "$SOURCE_BASE" "$SOURCE_HEAD" -- file >"$WORK/curated-expected.diff"
+if cmp -s "$WORK/wave-input/review.diff" "$WORK/curated-expected.diff" \
+   && cmp -s "$WORK/wave-input/pr.diff" "$WORK/expected.diff"; then
+ pass 'curated bytes exclude configured paths and preserve the complete canary diff'
+else fail 'curated byte derivation'; fi
+WAVE_BOUND="$(p4b_bind_input "$WORK/wave-input/input.json" "$WORK/wave-input/review.diff" "$WORK/wave-input/review.diff" "$VERDICT")"
+if p4b_validate_bound_input "$WAVE_BOUND" "$WORK/wave-input/input.json" "$WORK/wave-input/review.diff" \
+   && p4b_revalidate_input fixture/repo 1753 "$WORK/wave-input"; then
+ pass 'curated binding preserves source scope, PR tuple and transition generation'
+else fail 'curated binding'; fi
+jq --arg head "$SOURCE_BASE" '.canonical_head_sha=$head' "$WORK/scope-request.json" >"$WORK/wrong-scope.json"
+if p4b_capture_wave_input fixture/repo 1753 "$BASE" "$HEAD_A" "$WORK/wrong-scope.json" "$WORK/wave-input" "$WORK/wave-policy.yml"; then
+ fail 'unverified canonical source accepted'
+else pass 'curated request cannot substitute a different canonical head'; fi
+: >"$WORK/proof-fails"
+if p4b_capture_wave_input fixture/repo 1753 "$BASE" "$HEAD_A" "$WORK/scope-request.json" "$WORK/wave-input" "$WORK/wave-policy.yml"; then
+ fail 'failed live byte proof accepted'
+else pass 'curated input fails closed without live canary byte proof'; fi
+rm "$WORK/proof-fails"
+chmod 600 "$WORK/wave-input/pr.diff"
+printf 'tampered PR bytes\n' >>"$WORK/wave-input/pr.diff"
+if p4b_revalidate_input fixture/repo 1753 "$WORK/wave-input"; then
+ fail 'tampered complete PR diff accepted'
+else pass 'curated review also fences the complete canary diff digest'; fi
 printf '\ntest_phase_4b_immutable_input: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]

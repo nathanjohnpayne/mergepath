@@ -2059,6 +2059,19 @@ if [ "$rc" = 1 ] \
   pass "Direction B (codex→claude) dry-run CHANGES_REQUESTED → exit 1"
 else fail "Direction B (rc=$rc): $out"; fi
 
+# The documented offline preview accepts a display SHA and cannot post.
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CLAUDE_BIN="$BIN/fake-claude-approve-p2-usage" \
+  P4B_FAKE_PR_BODY_AGENT=codex bash "$ORCH" 127 --repo o/r --author codex --head deadbeef --diff-file "$DIFF" --dry-run --offline-diff 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && printf '%s' "$out" | jq -e '.dry_run == true and .validated_verdict.review_input == null' >/dev/null; then
+  pass "offline explicit-diff preview has no postable binding"
+else fail "offline explicit-diff preview (rc=$rc): $out"; fi
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" bash "$ORCH" 127 --repo o/r --head deadbeef --diff-file "$DIFF" --offline-diff 2>/dev/null)"; rc=$?
+set -e
+[ "$rc" = 3 ] && pass "offline input cannot enter a real review path" || fail "offline mode accepted without dry-run (rc=$rc)"
+
 # #1186: a dry run makes the complete validated verdict available to the
 # caller before any publication path. The fixture includes a finding and full
 # normalized usage so a count/scalar-only summary cannot pass this assertion.
@@ -3757,6 +3770,16 @@ set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.adapter_timeout_seconds')" = "5" ]; then
   pass "P4B_ADAPTER_TIMEOUT_SECONDS override reaches the adapter inner timeout (2s CLI survives policy=1s)"
 else fail "timeout override propagation (rc=$rc, out=$out)"; fi
+
+# PR-backed evidence probes capture bytes instead of asking adapters to fetch.
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" CLAUDE_BIN="$BIN/fake-claude-approve-p2-usage" \
+  env -u OPENAI_API_KEY -u CODEX_API_KEY -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
+  bash "$EVI" --repo o/r --pr 150 --json 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && printf '%s' "$out" | jq -e '.ready == true' >/dev/null; then
+  pass "PR-backed enablement evidence supplies immutable diff bytes"
+else fail "PR-backed evidence capture (rc=$rc): $out"; fi
 
 # (3) An explicit P4B_CODEX_EFFORT override is what the adapter runs, so the
 # recorded reviewer_effort must reflect the override, not the policy (#598 P3).

@@ -36,7 +36,10 @@
 #                    live head/base pair is read together before adapter work,
 #                    before post-review issue filing, and immediately before
 #                    the review POST. A moved or unreadable base fails closed.
-#   --diff-file      pre-fetched unified diff (skips `gh pr diff`).
+#   --diff-file      compatibility assertion of the object-derived diff bytes.
+#   --wave-scope-file structured canonical range; trusted wave code regenerates
+#                    the curated bytes after live canary byte verification.
+#   --offline-diff   preview supplied bytes with --dry-run; never posts.
 #   --dry-run        do everything EXCEPT post the review; print intended
 #                    action.
 #   --force-enabled  run this one invocation even when
@@ -228,7 +231,7 @@ GH_AS_AUTHOR="${P4B_GH_AS_AUTHOR:-$ROOT/gh-as-author.sh}"
 ADAPTER_TIMEOUT_ENV="${P4B_ADAPTER_TIMEOUT_SECONDS:-}"
 ADAPTER_TIMEOUT=""
 
-PR="" ; REPO="" ; REVIEWER="" ; AUTHOR="" ; HEAD="" ; EXPECTED_BASE_SHA="" ; EXPECTED_BASE_SHA_SET=false ; DIFF_FILE="" ; DRY_RUN=false
+PR="" ; REPO="" ; REVIEWER="" ; AUTHOR="" ; HEAD="" ; EXPECTED_BASE_SHA="" ; EXPECTED_BASE_SHA_SET=false ; DIFF_FILE="" ; DRY_RUN=false ; OFFLINE_DIFF=false ; WAVE_SCOPE_FILE=""
 INPUT_DIR=""
 INPUT_METADATA_DIGEST=""
 FORCE_ENABLED=false
@@ -251,7 +254,9 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || p4b_die 3 "--expected-base-sha requires exactly 40 hexadecimal characters"
       EXPECTED_BASE_SHA_SET=true; EXPECTED_BASE_SHA="$2"; shift 2 ;;
     --diff-file)     DIFF_FILE="${2:-}"; shift 2 ;;
+    --wave-scope-file) WAVE_SCOPE_FILE="${2:-}"; shift 2 ;;
     --dry-run)       DRY_RUN=true; shift ;;
+    --offline-diff)  OFFLINE_DIFF=true; shift ;;
     --force-enabled) FORCE_ENABLED=true; shift ;;
     -h|--help)       usage ;;
     -*) echo "phase-4b-review.sh: unknown flag: $1" >&2; usage ;;
@@ -261,6 +266,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+if [ "$OFFLINE_DIFF" = true ]; then
+  [ -z "$WAVE_SCOPE_FILE" ] || p4b_die 3 "offline input cannot request wave scope"
+  [ "$DRY_RUN" = true ] && [ -n "$DIFF_FILE" ] && [ -n "$HEAD" ] \
+    || p4b_die 3 "--offline-diff requires --dry-run, --diff-file and a display --head"
+fi
 [ -n "$PR" ] || usage
 [[ "$PR" =~ ^[1-9][0-9]*$ ]] || p4b_die 3 "PR# must be a positive integer; got '$PR'"
 if [ "$EXPECTED_BASE_SHA_SET" = true ]; then
@@ -410,6 +420,11 @@ if [ -z "$REPO" ]; then
   [ -n "$REPO" ] || p4b_die 3 "could not resolve repo; pass --repo owner/name"
 fi
 
+if [ "$OFFLINE_DIFF" = true ]; then
+  # Explicit preview bytes have no server tuple or posting authority.
+  EXPECTED_BASE_SHA_SET=false
+  p4b_warn "offline diff preview: supplied bytes are unbound and cannot authorize a review POST"
+else
 # Capture head and base together on every path, including supplied --head.
 # Both exact Git objects become the immutable reasoning input below.
 need_gh
@@ -427,6 +442,8 @@ EXPECTED_BASE_SHA="$LIVE_BASE"
 EXPECTED_BASE_SHA_SET=true
 if ! revalidate_expected_base initial; then
   p4b_die 3 "$P4B_BASE_FENCE_REASON"
+fi
+
 fi
 
 # Authoring agent. The PR BODY is the record of authorship, and it is read and
@@ -1224,9 +1241,24 @@ require_feedback_accounted
 # endpoint. A supplied diff is only a compatibility assertion of these bytes.
 INPUT_DIR="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/p4b-input.XXXXXX")" \
   || fall_back_to_manual "could not create protected review input"
+if [ "$OFFLINE_DIFF" = true ]; then
+  [ -f "$DIFF_FILE" ] && [ ! -L "$DIFF_FILE" ] \
+    || p4b_die 3 "offline diff must be a regular file"
+  cp "$DIFF_FILE" "$INPUT_DIR/review.diff" || p4b_die 3 "could not protect offline input"
+  chmod 400 "$INPUT_DIR/review.diff"
+  DIFF_FILE="$INPUT_DIR/review.diff"
+  OFFLINE_INPUT_DIGEST="$(p4b_input_digest "$DIFF_FILE")" || p4b_die 3 "could not fingerprint offline input"
+else
 if ! p4b_run_with_timeout 90 "$ROOT/phase-4b/immutable-input.sh" capture \
      "$REPO" "$PR" "$EXPECTED_BASE_SHA" "$HEAD" "$INPUT_DIR"; then
   fall_back_to_manual "could not capture immutable PR base/head objects"
+fi
+if [ -n "$WAVE_SCOPE_FILE" ]; then
+  if ! p4b_run_with_timeout 180 "$ROOT/phase-4b/immutable-input.sh" wave-capture \
+      "$REPO" "$PR" "$EXPECTED_BASE_SHA" "$HEAD" \
+      "$WAVE_SCOPE_FILE" "$INPUT_DIR" "$(p4b_config)"; then
+    fall_back_to_manual "could not regenerate trusted canonical wave input"
+  fi
 fi
 INPUT_METADATA_DIGEST="$(p4b_input_digest "$INPUT_DIR/input.json")" \
   || fall_back_to_manual "could not fingerprint review input metadata"
@@ -1238,7 +1270,13 @@ if [ -n "$DIFF_FILE" ]; then
 fi
 DIFF_FILE="$INPUT_DIR/review.diff"
 
+fi
+
 revalidate_immutable_input() {
+  if [ "$OFFLINE_DIFF" = true ]; then
+    [ "$(p4b_input_digest "$DIFF_FILE")" = "$OFFLINE_INPUT_DIGEST" ]
+    return
+  fi
   [ "$(p4b_input_digest "$INPUT_DIR/input.json")" = "$INPUT_METADATA_DIGEST" ] \
     && p4b_revalidate_input "$REPO" "$PR" "$INPUT_DIR"
 }
@@ -1248,7 +1286,7 @@ ADAPTER_ARGS=( --pr "$PR" )
 [ -n "$REPO" ]      && ADAPTER_ARGS+=( --repo "$REPO" )
 [ -n "$HEAD" ]      && ADAPTER_ARGS+=( --head "$HEAD" )
 [ -n "$DIFF_FILE" ] && ADAPTER_ARGS+=( --diff-file "$DIFF_FILE" )
-ADAPTER_ARGS+=( --input-metadata "$INPUT_DIR/input.json" )
+[ "$OFFLINE_DIFF" = true ] || ADAPTER_ARGS+=( --input-metadata "$INPUT_DIR/input.json" )
 
 # Accounting (#602): per-loop timing signals, captured whether or not the
 # adapter succeeds so fail-closed loops carry their duration too.
@@ -1274,7 +1312,7 @@ if [ "$ADAPTER_RC" -ne 0 ]; then
 fi
 # Defense in depth: re-validate before we act on it.
 if ! revalidate_immutable_input \
-  || ! p4b_validate_bound_input "$VERDICT_JSON" "$INPUT_DIR/input.json" "$DIFF_FILE"; then
+  || { [ "$OFFLINE_DIFF" != true ] && ! p4b_validate_bound_input "$VERDICT_JSON" "$INPUT_DIR/input.json" "$DIFF_FILE"; }; then
   fall_back_to_manual "adapter input binding changed or PR head transitioned during review"
 fi
 if ! p4b_validate_verdict "$(printf '%s' "$VERDICT_JSON" | jq -c 'del(.review_input)')"; then
@@ -1566,6 +1604,12 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
   printf -- '- Reviewed merge base: `%s`\n' "$(jq -r '.review_input.merge_base_sha' <<<"$VERDICT_JSON")"
   printf -- '- Immutable diff SHA-256: `%s`\n' "$(jq -r '.review_input.diff_sha256' <<<"$VERDICT_JSON")"
   printf -- '- Reviewed diff SHA-256: `%s`\n' "$(jq -r '.review_input.reviewed_diff_sha256' <<<"$VERDICT_JSON")"
+  if jq -e '.review_input.wave_audit != null' <<<"$VERDICT_JSON" >/dev/null; then
+    printf -- '- Canonical wave range: `%s` .. `%s`\n' \
+      "$(jq -r '.review_input.wave_audit.canonical_base_sha' <<<"$VERDICT_JSON")" \
+      "$(jq -r '.review_input.wave_audit.canonical_head_sha' <<<"$VERDICT_JSON")"
+    printf -- '- Canary PR diff SHA-256: `%s`\n' "$(jq -r '.review_input.pr_diff_sha256' <<<"$VERDICT_JSON")"
+  fi
   printf -- '- Reviewer identity: `%s`\n' "$REVIEWER"
   printf -- '- Adapter: `%s`\n' "$ADAPTER"
   printf -- '- Adapter runs: `%s`\n' "$ADAPTER_RUNS"
@@ -1880,12 +1924,12 @@ post_review() {
   # finding is only the POST itself (#1584 Phase 4b P1). A request that lands
   # during this read is outside the recorded generation, and the merge gate
   # holds the approval until Codex answers it or Phase 4b reruns (#1598).
-  [ "$event" != "APPROVE" ] || refuse_approval_if_feedback_unaccounted
   if ! revalidate_immutable_input; then
     cleanup_pre_post_refusal_side_effects "immutable review input changed before POST" true \
       "The PR input" "the reviewed input of ${REPO}#${PR}"
     fall_back_to_manual "immutable review input changed before POST"
   fi
+  [ "$event" != "APPROVE" ] || refuse_approval_if_feedback_unaccounted
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \
     '{commit_id:$commit_id,event:$event,body:$body}' > "$payload_file"

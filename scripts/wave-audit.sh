@@ -165,7 +165,7 @@ audit_list() {
 }
 
 # --- args -------------------------------------------------------------------
-PR=""; REPO=""; BASE=""; HEAD_SHA=""; DRY_RUN=false
+PR=""; REPO=""; BASE=""; HEAD_SHA=""; DRY_RUN=false; CAPTURE_INPUT_DIR=""
 HISTORICAL_END=""; FINALIZE_HISTORICAL=false
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -173,6 +173,7 @@ while [ $# -gt 0 ]; do
     --base)      BASE="${2:-}"; shift 2 ;;
     --head-sha)  HEAD_SHA="${2:-}"; shift 2 ;;
     --dry-run)   DRY_RUN=true; shift ;;
+    --capture-input-dir) CAPTURE_INPUT_DIR="${2:-}"; DRY_RUN=true; shift 2 ;;
     --historical-end) HISTORICAL_END="${2:-}"; shift 2 ;;
     --finalize-historical) FINALIZE_HISTORICAL=true; shift ;;
     --parse-title-only)
@@ -190,6 +191,8 @@ done
 [ -n "$PR" ] || { usage >&2; die 3 "canary PR number is required"; }
 case "$PR" in ''|*[!0-9]*) die 3 "canary PR must be a number: $PR" ;; esac
 [ -n "$REPO" ] || die 3 "--repo <owner/repo> is required"
+[ -z "$CAPTURE_INPUT_DIR" ] || { [ -d "$CAPTURE_INPUT_DIR" ] && [ ! -L "$CAPTURE_INPUT_DIR" ]; } \
+  || die 3 "capture directory must already exist and be a real directory"
 [ -x "$ORCH" ] || [ -f "$ORCH" ] || die 3 "orchestrator not found: $ORCH"
 
 # --- config (fail-closed validation) ----------------------------------------
@@ -744,6 +747,20 @@ if [ "$BYTES" -gt "$DIFF_MAX" ]; then
   exit 8
 fi
 
+# Regeneration mode never dispatches a reviewer, writes a receipt, or advances
+# a watermark. The trusted orchestrator independently invokes this mode.
+if [ -n "$CAPTURE_INPUT_DIR" ]; then
+  cp "$DIFF_FILE" "$CAPTURE_INPUT_DIR/review.diff"
+  jq -n --arg base "$BASE_FULL" --arg head "$HEAD_FULL" \
+    --arg end "${HISTORICAL_END:+$RANGE_HEAD}" --argjson final "$FINALIZE_HISTORICAL" \
+    --arg manifest "$MANIFEST_BLOB" --arg fingerprint "$SCOPE_FINGERPRINT" \
+    '{version:1,canonical_base_sha:$base,canonical_head_sha:$head,
+      historical_end_sha:$end,finalize_historical:$final,
+      manifest_blob:$manifest,scope_fingerprint:$fingerprint}' > "$CAPTURE_INPUT_DIR/scope.json"
+  chmod 400 "$CAPTURE_INPUT_DIR/review.diff" "$CAPTURE_INPUT_DIR/scope.json"
+  exit 0
+fi
+
 if [ "$BYTES" -eq 0 ] && [ "$HISTORICAL" = false ]; then
   # Only excluded-prefix (or no) content changed in the range: vacuously
   # clean. Advance the watermark so the next audit does not re-walk it.
@@ -766,6 +783,13 @@ fi
 # there the claude direction falls back to its configured gating-lane effort
 # rather than failing closed on an invalid value.
 orch_args=("$PR" --repo "$REPO" --diff-file "$DIFF_FILE")
+SCOPE_REQUEST="$(mktemp "${TMPDIR:-/tmp}/wave-audit-scope.XXXXXX")"
+TMP_FILES[${#TMP_FILES[@]}]="$SCOPE_REQUEST"
+jq -n --arg base "$BASE_FULL" --arg head "$HEAD_FULL" \
+  --arg end "${HISTORICAL_END:+$RANGE_HEAD}" --argjson final "$FINALIZE_HISTORICAL" \
+  '{version:1,canonical_base_sha:$base,canonical_head_sha:$head,
+    historical_end_sha:$end,finalize_historical:$final}' > "$SCOPE_REQUEST"
+orch_args+=(--wave-scope-file "$SCOPE_REQUEST")
 # Pin review publication to the lane-verified pair: without --head, the
 # orchestrator could approve a pushed canary head the lane never verified;
 # without --expected-base-sha, a same-head retarget during the long review
