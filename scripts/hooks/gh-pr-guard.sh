@@ -3281,11 +3281,15 @@ for j in "${!TOKENS[@]}"; do
     continue
   fi
   case "$tok" in
-    --auto|--auto=true)
+    --auto)
       AUTO_REQUESTED=1
       continue
       ;;
-    --disable-auto|--disable-auto=true)
+    --auto=*)
+      case "${tok#--auto=}" in false|False|FALSE|f|F|0) ;; *) AUTO_REQUESTED=1 ;; esac
+      continue
+      ;;
+    --disable-auto|--disable-auto=true|--disable-auto=True|--disable-auto=TRUE|--disable-auto=t|--disable-auto=T|--disable-auto=1)
       DISABLE_AUTO_REQUESTED=1
       continue
       ;;

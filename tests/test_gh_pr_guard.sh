@@ -176,6 +176,10 @@ STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "head-scoped override accep
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "duplicate head preconditions do not authorize a tiebreak" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides --match-head-commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" BLOCKED
 
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "review blockers never prevent cancelling auto-merge" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto' BLOCKED human-hold
+for auto_true in true True TRUE t T 1; do
+  assert_rc_contains "deferred --auto=$auto_true refuses" 2 "deferred --auto" "scripts/gh-as-author.sh -- gh pr merge 123 --auto=$auto_true --squash" CLEAN
+done
+assert_rc_contains "an explicit false auto flag remains an immediate merge" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 --auto=false --squash' CLEAN
 assert_rc_contains "deferred auto-merge refuses even before a review blocker arrives" 2 "deferred --auto" 'scripts/gh-as-author.sh -- gh pr merge 123 --auto --squash' CLEAN
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "a later command cannot supply the head precondition" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match ; echo --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" BLOCKED
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "literal export form preserves a scoped owner tiebreak" 0 "owner tiebreak" "export BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ; $merge_overrides" BLOCKED
