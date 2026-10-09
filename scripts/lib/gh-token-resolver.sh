@@ -20,6 +20,24 @@ gh_resolver_repo_root() {
   printf '%s\n' "$this_dir"
 }
 
+# Public wrappers can enter with preflight credentials already exported.
+# Reject repository-relative command search before any external tool runs;
+# absolute operator-selected PATH directories remain the trust boundary.
+gh_wrapper_validate_path() {
+  local remaining="${PATH-}" entry
+  while :; do
+    entry="${remaining%%:*}"
+    case "$entry" in
+      /*) ;;
+      *) echo "gh-as-wrapper: refusing relative or empty PATH entry before credential-bearing command lookup." >&2; return 5 ;;
+    esac
+    case "$remaining" in
+      *:*) remaining="${remaining#*:}" ;;
+      *) break ;;
+    esac
+  done
+}
+
 # gh sends GH_TOKEN only to github.com; any other host reads
 # GH_ENTERPRISE_TOKEN / GITHUB_ENTERPRISE_TOKEN, then a stored login. The
 # wrappers set both to this fixed non-credential value for the wrapped command:
@@ -180,8 +198,8 @@ gh_author_git_push() { # <token> <owner/repo> -C <dir> push -u origin HEAD
     echo "gh-as-author: refusing git push: $dir/.git is not a plain directory (linked worktree, submodule or gitdir file)." >&2
     return 5
   fi
-  gitdir="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR "$git_bin" -C "$top" rev-parse --absolute-git-dir 2>/dev/null)" || gitdir=""
-  common="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR "$git_bin" -C "$top" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || common=""
+  gitdir="$(unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR; "$git_bin" -C "$top" rev-parse --absolute-git-dir 2>/dev/null)" || gitdir=""
+  common="$(unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR; "$git_bin" -C "$top" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || common=""
   if [ "$gitdir" != "$top/.git" ] || [ "$common" != "$top/.git" ] || [ -e "$top/.git/config.worktree" ]; then
     echo "gh-as-author: refusing git push: $dir is not a primary repository whose git dir is $dir/.git." >&2
     return 5
@@ -190,7 +208,7 @@ gh_author_git_push() { # <token> <owner/repo> -C <dir> push -u origin HEAD
   local cfg entry key value seen=" " bad="" rc=0
   local want_https="https://github.com/$expected.git" want_ssh="git@github.com:$expected.git"
   cfg="$(mktemp "${TMPDIR:-/tmp}/gh-as-author-cfg.XXXXXX")" || return 5
-  env -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT "$git_bin" config --file "$top/.git/config" --no-includes --list -z >"$cfg" 2>/dev/null || rc=$?
+  (unset GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT; "$git_bin" config --file "$top/.git/config" --no-includes --list -z) >"$cfg" 2>/dev/null || rc=$?
   if [ "$rc" -ne 0 ]; then
     rm -f "$cfg"
     echo "gh-as-author: refusing git push: could not parse $dir/.git/config." >&2

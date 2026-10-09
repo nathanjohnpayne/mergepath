@@ -1278,14 +1278,14 @@ else
 fi
 # Restore only the old bare validation probes in a temporary library. This
 # control proves the public-wrapper fixture reaches the earlier exposure.
-sed 's/GIT_COMMON_DIR "\$git_bin" -C/GIT_COMMON_DIR git -C/g; s/GIT_CONFIG_COUNT "\$git_bin" config/GIT_CONFIG_COUNT git config/g; /git_bin="$(gh_author_resolve_git)" || return 5/d' \
+sed 's/"\$git_bin" -C "\$top" rev-parse/git -C "\$top" rev-parse/g; s/"\$git_bin" config --file/git config --file/g; /git_bin="$(gh_author_resolve_git)" || return 5/d' \
   "$ROOT/scripts/lib/gh-token-resolver.sh" >"$WORKDIR/unguarded-preflight-resolver.sh"
 # The copied resolver must still locate the production identity checker.
 printf '\ngh_resolver_repo_root() { printf "%%s\\n" %q; }\n' "$ROOT" >>"$WORKDIR/unguarded-preflight-resolver.sh"
 # Source the production wrapper text with just its resolver include redirected.
 sed "s#\. \"\$ROOT/scripts/lib/gh-token-resolver.sh\"#. \"$WORKDIR/unguarded-preflight-resolver.sh\"#" "$WRAPPER" >"$WORKDIR/unguarded-author-wrapper.sh"
 # Preserve its trusted repository root rather than the temporary file's root.
-sed "s#^ROOT=.*#ROOT=\"$ROOT\"#" "$WORKDIR/unguarded-author-wrapper.sh" >"$WORKDIR/unguarded-author-root.sh"
+sed "s#^ROOT=.*#ROOT=\"$ROOT\"#; /gh_wrapper_validate_path || exit 5/d" "$WORKDIR/unguarded-author-wrapper.sh" >"$WORKDIR/unguarded-author-root.sh"
 rm -f "$WORKDIR/git-path-captured"
 set +e
 (cd "$WORKDIR" && PATH="relative-bin:$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" \
@@ -1297,6 +1297,56 @@ if [ "$(cat "$WORKDIR/git-path-captured" 2>/dev/null)" = ghp_author-token ]; the
 else
   fail "real wrapper preflight control did not reach the vulnerable validation probe"
 fi
+
+# The entry fence protects every command lookup, including env before Git.
+mkdir -p "$WORKDIR/relative-env-bin"
+cat >"$WORKDIR/relative-env-bin/env" <<'ENV_CANARY'
+#!/bin/sh
+# TOKEN_OUTPUT_EXEMPT: ambient credentials scrubbed; fake token pinned below.
+printf '%s' "${OP_PREFLIGHT_AUTHOR_PAT:-}" >"$AUTHOR_PATH_CAPTURE"
+exit 1
+ENV_CANARY
+chmod +x "$WORKDIR/relative-env-bin/env"
+rm -f "$WORKDIR/env-path-captured"
+set +e
+(cd "$WORKDIR" && PATH="relative-env-bin:$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" \
+  AUTHOR_PATH_CAPTURE="$WORKDIR/env-path-captured" OP_PREFLIGHT_AUTHOR_PAT=ghp_author-token \
+  GH_AS_AUTHOR_PUSH_REPO=example/repo "$WRAPPER" -- git -C "$PUSHREPO" push -u origin HEAD) >/dev/null 2>&1
+relative_env_rc=$?
+set -e
+if [ "$relative_env_rc" -eq 5 ] && [ ! -e "$WORKDIR/env-path-captured" ]; then
+  pass "real wrapper: relative env cannot read the exported preflight fixture token"
+else
+  fail "real wrapper relative env guard: rc=$relative_env_rc"
+fi
+# Restoring the old env probes and removing only the entry fence demonstrates
+# the exposure under the same real-wrapper fixture.
+sed 's/unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR; /env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR /g' \
+  "$ROOT/scripts/lib/gh-token-resolver.sh" >"$WORKDIR/unguarded-env-resolver.sh"
+printf '\ngh_resolver_repo_root() { printf "%%s\\n" %q; }\n' "$ROOT" >>"$WORKDIR/unguarded-env-resolver.sh"
+sed "s#^ROOT=.*#ROOT=\"$ROOT\"#; s#\. \"\$ROOT/scripts/lib/gh-token-resolver.sh\"#. \"$WORKDIR/unguarded-env-resolver.sh\"#; /gh_wrapper_validate_path || exit 5/d" "$WRAPPER" >"$WORKDIR/unguarded-env-wrapper.sh"
+set +e
+(cd "$WORKDIR" && PATH="relative-env-bin:$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" \
+  AUTHOR_PATH_CAPTURE="$WORKDIR/env-path-captured" OP_PREFLIGHT_AUTHOR_PAT=ghp_author-token \
+  GH_AS_AUTHOR_PUSH_REPO=example/repo bash "$WORKDIR/unguarded-env-wrapper.sh" -- git -C "$PUSHREPO" push -u origin HEAD) >/dev/null 2>&1
+set -e
+if [ "$(cat "$WORKDIR/env-path-captured" 2>/dev/null)" = ghp_author-token ]; then
+  pass "positive control: unguarded env probes capture the exported preflight fixture token"
+else
+  fail "relative env positive control did not reach the unsafe probe"
+fi
+# Both public wrapper identities share the fence before credential validation.
+for public_wrapper in "$WRAPPER" "$ROOT/scripts/gh-as-reviewer.sh"; do
+  for unsafe_path in 'relative-env-bin' '.' ''; do
+    set +e
+    (cd "$WORKDIR" && PATH="$unsafe_path:$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" \
+      OP_PREFLIGHT_AUTHOR_PAT=ghp_author-token OP_PREFLIGHT_REVIEWER_PAT=ghp_reviewer-token \
+      "$public_wrapper" -- gh pr view 123) >/dev/null 2>&1
+    wrapper_path_rc=$?
+    set -e
+    if [ "$wrapper_path_rc" -eq 5 ]; then pass "$(basename "$public_wrapper"): unsafe PATH '$unsafe_path' refuses at entry"; else fail "wrapper PATH fence rc=$wrapper_path_rc"; fi
+  done
+done
 
 # The trace marker: written after every check, immediately before the gh
 # write; never on a refusal; exit 70 when unwritable; never inherited.

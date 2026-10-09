@@ -45,9 +45,10 @@
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "${BASH_SOURCE[0]%/*}/.." && pwd -P)"
 # shellcheck source=lib/gh-token-resolver.sh
 . "$ROOT/scripts/lib/gh-token-resolver.sh"
+gh_wrapper_validate_path || exit 5
 # shellcheck source=lib/pr-body-contract.sh
 . "$ROOT/scripts/lib/pr-body-contract.sh"
 # shellcheck source=lib/gh-command-classifier.sh
