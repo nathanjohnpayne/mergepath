@@ -109,7 +109,9 @@ case "$endpoint" in
     if [ "$jq_filter" = .id ]; then printf '900\n'; else printf '{"id":900}\n'; fi
     ;;
   repos/acme/widget/issues/[0-9]*/comments)
-    if [ "$method" = POST ]; then printf '{"id": 901}\n'; else printf '[]\n'; fi
+    if [ "$method" = POST ]; then printf '{"id": 901}\n';
+    elif [ -n "${RELAY_COMMENTS_FILE:-}" ]; then cat "$RELAY_COMMENTS_FILE";
+    else printf '[]\n'; fi
     ;;
   repos/acme/widget/check-runs/[0-9]*)
     [ "$method" = PATCH ] || exit 65
@@ -655,6 +657,11 @@ if [ "${FAIL_RELAY_PROVENANCE:-false}" = true ] && [[ "${1:-}" == *verified-rela
   echo 'provenance API unavailable' >&2
   exit 2
 fi
+if [ -n "${RELAY_PROVENANCE_RESULT:-}" ] && [[ "${1:-}" == *verified-relay-markers.py ]]; then
+  cat >/dev/null
+  cat "$RELAY_PROVENANCE_RESULT"
+  exit 0
+fi
 exec "$REAL_RELAY_PYTHON" "$@"
 PYSH
 chmod +x "$BIN/python3"
@@ -693,6 +700,31 @@ if grep -F -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG" >/dev/nu
 else
   fail "no-lease cleanup lost its bound-head failure fallback: $(cat "$GH_LOG")"
 fi
+
+# Completion can suppress the no-lease failure only after provenance proof.
+printf '[{"id":99,"user":{"login":"github-actions[bot]"},"created_at":"2026-09-26T10:00:00Z","body":"<!-- mergepath-feedback-archive-relay:v1 run=501 status=complete -->"}]\n' > "$TMP/raw-completion.json"
+printf '[]\n' > "$TMP/unverified-completion.json"
+for disposition in unverified unavailable verified; do
+  : >"$GH_LOG"
+  proof="$TMP/unverified-completion.json"; unavailable=false
+  case "$disposition" in verified) proof="$TMP/raw-completion.json" ;; unavailable) unavailable=true ;; esac
+  set +e
+  PATH="$BIN:$PATH" GH_LOG="$GH_LOG" CANDIDATES="$CANDIDATES" FAIL_PR_HEAD_READ=true \
+    RELAY_COMMENTS_FILE="$TMP/raw-completion.json" RELAY_PROVENANCE_RESULT="$proof" FAIL_RELAY_PROVENANCE="$unavailable" \
+    RUNNER_TEMP="$TMP" REPO="$BASE_REPO" PR_NUMBER=41 SOURCE_RUN_ID=501 CHECK_ID='' \
+    BOUND_HEAD_SHA="$PUBLISH" CHECK_NAME='Codex P1 unresolved threads' "$CLEANUP" \
+    >"$TMP/cleanup.out" 2>"$TMP/cleanup.err"
+  CLEANUP_RC=$?
+  set -e
+  if [ "$disposition" = verified ]; then
+    if [ "$CLEANUP_RC" -eq 0 ] && ! grep -F -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG" >/dev/null; then
+      pass "verified completion retains its already published relay result"
+    else fail "verified completion lost its completion authority"; fi
+  elif grep -F -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG" >/dev/null \
+       && grep -F -- "head_sha=$PUBLISH" "$GH_LOG" >/dev/null; then
+    pass "$disposition completion cannot suppress the no-lease failure"
+  else fail "$disposition completion suppressed the no-lease failure"; fi
+done
 
 # The bind step (Resolve the source PR) retries the resolver's retryable
 # rc 3 on the same bounded schedule as the failure publisher, and stops on the

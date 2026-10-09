@@ -549,7 +549,14 @@ jobs:
           fi
           latest_status=""
           if [ "$marker_rc" -eq 0 ]; then
-            latest_status=$(printf '%s' "$comments" | jq -r --argjson run "$SOURCE_RUN_ID" '
+            verified_comments='[]'
+            if ! verified_comments=$(printf '%s' "$comments" \
+              | python3 scripts/workflow/verified-relay-markers.py \
+                --repo "$REPO" --pr "$PR_NUMBER"); then
+              echo "::warning::Relay provenance is unavailable; publishing a PR-head failure rather than retaining stale clearance"
+              marker_rc=1
+            else
+              latest_status=$(printf '%s' "$verified_comments" | jq -r --argjson run "$SOURCE_RUN_ID" '
               [
                 .[]
                 | select(.user.login == "github-actions[bot]")
@@ -562,7 +569,8 @@ jobs:
               ]
               | sort_by(.created_at, .id)
               | (last.status // "")
-            ') || marker_rc=$?
+              ') || marker_rc=$?
+            fi
           fi
           if [ "$marker_rc" -eq 0 ] && [ "$latest_status" != complete ] \
             && [ "$latest_status" != failed ]; then
