@@ -365,6 +365,10 @@ class CIProvider:
                     self._orphans.move_to_end(orphan_key)
                     while len(self._orphans) > self.jobs_cache:
                         self._orphans.popitem(last=False)
+                else:
+                    # A read that finds the attempt staffed retires its entry, so a later clock
+                    # step cannot bring the obsolete empty list back.
+                    self._orphans.pop(orphan_key, None)
         # Every check-run of an open-PR HEAD is read. The latest filter keeps one run per name
         # by completion time, which cannot prove that a success started after the failure it
         # hides. Scheduled sweeps attach check-runs to default-branch SHAs for days (2,052

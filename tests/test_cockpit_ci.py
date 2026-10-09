@@ -148,7 +148,7 @@ def orphan_run(run_id=30, created='2026-10-06T08:20:00Z', sha=OTHER_SHA, updated
     return run
 
 
-def orphan_fixture(on_head=False, runs=None, jobs=None, clock=None):
+def orphan_fixture(on_head=False, runs=None, jobs=None, clock=None, checks=None):
     runs = runs if runs is not None else [orphan_run(sha=SHA if on_head else OTHER_SHA)]
     calls = []
     class Client:
@@ -157,7 +157,7 @@ def orphan_fixture(on_head=False, runs=None, jobs=None, clock=None):
             if '/pulls?' in route: return [{'number': 7, 'head': {'sha': SHA}}]
             if '/actions/runs?' in route: return runs
             if '/jobs?' in route: return (jobs or {}).get(route.split('/runs/')[1].split('/')[0], [])
-            if '/check-runs?' in route: return []
+            if '/check-runs?' in route: return checks or []
             raise AssertionError('unexpected route: ' + route)
     clock = clock or [ORPHAN_NOW]
     provider = CIProvider(Client(), INVENTORY, clock=lambda: clock[0], monotonic=lambda: 0)
@@ -165,8 +165,13 @@ def orphan_fixture(on_head=False, runs=None, jobs=None, clock=None):
     return {'data': copy_json_tree(sample.data), 'hot': sample.hot, 'calls': calls, 'provider': provider}
 
 
+def failed_rerun_orphan():
+    run = orphan_run(sha=SHA); run.update(run_attempt=2, run_started_at='2026-10-06T08:00:00Z', created_at='2026-10-05T00:00:00Z')
+    return orphan_fixture(runs=[run], jobs={'30': [raw_job(300, 100)]}, checks=[raw_check(100)])
+
+
 def browser_fixtures():
-    fixtures = {'model': model(), 'unicode': unicode_model_and_excerpt(),
+    fixtures = {'model': model(), 'unicode': unicode_model_and_excerpt(), 'orphan:actionable': failed_rerun_orphan()['data'],
                 'orphan:False': orphan_fixture(False)['data'], 'orphan:True': orphan_fixture(True)['data'],
                 'workflow-no-pr': unmatched_checks_fixture(checks=[raw_check()], run_prs=[]),
                 'no-head': unmatched_checks_fixture(head=None)}
@@ -593,6 +598,21 @@ class ProviderTests(unittest.TestCase):
         clock[0] += 1; provider(5); self.assertEqual(jobs(), 2, 'an unchanged orphan is read again after ORPHAN_RECHECK_SECONDS')
         clock[0] += 60; provider(5); self.assertEqual(jobs(), 2, 'the re-read restarts the interval')
         clock[0] -= 3600; provider(5); self.assertEqual(jobs(), 3, 'a clock step backwards reads again')
+
+    def test_an_orphaned_rerun_keeps_its_earlier_attempts_unsuperseded_failure_actionable(self):
+        row = failed_rerun_orphan()['data']['runs'][0]
+        self.assertTrue(row['orphaned']); self.assertTrue(row['actionable']); self.assertEqual(row['current_head'], True)
+        self.assertEqual([job['attempt'] for job in row['jobs']], ['1'])
+
+    def test_a_recheck_that_finds_a_job_retires_the_cached_orphan(self):
+        run, clock, jobs = orphan_run(), [ORPHAN_NOW], {}
+        result = orphan_fixture(runs=[run], clock=clock, jobs=jobs); provider, calls = result['provider'], result['calls']
+        reads = lambda: sum('/jobs?' in route for route in calls)
+        jobs['30'] = [{**raw_job(300), 'status': 'queued', 'conclusion': None}]
+        clock[0] += 1800; self.assertFalse(provider(5).data['runs'][0]['orphaned']); self.assertEqual(reads(), 2)
+        jobs['30'] = []
+        clock[0] -= 1700; provider(5)
+        self.assertEqual(reads(), 3, 'a retired entry is not reused when the clock steps back into its interval')
 
     def test_orphan_on_an_open_head_does_not_hold_the_hot_cadence(self):
         self.assertFalse(orphan_fixture(True)['hot'])

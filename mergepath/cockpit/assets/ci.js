@@ -44,7 +44,7 @@
         && (checksOnly ? row.rerun_command === null : row.rerun_command === null || row.rerun_command === `gh run rerun ${row.id} --failed --repo ${row.repo}`)
         && (!row.actionable || row.current_head === true && row.severity !== null)
         && (row.orphaned === undefined || row.orphaned === false || row.orphaned === true && !checksOnly && row.status === "queued"
-          && row.jobs_scope === "all-attempts" && !row.jobs.some(job => job.attempt === null || job.attempt === row.attempt) && !row.actionable));
+          && row.jobs_scope === "all-attempts" && !row.jobs.some(job => job.attempt === null || job.attempt === row.attempt)));
       keys.add(row.key);
       const jobIds = new Set();
       for (const job of row.jobs) {
@@ -75,8 +75,10 @@
   function runTone(row) {
     if (row.kind === "checks" && row.checks.length === 0) return {state: "idle", label: "No check observations"};
     if (row.actionable) return {state: row.severity, label: row.severity === "boulder" ? row.reason === "Observed installation rate-limit failure" ? "Token exhausted" : "Not retryable" : "Stale failure"};
-    if (row.superseded && !(row.kind === "checks" && live.includes(row.status))) return {state: "idle", label: "Failed · superseded"};
+    // An orphaned rerun can carry an earlier attempt's failure: an unsuperseded current-HEAD one stays
+    // actionable above, while superseded history yields to the attempt's own orphaned state.
     if (row.orphaned === true) return {state: "idle", label: "Orphaned"};
+    if (row.superseded && !(row.kind === "checks" && live.includes(row.status))) return {state: "idle", label: "Failed · superseded"};
     if (live.includes(row.status)) return {state: "running", label: row.status === "in_progress" ? "Running" : "Queued"};
     if (failures.includes(row.conclusion)) return {state: "idle", label: row.current_head === false ? "Failed · old HEAD" : row.current_head === null ? "Failed · HEAD unknown" : "Failed"};
     if (row.kind === "checks" && row.current_head !== true) return {state: "idle", label: row.current_head === false ? "Checks · old HEAD" : "Checks · HEAD unknown"};
