@@ -7,7 +7,7 @@
 #
 # Usage:
 #   scripts/gh-as-author.sh -- gh pr create --title ... --body-file pr-body.md
-#   scripts/gh-as-author.sh -- gh pr merge 123 --squash --delete-branch
+#   scripts/gh-as-author.sh -- gh pr merge 123 --squash --delete-branch --match-head-commit <full-current-head-sha>
 #   scripts/gh-as-author.sh -- gh pr edit 123 --add-label foo
 #   GH_AS_AUTHOR_PUSH_REPO=owner/repo scripts/gh-as-author.sh -- git -C <dir> push -u origin HEAD
 #
