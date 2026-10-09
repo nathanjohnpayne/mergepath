@@ -1989,6 +1989,10 @@ for i in "${!TOKENS[@]}"; do
           GLOBAL_REPO="${tok#-R=}"
           continue
           ;;
+        -R?*)
+          GLOBAL_REPO="${tok#-R}"
+          continue
+          ;;
         --repo=*)
           GLOBAL_REPO="${tok#--repo=}"
           continue
@@ -2021,6 +2025,10 @@ for i in "${!TOKENS[@]}"; do
         ;;
       -R=*)
         GLOBAL_REPO="${tok#-R=}"
+        continue
+        ;;
+      -R?*)
+        GLOBAL_REPO="${tok#-R}"
         continue
         ;;
       --repo=*)
@@ -3345,6 +3353,10 @@ for j in "${!TOKENS[@]}"; do
       ;;
     -R=*)
       REPO_ARG="${tok#-R=}"
+      continue
+      ;;
+    -R?*)
+      REPO_ARG="${tok#-R}"
       continue
       ;;
     --body|-b|--body-file|-F|--subject|-t|--author-email|-A)

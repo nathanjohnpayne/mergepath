@@ -36,6 +36,9 @@ case "${1:-} ${2:-}" in
     exit 0
     ;;
   "pr view")
+    if [ -n "${STUB_EXPECT_REPO:-}" ]; then
+      case " $* " in *" --repo $STUB_EXPECT_REPO "*) ;; *) exit 9 ;; esac
+    fi
     json_fields=""
     for ((i=1; i<=$#; i++)); do
       if [ "${!i}" = "--json" ]; then
@@ -80,6 +83,9 @@ case "${1:-} ${2:-}" in
       exit 0
     fi
     [ "${STUB_REVIEW_FAILURE:-0}" = 0 ] || exit 1
+    if [ -n "${STUB_EXPECT_REPO:-}" ]; then
+      case "$*" in *"repos/$STUB_EXPECT_REPO/pulls/"*) ;; *) exit 9 ;; esac
+    fi
     case "$*" in *"--paginate --slurp"*) ;; *) exit 1 ;; esac
     if [ -n "${STUB_REVIEW_PAGES:-}" ]; then printf '%s\n' "$STUB_REVIEW_PAGES"; else echo '[[]]'; fi
     ;;
@@ -148,6 +154,9 @@ review_pages="[[$change_review]]"
 merge_overrides='BREAK_GLASS_ADMIN=1 BREAK_GLASS_MERGE_STATE=1 scripts/gh-as-author.sh -- gh pr merge 123 --admin --squash --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "admin and merge-state overrides do not decide a reviewer disagreement" 2 "nathanpayne-codex" "$merge_overrides" BLOCKED
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "ordinary merge blocks an older-head change request" 2 "bbbbbbbb" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash'
+for compact_merge in 'gh -Rother/repo pr merge 123' 'gh pr -Rother/repo merge 123' 'gh pr merge -Rother/repo 123' 'gh pr merge 123 -Rother/repo'; do
+  STUB_EXPECT_REPO=other/repo STUB_PR_URL=https://github.com/other/repo/pull/123 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "compact repository selector binds metadata and disagreement reads ($compact_merge)" 2 "CHANGES_REQUESTED" "scripts/gh-as-author.sh -- $compact_merge --squash --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+done
 for new_state in APPROVED; do
   newer_review="${change_review/\"id\":1/\"id\":2}"
   newer_review="${newer_review/CHANGES_REQUESTED/$new_state}"
