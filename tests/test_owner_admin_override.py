@@ -141,6 +141,30 @@ print(json.dumps(result))
             self.assertEqual(self.run_prepare().returncode, 2)
         self.assertEqual(self.run_prepare({**AUTH, 'allow_codex_inflight': True}).returncode, 0)
 
+    def test_whitespace_padded_commands_do_not_start_requests(self):
+        for command in (' @codex review', '@codex review ', '@codex review\n'):
+            with self.subTest(command=command):
+                self.state['comments'] = [{'user': {'login': 'nathanjohnpayne'}, 'body': command,
+                                           'created_at': '2026-01-01T00:00:01Z'}]
+                result = self.run_prepare()
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_audit_retains_recorded_governing_bot_after_policy_changes(self):
+        self.state['policy'] = {'codex': {'bot_login': 'historical-codex[bot]'}}
+        request = {'user': {'login': 'nathanjohnpayne'}, 'body': '@codex review',
+                   'created_at': '2026-01-01T00:00:01Z'}
+        response = {'user': {'login': 'historical-codex[bot]'}, 'commit_id': HEAD,
+                    'body': 'review complete', 'submitted_at': '2026-01-01T00:00:02Z'}
+        self.state.update(comments=[request], reviews=[response])
+        self.assertEqual(self.run_prepare().returncode, 0)
+        posted = json.loads((self.path / 'posted.json').read_text())
+        payload = {'pr': {'html_url': URL, 'head': {'sha': HEAD}, 'merged_at': '2026-01-01T00:02:00Z'},
+                   'author': 'nathanjohnpayne', 'codex_bot_login': 'replacement-codex[bot]',
+                   'comments': [request, posted], 'reviews': [response], 'inline_comments': []}
+        self.assertTrue(override.audit(payload)['recorded_override'])
+        response['user']['login'] = 'replacement-codex[bot]'
+        self.assertFalse(override.audit(payload)['recorded_override'])
+
     def test_existing_record_must_postdate_authorization(self):
         record = {**AUTH, 'authorized_at': '2026-01-01T00:00:30Z'}
         self.assertEqual(self.run_prepare(record).returncode, 0)
@@ -339,7 +363,8 @@ const github={rest:{issues:{listComments:'comments'},pulls:{listReviews:'reviews
         self.assertEqual(self.run_prepare().returncode, 0)
         posted = json.loads((self.path / 'posted.json').read_text())
         record = json.loads(posted['body'].split('```json\n', 1)[1].rsplit('\n```', 1)[0])
-        for key, value in (('version', True), ('observed_codex_inflight', 'false'),
+        for key, value in (('version', True), ('observed_codex_bot_login', ''),
+                           ('observed_codex_bot_login', 9), ('observed_codex_inflight', 'false'),
                            ('observed_fresh_escalation', 0), ('observed_red_gates', 'lint')):
             bad = copy.deepcopy(record)
             bad[key] = value
@@ -362,9 +387,10 @@ const github={rest:{issues:{listComments:'comments'},pulls:{listReviews:'reviews
         response['created_at'] = '2026-01-01T00:01:59Z'
         self.assertTrue(override.audit(payload)['recorded_override'])
         payload['codex_bot_login'] = 'custom-codex[bot]'
-        self.assertFalse(override.audit(payload)['recorded_override'])
-        response['user']['login'] = 'custom-codex[bot]'
         self.assertTrue(override.audit(payload)['recorded_override'])
+        response['user']['login'] = 'custom-codex[bot]'
+        self.assertFalse(override.audit(payload)['recorded_override'])
+        response['user']['login'] = override.BOT
         request['updated_at'] = '2026-01-01T00:03:00Z'
         self.assertFalse(override.audit(payload)['recorded_override'])
         request['body'] = 'edited away'
@@ -383,7 +409,7 @@ const github={rest:{issues:{listComments:'comments'},pulls:{listReviews:'reviews
         self.assertFalse(override.audit(payload)['recorded_override'])
         summary['user']['login'] = 'custom-codex[bot]'
         payload['codex_bot_login'] = 'custom-codex[bot]'
-        self.assertFalse(override.audit(payload)['recorded_override'])
+        self.assertTrue(override.audit(payload)['recorded_override'])
 
 
 if __name__ == '__main__':

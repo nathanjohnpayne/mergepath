@@ -199,7 +199,7 @@ def codex_inflight(comments, reviews, inline, head, author, at=None, bot=BOT):
     inline = [comment for comment in inline if visible(comment, 'created_at')]
     requests = [comment['created_at'] for comment in comments
                 if comment.get('user', {}).get('login') == author
-                and comment.get('body', '').strip().lower() == '@codex review']
+                and comment.get('body', '').lower() == '@codex review']
     responses = [review['submitted_at'] for review in reviews
                  if review.get('user', {}).get('login') == bot and review.get('commit_id') == head
                  and (review.get('body', '').strip() or not any(comment.get('pull_request_review_id') == review.get('id') for comment in inline)
@@ -313,7 +313,7 @@ def prepare(argv, *, check_only=False):
         return  # Authorization semantics verified without any GitHub write.
     red = sorted({check.get('name') or check.get('context') or '<unnamed>' for check in pr['statusCheckRollup']
                   if (check.get('conclusion') or check.get('state')) not in ('SUCCESS', 'NEUTRAL', 'SKIPPED')})
-    published = {**record, 'observed_red_gates': red, 'observed_codex_inflight': inflight,
+    published = {**record, 'observed_codex_bot_login': bot, 'observed_red_gates': red, 'observed_codex_inflight': inflight,
                  'observed_fresh_escalation': fresh_escalation}
     body = MARKER + '\n```json\n' + json.dumps(published, sort_keys=True, indent=2) + '\n```'
     def in_authorization_window(comment):
@@ -357,10 +357,12 @@ def audit(payload):
             continue
         try:
             record = json.loads(match.group(1))
-            observed = {'observed_red_gates', 'observed_codex_inflight', 'observed_fresh_escalation'}
+            observed = {'observed_codex_bot_login', 'observed_red_gates', 'observed_codex_inflight', 'observed_fresh_escalation'}
             if not isinstance(record, dict) or set(record) != FIELDS | observed:
                 continue
-            if (type(record['observed_codex_inflight']) is not bool
+            if (not isinstance(record['observed_codex_bot_login'], str)
+                    or not record['observed_codex_bot_login'].strip()
+                    or type(record['observed_codex_inflight']) is not bool
                     or type(record['observed_fresh_escalation']) is not bool
                     or not isinstance(record['observed_red_gates'], list)
                     or not all(isinstance(gate, str) for gate in record['observed_red_gates'])):
@@ -378,7 +380,7 @@ def audit(payload):
                 continue
             if (record['observed_codex_inflight'] or codex_inflight(
                     payload['comments'], payload['reviews'], payload['inline_comments'],
-                    pr['head']['sha'], author, pr['merged_at'], bot=payload.get('codex_bot_login', BOT))) and not record['allow_codex_inflight']:
+                    pr['head']['sha'], author, pr['merged_at'], bot=record['observed_codex_bot_login'])) and not record['allow_codex_inflight']:
                 continue
             return {'recorded_override': True, 'comment_url': comment['html_url'], 'record': record}
         except (ValueError, KeyError, TypeError):
