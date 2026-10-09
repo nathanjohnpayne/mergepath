@@ -18,6 +18,8 @@ Do NOT use the wizard for:
 
 ## Quick start
 
+Install `gh`, `op`, `git`, mikefarah `yq`, `rsync` and Python 3 before running the wizard. Python 3 is also required by the installed review accounting and relay provenance tools, even when `yq` supplies YAML parsing. Preflight rejects a missing dependency before creating the repository.
+
 ```bash
 # From mergepath's worktree root, on main, clean.
 eval "$(scripts/op-preflight.sh --agent claude --mode all)"   # cache PATs

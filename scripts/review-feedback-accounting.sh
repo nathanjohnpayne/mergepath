@@ -71,6 +71,8 @@ case "$PR_NUMBER" in
   ''|*[!0-9]*) die 2 "PR_NUMBER must be an integer; got '$PR_NUMBER'" ;;
 esac
 [ -n "${GH_TOKEN:-}" ] || die 2 "GH_TOKEN is required"
+command -v python3 >/dev/null 2>&1 && python3 --version >/dev/null 2>&1 \
+  || die 2 "Python 3 is required for authenticated relay provenance; install it before running review accounting"
 
 REPO="${2:-}"
 if [ -z "$REPO" ]; then
