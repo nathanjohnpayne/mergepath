@@ -22,7 +22,8 @@ prefix=$(jq -er '.propagation_prs.branch_prefix // "mergepath-sync/" | select(ty
 ref=$(jq -r '.head.ref' <<<"$metadata") || exit 2
 [[ "$ref" == "$prefix"* ]] || exit 1
 author=$(jq -er '.author_identity | select(type == "string" and length > 0)' <<<"$config") || exit 2
-[ "$(jq -r '.user.login' <<<"$metadata")" = "$author" ] || exit 1
+pr_author=$(jq -r '.user.login' <<<"$metadata") || exit 2
+[ "$pr_author" = "$author" ] || exit 1
 key=${ref#"$prefix"}
 if [[ "$key" =~ ^sync-all-([0-9a-f]{7,40})-[0-9a-f]{12}$ ]]; then
   source_key=${BASH_REMATCH[1]}

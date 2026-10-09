@@ -301,6 +301,16 @@ os.execv(argv[0],argv)
                 self.assertEqual(result.stdout, '')
                 stub.unlink()
 
+    def test_author_lookup_failure_is_indeterminate(self):
+        import shutil
+        real_jq = shutil.which('jq')
+        stub = self.path / 'bin' / 'jq'
+        stub.write_text('#!/bin/sh\nif [ "$1" = "-r" ] && [ "$2" = ".user.login" ]; then exit 1; fi\nexec "' + real_jq + '" "$@"\n')
+        stub.chmod(0o755)
+        result = self.invoke()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, '')
+
     def test_source_lookup_failure_is_indeterminate(self):
         self.environment['LANE_SOURCE_LOOKUP_FAIL'] = '1'
         result = self.invoke()
