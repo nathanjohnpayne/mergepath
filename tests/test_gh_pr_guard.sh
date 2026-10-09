@@ -101,7 +101,7 @@ run_hook() {
   # Existing merge-state fixtures supply the ordinary exact-head precondition.
   # Explicit missing/mismatched tests below opt out or provide their own flag.
   if [[ "$cmd" == *'gh pr merge '* && "$cmd" != *'--match-head-commit'* && "${TEST_UNPINNED_MERGE:-0}" = 0 ]]; then
-    cmd="$cmd --match-head-commit ${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+    cmd="${cmd/gh pr merge /gh pr merge --match-head-commit ${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa} }"
   fi
   local merge_state="${2:-CLEAN}"
   local labels="${3:-}"
@@ -173,6 +173,9 @@ done
 for discovery_prefix in 'GIT_DIR=/other/.git' 'env GIT_WORK_TREE=/other' 'GIT_CONFIG_COUNT=1 ;' 'export GIT_COMMON_DIR=/other ;' 'unset GIT_DIR ;' 'env -u GIT_DIR' 'env --unset=GIT_DIR' 'env -uGIT_DIR' 'env -i'; do
   assert_rc_contains "command-local Git discovery refuses ($discovery_prefix)" 2 "repository-discovery" "$discovery_prefix scripts/gh-as-author.sh -- gh pr merge 123 --squash"
 done
+for eval_repo in 'eval GH_REPO=other/repo ;' 'eval export GH_REPO=other/repo ;' 'eval GIT_DIR=/other ;'; do
+  assert_rc_contains "eval repository changes persist before merge ($eval_repo)" 2 "repository-discovery" "$eval_repo scripts/gh-as-author.sh -- gh pr merge 123 --squash"
+done
 for directory_prefix in 'cd /other &&' 'builtin cd /other ;' 'command cd /other &&' 'pushd /other ;' 'popd ;' 'source /tmp/change-directory.sh ;' '. /tmp/change-directory.sh ;' 'builtin source /tmp/change-directory.sh ;' 'command . /tmp/change-directory.sh ;' 'env -C /other' 'env -C/other' 'env --chdir=/other' 'env --chdir /other'; do
   assert_rc_contains "command-local directory changes refuse ($directory_prefix)" 2 "command-local directory changes" "$directory_prefix scripts/gh-as-author.sh -- gh pr merge 123 --squash"
 done
@@ -234,10 +237,22 @@ for auto_true in true True TRUE t T 1; do
 done
 assert_rc_contains "invalid retraction boolean refuses" 2 "invalid --disable-auto boolean" 'scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto --disable-auto=invalid' CLEAN
 assert_rc_contains "invalid auto boolean refuses" 2 "invalid --auto boolean" 'scripts/gh-as-author.sh -- gh pr merge 123 --auto=invalid' CLEAN
+for cluster in -sb -db -dt -sF -sA -sR; do
+  TEST_UNPINNED_MERGE=1 assert_rc_contains "short cluster cannot grant retraction exception ($cluster)" 2 "unrecognized merge option or short cluster" "scripts/gh-as-author.sh -- gh pr merge 123 $cluster --disable-auto" CLEAN
+done
+for cluster in -sb -dt -sF -sA -sR; do
+  assert_rc_contains "short cluster cannot consume the writer's head precondition ($cluster)" 2 "unrecognized merge option or short cluster" "scripts/gh-as-author.sh -- gh pr merge 123 $cluster --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" CLEAN
+done
+assert_rc_contains "attached body value cannot request retraction" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 -b--disable-auto --squash' CLEAN
+assert_rc_contains "other merge options cannot grant retraction exception" 2 "retraction permits only" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash --disable-auto' CLEAN
 TEST_UNPINNED_MERGE=1 assert_rc_contains "option-looking branch after separator cannot request retraction" 2 "exactly one --match-head-commit" 'scripts/gh-as-author.sh -- gh pr merge -- --disable-auto' CLEAN
 TEST_UNPINNED_MERGE=1 assert_rc_contains "option-looking branch after separator cannot supply head pinning" 2 "exactly one --match-head-commit" 'scripts/gh-as-author.sh -- gh pr merge 123 -- --match-head-commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' CLEAN
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "false-looking branch after separator cannot cancel retraction" 0 "" 'scripts/gh-as-author.sh -- gh pr merge --disable-auto -- --disable-auto=false' BLOCKED needs-external-review
 assert_rc_contains "deferred auto-merge refuses even before a review blocker arrives" 2 "deferred --auto" 'scripts/gh-as-author.sh -- gh pr merge 123 --auto --squash' CLEAN
+for trailing in "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa echo ok" "export BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; do
+  STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "trailing assignment cannot authorize an earlier merge ($trailing)" 2 "CHANGES_REQUESTED" "scripts/gh-as-author.sh -- gh pr merge 123 --squash --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ; $trailing" CLEAN
+done
+assert_rc_contains "trailing command cannot clear merge-local repository environment" 2 "repository-discovery" 'GH_REPO=other/repo scripts/gh-as-author.sh -- gh pr merge 123 --squash --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ; true' CLEAN
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "a later command cannot supply the head precondition" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match ; echo --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" BLOCKED
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "unexported standalone tiebreak grants no authority" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa && $merge_overrides" BLOCKED
 BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "standalone assignment cannot reuse ambient tiebreak" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=invalid ; $merge_overrides" BLOCKED

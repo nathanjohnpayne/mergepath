@@ -23,7 +23,8 @@
 #      `human-hold`, with no CODEX_CLEARED / BREAK_GLASS_* bypass.
 #      This is the human-controlled hard freeze: agents may add the
 #      label, but only the human releases it.
-#   5. gh pr merge (any flavor) — blocks outstanding non-author
+#   5. Immediate gh pr merge (except attributed --disable-auto retraction)
+#      blocks outstanding non-author
 #      CHANGES_REQUESTED reviews, including on older heads. Only a reviewer
 #      approval, dismissal or owner-authorized
 #      BREAK_GLASS_REVIEW_DISAGREEMENT=<PR>@<full-head-sha> releases it;
@@ -2149,7 +2150,6 @@ for i in "${!TOKENS[@]}"; do
       if [ "$SEGMENT_HAS_COMMAND" -eq 1 ]; then
         IDENTITY_ENV_CLEARED_FOR_WRAPPER=0
         INLINE_DIRECTORY_CHANGED=0
-        INLINE_REPO_ENV_SET=0
         INLINE_CODEX_CLEARED=""
         INLINE_BREAK_GLASS_ADMIN=""
         INLINE_BREAK_GLASS_MERGE_STATE=""
@@ -3322,6 +3322,7 @@ MATCH_HEAD_SHA=""
 MATCH_HEAD_COUNT=0
 AUTO_REQUESTED=0
 DISABLE_AUTO_REQUESTED=0
+RETRACTION_ARGS_SAFE=1
 MERGE_FLAGS_ENDED=0
 SKIP_NEXT_AS=""  # "" | "skip" | "repo"
 merge_walk_start=$((PR_SUBCOMMAND_INDEX + 1))
@@ -3356,10 +3357,12 @@ for j in "${!TOKENS[@]}"; do
       continue
       ;;
     --auto)
+      RETRACTION_ARGS_SAFE=0
       AUTO_REQUESTED=1
       continue
       ;;
     --auto=*)
+      RETRACTION_ARGS_SAFE=0
       case "${tok#--auto=}" in
         false|False|FALSE|f|F|0) AUTO_REQUESTED=0 ;;
         true|True|TRUE|t|T|1) AUTO_REQUESTED=1 ;;
@@ -3389,6 +3392,7 @@ for j in "${!TOKENS[@]}"; do
       continue
       ;;
     --admin)
+      RETRACTION_ARGS_SAFE=0
       ADMIN_REQUESTED=1
       continue
       ;;
@@ -3409,13 +3413,19 @@ for j in "${!TOKENS[@]}"; do
       continue
       ;;
     --body|-b|--body-file|-F|--subject|-t|--author-email|-A)
+      RETRACTION_ARGS_SAFE=0
       SKIP_NEXT_AS="skip"
+      continue
+      ;;
+    --body=*|--body-file=*|--subject=*|--author-email=*|-b?*|-F?*|-t?*|-A?*|--squash|--squash=*|--merge|--merge=*|--rebase|--rebase=*|--delete-branch|--delete-branch=*|--help|-s|-m|-r|-d|-h|-s=*|-m=*|-r=*|-d=*|-h=*)
+      RETRACTION_ARGS_SAFE=0
       continue
       ;;
   esac
   case "$tok" in
     -*)
-      continue
+      echo "BLOCKED: unrecognized merge option or short cluster; use supported separate flags so head and retraction arguments remain unambiguous." >&2
+      exit 2
       ;;
   esac
   # First non-flag token after the gh-context `merge` is the
@@ -3425,6 +3435,14 @@ for j in "${!TOKENS[@]}"; do
     PR_SELECTOR="$tok"
   fi
 done
+
+# Retraction's early return accepts only selectors, repository options and
+# the exact head option. Unknown flags or short clusters may consume what
+# looks like --disable-auto as an argument, so they never grant the exception.
+if [ "$DISABLE_AUTO_REQUESTED" -eq 1 ] && [ "$RETRACTION_ARGS_SAFE" -ne 1 ]; then
+  echo "BLOCKED: retraction permits only --disable-auto, repository/selector and head options; remove other merge flags or short clusters." >&2
+  exit 2
+fi
 
 # Deferred merging outlives this local snapshot and cannot enforce a later
 # disagreement in repositories without review-state branch protection.
