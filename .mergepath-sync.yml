@@ -926,6 +926,8 @@ paths:
     # `--body-file` path with no Authoring-Agent or Self-Review check at all.
     # Declaring the contract libs here keeps the two halves inseparable.
     requires:
+      - "scripts/workflow/owner-admin-override.py"
+      - "scripts/lib/feedback-policy-helpers.sh"  # owner preflight parses the immutable base policy
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/identity-check.sh"         # gh-token-resolver.sh executes it before any write
       - "scripts/lib/gh-command-classifier.sh"  # shared guard/wrapper prefix vocabulary
@@ -1091,6 +1093,12 @@ paths:
   - path: tests/test_gh_pr_guard.sh
     type: canonical
     consumers: all
+  - path: tests/test_owner_admin_override.py
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/owner-admin-override.py"
+
   - path: tests/test_gh_as_author.sh
     type: canonical
     consumers: all
@@ -1953,6 +1961,8 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/workflow/owner-admin-override.py"
       - "scripts/workflow/record-merge-queue-authorization.sh"
       - "scripts/lib/merge-queue-protection.sh"
       - "scripts/lib/merge-queue-authorization.sh"
@@ -1977,6 +1987,8 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/workflow/owner-admin-override.py"
       - "scripts/workflow/record-merge-queue-final-audit.sh"
       - "scripts/lib/merge-queue-authorization.sh"
       - "scripts/lib/merge-queue-protection.sh"
@@ -1995,6 +2007,8 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/workflow/owner-admin-override.py"
       - "scripts/lib/merge-queue-authorization.sh"
       - "scripts/lib/merge-queue-protection.sh"
       - "scripts/lib/blocking-labels.sh"
@@ -2027,6 +2041,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/workflow/owner-admin-override.py"
       - "scripts/lib/pr-body-contract.mjs"  # weekly audit uses the canonical rendered-body parser
       - "scripts/workflow/resolve-codex-verdict-anchors.py"
   - path: .github/workflows/codex-p1-gate.yml
@@ -2200,6 +2215,7 @@ paths:
     # closure gap that surfaced as #264 on the original propagation
     # wave (check_gh_as_author missing its tests on every consumer).
     requires:
+      - "scripts/workflow/owner-admin-override.py"
       - "scripts/lib/ci-check-modes.sh"          # shared --check/--self-test selector (#1062)
       - "scripts/lib/blocking-labels.sh"         # check_workflow_parsers shared exact-label predicate (#1062)
       - "scripts/lib/gh-command-classifier.sh"   # shared native/API mutation guard (#1058)
@@ -2353,6 +2369,8 @@ paths:
     # helpers (parse_manifest_paths.sh, match_protected_paths.sh) are
     # already inside this kit; the two scripts/lib/ deps are declared here.
     requires:
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/workflow/owner-admin-override.py"
       - "scripts/lib/template-substitution.sh"   # verify-propagation-pr.sh templated render (#531)
       - "scripts/lib/manifest-fact-helpers.sh"   # verify-propagation-pr.sh consumer-facts load (#531)
       # external_review_fingerprint.sh + external_review_carryforward.sh (both

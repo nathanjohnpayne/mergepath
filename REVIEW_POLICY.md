@@ -1386,3 +1386,7 @@ To reverse the CodeRabbit integration (e.g., if the trial ends):
 2. In each repo where CodeRabbit was enabled: set `coderabbit.enabled: false` in `.github/review-policy.yml` and delete `.coderabbit.yml`.
 3. No documentation changes are needed — all agent instructions route Phase 2.5 through `scripts/coderabbit-should-invoke.sh`, whose decision skips when `coderabbit.enabled: false`.
 4. Optionally remove `.coderabbit.yml` from the template if CodeRabbit will not be used for future repos.
+
+### Recorded owner admin overrides
+
+An explicit owner admin instruction is scoped to one full PR URL, one full HEAD and its UTC authorization timestamp. Use `BREAK_GLASS_ADMIN=<full-PR-URL>@<full-head>` with `MERGEPATH_OWNER_ADMIN_AUTHORIZATION` as defined in [Scoped owner admin overrides](specs/owner_admin_override.md), and exactly one matching `--match-head-commit`. A boolean override is insufficient. The author wrapper posts and verifies the quote and observed red gates before the writer runs. A later human-review escalation or an unfinished Codex review requires its explicit allow field; human-hold and policy-violation still require human label removal. The weekly audit separates valid recorded instructions from unexplained violations.

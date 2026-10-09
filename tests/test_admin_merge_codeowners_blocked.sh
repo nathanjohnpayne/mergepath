@@ -57,8 +57,17 @@ trap 'rm -rf "$SCRATCH"' EXIT
 # script hard-requires at startup (a no-op — the merge is never reached on
 # the refuse paths under test).
 FIXTURE_ROOT="$SCRATCH/repo"
-mkdir -p "$FIXTURE_ROOT/scripts"
+mkdir -p "$FIXTURE_ROOT/scripts/workflow"
 cp "$SCRIPT" "$FIXTURE_ROOT/scripts/admin-merge-codeowners-blocked.sh"
+cp "$ROOT/scripts/workflow/owner-admin-override.py" "$FIXTURE_ROOT/scripts/workflow/owner-admin-override.py"
+mkdir -p "$FIXTURE_ROOT/scripts/lib"
+cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$FIXTURE_ROOT/scripts/lib/feedback-policy-helpers.sh"
+cat > "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" <<'STUB'
+#!/usr/bin/env bash
+echo THREAD-MUTATION >> "$GH_ARGV_LOG"
+exit 1
+STUB
+chmod +x "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh"
 cat > "$FIXTURE_ROOT/scripts/gh-as-author.sh" <<'STUB'
 #!/usr/bin/env bash
 exit 0
@@ -85,9 +94,22 @@ case "$1" in
   pr)
     case "$2" in
       view)
+        case "$*" in
+          *'--json url,headRefOid,baseRefOid,labels'*)
+            echo '{"url":"https://github.com/test/current/pull/99999","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","baseRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","labels":[],"statusCheckRollup":[]}'
+            exit 0 ;;
+          *'--json url,headRefOid'*)
+            if [ "${STUB_MOVE_BEFORE_RESOLVE:-0}" = 1 ]; then
+              echo 'https://github.com/test/current/pull/99999|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|'
+            else
+              echo "https://github.com/test/current/pull/99999|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|${STUB_HOLD_LABEL:-}"
+            fi
+            exit 0
+            ;;
+        esac
         # Gate 1 reads state|mergeable|mergeStateStatus|headRefOid|title via
         # gh's own --jq; the stub returns the already-projected scalar.
-        echo "OPEN|MERGEABLE|BLOCKED|deadbeefHEAD|Test PR (off-page check)"
+        echo "OPEN|MERGEABLE|BLOCKED|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|https://github.com/test/current/pull/99999|Test PR (off-page check)"
         ;;
       merge)
         echo "MERGE-ATTEMPTED" >> "$GH_ARGV_LOG"
@@ -105,10 +127,20 @@ case "$1" in
             cat "$ROLLUP_PAGE1_FILE"
           fi
         else
-          # Gate 3 reviews query (or anything else): no qualifying approval.
-          echo '{}'
+          if [ "${STUB_QUALIFIED_REVIEW:-0}" = 1 ]; then
+            echo '{"data":{"repository":{"pullRequest":{"author":{"login":"nathanjohnpayne"},"reviews":{"pageInfo":{"hasNextPage":false},"nodes":[{"author":{"login":"nathanpayne-codex"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z","commit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]}}}}}'
+          else
+            # Gate 3: no qualifying approval.
+            echo '{}'
+          fi
         fi
         ;;
+      --paginate)
+        if [ "${STUB_CODEX_INFLIGHT:-0}" = 1 ] && [[ "$*" == *issues/*/comments* ]]; then
+          echo '[[{"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-01-01T00:01:00Z"}]]'
+        else echo '[[]]'; fi ;;
+      repos/*/contents/.github/review-policy.yml*) echo '{"encoding":"base64","content":"e30="}' ;;
+      repos/*/collaborators/*/permission) echo write ;;
       *) echo '{}' ;;
     esac
     ;;
@@ -147,6 +179,8 @@ rollup_page() {
 run_admin_merge() {
   # run_admin_merge <page1-file> <page2-file> → captures output + rc
   local page1="$1" page2="$2"
+  local auth_args=()
+  if [ -n "${STUB_AUTHORIZATION_FILE:-}" ]; then auth_args=(--authorization-file "$STUB_AUTHORIZATION_FILE"); fi
   make_gh_stub "$SCRATCH/gh-real"
   make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
   set +e
@@ -156,7 +190,7 @@ run_admin_merge() {
     ROLLUP_PAGE2_FILE="$page2" \
     PATH="$SCRATCH:$PATH" \
     env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
-    bash "$FIXTURE_ROOT/scripts/admin-merge-codeowners-blocked.sh" test/repo#99999 2>&1
+    bash "$FIXTURE_ROOT/scripts/admin-merge-codeowners-blocked.sh" "${auth_args[@]+"${auth_args[@]}"}" test/repo#99999 2>&1
   )
   RUN_RC=$?
   set -e
@@ -209,6 +243,15 @@ rollup_page false "" '[
 
 GH_ARGV_LOG="$SCRATCH/t2.log"; : > "$GH_ARGV_LOG"
 run_admin_merge "$SCRATCH/p1_ok.json" "$SCRATCH/p2_ok.json"
+
+if grep -q 'url: *https://github.com/test/current/pull/99999' <<<"$RUN_OUT" \
+   && grep -q 'headRefOid,url,title' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: renamed input repository uses GitHub's resolved canonical PR URL"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: canonical PR URL was reconstructed from the supplied repository"
+fi
 
 # Past Gate 2 iff no "checks not green" AND the script went on to issue the
 # Gate 3 reviews GraphQL query (reviews(first:100)) — which then finds no
@@ -327,6 +370,84 @@ else
 fi
 
 echo
+# The actual selector keeps batch authorizations specific to each PR/head.
+eval "$(sed -n '/^select_admin_record()/,/^}/p' "$SCRIPT")"
+AUTHORIZATION_FILE="$SCRATCH/authorizations.json"
+jq -n '[{pr_url:"https://github.com/test/repo/pull/1",head_sha:("a"*40),authorization_quote:"first"},
+        {pr_url:"https://github.com/test/repo/pull/2",head_sha:("b"*40),authorization_quote:"second"}]' > "$AUTHORIZATION_FILE"
+selected=$(select_admin_record https://github.com/test/repo/pull/2 "$(printf '%040d' 0 | tr 0 b)")
+if [ "$(printf '%s' "$selected" | jq -r .authorization_quote)" = second ]; then
+  pass=$((pass + 1)); echo "PASS: batch selects only the exact PR/head owner record"
+else
+  fail=$((fail + 1)); echo "FAIL: batch reused another PR authorization"
+fi
+if select_admin_record https://github.com/test/repo/pull/1 "$(printf '%040d' 0 | tr 0 b)" >/dev/null; then
+  fail=$((fail + 1)); echo "FAIL: stale-head authorization accepted"
+else
+  pass=$((pass + 1)); echo "PASS: stale-head authorization refuses"
+fi
+jq '. + [.[1]]' "$AUTHORIZATION_FILE" > "$SCRATCH/duplicates.json"
+AUTHORIZATION_FILE="$SCRATCH/duplicates.json"
+if select_admin_record https://github.com/test/repo/pull/2 "$(printf '%040d' 0 | tr 0 b)" >/dev/null; then
+  fail=$((fail + 1)); echo "FAIL: duplicate authorization accepted"
+else
+  pass=$((pass + 1)); echo "PASS: ambiguous duplicate authorizations refuse"
+fi
+
+
+# Actual entrypoint refuses unauthorized BLOCKED PRs before resolving threads.
+for kind in missing stale duplicate malformed; do
+  case "$kind" in
+    missing) printf '[]\n' > "$SCRATCH/early-auth.json" ;;
+    stale) printf '[{"pr_url":"https://github.com/test/current/pull/99999","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]\n' > "$SCRATCH/early-auth.json" ;;
+    duplicate) printf '[{"pr_url":"https://github.com/test/current/pull/99999","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{"pr_url":"https://github.com/test/current/pull/99999","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]\n' > "$SCRATCH/early-auth.json" ;;
+    malformed) printf '[{"pr_url":"https://github.com/test/current/pull/99999","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]\n' > "$SCRATCH/early-auth.json" ;;
+  esac
+  GH_ARGV_LOG="$SCRATCH/early-$kind.log"; : > "$GH_ARGV_LOG"
+  STUB_QUALIFIED_REVIEW=1 STUB_AUTHORIZATION_FILE="$SCRATCH/early-auth.json" run_admin_merge "$SCRATCH/p1_ok.json" "$SCRATCH/p2_ok.json"
+  if [ "$RUN_RC" -ne 0 ] && grep -q 'refusing before thread mutation' <<<"$RUN_OUT" && ! grep -q 'THREAD-MUTATION' "$GH_ARGV_LOG"; then
+    pass=$((pass + 1)); echo "PASS: $kind authorization refuses before thread mutation"
+  else
+    fail=$((fail + 1)); echo "FAIL: $kind authorization mutated threads or missed the authorization gate: $RUN_OUT"
+  fi
+done
+
+cat > "$SCRATCH/current-auth.json" <<'AUTH'
+[{"version":1,"pr_url":"https://github.com/test/current/pull/99999","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","authorized_at":"2026-01-01T00:00:00Z","authorization_quote":"Merge this exact head.","allow_needs_human_review":false,"allow_codex_inflight":false}]
+AUTH
+GH_ARGV_LOG="$SCRATCH/moved-before-resolve.log"; : > "$GH_ARGV_LOG"
+STUB_MOVE_BEFORE_RESOLVE=1 STUB_QUALIFIED_REVIEW=1 STUB_AUTHORIZATION_FILE="$SCRATCH/current-auth.json" run_admin_merge "$SCRATCH/p1_ok.json" "$SCRATCH/p2_ok.json"
+if [ "$RUN_RC" -ne 0 ] && grep -q 'before thread mutation' <<<"$RUN_OUT" && ! grep -q 'THREAD-MUTATION' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1)); echo "PASS: replacement head refuses before thread mutation"
+else
+  fail=$((fail + 1)); echo "FAIL: replacement head crossed the thread mutation boundary: $RUN_OUT"
+fi
+
+for label in human-hold policy-violation needs-human-review; do
+  GH_ARGV_LOG="$SCRATCH/hold-$label.log"; : > "$GH_ARGV_LOG"
+  STUB_HOLD_LABEL="$label" STUB_QUALIFIED_REVIEW=1 STUB_AUTHORIZATION_FILE="$SCRATCH/current-auth.json" run_admin_merge "$SCRATCH/p1_ok.json" "$SCRATCH/p2_ok.json"
+  if [ "$RUN_RC" -ne 0 ] && grep -q 'before thread mutation' <<<"$RUN_OUT" && ! grep -q 'THREAD-MUTATION' "$GH_ARGV_LOG"; then
+    pass=$((pass + 1)); echo "PASS: $label refuses before thread mutation"
+  else
+    fail=$((fail + 1)); echo "FAIL: $label crossed the thread mutation boundary: $RUN_OUT"
+  fi
+done
+
+GH_ARGV_LOG="$SCRATCH/semantic-clean.log"; : > "$GH_ARGV_LOG"
+STUB_QUALIFIED_REVIEW=1 STUB_AUTHORIZATION_FILE="$SCRATCH/current-auth.json" run_admin_merge "$SCRATCH/p1_ok.json" "$SCRATCH/p2_ok.json"
+if grep -q THREAD-MUTATION "$GH_ARGV_LOG"; then
+  pass=$((pass + 1)); echo "PASS: semantic authorization permits the thread gate without posting a comment"
+else
+  fail=$((fail + 1)); echo "FAIL: valid semantic authorization never reached the thread gate: $RUN_OUT"
+fi
+GH_ARGV_LOG="$SCRATCH/semantic-inflight.log"; : > "$GH_ARGV_LOG"
+STUB_CODEX_INFLIGHT=1 STUB_QUALIFIED_REVIEW=1 STUB_AUTHORIZATION_FILE="$SCRATCH/current-auth.json" run_admin_merge "$SCRATCH/p1_ok.json" "$SCRATCH/p2_ok.json"
+if [ "$RUN_RC" -ne 0 ] && grep -q 'semantic owner authorization refused before thread mutation' <<<"$RUN_OUT" && ! grep -q THREAD-MUTATION "$GH_ARGV_LOG"; then
+  pass=$((pass + 1)); echo "PASS: unanswered Codex request refuses before thread mutation"
+else
+  fail=$((fail + 1)); echo "FAIL: unanswered request crossed the thread mutation boundary: $RUN_OUT"
+fi
+
 if [ "$fail" -eq 0 ]; then
   echo "test_admin_merge_codeowners_blocked: PASS ($pass tests)"
   exit 0

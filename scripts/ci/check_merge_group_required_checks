@@ -261,6 +261,8 @@ paths = manifest.fetch("paths")
 abort "FAIL: sync manifest paths are malformed" unless paths.is_a?(Array)
 
 author_wrapper_runtime = [
+  "scripts/workflow/owner-admin-override.py",
+  "scripts/lib/feedback-policy-helpers.sh",
   "scripts/lib/gh-token-resolver.sh",
   "scripts/identity-check.sh",
   "scripts/lib/gh-command-classifier.sh",

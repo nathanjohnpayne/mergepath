@@ -446,7 +446,7 @@ assert_rc_contains "DIRTY stays blocked (#547 split)" 2 "mergeStateStatus is DIR
   'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "DIRTY" ""
 
 assert_rc_contains "author wrapper pr merge human-hold blocks" 2 "human-hold" \
-  'CODEX_CLEARED=1 BREAK_GLASS_ADMIN=1 BREAK_GLASS_MERGE_STATE=1 scripts/gh-as-author.sh -- gh pr merge 123 --admin --squash' "DIRTY" "human-hold"
+  'CODEX_CLEARED=1 BREAK_GLASS_ADMIN=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa BREAK_GLASS_MERGE_STATE=1 scripts/gh-as-author.sh -- gh pr merge 123 --admin --squash' "DIRTY" "human-hold"
 
 assert_rc_contains "direct pr comment blocked" 2 "token-verifying wrapper" \
   'gh pr comment 123 --body "ping"'
