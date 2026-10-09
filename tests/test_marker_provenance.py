@@ -245,6 +245,8 @@ exclusions: []
         git = binary / 'git'
         git.write_text('''#!/usr/bin/env python3
 import os, sys
+if os.environ.get('LANE_SOURCE_LOOKUP_FAIL') and 'rev-parse' in sys.argv and '--verify' in sys.argv:
+    raise SystemExit(1)
 argv=[os.environ['REAL_GIT']]+[os.environ['CANONICAL_FIXTURE'] if arg=='https://github.com/nathanjohnpayne/mergepath.git' else os.environ['CONSUMER_FIXTURE'] if arg=='https://github.com/acme/widget.git' else arg for arg in sys.argv[1:]]
 os.execv(argv[0],argv)
 ''')
@@ -287,6 +289,23 @@ os.execv(argv[0],argv)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), {
             'source_sha': self.source, 'head_sha': self.head, 'base_sha': self.base})
+
+    def test_setup_failures_are_indeterminate_not_negative_proof(self):
+        for command in ('mktemp', 'chmod', 'mkdir', 'cat'):
+            with self.subTest(command=command):
+                stub = self.path / 'bin' / command
+                stub.write_text('#!/bin/sh\nexit 1\n')
+                stub.chmod(0o755)
+                result = self.invoke()
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, '')
+                stub.unlink()
+
+    def test_source_lookup_failure_is_indeterminate(self):
+        self.environment['LANE_SOURCE_LOOKUP_FAIL'] = '1'
+        result = self.invoke()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, '')
 
     def test_faithful_lane_uses_available_yaml_parser_without_ruby(self):
         ruby = self.path / 'bin/ruby'

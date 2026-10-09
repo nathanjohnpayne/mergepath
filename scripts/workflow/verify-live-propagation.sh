@@ -6,20 +6,20 @@ repo=${1:-} pr=${2:-} head=${3:-} base=${4:-} policy=${5:-}
 [[ "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || exit 2
 [[ "$pr" =~ ^[1-9][0-9]*$ && "$head" =~ ^[0-9a-f]{40}$ && "$base" =~ ^[0-9a-f]{40}$ ]] || exit 2
 [ -f "$policy" ] || exit 2
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-metadata=$(cat)
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd) || exit 2
+metadata=$(cat) || exit 2
 printf '%s' "$metadata" | jq -e --argjson pr "$pr" --arg head "$head" --arg base "$base" '
   .number == $pr and .head.sha == $head and .base.sha == $base
   and (.head.ref | type == "string") and (.user.login | type == "string")
 ' >/dev/null || exit 2
 # shellcheck source=../lib/feedback-policy-helpers.sh
-. "$root/../lib/feedback-policy-helpers.sh"
+. "$root/../lib/feedback-policy-helpers.sh" || exit 2
 config=$(policy_yaml_to_json "$policy") || exit 2
 jq -e 'type == "object"' <<<"$config" >/dev/null || exit 2
-enabled=$(jq -r 'if .propagation_prs.enabled == null then true else .propagation_prs.enabled end' <<<"$config")
+enabled=$(jq -r 'if .propagation_prs.enabled == null then true else .propagation_prs.enabled end' <<<"$config") || exit 2
 case "$enabled" in false) exit 1 ;; true) ;; *) exit 2 ;; esac
 prefix=$(jq -er '.propagation_prs.branch_prefix // "mergepath-sync/" | select(type == "string" and length > 0)' <<<"$config") || exit 2
-ref=$(jq -r '.head.ref' <<<"$metadata")
+ref=$(jq -r '.head.ref' <<<"$metadata") || exit 2
 [[ "$ref" == "$prefix"* ]] || exit 1
 author=$(jq -er '.author_identity | select(type == "string" and length > 0)' <<<"$config") || exit 2
 [ "$(jq -r '.user.login' <<<"$metadata")" = "$author" ] || exit 1
@@ -32,13 +32,13 @@ else
   source_key=$key
 fi
 [[ "$source_key" =~ ^[0-9a-fA-F]{7,40}$ ]] || exit 1
-git_bin=$(command -v git) gh_bin=$(command -v gh)
+git_bin=$(command -v git) gh_bin=$(command -v gh) || exit 2
 case "$git_bin:$gh_bin" in /*:/*) ;; *) exit 2 ;; esac
 case "$gh_bin" in *"'"*|*'\'*) exit 2 ;; esac
-task_dir=$(mktemp -d)
+task_dir=$(mktemp -d) || exit 2
 trap 'rm -rf "$task_dir"' EXIT
-chmod 700 "$task_dir"
-mkdir "$task_dir/home"
+chmod 700 "$task_dir" || exit 2
+mkdir "$task_dir/home" || exit 2
 # Fresh repositories, no inherited Git redirects, configuration or hooks.
 git_environment=()
 for variable in $(compgen -e); do
@@ -53,7 +53,7 @@ git_isolated() {
 # never from this runtime clone or from the consumer's proposed tree.
 git_isolated -c credential.helper= clone --quiet --filter=blob:none --no-checkout \
   https://github.com/nathanjohnpayne/mergepath.git "$task_dir/canonical" || exit 2
-source_sha=$(git_isolated -C "$task_dir/canonical" rev-parse --verify "$source_key^{commit}") || exit 1
+source_sha=$(git_isolated -C "$task_dir/canonical" rev-parse --verify "$source_key^{commit}") || exit 2
 [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || exit 2
 git_isolated -C "$task_dir/canonical" checkout --quiet --detach "$source_sha" || exit 2
 git_isolated init --quiet "$task_dir/consumer" || exit 2
@@ -72,4 +72,4 @@ printf '%s' "$current" | jq -e --arg head "$head" --arg base "$base" \
 # Data-only provenance for trusted curated-wave capture. Callers that only
 # need the eligibility predicate may discard stdout.
 jq -cn --arg source "$source_sha" --arg head "$head" --arg base "$base" \
-  '{source_sha:$source,head_sha:$head,base_sha:$base}'
+  '{source_sha:$source,head_sha:$head,base_sha:$base}' || exit 2
