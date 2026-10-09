@@ -2126,16 +2126,10 @@ fi  # end REQUIRE_CI_GREEN
 
 # --- Codex issue-comment verdict signal (#600 / #567) ----------------------
 #
-# Codex posts its review verdict as a PR ISSUE COMMENT
-# (issues/{pr}/comments), e.g. "Codex Review: Didn't find any major issues.
-# Swish!" followed by a "**Reviewed commit:** <sha>" line — NOT always a
-# review object or a 👍 reaction (#567). The 👍 reaction additionally
-# EXPIRES after reaction_freshness_window_seconds and Codex does not
-# reliably re-post it on a re-review, so a genuinely-clean Codex clearance
-# can manifest purely as this issue-comment verdict. Recognize a
-# HEAD-anchored AFFIRMATIVE verdict as a clearance signal for gate (b)
-# branch 2 and gate (c) (#600); this ADDS to — never replaces — the
-# existing review-object and 👍 paths.
+# Codex can post its verdict as a PR issue comment rather than a review
+# object. An affirmative Reviewed commit verdict supplies commit-anchored
+# evidence for gate (b) branch 2 and gate (c). PR-level reactions have no
+# reviewed commit and never supply clearance (#1751).
 #
 # Fail-closed matching — a comment qualifies as CODEX_HEAD_VERDICT_TIME
 # ONLY when ALL hold:
@@ -2318,7 +2312,7 @@ if [ "$CODEX_ENABLED" = "true" ]; then
   # If a prior affirmative Codex verdict reviewed that exact content
   # fingerprint, treat it as a fallback Codex signal for this head. This is only
   # consulted when there is NO current-head Codex signal; the latest-signal-wins
-  # block below still lets any current-head review/verdict/reaction override it.
+  # block below still lets a current-head review or verdict override it.
   CARRY_BIN="$__CODEX_CHECK_DIR/workflow/external_review_carryforward.sh"
   if [ "$REQUIRE_HEAD_SIGNAL" = "1" ]; then
     # #814: the caller is asking whether Codex spoke on THIS head. A
@@ -2527,15 +2521,9 @@ if [ -z "$APPROVING_REVIEWER" ]; then
       log "gate (b): same-agent + exact-head Codex review @ $GATE_B_CODEX_REVIEW — branch 2 cleared (#1751)"
       APPROVING_REVIEWER="(branch 2: same-agent + exact-head Codex review)"
     elif [ -n "$CODEX_HEAD_VERDICT_TIME" ]; then
-      # #600: the 👍 reaction expires after reaction_freshness_window_seconds
-      # and Codex does not reliably re-post it on a re-review, but its
-      # HEAD-anchored affirmative issue-comment verdict ("Didn't find any
-      # major issues" + "Reviewed commit: <HEAD>") is an equally strong
-      # same-agent cross-review signal — and, being HEAD-anchored by the
-      # Reviewed-commit sha, needs no time-window freshness check. Accept it
-      # as a branch-2 clearance too. (gate (c) still enforces zero
-      # unaddressed P0/P1 on HEAD, so this only substitutes for the reviewer
-      # cross-check, not the findings check.)
+      # The affirmative verdict's reviewed-commit anchor supplies the
+      # same-agent cross-review signal. Gate (c) still enforces findings;
+      # this branch substitutes only for the reviewer approval state.
       log "gate (b): same-agent + Codex HEAD-anchored verdict comment @ $CODEX_HEAD_VERDICT_TIME — branch 2 cleared (#600)"
       APPROVING_REVIEWER="(branch 2: same-agent + Codex verdict comment)"
     elif [ -n "$CODEX_CARRYFORWARD_VERDICT_TIME" ]; then
@@ -2699,7 +2687,7 @@ done
 
 # #1157: the mutable summary's Completed row is an additional exact-head
 # terminal signal only for diagnostic callers. It does not say whether the run
-# was clean, so the merge gate must continue to require a review, reaction, or
+# was clean, so the merge gate must continue to require a review or
 # affirmative legacy verdict. Use updated_at for ordering because Codex edits
 # the one summary comment in place from Running to Completed.
 if [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ] \
@@ -2796,8 +2784,8 @@ else
   log "gate (c): codex.enabled=false — ignoring Codex bot review/reaction signals; requiring Phase 4b substitute clearance when allowed"
 fi
 
-# Phase 4b substitute (#218): if Codex hasn't cleared via 👍 or a
-# COMMENTED-on-HEAD review, and the knob is on, accept a fresh APPROVED
+# Phase 4b substitute (#218): if Codex has not cleared via an anchored
+# affirmative verdict or COMMENTED-on-HEAD review, and the knob is on, accept a fresh APPROVED
 # review on the current HEAD from an available_reviewers identity that
 # is NOT the PR author. This is the merge gate's understanding of
 # Phase 4b clearance per REVIEW_POLICY.md § Phase 4b: when the Codex
@@ -2853,7 +2841,7 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
     # Major @ scripts/codex-review-check.sh:811 on PR #225 round 3):
     # accept the Phase 4b substitute ONLY when its APPROVED is the
     # newest external clearance signal on HEAD. If a Codex bot review
-    # or 👍 reaction on HEAD is newer than the Phase 4b APPROVED, the
+    # or verdict on HEAD is newer than the Phase 4b APPROVED, the
     # Codex signal carries the verdict — and since the Codex paths
     # above already failed to clear (CLEARED != true at this point),
     # that means Codex's newer signal indicated unresolved P0/P1
@@ -2868,7 +2856,7 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
     # - Phase 4b APPROVED newer than Codex review timestamp: the
     #   reviewer saw Codex's findings and approved anyway (or the
     #   findings were addressed and Codex's review captured them
-    #   without a 👍). Treat as deliberate; accept.
+    #   without an affirmative verdict). Treat as deliberate; accept.
     LATEST_CODEX_SIGNAL_TIME=""
     if [ -n "$CODEX_REVIEW_TIME" ] && { [ -z "$LATEST_CODEX_SIGNAL_TIME" ] || [[ "$CODEX_REVIEW_TIME" > "$LATEST_CODEX_SIGNAL_TIME" ]]; }; then
       LATEST_CODEX_SIGNAL_TIME="$CODEX_REVIEW_TIME"
@@ -2979,7 +2967,7 @@ if [ "$CLEARED" != "true" ]; then
     fail_gate "Codex review summary is Running on current HEAD $HEAD_SHA (updated $CODEX_SUMMARY_TIME; trigger: ${CODEX_SUMMARY_TRIGGER:-unknown}) — liveness is confirmed, but the review has not completed (#1157)"
   elif [ -z "$LATEST_SIGNAL_KIND" ]; then
     if [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ]; then
-      fail_gate "Codex has not produced an eligible current-head review, reaction, verdict, or Completed review summary$BLOCKED_SUFFIX"
+      fail_gate "Codex has not produced an eligible current-head review or affirmative verdict$BLOCKED_SUFFIX"
     elif [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
       fail_gate "Codex has not cleared current HEAD and no Phase 4b substitute APPROVED on $HEAD_SHA from a non-author identity in available_reviewers (no eligible current-head review or verdict)$BLOCKED_SUFFIX"
     else
@@ -2999,15 +2987,11 @@ log "gate (c): cleared — $CLEARANCE_REASON"
 
 # --- all gates pass ---------------------------------------------------------
 
-# What just cleared is the POLICY gate, not GitHub's. Saying "is mergeable"
-# invited exactly one wrong inference: gate (b) branch 2 accepts a Codex 👍,
-# but a 👍 is a REACTION and GitHub's `required_approving_review_count` counts
-# only APPROVED REVIEW OBJECTS. On every consumer that count is 1 (the hub is
-# 0), so a 👍-cleared consumer PR reports all-gates-pass here and stays
-# BLOCKED / REVIEW_REQUIRED indefinitely — and because the symptom surfaces as
-# a stale red required check, the time goes into re-firing recheck dispatches
-# at a context that is already green. Name the outstanding approval instead of
-# leaving it to be rediscovered per PR. See mergepath#1059.
+# Policy clearance and GitHub approval requirements are separate. The
+# same-agent fallback can accept a commit-anchored COMMENTED review or
+# verdict, while GitHub counts APPROVED review objects. Name an outstanding
+# GitHub approval requirement instead of suggesting repeated gate dispatches.
+# See mergepath#1059.
 #
 # Advisory only: this is a policy gate and must not start failing on a
 # branch-protection condition it does not own. An unreadable reviewDecision
