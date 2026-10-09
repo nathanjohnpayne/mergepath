@@ -628,17 +628,27 @@ jobs:
                 let latestReviewTime = '';
                 let latestReviewTimeForStaleness = '';
                 let latestCodexReview = null;
-                if (codexEnabled && inlineComments !== null && codexCommentedOnHead.length > 0) {
-                  latestCodexReview = codexCommentedOnHead.filter(r => {
-                    const comments = inlineComments.filter(c => c.pull_request_review_id === r.id);
-                    return comments.length === 0 || comments.some(c => !c.in_reply_to_id && c.user && c.user.login === codexBotLogin) || /\S/.test(r.body || '');
-                  }).reduce(
-                    (latest, r) => (!latest || r.submitted_at > latest.submitted_at) ? r : latest,
-                    null
-                  );
-                  latestReviewTime = latestCodexReview ? (latestCodexReview.submitted_at || '') : '';
-                  if (mergedAt && latestReviewTime && latestReviewTime <= mergedAt) {
-                    latestReviewTimeForStaleness = latestReviewTime;
+                if (codexEnabled && codexCommentedOnHead.length > 0) {
+                  // Without inline comments, every HEAD review conservatively
+                  // bounds CLI-approval freshness; none grants clearance.
+                  const substantiveReviews = inlineComments === null
+                    ? codexCommentedOnHead
+                    : codexCommentedOnHead.filter(r => {
+                        const comments = inlineComments.filter(c => c.pull_request_review_id === r.id);
+                        return comments.length === 0 || comments.some(c => !c.in_reply_to_id && c.user && c.user.login === codexBotLogin) || /\S/.test(r.body || '');
+                      });
+                  if (inlineComments !== null) {
+                    latestCodexReview = substantiveReviews.reduce(
+                      (latest, r) => (!latest || r.submitted_at > latest.submitted_at) ? r : latest,
+                      null
+                    );
+                    latestReviewTime = latestCodexReview ? (latestCodexReview.submitted_at || '') : '';
+                  }
+                  for (const r of substantiveReviews) {
+                    const t = r.submitted_at || '';
+                    if (mergedAt && t && t <= mergedAt && t > latestReviewTimeForStaleness) {
+                      latestReviewTimeForStaleness = t;
+                    }
                   }
                 }
 

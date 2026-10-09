@@ -2361,8 +2361,9 @@ fi
 
 # BEGIN codex_request_diagnostics
 crc_select_head_review() { # reviews-json bot head
-  printf '%s\n' "$1" | jq --arg bot "$2" --arg sha "$3" --argjson comments "${4:-[]}" '
-    [.[] | select(.user.login == $bot) | select(.commit_id == $sha)
+  printf '%s\n' "$1" "${4:-[]}" | jq -s --arg bot "$2" --arg sha "$3" '
+    .[0] as $reviews | .[1] as $comments
+    | [$reviews[] | select(.user.login == $bot) | select(.commit_id == $sha)
       | . as $r
       | [$comments[] | select(.pull_request_review_id == $r.id)] as $inline
       | select(any($inline[]; (.user.login == $bot) and (.in_reply_to_id == null))

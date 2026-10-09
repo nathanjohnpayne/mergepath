@@ -331,6 +331,33 @@ for fixture in "$FIXTURES_DIR"/*.json; do
   fi
 done
 
+# Execute the production timestamp block, including its failure fallback.
+node - "$WORKFLOW" <<'NODE'
+const fs = require('fs');
+const source = fs.readFileSync(process.argv[2], 'utf8');
+const begin = source.indexOf("                let latestReviewTime = '';");
+const end = source.indexOf('                // ── Clearance decision', begin);
+if (begin < 0 || end < 0) throw new Error('production timestamp block missing');
+const evaluate = new Function('codexCommentedOnHead', 'inlineComments', 'mergedAt', `
+  const codexEnabled = true, codexBotLogin = 'chatgpt-codex-connector[bot]';
+  let latestAnyCodexSignalTime = '', latestVerdictTime = '';
+  ${source.slice(begin, end)}
+  return {time: latestAnyCodexSignalTime, clearanceReview: latestCodexReview};
+`);
+const review = {id: 1, submitted_at: '2026-09-14T00:02:00Z', body: 'Codex Review'};
+const merged = '2026-09-14T00:04:00Z';
+const failed = evaluate([review], null, merged);
+if (failed.time !== review.submitted_at || failed.clearanceReview !== null)
+  throw new Error('inline fetch failure lost staleness evidence or granted review clearance');
+const postmerge = {...review, id: 2, submitted_at: '2026-09-14T00:05:00Z'};
+if (evaluate([review, postmerge], null, merged).time !== review.submitted_at)
+  throw new Error('post-merge review masked the merge-time staleness baseline');
+if (evaluate([postmerge], null, merged).time !== '')
+  throw new Error('post-merge review supplied merge-time evidence');
+console.log('  PASS: production audit retains bounded HEAD timestamps when inline fetch fails');
+NODE
+pass=$((pass + 1))
+
 # Structural assertion: the workflow contains the load-bearing
 # `p01Regex` literal. If someone refactors the workflow to drop the
 # P0/P1 check entirely, this assertion is the long-pole canary.

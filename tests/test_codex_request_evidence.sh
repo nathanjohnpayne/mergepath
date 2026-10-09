@@ -352,4 +352,16 @@ fi
 PASS=$((PASS + 1))
 echo "PASS: #1598 codex-disabled"
 
+# Large provider history must travel over stdin, not the OS argument vector.
+eval "$(sed -n '/^crc_select_head_review()/,/^}/p' "$ROOT/scripts/codex-review-check.sh")"
+large_comments=$(python3 - <<'PYDATA'
+import json
+print(json.dumps([{'pull_request_review_id':789,'user':{'login':'chatgpt-codex-connector[bot]'},'body':'x'*262144}]))
+PYDATA
+)
+selected=$(crc_select_head_review "$REVIEW" 'chatgpt-codex-connector[bot]' 'abcdef0123456789000000000000000000000000' "$large_comments")
+[ "$(printf '%s\n' "$selected" | jq -r '.id')" = 789 ]
+PASS=$((PASS + 1))
+echo "PASS: large inline history does not exceed the jq argument limit"
+
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"
