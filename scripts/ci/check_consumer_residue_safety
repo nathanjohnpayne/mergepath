@@ -105,9 +105,10 @@
 #     OUTSIDE the fixture (a real $HOME dotfile, a system temp dir) is
 #     still shared between probes.
 #
-# Runtime is ~3 minutes: about a third of it is one probe that legitimately
-# executes a nested hub suite until the per-probe timeout kills it, and
-# another third is the single |H| = 32 wrapper's 529-subset lattice. Still
+# Runtime is a few minutes, about a third of it the single |H| = 32
+# wrapper's 529-subset lattice. (The probe that used to run a nested hub
+# suite until the per-probe timeout killed it was
+# check_repo_lint_consumer_safety on its pre-marker-first pair gate.) Still
 # cheaper than check_repo_lint_consumer_safety, so it sits just ahead of it.
 
 set -euo pipefail
