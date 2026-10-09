@@ -1,0 +1,11 @@
+---
+spec_id: owner_admin_override
+---
+
+# Scoped owner admin overrides
+
+An admin merge through `gh-as-author.sh` requires `BREAK_GLASS_ADMIN=<full-PR-URL>@<full-head>` and `MERGEPATH_OWNER_ADMIN_AUTHORIZATION`, a version-1 JSON record with `pr_url`, `head_sha`, `authorized_at` (UTC seconds), `authorization_quote`, `allow_needs_human_review` and `allow_codex_inflight`. Both allow fields are explicit booleans. The actual command must contain exactly one matching `--match-head-commit`.
+
+The wrapper refuses a different PR/head, a future timestamp, an empty quote, an unreadable API, a later human-review escalation without explicit authorization, and an unanswered Codex request without explicit authorization. `human-hold` and `policy-violation` require human label removal. The wrapper posts the quote, timestamp, exact tuple and observed red gates before merging, verifies the comment's author/body, and rechecks the head. GitHub's head precondition closes the final push interval.
+
+The weekly audit validates author, PR/head and authorization/comment/merge timestamp order, and reports those records separately from unexplained violations. A recorded instruction preserves the operator's account of the owner's authorization; it does not independently authenticate a local chat transcript. Read failures and malformed records grant no audit exemption.

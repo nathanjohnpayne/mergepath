@@ -921,6 +921,7 @@ paths:
     # `--body-file` path with no Authoring-Agent or Self-Review check at all.
     # Declaring the contract libs here keeps the two halves inseparable.
     requires:
+      - "scripts/workflow/owner-admin-override.py"
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/identity-check.sh"         # gh-token-resolver.sh executes it before any write
       - "scripts/lib/gh-command-classifier.sh"  # shared guard/wrapper prefix vocabulary
@@ -1086,6 +1087,12 @@ paths:
   - path: tests/test_gh_pr_guard.sh
     type: canonical
     consumers: all
+  - path: tests/test_owner_admin_override.py
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/owner-admin-override.py"
+
   - path: tests/test_gh_as_author.sh
     type: canonical
     consumers: all
@@ -2017,6 +2024,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/workflow/owner-admin-override.py"
       - "scripts/lib/pr-body-contract.mjs"  # weekly audit uses the canonical rendered-body parser
   - path: .github/workflows/codex-p1-gate.yml
     type: canonical

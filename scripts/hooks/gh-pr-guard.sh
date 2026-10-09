@@ -3468,12 +3468,12 @@ esac
 # a failing merge state. Requiring both for the worst-case merge
 # (admin AND failing CI) is intentional.
 if [ "$ADMIN_REQUESTED" -eq 1 ]; then
-  if [ "$EFFECTIVE_BREAK_GLASS_ADMIN" = "1" ]; then
+  if [[ "$EFFECTIVE_BREAK_GLASS_ADMIN" =~ ^https://github\.com/[^/]+/[^/]+/pull/[1-9][0-9]*@[0-9a-f]{40}$ ]]; then
     echo "BREAK-GLASS: --admin merge authorized by human." >&2
     exit 0
   fi
   echo "BLOCKED: --admin merge requires explicit human authorization." >&2
-  echo "Ask the human to confirm break-glass, then retry with BREAK_GLASS_ADMIN=1 (export or inline prefix)." >&2
+  echo "Ask the human to confirm break-glass, then retry with BREAK_GLASS_ADMIN=<full-PR-URL>@<full-head> and MERGEPATH_OWNER_ADMIN_AUTHORIZATION (version-1 JSON)." >&2
   exit 2
 fi
 
