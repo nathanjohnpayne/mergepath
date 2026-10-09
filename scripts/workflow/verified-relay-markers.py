@@ -80,7 +80,7 @@ class Evidence:
                 or run.get('workflow_id') != self.workflow['id']
                 or not isinstance(branch, str) or not branch
                 or run.get('path') not in (PATH, PATH + '@' + branch)
-                or (run.get('repository') or {}).get('full_name') != self.repo
+                or str((run.get('repository') or {}).get('full_name')).lower() != self.repo.lower()
                 or not re.fullmatch('[0-9a-f]{40}', run.get('head_sha', ''))):
             return False
         pages = self.api(f'actions/runs/{publisher}/jobs?filter=all&per_page=100', pages=True)

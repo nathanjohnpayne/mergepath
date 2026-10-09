@@ -74,6 +74,11 @@ print(value if isinstance(value,str) else json.dumps(value))
         code, comments, error = self.invoke()
         self.assertEqual((code, len(comments)), (0, 1), error)
 
+    def test_repository_case_difference_preserves_authentic_completion(self):
+        self.run['repository']['full_name'] = REPO.upper()
+        code, comments, error = self.invoke()
+        self.assertEqual((code, len(comments)), (0, 1), error)
+
     def test_historical_run_survives_default_branch_rename(self):
         self.run['head_branch'] = 'previous-default'
         self.run['path'] += '@previous-default'
