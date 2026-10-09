@@ -191,14 +191,19 @@ if (codexEnabled && issueComments !== null) {
       if (!(mergedAt && c.created_at && c.created_at <= mergedAt)) continue;
       const body = (c.body || '').toLowerCase();
       const shaMatches = [
-        ...body.matchAll(/reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})/g),
-      ].map(m => m[1]);
-      if (!shaMatches.some(s => headLower.startsWith(s))) continue;
+        ...body.matchAll(/reviewed commit[^0-9a-z_\r\n]{0,6}([^\r\n]*)/g),
+      ].map(m => m[1].replace(/^[`*\s]+|[`*\s]+$/g, ''));
+      const fieldCount = (body.match(/reviewed commit/g) || []).length;
+      const exact = /^[0-9a-f]{40}$/.test(headLower) && shaMatches.length > 0
+        && shaMatches.length === fieldCount && shaMatches.every(s => s === headLower);
+      const clean = /^\s*codex review:\s*didn.?t find any major issues\b/im.test(c.body || '');
+      const ambiguousNegative = fieldCount > 0 && !clean && /^\s*codex review:/im.test(c.body || '')
+        && (shaMatches.length !== fieldCount || shaMatches.some(s => s === headLower || !/^[0-9a-f]{40}$/.test(s)));
+      if (!exact && !ambiguousNegative) continue;
       if (!latestVerdict || c.created_at >= latestVerdict.created_at) {
         latestVerdict = {
           created_at: c.created_at,
-          affirmative: /^\s*codex review:\s*didn.?t find any major issues\b/im
-            .test(c.body || ''),
+          affirmative: exact && clean,
         };
       }
     }
