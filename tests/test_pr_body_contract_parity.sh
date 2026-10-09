@@ -862,14 +862,15 @@ p4b_probe() {  # <pr-body> -> prints "rc=<n> <first stderr line>"
   local body="$1" d bin
   d="$(mktemp -d "${TMPDIR:-/tmp}/p4b-verdict.XXXXXX")"
   bin="$d/bin"; mkdir -p "$bin"
-  # Minimal gh: serves the PR body for the `.body // ""` read, a fixed head
-  # otherwise. Nothing else is reached before the contract check.
+  # Minimal gh: serves the PR body and a coherent full head/base pair.
+  # Nothing else is reached before the contract check.
   {
     printf '#!/usr/bin/env bash\n'
     printf 'if [ "${1:-}" = "api" ]; then\n'
     printf '  case "$*" in\n'
     printf '    *".body // \\"\\""*) cat %q; exit 0 ;;\n' "$d/body.txt"
-    printf '    *) printf "%%s\\n" abc123; exit 0 ;;\n'
+    printf '    *".head.sha, .base.sha"*) printf "%%s %%s\\n" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; exit 0 ;;\n'
+    printf '    *) printf "%%s\\n" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; exit 0 ;;\n'
     printf '  esac\n'
     printf 'fi\n'
     printf 'exit 0\n'
@@ -880,7 +881,7 @@ p4b_probe() {  # <pr-body> -> prints "rc=<n> <first stderr line>"
   local out rc=0
   out="$(cd "$ROOT" && PATH="$bin:$PATH" \
     MERGEPATH_REVIEW_POLICY_PATH="$ROOT/.github/review-policy.yml" \
-    bash scripts/phase-4b-review.sh 123 --repo o/r --head abc123 \
+    bash scripts/phase-4b-review.sh 123 --repo o/r --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
       --diff-file "$d/diff.txt" --dry-run --force-enabled 2>&1)" || rc=$?
   rm -rf "$d"
   printf 'rc=%s %s' "$rc" "$(printf '%s\n' "$out" | grep -m1 -iE 'contract|Authoring-Agent' || true)"

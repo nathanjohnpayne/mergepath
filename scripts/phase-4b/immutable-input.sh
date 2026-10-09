@@ -17,6 +17,15 @@ p4b_input_digest() {
   "$node_bin" -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' "$1"
 }
 
+# Preserve gh's existing auth location when isolating Git's HOME/config.
+p4b_input_gh_config_dir() {
+  if [ -n "${GH_CONFIG_DIR:-}" ]; then printf '%s\n' "$GH_CONFIG_DIR"
+  elif [ -n "${XDG_CONFIG_HOME:-}" ]; then printf '%s/gh\n' "$XDG_CONFIG_HOME"
+  elif [ -n "${AppData:-}" ]; then printf '%s/GitHub CLI\n' "$AppData"
+  else printf '%s/.config/gh\n' "$HOME"
+  fi
+}
+
 # API-owned head-transition events detect an observed A-B-A swap while the
 # model runs. The immutable object diff remains authoritative regardless.
 p4b_input_transitions() { # repo pr output-file
@@ -51,11 +60,12 @@ p4b_capture_input() { # repo pr full-base full-head private-output-dir
   for variable in $(compgen -e); do
     case "$variable" in GIT_*) git_env+=(-u "$variable") ;; esac
   done
-  git_env+=(HOME="$dest/home" XDG_CONFIG_HOME="$dest/home/.config"
+  git_env+=(GH_CONFIG_DIR="$(p4b_input_gh_config_dir)"
+    HOME="$dest/home" XDG_CONFIG_HOME="$dest/home/.config"
     GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
     GIT_ASKPASS= SSH_ASKPASS=)
-  env -u GITHUB_TOKEN ${git_env[@]+"${git_env[@]}"} "$git_bin" init --bare -q "$dest/objects.git" || return 1
-  env -u GITHUB_TOKEN ${git_env[@]+"${git_env[@]}"} "$git_bin" -C "$dest/objects.git" \
+  env ${git_env[@]+"${git_env[@]}"} "$git_bin" init --bare -q "$dest/objects.git" || return 1
+  env ${git_env[@]+"${git_env[@]}"} "$git_bin" -C "$dest/objects.git" \
     -c credential.helper= -c "credential.helper=!'$gh_bin' auth git-credential" \
     -c core.hooksPath=/dev/null -c http.extraHeader= \
     fetch --quiet --no-tags --no-recurse-submodules --no-write-fetch-head -- \
@@ -126,7 +136,8 @@ p4b_capture_wave_input() { # repo pr base head request-json input-dir governing-
   mkdir "$dest/wave" || return 1
   # Only this verified child may bypass the redundant marker precondition in
   # older trusted wave code. Capture mode itself has no publishing authority.
-  env ${clean_env[@]+"${clean_env[@]}"} HOME="$dest/home" XDG_CONFIG_HOME="$dest/home/.config" \
+  env ${clean_env[@]+"${clean_env[@]}"} GH_CONFIG_DIR="$(p4b_input_gh_config_dir)" \
+    HOME="$dest/home" XDG_CONFIG_HOME="$dest/home/.config" \
     GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
     GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null \
     WAVE_AUDIT_REPO_DIR="$(dirname "$scripts_root")" WAVE_AUDIT_MANIFEST_RELPATH=.mergepath-sync.yml \

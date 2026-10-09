@@ -37,6 +37,14 @@ for arg in "$@"; do
  case "$arg" in https://github.com/fixture/repo.git) arg="$INPUT_FIXTURE" ;; esac
  args+=("$arg")
 done
+prefix=(); is_fetch=0
+for arg in "$@"; do
+ if [ "$arg" = fetch ]; then is_fetch=1; break; fi
+ prefix+=("$arg")
+done
+if [ "${INPUT_REQUIRE_AUTH_CONTEXT:-0}" = 1 ] && [ "$is_fetch" = 1 ]; then
+ printf 'protocol=https\nhost=github.com\n\n' | "$INPUT_REAL_GIT" "${prefix[@]}" credential fill >/dev/null
+fi
 printf '%s\n' "$*" >> "$INPUT_WORK/git-calls"
 exec "$INPUT_REAL_GIT" "${args[@]}"
 SH
@@ -44,6 +52,16 @@ cat > "$WORK/bin/gh" <<'SH'
 #!/usr/bin/env bash
 set -eu
 printf '%s\n' "$*" >> "$INPUT_WORK/gh-calls"
+if [ "${INPUT_REQUIRE_AUTH_CONTEXT:-0}" = 1 ]; then
+ if [ "$INPUT_AUTH_SOURCE" = token ]; then
+  [ "${GITHUB_TOKEN:-}" = fixture-token ] || exit 92
+ else
+  [ -f "${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/gh}/hosts.yml" ] || exit 93
+ fi
+fi
+if [ "$1" = auth ] && [ "$2" = git-credential ]; then
+ printf 'username=fixture\npassword=fixture\n'; exit 0
+fi
 if [ "$1" = api ] && [ "$2" = --paginate ] && [ "$3" = --slurp ]; then
  if [ -e "$INPUT_WORK/aba" ]; then
   printf '[[{"id":1,"event":"head_ref_force_pushed","created_at":"2026-10-08T00:00:01Z","commit_id":null},{"id":2,"event":"head_ref_force_pushed","created_at":"2026-10-08T00:00:02Z","commit_id":null}]]\n'
@@ -88,6 +106,21 @@ printf '+changed after capture\n' >> "$WORK/input/review.diff"
 if p4b_validate_bound_input "$BOUND" "$WORK/input/input.json" "$WORK/input/review.diff"; then fail 'changed input accepted'; else pass 'changed diff cannot retain bound approval'; fi
 if p4b_capture_input fixture/repo 1753 "${BASE:0:7}" "$HEAD_A" "$WORK/input"; then fail 'abbreviated base accepted'; else pass 'abbreviated capture IDs are rejected'; fi
 
+mkdir -p "$WORK/auth-home/.config/gh"
+printf 'fixture auth configuration\n' > "$WORK/auth-home/.config/gh/hosts.yml"
+for auth_source in stored explicit token; do
+ if (
+  export INPUT_REQUIRE_AUTH_CONTEXT=1 INPUT_AUTH_SOURCE="$auth_source"
+  export XDG_CONFIG_HOME="$WORK/auth-home/.config"
+  unset GH_CONFIG_DIR GH_TOKEN GITHUB_TOKEN
+  if [ "$auth_source" = explicit ]; then export GH_CONFIG_DIR="$WORK/auth-home/.config/gh"; fi
+  if [ "$auth_source" = token ]; then export GITHUB_TOKEN=fixture-token; fi
+  mkdir "$WORK/auth-$auth_source"
+  p4b_capture_input fixture/repo 1753 "$BASE" "$HEAD_A" "$WORK/auth-$auth_source"
+ ); then pass "isolated real Git credential helper retains $auth_source gh auth"
+ else fail "$auth_source gh auth lost during capture"; fi
+done
+
 # Curated-wave input deliberately differs from the complete consumer PR diff.
 # Execute real trusted wave regeneration over a separate committed canonical
 # range; only the external live-byte provider is replaced with a fixed proof.
@@ -107,7 +140,14 @@ printf 'excluded head\n' >"$CANON/docs/excluded"
 SOURCE_HEAD="$("$INPUT_REAL_GIT" -C "$CANON" rev-parse HEAD)"
 export SOURCE_HEAD HEAD_A BASE
 cp "$ROOT/scripts/phase-4b/immutable-input.sh" "$CANON/scripts/phase-4b/"
-cp "$ROOT/scripts/wave-audit.sh" "$CANON/scripts/"
+cp "$ROOT/scripts/wave-audit.sh" "$CANON/scripts/wave-audit-real.sh"
+cat > "$CANON/scripts/wave-audit.sh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+[ -f "${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/gh}/hosts.yml" ] || exit 94
+printf 'wave auth preserved\n' >> "$INPUT_WORK/auth-boundaries"
+exec bash "$(dirname "${BASH_SOURCE[0]}")/wave-audit-real.sh" "$@"
+SH
 printf '#!/usr/bin/env bash\nexit 99\n' >"$CANON/scripts/phase-4b-review.sh"
 cat >"$CANON/scripts/workflow/verify-live-propagation.sh" <<'SH'
 #!/usr/bin/env bash
@@ -126,10 +166,15 @@ p4b_capture_input fixture/repo 1753 "$BASE" "$HEAD_A" "$WORK/wave-input"
 # Caller overrides and dirty source files must not alter pinned scope or bytes.
 printf 'dirty canonical bytes MUST NOT BE REVIEWED\n' >"$CANON/file"
 export WAVE_AUDIT_MANIFEST_RELPATH=attacker.yml WAVE_AUDIT_REPO_DIR=/nonexistent
+export XDG_CONFIG_HOME="$WORK/auth-home/.config" INPUT_REQUIRE_AUTH_CONTEXT=1 INPUT_AUTH_SOURCE=stored
+unset GH_CONFIG_DIR
 if p4b_capture_wave_input fixture/repo 1753 "$BASE" "$HEAD_A" "$WORK/scope-request.json" "$WORK/wave-input" "$WORK/wave-policy.yml"; then
  pass 'curated canonical range is regenerated independently of the canary diff'
 else fail 'trusted curated regeneration'; fi
 unset WAVE_AUDIT_MANIFEST_RELPATH WAVE_AUDIT_REPO_DIR
+if grep -q 'wave auth preserved' "$INPUT_WORK/auth-boundaries"; then
+ pass 'isolated wave subprocess retains the original gh configuration'
+else fail 'wave gh auth context lost'; fi
 "$INPUT_REAL_GIT" -C "$CANON" diff "$SOURCE_BASE" "$SOURCE_HEAD" -- file >"$WORK/curated-expected.diff"
 if cmp -s "$WORK/wave-input/review.diff" "$WORK/curated-expected.diff" \
    && cmp -s "$WORK/wave-input/pr.diff" "$WORK/expected.diff"; then
