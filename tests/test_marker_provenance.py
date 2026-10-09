@@ -196,10 +196,22 @@ os.execv(argv[0],argv)
                                REPO, '7', self.head, self.base, str(self.policy)],
                               input=json.dumps(self.metadata), env=self.environment, text=True, capture_output=True)
 
+    def test_non_lane_ref_precedes_author_validation_but_unknown_prefix_refuses(self):
+        self.policy.write_text('propagation_prs:\n  branch_prefix: custom/\n')
+        self.metadata['head']['ref'] = 'codex/ordinary'
+        self.assertEqual(self.invoke().returncode, 1)
+        self.metadata['head']['ref'] = 'custom/' + self.source[:7]
+        self.assertEqual(self.invoke().returncode, 2)
+        self.policy.write_text('propagation_prs: [invalid YAML\n')
+        self.metadata['head']['ref'] = 'codex/ordinary'
+        self.assertEqual(self.invoke().returncode, 2)
+
     def test_real_faithful_git_objects_clear_without_any_marker(self):
         self.metadata.pop('comments')
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {
+            'source_sha': self.source, 'head_sha': self.head, 'base_sha': self.base})
 
     def test_forged_bot_marker_cannot_exempt_modified_workflow(self):
         self.consumer_file.write_text('name: PR-controlled unsafe workflow\n')

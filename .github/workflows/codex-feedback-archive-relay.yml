@@ -329,8 +329,12 @@ jobs:
               published_lease=true
             fi
           fi
-          existing=$(printf '%s' "$existing" \
-            | python3 scripts/workflow/verified-relay-markers.py --repo "$REPO" --pr "$PR_NUMBER")
+          if ! verified_existing=$(printf '%s' "$existing" \
+            | python3 scripts/workflow/verified-relay-markers.py --repo "$REPO" --pr "$PR_NUMBER"); then
+            echo "::warning::Relay provenance is unavailable; publishing a PR-head failure rather than retaining stale clearance."
+            verified_existing='[]'
+          fi
+          existing="$verified_existing"
           if [ "$published_lease" = true ] && jq -e --arg body "$complete" \
             'any(.[]; (.user.login // "") == "github-actions[bot]" and (.body // "") == $body)' \
             <<<"$existing" >/dev/null; then
@@ -513,7 +517,15 @@ jobs:
             -f status=completed -f conclusion="$conclusion" \
             -f "output[title]=$title" -f "output[summary]=${output:0:60000}" \
             >/dev/null
-          gh api --method DELETE "repos/$REPO/actions/artifacts/$ARTIFACT_ID" >/dev/null
+
+      - name: Retire the published handoff artifact
+        if: ${{ success() && steps.persist.outputs.check_id != '' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ARTIFACT_ID: ${{ steps.artifact.outputs.id }}
+        run: gh api --method DELETE "repos/$REPO/actions/artifacts/$ARTIFACT_ID" >/dev/null
 
       - name: Close an abandoned read-only relay lease
         if: >-
@@ -543,7 +555,7 @@ jobs:
                 | select(.user.login == "github-actions[bot]")
                 | . as $comment
                 | ((.body // "")
-                  | try capture("^<!-- mergepath-feedback-archive-relay:v1 run=(?<run>[0-9]+) status=(?<status>complete|failed) -->$")
+                  | try capture("^<!-- mergepath-feedback-archive-relay:v(?:1|2) run=(?<run>[0-9]+)(?: publisher=[0-9]+)? status=(?<status>complete|failed) -->$")
                     catch null) as $marker
                 | select($marker != null and ($marker.run | tonumber) == $run)
                 | {status:$marker.status,created_at:($comment.created_at // ""),id:$comment.id}

@@ -21,6 +21,7 @@ command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not available" >&2; exit 0; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wave-audit-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
+export FAKE_POLICY_ARGS_LOG="$WORK/policy-args"
 
 # Wave dispatch models the trusted verifier boundary. The actual Git byte
 # comparison is exercised by test_marker_provenance.py, not duplicated here.
@@ -29,6 +30,7 @@ cp "$WA" "$WORK/trusted/scripts/wave-audit.sh"
 WA="$WORK/trusted/scripts/wave-audit.sh"
 cat > "$WORK/trusted/scripts/workflow/resolve_base_policy.sh" <<'SH'
 #!/bin/sh
+printf '%s\n' "$*" >> "${FAKE_POLICY_ARGS_LOG:-/dev/null}"
 policy=$(mktemp)
 printf 'author_identity: nathanjohnpayne\n' > "$policy"
 printf '%s\n' "$policy"
@@ -220,7 +222,7 @@ if [ "$1" = "pr" ]; then
 fi
 if [ "$1" = "api" ]; then
   jq -cn --arg head "${FAKE_CANARY_HEAD:?}" --arg base "${FAKE_CANARY_BASE:?}" \
-    '{head:{sha:$head},base:{sha:$base}}'
+    '{head:{sha:$head},base:{sha:$base,ref:"main",repo:{default_branch:"main"}}}'
   exit 0
 fi
 exit 1
@@ -1079,4 +1081,10 @@ FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 86 --repo owner/consumer \
 
 echo
 echo "Summary: $PASS passed, $FAIL failed"
+if [ -s "$FAKE_POLICY_ARGS_LOG" ] && grep -q -- '--base-ref main --base-sha ' "$FAKE_POLICY_ARGS_LOG" \
+  && ! grep -q -- '--pr ' "$FAKE_POLICY_ARGS_LOG"; then
+  pass "governing policy resolves the observed exact base without a second PR read"
+else
+  fail "governing policy was not bound to the observed exact base"
+fi
 [ "$FAIL" -eq 0 ]

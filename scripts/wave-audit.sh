@@ -287,7 +287,14 @@ if [ "${WAVE_AUDIT_LANE_VERIFIED_OK:-0}" != "1" ]; then
     || die 3 "invalid PR head/base reading $REPO#$PR for lane verification"
   lane_pr=$(gh api "repos/$REPO/pulls/$PR") \
     || die 3 "could not read the canary for live byte verification"
-  lane_policy=$(bash "$ROOT/scripts/workflow/resolve_base_policy.sh" --repo "$REPO" --pr "$PR" --materialize-default) \
+  lane_base_ref=$(printf '%s' "$lane_pr" | jq -er '.base.ref | select(type == "string" and length > 0)') \
+    || die 3 "could not read the canary base ref"
+  lane_base_sha=$(printf '%s' "$lane_pr" | jq -er '.base.sha')
+  lane_default=$(printf '%s' "$lane_pr" | jq -er '.base.repo.default_branch | select(type == "string" and length > 0)') \
+    || die 3 "could not read the canary default branch"
+  [ "$lane_base_sha" = "$pr_base" ] || die 3 "canary base changed before policy resolution"
+  lane_policy=$(bash "$ROOT/scripts/workflow/resolve_base_policy.sh" --repo "$REPO" \
+    --base-ref "$lane_base_ref" --base-sha "$pr_base" --default-branch "$lane_default" --materialize-default) \
     || die 3 "could not read the canary governing policy"
   lane_rc=0
   printf '%s' "$lane_pr" | bash "$ROOT/scripts/workflow/verify-live-propagation.sh" \

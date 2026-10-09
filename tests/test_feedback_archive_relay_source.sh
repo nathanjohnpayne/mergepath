@@ -529,7 +529,7 @@ assert_empty_writes "failed fallback preparation makes no target-PR mutation"
 PERSIST="$TMP/persist.sh"
 awk '
   /name: Persist archive and publish the exact-head gate/ { active=1 }
-  active && /^      - name: Close an abandoned read-only relay lease/ { exit }
+  active && /^      - name: / && !/Persist archive and publish the exact-head gate/ { exit }
   active && /^        run: \|$/ { body=1; next }
   body { sub(/^          /, ""); print }
 ' "$ROOT/.github/workflows/codex-feedback-archive-relay.yml" >"$PERSIST"
@@ -644,6 +644,28 @@ if grep -F -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG" >/dev/nu
   pass "missing-handoff writer falls back to the known bound API head"
 else
   fail "missing-handoff writer lost its bound-head failure fallback: $(cat "$GH_LOG")"
+fi
+
+# Execute the actual failure publisher with an unavailable provenance read.
+REAL_RELAY_PYTHON="$(command -v python3)"
+export REAL_RELAY_PYTHON
+cat >"$BIN/python3" <<'PYSH'
+#!/usr/bin/env bash
+if [ "${FAIL_RELAY_PROVENANCE:-false}" = true ] && [[ "${1:-}" == *verified-relay-markers.py ]]; then
+  echo 'provenance API unavailable' >&2
+  exit 2
+fi
+exec "$REAL_RELAY_PYTHON" "$@"
+PYSH
+chmod +x "$BIN/python3"
+FAIL_RELAY_PROVENANCE=true run_missing_handoff
+assert_eq "$MISSING_RC" 1 "provenance outage retains the deliberate failure result"
+if grep -F -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG" >/dev/null \
+  && grep -F -- "head_sha=$PUBLISH" "$GH_LOG" >/dev/null \
+  && grep -q 'Relay provenance is unavailable' "$TMP/missing.out"; then
+  pass "provenance outage still retracts prior PR-head clearance"
+else
+  fail "provenance outage aborted before the PR-head failure publication"
 fi
 
 CLEANUP="$TMP/cleanup.sh"

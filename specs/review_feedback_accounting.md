@@ -63,3 +63,5 @@ Disposition replies and top-level acknowledgements are posted through the identi
 - The gate does not judge whether a rationale is persuasive; it verifies that a finding-bound disposition record exists.
 - The gate does not replace severity-specific merge policy, external-review clearance, reviewer approval, or GitHub conversation resolution. Those remain independent gates.
 - The gate does not auto-resolve threads, post acknowledgements, react to findings, push commits, or merge.
+
+Missing-handoff provenance outages publish a failed check on the bound PR head. Artifact retirement is a separate best-effort step after successful persistence, and cleanup recognizes both completion-marker versions. Live lane verification classifies the configured branch prefix before requiring author metadata, and wave policy resolution uses its initially observed base SHA.

@@ -587,6 +587,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/workflow/verified-relay-markers.py"   # #1546, publisher-run provenance verification
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/lib/preflight-helpers.sh"
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
@@ -2031,6 +2032,7 @@ paths:
     # workflow without the script makes the gate fail-closed on
     # `command not found` for every PR in the consumer.
     requires:
+      - "scripts/workflow/verified-relay-markers.py"   # #1546, publisher-run provenance verification
       - ".github/workflows/codex-feedback-archive-relay.yml"   # #1000, privileged read-only fork/Dependabot archive persistence
       - "scripts/codex-p1-gate.sh"
       - "scripts/render-feedback-archive.sh"   # #1000, persist edited/deleted PR-level, inline, and review-body findings
@@ -2050,6 +2052,7 @@ paths:
     # feedback archival and the corresponding PR-head check. Its requires
     # edges keep the evaluator and surface fingerprint on the same wave.
     requires:
+      - "scripts/workflow/verified-relay-markers.py"   # #1546, publisher-run provenance verification
       - "scripts/codex-p1-gate.sh"
       - "scripts/review-feedback-surface-fingerprint.sh"
       - "scripts/workflow/feedback-archive-relay-source.sh"   # #1413, positive source-run/PR binding before every writer

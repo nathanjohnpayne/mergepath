@@ -16,10 +16,10 @@ config=$(ruby -rjson -ryaml -e 'p=YAML.safe_load(File.read(ARGV[0]), aliases: fa
 enabled=$(jq -r 'if .propagation_prs.enabled == null then true else .propagation_prs.enabled end' <<<"$config")
 case "$enabled" in false) exit 1 ;; true) ;; *) exit 2 ;; esac
 prefix=$(jq -er '.propagation_prs.branch_prefix // "mergepath-sync/" | select(type == "string" and length > 0)' <<<"$config") || exit 2
-author=$(jq -er '.author_identity | select(type == "string" and length > 0)' <<<"$config") || exit 2
 ref=$(jq -r '.head.ref' <<<"$metadata")
-[ "$(jq -r '.user.login' <<<"$metadata")" = "$author" ] || exit 1
 [[ "$ref" == "$prefix"* ]] || exit 1
+author=$(jq -er '.author_identity | select(type == "string" and length > 0)' <<<"$config") || exit 2
+[ "$(jq -r '.user.login' <<<"$metadata")" = "$author" ] || exit 1
 key=${ref#"$prefix"}
 if [[ "$key" =~ ^sync-all-([0-9a-f]{7,40})-[0-9a-f]{12}$ ]]; then
   source_key=${BASH_REMATCH[1]}
@@ -60,9 +60,13 @@ git_isolated -C "$task_dir/consumer" -c credential.helper= \
   fetch --quiet --no-tags --no-recurse-submodules -- "https://github.com/$repo.git" "$base" "$head" || exit 2
 result=0
 env -u MERGEPATH_CONSUMER "${git_environment[@]}" bash "$root/verify-propagation-pr.sh" \
-  "$task_dir/canonical" "$task_dir/consumer" "$base" "$head" "$source_sha" || result=$?
+  "$task_dir/canonical" "$task_dir/consumer" "$base" "$head" "$source_sha" >/dev/null || result=$?
 case "$result" in 0) ;; 1) exit 1 ;; *) exit 2 ;; esac
 # The proof applies only to the caller's still-live pair.
 current=$("$gh_bin" api "repos/$repo/pulls/$pr") || exit 2
 printf '%s' "$current" | jq -e --arg head "$head" --arg base "$base" \
   '.head.sha == $head and .base.sha == $base' >/dev/null || exit 2
+# Data-only provenance for trusted curated-wave capture. Callers that only
+# need the eligibility predicate may discard stdout.
+jq -cn --arg source "$source_sha" --arg head "$head" --arg base "$base" \
+  '{source_sha:$source,head_sha:$head,base_sha:$base}'
