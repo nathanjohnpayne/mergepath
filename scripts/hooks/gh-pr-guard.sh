@@ -3322,6 +3322,7 @@ MATCH_HEAD_SHA=""
 MATCH_HEAD_COUNT=0
 AUTO_REQUESTED=0
 DISABLE_AUTO_REQUESTED=0
+MERGE_FLAGS_ENDED=0
 SKIP_NEXT_AS=""  # "" | "skip" | "repo"
 merge_walk_start=$((PR_SUBCOMMAND_INDEX + 1))
 for j in "${!TOKENS[@]}"; do
@@ -3345,7 +3346,15 @@ for j in "${!TOKENS[@]}"; do
     continue
   fi
   case "$tok" in "&&"|"||"|";"|"|"|"|&"|"&"|"("|")") break ;; esac
+  if [ "$MERGE_FLAGS_ENDED" -eq 1 ]; then
+    if [ -z "$PR_SELECTOR" ]; then PR_SELECTOR="$tok"; fi
+    continue
+  fi
   case "$tok" in
+    --)
+      MERGE_FLAGS_ENDED=1
+      continue
+      ;;
     --auto)
       AUTO_REQUESTED=1
       continue

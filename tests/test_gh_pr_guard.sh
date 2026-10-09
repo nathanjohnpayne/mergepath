@@ -234,6 +234,9 @@ for auto_true in true True TRUE t T 1; do
 done
 assert_rc_contains "invalid retraction boolean refuses" 2 "invalid --disable-auto boolean" 'scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto --disable-auto=invalid' CLEAN
 assert_rc_contains "invalid auto boolean refuses" 2 "invalid --auto boolean" 'scripts/gh-as-author.sh -- gh pr merge 123 --auto=invalid' CLEAN
+TEST_UNPINNED_MERGE=1 assert_rc_contains "option-looking branch after separator cannot request retraction" 2 "exactly one --match-head-commit" 'scripts/gh-as-author.sh -- gh pr merge -- --disable-auto' CLEAN
+TEST_UNPINNED_MERGE=1 assert_rc_contains "option-looking branch after separator cannot supply head pinning" 2 "exactly one --match-head-commit" 'scripts/gh-as-author.sh -- gh pr merge 123 -- --match-head-commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' CLEAN
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "false-looking branch after separator cannot cancel retraction" 0 "" 'scripts/gh-as-author.sh -- gh pr merge --disable-auto -- --disable-auto=false' BLOCKED needs-external-review
 assert_rc_contains "deferred auto-merge refuses even before a review blocker arrives" 2 "deferred --auto" 'scripts/gh-as-author.sh -- gh pr merge 123 --auto --squash' CLEAN
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "a later command cannot supply the head precondition" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match ; echo --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" BLOCKED
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "unexported standalone tiebreak grants no authority" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa && $merge_overrides" BLOCKED
