@@ -39,12 +39,13 @@ with (p/'calls').open('a') as f: f.write(json.dumps(a)+'\\n')
 if a[:2]==['pr','view']:
  result=s['pr'].copy()
  if (p/'posted.json').exists() and s.get('move'): result['headRefOid']='b'*40
+ if (p/'posted.json').exists() and s.get('late_label'): result['labels']=[{'name':s['late_label']}]
 elif a[:3]==['api','--paginate','--slurp']:
  suffix=a[3].split('/')[-1]; result=[s.get('inline' if '/pulls/' in a[3] and suffix=='comments' else suffix,[])]
 elif a[0]=='api' and '/issues/comments/' in a[1]:
  result=json.loads((p/'posted.json').read_text())
 elif a[0]=='api' and a[1].endswith('/comments') and '-f' in a:
- body=a[a.index('-f')+1][5:]; result={'id':77,'body':body,'user':{'login':'nathanjohnpayne'},'created_at':'2026-01-01T00:01:00Z','html_url':'https://github.com/example/repo/pull/123#issuecomment-77'}
+ body=a[a.index('-f')+1][5:]; result={'id':77,'body':body,'user':{'login':'nathanjohnpayne'},'created_at':'2026-01-01T00:01:00Z','updated_at':'2026-01-01T00:01:00Z','html_url':'https://github.com/example/repo/pull/123#issuecomment-77'}
  if s.get('bad_readback'): result['user']['login']='wrong-account'
  (p/'posted.json').write_text(json.dumps(result))
 else: sys.exit(9)
@@ -114,10 +115,34 @@ print(json.dumps(result))
             self.assertEqual(self.run_prepare().returncode, 2)
             self.state[case] = False
 
+    def test_labels_added_before_final_read_refuse_writer(self):
+        for label in ('human-hold', 'policy-violation', 'needs-human-review'):
+            self.state['late_label'] = label
+            result = self.run_prepare()
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertTrue((self.path / 'posted.json').exists())
+
+    def test_audit_requires_explicit_human_label_exception(self):
+        self.assertEqual(self.run_prepare().returncode, 0)
+        posted = json.loads((self.path / 'posted.json').read_text())
+        payload = {'pr': {'html_url': URL, 'head': {'sha': HEAD}, 'merged_at': '2026-01-01T00:02:00Z'},
+                   'author': 'nathanjohnpayne', 'comments': [posted], 'needs_human_review_at_merge': True}
+        self.assertFalse(override.audit(payload)['recorded_override'])
+        self.assertEqual(self.run_prepare({**AUTH, 'allow_needs_human_review': True}).returncode, 0)
+        payload['comments'] = [json.loads((self.path / 'posted.json').read_text())]
+        self.assertTrue(override.audit(payload)['recorded_override'])
+        payload['hard_hold_at_merge'] = True
+        self.assertFalse(override.audit(payload)['recorded_override'])
+
     def test_quoted_admin_subject_is_an_ordinary_merge(self):
         self.assertIsNone(override.merge_args(['gh', 'pr', 'merge', '123', '--subject', '--admin']))
         self.assertIsNone(override.merge_args(['gh', 'pr', 'merge', '123', '--admin=false']))
         self.assertIsNone(override.merge_args(['gh', 'pr', 'create', '--title', '--admin']))
+
+    def test_inherited_repository_options_before_merge_are_recognized(self):
+        for flags in (['--repo', 'example/repo'], ['--repo=example/repo'], ['-R', 'example/repo'], ['-Rexample/repo']):
+            self.assertEqual(override.merge_args(['gh', 'pr', *flags, 'merge', '123', '--admin']),
+                             ('123', 'example/repo', []))
 
     def test_audit_requires_author_head_and_timestamp_order(self):
         self.assertEqual(self.run_prepare().returncode, 0)
@@ -125,11 +150,13 @@ print(json.dumps(result))
         payload = {'pr': {'html_url': URL, 'head': {'sha': HEAD}, 'merged_at': '2026-01-01T00:02:00Z'},
                    'author': 'nathanjohnpayne', 'comments': [posted]}
         self.assertTrue(override.audit(payload)['recorded_override'])
-        for mutation in ('author', 'head', 'time'):
+        for mutation in ('author', 'head', 'time', 'postmerge-edit', 'missing-edit-time'):
             bad = copy.deepcopy(payload)
             if mutation == 'author': bad['comments'][0]['user']['login'] = 'github-actions[bot]'
             elif mutation == 'head': bad['pr']['head']['sha'] = 'b' * 40
-            else: bad['comments'][0]['created_at'] = '2026-01-01T00:03:00Z'
+            elif mutation == 'time': bad['comments'][0]['created_at'] = '2026-01-01T00:03:00Z'
+            elif mutation == 'postmerge-edit': bad['comments'][0]['updated_at'] = '2026-01-01T00:03:00Z'
+            else: del bad['comments'][0]['updated_at']
             self.assertFalse(override.audit(bad)['recorded_override'])
 
     def test_audit_does_not_accept_malformed_observed_state(self):

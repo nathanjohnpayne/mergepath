@@ -1078,7 +1078,7 @@ jobs:
                   });
                   const { execFileSync } = require('child_process');
                   const result = JSON.parse(execFileSync('python3', ['scripts/workflow/owner-admin-override.py', 'audit'], {
-                    input: JSON.stringify({pr, author: authorIdentity, comments}), encoding: 'utf8',
+                    input: JSON.stringify({pr, author: authorIdentity, comments, needs_human_review_at_merge: hadHumanLabel, hard_hold_at_merge: hadHumanHold || hadPolicyViolation}), encoding: 'utf8',
                   }));
                   if (result.recorded_override) recordedOverride = result;
                 } catch (e) {

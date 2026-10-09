@@ -49,9 +49,20 @@ def merge_args(argv):
             repo = flag[2:].lstrip('=')
         else:
             return None
-    if args[:2] != ['pr', 'merge']:
+    if not args or args.pop(0) != 'pr':
         return None
-    args = args[2:]
+    while args and args[0] != 'merge':
+        flag = args.pop(0)
+        if flag in ('--repo', '-R') and args:
+            repo = args.pop(0)
+        elif flag.startswith('--repo='):
+            repo = flag.split('=', 1)[1]
+        elif flag.startswith('-R') and len(flag) > 2:
+            repo = flag[2:].lstrip('=')
+        else:
+            return None
+    if not args or args.pop(0) != 'merge':
+        return None
     admin = False
     selector = None
     heads = []
@@ -156,7 +167,12 @@ def prepare(argv):
     if confirmed.get('body') != body or confirmed.get('user', {}).get('login') != os.environ['GH_AS_AUTHOR_RECORD_IDENTITY']:
         raise ValueError('owner override comment failed author/body readback')
     # A branch push after this read is rejected by GitHub's writer precondition.
-    if gh(*query, '--json', 'url,headRefOid')['headRefOid'] != head:
+    final_pr = gh(*query, '--json', 'url,headRefOid,labels')
+    if {label['name'] for label in final_pr['labels']} & {'human-hold', 'policy-violation'}:
+        raise ValueError('human-hold and policy-violation require human label removal')
+    if 'needs-human-review' in {label['name'] for label in final_pr['labels']} and not record['allow_needs_human_review']:
+        raise ValueError('needs-human-review requires explicit owner authorization')
+    if final_pr['headRefOid'] != head:
         raise ValueError('PR head changed after recording the owner instruction')
     print('gh-as-author: recorded scoped owner admin authorization', file=sys.stderr)
 
@@ -184,9 +200,12 @@ def audit(payload):
             merged = timestamp(pr['merged_at'])
             validate(authorization, pr['html_url'], pr['head']['sha'], merged)
             posted = timestamp(comment['created_at'])
-            if not timestamp(record['authorized_at']) <= posted <= merged:
+            updated = timestamp(comment['updated_at'])
+            if not timestamp(record['authorized_at']) <= posted <= updated <= merged:
                 continue
-            if record['observed_fresh_escalation'] and not record['allow_needs_human_review']:
+            if payload.get('hard_hold_at_merge') is True:
+                continue
+            if (record['observed_fresh_escalation'] or payload.get('needs_human_review_at_merge') is True) and not record['allow_needs_human_review']:
                 continue
             if record['observed_codex_inflight'] and not record['allow_codex_inflight']:
                 continue
