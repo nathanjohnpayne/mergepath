@@ -28,6 +28,8 @@ Feature: static, single-file review-policy playground. One surface of the Mergep
 
 ## Hardening requirements
 
+- **Author declarations.** Both the local simulator and public-repo loader read an Authoring-Agent declaration only at source column zero, including after earlier body text. Prose mentions and indented lines are ignored. A valid declaration takes precedence over later mentions; otherwise reporting falls back to the GitHub login.
+
 - **XSS.** No dynamic content is injected via `innerHTML`. All user-supplied or injected data (path globs, PR titles, author handles, paths) is rendered through `textContent` or DOM node creation.
 - **Input validation.** Protected-path input is trimmed, length-capped at 200 characters, deduped, and rejected if it contains characters outside `[A-Za-z0-9_.\-/*?[\]{}:@+,!~$^=]`. The list is capped at 25 entries.
 - **Glob safety.** Glob compilation is wrapped in try/catch; an invalid pattern falls back to "no match" rather than throwing.

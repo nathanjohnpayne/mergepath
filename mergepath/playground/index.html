@@ -1643,8 +1643,8 @@
       const filesBody = await filesRes.json();  // one page; >100-file PRs truncate
       const files = Array.isArray(filesBody) ? filesBody : [];
       // Author detection mirrors scripts/policy-sim.sh: Authoring-Agent:
-      // trailer in the PR body first, then the GitHub login.
-      const m = String(pr.body || '').match(/Authoring-Agent:\s*([A-Za-z0-9_-]+)/);
+      // declaration at column zero first, then the GitHub login.
+      const m = String(pr.body || '').match(/^Authoring-Agent:\s*([A-Za-z0-9_-]+)/m);
       prs.push({
         id: '#' + pr.number,
         title: pr.title,

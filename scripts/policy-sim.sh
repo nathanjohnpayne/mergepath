@@ -72,7 +72,7 @@ trap 'rm -rf "$PRS_DIR"' EXIT
     id: ("#\(.number)"),
     title: .title,
     author: (
-      ((.body // "") | (try capture("Authoring-Agent:\\s*(?<a>[a-zA-Z0-9_-]+)").a catch null))
+      ((.body // "") | [split("\n")[] | (try capture("^Authoring-Agent:\\s*(?<a>[a-zA-Z0-9_-]+)").a catch empty)] | .[0])
       // .author.login
     ),
     lines: (.additions + .deletions),
