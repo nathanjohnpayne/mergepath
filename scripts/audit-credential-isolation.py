@@ -11,6 +11,17 @@ AUTHORITY = {'AUTHOR_MERGE_TOKEN', 'REVIEWER_ASSIGNMENT_TOKEN', 'CLAUDE_PAT', 'C
              'CURSOR_PAT', 'OP_SERVICE_ACCOUNT_TOKEN', 'BRANCH_PROTECTION_AUDIT_TOKEN', 'CI_ACTOR_TOKEN'}
 
 
+def deployment_policy(environment):
+    """Distinguish an explicitly unrestricted policy from unreadable schema."""
+    if 'deployment_branch_policy' not in environment:
+        raise ValueError('deployment branch policy metadata is unavailable')
+    policy = environment['deployment_branch_policy']
+    if policy is not None and (not isinstance(policy, dict)
+            or any(type(policy.get(field)) is not bool for field in ('protected_branches', 'custom_branch_policies'))):
+        raise ValueError('deployment branch policy metadata is malformed')
+    return policy
+
+
 def assess(repo_secrets, environment, policies, branch, organization_secrets=None):
     """Return drift; malformed or incomplete observations are infrastructure."""
     if not isinstance(repo_secrets, list) or not all(isinstance(item, dict) and isinstance(item.get('name'), str) for item in repo_secrets):
@@ -33,7 +44,7 @@ def assess(repo_secrets, environment, policies, branch, organization_secrets=Non
         raise ValueError('environment bypass metadata is unavailable')
     if environment['can_admins_bypass']:
         drift.append('The protected credential environment permits admin bypass')
-    policy = environment.get('deployment_branch_policy')
+    policy = deployment_policy(environment)
     if policy != {'protected_branches': False, 'custom_branch_policies': True}:
         drift.append('The credential environment must use a custom branch policy')
     if not policies or any(item['name'] != branch or item['type'] != 'branch' for item in policies):
@@ -72,7 +83,9 @@ def main():
     try:
         secrets = items(root + '/actions/secrets?per_page=100', 'secrets')
         repository = api(root)
-        if len(repository) != 1 or not isinstance(repository[0], dict) or repository[0].get('owner', {}).get('type') not in ('User', 'Organization'):
+        if (len(repository) != 1 or not isinstance(repository[0], dict)
+                or not isinstance(repository[0].get('owner'), dict)
+                or repository[0]['owner'].get('type') not in ('User', 'Organization')):
             raise ValueError('repository owner metadata is unavailable')
         organization_secrets = (items(root + '/actions/organization-secrets?per_page=100', 'secrets')
                                 if repository[0]['owner']['type'] == 'Organization' else [])
@@ -101,7 +114,7 @@ def main():
         # GitHub returns 404 for this endpoint when the environment has no
         # custom branch policy. The environment object already proves that
         # drift; do not misclassify the expected 404 as an auth outage.
-        policy = environments[0].get('deployment_branch_policy')
+        policy = deployment_policy(environments[0])
         policies = (items(root + '/environments/' + env + '/deployment-branch-policies?per_page=100', 'branch_policies')
                     if isinstance(policy, dict) and policy.get('custom_branch_policies') is True else [])
         drift = assess(secrets, environments[0], policies, args.branch, organization_secrets)

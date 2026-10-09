@@ -44,10 +44,11 @@ class IsolationTests(unittest.TestCase):
 
 class IsolationCliTests(unittest.TestCase):
     def run_audit(self, *, secrets=None, env=None, policies=None, failure=None,
-                  owner_type='User', organization_secrets=None, failure_text='permission denied', inventory=None):
+                  owner_type='User', organization_secrets=None, failure_text='permission denied', inventory=None,
+                  repository=None):
         root = 'repos/owner/repo'
         observations = {
-            root: [{'owner': {'type': owner_type}}],
+            root: [{'owner': {'type': owner_type}}] if repository is None else repository,
             root + '/actions/organization-secrets?per_page=100': organization_secrets or [{'total_count': 0, 'secrets': []}],
             root + '/environments?per_page=100': inventory or [{'total_count': 0, 'environments': []}],
             root + '/actions/secrets?per_page=100': secrets if secrets is not None else [{'total_count': 0, 'secrets': []}],
@@ -148,6 +149,32 @@ print(json.dumps(json.loads(Path(os.environ['AUDIT_OBSERVATIONS']).read_text())[
         for page in (None, [], 'invalid'):
             code, report, _ = self.run_audit(env=[page])
             self.assertEqual((code, report['status']), (2, 'ERROR'))
+
+    def test_non_object_repository_owner_is_structured_error(self):
+        for owner in (None, [], 'invalid', 1, True):
+            with self.subTest(owner=owner):
+                code, report, calls = self.run_audit(repository=[{'owner': owner}])
+                self.assertEqual((code, report['status']), (2, 'ERROR'))
+                self.assertEqual(len(calls), 2)
+
+    def test_missing_or_malformed_deployment_policy_is_structured_error(self):
+        missing = {k: v for k, v in CLOSED.items() if k != 'deployment_branch_policy'}
+        invalid = [missing, *[dict(CLOSED, deployment_branch_policy=policy)
+                             for policy in ([], False, 'invalid', {},
+                                            {'protected_branches': False, 'custom_branch_policies': 'true'})]]
+        for environment in invalid:
+            with self.subTest(environment=environment):
+                code, report, calls = self.run_audit(env=[environment])
+                self.assertEqual((code, report['status']), (2, 'ERROR'))
+                self.assertEqual(len(calls), 3)
+
+    def test_non_main_policy_on_second_page_is_drift(self):
+        code, report, _ = self.run_audit(policies=[
+            {'total_count': 2, 'branch_policies': MAIN},
+            {'total_count': 2, 'branch_policies': [{'name': 'feature/*', 'type': 'branch'}]},
+        ])
+        self.assertEqual((code, report['status']), (3, 'DRIFT'))
+        self.assertTrue(any('literal default branch' in drift for drift in report['drift']))
 
     def test_missing_gh_is_structured_error(self):
         result = subprocess.run([sys.executable, str(ROOT / 'scripts/audit-credential-isolation.py'),
