@@ -210,6 +210,17 @@ jobs:
                 }
               }
 
+              // Shared-author identity must be known before either Codex or
+              // an independent CLI approval can excuse review clearance.
+              const validAuthorDeclaration = pr.user.login !== authorIdentity ||
+                (bodyContract.authorCount === 1 && Boolean(bodyContract.author) &&
+                  reviewerAccounts.filter(r => String(r).toLowerCase().endsWith(
+                    '-' + String(bodyContract.author).toLowerCase()
+                  )).length === 1);
+              if (!validAuthorDeclaration) {
+                prViolations.push('Missing, ambiguous, or unconfigured `Authoring-Agent` declaration');
+              }
+
               // Fetch all reviews for this PR once, up front. Both
               // Check 2 (external-review approval) and Check 3 (bot
               // self-approval) consume them, and an earlier version
@@ -751,8 +762,8 @@ jobs:
                   // An anchored review or affirmative verdict substitutes for reviewer
                   // approval only with same-agent context or an existing
                   // independent CLI approval.
-                  const gateBSatisfied = cliApprovedReviews.length > 0 ||
-                    (sameAgentContext && (latestKind !== 'review' || !reviewHasBlockingRoots));
+                  const gateBSatisfied = validAuthorDeclaration && (cliApprovedReviews.length > 0 ||
+                    (sameAgentContext && (latestKind !== 'review' || !reviewHasBlockingRoots)));
                   if (latestKind === 'review') {
                     codexCleared = gateBSatisfied && !reviewHasUnresolvedP01;
                   } else if (latestKind === 'verdict') {
@@ -830,7 +841,7 @@ jobs:
                 // always empty in that config) — a transient issueComments
                 // fetch failure must not invalidate an otherwise-fresh CLI
                 // approval over a signal source the repo doesn't use.
-                const hasFreshCliApproval = cliApprovedReviews.length > 0 &&
+                const hasFreshCliApproval = validAuthorDeclaration && cliApprovedReviews.length > 0 &&
                   (!codexEnabled || issueComments !== null) &&
                   (!latestAnyCodexSignalTime || latestCliApprovedTime > latestAnyCodexSignalTime);
 
