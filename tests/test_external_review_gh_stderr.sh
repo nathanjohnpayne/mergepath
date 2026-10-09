@@ -506,6 +506,26 @@ for bad_anchor in "${HEAD_SHA:0:6}" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb '@@
 done
 reset_stub_env
 
+# Empty or malformed newer negative fields must survive the history scan.
+# The older clean verdict has the same fingerprint and would otherwise carry.
+for bad_anchor in '' '   ' '@@' "${HEAD_SHA:0:7}"; do
+  jq -n --arg bad "$bad_anchor" '[
+    {user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-01-01T00:00:00Z",
+     body:"Codex Review: Didnt find any major issues.\nReviewed commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    {user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-02-01T00:00:00Z",
+     body:("Codex Review: Further changes required.\nReviewed commit: " + $bad)}
+  ]' >"$CF1752_COMMENTS"
+  reset_stub_env
+  export STUB_COMMENTS_JSON="$CF1752_COMMENTS"
+  run_cf "$WORK/cf1752-empty-newer.stderr"
+  if [ "$RC" -eq 2 ] && grep -q 'abbreviated or malformed commit' "$WORK/cf1752-empty-newer.stderr"; then
+    pass "#1752: newer negative malformed/empty anchor refuses older clearance ($bad_anchor)"
+  else
+    fail "#1752: newer malformed anchor disappeared (rc=$RC out=$OUT)"
+  fi
+done
+reset_stub_env
+
 # ── Oversized comments/reviews payloads (#1092) ─────────────────────
 #
 # carryforward.sh handed the whole /issues/N/comments and /pulls/N/reviews

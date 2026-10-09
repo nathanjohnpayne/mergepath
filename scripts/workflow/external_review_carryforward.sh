@@ -336,7 +336,7 @@ while IFS=$'\t' read -r source_time source_sha; do
     continue
   fi
 
-  NEWER_SIGNALS=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -r \
+  NEWER_SIGNALS=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -c \
     --arg bot "$BOT_LOGIN" \
     --arg source_time "$source_time" \
     '
@@ -364,16 +364,19 @@ while IFS=$'\t' read -r source_time source_sha; do
       | select(.user.login == $bot)
       | {kind: "review", time: (.submitted_at // ""), sha: (.commit_id // ""), affirmative: false}
     ])
-    | map(select(.time != "" and .sha != "" and .time > $source_time and .affirmative != true))
+    | map(select(.time != "" and .time > $source_time and .affirmative != true))
     | sort_by(.time)
     | reverse
     | .[]
-    | [.time, .sha, .kind]
-    | @tsv
   ')
   blocked_by_newer_same_fingerprint=false
-  while IFS=$'\t' read -r signal_time signal_sha signal_kind; do
-    [ -n "$signal_sha" ] || continue
+  # Preserve empty fields in structured JSON. TSV read collapses empty cells,
+  # and an empty commit anchor must refuse rather than disappear from history.
+  while IFS= read -r signal_json; do
+    [ -n "$signal_json" ] || continue
+    signal_time=$(printf '%s' "$signal_json" | jq -r '.time')
+    signal_sha=$(printf '%s' "$signal_json" | jq -r '.sha')
+    signal_kind=$(printf '%s' "$signal_json" | jq -r '.kind')
     signal_resolved=""
     signal_lc=$(printf '%s' "$signal_sha" | tr '[:upper:]' '[:lower:]')
     if [[ ! "$signal_lc" =~ ^[0-9a-f]{40}$ ]]; then
