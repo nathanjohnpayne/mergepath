@@ -10,6 +10,8 @@
 # Used by check_spec_test_alignment when the default filename search
 # wouldn't find the test.
 spec_test_map:
+  merge_review_disagreement:
+    - tests/test_gh_pr_guard.sh
   bootstrap_git_execution:
     - tests/test_gh_as_author.sh
   credential_isolation: tests/test_credential_isolation.py

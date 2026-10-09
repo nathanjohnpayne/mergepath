@@ -23,7 +23,13 @@
 #      `human-hold`, with no CODEX_CLEARED / BREAK_GLASS_* bypass.
 #      This is the human-controlled hard freeze: agents may add the
 #      label, but only the human releases it.
-#   5. gh pr merge (non-admin) — blocks when the target PR carries
+#   5. Immediate gh pr merge (except attributed --disable-auto retraction)
+#      blocks outstanding non-author
+#      CHANGES_REQUESTED reviews, including on older heads. Only a reviewer
+#      approval, dismissal or owner-authorized
+#      BREAK_GLASS_REVIEW_DISAGREEMENT=<PR>@<full-head-sha> releases it;
+#      admin and merge-state overrides never decide that disagreement.
+#   6. gh pr merge (non-admin) — blocks when the target PR carries
 #      the `needs-external-review` label unless CODEX_CLEARED=1
 #      (agent must have just run scripts/codex-review-check.sh
 #      successfully). This enforces REVIEW_POLICY.md § Phase 4a
@@ -213,10 +219,8 @@
 #     update; misclassifying them as boolean would let the next
 #     token leak through as the subcommand.
 #
-#   - Other env vars in the inline prefix (anything other than
-#     CODEX_CLEARED and BREAK_GLASS_ADMIN) are skipped without
-#     interpretation. This is fine because no other env var is
-#     consulted by hook policy decisions.
+#   - Only the policy variables captured by the token walk below are
+#     interpreted from inline prefixes; unrelated assignments are skipped.
 
 set -euo pipefail
 
@@ -1699,7 +1703,7 @@ for _ci in "${!TOKENS[@]}"; do
       # real command (which may be a synth cmdsub) follows — stay command position.
       continue
       ;;
-    sudo|eval|time|nohup|env|command|exec|nice|ionice)
+    builtin|sudo|eval|time|nohup|env|command|exec|nice|ionice)
       _synth_prefix="$_stok"
       continue
       ;;
@@ -1763,7 +1767,7 @@ for i in "${!TOKENS[@]}"; do
     [A-Za-z_]*=*)
       continue
       ;;
-    sudo|eval|time|nohup|env|command|exec|nice|ionice)
+    builtin|sudo|eval|time|nohup|env|command|exec|nice|ionice)
       SCAN_CURRENT_PREFIX="$tok"
       continue
       ;;
@@ -1858,6 +1862,10 @@ fi
 INLINE_CODEX_CLEARED=""
 INLINE_BREAK_GLASS_ADMIN=""
 INLINE_BREAK_GLASS_MERGE_STATE=""
+INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT=""
+INLINE_REVIEW_DISAGREEMENT_SET=0
+EXPORTED_BREAK_GLASS_REVIEW_DISAGREEMENT=""
+EXPORTED_REVIEW_DISAGREEMENT_SET=0
 INLINE_GH_AS_AUTHOR_IDENTITY=""
 INLINE_GH_AS_REVIEWER_IDENTITY=""
 # Standalone (own-segment) identity assignments persist as shell
@@ -1904,6 +1912,10 @@ INLINE_MERGEPATH_AGENT_SET=0
 INLINE_OP_PREFLIGHT_AGENT=""
 INLINE_OP_PREFLIGHT_AGENT_SET=0
 GLOBAL_REPO=""
+INLINE_REPO_ENV_SET=0
+STANDALONE_REPO_ENV_SET=0
+SHELL_DIRECTORY_CHANGED=0
+INLINE_DIRECTORY_CHANGED=0
 PR_SUBCOMMAND=""
 PR_SUBCOMMAND_INDEX=-1    # index in TOKENS where the gh pr subcommand was found
 WRAPPER_KIND=""           # "" | "author" | "reviewer"
@@ -1980,6 +1992,10 @@ for i in "${!TOKENS[@]}"; do
           GLOBAL_REPO="${tok#-R=}"
           continue
           ;;
+        -R?*)
+          GLOBAL_REPO="${tok#-R}"
+          continue
+          ;;
         --repo=*)
           GLOBAL_REPO="${tok#--repo=}"
           continue
@@ -2012,6 +2028,10 @@ for i in "${!TOKENS[@]}"; do
         ;;
       -R=*)
         GLOBAL_REPO="${tok#-R=}"
+        continue
+        ;;
+      -R?*)
+        GLOBAL_REPO="${tok#-R}"
         continue
         ;;
       --repo=*)
@@ -2058,6 +2078,9 @@ for i in "${!TOKENS[@]}"; do
     # on (Codex P2 on PR #442 r17, env --help verified).
     if [ "$PENDING_PREFIX_FLAG" = "env:-u" ] || [ "$PENDING_PREFIX_FLAG" = "env:--unset" ]; then
       case "$tok" in
+        GH_REPO|GIT_*)
+          INLINE_REPO_ENV_SET=1
+          ;;
         GH_AS_AUTHOR_IDENTITY)
           INLINE_GH_AS_AUTHOR_IDENTITY=""
           INLINE_GH_AS_AUTHOR_IDENTITY_SET=1
@@ -2115,10 +2138,23 @@ for i in "${!TOKENS[@]}"; do
       # nathanpayne-codex caught the over-clearing on template PR #76
       # round 1 — `CODEX_CLEARED=1 && gh pr merge` was being cleared
       # even though the assignment was standalone.
+      # Only explicit exports or a direct command prefix grant disagreement
+      # authority. A standalone assignment may be unexported, or may overwrite
+      # an already exported value; neither can fall back to ambient authority.
+      if [ "$SEGMENT_HAS_COMMAND" -eq 0 ] && [ "$INLINE_REVIEW_DISAGREEMENT_SET" -eq 1 ]; then
+        EXPORTED_BREAK_GLASS_REVIEW_DISAGREEMENT="unverifiable"
+        EXPORTED_REVIEW_DISAGREEMENT_SET=1
+      fi
+      INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT=""
+      INLINE_REVIEW_DISAGREEMENT_SET=0
       if [ "$SEGMENT_HAS_COMMAND" -eq 1 ]; then
+        IDENTITY_ENV_CLEARED_FOR_WRAPPER=0
+        INLINE_DIRECTORY_CHANGED=0
         INLINE_CODEX_CLEARED=""
         INLINE_BREAK_GLASS_ADMIN=""
         INLINE_BREAK_GLASS_MERGE_STATE=""
+        INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT=""
+        INLINE_REVIEW_DISAGREEMENT_SET=0
       fi
       # Identity assignments: their consumer is the WRAPPER process
       # environment, not this hook, and what survives a separator
@@ -2139,6 +2175,9 @@ for i in "${!TOKENS[@]}"; do
       #     an unexported standalone value would have masked the
       #     wrapper falling back to its stock default).
       if [ "$SEGMENT_HAS_COMMAND" -eq 0 ] || [ "${SEGMENT_HAS_EVAL:-0}" -eq 1 ]; then
+        if [ "$INLINE_REPO_ENV_SET" -eq 1 ]; then
+          STANDALONE_REPO_ENV_SET=1
+        fi
         # Bare standalone segment, or an eval segment — in both, a
         # captured assignment persists past the separator (eval'd
         # assignments are standalone-equivalent; assignments that
@@ -2166,6 +2205,7 @@ for i in "${!TOKENS[@]}"; do
       INLINE_MERGEPATH_AGENT_SET=0
       INLINE_OP_PREFLIGHT_AGENT=""
       INLINE_OP_PREFLIGHT_AGENT_SET=0
+      INLINE_REPO_ENV_SET=0
       SEGMENT_HAS_COMMAND=0
       continue
       ;;
@@ -2181,11 +2221,22 @@ for i in "${!TOKENS[@]}"; do
   # `CODEX_CLEARED=1 sudo gh pr merge 65`) count.
   if [ "$AT_COMMAND_POSITION" -eq 1 ]; then
     case "$tok" in
+      GH_REPO=*|GIT_*=*)
+        INLINE_REPO_ENV_SET=1
+        ;;
       CODEX_CLEARED=*)
         INLINE_CODEX_CLEARED="${tok#CODEX_CLEARED=}"
         ;;
       BREAK_GLASS_ADMIN=*)
         INLINE_BREAK_GLASS_ADMIN="${tok#BREAK_GLASS_ADMIN=}"
+        ;;
+      BREAK_GLASS_REVIEW_DISAGREEMENT=*)
+        INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT="${tok#BREAK_GLASS_REVIEW_DISAGREEMENT=}"
+        INLINE_REVIEW_DISAGREEMENT_SET=1
+        case "${TOKENS[$((i+1))]:-}" in
+          __MERGEPATH_CMDSUB__|__MERGEPATH_CMDSUB_LITERAL__)
+            INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT="unverifiable" ;;
+        esac
         ;;
       BREAK_GLASS_MERGE_STATE=*)
         INLINE_BREAK_GLASS_MERGE_STATE="${tok#BREAK_GLASS_MERGE_STATE=}"
@@ -2264,7 +2315,34 @@ for i in "${!TOKENS[@]}"; do
     # Capture them into the standalone (possibly-effective) slots the
     # candidate model already validates.
     if [ "$IN_EXPORT_SEGMENT" -eq 1 ]; then
+      # Only a literal export grants this release; ambiguous declaration
+      # forms must not acquire authority through identity over-capture.
+      if [ "$DECLARATION_KIND" = export ]; then
+        case "$tok" in
+          -*) DECLARATION_KIND="ambiguous-export" ;;
+          BREAK_GLASS_REVIEW_DISAGREEMENT=*)
+            EXPORTED_BREAK_GLASS_REVIEW_DISAGREEMENT="${tok#BREAK_GLASS_REVIEW_DISAGREEMENT=}"
+            EXPORTED_REVIEW_DISAGREEMENT_SET=1
+            case "${TOKENS[$((i+1))]:-}" in
+              __MERGEPATH_CMDSUB__|__MERGEPATH_CMDSUB_LITERAL__)
+                EXPORTED_BREAK_GLASS_REVIEW_DISAGREEMENT="unverifiable" ;;
+            esac
+            ;;
+          BREAK_GLASS_REVIEW_DISAGREEMENT)
+            if [ -n "$INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT" ]; then
+              EXPORTED_BREAK_GLASS_REVIEW_DISAGREEMENT="$INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT"
+              EXPORTED_REVIEW_DISAGREEMENT_SET=1
+            fi
+            ;;
+        esac
+      elif [ "$DECLARATION_KIND" = unset ] && [ "$tok" = BREAK_GLASS_REVIEW_DISAGREEMENT ]; then
+        EXPORTED_BREAK_GLASS_REVIEW_DISAGREEMENT=""
+        EXPORTED_REVIEW_DISAGREEMENT_SET=1
+      fi
       case "$tok" in
+        GH_REPO=*|GH_REPO|GIT_*)
+          STANDALONE_REPO_ENV_SET=1
+          ;;
         GH_AS_AUTHOR_IDENTITY=*)
           STANDALONE_GH_AS_AUTHOR_IDENTITY="${tok#GH_AS_AUTHOR_IDENTITY=}"
           STANDALONE_GH_AS_AUTHOR_IDENTITY_SET=1
@@ -2320,6 +2398,9 @@ for i in "${!TOKENS[@]}"; do
     if [ "$INLINE_GH_AS_AUTHOR_IDENTITY_SET" -eq 1 ]; then
       STANDALONE_GH_AS_AUTHOR_IDENTITY="$INLINE_GH_AS_AUTHOR_IDENTITY"
       STANDALONE_GH_AS_AUTHOR_IDENTITY_SET=1
+    fi
+    if [ "$INLINE_REPO_ENV_SET" -eq 1 ]; then
+      STANDALONE_REPO_ENV_SET=1
     fi
     if [ "$INLINE_GH_AS_REVIEWER_IDENTITY_SET" -eq 1 ]; then
       STANDALONE_GH_AS_REVIEWER_IDENTITY="$INLINE_GH_AS_REVIEWER_IDENTITY"
@@ -2397,7 +2478,7 @@ for i in "${!TOKENS[@]}"; do
       esac
       continue
       ;;
-    sudo|eval|time|nohup|env|command|exec|nice|ionice)
+    builtin|sudo|eval|time|nohup|env|command|exec|nice|ionice)
       # Known prefix command. Stay in command position so the
       # next non-flag token is still treated as the command.
       # Track which prefix we're parsing flags for so we can
@@ -2437,6 +2518,16 @@ for i in "${!TOKENS[@]}"; do
       # over-fix from breaking `time -p`. Keep this shared with
       # the #348 compound pre-scan so both walks classify prefixes
       # identically.
+      if [ "$CURRENT_PREFIX" = env ]; then
+        case "$tok" in
+          -C|--chdir)
+            INLINE_DIRECTORY_CHANGED=1
+            SKIP_PREFIX_VALUE=1
+            PENDING_PREFIX_FLAG="env:chdir"
+            continue ;;
+          -C?*|--chdir=*) INLINE_DIRECTORY_CHANGED=1; continue ;;
+        esac
+      fi
       if prefix_flag_takes_value "$CURRENT_PREFIX" "$tok"; then
         SKIP_PREFIX_VALUE=1
         PENDING_PREFIX_FLAG="$CURRENT_PREFIX:$tok"
@@ -2453,6 +2544,10 @@ for i in "${!TOKENS[@]}"; do
       # recognize, so it must be modeled explicitly here.
       if [ "$CURRENT_PREFIX" = "env" ]; then
         case "$tok" in
+          --unset=GH_REPO|-u=GH_REPO|-uGH_REPO|--unset=GIT_*|-u=GIT_*|-uGIT_*)
+            INLINE_REPO_ENV_SET=1
+            continue
+            ;;
           --unset=GH_AS_AUTHOR_IDENTITY|-u=GH_AS_AUTHOR_IDENTITY|-uGH_AS_AUTHOR_IDENTITY)
             INLINE_GH_AS_AUTHOR_IDENTITY=""
             INLINE_GH_AS_AUTHOR_IDENTITY_SET=1
@@ -2497,6 +2592,11 @@ for i in "${!TOKENS[@]}"; do
       # boolean to avoid eating `gh`). Stay in command position.
       continue
       ;;
+    cd|pushd|popd|source|.)
+      SHELL_DIRECTORY_CHANGED=1
+      AT_COMMAND_POSITION=0
+      SEGMENT_HAS_COMMAND=1
+      continue ;;
     *)
       # An unrelated command (echo, printf, cat, find, etc.).
       # gh-as-an-argument should NOT trigger the hook;
@@ -2516,6 +2616,13 @@ done
 EFFECTIVE_CODEX_CLEARED="${CODEX_CLEARED:-${INLINE_CODEX_CLEARED:-}}"
 EFFECTIVE_BREAK_GLASS_ADMIN="${BREAK_GLASS_ADMIN:-${INLINE_BREAK_GLASS_ADMIN:-}}"
 EFFECTIVE_BREAK_GLASS_MERGE_STATE="${BREAK_GLASS_MERGE_STATE:-${INLINE_BREAK_GLASS_MERGE_STATE:-}}"
+EFFECTIVE_BREAK_GLASS_REVIEW_DISAGREEMENT="${BREAK_GLASS_REVIEW_DISAGREEMENT:-}"
+if [ "$EXPORTED_REVIEW_DISAGREEMENT_SET" -eq 1 ]; then
+  EFFECTIVE_BREAK_GLASS_REVIEW_DISAGREEMENT="$EXPORTED_BREAK_GLASS_REVIEW_DISAGREEMENT"
+fi
+if [ "$INLINE_REVIEW_DISAGREEMENT_SET" -eq 1 ]; then
+  EFFECTIVE_BREAK_GLASS_REVIEW_DISAGREEMENT="$INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT"
+fi
 
 # Distinguish `gh pr comment` from `gh issue comment` (both share the
 # subcommand label `comment` but route through different parent
@@ -3211,6 +3318,12 @@ fi
 PR_SELECTOR=""
 REPO_ARG=""
 ADMIN_REQUESTED=0
+MATCH_HEAD_SHA=""
+MATCH_HEAD_COUNT=0
+AUTO_REQUESTED=0
+DISABLE_AUTO_REQUESTED=0
+RETRACTION_ARGS_SAFE=1
+MERGE_FLAGS_ENDED=0
 SKIP_NEXT_AS=""  # "" | "skip" | "repo"
 merge_walk_start=$((PR_SUBCOMMAND_INDEX + 1))
 for j in "${!TOKENS[@]}"; do
@@ -3227,8 +3340,59 @@ for j in "${!TOKENS[@]}"; do
     SKIP_NEXT_AS=""
     continue
   fi
+  if [ "$SKIP_NEXT_AS" = "match" ]; then
+    MATCH_HEAD_SHA="$tok"
+    MATCH_HEAD_COUNT=$((MATCH_HEAD_COUNT + 1))
+    SKIP_NEXT_AS=""
+    continue
+  fi
+  case "$tok" in "&&"|"||"|";"|"|"|"|&"|"&"|"("|")") break ;; esac
+  if [ "$MERGE_FLAGS_ENDED" -eq 1 ]; then
+    if [ -z "$PR_SELECTOR" ]; then PR_SELECTOR="$tok"; fi
+    continue
+  fi
   case "$tok" in
+    --)
+      MERGE_FLAGS_ENDED=1
+      continue
+      ;;
+    --auto)
+      RETRACTION_ARGS_SAFE=0
+      AUTO_REQUESTED=1
+      continue
+      ;;
+    --auto=*)
+      RETRACTION_ARGS_SAFE=0
+      case "${tok#--auto=}" in
+        false|False|FALSE|f|F|0) AUTO_REQUESTED=0 ;;
+        true|True|TRUE|t|T|1) AUTO_REQUESTED=1 ;;
+        *) echo "BLOCKED: invalid --auto boolean value." >&2; exit 2 ;;
+      esac
+      continue
+      ;;
+    --disable-auto)
+      DISABLE_AUTO_REQUESTED=1
+      continue
+      ;;
+    --disable-auto=*)
+      case "${tok#--disable-auto=}" in
+        false|False|FALSE|f|F|0) DISABLE_AUTO_REQUESTED=0 ;;
+        true|True|TRUE|t|T|1) DISABLE_AUTO_REQUESTED=1 ;;
+        *) echo "BLOCKED: invalid --disable-auto boolean value." >&2; exit 2 ;;
+      esac
+      continue
+      ;;
+    --match-head-commit)
+      SKIP_NEXT_AS="match"
+      continue
+      ;;
+    --match-head-commit=*)
+      MATCH_HEAD_SHA="${tok#--match-head-commit=}"
+      MATCH_HEAD_COUNT=$((MATCH_HEAD_COUNT + 1))
+      continue
+      ;;
     --admin)
+      RETRACTION_ARGS_SAFE=0
       ADMIN_REQUESTED=1
       continue
       ;;
@@ -3244,24 +3408,65 @@ for j in "${!TOKENS[@]}"; do
       REPO_ARG="${tok#-R=}"
       continue
       ;;
-    --body|-b|--body-file|-F|--subject|-t|--author-email|-A|--match-head-commit)
+    -R?*)
+      REPO_ARG="${tok#-R}"
+      continue
+      ;;
+    --body|-b|--body-file|-F|--subject|-t|--author-email|-A)
+      RETRACTION_ARGS_SAFE=0
       SKIP_NEXT_AS="skip"
+      continue
+      ;;
+    --body=*|--body-file=*|--subject=*|--author-email=*|-b?*|-F?*|-t?*|-A?*|--squash|--squash=*|--merge|--merge=*|--rebase|--rebase=*|--delete-branch|--delete-branch=*|--help|-s|-m|-r|-d|-h|-s=*|-m=*|-r=*|-d=*|-h=*)
+      RETRACTION_ARGS_SAFE=0
       continue
       ;;
   esac
   case "$tok" in
     -*)
-      continue
+      echo "BLOCKED: unrecognized merge option or short cluster; use supported separate flags so head and retraction arguments remain unambiguous." >&2
+      exit 2
       ;;
   esac
   # First non-flag token after the gh-context `merge` is the
   # selector. Don't break — keep walking so a `--repo`/`-R` flag or
   # `--admin` flag appearing AFTER the selector still gets captured.
+  case "$tok" in
+    *'$'*|*'`'*|__MERGEPATH_CMDSUB__|__MERGEPATH_CMDSUB_LITERAL__)
+      echo "BLOCKED: dynamic merge arguments cannot bind the writer's flags or head precondition; use literal selectors and separate flags." >&2
+      exit 2
+      ;;
+  esac
   if [ -z "$PR_SELECTOR" ]; then
     PR_SELECTOR="$tok"
+  else
+    RETRACTION_ARGS_SAFE=0
   fi
 done
 
+# Retraction's early return accepts only selectors, repository options and
+# the exact head option. Unknown flags or short clusters may consume what
+# looks like --disable-auto as an argument, so they never grant the exception.
+if [ "$DISABLE_AUTO_REQUESTED" -eq 1 ] && [ "$RETRACTION_ARGS_SAFE" -ne 1 ]; then
+  echo "BLOCKED: retraction permits only --disable-auto, repository/selector and head options; remove other merge flags or short clusters." >&2
+  exit 2
+fi
+
+# Deferred merging outlives this local snapshot and cannot enforce a later
+# disagreement in repositories without review-state branch protection.
+if [ "$SHELL_DIRECTORY_CHANGED" -eq 1 ] || [ "$INLINE_DIRECTORY_CHANGED" -eq 1 ]; then
+  echo "BLOCKED: command-local directory changes cannot bind repository review reads; set the tool's working directory before invoking the guarded merge." >&2
+  exit 2
+fi
+if [ "$INLINE_REPO_ENV_SET" -eq 1 ] || [ "$STANDALONE_REPO_ENV_SET" -eq 1 ] \
+   || [ "$IDENTITY_ENV_CLEARED_FOR_WRAPPER" -eq 1 ]; then
+  echo "BLOCKED: command-local GH_REPO or Git repository-discovery changes, including environment resets, cannot bind the hook's repository reads; use an explicit --repo or canonical PR URL with the inherited repository environment." >&2
+  exit 2
+fi
+if [ "$AUTO_REQUESTED" -eq 1 ]; then
+  echo "BLOCKED: deferred --auto merging cannot enforce the reviewer disagreement gate; use an immediate guarded merge." >&2
+  exit 2
+fi
 # Subcommand-scoped REPO_ARG wins over global GLOBAL_REPO (mirrors
 # gh's typical "more specific flag wins" behavior). Fall back to
 # the global value only if the subcommand didn't specify one.
@@ -3301,10 +3506,10 @@ fi
 # timestamped SUCCESS, so an UNSTABLE PR with a check still re-running counted
 # all-green and could merge before CI finished. `if any(.[]; .c=="PENDING")`
 # treats a group with ANY in-progress run as non-green regardless of timestamps.
-GH_JQ='.mergeStateStatus, .mergeable, ([.statusCheckRollup[] | {n:(.name//.context//"?"), c:(.conclusion//.state//"PENDING"), t:(.completedAt//.startedAt//"")}] | group_by(.n) | map(if any(.[]; .c == "PENDING") then "PENDING" else max_by(.t).c end) | map(select(. != "SUCCESS" and . != "SKIPPED" and . != "NEUTRAL")) | length), .labels[].name'
-GH_ARGS=(pr view --json labels,mergeStateStatus,mergeable,statusCheckRollup --jq "$GH_JQ")
+GH_JQ='.mergeStateStatus, .mergeable, ([.statusCheckRollup[] | {n:(.name//.context//"?"), c:(.conclusion//.state//"PENDING"), t:(.completedAt//.startedAt//"")}] | group_by(.n) | map(if any(.[]; .c == "PENDING") then "PENDING" else max_by(.t).c end) | map(select(. != "SUCCESS" and . != "SKIPPED" and . != "NEUTRAL")) | length), .url, .headRefOid, (.author.login // ""), .labels[].name'
+GH_ARGS=(pr view --json labels,mergeStateStatus,mergeable,statusCheckRollup,url,headRefOid,author --jq "$GH_JQ")
 if [ -n "$PR_SELECTOR" ]; then
-  GH_ARGS=(pr view "$PR_SELECTOR" --json labels,mergeStateStatus,mergeable,statusCheckRollup --jq "$GH_JQ")
+  GH_ARGS=(pr view "$PR_SELECTOR" --json labels,mergeStateStatus,mergeable,statusCheckRollup,url,headRefOid,author --jq "$GH_JQ")
 fi
 if [ -n "$REPO_ARG" ]; then
   GH_ARGS+=(--repo "$REPO_ARG")
@@ -3343,7 +3548,7 @@ fi
 # CONFLICTING / UNKNOWN — conflict-only, NOT a check-pass signal);
 # line 3 is the count of check names whose LATEST run is non-green
 # (a stale failure superseded by a later passing run does NOT count);
-# lines 4..N are label names (one per line, possibly zero).
+# lines 4..6 identify the PR URL, head SHA and author; lines 7..N are labels.
 # Empty/missing MERGE_STATE (e.g. transient API state) falls into the
 # `*` case below and fails closed. LABELS keeps the newline-delimited
 # remainder for the exact-match gate further down — never re-join it
@@ -3351,7 +3556,10 @@ fi
 MERGE_STATE=$(printf '%s\n' "$GH_OUTPUT" | sed -n '1p')
 MERGEABLE_STATE=$(printf '%s\n' "$GH_OUTPUT" | sed -n '2p')
 ROLLUP_NONGREEN=$(printf '%s\n' "$GH_OUTPUT" | sed -n '3p')
-LABELS=$(printf '%s\n' "$GH_OUTPUT" | sed -n '4,$p')
+PR_URL=$(printf '%s\n' "$GH_OUTPUT" | sed -n '4p')
+PR_HEAD_SHA=$(printf '%s\n' "$GH_OUTPUT" | sed -n '5p')
+PR_AUTHOR_LOGIN=$(printf '%s\n' "$GH_OUTPUT" | sed -n '6p')
+LABELS=$(printf '%s\n' "$GH_OUTPUT" | sed -n '7,$p')
 
 # `human-hold` is a human-controlled hard freeze. Check it before
 # mergeStateStatus, --admin, or needs-external-review handling so no
@@ -3361,6 +3569,80 @@ if printf '%s\n' "$LABELS" | grep -Fxq "human-hold"; then
   echo "BLOCKED: PR carries 'human-hold'." >&2
   echo "  This is a human-remove-only hard hold and supersedes all merge gates." >&2
   echo "  Ask the human to remove the label before merging; no agent bypass is available." >&2
+  exit 2
+fi
+
+# Retraction skips merge-only checks, but the human-controlled hard freeze
+# still applies to every flavor of gh pr merge.
+[ "$DISABLE_AUTO_REQUESTED" -eq 0 ] || exit 0
+
+# Review disagreements are independent of CI and merge-state overrides
+# (#1824). Fetch every page: latestReviews in gh pr view is bounded and can
+# hide a reviewer on a busy PR. COMMENTED/PENDING never supersede an opinion.
+if [[ ! "$PR_URL" =~ ^https://([^/]+)/([^/]+)/([^/]+)/pull/([0-9]+)$ ]] \
+   || [[ ! "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "BLOCKED: gh-pr-guard could not read the PR identity/head for reviewer disagreement checks." >&2
+  exit 2
+fi
+# A second regex match above changes BASH_REMATCH; capture URL parts again.
+[[ "$PR_URL" =~ ^https://([^/]+)/([^/]+)/([^/]+)/pull/([0-9]+)$ ]]
+PR_HOST="${BASH_REMATCH[1]}"
+PR_REPO="${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
+PR_NUMBER="${BASH_REMATCH[4]}"
+# gh pr merge implicitly defers to a required native queue even without
+# --auto. Read the same GraphQL fields the CLI uses, bound to this PR/head.
+QUEUE_QUERY='query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){url headRefOid isMergeQueueEnabled isInMergeQueue}}}'
+if ! QUEUE_JSON=$(gh api --hostname "$PR_HOST" graphql -f query="$QUEUE_QUERY" \
+     -f owner="${PR_REPO%/*}" -f repo="${PR_REPO#*/}" -F number="$PR_NUMBER" 2>"$GH_STDERR") \
+   || ! printf '%s' "$QUEUE_JSON" | jq -e --arg url "$PR_URL" --arg head "$PR_HEAD_SHA" '
+      (.errors // [] | length) == 0 and
+      (.data.repository.pullRequest | .url == $url and .headRefOid == $head
+        and (.isMergeQueueEnabled | type == "boolean")
+        and (.isInMergeQueue | type == "boolean"))' >/dev/null; then
+  echo "BLOCKED: could not verify native merge-queue state for the reviewed PR head." >&2
+  exit 2
+fi
+if [ "$ADMIN_REQUESTED" -eq 0 ] && printf '%s' "$QUEUE_JSON" | jq -e '
+     .data.repository.pullRequest | .isMergeQueueEnabled or .isInMergeQueue' >/dev/null; then
+  echo "BLOCKED: native merge-queue deferral outlives the reviewer disagreement snapshot." >&2
+  exit 2
+fi
+if ! REVIEW_PAGES=$(gh api --hostname "$PR_HOST" --paginate --slurp "repos/$PR_REPO/pulls/$PR_NUMBER/reviews" 2>"$GH_STDERR") \
+   || ! printf '%s' "$REVIEW_PAGES" | jq -e '
+      type == "array" and all(.[]; type == "array" and all(.[];
+        type == "object" and (.id | type == "number") and
+        (.user == null or (.user.login | type == "string" and length > 0)) and
+        (.commit_id == null or (.commit_id | type == "string" and test("^[0-9a-f]{40}$"))) and
+        (.state | IN("APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"))))' >/dev/null; then
+  echo "BLOCKED: gh-pr-guard could not read complete PR review state; restore gh/auth connectivity and retry." >&2
+  exit 2
+fi
+REVIEW_BLOCKERS=$(printf '%s' "$REVIEW_PAGES" | jq -c --arg author "$PR_AUTHOR_LOGIN" '
+  [.[][] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")] as $opinions
+  | (reduce ($opinions[] | select(.user != null)) as $review
+      ({}; .[$review.user.login] = $review) | [.[]])
+    + [$opinions[] | select(.user == null and .state == "CHANGES_REQUESTED")]
+  | map(select(.state == "CHANGES_REQUESTED" and .user.login != $author))')
+if [ "$(printf '%s' "$REVIEW_BLOCKERS" | jq length)" -gt 0 ]; then
+  if [ "$EFFECTIVE_BREAK_GLASS_REVIEW_DISAGREEMENT" = "$PR_URL@$PR_HEAD_SHA" ]; then
+    if [ "$MATCH_HEAD_COUNT" -ne 1 ] || [ "$MATCH_HEAD_SHA" != "$PR_HEAD_SHA" ]; then
+      echo "BLOCKED: reviewer tiebreak requires exactly one --match-head-commit $PR_HEAD_SHA; a changed head must not inherit the authorization." >&2
+      exit 2
+    fi
+    echo "BREAK-GLASS: owner tiebreak authorized for reviewer disagreement on $PR_URL@$PR_HEAD_SHA." >&2
+  else
+    echo "BLOCKED: outstanding reviewer CHANGES_REQUESTED; REVIEW_POLICY.md reserves the tiebreak for the owner." >&2
+    printf '%s' "$REVIEW_BLOCKERS" | jq -r '.[] | "  Reviewer: \(.user.login // "<deleted account>"); reviewed commit: \(.commit_id // "<unknown commit>")"' >&2
+    echo "  Reviewer approval or dismissal releases this gate. Admin/merge-state overrides do not." >&2
+    echo "  Stop and ask the owner. Override format: BREAK_GLASS_REVIEW_DISAGREEMENT=<canonical-PR-URL>@<full-head-sha>." >&2
+    exit 2
+  fi
+fi
+
+# Bind every immediate write to the head inspected above, including merges
+# without an owner override. GitHub rejects a concurrent push at the writer.
+if [ "$MATCH_HEAD_COUNT" -ne 1 ] || [ "$MATCH_HEAD_SHA" != "$PR_HEAD_SHA" ]; then
+  echo "BLOCKED: immediate merge requires exactly one --match-head-commit $PR_HEAD_SHA." >&2
   exit 2
 fi
 
