@@ -523,6 +523,12 @@ if [ "${1:-}" = "api" ]; then
             ;;
         esac
       done
+      if [ "$#" = 2 ]; then
+        jq -cn --arg head "${P4B_FAKE_LIVE_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
+          --arg base "${P4B_FAKE_LIVE_BASE:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" \
+          '{head:{sha:$head},base:{sha:$base}}'
+        exit 0
+      fi
       # #674 round 4: P4B_FAKE_LIVE_HEAD2 simulates a head that drifts
       # between reads — served from the SECOND live-head read on.
       cnt_file="${P4B_ISSUE_LOG:-${TMPDIR:-/tmp}/p4b-fake}.headreads"

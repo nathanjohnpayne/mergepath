@@ -26,6 +26,7 @@ BASE="$("$INPUT_REAL_GIT" -C "$INPUT_FIXTURE" rev-parse HEAD)"
 printf 'head A\n' > "$INPUT_FIXTURE/file"
 "$INPUT_REAL_GIT" -C "$INPUT_FIXTURE" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qam A
 HEAD_A="$("$INPUT_REAL_GIT" -C "$INPUT_FIXTURE" rev-parse HEAD)"
+export HEAD_A BASE
 printf 'head B MUST NOT BE REVIEWED\n' > "$INPUT_FIXTURE/file"
 "$INPUT_REAL_GIT" -C "$INPUT_FIXTURE" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qam B
 # Mutable branch now names B; capture must derive A from its immutable ID.
@@ -34,7 +35,10 @@ cat > "$WORK/bin/git" <<'SH'
 set -eu
 args=()
 for arg in "$@"; do
- case "$arg" in https://github.com/fixture/repo.git) arg="$INPUT_FIXTURE" ;; esac
+ case "$arg" in
+  https://github.com/fixture/repo.git) arg="$INPUT_FIXTURE" ;;
+  https://*) printf 'unexpected remote: %s\n' "$arg" >> "$INPUT_WORK/git-calls"; exit 99 ;;
+ esac
  args+=("$arg")
 done
 prefix=(); is_fetch=0
@@ -63,13 +67,25 @@ if [ "$1" = auth ] && [ "$2" = git-credential ]; then
  printf 'username=fixture\npassword=fixture\n'; exit 0
 fi
 if [ "$1" = api ] && [ "$2" = --paginate ] && [ "$3" = --slurp ]; then
+ if [ -e "$INPUT_WORK/base-moves-during-timeline" ]; then
+  printf '%s\n' "$HEAD_A" > "$INPUT_WORK/live-base"
+ fi
  if [ -e "$INPUT_WORK/aba" ]; then
   printf '[[{"id":1,"event":"head_ref_force_pushed","created_at":"2026-10-08T00:00:01Z","commit_id":null},{"id":2,"event":"head_ref_force_pushed","created_at":"2026-10-08T00:00:02Z","commit_id":null}]]\n'
  else printf '[[]]\n'; fi
  exit 0
 fi
 if [ "$1" = api ] && [ "$2" = repos/fixture/repo/pulls/1753 ]; then
- printf '{}\n'
+ [ ! -e "$INPUT_WORK/tuple-fails" ] || exit 1
+ live_base="$BASE"
+ if [ -e "$INPUT_WORK/live-base" ]; then live_base="$(cat "$INPUT_WORK/live-base")"; fi
+ jq -cn --arg head "$HEAD_A" --arg base "$live_base" --arg source "${SOURCE_HEAD:-$HEAD_A}" \
+  '{number:1753,head:{sha:$head,ref:("mergepath-sync/"+$source)},base:{sha:$base,ref:"main",repo:{default_branch:"main"}},user:{login:"fixture"}}'
+ exit 0
+fi
+if [ "$1" = api ] && [ "$2" = "repos/fixture/repo/contents/.github/review-policy.yml?ref=$BASE" ]; then
+ [ ! -e "$INPUT_WORK/policy-fails" ] || exit 1
+ cat "$INPUT_WORK/consumer-policy.yml"
  exit 0
 fi
 # A mutable PR diff read would violate the production capture contract.
@@ -94,6 +110,16 @@ VERDICT='{"verdict":"APPROVED","summary":"A reviewed","findings":[],"usage":null
 BOUND="$(p4b_bind_input "$WORK/input/input.json" "$WORK/input/review.diff" "$WORK/input/review.diff" "$VERDICT")"
 if p4b_validate_bound_input "$BOUND" "$WORK/input/input.json" "$WORK/input/review.diff"; then pass 'trusted adapter binds base head and input digests'; else fail 'bound verdict'; fi
 if p4b_revalidate_input fixture/repo 1753 "$WORK/input"; then pass 'authorized unchanged input survives the generation fence'; else fail 'positive revalidation'; fi
+: > "$WORK/base-moves-during-timeline"
+if p4b_revalidate_input fixture/repo 1753 "$WORK/input"; then
+ fail 'base-only move during timeline accepted'
+else pass 'base-only move during final timeline read refuses unchanged head and bytes'; fi
+rm "$WORK/base-moves-during-timeline" "$WORK/live-base"
+: > "$WORK/tuple-fails"
+if p4b_revalidate_input fixture/repo 1753 "$WORK/input"; then
+ fail 'unreadable final tuple accepted'
+else pass 'unreadable final coherent tuple refuses review'; fi
+rm "$WORK/tuple-fails"
 TAMPERED="$(printf '%s' "$BOUND" | jq -c --arg base "$BASE" '.review_input.head_sha=$base')"
 if p4b_validate_bound_input "$TAMPERED" "$WORK/input/input.json" "$WORK/input/review.diff"; then fail 'wrong-head verdict accepted'; else pass 'wrong-head binding is rejected'; fi
 STANDALONE="$(p4b_bind_input '' "$WORK/input/review.diff" "$WORK/input/review.diff" "$VERDICT")"
@@ -140,6 +166,7 @@ printf 'excluded head\n' >"$CANON/docs/excluded"
 SOURCE_HEAD="$("$INPUT_REAL_GIT" -C "$CANON" rev-parse HEAD)"
 export SOURCE_HEAD HEAD_A BASE
 cp "$ROOT/scripts/phase-4b/immutable-input.sh" "$CANON/scripts/phase-4b/"
+cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$CANON/scripts/workflow/"
 cp "$ROOT/scripts/wave-audit.sh" "$CANON/scripts/wave-audit-real.sh"
 cat > "$CANON/scripts/wave-audit.sh" <<'SH'
 #!/usr/bin/env bash
@@ -153,10 +180,13 @@ cat >"$CANON/scripts/workflow/verify-live-propagation.sh" <<'SH'
 #!/usr/bin/env bash
 cat >/dev/null
 [ ! -e "$INPUT_WORK/proof-fails" ] || exit 2
+cmp -s "$5" "$INPUT_WORK/consumer-policy.yml" || exit 2
+[ -f "${GH_CONFIG_DIR:-}/hosts.yml" ] || exit 2
 jq -cn --arg source "$SOURCE_HEAD" --arg head "$HEAD_A" --arg base "$BASE" \
  '{source_sha:$source,head_sha:$head,base_sha:$base}'
 SH
 printf 'propagation_audit:\n  scope_exclude_prefixes:\n    - docs/\n' >"$WORK/wave-policy.yml"
+printf 'propagation_prs:\n  enabled: true\n' >"$INPUT_WORK/consumer-policy.yml"
 jq -n --arg base "$SOURCE_BASE" --arg head "$SOURCE_HEAD" \
  '{version:1,canonical_base_sha:$base,canonical_head_sha:$head,historical_end_sha:"",finalize_historical:false}' >"$WORK/scope-request.json"
 mkdir "$WORK/wave-input"
@@ -194,6 +224,28 @@ if p4b_capture_wave_input fixture/repo 1753 "$BASE" "$HEAD_A" "$WORK/scope-reque
  fail 'failed live byte proof accepted'
 else pass 'curated input fails closed without live canary byte proof'; fi
 rm "$WORK/proof-fails"
+# Execute the production verifier for an enabled hub / opted-out consumer.
+# A refusal must happen before Git verification or curated regeneration.
+mkdir -p "$CANON/scripts/lib"
+cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$CANON/scripts/lib/"
+cp "$ROOT/scripts/workflow/verify-live-propagation.sh" "$CANON/scripts/workflow/"
+mkdir "$WORK/disabled-input"
+p4b_capture_input fixture/repo 1753 "$BASE" "$HEAD_A" "$WORK/disabled-input"
+cp "$INPUT_WORK/git-calls" "$WORK/git-calls-before-disabled"
+cp "$INPUT_WORK/auth-boundaries" "$WORK/wave-calls-before-disabled"
+printf 'propagation_prs:\n  enabled: false\n' >"$INPUT_WORK/consumer-policy.yml"
+if p4b_capture_wave_input fixture/repo 1753 "$BASE" "$HEAD_A" "$WORK/scope-request.json" "$WORK/disabled-input" "$WORK/wave-policy.yml"; then
+ fail 'hub policy overrode the consumer exemption opt-out'
+elif cmp -s "$INPUT_WORK/git-calls" "$WORK/git-calls-before-disabled" \
+  && cmp -s "$INPUT_WORK/auth-boundaries" "$WORK/wave-calls-before-disabled" \
+  && grep -Fq "contents/.github/review-policy.yml?ref=$BASE" "$INPUT_WORK/gh-calls"; then
+ pass 'exact consumer base policy disables curated capture before Git or wave dispatch'
+else fail 'consumer opt-out refused through the wrong boundary'; fi
+: > "$INPUT_WORK/policy-fails"
+if p4b_capture_wave_input fixture/repo 1753 "$BASE" "$HEAD_A" "$WORK/scope-request.json" "$WORK/disabled-input" "$WORK/wave-policy.yml"; then
+ fail 'unreadable consumer policy fell back to the hub'
+else pass 'unreadable exact consumer policy refuses curated capture'; fi
+rm "$INPUT_WORK/policy-fails"
 chmod 600 "$WORK/wave-input/pr.diff"
 printf 'tampered PR bytes\n' >>"$WORK/wave-input/pr.diff"
 if p4b_revalidate_input fixture/repo 1753 "$WORK/wave-input"; then
