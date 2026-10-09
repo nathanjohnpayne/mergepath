@@ -1225,6 +1225,40 @@ else
   fail "repo-shipped gh: out=$path_out captured=$([ -e "$WORKDIR/path-captured" ] && echo yes || echo no)"
 fi
 
+# Relative PATH entries must never select the token-bearing git itself.
+# The guard-removed control uses a temporary copy, never mutates source, and
+# proves that the same fake executable would receive the fixture token.
+mkdir -p "$WORKDIR/relative-bin"
+cat >"$WORKDIR/relative-bin/git" <<'RELATIVE_GIT'
+#!/bin/sh
+# TOKEN_OUTPUT_EXEMPT: this harness scrubs ambient credentials and pins a fake token.
+printf '%s' "${GH_TOKEN:-}" >"$AUTHOR_PATH_CAPTURE"
+RELATIVE_GIT
+chmod +x "$WORKDIR/relative-bin/git"
+set +e
+relative_git_out="$(cd "$WORKDIR" && PATH="relative-bin:$CRED_DIR:$PATH" AUTHOR_PATH_CAPTURE="$WORKDIR/git-path-captured" \
+  bash -c '. "$1"; gh_author_git_exec ghp_git-path-fixture --version' _ "$ROOT/scripts/lib/gh-token-resolver.sh" 2>&1)"
+relative_git_rc=$?
+set -e
+if [ "$relative_git_rc" -eq 5 ] && [ ! -e "$WORKDIR/git-path-captured" ]; then
+  pass "relative git refuses before the fixture token reaches a child"
+else
+  fail "relative git guard: rc=$relative_git_rc captured=$([ -e "$WORKDIR/git-path-captured" ] && echo yes || echo no)"
+fi
+
+# Drop only the git path check and restore the old bare invocation. Keep the
+# rest of the isolation machinery intact so the control tests this boundary.
+awk '/^  # Resolve git before exporting/{skip=1; next} skip && /^  # Every inherited GIT_/{skip=0} !skip {gsub(/"\$git_bin" -c/, "git -c"); print}' \
+  "$ROOT/scripts/lib/gh-token-resolver.sh" >"$WORKDIR/unguarded-git-resolver.sh"
+rm -f "$WORKDIR/git-path-captured"
+(cd "$WORKDIR" && PATH="relative-bin:$CRED_DIR:$PATH" AUTHOR_PATH_CAPTURE="$WORKDIR/git-path-captured" \
+  bash -c '. "$1"; gh_author_git_exec ghp_git-path-fixture --version' _ "$WORKDIR/unguarded-git-resolver.sh")
+if [ "$(cat "$WORKDIR/git-path-captured" 2>/dev/null)" = ghp_git-path-fixture ]; then
+  pass "positive control: removing the git guard exposes the fixture token"
+else
+  fail "relative git positive control did not execute with the fixture token"
+fi
+
 # The trace marker: written after every check, immediately before the gh
 # write; never on a refusal; exit 70 when unwritable; never inherited.
 MARKER="$WORKDIR/reached-marker"

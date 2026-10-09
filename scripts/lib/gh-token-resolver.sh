@@ -81,7 +81,7 @@ gh_author_payload_kind() { # <payload...>
 # headers are reset, hooks are disabled, and SSH github.com spellings are
 # rewritten to HTTPS so the helper, not an SSH key, decides.
 gh_author_git_exec() { # <token> <git args...>
-  local token="$1" home rc gh_bin
+  local token="$1" home rc gh_bin git_bin
   shift
   # The credential helper names gh by ABSOLUTE path, resolved here, before
   # git enters the repository: a bare `!gh` is looked up after `git -C`
@@ -94,6 +94,16 @@ gh_author_git_exec() { # <token> <git args...>
   esac
   case "$gh_bin" in
     *"'"*|*'\'*) echo "gh-as-author: refusing git: the gh path contains a quote or backslash." >&2; return 5 ;;
+  esac
+  # Resolve git before exporting the author token, too (#1818). A relative
+  # PATH entry can otherwise select a repository-controlled executable.
+  git_bin="$(command -v git 2>/dev/null || true)"
+  case "$git_bin" in
+    /*) ;;
+    *) echo "gh-as-author: refusing git: git does not resolve to an absolute path ('${git_bin:-not found}')." >&2; return 5 ;;
+  esac
+  case "$git_bin" in
+    *"'"*|*'\'*) echo "gh-as-author: refusing git: the git path contains a quote or backslash." >&2; return 5 ;;
   esac
   # Every inherited GIT_* variable is dropped, not a list of known ones:
   # GIT_EXEC_PATH can substitute git-remote-https itself, GIT_TRACE_CURL with
@@ -111,7 +121,7 @@ gh_author_git_exec() { # <token> <git args...>
     GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= SSH_ASKPASS= \
     GH_TOKEN="$token" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
     GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
-    git -c credential.helper= -c "credential.helper=!'$gh_bin' auth git-credential" \
+    "$git_bin" -c credential.helper= -c "credential.helper=!'$gh_bin' auth git-credential" \
         -c http.extraHeader= \
         -c core.hooksPath=/dev/null \
         -c url.https://github.com/.insteadOf=git@github.com: \
