@@ -2592,7 +2592,7 @@ for i in "${!TOKENS[@]}"; do
       # boolean to avoid eating `gh`). Stay in command position.
       continue
       ;;
-    cd|pushd|popd)
+    cd|pushd|popd|source|.)
       SHELL_DIRECTORY_CHANGED=1
       AT_COMMAND_POSITION=0
       SEGMENT_HAS_COMMAND=1
