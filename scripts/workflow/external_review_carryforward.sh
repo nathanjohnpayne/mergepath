@@ -173,7 +173,7 @@ CURRENT_SIGNAL=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -c \
   def verdict_shas($body):
     [ $body
       | ascii_downcase
-      | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,})(?![0-9a-z_])")
+      | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([0-9a-z_]+)")
       | .[0]
     ];
   .[0] as $comments |
@@ -182,8 +182,10 @@ CURRENT_SIGNAL=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -c \
     $comments[]
     | select(.user.login == $bot)
     | . as $c
-    | verdict_shas($c.body)[] as $sha
-    | select(($sha | test("^[0-9a-f]{40}$")) and $head == $sha)
+    | verdict_shas($c.body) as $shas
+    | select(($shas | length) > 0
+             and ($shas | length) == ([$c.body | ascii_downcase | scan("reviewed commit")] | length)
+             and ($shas | all(. == $head)) and ($head | test("^[0-9a-f]{40}$")))
     | {
         kind: "verdict",
         time: ($c.created_at // ""),
@@ -232,10 +234,12 @@ CANDIDATES=$(printf '%s' "$COMMENTS_JSON" | jq -r \
     | . as $c
     | [ $c.body
         | ascii_downcase
-        | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,})(?![0-9a-z_])")
+        | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([0-9a-z_]+)")
         | .[0]
       ] as $shas
-    | select(($shas | length) > 0 and ($shas | all(test("^[0-9a-f]{40}$")))
+    | select(($shas | length) > 0
+             and ($shas | length) == ([$c.body | ascii_downcase | scan("reviewed commit")] | length)
+             and ($shas | all(test("^[0-9a-f]{40}$")))
              and ($shas | unique | length) == 1)
     | {time: $c.created_at, sha: $shas[0]}
   ]
@@ -301,7 +305,7 @@ while IFS=$'\t' read -r source_time source_sha; do
     def verdict_shas($body):
       [ $body
         | ascii_downcase
-        | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,})(?![0-9a-z_])")
+        | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([0-9a-z_]+)")
         | .[0]
       ];
     .[0] as $comments |
@@ -339,7 +343,7 @@ while IFS=$'\t' read -r source_time source_sha; do
     def verdict_shas($body):
       [ $body
         | ascii_downcase
-        | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,})(?![0-9a-z_])")
+        | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([0-9a-z_]+)")
         | .[0]
       ];
     .[0] as $comments |

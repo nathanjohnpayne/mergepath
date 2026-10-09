@@ -262,7 +262,7 @@ crqe_verdicts() { # issue-comments-json bot-login
       | . as $c
       | ( [ $c.body // ""
             | ascii_downcase
-            | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,})(?![0-9a-z_])")
+            | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([0-9a-z_]+)")
             | .[0]
           ] ) as $shas
       | select(($shas | length) > 0 or (($c.body // "") | test("(?im)^\\s*codex review:")))

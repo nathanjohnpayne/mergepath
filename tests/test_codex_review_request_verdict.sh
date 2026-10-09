@@ -38,7 +38,7 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 #      HEAD-anchored verdict signal, gated on the same anchor/affirmative
 #      logic as the merge gate, referenced to #609.
 if grep -q 'issue_comments=\$(fetch_scan_array "repos/\$REPO/issues/\$PR_NUMBER/comments"' "$SCRIPT" \
-   && grep -q "reviewed commit\[\^0-9a-f\]" "$SCRIPT" \
+   && grep -Fq "reviewed commit[^0-9a-z_" "$SCRIPT" \
    && grep -qi "didn.?t find any major issues" "$SCRIPT" \
    && grep -Fq '$shas | all(. == $head)' "$SCRIPT" \
    && grep -q "max_by(.created_at) // null" "$SCRIPT" \
@@ -106,6 +106,14 @@ check_verdict() { # desc expected_json fixture
     fail "verdict filter: $desc — expected '$expected', got '$got'"
   fi
 }
+
+# Every Reviewed commit field participates, including malformed values.
+for bad_anchor in "${HEAD:0:6}" zzzzzz '@@' ''; do
+  check_verdict "mixed full HEAD and malformed anchor refuses ($bad_anchor)" "null" \
+    "$(mk "$BOT" "Codex Review: Didn't find any major issues.
+Reviewed commit: $HEAD
+Reviewed commit: $bad_anchor" "2026-07-03T10:00:00Z")"
+done
 
 # #1752: the requester must not suppress review on a colliding prefix.
 for n in 6 7 8 12 20 39; do

@@ -167,7 +167,7 @@ fi
 if grep -q "CODEX_HEAD_VERDICT_TIME" "$SCRIPT" \
    && grep -q 'issues/\$PR_NUMBER/comments' "$SCRIPT" \
    && grep -qi "didn.?t find any major issues" "$SCRIPT" \
-   && grep -q "reviewed commit\[\^0-9a-f\]" "$SCRIPT" \
+   && grep -Fq "reviewed commit[^0-9a-z_" "$SCRIPT" \
    && grep -Fq '$shas | all(. == $head)' "$SCRIPT" \
    && grep -q "#600" "$SCRIPT"; then
   pass "codex-review-check.sh computes the HEAD-anchored affirmative issue-comment verdict signal (#600)"
@@ -290,6 +290,14 @@ check_case() { # desc expected fixture
     fail "verdict filter: $desc — expected '$expected', got '$got'"
   fi
 }
+
+# Every Reviewed commit field participates, including malformed values.
+for bad_anchor in "${HEAD:0:6}" zzzzzz '@@' ''; do
+  check_case "mixed full HEAD and malformed anchor refuses ($bad_anchor)" "" \
+    "$(mk "$BOT" "Codex Review: Didn't find any major issues.
+Reviewed commit: $HEAD
+Reviewed commit: $bad_anchor" "2026-07-03T10:00:00Z")"
+done
 
 # #1752: two full object IDs sharing seven characters must not borrow
 # the same short verdict. Every abbreviation and overlong token refuses.

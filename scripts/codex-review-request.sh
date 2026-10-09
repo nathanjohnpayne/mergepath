@@ -937,10 +937,11 @@ scan_codex_state() {
         | . as $c
         | ( [ $c.body
               | ascii_downcase
-              | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,})(?![0-9a-z_])")
+              | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([0-9a-z_]+)")
               | .[0]
             ] ) as $shas
         | select( ($shas | length) > 0
+                  and ($shas | length) == ([$c.body | ascii_downcase | scan("reviewed commit")] | length)
                   and ($head | test("^[0-9a-f]{40}$"))
                   and ($shas | all(. == $head)) )
         | { created_at: .created_at,

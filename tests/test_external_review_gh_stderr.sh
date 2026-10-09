@@ -492,6 +492,20 @@ else
 fi
 reset_stub_env
 
+# Mixed full/invalid anchors are neither direct signals nor candidates.
+for bad_anchor in "${HEAD_SHA:0:6}" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb '@@' ''; do
+  jq -n --arg head "$HEAD_SHA" --arg bad "$bad_anchor" '[{user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-01-01T00:00:00Z",body:("Codex Review: Didnt find any major issues.\nReviewed commit: " + $head + "\nReviewed commit: " + $bad)}]' >"$CF1752_COMMENTS"
+  reset_stub_env
+  export STUB_COMMENTS_JSON="$CF1752_COMMENTS"
+  run_cf "$WORK/cf1752-mixed.stderr"
+  if [ "$RC" -eq 0 ] && [ "$(printf '%s' "$OUT" | jq -r '.carried == false and (.current_signal == null)')" = true ]; then
+    pass "#1752: mixed full and invalid anchor never creates a current signal ($bad_anchor)"
+  else
+    fail "#1752: mixed anchors created a signal (rc=$RC out=$OUT)"
+  fi
+done
+reset_stub_env
+
 # ── Oversized comments/reviews payloads (#1092) ─────────────────────
 #
 # carryforward.sh handed the whole /issues/N/comments and /pulls/N/reviews
