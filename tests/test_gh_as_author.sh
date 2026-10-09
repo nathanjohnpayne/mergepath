@@ -1232,7 +1232,7 @@ mkdir -p "$WORKDIR/relative-bin"
 cat >"$WORKDIR/relative-bin/git" <<'RELATIVE_GIT'
 #!/bin/sh
 # TOKEN_OUTPUT_EXEMPT: this harness scrubs ambient credentials and pins a fake token.
-printf '%s' "${GH_TOKEN:-}" >"$AUTHOR_PATH_CAPTURE"
+printf '%s' "${OP_PREFLIGHT_AUTHOR_PAT:-${GH_TOKEN:-}}" >"$AUTHOR_PATH_CAPTURE"
 RELATIVE_GIT
 chmod +x "$WORKDIR/relative-bin/git"
 set +e
@@ -1248,7 +1248,8 @@ fi
 
 # Drop only the git path check and restore the old bare invocation. Keep the
 # rest of the isolation machinery intact so the control tests this boundary.
-awk '/^  # Resolve git before exporting/{skip=1; next} skip && /^  # Every inherited GIT_/{skip=0} !skip {gsub(/"\$git_bin" -c/, "git -c"); print}' \
+awk '/^gh_author_resolve_git\(\)/ { print "gh_author_resolve_git() { command -v git; }"; skip=1; next }
+     skip && /^}/ { skip=0; next } !skip { print }' \
   "$ROOT/scripts/lib/gh-token-resolver.sh" >"$WORKDIR/unguarded-git-resolver.sh"
 rm -f "$WORKDIR/git-path-captured"
 (cd "$WORKDIR" && PATH="relative-bin:$CRED_DIR:$PATH" AUTHOR_PATH_CAPTURE="$WORKDIR/git-path-captured" \
@@ -1257,6 +1258,44 @@ if [ "$(cat "$WORKDIR/git-path-captured" 2>/dev/null)" = ghp_git-path-fixture ];
   pass "positive control: removing the git guard exposes the fixture token"
 else
   fail "relative git positive control did not execute with the fixture token"
+fi
+
+
+# Exercise the real public wrapper with the preflight token already exported.
+# The former transport-only guard ran after three bare validation probes.
+fresh_pushrepo
+rm -f "$WORKDIR/git-path-captured"
+set +e
+preflight_git_out="$(cd "$WORKDIR" && PATH="relative-bin:$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" \
+  AUTHOR_PATH_CAPTURE="$WORKDIR/git-path-captured" OP_PREFLIGHT_AUTHOR_PAT=ghp_author-token \
+  GH_AS_AUTHOR_PUSH_REPO=example/repo "$WRAPPER" -- git -C "$PUSHREPO" push -u origin HEAD 2>&1)"
+preflight_git_rc=$?
+set -e
+if [ "$preflight_git_rc" -eq 5 ] && [ ! -e "$WORKDIR/git-path-captured" ]; then
+  pass "real wrapper: relative Git never runs a validation probe with the exported preflight token"
+else
+  fail "real wrapper preflight Git guard: rc=$preflight_git_rc captured=$([ -e "$WORKDIR/git-path-captured" ] && echo yes || echo no)"
+fi
+# Restore only the old bare validation probes in a temporary library. This
+# control proves the public-wrapper fixture reaches the earlier exposure.
+sed 's/GIT_COMMON_DIR "\$git_bin" -C/GIT_COMMON_DIR git -C/g; s/GIT_CONFIG_COUNT "\$git_bin" config/GIT_CONFIG_COUNT git config/g; /git_bin="$(gh_author_resolve_git)" || return 5/d' \
+  "$ROOT/scripts/lib/gh-token-resolver.sh" >"$WORKDIR/unguarded-preflight-resolver.sh"
+# The copied resolver must still locate the production identity checker.
+printf '\ngh_resolver_repo_root() { printf "%%s\\n" %q; }\n' "$ROOT" >>"$WORKDIR/unguarded-preflight-resolver.sh"
+# Source the production wrapper text with just its resolver include redirected.
+sed "s#\. \"\$ROOT/scripts/lib/gh-token-resolver.sh\"#. \"$WORKDIR/unguarded-preflight-resolver.sh\"#" "$WRAPPER" >"$WORKDIR/unguarded-author-wrapper.sh"
+# Preserve its trusted repository root rather than the temporary file's root.
+sed "s#^ROOT=.*#ROOT=\"$ROOT\"#" "$WORKDIR/unguarded-author-wrapper.sh" >"$WORKDIR/unguarded-author-root.sh"
+rm -f "$WORKDIR/git-path-captured"
+set +e
+(cd "$WORKDIR" && PATH="relative-bin:$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" \
+  AUTHOR_PATH_CAPTURE="$WORKDIR/git-path-captured" OP_PREFLIGHT_AUTHOR_PAT=ghp_author-token \
+  GH_AS_AUTHOR_PUSH_REPO=example/repo bash "$WORKDIR/unguarded-author-root.sh" -- git -C "$PUSHREPO" push -u origin HEAD) >/dev/null 2>&1
+set -e
+if [ "$(cat "$WORKDIR/git-path-captured" 2>/dev/null)" = ghp_author-token ]; then
+  pass "positive control: bare pre-push probes expose the exported preflight fixture token"
+else
+  fail "real wrapper preflight control did not reach the vulnerable validation probe"
 fi
 
 # The trace marker: written after every check, immediately before the gh
