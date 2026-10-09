@@ -11,18 +11,26 @@ AUTHORITY = {'AUTHOR_MERGE_TOKEN', 'REVIEWER_ASSIGNMENT_TOKEN', 'CLAUDE_PAT', 'C
              'CURSOR_PAT', 'OP_SERVICE_ACCOUNT_TOKEN', 'BRANCH_PROTECTION_AUDIT_TOKEN', 'CI_ACTOR_TOKEN'}
 
 
-def assess(repo_secrets, environment, policies, branch):
+def assess(repo_secrets, environment, policies, branch, organization_secrets=None):
     """Return drift; malformed or incomplete observations are infrastructure."""
     if not isinstance(repo_secrets, list) or not all(isinstance(item, dict) and isinstance(item.get('name'), str) for item in repo_secrets):
         raise ValueError('repository secret metadata is malformed')
-    if not isinstance(environment, dict) or type(environment.get('can_admins_bypass')) is not bool:
-        raise ValueError('environment bypass metadata is unavailable')
+    organization_secrets = [] if organization_secrets is None else organization_secrets
+    if not isinstance(organization_secrets, list) or not all(isinstance(item, dict) and isinstance(item.get('name'), str) for item in organization_secrets):
+        raise ValueError('organization secret metadata is malformed')
     if not isinstance(policies, list) or not all(isinstance(item, dict) and isinstance(item.get('name'), str) and item.get('type') in ('branch', 'tag') for item in policies):
         raise ValueError('deployment branch policies are malformed')
     drift = []
     exposed = sorted(item['name'] for item in repo_secrets if item['name'] in AUTHORITY)
     if exposed:
         drift.append('Repository-scoped authority credentials: ' + ', '.join(exposed))
+    exposed = sorted(item['name'] for item in organization_secrets if item['name'] in AUTHORITY)
+    if exposed:
+        drift.append('Organization-shared authority credentials: ' + ', '.join(exposed))
+    if environment is None:
+        return drift + ['The protected credential environment is missing']
+    if not isinstance(environment, dict) or type(environment.get('can_admins_bypass')) is not bool:
+        raise ValueError('environment bypass metadata is unavailable')
     if environment['can_admins_bypass']:
         drift.append('The protected credential environment permits admin bypass')
     policy = environment.get('deployment_branch_policy')
@@ -63,7 +71,31 @@ def main():
     env = quote(args.environment, safe='')
     try:
         secrets = items(root + '/actions/secrets?per_page=100', 'secrets')
-        environments = api(root + '/environments/' + env)
+        repository = api(root)
+        if len(repository) != 1 or not isinstance(repository[0], dict) or repository[0].get('owner', {}).get('type') not in ('User', 'Organization'):
+            raise ValueError('repository owner metadata is unavailable')
+        organization_secrets = (items(root + '/actions/organization-secrets?per_page=100', 'secrets')
+                                if repository[0]['owner']['type'] == 'Organization' else [])
+        confirmed_missing_environment = False
+        try:
+            environments = api(root + '/environments/' + env)
+        except subprocess.CalledProcessError as error:
+            if not re.search(r'\(HTTP 404\)', error.stderr or ''):
+                raise
+            # A 404 alone can conceal a permission failure. Confirm absence
+            # against the complete, readable environment inventory.
+            inventory = items(root + '/environments?per_page=100', 'environments')
+            if not all(isinstance(item, dict) and isinstance(item.get('name'), str) for item in inventory):
+                raise ValueError('environment inventory is malformed')
+            if any(item['name'].casefold() == args.environment.casefold() for item in inventory):
+                raise
+            environments = [None]
+            confirmed_missing_environment = True
+        if confirmed_missing_environment:
+            drift = assess(secrets, None, [], args.branch, organization_secrets)
+            print(json.dumps({'repo': args.repo, 'environment': args.environment,
+                              'status': 'DRIFT', 'drift': drift}))
+            return 3
         if len(environments) != 1 or not isinstance(environments[0], dict):
             raise ValueError('environment metadata must be one object')
         # GitHub returns 404 for this endpoint when the environment has no
@@ -72,7 +104,7 @@ def main():
         policy = environments[0].get('deployment_branch_policy')
         policies = (items(root + '/environments/' + env + '/deployment-branch-policies?per_page=100', 'branch_policies')
                     if isinstance(policy, dict) and policy.get('custom_branch_policies') is True else [])
-        drift = assess(secrets, environments[0], policies, args.branch)
+        drift = assess(secrets, environments[0], policies, args.branch, organization_secrets)
         print(json.dumps({'repo': args.repo, 'environment': args.environment,
                           'status': 'DRIFT' if drift else 'PASS', 'drift': drift}))
         return 3 if drift else 0

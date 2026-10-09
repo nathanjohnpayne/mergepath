@@ -565,6 +565,12 @@ case "$path" in
     exit 0
     ;;
   repos/*/*)
+    # The isolation auditor reads the unfiltered owner type to decide whether
+    # an organization-shared secret inventory is required.
+    if [ -z "$jq_expr" ]; then
+      printf '%s\n' '[{"owner":{"type":"User"},"default_branch":"main"}]'
+      exit 0
+    fi
     # Repository metadata. The audit reads TWO different fields from this
     # one endpoint with two different `--jq` expressions, so the stub
     # dispatches on the expression the way real gh does — otherwise the
