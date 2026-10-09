@@ -170,6 +170,10 @@ assert_rc_contains "ordinary immediate merge refuses a different head preconditi
 for prefix in 'GH_REPO=other/repo' 'env GH_REPO=other/repo' 'GH_REPO=other/repo ;' 'export GH_REPO=other/repo ;' 'unset GH_REPO ;' 'env -u GH_REPO' 'env --unset=GH_REPO' 'env -uGH_REPO'; do
   assert_rc_contains "command-local repository selector refuses ($prefix)" 2 "command-local GH_REPO" "$prefix scripts/gh-as-author.sh -- gh pr merge 123 --squash"
 done
+for discovery_prefix in 'GIT_DIR=/other/.git' 'env GIT_WORK_TREE=/other' 'GIT_CONFIG_COUNT=1 ;' 'export GIT_COMMON_DIR=/other ;' 'unset GIT_DIR ;' 'env -u GIT_DIR' 'env --unset=GIT_DIR' 'env -uGIT_DIR' 'env -i'; do
+  assert_rc_contains "command-local Git discovery refuses ($discovery_prefix)" 2 "repository-discovery" "$discovery_prefix scripts/gh-as-author.sh -- gh pr merge 123 --squash"
+done
+assert_rc_contains "Git discovery scoped to an earlier command is discarded" 0 "" 'GIT_DIR=/other/.git echo ok ; scripts/gh-as-author.sh -- gh pr merge 123 --squash'
 assert_rc_contains "unrelated echoed repository selector is not an assignment" 0 "" 'echo GH_REPO=other/repo ; scripts/gh-as-author.sh -- gh pr merge 123 --squash'
 assert_rc_contains "repository assignment scoped to an earlier command is discarded" 0 "" 'GH_REPO=other/repo echo ok ; scripts/gh-as-author.sh -- gh pr merge 123 --squash'
 assert_rc_contains "quoted separator subject does not conceal later auto flag" 2 "deferred" "scripts/gh-as-author.sh -- gh pr merge --subject ';' 456 --auto"

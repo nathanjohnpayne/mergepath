@@ -1911,8 +1911,8 @@ INLINE_MERGEPATH_AGENT_SET=0
 INLINE_OP_PREFLIGHT_AGENT=""
 INLINE_OP_PREFLIGHT_AGENT_SET=0
 GLOBAL_REPO=""
-INLINE_GH_REPO_SET=0
-STANDALONE_GH_REPO_SET=0
+INLINE_REPO_ENV_SET=0
+STANDALONE_REPO_ENV_SET=0
 PR_SUBCOMMAND=""
 PR_SUBCOMMAND_INDEX=-1    # index in TOKENS where the gh pr subcommand was found
 WRAPPER_KIND=""           # "" | "author" | "reviewer"
@@ -2075,8 +2075,8 @@ for i in "${!TOKENS[@]}"; do
     # on (Codex P2 on PR #442 r17, env --help verified).
     if [ "$PENDING_PREFIX_FLAG" = "env:-u" ] || [ "$PENDING_PREFIX_FLAG" = "env:--unset" ]; then
       case "$tok" in
-        GH_REPO)
-          INLINE_GH_REPO_SET=1
+        GH_REPO|GIT_*)
+          INLINE_REPO_ENV_SET=1
           ;;
         GH_AS_AUTHOR_IDENTITY)
           INLINE_GH_AS_AUTHOR_IDENTITY=""
@@ -2136,7 +2136,7 @@ for i in "${!TOKENS[@]}"; do
       # round 1 — `CODEX_CLEARED=1 && gh pr merge` was being cleared
       # even though the assignment was standalone.
       if [ "$SEGMENT_HAS_COMMAND" -eq 1 ]; then
-        INLINE_GH_REPO_SET=0
+        INLINE_REPO_ENV_SET=0
         INLINE_CODEX_CLEARED=""
         INLINE_BREAK_GLASS_ADMIN=""
         INLINE_BREAK_GLASS_MERGE_STATE=""
@@ -2162,8 +2162,8 @@ for i in "${!TOKENS[@]}"; do
       #     an unexported standalone value would have masked the
       #     wrapper falling back to its stock default).
       if [ "$SEGMENT_HAS_COMMAND" -eq 0 ] || [ "${SEGMENT_HAS_EVAL:-0}" -eq 1 ]; then
-        if [ "$INLINE_GH_REPO_SET" -eq 1 ]; then
-          STANDALONE_GH_REPO_SET=1
+        if [ "$INLINE_REPO_ENV_SET" -eq 1 ]; then
+          STANDALONE_REPO_ENV_SET=1
         fi
         # Bare standalone segment, or an eval segment — in both, a
         # captured assignment persists past the separator (eval'd
@@ -2192,7 +2192,7 @@ for i in "${!TOKENS[@]}"; do
       INLINE_MERGEPATH_AGENT_SET=0
       INLINE_OP_PREFLIGHT_AGENT=""
       INLINE_OP_PREFLIGHT_AGENT_SET=0
-      INLINE_GH_REPO_SET=0
+      INLINE_REPO_ENV_SET=0
       SEGMENT_HAS_COMMAND=0
       continue
       ;;
@@ -2208,8 +2208,8 @@ for i in "${!TOKENS[@]}"; do
   # `CODEX_CLEARED=1 sudo gh pr merge 65`) count.
   if [ "$AT_COMMAND_POSITION" -eq 1 ]; then
     case "$tok" in
-      GH_REPO=*)
-        INLINE_GH_REPO_SET=1
+      GH_REPO=*|GIT_*=*)
+        INLINE_REPO_ENV_SET=1
         ;;
       CODEX_CLEARED=*)
         INLINE_CODEX_CLEARED="${tok#CODEX_CLEARED=}"
@@ -2327,8 +2327,8 @@ for i in "${!TOKENS[@]}"; do
         EXPORTED_REVIEW_DISAGREEMENT_SET=1
       fi
       case "$tok" in
-        GH_REPO=*|GH_REPO)
-          STANDALONE_GH_REPO_SET=1
+        GH_REPO=*|GH_REPO|GIT_*)
+          STANDALONE_REPO_ENV_SET=1
           ;;
         GH_AS_AUTHOR_IDENTITY=*)
           STANDALONE_GH_AS_AUTHOR_IDENTITY="${tok#GH_AS_AUTHOR_IDENTITY=}"
@@ -2386,8 +2386,8 @@ for i in "${!TOKENS[@]}"; do
       STANDALONE_GH_AS_AUTHOR_IDENTITY="$INLINE_GH_AS_AUTHOR_IDENTITY"
       STANDALONE_GH_AS_AUTHOR_IDENTITY_SET=1
     fi
-    if [ "$INLINE_GH_REPO_SET" -eq 1 ]; then
-      STANDALONE_GH_REPO_SET=1
+    if [ "$INLINE_REPO_ENV_SET" -eq 1 ]; then
+      STANDALONE_REPO_ENV_SET=1
     fi
     if [ "$INLINE_GH_AS_REVIEWER_IDENTITY_SET" -eq 1 ]; then
       STANDALONE_GH_AS_REVIEWER_IDENTITY="$INLINE_GH_AS_REVIEWER_IDENTITY"
@@ -2521,8 +2521,8 @@ for i in "${!TOKENS[@]}"; do
       # recognize, so it must be modeled explicitly here.
       if [ "$CURRENT_PREFIX" = "env" ]; then
         case "$tok" in
-          --unset=GH_REPO|-u=GH_REPO|-uGH_REPO)
-            INLINE_GH_REPO_SET=1
+          --unset=GH_REPO|-u=GH_REPO|-uGH_REPO|--unset=GIT_*|-u=GIT_*|-uGIT_*)
+            INLINE_REPO_ENV_SET=1
             continue
             ;;
           --unset=GH_AS_AUTHOR_IDENTITY|-u=GH_AS_AUTHOR_IDENTITY|-uGH_AS_AUTHOR_IDENTITY)
@@ -3379,9 +3379,9 @@ done
 
 # Deferred merging outlives this local snapshot and cannot enforce a later
 # disagreement in repositories without review-state branch protection.
-if [ "$INLINE_GH_REPO_SET" -eq 1 ] || [ "$STANDALONE_GH_REPO_SET" -eq 1 ] \
-   || { [ "$IDENTITY_ENV_CLEARED_FOR_WRAPPER" -eq 1 ] && [ -n "${GH_REPO:-}" ]; }; then
-  echo "BLOCKED: command-local GH_REPO changes cannot bind the hook's repository reads; use an explicit --repo or canonical PR URL without changing GH_REPO in this command." >&2
+if [ "$INLINE_REPO_ENV_SET" -eq 1 ] || [ "$STANDALONE_REPO_ENV_SET" -eq 1 ] \
+   || [ "$IDENTITY_ENV_CLEARED_FOR_WRAPPER" -eq 1 ]; then
+  echo "BLOCKED: command-local GH_REPO or Git repository-discovery changes, including environment resets, cannot bind the hook's repository reads; use an explicit --repo or canonical PR URL with the inherited repository environment." >&2
   exit 2
 fi
 if [ "$AUTO_REQUESTED" -eq 1 ]; then
