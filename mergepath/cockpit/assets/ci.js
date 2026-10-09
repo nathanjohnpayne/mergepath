@@ -44,7 +44,7 @@
         && (checksOnly ? row.rerun_command === null : row.rerun_command === null || row.rerun_command === `gh run rerun ${row.id} --failed --repo ${row.repo}`)
         && (!row.actionable || row.current_head === true && row.severity !== null)
         && (row.orphaned === undefined || row.orphaned === false || row.orphaned === true && !checksOnly && row.status === "queued"
-          && row.jobs_scope === "all-attempts" && row.jobs.length === 0 && !row.actionable));
+          && row.jobs_scope === "all-attempts" && !row.jobs.some(job => job.attempt === null || job.attempt === row.attempt) && !row.actionable));
       keys.add(row.key);
       const jobIds = new Set();
       for (const job of row.jobs) {

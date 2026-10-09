@@ -148,7 +148,7 @@ def orphan_run(run_id=30, created='2026-10-06T08:20:00Z', sha=OTHER_SHA, updated
     return run
 
 
-def orphan_fixture(on_head=False, runs=None, jobs=None):
+def orphan_fixture(on_head=False, runs=None, jobs=None, clock=None):
     runs = runs if runs is not None else [orphan_run(sha=SHA if on_head else OTHER_SHA)]
     calls = []
     class Client:
@@ -159,7 +159,8 @@ def orphan_fixture(on_head=False, runs=None, jobs=None):
             if '/jobs?' in route: return (jobs or {}).get(route.split('/runs/')[1].split('/')[0], [])
             if '/check-runs?' in route: return []
             raise AssertionError('unexpected route: ' + route)
-    provider = CIProvider(Client(), INVENTORY, clock=lambda: ORPHAN_NOW, monotonic=lambda: 0)
+    clock = clock or [ORPHAN_NOW]
+    provider = CIProvider(Client(), INVENTORY, clock=lambda: clock[0], monotonic=lambda: 0)
     sample = provider(5)
     return {'data': copy_json_tree(sample.data), 'hot': sample.hot, 'calls': calls, 'provider': provider}
 
@@ -560,6 +561,38 @@ class ProviderTests(unittest.TestCase):
             with self.subTest(status=status):
                 other = orphan_run(); other['status'] = status
                 self.assertFalse(orphan_fixture(runs=[other])['data']['runs'][0]['orphaned'])
+
+    def test_a_rerun_is_aged_and_emptied_by_its_current_attempt(self):
+        def rerun(started, run_id=40):
+            run = orphan_run(run_id, created='2026-09-01T00:00:00Z'); run.update(run_attempt=2, run_started_at=started)
+            return run
+        old_jobs = {'40': [raw_job(400)], '41': [raw_job(410)]}
+        rows = {row['id']: row for row in orphan_fixture(runs=[rerun('2026-10-06T15:00:00Z'), rerun('2026-10-06T08:00:00Z', 41)],
+                                                          jobs=old_jobs)['data']['runs']}
+        self.assertFalse(rows['40']['orphaned'], 'a fresh rerun of an old run is waiting, not orphaned')
+        self.assertTrue(rows['41']['orphaned'], 'an old attempt-2 with only attempt-1 jobs is orphaned')
+        self.assertEqual([job['attempt'] for job in rows['41']['jobs']], ['1'], 'earlier attempts stay visible')
+        cached = orphan_fixture(runs=[rerun('2026-10-06T08:00:00Z', 41)], jobs=old_jobs)
+        again = cached['provider'](5).data['runs'][0]
+        self.assertEqual(sum('/jobs?' in route for route in cached['calls']), 1)
+        self.assertEqual([job['attempt'] for job in again['jobs']], ['1'], 'a cache hit keeps earlier attempts visible')
+        staffed = rerun('2026-10-06T08:00:00Z', 42)
+        unknown = {'42': [{**raw_job(420), 'run_attempt': None}], '43': [{**raw_job(430), 'run_attempt': 2}]}
+        current = rerun('2026-10-06T08:00:00Z', 43)
+        rows = {row['id']: row for row in orphan_fixture(runs=[staffed, current], jobs=unknown)['data']['runs']}
+        self.assertFalse(rows['42']['orphaned'], 'a job of unknown attempt counts as present')
+        self.assertFalse(rows['43']['orphaned'], 'a job of the current attempt counts as present')
+        missing = orphan_run(44); missing.pop('run_started_at')
+        self.assertTrue(orphan_fixture(runs=[missing])['data']['runs'][0]['orphaned'], 'created_at ages a run without run_started_at')
+
+    def test_a_cached_orphan_is_read_again_after_the_recheck_interval(self):
+        run, clock = orphan_run(), [ORPHAN_NOW]
+        result = orphan_fixture(runs=[run], clock=clock); provider, calls = result['provider'], result['calls']
+        jobs = lambda: sum('/jobs?' in route for route in calls)
+        clock[0] += 1799; provider(5); self.assertEqual(jobs(), 1)
+        clock[0] += 1; provider(5); self.assertEqual(jobs(), 2, 'an unchanged orphan is read again after ORPHAN_RECHECK_SECONDS')
+        clock[0] += 60; provider(5); self.assertEqual(jobs(), 2, 'the re-read restarts the interval')
+        clock[0] -= 3600; provider(5); self.assertEqual(jobs(), 3, 'a clock step backwards reads again')
 
     def test_orphan_on_an_open_head_does_not_hold_the_hot_cadence(self):
         self.assertFalse(orphan_fixture(True)['hot'])

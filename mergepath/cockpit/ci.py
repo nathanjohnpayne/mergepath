@@ -28,8 +28,11 @@ OBSERVATION_GAP = TIMEOUT + IDLE_INTERVAL + TIMEOUT + 30
 DIAGNOSTIC_SECONDS = 3600
 # A run GitHub created during an Actions incident can sit `queued` with zero jobs forever:
 # no runner is assigned, and cancel and force-cancel both refuse it. Past this age a queued
-# run without jobs is orphaned, not waiting; it is history, not something to watch.
+# attempt without jobs is orphaned, not waiting; it is history, not something to watch.
 ORPHAN_SECONDS = 6 * 3600
+# GitHub does not promise that a new job changes the run's updated_at, so a cached orphan's
+# jobs are read again at least this often.
+ORPHAN_RECHECK_SECONDS = 1800
 SHA = re.compile(r'[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?\Z')
 DECIMAL = re.compile(r'[1-9][0-9]{0,79}\Z')
 ANSI = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*?(?:\x07|\x1b\\|$))')
@@ -195,9 +198,17 @@ def _check_evidence(checks, current):
 
 
 def orphaned(raw, fetched, now):
-    created = stamp(_row(raw).get('created_at'))
-    return (_row(raw).get('status') == 'queued' and fetched == [] and now is not None
-            and created is not None and now - created >= ORPHAN_SECONDS)
+    raw = _row(raw)
+    # A rerun keeps the run's created_at and its earlier attempts' jobs (jobs are read with
+    # filter=all), so the age and the emptiness are those of the current attempt.
+    # run_started_at resets on a rerun; a job of unknown attempt counts as present.
+    started = stamp(raw.get('run_started_at'))
+    if started is None:
+        started = stamp(raw.get('created_at'))
+    attempt = identity(raw.get('run_attempt', 1))
+    return (raw.get('status') == 'queued' and fetched is not None and now is not None
+            and started is not None and now - started >= ORPHAN_SECONDS
+            and not any(job.get('attempt') in (attempt, None) for job in fetched))
 
 
 def group_runs(repo, raw_runs, jobs, checks, heads, now=None):
@@ -241,7 +252,7 @@ def group_runs(repo, raw_runs, jobs, checks, heads, now=None):
                    'rerun_command': f'gh run rerun {run_id} --failed --repo {repo}' if raw.get('conclusion') in FAILURES else None,
                    'orphaned': ghost}
             if ghost:
-                row['reason'] = 'Queued with no jobs for over 6h: GitHub never started this run, and it will not run.'
+                row['reason'] = 'Queued with no jobs in this attempt for over 6h: GitHub never started it, and it will not run.'
             rows.append(row)
             key = (number, sha)
             groups.setdefault(key, {'repo': repo, 'pr': number, 'sha': sha, 'run_keys': []})['run_keys'].append(row['key'])
@@ -298,7 +309,8 @@ class CIProvider:
             raise ValueError('invalid_jobs_cache')
         self.jobs_cache = jobs_cache
         self._records, self._failures, self._jobs_cache, self._suite_cache = {}, {}, OrderedDict(), OrderedDict()
-        # Orphaned runs keyed by their update time: an unchanged orphan is not re-read every scan.
+        # Orphaned attempts keyed by their update time: an unchanged orphan's jobs are reused
+        # until ORPHAN_RECHECK_SECONDS pass, not re-read every scan.
         self._orphans = OrderedDict()
 
     def _repo(self, repo, deadline):
@@ -332,8 +344,9 @@ class CIProvider:
             orphan_key = job_key + (raw.get('updated_at'),)
             if run_id not in detailed:
                 jobs[run_id] = None
-            elif raw.get('status') == 'queued' and orphan_key in self._orphans:
-                jobs[run_id] = []
+            elif (raw.get('status') == 'queued' and orphan_key in self._orphans
+                    and 0 <= self.clock() - self._orphans[orphan_key][0] < ORPHAN_RECHECK_SECONDS):
+                jobs[run_id] = copy.deepcopy(self._orphans[orphan_key][1])
                 self._orphans.move_to_end(orphan_key)
             elif raw.get('status') == 'completed' and job_key in self._jobs_cache:
                 jobs[run_id] = copy.deepcopy(self._jobs_cache[job_key])
@@ -348,7 +361,8 @@ class CIProvider:
                     while len(self._jobs_cache) > self.jobs_cache:
                         self._jobs_cache.popitem(last=False)
                 elif orphaned(raw, jobs[run_id], self.clock()):
-                    self._orphans[orphan_key] = True
+                    self._orphans[orphan_key] = (self.clock(), copy.deepcopy(jobs[run_id]))
+                    self._orphans.move_to_end(orphan_key)
                     while len(self._orphans) > self.jobs_cache:
                         self._orphans.popitem(last=False)
         # Every check-run of an open-PR HEAD is read. The latest filter keeps one run per name

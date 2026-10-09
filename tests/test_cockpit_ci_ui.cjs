@@ -408,8 +408,12 @@ test("an orphaned run on an open HEAD stays visible and never establishes curren
   assert.match(model.label, /current CI success not established/);
 });
 
-test("orphaned is accepted only on a queued workflow run with no jobs", () => {
+test("orphaned is accepted only on a queued workflow run with no jobs in its current attempt", () => {
   const ok = pythonFixture("orphan:False"); assert.doesNotThrow(() => CI.validate(ok));
+  const rerun = pythonFixture("orphan:False"); rerun.runs[0].attempt = "2";
+  rerun.runs[0].jobs = [{id: "1", name: "x", status: "completed", conclusion: "success", started_at: null, completed_at: null, steps: [], check_id: null, attempt: "1"}];
+  assert.doesNotThrow(() => CI.validate(rerun), "earlier attempts' jobs may sit beside an orphaned current attempt");
+  rerun.runs[0].jobs[0].attempt = null; assert.throws(() => CI.validate(rerun), "a job of unknown attempt counts as present");
   for (const mutate of [row => {row.status = "in_progress";}, row => {row.orphaned = "yes";},
     row => {row.jobs_scope = "not-fetched";}, row => {row.jobs = [{id: "1", name: "x", status: "queued", conclusion: null, started_at: null, completed_at: null, steps: [], check_id: null, attempt: "1"}];}]) {
     const data = pythonFixture("orphan:False"); mutate(data.runs[0]);
