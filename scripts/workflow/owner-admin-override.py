@@ -69,6 +69,8 @@ def reject_merge_api(args):
             flag, value = token.split('=', 1)
         elif len(token) > 2 and token[:2] in ('-X', '-f', '-F', '-H', '-q', '-t', '-p'):
             flag, value = token[:2], token[2:]
+        elif token.startswith('-') and not token.startswith('--') and len(token) > 2:
+            raise ValueError('clustered API shorthand is ambiguous; use separate flags for inspectable merge protection')
         if flag in ('-X', '--method'):
             method = value.upper()
         elif flag in ('-f', '--raw-field', '-F', '--field'):

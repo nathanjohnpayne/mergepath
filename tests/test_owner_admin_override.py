@@ -222,6 +222,8 @@ print(json.dumps(result))
     def test_raw_merge_api_writes_cannot_bypass_scoped_preparation(self):
         requests = [
             ['repos/example/repo/pulls/123/merge', '-X', 'PUT'],
+            ['repos/example/repo/pulls/123/merge', '-iXPUT'],
+            ['repos/example/repo/pulls/123/merge', '-iX', 'PUT'],
             ['-XPUT', 'repos/example/repo/pulls/123/merge'],
             ['https://api.github.com/repos/example/repo/pulls/123/merge', '--method=PUT'],
             ['repos/example/repo/%70ulls/123/merge', '-f', 'merge_method=squash'],
