@@ -1524,6 +1524,12 @@ paths:
       - "scripts/lib/feedback-policy-helpers.sh"
       - "tests/fixtures/phase_4b_verdicts.jsonl"
   # Advisory heartbeat tests execute the real orchestrator with fake boundaries.
+  # Core assertions run on consumers; curated-wave fixtures run only on the hub.
+  - path: tests/test_phase_4b_immutable_input.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/phase-4b/"
   - path: tests/test_phase_4b_heartbeat.sh
     type: canonical
     consumers: all

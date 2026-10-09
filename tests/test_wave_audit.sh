@@ -1080,6 +1080,39 @@ FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 86 --repo owner/consumer \
   || fail "empty historical chunk reached adapter or claimed reviewer evidence"
 
 echo
+# Capture mode must preserve normal, historical-chunk and finalization inputs
+# without invoking the orchestrator or publishing any tag.
+capture_tags_before="$(git -C "$CANON" tag -l)"
+capture_remote_before="$(git ls-remote --tags "$REMOTE")"
+mkdir "$WORK/capture-normal" "$WORK/capture-chunk" "$WORK/capture-final"
+run_wa "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$C1" --head-sha "$C2" \
+  --capture-input-dir "$WORK/capture-normal" >/dev/null 2>"$WORK/capture-normal.err"
+if [ ! -e "$CAPTURE/args" ] && grep -q '^diff --git a/scripts/a.sh' "$WORK/capture-normal/review.diff" \
+   && jq -e --arg base "$C1" --arg head "$C2" \
+     '.canonical_base_sha == $base and .canonical_head_sha == $head and .historical_end_sha == "" and .finalize_historical == false' \
+     "$WORK/capture-normal/scope.json" >/dev/null; then
+  pass "normal capture regenerates curated bytes and complete scope without dispatch"
+else fail "normal capture"; fi
+run_wa "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$CHURN_BASE" --head-sha "$EMPTY_HIST_HEAD" \
+  --historical-end "$CHURN_MIDDLE" --capture-input-dir "$WORK/capture-chunk" >/dev/null 2>"$WORK/capture-chunk.err"
+if [ ! -e "$CAPTURE/args" ] && grep -q '^-old' "$WORK/capture-chunk/review.diff" \
+   && jq -e --arg end "$CHURN_MIDDLE" '.historical_end_sha == $end and .finalize_historical == false' \
+     "$WORK/capture-chunk/scope.json" >/dev/null; then
+  pass "historical chunk capture regenerates the pinned committed range"
+else fail "historical chunk capture"; fi
+run_wa "$POLICY_GOOD" reset 87 --repo owner/consumer --base "$C1" --head-sha "$LARGE_HEAD" \
+  --finalize-historical --capture-input-dir "$WORK/capture-final" >/dev/null 2>"$WORK/capture-final.err"
+if [ ! -e "$CAPTURE/args" ] && jq -e '.finalize_historical == true and .historical_end_sha == ""' \
+     "$WORK/capture-final/scope.json" >/dev/null \
+   && jq -e '.artifact_kind == "wave-audit-cumulative-coverage-receipts" and (.receipts | length) == 5' \
+     < <(sed -n '/^+{/,$s/^+//p' "$WORK/capture-final/review.diff") >/dev/null; then
+  pass "finalization capture regenerates the complete historical receipt package"
+else fail "finalization capture"; fi
+if [ "$(git -C "$CANON" tag -l)" = "$capture_tags_before" ] \
+   && [ "$(git ls-remote --tags "$REMOTE")" = "$capture_remote_before" ]; then
+  pass "all capture modes leave local and remote publication state unchanged"
+else fail "capture mode published a receipt or watermark"; fi
+
 echo "Summary: $PASS passed, $FAIL failed"
 if [ -s "$FAKE_POLICY_ARGS_LOG" ] && grep -q -- '--base-ref main --base-sha ' "$FAKE_POLICY_ARGS_LOG" \
   && ! grep -q -- '--pr ' "$FAKE_POLICY_ARGS_LOG"; then

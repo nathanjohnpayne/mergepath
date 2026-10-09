@@ -40,6 +40,7 @@ spec_test_map:
     - tests/test_cockpit_prs.py
     - tests/test_cockpit_prs_ui.cjs
   sync_audit_json: tests/test_sync_audit_json.sh
+  phase_4b_immutable_input: tests/test_phase_4b_immutable_input.sh
   phase_4b_heartbeat:
     - tests/test_phase_4b_heartbeat.sh
     - tests/test_phase_4b_accounting.sh

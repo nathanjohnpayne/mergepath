@@ -29,11 +29,15 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 . "$HERE/lib.sh"
+# shellcheck source=immutable-input.sh
+. "$HERE/immutable-input.sh"
 
 CODEX_BIN="${CODEX_BIN:-codex}"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 
 REPO="" ; PR="" ; DIFF_FILE="" ; FORMAT="markdown" ; RUN_DRYRUN=auto
+INPUT_CAPTURE_DIR=""; INPUT_METADATA=""; INPUT_CAPTURE_FAILED=false
+trap '[ -z "$INPUT_CAPTURE_DIR" ] || { chmod -R u+w "$INPUT_CAPTURE_DIR"; rm -rf "$INPUT_CAPTURE_DIR"; }' EXIT
 
 usage() {
   echo "usage: collect-enablement-evidence.sh [--repo owner/repo] [--pr N] [--diff-file F] [--json] [--no-dry-run]" >&2
@@ -134,6 +138,7 @@ run_dryrun() { # run_dryrun <adapter> <bin-ok>
   if [ -z "$DIFF_FILE" ] && { [ -z "$PR" ] || [ -z "$REPO" ]; }; then
     printf 'skipped\tskipped (pass --diff-file, or --pr and --repo)'; return
   fi
+  [ "$INPUT_CAPTURE_FAILED" != true ] || { printf 'failed\tfailed (immutable PR input unavailable)'; return; }
   timeout="$(p4b_resolve_adapter_timeout "$adapter" 2>/dev/null)" \
     || { printf 'failed\tfailed (invalid timeout config)'; return; }
   effort="$(p4b_resolve_adapter_effort "$adapter" 2>/dev/null)" \
@@ -141,6 +146,7 @@ run_dryrun() { # run_dryrun <adapter> <bin-ok>
   args=( --pr "${PR:-0}" )
   [ -n "$REPO" ]      && args+=( --repo "$REPO" )
   [ -n "$DIFF_FILE" ] && args+=( --diff-file "$DIFF_FILE" )
+  [ -n "$INPUT_METADATA" ] && args+=( --input-metadata "$INPUT_METADATA" )
   local env_prefix=( "P4B_REVIEW_CLI_TIMEOUT_SECONDS=$timeout" )
   case "$adapter" in
     codex)  [ -n "$effort" ] && env_prefix+=( "P4B_CODEX_EFFORT=$effort" ) ;;
@@ -156,6 +162,29 @@ run_dryrun() { # run_dryrun <adapter> <bin-ok>
     printf 'failed\trc=%s verdict=- (fail-closed)' "$rc"
   fi
 }
+# Capture one coherent immutable input for both supported PR-backed probes.
+if [ "$RUN_DRYRUN" != off ] && [ -z "$DIFF_FILE" ] && [ -n "$PR" ] && [ -n "$REPO" ] \
+  && { [ "$CODEX_AUTH_OK" = true ] || [ "$CLAUDE_AUTH_OK" = true ]; }; then
+  if ! INPUT_CAPTURE_DIR="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/p4b-evidence-input.XXXXXX")"; then
+    INPUT_CAPTURE_FAILED=true
+  else
+    pair=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha,.base.sha] | join(" ")') || pair=""
+    IFS=' ' read -r input_head input_base input_extra <<EOF
+$pair
+EOF
+    if [[ "$input_head" =~ ^[0-9a-f]{40}$ && "$input_base" =~ ^[0-9a-f]{40}$ ]] \
+      && [ -z "$input_extra" ] \
+      && p4b_run_with_timeout 90 "$HERE/immutable-input.sh" capture "$REPO" "$PR" "$input_base" "$input_head" "$INPUT_CAPTURE_DIR" \
+      && [ "$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha,.base.sha] | join(" ")')" = "$pair" ] \
+      && p4b_revalidate_input "$REPO" "$PR" "$INPUT_CAPTURE_DIR"; then
+      DIFF_FILE="$INPUT_CAPTURE_DIR/review.diff"
+      INPUT_METADATA="$INPUT_CAPTURE_DIR/input.json"
+    else
+      INPUT_CAPTURE_FAILED=true
+    fi
+  fi
+fi
+
 CODEX_DRYRUN="not-run"; CLAUDE_DRYRUN="not-run"
 CODEX_DRYRUN_STATUS=skipped; CLAUDE_DRYRUN_STATUS=skipped
 if [ "$RUN_DRYRUN" != off ]; then

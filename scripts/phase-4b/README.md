@@ -316,8 +316,10 @@ printf 'verdict' > "$P4B_OFFLINE/diff.txt"
 CODEX_BIN=/path/to/fake-codex \
   MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD=true \
   scripts/phase-4b-review.sh 123 --repo nathanjohnpayne/mergepath \
-    --author claude --head deadbeef --diff-file "$P4B_OFFLINE/diff.txt" --dry-run
+    --author claude --head deadbeef --diff-file "$P4B_OFFLINE/diff.txt" --dry-run --offline-diff
 ```
+
+`--offline-diff` is a preview-only path: it requires `--dry-run`, an explicit regular diff file and a display head. It freezes those bytes without a live tuple, Git fetch or transition query; its verdict has no postable input binding. The normal path still captures exact PR objects.
 
 `--dry-run` reads and validates the PR body, then performs selection + adapter
 dispatch + verdict validation, and prints the intended action without posting.

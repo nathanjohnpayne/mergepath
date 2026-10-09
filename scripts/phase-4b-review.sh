@@ -36,7 +36,10 @@
 #                    live head/base pair is read together before adapter work,
 #                    before post-review issue filing, and immediately before
 #                    the review POST. A moved or unreadable base fails closed.
-#   --diff-file      pre-fetched unified diff (skips `gh pr diff`).
+#   --diff-file      compatibility assertion of the object-derived diff bytes.
+#   --wave-scope-file structured canonical range; trusted wave code regenerates
+#                    the curated bytes after live canary byte verification.
+#   --offline-diff   preview supplied bytes with --dry-run; never posts.
 #   --dry-run        do everything EXCEPT post the review; print intended
 #                    action.
 #   --force-enabled  run this one invocation even when
@@ -74,7 +77,7 @@
 # Exit codes:
 #   0  APPROVED — review posted (or would post under --dry-run).
 #   1  CHANGES_REQUESTED — review posted; the author must address findings.
-#   3  usage / infrastructure error.
+#   3  usage / infrastructure or immutable-input integrity error; hard stop.
 #   4  fell back to the manual handoff (adapter error/timeout, invalid
 #      verdict, or no adapter for the selected reviewer). The chat-side
 #      block from scripts/post-phase-4b-handoff.sh is emitted on stderr.
@@ -106,6 +109,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=phase-4b/lib.sh
 . "$ROOT/phase-4b/lib.sh"
+# shellcheck source=phase-4b/immutable-input.sh
+. "$ROOT/phase-4b/immutable-input.sh"
 
 # Phase 4b approval-loop accounting (#602). Sourced when present so the hook
 # call sites below exist; a missing or unsourceable module simply leaves
@@ -226,7 +231,9 @@ GH_AS_AUTHOR="${P4B_GH_AS_AUTHOR:-$ROOT/gh-as-author.sh}"
 ADAPTER_TIMEOUT_ENV="${P4B_ADAPTER_TIMEOUT_SECONDS:-}"
 ADAPTER_TIMEOUT=""
 
-PR="" ; REPO="" ; REVIEWER="" ; AUTHOR="" ; HEAD="" ; EXPECTED_BASE_SHA="" ; EXPECTED_BASE_SHA_SET=false ; DIFF_FILE="" ; DRY_RUN=false
+PR="" ; REPO="" ; REVIEWER="" ; AUTHOR="" ; HEAD="" ; EXPECTED_BASE_SHA="" ; EXPECTED_BASE_SHA_SET=false ; DIFF_FILE="" ; DRY_RUN=false ; OFFLINE_DIFF=false ; WAVE_SCOPE_FILE=""
+INPUT_DIR=""
+INPUT_METADATA_DIGEST=""
 FORCE_ENABLED=false
 case "${P4B_FORCE_ENABLED:-}" in
   1|true|TRUE|True|yes|YES) FORCE_ENABLED=true ;;
@@ -247,7 +254,9 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || p4b_die 3 "--expected-base-sha requires exactly 40 hexadecimal characters"
       EXPECTED_BASE_SHA_SET=true; EXPECTED_BASE_SHA="$2"; shift 2 ;;
     --diff-file)     DIFF_FILE="${2:-}"; shift 2 ;;
+    --wave-scope-file) WAVE_SCOPE_FILE="${2:-}"; shift 2 ;;
     --dry-run)       DRY_RUN=true; shift ;;
+    --offline-diff)  OFFLINE_DIFF=true; shift ;;
     --force-enabled) FORCE_ENABLED=true; shift ;;
     -h|--help)       usage ;;
     -*) echo "phase-4b-review.sh: unknown flag: $1" >&2; usage ;;
@@ -257,6 +266,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+if [ "$OFFLINE_DIFF" = true ]; then
+  [ -z "$WAVE_SCOPE_FILE" ] || p4b_die 3 "offline input cannot request wave scope"
+  [ "$DRY_RUN" = true ] && [ -n "$DIFF_FILE" ] && [ -n "$HEAD" ] \
+    || p4b_die 3 "--offline-diff requires --dry-run, --diff-file and a display --head"
+fi
 [ -n "$PR" ] || usage
 [[ "$PR" =~ ^[1-9][0-9]*$ ]] || p4b_die 3 "PR# must be a positive integer; got '$PR'"
 if [ "$EXPECTED_BASE_SHA_SET" = true ]; then
@@ -373,7 +387,7 @@ need_gh() { command -v gh >/dev/null 2>&1 || p4b_die 3 "gh is required for this 
 # Opt-in base fence for callers that captured an exact head/base pair (#1475).
 # Read both mutable refs in ONE PR response: separate head and base reads can
 # manufacture a pair that never existed together. The historic --head-only
-# path deliberately remains unchanged when this option is absent.
+# path now captures and fences the same coherent pair when this option is absent.
 P4B_BASE_FENCE_REASON=""
 revalidate_expected_base() {  # <stage>
   local stage="$1" pair live_head live_base extra
@@ -406,19 +420,30 @@ if [ -z "$REPO" ]; then
   [ -n "$REPO" ] || p4b_die 3 "could not resolve repo; pass --repo owner/name"
 fi
 
-if [ -z "$HEAD" ]; then
-  need_gh
-  # #799: the `[ -n "$HEAD" ]` guard below was dead. An unreadable response
-  # put the JSON error body in $HEAD, which then became the head every
-  # downstream drift check compares against — so a run that could not read
-  # the PR at all reviewed, and could approve, a "head" nobody has.
-  HEAD="$(gh_api_scalar --shape sha "HEAD sha for $REPO#$PR" \
-    "repos/$REPO/pulls/$PR" --jq '.head.sha')" || HEAD=""
-  [ -n "$HEAD" ] || p4b_die 3 "could not resolve HEAD sha for $REPO#$PR; pass --head"
-fi
-
+if [ "$OFFLINE_DIFF" = true ]; then
+  # Explicit preview bytes have no server tuple or posting authority.
+  EXPECTED_BASE_SHA_SET=false
+  p4b_warn "offline diff preview: supplied bytes are unbound and cannot authorize a review POST"
+else
+# Capture head and base together on every path, including supplied --head.
+# Both exact Git objects become the immutable reasoning input below.
+need_gh
+PAIR="$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | join(" ")' 2>/dev/null)" || PAIR=""
+IFS=' ' read -r LIVE_HEAD LIVE_BASE PAIR_EXTRA <<EOF
+$PAIR
+EOF
+[[ "$LIVE_HEAD" =~ ^[0-9a-f]{40}$ && "$LIVE_BASE" =~ ^[0-9a-f]{40}$ ]] \
+  && [ -z "$PAIR_EXTRA" ] || p4b_die 3 "could not resolve a complete coherent PR head/base pair"
+[ -z "$HEAD" ] || [ "$HEAD" = "$LIVE_HEAD" ] || p4b_die 3 "supplied head differs from live PR head"
+[ "$EXPECTED_BASE_SHA_SET" != true ] || [ "$EXPECTED_BASE_SHA" = "$LIVE_BASE" ] \
+  || p4b_die 3 "supplied base differs from live PR base"
+HEAD="$LIVE_HEAD"
+EXPECTED_BASE_SHA="$LIVE_BASE"
+EXPECTED_BASE_SHA_SET=true
 if ! revalidate_expected_base initial; then
   p4b_die 3 "$P4B_BASE_FENCE_REASON"
+fi
+
 fi
 
 # Authoring agent. The PR BODY is the record of authorship, and it is read and
@@ -1110,6 +1135,7 @@ revalidate_pr_body_author() {  # <stage-label>
 # review body rendered below and the dry-run accounting sandbox, when one
 # exists).
 _p4b_cleanup_tmp() {
+  if [ -n "${INPUT_DIR:-}" ]; then rm -rf "$INPUT_DIR" 2>/dev/null || true; fi
   if [ -n "${BODY_FILE:-}" ]; then rm -f "$BODY_FILE" 2>/dev/null || true; fi
   if [ -n "${_P4B_ACCT_DRY_STATE:-}" ]; then rm -rf "$_P4B_ACCT_DRY_STATE" 2>/dev/null || true; fi
 }
@@ -1211,11 +1237,56 @@ fi
 # gate protects. The command override keeps the orchestrator hermetic in tests.
 require_feedback_accounted
 
+# Resolve exact objects in an isolated store, never through a mutable PR diff
+# endpoint. A supplied diff is only a compatibility assertion of these bytes.
+INPUT_DIR="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/p4b-input.XXXXXX")" \
+  || p4b_die 3 "could not create protected review input"
+if [ "$OFFLINE_DIFF" = true ]; then
+  [ -f "$DIFF_FILE" ] && [ ! -L "$DIFF_FILE" ] \
+    || p4b_die 3 "offline diff must be a regular file"
+  cp "$DIFF_FILE" "$INPUT_DIR/review.diff" || p4b_die 3 "could not protect offline input"
+  chmod 400 "$INPUT_DIR/review.diff"
+  DIFF_FILE="$INPUT_DIR/review.diff"
+  OFFLINE_INPUT_DIGEST="$(p4b_input_digest "$DIFF_FILE")" || p4b_die 3 "could not fingerprint offline input"
+else
+if ! p4b_run_with_timeout 90 "$ROOT/phase-4b/immutable-input.sh" capture \
+     "$REPO" "$PR" "$EXPECTED_BASE_SHA" "$HEAD" "$INPUT_DIR"; then
+  p4b_die 3 "could not capture immutable PR base/head objects"
+fi
+if [ -n "$WAVE_SCOPE_FILE" ]; then
+  if ! p4b_run_with_timeout 180 "$ROOT/phase-4b/immutable-input.sh" wave-capture \
+      "$REPO" "$PR" "$EXPECTED_BASE_SHA" "$HEAD" \
+      "$WAVE_SCOPE_FILE" "$INPUT_DIR" "$(p4b_config)"; then
+    p4b_die 3 "could not regenerate trusted canonical wave input"
+  fi
+fi
+INPUT_METADATA_DIGEST="$(p4b_input_digest "$INPUT_DIR/input.json")" \
+  || p4b_die 3 "could not fingerprint review input metadata"
+if [ -n "$DIFF_FILE" ]; then
+  SUPPLIED_DIGEST="$(p4b_input_digest "$DIFF_FILE")" \
+    || p4b_die 3 "supplied diff is unreadable or unprotected"
+  [ "$SUPPLIED_DIGEST" = "$(jq -er '.diff_sha256' "$INPUT_DIR/input.json")" ] \
+    || p4b_die 3 "supplied diff differs from captured immutable objects"
+fi
+DIFF_FILE="$INPUT_DIR/review.diff"
+
+fi
+
+revalidate_immutable_input() {
+  if [ "$OFFLINE_DIFF" = true ]; then
+    [ "$(p4b_input_digest "$DIFF_FILE")" = "$OFFLINE_INPUT_DIGEST" ]
+    return
+  fi
+  [ "$(p4b_input_digest "$INPUT_DIR/input.json")" = "$INPUT_METADATA_DIGEST" ] \
+    && p4b_revalidate_input "$REPO" "$PR" "$INPUT_DIR"
+}
+
 # --- run the adapter (reasoning plane; never posts) ------------------------
 ADAPTER_ARGS=( --pr "$PR" )
 [ -n "$REPO" ]      && ADAPTER_ARGS+=( --repo "$REPO" )
 [ -n "$HEAD" ]      && ADAPTER_ARGS+=( --head "$HEAD" )
 [ -n "$DIFF_FILE" ] && ADAPTER_ARGS+=( --diff-file "$DIFF_FILE" )
+[ "$OFFLINE_DIFF" = true ] || ADAPTER_ARGS+=( --input-metadata "$INPUT_DIR/input.json" )
 
 # Accounting (#602): per-loop timing signals, captured whether or not the
 # adapter succeeds so fail-closed loops carry their duration too.
@@ -1234,13 +1305,19 @@ if [ "$DRY_RUN" != true ]; then
   revalidate_codex_request_budget_authority post-adapter
 fi
 if [ "$ADAPTER_RC" -ne 0 ]; then
+  # Input binding and setup errors are hard stops, not unavailable reviewers.
+  [ "$ADAPTER_RC" -ne 3 ] || p4b_die 3 "adapter input or infrastructure failure (exit 3)"
   if p4b_is_timeout_rc "$ADAPTER_RC"; then
     fall_back_to_manual "adapter timed out after ${ADAPTER_TIMEOUT}s"
   fi
   fall_back_to_manual "adapter exited $ADAPTER_RC"
 fi
 # Defense in depth: re-validate before we act on it.
-if ! p4b_validate_verdict "$VERDICT_JSON"; then
+if ! revalidate_immutable_input \
+  || { [ "$OFFLINE_DIFF" != true ] && ! p4b_validate_bound_input "$VERDICT_JSON" "$INPUT_DIR/input.json" "$DIFF_FILE"; }; then
+  p4b_die 3 "adapter input binding changed or PR head transitioned during review"
+fi
+if ! p4b_validate_verdict "$(printf '%s' "$VERDICT_JSON" | jq -c 'del(.review_input)')"; then
   fall_back_to_manual "adapter returned a non-conformant verdict"
 fi
 # #1598: the approval's request-generation record must be writer-owned. The
@@ -1437,12 +1514,12 @@ if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
     live_head_pre="$(gh_api_scalar --shape sha "live PR head for $REPO#$PR" \
       "repos/$REPO/pulls/$PR" --jq '.head.sha')" || live_head_pre=""
     [ -n "$live_head_pre" ] \
-      || fall_back_to_manual "could not re-read the live PR head before filing post-review issues"
+      || p4b_die 3 "could not re-read the live PR head before filing post-review issues"
     if [ "$live_head_pre" != "$HEAD" ]; then
-      fall_back_to_manual "PR head changed during review (reviewed $HEAD, live $live_head_pre) — refusing to file post-review issues for an approval that will not post"
+      p4b_die 3 "PR head changed during review (reviewed $HEAD, live $live_head_pre) — refusing to file post-review issues for an approval that will not post"
     fi
     if ! revalidate_expected_base pre-issue-filing; then
-      fall_back_to_manual "$P4B_BASE_FENCE_REASON — refusing to file post-review issues for an approval that will not post"
+      p4b_die 3 "$P4B_BASE_FENCE_REASON — refusing to file post-review issues for an approval that will not post"
     fi
     # Identity drift (#1143), hoisted ahead of the side effects for the same
     # reason the head re-read above is: filing issues under the author PAT,
@@ -1495,7 +1572,7 @@ if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
     if [ -z "$live_head_post" ] || [ "$live_head_post" != "$HEAD" ]; then
       p4b_warn "PR head drifted during issue filing (reviewed $HEAD, live ${live_head_post:-unreadable}) — closing this run's filed issues as superseded"
       p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: the PR head of ${REPO}#${PR} changed before the Phase 4b approval could post; a re-run on the new head files fresh follow-ups."
-      fall_back_to_manual "PR head changed while filing post-review issues (reviewed $HEAD, live ${live_head_post:-unreadable}); the filed issues were closed as superseded"
+      p4b_die 3 "PR head changed while filing post-review issues (reviewed $HEAD, live ${live_head_post:-unreadable}); the filed issues were closed as superseded"
     fi
     p4b_log "filed $FILE_COUNT post-review issue(s): $POST_REVIEW_ISSUE_REFS"
     # Enrich the accounting record (#675): the line-1 refs align 1:1 with
@@ -1525,6 +1602,16 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
   printf '%s\n' "$SUMMARY"
   printf '\n### Review Metadata\n\n'
   printf -- '- Reviewed head: `%s`\n' "${HEAD:-unknown}"
+  printf -- '- Reviewed base: `%s`\n' "$EXPECTED_BASE_SHA"
+  printf -- '- Reviewed merge base: `%s`\n' "$(jq -r '.review_input.merge_base_sha' <<<"$VERDICT_JSON")"
+  printf -- '- Immutable diff SHA-256: `%s`\n' "$(jq -r '.review_input.diff_sha256' <<<"$VERDICT_JSON")"
+  printf -- '- Reviewed diff SHA-256: `%s`\n' "$(jq -r '.review_input.reviewed_diff_sha256' <<<"$VERDICT_JSON")"
+  if jq -e '.review_input.wave_audit != null' <<<"$VERDICT_JSON" >/dev/null; then
+    printf -- '- Canonical wave range: `%s` .. `%s`\n' \
+      "$(jq -r '.review_input.wave_audit.canonical_base_sha' <<<"$VERDICT_JSON")" \
+      "$(jq -r '.review_input.wave_audit.canonical_head_sha' <<<"$VERDICT_JSON")"
+    printf -- '- Canary PR diff SHA-256: `%s`\n' "$(jq -r '.review_input.pr_diff_sha256' <<<"$VERDICT_JSON")"
+  fi
   printf -- '- Reviewer identity: `%s`\n' "$REVIEWER"
   printf -- '- Adapter: `%s`\n' "$ADAPTER"
   printf -- '- Adapter runs: `%s`\n' "$ADAPTER_RUNS"
@@ -1772,18 +1859,20 @@ post_review() {
   # means unread, and the guard on the next line is live.
   live_head="$(gh_api_scalar --shape sha "live PR head for $REPO#$PR" \
     "repos/$REPO/pulls/$PR" --jq '.head.sha')" || live_head=""
-  [ -n "$live_head" ] || { p4b_acct_mark_unposted "could not re-read live PR head before posting review"; p4b_die 3 "could not re-read live PR head before posting review"; }
+  if [ -z "$live_head" ]; then
+    cleanup_pre_post_refusal_side_effects "could not re-read live PR head before posting review" true \
+      "The PR head" "the head of ${REPO}#${PR}"
+    p4b_die 3 "could not re-read live PR head before posting review"
+  fi
   if [ "$live_head" != "$HEAD" ]; then
     # Late-window drift (#674 round-5 P2): a push landing during body or
     # accounting rendering reaches this final check with the step-9 issues
     # already filed — close this run's creations before refusing, same as
     # the post-file recheck, so no orphan claims an approval that never
     # posted.
-    if [ "$event" = "APPROVE" ] && [ -n "${P4B_CREATED_ISSUE_REFS:-}" ]; then
-      p4b_warn "PR head drifted before the approval POST — closing this run's filed post-review issues as superseded: $P4B_CREATED_ISSUE_REFS"
-      p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: the PR head of ${REPO}#${PR} changed before the Phase 4b approval could post; a re-run on the new head files fresh follow-ups."
-    fi
-    fall_back_to_manual "PR head changed during review (reviewed $HEAD, live $live_head)"
+    cleanup_pre_post_refusal_side_effects "PR head changed during review (reviewed $HEAD, live $live_head)" true \
+      "The PR head" "the head of ${REPO}#${PR}"
+    p4b_die 3 "PR head changed during review (reviewed $HEAD, live $live_head)"
   fi
   # Identity drift, last fence before the POST (#1143). Rendering, accounting
   # and step-9 filing all sit between the pre-filing check and here, and a body
@@ -1813,7 +1902,7 @@ post_review() {
   if ! revalidate_expected_base pre-post; then
     cleanup_pre_post_refusal_side_effects "$P4B_BASE_FENCE_REASON" true \
       "The PR base" "the base of ${REPO}#${PR}"
-    fall_back_to_manual "$P4B_BASE_FENCE_REASON"
+    p4b_die 3 "$P4B_BASE_FENCE_REASON"
   fi
   # #1581: an approval is the one write a late finding must not slip past.
   # A required-tier finding can land while the adapter runs, so account for
@@ -1839,6 +1928,11 @@ post_review() {
   # finding is only the POST itself (#1584 Phase 4b P1). A request that lands
   # during this read is outside the recorded generation, and the merge gate
   # holds the approval until Codex answers it or Phase 4b reruns (#1598).
+  if ! revalidate_immutable_input; then
+    cleanup_pre_post_refusal_side_effects "immutable review input changed before POST" true \
+      "The PR input" "the reviewed input of ${REPO}#${PR}"
+    p4b_die 3 "immutable review input changed before POST"
+  fi
   [ "$event" != "APPROVE" ] || refuse_approval_if_feedback_unaccounted
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \
@@ -1854,6 +1948,8 @@ post_review() {
   [ "$review_rc" -eq 0 ] || { p4b_acct_mark_unposted "review POST failed (gh exit $review_rc)"; return "$review_rc"; }
   POSTED_REVIEW_ID="$(printf '%s' "$review_response" | jq -r '.id // empty' 2>/dev/null || true)"
   created_commit="$(printf '%s' "$review_response" | jq -r '.commit_id // empty' 2>/dev/null || true)"
+  printf '%s' "$review_response" | jq -e --rawfile body "$BODY_FILE" '.body == $body' >/dev/null \
+    || { p4b_acct_mark_unposted "created review body differs from bound review input"; p4b_die 3 "created review body did not preserve input binding"; }
   [ "$created_commit" = "$HEAD" ] || { p4b_acct_mark_unposted "created review not pinned to reviewed head"; p4b_die 3 "created review was not pinned to reviewed head (expected $HEAD, got ${created_commit:-unknown})"; }
 }
 
