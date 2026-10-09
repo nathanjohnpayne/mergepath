@@ -95,7 +95,7 @@ case "$endpoint" in
   repos/acme/widget/actions/workflows/codex-feedback-archive-relay.yml)
     printf '{"id":444,"path":".github/workflows/codex-feedback-archive-relay.yml"}\n' ;;
   repos/acme/widget/actions/workflows/codex-feedback-archive-relay.yml/runs\?*)
-    printf '[{"workflow_runs":[{"id":9876,"conclusion":"success"}]}]\n' ;;
+    printf '[{"workflow_runs":[{"id":9876,"conclusion":"success","created_at":"2026-08-18T19:01:00Z","workflow_id":444,"event":"workflow_run","path":".github/workflows/codex-feedback-archive-relay.yml","head_branch":"main","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repository":{"full_name":"acme/widget"}}]}]\n' ;;
   repos/acme/widget/actions/runs/9876)
     printf '{"id":9876,"workflow_id":444,"event":"workflow_run","path":".github/workflows/codex-feedback-archive-relay.yml","head_branch":"main","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repository":{"full_name":"acme/widget"}}\n' ;;
   repos/acme/widget/actions/runs/9876/jobs\?*)
