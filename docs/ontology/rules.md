@@ -235,9 +235,9 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **R-97.** Gate (b) branch 1: an APPROVED review from a registered reviewer identity different from the authoring agent. ● — REVIEW_POLICY.md § Phase 4a
 
-**R-98.** Gate (b) branch 2 (same-agent fallback): with Codex enabled and the authoring agent registered, a fresh Codex thumbs-up or a HEAD-anchored affirmative verdict substitutes for the approval state. ● — REVIEW_POLICY.md § Phase 4a
+**R-98.** Gate (b) branch 2 (same-agent fallback): with Codex enabled and the authoring agent registered, a Codex COMMENTED review on HEAD or a HEAD-anchored affirmative verdict substitutes for the approval state. ● — REVIEW_POLICY.md § Phase 4a
 
-**R-99.** Gate (c): Codex clearance on the current HEAD in one of the three recognized forms, or a same-fingerprint carry-forward, or a Phase 4b substitute approval. ● — REVIEW_POLICY.md § Phase 4a
+**R-99.** Gate (c): Codex clearance on the current HEAD from a qualifying commit-anchored review or affirmative verdict, or a same-fingerprint carry-forward, or a Phase 4b substitute approval. ● — REVIEW_POLICY.md § Phase 4a
 
 **R-100.** The fingerprint carry-forward covers base-only churn exclusively; any changed reviewed content invalidates it. ● — REVIEW_POLICY.md § Phase 4a
 

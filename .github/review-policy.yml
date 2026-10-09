@@ -464,15 +464,15 @@ coderabbit:
 #        b) an approving review from a registered reviewer identity
 #           (`available_reviewers`) is present on the PR
 #        c) Codex (or a Phase 4b substitute reviewer) has signaled
-#           clearance on the current HEAD via one of three forms — the
+#           clearance on the current HEAD via anchored forms — the
 #           Codex bot signals NEVER include an `APPROVED` review state,
 #           because the Codex GitHub App does not post `APPROVED`
 #           reviews:
 #            - a `COMMENTED` review from `chatgpt-codex-connector[bot]`
 #              on or after the latest commit, with no unaddressed P0/P1
 #              inline findings on the `/pulls/{pr}/comments` endpoint, OR
-#            - a 👍 / `+1` reaction from `chatgpt-codex-connector[bot]`
-#              on the PR issue, posted after the latest commit, OR
+#            - an affirmative issue-comment verdict from that bot whose
+#              Reviewed commit anchor matches the current HEAD, OR
 #            - a prior affirmative Codex issue-comment verdict whose
 #              `Reviewed commit` has the same external-review fingerprint
 #              as the current head, but only when the current head has no
@@ -617,7 +617,7 @@ codex:
   # agent usage limits hit), Phase 4b kicks in and an external CLI
   # reviewer (e.g., nathanpayne-cursor) posts APPROVED on the current
   # HEAD. Without this knob ON, gate (c) requires a Codex bot signal
-  # (👍 or COMMENTED-on-HEAD) that will never arrive in Phase 4b, and
+  # (a commit-anchored review or affirmative verdict), and
   # the auto-clear-blocking-labels workflow fails to remove
   # `needs-external-review` until a human clears it manually.
   #
@@ -1071,14 +1071,13 @@ propagation_audit:
 # event-driven evaluate-and-clear job ships unconditionally; the
 # periodic scheduled-sweep job below is optional.
 auto_clear_labels:
-  # Periodic sweep catches the 👍-after-last-push case: Codex reacts
-  # on the PR issue with no synchronize / pull_request_review /
-  # workflow_run event to fire the event-driven path. Defaults to
-  # true; set false if the every-5-minute cron is too noisy for a
-  # given repo's PR volume.
+  # Periodic sweep catches commit-anchored verdict comments that arrive
+  # without synchronize / pull_request_review / workflow_run events.
+  # Defaults to true; set false if the every-5-minute cron is too noisy
+  # for a given repo's PR volume. PR-level reactions grant no clearance.
   scheduled_sweep_enabled: true
   # Documentary only — the actual cron lives in
   # .github/workflows/auto-clear-blocking-labels.yml. Tightened from
-  # 15→5 minutes in mergepath#324 to close the 👍-after-last-push
-  # gap (observed on 3 of 6 mergepath#250 Phase D consumer PRs).
+  # 15→5 minutes in mergepath#324 for delayed provider signals. The
+  # historical reaction-clearance path was retired by mergepath#1751.
   scheduled_sweep_interval_minutes: 5
