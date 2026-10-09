@@ -130,6 +130,22 @@ run_case "template_auto_pause_correct_value_reported" 0 \
   auto_review:
     auto_pause_after_reviewed_commits: 15"
 
+run_case "template_auto_pause_string_fails" 1 \
+  "integer; got type '!!str'" \
+  "force" \
+  "reviews:
+  profile: chill
+  auto_review:
+    auto_pause_after_reviewed_commits: '15'"
+
+run_case "template_auto_pause_float_fails" 1 \
+  "integer; got type '!!float'" \
+  "force" \
+  "reviews:
+  profile: chill
+  auto_review:
+    auto_pause_after_reviewed_commits: 15.0"
+
 # Template with profile=assertive → FAIL with the expected error message.
 run_case "template_profile_assertive_fails" 1 "FAIL: reviews.profile is 'assertive'" \
   "force" \

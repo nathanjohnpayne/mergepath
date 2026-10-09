@@ -241,8 +241,9 @@ if [ "$profile" != "$EXPECTED_PROFILE" ]; then
 fi
 
 auto_pause_commits=$(yq -r '.reviews.auto_review.auto_pause_after_reviewed_commits' "$CONFIG")
-if [ "$auto_pause_commits" != "$EXPECTED_AUTO_PAUSE_COMMITS" ]; then
-  echo "FAIL: reviews.auto_review.auto_pause_after_reviewed_commits is '$auto_pause_commits', expected '$EXPECTED_AUTO_PAUSE_COMMITS' (#1675 hub review budget)"
+auto_pause_type=$(yq -r '.reviews.auto_review.auto_pause_after_reviewed_commits | tag' "$CONFIG")
+if [ "$auto_pause_commits" != "$EXPECTED_AUTO_PAUSE_COMMITS" ] || [ "$auto_pause_type" != "!!int" ]; then
+  echo "FAIL: reviews.auto_review.auto_pause_after_reviewed_commits is '$auto_pause_commits', expected '$EXPECTED_AUTO_PAUSE_COMMITS' (integer; got type '$auto_pause_type') (#1675 hub review budget)"
   echo "      Keep the template's deliberate pause threshold; consumer repos retain their local configuration."
   exit 1
 fi
