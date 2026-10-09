@@ -215,7 +215,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **R-88.** Codex completion is checked as the union of both endpoints, filtered to the Codex bot, HEAD-anchored; single-endpoint watchers are prohibited. ● — REVIEW_POLICY.md § Phase 4a
 
-**R-89.** A Codex signal counts only when its HEAD anchor matches the PR HEAD — the review's full commit id, or every complete reviewed-commit field equaling the full 40-character HEAD. ● — REVIEW_POLICY.md § Phase 4a
+**R-89.** A Codex signal can grant clearance only when its HEAD anchor matches the PR HEAD — the review's full commit id, or every complete reviewed-commit field equaling the full 40-character HEAD. A newer negative verdict with a missing, malformed or conflicting anchor remains non-affirmative and can supersede older clearance. ● — REVIEW_POLICY.md § Phase 4a
 
 **R-90.** The eyes reaction is acknowledgment only, never clearance. ● — REVIEW_POLICY.md § Phase 4a
 

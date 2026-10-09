@@ -107,6 +107,16 @@ check_verdict() { # desc expected_json fixture
   fi
 }
 
+# A negative response cannot disappear merely because its head is unknown.
+for negative in 'Codex Review: Found issues.' 'Codex Review: Found issues.
+Reviewed commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Reviewed commit: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+'; do
+  history="$(jq -s 'add' <(mk "$BOT" "Codex Review: Didnt find any major issues.
+Reviewed commit: $HEAD" "2026-07-01T10:00:00Z") <(mk "$BOT" "$negative" "2026-07-01T12:00:00Z"))"
+  check_verdict "newer missing or conflicting foreign anchors supersede older clearance" '{"created_at":"2026-07-01T12:00:00Z","affirmative":false}' "$history"
+done
+
 # Every Reviewed commit field participates, including malformed values.
 for bad_anchor in "${HEAD:0:6}" zzzzzz '@@' ''; do
   check_verdict "mixed full HEAD and malformed anchor refuses ($bad_anchor)" "null" \

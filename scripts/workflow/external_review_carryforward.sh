@@ -352,7 +352,11 @@ while IFS=$'\t' read -r source_time source_sha; do
       $comments[]
       | select(.user.login == $bot)
       | . as $c
-      | verdict_shas($c.body)[] as $sha
+      | (verdict_shas($c.body) as $shas
+         | ([$c.body | ascii_downcase | scan("reviewed commit")] | length) as $fields
+         | if (($shas | length) == 0 and ($c.body | test("(?im)^\\s*codex review:")))
+              or ($shas | length) != $fields or ($shas | unique | length) > 1
+           then [""] else $shas end)[] as $sha
       | {
           kind: "verdict",
           time: ($c.created_at // ""),

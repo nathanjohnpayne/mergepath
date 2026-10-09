@@ -197,8 +197,8 @@ if (codexEnabled && issueComments !== null) {
       const exact = /^[0-9a-f]{40}$/.test(headLower) && shaMatches.length > 0
         && shaMatches.length === fieldCount && shaMatches.every(s => s === headLower);
       const clean = /^\s*codex review:\s*didn.?t find any major issues\b/im.test(c.body || '');
-      const ambiguousNegative = fieldCount > 0 && !clean && /^\s*codex review:/im.test(c.body || '')
-        && (shaMatches.length !== fieldCount || shaMatches.some(s => s === headLower || !/^[0-9a-f]{40}$/.test(s)));
+      const ambiguousNegative = !clean && /^\s*codex review:/im.test(c.body || '')
+        && (shaMatches.length === 0 || new Set(shaMatches).size > 1 || shaMatches.length !== fieldCount || shaMatches.some(s => s === headLower || !/^[0-9a-f]{40}$/.test(s)));
       if (!exact && !ambiguousNegative) continue;
       if (!latestVerdict || c.created_at >= latestVerdict.created_at) {
         latestVerdict = {

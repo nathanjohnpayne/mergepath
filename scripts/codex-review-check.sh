@@ -2338,9 +2338,10 @@ if [ "$CODEX_ENABLED" = "true" ]; then
         # older clearance. It never grants clearance or names another head.
         # Only complete, valid anchors exclusively naming other heads can be
         # safely excluded from the latest-signal ordering for this head.
-        | select($exact or ($fields > 0 and ($affirmative | not)
+        | select($exact or (($affirmative | not)
             and ($c.body | test("(?im)^\\s*codex review:"))
-            and (($shas | length) != $fields or ($shas | any(. == $head))
+            and ($fields == 0 or ($shas | unique | length) > 1
+                 or ($shas | length) != $fields or ($shas | any(. == $head))
                  or ($shas | any(test("^[0-9a-f]{40}$") | not)))))
         # affirmative ONLY when the Codex verdict HEADER line is the clean
         # verdict — anchored to a line starting with "codex review:" then the

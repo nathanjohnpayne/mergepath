@@ -291,6 +291,19 @@ check_case() { # desc expected fixture
   fi
 }
 
+# A negative response cannot disappear merely because its head is unknown.
+for negative in 'Codex Review: Found issues.' 'Codex Review: Found issues.
+Reviewed commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Reviewed commit: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+'; do
+  history="$(jq -s 'add' <(mk "$BOT" "Codex Review: Didnt find any major issues.
+Reviewed commit: $HEAD" "2026-07-01T10:00:00Z") <(mk "$BOT" "$negative" "2026-07-01T12:00:00Z"))"
+  check_case "newer missing or conflicting foreign anchors supersede older clearance" "" "$history"
+  observed="$(printf '%s' "$history" | jq -r --arg bot "$BOT" --arg sha "$HEAD" "$ANY_FILTER")"
+  if [ "$observed" = "2026-07-01T12:00:00Z" ]; then pass "ambiguous foreign response raises freshness floor";
+  else fail "ambiguous foreign response lost from freshness floor: $observed"; fi
+done
+
 # Every Reviewed commit field participates, including malformed values.
 for bad_anchor in "${HEAD:0:6}" zzzzzz '@@' ''; do
   check_case "mixed full HEAD and malformed anchor refuses ($bad_anchor)" "" \
