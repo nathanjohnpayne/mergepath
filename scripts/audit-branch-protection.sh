@@ -1517,9 +1517,14 @@ if [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 1 ]; then
 fi
 
 if [ "$REQUIRE_CREDENTIAL_ISOLATION" -eq 1 ]; then
+  resolve_repo_default_branch
+  if [ -z "$REPO_DEFAULT_BRANCH" ]; then
+    echo "ERROR: could not resolve the repository default branch for credential isolation" >&2
+    exit 2
+  fi
   isolation_rc=0
   python3 "$(dirname "${BASH_SOURCE[0]}")/audit-credential-isolation.py" \
-    --repo "$REPO" --branch "$BRANCH" || isolation_rc=$?
+    --repo "$REPO" --branch "$REPO_DEFAULT_BRANCH" || isolation_rc=$?
   case "$isolation_rc" in
     0) ;;
     3) GAPS=$((GAPS + 1)) ;;

@@ -170,6 +170,12 @@ emit_status_and_body() {
 }
 
 case "$path" in
+  */actions/secrets)
+    printf '%s\n' '[{"total_count":0,"secrets":[]}]'; exit 0 ;;
+  */environments/merge-queue-policy)
+    printf '%s\n' '[{"can_admins_bypass":false,"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}]'; exit 0 ;;
+  */environments/merge-queue-policy/deployment-branch-policies)
+    printf '%s\n' '[{"total_count":1,"branch_policies":[{"name":"main","type":"branch"}]}]'; exit 0 ;;
   */branches/*/protection)
     case "${STUB_SCENARIO:-}" in
       auth_403)
@@ -2506,6 +2512,17 @@ elif grep -q 'feat#2' "$PATH_LOG"; then
   fail "an unencoded '#' reached the API path (everything after it is a URL fragment); requested paths: $(cat "$PATH_LOG")"
 else
   pass "a branch name is percent-encoded per segment for the protection path ('/' preserved)"
+fi
+
+# Credential isolation remains default-branch scoped with a different target.
+set +e
+out=$(run_audit ruleset_all --branch release --require-credential-isolation 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ] || ! echo "$out" | grep -q '"status": "PASS"'; then
+  fail "credential isolation used the protection target instead of main: rc=$rc output=$out"
+else
+  pass "credential isolation uses the actual default branch when --branch selects release"
 fi
 
 # ---------------------------------------------------------------------------

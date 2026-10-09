@@ -23,6 +23,10 @@ class IsolationTests(unittest.TestCase):
         for name in isolation.AUTHORITY:
             self.assertIn(name, isolation.assess([{'name':name}], CLOSED, MAIN, 'main')[0])
 
+    def test_merge_queue_tokens_are_authority_credentials(self):
+        for name in ('MERGE_QUEUE_POLICY_TOKEN', 'MERGE_QUEUE_SOURCE_TOKEN'):
+            self.assertTrue(isolation.assess([{'name':name}], CLOSED, MAIN, 'main'))
+
     def test_wildcard_tag_and_extra_branch_are_drift(self):
         for policies in ([{'name':'*','type':'branch'}], [{'name':'main','type':'tag'}],
                          MAIN + [{'name':'codex/*','type':'branch'}], []):
