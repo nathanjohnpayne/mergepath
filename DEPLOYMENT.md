@@ -403,7 +403,7 @@ Issue #1099 cleanup has no non-Dependabot disable mutation because GitHub provid
 - Fix the CI secrets so status checks report, **or**
 - Use the GitHub web UI "Merge without waiting for requirements" bypass checkbox
 
-The `--admin` flag on `gh pr merge` does **not** bypass required status checks — it only bypasses review requirements. The break-glass hook (`BREAK_GLASS_ADMIN=1`) only bypasses the Claude Code PreToolUse guard, not GitHub's branch protection API.
+The `--admin` flag on `gh pr merge` does **not** bypass required status checks — it only bypasses review requirements. The scoped break-glass path requires `BREAK_GLASS_ADMIN=<canonical-PR-URL>@<full-head>`, an explicit version-1 `MERGEPATH_OWNER_ADMIN_AUTHORIZATION` JSON record, and a matching `--match-head-commit`. The record quotes the owner instruction and names the exact PR/head, UTC authorization time, and explicit `allow_needs_human_review` / `allow_codex_inflight` booleans. Use `scripts/gh-as-author.sh` to record and verify that authorization before the merge; the blanket `BREAK_GLASS_ADMIN=1` form is refused. Neither `human-hold` nor `policy-violation` permits this exception. See `specs/owner_admin_override.md` for the record schema.
 
 ### 5. Create required labels
 

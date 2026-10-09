@@ -57,8 +57,15 @@ trap 'rm -rf "$SCRATCH"' EXIT
 # script hard-requires at startup (a no-op — the merge is never reached on
 # the refuse paths under test).
 FIXTURE_ROOT="$SCRATCH/repo"
-mkdir -p "$FIXTURE_ROOT/scripts"
+mkdir -p "$FIXTURE_ROOT/scripts/workflow"
 cp "$SCRIPT" "$FIXTURE_ROOT/scripts/admin-merge-codeowners-blocked.sh"
+cp "$ROOT/scripts/workflow/owner-admin-override.py" "$FIXTURE_ROOT/scripts/workflow/owner-admin-override.py"
+cat > "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" <<'STUB'
+#!/usr/bin/env bash
+echo THREAD-MUTATION >> "$GH_ARGV_LOG"
+exit 1
+STUB
+chmod +x "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh"
 cat > "$FIXTURE_ROOT/scripts/gh-as-author.sh" <<'STUB'
 #!/usr/bin/env bash
 exit 0
@@ -87,7 +94,7 @@ case "$1" in
       view)
         # Gate 1 reads state|mergeable|mergeStateStatus|headRefOid|title via
         # gh's own --jq; the stub returns the already-projected scalar.
-        echo "OPEN|MERGEABLE|BLOCKED|deadbeefHEAD|https://github.com/test/current/pull/99999|Test PR (off-page check)"
+        echo "OPEN|MERGEABLE|BLOCKED|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|https://github.com/test/current/pull/99999|Test PR (off-page check)"
         ;;
       merge)
         echo "MERGE-ATTEMPTED" >> "$GH_ARGV_LOG"
@@ -105,10 +112,15 @@ case "$1" in
             cat "$ROLLUP_PAGE1_FILE"
           fi
         else
-          # Gate 3 reviews query (or anything else): no qualifying approval.
-          echo '{}'
+          if [ "${STUB_QUALIFIED_REVIEW:-0}" = 1 ]; then
+            echo '{"data":{"repository":{"pullRequest":{"author":{"login":"nathanjohnpayne"},"reviews":{"pageInfo":{"hasNextPage":false},"nodes":[{"author":{"login":"nathanpayne-codex"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z","commit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]}}}}}'
+          else
+            # Gate 3: no qualifying approval.
+            echo '{}'
+          fi
         fi
         ;;
+      repos/*/collaborators/*/permission) echo write ;;
       *) echo '{}' ;;
     esac
     ;;
@@ -147,6 +159,8 @@ rollup_page() {
 run_admin_merge() {
   # run_admin_merge <page1-file> <page2-file> → captures output + rc
   local page1="$1" page2="$2"
+  local auth_args=()
+  if [ -n "${STUB_AUTHORIZATION_FILE:-}" ]; then auth_args=(--authorization-file "$STUB_AUTHORIZATION_FILE"); fi
   make_gh_stub "$SCRATCH/gh-real"
   make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
   set +e
@@ -156,7 +170,7 @@ run_admin_merge() {
     ROLLUP_PAGE2_FILE="$page2" \
     PATH="$SCRATCH:$PATH" \
     env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
-    bash "$FIXTURE_ROOT/scripts/admin-merge-codeowners-blocked.sh" test/repo#99999 2>&1
+    bash "$FIXTURE_ROOT/scripts/admin-merge-codeowners-blocked.sh" "${auth_args[@]+"${auth_args[@]}"}" test/repo#99999 2>&1
   )
   RUN_RC=$?
   set -e
@@ -359,6 +373,24 @@ if select_admin_record https://github.com/test/repo/pull/2 "$(printf '%040d' 0 |
 else
   pass=$((pass + 1)); echo "PASS: ambiguous duplicate authorizations refuse"
 fi
+
+
+# Actual entrypoint refuses unauthorized BLOCKED PRs before resolving threads.
+for kind in missing stale duplicate malformed; do
+  case "$kind" in
+    missing) printf '[]\n' > "$SCRATCH/early-auth.json" ;;
+    stale) printf '[{"pr_url":"https://github.com/test/current/pull/99999","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]\n' > "$SCRATCH/early-auth.json" ;;
+    duplicate) printf '[{"pr_url":"https://github.com/test/current/pull/99999","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{"pr_url":"https://github.com/test/current/pull/99999","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]\n' > "$SCRATCH/early-auth.json" ;;
+    malformed) printf '[{"pr_url":"https://github.com/test/current/pull/99999","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]\n' > "$SCRATCH/early-auth.json" ;;
+  esac
+  GH_ARGV_LOG="$SCRATCH/early-$kind.log"; : > "$GH_ARGV_LOG"
+  STUB_QUALIFIED_REVIEW=1 STUB_AUTHORIZATION_FILE="$SCRATCH/early-auth.json" run_admin_merge "$SCRATCH/p1_ok.json" "$SCRATCH/p2_ok.json"
+  if [ "$RUN_RC" -ne 0 ] && grep -q 'refusing before thread mutation' <<<"$RUN_OUT" && ! grep -q 'THREAD-MUTATION' "$GH_ARGV_LOG"; then
+    pass=$((pass + 1)); echo "PASS: $kind authorization refuses before thread mutation"
+  else
+    fail=$((fail + 1)); echo "FAIL: $kind authorization mutated threads or missed the authorization gate: $RUN_OUT"
+  fi
+done
 
 if [ "$fail" -eq 0 ]; then
   echo "test_admin_merge_codeowners_blocked: PASS ($pass tests)"

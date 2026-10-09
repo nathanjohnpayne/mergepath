@@ -922,6 +922,7 @@ paths:
     # Declaring the contract libs here keeps the two halves inseparable.
     requires:
       - "scripts/workflow/owner-admin-override.py"
+      - "scripts/lib/feedback-policy-helpers.sh"  # owner preflight parses the immutable base policy
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/identity-check.sh"         # gh-token-resolver.sh executes it before any write
       - "scripts/lib/gh-command-classifier.sh"  # shared guard/wrapper prefix vocabulary

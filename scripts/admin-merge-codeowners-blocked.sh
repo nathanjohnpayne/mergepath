@@ -420,6 +420,18 @@ for ref in "${PR_REFS[@]}"; do
   fi
   printf '  · qualifying approval from %s\n' "$qualified_approver"
 
+  # Bind and validate authorization before the first mutating gate. An
+  # unauthorized attempt must not resolve or reclassify any review thread.
+  authorization=""
+  if [ "$pr_msstatus" = "BLOCKED" ]; then
+    if ! authorization=$(select_admin_record "$pr_url" "$pr_head") \
+       || ! authorization=$(printf '%s' "$authorization" | python3 "$SCRIPT_DIR/workflow/owner-admin-override.py" validate "$pr_url" "$pr_head"); then
+      printf '  ✗ missing, invalid or ambiguous owner authorization for %s@%s — refusing before thread mutation\n' "$pr_url" "$pr_head"
+      OVERALL_RC=1
+      continue
+    fi
+  fi
+
   # Resolve bot-authored review threads on the current HEAD via the
   # canonical helper (current-HEAD freshness guarded; bot threads only).
   # FAIL CLOSED on any failure: --admin bypasses
@@ -508,11 +520,6 @@ for ref in "${PR_REFS[@]}"; do
   admin_flag=()
   merge_env=()
   if [ "$pr_msstatus" = "BLOCKED" ]; then
-    if ! authorization=$(select_admin_record "$pr_url" "$pr_head"); then
-      printf '  ✗ missing or ambiguous owner authorization for %s@%s — refusing --admin merge\n' "$pr_url" "$pr_head"
-      OVERALL_RC=1
-      continue
-    fi
     merge_env=("BREAK_GLASS_ADMIN=$pr_url@$pr_head" "MERGEPATH_OWNER_ADMIN_AUTHORIZATION=$authorization")
     admin_flag=(--admin)
     printf '  ⤷ merging with --admin (CODEOWNERS-author deadlock), pinned to %s\n' "${pr_head:0:7}"

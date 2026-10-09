@@ -31,12 +31,12 @@ class OverrideTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name)
-        self.state = {'pr': {'url': URL, 'headRefOid': HEAD, 'labels': [],
+        self.state = {'pr': {'url': URL, 'headRefOid': HEAD, 'baseRefOid': 'b' * 40, 'labels': [],
                             'statusCheckRollup': [{'name': 'Merge clearance gate', 'conclusion': 'FAILURE'}]},
                       'comments': [], 'reviews': [], 'timeline': []}
         stub = self.path / 'gh'
         stub.write_text('''#!/usr/bin/env python3
-import json, os, sys
+import base64, json, os, sys
 from pathlib import Path
 p=Path(os.environ['OVERRIDE_CASE']); s=json.loads((p/'state.json').read_text()); a=sys.argv[1:]
 with (p/'calls').open('a') as f: f.write(json.dumps(a)+'\\n')
@@ -44,6 +44,8 @@ if a[:2]==['pr','view']:
  result=s['pr'].copy()
  if (p/'posted.json').exists() and s.get('move'): result['headRefOid']='b'*40
  if (p/'posted.json').exists() and s.get('late_label'): result['labels']=[{'name':s['late_label']}]
+elif a[0]=='api' and '/contents/.github/review-policy.yml?ref=' in a[1]:
+ result={'encoding':'base64','content':base64.b64encode(json.dumps(s.get('policy',{})).encode()).decode()}
 elif a[:3]==['api','--paginate','--slurp']:
  suffix=a[3].split('/')[-1]; result=[s.get('inline' if '/pulls/' in a[3] and suffix=='comments' else suffix,[])]
  if (p/'posted.json').exists() and s.get('late_codex') and '/issues/' in a[3] and suffix=='comments':
@@ -93,6 +95,20 @@ print(json.dumps(result))
         self.state['timeline'] = [{'event': 'labeled', 'label': {'name': 'needs-human-review'}, 'created_at': '2026-01-01T00:00:01Z'}]
         self.assertEqual(self.run_prepare().returncode, 2)
         self.assertEqual(self.run_prepare({**AUTH, 'allow_needs_human_review': True}).returncode, 0)
+
+    def test_completed_review_uses_governing_custom_bot(self):
+        self.state['policy'] = {'codex': {'bot_login': 'custom-codex[bot]'}}
+        self.state['comments'] = [{'user': {'login': 'nathanjohnpayne'}, 'body': '@codex review', 'created_at': '2026-01-01T00:00:01Z'}]
+        self.state['reviews'] = [{'user': {'login': 'custom-codex[bot]'}, 'commit_id': HEAD, 'body': 'review complete', 'submitted_at': '2026-01-01T00:00:02Z'}]
+        self.assertEqual(self.run_prepare().returncode, 0)
+        self.state['reviews'][0]['user']['login'] = override.BOT
+        self.assertEqual(self.run_prepare().returncode, 2)
+
+    def test_malformed_governing_bot_fails_before_recording(self):
+        self.state['policy'] = {'codex': {'bot_login': ['custom-codex[bot]']}}
+        result = self.run_prepare()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse((self.path / 'posted.json').exists())
 
     def test_unfinished_codex_requires_named_authorization(self):
         self.state['comments'] = [{'user': {'login': 'nathanjohnpayne'}, 'body': '@codex review', 'created_at': '2026-01-01T00:00:01Z'}]
@@ -218,6 +234,10 @@ print(json.dumps(result))
         payload['comments'].append(response)
         self.assertFalse(override.audit(payload)['recorded_override'])
         response['created_at'] = '2026-01-01T00:01:59Z'
+        self.assertTrue(override.audit(payload)['recorded_override'])
+        payload['codex_bot_login'] = 'custom-codex[bot]'
+        self.assertFalse(override.audit(payload)['recorded_override'])
+        response['user']['login'] = 'custom-codex[bot]'
         self.assertTrue(override.audit(payload)['recorded_override'])
 
 

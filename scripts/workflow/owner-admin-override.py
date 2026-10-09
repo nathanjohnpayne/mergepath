@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Bind an operator-recorded owner instruction to one admin merge (#1803)."""
+import base64
 import datetime as dt
 import json
 import os
@@ -7,6 +8,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 MARKER = '<!-- mergepath-owner-admin-override:v1 -->'
 BOT = 'chatgpt-codex-connector[bot]'
@@ -100,7 +103,7 @@ def response_anchor(body, head):
     return bool(match and head.startswith(match[1].lower()))
 
 
-def codex_inflight(comments, reviews, inline, head, author, at=None):
+def codex_inflight(comments, reviews, inline, head, author, at=None, bot=BOT):
     """Observe unanswered requests without granting response clearance."""
     def visible(item, field):
         return at is None or (item.get(field, '') <= at
@@ -113,21 +116,46 @@ def codex_inflight(comments, reviews, inline, head, author, at=None):
                 if comment.get('user', {}).get('login') == author
                 and comment.get('body', '').strip() == '@codex review']
     responses = [review['submitted_at'] for review in reviews
-                 if review.get('user', {}).get('login') == BOT and review.get('commit_id') == head
+                 if review.get('user', {}).get('login') == bot and review.get('commit_id') == head
                  and (review.get('body', '').strip() or not any(comment.get('pull_request_review_id') == review.get('id') for comment in inline)
                       or any(comment.get('pull_request_review_id') == review.get('id') and not comment.get('in_reply_to_id')
-                             and comment.get('user', {}).get('login') == BOT for comment in inline))]
+                             and comment.get('user', {}).get('login') == bot for comment in inline))]
     responses += [comment['created_at'] for comment in comments
-                  if comment.get('user', {}).get('login') == BOT and response_anchor(comment.get('body', ''), head)]
+                  if comment.get('user', {}).get('login') == bot and response_anchor(comment.get('body', ''), head)]
     if requests and (not responses or max(requests) >= max(responses)):
         return True
     for comment in comments:
-        if comment.get('user', {}).get('login') != BOT or '<!-- codex-pull-request-review-summary -->' not in comment.get('body', ''):
+        if comment.get('user', {}).get('login') != bot or '<!-- codex-pull-request-review-summary -->' not in comment.get('body', ''):
             continue
         row = re.search(r'Code Review[^\n]*\|[^\n]*Running[^\n]*\|\s*`([0-9a-f]{7,40})`', comment['body'])
         if row and head.startswith(row[1]) and (not responses or comment.get('updated_at', comment['created_at']) >= max(responses)):
             return True
     return False
+
+
+def governing_bot(gh, repository, base):
+    """Read bot identity from the immutable governing policy, never PR bytes."""
+    if not isinstance(base, str) or not re.fullmatch('[0-9a-f]{40}', base):
+        raise ValueError('governing base SHA is unavailable')
+    source = gh('api', f'repos/{repository}/contents/.github/review-policy.yml?ref={base}')
+    if not isinstance(source, dict) or source.get('encoding') != 'base64' or not isinstance(source.get('content'), str):
+        raise ValueError('governing review policy is unreadable')
+    content = base64.b64decode(''.join(source['content'].split()), validate=True).decode('utf-8')
+    helper = Path(__file__).resolve().parents[1] / 'lib/feedback-policy-helpers.sh'
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8') as policy_file:
+        policy_file.write(content)
+        policy_file.flush()
+        result = subprocess.run(['/bin/bash', '-c', '. "$1"; policy_yaml_to_json "$2"',
+                                 '_', str(helper), policy_file.name],
+                                text=True, capture_output=True, check=True, timeout=300)
+    policy = json.loads(result.stdout)
+    if not isinstance(policy, dict):
+        raise ValueError('governing review policy must be an object')
+    codex = policy.get('codex')
+    codex = {} if codex is None else codex
+    if not isinstance(codex, dict) or (codex.get('bot_login') is not None and not isinstance(codex['bot_login'], str)):
+        raise ValueError('governing codex.bot_login must be a string')
+    return codex.get('bot_login') or BOT
 
 
 def prepare(argv):
@@ -146,7 +174,7 @@ def prepare(argv):
     query = ['pr', 'view'] + ([selector] if selector else [])
     if repo:
         query += ['--repo', repo]
-    pr = gh(*query, '--json', 'url,headRefOid,labels,statusCheckRollup')
+    pr = gh(*query, '--json', 'url,headRefOid,baseRefOid,labels,statusCheckRollup')
     url, head = pr['url'], pr['headRefOid']
     match = re.fullmatch(r'https://github.com/([^/]+/[^/]+)/pull/([1-9][0-9]*)', url)
     if not match:
@@ -159,6 +187,8 @@ def prepare(argv):
     if labels & {'human-hold', 'policy-violation'}:
         raise ValueError('human-hold and policy-violation require human label removal')
     repository, number = match.groups()
+    base = pr['baseRefOid']
+    bot = governing_bot(gh, repository, base)
 
     def pages(endpoint):
         result = gh('api', '--paginate', '--slurp', f'repos/{repository}/{endpoint}')
@@ -174,7 +204,7 @@ def prepare(argv):
     comments = pages(f'issues/{number}/comments')
     reviews = pages(f'pulls/{number}/reviews')
     inline = pages(f'pulls/{number}/comments')
-    inflight = codex_inflight(comments, reviews, inline, head, os.environ['GH_AS_AUTHOR_RECORD_IDENTITY'])
+    inflight = codex_inflight(comments, reviews, inline, head, os.environ['GH_AS_AUTHOR_RECORD_IDENTITY'], bot=bot)
     if inflight and not record['allow_codex_inflight']:
         raise ValueError('an unanswered Codex request requires explicit owner authorization')
     red = sorted({check.get('name') or check.get('context') or '<unnamed>' for check in pr['statusCheckRollup']
@@ -189,16 +219,16 @@ def prepare(argv):
     if confirmed.get('body') != body or confirmed.get('user', {}).get('login') != os.environ['GH_AS_AUTHOR_RECORD_IDENTITY']:
         raise ValueError('owner override comment failed author/body readback')
     # A branch push after this read is rejected by GitHub's writer precondition.
-    final_pr = gh(*query, '--json', 'url,headRefOid,labels')
+    final_pr = gh(*query, '--json', 'url,headRefOid,baseRefOid,labels')
     if {label['name'] for label in final_pr['labels']} & {'human-hold', 'policy-violation'}:
         raise ValueError('human-hold and policy-violation require human label removal')
     if 'needs-human-review' in {label['name'] for label in final_pr['labels']} and not record['allow_needs_human_review']:
         raise ValueError('needs-human-review requires explicit owner authorization')
-    if final_pr['headRefOid'] != head:
-        raise ValueError('PR head changed after recording the owner instruction')
+    if final_pr['headRefOid'] != head or final_pr['baseRefOid'] != base:
+        raise ValueError('PR head or governing base changed after recording the owner instruction')
     if not record['allow_codex_inflight'] and codex_inflight(
             pages(f'issues/{number}/comments'), pages(f'pulls/{number}/reviews'),
-            pages(f'pulls/{number}/comments'), head, os.environ['GH_AS_AUTHOR_RECORD_IDENTITY']):
+            pages(f'pulls/{number}/comments'), head, os.environ['GH_AS_AUTHOR_RECORD_IDENTITY'], bot=bot):
         raise ValueError('a later unanswered Codex request requires explicit owner authorization')
     print('gh-as-author: recorded scoped owner admin authorization', file=sys.stderr)
 
@@ -235,7 +265,7 @@ def audit(payload):
                 continue
             if (record['observed_codex_inflight'] or codex_inflight(
                     payload['comments'], payload['reviews'], payload['inline_comments'],
-                    pr['head']['sha'], author, pr['merged_at'])) and not record['allow_codex_inflight']:
+                    pr['head']['sha'], author, pr['merged_at'], bot=payload.get('codex_bot_login', BOT))) and not record['allow_codex_inflight']:
                 continue
             return {'recorded_override': True, 'comment_url': comment['html_url'], 'record': record}
         except (ValueError, KeyError, TypeError):
@@ -245,12 +275,14 @@ def audit(payload):
 
 if __name__ == '__main__':
     try:
-        if sys.argv[1:2] == ['audit']:
+        if sys.argv[1:2] == ['validate'] and len(sys.argv) == 4:
+            print(json.dumps(validate(json.load(sys.stdin), sys.argv[2], sys.argv[3], dt.datetime.now(dt.timezone.utc))))
+        elif sys.argv[1:2] == ['audit']:
             print(json.dumps(audit(json.load(sys.stdin))))
         elif sys.argv[1:2] == ['prepare']:
             prepare(sys.argv[2:])
         else:
-            raise ValueError('usage: owner-admin-override.py prepare <gh argv...> | audit < JSON')
+            raise ValueError('usage: owner-admin-override.py prepare <gh argv...> | validate <URL> <HEAD> | audit < JSON')
     except (ValueError, KeyError, TypeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         print(f'BLOCKED: owner admin authorization: {error}', file=sys.stderr)
         sys.exit(2)
