@@ -64,7 +64,7 @@ def main():
     try:
         secrets = items(root + '/actions/secrets?per_page=100', 'secrets')
         environments = api(root + '/environments/' + env)
-        if len(environments) != 1:
+        if len(environments) != 1 or not isinstance(environments[0], dict):
             raise ValueError('environment metadata must be one object')
         # GitHub returns 404 for this endpoint when the environment has no
         # custom branch policy. The environment object already proves that
@@ -76,7 +76,7 @@ def main():
         print(json.dumps({'repo': args.repo, 'environment': args.environment,
                           'status': 'DRIFT' if drift else 'PASS', 'drift': drift}))
         return 3 if drift else 0
-    except (ValueError, TypeError, subprocess.CalledProcessError) as error:
+    except (ValueError, TypeError, OSError, subprocess.CalledProcessError) as error:
         # No secret values are requested. Do not print a CLI environment or
         # command debug dump on an authentication failure.
         print(json.dumps({'repo': args.repo, 'status': 'ERROR', 'reason': str(error)}))

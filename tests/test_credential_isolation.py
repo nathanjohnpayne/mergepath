@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -109,6 +110,19 @@ print(json.dumps(json.loads(Path(os.environ['AUDIT_OBSERVATIONS']).read_text())[
                        '/environments/merge-queue-policy/deployment-branch-policies?per_page=100'):
             code, report, _ = self.run_audit(failure='repos/owner/repo' + suffix)
             self.assertEqual((code, report['status']), (2, 'ERROR'))
+
+    def test_non_object_environment_is_structured_error(self):
+        for page in (None, [], 'invalid'):
+            code, report, _ = self.run_audit(env=[page])
+            self.assertEqual((code, report['status']), (2, 'ERROR'))
+
+    def test_missing_gh_is_structured_error(self):
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/audit-credential-isolation.py'),
+                                 '--repo', 'owner/repo', '--branch', 'main'],
+                                env=dict(os.environ, PATH='/nonexistent'), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stdout)['status'], 'ERROR')
+        self.assertNotIn('Traceback', result.stderr)
 
     def test_unreadable_bypass_field_is_error(self):
         code, report, _ = self.run_audit(env=[{'deployment_branch_policy': None}])
