@@ -401,7 +401,7 @@ Reviewed commit: d05ff4d0" "2026-07-01T14:00:00Z")"
 gatec_clears() { # thumbs_t review_t verdict_any_t verdict_affirm(0/1) unaddressed
   local tt="$1" rt="$2" vt="$3" va="$4" uc="$5"
   local kind="" time="" sig k t
-  for sig in "thumbs|$tt" "review|$rt" "verdict|$vt"; do
+  for sig in "review|$rt" "verdict|$vt"; do
     k=${sig%%|*}; t=${sig#*|}
     [ -n "$t" ] || continue
     if [ -z "$time" ] || [[ "$t" > "$time" ]] || [ "$t" = "$time" ]; then
@@ -409,7 +409,6 @@ gatec_clears() { # thumbs_t review_t verdict_any_t verdict_affirm(0/1) unaddress
     fi
   done
   case "$kind" in
-    thumbs) echo yes ;;
     review) if [ "$uc" -eq 0 ]; then echo yes; else echo no; fi ;;
     verdict) if [ "$va" = "1" ] && [ "$uc" -eq 0 ]; then echo yes; else echo no; fi ;;
     *) echo no ;;
@@ -425,12 +424,31 @@ gc() { # desc expected thumbs review verdict affirm unaddressed
 gc "older 👍 + NEWER non-affirmative verdict → NO (P1 #608)"        no  "2026-07-01T10:00:00Z" ""                    "2026-07-01T12:00:00Z" 0 0
 gc "older clean review + NEWER non-affirmative verdict → NO (#608)" no  ""                    "2026-07-01T10:00:00Z" "2026-07-01T12:00:00Z" 0 0
 gc "same-second 👍 vs non-affirmative verdict → verdict wins tie → NO" no "2026-07-01T10:00:00Z" ""                 "2026-07-01T10:00:00Z" 0 0
-gc "older non-affirmative verdict + NEWER 👍 → YES"                 yes "2026-07-01T12:00:00Z" ""                    "2026-07-01T10:00:00Z" 0 0
+gc "older negative verdict + NEWER unanchored 👍 → NO"             no  "2026-07-01T12:00:00Z" ""                    "2026-07-01T10:00:00Z" 0 0
 gc "verdict-only affirmative + 0 findings → YES"                    yes ""                    ""                    "2026-07-01T10:00:00Z" 1 0
 gc "verdict-only affirmative + unaddressed findings → NO"           no  ""                    ""                    "2026-07-01T10:00:00Z" 1 2
-gc "thumbs-only → YES"                                              yes "2026-07-01T10:00:00Z" ""                    ""                    0 0
+gc "thumbs-only → NO"                                               no  "2026-07-01T10:00:00Z" ""                    ""                    0 0
 gc "review-only clean → YES"                                        yes ""                    "2026-07-01T10:00:00Z" ""                    0 0
 gc "no signals at all → NO"                                         no  ""                    ""                    ""                    0 0
+
+# Exercise the production gate ordering, with an impossible future thumbs
+# timestamp and a backdated current head. No copied clearance algorithm.
+SIGNAL_BLOCK=$(sed -n '/^LATEST_SIGNAL_KIND=""/,/^done$/p' "$SCRIPT")
+for anchored_kind in none review verdict; do
+  CODEX_REVIEW_TIME=""; CODEX_HEAD_VERDICT_ANY_TIME=""
+  case "$anchored_kind" in
+    review) CODEX_REVIEW_TIME=2026-07-01T10:00:00Z ;;
+    verdict) CODEX_HEAD_VERDICT_ANY_TIME=2026-07-01T10:00:00Z ;;
+  esac
+  LATEST_THUMBS_TIME=2999-01-01T00:00:00Z
+  eval "$SIGNAL_BLOCK"
+  wanted="$anchored_kind"; [ "$wanted" != none ] || wanted=""
+  if [ "$LATEST_SIGNAL_KIND" = "$wanted" ]; then
+    pass "#1751: production gate ignores unanchored reaction with $anchored_kind evidence"
+  else
+    fail "#1751: reaction contaminated production gate ordering: $LATEST_SIGNAL_KIND"
+  fi
+done
 
 # ── #814: the diagnostic bypass is a FLAG, not an inheritable env var.
 #

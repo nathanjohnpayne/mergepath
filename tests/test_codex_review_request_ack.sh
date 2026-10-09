@@ -245,7 +245,9 @@ case "$endpoint" in
         printf '%s\n' "$reads" >"$state_dir/review-reads"
         ;;
     esac
-    if [ "$scenario" = "resume-read-502-once" ] && [ "$reads" -gt 1 ]; then
+    if [ "$scenario" = "skip_review" ]; then
+      printf '[{"id":101,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:00:05Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"exact current-head clean review"}]\n' "$bot"
+    elif [ "$scenario" = "resume-read-502-once" ] && [ "$reads" -gt 1 ]; then
       printf '[{"id":94,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:01:00Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"response to the resumed request"}]\n' "$bot"
     elif [ "$scenario" = "resume-blocked" ]; then
       # An older P1 review on HEAD that the pending request asked Codex to
@@ -749,7 +751,7 @@ test_malformed_request_cap_does_not_change_clearance_skip() {
   local dir rc before=$FAIL
   dir=$(make_case "malformed-cap-cleared" 0 1)
   printf '  max_review_rounds: 999999999999999999999999\n' >>"$dir/state/base-review-policy.yml"
-  rc=$(run_case "$dir" skip_reaction)
+  rc=$(run_case "$dir" skip_review)
   [ "$rc" = 0 ] || fail "#813 malformed cap: cleared skip exit $rc, expected 0; stderr=$(cat "$dir/err.log")"
   [ "$(trigger_count "$dir")" = 0 ] || fail "#813 malformed cap: cleared skip posted a trigger"
   [ "$FAIL" -ne "$before" ] || pass "#813: malformed cap leaves an already-cleared no-spend path unchanged"
@@ -758,10 +760,10 @@ test_malformed_request_cap_does_not_change_clearance_skip() {
 test_skip_path_posts_no_trigger_or_ack_check() {
   local dir rc count ack_count reaction_content
   dir=$(make_case "skip-path" 0 1)
-  rc=$(run_case "$dir" skip_reaction)
+  rc=$(run_case "$dir" skip_review)
   count=$(trigger_count "$dir")
   ack_count=$(ack_endpoint_count "$dir")
-  reaction_content=$(jq -r '.reaction.content' "$dir/out.json")
+  reaction_content=$(jq -r '.reaction // "null"' "$dir/out.json")
 
   if [ "$rc" != "0" ]; then
     fail "skip path: exit $rc, expected 0; stderr=$(cat "$dir/err.log")"
@@ -769,11 +771,22 @@ test_skip_path_posts_no_trigger_or_ack_check() {
     fail "skip path: trigger count $count, expected 0"
   elif [ "$ack_count" != "0" ]; then
     fail "skip path: ack endpoint called $ack_count times, expected 0"
-  elif [ "$reaction_content" != "+1" ]; then
-    fail "skip path: reaction content $reaction_content, expected +1"
+  elif [ "$reaction_content" != "null" ]; then
+    fail "skip path: reaction content $reaction_content, expected null"
   else
     pass "cleared pre-flight skip path: no trigger and no ack check"
   fi
+}
+
+
+test_prior_reaction_cannot_clear_backdated_ordinary_push() {
+  local dir rc before=$FAIL
+  dir=$(make_case "prior-reaction-backdated-push" 0 0 1)
+  rc=$(CODEX_TEST_COMMIT_DATE=2026-05-01T00:00:00Z run_case "$dir" skip_reaction)
+  [ "$rc" = 4 ] || fail "#1751: prior-head reaction exit $rc, expected bounded fallback; stderr=$(cat "$dir/err.log")"
+  [ "$(trigger_count "$dir")" = 1 ] || fail "#1751: prior-head reaction suppressed the new-head review request"
+  [ "$(jq -r '.reaction // "null"' "$dir/out.json")" = null ] || fail "#1751: unanchored reaction leaked into authoritative signal output"
+  [ "$FAIL" -ne "$before" ] || pass "#1751: a future-dated prior reaction cannot clear an ordinary push with an old committer date"
 }
 
 test_missing_comment_id_fails_closed_without_timeout_marker() {
@@ -1459,7 +1472,7 @@ test_default_reply_deadline_is_1800() {
   local dir
   dir=$(make_case "default-deadline" 0 0 0)
   sed -i.bak '/review_timeout_seconds/d' "$dir/.github/review-policy.yml"
-  run_case "$dir" skip_reaction >/dev/null
+  run_case "$dir" skip_review >/dev/null
   if grep -q 'timeout = 1800s' "$dir/err.log"; then
     pass "#1550: an absent codex.review_timeout_seconds defaults to 1800s"
   else
@@ -1467,6 +1480,7 @@ test_default_reply_deadline_is_1800() {
   fi
 }
 
+test_prior_reaction_cannot_clear_backdated_ordinary_push
 test_eyes_ack_does_not_retrigger_or_clear
 test_missing_ack_retriggers_once
 test_ack_retry_ignores_blocking_budget_value
