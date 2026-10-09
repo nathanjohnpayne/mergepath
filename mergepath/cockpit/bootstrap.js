@@ -16,6 +16,9 @@ const STORED_SCOPE = "mergepath.cockpit.scope";
 function storage() {
   try { return window.localStorage || null; } catch { return null; }
 }
+function rawStored() {
+  try { return storage()?.getItem(STORED_SCOPE) ?? null; } catch { return null; }
+}
 function remember(value) {
   try { storage()?.setItem(STORED_SCOPE, value); } catch { /* reopen is a convenience */ }
 }
@@ -28,10 +31,8 @@ function forget(expected) {
   } catch { /* nothing to clear */ }
 }
 function recall() {
-  try {
-    const value = storage()?.getItem(STORED_SCOPE);
-    return typeof value === "string" && SCOPE.test(value) ? value : null;
-  } catch { return null; }
+  const value = rawStored();
+  return typeof value === "string" && SCOPE.test(value) ? value : null;
 }
 
 async function establishSession(status) {
@@ -63,7 +64,7 @@ async function establishSession(status) {
 async function reopenSession(status) {
   let stored = recall();
   if (!stored) {
-    const raw = (() => { try { return storage()?.getItem(STORED_SCOPE) ?? null; } catch { return null; } })();
+    const raw = rawStored();
     if (raw !== null) forget(raw);
     status.textContent = "No Cockpit session in this browser. Open the Cockpit from the browser scripts/cockpit.sh launched, or relaunch it.";
     return;
