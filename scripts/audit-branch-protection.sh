@@ -828,6 +828,7 @@ if [ -z "$PROT_BODY" ] && [ -z "$PROT_STATUS" ]; then
   PROT_BODY="$PROT_RAW"
 fi
 
+GAPS=0
 HAVE_CLASSIC=0
 case "$PROT_STATUS" in
   200)
@@ -1183,7 +1184,7 @@ if [ "$SCAN_RULESETS" -eq 1 ]; then
 
   if [ -z "$MATCHING_IDS" ] && [ "$HAVE_CLASSIC" -eq 0 ]; then
     echo "FAIL: no rulesets target $BRANCH on $REPO. PR merges are completely unprotected."
-    exit 3
+    GAPS=1
   fi
 
   # Step B: extract required status checks ONLY from the rulesets that
@@ -1382,7 +1383,7 @@ if [ -z "$REQUIRED_CHECKS" ]; then
   echo "        Settings → Branches → Branch protection rule for '$BRANCH'"
   echo "        → Require status checks to pass before merging"
   echo "        → Add: ${CANONICAL_REQUIRED_CHECKS[*]}"
-  exit 3
+  GAPS=1
 fi
 
 echo "Required status checks currently enforced:"
@@ -1398,8 +1399,6 @@ echo ""
 # Both are reported in one run — a repo that fixes the first and not the
 # second is still not enforcing anything, and finding that out a week
 # later is exactly the latency #774 exists to remove.
-GAPS=0
-
 MISSING=()
 for check in "${CANONICAL_REQUIRED_CHECKS[@]}"; do
   if ! echo "$REQUIRED_CHECKS" | grep -Fxq "$check"; then

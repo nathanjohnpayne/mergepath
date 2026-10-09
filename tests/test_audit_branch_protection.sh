@@ -171,6 +171,10 @@ emit_status_and_body() {
 
 case "$path" in
   */actions/secrets)
+    [ "${STUB_ISOLATION_MODE:-pass}" != error ] || exit 1
+    if [ "${STUB_ISOLATION_MODE:-pass}" = drift ]; then
+      printf '%s\n' '[{"total_count":1,"secrets":[{"name":"MERGE_QUEUE_POLICY_TOKEN"}]}]'; exit 0
+    fi
     printf '%s\n' '[{"total_count":0,"secrets":[]}]'; exit 0 ;;
   */environments/merge-queue-policy)
     printf '%s\n' '[{"can_admins_bypass":false,"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}]'; exit 0 ;;
@@ -2524,6 +2528,25 @@ if [ "$rc" -ne 0 ] || ! echo "$out" | grep -q '"status": "PASS"'; then
 else
   pass "credential isolation uses the actual default branch when --branch selects release"
 fi
+
+# Protection drift must not suppress the independent isolation audit or turn
+# an unreadable Secrets API into ordinary drift (exit 3 instead of error 2).
+for protection_scenario in no_protection ruleset_untrusted_producer; do
+  for isolation_mode in pass drift error; do
+    set +e
+    out=$(STUB_ISOLATION_MODE="$isolation_mode" run_audit "$protection_scenario" --require-credential-isolation 2>&1)
+    rc=$?
+    set -e
+    expected=3; expected_status=PASS
+    [ "$isolation_mode" != drift ] || expected_status=DRIFT
+    if [ "$isolation_mode" = error ]; then expected=2; expected_status=ERROR; fi
+    if [ "$rc" = "$expected" ] && echo "$out" | grep -q "\"status\": \"$expected_status\""; then
+      pass "isolation $isolation_mode remains visible after protection drift ($protection_scenario)"
+    else
+      fail "isolation was skipped or misclassified ($protection_scenario/$isolation_mode rc=$rc output=$out)"
+    fi
+  done
+done
 
 # ---------------------------------------------------------------------------
 # Summary
