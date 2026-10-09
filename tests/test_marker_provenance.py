@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
+import runpy
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'scripts/workflow/verified-relay-markers.py'
@@ -29,7 +31,8 @@ class RelayTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name)
         self.run = {'id': 900, 'workflow_id': 89, 'event': 'workflow_run', 'path': '.github/workflows/codex-feedback-archive-relay.yml',
-                    'head_branch': 'main', 'head_sha': 'a' * 40, 'repository': {'full_name': REPO}}
+                    'head_branch': 'main', 'head_sha': 'a' * 40, 'repository': {'full_name': REPO},
+                    'conclusion': 'success', 'created_at': '2026-10-09T00:00:00Z'}
         self.job = {'id': 901, 'run_id': 900, 'steps': [
             {'name': 'Persist archive and publish the exact-head gate', 'conclusion': 'success'}]}
         self.responses = {
@@ -134,10 +137,55 @@ print(value if isinstance(value,str) else json.dumps(value))
         self.responses['repos/' + REPO + '/actions/runs/12345'] = {
             'created_at': '2026-10-09T00:00:00Z', 'updated_at': '2026-10-09T00:00:00Z'}
         endpoint = 'repos/' + REPO + '/actions/workflows/codex-feedback-archive-relay.yml/runs?event=workflow_run&created=2026-10-09..2026-10-10&per_page=100'
-        self.responses[endpoint] = [{'workflow_runs': [{'id': 900, 'conclusion': 'success'}]}]
+        self.responses[endpoint] = [{'workflow_runs': [self.run]}]
         self.assertEqual(len(self.invoke()[1]), 1)
         self.run['event'] = 'pull_request'
         self.assertEqual(self.invoke()[:2], (0, []))
+
+    def test_large_legacy_history_filters_metadata_and_prefers_nearest_run(self):
+        self.comments[0]['body'] = '<!-- mergepath-feedback-archive-relay:v1 run=12345 status=complete -->'
+        unrelated = [{**self.run, 'id': n, 'workflow_id': 999} for n in range(1000, 1060)]
+        distant = [{**self.run, 'id': n, 'created_at': '2026-10-09T12:00:00Z'} for n in range(1100, 1106)]
+        endpoint = 'repos/' + REPO + '/actions/workflows/codex-feedback-archive-relay.yml/runs?event=workflow_run&created=2026-10-09..2026-10-10&per_page=100'
+        self.responses[endpoint] = [{'workflow_runs': unrelated + distant + [self.run]}]
+        self.assertEqual(len(self.invoke()[1]), 1)
+        calls = (self.path / 'calls').read_text().splitlines()
+        self.assertFalse(any('/actions/runs/11' in call for call in calls))
+
+    def test_legacy_probes_are_bounded_and_follow_direct_publisher_proof(self):
+        self.comments.insert(0, dict(self.comments[0], body='<!-- mergepath-feedback-archive-relay:v1 run=999 status=complete -->'))
+        candidates = [{**self.run, 'id': n} for n in range(1000, 1006)]
+        endpoint = 'repos/' + REPO + '/actions/workflows/codex-feedback-archive-relay.yml/runs?event=workflow_run&created=2026-10-09..2026-10-10&per_page=100'
+        self.responses[endpoint] = [{'workflow_runs': candidates}]
+        for run in candidates:
+            self.responses[f'repos/{REPO}/actions/runs/{run["id"]}'] = run
+            self.responses[f'repos/{REPO}/actions/runs/{run["id"]}/jobs?filter=all&per_page=100'] = [{'jobs': []}]
+        code, comments, error = self.invoke()
+        self.assertEqual((code, len(comments)), (0, 1), error)
+        calls = (self.path / 'calls').read_text().splitlines()
+        self.assertLess(calls.index(f'repos/{REPO}/actions/runs/900'), calls.index(f'repos/{REPO}/actions/runs/999'))
+        self.assertEqual(sum(call in {f'repos/{REPO}/actions/runs/{n}' for n in range(1000, 1006)} for call in calls), 3)
+
+    def test_legacy_timeout_keeps_verified_v2_completion(self):
+        self.comments.insert(0, dict(self.comments[0], body='<!-- mergepath-feedback-archive-relay:v1 run=999 status=complete -->'))
+        (self.path / 'responses').write_text(json.dumps(self.responses))
+        module = runpy.run_path(str(SCRIPT))
+        actual_run = subprocess.run
+        timeouts = []
+        def provider(argv, **kwargs):
+            if argv[-1].endswith('/actions/runs/999'):
+                timeouts.append(kwargs['timeout'])
+                raise subprocess.TimeoutExpired(argv, kwargs['timeout'])
+            return actual_run(argv, **kwargs)
+        with mock.patch.dict(os.environ, PATH=str(self.path) + os.pathsep + os.environ['PATH'], PROVENANCE_CASE=str(self.path)), \
+                mock.patch.object(subprocess, 'run', side_effect=provider):
+            evidence = module['Evidence'](REPO, 7)
+            deadline = evidence.deadline
+            comments = module['verified'](self.comments, evidence)
+            self.assertEqual(evidence.deadline, deadline)
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(len(timeouts), 1)
+        self.assertLessEqual(timeouts[0], 10)
 
     def test_same_publisher_cannot_clear_another_source_and_reuses_reads(self):
         self.comments.append(dict(self.comments[0], body=MARKER.replace('run=12345 ', 'run=999 ')))

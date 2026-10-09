@@ -15,6 +15,10 @@ STEP = 'Persist archive and publish the exact-head gate'
 MARKER = re.compile(r'^<!-- mergepath-feedback-archive-relay:v(?P<version>[12]) run=(?P<source>[1-9][0-9]*)(?: publisher=(?P<publisher>[1-9][0-9]*))? status=(?P<status>complete|failed) -->$')
 
 
+class ReadBudgetExhausted(ValueError):
+    pass
+
+
 def log_binds_persist(log, source, pr):
     """Read runner-generated env blocks, never arbitrary application output."""
     clean = re.sub(r'\x1b\[[0-9;]*m', '', log)
@@ -47,7 +51,7 @@ class Evidence:
             return self.read_cache[key]
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
-            raise ValueError('relay provenance read budget exhausted')
+            raise ReadBudgetExhausted('relay provenance read budget exhausted')
         argv = [self.gh, 'api'] + (['--paginate', '--slurp'] if pages else []) + [f'repos/{self.repo}' + ('/' + endpoint if endpoint else '')]
         result = subprocess.run(argv, capture_output=True, text=True, timeout=min(remaining, 20))
         if result.returncode:
@@ -59,12 +63,7 @@ class Evidence:
         self.read_cache[key] = value
         return value
 
-    def proves(self, publisher, source):
-        key = publisher, source
-        if key in self.cache:
-            return self.cache[key]
-        self.cache[key] = False
-        run = self.api(f'actions/runs/{publisher}')
+    def trusted_run(self, run, publisher):
         if not isinstance(run, dict):
             return False
         if self.workflow is None:
@@ -76,12 +75,19 @@ class Evidence:
         # stable workflow id and event prove that execution lane even after
         # a branch rename; old run metadata is not rewritten by the rename.
         branch = run.get('head_branch')
-        if (run.get('id') != publisher or run.get('event') != 'workflow_run'
+        return not (run.get('id') != publisher or run.get('event') != 'workflow_run'
                 or run.get('workflow_id') != self.workflow['id']
                 or not isinstance(branch, str) or not branch
                 or run.get('path') not in (PATH, PATH + '@' + branch)
                 or str((run.get('repository') or {}).get('full_name')).lower() != self.repo.lower()
-                or not re.fullmatch('[0-9a-f]{40}', run.get('head_sha', ''))):
+                or not re.fullmatch('[0-9a-f]{40}', run.get('head_sha', '')))
+
+    def proves(self, publisher, source):
+        key = publisher, source
+        if key in self.cache:
+            return self.cache[key]
+        self.cache[key] = False
+        if not self.trusted_run(self.api(f'actions/runs/{publisher}'), publisher):
             return False
         pages = self.api(f'actions/runs/{publisher}/jobs?filter=all&per_page=100', pages=True)
         if not isinstance(pages, list) or not all(isinstance(page, dict) and isinstance(page.get('jobs'), list) for page in pages):
@@ -98,12 +104,22 @@ class Evidence:
         return False
 
     def legacy_proves(self, source, created_at):
+        deadline = self.deadline
+        self.deadline = min(deadline, time.monotonic() + 10)
+        try:
+            return self.recover_legacy(source, created_at)
+        except (ReadBudgetExhausted, subprocess.TimeoutExpired):
+            return False  # Unproven legacy evidence grants no completion.
+        finally:
+            self.deadline = deadline
+
+    def recover_legacy(self, source, created_at):
         # Legacy markers carry no publisher id. Recover it from authentic
         # workflow history near their posting or the source's original/rerun
         # dates. Deleted/expired logs grant no authority; no PAT substitution.
         source_run = self.api(f'actions/runs/{source}')
         stamps = [created_at] + ([source_run.get('created_at'), source_run.get('updated_at')] if isinstance(source_run, dict) else [])
-        candidates = set()
+        candidates = {}
         for stamp in dict.fromkeys(stamps):
             if not isinstance(stamp, str) or not re.match(r'^\d{4}-\d\d-\d\dT', stamp):
                 continue
@@ -114,19 +130,29 @@ class Evidence:
                 raise ValueError('legacy relay history unavailable')
             for page in pages:
                 for run in page['workflow_runs']:
-                    if run.get('conclusion') == 'success':
-                        candidates.add(run['id'])
-            if len(candidates) > 50:
-                raise ValueError('legacy relay history exceeds the bounded recovery window')
-            for publisher in sorted(candidates, reverse=True):
-                if self.proves(publisher, source):
-                    return True
+                    if (run.get('conclusion') == 'success' and type(run.get('id')) is int
+                            and self.trusted_run(run, run['id'])):
+                        candidates[run['id']] = run
+        # Metadata rejects other workflows before expensive job/log reads.
+        # Nearest timestamps win, not the highest ids from unrelated reruns.
+        def distance(run):
+            try:
+                when = dt.datetime.fromisoformat(run['created_at'].replace('Z', '+00:00'))
+                return min(abs((when - dt.datetime.fromisoformat(stamp.replace('Z', '+00:00'))).total_seconds())
+                           for stamp in stamps if isinstance(stamp, str))
+            except (ValueError, TypeError, KeyError):
+                return float('inf')
+
+        for publisher in sorted(candidates, key=lambda item: (distance(candidates[item]), -item))[:3]:
+            if self.proves(publisher, source):
+                return True
         return False
 
 
 def verified(comments, evidence):
     result = []
-    for comment in comments:
+    eligible = []
+    for index, comment in enumerate(comments):
         if (comment.get('user') or {}).get('login') != 'github-actions[bot]':
             continue
         marker = MARKER.fullmatch(comment.get('body', ''))
@@ -137,14 +163,19 @@ def verified(comments, evidence):
             continue
         if marker['version'] == '1' and marker['publisher']:
             continue
+        eligible.append((index, comment, marker))
+    # Direct publisher proofs precede optional legacy recovery, so old history
+    # cannot spend the deadline needed to verify current v2 completions.
+    for index, comment, marker in sorted(eligible, key=lambda item: item[2]['version'] == '1' and item[2]['status'] == 'complete'):
+        source = int(marker['source'])
         if marker['status'] == 'complete':
             if not (evidence.proves(int(marker['publisher']), source) if marker['publisher']
                     else evidence.legacy_proves(source, comment.get('created_at'))):
                 continue
         # Normalize for the existing terminal-state reducer. Only completion
         # has subtraction authority; an unverified failure remains fail-closed.
-        result.append(dict(comment, body=f'<!-- mergepath-feedback-archive-relay:v1 run={source} status={marker["status"]} -->'))
-    return result
+        result.append((index, dict(comment, body=f'<!-- mergepath-feedback-archive-relay:v1 run={source} status={marker["status"]} -->')))
+    return [comment for _, comment in sorted(result)]
 
 
 def main():
