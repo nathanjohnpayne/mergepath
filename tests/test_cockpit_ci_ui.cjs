@@ -394,6 +394,10 @@ test("an orphaned queued run off open heads is history, not a running run, and s
   assert.equal(view.historyToggle.textContent, "1 orphaned queued run · show");
   assert.equal(run.flag.hidden, false); assert.match(run.reason.textContent, /never started/);
   assert.equal(run.duration.textContent, "queued 7h 0m");
+  // A rerun's queue age is its current attempt's: run_started_at resets, created_at does not.
+  const rerun = structuredClone(data); rerun.runs[0].created_at -= 30 * 86400;
+  view.update(CI.project(envelope(rerun), null, 1791300000)); assert.equal(run.duration.textContent, "queued 7h 0m");
+  rerun.runs[0].started_at = null; view.update(CI.project(envelope(rerun), null, 1791300000)); assert.equal(run.duration.textContent, "queued 727h 0m");
   // Beside completed history both counts are named.
   const done = {...structuredClone(row), id: "11", key: `${row.repo}:11:none`, status: "completed", conclusion: "success", orphaned: false, reason: null};
   data.runs.push(done); view.update(CI.project(envelope(data), null, 1791300000));

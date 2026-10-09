@@ -160,7 +160,8 @@
       // A run without fetched job detail ends at its workflow update time.
       const completed = row.status !== "completed" ? null : row.jobs.length ? Math.max(...row.jobs.map(job => job.completed_at ?? -1)) : row.jobs_scope === "not-fetched" ? row.updated_at ?? -1 : -1;
       this.duration.textContent = row.kind === "checks" ? `${row.checks.length} checks` : completed === -1 ? "Duration unknown" : elapsed(row.started_at ?? row.created_at, completed, model.now);
-      if (row.kind !== "checks" && row.status !== "in_progress" && row.status !== "completed") this.duration.textContent = `queued ${elapsed(row.created_at, null, model.now)}`;
+      // run_started_at resets on a rerun, so the queue age is the current attempt's, not the run's.
+      if (row.kind !== "checks" && row.status !== "in_progress" && row.status !== "completed") this.duration.textContent = `queued ${elapsed(row.started_at ?? row.created_at, null, model.now)}`;
       while (this.pips.children.length > row.jobs.length) this.pips.lastChild.remove();
       row.jobs.forEach((job, index) => {
         let pip = this.pips.children[index]; if (!pip) {pip = element("span", "ci-pip"); this.pips.append(pip);}
