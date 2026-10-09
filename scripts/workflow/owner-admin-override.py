@@ -102,14 +102,14 @@ def reject_merge_api(args):
     path = urllib.parse.urlsplit(endpoint).path.rstrip('/')
     method = method or ('POST' if fields else 'GET')
     if re.search(r'(?:^|/)pulls/[^/]+/merge$', path) and method not in ('GET', 'HEAD'):
-        raise ValueError('merge API mutations are forbidden; use the head-pinned gh pr merge path')
+        raise ValueError('merge API mutations are forbidden; use the head-pinned PR merge command')
     if path.rsplit('/', 1)[-1] == 'graphql':
         # Files/stdin can change after validation or hide a persisted query.
         # A literal immutable query is the only inspectable wrapper payload.
         if opaque or len(queries) != 1:
             raise ValueError('author GraphQL API calls require one literal query; opaque merge payloads are forbidden')
         if re.search(r'\bmergePullRequest\b', queries[0]):
-            raise ValueError('merge API mutations are forbidden; use the head-pinned gh pr merge path')
+            raise ValueError('merge API mutations are forbidden; use the head-pinned PR merge command')
 
 
 def merge_args(argv):
@@ -183,9 +183,9 @@ def response_anchor(body, head):
 
 def codex_inflight(comments, reviews, inline, head, author, at=None, bot=BOT):
     """Observe unanswered requests without granting response clearance."""
-    # An edited author comment no longer proves its pre-merge command body.
+    # Edited author/bot comments no longer prove their pre-merge request/status.
     # Keep that uncertainty blocking instead of deleting possible requests.
-    if at is not None and any(comment.get('user', {}).get('login') == author
+    if at is not None and any(comment.get('user', {}).get('login') in (author, bot)
             and comment.get('created_at', '') <= at < comment.get('updated_at', comment.get('created_at', ''))
             for comment in comments):
         return True
@@ -199,7 +199,7 @@ def codex_inflight(comments, reviews, inline, head, author, at=None, bot=BOT):
     inline = [comment for comment in inline if visible(comment, 'created_at')]
     requests = [comment['created_at'] for comment in comments
                 if comment.get('user', {}).get('login') == author
-                and comment.get('body', '').strip() == '@codex review']
+                and comment.get('body', '').strip().lower() == '@codex review']
     responses = [review['submitted_at'] for review in reviews
                  if review.get('user', {}).get('login') == bot and review.get('commit_id') == head
                  and (review.get('body', '').strip() or not any(comment.get('pull_request_review_id') == review.get('id') for comment in inline)
@@ -308,12 +308,21 @@ def prepare(argv, *, check_only=False):
     published = {**record, 'observed_red_gates': red, 'observed_codex_inflight': inflight,
                  'observed_fresh_escalation': fresh_escalation}
     body = MARKER + '\n```json\n' + json.dumps(published, sort_keys=True, indent=2) + '\n```'
+    def in_authorization_window(comment):
+        try:
+            return (timestamp(record['authorized_at']) <= timestamp(comment['created_at'])
+                    <= timestamp(comment['updated_at']) <= dt.datetime.now(dt.timezone.utc))
+        except (ValueError, KeyError, TypeError):
+            return False
+
     existing = [comment for comment in comments if comment.get('body') == body
-                and comment.get('user', {}).get('login') == os.environ['GH_AS_AUTHOR_RECORD_IDENTITY']]
+                and comment.get('user', {}).get('login') == os.environ['GH_AS_AUTHOR_RECORD_IDENTITY']
+                and in_authorization_window(comment)]
     posted = existing[-1] if existing else gh('api', f'repos/{repository}/issues/{number}/comments', '-f', f'body={body}')
     confirmed = gh('api', f'repos/{repository}/issues/comments/{posted["id"]}')
-    if confirmed.get('body') != body or confirmed.get('user', {}).get('login') != os.environ['GH_AS_AUTHOR_RECORD_IDENTITY']:
-        raise ValueError('owner override comment failed author/body readback')
+    if (confirmed.get('body') != body or not in_authorization_window(confirmed)
+            or confirmed.get('user', {}).get('login') != os.environ['GH_AS_AUTHOR_RECORD_IDENTITY']):
+        raise ValueError('owner override comment failed author/body/authorization-order readback')
     # A branch push after this read is rejected by GitHub's writer precondition.
     final_pr = gh(*query, '--json', 'url,headRefOid,baseRefOid,labels')
     if {label['name'] for label in final_pr['labels']} & {'human-hold', 'policy-violation'}:

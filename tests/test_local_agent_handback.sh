@@ -333,9 +333,10 @@ fi
 # serves run lists from a sequence: the dispatch's own run must be found by
 # its nonce (not the newest run), polled for until it is listed, and watched.
 DFIX="$WORKDIR/dispatch"
-mkdir -p "$DFIX/scripts/lib" "$DFIX/bin"
+mkdir -p "$DFIX/scripts/lib" "$DFIX/scripts/workflow" "$DFIX/bin"
 cp "$ROOT/scripts/dispatch-thread-resolution-lane.sh" "$ROOT/scripts/gh-as-author.sh" "$ROOT/scripts/identity-check.sh" "$DFIX/scripts/"
-for f in gh-token-resolver.sh credential-class.sh gh-command-classifier.sh pr-body-contract.sh pr-body-contract.mjs reviewers-helpers.sh; do
+cp "$ROOT/scripts/workflow/owner-admin-override.py" "$DFIX/scripts/workflow/"
+for f in gh-token-resolver.sh credential-class.sh gh-command-classifier.sh pr-body-contract.sh pr-body-contract.mjs reviewers-helpers.sh feedback-policy-helpers.sh; do
   [ -f "$ROOT/scripts/lib/$f" ] && cp "$ROOT/scripts/lib/$f" "$DFIX/scripts/lib/"
 done
 cat >"$DFIX/bin/gh" <<'G'

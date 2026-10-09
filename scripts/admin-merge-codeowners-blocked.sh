@@ -471,7 +471,7 @@ for ref in "${PR_REFS[@]}"; do
       semantic_env+=("GH_TOKEN=$OP_PREFLIGHT_REVIEWER_PAT")
     fi
     if ! env "${semantic_env[@]}" python3 "$SCRIPT_DIR/workflow/owner-admin-override.py" check \
-        gh pr merge "$num" --repo "$repo" --admin --match-head-commit "$pr_head"; then
+        gh pr merge "$num" --repo "$repo" --admin --match-head-commit "$pr_head"; then # NO_BARE_GH_WRITE_EXEMPT: argv for the read-only authorization check; no merge writer runs here.
       printf '  ✗ semantic owner authorization refused before thread mutation\n'
       OVERALL_RC=1; continue
     fi

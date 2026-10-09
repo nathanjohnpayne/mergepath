@@ -13,7 +13,11 @@ from unittest import mock
 import runpy
 import contextlib
 import io
+import sys
 
+# Import the real helper without generating binary artifacts in scripts/,
+# which the repository's standing text checks inspect.
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'scripts/workflow/owner-admin-override.py'
 spec = importlib.util.spec_from_file_location('override', SCRIPT)
@@ -132,9 +136,23 @@ print(json.dumps(result))
         self.assertFalse((self.path / 'posted.json').exists())
 
     def test_unfinished_codex_requires_named_authorization(self):
-        self.state['comments'] = [{'user': {'login': 'nathanjohnpayne'}, 'body': '@codex review', 'created_at': '2026-01-01T00:00:01Z'}]
-        self.assertEqual(self.run_prepare().returncode, 2)
+        for command in ('@codex review', '@Codex review', '@CODEX REVIEW'):
+            self.state['comments'] = [{'user': {'login': 'nathanjohnpayne'}, 'body': command, 'created_at': '2026-01-01T00:00:01Z'}]
+            self.assertEqual(self.run_prepare().returncode, 2)
         self.assertEqual(self.run_prepare({**AUTH, 'allow_codex_inflight': True}).returncode, 0)
+
+    def test_existing_record_must_postdate_authorization(self):
+        record = {**AUTH, 'authorized_at': '2026-01-01T00:00:30Z'}
+        self.assertEqual(self.run_prepare(record).returncode, 0)
+        posted = json.loads((self.path / 'posted.json').read_text())
+        for created, expected_posts in [('2026-01-01T00:00:10Z', 1), ('2026-01-01T00:01:00Z', 0)]:
+            self.state['comments'] = [{**posted, 'created_at': created}]
+            (self.path / 'calls').write_text('')
+            result = self.run_prepare(record)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = [json.loads(line) for line in (self.path / 'calls').read_text().splitlines()]
+            writes = [call for call in calls if call[0] == 'api' and call[1].endswith('/comments') and '-f' in call]
+            self.assertEqual(len(writes), expected_posts)
 
     def test_anchored_issue_comment_is_a_response_observation(self):
         self.state['comments'] = [
@@ -311,6 +329,21 @@ print(json.dumps(result))
         request['updated_at'] = '2026-01-01T00:03:00Z'
         self.assertFalse(override.audit(payload)['recorded_override'])
         request['body'] = 'edited away'
+        self.assertFalse(override.audit(payload)['recorded_override'])
+
+    def test_audit_retains_edited_bot_summary_uncertainty(self):
+        self.assertEqual(self.run_prepare().returncode, 0)
+        posted = json.loads((self.path / 'posted.json').read_text())
+        summary = {'user': {'login': override.BOT}, 'created_at': '2026-01-01T00:01:30Z',
+                   'updated_at': '2026-01-01T00:03:00Z',
+                   'body': '<!-- codex-pull-request-review-summary -->\n| Code Review | Completed | `' + HEAD[:8] + '` | Automatic |'}
+        payload = {'pr': {'html_url': URL, 'head': {'sha': HEAD}, 'merged_at': '2026-01-01T00:02:00Z'},
+                   'author': 'nathanjohnpayne', 'comments': [posted, summary], 'reviews': [], 'inline_comments': []}
+        self.assertFalse(override.audit(payload)['recorded_override'])
+        summary['body'] = 'edited away'
+        self.assertFalse(override.audit(payload)['recorded_override'])
+        summary['user']['login'] = 'custom-codex[bot]'
+        payload['codex_bot_login'] = 'custom-codex[bot]'
         self.assertFalse(override.audit(payload)['recorded_override'])
 
 
