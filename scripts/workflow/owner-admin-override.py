@@ -100,6 +100,36 @@ def response_anchor(body, head):
     return bool(match and head.startswith(match[1].lower()))
 
 
+def codex_inflight(comments, reviews, inline, head, author, at=None):
+    """Observe unanswered requests without granting response clearance."""
+    def visible(item, field):
+        return at is None or (item.get(field, '') <= at
+                              and item.get('updated_at', item.get(field, '')) <= at)
+
+    comments = [comment for comment in comments if visible(comment, 'created_at')]
+    reviews = [review for review in reviews if visible(review, 'submitted_at')]
+    inline = [comment for comment in inline if visible(comment, 'created_at')]
+    requests = [comment['created_at'] for comment in comments
+                if comment.get('user', {}).get('login') == author
+                and comment.get('body', '').strip() == '@codex review']
+    responses = [review['submitted_at'] for review in reviews
+                 if review.get('user', {}).get('login') == BOT and review.get('commit_id') == head
+                 and (review.get('body', '').strip() or not any(comment.get('pull_request_review_id') == review.get('id') for comment in inline)
+                      or any(comment.get('pull_request_review_id') == review.get('id') and not comment.get('in_reply_to_id')
+                             and comment.get('user', {}).get('login') == BOT for comment in inline))]
+    responses += [comment['created_at'] for comment in comments
+                  if comment.get('user', {}).get('login') == BOT and response_anchor(comment.get('body', ''), head)]
+    if requests and (not responses or max(requests) >= max(responses)):
+        return True
+    for comment in comments:
+        if comment.get('user', {}).get('login') != BOT or '<!-- codex-pull-request-review-summary -->' not in comment.get('body', ''):
+            continue
+        row = re.search(r'Code Review[^\n]*\|[^\n]*Running[^\n]*\|\s*`([0-9a-f]{7,40})`', comment['body'])
+        if row and head.startswith(row[1]) and (not responses or comment.get('updated_at', comment['created_at']) >= max(responses)):
+            return True
+    return False
+
+
 def prepare(argv):
     parsed = merge_args(argv)
     if parsed is None:
@@ -109,7 +139,7 @@ def prepare(argv):
         raise ValueError('an absolute gh executable is required')
 
     def gh(*args):
-        result = subprocess.run([executable, *args], text=True, capture_output=True, check=True)
+        result = subprocess.run([executable, *args], text=True, capture_output=True, check=True, timeout=300)
         return json.loads(result.stdout)
 
     selector, repo, heads = parsed
@@ -144,24 +174,7 @@ def prepare(argv):
     comments = pages(f'issues/{number}/comments')
     reviews = pages(f'pulls/{number}/reviews')
     inline = pages(f'pulls/{number}/comments')
-    requests = [comment['created_at'] for comment in comments
-                if comment.get('user', {}).get('login') == os.environ['GH_AS_AUTHOR_RECORD_IDENTITY']
-                and comment.get('body', '').strip() == '@codex review']
-    responses = [review['submitted_at'] for review in reviews
-                 if review.get('user', {}).get('login') == BOT and review.get('commit_id') == head
-                 and (review.get('body', '').strip() or not any(comment.get('pull_request_review_id') == review.get('id') for comment in inline)
-                      or any(comment.get('pull_request_review_id') == review.get('id') and not comment.get('in_reply_to_id')
-                             and comment.get('user', {}).get('login') == BOT for comment in inline))]
-    for comment in comments:
-        if comment.get('user', {}).get('login') == BOT and response_anchor(comment.get('body', ''), head):
-            responses.append(comment['created_at'])
-    inflight = bool(requests and (not responses or max(requests) >= max(responses)))
-    for comment in comments:
-        if comment.get('user', {}).get('login') != BOT or '<!-- codex-pull-request-review-summary -->' not in comment.get('body', ''):
-            continue
-        row = re.search(r'Code Review[^\n]*\|[^\n]*Running[^\n]*\|\s*`([0-9a-f]{7,40})`', comment['body'])
-        if row and head.startswith(row[1]) and (not responses or comment.get('updated_at', comment['created_at']) >= max(responses)):
-            inflight = True
+    inflight = codex_inflight(comments, reviews, inline, head, os.environ['GH_AS_AUTHOR_RECORD_IDENTITY'])
     if inflight and not record['allow_codex_inflight']:
         raise ValueError('an unanswered Codex request requires explicit owner authorization')
     red = sorted({check.get('name') or check.get('context') or '<unnamed>' for check in pr['statusCheckRollup']
@@ -183,6 +196,10 @@ def prepare(argv):
         raise ValueError('needs-human-review requires explicit owner authorization')
     if final_pr['headRefOid'] != head:
         raise ValueError('PR head changed after recording the owner instruction')
+    if not record['allow_codex_inflight'] and codex_inflight(
+            pages(f'issues/{number}/comments'), pages(f'pulls/{number}/reviews'),
+            pages(f'pulls/{number}/comments'), head, os.environ['GH_AS_AUTHOR_RECORD_IDENTITY']):
+        raise ValueError('a later unanswered Codex request requires explicit owner authorization')
     print('gh-as-author: recorded scoped owner admin authorization', file=sys.stderr)
 
 
@@ -216,7 +233,9 @@ def audit(payload):
                 continue
             if (record['observed_fresh_escalation'] or payload.get('needs_human_review_at_merge') is True) and not record['allow_needs_human_review']:
                 continue
-            if record['observed_codex_inflight'] and not record['allow_codex_inflight']:
+            if (record['observed_codex_inflight'] or codex_inflight(
+                    payload['comments'], payload['reviews'], payload['inline_comments'],
+                    pr['head']['sha'], author, pr['merged_at'])) and not record['allow_codex_inflight']:
                 continue
             return {'recorded_override': True, 'comment_url': comment['html_url'], 'record': record}
         except (ValueError, KeyError, TypeError):
@@ -232,6 +251,6 @@ if __name__ == '__main__':
             prepare(sys.argv[2:])
         else:
             raise ValueError('usage: owner-admin-override.py prepare <gh argv...> | audit < JSON')
-    except (ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
+    except (ValueError, KeyError, TypeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         print(f'BLOCKED: owner admin authorization: {error}', file=sys.stderr)
         sys.exit(2)

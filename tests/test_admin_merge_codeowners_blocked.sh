@@ -87,7 +87,7 @@ case "$1" in
       view)
         # Gate 1 reads state|mergeable|mergeStateStatus|headRefOid|title via
         # gh's own --jq; the stub returns the already-projected scalar.
-        echo "OPEN|MERGEABLE|BLOCKED|deadbeefHEAD|Test PR (off-page check)"
+        echo "OPEN|MERGEABLE|BLOCKED|deadbeefHEAD|https://github.com/test/current/pull/99999|Test PR (off-page check)"
         ;;
       merge)
         echo "MERGE-ATTEMPTED" >> "$GH_ARGV_LOG"
@@ -209,6 +209,15 @@ rollup_page false "" '[
 
 GH_ARGV_LOG="$SCRATCH/t2.log"; : > "$GH_ARGV_LOG"
 run_admin_merge "$SCRATCH/p1_ok.json" "$SCRATCH/p2_ok.json"
+
+if grep -q 'url: *https://github.com/test/current/pull/99999' <<<"$RUN_OUT" \
+   && grep -q 'headRefOid,url,title' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: renamed input repository uses GitHub's resolved canonical PR URL"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: canonical PR URL was reconstructed from the supplied repository"
+fi
 
 # Past Gate 2 iff no "checks not green" AND the script went on to issue the
 # Gate 3 reviews GraphQL query (reviews(first:100)) — which then finds no

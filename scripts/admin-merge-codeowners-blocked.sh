@@ -194,8 +194,8 @@ for ref in "${PR_REFS[@]}"; do
   printf '========================================\n'
 
   state=$(gh_ro pr view "$num" --repo "$repo" \
-    --json state,mergeable,mergeStateStatus,headRefOid,title \
-    --jq '.state + "|" + (.mergeable // "") + "|" + (.mergeStateStatus // "") + "|" + (.headRefOid // "") + "|" + .title' 2>&1) || {
+    --json state,mergeable,mergeStateStatus,headRefOid,url,title \
+    --jq '.state + "|" + (.mergeable // "") + "|" + (.mergeStateStatus // "") + "|" + (.headRefOid // "") + "|" + .url + "|" + .title' 2>&1) || {
     printf '  ✗ could not read PR state: %s\n' "$state"
     OVERALL_RC=1
     continue
@@ -204,7 +204,9 @@ for ref in "${PR_REFS[@]}"; do
   pr_mergeable=$(printf '%s\n' "$state" | cut -d'|' -f2)
   pr_msstatus=$(printf '%s\n' "$state" | cut -d'|' -f3)
   pr_head=$(printf '%s\n' "$state" | cut -d'|' -f4)
-  pr_title=$(printf '%s\n' "$state" | cut -d'|' -f5-)
+  pr_url=$(printf '%s\n' "$state" | cut -d'|' -f5)
+  pr_title=$(printf '%s\n' "$state" | cut -d'|' -f6-)
+  printf '  url:             %s\n' "$pr_url"
   printf '  title:           %s\n' "$pr_title"
   printf '  state:           %s\n' "$pr_state"
   printf '  mergeable:       %s\n' "$pr_mergeable"
@@ -506,7 +508,6 @@ for ref in "${PR_REFS[@]}"; do
   admin_flag=()
   merge_env=()
   if [ "$pr_msstatus" = "BLOCKED" ]; then
-    pr_url="https://github.com/$repo/pull/$num"
     if ! authorization=$(select_admin_record "$pr_url" "$pr_head"); then
       printf '  ✗ missing or ambiguous owner authorization for %s@%s — refusing --admin merge\n' "$pr_url" "$pr_head"
       OVERALL_RC=1

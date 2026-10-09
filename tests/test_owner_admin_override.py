@@ -9,6 +9,10 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
+import runpy
+import contextlib
+import io
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'scripts/workflow/owner-admin-override.py'
@@ -42,6 +46,8 @@ if a[:2]==['pr','view']:
  if (p/'posted.json').exists() and s.get('late_label'): result['labels']=[{'name':s['late_label']}]
 elif a[:3]==['api','--paginate','--slurp']:
  suffix=a[3].split('/')[-1]; result=[s.get('inline' if '/pulls/' in a[3] and suffix=='comments' else suffix,[])]
+ if (p/'posted.json').exists() and s.get('late_codex') and '/issues/' in a[3] and suffix=='comments':
+  result=[[*result[0],{'user':{'login':'nathanjohnpayne'},'body':'@codex review','created_at':'2026-01-01T00:01:01Z'}]]
 elif a[0]=='api' and '/issues/comments/' in a[1]:
  result=json.loads((p/'posted.json').read_text())
 elif a[0]=='api' and a[1].endswith('/comments') and '-f' in a:
@@ -70,7 +76,7 @@ print(json.dumps(result))
         self.assertIn(AUTH['authorization_quote'], posted['body'])
         self.assertIn('Merge clearance gate', posted['body'])
         calls = [json.loads(line) for line in (self.path / 'calls').read_text().splitlines()]
-        self.assertEqual(calls[-1][:2], ['pr', 'view'])
+        self.assertEqual(calls[-1][:3], ['api', '--paginate', '--slurp'])
 
     def test_different_head_and_boolean_pin_refuse_without_post(self):
         for pin in ('1', URL + '@' + 'b' * 40):
@@ -133,11 +139,28 @@ print(json.dumps(result))
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertTrue((self.path / 'posted.json').exists())
 
+    def test_request_after_initial_observation_requires_exception(self):
+        self.state['late_codex'] = True
+        self.assertEqual(self.run_prepare().returncode, 2)
+        self.assertEqual(self.run_prepare({**AUTH, 'allow_codex_inflight': True}).returncode, 0)
+
+    def test_gh_timeout_is_bounded_and_exits_blocked(self):
+        with mock.patch.dict(os.environ, {'GH_AS_AUTHOR_RECORD_IDENTITY': 'nathanjohnpayne'}), \
+                mock.patch('sys.argv', [str(SCRIPT), 'prepare', 'gh', 'pr', 'merge', '123', '--admin']), \
+                mock.patch('shutil.which', return_value='/fixture/gh'), \
+                mock.patch('subprocess.run', side_effect=subprocess.TimeoutExpired('gh', 300)) as call, \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit) as exit_result:
+                runpy.run_path(str(SCRIPT), run_name='__main__')
+        self.assertEqual(exit_result.exception.code, 2)
+        self.assertEqual(call.call_args.kwargs['timeout'], 300)
+        self.assertIn('BLOCKED: owner admin authorization:', stderr.getvalue())
+
     def test_audit_requires_explicit_human_label_exception(self):
         self.assertEqual(self.run_prepare().returncode, 0)
         posted = json.loads((self.path / 'posted.json').read_text())
         payload = {'pr': {'html_url': URL, 'head': {'sha': HEAD}, 'merged_at': '2026-01-01T00:02:00Z'},
-                   'author': 'nathanjohnpayne', 'comments': [posted], 'needs_human_review_at_merge': True}
+                   'author': 'nathanjohnpayne', 'comments': [posted], 'reviews': [], 'inline_comments': [], 'needs_human_review_at_merge': True}
         self.assertFalse(override.audit(payload)['recorded_override'])
         self.assertEqual(self.run_prepare({**AUTH, 'allow_needs_human_review': True}).returncode, 0)
         payload['comments'] = [json.loads((self.path / 'posted.json').read_text())]
@@ -159,7 +182,7 @@ print(json.dumps(result))
         self.assertEqual(self.run_prepare().returncode, 0)
         posted = json.loads((self.path / 'posted.json').read_text())
         payload = {'pr': {'html_url': URL, 'head': {'sha': HEAD}, 'merged_at': '2026-01-01T00:02:00Z'},
-                   'author': 'nathanjohnpayne', 'comments': [posted]}
+                   'author': 'nathanjohnpayne', 'comments': [posted], 'reviews': [], 'inline_comments': []}
         self.assertTrue(override.audit(payload)['recorded_override'])
         for mutation in ('author', 'head', 'time', 'postmerge-edit', 'missing-edit-time'):
             bad = copy.deepcopy(payload)
@@ -180,8 +203,22 @@ print(json.dumps(result))
             bad[key] = value
             altered = dict(posted, body=override.MARKER + '\n```json\n' + json.dumps(bad) + '\n```')
             payload = {'pr': {'html_url': URL, 'head': {'sha': HEAD}, 'merged_at': '2026-01-01T00:02:00Z'},
-                       'author': 'nathanjohnpayne', 'comments': [altered]}
+                       'author': 'nathanjohnpayne', 'comments': [altered], 'reviews': [], 'inline_comments': []}
             self.assertFalse(override.audit(payload)['recorded_override'])
+
+    def test_audit_observes_unanswered_request_at_merge(self):
+        self.assertEqual(self.run_prepare().returncode, 0)
+        posted = json.loads((self.path / 'posted.json').read_text())
+        request = {'user': {'login': 'nathanjohnpayne'}, 'body': '@codex review', 'created_at': '2026-01-01T00:01:01Z'}
+        payload = {'pr': {'html_url': URL, 'head': {'sha': HEAD}, 'merged_at': '2026-01-01T00:02:00Z'},
+                   'author': 'nathanjohnpayne', 'comments': [posted, request], 'reviews': [], 'inline_comments': []}
+        self.assertFalse(override.audit(payload)['recorded_override'])
+        response = {'user': {'login': override.BOT}, 'body': 'Reviewed commit: ' + HEAD,
+                    'created_at': '2026-01-01T00:03:00Z'}
+        payload['comments'].append(response)
+        self.assertFalse(override.audit(payload)['recorded_override'])
+        response['created_at'] = '2026-01-01T00:01:59Z'
+        self.assertTrue(override.audit(payload)['recorded_override'])
 
 
 if __name__ == '__main__':
