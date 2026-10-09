@@ -106,6 +106,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=phase-4b/lib.sh
 . "$ROOT/phase-4b/lib.sh"
+# shellcheck source=phase-4b/immutable-input.sh
+. "$ROOT/phase-4b/immutable-input.sh"
 
 # Phase 4b approval-loop accounting (#602). Sourced when present so the hook
 # call sites below exist; a missing or unsourceable module simply leaves
@@ -227,6 +229,8 @@ ADAPTER_TIMEOUT_ENV="${P4B_ADAPTER_TIMEOUT_SECONDS:-}"
 ADAPTER_TIMEOUT=""
 
 PR="" ; REPO="" ; REVIEWER="" ; AUTHOR="" ; HEAD="" ; EXPECTED_BASE_SHA="" ; EXPECTED_BASE_SHA_SET=false ; DIFF_FILE="" ; DRY_RUN=false
+INPUT_DIR=""
+INPUT_METADATA_DIGEST=""
 FORCE_ENABLED=false
 case "${P4B_FORCE_ENABLED:-}" in
   1|true|TRUE|True|yes|YES) FORCE_ENABLED=true ;;
@@ -373,7 +377,7 @@ need_gh() { command -v gh >/dev/null 2>&1 || p4b_die 3 "gh is required for this 
 # Opt-in base fence for callers that captured an exact head/base pair (#1475).
 # Read both mutable refs in ONE PR response: separate head and base reads can
 # manufacture a pair that never existed together. The historic --head-only
-# path deliberately remains unchanged when this option is absent.
+# path now captures and fences the same coherent pair when this option is absent.
 P4B_BASE_FENCE_REASON=""
 revalidate_expected_base() {  # <stage>
   local stage="$1" pair live_head live_base extra
@@ -406,17 +410,21 @@ if [ -z "$REPO" ]; then
   [ -n "$REPO" ] || p4b_die 3 "could not resolve repo; pass --repo owner/name"
 fi
 
-if [ -z "$HEAD" ]; then
-  need_gh
-  # #799: the `[ -n "$HEAD" ]` guard below was dead. An unreadable response
-  # put the JSON error body in $HEAD, which then became the head every
-  # downstream drift check compares against — so a run that could not read
-  # the PR at all reviewed, and could approve, a "head" nobody has.
-  HEAD="$(gh_api_scalar --shape sha "HEAD sha for $REPO#$PR" \
-    "repos/$REPO/pulls/$PR" --jq '.head.sha')" || HEAD=""
-  [ -n "$HEAD" ] || p4b_die 3 "could not resolve HEAD sha for $REPO#$PR; pass --head"
-fi
-
+# Capture head and base together on every path, including supplied --head.
+# Both exact Git objects become the immutable reasoning input below.
+need_gh
+PAIR="$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | join(" ")' 2>/dev/null)" || PAIR=""
+IFS=' ' read -r LIVE_HEAD LIVE_BASE PAIR_EXTRA <<EOF
+$PAIR
+EOF
+[[ "$LIVE_HEAD" =~ ^[0-9a-f]{40}$ && "$LIVE_BASE" =~ ^[0-9a-f]{40}$ ]] \
+  && [ -z "$PAIR_EXTRA" ] || p4b_die 3 "could not resolve a complete coherent PR head/base pair"
+[ -z "$HEAD" ] || [ "$HEAD" = "$LIVE_HEAD" ] || p4b_die 3 "supplied head differs from live PR head"
+[ "$EXPECTED_BASE_SHA_SET" != true ] || [ "$EXPECTED_BASE_SHA" = "$LIVE_BASE" ] \
+  || p4b_die 3 "supplied base differs from live PR base"
+HEAD="$LIVE_HEAD"
+EXPECTED_BASE_SHA="$LIVE_BASE"
+EXPECTED_BASE_SHA_SET=true
 if ! revalidate_expected_base initial; then
   p4b_die 3 "$P4B_BASE_FENCE_REASON"
 fi
@@ -1110,6 +1118,7 @@ revalidate_pr_body_author() {  # <stage-label>
 # review body rendered below and the dry-run accounting sandbox, when one
 # exists).
 _p4b_cleanup_tmp() {
+  if [ -n "${INPUT_DIR:-}" ]; then rm -rf "$INPUT_DIR" 2>/dev/null || true; fi
   if [ -n "${BODY_FILE:-}" ]; then rm -f "$BODY_FILE" 2>/dev/null || true; fi
   if [ -n "${_P4B_ACCT_DRY_STATE:-}" ]; then rm -rf "$_P4B_ACCT_DRY_STATE" 2>/dev/null || true; fi
 }
@@ -1211,11 +1220,35 @@ fi
 # gate protects. The command override keeps the orchestrator hermetic in tests.
 require_feedback_accounted
 
+# Resolve exact objects in an isolated store, never through a mutable PR diff
+# endpoint. A supplied diff is only a compatibility assertion of these bytes.
+INPUT_DIR="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/p4b-input.XXXXXX")" \
+  || fall_back_to_manual "could not create protected review input"
+if ! p4b_run_with_timeout 90 "$ROOT/phase-4b/immutable-input.sh" capture \
+     "$REPO" "$PR" "$EXPECTED_BASE_SHA" "$HEAD" "$INPUT_DIR"; then
+  fall_back_to_manual "could not capture immutable PR base/head objects"
+fi
+INPUT_METADATA_DIGEST="$(p4b_input_digest "$INPUT_DIR/input.json")" \
+  || fall_back_to_manual "could not fingerprint review input metadata"
+if [ -n "$DIFF_FILE" ]; then
+  SUPPLIED_DIGEST="$(p4b_input_digest "$DIFF_FILE")" \
+    || fall_back_to_manual "supplied diff is unreadable or unprotected"
+  [ "$SUPPLIED_DIGEST" = "$(jq -er '.diff_sha256' "$INPUT_DIR/input.json")" ] \
+    || fall_back_to_manual "supplied diff differs from captured immutable objects"
+fi
+DIFF_FILE="$INPUT_DIR/review.diff"
+
+revalidate_immutable_input() {
+  [ "$(p4b_input_digest "$INPUT_DIR/input.json")" = "$INPUT_METADATA_DIGEST" ] \
+    && p4b_revalidate_input "$REPO" "$PR" "$INPUT_DIR"
+}
+
 # --- run the adapter (reasoning plane; never posts) ------------------------
 ADAPTER_ARGS=( --pr "$PR" )
 [ -n "$REPO" ]      && ADAPTER_ARGS+=( --repo "$REPO" )
 [ -n "$HEAD" ]      && ADAPTER_ARGS+=( --head "$HEAD" )
 [ -n "$DIFF_FILE" ] && ADAPTER_ARGS+=( --diff-file "$DIFF_FILE" )
+ADAPTER_ARGS+=( --input-metadata "$INPUT_DIR/input.json" )
 
 # Accounting (#602): per-loop timing signals, captured whether or not the
 # adapter succeeds so fail-closed loops carry their duration too.
@@ -1240,7 +1273,11 @@ if [ "$ADAPTER_RC" -ne 0 ]; then
   fall_back_to_manual "adapter exited $ADAPTER_RC"
 fi
 # Defense in depth: re-validate before we act on it.
-if ! p4b_validate_verdict "$VERDICT_JSON"; then
+if ! revalidate_immutable_input \
+  || ! p4b_validate_bound_input "$VERDICT_JSON" "$INPUT_DIR/input.json" "$DIFF_FILE"; then
+  fall_back_to_manual "adapter input binding changed or PR head transitioned during review"
+fi
+if ! p4b_validate_verdict "$(printf '%s' "$VERDICT_JSON" | jq -c 'del(.review_input)')"; then
   fall_back_to_manual "adapter returned a non-conformant verdict"
 fi
 # #1598: the approval's request-generation record must be writer-owned. The
@@ -1525,6 +1562,10 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
   printf '%s\n' "$SUMMARY"
   printf '\n### Review Metadata\n\n'
   printf -- '- Reviewed head: `%s`\n' "${HEAD:-unknown}"
+  printf -- '- Reviewed base: `%s`\n' "$EXPECTED_BASE_SHA"
+  printf -- '- Reviewed merge base: `%s`\n' "$(jq -r '.review_input.merge_base_sha' <<<"$VERDICT_JSON")"
+  printf -- '- Immutable diff SHA-256: `%s`\n' "$(jq -r '.review_input.diff_sha256' <<<"$VERDICT_JSON")"
+  printf -- '- Reviewed diff SHA-256: `%s`\n' "$(jq -r '.review_input.reviewed_diff_sha256' <<<"$VERDICT_JSON")"
   printf -- '- Reviewer identity: `%s`\n' "$REVIEWER"
   printf -- '- Adapter: `%s`\n' "$ADAPTER"
   printf -- '- Adapter runs: `%s`\n' "$ADAPTER_RUNS"
@@ -1840,6 +1881,11 @@ post_review() {
   # during this read is outside the recorded generation, and the merge gate
   # holds the approval until Codex answers it or Phase 4b reruns (#1598).
   [ "$event" != "APPROVE" ] || refuse_approval_if_feedback_unaccounted
+  if ! revalidate_immutable_input; then
+    cleanup_pre_post_refusal_side_effects "immutable review input changed before POST" true \
+      "The PR input" "the reviewed input of ${REPO}#${PR}"
+    fall_back_to_manual "immutable review input changed before POST"
+  fi
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \
     '{commit_id:$commit_id,event:$event,body:$body}' > "$payload_file"
@@ -1854,6 +1900,8 @@ post_review() {
   [ "$review_rc" -eq 0 ] || { p4b_acct_mark_unposted "review POST failed (gh exit $review_rc)"; return "$review_rc"; }
   POSTED_REVIEW_ID="$(printf '%s' "$review_response" | jq -r '.id // empty' 2>/dev/null || true)"
   created_commit="$(printf '%s' "$review_response" | jq -r '.commit_id // empty' 2>/dev/null || true)"
+  printf '%s' "$review_response" | jq -e --rawfile body "$BODY_FILE" '.body == $body' >/dev/null \
+    || { p4b_acct_mark_unposted "created review body differs from bound review input"; p4b_die 3 "created review body did not preserve input binding"; }
   [ "$created_commit" = "$HEAD" ] || { p4b_acct_mark_unposted "created review not pinned to reviewed head"; p4b_die 3 "created review was not pinned to reviewed head (expected $HEAD, got ${created_commit:-unknown})"; }
 }
 

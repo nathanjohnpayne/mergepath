@@ -60,14 +60,14 @@ export P4B_ACCT_STATE_DIR="$WORK/acct-state"
 # reported on this head" so each still exercises the flow it was written for
 # rather than stopping at the barrier; cases that want a different barrier
 # outcome override these two. Every orchestrator case in this file reviews
-# --head abc123.
+# --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.
 cat >"$WORK/stub-barrier-codex.sh" <<'EOF'
 #!/bin/sh
 exit 0
 EOF
 cat >"$WORK/stub-barrier-coderabbit.sh" <<'EOF'
 #!/bin/sh
-printf '{"head_sha":"abc123","probe":{"mode":true,"observed":"terminal"}}'
+printf '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","probe":{"mode":true,"observed":"terminal"}}'
 EOF
 chmod +x "$WORK/stub-barrier-codex.sh" "$WORK/stub-barrier-coderabbit.sh"
 export P4B_CODEX_REVIEW_CHECK="$WORK/stub-barrier-codex.sh"
@@ -387,9 +387,28 @@ exit 127
 SH
 chmod +x "$NO_NODE_DIR/node"
 
+export P4B_FIXTURE_DIFF="$DIFF"
+cat > "$BIN/git" <<'SH'
+#!/usr/bin/env bash
+set -eu
+for arg in "$@"; do
+  case "$arg" in
+    init) mkdir -p "${!#}"; exit 0 ;;
+    fetch) exit 0 ;;
+    rev-parse) value="${!#}"; printf '%s\n' "${value%\^\{commit\}}"; exit 0 ;;
+    merge-base) prev=''; for value in "$@"; do previous="$prev"; prev="$value"; done; printf '%s\n' "$previous"; exit 0 ;;
+    diff) cat "$P4B_FIXTURE_DIFF"; exit 0 ;;
+  esac
+done
+exit 99
+SH
+chmod +x "$BIN/git"
 cat > "$BIN/gh" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = "api" ]; then
+  if [ "${2:-}" = --paginate ] && [ "${3:-}" = --slurp ] && [[ "${4:-}" = */timeline ]]; then
+    printf '[[]]\n'; exit 0
+  fi
   if [ "${2:-}" = "--paginate" ] \
      && [ "${3:-}" = "repos/o/r/issues/131/comments" ] \
      && [ -n "${P4B_FAKE_COMMENTS_BEFORE:-}" ] \
@@ -450,7 +469,7 @@ if [ "${1:-}" = "api" ]; then
             pair_count_file="${P4B_FAKE_LIVE_PAIR_COUNT:-${TMPDIR:-/tmp}/p4b-fake-pair-count}"
             pair_count=$(( $( [ -f "$pair_count_file" ] && cat "$pair_count_file" || echo 0 ) + 1 ))
             printf '%s\n' "$pair_count" > "$pair_count_file"
-            pair_head="${P4B_FAKE_LIVE_HEAD:-abc123}"
+            pair_head="${P4B_FAKE_LIVE_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
             pair_base="${P4B_FAKE_LIVE_BASE:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}"
             if [ -n "${P4B_FAKE_LIVE_BASE2:-}" ] \
                && [ "$pair_count" -ge "${P4B_FAKE_LIVE_BASE2_FROM:-2}" ]; then
@@ -512,7 +531,7 @@ if [ "${1:-}" = "api" ]; then
       if [ -n "${P4B_FAKE_LIVE_HEAD2:-}" ] && [ "$cnt" -ge "${P4B_FAKE_LIVE_HEAD2_FROM:-2}" ]; then
         printf '%s\n' "$P4B_FAKE_LIVE_HEAD2"
       else
-        printf '%s\n' "${P4B_FAKE_LIVE_HEAD:-abc123}"
+        printf '%s\n' "${P4B_FAKE_LIVE_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
       fi
       exit 0
       ;;
@@ -559,7 +578,8 @@ while [ "$#" -gt 0 ]; do
     if [ -n "${P4B_WRAPPER_BODY:-}" ]; then
       jq -r '.body' "${2:?}" > "$P4B_WRAPPER_BODY"
     fi
-    printf '{"id":1,"commit_id":"%s"}\n' "${P4B_FAKE_CREATED_REVIEW_HEAD:-abc123}"
+    jq -nc --arg head "${P4B_FAKE_CREATED_REVIEW_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" --slurpfile payload "$2" \
+      '{id:1,commit_id:$head,body:$payload[0].body}'
     exit 0
   fi
   if [ "$1" = "--body-file" ]; then
@@ -568,7 +588,7 @@ while [ "$#" -gt 0 ]; do
   fi
   shift
 done
-printf '{"id":1,"commit_id":"%s"}\n' "${P4B_FAKE_CREATED_REVIEW_HEAD:-abc123}"
+printf '{"id":1,"commit_id":"%s"}\n' "${P4B_FAKE_CREATED_REVIEW_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
 SH
 chmod +x "$BIN/fake-gh-as-reviewer"
 
@@ -641,7 +661,7 @@ fi
 kind=review-body
 [ "${P4B_ACK_ARCHIVED_BODY:-}" != true ] || kind=review-body-archive
 jq -n --arg kind "$kind" --argjson body "$body_json" --arg token "$token" --argjson accounted "$accounted" '
-  {kind:$kind, review_id:1, commit_id:"abc123", tier:"p2", body:$body, ack_token:$token, accounted:$accounted} as $f
+  {kind:$kind, review_id:1, commit_id:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", tier:"p2", body:$body, ack_token:$token, accounted:$accounted} as $f
   | {feedback_policy:{},findings:[$f],missing:([$f] | map(select(.accounted == false)))}'
 [ "$accounted" = true ]
 SH
@@ -657,7 +677,7 @@ while [ "$#" -gt 0 ]; do
       */reviews)
         jq --arg submitted "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
           '. + {submitted_at:$submitted}' "$2" > "$P4B_ACK_REVIEW"
-        printf '{"id":1,"commit_id":"abc123"}'
+        jq -c '. + {id:1}' "$P4B_ACK_REVIEW"
         ;;
       */comments)
         [ "${P4B_ACK_POST_FAIL:-}" != true ] || exit 1
@@ -718,7 +738,7 @@ run_approval_ack_case() {
     P4B_ACK_IDENTITY="$P4B_ACK_CASE/identity" P4B_ACK_POLICY="$POLICY_ON" \
     P4B_ACK_GATE_BIN="$WORK/approval-accounting-bin" \
     P4B_ACK_GATE_SCRIPT="$ROOT/scripts/review-feedback-accounting.sh" "$@" \
-    bash "$ORCH" 1261 --repo o/r --author "$author" --head abc123 --diff-file "$DIFF" ${extra_args[@]+"${extra_args[@]}"} \
+    bash "$ORCH" 1261 --repo o/r --author "$author" --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" ${extra_args[@]+"${extra_args[@]}"} \
     2>"$P4B_ACK_CASE/stderr")
   rc=$?
   set -e
@@ -1894,7 +1914,7 @@ else fail "#1143: disabled path must not require node (rc=$rc, out=$out)"; fi
 # deeper, on a host that satisfied every documented prerequisite.
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" PATH="$NO_NODE_DIR:$PATH" \
-  bash "$ORCH" 1150 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>&1)"; rc=$?
+  bash "$ORCH" 1150 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>&1)"; rc=$?
 set -e
 case "$out" in
   *"node is required"*)
@@ -1928,7 +1948,7 @@ else fail "#1046: disabled-skip enabled_via (rc=$rc, out=$out)"; fi
 # case below, but starting from POLICY_OFF instead of POLICY_ON.
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_OFF" CODEX_BIN="$BIN/fake-codex-approve" \
-  bash "$ORCH" 123 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run --force-enabled 2>/dev/null)"; rc=$?
+  bash "$ORCH" 123 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run --force-enabled 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] \
    && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ] \
@@ -1941,7 +1961,7 @@ else fail "#1046: --force-enabled dry-run (rc=$rc): $out"; fi
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_OFF" CODEX_BIN="$BIN/fake-codex-approve" \
   P4B_FORCE_ENABLED=1 \
-  bash "$ORCH" 123 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  bash "$ORCH" 123 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] \
    && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ] \
@@ -1994,7 +2014,7 @@ set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
   MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$FEEDBACK_BLOCK_STUB" \
   CODEX_BIN="$FEEDBACK_ADAPTER_PROBE" \
-  bash "$ORCH" 122 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>&1)"; rc=$?
+  bash "$ORCH" 122 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>&1)"; rc=$?
 set -e
 if [ "$rc" = 7 ] \
    && printf '%s' "$out" | grep -q 'review feedback is unaccounted' \
@@ -2006,7 +2026,7 @@ set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
   MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$FEEDBACK_BLOCK_STUB" \
   P4B_ADAPTER_DIR="$WORK/no-adapters" \
-  bash "$ORCH" 122 --repo o/r --author claude --reviewer nathanpayne-codex --head abc123 --diff-file "$DIFF" --dry-run 2>&1)"; rc=$?
+  bash "$ORCH" 122 --repo o/r --author claude --reviewer nathanpayne-codex --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>&1)"; rc=$?
 set -e
 if [ "$rc" = 7 ] \
    && printf '%s' "$out" | grep -q 'review feedback is unaccounted' \
@@ -2017,7 +2037,7 @@ else fail "early fallback feedback hold propagation (rc=$rc, out=$out)"; fi
 # Direction A: author=claude → reviewer codex → APPROVED → exit 0
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
-  bash "$ORCH" 123 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  bash "$ORCH" 123 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] \
    && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ] \
@@ -2030,7 +2050,7 @@ else fail "Direction A (rc=$rc): $out"; fi
 # Direction B: author=codex → reviewer claude → CHANGES_REQUESTED → exit 1
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CLAUDE_BIN="$BIN/fake-claude-changes" \
-  P4B_FAKE_PR_BODY_AGENT=codex bash "$ORCH" 124 --repo o/r --author codex --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  P4B_FAKE_PR_BODY_AGENT=codex bash "$ORCH" 124 --repo o/r --author codex --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 1 ] \
    && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "CHANGES_REQUESTED" ] \
@@ -2043,14 +2063,14 @@ else fail "Direction B (rc=$rc): $out"; fi
 # caller before any publication path. The fixture includes a finding and full
 # normalized usage so a count/scalar-only summary cannot pass this assertion.
 expected_verdict="$(CLAUDE_BIN="$BIN/fake-claude-approve-p2-usage" \
-  bash "$AD_CLAUDE" --pr 127 --repo o/r --head abc123 --diff-file "$DIFF")"
+  bash "$AD_CLAUDE" --pr 127 --repo o/r --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF")"
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CLAUDE_BIN="$BIN/fake-claude-approve-p2-usage" \
-  P4B_FAKE_PR_BODY_AGENT=codex bash "$ORCH" 127 --repo o/r --author codex --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  P4B_FAKE_PR_BODY_AGENT=codex bash "$ORCH" 127 --repo o/r --author codex --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] \
    && printf '%s' "$out" | jq -e --argjson expected "$expected_verdict" \
-     '.dry_run == true and .validated_verdict == $expected' >/dev/null; then
+     '.dry_run == true and (.validated_verdict | del(.review_input)) == ($expected | del(.review_input)) and (.validated_verdict.review_input.head_sha == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")' >/dev/null; then
   pass "#1186: dry-run final JSON preserves the complete validated verdict"
 else fail "#1186: dry-run validated verdict (rc=$rc): $out"; fi
 
@@ -2059,7 +2079,7 @@ HANDOFF_LOG="$WORK/handoff-junk.log"
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-junk" \
   P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" \
-  bash "$ORCH" 125 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  bash "$ORCH" 125 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] \
    && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = "true" ] \
@@ -2071,7 +2091,7 @@ HANDOFF_LOG="$WORK/handoff-claude.log"
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CLAUDE_BIN="$BIN/fake-claude-junk" \
   P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" \
-  P4B_FAKE_PR_BODY_AGENT=codex bash "$ORCH" 126 --repo o/r --author codex --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  P4B_FAKE_PR_BODY_AGENT=codex bash "$ORCH" 126 --repo o/r --author codex --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] \
    && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = "true" ] \
@@ -2112,7 +2132,7 @@ p4b1143_run() {  # p4b1143_run <body-file-or-""> <extra orchestrator args...>
   out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
     CLAUDE_BIN="$BIN/fake-claude-approve-usage" \
     P4B_FAKE_PR_BODY_FILE="$bodyfile" \
-    bash "$ORCH" 1143 --repo o/r --head abc123 --diff-file "$DIFF" --dry-run "$@" 2>&1)"
+    bash "$ORCH" 1143 --repo o/r --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run "$@" 2>&1)"
   rc=$?
   set -e
   printf 'rc=%s %s' "$rc" "$out"
@@ -2148,7 +2168,7 @@ out="$(PATH="$P4B1143_NODE_DIR:$PATH" \
   P4B1143_AUTHOR_PARSE_COUNT="$P4B1143_AUTHOR_PARSE_COUNT" \
   MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
   CLAUDE_BIN="$BIN/fake-claude-approve-usage" P4B_FAKE_PR_BODY_FILE="$P4B1143_BODY" \
-  bash "$ORCH" 124 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>&1)"
+  bash "$ORCH" 124 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>&1)"
 rc=$?
 set -e
 if [ "$rc" = 3 ] \
@@ -2293,7 +2313,7 @@ p4b1143r2_run() {
     P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" \
     P4B_GH_AS_REVIEWER="$revwrap" \
     P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$WORK/p4b1143r2-handoff.log" \
-    P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+    P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     P4B_ISSUE_LOG="$WORK/p4b1143r2-issues-${pr}.log" \
     P4B_FAKE_PR_BODY_FILE="$P4B1143R2_BODY1" \
     P4B_FAKE_PR_BODY_FILE2="$P4B1143R2_BODY2" \
@@ -2301,7 +2321,7 @@ p4b1143r2_run() {
     P4B_FAKE_PR_BODY_COUNT="$WORK/p4b1143r2-count-${pr}" \
     P4B_FAKE_PR_BODY_SWAPPED="$WORK/p4b1143r2-swapped-${pr}" \
     "$@" \
-    bash "$ORCH" "$pr" --repo o/r --head abc123 --diff-file "$DIFF" 2>&1)"
+    bash "$ORCH" "$pr" --repo o/r --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>&1)"
   rc=$?
   set -e
   printf 'rc=%s %s' "$rc" "$out"
@@ -2597,7 +2617,7 @@ p4b1143r5_case 1153 1 2 \
 # carried by an approval, even when the adapter output is otherwise valid.
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_P2_REQUIRED" CODEX_BIN="$BIN/fake-codex-approve-p2" \
-  bash "$ORCH" 131 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  bash "$ORCH" 131 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = "true" ]; then
   pass "policy-required finding in APPROVED verdict → manual fallback, no auto-approve"
@@ -2609,7 +2629,7 @@ else fail "policy-required finding fallback (rc=$rc): $out"; fi
 # still reports a dry-run APPROVED.
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
-  bash "$ORCH" 133 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  bash "$ORCH" 133 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] \
    && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ] \
@@ -2625,8 +2645,8 @@ set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$ISSUE_LOG" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b672-wrapper.log" \
-  P4B_WRAPPER_BODY="$P4B672_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
-  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_WRAPPER_BODY="$P4B672_BODY" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  bash "$ORCH" 134 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = "true" ]; then
   pass "#672: APPROVED with advisory findings posts after filing issues"
@@ -2651,9 +2671,9 @@ set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
-  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   P4B_FAKE_ISSUE_COMMENTS='[{"id":7202,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"},{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"},{"id":7203,"user":{"login":"someone-else"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' \
-  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 134 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = true ] \
    && grep -qxF '<!-- mergepath-p4b-request-generation: [7201,7202] -->' "$P1598_BODY"; then
@@ -2666,9 +2686,9 @@ set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
-  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   P4B_FAKE_ISSUE_COMMENTS_FAIL=1 \
-  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 134 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 10 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = false ] \
    && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = request-generation-unreadable ] \
@@ -2692,9 +2712,9 @@ set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$WORK/p1598-marker-adapter.sh" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
-  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   P4B_FAKE_ISSUE_COMMENTS='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' \
-  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 134 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 _p1598_records=$(grep -o '<!-- mergepath-p4b-request-generation: [^>]*-->' "$P1598_BODY" 2>/dev/null || true)
 if [ "$rc" = 0 ] && [ "$_p1598_records" = '<!-- mergepath-p4b-request-generation: [7201] -->' ]; then
@@ -2723,9 +2743,9 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$P1598_CODEX_OFF" CODEX_B
   P4B_RESOLVE_BASE_POLICY="$P1598_RESOLVER" P1598_GOVERNING_POLICY="$P1598_CODEX_OFF" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
-  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   P4B_FAKE_ISSUE_COMMENTS_FAIL=1 \
-  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 134 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = true ] \
    && [ -s "$P1598_BODY" ] && ! grep -q 'mergepath-p4b-request-generation' "$P1598_BODY"; then
@@ -2742,9 +2762,9 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$P1598_CODEX_OFF" CODEX_B
   P4B_RESOLVE_BASE_POLICY="$P1598_RESOLVER" P1598_GOVERNING_POLICY="$POLICY_ON" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
-  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   P4B_FAKE_ISSUE_COMMENTS='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' \
-  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 134 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] && grep -qxF '<!-- mergepath-p4b-request-generation: [7201] -->' "$P1598_BODY"; then
   pass "#1598: a governing policy that enables Codex is followed even when the local checkout disables it"
@@ -2760,9 +2780,9 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$B
   P4B_RESOLVE_BASE_POLICY="$P1598_RESOLVER" P1598_GOVERNING_POLICY="$P1598_CODEX_OFF" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
-  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   P4B_FAKE_ISSUE_COMMENTS_FAIL=1 \
-  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 134 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = true ] \
    && [ -s "$P1598_BODY" ] && ! grep -q 'mergepath-p4b-request-generation' "$P1598_BODY"; then
@@ -2783,9 +2803,9 @@ for _gm in on:on on:off off:on off:off; do
     P4B_RESOLVE_BASE_POLICY="$P1598_RESOLVER" P1598_GOVERNING_POLICY="$_gm_gov_policy" \
     OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
     P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
-    P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+    P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     P4B_FAKE_ISSUE_COMMENTS_FAIL=1 \
-    bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+    bash "$ORCH" 134 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
   set -e
   if [ "$_gm_gov" = off ]; then
     if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = true ] \
@@ -2819,11 +2839,11 @@ set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$WORK/p1598-adapter.sh" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
-  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   P4B_FAKE_ISSUE_COMMENTS='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' \
   P4B_FAKE_ISSUE_COMMENTS_AFTER='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"},{"id":7204,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:01:00Z","body":"@codex review"}]' \
   P4B_FAKE_ISSUE_COMMENTS_SENTINEL="$P1598_SENTINEL" \
-  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 134 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 10 ] && [ -e "$P1598_SENTINEL" ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = false ] \
    && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = request-generation-changed ] \
@@ -2840,11 +2860,11 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$W
   P4B_RESOLVE_BASE_POLICY="$P1598_RESOLVER" P1598_GOVERNING_POLICY="$P1598_CODEX_OFF" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
-  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   P4B_FAKE_ISSUE_COMMENTS='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' \
   P4B_FAKE_ISSUE_COMMENTS_AFTER='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"},{"id":7204,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:01:00Z","body":"@codex review"}]' \
   P4B_FAKE_ISSUE_COMMENTS_SENTINEL="$P1598_SENTINEL" \
-  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 134 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ -e "$P1598_SENTINEL" ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = true ]; then
   pass "#1598: a moved request generation is not a refusal when the governing policy disables Codex"
@@ -2878,11 +2898,11 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$B
   MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$WORK/p1598-acct-touch.sh" P4B_TEST_ACCT_COUNT="$WORK/p1598-acct.count" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
-  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   P4B_FAKE_ISSUE_COMMENTS='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' \
   P4B_FAKE_ISSUE_COMMENTS_AFTER='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"},{"id":7204,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:01:00Z","body":"@codex review"}]' \
   P4B_FAKE_ISSUE_COMMENTS_SENTINEL="$P1598_SENTINEL" \
-  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 134 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ -e "$P1598_SENTINEL" ] && [ "$(cat "$WORK/p1598-acct.count" 2>/dev/null || echo 0)" -ge 3 ] \
    && [ "$(grep -o '<!-- mergepath-p4b-request-generation: [^>]*-->' "$P1598_BODY" 2>/dev/null)" = '<!-- mergepath-p4b-request-generation: [7201] -->' ]; then
@@ -2902,10 +2922,10 @@ for _g3 in enabled disabled; do
     P4B_RESOLVE_BASE_POLICY="$_g3_resolver" P1598_GOVERNING_POLICY="$P1598_CODEX_OFF" \
     OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
     P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
-    P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+    P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     P4B_FAKE_ISSUE_COMMENTS='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' \
     P4B_FAKE_ISSUE_COMMENTS_SENTINEL="$P1598_SENTINEL" P4B_FAKE_ISSUE_COMMENTS_FAIL_AFTER_SENTINEL=1 \
-    bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+    bash "$ORCH" 134 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
   set -e
   if [ "$_g3" = enabled ]; then
     if [ "$rc" = 10 ] && [ -e "$P1598_SENTINEL" ] \
@@ -2924,7 +2944,7 @@ for _g3 in enabled disabled; do
   fi
 done
 P2_FP="$(printf '%s|%s|%s|%s' P2 x.js 2 "should be handled under stricter policy" | cksum | cut -d' ' -f1)"
-grep -q "p4b-post-review o/r#134 head=abc123 finding=${P2_FP}" "${ISSUE_LOG}.body.1" \
+grep -q "p4b-post-review o/r#134 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa finding=${P2_FP}" "${ISSUE_LOG}.body.1" \
   && pass "#674: filed issue body embeds the content-fingerprinted dedup marker" || fail "#674: content-fingerprint marker missing from issue body"
 grep -q -- "--title \[Post-Review\]" "$ISSUE_LOG" || grep -q "\[Post-Review\]" "$ISSUE_LOG" \
   && pass "#674: issue title follows the documented Post-Review convention" || fail "#674: Post-Review title prefix missing"
@@ -2950,8 +2970,8 @@ set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$DEDUP_ISSUE_LOG" P4B_FAKE_EXISTING_ISSUE=1 \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-dedup-wrapper.log" \
-  P4B_WRAPPER_BODY="$DEDUP_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
-  bash "$ORCH" 140 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_WRAPPER_BODY="$DEDUP_BODY" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  bash "$ORCH" 140 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ ! -s "$DEDUP_ISSUE_LOG" ] && grep -q "#777" "$DEDUP_BODY"; then
   pass "#674: existing marker match reused (no duplicate issue; reference carried)"
@@ -2974,7 +2994,7 @@ phase_4b_automation:
 YAML
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_BAD_KNOB" CODEX_BIN="$BIN/fake-codex-approve-p2" \
-  bash "$ORCH" 141 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  bash "$ORCH" 141 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] \
    && printf '%s' "$out" | jq -r '.reason' | grep -q "invalid phase_4b_automation.post_review_issues"; then
@@ -2987,8 +3007,8 @@ set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$WORK/issue-fail.log" P4B_FAKE_ISSUE_FAIL=1 \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b672-fail-wrapper.log" \
-  P4B_FAKE_LIVE_HEAD=abc123 \
-  bash "$ORCH" 135 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  bash "$ORCH" 135 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] \
    && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = "true" ] \
@@ -3006,12 +3026,10 @@ set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$DRIFT_ISSUE_LOG" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-drift-wrapper.log" \
-  P4B_FAKE_LIVE_HEAD=def456 \
-  bash "$ORCH" 137 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_FAKE_LIVE_HEAD=dddddddddddddddddddddddddddddddddddddddd \
+  bash "$ORCH" 137 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
-if [ "$rc" = 10 ] \
-   && [ "$(printf '%s' "$out" | jq -r '.infrastructure_error')" = true ] \
-   && printf '%s' "$out" | jq -r '.reason' | grep -q "head moved"; then
+if [ "$rc" = 3 ] && [ -z "$out" ]; then
   pass "#674: head drift stops before issue filing with no stale-head authority"
 else fail "#674 head-drift pre-check (rc=$rc): $out"; fi
 [ ! -s "$DRIFT_ISSUE_LOG" ] \
@@ -3026,8 +3044,8 @@ set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$PREFILE_DRIFT_ISSUE_LOG" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$PREFILE_DRIFT_WRAPPER_LOG" \
-  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_HEAD2=def456 P4B_FAKE_LIVE_HEAD2_FROM=2 \
-  bash "$ORCH" 1371 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_LIVE_HEAD2=def456 P4B_FAKE_LIVE_HEAD2_FROM=2 \
+  bash "$ORCH" 1371 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] \
    && printf '%s' "$out" | jq -r '.reason' | grep -q "refusing to file post-review issues" \
@@ -3044,8 +3062,8 @@ set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-risk" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$RISK_ISSUE_LOG" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-risk-wrapper.log" \
-  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
-  bash "$ORCH" 138 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  bash "$ORCH" 138 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] && grep -q -- "--label risk" "$RISK_ISSUE_LOG" && ! grep -q -- "--label observation" "$RISK_ISSUE_LOG"; then
   pass "#674: risk-worded finding files under the risk label"
@@ -3077,8 +3095,8 @@ set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_P3_IGNORE" CODEX_BIN="$BIN/fake-codex-approve-p3" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$IGNORE_ISSUE_LOG" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-ignore-wrapper.log" \
-  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
-  bash "$ORCH" 139 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  bash "$ORCH" 139 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = "true" ] && [ ! -s "$IGNORE_ISSUE_LOG" ]; then
   pass "#674: ignore-tier findings file nothing and the approval still posts"
@@ -3093,8 +3111,8 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$B
   GH_TOKEN=ambient-reviewer-token P4B_ISSUE_LOG="$KEYRING_ISSUE_LOG" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" \
   P4B_WRAPPER_LOG="$WORK/p4b674-keyring-wrapper.log" \
-  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
-  bash "$ORCH" 142 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  bash "$ORCH" 142 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] \
    && grep -q "^VIA gh-as-author$" "$KEYRING_ISSUE_LOG" \
@@ -3109,8 +3127,8 @@ set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$SEARCHFAIL_LOG" P4B_FAKE_SEARCH_FAIL=1 \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" \
-  P4B_WRAPPER_LOG="$WORK/p4b674-searchfail-wrapper.log" P4B_FAKE_LIVE_HEAD=abc123 \
-  bash "$ORCH" 148 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_WRAPPER_LOG="$WORK/p4b674-searchfail-wrapper.log" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  bash "$ORCH" 148 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] \
    && printf '%s' "$out" | jq -r '.reason' | grep -q "issue filing failed" \
@@ -3127,8 +3145,8 @@ set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-2p2" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$PARTIAL_ISSUE_LOG" P4B_FAKE_ISSUE_FAIL_AFTER_1=1 \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-partial-wrapper.log" \
-  P4B_FAKE_LIVE_HEAD=abc123 \
-  bash "$ORCH" 143 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  bash "$ORCH" 143 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] \
    && printf '%s' "$out" | jq -r '.reason' | grep -q "partial refs: #901"; then
@@ -3145,9 +3163,9 @@ DRIFT2_ISSUE_LOG="$WORK/issue-drift2.log"; : > "$DRIFT2_ISSUE_LOG"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$DRIFT2_ISSUE_LOG" \
-  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_HEAD2=def456 P4B_FAKE_LIVE_HEAD2_FROM=3 \
+  P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_LIVE_HEAD2=def456 P4B_FAKE_LIVE_HEAD2_FROM=3 \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-drift2-wrapper.log" \
-  bash "$ORCH" 145 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 145 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] \
    && printf '%s' "$out" | jq -r '.reason' | grep -q "changed while filing post-review issues" \
@@ -3166,8 +3184,8 @@ set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_P3_IGNORE" CODEX_BIN="$BIN/fake-codex-approve-p2p3" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$MIXED_ISSUE_LOG" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-mixed-wrapper.log" \
-  P4B_WRAPPER_BODY="$MIXED_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
-  bash "$ORCH" 144 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_WRAPPER_BODY="$MIXED_BODY" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  bash "$ORCH" 144 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] \
    && [ "$(grep -c '^ARGV ' "$MIXED_ISSUE_LOG")" = "1" ] \
@@ -3184,8 +3202,8 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$B
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$REUSE_ISSUE_LOG" \
   P4B_FAKE_EXISTING_ISSUE_ONCE=1 P4B_FAKE_ISSUE_FAIL=1 \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-reuse-wrapper.log" \
-  P4B_FAKE_LIVE_HEAD=abc123 \
-  bash "$ORCH" 146 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  bash "$ORCH" 146 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] && ! grep -q "^CLOSE #777$" "$REUSE_ISSUE_LOG"; then
   pass "#674: reused prior-run issue is NOT closed by this run's failure cleanup"
@@ -3197,9 +3215,9 @@ LATE_ISSUE_LOG="$WORK/issue-late-drift.log"; : > "$LATE_ISSUE_LOG"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$LATE_ISSUE_LOG" \
-  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_HEAD2=def456 P4B_FAKE_LIVE_HEAD2_FROM=4 \
+  P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_LIVE_HEAD2=def456 P4B_FAKE_LIVE_HEAD2_FROM=4 \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-late-wrapper.log" \
-  bash "$ORCH" 147 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 147 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] \
    && printf '%s' "$out" | jq -r '.reason' | grep -q "changed during review" \
@@ -3225,7 +3243,7 @@ phase_4b_automation:
 YAML
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_NO_ISSUES" CODEX_BIN="$BIN/fake-codex-approve-p2" \
-  bash "$ORCH" 136 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  bash "$ORCH" 136 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] \
    && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = "true" ] \
@@ -3244,9 +3262,9 @@ WRAPPER_LOG="$WORK/base-fence-success-wrapper.log"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" \
-  P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_BASE="$P4B_EXPECTED_BASE" \
+  P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_LIVE_BASE="$P4B_EXPECTED_BASE" \
   P4B_FAKE_LIVE_PAIR_COUNT="$WORK/base-fence-success.count" \
-  bash "$ORCH" 14751 --repo o/r --author claude --head abc123 --expected-base-sha "$P4B_EXPECTED_BASE" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 14751 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --expected-base-sha "$P4B_EXPECTED_BASE" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ -s "$WRAPPER_LOG" ] && [ "$(cat "$WORK/base-fence-success.count")" -ge 2 ]; then
   pass "expected base fence allows a coherent matching head/base pair"
@@ -3261,9 +3279,9 @@ set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$BASE_MOVE_EARLY_ISSUES" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" \
-  P4B_WRAPPER_LOG="$BASE_MOVE_EARLY_WRAPPER" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_BASE="$P4B_EXPECTED_BASE" \
-  P4B_FAKE_LIVE_BASE2="$P4B_MOVED_BASE" P4B_FAKE_LIVE_BASE2_FROM=2 P4B_FAKE_LIVE_PAIR_COUNT="$WORK/base-fence-early.count" \
-  bash "$ORCH" 14752 --repo o/r --author claude --head abc123 --expected-base-sha "$P4B_EXPECTED_BASE" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_WRAPPER_LOG="$BASE_MOVE_EARLY_WRAPPER" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_LIVE_BASE="$P4B_EXPECTED_BASE" \
+  P4B_FAKE_LIVE_BASE2="$P4B_MOVED_BASE" P4B_FAKE_LIVE_BASE2_FROM=3 P4B_FAKE_LIVE_PAIR_COUNT="$WORK/base-fence-early.count" \
+  bash "$ORCH" 14752 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --expected-base-sha "$P4B_EXPECTED_BASE" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] \
    && printf '%s' "$out" | jq -r '.reason' | grep -q "PR base changed during review" \
@@ -3280,9 +3298,9 @@ set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$BASE_MOVE_LATE_ISSUES" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" \
-  P4B_WRAPPER_LOG="$BASE_MOVE_LATE_WRAPPER" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_BASE="$P4B_EXPECTED_BASE" \
-  P4B_FAKE_LIVE_BASE2="$P4B_MOVED_BASE" P4B_FAKE_LIVE_BASE2_FROM=3 P4B_FAKE_LIVE_PAIR_COUNT="$WORK/base-fence-late.count" \
-  bash "$ORCH" 14753 --repo o/r --author claude --head abc123 --expected-base-sha "$P4B_EXPECTED_BASE" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_WRAPPER_LOG="$BASE_MOVE_LATE_WRAPPER" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_LIVE_BASE="$P4B_EXPECTED_BASE" \
+  P4B_FAKE_LIVE_BASE2="$P4B_MOVED_BASE" P4B_FAKE_LIVE_BASE2_FROM=4 P4B_FAKE_LIVE_PAIR_COUNT="$WORK/base-fence-late.count" \
+  bash "$ORCH" 14753 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --expected-base-sha "$P4B_EXPECTED_BASE" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] \
    && printf '%s' "$out" | jq -r '.reason' | grep -q "PR base changed during review" \
@@ -3298,8 +3316,8 @@ for base_case in unreadable malformed; do
   esac
   set +e
   out="$(env PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
-    "${base_env[@]}" P4B_FAKE_LIVE_HEAD=abc123 \
-    bash "$ORCH" 14754 --repo o/r --author claude --head abc123 --expected-base-sha "$P4B_EXPECTED_BASE" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+    "${base_env[@]}" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    bash "$ORCH" 14754 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --expected-base-sha "$P4B_EXPECTED_BASE" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
   set -e
   if [ "$rc" = 3 ] && [ -z "$out" ]; then
     pass "expected base fence fails closed when the live pair is $base_case"
@@ -3308,7 +3326,7 @@ done
 
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
-  bash "$ORCH" 14756 --repo o/r --head abc123 --expected-base-sha '' --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 14756 --repo o/r --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --expected-base-sha '' --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 3 ] && [ -z "$out" ]; then
   pass "explicit empty expected-base argument fails validation instead of disabling the fence"
@@ -3316,35 +3334,32 @@ else fail "empty expected-base validation (rc=$rc, out=$out)"; fi
 
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
-  bash "$ORCH" 14757 --repo o/r --head abc123 --expected-base-sha 2>/dev/null)"; rc=$?
+  bash "$ORCH" 14757 --repo o/r --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --expected-base-sha 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 3 ] && [ -z "$out" ]; then
   pass "missing expected-base argument fails validation instead of a shell shift error"
 else fail "missing expected-base validation (rc=$rc, out=$out)"; fi
 
-# Existing callers pass no base, so even an unreadable pair fixture must not
-# add a new network dependency or change their approval behavior.
+# Every review now captures a coherent base/head pair, including callers
+# that omit the optional expected-base assertion. Unreadable input refuses.
 WRAPPER_LOG="$WORK/base-fence-absent-wrapper.log"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" \
-  P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_PAIR_FAIL=1 \
-  bash "$ORCH" 14755 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_LIVE_PAIR_FAIL=1 \
+  bash "$ORCH" 14755 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
-if [ "$rc" = 0 ] && [ -s "$WRAPPER_LOG" ]; then
-  pass "absent expected-base flag preserves the head-only approval path"
+if [ "$rc" = 3 ] && [ -z "$out" ] && [ ! -e "$WRAPPER_LOG" ]; then
+  pass "absent expected-base flag still requires coherent immutable input"
 else fail "absent expected-base compatibility (rc=$rc, out=$out)"; fi
 
 WRAPPER_LOG="$WORK/wrapper.log"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
-  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_FAKE_LIVE_HEAD=def456 \
-  bash "$ORCH" 127 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_FAKE_LIVE_HEAD=dddddddddddddddddddddddddddddddddddddddd \
+  bash "$ORCH" 127 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
-if [ "$rc" = 10 ] \
-   && [ "$(printf '%s' "$out" | jq -r '.infrastructure_error')" = "true" ] \
-   && printf '%s' "$out" | jq -r '.reason' | grep -q "head moved" \
-   && [ ! -e "$WRAPPER_LOG" ]; then
+if [ "$rc" = 3 ] && [ -z "$out" ] && [ ! -e "$WRAPPER_LOG" ]; then
   pass "live head drift before posting → authority stop, no review write"
 else fail "stale-head guard (rc=$rc, out=$out, wrapper_log=$(test -e "$WRAPPER_LOG" && cat "$WRAPPER_LOG" || true))"; fi
 
@@ -3357,8 +3372,8 @@ set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
   P4B_ISSUE_LOG="$NO_FINDINGS_DRIFT_LOG" P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" \
   P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$NO_FINDINGS_DRIFT_WRAPPER" \
-  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_HEAD2=def456 P4B_FAKE_LIVE_HEAD2_FROM=2 \
-  bash "$ORCH" 1271 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_LIVE_HEAD2=def456 P4B_FAKE_LIVE_HEAD2_FROM=2 \
+  bash "$ORCH" 1271 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] \
    && printf '%s' "$out" | jq -r '.reason' | grep -q "PR head changed during review" \
@@ -3373,15 +3388,15 @@ WRAPPER_BODY="$WORK/wrapper-success-body.md"
 WRAPPER_PAYLOAD="$WORK/wrapper-success-payload.json"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
-  OP_PREFLIGHT_REVIEWER_PAT=wrong-current-agent-token P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_WRAPPER_BODY="$WRAPPER_BODY" P4B_WRAPPER_PAYLOAD="$WRAPPER_PAYLOAD" P4B_FAKE_LIVE_HEAD=abc123 \
-  bash "$ORCH" 129 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  OP_PREFLIGHT_REVIEWER_PAT=wrong-current-agent-token P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_WRAPPER_BODY="$WRAPPER_BODY" P4B_WRAPPER_PAYLOAD="$WRAPPER_PAYLOAD" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  bash "$ORCH" 129 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] \
    && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = "true" ] \
    && grep -q -- "api repos/o/r/pulls/129/reviews --method POST --input" "$WRAPPER_LOG" \
-   && jq -e '.commit_id == "abc123" and .event == "APPROVE"' "$WRAPPER_PAYLOAD" >/dev/null \
+   && jq -e '.commit_id == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" and .event == "APPROVE"' "$WRAPPER_PAYLOAD" >/dev/null \
    && grep -q -- "OP_PREFLIGHT_REVIEWER_PAT=$" "$WRAPPER_LOG" \
-   && grep -q -- "Reviewed head: \`abc123\`" "$WRAPPER_BODY" \
+   && grep -q -- "Reviewed head: \`aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\`" "$WRAPPER_BODY" \
    && grep -q -- "Reviewer identity: \`nathanpayne-codex\`" "$WRAPPER_BODY" \
    && grep -q -- "Adapter runs: \`1\`" "$WRAPPER_BODY" \
    && grep -q -- "Token usage: not exposed by adapter/CLI" "$WRAPPER_BODY" \
@@ -3394,10 +3409,10 @@ WRAPPER_BODY="$WORK/wrapper-mismatch-body.md"
 WRAPPER_PAYLOAD="$WORK/wrapper-mismatch-payload.json"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
-  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_WRAPPER_BODY="$WRAPPER_BODY" P4B_WRAPPER_PAYLOAD="$WRAPPER_PAYLOAD" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=def456 \
-  bash "$ORCH" 132 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_WRAPPER_BODY="$WRAPPER_BODY" P4B_WRAPPER_PAYLOAD="$WRAPPER_PAYLOAD" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=def456 \
+  bash "$ORCH" 132 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
-if [ "$rc" = 3 ] && jq -e '.commit_id == "abc123" and .event == "APPROVE"' "$WRAPPER_PAYLOAD" >/dev/null; then
+if [ "$rc" = 3 ] && jq -e '.commit_id == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" and .event == "APPROVE"' "$WRAPPER_PAYLOAD" >/dev/null; then
   pass "created review commit mismatch fails closed after pinned API post"
 else fail "created-review commit mismatch (rc=$rc, out=$out, payload=$(test -e "$WRAPPER_PAYLOAD" && cat "$WRAPPER_PAYLOAD" || true))"; fi
 
@@ -3406,14 +3421,14 @@ WRAPPER_BODY="$WORK/wrapper-usage-body.md"
 WRAPPER_PAYLOAD="$WORK/wrapper-usage-payload.json"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CLAUDE_BIN="$BIN/fake-claude-approve-usage" \
-  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_WRAPPER_BODY="$WRAPPER_BODY" P4B_WRAPPER_PAYLOAD="$WRAPPER_PAYLOAD" P4B_FAKE_LIVE_HEAD=abc123 \
-  P4B_FAKE_PR_BODY_AGENT=codex bash "$ORCH" 130 --repo o/r --author codex --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_WRAPPER_BODY="$WRAPPER_BODY" P4B_WRAPPER_PAYLOAD="$WRAPPER_PAYLOAD" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  P4B_FAKE_PR_BODY_AGENT=codex bash "$ORCH" 130 --repo o/r --author codex --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] \
    && [ "$(printf '%s' "$out" | jq -r '.token_count')" = "150" ] \
    && [ "$(printf '%s' "$out" | jq -r '.usage_source')" = "claude-json-envelope" ] \
    && [ "$(printf '%s' "$out" | jq -r 'has("validated_verdict")')" = "false" ] \
-   && jq -e '.commit_id == "abc123" and .event == "APPROVE"' "$WRAPPER_PAYLOAD" >/dev/null \
+   && jq -e '.commit_id == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" and .event == "APPROVE"' "$WRAPPER_PAYLOAD" >/dev/null \
    && grep -q -- "Reviewer identity: \`nathanpayne-claude\`" "$WRAPPER_BODY" \
    && grep -q -- "Token usage: \`150\` tokens (source: \`claude-json-envelope\`)" "$WRAPPER_BODY"; then
   pass "posted approval retains token usage and omits dry-run-only verdict data"
@@ -3422,7 +3437,7 @@ else fail "success review token usage (rc=$rc, out=$out, log=$(test -e "$WRAPPER
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-sleep" \
   P4B_ADAPTER_TIMEOUT_SECONDS=1 P4B_REVIEW_CLI_TIMEOUT_SECONDS=0 \
-  bash "$ORCH" 128 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  bash "$ORCH" 128 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] \
    && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = "true" ] \
@@ -3433,7 +3448,7 @@ else fail "orchestrator adapter timeout (rc=$rc): $out"; fi
 # Forced reviewer override must still preserve the cross-agent invariant.
 set +e
 MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
-  P4B_FAKE_PR_BODY_AGENT=codex bash "$ORCH" 133 --repo o/r --author codex --reviewer nathanpayne-codex --head abc123 --diff-file "$DIFF" --dry-run >/dev/null 2>&1; rc=$?
+  P4B_FAKE_PR_BODY_AGENT=codex bash "$ORCH" 133 --repo o/r --author codex --reviewer nathanpayne-codex --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run >/dev/null 2>&1; rc=$?
 set -e
 [ "$rc" = 3 ] && pass "forced reviewer matching author rejected with exit 3" \
   || fail "forced same-agent reviewer should exit 3 (got $rc)"
@@ -3441,7 +3456,7 @@ set -e
 # No adapter for the selected reviewer (cursor) → manual fallback, exit 4
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
-  bash "$ORCH" 126 --repo o/r --author claude --reviewer nathanpayne-cursor --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  bash "$ORCH" 126 --repo o/r --author claude --reviewer nathanpayne-cursor --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = "true" ]; then
   pass "unsupported reviewer (cursor, no adapter) → manual fallback (exit 4)"
@@ -3597,8 +3612,8 @@ echo "orchestrator — policy-driven timeout/effort (#589)"
 EFFORT_BODY="$WORK/orch-effort-body.md"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-te.yml" CODEX_BIN="$BIN/fake-codex-effort" \
-  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/orch-effort-wrapper.log" P4B_WRAPPER_BODY="$EFFORT_BODY" P4B_FAKE_LIVE_HEAD=abc123 \
-  bash "$ORCH" 140 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/orch-effort-wrapper.log" P4B_WRAPPER_BODY="$EFFORT_BODY" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  bash "$ORCH" 140 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] \
    && [ "$(printf '%s' "$out" | jq -r '.reviewer_effort')" = "high" ] \
@@ -3610,7 +3625,7 @@ else fail "orchestrator policy codex effort/timeout (rc=$rc, out=$out, body=$(te
 
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-te.yml" CLAUDE_BIN="$BIN/fake-claude-effort" \
-  P4B_FAKE_PR_BODY_AGENT=codex bash "$ORCH" 141 --repo o/r --author codex --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  P4B_FAKE_PR_BODY_AGENT=codex bash "$ORCH" 141 --repo o/r --author codex --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.reviewer_effort')" = "xhigh" ]; then
   pass "orchestrator resolves claude effort=xhigh from policy (author=codex → reviewer claude)"
@@ -3620,7 +3635,7 @@ else fail "orchestrator policy claude effort (rc=$rc, out=$out)"; fi
 # the policy-resolved outer bound fires deterministically on the 5s sleep.
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-te-t1.yml" P4B_REVIEW_CLI_TIMEOUT_SECONDS=0 CODEX_BIN="$BIN/fake-codex-sleep" \
-  bash "$ORCH" 142 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  bash "$ORCH" 142 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r '.reason')" = "adapter timed out after 1s" ]; then
   pass "orchestrator outer timeout is policy-driven (adapter_timeout_seconds=1 → exit 4)"
@@ -3628,13 +3643,13 @@ else fail "orchestrator policy timeout (rc=$rc, out=$out)"; fi
 
 set +e
 MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-te-bad-timeout.yml" CODEX_BIN="$BIN/fake-codex-approve" \
-  bash "$ORCH" 143 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run >/dev/null 2>&1; rc=$?
+  bash "$ORCH" 143 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run >/dev/null 2>&1; rc=$?
 set -e
 [ "$rc" = 3 ] && pass "orchestrator fails closed (exit 3) on invalid policy timeout" || fail "invalid policy timeout should exit 3 (got $rc)"
 
 set +e
 MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-te-bad-effort.yml" CODEX_BIN="$BIN/fake-codex-approve" \
-  bash "$ORCH" 144 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run >/dev/null 2>&1; rc=$?
+  bash "$ORCH" 144 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run >/dev/null 2>&1; rc=$?
 set -e
 [ "$rc" = 3 ] && pass "orchestrator fails closed (exit 3) on invalid policy effort" || fail "invalid policy effort should exit 3 (got $rc)"
 
@@ -3737,7 +3752,7 @@ mk_fake fake-codex-sleep2 \
 printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"ok\",\"findings\":[]}'"
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-te-t1.yml" P4B_ADAPTER_TIMEOUT_SECONDS=5 CODEX_BIN="$BIN/fake-codex-sleep2" \
-  bash "$ORCH" 150 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  bash "$ORCH" 150 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.adapter_timeout_seconds')" = "5" ]; then
   pass "P4B_ADAPTER_TIMEOUT_SECONDS override reaches the adapter inner timeout (2s CLI survives policy=1s)"
@@ -3747,7 +3762,7 @@ else fail "timeout override propagation (rc=$rc, out=$out)"; fi
 # recorded reviewer_effort must reflect the override, not the policy (#598 P3).
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-te.yml" P4B_CODEX_EFFORT=low CODEX_BIN="$BIN/fake-codex-effort" \
-  bash "$ORCH" 151 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  bash "$ORCH" 151 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.reviewer_effort')" = "low" ]; then
   pass "orchestrator records the effective effort override (low), not policy (high)"
@@ -3842,15 +3857,15 @@ else
 fi
 
 # Terminality. Only reported / will-not-report may open a barrier.
-_cr() { p4b_barrier_class_coderabbit abc123 "$1" "$2"; }
+_cr() { p4b_barrier_class_coderabbit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "$1" "$2"; }
 bad=""
-[ "$(_cr 0 '{"head_sha":"abc123"}')" = reported ]        || bad="$bad rc0-match"
+[ "$(_cr 0 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}')" = reported ]        || bad="$bad rc0-match"
 # rc 2 is NOT a report. In --probe mode it is the one verdict the probe makes:
 # a blocking marker carried solely by the PR-level summary, which #823 emits
 # precisely because no required gate dispositions that class. The barrier is
 # the only reader of that signal, so it escalates to a human rather than
 # opening and letting an approval post over it (Codex P1 on #842).
-[ "$(_cr 2 '{"head_sha":"abc123"}')" = escalate ]        || bad="$bad rc2-summary-only"
+[ "$(_cr 2 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}')" = escalate ]        || bad="$bad rc2-summary-only"
 [ "$(_cr 2 '{"head_sha":"stale99"}')" = escalate ]       || bad="$bad rc2-stale"
 # A terminal rc anchored on an OLDER head is a stale clearance — the #794 shape.
 [ "$(_cr 0 '{"head_sha":"old999"}')" = not-yet ]         || bad="$bad rc0-stale"
@@ -3878,11 +3893,11 @@ bad=""
 # the summary publication while coderabbitai[bot] had two COMMENTED reviews
 # on the exact head and a per-SHA success postdating them, and the barrier
 # held not-yet until it escalated.
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"awaiting-summary","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = reported ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"awaiting-summary","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = reported ] \
                                                          || bad="$bad rc7-review-object-ctx"
 # At-or-after is inclusive: a status refreshed the same second as the
 # object still corroborates it.
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"awaiting-summary","context_state":"success","context_updated_at":"2026-06-04T00:00:06Z"}}')" = reported ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"awaiting-summary","context_state":"success","context_updated_at":"2026-06-04T00:00:06Z"}}')" = reported ] \
                                                          || bad="$bad rc7-review-object-eqctx"
 # Observed-state precedence (P1 round 3 on #875): an ACTIVE adverse state
 # named by the probe — a pending rate-limit / pause / in-progress notice
@@ -3895,15 +3910,15 @@ bad=""
 # It still does not OPEN — which is all the #875 precedence rule ever
 # asserted — but it now carries its own class, because a refusal and a delay
 # need different handling and only the composer can choose between them.
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"rate_limit","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = rate-limited ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"rate_limit","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = rate-limited ] \
                                                          || bad="$bad rc7-observed-ratelimit"
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"paused","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"paused","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-observed-paused"
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"in_progress","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"in_progress","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-observed-inprogress"
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-observed-missing"
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"someday-new-state","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"someday-new-state","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-observed-unmodelled"
 # A BARE just-posted review object must NOT open the barrier (P1 on #875):
 # the PR-level summary still in flight can carry the ONLY blocking marker
@@ -3911,28 +3926,28 @@ bad=""
 # returns rc 7 observed=awaiting-summary for that state on purpose. Missing
 # context_state — including the trust-opted-out null — and every
 # non-success state stay not-yet.
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-bare"
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"awaiting-summary","context_state":null,"context_updated_at":null}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"awaiting-summary","context_state":null,"context_updated_at":null}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-nullctx"
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"missing","context_updated_at":null}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"missing","context_updated_at":null}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-missingctx"
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"pending","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"pending","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-pendingctx"
 # The same-SHA rerun shape (#875 round 2): a success whose refresh time
 # PREDATES the review object belongs to the PREVIOUS run against this sha —
 # the new object's summary and status refresh are still pending, so the
 # stale success must not open the barrier past them.
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:00Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:00Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-stalectx"
 # Either half of the correlation missing, or unparseable, fails closed —
 # an old probe emission (no submitted_at / no context_updated_at) keeps
 # the pre-#869 bounded wait.
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-nosubmitted"
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success"}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-noctxat"
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"not-a-date"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"not-a-date"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-badts"
 # Stale-head evidence must not clear even fully corroborated — the same
 # #794 posture as rc 0.
@@ -3941,11 +3956,11 @@ bad=""
 # "issues" evidence on rc 7 is a pending notice or a prior-head summary,
 # never head-anchored terminality — a correlated context success cannot
 # upgrade it.
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9982,"endpoint":"issues","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9982,"endpoint":"issues","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-issues-evidence"
 # The channel is probe-only: a polling timeout (rc 4) never carries
 # review-object evidence, and unmodelled shapes must not open the barrier.
-[ "$(_cr 4 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 4 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc4-no-channel"
 # rc 5 is only an escalation when the #489 failover did NOT engage. When it
 # did, AGENTS.md step 5 makes the stall a non-blocking note and the Codex arm
@@ -3965,7 +3980,7 @@ bad=""
 #    rate_limit (should_trigger declines) nor reach the polling retry from
 #    --probe, so the bounded wait it used to buy could not be satisfied by
 #    anything the run was allowed to do.
-[ "$(_cr 7 '{"head_sha":"abc123","probe":{"observed":"rate_limit"}}')" = rate-limited ] \
+[ "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","probe":{"observed":"rate_limit"}}')" = rate-limited ] \
                                                          || bad="$bad rc7-ratelimit-bare"
 # 2. NOT head-anchored, unlike the `reported` conjunction. A rate limit is
 #    provider-level state, the same shape as a pause; head identity is the
@@ -3978,12 +3993,12 @@ bad=""
 # 3. It never opens the barrier on its own. `rate-limited` is not in the
 #    reported / will-not-report / waived family, so the composition below is
 #    the only thing that can turn it into an `open`.
-case "$(_cr 7 '{"head_sha":"abc123","probe":{"observed":"rate_limit"}}')" in
+case "$(_cr 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","probe":{"observed":"rate_limit"}}')" in
   reported|will-not-report|waived) bad="$bad rc7-ratelimit-opens" ;;
 esac
 # The class is probe-shaped and must not leak into the polling rcs, whose own
 # rate-limit contract (rc 5) is unchanged and asserted above.
-[ "$(_cr 4 '{"head_sha":"abc123","probe":{"observed":"rate_limit"}}')" = not-yet ] \
+[ "$(_cr 4 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","probe":{"observed":"rate_limit"}}')" = not-yet ] \
                                                          || bad="$bad rc4-ratelimit-leak"
 [ "$(p4b_barrier_class_codex 0)" = reported ]            || bad="$bad codex0"
 [ "$(p4b_barrier_class_codex 1)" = not-yet ]             || bad="$bad codex1"
@@ -4335,7 +4350,7 @@ case "$endpoint" in
       emit "{\"tree\":[{\"path\":\"README.md\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"r\"},{\"path\":\".coderabbit.yml\",\"mode\":\"$mode\",\"type\":\"blob\",\"sha\":\"$blob\"}]}"
     fi ;;
   repos/owner/repo/pulls/7|repos/o/r/pulls/814)
-    head_sha=${P4B_TEST_LIVE_HEAD:-abc123}
+    head_sha=${P4B_TEST_LIVE_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}
     if [ -n "${P4B_TEST_HEAD_RACE_FILE:-}" ]; then
       hn=$(cat "$P4B_TEST_HEAD_RACE_FILE" 2>/dev/null || printf 0)
       hn=$((hn + 1)); printf '%s\n' "$hn" >"$P4B_TEST_HEAD_RACE_FILE"
@@ -4448,7 +4463,7 @@ _barrier() { # <cx_rc> <cr_rc> <cr_json> [policy] [head]
     export P4B_TEST_CODEX_RECHECK_MARKER="${P4B_TEST_CODEX_RECHECK_MARKER:-$WORK/codex-recheck.marker}"
     export P4B_CODERABBIT_WAIT="$WORK/stub-cr.sh"
     export P4B_RESOLVE_BASE_POLICY="$WORK/barrier-bin/resolve-policy"
-    export P4B_TEST_COMMENTS_JSON="${P4B_TEST_COMMENTS_JSON-[]}" P4B_TEST_LIVE_HEAD="${P4B_TEST_LIVE_HEAD:-${5:-abc123}}"
+    export P4B_TEST_COMMENTS_JSON="${P4B_TEST_COMMENTS_JSON-[]}" P4B_TEST_LIVE_HEAD="${P4B_TEST_LIVE_HEAD:-${5:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}"
     export P4B_TEST_COMMENTS_FAIL="${P4B_TEST_COMMENTS_FAIL:-false}"
     export P4B_TEST_COMMENTS_RACE_FILE="${P4B_TEST_COMMENTS_RACE_FILE:-}" P4B_TEST_COMMENTS_FAIL_AFTER="${P4B_TEST_COMMENTS_FAIL_AFTER:-999}"
     export P4B_TEST_COMMENTS_CHANGE_AFTER="${P4B_TEST_COMMENTS_CHANGE_AFTER:-999}" P4B_TEST_COMMENTS_JSON_AFTER="${P4B_TEST_COMMENTS_JSON_AFTER:-}"
@@ -4460,7 +4475,7 @@ _barrier() { # <cx_rc> <cr_rc> <cr_json> [policy] [head]
     export P4B_TEST_HEAD_RACE_FILE="${P4B_TEST_HEAD_RACE_FILE:-}" P4B_TEST_HEAD_RACE_AFTER="${P4B_TEST_HEAD_RACE_AFTER:-1}" P4B_TEST_LIVE_HEAD_AFTER="${P4B_TEST_LIVE_HEAD_AFTER:-def456}"
     export P4B_TEST_BASE_POLICY_PATH="${P4B_TEST_BASE_POLICY_PATH-}"
     export PATH="$WORK/barrier-bin:$PATH"
-    p4b_same_head_barrier owner/repo 7 "${5:-abc123}" rev-bot true "${6:-all}"
+    p4b_same_head_barrier owner/repo 7 "${5:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" rev-bot true "${6:-all}"
   )
 }
 
@@ -4480,13 +4495,13 @@ codex:
 EOF
 
 bad=""
-out="$(_barrier 0 0 '{"head_sha":"abc123"}')" && rc=0 || rc=$?
+out="$(_barrier 0 0 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}')" && rc=0 || rc=$?
 [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = open ] || bad="$bad both-reported"
 # The marker must be gone once the barrier opens, so a later not-yet on the
 # same head starts a fresh budget instead of inheriting this wait.
-[ ! -f "$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-abc123.pending" ] || bad="$bad open-left-marker"
+[ ! -f "$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pending" ] || bad="$bad open-left-marker"
 
-out="$(_barrier 1 0 '{"head_sha":"abc123"}')" && rc=0 || rc=$?
+out="$(_barrier 1 0 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}')" && rc=0 || rc=$?
 [ "$rc" = 1 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = pending ] || bad="$bad codex-notyet"
 [ "$(printf '%s' "$out" | jq -r .retry_after)" = 100 ] || bad="$bad retry-after"
 
@@ -5179,7 +5194,7 @@ bad=""
 [ "$(p4b_barrier_class_codex 0)" = reported ] || bad="$bad rc0"
 [ "$(p4b_barrier_class_codex 3)" = escalate ] || bad="$bad rc3"
 # End to end: a blocked Codex opens the barrier so the adapter can run.
-out="$(_barrier 2 0 '{"head_sha":"abc123"}')" && rc=0 || rc=$?
+out="$(_barrier 2 0 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}')" && rc=0 || rc=$?
 [ "$rc" = 0 ] || bad="$bad blocked-codex-held"
 printf '%s' "$out" | jq -e '.codex == "waived"' >/dev/null 2>&1 || bad="$bad blocked-codex-class"
 # ...but only where a Phase 4b APPROVED can actually clear gate (c). With the
@@ -5194,7 +5209,7 @@ codex:
   enabled: true
   allow_phase_4b_substitute: false
 EOF
-out="$(_barrier 2 0 '{"head_sha":"abc123"}' "$WORK/policy-nosub.yml")" && rc=0 || rc=$?
+out="$(_barrier 2 0 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' "$WORK/policy-nosub.yml")" && rc=0 || rc=$?
 [ "$rc" = 2 ] || bad="$bad nosub-not-escalated"
 printf '%s' "$out" | jq -e '.reason | test("allow_phase_4b_substitute")' >/dev/null 2>&1 \
   || bad="$bad nosub-reason"
@@ -5210,7 +5225,7 @@ fi
 # that nothing asserted before — the issue's acceptance criteria 1-3 as
 # BEHAVIOUR rather than as classifier arithmetic.
 bad=""
-_marker="$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-abc123.pending"
+_marker="$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pending"
 _cxlog="$WORK/stub-cx-invocation.log"
 
 # A recording stub for the Codex delegate: same exit code, plus its argv and
@@ -5235,7 +5250,7 @@ EOF
     export P4B_CODERABBIT_WAIT="$WORK/stub-cr.sh"
     export P4B_RESOLVE_BASE_POLICY="$WORK/barrier-bin/resolve-policy"
     export PATH="$WORK/barrier-bin:$PATH"
-    p4b_same_head_barrier owner/repo 7 abc123 rev-bot true
+    p4b_same_head_barrier owner/repo 7 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa rev-bot true
   )
 }
 
@@ -5245,7 +5260,7 @@ EOF
 #    contract; if the barrier stopped passing the flag, the delegate would
 #    answer 1 for a blocked account and the budget burn would silently return.
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
-out="$(_barrier_recording_cx 2 0 '{"head_sha":"abc123"}')" && rc=0 || rc=$?
+out="$(_barrier_recording_cx 2 0 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}')" && rc=0 || rc=$?
 grep -q -- '--diagnostic-signal-only' "$_cxlog" || bad="$bad no-diagnostic-flag"
 grep -q 'argv=.*--diagnostic-signal-only 7 owner/repo' "$_cxlog" || bad="$bad wrong-argv"
 grep -q 'skip_ci=1 require_approval=1 allow_sub=false' "$_cxlog" || bad="$bad missing-overrides"
@@ -5261,7 +5276,7 @@ grep -q 'skip_ci=1 require_approval=1 allow_sub=false' "$_cxlog" || bad="$bad mi
 #    "waive everything", which would let Phase 4b approve ahead of a Codex
 #    round that simply had not landed yet.
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
-out="$(_barrier_recording_cx 1 0 '{"head_sha":"abc123"}')" && rc=0 || rc=$?
+out="$(_barrier_recording_cx 1 0 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}')" && rc=0 || rc=$?
 [ "$rc" = 1 ] || bad="$bad absent-signal-not-pending"
 [ "$(printf '%s' "$out" | jq -r .codex)" = "not-yet" ] || bad="$bad absent-signal-class"
 [ -f "$_marker" ] || bad="$bad absent-signal-no-marker"
@@ -5309,8 +5324,8 @@ fi
 # head under review — and varies only the Codex delegate's exit code, because
 # that is the whole decision.
 bad=""
-_ratelimited='{"head_sha":"abc123","probe":{"observed":"rate_limit"}}'
-_marker="$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-abc123.pending"
+_ratelimited='{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","probe":{"observed":"rate_limit"}}'
+_marker="$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pending"
 
 # 1. Codex reported on this head ⇒ OPEN. The barrier's guarantee is that some
 #    provider has read the head about to be approved, and Codex reporting is
@@ -5376,7 +5391,7 @@ rm -rf "$WORK/barrier-state/phase-4b-barrier"
 #    a review that was seconds from landing.
 for _o in none in_progress paused awaiting-summary summary-without-head-review; do
   rm -rf "$WORK/barrier-state/phase-4b-barrier"
-  out="$(_barrier 0 7 "{\"head_sha\":\"abc123\",\"probe\":{\"observed\":\"$_o\"}}")" && rc=0 || rc=$?
+  out="$(_barrier 0 7 "{\"head_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"probe\":{\"observed\":\"$_o\"}}")" && rc=0 || rc=$?
   [ "$rc" = 1 ] || bad="$bad slow-$_o-not-pending"
   printf '%s' "$out" | jq -e '.coderabbit == "not-yet"' >/dev/null 2>&1 || bad="$bad slow-$_o-class"
   [ -f "$_marker" ] || bad="$bad slow-$_o-no-marker"
@@ -5590,7 +5605,7 @@ fi
 _L=2222222222222222222222222222222222222222
 cat >"$WORK/stub-cr-carried.sh" <<EOF
 #!/bin/sh
-printf '{"head_sha":"abc123","probe":{"mode":true,"observed":"none","carryforward":{"reviewed_head":"$_L","head_context_state":"success","head_context_permits_clearance":true}}}'
+printf '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","probe":{"mode":true,"observed":"none","carryforward":{"reviewed_head":"$_L","head_context_state":"success","head_context_permits_clearance":true}}}'
 exit 7
 EOF
 mkdir -p "$WORK/cf-bin"
@@ -5619,14 +5634,14 @@ WRAPPER_PAYLOAD="$WORK/wrapper-carried-payload.json"
 set +e
 out="$(env PATH="$WORK/cf-bin:$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
   P4B_CODERABBIT_WAIT="$WORK/stub-cr-carried.sh" P4B_EXTERNAL_REVIEW_FINGERPRINT="$WORK/stub-fp.sh" \
-  P4B_TEST_FP_LOG="$WORK/stub-fp-e2e.log" P4B_TEST_FP_abc123=external-review:v2:same "P4B_TEST_FP_$_L=external-review:v2:same" \
-  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_WRAPPER_BODY="$WRAPPER_BODY" P4B_WRAPPER_PAYLOAD="$WRAPPER_PAYLOAD" P4B_FAKE_LIVE_HEAD=abc123 \
-  bash "$ORCH" 1335 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>"$WORK/carried-e2e.err")"; rc=$?
+  P4B_TEST_FP_LOG="$WORK/stub-fp-e2e.log" P4B_TEST_FP_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=external-review:v2:same "P4B_TEST_FP_$_L=external-review:v2:same" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_WRAPPER_BODY="$WRAPPER_BODY" P4B_WRAPPER_PAYLOAD="$WRAPPER_PAYLOAD" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  bash "$ORCH" 1335 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>"$WORK/carried-e2e.err")"; rc=$?
 set -e
 if [ "$rc" = 0 ] \
-   && jq -e '.commit_id == "abc123" and .event == "APPROVE"' "$WRAPPER_PAYLOAD" >/dev/null 2>&1 \
+   && jq -e '.commit_id == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" and .event == "APPROVE"' "$WRAPPER_PAYLOAD" >/dev/null 2>&1 \
    && grep -qF -- "its review of \`$_L\` carries forward because the external-review fingerprint is unchanged (\`external-review:v2:same\`) (#1335)" "$WRAPPER_BODY" \
-   && grep -qF -- "CodeRabbit did not re-review abc123" "$WORK/carried-e2e.err" \
+   && grep -qF -- "CodeRabbit did not re-review aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$WORK/carried-e2e.err" \
    && ! grep -q -- "rate limited" "$WRAPPER_BODY"; then
   pass "#1335: an approval over a carried CodeRabbit records the source commit and fingerprint in its Review Metadata"
 else fail "#1335 carried-approval metadata (rc=$rc, out=$out, body=$(test -e "$WRAPPER_BODY" && cat "$WRAPPER_BODY" || true), err=$(tail -20 "$WORK/carried-e2e.err" 2>/dev/null || true))"; fi
@@ -5650,7 +5665,7 @@ chmod +x "$WORK/barrier-bin/fake-reviewer2"
   export MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-botlogin.yml"
   export P4B_ACCT_STATE_DIR="$WORK/barrier-state"
   export P4B_GH_AS_REVIEWER="$WORK/barrier-bin/fake-reviewer2"
-  p4b_barrier_post_trigger o/r 7 abc123 rev-bot
+  p4b_barrier_post_trigger o/r 7 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa rev-bot
 ) >/dev/null 2>&1 || true
 if grep -q '^@my-rabbit review' "$WORK/trigger-argv.log" \
    && ! grep -q '@coderabbitai' "$WORK/trigger-argv.log"; then
@@ -5662,8 +5677,8 @@ fi
 # The bound is what turns an indefinite wait into a human handoff.
 mkdir -p "$WORK/barrier-state/phase-4b-barrier"
 printf '%s\n' "$(( $(date +%s) - 500 ))" \
-  >"$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-abc123.pending"
-out="$(_barrier 1 0 '{"head_sha":"abc123"}')" && rc=0 || rc=$?
+  >"$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pending"
+out="$(_barrier 1 0 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}')" && rc=0 || rc=$?
 if [ "$rc" = 2 ] && printf '%s' "$out" | jq -e '.reason | test("within 100s")' >/dev/null; then
   pass "#814: an exhausted bound escalates to a human instead of holding forever"
 else
@@ -5676,7 +5691,7 @@ fi
 # because AGENTS.md, REVIEW_POLICY.md and wave-audit.sh all read 4 as a
 # reviewer that will not answer — and wave-audit proceeds fail-open on it.
 # Codex reports not-yet here; the CodeRabbit stub installed at the top of this
-# file still reports on abc123.
+# file still reports on aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.
 printf '#!/bin/sh\nexit 1\n' >"$WORK/stub-cx-notyet.sh"
 printf '#!/bin/sh\necho "REGRESSION: reviewer wrapper invoked from the hold path" >&2\nexit 9\n' \
   >"$WORK/stub-rev-guard.sh"
@@ -5694,7 +5709,7 @@ out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
   P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
   P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" \
   PATH="$WORK/barrier-bin:$PATH" \
-  bash "$ORCH" 814 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 814 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 6 ] \
    && [ "$(printf '%s' "$out" | jq -r '.barrier_pending')" = "true" ] \
@@ -6421,7 +6436,7 @@ if [ "\${1:-}" = api ] && [ "\${2:-}" = repos/o/r/pulls/131 ]; then
         if [ -n "\${P4B_FAKE_TUPLE_FILE:-}" ] && [ -r "\$P4B_FAKE_TUPLE_FILE" ]; then
           cat "\$P4B_FAKE_TUPLE_FILE"
         else
-          jq -nc --arg h "\${P4B_FAKE_LIVE_HEAD:-abc123}" \
+          jq -nc --arg h "\${P4B_FAKE_LIVE_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
             '{head_sha:\$h,base_ref:"main",base_sha:"3333333333333333333333333333333333333333",default_branch:"main"}'
         fi
         exit 0
@@ -6978,7 +6993,7 @@ printf '#!/bin/sh\necho "REGRESSION: attempted a live trigger post" >&2\nexit 9\
 chmod +x "$WORK/barrier-bin/fake-reviewer"
 res="$(P4B_ACCT_STATE_DIR="$WORK/barrier-state" PATH="$WORK/barrier-bin:$PATH" \
   P4B_GH_AS_REVIEWER="$WORK/barrier-bin/fake-reviewer" \
-  p4b_barrier_maybe_trigger o/r 7 abc123 rev-bot '{"probe":{"observed":"none"}}' false 2>/dev/null)"
+  p4b_barrier_maybe_trigger o/r 7 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa rev-bot '{"probe":{"observed":"none"}}' false 2>/dev/null)"
 printf '#!/bin/sh\necho "[]"\n' >"$WORK/barrier-bin/gh"
 if [ "$res" = "trigger-read-failed" ]; then
   pass "#814: a failed comments read declines to trigger rather than reading as 'never triggered'"
@@ -7613,20 +7628,20 @@ cat >"$WORK/barrier-bin/gh" <<'EOF'
 #!/bin/sh
 if [ "${1:-}" = api ] && [ "${2:-}" = repos/owner/repo/pulls/7 ]; then
   for prev in "$@"; do
-    [ "${want_jq:-false}" = true ] && { printf '{"head":{"sha":"abc123"}}' | jq -r "$prev"; exit; }
+    [ "${want_jq:-false}" = true ] && { printf '{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}' | jq -r "$prev"; exit; }
     [ "$prev" = --jq ] && want_jq=true
   done
-  printf '{"head":{"sha":"abc123"}}\n'; exit
+  printf '{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}\n'; exit
 fi
 printf '[]\n'
 EOF
 chmod +x "$WORK/barrier-bin/gh"
 bad=""
-out="$(_barrier 0 7 '{"head_sha":"abc123","probe":{"observed":"paused"},"review":{"id":771}}')" && rc=0 || rc=$?
+out="$(_barrier 0 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","probe":{"observed":"paused"},"review":{"id":771}}')" && rc=0 || rc=$?
 [ "$rc" = 1 ] || bad="$bad paused-rc"
 printf '%s' "$out" | jq -e '.resume == "would-resume"' >/dev/null 2>&1 || bad="$bad paused-resume-field"
 printf '%s' "$out" | jq -e '.trigger == "declined"' >/dev/null 2>&1 || bad="$bad paused-trigger"
-out="$(_barrier 0 7 '{"head_sha":"abc123","probe":{"observed":"none"}}')" && rc=0 || rc=$?
+out="$(_barrier 0 7 '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","probe":{"observed":"none"}}')" && rc=0 || rc=$?
 printf '%s' "$out" | jq -e '.resume == "skipped"' >/dev/null 2>&1 || bad="$bad none-resume-field"
 if [ -z "$bad" ]; then
   pass "#847: the barrier surfaces resume in its JSON and still declines the trigger on paused"

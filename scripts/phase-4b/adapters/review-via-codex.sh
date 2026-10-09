@@ -73,11 +73,13 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib.sh
 . "$HERE/../lib.sh"
+# shellcheck source=../immutable-input.sh
+. "$HERE/../immutable-input.sh"
 
 SCHEMA="$HERE/../verdict.schema.json"
 CODEX_BIN="${CODEX_BIN:-codex}"
 
-PR="" ; REPO="" ; HEAD="" ; DIFF_FILE="" ; MODEL="${P4B_CODEX_MODEL:-}"
+PR="" ; REPO="" ; HEAD="" ; DIFF_FILE="" ; INPUT_METADATA="" ; MODEL="${P4B_CODEX_MODEL:-}"
 SANDBOX=read-only
 CLI_TIMEOUT="${P4B_REVIEW_CLI_TIMEOUT_SECONDS:-${P4B_ADAPTER_TIMEOUT_SECONDS:-900}}"
 # Reasoning effort (#589). Empty ⇒ omit the flag and use the Codex CLI default
@@ -97,6 +99,7 @@ while [ $# -gt 0 ]; do
     --repo)      REPO="${2:-}"; shift 2 ;;
     --head)      HEAD="${2:-}"; shift 2 ;;
     --diff-file) DIFF_FILE="${2:-}"; shift 2 ;;
+    --input-metadata) INPUT_METADATA="${2:-}"; shift 2 ;;
     --model)     MODEL="${2:-}"; shift 2 ;;
     -h|--help)   usage ;;
     *) echo "review-via-codex.sh: unknown arg: $1" >&2; usage ;;
@@ -112,15 +115,11 @@ case "$EFFORT" in
 esac
 
 # --- obtain the diff -------------------------------------------------------
-DIFF=""
-if [ -n "$DIFF_FILE" ]; then
-  [ -r "$DIFF_FILE" ] || p4b_die 3 "diff file not readable: $DIFF_FILE"
-  DIFF="$(cat "$DIFF_FILE")"
-else
-  command -v gh >/dev/null 2>&1 || p4b_die 3 "gh is required to fetch the diff (or pass --diff-file)"
-  [ -n "$REPO" ] || p4b_die 2 "--repo is required when no --diff-file is given"
-  DIFF="$(gh pr diff "$PR" --repo "$REPO" 2>/dev/null)" || p4b_die 4 "failed to fetch PR diff via gh"
-fi
+# The orchestrator supplies an immutable object-derived diff. Standalone
+# reasoning must also provide explicit bytes; it never fetches a mutable PR.
+[ -n "$DIFF_FILE" ] && [ -r "$DIFF_FILE" ] && [ ! -L "$DIFF_FILE" ] \
+  || p4b_die 3 "an explicit regular --diff-file is required"
+DIFF="$(cat "$DIFF_FILE")"
 [ -n "$DIFF" ] || p4b_die 4 "empty diff — nothing to review"
 
 command -v "$CODEX_BIN" >/dev/null 2>&1 || p4b_die 3 "codex CLI not found on PATH (set CODEX_BIN)"
@@ -288,6 +287,8 @@ if CLI_VERSION_RAW="$(p4b_run_with_timeout 10 "${SAFE_ENV[@]}" "$CODEX_BIN" --ve
   esac
 fi
 
-printf '%s' "$VERDICT_JSON" | jq -c --argjson usage "$USAGE" --argjson cli_version "$CLI_VERSION_JSON" \
-  '. + {usage: $usage, cli_version: $cli_version}'
+VERDICT_JSON="$(printf '%s' "$VERDICT_JSON" | jq -c --argjson usage "$USAGE" --argjson cli_version "$CLI_VERSION_JSON" \
+  '. + {usage: $usage, cli_version: $cli_version}')"
+p4b_bind_input "$INPUT_METADATA" "$DIFF_FILE" "$DIFF_FIT" "$VERDICT_JSON" \
+  || p4b_die 4 "review input metadata does not match the supplied diff"
 exit 0

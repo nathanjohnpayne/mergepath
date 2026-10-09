@@ -35,11 +35,13 @@ REQUIRED_EXEC=(
   "scripts/phase-4b/adapters/review-via-codex.sh"
   "scripts/phase-4b/adapters/review-via-claude.sh"
   "scripts/phase-4b/collect-enablement-evidence.sh"
+  "scripts/phase-4b/immutable-input.sh"
 )
 REQUIRED_FILES=(
   "scripts/phase-4b/lib.sh"
   "scripts/phase-4b/heartbeat.sh"
   "tests/test_phase_4b_heartbeat.sh"
+  "tests/test_phase_4b_immutable_input.sh"
   "scripts/phase-4b/verdict.schema.json"
   "scripts/lib/codex-failure-markers.sh"
   "scripts/lib/gh-api-array.sh"
@@ -103,6 +105,8 @@ if command -v shellcheck >/dev/null 2>&1; then
       "$REPO_ROOT/scripts/phase-4b/collect-enablement-evidence.sh" \
       "$REPO_ROOT/tests/test_phase_4b_automation.sh" \
       "$REPO_ROOT/scripts/phase-4b/heartbeat.sh" \
+      "$REPO_ROOT/scripts/phase-4b/immutable-input.sh" \
+      "$REPO_ROOT/tests/test_phase_4b_immutable_input.sh" \
       "$REPO_ROOT/tests/test_phase_4b_heartbeat.sh"; then
     echo "FAIL: shellcheck reported warnings/errors in the phase-4b scripts"; FAILED=1
   fi
@@ -134,6 +138,7 @@ fi
 echo "check_phase_4b_automation: running $TEST"
 "$REPO_ROOT/$TEST"
 bash "$REPO_ROOT/$TEST" --heartbeat-only
+bash "$REPO_ROOT/tests/test_phase_4b_immutable_input.sh"
 
 echo "check_phase_4b_automation: PASS"
 exit 0

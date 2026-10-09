@@ -14,6 +14,7 @@ fail() { printf '  FAIL: %s\n' "$*" >&2; FAIL=$((FAIL + 1)); }
 . "$ROOT/scripts/phase-4b/heartbeat.sh"
 BIN="$WORK/bin"; mkdir -p "$BIN" "$WORK/adapters"
 HEAD_FIXTURE=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+export P4B_INPUT_HELPER="$ROOT/scripts/phase-4b/immutable-input.sh"
 export HB_HEAD="$HEAD_FIXTURE" HB_WORK="$WORK"
 export P4B_ADAPTER_DIR="$WORK/adapters" P4B_RESOLVE_BASE_POLICY="$BIN/resolve"
 export P4B_CODEX_REVIEW_CHECK="$BIN/codex-check" P4B_CODEX_LEDGER="$BIN/ledger"
@@ -63,6 +64,12 @@ set -eu
 printf '%s\n' "read:$*" >> "$HB_CASE/events"
 [ "$1" = api ] || exit 99
 shift
+if [ "$1" = --paginate ] && [ "${2:-}" = --slurp ] && [[ "${3:-}" = */timeline ]]; then
+  if [ -e "$HB_CASE/aba-swap" ]; then
+    printf '[[{"id":1,"event":"head_ref_force_pushed","created_at":"2026-08-01T00:00:01Z","commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"id":2,"event":"head_ref_force_pushed","created_at":"2026-08-01T00:00:02Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]]\n'
+  else printf '[[]]\n'; fi
+  exit 0
+fi
 if [ "$1" = --paginate ]; then
   case "$2" in
     */comments)
@@ -135,7 +142,7 @@ while [ $# -gt 0 ]; do
  if [ "$1" = --input ]; then cp "$2" "$HB_CASE/posted.json"; break; fi
  shift
 done
-jq -nc --arg h "$HB_HEAD" '{id:42,commit_id:$h}'
+jq -nc --arg h "$HB_HEAD" --slurpfile payload "$HB_CASE/posted.json" '{id:42,commit_id:$h,body:$payload[0].body}'
 EOF
 cat > "$BIN/handoff" <<'EOF'
 #!/usr/bin/env bash
@@ -151,12 +158,33 @@ printf 'adapter\n' >> "$HB_CASE/events"
 case "$HB_MODE" in
  timeout|killed) sleep 20 ;;
  moved-request) : > "$HB_CASE/new-request" ;;
+ aba) : > "$HB_CASE/aba-swap" ;;
 esac
 if [ "$HB_MODE" = changes ]; then
- printf '{"verdict":"CHANGES_REQUESTED","summary":"repair this","findings":[{"severity":"P1","path":"x.sh","line":1,"body":"wrong behavior"}],"usage":{"token_count":123,"input_tokens":null,"output_tokens":null,"cache_creation_input_tokens":null,"cache_read_input_tokens":null,"reasoning_tokens":null,"total_cost_usd":null,"source":"fixture"},"cli_version":null}\n'
+ verdict=$(printf '{"verdict":"CHANGES_REQUESTED","summary":"repair this","findings":[{"severity":"P1","path":"x.sh","line":1,"body":"wrong behavior"}],"usage":{"token_count":123,"input_tokens":null,"output_tokens":null,"cache_creation_input_tokens":null,"cache_read_input_tokens":null,"reasoning_tokens":null,"total_cost_usd":null,"source":"fixture"},"cli_version":null}\n')
 else
- printf '{"verdict":"APPROVED","summary":"looks good","findings":[],"usage":{"token_count":123,"input_tokens":null,"output_tokens":null,"cache_creation_input_tokens":null,"cache_read_input_tokens":null,"reasoning_tokens":null,"total_cost_usd":null,"source":"fixture"},"cli_version":null}\n'
+ verdict=$(printf '{"verdict":"APPROVED","summary":"looks good","findings":[],"usage":{"token_count":123,"input_tokens":null,"output_tokens":null,"cache_creation_input_tokens":null,"cache_read_input_tokens":null,"reasoning_tokens":null,"total_cost_usd":null,"source":"fixture"},"cli_version":null}\n')
 fi
+metadata=''; diff=''
+while [ "$#" -gt 0 ]; do
+ case "$1" in --input-metadata) metadata=$2; shift 2 ;; --diff-file) diff=$2; shift 2 ;; *) shift ;; esac
+done
+. "$P4B_INPUT_HELPER"
+p4b_bind_input "$metadata" "$diff" "$diff" "$verdict"
+EOF
+cat > "$BIN/git" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+for arg in "$@"; do
+ case "$arg" in
+  init) mkdir -p "${!#}"; exit 0 ;;
+  fetch) exit 0 ;;
+  rev-parse) value="${!#}"; printf '%s\n' "${value%\^\{commit\}}"; exit 0 ;;
+  merge-base) prev=''; for value in "$@"; do previous="$prev"; prev="$value"; done; printf '%s\n' "$previous"; exit 0 ;;
+  diff) cat "$HB_WORK/diff"; exit 0 ;;
+ esac
+done
+exit 99
 EOF
 chmod +x "$BIN"/* "$WORK/adapters"/*
 printf 'diff --git a/x.sh b/x.sh\n+true\n' > "$WORK/diff"
@@ -248,7 +276,7 @@ run_case() {
     .schema == "p4b-heartbeat/v1" and .stage == "done" and .exit_code == $rc
     and ([.stages[].stage]|join(",")) == $stages and .head == $h
     and (.run_id|test("^p4b-[0-9a-f]{32}$")) and .repo == "fixture/repo" and .pr == "1589"
-    and .adapter_timeout_seconds == (if $rc == 4 then 1 else 3 end)
+    and .adapter_timeout_seconds == (if $rc == 4 and .adapter_exit_code != 0 then 1 else 3 end)
     and (.stages|all(.stage_at_epoch != null and (.stage_at|length)>0))
     and .process_started_at != null and (.checkout|length)>0' "$record" >/dev/null 2>&1; then
     pass "$mode records reached stages and terminal identity"
@@ -286,6 +314,7 @@ run_case() {
 # storage. The latter is a regular file at the directory path (chmod is not a
 # faithful failure injection when CI runs as root).
 for storage in good blocked; do
+  run_case aba 4 'barrier,adapter,done' "$storage"
   run_case approve 0 barrier,adapter,posting,done "$storage"
   run_case changes 1 barrier,adapter,posting,done "$storage"
   run_case timeout 4 barrier,adapter,done "$storage"
@@ -297,10 +326,11 @@ done
 run_case moved-request 10 barrier,adapter,posting,done
 run_case late-feedback 7 barrier,adapter,posting,done
 run_case final-accounting-request 0 barrier,adapter,posting,done
-# Last authority/feedback read is still the final pre-POST accounting call.
-if [ "$(sed -n '/^post$/{x;p;};h' "$HB_CASE/events")" = feedback:3 ] \
+# Feedback remains the last request-budget read; the final transition
+# fence checks head history afterward without adopting another request.
+if [ "$(sed '/read:.*timeline/d' "$HB_CASE/events" | sed -n '/^post$/{x;p;};h')" = feedback:3 ] \
    && jq -er '.body' "$HB_CASE/posted.json" | grep -qxF '<!-- mergepath-p4b-request-generation: [1] -->'; then
-  pass 'late request remains outside original approval generation; feedback is last pre-POST read'
+  pass 'late request remains outside original approval generation; feedback remains the last request-budget read before the transition fence'
 else fail 'request-generation race/read order changed'; fi
 
 # Entropy failures preserve both the successful POST/accounting transaction
