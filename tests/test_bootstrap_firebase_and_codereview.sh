@@ -149,7 +149,7 @@ mkdir -p "$SHIM_DIR"
 : >"$SHIM_LOG"
 
 # Real tool symlinks (so coreutils + git + yq + rsync still resolve).
-for tool in bash yq git rsync sed awk grep mktemp tr cut tail head wc ls rm cat printf chmod find dirname basename mv mkdir; do
+for tool in bash yq git rsync sed awk grep mktemp tr cut tail head wc ls rm cat printf chmod find dirname basename mv mkdir python3; do
   src=$(command -v "$tool" 2>/dev/null || true)
   [ -n "$src" ] && ln -sf "$src" "$SHIM_DIR/$tool"
 done

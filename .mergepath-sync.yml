@@ -592,6 +592,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/workflow/verified-relay-markers.py"   # #1546, publisher-run provenance verification
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/lib/preflight-helpers.sh"
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
@@ -926,6 +927,8 @@ paths:
     # `--body-file` path with no Authoring-Agent or Self-Review check at all.
     # Declaring the contract libs here keeps the two halves inseparable.
     requires:
+      - "scripts/workflow/owner-admin-override.py"
+      - "scripts/lib/feedback-policy-helpers.sh"  # owner preflight parses the immutable base policy
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/identity-check.sh"         # gh-token-resolver.sh executes it before any write
       - "scripts/lib/gh-command-classifier.sh"  # shared guard/wrapper prefix vocabulary
@@ -1091,6 +1094,12 @@ paths:
   - path: tests/test_gh_pr_guard.sh
     type: canonical
     consumers: all
+  - path: tests/test_owner_admin_override.py
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/owner-admin-override.py"
+
   - path: tests/test_gh_as_author.sh
     type: canonical
     consumers: all
@@ -1953,6 +1962,8 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/workflow/owner-admin-override.py"
       - "scripts/workflow/record-merge-queue-authorization.sh"
       - "scripts/lib/merge-queue-protection.sh"
       - "scripts/lib/merge-queue-authorization.sh"
@@ -1977,6 +1988,8 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/workflow/owner-admin-override.py"
       - "scripts/workflow/record-merge-queue-final-audit.sh"
       - "scripts/lib/merge-queue-authorization.sh"
       - "scripts/lib/merge-queue-protection.sh"
@@ -1995,6 +2008,8 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/workflow/owner-admin-override.py"
       - "scripts/lib/merge-queue-authorization.sh"
       - "scripts/lib/merge-queue-protection.sh"
       - "scripts/lib/blocking-labels.sh"
@@ -2023,10 +2038,16 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/gh-retry-helpers.sh"
+  - path: tests/test_marker_provenance.py
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/"
   - path: .github/workflows/pr-audit.yml
     type: canonical
     consumers: all
     requires:
+      - "scripts/workflow/owner-admin-override.py"
       - "scripts/lib/pr-body-contract.mjs"  # weekly audit uses the canonical rendered-body parser
       - "scripts/workflow/resolve-codex-verdict-anchors.py"
   - path: .github/workflows/codex-p1-gate.yml
@@ -2037,6 +2058,7 @@ paths:
     # workflow without the script makes the gate fail-closed on
     # `command not found` for every PR in the consumer.
     requires:
+      - "scripts/workflow/verified-relay-markers.py"   # #1546, publisher-run provenance verification
       - ".github/workflows/codex-feedback-archive-relay.yml"   # #1000, privileged read-only fork/Dependabot archive persistence
       - "scripts/codex-p1-gate.sh"
       - "scripts/render-feedback-archive.sh"   # #1000, persist edited/deleted PR-level, inline, and review-body findings
@@ -2056,6 +2078,7 @@ paths:
     # feedback archival and the corresponding PR-head check. Its requires
     # edges keep the evaluator and surface fingerprint on the same wave.
     requires:
+      - "scripts/workflow/verified-relay-markers.py"   # #1546, publisher-run provenance verification
       - "scripts/codex-p1-gate.sh"
       - "scripts/review-feedback-surface-fingerprint.sh"
       - "scripts/workflow/feedback-archive-relay-source.sh"   # #1413, positive source-run/PR binding before every writer
@@ -2200,6 +2223,7 @@ paths:
     # closure gap that surfaced as #264 on the original propagation
     # wave (check_gh_as_author missing its tests on every consumer).
     requires:
+      - "scripts/workflow/owner-admin-override.py"
       - "scripts/lib/ci-check-modes.sh"          # shared --check/--self-test selector (#1062)
       - "scripts/lib/blocking-labels.sh"         # check_workflow_parsers shared exact-label predicate (#1062)
       - "scripts/lib/gh-command-classifier.sh"   # shared native/API mutation guard (#1058)
@@ -2229,6 +2253,7 @@ paths:
       - "tests/test_codex_p1_gate.sh"          # check_codex_p1_gate
       - "tests/test_codex_p1_workflow_runtime.sh"  # check_codex_p1_gate (#1230/#1434)
       - "tests/test_review_feedback_accounting.sh"  # check_review_feedback_accounting (#1000)
+      - "tests/test_marker_provenance.py"  # trusted marker evidence (#1546)
       - "scripts/review-feedback-accounting.sh"  # check_review_feedback_accounting (#1000)
       - "scripts/render-feedback-archive.sh"  # check_review_feedback_accounting (#1000)
       - "scripts/review-feedback-surface-fingerprint.sh"  # check_review_feedback_accounting (#1000)
@@ -2353,7 +2378,10 @@ paths:
     # helpers (parse_manifest_paths.sh, match_protected_paths.sh) are
     # already inside this kit; the two scripts/lib/ deps are declared here.
     requires:
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/workflow/owner-admin-override.py"
       - "scripts/lib/template-substitution.sh"   # verify-propagation-pr.sh templated render (#531)
+      - "scripts/lib/feedback-policy-helpers.sh" # verify-live-propagation.sh shared YAML parser (#1546)
       - "scripts/lib/manifest-fact-helpers.sh"   # verify-propagation-pr.sh consumer-facts load (#531)
       # external_review_fingerprint.sh + external_review_carryforward.sh (both
       # in this kit) hard-source it for their sha reads (#799). Those two

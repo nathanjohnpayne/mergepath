@@ -191,15 +191,15 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **R-77.** Path confinement alone never qualifies a PR for the lane; the byte-level comparison is the load-bearing criterion. ● — REVIEW_POLICY.md § Phase 3.5
 
-**R-78.** All lane trust inputs come from outside the PR's own checkout: config from the base commit, verifier and manifest and content from immutable public Mergepath at the declared commit. ● — REVIEW_POLICY.md § Phase 3.5
+**R-78.** All lane trust inputs come from outside the PR's own checkout: governing config and verifier from the trusted PR-base checkout, manifest and canonical content from immutable public Mergepath at the declared commit. ● — REVIEW_POLICY.md § Phase 3.5
 
 **R-79.** An enable flag must not live solely in a never-propagated file (hence the lane defaults ON when its block is absent). ○ — REVIEW_POLICY.md § Phase 3.5
 
 **R-80.** A lane PR is not un-reviewed: required CI, advisory review (on the canary), and an internal approval still apply; only the cross-agent external review is removed. ● — REVIEW_POLICY.md § Phase 3.5
 
-**R-81.** Lane clearance is re-derived from a matching v2 verified-head/verified-base marker for the live pair; legacy head-only markers and label events grant no exemption. ● — REVIEW_POLICY.md § Phase 3.5
+**R-81.** Lane clearance is re-derived by trusted live byte verification of the current head/base pair; marker comments and label events grant no exemption. ● — REVIEW_POLICY.md § Phase 3.5
 
-**R-82.** The wave audit fails closed unless the canary's live head/base pair is lane-verified by a matching v2 marker, and newly manifest-added paths are audited in full against the empty tree. ● — REVIEW_POLICY.md § Phase 3.5
+**R-82.** The wave audit fails closed unless the canary's live head/base pair passes trusted live byte verification, and newly manifest-added paths are audited in full against the empty tree. ● — REVIEW_POLICY.md § Phase 3.5
 
 **R-83.** On a wave-audit changes-requested, the fix lands at the source and the wave is re-cut — never patched in the mirror. ○ — REVIEW_POLICY.md § Phase 3.5
 
@@ -669,7 +669,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **G-93.** A canary failure stops the fan-out; investigation happens in that one PR. ○ — docs/agents/propagation-ordering.md
 
-**G-94.** The wave-audit helper refuses to dispatch unless the canary's live head/base pair carries a matching v2 lane marker. ● — docs/agents/propagation-ordering.md
+**G-94.** The wave-audit helper refuses to dispatch unless the canary's live head/base pair passes trusted live byte verification; markers are diagnostic only. ● — docs/agents/propagation-ordering.md
 
 **G-95.** The watermark advances only on a posted approval or a scope-empty range; an unavailable reviewer never advances it. ● — docs/agents/propagation-ordering.md
 

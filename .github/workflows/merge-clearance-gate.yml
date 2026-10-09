@@ -65,9 +65,9 @@ on:
   # trigger would never fire for the marker. Instead pr-review-policy.yml's
   # lane, right after posting a fresh marker, sends a repository_dispatch (PAT-
   # driven, best-effort) that DOES create a run. The dispatch only SCHEDULES a
-  # re-evaluation — the dispatch-recheck job below re-derives clearance from the
-  # (head/base-pinned, github-actions[bot]) marker via lane_verified(), never trusts
-  # the dispatch payload for clearance, and POSTs a check_run to the PR head
+  # re-evaluation — the dispatch-recheck job below re-derives clearance through
+  # live byte verification via lane_verified(), never trusts the marker or
+  # dispatch payload for clearance, and POSTs a check_run to the PR head
   # (like the sweep — a repository_dispatch run has no PR-head association).
   # Keep the event type `merge-clearance-recheck` in sync with the lane.
   repository_dispatch:
@@ -87,13 +87,12 @@ on:
 # as well, so that no two producers of this required context can carry
 # different verdicts on one head.
 #
-# `issues: read` is required (Codex P2 on PR #429): the gate reads
-# /issues/{pr}/comments for the propagation-lane marker, and the delegated
-# codex-review-check.sh reads /issues/{pr}/reactions for the Codex 👍
-# signal — both are ISSUES-scoped endpoints. On a restricted-default
+# `issues: read` is required (Codex P2 on PR #429): clearance and feedback
+# helpers read issue comments for anchored review verdicts and diagnostic
+# observations. Those are ISSUES-scoped endpoints. On a restricted-default
 # GITHUB_TOKEN (private repos) an omitted scope defaults to `none`, so
-# without this the required check would fail with an infra error (or miss
-# the propagation exemption) even when clearance exists.
+# without this the required check would fail with an infra error even when
+# clearance exists. Propagation exemptions require independent live byte proof.
 permissions:
   contents: read
   pull-requests: read
@@ -550,9 +549,9 @@ jobs:
     # issue comment, which creates no workflow run — so the lane nudges the
     # gate with a PAT-driven dispatch instead (best-effort; if it never
     # arrives, the */15 sweep still recovers the gate). This job does NOT
-    # trust the dispatch for clearance: it only re-runs
+    # trust the diagnostic marker or dispatch for clearance: it only re-runs
     # scripts/merge-clearance-gate.sh, which re-derives clearance from the
-    # (head/base-pinned, github-actions[bot]) marker via lane_verified() on the
+    # trusted live byte verification via lane_verified() on the
     # CURRENT head/base pair, then POSTs the honest result. A dispatch with any pr
     # payload can therefore only trigger an honest re-evaluation — never force
     # a pass — so no guard on the payload is needed beyond validating it is a

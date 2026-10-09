@@ -602,13 +602,18 @@ if relay_job.is_a?(Hash)
     before = relay_run.index("fingerprint_before=")
     evaluate = relay_run.index("scripts/codex-p1-gate.sh")
     after = relay_run.index("fingerprint_after=")
-    complete = relay_run.index("status=complete")
+    complete = relay_run.index(%q{marker="<!-- mergepath-feedback-archive-relay:v2})
     close = relay_run.index('check-runs/$check_id')
-    delete = relay_run.index('actions/artifacts/$ARTIFACT_ID')
+    retire = relay_steps.find { |step| step["name"] == "Retire the published handoff artifact" }
+    persist_step = relay_steps.find { |step| step["run"] == relay_run }
+    retirement_ok = retire && retire["continue-on-error"] == true &&
+      retire["if"].to_s.include?("success()") &&
+      retire["run"].to_s.include?('actions/artifacts/$ARTIFACT_ID') &&
+      relay_steps.index(persist_step) < relay_steps.index(retire)
     require_shape.call(
-      [validate, lease, persist, before, evaluate, after, complete, close, delete].all? &&
+      [validate, lease, persist, before, evaluate, after, complete, close].all? && retirement_ok &&
         validate < lease && lease < persist && persist < before && before < evaluate &&
-        evaluate < after && after < complete && complete < close && close < delete,
+        evaluate < after && after < complete && complete < close,
       "read-only archive relay does not validate, persist, evaluate, publish, and retire in fail-closed order"
     )
     require_shape.call(

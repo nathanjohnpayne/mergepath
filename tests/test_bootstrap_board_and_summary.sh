@@ -178,7 +178,7 @@ chmod +x "$SHIM_DIR/gh"
 
 # Real PATH for everything else.
 SHIM_PATH="$SHIM_DIR:/usr/bin:/bin"
-for tool in bash yq git rsync sed awk grep mktemp tr cut tail head wc ls rm cat printf chmod find dirname basename jq; do
+for tool in bash yq git rsync sed awk grep mktemp tr cut tail head wc ls rm cat printf chmod find dirname basename jq python3; do
   src=$(command -v "$tool" 2>/dev/null || true)
   [ -n "$src" ] && ln -sf "$src" "$SHIM_DIR/$tool"
 done

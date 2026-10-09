@@ -59,6 +59,24 @@ fi
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/merge-clearance-gate-test.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
 
+# Model the trusted live-byte-verifier boundary separately from the gate's
+# policy/dispatch decisions. Its actual Git/provenance implementation is
+# exercised by test_marker_provenance.py, including workflow tampering.
+GATE_FIXTURE="$WORKDIR/gate-scripts"
+mkdir -p "$GATE_FIXTURE/lib" "$GATE_FIXTURE/workflow"
+cp "$SCRIPT" "$GATE_FIXTURE/merge-clearance-gate.sh"
+cp -R "$ROOT/scripts/lib/." "$GATE_FIXTURE/lib/"
+cp -R "$ROOT/scripts/workflow/." "$GATE_FIXTURE/workflow/"
+SCRIPT="$GATE_FIXTURE/merge-clearance-gate.sh"
+cat >"$GATE_FIXTURE/workflow/verify-live-propagation.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+[[ "$3" =~ ^[0-9a-f]{40}$ && "$4" =~ ^[0-9a-f]{40}$ ]] || exit 2
+[ "${FIXTURE_COMMENTS_FAIL:-0}" != 1 ] || exit 2
+exit "${FIXTURE_LIVE_PROPAGATION_RC:-1}"
+SH
+chmod +x "$GATE_FIXTURE/workflow/verify-live-propagation.sh"
+
 PASS=0
 FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
@@ -1239,21 +1257,21 @@ fi
 # needs-external-review label, with a github-actions[bot] lane marker scoped
 # to the CURRENT head → EXEMPT (not applicable), must NOT delegate.
 # ---------------------------------------------------------------------------
-echo; echo "--- Test 17: verified propagation lane (head/base-pinned) → exempt"
+echo; echo "--- Test 17: verified propagation lane (fresh byte proof) → exempt"
 SCRATCH=$(make_scratch false true)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]')
 FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":400,"deletions":50}]')
 FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg h "$HEAD_SHA" --arg b "$BASE_SHA" '
   [{user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane:v2 verified-head=" + $h + " verified-base=" + $b + " -->\nverified faithful mirror ✅")}]')")
 set +e
-OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+OUT=$(FIXTURE_LIVE_PROPAGATION_RC=0 FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
       MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
       CODEX_STUB_RC=1 \
       run_gate "$SCRATCH" 99 owner/repo 2>&1)
 RC=$?
 set -e
 if [ "$RC" = 0 ] && echo "$OUT" | grep -qi "not applicable"; then
-  pass "verified propagation lane (current-pair marker) → exempt (exit 0, no delegate)"
+  pass "verified propagation lane (fresh byte verification) → exempt (exit 0, no delegate)"
 else
   fail "expected rc=0 not-applicable (exempt); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
 fi
@@ -2295,7 +2313,7 @@ else
   fail "query: protected path expected true/0; got rc=$RC out='$OUT'"
 fi
 
-echo; echo "--- Query 5: verified lane marker for HEAD, label absent → false"
+echo; echo "--- Query 5: live byte verification, label absent → false"
 SCRATCH=$(make_scratch false true)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
 FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":500,"deletions":0}]')
@@ -2303,7 +2321,7 @@ FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" --arg ba
   [{ user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane:v2 verified-head=" + $sha + " verified-base=" + $base + " -->") }]
 ')")
 set +e
-OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+OUT=$(FIXTURE_LIVE_PROPAGATION_RC=0 FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
   run_gate "$SCRATCH" --derive-external-requiredness 99 owner/repo 2>/dev/null)
 RC=$?
 set -e
@@ -2458,7 +2476,7 @@ FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" --arg ba
   [{ user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane:v2 verified-head=" + $sha + " verified-base=" + $base + " -->") }]
 ')")
 set +e
-OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+OUT=$(FIXTURE_LIVE_PROPAGATION_RC=0 FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
   run_gate "$SCRATCH" --derive-phase-4-requiredness 99 owner/repo 2>/dev/null)
 RC=$?
 set -e
@@ -2732,7 +2750,7 @@ FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" --arg ba
 FIXTURE_PROTECTION=$(make_protection_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')")
 : > "$WORKDIR/gh-calls.log"
 set +e
-OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+OUT=$(FIXTURE_LIVE_PROPAGATION_RC=0 FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
       FIXTURE_PROTECTION="$FIXTURE_PROTECTION" \
   run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
 RC=$?

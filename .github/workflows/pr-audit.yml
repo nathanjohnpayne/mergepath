@@ -163,6 +163,7 @@ jobs:
             );
 
             const violations = [];
+            const recordedOverrides = [];
 
             async function labelWasPresentAtMerge(pr, labelName) {
               const events = await github.paginate(
@@ -940,7 +941,39 @@ jobs:
                 );
               }
 
-              if (prViolations.length > 0) {
+              // Read scoped author records from the same durable PR history
+              // the operator wrote before merging. These are recorded owner
+              // instructions, not independent proof of the original chat.
+              let recordedOverride = null;
+              if (!hadHumanHold && !hadPolicyViolation) {
+                try {
+                  const comments = await github.paginate(github.rest.issues.listComments, {
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    issue_number: pr.number, per_page: 100,
+                  });
+                  if (comments.some(comment => comment.user?.login === authorIdentity &&
+                      (comment.body || '').startsWith('<!-- mergepath-owner-admin-override:v1 -->'))) {
+                    const { execFileSync } = require('child_process');
+                    const overrideReviews = await github.paginate(github.rest.pulls.listReviews, {
+                      owner: context.repo.owner, repo: context.repo.repo,
+                      pull_number: pr.number, per_page: 100,
+                    });
+                    const overrideInline = await github.paginate(github.rest.pulls.listReviewComments, {
+                      owner: context.repo.owner, repo: context.repo.repo,
+                      pull_number: pr.number, per_page: 100,
+                    });
+                    const result = JSON.parse(execFileSync('python3', ['scripts/workflow/owner-admin-override.py', 'audit'], {
+                      input: JSON.stringify({pr, author: authorIdentity, codex_bot_login: codexBotLogin, comments, reviews: overrideReviews, inline_comments: overrideInline, needs_human_review_at_merge: hadHumanLabel, hard_hold_at_merge: hadHumanHold || hadPolicyViolation}), encoding: 'utf8',
+                    }));
+                    if (result.recorded_override) recordedOverride = result;
+                  }
+                } catch (e) {
+                  core.warning(`Owner override record unreadable for #${pr.number}: ${e.message}`);
+                }
+              }
+              if (recordedOverride) {
+                recordedOverrides.push({number: pr.number, issues: prViolations, record: recordedOverride});
+              } else if (prViolations.length > 0) {
                 violations.push({
                   number: pr.number,
                   title: pr.title,
@@ -950,7 +983,7 @@ jobs:
               }
             }
 
-            if (violations.length > 0) {
+            if (violations.length > 0 || recordedOverrides.length > 0) {
               let body = `## PR Review Policy Violations\n\n`;
               body += `**Audit period:** ${sinceISO.split('T')[0]} to ${today}\n`;
               body += `**Violations found:** ${violations.length}\n\n`;
@@ -963,8 +996,19 @@ jobs:
                 }
               }
 
+              if (recordedOverrides.length > 0) {
+                body += `\n### Recorded owner overrides\n\n`;
+                for (const override of recordedOverrides) {
+                  body += `- **#${override.number}** — [authorization record](${override.record.comment_url}) for \`${override.record.record.head_sha}\` at ${override.record.record.authorized_at}\n`;
+                  for (const issue of override.issues) body += `  - Overridden: ${issue}\n`;
+                  for (const gate of override.record.record.observed_red_gates) body += `  - Recorded non-green gate: ${JSON.stringify(gate)}\n`;
+                }
+              }
+
               body += `\n---\n\n`;
-              body += `Per REVIEW_POLICY.md, these PRs must be retroactively reviewed by a human within one business day.\n\n`;
+              if (violations.length > 0) {
+                body += `Per REVIEW_POLICY.md, the unexplained violations above require human review within one business day.\n\n`;
+              }
               body += `cc @nathanjohnpayne`;
 
               await github.rest.issues.create({

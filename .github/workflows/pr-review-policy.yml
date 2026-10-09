@@ -894,17 +894,15 @@ jobs:
           # CLEAN-but-unmerged. The PAT is scoped to the two commands that must
           # create workflow runs GITHUB_TOKEN cannot: the label removal below,
           # and the #658 merge-clearance-recheck repository_dispatch. The
-          # lane-marker comment itself deliberately stays on GITHUB_TOKEN so it
-          # remains github-actions-authored for its #429 consumers — but that is
-          # exactly why it fires no run, hence the PAT dispatch that nudges
+          # lane-marker diagnostic stays on GITHUB_TOKEN; its authorship grants
+          # no clearance and its publication fires no run. The PAT dispatch nudges
           # merge-clearance-gate. Every other command keeps the restricted
           # default token.
           LABEL_REMOVAL_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          # Embedded in the lane marker so the signal is HEAD/BASE-PINNED — a
-          # consumer (merge-clearance-gate.sh's propagation exemption, #429)
-          # can confirm THIS pair was verified, not merely that the PR was
-          # once a faithful mirror before a push or retarget.
+          # Embedded in the diagnostic marker to report the checked pair.
+          # Consumers independently verify their live head/base pair; this
+          # snapshot cannot authorize an exemption after a push or retarget.
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
@@ -912,44 +910,20 @@ jobs:
           # PR review lane): the check step VERIFIED it is a byte-for-byte
           # faithful mirror of mergepath@<sha> — every changed file
           # byte-matches mergepath's content under a manifest path, as
-          # confirmed by mergepath@<sha>'s own verify-propagation-pr.sh.
+          # independently confirmed by the trusted live verifier at use time.
           # It is exempt from the Phase 4 external-review requirement —
           # but still subject to CI green, CodeRabbit advisory review,
           # and an internal reviewer-identity APPROVED (the standard
           # under-threshold path).
           #
-          # Post a HEAD/BASE-PINNED, machine-readable lane marker. The marker
-          # embeds the verified pair, so a consumer of this signal
-          # (scripts/merge-clearance-gate.sh's propagation exemption, #429)
-          # exempts a PR ONLY if the lane verified THAT head/base pair — not
-          # merely that the PR was once a faithful mirror before a retarget.
-          # Posted only by this workflow (github-actions[bot]); a PR author
-          # cannot forge that identity. One marker per distinct verified pair:
-          # re-runs on the same pair don't re-comment; a faithful re-push or
-          # same-head retarget posts a fresh marker only after that new pair is
-          # verified; a DIVERGED push never reaches this step.
-          # Marker contract is shared with merge-clearance-gate.sh
-          # (lane_verified(), also consumed indirectly by agent-review.yml's
-          # rc=5 branch via --derive-external-requiredness, #620) AND with
-          # agent-review.yml's triage job (#656: triage skips its
-          # needs-external-review add only for a pair this marker pins) —
-          # keep the `mergepath-propagation-lane:v2 verified-head=<sha>
-          # verified-base=<sha>` form
-          # in sync across the three files
-          # (scripts/ci/check_agent_review_triage_defers asserts the
-          # lockstep).
-          #
-          # ORDER MATTERS (#620 Codex r9): the marker MUST be posted before
-          # the label removal below. The removal fires agent-review.yml's
-          # unlabeled re-arm, whose rc=5 branch derives external
-          # requiredness via merge-clearance-gate.sh — whose lane_verified()
-          # reads this marker to tell exemption apart from clearance.
-          # Marker-after-removal would open a window where that derivation
-          # treats the exemption as an ordinary above-threshold arm.
-          # Marker-then-removal is safe in the failure direction: if the
-          # marker posts and the removal then fails, the still-present label
-          # keeps merge-clearance-gate blocking (a present label is never
-          # subject to the propagation exemption).
+          # Post a head/base-pinned diagnostic marker once per verified pair.
+          # Actions-bot authorship alone is not proof of this workflow's origin.
+          # Clearance and triage consumers independently verify the live pair
+          # with their trusted base-checkout verifier and governing policy;
+          # copied markers, old pairs and label events grant no exemption.
+          # Keep the v2 diagnostic shape in sync with its reporting consumers.
+          # A dispatch after publication schedules another live verification;
+          # neither the marker nor that dispatch supplies clearance authority.
           fence_event_pair() { # <operation-description>
             local operation=$1 pair live_head live_base
             if ! pair=$(gh api \
@@ -976,15 +950,16 @@ jobs:
           MARKER="<!-- mergepath-propagation-lane:v2 verified-head=$HEAD_SHA verified-base=$BASE_SHA -->"
           ALREADY=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json comments --jq '.comments[].body' | grep -F "$MARKER" || true)
           if [ -z "$ALREADY" ]; then
-            # The marker and dispatch authorize the propagation exemption for
-            # this pair. Check the complete event pair immediately before that
-            # authority is published.
-            fence_event_pair "publishing verified-propagation authority"
+            # Fence the complete event pair before publishing its diagnostic
+            # marker. Receivers independently verify the live pair.
+            fence_event_pair "publishing verified-propagation diagnostics"
             gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body "$(cat <<EOF
           $MARKER
           **Propagation PR review lane** — verified faithful mirror ✅ (head \`$HEAD_SHA\`, base \`$BASE_SHA\`)
 
           This PR was checked out against \`mergepath\` at the source commit named in its branch and **verified byte-for-byte at this head/base pair**: every changed file is under a \`.mergepath-sync.yml\` path AND matches \`mergepath@<sha>\`'s content (\`scripts/workflow/verify-propagation-pr.sh\`). Its content was already reviewed in the upstream mergepath PR(s). Per REVIEW_POLICY.md § Propagation PR review lane it is **exempt from the Phase 4 external-review requirement**.
+
+          This marker is diagnostic; clearance consumers independently verify their live head/base pair.
 
           It is still subject to: CI green, CodeRabbit advisory review, and an internal reviewer-identity \`APPROVED\` — the standard under-threshold path. Merge as the author once those clear.
 
@@ -1000,8 +975,8 @@ jobs:
             # of waiting up to 15 min for the scheduled sweep. PAT-driven: the
             # workflow token is contents:read (cannot POST /dispatches), and
             # keeping the dispatch on the PAT avoids widening the GITHUB_TOKEN
-            # scope. Best-effort — the gate re-derives clearance from THIS marker
-            # (lane_verified, head/base-pinned) and never trusts the dispatch payload,
+            # scope. Best-effort — the gate independently byte-verifies its live
+            # head/base pair and never trusts the marker or dispatch payload,
             # so on any failure the */15 sweep still recovers the gate; a failed
             # dispatch must never fail the lane. Keep the event type in sync with
             # merge-clearance-gate.yml's repository_dispatch trigger.

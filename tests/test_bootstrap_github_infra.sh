@@ -213,7 +213,7 @@ chmod +x "$SHIM_DIR/gh"
 SHIM_PATH="$SHIM_DIR:/usr/bin:/bin"
 # Include yq + git + rsync from the real PATH (the shim only covers
 # gh). We need bash 3.2+ on macOS to keep this portable.
-for tool in bash yq git rsync sed awk grep mktemp tr cut tail head wc ls rm cat printf chmod find dirname basename; do
+for tool in bash yq git rsync sed awk grep mktemp tr cut tail head wc ls rm cat printf chmod find dirname basename python3; do
   src=$(command -v "$tool" 2>/dev/null || true)
   [ -n "$src" ] && ln -sf "$src" "$SHIM_DIR/$tool"
 done

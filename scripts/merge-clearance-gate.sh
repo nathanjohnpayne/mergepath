@@ -809,69 +809,13 @@ EOF
   return 1
 }
 
-# Propagation-lane exemption (#429), HEAD/BASE-PINNED. Returns 0 (true) iff a PR
-# comment authored by github-actions[bot] carries the propagation-lane marker
-# scoped to the CURRENT pair — i.e. `mergepath-propagation-lane:v2
-# verified-head=<HEAD_SHA> verified-base=<BASE_SHA>`.
-# .github/workflows/pr-review-policy.yml posts that
-# marker ONLY after mergepath@<sha>'s verify-propagation-pr.sh byte-confirms a
-# faithful mirror AT THAT PAIR, and a PR author cannot post as
-# github-actions[bot] — so it is a TRUSTED, pair-scoped signal that the lane
-# already exempted THIS pair from external review (REVIEW_POLICY.md §
-# Propagation PR review lane).
-#
-# Why head-pinned (Codex round-3 P1 + nathanpayne-codex CHANGES_REQUESTED on
-# #429): an unscoped "was-ever-a-mirror" marker is posted once and survives a
-# later divergent push. On the synchronize where this gate finishes before
-# pr-review-policy.yml re-adds needs-external-review, an unscoped check would
-# go GREEN on an unverified large/.github PR. Pinning the exemption to the
-# current head/base pair closes that race independently of label timing: a
-# diverged, retargeted, or merely newer-not-yet-verified pair has no matching
-# marker, so the
-# gate does NOT exempt it and falls through to threshold/paths derivation.
-# A DIVERGED push never gets a marker at all (the lane's propagation_lane is
-# false → it posts nothing for that head). A faithful re-push is briefly
-# not-yet-exempt (fail-closed) until the lane posts the new head's marker and
-# the next event / scheduled sweep re-evaluates.
-#
-# Without this exemption, deriving applicability from threshold/protected-paths
-# would force verified propagation PRs — large by design, touching .github/**,
-# AND carrying an `Authoring-Agent` stamp (so codex-review-check.sh's
-# same-agent guard disqualifies their normal internal approval) — into Phase
-# 4/Codex clearance, breaking the documented under-threshold lane.
-#
-# Marker contract is shared with pr-review-policy.yml — keep the
-# `mergepath-propagation-lane:v2 verified-head=<sha> verified-base=<sha>`
-# form in sync. Legacy head-only markers grant no current exemption because
-# they cannot prove which base the lane verified.
-# agent-review.yml's rc=5 branch consumes it indirectly through this
-# script's --derive-external-requiredness query (#620).
+# A comment from github-actions[bot] is not provenance: a same-repo PR
+# workflow can mint it. Re-run the byte verifier from this trusted checkout.
+# 0=faithful live mirror, 1=not a mirror, 2=unprovable. Query modes preserve
+# the indeterminate result; full merge checks add review when uncertain.
 lane_verified() {
-  # Exit: 0 = marker present; 1 = definitively absent (fetch + parse OK, no
-  # matching comment); 2 = INDETERMINATE (comments API fetch or JSON parse
-  # failed). The full-gate callsite treats 1 and 2 alike — no exemption,
-  # fail-safe, since external review can only be ADDED. The
-  # The query modes MUST tell 2 apart (automated-4b round-5 P1): there
-  # `true` is the UNSAFE value (it authorizes the rc=5 CodeRabbit
-  # downgrade), and a verified propagation PR's real Merge clearance gate
-  # is green via the exemption — so an unknowable marker state must fail
-  # closed to the caller, not fall through to threshold derivation (which
-  # would return true for a large propagation PR).
-  local comments rc=0
-  if ! [[ "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]] \
-     || ! [[ "$BASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
-    return 2
-  fi
-  comments=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null) || return 2
-  # `|| rc=$?` keeps the capture correct under `set -e` regardless of call
-  # context (jq -e: 0 = match, 1 = no match, >1 = parse error).
-  echo "$comments" | jq -e --arg head "$HEAD_SHA" --arg base "$BASE_SHA" '
-    any(.[]; (.user.login == "github-actions[bot]")
-             and ((.body // "") | contains("<!-- mergepath-propagation-lane:v2 verified-head=" + $head + " verified-base=" + $base + " -->")))
-  ' >/dev/null 2>&1 || rc=$?
-  if [ "$rc" -eq 0 ]; then return 0; fi
-  if [ "$rc" -eq 1 ]; then return 1; fi
-  return 2
+  printf '%s' "$PR_JSON" | bash "$SCRIPT_DIR/workflow/verify-live-propagation.sh" \
+    "$REPO" "$PR_NUMBER" "$HEAD_SHA" "$BASE_SHA" "$POLICY_CONFIG" >/dev/null
 }
 
 # --- fetch PR metadata ------------------------------------------------------

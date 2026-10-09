@@ -1858,7 +1858,7 @@ EOF
   # Manufactured PATH with no yq.
   no_yq_path="$WORKDIR/no-yq-path"
   mkdir -p "$no_yq_path"
-  for tool in bash sed awk mktemp; do
+  for tool in bash sed awk mktemp python3; do
     src=$(command -v "$tool" || true)
     if [ -n "$src" ]; then ln -sf "$src" "$no_yq_path/$tool"; fi
   done
@@ -1928,7 +1928,7 @@ else
   mkdir -p "$preflight_target"
   preflight_path="$WORKDIR/preflight-noyq-path"
   mkdir -p "$preflight_path"
-  for tool in bash gh op git rsync; do
+  for tool in bash gh op git rsync python3; do
     src=$(command -v "$tool" || true)
     if [ -n "$src" ]; then ln -sf "$src" "$preflight_path/$tool"; fi
   done

@@ -7,7 +7,7 @@
 #
 # Usage:
 #   scripts/gh-as-author.sh -- gh pr create --title ... --body-file pr-body.md
-#   scripts/gh-as-author.sh -- gh pr merge 123 --squash --delete-branch
+#   scripts/gh-as-author.sh -- gh pr merge 123 --squash --delete-branch --match-head-commit <full-current-head-sha>
 #   scripts/gh-as-author.sh -- gh pr edit 123 --add-label foo
 #   GH_AS_AUTHOR_PUSH_REPO=owner/repo scripts/gh-as-author.sh -- git -C <dir> push -u origin HEAD
 #
@@ -243,6 +243,16 @@ run_with_author_token() {
   GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
     GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" "$@"
 }
+
+# Every admin merge records its scoped owner instruction before the write.
+# The helper sees actual argv and runs only for an actual --admin flag.
+(
+  unset GITHUB_TOKEN
+  GH_TOKEN="$TOKEN" GH_AS_AUTHOR_RECORD_IDENTITY="$AUTHOR" \
+    GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+    GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+    python3 "$ROOT/scripts/workflow/owner-admin-override.py" prepare "$@"
+)
 
 if [ "$IS_PR_CREATE" -eq 1 ]; then
   TMP_OUT=$(mktemp)
