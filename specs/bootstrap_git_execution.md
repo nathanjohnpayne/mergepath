@@ -1,3 +1,7 @@
+---
+spec_id: bootstrap_git_execution
+---
+
 # Bootstrap Git Execution
 
 Bootstrap's initial push uses `gh_author_git_exec` in `scripts/lib/gh-token-resolver.sh` after the author wrapper validates the repository and credential. Before creating the token-bearing child environment, the runner resolves both `git` and its `gh` credential helper with `command -v`. Each result must be an absolute path without quotes or backslashes; missing commands, shell functions and relative PATH results refuse with exit 5. The runner invokes those captured paths without another PATH lookup.
