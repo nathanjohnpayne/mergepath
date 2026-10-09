@@ -975,7 +975,8 @@ class ServerTests(unittest.TestCase):
     def test_namespace_is_required_with_cookie_and_never_disclosed_unscoped(self):
         self.bootstrap()
         self.assertEqual(len(self.app._scope), 43)
-        for route in ["/api/session", "/api/snapshot", "/api/panels/prs", "/events", "/assets/fixture.js", "/?reopen=1"]:
+        for route in ["/api/session", "/api/snapshot", "/api/panels/prs", "/events", "/assets/fixture.js",
+                      "/?reopen=1", "/?", "/bootstrap?", "/bootstrap.js?"]:
             status, headers, body = self.request(path=route, scoped=False)
             self.assertEqual(status, 404)
             self.assertNotIn("Location", headers)

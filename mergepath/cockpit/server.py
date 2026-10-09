@@ -283,7 +283,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         # The printed base URL serves the same secret-free transport document,
         # which reopens this browser's stored session without disclosing it (#1848).
-        public = self.command == "GET" and parts.path in {"/", "/bootstrap", "/bootstrap.js"} and not parts.query
+        # urlsplit reports an empty query for a bare trailing "?", so check the raw target.
+        public = self.command == "GET" and parts.path in {"/", "/bootstrap", "/bootstrap.js"} and "?" not in self.path
         bootstrap = self.command == "POST" and parts.path == "/api/bootstrap" and not parts.query
         if bootstrap:
             if (origin != "http://" + host or length or not app.bootstrap(
