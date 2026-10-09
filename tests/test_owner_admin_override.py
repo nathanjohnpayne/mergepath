@@ -80,6 +80,15 @@ print(json.dumps(result))
         calls = [json.loads(line) for line in (self.path / 'calls').read_text().splitlines()]
         self.assertEqual(calls[-1][:3], ['api', '--paginate', '--slurp'])
 
+    def test_rollup_at_cli_ceiling_refuses_before_recording(self):
+        self.state['pr']['statusCheckRollup'] = [{'name': 'green', 'conclusion': 'SUCCESS'}] * 100
+        result = self.run_prepare()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('may be truncated', result.stderr)
+        self.assertFalse((self.path / 'posted.json').exists())
+        self.state['pr']['statusCheckRollup'].pop()
+        self.assertEqual(self.run_prepare().returncode, 0)
+
     def test_read_only_authorization_check_performs_no_github_write(self):
         (self.path / 'state.json').write_text(json.dumps(self.state))
         env = {**os.environ, 'PATH': str(self.path) + os.pathsep + os.environ['PATH'],

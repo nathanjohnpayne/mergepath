@@ -252,6 +252,9 @@ def prepare(argv, *, check_only=False):
         query += ['--repo', repo]
     pr = gh(*query, '--json', 'url,headRefOid,baseRefOid,labels,statusCheckRollup')
     url, head = pr['url'], pr['headRefOid']
+    checks = pr.get('statusCheckRollup')
+    if not isinstance(checks, list) or len(checks) >= 100:
+        raise ValueError('check rollup may be truncated; refusing an incomplete owner authorization record')
     match = re.fullmatch(r'https://github.com/([^/]+/[^/]+)/pull/([1-9][0-9]*)', url)
     if not match:
         raise ValueError('admin recording supports the verified github.com author identity only')
