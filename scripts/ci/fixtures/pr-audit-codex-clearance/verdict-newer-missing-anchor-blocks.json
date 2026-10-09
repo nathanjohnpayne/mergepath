@@ -1,6 +1,6 @@
 {
-  "description": "HEAD-anchored affirmative issue-comment verdict only (no review object, no reaction) \u2192 cleared (#612)",
-  "expected_cleared": true,
+  "description": "A newer missing or conflicting foreign anchor cannot leave earlier clearance live.",
+  "expected_cleared": false,
   "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
   "codex_bot_login": "chatgpt-codex-connector[bot]",
   "authoring_agent": "claude",
@@ -12,6 +12,14 @@
       "id": 9001,
       "body": "Codex Review: Didn't find any major issues. Swish!\nReviewed commit: deadbeefcafe1234567890abcdef1234567890ab",
       "created_at": "2026-05-12T10:00:00Z",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]"
+      }
+    },
+    {
+      "id": 9002,
+      "body": "Codex Review: Found issues.",
+      "created_at": "2026-05-12T10:30:00Z",
       "user": {
         "login": "chatgpt-codex-connector[bot]"
       }

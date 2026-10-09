@@ -165,6 +165,8 @@ REVIEWS_JSON=$(printf '%s\n' "$REVIEWS_JSON" | jq -s 'add // []') || {
   exit 2
 }
 
+COMMENTS_JSON=$(printf '%s\n' "$COMMENTS_JSON" | python3 "$SCRIPT_DIR/resolve-codex-verdict-anchors.py" --repo "$REPO" --bot "$BOT_LOGIN") || exit 2
+
 HEAD_LC=$(printf '%s' "$HEAD_SHA" | tr '[:upper:]' '[:lower:]')
 CURRENT_SIGNAL=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -c \
   --arg bot "$BOT_LOGIN" \
@@ -173,8 +175,8 @@ CURRENT_SIGNAL=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -c \
   def verdict_shas($body):
     [ $body
       | ascii_downcase
-      | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
-      | .[0]
+      | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([^\\r\\n]*)")
+      | .[0] | sub("^[`*[:space:]]+"; "") | sub("[`*[:space:]]+$"; "")
     ];
   .[0] as $comments |
   .[1] as $reviews |
@@ -182,8 +184,10 @@ CURRENT_SIGNAL=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -c \
     $comments[]
     | select(.user.login == $bot)
     | . as $c
-    | verdict_shas($c.body)[] as $sha
-    | select($head | startswith($sha))
+    | verdict_shas($c.body) as $shas
+    | select(($shas | length) > 0
+             and ($shas | length) == ([$c.body | ascii_downcase | scan("reviewed commit")] | length)
+             and ($shas | all(. == $head)) and ($head | test("^[0-9a-f]{40}$")))
     | {
         kind: "verdict",
         time: ($c.created_at // ""),
@@ -193,7 +197,7 @@ CURRENT_SIGNAL=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -c \
     $reviews[]
     | select(.user.login == $bot)
     | ((.commit_id // "") | ascii_downcase) as $sha
-    | select($sha != "" and ($head == $sha or ($head | startswith($sha))))
+    | select(($sha | test("^[0-9a-f]{40}$")) and $head == $sha)
     | {kind: "review", time: (.submitted_at // ""), affirmative: false}
   ])
   | map(select(.time != ""))
@@ -232,11 +236,14 @@ CANDIDATES=$(printf '%s' "$COMMENTS_JSON" | jq -r \
     | . as $c
     | [ $c.body
         | ascii_downcase
-        | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
-        | .[0]
+        | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([^\\r\\n]*)")
+        | .[0] | sub("^[`*[:space:]]+"; "") | sub("[`*[:space:]]+$"; "")
       ] as $shas
-    | $shas[]
-    | {time: $c.created_at, sha: .}
+    | select(($shas | length) > 0
+             and ($shas | length) == ([$c.body | ascii_downcase | scan("reviewed commit")] | length)
+             and ($shas | all(test("^[0-9a-f]{40}$")))
+             and ($shas | unique | length) == 1)
+    | {time: $c.created_at, sha: $shas[0]}
   ]
   | sort_by(.time)
   | reverse
@@ -255,7 +262,7 @@ while IFS=$'\t' read -r source_time source_sha; do
   resolved_sha=""
   source_lc=$(printf '%s' "$source_sha" | tr '[:upper:]' '[:lower:]')
   case "$HEAD_LC" in
-    "$source_lc"*) resolved_sha="$HEAD_SHA" ;;
+    "$source_lc") resolved_sha="$HEAD_SHA" ;;
   esac
   if [ -z "$resolved_sha" ]; then
     # #799: an unreadable response used to arrive here as the JSON error
@@ -289,7 +296,7 @@ while IFS=$'\t' read -r source_time source_sha; do
   #   truncated sha), so failing closed here would let one bad string in any old
   #   comment permanently disable carry-forward for the PR. NEWER_SIGNALS is a
   #   small, safety-critical, machine-generated set where failing closed is right.
-  [ -n "$resolved_sha" ] || continue
+  [ -n "$resolved_sha" ] && [ "$(printf '%s' "$resolved_sha" | tr '[:upper:]' '[:lower:]')" = "$source_lc" ] || continue
 
   resolved_lc=$(printf '%s' "$resolved_sha" | tr '[:upper:]' '[:lower:]')
   NEWER_SOURCE_SIGNAL=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -c \
@@ -300,8 +307,8 @@ while IFS=$'\t' read -r source_time source_sha; do
     def verdict_shas($body):
       [ $body
         | ascii_downcase
-        | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
-        | .[0]
+        | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([^\\r\\n]*)")
+        | .[0] | sub("^[`*[:space:]]+"; "") | sub("[`*[:space:]]+$"; "")
       ];
     .[0] as $comments |
     .[1] as $reviews |
@@ -310,7 +317,7 @@ while IFS=$'\t' read -r source_time source_sha; do
       | select(.user.login == $bot)
       | . as $c
       | verdict_shas($c.body)[] as $sha
-      | select($resolved | startswith($sha))
+      | select(($sha | test("^[0-9a-f]{40}$")) and $resolved == $sha)
       | {
           kind: "verdict",
           time: ($c.created_at // ""),
@@ -320,7 +327,7 @@ while IFS=$'\t' read -r source_time source_sha; do
       $reviews[]
       | select(.user.login == $bot)
       | ((.commit_id // "") | ascii_downcase) as $sha
-      | select($sha != "" and ($resolved == $sha or ($resolved | startswith($sha))))
+      | select(($sha | test("^[0-9a-f]{40}$")) and $resolved == $sha)
       | {kind: "review", time: (.submitted_at // ""), affirmative: false}
     ])
     | map(select(.time != "" and .time > $source_time))
@@ -331,15 +338,15 @@ while IFS=$'\t' read -r source_time source_sha; do
     continue
   fi
 
-  NEWER_SIGNALS=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -r \
+  NEWER_SIGNALS=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -c \
     --arg bot "$BOT_LOGIN" \
     --arg source_time "$source_time" \
     '
     def verdict_shas($body):
       [ $body
         | ascii_downcase
-        | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
-        | .[0]
+        | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([^\\r\\n]*)")
+        | .[0] | sub("^[`*[:space:]]+"; "") | sub("[`*[:space:]]+$"; "")
       ];
     .[0] as $comments |
     .[1] as $reviews |
@@ -347,7 +354,11 @@ while IFS=$'\t' read -r source_time source_sha; do
       $comments[]
       | select(.user.login == $bot)
       | . as $c
-      | verdict_shas($c.body)[] as $sha
+      | (verdict_shas($c.body) as $shas
+         | ([$c.body | ascii_downcase | scan("reviewed commit")] | length) as $fields
+         | if (($shas | length) == 0 and ($c.body | test("(?im)^\\s*codex review:")))
+              or ($shas | length) != $fields or ($shas | unique | length) > 1
+           then [""] else $shas end)[] as $sha
       | {
           kind: "verdict",
           time: ($c.created_at // ""),
@@ -359,20 +370,27 @@ while IFS=$'\t' read -r source_time source_sha; do
       | select(.user.login == $bot)
       | {kind: "review", time: (.submitted_at // ""), sha: (.commit_id // ""), affirmative: false}
     ])
-    | map(select(.time != "" and .sha != "" and .time > $source_time and .affirmative != true))
+    | map(select(.time != "" and .time > $source_time and .affirmative != true))
     | sort_by(.time)
     | reverse
     | .[]
-    | [.time, .sha, .kind]
-    | @tsv
   ')
   blocked_by_newer_same_fingerprint=false
-  while IFS=$'\t' read -r signal_time signal_sha signal_kind; do
-    [ -n "$signal_sha" ] || continue
+  # Preserve empty fields in structured JSON. TSV read collapses empty cells,
+  # and an empty commit anchor must refuse rather than disappear from history.
+  while IFS= read -r signal_json; do
+    [ -n "$signal_json" ] || continue
+    signal_time=$(printf '%s' "$signal_json" | jq -r '.time')
+    signal_sha=$(printf '%s' "$signal_json" | jq -r '.sha')
+    signal_kind=$(printf '%s' "$signal_json" | jq -r '.kind')
     signal_resolved=""
     signal_lc=$(printf '%s' "$signal_sha" | tr '[:upper:]' '[:lower:]')
+    if [[ ! "$signal_lc" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "external_review_carryforward.sh: newer $signal_kind Codex signal has an abbreviated or malformed commit; refusing carry-forward" >&2
+      exit 2
+    fi
     case "$HEAD_LC" in
-      "$signal_lc"*) signal_resolved="$HEAD_SHA" ;;
+      "$signal_lc") signal_resolved="$HEAD_SHA" ;;
     esac
     if [ -z "$signal_resolved" ]; then
       # #799: this is the latest-signal-wins guard the asymmetry note above
@@ -384,7 +402,7 @@ while IFS=$'\t' read -r source_time source_sha; do
       signal_resolved=$(gh_api_scalar --shape sha "commit $signal_sha in $REPO" \
         "repos/$REPO/commits/$signal_sha" --jq .sha) || signal_resolved=""
     fi
-    if [ -z "$signal_resolved" ]; then
+    if [ -z "$signal_resolved" ] || [ "$(printf '%s' "$signal_resolved" | tr '[:upper:]' '[:lower:]')" != "$signal_lc" ]; then
       echo "external_review_carryforward.sh: newer $signal_kind Codex signal at $signal_time references unresolvable commit $signal_sha; refusing carry-forward" >&2
       exit 2
     fi

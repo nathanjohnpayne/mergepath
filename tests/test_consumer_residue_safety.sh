@@ -291,7 +291,6 @@ KNOWN_RESIDUE_VIOLATIONS=(
   "check_external_review_helpers|SKIP-ONLY"
   "check_onepassword_headless_proof_workflow|EXIT"
   "check_project_doc_sync|EXIT"
-  "check_repo_lint_consumer_safety|EXIT"
   "check_session_finalization|EXIT"
   "check_sweep_unresolved_feedback|EXIT"
   "check_sync_overrides|EXIT"

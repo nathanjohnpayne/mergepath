@@ -55,6 +55,8 @@ jobs:
         run: npm install --no-save --ignore-scripts --legacy-peer-deps js-yaml
 
       - name: Audit merged PRs for review policy compliance
+        env:
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
@@ -526,6 +528,20 @@ jobs:
                   issueComments = null;
                 }
 
+                if (issueComments !== null) {
+                  try {
+                    issueComments = JSON.parse(execFileSync('python3', [
+                      'scripts/workflow/resolve-codex-verdict-anchors.py',
+                      '--repo', `${context.repo.owner}/${context.repo.repo}`,
+                      '--bot', codexBotLogin,
+                    ], {input: JSON.stringify(issueComments), encoding: 'utf8', timeout: 35000,
+                      maxBuffer: Math.max(1024 * 1024, Buffer.byteLength(JSON.stringify(issueComments), 'utf8') * 6)}));
+                  } catch (e) {
+                    issueComments = null; // Missing/unreadable resolver cannot grant clearance.
+                    console.log(`WARNING: Codex anchor resolution failed for PR #${pr.number}`);
+                  }
+                }
+
                 // ── Clearance algorithm (#249/#449/#450/#612) ─────────
                 // KEEP IN SYNC with the mirrored runner in
                 // scripts/ci/check_pr_audit_codex_clearance.
@@ -581,14 +597,19 @@ jobs:
                       if (!(mergedAt && c.created_at && c.created_at <= mergedAt)) continue;
                       const body = (c.body || '').toLowerCase();
                       const shaMatches = [
-                        ...body.matchAll(/reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})/g),
-                      ].map(m => m[1]);
-                      if (!shaMatches.some(s => headLower.startsWith(s))) continue;
+                        ...body.matchAll(/reviewed commit[^0-9a-z_\r\n]{0,6}([^\r\n]*)/g),
+                      ].map(m => m[1].replace(/^[`*\s]+|[`*\s]+$/g, ''));
+                      const fieldCount = (body.match(/reviewed commit/g) || []).length;
+                      const exact = /^[0-9a-f]{40}$/.test(headLower) && shaMatches.length > 0
+                        && shaMatches.length === fieldCount && shaMatches.every(s => s === headLower);
+                      const clean = /^\s*codex review:\s*didn.?t find any major issues\b/im.test(c.body || '');
+                      const ambiguousNegative = !clean && /^\s*codex review:/im.test(c.body || '')
+                        && (shaMatches.length === 0 || new Set(shaMatches).size > 1 || shaMatches.length !== fieldCount || shaMatches.some(s => s === headLower || !/^[0-9a-f]{40}$/.test(s)));
+                      if (!exact && !ambiguousNegative) continue;
                       if (!latestVerdict || c.created_at >= latestVerdict.created_at) {
                         latestVerdict = {
                           created_at: c.created_at,
-                          affirmative: /^\s*codex review:\s*didn.?t find any major issues\b/im
-                            .test(c.body || ''),
+                          affirmative: exact && clean,
                         };
                       }
                     }

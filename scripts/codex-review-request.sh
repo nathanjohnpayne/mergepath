@@ -819,6 +819,7 @@ scan_codex_state() {
   reviews=$(fetch_scan_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") || return $?
   comments=$(fetch_scan_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments") || return $?
   issue_comments=$(fetch_scan_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || return $?
+  issue_comments=$(crqe_resolve_verdict_anchors "$issue_comments" "$REPO" "$BOT_LOGIN") || return 3
 
   # Latest review from the Codex bot on the current HEAD commit, if any.
   # Codex always uses COMMENTED state regardless of findings. We also
@@ -904,13 +905,25 @@ scan_codex_state() {
         | . as $c
         | ( [ $c.body
               | ascii_downcase
-              | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
-              | .[0]
+              | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([^\\r\\n]*)")
+              | .[0] | sub("^[`*[:space:]]+"; "") | sub("[`*[:space:]]+$"; "")
             ] ) as $shas
-        | select( ($shas | length) > 0
-                  and ($shas | any(. as $s | $head | startswith($s))) )
+        | ([$c.body | ascii_downcase | scan("reviewed commit")] | length) as $fields
+        | (($shas | length) > 0 and ($shas | length) == $fields
+           and ($head | test("^[0-9a-f]{40}$"))
+           and ($shas | all(. == $head))) as $exact
+        | ($c.body | test("(?im)^\\s*codex review:\\s*didn.?t find any major issues\\b")) as $affirmative
+        # A newer negative verdict with an ambiguous anchor must invalidate
+        # older clearance. It never grants clearance or names another head.
+        # Only complete, valid anchors exclusively naming other heads can be
+        # safely excluded from the latest-signal ordering for this head.
+        | select($exact or (($affirmative | not)
+            and ($c.body | test("(?im)^\\s*codex review:"))
+            and ($fields == 0 or ($shas | unique | length) > 1
+                 or ($shas | length) != $fields or ($shas | any(. == $head))
+                 or ($shas | any(test("^[0-9a-f]{40}$") | not)))))
         | { created_at: .created_at,
-            affirmative: (.body | test("(?im)^\\s*codex review:\\s*didn.?t find any major issues\\b")) }
+            affirmative: ($exact and $affirmative) }
       ]
     | max_by(.created_at) // null
   ')

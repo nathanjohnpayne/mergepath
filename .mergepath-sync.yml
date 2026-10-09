@@ -350,6 +350,11 @@ paths:
   - path: scripts/lib/codex-request-evidence.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/workflow/resolve-codex-verdict-anchors.py"
+  - path: scripts/workflow/resolve-codex-verdict-anchors.py
+    type: canonical
+    consumers: all
   # Codex review ledger (#1560): pure attribution over evidence the caller
   # reads with the shared parsers. Load-bearing since slice 3: the requester's
   # blocking-review budget refuses a request from its count, and fails closed
@@ -1319,6 +1324,11 @@ paths:
   # poller (#609). check_codex_scripts hard-runs it (same `No such file`
   # exit-127 coupling class as the ack suite above), so it must travel to
   # every consumer.
+  - path: tests/test_codex_verdict_anchor_resolution.py
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/resolve-codex-verdict-anchors.py"
   - path: tests/test_codex_review_request_verdict.sh
     type: canonical
     consumers: all
@@ -2018,6 +2028,7 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/pr-body-contract.mjs"  # weekly audit uses the canonical rendered-body parser
+      - "scripts/workflow/resolve-codex-verdict-anchors.py"
   - path: .github/workflows/codex-p1-gate.yml
     type: canonical
     consumers: all
@@ -2244,6 +2255,7 @@ paths:
       - "tests/test_codex_review_request_ack.sh"  # check_codex_scripts
       - "tests/test_codex_review_request_trigger_only.sh"  # check_codex_scripts (#489)
       - "tests/test_codex_review_request_entry.sh"  # check_codex_scripts (#486)
+      - "tests/test_codex_verdict_anchor_resolution.py" # check_codex_scripts (#1752)
       - "tests/test_codex_review_request_verdict.sh"  # check_codex_scripts (#609)
       - "tests/test_codex_review_request_token_fallback.sh"  # check_codex_scripts (#737)
       - "tests/test_codex_review_check_resolution.sh"  # check_codex_scripts (#460 Option B)

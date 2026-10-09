@@ -93,20 +93,20 @@ run_summary() {
 
 if declare -F crc_select_codex_review_summary >/dev/null 2>&1; then
   SUMMARY_COMPLETED=$(mk_summary "$SUMMARY_BOT" \
-    "$(summary_body '✅ **Completed** <relative-time datetime="2026-08-30T07:19:37Z">now</relative-time>' d05ff4d0 'Manual request')" \
+    "$(summary_body '✅ **Completed** <relative-time datetime="2026-08-30T07:19:37Z">now</relative-time>' d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708 'Manual request')" \
     "2026-08-30T07:16:18Z" "2026-08-30T07:19:41Z" 101)
   GOT=$(run_summary "$SUMMARY_COMPLETED")
-  if [ "$(echo "$GOT" | jq -r '[.status,.commit,.observed_at,.trigger] | @tsv')" = $'completed\td05ff4d0\t2026-08-30T07:19:41Z\tManual request' ]; then
+  if [ "$(echo "$GOT" | jq -r '[.status,.commit,.observed_at,.trigger] | @tsv')" = $'completed\td05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708\t2026-08-30T07:19:41Z\tManual request' ]; then
     pass "#1157 summary: exact-head Completed uses edited updated_at as terminal time"
   else
     fail "#1157 summary: exact-head Completed parse mismatch: $GOT"
   fi
 
   SUMMARY_RUNNING=$(mk_summary "$SUMMARY_BOT" \
-    "$(summary_body '🔄 **Running** since 1 minute ago' d05ff4d0 'Manual request')" \
+    "$(summary_body '🔄 **Running** since 1 minute ago' d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708 'Manual request')" \
     "2026-08-30T07:16:18Z" "2026-08-30T07:17:18Z" 102)
   GOT=$(run_summary "$SUMMARY_RUNNING")
-  if [ "$(echo "$GOT" | jq -r '[.status,.commit,.observed_at] | @tsv')" = $'running\td05ff4d0\t2026-08-30T07:17:18Z' ]; then
+  if [ "$(echo "$GOT" | jq -r '[.status,.commit,.observed_at] | @tsv')" = $'running\td05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708\t2026-08-30T07:17:18Z' ]; then
     pass "#1157 summary: exact-head Running is represented distinctly from Completed"
   else
     fail "#1157 summary: exact-head Running parse mismatch: $GOT"
@@ -122,7 +122,7 @@ if declare -F crc_select_codex_review_summary >/dev/null 2>&1; then
   fi
 
   WRONG_AUTHOR=$(mk_summary "nathanjohnpayne" \
-    "$(summary_body '✅ **Completed** now' d05ff4d0 'Manual request')" \
+    "$(summary_body '✅ **Completed** now' d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708 'Manual request')" \
     "2026-08-30T07:16:18Z" "2026-08-30T07:19:41Z" 104)
   if [ "$(run_summary "$WRONG_AUTHOR")" = "null" ]; then
     pass "#1157 summary: a human-authored lookalike is rejected"
@@ -130,7 +130,7 @@ if declare -F crc_select_codex_review_summary >/dev/null 2>&1; then
     fail "#1157 summary: a human-authored lookalike was accepted"
   fi
 
-  NO_MARKER_BODY=$(summary_body '✅ **Completed** now' d05ff4d0 'Manual request' | sed '1d')
+  NO_MARKER_BODY=$(summary_body '✅ **Completed** now' d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708 'Manual request' | sed '1d')
   NO_MARKER=$(mk_summary "$SUMMARY_BOT" "$NO_MARKER_BODY" \
     "2026-08-30T07:16:18Z" "2026-08-30T07:19:41Z" 105)
   if [ "$(run_summary "$NO_MARKER")" = "null" ]; then
@@ -139,7 +139,7 @@ if declare -F crc_select_codex_review_summary >/dev/null 2>&1; then
     fail "#1157 summary: an unmarked bot table was accepted"
   fi
 
-  TWO=$(jq -n --arg bot "$SUMMARY_BOT" --arg old "$(summary_body '✅ **Completed** now' d05ff4d0 'PR opened')" --arg new "$(summary_body '🔄 **Running** since 1 minute ago' d05ff4d0 'Manual request')" '[
+  TWO=$(jq -n --arg bot "$SUMMARY_BOT" --arg old "$(summary_body '✅ **Completed** now' d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708 'PR opened')" --arg new "$(summary_body '🔄 **Running** since 1 minute ago' d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708 'Manual request')" '[
     {user:{login:$bot},body:$old,created_at:"2026-08-30T07:00:00Z",updated_at:"2026-08-30T07:05:00Z",id:106},
     {user:{login:$bot},body:$new,created_at:"2026-08-30T07:10:00Z",updated_at:"2026-08-30T07:11:00Z",id:107}
   ]')
@@ -167,12 +167,12 @@ fi
 if grep -q "CODEX_HEAD_VERDICT_TIME" "$SCRIPT" \
    && grep -q 'issues/\$PR_NUMBER/comments' "$SCRIPT" \
    && grep -qi "didn.?t find any major issues" "$SCRIPT" \
-   && grep -q "reviewed commit\[\^0-9a-f\]" "$SCRIPT" \
-   && grep -q "startswith(\$s)" "$SCRIPT" \
+   && grep -Fq "reviewed commit[^0-9a-z_" "$SCRIPT" \
+   && grep -Fq '$shas | all(. == $head)' "$SCRIPT" \
    && grep -q "#600" "$SCRIPT"; then
   pass "codex-review-check.sh computes the HEAD-anchored affirmative issue-comment verdict signal (#600)"
 else
-  fail "codex-review-check.sh is missing the verdict signal (CODEX_HEAD_VERDICT_TIME / issue-comments fetch / affirmative regex / reviewed-commit scan / prefix anchor / #600)"
+  fail "codex-review-check.sh is missing the verdict signal (CODEX_HEAD_VERDICT_TIME / issue-comments fetch / affirmative regex / reviewed-commit scan / exact anchor / #600)"
 fi
 
 # ── 1b. Structural (#705): same-content carry-forward is present, is routed
@@ -260,22 +260,17 @@ fi
 #      the Phase 4b freshness guard).
 BOT="chatgpt-codex-connector[bot]"
 HEAD="d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708"
-LATEST_HEAD_VERDICT='
-    ($sha | ascii_downcase) as $head
-    | [ .[]
-        | select(.user.login == $bot)
-        | . as $c
-        | ( [ $c.body
-              | ascii_downcase
-              | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
-              | .[0]
-            ] ) as $shas
-        | select( ($shas | length) > 0
-                  and ($shas | any(. as $s | $head | startswith($s))) )
-        | { created_at: .created_at,
-            affirmative: (.body | test("(?im)^\\s*codex review:\\s*didn.?t find any major issues\\b")) }
-      ]
-    | max_by(.created_at) // null'
+LATEST_HEAD_VERDICT=$(python3 - "$SCRIPT" <<'SELECTOR'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+start = source.index('  CODEX_VERDICT_JSON=$(echo ')
+marker = '--arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" ' + chr(39)
+start = source.index(marker, start) + len(marker)
+end = source.index("\n  ')", start)
+print(source[start:end])
+SELECTOR
+)
 VERDICT_FILTER="$LATEST_HEAD_VERDICT"'
     | if . == null then "" elif .affirmative then .created_at else "" end'
 ANY_FILTER="$LATEST_HEAD_VERDICT"'
@@ -296,11 +291,84 @@ check_case() { # desc expected fixture
   fi
 }
 
+# A negative response cannot disappear merely because its head is unknown.
+for negative in 'Codex Review: Found issues.' 'Codex Review: Found issues.
+Reviewed commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Reviewed commit: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+'; do
+  history="$(jq -s 'add' <(mk "$BOT" "Codex Review: Didnt find any major issues.
+Reviewed commit: $HEAD" "2026-07-01T10:00:00Z") <(mk "$BOT" "$negative" "2026-07-01T12:00:00Z"))"
+  check_case "newer missing or conflicting foreign anchors supersede older clearance" "" "$history"
+  observed="$(printf '%s' "$history" | jq -r --arg bot "$BOT" --arg sha "$HEAD" "$ANY_FILTER")"
+  if [ "$observed" = "2026-07-01T12:00:00Z" ]; then pass "ambiguous foreign response raises freshness floor";
+  else fail "ambiguous foreign response lost from freshness floor: $observed"; fi
+done
+
+# Every Reviewed commit field participates, including malformed values.
+for bad_anchor in "${HEAD:0:6}" zzzzzz '@@' ''; do
+  check_case "mixed full HEAD and malformed anchor refuses ($bad_anchor)" "" \
+    "$(mk "$BOT" "Codex Review: Didn't find any major issues.
+Reviewed commit: $HEAD
+Reviewed commit: $bad_anchor" "2026-07-03T10:00:00Z")"
+done
+
+
+# Preserve an ambiguous newer negative response in both clearance and freshness.
+for anchor in "${HEAD:0:10}" '' "${HEAD}.junk" "${HEAD}
+Reviewed commit: @@"; do
+  history="$(jq -s 'add' <(mk "$BOT" "Codex Review: Didnt find any major issues.
+Reviewed commit: $HEAD" "2026-07-01T10:00:00Z") <(mk "$BOT" "Codex Review: Found issues.
+Reviewed commit: $anchor" "2026-07-01T12:00:00Z"))"
+  check_case "newer malformed negative supersedes older exact clean ($anchor)" "" "$history"
+  observed="$(printf '%s' "$history" | jq -r --arg bot "$BOT" --arg sha "$HEAD" "$ANY_FILTER")"
+  if [ "$observed" = "2026-07-01T12:00:00Z" ]; then
+    pass "newer malformed negative raises freshness floor ($anchor)"
+  else
+    fail "newer malformed negative lost from freshness ordering ($anchor): $observed"
+  fi
+done
+history="$(jq -s 'add' <(mk "$BOT" "Codex Review: Didnt find any major issues.
+Reviewed commit: $HEAD" "2026-07-01T10:00:00Z") <(mk "$BOT" "Codex Review: Found issues.
+Reviewed commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "2026-07-01T12:00:00Z"))"
+check_case "valid negative on another full head does not demote this head" "2026-07-01T10:00:00Z" "$history"
+
+# #1752: two full object IDs sharing seven characters must not borrow
+# the same short verdict. Every abbreviation and overlong token refuses.
+for n in 6 7 8 12 20 39; do
+  check_case "abbreviated Reviewed commit ($n chars) refuses" "" \
+    "$(mk "$BOT" "Codex Review: Didn't find any major issues.
+Reviewed commit: ${HEAD:0:$n}" "2026-07-01T10:00:00Z")"
+done
+for token in "${HEAD}a" "${HEAD}g" "${HEAD}-not-a-sha" "${HEAD}/suffix" "${HEAD}.junk" "${HEAD}_junk"; do
+  check_case "overlong or malformed SHA refuses" "" \
+    "$(mk "$BOT" "Codex Review: Didn't find any major issues.
+Reviewed commit: $token" "2026-07-01T10:00:00Z")"
+done
+check_case "conflicting full anchors refuse" "" \
+  "$(mk "$BOT" "Codex Review: Didn't find any major issues.
+Reviewed commit: $HEAD
+Reviewed commit: ${HEAD:0:7}000000000000000000000000000000000" "2026-07-01T10:00:00Z")"
+
+# A guard-removed filter demonstrates the colliding-prefix failure for both
+# distinct full object IDs without mining commits or mutating source files.
+collision_fixture="$(mk "$BOT" "Codex Review: Didn't find any major issues.
+Reviewed commit: ${HEAD:0:7}" "2026-07-01T10:00:00Z")"
+legacy_filter="$(printf '%s' "$LATEST_HEAD_VERDICT" | sed 's/all(. == $head)/any(. as $s | $head | startswith($s))/')"
+for collision_head in "$HEAD" "${HEAD:0:7}fffffffffffffffffffffffffffffffff"; do
+  guarded="$(printf '%s' "$collision_fixture" | jq -c --arg bot "$BOT" --arg sha "$collision_head" "$LATEST_HEAD_VERDICT")"
+  legacy="$(printf '%s' "$collision_fixture" | jq -c --arg bot "$BOT" --arg sha "$collision_head" "$legacy_filter")"
+  if [ "$guarded" = null ] && [ "$(printf '%s' "$legacy" | jq -r '.affirmative')" = true ]; then
+    pass "colliding-prefix verdict refuses; legacy control clears a distinct full SHA"
+  else
+    fail "collision control: guarded=$guarded legacy=$legacy"
+  fi
+done
+
 # 4a. accept: affirmative + 8-char prefix + markdown-bold, over newlines.
-check_case "affirmative + prefix sha + markdown-bold anchor → clears" \
+check_case "affirmative + full SHA + markdown-bold anchor → clears" \
   "2026-07-01T10:00:00Z" \
   "$(mk "$BOT" "Codex Review: Didn't find any major issues. Swish!
-**Reviewed commit:** d05ff4d0" "2026-07-01T10:00:00Z")"
+**Reviewed commit:** d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708" "2026-07-01T10:00:00Z")"
 
 # 4b. fail-closed: Reviewed commit does not prefix HEAD (stale head).
 check_case "stale-HEAD verdict (Reviewed commit != HEAD prefix) → empty" \
@@ -312,7 +380,7 @@ Reviewed commit: aaaa1111bbbb" "2026-07-01T10:00:00Z")"
 check_case "findings verdict (non-affirmative body) → empty" \
   "" \
   "$(mk "$BOT" "Codex Review: Found 2 issues to address.
-Reviewed commit: d05ff4d0" "2026-07-01T10:00:00Z")"
+Reviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708" "2026-07-01T10:00:00Z")"
 
 # 4d. fail-closed: affirmative but NO Reviewed-commit anchor line.
 check_case "affirmative but no Reviewed-commit line → empty" \
@@ -323,7 +391,7 @@ check_case "affirmative but no Reviewed-commit line → empty" \
 check_case "wrong author echoing the phrase + anchor → empty" \
   "" \
   "$(mk "nathanpayne-claude" "Codex said: Didn't find any major issues.
-Reviewed commit: d05ff4d0" "2026-07-01T10:00:00Z")"
+Reviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708" "2026-07-01T10:00:00Z")"
 
 # 4f. accept: full 40-char sha (exact match is a prefix of itself).
 check_case "full 40-char Reviewed-commit sha → clears" \
@@ -335,22 +403,22 @@ Reviewed commit: $HEAD" "2026-07-01T11:00:00Z")"
 check_case "apostrophe-less 'Didnt' + backticked sha → clears" \
   "2026-07-01T09:00:00Z" \
   "$(mk "$BOT" "Codex Review: Didnt find any major issues.
-Reviewed commit: \`d05ff4d0e\`" "2026-07-01T09:00:00Z")"
+Reviewed commit: \`d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708\`" "2026-07-01T09:00:00Z")"
 
 # 4h. latest-wins: two qualifying comments → max(created_at).
 check_case "two qualifying verdicts → picks the latest created_at" \
   "2026-07-01T12:00:00Z" \
   "$(jq -n --arg bot "$BOT" --arg h "$HEAD" '[
-     {user:{login:$bot},body:("Codex Review: Didn'"'"'t find any major issues.\nReviewed commit: d05ff4d0"),created_at:"2026-07-01T10:00:00Z"},
-     {user:{login:$bot},body:("Codex Review: Didn'"'"'t find any major issues. Keep them coming!\nReviewed commit: d05ff4d0e"),created_at:"2026-07-01T12:00:00Z"}
+     {user:{login:$bot},body:("Codex Review: Didn'"'"'t find any major issues.\nReviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708"),created_at:"2026-07-01T10:00:00Z"},
+     {user:{login:$bot},body:("Codex Review: Didn'"'"'t find any major issues. Keep them coming!\nReviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708"),created_at:"2026-07-01T12:00:00Z"}
    ]')"
 
 # 4i. P1 (#608) latest-wins fail-closed: older AFFIRMATIVE then a NEWER
 #     NON-affirmative verdict on the same HEAD → clearance signal is EMPTY
 #     (the newer negative verdict supersedes the older clean one).
 NEWER_NEGATIVE="$(jq -n --arg bot "$BOT" '[
-   {user:{login:$bot},body:("Codex Review: Didn'"'"'t find any major issues.\nReviewed commit: d05ff4d0"),created_at:"2026-07-01T10:00:00Z"},
-   {user:{login:$bot},body:("Codex Review: Found 2 issues to address.\nReviewed commit: d05ff4d0e"),created_at:"2026-07-01T12:00:00Z"}
+   {user:{login:$bot},body:("Codex Review: Didn'"'"'t find any major issues.\nReviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708"),created_at:"2026-07-01T10:00:00Z"},
+   {user:{login:$bot},body:("Codex Review: Found 2 issues to address.\nReviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708"),created_at:"2026-07-01T12:00:00Z"}
  ]')"
 check_case "older affirmative + NEWER non-affirmative verdict → clearance empty (P1 #608)" \
   "" "$NEWER_NEGATIVE"
@@ -360,8 +428,8 @@ check_case "older affirmative + NEWER non-affirmative verdict → clearance empt
 check_case "older non-affirmative + NEWER affirmative verdict → clears on the newer" \
   "2026-07-01T12:00:00Z" \
   "$(jq -n --arg bot "$BOT" '[
-     {user:{login:$bot},body:("Codex Review: Found 1 issue.\nReviewed commit: d05ff4d0"),created_at:"2026-07-01T10:00:00Z"},
-     {user:{login:$bot},body:("Codex Review: Didn'"'"'t find any major issues.\nReviewed commit: d05ff4d0e"),created_at:"2026-07-01T12:00:00Z"}
+     {user:{login:$bot},body:("Codex Review: Found 1 issue.\nReviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708"),created_at:"2026-07-01T10:00:00Z"},
+     {user:{login:$bot},body:("Codex Review: Didn'"'"'t find any major issues.\nReviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708"),created_at:"2026-07-01T12:00:00Z"}
    ]')"
 
 # 4k. ANY-timestamp (Phase 4b guard, #608 P2): the latest HEAD-anchored verdict
@@ -384,7 +452,7 @@ check_case "negative verdict quoting an affirmative (blockquote) → clearance e
 
 > Codex Review: Didn't find any major issues
 
-Reviewed commit: d05ff4d0" "2026-07-01T13:00:00Z")"
+Reviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708" "2026-07-01T13:00:00Z")"
 
 # 4m. accept: a genuine affirmative whose body has a leading preamble line, with
 #     the "Codex Review:" verdict header on its own line (multiline anchor).
@@ -392,7 +460,7 @@ check_case "affirmative header on a later line (multiline anchor) → clears" \
   "2026-07-01T14:00:00Z" \
   "$(mk "$BOT" "Here are some automated review suggestions.
 Codex Review: Didn't find any major issues.
-Reviewed commit: d05ff4d0" "2026-07-01T14:00:00Z")"
+Reviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708" "2026-07-01T14:00:00Z")"
 
 # ── 5. Gate (c) unified latest-signal-wins (#608 P1). Model the case block in
 #      codex-review-check.sh: pick the newest of {👍, review, verdict} (ties go

@@ -8,6 +8,7 @@ DIR=$(mktemp -d)
 trap 'rm -rf "$DIR"' EXIT
 mkdir -p "$DIR/scripts/workflow" "$DIR/bin"
 cp "$ROOT/scripts/codex-review-check.sh" "$DIR/scripts/"
+cp "$ROOT/scripts/workflow/resolve-codex-verdict-anchors.py" "$DIR/scripts/workflow/"
 ln -s "$ROOT/scripts/lib" "$DIR/scripts/lib"
 cat >"$DIR/policy.yml" <<'POLICY'
 author_identity: nathanjohnpayne
@@ -284,13 +285,13 @@ echo "PASS: #1598 reread-fails"
 # answering the newer request (a later review) clears again.
 SUP_REQ123='{"id":123,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:01:00Z","body":"@codex review"}'
 SUP_REQ124='{"id":124,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:04:00Z","body":"@codex review"}'
-SUP_VERDICT='{"id":130,"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-09-14T00:02:00Z","body":"Codex Review: Didn'"'"'t find any major issues.\n\nReviewed commit: `abcdef0`"}'
+SUP_VERDICT='{"id":130,"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-09-14T00:02:00Z","body":"Codex Review: Didn'"'"'t find any major issues.\n\nReviewed commit: `abcdef0123456789000000000000000000000000`"}'
 SUP_STALE_4B='{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789000000000000000000000000","submitted_at":"2026-09-14T00:05:00Z","body":"<!-- mergepath-p4b-request-generation: [123] -->"}'
 SUP_CODEX_REVIEW='{"id":789,"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"abcdef0123456789000000000000000000000000","submitted_at":"2026-09-14T00:02:00Z","state":"COMMENTED","body":""}'
 SUP_CODEX_REVIEW_LATER='{"id":790,"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"abcdef0123456789000000000000000000000000","submitted_at":"2026-09-14T00:07:00Z","state":"COMMENTED","body":""}'
 SUP_THUMBS='[{"user":{"login":"chatgpt-codex-connector[bot]"},"content":"+1","created_at":"2026-09-14T00:02:00Z"}]'
 SUP_THUMBS_LATER='[{"user":{"login":"chatgpt-codex-connector[bot]"},"content":"+1","created_at":"2026-09-14T00:02:00Z"},{"user":{"login":"chatgpt-codex-connector[bot]"},"content":"+1","created_at":"2026-09-14T00:07:00Z"}]'
-SUP_VERDICT_LATER='{"id":131,"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-09-14T00:07:00Z","body":"Codex Review: Didn'"'"'t find any major issues.\n\nReviewed commit: `abcdef0`"}'
+SUP_VERDICT_LATER='{"id":131,"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-09-14T00:07:00Z","body":"Codex Review: Didn'"'"'t find any major issues.\n\nReviewed commit: `abcdef0123456789000000000000000000000000`"}'
 SUP_REQ_NO_TIME='{"id":125,"user":{"login":"nathanjohnpayne"},"body":"@codex review"}'
 while IFS='|' read -r name comments reviews reactions carry expected pattern; do
   printf '%s\n' "$comments" >"$DIR/comments"
@@ -353,6 +354,45 @@ fi
 PASS=$((PASS + 1))
 echo "PASS: #1598 codex-disabled"
 
+# #1752: negative ambiguous anchors remain ordering observations, but must
+# never tell a diagnostic caller that the current head was reviewed.
+for anchor in missing prefix malformed conflicting exact; do
+  case "$anchor" in
+    missing) field='' ;;
+    prefix) field='Reviewed commit: abcdef0' ;;
+    malformed) field='Reviewed commit: abcdef0123456789000000000000000000000000.trailing' ;;
+    conflicting) field=$'Reviewed commit: abcdef0123456789000000000000000000000000\nReviewed commit: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' ;;
+    exact) field='Reviewed commit: abcdef0123456789000000000000000000000000' ;;
+  esac
+  jq -cn --arg field "$field" '[{user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-09-14T00:02:00Z",body:("Codex Review: Found issues\n" + $field)}]' > "$DIR/comments"
+  printf '[]\n' > "$DIR/reviews"
+  : > "$DIR/calls"
+  rc=0
+  PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=diagnostic-anchor \
+    PR_BODY='' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+    MERGEPATH_REVIEW_POLICY_PATH="$DIR/policy.yml" \
+    bash "$DIR/scripts/codex-review-check.sh" --diagnostic-signal-only 99 owner/repo > "$DIR/out" 2>&1 || rc=$?
+  if { [ "$anchor" = exact ] && [ "$rc" != 0 ]; } || { [ "$anchor" != exact ] && [ "$rc" = 0 ]; }; then
+    cat "$DIR/out"; echo "FAIL diagnostic $anchor rc=$rc"; exit 1
+  fi
+  PASS=$((PASS + 1)); echo "PASS: diagnostic anchor $anchor"
+done
+
+# Resolver infrastructure errors must never look like an account-block waiver.
+mv "$DIR/scripts/workflow/resolve-codex-verdict-anchors.py" "$DIR/resolver.saved"
+for mode in '' --diagnostic-signal-only --approval-readiness-only; do
+  rc=0
+  PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=diagnostic-anchor \
+    PR_BODY='' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+    MERGEPATH_REVIEW_POLICY_PATH="$DIR/policy.yml" \
+    bash "$DIR/scripts/codex-review-check.sh" ${mode:+"$mode"} 99 owner/repo > "$DIR/out" 2>&1 || rc=$?
+  if [ "$rc" != 3 ]; then
+    cat "$DIR/out"; echo "FAIL resolver infrastructure $mode rc=$rc"; exit 1
+  fi
+  PASS=$((PASS + 1)); echo "PASS: resolver infrastructure ${mode:-normal}"
+done
+mv "$DIR/resolver.saved" "$DIR/scripts/workflow/resolve-codex-verdict-anchors.py"
+
 # Large provider history must travel over stdin, not the OS argument vector.
 eval "$(sed -n '/^crc_select_head_review()/,/^}/p' "$ROOT/scripts/codex-review-check.sh")"
 large_comments=$(python3 - <<'PYDATA'
@@ -401,6 +441,8 @@ PASS=$((PASS + 1))
 echo "PASS: requester scans and emits large review and finding bodies over stdin"
 
 # Disabled Codex and approval-readiness paths do not depend on Codex inline reads.
+printf '%s\n' "$SUB_APPROVAL" >"$DIR/reviews"
+printf '[]\n' >"$DIR/comments"
 for mode in disabled readiness; do
   policy="$DIR/substitute-disabled-policy.yml"
   flag=''

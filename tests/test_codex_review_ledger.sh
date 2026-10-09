@@ -19,6 +19,8 @@ command -v jq >/dev/null 2>&1 || { echo "FAIL: jq is required" >&2; exit 1; }
 
 # shellcheck source=../scripts/lib/codex-review-ledger.sh
 . "$ROOT/scripts/lib/codex-review-ledger.sh"
+# shellcheck source=../scripts/lib/codex-request-evidence.sh
+. "$ROOT/scripts/lib/codex-request-evidence.sh"
 
 HEAD_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 HEAD_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -358,6 +360,15 @@ stop_check "stops: a rebuttal Codex answered clean, provably to the later reques
 # A PR reaction is not a response and cannot test any rebuttal.
 IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" | arr)" '[]' "$(reaction 900 2026-09-25T02:10:00Z | arr)" '[]')
 stop_check "stops: a PR reaction leaves the rebuttal untested" "$(stops "$IN" "$RB" 10)" '.stops == ["untested-rebuttal"]'
+# Malformed observed fields remain anchorless, so a later clean comment
+# cannot fabricate a distinct head and claim it tested the rebuttal.
+for token in zzzzzz "${HEAD_A}-not-a-sha" "${HEAD_A}a"; do
+  C=$(jq -nc --arg token "$token" '[{id:901,user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-09-25T02:10:00Z",body:("Codex Review: Didn\u0027t find any major issues.\nReviewed commit: " + $token)}]')
+  V=$(crqe_verdicts "$C" 'chatgpt-codex-connector[bot]')
+  IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" | arr)" "$V" '[]' '[]')
+  stop_check "malformed verdict $token leaves the rebuttal untested" "$(stops "$IN" "$RB" 10)" '.stops == ["untested-rebuttal"]'
+done
+
 # Even in the first and only request window, a reaction cannot be attributed
 # as a clean response to clear an earlier rebuttal at a spent request ceiling.
 IN=$(inputs "$(req 1 2026-09-25T02:00:00Z | arr)" '[]' '[]' "$(reaction 900 2026-09-25T02:10:00Z | arr)" '[]')
@@ -852,7 +863,7 @@ fi
 
 # ---- Part 3: the shared verdict expressions match their existing copies ----
 
-for expr in 'scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")' \
+for expr in 'scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([^\\r\\n]*)")' \
             'test("(?im)^\\s*codex review:\\s*didn.?t find any major issues\\b")'; do
   for f in scripts/lib/codex-request-evidence.sh scripts/codex-review-request.sh scripts/codex-review-check.sh; do
     if grep -qF -- "$expr" "$ROOT/$f"; then
