@@ -1862,6 +1862,8 @@ INLINE_CODEX_CLEARED=""
 INLINE_BREAK_GLASS_ADMIN=""
 INLINE_BREAK_GLASS_MERGE_STATE=""
 INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT=""
+EXPORTED_BREAK_GLASS_REVIEW_DISAGREEMENT=""
+EXPORTED_REVIEW_DISAGREEMENT_SET=0
 INLINE_GH_AS_AUTHOR_IDENTITY=""
 INLINE_GH_AS_REVIEWER_IDENTITY=""
 # Standalone (own-segment) identity assignments persist as shell
@@ -2194,6 +2196,10 @@ for i in "${!TOKENS[@]}"; do
         ;;
       BREAK_GLASS_REVIEW_DISAGREEMENT=*)
         INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT="${tok#BREAK_GLASS_REVIEW_DISAGREEMENT=}"
+        case "${TOKENS[$((i+1))]:-}" in
+          __MERGEPATH_CMDSUB__|__MERGEPATH_CMDSUB_LITERAL__)
+            INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT="unverifiable" ;;
+        esac
         ;;
       BREAK_GLASS_MERGE_STATE=*)
         INLINE_BREAK_GLASS_MERGE_STATE="${tok#BREAK_GLASS_MERGE_STATE=}"
@@ -2272,6 +2278,30 @@ for i in "${!TOKENS[@]}"; do
     # Capture them into the standalone (possibly-effective) slots the
     # candidate model already validates.
     if [ "$IN_EXPORT_SEGMENT" -eq 1 ]; then
+      # Only a literal export grants this release; ambiguous declaration
+      # forms must not acquire authority through identity over-capture.
+      if [ "$DECLARATION_KIND" = export ]; then
+        case "$tok" in
+          -*) DECLARATION_KIND="ambiguous-export" ;;
+          BREAK_GLASS_REVIEW_DISAGREEMENT=*)
+            EXPORTED_BREAK_GLASS_REVIEW_DISAGREEMENT="${tok#BREAK_GLASS_REVIEW_DISAGREEMENT=}"
+            EXPORTED_REVIEW_DISAGREEMENT_SET=1
+            case "${TOKENS[$((i+1))]:-}" in
+              __MERGEPATH_CMDSUB__|__MERGEPATH_CMDSUB_LITERAL__)
+                EXPORTED_BREAK_GLASS_REVIEW_DISAGREEMENT="unverifiable" ;;
+            esac
+            ;;
+          BREAK_GLASS_REVIEW_DISAGREEMENT)
+            if [ -n "$INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT" ]; then
+              EXPORTED_BREAK_GLASS_REVIEW_DISAGREEMENT="$INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT"
+              EXPORTED_REVIEW_DISAGREEMENT_SET=1
+            fi
+            ;;
+        esac
+      elif [ "$DECLARATION_KIND" = unset ] && [ "$tok" = BREAK_GLASS_REVIEW_DISAGREEMENT ]; then
+        EXPORTED_BREAK_GLASS_REVIEW_DISAGREEMENT=""
+        EXPORTED_REVIEW_DISAGREEMENT_SET=1
+      fi
       case "$tok" in
         GH_AS_AUTHOR_IDENTITY=*)
           STANDALONE_GH_AS_AUTHOR_IDENTITY="${tok#GH_AS_AUTHOR_IDENTITY=}"
@@ -2525,6 +2555,9 @@ EFFECTIVE_CODEX_CLEARED="${CODEX_CLEARED:-${INLINE_CODEX_CLEARED:-}}"
 EFFECTIVE_BREAK_GLASS_ADMIN="${BREAK_GLASS_ADMIN:-${INLINE_BREAK_GLASS_ADMIN:-}}"
 EFFECTIVE_BREAK_GLASS_MERGE_STATE="${BREAK_GLASS_MERGE_STATE:-${INLINE_BREAK_GLASS_MERGE_STATE:-}}"
 EFFECTIVE_BREAK_GLASS_REVIEW_DISAGREEMENT="${BREAK_GLASS_REVIEW_DISAGREEMENT:-${INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT:-}}"
+if [ "$EXPORTED_REVIEW_DISAGREEMENT_SET" -eq 1 ]; then
+  EFFECTIVE_BREAK_GLASS_REVIEW_DISAGREEMENT="$EXPORTED_BREAK_GLASS_REVIEW_DISAGREEMENT"
+fi
 
 # Distinguish `gh pr comment` from `gh issue comment` (both share the
 # subcommand label `comment` but route through different parent
@@ -3222,6 +3255,8 @@ REPO_ARG=""
 ADMIN_REQUESTED=0
 MATCH_HEAD_SHA=""
 MATCH_HEAD_COUNT=0
+AUTO_REQUESTED=0
+DISABLE_AUTO_REQUESTED=0
 SKIP_NEXT_AS=""  # "" | "skip" | "repo"
 merge_walk_start=$((PR_SUBCOMMAND_INDEX + 1))
 for j in "${!TOKENS[@]}"; do
@@ -3229,6 +3264,7 @@ for j in "${!TOKENS[@]}"; do
     continue
   fi
   tok="${TOKENS[$j]}"
+  case "$tok" in "&&"|"||"|";"|"|"|"|&"|"&"|"("|")") break ;; esac
   if [ "$SKIP_NEXT_AS" = "skip" ]; then
     SKIP_NEXT_AS=""
     continue
@@ -3245,6 +3281,14 @@ for j in "${!TOKENS[@]}"; do
     continue
   fi
   case "$tok" in
+    --auto|--auto=true)
+      AUTO_REQUESTED=1
+      continue
+      ;;
+    --disable-auto|--disable-auto=true)
+      DISABLE_AUTO_REQUESTED=1
+      continue
+      ;;
     --match-head-commit)
       SKIP_NEXT_AS="match"
       continue
@@ -3288,6 +3332,16 @@ for j in "${!TOKENS[@]}"; do
   fi
 done
 
+# Deferred merging outlives this local snapshot and cannot enforce a later
+# disagreement in repositories without review-state branch protection.
+if [ "$AUTO_REQUESTED" -eq 1 ]; then
+  echo "BLOCKED: deferred --auto merging cannot enforce the reviewer disagreement gate; use an immediate guarded merge." >&2
+  exit 2
+fi
+# Retraction is a safety operation, not a merge. Attribution checks above
+# still apply, but a blocker must never prevent cancelling an armed merge.
+[ "$DISABLE_AUTO_REQUESTED" -eq 0 ] || exit 0
+
 # Subcommand-scoped REPO_ARG wins over global GLOBAL_REPO (mirrors
 # gh's typical "more specific flag wins" behavior). Fall back to
 # the global value only if the subcommand didn't specify one.
@@ -3327,7 +3381,7 @@ fi
 # timestamped SUCCESS, so an UNSTABLE PR with a check still re-running counted
 # all-green and could merge before CI finished. `if any(.[]; .c=="PENDING")`
 # treats a group with ANY in-progress run as non-green regardless of timestamps.
-GH_JQ='.mergeStateStatus, .mergeable, ([.statusCheckRollup[] | {n:(.name//.context//"?"), c:(.conclusion//.state//"PENDING"), t:(.completedAt//.startedAt//"")}] | group_by(.n) | map(if any(.[]; .c == "PENDING") then "PENDING" else max_by(.t).c end) | map(select(. != "SUCCESS" and . != "SKIPPED" and . != "NEUTRAL")) | length), .url, .headRefOid, .author.login, .labels[].name'
+GH_JQ='.mergeStateStatus, .mergeable, ([.statusCheckRollup[] | {n:(.name//.context//"?"), c:(.conclusion//.state//"PENDING"), t:(.completedAt//.startedAt//"")}] | group_by(.n) | map(if any(.[]; .c == "PENDING") then "PENDING" else max_by(.t).c end) | map(select(. != "SUCCESS" and . != "SKIPPED" and . != "NEUTRAL")) | length), .url, .headRefOid, (.author.login // ""), .labels[].name'
 GH_ARGS=(pr view --json labels,mergeStateStatus,mergeable,statusCheckRollup,url,headRefOid,author --jq "$GH_JQ")
 if [ -n "$PR_SELECTOR" ]; then
   GH_ARGS=(pr view "$PR_SELECTOR" --json labels,mergeStateStatus,mergeable,statusCheckRollup,url,headRefOid,author --jq "$GH_JQ")
@@ -3397,7 +3451,7 @@ fi
 # (#1824). Fetch every page: latestReviews in gh pr view is bounded and can
 # hide a reviewer on a busy PR. COMMENTED/PENDING never supersede an opinion.
 if [[ ! "$PR_URL" =~ ^https://([^/]+)/([^/]+)/([^/]+)/pull/([0-9]+)$ ]] \
-   || [[ ! "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || [ -z "$PR_AUTHOR_LOGIN" ]; then
+   || [[ ! "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "BLOCKED: gh-pr-guard could not read the PR identity/head for reviewer disagreement checks." >&2
   exit 2
 fi

@@ -51,7 +51,7 @@ case "${1:-} ${2:-}" in
           --argjson additions "${STUB_PR_ADDITIONS:-0}" \
           --argjson deletions "${STUB_PR_DELETIONS:-0}" \
           --arg head "${STUB_PR_HEAD:-feature/some-branch}" \
-          --arg author "${STUB_PR_AUTHOR:-nathanjohnpayne}" \
+          --arg author "${STUB_PR_AUTHOR-nathanjohnpayne}" \
           '{body: $body, additions: $additions, deletions: $deletions, head: $head, author: $author}'
         exit 0
         ;;
@@ -61,7 +61,7 @@ case "${1:-} ${2:-}" in
         echo "${STUB_ROLLUP_NONGREEN:-0}"
         echo "https://github.com/example/repo/pull/123"
         echo "${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
-        echo "${STUB_PR_AUTHOR:-nathanjohnpayne}"
+        echo "${STUB_PR_AUTHOR-nathanjohnpayne}"
         if [ -n "${STUB_LABELS:-}" ]; then
           echo "$STUB_LABELS" | tr ';' '\n'
         fi
@@ -90,7 +90,7 @@ run_hook() {
   local additions="${6:-0}"
   local deletions="${7:-0}"
   local pr_head="${8:-feature/some-branch}"
-  local pr_author="${9:-nathanjohnpayne}"
+  local pr_author="${9-nathanjohnpayne}"
   local payload
   payload=$(jq -n --arg c "$cmd" '{tool_input: {command: $c}}')
   PATH="$STUB_DIR:$PATH" \
@@ -174,6 +174,15 @@ STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "head-scoped override refus
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "head-scoped override refuses a different server head precondition" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match --match-head-commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" BLOCKED
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "head-scoped override accepts the attached exact precondition" 0 "owner tiebreak" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match --match-head-commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" BLOCKED
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "duplicate head preconditions do not authorize a tiebreak" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides --match-head-commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" BLOCKED
+
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "review blockers never prevent cancelling auto-merge" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto' BLOCKED human-hold
+assert_rc_contains "deferred auto-merge refuses even before a review blocker arrives" 2 "deferred --auto" 'scripts/gh-as-author.sh -- gh pr merge 123 --auto --squash' CLEAN
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "a later command cannot supply the head precondition" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match ; echo --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "literal export form preserves a scoped owner tiebreak" 0 "owner tiebreak" "export BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ; $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "exported dynamic tiebreak is not treated as literal authority" 2 "CHANGES_REQUESTED" "export BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\$(echo x) ; $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "unset removes the captured export tiebreak" 2 "CHANGES_REQUESTED" "export BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ; unset BREAK_GLASS_REVIEW_DISAGREEMENT ; $merge_overrides" BLOCKED
+assert_rc_contains "a deleted PR author with no reviews remains mergeable" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' CLEAN '' MERGEABLE 0 '' 0 0 '' ''
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "a deleted PR author excludes no named reviewer" 2 "CHANGES_REQUESTED" "$merge_overrides" BLOCKED '' MERGEABLE 0 '' 0 0 '' ''
 
 assert_rc_contains "direct pr create blocked" 2 "token-verifying wrapper" \
   'gh pr create --title "t" --body "Authoring-Agent: claude

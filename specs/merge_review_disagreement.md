@@ -11,3 +11,5 @@ Admin and merge-state break-glass variables never release this gate. The owner m
 `tests/test_gh_pr_guard.sh` covers summary-only and older-head change requests, multiple pages, approval, dismissal, comments, bot and author identities, exact and mismatched overrides, and unavailable/malformed reads. The existing `scripts/ci/check_gh_as_author` entrypoint runs this suite.
 
 Consumer rollout must update each repository-owned policy snapshot with the disagreement rule and server head precondition before propagating the guard. The canonical pointer links to the hub policy so a frozen consumer snapshot cannot hide the new instructions.
+
+Deferred `--auto` merges refuse because this local review snapshot cannot govern a later merge. `--disable-auto` remains an attributed retraction and bypasses merge-only checks. Merge flags are scoped to the guarded shell command segment. A deleted PR author excludes no named reviewer from the disagreement check. Literal `export VAR=value; merge` is supported; dynamic exports never grant a tiebreak.
