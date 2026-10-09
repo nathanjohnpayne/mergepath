@@ -6,65 +6,79 @@ import re
 import shutil
 import subprocess
 import sys
-import time
 
 FIELD = re.compile(r'reviewed commit[^0-9a-z_\r\n]{0,6}([^\r\n]*)', re.I)
 HEX = re.compile(r'[0-9a-f]{7,40}', re.I)
-QUERY = '''query($owner:String!,$name:String!,$prefix:String!,$branch:String!,$tag:String!){
-  repository(owner:$owner,name:$name){
-    branch:ref(qualifiedName:$branch){name}
-    tag:ref(qualifiedName:$tag){name}
-    commit:object(expression:$prefix){__typename oid}
-  }
-}'''
 
 
 class Resolver:
     def __init__(self, repository):
         self.owner, self.name = repository.split('/')
         self.gh = shutil.which('gh')
-        self.deadline = time.monotonic() + 30
         self.cache = {}
+
+    def prefetch(self, prefixes):
+        prefixes = list(dict.fromkeys(value.lower() for value in prefixes if len(value) < 40))[:50]
+        self.cache = dict.fromkeys(prefixes)
+        if not self.gh or not prefixes:
+            return
+        # A hex-named branch/tag could shadow an ambiguous commit prefix.
+        # Resolve the bounded history in one request per scan. Aliases let a
+        # prefix-specific GraphQL error refuse that prefix without discarding
+        # independently verified objects from the same response.
+        fields = []
+        for index, prefix in enumerate(prefixes):
+            fields.extend([f'b{index}:ref(qualifiedName:"refs/heads/{prefix}"){{name}}',
+                           f't{index}:ref(qualifiedName:"refs/tags/{prefix}"){{name}}',
+                           f'c{index}:object(expression:"{prefix}"){{__typename oid}}'])
+        query = ('query($owner:String!,$name:String!){repository(owner:$owner,name:$name){'
+                 + ' '.join(fields) + '}}')
+        argv = [self.gh, 'api', 'graphql', '-f', 'query=' + query,
+                '-f', 'owner=' + self.owner, '-f', 'name=' + self.name]
+        try:
+            result = subprocess.run(argv, text=True, capture_output=True, timeout=10)
+            payload = json.loads(result.stdout)
+            if not isinstance(payload, dict):
+                return
+            errors = payload.get('errors', [])
+            if not isinstance(errors, list) or (result.returncode and not errors):
+                return
+            failed = set()
+            for error in errors:
+                path = error.get('path') if isinstance(error, dict) else None
+                if (not isinstance(path, list) or len(path) < 2 or path[0] != 'repository'
+                        or not isinstance(path[1], str) or not re.fullmatch(r'[btc]\d+', path[1])
+                        or int(path[1][1:]) >= len(prefixes)):
+                    return
+                failed.add(int(path[1][1:]))
+            repository = payload['data']['repository']
+            if not isinstance(repository, dict):
+                return
+            for index, prefix in enumerate(prefixes):
+                if index in failed or repository.get(f'b{index}', {}) is not None or repository.get(f't{index}', {}) is not None:
+                    continue
+                commit = repository.get(f'c{index}')
+                if not isinstance(commit, dict):
+                    continue
+                oid = commit.get('oid')
+                if (commit.get('__typename') == 'Commit' and isinstance(oid, str)
+                        and re.fullmatch('[0-9a-f]{40}', oid) and oid.startswith(prefix)):
+                    self.cache[prefix] = oid
+        except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired):
+            pass
 
     def resolve(self, prefix):
         prefix = prefix.lower()
-        if len(prefix) == 40:
-            return prefix
-        if prefix in self.cache:
-            return self.cache[prefix]
-        self.cache[prefix] = None
-        remaining = self.deadline - time.monotonic()
-        if not self.gh or remaining <= 0 or len(self.cache) > 50:
-            return None
-        # A hex-named branch/tag could shadow an ambiguous commit prefix.
-        # Read both exact refs alongside GitHub's revision resolver and refuse
-        # either alias; only an unambiguous Commit object can be normalized.
-        argv = [self.gh, 'api', 'graphql', '-f', 'query=' + QUERY,
-                '-f', 'owner=' + self.owner, '-f', 'name=' + self.name,
-                '-f', 'prefix=' + prefix, '-f', 'branch=refs/heads/' + prefix,
-                '-f', 'tag=refs/tags/' + prefix]
-        try:
-            result = subprocess.run(argv, text=True, capture_output=True,
-                                    timeout=min(remaining, 10))
-            if result.returncode:
-                return None
-            payload = json.loads(result.stdout)
-            if not isinstance(payload, dict) or payload.get('errors'):
-                return None
-            repository = payload['data']['repository']
-            if repository['branch'] is not None or repository['tag'] is not None:
-                return None
-            commit = repository['commit']
-            oid = commit['oid']
-            if (commit['__typename'] == 'Commit' and isinstance(oid, str)
-                    and re.fullmatch('[0-9a-f]{40}', oid) and oid.startswith(prefix)):
-                self.cache[prefix] = oid
-        except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired):
-            pass
-        return self.cache[prefix]
+        return prefix if len(prefix) == 40 else self.cache.get(prefix)
 
 
 def normalize(comments, bot, resolver):
+    resolver.prefetch(value for comment in comments
+                      if (comment.get('user') or {}).get('login') == bot
+                      and isinstance(comment.get('body'), str)
+                      for field in FIELD.finditer(comment['body'])
+                      for value in [field[1].strip('`* \t')]
+                      if HEX.fullmatch(value))
     result = []
     for comment in comments:
         body = comment.get('body')

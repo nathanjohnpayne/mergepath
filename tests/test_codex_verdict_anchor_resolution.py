@@ -18,8 +18,8 @@ class ResolutionTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name)
-        self.payload = {'data': {'repository': {'branch': None, 'tag': None,
-                        'commit': {'__typename': 'Commit', 'oid': SHA}}}}
+        self.payload = {'data': {'repository': {'b0': None, 't0': None,
+                        'c0': {'__typename': 'Commit', 'oid': SHA}}}}
         self.status = 0
         stub = self.path / 'gh'
         stub.write_text('''#!/usr/bin/env python3
@@ -33,7 +33,9 @@ sys.exit(int((p/'status').read_text()))
         stub.chmod(0o755)
 
     def invoke(self, body=None, bot=BOT):
-        comments = [{'id': 1, 'user': {'login': bot}, 'body': body or 'Codex Review: didn\'t find any major issues\n**Reviewed commit:** `' + SHA[:10] + '`'}]
+        bodies = body if isinstance(body, list) else [body or 'Codex Review: didn\'t find any major issues\n**Reviewed commit:** `' + SHA[:10] + '`']
+        comments = [{'id': index + 1, 'user': {'login': bot}, 'body': value}
+                    for index, value in enumerate(bodies)]
         (self.path/'payload').write_text(json.dumps(self.payload))
         (self.path/'status').write_text(str(self.status))
         result = subprocess.run(['python3', str(SCRIPT), '--repo', 'acme/widget', '--bot', BOT],
@@ -41,15 +43,16 @@ sys.exit(int((p/'status').read_text()))
                                 env={**os.environ, 'PATH': str(self.path)+os.pathsep+os.environ['PATH'],
                                      'ANCHOR_CASE': str(self.path)})
         self.assertEqual(result.returncode, 0, result.stderr)
-        return comments[0]['body'], json.loads(result.stdout)[0]['body']
+        self.output = json.loads(result.stdout)
+        return comments[0]['body'], self.output[0]['body']
 
     def test_unique_provider_abbreviation_becomes_full_exact_id(self):
         before, after = self.invoke()
         self.assertNotEqual(before, after)
         self.assertIn('Reviewed commit:** `' + SHA + '`', after)
         calls = [json.loads(line) for line in (self.path/'calls').read_text().splitlines()]
-        self.assertIn('branch=refs/heads/' + SHA[:10], calls[0])
-        self.assertIn('tag=refs/tags/' + SHA[:10], calls[0])
+        self.assertIn('refs/heads/' + SHA[:10], calls[0][3])
+        self.assertIn('refs/tags/' + SHA[:10], calls[0][3])
 
     def test_ambiguous_api_result_never_becomes_clearance(self):
         self.payload = {'data': {'repository': {'branch': None, 'tag': None, 'commit': None}},
@@ -57,7 +60,7 @@ sys.exit(int((p/'status').read_text()))
         self.assertEqual(*self.invoke())
 
     def test_branch_and_tag_aliases_cannot_shadow_a_collision(self):
-        for name in ('branch', 'tag'):
+        for name in ('b0', 't0'):
             self.payload['data']['repository'][name] = {'name': SHA[:10]}
             self.assertEqual(*self.invoke())
             self.payload['data']['repository'][name] = None
@@ -72,7 +75,7 @@ sys.exit(int((p/'status').read_text()))
     def test_wrong_type_prefix_or_overlong_oid_never_normalizes(self):
         for commit in ({'__typename': 'Tag', 'oid': SHA}, {'__typename': 'Commit', 'oid': 'b'*40},
                        {'__typename': 'Commit', 'oid': SHA+'a'}, {'__typename': 'Commit', 'oid': None}):
-            self.payload['data']['repository']['commit'] = commit
+            self.payload['data']['repository']['c0'] = commit
             self.assertEqual(*self.invoke())
 
     def test_full_id_requires_no_api_resolution(self):
@@ -98,6 +101,33 @@ sys.exit(int((p/'status').read_text()))
     def test_duplicate_prefix_reuses_one_bounded_api_read(self):
         self.invoke('Reviewed commit: '+SHA[:10]+'\nReviewed commit: '+SHA[:10])
         self.assertEqual(len((self.path/'calls').read_text().splitlines()), 1)
+
+    def test_distinct_historical_prefixes_use_one_api_read(self):
+        other = 'b' * 40
+        self.payload['data']['repository'].update(b1=None, t1=None,
+            c1={'__typename': 'Commit', 'oid': other})
+        before, after = self.invoke('Reviewed commit: '+SHA[:10]+'\nReviewed commit: '+other[:10])
+        self.assertEqual(before, after)  # Conflicting anchors still cannot clear.
+        calls = (self.path/'calls').read_text().splitlines()
+        self.assertEqual(len(calls), 1)
+        self.assertIn('c1:object', calls[0])
+
+    def test_prefix_error_does_not_poison_independent_resolution(self):
+        self.payload['errors'] = [{'message': 'ambiguous', 'path': ['repository', 'c1']}]
+        self.payload['data']['repository'].update(b1=None, t1=None, c1=None)
+        self.status = 1  # gh returns nonzero for partial GraphQL errors.
+        before, after = self.invoke(['Reviewed commit: '+SHA[:10], 'Reviewed commit: '+SHA[:11]])
+        self.assertNotEqual(before, after)
+        self.assertIn(SHA, after)
+        self.assertEqual(self.output[1]['body'], 'Reviewed commit: '+SHA[:11])
+        self.payload['errors'][0]['path'] = ['repository', 'c0']
+        self.assertEqual(*self.invoke())
+
+    def test_lookup_batch_has_a_fixed_prefix_limit(self):
+        body = '\n'.join('Reviewed commit: '+format(n, '010x') for n in range(60))
+        self.assertEqual(*self.invoke(body))
+        query = json.loads((self.path/'calls').read_text().splitlines()[0])[3]
+        self.assertEqual(query.count(':object('), 50)
 
 
 if __name__ == '__main__':
