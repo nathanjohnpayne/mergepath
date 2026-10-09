@@ -1,6 +1,6 @@
 {
-  "description": "Codex COMMENTED on HEAD with only P2/P3 findings (no P0/P1) \u2192 cleared (matches merge-gate semantics: P2/P3 are advisory)",
-  "expected_cleared": true,
+  "description": "Exact-head clean review requires same-agent context or an independent CLI approval.",
+  "expected_cleared": false,
   "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
   "codex_bot_login": "chatgpt-codex-connector[bot]",
   "reviews": [
@@ -18,22 +18,14 @@
     {
       "id": 5001,
       "pull_request_review_id": 1001,
-      "body": "![P2 Badge](https://example.com/p2.svg) Consider extracting this into a helper.",
-      "user": {
-        "login": "chatgpt-codex-connector[bot]"
-      }
-    },
-    {
-      "id": 5002,
-      "pull_request_review_id": 1001,
-      "body": "![P3 Badge](https://example.com/p3.svg) Nit: trailing whitespace.",
+      "body": "Nice work here \u2014 looks clean.",
       "user": {
         "login": "chatgpt-codex-connector[bot]"
       }
     }
   ],
-  "authoring_agent": "codex",
   "reviewer_accounts": [
     "nathanpayne-codex"
-  ]
+  ],
+  "has_cli_approval": false
 }

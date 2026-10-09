@@ -737,12 +737,12 @@ jobs:
                       latestTime = time;
                     }
                   }
-                  // An affirmative verdict substitutes for reviewer
+                  // An anchored review or affirmative verdict substitutes for reviewer
                   // approval only with same-agent context or an existing
                   // independent CLI approval.
                   const gateBSatisfied = sameAgentContext || cliApprovedReviews.length > 0;
                   if (latestKind === 'review') {
-                    codexCleared = !reviewHasUnresolvedP01;
+                    codexCleared = gateBSatisfied && !reviewHasUnresolvedP01;
                   } else if (latestKind === 'verdict') {
                     codexCleared = gateBSatisfied && verdictAffirmative && !reviewHasUnresolvedP01;
                   }

@@ -1,5 +1,5 @@
 {
-  "description": "Codex COMMENTED on HEAD; the only `![P1 Badge]`-bearing inline is a human quote-reply on a Codex thread \u2192 cleared (replies inherit pull_request_review_id but are not bot-authored; matches the nathanpaynedotcom#180 r3 fix in scripts/codex-review-check.sh)",
+  "description": "Exact-head clean review requires same-agent context or an independent CLI approval.",
   "expected_cleared": true,
   "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
   "codex_bot_login": "chatgpt-codex-connector[bot]",
@@ -11,22 +11,22 @@
       "submitted_at": "2026-05-12T10:00:00Z",
       "user": {
         "login": "chatgpt-codex-connector[bot]"
-      },
-      "body": "Codex Review: completed without findings."
+      }
     }
   ],
   "inline_comments": [
     {
       "id": 5001,
       "pull_request_review_id": 1001,
-      "body": "Addressed in 0123abc \u2014 was previously: `![P1 Badge]` retry loop. Confirming the bound is now 5 attempts.",
+      "body": "Nice work here \u2014 looks clean.",
       "user": {
-        "login": "nathanjohnpayne"
+        "login": "chatgpt-codex-connector[bot]"
       }
     }
   ],
-  "authoring_agent": "codex",
   "reviewer_accounts": [
     "nathanpayne-codex"
-  ]
+  ],
+  "has_cli_approval": true,
+  "authoring_agent": "unknown"
 }

@@ -1,5 +1,5 @@
 {
-  "description": "Codex COMMENTED on HEAD with zero P0/P1 inline findings → cleared",
+  "description": "Codex COMMENTED on HEAD with zero P0/P1 inline findings \u2192 cleared",
   "expected_cleared": true,
   "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
   "codex_bot_login": "chatgpt-codex-connector[bot]",
@@ -9,15 +9,23 @@
       "state": "COMMENTED",
       "commit_id": "deadbeefcafe1234567890abcdef1234567890ab",
       "submitted_at": "2026-05-12T10:00:00Z",
-      "user": { "login": "chatgpt-codex-connector[bot]" }
+      "user": {
+        "login": "chatgpt-codex-connector[bot]"
+      }
     }
   ],
   "inline_comments": [
     {
       "id": 5001,
       "pull_request_review_id": 1001,
-      "body": "Nice work here — looks clean.",
-      "user": { "login": "chatgpt-codex-connector[bot]" }
+      "body": "Nice work here \u2014 looks clean.",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]"
+      }
     }
+  ],
+  "authoring_agent": "codex",
+  "reviewer_accounts": [
+    "nathanpayne-codex"
   ]
 }
