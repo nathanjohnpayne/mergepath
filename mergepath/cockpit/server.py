@@ -281,7 +281,9 @@ class Handler(BaseHTTPRequestHandler):
         if length > 4096:
             self._respond(413, {"error": "body_too_large"})
             return
-        public = self.command == "GET" and parts.path in {"/bootstrap", "/bootstrap.js"} and not parts.query
+        # The printed base URL serves the same secret-free transport document,
+        # which reopens this browser's stored session without disclosing it (#1848).
+        public = self.command == "GET" and parts.path in {"/", "/bootstrap", "/bootstrap.js"} and not parts.query
         bootstrap = self.command == "POST" and parts.path == "/api/bootstrap" and not parts.query
         if bootstrap:
             if (origin != "http://" + host or length or not app.bootstrap(
@@ -374,7 +376,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(405, {"error": "method_not_allowed"})
             return
         if public:
-            suffix = "bootstrap.html" if parts.path == "/bootstrap" else "bootstrap.js"
+            suffix = "bootstrap.js" if parts.path == "/bootstrap.js" else "bootstrap.html"
             data = (Path(__file__).parent / suffix).read_bytes()
             self._respond(200, raw=data, content_type="text/html; charset=utf-8" if suffix.endswith("html")
                           else "text/javascript; charset=utf-8")

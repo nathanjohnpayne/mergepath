@@ -975,7 +975,7 @@ class ServerTests(unittest.TestCase):
     def test_namespace_is_required_with_cookie_and_never_disclosed_unscoped(self):
         self.bootstrap()
         self.assertEqual(len(self.app._scope), 43)
-        for route in ["/", "/api/session", "/api/snapshot", "/api/panels/prs", "/events", "/assets/fixture.js"]:
+        for route in ["/api/session", "/api/snapshot", "/api/panels/prs", "/events", "/assets/fixture.js", "/?reopen=1"]:
             status, headers, body = self.request(path=route, scoped=False)
             self.assertEqual(status, 404)
             self.assertNotIn("Location", headers)
@@ -985,6 +985,26 @@ class ServerTests(unittest.TestCase):
         for prefix in ["/s/" + "x" * 43 + "/", self.app.scope_path.rstrip("/") + "extra/"]:
             self.assertEqual(self.request(path=prefix + "api/snapshot", scoped=False)[0], 404)
         self.assertEqual(self.request()[0], 200)
+
+    def test_printed_base_url_serves_only_the_secret_free_reopen_document(self):
+        # The terminal prints the base URL; it reopens the stored session in the browser
+        # that launched it and must never disclose the namespace or a credential (#1848).
+        self.bootstrap()
+        transport = (ROOT / "mergepath/cockpit/bootstrap.html").read_bytes()
+        for authenticated in (True, False):
+            with self.subTest(authenticated=authenticated):
+                status, headers, body = self.request(path="/", scoped=False, authenticated=authenticated)
+                self.assertEqual(status, 200)
+                self.assertEqual(body, transport)
+                self.assertNotIn("Location", headers)
+                self.assertNotIn("Set-Cookie", headers)
+                self.assertEqual(headers["Content-Security-Policy"], CSP)
+                self.assertEqual(headers["Cache-Control"], "no-store")
+                for secret in [self.app._scope, self.app._session, self.app._nonce, self.app._csrf, TOKEN]:
+                    self.assertNotIn(secret.encode(), body)
+        for method in ["POST", "PUT", "DELETE"]:
+            with self.subTest(method=method):
+                self.assertEqual(self.request(method, path="/", scoped=False)[0], 404)
 
     def test_two_instances_and_sibling_port_cannot_overwrite_or_replay_cookie_alone(self):
         second = Application(self.app.inventory, self.github, static_root=self.root, logger=self.logs.append)
@@ -1705,8 +1725,11 @@ class InventoryAndLauncherTests(unittest.TestCase):
                 self.assertTrue(all(not path.exists() for path in workspaces))
                 self.assertEqual(len(workspaces), 0 if fault == "missing-tool" else 1)
                 self.assertIn("Fleet audits unavailable", output.getvalue())
-                for private in (TOKEN, temp, "fixture-private-workspace-failure", "fixture-author-secret", "fixture-ambient-secret"):
+                for private in (TOKEN, temp, "fixture-private-workspace-failure", "fixture-author-secret", "fixture-ambient-secret",
+                                applications[0]._scope, applications[0]._nonce, applications[0]._session, applications[0]._csrf):
                     self.assertNotIn(private, output.getvalue())
+                self.assertRegex(output.getvalue(), r"Mergepath Cockpit: http://127\.0\.0\.1:\d+/\n")
+                self.assertIn("Open that URL again in the browser it launched", output.getvalue())
 
     def test_launcher_agent_reaches_main_sync_provider_without_credentials(self):
         with tempfile.TemporaryDirectory() as temp:

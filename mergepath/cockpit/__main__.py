@@ -182,6 +182,7 @@ def main(argv=None):
         return 1
     port = server.server_address[1]
     print(f"Mergepath Cockpit: http://127.0.0.1:{port}/", flush=True)
+    print("Open that URL again in the browser it launched to return to the Cockpit.", flush=True)
     print("Shared observations ready. Ctrl-C stops the local server.", flush=True)
     app.scheduler.start()
     thread = threading.Thread(target=server.serve_forever, daemon=True, name="cockpit-http")
