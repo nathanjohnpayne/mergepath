@@ -211,20 +211,11 @@ jobs:
             fi
           done
           echo "Opened pending entries for all three contexts on $HEAD_SHA."
-          # Post-POST re-read (cross-agent round 5): if the parent flipped
-          # to completed inside this step's few-second window, the
-          # completed delivery's pass STARTS after these holds exist — the
-          # delivery post-dates parent completion, which post-dates the
-          # in_progress read above — so its freshness guard reads them as
-          # pre-pass phase-1 holds and its verdicts supersede them. A
-          # strand would need an entire pass (checkout plus three gate
-          # scripts) to fit inside this step's gap, which the duration
-          # floor excludes; the pathological remainder is retired by the
-          # sweep within one interval.
-          if parent_status=$(gh api "repos/$REPO/actions/runs/$PARENT_RUN_ID" --jq .status) \
-              && [ "$parent_status" = "completed" ]; then
-            echo "::warning::Parent completed during the POST burst. If its pass finished before these holds landed, they stay pending until the next publisher pass (sweep at worst); a pass that starts after them retires them via its freshness read."
-          fi
+          # A completion during this burst is handled by the completed
+          # delivery and its freshness guard, or the next sweep. Reading the
+          # parent again here cannot retract or repair these writes; it only
+          # emitted a warning and consumed another installation-budget GET.
+          # Keep the two pre-write status fences; omit that diagnostic read.
           [ "$open_failed" -eq 0 ] || exit 1
 
   # Phase 2. POSTs a fresh completed run per context rather than PATCHing
