@@ -19,8 +19,13 @@ function storage() {
 function remember(value) {
   try { storage()?.setItem(STORED_SCOPE, value); } catch { /* reopen is a convenience */ }
 }
-function forget() {
-  try { storage()?.removeItem(STORED_SCOPE); } catch { /* nothing to clear */ }
+// Remove only the namespace that failed: a launch in another tab may have
+// stored a newer one while this probe was in flight.
+function forget(expected) {
+  try {
+    const store = storage();
+    if (store && store.getItem(STORED_SCOPE) === expected) store.removeItem(STORED_SCOPE);
+  } catch { /* nothing to clear */ }
 }
 function recall() {
   try {
@@ -58,7 +63,8 @@ async function establishSession(status) {
 async function reopenSession(status) {
   let stored = recall();
   if (!stored) {
-    forget();
+    const raw = (() => { try { return storage()?.getItem(STORED_SCOPE) ?? null; } catch { return null; } })();
+    if (raw !== null) forget(raw);
     status.textContent = "No Cockpit session in this browser. Open the Cockpit from the browser scripts/cockpit.sh launched, or relaunch it.";
     return;
   }
@@ -73,7 +79,7 @@ async function reopenSession(status) {
   }
   if (response.status === 401 || response.status === 404) {
     // 401: the cookie expired or was cleared. 404: the server restarted with a new namespace.
-    stored = null; forget();
+    forget(stored); stored = null;
     status.textContent = "This Cockpit session has ended. Relaunch scripts/cockpit.sh to start a new one.";
     return;
   }

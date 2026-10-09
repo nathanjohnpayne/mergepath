@@ -147,6 +147,12 @@ test("reopen forgets an ended session on 401 or 404 and keeps it across transien
     assert.equal(run.store.size, 0, `status ${status}`); assert.match(run.status.textContent, /session has ended/);
     assert.equal(run.calls.some(call => call[0] === "navigate"), false);
   }
+  // A launch in another tab stores a newer namespace while this probe is in flight.
+  let racing;
+  racing = runBootstrap({stored: scope, respond: async () => {
+    await Promise.resolve(); racing.store.set("mergepath.cockpit.scope", "f".repeat(43)); return {ok: false, status: 404};}});
+  await racing.settle();
+  assert.equal(racing.store.get("mergepath.cockpit.scope"), "f".repeat(43), "a newer launch survives a stale probe");
   const busy = runBootstrap({stored: scope, respond: async () => ({ok: false, status: 503})}); await busy.settle();
   assert.equal(busy.store.get("mergepath.cockpit.scope"), scope); assert.equal(busy.calls.some(call => call[0] === "navigate"), false);
   const down = runBootstrap({stored: scope, respond: async () => {throw new TypeError("network");}}); await down.settle();

@@ -285,7 +285,7 @@ class Handler(BaseHTTPRequestHandler):
         # which reopens this browser's stored session without disclosing it (#1848).
         # urlsplit reports an empty query for a bare trailing "?", so check the raw target.
         public = self.command == "GET" and parts.path in {"/", "/bootstrap", "/bootstrap.js"} and "?" not in self.path
-        bootstrap = self.command == "POST" and parts.path == "/api/bootstrap" and not parts.query
+        bootstrap = self.command == "POST" and parts.path == "/api/bootstrap" and "?" not in self.path
         if bootstrap:
             if (origin != "http://" + host or length or not app.bootstrap(
                     self._single("X-Cockpit-Bootstrap"), self._single("X-Cockpit-CSRF"))):

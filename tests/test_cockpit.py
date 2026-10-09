@@ -1072,6 +1072,17 @@ class ServerTests(unittest.TestCase):
         self.app._nonce_used = False; self.app._nonce_expires = 0
         self.assertFalse(self.app.bootstrap(self.app._nonce, self.app._nonce))
 
+    def test_bootstrap_post_with_a_bare_query_marker_is_refused_without_consuming_the_nonce(self):
+        launch = [("Host", self.host), ("Origin", "http://" + self.host),
+                  ("X-Cockpit-Bootstrap", self.app._nonce), ("X-Cockpit-CSRF", self.app._nonce)]
+        for path in ["/api/bootstrap?", "/api/bootstrap?x=1"]:
+            with self.subTest(path=path):
+                status, headers, _body = self.request("POST", path, authenticated=False, scoped=False, headers=launch)
+                self.assertEqual(status, 404)
+                self.assertNotIn("Set-Cookie", headers)
+        self.assertFalse(self.app._nonce_used)
+        self.bootstrap()
+
     def test_concurrent_bootstrap_consumes_nonce_once(self):
         barrier = threading.Barrier(2)
         outcomes = []
