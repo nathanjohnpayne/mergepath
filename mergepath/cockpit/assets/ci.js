@@ -44,7 +44,9 @@
         && (checksOnly ? row.rerun_command === null : row.rerun_command === null || row.rerun_command === `gh run rerun ${row.id} --failed --repo ${row.repo}`)
         && (!row.actionable || row.current_head === true && row.severity !== null)
         && (row.orphaned === undefined || row.orphaned === false || row.orphaned === true && !checksOnly && row.status === "queued"
-          && row.jobs_scope === "all-attempts" && !row.jobs.some(job => job.attempt === null || job.attempt === row.attempt)));
+          && row.jobs_scope === "all-attempts" && !row.jobs.some(job => job.attempt === null || job.attempt === row.attempt))
+        && (row.orphan_reason === undefined || row.orphan_reason === null && row.orphaned !== true
+          || typeof row.orphan_reason === "string" && codePointLength(row.orphan_reason) <= 1000 && row.orphaned === true));
       keys.add(row.key);
       const jobIds = new Set();
       for (const job of row.jobs) {
@@ -171,7 +173,10 @@
         pip.className = `ci-pip ci-pip-${stepTone(job)}`; pip.setAttribute("aria-label", `${job.name}: ${job.conclusion ?? job.status}`);
       });
       this.flag.hidden = !row.actionable && !row.check_evidence_unknown && !row.superseded && !row.diagnostics.length && row.orphaned !== true;
-      this.reason.textContent = row.reason ?? (row.superseded ? "Failed history superseded by a later run of the same checks." : row.check_evidence_unknown ? "Failed run; current-check evidence unavailable." : "Check-run diagnostics observed · expand the run to read them.");
+      // An orphaned rerun can carry an earlier attempt's diagnosis as well as its own: show both.
+      const detail = row.reason ?? (row.superseded ? "Failed history superseded by a later run of the same checks." : row.check_evidence_unknown ? "Failed run; current-check evidence unavailable."
+        : row.orphaned === true && !row.diagnostics.length ? null : "Check-run diagnostics observed · expand the run to read them.");
+      this.reason.textContent = [detail, row.orphaned === true ? row.orphan_reason : null].filter(Boolean).join(" ");
       this.command.hidden = row.rerun_command === null; this.command.textContent = row.rerun_command ?? "";
       const wanted = new Set(row.jobs.map(job => job.id));
       for (const [id, view] of this.jobs) if (!wanted.has(id)) {view.root.remove(); this.jobs.delete(id);}

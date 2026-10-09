@@ -33,6 +33,7 @@ ORPHAN_SECONDS = 6 * 3600
 # GitHub does not promise that a new job changes the run's updated_at, so a cached orphan's
 # jobs are read again at least this often.
 ORPHAN_RECHECK_SECONDS = 1800
+ORPHAN_REASON = 'Queued with no jobs in this attempt for over 6h: GitHub never started it, and it will not run.'
 SHA = re.compile(r'[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?\Z')
 DECIMAL = re.compile(r'[1-9][0-9]{0,79}\Z')
 ANSI = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*?(?:\x07|\x1b\\|$))')
@@ -250,10 +251,8 @@ def group_runs(repo, raw_runs, jobs, checks, heads, now=None):
                    'jobs': copy.deepcopy(fetched or []), 'checks': owned, **evidence,
                    'check_evidence_unknown': raw.get('conclusion') in FAILURES and (unproven or not any(c['conclusion'] in FAILURES for c in owned)),
                    'rerun_command': f'gh run rerun {run_id} --failed --repo {repo}' if raw.get('conclusion') in FAILURES else None,
-                   'orphaned': ghost}
-            # An actionable failure from an earlier attempt keeps its own diagnosis.
-            if ghost and not row['actionable']:
-                row['reason'] = 'Queued with no jobs in this attempt for over 6h: GitHub never started it, and it will not run.'
+                   # Separate from reason: an earlier attempt's failure keeps its own diagnosis beside it.
+                   'orphaned': ghost, 'orphan_reason': ORPHAN_REASON if ghost else None}
             rows.append(row)
             key = (number, sha)
             groups.setdefault(key, {'repo': repo, 'pr': number, 'sha': sha, 'run_keys': []})['run_keys'].append(row['key'])

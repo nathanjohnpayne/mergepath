@@ -559,8 +559,8 @@ class ProviderTests(unittest.TestCase):
         rows = {row['id']: row for row in result['data']['runs']}
         self.assertEqual({rid: row['orphaned'] for rid, row in rows.items()}, {'30': True, '31': False, '32': False},
                          'only an old queued run with zero jobs is orphaned; a young one or one with a job is waiting')
-        self.assertIn('never started', rows['30']['reason'])
-        self.assertIsNone(rows['31']['reason'])
+        self.assertIn('never started', rows['30']['orphan_reason']); self.assertIsNone(rows['30']['reason'])
+        self.assertIsNone(rows['31']['orphan_reason']); self.assertIsNone(rows['31']['reason'])
         self.assertEqual(rows['30']['status'], 'queued', 'the observed status is reported unchanged')
         for status in ('in_progress', 'waiting', 'pending', 'requested'):
             with self.subTest(status=status):
@@ -603,6 +603,7 @@ class ProviderTests(unittest.TestCase):
         row = failed_rerun_orphan()['data']['runs'][0]
         self.assertTrue(row['orphaned']); self.assertTrue(row['actionable']); self.assertEqual(row['current_head'], True)
         self.assertNotIn('never started', row['reason'] or '', 'an actionable failure keeps its own diagnosis')
+        self.assertIn('never started', row['orphan_reason'], 'and the orphan explanation sits beside it')
         self.assertEqual(row['reason'], group_runs(REPO, [{**orphan_run(sha=SHA), 'status': 'completed', 'conclusion': 'failure'}],
                                                    {'30': [normalize_job(raw_job(300, 100))]}, supersede([normalize_check(REPO, raw_check(100), {})]), {'7': SHA})[0][0]['reason'])
         self.assertEqual([job['attempt'] for job in row['jobs']], ['1'])
