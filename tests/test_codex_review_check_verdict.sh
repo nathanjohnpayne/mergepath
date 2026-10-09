@@ -306,7 +306,7 @@ for n in 6 7 8 12 20 39; do
     "$(mk "$BOT" "Codex Review: Didn't find any major issues.
 Reviewed commit: ${HEAD:0:$n}" "2026-07-01T10:00:00Z")"
 done
-for token in "${HEAD}a" "${HEAD}g"; do
+for token in "${HEAD}a" "${HEAD}g" "${HEAD}-not-a-sha" "${HEAD}/suffix" "${HEAD}.junk" "${HEAD}_junk"; do
   check_case "overlong or malformed SHA refuses" "" \
     "$(mk "$BOT" "Codex Review: Didn't find any major issues.
 Reviewed commit: $token" "2026-07-01T10:00:00Z")"

@@ -173,8 +173,8 @@ CURRENT_SIGNAL=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -c \
   def verdict_shas($body):
     [ $body
       | ascii_downcase
-      | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([0-9a-z_]+)")
-      | .[0]
+      | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([^\\r\\n]*)")
+      | .[0] | sub("^[`*[:space:]]+"; "") | sub("[`*[:space:]]+$"; "")
     ];
   .[0] as $comments |
   .[1] as $reviews |
@@ -234,8 +234,8 @@ CANDIDATES=$(printf '%s' "$COMMENTS_JSON" | jq -r \
     | . as $c
     | [ $c.body
         | ascii_downcase
-        | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([0-9a-z_]+)")
-        | .[0]
+        | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([^\\r\\n]*)")
+        | .[0] | sub("^[`*[:space:]]+"; "") | sub("[`*[:space:]]+$"; "")
       ] as $shas
     | select(($shas | length) > 0
              and ($shas | length) == ([$c.body | ascii_downcase | scan("reviewed commit")] | length)
@@ -305,8 +305,8 @@ while IFS=$'\t' read -r source_time source_sha; do
     def verdict_shas($body):
       [ $body
         | ascii_downcase
-        | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([0-9a-z_]+)")
-        | .[0]
+        | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([^\\r\\n]*)")
+        | .[0] | sub("^[`*[:space:]]+"; "") | sub("[`*[:space:]]+$"; "")
       ];
     .[0] as $comments |
     .[1] as $reviews |
@@ -343,8 +343,8 @@ while IFS=$'\t' read -r source_time source_sha; do
     def verdict_shas($body):
       [ $body
         | ascii_downcase
-        | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([0-9a-z_]+)")
-        | .[0]
+        | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([^\\r\\n]*)")
+        | .[0] | sub("^[`*[:space:]]+"; "") | sub("[`*[:space:]]+$"; "")
       ];
     .[0] as $comments |
     .[1] as $reviews |

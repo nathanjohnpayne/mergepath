@@ -937,8 +937,8 @@ scan_codex_state() {
         | . as $c
         | ( [ $c.body
               | ascii_downcase
-              | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([0-9a-z_]+)")
-              | .[0]
+              | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([^\\r\\n]*)")
+              | .[0] | sub("^[`*[:space:]]+"; "") | sub("[`*[:space:]]+$"; "")
             ] ) as $shas
         | select( ($shas | length) > 0
                   and ($shas | length) == ([$c.body | ascii_downcase | scan("reviewed commit")] | length)

@@ -20,6 +20,24 @@ gh_resolver_repo_root() {
   printf '%s\n' "$this_dir"
 }
 
+# Public wrappers can enter with preflight credentials already exported.
+# Reject repository-relative command search before any external tool runs;
+# absolute operator-selected PATH directories remain the trust boundary.
+gh_wrapper_validate_path() {
+  local remaining="${PATH-}" entry
+  while :; do
+    entry="${remaining%%:*}"
+    case "$entry" in
+      /*) ;;
+      *) echo "gh-as-wrapper: refusing relative or empty PATH entry before credential-bearing command lookup." >&2; return 5 ;;
+    esac
+    case "$remaining" in
+      *:*) remaining="${remaining#*:}" ;;
+      *) break ;;
+    esac
+  done
+}
+
 # gh sends GH_TOKEN only to github.com; any other host reads
 # GH_ENTERPRISE_TOKEN / GITHUB_ENTERPRISE_TOKEN, then a stored login. The
 # wrappers set both to this fixed non-credential value for the wrapped command:
@@ -80,9 +98,32 @@ gh_author_payload_kind() { # <payload...>
 # the credential helper list is reset to gh's (which reads GH_TOKEN), extra
 # headers are reset, hooks are disabled, and SSH github.com spellings are
 # rewritten to HTTPS so the helper, not an SSH key, decides.
+# Capture Git before any validation probe: preflight credentials may already
+# be exported by the caller. Reuse this path for the probes and the push.
+gh_author_resolve_git() {
+  local git_bin
+  git_bin="$(command -v git 2>/dev/null || true)"
+  case "$git_bin" in
+    /*) ;;
+    *) echo "gh-as-author: refusing git: git does not resolve to an absolute path ('${git_bin:-not found}')." >&2; return 5 ;;
+  esac
+  case "$git_bin" in
+    *"'"*|*'\'*) echo "gh-as-author: refusing git: the git path contains a quote or backslash." >&2; return 5 ;;
+  esac
+  printf '%s\n' "$git_bin"
+}
+
 gh_author_git_exec() { # <token> <git args...>
-  local token="$1" home rc gh_bin
+  local token="$1" git_bin
   shift
+  git_bin="$(gh_author_resolve_git)" || return 5
+  gh_author_git_exec_at "$token" "$git_bin" "$@"
+}
+
+# Internal transport entry point; its Git path was captured by the caller.
+gh_author_git_exec_at() { # <token> <absolute git binary> <git args...>
+  local token="$1" git_bin="$2" home rc gh_bin
+  shift 2
   # The credential helper names gh by ABSOLUTE path, resolved here, before
   # git enters the repository: a bare `!gh` is looked up after `git -C`
   # changes directory, so a relative PATH entry (".") would run a gh file the
@@ -111,7 +152,7 @@ gh_author_git_exec() { # <token> <git args...>
     GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= SSH_ASKPASS= \
     GH_TOKEN="$token" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
     GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
-    git -c credential.helper= -c "credential.helper=!'$gh_bin' auth git-credential" \
+    "$git_bin" -c credential.helper= -c "credential.helper=!'$gh_bin' auth git-credential" \
         -c http.extraHeader= \
         -c core.hooksPath=/dev/null \
         -c url.https://github.com/.insteadOf=git@github.com: \
@@ -139,8 +180,9 @@ gh_author_git_exec() { # <token> <git args...>
 #     every key at most once; anything else refuses the push.
 # <owner/repo> comes from the caller's trusted input, never from the URL.
 gh_author_git_push() { # <token> <owner/repo> -C <dir> push -u origin HEAD
-  local token="$1" expected="$2" dir="$4"
+  local token="$1" expected="$2" dir="$4" git_bin
   shift 2
+  git_bin="$(gh_author_resolve_git)" || return 5
   case "$expected" in
     ''|*[!A-Za-z0-9._/-]*|*/*/*|/*|*/) expected="" ;;
     */*) ;;
@@ -156,8 +198,8 @@ gh_author_git_push() { # <token> <owner/repo> -C <dir> push -u origin HEAD
     echo "gh-as-author: refusing git push: $dir/.git is not a plain directory (linked worktree, submodule or gitdir file)." >&2
     return 5
   fi
-  gitdir="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR git -C "$top" rev-parse --absolute-git-dir 2>/dev/null)" || gitdir=""
-  common="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR git -C "$top" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || common=""
+  gitdir="$(unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR; "$git_bin" -C "$top" rev-parse --absolute-git-dir 2>/dev/null)" || gitdir=""
+  common="$(unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR; "$git_bin" -C "$top" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || common=""
   if [ "$gitdir" != "$top/.git" ] || [ "$common" != "$top/.git" ] || [ -e "$top/.git/config.worktree" ]; then
     echo "gh-as-author: refusing git push: $dir is not a primary repository whose git dir is $dir/.git." >&2
     return 5
@@ -166,7 +208,7 @@ gh_author_git_push() { # <token> <owner/repo> -C <dir> push -u origin HEAD
   local cfg entry key value seen=" " bad="" rc=0
   local want_https="https://github.com/$expected.git" want_ssh="git@github.com:$expected.git"
   cfg="$(mktemp "${TMPDIR:-/tmp}/gh-as-author-cfg.XXXXXX")" || return 5
-  env -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT git config --file "$top/.git/config" --no-includes --list -z >"$cfg" 2>/dev/null || rc=$?
+  (unset GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT; "$git_bin" config --file "$top/.git/config" --no-includes --list -z) >"$cfg" 2>/dev/null || rc=$?
   if [ "$rc" -ne 0 ]; then
     rm -f "$cfg"
     echo "gh-as-author: refusing git push: could not parse $dir/.git/config." >&2
@@ -200,7 +242,7 @@ gh_author_git_push() { # <token> <owner/repo> -C <dir> push -u origin HEAD
     printf '%s' "$bad" | sed -E 's#//[^/@]*@#//<redacted>@#g; s/^/  /' >&2
     return 5
   fi
-  gh_author_git_exec "$token" "$@"
+  gh_author_git_exec_at "$token" "$git_bin" "$@"
 }
 
 gh_default_reviewer_identity() {
