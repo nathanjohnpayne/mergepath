@@ -602,7 +602,7 @@ if relay_job.is_a?(Hash)
     before = relay_run.index("fingerprint_before=")
     evaluate = relay_run.index("scripts/codex-p1-gate.sh")
     after = relay_run.index("fingerprint_after=")
-    complete = relay_run.index("status=complete")
+    complete = relay_run.index(%q{marker="<!-- mergepath-feedback-archive-relay:v2})
     close = relay_run.index('check-runs/$check_id')
     delete = relay_run.index('actions/artifacts/$ARTIFACT_ID')
     require_shape.call(

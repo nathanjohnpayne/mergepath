@@ -994,6 +994,10 @@ jobs:
                   "repos/$REPO/issues/$PR/comments" | jq -s 'add // []'); then
                   relay_scan_error=true
                 else
+                  if ! relay_comments=$(printf '%s' "$relay_comments" \
+                    | python3 scripts/workflow/verified-relay-markers.py --repo "$REPO" --pr "$PR"); then
+                    relay_scan_error=true
+                  fi
                   terminal_runs=$(printf '%s' "$relay_comments" | jq -c '[
                     .[] | select(.user.login == "github-actions[bot]") | .body // ""
                     | try capture("^<!-- mergepath-feedback-archive-relay:v1 run=(?<run>[0-9]+) status=(?<status>complete|failed) -->$").run
@@ -1001,7 +1005,7 @@ jobs:
                     | tonumber
                   ]')
                   if jq -e --argjson terminal "$terminal_runs" \
-                    'any(.[] as $run; ($terminal | index($run)) == null)' \
+                    'any(.[]; . as $run | ($terminal | index($run)) == null)' \
                     <<<"$source_runs" >/dev/null; then
                     relay_pending=true
                   fi

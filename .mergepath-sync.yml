@@ -2013,6 +2013,11 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/gh-retry-helpers.sh"
+  - path: tests/test_marker_provenance.py
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/"
   - path: .github/workflows/pr-audit.yml
     type: canonical
     consumers: all
@@ -2218,6 +2223,7 @@ paths:
       - "tests/test_codex_p1_gate.sh"          # check_codex_p1_gate
       - "tests/test_codex_p1_workflow_runtime.sh"  # check_codex_p1_gate (#1230/#1434)
       - "tests/test_review_feedback_accounting.sh"  # check_review_feedback_accounting (#1000)
+      - "tests/test_marker_provenance.py"  # trusted marker evidence (#1546)
       - "scripts/review-feedback-accounting.sh"  # check_review_feedback_accounting (#1000)
       - "scripts/render-feedback-archive.sh"  # check_review_feedback_accounting (#1000)
       - "scripts/review-feedback-surface-fingerprint.sh"  # check_review_feedback_accounting (#1000)

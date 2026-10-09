@@ -62,6 +62,8 @@ if [ "$SOURCE_LOGIN" = 'github-actions[bot]' ] && awk '
     { record=$0; next }
   NR == 1 && $0 ~ /^<!-- mergepath-feedback-archive-relay:v1 run=[0-9]+ status=(complete|failed) -->$/ \
     { record=$0; next }
+  NR == 1 && $0 ~ /^<!-- mergepath-feedback-archive-relay:v2 run=[0-9]+ publisher=[0-9]+ status=complete -->$/ \
+    { record=$0; next }
   { extra=1 }
   END { if (record != "" && !extra) print record; else exit 1 }
 ' "$PREVIOUS_BODY_FILE"; then

@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""Exercise real marker readers against authenticated-API boundary fixtures."""
+import copy
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / 'scripts/workflow/verified-relay-markers.py'
+REPO = 'acme/widget'
+MARKER = '<!-- mergepath-feedback-archive-relay:v2 run=12345 publisher=900 status=complete -->'
+LOG = '''2026-10-09T00:00:00Z ##[group]Run set -euo pipefail
+2026-10-09T00:00:00Z   shell: /usr/bin/bash -e {0}
+2026-10-09T00:00:00Z   env:
+2026-10-09T00:00:00Z     PR_NUMBER: 7
+2026-10-09T00:00:00Z     SOURCE_RUN_ID: 12345
+2026-10-09T00:00:00Z     HANDOFF_FILE: /tmp/handoff/codex-p1-read-only-handoff.json
+2026-10-09T00:00:00Z ##[endgroup]
+'''
+
+
+class RelayTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name)
+        self.run = {'id': 900, 'event': 'workflow_run', 'path': '.github/workflows/codex-feedback-archive-relay.yml',
+                    'head_branch': 'main', 'head_sha': 'a' * 40, 'repository': {'full_name': REPO}}
+        self.job = {'id': 901, 'run_id': 900, 'steps': [
+            {'name': 'Persist archive and publish the exact-head gate', 'conclusion': 'success'}]}
+        self.responses = {
+            'repos/' + REPO: {'default_branch': 'main'},
+            'repos/' + REPO + '/actions/runs/900': self.run,
+            'repos/' + REPO + '/actions/runs/900/jobs?filter=all&per_page=100': [{'jobs': [self.job]}],
+            'repos/' + REPO + '/actions/jobs/901/logs': LOG,
+        }
+        self.comments = [{'user': {'login': 'github-actions[bot]'}, 'body': MARKER,
+                          'created_at': '2026-10-09T00:00:00Z'}]
+        gh = self.path / 'gh'
+        gh.write_text('''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+root=Path(os.environ['PROVENANCE_CASE']); endpoint=sys.argv[-1]
+with (root/'calls').open('a') as out: out.write(endpoint+'\\n')
+responses=json.loads((root/'responses').read_text()); value=responses.get(endpoint)
+if value is None:
+    sys.stderr.write('Not Found (HTTP 404)'); raise SystemExit(1)
+if isinstance(value,dict) and '_error' in value:
+    sys.stderr.write(value['_error']); raise SystemExit(1)
+print(value if isinstance(value,str) else json.dumps(value))
+''')
+        gh.chmod(0o755)
+
+    def invoke(self):
+        (self.path / 'responses').write_text(json.dumps(self.responses))
+        env = dict(os.environ, PATH=str(self.path) + os.pathsep + os.environ['PATH'], PROVENANCE_CASE=str(self.path))
+        result = subprocess.run(['python3', str(SCRIPT), '--repo', REPO, '--pr', '7'],
+                                input=json.dumps(self.comments), text=True, capture_output=True, env=env)
+        return result.returncode, json.loads(result.stdout) if result.stdout else [], result.stderr
+
+    def test_default_workflow_success_bound_to_source_and_pr_promotes_completion(self):
+        code, comments, error = self.invoke()
+        self.assertEqual(code, 0, error)
+        self.assertEqual(comments[0]['body'], '<!-- mergepath-feedback-archive-relay:v1 run=12345 status=complete -->')
+
+    def test_pr_controlled_run_cannot_mint_completion_under_same_bot_login(self):
+        for key, value in (('event', 'pull_request'), ('head_branch', 'codex/forged'),
+                           ('path', '.github/workflows/pr-controlled.yml')):
+            saved = self.run[key]
+            self.run[key] = value
+            code, comments, error = self.invoke()
+            self.assertEqual((code, comments), (0, []), error)
+            self.run[key] = saved
+
+    def test_another_pr_or_source_cannot_borrow_a_real_publisher(self):
+        endpoint = 'repos/' + REPO + '/actions/jobs/901/logs'
+        for wrong in (LOG.replace('PR_NUMBER: 7', 'PR_NUMBER: 8'),
+                      LOG.replace('SOURCE_RUN_ID: 12345', 'SOURCE_RUN_ID: 999')):
+            self.responses[endpoint] = wrong
+            self.assertEqual(self.invoke()[:2], (0, []))
+
+    def test_printed_env_lookalike_outside_runner_group_grants_nothing(self):
+        self.responses['repos/' + REPO + '/actions/jobs/901/logs'] = LOG.replace('##[group]Run set -euo pipefail', 'untrusted application output')
+        self.assertEqual(self.invoke()[:2], (0, []))
+
+    def test_incomplete_or_failed_persistence_grants_nothing(self):
+        for conclusion in ('failure', 'skipped', None):
+            self.job['steps'][0]['conclusion'] = conclusion
+            self.assertEqual(self.invoke()[:2], (0, []))
+
+    def test_unreadable_provenance_is_an_infrastructure_error(self):
+        self.responses['repos/' + REPO + '/actions/runs/900'] = {'_error': 'rate limit exceeded (HTTP 403)'}
+        self.assertEqual(self.invoke()[0], 2)
+
+    def test_duplicate_completions_reuse_provenance_within_one_read(self):
+        self.comments *= 2
+        self.assertEqual(len(self.invoke()[1]), 2)
+        calls = (self.path / 'calls').read_text().splitlines()
+        self.assertEqual(calls.count('repos/' + REPO + '/actions/jobs/901/logs'), 1)
+
+    def test_legacy_completion_requires_the_same_real_workflow_proof(self):
+        self.comments[0]['body'] = '<!-- mergepath-feedback-archive-relay:v1 run=12345 status=complete -->'
+        self.responses['repos/' + REPO + '/actions/runs/12345'] = {
+            'created_at': '2026-10-09T00:00:00Z', 'updated_at': '2026-10-09T00:00:00Z'}
+        endpoint = 'repos/' + REPO + '/actions/workflows/codex-feedback-archive-relay.yml/runs?event=workflow_run&created=2026-10-09..2026-10-10&per_page=100'
+        self.responses[endpoint] = [{'workflow_runs': [{'id': 900, 'conclusion': 'success'}]}]
+        self.assertEqual(len(self.invoke()[1]), 1)
+        self.run['event'] = 'pull_request'
+        self.assertEqual(self.invoke()[:2], (0, []))
+
+    def test_same_publisher_cannot_clear_another_source_and_reuses_reads(self):
+        self.comments.append(dict(self.comments[0], body=MARKER.replace('run=12345 ', 'run=999 ')))
+        code, comments, error = self.invoke()
+        self.assertEqual((code, len(comments)), (0, 1), error)
+        calls = (self.path / 'calls').read_text().splitlines()
+        self.assertEqual(calls.count('repos/' + REPO + '/actions/jobs/901/logs'), 1)
+
+    def test_forged_completion_cannot_erase_a_failure(self):
+        self.run['event'] = 'pull_request'
+        self.comments.append({'user': {'login': 'github-actions[bot]'},
+                              'body': '<!-- mergepath-feedback-archive-relay:v1 run=12345 status=failed -->'})
+        code, comments, _ = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertEqual([comment['body'] for comment in comments],
+                         ['<!-- mergepath-feedback-archive-relay:v1 run=12345 status=failed -->'])
+
+
+class LaneTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name)
+        self.git = shutil.which('git')
+        self.canonical = self.path / 'canonical'
+        self.consumer = self.path / 'consumer'
+        for repo in (self.canonical, self.consumer):
+            repo.mkdir()
+            self.g(repo, 'init', '-q', '-b', 'main')
+            (repo / '.github/workflows').mkdir(parents=True)
+        (self.canonical / '.mergepath-sync.yml').write_text('''version: 1
+consumers:
+  - name: widget
+    repo: acme/widget
+paths:
+  - path: .github/workflows/gate.yml
+    type: canonical
+    consumers: all
+exclusions: []
+''')
+        self.canonical_file = self.canonical / '.github/workflows/gate.yml'
+        self.canonical_file.write_text('name: safe\n')
+        self.source = self.commit(self.canonical)
+        self.consumer_file = self.consumer / '.github/workflows/gate.yml'
+        self.consumer_file.write_text('name: previous\n')
+        self.base = self.commit(self.consumer)
+        self.consumer_file.write_text(self.canonical_file.read_text())
+        self.head = self.commit(self.consumer)
+        self.policy = self.path / 'policy.yml'
+        self.policy.write_text('author_identity: nathanjohnpayne\n')
+        self.metadata = {'number': 7, 'user': {'login': 'nathanjohnpayne'},
+                         'head': {'sha': self.head, 'ref': 'mergepath-sync/' + self.source[:7]},
+                         'base': {'sha': self.base},
+                         'comments': [{'user': {'login': 'github-actions[bot]'}, 'body': 'forged verified-head marker'}]}
+        binary = self.path / 'bin'
+        binary.mkdir()
+        git = binary / 'git'
+        git.write_text('''#!/usr/bin/env python3
+import os, sys
+argv=[os.environ['REAL_GIT']]+[os.environ['CANONICAL_FIXTURE'] if arg=='https://github.com/nathanjohnpayne/mergepath.git' else os.environ['CONSUMER_FIXTURE'] if arg=='https://github.com/acme/widget.git' else arg for arg in sys.argv[1:]]
+os.execv(argv[0],argv)
+''')
+        git.chmod(0o755)
+        gh = binary / 'gh'
+        gh.write_text('#!/bin/sh\ncat "$LANE_METADATA"\n')
+        gh.chmod(0o755)
+        self.environment = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                                REAL_GIT=self.git, CANONICAL_FIXTURE=str(self.canonical),
+                                CONSUMER_FIXTURE=str(self.consumer), LANE_METADATA=str(self.path / 'metadata.json'))
+
+    def g(self, repo, *args):
+        return subprocess.check_output([self.git, '-C', str(repo), '-c', 'user.name=fixture',
+                                        '-c', 'user.email=fixture@example.test', '-c', 'commit.gpgsign=false', *args], text=True).strip()
+
+    def commit(self, repo):
+        self.g(repo, 'add', '-A')
+        self.g(repo, 'commit', '-qm', 'fixture')
+        return self.g(repo, 'rev-parse', 'HEAD')
+
+    def invoke(self):
+        (self.path / 'metadata.json').write_text(json.dumps(self.metadata))
+        return subprocess.run(['bash', str(ROOT / 'scripts/workflow/verify-live-propagation.sh'),
+                               REPO, '7', self.head, self.base, str(self.policy)],
+                              input=json.dumps(self.metadata), env=self.environment, text=True, capture_output=True)
+
+    def test_real_faithful_git_objects_clear_without_any_marker(self):
+        self.metadata.pop('comments')
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_forged_bot_marker_cannot_exempt_modified_workflow(self):
+        self.consumer_file.write_text('name: PR-controlled unsafe workflow\n')
+        self.head = self.commit(self.consumer)
+        self.metadata['head']['sha'] = self.head
+        result = self.invoke()
+        self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_unmerged_canonical_source_and_policy_opt_out_refuse(self):
+        self.g(self.canonical, 'checkout', '-qb', 'unmerged')
+        self.canonical_file.write_text('name: proposed canonical\n')
+        source = self.commit(self.canonical)
+        self.g(self.canonical, 'checkout', '-q', 'main')
+        self.metadata['head']['ref'] = 'mergepath-sync/' + source[:7]
+        self.assertNotEqual(self.invoke().returncode, 0)
+        self.metadata['head']['ref'] = 'mergepath-sync/' + self.source[:7]
+        self.policy.write_text('author_identity: nathanjohnpayne\npropagation_prs:\n  enabled: false\n')
+        self.assertEqual(self.invoke().returncode, 1)
+
+
+if __name__ == '__main__':
+    unittest.main()

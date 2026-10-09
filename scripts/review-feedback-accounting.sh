@@ -232,7 +232,9 @@ PR_HEAD_IS_FORK=$(printf '%s' "$PR_OBJECT" | jq -r '
 # stale failure could invent a permanent block). Presence of a completion is the
 # durable fact — the archive it records cannot be un-persisted by a later rerun
 # that no longer finds its artifact — and presence is immune to reordering.
-RELAY_FAILURE_RUN=$(printf '%s' "$ISSUE_COMMENTS" | jq -r '
+RELAY_COMMENTS=$(printf '%s' "$ISSUE_COMMENTS" | python3 "$SCRIPT_DIR/workflow/verified-relay-markers.py" \
+  --repo "$REPO" --pr "$PR_NUMBER") || die 2 "could not verify feedback relay provenance"
+RELAY_FAILURE_RUN=$(printf '%s' "$RELAY_COMMENTS" | jq -r '
   [
     .[]
     | select(.user.login == "github-actions[bot]")

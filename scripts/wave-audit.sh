@@ -267,11 +267,9 @@ HEAD_FULL="$(git -C "$REPO_DIR" rev-parse --verify --quiet "${HEAD_SHA}^{commit}
 # the canary PR content == mergepath@head — dispatching against a canary
 # whose current head is NOT lane-verified would let a non-faithful sync PR
 # clear external review without its actual PR diff ever being reviewed.
-# Fail closed unless the canary's live head/base pair carries the exact
-# pair-bound trusted lane marker (the same github-actions[bot] marker
-# merge-clearance-gate.sh keys on). A legacy head-only marker cannot establish
-# which base was verified, so it is deliberately not a rollout compatibility
-# path. WAVE_AUDIT_LANE_VERIFIED_OK=1 overrides — hermetic tests only.
+# Fail closed unless trusted code freshly verifies the live canary pair.
+# A bot-authored marker cannot prove which workflow or bytes produced it.
+# WAVE_AUDIT_LANE_VERIFIED_OK=1 overrides — hermetic tests only.
 pr_head=""
 pr_base=""
 if [ "${WAVE_AUDIT_LANE_VERIFIED_OK:-0}" != "1" ]; then
@@ -287,19 +285,20 @@ if [ "${WAVE_AUDIT_LANE_VERIFIED_OK:-0}" != "1" ]; then
   fi
   [[ "$pr_head" =~ ^[0-9a-fA-F]{40}$ ]] && [[ "$pr_base" =~ ^[0-9a-fA-F]{40}$ ]] \
     || die 3 "invalid PR head/base reading $REPO#$PR for lane verification"
-  lane_comments="$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null)" \
-    || die 3 "could not read canary PR comments for lane verification"
-  marker="<!-- mergepath-propagation-lane:v2 verified-head=$pr_head verified-base=$pr_base -->"
-  printf '%s' "$lane_comments" | jq -e --arg marker "$marker" '
-    any(.[]; (.user.login == "github-actions[bot]")
-         and ((.body // "") | contains($marker)))' >/dev/null 2>&1 \
-    || die 3 "canary $REPO#$PR pair $pr_head/$pr_base is not lane-verified (no exact pair-bound mergepath-propagation-lane:v2 marker) — wait for the External Review Check lane run or investigate a diverged canary; refusing to dispatch"
+  lane_pr=$(gh api "repos/$REPO/pulls/$PR") \
+    || die 3 "could not read the canary for live byte verification"
+  lane_policy=$(bash "$ROOT/scripts/workflow/resolve_base_policy.sh" --repo "$REPO" --pr "$PR" --materialize-default) \
+    || die 3 "could not read the canary governing policy"
+  lane_rc=0
+  printf '%s' "$lane_pr" | bash "$ROOT/scripts/workflow/verify-live-propagation.sh" \
+    "$REPO" "$PR" "$pr_head" "$pr_base" "$lane_policy" >/dev/null || lane_rc=$?
+  rm -f "$lane_policy"
+  [ "$lane_rc" -eq 0 ] || die 3 "canary $REPO#$PR is not a byte-verified live mirror; refusing to dispatch"
   log "canary lane verified for PR head/base $pr_head/$pr_base"
 fi
 
-# Re-read the live pair at each authority boundary. The initial marker binds
-# the originally observed pair; a later pair is never adopted implicitly,
-# even if it has since acquired its own marker. This closes the intervals in
+# Re-read the live pair at each authority boundary. The initial byte proof
+# binds the originally observed pair; a later pair is never adopted implicitly. This closes the intervals in
 # which a same-head base move could otherwise let a stale review dispatch or
 # receipt advance the wave. It is still a read-before-write fence, not an
 # atomic GitHub transaction. The override remains limited to hermetic tests.

@@ -329,6 +329,8 @@ jobs:
               published_lease=true
             fi
           fi
+          existing=$(printf '%s' "$existing" \
+            | python3 scripts/workflow/verified-relay-markers.py --repo "$REPO" --pr "$PR_NUMBER")
           if [ "$published_lease" = true ] && jq -e --arg body "$complete" \
             'any(.[]; (.user.login // "") == "github-actions[bot]" and (.body // "") == $body)' \
             <<<"$existing" >/dev/null; then
@@ -365,6 +367,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.source.outputs.pr }}
           SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
+          PUBLISHER_RUN_ID: ${{ github.run_id }}
           ARTIFACT_ID: ${{ steps.artifact.outputs.id }}
           EXPECTED_IS_FORK: ${{ steps.source.outputs.is_fork }}
           EXPECTED_PR_ACTOR: ${{ steps.source.outputs.pr_actor }}
@@ -398,8 +401,10 @@ jobs:
                   # supposed to restore the record, and the cleanup then wrote a
                   # permanent failure marker instead. The unprivileged handoff can
                   # also manufacture this shape; preserving it is the explicit
-                  # #1053 residual documented in review_feedback_accounting.md.
-                  test("^<!-- mergepath-feedback-archive-relay:v1 run=[0-9]+ status=(complete|failed) -->$")
+                  # retained payload risk documented in review_feedback_accounting.md;
+                  # completion readers independently verify real relay provenance.
+                  test("^<!-- mergepath-feedback-archive-relay:v1 run=[0-9]+ status=(complete|failed) -->$") or
+                  test("^<!-- mergepath-feedback-archive-relay:v2 run=[0-9]+ publisher=[0-9]+ status=complete -->$")
                 ))
             ' "$HANDOFF_FILE" >/dev/null
           # The artifact's head belongs to the historical source event. It is
@@ -496,7 +501,7 @@ jobs:
             fi
           fi
 
-          marker="<!-- mergepath-feedback-archive-relay:v1 run=$SOURCE_RUN_ID status=complete -->"
+          marker="<!-- mergepath-feedback-archive-relay:v2 run=$SOURCE_RUN_ID publisher=$PUBLISHER_RUN_ID status=complete -->"
           existing=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" | jq -s 'add // []')
           if ! jq -e --arg body "$marker" 'any(.[]; (.body // "") == $body)' \
             <<<"$existing" >/dev/null; then
