@@ -364,4 +364,39 @@ selected=$(crc_select_head_review "$REVIEW" 'chatgpt-codex-connector[bot]' 'abcd
 PASS=$((PASS + 1))
 echo "PASS: large inline history does not exceed the jq argument limit"
 
+# Exercise the complete production requester scan, including its final emitter.
+# A large finding must survive both selection and JSON assembly intact.
+eval "$(sed -n '/^scan_codex_state() {/,/^}/p' "$ROOT/scripts/codex-review-request.sh")"
+python3 - "$DIR" <<'PYDATA'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+bot = {'login': 'chatgpt-codex-connector[bot]'}
+root.joinpath('scan-reviews').write_text(json.dumps([{
+    'id': 789, 'user': bot, 'commit_id': 'abcdef0123456789000000000000000000000000',
+    'submitted_at': '2026-09-14T00:02:00Z', 'state': 'COMMENTED', 'body': 'y' * 262144,
+}]))
+root.joinpath('scan-inline').write_text(json.dumps([{
+    'id': 790, 'pull_request_review_id': 789, 'user': bot,
+    'body': '**P2 ' + 'x' * 262144, 'path': 'fixture.sh', 'line': 1,
+}]))
+PYDATA
+fetch_scan_array() {
+  case "$2" in
+    reviews) cat "$DIR/scan-reviews" ;;
+    'inline comments') cat "$DIR/scan-inline" ;;
+    'issue comments') printf '[]\n' ;;
+    *) return 3 ;;
+  esac
+}
+export BOT_LOGIN='chatgpt-codex-connector[bot]'
+export HEAD_SHA='abcdef0123456789000000000000000000000000'
+export REPO=owner/repo PR_NUMBER=99 REQUIRED_TIERS_JSON='["p0","p1"]'
+export CODEX_FAILURE_MARKERS_OK=false
+scan_codex_state >"$DIR/large-scan"
+jq -e '.review.id == 789 and (.review.body | length) == 262144
+  and (.findings | length) == 1 and (.findings[0].body | length) == 262149
+  and .findings[0].blocking == false' "$DIR/large-scan" >/dev/null
+PASS=$((PASS + 1))
+echo "PASS: requester scans and emits large review and finding bodies over stdin"
+
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"

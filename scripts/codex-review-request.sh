@@ -825,8 +825,10 @@ scan_codex_state() {
   # capture the review id so the findings filter can scope to THIS
   # review only and not pick up stale findings from an earlier review
   # round on the same HEAD.
-  review=$(echo "$reviews" | jq --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" --argjson comments "$comments" '
-    [.[] | select(.user.login == $bot) | select(.commit_id == $sha)
+  # Provider histories and finding bodies are unbounded; keep them off argv.
+  review=$(printf '%s\n' "$reviews" "$comments" | jq -s --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
+    .[0] as $reviews | .[1] as $comments
+    | [$reviews[] | select(.user.login == $bot) | select(.commit_id == $sha)
       | . as $r
       | [$comments[] | select(.pull_request_review_id == $r.id)] as $inline
       | select(any($inline[]; (.user.login == $bot) and (.in_reply_to_id == null))
@@ -947,8 +949,8 @@ scan_codex_state() {
     blocked='null'
   fi
 
-  jq -n --argjson review "$review" --argjson findings "$findings" --argjson reaction "$reaction" --argjson verdict "$verdict" --argjson blocked "$blocked" '
-    { review: $review, findings: $findings, reaction: $reaction, verdict: $verdict, blocked: $blocked }
+  printf '%s\n' "$review" "$findings" "$reaction" "$verdict" "$blocked" | jq -s '
+    { review: .[0], findings: .[1], reaction: .[2], verdict: .[3], blocked: .[4] }
   '
 }
 
