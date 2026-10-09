@@ -218,7 +218,8 @@ STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "head-scoped override refus
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "head-scoped override accepts the attached exact precondition" 0 "owner tiebreak" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match --match-head-commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" BLOCKED
 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "duplicate head preconditions do not authorize a tiebreak" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides --match-head-commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" BLOCKED
 
-STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "review blockers never prevent cancelling auto-merge" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto' BLOCKED human-hold
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "review blockers never prevent cancelling auto-merge" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto' BLOCKED needs-external-review
+assert_rc_contains "human-hold freezes attributed retraction too" 2 "human-hold" 'scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto' BLOCKED human-hold
 for auto_true in true True TRUE t T 1; do
   assert_rc_contains "deferred --auto=$auto_true refuses" 2 "deferred --auto" "scripts/gh-as-author.sh -- gh pr merge 123 --auto=$auto_true --squash" CLEAN
 done
@@ -248,7 +249,7 @@ STUB_QUEUE_REQUIRED=true assert_rc_contains "required merge queue refuses implic
 STUB_QUEUE_ENTERED=true assert_rc_contains "already queued PR cannot bypass snapshot enforcement" 2 "native merge-queue deferral" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' CLEAN
 STUB_QUEUE_FAILURE=1 assert_rc_contains "unreadable queue state fails closed" 2 "verify native merge-queue state" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' CLEAN
 STUB_QUEUE_JSON='{}' assert_rc_contains "malformed queue state fails closed" 2 "verify native merge-queue state" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' CLEAN
-STUB_QUEUE_REQUIRED=true assert_rc_contains "required queue does not prevent attributed retraction" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto' BLOCKED human-hold
+STUB_QUEUE_REQUIRED=true assert_rc_contains "required queue does not prevent attributed retraction" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto' BLOCKED
 
 assert_rc_contains "direct pr create blocked" 2 "token-verifying wrapper" \
   'gh pr create --title "t" --body "Authoring-Agent: claude

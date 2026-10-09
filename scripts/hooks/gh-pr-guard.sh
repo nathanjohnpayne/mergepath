@@ -3420,10 +3420,6 @@ if [ "$AUTO_REQUESTED" -eq 1 ]; then
   echo "BLOCKED: deferred --auto merging cannot enforce the reviewer disagreement gate; use an immediate guarded merge." >&2
   exit 2
 fi
-# Retraction is a safety operation, not a merge. Attribution checks above
-# still apply, but a blocker must never prevent cancelling an armed merge.
-[ "$DISABLE_AUTO_REQUESTED" -eq 0 ] || exit 0
-
 # Subcommand-scoped REPO_ARG wins over global GLOBAL_REPO (mirrors
 # gh's typical "more specific flag wins" behavior). Fall back to
 # the global value only if the subcommand didn't specify one.
@@ -3529,6 +3525,10 @@ if printf '%s\n' "$LABELS" | grep -Fxq "human-hold"; then
   exit 2
 fi
 
+# Retraction skips merge-only checks, but the human-controlled hard freeze
+# still applies to every flavor of gh pr merge.
+[ "$DISABLE_AUTO_REQUESTED" -eq 0 ] || exit 0
+
 # Review disagreements are independent of CI and merge-state overrides
 # (#1824). Fetch every page: latestReviews in gh pr view is bounded and can
 # hide a reviewer on a busy PR. COMMENTED/PENDING never supersede an opinion.
@@ -3587,7 +3587,7 @@ if [ "$(printf '%s' "$REVIEW_BLOCKERS" | jq length)" -gt 0 ]; then
     echo "BLOCKED: outstanding reviewer CHANGES_REQUESTED; REVIEW_POLICY.md reserves the tiebreak for the owner." >&2
     printf '%s' "$REVIEW_BLOCKERS" | jq -r '.[] | "  Reviewer: \(.user.login // "<deleted account>"); reviewed commit: \(.commit_id // "<unknown commit>")"' >&2
     echo "  Reviewer approval or dismissal releases this gate. Admin/merge-state overrides do not." >&2
-    echo "  Owner-only override: BREAK_GLASS_REVIEW_DISAGREEMENT=$PR_URL@$PR_HEAD_SHA" >&2
+    echo "  Stop and ask the owner. Override format: BREAK_GLASS_REVIEW_DISAGREEMENT=<canonical-PR-URL>@<full-head-sha>." >&2
     exit 2
   fi
 fi
