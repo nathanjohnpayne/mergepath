@@ -16,4 +16,6 @@ Deferred `--auto` and implicit native merge-queue merges refuse because this loc
 
 Every immediate merge must supply exactly one `--match-head-commit` equal to the inspected full HEAD. A dismissed review is ignored in the latest-opinion reduction; dismissing a different review cannot erase an active change request. Quoted option values are consumed before command separators are interpreted.
 
+Command-local `GH_REPO` assignments or removals refuse immediate merging because the hook does not share the future command environment. Use a literal `--repo` or canonical PR URL without changing `GH_REPO` in that command. Assignments scoped to an earlier unrelated command do not affect the merge.
+
 The required outcome in #1824 is a direct review-state read before the existing break-glass handling. This remains a client snapshot: a new change request submitted after that read can race an immediate merge on the same head where server protection permits it. An operator could therefore merge before seeing that newly submitted objection. This pre-existing interval is not enlarged by the patch; the head precondition fences pushes, and never claims to fence later review submissions. Atomic review-state enforcement at the server is a separate, stronger contract.

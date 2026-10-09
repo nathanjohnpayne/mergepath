@@ -158,6 +158,11 @@ STUB_REVIEW_PAGES="[[$dismissed_review]]" assert_rc_contains "dismissed change r
 STUB_REVIEW_PAGES="[[$change_review],[$dismissed_review]]" assert_rc_contains "dismissing a different review does not erase an active change request" 2 "CHANGES_REQUESTED" "$merge_overrides" BLOCKED
 TEST_UNPINNED_MERGE=1 assert_rc_contains "ordinary immediate merge requires a head precondition" 2 "exactly one --match-head-commit" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash'
 assert_rc_contains "ordinary immediate merge refuses a different head precondition" 2 "exactly one --match-head-commit" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash --match-head-commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+for prefix in 'GH_REPO=other/repo' 'env GH_REPO=other/repo' 'GH_REPO=other/repo ;' 'export GH_REPO=other/repo ;' 'unset GH_REPO ;' 'env -u GH_REPO' 'env --unset=GH_REPO' 'env -uGH_REPO'; do
+  assert_rc_contains "command-local repository selector refuses ($prefix)" 2 "command-local GH_REPO" "$prefix scripts/gh-as-author.sh -- gh pr merge 123 --squash"
+done
+assert_rc_contains "unrelated echoed repository selector is not an assignment" 0 "" 'echo GH_REPO=other/repo ; scripts/gh-as-author.sh -- gh pr merge 123 --squash'
+assert_rc_contains "repository assignment scoped to an earlier command is discarded" 0 "" 'GH_REPO=other/repo echo ok ; scripts/gh-as-author.sh -- gh pr merge 123 --squash'
 assert_rc_contains "quoted separator subject does not conceal later auto flag" 2 "deferred" "scripts/gh-as-author.sh -- gh pr merge --subject ';' 456 --auto"
 comment_review="${change_review/\"id\":1/\"id\":2}"
 comment_review="${comment_review/CHANGES_REQUESTED/COMMENTED}"
