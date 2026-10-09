@@ -605,19 +605,10 @@ jobs:
                 // (#612 round 4); only the P0/P1 CLEANLINESS check below
                 // needs inline comments, not the timestamp itself.
                 //
-                // latestReviewTime (used below for the CLEARANCE decision) is
-                // deliberately left UNBOUNDED by mergedAt, preserving
-                // pre-#612 behavior across the many existing fixtures that
-                // clear via a review with no merged_at set at all. A separate
-                // latestReviewTimeForStaleness IS merge-time bounded (#612
-                // round 5): without it, a post-merge Codex re-review (e.g. a
-                // late/retried bot run on the closed PR) could inflate the
-                // Phase 4b staleness guard's `latestAnyCodexSignalTime` past
-                // `merged_at`, making a genuinely valid pre-merge CLI
-                // approval look stale relative to a signal that postdates
-                // the merge and is irrelevant to whether that merge was
-                // compliant. Mirrors the merge-time bound already applied to
-                // the verdict and reaction paths.
+                // Both clearance and CLI-approval staleness are bounded by
+                // merge time. A later review cannot retrospectively justify
+                // or disqualify a merge; unknown merge time grants no review
+                // clearance. The verdict path applies the same boundary.
                 let latestReviewTime = '';
                 let latestReviewTimeForStaleness = '';
                 let latestCodexReview = null;
@@ -631,7 +622,7 @@ jobs:
                         return comments.length === 0 || comments.some(c => !c.in_reply_to_id && c.user && c.user.login === codexBotLogin) || /\S/.test(r.body || '');
                       });
                   if (inlineComments !== null) {
-                    latestCodexReview = substantiveReviews.reduce(
+                    latestCodexReview = substantiveReviews.filter(r => mergedAt && r.submitted_at && r.submitted_at <= mergedAt).reduce(
                       (latest, r) => (!latest || r.submitted_at > latest.submitted_at) ? r : latest,
                       null
                     );

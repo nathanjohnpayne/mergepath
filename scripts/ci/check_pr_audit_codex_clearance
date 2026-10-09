@@ -218,7 +218,7 @@ if (codexEnabled && inlineComments !== null && codexCommentedOnHead.length > 0) 
   latestCodexReview = codexCommentedOnHead.filter(r => {
     const comments = inlineComments.filter(c => c.pull_request_review_id === r.id);
     return comments.length === 0 || comments.some(c => !c.in_reply_to_id && c.user && c.user.login === codexBotLogin) || /\S/.test(r.body || '');
-  }).reduce(
+  }).filter(r => mergedAt && r.submitted_at && r.submitted_at <= mergedAt).reduce(
     (latest, r) => (!latest || r.submitted_at > latest.submitted_at) ? r : latest,
     null
   );
@@ -354,6 +354,12 @@ if (evaluate([review, postmerge], null, merged).time !== review.submitted_at)
   throw new Error('post-merge review masked the merge-time staleness baseline');
 if (evaluate([postmerge], null, merged).time !== '')
   throw new Error('post-merge review supplied merge-time evidence');
+if (evaluate([postmerge], [], merged).clearanceReview !== null)
+  throw new Error('post-merge review granted retrospective clearance');
+if (evaluate([review, postmerge], [], merged).clearanceReview.id !== review.id)
+  throw new Error('post-merge review replaced the actual merge-time review');
+if (evaluate([review], [], '').clearanceReview !== null)
+  throw new Error('unknown merge time granted retrospective clearance');
 console.log('  PASS: production audit retains bounded HEAD timestamps when inline fetch fails');
 NODE
 then
