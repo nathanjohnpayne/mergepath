@@ -362,6 +362,19 @@ else
   fail "empty command: rc=$rc expected 1"
 fi
 
+reset_log
+set +e
+(cd "$ROOT/scripts" && PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" \
+  GH_AS_REVIEWER_IDENTITY="nathanpayne-claude" OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" \
+  bash gh-as-reviewer.sh -- gh pr comment 123 --body x) >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q $'gh\tpr\tcomment' "$WORKDIR/calls.log"; then
+  pass "basename-only invocation from scripts directory preserves wrapper attribution"
+else
+  fail "basename-only invocation: rc=$rc"
+fi
+
 echo ""
 echo "test_gh_as_reviewer: $PASS passed, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then
