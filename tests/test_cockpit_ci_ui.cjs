@@ -380,3 +380,65 @@ test("a focused run that moves into collapsed history reveals it and keeps keybo
   view.summary.focus(); done.current_head = false; view.update(CI.project(envelope(data), null, 1004));
   assert.equal(view.historyOpen, false); assert.equal(view.historyList.hidden, true); assert.equal(document.activeElement, view.summary);
 });
+
+test("an orphaned queued run off open heads is history, not a running run, and says why", () => {
+  const data = pythonFixture("orphan:False"), row = data.runs[0];
+  assert.equal(row.orphaned, true); assert.equal(row.status, "queued");
+  const model = CI.project(envelope(data), null, 1791300000);
+  assert.match(model.label, /^0 running/); assert.equal(model.state, "idle"); assert.equal(model.hazards.length, 0);
+  assert.deepEqual(CI.runTone(row), {state: "idle", label: "Orphaned"}); assert.equal(CI.attention(row), false);
+  const parent = dom(), view = new CI.CIView(parent, () => assert.fail("unexpected fetch"));
+  view.update(model);
+  const run = view.rows.get(row.key);
+  assert.equal(run.root.parentNode, view.historyList);
+  assert.equal(view.historyToggle.textContent, "1 orphaned queued run · show");
+  assert.equal(run.flag.hidden, false); assert.equal(run.reason.textContent, row.orphan_reason); assert.match(row.orphan_reason, /never started/);
+  assert.equal(run.duration.textContent, "queued 7h 0m");
+  // A rerun's queue age is its current attempt's: run_started_at resets, created_at does not.
+  const rerun = structuredClone(data); rerun.runs[0].created_at -= 30 * 86400;
+  view.update(CI.project(envelope(rerun), null, 1791300000)); assert.equal(run.duration.textContent, "queued 7h 0m");
+  rerun.runs[0].started_at = null; view.update(CI.project(envelope(rerun), null, 1791300000)); assert.equal(run.duration.textContent, "queued 727h 0m");
+  // Beside completed history both counts are named.
+  const done = {...structuredClone(row), id: "11", key: `${row.repo}:11:none`, status: "completed", conclusion: "success", orphaned: false, orphan_reason: null, reason: null};
+  data.runs.push(done); view.update(CI.project(envelope(data), null, 1791300000));
+  assert.equal(view.historyToggle.textContent, "1 completed run off open heads · 1 orphaned queued run · show");
+});
+
+test("an orphaned run on an open HEAD stays visible and never establishes current CI success", () => {
+  const data = pythonFixture("orphan:True"), row = data.runs[0];
+  assert.equal(row.orphaned, true); assert.equal(row.current_head, true);
+  const model = CI.project(envelope(data), null, 1791300000);
+  assert.equal(CI.attention(row), true); assert.match(model.label, /^0 running/);
+  assert.match(model.label, /current CI success not established/);
+});
+
+test("an orphaned rerun keeps an earlier attempt's current failure as a hazard; superseded history yields to Orphaned", () => {
+  const data = pythonFixture("orphan:actionable"), row = data.runs[0];
+  assert.equal(row.orphaned, true); assert.equal(row.actionable, true);
+  const model = CI.project(envelope(data), null, 1791300000);
+  assert.equal(model.hazards.length, 1); assert.equal(CI.runTone(row).state, row.severity);
+  const parent = dom(), view = new CI.CIView(parent, () => assert.fail("unexpected fetch")); view.update(model);
+  const shown = view.rows.get(row.key).reason.textContent;
+  assert.ok(row.reason && shown.startsWith(row.reason), "the earlier attempt's diagnosis is shown"); assert.match(shown, /never started/);
+  for (const bad of [{orphan_reason: 7}, {orphaned: false}]) {
+    const broken = pythonFixture("orphan:actionable"); Object.assign(broken.runs[0], bad); assert.throws(() => CI.validate(broken));
+  }
+  // A superseded orphan on the current HEAD never ran, so it cannot let the panel claim clearance.
+  const current = pythonFixture("orphan:True"); current.runs[0].superseded = true;
+  assert.match(CI.project(envelope(current), null, 1791300000).label, /current CI success not established/);
+  const history = pythonFixture("orphan:False"); history.runs[0].superseded = true;
+  assert.doesNotThrow(() => CI.validate(history)); assert.deepEqual(CI.runTone(history.runs[0]), {state: "idle", label: "Orphaned"});
+});
+
+test("orphaned is accepted only on a queued workflow run with no jobs in its current attempt", () => {
+  const ok = pythonFixture("orphan:False"); assert.doesNotThrow(() => CI.validate(ok));
+  const rerun = pythonFixture("orphan:False"); rerun.runs[0].attempt = "2";
+  rerun.runs[0].jobs = [{id: "1", name: "x", status: "completed", conclusion: "success", started_at: null, completed_at: null, steps: [], check_id: null, attempt: "1"}];
+  assert.doesNotThrow(() => CI.validate(rerun), "earlier attempts' jobs may sit beside an orphaned current attempt");
+  rerun.runs[0].jobs[0].attempt = null; assert.throws(() => CI.validate(rerun), "a job of unknown attempt counts as present");
+  for (const mutate of [row => {row.status = "in_progress";}, row => {row.orphaned = "yes";},
+    row => {row.jobs_scope = "not-fetched";}, row => {row.jobs = [{id: "1", name: "x", status: "queued", conclusion: null, started_at: null, completed_at: null, steps: [], check_id: null, attempt: "1"}];}]) {
+    const data = pythonFixture("orphan:False"); mutate(data.runs[0]);
+    assert.throws(() => CI.validate(data));
+  }
+});

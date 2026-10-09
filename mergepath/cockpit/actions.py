@@ -272,7 +272,8 @@ def ci_observation(envelope, repo, now, max_age=120):
                     message = INSTALLATION
         normalized = {"id": int(identity), "created_at": dt.datetime.fromtimestamp(created, dt.timezone.utc).isoformat(),
                       "status": row.get("status"), "conclusion": row.get("conclusion"), "failure_message": message}
-        if row.get("status") == "queued":
+        # An orphaned run (queued with no jobs past ci.ORPHAN_SECONDS) holds no runner and never drains.
+        if row.get("status") == "queued" and row.get("orphaned") is not True:
             queued.append(normalized)
         if row.get("status") == "in_progress":
             running.append(normalized.copy())
