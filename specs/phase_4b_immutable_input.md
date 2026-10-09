@@ -21,3 +21,5 @@ Curated-wave regression coverage uses a separate committed canonical repository,
 An explicit `--offline-diff --dry-run` preview freezes supplied regular-file bytes without live Git/transition capture and carries no postable review binding. It still validates the declared author and never posts. Final immutable-input revalidation precedes the final feedback-accounting read so feedback remains the last preparation observation before an approval POST.
 
 The enablement collector reports an unavailable immutable input as a blocked dry-run result. Failure to allocate its private capture directory skips GitHub reads and adapter dispatch while preserving that structured report.
+
+The propagated immutable-input test runs regular capture, authentication, mutation and collector checks on every consumer. Curated-wave fixtures run only when the hub propagation entrypoint is present; a missing wave tool on that hub remains a failure. A hub regression executes the exact test with only its declared consumer closure, without wave tooling, to verify both positive and A-B-A refusal assertions remain active.

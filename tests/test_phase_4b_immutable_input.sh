@@ -7,6 +7,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/p4b-immutable-test.XXXXXX")"
 trap 'chmod -R u+w "$WORK"; rm -rf "$WORK"' EXIT
 PASS=0; FAIL=0
+INPUT_BASE_PATH="$PATH"
 pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS+1)); }
 fail() { printf 'FAIL: %s\n' "$*" >&2; FAIL=$((FAIL+1)); }
 unset GH_TOKEN GITHUB_TOKEN OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT
@@ -147,6 +148,9 @@ for auth_source in stored explicit token; do
  else fail "$auth_source gh auth lost during capture"; fi
 done
 
+# Curated wave tooling is hub-only. Missing tooling on the hub still fails;
+# consumers retain the regular immutable-input and collector assertions.
+if [ -f "$ROOT/scripts/sync-to-downstream.sh" ]; then
 # Curated-wave input deliberately differs from the complete consumer PR diff.
 # Execute real trusted wave regeneration over a separate committed canonical
 # range; only the external live-byte provider is replaced with a fixed proof.
@@ -251,6 +255,9 @@ printf 'tampered PR bytes\n' >>"$WORK/wave-input/pr.diff"
 if p4b_revalidate_input fixture/repo 1753 "$WORK/wave-input"; then
  fail 'tampered complete PR diff accepted'
 else pass 'curated review also fences the complete canary diff digest'; fi
+else
+ printf 'SKIP: curated-wave fixture is hub-only\n'
+fi
 # Exercise the real collector's allocation failure without provider access.
 INPUT_REAL_MKTEMP="$(command -v mktemp)"
 export INPUT_REAL_MKTEMP
@@ -278,6 +285,24 @@ if [ "$rc" = 1 ] && printf '%s' "$out" | jq -e '.ready == false and (.adapters.c
  pass 'collector allocation failure emits BLOCKED without GitHub reads or adapter dispatch'
 else fail "collector allocation failure rc=$rc: $out"; fi
 rm "$WORK/bin/mktemp"
+
+# Execute the exact propagated test with only its declared consumer closure.
+# The child has no hub marker or wave tool, so it cannot recurse into this arm.
+if [ -f "$ROOT/scripts/sync-to-downstream.sh" ]; then
+ CONSUMER="$WORK/consumer-root"
+ mkdir -p "$CONSUMER/scripts" "$CONSUMER/tests"
+ cp -R "$ROOT/scripts/phase-4b" "$CONSUMER/scripts/"
+ cp "$ROOT/tests/test_phase_4b_immutable_input.sh" "$CONSUMER/tests/"
+ if PATH="$INPUT_BASE_PATH" bash "$CONSUMER/tests/test_phase_4b_immutable_input.sh" >"$WORK/consumer.log" 2>&1 \
+   && grep -Fq 'PASS: authorized unchanged input survives the generation fence' "$WORK/consumer.log" \
+   && grep -Fq 'PASS: observed A-B-A generation refuses unchanged final A' "$WORK/consumer.log" \
+   && grep -Fq 'SKIP: curated-wave fixture is hub-only' "$WORK/consumer.log"; then
+  pass 'declared consumer closure runs core assertions without hub-only wave tooling'
+ else
+  cat "$WORK/consumer.log" >&2
+  fail 'propagated consumer immutable-input test'
+ fi
+fi
 
 printf '\ntest_phase_4b_immutable_input: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]
