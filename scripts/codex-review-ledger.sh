@@ -175,7 +175,6 @@ REQUIRED_JSON=$(printf '%s\n' "$REQUIRED_TIERS" | jq -Rsc 'split("\n") | map(sel
 ISSUE_COMMENTS=$(read_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
 REVIEWS=$(read_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
 REVIEW_COMMENTS=$(read_array "repos/$REPO/pulls/$PR_NUMBER/comments" "review comments")
-ISSUE_REACTIONS=$(read_array "repos/$REPO/issues/$PR_NUMBER/reactions" "issue reactions")
 printf '%s\n' "$ISSUE_COMMENTS" >"$LEDGER_TMP/issue_comments.json"
 printf '%s\n' "$REVIEW_COMMENTS" >"$LEDGER_TMP/review_comments.json"
 printf '%s\n' "$REVIEWS" >"$LEDGER_TMP/reviews.json"
@@ -344,8 +343,9 @@ REBUTTALS=$(jqx "rebuttals" -c --argjson b "$BODY_REBUTTALS" '. + $b' <<<"$REBUT
 # ---- verdicts, reactions, provider blocks, summary ------------------------------
 VERDICTS=$(crqe_verdicts "$ISSUE_COMMENTS" "$BOT") || die "cannot parse Codex verdict comments"
 VERDICTS=$(jqx "verdicts" -c 'unique_by(.comment_id)' <<<"$VERDICTS")
-REACTIONS=$(jqx "issue reactions" -c --arg bot "$BOT" \
-  '[.[] | select(.user.login == $bot and .content == "+1") | {id, created_at}] | unique_by(.id)' <<<"$ISSUE_REACTIONS")
+# PR-level reactions cannot establish a response or test a rebuttal. Keep the
+# legacy input field empty; request eyes and finding feedback are independent.
+REACTIONS='[]'
 BLOCKS='[]'
 while IFS= read -r c; do
   [ -n "$c" ] || continue

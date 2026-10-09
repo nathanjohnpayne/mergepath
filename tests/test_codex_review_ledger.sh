@@ -120,7 +120,7 @@ L=$(ledger "$( { req 1 $T0; req 2 $T3; } | arr)" "$( { review 10 $T1 $HEAD_A '["
 check "responses on different heads in successive windows are each attributed" "$L" \
   '([.requests[].outcome] == ["attributed","attributed"])'
 
-L=$(ledger "$( { req 1 $T0; req 2 $T3; } | arr)" "$(review 10 $T1 $HEAD_A '["p2"]' | arr)" '[]' "$(reaction 30 $T4 | arr)" '[]')
+L=$(ledger "$( { req 1 $T0; req 2 $T3; } | arr)" "$(review 10 $T1 $HEAD_A '["p2"]' | arr)" '[]' '[]' "$(block 30 $T4 usage_limit | arr)")
 check "an anchorless response after the first window is ambiguous with the previous request" "$L" \
   '.requests[1].outcome == "ambiguous" and (.requests[0].possible_second_response | length) == 1'
 
@@ -150,12 +150,12 @@ check "two reviews on the same head in one window are two responses, not one" "$
    and .requests[0].outcome == "ambiguous"'
 
 L=$(ledger "$(req 1 $T0 | arr)" '[]' "$(verdict 20 $T1 '["aaaaaaa"]' true | arr)" "$(reaction 30 $T1 | arr)" '[]')
-check "an affirmative verdict and a thumbs-up in one window are one clean response" "$L" \
+check "an affirmative verdict is the clean response; a thumbs-up adds no evidence" "$L" \
   '.summary.responses == 1 and .responses[0].class == "clean" and .requests[0].outcome == "attributed"'
 
 L=$(ledger "$(req 1 $T0 | arr)" "$(review 10 $T1 $HEAD_A '["p1"]' | arr)" '[]' "$(reaction 30 $T2 | arr)" '[]')
-check "a blocking review and a thumbs-up in one window keep blocking and are flagged conflicting" "$L" \
-  '.responses[0].class == "blocking" and .responses[0].conflicting == true'
+check "a blocking review and a thumbs-up keep blocking without reaction authority" "$L" \
+  '.responses[0].class == "blocking" and .responses[0].conflicting == false'
 
 L=$(ledger "$(req 1 $T0 | arr)" "$(review 10 $T1 $HEAD_A '["p2"]' | arr)" "$(verdict 20 $T2 '["aaaaaaa"]' false | arr)" '[]' '[]')
 check "a non-affirmative verdict joins its review and takes the review's class" "$L" \
@@ -355,11 +355,18 @@ stop_check "stops: a rebuttal with no Codex response after it is untested" "$(st
   '.stops == ["untested-rebuttal"] and .untested_rebuttals[0].finding == 100'
 IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[]' '[]' "$HEAD_B")" | arr)" '[]' '[]' '[]')
 stop_check "stops: a rebuttal Codex answered clean, provably to the later request, is settled" "$(stops "$IN" "$RB" 10)" '.stops == []'
-# A reaction-only clean pass has no anchor, so after the first window its
-# attribution is ambiguous: it may be a late answer to the earlier request.
-# Ambiguity never clears the stop (#1579).
+# A PR reaction is not a response and cannot test any rebuttal.
 IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" | arr)" '[]' "$(reaction 900 2026-09-25T02:10:00Z | arr)" '[]')
-stop_check "stops: an ambiguously attributed clean pass leaves the rebuttal untested" "$(stops "$IN" "$RB" 10)" '.stops == ["untested-rebuttal"]'
+stop_check "stops: a PR reaction leaves the rebuttal untested" "$(stops "$IN" "$RB" 10)" '.stops == ["untested-rebuttal"]'
+# Even in the first and only request window, a reaction cannot be attributed
+# as a clean response to clear an earlier rebuttal at a spent request ceiling.
+IN=$(inputs "$(req 1 2026-09-25T02:00:00Z | arr)" '[]' '[]' "$(reaction 900 2026-09-25T02:10:00Z | arr)" '[]')
+L=$(crl_ledger "$IN")
+check "a reaction-only first request remains unanswered" "$L" \
+  '.summary.responses == 0 and .requests[0].outcome == "no_response_yet"'
+stop_check "stops: a reaction-only first window cannot clear an earlier rebuttal" "$(stops "$IN" "$RB" 10 1)" \
+  '.stops == ["untested-rebuttal"]'
+
 # A response that lands after the rebuttal but answers a request posted before
 # it cannot have read the rebuttal (#1579): the only request predates it.
 IN=$(inputs "$(req 1 2026-09-25T00:00:00Z | arr)" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T01:30:00Z '[]')" | arr)" '[]' '[]' '[]')
@@ -369,7 +376,7 @@ IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" | arr)" '[]' '[]' "$(block 901 2026-
 stop_check "stops: a provider-block notice after a rebuttal leaves it untested" "$(stops "$IN" "$RB" 10)" '.stops == ["untested-rebuttal"]'
 # A response in the same second as the rebuttal cannot be shown to have read
 # it, so the rebuttal stays untested.
-IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" | arr)" '[]' "$(reaction 900 2026-09-25T02:10:00Z | arr)" '[]')
+IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[]' '[]' "$HEAD_B")" | arr)" '[]' '[]' '[]')
 stop_check "stops: a response in the same second as the rebuttal leaves it untested" \
   "$(stops "$IN" "$(rebut 100 x.sh 2026-09-25T02:10:00Z | arr)" 10)" '.stops == ["untested-rebuttal"]'
 IN=$(inputs "$R2" "$(printf '%s\n' "$FIRST" "$(preview 11 2026-09-25T02:10:00Z '[["x.sh","p1"]]')" | arr)" '[]' '[]' '[]')
@@ -484,7 +491,7 @@ if [ "$RC" = 0 ] && jq -e '.summary.requests == 1 and .summary.foreign_requests 
 else
   fail "CLI ok case: rc=$RC out=$(cat "$D/out") err=$(cat "$D/err")"
 fi
-if ! grep -qvE '^repos/o/r/(pulls/7|issues/7/comments|pulls/7/reviews|pulls/7/comments|issues/7/reactions|issues/comments/[0-9]+/reactions|pulls/comments/[0-9]+/reactions)$' "$D/calls"; then
+if ! grep -q '^repos/o/r/issues/7/reactions$' "$D/calls" && ! grep -qvE '^repos/o/r/(pulls/7|issues/7/comments|pulls/7/reviews|pulls/7/comments|issues/7/reactions|issues/comments/[0-9]+/reactions|pulls/comments/[0-9]+/reactions)$' "$D/calls"; then
   pass "CLI: reads only the PR's own records"
 else
   fail "CLI read an unexpected endpoint: $(cat "$D/calls")"

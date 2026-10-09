@@ -13,8 +13,7 @@
 # What the record does not prove, and how the ledger treats it:
 #   - A request comment names no commit, so a request never gets a head from
 #     timestamps. A response's head comes only from its own anchor (a review's
-#     commit_id, a verdict's "Reviewed commit"); reactions and block notices
-#     carry none.
+#     commit_id, a verdict's "Reviewed commit"); block notices carry none.
 #   - Anyone can request a review. Requests from other accounts, or author
 #     comments that are not the exact command, are FOREIGN: they open windows
 #     and are attribution candidates, but are not counted as the configured
@@ -23,10 +22,9 @@
 #     reaction when it finishes, so eyes are current state. The ledger only
 #     says eyes came before a re-post when the reaction's own timestamp proves
 #     it; otherwise it says unknown.
-#   - The thumbs-up on the pull request is one reaction per user: only its
-#     latest creation survives, so earlier reaction-only clean passes leave no
-#     record. The Review Summary is edited in place. Both are listed in
-#     `limits` on every ledger.
+#   - Pull-request reactions are not review evidence and never enter response
+#     attribution. The Review Summary is edited in place, so only its current
+#     state is listed in `limits` on every ledger.
 #
 # Every comment body is parsed by an existing shared helper the caller runs
 # first (crqe_trigger_generation, crqe_ack_present's selection, codex_tiers_of,
@@ -46,7 +44,7 @@
 #                  reply_markers: [...]}],
 #     rebuttals: [{finding, path, at, sources: [...]}],  # optional (slice 3)
 #     verdicts:  [{comment_id, created_at, reviewed_shas: [...], affirmative}],
-#     reactions: [{id, created_at}],             # bot +1 on the PR issue
+#     reactions: [],                            # legacy input, ignored
 #     blocks:    [{comment_id, created_at, reason}],
 #     summary:   null | {status, commit, observed_at, ...}
 #   }
@@ -94,7 +92,6 @@ crl_ledger() {
                 anchor: $anchor,
                 anchor_conflict: ($anchor == null and (.reviewed_shas | length) > 0),
                 affirmative } ]
-        + [ $in.reactions[] | { sid: ("reaction:" + (.id | tostring)), kind: "reaction", t: .created_at, anchor: null } ]
         + [ $in.blocks[] | { sid: ("block:" + (.comment_id | tostring)), kind: "block", t: .created_at,
                              anchor: null, reason } ]
         | map(. + {w: window_of(.t), tie: tie_of(.t)})
@@ -126,9 +123,8 @@ crl_ledger() {
         . as $g
         | ([ $g.sigs[] | select(.kind == "review") ] | first) as $rev
         | ([ $g.sigs[] | select(.kind == "verdict") ]) as $ver
-        | ([ $g.sigs[] | select(.kind == "reaction") ]) as $rea
         | ([ $g.sigs[] | select(.kind == "block") ]) as $blk
-        | (($ver | any(.affirmative)) or ($rea | length) > 0) as $clean_signal
+        | ($ver | any(.affirmative)) as $clean_signal
         | (($ver | any(.affirmative)) and ($ver | any(.affirmative | not))) as $verdicts_disagree
         | if $rev != null then
             { class: $rev.grade,
@@ -136,7 +132,6 @@ crl_ledger() {
           elif ($ver | length) > 0 then
             { class: (if ($ver | all(.affirmative)) then "clean" else "unknown_tier" end),
               conflicting: (($ver | any(.affirmative)) and ($ver | any(.affirmative | not))) }
-          elif ($rea | length) > 0 then { class: "clean", conflicting: false }
           elif ($blk | length) > 0 then { class: "provider_blocked", conflicting: false }
           else { class: "no_findings", conflicting: false } end;
       ( [ range(0; $n + 1) as $w
@@ -264,7 +259,7 @@ crl_ledger() {
       limits: [
         "a request comment names no commit; request heads are never inferred",
         "eyes are current state: Codex removes them when a review finishes",
-        "the pull-request thumbs-up keeps only its latest creation; earlier reaction-only clean passes leave no record",
+        "pull-request reactions are not response or attribution evidence",
         "the Review Summary is edited in place; only its current state is visible",
         "request comments are read as they stand now; an edited or deleted request changes the reconstructed windows"
       ],
