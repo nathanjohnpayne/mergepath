@@ -155,7 +155,8 @@ if p4b_revalidate_input fixture/repo 1753 "$WORK/wave-input"; then
  fail 'tampered complete PR diff accepted'
 else pass 'curated review also fences the complete canary diff digest'; fi
 # Exercise the real collector's allocation failure without provider access.
-export INPUT_REAL_MKTEMP="$(command -v mktemp)"
+INPUT_REAL_MKTEMP="$(command -v mktemp)"
+export INPUT_REAL_MKTEMP
 cat > "$WORK/bin/mktemp" <<'SH'
 #!/usr/bin/env bash
 case "$*" in *p4b-evidence-input.*) exit 1 ;; esac
