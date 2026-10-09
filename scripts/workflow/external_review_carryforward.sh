@@ -165,6 +165,8 @@ REVIEWS_JSON=$(printf '%s\n' "$REVIEWS_JSON" | jq -s 'add // []') || {
   exit 2
 }
 
+COMMENTS_JSON=$(printf '%s\n' "$COMMENTS_JSON" | python3 "$SCRIPT_DIR/resolve-codex-verdict-anchors.py" --repo "$REPO" --bot "$BOT_LOGIN") || exit 2
+
 HEAD_LC=$(printf '%s' "$HEAD_SHA" | tr '[:upper:]' '[:lower:]')
 CURRENT_SIGNAL=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -c \
   --arg bot "$BOT_LOGIN" \

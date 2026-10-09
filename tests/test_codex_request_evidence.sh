@@ -8,6 +8,7 @@ DIR=$(mktemp -d)
 trap 'rm -rf "$DIR"' EXIT
 mkdir -p "$DIR/scripts/workflow" "$DIR/bin"
 cp "$ROOT/scripts/codex-review-check.sh" "$DIR/scripts/"
+cp "$ROOT/scripts/workflow/resolve-codex-verdict-anchors.py" "$DIR/scripts/workflow/"
 ln -s "$ROOT/scripts/lib" "$DIR/scripts/lib"
 cat >"$DIR/policy.yml" <<'POLICY'
 author_identity: nathanjohnpayne
@@ -346,5 +347,29 @@ if [ "$rc" != 0 ] || ! grep -q 'cleared — Phase 4b substitute' "$DIR/out"; the
 fi
 PASS=$((PASS + 1))
 echo "PASS: #1598 codex-disabled"
+
+# #1752: negative ambiguous anchors remain ordering observations, but must
+# never tell a diagnostic caller that the current head was reviewed.
+for anchor in missing prefix malformed conflicting exact; do
+  case "$anchor" in
+    missing) field='' ;;
+    prefix) field='Reviewed commit: abcdef0' ;;
+    malformed) field='Reviewed commit: abcdef0123456789000000000000000000000000.trailing' ;;
+    conflicting) field=$'Reviewed commit: abcdef0123456789000000000000000000000000\nReviewed commit: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' ;;
+    exact) field='Reviewed commit: abcdef0123456789000000000000000000000000' ;;
+  esac
+  jq -cn --arg field "$field" '[{user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-09-14T00:02:00Z",body:("Codex Review: Found issues\n" + $field)}]' > "$DIR/comments"
+  printf '[]\n' > "$DIR/reviews"
+  : > "$DIR/calls"
+  rc=0
+  PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=diagnostic-anchor \
+    PR_BODY='' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+    MERGEPATH_REVIEW_POLICY_PATH="$DIR/policy.yml" \
+    bash "$DIR/scripts/codex-review-check.sh" --diagnostic-signal-only 99 owner/repo > "$DIR/out" 2>&1 || rc=$?
+  if { [ "$anchor" = exact ] && [ "$rc" != 0 ]; } || { [ "$anchor" != exact ] && [ "$rc" = 0 ]; }; then
+    cat "$DIR/out"; echo "FAIL diagnostic $anchor rc=$rc"; exit 1
+  fi
+  PASS=$((PASS + 1)); echo "PASS: diagnostic anchor $anchor"
+done
 
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"

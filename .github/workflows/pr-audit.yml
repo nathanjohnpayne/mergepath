@@ -55,6 +55,8 @@ jobs:
         run: npm install --no-save --ignore-scripts --legacy-peer-deps js-yaml
 
       - name: Audit merged PRs for review policy compliance
+        env:
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
@@ -652,6 +654,19 @@ jobs:
                     `verdict-comment clearance path disabled (fail closed). Error: ${e.message}`
                   );
                   issueComments = null;
+                }
+
+                if (issueComments !== null) {
+                  try {
+                    issueComments = JSON.parse(execFileSync('python3', [
+                      'scripts/workflow/resolve-codex-verdict-anchors.py',
+                      '--repo', `${context.repo.owner}/${context.repo.repo}`,
+                      '--bot', codexBotLogin,
+                    ], {input: JSON.stringify(issueComments), encoding: 'utf8', timeout: 35000}));
+                  } catch (e) {
+                    issueComments = null; // Missing/unreadable resolver cannot grant clearance.
+                    console.log(`WARNING: Codex anchor resolution failed for PR #${pr.number}`);
+                  }
                 }
 
                 // ── Clearance algorithm (#249/#449/#450/#612) ─────────

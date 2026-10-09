@@ -274,3 +274,8 @@ crqe_verdicts() { # issue-comments-json bot-login
     | sort_by(.created_at, .comment_id)
   '
 }
+
+# Read-side normalization preserves raw malformed/ambiguous observations.
+crqe_resolve_verdict_anchors() { # comments-json repository bot-login
+  printf '%s\n' "$1" | python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")/../workflow" && pwd)/resolve-codex-verdict-anchors.py" --repo "$2" --bot "$3"
+}

@@ -2313,6 +2313,7 @@ if [ "$CODEX_ENABLED" = "true" ]; then
   # whose full SHA equals HEAD; keeping the non-affirmative timestamp too lets the
   # Phase 4b substitute freshness guard reject a stale approval over a newer
   # negative verdict (Codex P2 on #608).
+  ISSUE_COMMENTS_JSON=$(crqe_resolve_verdict_anchors "$ISSUE_COMMENTS_JSON" "$REPO" "$BOT_LOGIN") || exit 2
   CODEX_VERDICT_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
     --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
     ($sha | ascii_downcase) as $head
@@ -2351,7 +2352,7 @@ if [ "$CODEX_ENABLED" = "true" ]; then
         # prior affirmative text (e.g. a blockquote of an earlier clean
         # verdict) read as affirmative and break fail-closed (CodeRabbit Major
         # on #608). Real Codex verdicts always lead with that header line.
-        | { created_at: .created_at,
+        | { created_at: .created_at, exact: $exact,
             affirmative: ($exact and $affirmative) }
       ]
     | max_by(.created_at) // null
@@ -2878,8 +2879,12 @@ case "$LATEST_SIGNAL_KIND" in
     if [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ]; then
       # Same as the review arm: a non-affirmative or findings-bearing verdict
       # on THIS head still means Codex reported on it.
-      CLEARED=true
-      CLEARANCE_REASON="head-anchored verdict comment @ $LATEST_SIGNAL_TIME (presence only; disposition not evaluated under --diagnostic-signal-only)"
+      if [ "$(printf '%s' "$CODEX_VERDICT_JSON" | jq -r '.exact // false')" = true ]; then
+        CLEARED=true
+        CLEARANCE_REASON="head-anchored verdict comment @ $LATEST_SIGNAL_TIME (presence only; disposition not evaluated under --diagnostic-signal-only)"
+      else
+        log "gate (c): ambiguous verdict is an ordering observation, not a same-head report"
+      fi
     elif [ -n "$CODEX_HEAD_VERDICT_TIME" ] && [ "$UNADDRESSED_COUNT" -eq 0 ]; then
       CLEARED=true
       CLEARANCE_REASON="latest Codex signal is a HEAD-anchored AFFIRMATIVE verdict comment @ $LATEST_SIGNAL_TIME (Reviewed commit equals $HEAD_SHA; no unaddressed P0/P1) (#600)"

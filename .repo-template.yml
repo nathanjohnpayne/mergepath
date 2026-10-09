@@ -43,7 +43,9 @@ spec_test_map:
     - tests/test_cockpit.sh
   pr_body_contract:
     - tests/test_pr_body_contract_parity.sh
-  codex_request_evidence: tests/test_codex_request_evidence.sh
+  codex_request_evidence:
+    - tests/test_codex_request_evidence.sh
+    - tests/test_codex_verdict_anchor_resolution.py
   codex_review_ledger: tests/test_codex_review_ledger.sh
   codex_usage_limit_marker: tests/test_codex_usage_limit_marker.sh
   coderabbit_phase_25_invocation:

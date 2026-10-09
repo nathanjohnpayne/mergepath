@@ -59,6 +59,8 @@ make_case() {
   cp "$ROOT/scripts/lib/gh-api-scalar.sh" "$dir/scripts/lib/gh-api-scalar.sh"   # #799, hard-sourced
   cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"     # #1008, hard-sourced
   cp "$ROOT/scripts/lib/codex-request-evidence.sh" "$dir/scripts/lib/codex-request-evidence.sh"
+  mkdir -p "$dir/scripts/workflow"
+  cp "$ROOT/scripts/workflow/resolve-codex-verdict-anchors.py" "$dir/scripts/workflow/resolve-codex-verdict-anchors.py"
   cp "$ROOT/scripts/lib/codex-failure-markers.sh" "$dir/scripts/lib/codex-failure-markers.sh"
   cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
   cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$dir/scripts/workflow/resolve_base_policy.sh"
@@ -654,6 +656,7 @@ make_gate_case() {
   local dir="$WORKDIR/$name"
   mkdir -p "$dir/scripts/workflow" "$dir/scripts/lib" "$dir/.github" "$dir/bin"
   cp "$GATE_SRC" "$FP_SRC" "$CF_SRC" \
+     "$ROOT/scripts/workflow/resolve-codex-verdict-anchors.py" \
      "$ROOT/scripts/workflow/parse_policy_list.sh" \
      "$ROOT/scripts/workflow/match_protected_paths.sh" \
      "$dir/scripts/workflow/"

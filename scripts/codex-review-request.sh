@@ -842,6 +842,7 @@ scan_codex_state() {
   comments=$(fetch_scan_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments") || return $?
   reactions=$(fetch_scan_array "repos/$REPO/issues/$PR_NUMBER/reactions" "reactions") || return $?
   issue_comments=$(fetch_scan_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || return $?
+  issue_comments=$(crqe_resolve_verdict_anchors "$issue_comments" "$REPO" "$BOT_LOGIN") || return 3
 
   # Latest review from the Codex bot on the current HEAD commit, if any.
   # Codex always uses COMMENTED state regardless of findings. We also
