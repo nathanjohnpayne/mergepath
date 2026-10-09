@@ -226,19 +226,66 @@ fi
 if [ "${2:-}" = -X ] && [ "${3:-}" = PATCH ]; then
   endpoint="$4"
   conclusion=""
+  summary=""
   previous=""
   for arg in "$@"; do
     if [ "$previous" = -f ] && [[ "$arg" == conclusion=* ]]; then
       conclusion="${arg#conclusion=}"
     fi
+    if [ "$previous" = -f ] && [[ "$arg" == 'output[summary]='* ]]; then
+      summary="${arg#*=}"
+    fi
     previous="$arg"
   done
   lease="${endpoint##*/}"
   printf 'close %s %s\n' "$lease" "$conclusion" >> "$FIXTURE_LOG/mutations.log"
+  printf '%s\n' "$summary" > "$FIXTURE_LOG/summary-$lease.log"
   exit 0
 fi
 
 endpoint="$2"
+if [ "$endpoint" = --method ] && [ "${3:-}" = GET ] \
+  && [ "${4:-}" = repos/owner/repo/actions/workflows/codex-p1-gate.yml/runs ]; then
+  source_event=""
+  for arg in "$@"; do
+    case "$arg" in event=*) source_event="${arg#event=}" ;; esac
+  done
+  if [ "$source_event" != pull_request ] || [ "${RELAY_MODE:-empty}" = empty ]; then
+    echo '{"total_count":0,"workflow_runs":[]}'
+  elif [ "$RELAY_MODE" = pending ]; then
+    echo '{"total_count":2,"workflow_runs":[{"id":501,"display_title":"Codex P1 Gate relay-v1 PR #1"},{"id":502,"display_title":"Codex P1 Gate relay-v1 PR #1"}]}'
+  else
+    echo '{"total_count":1,"workflow_runs":[{"id":501,"display_title":"Codex P1 Gate relay-v1 PR #1"}]}'
+  fi
+  exit 0
+fi
+if [ "$endpoint" = --paginate ] && [ "${3:-}" = repos/owner/repo/issues/1/comments ]; then
+  if [ "${RELAY_MODE:-empty}" = empty ]; then
+    echo '[]'
+  else
+    echo '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-feedback-archive-relay:v2 run=501 publisher=900 status=complete -->"}]'
+  fi
+  exit 0
+fi
+case "${@: -1}" in
+  repos/owner/repo/actions/workflows/codex-feedback-archive-relay.yml)
+    echo '{"id":89,"path":".github/workflows/codex-feedback-archive-relay.yml"}'; exit 0 ;;
+  repos/owner/repo/actions/runs/900)
+    echo '{"id":900,"workflow_id":89,"event":"workflow_run","path":".github/workflows/codex-feedback-archive-relay.yml","head_branch":"main","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repository":{"full_name":"owner/repo"}}'; exit 0 ;;
+  repos/owner/repo/actions/runs/900/jobs\?filter=all\&per_page=100)
+    echo '[{"jobs":[{"id":901,"run_id":900,"steps":[{"name":"Persist archive and publish the exact-head gate","conclusion":"success"}]}]}]'; exit 0 ;;
+  repos/owner/repo/actions/jobs/901/logs)
+    cat <<'LOG'
+##[group]Run set -euo pipefail
+  shell: /usr/bin/bash -e {0}
+  env:
+    PR_NUMBER: 1
+    SOURCE_RUN_ID: 501
+    HANDOFF_FILE: /tmp/handoff/codex-p1-read-only-handoff.json
+##[endgroup]
+LOG
+    exit 0 ;;
+esac
 if [[ "$endpoint" =~ ^repos/[^/]+/[^/]+/pulls/([0-9]+)$ ]]; then
   pr="${BASH_REMATCH[1]}"
   count_file="$FIXTURE_LOG/pull-$pr.count"
@@ -262,7 +309,9 @@ if [[ "$endpoint" =~ ^repos/[^/]+/[^/]+/pulls/([0-9]+)$ ]]; then
   if [[ " $* " == *" --jq "* ]]; then
     echo "$sha"
   else
-    jq -cn --arg sha "$sha" '{head:{sha:$sha,repo:{fork:false}},user:{login:"owner"},created_at:"2026-01-01T00:00:00Z"}'
+    fork=false
+    if [ "${SWEEP_MODE:-stable}" = relay-fork ] && [ "$pr" = 1 ]; then fork=true; fi
+    jq -cn --arg sha "$sha" --argjson fork "$fork" '{head:{sha:$sha,repo:{fork:$fork}},user:{login:"owner"},created_at:"2026-01-01T00:00:00Z"}'
   fi
   exit 0
 fi
@@ -281,6 +330,7 @@ run_sweep() {
     env PATH="$dir/bin:$PATH" FIXTURE_LOG="$dir" PRS=$'1\n2' \
       REPO=owner/repo CHECK_NAME='Codex P1 unresolved threads' \
       RUNNER_TEMP="$dir/runner" SWEEP_MODE="$sweep_mode" FP_MODE="$fp_mode" \
+      RELAY_MODE="${4:-empty}" \
       bash "$SWEEP_STEP"
   ) >"$dir/out" 2>&1
   local rc=$?
@@ -389,6 +439,51 @@ elif ! grep -Fxq 'close lease-2 success' "$dir/mutations.log"; then
 else
   pass "scheduled head drift fails closed on the opened generation"
 fi
+
+# Drive the production relay predicate inside the complete two-PR sweep. The
+# mixed case has one completed source run and one still awaiting its relay.
+for relay_mode in empty all-terminal pending; do
+  dir="$TMP/sweep-relay-$relay_mode"
+  make_sweep_fixture "$dir"
+  mkdir -p "$dir/scripts/workflow"
+  cp "$ROOT/scripts/workflow/verified-relay-markers.py" "$dir/scripts/workflow/"
+  cat > "$dir/scripts/workflow/feedback-archive-relay-source.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+jq -c '{requires_relay:true,source_run_id:.id}'
+SH
+  chmod +x "$dir/scripts/workflow/feedback-archive-relay-source.sh"
+  # The production scan uses GNU date syntax. Keep this fixture independent
+  # of the host date implementation and clock by supplying one fixed window.
+  cat > "$dir/bin/date" <<'SH'
+#!/usr/bin/env bash
+case "${@: -1}" in
+  +%s) echo 1767225600 ;;
+  +%Y-%m-%dT%H:%M:%SZ) echo 2026-01-01T00:00:00Z ;;
+  *) exit 92 ;;
+esac
+SH
+  chmod +x "$dir/bin/date"
+  rc=$(run_sweep "$dir" relay-fork stable "$relay_mode")
+  expected=success
+  [ "$relay_mode" != pending ] || expected=failure
+  if [ "$rc" -ne 0 ]; then
+    fail "relay $relay_mode inventory is not an infrastructure error" "sweep exited $rc"
+  elif ! grep -Fxq "close lease-1 $expected" "$dir/mutations.log"; then
+    fail "relay $relay_mode inventory yields the correct first-PR verdict" "expected $expected"
+  elif ! grep -Fxq 'close lease-2 success' "$dir/mutations.log" \
+    || ! grep -Fxq 'gate 2' "$dir/gate.log"; then
+    fail "relay $relay_mode inventory preserves later PR evaluation" "second PR was not evaluated"
+  elif [ "$relay_mode" = pending ] && \
+    { grep -Fxq 'gate 1' "$dir/gate.log" \
+      || ! grep -Fq 'relay is still pending' "$dir/summary-lease-1.log"; }; then
+    fail "pending relay holds only its PR" "pending relay was evaluated as clear"
+  elif [ "$relay_mode" != pending ] && ! grep -Fxq 'gate 1' "$dir/gate.log"; then
+    fail "relay $relay_mode inventory permits gate evaluation" "first PR was not evaluated"
+  else
+    pass "relay $relay_mode inventory yields its verdict and continues the sweep"
+  fi
+done
 
 echo ""
 echo "$PASS passed, $FAIL failed"

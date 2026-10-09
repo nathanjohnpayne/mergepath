@@ -38,14 +38,14 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 #      HEAD-anchored verdict signal, gated on the same anchor/affirmative
 #      logic as the merge gate, referenced to #609.
 if grep -q 'issue_comments=\$(fetch_scan_array "repos/\$REPO/issues/\$PR_NUMBER/comments"' "$SCRIPT" \
-   && grep -q "reviewed commit\[\^0-9a-f\]" "$SCRIPT" \
+   && grep -Fq "reviewed commit[^0-9a-z_" "$SCRIPT" \
    && grep -qi "didn.?t find any major issues" "$SCRIPT" \
-   && grep -q "startswith(\$s)" "$SCRIPT" \
+   && grep -Fq '$shas | all(. == $head)' "$SCRIPT" \
    && grep -q "max_by(.created_at) // null" "$SCRIPT" \
    && grep -q "#609" "$SCRIPT"; then
   pass "scan_codex_state computes the HEAD-anchored verdict signal (#609)"
 else
-  fail "scan_codex_state is missing the verdict signal (issue-comments fetch / affirmative regex / reviewed-commit scan / prefix anchor / #609)"
+  fail "scan_codex_state is missing the verdict signal (issue-comments fetch / affirmative regex / reviewed-commit scan / exact anchor / #609)"
 fi
 
 # ── 2. Structural: has_signal treats a verdict of EITHER disposition as a
@@ -81,22 +81,17 @@ fi
 #      (any disposition) and reports whether it is affirmative.
 BOT="chatgpt-codex-connector[bot]"
 HEAD="d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708"
-VERDICT_FILTER='
-    ($sha | ascii_downcase) as $head
-    | [ .[]
-        | select(.user.login == $bot)
-        | . as $c
-        | ( [ $c.body
-              | ascii_downcase
-              | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
-              | .[0]
-            ] ) as $shas
-        | select( ($shas | length) > 0
-                  and ($shas | any(. as $s | $head | startswith($s))) )
-        | { created_at: .created_at,
-            affirmative: (.body | test("(?im)^\\s*codex review:\\s*didn.?t find any major issues\\b")) }
-      ]
-    | max_by(.created_at) // null'
+VERDICT_FILTER=$(python3 - "$SCRIPT" <<'SELECTOR'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+start = source.index('  verdict=$(echo ')
+marker = '--arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" ' + chr(39)
+start = source.index(marker, start) + len(marker)
+end = source.index("\n  ')", start)
+print(source[start:end])
+SELECTOR
+)
 
 mk() { jq -n --arg login "$1" --arg body "$2" --arg t "$3" \
   '[{user:{login:$login},body:$body,created_at:$t}]'; }
@@ -112,11 +107,57 @@ check_verdict() { # desc expected_json fixture
   fi
 }
 
-# 5a. affirmative + prefix sha → verdict present, affirmative:true.
-check_verdict "affirmative + prefix sha → clears" \
+# A negative response cannot disappear merely because its head is unknown.
+for negative in 'Codex Review: Found issues.' 'Codex Review: Found issues.
+Reviewed commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Reviewed commit: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+'; do
+  history="$(jq -s 'add' <(mk "$BOT" "Codex Review: Didnt find any major issues.
+Reviewed commit: $HEAD" "2026-07-01T10:00:00Z") <(mk "$BOT" "$negative" "2026-07-01T12:00:00Z"))"
+  check_verdict "newer missing or conflicting foreign anchors supersede older clearance" '{"created_at":"2026-07-01T12:00:00Z","affirmative":false}' "$history"
+done
+
+# Every Reviewed commit field participates, including malformed values.
+for bad_anchor in "${HEAD:0:6}" zzzzzz '@@' ''; do
+  check_verdict "mixed full HEAD and malformed anchor refuses ($bad_anchor)" "null" \
+    "$(mk "$BOT" "Codex Review: Didn't find any major issues.
+Reviewed commit: $HEAD
+Reviewed commit: $bad_anchor" "2026-07-03T10:00:00Z")"
+done
+
+# #1752: the requester must not suppress review on a colliding prefix.
+for n in 6 7 8 12 20 39; do
+  check_verdict "abbreviated Reviewed commit ($n chars) refuses" null \
+    "$(mk "$BOT" "Codex Review: Didn't find any major issues.
+Reviewed commit: ${HEAD:0:$n}" "2026-07-03T10:00:00Z")"
+done
+for token in "${HEAD}a" "${HEAD}g" "${HEAD}-not-a-sha" "${HEAD}/suffix" "${HEAD}.junk" "${HEAD}_junk"; do
+  check_verdict "overlong or malformed SHA refuses" null \
+    "$(mk "$BOT" "Codex Review: Didn't find any major issues.
+Reviewed commit: $token" "2026-07-03T10:00:00Z")"
+done
+
+
+# A malformed newer negative response cannot leave an older clean verdict live.
+for anchor in "${HEAD:0:10}" '' "${HEAD}.junk" "${HEAD}
+Reviewed commit: @@"; do
+  history="$(jq -s 'add' <(mk "$BOT" "Codex Review: Didnt find any major issues.
+Reviewed commit: $HEAD" "2026-07-01T10:00:00Z") <(mk "$BOT" "Codex Review: Found issues.
+Reviewed commit: $anchor" "2026-07-01T12:00:00Z"))"
+  check_verdict "newer malformed negative supersedes older exact clean ($anchor)" \
+    '{"created_at":"2026-07-01T12:00:00Z","affirmative":false}' "$history"
+done
+history="$(jq -s 'add' <(mk "$BOT" "Codex Review: Didnt find any major issues.
+Reviewed commit: $HEAD" "2026-07-01T10:00:00Z") <(mk "$BOT" "Codex Review: Found issues.
+Reviewed commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "2026-07-01T12:00:00Z"))"
+check_verdict "valid negative on another full head does not demote this head" \
+  '{"created_at":"2026-07-01T10:00:00Z","affirmative":true}' "$history"
+
+# 5a. affirmative + full SHA → verdict present, affirmative:true.
+check_verdict "affirmative + full SHA → clears" \
   '{"created_at":"2026-07-03T10:00:00Z","affirmative":true}' \
   "$(mk "$BOT" "Codex Review: Didn't find any major issues. Swish!
-Reviewed commit: d05ff4d0" "2026-07-03T10:00:00Z")"
+Reviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708" "2026-07-03T10:00:00Z")"
 
 # 5b (acceptance criterion): stale-HEAD verdict (Reviewed commit does not
 # prefix HEAD) is ignored entirely — null, not just non-affirmative.
@@ -130,15 +171,15 @@ Reviewed commit: aaaa1111bbbb" "2026-07-03T10:00:00Z")"
 check_verdict "non-affirmative verdict on HEAD → present, affirmative:false" \
   '{"created_at":"2026-07-03T10:00:00Z","affirmative":false}' \
   "$(mk "$BOT" "Codex Review: Found 2 issues to address.
-Reviewed commit: d05ff4d0" "2026-07-03T10:00:00Z")"
+Reviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708" "2026-07-03T10:00:00Z")"
 
 # 5d (acceptance criterion): a NEWER non-affirmative verdict supersedes an
 # OLDER affirmative one on the same HEAD — latest-verdict-first, not
 # affirmative-first (same #608 P1 shape as the merge gate).
 older_affirmative="$(mk "$BOT" "Codex Review: Didn't find any major issues.
-Reviewed commit: d05ff4d0" "2026-07-03T10:00:00Z")"
+Reviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708" "2026-07-03T10:00:00Z")"
 newer_negative="$(mk "$BOT" "Codex Review: Found a regression.
-Reviewed commit: d05ff4d0e1" "2026-07-03T12:00:00Z")"
+Reviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708" "2026-07-03T12:00:00Z")"
 check_verdict "newer non-affirmative verdict supersedes older affirmative one" \
   '{"created_at":"2026-07-03T12:00:00Z","affirmative":false}' \
   "$(jq -s 'add' <(printf '%s' "$older_affirmative") <(printf '%s' "$newer_negative"))"

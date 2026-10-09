@@ -652,7 +652,7 @@ mkdir -p "$empty_path_dir"
 if ! command -v op >/dev/null 2>&1; then
   echo "SKIP: 'op' (1Password CLI) not on host PATH — Test 18 (--firebase none with hermetic PATH) cannot exercise the host-tool-check path on CI runners"
 else
-  for tool in bash gh op git yq rsync; do
+  for tool in bash gh op git yq rsync python3; do
     src=$(command -v "$tool" || true)
     if [ -n "$src" ]; then ln -sf "$src" "$empty_path_dir/$tool"; fi
   done

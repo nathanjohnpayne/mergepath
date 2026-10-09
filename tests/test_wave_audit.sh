@@ -21,6 +21,27 @@ command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not available" >&2; exit 0; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wave-audit-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
+export FAKE_POLICY_ARGS_LOG="$WORK/policy-args"
+
+# Wave dispatch models the trusted verifier boundary. The actual Git byte
+# comparison is exercised by test_marker_provenance.py, not duplicated here.
+mkdir -p "$WORK/trusted/scripts/workflow"
+cp "$WA" "$WORK/trusted/scripts/wave-audit.sh"
+WA="$WORK/trusted/scripts/wave-audit.sh"
+cat > "$WORK/trusted/scripts/workflow/resolve_base_policy.sh" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >> "${FAKE_POLICY_ARGS_LOG:-/dev/null}"
+policy=$(mktemp)
+printf 'author_identity: nathanjohnpayne\n' > "$policy"
+printf '%s\n' "$policy"
+SH
+cat > "$WORK/trusted/scripts/workflow/verify-live-propagation.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+jq -e --arg head "$3" --arg base "$4" '.head.sha == $head and .base.sha == $base' >/dev/null || exit 2
+[ -f "$5" ] || exit 2
+case "${FAKE_LANE:-good}" in good) exit 0 ;; modified) exit 1 ;; *) exit 2 ;; esac
+SH
 
 PASS=0; FAIL=0
 pass() { echo "  PASS: $*"; PASS=$((PASS + 1)); }
@@ -166,9 +187,8 @@ run_wa_repo() { # run_wa_repo <repo-dir> <policy> <capture-reset> <args...>
     bash "$WA" "$@"
 }
 
-# fake gh for the lane-precondition tests: serves the canary PR's live pair
-# and the issue-comments feed. FAKE_LANE selects a valid v2 marker or a
-# rejected legacy/malformed/wrong-pair/non-bot form.
+# Fake gh serves canary metadata and pair fences. FAKE_LANE controls the
+# independently tested verifier result rather than bot comment authority.
 FAKEBIN="$WORK/fakebin"
 mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/gh" <<'GH'
@@ -201,17 +221,8 @@ if [ "$1" = "pr" ]; then
   exit 0
 fi
 if [ "$1" = "api" ]; then
-  case "${FAKE_LANE:-good}" in
-    good) printf '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-propagation-lane:v2 verified-head=%s verified-base=%s -->"}]\n' "${FAKE_CANARY_HEAD:?}" "${FAKE_CANARY_BASE:?}" ;;
-    prose) printf '[{"user":{"login":"github-actions[bot]"},"body":"lane complete: <!-- mergepath-propagation-lane:v2 verified-head=%s verified-base=%s -->; dispatch authorized"}]\n' "${FAKE_CANARY_HEAD:?}" "${FAKE_CANARY_BASE:?}" ;;
-    wrong-head) printf '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-propagation-lane:v2 verified-head=dddddddddddddddddddddddddddddddddddddddd verified-base=%s -->"}]\n' "${FAKE_CANARY_BASE:?}" ;;
-    wrong-base) printf '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-propagation-lane:v2 verified-head=%s verified-base=cccccccccccccccccccccccccccccccccccccccc -->"}]\n' "${FAKE_CANARY_HEAD:?}" ;;
-    v1) printf '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-propagation-lane verified-head=%s -->"}]\n' "${FAKE_CANARY_HEAD:?}" ;;
-    malformed) printf '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-propagation-lane:v2 verified-head=%s verified-base=bad -->"}]\n' "${FAKE_CANARY_HEAD:?}" ;;
-    nonbot) printf '[{"user":{"login":"contributor"},"body":"<!-- mergepath-propagation-lane:v2 verified-head=%s verified-base=%s -->"}]\n' "${FAKE_CANARY_HEAD:?}" "${FAKE_CANARY_BASE:?}" ;;
-    unreadable) exit 1 ;;
-    *) printf '[]\n' ;;
-  esac
+  jq -cn --arg head "${FAKE_CANARY_HEAD:?}" --arg base "${FAKE_CANARY_BASE:?}" \
+    '{head:{sha:$head},base:{sha:$base,ref:"main",repo:{default_branch:"main"}}}'
   exit 0
 fi
 exit 1
@@ -373,22 +384,13 @@ grep -Fxq -- "--expected-base-sha" "$CAPTURE/args" \
   && grep -Fxq "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$CAPTURE/args" \
   && pass "review publication pinned to the lane-verified base" \
   || fail "lane-verified base not passed to the review publisher"
-run_wa_lane prose 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null \
-  && pass "complete v2 marker in bot prose dispatches" || fail "complete v2 marker in bot prose refused"
-if run_wa_lane none 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null 2>&1; then
-  fail "un-lane-verified canary was dispatched"
-else
-  [ $? -eq 3 ] && pass "un-lane-verified canary fails closed (exit 3)" || fail "wrong exit for unverified lane"
-fi
-[ ! -e "$CAPTURE/args" ] && pass "orchestrator NOT dispatched without the lane marker" || fail "dispatched despite missing lane marker"
-
-for rejected_lane in wrong-head wrong-base v1 malformed nonbot unreadable; do
+for rejected_lane in modified unreadable; do
   if run_wa_lane "$rejected_lane" 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null 2>&1; then
-    fail "$rejected_lane lane marker was accepted"
+    fail "$rejected_lane live verification was accepted"
   else
-    [ $? -eq 3 ] && pass "$rejected_lane lane marker fails closed (exit 3)" || fail "wrong exit for $rejected_lane lane marker"
+    [ $? -eq 3 ] && pass "$rejected_lane live verification fails closed (exit 3)" || fail "wrong exit for $rejected_lane proof"
   fi
-  [ ! -e "$CAPTURE/args" ] && pass "orchestrator NOT dispatched for $rejected_lane lane marker" || fail "dispatched despite $rejected_lane lane marker"
+  [ ! -e "$CAPTURE/args" ] && pass "orchestrator NOT dispatched for $rejected_lane proof" || fail "dispatched despite $rejected_lane proof"
 done
 
 if FAKE_CANARY_BASE=not-an-oid run_wa_lane good 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null 2>&1; then
@@ -1112,4 +1114,10 @@ if [ "$(git -C "$CANON" tag -l)" = "$capture_tags_before" ] \
 else fail "capture mode published a receipt or watermark"; fi
 
 echo "Summary: $PASS passed, $FAIL failed"
+if [ -s "$FAKE_POLICY_ARGS_LOG" ] && grep -q -- '--base-ref main --base-sha ' "$FAKE_POLICY_ARGS_LOG" \
+  && ! grep -q -- '--pr ' "$FAKE_POLICY_ARGS_LOG"; then
+  pass "governing policy resolves the observed exact base without a second PR read"
+else
+  fail "governing policy was not bound to the observed exact base"
+fi
 [ "$FAIL" -eq 0 ]

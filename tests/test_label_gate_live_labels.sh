@@ -198,10 +198,9 @@ check "unrelated labels alone pass" \
   '{"livePages":[["documentation","enhancement"]]}' \
   '.crashed == null and .failures == []'
 
-# The independent agent-review triage path consumes the same authority marker
-# before deciding whether to skip its needs-external-review add. Execute its
-# actual marker-reader block so producer/consumer lockstep is behavioral, not
-# only a grep assertion.
+# The independent triage path delegates authority to the live byte verifier.
+# Execute the actual workflow block and verify its exact pair/policy inputs,
+# fail-closed outcomes, and independence from historical comment markers.
 yq -r '.jobs.triage.steps[] | select(.id == "check") | .with.script' \
   "$AGENT_WORKFLOW" >"$WORK/agent-triage.js"
 awk '
@@ -210,7 +209,7 @@ awk '
   capture { print }
 ' "$WORK/agent-triage.js" >"$WORK/agent-lane-reader.js"
 if [ ! -s "$WORK/agent-lane-reader.js" ]; then
-  fail "could not extract agent-review's propagation marker reader"
+  fail "could not extract agent-review's live propagation verifier"
 else
   cat >>"$WORK/agent-lane-reader.js" <<'NODE'
 return laneVerifiedHead;
@@ -236,6 +235,15 @@ const github = {
 const context = { repo: { owner: 'o', repo: 'r' } };
 const core = { warning: message => warnings.push(message) };
 const needsExternal = true;
+const policyReadFailed = Boolean(scenario.policyReadFailed);
+const policyConfigPath = '/trusted/governing-policy.yml';
+const childProcess = {
+  execFileSync(file, args, options) {
+    calls.push({file, args, options});
+    if (scenario.verifierFails) throw new Error('live byte verification refused');
+    return '';
+  },
+};
 const pr = {
   number: 42,
   head: { ref: 'mergepath-sync/deadbee', sha: scenario.head },
@@ -245,8 +253,10 @@ let crashed = null;
 let laneVerifiedHead = null;
 try {
   laneVerifiedHead = await new AsyncFunction(
-    'github', 'context', 'core', 'needsExternal', 'pr', body
-  )(github, context, core, needsExternal, pr);
+    'github', 'context', 'core', 'needsExternal', 'pr',
+    'childProcess', 'policyReadFailed', 'policyConfigPath', body
+  )(github, context, core, needsExternal, pr,
+    childProcess, policyReadFailed, policyConfigPath);
 } catch (err) {
   crashed = err.message;
 }
@@ -264,29 +274,33 @@ agent_lane_check() { # <label> <scenario-json> <jq-assertion>
   fi
 }
 
-agent_lane_check "agent triage accepts a trusted exact-pair marker with surrounding prose" \
-  "$(jq -nc --arg h "$HEAD40" --arg b "$BASE40" '{head:$h,base:$b,comments:[{user:{login:"github-actions[bot]"},body:("context\n<!-- mergepath-propagation-lane:v2 verified-head="+$h+" verified-base="+$b+" -->\nmore context")}]}')" \
-  '.crashed == null and .laneVerifiedHead == true and (.calls | length) == 1'
+agent_lane_check "agent triage delegates the exact live pair and governing policy" \
+  "$(jq -nc --arg h "$HEAD40" --arg b "$BASE40" '{head:$h,base:$b,comments:[]}')" \
+  '.crashed == null and .laneVerifiedHead == true and (.calls | length) == 1
+   and .calls[0].file == "bash"
+   and .calls[0].args == ["scripts/workflow/verify-live-propagation.sh", "o/r", "42", "'"$HEAD40"'", "'"$BASE40"'", "/trusted/governing-policy.yml"]'
 
-agent_lane_check "agent triage rejects a marker for the old base" \
-  "$(jq -nc --arg h "$HEAD40" --arg b "$BASE40" --arg old "$OTHER_BASE40" '{head:$h,base:$b,comments:[{user:{login:"github-actions[bot]"},body:("<!-- mergepath-propagation-lane:v2 verified-head="+$h+" verified-base="+$old+" -->")}]}')" \
-  '.crashed == null and .laneVerifiedHead == false'
+agent_lane_check "agent triage supplies the live PR snapshot and bounded verifier options" \
+  "$(jq -nc --arg h "$HEAD40" --arg b "$BASE40" '{head:$h,base:$b,comments:[]}')" \
+  '.crashed == null and .calls[0].options.encoding == "utf8"
+   and .calls[0].options.timeout == 120000
+   and (.calls[0].options.input | fromjson) == {number:42,head:{ref:"mergepath-sync/deadbee",sha:"'"$HEAD40"'"},base:{sha:"'"$BASE40"'"}}'
 
-agent_lane_check "agent triage rejects a legacy head-only marker" \
-  "$(jq -nc --arg h "$HEAD40" --arg b "$BASE40" '{head:$h,base:$b,comments:[{user:{login:"github-actions[bot]"},body:("<!-- mergepath-propagation-lane verified-head="+$h+" -->")}]}')" \
-  '.crashed == null and .laneVerifiedHead == false'
+agent_lane_check "agent triage keeps a rejected live pair external-required" \
+  "$(jq -nc --arg h "$HEAD40" --arg b "$OTHER_BASE40" '{head:$h,base:$b,comments:[],verifierFails:true}')" \
+  '.crashed == null and .laneVerifiedHead == false and (.calls | length) == 1 and (.warnings | length) == 1'
 
-agent_lane_check "agent triage rejects a non-bot exact-pair marker" \
-  "$(jq -nc --arg h "$HEAD40" --arg b "$BASE40" '{head:$h,base:$b,comments:[{user:{login:"nathanjohnpayne"},body:("<!-- mergepath-propagation-lane:v2 verified-head="+$h+" verified-base="+$b+" -->")}]}')" \
-  '.crashed == null and .laneVerifiedHead == false'
+agent_lane_check "agent triage does not accept a legacy marker after verification fails" \
+  "$(jq -nc --arg h "$HEAD40" --arg b "$BASE40" '{head:$h,base:$b,verifierFails:true,comments:[{user:{login:"github-actions[bot]"},body:("<!-- mergepath-propagation-lane verified-head="+$h+" -->")}]}')" \
+  '.crashed == null and .laneVerifiedHead == false and (.calls | length) == 1'
 
-agent_lane_check "agent triage rejects malformed live pair input before reading comments" \
-  "$(jq -nc --arg b "$BASE40" '{head:"not-a-sha",base:$b,comments:[]}')" \
-  '.crashed == null and .laneVerifiedHead == false and .calls == [] and (.warnings | length) == 1'
+agent_lane_check "agent triage does not accept a spoofable bot marker after verification fails" \
+  "$(jq -nc --arg h "$HEAD40" --arg b "$BASE40" '{head:$h,base:$b,verifierFails:true,comments:[{user:{login:"github-actions[bot]"},body:("<!-- mergepath-propagation-lane:v2 verified-head="+$h+" verified-base="+$b+" -->")}]}')" \
+  '.crashed == null and .laneVerifiedHead == false and (.calls | length) == 1'
 
-agent_lane_check "agent triage fails closed when comments are unreadable" \
-  "$(jq -nc --arg h "$HEAD40" --arg b "$BASE40" '{head:$h,base:$b,comments:[],readFails:true}')" \
-  '.crashed == null and .laneVerifiedHead == false and (.warnings | length) == 1'
+agent_lane_check "agent triage skips propagation exemption when the governing policy is unreadable" \
+  "$(jq -nc --arg h "$HEAD40" --arg b "$BASE40" '{head:$h,base:$b,comments:[],policyReadFailed:true}')" \
+  '.crashed == null and .laneVerifiedHead == false and .calls == []'
 
 # #1321: execute the real reconciliation step with a fake public API. The stub
 # accepts only paginated timeline/comment reads, so the positive case also

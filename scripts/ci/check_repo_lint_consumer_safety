@@ -8,28 +8,35 @@
 # passing — catching a hub-only check that would red a consumer BEFORE the
 # wave propagates it. Hub-only by nature (it needs the full hub tree to
 # build the consumer shape from), so it uses the standard nested
-# consumer-safety guard itself. Runtime is a few minutes; it runs in the
-# repo_lint job's check_* loop on the hub and SKIPs everywhere else.
+# consumer-safety guard itself. It is the slowest deep-safety step on the
+# hub and SKIPs everywhere else.
+#
+# The guard is marker-FIRST (see check_consumer_residue_safety for the full
+# argument). It used to be the both-absent PAIR (wrapped test absent AND
+# scripts/sync-to-downstream.sh absent), which falls through on any consumer
+# that still carries tests/test_repo_lint_consumer_safety.sh as bootstrap
+# residue: that consumer ran its stale, unselected copy of the whole hub
+# suite on every deep-safety run (~15-20 min per run on fiveacross) — the
+# check_consumer_residue_safety KNOWN_RESIDUE_VIOLATIONS EXIT entry this
+# retires.
+# Marker-first keeps the pair's protection: on the hub the marker is
+# present, so a lost wrapped test still hard-errors below.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_SCRIPT="$REPO_ROOT/tests/test_repo_lint_consumer_safety.sh"
 
+# Marker-FIRST consumer gate (#601 consumer-safety; repo_lint.yml is
+# manifest-canonical, so consumers run this wrapper too). Consulted before
+# ANY test of this check's own hub-only artifacts, so the SKIP decision is a
+# function of what the manifest delivered and nothing else.
+if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+  echo "check_repo_lint_consumer_safety: SKIP (consumer checkout: hub marker scripts/sync-to-downstream.sh absent; hub-only consumer-safety net)"
+  exit 0
+fi
+
 if [ ! -f "$TEST_SCRIPT" ]; then
-  # Consumer-safety guard (#601): repo_lint.yml is manifest-canonical, so
-  # consumers run this wrapper too — but the suite it wraps is hub-only
-  # (never propagated). scripts/sync-to-downstream.sh is the standard hub
-  # marker (intentionally NOT propagated; same disambiguator as
-  # check_sync_manifest). Consulted ONLY inside this missing-test branch:
-  # both absent → consumer checkout → SKIP; marker present → the hub lost
-  # the test (accidental delete/rename) → hard error. Hub marker loss can
-  # never silently disable this check — with the test present the wrapper
-  # runs it regardless of the marker.
-  if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
-    echo "check_repo_lint_consumer_safety: SKIP (consumer checkout: wrapped test + scripts/sync-to-downstream.sh both absent; hub-only consumer-safety net)"
-    exit 0
-  fi
   echo "check_repo_lint_consumer_safety: ERROR (missing $TEST_SCRIPT)" >&2
   exit 1
 fi

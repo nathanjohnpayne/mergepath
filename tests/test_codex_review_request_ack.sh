@@ -82,6 +82,8 @@ make_case() {
   # the poll loop scans for arrives through it.
   cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"
   cp "$ROOT/scripts/lib/codex-request-evidence.sh" "$dir/scripts/lib/codex-request-evidence.sh"
+  mkdir -p "$dir/scripts/workflow"
+  cp "$ROOT/scripts/workflow/resolve-codex-verdict-anchors.py" "$dir/scripts/workflow/resolve-codex-verdict-anchors.py"
   # #1550: classifier for retrying transient poll reads (existence-guarded in
   # the script; without it every failure is permanent, the pre-#1550 shape).
   cp "$ROOT/scripts/lib/gh-retry-helpers.sh" "$dir/scripts/lib/gh-retry-helpers.sh"

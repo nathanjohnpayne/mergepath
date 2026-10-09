@@ -10,8 +10,12 @@
 # Used by check_spec_test_alignment when the default filename search
 # wouldn't find the test.
 spec_test_map:
+  merge_review_disagreement:
+    - tests/test_gh_pr_guard.sh
   bootstrap_git_execution:
     - tests/test_gh_as_author.sh
+  owner_admin_override: tests/test_owner_admin_override.py
+  credential_isolation: tests/test_credential_isolation.py
   cockpit_sync:
     - tests/test_cockpit_sync.py
     - tests/test_cockpit_sync_ui.cjs
@@ -44,7 +48,9 @@ spec_test_map:
     - tests/test_cockpit.sh
   pr_body_contract:
     - tests/test_pr_body_contract_parity.sh
-  codex_request_evidence: tests/test_codex_request_evidence.sh
+  codex_request_evidence:
+    - tests/test_codex_request_evidence.sh
+    - tests/test_codex_verdict_anchor_resolution.py
   codex_review_ledger: tests/test_codex_review_ledger.sh
   codex_usage_limit_marker: tests/test_codex_usage_limit_marker.sh
   coderabbit_phase_25_invocation:
@@ -63,6 +69,7 @@ spec_test_map:
     - tests/test_coderabbit_wait_statuscontext_ratelimit.sh
   review_feedback_accounting:
     - tests/test_review_feedback_accounting.sh
+    - tests/test_marker_provenance.py
   # NOTE - avoid a colon followed by a space anywhere in a comment inside this
   # block. check_spec_test_alignment parses it line by line and treats any
   # line containing one as a key, silently rebinding the current spec and

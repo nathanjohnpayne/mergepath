@@ -40,6 +40,10 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 FAILED=0
+if ! python3 "$REPO_ROOT/tests/test_owner_admin_override.py"; then
+  echo "check_gh_as_author: FAIL (owner admin override)" >&2
+  FAILED=1
+fi
 for rel in "${TESTS[@]}"; do
   full="$REPO_ROOT/$rel"
   if [ ! -f "$full" ]; then

@@ -784,8 +784,9 @@ fi
 # each fixture repo gets its own copy of the wrapper + its lib deps.
 install_wrapper_copy() {
   local dir=$1
-  mkdir -p "$dir/scripts/lib" "$dir/.github"
+  mkdir -p "$dir/scripts/lib" "$dir/scripts/workflow" "$dir/.github"
   cp "$ROOT/scripts/gh-as-author.sh" "$dir/scripts/gh-as-author.sh"
+  cp "$ROOT/scripts/workflow/owner-admin-override.py" "$dir/scripts/workflow/"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
   cp "$ROOT/scripts/lib/gh-command-classifier.sh" "$dir/scripts/lib/gh-command-classifier.sh"
   cp "$ROOT/scripts/lib/pr-body-contract.sh" "$dir/scripts/lib/pr-body-contract.sh"

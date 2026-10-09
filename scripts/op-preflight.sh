@@ -129,7 +129,7 @@
 #   # the command, set process-local GH_TOKEN, and never mutate gh state.
 #   GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> \
 #     scripts/gh-as-reviewer.sh -- gh pr review <PR#> --comment --body "..."
-#   scripts/gh-as-author.sh -- gh pr merge <PR#> --squash --delete-branch
+#   scripts/gh-as-author.sh -- gh pr merge <PR#> --squash --delete-branch --match-head-commit <full-current-head-sha>
 #
 #   # gcloud/firebase use GOOGLE_APPLICATION_CREDENTIALS automatically.
 

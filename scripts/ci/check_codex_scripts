@@ -63,6 +63,7 @@ echo "check_codex_scripts: running codex-review-request Phase 4a entry-decision 
 "$REPO_ROOT/tests/test_codex_review_request_entry.sh"
 
 echo "check_codex_scripts: running codex-review-request verdict-comment clearance tests (#609)"
+python3 "$REPO_ROOT/tests/test_codex_verdict_anchor_resolution.py"
 "$REPO_ROOT/tests/test_codex_review_request_verdict.sh"
 
 echo "check_codex_scripts: running codex-review-request write-token / keyring-fallback tests (#737)"
