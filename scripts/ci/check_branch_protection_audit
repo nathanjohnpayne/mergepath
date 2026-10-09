@@ -51,6 +51,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 AUDIT_SCRIPT="$REPO_ROOT/scripts/audit-branch-protection.sh"
+ISOLATION_SCRIPT="$REPO_ROOT/scripts/audit-credential-isolation.py"
+ISOLATION_TEST="$REPO_ROOT/tests/test_credential_isolation.py"
 WORKFLOW="$REPO_ROOT/.github/workflows/branch-protection-audit.yml"
 TESTS=(
   "$REPO_ROOT/tests/test_audit_branch_protection.sh"
@@ -62,7 +64,7 @@ if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
   exit 0
 fi
 
-for f in "$AUDIT_SCRIPT" "$WORKFLOW" "${TESTS[@]}"; do
+for f in "$AUDIT_SCRIPT" "$ISOLATION_SCRIPT" "$ISOLATION_TEST" "$WORKFLOW" "${TESTS[@]}"; do
   if [ ! -f "$f" ]; then
     echo "check_branch_protection_audit: ERROR missing required file: $f" >&2
     exit 1
@@ -86,5 +88,8 @@ for t in "${TESTS[@]}"; do
   echo "check_branch_protection_audit: running $(basename "$t")"
   bash "$t"
 done
+
+echo "check_branch_protection_audit: running test_credential_isolation.py"
+python3 "$ISOLATION_TEST"
 
 echo "check_branch_protection_audit: PASS"
