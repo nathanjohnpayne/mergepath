@@ -716,6 +716,8 @@ if [ "$APPROVAL_READINESS_ONLY" = "1" ]; then
   GATE_B_SAME_AGENT_REVIEWER=""
 fi
 
+REACTION_THRESHOLD=""
+if [ "$APPROVAL_READINESS_ONLY" != "1" ]; then
 HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.committer.date' 2>&1) \
   || die 3 "failed to fetch commit date for $HEAD_SHA: $HEAD_COMMITTER_DATE"
 
@@ -767,6 +769,8 @@ log "HEAD = $HEAD_SHA    author = $PR_AUTHOR"
 log "committer_date = $HEAD_COMMITTER_DATE"
 log "anchor = $HEAD_PUSHED_AT (source: $ANCHOR_SOURCE)"
 log "reaction_threshold = $REACTION_THRESHOLD (source: $REACTION_THRESHOLD_SOURCE)"
+
+fi
 
 # --- preflight: blocking labels --------------------------------------------
 #

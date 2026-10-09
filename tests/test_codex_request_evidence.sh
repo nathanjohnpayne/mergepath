@@ -36,7 +36,7 @@ shift
 printf '%s\n' "$1" >>"$CALLS"
 case "$1" in
   repos/owner/repo/pulls/99) jq -cn --arg body "$PR_BODY" --arg author "$PR_AUTHOR" '{head:{sha:"abcdef0123456789000000000000000000000000"},user:{login:$author},body:$body,labels:[]}' ;;
-  repos/owner/repo/commits/*) echo '2026-09-14T00:00:00Z' ;;
+  repos/owner/repo/commits/*) [ "${TIMESTAMP_READS_FAIL:-0}" != 1 ] || exit 1; echo '2026-09-14T00:00:00Z' ;;
   repos/owner/repo/issues/99/comments)
     if [ -n "${COMMENTS_FAIL_FROM:-}" ] \
        && [ "$(grep -c '^repos/owner/repo/issues/99/comments$' "$CALLS")" -ge "$COMMENTS_FAIL_FROM" ]; then
@@ -47,7 +47,7 @@ case "$1" in
   repos/owner/repo/issues/comments/123/reactions) [ "$ACK_READ" != error ] || exit 1; cat "$FIXTURES/ack" ;;
   repos/owner/repo/issues/comments/124/reactions) echo '[]' ;;
   repos/owner/repo/issues/99/reactions) printf '%s\n' "$ISSUE_REACTIONS" ;;
-  repos/owner/repo/issues/99/timeline) echo '[]' ;;
+  repos/owner/repo/issues/99/timeline) [ "${TIMESTAMP_READS_FAIL:-0}" != 1 ] || exit 1; echo '[]' ;;
   repos/owner/repo/pulls/99/comments) [ "${INLINE_COMMENTS_FAIL:-0}" != 1 ] || exit 1; echo '[]' ;;
   graphql) echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}' ;;
   *) echo "unexpected $*" >&2; exit 99 ;;
@@ -406,15 +406,20 @@ for mode in disabled readiness; do
   flag=''
   if [ "$mode" = readiness ]; then policy="$DIR/substitute-policy.yml"; flag=--approval-readiness-only; fi
   : >"$DIR/calls"
+  timestamp_reads_fail=0
+  [ "$mode" != readiness ] || timestamp_reads_fail=1
   rc=0
   PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=no-inline \
-    INLINE_COMMENTS_FAIL=1 PR_BODY='Authoring-Agent: claude' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+    TIMESTAMP_READS_FAIL="$timestamp_reads_fail" INLINE_COMMENTS_FAIL=1 PR_BODY='Authoring-Agent: claude' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
     MERGEPATH_REVIEW_POLICY_PATH="$policy" \
     bash "$DIR/scripts/codex-review-check.sh" ${flag:+"$flag"} 99 owner/repo > "$DIR/out" 2>&1 || rc=$?
   if [ "$rc" != 0 ] || grep -q '^repos/owner/repo/pulls/99/comments$' "$DIR/calls"; then
     cat "$DIR/out"; echo "FAIL $mode depends on irrelevant inline reads rc=$rc"; exit 1
   fi
-  PASS=$((PASS + 1)); echo "PASS: $mode skips irrelevant inline reads"
+  if [ "$mode" = readiness ] && grep -Eq '^repos/owner/repo/(commits/|issues/99/timeline$)' "$DIR/calls"; then
+    cat "$DIR/calls"; echo 'FAIL readiness depends on timestamp-only reads'; exit 1
+  fi
+  PASS=$((PASS + 1)); echo "PASS: $mode skips irrelevant API reads"
 done
 
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"
