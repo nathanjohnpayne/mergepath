@@ -59,12 +59,20 @@ case "${1:-} ${2:-}" in
         echo "${STUB_MERGE_STATE:-CLEAN}"
         echo "${STUB_MERGEABLE:-MERGEABLE}"
         echo "${STUB_ROLLUP_NONGREEN:-0}"
+        echo "https://github.com/example/repo/pull/123"
+        echo "${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+        echo "${STUB_PR_AUTHOR:-nathanjohnpayne}"
         if [ -n "${STUB_LABELS:-}" ]; then
           echo "$STUB_LABELS" | tr ';' '\n'
         fi
         exit 0
         ;;
     esac
+    ;;
+  "api --hostname")
+    [ "${STUB_REVIEW_FAILURE:-0}" = 0 ] || exit 1
+    case "$*" in *"--paginate --slurp"*) ;; *) exit 1 ;; esac
+    if [ -n "${STUB_REVIEW_PAGES:-}" ]; then printf '%s\n' "$STUB_REVIEW_PAGES"; else echo '[[]]'; fi
     ;;
   *)
     exit 0
@@ -95,6 +103,9 @@ run_hook() {
   STUB_PR_DELETIONS="$deletions" \
   STUB_PR_HEAD="$pr_head" \
   STUB_PR_AUTHOR="$pr_author" \
+  STUB_REVIEW_PAGES="${STUB_REVIEW_PAGES:-}" \
+  STUB_REVIEW_FAILURE="${STUB_REVIEW_FAILURE:-0}" \
+  STUB_HEAD_SHA="${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
   OP_PREFLIGHT_AGENT="${TEST_OP_PREFLIGHT_AGENT:-}" \
   GH_PR_GUARD_EXPECTED_REVIEWER="$expected_reviewer" \
     bash "$HOOK" <<<"$payload"
@@ -115,6 +126,35 @@ assert_rc_contains() {
     pass "$label"
   fi
 }
+
+# Summary-only change requests have no review thread. Read every review
+# page and keep each reviewer's latest opinion, even on an older head.
+change_review='{"id":1,"user":{"login":"nathanpayne-codex"},"state":"CHANGES_REQUESTED","commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}'
+review_pages="[[$change_review]]"
+merge_overrides='BREAK_GLASS_ADMIN=1 BREAK_GLASS_MERGE_STATE=1 scripts/gh-as-author.sh -- gh pr merge 123 --admin --squash'
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "admin and merge-state overrides do not decide a reviewer disagreement" 2 "nathanpayne-codex" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "ordinary merge blocks an older-head change request" 2 "bbbbbbbb" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash'
+for new_state in APPROVED DISMISSED; do
+  newer_review="${change_review/\"id\":1/\"id\":2}"
+  newer_review="${newer_review/CHANGES_REQUESTED/$new_state}"
+  STUB_REVIEW_PAGES="[[$change_review],[$newer_review]]" assert_rc_contains "later $new_state releases the review disagreement" 0 "" "$merge_overrides" BLOCKED
+done
+comment_review="${change_review/\"id\":1/\"id\":2}"
+comment_review="${comment_review/CHANGES_REQUESTED/COMMENTED}"
+STUB_REVIEW_PAGES="[[$comment_review]]" assert_rc_contains "COMMENTED-only reviewer does not block" 0 "" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="[[$change_review],[$comment_review]]" assert_rc_contains "later COMMENTED does not erase a change request" 2 "CHANGES_REQUESTED" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="[[],[$change_review]]" assert_rc_contains "change request on a later page blocks" 2 "CHANGES_REQUESTED" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "exact PR and head disagreement override releases the separate gate" 0 "owner tiebreak" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "wrong head disagreement override refuses" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "wrong PR disagreement override refuses" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=124@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "abbreviated head disagreement override refuses" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaa $merge_overrides" BLOCKED
+BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "exported exact disagreement override releases the gate" 0 "owner tiebreak" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "override on an earlier command cannot release a disagreement" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa echo ok ; $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "exact disagreement override never releases human-hold" 2 "human-hold" "BREAK_GLASS_REVIEW_DISAGREEMENT=123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides" BLOCKED human-hold
+STUB_REVIEW_FAILURE=1 assert_rc_contains "unreadable reviews refuse despite merge overrides" 2 "complete PR review state" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES='null' assert_rc_contains "malformed reviews refuse despite merge overrides" 2 "complete PR review state" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="[[${change_review/nathanpayne-codex/nathanjohnpayne}]]" assert_rc_contains "PR author's own review does not create a disagreement" 0 "" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="[[${change_review/nathanpayne-codex/coderabbitai[bot]}]]" assert_rc_contains "bot change requests also require an explicit disposition" 2 "CHANGES_REQUESTED" "$merge_overrides" BLOCKED
 
 assert_rc_contains "direct pr create blocked" 2 "token-verifying wrapper" \
   'gh pr create --title "t" --body "Authoring-Agent: claude

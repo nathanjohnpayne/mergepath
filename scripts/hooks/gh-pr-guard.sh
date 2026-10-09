@@ -23,7 +23,12 @@
 #      `human-hold`, with no CODEX_CLEARED / BREAK_GLASS_* bypass.
 #      This is the human-controlled hard freeze: agents may add the
 #      label, but only the human releases it.
-#   5. gh pr merge (non-admin) — blocks when the target PR carries
+#   5. gh pr merge (any flavor) — blocks outstanding non-author
+#      CHANGES_REQUESTED reviews, including on older heads. Only a reviewer
+#      approval, dismissal or owner-authorized
+#      BREAK_GLASS_REVIEW_DISAGREEMENT=<PR>@<full-head-sha> releases it;
+#      admin and merge-state overrides never decide that disagreement.
+#   6. gh pr merge (non-admin) — blocks when the target PR carries
 #      the `needs-external-review` label unless CODEX_CLEARED=1
 #      (agent must have just run scripts/codex-review-check.sh
 #      successfully). This enforces REVIEW_POLICY.md § Phase 4a
@@ -213,10 +218,8 @@
 #     update; misclassifying them as boolean would let the next
 #     token leak through as the subcommand.
 #
-#   - Other env vars in the inline prefix (anything other than
-#     CODEX_CLEARED and BREAK_GLASS_ADMIN) are skipped without
-#     interpretation. This is fine because no other env var is
-#     consulted by hook policy decisions.
+#   - Only the policy variables captured by the token walk below are
+#     interpreted from inline prefixes; unrelated assignments are skipped.
 
 set -euo pipefail
 
@@ -1858,6 +1861,7 @@ fi
 INLINE_CODEX_CLEARED=""
 INLINE_BREAK_GLASS_ADMIN=""
 INLINE_BREAK_GLASS_MERGE_STATE=""
+INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT=""
 INLINE_GH_AS_AUTHOR_IDENTITY=""
 INLINE_GH_AS_REVIEWER_IDENTITY=""
 # Standalone (own-segment) identity assignments persist as shell
@@ -2119,6 +2123,7 @@ for i in "${!TOKENS[@]}"; do
         INLINE_CODEX_CLEARED=""
         INLINE_BREAK_GLASS_ADMIN=""
         INLINE_BREAK_GLASS_MERGE_STATE=""
+        INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT=""
       fi
       # Identity assignments: their consumer is the WRAPPER process
       # environment, not this hook, and what survives a separator
@@ -2186,6 +2191,9 @@ for i in "${!TOKENS[@]}"; do
         ;;
       BREAK_GLASS_ADMIN=*)
         INLINE_BREAK_GLASS_ADMIN="${tok#BREAK_GLASS_ADMIN=}"
+        ;;
+      BREAK_GLASS_REVIEW_DISAGREEMENT=*)
+        INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT="${tok#BREAK_GLASS_REVIEW_DISAGREEMENT=}"
         ;;
       BREAK_GLASS_MERGE_STATE=*)
         INLINE_BREAK_GLASS_MERGE_STATE="${tok#BREAK_GLASS_MERGE_STATE=}"
@@ -2516,6 +2524,7 @@ done
 EFFECTIVE_CODEX_CLEARED="${CODEX_CLEARED:-${INLINE_CODEX_CLEARED:-}}"
 EFFECTIVE_BREAK_GLASS_ADMIN="${BREAK_GLASS_ADMIN:-${INLINE_BREAK_GLASS_ADMIN:-}}"
 EFFECTIVE_BREAK_GLASS_MERGE_STATE="${BREAK_GLASS_MERGE_STATE:-${INLINE_BREAK_GLASS_MERGE_STATE:-}}"
+EFFECTIVE_BREAK_GLASS_REVIEW_DISAGREEMENT="${BREAK_GLASS_REVIEW_DISAGREEMENT:-${INLINE_BREAK_GLASS_REVIEW_DISAGREEMENT:-}}"
 
 # Distinguish `gh pr comment` from `gh issue comment` (both share the
 # subcommand label `comment` but route through different parent
@@ -3301,10 +3310,10 @@ fi
 # timestamped SUCCESS, so an UNSTABLE PR with a check still re-running counted
 # all-green and could merge before CI finished. `if any(.[]; .c=="PENDING")`
 # treats a group with ANY in-progress run as non-green regardless of timestamps.
-GH_JQ='.mergeStateStatus, .mergeable, ([.statusCheckRollup[] | {n:(.name//.context//"?"), c:(.conclusion//.state//"PENDING"), t:(.completedAt//.startedAt//"")}] | group_by(.n) | map(if any(.[]; .c == "PENDING") then "PENDING" else max_by(.t).c end) | map(select(. != "SUCCESS" and . != "SKIPPED" and . != "NEUTRAL")) | length), .labels[].name'
-GH_ARGS=(pr view --json labels,mergeStateStatus,mergeable,statusCheckRollup --jq "$GH_JQ")
+GH_JQ='.mergeStateStatus, .mergeable, ([.statusCheckRollup[] | {n:(.name//.context//"?"), c:(.conclusion//.state//"PENDING"), t:(.completedAt//.startedAt//"")}] | group_by(.n) | map(if any(.[]; .c == "PENDING") then "PENDING" else max_by(.t).c end) | map(select(. != "SUCCESS" and . != "SKIPPED" and . != "NEUTRAL")) | length), .url, .headRefOid, .author.login, .labels[].name'
+GH_ARGS=(pr view --json labels,mergeStateStatus,mergeable,statusCheckRollup,url,headRefOid,author --jq "$GH_JQ")
 if [ -n "$PR_SELECTOR" ]; then
-  GH_ARGS=(pr view "$PR_SELECTOR" --json labels,mergeStateStatus,mergeable,statusCheckRollup --jq "$GH_JQ")
+  GH_ARGS=(pr view "$PR_SELECTOR" --json labels,mergeStateStatus,mergeable,statusCheckRollup,url,headRefOid,author --jq "$GH_JQ")
 fi
 if [ -n "$REPO_ARG" ]; then
   GH_ARGS+=(--repo "$REPO_ARG")
@@ -3343,7 +3352,7 @@ fi
 # CONFLICTING / UNKNOWN — conflict-only, NOT a check-pass signal);
 # line 3 is the count of check names whose LATEST run is non-green
 # (a stale failure superseded by a later passing run does NOT count);
-# lines 4..N are label names (one per line, possibly zero).
+# lines 4..6 identify the PR URL, head SHA and author; lines 7..N are labels.
 # Empty/missing MERGE_STATE (e.g. transient API state) falls into the
 # `*` case below and fails closed. LABELS keeps the newline-delimited
 # remainder for the exact-match gate further down — never re-join it
@@ -3351,7 +3360,10 @@ fi
 MERGE_STATE=$(printf '%s\n' "$GH_OUTPUT" | sed -n '1p')
 MERGEABLE_STATE=$(printf '%s\n' "$GH_OUTPUT" | sed -n '2p')
 ROLLUP_NONGREEN=$(printf '%s\n' "$GH_OUTPUT" | sed -n '3p')
-LABELS=$(printf '%s\n' "$GH_OUTPUT" | sed -n '4,$p')
+PR_URL=$(printf '%s\n' "$GH_OUTPUT" | sed -n '4p')
+PR_HEAD_SHA=$(printf '%s\n' "$GH_OUTPUT" | sed -n '5p')
+PR_AUTHOR_LOGIN=$(printf '%s\n' "$GH_OUTPUT" | sed -n '6p')
+LABELS=$(printf '%s\n' "$GH_OUTPUT" | sed -n '7,$p')
 
 # `human-hold` is a human-controlled hard freeze. Check it before
 # mergeStateStatus, --admin, or needs-external-review handling so no
@@ -3362,6 +3374,45 @@ if printf '%s\n' "$LABELS" | grep -Fxq "human-hold"; then
   echo "  This is a human-remove-only hard hold and supersedes all merge gates." >&2
   echo "  Ask the human to remove the label before merging; no agent bypass is available." >&2
   exit 2
+fi
+
+# Review disagreements are independent of CI and merge-state overrides
+# (#1824). Fetch every page: latestReviews in gh pr view is bounded and can
+# hide a reviewer on a busy PR. COMMENTED/PENDING never supersede an opinion.
+if [[ ! "$PR_URL" =~ ^https://([^/]+)/([^/]+)/([^/]+)/pull/([0-9]+)$ ]] \
+   || [[ ! "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || [ -z "$PR_AUTHOR_LOGIN" ]; then
+  echo "BLOCKED: gh-pr-guard could not read the PR identity/head for reviewer disagreement checks." >&2
+  exit 2
+fi
+# A second regex match above changes BASH_REMATCH; capture URL parts again.
+[[ "$PR_URL" =~ ^https://([^/]+)/([^/]+)/([^/]+)/pull/([0-9]+)$ ]]
+PR_HOST="${BASH_REMATCH[1]}"
+PR_REPO="${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
+PR_NUMBER="${BASH_REMATCH[4]}"
+if ! REVIEW_PAGES=$(gh api --hostname "$PR_HOST" --paginate --slurp "repos/$PR_REPO/pulls/$PR_NUMBER/reviews" 2>"$GH_STDERR") \
+   || ! printf '%s' "$REVIEW_PAGES" | jq -e '
+      type == "array" and all(.[]; type == "array" and all(.[];
+        type == "object" and (.id | type == "number") and
+        (.user.login | type == "string" and length > 0) and
+        (.commit_id | type == "string" and test("^[0-9a-f]{40}$")) and
+        (.state | IN("APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"))))' >/dev/null; then
+  echo "BLOCKED: gh-pr-guard could not read complete PR review state; restore gh/auth connectivity and retry." >&2
+  exit 2
+fi
+REVIEW_BLOCKERS=$(printf '%s' "$REVIEW_PAGES" | jq -c --arg author "$PR_AUTHOR_LOGIN" '
+  [.[][] | select(.state != "COMMENTED" and .state != "PENDING")]
+  | group_by(.user.login) | map(max_by(.id))
+  | map(select(.state == "CHANGES_REQUESTED" and .user.login != $author))')
+if [ "$(printf '%s' "$REVIEW_BLOCKERS" | jq length)" -gt 0 ]; then
+  if [ "$EFFECTIVE_BREAK_GLASS_REVIEW_DISAGREEMENT" = "$PR_NUMBER@$PR_HEAD_SHA" ]; then
+    echo "BREAK-GLASS: owner tiebreak authorized for reviewer disagreement on $PR_NUMBER@$PR_HEAD_SHA." >&2
+  else
+    echo "BLOCKED: outstanding reviewer CHANGES_REQUESTED; REVIEW_POLICY.md reserves the tiebreak for the owner." >&2
+    printf '%s' "$REVIEW_BLOCKERS" | jq -r '.[] | "  Reviewer: \(.user.login); reviewed commit: \(.commit_id)"' >&2
+    echo "  Reviewer approval or dismissal releases this gate. Admin/merge-state overrides do not." >&2
+    echo "  Owner-only override: BREAK_GLASS_REVIEW_DISAGREEMENT=$PR_NUMBER@$PR_HEAD_SHA" >&2
+    exit 2
+  fi
 fi
 
 # mergeStateStatus check (#171 layer 2). API enum (full set per
