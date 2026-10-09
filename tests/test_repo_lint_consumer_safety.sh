@@ -753,6 +753,51 @@ if [ "$GUARDED" -gt 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# check_repo_lint_consumer_safety's own marker-first gate. The block above
+# exercises the run: tail with the wrapper STUBBED; this runs the real
+# wrapper against its three states, with a sentinel standing in for this
+# suite so the wrapper cannot recurse into it.
+# ---------------------------------------------------------------------------
+self_tree() {  # $1 = dir, $2 = "marker" or "", $3 = "test" or ""
+  rm -rf "$1"
+  mkdir -p "$1/scripts/ci" "$1/tests"
+  cp "$ROOT/scripts/ci/check_repo_lint_consumer_safety" "$1/scripts/ci/"
+  [ -n "$2" ] && touch "$1/scripts/sync-to-downstream.sh"
+  if [ -n "$3" ]; then
+    printf '#!/bin/sh\necho INNER-SUITE-RAN\nexit 42\n' >"$1/tests/test_repo_lint_consumer_safety.sh"
+  fi
+  return 0
+}
+self_run() {  # $1 = tree; prints output, returns the wrapper's exit code
+  bash "$1/scripts/ci/check_repo_lint_consumer_safety" </dev/null 2>&1
+}
+
+self_tree "$GUARD_DIR/self-residue" "" "test"
+set +e; out=$(self_run "$GUARD_DIR/self-residue"); rc=$?; set -e
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'check_repo_lint_consumer_safety: SKIP (consumer checkout' \
+   && ! printf '%s' "$out" | grep -q INNER-SUITE-RAN; then
+  pass "marker-first: a consumer carrying the wrapped test as bootstrap residue SKIPs without running it"
+else
+  fail "marker-first: consumer with residue must SKIP without running the wrapped test (rc=$rc): $out"
+fi
+
+self_tree "$GUARD_DIR/self-hubmissing" "marker" ""
+set +e; out=$(self_run "$GUARD_DIR/self-hubmissing"); rc=$?; set -e
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'ERROR (missing'; then
+  pass "marker-first: the hub (marker present) hard-errors when the wrapped test is missing"
+else
+  fail "marker-first: hub with the wrapped test missing must hard-error (rc=$rc): $out"
+fi
+
+self_tree "$GUARD_DIR/self-hubpresent" "marker" "test"
+set +e; out=$(self_run "$GUARD_DIR/self-hubpresent"); rc=$?; set -e
+if [ "$rc" -eq 42 ] && printf '%s' "$out" | grep -q INNER-SUITE-RAN; then
+  pass "marker-first: the hub runs the wrapped test and propagates its exit code"
+else
+  fail "marker-first: hub with the wrapped test present must run it and propagate rc 42 (rc=$rc): $out"
+fi
+
+# ---------------------------------------------------------------------------
 # #979 round 2 — the SETUP steps ahead of the guarded checks.
 #
 # The block above proves each check wire survives a kit-less consumer. That is
