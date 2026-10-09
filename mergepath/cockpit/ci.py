@@ -26,6 +26,10 @@ OBSERVATION_GAP = TIMEOUT + IDLE_INTERVAL + TIMEOUT + 30
 # Diagnostics of a failed run off every open HEAD are read for the last hour, the window
 # the Actions budget derives installation exhaustion from.
 DIAGNOSTIC_SECONDS = 3600
+# A run GitHub created during an Actions incident can sit `queued` with zero jobs forever:
+# no runner is assigned, and cancel and force-cancel both refuse it. Past this age a queued
+# run without jobs is orphaned, not waiting; it is history, not something to watch.
+ORPHAN_SECONDS = 6 * 3600
 SHA = re.compile(r'[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?\Z')
 DECIMAL = re.compile(r'[1-9][0-9]{0,79}\Z')
 ANSI = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*?(?:\x07|\x1b\\|$))')
@@ -190,7 +194,13 @@ def _check_evidence(checks, current):
             'superseded': bool(failed) and all(check['superseded_by'] is not None for check in failed)}
 
 
-def group_runs(repo, raw_runs, jobs, checks, heads):
+def orphaned(raw, fetched, now):
+    created = stamp(_row(raw).get('created_at'))
+    return (_row(raw).get('status') == 'queued' and fetched == [] and now is not None
+            and created is not None and now - created >= ORPHAN_SECONDS)
+
+
+def group_runs(repo, raw_runs, jobs, checks, heads, now=None):
     groups, rows, ids = {}, [], set()
     for raw in raw_runs:
         raw = _row(raw)
@@ -208,6 +218,7 @@ def group_runs(repo, raw_runs, jobs, checks, heads):
         related = [check for check in checks if check['sha'] == sha and check['id'] in {job['check_id'] for job in fetched}] if fetched is not None else []
         # Every failed job must be tied to an observed check-run; one proven sibling never vouches for another.
         observed = {check['id'] for check in related}
+        ghost = orphaned(raw, fetched, now)
         unproven = raw.get('conclusion') in FAILURES and (fetched is None or any(
             job.get('conclusion') in FAILURES and (job.get('check_id') is None or job['check_id'] not in observed) for job in fetched))
         # A failed job's check-run can be absent (a SHA whose check-runs are not read, or the
@@ -227,7 +238,10 @@ def group_runs(repo, raw_runs, jobs, checks, heads):
                    'updated_at': stamp(raw.get('updated_at')), 'current_head': current,
                    'jobs': copy.deepcopy(fetched or []), 'checks': owned, **evidence,
                    'check_evidence_unknown': raw.get('conclusion') in FAILURES and (unproven or not any(c['conclusion'] in FAILURES for c in owned)),
-                   'rerun_command': f'gh run rerun {run_id} --failed --repo {repo}' if raw.get('conclusion') in FAILURES else None}
+                   'rerun_command': f'gh run rerun {run_id} --failed --repo {repo}' if raw.get('conclusion') in FAILURES else None,
+                   'orphaned': ghost}
+            if ghost:
+                row['reason'] = 'Queued with no jobs for over 6h: GitHub never started this run, and it will not run.'
             rows.append(row)
             key = (number, sha)
             groups.setdefault(key, {'repo': repo, 'pr': number, 'sha': sha, 'run_keys': []})['run_keys'].append(row['key'])
@@ -284,6 +298,8 @@ class CIProvider:
             raise ValueError('invalid_jobs_cache')
         self.jobs_cache = jobs_cache
         self._records, self._failures, self._jobs_cache, self._suite_cache = {}, {}, OrderedDict(), OrderedDict()
+        # Orphaned runs keyed by their update time: an unchanged orphan is not re-read every scan.
+        self._orphans = OrderedDict()
 
     def _repo(self, repo, deadline):
         base = '/repos/' + repo
@@ -313,8 +329,12 @@ class CIProvider:
             run_id = identity(raw.get('id'))
             record_lineage(workflows, raw)
             job_key = (repo, run_id, identity(raw.get('run_attempt', 1)))
+            orphan_key = job_key + (raw.get('updated_at'),)
             if run_id not in detailed:
                 jobs[run_id] = None
+            elif raw.get('status') == 'queued' and orphan_key in self._orphans:
+                jobs[run_id] = []
+                self._orphans.move_to_end(orphan_key)
             elif raw.get('status') == 'completed' and job_key in self._jobs_cache:
                 jobs[run_id] = copy.deepcopy(self._jobs_cache[job_key])
                 self._jobs_cache.move_to_end(job_key)
@@ -327,6 +347,10 @@ class CIProvider:
                     self._jobs_cache.move_to_end(job_key)
                     while len(self._jobs_cache) > self.jobs_cache:
                         self._jobs_cache.popitem(last=False)
+                elif orphaned(raw, jobs[run_id], self.clock()):
+                    self._orphans[orphan_key] = True
+                    while len(self._orphans) > self.jobs_cache:
+                        self._orphans.popitem(last=False)
         # Every check-run of an open-PR HEAD is read. The latest filter keeps one run per name
         # by completion time, which cannot prove that a success started after the failure it
         # hides. Scheduled sweeps attach check-runs to default-branch SHAs for days (2,052
@@ -370,7 +394,7 @@ class CIProvider:
         # A list that grows while its pages are walked repeats a row at a page edge;
         # the first observation of an id stands.
         checks = supersede(list({check['id']: check for check in reversed(checks)}.values())[::-1])
-        rows, groups = group_runs(repo, runs, jobs, checks, heads)
+        rows, groups = group_runs(repo, runs, jobs, checks, heads, self.clock())
         return rows, groups, _group_check_rows(repo, checks, heads, rows, groups)
 
     def __call__(self, deadline):
@@ -418,7 +442,7 @@ class CIProvider:
         data = {'schema': 'ci/v1', 'runs': rows, 'groups': groups, 'repositories': observations, 'recent_seconds': self.recent_seconds, 'check_rows': check_rows}
         # Hot means a live run on an open-PR HEAD, the thing an operator is waiting
         # on. Scheduled sweeps and failing repositories keep the idle cadence.
-        hot = any(row['status'] in LIVE and row.get('current_head') is True for row in rows + check_rows)
+        hot = any(row['status'] in LIVE and row.get('current_head') is True and not row.get('orphaned') for row in rows + check_rows)
         return Sample(copy_json_tree(data), hot=hot)
 
 

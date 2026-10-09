@@ -11,6 +11,8 @@
   const failures = ["failure", "timed_out", "action_required", "startup_failure"];
   const live = ["queued", "in_progress", "waiting", "pending", "requested"];
   const status = value => [...live, "completed", "unknown"].includes(value);
+  // An orphaned run sits queued with no jobs and never starts; it is not a live run.
+  const active = row => live.includes(row.status) && row.orphaned !== true;
   const conclusion = value => value === null || [...failures, "success", "neutral", "cancelled", "skipped", "stale"].includes(value);
   const codePointLength = value => Array.from(value).length;
   function requireValid(value) {if (!value) throw new Error("invalid_ci_observation");}
@@ -40,7 +42,9 @@
           && row.status === "unknown" && row.conclusion === null && row.check_evidence_unknown && !row.actionable
           && !row.superseded && row.severity === null && row.diagnostics.length === 0))
         && (checksOnly ? row.rerun_command === null : row.rerun_command === null || row.rerun_command === `gh run rerun ${row.id} --failed --repo ${row.repo}`)
-        && (!row.actionable || row.current_head === true && row.severity !== null));
+        && (!row.actionable || row.current_head === true && row.severity !== null)
+        && (row.orphaned === undefined || row.orphaned === false || row.orphaned === true && !checksOnly && row.status === "queued"
+          && row.jobs_scope === "all-attempts" && row.jobs.length === 0 && !row.actionable));
       keys.add(row.key);
       const jobIds = new Set();
       for (const job of row.jobs) {
@@ -72,6 +76,7 @@
     if (row.kind === "checks" && row.checks.length === 0) return {state: "idle", label: "No check observations"};
     if (row.actionable) return {state: row.severity, label: row.severity === "boulder" ? row.reason === "Observed installation rate-limit failure" ? "Token exhausted" : "Not retryable" : "Stale failure"};
     if (row.superseded && !(row.kind === "checks" && live.includes(row.status))) return {state: "idle", label: "Failed · superseded"};
+    if (row.orphaned === true) return {state: "idle", label: "Orphaned"};
     if (live.includes(row.status)) return {state: "running", label: row.status === "in_progress" ? "Running" : "Queued"};
     if (failures.includes(row.conclusion)) return {state: "idle", label: row.current_head === false ? "Failed · old HEAD" : row.current_head === null ? "Failed · HEAD unknown" : "Failed"};
     if (row.kind === "checks" && row.current_head !== true) return {state: "idle", label: row.current_head === false ? "Checks · old HEAD" : "Checks · HEAD unknown"};
@@ -92,11 +97,11 @@
         detail: row.kind === "checks" ? `Check runs · ${row.sha}. No Actions rerun for these checks.` : `Run ${row.id} · ${row.sha}. ${row.rerun_command ?? "Rerun command unavailable"}`,
         timing: {kind: "now"}, observed_at: observation.observed_at, stale: envelope.stale === true || observation.stale};
     });
-    const running = rows.filter(row => live.includes(row.status)).length, attention = rows.filter(row => row.actionable).length;
+    const running = rows.filter(active).length, attention = rows.filter(row => row.actionable).length;
     const unknown = rows.some(row => row.check_evidence_unknown || failures.includes(row.conclusion) && row.current_head === null || row.kind === "checks" && row.current_head === null)
       || repositories.some(item => item.observed_at === null);
     const terminalPass = ["success", "neutral", "skipped"];
-    const uncleared = rows.some(row => row.current_head === true && !live.includes(row.status)
+    const uncleared = rows.some(row => row.current_head === true && !active(row)
       && (row.checks.some(check => check.conclusion === "cancelled") || !row.superseded && (row.kind === "checks"
         ? !row.checks.length || row.checks.some(check => check.status !== "completed" || !terminalPass.includes(check.conclusion))
         : row.status !== "completed" || !terminalPass.includes(row.conclusion))));
@@ -161,7 +166,7 @@
         let pip = this.pips.children[index]; if (!pip) {pip = element("span", "ci-pip"); this.pips.append(pip);}
         pip.className = `ci-pip ci-pip-${stepTone(job)}`; pip.setAttribute("aria-label", `${job.name}: ${job.conclusion ?? job.status}`);
       });
-      this.flag.hidden = !row.actionable && !row.check_evidence_unknown && !row.superseded && !row.diagnostics.length;
+      this.flag.hidden = !row.actionable && !row.check_evidence_unknown && !row.superseded && !row.diagnostics.length && row.orphaned !== true;
       this.reason.textContent = row.reason ?? (row.superseded ? "Failed history superseded by a later run of the same checks." : row.check_evidence_unknown ? "Failed run; current-check evidence unavailable." : "Check-run diagnostics observed · expand the run to read them.");
       this.command.hidden = row.rerun_command === null; this.command.textContent = row.rerun_command ?? "";
       const wanted = new Set(row.jobs.map(job => job.id));
@@ -234,9 +239,10 @@
       finally {if (this.requests.get(key) === request) {this.requests.delete(key); view.button.setAttribute("aria-busy", "false");}}
     }
   }
-  // Runs the operator is waiting on stay in the main list; every other completed run is history.
+  // Runs the operator is waiting on stay in the main list; every other completed run, and every
+  // orphaned run off the open heads, is history.
   function attention(row) {
-    return live.includes(row.status) || row.actionable === true || row.current_head === true || failures.includes(row.conclusion) || row.kind === "checks";
+    return active(row) || row.actionable === true || row.current_head === true || failures.includes(row.conclusion) || row.kind === "checks";
   }
   class CIView {
     constructor(parent, fetcher = (...args) => fetch(...args)) {
@@ -258,11 +264,15 @@
     }
     discloseHistory() {
       const count = this.historyList.children.length;
+      const orphans = [...this.rows.values()].filter(view => view.root.parentNode === this.historyList && view.row.orphaned === true).length;
+      const plural = n => n === 1 ? "run" : "runs";
+      const parts = [count - orphans ? `${count - orphans} completed ${plural(count - orphans)} off open heads` : null,
+        orphans ? `${orphans} orphaned queued ${plural(orphans)}` : null].filter(Boolean);
       // Hiding an emptied history must not strand focus on its toggle: move it to the summary first.
       if (count === 0 && this.history.contains(document.activeElement)) {this.summary.tabIndex = -1; this.summary.focus();}
       this.history.hidden = count === 0; this.historyList.hidden = !this.historyOpen;
       this.historyToggle.setAttribute("aria-expanded", String(this.historyOpen));
-      this.historyToggle.textContent = `${count} completed ${count === 1 ? "run" : "runs"} off open heads · ${this.historyOpen ? "hide" : "show"}`;
+      this.historyToggle.textContent = `${parts.join(" · ")} · ${this.historyOpen ? "hide" : "show"}`;
     }
     toggle(key) {this.open = this.open === key ? null : key; for (const [id, view] of this.rows) view.disclose(id === this.open);}
     update(model) {

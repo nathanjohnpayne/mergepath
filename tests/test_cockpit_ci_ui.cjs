@@ -380,3 +380,39 @@ test("a focused run that moves into collapsed history reveals it and keeps keybo
   view.summary.focus(); done.current_head = false; view.update(CI.project(envelope(data), null, 1004));
   assert.equal(view.historyOpen, false); assert.equal(view.historyList.hidden, true); assert.equal(document.activeElement, view.summary);
 });
+
+test("an orphaned queued run off open heads is history, not a running run, and says why", () => {
+  const data = pythonFixture("orphan:False"), row = data.runs[0];
+  assert.equal(row.orphaned, true); assert.equal(row.status, "queued");
+  const model = CI.project(envelope(data), null, 1791300000);
+  assert.match(model.label, /^0 running/); assert.equal(model.state, "idle"); assert.equal(model.hazards.length, 0);
+  assert.deepEqual(CI.runTone(row), {state: "idle", label: "Orphaned"}); assert.equal(CI.attention(row), false);
+  const parent = dom(), view = new CI.CIView(parent, () => assert.fail("unexpected fetch"));
+  view.update(model);
+  const run = view.rows.get(row.key);
+  assert.equal(run.root.parentNode, view.historyList);
+  assert.equal(view.historyToggle.textContent, "1 orphaned queued run · show");
+  assert.equal(run.flag.hidden, false); assert.match(run.reason.textContent, /never started/);
+  assert.equal(run.duration.textContent, "queued 7h 0m");
+  // Beside completed history both counts are named.
+  const done = {...structuredClone(row), id: "11", key: `${row.repo}:11:none`, status: "completed", conclusion: "success", orphaned: false, reason: null};
+  data.runs.push(done); view.update(CI.project(envelope(data), null, 1791300000));
+  assert.equal(view.historyToggle.textContent, "1 completed run off open heads · 1 orphaned queued run · show");
+});
+
+test("an orphaned run on an open HEAD stays visible and never establishes current CI success", () => {
+  const data = pythonFixture("orphan:True"), row = data.runs[0];
+  assert.equal(row.orphaned, true); assert.equal(row.current_head, true);
+  const model = CI.project(envelope(data), null, 1791300000);
+  assert.equal(CI.attention(row), true); assert.match(model.label, /^0 running/);
+  assert.match(model.label, /current CI success not established/);
+});
+
+test("orphaned is accepted only on a queued workflow run with no jobs", () => {
+  const ok = pythonFixture("orphan:False"); assert.doesNotThrow(() => CI.validate(ok));
+  for (const mutate of [row => {row.status = "in_progress";}, row => {row.orphaned = "yes";},
+    row => {row.jobs_scope = "not-fetched";}, row => {row.jobs = [{id: "1", name: "x", status: "queued", conclusion: null, started_at: null, completed_at: null, steps: [], check_id: null, attempt: "1"}];}]) {
+    const data = pythonFixture("orphan:False"); mutate(data.runs[0]);
+    assert.throws(() => CI.validate(data));
+  }
+});

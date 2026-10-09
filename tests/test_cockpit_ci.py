@@ -138,8 +138,35 @@ def coverage_fixture(kind):
     return {'data': sample.data, 'calls': calls, 'hot': sample.hot}
 
 
+ORPHAN_NOW = 1791300000.0  # 2026-10-06T15:20:00Z
+
+
+def orphan_run(run_id=30, created='2026-10-06T08:20:00Z', sha=OTHER_SHA, updated=None):
+    run = raw_run(run_id, None, sha)
+    run.update(status='queued', conclusion=None, pull_requests=[], created_at=created, run_started_at=created,
+               updated_at=updated or created)
+    return run
+
+
+def orphan_fixture(on_head=False, runs=None, jobs=None):
+    runs = runs if runs is not None else [orphan_run(sha=SHA if on_head else OTHER_SHA)]
+    calls = []
+    class Client:
+        def pages(self, route, **kwargs):
+            calls.append(route)
+            if '/pulls?' in route: return [{'number': 7, 'head': {'sha': SHA}}]
+            if '/actions/runs?' in route: return runs
+            if '/jobs?' in route: return (jobs or {}).get(route.split('/runs/')[1].split('/')[0], [])
+            if '/check-runs?' in route: return []
+            raise AssertionError('unexpected route: ' + route)
+    provider = CIProvider(Client(), INVENTORY, clock=lambda: ORPHAN_NOW, monotonic=lambda: 0)
+    sample = provider(5)
+    return {'data': copy_json_tree(sample.data), 'hot': sample.hot, 'calls': calls, 'provider': provider}
+
+
 def browser_fixtures():
     fixtures = {'model': model(), 'unicode': unicode_model_and_excerpt(),
+                'orphan:False': orphan_fixture(False)['data'], 'orphan:True': orphan_fixture(True)['data'],
                 'workflow-no-pr': unmatched_checks_fixture(checks=[raw_check()], run_prs=[]),
                 'no-head': unmatched_checks_fixture(head=None)}
     for with_actions in (True, False):
@@ -518,6 +545,36 @@ class ProviderTests(unittest.TestCase):
         self.assertTrue(provider(5).hot)
         with self.assertRaises(ValueError):
             CIProvider(Client(), INVENTORY, jobs_cache=0)
+
+    def test_queued_run_without_jobs_past_the_orphan_age_is_orphaned_history_not_live(self):
+        fresh = orphan_run(31, '2026-10-06T14:20:00Z')
+        staffed = orphan_run(32)
+        result = orphan_fixture(runs=[orphan_run(), fresh, staffed], jobs={'32': [{**raw_job(320), 'status': 'queued', 'conclusion': None}]})
+        rows = {row['id']: row for row in result['data']['runs']}
+        self.assertEqual({rid: row['orphaned'] for rid, row in rows.items()}, {'30': True, '31': False, '32': False},
+                         'only an old queued run with zero jobs is orphaned; a young one or one with a job is waiting')
+        self.assertIn('never started', rows['30']['reason'])
+        self.assertIsNone(rows['31']['reason'])
+        self.assertEqual(rows['30']['status'], 'queued', 'the observed status is reported unchanged')
+        for status in ('in_progress', 'waiting', 'pending', 'requested'):
+            with self.subTest(status=status):
+                other = orphan_run(); other['status'] = status
+                self.assertFalse(orphan_fixture(runs=[other])['data']['runs'][0]['orphaned'])
+
+    def test_orphan_on_an_open_head_does_not_hold_the_hot_cadence(self):
+        self.assertFalse(orphan_fixture(True)['hot'])
+        live = orphan_run(created='2026-10-06T15:00:00Z', sha=SHA)
+        self.assertTrue(orphan_fixture(runs=[live])['hot'], 'a young queued run on an open HEAD is still waited on')
+
+    def test_unchanged_orphan_is_not_reread_until_github_updates_it(self):
+        run = orphan_run(); result = orphan_fixture(runs=[run]); provider, calls = result['provider'], result['calls']
+        jobs = lambda: sum('/jobs?' in route for route in calls)
+        self.assertEqual(jobs(), 1)
+        self.assertTrue(provider(5).data['runs'][0]['orphaned']); self.assertEqual(jobs(), 1)
+        run['updated_at'] = '2026-10-06T15:00:00Z'
+        provider(5); self.assertEqual(jobs(), 2, 'a changed run is read again')
+        run['status'] = 'in_progress'
+        self.assertFalse(provider(5).data['runs'][0]['orphaned']); self.assertEqual(jobs(), 3)
 
     def test_unmatched_live_and_unknown_checks_do_not_invent_completed_success(self):
         for status, conclusion, hot, unknown in [('queued', None, True, False), ('in_progress', None, True, False),
