@@ -20,7 +20,9 @@
 
 set -euo pipefail
 
-ROOT="$(cd "${BASH_SOURCE[0]%/*}/.." && pwd -P)"
+SOURCE_DIR="${BASH_SOURCE[0]%/*}"
+[ "$SOURCE_DIR" != "${BASH_SOURCE[0]}" ] || SOURCE_DIR=.
+ROOT="$(cd "$SOURCE_DIR/.." && pwd -P)"
 # shellcheck source=lib/gh-token-resolver.sh
 . "$ROOT/scripts/lib/gh-token-resolver.sh"
 gh_wrapper_validate_path || exit 5

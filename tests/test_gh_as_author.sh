@@ -1393,6 +1393,19 @@ set -e
 [ "$rc" -eq 1 ] && pass "trace marker with a git payload: refused (the marker means the gh write ran)" \
   || fail "trace marker with git payload: rc=$rc"
 
+reset_log
+set +e
+(cd "$ROOT/scripts" && PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" \
+  GH_AS_AUTHOR_IDENTITY="nathanjohnpayne" OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" \
+  bash gh-as-author.sh -- gh pr comment 123 --body x) >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q $'gh\tpr\tcomment' "$WORKDIR/calls.log"; then
+  pass "basename-only invocation from scripts directory preserves wrapper attribution"
+else
+  fail "basename-only invocation: rc=$rc"
+fi
+
 echo ""
 echo "test_gh_as_author: $PASS passed, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then
