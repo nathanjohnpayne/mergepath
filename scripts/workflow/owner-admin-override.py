@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from pathlib import Path
 
 MARKER = '<!-- mergepath-owner-admin-override:v1 -->'
@@ -47,6 +48,68 @@ def validate(record, url, head, now):
     return record
 
 
+def reject_merge_api(args):
+    """Keep owner-token API transports from bypassing the scoped merge path."""
+    args = list(args)
+    endpoint, method, queries = None, None, []
+    fields, opaque = False, False
+    value_flags = {'-X', '--method', '-f', '--raw-field', '-F', '--field',
+                   '-H', '--header', '--input', '--hostname', '-q', '--jq',
+                   '-t', '--template', '--cache'}
+    while args:
+        token = args.pop(0)
+        flag, value = token, None
+        if token in ('--help', '-h'):
+            return
+        if token in value_flags:
+            if not args:
+                raise ValueError('API option needs a value')
+            value = args.pop(0)
+        elif token.startswith('--') and '=' in token:
+            flag, value = token.split('=', 1)
+        elif len(token) > 2 and token[:2] in ('-X', '-f', '-F', '-H', '-q', '-t'):
+            flag, value = token[:2], token[2:]
+        if flag in ('-X', '--method'):
+            method = value.upper()
+        elif flag in ('-f', '--raw-field', '-F', '--field'):
+            fields = True
+            key, _, content = value.partition('=')
+            if key == 'query':
+                if flag in ('-F', '--field') and content.startswith('@'):
+                    opaque = True
+                else:
+                    queries.append(content)
+            elif key.startswith('query[') or key == 'extensions':
+                opaque = True
+        elif flag == '--input':
+            opaque = True
+            fields = True
+        elif not token.startswith('-'):
+            if endpoint is not None:
+                raise ValueError('ambiguous API endpoint')
+            endpoint = token
+    if endpoint is None:
+        return
+    # Decode URI spelling before classifying the actual GitHub route. This
+    # includes full API URLs and CLI owner/repo placeholder forms.
+    for _ in range(3):
+        decoded = urllib.parse.unquote(endpoint)
+        if decoded == endpoint:
+            break
+        endpoint = decoded
+    path = urllib.parse.urlsplit(endpoint).path.rstrip('/')
+    method = method or ('POST' if fields else 'GET')
+    if re.search(r'(?:^|/)pulls/[^/]+/merge$', path) and method not in ('GET', 'HEAD'):
+        raise ValueError('merge API mutations are forbidden; use the head-pinned gh pr merge path')
+    if path.rsplit('/', 1)[-1] == 'graphql':
+        # Files/stdin can change after validation or hide a persisted query.
+        # A literal immutable query is the only inspectable wrapper payload.
+        if opaque or len(queries) != 1:
+            raise ValueError('author GraphQL API calls require one literal query; opaque merge payloads are forbidden')
+        if re.search(r'\bmergePullRequest\b', queries[0]):
+            raise ValueError('merge API mutations are forbidden; use the head-pinned gh pr merge path')
+
+
 def merge_args(argv):
     """Inspect actual argv; option values never become flags or selectors."""
     args = argv[1:]
@@ -60,6 +123,8 @@ def merge_args(argv):
         elif flag.startswith('-R') and len(flag) > 2:
             repo = flag[2:].lstrip('=')
         else:
+            if flag == 'api':
+                reject_merge_api(args)
             if flag not in BUILTIN_COMMANDS and flag not in ('--help', '--version'):
                 raise ValueError('author wrapper requires a literal built-in gh command; aliases and extensions cannot authorize an admin merge')
             return None

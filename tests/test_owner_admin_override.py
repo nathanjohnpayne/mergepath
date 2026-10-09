@@ -210,6 +210,38 @@ print(json.dumps(result))
         for command in ('api', 'issue', 'run', 'repo', 'alias', 'discussion'):
             self.assertIsNone(override.merge_args(['gh', command, '--help']))
 
+    def test_raw_merge_api_writes_cannot_bypass_scoped_preparation(self):
+        requests = [
+            ['repos/example/repo/pulls/123/merge', '-X', 'PUT'],
+            ['-XPUT', 'repos/example/repo/pulls/123/merge'],
+            ['https://api.github.com/repos/example/repo/pulls/123/merge', '--method=PUT'],
+            ['repos/example/repo/%70ulls/123/merge', '-f', 'merge_method=squash'],
+            ['repos/{owner}/{repo}/pulls/{number}/merge', '--input', '-'],
+            ['graphql', '-f', 'query=mutation { mergePullRequest(input:{pullRequestId:"PR_x"}) {clientMutationId}}'],
+            ['graphql', '--raw-field=query=mutation { m:mergePullRequest(input:{}) {clientMutationId}}'],
+            ['graphql', '-Fquery=@payload.graphql'],
+            ['graphql', '--input', 'payload.json'],
+            ['graphql', '--input=-'],
+            ['graphql', '-f', 'query=query { viewer {login}}', '-f', 'query=mutation {mergePullRequest(input:{}){clientMutationId}}'],
+        ]
+        for request in requests:
+            with self.subTest(request=request), self.assertRaisesRegex(ValueError, 'merge|literal query'):
+                override.prepare(['gh', 'api', *request])
+        self.assertFalse((self.path / 'calls').exists())
+
+    def test_non_merge_api_reads_and_inspectable_mutations_are_unchanged(self):
+        requests = [
+            ['repos/example/repo/pulls/123/merge'],
+            ['repos/example/repo/issues/123/comments', '-f', 'body=hello'],
+            ['graphql', '-f', 'query=query {viewer {login}}'],
+            ['graphql', '-f', 'query=mutation {addComment(input:{subjectId:"I_x",body:"hello"}) {clientMutationId}}'],
+            ['graphql', '--help'],
+        ]
+        for request in requests:
+            with self.subTest(request=request):
+                override.prepare(['gh', 'api', *request])
+        self.assertFalse((self.path / 'calls').exists())
+
     def test_inherited_repository_options_before_merge_are_recognized(self):
         for flags in (['--repo', 'example/repo'], ['--repo=example/repo'], ['-R', 'example/repo'], ['-Rexample/repo']):
             self.assertEqual(override.merge_args(['gh', 'pr', *flags, 'merge', '123', '--admin']),
