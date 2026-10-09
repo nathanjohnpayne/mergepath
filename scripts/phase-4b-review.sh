@@ -1514,12 +1514,12 @@ if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
     live_head_pre="$(gh_api_scalar --shape sha "live PR head for $REPO#$PR" \
       "repos/$REPO/pulls/$PR" --jq '.head.sha')" || live_head_pre=""
     [ -n "$live_head_pre" ] \
-      || fall_back_to_manual "could not re-read the live PR head before filing post-review issues"
+      || p4b_die 3 "could not re-read the live PR head before filing post-review issues"
     if [ "$live_head_pre" != "$HEAD" ]; then
-      fall_back_to_manual "PR head changed during review (reviewed $HEAD, live $live_head_pre) — refusing to file post-review issues for an approval that will not post"
+      p4b_die 3 "PR head changed during review (reviewed $HEAD, live $live_head_pre) — refusing to file post-review issues for an approval that will not post"
     fi
     if ! revalidate_expected_base pre-issue-filing; then
-      fall_back_to_manual "$P4B_BASE_FENCE_REASON — refusing to file post-review issues for an approval that will not post"
+      p4b_die 3 "$P4B_BASE_FENCE_REASON — refusing to file post-review issues for an approval that will not post"
     fi
     # Identity drift (#1143), hoisted ahead of the side effects for the same
     # reason the head re-read above is: filing issues under the author PAT,
@@ -1572,7 +1572,7 @@ if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
     if [ -z "$live_head_post" ] || [ "$live_head_post" != "$HEAD" ]; then
       p4b_warn "PR head drifted during issue filing (reviewed $HEAD, live ${live_head_post:-unreadable}) — closing this run's filed issues as superseded"
       p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: the PR head of ${REPO}#${PR} changed before the Phase 4b approval could post; a re-run on the new head files fresh follow-ups."
-      fall_back_to_manual "PR head changed while filing post-review issues (reviewed $HEAD, live ${live_head_post:-unreadable}); the filed issues were closed as superseded"
+      p4b_die 3 "PR head changed while filing post-review issues (reviewed $HEAD, live ${live_head_post:-unreadable}); the filed issues were closed as superseded"
     fi
     p4b_log "filed $FILE_COUNT post-review issue(s): $POST_REVIEW_ISSUE_REFS"
     # Enrich the accounting record (#675): the line-1 refs align 1:1 with
@@ -1859,18 +1859,20 @@ post_review() {
   # means unread, and the guard on the next line is live.
   live_head="$(gh_api_scalar --shape sha "live PR head for $REPO#$PR" \
     "repos/$REPO/pulls/$PR" --jq '.head.sha')" || live_head=""
-  [ -n "$live_head" ] || { p4b_acct_mark_unposted "could not re-read live PR head before posting review"; p4b_die 3 "could not re-read live PR head before posting review"; }
+  if [ -z "$live_head" ]; then
+    cleanup_pre_post_refusal_side_effects "could not re-read live PR head before posting review" true \
+      "The PR head" "the head of ${REPO}#${PR}"
+    p4b_die 3 "could not re-read live PR head before posting review"
+  fi
   if [ "$live_head" != "$HEAD" ]; then
     # Late-window drift (#674 round-5 P2): a push landing during body or
     # accounting rendering reaches this final check with the step-9 issues
     # already filed — close this run's creations before refusing, same as
     # the post-file recheck, so no orphan claims an approval that never
     # posted.
-    if [ "$event" = "APPROVE" ] && [ -n "${P4B_CREATED_ISSUE_REFS:-}" ]; then
-      p4b_warn "PR head drifted before the approval POST — closing this run's filed post-review issues as superseded: $P4B_CREATED_ISSUE_REFS"
-      p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: the PR head of ${REPO}#${PR} changed before the Phase 4b approval could post; a re-run on the new head files fresh follow-ups."
-    fi
-    fall_back_to_manual "PR head changed during review (reviewed $HEAD, live $live_head)"
+    cleanup_pre_post_refusal_side_effects "PR head changed during review (reviewed $HEAD, live $live_head)" true \
+      "The PR head" "the head of ${REPO}#${PR}"
+    p4b_die 3 "PR head changed during review (reviewed $HEAD, live $live_head)"
   fi
   # Identity drift, last fence before the POST (#1143). Rendering, accounting
   # and step-9 filing all sit between the pre-filing check and here, and a body
@@ -1900,7 +1902,7 @@ post_review() {
   if ! revalidate_expected_base pre-post; then
     cleanup_pre_post_refusal_side_effects "$P4B_BASE_FENCE_REASON" true \
       "The PR base" "the base of ${REPO}#${PR}"
-    fall_back_to_manual "$P4B_BASE_FENCE_REASON"
+    p4b_die 3 "$P4B_BASE_FENCE_REASON"
   fi
   # #1581: an approval is the one write a late finding must not slip past.
   # A required-tier finding can land while the adapter runs, so account for

@@ -3122,10 +3122,10 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$B
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$PREFILE_DRIFT_ISSUE_LOG" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$PREFILE_DRIFT_WRAPPER_LOG" \
   P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_LIVE_HEAD2=dddddddddddddddddddddddddddddddddddddddd P4B_FAKE_LIVE_HEAD2_FROM=2 \
-  bash "$ORCH" 1371 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 1371 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>&1)"; rc=$?
 set -e
-if [ "$rc" = 4 ] \
-   && printf '%s' "$out" | jq -r '.reason' | grep -q "refusing to file post-review issues" \
+if [ "$rc" = 3 ] \
+   && printf '%s' "$out" | grep -q "refusing to file post-review issues" \
    && [ "$(cat "$PREFILE_DRIFT_ISSUE_LOG.headreads" 2>/dev/null || printf 0)" -ge 2 ] \
    && ! grep -q '^ARGV ' "$PREFILE_DRIFT_ISSUE_LOG" \
    && ! grep -q 'pulls/.*/reviews' "$PREFILE_DRIFT_WRAPPER_LOG" 2>/dev/null; then
@@ -3242,10 +3242,10 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$B
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$DRIFT2_ISSUE_LOG" \
   P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_LIVE_HEAD2=dddddddddddddddddddddddddddddddddddddddd P4B_FAKE_LIVE_HEAD2_FROM=3 \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-drift2-wrapper.log" \
-  bash "$ORCH" 145 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 145 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>&1)"; rc=$?
 set -e
-if [ "$rc" = 4 ] \
-   && printf '%s' "$out" | jq -r '.reason' | grep -q "changed while filing post-review issues" \
+if [ "$rc" = 3 ] \
+   && printf '%s' "$out" | grep -q "changed while filing post-review issues" \
    && grep -q "^ARGV " "$DRIFT2_ISSUE_LOG" \
    && grep -q "^CLOSE #901$" "$DRIFT2_ISSUE_LOG"; then
   pass "#674: mid-filing head drift refuses and closes the filed issues"
@@ -3294,10 +3294,10 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$B
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$LATE_ISSUE_LOG" \
   P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_LIVE_HEAD2=dddddddddddddddddddddddddddddddddddddddd P4B_FAKE_LIVE_HEAD2_FROM=4 \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-late-wrapper.log" \
-  bash "$ORCH" 147 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 147 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>&1)"; rc=$?
 set -e
-if [ "$rc" = 4 ] \
-   && printf '%s' "$out" | jq -r '.reason' | grep -q "changed during review" \
+if [ "$rc" = 3 ] \
+   && printf '%s' "$out" | grep -q "changed during review" \
    && grep -q "^CLOSE #901$" "$LATE_ISSUE_LOG"; then
   pass "#674: render-window drift closes this run's filed issues before refusing"
 else fail "#674 late-drift cleanup (rc=$rc): $out"; fi
@@ -3329,7 +3329,7 @@ if [ "$rc" = 4 ] \
 else fail "#672 opt-out (rc=$rc): $out"; fi
 
 # Stale-head guard: a non-dry-run APPROVED must re-read the live head and
-# fall back before the wrapper writes if the reviewed SHA is no longer live.
+# hard-stop before the wrapper writes if the reviewed SHA is no longer live.
 echo "orchestrator — optional expected-base fence (#1475)"
 P4B_EXPECTED_BASE="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 P4B_MOVED_BASE="cccccccccccccccccccccccccccccccccccccccc"
@@ -3358,10 +3358,10 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$B
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" \
   P4B_WRAPPER_LOG="$BASE_MOVE_EARLY_WRAPPER" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_LIVE_BASE="$P4B_EXPECTED_BASE" \
   P4B_FAKE_LIVE_BASE2="$P4B_MOVED_BASE" P4B_FAKE_LIVE_BASE2_FROM=3 P4B_FAKE_LIVE_PAIR_COUNT="$WORK/base-fence-early.count" \
-  bash "$ORCH" 14752 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --expected-base-sha "$P4B_EXPECTED_BASE" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 14752 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --expected-base-sha "$P4B_EXPECTED_BASE" --diff-file "$DIFF" 2>&1)"; rc=$?
 set -e
-if [ "$rc" = 4 ] \
-   && printf '%s' "$out" | jq -r '.reason' | grep -q "PR base changed during review" \
+if [ "$rc" = 3 ] \
+   && printf '%s' "$out" | grep -q "PR base changed during review" \
    && [ ! -s "$BASE_MOVE_EARLY_ISSUES" ] && [ ! -e "$BASE_MOVE_EARLY_WRAPPER" ]; then
   pass "same-head base move during adapter work refuses before post-review filing"
 else fail "early expected-base drift (rc=$rc, out=$out)"; fi
@@ -3377,10 +3377,10 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$B
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" \
   P4B_WRAPPER_LOG="$BASE_MOVE_LATE_WRAPPER" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_LIVE_BASE="$P4B_EXPECTED_BASE" \
   P4B_FAKE_LIVE_BASE2="$P4B_MOVED_BASE" P4B_FAKE_LIVE_BASE2_FROM=4 P4B_FAKE_LIVE_PAIR_COUNT="$WORK/base-fence-late.count" \
-  bash "$ORCH" 14753 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --expected-base-sha "$P4B_EXPECTED_BASE" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 14753 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --expected-base-sha "$P4B_EXPECTED_BASE" --diff-file "$DIFF" 2>&1)"; rc=$?
 set -e
-if [ "$rc" = 4 ] \
-   && printf '%s' "$out" | jq -r '.reason' | grep -q "PR base changed during review" \
+if [ "$rc" = 3 ] \
+   && printf '%s' "$out" | grep -q "PR base changed during review" \
    && grep -q '^ARGV ' "$BASE_MOVE_LATE_ISSUES" && grep -q '^CLOSE #901$' "$BASE_MOVE_LATE_ISSUES" \
    && [ ! -e "$BASE_MOVE_LATE_WRAPPER" ]; then
   pass "pre-POST base fence closes raced post-review follow-ups before refusing"
@@ -3450,10 +3450,10 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$B
   P4B_ISSUE_LOG="$NO_FINDINGS_DRIFT_LOG" P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" \
   P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$NO_FINDINGS_DRIFT_WRAPPER" \
   P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_LIVE_HEAD2=dddddddddddddddddddddddddddddddddddddddd P4B_FAKE_LIVE_HEAD2_FROM=2 \
-  bash "$ORCH" 1271 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$ORCH" 1271 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>&1)"; rc=$?
 set -e
-if [ "$rc" = 4 ] \
-   && printf '%s' "$out" | jq -r '.reason' | grep -q "PR head changed during review" \
+if [ "$rc" = 3 ] \
+   && printf '%s' "$out" | grep -q "PR head changed during review" \
    && [ "$(cat "$NO_FINDINGS_DRIFT_LOG.headreads" 2>/dev/null || printf 0)" -ge 2 ] \
    && ! grep -q '^ARGV ' "$NO_FINDINGS_DRIFT_LOG" \
    && ! grep -q 'pulls/.*/reviews' "$NO_FINDINGS_DRIFT_WRAPPER" 2>/dev/null; then
