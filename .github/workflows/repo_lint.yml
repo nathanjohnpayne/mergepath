@@ -836,6 +836,13 @@ jobs:
     needs: scope
     if: needs.scope.outputs.deep == 'true'
     runs-on: ubuntu-latest
+    # Bound the job so a wedged step fails fast instead of sitting
+    # in_progress to the 6h runner default: a pending non-required check
+    # still pins a PR's mergeStateStatus UNSTABLE, which gh-pr-guard treats
+    # as a merge block. Observed worst cases on 2026-10-09: ~25 min on the
+    # hub, ~36 min on a consumer that ran the full hub suite as bootstrap
+    # residue (see check_repo_lint_consumer_safety).
+    timeout-minutes: 60
     env:
       REPO_LINT_FULL: ${{ needs.scope.outputs.full }}
       REPO_LINT_CHECKS_JSON: ${{ needs.scope.outputs.checks }}
