@@ -299,6 +299,26 @@ Reviewed commit: $HEAD
 Reviewed commit: $bad_anchor" "2026-07-03T10:00:00Z")"
 done
 
+
+# Preserve an ambiguous newer negative response in both clearance and freshness.
+for anchor in "${HEAD:0:10}" '' "${HEAD}.junk" "${HEAD}
+Reviewed commit: @@"; do
+  history="$(jq -s 'add' <(mk "$BOT" "Codex Review: Didnt find any major issues.
+Reviewed commit: $HEAD" "2026-07-01T10:00:00Z") <(mk "$BOT" "Codex Review: Found issues.
+Reviewed commit: $anchor" "2026-07-01T12:00:00Z"))"
+  check_case "newer malformed negative supersedes older exact clean ($anchor)" "" "$history"
+  observed="$(printf '%s' "$history" | jq -r --arg bot "$BOT" --arg sha "$HEAD" "$ANY_FILTER")"
+  if [ "$observed" = "2026-07-01T12:00:00Z" ]; then
+    pass "newer malformed negative raises freshness floor ($anchor)"
+  else
+    fail "newer malformed negative lost from freshness ordering ($anchor): $observed"
+  fi
+done
+history="$(jq -s 'add' <(mk "$BOT" "Codex Review: Didnt find any major issues.
+Reviewed commit: $HEAD" "2026-07-01T10:00:00Z") <(mk "$BOT" "Codex Review: Found issues.
+Reviewed commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "2026-07-01T12:00:00Z"))"
+check_case "valid negative on another full head does not demote this head" "2026-07-01T10:00:00Z" "$history"
+
 # #1752: two full object IDs sharing seven characters must not borrow
 # the same short verdict. Every abbreviation and overlong token refuses.
 for n in 6 7 8 12 20 39; do

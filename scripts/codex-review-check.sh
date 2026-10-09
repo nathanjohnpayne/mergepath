@@ -2329,10 +2329,19 @@ if [ "$CODEX_ENABLED" = "true" ]; then
               | scan("reviewed commit[^0-9a-z_\\r\\n]{0,6}([^\\r\\n]*)")
               | .[0] | sub("^[`*[:space:]]+"; "") | sub("[`*[:space:]]+$"; "")
             ] ) as $shas
-        | select( ($shas | length) > 0
-                  and ($shas | length) == ([$c.body | ascii_downcase | scan("reviewed commit")] | length)
-                  and ($head | test("^[0-9a-f]{40}$"))
-                  and ($shas | all(. == $head)) )
+        | ([$c.body | ascii_downcase | scan("reviewed commit")] | length) as $fields
+        | (($shas | length) > 0 and ($shas | length) == $fields
+           and ($head | test("^[0-9a-f]{40}$"))
+           and ($shas | all(. == $head))) as $exact
+        | ($c.body | test("(?im)^\\s*codex review:\\s*didn.?t find any major issues\\b")) as $affirmative
+        # A newer negative verdict with an ambiguous anchor must invalidate
+        # older clearance. It never grants clearance or names another head.
+        # Only complete, valid anchors exclusively naming other heads can be
+        # safely excluded from the latest-signal ordering for this head.
+        | select($exact or ($fields > 0 and ($affirmative | not)
+            and ($c.body | test("(?im)^\\s*codex review:"))
+            and (($shas | length) != $fields or ($shas | any(. == $head))
+                 or ($shas | any(test("^[0-9a-f]{40}$") | not)))))
         # affirmative ONLY when the Codex verdict HEADER line is the clean
         # verdict — anchored to a line starting with "codex review:" then the
         # no-major-issues phrase (multiline, case-insensitive; .? tolerates a
@@ -2342,7 +2351,7 @@ if [ "$CODEX_ENABLED" = "true" ]; then
         # verdict) read as affirmative and break fail-closed (CodeRabbit Major
         # on #608). Real Codex verdicts always lead with that header line.
         | { created_at: .created_at,
-            affirmative: (.body | test("(?im)^\\s*codex review:\\s*didn.?t find any major issues\\b")) }
+            affirmative: ($exact and $affirmative) }
       ]
     | max_by(.created_at) // null
   ')

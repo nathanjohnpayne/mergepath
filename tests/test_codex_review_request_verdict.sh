@@ -127,6 +127,22 @@ for token in "${HEAD}a" "${HEAD}g" "${HEAD}-not-a-sha" "${HEAD}/suffix" "${HEAD}
 Reviewed commit: $token" "2026-07-03T10:00:00Z")"
 done
 
+
+# A malformed newer negative response cannot leave an older clean verdict live.
+for anchor in "${HEAD:0:10}" '' "${HEAD}.junk" "${HEAD}
+Reviewed commit: @@"; do
+  history="$(jq -s 'add' <(mk "$BOT" "Codex Review: Didnt find any major issues.
+Reviewed commit: $HEAD" "2026-07-01T10:00:00Z") <(mk "$BOT" "Codex Review: Found issues.
+Reviewed commit: $anchor" "2026-07-01T12:00:00Z"))"
+  check_verdict "newer malformed negative supersedes older exact clean ($anchor)" \
+    '{"created_at":"2026-07-01T12:00:00Z","affirmative":false}' "$history"
+done
+history="$(jq -s 'add' <(mk "$BOT" "Codex Review: Didnt find any major issues.
+Reviewed commit: $HEAD" "2026-07-01T10:00:00Z") <(mk "$BOT" "Codex Review: Found issues.
+Reviewed commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "2026-07-01T12:00:00Z"))"
+check_verdict "valid negative on another full head does not demote this head" \
+  '{"created_at":"2026-07-01T10:00:00Z","affirmative":true}' "$history"
+
 # 5a. affirmative + full SHA → verdict present, affirmative:true.
 check_verdict "affirmative + full SHA → clears" \
   '{"created_at":"2026-07-03T10:00:00Z","affirmative":true}' \
