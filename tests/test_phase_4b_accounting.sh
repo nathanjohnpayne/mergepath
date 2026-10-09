@@ -2814,12 +2814,12 @@ set +e
 # head that CHANGED, which needs a different but VALID object name — `zzz999`
 # is not hex and so is not a sha any API can return. Since the live-head
 # re-read shape-checks its answer, an impossible value now reads as an
-# UNREADABLE head (p4b_die 3) rather than a drifted one (exit 4), which is a
-# different branch than this case is about.
+# UNREADABLE head rather than a drifted one. Both now hard-stop with exit 3,
+# but this case must exercise the changed-head cleanup branch.
 run_orch "$STATE_I" "$POLICY_ON" fake-codex-approve 209 P4B_FAKE_REQUEST_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_LIVE_HEAD=9999999999999999999999999999999999999999 -- >/dev/null 2>&1; rc=$?
 set -e
 LOG_I="$(find "$STATE_I/phase-4b-loops" -name '*.jsonl' 2>/dev/null | head -n1)"
-if [ "$rc" = 4 ] \
+if [ "$rc" = 3 ] \
    && [ ! -e "$STATE_I/phase-4b-ledger.jsonl" ] \
    && [ -z "$(find "$STATE_I/phase-4b-pending" -type f 2>/dev/null)" ] \
    && [ -n "$LOG_I" ] \
@@ -2830,7 +2830,7 @@ if [ "$rc" = 4 ] \
         and .[0].loop.fell_back == true
         and .[0].loop.fail_closed.happened == true
         and (.[0].loop.fail_closed.reason | test("head changed"))' "$LOG_I" >/dev/null; then
-  pass "head drift after the provisional record: loop corrected in place, no phantom ledger approval, exit 4 (#615)"
+  pass "head drift after the provisional record: loop corrected in place, no phantom ledger approval, exit 3 (#615)"
 else fail "head-drift correction (rc=$rc, ledger=$(cat "$STATE_I/phase-4b-ledger.jsonl" 2>/dev/null), log=$(cat "$LOG_I" 2>/dev/null))"; fi
 
 # (j) review POST failure (#615 Codex): same correction on the gh-write
