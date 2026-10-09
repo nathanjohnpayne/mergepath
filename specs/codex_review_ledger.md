@@ -15,9 +15,9 @@ Every comment body is parsed by an existing shared helper: requests by `crqe_tri
 
 ## What the record proves, and what it does not
 
-- A request comment names no commit, so a request never gets a head from timestamps. A response's head comes only from its own anchor: a review's `commit_id` or a verdict's `Reviewed commit`. A verdict quoting heads that disagree has no anchor and is flagged `anchor_conflict`. Reactions and block notices carry none.
+- A request comment names no commit, so a request never gets a head from timestamps. A response's head comes only from its own anchor: a review's `commit_id` or a verdict's `Reviewed commit`. A verdict quoting heads that disagree has no anchor and is flagged `anchor_conflict`. Block notices carry none.
 - Codex reacts with eyes while a review runs and usually removes the reaction when it finishes. Each counted request reports `eyes_at`, the reaction's timestamp if it is still present, and nothing else about acknowledgement.
-- The pull-request thumbs-up is one reaction per user, so only its latest creation survives: earlier reaction-only clean passes leave no record, and the requests they answered may read as unanswered.
+- Pull-request reactions are not review evidence and never create, classify or attribute a response. They cannot test a rebuttal or remove a human stop, even in the first request window. Request-comment eyes and per-finding feedback reactions retain their separate roles.
 - The Review Summary is edited in place. It is reported as `current_summary` and never used as history.
 - Request comments are read as they stand now. An edited or deleted request comment changes the reconstructed windows, so the ledger, like the request cap it shares a grammar with, bounds the observed history rather than an immutable one (`specs/codex_request_evidence.md`). The configured author's comments are trusted on that basis.
 
@@ -29,13 +29,13 @@ Signals belong to the window of the latest request posted at or before them; sig
 
 - each review (root inline findings plus top-level body findings) is its own response, including a review without a `commit_id`, so two reviews in one window are two responses (`multiple_in_window`);
 - a verdict joins the latest review on the same head at or before it, else the earliest later one; a verdict with no matching review stands alone;
-- signals without an anchor (reactions, block notices, verdicts without a sha) join the window's single response, or form their own when the window has none or several;
+- signals without an anchor (block notices, verdicts without a sha) join the window's single response, or form their own when the window has none or several;
 - a window whose responses sit on more than one head is `mixed_heads`; heads are the anchors that are not a prefix of another, so a short sha and its full sha are one head, but a short sha matching two different full shas leaves two;
 - a response in the same second as a request is a `tie`.
 
 Review objects whose inline comments are all thread replies are not responses. They are listed under `thread_reply_reviews` with any provider marker in the replies, because a connector reply in a review thread lands as one.
 
-A response class says what Codex answered and nothing about merge clearance, which stays with `codex-review-check.sh`. A response with a review takes the review's grade: `blocking` (a finding in a required tier, with P0 always blocking), `discretionary` (findings, none required, including unmarked ones), or `no_findings`. Without a review, verdicts decide (`clean` when all are affirmative, otherwise `unknown_tier`), then a thumbs-up (`clean`), then a block notice (`provider_blocked`). A blocking review alongside a clean signal, or affirmative and non-affirmative verdicts together (whether or not a review is present), is `conflicting`.
+A response class says what Codex answered and nothing about merge clearance, which stays with `codex-review-check.sh`. A response with a review takes the review's grade: `blocking` (a finding in a required tier, with P0 always blocking), `discretionary` (findings, none required, including unmarked ones), or `no_findings`. Without a review, verdicts decide (`clean` when all are affirmative, otherwise `unknown_tier`), then a block notice (`provider_blocked`). A blocking review alongside a clean signal, or affirmative and non-affirmative verdicts together (whether or not a review is present), is `conflicting`.
 
 ## Attribution
 

@@ -290,5 +290,5 @@ fi
 VERDICT_JSON="$(printf '%s' "$VERDICT_JSON" | jq -c --argjson usage "$USAGE" --argjson cli_version "$CLI_VERSION_JSON" \
   '. + {usage: $usage, cli_version: $cli_version}')"
 p4b_bind_input "$INPUT_METADATA" "$DIFF_FILE" "$DIFF_FIT" "$VERDICT_JSON" \
-  || p4b_die 4 "review input metadata does not match the supplied diff"
+  || p4b_die 3 "review input metadata does not match the supplied diff"
 exit 0

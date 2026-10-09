@@ -23,3 +23,5 @@ An explicit `--offline-diff --dry-run` preview freezes supplied regular-file byt
 The enablement collector reports an unavailable immutable input as a blocked dry-run result. Failure to allocate its private capture directory skips GitHub reads and adapter dispatch while preserving that structured report.
 
 The propagated immutable-input test runs regular capture, authentication, mutation and collector checks on every consumer. Curated-wave fixtures run only when the hub propagation entrypoint is present; a missing wave tool on that hub remains a failure. A hub regression executes the exact test with only its declared consumer closure, without wave tooling, to verify both positive and A-B-A refusal assertions remain active.
+
+Immutable capture, binding and revalidation refusals exit 3, including adapter binding failures. They are hard stops in the existing wave-audit status contract and cannot use the reviewer-unavailable path that permits an unaudited fan-out. Pre-POST refusal retains the existing cleanup of provisional accounting and filed follow-ups.

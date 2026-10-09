@@ -848,7 +848,7 @@ jobs:
                   # Comment ONLY if THIS sweep performed the removal (#827).
                   case "$del_status" in
                     200|204)
-                      comment_body='**Automated label removal (scheduled sweep).** `scripts/codex-review-check.sh` cleared the merge gate on this HEAD between event triggers (typical: Codex 👍 after the last push, with no synchronize / review / workflow_run event to fire the event-driven path). Removed `needs-external-review`. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#197) for the sweep doctrine.'
+                      comment_body='**Automated label removal (scheduled sweep).** `scripts/codex-review-check.sh` cleared the merge gate on this HEAD between event triggers (for example, an anchored Codex verdict or review arriving between event-driven evaluations). Removed `needs-external-review`. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#197) for the sweep doctrine.'
                       # #530: non-idempotent comment POST — deliberately
                       # unretried (a single attempt cannot duplicate); see the
                       # event-driven job above for the full rationale. Failure

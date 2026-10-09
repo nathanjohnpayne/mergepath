@@ -37,7 +37,7 @@ shift
 printf '%s\n' "$1" >>"$CALLS"
 case "$1" in
   repos/owner/repo/pulls/99) jq -cn --arg body "$PR_BODY" --arg author "$PR_AUTHOR" '{head:{sha:"abcdef0123456789000000000000000000000000"},user:{login:$author},body:$body,labels:[]}' ;;
-  repos/owner/repo/commits/*) echo '2026-09-14T00:00:00Z' ;;
+  repos/owner/repo/commits/*) [ "${TIMESTAMP_READS_FAIL:-0}" != 1 ] || exit 1; echo '2026-09-14T00:00:00Z' ;;
   repos/owner/repo/issues/99/comments)
     if [ -n "${COMMENTS_FAIL_FROM:-}" ] \
        && [ "$(grep -c '^repos/owner/repo/issues/99/comments$' "$CALLS")" -ge "$COMMENTS_FAIL_FROM" ]; then
@@ -48,7 +48,8 @@ case "$1" in
   repos/owner/repo/issues/comments/123/reactions) [ "$ACK_READ" != error ] || exit 1; cat "$FIXTURES/ack" ;;
   repos/owner/repo/issues/comments/124/reactions) echo '[]' ;;
   repos/owner/repo/issues/99/reactions) printf '%s\n' "$ISSUE_REACTIONS" ;;
-  repos/owner/repo/issues/99/timeline|repos/owner/repo/pulls/99/comments) echo '[]' ;;
+  repos/owner/repo/issues/99/timeline) [ "${TIMESTAMP_READS_FAIL:-0}" != 1 ] || exit 1; echo '[]' ;;
+  repos/owner/repo/pulls/99/comments) [ "${INLINE_COMMENTS_FAIL:-0}" != 1 ] || exit 1; printf '%s\n' "${INLINE_COMMENTS_JSON:-[]}" ;;
   graphql) echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}' ;;
   *) echo "unexpected $*" >&2; exit 99 ;;
 esac
@@ -88,6 +89,11 @@ while IFS='|' read -r name comments ack reviews mode opted expected pattern read
   [ "$name" != unknown-budget ] || sed -i.bak 's/review_timeout_seconds:.*/review_timeout_seconds: unavailable/' "$DIR/policy.yml"
   [ "$name" != default-budgets ] || sed -i.bak '/review_timeout_seconds:/d; /ack_wait_seconds:/d' "$DIR/policy.yml"
   pr_body='Authoring-Agent: codex'; pr_author=nathanjohnpayne; issue_reactions='[]'
+  if [ "$name" = rerun ] || [ "$name" = terminal-unapproved ]; then
+    # An external contributor has no same-agent approval fallback. Preserve
+    # this diagnostic fixture's missing registered-reviewer approval.
+    pr_body=''; pr_author=contributor
+  fi
   if [ "$name" = thumbs-unapproved ]; then
     pr_body=''; pr_author=contributor; issue_reactions="${EYES/eyes/+1}"
   fi
@@ -274,7 +280,7 @@ echo "PASS: #1598 reread-fails"
 # request Codex has not answered. Otherwise the earlier clearance supplies
 # gate (c) while a stale Phase 4b approval (recorded generation [123], new
 # request #124 landing during final accounting) supplies gate (b). Each
-# clearance form is covered: a clean COMMENTED review, a thumbs-up reaction,
+# anchored clearance forms are covered; unanchored thumbs never clear,
 # an affirmative verdict comment and a carried-forward verdict. Codex
 # answering the newer request (a later review) clears again.
 SUP_REQ123='{"id":123,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:01:00Z","body":"@codex review"}'
@@ -304,14 +310,14 @@ while IFS='|' read -r name comments reviews reactions carry expected pattern; do
   echo "PASS: #1598 $name"
 done <<CASES
 review-then-newer-request|[$SUP_REQ123,$SUP_REQ124]|[$SUP_CODEX_REVIEW,$SUP_STALE_4B]|[]||1|Codex clearance @ 2026-09-14T00:02:00Z is superseded
-thumbs-then-newer-request|[$SUP_REQ123,$SUP_REQ124]|[$SUP_STALE_4B]|$SUP_THUMBS||1|Codex clearance @ 2026-09-14T00:02:00Z is superseded
+thumbs-then-newer-request|[$SUP_REQ123,$SUP_REQ124]|[$SUP_STALE_4B]|$SUP_THUMBS||1|Codex has not cleared current HEAD
 verdict-then-newer-request|[$SUP_REQ123,$SUP_VERDICT,$SUP_REQ124]|[$SUP_STALE_4B]|[]||1|Codex clearance @ 2026-09-14T00:02:00Z is superseded
 carry-then-newer-request|[$SUP_REQ123,$SUP_REQ124]|[$SUP_STALE_4B]|[]|{"carried":true,"source_time":"2026-09-14T00:02:00Z","source_commit":"oldhead","fingerprint":"same"}|1|Codex clearance @ 2026-09-14T00:02:00Z is superseded
 review-older-request-still-clears|[$SUP_REQ123]|[$SUP_CODEX_REVIEW,$SUP_STALE_4B]|[]||0|latest Codex signal is COMMENTED review @ 2026-09-14T00:02:00Z
 codex-answers-newer-request|[$SUP_REQ123,$SUP_REQ124]|[$SUP_CODEX_REVIEW,$SUP_STALE_4B,$SUP_CODEX_REVIEW_LATER]|[]||0|latest Codex signal is COMMENTED review @ 2026-09-14T00:07:00Z
-thumbs-older-request-still-clears|[$SUP_REQ123]|[$SUP_STALE_4B]|$SUP_THUMBS||0|latest Codex signal is 👍 reaction @ 2026-09-14T00:02:00Z
+prior-head-thumbs-do-not-clear-backdated-push|[$SUP_REQ123,$SUP_REQ124]|[$SUP_STALE_4B]|$SUP_THUMBS||1|no eligible current-head review or verdict
 verdict-older-request-still-clears|[$SUP_REQ123,$SUP_VERDICT]|[$SUP_STALE_4B]|[]||0|AFFIRMATIVE verdict comment @ 2026-09-14T00:02:00Z
-codex-thumbs-answers-newer-request|[$SUP_REQ123,$SUP_REQ124]|[$SUP_STALE_4B]|$SUP_THUMBS_LATER||0|latest Codex signal is 👍 reaction @ 2026-09-14T00:07:00Z
+codex-thumbs-cannot-answer-newer-request|[$SUP_REQ123,$SUP_REQ124]|[$SUP_STALE_4B]|$SUP_THUMBS_LATER||1|Codex has not cleared current HEAD
 codex-verdict-answers-newer-request|[$SUP_REQ123,$SUP_VERDICT,$SUP_REQ124,$SUP_VERDICT_LATER]|[$SUP_STALE_4B]|[]||0|AFFIRMATIVE verdict comment @ 2026-09-14T00:07:00Z
 codex-clearance-request-without-timestamp|[$SUP_REQ123,$SUP_REQ_NO_TIME]|[$SUP_CODEX_REVIEW,$SUP_STALE_4B]|[]||1|Codex clearance @ 2026-09-14T00:02:00Z is superseded: Codex request evidence unreadable
 CASES
@@ -386,5 +392,101 @@ for mode in '' --diagnostic-signal-only --approval-readiness-only; do
   PASS=$((PASS + 1)); echo "PASS: resolver infrastructure ${mode:-normal}"
 done
 mv "$DIR/resolver.saved" "$DIR/scripts/workflow/resolve-codex-verdict-anchors.py"
+
+# Large provider history must travel over stdin, not the OS argument vector.
+eval "$(sed -n '/^crc_select_head_review()/,/^}/p' "$ROOT/scripts/codex-review-check.sh")"
+large_comments=$(python3 - <<'PYDATA'
+import json
+print(json.dumps([{'pull_request_review_id':789,'user':{'login':'chatgpt-codex-connector[bot]'},'body':'x'*262144}]))
+PYDATA
+)
+selected=$(crc_select_head_review "$REVIEW" 'chatgpt-codex-connector[bot]' 'abcdef0123456789000000000000000000000000' "$large_comments")
+[ "$(printf '%s\n' "$selected" | jq -r '.id')" = 789 ]
+PASS=$((PASS + 1))
+echo "PASS: large inline history does not exceed the jq argument limit"
+
+# Exercise the complete production requester scan, including its final emitter.
+# A large finding must survive both selection and JSON assembly intact.
+eval "$(sed -n '/^scan_codex_state() {/,/^}/p' "$ROOT/scripts/codex-review-request.sh")"
+python3 - "$DIR" <<'PYDATA'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+bot = {'login': 'chatgpt-codex-connector[bot]'}
+root.joinpath('scan-reviews').write_text(json.dumps([{
+    'id': 789, 'user': bot, 'commit_id': 'abcdef0123456789000000000000000000000000',
+    'submitted_at': '2026-09-14T00:02:00Z', 'state': 'COMMENTED', 'body': 'y' * 262144,
+}]))
+root.joinpath('scan-inline').write_text(json.dumps([{
+    'id': 790, 'pull_request_review_id': 789, 'user': bot,
+    'body': '**P2 ' + 'x' * 262144, 'path': 'fixture.sh', 'line': 1,
+}]))
+PYDATA
+fetch_scan_array() {
+  case "$2" in
+    reviews) cat "$DIR/scan-reviews" ;;
+    'inline comments') cat "$DIR/scan-inline" ;;
+    'issue comments') printf '[]\n' ;;
+    *) return 3 ;;
+  esac
+}
+export BOT_LOGIN='chatgpt-codex-connector[bot]'
+export HEAD_SHA='abcdef0123456789000000000000000000000000'
+export REPO=owner/repo PR_NUMBER=99 REQUIRED_TIERS_JSON='["p0","p1"]'
+export CODEX_FAILURE_MARKERS_OK=false
+scan_codex_state >"$DIR/large-scan"
+jq -e '.review.id == 789 and (.review.body | length) == 262144
+  and (.findings | length) == 1 and (.findings[0].body | length) == 262149
+  and .findings[0].blocking == false' "$DIR/large-scan" >/dev/null
+PASS=$((PASS + 1))
+echo "PASS: requester scans and emits large review and finding bodies over stdin"
+
+# Disabled Codex and approval-readiness paths do not depend on Codex inline reads.
+printf '%s\n' "$SUB_APPROVAL" >"$DIR/reviews"
+printf '[]\n' >"$DIR/comments"
+for mode in disabled readiness; do
+  policy="$DIR/substitute-disabled-policy.yml"
+  flag=''
+  if [ "$mode" = readiness ]; then policy="$DIR/substitute-policy.yml"; flag=--approval-readiness-only; fi
+  : >"$DIR/calls"
+  timestamp_reads_fail=0
+  [ "$mode" != readiness ] || timestamp_reads_fail=1
+  rc=0
+  PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=no-inline \
+    TIMESTAMP_READS_FAIL="$timestamp_reads_fail" INLINE_COMMENTS_FAIL=1 PR_BODY='Authoring-Agent: claude' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+    MERGEPATH_REVIEW_POLICY_PATH="$policy" \
+    bash "$DIR/scripts/codex-review-check.sh" ${flag:+"$flag"} 99 owner/repo > "$DIR/out" 2>&1 || rc=$?
+  if [ "$rc" != 0 ] || grep -q '^repos/owner/repo/pulls/99/comments$' "$DIR/calls"; then
+    cat "$DIR/out"; echo "FAIL $mode depends on irrelevant inline reads rc=$rc"; exit 1
+  fi
+  if [ "$mode" = readiness ] && grep -Eq '^repos/owner/repo/(commits/|issues/99/timeline$)' "$DIR/calls"; then
+    cat "$DIR/calls"; echo 'FAIL readiness depends on timestamp-only reads'; exit 1
+  fi
+  PASS=$((PASS + 1)); echo "PASS: $mode skips irrelevant API reads"
+done
+
+# A findings-bearing review is not an affirmative approval substitute,
+# even after the author replies; discretionary findings still allow it.
+printf '[]\n' >"$DIR/comments"
+for shape in badge text review-body; do
+for tier in P0 P1 P2; do
+  finding="![${tier} Badge] finding"
+  [ "$shape" = badge ] || finding="**$tier finding**"
+  printf '%s\n' "$REVIEW" >"$DIR/reviews"
+  inline=$(jq -cn --arg finding "$finding" '[{id:5001,pull_request_review_id:789,user:{login:"chatgpt-codex-connector[bot]"},body:$finding},{id:5002,pull_request_review_id:789,in_reply_to_id:5001,user:{login:"nathanpayne-codex"},body:"Rebutted and resolved."}]')
+  if [ "$shape" = review-body ]; then
+    printf '%s\n' "$REVIEW" | jq --arg finding "$finding" '.[0].body=$finding' >"$DIR/reviews"
+    inline='[]'
+  fi
+  expected=1; [ "$tier" != P2 ] || expected=0
+  : >"$DIR/calls"; rc=0
+  PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=blocking-roots \
+    INLINE_COMMENTS_JSON="$inline" PR_BODY='Authoring-Agent: codex' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+    MERGEPATH_REVIEW_POLICY_PATH="$DIR/default-policy.yml" \
+    bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/out" 2>&1 || rc=$?
+  if [ "$rc" != "$expected" ]; then cat "$DIR/out"; echo "FAIL $shape $tier approval substitute rc=$rc"; exit 1; fi
+  if [ "$tier" != P2 ] && ! grep -q 'no reviewer identity' "$DIR/out"; then cat "$DIR/out"; exit 1; fi
+  PASS=$((PASS + 1)); echo "PASS: $shape $tier approval-substitute boundary"
+done
+done
 
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"

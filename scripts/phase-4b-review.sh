@@ -77,7 +77,7 @@
 # Exit codes:
 #   0  APPROVED — review posted (or would post under --dry-run).
 #   1  CHANGES_REQUESTED — review posted; the author must address findings.
-#   3  usage / infrastructure error.
+#   3  usage / infrastructure or immutable-input integrity error; hard stop.
 #   4  fell back to the manual handoff (adapter error/timeout, invalid
 #      verdict, or no adapter for the selected reviewer). The chat-side
 #      block from scripts/post-phase-4b-handoff.sh is emitted on stderr.
@@ -1240,7 +1240,7 @@ require_feedback_accounted
 # Resolve exact objects in an isolated store, never through a mutable PR diff
 # endpoint. A supplied diff is only a compatibility assertion of these bytes.
 INPUT_DIR="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/p4b-input.XXXXXX")" \
-  || fall_back_to_manual "could not create protected review input"
+  || p4b_die 3 "could not create protected review input"
 if [ "$OFFLINE_DIFF" = true ]; then
   [ -f "$DIFF_FILE" ] && [ ! -L "$DIFF_FILE" ] \
     || p4b_die 3 "offline diff must be a regular file"
@@ -1251,22 +1251,22 @@ if [ "$OFFLINE_DIFF" = true ]; then
 else
 if ! p4b_run_with_timeout 90 "$ROOT/phase-4b/immutable-input.sh" capture \
      "$REPO" "$PR" "$EXPECTED_BASE_SHA" "$HEAD" "$INPUT_DIR"; then
-  fall_back_to_manual "could not capture immutable PR base/head objects"
+  p4b_die 3 "could not capture immutable PR base/head objects"
 fi
 if [ -n "$WAVE_SCOPE_FILE" ]; then
   if ! p4b_run_with_timeout 180 "$ROOT/phase-4b/immutable-input.sh" wave-capture \
       "$REPO" "$PR" "$EXPECTED_BASE_SHA" "$HEAD" \
       "$WAVE_SCOPE_FILE" "$INPUT_DIR" "$(p4b_config)"; then
-    fall_back_to_manual "could not regenerate trusted canonical wave input"
+    p4b_die 3 "could not regenerate trusted canonical wave input"
   fi
 fi
 INPUT_METADATA_DIGEST="$(p4b_input_digest "$INPUT_DIR/input.json")" \
-  || fall_back_to_manual "could not fingerprint review input metadata"
+  || p4b_die 3 "could not fingerprint review input metadata"
 if [ -n "$DIFF_FILE" ]; then
   SUPPLIED_DIGEST="$(p4b_input_digest "$DIFF_FILE")" \
-    || fall_back_to_manual "supplied diff is unreadable or unprotected"
+    || p4b_die 3 "supplied diff is unreadable or unprotected"
   [ "$SUPPLIED_DIGEST" = "$(jq -er '.diff_sha256' "$INPUT_DIR/input.json")" ] \
-    || fall_back_to_manual "supplied diff differs from captured immutable objects"
+    || p4b_die 3 "supplied diff differs from captured immutable objects"
 fi
 DIFF_FILE="$INPUT_DIR/review.diff"
 
@@ -1305,6 +1305,8 @@ if [ "$DRY_RUN" != true ]; then
   revalidate_codex_request_budget_authority post-adapter
 fi
 if [ "$ADAPTER_RC" -ne 0 ]; then
+  # Input binding and setup errors are hard stops, not unavailable reviewers.
+  [ "$ADAPTER_RC" -ne 3 ] || p4b_die 3 "adapter input or infrastructure failure (exit 3)"
   if p4b_is_timeout_rc "$ADAPTER_RC"; then
     fall_back_to_manual "adapter timed out after ${ADAPTER_TIMEOUT}s"
   fi
@@ -1313,7 +1315,7 @@ fi
 # Defense in depth: re-validate before we act on it.
 if ! revalidate_immutable_input \
   || { [ "$OFFLINE_DIFF" != true ] && ! p4b_validate_bound_input "$VERDICT_JSON" "$INPUT_DIR/input.json" "$DIFF_FILE"; }; then
-  fall_back_to_manual "adapter input binding changed or PR head transitioned during review"
+  p4b_die 3 "adapter input binding changed or PR head transitioned during review"
 fi
 if ! p4b_validate_verdict "$(printf '%s' "$VERDICT_JSON" | jq -c 'del(.review_input)')"; then
   fall_back_to_manual "adapter returned a non-conformant verdict"
@@ -1927,7 +1929,7 @@ post_review() {
   if ! revalidate_immutable_input; then
     cleanup_pre_post_refusal_side_effects "immutable review input changed before POST" true \
       "The PR input" "the reviewed input of ${REPO}#${PR}"
-    fall_back_to_manual "immutable review input changed before POST"
+    p4b_die 3 "immutable review input changed before POST"
   fi
   [ "$event" != "APPROVE" ] || refuse_approval_if_feedback_unaccounted
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"

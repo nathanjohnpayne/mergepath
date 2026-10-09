@@ -286,7 +286,7 @@ PR ready for external review (Phase 4b):
 
 Context: ${content}
 Gate: post APPROVED as ${REVIEWER_IDENTITY} on the listed HEAD, OR a
-      Codex bot review / 👍 reaction newer than the HEAD committer date.
+      Codex bot review or affirmative verdict anchored to the listed HEAD.
 Threads: ${unresolved} unresolved (resolve addressed bot or agent-reviewer
          threads per the pre-merge gate; never resolve real-human
          threads automatically).
@@ -358,8 +358,8 @@ done <<<"$ROWS_TSV"
 echo
 echo "Context: ${SHARED_CONTEXT}"
 echo "Gate: for each PR, post APPROVED as ${REVIEWER_IDENTITY} on the listed"
-echo '      HEAD, OR a Codex bot review / 👍 reaction newer than the HEAD'
-echo '      committer date.'
+echo '      HEAD, OR a Codex bot review or affirmative verdict anchored to'
+echo '      the listed HEAD.'
 echo 'Threads: see "Unresolved threads" column (resolve addressed bot or'
 echo '         agent-reviewer threads per the pre-merge gate; never resolve'
 echo '         real-human threads automatically).'

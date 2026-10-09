@@ -393,8 +393,11 @@ cat > "$BIN/git" <<'SH'
 set -eu
 for arg in "$@"; do
   case "$arg" in
-    init) mkdir -p "${!#}"; exit 0 ;;
-    fetch) exit 0 ;;
+    init)
+      mkdir -p "${!#}"
+      [ -z "${P4B_FAKE_CAPTURE_DIR_FILE:-}" ] || dirname "${!#}" > "$P4B_FAKE_CAPTURE_DIR_FILE"
+      exit 0 ;;
+    fetch) [ "${P4B_FAKE_CAPTURE_FAIL:-}" != 1 ]; exit $? ;;
     rev-parse) value="${!#}"; printf '%s\n' "${value%\^\{commit\}}"; exit 0 ;;
     merge-base) prev=''; for value in "$@"; do previous="$prev"; prev="$value"; done; printf '%s\n' "$previous"; exit 0 ;;
     diff) cat "$P4B_FIXTURE_DIFF"; exit 0 ;;
@@ -407,6 +410,13 @@ cat > "$BIN/gh" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = "api" ]; then
   if [ "${2:-}" = --paginate ] && [ "${3:-}" = --slurp ] && [[ "${4:-}" = */timeline ]]; then
+    if [ -n "${P4B_FAKE_TIMELINE_COUNT:-}" ]; then
+      n=$(( $( [ -f "$P4B_FAKE_TIMELINE_COUNT" ] && cat "$P4B_FAKE_TIMELINE_COUNT" || echo 0 ) + 1 ))
+      printf '%s\n' "$n" > "$P4B_FAKE_TIMELINE_COUNT"
+      if [ "$n" -ge "${P4B_FAKE_TRANSITIONS_FROM:-2}" ] && [ -s "${P4B_FAKE_TRANSITIONS_FILE:-}" ]; then
+        cat "$P4B_FAKE_TRANSITIONS_FILE"; exit 0
+      fi
+    fi
     printf '[[]]\n'; exit 0
   fi
   if [ "${2:-}" = "--paginate" ] \
@@ -634,6 +644,54 @@ exit 64
 SH
 chmod +x "$BIN/fake-gh-as-author"
 
+# ===========================================================================
+# Production orchestrator refusals must retain the wave caller's hard-stop status.
+# Model fakes write only the test-owned paths embedded here, outside the CLI env.
+mk_fake fake-codex-input-transition \
+  "printf '%s' '[[{\"id\":1,\"event\":\"head_ref_force_pushed\",\"created_at\":\"2026-10-09T00:00:01Z\",\"commit_id\":null}]]' > \"$WORK/integrity-transitions.json\"
+   printf ran > \"$WORK/integrity-adapter-ran\"
+   printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"reviewed\",\"findings\":[]}'"
+mk_fake fake-codex-input-tamper \
+  "private=\$(cat \"$WORK/integrity-capture-dir\")
+   chmod 600 \"\$private/review.diff\"
+   printf '+tampered after review\\n' >> \"\$private/review.diff\"
+   printf ran > \"$WORK/integrity-adapter-ran\"
+   printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"reviewed\",\"findings\":[]}'"
+for integrity_case in positive capture binding transition late-transition; do
+ rm -f "$P4B_TEST_POSTED_REVIEW" "$WORK/integrity-transitions.json" "$WORK/integrity-adapter-ran" "$WORK/integrity-count"
+ integrity_fake="fake-codex-input-transition"; integrity_from=2; integrity_capture_fail=0
+ case "$integrity_case" in
+  positive) integrity_fake="fake-codex-approve" ;;
+  capture) integrity_capture_fail=1 ;;
+  binding) integrity_fake="fake-codex-input-tamper" ;;
+  late-transition) integrity_from=3 ;;
+ esac
+ set +e
+ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/$integrity_fake" \
+   P4B_ADAPTER_TIMEOUT_SECONDS=3 P4B_ACCT_STATE_DIR="$WORK/integrity-$integrity_case-state" \
+   P4B_FAKE_CAPTURE_FAIL="$integrity_capture_fail" P4B_FAKE_CAPTURE_DIR_FILE="$WORK/integrity-capture-dir" \
+   P4B_FAKE_TIMELINE_COUNT="$WORK/integrity-count" P4B_FAKE_TRANSITIONS_FROM="$integrity_from" \
+   P4B_FAKE_TRANSITIONS_FILE="$WORK/integrity-transitions.json" \
+   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WORK/integrity-wrapper.log" \
+   bash "$ORCH" 1753 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" \
+   2>"$WORK/integrity-$integrity_case.stderr")"; rc=$?
+ set -e
+ if [ "$integrity_case" = positive ]; then
+  if [ "$rc" = 0 ] && [ -s "$P4B_TEST_POSTED_REVIEW" ]; then pass 'immutable input allows the unchanged orchestrator approval'
+  else fail "immutable positive approval (rc=$rc): $(tail -n 3 "$WORK/integrity-$integrity_case.stderr")"; fi
+ elif [ "$rc" = 3 ] && [ ! -e "$P4B_TEST_POSTED_REVIEW" ] \
+   && [ ! -e "$WORK/integrity-$integrity_case-state/phase-4b-ledger.jsonl" ] \
+   && ! printf '%s' "$out" | grep -q 'fell_back_to_manual'; then
+  if [ "$integrity_case" != capture ] || [ ! -e "$WORK/integrity-adapter-ran" ]; then
+   pass "immutable $integrity_case refusal is a hard stop, without approval or manual authority"
+  else fail 'capture refusal dispatched the adapter'; fi
+ else fail "immutable $integrity_case status (rc=$rc): $(tail -n 3 "$WORK/integrity-$integrity_case.stderr")"; fi
+ done
+if [ "${1:-}" = --input-integrity-only ]; then
+ printf 'Input integrity: %s passed, %s failed\n' "$PASS" "$FAIL"
+ [ "$FAIL" = 0 ]; exit $?
+fi
+
 # --- #1261 approval acknowledgment regression -------------------------------
 # This stub is clear before posting and inventories the actual review payload
 # afterwards. It also requires the production fingerprint encoding (including
@@ -826,7 +884,7 @@ else fail "#1261: ignored summary marker invented an obligation (rc=$rc; $out)";
 
 # --- end #1261 approval acknowledgment regression ---------------------------
 
-# ===========================================================================
+
 echo "lib.sh — reviewer selection"
 # ===========================================================================
 export MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON"

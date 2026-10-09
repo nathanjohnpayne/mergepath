@@ -464,15 +464,15 @@ coderabbit:
 #        b) an approving review from a registered reviewer identity
 #           (`available_reviewers`) is present on the PR
 #        c) Codex (or a Phase 4b substitute reviewer) has signaled
-#           clearance on the current HEAD via one of three forms — the
+#           clearance on the current HEAD via anchored forms — the
 #           Codex bot signals NEVER include an `APPROVED` review state,
 #           because the Codex GitHub App does not post `APPROVED`
 #           reviews:
 #            - a `COMMENTED` review from `chatgpt-codex-connector[bot]`
 #              on or after the latest commit, with no unaddressed P0/P1
 #              inline findings on the `/pulls/{pr}/comments` endpoint, OR
-#            - a 👍 / `+1` reaction from `chatgpt-codex-connector[bot]`
-#              on the PR issue, posted after the latest commit, OR
+#            - an affirmative issue-comment verdict from that bot whose
+#              Reviewed commit anchor matches the current HEAD, OR
 #            - a prior affirmative Codex issue-comment verdict whose
 #              `Reviewed commit` has the same external-review fingerprint
 #              as the current head, but only when the current head has no
@@ -588,9 +588,8 @@ codex:
   # Terminal reviews may still take much longer and remain governed by
   # `review_timeout_seconds`.
   #
-  # Eyes is ACKNOWLEDGMENT ONLY. It is never treated as clearance and it
-  # never populates the output JSON's `reaction` field, which remains
-  # reserved for Codex's +1 / 👍 no-findings signal.
+  # Eyes is ACKNOWLEDGMENT ONLY. It is never treated as clearance.
+  # PR-level reactions are observations only: they have no commit anchor.
   ack_wait_seconds: 30
 
   # Maximum number of bounded re-posts when the trigger comment does not
@@ -605,37 +604,9 @@ codex:
   # without explicit human authorization.
   require_ci_green: true
 
-  # Maximum age, in seconds, of a `+1` / 👍 reaction from the Codex bot that
-  # can clear gate (c) in codex-review-check.sh and be treated as a current
-  # signal by the pre-flight scan in codex-review-request.sh.
-  #
-  # Background: GitHub's REST and GraphQL APIs do not expose a per-PR push
-  # timestamp for ordinary (non-force) pushes. The timeline endpoint has a
-  # `committed` event for each commit, but its `created_at` field is null
-  # (verified against PR #63 on 2026-04-15). For force-push, the
-  # `head_ref_force_pushed` event provides a tight per-PR arrival time;
-  # for ordinary push, the best anchor we can derive is the commit's
-  # committer date, which is commit metadata and can be arbitrarily old
-  # (cherry-pick, rebase with `--committer-date-is-author-date`, or any
-  # commit amended from a previously-authored SHA).
-  #
-  # Consequence: without a freshness constraint, a stale 👍 reaction from
-  # a prior HEAD would pass `reaction.created_at >= HEAD_COMMITTER_DATE`
-  # when the new HEAD's committer date is older than the prior 👍 — a
-  # false clear.
-  #
-  # Mitigation: require the 👍 reaction to be created within this many
-  # seconds of the scan time. A stale 👍 from a prior HEAD is filtered
-  # out once it ages past the window, closing the exposure in practice.
-  # The window must be long enough for a typical Phase 4a cycle (push →
-  # `@codex review` trigger → Codex response → gate check) to complete
-  # without forcing a re-trigger, and short enough that cross-cycle
-  # staleness is caught.
-  #
-  # Default 1800 seconds (30 min) is conservative for the agent flow;
-  # typical cycles complete in 1–5 minutes. Applies to both
-  # codex-review-check.sh gate (c) and codex-review-request.sh pre-flight
-  # and poll scans.
+  # Compatibility setting retained for older consumers. PR-level +1 / 👍
+  # reactions never clear gate (c) or terminate requester scans. Clearance
+  # requires a qualifying commit-anchored review or affirmative verdict.
   reaction_freshness_window_seconds: 1800
 
   # When true (default), `codex-review-check.sh` accepts an APPROVED
@@ -646,7 +617,7 @@ codex:
   # agent usage limits hit), Phase 4b kicks in and an external CLI
   # reviewer (e.g., nathanpayne-cursor) posts APPROVED on the current
   # HEAD. Without this knob ON, gate (c) requires a Codex bot signal
-  # (👍 or COMMENTED-on-HEAD) that will never arrive in Phase 4b, and
+  # (a commit-anchored review or affirmative verdict), and
   # the auto-clear-blocking-labels workflow fails to remove
   # `needs-external-review` until a human clears it manually.
   #
@@ -1100,14 +1071,13 @@ propagation_audit:
 # event-driven evaluate-and-clear job ships unconditionally; the
 # periodic scheduled-sweep job below is optional.
 auto_clear_labels:
-  # Periodic sweep catches the 👍-after-last-push case: Codex reacts
-  # on the PR issue with no synchronize / pull_request_review /
-  # workflow_run event to fire the event-driven path. Defaults to
-  # true; set false if the every-5-minute cron is too noisy for a
-  # given repo's PR volume.
+  # Periodic sweep catches commit-anchored verdict comments that arrive
+  # without synchronize / pull_request_review / workflow_run events.
+  # Defaults to true; set false if the every-5-minute cron is too noisy
+  # for a given repo's PR volume. PR-level reactions grant no clearance.
   scheduled_sweep_enabled: true
   # Documentary only — the actual cron lives in
   # .github/workflows/auto-clear-blocking-labels.yml. Tightened from
-  # 15→5 minutes in mergepath#324 to close the 👍-after-last-push
-  # gap (observed on 3 of 6 mergepath#250 Phase D consumer PRs).
+  # 15→5 minutes in mergepath#324 for delayed provider signals. The
+  # historical reaction-clearance path was retired by mergepath#1751.
   scheduled_sweep_interval_minutes: 5

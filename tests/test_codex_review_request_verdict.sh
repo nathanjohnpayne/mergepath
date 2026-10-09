@@ -50,21 +50,21 @@ fi
 
 # ── 2. Structural: has_signal treats a verdict of EITHER disposition as a
 #      terminal response (the poll must stop, not time out).
-if grep -q '.review != null or .reaction != null or .verdict != null' "$SCRIPT"; then
+if grep -q '.review != null or .verdict != null' "$SCRIPT"; then
   pass "has_signal treats any HEAD-anchored verdict as a response signal"
 else
   fail "has_signal does not include the verdict in its ANY-signal check"
 fi
 
 # ── 3. Structural: has_cleared_signal folds the verdict into a three-way
-#      latest-signal-wins decision (reaction / review / verdict), not a
+#      latest-signal-wins decision (review / verdict), not a
 #      two-way check with the verdict bolted on as a fallback.
-if grep -q '\["reaction", reaction_time\], \["review", review_time\], \["verdict", verdict_time\]' "$SCRIPT" \
+if grep -q '\["review", review_time\], \["verdict", verdict_time\]' "$SCRIPT" \
    && grep -q 'elif \$latest.kind == "verdict" then' "$SCRIPT" \
    && grep -q '.verdict.affirmative == true and review_clean' "$SCRIPT"; then
-  pass "has_cleared_signal folds the verdict into three-way latest-signal-wins"
+  pass "has_cleared_signal folds the verdict into commit-anchored latest-signal-wins"
 else
-  fail "has_cleared_signal is missing the three-way latest-signal-wins verdict path"
+  fail "has_cleared_signal is missing the commit-anchored latest-signal-wins verdict path"
 fi
 
 # ── 4. Structural: has_post_trigger_signal also fires on a verdict at/after
@@ -185,35 +185,21 @@ check_verdict "newer non-affirmative verdict supersedes older affirmative one" \
   "$(jq -s 'add' <(printf '%s' "$older_affirmative") <(printf '%s' "$newer_negative"))"
 
 # ── 6. Inline logic: has_signal. KEEP IN SYNC with has_signal in the script.
-HAS_SIGNAL_FILTER='.review != null or .reaction != null or .verdict != null'
+# Only source pure production signal functions, not the network-driving script.
+for signal_function in has_signal has_cleared_signal has_post_trigger_signal; do
+  eval "$(sed -n "/^${signal_function}() {/,/^}/p" "$SCRIPT")"
+done
 hs() { # desc expected scan_json
   local desc="$1" expected="$2" got
-  got=$(printf '%s' "$3" | jq -r "$HAS_SIGNAL_FILTER")
+  if has_signal "$3"; then got=true; else got=false; fi
   if [ "$got" = "$expected" ]; then pass "has_signal: $desc"; else fail "has_signal: $desc — expected $expected got $got"; fi
 }
 hs "verdict-only (non-affirmative) → true (a real response, not a timeout)" \
   "true" '{"review":null,"reaction":null,"verdict":{"created_at":"2026-07-03T10:00:00Z","affirmative":false}}'
+hs "reaction alone is not a response" "false" '{"review":null,"reaction":{"created_at":"2999-01-01T00:00:00Z"},"verdict":null}'
 hs "no signals → false" \
   "false" '{"review":null,"reaction":null,"verdict":null}'
 
-# ── 7. Inline logic: has_cleared_signal's three-way latest-signal-wins.
-#      KEEP IN SYNC with has_cleared_signal in the script.
-CLEARED_FILTER='
-    def review_time: if .review == null then "" else .review.submitted_at end;
-    def reaction_time: if .reaction == null then "" else .reaction.created_at end;
-    def verdict_time: if .verdict == null then "" else .verdict.created_at end;
-    def review_clean: ([.findings[] | select(.priority == "P0" or .blocking == true)] | length) == 0;
-
-    ( reduce ( [["reaction", reaction_time], ["review", review_time], ["verdict", verdict_time]] | .[] ) as $sig
-        ({kind: "", time: ""};
-         if ($sig[1] != "" and ($sig[1] >= .time)) then {kind: $sig[0], time: $sig[1]} else . end)
-    ) as $latest
-    | if $latest.kind == "reaction" then "true"
-      elif $latest.kind == "review" then (review_clean | tostring)
-      elif $latest.kind == "verdict" then
-        ((.verdict.affirmative == true and review_clean) | tostring)
-      else "false"
-      end'
 
 build_scan() { # reaction_time review_time review_findings_json verdict_time verdict_affirmative
   jq -n \
@@ -225,7 +211,7 @@ build_scan() { # reaction_time review_time review_findings_json verdict_time ver
       verdict: (if $vdt == "" then null else {created_at: $vdt, affirmative: ($aff == "true")} end)
     }'
 }
-cleared() { echo "$1" | jq -r "$CLEARED_FILTER"; }
+cleared() { if has_cleared_signal "$1"; then echo true; else echo false; fi; }
 cc() { # desc expected reaction_time review_time findings_json verdict_time verdict_affirmative
   local desc="$1" exp="$2" got
   got=$(cleared "$(build_scan "$3" "$4" "$5" "$6" "$7")")
@@ -250,31 +236,30 @@ cc "older clean review + NEWER non-affirmative verdict → NOT cleared" \
   "false" "" "2026-07-03T09:00:00Z" "[]" "2026-07-03T12:00:00Z" "false"
 
 # 7d: an older non-affirmative verdict does not block a NEWER clean signal.
-cc "older non-affirmative verdict + NEWER 👍 → cleared" \
-  "true" "2026-07-03T12:00:00Z" "" "[]" "2026-07-03T09:00:00Z" "false"
+cc "older negative verdict + NEWER unanchored 👍 → not cleared" \
+  "false" "2026-07-03T12:00:00Z" "" "[]" "2026-07-03T09:00:00Z" "false"
 
 # 7e: pre-#609 paths still behave identically (no verdict present at all).
-cc "thumbs-only, no verdict → cleared" \
-  "true" "2026-07-03T10:00:00Z" "" "[]" "" ""
+cc "thumbs-only, no verdict → not cleared" \
+  "false" "2026-07-03T10:00:00Z" "" "[]" "" ""
 cc "review-only clean, no verdict → cleared" \
   "true" "" "2026-07-03T10:00:00Z" "[]" "" ""
 cc "no signals at all → NOT cleared" \
   "false" "" "" "[]" "" ""
 
 # ── 8. Inline logic: has_post_trigger_signal. KEEP IN SYNC with the script.
-POST_TRIGGER_FILTER='
-    ((.review != null and .review.submitted_at >= $after)
-     or (.reaction != null and .reaction.created_at >= $after)
-     or (.verdict != null and .verdict.created_at >= $after))'
+
 pts() { # desc expected scan_json after
   local desc="$1" expected="$2" got
-  got=$(printf '%s' "$3" | jq -r --arg after "$4" "$POST_TRIGGER_FILTER")
+  if TRIGGER_SIGNAL_THRESHOLD="$4" has_post_trigger_signal "$3"; then got=true; else got=false; fi
   if [ "$got" = "$expected" ]; then pass "has_post_trigger_signal: $desc"; else fail "has_post_trigger_signal: $desc — expected $expected got $got"; fi
 }
 pts "post-trigger verdict (at threshold, >=) → true" \
   "true" '{"review":null,"reaction":null,"verdict":{"created_at":"2026-07-03T10:00:00Z"}}' "2026-07-03T10:00:00Z"
 pts "pre-trigger (stale) verdict → false" \
   "false" '{"review":null,"reaction":null,"verdict":{"created_at":"2026-07-03T09:00:00Z"}}' "2026-07-03T10:00:00Z"
+
+pts "unanchored post-trigger reaction is not a response" "false" '{"review":null,"reaction":{"created_at":"2999-01-01T00:00:00Z"},"verdict":null}' "2026-07-03T10:00:00Z"
 
 # ── 9. Behavioral: a failed fetch_api_array read inside scan_codex_state
 #      reaches its callers as a non-zero status FROM scan_codex_state

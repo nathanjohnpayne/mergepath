@@ -899,12 +899,12 @@ case "$orc" in
     log "CHANGES_REQUESTED posted on ${REPO}#${PR} — fix at the mergepath source, re-cut the wave, re-run the audit on the fresh canary"
     ;;
   3)
-    # Config/usage/infrastructure error — including a failed review POST
+    # Input integrity/config/usage/infrastructure error — including a failed review POST
     # (Codex P2 on #663). No reliable verdict exists and the local setup or
     # the GitHub write path is broken: this is NOT a proceedable audit
     # miss, so do not suggest fanning out on it.
     emit_json 3 false null
-    log "ERROR: orchestrator infrastructure/config failure (exit 3) — no verdict exists; fix the configuration or write path and rerun the audit before fanning out"
+    log "ERROR: orchestrator input integrity/infrastructure/config failure (exit 3) — no verdict exists; fix the configuration or write path and rerun the audit before fanning out"
     ;;
   6)
     # #814 barrier hold: external review has not reached the canary head YET.
