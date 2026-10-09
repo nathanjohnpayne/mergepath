@@ -253,7 +253,7 @@ crqe_select_codex_review_summary() { # issue-comments-json bot-login head-sha
 # codex-review-request.sh (scan_codex_state) and codex-review-check.sh
 # (CODEX_VERDICT_JSON) use; tests/test_codex_review_ledger.sh pins all three
 # copies byte-for-byte. Selection differs by design: those two keep only
-# verdicts whose sha prefixes the current head and take the latest, while
+# verdicts whose full SHA equals the current head and take the latest, while
 # this reports every verdict and leaves selection to the caller.
 crqe_verdicts() { # issue-comments-json bot-login
   printf '%s\n' "${1:-[]}" | jq -c --arg bot "${2:-}" '
@@ -262,7 +262,7 @@ crqe_verdicts() { # issue-comments-json bot-login
       | . as $c
       | ( [ $c.body // ""
             | ascii_downcase
-            | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
+            | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,})(?![0-9a-z_])")
             | .[0]
           ] ) as $shas
       | select(($shas | length) > 0 or (($c.body // "") | test("(?im)^\\s*codex review:")))

@@ -128,7 +128,11 @@ case "$PATHARG" in
     if [ -n "${STUB_COMMIT_ERR_SHA:-}" ] && [ "${PATHARG##*/}" = "$STUB_COMMIT_ERR_SHA" ]; then
       emit_http_error "${STUB_COMMIT_ERR_RC:-1}" '{"message":"No commit found for SHA","status":"422"}'
     fi
-    emit '{"sha":"c0ffee01","commit":{"tree":{"sha":"treeshafixed1"}}}' "" 0 ;;
+    if [[ "${PATHARG##*/}" =~ ^[0-9a-f]{40}$ ]]; then
+      emit "$(jq -nc --arg sha "${PATHARG##*/}" '{sha:$sha,commit:{tree:{sha:"treeshafixed1"}}}')" "" 0
+    else
+      emit '{"sha":"c0ffee01","commit":{"tree":{"sha":"treeshafixed1"}}}' "" 0
+    fi ;;
   repos/*/compare/*)
     emit '{"merge_base_commit":{"sha":"de4dbee5"}}' "" 0 ;;
   repos/*/pulls/*)
@@ -471,6 +475,21 @@ for cf_rc in 1 0; do
     fail "#799: carryforward did not refuse on an error-body commit read, exit $cf_rc (rc=$RC out=$OUT)"
   fi
 done
+reset_stub_env
+
+# #1752: a prefix of the current head must not become an affirmative
+# carry-forward candidate, even when every reviewed-file fingerprint matches.
+CF1752_COMMENTS="$WORK/cf1752-comments.json"
+printf '[{"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-01-01T00:00:00Z","body":"Codex Review: Didnt find any major issues.\\nReviewed commit: %s"}]\n' \
+  "${HEAD_SHA:0:7}" >"$CF1752_COMMENTS"
+reset_stub_env
+export STUB_COMMENTS_JSON="$CF1752_COMMENTS"
+run_cf "$WORK/cf1752.stderr"
+if [ "$RC" -eq 0 ] && [ "$(printf '%s' "$OUT" | jq -r '.carried')" = false ]; then
+  pass "#1752: a colliding-prefix verdict cannot grant carry-forward clearance"
+else
+  fail "#1752: abbreviated candidate cleared (rc=$RC out=$OUT)"
+fi
 reset_stub_env
 
 # ── Oversized comments/reviews payloads (#1092) ─────────────────────

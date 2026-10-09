@@ -2311,7 +2311,7 @@ if [ "$CODEX_ENABLED" = "true" ]; then
   # "Codex Review: Found …" / changes-requested verdict for the same HEAD was
   # posted after it — a false clear (Codex P1 on #608). A "HEAD-anchored
   # verdict" is any Codex-bot comment carrying a `Reviewed commit: <sha>` line
-  # whose sha prefixes HEAD; keeping the non-affirmative timestamp too lets the
+  # whose full SHA equals HEAD; keeping the non-affirmative timestamp too lets the
   # Phase 4b substitute freshness guard reject a stale approval over a newer
   # negative verdict (Codex P2 on #608).
   CODEX_VERDICT_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
@@ -2322,16 +2322,17 @@ if [ "$CODEX_ENABLED" = "true" ]; then
         | . as $c
         # HEAD anchor — extract every "Reviewed commit: <sha>" hex token
         # (lowercased; tolerate ":", "**", backticks, whitespace between the
-        # label and the sha) and require at least one to prefix HEAD. This
+        # label and the sha) and require every anchor to equal the full HEAD SHA. This
         # keeps verdicts of ANY disposition so latest-wins can see a newer
         # negative verdict.
         | ( [ $c.body
               | ascii_downcase
-              | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
+              | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,})(?![0-9a-z_])")
               | .[0]
             ] ) as $shas
         | select( ($shas | length) > 0
-                  and ($shas | any(. as $s | $head | startswith($s))) )
+                  and ($head | test("^[0-9a-f]{40}$"))
+                  and ($shas | all(. == $head)) )
         # affirmative ONLY when the Codex verdict HEADER line is the clean
         # verdict — anchored to a line starting with "codex review:" then the
         # no-major-issues phrase (multiline, case-insensitive; .? tolerates a
@@ -2348,7 +2349,7 @@ if [ "$CODEX_ENABLED" = "true" ]; then
   CODEX_HEAD_VERDICT_ANY_TIME=$(echo "$CODEX_VERDICT_JSON" | jq -r 'if . == null then "" else .created_at end')
   if [ "$(echo "$CODEX_VERDICT_JSON" | jq -r 'if . == null then "false" else (.affirmative | tostring) end')" = "true" ]; then
     CODEX_HEAD_VERDICT_TIME="$CODEX_HEAD_VERDICT_ANY_TIME"
-    log "codex verdict: latest HEAD-anchored verdict @ $CODEX_HEAD_VERDICT_TIME is AFFIRMATIVE (Reviewed commit prefixes $HEAD_SHA)"
+    log "codex verdict: latest HEAD-anchored verdict @ $CODEX_HEAD_VERDICT_TIME is AFFIRMATIVE (Reviewed commit equals $HEAD_SHA)"
   elif [ -n "$CODEX_HEAD_VERDICT_ANY_TIME" ]; then
     log "codex verdict: latest HEAD-anchored verdict @ $CODEX_HEAD_VERDICT_ANY_TIME is NON-affirmative — not a clearance signal (fail closed); carried into the Phase 4b freshness guard"
   fi
@@ -2839,7 +2840,7 @@ case "$LATEST_SIGNAL_KIND" in
       # this, and a caller asking "did Codex review THIS head" would be told
       # yes. Diagnostic mode accepts only the two head-anchored forms: a review
       # object (commit_id == HEAD) or a verdict comment whose Reviewed commit
-      # prefixes HEAD.
+      # equals the full HEAD SHA.
       log "gate (c): 👍 reaction @ $LATEST_SIGNAL_TIME is not head-anchored — rejected under --diagnostic-signal-only"
     else
       CLEARED=true
@@ -2871,7 +2872,7 @@ case "$LATEST_SIGNAL_KIND" in
       CLEARANCE_REASON="head-anchored verdict comment @ $LATEST_SIGNAL_TIME (presence only; disposition not evaluated under --diagnostic-signal-only)"
     elif [ -n "$CODEX_HEAD_VERDICT_TIME" ] && [ "$UNADDRESSED_COUNT" -eq 0 ]; then
       CLEARED=true
-      CLEARANCE_REASON="latest Codex signal is a HEAD-anchored AFFIRMATIVE verdict comment @ $LATEST_SIGNAL_TIME (Reviewed commit prefixes $HEAD_SHA; no unaddressed P0/P1) (#600)"
+      CLEARANCE_REASON="latest Codex signal is a HEAD-anchored AFFIRMATIVE verdict comment @ $LATEST_SIGNAL_TIME (Reviewed commit equals $HEAD_SHA; no unaddressed P0/P1) (#600)"
     else
       log "gate (c): latest Codex signal is a non-affirmative or findings-bearing verdict comment @ $LATEST_SIGNAL_TIME — fail closed, does not clear (#608 P1)"
     fi

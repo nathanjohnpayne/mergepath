@@ -173,7 +173,7 @@ CURRENT_SIGNAL=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -c \
   def verdict_shas($body):
     [ $body
       | ascii_downcase
-      | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
+      | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,})(?![0-9a-z_])")
       | .[0]
     ];
   .[0] as $comments |
@@ -183,7 +183,7 @@ CURRENT_SIGNAL=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -c \
     | select(.user.login == $bot)
     | . as $c
     | verdict_shas($c.body)[] as $sha
-    | select($head | startswith($sha))
+    | select(($sha | test("^[0-9a-f]{40}$")) and $head == $sha)
     | {
         kind: "verdict",
         time: ($c.created_at // ""),
@@ -193,7 +193,7 @@ CURRENT_SIGNAL=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -c \
     $reviews[]
     | select(.user.login == $bot)
     | ((.commit_id // "") | ascii_downcase) as $sha
-    | select($sha != "" and ($head == $sha or ($head | startswith($sha))))
+    | select(($sha | test("^[0-9a-f]{40}$")) and $head == $sha)
     | {kind: "review", time: (.submitted_at // ""), affirmative: false}
   ])
   | map(select(.time != ""))
@@ -232,11 +232,12 @@ CANDIDATES=$(printf '%s' "$COMMENTS_JSON" | jq -r \
     | . as $c
     | [ $c.body
         | ascii_downcase
-        | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
+        | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,})(?![0-9a-z_])")
         | .[0]
       ] as $shas
-    | $shas[]
-    | {time: $c.created_at, sha: .}
+    | select(($shas | length) > 0 and ($shas | all(test("^[0-9a-f]{40}$")))
+             and ($shas | unique | length) == 1)
+    | {time: $c.created_at, sha: $shas[0]}
   ]
   | sort_by(.time)
   | reverse
@@ -255,7 +256,7 @@ while IFS=$'\t' read -r source_time source_sha; do
   resolved_sha=""
   source_lc=$(printf '%s' "$source_sha" | tr '[:upper:]' '[:lower:]')
   case "$HEAD_LC" in
-    "$source_lc"*) resolved_sha="$HEAD_SHA" ;;
+    "$source_lc") resolved_sha="$HEAD_SHA" ;;
   esac
   if [ -z "$resolved_sha" ]; then
     # #799: an unreadable response used to arrive here as the JSON error
@@ -289,7 +290,7 @@ while IFS=$'\t' read -r source_time source_sha; do
   #   truncated sha), so failing closed here would let one bad string in any old
   #   comment permanently disable carry-forward for the PR. NEWER_SIGNALS is a
   #   small, safety-critical, machine-generated set where failing closed is right.
-  [ -n "$resolved_sha" ] || continue
+  [ -n "$resolved_sha" ] && [ "$(printf '%s' "$resolved_sha" | tr '[:upper:]' '[:lower:]')" = "$source_lc" ] || continue
 
   resolved_lc=$(printf '%s' "$resolved_sha" | tr '[:upper:]' '[:lower:]')
   NEWER_SOURCE_SIGNAL=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -c \
@@ -300,7 +301,7 @@ while IFS=$'\t' read -r source_time source_sha; do
     def verdict_shas($body):
       [ $body
         | ascii_downcase
-        | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
+        | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,})(?![0-9a-z_])")
         | .[0]
       ];
     .[0] as $comments |
@@ -310,7 +311,7 @@ while IFS=$'\t' read -r source_time source_sha; do
       | select(.user.login == $bot)
       | . as $c
       | verdict_shas($c.body)[] as $sha
-      | select($resolved | startswith($sha))
+      | select(($sha | test("^[0-9a-f]{40}$")) and $resolved == $sha)
       | {
           kind: "verdict",
           time: ($c.created_at // ""),
@@ -320,7 +321,7 @@ while IFS=$'\t' read -r source_time source_sha; do
       $reviews[]
       | select(.user.login == $bot)
       | ((.commit_id // "") | ascii_downcase) as $sha
-      | select($sha != "" and ($resolved == $sha or ($resolved | startswith($sha))))
+      | select(($sha | test("^[0-9a-f]{40}$")) and $resolved == $sha)
       | {kind: "review", time: (.submitted_at // ""), affirmative: false}
     ])
     | map(select(.time != "" and .time > $source_time))
@@ -338,7 +339,7 @@ while IFS=$'\t' read -r source_time source_sha; do
     def verdict_shas($body):
       [ $body
         | ascii_downcase
-        | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
+        | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,})(?![0-9a-z_])")
         | .[0]
       ];
     .[0] as $comments |
@@ -371,8 +372,12 @@ while IFS=$'\t' read -r source_time source_sha; do
     [ -n "$signal_sha" ] || continue
     signal_resolved=""
     signal_lc=$(printf '%s' "$signal_sha" | tr '[:upper:]' '[:lower:]')
+    if [[ ! "$signal_lc" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "external_review_carryforward.sh: newer $signal_kind Codex signal has an abbreviated or malformed commit; refusing carry-forward" >&2
+      exit 2
+    fi
     case "$HEAD_LC" in
-      "$signal_lc"*) signal_resolved="$HEAD_SHA" ;;
+      "$signal_lc") signal_resolved="$HEAD_SHA" ;;
     esac
     if [ -z "$signal_resolved" ]; then
       # #799: this is the latest-signal-wins guard the asymmetry note above
@@ -384,7 +389,7 @@ while IFS=$'\t' read -r source_time source_sha; do
       signal_resolved=$(gh_api_scalar --shape sha "commit $signal_sha in $REPO" \
         "repos/$REPO/commits/$signal_sha" --jq .sha) || signal_resolved=""
     fi
-    if [ -z "$signal_resolved" ]; then
+    if [ -z "$signal_resolved" ] || [ "$(printf '%s' "$signal_resolved" | tr '[:upper:]' '[:lower:]')" != "$signal_lc" ]; then
       echo "external_review_carryforward.sh: newer $signal_kind Codex signal at $signal_time references unresolvable commit $signal_sha; refusing carry-forward" >&2
       exit 2
     fi

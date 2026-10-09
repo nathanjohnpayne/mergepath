@@ -845,7 +845,7 @@ fi
 
 # ---- Part 3: the shared verdict expressions match their existing copies ----
 
-for expr in 'scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")' \
+for expr in 'scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,})(?![0-9a-z_])")' \
             'test("(?im)^\\s*codex review:\\s*didn.?t find any major issues\\b")'; do
   for f in scripts/lib/codex-request-evidence.sh scripts/codex-review-request.sh scripts/codex-review-check.sh; do
     if grep -qF -- "$expr" "$ROOT/$f"; then
