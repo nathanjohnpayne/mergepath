@@ -128,7 +128,11 @@ case "$PATHARG" in
     if [ -n "${STUB_COMMIT_ERR_SHA:-}" ] && [ "${PATHARG##*/}" = "$STUB_COMMIT_ERR_SHA" ]; then
       emit_http_error "${STUB_COMMIT_ERR_RC:-1}" '{"message":"No commit found for SHA","status":"422"}'
     fi
-    emit '{"sha":"c0ffee01","commit":{"tree":{"sha":"treeshafixed1"}}}' "" 0 ;;
+    if [[ "${PATHARG##*/}" =~ ^[0-9a-f]{40}$ ]]; then
+      emit "$(jq -nc --arg sha "${PATHARG##*/}" '{sha:$sha,commit:{tree:{sha:"treeshafixed1"}}}')" "" 0
+    else
+      emit '{"sha":"c0ffee01","commit":{"tree":{"sha":"treeshafixed1"}}}' "" 0
+    fi ;;
   repos/*/compare/*)
     emit '{"merge_base_commit":{"sha":"de4dbee5"}}' "" 0 ;;
   repos/*/pulls/*)
@@ -469,6 +473,57 @@ for cf_rc in 1 0; do
     pass "#799: external_review_carryforward.sh refuses carry-forward when a newer signal's commit read returns an error body on stdout (exit $cf_rc)"
   else
     fail "#799: carryforward did not refuse on an error-body commit read, exit $cf_rc (rc=$RC out=$OUT)"
+  fi
+done
+reset_stub_env
+
+# #1752: a prefix of the current head must not become an affirmative
+# carry-forward candidate, even when every reviewed-file fingerprint matches.
+CF1752_COMMENTS="$WORK/cf1752-comments.json"
+printf '[{"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-01-01T00:00:00Z","body":"Codex Review: Didnt find any major issues.\\nReviewed commit: %s"}]\n' \
+  "${HEAD_SHA:0:7}" >"$CF1752_COMMENTS"
+reset_stub_env
+export STUB_COMMENTS_JSON="$CF1752_COMMENTS"
+run_cf "$WORK/cf1752.stderr"
+if [ "$RC" -eq 0 ] && [ "$(printf '%s' "$OUT" | jq -r '.carried')" = false ]; then
+  pass "#1752: a colliding-prefix verdict cannot grant carry-forward clearance"
+else
+  fail "#1752: abbreviated candidate cleared (rc=$RC out=$OUT)"
+fi
+reset_stub_env
+
+# Mixed full/invalid anchors are neither direct signals nor candidates.
+for bad_anchor in "${HEAD_SHA:0:6}" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb '@@' ''; do
+  jq -n --arg head "$HEAD_SHA" --arg bad "$bad_anchor" '[{user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-01-01T00:00:00Z",body:("Codex Review: Didnt find any major issues.\nReviewed commit: " + $head + "\nReviewed commit: " + $bad)}]' >"$CF1752_COMMENTS"
+  reset_stub_env
+  export STUB_COMMENTS_JSON="$CF1752_COMMENTS"
+  run_cf "$WORK/cf1752-mixed.stderr"
+  if [ "$RC" -eq 0 ] && [ "$(printf '%s' "$OUT" | jq -r '.carried == false and (.current_signal == null)')" = true ]; then
+    pass "#1752: mixed full and invalid anchor never creates a current signal ($bad_anchor)"
+  else
+    fail "#1752: mixed anchors created a signal (rc=$RC out=$OUT)"
+  fi
+done
+reset_stub_env
+
+# Empty or malformed newer negative fields must survive the history scan.
+# The older clean verdict has the same fingerprint and would otherwise carry.
+for bad_anchor in '' '   ' '@@' "${HEAD_SHA:0:7}" '__MISSING__' 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+Reviewed commit: cccccccccccccccccccccccccccccccccccccccc'; do
+  jq -n --arg bad "$bad_anchor" '[
+    {user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-01-01T00:00:00Z",
+     body:"Codex Review: Didnt find any major issues.\nReviewed commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    {user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-02-01T00:00:00Z",
+     body:(if $bad == "__MISSING__" then "Codex Review: Further changes required."
+           else "Codex Review: Further changes required.\nReviewed commit: " + $bad end)}
+  ]' >"$CF1752_COMMENTS"
+  reset_stub_env
+  export STUB_COMMENTS_JSON="$CF1752_COMMENTS"
+  run_cf "$WORK/cf1752-empty-newer.stderr"
+  if [ "$RC" -eq 2 ] && grep -q 'abbreviated or malformed commit' "$WORK/cf1752-empty-newer.stderr"; then
+    pass "#1752: newer negative malformed/empty anchor refuses older clearance ($bad_anchor)"
+  else
+    fail "#1752: newer malformed anchor disappeared (rc=$RC out=$OUT)"
   fi
 done
 reset_stub_env

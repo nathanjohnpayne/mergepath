@@ -8,6 +8,7 @@ DIR=$(mktemp -d)
 trap 'rm -rf "$DIR"' EXIT
 mkdir -p "$DIR/scripts/workflow" "$DIR/bin"
 cp "$ROOT/scripts/codex-review-check.sh" "$DIR/scripts/"
+cp "$ROOT/scripts/workflow/resolve-codex-verdict-anchors.py" "$DIR/scripts/workflow/"
 ln -s "$ROOT/scripts/lib" "$DIR/scripts/lib"
 cat >"$DIR/policy.yml" <<'POLICY'
 author_identity: nathanjohnpayne
@@ -35,7 +36,7 @@ shift
 [ "${1:-}" != --paginate ] || shift
 printf '%s\n' "$1" >>"$CALLS"
 case "$1" in
-  repos/owner/repo/pulls/99) jq -cn --arg body "$PR_BODY" --arg author "$PR_AUTHOR" '{head:{sha:"abcdef0123456789"},user:{login:$author},body:$body,labels:[]}' ;;
+  repos/owner/repo/pulls/99) jq -cn --arg body "$PR_BODY" --arg author "$PR_AUTHOR" '{head:{sha:"abcdef0123456789000000000000000000000000"},user:{login:$author},body:$body,labels:[]}' ;;
   repos/owner/repo/commits/*) echo '2026-09-14T00:00:00Z' ;;
   repos/owner/repo/issues/99/comments)
     if [ -n "${COMMENTS_FAIL_FROM:-}" ] \
@@ -58,7 +59,7 @@ LATER_MENTION='{"id":124,"user":{"login":"nathanjohnpayne"},"created_at":"2026-0
 EYES='[{"user":{"login":"chatgpt-codex-connector[bot]"},"content":"eyes","created_at":"2026-09-14T00:02:00Z"}]'
 # shellcheck disable=SC2016 # Literal Markdown commit cell, not shell substitution.
 RUNNING='{"id":456,"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-09-14T00:02:00Z","body":"<!-- codex-pull-request-review-summary -->\n| 📝 **Code Review** | **Running** | `abcdef0` | Manual |"}'
-REVIEW='[{"id":789,"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:02:00Z","state":"COMMENTED"}]'
+REVIEW='[{"id":789,"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"abcdef0123456789000000000000000000000000","submitted_at":"2026-09-14T00:02:00Z","state":"COMMENTED"}]'
 PASS=0
 while IFS='|' read -r name comments ack reviews mode opted expected pattern reads; do
   case "$comments" in
@@ -77,7 +78,7 @@ while IFS='|' read -r name comments ack reviews mode opted expected pattern read
   case "$ack" in eyes) ack="$EYES" ;; foreign) ack="${EYES/chatgpt-codex-connector\[bot\]/someone}" ;; *) ack='[]' ;; esac
   case "$reviews" in
     review) reviews="$REVIEW" ;;
-    approved) reviews='[{"user":{"login":"nathanpayne-claude"},"state":"APPROVED","commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:02:00Z"}]' ;;
+    approved) reviews='[{"user":{"login":"nathanpayne-claude"},"state":"APPROVED","commit_id":"abcdef0123456789000000000000000000000000","submitted_at":"2026-09-14T00:02:00Z"}]' ;;
   esac
   printf '%s\n' "$comments" >"$DIR/comments"
   printf '%s\n' "$ack" >"$DIR/ack"
@@ -194,7 +195,7 @@ _latest=$(crqe_latest_trigger_time '[{"id":1,"user":{"login":"nathanjohnpayne"},
 ! crqe_latest_trigger_time '[{"id":1,"user":{"login":"nathanjohnpayne"},"body":"@codex review"}]' nathanjohnpayne >/dev/null 2>&1 \
   || { echo 'FAIL: a qualifying request without created_at did not fail closed'; exit 1; }
 sed 's/allow_phase_4b_substitute: false/allow_phase_4b_substitute: true/' "$DIR/default-policy.yml" >"$DIR/substitute-policy.yml"
-SUB_APPROVAL='[{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:05:00Z"}]'
+SUB_APPROVAL='[{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789000000000000000000000000","submitted_at":"2026-09-14T00:05:00Z"}]'
 while IFS='|' read -r name comments expected pattern; do
   printf '%s\n' "$comments" >"$DIR/comments"
   printf '%s\n' "$SUB_APPROVAL" >"$DIR/reviews"
@@ -224,12 +225,12 @@ CASES
 # was authorized under ([123]); #124 is outside it, so the approval must not
 # clear gate (c) although the request is OLDER than the approval.
 RACE_COMMENTS='[{"id":123,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:01:00Z","body":"@codex review"},{"id":124,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:04:00Z","body":"@codex review"}]'
-RACE_APPROVAL='[{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:05:00Z","body":"Automated Phase 4b review\n<!-- mergepath-p4b-request-generation: [123] -->"}]'
-COVERED_APPROVAL='[{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:05:00Z","body":"Automated Phase 4b review\n<!-- mergepath-p4b-request-generation: [123,124] -->"}]'
+RACE_APPROVAL='[{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789000000000000000000000000","submitted_at":"2026-09-14T00:05:00Z","body":"Automated Phase 4b review\n<!-- mergepath-p4b-request-generation: [123] -->"}]'
+COVERED_APPROVAL='[{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789000000000000000000000000","submitted_at":"2026-09-14T00:05:00Z","body":"Automated Phase 4b review\n<!-- mergepath-p4b-request-generation: [123,124] -->"}]'
 # Two markers (e.g. a writer record plus a copy in reviewer-controlled text)
 # are ambiguous: fail closed rather than trust either (Codex on #1599 round 4).
-DUP_RECORD_APPROVAL='[{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:05:00Z","body":"<!-- mergepath-p4b-request-generation: [123,124] -->\n<!-- mergepath-p4b-request-generation: [123,124] -->"}]'
-INVALID_RECORD_APPROVAL='[{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:05:00Z","body":"Automated Phase 4b review\n<!-- mergepath-p4b-request-generation: [123,\"x\"] -->"}]'
+DUP_RECORD_APPROVAL='[{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789000000000000000000000000","submitted_at":"2026-09-14T00:05:00Z","body":"<!-- mergepath-p4b-request-generation: [123,124] -->\n<!-- mergepath-p4b-request-generation: [123,124] -->"}]'
+INVALID_RECORD_APPROVAL='[{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789000000000000000000000000","submitted_at":"2026-09-14T00:05:00Z","body":"Automated Phase 4b review\n<!-- mergepath-p4b-request-generation: [123,\"x\"] -->"}]'
 while IFS='|' read -r name reviews expected pattern; do
   printf '%s\n' "$RACE_COMMENTS" >"$DIR/comments"
   printf '%s\n' "$reviews" >"$DIR/reviews"
@@ -278,13 +279,13 @@ echo "PASS: #1598 reread-fails"
 # answering the newer request (a later review) clears again.
 SUP_REQ123='{"id":123,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:01:00Z","body":"@codex review"}'
 SUP_REQ124='{"id":124,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:04:00Z","body":"@codex review"}'
-SUP_VERDICT='{"id":130,"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-09-14T00:02:00Z","body":"Codex Review: Didn'"'"'t find any major issues.\n\nReviewed commit: `abcdef0`"}'
-SUP_STALE_4B='{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:05:00Z","body":"<!-- mergepath-p4b-request-generation: [123] -->"}'
-SUP_CODEX_REVIEW='{"id":789,"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:02:00Z","state":"COMMENTED","body":""}'
-SUP_CODEX_REVIEW_LATER='{"id":790,"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"abcdef0123456789","submitted_at":"2026-09-14T00:07:00Z","state":"COMMENTED","body":""}'
+SUP_VERDICT='{"id":130,"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-09-14T00:02:00Z","body":"Codex Review: Didn'"'"'t find any major issues.\n\nReviewed commit: `abcdef0123456789000000000000000000000000`"}'
+SUP_STALE_4B='{"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abcdef0123456789000000000000000000000000","submitted_at":"2026-09-14T00:05:00Z","body":"<!-- mergepath-p4b-request-generation: [123] -->"}'
+SUP_CODEX_REVIEW='{"id":789,"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"abcdef0123456789000000000000000000000000","submitted_at":"2026-09-14T00:02:00Z","state":"COMMENTED","body":""}'
+SUP_CODEX_REVIEW_LATER='{"id":790,"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"abcdef0123456789000000000000000000000000","submitted_at":"2026-09-14T00:07:00Z","state":"COMMENTED","body":""}'
 SUP_THUMBS='[{"user":{"login":"chatgpt-codex-connector[bot]"},"content":"+1","created_at":"2026-09-14T00:02:00Z"}]'
 SUP_THUMBS_LATER='[{"user":{"login":"chatgpt-codex-connector[bot]"},"content":"+1","created_at":"2026-09-14T00:02:00Z"},{"user":{"login":"chatgpt-codex-connector[bot]"},"content":"+1","created_at":"2026-09-14T00:07:00Z"}]'
-SUP_VERDICT_LATER='{"id":131,"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-09-14T00:07:00Z","body":"Codex Review: Didn'"'"'t find any major issues.\n\nReviewed commit: `abcdef0`"}'
+SUP_VERDICT_LATER='{"id":131,"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-09-14T00:07:00Z","body":"Codex Review: Didn'"'"'t find any major issues.\n\nReviewed commit: `abcdef0123456789000000000000000000000000`"}'
 SUP_REQ_NO_TIME='{"id":125,"user":{"login":"nathanjohnpayne"},"body":"@codex review"}'
 while IFS='|' read -r name comments reviews reactions carry expected pattern; do
   printf '%s\n' "$comments" >"$DIR/comments"
@@ -346,5 +347,44 @@ if [ "$rc" != 0 ] || ! grep -q 'cleared — Phase 4b substitute' "$DIR/out"; the
 fi
 PASS=$((PASS + 1))
 echo "PASS: #1598 codex-disabled"
+
+# #1752: negative ambiguous anchors remain ordering observations, but must
+# never tell a diagnostic caller that the current head was reviewed.
+for anchor in missing prefix malformed conflicting exact; do
+  case "$anchor" in
+    missing) field='' ;;
+    prefix) field='Reviewed commit: abcdef0' ;;
+    malformed) field='Reviewed commit: abcdef0123456789000000000000000000000000.trailing' ;;
+    conflicting) field=$'Reviewed commit: abcdef0123456789000000000000000000000000\nReviewed commit: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' ;;
+    exact) field='Reviewed commit: abcdef0123456789000000000000000000000000' ;;
+  esac
+  jq -cn --arg field "$field" '[{user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-09-14T00:02:00Z",body:("Codex Review: Found issues\n" + $field)}]' > "$DIR/comments"
+  printf '[]\n' > "$DIR/reviews"
+  : > "$DIR/calls"
+  rc=0
+  PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=diagnostic-anchor \
+    PR_BODY='' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+    MERGEPATH_REVIEW_POLICY_PATH="$DIR/policy.yml" \
+    bash "$DIR/scripts/codex-review-check.sh" --diagnostic-signal-only 99 owner/repo > "$DIR/out" 2>&1 || rc=$?
+  if { [ "$anchor" = exact ] && [ "$rc" != 0 ]; } || { [ "$anchor" != exact ] && [ "$rc" = 0 ]; }; then
+    cat "$DIR/out"; echo "FAIL diagnostic $anchor rc=$rc"; exit 1
+  fi
+  PASS=$((PASS + 1)); echo "PASS: diagnostic anchor $anchor"
+done
+
+# Resolver infrastructure errors must never look like an account-block waiver.
+mv "$DIR/scripts/workflow/resolve-codex-verdict-anchors.py" "$DIR/resolver.saved"
+for mode in '' --diagnostic-signal-only --approval-readiness-only; do
+  rc=0
+  PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=diagnostic-anchor \
+    PR_BODY='' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+    MERGEPATH_REVIEW_POLICY_PATH="$DIR/policy.yml" \
+    bash "$DIR/scripts/codex-review-check.sh" ${mode:+"$mode"} 99 owner/repo > "$DIR/out" 2>&1 || rc=$?
+  if [ "$rc" != 3 ]; then
+    cat "$DIR/out"; echo "FAIL resolver infrastructure $mode rc=$rc"; exit 1
+  fi
+  PASS=$((PASS + 1)); echo "PASS: resolver infrastructure ${mode:-normal}"
+done
+mv "$DIR/resolver.saved" "$DIR/scripts/workflow/resolve-codex-verdict-anchors.py"
 
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"
