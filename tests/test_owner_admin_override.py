@@ -167,8 +167,47 @@ print(json.dumps(result))
 
     def test_running_summary_without_an_explicit_request_blocks(self):
         self.state['comments'] = [{'user': {'login': override.BOT}, 'created_at': '2026-01-01T00:00:01Z',
-                                  'body': '<!-- codex-pull-request-review-summary -->\n| Code Review | Running | `' + HEAD[:8] + '` | Automatic |'}]
+                                  'body': '<!-- codex-pull-request-review-summary -->\n| 📝 **Code Review** | **Running** | `' + HEAD[:8] + '` | Automatic |'}]
         self.assertEqual(self.run_prepare().returncode, 2)
+
+    def test_completed_summary_finishes_request_without_granting_clearance(self):
+        self.state['comments'] = [
+            {'user': {'login': 'nathanjohnpayne'}, 'body': '@codex review', 'created_at': '2026-01-01T00:00:01Z'},
+            {'id': 2, 'user': {'login': override.BOT}, 'created_at': '2026-01-01T00:00:00Z',
+             'updated_at': '2026-01-01T00:00:02Z', 'body': '<!-- codex-pull-request-review-summary -->\n| 📝 **Code Review** | **Completed** | `' + HEAD[:8] + '` | Manual request |'}]
+        self.assertEqual(self.run_prepare().returncode, 0)
+        for replacement in (HEAD[:8].replace('a', 'b'), HEAD[:8] + '.trailing'):
+            self.state['comments'][1]['body'] = self.state['comments'][1]['body'].replace(HEAD[:8], replacement)
+            self.assertEqual(self.run_prepare().returncode, 2)
+            self.state['comments'][1]['body'] = self.state['comments'][1]['body'].replace(replacement, HEAD[:8])
+        self.state['comments'][0]['created_at'] = '2026-01-01T00:00:03Z'
+        self.assertEqual(self.run_prepare().returncode, 2)
+
+    def test_weekly_audit_reports_record_without_other_violations(self):
+        self.assertEqual(self.run_prepare().returncode, 0)
+        posted = json.loads((self.path / 'posted.json').read_text())
+        workflow = (ROOT / '.github/workflows/pr-audit.yml').read_text()
+        collection = workflow.split('              let recordedOverride = null;', 1)[1].split('\n            }\n\n            if (violations.length', 1)[0]
+        rendering = workflow.split('              if (recordedOverrides.length > 0) {', 1)[1].split('              body += `\\n---', 1)[0]
+        pr = {'number': 123, 'html_url': URL, 'head': {'sha': HEAD}, 'merged_at': '2026-01-01T00:02:00Z'}
+        setup = '''const context={repo:{owner:'example',repo:'repo'}};
+const prViolations=[],recordedOverrides=[],violations=[];
+const hadHumanHold=false,hadPolicyViolation=false,hadHumanLabel=false;
+const authorIdentity='nathanjohnpayne',codexBotLogin='chatgpt-codex-connector[bot]';
+const core={warning:message=>{throw new Error(message)}};
+const github={rest:{issues:{listComments:'comments'},pulls:{listReviews:'reviews',listReviewComments:'inline'}},paginate:async endpoint=>endpoint==='comments'?[posted]:[]};
+'''
+        code = 'const pr=' + json.dumps(pr) + ',posted=' + json.dumps(posted) + ';\n' + setup
+        code += '(async()=>{let recordedOverride=null;' + collection
+        code += '\nlet body="";if(recordedOverrides.length>0){' + rendering
+        code += '\nconsole.log(JSON.stringify({recordedOverrides,violations,body}));})().catch(e=>{console.error(e);process.exit(1)});'
+        result = subprocess.run(['node', '-e', code], cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(len(report['recordedOverrides']), 1)
+        self.assertEqual(report['violations'], [])
+        self.assertIn('Merge clearance gate', report['body'])
+        self.assertIn('authorization record', report['body'])
 
     def test_reply_wrapper_cannot_complete_an_unanswered_request(self):
         self.state['comments'] = [{'user': {'login': 'nathanjohnpayne'}, 'body': '@codex review', 'created_at': '2026-01-01T00:00:01Z'}]

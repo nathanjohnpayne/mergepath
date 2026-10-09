@@ -1070,25 +1070,28 @@ jobs:
               // the operator wrote before merging. These are recorded owner
               // instructions, not independent proof of the original chat.
               let recordedOverride = null;
-              if (prViolations.length > 0 && !hadHumanHold && !hadPolicyViolation) {
+              if (!hadHumanHold && !hadPolicyViolation) {
                 try {
                   const comments = await github.paginate(github.rest.issues.listComments, {
                     owner: context.repo.owner, repo: context.repo.repo,
                     issue_number: pr.number, per_page: 100,
                   });
-                  const { execFileSync } = require('child_process');
-                  const overrideReviews = await github.paginate(github.rest.pulls.listReviews, {
-                    owner: context.repo.owner, repo: context.repo.repo,
-                    pull_number: pr.number, per_page: 100,
-                  });
-                  const overrideInline = await github.paginate(github.rest.pulls.listReviewComments, {
-                    owner: context.repo.owner, repo: context.repo.repo,
-                    pull_number: pr.number, per_page: 100,
-                  });
-                  const result = JSON.parse(execFileSync('python3', ['scripts/workflow/owner-admin-override.py', 'audit'], {
-                    input: JSON.stringify({pr, author: authorIdentity, codex_bot_login: codexBotLogin, comments, reviews: overrideReviews, inline_comments: overrideInline, needs_human_review_at_merge: hadHumanLabel, hard_hold_at_merge: hadHumanHold || hadPolicyViolation}), encoding: 'utf8',
-                  }));
-                  if (result.recorded_override) recordedOverride = result;
+                  if (comments.some(comment => comment.user?.login === authorIdentity &&
+                      (comment.body || '').startsWith('<!-- mergepath-owner-admin-override:v1 -->'))) {
+                    const { execFileSync } = require('child_process');
+                    const overrideReviews = await github.paginate(github.rest.pulls.listReviews, {
+                      owner: context.repo.owner, repo: context.repo.repo,
+                      pull_number: pr.number, per_page: 100,
+                    });
+                    const overrideInline = await github.paginate(github.rest.pulls.listReviewComments, {
+                      owner: context.repo.owner, repo: context.repo.repo,
+                      pull_number: pr.number, per_page: 100,
+                    });
+                    const result = JSON.parse(execFileSync('python3', ['scripts/workflow/owner-admin-override.py', 'audit'], {
+                      input: JSON.stringify({pr, author: authorIdentity, codex_bot_login: codexBotLogin, comments, reviews: overrideReviews, inline_comments: overrideInline, needs_human_review_at_merge: hadHumanLabel, hard_hold_at_merge: hadHumanHold || hadPolicyViolation}), encoding: 'utf8',
+                    }));
+                    if (result.recorded_override) recordedOverride = result;
+                  }
                 } catch (e) {
                   core.warning(`Owner override record unreadable for #${pr.number}: ${e.message}`);
                 }
@@ -1123,6 +1126,7 @@ jobs:
                 for (const override of recordedOverrides) {
                   body += `- **#${override.number}** — [authorization record](${override.record.comment_url}) for \`${override.record.record.head_sha}\` at ${override.record.record.authorized_at}\n`;
                   for (const issue of override.issues) body += `  - Overridden: ${issue}\n`;
+                  for (const gate of override.record.record.observed_red_gates) body += `  - Recorded non-green gate: ${JSON.stringify(gate)}\n`;
                 }
               }
 

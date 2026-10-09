@@ -207,14 +207,22 @@ def codex_inflight(comments, reviews, inline, head, author, at=None, bot=BOT):
                              and comment.get('user', {}).get('login') == bot for comment in inline))]
     responses += [comment['created_at'] for comment in comments
                   if comment.get('user', {}).get('login') == bot and response_anchor(comment.get('body', ''), head)]
+    summaries = []
+    for comment in comments:
+        body = comment.get('body', '')
+        if comment.get('user', {}).get('login') != bot or not body.startswith('<!-- codex-pull-request-review-summary -->'):
+            continue
+        row = re.search(r'(?m)^\|\s*📝\s*\*\*Code Review\*\*\s*\|([^|\n]+)\|\s*`([0-9a-f]{7,40})`\s*\|[^|\n]+\|\s*$', body, re.I)
+        if row and head.lower().startswith(row[2].lower()):
+            status = 'completed' if re.search(r'\*\*Completed\*\*', row[1], re.I) else 'running' if re.search(r'\*\*Running\*\*', row[1], re.I) else 'unknown'
+            summaries.append((comment.get('updated_at', comment['created_at']), comment.get('id', 0), status))
+    summary = max(summaries) if summaries else None
+    if summary and summary[2] == 'completed':
+        responses.append(summary[0])  # Terminal delivery, never merge clearance.
     if requests and (not responses or max(requests) >= max(responses)):
         return True
-    for comment in comments:
-        if comment.get('user', {}).get('login') != bot or '<!-- codex-pull-request-review-summary -->' not in comment.get('body', ''):
-            continue
-        row = re.search(r'Code Review[^\n]*\|[^\n]*Running[^\n]*\|\s*`([0-9a-f]{7,40})`', comment['body'])
-        if row and head.startswith(row[1]) and (not responses or comment.get('updated_at', comment['created_at']) >= max(responses)):
-            return True
+    if summary and summary[2] == 'running' and (not responses or summary[0] >= max(responses)):
+        return True
     return False
 
 
