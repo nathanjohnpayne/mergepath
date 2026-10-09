@@ -107,6 +107,71 @@ test("bootstrap scrubs full fragment before I/O and accepts only a fixed scope g
     } else {assert.equal(calls.length, 1); assert.match(status.textContent, /Relaunch/);}
   }
 });
+function runBootstrap({hash = "", stored, storageThrows = false, onGet = null, respond = async () => ({ok: true, status: 200})} = {}) {
+  const source = fs.readFileSync(require.resolve("../mergepath/cockpit/bootstrap.js"), "utf8");
+  const calls = [], status = {textContent: ""}, store = new Map(stored === undefined ? [] : [["mergepath.cockpit.scope", stored]]);
+  const localStorage = {getItem: key => {const value = store.has(key) ? store.get(key) : null; if (onGet) onGet(store); return value;},
+    setItem: (key, value) => {calls.push(["store", value]); store.set(key, String(value));},
+    removeItem: key => {calls.push(["forget"]); store.delete(key);}};
+  const window = {location: {hash, replace: path => calls.push(["navigate", path])},
+    history: {replaceState: (_state, _title, path) => calls.push(["scrub", path])}};
+  Object.defineProperty(window, "localStorage", {get: () => {if (storageThrows) throw new Error("SecurityError"); return localStorage;}});
+  const context = {URLSearchParams, document: {getElementById: () => status}, window,
+    fetch: async (path, options) => {calls.push(["fetch", path, options]); return respond(path, options);}};
+  vm.runInNewContext(source, context);
+  return {calls, status, store, settle: () => new Promise(resolve => setImmediate(resolve))};
+}
+test("a successful launch stores the namespace for reopening; a refused one stores nothing (#1848)", async () => {
+  const scope = "b".repeat(43);
+  const ok = runBootstrap({hash: `#launch=fixture-only&scope=${scope}`}); await ok.settle();
+  assert.deepEqual(ok.calls.map(call => call[0]), ["scrub", "fetch", "store", "navigate"]);
+  assert.equal(ok.store.get("mergepath.cockpit.scope"), scope);
+  const refused = runBootstrap({hash: `#launch=fixture-only&scope=${scope}`, respond: async () => ({ok: false, status: 403})});
+  await refused.settle();
+  assert.equal(refused.store.size, 0); assert.match(refused.status.textContent, /Relaunch/);
+  const noStorage = runBootstrap({hash: `#launch=fixture-only&scope=${scope}`, storageThrows: true}); await noStorage.settle();
+  assert.deepEqual(noStorage.calls.at(-1), ["navigate", `/s/${scope}/`]);
+});
+test("the printed base URL reopens a live stored session after a scoped probe, without scrubbing history", async () => {
+  const scope = "c".repeat(43);
+  const run = runBootstrap({stored: scope}); await run.settle();
+  assert.equal(run.calls[0][0], "fetch"); assert.equal(run.calls[0][1], `/s/${scope}/api/session`);
+  assert.equal(run.calls[0][2].credentials, "same-origin"); assert.equal(run.calls[0][2].method, undefined);
+  assert.deepEqual(run.calls.at(-1), ["navigate", `/s/${scope}/`]);
+  assert.equal(run.calls.some(call => call[0] === "scrub"), false);
+});
+test("reopen forgets an ended session on 401 or 404 and keeps it across transient failures", async () => {
+  const scope = "d".repeat(43);
+  for (const status of [401, 404]) {
+    const run = runBootstrap({stored: scope, respond: async () => ({ok: false, status})}); await run.settle();
+    assert.equal(run.store.size, 0, `status ${status}`); assert.match(run.status.textContent, /session has ended/);
+    assert.equal(run.calls.some(call => call[0] === "navigate"), false);
+  }
+  // A launch in another tab stores a newer namespace while this probe is in flight.
+  let racing;
+  racing = runBootstrap({stored: scope, respond: async () => {
+    await Promise.resolve(); racing.store.set("mergepath.cockpit.scope", "f".repeat(43)); return {ok: false, status: 404};}});
+  await racing.settle();
+  assert.equal(racing.store.get("mergepath.cockpit.scope"), "f".repeat(43), "a newer launch survives a stale probe");
+  const busy = runBootstrap({stored: scope, respond: async () => ({ok: false, status: 503})}); await busy.settle();
+  assert.equal(busy.store.get("mergepath.cockpit.scope"), scope); assert.equal(busy.calls.some(call => call[0] === "navigate"), false);
+  const down = runBootstrap({stored: scope, respond: async () => {throw new TypeError("network");}}); await down.settle();
+  assert.equal(down.store.get("mergepath.cockpit.scope"), scope); assert.match(down.status.textContent, /not answering/);
+});
+test("reopen never fetches or navigates without a well-formed stored namespace", async () => {
+  for (const stored of [undefined, "", "../escape", "e".repeat(42), "/".repeat(43), "e".repeat(43) + "/x"]) {
+    const run = runBootstrap({stored}); await run.settle();
+    assert.equal(run.calls.some(call => call[0] === "fetch" || call[0] === "navigate"), false, String(stored));
+    assert.equal(run.store.size, 0); assert.match(run.status.textContent, /No Cockpit session in this browser/);
+  }
+  // A concurrent launch stores a valid namespace right after this tab read a malformed one.
+  let reads = 0;
+  const cleanup = runBootstrap({stored: "../escape", onGet: store => {if (++reads === 1) store.set("mergepath.cockpit.scope", "g".repeat(43));}});
+  await cleanup.settle();
+  assert.equal(cleanup.store.get("mergepath.cockpit.scope"), "g".repeat(43), "malformed-entry cleanup keeps a concurrent launch's namespace");
+  const blocked = runBootstrap({storageThrows: true}); await blocked.settle();
+  assert.equal(blocked.calls.length, 0); assert.match(blocked.status.textContent, /No Cockpit session/);
+});
 test("six states preserve common ordering; unavailable is not clear", () => {
   assert.equal(C.STATES.length, 6);
   assert.equal(C.worstState(["done", "running", "clear", "bump", "boulder"]), "boulder");
