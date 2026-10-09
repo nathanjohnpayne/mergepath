@@ -19,7 +19,7 @@ FIELDS = {'version', 'pr_url', 'head_sha', 'authorized_at', 'authorization_quote
 # or executable extensions whose expansion can hide an admin merge.
 BUILTIN_COMMANDS = {
     'agent-task', 'alias', 'api', 'attestation', 'auth', 'browse', 'cache',
-    'codespace', 'completion', 'config', 'gist', 'gpg-key', 'help', 'issue',
+    'codespace', 'completion', 'config', 'discussion', 'gist', 'gpg-key', 'help', 'issue',
     'label', 'licenses', 'org', 'pr', 'preview', 'project', 'release', 'repo',
     'ruleset', 'run', 'search', 'secret', 'skill', 'ssh-key', 'status',
     'variable', 'workflow',
@@ -169,7 +169,7 @@ def governing_bot(gh, repository, base):
     return codex.get('bot_login') or BOT
 
 
-def prepare(argv):
+def prepare(argv, *, check_only=False):
     parsed = merge_args(argv)
     if parsed is None:
         return
@@ -218,6 +218,14 @@ def prepare(argv):
     inflight = codex_inflight(comments, reviews, inline, head, os.environ['GH_AS_AUTHOR_RECORD_IDENTITY'], bot=bot)
     if inflight and not record['allow_codex_inflight']:
         raise ValueError('an unanswered Codex request requires explicit owner authorization')
+    if check_only:
+        final_pr = gh(*query, '--json', 'url,headRefOid,baseRefOid,labels')
+        labels = {label['name'] for label in final_pr['labels']}
+        if (final_pr['url'] != url or final_pr['headRefOid'] != head
+                or final_pr['baseRefOid'] != base or labels & {'human-hold', 'policy-violation'}
+                or ('needs-human-review' in labels and not record['allow_needs_human_review'])):
+            raise ValueError('PR tuple or hold state changed before thread mutation')
+        return  # Authorization semantics verified without any GitHub write.
     red = sorted({check.get('name') or check.get('context') or '<unnamed>' for check in pr['statusCheckRollup']
                   if (check.get('conclusion') or check.get('state')) not in ('SUCCESS', 'NEUTRAL', 'SKIPPED')})
     published = {**record, 'observed_red_gates': red, 'observed_codex_inflight': inflight,
@@ -290,8 +298,8 @@ if __name__ == '__main__':
             print(json.dumps(validate(json.load(sys.stdin), sys.argv[2], sys.argv[3], dt.datetime.now(dt.timezone.utc))))
         elif sys.argv[1:2] == ['audit']:
             print(json.dumps(audit(json.load(sys.stdin))))
-        elif sys.argv[1:2] == ['prepare']:
-            prepare(sys.argv[2:])
+        elif sys.argv[1:2] in (['prepare'], ['check']):
+            prepare(sys.argv[2:], check_only=sys.argv[1] == 'check')
         else:
             raise ValueError('usage: owner-admin-override.py prepare <gh argv...> | validate <URL> <HEAD> | audit < JSON')
     except (ValueError, KeyError, TypeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:

@@ -444,11 +444,37 @@ for ref in "${PR_REFS[@]}"; do
   fi
   # The owner record is scoped to the observed head. Bind it again at the
   # mutation boundary so a push during the read-only gates cannot reuse it.
-  mutation_target=$(gh_ro pr view "$num" --repo "$repo" --json url,headRefOid --jq '[.url,.headRefOid] | join("|")') || mutation_target=""
-  if [ "$mutation_target" != "$pr_url|$pr_head" ]; then
+  mutation_target=$(gh_ro pr view "$num" --repo "$repo" --json url,headRefOid,labels --jq '[.url,.headRefOid,([.labels[].name] | join(","))] | join("|")') || mutation_target=""
+  mutation_labels=${mutation_target##*|}
+  if [ "${mutation_target%|*}" != "$pr_url|$pr_head" ]; then
     printf '  ✗ PR URL/head moved or became unreadable before thread mutation — refusing --admin merge\n'
     OVERALL_RC=1
     continue
+  fi
+  case ",$mutation_labels," in
+    *,human-hold,*|*,policy-violation,*)
+      printf '  ✗ hard hold before thread mutation — refusing merge\n'
+      OVERALL_RC=1; continue ;;
+    *,needs-human-review,*)
+      if [ "$(printf '%s' "${authorization:-null}" | jq -r '.allow_needs_human_review // false')" != true ]; then
+        printf '  ✗ needs-human-review before thread mutation requires owner authorization\n'
+        OVERALL_RC=1; continue
+      fi ;;
+  esac
+  if [ "$pr_msstatus" = BLOCKED ]; then
+    # Reuse the writer's read-only semantic authorization check, including
+    # governing bot identity, escalation history and unanswered requests.
+    semantic_env=("GH_AS_AUTHOR_RECORD_IDENTITY=$pr_author"
+      "BREAK_GLASS_ADMIN=$pr_url@$pr_head"
+      "MERGEPATH_OWNER_ADMIN_AUTHORIZATION=$authorization")
+    if [ -n "${OP_PREFLIGHT_REVIEWER_PAT:-}" ]; then
+      semantic_env+=("GH_TOKEN=$OP_PREFLIGHT_REVIEWER_PAT")
+    fi
+    if ! env "${semantic_env[@]}" python3 "$SCRIPT_DIR/workflow/owner-admin-override.py" check \
+        gh pr merge "$num" --repo "$repo" --admin --match-head-commit "$pr_head"; then
+      printf '  ✗ semantic owner authorization refused before thread mutation\n'
+      OVERALL_RC=1; continue
+    fi
   fi
   rt_rc=0
   "$RESOLVE_THREADS" "$num" --repo "$repo" --auto-resolve-bots || rt_rc=$?

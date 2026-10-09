@@ -60,6 +60,8 @@ FIXTURE_ROOT="$SCRATCH/repo"
 mkdir -p "$FIXTURE_ROOT/scripts/workflow"
 cp "$SCRIPT" "$FIXTURE_ROOT/scripts/admin-merge-codeowners-blocked.sh"
 cp "$ROOT/scripts/workflow/owner-admin-override.py" "$FIXTURE_ROOT/scripts/workflow/owner-admin-override.py"
+mkdir -p "$FIXTURE_ROOT/scripts/lib"
+cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$FIXTURE_ROOT/scripts/lib/feedback-policy-helpers.sh"
 cat > "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" <<'STUB'
 #!/usr/bin/env bash
 echo THREAD-MUTATION >> "$GH_ARGV_LOG"
@@ -93,11 +95,14 @@ case "$1" in
     case "$2" in
       view)
         case "$*" in
+          *'--json url,headRefOid,baseRefOid,labels'*)
+            echo '{"url":"https://github.com/test/current/pull/99999","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","baseRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","labels":[],"statusCheckRollup":[]}'
+            exit 0 ;;
           *'--json url,headRefOid'*)
             if [ "${STUB_MOVE_BEFORE_RESOLVE:-0}" = 1 ]; then
-              echo 'https://github.com/test/current/pull/99999|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+              echo 'https://github.com/test/current/pull/99999|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|'
             else
-              echo 'https://github.com/test/current/pull/99999|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+              echo "https://github.com/test/current/pull/99999|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|${STUB_HOLD_LABEL:-}"
             fi
             exit 0
             ;;
@@ -130,6 +135,11 @@ case "$1" in
           fi
         fi
         ;;
+      --paginate)
+        if [ "${STUB_CODEX_INFLIGHT:-0}" = 1 ] && [[ "$*" == *issues/*/comments* ]]; then
+          echo '[[{"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-01-01T00:01:00Z"}]]'
+        else echo '[[]]'; fi ;;
+      repos/*/contents/.github/review-policy.yml*) echo '{"encoding":"base64","content":"e30="}' ;;
       repos/*/collaborators/*/permission) echo write ;;
       *) echo '{}' ;;
     esac
@@ -411,6 +421,31 @@ if [ "$RUN_RC" -ne 0 ] && grep -q 'before thread mutation' <<<"$RUN_OUT" && ! gr
   pass=$((pass + 1)); echo "PASS: replacement head refuses before thread mutation"
 else
   fail=$((fail + 1)); echo "FAIL: replacement head crossed the thread mutation boundary: $RUN_OUT"
+fi
+
+for label in human-hold policy-violation needs-human-review; do
+  GH_ARGV_LOG="$SCRATCH/hold-$label.log"; : > "$GH_ARGV_LOG"
+  STUB_HOLD_LABEL="$label" STUB_QUALIFIED_REVIEW=1 STUB_AUTHORIZATION_FILE="$SCRATCH/current-auth.json" run_admin_merge "$SCRATCH/p1_ok.json" "$SCRATCH/p2_ok.json"
+  if [ "$RUN_RC" -ne 0 ] && grep -q 'before thread mutation' <<<"$RUN_OUT" && ! grep -q 'THREAD-MUTATION' "$GH_ARGV_LOG"; then
+    pass=$((pass + 1)); echo "PASS: $label refuses before thread mutation"
+  else
+    fail=$((fail + 1)); echo "FAIL: $label crossed the thread mutation boundary: $RUN_OUT"
+  fi
+done
+
+GH_ARGV_LOG="$SCRATCH/semantic-clean.log"; : > "$GH_ARGV_LOG"
+STUB_QUALIFIED_REVIEW=1 STUB_AUTHORIZATION_FILE="$SCRATCH/current-auth.json" run_admin_merge "$SCRATCH/p1_ok.json" "$SCRATCH/p2_ok.json"
+if grep -q THREAD-MUTATION "$GH_ARGV_LOG"; then
+  pass=$((pass + 1)); echo "PASS: semantic authorization permits the thread gate without posting a comment"
+else
+  fail=$((fail + 1)); echo "FAIL: valid semantic authorization never reached the thread gate: $RUN_OUT"
+fi
+GH_ARGV_LOG="$SCRATCH/semantic-inflight.log"; : > "$GH_ARGV_LOG"
+STUB_CODEX_INFLIGHT=1 STUB_QUALIFIED_REVIEW=1 STUB_AUTHORIZATION_FILE="$SCRATCH/current-auth.json" run_admin_merge "$SCRATCH/p1_ok.json" "$SCRATCH/p2_ok.json"
+if [ "$RUN_RC" -ne 0 ] && grep -q 'semantic owner authorization refused before thread mutation' <<<"$RUN_OUT" && ! grep -q THREAD-MUTATION "$GH_ARGV_LOG"; then
+  pass=$((pass + 1)); echo "PASS: unanswered Codex request refuses before thread mutation"
+else
+  fail=$((fail + 1)); echo "FAIL: unanswered request crossed the thread mutation boundary: $RUN_OUT"
 fi
 
 if [ "$fail" -eq 0 ]; then

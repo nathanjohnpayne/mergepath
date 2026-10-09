@@ -80,6 +80,18 @@ print(json.dumps(result))
         calls = [json.loads(line) for line in (self.path / 'calls').read_text().splitlines()]
         self.assertEqual(calls[-1][:3], ['api', '--paginate', '--slurp'])
 
+    def test_read_only_authorization_check_performs_no_github_write(self):
+        (self.path / 'state.json').write_text(json.dumps(self.state))
+        env = {**os.environ, 'PATH': str(self.path) + os.pathsep + os.environ['PATH'],
+               'OVERRIDE_CASE': str(self.path), 'GH_AS_AUTHOR_RECORD_IDENTITY': 'nathanjohnpayne',
+               'BREAK_GLASS_ADMIN': URL + '@' + HEAD,
+               'MERGEPATH_OWNER_ADMIN_AUTHORIZATION': json.dumps(AUTH)}
+        result = subprocess.run(['python3', str(SCRIPT), 'check', 'gh', 'pr', 'merge', '123',
+                                 '--admin', '--match-head-commit', HEAD], env=env,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.path / 'posted.json').exists())
+
     def test_different_head_and_boolean_pin_refuse_without_post(self):
         for pin in ('1', URL + '@' + 'b' * 40):
             result = self.run_prepare(pin=pin)
@@ -195,7 +207,7 @@ print(json.dumps(result))
             with self.subTest(command=command), self.assertRaisesRegex(ValueError, 'literal built-in'):
                 override.prepare(['gh', *command])
         self.assertFalse((self.path / 'calls').exists())
-        for command in ('api', 'issue', 'run', 'repo', 'alias'):
+        for command in ('api', 'issue', 'run', 'repo', 'alias', 'discussion'):
             self.assertIsNone(override.merge_args(['gh', command, '--help']))
 
     def test_inherited_repository_options_before_merge_are_recognized(self):
