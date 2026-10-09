@@ -2429,7 +2429,10 @@ crc_render_request_evidence() {
 log "gate (b): checking for latest-state APPROVED review from a reviewer identity"
 
 REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
-COMMENTS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments")
+COMMENTS_JSON='[]'
+if [ "$CODEX_ENABLED" = "true" ] && [ "$APPROVAL_READINESS_ONLY" != "1" ]; then
+  COMMENTS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments")
+fi
 
 # Build a JSON array of reviewer logins for the filter.
 REVIEWERS_JSON=$(echo "$REVIEWERS" | jq -R . | jq -s .)

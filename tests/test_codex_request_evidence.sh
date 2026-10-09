@@ -47,7 +47,8 @@ case "$1" in
   repos/owner/repo/issues/comments/123/reactions) [ "$ACK_READ" != error ] || exit 1; cat "$FIXTURES/ack" ;;
   repos/owner/repo/issues/comments/124/reactions) echo '[]' ;;
   repos/owner/repo/issues/99/reactions) printf '%s\n' "$ISSUE_REACTIONS" ;;
-  repos/owner/repo/issues/99/timeline|repos/owner/repo/pulls/99/comments) echo '[]' ;;
+  repos/owner/repo/issues/99/timeline) echo '[]' ;;
+  repos/owner/repo/pulls/99/comments) [ "${INLINE_COMMENTS_FAIL:-0}" != 1 ] || exit 1; echo '[]' ;;
   graphql) echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}' ;;
   *) echo "unexpected $*" >&2; exit 99 ;;
 esac
@@ -398,5 +399,22 @@ jq -e '.review.id == 789 and (.review.body | length) == 262144
   and .findings[0].blocking == false' "$DIR/large-scan" >/dev/null
 PASS=$((PASS + 1))
 echo "PASS: requester scans and emits large review and finding bodies over stdin"
+
+# Disabled Codex and approval-readiness paths do not depend on Codex inline reads.
+for mode in disabled readiness; do
+  policy="$DIR/substitute-disabled-policy.yml"
+  flag=''
+  if [ "$mode" = readiness ]; then policy="$DIR/substitute-policy.yml"; flag=--approval-readiness-only; fi
+  : >"$DIR/calls"
+  rc=0
+  PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=no-inline \
+    INLINE_COMMENTS_FAIL=1 PR_BODY='Authoring-Agent: claude' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+    MERGEPATH_REVIEW_POLICY_PATH="$policy" \
+    bash "$DIR/scripts/codex-review-check.sh" ${flag:+"$flag"} 99 owner/repo > "$DIR/out" 2>&1 || rc=$?
+  if [ "$rc" != 0 ] || grep -q '^repos/owner/repo/pulls/99/comments$' "$DIR/calls"; then
+    cat "$DIR/out"; echo "FAIL $mode depends on irrelevant inline reads rc=$rc"; exit 1
+  fi
+  PASS=$((PASS + 1)); echo "PASS: $mode skips irrelevant inline reads"
+done
 
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"
