@@ -107,10 +107,10 @@ test("bootstrap scrubs full fragment before I/O and accepts only a fixed scope g
     } else {assert.equal(calls.length, 1); assert.match(status.textContent, /Relaunch/);}
   }
 });
-function runBootstrap({hash = "", stored, storageThrows = false, respond = async () => ({ok: true, status: 200})} = {}) {
+function runBootstrap({hash = "", stored, storageThrows = false, onGet = null, respond = async () => ({ok: true, status: 200})} = {}) {
   const source = fs.readFileSync(require.resolve("../mergepath/cockpit/bootstrap.js"), "utf8");
   const calls = [], status = {textContent: ""}, store = new Map(stored === undefined ? [] : [["mergepath.cockpit.scope", stored]]);
-  const localStorage = {getItem: key => store.has(key) ? store.get(key) : null,
+  const localStorage = {getItem: key => {const value = store.has(key) ? store.get(key) : null; if (onGet) onGet(store); return value;},
     setItem: (key, value) => {calls.push(["store", value]); store.set(key, String(value));},
     removeItem: key => {calls.push(["forget"]); store.delete(key);}};
   const window = {location: {hash, replace: path => calls.push(["navigate", path])},
@@ -164,6 +164,11 @@ test("reopen never fetches or navigates without a well-formed stored namespace",
     assert.equal(run.calls.some(call => call[0] === "fetch" || call[0] === "navigate"), false, String(stored));
     assert.equal(run.store.size, 0); assert.match(run.status.textContent, /No Cockpit session in this browser/);
   }
+  // A concurrent launch stores a valid namespace right after this tab read a malformed one.
+  let reads = 0;
+  const cleanup = runBootstrap({stored: "../escape", onGet: store => {if (++reads === 1) store.set("mergepath.cockpit.scope", "g".repeat(43));}});
+  await cleanup.settle();
+  assert.equal(cleanup.store.get("mergepath.cockpit.scope"), "g".repeat(43), "malformed-entry cleanup keeps a concurrent launch's namespace");
   const blocked = runBootstrap({storageThrows: true}); await blocked.settle();
   assert.equal(blocked.calls.length, 0); assert.match(blocked.status.textContent, /No Cockpit session/);
 });

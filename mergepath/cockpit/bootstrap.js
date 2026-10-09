@@ -30,10 +30,6 @@ function forget(expected) {
     if (store && store.getItem(STORED_SCOPE) === expected) store.removeItem(STORED_SCOPE);
   } catch { /* nothing to clear */ }
 }
-function recall() {
-  const value = rawStored();
-  return typeof value === "string" && SCOPE.test(value) ? value : null;
-}
 
 async function establishSession(status) {
   if (!launch || !SCOPE.test(scope || "")) {
@@ -62,9 +58,11 @@ async function establishSession(status) {
 // the scoped session route confirms the cookie is still valid. No secret is
 // ever printed: the namespace never leaves this origin's storage.
 async function reopenSession(status) {
-  let stored = recall();
+  // Validate and clean up from ONE read: a second read could pick up a valid
+  // namespace a concurrent launch stored in between, and then delete it.
+  const raw = rawStored();
+  let stored = typeof raw === "string" && SCOPE.test(raw) ? raw : null;
   if (!stored) {
-    const raw = rawStored();
     if (raw !== null) forget(raw);
     status.textContent = "No Cockpit session in this browser. Open the Cockpit from the browser scripts/cockpit.sh launched, or relaunch it.";
     return;
