@@ -12,7 +12,10 @@ printf '%s' "$metadata" | jq -e --argjson pr "$pr" --arg head "$head" --arg base
   .number == $pr and .head.sha == $head and .base.sha == $base
   and (.head.ref | type == "string") and (.user.login | type == "string")
 ' >/dev/null || exit 2
-config=$(ruby -rjson -ryaml -e 'p=YAML.safe_load(File.read(ARGV[0]), aliases: false); abort "policy must be an object" unless p.is_a?(Hash); puts JSON.generate(p)' "$policy") || exit 2
+# shellcheck source=../lib/feedback-policy-helpers.sh
+. "$root/../lib/feedback-policy-helpers.sh"
+config=$(policy_yaml_to_json "$policy") || exit 2
+jq -e 'type == "object"' <<<"$config" >/dev/null || exit 2
 enabled=$(jq -r 'if .propagation_prs.enabled == null then true else .propagation_prs.enabled end' <<<"$config")
 case "$enabled" in false) exit 1 ;; true) ;; *) exit 2 ;; esac
 prefix=$(jq -er '.propagation_prs.branch_prefix // "mergepath-sync/" | select(type == "string" and length > 0)' <<<"$config") || exit 2

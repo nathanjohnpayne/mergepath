@@ -235,6 +235,15 @@ os.execv(argv[0],argv)
         self.assertEqual(json.loads(result.stdout), {
             'source_sha': self.source, 'head_sha': self.head, 'base_sha': self.base})
 
+    def test_faithful_lane_uses_available_yaml_parser_without_ruby(self):
+        ruby = self.path / 'bin/ruby'
+        ruby.write_text('#!/bin/sh\nprintf called > "$LANE_RUBY_LOG"\nexit 127\n')
+        ruby.chmod(0o755)
+        self.environment['LANE_RUBY_LOG'] = str(self.path / 'ruby-called')
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.path / 'ruby-called').exists())
+
     def test_forged_bot_marker_cannot_exempt_modified_workflow(self):
         self.consumer_file.write_text('name: PR-controlled unsafe workflow\n')
         self.head = self.commit(self.consumer)

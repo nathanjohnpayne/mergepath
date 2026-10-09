@@ -2351,6 +2351,7 @@ paths:
     # already inside this kit; the two scripts/lib/ deps are declared here.
     requires:
       - "scripts/lib/template-substitution.sh"   # verify-propagation-pr.sh templated render (#531)
+      - "scripts/lib/feedback-policy-helpers.sh" # verify-live-propagation.sh shared YAML parser (#1546)
       - "scripts/lib/manifest-fact-helpers.sh"   # verify-propagation-pr.sh consumer-facts load (#531)
       # external_review_fingerprint.sh + external_review_carryforward.sh (both
       # in this kit) hard-source it for their sha reads (#799). Those two
