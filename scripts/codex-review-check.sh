@@ -37,7 +37,7 @@
 #         - **Issue-comment verdict (#600/#567):** a Codex-bot PR issue
 #           comment carrying its stable affirmative verdict phrasing
 #           ("Didn't find any major issues") AND a `Reviewed commit:
-#           <sha>` line whose sha prefixes the current HEAD_SHA
+#           <sha>` line whose complete 40-character SHA equals HEAD_SHA
 #           (HEAD-anchored), with NO unaddressed P0/P1 inline findings
 #           on HEAD. Codex routes its verdict here rather than to a
 #           review object, and its 👍 reaction expires after
@@ -2205,8 +2205,7 @@ fi  # end REQUIRE_CI_GREEN
 #      ("Didn't find any major issues") — a structured shape, not
 #      open-ended NLP;
 #   3. body carries a `Reviewed commit: <sha>` line whose <sha> is a
-#      prefix of the current HEAD_SHA (HEAD-anchored; Codex abbreviates
-#      the sha, so match by prefix, not equality).
+#      complete 40-character SHA equal to HEAD_SHA (HEAD-anchored).
 # A findings-bearing verdict, a changes-requested verdict, a stale-HEAD
 # verdict (Reviewed commit != HEAD), or unrecognized text does NOT match —
 # the signal stays empty and the gate falls through to its other
