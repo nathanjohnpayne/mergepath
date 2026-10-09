@@ -372,4 +372,19 @@ for anchor in missing prefix malformed conflicting exact; do
   PASS=$((PASS + 1)); echo "PASS: diagnostic anchor $anchor"
 done
 
+# Resolver infrastructure errors must never look like an account-block waiver.
+mv "$DIR/scripts/workflow/resolve-codex-verdict-anchors.py" "$DIR/resolver.saved"
+for mode in '' --diagnostic-signal-only --approval-readiness-only; do
+  rc=0
+  PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=diagnostic-anchor \
+    PR_BODY='' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+    MERGEPATH_REVIEW_POLICY_PATH="$DIR/policy.yml" \
+    bash "$DIR/scripts/codex-review-check.sh" ${mode:+"$mode"} 99 owner/repo > "$DIR/out" 2>&1 || rc=$?
+  if [ "$rc" != 3 ]; then
+    cat "$DIR/out"; echo "FAIL resolver infrastructure $mode rc=$rc"; exit 1
+  fi
+  PASS=$((PASS + 1)); echo "PASS: resolver infrastructure ${mode:-normal}"
+done
+mv "$DIR/resolver.saved" "$DIR/scripts/workflow/resolve-codex-verdict-anchors.py"
+
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"
