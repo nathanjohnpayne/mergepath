@@ -1,3 +1,7 @@
+---
+spec_id: merge_review_disagreement
+---
+
 # Merge Review Disagreement
 
 The PreToolUse merge guard reads every page of the PR's reviews before allowing any merge command. For each non-author reviewer, its latest opinionated review controls: `COMMENTED` and `PENDING` do not supersede an opinion; `APPROVED` and `DISMISSED` release a previous `CHANGES_REQUESTED`. An outstanding change request blocks even when it names an older head. Bot and human reviewers follow the same rule because either can carry an active GitHub change request.
