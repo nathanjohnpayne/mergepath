@@ -192,6 +192,7 @@ AUDIT_CMD=""
 HUB_REPO=""
 SUMMARY_FILE=""
 REQUIRE_ADMIN_ENFORCEMENT=0
+REQUIRE_CREDENTIAL_ISOLATION=0
 # Caller-supplied answer to "what is this repo's default branch". Set by
 # --fleet on each child audit, which has already resolved it from
 # GET /repos/{owner}/{repo}; see --default-branch below.
@@ -221,6 +222,8 @@ while [ $# -gt 0 ]; do
         echo "Error: --default-branch requires a non-empty value" >&2; exit 1
       fi
       DEFAULT_BRANCH_HINT="$2"; shift 2 ;;
+    --require-credential-isolation)
+      REQUIRE_CREDENTIAL_ISOLATION=1; shift ;;
     --require-admin-enforcement)
       # Off by default in single-repo mode. The fleet loop below opts the
       # staged #937 consumers in explicitly; the hub remains excepted. Kept
@@ -254,7 +257,7 @@ while [ $# -gt 0 ]; do
       cat <<EOF
 Usage: scripts/audit-branch-protection.sh [--repo owner/name] [--branch <name>]
                                           [--default-branch <name>]
-                                          [--require-admin-enforcement]
+                                          [--require-admin-enforcement] [--require-credential-isolation]
        scripts/audit-branch-protection.sh --fleet [--branch <name>]
                                           [--hub-repo owner/name]
                                           [--manifest <path>]
@@ -278,6 +281,11 @@ repository admin). A ruleset payload that answers neither bypass
 question exits 2. In --fleet mode it is passed only for the staged #937
 consumer nathanjohnpayne/fiveacross. The hub and unactivated consumers
 retain the admin recovery path. Available for ad-hoc audits.
+
+--require-credential-isolation additionally audits authority secret names and
+merge-queue-policy's main-only branch policy with admin bypass off. It requires
+Secrets:read and Environments:read as well as the ordinary protection reads;
+it never retrieves secret values. The fleet mode forwards this option.
 
 --default-branch supplies this repo's default branch instead of reading
 it from GET /repos/{owner}/{repo}; only \`~DEFAULT_BRANCH\` ruleset
@@ -580,6 +588,7 @@ fleet_audit() {
     if [ "$r" = "nathanjohnpayne/fiveacross" ] && [ "$r" != "$hub" ]; then
       child_args+=(--require-admin-enforcement)
     fi
+    if [ "$REQUIRE_CREDENTIAL_ISOLATION" -eq 1 ]; then child_args+=(--require-credential-isolation); fi
     "$audit_cmd" --repo "$r" --branch "$repo_branch" "${child_args[@]}" >"$tmp" 2>&1 || rc=$?
     out="$(cat "$tmp")"
     case "$rc" in
@@ -819,6 +828,7 @@ if [ -z "$PROT_BODY" ] && [ -z "$PROT_STATUS" ]; then
   PROT_BODY="$PROT_RAW"
 fi
 
+GAPS=0
 HAVE_CLASSIC=0
 case "$PROT_STATUS" in
   200)
@@ -1174,7 +1184,7 @@ if [ "$SCAN_RULESETS" -eq 1 ]; then
 
   if [ -z "$MATCHING_IDS" ] && [ "$HAVE_CLASSIC" -eq 0 ]; then
     echo "FAIL: no rulesets target $BRANCH on $REPO. PR merges are completely unprotected."
-    exit 3
+    GAPS=1
   fi
 
   # Step B: extract required status checks ONLY from the rulesets that
@@ -1373,7 +1383,7 @@ if [ -z "$REQUIRED_CHECKS" ]; then
   echo "        Settings → Branches → Branch protection rule for '$BRANCH'"
   echo "        → Require status checks to pass before merging"
   echo "        → Add: ${CANONICAL_REQUIRED_CHECKS[*]}"
-  exit 3
+  GAPS=1
 fi
 
 echo "Required status checks currently enforced:"
@@ -1389,8 +1399,6 @@ echo ""
 # Both are reported in one run — a repo that fixes the first and not the
 # second is still not enforcing anything, and finding that out a week
 # later is exactly the latency #774 exists to remove.
-GAPS=0
-
 MISSING=()
 for check in "${CANONICAL_REQUIRED_CHECKS[@]}"; do
   if ! echo "$REQUIRED_CHECKS" | grep -Fxq "$check"; then
@@ -1505,6 +1513,22 @@ if [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 1 ]; then
   else
     echo "Admin enforcement: OK — no bypass actor can skip a canonical required check on $BRANCH."
   fi
+fi
+
+if [ "$REQUIRE_CREDENTIAL_ISOLATION" -eq 1 ]; then
+  resolve_repo_default_branch
+  if [ -z "$REPO_DEFAULT_BRANCH" ]; then
+    echo "ERROR: could not resolve the repository default branch for credential isolation" >&2
+    exit 2
+  fi
+  isolation_rc=0
+  python3 "$(dirname "${BASH_SOURCE[0]}")/audit-credential-isolation.py" \
+    --repo "$REPO" --branch "$REPO_DEFAULT_BRANCH" || isolation_rc=$?
+  case "$isolation_rc" in
+    0) ;;
+    3) GAPS=$((GAPS + 1)) ;;
+    *) exit 2 ;;
+  esac
 fi
 
 if [ "$GAPS" -eq 0 ]; then
