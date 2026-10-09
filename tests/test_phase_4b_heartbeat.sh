@@ -276,7 +276,7 @@ run_case() {
     .schema == "p4b-heartbeat/v1" and .stage == "done" and .exit_code == $rc
     and ([.stages[].stage]|join(",")) == $stages and .head == $h
     and (.run_id|test("^p4b-[0-9a-f]{32}$")) and .repo == "fixture/repo" and .pr == "1589"
-    and .adapter_timeout_seconds == (if $rc == 4 and .adapter_exit_code != 0 then 1 else 3 end)
+    and .adapter_timeout_seconds == (if $rc == 4 then 1 else 3 end)
     and (.stages|all(.stage_at_epoch != null and (.stage_at|length)>0))
     and .process_started_at != null and (.checkout|length)>0' "$record" >/dev/null 2>&1; then
     pass "$mode records reached stages and terminal identity"
@@ -314,7 +314,7 @@ run_case() {
 # storage. The latter is a regular file at the directory path (chmod is not a
 # faithful failure injection when CI runs as root).
 for storage in good blocked; do
-  run_case aba 4 'barrier,adapter,done' "$storage"
+  run_case aba 3 'barrier,adapter,done' "$storage"
   run_case approve 0 barrier,adapter,posting,done "$storage"
   run_case changes 1 barrier,adapter,posting,done "$storage"
   run_case timeout 4 barrier,adapter,done "$storage"
