@@ -229,6 +229,7 @@ print(json.dumps(result))
             ['graphql', '-f', 'query=mutation { mergePullRequest(input:{pullRequestId:"PR_x"}) {clientMutationId}}'],
             ['graphql', '--raw-field=query=mutation { m:mergePullRequest(input:{}) {clientMutationId}}'],
             ['graphql', '-Fquery=@payload.graphql'],
+            ['graphql', '-F', 'query=@-'],
             ['graphql', '--input', 'payload.json'],
             ['graphql', '--input=-'],
             ['graphql', '-f', 'query=query { viewer {login}}', '-f', 'query=mutation {mergePullRequest(input:{}){clientMutationId}}'],
@@ -245,6 +246,10 @@ print(json.dumps(result))
             ['graphql', '-f', 'query=query {viewer {login}}'],
             ['graphql', '-f', 'query=mutation {addComment(input:{subjectId:"I_x",body:"hello"}) {clientMutationId}}'],
             ['graphql', '--help'],
+            ['repos/example/repo/issues', '--preview', 'some-preview'],
+            ['--preview', 'some-preview', 'repos/example/repo/issues'],
+            ['repos/example/repo/issues', '-p', 'some-preview'],
+            ['repos/example/repo/issues', '-psome-preview'],
         ]
         for request in requests:
             with self.subTest(request=request):
@@ -301,6 +306,10 @@ print(json.dumps(result))
         self.assertFalse(override.audit(payload)['recorded_override'])
         response['user']['login'] = 'custom-codex[bot]'
         self.assertTrue(override.audit(payload)['recorded_override'])
+        request['updated_at'] = '2026-01-01T00:03:00Z'
+        self.assertFalse(override.audit(payload)['recorded_override'])
+        request['body'] = 'edited away'
+        self.assertFalse(override.audit(payload)['recorded_override'])
 
 
 if __name__ == '__main__':

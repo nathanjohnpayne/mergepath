@@ -55,7 +55,7 @@ def reject_merge_api(args):
     fields, opaque = False, False
     value_flags = {'-X', '--method', '-f', '--raw-field', '-F', '--field',
                    '-H', '--header', '--input', '--hostname', '-q', '--jq',
-                   '-t', '--template', '--cache'}
+                   '-t', '--template', '--cache', '-p', '--preview'}
     while args:
         token = args.pop(0)
         flag, value = token, None
@@ -67,7 +67,7 @@ def reject_merge_api(args):
             value = args.pop(0)
         elif token.startswith('--') and '=' in token:
             flag, value = token.split('=', 1)
-        elif len(token) > 2 and token[:2] in ('-X', '-f', '-F', '-H', '-q', '-t'):
+        elif len(token) > 2 and token[:2] in ('-X', '-f', '-F', '-H', '-q', '-t', '-p'):
             flag, value = token[:2], token[2:]
         if flag in ('-X', '--method'):
             method = value.upper()
@@ -181,6 +181,13 @@ def response_anchor(body, head):
 
 def codex_inflight(comments, reviews, inline, head, author, at=None, bot=BOT):
     """Observe unanswered requests without granting response clearance."""
+    # An edited author comment no longer proves its pre-merge command body.
+    # Keep that uncertainty blocking instead of deleting possible requests.
+    if at is not None and any(comment.get('user', {}).get('login') == author
+            and comment.get('created_at', '') <= at < comment.get('updated_at', comment.get('created_at', ''))
+            for comment in comments):
+        return True
+
     def visible(item, field):
         return at is None or (item.get(field, '') <= at
                               and item.get('updated_at', item.get(field, '')) <= at)
