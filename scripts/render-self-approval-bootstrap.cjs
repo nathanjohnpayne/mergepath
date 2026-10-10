@@ -41,6 +41,11 @@ function between(text, begin, end, label) {
   return text.slice(beginAt + begin.length, endAt).replace(/^\r?\n/, '').replace(/\r?\n$/, '');
 }
 
+function markedBlock(text, begin, end, label) {
+  between(text, begin, end, label);
+  return text.slice(text.indexOf(begin), text.indexOf(end) + end.length);
+}
+
 const mode = process.argv[2] || '--check';
 if (!['--check', '--write'].includes(mode) || process.argv.length > 3) {
   fail('usage: scripts/render-self-approval-bootstrap.cjs [--check|--write]');
@@ -75,18 +80,26 @@ const labelGenerated = [
   ),
   labelTargetEnd,
 ].join('\n');
-const currentBody = between(workflow, targetBegin, targetEnd, workflowPath);
-const current = `${targetBegin}\n${currentBody}\n${targetEnd}`;
-const labelCurrentBody = between(
-  workflow,
-  labelTargetBegin,
-  labelTargetEnd,
-  workflowPath,
-);
-const labelCurrent =
-  `${labelTargetBegin}\n${labelCurrentBody}\n${labelTargetEnd}`;
+const approvalPath = path.join(root, 'scripts/workflow/approval-triage.cjs');
+const approvalImplementation = between(fs.readFileSync(approvalPath, 'utf8'),
+  '// BEGIN APPROVAL TRIAGE IMPLEMENTATION', '// END APPROVAL TRIAGE IMPLEMENTATION', approvalPath);
+const approvalBlocks = ['TRIAGE READ BOOTSTRAP', 'APPROVAL TRIAGE BOOTSTRAP'].map(label => {
+  const begin = `            // BEGIN ${label}`;
+  const end = `            // END ${label}`;
+  const current = markedBlock(workflow, begin, end, workflowPath);
+  const generated = [begin,
+    '            // Generated from scripts/workflow/approval-triage.cjs. Do not edit.',
+    '            function bootstrapApprovalTriage() {',
+    ...approvalImplementation.split(/\r?\n/).map(line => line ? `              ${line}` : ''),
+    '              return {retryGithubRead, preserveApprovalAfterTriageFailure, selectApprovalTriage};',
+    '            }', end].join('\n');
+  return {current, generated};
+});
+const current = markedBlock(workflow, targetBegin, targetEnd, workflowPath);
+const labelCurrent = markedBlock(workflow, labelTargetBegin, labelTargetEnd, workflowPath);
 
-if (current === generated && labelCurrent === labelGenerated) {
+if (current === generated && labelCurrent === labelGenerated &&
+    approvalBlocks.every(block => block.current === block.generated)) {
   process.stdout.write(
     'render-self-approval-bootstrap: PASS (generated mirrors are current)\n',
   );
@@ -97,9 +110,12 @@ if (mode === '--check') {
   fail('generated workflow bootstrap is stale; run scripts/render-self-approval-bootstrap.cjs --write');
 }
 
-const updated = workflow
+let updated = workflow
   .replace(current, () => generated)
   .replace(labelCurrent, () => labelGenerated);
+for (const block of approvalBlocks) {
+  updated = updated.replace(block.current, () => block.generated);
+}
 if (updated === workflow) {
   fail('could not replace the workflow bootstrap blocks');
 }

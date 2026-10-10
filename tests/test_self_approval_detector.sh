@@ -24,8 +24,9 @@ trap 'rm -f "$BOOTSTRAP_MODULE" "$DISMISS_MODULE" "$PROTECTION_MODULE" "$SNAPSHO
 # JavaScript replacement strings interpret $&, $`, $', $1, $<name>, and $$.
 # Canonical detector source is arbitrary text, so the renderer must preserve
 # every such sequence byte-for-byte in both generated workflow mirrors.
-mkdir -p "$RENDER_FIXTURE/scripts" "$RENDER_FIXTURE/.github/workflows"
+mkdir -p "$RENDER_FIXTURE/scripts/workflow" "$RENDER_FIXTURE/.github/workflows"
 cp "$DETECTOR" "$RENDER_FIXTURE/scripts/self-approval-detector.cjs"
+cp "$ROOT/scripts/workflow/approval-triage.cjs" "$RENDER_FIXTURE/scripts/workflow/approval-triage.cjs"
 cp "$RENDERER" "$RENDER_FIXTURE/scripts/render-self-approval-bootstrap.cjs"
 cp "$WORKFLOW" "$RENDER_FIXTURE/.github/workflows/agent-review.yml"
 RENDER_DETECTOR="$RENDER_FIXTURE/scripts/self-approval-detector.cjs" node <<'NODE'
@@ -52,6 +53,26 @@ if ! node "$RENDER_FIXTURE/scripts/render-self-approval-bootstrap.cjs" --write \
   cat "$RENDER_FIXTURE/write.err" "$RENDER_FIXTURE/check.err" >&2
   exit 1
 fi
+
+# A mixed-CRLF approval block must be replaced exactly, even if the other
+# blocks also change and would make an aggregate write appear successful.
+RENDER_WORKFLOW="$RENDER_FIXTURE/.github/workflows/agent-review.yml" \
+RENDER_APPROVAL="$RENDER_FIXTURE/scripts/workflow/approval-triage.cjs" node <<'NODE'
+const fs = require('fs');
+const file = process.env.RENDER_WORKFLOW;
+let workflow = fs.readFileSync(file, 'utf8');
+const begin = workflow.indexOf('            // BEGIN TRIAGE READ BOOTSTRAP');
+const endMarker = '            // END TRIAGE READ BOOTSTRAP';
+const end = workflow.indexOf(endMarker, begin) + endMarker.length;
+workflow = workflow.slice(0, begin) + workflow.slice(begin, end).replace(/\n/g, '\r\n') + workflow.slice(end);
+fs.writeFileSync(file, workflow);
+const helper = process.env.RENDER_APPROVAL;
+fs.writeFileSync(helper, fs.readFileSync(helper, 'utf8').replace(
+  '// BEGIN APPROVAL TRIAGE IMPLEMENTATION',
+  '// BEGIN APPROVAL TRIAGE IMPLEMENTATION\n// mixed-line-ending replacement regression'));
+NODE
+node "$RENDER_FIXTURE/scripts/render-self-approval-bootstrap.cjs" --write >/dev/null
+node "$RENDER_FIXTURE/scripts/render-self-approval-bootstrap.cjs" --check >/dev/null
 awk '
   /BEGIN SELF-APPROVAL BOOTSTRAP/ { capture=1; next }
   /END SELF-APPROVAL BOOTSTRAP/   { capture=0 }
@@ -1044,6 +1065,102 @@ main().catch(error => {
   console.error(error);
   process.exitCode = 1;
 });
+NODE
+
+# #1525: invoke the actual github-script guard with fake read/write APIs.
+APPROVAL_ROOT="$ROOT" APPROVAL_WORKFLOW="$WORKFLOW" node <<'NODE'
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const root = process.env.APPROVAL_ROOT;
+const {retryGithubRead, selectApprovalTriage} = require(path.join(root, 'scripts/workflow/approval-triage.cjs'));
+const source = fs.readFileSync(process.env.APPROVAL_WORKFLOW, 'utf8');
+const step = source.slice(source.indexOf('      - name: Classify and dismiss ineligible approvals'));
+const scriptLines = step.slice(step.indexOf('          script: |\n') + '          script: |\n'.length).split('\n');
+const script = [];
+for (const line of scriptLines) {
+  if (line && !line.startsWith('            ')) break;
+  script.push(line.replace(/^ {12}/, ''));
+}
+const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
+const guard = new AsyncFunction('github', 'context', 'core', 'require', script.join('\n'));
+const workflowRequire = name => require(name.startsWith('./') ? path.resolve(root, name) : name);
+const head = 'a'.repeat(40);
+const pr = {number: 99, head: {sha: head}, base: {ref: 'main', sha: 'b'.repeat(40)},
+  user: {login: 'nathanjohnpayne'}, body: 'Authoring-Agent: codex', labels: [{name: 'priority:high'}]};
+const clone = value => JSON.parse(JSON.stringify(value));
+async function main() {
+  for (const error of [Object.assign(new Error('write EPIPE'), {code:'EPIPE'}),
+    Object.assign(new Error('reset'), {cause:{code:'ECONNRESET'}}), new Error('fetch failed'),
+    Object.assign(new Error('server'), {status:503}), Object.assign(new Error('rate'), {status:429})]) {
+    let calls = 0; const waits = [];
+    assert.equal(await retryGithubRead(async () => { if (++calls < 3) throw error; return 'ok'; },
+      async ms => waits.push(ms)), 'ok');
+    assert.equal(calls, 3); assert.deepEqual(waits, [250,500]);
+  }
+  for (const status of [401,403,404,422]) {
+    let calls = 0;
+    await assert.rejects(retryGithubRead(async () => { calls++; throw Object.assign(new Error('fetch failed'), {status}); }, async () => {}));
+    assert.equal(calls, 1);
+  }
+  let exhausted = 0;
+  await assert.rejects(retryGithubRead(async () => { exhausted++; throw new Error('fetch failed'); }, async () => {}));
+  assert.equal(exhausted, 3);
+  process.env.GITHUB_WORKSPACE = root;
+  process.env.TRIAGE_RESULT = 'failure';
+  process.env.REVIEWERS_JSON = '["nathanpayne-claude"]';
+  process.env.EVENT_REVIEWERS_JSON = '["nathanpayne-claude"]';
+  assert.equal(selectApprovalTriage({modulePresent:false,trustedWorkflow:'old workflow',loadBootstrap:()=>'fallback'}), 'fallback');
+  assert.throws(() => selectApprovalTriage({modulePresent:false,trustedWorkflow:source,loadBootstrap:()=>'fallback'}), /requires the missing/);
+  assert.throws(() => selectApprovalTriage({modulePresent:true,trustedWorkflow:'old workflow',loadCanonical:()=>{throw new Error('broken canonical');},loadBootstrap:()=>'fallback'}), /broken canonical/);
+  for (const mode of ['stable','null-body','first-rollout','EPIPE','head','base-ref','base-sha','body','labels','author','late-drift','old-approval','malformed','unreadable','missing-canonical','unregistered','not-approved','non-review']) {
+    let reads = 0; let dismissed = 0; const outputs = {}; const failed = []; const notices = [];
+    const eventPr = clone(pr);
+    if (mode === 'null-body') eventPr.body = null;
+    const review = {id:301,state:'approved',commit_id:head,user:{login:'nathanpayne-claude'}};
+    if (mode === 'old-approval') review.commit_id = 'c'.repeat(40);
+    if (mode === 'unregistered') review.user.login = 'human-reviewer';
+    if (mode === 'not-approved') review.state = 'commented';
+    const github = {rest:{pulls:{
+      get: async () => {
+        reads++;
+        if (mode === 'EPIPE' && reads === 1) throw Object.assign(new Error('write EPIPE'), {code:'EPIPE'});
+        if (mode === 'unreadable') throw Object.assign(new Error('not found'), {status:404});
+        const live = clone(eventPr);
+        if (mode === 'head' || (mode === 'late-drift' && reads === 2)) live.head.sha = 'd'.repeat(40);
+        if (mode === 'base-ref') live.base.ref = 'other';
+        if (mode === 'base-sha') live.base.sha = 'd'.repeat(40);
+        if (mode === 'body') live.body += ' edited';
+        if (mode === 'labels') live.labels.push({name:'human-hold'});
+        if (mode === 'author') live.user.login = 'other-author';
+        if (mode === 'malformed') live.labels = null;
+        return {data:live};
+      },
+      dismissReview: async () => { dismissed++; },
+    }}};
+    await guard(github, {eventName:mode === 'non-review' ? 'pull_request' : 'pull_request_review',repo:{owner:'owner',repo:'repo'},
+      payload:{pull_request:eventPr,review}}, {
+      setOutput:(key,value) => { outputs[key]=value; }, setFailed:message => failed.push(message),
+      notice:message => notices.push(message), info:() => {},
+    }, ['first-rollout','missing-canonical'].includes(mode) ? name => {
+      if (name === 'fs') return {...fs,
+        existsSync:file => String(file).endsWith('approval-triage.cjs') ? false : fs.existsSync(file),
+        readFileSync:(file,...args) => String(file).endsWith('agent-review.yml')
+          ? (mode === 'first-rollout' ? source.replaceAll('const approvalTriage = selectApprovalTriage(', 'old-helper-rollout') : source)
+          : fs.readFileSync(file,...args)};
+      return workflowRequire(name);
+    } : workflowRequire);
+    const preserved = ['stable','null-body','first-rollout','EPIPE'].includes(mode);
+    assert.equal(dismissed, preserved || ['unregistered','not-approved','non-review'].includes(mode) ? 0 : 1, mode);
+    assert.deepEqual(outputs, {eligible_approval:'false',snapshot_current:'false'}, mode);
+    assert.equal(failed.length, 1, mode);
+    assert.equal(notices.some(message => message.includes('preserving the approval')), preserved, mode);
+    if (mode === 'stable') assert.equal(reads, 2);
+    if (mode === 'EPIPE') assert.equal(reads, 3);
+  }
+  console.log('Approval triage: 10 bounded-retry, 3 canonical-loader and 18 production-guard cases passed');
+}
+main().catch(error => { console.error(error); process.exitCode = 1; });
 NODE
 
 echo "test_self_approval_detector: PASS"

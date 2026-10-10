@@ -10,6 +10,8 @@
 # Used by check_spec_test_alignment when the default filename search
 # wouldn't find the test.
 spec_test_map:
+  approval_triage:
+    - tests/test_self_approval_detector.sh
   yq_bootstrap:
     - tests/test_resolve_pr_threads_verified_propagation.sh
   coderabbit_config:

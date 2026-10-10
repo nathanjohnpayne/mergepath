@@ -276,6 +276,71 @@ jobs:
             const fs = require('fs');
             const os = require('os');
             const path = require('path');
+            // BEGIN TRIAGE READ BOOTSTRAP
+            // Generated from scripts/workflow/approval-triage.cjs. Do not edit.
+            function bootstrapApprovalTriage() {
+              // Read-only GitHub operations: retry transport failures, never policy drift or
+              // a permanent authorization/not-found response. Three attempts, 250ms then 500ms backoff (750ms total).
+              async function retryGithubRead(read, wait = ms => new Promise(resolve => setTimeout(resolve, ms))) {
+                for (let attempt = 0; ; attempt += 1) {
+                  try {
+                    return await read();
+                  } catch (error) {
+                    const status = Number(error && error.status || 0);
+                    const detail = [error && error.code, error && error.message,
+                      error && error.cause && error.cause.code,
+                      error && error.cause && error.cause.message].join(' ');
+                    const permanent = status >= 400 && status < 500 && status !== 429;
+                    const transient = status === 429 || (status >= 500 && status <= 599) ||
+                      /EPIPE|ECONNRESET|ETIMEDOUT|fetch failed/i.test(detail);
+                    if (attempt >= 2 || permanent || !transient) throw error;
+                    await wait(250 * (attempt + 1));
+                  }
+                }
+              }
+
+              // This only preserves an existing exact-event approval; it never classifies,
+              // grants eligibility or permits merge while triage remains unsuccessful.
+              async function preserveApprovalAfterTriageFailure(input) {
+                const {review, registered, eventPr, readPr, snapshot} = input;
+                if (registered !== true || !review || !Number.isInteger(review.id) || review.id <= 0 ||
+                    String(review.state).toUpperCase() !== 'APPROVED' ||
+                    !eventPr || !eventPr.head || !eventPr.head.sha ||
+                    !eventPr.base || !eventPr.base.ref || !eventPr.base.sha ||
+                    !eventPr.user || typeof eventPr.user.login !== 'string' || !eventPr.user.login ||
+                    (eventPr.body !== null && typeof eventPr.body !== 'string') || review.commit_id !== eventPr.head.sha) return false;
+                try {
+                  const expected = snapshot(eventPr);
+                  const before = await retryGithubRead(readPr);
+                  if (snapshot(before) !== expected) return false;
+                  const after = await retryGithubRead(readPr);
+                  return snapshot(after) === expected;
+                } catch {
+                  return false;
+                }
+              }
+
+              function selectApprovalTriage(input) {
+                if (input.modulePresent) return input.loadCanonical();
+                if (input.trustedWorkflow.includes('const approvalTriage = selectApprovalTriage(')) {
+                  throw new Error('trusted workflow requires the missing approval-triage canonical helper');
+                }
+                return input.loadBootstrap();
+              }
+              return {retryGithubRead, preserveApprovalAfterTriageFailure, selectApprovalTriage};
+            }
+            // END TRIAGE READ BOOTSTRAP
+            const {selectApprovalTriage} = bootstrapApprovalTriage();
+            const approvalTriagePath = path.resolve(process.env.GITHUB_WORKSPACE,
+              'scripts/workflow/approval-triage.cjs');
+            const approvalTriage = selectApprovalTriage({
+              modulePresent: fs.existsSync(approvalTriagePath),
+              trustedWorkflow: fs.readFileSync(path.resolve(process.env.GITHUB_WORKSPACE,
+                '.github/workflows/agent-review.yml'), 'utf8'),
+              loadCanonical: () => require(approvalTriagePath),
+              loadBootstrap: bootstrapApprovalTriage,
+            });
+            const {retryGithubRead} = approvalTriage;
 
             function parseReviewerList(raw, label) {
               let reviewers;
@@ -412,11 +477,11 @@ jobs:
               baseSha: candidate && candidate.base && candidate.base.sha,
               labels: stablePrLabelNames(candidate),
             });
-            const {data: pr} = await github.rest.pulls.get({
+            const {data: pr} = await retryGithubRead(() => github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: eventPr.number,
-            });
+            }));
             const triageSnapshot = snapshotKey(pr);
             if (snapshotKey(eventPr) !== triageSnapshot) {
               core.notice(
@@ -442,19 +507,19 @@ jobs:
             const threshold = parseInt(process.env.THRESHOLD, 10);
             const protectedPaths = JSON.parse(process.env.PROTECTED_PATHS);
 
-            const files = await github.paginate(
+            const files = await retryGithubRead(() => github.paginate(
               github.rest.pulls.listFiles,
               {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 pull_number: pr.number,
               }
-            );
-            const {data: prAfterFiles} = await github.rest.pulls.get({
+            ));
+            const {data: prAfterFiles} = await retryGithubRead(() => github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: eventPr.number,
-            });
+            }));
             if (snapshotKey(prAfterFiles) !== triageSnapshot) {
               throw new Error(
                 'PR head/base changed while triage read the live file list; ' +
@@ -1045,6 +1110,62 @@ jobs:
           script: |
             const fs = require('fs');
             const path = require('path');
+            // BEGIN APPROVAL TRIAGE BOOTSTRAP
+            // Generated from scripts/workflow/approval-triage.cjs. Do not edit.
+            function bootstrapApprovalTriage() {
+              // Read-only GitHub operations: retry transport failures, never policy drift or
+              // a permanent authorization/not-found response. Three attempts, 250ms then 500ms backoff (750ms total).
+              async function retryGithubRead(read, wait = ms => new Promise(resolve => setTimeout(resolve, ms))) {
+                for (let attempt = 0; ; attempt += 1) {
+                  try {
+                    return await read();
+                  } catch (error) {
+                    const status = Number(error && error.status || 0);
+                    const detail = [error && error.code, error && error.message,
+                      error && error.cause && error.cause.code,
+                      error && error.cause && error.cause.message].join(' ');
+                    const permanent = status >= 400 && status < 500 && status !== 429;
+                    const transient = status === 429 || (status >= 500 && status <= 599) ||
+                      /EPIPE|ECONNRESET|ETIMEDOUT|fetch failed/i.test(detail);
+                    if (attempt >= 2 || permanent || !transient) throw error;
+                    await wait(250 * (attempt + 1));
+                  }
+                }
+              }
+
+              // This only preserves an existing exact-event approval; it never classifies,
+              // grants eligibility or permits merge while triage remains unsuccessful.
+              async function preserveApprovalAfterTriageFailure(input) {
+                const {review, registered, eventPr, readPr, snapshot} = input;
+                if (registered !== true || !review || !Number.isInteger(review.id) || review.id <= 0 ||
+                    String(review.state).toUpperCase() !== 'APPROVED' ||
+                    !eventPr || !eventPr.head || !eventPr.head.sha ||
+                    !eventPr.base || !eventPr.base.ref || !eventPr.base.sha ||
+                    !eventPr.user || typeof eventPr.user.login !== 'string' || !eventPr.user.login ||
+                    (eventPr.body !== null && typeof eventPr.body !== 'string') || review.commit_id !== eventPr.head.sha) return false;
+                try {
+                  const expected = snapshot(eventPr);
+                  const before = await retryGithubRead(readPr);
+                  if (snapshot(before) !== expected) return false;
+                  const after = await retryGithubRead(readPr);
+                  return snapshot(after) === expected;
+                } catch {
+                  return false;
+                }
+              }
+
+              function selectApprovalTriage(input) {
+                if (input.modulePresent) return input.loadCanonical();
+                if (input.trustedWorkflow.includes('const approvalTriage = selectApprovalTriage(')) {
+                  throw new Error('trusted workflow requires the missing approval-triage canonical helper');
+                }
+                return input.loadBootstrap();
+              }
+              return {retryGithubRead, preserveApprovalAfterTriageFailure, selectApprovalTriage};
+            }
+            // END APPROVAL TRIAGE BOOTSTRAP
+            const {selectApprovalTriage} = bootstrapApprovalTriage();
+
 
             // BEGIN SELF-APPROVAL BOOTSTRAP
             // Generated from scripts/self-approval-detector.cjs. Do not edit.
@@ -1559,15 +1680,29 @@ jobs:
 
             core.setOutput('eligible_approval', 'false');
             core.setOutput('snapshot_current', 'false');
-            if (process.env.TRIAGE_RESULT !== 'success') {
+            let retryGithubRead, preserveApprovalAfterTriageFailure;
+            try {
+              const approvalTriagePath = path.resolve(process.env.GITHUB_WORKSPACE,
+                'scripts/workflow/approval-triage.cjs');
+              const approvalTriage = selectApprovalTriage({
+                modulePresent: fs.existsSync(approvalTriagePath),
+                trustedWorkflow: fs.readFileSync(path.resolve(process.env.GITHUB_WORKSPACE,
+                  '.github/workflows/agent-review.yml'), 'utf8'),
+                loadCanonical: () => require(approvalTriagePath),
+                loadBootstrap: bootstrapApprovalTriage,
+              });
+              ({retryGithubRead, preserveApprovalAfterTriageFailure} = approvalTriage);
+              if (typeof retryGithubRead !== 'function' ||
+                  typeof preserveApprovalAfterTriageFailure !== 'function') {
+                throw new Error('approval-triage helper exports are unavailable');
+              }
+            } catch (error) {
               await failClosedBeforeClassification(
-                'live triage did not complete',
-                'Phase 4 classification did not complete; refusing to ' +
-                'classify or consume approvals.',
+                `approval-triage helper load failed: ${error.message}`,
+                'Approval-triage helper is unavailable; refusing to classify or consume approvals.',
               );
               return;
             }
-
             const eventPr = context.payload.pull_request;
             const policySnapshot = candidate => JSON.stringify({
               head: candidate && candidate.head && candidate.head.sha,
@@ -1576,6 +1711,33 @@ jobs:
             });
             const enforcementSnapshot = candidate =>
               approvalEnforcementSnapshot(candidate, policySnapshot);
+            if (process.env.TRIAGE_RESULT !== 'success') {
+              const directReview = context.eventName === 'pull_request_review'
+                ? context.payload.review : null;
+              const registered = registeredReviewerUnion([
+                process.env.REVIEWERS_JSON, process.env.EVENT_REVIEWERS_JSON,
+              ]).has(String(directReview && directReview.user &&
+                directReview.user.login || '').trim().toLowerCase());
+              const preserve = await preserveApprovalAfterTriageFailure({
+                review: directReview, registered, eventPr,
+                snapshot: enforcementSnapshot,
+                readPr: async () => (await github.rest.pulls.get({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  pull_number: eventPr.number,
+                })).data,
+              });
+              if (preserve) {
+                core.notice('Triage failed but the exact approval snapshot is stable; preserving the approval.');
+                core.setFailed('Phase 4 classification did not complete; refusing to classify or consume approvals.');
+              } else {
+                await failClosedBeforeClassification(
+                  'live triage did not complete and approval snapshot is not proven stable',
+                  'Phase 4 classification did not complete; refusing to classify or consume approvals.',
+                );
+              }
+              return;
+            }
+
             const triageSnapshot = JSON.stringify({
               head: process.env.TRIAGE_HEAD || '',
               baseRef: process.env.TRIAGE_BASE_REF || '',
@@ -1583,11 +1745,11 @@ jobs:
             });
             let livePrResponse;
             try {
-              livePrResponse = await github.rest.pulls.get({
+              livePrResponse = await retryGithubRead(() => github.rest.pulls.get({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 pull_number: eventPr.number,
-              });
+              }));
             } catch (error) {
               await failClosedBeforeClassification(
                 `live PR read failed: ${error.message}`,
@@ -1662,7 +1824,7 @@ jobs:
                 triageSnapshot,
                 enforcementSnapshot,
                 policySnapshot,
-                listReviews: currentPr => github.paginate(
+                listReviews: currentPr => retryGithubRead(() => github.paginate(
                   github.rest.pulls.listReviews,
                   {
                     owner: context.repo.owner,
@@ -1670,13 +1832,13 @@ jobs:
                     pull_number: currentPr.number,
                     per_page: 100,
                   },
-                ),
+                )),
                 readPr: async () => {
-                  const response = await github.rest.pulls.get({
+                  const response = await retryGithubRead(() => github.rest.pulls.get({
                     owner: context.repo.owner,
                     repo: context.repo.repo,
                     pull_number: pr.number,
-                  });
+                  }));
                   return response.data;
                 },
                 notice: attempt => core.notice(

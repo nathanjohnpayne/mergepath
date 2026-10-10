@@ -16,6 +16,8 @@ The shared CI yq bootstrap installs mikefarah/yq v4.53.6 only after checking the
 
 `scripts/ci/check_doc_ownership` is a fail-closed repository-integrity check. It validates the `doc_ownership` inventory and verifies that canonical agent documentation does not contain rendered relative links to hub-only documentation that consumers do not receive. Its Markdown extraction contract is defined in [`specs/doc_ownership_validation.md`](../../specs/doc_ownership_validation.md) and covered by `tests/test_check_doc_ownership.sh`.
 
+Failed review triage preserves an exact-head registered approval only after two live observations match its event snapshot, while keeping classification and merge blocked. Bounded transient-read retries and the unchanged drift protection are specified in [`specs/approval_triage.md`](../../specs/approval_triage.md).
+
 The Codex requester and same-agent merge fallback share the substantive review-run selector and approval predicate. Threaded replies alone cannot suppress a needed request, and P0/P1 findings in review bodies retain their approval boundary. See [`specs/codex_request_evidence.md`](../../specs/codex_request_evidence.md).
 
 Blocked review diagnostics bind request age and acknowledgement to an exact `@codex review` command comment; later prose mentions do not replace that evidence. The diagnostic filter preserves requester deduplication and clearance behavior. Its contract and coverage are in [`specs/codex_request_evidence.md`](../../specs/codex_request_evidence.md) and `tests/test_codex_request_evidence.sh`.
