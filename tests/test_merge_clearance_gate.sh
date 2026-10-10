@@ -3993,7 +3993,7 @@ rcp_case open-group \
 # ── A11 — write scope is job-scoped, never workflow-scoped ────────────
 rcp_case perms-actions \
   's{^      actions: read\n      checks: write\n    steps:}{      checks: write\n    steps:}m' \
-  fail 'not read. Both jobs'
+  fail "job 'open' scope 'actions'"
 # The workflow-level grant is P1a in miniature: it hands checks: write to
 # every future job added to this file.
 rcp_case perms-top \
@@ -4013,7 +4013,38 @@ rcp_case perms-job-absent \
 # quietly stops refreshing all three contexts.
 rcp_case perms-job-checks \
   's{^      checks: write$}{      checks: read}m' \
-  fail 'not write — its POSTs'
+  fail "job 'open' scope 'checks'"
+
+# #1662: every declared scope is required and exact, not only checks/actions.
+for permission_job in open publish; do
+  permission_scopes="contents pull-requests actions checks"
+  if [ "$permission_job" = publish ]; then
+    permission_scopes="$permission_scopes issues security-events"
+  fi
+  for permission_scope in $permission_scopes; do
+    rcp_case "permission-$permission_job-$permission_scope-absent" \
+      's{(^  '"$permission_job"':\n.*?)^      '"$permission_scope"': [^\n]*\n}{$1}ms' \
+      fail "job '$permission_job' scope '$permission_scope'"
+  done
+  rcp_case "permission-$permission_job-extra" \
+    's{(^  '"$permission_job"':\n.*?^    permissions:\n)}{$1      deployments: write\n}ms' \
+    fail "job '$permission_job' declares unexpected scope 'deployments'"
+done
+rcp_case permission-value-drift \
+  's{(^  open:\n.*?^      contents:) read}{$1 write}ms' \
+  fail "job 'open' scope 'contents'"
+rcp_case permission-third-writer \
+  's{\z}{\n  extra:\n    runs-on: ubuntu-latest\n    permissions: {checks: write}\n    steps: [{run: echo extra}]\n}s' \
+  fail '[rcp extra writer]'
+rcp_case permission-third-write-all \
+  's{\z}{\n  extra:\n    runs-on: ubuntu-latest\n    permissions: write-all\n    steps: [{run: echo extra}]\n}s' \
+  fail '[rcp extra writer]'
+rcp_case phase-one-token-absent \
+  's{(      - name: Open pending entries on the event head\n.*?)^          GH_TOKEN: [^\n]*\n}{$1}ms' \
+  fail 'declares no GH_TOKEN'
+rcp_case phase-one-token-drift \
+  's{(      - name: Open pending entries on the event head\n.*?)^          GH_TOKEN: [^\n]*}{$1          GH_TOKEN: wrong-token}ms' \
+  fail 'binds GH_TOKEN to'
 
 # The phase-1 ordering cases (A3), the success-conclusion count (A8) and
 # the read-then-write ordering cases (A12) were REMOVED with their
