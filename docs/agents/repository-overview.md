@@ -10,6 +10,8 @@ The hub-only Cockpit includes a read-only Fleet audit source: a thirty-minute sc
 
 `scripts/ci/check_doc_ownership` is a fail-closed repository-integrity check. It validates the `doc_ownership` inventory and verifies that canonical agent documentation does not contain rendered relative links to hub-only documentation that consumers do not receive. Its Markdown extraction contract is defined in [`specs/doc_ownership_validation.md`](../../specs/doc_ownership_validation.md) and covered by `tests/test_check_doc_ownership.sh`.
 
+The Codex requester and same-agent merge fallback share the substantive review-run selector and approval predicate. Threaded replies alone cannot suppress a needed request, and P0/P1 findings in review bodies retain their approval boundary. See [`specs/codex_request_evidence.md`](../../specs/codex_request_evidence.md).
+
 Blocked review diagnostics bind request age and acknowledgement to an exact `@codex review` command comment; later prose mentions do not replace that evidence. The diagnostic filter preserves requester deduplication and clearance behavior. Its contract and coverage are in [`specs/codex_request_evidence.md`](../../specs/codex_request_evidence.md) and `tests/test_codex_request_evidence.sh`.
 
 Cockpit live observations read bounded local Phase 4b heartbeat records independently of accounting history. The launch-owned default directory, canonical process identity, observed adapter clock and separate POST/final-summary facts are specified in `specs/cockpit_live_agents.md`; shared HTTP/SSE and scheduling remain in `specs/cockpit_foundation.md`.

@@ -207,6 +207,7 @@ build_scan() { # reaction_time review_time review_findings_json verdict_time ver
     {
       reaction: (if $rt == "" then null else {created_at: $rt} end),
       review: (if $vt == "" then null else {submitted_at: $vt} end),
+      review_approval_eligible: ($vt != ""),
       findings: $findings,
       verdict: (if $vdt == "" then null else {created_at: $vdt, affirmative: ($aff == "true")} end)
     }'

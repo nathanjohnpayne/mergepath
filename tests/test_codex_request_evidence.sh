@@ -464,6 +464,9 @@ for mode in disabled readiness; do
   PASS=$((PASS + 1)); echo "PASS: $mode skips irrelevant API reads"
 done
 
+# Exercise the production requester clearance decision on the same provider
+# fixtures as gate (b), rather than copying either jq predicate (#1543).
+eval "$(sed -n '/^has_cleared_signal()/,/^}/p' "$ROOT/scripts/codex-review-request.sh")"
 # A findings-bearing review is not an affirmative approval substitute,
 # even after the author replies; discretionary findings still allow it.
 printf '[]\n' >"$DIR/comments"
@@ -485,8 +488,36 @@ for tier in P0 P1 P2; do
     bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/out" 2>&1 || rc=$?
   if [ "$rc" != "$expected" ]; then cat "$DIR/out"; echo "FAIL $shape $tier approval substitute rc=$rc"; exit 1; fi
   if [ "$tier" != P2 ] && ! grep -q 'no reviewer identity' "$DIR/out"; then cat "$DIR/out"; exit 1; fi
+  cp "$DIR/reviews" "$DIR/scan-reviews"
+  printf '%s\n' "$inline" > "$DIR/scan-inline"
+  requester_cleared=false
+  if has_cleared_signal "$(scan_codex_state)"; then requester_cleared=true; fi
+  wanted_clearance=false; [ "$tier" != P2 ] || wanted_clearance=true
+  if [ "$requester_cleared" != "$wanted_clearance" ]; then
+    echo "FAIL requester/checker disagreement on $shape $tier"; exit 1
+  fi
   PASS=$((PASS + 1)); echo "PASS: $shape $tier approval-substitute boundary"
 done
 done
+
+# A reply-only wrapper on the exact head must leave both paths un-cleared.
+printf '%s\n' "$REVIEW" > "$DIR/reviews"
+reply_only='[{"id":5003,"pull_request_review_id":789,"in_reply_to_id":5001,"user":{"login":"chatgpt-codex-connector[bot]"},"body":"Review Result: Verified commit abcdef0 resolves the reported issue."}]'
+printf '%s\n' "$reply_only" > "$DIR/scan-inline"
+cp "$DIR/reviews" "$DIR/scan-reviews"
+reply_scan=$(scan_codex_state)
+if [ "$(printf '%s' "$reply_scan" | jq -r '.review == null')" != true ] \
+   || has_cleared_signal "$reply_scan"; then
+  echo 'FAIL threaded reply alone suppressed a needed requester trigger'; exit 1
+fi
+rc=0
+PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=blocking-roots \
+  INLINE_COMMENTS_JSON="$reply_only" PR_BODY='Authoring-Agent: codex' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+  MERGEPATH_REVIEW_POLICY_PATH="$DIR/default-policy.yml" \
+  bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/out" 2>&1 || rc=$?
+if [ "$rc" != 1 ] || ! grep -q 'no reviewer identity' "$DIR/out"; then
+  cat "$DIR/out"; echo "FAIL reply-only checker status rc=$rc"; exit 1
+fi
+PASS=$((PASS + 1)); echo 'PASS: requester and checker reject threaded-reply-only clearance'
 
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"
