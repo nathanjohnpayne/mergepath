@@ -99,7 +99,7 @@ jobs:
              && yq --version 2>&1 | grep -Eq 'mikefarah/yq.*version v[4-9]\.'; then
             echo "yq already present: $(yq --version)"
           else
-            YQ_VERSION="v4.44.3"
+            YQ_VERSION="v4.53.6"
             YQ_ASSET="yq_linux_amd64"
             tmp_yq="$(mktemp)"
             tmp_sums="$(mktemp)"

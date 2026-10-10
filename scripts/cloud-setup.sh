@@ -24,10 +24,9 @@
 # `yq` is installed the same way, from the mikefarah/yq release binary, at the
 # version the repo's CI actually runs: the GitHub runner's preinstalled yq
 # (v4.53.6 in repo-lint run 37160023472), which scripts/lib/ensure-yq.sh keeps
-# because it installs only when no mikefarah/yq is present. Its own pin
-# (v4.44.3) is older than the checks need: v4.44.3 does not expand "\t" in a
-# string concatenation, so check_sync_manifest and the
-# resolve-pr-threads/doc-ownership suites fail under it. The hashes below were
+# because it installs only when no mikefarah/yq is present. Older yq
+# releases do not expand "\t" in a string concatenation, so check_sync_manifest and the resolve-pr-threads/doc-ownership suites
+# require this minimum. The hashes below were
 # taken from the release's checksums file and the downloaded binaries; they
 # still need the same GitHub API asset-digest cross-check the gh pins had.
 #
@@ -223,8 +222,7 @@ is_mikefarah_yq() { # <path>
 }
 
 # The oldest mikefarah/yq the repository checks pass under. An older v4 on
-# PATH (v4.44.3, the scripts/lib/ensure-yq.sh pin, among them) is replaced,
-# not kept: it breaks the checks named at the top of this script.
+# PATH is replaced, not kept: it breaks the checks named at the top of this script.
 YQ_MIN_VERSION="v4.53.6"
 
 # Succeeds when <have> is at least <want>; both are [v]MAJOR.MINOR.PATCH,
