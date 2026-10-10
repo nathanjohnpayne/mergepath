@@ -28,6 +28,8 @@ Each required context has two independent producers, and under the resolution ru
 
 "Single producer" therefore means **single owner of the synthetic lineage**, never the deletion of a natively-named job. Deleting the job named for a context does not merge the lineages — it deletes one, leaving a required context whose only producer is a workflow. If that workflow is absent from the default branch, renamed, disabled, or its `workflow_run` delivery drops, the context has no producer at all and every PR in the repo blocks forever with no partial degradation to warn anyone. The natively-named jobs in the three gate workflows keep their names and keep computing their own verdicts; what they lose (in #845 PR 4) is the ability to write the Checks API.
 
+The structural fence also reads `pr-review-policy.yml` and rejects `schedule` or `workflow_dispatch` triggers, including quoted keys, inline mappings, sequences and scalar trigger definitions. Non-PR runs could otherwise place satisfying skipped checks under `Self-Review Required` and `Label Gate`. Missing, malformed or unreadable policy workflow input fails validation. Existing mutation coverage in `tests/test_merge_clearance_gate.sh` exercises these spellings and safe controls.
+
 ## Trust model
 
 The publisher's definition always comes from the **default branch**: `workflow_run`, `schedule`, and `repository_dispatch` all execute the default-branch copy. A pull request therefore cannot edit the workflow that evaluates it, which is the closure for the P1a exposure — inline `gh api` calls and a `checks: write` grant sitting in PR-authored YAML.
