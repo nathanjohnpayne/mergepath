@@ -773,6 +773,37 @@ for direction in codex claude; do
     done
   done
  done
+# Binding validation must precede unavailability, including the wave's
+# metadata-backed path. Keep the final post-CLI binding check above, too.
+source "$ROOT/scripts/phase-4b/immutable-input.sh"
+jq -n --arg digest "$(p4b_input_digest "$DIFF")" \
+  '{base_sha:("b"*40),head_sha:("a"*40),merge_base_sha:("c"*40),
+    diff_sha256:$digest,head_transitions_sha256:("d"*64)}' > "$WORK/valid-input.json"
+printf '%s' '{broken' > "$WORK/malformed-input.json"
+jq '.diff_sha256 = ("0"*64)' "$WORK/valid-input.json" > "$WORK/tampered-input.json"
+for direction in codex claude; do
+  for unavailable in cli schema; do
+    adapter="$ROOT/scripts/phase-4b/adapters/review-via-$direction.sh"
+    [ "$unavailable" != schema ] || adapter="$SCHEMA_FIXTURE/adapters/review-via-$direction.sh"
+    for input_case in valid malformed tampered; do
+      set +e
+      out=$(env CODEX_BIN="$WORK/missing-codex" CLAUDE_BIN="$WORK/missing-claude" \
+        "$BASH" "$adapter" --pr 1 --diff-file "$DIFF" \
+        --input-metadata "$WORK/$input_case-input.json" 2>&1)
+      rc=$?
+      set -e
+      expected=3; cause='review input metadata does not match'
+      if [ "$input_case" = valid ]; then
+        expected=4
+        if [ "$unavailable" = schema ]; then cause='verdict schema not readable'
+        else cause='CLI not found'; fi
+      fi
+      if [ "$rc" = "$expected" ] && printf '%s' "$out" | grep -q "$cause"; then
+        pass "$direction $input_case binding retains exit $expected with missing $unavailable"
+      else fail "$direction mixed binding/$unavailable refusal (rc=$rc): $out"; fi
+    done
+  done
+ done
 if [ "${1:-}" = --input-integrity-only ]; then
  printf 'Input integrity: %s passed, %s failed\n' "$PASS" "$FAIL"
  [ "$FAIL" = 0 ]; exit $?

@@ -123,6 +123,10 @@ MAX_DIFF_BYTES="$(p4b_resolve_diff_max_bytes)" \
   || p4b_die 3 "invalid diff byte budget (P4B_DIFF_MAX_BYTES must be an integer; phase_4b_automation.diff_max_bytes must be an integer in ${P4B_MIN_DIFF_MAX_BYTES}..${P4B_MAX_DIFF_MAX_BYTES})"
 REQUIRED_SEVERITIES="$(p4b_required_verdict_severities_json)" \
   || p4b_die 3 "invalid feedback_policy; cannot determine required verdict severities"
+# A tooling outage cannot turn malformed/tampered immutable input into the
+# wave caller's reviewer-unavailable allowance. Recheck after the CLI as well.
+p4b_bind_input "$INPUT_METADATA" "$DIFF_FILE" "$DIFF_FILE" '{}' >/dev/null \
+  || p4b_die 3 "review input metadata does not match the supplied diff"
 [ -r "$SCHEMA" ] || p4b_die 4 "verdict schema not readable: $SCHEMA"
 DIFF="$(cat "$DIFF_FILE")"
 [ -n "$DIFF" ] || p4b_die 4 "empty diff — nothing to review"
