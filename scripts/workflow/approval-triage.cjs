@@ -2,7 +2,7 @@
 
 // BEGIN APPROVAL TRIAGE IMPLEMENTATION
 // Read-only GitHub operations: retry transport failures, never policy drift or
-// a permanent authorization/not-found response. Three attempts, 750ms backoff.
+// a permanent authorization/not-found response. Three attempts, 250ms then 500ms backoff (750ms total).
 async function retryGithubRead(read, wait = ms => new Promise(resolve => setTimeout(resolve, ms))) {
   for (let attempt = 0; ; attempt += 1) {
     try {

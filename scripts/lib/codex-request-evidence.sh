@@ -279,3 +279,33 @@ crqe_verdicts() { # issue-comments-json bot-login
 crqe_resolve_verdict_anchors() { # comments-json repository bot-login
   printf '%s\n' "$1" | python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")/../workflow" && pwd)/resolve-codex-verdict-anchors.py" --repo "$2" --bot "$3"
 }
+
+# One substantive head-review selector for requester and merge gate (#1543).
+# A body-less wrapper around a threaded reply is not a completed review run.
+crqe_select_head_review() { # reviews-json comments-json bot head
+  printf '%s\n' "$1" "$2" | jq -s --arg bot "$3" --arg sha "$4" '
+    .[0] as $reviews | .[1] as $comments
+    | [$reviews[] | select(.user.login == $bot and .commit_id == $sha)
+      | . as $r
+      | [$comments[] | select(.pull_request_review_id == $r.id)] as $inline
+      | select(any($inline[]; (.user.login == $bot) and (.in_reply_to_id == null))
+               or (($r.body // "") | test("[^[:space:]]"))
+               or ($inline | length) == 0)]
+    | max_by(.submitted_at) // null
+  '
+}
+
+# Same-agent approval substitute: returns its time or empty. Resolved P0/P1
+# findings still require a fresh affirmative verdict or independent approval.
+crqe_review_approval_time() { # selected-review-json comments-json bot head
+  printf '%s\n' "$1" "$2" | jq -s -r --arg bot "$3" --arg sha "$4" '
+    .[0] as $review | .[1] as $comments
+    | if length == 2 and $review != null and $review.state == "COMMENTED"
+        and ($sha | test("^[0-9a-f]{40}$")) and $review.commit_id == $sha
+        and (($review.body // "") | test("!\\[P[01] Badge\\]|\\*\\*P[01]") | not)
+        and ([ $comments[] | select(.user.login == $bot and .in_reply_to_id == null
+          and .pull_request_review_id == $review.id)
+          | select((.body // "") | test("!\\[P[01] Badge\\]|\\*\\*P[01]")) ] | length) == 0
+      then $review.submitted_at else "" end
+  '
+}

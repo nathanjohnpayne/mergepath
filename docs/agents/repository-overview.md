@@ -18,6 +18,8 @@ The shared CI yq bootstrap installs mikefarah/yq v4.53.6 only after checking the
 
 Failed review triage preserves an exact-head registered approval only after two live observations match its event snapshot, while keeping classification and merge blocked. Bounded transient-read retries and the unchanged drift protection are specified in [`specs/approval_triage.md`](../../specs/approval_triage.md).
 
+The Codex requester and same-agent merge fallback share the substantive review-run selector and approval predicate. Threaded replies alone cannot suppress a needed request, and P0/P1 findings in review bodies retain their approval boundary. See [`specs/codex_request_evidence.md`](../../specs/codex_request_evidence.md).
+
 Blocked review diagnostics bind request age and acknowledgement to an exact `@codex review` command comment; later prose mentions do not replace that evidence. The diagnostic filter preserves requester deduplication and clearance behavior. Its contract and coverage are in [`specs/codex_request_evidence.md`](../../specs/codex_request_evidence.md) and `tests/test_codex_request_evidence.sh`.
 
 Cockpit live observations read bounded local Phase 4b heartbeat records independently of accounting history. The launch-owned default directory, canonical process identity, observed adapter clock and separate POST/final-summary facts are specified in `specs/cockpit_live_agents.md`; shared HTTP/SSE and scheduling remain in `specs/cockpit_foundation.md`.
