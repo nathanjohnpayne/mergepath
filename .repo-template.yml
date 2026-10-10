@@ -10,6 +10,8 @@
 # Used by check_spec_test_alignment when the default filename search
 # wouldn't find the test.
 spec_test_map:
+  yq_bootstrap:
+    - tests/test_resolve_pr_threads_verified_propagation.sh
   merge_review_disagreement:
     - tests/test_gh_pr_guard.sh
   bootstrap_git_execution:
