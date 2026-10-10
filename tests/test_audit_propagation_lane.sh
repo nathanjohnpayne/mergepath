@@ -177,7 +177,7 @@ fi
 STUB_BIN="$WORKDIR/stub-bin"; mkdir -p "$STUB_BIN"
 cat > "$STUB_BIN/yq" <<'YQ'
 #!/usr/bin/env bash
-case "${1:-}" in --version) echo "yq (https://github.com/mikefarah/yq/) version v4.44.3" ;; *) echo "[]" ;; esac
+case "${1:-}" in --version) echo "yq (https://github.com/mikefarah/yq/) version v4.53.6" ;; *) echo "[]" ;; esac
 YQ
 cat > "$STUB_BIN/gh" <<'GH'
 #!/usr/bin/env bash

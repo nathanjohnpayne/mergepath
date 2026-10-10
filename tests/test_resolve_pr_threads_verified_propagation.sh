@@ -65,7 +65,8 @@
 #      GITHUB_ACTIONS=true; with it, installs the PINNED release via
 #      stubbed sudo/wget (no network) to ENSURE_YQ_DEST (#616 finding
 #      3509734393) — INCLUDING when a wrong-implementation (non-mikefarah)
-#      yq is already on PATH (#616 finding 3509930342).
+#      yq is already on PATH (#616 finding 3509930342). Download/hash
+#      refusals leave the destination intact without sudo or execution (#1746).
 #  13. check_resolve_pr_threads wires the CI-only bootstrap: structural
 #      assertions that the check ALWAYS delegates to
 #      scripts/lib/ensure-yq.sh --ci-only (no `command -v yq` gate — a
@@ -926,7 +927,12 @@ YQBOOT_LOG="$SCRATCH/yqboot-installer.log"
 # the URL and writes a fake mikefarah yq to the -O destination.
 YQBOOT_BIN="$SCRATCH/yqboot-bin"
 mkdir -p "$YQBOOT_BIN" "$SCRATCH/yqboot-dest"
-ln -s "$(command -v chmod)" "$YQBOOT_BIN/chmod"
+for tool in chmod mktemp rm install shasum; do
+  ln -s "$(command -v "$tool")" "$YQBOOT_BIN/$tool"
+done
+YQBOOT_SHA256=$(printf '%s\n%s\n' '#!/bin/sh' \
+  'echo "yq (https://github.com/mikefarah/yq/) version v4.53.6"' | shasum -a 256)
+YQBOOT_SHA256=${YQBOOT_SHA256%% *}
 cat > "$YQBOOT_BIN/sudo" <<SUDO_STUB
 #!/bin/sh
 echo "SUDO: \$*" >> "$YQBOOT_LOG"
@@ -945,8 +951,9 @@ while [ \$# -gt 0 ]; do
   esac
 done
 echo "WGET: \$url" >> "$YQBOOT_LOG"
+[ "\${YQBOOT_DOWNLOAD_FAIL:-}" != true ] || exit 22
 printf '%s\n%s\n' '#!/bin/sh' \
-  'echo "yq (https://github.com/mikefarah/yq/) version v4.44.3"' > "\$dest"
+  'echo "yq (https://github.com/mikefarah/yq/) version v4.53.6"' > "\$dest"
 chmod +x "\$dest"
 WGET_STUB
 chmod +x "$YQBOOT_BIN/wget"
@@ -961,7 +968,7 @@ ln -s "$YQBOOT_BIN/sudo" "$YQPRESENT_BIN/sudo"
 ln -s "$YQBOOT_BIN/wget" "$YQPRESENT_BIN/wget"
 cat > "$YQPRESENT_BIN/yq" <<'YQ_FAKE'
 #!/bin/sh
-echo "yq (https://github.com/mikefarah/yq/) version v4.44.3"
+echo "yq (https://github.com/mikefarah/yq/) version v4.53.6"
 YQ_FAKE
 chmod +x "$YQPRESENT_BIN/yq"
 
@@ -1003,6 +1010,7 @@ set -e
 # ENSURE_YQ_DEST, then verify the installed binary runs.
 set +e
 out_b=$(env GITHUB_ACTIONS=true PATH="$YQBOOT_BIN" \
+  ENSURE_YQ_SHA256="$YQBOOT_SHA256" \
   ENSURE_YQ_DEST="$SCRATCH/yqboot-dest/yq" \
   "$BASH" "$ENSURE_YQ" --ci-only 2>&1)
 rc_b=$?
@@ -1019,7 +1027,9 @@ mkdir -p "$YQWRONG_BIN" "$SCRATCH/yqboot-dest-c"
 ln -s "$(command -v grep)" "$YQWRONG_BIN/grep"
 ln -s "$YQBOOT_BIN/sudo" "$YQWRONG_BIN/sudo"
 ln -s "$YQBOOT_BIN/wget" "$YQWRONG_BIN/wget"
-ln -s "$(command -v chmod)" "$YQWRONG_BIN/chmod"
+for tool in chmod mktemp rm install shasum; do
+  ln -s "$(command -v "$tool")" "$YQWRONG_BIN/$tool"
+done
 cat > "$YQWRONG_BIN/yq" <<'YQ_WRONG'
 #!/bin/sh
 echo "yq 3.4.3"
@@ -1028,6 +1038,7 @@ chmod +x "$YQWRONG_BIN/yq"
 
 set +e
 out_c=$(env GITHUB_ACTIONS=true PATH="$YQWRONG_BIN" \
+  ENSURE_YQ_SHA256="$YQBOOT_SHA256" \
   ENSURE_YQ_DEST="$SCRATCH/yqboot-dest-c/yq" \
   "$BASH" "$ENSURE_YQ" --ci-only 2>&1)
 rc_c=$?
@@ -1036,13 +1047,13 @@ set -e
 if [ "$rc_a" -eq 0 ] \
    && grep -q 'not a CI run' <<<"$out_a" \
    && [ "$rc_b" -eq 0 ] \
-   && grep -q 'WGET: https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64' "$YQBOOT_LOG" \
+   && grep -q 'WGET: https://github.com/mikefarah/yq/releases/download/v4.53.6/yq_linux_amd64' "$YQBOOT_LOG" \
    && [ -x "$SCRATCH/yqboot-dest/yq" ] \
-   && grep -q 'version v4.44.3' <<<"$out_b" \
+   && grep -q 'version v4.53.6' <<<"$out_b" \
    && [ "$rc_c" -eq 0 ] \
    && ! grep -q 'yq already present' <<<"$out_c" \
    && [ -x "$SCRATCH/yqboot-dest-c/yq" ] \
-   && grep -q 'version v4.44.3' <<<"$out_c"; then
+   && grep -q 'version v4.53.6' <<<"$out_c"; then
   pass=$((pass + 1))
   echo "  PASS: non-CI no-op; CI installs pinned when yq is missing AND when a wrong-implementation yq is on PATH"
 else
@@ -1053,6 +1064,36 @@ else
   echo "    wrong-impl output:" >&2; echo "$out_c" | sed 's/^/      /' >&2
   echo "    installer log:" >&2; sed 's/^/      /' "$YQBOOT_LOG" >&2 || true
 fi
+
+# Rejected downloads must leave an existing destination untouched and
+# must never reach sudo or execute the untrusted artifact (#1746).
+for rejection in mismatch malformed-hash override-without-hash download-failure; do
+  : > "$YQBOOT_LOG"
+  printf '%s\n' 'existing destination' > "$SCRATCH/yqboot-dest/rejected"
+  rejection_env=(ENSURE_YQ_SHA256="$YQBOOT_SHA256")
+  expected='SHA-256 mismatch'
+  case "$rejection" in
+    mismatch) rejection_env=(ENSURE_YQ_SHA256="$(printf '%064d' 0)") ;;
+    malformed-hash) rejection_env=(ENSURE_YQ_SHA256=invalid); expected='64 lowercase hex' ;;
+    override-without-hash) rejection_env=(ENSURE_YQ_VERSION=v4.52.0); expected='override requires' ;;
+    download-failure) rejection_env+=(YQBOOT_DOWNLOAD_FAIL=true); expected='' ;;
+  esac
+  set +e
+  rejected_out=$(env -u ENSURE_YQ_SHA256 GITHUB_ACTIONS=true PATH="$YQBOOT_BIN" \
+    ENSURE_YQ_DEST="$SCRATCH/yqboot-dest/rejected" "${rejection_env[@]}" \
+    "$BASH" "$ENSURE_YQ" --ci-only 2>&1)
+  rejected_rc=$?
+  set -e
+  if [ "$rejected_rc" -ne 0 ] && ! grep -q 'SUDO:' "$YQBOOT_LOG" \
+     && [ "$(cat "$SCRATCH/yqboot-dest/rejected")" = 'existing destination' ] \
+     && ! grep -q 'version v4.53.6' <<<"$rejected_out" \
+     && { [ -z "$expected" ] || grep -q "$expected" <<<"$rejected_out"; }; then
+    pass=$((pass + 1)); echo "  PASS: #1746 $rejection fails before install or execution"
+  else
+    fail=$((fail + 1)); echo "  FAIL: #1746 $rejection was not safely rejected (rc=$rejected_rc)" >&2
+    echo "$rejected_out" >&2
+  fi
+done
 
 echo
 echo "Test 13: check_resolve_pr_threads wires the CI-only yq bootstrap (#616)"

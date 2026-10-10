@@ -3483,7 +3483,7 @@ mkdir -p "$RCP_DIR"
 # Populated from the real .github/workflows so the controls cannot drift.
 RCP_WFDIR="$RCP_DIR/workflows"
 mkdir -p "$RCP_WFDIR"
-for _f in required-check-publisher.yml merge-clearance-gate.yml \
+for _f in required-check-publisher.yml merge-clearance-gate.yml pr-review-policy.yml \
           codex-p1-gate.yml coderabbit-severity-gate.yml; do
   cp "$ROOT/.github/workflows/$_f" "$RCP_WFDIR/$_f"
 done
@@ -3993,7 +3993,7 @@ rcp_case open-group \
 # ── A11 — write scope is job-scoped, never workflow-scoped ────────────
 rcp_case perms-actions \
   's{^      actions: read\n      checks: write\n    steps:}{      checks: write\n    steps:}m' \
-  fail 'not read. Both jobs'
+  fail "job 'open' scope 'actions'"
 # The workflow-level grant is P1a in miniature: it hands checks: write to
 # every future job added to this file.
 rcp_case perms-top \
@@ -4013,7 +4013,38 @@ rcp_case perms-job-absent \
 # quietly stops refreshing all three contexts.
 rcp_case perms-job-checks \
   's{^      checks: write$}{      checks: read}m' \
-  fail 'not write — its POSTs'
+  fail "job 'open' scope 'checks'"
+
+# #1662: every declared scope is required and exact, not only checks/actions.
+for permission_job in open publish; do
+  permission_scopes="contents pull-requests actions checks"
+  if [ "$permission_job" = publish ]; then
+    permission_scopes="$permission_scopes issues security-events"
+  fi
+  for permission_scope in $permission_scopes; do
+    rcp_case "permission-$permission_job-$permission_scope-absent" \
+      's{(^  '"$permission_job"':\n.*?)^      '"$permission_scope"': [^\n]*\n}{$1}ms' \
+      fail "job '$permission_job' scope '$permission_scope'"
+  done
+  rcp_case "permission-$permission_job-extra" \
+    's{(^  '"$permission_job"':\n.*?^    permissions:\n)}{$1      deployments: write\n}ms' \
+    fail "job '$permission_job' declares unexpected scope 'deployments'"
+done
+rcp_case permission-value-drift \
+  's{(^  open:\n.*?^      contents:) read}{$1 write}ms' \
+  fail "job 'open' scope 'contents'"
+rcp_case permission-third-writer \
+  's{\z}{\n  extra:\n    runs-on: ubuntu-latest\n    permissions: {checks: write}\n    steps: [{run: echo extra}]\n}s' \
+  fail '[rcp extra writer]'
+rcp_case permission-third-write-all \
+  's{\z}{\n  extra:\n    runs-on: ubuntu-latest\n    permissions: write-all\n    steps: [{run: echo extra}]\n}s' \
+  fail '[rcp extra writer]'
+rcp_case phase-one-token-absent \
+  's{(      - name: Open pending entries on the event head\n.*?)^          GH_TOKEN: [^\n]*\n}{$1}ms' \
+  fail 'declares no GH_TOKEN'
+rcp_case phase-one-token-drift \
+  's{(      - name: Open pending entries on the event head\n.*?)^          GH_TOKEN: [^\n]*}{$1          GH_TOKEN: wrong-token}ms' \
+  fail 'binds GH_TOKEN to'
 
 # The phase-1 ordering cases (A3), the success-conclusion count (A8) and
 # the read-then-write ordering cases (A12) were REMOVED with their
@@ -4050,6 +4081,35 @@ rcp_dir_case() {
   rcp_verdict "$name" "$rc" "$expect" "$want" "$dir/required-check-publisher.yml.out"
 }
 
+# #1249: the parsed trigger definition, including alternate YAML spellings.
+rcp_dir_case policy-dispatch-block \
+  'perl -0777 -i -pe "s{^on:\$}{on:\n  workflow_dispatch:}m" pr-review-policy.yml' \
+  fail '[rcp review-policy triggers]'
+rcp_dir_case policy-schedule-quoted \
+  'perl -0777 -i -pe "s{^on:\$}{\"on\":\n  \"schedule\": [{cron: \"0 * * * *\"}]}m" pr-review-policy.yml' \
+  fail 'forbids triggers'
+rcp_dir_case policy-dispatch-inline \
+  'perl -0777 -i -pe "s{^on:\n.*?(?=^permissions:)}{\"on\": {pull_request: {}, \"workflow_dispatch\": {}}\n\n}ms" pr-review-policy.yml' \
+  fail 'forbids triggers'
+rcp_dir_case policy-dispatch-list \
+  'perl -0777 -i -pe "s{^on:\n.*?(?=^permissions:)}{on: [pull_request, workflow_dispatch]\n\n}ms" pr-review-policy.yml' \
+  fail 'forbids triggers'
+rcp_dir_case policy-dispatch-scalar \
+  'perl -0777 -i -pe "s{^on:\n.*?(?=^permissions:)}{on: workflow_dispatch\n\n}ms" pr-review-policy.yml' \
+  fail 'forbids triggers'
+rcp_dir_case policy-quoted-safe \
+  'perl -0777 -i -pe "s{^on:\$}{\"on\":}m" pr-review-policy.yml' \
+  pass
+rcp_dir_case policy-list-safe \
+  'perl -0777 -i -pe "s{^on:\n.*?(?=^permissions:)}{on: [pull_request]\n\n}ms" pr-review-policy.yml' \
+  pass
+rcp_dir_case policy-missing \
+  'rm pr-review-policy.yml' \
+  fail 'cannot be validated'
+rcp_dir_case policy-invalid \
+  'printf "on: [unclosed\n" > pr-review-policy.yml' \
+  fail 'cannot be validated'
+
 # Renaming the natively-named job: the context keeps a producer in name
 # only.
 rcp_dir_case native-producer \
@@ -4084,6 +4144,32 @@ rcp_dir_case native-producer-name-drift \
 rcp_dir_case native-producer-needs-drift \
   'perl -0777 -i -pe "s{needs: \[archive-edited-feedback\]}{needs: []}" codex-p1-gate.yml' \
   fail 'does not need'
+
+rcp_dir_case native-concurrency-merge-clearance \
+  'perl -0777 -i -pe "s{^  merge-clearance-gate:\$}{  merge-clearance-gate:\n    concurrency: {group: native, cancel-in-progress: false}}m" merge-clearance-gate.yml' \
+  fail '[rcp native concurrency]'
+rcp_dir_case native-concurrency-codex \
+  'perl -0777 -i -pe "s{^  codex-p1-gate:\$}{  codex-p1-gate:\n    concurrency: {group: native, cancel-in-progress: false}}m" codex-p1-gate.yml' \
+  fail '[rcp native concurrency]'
+rcp_dir_case native-concurrency-coderabbit \
+  'perl -0777 -i -pe "s{^  coderabbit-severity-gate:\$}{  coderabbit-severity-gate:\n    concurrency: {group: native, cancel-in-progress: false}}m" coderabbit-severity-gate.yml' \
+  fail '[rcp native concurrency]'
+rcp_dir_case native-concurrency-null \
+  'perl -0777 -i -pe "s{^  coderabbit-severity-gate:\$}{  coderabbit-severity-gate:\n    concurrency: null}m" coderabbit-severity-gate.yml' \
+  fail '[rcp native concurrency]'
+
+rcp_dir_case native-workflow-concurrency-merge-clearance \
+  'perl -0777 -i -pe "s{^jobs:\$}{concurrency: {group: native, cancel-in-progress: false}\njobs:}m" merge-clearance-gate.yml' \
+  fail '[rcp native workflow concurrency]'
+rcp_dir_case native-workflow-concurrency-codex \
+  'perl -0777 -i -pe "s{^jobs:\$}{concurrency: {group: native, cancel-in-progress: false}\njobs:}m" codex-p1-gate.yml' \
+  fail '[rcp native workflow concurrency]'
+rcp_dir_case native-workflow-concurrency-coderabbit \
+  'perl -0777 -i -pe "s{^jobs:\$}{concurrency: {group: native, cancel-in-progress: false}\njobs:}m" coderabbit-severity-gate.yml' \
+  fail '[rcp native workflow concurrency]'
+rcp_dir_case native-workflow-concurrency-null \
+  'perl -0777 -i -pe "s{^jobs:\$}{concurrency: null\njobs:}m" coderabbit-severity-gate.yml' \
+  fail '[rcp native workflow concurrency]'
 
 # The A7 observer fixture is REMOVED because the assertion it exercised was
 # wrong, not merely under-powered. GitHub documents the cap as three levels

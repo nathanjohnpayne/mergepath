@@ -2370,17 +2370,8 @@ if [ "$CODEX_ENABLED" = "true" ]; then
 fi
 
 # BEGIN codex_request_diagnostics
-crc_select_head_review() { # reviews-json bot head
-  printf '%s\n' "$1" "${4:-[]}" | jq -s --arg bot "$2" --arg sha "$3" '
-    .[0] as $reviews | .[1] as $comments
-    | [$reviews[] | select(.user.login == $bot) | select(.commit_id == $sha)
-      | . as $r
-      | [$comments[] | select(.pull_request_review_id == $r.id)] as $inline
-      | select(any($inline[]; (.user.login == $bot) and (.in_reply_to_id == null))
-               or (($r.body // "") | test("[^[:space:]]"))
-               or ($inline | length) == 0)]
-    | max_by(.submitted_at) // null
-  '
+crc_select_head_review() { # reviews-json bot head comments-json
+  crqe_select_head_review "$1" "${4:-[]}" "$2" "$3"
 }
 
 # Called only after an ordinary opted-in external gate has already blocked.
@@ -2535,18 +2526,10 @@ if [ -z "$APPROVING_REVIEWER" ]; then
     log "gate (b): same-agent anchored Codex fallback unavailable because codex.enabled=false"
   elif [ -n "$SAME_AGENT_REVIEWER" ]; then
     log "gate (b): no reviewer-identity APPROVED, but same-agent author/reviewer detected (Authoring-Agent: $AUTHORING_AGENT → $SAME_AGENT_REVIEWER); checking for anchored Codex fallback per #170"
-    GATE_B_CODEX_REVIEW=$({
-      crc_select_head_review "$REVIEWS_JSON" "$BOT_LOGIN" "$HEAD_SHA" "$COMMENTS_JSON"
-      printf '%s\n' "$COMMENTS_JSON"
-    } | jq -s -r --arg sha "$HEAD_SHA" --arg bot "$BOT_LOGIN" '
-      .[0] as $review | .[1] as $comments
-      | if length == 2 and $review != null and $review.state == "COMMENTED"
-          and ($sha | test("^[0-9a-f]{40}$"))
-          and (($review.body // "") | test("!\\[P[01] Badge\\]|\\*\\*P[01]") | not)
-          and ([ $comments[] | select(.user.login == $bot and .in_reply_to_id == null
-            and .pull_request_review_id == $review.id)
-            | select((.body // "") | test("!\\[P[01] Badge\\]|\\*\\*P[01]")) ] | length) == 0
-        then $review.submitted_at else "" end')
+    GATE_B_SELECTED_REVIEW=$(crc_select_head_review "$REVIEWS_JSON" "$BOT_LOGIN" "$HEAD_SHA" "$COMMENTS_JSON") \
+      || die 3 "shared Codex head-review selector failed"
+    GATE_B_CODEX_REVIEW=$(crqe_review_approval_time "$GATE_B_SELECTED_REVIEW" "$COMMENTS_JSON" "$BOT_LOGIN" "$HEAD_SHA") \
+      || die 3 "shared Codex approval predicate failed"
     if [ -n "$GATE_B_CODEX_REVIEW" ]; then
       log "gate (b): same-agent + exact-head Codex review @ $GATE_B_CODEX_REVIEW — branch 2 cleared (#1751)"
       APPROVING_REVIEWER="(branch 2: same-agent + exact-head Codex review)"
