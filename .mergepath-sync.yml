@@ -864,6 +864,9 @@ paths:
     # Must sync in lockstep with the workflow. See #259.
     type: canonical
     consumers: all
+  - path: scripts/workflow/approval-triage.cjs
+    type: canonical
+    consumers: all
   - path: scripts/self-approval-detector.cjs
     # Runtime dependency of .github/workflows/agent-review.yml's
     # block-self-approval job and the shared final approval continuation. It
@@ -1483,6 +1486,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/workflow/approval-triage.cjs"
       - "scripts/self-approval-detector.cjs"
       - ".github/workflows/agent-review.yml"
   # Pairs with scripts/post-phase-4b-handoff.sh (#281). PATH-shimmed
@@ -1888,6 +1892,7 @@ paths:
     # wave that moved the workflow without the kit would break every
     # consumer's load-config step.
     requires:
+      - "scripts/workflow/approval-triage.cjs"
       - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/disagreement-detector.cjs"

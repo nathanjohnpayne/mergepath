@@ -10,6 +10,8 @@
 # Used by check_spec_test_alignment when the default filename search
 # wouldn't find the test.
 spec_test_map:
+  approval_triage:
+    - tests/test_self_approval_detector.sh
   coderabbit_config:
     - tests/test_check_coderabbit_config.sh
   merge_review_disagreement:

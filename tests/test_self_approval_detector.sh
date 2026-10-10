@@ -1046,4 +1046,86 @@ main().catch(error => {
 });
 NODE
 
+# #1525: invoke the actual github-script guard with fake read/write APIs.
+APPROVAL_ROOT="$ROOT" APPROVAL_WORKFLOW="$WORKFLOW" node <<'NODE'
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const root = process.env.APPROVAL_ROOT;
+const {retryGithubRead} = require(path.join(root, 'scripts/workflow/approval-triage.cjs'));
+const source = fs.readFileSync(process.env.APPROVAL_WORKFLOW, 'utf8');
+const step = source.slice(source.indexOf('      - name: Classify and dismiss ineligible approvals'));
+const scriptLines = step.slice(step.indexOf('          script: |\n') + '          script: |\n'.length).split('\n');
+const script = [];
+for (const line of scriptLines) {
+  if (line && !line.startsWith('            ')) break;
+  script.push(line.replace(/^ {12}/, ''));
+}
+const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
+const guard = new AsyncFunction('github', 'context', 'core', 'require', script.join('\n'));
+const workflowRequire = name => require(name.startsWith('./') ? path.resolve(root, name) : name);
+const head = 'a'.repeat(40);
+const pr = {number: 99, head: {sha: head}, base: {ref: 'main', sha: 'b'.repeat(40)},
+  user: {login: 'nathanjohnpayne'}, body: 'Authoring-Agent: codex', labels: [{name: 'priority:high'}]};
+const clone = value => JSON.parse(JSON.stringify(value));
+async function main() {
+  for (const error of [Object.assign(new Error('write EPIPE'), {code:'EPIPE'}),
+    Object.assign(new Error('reset'), {cause:{code:'ECONNRESET'}}), new Error('fetch failed'),
+    Object.assign(new Error('server'), {status:503}), Object.assign(new Error('rate'), {status:429})]) {
+    let calls = 0; const waits = [];
+    assert.equal(await retryGithubRead(async () => { if (++calls < 3) throw error; return 'ok'; },
+      async ms => waits.push(ms)), 'ok');
+    assert.equal(calls, 3); assert.deepEqual(waits, [250,500]);
+  }
+  for (const status of [401,403,404,422]) {
+    let calls = 0;
+    await assert.rejects(retryGithubRead(async () => { calls++; throw Object.assign(new Error('fetch failed'), {status}); }, async () => {}));
+    assert.equal(calls, 1);
+  }
+  let exhausted = 0;
+  await assert.rejects(retryGithubRead(async () => { exhausted++; throw new Error('fetch failed'); }, async () => {}));
+  assert.equal(exhausted, 3);
+  process.env.GITHUB_WORKSPACE = root;
+  process.env.TRIAGE_RESULT = 'failure';
+  process.env.REVIEWERS_JSON = '["nathanpayne-claude"]';
+  process.env.EVENT_REVIEWERS_JSON = '["nathanpayne-claude"]';
+  for (const mode of ['stable','EPIPE','head','base-ref','base-sha','body','labels','author','late-drift','old-approval','malformed','unreadable']) {
+    let reads = 0; let dismissed = 0; const outputs = {}; const failed = []; const notices = [];
+    const review = {id:301,state:'approved',commit_id:head,user:{login:'nathanpayne-claude'}};
+    if (mode === 'old-approval') review.commit_id = 'c'.repeat(40);
+    const github = {rest:{pulls:{
+      get: async () => {
+        reads++;
+        if (mode === 'EPIPE' && reads === 1) throw Object.assign(new Error('write EPIPE'), {code:'EPIPE'});
+        if (mode === 'unreadable') throw Object.assign(new Error('not found'), {status:404});
+        const live = clone(pr);
+        if (mode === 'head' || (mode === 'late-drift' && reads === 2)) live.head.sha = 'd'.repeat(40);
+        if (mode === 'base-ref') live.base.ref = 'other';
+        if (mode === 'base-sha') live.base.sha = 'd'.repeat(40);
+        if (mode === 'body') live.body += ' edited';
+        if (mode === 'labels') live.labels.push({name:'human-hold'});
+        if (mode === 'author') live.user.login = 'other-author';
+        if (mode === 'malformed') live.labels = null;
+        return {data:live};
+      },
+      dismissReview: async () => { dismissed++; },
+    }}};
+    await guard(github, {eventName:'pull_request_review',repo:{owner:'owner',repo:'repo'},
+      payload:{pull_request:clone(pr),review}}, {
+      setOutput:(key,value) => { outputs[key]=value; }, setFailed:message => failed.push(message),
+      notice:message => notices.push(message), info:() => {},
+    }, workflowRequire);
+    const preserved = mode === 'stable' || mode === 'EPIPE';
+    assert.equal(dismissed, preserved ? 0 : 1, mode);
+    assert.deepEqual(outputs, {eligible_approval:'false',snapshot_current:'false'}, mode);
+    assert.equal(failed.length, 1, mode);
+    assert.equal(notices.some(message => message.includes('preserving the approval')), preserved, mode);
+    if (mode === 'stable') assert.equal(reads, 2);
+    if (mode === 'EPIPE') assert.equal(reads, 3);
+  }
+  console.log('Approval triage: 10 bounded-retry and 12 production-guard cases passed');
+}
+main().catch(error => { console.error(error); process.exitCode = 1; });
+NODE
+
 echo "test_self_approval_detector: PASS"
