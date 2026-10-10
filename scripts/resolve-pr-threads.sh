@@ -2799,7 +2799,7 @@ ledger_paths() {
 # ledger path, exit 0; exit 1 when no row qualifies.
 #
 # A row qualifies only when it is about THIS finding in THIS repo, carries a
-# real verdict, and was recorded AFTER the staleness floor — a verdict logged
+# real verdict, and was recorded AT OR AFTER the staleness floor — a verdict logged
 # before the bot's latest re-raise dispositioned the earlier round, not the
 # live one. FAIL CLOSED throughout: an absent ledger, a malformed line (jq -s
 # errors on the whole file), or an unusable id all read as "no evidence".
@@ -2830,7 +2830,7 @@ ledger_verdict_for_finding() {
             and (.repo == $repo)
             and (((.verdict // "") | tostring) != "")
             and (((.recorded_at // "") | tostring) != "")
-            and ($floor == "" or (.recorded_at > $floor)))
+            and ($floor == "" or (.recorded_at >= $floor)))
         ' "$f" >/dev/null 2>/dev/null || rc=$?
     if [ "$rc" -eq 0 ]; then
       printf '%s' "$f"
@@ -2945,8 +2945,9 @@ EOF
 # A current bot/reviewer re-raise has a new comment id, so consult every
 # eligible current-round non-agent comment id rather than only the original
 # .all_comments[0] id. The current round begins at latest_nonagent_created;
-# ledger_verdict_for_finding separately requires recorded_at to be after that
-# same floor. The complete list invariant remains mandatory (fail-closed on a
+# ledger_verdict_for_finding separately requires recorded_at to be at or after that
+# same floor (including its timestamp second for the matching finding id).
+# The complete list invariant remains mandatory (fail-closed on a
 # re-fetch failure, #573 item 2).
 finding_dispositioned() {
   local tj="$1" cid floor lf ids

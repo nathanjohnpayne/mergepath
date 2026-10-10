@@ -2183,7 +2183,7 @@ fi
 T1010_LEDGER="$SCRATCH/t1010-coderabbit-ledger.jsonl"
 T1010_REPLIED=$(printf '%s' "$T990_B_BARE" | jq '. + [{author:{login:"nathanpayne-claude"},body:"Tracked in test/repo#42; intentionally deferred from this PR.",databaseId:99103,createdAt:"2026-01-02T00:00:00Z"}]')
 T1010_COMMITS_SAVE="$COMMITS_T990"
-for variant in bare replied same-second fixed reraised-fixed reraised-equal; do
+for variant in bare replied same-second fixed fixed-equal reraised-fixed reraised-equal reraised-fixed-equal; do
   COMMITS_T990="$T1010_COMMITS_SAVE"
   cat > "$T1010_LEDGER" <<'JSON'
 {"repo":"test/repo","comment_id":99101,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-02T00:00:00Z"}
@@ -2198,13 +2198,23 @@ JSON
     printf '%s\n' '{"repo":"test/repo","comment_id":99101,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-05T00:00:00Z"}' >> "$T1010_LEDGER"
     expected_rc=0; expected_resolved="PRT_990A PRT_990B "
   fi
-  if [ "$variant" = reraised-fixed ] || [ "$variant" = reraised-equal ]; then
+  if [ "$variant" = fixed-equal ]; then
+    jq -nc '{repo:"test/repo",comment_id:99101,verdict:"deferred",disposition:"deferred-to-followup",recorded_at:"2026-01-01T00:00:00Z"}' > "$T1010_LEDGER"
+    jq -nc '{repo:"test/repo",comment_id:99101,verdict:"fixed",disposition:"fixed",recorded_at:"2026-01-01T00:00:00Z"}' >> "$T1010_LEDGER"
+    expected_rc=0; expected_resolved="PRT_990A PRT_990B "
+  fi
+  if [ "$variant" = reraised-fixed ] || [ "$variant" = reraised-equal ] || [ "$variant" = reraised-fixed-equal ]; then
     comments="$T990_B_RERAISED"; expected_rc=0; expected_resolved="PRT_990A PRT_990B "
     COMMITS_T990='[{"sha":"c0ffee1234","login":"nathanpayne-claude","date":"2026-01-06T00:00:00Z"}]'
     deferred_at=2026-01-06T00:00:00Z
     [ "$variant" != reraised-equal ] || deferred_at=2026-01-05T00:00:00Z
     printf '{"repo":"test/repo","comment_id":99101,"disposition":"deferred-to-followup","recorded_at":"%s"}\n' "$deferred_at" >> "$T1010_LEDGER"
-    printf '%s\n' '{"repo":"test/repo","comment_id":99102,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-06T00:00:00Z"}' >> "$T1010_LEDGER"
+    fixed_at=2026-01-06T00:00:00Z
+    if [ "$variant" = reraised-fixed-equal ]; then
+      fixed_at=2026-01-05T00:00:00Z
+      printf '%s\n' '{"repo":"test/repo","comment_id":99102,"verdict":"deferred","disposition":"deferred-to-followup","recorded_at":"2026-01-05T00:00:00Z"}' >> "$T1010_LEDGER"
+    fi
+    printf '{"repo":"test/repo","comment_id":99102,"verdict":"fixed","disposition":"fixed","recorded_at":"%s"}\n' "$fixed_at" >> "$T1010_LEDGER"
   fi
   set +e
   out=$(run_t990 "$SCRATCH/t1010-$variant.log" "$(t990_threads "$comments")" CODERABBIT_FEEDBACK_LEDGER="$T1010_LEDGER")
