@@ -113,6 +113,10 @@ case "$EFFORT" in
   *) p4b_die 3 "invalid P4B_CLAUDE_EFFORT '$EFFORT' (expected low|medium|high|xhigh|max)" ;;
 esac
 
+case "$CLI_TIMEOUT" in
+  *[!0-9]*) p4b_die 3 "invalid reviewer CLI timeout '$CLI_TIMEOUT' (expected a non-negative integer)" ;;
+esac
+
 # --- obtain the diff -------------------------------------------------------
 # The orchestrator supplies an immutable object-derived diff. Standalone
 # reasoning must also provide explicit bytes; it never fetches a mutable PR.

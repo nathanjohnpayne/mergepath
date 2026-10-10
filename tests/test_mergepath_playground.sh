@@ -161,7 +161,7 @@ grep -qF 'livePRs ?? (Array.isArray(window.__PRS)' "$CHECK_FILE" \
   || { echo "currentPRs accessor fallback chain missing (#732)"; exit 1; }
 grep -qF 'const prs = currentPRs()' "$CHECK_FILE" \
   || { echo "renderPRs must route through currentPRs() (#732)"; exit 1; }
-grep -qF 'encodeURIComponent(parts[0])' "$CHECK_FILE" && grep -qF 'encodeURIComponent(parts[1])' "$CHECK_FILE" \
+{ grep -qF 'encodeURIComponent(parts[0])' "$CHECK_FILE" && grep -qF 'encodeURIComponent(parts[1])' "$CHECK_FILE"; } \
   || { echo "owner/repo must be encodeURIComponent'd before URL interpolation (#732)"; exit 1; }
 # Request timeout (#732 round 2): both the list fetch and the /files fetch
 # must route through the AbortController-backed helper so a hung request
@@ -352,6 +352,34 @@ node "$YAML_HARNESS"
 # ---------------------------------------------------------------------------
 LOADER_HARNESS="$TMPDIR_SAFE/loader_harness.mjs"
 
+# One author-declaration corpus exercises both reporting entry points.
+AUTHORS_FIXTURE="$TMPDIR_SAFE/authors.json"
+python3 - "$AUTHORS_FIXTURE" <<'PY'
+import json, sys
+cases = [
+    ("Explains the Authoring-Agent: codex convention.", "fallback"),
+    ("Authoring-Agent: claude\nExplains Authoring-Agent: codex.", "claude"),
+    ("Explains Authoring-Agent: claude.\nAuthoring-Agent: cursor\n", "cursor"),
+    ("  Authoring-Agent: codex", "fallback"),
+    ("\tAuthoring-Agent: codex", "fallback"),
+    ("Authoring-Agent:\nclaude", "fallback"),
+    ("Authoring-Agent:\nAuthoring-Agent: cursor", "cursor"),
+    ("Authoring-Agent:\tclaude", "claude"),
+    ("Prose\r\nAuthoring-Agent: codex\r\n", "codex"),
+    ("Prose\rAuthoring-Agent: codex", "codex"),
+    ("Authoring-Agent: codex wrote this", "fallback"),
+    ("Authoring-Agent: codex.foo", "fallback"),
+    ("Authoring-Agent: codex wrote this\nAuthoring-Agent: claude", "claude"),
+    ("Authoring-Agent: codex \t", "codex"),
+]
+rows = [dict(number=i, title=f"Author case {i}", merged_at="2026-01-01T00:00:00Z",
+             body=body, author={"login": "fallback"}, user={"login": "fallback"},
+             additions=0, deletions=0, files=[], expected_author=expected)
+        for i, (body, expected) in enumerate(cases, 1)]
+with open(sys.argv[1], "w") as f:
+    json.dump(rows, f)
+PY
+
 python3 - "$PAGE" "$LOADER_HARNESS" "$DOM_PRELUDE" <<'PY'
 import re, sys
 html = open(sys.argv[1]).read()
@@ -436,6 +464,16 @@ if (got[0].paths.join(',') !== 'src/a.ts,src/b.ts') fail('paths must be /files f
 if (got[1].author !== 'octocat') fail('author must fall back to user.login: ' + got[1].author);
 if (got[1].lines !== 15) fail('second PR lines wrong: ' + got[1].lines);
 
+// #927: execute the actual loader against the shared declaration corpus.
+const authorCases = JSON.parse((await import('node:fs')).readFileSync(process.argv[2], 'utf8'));
+__queue(200, authorCases);
+for (const pr of authorCases) __queue(200, []);
+const authorResults = await loadPublicRepo('octo/authors', authorCases.length);
+for (let i = 0; i < authorCases.length; i++) {
+  if (authorResults[i].author !== authorCases[i].expected_author)
+    fail('author declaration case ' + (i + 1) + ': ' + authorResults[i].author);
+}
+
 // 4b. Merged-count shortfall: the candidate page can hold more merged PRs
 //     than requested — the merged results must slice to n, and the /files
 //     budget must stay bounded by n (here: n=1 → exactly 1 /files request).
@@ -489,6 +527,51 @@ console.error('public-repo loader OK (validation, error surfaces, /files aggrega
 open(sys.argv[2], 'w').write(open(sys.argv[3]).read() + fetch_stub + body + footer)
 PY
 
-node "$LOADER_HARNESS"
+node "$LOADER_HARNESS" "$AUTHORS_FIXTURE"
+
+# Execute the real local simulator with an inert gh list and browser opener.
+# The stub evaluates its actual --jq program against the same author corpus.
+SIM_BIN="$TMPDIR_SAFE/sim-bin"
+mkdir -p "$SIM_BIN"
+cat > "$SIM_BIN/gh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+[ "$1" = "pr" ] && [ "$2" = "list" ]
+query=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--jq" ]; then
+    shift
+    query=$1
+  fi
+  shift
+done
+[ -n "$query" ]
+jq "$query" "$POLICY_SIM_TEST_PRS"
+SH
+cat > "$SIM_BIN/open" <<'SH'
+#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$1" > "$POLICY_SIM_TEST_OPENED"
+SH
+chmod +x "$SIM_BIN/gh" "$SIM_BIN/open"
+cp "$SIM_BIN/open" "$SIM_BIN/xdg-open"
+POLICY_SIM_TEST_PRS="$AUTHORS_FIXTURE" \
+POLICY_SIM_TEST_OPENED="$TMPDIR_SAFE/opened-path" \
+TMPDIR="$TMPDIR_SAFE" PATH="$SIM_BIN:$PATH" \
+  bash "$SCRIPT" 5 > "$TMPDIR_SAFE/sim-output"
+python3 - "$AUTHORS_FIXTURE" "$TMPDIR_SAFE/opened-path" <<'PY'
+import json, re, sys
+from pathlib import Path
+cases = json.loads(Path(sys.argv[1]).read_text())
+html = Path(Path(sys.argv[2]).read_text().strip()).read_text()
+html = re.sub(r"<!--.*?-->", "", html, flags=re.S)
+match = re.search(r"<script>window\.__PRS = (.*?);</script>", html, re.S)
+assert match, "local simulator did not inject the real gh result"
+rows = json.loads(match.group(1))
+assert len(rows) == len(cases)
+for row, case in zip(rows, cases):
+    assert row["author"] == case["expected_author"], (row, case)
+print("OK: local simulator and public loader author-declaration corpus passed")
+PY
 
 echo "OK: Mergepath Playground checks passed"

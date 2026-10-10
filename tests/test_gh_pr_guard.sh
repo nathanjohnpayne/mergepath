@@ -516,6 +516,15 @@ assert_rc_contains "markerless external-contributor PR can receive reviewer appr
 assert_rc_contains "markerless shared-author PR still fails closed" 2 "exactly one visible Authoring-Agent" \
   'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "" "5000" "0" "feature/fix" "nathanjohnpayne"
 
+assert_rc_contains "prose author mention is not a declaration (#927)" 2 "exactly one visible Authoring-Agent" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "Explains the Authoring-Agent: claude convention." "5000" "0"
+
+assert_rc_contains "real declaration wins over a later prose mention (#927)" 2 "self-approve detected" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" $'Authoring-Agent: codex\nExplains Authoring-Agent: claude.' "5000" "0"
+
+assert_rc_contains "indented author line is not a declaration (#927)" 2 "exactly one visible Authoring-Agent" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "  Authoring-Agent: claude" "5000" "0"
+
 # --- #671: the self-approve sub-guard resolves the reviewer the same way
 # the wrapper will (GH_AS_REVIEWER_IDENTITY, then MERGEPATH_AGENT, then
 # the default), honoring an inline same-segment MERGEPATH_AGENT prefix.

@@ -334,7 +334,7 @@ fi
 # shellcheck source=lib/codex-request-evidence.sh
 if [ ! -r "$__CODEX_REQUEST_DIR/lib/codex-request-evidence.sh" ] \
   || ! . "$__CODEX_REQUEST_DIR/lib/codex-request-evidence.sh" \
-  || ! declare -F crqe_select_trigger crqe_count_triggers crqe_ack_present crqe_request_threshold >/dev/null; then
+  || ! declare -F crqe_select_trigger crqe_count_triggers crqe_ack_present crqe_request_threshold crqe_select_head_review crqe_review_approval_time >/dev/null; then
   echo "[codex-review-request] ERROR: request evidence helper unavailable (see #1276)" >&2
   exit 3
 fi
@@ -804,7 +804,7 @@ log "ack_wait = ${ACK_WAIT_SECONDS}s    max_ack_retries = $MAX_ACK_RETRIES"
 # success. Emits empty object { "review": null, "findings": [], "reaction": null }
 # if nothing matches yet.
 scan_codex_state() {
-  local reviews comments issue_comments review findings reaction verdict blocked
+  local reviews comments issue_comments review findings reaction verdict blocked approval_time
 
   # Each read must propagate fetch_api_array's status explicitly (#966):
   # scan_codex_state is invoked from every call site as
@@ -827,19 +827,9 @@ scan_codex_state() {
   # review only and not pick up stale findings from an earlier review
   # round on the same HEAD.
   # Provider histories and finding bodies are unbounded; keep them off argv.
-  review=$(printf '%s\n' "$reviews" "$comments" | jq -s --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
-    .[0] as $reviews | .[1] as $comments
-    | [$reviews[] | select(.user.login == $bot) | select(.commit_id == $sha)
-      | . as $r
-      | [$comments[] | select(.pull_request_review_id == $r.id)] as $inline
-      | select(any($inline[]; (.user.login == $bot) and (.in_reply_to_id == null))
-               or (($r.body // "") | test("[^[:space:]]"))
-               or ($inline | length) == 0)]
-    | sort_by(.submitted_at) | last
-    | if . == null then null
-      else { id, state, submitted_at, commit_id, body }
-      end
-  ')
+  review=$(crqe_select_head_review "$reviews" "$comments" "$BOT_LOGIN" "$HEAD_SHA") || return 3
+  approval_time=$(crqe_review_approval_time "$review" "$comments" "$BOT_LOGIN" "$HEAD_SHA") || return 3
+  review=$(printf '%s\n' "$review" | jq 'if . == null then null else {id,state,submitted_at,commit_id,body} end') || return 3
 
   # Get the LATEST Codex review id so findings are scoped to that
   # round only. nathanpayne-codex caught (swipewatch propagation
@@ -962,9 +952,9 @@ scan_codex_state() {
     blocked='null'
   fi
 
-  printf '%s\n' "$review" "$findings" "$reaction" "$verdict" "$blocked" | jq -s '
+  printf '%s\n' "$review" "$findings" "$reaction" "$verdict" "$blocked" | jq -s --arg approval_time "$approval_time" '
     if length != 5 then error("incomplete Codex scan components") else
-      { review: .[0], findings: .[1], reaction: .[2], verdict: .[3], blocked: .[4] }
+      { review: .[0], findings: .[1], reaction: .[2], verdict: .[3], blocked: .[4], review_approval_eligible: ($approval_time != "") }
     end
   '
 }
@@ -1002,7 +992,8 @@ has_signal() {
 
 # Returns 0 iff the scan produced a signal that should be treated as
 # CLEARED (no further @codex review trigger needed). Cleared means one of:
-#   - a review on HEAD with zero blocking (required-tier) inline findings
+#   - a substantive review on HEAD eligible for the same-agent approval
+#     substitute, with zero blocking (required-tier) inline findings
 #     (the reviewed-and-clean path; "blocking" reflects the resolved
 #     feedback_policy required set, so this is P0/P1 by default), OR
 #   - a HEAD-anchored AFFIRMATIVE issue-comment verdict AND zero blocking
@@ -1040,7 +1031,7 @@ has_cleared_signal() {
         ({kind: "", time: ""};
          if ($sig[1] != "" and ($sig[1] >= .time)) then {kind: $sig[0], time: $sig[1]} else . end)
     ) as $latest
-    | if $latest.kind == "review" then (review_clean | tostring)
+    | if $latest.kind == "review" then ((.review_approval_eligible == true and review_clean) | tostring)
       elif $latest.kind == "verdict" then
         ((.verdict.affirmative == true and review_clean) | tostring)
       else "false"

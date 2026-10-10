@@ -97,6 +97,7 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 scenario=${CODEX_TEST_SCENARIO:?}
+head_sha=${CODEX_TEST_HEAD:-head-sha}
 author='nathanjohnpayne'
 reviewer='nathanpayne-codex'
 t='2026-06-04T00:00:00Z'
@@ -106,7 +107,7 @@ shift
 [ "${1:-}" = "--paginate" ] && shift
 endpoint=${1:-}
 case "$endpoint" in
-  repos/owner/repo/pulls/999)            printf '{"head":{"sha":"head-sha"},"base":{"ref":"main","sha":"base-sha","repo":{"default_branch":"main"}}}\n' ;;
+  repos/owner/repo/pulls/999)            jq -cn --arg h "$head_sha" '{head:{sha:$h},base:{ref:"main",sha:"base-sha",repo:{default_branch:"main"}}}' ;;
   'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha')
     printf '1\n' >>"$CODEX_TEST_STATE_DIR/base-policy-read-count"
     if [ "${CODEX_TEST_BASE_POLICY_MODE:-ok}" = fail ]; then
@@ -115,10 +116,19 @@ case "$endpoint" in
     fi
     cat "$CODEX_TEST_STATE_DIR/base-review-policy.yml"
     ;;
-  repos/owner/repo/commits/head-sha)     printf '%s\n' "$t" ;;
+  repos/owner/repo/commits/*)     printf '%s\n' "$t" ;;
   repos/owner/repo/issues/999/timeline)  printf '[]\n' ;;
-  repos/owner/repo/pulls/999/reviews)    printf '[]\n' ;;
-  repos/owner/repo/pulls/999/comments)   printf '[]\n' ;;
+  repos/owner/repo/pulls/999/reviews)
+    case "$scenario" in
+      reply-only|body-P1|body-P2)
+        body=''; [ "$scenario" = reply-only ] || body="**${scenario#body-} finding**"
+        jq -cn --arg h "$head_sha" --arg t "$t" --arg b "$body" '[{id:91,user:{login:"chatgpt-codex-connector[bot]"},commit_id:$h,submitted_at:$t,state:"COMMENTED",body:$b}]' ;;
+      *) printf '[]\n' ;;
+    esac ;;
+  repos/owner/repo/pulls/999/comments)
+    if [ "$scenario" = reply-only ]; then
+      printf '%s\n' '[{"id":92,"pull_request_review_id":91,"in_reply_to_id":90,"user":{"login":"chatgpt-codex-connector[bot]"},"body":"Review Result: Verified commit resolves the reported issue."}]'
+    else printf '[]\n'; fi ;;
   repos/owner/repo/issues/999/reactions) printf '[]\n' ;;
   repos/owner/repo/issues/999/comments)
     case "$scenario" in
@@ -1081,6 +1091,19 @@ test_workflow_declares_auto_trigger_flag() {
   fi
   [ "$FAIL" -ne "$before" ] || pass "K: registered approval remains read-only and delegates privileged continuation"
 }
+
+# #1543: actual requester entrypoint must post when gate-(b) evidence is
+# insufficient, while a substantive discretionary-only review still deduplicates.
+for scenario in reply-only body-P1 body-P2; do
+  dir=$(make_case "shared-clearance-$scenario")
+  expected=1; [ "$scenario" != body-P2 ] || expected=0
+  rc=$(CODEX_TEST_HEAD=abcdef0123456789000000000000000000000000 run_trigger_only "$dir" "$scenario")
+  if [ "$rc" = 0 ] && [ "$(trig_count "$dir")" = "$expected" ]; then
+    pass "#1543: $scenario posts exactly $expected request(s)"
+  else
+    fail "#1543: $scenario rc=$rc trigger-count=$(trig_count "$dir")"; cat "$dir/err.log" >&2
+  fi
+done
 
 test_fresh_posts_once_no_poll
 test_dup_author_skips

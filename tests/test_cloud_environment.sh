@@ -561,7 +561,7 @@ else
   fail "setup shadowed yq: rc=$rc err=$(cat "$WORKDIR/setup.err")"
 fi
 
-# A mikefarah/yq v4 older than the checks need (v4.44.3, the ensure-yq.sh pin)
+# A mikefarah/yq v4 older than the checks need (v4.52.0)
 # is not kept: setup installs the pinned one ahead of it. The minimum itself
 # and a newer release, compared as numbers (v4.100.0 > v4.53.6), are kept and
 # nothing is downloaded.
@@ -570,15 +570,15 @@ yq_stub_dir() { # <dir> <version>
   printf '#!/usr/bin/env bash\necho "yq (https://github.com/mikefarah/yq/) version %s"\n' "$2" >"$1/yq"
   chmod +x "$1/yq"
 }
-yq_stub_dir "$WORKDIR/yq-old" v4.44.3
+yq_stub_dir "$WORKDIR/yq-old" v4.52.0
 : >"$WORKDIR/curl.log"
 set +e
 run_setup "$WORKDIR/y-old" MERGEPATH_YQ_VERSION="$YQVER" MERGEPATH_YQ_SHA256="$yqsum" PATH="$WORKDIR/y-old/bin:$WORKDIR/yq-old:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
 set -e
-if [ "$rc" -eq 0 ] && grep -q "is older than mikefarah/yq v4.53.6, which the repository checks need (yq (https://github.com/mikefarah/yq/) version v4.44.3)" "$WORKDIR/setup.err" \
+if [ "$rc" -eq 0 ] && grep -q "is older than mikefarah/yq v4.53.6, which the repository checks need (yq (https://github.com/mikefarah/yq/) version v4.52.0)" "$WORKDIR/setup.err" \
    && [ -x "$WORKDIR/y-old/bin/yq" ] && grep -q "installed yq $YQVER" "$WORKDIR/setup.err" \
    && grep -q "mikefarah/yq/releases/download/$YQVER/yq_linux_amd64" "$WORKDIR/curl.log"; then
-  pass "setup, mikefarah/yq v4.44.3 on PATH: older than the minimum, so the pinned yq is installed ahead of it"
+  pass "setup, mikefarah/yq v4.52.0 on PATH: older than the minimum, so the pinned yq is installed ahead of it"
 else
   fail "setup old yq: rc=$rc err=$(cat "$WORKDIR/setup.err") curl=$(cat "$WORKDIR/curl.log")"
 fi
@@ -621,14 +621,14 @@ fi
 
 # An override that installs an older v4 does not report success with a yq the
 # checks cannot use.
-printf '#!/usr/bin/env bash\necho "yq (https://github.com/mikefarah/yq/) version v4.44.3"\n' >"$REL/yq/yq_linux_amd64"
+printf '#!/usr/bin/env bash\necho "yq (https://github.com/mikefarah/yq/) version v4.52.0"\n' >"$REL/yq/yq_linux_amd64"
 oldsum="$(sha256sum "$REL/yq/yq_linux_amd64" 2>/dev/null | awk '{print $1}')"
 [ -n "$oldsum" ] || oldsum="$(shasum -a 256 "$REL/yq/yq_linux_amd64" | awk '{print $1}')"
 set +e
-run_setup "$WORKDIR/y-oldinstall" MERGEPATH_YQ_VERSION=v4.44.3 MERGEPATH_YQ_SHA256="$oldsum" PATH="$WORKDIR/y-oldinstall/bin:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
+run_setup "$WORKDIR/y-oldinstall" MERGEPATH_YQ_VERSION=v4.52.0 MERGEPATH_YQ_SHA256="$oldsum" PATH="$WORKDIR/y-oldinstall/bin:$NOYQ" >/dev/null 2>"$WORKDIR/setup.err"; rc=$?
 set -e
 if [ "$rc" -eq 1 ] && grep -q "does not run as mikefarah/yq v4 at v4.53.6 or later" "$WORKDIR/setup.err" && ! grep -q "installed yq" "$WORKDIR/setup.err"; then
-  pass "setup, an override installing yq v4.44.3: fails instead of reporting a yq older than the minimum"
+  pass "setup, an override installing yq v4.52.0: fails instead of reporting a yq older than the minimum"
 else
   fail "setup yq old install: rc=$rc err=$(cat "$WORKDIR/setup.err")"
 fi

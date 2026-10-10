@@ -22,8 +22,9 @@
 #     "true". Local runs keep the calling tool's own hard "yq is
 #     required" error instead of getting a surprise sudo install.
 #   - Otherwise: install the PINNED release to /usr/local/bin/yq via
-#     sudo wget (the ubuntu-runner path), then verify the installed
-#     binary runs. The official ubuntu-latest image ships yq 4.x
+#     an unprivileged temporary download whose SHA-256 matches the pin
+#     below, then sudo install and verify the installed binary runs.
+#     The official ubuntu-latest image ships yq 4.x
 #     preinstalled today; pinning keeps the checks resilient to runner
 #     image changes.
 #
@@ -31,6 +32,7 @@
 # redirect the destination so no network or root is touched; production
 # uses the defaults):
 #   ENSURE_YQ_VERSION  release tag to pin (default: the one below)
+#   ENSURE_YQ_SHA256   expected digest (required for a version override)
 #   ENSURE_YQ_DEST     install destination (default /usr/local/bin/yq)
 
 set -euo pipefail
@@ -55,12 +57,34 @@ if $CI_ONLY && [ "${GITHUB_ACTIONS:-}" != "true" ]; then
   exit 0
 fi
 
-YQ_VERSION="${ENSURE_YQ_VERSION:-v4.44.3}"
+YQ_VERSION="${ENSURE_YQ_VERSION:-v4.53.6}"
 YQ_DEST="${ENSURE_YQ_DEST:-/usr/local/bin/yq}"
+# Official yq_linux_amd64 asset digest, cross-checked against the release
+# metadata: https://github.com/mikefarah/yq/releases/tag/v4.53.6
+YQ_SHA256="${ENSURE_YQ_SHA256:-c5f056448f973ae7d39b5401949648a78f2dc1947d6a8eb65be60d5c504b9385}"
+if [ "$YQ_VERSION" != v4.53.6 ] && [ -z "${ENSURE_YQ_SHA256:-}" ]; then
+  echo "ensure-yq.sh: a version override requires ENSURE_YQ_SHA256" >&2
+  exit 1
+fi
+if [[ ! "$YQ_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "ensure-yq.sh: expected SHA-256 must contain 64 lowercase hex digits" >&2
+  exit 1
+fi
 
-sudo wget -q -O "$YQ_DEST" \
+YQ_TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ensure-yq.XXXXXX")
+trap 'rm -rf "$YQ_TMP_DIR"' EXIT
+wget -q -O "$YQ_TMP_DIR/yq" \
   "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
-sudo chmod +x "$YQ_DEST"
+if command -v sha256sum >/dev/null 2>&1; then
+  YQ_ACTUAL_SHA256=$(sha256sum "$YQ_TMP_DIR/yq")
+else
+  YQ_ACTUAL_SHA256=$(shasum -a 256 "$YQ_TMP_DIR/yq")
+fi
+if [ "${YQ_ACTUAL_SHA256%% *}" != "$YQ_SHA256" ]; then
+  echo "ensure-yq.sh: SHA-256 mismatch for ${YQ_VERSION}/yq_linux_amd64; refusing install" >&2
+  exit 1
+fi
+sudo install -m 0755 "$YQ_TMP_DIR/yq" "$YQ_DEST"
 # Verify the artifact we just installed actually runs (fail closed on a
 # truncated/failed download rather than letting a later check hit it).
 "$YQ_DEST" --version

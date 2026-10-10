@@ -754,14 +754,16 @@ for adapter in "$SCHEMA_FIXTURE"/adapters/*.sh; do
 # Availability never masks invalid adapter configuration (#1955 review).
 for direction in codex claude; do
   for unavailable in cli schema; do
-    for invalid in effort budget; do
+    for invalid in effort budget timeout; do
       adapter="$ROOT/scripts/phase-4b/adapters/review-via-$direction.sh"
       [ "$unavailable" != schema ] || adapter="$SCHEMA_FIXTURE/adapters/review-via-$direction.sh"
       extra_env=(CODEX_BIN="$WORK/missing-codex" CLAUDE_BIN="$WORK/missing-claude")
       if [ "$invalid" = effort ]; then
         extra_env+=(P4B_CODEX_EFFORT=invalid P4B_CLAUDE_EFFORT=invalid)
-      else
+      elif [ "$invalid" = budget ]; then
         extra_env+=(P4B_DIFF_MAX_BYTES=invalid)
+      else
+        extra_env+=(P4B_REVIEW_CLI_TIMEOUT_SECONDS=invalid)
       fi
       set +e
       out=$(env "${extra_env[@]}" "$BASH" "$adapter" --pr 1 --diff-file "$DIFF" 2>&1)
@@ -772,6 +774,19 @@ for direction in codex claude; do
       else fail "$direction mixed $invalid/$unavailable refusal (rc=$rc): $out"; fi
     done
   done
+ done
+# The production adapters must reject an invalid inner timeout even when
+# the reviewer CLI is available, before the command runner can translate it.
+for direction in codex claude; do
+  set +e
+  out=$(env CODEX_BIN="$BIN/fake-codex-approve" CLAUDE_BIN="$BIN/fake-claude-approve-usage" \
+    P4B_REVIEW_CLI_TIMEOUT_SECONDS=invalid "$BASH" \
+    "$ROOT/scripts/phase-4b/adapters/review-via-$direction.sh" --pr 1 --diff-file "$DIFF" 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" = 3 ] && printf '%s' "$out" | grep -q 'invalid reviewer CLI timeout'; then
+    pass "$direction invalid inner timeout is a hard configuration refusal"
+  else fail "$direction invalid inner timeout status (rc=$rc): $out"; fi
  done
 # Binding validation must precede unavailability, including the wave's
 # metadata-backed path. Keep the final post-CLI binding check above, too.
