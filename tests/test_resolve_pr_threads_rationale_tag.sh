@@ -2107,11 +2107,11 @@ out=$(run_t990 "$SCRATCH/t35.log" "$(t990_threads "$T990_B_BARE")" \
 rc=$?
 set -e
 
-t35_resolved=$(resolved_threads "$SCRATCH/t35.log" | sort -u | tr '\n' ' ')
+t35_resolved=$(resolved_threads "$SCRATCH/t35.log" | sort -u | tr '\n' ' ' || true)
 if [ "$rc" -eq 3 ] \
-   && [ "$t35_resolved" = "PRT_990A " ] \
+   && [ -z "$t35_resolved" ] \
    && grep -qF "WARN: ledger $T35_LEDGER could not be parsed" <<<"$out" \
-   && grep -q 'Skipped (never-dispositioned): 1' <<<"$out" \
+   && grep -q 'Skipped (never-dispositioned): 2' <<<"$out" \
    && ! grep -q 'verdict for finding' <<<"$out"; then
   pass=$((pass + 1))
   echo "  PASS: malformed ledger fails closed AND warns naming the file"
@@ -2176,6 +2176,130 @@ else
   fail=$((fail + 1))
   echo "  FAIL: thread_is_actioned still swallows the malformed-ledger WARN (rc=$rc)" >&2
   echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
+# #1010: deferral must not become actioned through an older fixed row or
+# a prose reply. Only a later superseding fix restores that evidence.
+T1010_LEDGER="$SCRATCH/t1010-coderabbit-ledger.jsonl"
+T1010_REPLIED=$(printf '%s' "$T990_B_BARE" | jq '. + [{author:{login:"nathanpayne-claude"},body:"Tracked in test/repo#42; intentionally deferred from this PR.",databaseId:99103,createdAt:"2026-01-02T00:00:00Z"}]')
+T1010_COMMITS_SAVE="$COMMITS_T990"
+for variant in bare replied same-second fixed fixed-equal reraised-fixed reraised-equal reraised-fixed-equal tied-fixed tied-deferred tied-unhandled skew-deferred skew-fixed incomplete incomplete-replied incomplete-restored; do
+  COMMITS_T990="$T1010_COMMITS_SAVE"
+  cat > "$T1010_LEDGER" <<'JSON'
+{"repo":"test/repo","comment_id":99101,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-02T00:00:00Z"}
+{"repo":"test/repo","comment_id":99101,"verdict":"deferred","disposition":"deferred-to-followup","recorded_at":"2026-01-04T00:00:00Z"}
+JSON
+  comments="$T990_B_BARE"; expected_rc=3; expected_resolved="PRT_990A "
+  if [ "$variant" = replied ] || [ "$variant" = same-second ]; then comments="$T1010_REPLIED"; fi
+  if [ "$variant" = same-second ]; then
+    printf '%s\n' '{"repo":"test/repo","comment_id":99101,"verdict":"deferred","disposition":"deferred-to-followup","recorded_at":"2026-01-01T00:00:00Z"}' >> "$T1010_LEDGER"
+  fi
+  if [ "$variant" = fixed ]; then
+    printf '%s\n' '{"repo":"test/repo","comment_id":99101,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-05T00:00:00Z"}' >> "$T1010_LEDGER"
+    expected_rc=0; expected_resolved="PRT_990A PRT_990B "
+  fi
+  if [ "$variant" = fixed-equal ]; then
+    jq -nc '{repo:"test/repo",comment_id:99101,verdict:"deferred",disposition:"deferred-to-followup",recorded_at:"2026-01-01T00:00:00Z"}' > "$T1010_LEDGER"
+    jq -nc '{repo:"test/repo",comment_id:99101,verdict:"fixed",disposition:"fixed",recorded_at:"2026-01-01T00:00:00Z"}' >> "$T1010_LEDGER"
+    expected_rc=0; expected_resolved="PRT_990A PRT_990B "
+  fi
+  if [ "$variant" = reraised-fixed ] || [ "$variant" = reraised-equal ] || [ "$variant" = reraised-fixed-equal ]; then
+    comments="$T990_B_RERAISED"; expected_rc=0; expected_resolved="PRT_990A PRT_990B "
+    COMMITS_T990='[{"sha":"c0ffee1234","login":"nathanpayne-claude","date":"2026-01-06T00:00:00Z"}]'
+    deferred_at=2026-01-06T00:00:00Z
+    [ "$variant" != reraised-equal ] || deferred_at=2026-01-05T00:00:00Z
+    printf '{"repo":"test/repo","comment_id":99101,"disposition":"deferred-to-followup","recorded_at":"%s"}\n' "$deferred_at" >> "$T1010_LEDGER"
+    fixed_at=2026-01-06T00:00:00Z
+    if [ "$variant" = reraised-fixed-equal ]; then
+      fixed_at=2026-01-05T00:00:00Z
+      printf '%s\n' '{"repo":"test/repo","comment_id":99102,"verdict":"deferred","disposition":"deferred-to-followup","recorded_at":"2026-01-05T00:00:00Z"}' >> "$T1010_LEDGER"
+    fi
+    printf '{"repo":"test/repo","comment_id":99102,"verdict":"fixed","disposition":"fixed","recorded_at":"%s"}\n' "$fixed_at" >> "$T1010_LEDGER"
+  fi
+  case "$variant" in
+    incomplete*)
+      # A parseable partial row must not hide the preceding deferral and
+      # resurrect an older fixed verdict, even with an agent reply.
+      printf '%s\n' '{"repo":"test/repo","comment_id":99101,"verdict":"fixed","disposition":"fixed"}' >> "$T1010_LEDGER"
+      if [ "$variant" = incomplete-replied ]; then comments="$T1010_REPLIED"; fi
+      if [ "$variant" = incomplete-restored ]; then
+        printf '%s\n' '{"repo":"test/repo","comment_id":99101,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-05T00:00:00Z"}' >> "$T1010_LEDGER"
+        expected_rc=0; expected_resolved="PRT_990A PRT_990B "
+      fi
+      ;;
+    skew-*)
+      # Matching the selected finding ID proves the recorder observed it,
+      # even when its local clock lags GitHub by a second.
+      jq -nc '{repo:"test/repo",comment_id:99101,verdict:"deferred",disposition:"deferred-to-followup",recorded_at:"2025-12-31T23:59:59Z"}' > "$T1010_LEDGER"
+      if [ "$variant" = skew-deferred ]; then
+        comments="$T1010_REPLIED"
+      else
+        jq -nc '{repo:"test/repo",comment_id:99101,verdict:"fixed",disposition:"fixed",recorded_at:"2025-12-31T23:59:59Z"}' >> "$T1010_LEDGER"
+        expected_rc=0; expected_resolved="PRT_990A PRT_990B "
+      fi
+      ;;
+    tied-*)
+      comments=$(printf '%s' "$T990_B_RERAISED" | jq 'map(.createdAt = "2026-01-01T00:00:00Z")')
+      if [ "$variant" = tied-fixed ]; then
+        printf '%s\n' '{"repo":"test/repo","comment_id":99102,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-05T00:00:00Z"}' >> "$T1010_LEDGER"
+        expected_rc=0; expected_resolved="PRT_990A PRT_990B "
+      else
+        # An older fixed finding must not clear a newer deferral or an
+        # undispositioned re-raise in the same timestamp second.
+        jq -nc '{repo:"test/repo",comment_id:99101,verdict:"fixed",disposition:"fixed",recorded_at:"2026-01-05T00:00:00Z"}' > "$T1010_LEDGER"
+        if [ "$variant" = tied-deferred ]; then
+          printf '%s\n' '{"repo":"test/repo","comment_id":99102,"verdict":"deferred","disposition":"deferred-to-followup","recorded_at":"2026-01-05T00:00:00Z"}' >> "$T1010_LEDGER"
+        fi
+      fi
+      ;;
+  esac
+  set +e
+  out=$(run_t990 "$SCRATCH/t1010-$variant.log" "$(t990_threads "$comments")" CODERABBIT_FEEDBACK_LEDGER="$T1010_LEDGER")
+  rc=$?
+  set -e
+  actual_resolved=$(resolved_threads "$SCRATCH/t1010-$variant.log" | sort -u | tr '\n' ' ')
+  if [ "$rc" -eq "$expected_rc" ] && [ "$actual_resolved" = "$expected_resolved" ]; then
+    pass=$((pass + 1)); echo "  PASS: #1010 latest deferred/fixed disposition governs $variant evidence"
+  else
+    fail=$((fail + 1)); echo "  FAIL: #1010 $variant rc=$rc resolved='$actual_resolved'" >&2
+    echo "$out" >&2
+  fi
+done
+
+COMMITS_T990="$T1010_COMMITS_SAVE"
+
+# The explicit deferral path must keep the truthful class rather than
+# upgrading it to addressed-elsewhere through the older row/reply.
+printf '%s\n' '{"repo":"test/repo","comment_id":99101,"verdict":"deferred","disposition":"deferred-to-followup","recorded_at":"2026-01-06T00:00:00Z"}' >> "$T1010_LEDGER"
+GH_ARGV_LOG="$SCRATCH/t1010-defer.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$(t990_threads "$T1010_REPLIED")" "$FILES_T990" "$COMMITS_T990" "$CFILES_T990"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN CODERABBIT_FEEDBACK_LEDGER="$T1010_LEDGER" \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 778 --repo test/repo \
+    --auto-resolve-bots --rationale 'Tracked in test/repo#42; deferred from this PR.' 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1)); echo "  PASS: #1010 explicit deferral retains deferred-to-followup tag"
+else
+  fail=$((fail + 1)); echo "  FAIL: #1010 deferral tag was lost (rc=$rc)" >&2; echo "$out" >&2
+fi
+
+# A partial append cannot erase a previously explicit current deferral,
+# including when the thread carries a substantive agent reply.
+printf '%s\n' '{"partial"' >> "$T1010_LEDGER"
+set +e
+out=$(run_t990 "$SCRATCH/t1010-malformed.log" "$(t990_threads "$T1010_REPLIED")" CODERABBIT_FEEDBACK_LEDGER="$T1010_LEDGER")
+rc=$?
+set -e
+malformed_resolved=$(resolved_threads "$SCRATCH/t1010-malformed.log" | tr '\n' ' ' || true)
+if [ "$rc" -eq 3 ] && [ -z "$malformed_resolved" ] \
+  && grep -qF "WARN: ledger $T1010_LEDGER could not be parsed" <<<"$out"; then
+  pass=$((pass + 1)); echo "  PASS: #1010 partial ledger append holds actioned replies and preserves deferral"
+else
+  fail=$((fail + 1)); echo "  FAIL: #1010 malformed ledger erased a deferral (rc=$rc)" >&2; echo "$out" >&2
 fi
 
 echo

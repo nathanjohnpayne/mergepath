@@ -8,6 +8,8 @@ The publisher structural fence prevents workflow and job concurrency for all thr
 
 The shared pull-request body parser and its standalone generated runtime are specified in [`specs/pr_body_contract.md`](../../specs/pr_body_contract.md).
 
+Explicitly deferred CodeRabbit findings retain the `deferred-to-followup` ledger disposition and resolver tag. The recorder and resolver evidence contract is in `specs/review_feedback_accounting.md`.
+
 The Playground's local simulator and public-repository loader read author-agent declarations at source column zero and fall back to the GitHub login for prose mentions or indented lines. Their reporting contract and regression coverage live in specs/mergepath_playground.md and tests/test_mergepath_playground.sh.
 
 The hub-only Cockpit includes a read-only Fleet audit source: a thirty-minute schedule and authenticated manual refresh share one bounded subprocess and retain last-good rows on failure. Audit workers use the cached reviewer credential in an isolated cache; refresh does not invoke propagation. The separate confirmed-sync flow previews current hub/consumer evidence, requires explicit confirmation and runs the fixed author-wrapped executor; its contract is [Cockpit confirmed sync](https://github.com/nathanjohnpayne/mergepath/blob/main/specs/cockpit_sync.md). Its contract is [Cockpit Fleet](https://github.com/nathanjohnpayne/mergepath/blob/main/specs/cockpit_fleet.md).

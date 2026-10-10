@@ -341,7 +341,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **R-147.** The Codex recorder reacts only to soliciting findings, posts under the reviewer identity, is idempotent and HEAD-pinned, and writes a durable ledger. ● — REVIEW_POLICY.md § Phase 4a
 
-**R-148.** Each CodeRabbit finding's disposition is recorded as fixed or false-positive in the CodeRabbit ledger. ● — REVIEW_POLICY.md § Phase 2.5
+**R-148.** Each CodeRabbit finding's disposition is recorded as fixed, rebutted or explicitly deferred-to-followup in the CodeRabbit ledger. ● — REVIEW_POLICY.md § Phase 2.5
 
 **R-149.** The CodeRabbit recorder is disposition-logging only and never writes to GitHub. ● — REVIEW_POLICY.md § Phase 2.5
 
