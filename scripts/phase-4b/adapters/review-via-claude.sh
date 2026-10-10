@@ -67,6 +67,8 @@
 #               is judged by (#668).
 #
 # Exit codes: identical contract to review-via-codex.sh (0/2/3/4).
+# Exit 3 is an input/configuration refusal; unavailable reviewer CLI, schema
+# or plan login use exit 4, preserving the manual-handoff path.
 
 set -euo pipefail
 
@@ -106,10 +108,13 @@ done
 
 [ -n "$PR" ] || usage
 command -v jq >/dev/null 2>&1 || p4b_die 3 "jq is required"
-[ -r "$SCHEMA" ] || p4b_die 3 "verdict schema not readable: $SCHEMA"
 case "$EFFORT" in
   low|medium|high|xhigh|max) ;;
   *) p4b_die 3 "invalid P4B_CLAUDE_EFFORT '$EFFORT' (expected low|medium|high|xhigh|max)" ;;
+esac
+
+case "$CLI_TIMEOUT" in
+  *[!0-9]*) p4b_die 3 "invalid reviewer CLI timeout '$CLI_TIMEOUT' (expected a non-negative integer)" ;;
 esac
 
 # --- obtain the diff -------------------------------------------------------
@@ -117,10 +122,20 @@ esac
 # reasoning must also provide explicit bytes; it never fetches a mutable PR.
 [ -n "$DIFF_FILE" ] && [ -r "$DIFF_FILE" ] && [ ! -L "$DIFF_FILE" ] \
   || p4b_die 3 "an explicit regular --diff-file is required"
+# Validate hard configuration refusals before reviewer availability.
+MAX_DIFF_BYTES="$(p4b_resolve_diff_max_bytes)" \
+  || p4b_die 3 "invalid diff byte budget (P4B_DIFF_MAX_BYTES must be an integer; phase_4b_automation.diff_max_bytes must be an integer in ${P4B_MIN_DIFF_MAX_BYTES}..${P4B_MAX_DIFF_MAX_BYTES})"
+REQUIRED_SEVERITIES="$(p4b_required_verdict_severities_json)" \
+  || p4b_die 3 "invalid feedback_policy; cannot determine required verdict severities"
+# A tooling outage cannot turn malformed/tampered immutable input into the
+# wave caller's reviewer-unavailable allowance. Recheck after the CLI as well.
+p4b_bind_input "$INPUT_METADATA" "$DIFF_FILE" "$DIFF_FILE" '{}' >/dev/null \
+  || p4b_die 3 "review input metadata does not match the supplied diff"
+[ -r "$SCHEMA" ] || p4b_die 4 "verdict schema not readable: $SCHEMA"
 DIFF="$(cat "$DIFF_FILE")"
 [ -n "$DIFF" ] || p4b_die 4 "empty diff — nothing to review"
 
-command -v "$CLAUDE_BIN" >/dev/null 2>&1 || p4b_die 3 "claude CLI not found on PATH (set CLAUDE_BIN)"
+command -v "$CLAUDE_BIN" >/dev/null 2>&1 || p4b_die 4 "claude CLI not found on PATH (set CLAUDE_BIN)"
 p4b_require_claude_plan_auth "$CLAUDE_BIN"
 
 ERR_OUT="$(mktemp "${TMPDIR:-/tmp}/p4b-claude-stderr.XXXXXX")"
@@ -130,8 +145,6 @@ DIFF_FIT="$(mktemp "${TMPDIR:-/tmp}/p4b-claude-diff-fit.XXXXXX")"
 trap "rm -f '$ERR_OUT' '$DIFF_RAW' '$DIFF_FIT'" EXIT
 
 # --- bound the diff to the review byte budget (#635) ------------------------
-MAX_DIFF_BYTES="$(p4b_resolve_diff_max_bytes)" \
-  || p4b_die 3 "invalid diff byte budget (P4B_DIFF_MAX_BYTES must be an integer; phase_4b_automation.diff_max_bytes must be an integer in ${P4B_MIN_DIFF_MAX_BYTES}..${P4B_MAX_DIFF_MAX_BYTES})"
 printf '%s\n' "$DIFF" > "$DIFF_RAW"
 DIFF_BYTES="$(wc -c < "$DIFF_RAW" | tr -d '[:space:]')"
 OMIT_GLOBS="$(p4b_diff_omit_globs)"
@@ -158,8 +171,6 @@ CHANGES_REQUESTED and say so in the summary."
 fi
 
 # --- run the review --------------------------------------------------------
-REQUIRED_SEVERITIES="$(p4b_required_verdict_severities_json)" \
-  || p4b_die 3 "invalid feedback_policy; cannot determine required verdict severities"
 PROMPT="You are an external code reviewer for GitHub PR #${PR}${REPO:+ in ${REPO}}${HEAD:+ at commit ${HEAD}}.
 Exhaustive code review: keep looking for additional findings until you stop
 finding new issues, then return the verdict.

@@ -1305,8 +1305,9 @@ if [ "$DRY_RUN" != true ]; then
   revalidate_codex_request_budget_authority post-adapter
 fi
 if [ "$ADAPTER_RC" -ne 0 ]; then
-  # Input binding and setup errors are hard stops, not unavailable reviewers.
-  [ "$ADAPTER_RC" -ne 3 ] || p4b_die 3 "adapter input or infrastructure failure (exit 3)"
+  # Input/configuration refusals are hard stops. Adapter dependencies and
+  # unavailable plan login use exit 4 and retain the manual handoff (#1955).
+  [ "$ADAPTER_RC" -ne 3 ] || p4b_die 3 "adapter input or configuration refusal (exit 3)"
   if p4b_is_timeout_rc "$ADAPTER_RC"; then
     fall_back_to_manual "adapter timed out after ${ADAPTER_TIMEOUT}s"
   fi

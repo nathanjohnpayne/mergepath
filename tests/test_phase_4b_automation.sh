@@ -687,6 +687,138 @@ for integrity_case in positive capture binding transition late-transition; do
   else fail 'capture refusal dispatched the adapter'; fi
  else fail "immutable $integrity_case status (rc=$rc): $(tail -n 3 "$WORK/integrity-$integrity_case.stderr")"; fi
  done
+# #1955: dependency/auth unavailability retains the ordinary manual handoff,
+# while the immutable-input cases above retain the wave's hard-stop status.
+for direction in codex claude; do
+  for unavailable in cli auth; do
+    rm -f "$P4B_TEST_POSTED_REVIEW" "$WORK/unavailable-handoff.log"
+    extra_env=(CODEX_BIN="$BIN/fake-codex-approve" CLAUDE_BIN="$BIN/fake-claude-approve-usage")
+    author=claude
+    [ "$direction" != claude ] || author=codex
+    case "$direction:$unavailable" in
+      codex:cli) extra_env+=(CODEX_BIN="$WORK/missing-codex") ;;
+      claude:cli) extra_env+=(CLAUDE_BIN="$WORK/missing-claude") ;;
+      codex:auth) extra_env+=(P4B_CODEX_AUTH_FILE="$WORK/missing-codex-auth.json") ;;
+      claude:auth) printf '%s' '{"loggedIn":false}' > "$WORK/unavailable-auth.json"
+        extra_env+=(P4B_CLAUDE_AUTH_STATUS_FILE="$WORK/unavailable-auth.json") ;;
+    esac
+    set +e
+    out=$(env PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+      P4B_FAKE_PR_BODY_AGENT="$author" P4B_ADAPTER_TIMEOUT_SECONDS=3 \
+      P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" \
+      P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$WORK/unavailable-handoff.log" \
+      P4B_ACCT_STATE_DIR="$WORK/unavailable-$direction-$unavailable-state" \
+      "${extra_env[@]}" bash "$ORCH" 1753 --repo o/r --author "$author" \
+      --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" \
+      2>"$WORK/unavailable-$direction-$unavailable.stderr")
+    rc=$?
+    set -e
+    cause_matches=true
+    if [ "$direction:$unavailable" = claude:auth ]; then
+      grep -q 'claude is not logged in' "$WORK/unavailable-$direction-$unavailable.stderr" || cause_matches=false
+    fi
+    if [ "$rc" = 4 ] && [ "$cause_matches" = true ] && [ -s "$WORK/unavailable-handoff.log" ] \
+       && [ ! -e "$P4B_TEST_POSTED_REVIEW" ] \
+       && printf '%s' "$out" | jq -e '.fell_back_to_manual == true' >/dev/null; then
+      pass "$direction $unavailable unavailability renders manual handoff without approval"
+    else fail "$direction $unavailable fallback (rc=$rc): $(tail -n 3 "$WORK/unavailable-$direction-$unavailable.stderr")"; fi
+  done
+ done
+# Missing jq remains a hard orchestrator prerequisite, checked at the adapter boundary
+# with a PATH that cannot fall through to the host jq installation.
+MISSING_JQ_BIN="$WORK/missing-jq-bin"; mkdir -p "$MISSING_JQ_BIN"
+ln -s "$(command -v dirname)" "$MISSING_JQ_BIN/dirname"
+for adapter in "$AD_CODEX" "$AD_CLAUDE"; do
+  set +e
+  out=$(env PATH="$MISSING_JQ_BIN" "$BASH" "$adapter" --pr 1 --diff-file "$DIFF" 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" = 3 ] && printf '%s' "$out" | grep -q 'jq is required'; then
+    pass "$(basename "$adapter") missing jq retains the orchestrator prerequisite refusal"
+  else fail "missing jq status (rc=$rc): $out"; fi
+ done
+# An unreadable schema is likewise reviewer infrastructure, using copied
+# production adapters with only the schema deliberately absent.
+SCHEMA_FIXTURE="$WORK/missing-schema"; mkdir -p "$SCHEMA_FIXTURE/adapters"
+cp "$LIB" "$ROOT/scripts/phase-4b/immutable-input.sh" "$SCHEMA_FIXTURE/"
+cp "$AD_CODEX" "$AD_CLAUDE" "$SCHEMA_FIXTURE/adapters/"
+for adapter in "$SCHEMA_FIXTURE"/adapters/*.sh; do
+  set +e
+  out=$("$BASH" "$adapter" --pr 1 --diff-file "$DIFF" 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" = 4 ] && printf '%s' "$out" | grep -q 'verdict schema not readable'; then
+    pass "$(basename "$adapter") missing schema is unavailable, not an integrity refusal"
+  else fail "missing schema status (rc=$rc): $out"; fi
+ done
+# Availability never masks invalid adapter configuration (#1955 review).
+for direction in codex claude; do
+  for unavailable in cli schema; do
+    for invalid in effort budget timeout; do
+      adapter="$ROOT/scripts/phase-4b/adapters/review-via-$direction.sh"
+      [ "$unavailable" != schema ] || adapter="$SCHEMA_FIXTURE/adapters/review-via-$direction.sh"
+      extra_env=(CODEX_BIN="$WORK/missing-codex" CLAUDE_BIN="$WORK/missing-claude")
+      if [ "$invalid" = effort ]; then
+        extra_env+=(P4B_CODEX_EFFORT=invalid P4B_CLAUDE_EFFORT=invalid)
+      elif [ "$invalid" = budget ]; then
+        extra_env+=(P4B_DIFF_MAX_BYTES=invalid)
+      else
+        extra_env+=(P4B_REVIEW_CLI_TIMEOUT_SECONDS=invalid)
+      fi
+      set +e
+      out=$(env "${extra_env[@]}" "$BASH" "$adapter" --pr 1 --diff-file "$DIFF" 2>&1)
+      rc=$?
+      set -e
+      if [ "$rc" = 3 ] && printf '%s' "$out" | grep -q 'invalid'; then
+        pass "$direction invalid $invalid takes precedence over missing $unavailable"
+      else fail "$direction mixed $invalid/$unavailable refusal (rc=$rc): $out"; fi
+    done
+  done
+ done
+# The production adapters must reject an invalid inner timeout even when
+# the reviewer CLI is available, before the command runner can translate it.
+for direction in codex claude; do
+  set +e
+  out=$(env CODEX_BIN="$BIN/fake-codex-approve" CLAUDE_BIN="$BIN/fake-claude-approve-usage" \
+    P4B_REVIEW_CLI_TIMEOUT_SECONDS=invalid "$BASH" \
+    "$ROOT/scripts/phase-4b/adapters/review-via-$direction.sh" --pr 1 --diff-file "$DIFF" 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" = 3 ] && printf '%s' "$out" | grep -q 'invalid reviewer CLI timeout'; then
+    pass "$direction invalid inner timeout is a hard configuration refusal"
+  else fail "$direction invalid inner timeout status (rc=$rc): $out"; fi
+ done
+# Binding validation must precede unavailability, including the wave's
+# metadata-backed path. Keep the final post-CLI binding check above, too.
+source "$ROOT/scripts/phase-4b/immutable-input.sh"
+jq -n --arg digest "$(p4b_input_digest "$DIFF")" \
+  '{base_sha:("b"*40),head_sha:("a"*40),merge_base_sha:("c"*40),
+    diff_sha256:$digest,head_transitions_sha256:("d"*64)}' > "$WORK/valid-input.json"
+printf '%s' '{broken' > "$WORK/malformed-input.json"
+jq '.diff_sha256 = ("0"*64)' "$WORK/valid-input.json" > "$WORK/tampered-input.json"
+for direction in codex claude; do
+  for unavailable in cli schema; do
+    adapter="$ROOT/scripts/phase-4b/adapters/review-via-$direction.sh"
+    [ "$unavailable" != schema ] || adapter="$SCHEMA_FIXTURE/adapters/review-via-$direction.sh"
+    for input_case in valid malformed tampered; do
+      set +e
+      out=$(env CODEX_BIN="$WORK/missing-codex" CLAUDE_BIN="$WORK/missing-claude" \
+        "$BASH" "$adapter" --pr 1 --diff-file "$DIFF" \
+        --input-metadata "$WORK/$input_case-input.json" 2>&1)
+      rc=$?
+      set -e
+      expected=3; cause='review input metadata does not match'
+      if [ "$input_case" = valid ]; then
+        expected=4
+        if [ "$unavailable" = schema ]; then cause='verdict schema not readable'
+        else cause='CLI not found'; fi
+      fi
+      if [ "$rc" = "$expected" ] && printf '%s' "$out" | grep -q "$cause"; then
+        pass "$direction $input_case binding retains exit $expected with missing $unavailable"
+      else fail "$direction mixed binding/$unavailable refusal (rc=$rc): $out"; fi
+    done
+  done
+ done
 if [ "${1:-}" = --input-integrity-only ]; then
  printf 'Input integrity: %s passed, %s failed\n' "$PASS" "$FAIL"
  [ "$FAIL" = 0 ]; exit $?
@@ -6662,8 +6794,8 @@ for _budget_outcome in approve adapter-failure unreadable accounting-window-adap
       fail "#1305: stable adapter-failure control changed (rc=$rc reads=$(cat "$_budget_count" 2>/dev/null || true) adapter=$_budget_adapter_evidence reviewer=$(cat "$_budget_reviewer" 2>/dev/null || true) helper=$(cat "$_budget_handoff" 2>/dev/null || true) stderr=$(tr '\n' ' ' <"$_budget_stderr" 2>/dev/null || true)): $out"
     fi
   else
-    _budget_expected_reason=request-generation-changed
-    [ "$_budget_outcome" != unreadable ] || _budget_expected_reason=request-generation-reread-failed
+    _budget_expected_reason='request-generation-changed'
+    [ "$_budget_outcome" != unreadable ] || _budget_expected_reason='request-generation-reread-failed'
     if [ "$rc" = 10 ] \
        && [ "$(printf '%s' "$out" | jq -r .infrastructure_error)" = true ] \
        && [ "$(printf '%s' "$out" | jq -r '.barrier.request_budget.reason')" = "$_budget_expected_reason" ] \
