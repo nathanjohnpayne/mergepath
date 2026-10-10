@@ -4098,6 +4098,19 @@ rcp_dir_case native-concurrency-null \
   'perl -0777 -i -pe "s{^  coderabbit-severity-gate:\$}{  coderabbit-severity-gate:\n    concurrency: null}m" coderabbit-severity-gate.yml' \
   fail '[rcp native concurrency]'
 
+rcp_dir_case native-workflow-concurrency-merge-clearance \
+  'perl -0777 -i -pe "s{^jobs:\$}{concurrency: {group: native, cancel-in-progress: false}\njobs:}m" merge-clearance-gate.yml' \
+  fail '[rcp native workflow concurrency]'
+rcp_dir_case native-workflow-concurrency-codex \
+  'perl -0777 -i -pe "s{^jobs:\$}{concurrency: {group: native, cancel-in-progress: false}\njobs:}m" codex-p1-gate.yml' \
+  fail '[rcp native workflow concurrency]'
+rcp_dir_case native-workflow-concurrency-coderabbit \
+  'perl -0777 -i -pe "s{^jobs:\$}{concurrency: {group: native, cancel-in-progress: false}\njobs:}m" coderabbit-severity-gate.yml' \
+  fail '[rcp native workflow concurrency]'
+rcp_dir_case native-workflow-concurrency-null \
+  'perl -0777 -i -pe "s{^jobs:\$}{concurrency: null\njobs:}m" coderabbit-severity-gate.yml' \
+  fail '[rcp native workflow concurrency]'
+
 # The A7 observer fixture is REMOVED because the assertion it exercised was
 # wrong, not merely under-powered. GitHub documents the cap as three levels
 # of CHAINED workflows, illustrated as A → B → C → D → E → F where "E and F
