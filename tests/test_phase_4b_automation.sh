@@ -747,6 +747,28 @@ for adapter in "$SCHEMA_FIXTURE"/adapters/*.sh; do
     pass "$(basename "$adapter") missing schema is unavailable, not an integrity refusal"
   else fail "missing schema status (rc=$rc): $out"; fi
  done
+# Availability never masks invalid adapter configuration (#1955 review).
+for direction in codex claude; do
+  for unavailable in cli schema; do
+    for invalid in effort budget; do
+      adapter="$ROOT/scripts/phase-4b/adapters/review-via-$direction.sh"
+      [ "$unavailable" != schema ] || adapter="$SCHEMA_FIXTURE/adapters/review-via-$direction.sh"
+      extra_env=(CODEX_BIN="$WORK/missing-codex" CLAUDE_BIN="$WORK/missing-claude")
+      if [ "$invalid" = effort ]; then
+        extra_env+=(P4B_CODEX_EFFORT=invalid P4B_CLAUDE_EFFORT=invalid)
+      else
+        extra_env+=(P4B_DIFF_MAX_BYTES=invalid)
+      fi
+      set +e
+      out=$(env "${extra_env[@]}" "$BASH" "$adapter" --pr 1 --diff-file "$DIFF" 2>&1)
+      rc=$?
+      set -e
+      if [ "$rc" = 3 ] && printf '%s' "$out" | grep -q 'invalid'; then
+        pass "$direction invalid $invalid takes precedence over missing $unavailable"
+      else fail "$direction mixed $invalid/$unavailable refusal (rc=$rc): $out"; fi
+    done
+  done
+ done
 if [ "${1:-}" = --input-integrity-only ]; then
  printf 'Input integrity: %s passed, %s failed\n' "$PASS" "$FAIL"
  [ "$FAIL" = 0 ]; exit $?
