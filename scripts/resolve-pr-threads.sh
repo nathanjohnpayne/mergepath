@@ -2826,11 +2826,10 @@ ledger_verdict_for_finding() {
     [ -f "$f" ] || continue
     rc=0
     jq -e -s --argjson cid "$cid" --arg repo "$REPO" '
-          any(.[];
-            (.comment_id == $cid)
-            and (.repo == $repo)
+          [.[] | select(.comment_id == $cid and .repo == $repo)] | last
+            | . != null
             and (((.verdict // "") | tostring) != "")
-            and (.recorded_at | type == "string" and length > 0))
+            and (.recorded_at | type == "string" and length > 0)
         ' "$f" >/dev/null 2>/dev/null || rc=$?
     if [ "$rc" -eq 0 ]; then
       printf '%s' "$f"
@@ -2915,18 +2914,29 @@ current_round_finding_ids() {
 # older ledger row or a reply would otherwise qualify (#1010). A later
 # superseding fixed/rebutted row restores the normal evidence path.
 thread_has_current_deferral() {
-  local tj="$1" floor ids f rc
+  local tj="$1" floor ids f rc state
   floor=$(latest_nonagent_created "$tj")
   ids=$(current_round_finding_ids "$tj" "$floor") || return 2
   while IFS= read -r f; do
     [ -f "$f" ] || continue
-    if jq -e -s --argjson ids "$ids" --arg repo "$REPO" '
-      [.[] | select(.repo == $repo)] | group_by(.comment_id) | map(last)
-      | any(.[]; .comment_id as $id | ($ids | index($id)) != null
-          and .disposition == "deferred-to-followup"
-          and (.recorded_at | type == "string" and length > 0))
-    ' "$f" >/dev/null 2>/dev/null; then
-      return 0
+    if state=$(jq -r -s --argjson ids "$ids" --arg repo "$REPO" '
+      [.[] | select(.repo == $repo)
+             | select(.comment_id as $id | ($ids | index($id)) != null)]
+      | group_by(.comment_id) | map(last)
+      | if any(.[];
+          ((.recorded_at | type == "string" and length > 0)
+           and (.disposition == "deferred-to-followup"
+                or (.verdict | type == "string" and length > 0))) | not)
+        then "unusable"
+        elif any(.[]; .disposition == "deferred-to-followup") then "deferred"
+        else "clear" end
+    ' "$f" 2>/dev/null); then
+      case "$state" in
+        deferred) return 0 ;;
+        unusable)
+          echo "WARN: ledger $f has an unusable newest row for the current finding; refusing actioned classification (#1010)" >&2
+          return 2 ;;
+      esac
     else
       rc=$?
       if [ "$rc" -ne 1 ]; then

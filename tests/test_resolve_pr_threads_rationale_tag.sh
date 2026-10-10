@@ -2183,7 +2183,7 @@ fi
 T1010_LEDGER="$SCRATCH/t1010-coderabbit-ledger.jsonl"
 T1010_REPLIED=$(printf '%s' "$T990_B_BARE" | jq '. + [{author:{login:"nathanpayne-claude"},body:"Tracked in test/repo#42; intentionally deferred from this PR.",databaseId:99103,createdAt:"2026-01-02T00:00:00Z"}]')
 T1010_COMMITS_SAVE="$COMMITS_T990"
-for variant in bare replied same-second fixed fixed-equal reraised-fixed reraised-equal reraised-fixed-equal tied-fixed tied-deferred tied-unhandled skew-deferred skew-fixed; do
+for variant in bare replied same-second fixed fixed-equal reraised-fixed reraised-equal reraised-fixed-equal tied-fixed tied-deferred tied-unhandled skew-deferred skew-fixed incomplete incomplete-replied incomplete-restored; do
   COMMITS_T990="$T1010_COMMITS_SAVE"
   cat > "$T1010_LEDGER" <<'JSON'
 {"repo":"test/repo","comment_id":99101,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-02T00:00:00Z"}
@@ -2217,6 +2217,16 @@ JSON
     printf '{"repo":"test/repo","comment_id":99102,"verdict":"fixed","disposition":"fixed","recorded_at":"%s"}\n' "$fixed_at" >> "$T1010_LEDGER"
   fi
   case "$variant" in
+    incomplete*)
+      # A parseable partial row must not hide the preceding deferral and
+      # resurrect an older fixed verdict, even with an agent reply.
+      printf '%s\n' '{"repo":"test/repo","comment_id":99101,"verdict":"fixed","disposition":"fixed"}' >> "$T1010_LEDGER"
+      if [ "$variant" = incomplete-replied ]; then comments="$T1010_REPLIED"; fi
+      if [ "$variant" = incomplete-restored ]; then
+        printf '%s\n' '{"repo":"test/repo","comment_id":99101,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-05T00:00:00Z"}' >> "$T1010_LEDGER"
+        expected_rc=0; expected_resolved="PRT_990A PRT_990B "
+      fi
+      ;;
     skew-*)
       # Matching the selected finding ID proves the recorder observed it,
       # even when its local clock lags GitHub by a second.
