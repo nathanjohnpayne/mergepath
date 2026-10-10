@@ -2898,13 +2898,24 @@ thread_reply_disposition() {
   return 1
 }
 
+# Finding IDs eligible for ledger evidence at the current re-raise floor.
+# Use the same selector for deferrals and fixed/rebutted verdicts.
+current_round_finding_ids() {
+  printf '%s' "$1" | jq --arg floor "$2" --arg agents "$MERGEPATH_AGENT_AUTHORS" '
+    ($agents | split(":")) as $authors
+    | [.all_comments[] | select((.createdAt // "") >= $floor)
+       | select(.author.login as $login | ($authors | index($login)) == null)
+       | .databaseId]
+  '
+}
+
 # An explicit current deferral is not fix/rebuttal evidence, even when an
 # older ledger row or a reply would otherwise qualify (#1010). A later
 # superseding fixed/rebutted row restores the normal evidence path.
 thread_has_current_deferral() {
   local tj="$1" floor ids f rc
   floor=$(latest_nonagent_created "$tj")
-  ids=$(printf '%s' "$tj" | jq '[.all_comments[].databaseId]') || return 1
+  ids=$(current_round_finding_ids "$tj" "$floor") || return 2
   while IFS= read -r f; do
     [ -f "$f" ] || continue
     if jq -e -s --argjson ids "$ids" --arg repo "$REPO" --arg floor "$floor" '
@@ -2938,7 +2949,7 @@ EOF
 # same floor. The complete list invariant remains mandatory (fail-closed on a
 # re-fetch failure, #573 item 2).
 finding_dispositioned() {
-  local tj="$1" cid floor lf cnt i login created
+  local tj="$1" cid floor lf ids
   if thread_has_current_deferral "$tj"; then
     return 1
   else
@@ -2949,21 +2960,12 @@ finding_dispositioned() {
     return 0
   fi
   floor=$(latest_nonagent_created "$tj")
-  cnt=$(printf '%s' "$tj" | jq '.all_comments | length' 2>/dev/null || echo 0)
-  case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
-  i=0
-  while [ "$i" -lt "$cnt" ]; do
-    login=$(printf '%s' "$tj" | jq -r ".all_comments[$i].author.login // \"\"")
-    created=$(printf '%s' "$tj" | jq -r ".all_comments[$i].createdAt // \"\"")
-    cid=$(printf '%s' "$tj" | jq -r ".all_comments[$i].databaseId // \"\"")
-    if ! is_agent_author_local "$login" \
-      && { [ "$created" = "$floor" ] || [ "$created" \> "$floor" ]; }; then
-      if lf=$(ledger_verdict_for_finding "$cid" "$floor"); then
-        printf 'verdict for finding %s recorded in %s' "$cid" "${lf##*/}"
-        return 0
-      fi
+  ids=$(current_round_finding_ids "$tj" "$floor") || return 1
+  for cid in $(printf '%s' "$ids" | jq -r '.[]'); do
+    if lf=$(ledger_verdict_for_finding "$cid" "$floor"); then
+      printf 'verdict for finding %s recorded in %s' "$cid" "${lf##*/}"
+      return 0
     fi
-    i=$((i + 1))
   done
   return 1
 }

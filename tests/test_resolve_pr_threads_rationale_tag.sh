@@ -2182,7 +2182,9 @@ fi
 # a prose reply. Only a later superseding fix restores that evidence.
 T1010_LEDGER="$SCRATCH/t1010-coderabbit-ledger.jsonl"
 T1010_REPLIED=$(printf '%s' "$T990_B_BARE" | jq '. + [{author:{login:"nathanpayne-claude"},body:"Tracked in test/repo#42; intentionally deferred from this PR.",databaseId:99103,createdAt:"2026-01-02T00:00:00Z"}]')
-for variant in bare replied same-second fixed; do
+T1010_COMMITS_SAVE="$COMMITS_T990"
+for variant in bare replied same-second fixed reraised-fixed reraised-equal; do
+  COMMITS_T990="$T1010_COMMITS_SAVE"
   cat > "$T1010_LEDGER" <<'JSON'
 {"repo":"test/repo","comment_id":99101,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-02T00:00:00Z"}
 {"repo":"test/repo","comment_id":99101,"verdict":"deferred","disposition":"deferred-to-followup","recorded_at":"2026-01-04T00:00:00Z"}
@@ -2196,6 +2198,14 @@ JSON
     printf '%s\n' '{"repo":"test/repo","comment_id":99101,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-05T00:00:00Z"}' >> "$T1010_LEDGER"
     expected_rc=0; expected_resolved="PRT_990A PRT_990B "
   fi
+  if [ "$variant" = reraised-fixed ] || [ "$variant" = reraised-equal ]; then
+    comments="$T990_B_RERAISED"; expected_rc=0; expected_resolved="PRT_990A PRT_990B "
+    COMMITS_T990='[{"sha":"c0ffee1234","login":"nathanpayne-claude","date":"2026-01-06T00:00:00Z"}]'
+    deferred_at=2026-01-06T00:00:00Z
+    [ "$variant" != reraised-equal ] || deferred_at=2026-01-05T00:00:00Z
+    printf '{"repo":"test/repo","comment_id":99101,"disposition":"deferred-to-followup","recorded_at":"%s"}\n' "$deferred_at" >> "$T1010_LEDGER"
+    printf '%s\n' '{"repo":"test/repo","comment_id":99102,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-06T00:00:00Z"}' >> "$T1010_LEDGER"
+  fi
   set +e
   out=$(run_t990 "$SCRATCH/t1010-$variant.log" "$(t990_threads "$comments")" CODERABBIT_FEEDBACK_LEDGER="$T1010_LEDGER")
   rc=$?
@@ -2208,6 +2218,8 @@ JSON
     echo "$out" >&2
   fi
 done
+
+COMMITS_T990="$T1010_COMMITS_SAVE"
 
 # The explicit deferral path must keep the truthful class rather than
 # upgrading it to addressed-elsewhere through the older row/reply.
