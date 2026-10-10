@@ -2899,13 +2899,15 @@ thread_reply_disposition() {
 }
 
 # Finding IDs eligible for ledger evidence at the current re-raise floor.
-# Use the same selector for deferrals and fixed/rebutted verdicts.
+# Complete thread order breaks timestamp ties: a re-raise supersedes the
+# earlier finding even within one second. Use the same selector for
+# deferrals and fixed/rebutted verdicts.
 current_round_finding_ids() {
   printf '%s' "$1" | jq --arg floor "$2" --arg agents "$MERGEPATH_AGENT_AUTHORS" '
     ($agents | split(":")) as $authors
     | [.all_comments[] | select((.createdAt // "") >= $floor)
        | select(.author.login as $login | ($authors | index($login)) == null)
-       | .databaseId]
+      ] | [last | select(. != null) | .databaseId]
   '
 }
 
@@ -2942,9 +2944,9 @@ EOF
 # exit 0; exit 1 when this specific finding was never dispositioned.
 #
 # Recorder scripts key their ledger rows to the comment they dispositioned.
-# A current bot/reviewer re-raise has a new comment id, so consult every
-# eligible current-round non-agent comment id rather than only the original
-# .all_comments[0] id. The current round begins at latest_nonagent_created;
+# A current bot/reviewer re-raise has a new comment id, so consult the last
+# eligible current-round non-agent comment rather than the original id or
+# an earlier finding sharing its timestamp. The floor is latest_nonagent_created;
 # ledger_verdict_for_finding separately requires recorded_at to be at or after that
 # same floor (including its timestamp second for the matching finding id).
 # The complete list invariant remains mandatory (fail-closed on a
