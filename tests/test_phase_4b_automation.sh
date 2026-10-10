@@ -6794,8 +6794,8 @@ for _budget_outcome in approve adapter-failure unreadable accounting-window-adap
       fail "#1305: stable adapter-failure control changed (rc=$rc reads=$(cat "$_budget_count" 2>/dev/null || true) adapter=$_budget_adapter_evidence reviewer=$(cat "$_budget_reviewer" 2>/dev/null || true) helper=$(cat "$_budget_handoff" 2>/dev/null || true) stderr=$(tr '\n' ' ' <"$_budget_stderr" 2>/dev/null || true)): $out"
     fi
   else
-    _budget_expected_reason=request-generation-changed
-    [ "$_budget_outcome" != unreadable ] || _budget_expected_reason=request-generation-reread-failed
+    _budget_expected_reason='request-generation-changed'
+    [ "$_budget_outcome" != unreadable ] || _budget_expected_reason='request-generation-reread-failed'
     if [ "$rc" = 10 ] \
        && [ "$(printf '%s' "$out" | jq -r .infrastructure_error)" = true ] \
        && [ "$(printf '%s' "$out" | jq -r '.barrier.request_budget.reason')" = "$_budget_expected_reason" ] \
