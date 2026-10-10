@@ -2182,13 +2182,16 @@ fi
 # a prose reply. Only a later superseding fix restores that evidence.
 T1010_LEDGER="$SCRATCH/t1010-coderabbit-ledger.jsonl"
 T1010_REPLIED=$(printf '%s' "$T990_B_BARE" | jq '. + [{author:{login:"nathanpayne-claude"},body:"Tracked in test/repo#42; intentionally deferred from this PR.",databaseId:99103,createdAt:"2026-01-02T00:00:00Z"}]')
-for variant in bare replied fixed; do
+for variant in bare replied same-second fixed; do
   cat > "$T1010_LEDGER" <<'JSON'
 {"repo":"test/repo","comment_id":99101,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-02T00:00:00Z"}
 {"repo":"test/repo","comment_id":99101,"verdict":"deferred","disposition":"deferred-to-followup","recorded_at":"2026-01-04T00:00:00Z"}
 JSON
   comments="$T990_B_BARE"; expected_rc=3; expected_resolved="PRT_990A "
-  if [ "$variant" = replied ]; then comments="$T1010_REPLIED"; fi
+  if [ "$variant" = replied ] || [ "$variant" = same-second ]; then comments="$T1010_REPLIED"; fi
+  if [ "$variant" = same-second ]; then
+    printf '%s\n' '{"repo":"test/repo","comment_id":99101,"verdict":"deferred","disposition":"deferred-to-followup","recorded_at":"2026-01-01T00:00:00Z"}' >> "$T1010_LEDGER"
+  fi
   if [ "$variant" = fixed ]; then
     printf '%s\n' '{"repo":"test/repo","comment_id":99101,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-05T00:00:00Z"}' >> "$T1010_LEDGER"
     expected_rc=0; expected_resolved="PRT_990A PRT_990B "

@@ -2911,7 +2911,7 @@ thread_has_current_deferral() {
       [.[] | select(.repo == $repo)] | group_by(.comment_id) | map(last)
       | any(.[]; .comment_id as $id | ($ids | index($id)) != null
           and .disposition == "deferred-to-followup"
-          and (.recorded_at // "") > $floor)
+          and (.recorded_at // "") >= $floor)
     ' "$f" >/dev/null 2>/dev/null; then
       return 0
     else
