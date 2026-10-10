@@ -720,7 +720,7 @@ for direction in codex claude; do
     else fail "$direction $unavailable fallback (rc=$rc): $(tail -n 3 "$WORK/unavailable-$direction-$unavailable.stderr")"; fi
   done
  done
-# Missing jq must also be availability, tested at the actual adapter boundary
+# Missing jq remains a hard orchestrator prerequisite, checked at the adapter boundary
 # with a PATH that cannot fall through to the host jq installation.
 MISSING_JQ_BIN="$WORK/missing-jq-bin"; mkdir -p "$MISSING_JQ_BIN"
 ln -s "$(command -v dirname)" "$MISSING_JQ_BIN/dirname"
@@ -729,8 +729,8 @@ for adapter in "$AD_CODEX" "$AD_CLAUDE"; do
   out=$(env PATH="$MISSING_JQ_BIN" "$BASH" "$adapter" --pr 1 --diff-file "$DIFF" 2>&1)
   rc=$?
   set -e
-  if [ "$rc" = 4 ] && printf '%s' "$out" | grep -q 'jq is required'; then
-    pass "$(basename "$adapter") missing jq is unavailable, not an integrity refusal"
+  if [ "$rc" = 3 ] && printf '%s' "$out" | grep -q 'jq is required'; then
+    pass "$(basename "$adapter") missing jq retains the orchestrator prerequisite refusal"
   else fail "missing jq status (rc=$rc): $out"; fi
  done
 # An unreadable schema is likewise reviewer infrastructure, using copied

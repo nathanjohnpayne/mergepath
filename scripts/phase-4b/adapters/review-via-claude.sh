@@ -67,7 +67,7 @@
 #               is judged by (#668).
 #
 # Exit codes: identical contract to review-via-codex.sh (0/2/3/4).
-# Exit 3 is an input/configuration refusal; unavailable dependencies, schema
+# Exit 3 is an input/configuration refusal; unavailable reviewer CLI, schema
 # or plan login use exit 4, preserving the manual-handoff path.
 
 set -euo pipefail
@@ -107,7 +107,7 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$PR" ] || usage
-command -v jq >/dev/null 2>&1 || p4b_die 4 "jq is required"
+command -v jq >/dev/null 2>&1 || p4b_die 3 "jq is required"
 [ -r "$SCHEMA" ] || p4b_die 4 "verdict schema not readable: $SCHEMA"
 case "$EFFORT" in
   low|medium|high|xhigh|max) ;;

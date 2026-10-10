@@ -10,7 +10,7 @@ The hub-only Cockpit includes a read-only Fleet audit source: a thirty-minute sc
 
 `scripts/ci/check_doc_ownership` is a fail-closed repository-integrity check. It validates the `doc_ownership` inventory and verifies that canonical agent documentation does not contain rendered relative links to hub-only documentation that consumers do not receive. Its Markdown extraction contract is defined in [`specs/doc_ownership_validation.md`](../../specs/doc_ownership_validation.md) and covered by `tests/test_check_doc_ownership.sh`.
 
-Phase 4b adapter availability uses the manual-handoff status independently of immutable-input integrity refusals. Missing CLI/jq/schema and unavailable subscription auth use exit 4; binding and live head/base refusals retain exit 3 and cannot enable wave fan-out. See [`specs/phase_4b_immutable_input.md`](../../specs/phase_4b_immutable_input.md).
+Phase 4b adapter availability uses the manual-handoff status independently of immutable-input integrity refusals. Missing reviewer CLI/schema and unavailable subscription auth use exit 4; missing jq remains an orchestrator prerequisite with exit 3; binding and live head/base refusals retain exit 3 and cannot enable wave fan-out. See [`specs/phase_4b_immutable_input.md`](../../specs/phase_4b_immutable_input.md).
 
 Blocked review diagnostics bind request age and acknowledgement to an exact `@codex review` command comment; later prose mentions do not replace that evidence. The diagnostic filter preserves requester deduplication and clearance behavior. Its contract and coverage are in [`specs/codex_request_evidence.md`](../../specs/codex_request_evidence.md) and `tests/test_codex_request_evidence.sh`.
 

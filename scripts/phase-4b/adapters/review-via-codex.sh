@@ -63,8 +63,8 @@
 # Exit codes:
 #   0  valid verdict JSON on stdout.
 #   2  usage error.
-#   3  immutable-input refusal or invalid adapter configuration.
-#   4  unavailable dependency/schema/plan login, CLI error, timeout, or
+#   3  immutable-input refusal, missing jq or invalid adapter configuration.
+#   4  unavailable reviewer CLI/schema/plan login, CLI error, timeout, or
 #      non-conformant output — the orchestrator falls back to the manual
 #      handoff. Fail-closed: never emits an APPROVED on doubt.
 
@@ -107,7 +107,7 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$PR" ] || usage
-command -v jq >/dev/null 2>&1 || p4b_die 4 "jq is required"
+command -v jq >/dev/null 2>&1 || p4b_die 3 "jq is required"
 [ -r "$SCHEMA" ] || p4b_die 4 "verdict schema not readable: $SCHEMA"
 case "$EFFORT" in
   ''|minimal|low|medium|high|xhigh) ;;
