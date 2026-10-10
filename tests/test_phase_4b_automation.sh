@@ -692,7 +692,7 @@ for integrity_case in positive capture binding transition late-transition; do
 for direction in codex claude; do
   for unavailable in cli auth; do
     rm -f "$P4B_TEST_POSTED_REVIEW" "$WORK/unavailable-handoff.log"
-    extra_env=(CODEX_BIN="$BIN/fake-codex-approve" CLAUDE_BIN="$BIN/fake-claude-approve")
+    extra_env=(CODEX_BIN="$BIN/fake-codex-approve" CLAUDE_BIN="$BIN/fake-claude-approve-usage")
     author=claude
     [ "$direction" != claude ] || author=codex
     case "$direction:$unavailable" in
@@ -713,7 +713,11 @@ for direction in codex claude; do
       2>"$WORK/unavailable-$direction-$unavailable.stderr")
     rc=$?
     set -e
-    if [ "$rc" = 4 ] && [ -s "$WORK/unavailable-handoff.log" ] \
+    cause_matches=true
+    if [ "$direction:$unavailable" = claude:auth ]; then
+      grep -q 'claude is not logged in' "$WORK/unavailable-$direction-$unavailable.stderr" || cause_matches=false
+    fi
+    if [ "$rc" = 4 ] && [ "$cause_matches" = true ] && [ -s "$WORK/unavailable-handoff.log" ] \
        && [ ! -e "$P4B_TEST_POSTED_REVIEW" ] \
        && printf '%s' "$out" | jq -e '.fell_back_to_manual == true' >/dev/null; then
       pass "$direction $unavailable unavailability renders manual handoff without approval"
