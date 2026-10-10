@@ -2898,21 +2898,11 @@ thread_reply_disposition() {
   return 1
 }
 
-# finding_dispositioned <thread_json> → prints the evidence description,
-# exit 0; exit 1 when this specific finding was never dispositioned.
-#
-# Recorder scripts key their ledger rows to the comment they dispositioned.
-# A current bot/reviewer re-raise has a new comment id, so consult every
-# eligible current-round non-agent comment id rather than only the original
-# .all_comments[0] id. The current round begins at latest_nonagent_created;
-# ledger_verdict_for_finding separately requires recorded_at to be after that
-# same floor. The complete list invariant remains mandatory (fail-closed on a
-# re-fetch failure, #573 item 2).
 # An explicit current deferral is not fix/rebuttal evidence, even when an
 # older ledger row or a reply would otherwise qualify (#1010). A later
 # superseding fixed/rebutted row restores the normal evidence path.
 thread_has_current_deferral() {
-  local tj="$1" floor ids f
+  local tj="$1" floor ids f rc
   floor=$(latest_nonagent_created "$tj")
   ids=$(printf '%s' "$tj" | jq '[.all_comments[].databaseId]') || return 1
   while IFS= read -r f; do
@@ -2924,6 +2914,12 @@ thread_has_current_deferral() {
           and (.recorded_at // "") > $floor)
     ' "$f" >/dev/null 2>/dev/null; then
       return 0
+    else
+      rc=$?
+      if [ "$rc" -ne 1 ]; then
+        echo "WARN: ledger $f could not be parsed (jq exit $rc); refusing actioned classification because deferral state is unreadable (#1010)" >&2
+        return 2
+      fi
     fi
   done <<EOF
 $(ledger_paths)
@@ -2931,9 +2927,23 @@ EOF
   return 1
 }
 
+# finding_dispositioned <thread_json> → prints the evidence description,
+# exit 0; exit 1 when this specific finding was never dispositioned.
+#
+# Recorder scripts key their ledger rows to the comment they dispositioned.
+# A current bot/reviewer re-raise has a new comment id, so consult every
+# eligible current-round non-agent comment id rather than only the original
+# .all_comments[0] id. The current round begins at latest_nonagent_created;
+# ledger_verdict_for_finding separately requires recorded_at to be after that
+# same floor. The complete list invariant remains mandatory (fail-closed on a
+# re-fetch failure, #573 item 2).
 finding_dispositioned() {
   local tj="$1" cid floor lf cnt i login created
-  thread_has_current_deferral "$tj" && return 1
+  if thread_has_current_deferral "$tj"; then
+    return 1
+  else
+    [ "$?" -eq 1 ] || return 1
+  fi
   if thread_reply_disposition "$tj"; then
     printf 'agent reply on the thread after the latest re-raise'
     return 0

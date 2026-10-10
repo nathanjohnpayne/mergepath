@@ -2107,11 +2107,11 @@ out=$(run_t990 "$SCRATCH/t35.log" "$(t990_threads "$T990_B_BARE")" \
 rc=$?
 set -e
 
-t35_resolved=$(resolved_threads "$SCRATCH/t35.log" | sort -u | tr '\n' ' ')
+t35_resolved=$(resolved_threads "$SCRATCH/t35.log" | sort -u | tr '\n' ' ' || true)
 if [ "$rc" -eq 3 ] \
-   && [ "$t35_resolved" = "PRT_990A " ] \
+   && [ -z "$t35_resolved" ] \
    && grep -qF "WARN: ledger $T35_LEDGER could not be parsed" <<<"$out" \
-   && grep -q 'Skipped (never-dispositioned): 1' <<<"$out" \
+   && grep -q 'Skipped (never-dispositioned): 2' <<<"$out" \
    && ! grep -q 'verdict for finding' <<<"$out"; then
   pass=$((pass + 1))
   echo "  PASS: malformed ledger fails closed AND warns naming the file"
@@ -2223,6 +2223,21 @@ if [ "$rc" -eq 0 ] && grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-foll
   pass=$((pass + 1)); echo "  PASS: #1010 explicit deferral retains deferred-to-followup tag"
 else
   fail=$((fail + 1)); echo "  FAIL: #1010 deferral tag was lost (rc=$rc)" >&2; echo "$out" >&2
+fi
+
+# A partial append cannot erase a previously explicit current deferral,
+# including when the thread carries a substantive agent reply.
+printf '%s\n' '{"partial"' >> "$T1010_LEDGER"
+set +e
+out=$(run_t990 "$SCRATCH/t1010-malformed.log" "$(t990_threads "$T1010_REPLIED")" CODERABBIT_FEEDBACK_LEDGER="$T1010_LEDGER")
+rc=$?
+set -e
+malformed_resolved=$(resolved_threads "$SCRATCH/t1010-malformed.log" | tr '\n' ' ' || true)
+if [ "$rc" -eq 3 ] && [ -z "$malformed_resolved" ] \
+  && grep -qF "WARN: ledger $T1010_LEDGER could not be parsed" <<<"$out"; then
+  pass=$((pass + 1)); echo "  PASS: #1010 partial ledger append holds actioned replies and preserves deferral"
+else
+  fail=$((fail + 1)); echo "  FAIL: #1010 malformed ledger erased a deferral (rc=$rc)" >&2; echo "$out" >&2
 fi
 
 echo
