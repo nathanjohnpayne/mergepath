@@ -41,6 +41,11 @@ function between(text, begin, end, label) {
   return text.slice(beginAt + begin.length, endAt).replace(/^\r?\n/, '').replace(/\r?\n$/, '');
 }
 
+function markedBlock(text, begin, end, label) {
+  between(text, begin, end, label);
+  return text.slice(text.indexOf(begin), text.indexOf(end) + end.length);
+}
+
 const mode = process.argv[2] || '--check';
 if (!['--check', '--write'].includes(mode) || process.argv.length > 3) {
   fail('usage: scripts/render-self-approval-bootstrap.cjs [--check|--write]');
@@ -81,8 +86,7 @@ const approvalImplementation = between(fs.readFileSync(approvalPath, 'utf8'),
 const approvalBlocks = ['TRIAGE READ BOOTSTRAP', 'APPROVAL TRIAGE BOOTSTRAP'].map(label => {
   const begin = `            // BEGIN ${label}`;
   const end = `            // END ${label}`;
-  const body = between(workflow, begin, end, workflowPath);
-  const current = `${begin}\n${body ? body + '\n' : ''}${end}`;
+  const current = markedBlock(workflow, begin, end, workflowPath);
   const generated = [begin,
     '            // Generated from scripts/workflow/approval-triage.cjs. Do not edit.',
     '            function bootstrapApprovalTriage() {',
@@ -91,16 +95,8 @@ const approvalBlocks = ['TRIAGE READ BOOTSTRAP', 'APPROVAL TRIAGE BOOTSTRAP'].ma
     '            }', end].join('\n');
   return {current, generated};
 });
-const currentBody = between(workflow, targetBegin, targetEnd, workflowPath);
-const current = `${targetBegin}\n${currentBody}\n${targetEnd}`;
-const labelCurrentBody = between(
-  workflow,
-  labelTargetBegin,
-  labelTargetEnd,
-  workflowPath,
-);
-const labelCurrent =
-  `${labelTargetBegin}\n${labelCurrentBody}\n${labelTargetEnd}`;
+const current = markedBlock(workflow, targetBegin, targetEnd, workflowPath);
+const labelCurrent = markedBlock(workflow, labelTargetBegin, labelTargetEnd, workflowPath);
 
 if (current === generated && labelCurrent === labelGenerated &&
     approvalBlocks.every(block => block.current === block.generated)) {

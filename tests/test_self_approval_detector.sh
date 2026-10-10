@@ -53,6 +53,26 @@ if ! node "$RENDER_FIXTURE/scripts/render-self-approval-bootstrap.cjs" --write \
   cat "$RENDER_FIXTURE/write.err" "$RENDER_FIXTURE/check.err" >&2
   exit 1
 fi
+
+# A mixed-CRLF approval block must be replaced exactly, even if the other
+# blocks also change and would make an aggregate write appear successful.
+RENDER_WORKFLOW="$RENDER_FIXTURE/.github/workflows/agent-review.yml" \
+RENDER_APPROVAL="$RENDER_FIXTURE/scripts/workflow/approval-triage.cjs" node <<'NODE'
+const fs = require('fs');
+const file = process.env.RENDER_WORKFLOW;
+let workflow = fs.readFileSync(file, 'utf8');
+const begin = workflow.indexOf('            // BEGIN TRIAGE READ BOOTSTRAP');
+const endMarker = '            // END TRIAGE READ BOOTSTRAP';
+const end = workflow.indexOf(endMarker, begin) + endMarker.length;
+workflow = workflow.slice(0, begin) + workflow.slice(begin, end).replace(/\n/g, '\r\n') + workflow.slice(end);
+fs.writeFileSync(file, workflow);
+const helper = process.env.RENDER_APPROVAL;
+fs.writeFileSync(helper, fs.readFileSync(helper, 'utf8').replace(
+  '// BEGIN APPROVAL TRIAGE IMPLEMENTATION',
+  '// BEGIN APPROVAL TRIAGE IMPLEMENTATION\n// mixed-line-ending replacement regression'));
+NODE
+node "$RENDER_FIXTURE/scripts/render-self-approval-bootstrap.cjs" --write >/dev/null
+node "$RENDER_FIXTURE/scripts/render-self-approval-bootstrap.cjs" --check >/dev/null
 awk '
   /BEGIN SELF-APPROVAL BOOTSTRAP/ { capture=1; next }
   /END SELF-APPROVAL BOOTSTRAP/   { capture=0 }
