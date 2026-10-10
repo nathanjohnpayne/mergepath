@@ -208,7 +208,7 @@ for success_requirement in \
 done
 
 if grep -qF 'approvals = [context.payload.review]' "$WORKFLOW" ||
-  ! grep -qF 'listReviews: currentPr => github.paginate(' "$WORKFLOW"; then
+  ! grep -qF 'listReviews: currentPr => retryGithubRead(() => github.paginate(' "$WORKFLOW"; then
   echo "check_self_approval_detector: direct approval events must paginate and enforce the complete standing approval set" >&2
   exit 1
 fi
