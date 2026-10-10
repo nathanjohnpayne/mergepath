@@ -22,6 +22,8 @@ The Codex requester and same-agent merge fallback share the substantive review-r
 
 Blocked review diagnostics bind request age and acknowledgement to an exact `@codex review` command comment; later prose mentions do not replace that evidence. The diagnostic filter preserves requester deduplication and clearance behavior. Its contract and coverage are in [`specs/codex_request_evidence.md`](../../specs/codex_request_evidence.md) and `tests/test_codex_request_evidence.sh`.
 
+The publisher structural fence pins both complete permission maps, excludes extra Checks-API writers and requires the phase-1 token binding. Its contract and mutation coverage are in `specs/required_check_publisher.md` and `tests/test_merge_clearance_gate.sh`.
+
 Cockpit live observations read bounded local Phase 4b heartbeat records independently of accounting history. The launch-owned default directory, canonical process identity, observed adapter clock and separate POST/final-summary facts are specified in `specs/cockpit_live_agents.md`; shared HTTP/SSE and scheduling remain in `specs/cockpit_foundation.md`.
 
 The Cockpit header shows nathanjohnpayne’s author GraphQL allowance first, obtained by a bounded fixed read-only worker using the canonical noninteractive cached-author check; the resident server retains only its reviewer credential and displays that active reviewer’s response-header pools separately. Independent identity, reset, stale and backoff evidence is specified in `specs/cockpit_foundation.md`; telemetry never warms credentials or invokes confirmed sync.

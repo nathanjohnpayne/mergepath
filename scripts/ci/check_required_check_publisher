@@ -82,8 +82,6 @@
 #   * job reachability beyond the existence of the known producer jobs;
 #     their parsed display-name contracts ARE pinned below, including the
 #     exact read-only-aware Codex expression introduced by #1000;
-#   * the all-jobs sweep for `checks: write` (the two known jobs ARE
-#     checked below; a third job added later is not).
 # Also tracked, in #976: the dataflow residual behind the head-binding
 # allowlist — reassigning an allowlisted variable immediately before a
 # POST rebinds it without touching any binding site.
@@ -211,6 +209,15 @@ PUBLISHER, PARENT_WORKFLOW, WORKFLOW_DIR = sys.argv[1], sys.argv[2], sys.argv[3]
 # every failure after phase 1 fail CLOSED; one job cannot carry both.
 OPEN_JOB = "open"
 PUBLISH_JOB = "publish"
+EXPECTED_JOB_PERMISSIONS = {
+    OPEN_JOB: {
+        "contents": "read", "pull-requests": "read", "actions": "read", "checks": "write",
+    },
+    PUBLISH_JOB: {
+        "contents": "read", "pull-requests": "read", "issues": "read",
+        "actions": "read", "checks": "write", "security-events": "read",
+    },
+}
 
 # The three gate workflows and the display-name contract each producer job
 # must retain (A5). Merge clearance and CodeRabbit are static. Codex selects
@@ -362,7 +369,8 @@ EXPECTED_CONCURRENCY_KEYS = {"group", "cancel-in-progress"}
 REQUIRED_HEAD_ENV = {
     OPEN_JOB: (
         "Open pending entries on the event head",
-        {"HEAD_SHA": "${{ github.event.workflow_run.head_sha }}"},
+        {"HEAD_SHA": "${{ github.event.workflow_run.head_sha }}",
+         "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}"},
     ),
     PUBLISH_JOB: (
         "Resolve targets, evaluate gates, publish",
@@ -800,17 +808,23 @@ for key, job in ((OPEN_JOB, open_job), (PUBLISH_JOB, publish_job)):
         bad("FAIL: [rcp permissions] job %r declares no permissions mapping, so it" % key,
             "      inherits the workflow floor and cannot write check runs at all.")
         continue
-    if perms.get("checks") != "write":
-        bad("FAIL: [rcp permissions] job %r has checks: %r, not write — its POSTs"
-            % (key, perms.get("checks")),
-            "      403 and that path silently stops refreshing every required context.")
-    if perms.get("actions") != "read":
-        bad("FAIL: [rcp permissions] job %r has actions: %r, not read. Both jobs"
-            % (key, perms.get("actions")),
-            "      read Actions run state — `open` guards on the parent's status,",
-            "      `publish` reads its own server-issued start time — and without the",
-            "      scope those lookups 403 into a degraded branch on repositories",
-            "      whose default workflow permission is restricted.")
+    expected = EXPECTED_JOB_PERMISSIONS[key]
+    for scope in sorted(set(perms) | set(expected)):
+        if scope not in expected:
+            bad("FAIL: [rcp permission map] job %r declares unexpected scope %r."
+                % (key, scope))
+        elif scope not in perms or perms[scope] != expected[scope]:
+            bad("FAIL: [rcp permission map] job %r scope %r is %r, expected %r."
+                % (key, scope, perms.get(scope), expected[scope]))
+
+for key, job in jobs.items():
+    if key in EXPECTED_JOB_PERMISSIONS or not isinstance(job, dict):
+        continue
+    perms = job.get("permissions")
+    if perms == "write-all" or (isinstance(perms, dict) and perms.get("checks") == "write"):
+        bad("FAIL: [rcp extra writer] job %r grants checks: write outside open/publish."
+            % key,
+            "      Only the two reviewed publisher jobs may write this lineage (#1662).")
 
 # ── A2 — every head_sha binding SITE is on an allowlist ────────────────
 #
