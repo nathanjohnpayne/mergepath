@@ -921,6 +921,11 @@ for basename, (job_key, context, expected_display) in NATIVE_PRODUCERS.items():
             "      that a workflow owns.")
         continue
     gate_job = gate_jobs[job_key]
+    if isinstance(gate_job, dict) and "concurrency" in gate_job:
+        bad("FAIL: [rcp native concurrency] %s job %r must not declare concurrency."
+            % (path, job_key),
+            "      Cancelling a pending native required check cannot be retired by",
+            "      the publisher's independent Checks-API lineage (#1661).")
     display = gate_job.get("name") if isinstance(gate_job, dict) else None
     effective = display if display is not None else job_key
     if str(effective) != expected_display:
