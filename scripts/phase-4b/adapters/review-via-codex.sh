@@ -63,9 +63,9 @@
 # Exit codes:
 #   0  valid verdict JSON on stdout.
 #   2  usage error.
-#   3  missing dependency (codex/jq/gh) or unreadable schema.
-#   4  adapter could not produce a VALID verdict (CLI error, timeout, or
-#      non-conformant output) — the orchestrator falls back to the manual
+#   3  immutable-input refusal or invalid adapter configuration.
+#   4  unavailable dependency/schema/plan login, CLI error, timeout, or
+#      non-conformant output — the orchestrator falls back to the manual
 #      handoff. Fail-closed: never emits an APPROVED on doubt.
 
 set -euo pipefail
@@ -107,8 +107,8 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$PR" ] || usage
-command -v jq >/dev/null 2>&1 || p4b_die 3 "jq is required"
-[ -r "$SCHEMA" ] || p4b_die 3 "verdict schema not readable: $SCHEMA"
+command -v jq >/dev/null 2>&1 || p4b_die 4 "jq is required"
+[ -r "$SCHEMA" ] || p4b_die 4 "verdict schema not readable: $SCHEMA"
 case "$EFFORT" in
   ''|minimal|low|medium|high|xhigh) ;;
   *) p4b_die 3 "invalid P4B_CODEX_EFFORT '$EFFORT' (expected minimal|low|medium|high|xhigh)" ;;
@@ -122,7 +122,7 @@ esac
 DIFF="$(cat "$DIFF_FILE")"
 [ -n "$DIFF" ] || p4b_die 4 "empty diff — nothing to review"
 
-command -v "$CODEX_BIN" >/dev/null 2>&1 || p4b_die 3 "codex CLI not found on PATH (set CODEX_BIN)"
+command -v "$CODEX_BIN" >/dev/null 2>&1 || p4b_die 4 "codex CLI not found on PATH (set CODEX_BIN)"
 p4b_require_codex_plan_auth
 CODEX_AUTH_SOURCE="$(p4b_codex_auth_file)"
 

@@ -67,6 +67,8 @@
 #               is judged by (#668).
 #
 # Exit codes: identical contract to review-via-codex.sh (0/2/3/4).
+# Exit 3 is an input/configuration refusal; unavailable dependencies, schema
+# or plan login use exit 4, preserving the manual-handoff path.
 
 set -euo pipefail
 
@@ -105,8 +107,8 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$PR" ] || usage
-command -v jq >/dev/null 2>&1 || p4b_die 3 "jq is required"
-[ -r "$SCHEMA" ] || p4b_die 3 "verdict schema not readable: $SCHEMA"
+command -v jq >/dev/null 2>&1 || p4b_die 4 "jq is required"
+[ -r "$SCHEMA" ] || p4b_die 4 "verdict schema not readable: $SCHEMA"
 case "$EFFORT" in
   low|medium|high|xhigh|max) ;;
   *) p4b_die 3 "invalid P4B_CLAUDE_EFFORT '$EFFORT' (expected low|medium|high|xhigh|max)" ;;
@@ -120,7 +122,7 @@ esac
 DIFF="$(cat "$DIFF_FILE")"
 [ -n "$DIFF" ] || p4b_die 4 "empty diff — nothing to review"
 
-command -v "$CLAUDE_BIN" >/dev/null 2>&1 || p4b_die 3 "claude CLI not found on PATH (set CLAUDE_BIN)"
+command -v "$CLAUDE_BIN" >/dev/null 2>&1 || p4b_die 4 "claude CLI not found on PATH (set CLAUDE_BIN)"
 p4b_require_claude_plan_auth "$CLAUDE_BIN"
 
 ERR_OUT="$(mktemp "${TMPDIR:-/tmp}/p4b-claude-stderr.XXXXXX")"
