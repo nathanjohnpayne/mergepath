@@ -882,6 +882,7 @@ paths:
     consumers: all
     requires:
       - "scripts/self-approval-detector.cjs"
+      - "scripts/workflow/approval-triage.cjs"
       - ".github/workflows/agent-review.yml"
   - path: scripts/resolve-pr-threads.sh
     type: canonical

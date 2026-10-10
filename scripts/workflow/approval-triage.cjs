@@ -1,5 +1,6 @@
 'use strict';
 
+// BEGIN APPROVAL TRIAGE IMPLEMENTATION
 // Read-only GitHub operations: retry transport failures, never policy drift or
 // a permanent authorization/not-found response. Three attempts, 750ms backoff.
 async function retryGithubRead(read, wait = ms => new Promise(resolve => setTimeout(resolve, ms))) {
@@ -29,7 +30,7 @@ async function preserveApprovalAfterTriageFailure(input) {
       !eventPr || !eventPr.head || !eventPr.head.sha ||
       !eventPr.base || !eventPr.base.ref || !eventPr.base.sha ||
       !eventPr.user || typeof eventPr.user.login !== 'string' || !eventPr.user.login ||
-      typeof eventPr.body !== 'string' || review.commit_id !== eventPr.head.sha) return false;
+      (eventPr.body !== null && typeof eventPr.body !== 'string') || review.commit_id !== eventPr.head.sha) return false;
   try {
     const expected = snapshot(eventPr);
     const before = await retryGithubRead(readPr);
@@ -41,4 +42,13 @@ async function preserveApprovalAfterTriageFailure(input) {
   }
 }
 
-module.exports = {retryGithubRead, preserveApprovalAfterTriageFailure};
+function selectApprovalTriage(input) {
+  if (input.modulePresent) return input.loadCanonical();
+  if (input.trustedWorkflow.includes('const approvalTriage = selectApprovalTriage(')) {
+    throw new Error('trusted workflow requires the missing approval-triage canonical helper');
+  }
+  return input.loadBootstrap();
+}
+// END APPROVAL TRIAGE IMPLEMENTATION
+
+module.exports = {retryGithubRead, preserveApprovalAfterTriageFailure, selectApprovalTriage};

@@ -75,6 +75,22 @@ const labelGenerated = [
   ),
   labelTargetEnd,
 ].join('\n');
+const approvalPath = path.join(root, 'scripts/workflow/approval-triage.cjs');
+const approvalImplementation = between(fs.readFileSync(approvalPath, 'utf8'),
+  '// BEGIN APPROVAL TRIAGE IMPLEMENTATION', '// END APPROVAL TRIAGE IMPLEMENTATION', approvalPath);
+const approvalBlocks = ['TRIAGE READ BOOTSTRAP', 'APPROVAL TRIAGE BOOTSTRAP'].map(label => {
+  const begin = `            // BEGIN ${label}`;
+  const end = `            // END ${label}`;
+  const body = between(workflow, begin, end, workflowPath);
+  const current = `${begin}\n${body ? body + '\n' : ''}${end}`;
+  const generated = [begin,
+    '            // Generated from scripts/workflow/approval-triage.cjs. Do not edit.',
+    '            function bootstrapApprovalTriage() {',
+    ...approvalImplementation.split(/\r?\n/).map(line => line ? `              ${line}` : ''),
+    '              return {retryGithubRead, preserveApprovalAfterTriageFailure, selectApprovalTriage};',
+    '            }', end].join('\n');
+  return {current, generated};
+});
 const currentBody = between(workflow, targetBegin, targetEnd, workflowPath);
 const current = `${targetBegin}\n${currentBody}\n${targetEnd}`;
 const labelCurrentBody = between(
@@ -86,7 +102,8 @@ const labelCurrentBody = between(
 const labelCurrent =
   `${labelTargetBegin}\n${labelCurrentBody}\n${labelTargetEnd}`;
 
-if (current === generated && labelCurrent === labelGenerated) {
+if (current === generated && labelCurrent === labelGenerated &&
+    approvalBlocks.every(block => block.current === block.generated)) {
   process.stdout.write(
     'render-self-approval-bootstrap: PASS (generated mirrors are current)\n',
   );
@@ -97,9 +114,12 @@ if (mode === '--check') {
   fail('generated workflow bootstrap is stale; run scripts/render-self-approval-bootstrap.cjs --write');
 }
 
-const updated = workflow
+let updated = workflow
   .replace(current, () => generated)
   .replace(labelCurrent, () => labelGenerated);
+for (const block of approvalBlocks) {
+  updated = updated.replace(block.current, () => block.generated);
+}
 if (updated === workflow) {
   fail('could not replace the workflow bootstrap blocks');
 }
