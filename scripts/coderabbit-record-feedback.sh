@@ -14,9 +14,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # After the authoring agent adjudicates each CodeRabbit inline finding
-# (fixed by a code change, or rebutted as a false positive), this helper
-# records the per-finding verdict so CodeRabbit review precision is
-# trackable over time, symmetric with the Codex ledger from #487.
+# (fixed, rebutted, or explicitly deferred), this helper records the
+# per-finding verdict so review precision is trackable over time, symmetric
+# with the Codex ledger from #487.
 #
 # Usage:
 #   scripts/coderabbit-record-feedback.sh <PR_NUMBER> [--repo <owner/repo>] \
@@ -39,6 +39,10 @@
 #                         rebutted | false-positive |
 #                           false_positive | not-useful |
 #                           not_useful | -1                → disposition `rebutted`
+#                         deferred | tracked | split |
+#                           deferred-to-followup          → disposition `deferred-to-followup`
+#                       Legacy real/useful/+1 aliases still mean fixed.
+#                       Use deferred for accepted findings not fixed here.
 #                       A comment_id with no matching collected finding is
 #                       skipped with a `not-found` note, not an error.
 #   --findings-json F   Read a findings array from F (a file, or "-" for
@@ -83,7 +87,7 @@
 #     path: "p"|null, line: N|null,
 #     tier: "p1"|"p2"|"p3"|"nitpick"|null,   # coderabbit_tier_of (#576)
 #     verdict: "<alias as supplied>",
-#     disposition: "fixed"|"rebutted",
+#     disposition: "fixed"|"rebutted"|"deferred-to-followup",
 #     reason: "..."|null,
 #     resolved: true|false,     # thread isResolved at record time
 #     superseded_prior: true|false,
@@ -319,16 +323,20 @@ fi
 
 # --- verdict vocabulary -----------------------------------------------------
 
-# Map a verdict alias to its disposition. Echoes `fixed` or `rebutted` on
-# success, returns non-zero on an unrecognized alias. Same alias set as the
+# Map a verdict alias to fixed, rebutted, or deferred-to-followup. Returns
+# non-zero on an unrecognized alias. Fixed/rebutted aliases match the
 # codex twin's resolve_reaction (the +1/-1/thumbs* aliases are kept for
 # muscle-memory parity even though NO reaction is ever posted here).
+# Explicit deferral is CodeRabbit-only: Codex reacts to usefulness and keeps
+# its raw verdict; this ledger additionally names the resolve-side class.
 resolve_disposition() {
   local v
   v=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
   case "$v" in
     fixed|real|useful|"+1"|thumbsup|thumbs-up|up)
       printf 'fixed\n' ;;
+    deferred|tracked|split|deferred-to-followup)
+      printf 'deferred-to-followup\n' ;;
     rebutted|false-positive|false_positive|falsepositive|not-useful|not_useful|notuseful|"-1"|thumbsdown|thumbs-down|down)
       printf 'rebutted\n' ;;
     *)
@@ -341,7 +349,7 @@ resolve_disposition() {
 # effects (stricter placement than the codex twin, per the #584 contract).
 for ((vi = 0; vi < ${#VERDICT_VALS[@]}; vi++)); do
   if ! resolve_disposition "${VERDICT_VALS[$vi]}" >/dev/null; then
-    die 2 "unrecognized verdict '${VERDICT_VALS[$vi]}' for comment ${VERDICT_IDS[$vi]} (use fixed|real|useful|+1 or rebutted|false-positive|not-useful|-1)"
+    die 2 "unrecognized verdict '${VERDICT_VALS[$vi]}' for comment ${VERDICT_IDS[$vi]} (use fixed|real|useful|+1, rebutted|false-positive|not-useful|-1, or deferred|tracked|split|deferred-to-followup)"
   fi
 done
 

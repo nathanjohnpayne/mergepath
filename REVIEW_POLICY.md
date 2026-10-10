@@ -311,6 +311,7 @@ After internal review passes (Phase 2), CodeRabbit provides an independent autom
 
    - **Validated as real and actioned (fixed)** → `--verdict <id>=fixed` (disposition `fixed`).
    - **Determined to be a false positive / rebutted** → `--verdict <id>=false-positive[:<reason>]` (disposition `rebutted`).
+   - **Accepted but deferred** → `--verdict <id>=deferred:<follow-up reason>` (aliases `tracked`, `split`, `deferred-to-followup`; disposition `deferred-to-followup`). Legacy `real`/`useful`/`+1` aliases retain their fixed meaning. Use the matching `--auto-resolve-bots --rationale` path for a permitted deferral; a deferred ledger row is not evidence of a fix or rebuttal.
 
    This is the CodeRabbit counterpart of the Codex step 13a-bis recorder, with **one by-nature asymmetry**: Codex ends each finding with *"Useful? React with 👍 / 👎."*, so `scripts/codex-record-feedback.sh` POSTs the solicited reaction. CodeRabbit does **not** solicit per-finding reactions, so `scripts/coderabbit-record-feedback.sh` is **disposition-logging only** — it NEVER posts a reaction (or any other write) to GitHub; every GitHub call it makes is a read (REST GETs plus the read-only GraphQL `reviewThreads` query for the `resolved` bit). The helper:
 
@@ -319,7 +320,7 @@ After internal review passes (Phase 2), CodeRabbit provides an independent autom
    - Is **idempotent / append-only**: re-recording a comment with the same disposition is a no-op; a different disposition appends a superseding row flagged `superseded_prior: true` without rewriting prior rows.
    - Writes a **durable per-finding verdict** (comment_id, tier, verdict, disposition, optional reason, resolved bit) to a JSONL ledger (`.mergepath/coderabbit-feedback-ledger.jsonl` by default) so CodeRabbit review precision is trackable over time, symmetric with the Codex ledger from #487.
 
-   This step is disposition-tracking, not a merge gate — CodeRabbit remains advisory. It records the same fix/rebuttal decisions the agent already made in step 4; skipping it leaves the CodeRabbit ledger empty but does not block the merge.
+   This step is disposition-tracking, not a merge gate — CodeRabbit remains advisory. It records the same fix, rebuttal or permitted-deferral decisions the agent already made in step 4; skipping it leaves the CodeRabbit ledger empty but does not block the merge.
 7. CodeRabbit review is advisory. It does not block merge via CI and does not submit a "Changes Requested" review state.
 
 CodeRabbit's advisory status does **not** override GitHub branch protection's `required_conversation_resolution` gate. A CodeRabbit comment may be left unfixed only when it is not an unresolved GitHub review conversation, or when the agent has posted an explicit rationale and used the allowed bot-thread resolution path in the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate).
@@ -339,7 +340,7 @@ Before moving past Phase 2.5, confirm all of the following:
 - [ ] Read inline diff comments via the `pulls/{pr}/comments` endpoint, **with `--paginate`** (`gh api --paginate repos/{owner}/{repo}/pulls/{pr}/comments`) — an unpaginated read returns only the first page, so every "have I handled everything?" question gets answered against a partial finding list and the gap looks smaller than it is (#990). The helper scripts already paginate internally; this is for the ad-hoc reads an agent runs alongside them
 - [ ] Graded inline comments with the shared `coderabbit_tier_of` ladder (not a literal `Potential issue` / `⚠️` grep) — every `p0`/`p1` finding addressed
 - [ ] Substantive findings fixed or dismissed with reasoning
-- [ ] Recorded each finding's disposition (fixed / rebutted) via `scripts/coderabbit-record-feedback.sh` (disposition-logging only — no reaction posted; #584)
+- [ ] Recorded each finding's disposition (fixed / rebutted / permitted deferral) via `scripts/coderabbit-record-feedback.sh` (disposition-logging only — no reaction posted; #584)
 
 ### Real-Time Per-Finding Disposition (#865)
 

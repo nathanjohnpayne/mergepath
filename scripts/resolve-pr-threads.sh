@@ -2908,8 +2908,32 @@ thread_reply_disposition() {
 # ledger_verdict_for_finding separately requires recorded_at to be after that
 # same floor. The complete list invariant remains mandatory (fail-closed on a
 # re-fetch failure, #573 item 2).
+# An explicit current deferral is not fix/rebuttal evidence, even when an
+# older ledger row or a reply would otherwise qualify (#1010). A later
+# superseding fixed/rebutted row restores the normal evidence path.
+thread_has_current_deferral() {
+  local tj="$1" floor ids f
+  floor=$(latest_nonagent_created "$tj")
+  ids=$(printf '%s' "$tj" | jq '[.all_comments[].databaseId]') || return 1
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    if jq -e -s --argjson ids "$ids" --arg repo "$REPO" --arg floor "$floor" '
+      [.[] | select(.repo == $repo)] | group_by(.comment_id) | map(last)
+      | any(.[]; .comment_id as $id | ($ids | index($id)) != null
+          and .disposition == "deferred-to-followup"
+          and (.recorded_at // "") > $floor)
+    ' "$f" >/dev/null 2>/dev/null; then
+      return 0
+    fi
+  done <<EOF
+$(ledger_paths)
+EOF
+  return 1
+}
+
 finding_dispositioned() {
   local tj="$1" cid floor lf cnt i login created
+  thread_has_current_deferral "$tj" && return 1
   if thread_reply_disposition "$tj"; then
     printf 'agent reply on the thread after the latest re-raise'
     return 0

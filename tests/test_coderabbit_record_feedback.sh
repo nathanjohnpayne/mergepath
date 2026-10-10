@@ -472,6 +472,35 @@ test_marker_absence_preserves_supplied_tier() {
   fi
 }
 
+test_deferred_aliases_and_superseding_rows() {
+  local alias dir rc rc2 rc3 rc4
+  for alias in deferred tracked split deferred-to-followup; do
+    dir=$(make_case "deferred-$alias")
+    jq -n --arg b "$MINOR_BODY" '[{path:"x",line:1,comment_id:9801,body:$b}]' > "$dir/findings.json"
+    make_threads_fixture '[{isResolved: true, comment_ids: [9801]}]' > "$dir/threads.json"
+    rc=$(run_case "$dir" -- 999 --repo owner/repo --findings-json findings.json --verdict 9801=fixed)
+    rc2=$(run_case "$dir" -- 999 --repo owner/repo --findings-json findings.json --verdict "9801=$alias:tracked in owner/repo#42")
+    rc3=$(run_case "$dir" -- 999 --repo owner/repo --findings-json findings.json --verdict 9801=deferred)
+    if [ "$rc/$rc2/$rc3" != "0/0/0" ] || [ "$(ledger_lines "$dir")" != 2 ] \
+      || ! jq -se --arg alias "$alias" '
+        .[0].disposition == "fixed" and .[1].disposition == "deferred-to-followup"
+        and .[1].verdict == $alias and .[1].reason == "tracked in owner/repo#42"
+        and .[1].resolved == true and .[1].superseded_prior == true
+      ' "$(ledger_file "$dir")" >/dev/null; then
+      fail "deferred alias $alias must preserve a truthful superseding row and be idempotent"
+      continue
+    fi
+    rc4=$(run_case "$dir" -- 999 --repo owner/repo --findings-json findings.json --verdict 9801=fixed)
+    if [ "$rc4" = 0 ] && [ "$(ledger_lines "$dir")" = 3 ] \
+      && jq -se '.[0].disposition == "fixed" and .[1].disposition == "deferred-to-followup" and .[2].disposition == "fixed" and .[2].superseded_prior' "$(ledger_file "$dir")" >/dev/null; then
+      pass "deferred alias $alias remains distinguishable after resolution; later fix appends without rewriting history"
+    else
+      fail "deferred alias $alias could not be superseded by a later fix"
+    fi
+  done
+}
+
+test_deferred_aliases_and_superseding_rows
 test_tier_extraction_error_refuses_supplied_fallback
 test_marker_absence_preserves_supplied_tier
 test_fixed_verdict_writes_ledger_row
