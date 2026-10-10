@@ -103,6 +103,10 @@ module.exports = [
   // a follow-up commit on the propagation PR if a repo needs extras
   // (e.g., functions/lib for cloud-functions repos).
   //
+  // `dist-*/**` covers secondary build outputs (e.g. nathanpaynedotcom's
+  // `dist-flag-off/` and `dist-privacy-test/` feature-flag builds); they
+  // are minified bundles, never source, and are not tracked anywhere.
+  //
   // `.claude/worktrees/**` is the per-agent worktree root that
   // Claude Code creates for parallel sub-tasks; linting the working
   // copies inside it is duplicative and noisy on every agent run.
@@ -110,6 +114,7 @@ module.exports = [
     ignores: [
       "node_modules/**",
       "dist/**",
+      "dist-*/**",
       "build/**",
       "coverage/**",
       ".astro/**",
