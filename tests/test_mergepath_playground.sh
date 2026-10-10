@@ -362,6 +362,10 @@ cases = [
     ("Explains Authoring-Agent: claude.\nAuthoring-Agent: cursor\n", "cursor"),
     ("  Authoring-Agent: codex", "fallback"),
     ("\tAuthoring-Agent: codex", "fallback"),
+    ("Authoring-Agent:\nclaude", "fallback"),
+    ("Authoring-Agent:\nAuthoring-Agent: cursor", "cursor"),
+    ("Authoring-Agent:\tclaude", "claude"),
+    ("Prose\r\nAuthoring-Agent: codex\r\n", "codex"),
 ]
 rows = [dict(number=i, title=f"Author case {i}", merged_at="2026-01-01T00:00:00Z",
              body=body, author={"login": "fallback"}, user={"login": "fallback"},

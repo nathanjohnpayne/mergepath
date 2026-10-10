@@ -1644,7 +1644,7 @@
       const files = Array.isArray(filesBody) ? filesBody : [];
       // Author detection mirrors scripts/policy-sim.sh: Authoring-Agent:
       // declaration at column zero first, then the GitHub login.
-      const m = String(pr.body || '').match(/^Authoring-Agent:\s*([A-Za-z0-9_-]+)/m);
+      const m = String(pr.body || '').match(/^Authoring-Agent:[ \t]*([A-Za-z0-9_-]+)/m);
       prs.push({
         id: '#' + pr.number,
         title: pr.title,
