@@ -2795,13 +2795,14 @@ ledger_paths() {
     "${CODERABBIT_FEEDBACK_LEDGER:-$dir/coderabbit-feedback-ledger.jsonl}"
 }
 
-# ledger_verdict_for_finding <comment_id> <floor-iso> → prints the matching
+# ledger_verdict_for_finding <current-comment-id> → prints the matching
 # ledger path, exit 0; exit 1 when no row qualifies.
 #
 # A row qualifies only when it is about THIS finding in THIS repo, carries a
-# real verdict, and was recorded AT OR AFTER the staleness floor — a verdict logged
-# before the bot's latest re-raise dispositioned the earlier round, not the
-# live one. FAIL CLOSED throughout: an absent ledger, a malformed line (jq -s
+# real verdict and a recorded timestamp. The caller selects the current
+# finding ID first; matching that ID proves observation without comparing
+# the recorder's local clock with GitHub's clock. FAIL CLOSED throughout:
+# an absent ledger, a malformed line (jq -s
 # errors on the whole file), or an unusable id all read as "no evidence".
 #
 # The fail-closed status is deliberately the same either way — no evidence
@@ -2816,7 +2817,7 @@ ledger_paths() {
 # reason printed by callers, tells the operator something they can fix in a
 # second.
 ledger_verdict_for_finding() {
-  local cid="$1" floor="$2" f rc
+  local cid="$1" f rc
   case "$cid" in
     ''|null|*[!0-9]*) return 1 ;;
   esac
@@ -2824,13 +2825,12 @@ ledger_verdict_for_finding() {
     [ -n "$f" ] || continue
     [ -f "$f" ] || continue
     rc=0
-    jq -e -s --argjson cid "$cid" --arg repo "$REPO" --arg floor "$floor" '
+    jq -e -s --argjson cid "$cid" --arg repo "$REPO" '
           any(.[];
             (.comment_id == $cid)
             and (.repo == $repo)
             and (((.verdict // "") | tostring) != "")
-            and (((.recorded_at // "") | tostring) != "")
-            and ($floor == "" or (.recorded_at >= $floor)))
+            and (.recorded_at | type == "string" and length > 0))
         ' "$f" >/dev/null 2>/dev/null || rc=$?
     if [ "$rc" -eq 0 ]; then
       printf '%s' "$f"
@@ -2920,11 +2920,11 @@ thread_has_current_deferral() {
   ids=$(current_round_finding_ids "$tj" "$floor") || return 2
   while IFS= read -r f; do
     [ -f "$f" ] || continue
-    if jq -e -s --argjson ids "$ids" --arg repo "$REPO" --arg floor "$floor" '
+    if jq -e -s --argjson ids "$ids" --arg repo "$REPO" '
       [.[] | select(.repo == $repo)] | group_by(.comment_id) | map(last)
       | any(.[]; .comment_id as $id | ($ids | index($id)) != null
           and .disposition == "deferred-to-followup"
-          and (.recorded_at // "") >= $floor)
+          and (.recorded_at | type == "string" and length > 0))
     ' "$f" >/dev/null 2>/dev/null; then
       return 0
     else
@@ -2947,8 +2947,7 @@ EOF
 # A current bot/reviewer re-raise has a new comment id, so consult the last
 # eligible current-round non-agent comment rather than the original id or
 # an earlier finding sharing its timestamp. The floor is latest_nonagent_created;
-# ledger_verdict_for_finding separately requires recorded_at to be at or after that
-# same floor (including its timestamp second for the matching finding id).
+# matching the selected ID binds ledger evidence without cross-clock ordering.
 # The complete list invariant remains mandatory (fail-closed on a
 # re-fetch failure, #573 item 2).
 finding_dispositioned() {
@@ -2965,7 +2964,7 @@ finding_dispositioned() {
   floor=$(latest_nonagent_created "$tj")
   ids=$(current_round_finding_ids "$tj" "$floor") || return 1
   for cid in $(printf '%s' "$ids" | jq -r '.[]'); do
-    if lf=$(ledger_verdict_for_finding "$cid" "$floor"); then
+    if lf=$(ledger_verdict_for_finding "$cid"); then
       printf 'verdict for finding %s recorded in %s' "$cid" "${lf##*/}"
       return 0
     fi
