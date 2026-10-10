@@ -1466,6 +1466,7 @@ paths:
       # in the six repos where it is required: the new cases expect FAIL lines
       # an older check does not emit.
       - "scripts/ci/check_merge_clearance_gate"
+      - ".github/workflows/pr-review-policy.yml"  # #1249 sibling fixture
       - "scripts/merge-clearance-gate.sh"
       # Test 22's positive controls are EXTRACTED from the workflow (#849), so
       # the test reads it directly at runtime. Without this edge the closure
@@ -2354,6 +2355,7 @@ paths:
       # mid-rollout, not broken), so this edge is defence in depth on the
       # #845 ordering constraint, not the only guard.
       - ".github/workflows/required-check-publisher.yml"  # check_required_check_publisher subject
+      - ".github/workflows/pr-review-policy.yml"  # #1249 parsed native gate trigger fence
       - "tests/test_required_check_publisher_dedup.sh"  # check_required_check_publisher behavior suite (#1130)
       - "tests/test_required_check_publisher_summary_hold.sh"  # CodeRabbit rc-3 publication hold (#886)
       - ".github/workflows/pr-audit.yml"       # check_pr_audit_codex_clearance

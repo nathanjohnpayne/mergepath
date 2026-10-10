@@ -15,3 +15,5 @@ Blocked review diagnostics bind request age and acknowledgement to an exact `@co
 Cockpit live observations read bounded local Phase 4b heartbeat records independently of accounting history. The launch-owned default directory, canonical process identity, observed adapter clock and separate POST/final-summary facts are specified in `specs/cockpit_live_agents.md`; shared HTTP/SSE and scheduling remain in `specs/cockpit_foundation.md`.
 
 The Cockpit header shows nathanjohnpayne’s author GraphQL allowance first, obtained by a bounded fixed read-only worker using the canonical noninteractive cached-author check; the resident server retains only its reviewer credential and displays that active reviewer’s response-header pools separately. Independent identity, reset, stale and backoff evidence is specified in `specs/cockpit_foundation.md`; telemetry never warms credentials or invokes confirmed sync.
+
+The propagated publisher structural fence also prevents scheduled and manually dispatched runs of the native body/label gate. Its parsed-YAML contract is in `specs/required_check_publisher.md` and its mutation cases are in `tests/test_merge_clearance_gate.sh`.

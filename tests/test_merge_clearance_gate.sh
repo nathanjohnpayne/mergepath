@@ -3483,7 +3483,7 @@ mkdir -p "$RCP_DIR"
 # Populated from the real .github/workflows so the controls cannot drift.
 RCP_WFDIR="$RCP_DIR/workflows"
 mkdir -p "$RCP_WFDIR"
-for _f in required-check-publisher.yml merge-clearance-gate.yml \
+for _f in required-check-publisher.yml merge-clearance-gate.yml pr-review-policy.yml \
           codex-p1-gate.yml coderabbit-severity-gate.yml; do
   cp "$ROOT/.github/workflows/$_f" "$RCP_WFDIR/$_f"
 done
@@ -4049,6 +4049,35 @@ rcp_dir_case() {
   rc=$(rcp_run "$dir/required-check-publisher.yml" "$dir" "$dir/merge-clearance-gate.yml")
   rcp_verdict "$name" "$rc" "$expect" "$want" "$dir/required-check-publisher.yml.out"
 }
+
+# #1249: the parsed trigger definition, including alternate YAML spellings.
+rcp_dir_case policy-dispatch-block \
+  'perl -0777 -i -pe "s{^on:\$}{on:\n  workflow_dispatch:}m" pr-review-policy.yml' \
+  fail '[rcp review-policy triggers]'
+rcp_dir_case policy-schedule-quoted \
+  'perl -0777 -i -pe "s{^on:\$}{\"on\":\n  \"schedule\": [{cron: \"0 * * * *\"}]}m" pr-review-policy.yml' \
+  fail 'forbids triggers'
+rcp_dir_case policy-dispatch-inline \
+  'perl -0777 -i -pe "s{^on:\n.*?(?=^permissions:)}{\"on\": {pull_request: {}, \"workflow_dispatch\": {}}\n\n}ms" pr-review-policy.yml' \
+  fail 'forbids triggers'
+rcp_dir_case policy-dispatch-list \
+  'perl -0777 -i -pe "s{^on:\n.*?(?=^permissions:)}{on: [pull_request, workflow_dispatch]\n\n}ms" pr-review-policy.yml' \
+  fail 'forbids triggers'
+rcp_dir_case policy-dispatch-scalar \
+  'perl -0777 -i -pe "s{^on:\n.*?(?=^permissions:)}{on: workflow_dispatch\n\n}ms" pr-review-policy.yml' \
+  fail 'forbids triggers'
+rcp_dir_case policy-quoted-safe \
+  'perl -0777 -i -pe "s{^on:\$}{\"on\":}m" pr-review-policy.yml' \
+  pass
+rcp_dir_case policy-list-safe \
+  'perl -0777 -i -pe "s{^on:\n.*?(?=^permissions:)}{on: [pull_request]\n\n}ms" pr-review-policy.yml' \
+  pass
+rcp_dir_case policy-missing \
+  'rm pr-review-policy.yml' \
+  fail 'cannot be validated'
+rcp_dir_case policy-invalid \
+  'printf "on: [unclosed\n" > pr-review-policy.yml' \
+  fail 'cannot be validated'
 
 # Renaming the natively-named job: the context keeps a producer in name
 # only.
