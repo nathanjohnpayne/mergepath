@@ -1113,12 +1113,14 @@ async function main() {
   assert.equal(selectApprovalTriage({modulePresent:false,trustedWorkflow:'old workflow',loadBootstrap:()=>'fallback'}), 'fallback');
   assert.throws(() => selectApprovalTriage({modulePresent:false,trustedWorkflow:source,loadBootstrap:()=>'fallback'}), /requires the missing/);
   assert.throws(() => selectApprovalTriage({modulePresent:true,trustedWorkflow:'old workflow',loadCanonical:()=>{throw new Error('broken canonical');},loadBootstrap:()=>'fallback'}), /broken canonical/);
-  for (const mode of ['stable','null-body','first-rollout','EPIPE','head','base-ref','base-sha','body','labels','author','late-drift','old-approval','malformed','unreadable']) {
+  for (const mode of ['stable','null-body','first-rollout','EPIPE','head','base-ref','base-sha','body','labels','author','late-drift','old-approval','malformed','unreadable','missing-canonical','unregistered','not-approved','non-review']) {
     let reads = 0; let dismissed = 0; const outputs = {}; const failed = []; const notices = [];
     const eventPr = clone(pr);
     if (mode === 'null-body') eventPr.body = null;
     const review = {id:301,state:'approved',commit_id:head,user:{login:'nathanpayne-claude'}};
     if (mode === 'old-approval') review.commit_id = 'c'.repeat(40);
+    if (mode === 'unregistered') review.user.login = 'human-reviewer';
+    if (mode === 'not-approved') review.state = 'commented';
     const github = {rest:{pulls:{
       get: async () => {
         reads++;
@@ -1136,27 +1138,27 @@ async function main() {
       },
       dismissReview: async () => { dismissed++; },
     }}};
-    await guard(github, {eventName:'pull_request_review',repo:{owner:'owner',repo:'repo'},
+    await guard(github, {eventName:mode === 'non-review' ? 'pull_request' : 'pull_request_review',repo:{owner:'owner',repo:'repo'},
       payload:{pull_request:eventPr,review}}, {
       setOutput:(key,value) => { outputs[key]=value; }, setFailed:message => failed.push(message),
       notice:message => notices.push(message), info:() => {},
-    }, mode === 'first-rollout' ? name => {
+    }, ['first-rollout','missing-canonical'].includes(mode) ? name => {
       if (name === 'fs') return {...fs,
         existsSync:file => String(file).endsWith('approval-triage.cjs') ? false : fs.existsSync(file),
         readFileSync:(file,...args) => String(file).endsWith('agent-review.yml')
-          ? source.replaceAll('const approvalTriage = selectApprovalTriage(', 'old-helper-rollout')
+          ? (mode === 'first-rollout' ? source.replaceAll('const approvalTriage = selectApprovalTriage(', 'old-helper-rollout') : source)
           : fs.readFileSync(file,...args)};
       return workflowRequire(name);
     } : workflowRequire);
     const preserved = ['stable','null-body','first-rollout','EPIPE'].includes(mode);
-    assert.equal(dismissed, preserved ? 0 : 1, mode);
+    assert.equal(dismissed, preserved || ['unregistered','not-approved','non-review'].includes(mode) ? 0 : 1, mode);
     assert.deepEqual(outputs, {eligible_approval:'false',snapshot_current:'false'}, mode);
     assert.equal(failed.length, 1, mode);
     assert.equal(notices.some(message => message.includes('preserving the approval')), preserved, mode);
     if (mode === 'stable') assert.equal(reads, 2);
     if (mode === 'EPIPE') assert.equal(reads, 3);
   }
-  console.log('Approval triage: 10 bounded-retry, 3 canonical-loader and 14 production-guard cases passed');
+  console.log('Approval triage: 10 bounded-retry, 3 canonical-loader and 18 production-guard cases passed');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });
 NODE

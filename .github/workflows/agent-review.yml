@@ -1165,16 +1165,7 @@ jobs:
             }
             // END APPROVAL TRIAGE BOOTSTRAP
             const {selectApprovalTriage} = bootstrapApprovalTriage();
-            const approvalTriagePath = path.resolve(process.env.GITHUB_WORKSPACE,
-              'scripts/workflow/approval-triage.cjs');
-            const approvalTriage = selectApprovalTriage({
-              modulePresent: fs.existsSync(approvalTriagePath),
-              trustedWorkflow: fs.readFileSync(path.resolve(process.env.GITHUB_WORKSPACE,
-                '.github/workflows/agent-review.yml'), 'utf8'),
-              loadCanonical: () => require(approvalTriagePath),
-              loadBootstrap: bootstrapApprovalTriage,
-            });
-            const {retryGithubRead, preserveApprovalAfterTriageFailure} = approvalTriage;
+
 
             // BEGIN SELF-APPROVAL BOOTSTRAP
             // Generated from scripts/self-approval-detector.cjs. Do not edit.
@@ -1689,6 +1680,29 @@ jobs:
 
             core.setOutput('eligible_approval', 'false');
             core.setOutput('snapshot_current', 'false');
+            let retryGithubRead, preserveApprovalAfterTriageFailure;
+            try {
+              const approvalTriagePath = path.resolve(process.env.GITHUB_WORKSPACE,
+                'scripts/workflow/approval-triage.cjs');
+              const approvalTriage = selectApprovalTriage({
+                modulePresent: fs.existsSync(approvalTriagePath),
+                trustedWorkflow: fs.readFileSync(path.resolve(process.env.GITHUB_WORKSPACE,
+                  '.github/workflows/agent-review.yml'), 'utf8'),
+                loadCanonical: () => require(approvalTriagePath),
+                loadBootstrap: bootstrapApprovalTriage,
+              });
+              ({retryGithubRead, preserveApprovalAfterTriageFailure} = approvalTriage);
+              if (typeof retryGithubRead !== 'function' ||
+                  typeof preserveApprovalAfterTriageFailure !== 'function') {
+                throw new Error('approval-triage helper exports are unavailable');
+              }
+            } catch (error) {
+              await failClosedBeforeClassification(
+                `approval-triage helper load failed: ${error.message}`,
+                'Approval-triage helper is unavailable; refusing to classify or consume approvals.',
+              );
+              return;
+            }
             const eventPr = context.payload.pull_request;
             const policySnapshot = candidate => JSON.stringify({
               head: candidate && candidate.head && candidate.head.sha,

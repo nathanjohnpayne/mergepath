@@ -865,6 +865,8 @@ paths:
     type: canonical
     consumers: all
   - path: scripts/workflow/approval-triage.cjs
+    # Trusted agent-review runtime; the workflow and renderer require this
+    # source. Generated workflow mirrors allow only the first atomic rollout.
     type: canonical
     consumers: all
   - path: scripts/self-approval-detector.cjs
