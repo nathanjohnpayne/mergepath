@@ -911,6 +911,30 @@ if GITHUB_SHA_REF.search(raw_text):
 # reinstates both over a parsed shell AST, where the property is the one
 # actually asserted.
 
+# The body/label gate's native contexts must never run on dispatch or cron
+# (#1249): skipped jobs still satisfy required checks. Reuse ActionsLoader
+# so quoted keys and flow-style YAML cannot bypass the trigger fence.
+policy_path = os.path.join(WORKFLOW_DIR, "pr-review-policy.yml")
+try:
+    policy_doc = load(policy_path)
+    policy_on = policy_doc.get("on") if isinstance(policy_doc, dict) else None
+    if isinstance(policy_on, dict):
+        policy_triggers = set(policy_on)
+    elif isinstance(policy_on, list) and all(isinstance(x, str) for x in policy_on):
+        policy_triggers = set(policy_on)
+    elif isinstance(policy_on, str):
+        policy_triggers = {policy_on}
+    else:
+        raise ValueError("missing or invalid on trigger definition")
+    forbidden = policy_triggers & {"schedule", "workflow_dispatch"}
+    if forbidden:
+        bad("FAIL: [rcp review-policy triggers] %s forbids triggers %s (#1249):"
+            % (policy_path, sorted(forbidden)),
+            "      non-PR runs can publish satisfying skipped native gate checks.")
+except Exception as exc:
+    bad("FAIL: [rcp review-policy triggers] %s cannot be validated: %s"
+        % (policy_path, " ".join(str(exc).split())))
+
 # ── A5 — the native producers are RETAINED ─────────────────────────────
 for basename, (job_key, context, expected_display) in NATIVE_PRODUCERS.items():
     path = os.path.join(WORKFLOW_DIR, basename)
@@ -927,6 +951,10 @@ for basename, (job_key, context, expected_display) in NATIVE_PRODUCERS.items():
         bad("FAIL: [rcp native producer] %s does not parse: %s"
             % (path, " ".join(str(exc).split())))
         continue
+    if isinstance(gate_doc, dict) and "concurrency" in gate_doc:
+        bad("FAIL: [rcp native workflow concurrency] %s must not declare workflow concurrency."
+            % path,
+            "      Workflow cancellation also cancels its native required producer (#1661).")
     gate_jobs = (gate_doc or {}).get("jobs")
     if not isinstance(gate_jobs, dict) or job_key not in gate_jobs:
         bad("FAIL: [rcp native producer] %s has no %r job." % (path, job_key),
@@ -935,6 +963,11 @@ for basename, (job_key, context, expected_display) in NATIVE_PRODUCERS.items():
             "      that a workflow owns.")
         continue
     gate_job = gate_jobs[job_key]
+    if isinstance(gate_job, dict) and "concurrency" in gate_job:
+        bad("FAIL: [rcp native concurrency] %s job %r must not declare concurrency."
+            % (path, job_key),
+            "      Cancelling a pending native required check cannot be retired by",
+            "      the publisher's independent Checks-API lineage (#1661).")
     display = gate_job.get("name") if isinstance(gate_job, dict) else None
     effective = display if display is not None else job_key
     if str(effective) != expected_display:

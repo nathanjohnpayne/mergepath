@@ -3483,7 +3483,7 @@ mkdir -p "$RCP_DIR"
 # Populated from the real .github/workflows so the controls cannot drift.
 RCP_WFDIR="$RCP_DIR/workflows"
 mkdir -p "$RCP_WFDIR"
-for _f in required-check-publisher.yml merge-clearance-gate.yml \
+for _f in required-check-publisher.yml merge-clearance-gate.yml pr-review-policy.yml \
           codex-p1-gate.yml coderabbit-severity-gate.yml; do
   cp "$ROOT/.github/workflows/$_f" "$RCP_WFDIR/$_f"
 done
@@ -4081,6 +4081,35 @@ rcp_dir_case() {
   rcp_verdict "$name" "$rc" "$expect" "$want" "$dir/required-check-publisher.yml.out"
 }
 
+# #1249: the parsed trigger definition, including alternate YAML spellings.
+rcp_dir_case policy-dispatch-block \
+  'perl -0777 -i -pe "s{^on:\$}{on:\n  workflow_dispatch:}m" pr-review-policy.yml' \
+  fail '[rcp review-policy triggers]'
+rcp_dir_case policy-schedule-quoted \
+  'perl -0777 -i -pe "s{^on:\$}{\"on\":\n  \"schedule\": [{cron: \"0 * * * *\"}]}m" pr-review-policy.yml' \
+  fail 'forbids triggers'
+rcp_dir_case policy-dispatch-inline \
+  'perl -0777 -i -pe "s{^on:\n.*?(?=^permissions:)}{\"on\": {pull_request: {}, \"workflow_dispatch\": {}}\n\n}ms" pr-review-policy.yml' \
+  fail 'forbids triggers'
+rcp_dir_case policy-dispatch-list \
+  'perl -0777 -i -pe "s{^on:\n.*?(?=^permissions:)}{on: [pull_request, workflow_dispatch]\n\n}ms" pr-review-policy.yml' \
+  fail 'forbids triggers'
+rcp_dir_case policy-dispatch-scalar \
+  'perl -0777 -i -pe "s{^on:\n.*?(?=^permissions:)}{on: workflow_dispatch\n\n}ms" pr-review-policy.yml' \
+  fail 'forbids triggers'
+rcp_dir_case policy-quoted-safe \
+  'perl -0777 -i -pe "s{^on:\$}{\"on\":}m" pr-review-policy.yml' \
+  pass
+rcp_dir_case policy-list-safe \
+  'perl -0777 -i -pe "s{^on:\n.*?(?=^permissions:)}{on: [pull_request]\n\n}ms" pr-review-policy.yml' \
+  pass
+rcp_dir_case policy-missing \
+  'rm pr-review-policy.yml' \
+  fail 'cannot be validated'
+rcp_dir_case policy-invalid \
+  'printf "on: [unclosed\n" > pr-review-policy.yml' \
+  fail 'cannot be validated'
+
 # Renaming the natively-named job: the context keeps a producer in name
 # only.
 rcp_dir_case native-producer \
@@ -4115,6 +4144,32 @@ rcp_dir_case native-producer-name-drift \
 rcp_dir_case native-producer-needs-drift \
   'perl -0777 -i -pe "s{needs: \[archive-edited-feedback\]}{needs: []}" codex-p1-gate.yml' \
   fail 'does not need'
+
+rcp_dir_case native-concurrency-merge-clearance \
+  'perl -0777 -i -pe "s{^  merge-clearance-gate:\$}{  merge-clearance-gate:\n    concurrency: {group: native, cancel-in-progress: false}}m" merge-clearance-gate.yml' \
+  fail '[rcp native concurrency]'
+rcp_dir_case native-concurrency-codex \
+  'perl -0777 -i -pe "s{^  codex-p1-gate:\$}{  codex-p1-gate:\n    concurrency: {group: native, cancel-in-progress: false}}m" codex-p1-gate.yml' \
+  fail '[rcp native concurrency]'
+rcp_dir_case native-concurrency-coderabbit \
+  'perl -0777 -i -pe "s{^  coderabbit-severity-gate:\$}{  coderabbit-severity-gate:\n    concurrency: {group: native, cancel-in-progress: false}}m" coderabbit-severity-gate.yml' \
+  fail '[rcp native concurrency]'
+rcp_dir_case native-concurrency-null \
+  'perl -0777 -i -pe "s{^  coderabbit-severity-gate:\$}{  coderabbit-severity-gate:\n    concurrency: null}m" coderabbit-severity-gate.yml' \
+  fail '[rcp native concurrency]'
+
+rcp_dir_case native-workflow-concurrency-merge-clearance \
+  'perl -0777 -i -pe "s{^jobs:\$}{concurrency: {group: native, cancel-in-progress: false}\njobs:}m" merge-clearance-gate.yml' \
+  fail '[rcp native workflow concurrency]'
+rcp_dir_case native-workflow-concurrency-codex \
+  'perl -0777 -i -pe "s{^jobs:\$}{concurrency: {group: native, cancel-in-progress: false}\njobs:}m" codex-p1-gate.yml' \
+  fail '[rcp native workflow concurrency]'
+rcp_dir_case native-workflow-concurrency-coderabbit \
+  'perl -0777 -i -pe "s{^jobs:\$}{concurrency: {group: native, cancel-in-progress: false}\njobs:}m" coderabbit-severity-gate.yml' \
+  fail '[rcp native workflow concurrency]'
+rcp_dir_case native-workflow-concurrency-null \
+  'perl -0777 -i -pe "s{^jobs:\$}{concurrency: null\njobs:}m" coderabbit-severity-gate.yml' \
+  fail '[rcp native workflow concurrency]'
 
 # The A7 observer fixture is REMOVED because the assertion it exercised was
 # wrong, not merely under-powered. GitHub documents the cap as three levels
