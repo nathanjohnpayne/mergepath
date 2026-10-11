@@ -192,11 +192,11 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     operative verb: a `{name}` redirection does not move fd 1, so it is not a
     stdout move and cannot escape a capture or a pipe either.  Every one of
     those readings is a corpus case.
-    An escaped command word (`\echo`) is the same emitter.  `printf -v NAME`
-    is NOT output: bash assigns to a variable instead of writing to a stream
-    -- but the `-v` test is position-blind, so a `-v` appearing as DATA after
-    the format operand also reads as an assignment.  Both remaining gaps are
-    declared misses below.
+    An escaped command word (`\echo`) is the same emitter. `printf -v NAME`
+    and `printf -vNAME` assign only in option position before the format and
+    before `--`; the same spellings after the format are data and emit.
+    Numeric-conversion diagnostics from valid assignment forms remain the
+    separate #1461 gap, unchanged by the option-position repair (#1645).
   * An in-file message helper: a function whose body writes one of its own
     positional parameters VERBATIM through an emitter, or hands one to
     `cat`/`tee` on a HERE-STRING -- unless the file redefines that name, in
@@ -386,7 +386,7 @@ The list below mixes TWO KINDS of gap and says which is which.  Most of it is
 the DESIGN LIMIT: this is a single-hop source-text scanner over one logical line
 at a time, with no dataflow, no cross-file analysis, and no knowledge of what a
 variable holds at runtime, so indirection, external commands, interpreters and
-unscanned files are permanently out of reach.  Four bullets are marked (#1035)
+unscanned files are permanently out of reach.  Three bullets are marked (#1035)
 instead: those are `resolve_command` / `classify` mis-deciding what a segment
 RUNS, a repairable seam with an open issue, not a property of the design.  It
 does not catch:
@@ -422,9 +422,6 @@ does not catch:
     option ARGUMENT: `timeout 5 echo "$PAT"` and `nice -n 5 echo "$PAT"` both
     resolve to `5` and read clean.  Wrapper OPTIONS are stepped over; wrapper
     operands are not parsed.
-  * (#1035) `printf '%s\n' -v "$PAT"`, where `-v` is DATA after the format
-    operand.  The `printf -v` assignment test scans every word rather than only
-    option position, so the segment reads as an assignment, not an emission.
   * (#1035) A message helper whose opening `{` starts the line AFTER the
     declaration (`log()` then `{ echo "$1"; }`).  The one-line spelling of the
     same helper is found and flagged, so this is a spelling gap in discovery.
@@ -2616,9 +2613,18 @@ def classify(seg, emitter_helpers):
     if cmd in OPAQUE_COMMANDS:
         return OPAQUE
     if cmd == "printf":
-        lits = [_unquote_command_word(w) for w in seg.words]
-        if "-v" in lits:
-            return ASSIGN
+        # Only option position before the format can assign. Reuse the
+        # command/argument boundaries so prefixes and redirections are not
+        # printf operands; "--" and a format operand end option parsing.
+        idx = _command_index(seg.words, frozenset({"printf"}))
+        if idx is not None:
+            args = list(_command_arguments(seg.words, idx + 1))
+            if args:
+                option = args[0][1]
+                if option == "-v" and len(args) > 1:
+                    return ASSIGN
+                if option is not None and option.startswith("-v") and len(option) > 2:
+                    return ASSIGN
         return EMIT
     if cmd in EMITTERS:
         return EMIT
@@ -5124,6 +5130,27 @@ CORPUS = [
         MUST_NOT_FLAG,
         "v=$(printf '%s' \"$GH_TOKEN\")\necho \"len=${#v}\"\n",
     ),
+    # #1645 / #1035: assignment options and data operands share spellings.
+    (
+        "printf-v-attached-option",
+        MUST_NOT_FLAG,
+        "printf -vout '%s\\n' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-separate-option",
+        MUST_NOT_FLAG,
+        "printf -v out '%s\\n' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-attached-data",
+        MUST_FLAG,
+        "printf '%s\\n' -vout \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-protected-format",
+        MUST_FLAG,
+        "printf -- '-vout %s\\n' \"$GH_TOKEN\"\n",
+    ),
     (
         "printf-v-helper",
         MUST_NOT_FLAG,
@@ -5400,13 +5427,9 @@ CORPUS = [
         'nice -n 5 echo "$GH_TOKEN"\n',
     ),
     (
-        # `if "-v" in lits: return ASSIGN` scans EVERY word of the segment.
-        # Here `-v` is ordinary data AFTER the format operand, and printf
-        # writes it -- and the token -- to stdout.  `printf -v dest ...`, the
-        # real assignment form, is `printf-v-helper` above and is correctly
-        # clean.
+        # A `-v` after the format is ordinary data and emits the token.
         "printf-v-in-operand-position",
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         "printf '%s\\n' -v \"$GH_TOKEN\"\n",
     ),
     (
@@ -6366,11 +6389,6 @@ KNOWN_MISSES = {
     "wrapper-operand-nice": (
         "the same wrapper gap reached through an option's ARGUMENT: `-n` is "
         "stepped over as a lone option, so `5` becomes the command word"
-    ),
-    "printf-v-in-operand-position": (
-        "the `printf -v` test is position-blind -- it scans every word of the "
-        "segment, so a `-v` appearing as DATA after the format operand reads "
-        "as an assignment and the segment is not an emission"
     ),
     "helper-brace-on-next-line": (
         "helper discovery requires the opening `{` on the declaration line; "
