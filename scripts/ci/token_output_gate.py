@@ -202,18 +202,23 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     integer/nameref declarations, and numeric, ANSI-C, expanded, dynamic or unknown formats. Repeated
     assignment options and the option delimiter precede the inspected format.
     Attached value operands with credential references inside arithmetic or
-    error-word evaluation retain output verdicts: expansion may diagnose before
+    error-word evaluation retain output verdicts: modern/legacy arithmetic,
+    indexed subscripts and substring offsets may diagnose before
     printf assigns. Ordinary, single-quoted and escaped value data stays eligible.
     Captured arithmetic diagnostics remain the measured preexisting #2058
     miss; this eligibility check does not change the output walk.
     Split-line or continued function headers invalidate attached builtin provenance
     without extending general helper body-span discovery. Prompt-managed
     targets can emit or execute values in interactive shells and stay conservative.
-    Timing/history formats, mail-arrival paths and default cd paths likewise
+    Timing/history formats, history-file diagnostics, default fc editor commands,
+    mail-arrival paths and default cd paths likewise
     stay conservative as finite managed targets. The noninteractive corpus
     declares mail-arrival checks separately from an independent PTY oracle.
     PWD can supply an interactive directory prompt even when noninteractive
     pwd ignores its assigned value; both points are explicit conservative cases.
+    INPUTRC is conservatively reserved as a named Readline target. Its measured
+    bind -f case explicitly consumes the variable; ordinary alias propagation
+    remains outside this eligibility repair, with no automatic-read claim.
     Credential-bearing prefixes were also missed by the parent scanner;
     their diagnostic check here is limited to attached-option assignments.
     Numeric-conversion diagnostics from the separate assignment form remain
@@ -988,6 +993,7 @@ class LogicalLine:
 
 _WORD_BREAK_BEFORE_COMMENT = set(" \t\n;&|()")
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_POSITIONAL_PARAMETER_RE = re.compile(r"[0-9]+|[@*?$!-]")
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=")
 # The ONLY things bash lets precede a redirection operator inside the same
 # token are an IO_NUMBER (`2>&1`) and a `{name}` descriptor variable.  Ordinary
@@ -1448,6 +1454,11 @@ class Lexer:
                     cur_level()["word"].append("$((")
                     i += 3
                     continue
+                if nxt == "[":
+                    quotes.append("$[")  # Bash's legacy arithmetic expansion.
+                    cur_level()["word"].append("$[")
+                    i += 2
+                    continue
                 if nxt == "(":
                     # command substitution: a capturing level
                     parent_seg = cur_level()["seg"]
@@ -1472,7 +1483,8 @@ class Lexer:
                     # marker rather than a parallel counter because the pop on
                     # `}` has to stay exactly symmetric with the push.
                     quotes.append(
-                        "${?" if error_word_expansion_at(text, i) else "${"
+                        "${?" if error_word_expansion_at(text, i)
+                        else parameter_arithmetic_at(text, i) or "${"
                     )
                     cur_level()["word"].append("${")
                     # `${NAME...}`: `braced_ref_at` is the single decider,
@@ -1490,7 +1502,10 @@ class Lexer:
                                 in_assign_prefix(),
                             )
                             r.in_error_word = "${?" in quotes[:-1]
-                            r.in_arithmetic = "$((" in quotes
+                            # The parameter's base value is not an arithmetic
+                            # operand; nested references in its index/offset are.
+                            r.in_arithmetic = any(q in ("$((", "$[", "${[", "${:")
+                                                  for q in quotes[:-1])
                             cur_ll.refs.append(r)
                     i += 2
                     continue
@@ -1505,14 +1520,38 @@ class Lexer:
                             in_assign_prefix(),
                         )
                         r.in_error_word = "${?" in quotes
-                        r.in_arithmetic = "$((" in quotes
+                        r.in_arithmetic = any(q in ("$((", "$[", "${[", "${:")
+                                              for q in quotes)
                         cur_ll.refs.append(r)
                 cur_level()["word"].append(c)
                 i += 1
                 continue
 
-            if c == "}" and quotes and quotes[-1] in ("${", "${?"):
+            if c == "}" and quotes and quotes[-1] in ("${", "${?", "${:", "${array", "${["):
                 quotes.pop()
+                cur_level()["word"].append(c)
+                i += 1
+                continue
+
+            if c == "[" and quotes and quotes[-1] in ("${array", "${[", "[["):
+                if quotes[-1] == "${array":
+                    quotes[-1] = "${["
+                else:
+                    quotes.append("[[")  # Nested indexed-array arithmetic.
+                cur_level()["word"].append(c)
+                i += 1
+                continue
+
+            if c == "]" and quotes and quotes[-1] in ("$[", "[[", "${["):
+                if quotes[-1] == "${[":
+                    # A default/alternate word after an index is ordinary
+                    # value data; only a substring operator continues math.
+                    suffix = text[i + 1:i + 3]
+                    substring = (suffix.startswith(":")
+                                 and suffix[1:] not in ("-", "+", "=", "?"))
+                    quotes[-1] = "${:" if substring else "${"
+                else:
+                    quotes.pop()
                 cur_level()["word"].append(c)
                 i += 1
                 continue
@@ -1524,7 +1563,8 @@ class Lexer:
                     i += 2
                     continue
 
-            if c == "'" and (not quotes or quotes[-1] in ("${", "${?", "$((")):
+            if c == "'" and (not quotes or quotes[-1] in
+                             ("${", "${?", "${:", "${array", "${[", "[[", "$((", "$[")):
                 quotes.append("'")
                 cur_level()["word"].append(c)
                 i += 1
@@ -2210,6 +2250,29 @@ def error_word_expansion_at(text, brace_open):
     return rest.startswith(":?") or rest.startswith("?")
 
 
+def parameter_arithmetic_at(text, brace_open):
+    """Identify an indexed subscript or substring operand at a brace header.
+
+    These contexts may diagnose an expanded credential before printf assigns.
+    This marks syntax for attached eligibility, not an array-kind/value model.
+    """
+    start = brace_open + 2
+    if text[start:start + 1] in ("#", "!"):
+        start += 1
+    name, end = ident_at(text, start)
+    if name is None:
+        match = _POSITIONAL_PARAMETER_RE.match(text, start)
+        if match is None:
+            return None
+        end = match.end()
+    suffix = text[end:end + 2]
+    if suffix.startswith("["):
+        return "${array"
+    if suffix.startswith(":") and suffix[1:] not in ("-", "+", "=", "?"):
+        return "${:"
+    return None
+
+
 def braced_ref_at(text, brace_open):
     """Decide a `${...}` expansion at `brace_open` (the index of the `$`).
 
@@ -2668,13 +2731,13 @@ def _printf_nondiagnostic_format(raw, literal):
 
 
 _PRINTF_SPECIAL_TARGETS = frozenset({
-    "BASH", "BASHOPTS", "BASHPID", "COMP_CWORD", "COMP_POINT", "COLUMNS", "EUID", "HISTFILESIZE",
+    "BASH", "BASHOPTS", "BASHPID", "COMP_CWORD", "COMP_POINT", "COLUMNS", "EUID", "HISTFILE", "HISTFILESIZE",
     "HISTSIZE", "HISTCMD", "IGNOREEOF", "LANG", "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES",
     "LC_NUMERIC", "LC_TIME", "LINENO", "LINES", "MAILCHECK", "OPTIND", "PPID",
     "RANDOM", "SECONDS", "SHLVL", "SRANDOM", "TMOUT", "UID", "PIPESTATUS",
     "PS0", "PS1", "PS2", "PS3", "PS4", "PROMPT_COMMAND",
     "TIMEFORMAT", "HISTTIMEFORMAT", "HOME", "CDPATH", "OLDPWD", "MAIL", "MAILPATH", "PWD",
-    "FUNCNAME", "GROUPS", "DIRSTACK",
+    "FUNCNAME", "GROUPS", "DIRSTACK", "FCEDIT", "EDITOR", "INPUTRC",
 })
 
 
@@ -5609,6 +5672,141 @@ CORPUS = [
         "printf -vout '%s' harmless >\"./absent/$GH_TOKEN\"\n",
     ),
     (
+        'printf-v-managed-fcedit-diagnostic',
+        MUST_FLAG,
+        'TMPDIR=.\nset -o history; history -s \':\'; printf -vFCEDIT \'%s\' "$GH_TOKEN"; fc -1 -1\n',
+    ),
+    (
+        'printf-v-managed-fcedit-point',
+        MUST_FLAG,
+        'printf -vFCEDIT \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-managed-fcedit-ordinary-control',
+        MUST_NOT_FLAG,
+        'TMPDIR=.\nset -o history; history -s \':\'; FCEDIT=/usr/bin/true; printf -vout \'%s\' "$GH_TOKEN"; fc -1 -1 && echo editor-route-completed\n',
+    ),
+    (
+        'printf-v-managed-editor-diagnostic',
+        MUST_FLAG,
+        'TMPDIR=.\nset -o history; history -s \':\'; unset FCEDIT; printf -vEDITOR \'%s\' "$GH_TOKEN"; fc -1 -1\n',
+    ),
+    (
+        'printf-v-managed-editor-point',
+        MUST_FLAG,
+        'printf -vEDITOR \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-managed-editor-ordinary-control',
+        MUST_NOT_FLAG,
+        'TMPDIR=.\nset -o history; history -s \':\'; FCEDIT=/usr/bin/true; printf -vout \'%s\' "$GH_TOKEN"; fc -1 -1 && echo editor-route-completed\n',
+    ),
+    (
+        'printf-v-managed-inputrc-diagnostic',
+        MUST_FLAG,
+        'printf -vINPUTRC \'%s\' "$GH_TOKEN"; bind -f "$INPUTRC"\n',
+    ),
+    (
+        'printf-v-managed-inputrc-point',
+        MUST_FLAG,
+        'printf -vINPUTRC \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-managed-inputrc-ordinary-control',
+        MUST_NOT_FLAG,
+        'INPUTRC=/dev/null; printf -vout \'%s\' "$GH_TOKEN"; bind -f "$INPUTRC"\n',
+    ),
+    (
+        'printf-v-eligibility-legacy-arithmetic',
+        MUST_FLAG,
+        'GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "$[ $GH_TOKEN ]"\n',
+    ),
+    (
+        'printf-v-eligibility-legacy-braced',
+        MUST_FLAG,
+        'GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "$[ ${GH_TOKEN} ]"\n',
+    ),
+    (
+        'printf-v-eligibility-legacy-nested',
+        MUST_FLAG,
+        'GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "${UNSET:-$[ $GH_TOKEN ]}"\n',
+    ),
+    (
+        'printf-v-eligibility-substring-offset',
+        MUST_FLAG,
+        'value=data; GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "${value:$GH_TOKEN}"\n',
+    ),
+    (
+        'printf-v-eligibility-substring-length',
+        MUST_FLAG,
+        'value=data; GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "${value:0:$GH_TOKEN}"\n',
+    ),
+    (
+        'printf-v-eligibility-indexed-subscript',
+        MUST_FLAG,
+        'value=(data); GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "${value[$GH_TOKEN]}"\n',
+    ),
+    (
+        'printf-v-eligibility-histfile-diagnostic',
+        MUST_FLAG,
+        'set -o history; GH_TOKEN="/definitely-absent/$GH_TOKEN"; printf -vHISTFILE \'%s\' "$GH_TOKEN"; history -s entry; history -a\n',
+    ),
+    (
+        'printf-v-eligibility-histfile-point',
+        MUST_FLAG,
+        'printf -vHISTFILE \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-eligibility-ordinary-legacy-arithmetic',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "$[ 1 + 2 ]$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-eligibility-single-quoted-legacy',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' \'$[ $GH_TOKEN ]\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-eligibility-escaped-legacy',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "\\$[ $GH_TOKEN ]"\n',
+    ),
+    (
+        'printf-v-eligibility-ordinary-substring',
+        MUST_NOT_FLAG,
+        'value=data; printf -vout \'%s\' "${value:0:2}$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-eligibility-ordinary-array',
+        MUST_NOT_FLAG,
+        'value=(data); printf -vout \'%s\' "${value[0]}$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-eligibility-positional-offset',
+        MUST_FLAG,
+        'set -- data; GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "${1:$GH_TOKEN}"\n',
+    ),
+    (
+        'printf-v-eligibility-ordinary-token-substring',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "${GH_TOKEN:0:8}"\n',
+    ),
+    (
+        'printf-v-eligibility-array-default-data',
+        MUST_NOT_FLAG,
+        'value=(); printf -vout \'%s\' "${value[0]:-$GH_TOKEN}"\n',
+    ),
+    (
+        'printf-v-eligibility-default-colon-data',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "${UNSET:-:$GH_TOKEN}"\n',
+    ),
+    (
+        'printf-v-eligibility-history-ordinary-target',
+        MUST_NOT_FLAG,
+        'set -o history; GH_TOKEN="/definitely-absent/$GH_TOKEN"; printf -vout \'%s\' "$GH_TOKEN"; history -s entry; history -a\n',
+    ),
+    (
         'printf-v-value-arithmetic-diagnostic',
         MUST_FLAG,
         'GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "$(( $GH_TOKEN ))"\n',
@@ -7179,6 +7377,20 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    'printf-v-managed-fcedit-point': (
+        'Bash default fc editor lookup can diagnose its configured command; this point does not invoke fc, so attached eligibility conservatively reserves the named target'
+    ),
+    'printf-v-managed-editor-point': (
+        'Bash default fc editor lookup can diagnose its configured command; this point does not invoke fc, so attached eligibility conservatively reserves the named target'
+    ),
+    'printf-v-managed-inputrc-point': (
+        'INPUTRC is conservatively reserved as a named Bash/Readline target; this point does not access a file, while the measured bind -f case explicitly consumes INPUTRC and ordinary alias propagation remains outside the model'
+    ),
+    "printf-v-eligibility-histfile-point": (
+        "HISTFILE can supply a history-write path diagnostic; this point "
+        "does not write history, but attached eligibility does not prove "
+        "whether subsequent shell-managed history output will occur"
+    ),
     "printf-v-value-arithmetic-clean-point": (
         "arithmetic value expansion may diagnose a credential before attached "
         "printf assigns; the single letter-leading sentinel happens to "
