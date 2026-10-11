@@ -86,6 +86,8 @@ jobs:
               );
               return;
             }
+            // check_pr_review_policy_nudge asserts parity with the shared
+            // scripts/lib/blocking-labels.sh predicate (#1241).
             const blockingLabels = [
               'needs-external-review',
               'needs-human-review',

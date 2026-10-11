@@ -199,7 +199,7 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     locally defined commands/prefixes, query modifiers, changed builtin
     availability (`enable`, aliases or opaque setup), credential-bearing
     redirections, complex/special targets or integer/nameref declarations, and numeric, ANSI-C, expanded
-    or unknown formats. Repeated
+    dynamic or unknown formats. Repeated
     assignment options and the option delimiter precede the inspected format.
     Numeric-conversion diagnostics from the separate assignment form remain
     the #1461 gap, unchanged by the option-position repair (#1645).
