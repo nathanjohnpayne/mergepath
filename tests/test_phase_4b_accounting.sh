@@ -2238,6 +2238,8 @@ cp "$default" "$tmp"
 printf '%s\n' "$tmp"
 SH
 chmod +x "$BIN/fake-resolve-base-policy"
+# Direct orchestration cases below share the same governing-policy fixture.
+export P4B_RESOLVE_BASE_POLICY="$BIN/fake-resolve-base-policy"
 
 run_orch() { # run_orch <state-dir> <policy> <codex-fake> <pr> [extra env as VAR=VAL...] -- [extra args...]
   # Extra env vars come LAST so a test can override the defaults below (env
@@ -2249,7 +2251,6 @@ run_orch() { # run_orch <state-dir> <policy> <codex-fake> <pr> [extra env as VAR
   [ "${1:-}" = "--" ] && shift
   env PATH="$BIN:$PATH" \
     MERGEPATH_REVIEW_POLICY_PATH="$policy" \
-    P4B_RESOLVE_BASE_POLICY="$BIN/fake-resolve-base-policy" \
     P4B_ACCT_STATE_DIR="$state" \
     CODEX_BIN="$BIN/$fake" \
     P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" \
