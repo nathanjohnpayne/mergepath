@@ -520,4 +520,66 @@ if [ "$rc" != 1 ] || ! grep -q 'no reviewer identity' "$DIR/out"; then
 fi
 PASS=$((PASS + 1)); echo 'PASS: requester and checker reject threaded-reply-only clearance'
 
+# #1618: source the production Phase 4b helpers directly; never dispatch an
+# adapter to exercise request-generation authority. Candidate and base policies
+# deliberately disagree, as they can on trusted cross-repository orchestration.
+(
+  # shellcheck source=../scripts/phase-4b/lib.sh
+  . "$ROOT/scripts/phase-4b/lib.sh"
+  export MERGEPATH_REVIEW_POLICY_PATH="$DIR/candidate.yml"
+  export P4B_RESOLVE_BASE_POLICY="$DIR/base-resolver"
+  export P4B_TEST_BASE="$DIR/base.yml" P4B_TEST_RESOLVER_LOG="$DIR/resolver-log"
+  printf 'author_identity: candidate-author\n' >"$MERGEPATH_REVIEW_POLICY_PATH"
+  cat >"$P4B_RESOLVE_BASE_POLICY" <<'RESOLVER'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$P4B_TEST_RESOLVER_LOG"
+[ "${P4B_TEST_RESOLVER_FAIL:-0}" != 1 ] || exit 2
+resolved=$(mktemp)
+cp "$P4B_TEST_BASE" "$resolved"
+printf '%s\n' "$resolved"
+RESOLVER
+  chmod +x "$P4B_RESOLVE_BASE_POLICY"
+  gh_api_array() { printf '%s\n' "$P4B_TEST_COMMENTS"; }
+  P4B_TEST_COMMENTS='[{"id":8201,"user":{"login":"base-author"},"body":"@codex review"},{"id":8202,"user":{"login":"candidate-author"},"body":"@codex review"}]'
+  printf 'author_identity: base-author\n' >"$P4B_TEST_BASE"
+  captured=$(p4b_live_request_generation owner/repo 99)
+  [ "$captured" = '[8201]' ] || { echo "FAIL governing author capture: $captured"; exit 1; }
+  P4B_TEST_COMMENTS=$(printf '%s' "$P4B_TEST_COMMENTS" | jq -c '. + [{id:8203,user:{login:"base-author"},body:"@codex review"}]')
+  revalidated=$(p4b_live_request_generation owner/repo 99)
+  [ "$revalidated" = '[8201,8203]' ] && [ "$revalidated" != "$captured" ] \
+    || { echo "FAIL governing author revalidation: $revalidated"; exit 1; }
+  [ "$(wc -l <"$P4B_TEST_RESOLVER_LOG" | tr -d ' ')" = 2 ]
+  grep -q -- '--repo owner/repo --pr 99 --default-config .*candidate.yml --materialize-default' "$P4B_TEST_RESOLVER_LOG"
+  echo 'PASS: governing author capture and revalidation ignore divergent candidate identity'
+
+  # Preserve the merge checker's absent-key default, but never repair a
+  # present invalid identity or unreadable policy with the candidate's login.
+  P4B_TEST_COMMENTS='[{"id":8301,"user":{"login":"nathanjohnpayne"},"body":"@codex review"}]'
+  printf 'codex:\n  enabled: true\n' >"$P4B_TEST_BASE"
+  [ "$(p4b_live_request_generation owner/repo 99)" = '[8301]' ]
+  echo 'PASS: absent governing author uses the shared-author compatibility default'
+  [ "$(p4b_governing_codex_enabled owner/repo 99)" = true ]
+  printf 'codex:\n  enabled: false\n' >"$P4B_TEST_BASE"
+  [ "$(p4b_governing_codex_enabled owner/repo 99)" = false ]
+  echo 'PASS: shared governing-policy reader preserves Codex enablement'
+
+  for invalid in 'author_identity: ""' 'author_identity: []' 'author_identity: null' 'author_identity: [broken'; do
+    printf '%s\n' "$invalid" >"$P4B_TEST_BASE"
+    rc=0; result=$(p4b_live_request_generation owner/repo 99) || rc=$?
+    [ "$rc" = 2 ] && [ -z "$result" ] || { echo "FAIL invalid governing author: rc=$rc result=$result"; exit 1; }
+  done
+  echo 'PASS: empty, non-scalar and malformed governing authors fail closed'
+  rc=0; result=$(P4B_TEST_RESOLVER_FAIL=1 p4b_live_request_generation owner/repo 99) || rc=$?
+  [ "$rc" = 2 ] && [ -z "$result" ] || { echo 'FAIL unreadable governing policy'; exit 1; }
+  printf 'author_identity: base-author\n' >"$P4B_TEST_BASE"
+  gh_api_array() { return 1; }
+  rc=0; result=$(p4b_live_request_generation owner/repo 99) || rc=$?
+  [ "$rc" = 2 ] && [ -z "$result" ] || { echo 'FAIL unreadable request history'; exit 1; }
+  gh_api_array() { printf '%s\n' '[{"user":{"login":"base-author"},"body":"@codex review"}]'; }
+  rc=0; result=$(p4b_live_request_generation owner/repo 99) || rc=$?
+  [ "$rc" = 2 ] && [ -z "$result" ] || { echo 'FAIL malformed request identity'; exit 1; }
+  echo 'PASS: unreadable policy/history and malformed request evidence fail closed'
+)
+PASS=$((PASS + 12))
+
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"

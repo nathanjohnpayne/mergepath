@@ -652,11 +652,11 @@ p4b_codex_request_budget_state() {
   fi
 }
 
-# p4b_governing_codex_enabled <repo> <pr>
-# Prints true or false for codex.enabled in the PR's GOVERNING base policy,
-# the policy the substitute merge gate applies, rather than the local
-# checkout's (#1598). Returns 2 when the policy cannot be resolved.
-p4b_governing_codex_enabled() {
+# p4b_governing_policy_json <repo> <pr>
+# Materialize the PR's governing base policy, even when the caller's trusted
+# checkout has another author or targets another repository (#1618). Returns
+# 2 on an unreadable policy; removes only the resolver's materialized copy.
+p4b_governing_policy_json() {
   local repo="$1" pr="$2" config resolver base_cfg base_json rc=0
   command -v policy_yaml_to_json >/dev/null 2>&1 || return 2
   config="$(p4b_config)"
@@ -668,23 +668,35 @@ p4b_governing_codex_enabled() {
   base_json=$(policy_yaml_to_json "$base_cfg" 2>/dev/null) || rc=$?
   [ "$base_cfg" = "$config" ] || rm -f "$base_cfg" 2>/dev/null || true
   [ "$rc" -eq 0 ] && [ -n "$base_json" ] || return 2
-  printf '%s' "$base_json" | jq -er '
-    if type != "object" then error("policy")
-    elif ((.codex | type) == "object") and (.codex.enabled == false) then "false"
+  printf '%s' "$base_json" | jq -ce 'select(type == "object")' 2>/dev/null || return 2
+}
+
+# p4b_governing_codex_enabled <repo> <pr>
+# Prints true or false for codex.enabled in the PR's GOVERNING base policy,
+# the policy the substitute merge gate applies, rather than the local
+# checkout's (#1598). Returns 2 when the policy cannot be resolved.
+p4b_governing_codex_enabled() {
+  local policy
+  policy=$(p4b_governing_policy_json "$1" "$2") || return 2
+  printf '%s' "$policy" | jq -er '
+    if ((.codex | type) == "object") and (.codex.enabled == false) then "false"
     else "true" end' 2>/dev/null || return 2
 }
 
 # p4b_live_request_generation <repo> <pr>
-# The configured author's Codex request generation as it stands now: a sorted
+# The governing base policy author's Codex request generation: a sorted
 # array of request comment ids (#1598). An approval records the generation it
 # was authorized under, and the substitute merge gate refuses it once the live
 # generation holds a request outside that record. Returns 2 when the read or
 # the selector fails.
 p4b_live_request_generation() {
-  local repo="$1" pr="$2" author comments
+  local repo="$1" pr="$2" policy author comments
   command -v crqe_trigger_generation gh_api_array >/dev/null 2>&1 || return 2
-  author="$(p4b_top_field author_identity)"
-  author="${author:-nathanjohnpayne}"
+  policy=$(p4b_governing_policy_json "$repo" "$pr") || return 2
+  author=$(printf '%s' "$policy" | jq -er '
+    if has("author_identity") then
+      .author_identity | select(type == "string" and length > 0)
+    else "nathanjohnpayne" end' 2>/dev/null) || return 2
   comments=$(gh_api_array "repos/$repo/issues/$pr/comments" "Codex request generation for the approval record") \
     || return 2
   crqe_trigger_generation "$comments" "$author" 2>/dev/null | jq -ce 'select(type == "array")' 2>/dev/null \
