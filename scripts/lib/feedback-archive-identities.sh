@@ -25,7 +25,17 @@ feedback_archive_registry_load() {
 feedback_archive_registry_from_json() {
   local parsed="$1"
   FEEDBACK_ARCHIVE_IDENTITIES=$(printf '%s' "$parsed" | jq -ce '
-    .feedback_archive.identities
+    # Reuse the trusted parsed policy and the accounting defaults. Empty login
+    # fields have the same default behavior as the existing shell readers.
+    def current_login($config; $fallback):
+      ($config.bot_login // "") | if . == "" then $fallback else . end;
+    . as $policy
+    | [ {login:current_login(.codex; "chatgpt-codex-connector[bot]"), provider:"codex"},
+      {login:current_login(.coderabbit; "coderabbitai[bot]"), provider:"coderabbit"},
+      {login:current_login(.code_scanning; "github-advanced-security[bot]"), provider:"ghas"},
+      ((.available_reviewers // [])[] | {login:., provider:"reviewer"}) ]
+    | map(.login |= ascii_downcase) as $current_roles
+    | $policy.feedback_archive.identities
     | select(type == "array" and length > 0 and length <= 128)
     | select(all(.[];
         (.login | type == "string" and test("^[A-Za-z0-9-]+(_[A-Za-z0-9]+|\\[bot\\])?$")) and
@@ -34,6 +44,12 @@ feedback_archive_registry_from_json() {
         (.status == "active" or .status == "retired")))
     | select((map(.login | ascii_downcase) | unique | length) == length)
     | select(all(.[]; (.login | ascii_downcase) != "github-actions[bot]"))
+    # Active roles must agree with current provider/reviewer configuration.
+    # Retired entries are verified historical roles, never current allowlists.
+    | select(all(.[];
+        . as $identity | .status == "retired" or
+        ([$current_roles[] | select(.login == ($identity.login | ascii_downcase))
+          | .provider] | unique) == [$identity.provider]))
   ') || { echo 'feedback-archive: missing, invalid, or ambiguous retained identity registry' >&2; return 2; }
 }
 

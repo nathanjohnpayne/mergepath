@@ -961,8 +961,10 @@ append_archive_candidate() {
   source_id=$(printf '%s' "$payload" | jq -r '.source_comment_id')
   source_login=$(printf '%s' "$payload" | jq -r '.source_login')
   body_fingerprint=$(printf '%s' "$payload" | jq -r '.body_fingerprint')
-  archive_provider=$(feedback_archive_source_provider "$source_kind" "$source_login") || return 0
-  source_comments=$(archive_source_comments "$source_kind" "$source_login") || return 0
+  archive_provider=$(feedback_archive_source_provider "$source_kind" "$source_login") \
+    || die 2 "feedback archive source lacks retained enrollment or an eligible source kind: $source_login ($source_kind)"
+  source_comments=$(archive_source_comments "$source_kind" "$source_login") \
+    || die 2 "could not resolve the feedback archive source inventory"
 
   source_comment=$(printf '%s' "$source_comments" | jq -c \
     --argjson id "$source_id" 'first(.[] | select(.id == $id)) // null')
@@ -972,14 +974,19 @@ append_archive_candidate() {
     live_source_body_json=$(printf '%s' "$source_comment" | jq -c '.body // ""')
     live_source_fingerprint=$(fingerprint "$live_source_body_json")
     live_body=$(printf '%s' "$live_source_body_json" | jq -r '.')
-    # Equality suppresses an archive only when current policy inventories
-    # that source identity. Retirement cannot erase retained history merely
-    # because its unchanged live object no longer carries current standing.
+    # Equality suppresses history only when the current role matches the
+    # retained provider and inventories this source kind. Reusing an old login
+    # in another provider role cannot let its different parser erase history.
     case "$source_login" in
-      "$CODEX_BOT"|"$CODERABBIT_BOT") live_source_current=true ;;
-      "$GHAS_BOT") [ "$source_kind" != inline ] || live_source_current=true ;;
+      "$CODEX_BOT") [ "$archive_provider" != codex ] || live_source_current=true ;;
+      "$CODERABBIT_BOT") [ "$archive_provider" != coderabbit ] || live_source_current=true ;;
+      "$GHAS_BOT")
+        if [ "$archive_provider" = ghas ] && [ "$source_kind" = inline ]; then
+          live_source_current=true
+        fi
+        ;;
       *)
-        if [ "$source_kind" != issue-comment ] && registered_reviewer_login "$source_login"; then
+        if [ "$archive_provider" = reviewer ] && [ "$source_kind" != issue-comment ] && registered_reviewer_login "$source_login"; then
           live_source_current=true
         fi
         ;;

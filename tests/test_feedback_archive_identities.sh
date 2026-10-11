@@ -11,6 +11,7 @@ check() { "$@" || { echo "FAIL: $*" >&2; exit 1; }; PASS=$((PASS + 1)); }
 cat >"$TMP/policy.yml" <<'YAML'
 available_reviewers: []
 codex: {bot_login: "new-codex[bot]"}
+code_scanning: {bot_login: "custom-ghas[bot]"}
 feedback_archive:
   identities:
     - {login: retired-reviewer, provider: reviewer, status: retired}
@@ -145,6 +146,33 @@ for schema in \
   rc=0; feedback_archive_registry_from_json "$schema" || rc=$?
   check test "$rc" = 2
 done
+# Active enrollment must match exactly one configured current role. Retired
+# roles remain explicit historical enrollment after provider/reviewer changes.
+role_policy=$(policy_yaml_to_json "$TMP/policy.yml")
+for change in '.feedback_archive.identities[-1].provider="codex"' '.code_scanning.bot_login="new-ghas[bot]"' '.feedback_archive.identities += [{login:"stale-reviewer",provider:"reviewer",status:"active"}]'; do
+  invalid=$(printf '%s' "$role_policy" | jq -c "$change")
+  rc=0; feedback_archive_registry_from_json "$invalid" || rc=$?
+  check test "$rc" = 2
+done
+retired_policy=$(printf '%s' "$role_policy" | jq -c '.code_scanning.bot_login="new-ghas[bot]" | .feedback_archive.identities[-1].status="retired"')
+feedback_archive_registry_from_json "$retired_policy"; PASS=$((PASS + 1))
+check test "$(feedback_archive_source_provider inline 'custom-ghas[bot]')" = ghas
+# Current configured identities need not be enrolled. This is explicit archive
+# enrollment, not an implicit grant derived from current reviewer membership.
+reviewer_policy=$(printf '%s' "$role_policy" | jq -c '.available_reviewers=["current-reviewer","unenrolled-reviewer"] | .feedback_archive.identities += [{login:"current-reviewer",provider:"reviewer",status:"active"}]')
+feedback_archive_registry_from_json "$reviewer_policy"; PASS=$((PASS + 1))
+check test "$(feedback_archive_source_provider inline current-reviewer)" = reviewer
+rc=0; feedback_archive_source_provider inline unenrolled-reviewer >/dev/null || rc=$?
+check test "$rc" = 1
+wrong_reviewer=$(printf '%s' "$reviewer_policy" | jq -c '.feedback_archive.identities[-1].provider="coderabbit"')
+rc=0; feedback_archive_registry_from_json "$wrong_reviewer" || rc=$?
+check test "$rc" = 2
+# Default and explicitly empty provider-login fields match accounting defaults.
+for defaults in '{}' '{"codex":{"bot_login":""}}'; do
+  schema=$(printf '%s' "$defaults" | jq -c '.feedback_archive.identities=[{login:"chatgpt-codex-connector[bot]",provider:"codex",status:"active"}]')
+  feedback_archive_registry_from_json "$schema"; PASS=$((PASS + 1))
+done
+feedback_archive_registry_load "$TMP/policy.yml"
 # Exercise the checked-in producer with fake API responses and credentials.
 # Unknown source bodies never reach the renderer/post path; a retired reviewer
 # edit/deletion uploads its exact sole previous body on both read-only routes.

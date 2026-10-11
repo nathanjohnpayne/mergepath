@@ -1283,6 +1283,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/feedback-policy-helpers.sh"   # directly sourced; path-filtered closure is not recursive
       - "scripts/lib/feedback-archive-identities.sh"
       - "scripts/render-feedback-archive.sh"
       - ".github/workflows/codex-p1-gate.yml"
@@ -2126,6 +2127,7 @@ paths:
     # feedback archival and the corresponding PR-head check. Its requires
     # edges keep the evaluator and surface fingerprint on the same wave.
     requires:
+      - "scripts/lib/feedback-policy-helpers.sh"   # directly sourced before retained registry validation
       - "scripts/lib/feedback-archive-identities.sh"   # #1437, retained source eligibility and bounds
       - "scripts/workflow/verified-relay-markers.py"   # #1546, publisher-run provenance verification
       - "scripts/codex-p1-gate.sh"

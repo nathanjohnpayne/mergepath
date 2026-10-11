@@ -154,7 +154,7 @@ feedback_archive:
     - {login: nathanpayne-claude, provider: reviewer, status: active}
     - {login: nathanpayne-cursor, provider: reviewer, status: active}
     - {login: nathanpayne-codex, provider: reviewer, status: active}
-    - {login: nathanpayne-release, provider: reviewer, status: active}
+    - {login: nathanpayne-release, provider: reviewer, status: retired}
 YAML
 
 reset_fixtures() {
@@ -190,9 +190,9 @@ feedback_archive:
     - {login: "chatgpt-codex-connector[bot]", provider: codex, status: active}
     - {login: "coderabbitai[bot]", provider: coderabbit, status: active}
     - {login: "github-advanced-security[bot]", provider: ghas, status: active}
-    - {login: nathanpayne-claude, provider: reviewer, status: active}
-    - {login: nathanpayne-cursor, provider: reviewer, status: active}
-    - {login: nathanpayne-codex, provider: reviewer, status: active}
+    - {login: nathanpayne-claude, provider: reviewer, status: retired}
+    - {login: nathanpayne-cursor, provider: reviewer, status: retired}
+    - {login: nathanpayne-codex, provider: reviewer, status: retired}
     - {login: nathanpayne-release, provider: reviewer, status: active}
 YAML
   rm -f "$TMP/fixtures"/reactions-*.json
@@ -3164,6 +3164,53 @@ jq '.[1].user.login="nathanpayne-codex"' "$TMP/fixtures/issues.json" >"$TMP/fixt
 mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
 run_gate
 assert_eq 0 "$RUN_RC" "a current reviewer can account for the retained historical finding"
+# A valid, parsed Actions archive cannot silently disappear when its retained
+# entry is omitted. This differs from an ordinary never-enrolled live event.
+cp "$TMP/review-policy.yml" "$TMP/policy-with-retired-entry.yml"
+sed '/login: nathanpayne-claude, provider: reviewer, status: retired/d' "$TMP/review-policy.yml" >"$TMP/omitted-entry.yml"
+mv "$TMP/omitted-entry.yml" "$TMP/review-policy.yml"
+run_gate
+assert_eq 2 "$RUN_RC" "omitting an already archived retired identity is an infrastructure failure"
+assert_eq "" "$RUN_JSON" "omitted archive enrollment emits no clean accounting verdict"
+assert_match 'feedback archive source lacks retained enrollment' "$RUN_ERR" "omitted history names the missing retained source"
+mv "$TMP/policy-with-retired-entry.yml" "$TMP/review-policy.yml"
+
+# Wrong active provider roles must fail configuration rather than select an
+# empty tier array and erase a Major. Correct retired roles survive bot rename.
+reset_fixtures
+printf '_🟠 Major_\nSole previous CodeRabbit body.\n' >"$TMP/role-body.txt"
+ROLE_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9093 'coderabbitai[bot]' \
+  '2026-10-11T01:00:00Z' "$TMP/role-body.txt")
+jq -n --arg body "$ROLE_ARCHIVE" '[{id:9094,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+cp "$TMP/review-policy.yml" "$TMP/correct-active-policy.yml"
+sed 's/login: "coderabbitai\[bot\]", provider: coderabbit/login: "coderabbitai[bot]", provider: codex/' "$TMP/correct-active-policy.yml" >"$TMP/review-policy.yml"
+run_gate
+assert_eq 2 "$RUN_RC" "an active CodeRabbit login enrolled as Codex is a configuration failure"
+assert_eq "" "$RUN_JSON" "wrong active role emits no empty-success verdict"
+sed 's/bot_login: "coderabbitai\[bot\]"/bot_login: "new-coderabbit[bot]"/' "$TMP/correct-active-policy.yml" >"$TMP/review-policy.yml"
+run_gate
+assert_eq 2 "$RUN_RC" "a stale active provider absent from current policy fails configuration"
+sed 's/login: "coderabbitai\[bot\]", provider: coderabbit, status: active/login: "coderabbitai[bot]", provider: coderabbit, status: retired/' "$TMP/review-policy.yml" >"$TMP/retired-provider.yml"
+mv "$TMP/retired-provider.yml" "$TMP/review-policy.yml"
+run_gate
+assert_eq 1 "$RUN_RC" "a correctly retired CodeRabbit identity preserves required history after bot rename"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "retired CodeRabbit history retains its specialized Major tier"
+# Reusing the old CodeRabbit login as current Codex cannot let the current
+# Codex parser (which does not inventory Major) suppress retired history.
+sed -e 's/bot_login: "chatgpt-codex-connector\[bot\]"/bot_login: "coderabbitai[bot]"/' \
+  -e 's/login: "chatgpt-codex-connector\[bot\]", provider: codex, status: active/login: "chatgpt-codex-connector[bot]", provider: codex, status: retired/' \
+  "$TMP/review-policy.yml" >"$TMP/reused-login-policy.yml"
+mv "$TMP/reused-login-policy.yml" "$TMP/review-policy.yml"
+for shape in equal ack-suffix; do
+  jq -n --rawfile body "$TMP/role-body.txt" --arg shape "$shape" '[{id:9093,user:{login:"coderabbitai[bot]"},created_at:"2026-10-10T01:00:00Z",updated_at:"2026-10-11T01:01:00Z",commit_id:"cccccccccccccccccccccccccccccccccccccccc",body:($body + if $shape=="ack-suffix" then "\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678\n\n<!-- This is an auto-generated reply by CodeRabbit -->" else "" end)}]' >"$TMP/fixtures/inline.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "$shape live source in another provider role cannot erase retired Major history"
+  assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "$shape role reuse retains historical required CodeRabbit tier"
+  assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "$shape role reuse retains the archived finding"
+  assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$shape role reuse has one historical finding despite the current parser omitting Major"
+done
+mv "$TMP/correct-active-policy.yml" "$TMP/review-policy.yml"
+
 # Missing registry is fatal when there is an archive, but unrelated live
 # feedback keeps its existing accounting semantics during seed migration.
 sed '/^feedback_archive:/,/^    - {login: nathanpayne-release/d' "$TMP/review-policy.yml" >"$TMP/missing-registry.yml"
