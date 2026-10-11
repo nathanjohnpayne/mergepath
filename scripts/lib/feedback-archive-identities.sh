@@ -66,10 +66,12 @@ feedback_archive_validate_records() {
     .archive_records as $records
     | ($records | type == "array" and length <= 32) and
       (if ($records | length) == 0 then true
-       elif .archive_source.login == "github-actions[bot]" and
-            .archive_source.kind == "issue-comment" then
+       elif (.archive_source.login == "github-actions[bot]" and
+             .archive_source.kind == "issue-comment") or
+            ((has("archive_source") | not) and ($records | length) == 1 and
+             ($records[0] | startswith("<!-- mergepath-feedback-archive:v1 ") | not)) then
          ($records | length == 1) and
-         all($records[];
+         all($records[]; [
            if startswith("<!-- mergepath-feedback-archive:v1 ") then
              capture("^<!-- mergepath-feedback-archive:v1 (?<data>[A-Za-z0-9+/=]{1,60000}) -->$")
              | .data | @base64d | fromjson | payload_ok(.)
@@ -77,9 +79,8 @@ feedback_archive_validate_records() {
              capture("^<!-- mergepath-feedback-archive:v2 id=[0-9a-f]{64} part=(?<part>[0-9]+)/(?<total>[0-9]+) data=[A-Za-z0-9+/=]{1,60000} -->$")
              | (.part | tonumber) as $part | (.total | tonumber) as $total
              | $part >= 1 and $part <= $total and $total <= 32
-           else test("^<!-- mergepath-feedback-archive-relay:v(1 run=[0-9]+ status=(complete|failed)|2 run=[0-9]+ publisher=[0-9]+ status=complete) -->$") end)
+           else test("^<!-- mergepath-feedback-archive-relay:v(1 run=[0-9]+ status=(complete|failed)|2 run=[0-9]+ publisher=[0-9]+ status=complete) -->$") end] | length == 1 and .[0] == true)
        else
-         eligible(.archive_source.kind; .archive_source.login) and
          (if ($records[0] | startswith("<!-- mergepath-feedback-archive:v1 ")) then
             if ($records | length) != 1 then error("multiple source bodies") else
               $records[0] | capture("^<!-- mergepath-feedback-archive:v1 (?<data>[A-Za-z0-9+/=]{1,60000}) -->$") | .data
@@ -93,9 +94,12 @@ feedback_archive_validate_records() {
               else map(.data) | join("") end
           end | @base64d | fromjson) as $payload
          | payload_ok($payload) and
-           $payload.source_login == .archive_source.login and
-           ($payload.source_kind // "issue-comment") == .archive_source.kind and
-           $payload.source_comment_id == .archive_source.id
+           (if has("archive_source") then
+             eligible(.archive_source.kind; .archive_source.login) and
+             $payload.source_login == .archive_source.login and
+             ($payload.source_kind // "issue-comment") == .archive_source.kind and
+             $payload.source_comment_id == .archive_source.id
+            else true end)
        end)
   ' "$handoff" >/dev/null 2>&1 || {
     echo 'feedback-archive: handoff has ineligible, ambiguous, or excessive source records' >&2

@@ -11,8 +11,10 @@ HELPERS="$SCRIPT_DIR/lib/feedback-policy-helpers.sh"
 [ -r "$HELPERS" ] || { echo "render-feedback-archive: missing $HELPERS" >&2; exit 2; }
 # shellcheck source=lib/feedback-policy-helpers.sh
 . "$HELPERS"
+ARCHIVE_IDENTITIES_HELPER="$SCRIPT_DIR/lib/feedback-archive-identities.sh"
+[ -r "$ARCHIVE_IDENTITIES_HELPER" ] || { echo "render-feedback-archive: missing $ARCHIVE_IDENTITIES_HELPER" >&2; exit 2; }
 # shellcheck source=lib/feedback-archive-identities.sh
-. "$SCRIPT_DIR/lib/feedback-archive-identities.sh"
+. "$ARCHIVE_IDENTITIES_HELPER"
 feedback_archive_registry_load "${CONFIG:-$SCRIPT_DIR/../.github/review-policy.yml}" || exit 2
 
 if [ "$#" -lt 5 ] || [ "$#" -gt 6 ]; then

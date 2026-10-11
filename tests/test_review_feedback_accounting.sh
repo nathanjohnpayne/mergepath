@@ -3147,6 +3147,13 @@ jq -n --arg body "$RETIRED_ARCHIVE" '[{id:9091,user:{login:"github-actions[bot]"
 run_gate
 assert_eq 1 "$RUN_RC" "a retired reviewer deleted-source archive stays unaccounted without live prior-body fallback"
 assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "retired history uses the archive acknowledgement channel"
+# Delayed delivery can leave an equal live object after policy removal. Since
+# that live object is no longer inventoried, it cannot suppress the archive.
+jq -n --rawfile body "$TMP/retired-body.txt" '[{id:9090,user:{login:"nathanpayne-claude"},body:$body,created_at:"2026-10-11T00:00:00Z"}]' >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "an equal surviving retired source cannot suppress the only inventoried history"
+assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "equal retired live text leaves the archive obligation intact"
+printf '[]\n' >"$TMP/fixtures/inline.json"
 RETIRED_TOKEN=$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')
 jq --arg token "$RETIRED_TOKEN" '. + [{id:9092,user:{login:"nathanpayne-claude"},created_at:"2026-10-11T01:01:00Z",body:($token+"\nI addressed this historical finding.")}]' \
   "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"

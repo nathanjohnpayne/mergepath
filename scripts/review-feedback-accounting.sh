@@ -144,8 +144,10 @@ validate_governing_policy() {
 
 validate_governing_policy
 
+ARCHIVE_IDENTITIES_HELPER="$SCRIPT_DIR/lib/feedback-archive-identities.sh"
+[ -r "$ARCHIVE_IDENTITIES_HELPER" ] || die 2 "missing retained archive identity helper"
 # shellcheck source=lib/feedback-archive-identities.sh
-. "$SCRIPT_DIR/lib/feedback-archive-identities.sh"
+. "$ARCHIVE_IDENTITIES_HELPER"
 
 policy_top_field() {
   local field="$1"
@@ -935,7 +937,7 @@ append_archive_candidate() {
   local source_kind source_id source_login source_comments source_comment
   local live_source_login live_source_body_json live_source_fingerprint archive_tiers tier
   local body_fingerprint payload_body_json finding_kind ack_token accounted evidence
-  local live_body archived_body archive_provider
+  local live_body archived_body archive_provider live_source_current=false
 
   printf '%s' "$payload" | validate_archive_payload \
     || die 2 "feedback archive payload failed schema validation"
@@ -969,7 +971,22 @@ append_archive_candidate() {
     [ "$live_source_login" = "$source_login" ] || return 0
     live_source_body_json=$(printf '%s' "$source_comment" | jq -c '.body // ""')
     live_source_fingerprint=$(fingerprint "$live_source_body_json")
-    [ "$live_source_fingerprint" != "$body_fingerprint" ] || return 0
+    live_body=$(printf '%s' "$live_source_body_json" | jq -r '.')
+    # Equality suppresses an archive only when current policy inventories
+    # that source identity. Retirement cannot erase retained history merely
+    # because its unchanged live object no longer carries current standing.
+    case "$source_login" in
+      "$CODEX_BOT"|"$CODERABBIT_BOT") live_source_current=true ;;
+      "$GHAS_BOT") [ "$source_kind" != inline ] || live_source_current=true ;;
+      *)
+        if [ "$source_kind" != issue-comment ] && registered_reviewer_login "$source_login"; then
+          live_source_current=true
+        fi
+        ;;
+    esac
+    if [ "$live_source_current" = true ]; then
+      [ "$live_source_fingerprint" != "$body_fingerprint" ] || return 0
+    fi
     # A CodeRabbit acknowledgement is an edit of the finding, so the relay
     # archives the revision being acknowledged. That revision is the same
     # finding, already dispositioned by the reply the acknowledgement
@@ -978,7 +995,7 @@ append_archive_candidate() {
     # confirmation runs removed: equal means the archive adds nothing to
     # disposition, and a changed visible content line still archives.
     if [ "$source_kind" = inline ] && [ "$archive_provider" = coderabbit ] \
-      && [ -n "$payload_body_json" ]; then
+      && [ "$live_source_current" = true ] && [ -n "$payload_body_json" ]; then
       live_body=$(printf '%s' "$source_comment" | jq -r '.body // ""')
       archived_body=$(printf '%s' "$payload_body_json" | jq -r '.')
       [ "$(coderabbit_strip_ack_suffix "$live_body")" != \

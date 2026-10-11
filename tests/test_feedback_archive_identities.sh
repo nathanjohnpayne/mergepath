@@ -35,6 +35,15 @@ check test -n "$record"
 jq -n --arg record "$record" '{archive_source:{kind:"inline",login:"retired-reviewer",id:7},archive_records:[$record]}' >"$TMP/handoff"
 feedback_archive_validate_records "$TMP/handoff"
 PASS=$((PASS + 1))
+# An old workflow run cannot gain a new handoff field on rerun. Its decoded
+# source still needs retained enrollment; metadata is an additional binding.
+jq 'del(.archive_source)' "$TMP/handoff" >"$TMP/legacy"
+feedback_archive_validate_records "$TMP/legacy"
+PASS=$((PASS + 1))
+jq -n --arg record "$(printf '%s' "$record" | sed -E 's/^<!-- mergepath-feedback-archive:v1 (.*) -->$/\1/' | jq -Rr '@base64d | fromjson | .source_login="never-registered" | @json | @base64')" \
+  '{archive_records:[("<!-- mergepath-feedback-archive:v1 "+$record+" -->")]}' >"$TMP/legacy-ineligible"
+rc=0; feedback_archive_validate_records "$TMP/legacy-ineligible" || rc=$?
+check test "$rc" = 2
 jq '.archive_source.login="never-registered"' "$TMP/handoff" >"$TMP/bad"
 rc=0; feedback_archive_validate_records "$TMP/bad" || rc=$?
 check test "$rc" = 2
@@ -64,6 +73,11 @@ check test "$restored" = "$record"
 jq -n --arg record "$record" '{archive_source:{kind:"issue-comment",login:"github-actions[bot]",id:8},archive_records:[$record]}' >"$TMP/restored-handoff"
 feedback_archive_validate_records "$TMP/restored-handoff"
 PASS=$((PASS + 1))
+# A no-match parser result must not vacuously validate an oversized restored
+# chunk. Restoration is bounded even though only one part can be recovered.
+jq -n '{archive_source:{kind:"issue-comment",login:"github-actions[bot]"},archive_records:[("<!-- mergepath-feedback-archive:v2 id=" + ("a" * 64) + " part=1/2 data=" + ("a" * 60001) + " -->")]}' >"$TMP/oversized-restoration"
+rc=0; feedback_archive_validate_records "$TMP/oversized-restoration" || rc=$?
+check test "$rc" = 2
 # Unknown enrollment emits no rendered body and fails conservatively.
 printf 'available_reviewers: [retired-reviewer]\n' >"$TMP/missing.yml"
 rc=0; out=$(CONFIG="$TMP/missing.yml" "$ROOT/scripts/render-feedback-archive.sh" inline 7 retired-reviewer 2026-10-11T01:00:00Z "$TMP/body") || rc=$?
