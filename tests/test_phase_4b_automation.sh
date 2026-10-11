@@ -3144,16 +3144,30 @@ if [ "$rc" = 0 ] && [ -e "$P1598_SENTINEL" ] && [ "$(cat "$WORK/p1598-acct.count
 else
   fail "#1598 G2: already-cleared route, request during final accounting (rc=$rc record=$(grep -o 'mergepath-p4b-request-generation: [^ ]*' "$P1598_BODY" 2>/dev/null)): $out"
 fi
-# G3: the authorization read succeeds but the writer's re-read fails. With
-# the governing policy enabling Codex (unresolvable here, which counts as
-# enabled) the approval is refused (exit 10) after cleanup; with it disabling
-# Codex the run posts.
+# G3: the authorization read succeeds but the writer's re-read fails. The
+# enabled fixture resolves governing policy until the adapter runs, then makes
+# it unreadable (which counts as enabled); the approval is refused (exit 10)
+# after cleanup. A governing policy that disables Codex still permits posting.
+P1598_G3_RESOLVER="$WORK/p1598-g3-resolve-policy"
+cat >"$P1598_G3_RESOLVER" <<'EOF'
+#!/bin/sh
+set -eu
+[ ! -e "$P4B_FAKE_ISSUE_COMMENTS_SENTINEL" ] || exit 2
+tmp=$(mktemp "${TMPDIR:-/tmp}/p1598-g3-policy.XXXXXX")
+cp "$P1598_GOVERNING_POLICY" "$tmp"
+printf '%s\n' "$tmp"
+EOF
+chmod +x "$P1598_G3_RESOLVER"
 for _g3 in enabled disabled; do
   rm -f "$P1598_SENTINEL"; : >"$P1598_LOG"; rm -f "$P1598_BODY"
-  if [ "$_g3" = disabled ]; then _g3_resolver="$P1598_RESOLVER"; else _g3_resolver="$WORK/p1598-no-resolver"; fi
+  if [ "$_g3" = disabled ]; then
+    _g3_resolver="$P1598_RESOLVER"; _g3_policy="$P1598_CODEX_OFF"
+  else
+    _g3_resolver="$P1598_G3_RESOLVER"; _g3_policy="$POLICY_ON"
+  fi
   set +e
   out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$WORK/p1598-adapter.sh" \
-    P4B_RESOLVE_BASE_POLICY="$_g3_resolver" P1598_GOVERNING_POLICY="$P1598_CODEX_OFF" \
+    P4B_RESOLVE_BASE_POLICY="$_g3_resolver" P1598_GOVERNING_POLICY="$_g3_policy" \
     OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
     P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
     P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
