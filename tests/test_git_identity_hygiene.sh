@@ -245,6 +245,52 @@ else
   fail "hub suite gate: rc=$RC out=$OUT"
 fi
 
+# Case 10b: the real Git index must preserve names Git normally C-quotes.
+# The copied production check runs markerless; all commands below are scan
+# input, never executed. Clear each writer before probing the next path so
+# a previous finding cannot mask a skipped file.
+PATHS_CONSUMER="$WORKDIR/consumer-paths"
+mkdir -p "$PATHS_CONSUMER/scripts/ci" "$PATHS_CONSUMER/docs" "$PATHS_CONSUMER/tests" "$PATHS_CONSUMER/tools"
+git init -q -b main "$PATHS_CONSUMER"
+cp "$CHECK" "$PATHS_CONSUMER/scripts/ci/check_git_identity_hygiene"
+for REL in 'docs/résumé.md' 'tests/署名.sh' $'docs/line\nbreak.md' $'docs/tab\tname.md' 'docs/quote"name.md' 'tools/हुक'; do
+  printf '#!/usr/bin/env bash\ngit config user.email leak@example.com\n' > "$PATHS_CONSUMER/$REL"
+  git -C "$PATHS_CONSUMER" add -- "$REL"
+  set +e
+  OUT="$(bash "$PATHS_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"
+  RC=$?
+  set -e
+  # The human-readable report prefixes every output line, including
+  # embedded newlines in a path. Assert the complete displayed pathname.
+  REPORTED_REL="${REL//$'\n'/$'\n  - '}"
+  if [ "$RC" = "1" ] && [[ "$OUT" == *"$REPORTED_REL:2:"* ]]; then
+    pass "tracked C-quoted path retains its finding: $REL"
+  else
+    fail "tracked pathname skipped: '$REL' rc=$RC out=$OUT"
+  fi
+  printf '#!/usr/bin/env bash\ngit -C "$FIXTURE" config user.email fixture@example.com\n' > "$PATHS_CONSUMER/$REL"
+done
+printf 'git config user.email untracked@example.com\n' > "$PATHS_CONSUMER/docs/non-suivi-署名.md"
+set +e
+OUT="$(bash "$PATHS_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "0" ]; then
+  pass "scoped tracked paths pass; untracked Unicode source stays excluded"
+else
+  fail "clean tracked pathname corpus: rc=$RC out=$OUT"
+fi
+for REL in 'docs/résumé.md' $'docs/line\nbreak.md'; do
+  run_on_fixture "$REL" 'git config user.email leak@example.com
+'
+  REPORTED_REL="${REL//$'\n'/$'\n  - '}"
+  if [ "$RC" = "1" ] && [[ "$OUT" == *"$REPORTED_REL:1:"* ]]; then
+    pass "fixture enumeration preserves pathname: $REL"
+  else
+    fail "fixture pathname skipped: '$REL' rc=$RC out=$OUT"
+  fi
+done
+
 # Case 11: a backslash continuation between `git` and `config`. Neither
 # physical line matches on its own — the first carries no `config`, the
 # second no `git` — so a line-at-a-time scan waves through exactly the
@@ -1416,6 +1462,38 @@ git config user.email 'fixture@example.com' # GIT_IDENTITY_SCOPE_EXEMPT: isolate
 git config user.email fixture\ value # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
 git config user.email "escaped \" value" # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
 git config user.email $'escaped \' value' # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+EOF
+
+# Case 54ca: a control operator opens a real comment boundary even when
+# no space precedes the #. Quoted or escaped operators remain string data.
+while IFS= read -r LINE; do
+  run_on_fixture "tests/operator-comment.sh" "$LINE
+"
+  if [ "$RC" = "0" ]; then
+    pass "real exemption after a control operator: $LINE"
+  else
+    fail "control-operator exemption rejected: rc=$RC out=$OUT"
+  fi
+done <<'EOF'
+git config user.email fixture@example.com;# GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+git config user.email fixture@example.com&&# GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+git config user.email fixture@example.com||# GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+git config user.email fixture@example.com&# GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+git config user.email fixture@example.com|# GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+(git config user.email fixture@example.com)# GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+EOF
+while IFS= read -r LINE; do
+  run_on_fixture "tests/operator-data.sh" "$LINE
+"
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'tests/operator-data.sh:1'; then
+    pass "quoted/escaped control operator cannot forge exemption: $LINE"
+  else
+    fail "control-operator data exempted writer: rc=$RC out=$OUT"
+  fi
+done <<'EOF'
+git config user.email leak@example.com; echo ";# GIT_IDENTITY_SCOPE_EXEMPT: literal"
+git config user.email leak@example.com; echo '|# GIT_IDENTITY_SCOPE_EXEMPT: literal'
+git config user.email leak@example.com; echo \;# GIT_IDENTITY_SCOPE_EXEMPT: literal
 EOF
 
 # Case 54d: Markdown exemptions need a complete comment with its reason inside.

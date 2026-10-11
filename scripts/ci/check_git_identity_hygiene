@@ -1228,14 +1228,15 @@ scan_unscoped_identity_writes() {
   newtmp scan FILES_LIST
 
   if [ -n "$FIXTURE_ROOT" ]; then
-    # `.git` is pruned to match the default path, which enumerates with
-    # `git ls-files` and therefore never sees repository internals.
+    # `.git` is pruned to match the default tracked-path enumeration.
+    # Both paths remain NUL-framed: Git otherwise quotes Unicode names,
+    # and newline-delimited reads split valid filenames into false paths.
     ( cd "$REPO_ROOT" && find . -name .git -prune -o -type f -print0 ) \
       | while IFS= read -r -d '' f; do
-          printf '%s\n' "${f#./}"
+          printf '%s\0' "${f#./}"
         done > "$FILES_LIST"
   else
-    ( cd "$REPO_ROOT" && git ls-files ) > "$FILES_LIST"
+    ( cd "$REPO_ROOT" && git ls-files -z ) > "$FILES_LIST"
   fi
 
   # Paths excluded from the scan, with the reason each is excluded:
@@ -1278,7 +1279,7 @@ scan_unscoped_identity_writes() {
   # asserts a `.markdown` file gets the Markdown treatment.
   SHEBANG_RX='^#!.*[/[:space:]](sh|bash|zsh|ksh|dash|ash|mksh)([[:space:]]|$)'
   SCAN_FILES=()
-  while IFS= read -r rel; do
+  while IFS= read -r -d '' rel; do
     [ -n "$rel" ] || continue
     should_skip "$rel" && continue
     abs="$REPO_ROOT/$rel"
@@ -1656,7 +1657,7 @@ scan_unscoped_identity_writes() {
     # sentence that named the marker in prose and put the write in a code
     # span. The documented spellings are a shell comment and a Markdown
     # HTML comment, so those are what count: a `#` opening a comment
-    # (line start, or after whitespace) in either kind of file — a fenced
+    # (line start, or after whitespace/control operators) in either kind of file — a fenced
     # or indented code block inside a doc is where a real Markdown
     # exemption most often sits — or `<!-- … -->` in Markdown only.
     #
@@ -1678,7 +1679,7 @@ scan_unscoped_identity_writes() {
         }
         if (c == "#" && boundary)
           return substr(s, i) ~ /^#.*GIT_IDENTITY_SCOPE_EXEMPT:[[:space:]]*[^[:space:]]/
-        boundary = (c ~ /[[:space:]]/)
+        boundary = (c ~ /[[:space:];|&()]/)
         dollar = (c == "$")
       }
       return 0
