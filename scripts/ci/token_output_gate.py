@@ -201,7 +201,7 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     redirections or assignment prefixes, complex/special targets (including Bash locale selectors) or
     integer/nameref declarations, and numeric, ANSI-C, expanded, dynamic or unknown formats. Repeated
     assignment options and the option delimiter precede the inspected format.
-    Split-line function-keyword headers invalidate attached builtin provenance
+    Split-line or continued function headers invalidate attached builtin provenance
     without extending general helper body-span discovery. Prompt-managed
     targets can emit or execute values in interactive shells and stay conservative.
     Credential-bearing prefixes were also missed by the parent scanner;
@@ -886,7 +886,7 @@ class Segment:
     __slots__ = (
         "sid", "parent", "parent_is_capture", "parent_is_subshell", "words",
         "line", "pipe_to", "_cmd", "_resolved", "_cmd_index", "_cmd_literal",
-        "_cmd_external",
+        "_cmd_external", "_function_binding",
     )
 
     def __init__(self, sid, parent, parent_is_capture, line):
@@ -919,6 +919,7 @@ class Segment:
         self._cmd_index = None
         self._cmd_literal = None
         self._cmd_external = False
+        self._function_binding = None
 
 
 class Ref:
@@ -1779,6 +1780,15 @@ class Lexer:
                     line += inner.count("\n")
                     i = j
                     continue
+                # Preserve an empty-parens header's existing command position.
+                # Continuations are already consumed by this lexer; this marker
+                # does not change segment structure or discover function bodies.
+                if re.match(r"\((?:[ \t]|\\\n)*\)", text[i:]):
+                    seg = cur_level()["seg"]
+                    if word_so_far:
+                        seg._function_binding = (len(seg.words), word_so_far)
+                    elif seg.words:
+                        seg._function_binding = (len(seg.words) - 1, seg.words[-1])
                 if not word_so_far:
                     # subshell / case-pattern parens.  A subshell does not
                     # capture anything ITSELF, so `( echo "$PAT" )` at the top
@@ -3261,6 +3271,11 @@ def discover_emitter_helpers(text):
     for line in Lexer(text).logical:
         for seg in line.segments:
             cmd = resolve_command(seg)[0]
+            if seg._function_binding is not None:
+                position, word = seg._function_binding
+                if (position == seg._cmd_index
+                        and _unquote_command_word(word) in binding_names):
+                    availability_changed = True
             # A function-keyword header can put its body on the next line.
             # Record only the uncertain binding using existing command
             # positions; general helper body-span discovery stays unchanged.
@@ -5558,6 +5573,56 @@ CORPUS = [
         "printf -vout '%s' harmless >\"./absent/$GH_TOKEN\"\n",
     ),
     (
+        'printf-v-continued-function',
+        MUST_FLAG,
+        'printf\\\n() { echo "$@"; }\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-continued-spaced-function',
+        MUST_FLAG,
+        'printf \\\n( ) { echo "$@"; }\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-continued-name-function',
+        MUST_FLAG,
+        'pri\\\nntf() { echo "$@"; }\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-continued-parens-function',
+        MUST_FLAG,
+        'printf(\\\n) { echo "$@"; }\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-continued-split-body',
+        MUST_FLAG,
+        'printf\\\n()\n{ echo "$@"; }\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-continued-prefix-function',
+        MUST_FLAG,
+        'command\\\n() { echo "$@"; }\ncommand printf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-continued-noop-function',
+        MUST_FLAG,
+        'printf \\\n( ) { :; }\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-continued-quoted-parens',
+        MUST_NOT_FLAG,
+        'printf \'()\' harmless\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-continued-heredoc-data',
+        MUST_NOT_FLAG,
+        'cat >/dev/null <<\'EOF\'\nprintf\\\n() { echo "$@"; }\nEOF\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-continued-brace-operand',
+        MUST_NOT_FLAG,
+        'printf \'{\' harmless\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
         'printf-v-split-keyword-function',
         MUST_FLAG,
         'function printf\n{ echo "$@"; }\nprintf -vout \'%s\' "$GH_TOKEN"\n',
@@ -6922,6 +6987,10 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    "printf-v-continued-noop-function": (
+        "a continued declaration prevents proving builtin lookup even when "
+        "its body emits nothing; retain attached-form conservative provenance"
+    ),
     "printf-v-split-keyword-noop": (
         "a function-keyword declaration prevents proving builtin lookup even "
         "when its split-line body emits nothing; preserve the attached "
