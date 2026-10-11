@@ -44,7 +44,7 @@ if state.get('require_lower_proxy') and args[:2] != ['api','user'] and not __imp
 with (root/'calls.jsonl').open('a') as out: out.write(json.dumps(args)+'\n')
 def emit(value): print(json.dumps(value))
 head, base, source = 'a'*40, 'b'*40, 'c'*40
-url='https://github.com/example/repo/pull/123'
+url=state.get('reported_url','https://github.com/example/repo/pull/123')
 labels=state.get('labels',['needs-external-review'])
 clearance_files_read='repos/example/repo/pulls/123/files' in (root/'calls.jsonl').read_text()
 if args[:2] == ['pr','merge']:
@@ -183,6 +183,18 @@ class WriterTests(unittest.TestCase):
         self.assertEqual(len(writes),1)
         self.assertEqual(json.loads(writes[0])[:3],['pr','merge',URL])
         self.assertNotIn('--repo',json.loads(writes[0]))
+
+    def test_reported_host_is_literal_github_com(self):
+        self.state={'generation':[123,124],'reported_url':'https://githubXcom/example/repo/pull/123'}
+        self.assert_blocked(self.run_writer(),'canonical open github.com PR')
+        calls=(self.path/'calls.jsonl').read_text()
+        self.assertNotIn('/tarball/',calls)
+        self.state={'generation':[123,124],'reported_url':URL}
+        result=self.run_writer()
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        writes=(self.path/'writes.jsonl').read_text().splitlines()
+        self.assertEqual(len(writes),1)
+        self.assertEqual(json.loads(writes[0])[:3],['pr','merge',URL])
 
     def test_caller_bypass_knobs_cannot_select_gate_semantics(self):
         self.assert_blocked(self.run_writer(MERGE_CLEARANCE_CODEX_CHECK_BIN='/bin/true',

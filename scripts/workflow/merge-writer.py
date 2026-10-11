@@ -24,7 +24,7 @@ SPEC = importlib.util.spec_from_file_location('owner_override', Path(__file__).w
 OWNER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(OWNER)
 SHA = re.compile(r'[0-9a-f]{40}')
-URL = re.compile(r'https://github.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)')
+URL = re.compile(r'https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)')
 CODE_FILES = {'scripts/identity-check.sh', 'scripts/merge-clearance-gate.sh', 'scripts/codex-review-check.sh',
               'scripts/hooks/gh-pr-guard.sh', '.github/review-policy.yml'}
 CODE_DIRS = ('scripts/lib/', 'scripts/workflow/')
