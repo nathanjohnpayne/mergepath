@@ -693,10 +693,7 @@ p4b_live_request_generation() {
   local repo="$1" pr="$2" policy author comments
   command -v crqe_trigger_generation gh_api_array >/dev/null 2>&1 || return 2
   policy=$(p4b_governing_policy_json "$repo" "$pr") || return 2
-  author=$(printf '%s' "$policy" | jq -er '
-    if has("author_identity") then
-      .author_identity | select(type == "string" and length > 0)
-    else "nathanjohnpayne" end' 2>/dev/null) || return 2
+  author=$(crqe_policy_author "$policy" 2>/dev/null) || return 2
   comments=$(gh_api_array "repos/$repo/issues/$pr/comments" "Codex request generation for the approval record") \
     || return 2
   crqe_trigger_generation "$comments" "$author" 2>/dev/null | jq -ce 'select(type == "array")' 2>/dev/null \

@@ -560,6 +560,22 @@ if [ "$rc" != 1 ] || ! grep -q 'no reviewer identity' "$DIR/out"; then
 fi
 PASS=$((PASS + 1)); echo 'PASS: requester and checker reject threaded-reply-only clearance'
 
+# The real checker must bind a quoted YAML author key, too. Its old line
+# grep defaulted to nathanjohnpayne and accepted this base-author request.
+sed "s/^author_identity:.*/'author_identity': base-author/" "$DIR/substitute-policy.yml" >"$DIR/quoted-author-policy.yml"
+printf '%s\n' '[{"id":8203,"user":{"login":"base-author"},"created_at":"2026-09-14T00:09:00Z","body":"@codex review"}]' >"$DIR/comments"
+printf '%s\n' "$SUB_APPROVAL" >"$DIR/reviews"
+: >"$DIR/calls"
+rc=0
+PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ=none \
+  PR_BODY='Authoring-Agent: claude' PR_AUTHOR=base-author ISSUE_REACTIONS='[]' \
+  MERGEPATH_REVIEW_POLICY_PATH="$DIR/quoted-author-policy.yml" \
+  bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/out" 2>&1 || rc=$?
+if [ "$rc" != 1 ] || ! grep -q 'a Codex request by base-author' "$DIR/out"; then
+  cat "$DIR/out"; echo "FAIL parsed author checker: rc=$rc"; exit 1
+fi
+PASS=$((PASS + 1)); echo 'PASS: real checker rejects a later request by the parsed quoted-key author'
+
 # #1618: source the production Phase 4b helpers directly; never dispatch an
 # adapter to exercise request-generation authority. Candidate and base policies
 # deliberately disagree, as they can on trusted cross-repository orchestration.
@@ -592,6 +608,26 @@ RESOLVER
   grep -q -- '--repo owner/repo --pr 99 --default-config .*candidate.yml --materialize-default' "$P4B_TEST_RESOLVER_LOG"
   echo 'PASS: governing author capture and revalidation ignore divergent candidate identity'
 
+  # Execute the checker's actual author-assignment block against the same
+  # resolved flow-style base policy. Other legacy checker fields still reject
+  # full-flow configurations independently; author selection cannot diverge.
+  printf '%s\n' '{author_identity: base-author, codex: {enabled: true}}' >"$P4B_TEST_BASE"
+  checker_author_block=$(sed -n '/^AUTHOR_POLICY_JSON=/,/^  }$/p' "$ROOT/scripts/codex-review-check.sh")
+  [ -n "$checker_author_block" ] || { echo 'FAIL checker parsed-author assignment missing'; exit 1; }
+  checker_author=$(export CONFIG="$P4B_TEST_BASE"; eval "$checker_author_block"; printf '%s' "$AUTHOR_IDENTITY")
+  [ "$checker_author" = base-author ] && [ "$(p4b_live_request_generation owner/repo 99)" = '[8201,8203]' ]
+  echo 'PASS: valid flow YAML selects the same author in capture and production checker'
+  printf '%s\n' '{codex: {enabled: true}}' >"$P4B_TEST_BASE"
+  checker_author=$(export CONFIG="$P4B_TEST_BASE"; eval "$checker_author_block"; printf '%s' "$AUTHOR_IDENTITY")
+  [ "$checker_author" = nathanjohnpayne ]
+  echo 'PASS: checker parsed-author assignment preserves absent-key fallback'
+  for invalid in '{author_identity: ""}' '{author_identity: []}' '{author_identity: null}' '{author_identity: [broken'; do
+    printf '%s\n' "$invalid" >"$P4B_TEST_BASE"
+    rc=0; result=$(export CONFIG="$P4B_TEST_BASE"; eval "$checker_author_block"; printf '%s' "$AUTHOR_IDENTITY") || rc=$?
+    [ "$rc" = 3 ] && [ -z "$result" ] || { echo "FAIL checker invalid author: rc=$rc result=$result"; exit 1; }
+  done
+  echo 'PASS: checker rejects malformed-present author rather than using a default'
+
   # Preserve the merge checker's absent-key default, but never repair a
   # present invalid identity or unreadable policy with the candidate's login.
   P4B_TEST_COMMENTS='[{"id":8301,"user":{"login":"nathanjohnpayne"},"body":"@codex review"}]'
@@ -620,6 +656,6 @@ RESOLVER
   [ "$rc" = 2 ] && [ -z "$result" ] || { echo 'FAIL malformed request identity'; exit 1; }
   echo 'PASS: unreadable policy/history and malformed request evidence fail closed'
 )
-PASS=$((PASS + 12))
+PASS=$((PASS + 18))
 
 echo "test_codex_request_evidence: $PASS blocked/query cases and carry-forward success passed"

@@ -156,6 +156,15 @@ if [ -r "$__CODEX_CHECK_DIR/lib/codex-request-evidence.sh" ]; then
   . "$__CODEX_CHECK_DIR/lib/codex-request-evidence.sh"
 fi
 
+# Governing author authority uses the same YAML parser as Phase 4b capture,
+# including valid flow-style/quoted keys. A missing parser is unknown authority.
+if [ ! -r "$__CODEX_CHECK_DIR/lib/feedback-policy-helpers.sh" ]; then
+  echo "ERROR: governing-policy parser missing: $__CODEX_CHECK_DIR/lib/feedback-policy-helpers.sh" >&2
+  exit 3
+fi
+# shellcheck source=lib/feedback-policy-helpers.sh
+. "$__CODEX_CHECK_DIR/lib/feedback-policy-helpers.sh"
+
 # --- Codex failure-marker regexes (#722) ------------------------------------
 # Source the shared usage-limit / not-connected marker patterns so gate (c)'s
 # failure message can name an account-level quota or app-not-connected block
@@ -547,8 +556,13 @@ if [ -z "$REVIEWERS" ]; then
   echo "ERROR: no available_reviewers found in $CONFIG" >&2
   exit 3
 fi
-AUTHOR_IDENTITY=$(grep -m1 '^author_identity:' "$CONFIG" | awk '{print $2}' | sed -E "s/^[\"']//; s/[\"']\$//" || true)
-AUTHOR_IDENTITY="${AUTHOR_IDENTITY:-nathanjohnpayne}"
+# The resolver above selected governing CONFIG; parse it rather than guessing
+# authority from line shape. Malformed present identities never use the default.
+AUTHOR_POLICY_JSON=$(policy_yaml_to_json "$CONFIG") &&
+  AUTHOR_IDENTITY=$(crqe_policy_author "$AUTHOR_POLICY_JSON") || {
+    echo "ERROR: governing policy author_identity could not be read" >&2
+    exit 3
+  }
 
 # --- logging helpers --------------------------------------------------------
 
