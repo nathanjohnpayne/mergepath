@@ -526,7 +526,7 @@ test_print_exports_error_paths_fail_closed() {
 # ---------------------------------------------------------------------------
 test_argument_errors_fail_closed_under_eval() {
   local case_dir="$WORKDIR/case1057_args"   # never created; unreachable anyway
-  local spec label args rc out
+  local spec label args rc out errfile="$WORKDIR/argument-error.stderr"
   for spec in "unknown-agent|--agent nosuchagent --check --print-exports" \
               "unknown-argument|--agent claude --check --print-exports --bogus" \
               "missing-agent|--check --print-exports" \
@@ -539,10 +539,14 @@ test_argument_errors_fail_closed_under_eval() {
     rc=0
     out=$(bash -c '
       [ "$4" = bad-ttl ] && export OP_PREFLIGHT_TTL_SECONDS=soon
-      eval "$(PATH="$2:$PATH" OP_PREFLIGHT_CACHE_DIR="$3" "$1" $5 2>/dev/null)" && printf "REACHED"
-    ' _ "$SCRIPT" "$STUB_DIR" "$case_dir" "$label" "$args" 2>/dev/null) || rc=$?
+      eval "$(PATH="$2:$PATH" OP_PREFLIGHT_CACHE_DIR="$3" "$1" $5)" && printf "REACHED"
+    ' _ "$SCRIPT" "$STUB_DIR" "$case_dir" "$label" "$args" 2>"$errfile") || rc=$?
     if [ "$rc" -eq 0 ] || [ -n "$out" ]; then
       fail "test_argument_errors_fail_closed_under_eval: $label: eval did not fail closed (rc=$rc out=$out)"
+      return
+    fi
+    if [ "$label" = bad-ttl ] && ! grep -q 'OP_PREFLIGHT_TTL_SECONDS must be an integer' "$errfile"; then
+      fail "test_argument_errors_fail_closed_under_eval: bad-ttl did not report its TTL validation error: $(cat "$errfile")"
       return
     fi
   done

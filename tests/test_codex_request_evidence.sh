@@ -186,7 +186,10 @@ GENERATION_FIXTURE='[
 ]'
 [ "$(crqe_trigger_generation "$GENERATION_FIXTURE" nathanjohnpayne)" = '[123,125]' ]
 [ "$(crqe_count_triggers "$GENERATION_FIXTURE" nathanjohnpayne)" = 2 ]
-! crqe_trigger_generation '[{"id":"bad","user":{"login":"nathanjohnpayne"},"body":"@codex review"}]' nathanjohnpayne >/dev/null 2>&1
+if crqe_trigger_generation '[{"id":"bad","user":{"login":"nathanjohnpayne"},"body":"@codex review"}]' nathanjohnpayne >/dev/null 2>&1; then
+  echo "FAIL: malformed qualifying request ID was accepted" >&2
+  exit 1
+fi
 echo "PASS: shared exact-request generation selector"
 
 # #1598: a Codex request the configured author posts AFTER a Phase 4b
