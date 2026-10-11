@@ -10,7 +10,7 @@ How to run a multi-ticket session whose goal is to unblock one or more consumer-
 2. **Verify the checkout.** Check the root (`git rev-parse --show-toplevel`), the `origin` URL, the branch, and write permission. Work only in worktrees placed per [worktree-placement.md](worktree-placement.md). Use `git -C <worktree>` rather than `cd`, because absolute-path edits from a nested worktree can land in the main checkout.
 3. **Verify identity and signing.** After step 4 warms the cache, verify both cached tokens: `GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT" scripts/identity-check.sh --expect-token-identity nathanjohnpayne` and `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/identity-check.sh --expect-token-identity nathanpayne-<agent>`. The write wrappers re-verify with `--expect-write-identity` on every write. Confirm that `git config user.signingkey` resolves and that a test commit verifies as `nathanjohnpayne`.
 4. **Warm credentials once.** Run `eval "$(scripts/op-preflight.sh --agent <agent> --mode review)"`. Before every later credentialed call, revalidate with `eval "$(scripts/op-preflight.sh --agent <agent> --check --print-exports)"`, which never prompts. Never print token values, and never change the gh keyring's active account.
-5. **Find other sessions before touching shared state.** The preflight cache is keyed per agent (`op-preflight-<agent>.env`), so every session of the same agent on this machine shares it. List active sessions (`ListAgents` or the app's session list). Refresh the live ownership of any PRs or issues the prompt says another session owns: their author, latest pushes, labels and open comments. Do not alter another session's PRs, branches, holds, review budgets or cache.
+5. **Find other sessions before touching shared state.** The preflight cache is keyed per agent (`op-preflight-<agent>.env`), so every session of the same agent on this machine shares it. Check for other sessions with an app-wide or machine-wide view, such as the desktop app's session list. `ListAgents` alone is not enough: it lists only this session's own team and subagents, so it can report no peers while another top-level session shares the cache. Refresh the live ownership of any PRs or issues the prompt says another session owns: their author, latest pushes, labels and open comments. Do not alter another session's PRs, branches, holds, review budgets or cache.
 
 ## 2. Building the work set
 
@@ -61,26 +61,26 @@ A stronger reviewer model, a prompt warning or a schema validation is not a subs
 
 ## 5. The per-PR loop
 
-Follow REVIEW_POLICY.md's workflow. The scripts it relies on are:
+Follow REVIEW_POLICY.md's workflow. The scripts it relies on are listed below. Always pass the PR number **and** the target repository: helpers that omit the repository fall back to `gh repo view` in the shell's current checkout, which in a cross-repo session can be a different repo with a same-numbered PR.
 
 | Step | Script |
 | --- | --- |
 | Author writes (create, edit, comment, merge) | `scripts/gh-as-author.sh -- gh …` |
 | Reviewer writes | `GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> scripts/gh-as-reviewer.sh -- gh …` |
 | Should CodeRabbit be invoked? | `scripts/coderabbit-should-invoke.sh <PR#> --repo <owner/repo>` |
-| Wait out a CodeRabbit window | `scripts/coderabbit-wait.sh` (sleep only the remaining `retry_after` window) |
-| Request Codex | `scripts/codex-review-request.sh <PR#>` (never hand-roll the `@codex review` trigger) |
-| Read the Codex verdict | `scripts/codex-review-check.sh <PR#>` |
-| Record per-finding verdicts | `scripts/codex-record-feedback.sh`, `scripts/coderabbit-record-feedback.sh` |
-| Complete-history accounting | `scripts/review-feedback-accounting.sh <PR#>` (require exit `0` and `posted == accounted`) |
-| Resolve threads | REVIEW_POLICY.md § Pre-Merge Review Conversation Gate (`scripts/resolve-pr-threads.sh`) |
+| Wait out a CodeRabbit window | `scripts/coderabbit-wait.sh <PR#> <owner/repo>` (sleep only the remaining `retry_after` window) |
+| Request Codex | `scripts/codex-review-request.sh <PR#> <owner/repo>` (never hand-roll the `@codex review` trigger) |
+| Read the Codex verdict | `scripts/codex-review-check.sh <PR#> <owner/repo>` |
+| Record per-finding verdicts | `scripts/codex-record-feedback.sh <PR#> <owner/repo> --verdict …`, `scripts/coderabbit-record-feedback.sh <PR#> --repo <owner/repo> …` |
+| Complete-history accounting | `scripts/review-feedback-accounting.sh <PR#> <owner/repo>` (require exit `0` and `posted == accounted`) |
+| Resolve threads | REVIEW_POLICY.md § Pre-Merge Review Conversation Gate (`scripts/resolve-pr-threads.sh <PR#> --repo <owner/repo>`) |
 | Automated Phase 4b | `scripts/phase-4b-review.sh <PR#> --repo <owner/repo>`, **only** from a trusted main-ref checkout and only when policy enables it |
 
 Rules that come up repeatedly:
 
 - Disposition each finding in real time: reply, then fix, record and resolve. Do not batch them at the end of a round.
 - Do not infer a completed CodeRabbit review from a mutable summary's assessment marker. Do not retry a refusing provider before its `retry_after` window has elapsed.
-- Treat a Phase 4b `HELD` result as a bounded wait. Treat a human-tiebreaker outcome as a required decision.
+- On a Phase 4b `HELD` result (exit `6`), read the emitted reason first. A hold that clears on its own, such as external review not yet reaching the head, is a bounded wait: sleep the JSON's `retry_after` and rerun. A hold caused by persistent PR state, such as a draft or a non-base target, will not clear by waiting; fix the state instead. Treat a human-tiebreaker outcome as a required decision.
 - Never reset review counters, and never restart an exhausted loop without an explicit owner decision.
 
 ### Stop conditions
@@ -90,8 +90,9 @@ A spent Codex request ceiling (`CAP_EXHAUSTED`, `kind: request-ceiling`) is cost
 Park a PR and move to other work, recording why in the ledger and on the PR, when any of these happen:
 
 - an escalation signal from REVIEW_POLICY.md fires (repeat-after-rebuttal, the Phase 4b barrier's `runaway` stop, or a blocking-review ceiling), or Phase 4b returns a human-tiebreaker outcome;
+- `scripts/coderabbit-wait.sh` exits `5` (rate-limit stalled) with `codex_failover_requested: false` in its JSON. Alert the human and do not proceed toward merge. When the failover did engage (`codex_failover_requested: true`), exit `5` is a non-blocking note and the PR continues through Phase 4a;
 - the PR needs a decision that § 4 classifies as an owner decision;
-- review findings are enlarging the contract rather than finding defects in it (see [high-priority-scope-discipline.md](high-priority-scope-discipline.md)).
+- a required-tier finding would enlarge the PR's contract rather than find a defect in it, and `feedback_policy` does not permit deferring it (see [high-priority-scope-discipline.md](high-priority-scope-discipline.md)). A finding whose tier permits deferral is recorded as a follow-up or accepted residual and the PR continues through the normal accounting and merge gates.
 
 ## 6. Immediately before every merge
 
@@ -101,7 +102,7 @@ Do every step, every time, even if you just did it:
 2. Confirm the required approvals exist **on that head**.
 3. Confirm every required check source is green on that head. The newest run of **each** lineage must pass, and a check that never reported is not passing.
 4. Confirm there are no `human-hold` or other blocking labels.
-5. Run both feedback recorders, then `scripts/review-feedback-accounting.sh`, and require `posted == accounted`.
+5. Run both feedback recorders, then `scripts/review-feedback-accounting.sh <PR#> <owner/repo>`, and require `posted == accounted`.
 6. Run the Pre-Merge Review Conversation Gate and require zero unresolved conversations. Resolve actioned bot threads and accepted registered-agent threads only through the identity-checked paths. Never resolve or alter human-authored conversations, and never remove `human-hold`.
 7. Merge: `scripts/gh-as-author.sh -- gh pr merge <PR#> --repo <owner/repo> --squash --delete-branch --match-head-commit <full-head-sha>`. Always pass `--repo` (or the full PR URL): a session working across repos with `git -C` would otherwise resolve the PR number against whatever checkout the shell is in.
 
@@ -157,7 +158,7 @@ Send a short update when a PR opens, when it merges, when a blocker appears, and
 1. Update the upstream and downstream trackers with linked, current evidence. Close a downstream tracker only when its consumer criteria are verified.
 2. Sync `main`. Preserve recovery evidence, including any necessary ignored files, before cleanup.
 3. Remove only the worktrees and branches this task created (`scripts/worktree-cleanup.sh` audits candidates).
-4. Finalize the credential cache **only if no other session of the same agent is active**. `scripts/op-preflight.sh --agent <agent> --purge` deletes the cache that every session of that agent shares; never purge another agent's cache. Never use `--purge-all`.
+4. Finalize the credential cache **only if a machine-wide check (§ 1 step 5) shows no other session of the same agent is active**; if you cannot establish that, leave the cache in place. `scripts/op-preflight.sh --agent <agent> --purge` deletes the cache that every session of that agent shares; never purge another agent's cache. Never use `--purge-all`.
 
 ## What the session prompt supplies
 
