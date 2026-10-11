@@ -8,7 +8,7 @@
 # consumers via the sync-to-downstream marker, the way check_wave_audit and
 # check_project_doc_sync do; the paired suite legitimately does not travel.
 #
-# Two live assertions run before the suite, because each pins a property whose
+# Live assertions run before the suite, because each pins a property whose
 # quiet loss would turn the nudge back into the architecture #931 rejected:
 #
 #   1. It publishes nothing. The whole reason this is a nudge and not a second
@@ -20,6 +20,8 @@
 #      those two strings; if the workflow renames a job, the match silently
 #      stops firing and the script degrades into an unconditional "re-run my
 #      checks" button, which is exactly what it must not become.
+#   3. Label Gate and the trusted shell predicate name identical blocking
+#      labels. One-copy drift must fail lint before it weakens a required gate.
 #
 # See docs/architecture/0003-pr-review-policy-recovery-producer.md.
 
@@ -63,9 +65,10 @@ SUBJECT="scripts/pr-review-policy-nudge.sh"
 TEST_SCRIPT="tests/test_pr_review_policy_nudge.sh"
 GATE_WORKFLOW=".github/workflows/pr-review-policy.yml"
 LABEL_GATE_TEST="tests/test_label_gate_live_labels.sh"
+BLOCKING_LABELS="scripts/lib/blocking-labels.sh"
 
 
-for f in "$SUBJECT" "$TEST_SCRIPT" "$GATE_WORKFLOW" "$LABEL_GATE_TEST"; do
+for f in "$SUBJECT" "$TEST_SCRIPT" "$GATE_WORKFLOW" "$LABEL_GATE_TEST" "$BLOCKING_LABELS"; do
   if [ ! -f "$f" ]; then
     echo "check_pr_review_policy_nudge: missing required file: $f" >&2
     exit 1
@@ -158,6 +161,36 @@ assert_job_name() {  # <script constant> <workflow job id>
 
 assert_job_name CONTEXT_SELF_REVIEW self-review-check
 assert_job_name CONTEXT_LABEL_GATE label-gate
+
+# --- 2b: the required Label Gate and trusted shell predicate agree (#1241) --
+# Read the actual job through YAML, then accept only the existing literal
+# representations. A representation change must update this assertion rather
+# than silently dropping a label. Neither source is executed to discover it.
+if ! command -v node >/dev/null 2>&1; then
+  echo "check_pr_review_policy_nudge: ERROR node is required for blocking-label parity" >&2
+  exit 1
+fi
+LABEL_GATE_BODY=$(yq -r '.jobs."label-gate".steps[] | select(.uses // "" | test("^actions/github-script@")) | .with.script' "$GATE_WORKFLOW")
+printf '%s' "$LABEL_GATE_BODY" | node -e '
+const fs = require("node:fs");
+const fail = message => {
+  console.error(`check_pr_review_policy_nudge: blocking-label parity: ${message}`);
+  process.exit(1);
+};
+const shell = fs.readFileSync(process.argv[1], "utf8");
+const js = fs.readFileSync(0, "utf8");
+const predicates = [...shell.matchAll(/mergepath_is_blocking_label\(\)\s*\{\s*case "\$\{1:-\}" in\s*([a-z0-9-]+(?:\|[a-z0-9-]+)*)\)\s*return 0\s*;;\s*\*\)\s*return 1\s*;;\s*esac\s*\}/g)];
+const arrays = [...js.matchAll(/const blockingLabels\s*=\s*\[([^\]]*)\];/g)];
+if (predicates.length !== 1 || arrays.length !== 1) fail("unrecognized or ambiguous label definition");
+const literal = arrays[0][1];
+if (!/^\s*(?:\x27[a-z0-9-]+\x27\s*,\s*)*\x27[a-z0-9-]+\x27\s*,?\s*$/.test(literal)) fail("expected a nonempty literal JS label array");
+const shellLabels = predicates[0][1].split("|").sort();
+const jsLabels = [...literal.matchAll(/\x27([a-z0-9-]+)\x27/g)].map(match => match[1]).sort();
+if (JSON.stringify(shellLabels) !== JSON.stringify(jsLabels)) {
+  fail(`shell labels [${shellLabels}] differ from Label Gate labels [${jsLabels}]`);
+}
+console.log("check_pr_review_policy_nudge: blocking-label parity: PASS");
+' "$BLOCKING_LABELS"
 
 # --- 3: the recovery contract the nudge depends on --------------------------
 # The whole mechanism is "a body edit fires `edited`, and `edited` re-runs all
