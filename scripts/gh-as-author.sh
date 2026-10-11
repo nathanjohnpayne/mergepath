@@ -236,12 +236,10 @@ fi
 # it can neither carry the write nor receive the PAT (see gh-token-resolver.sh).
 run_with_author_token() {
   unset GITHUB_TOKEN
-  if [ -n "$TRACE_MARKER" ] && ! : >"$TRACE_MARKER"; then
-    echo "gh-as-author: cannot write the trace marker $TRACE_MARKER; refusing to run the write unrecorded." >&2
-    exit 70
-  fi
-  GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
-    GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" "$@"
+  GH_TOKEN="$TOKEN" GH_AS_AUTHOR_RECORD_IDENTITY="$AUTHOR" \
+    GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+    GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+    python3 "$ROOT/scripts/workflow/merge-writer.py" "$TRACE_MARKER" "$@"
 }
 
 # Every admin merge records its scoped owner instruction before the write.

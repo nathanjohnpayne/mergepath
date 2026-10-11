@@ -1216,6 +1216,8 @@ scripts/gh-as-author.sh -- gh pr merge <PR#> --squash --delete-branch --match-he
 scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
 ```
 
+Ordinary author-wrapped merges run the fresh threshold-aware clearance dispatcher at the final writer boundary (#1609), after the existing hold/CI/disagreement/queue guards. The checker and its dependency families come from the target repository's exact observed default-branch commit; policy comes from the exact PR base. An earlier green check or `CODEX_CLEARED=1` cannot authorize the write, and caller checker/config/skip overrides are excluded. Exactly one matching full head is mandatory and the final target is the canonical observed PR. Scoped genuine admin recording and cancellation retain their separate paths; ordinary deferred auto-merge remains refused. The installed launcher/operator toolchain remain trusted, and GitHub's head precondition does not atomically fence comment generations. See [Codex request evidence](specs/codex_request_evidence.md) for the runtime-code and client-snapshot boundary.
+
 - Use the item ID from the [PAT lookup table](#pat-lookup-table) for your agent identity. Do not use the 1Password item title.
 - Verify token identity with `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login` or by letting the wrapper call `identity-check.sh --expect-write-identity` before the write. Do not use `gh auth status` as an attribution proof.
 - If `op whoami` says you are not signed in, still run the `op read ...` command in an interactive TTY. That is what triggers the 1Password biometric prompt on local machines.

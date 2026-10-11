@@ -442,17 +442,17 @@ reset_log() {
 
 reset_log
 OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" GITHUB_TOKEN="ambient-token" \
-  run_wrapper -- gh pr merge 123 --squash >/dev/null 2>&1
+  run_wrapper -- gh pr merge 123 --disable-auto >/dev/null 2>&1
 rc=$?
 if [ "$rc" -ne 0 ]; then
-  fail "merge happy path: rc=$rc"
+  fail "merge cancellation identity path: rc=$rc"
 elif grep -q $'gh\tauth\tswitch' "$WORKDIR/calls.log"; then
-  fail "merge happy path: called gh auth switch"
-elif ! grep -q $'GH_TOKEN=ghp_author-token GITHUB_TOKEN= gh\tpr\tmerge\t123\t--squash' "$WORKDIR/calls.log"; then
-  fail "merge happy path: wrapped command did not run with author token and GITHUB_TOKEN unset"
+  fail "merge cancellation identity path: called gh auth switch"
+elif ! grep -q $'GH_TOKEN=ghp_author-token GITHUB_TOKEN= gh\tpr\tmerge\t123\t--disable-auto' "$WORKDIR/calls.log"; then
+  fail "merge cancellation identity path: wrapped command did not run with author token and GITHUB_TOKEN unset"
   cat "$WORKDIR/calls.log" >&2
 else
-  pass "merge happy path: verified author token, no keyring switch, ambient GITHUB_TOKEN cleared"
+  pass "merge cancellation identity path: verified author token, no keyring switch, ambient GITHUB_TOKEN cleared"
 fi
 
 reset_log
@@ -740,7 +740,7 @@ fi
 
 reset_log
 unset OP_PREFLIGHT_AUTHOR_PAT
-run_wrapper -- gh pr merge 123 --squash >/dev/null 2>&1
+run_wrapper -- gh pr merge 123 --disable-auto >/dev/null 2>&1
 rc=$?
 if [ "$rc" -ne 0 ]; then
   fail "fallback token: rc=$rc"
@@ -753,7 +753,7 @@ fi
 
 reset_log
 set +e
-stderr_capture=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_reviewer-token" run_wrapper -- gh pr merge 123 --squash 2>&1 >/dev/null)
+stderr_capture=$(OP_PREFLIGHT_AUTHOR_PAT="ghp_reviewer-token" run_wrapper -- gh pr merge 123 --disable-auto 2>&1 >/dev/null)
 rc=$?
 set -e
 if [ "$rc" -eq 0 ]; then
@@ -786,7 +786,7 @@ install_wrapper_copy() {
   local dir=$1
   mkdir -p "$dir/scripts/lib" "$dir/scripts/workflow" "$dir/.github"
   cp "$ROOT/scripts/gh-as-author.sh" "$dir/scripts/gh-as-author.sh"
-  cp "$ROOT/scripts/workflow/owner-admin-override.py" "$dir/scripts/workflow/"
+  cp "$ROOT/scripts/workflow/owner-admin-override.py" "$ROOT/scripts/workflow/merge-writer.py" "$dir/scripts/workflow/"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
   cp "$ROOT/scripts/lib/gh-command-classifier.sh" "$dir/scripts/lib/gh-command-classifier.sh"
   cp "$ROOT/scripts/lib/pr-body-contract.sh" "$dir/scripts/lib/pr-body-contract.sh"
@@ -824,10 +824,10 @@ printf "author_identity: 'custom-author'\n" >"$PIN_DIR2/.github/review-policy.ym
 reset_log
 set +e
 ( cd "$PIN_DIR2" && GH_AS_AUTHOR_IDENTITY="custom-author" \
-    PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" "$PIN_DIR2/scripts/gh-as-author.sh" -- gh pr merge 9 --squash ) >/dev/null 2>&1
+    PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" "$PIN_DIR2/scripts/gh-as-author.sh" -- gh pr merge 9 --disable-auto ) >/dev/null 2>&1
 rc=$?
 set -e
-if [ "$rc" -eq 0 ] && grep -q $'GH_TOKEN=gho_fallback-custom-author-token GITHUB_TOKEN= gh\tpr\tmerge\t9\t--squash' "$WORKDIR/calls.log"; then
+if [ "$rc" -eq 0 ] && grep -q $'GH_TOKEN=gho_fallback-custom-author-token GITHUB_TOKEN= gh\tpr\tmerge\t9\t--disable-auto' "$WORKDIR/calls.log"; then
   pass "runtime pin: matching custom identity (quoted policy) proceeds with its token"
 else
   fail "runtime pin: matching custom identity should proceed; rc=$rc calls=$(cat "$WORKDIR/calls.log")"
@@ -853,11 +853,11 @@ rm -rf "$NO_POLICY_DIR/.github"
 reset_log
 set +e
 ( cd "$NO_POLICY_DIR" && OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" \
-    PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" "$NO_POLICY_DIR/scripts/gh-as-author.sh" -- gh pr merge 9 --squash ) >/dev/null 2>&1
+    PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" "$NO_POLICY_DIR/scripts/gh-as-author.sh" -- gh pr merge 9 --disable-auto ) >/dev/null 2>&1
 rc=$?
 set -e
 if [ "$rc" -eq 0 ]; then
-  pass "runtime pin: absent policy file keeps legacy behavior"
+  pass "runtime pin: absent policy retains cancellation behavior"
 else
   fail "runtime pin: absent policy file should not block; rc=$rc"
 fi
@@ -883,7 +883,7 @@ reset_log
 : >"$WORKDIR/ent.log"
 set +e
 STUB_ENT_LOG="$WORKDIR/ent.log" OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" \
-  run_wrapper -- gh pr merge 123 --squash >/dev/null 2>&1
+  run_wrapper -- gh pr merge 123 --disable-auto >/dev/null 2>&1
 rc=$?
 set -e
 if [ "$rc" -eq 0 ] && grep -qx 'mergepath-guarded-write-github-com-only|mergepath-guarded-write-github-com-only|pr merge' "$WORKDIR/ent.log"; then
@@ -898,7 +898,7 @@ fi
 # refuse, never write under the placeholder.
 reset_log
 set +e
-GITHUB_TOKEN= GH_TOKEN="proxy-injected" run_wrapper -- gh pr merge 123 --squash >/dev/null 2>&1
+GITHUB_TOKEN= GH_TOKEN="proxy-injected" run_wrapper -- gh pr merge 123 --disable-auto >/dev/null 2>&1
 rc=$?
 set -e
 if [ "$rc" -eq 0 ] && grep -q $'GH_TOKEN=gho_fallback-author-token GITHUB_TOKEN= gh\tpr\tmerge' "$WORKDIR/calls.log" \
@@ -911,7 +911,7 @@ fi
 
 reset_log
 set +e
-STUB_NO_KEYRING=1 GITHUB_TOKEN= GH_TOKEN="proxy-injected" run_wrapper -- gh pr merge 123 --squash >/dev/null 2>&1
+STUB_NO_KEYRING=1 GITHUB_TOKEN= GH_TOKEN="proxy-injected" run_wrapper -- gh pr merge 123 --disable-auto >/dev/null 2>&1
 rc=$?
 set -e
 if [ "$rc" -ne 0 ] && ! grep -q $'gh\tpr\tmerge' "$WORKDIR/calls.log"; then
@@ -1355,7 +1355,7 @@ MARKER="$WORKDIR/reached-marker"
 rm -f "$MARKER"; reset_log; : >"$WORKDIR/marker-env.log"
 set +e
 STUB_MARKER_ENV_LOG="$WORKDIR/marker-env.log" GH_AS_AUTHOR_TRACE_MARKER="$MARKER" OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" \
-  run_wrapper -- gh pr merge 123 --squash >/dev/null 2>&1
+  run_wrapper -- gh pr merge 123 --disable-auto >/dev/null 2>&1
 rc=$?
 set -e
 if [ "$rc" -eq 0 ] && [ -f "$MARKER" ] && grep -q $'gh\tpr\tmerge' "$WORKDIR/calls.log" && ! grep -vqx '<unset>' "$WORKDIR/marker-env.log"; then
@@ -1366,7 +1366,7 @@ fi
 rm -f "$MARKER"; reset_log
 set +e
 GITHUB_TOKEN= GH_TOKEN= GH_AS_AUTHOR_TRACE_MARKER="$MARKER" GH_AS_AUTHOR_IDENTITY=custom-author-nokeyring \
-  run_wrapper -- gh pr merge 123 --squash >/dev/null 2>&1
+  run_wrapper -- gh pr merge 123 --disable-auto >/dev/null 2>&1
 rc=$?
 set -e
 if [ "$rc" -ne 0 ] && [ ! -e "$MARKER" ] && ! grep -q $'gh\tpr\tmerge' "$WORKDIR/calls.log"; then
@@ -1377,7 +1377,7 @@ fi
 reset_log
 set +e
 GH_AS_AUTHOR_TRACE_MARKER="$WORKDIR/no-such-dir/marker" OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" \
-  run_wrapper -- gh pr merge 123 --squash >/dev/null 2>&1
+  run_wrapper -- gh pr merge 123 --disable-auto >/dev/null 2>&1
 rc=$?
 set -e
 if [ "$rc" -eq 70 ] && ! grep -q $'gh\tpr\tmerge' "$WORKDIR/calls.log"; then

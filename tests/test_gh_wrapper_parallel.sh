@@ -44,7 +44,7 @@ STUB
 chmod +x "$STUB_DIR/gh"
 
 PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$LOG" OP_PREFLIGHT_AUTHOR_PAT="ghp_author-token" \
-  "$AUTHOR_WRAPPER" -- gh pr merge 1 --squash >/dev/null 2>"$WORKDIR/author.err" &
+  "$AUTHOR_WRAPPER" -- gh pr merge 1 --disable-auto >/dev/null 2>"$WORKDIR/author.err" &
 author_pid=$!
 
 PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$LOG" OP_PREFLIGHT_REVIEWER_PAT="ghp_reviewer-token" \
@@ -70,7 +70,7 @@ if grep -q $'gh\tauth\tswitch' "$LOG"; then
   cat "$LOG" >&2
   exit 1
 fi
-if ! grep -q $'GH_TOKEN=ghp_author-token gh\tpr\tmerge\t1\t--squash' "$LOG"; then
+if ! grep -q $'GH_TOKEN=ghp_author-token gh\tpr\tmerge\t1\t--disable-auto' "$LOG"; then
   echo "FAIL: author write did not run under ghp_author-token" >&2
   cat "$LOG" >&2
   exit 1

@@ -29,13 +29,9 @@
 #      approval, dismissal or owner-authorized
 #      BREAK_GLASS_REVIEW_DISAGREEMENT=<PR>@<full-head-sha> releases it;
 #      admin and merge-state overrides never decide that disagreement.
-#   6. gh pr merge (non-admin) — blocks when the target PR carries
-#      the `needs-external-review` label unless CODEX_CLEARED=1
-#      (agent must have just run scripts/codex-review-check.sh
-#      successfully). This enforces REVIEW_POLICY.md § Phase 4a
-#      merge gate at the hook layer so an agent can't accidentally
-#      merge past Label Gate by removing the label without running
-#      the gate check first.
+#   6. Ordinary merges must use the author wrapper, whose final writer
+#      re-runs trusted threshold-aware clearance (#1609). CODEX_CLEARED
+#      claims and earlier green checks grant no runtime writer authority.
 #
 # Byline-sensitive command coverage (#284/#411):
 #
@@ -157,12 +153,10 @@
 #     quoting fails closed like any other parse error. Closes the
 #     eval / bash -c / sh -c admin-merge bypass (#533 item 1).
 #
-#   - The CODEX_CLEARED check is a hook-layer defense-in-depth.
-#     The authoritative merge gate is scripts/codex-review-check.sh;
-#     the hook only verifies the agent claims to have run it. An
-#     agent that sets CODEX_CLEARED=1 without actually running the
-#     check is violating policy — the hook is not an integrity
-#     check, it is an ordering check.
+#   - Fresh clearance belongs to gh-as-author.sh's final writer. This
+#     hook preserves static command admission and hold/CI/disagreement/
+#     queue checks; it is also run from trusted default-ref code by the
+#     writer. The generation evaluator is shared, not reimplemented here.
 #
 #   - PR selector is parsed from the command tokens: first non-flag
 #     positional argument after `merge`. Accepts <number> | <url> |
@@ -3396,6 +3390,15 @@ for j in "${!TOKENS[@]}"; do
       ADMIN_REQUESTED=1
       continue
       ;;
+    --admin=*)
+      RETRACTION_ARGS_SAFE=0
+      case "${tok#--admin=}" in
+        false|False|FALSE|f|F|0) ADMIN_REQUESTED=0 ;;
+        true|True|TRUE|t|T|1) ADMIN_REQUESTED=1 ;;
+        *) echo "BLOCKED: invalid --admin boolean value." >&2; exit 2 ;;
+      esac
+      continue
+      ;;
     --repo|-R)
       SKIP_NEXT_AS="repo"
       continue
@@ -3765,14 +3768,10 @@ fi
 # GitHub label names) is its own line and does NOT false-match the
 # real `needs-external-review` gate.
 if printf '%s\n' "$LABELS" | grep -Fxq "needs-external-review"; then
-  if [ "$EFFECTIVE_CODEX_CLEARED" != "1" ]; then
-    echo "BLOCKED: PR carries 'needs-external-review' and CODEX_CLEARED is not set." >&2
-    echo "  Phase 4a merge gate: run 'scripts/codex-review-check.sh <PR#>' first." >&2
-    echo "  When it exits 0, retry this merge with CODEX_CLEARED=1 (export or inline prefix)." >&2
-    echo "  See REVIEW_POLICY.md § Phase 4a for the full flow." >&2
-    exit 2
+  if [ "$EFFECTIVE_CODEX_CLEARED" = "1" ]; then
+    echo "Cached CODEX_CLEARED claim is ignored at the final writer." >&2
   fi
-  echo "CODEX_CLEARED=1 set; PR is labeled needs-external-review but agent claims merge-gate has passed." >&2
+  echo "Merge-time clearance is enforced by gh-as-author.sh; CODEX_CLEARED claims grant no authority." >&2
 fi
 
 exit 0
