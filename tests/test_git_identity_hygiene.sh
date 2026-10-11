@@ -326,6 +326,56 @@ for REL in 'docs/résumé.md' $'docs/line\nbreak.md'; do
   fi
 done
 
+# Case 10c: tracked symlinks name link objects, not source on this machine.
+# Exercise missing, clean and offending external targets in a real index.
+# The companion regular source must still be scanned in every state.
+LINKS_CONSUMER="$WORKDIR/consumer-links"
+mkdir -p "$LINKS_CONSUMER/scripts/ci" "$LINKS_CONSUMER/docs" "$WORKDIR/external-source"
+git init -q -b main "$LINKS_CONSUMER"
+cp "$CHECK" "$LINKS_CONSUMER/scripts/ci/check_git_identity_hygiene"
+for REL in linked.md linked.sh linked-hook; do
+  ln -s "$WORKDIR/external-source/target" "$LINKS_CONSUMER/$REL"
+done
+printf 'git -C "$FIXTURE" config user.email fixture@example.com\n' > "$LINKS_CONSUMER/docs/regular.md"
+git -C "$LINKS_CONSUMER" add .
+for STATE in absent clean writer; do
+  case "$STATE" in
+    clean) printf '#!/usr/bin/env bash\ngit -C "$FIXTURE" config user.email fixture@example.com\n' > "$WORKDIR/external-source/target" ;;
+    writer) printf '#!/usr/bin/env bash\ngit config user.email external@example.com\n' > "$WORKDIR/external-source/target" ;;
+  esac
+  set +e
+  OUT="$(bash "$LINKS_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+  set -e
+  if [ "$RC" = "0" ]; then
+    pass "tracked symlink targets excluded when external source is $STATE"
+  else
+    fail "symlink target affected tracked-source scan ($STATE): rc=$RC out=$OUT"
+  fi
+  printf 'git config user.email regular@example.com\n' > "$LINKS_CONSUMER/docs/regular.md"
+  set +e
+  OUT="$(bash "$LINKS_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+  set -e
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/regular.md:1:' \
+    && ! printf '%s' "$OUT" | grep -q 'linked.*:2:'; then
+    pass "regular tracked companion still scanned with $STATE symlink target"
+  else
+    fail "regular source beside $STATE symlink: rc=$RC out=$OUT"
+  fi
+  printf 'git -C "$FIXTURE" config user.email fixture@example.com\n' > "$LINKS_CONSUMER/docs/regular.md"
+done
+# A tracked directory replaced with a symlink must not redirect regular paths.
+mv "$LINKS_CONSUMER/docs" "$WORKDIR/original-source"
+printf 'git config user.email external@example.com\n' > "$WORKDIR/external-source/regular.md"
+ln -s "$WORKDIR/external-source" "$LINKS_CONSUMER/docs"
+set +e
+OUT="$(bash "$LINKS_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+set -e
+if [ "$RC" = "0" ]; then
+  pass "symlinked directory cannot redirect tracked source to machine-local bytes"
+else
+  fail "symlinked parent directory followed: rc=$RC out=$OUT"
+fi
+
 # Case 11: a backslash continuation between `git` and `config`. Neither
 # physical line matches on its own — the first carries no `config`, the
 # second no `git` — so a line-at-a-time scan waves through exactly the
@@ -1600,6 +1650,91 @@ if [ "$RC" = "0" ]; then
   pass "unclosed Markdown fence does not leak into another file"
 else
   fail "Markdown fence state leaked between files: rc=$RC out=$OUT"
+fi
+
+# Case 54j: VT/FF are neither fence-closing blanks nor shell blanks.
+# These are scan-only source bytes, never executed fixture commands.
+for CONTROL in $'\v' $'\f' $'\r'; do
+  run_on_fixture "tests/control-marker.sh" "git config user.email leak@example.com;echo X${CONTROL}# GIT_IDENTITY_SCOPE_EXEMPT: printed data
+"
+  if [ "$RC" = "1" ]; then
+    pass "non-shell blank before hash cannot forge a comment exemption"
+  else
+    fail "control byte forged shell comment: rc=$RC out=$OUT"
+  fi
+done
+for CONTROL in $'\v' $'\f'; do
+  for FENCE in '```' '~~~'; do
+    run_on_fixture "docs/control-fence.md" "${FENCE}bash
+${FENCE}${CONTROL}
+git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: fenced data -->
+${FENCE}
+"'`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: real outside comment -->
+'
+    if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/control-fence.md:3:' \
+      && ! printf '%s' "$OUT" | grep -q 'docs/control-fence.md:5:'; then
+      pass "control byte cannot close $FENCE fence; real closer restores HTML comments"
+    else
+      fail "control-byte $FENCE fence boundary: rc=$RC out=$OUT"
+    fi
+  done
+done
+for BLANK in ' ' $'\t'; do
+  run_on_fixture "tests/blank-marker.sh" "git config user.email fixture@example.com;echo X${BLANK}# GIT_IDENTITY_SCOPE_EXEMPT: real shell comment
+"
+  if [ "$RC" = "0" ]; then
+    pass "shell space/tab still opens a real exemption comment"
+  else
+    fail "real shell blank rejected: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/blank-fence.md" '```bash
+'"\`\`\`${BLANK}"$'\r\n'"git config user.email fixture@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: after CRLF closer -->"$'\r\n'
+  if [ "$RC" = "0" ]; then
+    pass "space/tab fence closer accepts CRLF and restores real HTML exemptions"
+  else
+    fail "real CRLF fence closer rejected: rc=$RC out=$OUT"
+  fi
+done
+
+# Case 54k: comment-shaped text in inline links and HTML attributes is data.
+# Quote styles, balanced/escaped parentheses, and markup escapes share the
+# real lexer. A real comment after each closed construct still exempts.
+for DATA in \
+  '[marker](https://example.invalid "<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal title -->")' \
+  "[marker](https://example.invalid '<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal title -->')" \
+  '[marker](https://example.invalid (<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal title -->))' \
+  '[marker](<https://example.invalid/a)> "<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal title -->")' \
+  "[marker](<https://example.invalid/a)> '<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal title -->')" \
+  '[marker]( <https://example.invalid/a(b)> (<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal title -->))' \
+  '[marker](<https://example.invalid/a\>b)> "<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal title -->")' \
+  '[marker](https://example.invalid/a(b) "<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal ) title -->")' \
+  '[marker](https://example.invalid/a\(b\) "<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal title -->")' \
+  '<span title="<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal attribute -->">text</span>' \
+  "<span title='<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal attribute -->'>text</span>" \
+  '<span title="literal > <!-- GIT_IDENTITY_SCOPE_EXEMPT: attribute -->">text</span>' \
+  '\<!-- GIT_IDENTITY_SCOPE_EXEMPT: escaped markup -->'; do
+  run_on_fixture "docs/data-marker.md" "git config user.email leak@example.com ${DATA}
+"
+  if [ "$RC" = "1" ]; then
+    pass "HTML marker in link/attribute/escaped data cannot exempt a writer"
+  else
+    fail "comment-shaped Markdown data accepted: '$DATA' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/data-then-comment.md" "git config user.email fixture@example.com ${DATA} <!-- GIT_IDENTITY_SCOPE_EXEMPT: real comment after data -->
+"
+  if [ "$RC" = "0" ]; then
+    pass "real HTML comment after closed link/attribute/escaped data still exempts"
+  else
+    fail "real comment after Markdown data rejected: '$DATA' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "docs/comments-with-quotes.md" 'git config user.email fixture@example.com "quoted prose" <!-- GIT_IDENTITY_SCOPE_EXEMPT: "real quoted reason" -->
+git config user.email fixture@example.com <!-- ordinary comment --> <!-- GIT_IDENTITY_SCOPE_EXEMPT: second real comment -->
+'
+if [ "$RC" = "0" ]; then
+  pass "prose quotes and preceding ordinary comments do not mask a true HTML exemption"
+else
+  fail "true HTML comment over-masked: rc=$RC out=$OUT"
 fi
 
 # Case 54f: blockquote and list containers do not make fenced HTML live.
