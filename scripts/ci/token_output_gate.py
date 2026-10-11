@@ -195,47 +195,25 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     An escaped command word (`\echo`) is the same emitter. `printf -v NAME`
     and `printf -vNAME` assign only in option position before the format and
     before `--`; the same spellings after the format are data and emit.
-    Attached forms retain conservative output verdicts for external or
-    locally defined commands/prefixes, query modifiers, changed builtin
-    availability (`enable`, aliases or opaque setup), credential-bearing
-    redirections or assignment prefixes, complex/special targets (including Bash locale selectors) or
-    integer/nameref declarations, and numeric, ANSI-C, expanded, dynamic or unknown formats. Repeated
-    assignment options and the option delimiter precede the inspected format.
-    Attached value operands with credential references inside arithmetic or
-    error-word evaluation retain output verdicts: modern/legacy arithmetic,
-    indexed subscripts and substring offsets may diagnose before
-    printf assigns. Ordinary, single-quoted and escaped value data stays eligible.
-    Nested indexed operands keep legacy arithmetic context through inner brackets.
-    Positional/special offsets and positional/array error words participate only
-    in attached eligibility. Input redirection references and interpolating
-    here-doc metadata also withhold this exemption, conservatively even for plain
-    ignored input; quoted delimiters and literal input retain their verdicts.
-    Deferred mapfile/readarray callbacks invalidate builtin lookup. Only an
-    unquoted reserved time at a pipeline start proves that prefix.
-    Captured arithmetic diagnostics remain the measured preexisting #2058
-    miss; this eligibility check does not change the output walk.
-    Invalid-name indirection remains the measured preexisting #2059 miss;
-    credential-value reference selection remains unchanged.
-    Separate-option positional/array error-word diagnostics remain the measured
-    preexisting #2061 misses; #1461 owns the separate numeric-format diagnostic.
-    Split-line or continued function headers invalidate attached builtin provenance
-    without extending general helper body-span discovery. Prompt-managed
-    targets can emit or execute values in interactive shells and stay conservative.
-    Timing/history formats, history-file diagnostics, default fc editor commands,
-    mail-arrival paths and default cd paths likewise
-    stay conservative as finite managed targets. The noninteractive corpus
-    declares mail-arrival checks separately from an independent PTY oracle.
-    PWD can supply an interactive directory prompt even when noninteractive
-    pwd ignores its assigned value; both points are explicit conservative cases.
-    INPUTRC is conservatively reserved as a named Readline target. Its measured
-    bind -f case explicitly consumes the variable; ordinary alias propagation
-    remains outside this eligibility repair, with no automatic-read claim.
-    Credential-bearing prefixes were also missed by the parent scanner;
-    their diagnostic check here is limited to attached-option assignments.
-    Numeric-conversion diagnostics from the separate assignment form remain
-    the #1461 gap, unchanged by the option-position repair (#1645).
-    Nonordinary attached targets reuse the bounded deferred-text reader for
-    quoted evaluation; no new runtime binding or execution model is inferred.
+    The attached exemption is the owner-ratified Option A allowlist (#1645):
+    target `[a-z_][a-z0-9_]*`, excluding `_`, `auto_resume` and `histchars`;
+    a literal format with only unmodified `%s` conversions and plain text;
+    values that are literal data or one double-quoted plain ordinary-name
+    expansion, without modifiers, subscripts or arithmetic; and a bare command
+    segment with no assignment prefixes, redirections or wrappers. The existing
+    in-file builtin-provenance predicate must also pass. Every other attached
+    form retains its conservative verdict, with safe false positives declared.
+    Repeated assignment options and `--` precede the actual format. Separate
+    `-v NAME`, including #1461 numeric diagnostics, keeps its prior scope.
+    Imported printf functions are an owner-accepted residual: this source-only
+    predicate cannot establish ambient lookup, so a function imported by Bash
+    can print allowed assignment arguments. The noninteractive oracle also
+    cannot settle terminal-only output. These are explicit limits, not promises
+    of environment or shell-state proof. Captured arithmetic diagnostics (#2058),
+    invalid-name indirection (#2059), and separate positional/array diagnostics
+    (#2061) retain their measured existing limits. The quoted nonordinary-target
+    reader remains bounded and refuses new clean verdicts; no general deferred
+    operand-flow or function-invocation model is introduced.
   * An in-file message helper: a function whose body writes one of its own
     positional parameters VERBATIM through an emitter, or hands one to
     `cat`/`tee` on a HERE-STRING -- unless the file redefines that name, in
@@ -912,7 +890,7 @@ class Segment:
     __slots__ = (
         "sid", "parent", "parent_is_capture", "parent_is_subshell", "words",
         "line", "pipe_to", "_cmd", "_resolved", "_cmd_index", "_cmd_literal",
-        "_cmd_external", "_function_binding", "_printf_heredoc_has_ref",
+        "_function_binding",
     )
 
     def __init__(self, sid, parent, parent_is_capture, line):
@@ -944,15 +922,13 @@ class Segment:
         self._resolved = False
         self._cmd_index = None
         self._cmd_literal = None
-        self._cmd_external = False
         self._function_binding = None
-        self._printf_heredoc_has_ref = False
 
 
 class Ref:
     __slots__ = (
         "name", "line", "seg", "heredoc_owner", "in_assign_prefix",
-        "in_heredoc_body", "in_error_word", "in_arithmetic", "in_printf_diagnostic",
+        "in_heredoc_body", "in_error_word",
     )
 
     def __init__(self, name, line, seg, in_assign_prefix=False):
@@ -967,12 +943,6 @@ class Ref:
         # Grading it against the command word answered a question that is not
         # the one being asked (#1032 round 5 P1).
         self.in_error_word = False
-        # Used only to withhold the attached printf assignment exemption:
-        # arithmetic evaluation can diagnose an expanded operand before the
-        # builtin captures it. Ordinary expansion remains eligible.
-        self.in_arithmetic = False
-        # Guard-only positional/array error words retain the separate-form walk.
-        self.in_printf_diagnostic = False
         # Set when the reference is body TEXT the here-doc owner writes, so
         # the owner's segment is where the walk starts.  A reference inside a
         # COMMAND SUBSTITUTION in that same body leaves this None and carries
@@ -1007,7 +977,6 @@ class LogicalLine:
 
 _WORD_BREAK_BEFORE_COMMENT = set(" \t\n;&|()")
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-_POSITIONAL_PARAMETER_RE = re.compile(r"[0-9]+|[@*?#$!-]")
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=")
 # The ONLY things bash lets precede a redirection operator inside the same
 # token are an IO_NUMBER (`2>&1`) and a `{name}` descriptor variable.  Ordinary
@@ -1254,12 +1223,9 @@ class Lexer:
             return
         start_line = hd.body_lines[0][0]
         body = "\n".join(raw for _lno, raw in hd.body_lines)
-        prior_refs = len(cur_ll.refs)
         masked = self._absorb_substitutions(
             body, hd.owner, start_line, cur_ll, in_heredoc_body=True
         )
-        if len(cur_ll.refs) > prior_refs:
-            hd.owner._printf_heredoc_has_ref = True
         for offset, raw in enumerate(masked.split("\n")):
             for name, in_ew in _iter_refs_ew(raw):
                 r = Ref(name, start_line + offset, hd.owner)
@@ -1270,7 +1236,6 @@ class Lexer:
                 # owner emits.  Without this the reference was attributed to
                 # the safe `read` and graded clean (#1032 round 6 P1).
                 r.in_error_word = in_ew
-                hd.owner._printf_heredoc_has_ref = True
                 cur_ll.refs.append(r)
 
     # -- helpers ---------------------------------------------------------
@@ -1472,11 +1437,6 @@ class Lexer:
                     cur_level()["word"].append("$((")
                     i += 3
                     continue
-                if nxt == "[":
-                    quotes.append("$[")  # Bash's legacy arithmetic expansion.
-                    cur_level()["word"].append("$[")
-                    i += 2
-                    continue
                 if nxt == "(":
                     # command substitution: a capturing level
                     parent_seg = cur_level()["seg"]
@@ -1501,8 +1461,7 @@ class Lexer:
                     # marker rather than a parallel counter because the pop on
                     # `}` has to stay exactly symmetric with the push.
                     quotes.append(
-                        "${?" if error_word_expansion_at(text, i)
-                        else parameter_arithmetic_at(text, i) or "${"
+                        "${?" if error_word_expansion_at(text, i) else "${"
                     )
                     cur_level()["word"].append("${")
                     # `${NAME...}`: `braced_ref_at` is the single decider,
@@ -1520,11 +1479,6 @@ class Lexer:
                                 in_assign_prefix(),
                             )
                             r.in_error_word = "${?" in quotes[:-1]
-                            r.in_printf_diagnostic = "${printf?" in quotes[:-1]
-                            # The parameter's base value is not an arithmetic
-                            # operand; nested references in its index/offset are.
-                            r.in_arithmetic = any(q in ("$((", "$[", "${[", "${:")
-                                                  for q in quotes[:-1])
                             cur_ll.refs.append(r)
                     i += 2
                     continue
@@ -1539,41 +1493,13 @@ class Lexer:
                             in_assign_prefix(),
                         )
                         r.in_error_word = "${?" in quotes
-                        r.in_printf_diagnostic = "${printf?" in quotes
-                        r.in_arithmetic = any(q in ("$((", "$[", "${[", "${:")
-                                              for q in quotes)
                         cur_ll.refs.append(r)
                 cur_level()["word"].append(c)
                 i += 1
                 continue
 
-            if c == "}" and quotes and quotes[-1] in ("${", "${?", "${printf?", "${:", "${array", "${["):
+            if c == "}" and quotes and quotes[-1] in ("${", "${?"):
                 quotes.pop()
-                cur_level()["word"].append(c)
-                i += 1
-                continue
-
-            if c == "[" and quotes and quotes[-1] in ("${array", "${[", "[[", "$["):
-                if quotes[-1] == "${array":
-                    quotes[-1] = "${["
-                else:
-                    quotes.append("[[")  # Nested indexed-array arithmetic.
-                cur_level()["word"].append(c)
-                i += 1
-                continue
-
-            if c == "]" and quotes and quotes[-1] in ("$[", "[[", "${["):
-                if quotes[-1] == "${[":
-                    # A default/alternate word after an index is ordinary
-                    # value data; only a substring operator continues math.
-                    suffix = text[i + 1:i + 3]
-                    substring = (suffix.startswith(":")
-                                 and suffix[1:] not in ("-", "+", "=", "?"))
-                    quotes[-1] = ("${:" if substring else "${printf?"
-                                  if suffix.startswith(":?") or suffix.startswith("?")
-                                  else "${")
-                else:
-                    quotes.pop()
                 cur_level()["word"].append(c)
                 i += 1
                 continue
@@ -1585,8 +1511,7 @@ class Lexer:
                     i += 2
                     continue
 
-            if c == "'" and (not quotes or quotes[-1] in
-                             ("${", "${?", "${printf?", "${:", "${array", "${[", "[[", "$((", "$[")):
+            if c == "'" and (not quotes or quotes[-1] in ("${", "${?", "$((")):
                 quotes.append("'")
                 cur_level()["word"].append(c)
                 i += 1
@@ -1639,8 +1564,6 @@ class Lexer:
                         # (#1564 review).
                         ref = Ref(r.name, line, r.seg, r.in_assign_prefix)
                         ref.in_error_word = r.in_error_word
-                        ref.in_arithmetic = r.in_arithmetic
-                        ref.in_printf_diagnostic = r.in_printf_diagnostic
                         ref.heredoc_owner = r.heredoc_owner
                         ref.in_heredoc_body = r.in_heredoc_body
                         cur_ll.refs.append(ref)
@@ -1860,9 +1783,8 @@ class Lexer:
                     line += inner.count("\n")
                     i = j
                     continue
-                # Preserve an empty-parens header's existing command position.
-                # Continuations are already consumed by this lexer; this marker
-                # does not change segment structure or discover function bodies.
+                # Record declarations only for builtin provenance; body-span
+                # discovery remains the independent #1647 seam.
                 if re.match(r"\((?:[ \t]|\\\n)*\)", text[i:]):
                     seg = cur_level()["seg"]
                     if word_so_far:
@@ -2273,30 +2195,6 @@ def error_word_expansion_at(text, brace_open):
     return rest.startswith(":?") or rest.startswith("?")
 
 
-def parameter_arithmetic_at(text, brace_open):
-    """Identify an indexed subscript or substring operand at a brace header.
-
-    These contexts may diagnose an expanded credential before printf assigns.
-    This marks syntax for attached eligibility, not an array-kind/value model.
-    """
-    start = brace_open + 2
-    if (text[start:start + 1] in ("#", "!")
-            and text[start + 1:start + 2] not in (":", "?", "}", "")):
-        start += 1
-    name, end = ident_at(text, start)
-    if name is None:
-        match = _POSITIONAL_PARAMETER_RE.match(text, start)
-        if match is None:
-            return None
-        end = match.end()
-    suffix = text[end:end + 2]
-    if suffix.startswith("["):
-        return "${array"
-    if suffix.startswith(":?") or suffix.startswith("?"):
-        return "${printf?"
-    if suffix.startswith(":") and suffix[1:] not in ("-", "+", "=", "?"):
-        return "${:"
-    return None
 
 
 def braced_ref_at(text, brace_open):
@@ -2620,9 +2518,6 @@ def resolve_command(seg):
             continue
         base = _basename(lit)
         if base in PASSTHRU and passthru_budget > 0:
-            # Only shell command/builtin/time prefixes retain builtin lookup.
-            if "/" in lit or base not in ("command", "builtin", "time"):
-                seg._cmd_external = True
             passthru_budget -= 1
             idx += 1
             # step over the wrapper's own options / assignments
@@ -2639,10 +2534,6 @@ def resolve_command(seg):
                     idx += 1
                     continue
                 if nlit.startswith("-"):
-                    # `command -v/-V` reports names instead of invoking printf.
-                    # Only its ordinary -p modifier preserves this exemption.
-                    if (base in ("command", "time") and nlit != "-p") or base == "builtin":
-                        seg._cmd_external = True
                     # env -u NAME / -C DIR / timeout -s SIG take an argument
                     if base == "env" and nlit in ("-u", "-C", "--unset", "--chdir"):
                         idx += 2
@@ -2746,50 +2637,46 @@ def tee_file_operands(seg):
     return files
 
 
-def _printf_nondiagnostic_format(raw, literal):
-    """Literal text/string formats cannot diagnose a numeric token operand."""
+def _printf_literal(raw, literal):
+    """Only already literal, non-expanding shell words enter the allowlist."""
     if literal is None or "$'" in raw or _command_word_expands(raw):
-        return False  # ANSI-C escapes are not decoded by literal reduction.
-    # Unknown conversions and dynamic width/precision retain the prior
-    # attached-option conservative verdict rather than suppress diagnostics.
-    remainder = re.sub(r"%(?:%|[-+# 0]*[0-9]*(?:\.[0-9]*)?[sbq])", "", literal)
-    return "%" not in remainder
-
-
-_PRINTF_SPECIAL_TARGETS = frozenset({
-    "BASH", "BASHOPTS", "BASHPID", "COMP_CWORD", "COMP_POINT", "COLUMNS", "EUID", "HISTFILE", "HISTFILESIZE",
-    "HISTSIZE", "HISTCMD", "IGNOREEOF", "LANG", "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES",
-    "LC_NUMERIC", "LC_TIME", "LINENO", "LINES", "MAILCHECK", "OPTIND", "PPID",
-    "RANDOM", "SECONDS", "SHLVL", "SRANDOM", "TMOUT", "UID", "PIPESTATUS",
-    "PS0", "PS1", "PS2", "PS3", "PS4", "PROMPT_COMMAND",
-    "TIMEFORMAT", "HISTTIMEFORMAT", "HOME", "CDPATH", "OLDPWD", "MAIL", "MAILPATH", "PWD",
-    "FUNCNAME", "GROUPS", "DIRSTACK", "FCEDIT", "EDITOR", "INPUTRC",
-})
+        return False
+    try:
+        return shlex.split(raw) == [literal]
+    except ValueError:
+        return False  # Unproven quoting/escaping never authorizes admission.
 
 
 def _printf_text_target(raw, target):
-    """Only ordinary scalar names can acquire the new attached exemption."""
-    return (re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", target) is not None
-            and "$'" not in raw and not _command_word_expands(raw)
-            and not target.startswith("BASH_") and target not in _PRINTF_SPECIAL_TARGETS)
+    """Owner-ratified lower-case scalar target grammar, not a managed denylist."""
+    return (_printf_literal(raw, _unquote_command_word(raw))
+            and re.fullmatch(r"[a-z_][a-z0-9_]*", target) is not None
+            and target not in {"_", "auto_resume", "histchars"})
 
 
-def _printf_assignment_prefix_has_ref(words, command_index):
-    """Applying a credential-bearing prefix can diagnose before printf."""
-    return any(_ASSIGN_RE.match(word) and _iter_refs(word)
-               for word in words[:command_index])
+def _printf_nondiagnostic_format(raw, literal):
+    """The only conversion exempted by Option A is an unmodified %s."""
+    return (_printf_literal(raw, literal)
+            and "%" not in literal.replace("%s", ""))
+
+
+def _printf_value_allowed(raw, literal):
+    """Literal data or one double-quoted, unmodified ordinary-name expansion."""
+    if _printf_literal(raw, literal):
+        return True
+    return re.fullmatch(r'"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})"', raw) is not None
 
 
 def _printf_assignment_options(seg):
-    """Parse option-position assignments once for command and prefix refs."""
+    """Only options before the format/delimiter can select assignment."""
     resolve_command(seg)
     idx = seg._cmd_index
     args = list(_command_arguments(seg.words, idx + 1)) if idx is not None else []
     option_index = 0
     assigned = separate = False
-    simple_targets = True
+    allowed_targets = True
     while option_index < len(args):
-        option = args[option_index][1]
+        raw, option = args[option_index]
         if option == "--":
             option_index += 1
             break
@@ -2798,56 +2685,23 @@ def _printf_assignment_options(seg):
             option_index += 2
         elif option is not None and option.startswith("-v") and len(option) > 2:
             assigned = True
-            simple_targets = (simple_targets and
-                _printf_text_target(args[option_index][0], option[2:]))
+            allowed_targets = allowed_targets and _printf_text_target(raw, option[2:])
             option_index += 1
         else:
             break
-    return args, option_index, assigned, separate, simple_targets
+    return args, option_index, assigned, separate, allowed_targets
 
 
-def _printf_redirection_has_ref(words):
-    """A credential-bearing redirection can diagnose before printf executes."""
-    operand = False
-    for word in words:
-        if operand and (any(ll.refs for ll in Lexer(word).logical)
-                        if operand == "herestring" else _iter_refs(word)):
-            return True
-        operand = False
-        if word.startswith("<<<"):
-            suffix = word[3:]
-            if suffix and any(ll.refs for ll in Lexer(suffix).logical):
-                return True
-            operand = "herestring" if not suffix else False
-            continue
-        match = _REDIR_RE.match(word)
-        if match:
-            if _iter_refs(word[match.end():]):
-                return True
-            operand = match.end() == len(word)
-    return False
-
-
-def _printf_value_has_diagnostic_ref(args):
-    """Inspect value expansion contexts without treating quoted data as code."""
-    for raw, literal in args:
-        if literal is not None:
-            continue
-        for logical_line in Lexer(raw).logical:
-            if any(ref.in_arithmetic or ref.in_error_word or ref.in_printf_diagnostic
-                   for ref in logical_line.refs):
-                return True
-    return False
-
-
-def _printf_time_prefix_proven(seg):
-    """Only literal reserved time at a pipeline start proves this prefix."""
-    for i, word in enumerate(seg.words[:seg._cmd_index]):
-        literal = _unquote_command_word(word)
-        if literal is not None and _basename(literal) == "time":
-            if word != "time" or any(w not in ("!", "{") for w in seg.words[:i]):
-                return False
-    return True
+def _printf_attached_allowed(seg, helpers, args, option_index, allowed_targets):
+    # A wrapper, assignment prefix or redirection is outside Option A, even
+    # when a particular spelling happens to emit nothing in the oracle.
+    return (allowed_targets and seg._cmd_index == 0
+            and seg._cmd_literal == "printf" and _printf_literal(seg.words[0], "printf")
+            and "printf" not in helpers and not resolve_command(seg)[1]
+            and not any(_REDIR_RE.match(word) or word.startswith("<<") for word in seg.words)
+            and option_index < len(args)
+            and _printf_nondiagnostic_format(*args[option_index])
+            and all(_printf_value_allowed(*arg) for arg in args[option_index + 1:]))
 
 
 def classify(seg, emitter_helpers):
@@ -2868,16 +2722,9 @@ def classify(seg, emitter_helpers):
             # Preserve the separate form's existing #1461 verdict.
             if separate:
                 return ASSIGN
-            # Attached options need the actual format after every option and
-            # delimiter, and known builtin availability, before exemption.
-            if (assigned and simple_targets and seg._cmd_literal == "printf" and not seg._cmd_external
-                    and cmd not in emitter_helpers and option_index < len(args)
-                    and not seg._printf_heredoc_has_ref
-                    and _printf_time_prefix_proven(seg)
-                    and not _printf_redirection_has_ref(seg.words)
-                    and not _printf_assignment_prefix_has_ref(seg.words, idx)
-                    and not _printf_value_has_diagnostic_ref(args[option_index + 1:])
-                    and _printf_nondiagnostic_format(*args[option_index])):
+            # No per-case target/value exclusions: only the ratified grammar
+            # can authorize the new attached-assignment exemption.
+            if assigned and _printf_attached_allowed(seg, emitter_helpers, args, option_index, simple_targets):
                 return ASSIGN
         return EMIT
     if cmd in EMITTERS:
@@ -3382,6 +3229,39 @@ def _iter_function_definitions(text):
             yield m, name, text[open_idx + 1 : close_idx]
 
 
+def _printf_callback_changes_lookup(seg):
+    """Withhold attached eligibility for mapfile/readarray callback options.
+
+    Read only the finite builtin short-option prefix. Options taking an argument
+    consume the cluster remainder or the next word; a C in that data is not -C.
+    This does not change the broader deferred-source reader or output walk.
+    """
+    cmd, _redir = resolve_command(seg)
+    if cmd not in DEFERRED_SHELL_OPTIONS or seg._cmd_index is None:
+        return False
+    args = list(_command_arguments(seg.words, seg._cmd_index + 1))
+    i = 0
+    while i < len(args):
+        raw, literal = args[i]
+        if literal is None or "$'" in raw or _command_word_expands(raw):
+            return True  # An unresolved option can request a callback.
+        if literal == "--" or literal == "-" or not literal.startswith("-"):
+            return False
+        cluster = literal[1:]
+        for j, option in enumerate(cluster):
+            if option == "C":
+                return True  # Callback execution/restoration is not proved.
+            if option in "cdnOsu":
+                if j + 1 == len(cluster):
+                    i += 1  # Its argument is the next word, even if option-like.
+                break
+            if option != "t":
+                return True  # Unsupported clusters do not prove lookup safety.
+        i += 1
+    return False
+
+
+
 def discover_emitter_helpers(text):
     """Functions whose body writes one of their own positionals VERBATIM."""
     bodies = {}
@@ -3429,9 +3309,7 @@ def discover_emitter_helpers(text):
                 if (word == "function" and i + 1 < len(seg.words)
                         and _unquote_command_word(seg.words[i + 1]) in binding_names):
                     availability_changed = True
-            if (cmd in DEFERRED_SHELL_OPTIONS
-                    and any(literal is not None and literal.startswith(DEFERRED_SHELL_OPTIONS[cmd])
-                            for _raw, literal in _command_arguments(seg.words, seg._cmd_index + 1))):
+            if _printf_callback_changes_lookup(seg):
                 # Existing deferred callbacks can change lookup before printf.
                 availability_changed = True
             if cmd in OPAQUE_COMMANDS | {"enable", "alias", UNRESOLVED}:
@@ -4670,6 +4548,12 @@ MUST_NOT_FLAG = "clean"
 
 # (id, disposition, body)  -- body is appended to PROLOGUE.
 CORPUS = [
+    ('printf-option-a-braced-value', MUST_NOT_FLAG, 'printf -vout \'%s\' "${GH_TOKEN}"\n'),
+    ('printf-option-a-readline-target', MUST_FLAG, 'printf -vREADLINE_LINE \'%s\' "$GH_TOKEN"\n'),
+    ('printf-option-a-lowercase-special', MUST_FLAG, 'printf -vhistchars \'%s\' "$GH_TOKEN"\n'),
+    ('printf-option-a-string-conversion-only', MUST_FLAG, 'printf -vout \'%b\' "$GH_TOKEN"\n'),
+    ('printf-option-a-mapfile-cluster', MUST_FLAG, 'cat > printf <<\'SH\'\n#!/usr/bin/env bash\nbuiltin printf \'%s\\n\' "$@"\nSH\nchmod +x printf\nPATH="$PWD:$PATH"\nmapfile -tC \'enable -n printf; true \' -c 1 rows < <(echo x)\nprintf -vout \'%s\' "$GH_TOKEN"\n'),
+    ('printf-option-a-readarray-cluster', MUST_FLAG, 'cat > printf <<\'SH\'\n#!/usr/bin/env bash\nbuiltin printf \'%s\\n\' "$@"\nSH\nchmod +x printf\nPATH="$PWD:$PATH"\nreadarray -tC \'enable -n printf; true \' -c 1 rows < <(echo x)\nprintf -vout \'%s\' "$GH_TOKEN"\n'),
     # --- plain emitters -------------------------------------------------
     ("echo-plain", MUST_FLAG, 'echo "$GH_TOKEN"\n'),
     ("echo-unquoted", MUST_FLAG, "echo $GH_TOKEN\n"),
@@ -5524,7 +5408,7 @@ CORPUS = [
     ),
     (
         "printf-v-builtin-prefix",
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         "builtin -- printf -vout '%s' \"$GH_TOKEN\"\n",
     ),
     (
@@ -5539,12 +5423,12 @@ CORPUS = [
     ),
     (
         "printf-v-command-prefix",
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         "command printf -vout '%s' \"$GH_TOKEN\"\n",
     ),
     (
         "printf-v-command-path-prefix",
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         "command -p printf -vout '%s' \"$GH_TOKEN\"\n",
     ),
     (
@@ -5664,12 +5548,12 @@ CORPUS = [
     ),
     (
         'printf-v-locale-lc_custom',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'unset LC_ALL\nprintf -vLC_CUSTOM \'%s\' "$GH_TOKEN"\n',
     ),
     (
         'printf-v-locale-lc_monetary',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'unset LC_ALL\nprintf -vLC_MONETARY \'%s\' "$GH_TOKEN"\n',
     ),
     (
@@ -5689,7 +5573,7 @@ CORPUS = [
     ),
     (
         'printf-v-literal-assignment-prefix',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'LC_ALL=C printf -vout \'%s\' "$GH_TOKEN"\n',
     ),
     (
@@ -5795,22 +5679,22 @@ CORPUS = [
     ),
     (
         'printf-v-round-six-time-reserved-control',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'cat > time <<\'SH\'\n#!/usr/bin/env bash\nbuiltin printf \'%s\\n\' "$@"\nSH\nchmod +x time\nPATH="$PWD:$PATH"\ntime printf -vout \'%s\' "$GH_TOKEN"\n',
     ),
     (
         'printf-v-round-six-time-reserved-negated-control',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'cat > time <<\'SH\'\n#!/usr/bin/env bash\nbuiltin printf \'%s\\n\' "$@"\nSH\nchmod +x time\nPATH="$PWD:$PATH"\n! time printf -vout \'%s\' "$GH_TOKEN"\n',
     ),
     (
         'printf-v-round-six-count-length-control',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'printf -vout \'%s\' "${#GH_TOKEN}$GH_TOKEN"\n',
     ),
     (
         'printf-v-round-six-offset-literal-control',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'printf -vout \'%s\' "${#:0}$GH_TOKEN"\n',
     ),
     (
@@ -5825,7 +5709,7 @@ CORPUS = [
     ),
     (
         'printf-v-round-six-array-default-control',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'printf -vout \'%s\' "${value[0]:-$GH_TOKEN}"\n',
     ),
     (
@@ -5845,12 +5729,12 @@ CORPUS = [
     ),
     (
         'printf-v-round-six-heredoc-quoted-control',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'printf -vout \'%s\' "$GH_TOKEN" <<\'EOF\'\n$(( $GH_TOKEN ))\nEOF\n',
     ),
     (
         'printf-v-round-six-heredoc-literal-control',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'printf -vout \'%s\' "$GH_TOKEN" <<EOF\nsafe\nEOF\n',
     ),
     (
@@ -5865,12 +5749,12 @@ CORPUS = [
     ),
     (
         'printf-v-round-six-herestring-quoted-control',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'printf -vout \'%s\' "$GH_TOKEN" <<< \'$(( $GH_TOKEN ))\'\n',
     ),
     (
         'printf-v-round-six-herestring-escaped-control',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'printf -vout \'%s\' "$GH_TOKEN" <<< "\\$(( \\$GH_TOKEN ))"\n',
     ),
     (
@@ -5900,7 +5784,7 @@ CORPUS = [
     ),
     (
         'printf-v-round-six-time-p-control',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'time -p printf -vout \'%s\' "$GH_TOKEN"\n',
     ),
     (
@@ -5915,7 +5799,7 @@ CORPUS = [
     ),
     (
         'printf-v-manual-legacy-ordinary-after-index',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'printf -vout \'%s\' "$[ a[1] + 2 ]$GH_TOKEN"\n',
     ),
     (
@@ -6020,7 +5904,7 @@ CORPUS = [
     ),
     (
         'printf-v-eligibility-ordinary-legacy-arithmetic',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'printf -vout \'%s\' "$[ 1 + 2 ]$GH_TOKEN"\n',
     ),
     (
@@ -6030,17 +5914,17 @@ CORPUS = [
     ),
     (
         'printf-v-eligibility-escaped-legacy',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'printf -vout \'%s\' "\\$[ $GH_TOKEN ]"\n',
     ),
     (
         'printf-v-eligibility-ordinary-substring',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'value=data; printf -vout \'%s\' "${value:0:2}$GH_TOKEN"\n',
     ),
     (
         'printf-v-eligibility-ordinary-array',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'value=(data); printf -vout \'%s\' "${value[0]}$GH_TOKEN"\n',
     ),
     (
@@ -6050,17 +5934,17 @@ CORPUS = [
     ),
     (
         'printf-v-eligibility-ordinary-token-substring',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'printf -vout \'%s\' "${GH_TOKEN:0:8}"\n',
     ),
     (
         'printf-v-eligibility-array-default-data',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'value=(); printf -vout \'%s\' "${value[0]:-$GH_TOKEN}"\n',
     ),
     (
         'printf-v-eligibility-default-colon-data',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'printf -vout \'%s\' "${UNSET:-:$GH_TOKEN}"\n',
     ),
     (
@@ -6105,12 +5989,12 @@ CORPUS = [
     ),
     (
         'printf-v-value-ordinary-default',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'printf -vout \'%s\' "${UNSET:-$GH_TOKEN}"\n',
     ),
     (
         'printf-v-value-ordinary-arithmetic',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'printf -vout \'%s\' "$(( 1 + 2 ))$GH_TOKEN"\n',
     ),
     (
@@ -6120,7 +6004,7 @@ CORPUS = [
     ),
     (
         'printf-v-value-escaped-arithmetic',
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'printf -vout \'%s\' "\\$(( $GH_TOKEN ))"\n',
     ),
     (
@@ -7648,6 +7532,9 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    "printf-option-a-readline-target": "Option A rejects every uppercase target, including Readline's editable buffer; the noninteractive oracle does not exercise redisplay and no environment/state proof is claimed",
+    "printf-option-a-lowercase-special": "Option A explicitly excludes histchars, auto_resume and _ as lowercase managed targets even when this noninteractive fixture emits nothing",
+    "printf-option-a-string-conversion-only": "Option A allows only unmodified %s conversions/plain text; a safe attached %b format deliberately retains the conservative verdict",
     'printf-v-round-six-positional-set': 'Attached exemption requires static diagnostic/lookup proof; runtime value, input consumption and callback effects are not simulated.',
     'printf-v-round-six-array-set': 'Attached exemption requires static diagnostic/lookup proof; runtime value, input consumption and callback effects are not simulated.',
     'printf-v-round-six-heredoc-plain': 'Attached exemption requires static diagnostic/lookup proof; runtime value, input consumption and callback effects are not simulated.',
@@ -7964,6 +7851,87 @@ KNOWN_BROADER = {
         "flagged by the same undiscriminating rule, which is why the two are "
         "not currently distinguishable"
     ),
+    'printf-v-builtin-prefix': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-command-path-prefix': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-command-prefix': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-eligibility-array-default-data': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-eligibility-default-colon-data': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-eligibility-escaped-legacy': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-eligibility-ordinary-array': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-eligibility-ordinary-legacy-arithmetic': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-eligibility-ordinary-substring': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-eligibility-ordinary-token-substring': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-literal-assignment-prefix': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-locale-lc_custom': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-locale-lc_monetary': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-manual-legacy-ordinary-after-index': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-round-six-array-default-control': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-round-six-count-length-control': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-round-six-heredoc-literal-control': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-round-six-heredoc-quoted-control': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-round-six-herestring-escaped-control': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-round-six-herestring-quoted-control': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-round-six-offset-literal-control': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-round-six-time-p-control': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-round-six-time-reserved-control': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-round-six-time-reserved-negated-control': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-value-escaped-arithmetic': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-value-ordinary-arithmetic': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
+    'printf-v-value-ordinary-default': (
+        'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
+    ),
 }
 
 
@@ -8211,12 +8179,84 @@ def _corpus_id_cases():
     return failures
 
 
+def _printf_allowlist_cases():
+    """Pin the owner grammar through real lexer/classifier admission."""
+    failures = []
+
+    def check(source, expected):
+        helpers = discover_emitter_helpers(source)
+        segments = [seg for line in Lexer(source).logical for seg in line.segments
+                    if resolve_command(seg)[0] == "printf"]
+        if not segments:
+            failures.append("printf allowlist: no call discovered in %r" % source)
+            return
+        actual = classify(segments[-1], helpers) == ASSIGN
+        if actual != expected:
+            failures.append("printf allowlist: %r assigns=%s expected=%s" %
+                            (source, actual, expected))
+
+    for target in ("out", "_cache", "name_09"):
+        check("printf -v%s 'prefix %%s suffix' \"$GH_TOKEN\"\n" % target, True)
+    for target in ("_", "auto_resume", "histchars", "READLINE_LINE", "PWD",
+                   "LC_CUSTOM", "Out", "1out", "out[0]", "out[$GH_TOKEN]"):
+        check("printf '-v%s' '%%s' \"$GH_TOKEN\"\n" % target, False)
+    for fmt in ("%s", "text", "pre %s / %s"):
+        check("printf -vout '%s' \"${GH_TOKEN}\"\n" % fmt, True)
+    for fmt in ("%b", "%q", "%d", "%%", "%4s", "%.2s", "%s%n"):
+        check("printf -vout '%s' \"$GH_TOKEN\"\n" % fmt, False)
+    for value in ("literal", "'literal text'", '"$GH_TOKEN"', '"${GH_TOKEN}"',
+                  "'${GH_TOKEN:?literal}'", "'$(literal)'"):
+        check("printf -vout '%s' " + value + "\n", True)
+    for value in ("$GH_TOKEN", '"${GH_TOKEN:-x}"', '"${GH_TOKEN:0:2}"',
+                  '"${arr[0]}"', '"$1"', '"$?"', '"$((1))"',
+                  '"prefix$GH_TOKEN"', '"${GH_TOKEN@Q}"', '"${!target}"',
+                  '"$(echo "$GH_TOKEN")"'):
+        check("printf -vout '%s' " + value + "\n", False)
+    for prefix in ("builtin ", "command ", "command -p ", "env ", "time ",
+                   "LC_ALL=C ", "safe=literal "):
+        check(prefix + "printf -vout '%s' \"$GH_TOKEN\"\n", False)
+    for suffix in (" >/dev/null", " <literal", " <<<literal", " <<'EOF'\nliteral\nEOF"):
+        check("printf -vout '%s' \"$GH_TOKEN\"" + suffix + "\n", False)
+    check("printf() { :; }\nprintf -vout '%s' \"$GH_TOKEN\"\n", False)
+    check("enable -n printf\nprintf -vout '%s' \"$GH_TOKEN\"\n", False)
+    # The consensus reader must refuse malformed words, not raise.
+    dangling = "literal" + chr(92)
+    if _printf_literal(dangling, _unquote_command_word(dangling)):
+        failures.append("printf literal consensus admitted a dangling escape")
+    if not _printf_literal("'literal text'", "literal text"):
+        failures.append("printf literal consensus refused ordinary literal data")
+    # Refuse partial literal reductions; this is proof of syntax, not state.
+    check('printf -vout "%\\s" "$GH_TOKEN"\n', False)
+    check('printf "-v\\x50S1" \'%s\' "$GH_TOKEN"\n', False)
+    check('"p\\rintf" -vout \'%s\' "$GH_TOKEN"\n', False)
+    check('printf -vout $\'\\x25d\' "$GH_TOKEN"\n', False)
+    # Preserve the independent, pre-existing separate/numeric scope.
+    check("printf -v out '%s' \"$GH_TOKEN\"\n", True)
+    check("printf -v n '%d' \"$GH_TOKEN\"\n", True)
+    check("printf '%s' -v \"$GH_TOKEN\"\n", False)
+    check("printf '%s' -vout \"$GH_TOKEN\"\n", False)
+    check("printf -- '-vout %s' \"$GH_TOKEN\"\n", False)
+    # The finite callback-prefix provenance predicate must consume operands.
+    for command in ("mapfile", "readarray"):
+        for options, expected in (("-tC true rows", True),
+                                  ("'-tCtrue' rows", True),
+                                  ("-tdC rows", False),
+                                  ("-d '-tC' rows", False),
+                                  ("-- rows -tC", False)):
+            seg = Lexer(command + " " + options + "\n").logical[0].segments[0]
+            actual = _printf_callback_changes_lookup(seg)
+            if actual != expected:
+                failures.append("printf callback provenance: %r -> %s" % (options, actual))
+    return failures
+
+
 def self_test():
     failures = []
     passed = 0
     tp = fn = fp = tn = 0
 
     failures.extend(_corpus_id_cases())
+    failures.extend(_printf_allowlist_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
