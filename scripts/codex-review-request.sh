@@ -592,13 +592,6 @@ should_request_codex() {
   [ "$PHASE_4A_GATED" = "true" ]
 }
 
-REACTION_FRESHNESS_SECONDS=$(codex_field reaction_freshness_window_seconds)
-REACTION_FRESHNESS_SECONDS=${REACTION_FRESHNESS_SECONDS:-1800}
-if ! [[ "$REACTION_FRESHNESS_SECONDS" =~ ^[0-9]+$ ]]; then
-  echo "ERROR: codex.reaction_freshness_window_seconds must be an integer; got '$REACTION_FRESHNESS_SECONDS'" >&2
-  exit 3
-fi
-
 # ack_wait_seconds: the 👀 eyes-ack window (#419). Default 30s aligned to the
 # shipped policy value (#647) from the measured ack latency (#623): healthy
 # acks land in p50 9s / p99 13s / max 13s (n=14, the full recorded ack
@@ -779,6 +772,12 @@ HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.commi
 # Retain the shared timestamp diagnostics used by request evidence and
 # provider-state polling. Clearance below depends on commit anchors; a PR
 # reaction cannot suppress a request or end the polling loop.
+# #1567: timing is governed by the target base policy, as in Phase 4b. Read
+# freshness before any threshold/reuse decision, without validating request
+# caps on a no-spend path. Each new write still re-reads its governed budgets.
+REACTION_FRESHNESS_SECONDS=$(crqe_governing_freshness "$REPO" "$PR_NUMBER" "$CONFIG" \
+  "$__CODEX_REQUEST_DIR/workflow/resolve_base_policy.sh") \
+  || die 3 "cannot read the governing review policy/request freshness"
 TIMELINE_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/timeline" "PR timeline")
 EPOCH_NOW=$(date +%s)
 REACTION_ANCHOR=$(crqe_request_threshold "$HEAD_COMMITTER_DATE" "$TIMELINE_JSON" \

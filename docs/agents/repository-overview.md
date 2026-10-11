@@ -33,3 +33,5 @@ The Cockpit header shows nathanjohnpayne’s author GraphQL allowance first, obt
 The propagated publisher structural fence also prevents scheduled and manually dispatched runs of the native body/label gate. Its parsed-YAML contract is in `specs/required_check_publisher.md` and its mutation cases are in `tests/test_merge_clearance_gate.sh`.
 
 Phase 4b adapter availability uses the manual-handoff status independently of immutable-input integrity refusals. Missing reviewer CLI/schema and unavailable subscription auth use exit 4; missing jq remains an orchestrator prerequisite with exit 3; binding and live head/base refusals retain exit 3 and cannot enable wave fan-out. See [`specs/phase_4b_immutable_input.md`](../../specs/phase_4b_immutable_input.md).
+
+Codex request reuse takes its freshness window from the PR's governing base policy before any timing decision. This read does not validate request caps; new trigger writes retain the separate governing-budget fence. The contract and production-requester regressions are in `specs/codex_request_evidence.md` and `tests/test_codex_review_request_trigger_only.sh`.

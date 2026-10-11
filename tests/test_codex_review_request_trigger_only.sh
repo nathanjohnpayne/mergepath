@@ -100,7 +100,7 @@ scenario=${CODEX_TEST_SCENARIO:?}
 head_sha=${CODEX_TEST_HEAD:-head-sha}
 author='nathanjohnpayne'
 reviewer='nathanpayne-codex'
-t='2026-06-04T00:00:00Z'
+t=${CODEX_TEST_HEAD_DATE:-2026-06-04T00:00:00Z}
 old='2026-06-03T00:00:00Z'
 [ "${1:-}" = "api" ] || { echo "unexpected gh command: $*" >&2; exit 99; }
 shift
@@ -132,6 +132,7 @@ case "$endpoint" in
   repos/owner/repo/issues/999/reactions) printf '[]\n' ;;
   repos/owner/repo/issues/999/comments)
     case "$scenario" in
+      freshness_author) jq -cn --arg who "$author" --arg t "$CODEX_TEST_TRIGGER_AT" '[{id:7050,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       dup_author)       jq -cn --arg who "$author" --arg t "$t" '[{id:7001,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       dup_author_upper) jq -cn --arg who "$author" --arg t "$t" '[{id:7002,user:{login:$who},created_at:$t,body:"@CODEX REVIEW"}]' ;;
       author_prose)     jq -cn --arg who "$author" --arg t "$t" '[{id:7003,user:{login:$who},created_at:$t,body:"Status: @codex review was already requested."}]' ;;
@@ -379,15 +380,65 @@ test_missing_governing_codex_block_defaults_request_cap() {
   [ "$FAIL" -ne "$before" ] || pass "#813: missing governing codex block defaults the request cap to 10"
 }
 
-test_idempotent_skip_does_not_resolve_governing_cap() {
+# Timing authority is now resolved even on no-spend paths; its read failure
+# cannot become false freshness evidence. Cap values themselves stay deferred.
+test_idempotent_skip_requires_governing_freshness() {
   local dir rc before=$FAIL
-  dir=$(make_case "request-cap-idempotent-no-read")
-  printf '  max_review_rounds: 999999999\n' >> "$dir/.github/review-policy.yml"
+  dir=$(make_case "freshness-idempotent-unreadable")
   rc=$(run_trigger_only "$dir" dup_author false fail)
-  [ "$rc" = 0 ] || fail "#813 idempotent cap skip: expected exit 0, got $rc; err=$(cat "$dir/err.log")"
-  [ "$(trig_count "$dir")" = 0 ] || fail "#813 idempotent cap skip: posted a duplicate trigger"
-  [ ! -f "$dir/state/base-policy-read-count" ] || fail "#813 idempotent cap skip: resolved policy despite no write"
-  [ "$FAIL" -ne "$before" ] || pass "#813: idempotent no-write path does not resolve the governing cap"
+  [ "$rc" = 3 ] || fail "#1567 idempotent freshness: expected exit 3, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = 0 ] || fail "#1567 idempotent freshness: posted a duplicate trigger"
+  [ -f "$dir/state/base-policy-read-count" ] || fail "#1567 idempotent freshness: did not read governing policy"
+  [ "$FAIL" -ne "$before" ] || pass "#1567: no-spend paths fail closed on unreadable governing freshness"
+}
+
+# A one-hour-old request straddles the candidate/base windows. Run the actual
+# requester rather than only comparing helper timestamps.
+test_governing_request_freshness() {
+  local scenario candidate governing expected_posts dir rc before trigger_at
+  trigger_at=$(date -u -r "$(($(date +%s) - 3600))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -d '@'"$(($(date +%s) - 3600))" +%Y-%m-%dT%H:%M:%SZ)
+  for scenario in candidate-wide candidate-short candidate-invalid default-window; do
+    before=$FAIL
+    case "$scenario" in
+      candidate-wide) candidate=999999999; governing=1800; expected_posts=1 ;;
+      candidate-short) candidate=1; governing=7200; expected_posts=0 ;;
+      candidate-invalid) candidate=broken; governing=7200; expected_posts=0 ;;
+      default-window) candidate=999999999; governing=absent; expected_posts=1 ;;
+    esac
+    dir=$(make_case "freshness-$scenario")
+    sed -i.bak "s/reaction_freshness_window_seconds:.*/reaction_freshness_window_seconds: $candidate/" "$dir/.github/review-policy.yml"
+    if [ "$governing" = absent ]; then
+      sed -i.bak '/reaction_freshness_window_seconds:/d' "$dir/state/base-review-policy.yml"
+    else
+      sed -i.bak "s/reaction_freshness_window_seconds:.*/reaction_freshness_window_seconds: $governing/" "$dir/state/base-review-policy.yml"
+    fi
+    rc=$(CODEX_TEST_HEAD_DATE=1999-01-01T00:00:00Z CODEX_TEST_TRIGGER_AT="$trigger_at" \
+      run_trigger_only "$dir" freshness_author)
+    [ "$rc" = 0 ] && [ "$(trig_count "$dir")" = "$expected_posts" ] \
+      || fail "#1567 $scenario: rc=$rc posts=$(trig_count "$dir") expected=$expected_posts; err=$(cat "$dir/err.log")"
+    [ "$FAIL" -ne "$before" ] || pass "#1567: $scenario uses governing freshness for actual request reuse"
+  done
+}
+
+test_governing_freshness_validation_preserves_no_spend_caps() {
+  local value dir rc before
+  for value in false null '[]' '-1'; do
+    before=$FAIL
+    dir=$(make_case "freshness-invalid-$value")
+    sed -i.bak "s/reaction_freshness_window_seconds:.*/reaction_freshness_window_seconds: $value/" "$dir/state/base-review-policy.yml"
+    rc=$(run_trigger_only "$dir" dup_author)
+    [ "$rc" = 3 ] && [ "$(trig_count "$dir")" = 0 ] \
+      || fail "#1567 invalid freshness $value: rc=$rc posts=$(trig_count "$dir")"
+    [ "$FAIL" -ne "$before" ] || pass "#1567: invalid governing freshness $value fails closed before reuse"
+  done
+  before=$FAIL
+  dir=$(make_case "freshness-no-spend-invalid-cap")
+  printf '  max_review_rounds: false\n  max_blocking_reviews: false\n' >>"$dir/state/base-review-policy.yml"
+  rc=$(run_trigger_only "$dir" dup_author)
+  [ "$rc" = 0 ] && [ "$(trig_count "$dir")" = 0 ] \
+    || fail "#1567 no-spend invalid caps: rc=$rc posts=$(trig_count "$dir"); err=$(cat "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "#1567: no-spend reuse still skips malformed governing cap validation"
 }
 
 test_gated_cap_leaves_routing_to_caller() {
@@ -1118,7 +1169,9 @@ test_governing_cap_read_failure_refuses_new_write
 test_invalid_present_governing_cap_refuses_new_write
 test_invalid_present_governing_codex_block_refuses_new_write
 test_missing_governing_codex_block_defaults_request_cap
-test_idempotent_skip_does_not_resolve_governing_cap
+test_idempotent_skip_requires_governing_freshness
+test_governing_request_freshness
+test_governing_freshness_validation_preserves_no_spend_caps
 test_gated_cap_leaves_routing_to_caller
 test_cap_preserves_provider_block_as_diagnostic_only
 test_blocking_budget_boundary
