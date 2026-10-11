@@ -196,7 +196,9 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     and `printf -vNAME` assign only in option position before the format and
     before `--`; the same spellings after the format are data and emit.
     Attached forms retain conservative output verdicts for external or
-    detected helper commands and numeric, dynamic or unknown formats.
+    detected helper commands, changed builtin availability (`enable`), and
+    numeric, dynamic or unknown formats. Repeated assignment options and the
+    option delimiter are parsed before inspecting the format.
     Numeric-conversion diagnostics from the separate assignment form remain
     the #1461 gap, unchanged by the option-position repair (#1645).
   * An in-file message helper: a function whose body writes one of its own
@@ -2640,18 +2642,31 @@ def classify(seg, emitter_helpers):
         idx = seg._cmd_index
         if idx is not None:
             args = list(_command_arguments(seg.words, idx + 1))
-            if args:
-                option = args[0][1]
-                if option == "-v" and len(args) > 1:
-                    return ASSIGN
-                if option is not None and option.startswith("-v") and len(option) > 2:
-                    # Preserve the old conservative verdict for external or
-                    # shadowed commands and diagnostic-capable formats. The
-                    # separate -v form's #1461 verdict is unchanged.
-                    if (seg._cmd_literal == "printf" and not seg._cmd_external
-                            and cmd not in emitter_helpers and len(args) > 1
-                            and _printf_nondiagnostic_format(args[1][1])):
-                        return ASSIGN
+            option_index = 0
+            assigned = False
+            separate = False
+            while option_index < len(args):
+                option = args[option_index][1]
+                if option == "--":
+                    option_index += 1
+                    break
+                if option == "-v" and option_index + 1 < len(args):
+                    assigned = separate = True
+                    option_index += 2
+                elif option is not None and option.startswith("-v") and len(option) > 2:
+                    assigned = True
+                    option_index += 1
+                else:
+                    break
+            # Preserve the separate form's existing #1461 verdict.
+            if separate:
+                return ASSIGN
+            # Attached options need the actual format after every option and
+            # delimiter, and known builtin availability, before exemption.
+            if (assigned and seg._cmd_literal == "printf" and not seg._cmd_external
+                    and cmd not in emitter_helpers and option_index < len(args)
+                    and _printf_nondiagnostic_format(args[option_index][1])):
+                return ASSIGN
         return EMIT
     if cmd in EMITTERS:
         return EMIT
@@ -3168,7 +3183,14 @@ def discover_emitter_helpers(text):
     # A local printf definition invalidates the new attached-option builtin
     # exemption even when its body is not a recognized positional emitter.
     # Retain the parent scanner's conservative verdict on that spelling.
-    helpers = {"printf"} if "printf" in bodies else set()
+    # `enable` changes builtin availability. Without execution/state dataflow
+    # any such operation makes the attached printf exemption uncertain; even
+    # a later apparent re-enable is not proof it executed in this shell.
+    availability_changed = any(
+        resolve_command(seg)[0] == "enable"
+        for line in Lexer(text).logical for seg in line.segments
+    )
+    helpers = {"printf"} if "printf" in bodies or availability_changed else set()
     # A FIXED POINT, not a fixed number of rounds.  Each round can promote at
     # most one link of a call chain, so a chain longer than the round budget
     # left its outermost helper undiscovered -- `a` calls `b` calls `c` calls
@@ -5192,6 +5214,38 @@ CORPUS = [
         "printf -vout '%i' \"$GH_TOKEN\"\n",
     ),
     (
+        "printf-v-attached-delimited-numeric",
+        MUST_FLAG,
+        "printf -vout -- '%d' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-attached-delimited-text",
+        MUST_NOT_FLAG,
+        "printf -vout -- '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-attached-repeat-numeric",
+        MUST_FLAG,
+        "printf -vout -vother -- '%d' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-attached-repeat-text",
+        MUST_NOT_FLAG,
+        "printf -vout -vother -- '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-disabled-builtin",
+        MUST_FLAG,
+        "printf '%s\\n' '#!/usr/bin/env bash' 'echo \"$@\"' > printf\n"
+        "chmod +x printf\nPATH=\"$PWD:$PATH\"\nenable -n printf\n"
+        "printf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-restored-builtin",
+        MUST_FLAG,
+        "enable -n printf\nenable printf\nprintf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
         "printf-v-redirection-command-name",
         MUST_NOT_FLAG,
         "> printf printf -v out '%s' \"$GH_TOKEN\"\n",
@@ -6489,6 +6543,11 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    "printf-v-restored-builtin": (
+        "enable changes builtin availability, and this source scanner does "
+        "not prove a later re-enable executed in the same shell; retain the "
+        "parent attached-option conservative verdict on the entire file"
+    ),
     "printf-v-shadowed-noop": (
         "a local printf definition prevents assuming Bash builtin assignment "
         "semantics, even when this fixture's function writes nothing; retain "
