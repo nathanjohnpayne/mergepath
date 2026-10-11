@@ -32,10 +32,11 @@ def assess(repo_secrets, environment, policies, branch, organization_secrets=Non
     if not isinstance(policies, list) or not all(isinstance(item, dict) and isinstance(item.get('name'), str) and item.get('type') in ('branch', 'tag') for item in policies):
         raise ValueError('deployment branch policies are malformed')
     drift = []
-    exposed = sorted(item['name'] for item in repo_secrets if item['name'] in AUTHORITY)
+    # Observations select fixed labels; no observed secret metadata is emitted.
+    exposed = sorted(name for name in AUTHORITY for item in repo_secrets if item['name'] == name)
     if exposed:
         drift.append('Repository-scoped authority credentials: ' + ', '.join(exposed))
-    exposed = sorted(item['name'] for item in organization_secrets if item['name'] in AUTHORITY)
+    exposed = sorted(name for name in AUTHORITY for item in organization_secrets if item['name'] == name)
     if exposed:
         drift.append('Organization-shared authority credentials: ' + ', '.join(exposed))
     if environment is None:

@@ -28,6 +28,23 @@ class IsolationTests(unittest.TestCase):
         for name in ('MERGE_QUEUE_POLICY_TOKEN', 'MERGE_QUEUE_SOURCE_TOKEN'):
             self.assertTrue(isolation.assess([{'name':name}], CLOSED, MAIN, 'main'))
 
+    def test_only_known_authority_labels_are_reported_in_sorted_order(self):
+        names = sorted(isolation.AUTHORITY)
+        metadata = [{'name': name, 'value': 'SYNTHETIC_VALUE_NOT_FOR_REPORTING'}
+                    for name in reversed(names)]
+        metadata += [{'name': 'UNRELATED_BUILD_KEY', 'value': 'SYNTHETIC_VALUE_NOT_FOR_REPORTING'}]
+        drift = isolation.assess(metadata, CLOSED, MAIN, 'main', metadata)
+        self.assertEqual(drift, [
+            'Repository-scoped authority credentials: ' + ', '.join(names),
+            'Organization-shared authority credentials: ' + ', '.join(names),
+        ])
+
+    def test_repeated_authority_observations_preserve_drift_diagnostics(self):
+        metadata = [{'name': 'CODEX_PAT'}, {'name': 'AUTHOR_MERGE_TOKEN'}, {'name': 'CODEX_PAT'}]
+        self.assertEqual(isolation.assess(metadata, CLOSED, MAIN, 'main'), [
+            'Repository-scoped authority credentials: AUTHOR_MERGE_TOKEN, CODEX_PAT, CODEX_PAT',
+        ])
+
     def test_wildcard_tag_and_extra_branch_are_drift(self):
         for policies in ([{'name':'*','type':'branch'}], [{'name':'main','type':'tag'}],
                          MAIN + [{'name':'codex/*','type':'branch'}], []):
@@ -138,6 +155,26 @@ print(json.dumps(json.loads(Path(os.environ['AUDIT_OBSERVATIONS']).read_text())[
             failure_text='gh: Not Found (HTTP 404)')
         self.assertEqual((code, report['status']), (3, 'DRIFT'))
         self.assertIn('missing', report['drift'][0])
+
+    def test_authority_reports_omit_unrelated_metadata_on_both_output_paths(self):
+        names = sorted(isolation.AUTHORITY)
+        marker = 'SYNTHETIC_VALUE_NOT_FOR_REPORTING'
+        metadata = [{'total_count': len(names), 'secrets': [
+            {'name': name, 'value': marker, 'description': marker} for name in reversed(names)
+        ]}]
+        for missing in (False, True):
+            with self.subTest(missing_environment=missing):
+                code, report, _ = self.run_audit(
+                    secrets=metadata, owner_type='Organization', organization_secrets=metadata,
+                    failure='repos/owner/repo/environments/merge-queue-policy' if missing else None,
+                    failure_text='gh: Not Found (HTTP 404)')
+                self.assertEqual((code, report['status']), (3, 'DRIFT'))
+                self.assertEqual(report['drift'][:2], [
+                    'Repository-scoped authority credentials: ' + ', '.join(names),
+                    'Organization-shared authority credentials: ' + ', '.join(names),
+                ])
+                self.assertNotIn(marker, json.dumps(report))
+                self.assertEqual('The protected credential environment is missing' in report['drift'], missing)
 
     def test_environment_404_is_error_when_inventory_says_it_exists(self):
         code, report, _ = self.run_audit(failure='repos/owner/repo/environments/merge-queue-policy',
