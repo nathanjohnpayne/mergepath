@@ -205,8 +205,17 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     error-word evaluation retain output verdicts: modern/legacy arithmetic,
     indexed subscripts and substring offsets may diagnose before
     printf assigns. Ordinary, single-quoted and escaped value data stays eligible.
+    Nested indexed operands keep legacy arithmetic context through inner brackets.
+    Positional/special offsets and positional/array error words participate only
+    in attached eligibility. Input redirection references and interpolating
+    here-doc metadata also withhold this exemption, conservatively even for plain
+    ignored input; quoted delimiters and literal input retain their verdicts.
+    Deferred mapfile/readarray callbacks invalidate builtin lookup. Only an
+    unquoted reserved time at a pipeline start proves that prefix.
     Captured arithmetic diagnostics remain the measured preexisting #2058
     miss; this eligibility check does not change the output walk.
+    Invalid-name indirection remains the measured preexisting #2059 miss;
+    credential-value reference selection remains unchanged.
     Split-line or continued function headers invalidate attached builtin provenance
     without extending general helper body-span discovery. Prompt-managed
     targets can emit or execute values in interactive shells and stay conservative.
@@ -901,7 +910,7 @@ class Segment:
     __slots__ = (
         "sid", "parent", "parent_is_capture", "parent_is_subshell", "words",
         "line", "pipe_to", "_cmd", "_resolved", "_cmd_index", "_cmd_literal",
-        "_cmd_external", "_function_binding",
+        "_cmd_external", "_function_binding", "_printf_heredoc_has_ref",
     )
 
     def __init__(self, sid, parent, parent_is_capture, line):
@@ -935,12 +944,13 @@ class Segment:
         self._cmd_literal = None
         self._cmd_external = False
         self._function_binding = None
+        self._printf_heredoc_has_ref = False
 
 
 class Ref:
     __slots__ = (
         "name", "line", "seg", "heredoc_owner", "in_assign_prefix",
-        "in_heredoc_body", "in_error_word", "in_arithmetic",
+        "in_heredoc_body", "in_error_word", "in_arithmetic", "in_printf_diagnostic",
     )
 
     def __init__(self, name, line, seg, in_assign_prefix=False):
@@ -959,6 +969,8 @@ class Ref:
         # arithmetic evaluation can diagnose an expanded operand before the
         # builtin captures it. Ordinary expansion remains eligible.
         self.in_arithmetic = False
+        # Guard-only positional/array error words retain the separate-form walk.
+        self.in_printf_diagnostic = False
         # Set when the reference is body TEXT the here-doc owner writes, so
         # the owner's segment is where the walk starts.  A reference inside a
         # COMMAND SUBSTITUTION in that same body leaves this None and carries
@@ -993,7 +1005,7 @@ class LogicalLine:
 
 _WORD_BREAK_BEFORE_COMMENT = set(" \t\n;&|()")
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-_POSITIONAL_PARAMETER_RE = re.compile(r"[0-9]+|[@*?$!-]")
+_POSITIONAL_PARAMETER_RE = re.compile(r"[0-9]+|[@*?#$!-]")
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=")
 # The ONLY things bash lets precede a redirection operator inside the same
 # token are an IO_NUMBER (`2>&1`) and a `{name}` descriptor variable.  Ordinary
@@ -1240,9 +1252,12 @@ class Lexer:
             return
         start_line = hd.body_lines[0][0]
         body = "\n".join(raw for _lno, raw in hd.body_lines)
+        prior_refs = len(cur_ll.refs)
         masked = self._absorb_substitutions(
             body, hd.owner, start_line, cur_ll, in_heredoc_body=True
         )
+        if len(cur_ll.refs) > prior_refs:
+            hd.owner._printf_heredoc_has_ref = True
         for offset, raw in enumerate(masked.split("\n")):
             for name, in_ew in _iter_refs_ew(raw):
                 r = Ref(name, start_line + offset, hd.owner)
@@ -1253,6 +1268,7 @@ class Lexer:
                 # owner emits.  Without this the reference was attributed to
                 # the safe `read` and graded clean (#1032 round 6 P1).
                 r.in_error_word = in_ew
+                hd.owner._printf_heredoc_has_ref = True
                 cur_ll.refs.append(r)
 
     # -- helpers ---------------------------------------------------------
@@ -1502,6 +1518,7 @@ class Lexer:
                                 in_assign_prefix(),
                             )
                             r.in_error_word = "${?" in quotes[:-1]
+                            r.in_printf_diagnostic = "${printf?" in quotes[:-1]
                             # The parameter's base value is not an arithmetic
                             # operand; nested references in its index/offset are.
                             r.in_arithmetic = any(q in ("$((", "$[", "${[", "${:")
@@ -1520,6 +1537,7 @@ class Lexer:
                             in_assign_prefix(),
                         )
                         r.in_error_word = "${?" in quotes
+                        r.in_printf_diagnostic = "${printf?" in quotes
                         r.in_arithmetic = any(q in ("$((", "$[", "${[", "${:")
                                               for q in quotes)
                         cur_ll.refs.append(r)
@@ -1527,13 +1545,13 @@ class Lexer:
                 i += 1
                 continue
 
-            if c == "}" and quotes and quotes[-1] in ("${", "${?", "${:", "${array", "${["):
+            if c == "}" and quotes and quotes[-1] in ("${", "${?", "${printf?", "${:", "${array", "${["):
                 quotes.pop()
                 cur_level()["word"].append(c)
                 i += 1
                 continue
 
-            if c == "[" and quotes and quotes[-1] in ("${array", "${[", "[["):
+            if c == "[" and quotes and quotes[-1] in ("${array", "${[", "[[", "$["):
                 if quotes[-1] == "${array":
                     quotes[-1] = "${["
                 else:
@@ -1549,7 +1567,9 @@ class Lexer:
                     suffix = text[i + 1:i + 3]
                     substring = (suffix.startswith(":")
                                  and suffix[1:] not in ("-", "+", "=", "?"))
-                    quotes[-1] = "${:" if substring else "${"
+                    quotes[-1] = ("${:" if substring else "${printf?"
+                                  if suffix.startswith(":?") or suffix.startswith("?")
+                                  else "${")
                 else:
                     quotes.pop()
                 cur_level()["word"].append(c)
@@ -1564,7 +1584,7 @@ class Lexer:
                     continue
 
             if c == "'" and (not quotes or quotes[-1] in
-                             ("${", "${?", "${:", "${array", "${[", "[[", "$((", "$[")):
+                             ("${", "${?", "${printf?", "${:", "${array", "${[", "[[", "$((", "$[")):
                 quotes.append("'")
                 cur_level()["word"].append(c)
                 i += 1
@@ -1618,6 +1638,7 @@ class Lexer:
                         ref = Ref(r.name, line, r.seg, r.in_assign_prefix)
                         ref.in_error_word = r.in_error_word
                         ref.in_arithmetic = r.in_arithmetic
+                        ref.in_printf_diagnostic = r.in_printf_diagnostic
                         ref.heredoc_owner = r.heredoc_owner
                         ref.in_heredoc_body = r.in_heredoc_body
                         cur_ll.refs.append(ref)
@@ -2257,7 +2278,8 @@ def parameter_arithmetic_at(text, brace_open):
     This marks syntax for attached eligibility, not an array-kind/value model.
     """
     start = brace_open + 2
-    if text[start:start + 1] in ("#", "!"):
+    if (text[start:start + 1] in ("#", "!")
+            and text[start + 1:start + 2] not in (":", "?", "}", "")):
         start += 1
     name, end = ident_at(text, start)
     if name is None:
@@ -2268,6 +2290,8 @@ def parameter_arithmetic_at(text, brace_open):
     suffix = text[end:end + 2]
     if suffix.startswith("["):
         return "${array"
+    if suffix.startswith(":?") or suffix.startswith("?"):
+        return "${printf?"
     if suffix.startswith(":") and suffix[1:] not in ("-", "+", "=", "?"):
         return "${:"
     return None
@@ -2784,9 +2808,16 @@ def _printf_redirection_has_ref(words):
     """A credential-bearing redirection can diagnose before printf executes."""
     operand = False
     for word in words:
-        if operand and _iter_refs(word):
+        if operand and (any(ll.refs for ll in Lexer(word).logical)
+                        if operand == "herestring" else _iter_refs(word)):
             return True
         operand = False
+        if word.startswith("<<<"):
+            suffix = word[3:]
+            if suffix and any(ll.refs for ll in Lexer(suffix).logical):
+                return True
+            operand = "herestring" if not suffix else False
+            continue
         match = _REDIR_RE.match(word)
         if match:
             if _iter_refs(word[match.end():]):
@@ -2801,9 +2832,20 @@ def _printf_value_has_diagnostic_ref(args):
         if literal is not None:
             continue
         for logical_line in Lexer(raw).logical:
-            if any(ref.in_arithmetic or ref.in_error_word for ref in logical_line.refs):
+            if any(ref.in_arithmetic or ref.in_error_word or ref.in_printf_diagnostic
+                   for ref in logical_line.refs):
                 return True
     return False
+
+
+def _printf_time_prefix_proven(seg):
+    """Only literal reserved time at a pipeline start proves this prefix."""
+    for i, word in enumerate(seg.words[:seg._cmd_index]):
+        literal = _unquote_command_word(word)
+        if literal is not None and _basename(literal) == "time":
+            if word != "time" or any(w not in ("!", "{") for w in seg.words[:i]):
+                return False
+    return True
 
 
 def classify(seg, emitter_helpers):
@@ -2828,6 +2870,8 @@ def classify(seg, emitter_helpers):
             # delimiter, and known builtin availability, before exemption.
             if (assigned and simple_targets and seg._cmd_literal == "printf" and not seg._cmd_external
                     and cmd not in emitter_helpers and option_index < len(args)
+                    and not seg._printf_heredoc_has_ref
+                    and _printf_time_prefix_proven(seg)
                     and not _printf_redirection_has_ref(seg.words)
                     and not _printf_assignment_prefix_has_ref(seg.words, idx)
                     and not _printf_value_has_diagnostic_ref(args[option_index + 1:])
@@ -3383,6 +3427,11 @@ def discover_emitter_helpers(text):
                 if (word == "function" and i + 1 < len(seg.words)
                         and _unquote_command_word(seg.words[i + 1]) in binding_names):
                     availability_changed = True
+            if (cmd in DEFERRED_SHELL_OPTIONS
+                    and any(literal is not None and literal.startswith(DEFERRED_SHELL_OPTIONS[cmd])
+                            for _raw, literal in _command_arguments(seg.words, seg._cmd_index + 1))):
+                # Existing deferred callbacks can change lookup before printf.
+                availability_changed = True
             if cmd in OPAQUE_COMMANDS | {"enable", "alias", UNRESOLVED}:
                 # Opaque setup or aliases may change lookup indirectly. No
                 # execution-state model proves builtin availability afterward.
@@ -5671,6 +5720,217 @@ CORPUS = [
         MUST_FLAG,
         "printf -vout '%s' harmless >\"./absent/$GH_TOKEN\"\n",
     ),
+    # Attached assignment eligibility: diagnostic expansion and lookup proof.
+    (
+        'printf-v-round-six-nested-legacy-exact',
+        MUST_FLAG,
+        'GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "$[ 1 + arr[0] + $GH_TOKEN ]"\n',
+    ),
+    (
+        'printf-v-round-six-special-count-offset',
+        MUST_FLAG,
+        'GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "${#:$GH_TOKEN}"\n',
+    ),
+    (
+        'printf-v-round-six-special-pid-offset',
+        MUST_FLAG,
+        ': &\nGH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "${!:$GH_TOKEN}"\n',
+    ),
+    (
+        'printf-v-round-six-here-string-arithmetic',
+        MUST_FLAG,
+        'GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' harmless <<< "$(( $GH_TOKEN ))"\n',
+    ),
+    (
+        'printf-v-round-six-here-doc-arithmetic',
+        MUST_FLAG,
+        'GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' harmless <<EOF\n$(( $GH_TOKEN ))\nEOF\n',
+    ),
+    (
+        'printf-v-round-six-positional-error-word',
+        MUST_FLAG,
+        'printf -vout \'%s\' "${1:?$GH_TOKEN}"\n',
+    ),
+    (
+        'printf-v-round-six-array-error-word',
+        MUST_FLAG,
+        'value=(); printf -vout \'%s\' "${value[0]:?$GH_TOKEN}"\n',
+    ),
+    (
+        'printf-v-round-six-mapfile-callback',
+        MUST_FLAG,
+        'cat > printf <<\'SH\'\n#!/usr/bin/env bash\nbuiltin printf \'%s\\n\' "$@"\nSH\nchmod +x printf\nPATH="$PWD:$PATH"\nmapfile -C \'enable -n printf; true \' -c 1 rows < <(echo x)\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-round-six-readarray-callback',
+        MUST_FLAG,
+        'cat > printf <<\'SH\'\n#!/usr/bin/env bash\nbuiltin printf \'%s\\n\' "$@"\nSH\nchmod +x printf\nPATH="$PWD:$PATH"\nreadarray -C \'enable -n printf; true \' -c 1 rows < <(echo x)\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-round-six-time-quoted',
+        MUST_FLAG,
+        'cat > time <<\'SH\'\n#!/usr/bin/env bash\nbuiltin printf \'%s\\n\' "$@"\nSH\nchmod +x time\nPATH="$PWD:$PATH"\n"time" printf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-round-six-time-escaped',
+        MUST_FLAG,
+        'cat > time <<\'SH\'\n#!/usr/bin/env bash\nbuiltin printf \'%s\\n\' "$@"\nSH\nchmod +x time\nPATH="$PWD:$PATH"\n\\time printf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-round-six-time-partly-quoted',
+        MUST_FLAG,
+        'cat > time <<\'SH\'\n#!/usr/bin/env bash\nbuiltin printf \'%s\\n\' "$@"\nSH\nchmod +x time\nPATH="$PWD:$PATH"\nti"me" printf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-round-six-time-command-position',
+        MUST_FLAG,
+        'cat > time <<\'SH\'\n#!/usr/bin/env bash\nbuiltin printf \'%s\\n\' "$@"\nSH\nchmod +x time\nPATH="$PWD:$PATH"\ncommand time printf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-round-six-time-assignment-position',
+        MUST_FLAG,
+        'cat > time <<\'SH\'\n#!/usr/bin/env bash\nbuiltin printf \'%s\\n\' "$@"\nSH\nchmod +x time\nPATH="$PWD:$PATH"\nmarker=x time printf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-round-six-time-reserved-control',
+        MUST_NOT_FLAG,
+        'cat > time <<\'SH\'\n#!/usr/bin/env bash\nbuiltin printf \'%s\\n\' "$@"\nSH\nchmod +x time\nPATH="$PWD:$PATH"\ntime printf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-round-six-time-reserved-negated-control',
+        MUST_NOT_FLAG,
+        'cat > time <<\'SH\'\n#!/usr/bin/env bash\nbuiltin printf \'%s\\n\' "$@"\nSH\nchmod +x time\nPATH="$PWD:$PATH"\n! time printf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-round-six-count-length-control',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "${#GH_TOKEN}$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-round-six-offset-literal-control',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "${#:0}$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-round-six-positional-set',
+        MUST_FLAG,
+        'set -- safe; printf -vout \'%s\' "${1:?$GH_TOKEN}"\n',
+    ),
+    (
+        'printf-v-round-six-array-set',
+        MUST_FLAG,
+        'value=(safe); printf -vout \'%s\' "${value[0]:?$GH_TOKEN}"\n',
+    ),
+    (
+        'printf-v-round-six-array-default-control',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "${value[0]:-$GH_TOKEN}"\n',
+    ),
+    (
+        'printf-v-round-six-positional-separate-control',
+        MUST_NOT_FLAG,
+        'printf -v out \'%s\' "${1:?$GH_TOKEN}"\n',
+    ),
+    (
+        'printf-v-round-six-array-separate-control',
+        MUST_NOT_FLAG,
+        'printf -v out \'%s\' "${value[0]:?$GH_TOKEN}"\n',
+    ),
+    (
+        'printf-v-round-six-heredoc-plain',
+        MUST_FLAG,
+        "printf -vout '%s' harmless <<EOF\n$GH_TOKEN\nEOF\n",
+    ),
+    (
+        'printf-v-round-six-heredoc-quoted-control',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "$GH_TOKEN" <<\'EOF\'\n$(( $GH_TOKEN ))\nEOF\n',
+    ),
+    (
+        'printf-v-round-six-heredoc-literal-control',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "$GH_TOKEN" <<EOF\nsafe\nEOF\n',
+    ),
+    (
+        'printf-v-round-six-heredoc-segment-isolation',
+        MUST_NOT_FLAG,
+        'read -r value <<EOF\n$GH_TOKEN\nEOF\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-round-six-heredoc-multiple',
+        MUST_FLAG,
+        'GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' harmless <<ONE <<TWO\nsafe\nONE\n$(( $GH_TOKEN ))\nTWO\n',
+    ),
+    (
+        'printf-v-round-six-herestring-quoted-control',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "$GH_TOKEN" <<< \'$(( $GH_TOKEN ))\'\n',
+    ),
+    (
+        'printf-v-round-six-herestring-escaped-control',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "$GH_TOKEN" <<< "\\$(( \\$GH_TOKEN ))"\n',
+    ),
+    (
+        'printf-v-round-six-herestring-plain',
+        MUST_FLAG,
+        'printf -vout \'%s\' harmless <<< "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-round-six-callback-noop',
+        MUST_FLAG,
+        'mapfile -C true -c 1 rows < <(echo x)\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-round-six-callback-attached',
+        MUST_FLAG,
+        'mapfile -Ctrue -c 1 rows < <(echo x)\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-round-six-callback-dynamic',
+        MUST_FLAG,
+        'callback=true; readarray -C "$callback" -c 1 rows < <(echo x)\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-round-six-mapfile-no-c-control',
+        MUST_NOT_FLAG,
+        'mapfile rows < <(echo x)\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-round-six-time-p-control',
+        MUST_NOT_FLAG,
+        'time -p printf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-manual-legacy-nested-index',
+        MUST_FLAG,
+        'GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "$[ a[1] + $GH_TOKEN ]"\n',
+    ),
+    (
+        'printf-v-manual-legacy-double-nested-index',
+        MUST_FLAG,
+        'GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "$[ a[b[0]] + $GH_TOKEN ]"\n',
+    ),
+    (
+        'printf-v-manual-legacy-ordinary-after-index',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "$[ a[1] + 2 ]$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-manual-indirect-invalid-name',
+        MUST_NOT_FLAG,
+        'GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "${!GH_TOKEN}"\n',
+    ),
+    (
+        'printf-v-manual-indirect-valid-name',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "${!GH_TOKEN}"\n',
+    ),
+    (
+        'printf-v-manual-ordinary-direct-value',
+        MUST_NOT_FLAG,
+        'GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
     (
         'printf-v-managed-fcedit-diagnostic',
         MUST_FLAG,
@@ -7237,6 +7497,15 @@ CORPUS.extend(_generated_corpus())
 # fails when an undeclared disagreement appears AND when a declared entry stops
 # disagreeing, so neither list can quietly rot.
 KNOWN_MISSES = {
+    'printf-v-round-six-positional-separate-control': 'The preexisting separate -v diagnostic verdict is retained under #1461; attached eligibility metadata does not alter the output walk.',
+    'printf-v-round-six-array-separate-control': 'The preexisting separate -v diagnostic verdict is retained under #1461; attached eligibility metadata does not alter the output walk.',
+
+    "printf-v-manual-indirect-invalid-name": (
+        "indirect name evaluation can diagnose an invalid expanded name; "
+        "main before #1645 already misses this because braced_ref_at excludes "
+        "indirection from credential-value references; this is not arithmetic "
+        "and is tracked in https://github.com/nathanjohnpayne/mergepath/issues/2059"
+    ),
     "printf-v-value-arithmetic-capture-baseline": (
         "the captured expansion-stderr miss is reproduced on main before "
         "#1645 and on the parent head; the attached eligibility repair does "
@@ -7377,6 +7646,14 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    'printf-v-round-six-positional-set': 'Attached exemption requires static diagnostic/lookup proof; runtime value, input consumption and callback effects are not simulated.',
+    'printf-v-round-six-array-set': 'Attached exemption requires static diagnostic/lookup proof; runtime value, input consumption and callback effects are not simulated.',
+    'printf-v-round-six-heredoc-plain': 'Attached exemption requires static diagnostic/lookup proof; runtime value, input consumption and callback effects are not simulated.',
+    'printf-v-round-six-herestring-plain': 'Attached exemption requires static diagnostic/lookup proof; runtime value, input consumption and callback effects are not simulated.',
+    'printf-v-round-six-callback-noop': 'Attached exemption requires static diagnostic/lookup proof; runtime value, input consumption and callback effects are not simulated.',
+    'printf-v-round-six-callback-attached': 'Attached exemption requires static diagnostic/lookup proof; runtime value, input consumption and callback effects are not simulated.',
+    'printf-v-round-six-callback-dynamic': 'Attached exemption requires static diagnostic/lookup proof; runtime value, input consumption and callback effects are not simulated.',
+
     'printf-v-managed-fcedit-point': (
         'Bash default fc editor lookup can diagnose its configured command; this point does not invoke fc, so attached eligibility conservatively reserves the named target'
     ),
