@@ -552,11 +552,21 @@ exit "${TEST_GATE_RC:-0}"
 SH
 chmod +x "$TRUSTED/scripts/review-feedback-surface-fingerprint.sh" "$TRUSTED/scripts/codex-p1-gate.sh"
 HANDOFF="$TMP/handoff.json"
-ARCHIVE='<!-- mergepath-feedback-archive-relay:v1 run=777 status=complete -->'
+printf '**P1** Historical enrolled inline finding.\n' >"$TMP/ordinary-body"
+ARCHIVE=$("$ROOT/scripts/render-feedback-archive.sh" inline 555 'chatgpt-codex-connector[bot]' 2026-10-11T01:00:00Z "$TMP/ordinary-body")
+# Real chunk restoration cannot decode one part without its sibling comments.
+python3 - <<'PYTHON' >"$TMP/restoration-body"
+print('**P1** Historical large finding.\n' + 'retained text ' * 8000, end='')
+PYTHON
+"$ROOT/scripts/render-feedback-archive.sh" inline 555 'chatgpt-codex-connector[bot]' 2026-10-11T01:00:00Z "$TMP/restoration-body" >"$TMP/restoration-records"
+RESTORATION_RECORD=$(head -n 1 "$TMP/restoration-records")
 write_handoff() {
   # event, artifact/source head; persist supplies the rest from trusted binding.
   jq -n --arg repo "$BASE_REPO" --argjson pr 41 --argjson run 501 --arg event "$1" --arg head "$2" \
-    --arg actor alice --arg archive "$ARCHIVE" '{version:1,repo:$repo,pr:$pr,source_run_id:$run,requires_relay:true,is_fork:true,pr_actor:$actor,event_name:$event,head_sha:$head,archive_source:{kind:"issue-comment",login:"github-actions[bot]",id:555},archive_records:[$archive]}' >"$HANDOFF"
+    --arg actor alice --arg archive "$ARCHIVE" --arg restoration "$RESTORATION_RECORD" '{version:1,repo:$repo,pr:$pr,source_run_id:$run,requires_relay:true,is_fork:true,pr_actor:$actor,event_name:$event,head_sha:$head} +
+    (if $event=="issue_comment" then {archive_source:{kind:"issue-comment",login:"github-actions[bot]",id:556},archive_records:[$restoration]}
+     elif $event=="pull_request" then {archive_source:{kind:"",login:"",id:0},archive_records:[]}
+     else {archive_source:{kind:"inline",login:"chatgpt-codex-connector[bot]",id:555},archive_records:[$archive]} end)'  >"$HANDOFF"
 }
 run_persist() {
   : >"$GH_LOG"
@@ -588,17 +598,17 @@ assert_empty_writes "wrong artifact event reaches no lease or archive writer"
 # A valid delayed archive preserves its historical record but opens and
 # evaluates the lease at the current bound API head, not the handoff source.
 # #1437: source enrollment is checked before either the lease or archive POST.
-write_handoff pull_request "$SRC"
+write_handoff pull_request_review_comment "$SRC"
 jq '.archive_source.login="never-registered"' "$HANDOFF" >"$TMP/unregistered-handoff.json"
 mv "$TMP/unregistered-handoff.json" "$HANDOFF"
 printf '%s\n' "$PUBLISH" >"$HEAD_SEQUENCE_FILE"
-run_persist pull_request "$SRC"
+run_persist pull_request_review_comment "$SRC"
 assert_eq "$PERSIST_RC" 2 "actual persist writer rejects an unregistered tier/record source"
 assert_empty_writes "ineligible archived source cannot open a check lease or post records"
 
-write_handoff pull_request "$SRC"
+write_handoff pull_request_review_comment "$SRC"
 printf '%s\n' "$PUBLISH" "$PUBLISH" "$PUBLISH" >"$HEAD_SEQUENCE_FILE"
-run_persist pull_request "$SRC"
+run_persist pull_request_review_comment "$SRC"
 assert_eq "$PERSIST_RC" 0 "actual persist writer accepts a valid delayed source archive"
 if grep -F -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG" >/dev/null \
   && grep -F -- $'head_sha=0000000000000000000000000000000000000012' "$GH_LOG" >/dev/null \
@@ -611,11 +621,81 @@ else
   fail "actual persist writer did not preserve delayed archive/current-head separation: $(cat "$GH_LOG")"
 fi
 
+# Actual non-source and restoration producer shapes: empty source metadata is
+# harmless; explicit Actions issue-comment restores the exact single chunk.
+write_handoff pull_request "$SRC"
+printf '%s\n' "$PUBLISH" "$PUBLISH" "$PUBLISH" >"$HEAD_SEQUENCE_FILE"
+run_persist pull_request "$SRC"
+assert_eq "$PERSIST_RC" 0 "actual persist accepts an empty non-source handoff"
+if ! grep -F -- "$ARCHIVE" "$GH_LOG" >/dev/null; then pass "empty non-source handoff posts no archive"; else fail "empty handoff posted an archive"; fi
+write_handoff issue_comment "$SRC"
+printf '%s\n' "$PUBLISH" "$PUBLISH" "$PUBLISH" >"$HEAD_SEQUENCE_FILE"
+run_persist issue_comment "$SRC"
+assert_eq "$PERSIST_RC" 0 "actual persist accepts a real incomplete Actions restoration chunk"
+if grep -F -- "$RESTORATION_RECORD" "$GH_LOG" >/dev/null; then pass "actual persist preserves the exact restoration chunk"; else fail "restoration chunk was not posted"; fi
+# Feed the existing resolver output to the actual privileged writer: these
+# legacy artifacts came from immutable default-branch issue-comment producers.
+write_run issue_comment "$ISSUE_HEAD" "$BASE_ID" "$BASE_REPO" main '[]' '.github/workflows/codex-p1-gate.yml@refs/heads/main'
+run_case 41
+assert_eq "$RC" 0 "legacy restoration source is verified as a base/default-branch issue-comment run"
+VERIFIED_EVENT=$(printf '%s' "$OUTPUT" | jq -r .source_event)
+VERIFIED_HEAD=$(printf '%s' "$OUTPUT" | jq -r .source_head_sha)
+for legacy_record in "$RESTORATION_RECORD" '<!-- mergepath-feedback-archive-relay:v2 run=501 publisher=777 status=complete -->'; do
+  write_handoff issue_comment "$SRC"
+  jq --arg record "$legacy_record" 'del(.archive_source) | .archive_records=[$record]' "$HANDOFF" >"$TMP/legacy-restoration.json"
+  mv "$TMP/legacy-restoration.json" "$HANDOFF"
+  printf '%s\n' "$PUBLISH" "$PUBLISH" "$PUBLISH" >"$HEAD_SEQUENCE_FILE"
+  run_persist "$VERIFIED_EVENT" "$VERIFIED_HEAD"
+  assert_eq "$PERSIST_RC" 0 "actual persist accepts legacy restoration with independently verified source context"
+  if grep -F -- "$legacy_record" "$GH_LOG" >/dev/null; then pass "legacy restoration exact prior record is preserved"; else fail "legacy prior record was not posted"; fi
+  run_persist "" "$VERIFIED_HEAD"
+  assert_eq "$PERSIST_RC" 1 "missing verified context cannot authorize legacy restoration"
+  assert_empty_writes "missing source context reaches no lease or archive writer"
+  jq '.event_name="pull_request"' "$HANDOFF" >"$TMP/forged-event.json"
+  mv "$TMP/forged-event.json" "$HANDOFF"
+  run_persist "$VERIFIED_EVENT" "$VERIFIED_HEAD"
+  assert_eq "$PERSIST_RC" 1 "forged pull-request handoff cannot match verified issue-comment context"
+  assert_empty_writes "source event mismatch reaches no lease or archive writer"
+  run_persist pull_request "$SRC"
+  assert_eq "$PERSIST_RC" 2 "verified pull-request context grants no legacy partial or terminal restoration"
+  assert_empty_writes "pull-request context cannot promote legacy restoration records"
+  jq '.event_name="issue_comment" | .archive_source={kind:"issue-comment",login:"github-actions[bot]",id:0}' "$HANDOFF" >"$TMP/invalid-source.json"
+  mv "$TMP/invalid-source.json" "$HANDOFF"
+  run_persist "$VERIFIED_EVENT" "$VERIFIED_HEAD"
+  assert_eq "$PERSIST_RC" 2 "present invalid source metadata cannot fall back to verified legacy restoration"
+  assert_empty_writes "invalid metadata reaches no lease or archive writer"
+done
+write_run issue_comment "$ISSUE_HEAD" "$BASE_ID" "$BASE_REPO" candidate-branch '[]' '.github/workflows/codex-p1-gate.yml@refs/heads/main'
+run_case 41
+assert_eq "$RC" 4 "candidate-branch issue-comment source cannot grant legacy restoration context"
+assert_empty_writes "unverified source resolver emits no privileged write"
+
+# A complete one-part v2 decodes enrollment even in old handoffs and the
+# restoration path. Unenrolled sources never reach a privileged write.
+encoded=$(printf '%s' "$ARCHIVE" | sed -E 's/^<!-- mergepath-feedback-archive:v1 (.*) -->$/\1/')
+for mode in legacy restoration; do
+  for login in 'chatgpt-codex-connector[bot]' never-registered; do
+    write_handoff issue_comment "$SRC"
+    payload=$(printf '%s' "$encoded" | jq -Rr --arg login "$login" '@base64d | fromjson | .source_login=$login | @json | @base64')
+    jq --arg payload "$payload" --arg mode "$mode" '.archive_records=[("<!-- mergepath-feedback-archive:v2 id="+("a"*64)+" part=1/1 data="+$payload+" -->")] | if $mode=="legacy" then del(.archive_source) else . end' "$HANDOFF" >"$TMP/singleton.json"
+    mv "$TMP/singleton.json" "$HANDOFF"
+    printf '%s\n' "$PUBLISH" "$PUBLISH" "$PUBLISH" >"$HEAD_SEQUENCE_FILE"
+    run_persist issue_comment "$SRC"
+    if [ "$login" = never-registered ]; then
+      assert_eq "$PERSIST_RC" 2 "actual persist rejects unenrolled $mode complete v2"
+      assert_empty_writes "unenrolled $mode complete v2 opens no lease or archive"
+    else
+      assert_eq "$PERSIST_RC" 0 "actual persist accepts enrolled $mode complete v2"
+    fi
+  done
+done
+write_handoff pull_request_review_comment "$SRC"
+
 # If the head moves only at the final read, the existing lease is closed as a
 # failure; no second lease is opened on the newly observed head.
 NEW_HEAD=$(sha 13)
 printf '%s\n' "$PUBLISH" "$PUBLISH" "$NEW_HEAD" >"$HEAD_SEQUENCE_FILE"
-run_persist pull_request "$SRC"
+run_persist pull_request_review_comment "$SRC"
 assert_eq "$PERSIST_RC" 0 "head drift closes the existing persist invocation"
 if [ "$(grep -Fc -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG")" -eq 1 ] \
   && grep -F -- $'--method\tPATCH\trepos/acme/widget/check-runs/900' "$GH_LOG" >/dev/null \

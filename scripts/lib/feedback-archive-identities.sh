@@ -28,7 +28,7 @@ feedback_archive_registry_from_json() {
     .feedback_archive.identities
     | select(type == "array" and length > 0 and length <= 128)
     | select(all(.[];
-        (.login | type == "string" and test("^[A-Za-z0-9-]+(\\[bot\\])?$")) and
+        (.login | type == "string" and test("^[A-Za-z0-9-]+(_[A-Za-z0-9]+|\\[bot\\])?$")) and
         (.provider == "codex" or .provider == "coderabbit" or
          .provider == "ghas" or .provider == "reviewer") and
         (.status == "active" or .status == "retired")))
@@ -42,8 +42,8 @@ feedback_archive_registry_from_json() {
 feedback_archive_source_provider() {
   local kind="$1" login="$2" result rc=0
   [ -n "${FEEDBACK_ARCHIVE_IDENTITIES:-}" ] || return 2
-  case "$kind" in issue-comment|inline|review-body) ;; *) return 2 ;; esac
-  [[ "$login" =~ ^[A-Za-z0-9-]+(\[bot\])?$ ]] || return 2
+  case "$kind" in issue-comment|inline|review-body) ;; *) return 1 ;; esac
+  [[ "$login" =~ ^[A-Za-z0-9-]+(_[A-Za-z0-9]+|\[bot\])?$ ]] || return 1
   result=$(printf '%s' "$FEEDBACK_ARCHIVE_IDENTITIES" | jq -er --arg kind "$kind" --arg login "$login" \
     "$FEEDBACK_ARCHIVE_ELIGIBILITY_JQ"'archive_provider(.; $kind; $login)' 2>/dev/null) || rc=$?
   [ "$rc" -ne 4 ] || return 1
@@ -54,8 +54,10 @@ feedback_archive_source_provider() {
 # An inert handoff contains at most one source body (32 chunks) or one restored
 # record. Decode only as data; a retained enrollment grants no payload authority.
 feedback_archive_validate_records() {
-  local handoff="$1"
-  jq -e --argjson identities "$FEEDBACK_ARCHIVE_IDENTITIES" "$FEEDBACK_ARCHIVE_ELIGIBILITY_JQ"'
+  # Optional context comes from the relay source resolver AFTER its trusted
+  # repository/default-branch binding and handoff tuple check, never the payload.
+  local handoff="$1" verified_source_event="${2:-}"
+  jq -e --arg verified_source_event "$verified_source_event" --argjson identities "$FEEDBACK_ARCHIVE_IDENTITIES" "$FEEDBACK_ARCHIVE_ELIGIBILITY_JQ"'
     def eligible($kind; $login):
       [archive_provider($identities; $kind; $login)] | length == 1;
     def payload_ok($p):
@@ -63,31 +65,44 @@ feedback_archive_validate_records() {
       ($p.source_comment_id | type == "number" and . > 0 and floor == .) and
       ($p.source_login | type == "string") and
       eligible(($p.source_kind // "issue-comment"); $p.source_login);
+    # Absolute anchors forbid extra lines; a missing match is an error rather
+    # than an empty stream that could silently remove a record from the set.
+    def exact($pattern):
+      [capture($pattern)] | if length == 1 then .[0] else error("invalid record wrapper") end;
+    def v1:
+      exact("\\A<!-- mergepath-feedback-archive:v1 (?<data>[A-Za-z0-9+/=]{1,60000}) -->\\z") | .data;
+    def v2:
+      exact("\\A<!-- mergepath-feedback-archive:v2 id=(?<id>[0-9a-f]{64}) part=(?<part>[0-9]+)/(?<total>[0-9]+) data=(?<data>[A-Za-z0-9+/=]{1,60000}) -->\\z")
+      | .part |= tonumber | .total |= tonumber;
     .archive_records as $records
     | ($records | type == "array" and length <= 32) and
+      all($records[]; type == "string") and
       (if ($records | length) == 0 then true
        elif (.archive_source.login == "github-actions[bot]" and
              .archive_source.kind == "issue-comment") or
             ((has("archive_source") | not) and ($records | length) == 1 and
-             ($records[0] | startswith("<!-- mergepath-feedback-archive:v1 ") | not)) then
+             $verified_source_event == "issue_comment") then
+         # Immutable old producers lack archive_source. Only independently
+         # verified default-branch issue-comment context permits that legacy
+         # restoration. Present invalid metadata never takes this fallback.
+         .event_name == "issue_comment" and
+         (if has("archive_source") then
+            (.archive_source.id | type == "number" and . > 0 and floor == .)
+          else $verified_source_event == "issue_comment" end) and
          ($records | length == 1) and
-         all($records[]; [
+         ([$records[] |
            if startswith("<!-- mergepath-feedback-archive:v1 ") then
-             capture("^<!-- mergepath-feedback-archive:v1 (?<data>[A-Za-z0-9+/=]{1,60000}) -->$")
-             | .data | @base64d | fromjson | payload_ok(.)
+             v1 | @base64d | fromjson | payload_ok(.)
            elif startswith("<!-- mergepath-feedback-archive:v2 ") then
-             capture("^<!-- mergepath-feedback-archive:v2 id=[0-9a-f]{64} part=(?<part>[0-9]+)/(?<total>[0-9]+) data=[A-Za-z0-9+/=]{1,60000} -->$")
-             | (.part | tonumber) as $part | (.total | tonumber) as $total
-             | $part >= 1 and $part <= $total and $total <= 32
-           else test("^<!-- mergepath-feedback-archive-relay:v(1 run=[0-9]+ status=(complete|failed)|2 run=[0-9]+ publisher=[0-9]+ status=complete) -->$") end] | length == 1 and .[0] == true)
+             v2 | .part >= 1 and .part <= .total and .total <= 32 and
+               (if .total == 1 then .data | @base64d | fromjson | payload_ok(.) else true end)
+           else test("\\A<!-- mergepath-feedback-archive-relay:v(1 run=[0-9]+ status=(complete|failed)|2 run=[0-9]+ publisher=[0-9]+ status=complete) -->\\z") end]
+           | length == 1 and .[0] == true)
        else
          (if ($records[0] | startswith("<!-- mergepath-feedback-archive:v1 ")) then
-            if ($records | length) != 1 then error("multiple source bodies") else
-              $records[0] | capture("^<!-- mergepath-feedback-archive:v1 (?<data>[A-Za-z0-9+/=]{1,60000}) -->$") | .data
-            end
+            if ($records | length) != 1 then error("multiple source bodies") else $records[0] | v1 end
           else
-            [$records[] | capture("^<!-- mergepath-feedback-archive:v2 id=(?<id>[0-9a-f]{64}) part=(?<part>[0-9]+)/(?<total>[0-9]+) data=(?<data>[A-Za-z0-9+/=]{1,60000}) -->$")
-              | .part |= tonumber | .total |= tonumber] | sort_by(.part)
+            [$records[] | v2] | sort_by(.part)
             | if (map(.id) | unique | length) != 1 or
                  (map(.total) | unique | length) != 1 or .[0].total != length or
                  map(.part) != [range(1; length + 1)] then error("incomplete source body")

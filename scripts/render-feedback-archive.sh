@@ -74,8 +74,8 @@ if [ "$SOURCE_KIND" = issue-comment ] && [ "$SOURCE_LOGIN" = 'github-actions[bot
   { extra=1 }
   END { if (record != "" && !extra) print record; else exit 1 }
 ' "$PREVIOUS_BODY_FILE"); then
-  jq -n --arg record "$RESTORED_RECORD" '
-    {archive_source:{kind:"issue-comment",login:"github-actions[bot]"},archive_records:[$record]}
+  jq -n --arg record "$RESTORED_RECORD" --argjson id "$SOURCE_ID" '
+    {event_name:"issue_comment",archive_source:{kind:"issue-comment",login:"github-actions[bot]",id:$id},archive_records:[$record]}
   ' | feedback_archive_validate_records /dev/stdin || exit 2
   printf '%s\n' "$RESTORED_RECORD"
   exit 0

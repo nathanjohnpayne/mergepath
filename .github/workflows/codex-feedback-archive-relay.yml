@@ -417,7 +417,9 @@ jobs:
           . scripts/lib/feedback-archive-identities.sh
           if [ "$(jq '.archive_records | length' "$HANDOFF_FILE")" -gt 0 ]; then
             feedback_archive_registry_load .github/review-policy.yml
-            feedback_archive_validate_records "$HANDOFF_FILE"
+            # The preceding tuple check matches this independently resolved
+            # source event; payload.event_name alone grants no legacy restoration.
+            feedback_archive_validate_records "$HANDOFF_FILE" "$EXPECTED_SOURCE_EVENT"
           fi
 
           # The artifact's head belongs to the historical source event. It is

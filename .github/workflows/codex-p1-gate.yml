@@ -283,7 +283,7 @@ jobs:
               if [ -n "$alert_number" ]; then
                 # A failed cache_init (disk/permissions) leaves
                 # GHAS_SEVERITY_CACHE unset, which ghas_alert_severity below
-                # already treats as an rc-3 read failure -- same WARN+p2
+                # already treats as an rc-3 read failure -- same WARN+p1
                 # fallback as a failed live fetch, so no separate handling
                 # is needed here.
                 ghas_severity_cache_init || true
