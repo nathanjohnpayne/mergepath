@@ -198,8 +198,8 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     Attached forms retain conservative output verdicts for external or
     locally defined commands/prefixes, query modifiers, changed builtin
     availability (`enable`, aliases or opaque setup), credential-bearing
-    redirections, complex/special targets or integer/nameref declarations, and numeric, ANSI-C, expanded
-    dynamic or unknown formats. Repeated
+    redirections, complex/special targets (including Bash locale selectors) or
+    integer/nameref declarations, and numeric, ANSI-C, expanded, dynamic or unknown formats. Repeated
     assignment options and the option delimiter precede the inspected format.
     Numeric-conversion diagnostics from the separate assignment form remain
     the #1461 gap, unchanged by the option-position repair (#1645).
@@ -2637,7 +2637,8 @@ def _printf_nondiagnostic_format(raw, literal):
 
 _PRINTF_SPECIAL_TARGETS = frozenset({
     "BASH", "BASHOPTS", "BASHPID", "COMP_CWORD", "COMP_POINT", "COLUMNS", "EUID", "HISTFILESIZE",
-    "HISTSIZE", "IGNOREEOF", "LINENO", "LINES", "MAILCHECK", "OPTIND", "PPID",
+    "HISTSIZE", "IGNOREEOF", "LANG", "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES",
+    "LC_NUMERIC", "LC_TIME", "LINENO", "LINES", "MAILCHECK", "OPTIND", "PPID",
     "RANDOM", "SECONDS", "SHLVL", "SRANDOM", "TMOUT", "UID", "PIPESTATUS",
     "FUNCNAME", "GROUPS", "DIRSTACK",
 })
@@ -5426,6 +5427,51 @@ CORPUS = [
         "printf -vBASH_XTRACEFD '%s' \"$GH_TOKEN\"\n",
     ),
     (
+        'printf-v-locale-lc_all',
+        MUST_FLAG,
+        'printf -vLC_ALL \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-locale-lc_ctype',
+        MUST_FLAG,
+        'unset LC_ALL\nprintf -vLC_CTYPE \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-locale-lc_collate',
+        MUST_FLAG,
+        'unset LC_ALL\nprintf -vLC_COLLATE \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-locale-lc_messages',
+        MUST_FLAG,
+        'unset LC_ALL\nprintf -vLC_MESSAGES \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-locale-lc_numeric',
+        MUST_FLAG,
+        'unset LC_ALL\nprintf -vLC_NUMERIC \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-locale-lc_time',
+        MUST_FLAG,
+        'unset LC_ALL\nprintf -vLC_TIME \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-locale-lang',
+        MUST_FLAG,
+        'unset LC_ALL\nprintf -vLANG \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-locale-lc_custom',
+        MUST_NOT_FLAG,
+        'unset LC_ALL\nprintf -vLC_CUSTOM \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-locale-lc_monetary',
+        MUST_NOT_FLAG,
+        'unset LC_ALL\nprintf -vLC_MONETARY \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
         "printf-v-integer-target-diagnostic",
         MUST_FLAG,
         "declare -i out\nGH_TOKEN=\"$GH_TOKEN.\"\nprintf -vout '%s' \"$GH_TOKEN\"\n",
@@ -6765,6 +6811,11 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    "printf-v-locale-lang": (
+        "LANG participates in shell locale selection; retain the parent "
+        "attached-option verdict without proving the controlling locale state, "
+        "even though this fixture does not print the sentinel"
+    ),
     "printf-v-restored-builtin": (
         "enable changes builtin availability, and this source scanner does "
         "not prove a later re-enable executed in the same shell; retain the "
