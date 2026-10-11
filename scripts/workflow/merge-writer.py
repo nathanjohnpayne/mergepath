@@ -10,12 +10,14 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import selectors
 import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('owner_override', Path(__file__).with_name('owner-admin-override.py'))
@@ -94,6 +96,36 @@ def extract_code(archive, destination):
         raise ValueError('trusted default branch lacks the merge-checker closure')
 
 
+
+def download_code(gh, endpoint, environment, archive):
+    """Bound the archive producer while retaining the existing read deadline."""
+    command = [gh, 'api', endpoint]
+    deadline = time.monotonic() + TIMEOUT
+    with subprocess.Popen(command, env=environment, stdout=subprocess.PIPE) as producer:
+        try:
+            total = 0
+            with selectors.DefaultSelector() as selector:
+                selector.register(producer.stdout, selectors.EVENT_READ)
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        raise subprocess.TimeoutExpired(command, TIMEOUT)
+                    chunk = os.read(producer.stdout.fileno(), 64 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > 64 * 1024 * 1024:
+                        raise ValueError('trusted source download exceeds its size bound')
+                    archive.write(chunk)
+            result = producer.wait(timeout=max(0, deadline - time.monotonic()))
+            if result:
+                raise subprocess.CalledProcessError(result, command)
+        finally:
+            if producer.poll() is None:
+                producer.kill()
+            producer.wait()
+
+
 def merge_preflight(argv, command, tools, task):
     environment = clean_environment()
     gh = tools['gh']
@@ -137,10 +169,7 @@ def merge_preflight(argv, command, tools, task):
         raise ValueError('trusted default branch did not resolve to a full commit')
     print(f'merge-writer: {pr["url"]}@{head}; trusted code {repo}@{source_sha}; governing base {base}', file=sys.stderr)
     with tempfile.TemporaryFile() as archive:
-        subprocess.run([gh, 'api', f'repos/{repo}/tarball/{source_sha}'],
-                       env=environment, stdout=archive, check=True, timeout=TIMEOUT)
-        if archive.tell() > 64 * 1024 * 1024:
-            raise ValueError('trusted source download exceeds its size bound')
+        download_code(gh, f'repos/{repo}/tarball/{source_sha}', environment, archive)
         archive.seek(0)
         extract_code(archive, task)
     resolver = task / 'scripts/workflow/resolve_base_policy.sh'

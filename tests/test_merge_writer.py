@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tarfile
+import time
 import tempfile
 import unittest
 
@@ -70,6 +71,13 @@ if endpoint=='repos/example/repo': emit(dict(full_name='example/repo',default_br
 if endpoint=='repos/example/repo/commits/main': emit({'sha':source}); sys.exit(0)
 if endpoint.startswith('repos/example/repo/tarball/'):
     if state.get('archive_fails'): sys.exit(1)
+    if state.get('archive_oversize') or state.get('archive_stalls'):
+        (root/'producer.pid').write_text(str(__import__('os').getpid()))
+    if state.get('archive_stalls'):
+        sys.stdout.buffer.write(b'partial'); sys.stdout.buffer.flush(); __import__('time').sleep(30)
+    if state.get('archive_oversize'):
+        for _ in range(65): sys.stdout.buffer.write(b'x'*(1024*1024))
+        sys.stdout.buffer.flush(); __import__('time').sleep(30)
     sys.stdout.buffer.write((root/'source.tar.gz').read_bytes()); sys.exit(0)
 if 'contents/.github/review-policy.yml' in endpoint:
     if state.get('policy_fails'): sys.exit(1)
@@ -268,6 +276,29 @@ class WriterTests(unittest.TestCase):
                                    'gh','pr','merge','123',action,'--match-head-commit',HEAD],
                                   env=env,cwd=self.candidate,text=True,capture_output=True,timeout=40)
             self.assert_blocked(result)
+
+    def assert_producer_reaped(self):
+        pid=int((self.path/'producer.pid').read_text())
+        with self.assertRaises(ProcessLookupError): os.kill(pid,0)
+
+    def test_oversized_download_is_stopped_before_writing_all_bytes(self):
+        self.state['archive_oversize']=True
+        self.assert_blocked(self.run_writer(),'download exceeds its size bound')
+        self.assert_producer_reaped()
+
+    def test_stalled_archive_producer_is_killed_and_reaped_on_timeout(self):
+        (self.path/'state.json').write_text(json.dumps({'archive_stalls':True}))
+        spec=importlib.util.spec_from_file_location('writer_timeout',ROOT/'scripts/workflow/merge-writer.py')
+        writer=importlib.util.module_from_spec(spec);spec.loader.exec_module(writer)
+        writer.TIMEOUT=0.15
+        started=time.monotonic()
+        with tempfile.TemporaryFile() as archive:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                writer.download_code(str(self.path/'bin/gh'),'repos/example/repo/tarball/'+SOURCE,dict(os.environ),archive)
+        self.assertLess(time.monotonic()-started,3)
+        self.assert_producer_reaped()
+        self.assertFalse((self.path/'trace').exists())
+        self.assertFalse((self.path/'writes.jsonl').exists())
 
     def test_missing_or_unsafe_closure_refuses(self):
         with tarfile.open(self.path/'source.tar.gz','w:gz') as bundle:
