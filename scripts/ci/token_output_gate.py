@@ -195,8 +195,10 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     An escaped command word (`\echo`) is the same emitter. `printf -v NAME`
     and `printf -vNAME` assign only in option position before the format and
     before `--`; the same spellings after the format are data and emit.
-    Numeric-conversion diagnostics from valid assignment forms remain the
-    separate #1461 gap, unchanged by the option-position repair (#1645).
+    Attached forms retain conservative output verdicts for external or
+    detected helper commands and numeric, dynamic or unknown formats.
+    Numeric-conversion diagnostics from the separate assignment form remain
+    the #1461 gap, unchanged by the option-position repair (#1645).
   * An in-file message helper: a function whose body writes one of its own
     positional parameters VERBATIM through an emitter, or hands one to
     `cat`/`tee` on a HERE-STRING -- unless the file redefines that name, in
@@ -872,7 +874,8 @@ class CheckError(Exception):
 class Segment:
     __slots__ = (
         "sid", "parent", "parent_is_capture", "parent_is_subshell", "words",
-        "line", "pipe_to", "_cmd", "_resolved",
+        "line", "pipe_to", "_cmd", "_resolved", "_cmd_index", "_cmd_literal",
+        "_cmd_external",
     )
 
     def __init__(self, sid, parent, parent_is_capture, line):
@@ -902,6 +905,9 @@ class Segment:
         self.pipe_to = None
         self._cmd = None
         self._resolved = False
+        self._cmd_index = None
+        self._cmd_literal = None
+        self._cmd_external = False
 
 
 class Ref:
@@ -2487,6 +2493,9 @@ def resolve_command(seg):
             continue
         base = _basename(lit)
         if base in PASSTHRU and passthru_budget > 0:
+            # Only shell command/builtin/time prefixes retain builtin lookup.
+            if "/" in lit or base not in ("command", "builtin", "time"):
+                seg._cmd_external = True
             passthru_budget -= 1
             idx += 1
             # step over the wrapper's own options / assignments
@@ -2527,6 +2536,8 @@ def resolve_command(seg):
             # literal is not the command.  Fail closed.
             seg._cmd = (UNRESOLVED, has_redir)
             return seg._cmd
+        seg._cmd_index = idx
+        seg._cmd_literal = lit
         seg._cmd = (base, has_redir)
         return seg._cmd
     seg._cmd = (None, has_redir)
@@ -2604,6 +2615,16 @@ def tee_file_operands(seg):
     return files
 
 
+def _printf_nondiagnostic_format(literal):
+    """Literal text/string formats cannot diagnose a numeric token operand."""
+    if literal is None:
+        return False
+    # Unknown conversions and dynamic width/precision retain the prior
+    # attached-option conservative verdict rather than suppress diagnostics.
+    remainder = re.sub(r"%(?:%|[-+# 0]*[0-9]*(?:\.[0-9]*)?[sbq])", "", literal)
+    return "%" not in remainder
+
+
 def classify(seg, emitter_helpers):
     cmd, _redir = resolve_command(seg)
     if cmd is None:
@@ -2616,7 +2637,7 @@ def classify(seg, emitter_helpers):
         # Only option position before the format can assign. Reuse the
         # command/argument boundaries so prefixes and redirections are not
         # printf operands; "--" and a format operand end option parsing.
-        idx = _command_index(seg.words, frozenset({"printf"}))
+        idx = seg._cmd_index
         if idx is not None:
             args = list(_command_arguments(seg.words, idx + 1))
             if args:
@@ -2624,7 +2645,13 @@ def classify(seg, emitter_helpers):
                 if option == "-v" and len(args) > 1:
                     return ASSIGN
                 if option is not None and option.startswith("-v") and len(option) > 2:
-                    return ASSIGN
+                    # Preserve the old conservative verdict for external or
+                    # shadowed commands and diagnostic-capable formats. The
+                    # separate -v form's #1461 verdict is unchanged.
+                    if (seg._cmd_literal == "printf" and not seg._cmd_external
+                            and cmd not in emitter_helpers and len(args) > 1
+                            and _printf_nondiagnostic_format(args[1][1])):
+                        return ASSIGN
         return EMIT
     if cmd in EMITTERS:
         return EMIT
@@ -3138,7 +3165,10 @@ def discover_emitter_helpers(text):
     # what the fixed point below iterates.
     lexed = {name: Lexer(body) for name, body in bodies.items()}
 
-    helpers = set()
+    # A local printf definition invalidates the new attached-option builtin
+    # exemption even when its body is not a recognized positional emitter.
+    # Retain the parent scanner's conservative verdict on that spelling.
+    helpers = {"printf"} if "printf" in bodies else set()
     # A FIXED POINT, not a fixed number of rounds.  Each round can promote at
     # most one link of a call chain, so a chain longer than the round budget
     # left its outermost helper undiscovered -- `a` calls `b` calls `c` calls
@@ -5152,6 +5182,48 @@ CORPUS = [
         "printf -- '-vout %s\\n' \"$GH_TOKEN\"\n",
     ),
     (
+        "printf-v-attached-numeric",
+        MUST_FLAG,
+        "printf -vout '%d' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-attached-numeric-i",
+        MUST_FLAG,
+        "printf -vout '%i' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-redirection-command-name",
+        MUST_NOT_FLAG,
+        "> printf printf -v out '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-shadowed-command",
+        MUST_FLAG,
+        "printf() { echo \"$@\"; }\nprintf -vout '%s\\n' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-shadowed-noop",
+        MUST_FLAG,
+        "printf() { :; }\nprintf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-attached-dynamic-format",
+        MUST_FLAG,
+        "format='%s'\nprintf -vout \"$format\" \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-external-command",
+        MUST_FLAG,
+        "printf '%s\\n' '#!/usr/bin/env bash' 'builtin printf -- \"$@\"' > printf\n"
+        "chmod +x printf\n./printf '-v%s\\n' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-external-wrapper",
+        MUST_FLAG,
+        "printf '%s\\n' '#!/usr/bin/env bash' 'builtin printf -- \"$@\"' > printf\n"
+        "chmod +x printf\nPATH=\"$PWD:$PATH\" env printf '-v%s\\n' \"$GH_TOKEN\"\n",
+    ),
+    (
         "printf-v-helper",
         MUST_NOT_FLAG,
         'store() { printf -v out \'%s\' "$1"; }\nstore "$GH_TOKEN"\necho done\n',
@@ -6417,6 +6489,16 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    "printf-v-shadowed-noop": (
+        "a local printf definition prevents assuming Bash builtin assignment "
+        "semantics, even when this fixture's function writes nothing; retain "
+        "the parent attached-option conservative verdict"
+    ),
+    "printf-v-attached-dynamic-format": (
+        "a dynamic format may diagnose a numeric token operand; this fixture "
+        "holds a safe string format, but the scanner does no value dataflow "
+        "and retains the parent attached-option conservative verdict"
+    ),
     "read-prompt-separate": (
         "`read -p` writes its prompt only when standard input is a terminal. "
         "The differential oracle deliberately captures non-interactive "
