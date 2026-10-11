@@ -1407,52 +1407,105 @@ while IFS= read -r wf; do
   fi
 done <<< "$wf_sites"
 
-# The two failure modes differ by design and the difference is load-bearing, so
-# it is pinned rather than left to a reader of the workflow.
-#
-#   pr-audit.yml rethrows timeout errors from its per-PR catch: the step fails
-#   rather than auditing a PR it could not parse.
-#   agent-review.yml catches and yields '', which cannot equal any reviewer, so
-#   ASSIGNMENT falls through to the default. Safe only because assignment is not
-#   a gate -- the same empty value would be fail-open in gate (b).
+# Execute the actual weekly-audit script with fake GitHub and parser boundaries.
+# Parser infrastructure failures must survive Dependabot exemptions, later PRs
+# must still be audited, and a spent budget must report the unaudited remainder.
 if node - "$ROOT/.github/workflows/pr-audit.yml" <<'NODE'
+const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const source = fs.readFileSync(process.argv[2], 'utf8');
-const start = source.indexOf('              let bodyContract = { author:');
-const end = source.indexOf('\n              // Fetch all reviews for this PR once', start);
-if (start < 0 || end < 0) throw new Error('audit parser caller block not found');
-const callerImpl = new Function('pr', 'isDependabot', 'parsePrBodyContract', 'prViolations',
-  'authorIdentity', 'reviewerAccounts',
-  `${source.slice(start, end)}\nreturn { bodyContract, prViolations };`);
-// The extracted caller also validates shared-author context before reviews.
-const caller = (pr, isDependabot, parsePrBodyContract, prViolations) => callerImpl(
-  { ...pr, user: { login: isDependabot ? 'dependabot[bot]' : 'nathanjohnpayne' } },
-  isDependabot, parsePrBodyContract, prViolations,
-  'nathanjohnpayne', ['nathanpayne-codex']);
-const timeout = Object.assign(new Error('parser timed out'), { code: 'ETIMEDOUT' });
-for (const isDependabot of [false, true]) {
-  try {
-    caller({ body: 'pathological body' }, isDependabot, () => { throw timeout; }, []);
-    throw new Error(`timeout was swallowed for isDependabot=${isDependabot}`);
-  } catch (error) {
-    if (error !== timeout) throw error;
+const script = source.split('          script: |\n')[1]
+  .split('\n').map(line => line.replace(/^            /, '')).join('\n');
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+const execute = new AsyncFunction('require', 'github', 'context', 'core', 'Date', 'console', script);
+const startTime = new Date('2026-10-11T12:00:00Z').getTime();
+const pr = (number, login = 'nathanjohnpayne', body = 'valid') => ({
+  number, title: `Fixture PR ${number}`, user: { login }, body,
+  merged_at: new Date(startTime).toISOString(), labels: [],
+  head: { sha: 'a'.repeat(40), ref: 'fixture', repo: { full_name: 'owner/repo' } },
+});
+async function audit(prs, { expireAfterFirst = false } = {}) {
+  let now = startTime;
+  const parsed = [], reviewed = [], reports = [], failures = [], messages = [];
+  class Clock extends Date {
+    constructor(...args) { super(...(args.length ? args : [now])); }
+    static now() { return now; }
   }
+  const endpoints = {
+    pulls: { list: 'prs', listReviews: 'reviews' },
+    issues: { listEvents: 'events', listComments: 'comments',
+      create: async report => reports.push(report) },
+  };
+  const github = { rest: endpoints, paginate: async (endpoint, args) => {
+    if (endpoint === 'prs') return prs;
+    if (endpoint === 'reviews') reviewed.push(args.pull_number);
+    return [];
+  } };
+  const mockedRequire = name => {
+    if (name === 'fs') return { readFileSync: () => 'policy' };
+    if (name === 'js-yaml') return { load: () => ({
+      available_reviewers: ['nathanpayne-codex'], author_identity: 'nathanjohnpayne',
+    }) };
+    if (name === 'child_process') return { execFileSync: (command, args, options) => {
+      assert.equal(args[0], 'scripts/lib/pr-body-contract.mjs');
+      assert.equal(options.timeout, 120000);
+      assert.equal(options.killSignal, 'SIGKILL');
+      parsed.push(options.input);
+      if (expireAfterFirst && parsed.length === 1) now += 25 * 60 * 1000;
+      if (options.input.startsWith('timeout')) {
+        now += options.timeout;
+        throw Object.assign(new Error('parser timed out'), { code: 'ETIMEDOUT' });
+      }
+      if (options.input === 'ordinary') throw new Error('ordinary parser failure');
+      return JSON.stringify({ author: 'codex', authorCount: 1, hasSelfReview: true });
+    } };
+    throw new Error(`Unexpected require: ${name}`);
+  };
+  await execute(mockedRequire, github, { repo: { owner: 'owner', repo: 'repo' } },
+    { setFailed: message => failures.push(message) }, Clock,
+    { log: message => messages.push(message) });
+  return { parsed, reviewed, reports, failures, messages };
 }
-const ordinary = caller({ body: 'invalid body' }, false,
-  () => { throw new Error('ordinary parser failure'); }, []);
-if (ordinary.prViolations[0] !== 'Could not parse PR body contract') {
-  throw new Error('ordinary parser-error fallback changed');
-}
-const validContract = { author: 'codex', authorCount: 1, hasSelfReview: true };
-const valid = caller({ body: 'valid body' }, false, () => validContract, []);
-if (valid.bodyContract !== validContract || valid.prViolations.length !== 0) {
-  throw new Error('successful parser result changed');
-}
+(async () => {
+  const mixed = await audit([
+    pr(1, 'nathanjohnpayne', 'timeout-author'),
+    pr(2, 'dependabot[bot]', 'timeout-dependabot'), pr(3),
+  ]);
+  assert.equal(mixed.parsed.length, 3, 'later PR body must be parsed');
+  assert.deepEqual(mixed.reviewed, [3], 'later PR must reach policy checks');
+  assert.equal(mixed.reports.length, 1, 'infrastructure failures need a durable report');
+  const body = mixed.reports[0].body;
+  assert.match(body, /Audit coverage:\*\* incomplete/);
+  assert.match(body, /Parser infrastructure errors:\*\* 2/);
+  for (const number of [1, 2]) assert.match(body, new RegExp(`\\*\\*#${number}\\*\\*`));
+  assert.equal((body.match(/ETIMEDOUT/g) || []).length, 2);
+  assert.doesNotMatch(body, /Missing.*Self-Review|Missing, ambiguous|Could not parse PR body contract/);
+  assert.equal(mixed.failures.length, 1, 'timeouts must fail the final audit');
+  assert.ok(!mixed.messages.some(message => message.startsWith('No policy violations')));
+
+  const budget = await audit([pr(4), pr(5), pr(6, 'dependabot[bot]')], { expireAfterFirst: true });
+  assert.equal(budget.parsed.length, 1, 'spent budget must stop starting PR audits');
+  assert.equal(budget.reports.length, 1);
+  assert.match(budget.reports[0].body, /Audit coverage:\*\* incomplete/);
+  assert.match(budget.reports[0].body, /Unaudited PRs/);
+  for (const number of [5, 6]) assert.match(budget.reports[0].body, new RegExp(`\\*\\*#${number}\\*\\*`));
+  assert.equal(budget.failures.length, 1);
+
+  const ordinary = await audit([pr(7, 'nathanjohnpayne', 'ordinary')]);
+  assert.match(ordinary.reports[0].body, /Could not parse PR body contract/);
+  assert.equal(ordinary.failures.length, 0, 'ordinary parser-error disposition must remain unchanged');
+  const ordinaryBot = await audit([pr(8, 'dependabot[bot]', 'ordinary')]);
+  assert.doesNotMatch(ordinaryBot.reports[0].body, /Could not parse PR body contract|ETIMEDOUT/);
+  const valid = await audit([pr(9)]);
+  assert.equal(valid.reports.length, 0);
+  assert.equal(valid.failures.length, 0);
+  assert.ok(valid.messages.includes('No policy violations found for the past 7 days.'));
+})().catch(error => { console.error(error); process.exitCode = 1; });
 NODE
 then
-  ok "#1281: pr-audit.yml propagates parser timeouts through the actual caller while retaining ordinary fallback"
+  ok "#1613: weekly audit records each timeout, audits later PRs, reports budget gaps and fails incomplete runs"
 else
-  bad "#1281: pr-audit.yml swallowed a timeout or changed the ordinary parser result"
+  bad "#1613: weekly audit lost per-PR timeout accounting or incomplete coverage"
 fi
 
 if sed -n '/const runParser/,/^            };/p' "$ROOT/.github/workflows/agent-review.yml" | grep -q "return '';"; then
