@@ -1660,20 +1660,50 @@ scan_unscoped_identity_writes() {
     # or indented code block inside a doc is where a real Markdown
     # exemption most often sits — or `<!-- … -->` in Markdown only.
     #
-    # Residual, deliberately: a string that is shaped exactly like a
-    # comment (`echo "# GIT_IDENTITY_SCOPE_EXEMPT: x"`) still exempts,
-    # because telling it from a real comment needs a shell quote parser.
-    # A line that goes to that trouble is forging an exemption on
-    # purpose, not tripping over one, and the marker is reviewed where it
-    # is written.
+    # Only an unquoted, unescaped # at a word boundary opens a shell
+    # comment. Quoted comment-shaped data must not exempt a live write.
+    function shell_comment_marker(s,   i, c, quote, boundary, dollar, ansi) {
+      quote = ""; boundary = 1; dollar = 0; ansi = 0
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (quote != "") {
+          if (c == "\\" && (quote == "\"" || ansi)) { i++; continue }
+          if (c == quote) quote = ""
+          continue
+        }
+        if (c == "\\") { i++; boundary = 0; dollar = 0; continue }
+        if (c == sprintf("%c", 39) || c == "\"") {
+          ansi = (c == sprintf("%c", 39) && dollar)
+          quote = c; boundary = 0; dollar = 0; continue
+        }
+        if (c == "#" && boundary)
+          return substr(s, i) ~ /^#.*GIT_IDENTITY_SCOPE_EXEMPT:[[:space:]]*[^[:space:]]/
+        boundary = (c ~ /[[:space:]]/)
+        dollar = (c == "$")
+      }
+      return 0
+    }
+    # Test the body of each complete HTML comment independently. A
+    # closing delimiter is required and cannot itself supply the reason.
+    function html_comment_marker(s,   opening, closing, body) {
+      while ((opening = index(s, "<!--")) > 0) {
+        s = substr(s, opening + 4)
+        closing = index(s, "-->")
+        if (!closing) return 0
+        body = substr(s, 1, closing - 1)
+        if (body ~ /GIT_IDENTITY_SCOPE_EXEMPT:[[:space:]]*[^[:space:]]/) return 1
+        s = substr(s, closing + 3)
+      }
+      return 0
+    }
     function exempt(s, md,   t) {
       t = s
       if (md) {
         gsub(/``[^`]*``/, "", t)
         gsub(/`[^`]*`/, "", t)
       }
-      if (t ~ /(^|[[:space:]])#.*GIT_IDENTITY_SCOPE_EXEMPT:[[:space:]]*[^[:space:]]/) return 1
-      if (md && t ~ /<!--.*GIT_IDENTITY_SCOPE_EXEMPT:[[:space:]]*[^[:space:]]/) return 1
+      if (shell_comment_marker(t)) return 1
+      if (md && html_comment_marker(t)) return 1
       return 0
     }
     function emit(ln, txt,   rel) {

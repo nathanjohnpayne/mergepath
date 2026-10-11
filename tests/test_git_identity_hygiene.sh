@@ -1382,6 +1382,64 @@ else
   fail "marker in a Markdown code block not honoured: rc=$RC out=$OUT"
 fi
 
+# Case 54b: quoted or escaped shell data cannot forge a comment marker.
+# These are scan-only inputs; none of the fixture commands are executed.
+while IFS= read -r LINE; do
+  run_on_fixture "tests/quoted-marker.sh" "$LINE
+"
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "tests/quoted-marker.sh:1"; then
+    pass "quoted/escaped comment-shaped marker does not exempt: $LINE"
+  else
+    fail "quoted/escaped marker exemption: rc=$RC out=$OUT"
+  fi
+done <<'EOF'
+git config user.email leak@example.com; echo " # GIT_IDENTITY_SCOPE_EXEMPT: x"
+git config user.email leak@example.com; echo ' # GIT_IDENTITY_SCOPE_EXEMPT: x'
+git config user.email leak@example.com; echo \# GIT_IDENTITY_SCOPE_EXEMPT: x
+git config user.email leak@example.com; echo \ # GIT_IDENTITY_SCOPE_EXEMPT: x
+git config user.email leak@example.com; echo "escaped \" # GIT_IDENTITY_SCOPE_EXEMPT: x"
+git config user.email leak@example.com; echo $'escaped \' # GIT_IDENTITY_SCOPE_EXEMPT: x'
+EOF
+
+# Case 54c: closed strings and escaped data do not hide a later real comment.
+while IFS= read -r LINE; do
+  run_on_fixture "tests/comment-marker.sh" "$LINE
+"
+  if [ "$RC" = "0" ]; then
+    pass "real comment after quoted/escaped data still exempts: $LINE"
+  else
+    fail "real marker after quoted/escaped data: rc=$RC out=$OUT"
+  fi
+done <<'EOF'
+git config user.email "fixture@example.com" # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+git config user.email 'fixture@example.com' # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+git config user.email fixture\ value # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+git config user.email "escaped \" value" # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+git config user.email $'escaped \' value' # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+EOF
+
+# Case 54d: Markdown exemptions need a complete comment with its reason inside.
+while IFS= read -r LINE; do
+  run_on_fixture "docs/broken-marker.md" "$LINE
+"
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/broken-marker.md:1"; then
+    pass "invalid Markdown comment does not exempt: $LINE"
+  else
+    fail "invalid Markdown comment exemption: rc=$RC out=$OUT"
+  fi
+done <<'EOF'
+git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: x
+git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: -->
+git config user.email leak@example.com <!-- other --> GIT_IDENTITY_SCOPE_EXEMPT: x <!-- other -->
+EOF
+run_on_fixture "docs/closed-marker.md" '`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: fixture value > only -->
+'
+if [ "$RC" = "0" ]; then
+  pass "complete HTML exemption after a code span: allowed, including > in the reason"
+else
+  fail "complete Markdown marker: rc=$RC out=$OUT"
+fi
+
 # ── Fail-closed: include paths the walk cannot follow ──────────────────
 
 # Case 55: `~/…` in an include path is expanded against the operator's
