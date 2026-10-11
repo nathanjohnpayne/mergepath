@@ -36,6 +36,7 @@ import json, pathlib, sys
 root = pathlib.Path(__file__).resolve().parent.parent
 state = json.loads((root/'state.json').read_text())
 args = sys.argv[1:]
+if state.get('require_lower_proxy') and args[:2] != ['api','user'] and not __import__('os').environ.get('https_proxy'): sys.exit(98)
 with (root/'calls.jsonl').open('a') as out: out.write(json.dumps(args)+'\n')
 def emit(value): print(json.dumps(value))
 head, base, source = 'a'*40, 'b'*40, 'c'*40
@@ -50,11 +51,13 @@ if args[:2] == ['pr','view']:
         print('\n'.join(['CLEAN','MERGEABLE','0',url,head,'nathanjohnpayne',*labels]))
     else:
         calls=(root/'calls.jsonl').read_text().count('"pr", "view"')
-        emit(dict(url=url,headRefOid='d'*40 if state.get('head_moves') and calls>2 else head,
-                  baseRefOid=base,baseRefName='release' if state.get('nondefault') else 'main',state='OPEN'))
+        value=dict(url=url,headRefOid='d'*40 if state.get('head_moves') and calls>2 else head,
+                  baseRefOid=base,baseRefName='release' if state.get('nondefault') else 'main',state='OPEN')
+        if 'labels' in fields: value['labels']=[dict(name=n) for n in state.get('final_labels',labels)]
+        emit(value)
     sys.exit(0)
 if not args or args[0]!='api': sys.exit(99)
-if 'user' in args: print('nathanjohnpayne'); sys.exit(0)
+if 'user' in args: print(state.get('api_identity','nathanjohnpayne')); sys.exit(0)
 endpoint=next((a for a in args[1:] if a=='graphql' or a.startswith('repos/')), '')
 if endpoint=='graphql':
     if any('reviewThreads' in a for a in args):
@@ -70,6 +73,10 @@ if endpoint.startswith('repos/example/repo/tarball/'):
     sys.stdout.buffer.write((root/'source.tar.gz').read_bytes()); sys.exit(0)
 if 'contents/.github/review-policy.yml' in endpoint:
     if state.get('policy_fails'): sys.exit(1)
+    if state.get('missing_base_policy') and 'ref='+base in endpoint:
+        print('gh: Not Found (HTTP 404)',file=sys.stderr); sys.exit(1)
+    if state.get('missing_base_policy') and 'ref=main' in endpoint:
+        print('author_identity: wrong-author'); sys.exit(0)
     print((root/'governing-policy.yml').read_text()); sys.exit(0)
 if endpoint=='repos/example/repo/pulls/123':
     emit(dict(number=123,head=dict(sha=head,ref='feature/fixture'),
@@ -96,7 +103,7 @@ print('unexpected API '+repr(args),file=sys.stderr); sys.exit(99)
 class WriterTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        files = ['scripts/merge-clearance-gate.sh', 'scripts/codex-review-check.sh', 'scripts/hooks/gh-pr-guard.sh']
+        files = ['scripts/identity-check.sh', 'scripts/merge-clearance-gate.sh', 'scripts/codex-review-check.sh', 'scripts/hooks/gh-pr-guard.sh']
         files += [str(p.relative_to(ROOT)) for d in ('scripts/lib','scripts/workflow') for p in (ROOT/d).rglob('*') if p.is_file() and '__pycache__' not in str(p)]
         cls.archive = io.BytesIO()
         with tarfile.open(fileobj=cls.archive,mode='w:gz') as bundle:
@@ -157,7 +164,8 @@ class WriterTests(unittest.TestCase):
         self.assertTrue((self.path/'trace').exists())
         writes=(self.path/'writes.jsonl').read_text().splitlines()
         self.assertEqual(len(writes),1)
-        self.assertEqual(json.loads(writes[0])[:5],['pr','merge',URL,'--repo','example/repo'])
+        self.assertEqual(json.loads(writes[0])[:3],['pr','merge',URL])
+        self.assertNotIn('--repo',json.loads(writes[0]))
 
     def test_caller_bypass_knobs_cannot_select_gate_semantics(self):
         self.assert_blocked(self.run_writer(MERGE_CLEARANCE_CODEX_CHECK_BIN='/bin/true',
@@ -222,6 +230,44 @@ class WriterTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         calls=[json.loads(line) for line in (self.path/'calls.jsonl').read_text().splitlines()]
         self.assertFalse(any('tarball/' in ' '.join(call) for call in calls))
+
+    def test_final_snapshot_rejects_new_blocking_labels(self):
+        for label in ('human-hold','needs-human-review','policy-violation'):
+            self.state={'generation':[123,124],'final_labels':[label]}
+            self.assert_blocked(self.run_writer(),'hold is present in the final snapshot')
+
+    def test_lowercase_proxy_transport_is_preserved(self):
+        self.state={'generation':[123,124],'require_lower_proxy':True}
+        result=self.run_writer(https_proxy='http://fixture.proxy.invalid:8080')
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+
+    def test_missing_base_policy_fallback_uses_immutable_source(self):
+        self.state={'generation':[123,124],'missing_base_policy':True}
+        result=self.run_writer()
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        calls=[json.loads(line) for line in (self.path/'calls.jsonl').read_text().splitlines()]
+        policy_refs=[call for call in calls if 'contents/.github/review-policy.yml' in ' '.join(call)]
+        self.assertTrue(any('ref='+SOURCE in ' '.join(call) for call in policy_refs))
+        self.assertFalse(any('ref=main' in ' '.join(call) for call in policy_refs))
+
+    def test_branch_cleanup_preserves_repository_flag_presence(self):
+        self.state={'generation':[123,124]}
+        for repo_args in ([],['--repo','example/repo']):
+            result=self.run_writer(['pr','merge','123','--delete-branch','--match-head-commit',HEAD,*repo_args])
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        writes=[json.loads(line) for line in (self.path/'writes.jsonl').read_text().splitlines()]
+        self.assertNotIn('--repo',writes[0]); self.assertIn('--repo',writes[1])
+        self.assertTrue(all('--delete-branch' in call and call[2]==URL for call in writes))
+
+    def test_private_writer_does_not_add_admin_or_identity_bypass(self):
+        (self.path/'state.json').write_text(json.dumps({'api_identity':'nathanpayne-codex'}))
+        env={k:v for k,v in os.environ.items() if not k.startswith(('GH_','GITHUB_','OP_PREFLIGHT_','MERGEPATH_','MERGE_CLEARANCE_','CODEX_REVIEW_','GIT_','BASH_','PYTHON','NODE_','BREAK_GLASS_')) and k not in ('ENV','CODEX_CLEARED')}
+        env.update(PATH=str(self.path/'bin')+os.pathsep+env['PATH'],GH_TOKEN='ghp_fixture-reviewer',GH_AS_AUTHOR_RECORD_IDENTITY='nathanjohnpayne')
+        for action in ('--admin','--squash'):
+            result=subprocess.run(['python3',str(self.candidate/'scripts/workflow/merge-writer.py'),str(self.path/'trace'),
+                                   'gh','pr','merge','123',action,'--match-head-commit',HEAD],
+                                  env=env,cwd=self.candidate,text=True,capture_output=True,timeout=40)
+            self.assert_blocked(result)
 
     def test_missing_or_unsafe_closure_refuses(self):
         with tarfile.open(self.path/'source.tar.gz','w:gz') as bundle:

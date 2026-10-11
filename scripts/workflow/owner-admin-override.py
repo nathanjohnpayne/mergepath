@@ -434,6 +434,9 @@ if __name__ == '__main__':
             print(json.dumps(validate(json.load(sys.stdin), sys.argv[2], sys.argv[3], dt.datetime.now(dt.timezone.utc))))
         elif sys.argv[1:2] == ['audit']:
             print(json.dumps(audit(json.load(sys.stdin))))
+        elif sys.argv[1:2] == ['classify']:
+            command = merge_command(sys.argv[2:])
+            print(command['action'] if command else '')
         elif sys.argv[1:2] in (['prepare'], ['check']):
             prepare(sys.argv[2:], check_only=sys.argv[1] == 'check')
         else:

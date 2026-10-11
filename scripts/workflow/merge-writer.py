@@ -23,7 +23,7 @@ OWNER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(OWNER)
 SHA = re.compile(r'[0-9a-f]{40}')
 URL = re.compile(r'https://github.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)')
-CODE_FILES = {'scripts/merge-clearance-gate.sh', 'scripts/codex-review-check.sh',
+CODE_FILES = {'scripts/identity-check.sh', 'scripts/merge-clearance-gate.sh', 'scripts/codex-review-check.sh',
               'scripts/hooks/gh-pr-guard.sh', '.github/review-policy.yml'}
 CODE_DIRS = ('scripts/lib/', 'scripts/workflow/')
 TIMEOUT = 300
@@ -34,7 +34,7 @@ def clean_environment():
     # shell startup, Python/Node injection, Git redirects or exported functions.
     names = ('PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'GH_TOKEN',
              'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'GH_CONFIG_DIR',
-             'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'SSL_CERT_FILE')
+             'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy', 'SSL_CERT_FILE')
     return {key: os.environ[key] for key in names if key in os.environ}
 
 
@@ -146,7 +146,9 @@ def merge_preflight(argv, command, tools, task):
     resolver = task / 'scripts/workflow/resolve_base_policy.sh'
     policy_result = subprocess.run([tools['bash'], str(resolver), '--repo', repo,
                                    '--base-ref', pr['baseRefName'], '--base-sha', base,
-                                   '--default-branch', repository['default_branch'],
+                                   # A confirmed missing base policy falls back only to the
+                                   # immutable default commit already used for this code.
+                                   '--default-branch', source_sha,
                                    '--default-config', str(task / '.github/review-policy.yml'),
                                    '--materialize-default'], env=environment,
                                   cwd=task, text=True, capture_output=True, check=True, timeout=TIMEOUT)
@@ -169,7 +171,15 @@ def merge_preflight(argv, command, tools, task):
     author = policy_data.get('author_identity')
     if not author or author != os.environ.get('GH_AS_AUTHOR_RECORD_IDENTITY'):
         raise ValueError('verified author differs from the governing base policy')
-    normalized = [gh, 'pr', 'merge', pr['url'], '--repo', repo, *command['options']]
+    subprocess.run([tools['bash'], str(task / 'scripts/identity-check.sh'), '--expect-write-identity', author],
+                   env=environment, cwd=task, check=True, timeout=TIMEOUT)
+    # A canonical URL binds the target without forcing --repo for local
+    # forms: gh uses that flag's presence to disable local branch cleanup.
+    normalized = [gh, 'pr', 'merge', pr['url']]
+    if command['repo'] is not None:
+        normalized += ['--repo', repo]
+    normalized += command['options']
+    guard_command = [gh, 'pr', 'merge', pr['url'], '--repo', repo, *command['options']]
     # Existing hook owns CI/merge-state, human stops, reviewer disagreements
     # and native-queue refusal. Scoped existing owner tiebreaks retain their
     # own contract; no caller knob chooses the fresh clearance semantics.
@@ -178,17 +188,25 @@ def merge_preflight(argv, command, tools, task):
             environment[name] = os.environ[name]
     environment.update(GH_AS_AUTHOR_IDENTITY=author, GH_PR_GUARD_EXPECTED_AUTHOR=author,
                        CODEX_CLEARED='1')  # Compatibility with pre-#1609 trusted hooks.
-    payload = json.dumps({'tool_input': {'command': shlex.join(['scripts/gh-as-author.sh', '--', *normalized])}})
+    payload = json.dumps({'tool_input': {'command': shlex.join(['scripts/gh-as-author.sh', '--', *guard_command])}})
     subprocess.run([tools['bash'], str(task / 'scripts/hooks/gh-pr-guard.sh')], input=payload,
                    env=environment, cwd=task, text=True, check=True, timeout=TIMEOUT)
     environment.pop('CODEX_CLEARED', None)
     environment.update(MERGE_CLEARANCE_EXPECTED_HEAD_SHA=head,
                        MERGE_CLEARANCE_EXPECTED_BASE_SHA=base,
                        MERGE_CLEARANCE_EXPECTED_BASE_REF=pr['baseRefName'],
-                       MERGE_CLEARANCE_MATERIALIZE_DEFAULT_POLICY='true')
+                       # Exact-base policy was materialized above into this artifact.
+                       # Reuse it for the default base; the resolver fetches
+                       # nondefault bases and uses this file on confirmed 404.
+                       MERGE_CLEARANCE_MATERIALIZE_DEFAULT_POLICY='false')
     subprocess.run([tools['bash'], str(task / 'scripts/merge-clearance-gate.sh'), number, repo],
                    env=environment, cwd=task, check=True, timeout=TIMEOUT)
-    fresh = read('pr', 'view', pr['url'], '--repo', repo, '--json', fields)
+    fresh = read('pr', 'view', pr['url'], '--repo', repo, '--json', fields + ',labels')
+    labels = fresh.pop('labels')
+    if not isinstance(labels, list) or any(not isinstance(label, dict) or not isinstance(label.get('name'), str) for label in labels):
+        raise ValueError('final blocking labels are unreadable')
+    if {'human-hold', 'needs-human-review', 'policy-violation'} & {label['name'] for label in labels}:
+        raise ValueError('a human-controlled hold is present in the final snapshot')
     if fresh != pr:
         raise ValueError('PR target/head/base/state changed during final clearance')
     return normalized
@@ -198,12 +216,12 @@ def run(marker, argv):
     command = OWNER.merge_command(argv)
     if command and command['action'] == 'deferred':
         raise ValueError('deferred auto-merge is not authorized by a client clearance snapshot')
-    if command and command['action'] == 'ordinary':
-        tools = trusted_tools(argv)
-        with tempfile.TemporaryDirectory(prefix='mergepath-merge-code-') as directory:
-            normalized = merge_preflight(argv, command, tools, Path(directory))
-            return write(marker, normalized)
-    return write(marker, argv)
+    if not command or command['action'] != 'ordinary':
+        raise ValueError('fresh writer accepts ordinary merges only; use gh-as-author.sh for other writes')
+    tools = trusted_tools(argv)
+    with tempfile.TemporaryDirectory(prefix='mergepath-merge-code-') as directory:
+        normalized = merge_preflight(argv, command, tools, Path(directory))
+        return write(marker, normalized)
 
 
 def write(marker, argv):

@@ -236,10 +236,27 @@ fi
 # it can neither carry the write nor receive the PAT (see gh-token-resolver.sh).
 run_with_author_token() {
   unset GITHUB_TOKEN
-  GH_TOKEN="$TOKEN" GH_AS_AUTHOR_RECORD_IDENTITY="$AUTHOR" \
-    GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
-    GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
-    python3 "$ROOT/scripts/workflow/merge-writer.py" "$TRACE_MARKER" "$@"
+  # Classify actual argv through the same parser used by scoped admin
+  # preparation. Only ordinary/deferred merges enter the fresh runtime;
+  # other author writes keep their established direct transport and trace.
+  MERGE_PAYLOAD_ACTION=$(python3 "$ROOT/scripts/workflow/owner-admin-override.py" classify "$@") || return $?
+  case "$MERGE_PAYLOAD_ACTION" in
+    ordinary|deferred)
+      GH_TOKEN="$TOKEN" GH_AS_AUTHOR_RECORD_IDENTITY="$AUTHOR" \
+        GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+        GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+        python3 "$ROOT/scripts/workflow/merge-writer.py" "$TRACE_MARKER" "$@"
+      return $?
+      ;;
+    ""|admin|retraction) ;;
+    *) echo "gh-as-author: unknown merge classification; refusing the write." >&2; return 2 ;;
+  esac
+  if [ -n "$TRACE_MARKER" ] && ! : >"$TRACE_MARKER"; then
+    echo "gh-as-author: cannot write the trace marker $TRACE_MARKER; refusing to run the write unrecorded." >&2
+    exit 70
+  fi
+  GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+    GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" "$@"
 }
 
 # Every admin merge records its scoped owner instruction before the write.
