@@ -85,7 +85,7 @@ Rules that come up repeatedly:
 
 ### Stop conditions
 
-A spent Codex request ceiling (`CAP_EXHAUSTED`, `kind: request-ceiling`) is cost exhaustion, not a reason to park: route the PR to Phase 4b as REVIEW_POLICY.md directs, and let the Phase 4b barrier decide whether to dispatch the adapter or stop for a human tiebreaker.
+A spent Codex request ceiling (`CAP_EXHAUSTED`, `kind: request-ceiling`) is cost exhaustion, not a reason to park: route the PR to Phase 4b as REVIEW_POLICY.md directs. When `phase_4b_automation.enabled` is true, run the automated leg and let its barrier decide whether to dispatch the adapter or stop for a human tiebreaker; when it is false or absent, use the manual Phase 4b CLI handoff.
 
 Park a PR and move to other work, recording why in the ledger and on the PR, when any of these happen:
 
