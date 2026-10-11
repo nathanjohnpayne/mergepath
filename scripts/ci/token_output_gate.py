@@ -207,6 +207,8 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     Timing/history formats, mail-arrival paths and default cd paths likewise
     stay conservative as finite managed targets. The noninteractive corpus
     declares mail-arrival checks separately from an independent PTY oracle.
+    PWD can supply an interactive directory prompt even when noninteractive
+    pwd ignores its assigned value; both points are explicit conservative cases.
     Credential-bearing prefixes were also missed by the parent scanner;
     their diagnostic check here is limited to attached-option assignments.
     Numeric-conversion diagnostics from the separate assignment form remain
@@ -2659,7 +2661,7 @@ _PRINTF_SPECIAL_TARGETS = frozenset({
     "LC_NUMERIC", "LC_TIME", "LINENO", "LINES", "MAILCHECK", "OPTIND", "PPID",
     "RANDOM", "SECONDS", "SHLVL", "SRANDOM", "TMOUT", "UID", "PIPESTATUS",
     "PS0", "PS1", "PS2", "PS3", "PS4", "PROMPT_COMMAND",
-    "TIMEFORMAT", "HISTTIMEFORMAT", "HOME", "CDPATH", "OLDPWD", "MAIL", "MAILPATH",
+    "TIMEFORMAT", "HISTTIMEFORMAT", "HOME", "CDPATH", "OLDPWD", "MAIL", "MAILPATH", "PWD",
     "FUNCNAME", "GROUPS", "DIRSTACK",
 })
 
@@ -5583,6 +5585,21 @@ CORPUS = [
         "printf -vout '%s' harmless >\"./absent/$GH_TOKEN\"\n",
     ),
     (
+        'printf-v-managed-pwd-prompt',
+        MUST_FLAG,
+        'PS1=\'\\w> \'\nprintf -vPWD \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-managed-pwd-noninteractive-point',
+        MUST_FLAG,
+        'ln -s . "$GH_TOKEN"\nprintf -vPWD \'%s\' "$GH_TOKEN"\npwd\n',
+    ),
+    (
+        'printf-v-managed-ordinary-pwd-prompt',
+        MUST_NOT_FLAG,
+        'PS1=\'\\w> \'\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
         'printf-v-managed-timeformat',
         MUST_FLAG,
         'printf -vTIMEFORMAT \'%s\' "$GH_TOKEN"\ntime :\n',
@@ -7077,6 +7094,17 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    "printf-v-managed-pwd-prompt": (
+        "interactive directory-prompt expansion can print the assigned PWD; "
+        "the standard oracle is noninteractive, while an echo-disabled PTY "
+        "with an environment-only fake sentinel measures the leak and keeps "
+        "an ordinary-target control clean"
+    ),
+    "printf-v-managed-pwd-noninteractive-point": (
+        "noninteractive pwd can print the actual directory without the assigned "
+        "fake value; PWD remains conservative because the same assignment can "
+        "supply an interactive directory prompt, measured by the PTY oracle"
+    ),
     "printf-v-managed-mail": (
         "interactive mail-arrival checks can automatically print the assigned "
         "path; the standard oracle is noninteractive, while an echo-disabled "
