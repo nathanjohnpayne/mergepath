@@ -33,9 +33,12 @@ codex:
     enabled: true
 '''
 STUB = r'''#!/usr/bin/env python3
-import json, pathlib, sys
+import json, os, pathlib, sys
 root = pathlib.Path(__file__).resolve().parent.parent
 state = json.loads((root/'state.json').read_text())
+config_dir=os.environ.get('GH_CONFIG_DIR')
+config=pathlib.Path(config_dir)/'config.yml' if config_dir else None
+socket_override=bool(config and config.exists() and 'http_unix_socket' in config.read_text())
 args = sys.argv[1:]
 if state.get('require_lower_proxy') and args[:2] != ['api','user'] and not __import__('os').environ.get('https_proxy'): sys.exit(98)
 with (root/'calls.jsonl').open('a') as out: out.write(json.dumps(args)+'\n')
@@ -45,6 +48,8 @@ url='https://github.com/example/repo/pull/123'
 labels=state.get('labels',['needs-external-review'])
 clearance_files_read='repos/example/repo/pulls/123/files' in (root/'calls.jsonl').read_text()
 if args[:2] == ['pr','merge']:
+    if state.get('require_private_config_writer') and socket_override: sys.exit(97)
+    with (root/'writer-config.txt').open('w') as out: out.write(config_dir or '')
     with (root/'writes.jsonl').open('a') as out: out.write(json.dumps(args)+'\n')
     sys.exit(0)
 if args[:2] == ['pr','view']:
@@ -62,6 +67,7 @@ if args[:2] == ['pr','view']:
     sys.exit(0)
 if not args or args[0]!='api': sys.exit(99)
 if 'user' in args: print(state.get('api_identity','nathanjohnpayne')); sys.exit(0)
+if state.get('require_cert_dir') and not os.environ.get('SSL_CERT_DIR'): sys.exit(98)
 endpoint=next((a for a in args[1:] if a=='graphql' or a.startswith('repos/')), '')
 if endpoint=='graphql':
     if any('reviewThreads' in a for a in args):
@@ -98,7 +104,7 @@ if endpoint.startswith('repos/example/repo/commits/'):
     print('2026-09-14T00:00:00Z'); sys.exit(0)
 if endpoint.endswith('/reviews'):
     reviews=[dict(id=1,user=dict(login='nathanpayne-claude'),state='APPROVED',commit_id=head,
-                  submitted_at='2026-09-14T00:05:00Z',body='<!-- mergepath-p4b-request-generation: '+json.dumps(state.get('generation',[123]))+' -->')]
+                  submitted_at='2026-09-14T00:05:00Z',body='<!-- mergepath-p4b-request-generation: '+json.dumps([123,124] if state.get('socket_forges_generation') and socket_override else state.get('generation',[123]))+' -->')]
     if state.get('disagreement') or state.get('late_disagreement') and clearance_files_read: reviews.append(dict(id=2,user=dict(login='nathanpayne-codex'),state='CHANGES_REQUESTED',commit_id='d'*40))
     emit([reviews] if '--slurp' in args else reviews); sys.exit(0)
 if endpoint.endswith('/issues/123/comments'):
@@ -258,6 +264,29 @@ class WriterTests(unittest.TestCase):
     def test_lowercase_proxy_transport_is_preserved(self):
         self.state={'generation':[123,124],'require_lower_proxy':True}
         result=self.run_writer(https_proxy='http://fixture.proxy.invalid:8080')
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+
+    def caller_socket_config(self):
+        directory=self.candidate/'caller-gh-config';directory.mkdir()
+        (directory/'config.yml').write_text('http_unix_socket: /caller/socket\n')
+        return str(directory)
+
+    def test_caller_gh_config_cannot_forge_trusted_clearance(self):
+        self.state={'socket_forges_generation':True}
+        self.assert_blocked(self.run_writer(GH_CONFIG_DIR=self.caller_socket_config()),'outside the request generation')
+
+    def test_final_native_writer_uses_private_empty_gh_config(self):
+        directory=self.caller_socket_config()
+        self.state={'generation':[123,124],'require_private_config_writer':True}
+        result=self.run_writer(GH_CONFIG_DIR=directory)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        actual=(self.path/'writer-config.txt').read_text()
+        self.assertNotEqual(actual,directory)
+        self.assertEqual(Path(actual).name,'.gh-config')
+
+    def test_certificate_directory_transport_is_preserved(self):
+        self.state={'generation':[123,124],'require_cert_dir':True}
+        result=self.run_writer(SSL_CERT_DIR=str(self.path/'operator-ca-dir'))
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
 
     def test_missing_base_policy_fallback_uses_immutable_source(self):

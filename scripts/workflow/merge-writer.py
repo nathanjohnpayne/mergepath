@@ -35,8 +35,8 @@ def clean_environment():
     # Explicit transport/runtime values only. No inherited checker/config/skip,
     # shell startup, Python/Node injection, Git redirects or exported functions.
     names = ('PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'GH_TOKEN',
-             'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'GH_CONFIG_DIR',
-             'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy', 'SSL_CERT_FILE')
+             'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN',
+             'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy', 'SSL_CERT_FILE', 'SSL_CERT_DIR')
     return {key: os.environ[key] for key in names if key in os.environ}
 
 
@@ -128,6 +128,11 @@ def download_code(gh, endpoint, environment, archive):
 
 def merge_preflight(argv, command, tools, task):
     environment = clean_environment()
+    # An inherited gh config can replace HTTPS with http_unix_socket.
+    # Use an empty private config for every trusted read and the writer.
+    config_dir = task / '.gh-config'
+    config_dir.mkdir()
+    environment['GH_CONFIG_DIR'] = str(config_dir)
     gh = tools['gh']
     tool_dir = task / '.toolchain'
     tool_dir.mkdir()
@@ -240,7 +245,7 @@ def merge_preflight(argv, command, tools, task):
         raise ValueError('a human-controlled hold is present in the final snapshot')
     if fresh != pr:
         raise ValueError('PR target/head/base/state changed during final clearance')
-    return normalized
+    return normalized, environment
 
 
 def run(marker, argv):
@@ -251,18 +256,18 @@ def run(marker, argv):
         raise ValueError('fresh writer accepts ordinary merges only; use gh-as-author.sh for other writes')
     tools = trusted_tools(argv)
     with tempfile.TemporaryDirectory(prefix='mergepath-merge-code-') as directory:
-        normalized = merge_preflight(argv, command, tools, Path(directory))
-        return write(marker, normalized)
+        normalized, environment = merge_preflight(argv, command, tools, Path(directory))
+        return write(marker, normalized, environment)
 
 
-def write(marker, argv):
+def write(marker, argv, environment):
     if marker:
         try:
             Path(marker).write_bytes(b'')
         except OSError:
             print('gh-as-author: cannot write the trace marker; refusing the write unrecorded.', file=sys.stderr)
             return 70
-    return subprocess.call(argv)
+    return subprocess.call(argv, env=environment)
 
 
 if __name__ == '__main__':
