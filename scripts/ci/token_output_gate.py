@@ -196,9 +196,10 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     and `printf -vNAME` assign only in option position before the format and
     before `--`; the same spellings after the format are data and emit.
     Attached forms retain conservative output verdicts for external or
-    detected helper commands, changed builtin availability (`enable`), and
-    numeric, dynamic or unknown formats. Repeated assignment options and the
-    option delimiter are parsed before inspecting the format.
+    locally defined commands/prefixes, query modifiers, changed builtin
+    availability (`enable`, aliases or opaque setup), credential-bearing
+    redirections, and numeric, ANSI-C, expanded or unknown formats. Repeated
+    assignment options and the option delimiter precede the inspected format.
     Numeric-conversion diagnostics from the separate assignment form remain
     the #1461 gap, unchanged by the option-position repair (#1645).
   * An in-file message helper: a function whose body writes one of its own
@@ -2514,6 +2515,10 @@ def resolve_command(seg):
                     idx += 1
                     continue
                 if nlit.startswith("-"):
+                    # `command -v/-V` reports names instead of invoking printf.
+                    # Only its ordinary -p modifier preserves this exemption.
+                    if (base in ("command", "time") and nlit != "-p") or base == "builtin":
+                        seg._cmd_external = True
                     # env -u NAME / -C DIR / timeout -s SIG take an argument
                     if base == "env" and nlit in ("-u", "-C", "--unset", "--chdir"):
                         idx += 2
@@ -2617,14 +2622,29 @@ def tee_file_operands(seg):
     return files
 
 
-def _printf_nondiagnostic_format(literal):
+def _printf_nondiagnostic_format(raw, literal):
     """Literal text/string formats cannot diagnose a numeric token operand."""
-    if literal is None:
-        return False
+    if literal is None or "$'" in raw or _command_word_expands(raw):
+        return False  # ANSI-C escapes are not decoded by literal reduction.
     # Unknown conversions and dynamic width/precision retain the prior
     # attached-option conservative verdict rather than suppress diagnostics.
     remainder = re.sub(r"%(?:%|[-+# 0]*[0-9]*(?:\.[0-9]*)?[sbq])", "", literal)
     return "%" not in remainder
+
+
+def _printf_redirection_has_ref(words):
+    """A credential-bearing redirection can diagnose before printf executes."""
+    operand = False
+    for word in words:
+        if operand and _iter_refs(word):
+            return True
+        operand = False
+        match = _REDIR_RE.match(word)
+        if match:
+            if _iter_refs(word[match.end():]):
+                return True
+            operand = match.end() == len(word)
+    return False
 
 
 def classify(seg, emitter_helpers):
@@ -2665,7 +2685,8 @@ def classify(seg, emitter_helpers):
             # delimiter, and known builtin availability, before exemption.
             if (assigned and seg._cmd_literal == "printf" and not seg._cmd_external
                     and cmd not in emitter_helpers and option_index < len(args)
-                    and _printf_nondiagnostic_format(args[option_index][1])):
+                    and not _printf_redirection_has_ref(seg.words)
+                    and _printf_nondiagnostic_format(*args[option_index])):
                 return ASSIGN
         return EMIT
     if cmd in EMITTERS:
@@ -3180,17 +3201,22 @@ def discover_emitter_helpers(text):
     # what the fixed point below iterates.
     lexed = {name: Lexer(body) for name, body in bodies.items()}
 
-    # A local printf definition invalidates the new attached-option builtin
-    # exemption even when its body is not a recognized positional emitter.
+    # A local printf or passthrough-prefix definition invalidates the new
+    # attached-option builtin exemption even for a non-emitting body.
     # Retain the parent scanner's conservative verdict on that spelling.
     # `enable` changes builtin availability. Without execution/state dataflow
     # any such operation makes the attached printf exemption uncertain; even
     # a later apparent re-enable is not proof it executed in this shell.
-    availability_changed = any(
-        resolve_command(seg)[0] == "enable"
-        for line in Lexer(text).logical for seg in line.segments
-    )
-    helpers = {"printf"} if "printf" in bodies or availability_changed else set()
+    availability_changed = False
+    for line in Lexer(text).logical:
+        for seg in line.segments:
+            cmd = resolve_command(seg)[0]
+            if cmd in OPAQUE_COMMANDS | {"enable", "alias", UNRESOLVED}:
+                # Opaque setup or aliases may change lookup indirectly. No
+                # execution-state model proves builtin availability afterward.
+                availability_changed = True
+    shadowed = "printf" in bodies or any(name in PASSTHRU for name in bodies)
+    helpers = {"printf"} if shadowed or availability_changed else set()
     # A FIXED POINT, not a fixed number of rounds.  Each round can promote at
     # most one link of a call chain, so a chain longer than the round budget
     # left its outermost helper undiscovered -- `a` calls `b` calls `c` calls
@@ -5234,6 +5260,109 @@ CORPUS = [
         "printf -vout -vother -- '%s' \"$GH_TOKEN\"\n",
     ),
     (
+        "printf-v-command-verbose",
+        MUST_FLAG,
+        "command -V printf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-command-query",
+        MUST_FLAG,
+        "command -v printf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-command-bundled-verbose",
+        MUST_FLAG,
+        "command -pV printf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-builtin-prefix",
+        MUST_NOT_FLAG,
+        "builtin -- printf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-command-shadowed-wrapper",
+        MUST_FLAG,
+        "command() { echo \"$@\"; }\ncommand printf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-builtin-shadowed-wrapper",
+        MUST_FLAG,
+        "builtin() { echo \"$@\"; }\nbuiltin printf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-command-prefix",
+        MUST_NOT_FLAG,
+        "command printf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-command-path-prefix",
+        MUST_NOT_FLAG,
+        "command -p printf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-alias-command-wrapper",
+        MUST_FLAG,
+        "shopt -s expand_aliases\nalias command=echo\n"
+        "command printf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-alias-printf",
+        MUST_FLAG,
+        "shopt -s expand_aliases\nalias printf=echo\n"
+        "printf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-command-noop-wrapper",
+        MUST_FLAG,
+        "command() { :; }\ncommand printf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-alias-noop",
+        MUST_FLAG,
+        "shopt -s expand_aliases\nalias printf=: \n"
+        "printf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-indirect-disabled-builtin",
+        MUST_FLAG,
+        "printf '%s\\n' '#!/usr/bin/env bash' 'echo \"$@\"' > printf\n"
+        "chmod +x printf\nPATH=\"$PWD:$PATH\"\neval 'enable -n printf'\n"
+        "printf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-sourced-disabled-builtin",
+        MUST_FLAG,
+        "printf '%s\\n' '#!/usr/bin/env bash' 'echo \"$@\"' > printf\n"
+        "chmod +x printf\nPATH=\"$PWD:$PATH\"\n"
+        "printf '%s' 'enable -n printf' > setup\n. ./setup\n"
+        "printf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-ansi-numeric-format",
+        MUST_FLAG,
+        "printf -vout $'\\x25d' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-glob-numeric-format",
+        MUST_FLAG,
+        "touch '%d'\nprintf -vout %? \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-ansi-text-format",
+        MUST_FLAG,
+        "printf -vout $'\\x25s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-redirection-failure",
+        MUST_FLAG,
+        "printf -vout '%s' harmless > \"./absent/$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-redirection-failure-glued",
+        MUST_FLAG,
+        "printf -vout '%s' harmless >\"./absent/$GH_TOKEN\"\n",
+    ),
+    (
         "printf-v-disabled-builtin",
         MUST_FLAG,
         "printf '%s\\n' '#!/usr/bin/env bash' 'echo \"$@\"' > printf\n"
@@ -6552,6 +6681,22 @@ KNOWN_BROADER = {
         "a local printf definition prevents assuming Bash builtin assignment "
         "semantics, even when this fixture's function writes nothing; retain "
         "the parent attached-option conservative verdict"
+    ),
+    "printf-v-command-query": (
+        "command -v is a query rather than a builtin invocation; retain the "
+        "parent attached-option verdict even when this query prints no token"
+    ),
+    "printf-v-ansi-text-format": (
+        "ANSI-C format escapes are not decoded by literal reduction, so retain "
+        "the parent attached-option verdict rather than assume string conversion"
+    ),
+    "printf-v-command-noop-wrapper": (
+        "a locally defined passthrough prefix prevents proving builtin lookup, "
+        "even when its body is a no-op; retain the parent attached-option verdict"
+    ),
+    "printf-v-alias-noop": (
+        "an alias can replace the command before lookup; without execution-state "
+        "proof retain the parent attached-option verdict even for a no-op alias"
     ),
     "printf-v-attached-dynamic-format": (
         "a dynamic format may diagnose a numeric token operand; this fixture "
