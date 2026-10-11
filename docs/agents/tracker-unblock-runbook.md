@@ -1,0 +1,171 @@
+# Runbook: Unblocking Downstream Trackers
+
+How to run a multi-ticket session whose goal is to unblock one or more consumer-repo trackers through Mergepath work: refresh the live scope, deliver canonical fixes and their reviewed propagation, verify consumer acceptance, and leave honest evidence on every tracker.
+
+**This runbook sequences existing rules. It does not create new ones.** [REVIEW_POLICY.md](../../REVIEW_POLICY.md), `.github/review-policy.yml`, [AGENTS.md](../../AGENTS.md) and the `docs/agents/` files it indexes are the authority. Where this file disagrees with them, they win and this file is out of date. A session prompt that points here should supply only what is specific to the run: the trackers, the starting scope, dated context, owner decisions, authorizations, and limits (see [§ What the session prompt supplies](#what-the-session-prompt-supplies)).
+
+## 1. Session start
+
+1. **Read the authority first.** Read `AGENTS.md`, the `docs/agents/` files it lists, `REVIEW_POLICY.md`, `.github/review-policy.yml`, [templated-propagation.md](templated-propagation.md), [propagation-ordering.md](propagation-ordering.md), [high-priority-scope-discipline.md](high-priority-scope-discipline.md) for `priority:high` tickets, and any nested instructions under the paths you will touch.
+2. **Verify the checkout.** Check the root (`git rev-parse --show-toplevel`), the `origin` URL, the branch, and write permission. Work only in worktrees placed per [worktree-placement.md](worktree-placement.md). Use `git -C <worktree>` rather than `cd`, because absolute-path edits from a nested worktree can land in the main checkout.
+3. **Verify identity and signing.** Run `scripts/identity-check.sh`. Confirm that `git config user.signingkey` resolves and that a test commit verifies as `nathanjohnpayne`.
+4. **Warm credentials once.** Run `eval "$(scripts/op-preflight.sh --agent claude --mode review)"`. Before every later credentialed call, revalidate with `eval "$(scripts/op-preflight.sh --agent claude --check --print-exports)"`, which never prompts. Never print token values, and never change the gh keyring's active account.
+5. **Find other sessions before touching shared state.** The preflight cache is keyed per agent (`op-preflight-claude.env`), so every Claude session on this machine shares it. List active sessions (`ListAgents` or the app's session list). Refresh the live ownership of any PRs or issues the prompt says another session owns: their author, latest pushes, labels and open comments. Do not alter another session's PRs, branches, holds, review budgets or cache.
+
+## 2. Building the work set
+
+Rebuild the scope from live GitHub. Treat the prompt's issue list as a starting point, not as the current state.
+
+For each candidate issue, read:
+
+- the full body and **all** comments (paginate; `gh pr view --json` silently caps connections at 100);
+- linked owner decisions, including decisions recorded in comments and surfaced per [decision-records.md](decision-records.md);
+- project fields: priority, size, implementation model, reasoning effort;
+- dependencies (`gh api repos/<o>/<r>/issues/<n>/dependencies/blocked_by`), sub-issues, and `human-hold` or other blocking labels;
+- existing PRs (open, merged and closed) and their merge state.
+
+Then compare the current canonical source against each reported weakness. Classify every open ticket into exactly one **remaining-work class**:
+
+| Class | Meaning | Typical disposition |
+| --- | --- | --- |
+| `implement` | The canonical fix is missing or incomplete | Canonical PR |
+| `propagate` | The canonical fix has merged, but consumers lack it | Reviewed propagation PR |
+| `verify` | Consumers have it, but acceptance evidence has not been recorded | Verification comment; close the criteria actually met |
+| `owner` | Blocked on a decision only the owner can make | Propose-only (§ 4) |
+| `credential` / `external` | Blocked on a human credential, setting, rotation or deployment action | Prepare the evidence and the exact ask; do not perform it |
+
+Reuse existing fixes, PRs and tracking issues. Never build a second competing implementation of something that already has a canonical owner issue.
+
+### Work table
+
+Present one compact table before you start executing, and update it at each batch boundary:
+
+| Issue | Priority / impact | Class | Remaining size | Depends on / holds | Model | Effort | Disposition |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+
+## 3. Ordering and concurrency
+
+- **Order:** priority tier first; within a tier, smallest remaining size first; dependencies override both.
+- **Concurrency:** at most **two** PRs in review at once, and exactly one merge at a time. Start the next ticket while a PR waits on review or CI, but do not open a third. Each additional open PR multiplies rebases, expired approvals and spend against the shared token budgets (`GITHUB_TOKEN` 1k/hr/repo, PAT 5k/hr/account).
+- **Model and effort:** use the ticket's project fields. A session cannot change its own model, so when a ticket specifies a different model or effort, delegate that ticket's implementation to a subagent configured with it. When a field is unset, keep the session's setting. When a specified setting is unavailable, record the mismatch in the ledger, ask once, and continue other work.
+
+## 4. Owner decisions: propose, don't implement
+
+Some tickets require an owner decision, for example a change to merge authorization or a security model choice. For those:
+
+1. Write the decision proposal on the issue: options, recommendation, and the evidence that would distinguish them. Use the top-of-body callout convention from [decision-records.md](decision-records.md) once a decision exists.
+2. Mark the ticket `owner` in the work table and the ledger.
+3. Do not implement dependent work speculatively. Continue with other actionable tickets.
+
+A stronger reviewer model, a prompt warning or a schema validation is not a substitute for an owner decision, and it is not evidence of an independent authorization source.
+
+## 5. The per-PR loop
+
+Follow REVIEW_POLICY.md's workflow. The scripts it relies on are:
+
+| Step | Script |
+| --- | --- |
+| Author writes (create, edit, comment, merge) | `scripts/gh-as-author.sh -- gh …` |
+| Reviewer writes | `GH_AS_REVIEWER_IDENTITY=nathanpayne-claude scripts/gh-as-reviewer.sh -- gh …` |
+| Should CodeRabbit be invoked? | `scripts/coderabbit-should-invoke.sh` |
+| Wait out a CodeRabbit window | `scripts/coderabbit-wait.sh` (sleep only the remaining `retry_after` window) |
+| Request Codex | `scripts/codex-review-request.sh <PR#>` (never hand-roll the `@codex review` trigger) |
+| Read the Codex verdict | `scripts/codex-review-check.sh <PR#>` |
+| Record per-finding verdicts | `scripts/codex-record-feedback.sh`, `scripts/coderabbit-record-feedback.sh` |
+| Complete-history accounting | `scripts/review-feedback-accounting.sh <PR#>` (require exit `0` and `posted == accounted`) |
+| Resolve threads | REVIEW_POLICY.md § Pre-Merge Review Conversation Gate (`scripts/resolve-pr-threads.sh`) |
+| Automated Phase 4b | `scripts/phase-4b-review.sh <PR#> --repo <o/r>`, **only** from a trusted main-ref checkout and only when policy enables it |
+
+Rules that come up repeatedly:
+
+- Disposition each finding in real time: reply, then fix, record and resolve. Do not batch them at the end of a round.
+- Do not infer a completed CodeRabbit review from a mutable summary's assessment marker. Do not retry a refusing provider before its `retry_after` window has elapsed.
+- Treat a Phase 4b `HELD` result as a bounded wait. Treat a human-tiebreaker outcome as a required decision.
+- Never reset review counters, and never restart an exhausted loop without an explicit owner decision.
+
+### Stop conditions
+
+Park a PR and move to other work, recording why in the ledger and on the PR, when any of these happen:
+
+- an escalation signal from REVIEW_POLICY.md fires (repeat-after-rebuttal, runaway or a blocking-review ceiling);
+- the policy's Codex round budget is spent;
+- the PR needs a decision that § 4 classifies as an owner decision;
+- review findings are enlarging the contract rather than finding defects in it (see [high-priority-scope-discipline.md](high-priority-scope-discipline.md)).
+
+## 6. Immediately before every merge
+
+Do every step, every time, even if you just did it:
+
+1. Read the live full head SHA.
+2. Confirm the required approvals exist **on that head**.
+3. Confirm every required check source is green on that head. The newest run of **each** lineage must pass, and a check that never reported is not passing.
+4. Confirm there are no `human-hold` or other blocking labels.
+5. Run both feedback recorders, then `scripts/review-feedback-accounting.sh`, and require `posted == accounted`.
+6. Run the Pre-Merge Review Conversation Gate and require zero unresolved conversations. Resolve actioned bot threads and accepted registered-agent threads only through the identity-checked paths. Never resolve or alter human-authored conversations, and never remove `human-hold`.
+7. Merge: `scripts/gh-as-author.sh -- gh pr merge <PR#> --squash --delete-branch --match-head-commit <full-head-sha>`.
+
+### Break-glass
+
+`--admin` requires an explicit human authorization in chat (REVIEW_POLICY.md step 18a). A session prompt may pre-authorize it only for stuck workflow infrastructure, and only after every non-infrastructure gate above is satisfied. When you use it:
+
+- bind the authorization to the exact PR number and full head SHA;
+- record the evidence in a top-of-body callout on the PR: the failing workflow run URLs, the approvals on that head, and a link to the authorization;
+- explain the precise reason on any policy-violation ticket that the action creates.
+
+Break-glass never waives a real source failure, a required finding, a human hold or an escalation decision.
+
+## 7. Security work: what counts as evidence
+
+| Claim | Not sufficient on its own |
+| --- | --- |
+| A consumer is remediated | A canonical merge. You need the consumer's propagated revision plus a verified behavior check. |
+| Live credential exposure is remediated | A hub-only audit, or an environment-only scrub (on-disk caches can remain readable) |
+| A Security Cloud finding is fixed | Source reproduction. Record the evidence and leave the finding's status to its owner. |
+| Resistance to a hostile diff | A stronger model, a prompt warning or schema validation |
+
+Use safe adversarial fixtures with fake credentials. Keep fixtures scanner-clean, because a realistic `ghp_` string reds the whole fleet. Never run a live exploit, rotate a credential, deploy to production, run a paid API experiment, change a repository setting or weaken review policy without human authorization; prepare the concrete evidence and the proposal instead.
+
+## 8. Propagation
+
+Implement shared tooling at the canonical Mergepath source, and deliver consumer changes through the reviewed propagation path in [templated-propagation.md](templated-propagation.md). Read each consumer's current instructions before changing it. Never hand-edit generated mirrors, and never commit on a mirror branch. Per-repository-owned files such as a consumer's `REVIEW_POLICY.md` are not covered by propagation. A guard over them must scan the consumer corpus, and its migration findings must preserve legitimate fixture identity setup and explicit exemptions.
+
+## 9. The ledger
+
+Keep one durable ledger per run as a single comment on the run's primary tracker issue, edited in place. Its first line is `Run ledger: <session start date>`. It must not contain credentials or private job-search content. It records:
+
+- the dependency closure and the class of each ticket;
+- source and consumer revisions (SHA-pinned);
+- decisions, with links to where each was recorded;
+- acceptance coverage per criterion: met (with evidence link), unmet, or owner/credential-blocked;
+- per PR: full head, review state, CI state, and the next useful check time;
+- feedback dispositions that remain open;
+- merged results, and the rollout or owner actions that remain.
+
+## 10. Batch boundaries and reporting
+
+After each batch's PRs are confirmed merged:
+
+1. Run `scripts/op-preflight.sh --agent claude --check`.
+2. **If valid:** refresh the live closure, update the work table and ledger, and continue with the next actionable batch without asking.
+3. **If missing, stale or invalid:** pause credential-dependent work and report what is done, what is outstanding, and the exact human action needed. Do not re-warm credentials without the human present.
+
+Send a short update when a PR opens, when it merges, when a blocker appears, and at each batch boundary. Stay quiet otherwise.
+
+## 11. Session end
+
+1. Update the upstream and downstream trackers with linked, current evidence. Close a downstream tracker only when its consumer criteria are verified.
+2. Sync `main`. Preserve recovery evidence, including any necessary ignored files, before cleanup.
+3. Remove only the worktrees and branches this task created (`scripts/worktree-cleanup.sh` audits candidates).
+4. Finalize the credential cache **only if no other Claude session is active**. `scripts/op-preflight.sh --agent claude --purge` deletes the cache that every Claude session shares. Never use `--purge-all`.
+
+## What the session prompt supplies
+
+A prompt that points here should contain only:
+
+- the downstream trackers, and the starting Mergepath issue list;
+- dated context to revalidate ("as of YYYY-MM-DD");
+- owner decisions already made, and which tickets are propose-only;
+- authorizations (implementation, PRs, propagation, merges, and any scoped break-glass);
+- limits: maximum merged PRs or a time box, and anything explicitly out of scope;
+- other sessions' owned PRs or issues to avoid;
+- where the ledger lives, if not on the primary tracker.
