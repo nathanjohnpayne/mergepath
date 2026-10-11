@@ -1329,8 +1329,8 @@ scan_unscoped_identity_writes() {
     # `git` writes, and rejecting a leading slash waved both of them
     # through. The word still has to BE `git` and be followed by
     # optional matching shell quote and whitespace, so `.git/config`,
-    # `github`, and `mygit` do not match. Quoted command words (`"git"`
-    # and a quoted path-qualified Git word) are executable invocations too; `\047`
+    # `github`, and `mygit` do not match. Literal executable words are
+    # normalized after shell dequoting, including ordinary escapes; `\047`
     # spells a single quote without ending this shell-quoted awk program.
     function is_git_config(s) {
       return (s ~ /(^|[^-A-Za-z0-9_.])git["\047]?[[:space:]]+([^[:space:]]+[[:space:]]+)*config([[:space:]]|$)/)
@@ -1401,8 +1401,8 @@ scan_unscoped_identity_writes() {
     # A key quoted in PART (`user.\047email\047`, `"user".email`,
     # `us"er".email`) or escaped in part (`us\\er.email`) is handled by
     # working on WORDS rather than a single regular expression: the piece
-    # is split on whitespace into its command-line words (the same
-    # boundary the comment above already relies on), and each word is put
+    # is split into literal words with quoted/escaped blanks preserved,
+    # and each word is put
     # through `dequote_word` below before the comparison against the five
     # protected keys. Comparing the DEQUOTED WORD for EXACT equality is
     # what keeps the subsection class shut: quoting is only ever removed
@@ -1477,6 +1477,35 @@ scan_unscoped_identity_writes() {
       if (state != 0) return ""
       return out
     }
+    # End of one literal shell word. Preserve quoted blanks/operators and
+    # escapes; expansions and runtime executable lookup are not evaluated.
+    function word_end(s, start,   i, c, quote) {
+      quote = ""
+      for (i = start; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\\" && quote != "\047") { i++; continue }
+        if (quote != "") {
+          if (c == quote) quote = ""
+        } else if (c == "\047" || c == "\"") quote = c
+        else if (c ~ /[[:space:]()<>]/) break
+      }
+      return i
+    }
+    # Normalize only complete words that dequote to Git or a path to Git.
+    # Keeping the rest of the source unchanged retains option/key parsing.
+    function literal_git_words(s,   i, end, word, dq, out) {
+      out = ""; i = 1
+      while (i <= length(s)) {
+        if (substr(s, i, 1) ~ /[[:space:]()<>]/) {
+          out = out substr(s, i, 1); i++; continue
+        }
+        end = word_end(s, i)
+        word = substr(s, i, end - i); dq = dequote_word(word)
+        out = out (dq ~ /(^|\/)git$/ ? "git" : word)
+        i = end
+      }
+      return out
+    }
     function key_assign_pos(s,   n, i, start, end, word, dq, rest) {
       n = length(s)
       i = 1
@@ -1484,7 +1513,8 @@ scan_unscoped_identity_writes() {
         while (i <= n && substr(s, i, 1) ~ /[[:space:]]/) i++
         if (i > n) break
         start = i
-        while (i <= n && substr(s, i, 1) !~ /[[:space:]]/) i++
+        i = word_end(s, i)
+        if (i == start) { i++; continue }
         end = i - 1
         word = substr(s, start, end - start + 1)
         dq = dequote_word(tolower(word))
@@ -1528,54 +1558,67 @@ scan_unscoped_identity_writes() {
     # The region starts at the LAST `git` word before the key, not at the
     # start of the piece, for the prose case above: what precedes the
     # command is commentary, not its flags.
-    function flag_region(s, keypos,   pre, off, last, t) {
+    function option_operands(word, config) {
+      if (word ~ /^(-c|-C|--git-dir|--config-env|--work-tree|--namespace|--super-prefix)$/) return 1
+      if (!config) return 0
+      if (word ~ /^(-f|--fil(e)?|--blob|-t|--type|--default|--value|--comment|--remove-section)$/) return 1
+      if (word == "--rename-section" || word == "rename-section") return 2
+      return 0
+    }
+    function flag_region(s, keypos,   pre, last, i, end, word, skip, config) {
       pre = substr(s, 1, keypos - 1)
-      last = 0; off = 0; t = pre
-      while (match(t, /(^|[^-A-Za-z0-9_.])git["\047]?[[:space:]]/)) {
-        last = off + RSTART
-        off = off + RSTART + RLENGTH - 1
-        t = substr(t, RSTART + RLENGTH)
+      last = 0; i = 1; skip = 0; config = 0
+      while (i <= length(pre)) {
+        if (substr(pre, i, 1) ~ /[[:space:]()<>]/) { i++; continue }
+        end = word_end(pre, i); word = dequote_word(substr(pre, i, end - i))
+        if (skip) skip--
+        else if (word == "git") { last = i; config = 0 }
+        else {
+          if (word == "config") config = 1
+          skip = option_operands(word, config)
+        }
+        i = end
       }
       # No `git` word before the key at all: keep the whole prefix, the
       # conservative reading (more suppressors, so fewer hits).
       if (last == 0) return pre
       return substr(pre, last)
     }
-    # Explicitly targets some other repository or an out-of-repo scope.
-    # Every pattern is anchored on a token boundary, so a word that
-    # merely CONTAINS one of these spellings is not mistaken for it.
-    function targeted(s) {
-      if (s ~ /(^|[[:space:]])-C([[:space:]]|=)/) return 1
-      if (s ~ /(^|[[:space:]])--git-dir([[:space:]]|=)/) return 1
-      # Git accepts unambiguous long-option prefixes. These are the shortest
-      # prefixes verified against the config parser for the three write scopes.
-      if (s ~ /(^|[[:space:]])--gl(o(b(a(l)?)?)?)?([[:space:]]|$)/) return 1
-      if (s ~ /(^|[[:space:]])--sy(s(t(e(m)?)?)?)?([[:space:]]|$)/) return 1
-      if (s ~ /(^|[[:space:]])(-f|--fil(e)?|--blob)([[:space:]]|=)/) return 1
-      # `-f<path>` is the valid attached-argument form of the short option;
-      # a quote may begin that path in shell source (`-f"$cfg"`).
-      if (s ~ /(^|[[:space:]])-f[^[:space:]=]/) return 1
-      return 0
-    }
-    # Reads and removals are not identity writes. Anchored on token
-    # boundaries for the reason spelled out above flag_region: a bare
-    # substring search for `--get` classified `git config user.email
-    # author--get@example.com` — a write that succeeds — as a read.
-    function not_a_write(s) {
-      if (s ~ /(^|[[:space:]])--get(-[a-z]+)?([[:space:]]|=|$)/) return 1
-      if (s ~ /(^|[[:space:]])--list([[:space:]]|$)/) return 1
-      if (s ~ /(^|[[:space:]])--unset(-all)?([[:space:]]|$)/) return 1
-      if (s ~ /(^|[[:space:]])--remove-section([[:space:]]|$)/) return 1
-      if (s ~ /(^|[[:space:]])--rename-section([[:space:]]|$)/) return 1
+    # Scope/read exemptions inspect actual literal option words, never
+    # substrings of quoted values. Skip known option operands before any
+    # classification; attached values stay within their complete word.
+    function safe_option_region(s,   i, end, word, skip, options, config, action) {
+      i = 1; skip = 0; options = 1; config = 0; action = 0
+      while (i <= length(s)) {
+        if (substr(s, i, 1) ~ /[[:space:]()<>]/) { i++; continue }
+        end = word_end(s, i); word = dequote_word(substr(s, i, end - i)); i = end
+        if (skip) { skip--; continue }
+        if (word == "--") { options = 0; continue }
+        if (!options) continue
+        if (word == "config") { config = 1; action = 1; continue }
+        if (word ~ /^(-C|--git-dir)(=|$)/) return 1
+        if (config) {
+          # Unambiguous long scope prefixes keep their existing meaning.
+          if (word ~ /^--gl(o(b(a(l)?)?)?)?$/ || word ~ /^--sy(s(t(e(m)?)?)?)?$/) return 1
+          if (word ~ /^(-f|--fil(e)?|--blob)(=|$)/ || word ~ /^-f[^=]/) return 1
+          if (word ~ /^--get(-[a-z]+)?(=|$)/ ||
+              word ~ /^--(list|unset(-all)?|remove-section|rename-section)$/) return 1
+          if (action && word == "rename-section") return 1
+          if (word !~ /^-/) action = 0
+        }
+        # Separate operands belong to their option even when they look
+        # exactly like a scope/read flag. No expansion is performed.
+        skip = option_operands(word, config)
+      }
       return 0
     }
     function offending_one(s,   keypos, flags) {
+      s = literal_git_words(s)
       if (!is_git_config(s)) return 0
       keypos = key_assign_pos(s)
       if (keypos == 0) return 0
       flags = flag_region(s, keypos)
-      if (targeted(flags)) return 0
-      if (not_a_write(flags)) return 0
+      if (safe_option_region(flags)) return 0
       return 1
     }
     # One logical line can hold SEVERAL commands: `a && b`, `a; b`,
@@ -1588,11 +1631,8 @@ scan_unscoped_identity_writes() {
     # harmless neighbour. So the text is cut at shell command separators
     # and each command is judged on the flags it was actually given.
     #
-    # The cut ignores quoting, which can only split a command that would
-    # otherwise be judged as one: a separator inside a quoted value
-    # leaves the `git config …` head in its own piece, still carrying its
-    # own flags. It never merges two commands into one, which is the
-    # direction that would hide a write.
+    # Quoted/escaped separators are word data. Splitting one in a Git
+    # -c option before config would orphan the executable from its command.
     #
     # In MARKDOWN the backtick is a command boundary too, and it has to
     # be cut on for the same reason. A doc sentence carries no shell
@@ -1611,17 +1651,26 @@ scan_unscoped_identity_writes() {
     # of a doc and runs. Each code span is an independent command to the
     # reader, so it is judged as one here.
     #
-    # Cutting only shrinks pieces, so it can add hits but never hide one.
-    # It cannot orphan a value from its key either: a value opening with
-    # a backtick is already not a value (see writes_identity), so there
-    # is no `git config user.email `…`` form that this splits apart.
-    function offending(s, md,   parts, n, i) {
-      gsub(/[&|;]/, "\034", s)
+    function offending(s, md,   i, c, piece, quote, ansi) {
       if (md) gsub(/`/, "\034", s)
-      n = split(s, parts, "\034")
-      for (i = 1; i <= n; i++)
-        if (offending_one(parts[i])) return 1
-      return 0
+      piece = ""; quote = ""; ansi = 0
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\034" || (quote == "" && c ~ /[&|;]/)) {
+          if (offending_one(piece)) return 1
+          piece = ""; quote = ""; ansi = 0; continue
+        }
+        if (c == "\\" && (quote != "\047" || ansi)) {
+          piece = piece substr(s, i, 2); i++; continue
+        }
+        if (quote != "") {
+          if (c == quote) { quote = ""; ansi = 0 }
+        } else if (c == "\047" || c == "\"") {
+          quote = c; ansi = (c == "\047" && substr(s, i - 1, 1) == "$")
+        }
+        piece = piece c
+      }
+      return offending_one(piece)
     }
     # A backslash-continued line is HALF a command, and neither half
     # matches the patterns above: `git \` carries no `config`, and
@@ -1750,7 +1799,8 @@ scan_unscoped_identity_writes() {
       }
       return out
     }
-    function markdown_html_context(s,   c, width, rest, was_fenced, path, frames, n, i) {
+    function markdown_html_context(s,   c, width, rest, was_fenced, path, frames, n, i, indented, marker_width) {
+      sub(/\r$/, "", s)
       s = markdown_tab_columns(s)
       # Preserve container ORDER: each frame is a quote marker or a list
       # continuation width. Widths are separate so an inner list can end
@@ -1767,25 +1817,45 @@ scan_unscoped_identity_writes() {
         }
         path = path frames[i] " "
       }
-      if (i <= n) fence_char = ""
+      if (i <= n) { fence_char = ""; paragraph = 0 }
       # Once inside a fence, extra quote/list-looking text is code. Outside
       # it, consume alternating prefixes until the actual content begins.
       if (fence_char == "") {
         while (1) {
+          # A thematic break is a block boundary, not nested list markers.
+          if (s ~ /^ ? ? ?((\*[ \t]*){3,}|(-[ \t]*){3,}|(_[ \t]*){3,})$/) break
           if (match(s, /^ ? ? ?> ?/)) {
-            path = path "> "
-          } else if (match(s, /^ ? ? ?([-+*]|[0-9]+[.)]) +/)) {
-            path = path RLENGTH " "
+            path = path "> "; width = RLENGTH
+          } else if (match(s, /^ ? ? ?([-+*]|[0-9]+[.)])( +|$)/)) {
+            width = RLENGTH
+            match(s, /^ ? ? ?([-+*]|[0-9]+[.)])/); marker_width = RLENGTH
+            # Empty first children and runs over four blanks use W+1;
+            # preserve remaining indentation for the code-block decision.
+            if (width - marker_width > 4 || substr(s, width + 1) == "") width = marker_width + 1
+            path = path width " "
           } else break
-          s = substr(s, RLENGTH + 1)
+          s = substr(s, width + 1); paragraph = 0
         }
       }
       container_path = path
       markdown_text = s
       was_fenced = (fence_char != "")
+      # Indented code cannot interrupt an open paragraph. Measure after
+      # container prefixes/tab expansion so list/quote content columns apply.
+      indented = (s ~ /^    /)
+      if (!was_fenced && s ~ /^[ \t]*\r?$/) { paragraph = 0; return 1 }
+      if (!was_fenced && indented && !paragraph) return 0
       sub(/^ ? ? ?/, "", s)
       c = substr(s, 1, 1)
-      if (c != "`" && c != "~") return !was_fenced
+      if (c != "`" && c != "~") {
+        if (!was_fenced) {
+          if (!indented && (s ~ /^#{1,6}([ \t]|$)/ ||
+              s ~ /^((\*[ \t]*){3,}|(-[ \t]*){3,}|(_[ \t]*){3,})\r?$/ ||
+              (paragraph && s ~ /^[-=]+[ \t]*\r?$/))) paragraph = 0
+          else paragraph = 1
+        }
+        return !was_fenced
+      }
       width = 0
       while (substr(s, width + 1, 1) == c) width++
       rest = substr(s, width + 1)
@@ -1796,10 +1866,10 @@ scan_unscoped_identity_writes() {
         return 0
       }
       if (width >= 3 && (c != "`" || index(rest, "`") == 0)) {
-        fence_char = c; fence_width = width
+        fence_char = c; fence_width = width; paragraph = 0
         return 0
       }
-      return 1
+      paragraph = 1; return 1
     }
     function exempt(s, md, html_context,   t) {
       t = s
@@ -1866,7 +1936,7 @@ scan_unscoped_identity_writes() {
     # not absorb the first line of the next file.
     FNR == 1 {
       flush(); fence_char = ""; fence_width = 0
-      container_path = ""
+      container_path = ""; paragraph = 0
     }
     {
       # Every Markdown spelling the file classifier admits, matched the

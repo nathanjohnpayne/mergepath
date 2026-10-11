@@ -2711,6 +2711,243 @@ else
   fail "unmatched-quote dequoting wrong: hits=$N_UNMATCHED_HITS rc=$RC out=$OUT"
 fi
 
+# Case 65n: literal Git executable words dequote exactly, without expanding
+# variables or guessing executable lookup. All snippets below are scan input.
+for GIT_WORD in 'g\it' 'gi\t' 'g"i"t' "g'it'" '/usr/bin/g\it'; do
+  run_on_fixture "tests/literal-git.sh" "$GIT_WORD config user.email leak@example.invalid
+"
+  if [ "$RC" = "1" ]; then
+    pass "literal escaped/partially quoted Git word still reports its writer"
+  else
+    fail "literal Git executable missed: '$GIT_WORD' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "tests/scoped-literal-git.sh" "$GIT_WORD -C \"\$FIXTURE\" config user.email fixture@example.invalid
+"
+  if [ "$RC" = "0" ]; then
+    pass "literal Git word retains explicit fixture target"
+  else
+    fail "scoped literal Git rejected: '$GIT_WORD' rc=$RC out=$OUT"
+  fi
+done
+for GIT_WORD in "'g\it'" '"g\it"' 'notgit' 'git-helper' '$GIT'; do
+  run_on_fixture "tests/not-literal-git.sh" "$GIT_WORD config user.email leak@example.invalid
+"
+  if [ "$RC" = "0" ]; then
+    pass "non-Git/unresolved executable token is not rewritten to Git"
+  else
+    fail "non-Git word overmatched: '$GIT_WORD' rc=$RC out=$OUT"
+  fi
+done
+
+# Case 65o: quoted/escaped command separators before config are option data.
+for VALUE in "'a;b'" '"a&b"' "'a|b'" 'a\;b' '"a ; b"'; do
+  run_on_fixture "tests/quoted-option.sh" "git -c foo.bar=$VALUE config user.email leak@example.invalid
+"
+  if [ "$RC" = "1" ]; then
+    pass "quoted/escaped option separator keeps executable and config together"
+  else
+    fail "option separator hid writer: '$VALUE' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "tests/targeted-quoted-option.sh" "git -c foo.bar=$VALUE -C \"\$FIXTURE\" config user.email fixture@example.invalid
+"
+  if [ "$RC" = "0" ]; then
+    pass "quoted option separator retains explicit repository target"
+  else
+    fail "targeted option data rejected: '$VALUE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "tests/quoted-neighbour.sh" "git -c foo.bar='a;b' -C \"\$FIXTURE\" config user.email fixture@example.invalid; g\\it config user.name leak
+"
+if [ "$RC" = "1" ]; then
+  pass "real separator still isolates neighbouring targeted and unscoped commands"
+else
+  fail "real command boundary suppressed neighbour: rc=$RC out=$OUT"
+fi
+run_on_fixture "tests/quoted-continued.sh" "git -c foo.bar='a;b' \\
+config user.email leak@example.invalid
+"
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'tests/quoted-continued.sh:1:'; then
+  pass "quoted option separator preserves continued-command finding"
+else
+  fail "continued quoted-option writer missed: rc=$RC out=$OUT"
+fi
+run_on_fixture "docs/quoted-spans.md" "Use \`git -c foo.bar='a;b' config --global user.email fixture@example.invalid\`, never \`git -c foo.bar='a;b' config user.email leak@example.invalid\`.
+"
+if [ "$RC" = "1" ]; then
+  pass "quoted shell separators do not merge independent Markdown code spans"
+else
+  fail "Markdown spans merged through quoted option: rc=$RC out=$OUT"
+fi
+
+# Case 65r: scope/read spellings inside complete option-value words are
+# data. Paired real options still exempt, including quoted option tokens.
+for FLAG in --global --system --get --get-all --list --unset --unset-all --remove-section --rename-section; do
+  for QUOTE in "'" '"'; do
+    run_on_fixture "tests/quoted-flag-data.sh" "git -c foo.bar=${QUOTE}a; $FLAG b${QUOTE} config user.email leak@example.invalid
+"
+    if [ "$RC" = "1" ]; then
+      pass "quoted option value containing $FLAG cannot supply scope/read exemption"
+    else
+      fail "quoted data became an option: flag='$FLAG' quote='$QUOTE' rc=$RC out=$OUT"
+    fi
+  done
+  run_on_fixture "tests/real-flag.sh" "git -c foo.bar='a;b' config \"$FLAG\" user.email fixture@example.invalid
+"
+  if [ "$RC" = "0" ]; then
+    pass "complete real scope/read option $FLAG retains exemption"
+  else
+    fail "real quoted option rejected: flag='$FLAG' rc=$RC out=$OUT"
+  fi
+done
+for VALUE in "'a; git -C b'" "'a; git --global b'" "'a; config --get b'"; do
+  run_on_fixture "tests/quoted-command-data.sh" "git -c foo.bar=$VALUE config user.email leak@example.invalid
+"
+  if [ "$RC" = "1" ]; then
+    pass "Git/config words inside quoted data cannot move the option-region start"
+  else
+    fail "quoted command data replaced real prefix: value='$VALUE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  "git --namespace '--global' config user.email leak@example.invalid" \
+  "git --work-tree '--get' config user.email leak@example.invalid" \
+  "git config --type '--global' user.email leak@example.invalid" \
+  "git config set --comment '--get' user.email leak@example.invalid"; do
+  run_on_fixture "tests/option-operand.sh" "$SOURCE
+"
+  if [ "$RC" = "1" ]; then
+    pass "separate option operand cannot masquerade as scope/read flag"
+  else
+    fail "option operand supplied exemption: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "tests/git-directory-operand.sh" 'git -C "git" config user.email fixture@example.invalid
+'
+if [ "$RC" = "0" ]; then
+  pass "repository directory named Git does not replace the executable prefix"
+else
+  fail "Git-named target operand clipped actual -C option: rc=$RC out=$OUT"
+fi
+run_on_fixture "tests/options-ended.sh" 'git config -- "--global" user.email leak@example.invalid
+'
+if [ "$RC" = "1" ]; then
+  pass "option terminator prevents later word from supplying a scope exemption"
+else
+  fail "option data after terminator exempted writer: rc=$RC out=$OUT"
+fi
+
+# Case 65p: the modern rename verb moves a section, not the protected key.
+for ACTION in 'rename-section' '"rename-section"' "'rename-section'" '--rename-section'; do
+  run_on_fixture "tests/rename-section.sh" "git config $ACTION user.email archived
+"
+  if [ "$RC" = "0" ]; then
+    pass "literal modern/legacy rename-section is a nonwrite"
+  else
+    fail "section rename misclassified: '$ACTION' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "tests/rename-neighbour.sh" 'git config rename-section user.email archived; git config user.email leak@example.invalid
+'
+if [ "$RC" = "1" ]; then
+  pass "section rename cannot suppress neighbouring identity assignment"
+else
+  fail "rename suppressed neighbouring writer: rc=$RC out=$OUT"
+fi
+run_on_fixture "tests/rename-value.sh" "git -c foo.bar='config rename-section value' config user.email leak@example.invalid
+"
+if [ "$RC" = "1" ]; then
+  pass "rename-section inside quoted option value is not a subcommand"
+else
+  fail "quoted rename data suppressed writer: rc=$RC out=$OUT"
+fi
+
+# Actual Git oracles run only in a private fixture repo, never caller cwd.
+LITERAL_ORACLE="$WORKDIR/literal-git-oracle"
+git init -q -b main "$LITERAL_ORACLE"
+for SOURCE in "git -c foo.bar='a;b' config user.email fixture@example.invalid" 'g\it config user.email fixture@example.invalid'; do
+  (cd "$LITERAL_ORACLE" && bash -c "$SOURCE")
+  VALUE="$(git -C "$LITERAL_ORACLE" config --local --get user.email)"
+  if [ "$VALUE" = fixture@example.invalid ]; then
+    pass "private Git oracle confirms literal/quoted-option command writes identity"
+  else
+    fail "private Git oracle differed: source='$SOURCE' value='$VALUE'"
+  fi
+  git -C "$LITERAL_ORACLE" config --local --unset-all user.email
+done
+git -C "$LITERAL_ORACLE" config user.email.old fixture
+(cd "$LITERAL_ORACLE" && git config rename-section user.email archived)
+VALUE="$(git -C "$LITERAL_ORACLE" config --local --get user.email || true)"
+RENAMED="$(git -C "$LITERAL_ORACLE" config --local --get archived.old)"
+if [ -z "$VALUE" ] && [ "$RENAMED" = fixture ]; then
+  pass "private Git oracle confirms modern rename leaves protected key unset"
+else
+  fail "private rename oracle differed: protected='$VALUE' renamed='$RENAMED'"
+fi
+
+# Case 65q: indented Markdown code contains literal HTML, including in
+# list/quote containers. Shell exemptions and real comments after code survive.
+for PREFIX in '    ' $'\t' '>     ' '-     ' '1.     ' '> -     '; do
+  run_on_fixture "docs/indented-html.md" "${PREFIX}git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->
+"
+  if [ "$RC" = "1" ]; then
+    pass "HTML marker in indented/container code cannot exempt a writer"
+  else
+    fail "indented code exempted writer: prefix='$PREFIX' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/indented-shell.md" "${PREFIX}git config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+
+"'git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: outside code -->
+'
+  if [ "$RC" = "0" ]; then
+    pass "real shell marker in indented code and outside HTML marker remain valid"
+  else
+    fail "true comment around indented code rejected: prefix='$PREFIX' rc=$RC out=$OUT"
+  fi
+done
+for BEFORE in '# Heading' '- # Heading' '- ' '-' '* * *' '> # Heading'; do
+  INDENT='    '
+  case "$BEFORE" in '- '|'--'|'-'|'- # Heading') INDENT='      ' ;; '> # Heading') INDENT='>     ' ;; esac
+  run_on_fixture "docs/indented-boundary.md" "${BEFORE}
+${INDENT}git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->
+"
+  if [ "$RC" = "1" ]; then
+    pass "heading/empty-item/thematic boundary permits indented code, not HTML exemptions"
+  else
+    fail "indented block boundary missed: before='$BEFORE' rc=$RC out=$OUT"
+  fi
+done
+for BEFORE in 'Paragraph' '- Paragraph' '> Paragraph'; do
+  INDENT='    '
+  case "$BEFORE" in '- Paragraph') INDENT='      ' ;; '> Paragraph') INDENT='>     ' ;; esac
+  run_on_fixture "docs/paragraph-continuation.md" "${BEFORE}
+${INDENT}git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: true paragraph comment -->
+"
+  if [ "$RC" = "0" ]; then
+    pass "four-column indentation cannot interrupt a paragraph; true HTML comment remains valid"
+  else
+    fail "paragraph continuation treated as code: before='$BEFORE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "docs/indented-continued.md" '    git \
+    config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->
+'
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/indented-continued.md:1:'; then
+  pass "continued command in indented code cannot use literal HTML exemption"
+else
+  fail "continued indented writer missed: rc=$RC out=$OUT"
+fi
+run_on_fixture "docs/a-paragraph.md" 'Paragraph
+'
+printf '    git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->\n' > "$WORKDIR/fixture-$FIXTURE_SEQ/docs/b-code.md"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$WORKDIR/fixture-$FIXTURE_SEQ" bash "$CHECK" 2>&1)"; RC=$?
+set -e
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/b-code.md:1:'; then
+  pass "paragraph context resets between Markdown files"
+else
+  fail "paragraph state leaked between files: rc=$RC out=$OUT"
+fi
+
 # ── Linked worktrees: identity lives in every one of them (#806) ───────
 
 # Case 66: `git config --worktree` reads the INVOKING worktree's
