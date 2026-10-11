@@ -126,8 +126,8 @@ set -eu
 n=$(cat "$HB_CASE/feedback-count" 2>/dev/null || printf 0); n=$((n+1)); printf '%s' "$n" > "$HB_CASE/feedback-count"
 printf 'feedback:%s\n' "$n" >> "$HB_CASE/events"
 if [ "$HB_MODE" = feedback ] || { [ "$HB_MODE" = late-feedback ] && [ "$n" -ge 3 ]; }; then printf '{"missing":[]}\n'; exit 1; fi
-# The owner contract deliberately permits the final-accounting request race:
-# the writer posts with the original generation; merge-gate fixtures reject it.
+# The final-accounting request race is caught by the generation-only fence:
+# heartbeat must report refusal without inventing a posted approval.
 if [ "$HB_MODE" = final-accounting-request ] && [ "$n" = 3 ]; then : > "$HB_CASE/new-request"; fi
 printf '{"feedback_policy":{},"findings":[],"missing":[]}\n'
 EOF
@@ -285,7 +285,7 @@ run_case() {
   [ "$(sort -u "$HB_CASE/observed-ids")" = "$id" ] \
     && pass "$mode keeps one identity across live and terminal stages" || fail "$mode changed stage identity"
   case "$mode" in
-    approve|changes|final-accounting-request)
+    approve|changes)
       jq -e '.summary_emitted and .review_posted and .token_count == 123 and .adapter_elapsed_seconds != null and .adapter_started_at_epoch != null' "$record" >/dev/null \
         && pass "$mode final summary and measured adapter timing" || fail "$mode final summary/timing"
       grep -qx posting "$HB_CASE/observed" && grep -qx adapter "$HB_CASE/observed" \
@@ -325,13 +325,16 @@ for storage in good blocked; do
 done
 run_case moved-request 10 barrier,adapter,posting,done
 run_case late-feedback 7 barrier,adapter,posting,done
-run_case final-accounting-request 0 barrier,adapter,posting,done
-# Feedback remains the last request-budget read; the final transition
-# fence checks head history afterward without adopting another request.
-if [ "$(sed '/read:.*timeline/d' "$HB_CASE/events" | sed -n '/^post$/{x;p;};h')" = feedback:3 ] \
-   && jq -er '.body' "$HB_CASE/posted.json" | grep -qxF '<!-- mergepath-p4b-request-generation: [1] -->'; then
-  pass 'late request remains outside original approval generation; feedback remains the last request-budget read before the transition fence'
-else fail 'request-generation race/read order changed'; fi
+run_case final-accounting-request 10 barrier,adapter,posting,done
+# The final fence refuses before the reviewer wrapper, preserving provisional
+# loop identity and pending-record cleanup rather than archiving an approval.
+if [ -e "$HB_CASE/new-request" ] && [ ! -e "$HB_CASE/posted.json" ] \
+   && ! grep -qx post "$HB_CASE/events" \
+   && jq -e '.loop.posted == "not-posted" and .loop.fail_closed.happened' \
+      "$P4B_ACCT_STATE_DIR/phase-4b-loops/fixture-repo-pr1589.jsonl" >/dev/null \
+   && [ ! -e "$P4B_ACCT_STATE_DIR/phase-4b-pending/fixture-repo-pr1589.json" ]; then
+  pass 'final-accounting request refuses without POST and preserves truthful cleanup telemetry'
+else fail 'final-accounting request refusal/cleanup changed'; fi
 
 # Entropy failures preserve both the successful POST/accounting transaction
 # and a writer-boundary refusal with provisional-loop correction. A valid
