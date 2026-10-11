@@ -2639,7 +2639,9 @@ def tee_file_operands(seg):
 
 def _printf_literal(raw, literal):
     """Only already literal, non-expanding shell words enter the allowlist."""
-    if literal is None or "$'" in raw or _command_word_expands(raw):
+    if (literal is None or "$'" in raw
+            or raw.replace("\\\n", "").startswith("~")
+            or _command_word_expands(raw)):
         return False
     try:
         return shlex.split(raw) == [literal]
@@ -8204,6 +8206,17 @@ def _printf_allowlist_cases():
         check("printf -vout '%s' \"${GH_TOKEN}\"\n" % fmt, True)
     for fmt in ("%b", "%q", "%d", "%%", "%4s", "%.2s", "%s%n"):
         check("printf -vout '%s' \"$GH_TOKEN\"\n" % fmt, False)
+    # A bare leading tilde is expanded by Bash, not literal format/value data.
+    for word in ("~", "~/text", "~root", "~+", "~-", "~'%s'"):
+        check("printf -vout " + word + ' "$GH_TOKEN"\n', False)
+        check("printf -vout '%s' " + word + ' "$GH_TOKEN"\n', False)
+    for word in ("'~'", '"~"', r"\~", "''~", "'~'%s"):
+        check("printf -vout " + word + ' "$GH_TOKEN"\n', True)
+        check("printf -vout '%s' " + word + ' "$GH_TOKEN"\n', True)
+    check("HOME='%d'; printf -vout ~ \"$GH_TOKEN\"\n", False)
+    check("printf -vout \\\n~ \"$GH_TOKEN\"\n", False)
+    if _printf_literal("\\\n~", "~"):
+        failures.append("printf literal admitted a continued tilde prefix")
     for value in ("literal", "'literal text'", '"$GH_TOKEN"', '"${GH_TOKEN}"',
                   "'${GH_TOKEN:?literal}'", "'$(literal)'"):
         check("printf -vout '%s' " + value + "\n", True)
