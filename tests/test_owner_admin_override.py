@@ -211,11 +211,14 @@ print(json.dumps(result))
         self.assertEqual(self.run_prepare().returncode, 0)
         posted = json.loads((self.path / 'posted.json').read_text())
         workflow = (ROOT / '.github/workflows/pr-audit.yml').read_text()
-        collection = workflow.split('              let recordedOverride = null;', 1)[1].split('\n            }\n\n            if (violations.length', 1)[0]
+        # The PR-loop closing brace bounds collection independently of any
+        # declarations or conditions added to the later report renderer.
+        collection = workflow.split('              let recordedOverride = null;', 1)[1].split('\n            }\n', 1)[0]
         rendering = workflow.split('              if (recordedOverrides.length > 0) {', 1)[1].split('              body += `\\n---', 1)[0]
         pr = {'number': 123, 'html_url': URL, 'head': {'sha': HEAD}, 'merged_at': '2026-01-01T00:02:00Z'}
         setup = '''const context={repo:{owner:'example',repo:'repo'}};
 const prViolations=[],recordedOverrides=[],violations=[];
+let auditedPRCount=0;
 const hadHumanHold=false,hadPolicyViolation=false,hadHumanLabel=false;
 const authorIdentity='nathanjohnpayne',codexBotLogin='chatgpt-codex-connector[bot]';
 const core={warning:message=>{throw new Error(message)}};
@@ -224,12 +227,13 @@ const github={rest:{issues:{listComments:'comments'},pulls:{listReviews:'reviews
         code = 'const pr=' + json.dumps(pr) + ',posted=' + json.dumps(posted) + ';\n' + setup
         code += '(async()=>{let recordedOverride=null;' + collection
         code += '\nlet body="";if(recordedOverrides.length>0){' + rendering
-        code += '\nconsole.log(JSON.stringify({recordedOverrides,violations,body}));})().catch(e=>{console.error(e);process.exit(1)});'
+        code += '\nconsole.log(JSON.stringify({recordedOverrides,violations,body,auditedPRCount}));})().catch(e=>{console.error(e);process.exit(1)});'
         result = subprocess.run(['node', '-e', code], cwd=ROOT, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)
         self.assertEqual(len(report['recordedOverrides']), 1)
         self.assertEqual(report['violations'], [])
+        self.assertEqual(report['auditedPRCount'], 1)
         self.assertIn('Merge clearance gate', report['body'])
         self.assertIn('authorization record', report['body'])
 
