@@ -1169,10 +1169,10 @@ paths:
   # Pairs with scripts/ci/check_git_identity_hygiene (#777), the guard
   # against a repo-local git identity override silently reattributing and
   # unsigning every commit made from the checkout (and from every worktree
-  # sharing its config). The suite is hermetic — each case builds its own
-  # fixture tree and pivots the check onto it with
-  # MERGEPATH_GIT_IDENTITY_ROOT — so it passes identically on a consumer,
-  # where the check's hub-only static scan is skipped.
+  # sharing its config). Part C scans hub and consumer source alike.
+  # The suite uses hermetic fixtures for that shared scan but also reads
+  # hub-owned REVIEW_POLICY.md prose, so its execution remains hub-only;
+  # consumers still receive it as a self-excluded fixture surface.
   - path: tests/test_git_identity_hygiene.sh
     type: canonical
     consumers: all

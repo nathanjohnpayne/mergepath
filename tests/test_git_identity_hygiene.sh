@@ -15,8 +15,8 @@
 # what extends the "nothing moved .git/config" guarantee to the end of
 # the CI job rather than to the step before its last one.
 #
-# Every case pivots the check onto a fixture tree via
-# MERGEPATH_GIT_IDENTITY_ROOT, so nothing here touches the real repo.
+# Cases use isolated fixture roots or a copied check inside a fixture repo.
+# No fixture setup targets the real repo.
 
 set -euo pipefail
 
@@ -33,16 +33,15 @@ FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
-# Build a fixture tree containing the mergepath hub marker (so Part C's
-# static scan is active) plus one file with the given content, then run
-# the check against it. Sets OUT and RC.
+# Build a markerless consumer fixture plus one file with the given content,
+# then run the shared scan against it. Sets OUT and RC. All Part C cases
+# therefore protect consumers as well as the hub.
 FIXTURE_SEQ=0
 run_on_fixture() {
   local rel="$1" content="$2"
   FIXTURE_SEQ=$((FIXTURE_SEQ + 1))
   local tree="$WORKDIR/fixture-$FIXTURE_SEQ"
   mkdir -p "$tree/scripts" "$tree/$(dirname "$rel")"
-  printf '#!/usr/bin/env bash\n' > "$tree/scripts/sync-to-downstream.sh"
   printf '%s' "$content" > "$tree/$rel"
   set +e
   OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$tree" bash "$CHECK" 2>&1)"
@@ -175,23 +174,75 @@ else
   fail "generated PRD mirror: rc=$RC out=$OUT"
 fi
 
-# Case 10: consumer safety — scripts/ci/ is a propagated kit, and
-# consumers carry bootstrap-frozen copies of the files fixed upstream.
-# Without the mergepath marker the static scan must not run at all.
+# Case 10: consumers need the SAME scan on repo-owned scripts and policy.
+# Use a real index and the production path, without a fixture-root override,
+# to cover tracked enumeration and the separate hub-suite gate together.
 CONSUMER="$WORKDIR/consumer"
-mkdir -p "$CONSUMER/tests"
+mkdir -p "$CONSUMER/scripts/ci" "$CONSUMER/tests" "$CONSUMER/docs/projects/app/prds"
+git init -q -b main "$CONSUMER"
+cp "$CHECK" "$CONSUMER/scripts/ci/check_git_identity_hygiene"
 cat > "$CONSUMER/tests/leaky.sh" <<'EOF'
 #!/usr/bin/env bash
 git config user.email "test@example.com"
 EOF
+cat > "$CONSUMER/REVIEW_POLICY.md" <<'EOF'
+# Frozen consumer policy
+git config user.name "fixture"
+EOF
+# This hub suite must remain excluded from the scan AND never run here.
+cat > "$CONSUMER/tests/test_git_identity_hygiene.sh" <<'EOF'
+#!/usr/bin/env bash
+git config user.email "suite@example.com"
+exit 91
+EOF
+cp "$CONSUMER/REVIEW_POLICY.md" "$CONSUMER/docs/projects/app/prds/app.md"
+git -C "$CONSUMER" add .
 set +e
-OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$CONSUMER" bash "$CHECK" 2>&1)"
+OUT="$(bash "$CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"
 RC=$?
 set -e
-if [ "$RC" = "0" ] && printf '%s' "$OUT" | grep -q "Part C skipped (consumer checkout"; then
-  pass "consumer checkout (no sync-to-downstream.sh): static scan skipped"
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "tests/leaky.sh:2" \
+  && printf '%s' "$OUT" | grep -q "REVIEW_POLICY.md:2" \
+  && ! printf '%s' "$OUT" | grep -q "test_git_identity_hygiene.sh:" \
+  && ! printf '%s' "$OUT" | grep -q "docs/projects/app/prds/app.md:"; then
+  pass "markerless consumer: tracked script and policy writes caught; fixture and generated paths excluded"
 else
-  fail "consumer checkout: rc=$RC out=$OUT"
+  fail "consumer tracked scan: rc=$RC out=$OUT"
+fi
+cat > "$CONSUMER/tests/leaky.sh" <<'EOF'
+#!/usr/bin/env bash
+git -C "$FIXTURE" config user.email "fixture@example.com"
+git config user.name "fixture" # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture subshell
+EOF
+printf '# Policy\nLegacy byte: \377\n`git config user.name <name>`\n' > "$CONSUMER/REVIEW_POLICY.md"
+# Untracked source is not part of the production scan's contract.
+printf 'git config user.email "untracked@example.com"\n' > "$CONSUMER/untracked.sh"
+set +e
+OUT="$(bash "$CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "0" ] \
+  && printf '%s' "$OUT" | grep -q "regression test suite skipped (consumer checkout" \
+  && ! printf '%s' "$OUT" | grep -q "Part C skipped"; then
+  pass "markerless consumer: targeted fixture writes and explicit exemptions pass; hub suite remains skipped"
+else
+  fail "clean consumer with frozen hub-suite fixture: rc=$RC out=$OUT"
+fi
+# The hub marker changes only suite eligibility, not the scanner's verdict.
+# Replace the scan-only input before executing it: suites run from the
+# caller's cwd, so the forbidden fixture command must never be executed.
+printf '#!/usr/bin/env bash\nexit 91\n' > "$CONSUMER/tests/test_git_identity_hygiene.sh"
+printf '#!/usr/bin/env bash\n' > "$CONSUMER/scripts/sync-to-downstream.sh"
+git -C "$CONSUMER" add scripts/sync-to-downstream.sh
+set +e
+OUT="$(bash "$CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "regression test suite failed"; then
+  pass "hub marker: paired regression suite runs and failure is retained"
+else
+  fail "hub suite gate: rc=$RC out=$OUT"
 fi
 
 # Case 11: a backslash continuation between `git` and `config`. Neither

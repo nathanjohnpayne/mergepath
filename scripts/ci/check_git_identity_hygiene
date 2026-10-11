@@ -90,7 +90,7 @@
 #      the config file it was taken from and a run that finds one naming
 #      some other checkout's config leaves it alone.
 #
-#   C. Static scan for the idiom that produces the corruption (HUB-ONLY).
+#   C. Static scan for the idiom that produces the corruption (EVERY repo).
 #      Flags any tracked shell script or Markdown doc that writes one of
 #      the five identity/signing keys through `git config` without
 #      targeting a repository other than the current one (-C, --git-dir,
@@ -175,15 +175,11 @@
 #      `echo "GIT_IDENTITY_SCOPE_EXEMPT: printed"` beside a live write
 #      exempted the write.
 #
-#      Part C is gated on the mergepath marker file
-#      scripts/sync-to-downstream.sh (the check_sync_manifest idiom)
-#      because scripts/ci/ is a propagated kit: consumers carry
-#      bootstrap-frozen copies of REVIEW_POLICY.md and of the fixture
-#      tests fixed here, and nothing propagates those fixes, so a
-#      fleet-wide static scan would turn every consumer's required lint
-#      red for a defect they cannot fix locally. Parts A and B carry the
-#      guarantee that matters everywhere; Part C activates on consumers
-#      once their trees are cleaned up in a follow-up wave.
+#      Part C runs on hub and consumer checkouts alike. Repo-owned docs
+#      such as REVIEW_POLICY.md are not propagated, so the hub cannot
+#      keep their instruction shapes safe through sync alone (#1195).
+#      Generated PRD mirrors and this scanner's own fixture suite remain
+#      excluded; the paired hub regression suite stays marker-gated.
 #
 # On extensions.worktreeConfig: it does NOT prevent this class. It only
 # enables the `--worktree` SCOPE; an unscoped or `--local` write still
@@ -1226,11 +1222,9 @@ EOF
 assert_no_local_identity pre-suite || FAILED=1
 assert_config_unchanged pre-suite || FAILED=1
 
-# ── Part C: static scan for the unscoped-write idiom (hub-only) ───────
+# ── Part C: static scan for the unscoped-write idiom (every repo) ─────
 HUB_MARKER="$REPO_ROOT/scripts/sync-to-downstream.sh"
-if [ ! -f "$HUB_MARKER" ]; then
-  echo "check_git_identity_hygiene: Part C skipped (consumer checkout: scripts/sync-to-downstream.sh absent)"
-else
+scan_unscoped_identity_writes() {
   newtmp scan FILES_LIST
 
   if [ -n "$FIXTURE_ROOT" ]; then
@@ -1313,7 +1307,9 @@ else
   if [ "${#SCAN_FILES[@]}" -gt 0 ]; then
     newtmp hits HITS
     set +e
-    awk -v root="$REPO_ROOT/" '
+    # The command grammar is ASCII. Inspect source bytes consistently even
+    # when a consumer carries a document with invalid locale encoding.
+    LC_ALL=C awk -v root="$REPO_ROOT/" '
     # A `git … config …` invocation somewhere on the line. The optional
     # middle group absorbs global options (`-C dir`, `--git-dir=…`, `-c
     # k=v`) between `git` and the `config` subcommand.
@@ -1801,7 +1797,8 @@ EOF
       FAILED=1
     fi
   fi
-fi
+}
+scan_unscoped_identity_writes
 
 if [ "$FAILED" -ne 0 ]; then
   exit 1
@@ -1829,13 +1826,12 @@ if { [ -n "${MERGEPATH_GIT_IDENTITY_SUITE:-}" ] || [ -z "$FIXTURE_ROOT" ]; } \
   #
   # The MERGEPATH_GIT_IDENTITY_SUITE exemption keeps this off the suite's
   # OWN post-suite cases, which name a stub suite and deliberately build
-  # fixture trees with no marker in order to exercise Part C's skip. Left
+  # fixture trees with no marker to exercise post-suite assertions. Left
   # unexempted, this guard short-circuits those five cases and the
   # post-suite re-assertion silently stops being tested.
   #
-  # Parts A, B and C above still run on a consumer: the live identity
-  # assertion is exactly the #777 protection a consumer needs, and this
-  # leaves it untouched.
+  # Parts A, B and C above run on every consumer. Only the hub suite is
+  # skipped here; consumer-owned scripts and docs have already been scanned.
   if [ -z "${MERGEPATH_GIT_IDENTITY_SUITE:-}" ] && [ ! -f "$HUB_MARKER" ]; then
     echo "check_git_identity_hygiene: regression test suite skipped (consumer checkout: scripts/sync-to-downstream.sh absent)"
     echo "check_git_identity_hygiene: PASS"

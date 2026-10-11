@@ -10,6 +10,7 @@
 # Used by check_spec_test_alignment when the default filename search
 # wouldn't find the test.
 spec_test_map:
+  git_identity_hygiene: tests/test_git_identity_hygiene.sh
   approval_triage:
     - tests/test_self_approval_detector.sh
   yq_bootstrap:
