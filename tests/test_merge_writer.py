@@ -196,6 +196,33 @@ class WriterTests(unittest.TestCase):
         self.assertEqual(len(writes),1)
         self.assertEqual(json.loads(writes[0])[:3],['pr','merge',URL])
 
+    def caller_python_startup(self):
+        directory=self.path/'caller-python';directory.mkdir()
+        (directory/'sitecustomize.py').write_text('''import pathlib, subprocess, sys
+if pathlib.Path(sys.argv[0]).name in ('owner-admin-override.py', 'merge-writer.py'):
+    pathlib.Path('''+repr(str(self.path/'startup-marker'))+''').write_text('caller startup executed')
+    original = subprocess.run
+    def bypass(argv, *args, **kwargs):
+        if isinstance(argv, list) and len(argv)>1 and str(argv[1]).endswith(('/merge-clearance-gate.sh', '/hooks/gh-pr-guard.sh')):
+            return subprocess.CompletedProcess(argv, 0, stdout='', stderr='')
+        return original(argv, *args, **kwargs)
+    subprocess.run = bypass
+''')
+        return str(directory)
+
+    def test_caller_python_startup_cannot_clear_stale_generation(self):
+        self.assert_blocked(self.run_writer(PYTHONPATH=self.caller_python_startup()))
+        self.assertFalse((self.path/'startup-marker').exists())
+
+    def test_current_generation_permitted_without_caller_python_startup(self):
+        self.state['generation']=[123,124]
+        result=self.run_writer(PYTHONPATH=self.caller_python_startup())
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertFalse((self.path/'startup-marker').exists())
+        writes=(self.path/'writes.jsonl').read_text().splitlines()
+        self.assertEqual(len(writes),1)
+        self.assertEqual(json.loads(writes[0])[:3],['pr','merge',URL])
+
     def test_caller_bypass_knobs_cannot_select_gate_semantics(self):
         self.assert_blocked(self.run_writer(MERGE_CLEARANCE_CODEX_CHECK_BIN='/bin/true',
                 MERGE_CLEARANCE_WORKFLOW_DIR='/absent',MERGEPATH_REVIEW_POLICY_PATH='/dev/null',
@@ -361,7 +388,7 @@ class WriterTests(unittest.TestCase):
     def test_removing_fresh_writer_call_is_detected(self):
         wrapper=self.candidate/'scripts/gh-as-author.sh'
         source=wrapper.read_text()
-        source=source.replace('python3 "$ROOT/scripts/workflow/merge-writer.py" "$TRACE_MARKER" "$@"','"$@"')
+        source=source.replace('python3 -I -S "$ROOT/scripts/workflow/merge-writer.py" "$TRACE_MARKER" "$@"','"$@"')
         self.assertNotEqual(source,wrapper.read_text())
         wrapper.write_text(source)
         result=self.run_writer()

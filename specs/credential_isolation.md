@@ -8,6 +8,8 @@ spec_id: credential_isolation
 
 The audit reads secret names and environment settings, never secret values. For an organization-owned repository, it also checks every organization secret shared with that repository. Paginated counts must agree and every record must be readable. A missing credential environment is drift only after a complete, readable environment inventory confirms its absence; a 404 alone cannot prove absence. API, scope or schema failures return infrastructure error (2); observed placement/protection drift returns 3; complete isolated observations return 0. The option is explicit because the existing protection auditor's Administration:read permission alone cannot list Secrets or Environments.
 
+Authority drift reports emit names from the fixed authority inventory after matching observed metadata; they never copy observed secret metadata into report labels. Both the normal environment and confirmed-missing-environment output paths retain the same diagnostic names, ordering and status codes.
+
 Rollout requires provisioning environment secrets from their trusted vault sources, verifying trusted default-branch workflows can consume them, and then deleting the repository-scoped copies. It also requires moving any PR-controlled privileged-token consumer to a trusted execution path. An audit implementation alone does not complete that rollout or close issue #1547.
 
 Credential isolation uses the actual repository default branch independently of the branch-protection target selected by `--branch`. The authority-secret set includes both merge-queue policy/source tokens.

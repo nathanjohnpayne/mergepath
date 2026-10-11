@@ -1010,12 +1010,16 @@ if run_git_wrapper 0 "fresh bootstrap repo" git -C "$PUSHREPO" push -u origin HE
       pass "fresh bootstrap repo: pushed under the verified token, global/system/prompt/hooks closed, gh's helper alone" ;;
     *) fail "fresh bootstrap repo: unexpected push environment: $line" ;;
   esac
+else
+  fail "fresh bootstrap repo: wrapper did not complete the push"
 fi
 
 fresh_pushrepo "git@github.com:example/repo.git"
 if run_git_wrapper 0 "exact ssh spelling" git -C "$PUSHREPO" push -u origin HEAD \
    && grep -q -- '-c url.https://github.com/.insteadOf=git@github.com:' "$GIT_PUSH_LOG"; then
   pass "exact git@github.com: spelling for the expected repo: accepted and pushed over HTTPS"
+else
+  fail "exact git@github.com: spelling was not accepted and pushed over HTTPS"
 fi
 
 # The destination must be exactly the expected repository.
@@ -1046,9 +1050,12 @@ for kv in "remote.origin.pushurl=https://github.com/example/repo.git" "remote.or
 done
 fresh_pushrepo
 "$REAL_GIT" -C "$PUSHREPO" config --local "http.https://user:KEYSECRET@github.com/.extraheader" "x: y"
-run_git_wrapper 5 "redaction probe" git -C "$PUSHREPO" push -u origin HEAD \
-  && printf '%s' "$GIT_CASE_ERR" | grep -q '<redacted>@github.com' \
-  && pass "credential-bearing key name: named with its userinfo redacted"
+if run_git_wrapper 5 "redaction probe" git -C "$PUSHREPO" push -u origin HEAD \
+   && printf '%s' "$GIT_CASE_ERR" | grep -q '<redacted>@github.com'; then
+  pass "credential-bearing key name: named with its userinfo redacted"
+else
+  fail "credential-bearing key name was not named with its userinfo redacted"
+fi
 
 fresh_pushrepo
 "$REAL_GIT" -C "$PUSHREPO" config --local --add remote.origin.url https://github.com/example/repo.git

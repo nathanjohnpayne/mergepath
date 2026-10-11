@@ -2,6 +2,16 @@
 # Read-only selectors shared by request deduplication/ack and blocked evidence.
 # A trigger qualifies by complete command body, author, and freshness, not an
 # immutable commit anchor.
+# Read the author from parsed governing policy, shared by the capture producer,
+# request budget and merge checker. Only an absent key uses the legacy default.
+crqe_policy_author() { # policy-json
+  printf '%s' "$1" | jq -er '
+    if type != "object" then error("policy")
+    elif has("author_identity") then
+      .author_identity | select(type == "string" and length > 0)
+    else "nathanjohnpayne" end'
+}
+
 crqe_select_trigger() { # comments-json author since
   printf '%s\n' "$1" | jq -c --arg author "$2" --arg since "$3" '
     [.[] | select((.user.login // "") == $author)
@@ -86,18 +96,14 @@ crqe_request_threshold() { # head-committer-date timeline-json freshness-seconds
       reaction_threshold:$threshold,reaction_threshold_source:$threshold_source}'
 }
 
-# Resolve the request budget from the PR's governing base policy. The caller
-# must already have sourced feedback-policy-helpers.sh (policy_yaml_to_json).
-# Prints {author_identity,max_request_attempts,max_blocking_reviews,
-# reaction_freshness_window_seconds}, with max_blocking_reviews null when its
-# governed value is invalid;
-# returns non-zero on every
-# unreadable or malformed input. A materialized policy is removed here.
-crqe_governing_budget() { # repo pr default-config candidate-author [resolver [base-ref base-sha default-branch]]
-  local repo="$1" pr="$2" config="$3" candidate="$4"
-  local resolver="${5:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/workflow/resolve_base_policy.sh}"
-  local base_ref="${6:-}" base_sha="${7:-}" default_branch="${8:-}"
-  local base_cfg="" base_json="" author="" cap="" blocking="" freshness="" rc=0
+# Read one materialized governing policy for either timing or write authority.
+# Timing must not validate a request cap: no-spend paths keep their existing
+# exemption from cap validation (#1567).
+crqe_governing_policy_json() { # repo pr default-config [resolver [base-ref base-sha default-branch]]
+  local repo="$1" pr="$2" config="$3"
+  local resolver="${4:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/workflow/resolve_base_policy.sh}"
+  local base_ref="${5:-}" base_sha="${6:-}" default_branch="${7:-}"
+  local base_cfg="" base_json="" rc=0
   command -v policy_yaml_to_json >/dev/null 2>&1 || return 1
   [ -x "$resolver" ] || return 1
   if [ -n "$base_ref$base_sha$default_branch" ]; then
@@ -112,12 +118,48 @@ crqe_governing_budget() { # repo pr default-config candidate-author [resolver [b
   base_json=$(policy_yaml_to_json "$base_cfg" 2>/dev/null) || rc=$?
   [ "$base_cfg" = "$config" ] || rm -f "$base_cfg" 2>/dev/null || true
   [ "$rc" -eq 0 ] && [ -n "$base_json" ] || return 1
-  author=$(printf '%s' "$base_json" | jq -er '
-    if type != "object" then error("policy")
-    elif has("author_identity") then
-      if ((.author_identity | type) == "string") and ((.author_identity | length) > 0)
-      then .author_identity else error("author") end
-    else "nathanjohnpayne" end') || return 1
+  printf '%s' "$base_json" | jq -ce 'select(type == "object")' || return 1
+}
+
+# Shared freshness parser for the requester and the Phase 4b request budget.
+crqe_policy_reaction_freshness() { # policy-json
+  local base_json="$1" freshness
+  freshness=$(printf '%s' "$base_json" | jq -r '
+    if type != "object" then "__invalid__"
+    elif (has("codex") | not) then "1800"
+    elif ((.codex | type) != "object") then "__invalid__"
+    elif (.codex | has("reaction_freshness_window_seconds")) then
+      .codex.reaction_freshness_window_seconds
+      | if (type == "string" or type == "number") then tostring else "__invalid__" end
+    else "1800" end') || return 1
+  case "$freshness" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#freshness}" -le 9 ] || return 1
+  freshness=$(printf '%s' "$freshness" | sed 's/^0*//')
+  [ -n "$freshness" ] || freshness=0
+  printf '%s' "$freshness"
+}
+
+crqe_governing_freshness() { # repo pr default-config [resolver]
+  local policy
+  policy=$(crqe_governing_policy_json "$@") || return 1
+  crqe_policy_reaction_freshness "$policy"
+}
+
+# Resolve the request budget from the PR's governing base policy. The caller
+# must already have sourced feedback-policy-helpers.sh (policy_yaml_to_json).
+# Prints {author_identity,max_request_attempts,max_blocking_reviews,
+# reaction_freshness_window_seconds}, with max_blocking_reviews null when its
+# governed value is invalid;
+# returns non-zero on every
+# unreadable or malformed input. A materialized policy is removed here.
+crqe_governing_budget() { # repo pr default-config candidate-author [resolver [base-ref base-sha default-branch]]
+  local repo="$1" pr="$2" config="$3" candidate="$4"
+  local resolver="${5:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/workflow/resolve_base_policy.sh}"
+  local base_ref="${6:-}" base_sha="${7:-}" default_branch="${8:-}"
+  local base_json="" author="" cap="" blocking="" freshness=""
+  base_json=$(crqe_governing_policy_json "$repo" "$pr" "$config" "$resolver" \
+    "$base_ref" "$base_sha" "$default_branch") || return 1
+  author=$(crqe_policy_author "$base_json") || return 1
   if [ "$author" != "$candidate" ]; then
     printf "candidate author_identity '%s' does not match the governing base policy author_identity '%s'\n" \
       "$candidate" "$author" >&2
@@ -161,18 +203,7 @@ crqe_governing_budget() { # repo pr default-config candidate-author [resolver [b
       fi
       ;;
   esac
-  freshness=$(printf '%s' "$base_json" | jq -r '
-    if type != "object" then "__invalid__"
-    elif (has("codex") | not) then "1800"
-    elif ((.codex | type) != "object") then "__invalid__"
-    elif (.codex | has("reaction_freshness_window_seconds")) then
-      .codex.reaction_freshness_window_seconds
-      | if (type == "string" or type == "number") then tostring else "__invalid__" end
-    else "1800" end') || return 1
-  case "$freshness" in ''|*[!0-9]*) return 1 ;; esac
-  [ "${#freshness}" -le 9 ] || return 1
-  freshness=$(printf '%s' "$freshness" | sed 's/^0*//')
-  [ -n "$freshness" ] || freshness=0
+  freshness=$(crqe_policy_reaction_freshness "$base_json") || return 1
   local fingerprint
   fingerprint=$(crqe_policy_fingerprint "$base_json") || return 1
   jq -nc --arg author "$author" --argjson cap "$cap" --argjson blocking "$blocking" \

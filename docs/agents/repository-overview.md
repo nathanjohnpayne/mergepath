@@ -4,6 +4,8 @@ This repository is **Mergepath**, the reference implementation of the AI Agent T
 
 Primary stack: Markdown documentation, shell automation, YAML review-policy configuration, and the Mergepath Playground (static HTML + JS at `mergepath/playground/`). Agent role: maintain Mergepath's structure, the review-policy tooling and Playground, and the supporting developer workflows — ensuring documentation and tooling behavior do not drift over time. See [`BRAND.md`](../../BRAND.md) at repo root for the umbrella vocabulary.
 
+The read-only credential-isolation audit reports matched authority names from its fixed inventory, without copying secret metadata into diagnostic labels. The output contract and regression coverage are in `specs/credential_isolation.md` and `tests/test_credential_isolation.py`.
+
 The publisher structural fence prevents workflow and job concurrency for all three native required producers. The contract and mutation coverage are in `specs/required_check_publisher.md` and `tests/test_merge_clearance_gate.sh`.
 
 The shared pull-request body parser and its standalone generated runtime are specified in [`specs/pr_body_contract.md`](../../specs/pr_body_contract.md).
@@ -36,6 +38,12 @@ The required lint lane checks blocking-label parity between Label Gate and the s
 
 Phase 4b adapter availability uses the manual-handoff status independently of immutable-input integrity refusals. Missing reviewer CLI/schema and unavailable subscription auth use exit 4; missing jq remains an orchestrator prerequisite with exit 3; binding and live head/base refusals retain exit 3 and cannot enable wave fan-out. See [`specs/phase_4b_immutable_input.md`](../../specs/phase_4b_immutable_input.md).
 
+Phase 4b approvals without a request-budget snapshot capture and revalidate Codex request history under the PR's governing base-policy author identity. Both capture and the merge checker use the shared parsed-author selector, so valid flow-style or quoted YAML keys select the same authority; a present invalid author fails closed in both. A different identity in the trusted local checkout cannot supply request authority; unreadable governing policy or history fails closed when Codex requests are governed. If the governing policy disables Codex, the approval caller may proceed without a request record despite unreadable history. The contract and sourced-helper regressions live in `specs/codex_request_evidence.md` and `tests/test_codex_request_evidence.sh`.
+
+Codex request reuse takes its freshness window from the PR's governing base policy before any timing decision. This read does not validate request caps; new trigger writes retain the separate governing-budget fence. The contract and production-requester regressions are in `specs/codex_request_evidence.md` and `tests/test_codex_review_request_trigger_only.sh`.
+
 Phase 4b request-generation records distinguish a genuinely absent manual record from damaged automated evidence. Prefix detection, fail-closed parsing and production-checker regression coverage are specified in `specs/codex_request_evidence.md`; malformed or duplicate records never enable the manual timestamp fallback.
+
+Phase 4b approval writers compare the original governing request generation with one final live generation-only read after feedback accounting, including snapshot routes. Drift or unreadability refuses with exit 10 and existing pre-POST cleanup, without rebuilding the Codex ledger. The governing Codex-disabled exception remains. The contract and regression fixtures are in `specs/codex_request_evidence.md` and `tests/test_phase_4b_automation.sh`.
 
 Ordinary author-wrapped merges run a fresh threshold-aware clearance check at the final writer boundary. Exact default-commit code loading, governing-base policy materialization, canonical target/head checks and the non-atomic request-observation limit are specified in [`specs/codex_request_evidence.md`](../../specs/codex_request_evidence.md); production-writer integration runs through the guard suite.

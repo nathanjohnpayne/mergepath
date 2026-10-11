@@ -239,13 +239,13 @@ run_with_author_token() {
   # Classify actual argv through the same parser used by scoped admin
   # preparation. Only ordinary/deferred merges enter the fresh runtime;
   # other author writes keep their established direct transport and trace.
-  MERGE_PAYLOAD_ACTION=$(python3 "$ROOT/scripts/workflow/owner-admin-override.py" classify "$@") || return $?
+  MERGE_PAYLOAD_ACTION=$(python3 -I -S "$ROOT/scripts/workflow/owner-admin-override.py" classify "$@") || return $?
   case "$MERGE_PAYLOAD_ACTION" in
     ordinary|deferred)
       GH_TOKEN="$TOKEN" GH_AS_AUTHOR_RECORD_IDENTITY="$AUTHOR" \
         GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
         GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
-        python3 "$ROOT/scripts/workflow/merge-writer.py" "$TRACE_MARKER" "$@"
+        python3 -I -S "$ROOT/scripts/workflow/merge-writer.py" "$TRACE_MARKER" "$@"
       return $?
       ;;
     ""|admin|retraction) ;;
@@ -266,7 +266,7 @@ run_with_author_token() {
   GH_TOKEN="$TOKEN" GH_AS_AUTHOR_RECORD_IDENTITY="$AUTHOR" \
     GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
     GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
-    python3 "$ROOT/scripts/workflow/owner-admin-override.py" prepare "$@"
+    python3 -I -S "$ROOT/scripts/workflow/owner-admin-override.py" prepare "$@"
 )
 
 if [ "$IS_PR_CREATE" -eq 1 ]; then

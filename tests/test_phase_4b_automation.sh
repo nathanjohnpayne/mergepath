@@ -73,6 +73,31 @@ chmod +x "$WORK/stub-barrier-codex.sh" "$WORK/stub-barrier-coderabbit.sh"
 export P4B_CODEX_REVIEW_CHECK="$WORK/stub-barrier-codex.sh"
 export P4B_CODERABBIT_WAIT="$WORK/stub-barrier-coderabbit.sh"
 
+mkdir -p "$WORK/barrier-bin"
+cat >"$WORK/barrier-bin/resolve-policy" <<'EOF'
+#!/bin/sh
+set -eu
+default=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --default-config) default=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+source_path="${P4B_TEST_BASE_POLICY_PATH:-$default}"
+[ -r "$source_path" ] || exit 2
+tmp=$(mktemp "${TMPDIR:-/tmp}/p4b-test-policy.XXXXXX")
+cp "$source_path" "$tmp"
+printf '%s\n' "$tmp"
+EOF
+chmod +x "$WORK/barrier-bin/resolve-policy"
+# Every orchestrator fixture inherits the same governing-policy shim.
+# #1618: no-snapshot request-generation capture also materializes this policy,
+# so install it before the first orchestrator case, not at the later barrier cases.
+# It materializes the fixture's own policy unless a test supplies a distinct
+# base policy, matching the production resolver's ownership contract.
+export P4B_RESOLVE_BASE_POLICY="$WORK/barrier-bin/resolve-policy"
+
 PASS=0; FAIL=0
 pass() { echo "  PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
@@ -3080,12 +3105,9 @@ if [ "$rc" = 0 ] && [ -e "$P1598_SENTINEL" ] && [ "$(printf '%s' "$out" | jq -r 
 else
   fail "#1598: moved generation under governing-disabled Codex (rc=$rc): $out"
 fi
-# G2 (already-cleared route): a request that lands DURING the final
-# accounting read (accounting call 3) is not seen by the run, which posts.
-# The posted record excludes it ([7201], not 7204), so the merge gate holds
-# the approval (tests/test_codex_request_evidence.sh,
-# request-during-final-accounting). This is the revised contract: the run
-# publishes, and a fresh gate evaluation rejects the stale approval.
+# G2: final-accounting drift/unreadability refuses before POST on an already
+# cleared route. Keep unchanged and governing-disabled controls; the mutation
+# removes only the new final fence and must leak the same counted request.
 cat >"$WORK/p1598-acct-touch.sh" <<'EOF'
 #!/usr/bin/env bash
 n=0
@@ -3101,34 +3123,88 @@ else
 fi
 EOF
 chmod +x "$WORK/p1598-acct-touch.sh"
-rm -f "$P1598_SENTINEL" "$WORK/p1598-acct.count"; : >"$P1598_LOG"; rm -f "$P1598_BODY"; rm -f "$P4B_TEST_POSTED_REVIEW"
+P1598_FINAL_MUTANT="$WORK/p1598-no-final-generation.sh"
+awk -v actual_root="$ROOT/scripts" '
+  /^ROOT=/ { printf "ROOT=\"%s\"\n", actual_root; next }
+  /refuse_approval_if_request_generation_moved final$/ { removed++; next }
+  { print }
+  END { if (removed != 1) exit 2 }
+' "$ORCH" >"$P1598_FINAL_MUTANT"
+for P1598_FINAL_CASE in moved unreadable unchanged disabled mutation; do
+  P1598_CASE_POLICY="$POLICY_ON"; P1598_CASE_FAIL=""; P1598_CASE_ORCH="$ORCH"
+  P1598_CASE_AFTER='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"},{"id":7204,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:01:00Z","body":"@codex review"}]'
+  case "$P1598_FINAL_CASE" in
+    unreadable) P1598_CASE_FAIL=1 ;;
+    unchanged) P1598_CASE_AFTER='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' ;;
+    disabled) P1598_CASE_POLICY="$P1598_CODEX_OFF" ;;
+    mutation) P1598_CASE_ORCH="$P1598_FINAL_MUTANT" ;;
+  esac
+  P1598_FINAL_STATE="$WORK/p1598-final-state-$P1598_FINAL_CASE"
+  rm -f "$P1598_SENTINEL" "$WORK/p1598-acct.count" "$WORK/p1598-wrapper.log" "$P1598_BODY" "$P4B_TEST_POSTED_REVIEW"
+  : >"$P1598_LOG"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
   MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$WORK/p1598-acct-touch.sh" P4B_TEST_ACCT_COUNT="$WORK/p1598-acct.count" \
+  P4B_RESOLVE_BASE_POLICY="$P1598_RESOLVER" P1598_GOVERNING_POLICY="$P1598_CASE_POLICY" \
+  P4B_FAKE_ISSUE_COMMENTS_FAIL_AFTER_SENTINEL="$P1598_CASE_FAIL" P4B_ACCT_STATE_DIR="$P1598_FINAL_STATE" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
   P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   P4B_FAKE_ISSUE_COMMENTS='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"}]' \
-  P4B_FAKE_ISSUE_COMMENTS_AFTER='[{"id":7201,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:00:00Z","body":"@codex review"},{"id":7204,"user":{"login":"nathanjohnpayne"},"created_at":"2026-08-01T00:01:00Z","body":"@codex review"}]' \
+  P4B_FAKE_ISSUE_COMMENTS_AFTER="$P1598_CASE_AFTER" \
   P4B_FAKE_ISSUE_COMMENTS_SENTINEL="$P1598_SENTINEL" \
-  bash "$ORCH" 134 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  bash "$P1598_CASE_ORCH" 134 --repo o/r --author claude --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
-if [ "$rc" = 0 ] && [ -e "$P1598_SENTINEL" ] && [ "$(cat "$WORK/p1598-acct.count" 2>/dev/null || echo 0)" -ge 3 ] \
-   && [ "$(grep -o '<!-- mergepath-p4b-request-generation: [^>]*-->' "$P1598_BODY" 2>/dev/null)" = '<!-- mergepath-p4b-request-generation: [7201] -->' ]; then
-  pass "#1598 G2: on the already-cleared route a request during final accounting is posted outside the record [7201]"
-else
-  fail "#1598 G2: already-cleared route, request during final accounting (rc=$rc record=$(grep -o 'mergepath-p4b-request-generation: [^ ]*' "$P1598_BODY" 2>/dev/null)): $out"
-fi
-# G3: the authorization read succeeds but the writer's re-read fails. With
-# the governing policy enabling Codex (unresolvable here, which counts as
-# enabled) the approval is refused (exit 10) after cleanup; with it disabling
-# Codex the run posts.
+  P1598_FINAL_LOOP="$P1598_FINAL_STATE/phase-4b-loops/o-r-pr134.jsonl"
+  P1598_FINAL_PENDING="$P1598_FINAL_STATE/phase-4b-pending/o-r-pr134.json"
+  case "$P1598_FINAL_CASE" in
+    unchanged|disabled|mutation)
+      if [ "$rc" = 0 ] && [ -s "$P1598_BODY" ] && [ -e "$P1598_SENTINEL" ] \
+         && { [ "$P1598_FINAL_CASE" = disabled ] || grep -qxF '<!-- mergepath-p4b-request-generation: [7201] -->' "$P1598_BODY"; }; then
+        pass "#1598 G2 $P1598_FINAL_CASE: original positive control or isolated remove-final-fence mutation posts"
+      else fail "#1598 G2 $P1598_FINAL_CASE: rc=$rc $out"; fi
+      ;;
+    *)
+      P1598_EXPECTED_EVIDENCE="request-generation-changed"
+      [ "$P1598_FINAL_CASE" != unreadable ] || P1598_EXPECTED_EVIDENCE="request-generation-unrecorded"
+      if [ "$rc" = 10 ] && [ -e "$P1598_SENTINEL"  ] \
+         && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = "$P1598_EXPECTED_EVIDENCE" ] \
+         && [ "$(cat "$WORK/p1598-acct.count" 2>/dev/null)" = 3 ] \
+         && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = false ] \
+         && grep -q '^CLOSE #901$' "$P1598_LOG" \
+         && [ "$(jq -sr 'last.loop.posted' "$P1598_FINAL_LOOP")" = not-posted ] \
+         && [ "$(jq -sr 'last.loop.fail_closed.happened' "$P1598_FINAL_LOOP")" = true ] \
+         && [ ! -e "$P1598_FINAL_PENDING" ] && [ ! -e "$P1598_BODY" ] \
+         && [ ! -e "$WORK/p1598-wrapper.log" ]; then
+        pass "#1598 G2 $P1598_FINAL_CASE: final accounting refuses with cleanup and no POST"
+      else fail "#1598 G2 $P1598_FINAL_CASE: refusal/cleanup rc=$rc $out"; fi
+      ;;
+  esac
+done
+# G3: the authorization read succeeds but the writer's re-read fails. The
+# enabled fixture resolves governing policy until the adapter runs, then makes
+# it unreadable (which counts as enabled); the approval is refused (exit 10)
+# after cleanup. A governing policy that disables Codex still permits posting.
+P1598_G3_RESOLVER="$WORK/p1598-g3-resolve-policy"
+cat >"$P1598_G3_RESOLVER" <<'EOF'
+#!/bin/sh
+set -eu
+[ ! -e "$P4B_FAKE_ISSUE_COMMENTS_SENTINEL" ] || exit 2
+tmp=$(mktemp "${TMPDIR:-/tmp}/p1598-g3-policy.XXXXXX")
+cp "$P1598_GOVERNING_POLICY" "$tmp"
+printf '%s\n' "$tmp"
+EOF
+chmod +x "$P1598_G3_RESOLVER"
 for _g3 in enabled disabled; do
   rm -f "$P1598_SENTINEL"; : >"$P1598_LOG"; rm -f "$P1598_BODY"
-  if [ "$_g3" = disabled ]; then _g3_resolver="$P1598_RESOLVER"; else _g3_resolver="$WORK/p1598-no-resolver"; fi
+  if [ "$_g3" = disabled ]; then
+    _g3_resolver="$P1598_RESOLVER"; _g3_policy="$P1598_CODEX_OFF"
+  else
+    _g3_resolver="$P1598_G3_RESOLVER"; _g3_policy="$POLICY_ON"
+  fi
   set +e
   out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$WORK/p1598-adapter.sh" \
-    P4B_RESOLVE_BASE_POLICY="$_g3_resolver" P1598_GOVERNING_POLICY="$P1598_CODEX_OFF" \
+    P4B_RESOLVE_BASE_POLICY="$_g3_resolver" P1598_GOVERNING_POLICY="$_g3_policy" \
     OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$P1598_LOG" \
     P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p1598-wrapper.log" \
     P4B_WRAPPER_BODY="$P1598_BODY" P4B_FAKE_LIVE_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa P4B_FAKE_CREATED_REVIEW_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
@@ -4588,27 +4664,7 @@ case "$endpoint" in
 esac
 EOF
 chmod +x "$WORK/barrier-bin/gh"
-cat >"$WORK/barrier-bin/resolve-policy" <<'EOF'
-#!/bin/sh
-set -eu
-default=""
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --default-config) default=$2; shift 2 ;;
-    *) shift ;;
-  esac
-done
-source_path="${P4B_TEST_BASE_POLICY_PATH:-$default}"
-[ -r "$source_path" ] || exit 2
-tmp=$(mktemp "${TMPDIR:-/tmp}/p4b-test-policy.XXXXXX")
-cp "$source_path" "$tmp"
-printf '%s\n' "$tmp"
-EOF
-chmod +x "$WORK/barrier-bin/resolve-policy"
-# Every later orchestrator fixture inherits the same governing-policy shim.
-# It materializes the fixture's own policy unless a test supplies a distinct
-# base policy, matching the production resolver's ownership contract.
-export P4B_RESOLVE_BASE_POLICY="$WORK/barrier-bin/resolve-policy"
+
 
 # #1560 slice 3: the barrier reads the Codex review ledger only when a spent
 # request ceiling would dispatch the adapter. This stub prints a ledger for the
@@ -6545,7 +6601,7 @@ for _tr_case in moved unchanged; do
   set -e
   _tr_diag="rc=$rc reads=$(cat "$_race_count" 2>/dev/null || true) issue-log=$(tr '\n' ' ' <"$_race_issue_log" 2>/dev/null || true) wrapper=$(test -e "$_race_wrapper" && echo invoked || true)"
   if [ "$_tr_case" = unchanged ]; then
-    if [ "$(cat "$_race_count" 2>/dev/null)" = 5 ] && grep -q '^adapter-ran$' "$_race_adapter" && [ -e "$_race_wrapper" ] \
+    if [ "$(cat "$_race_count" 2>/dev/null)" = 6 ] && grep -q '^adapter-ran$' "$_race_adapter" && [ -e "$_race_wrapper" ] \
        && grep -qxF '<!-- mergepath-p4b-request-generation: [4101] -->' "$_tr_body"; then
       pass "#1598: on the timeout route an unchanged request generation reaches the review POST, recording [4101]"
     else
@@ -6568,10 +6624,8 @@ for _tr_case in moved unchanged; do
     fail "#1598: timeout-route request after authorization ($_tr_diag): $out"
   fi
 done
-# G1 (timeout route): a request that lands DURING the final accounting read
-# (accounting call 3, after the writer's generation verification at read 5)
-# is not seen by the run, which posts. The record excludes it ([4101], not
-# 4103), so the merge gate holds the approval (revised contract).
+# G1: the timeout route must observe a counted request arriving during the
+# third accounting call and refuse with cleanup before the reviewer wrapper.
 cat >"$WORK/acct-timeout-final.sh" <<'EOF'
 #!/usr/bin/env bash
 n=0
@@ -6606,11 +6660,16 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
   P4B_ISSUE_LOG="$_race_issue_log" P4B_ACCT_STATE_DIR="$_race_acct" \
   bash "$ORCH" 131 --repo o/r --author claude --head "$_race_head" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
-if [ "$rc" = 0 ] && [ -e "$_race_wrapper" ] && [ "$(cat "$_g1_acct_count" 2>/dev/null || echo 0)" -ge 3 ] \
-   && [ "$(grep -o '<!-- mergepath-p4b-request-generation: [^>]*-->' "$_g1_body" 2>/dev/null)" = '<!-- mergepath-p4b-request-generation: [4101] -->' ]; then
-  pass "#1598 G1: on the timeout route a request during final accounting is posted outside the record [4101]"
+if [ "$rc" = 10 ] && [ ! -e "$_race_wrapper" ] && [ ! -e "$_g1_body" ] \
+   && [ "$(cat "$_g1_acct_count" 2>/dev/null)" = 3 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = false ] \
+   && grep -q '^CLOSE #901$' "$_race_issue_log" \
+   && [ "$(jq -sr 'last.loop.posted' "$_race_loop")" = not-posted ] \
+   && [ "$(jq -sr 'last.loop.fail_closed.happened' "$_race_loop")" = true ] \
+   && [ ! -e "$_race_pending" ]; then
+  pass "#1598 G1: timeout final-accounting request refuses with cleanup and no POST"
 else
-  fail "#1598 G1: timeout route, request during final accounting (rc=$rc acct=$(cat "$_g1_acct_count" 2>/dev/null) record=$(grep -o 'mergepath-p4b-request-generation: [^ ]*' "$_g1_body" 2>/dev/null)): $out"
+  fail "#1598 G1: timeout final-accounting refusal (rc=$rc acct=$(cat "$_g1_acct_count" 2>/dev/null)): $out"
 fi
 
 # #1305/#1474: an account-blocked Codex with budget remaining may dispatch the
@@ -7037,21 +7096,25 @@ else
   fail "#1474: review-preparation request race leaked (rc=$rc reads=$(cat "$_prep_count" 2>/dev/null || true) flip=$(cat "$_prep_flip_log" 2>/dev/null || true) adapter=$(cat "$_prep_adapter_log" 2>/dev/null || true) issue=$(tr '\n' ' ' <"$_prep_issue" 2>/dev/null || true) loop=$(cat "$_prep_loop" 2>/dev/null || true) reviewer=$(cat "$_prep_reviewer" 2>/dev/null || true)): $out"
 fi
 
-# Mutation control for the exact writer-boundary seam above. Run a private
-# orchestrator copy with only the final authority call removed; pin its ROOT to
-# this checkout so it uses the same trusted libraries and fakes. The prepared
-# request change must then reach the fake reviewer wrapper, proving the
-# production refusal came from the final fence rather than the early one.
+# Isolate the original full-budget writer fence from #1598's new redundant
+# generation fence in this private mutation: remove the final budget call and
+# retain only the pre-accounting snapshot optimization at the added call site.
+# The original prepared-request POST assertion still discriminates the full
+# authority fence; G2 separately removes only the new generation fence.
 _prep_mutant="$WORK/phase-4b-review-no-final-authority.sh"
 awk -v actual_root="$ROOT/scripts" '
   /^ROOT=/ { printf "ROOT=\"%s\"\n", actual_root; next }
   /# The timeout\/head\/body\/base reads above prepare/ { final_block=1 }
+  /refuse_approval_if_request_generation_moved final$/ {
+    sub(/ final$/, "")
+    isolated += 1
+  }
   final_block && /^  revalidate_codex_request_budget_authority pre-post$/ {
     removed += 1
     next
   }
   { print }
-  END { if (removed != 1) exit 2 }
+  END { if (removed != 1 || isolated != 1) exit 2 }
 ' "$ORCH" >"$_prep_mutant"
 chmod +x "$_prep_mutant"
 cp "$_budget_before" "$_prep_before"
@@ -7080,17 +7143,13 @@ if [ "$rc" != 10 ] \
    && [ "$(cat "$_prep_adapter_log" 2>/dev/null || true)" = adapter-ran ] \
    && [ "$(cat "$_prep_flip_log" 2>/dev/null || true)" = preparation-read-flipped-after-comments-5 ] \
    && [ "$(cat "$_prep_reviewer" 2>/dev/null || true)" = invoked ]; then
-  pass "#1474 mutation: removing only the final authority fence leaks the prepared request change to review POST"
+  pass "#1474 mutation: isolated removal of the full authority fence leaks the prepared request change to review POST"
 else
   fail "#1474 mutation control did not isolate final writer fence (rc=$rc reads=$(cat "$_prep_count" 2>/dev/null || true) flip=$(cat "$_prep_flip_log" 2>/dev/null || true) adapter=$(cat "$_prep_adapter_log" 2>/dev/null || true) reviewer=$(cat "$_prep_reviewer" 2>/dev/null || true)): $out"
 fi
 
-# #1598's exact acceptance case on the writer side: a new author request lands
-# DURING the final feedback-accounting read (the 3rd accounting call), after
-# the last authority fence. The approval still posts (no read follows the final
-# accounting read), but it records the generation it was authorized under,
-# which excludes the new request; the substitute merge gate then refuses it
-# until Codex answers (tests/test_codex_request_evidence.sh covers the gate).
+# #1598 available-budget route: the original snapshot cannot bypass the new
+# final generation-only read after accounting call 3. Refuse and clean up.
 _rg_count="$WORK/record-gen-comments.count"
 _rg_acct_count="$WORK/record-gen-acct.count"
 _rg_body="$WORK/record-gen-body.txt"
@@ -7130,15 +7189,20 @@ out="$(PATH="$WORK/budget-bin:$BIN:$PATH" \
   bash "$ORCH" 131 --repo o/r --author claude --head "$_race_head" --diff-file "$DIFF" \
     2>"$WORK/record-gen.err")"; rc=$?
 set -e
-_rg_recorded=$(sed -n 's/^<!-- mergepath-p4b-request-generation: \(.*\) -->$/\1/p' "$_rg_body" 2>/dev/null)
 _rg_live=$(jq -c '[.[] | select(.user.login == "nathanjohnpayne") | .id] | sort' "$_budget_after" 2>/dev/null || true)
-if [ "$(cat "$_rg_acct_count" 2>/dev/null || echo 0)" -ge 3 ] \
-   && [ "$(cat "$_rg_count" 2>/dev/null || true)" = 99 ] \
-   && [ "$rc" = 0 ] && [ -s "$_rg_body" ] \
-   && [ "$_rg_recorded" = '[]' ] && [ "$_rg_live" = '[7101]' ]; then
-  pass "#1598: a request landing during the final accounting read stays outside the approval's recorded generation"
+if [ "$(cat "$_rg_acct_count" 2>/dev/null)" = 3 ] \
+   && [ "$rc" = 10 ] && [ ! -e "$_rg_body" ] \
+   && [ "$_rg_live" = '[7101]' ] \
+   && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = request-generation-changed ] \
+   && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = false ] \
+   && [ ! -s "$_rg_issue" ] \
+   && [ "$(jq -sr 'last.loop.posted' "$_rg_acct/phase-4b-loops/o-r-pr131.jsonl")" = not-posted ] \
+   && [ "$(jq -sr 'last.loop.fail_closed.happened' "$_rg_acct/phase-4b-loops/o-r-pr131.jsonl")" = true ] \
+   && [ ! -e "$_rg_acct/phase-4b-pending/o-r-pr131.json" ] \
+   && [ ! -e "$WORK/record-gen-wrapper.log" ]; then
+  pass "#1598: available-budget final-accounting request refuses with cleanup and no POST"
 else
-  fail "#1598: recorded generation under the final-accounting race (rc=$rc acct=$(cat "$_rg_acct_count" 2>/dev/null) reads=$(cat "$_rg_count" 2>/dev/null) recorded=$_rg_recorded live=$_rg_live): $out $(tail -3 "$WORK/record-gen.err")"
+  fail "#1598: available-budget final-accounting refusal (rc=$rc acct=$(cat "$_rg_acct_count" 2>/dev/null)): $out"
 fi
 
 # Unsafe evidence takes the manual-fallback route rather than a hold. Make the
