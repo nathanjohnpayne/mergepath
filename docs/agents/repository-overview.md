@@ -4,6 +4,8 @@ This repository is **Mergepath**, the reference implementation of the AI Agent T
 
 Primary stack: Markdown documentation, shell automation, YAML review-policy configuration, and the Mergepath Playground (static HTML + JS at `mergepath/playground/`). Agent role: maintain Mergepath's structure, the review-policy tooling and Playground, and the supporting developer workflows — ensuring documentation and tooling behavior do not drift over time. See [`BRAND.md`](../../BRAND.md) at repo root for the umbrella vocabulary.
 
+The read-only credential-isolation audit reports matched authority names from its fixed inventory, without copying secret metadata into diagnostic labels. The output contract and regression coverage are in `specs/credential_isolation.md` and `tests/test_credential_isolation.py`.
+
 The publisher structural fence prevents workflow and job concurrency for all three native required producers. The contract and mutation coverage are in `specs/required_check_publisher.md` and `tests/test_merge_clearance_gate.sh`.
 
 The shared pull-request body parser and its standalone generated runtime are specified in [`specs/pr_body_contract.md`](../../specs/pr_body_contract.md).
