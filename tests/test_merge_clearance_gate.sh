@@ -307,10 +307,28 @@ EOF
 
 make_files_fixture() {  # <json_array_literal>   e.g. '[{"filename":"x","additions":5,"deletions":0}]'
   local content=$1
-  local file="$WORKDIR/files.$$.$RANDOM.json"
+  local file
+  file=$(mktemp "$WORKDIR/files.XXXXXX") || return 1
   echo "$content" >"$file"
   echo "$file"
 }
+
+# Retained fixtures must survive another allocation even when filename
+# entropy repeats. A 16-bit $RANDOM pathname could overwrite the older file
+# and silently change Query 7b from over-threshold to under-threshold.
+if (
+  unset RANDOM
+  RANDOM=42
+  first_files=$(make_files_fixture '[{"filename":"src/big.js","additions":400,"deletions":0}]')
+  second_files=$(make_files_fixture '[{"filename":"package.json","additions":1,"deletions":1}]')
+  [ "$first_files" != "$second_files" ] &&
+    jq -e '.[0].additions == 400' "$first_files" >/dev/null &&
+    jq -e '.[0].additions == 1' "$second_files" >/dev/null
+); then
+  pass "files fixture allocation preserves retained data when entropy repeats"
+else
+  fail "files fixture allocation reused a path or overwrote retained data"
+fi
 
 make_comments_fixture() {  # <json_array_literal>  issue comments
   local content=$1

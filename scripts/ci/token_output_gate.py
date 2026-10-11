@@ -201,6 +201,9 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     redirections or assignment prefixes, complex/special targets (including Bash locale selectors) or
     integer/nameref declarations, and numeric, ANSI-C, expanded, dynamic or unknown formats. Repeated
     assignment options and the option delimiter precede the inspected format.
+    Split-line function-keyword headers invalidate attached builtin provenance
+    without extending general helper body-span discovery. Prompt-managed
+    targets can emit or execute values in interactive shells and stay conservative.
     Credential-bearing prefixes were also missed by the parent scanner;
     their diagnostic check here is limited to attached-option assignments.
     Numeric-conversion diagnostics from the separate assignment form remain
@@ -2642,6 +2645,7 @@ _PRINTF_SPECIAL_TARGETS = frozenset({
     "HISTSIZE", "HISTCMD", "IGNOREEOF", "LANG", "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES",
     "LC_NUMERIC", "LC_TIME", "LINENO", "LINES", "MAILCHECK", "OPTIND", "PPID",
     "RANDOM", "SECONDS", "SHLVL", "SRANDOM", "TMOUT", "UID", "PIPESTATUS",
+    "PS0", "PS1", "PS2", "PS3", "PS4", "PROMPT_COMMAND",
     "FUNCNAME", "GROUPS", "DIRSTACK",
 })
 
@@ -3253,9 +3257,18 @@ def discover_emitter_helpers(text):
     # any such operation makes the attached printf exemption uncertain; even
     # a later apparent re-enable is not proof it executed in this shell.
     availability_changed = False
+    binding_names = {"printf"} | PASSTHRU
     for line in Lexer(text).logical:
         for seg in line.segments:
             cmd = resolve_command(seg)[0]
+            # A function-keyword header can put its body on the next line.
+            # Record only the uncertain binding using existing command
+            # positions; general helper body-span discovery stays unchanged.
+            limit = seg._cmd_index if seg._cmd_index is not None else len(seg.words)
+            for i, word in enumerate(seg.words[:limit]):
+                if (word == "function" and i + 1 < len(seg.words)
+                        and _unquote_command_word(seg.words[i + 1]) in binding_names):
+                    availability_changed = True
             if cmd in OPAQUE_COMMANDS | {"enable", "alias", UNRESOLVED}:
                 # Opaque setup or aliases may change lookup indirectly. No
                 # execution-state model proves builtin availability afterward.
@@ -5545,6 +5558,61 @@ CORPUS = [
         "printf -vout '%s' harmless >\"./absent/$GH_TOKEN\"\n",
     ),
     (
+        'printf-v-split-keyword-function',
+        MUST_FLAG,
+        'function printf\n{ echo "$@"; }\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-split-posix-function',
+        MUST_FLAG,
+        'printf()\n{ echo "$@"; }\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-split-keyword-noop',
+        MUST_FLAG,
+        'function printf\n{ :; }\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-split-prefix-function',
+        MUST_FLAG,
+        'function command\n{ echo "$@"; }\ncommand printf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-split-heredoc-data',
+        MUST_NOT_FLAG,
+        'cat >/dev/null <<\'EOF\'\nfunction printf\n{ echo "$@"; }\nEOF\nprintf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-prompt-ps0',
+        MUST_FLAG,
+        'printf -vPS0 \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-prompt-ps1',
+        MUST_FLAG,
+        'printf -vPS1 \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-prompt-ps2',
+        MUST_FLAG,
+        'printf -vPS2 \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-prompt-ps3',
+        MUST_FLAG,
+        'printf -vPS3 \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-prompt-prompt_command',
+        MUST_FLAG,
+        'printf -vPROMPT_COMMAND \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-prompt-ps4',
+        MUST_FLAG,
+        'printf -vPS4 \'%s\' "$GH_TOKEN"\nset -x\n:\n',
+    ),
+    (
         "printf-v-disabled-builtin",
         MUST_FLAG,
         "printf '%s\\n' '#!/usr/bin/env bash' 'echo \"$@\"' > printf\n"
@@ -6854,6 +6922,36 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    "printf-v-split-keyword-noop": (
+        "a function-keyword declaration prevents proving builtin lookup even "
+        "when its split-line body emits nothing; preserve the attached "
+        "baseline without broadening helper body-span discovery"
+    ),
+    'printf-v-prompt-ps0': (
+        "prompt-managed targets can emit or execute the value in interactive "
+        "Bash; the standard oracle is noninteractive, and a separate "
+        "discriminating interactive oracle measures the leak with a clean control"
+    ),
+    'printf-v-prompt-ps1': (
+        "prompt-managed targets can emit or execute the value in interactive "
+        "Bash; the standard oracle is noninteractive, and a separate "
+        "discriminating interactive oracle measures the leak with a clean control"
+    ),
+    'printf-v-prompt-ps2': (
+        "prompt-managed targets can emit or execute the value in interactive "
+        "Bash; the standard oracle is noninteractive, and a separate "
+        "discriminating interactive oracle measures the leak with a clean control"
+    ),
+    'printf-v-prompt-ps3': (
+        "prompt-managed targets can emit or execute the value in interactive "
+        "Bash; the standard oracle is noninteractive, and a separate "
+        "discriminating interactive oracle measures the leak with a clean control"
+    ),
+    'printf-v-prompt-prompt_command': (
+        "prompt-managed targets can emit or execute the value in interactive "
+        "Bash; the standard oracle is noninteractive, and a separate "
+        "discriminating interactive oracle measures the leak with a clean control"
+    ),
     "printf-v-ordinary-assignment-prefix": (
         "credential-bearing prefixes on attached printf assignments are "
         "flagged because applying a prefix can diagnose before printf runs; "
