@@ -2701,6 +2701,13 @@ doc_ownership:
       Promote to canonical once the rules have been exercised on a
       consumer and the hub-specific citations are separated from the
       rules themselves.
+  - path: docs/agents/tracker-unblock-runbook.md
+    class: hub-only
+    note: >-
+      Runbook for multi-ticket sessions that unblock consumer trackers
+      through Mergepath work. HUB-ONLY: it sequences this repo's review
+      and propagation machinery and is run from the hub, so a consumer
+      copy would describe work that consumer sessions do not perform.
   - path: docs/agents/bootstrap-runbook.md
     class: hub-only
   - path: docs/agents/propagation-ordering.md
