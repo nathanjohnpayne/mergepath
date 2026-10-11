@@ -3273,8 +3273,14 @@ def discover_emitter_helpers(text):
             cmd = resolve_command(seg)[0]
             if seg._function_binding is not None:
                 position, word = seg._function_binding
-                if (position == seg._cmd_index
-                        and _unquote_command_word(word) in binding_names):
+                # Bare prefix names have no resolved invocation index: the
+                # resolver consumes them as wrappers. A declaration at the
+                # segment's command position still shadows that prefix.
+                at_command = position == seg._cmd_index or (
+                    seg._cmd_index is None
+                    and all(w in RESERVED_WORDS for w in seg.words[:position])
+                )
+                if at_command and _unquote_command_word(word) in binding_names:
                     availability_changed = True
             # A function-keyword header can put its body on the next line.
             # Record only the uncertain binding using existing command
@@ -5571,6 +5577,26 @@ CORPUS = [
         "printf-v-redirection-failure-glued",
         MUST_FLAG,
         "printf -vout '%s' harmless >\"./absent/$GH_TOKEN\"\n",
+    ),
+    (
+        'printf-v-continued-spaced-prefix',
+        MUST_FLAG,
+        'command \\\n( ) { echo "$@"; }\ncommand printf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-continued-spaced-builtin',
+        MUST_FLAG,
+        'builtin \\\n( ) { echo "$@"; }\nbuiltin printf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-continued-spaced-prefix-condition',
+        MUST_FLAG,
+        'if command \\\n( ) { echo "$@"; }; then :; fi\ncommand printf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-continued-prefix-data',
+        MUST_NOT_FLAG,
+        'echo command \'()\' >/dev/null\nprintf -vout \'%s\' "$GH_TOKEN"\n',
     ),
     (
         'printf-v-continued-function',
