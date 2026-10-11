@@ -1591,6 +1591,15 @@ if [ "${_ng:-0}" -ge 1 ]; then pass "merge-state jq: un-timestamped PENDING re-r
 _ng2=$(printf '%s' '{"statusCheckRollup":[{"name":"ci","conclusion":"SUCCESS","completedAt":"2026-06-28T10:00:00Z"},{"name":"lint","conclusion":"SUCCESS","completedAt":"2026-06-28T11:00:00Z"}],"labels":[]}' | jq -r "$GH_JQ" | sed -n '3p')
 if [ "${_ng2:-x}" = "0" ]; then pass "merge-state jq: all-terminal-green stays 0 (no false block) (#553)"; else fail "merge-state jq (#553): expected 0, got '$_ng2'"; fi
 
+# #1609: static admission must reach the real writer's fresh trusted gate.
+# Fake immutable-code/API transports only; includes stale/current generations,
+# missing evidence, poisoned candidate/env, cancellation/holds and a mutant.
+if python3 "$ROOT/tests/test_merge_writer.py"; then
+  pass "production merge writer freshly rejects uncovered request generations"
+else
+  fail "production merge writer freshness integration"
+fi
+
 echo ""
 echo "test_gh_pr_guard: $PASS passed, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then

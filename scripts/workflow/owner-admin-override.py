@@ -112,7 +112,7 @@ def reject_merge_api(args):
             raise ValueError('merge API mutations are forbidden; use the head-pinned PR merge command')
 
 
-def merge_args(argv):
+def merge_command(argv):
     """Inspect actual argv; option values never become flags or selectors."""
     args = argv[1:]
     repo = None
@@ -141,35 +141,75 @@ def merge_args(argv):
         elif flag.startswith('-R') and len(flag) > 2:
             repo = flag[2:].lstrip('=')
         else:
+            if flag.startswith('-'):
+                raise ValueError('unsupported option before PR verb; pass repository options explicitly')
             return None
     if not args or args.pop(0) != 'merge':
         return None
-    admin = False
+    action_flags = {'admin': False, 'auto': False, 'disable-auto': False}
     selector = None
     heads = []
+    options = []
+    positional = False
     while args:
         flag = args.pop(0)
-        if flag in ('--admin', '--admin=true', '--admin=True', '--admin=TRUE', '--admin=t', '--admin=T', '--admin=1'):
-            admin = True
-        elif flag in ('--admin=false', '--admin=False', '--admin=FALSE', '--admin=f', '--admin=F', '--admin=0'):
-            pass
-        elif flag in ('--repo', '-R', '--match-head-commit', '--body', '-b', '--body-file', '-F', '--subject', '-t', '--author-email', '-A'):
-            if not args:
-                raise ValueError(f'{flag} needs a value')
-            value = args.pop(0)
-            if flag in ('--repo', '-R'):
-                repo = value
-            elif flag == '--match-head-commit':
-                heads.append(value)
-        elif flag.startswith('--match-head-commit='):
-            heads.append(flag.split('=', 1)[1])
-        elif flag.startswith('--repo='):
-            repo = flag.split('=', 1)[1]
-        elif flag.startswith('-R') and len(flag) > 2:
-            repo = flag[2:].lstrip('=')
-        elif not flag.startswith('-') and selector is None:
+        if flag == '--' and not positional:
+            positional = True
+            continue
+        if positional or not flag.startswith('-'):
+            if selector is not None:
+                raise ValueError('merge requires at most one PR selector')
             selector = flag
-    return (selector, repo, heads) if admin else None
+            continue
+        key, equal, attached = flag.partition('=')
+        if key in ('--admin', '--auto', '--disable-auto'):
+            value = True
+            if equal:
+                if attached.lower() not in ('true', 't', '1', 'false', 'f', '0'):
+                    raise ValueError(f'{key} needs a boolean value')
+                value = attached.lower() in ('true', 't', '1')
+            action_flags[key[2:]] = value
+            options.append(flag)
+        elif key in ('--repo', '-R', '--match-head-commit', '--body', '-b', '--body-file', '-F', '--subject', '-t', '--author-email', '-A'):
+            if equal:
+                value = attached
+                spelling = [flag]
+            else:
+                if not args:
+                    raise ValueError(f'{flag} needs a value')
+                value = args.pop(0)
+                spelling = [flag, value]
+            if key in ('--repo', '-R'):
+                repo = value
+            else:
+                options.extend(spelling)
+                if key == '--match-head-commit':
+                    heads.append(value)
+        elif len(flag) > 2 and flag[:2] in ('-R', '-b', '-F', '-t', '-A'):
+            value = flag[2:].lstrip('=')
+            if flag[:2] == '-R':
+                repo = value
+            else:
+                options.append(flag)
+        elif key in ('--squash', '-s', '--merge', '-m', '--rebase', '-r', '--delete-branch', '-d'):
+            options.append(flag)
+        elif flag in ('--help', '-h'):
+            return None
+        else:
+            raise ValueError(f'unsupported merge option {flag}; use explicit merge flags')
+    action = ('retraction' if action_flags['disable-auto'] else
+              'deferred' if action_flags['auto'] else
+              'admin' if action_flags['admin'] else 'ordinary')
+    return {'selector': selector, 'repo': repo, 'heads': heads,
+            'action': action, 'options': options}
+
+
+def merge_args(argv):
+    """Historical admin-only interface; the writer shares the full classifier."""
+    command = merge_command(argv)
+    if command is None or command['action'] != 'admin':
+        return None
+    return command['selector'], command['repo'], command['heads']
 
 
 def response_anchor(body, head):
@@ -394,6 +434,9 @@ if __name__ == '__main__':
             print(json.dumps(validate(json.load(sys.stdin), sys.argv[2], sys.argv[3], dt.datetime.now(dt.timezone.utc))))
         elif sys.argv[1:2] == ['audit']:
             print(json.dumps(audit(json.load(sys.stdin))))
+        elif sys.argv[1:2] == ['classify']:
+            command = merge_command(sys.argv[2:])
+            print(command['action'] if command else '')
         elif sys.argv[1:2] in (['prepare'], ['check']):
             prepare(sys.argv[2:], check_only=sys.argv[1] == 'check')
         else:
