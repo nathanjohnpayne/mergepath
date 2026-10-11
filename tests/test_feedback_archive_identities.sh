@@ -211,7 +211,7 @@ for prior in "$record" "$chunk" "$terminal" "plain Actions narration"; do
     feedback_archive_validate_records "$handoff"; PASS=$((PASS + 1))
   fi
   check test "$(wc -l <"$TMP/api-calls" | tr -d ' ')" = 1
-  check rg -q 'repos/acme/widget/pulls/7' "$TMP/api-calls"
+  check grep -Fq 'repos/acme/widget/pulls/7' "$TMP/api-calls"
 done
 # Archive-time GHAS failed-read and successful markerless-read behavior is
 # exercised through the actual producer, preserving its one-shot API lookup.
@@ -227,6 +227,6 @@ for result in failed empty; do
   check test "$(jq -r '.archive_records[0] | capture("^<!-- mergepath-feedback-archive:v1 (?<data>.+) -->$").data | @base64d | fromjson | .ghas_tiers[0]' "$handoff")" = "$tier"
   feedback_archive_validate_records "$handoff"; PASS=$((PASS + 1))
   check test "$(wc -l <"$TMP/api-calls" | tr -d ' ')" = 1
-  check rg -q 'code-scanning/alerts/26' "$TMP/api-calls"
+  check grep -Fq 'code-scanning/alerts/26' "$TMP/api-calls"
 done
 printf 'feedback-archive-identities: PASS (%s assertions)\n' "$PASS"
