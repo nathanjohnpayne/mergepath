@@ -198,9 +198,11 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     Attached forms retain conservative output verdicts for external or
     locally defined commands/prefixes, query modifiers, changed builtin
     availability (`enable`, aliases or opaque setup), credential-bearing
-    redirections, complex/special targets (including Bash locale selectors) or
+    redirections or assignment prefixes, complex/special targets (including Bash locale selectors) or
     integer/nameref declarations, and numeric, ANSI-C, expanded, dynamic or unknown formats. Repeated
     assignment options and the option delimiter precede the inspected format.
+    Credential-bearing prefixes were also missed by the parent scanner;
+    their diagnostic check here is limited to attached-option assignments.
     Numeric-conversion diagnostics from the separate assignment form remain
     the #1461 gap, unchanged by the option-position repair (#1645).
     Nonordinary attached targets reuse the bounded deferred-text reader for
@@ -2637,7 +2639,7 @@ def _printf_nondiagnostic_format(raw, literal):
 
 _PRINTF_SPECIAL_TARGETS = frozenset({
     "BASH", "BASHOPTS", "BASHPID", "COMP_CWORD", "COMP_POINT", "COLUMNS", "EUID", "HISTFILESIZE",
-    "HISTSIZE", "IGNOREEOF", "LANG", "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES",
+    "HISTSIZE", "HISTCMD", "IGNOREEOF", "LANG", "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES",
     "LC_NUMERIC", "LC_TIME", "LINENO", "LINES", "MAILCHECK", "OPTIND", "PPID",
     "RANDOM", "SECONDS", "SHLVL", "SRANDOM", "TMOUT", "UID", "PIPESTATUS",
     "FUNCNAME", "GROUPS", "DIRSTACK",
@@ -2649,6 +2651,38 @@ def _printf_text_target(raw, target):
     return (re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", target) is not None
             and "$'" not in raw and not _command_word_expands(raw)
             and not target.startswith("BASH_") and target not in _PRINTF_SPECIAL_TARGETS)
+
+
+def _printf_assignment_prefix_has_ref(words, command_index):
+    """Applying a credential-bearing prefix can diagnose before printf."""
+    return any(_ASSIGN_RE.match(word) and _iter_refs(word)
+               for word in words[:command_index])
+
+
+def _printf_assignment_options(seg):
+    """Parse option-position assignments once for command and prefix refs."""
+    resolve_command(seg)
+    idx = seg._cmd_index
+    args = list(_command_arguments(seg.words, idx + 1)) if idx is not None else []
+    option_index = 0
+    assigned = separate = False
+    simple_targets = True
+    while option_index < len(args):
+        option = args[option_index][1]
+        if option == "--":
+            option_index += 1
+            break
+        if option == "-v" and option_index + 1 < len(args):
+            assigned = separate = True
+            option_index += 2
+        elif option is not None and option.startswith("-v") and len(option) > 2:
+            assigned = True
+            simple_targets = (simple_targets and
+                _printf_text_target(args[option_index][0], option[2:]))
+            option_index += 1
+        else:
+            break
+    return args, option_index, assigned, separate, simple_targets
 
 
 def _printf_redirection_has_ref(words):
@@ -2680,26 +2714,7 @@ def classify(seg, emitter_helpers):
         # printf operands; "--" and a format operand end option parsing.
         idx = seg._cmd_index
         if idx is not None:
-            args = list(_command_arguments(seg.words, idx + 1))
-            option_index = 0
-            assigned = False
-            separate = False
-            simple_targets = True
-            while option_index < len(args):
-                option = args[option_index][1]
-                if option == "--":
-                    option_index += 1
-                    break
-                if option == "-v" and option_index + 1 < len(args):
-                    assigned = separate = True
-                    option_index += 2
-                elif option is not None and option.startswith("-v") and len(option) > 2:
-                    assigned = True
-                    simple_targets = (simple_targets and
-                        _printf_text_target(args[option_index][0], option[2:]))
-                    option_index += 1
-                else:
-                    break
+            args, option_index, assigned, separate, simple_targets = _printf_assignment_options(seg)
             # Preserve the separate form's existing #1461 verdict.
             if separate:
                 return ASSIGN
@@ -2708,6 +2723,7 @@ def classify(seg, emitter_helpers):
             if (assigned and simple_targets and seg._cmd_literal == "printf" and not seg._cmd_external
                     and cmd not in emitter_helpers and option_index < len(args)
                     and not _printf_redirection_has_ref(seg.words)
+                    and not _printf_assignment_prefix_has_ref(seg.words, idx)
                     and _printf_nondiagnostic_format(*args[option_index])):
                 return ASSIGN
         return EMIT
@@ -2868,6 +2884,13 @@ def reaches_output(ref, emitter_helpers):
     if ref.in_assign_prefix:
         # `GH_TOKEN="$PAT" cmd ...` puts the value in the child's ENVIRONMENT.
         cmd, _ = resolve_command(ref.seg)
+        if cmd == "printf":
+            _args, _index, assigned, separate, _targets = _printf_assignment_options(ref.seg)
+            if assigned and not separate:
+                return True, (
+                    "a credential-bearing assignment prefix on attached printf "
+                    "assignment options, which may diagnose before printf runs"
+                )
         if cmd in ENV_DUMPERS:
             return True, (
                 "an env-prefix assignment handed to %s, which dumps the "
@@ -5472,6 +5495,26 @@ CORPUS = [
         'unset LC_ALL\nprintf -vLC_MONETARY \'%s\' "$GH_TOKEN"\n',
     ),
     (
+        'printf-v-histcmd-target-diagnostic',
+        MUST_FLAG,
+        'GH_TOKEN="$GH_TOKEN."\nprintf -vHISTCMD \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-locale-assignment-prefix',
+        MUST_FLAG,
+        'LC_ALL="$GH_TOKEN" printf -vout \'%s\' harmless\n',
+    ),
+    (
+        'printf-v-ordinary-assignment-prefix',
+        MUST_FLAG,
+        'OTHER="$GH_TOKEN" printf -vout \'%s\' harmless\n',
+    ),
+    (
+        'printf-v-literal-assignment-prefix',
+        MUST_NOT_FLAG,
+        'LC_ALL=C printf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
         "printf-v-integer-target-diagnostic",
         MUST_FLAG,
         "declare -i out\nGH_TOKEN=\"$GH_TOKEN.\"\nprintf -vout '%s' \"$GH_TOKEN\"\n",
@@ -6811,6 +6854,11 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    "printf-v-ordinary-assignment-prefix": (
+        "credential-bearing prefixes on attached printf assignments are "
+        "flagged because applying a prefix can diagnose before printf runs; "
+        "this ordinary variable control does not diagnose"
+    ),
     "printf-v-locale-lang": (
         "LANG participates in shell locale selection; retain the parent "
         "attached-option verdict without proving the controlling locale state, "
