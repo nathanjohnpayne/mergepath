@@ -109,6 +109,41 @@ else
   fail "--global writes: rc=$RC out=$OUT"
 fi
 
+# Case 4b: Git accepts the unique long-option prefixes --gl/--sy and up.
+# Scan-only snippets do not write any global or system configuration.
+for SCOPE in --gl --glo --glob --globa --global --sy --sys --syst --syste --system; do
+  run_on_fixture "tests/scope-prefix.sh" "git config $SCOPE user.email fixture@example.com
+"
+  if [ "$RC" = "0" ]; then
+    pass "Git-supported out-of-repo scope prefix $SCOPE: allowed"
+  else
+    fail "Git scope prefix $SCOPE rejected: rc=$RC out=$OUT"
+  fi
+done
+for SCOPE in --g --s --glued --systematic; do
+  run_on_fixture "tests/not-scope-prefix.sh" "git config $SCOPE user.email leak@example.com
+"
+  if [ "$RC" = "1" ]; then
+    pass "ambiguous/non-option scope spelling $SCOPE: cannot suppress a writer"
+  else
+    fail "unsupported scope spelling $SCOPE suppressed writer: rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "tests/neighbour-prefix.sh" 'git config --gl user.email fixture@example.com; git config user.email leak@example.com
+'
+if [ "$RC" = "1" ]; then
+  pass "short scope prefix on neighbouring command cannot suppress unscoped writer"
+else
+  fail "neighbouring scope prefix hid writer: rc=$RC out=$OUT"
+fi
+run_on_fixture "tests/trailing-prefix.sh" 'git config user.email leak@example.com --sy
+'
+if [ "$RC" = "1" ]; then
+  pass "short scope prefix after the value cannot suppress unscoped writer"
+else
+  fail "trailing scope prefix hid writer: rc=$RC out=$OUT"
+fi
+
 # Case 5: `git -c key=value <cmd>` is an ephemeral per-command override.
 # It writes no file, so it must never be flagged. Note the lowercase -c
 # is a different flag from the -C the check accepts as a repo target.
@@ -1629,6 +1664,99 @@ if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/list-continuation-html.
   pass "fence opened on a list continuation: HTML cannot exempt"
 else
   fail "list continuation fence: rc=$RC out=$OUT"
+fi
+
+# Case 54g: every same-line nested list marker precedes the fence.
+for PREFIX in '- - ' '1. - ' '> - - '; do
+  case "$PREFIX" in
+    '- - ') CONTINUATION='    ' ;;
+    '1. - ') CONTINUATION='     ' ;;
+    '> - - ') CONTINUATION='>     ' ;;
+  esac
+  run_on_fixture "docs/nested-list-html.md" "$PREFIX"'```bash
+'"$CONTINUATION"'git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+'"$CONTINUATION"'```
+'
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/nested-list-html.md:2'; then
+    pass "same-line nested list $PREFIX fence: HTML cannot exempt"
+  else
+    fail "nested list $PREFIX fence: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/nested-list-shell.md" "$PREFIX"'~~~bash
+'"$CONTINUATION"'git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture
+'"$CONTINUATION"'~~~
+
+`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: evidence outside -->
+'
+  if [ "$RC" = "0" ]; then
+    pass "same-line nested list $PREFIX preserves real shell/HTML exemptions"
+  else
+    fail "nested list $PREFIX real exemptions rejected: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/nested-list-continued.md" "$PREFIX"'```bash
+'"$CONTINUATION"'git config user.email \
+'"$CONTINUATION"'leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+'"$CONTINUATION"'```
+'
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/nested-list-continued.md:2'; then
+    pass "same-line nested list $PREFIX continued command: HTML cannot exempt"
+  else
+    fail "nested list $PREFIX continued command: rc=$RC out=$OUT"
+  fi
+done
+
+# Case 54h: list indentation is measured in columns, including tab stops.
+run_on_fixture "docs/tab-list-html.md" $'- Example:
+\t```bash
+\tgit config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+\t```
+'
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/tab-list-html.md:3'; then
+  pass "tab-indented list fence: HTML cannot exempt"
+else
+  fail "tab-indented list fence: rc=$RC out=$OUT"
+fi
+run_on_fixture "docs/tab-nested-list-html.md" $'-\t-\t~~~bash
+\t\tgit config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+\t\t~~~
+'
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/tab-nested-list-html.md:2'; then
+  pass "tab-separated nested list markers preserve column indentation"
+else
+  fail "tab-separated nested list fence: rc=$RC out=$OUT"
+fi
+run_on_fixture "docs/tab-list-shell.md" $'- Example:
+\t```bash
+\tgit config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture
+\t```
+
+`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: evidence outside -->
+'
+if [ "$RC" = "0" ]; then
+  pass "tab-indented list preserves real shell and outside HTML exemptions"
+else
+  fail "tab-indented list real exemptions rejected: rc=$RC out=$OUT"
+fi
+run_on_fixture "docs/tab-list-ended.md" $'- Example:
+\t```bash
+\tgit config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture
+
+`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: outside ended list -->
+'
+if [ "$RC" = "0" ]; then
+  pass "tab-indented list ending drops unclosed fence context"
+else
+  fail "ended tab-indented list kept stale fence: rc=$RC out=$OUT"
+fi
+run_on_fixture "docs/tab-list-continued.md" $'- Example:
+\t```bash
+\tgit config user.email \\\n\tleak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+\t```
+'
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/tab-list-continued.md:3'; then
+  pass "tab-indented continued command: HTML cannot exempt"
+else
+  fail "tab-indented continued command: rc=$RC out=$OUT"
 fi
 
 # ── Fail-closed: include paths the walk cannot follow ──────────────────
