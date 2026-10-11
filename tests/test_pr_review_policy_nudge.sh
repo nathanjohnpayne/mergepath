@@ -657,6 +657,7 @@ mkdir -p "$WRAPPER_FIXTURE/scripts/ci" "$WRAPPER_FIXTURE/scripts/lib" \
   "$WRAPPER_FIXTURE/tests" "$WRAPPER_FIXTURE/.github/workflows" "$TMP/wrapper-bin"
 cp "$SUBJECT" "$WRAPPER_FIXTURE/scripts/pr-review-policy-nudge.sh"
 cp "$ROOT/scripts/lib/ci-check-modes.sh" "$WRAPPER_FIXTURE/scripts/lib/"
+cp "$ROOT/scripts/lib/blocking-labels.sh" "$WRAPPER_FIXTURE/scripts/lib/"
 cp "$ROOT/.github/workflows/pr-review-policy.yml" "$WRAPPER_FIXTURE/.github/workflows/"
 # The wrapper also requires the #1339 Label Gate test to exist and be
 # executable; an empty stand-in is enough for the --check lane exercised here.
@@ -695,6 +696,44 @@ check_wrapper_condition "github.event.action == 'edited'" 0 \
   "the live wrapper preserves an explicitly supported edited condition"
 check_wrapper_condition "always()" 0 \
   "the live wrapper accepts a dependent job that always reports its result"
+
+# #1241: either direction of one-copy drift must fail the named live assertion.
+# Mutate inert source fixtures, restoring both copies before each probe.
+check_blocking_label_mutation() { # <shell|js> <add|remove>
+  local surface=$1 mutation=$2 rc=0
+  cp "$ROOT/scripts/lib/blocking-labels.sh" "$WRAPPER_FIXTURE/scripts/lib/"
+  cp "$ROOT/.github/workflows/pr-review-policy.yml" "$WRAPPER_FIXTURE/.github/workflows/"
+  python3 - "$WRAPPER_FIXTURE" "$surface" "$mutation" <<'PY'
+from pathlib import Path
+import sys
+
+root, surface, mutation = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+path = root / ("scripts/lib/blocking-labels.sh" if surface == "shell" else ".github/workflows/pr-review-policy.yml")
+text = path.read_text()
+old = "|human-hold)" if surface == "shell" else "              'human-hold',"
+if mutation == "add":
+    new = "|human-hold|new-policy-stop)" if surface == "shell" else old + "\n              'new-policy-stop',"
+else:
+    new = ")" if surface == "shell" else ""
+assert text.count(old) == 1, "mutation anchor must be unique"
+path.write_text(text.replace(old, new))
+PY
+  env PATH="$TMP/wrapper-bin:$PATH" STUB_WRAPPER_ROOT="$WRAPPER_FIXTURE" \
+    bash "$ROOT/scripts/ci/check_pr_review_policy_nudge" --check \
+    >"$TMP/wrapper.out" 2>&1 || rc=$?
+  if [ "$rc" -eq 1 ] && grep -q 'blocking-label parity: shell labels .* differ from Label Gate labels' "$TMP/wrapper.out"; then
+    pass "blocking-label parity rejects $surface-only label $mutation (#1241)"
+  else
+    fail "blocking-label parity mutation $surface/$mutation: rc=$rc; $(cat "$TMP/wrapper.out")"
+  fi
+}
+for surface in shell js; do
+  for mutation in add remove; do
+    check_blocking_label_mutation "$surface" "$mutation"
+  done
+done
+cp "$ROOT/scripts/lib/blocking-labels.sh" "$WRAPPER_FIXTURE/scripts/lib/"
+cp "$ROOT/.github/workflows/pr-review-policy.yml" "$WRAPPER_FIXTURE/.github/workflows/"
 
 # The nudge's `gh api` scan is a structural non-publication fence. Shell allows
 # arbitrary horizontal whitespace between command words, so preserve the one
