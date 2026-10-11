@@ -219,12 +219,16 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     `cat`/`tee` on a HERE-STRING -- unless the file redefines that name, in
     which case the here-string goes to the local function and what a function
     does with its standard input is the declared limit below.  Both definition
-    forms count, with the opening `{` on the DECLARATION line; bash also
-    accepts it on the next line and helper discovery does not.  Body
-    extraction is brace-depth counted over lexer state, so a nested block whose
+    forms count, with brace or subshell bodies on the same or following line,
+    including after inline or intervening comments. Body extraction is
+    compound-depth counted over lexer state, so a nested block whose
     closing brace starts its own line does not end it early.  Discovery
-    iterates to a FIXED POINT, so a helper that reaches an emitter only
-    through other helpers is found however long the chain is.  A helper is
+    retains EVERY recognized body for each name and iterates to a FIXED
+    POINT over all of them, so any emitting body promotes the name and a
+    helper reaching it through other helpers is found regardless of definition
+    order or chain length. Textual definitions are not proof of execution;
+    a later or false-branch emitter can conservatively flag a safe runtime
+    call. No control-flow or runtime function table is inferred. A helper is
     graded on what its body writes, not on where that write GOES, so a helper
     whose emitter feeds a pipe is treated as emitting -- declared conservatism
     below.
@@ -449,6 +453,12 @@ does not catch:
     passed.  All three spellings carry the same verdict on purpose -- flagging
     only the pipe one made the gate contradict itself, and it reds the
     canonical `--with-token` / `--password-stdin` hand-off.
+  * A quote-bearing comment adjacent to a `name()` header without whitespace,
+    as in `helper-adjacent-comment-unmatched-quotes`. The existing declaration
+    word in the Lexer prevents that `#` from starting a comment, so its quotes
+    can hide the later call. Function-body discovery recognizes the real
+    definition; this prior-main tokenization gap remains tracked by #2080
+    (https://github.com/nathanjohnpayne/mergepath/issues/2080).
   * An in-file helper that writes its STANDARD INPUT rather than one of its
     positional parameters (`relay() { cat; }` behind a pipe).  Helper
     discovery models parameters; nothing at the call site says what a helper
@@ -492,6 +502,11 @@ copy of it; this prose is a description of that registry, not a second source:
     HELPER whose emitter is redirected to a file
     (`log() { cat <<< "$1" > out.txt; }`), which helper discovery grades on
     what the body WRITES without asking where the write goes.
+  * A helper name with ANY recognized emitting definition is classified as
+    emitting, even when that definition occurs after the call, in an unexecuted
+    branch, or before a safe redefinition that actually executes (#1467).
+    The fixed point retains all bodies, including inner/outer redefinitions;
+    textual order and branch conditions do not establish runtime lookup.
   * A pipeline whose consumer is NOT a simple command -- `| { read -r v; }`,
     `| ( read -r v )`, and `|&`, whose consumer segment is recorded empty.
     Which command inside a group reads the pipe is a dataflow question a
@@ -1167,6 +1182,7 @@ class Lexer:
         self.logical = []
         self.heredocs = []
         self.func_defs = []  # (name, body_start_index, body_end_index)
+        self.quoted_data_offsets = set()  # Read-only function-header context.
         # Set when the text ends while a here-doc body is still open.  The
         # scanner has lost sync with the file at that point, and a silent
         # loss of the remainder is the failure mode this gate exists to stop.
@@ -1346,6 +1362,8 @@ class Lexer:
 
         while i < n:
             c = text[i]
+            if "'" in quotes or '"' in quotes:
+                self.quoted_data_offsets.add(i)
 
             # ---- inside a here-doc body ----
             if in_heredoc is not None:
@@ -3181,14 +3199,16 @@ _FUNC_DEF_RE = re.compile(
     r"|(?<=\buntil)|(?<=\bthen)|(?<=\bdo)|(?<=\belse)|(?<=\bin)"
     r"|(?<=\btime))[ \t]*(?P<keyword>function[ \t]+)?"
     r"(?P<name>[A-Za-z_][A-Za-z0-9_:.-]*)[ \t]*"
-    r"(?(keyword)(?:\([ \t]*\))?|\([ \t]*\))[ \t\n]*"
+    r"(?(keyword)(?:\([ \t]*\)|(?=[ \t\n]))|\([ \t]*\))"
+    r"(?:[ \t\n]|#[^\n]*\n)*"
     r"(?P<opener>\{|\((?![ \t]*\)))"
 )
 
 
-def _mask_heredoc_body_lines(text):
+def _mask_heredoc_body_lines(text, lx=None):
     """Blank here-doc DATA while preserving every source offset and newline."""
-    lx = Lexer(text)
+    if lx is None:
+        lx = Lexer(text)
     masked = list(text)
     line_starts = [0]
     for i, c in enumerate(text):
@@ -3212,15 +3232,18 @@ def _iter_function_definitions(text):
     command (#1032 external review).
 
     A completed name() or function-keyword header may precede its brace or
-    subshell body on a following line. Empty header parentheses are never a
-    body opener; the match ends at the actual opener for both consumers.
+    subshell body after whitespace or comments. Empty header parentheses are
+    never a body opener; the match ends at the actual opener for both consumers.
     """
     # Function-shaped here-doc DATA is not shell structure.  Discover against
     # an offset-preserving masked copy, then return the body from the original
     # source so a genuine function's own here-doc remains available to helper
     # analysis.
-    structural = _mask_heredoc_body_lines(text)
+    lx = Lexer(text)
+    structural = _mask_heredoc_body_lines(text, lx)
     for m in _FUNC_DEF_RE.finditer(structural):
+        if m.start("name") in lx.quoted_data_offsets:
+            continue
         name = m.group("name")
         if name in RESERVED_WORDS:
             continue
@@ -3264,7 +3287,7 @@ def _printf_callback_changes_lookup(seg):
 
 
 def discover_emitter_helpers(text):
-    """Functions whose body writes one of their own positionals VERBATIM."""
+    """Names with any recognized body writing their positionals VERBATIM."""
     bodies = {}
     # NOT `^[ \t]*`.  A function definition is valid at any COMMAND POSITION,
     # not only at the start of a physical line: `true; log(){ echo "$1"; }`
@@ -3272,13 +3295,16 @@ def discover_emitter_helpers(text):
     # `log "$PAT"` graded as an unknown external command and read clean
     # (#1032 round 6 P1).  The lookbehind keeps `m.start()` on the NAME, so
     # the `function`-form check below still sees the head it expects.
+    # Textual order cannot establish which definitions executed (#1467).
+    # Preserve every body, including definitions after calls or in false branches.
     for _match, name, body in _iter_function_definitions(text):
-        bodies[name] = body
+        bodies.setdefault(name, []).append(body)
 
     # Lex each body ONCE.  What a body does never changes between rounds; only
     # the `helpers` set a call inside it is graded against does, and that is
     # what the fixed point below iterates.
-    lexed = {name: Lexer(body) for name, body in bodies.items()}
+    lexed = [(name, body, Lexer(body))
+             for name, definitions in bodies.items() for body in definitions]
 
     # A local printf or passthrough-prefix definition invalidates the new
     # attached-option builtin exemption even for a non-emitting body.
@@ -3338,7 +3364,7 @@ def discover_emitter_helpers(text):
     # is bounded by the number of functions in the file, so this terminates.
     while True:
         grew = False
-        for name, lx in lexed.items():
+        for name, body_text, lx in lexed:
             if name in helpers:
                 continue
             emits = False
@@ -3379,7 +3405,6 @@ def discover_emitter_helpers(text):
             # both read clean (#1032 round 8 P1).  Graded on the body TEXT,
             # which is what those two mechanisms actually act on.
             if not emits:
-                body_text = bodies.get(name, "")
                 for a, b in _error_word_spans(body_text):
                     if _word_has_verbatim_positional(body_text[a:b]):
                         emits = True
@@ -4946,9 +4971,8 @@ CORPUS = [
         'die() { echo "`printf \'%s\' \'$1\'`"; }\n'
         'die "$GH_TOKEN"\n',
     ),
-    # A redefinition replaces the earlier body in helper discovery, so losing
-    # its close dropped the emitter the first call uses (#1498 review,
-    # r4129909620).
+    # Both emitting definitions must retain their actual body boundaries
+    # despite nested backtick quotes (#1498 review, r4129909620).
     (
         "helper-redefined-with-double-quoted-backtick",
         MUST_FLAG,
@@ -5272,6 +5296,74 @@ CORPUS = [
         MUST_FLAG,
         'd() { echo "$1"; }\nc() { d "$1"; }\nb() { c "$1"; }\n'
         'a() { b "$1"; }\na "$GH_TOKEN"\n',
+    ),
+    # #1467: keep every recognized definition, including bodies that Bash
+    # never executes. Safe runtime calls with a textual emitter are declared
+    # conservative below rather than treated as exact runtime lookup.
+    (
+        'helper-redefinitions-direct-later-safe',
+        MUST_FLAG,
+        'log() { echo "$1"; }\nlog "$GH_TOKEN"\nlog() { :; }\n',
+    ),
+    (
+        'helper-redefinitions-direct-later-emitter',
+        MUST_FLAG,
+        'log() { :; }\nlog "$GH_TOKEN"\nlog() { echo "$1"; }\n',
+    ),
+    (
+        'helper-redefinitions-direct-false-later-safe',
+        MUST_FLAG,
+        'log() { echo "$1"; }\nlog "$GH_TOKEN"\nif false; then log() { :; }; fi\n',
+    ),
+    (
+        'helper-redefinitions-direct-false-later-emitter',
+        MUST_FLAG,
+        'log() { :; }\nlog "$GH_TOKEN"\nif false; then log() { echo "$1"; }; fi\n',
+    ),
+    (
+        'helper-redefinitions-direct-before-call-safe',
+        MUST_FLAG,
+        'log() { echo "$1"; }\nlog() { :; }\nlog "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-redefinitions-direct-before-call-emitter',
+        MUST_FLAG,
+        'log() { :; }\nlog() { echo "$1"; }\nlog "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-redefinitions-chain-inner-later-safe',
+        MUST_FLAG,
+        'inner() { echo "$1"; }\nouter() { inner "$1"; }\nouter "$GH_TOKEN"\ninner() { :; }\n',
+    ),
+    (
+        'helper-redefinitions-chain-outer-later-safe',
+        MUST_FLAG,
+        'inner() { echo "$1"; }\nouter() { inner "$1"; }\nouter "$GH_TOKEN"\nouter() { :; }\n',
+    ),
+    (
+        'helper-redefinitions-chain-all-safe',
+        MUST_NOT_FLAG,
+        'inner() { :; }\nouter() { inner "$1"; }\ninner() { printf %s "${#1}"; }\nouter() { inner "$1"; }\nouter "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-redefinitions-chain-reverse-inner-later-safe',
+        MUST_FLAG,
+        'outer() { inner "$1"; }\ninner() { echo "$1"; }\nouter "$GH_TOKEN"\ninner() { :; }\n',
+    ),
+    (
+        'helper-redefinitions-chain-false-outer-later-safe',
+        MUST_FLAG,
+        'inner() { echo "$1"; }\nouter() { inner "$1"; }\nouter "$GH_TOKEN"\nif false; then outer() { :; }; fi\n',
+    ),
+    (
+        'helper-redefinitions-chain-before-call-safe',
+        MUST_FLAG,
+        'inner() { echo "$1"; }\nouter() { inner "$1"; }\ninner() { :; }\nouter "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-redefinitions-direct-all-safe',
+        MUST_NOT_FLAG,
+        'log() { :; }\nlog() { printf %s "${#1}"; }\nlog "$GH_TOKEN"\n',
     ),
     # --- multi-physical-line constructs ----------------------------------
     (
@@ -6816,6 +6908,54 @@ CORPUS = [
         MUST_FLAG,
         'set -x\nf()\n{\n  set +x\n}\nf\n: "$GH_TOKEN"\n',
     ),
+    (
+        "helper-header-inline-comment",
+        MUST_FLAG,
+        'log() # note\n{ echo "$1"; }\nlog "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-header-intervening-comment",
+        MUST_FLAG,
+        'function log\n# note\n( echo "$1"; )\nlog "$GH_TOKEN"\n',
+    ),
+    (
+        "xtrace-disable-in-commented-header-function",
+        MUST_FLAG,
+        'set -x\nf() # note\n# between\n{\n  set +x\n}\n: "$GH_TOKEN"\n',
+    ),
+    (
+        "xtrace-disable-in-called-commented-header-function",
+        MUST_FLAG,
+        'set -x\nf() # note\n# between\n{\n  set +x\n}\nf\n: "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-shaped-single-quoted-multiline-data",
+        MUST_NOT_FLAG,
+        'data=\'\ntrue()\n{\n echo "$1"\n}\n\'\ntrue "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-shaped-double-quoted-multiline-data",
+        MUST_NOT_FLAG,
+        'data="\ntrue()\n{\n echo $1\n}\n"\ntrue "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-in-quoted-substitution-code",
+        MUST_FLAG,
+        ': "$(function log\n# note\n{ echo "$1"; }\nlog "$GH_TOKEN" >&2)"\n',
+    ),
+    (
+        "helper-in-quoted-substitution-capture-control",
+        MUST_NOT_FLAG,
+        ': "$(function log\n# note\n{ echo "$1"; }\nlog "$GH_TOKEN")"\n',
+    ),
+    (
+        # https://github.com/nathanjohnpayne/mergepath/issues/2080
+        # Independently reproduced on prior main; the Lexer keeps the
+        # declaration word, so an adjacent comment's quotes hide the call.
+        "helper-adjacent-comment-unmatched-quotes",
+        MUST_NOT_FLAG,
+        'log()# ignored quotes \'"\n{ echo "$1"; }\nlog "$GH_TOKEN"\n',
+    ),
     # --- a credential NAME split by a line continuation ------------------
     #
     # Bash removes `\<newline>` before it parses the expansion, so these name
@@ -7392,6 +7532,12 @@ CORPUS.extend(_generated_corpus())
 # fails when an undeclared disagreement appears AND when a declared entry stops
 # disagreeing, so neither list can quietly rot.
 KNOWN_MISSES = {
+    "helper-adjacent-comment-unmatched-quotes": (
+        "#2080 preexisting declaration-word lexer gap: without whitespace before "
+        "an adjacent # comment, unmatched comment quotes hide the later "
+        "helper call. Function discovery recognizes the real body; this "
+        "case does not claim the separate tokenization limit is fixed"
+    ),
     'printf-v-round-six-positional-separate-control': 'Preexisting separate -v positional/array error-word diagnostics are owned by #2061; #1461 is related numeric-format work. Attached eligibility metadata does not alter the output walk.',
     'printf-v-round-six-array-separate-control': 'Preexisting separate -v positional/array error-word diagnostics are owned by #2061; #1461 is related numeric-format work. Attached eligibility metadata does not alter the output walk.',
 
@@ -7536,6 +7682,27 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    'helper-redefinitions-direct-later-emitter': (
+        "Every recognized emitting body promotes its helper name; this safe "
+        "runtime call does not execute that body. Textual order, false branches "
+        "and executed safe redefinitions do not prove runtime lookup (#1467)."
+    ),
+    'helper-redefinitions-direct-false-later-emitter': (
+        "Every recognized emitting body promotes its helper name; this safe "
+        "runtime call does not execute that body. Textual order, false branches "
+        "and executed safe redefinitions do not prove runtime lookup (#1467)."
+    ),
+    'helper-redefinitions-direct-before-call-safe': (
+        "Every recognized emitting body promotes its helper name; this safe "
+        "runtime call does not execute that body. Textual order, false branches "
+        "and executed safe redefinitions do not prove runtime lookup (#1467)."
+    ),
+    'helper-redefinitions-chain-before-call-safe': (
+        "Every recognized emitting body promotes its helper name; this safe "
+        "runtime call does not execute that body. Textual order, false branches "
+        "and executed safe redefinitions do not prove runtime lookup (#1467)."
+    ),
+
     "printf-option-a-readline-target": "Option A rejects every uppercase target, including Readline's editable buffer; the noninteractive oracle does not exercise redisplay and no environment/state proof is claimed",
     "printf-option-a-lowercase-special": "Option A explicitly excludes histchars, auto_resume and _ as lowercase managed targets even when this noninteractive fixture emits nothing",
     "printf-option-a-string-conversion-only": "Option A allows only unmodified %s conversions/plain text; a safe attached %b format deliberately retains the conservative verdict",
@@ -7712,6 +7879,15 @@ KNOWN_BROADER = {
         "author can pragma"
     ),
     "xtrace-disable-in-called-next-line-function": (
+        "a function that IS called and turns tracing off gets no credit for "
+        "it, because a source-text scanner cannot tell a called function from "
+        "an uncalled one.  The asymmetry is deliberate and the two directions "
+        "are not symmetric in cost: crediting a disable bash never runs is a "
+        "SILENT FALSE NEGATIVE and is trivially reachable (`set -x; f() { "
+        "set +x; }`), while refusing a real one costs a visible finding the "
+        "author can pragma"
+    ),
+    "xtrace-disable-in-called-commented-header-function": (
         "a function that IS called and turns tracing off gets no credit for "
         "it, because a source-text scanner cannot tell a called function from "
         "an uncalled one.  The asymmetry is deliberate and the two directions "
@@ -8278,23 +8454,46 @@ def _function_definition_cases():
     """Pin shared body discovery, source spans and the production consumers."""
     failures = []
     for header in ("log()", "function log", "function log()"):
-        for opener, closer in (("{", "}"), ("(", ")")):
-            body = '\n  echo "$1"\n'
-            text = header + "\n" + opener + body + closer + '\nlog "$GH_TOKEN"\n'
-            definitions = list(_iter_function_definitions(text))
-            if (len(definitions) != 1 or definitions[0][1:] != ("log", body)
-                    or text[definitions[0][0].end() - 1] != opener):
-                failures.append("function body discovery: %r" % text)
-            if _function_body_line_spans(text) != [(2, 4)]:
-                failures.append("function body span: %r" % text)
-            findings, errors = scan_text(PROLOGUE + text)
-            if "log" not in discover_emitter_helpers(text) or not findings or errors:
-                failures.append("next-line helper production scan: %r" % text)
+        separators = ("\n", " # note\n", "\n# note\n",
+                      " # ignored { ( quotes '\"\n# second comment\n\n")
+        if header.endswith(")"):
+            separators += ("# note\n",)
+        for separator in separators:
+            for opener, closer in (("{", "}"), ("(", ")")):
+                body = '\n  echo "$1"\n'
+                text = header + separator + opener + body + closer + '\nlog "$GH_TOKEN"\n'
+                definitions = list(_iter_function_definitions(text))
+                if (len(definitions) != 1 or definitions[0][1:] != ("log", body)
+                        or definitions[0][0].end() - 1 != len(header + separator)):
+                    failures.append("function body discovery: %r" % text)
+                start_line = 1 + separator.count("\n")
+                if _function_body_line_spans(text) != [(start_line, start_line + 2)]:
+                    failures.append("function body span: %r" % text)
+                findings, errors = scan_text(PROLOGUE + text)
+                if "log" not in discover_emitter_helpers(text) or not findings or errors:
+                    failures.append("next-line helper production scan: %r" % text)
     for text in ("log()\necho safe\n", "function log()\necho safe\n",
                  "log\n( echo safe; )\n", "log()\n", "function log\n",
-                 "cat <<'EOF' >/dev/null\nlog()\n{ echo \"$1\"; }\nEOF\n"):
+                 "log() # comment only { (\n", "function log # no body\n",
+                 "function log# note\n{ echo safe; }\n",
+                 "function log#note\n{ echo safe; }\n",
+                 "log() '# note'\n{ echo safe; }\n",
+                 'log() "# note"\n( echo safe; )\n',
+                 "cat <<'EOF' >/dev/null\nlog()\n{ echo \"$1\"; }\nEOF\n",
+                 "cat <<'EOF' >/dev/null\nlog() # note\n{ echo \"$1\"; }\nEOF\n"):
         if list(_iter_function_definitions(text)) or _function_body_line_spans(text):
             failures.append("non-definition acquired a body: %r" % text)
+    for text in (
+        'data=\'\ntrue()\n{\n echo "$1"\n}\n\'\ntrue "$GH_TOKEN"\n',
+        'data="\ntrue()\n{\n echo $1\n}\n"\ntrue "$GH_TOKEN"\n',
+    ):
+        findings, errors = scan_text(PROLOGUE + text)
+        if list(_iter_function_definitions(text)) or findings or errors:
+            failures.append("quoted data acquired an emitting helper: %r" % text)
+    executed = ': "$(function log\n# note\n{ echo "$1"; }\nlog "$GH_TOKEN" >&2)"\n'
+    findings, errors = scan_text(PROLOGUE + executed)
+    if "log" not in discover_emitter_helpers(executed) or not findings or errors:
+        failures.append("quoted substitution code lost helper discovery")
     return failures
 
 
