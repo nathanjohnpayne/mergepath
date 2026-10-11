@@ -219,9 +219,13 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     `cat`/`tee` on a HERE-STRING -- unless the file redefines that name, in
     which case the here-string goes to the local function and what a function
     does with its standard input is the declared limit below.  Both definition
-    forms count, with the opening `{` on the DECLARATION line; bash also
-    accepts it on the next line and helper discovery does not.  Body
-    extraction is brace-depth counted over lexer state, so a nested block whose
+    forms count, with brace or subshell bodies on the same or following line,
+    including after inline or intervening comments. Quoted data and actual
+    comments are excluded using existing lexer context, remapped from child
+    substitutions; interpolating here-doc substitutions retain their executable
+    source while their surrounding and nested here-doc data stay masked.
+    Body extraction is
+    compound-depth counted over lexer state, so a nested block whose
     closing brace starts its own line does not end it early.  Discovery
     retains EVERY recognized body for each name and iterates to a FIXED
     POINT over all of them, so any emitting body promotes the name and a
@@ -411,7 +415,7 @@ The list below mixes TWO KINDS of gap and says which is which.  Most of it is
 the DESIGN LIMIT: this is a single-hop source-text scanner over one logical line
 at a time, with no dataflow, no cross-file analysis, and no knowledge of what a
 variable holds at runtime, so indirection, external commands, interpreters and
-unscanned files are permanently out of reach.  Three bullets are marked (#1035)
+unscanned files are permanently out of reach.  Two bullets are marked (#1035)
 instead: those are `resolve_command` / `classify` mis-deciding what a segment
 RUNS, a repairable seam with an open issue, not a property of the design.  It
 does not catch:
@@ -447,9 +451,6 @@ does not catch:
     option ARGUMENT: `timeout 5 echo "$PAT"` and `nice -n 5 echo "$PAT"` both
     resolve to `5` and read clean.  Wrapper OPTIONS are stepped over; wrapper
     operands are not parsed.
-  * (#1035) A message helper whose opening `{` starts the line AFTER the
-    declaration (`log()` then `{ echo "$1"; }`).  The one-line spelling of the
-    same helper is found and flagged, so this is a spelling gap in discovery.
   * A token handed to an EXTERNAL command -- as an ARGUMENT
     (`curl -H "Authorization: Bearer $CF_API_TOKEN"`), on a HERE-STRING
     (`grep . <<< "$PAT"`), or through a PIPE (`printf '%s' "$PAT" | grep .`).
@@ -460,6 +461,12 @@ does not catch:
     passed.  All three spellings carry the same verdict on purpose -- flagging
     only the pipe one made the gate contradict itself, and it reds the
     canonical `--with-token` / `--password-stdin` hand-off.
+  * A quote-bearing comment adjacent to a `name()` header without whitespace,
+    as in `helper-adjacent-comment-unmatched-quotes`. The existing declaration
+    word in the Lexer prevents that `#` from starting a comment, so its quotes
+    can hide the later call. Function-body discovery recognizes the real
+    definition; this prior-main tokenization gap remains tracked by #2080
+    (https://github.com/nathanjohnpayne/mergepath/issues/2080).
   * An in-file helper that writes its STANDARD INPUT rather than one of its
     positional parameters (`relay() { cat; }` behind a pipe).  Helper
     discovery models parameters; nothing at the call site says what a helper
@@ -1183,6 +1190,9 @@ class Lexer:
         self.logical = []
         self.heredocs = []
         self.func_defs = []  # (name, body_start_index, body_end_index)
+        self.quoted_data_offsets = set()  # Read-only function-header context.
+        self.comment_offsets = set()
+        self.function_source_children = []  # (original body offset, child Lexer)
         # Set when the text ends while a here-doc body is still open.  The
         # scanner has lost sync with the file at that point, and a silent
         # loss of the remainder is the failure mode this gate exists to stop.
@@ -1190,8 +1200,17 @@ class Lexer:
         self._sid = 0
         self._run()
 
+    def _absorb_function_context(self, sub, body_offset):
+        """Retain child source context without changing tokens or references."""
+        self.quoted_data_offsets.update(
+            body_offset + i for i in sub.quoted_data_offsets
+        )
+        self.comment_offsets.update(body_offset + i for i in sub.comment_offsets)
+        self.function_source_children.append((body_offset, sub))
+
     def _absorb_substitutions(
-        self, inner, parent_seg, base_line, cur_ll, in_heredoc_body=False
+        self, inner, parent_seg, base_line, cur_ll,
+        in_heredoc_body=False, source_offset=0,
     ):
         """Lex the `$( )` bodies inside `inner`; return `inner` with them masked.
 
@@ -1217,6 +1236,9 @@ class Lexer:
             cursor = end
             body_line = base_line + inner[:start].count("\n")
             sub = Lexer(body)
+            prefix = 2 if inner[start : start + 2] == "$(" else 1
+            body_offset = source_offset + start + prefix
+            self._absorb_function_context(sub, body_offset)
             for ll in sub.logical:
                 for seg in ll.segments:
                     if seg.parent is None:
@@ -1236,8 +1258,12 @@ class Lexer:
             return
         start_line = hd.body_lines[0][0]
         body = "\n".join(raw for _lno, raw in hd.body_lines)
+        source_offset = sum(
+            len(raw) + 1 for raw in self.text.split("\n")[: start_line - 1]
+        )
         masked = self._absorb_substitutions(
-            body, hd.owner, start_line, cur_ll, in_heredoc_body=True
+            body, hd.owner, start_line, cur_ll, in_heredoc_body=True,
+            source_offset=source_offset,
         )
         for offset, raw in enumerate(masked.split("\n")):
             for name, in_ew in _iter_refs_ew(raw):
@@ -1362,6 +1388,8 @@ class Lexer:
 
         while i < n:
             c = text[i]
+            if "'" in quotes or '"' in quotes:
+                self.quoted_data_offsets.add(i)
 
             # ---- inside a here-doc body ----
             if in_heredoc is not None:
@@ -1432,6 +1460,7 @@ class Lexer:
                 if eol == -1:
                     eol = n
                 comment = text[i:eol]
+                self.comment_offsets.update(range(i, eol))
                 m = _PRAGMA_RE.search(comment)
                 if m:
                     reason = (m.group(1) or "").strip()
@@ -1556,6 +1585,7 @@ class Lexer:
                 inner = text[i + 1 : close]
                 parent_seg = cur_level()["seg"]
                 sub = Lexer(inner)
+                self._absorb_function_context(sub, i + 1)
                 for ll in sub.logical:
                     # Re-parent the segments the sub-lexer left PARENTLESS,
                     # the same rule `_absorb_substitutions` uses.  Re-parenting
@@ -1790,7 +1820,7 @@ class Lexer:
                     j = _skip_balanced_parens(text, i)
                     inner = text[i:j]
                     self._absorb_substitutions(
-                        inner, cur_level()["seg"], line, cur_ll
+                        inner, cur_level()["seg"], line, cur_ll, source_offset=i
                     )
                     cur_level()["word"].append(inner.replace("\n", " "))
                     line += inner.count("\n")
@@ -3195,15 +3225,18 @@ def _find_compound_close_legacy(text, open_idx):
 _FUNC_DEF_RE = re.compile(
     r"(?m)(?:^|(?<=[;&|(){}!])|(?<=\bif)|(?<=\belif)|(?<=\bwhile)"
     r"|(?<=\buntil)|(?<=\bthen)|(?<=\bdo)|(?<=\belse)|(?<=\bin)"
-    r"|(?<=\btime))[ \t]*(?:function[ \t]+)?"
-    r"([A-Za-z_][A-Za-z0-9_:.-]*)[ \t]*"
-    r"(?:\([ \t]*\))?[ \t]*([\{(])"
+    r"|(?<=\btime))[ \t]*(?P<keyword>function[ \t]+)?"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_:.-]*)[ \t]*"
+    r"(?(keyword)(?:\([ \t]*\)|(?=[ \t\n]))|\([ \t]*\))"
+    r"(?:[ \t\n]|#[^\n]*\n)*"
+    r"(?P<opener>\{|\((?![ \t]*\)))"
 )
 
 
-def _mask_heredoc_body_lines(text):
-    """Blank here-doc DATA while preserving every source offset and newline."""
-    lx = Lexer(text)
+def _mask_heredoc_body_lines(text, lx=None):
+    """Blank here-doc DATA, retaining already-lexed executable child source."""
+    if lx is None:
+        lx = Lexer(text)
     masked = list(text)
     line_starts = [0]
     for i, c in enumerate(text):
@@ -3213,6 +3246,12 @@ def _mask_heredoc_body_lines(text):
         for line, raw in hd.body_lines:
             start = line_starts[line - 1]
             masked[start : start + len(raw)] = " " * len(raw)
+    # An interpolating here-doc runs its substitutions. Restore their source,
+    # recursively masking the child's own here-doc DATA; quotes and comments
+    # retain the child Lexer's original offsets for the iterator's exclusions.
+    for start, sub in lx.function_source_children:
+        structural = _mask_heredoc_body_lines(sub.text, sub)
+        masked[start : start + len(structural)] = structural
     return "".join(masked)
 
 
@@ -3225,18 +3264,25 @@ def _iter_function_definitions(text):
     three copied regexes drifted together and still omitted those positions,
     letting a positional-emitting helper defined there read as an unknown safe
     command (#1032 external review).
+
+    A completed name() or function-keyword header may precede its brace or
+    subshell body after whitespace or comments. Empty header parentheses are
+    never a body opener; the match ends at the actual opener for both consumers.
     """
     # Function-shaped here-doc DATA is not shell structure.  Discover against
     # an offset-preserving masked copy, then return the body from the original
     # source so a genuine function's own here-doc remains available to helper
     # analysis.
-    structural = _mask_heredoc_body_lines(text)
+    lx = Lexer(text)
+    structural = _mask_heredoc_body_lines(text, lx)
     for m in _FUNC_DEF_RE.finditer(structural):
-        name = m.group(1)
-        if name in RESERVED_WORDS:
+        if (
+            m.start("name") in lx.quoted_data_offsets
+            or m.start("name") in lx.comment_offsets
+        ):
             continue
-        head = text[m.start() : m.end()]
-        if "(" not in head and not head.lstrip().startswith("function"):
+        name = m.group("name")
+        if name in RESERVED_WORDS:
             continue
         open_idx = m.end() - 1
         close_idx = _find_compound_close(structural, open_idx)
@@ -6645,12 +6691,9 @@ CORPUS = [
         "printf '%s\\n' -v \"$GH_TOKEN\"\n",
     ),
     (
-        # Bash accepts the opening brace on the line AFTER the declaration;
-        # helper discovery requires it on the declaration line.  The one-line
-        # spelling of this same helper is `helper-star` above, and IS flagged,
-        # so this is a spelling gap rather than a design gap.
+        # Completed headers and following-line bodies share helper discovery.
         "helper-brace-on-next-line",
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'log()\n{ echo "$1"; }\nlog "$GH_TOKEN"\n',
     ),
     (
@@ -7112,6 +7155,137 @@ CORPUS = [
         "xtrace-disable-in-called-function",
         MUST_FLAG,
         'set -x\nf() { set +x; }\nf\n: "$GH_TOKEN"\necho ok\n',
+    ),
+    (
+        "xtrace-disable-in-next-line-function",
+        MUST_FLAG,
+        'set -x\nf()\n{\n  set +x\n}\n: "$GH_TOKEN"\n',
+    ),
+    (
+        # A called function still receives no control-flow credit for set +x.
+        "xtrace-disable-in-called-next-line-function",
+        MUST_FLAG,
+        'set -x\nf()\n{\n  set +x\n}\nf\n: "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-header-inline-comment",
+        MUST_FLAG,
+        'log() # note\n{ echo "$1"; }\nlog "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-header-intervening-comment",
+        MUST_FLAG,
+        'function log\n# note\n( echo "$1"; )\nlog "$GH_TOKEN"\n',
+    ),
+    (
+        "xtrace-disable-in-commented-header-function",
+        MUST_FLAG,
+        'set -x\nf() # note\n# between\n{\n  set +x\n}\n: "$GH_TOKEN"\n',
+    ),
+    (
+        "xtrace-disable-in-called-commented-header-function",
+        MUST_FLAG,
+        'set -x\nf() # note\n# between\n{\n  set +x\n}\nf\n: "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-shaped-single-quoted-multiline-data",
+        MUST_NOT_FLAG,
+        'data=\'\ntrue()\n{\n echo "$1"\n}\n\'\ntrue "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-shaped-double-quoted-multiline-data",
+        MUST_NOT_FLAG,
+        'data="\ntrue()\n{\n echo $1\n}\n"\ntrue "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-in-quoted-substitution-code",
+        MUST_FLAG,
+        ': "$(function log\n# note\n{ echo "$1"; }\nlog "$GH_TOKEN" >&2)"\n',
+    ),
+    (
+        "helper-in-quoted-substitution-capture-control",
+        MUST_NOT_FLAG,
+        ': "$(function log\n# note\n{ echo "$1"; }\nlog "$GH_TOKEN")"\n',
+    ),
+    (
+        # https://github.com/nathanjohnpayne/mergepath/issues/2080
+        # Independently reproduced on prior main; the Lexer keeps the
+        # declaration word, so an adjacent comment's quotes hide the call.
+        "helper-adjacent-comment-unmatched-quotes",
+        MUST_NOT_FLAG,
+        'log()# ignored quotes \'"\n{ echo "$1"; }\nlog "$GH_TOKEN"\n',
+    ),
+    # Function source context from already-lexed children (#1647 review).
+    (
+        'helper-backtick-single-quoted-header-data',
+        MUST_NOT_FLAG,
+        'out=`\ndata=\'\ntrue()\n{ echo "$1"; }\n\'\ntrue "$GH_TOKEN" >&2\n`\n',
+    ),
+    (
+        'helper-backtick-double-quoted-header-data',
+        MUST_NOT_FLAG,
+        'out=`\ndata="\ntrue()\n{ echo $1; }\n"\ntrue "$GH_TOKEN" >&2\n`\n',
+    ),
+    (
+        'helper-backtick-comment-header-data',
+        MUST_NOT_FLAG,
+        'out=`\n:;#;true()\n{ echo "$1" >/dev/null; }\ntrue "$GH_TOKEN" >&2\n`\n',
+    ),
+    (
+        'helper-backtick-next-line-code',
+        MUST_FLAG,
+        'out=`\nfunction log\n{ echo "$1"; }\nlog "$GH_TOKEN" >&2`\n',
+    ),
+    (
+        'helper-comment-header-data',
+        MUST_NOT_FLAG,
+        ':;#;true()\n{ echo "$1" >/dev/null; }\ntrue "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-function-after-comment-header-data',
+        MUST_FLAG,
+        'set -x\n:;#;true()\nf()\n{ set +x; }\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-interpolating-heredoc-substitution',
+        MUST_FLAG,
+        'cat <<EOF >/dev/null\n$(function log\n{ echo "$1"; }\nlog "$GH_TOKEN" >&2)\nEOF\n',
+    ),
+    (
+        'helper-noninterpolating-heredoc-substitution-data',
+        MUST_NOT_FLAG,
+        'cat <<\'EOF\' >/dev/null\n$(function log\n{ echo "$1"; }\nlog "$GH_TOKEN" >&2)\nEOF\n',
+    ),
+    (
+        'helper-interpolating-heredoc-plain-data',
+        MUST_NOT_FLAG,
+        'cat <<EOF >/dev/null\nfunction log\n{ echo "$1"; }\nEOF\ntrue "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-substitution-quoted-data',
+        MUST_NOT_FLAG,
+        'cat <<EOF >/dev/null\n$(data=\'\ntrue()\n{ echo "$1"; }\n\'\ntrue "$GH_TOKEN" >&2)\nEOF\n',
+    ),
+    (
+        'helper-heredoc-substitution-comment-data',
+        MUST_NOT_FLAG,
+        'cat <<EOF >/dev/null\n$(:;#;true()\n{ echo "$1" >/dev/null; }\ntrue "$GH_TOKEN" >&2)\nEOF\n',
+    ),
+    (
+        'helper-heredoc-substitution-nested-heredoc-data',
+        MUST_NOT_FLAG,
+        'cat <<EOF >/dev/null\n$(cat <<\'INNER\' >/dev/null\ntrue()\n{ echo "$1"; }\nINNER\ntrue "$GH_TOKEN" >&2)\nEOF\n',
+    ),
+    # CR inside shell literal data does not start a physical source line.
+    (
+        'helper-heredoc-after-cr-literal',
+        MUST_FLAG,
+        ': \'x\ry\'\ncat <<EOF >/dev/null\n$(function log\n{ echo "$1"; }\nlog "$GH_TOKEN" >&2)\nEOF\n',
+    ),
+    (
+        'helper-quoted-heredoc-after-cr-literal',
+        MUST_NOT_FLAG,
+        ': \'x\ry\'\ncat <<\'EOF\' >/dev/null\n$(function log\n{ echo "$1"; }\nlog "$GH_TOKEN" >&2)\nEOF\n',
     ),
     # --- a credential NAME split by a line continuation ------------------
     #
@@ -7689,6 +7863,12 @@ CORPUS.extend(_generated_corpus())
 # fails when an undeclared disagreement appears AND when a declared entry stops
 # disagreeing, so neither list can quietly rot.
 KNOWN_MISSES = {
+    "helper-adjacent-comment-unmatched-quotes": (
+        "#2080 preexisting declaration-word lexer gap: without whitespace before "
+        "an adjacent # comment, unmatched comment quotes hide the later "
+        "helper call. Function discovery recognizes the real body; this "
+        "case does not claim the separate tokenization limit is fixed"
+    ),
     'printf-v-round-six-positional-separate-control': 'Preexisting separate -v positional/array error-word diagnostics are owned by #2061; #1461 is related numeric-format work. Attached eligibility metadata does not alter the output walk.',
     'printf-v-round-six-array-separate-control': 'Preexisting separate -v positional/array error-word diagnostics are owned by #2061; #1461 is related numeric-format work. Attached eligibility metadata does not alter the output walk.',
 
@@ -7810,11 +7990,6 @@ KNOWN_MISSES = {
     "wrapper-operand-nice": (
         "the same wrapper gap reached through an option's ARGUMENT: `-n` is "
         "stepped over as a lone option, so `5` becomes the command word"
-    ),
-    "helper-brace-on-next-line": (
-        "helper discovery requires the opening `{` on the declaration line; "
-        "bash accepts it on the next one.  The one-line spelling of the same "
-        "helper IS found, so this is a spelling gap, not a design gap"
     ),
     "dumper-bare-set": (
         "`ENV_DUMPERS -> EMIT` lives in `classify()`, and `classify()` is "
@@ -8050,6 +8225,24 @@ KNOWN_BROADER = {
         "shadow, which is escapable at the call site with the pragma"
     ),
     "xtrace-disable-in-called-function": (
+        "a function that IS called and turns tracing off gets no credit for "
+        "it, because a source-text scanner cannot tell a called function from "
+        "an uncalled one.  The asymmetry is deliberate and the two directions "
+        "are not symmetric in cost: crediting a disable bash never runs is a "
+        "SILENT FALSE NEGATIVE and is trivially reachable (`set -x; f() { "
+        "set +x; }`), while refusing a real one costs a visible finding the "
+        "author can pragma"
+    ),
+    "xtrace-disable-in-called-next-line-function": (
+        "a function that IS called and turns tracing off gets no credit for "
+        "it, because a source-text scanner cannot tell a called function from "
+        "an uncalled one.  The asymmetry is deliberate and the two directions "
+        "are not symmetric in cost: crediting a disable bash never runs is a "
+        "SILENT FALSE NEGATIVE and is trivially reachable (`set -x; f() { "
+        "set +x; }`), while refusing a real one costs a visible finding the "
+        "author can pragma"
+    ),
+    "xtrace-disable-in-called-commented-header-function": (
         "a function that IS called and turns tracing off gets no credit for "
         "it, because a source-text scanner cannot tell a called function from "
         "an uncalled one.  The asymmetry is deliberate and the two directions "
@@ -8612,6 +8805,66 @@ def _printf_allowlist_cases():
     return failures
 
 
+def _function_definition_cases():
+    """Pin shared body discovery, source spans and the production consumers."""
+    failures = []
+    for header in ("log()", "function log", "function log()"):
+        separators = ("\n", " # note\n", "\n# note\n",
+                      " # ignored { ( quotes '\"\n# second comment\n\n")
+        if header.endswith(")"):
+            separators += ("# note\n",)
+        for separator in separators:
+            for opener, closer in (("{", "}"), ("(", ")")):
+                body = '\n  echo "$1"\n'
+                text = header + separator + opener + body + closer + '\nlog "$GH_TOKEN"\n'
+                definitions = list(_iter_function_definitions(text))
+                if (len(definitions) != 1 or definitions[0][1:] != ("log", body)
+                        or definitions[0][0].end() - 1 != len(header + separator)):
+                    failures.append("function body discovery: %r" % text)
+                start_line = 1 + separator.count("\n")
+                if _function_body_line_spans(text) != [(start_line, start_line + 2)]:
+                    failures.append("function body span: %r" % text)
+                findings, errors = scan_text(PROLOGUE + text)
+                if "log" not in discover_emitter_helpers(text) or not findings or errors:
+                    failures.append("next-line helper production scan: %r" % text)
+    for text in ("log()\necho safe\n", "function log()\necho safe\n",
+                 "log\n( echo safe; )\n", "log()\n", "function log\n",
+                 "log() # comment only { (\n", "function log # no body\n",
+                 "function log# note\n{ echo safe; }\n",
+                 "function log#note\n{ echo safe; }\n",
+                 "log() '# note'\n{ echo safe; }\n",
+                 'log() "# note"\n( echo safe; )\n',
+                 "cat <<'EOF' >/dev/null\nlog()\n{ echo \"$1\"; }\nEOF\n",
+                 "cat <<'EOF' >/dev/null\nlog() # note\n{ echo \"$1\"; }\nEOF\n"):
+        if list(_iter_function_definitions(text)) or _function_body_line_spans(text):
+            failures.append("non-definition acquired a body: %r" % text)
+    for text in (
+        'data=\'\ntrue()\n{\n echo "$1"\n}\n\'\ntrue "$GH_TOKEN"\n',
+        'data="\ntrue()\n{\n echo $1\n}\n"\ntrue "$GH_TOKEN"\n',
+    ):
+        findings, errors = scan_text(PROLOGUE + text)
+        if list(_iter_function_definitions(text)) or findings or errors:
+            failures.append("quoted data acquired an emitting helper: %r" % text)
+    executed = ': "$(function log\n# note\n{ echo "$1"; }\nlog "$GH_TOKEN" >&2)"\n'
+    findings, errors = scan_text(PROLOGUE + executed)
+    if "log" not in discover_emitter_helpers(executed) or not findings or errors:
+        failures.append("quoted substitution code lost helper discovery")
+    # Pin offsets as well as the production verdict: an independent
+    # conservative path can flag a malformed remap while losing the helper.
+    corpus = {name: text for name, _disposition, text in CORPUS}
+    for name, expected in (("helper-heredoc-after-cr-literal", ["log"]),
+                           ("helper-quoted-heredoc-after-cr-literal", [])):
+        text = corpus[name]
+        definitions = list(_iter_function_definitions(text))
+        if [name for _match, name, _body in definitions] != expected:
+            failures.append("physical-LF child source discovery: " + name)
+        for match, _name, body in definitions:
+            if (match.end() - 1 != text.index('{ echo "$1"; }')
+                    or body != ' echo "$1"; '):
+                failures.append("physical-LF child source offset: " + name)
+    return failures
+
+
 def self_test():
     failures = []
     passed = 0
@@ -8619,6 +8872,7 @@ def self_test():
 
     failures.extend(_corpus_id_cases())
     failures.extend(_printf_allowlist_cases())
+    failures.extend(_function_definition_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
