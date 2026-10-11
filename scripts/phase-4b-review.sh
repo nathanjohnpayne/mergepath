@@ -651,20 +651,21 @@ codex_requests_ungoverned() {
 # authority fence. A route without a snapshot re-reads the live generation and
 # refuses the approval if it moved since authorization: a request that arrived
 # after the barrier (the Phase 4a timeout route included) was never reviewed
-# and must not be recorded as covered. Runs BEFORE the final accounting read,
-# which stays the last read before the POST.
+# and must not be recorded as covered. The final mode repeats only this cheap
+# generation read after final accounting, including on request-budget routes.
 refuse_approval_if_request_generation_moved() {
-  local live_gen="" reason evidence payload
+  local mode="${1:-pre-accounting}" live_gen="" reason evidence payload
   [ "$P4B_CODEX_REQUESTS_GOVERN" = true ] || return 0
   if [ -z "$P4B_AUTHORIZED_REQUEST_GENERATION" ]; then
     evidence=request-generation-unrecorded
     reason="the approval carries no authorized Codex request generation; refusing the approval"
-  elif printf '%s' "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" | jq -e '.request_generation | type == "array"' >/dev/null 2>&1; then
+  elif [ "$mode" != final ] && printf '%s' "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" | jq -e '.request_generation | type == "array"' >/dev/null 2>&1; then
     return 0
   elif ! live_gen="$(p4b_live_request_generation "$REPO" "$PR")"; then
     evidence=request-generation-unrecorded
     reason="Codex request generation could not be re-read before the approval; refusing the approval"
-  elif [ "$live_gen" != "$P4B_AUTHORIZED_REQUEST_GENERATION" ]; then
+  elif ! p4b_same_request_generation "{\"request_generation\":$live_gen}" \
+    "{\"request_generation\":$P4B_AUTHORIZED_REQUEST_GENERATION}"; then
     evidence=request-generation-changed
     reason="Codex request generation changed since the run was authorized; refusing the approval"
   else
@@ -1918,23 +1919,21 @@ post_review() {
   # This is a bounded consumer fence, not an atomic GitHub read/write protocol;
   # a residual network interval remains between this observation and the POST.
   revalidate_codex_request_budget_authority pre-post
-  # #1598: the approval body records the Codex request generation it was
-  # authorized under; verify it has not moved. A request that lands during the
-  # final accounting read below predates the approval but is outside the
-  # record, so the substitute merge gate holds the approval until Codex
-  # answers it. Verified here, BEFORE that read, which stays the last one.
+  # Preserve the early generation fence before the immutable-input and final
+  # feedback reads; snapshot routes were just re-proved by the budget fence.
   [ "$event" != "APPROVE" ] || refuse_approval_if_request_generation_moved
-  # That revalidation rebuilds the Codex ledger, a slow read, so a finding can
-  # land during it. Account once more after it so the window left for a late
-  # finding is only the POST itself (#1584 Phase 4b P1). A request that lands
-  # during this read is outside the recorded generation, and the merge gate
-  # holds the approval until Codex answers it or Phase 4b reruns (#1598).
+  # That budget revalidation rebuilds the Codex ledger, a slow read, so account
+  # once more after immutable-input validation for late findings (#1584).
   if ! revalidate_immutable_input; then
     cleanup_pre_post_refusal_side_effects "immutable review input changed before POST" true \
       "The PR input" "the reviewed input of ${REPO}#${PR}"
     p4b_die 3 "immutable review input changed before POST"
   fi
   [ "$event" != "APPROVE" ] || refuse_approval_if_feedback_unaccounted
+  # #1598: a request can arrive during final accounting. Compare only the live
+  # generation with the original authorization; never rebuild the ledger or
+  # treat that late request as covered. Drift/unreadability uses pre-POST cleanup.
+  [ "$event" != "APPROVE" ] || refuse_approval_if_request_generation_moved final
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \
     '{commit_id:$commit_id,event:$event,body:$body}' > "$payload_file"
