@@ -198,10 +198,13 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     Attached forms retain conservative output verdicts for external or
     locally defined commands/prefixes, query modifiers, changed builtin
     availability (`enable`, aliases or opaque setup), credential-bearing
-    redirections, and numeric, ANSI-C, expanded or unknown formats. Repeated
+    redirections, complex/special targets or integer/nameref declarations, and numeric, ANSI-C, expanded
+    or unknown formats. Repeated
     assignment options and the option delimiter precede the inspected format.
     Numeric-conversion diagnostics from the separate assignment form remain
     the #1461 gap, unchanged by the option-position repair (#1645).
+    Nonordinary attached targets reuse the bounded deferred-text reader for
+    quoted evaluation; no new runtime binding or execution model is inferred.
   * An in-file message helper: a function whose body writes one of its own
     positional parameters VERBATIM through an emitter, or hands one to
     `cat`/`tee` on a HERE-STRING -- unless the file redefines that name, in
@@ -2632,6 +2635,21 @@ def _printf_nondiagnostic_format(raw, literal):
     return "%" not in remainder
 
 
+_PRINTF_SPECIAL_TARGETS = frozenset({
+    "BASH", "BASHOPTS", "BASHPID", "COMP_CWORD", "COMP_POINT", "COLUMNS", "EUID", "HISTFILESIZE",
+    "HISTSIZE", "IGNOREEOF", "LINENO", "LINES", "MAILCHECK", "OPTIND", "PPID",
+    "RANDOM", "SECONDS", "SHLVL", "SRANDOM", "TMOUT", "UID", "PIPESTATUS",
+    "FUNCNAME", "GROUPS", "DIRSTACK",
+})
+
+
+def _printf_text_target(raw, target):
+    """Only ordinary scalar names can acquire the new attached exemption."""
+    return (re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", target) is not None
+            and "$'" not in raw and not _command_word_expands(raw)
+            and not target.startswith("BASH_") and target not in _PRINTF_SPECIAL_TARGETS)
+
+
 def _printf_redirection_has_ref(words):
     """A credential-bearing redirection can diagnose before printf executes."""
     operand = False
@@ -2665,6 +2683,7 @@ def classify(seg, emitter_helpers):
             option_index = 0
             assigned = False
             separate = False
+            simple_targets = True
             while option_index < len(args):
                 option = args[option_index][1]
                 if option == "--":
@@ -2675,6 +2694,8 @@ def classify(seg, emitter_helpers):
                     option_index += 2
                 elif option is not None and option.startswith("-v") and len(option) > 2:
                     assigned = True
+                    simple_targets = (simple_targets and
+                        _printf_text_target(args[option_index][0], option[2:]))
                     option_index += 1
                 else:
                     break
@@ -2683,7 +2704,7 @@ def classify(seg, emitter_helpers):
                 return ASSIGN
             # Attached options need the actual format after every option and
             # delimiter, and known builtin availability, before exemption.
-            if (assigned and seg._cmd_literal == "printf" and not seg._cmd_external
+            if (assigned and simple_targets and seg._cmd_literal == "printf" and not seg._cmd_external
                     and cmd not in emitter_helpers and option_index < len(args)
                     and not _printf_redirection_has_ref(seg.words)
                     and _printf_nondiagnostic_format(*args[option_index])):
@@ -3215,6 +3236,18 @@ def discover_emitter_helpers(text):
                 # Opaque setup or aliases may change lookup indirectly. No
                 # execution-state model proves builtin availability afterward.
                 availability_changed = True
+            elif cmd in ("declare", "typeset", "local") and seg._cmd_index is not None:
+                # A plain variable can name an arithmetic array target through
+                # a nameref, or validate its value through an integer attribute.
+                # Do not infer its runtime binding or restoration.
+                for raw, literal in _command_arguments(seg.words, seg._cmd_index + 1):
+                    if literal is None or "$'" in raw or _command_word_expands(raw):
+                        availability_changed = True
+                        break
+                    if literal == "--" or not literal.startswith("-"):
+                        break
+                    if set(literal[1:]) & {"i", "n"}:
+                        availability_changed = True
     shadowed = "printf" in bodies or any(name in PASSTHRU for name in bodies)
     helpers = {"printf"} if shadowed or availability_changed else set()
     # A FIXED POINT, not a fixed number of rounds.  Each round can promote at
@@ -3454,6 +3487,19 @@ _XTRACE_OFF = ("+x", "+o")
 def _deferred_shell_operands(seg):
     """LITERAL operands of a `trap` / `eval` segment, as shell source text."""
     cmd, _redir = resolve_command(seg)
+    if cmd == "printf" and seg._cmd_index is not None:
+        out = []
+        for raw, literal in _command_arguments(seg.words, seg._cmd_index + 1):
+            if literal == "-v":
+                return []  # Keep the prior separate-option scope unchanged.
+            if literal is None or not literal.startswith("-v") or len(literal) == 2:
+                break
+            target = literal[2:]
+            if not _printf_text_target(raw, target):
+                # Indexed targets can evaluate even single-quoted shell text.
+                # Reuse the existing bounded reader, not an execution model.
+                out.append(target)
+        return out
     if cmd in DEFERRED_SHELL_OPTIONS:
         opt = DEFERRED_SHELL_OPTIONS[cmd]
         lits = [_unquote_command_word(w) for w in seg.words]
@@ -5353,6 +5399,53 @@ CORPUS = [
         "printf -vout $'\\x25s' \"$GH_TOKEN\"\n",
     ),
     (
+        "printf-v-array-target-diagnostic",
+        MUST_FLAG,
+        "GH_TOKEN=\"$GH_TOKEN.\"\nprintf -v'out[$GH_TOKEN]' '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-ansi-array-target-diagnostic",
+        MUST_FLAG,
+        "GH_TOKEN=\"$GH_TOKEN.\"\n"
+        "printf $'-vout\\x5bGH_TOKEN\\x5d' '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-nameref-target-diagnostic",
+        MUST_FLAG,
+        "declare -n out='arr[$GH_TOKEN]'\nGH_TOKEN=\"$GH_TOKEN.\"\n"
+        "printf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-executable-array-target",
+        MUST_FLAG,
+        "printf -v'a[$(echo \"$GH_TOKEN\" >&2)]' '%s' harmless\n",
+    ),
+    (
+        "printf-v-special-validating-target",
+        MUST_FLAG,
+        "printf -vBASH_XTRACEFD '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-integer-target-diagnostic",
+        MUST_FLAG,
+        "declare -i out\nGH_TOKEN=\"$GH_TOKEN.\"\nprintf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-integer-scalar-target",
+        MUST_FLAG,
+        "declare -i out\nprintf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-nameref-scalar-target",
+        MUST_FLAG,
+        "declare -n out=other\nprintf -vout '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        "printf-v-array-target-literal",
+        MUST_FLAG,
+        "printf -v'out[0]' '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
         "printf-v-redirection-failure",
         MUST_FLAG,
         "printf -vout '%s' harmless > \"./absent/$GH_TOKEN\"\n",
@@ -6681,6 +6774,18 @@ KNOWN_BROADER = {
         "a local printf definition prevents assuming Bash builtin assignment "
         "semantics, even when this fixture's function writes nothing; retain "
         "the parent attached-option conservative verdict"
+    ),
+    "printf-v-integer-scalar-target": (
+        "integer attributes evaluate values arithmetically; retain the parent "
+        "attached-option verdict even when this sentinel happens to be accepted"
+    ),
+    "printf-v-nameref-scalar-target": (
+        "nameref declarations can redirect a plain target into arithmetic; "
+        "retain the parent attached-option verdict without runtime binding proof"
+    ),
+    "printf-v-array-target-literal": (
+        "array targets can evaluate arithmetic before assignment; retain the "
+        "parent attached-option verdict unless the target is a plain identifier"
     ),
     "printf-v-command-query": (
         "command -v is a query rather than a builtin invocation; retain the "
