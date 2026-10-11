@@ -2,6 +2,16 @@
 # Read-only selectors shared by request deduplication/ack and blocked evidence.
 # A trigger qualifies by complete command body, author, and freshness, not an
 # immutable commit anchor.
+# Read the author from parsed governing policy, shared by the capture producer,
+# request budget and merge checker. Only an absent key uses the legacy default.
+crqe_policy_author() { # policy-json
+  printf '%s' "$1" | jq -er '
+    if type != "object" then error("policy")
+    elif has("author_identity") then
+      .author_identity | select(type == "string" and length > 0)
+    else "nathanjohnpayne" end'
+}
+
 crqe_select_trigger() { # comments-json author since
   printf '%s\n' "$1" | jq -c --arg author "$2" --arg since "$3" '
     [.[] | select((.user.login // "") == $author)
@@ -149,12 +159,7 @@ crqe_governing_budget() { # repo pr default-config candidate-author [resolver [b
   local base_json="" author="" cap="" blocking="" freshness=""
   base_json=$(crqe_governing_policy_json "$repo" "$pr" "$config" "$resolver" \
     "$base_ref" "$base_sha" "$default_branch") || return 1
-  author=$(printf '%s' "$base_json" | jq -er '
-    if type != "object" then error("policy")
-    elif has("author_identity") then
-      if ((.author_identity | type) == "string") and ((.author_identity | length) > 0)
-      then .author_identity else error("author") end
-    else "nathanjohnpayne" end') || return 1
+  author=$(crqe_policy_author "$base_json") || return 1
   if [ "$author" != "$candidate" ]; then
     printf "candidate author_identity '%s' does not match the governing base policy author_identity '%s'\n" \
       "$candidate" "$author" >&2

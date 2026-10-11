@@ -626,6 +626,7 @@ paths:
     # retry semantics are lost — every transient failure becomes a
     # hard rc=3 and the auto-clear stalls.
     requires:
+      - "scripts/lib/feedback-policy-helpers.sh"  # #1618, governing author YAML parser
       - "scripts/lib/codex-request-evidence.sh"   # #1276, shared read-only request/ack selectors
       - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
