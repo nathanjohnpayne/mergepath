@@ -73,6 +73,31 @@ chmod +x "$WORK/stub-barrier-codex.sh" "$WORK/stub-barrier-coderabbit.sh"
 export P4B_CODEX_REVIEW_CHECK="$WORK/stub-barrier-codex.sh"
 export P4B_CODERABBIT_WAIT="$WORK/stub-barrier-coderabbit.sh"
 
+mkdir -p "$WORK/barrier-bin"
+cat >"$WORK/barrier-bin/resolve-policy" <<'EOF'
+#!/bin/sh
+set -eu
+default=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --default-config) default=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+source_path="${P4B_TEST_BASE_POLICY_PATH:-$default}"
+[ -r "$source_path" ] || exit 2
+tmp=$(mktemp "${TMPDIR:-/tmp}/p4b-test-policy.XXXXXX")
+cp "$source_path" "$tmp"
+printf '%s\n' "$tmp"
+EOF
+chmod +x "$WORK/barrier-bin/resolve-policy"
+# Every orchestrator fixture inherits the same governing-policy shim.
+# #1618: no-snapshot request-generation capture also materializes this policy,
+# so install it before the first orchestrator case, not at the later barrier cases.
+# It materializes the fixture's own policy unless a test supplies a distinct
+# base policy, matching the production resolver's ownership contract.
+export P4B_RESOLVE_BASE_POLICY="$WORK/barrier-bin/resolve-policy"
+
 PASS=0; FAIL=0
 pass() { echo "  PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
@@ -4588,27 +4613,7 @@ case "$endpoint" in
 esac
 EOF
 chmod +x "$WORK/barrier-bin/gh"
-cat >"$WORK/barrier-bin/resolve-policy" <<'EOF'
-#!/bin/sh
-set -eu
-default=""
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --default-config) default=$2; shift 2 ;;
-    *) shift ;;
-  esac
-done
-source_path="${P4B_TEST_BASE_POLICY_PATH:-$default}"
-[ -r "$source_path" ] || exit 2
-tmp=$(mktemp "${TMPDIR:-/tmp}/p4b-test-policy.XXXXXX")
-cp "$source_path" "$tmp"
-printf '%s\n' "$tmp"
-EOF
-chmod +x "$WORK/barrier-bin/resolve-policy"
-# Every later orchestrator fixture inherits the same governing-policy shim.
-# It materializes the fixture's own policy unless a test supplies a distinct
-# base policy, matching the production resolver's ownership contract.
-export P4B_RESOLVE_BASE_POLICY="$WORK/barrier-bin/resolve-policy"
+
 
 # #1560 slice 3: the barrier reads the Codex review ledger only when a spent
 # request ceiling would dispatch the adapter. This stub prints a ledger for the
