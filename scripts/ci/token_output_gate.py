@@ -223,8 +223,12 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     accepts it on the next line and helper discovery does not.  Body
     extraction is brace-depth counted over lexer state, so a nested block whose
     closing brace starts its own line does not end it early.  Discovery
-    iterates to a FIXED POINT, so a helper that reaches an emitter only
-    through other helpers is found however long the chain is.  A helper is
+    retains EVERY recognized body for each name and iterates to a FIXED
+    POINT over all of them, so any emitting body promotes the name and a
+    helper reaching it through other helpers is found regardless of definition
+    order or chain length. Textual definitions are not proof of execution;
+    a later or false-branch emitter can conservatively flag a safe runtime
+    call. No control-flow or runtime function table is inferred. A helper is
     graded on what its body writes, not on where that write GOES, so a helper
     whose emitter feeds a pipe is treated as emitting -- declared conservatism
     below.
@@ -495,6 +499,11 @@ copy of it; this prose is a description of that registry, not a second source:
     HELPER whose emitter is redirected to a file
     (`log() { cat <<< "$1" > out.txt; }`), which helper discovery grades on
     what the body WRITES without asking where the write goes.
+  * A helper name with ANY recognized emitting definition is classified as
+    emitting, even when that definition occurs after the call, in an unexecuted
+    branch, or before a safe redefinition that actually executes (#1467).
+    The fixed point retains all bodies, including inner/outer redefinitions;
+    textual order and branch conditions do not establish runtime lookup.
   * A pipeline whose consumer is NOT a simple command -- `| { read -r v; }`,
     `| ( read -r v )`, and `|&`, whose consumer segment is recorded empty.
     Which command inside a group reads the pipe is a dataflow question a
@@ -3265,7 +3274,7 @@ def _printf_callback_changes_lookup(seg):
 
 
 def discover_emitter_helpers(text):
-    """Functions whose body writes one of their own positionals VERBATIM."""
+    """Names with any recognized body writing their positionals VERBATIM."""
     bodies = {}
     # NOT `^[ \t]*`.  A function definition is valid at any COMMAND POSITION,
     # not only at the start of a physical line: `true; log(){ echo "$1"; }`
@@ -3273,13 +3282,16 @@ def discover_emitter_helpers(text):
     # `log "$PAT"` graded as an unknown external command and read clean
     # (#1032 round 6 P1).  The lookbehind keeps `m.start()` on the NAME, so
     # the `function`-form check below still sees the head it expects.
+    # Textual order cannot establish which definitions executed (#1467).
+    # Preserve every body, including definitions after calls or in false branches.
     for _match, name, body in _iter_function_definitions(text):
-        bodies[name] = body
+        bodies.setdefault(name, []).append(body)
 
     # Lex each body ONCE.  What a body does never changes between rounds; only
     # the `helpers` set a call inside it is graded against does, and that is
     # what the fixed point below iterates.
-    lexed = {name: Lexer(body) for name, body in bodies.items()}
+    lexed = [(name, body, Lexer(body))
+             for name, definitions in bodies.items() for body in definitions]
 
     # A local printf or passthrough-prefix definition invalidates the new
     # attached-option builtin exemption even for a non-emitting body.
@@ -3339,7 +3351,7 @@ def discover_emitter_helpers(text):
     # is bounded by the number of functions in the file, so this terminates.
     while True:
         grew = False
-        for name, lx in lexed.items():
+        for name, body_text, lx in lexed:
             if name in helpers:
                 continue
             emits = False
@@ -3380,7 +3392,6 @@ def discover_emitter_helpers(text):
             # both read clean (#1032 round 8 P1).  Graded on the body TEXT,
             # which is what those two mechanisms actually act on.
             if not emits:
-                body_text = bodies.get(name, "")
                 for a, b in _error_word_spans(body_text):
                     if _word_has_verbatim_positional(body_text[a:b]):
                         emits = True
@@ -4947,9 +4958,8 @@ CORPUS = [
         'die() { echo "`printf \'%s\' \'$1\'`"; }\n'
         'die "$GH_TOKEN"\n',
     ),
-    # A redefinition replaces the earlier body in helper discovery, so losing
-    # its close dropped the emitter the first call uses (#1498 review,
-    # r4129909620).
+    # Both emitting definitions must retain their actual body boundaries
+    # despite nested backtick quotes (#1498 review, r4129909620).
     (
         "helper-redefined-with-double-quoted-backtick",
         MUST_FLAG,
@@ -5273,6 +5283,74 @@ CORPUS = [
         MUST_FLAG,
         'd() { echo "$1"; }\nc() { d "$1"; }\nb() { c "$1"; }\n'
         'a() { b "$1"; }\na "$GH_TOKEN"\n',
+    ),
+    # #1467: keep every recognized definition, including bodies that Bash
+    # never executes. Safe runtime calls with a textual emitter are declared
+    # conservative below rather than treated as exact runtime lookup.
+    (
+        'helper-redefinitions-direct-later-safe',
+        MUST_FLAG,
+        'log() { echo "$1"; }\nlog "$GH_TOKEN"\nlog() { :; }\n',
+    ),
+    (
+        'helper-redefinitions-direct-later-emitter',
+        MUST_FLAG,
+        'log() { :; }\nlog "$GH_TOKEN"\nlog() { echo "$1"; }\n',
+    ),
+    (
+        'helper-redefinitions-direct-false-later-safe',
+        MUST_FLAG,
+        'log() { echo "$1"; }\nlog "$GH_TOKEN"\nif false; then log() { :; }; fi\n',
+    ),
+    (
+        'helper-redefinitions-direct-false-later-emitter',
+        MUST_FLAG,
+        'log() { :; }\nlog "$GH_TOKEN"\nif false; then log() { echo "$1"; }; fi\n',
+    ),
+    (
+        'helper-redefinitions-direct-before-call-safe',
+        MUST_FLAG,
+        'log() { echo "$1"; }\nlog() { :; }\nlog "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-redefinitions-direct-before-call-emitter',
+        MUST_FLAG,
+        'log() { :; }\nlog() { echo "$1"; }\nlog "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-redefinitions-chain-inner-later-safe',
+        MUST_FLAG,
+        'inner() { echo "$1"; }\nouter() { inner "$1"; }\nouter "$GH_TOKEN"\ninner() { :; }\n',
+    ),
+    (
+        'helper-redefinitions-chain-outer-later-safe',
+        MUST_FLAG,
+        'inner() { echo "$1"; }\nouter() { inner "$1"; }\nouter "$GH_TOKEN"\nouter() { :; }\n',
+    ),
+    (
+        'helper-redefinitions-chain-all-safe',
+        MUST_NOT_FLAG,
+        'inner() { :; }\nouter() { inner "$1"; }\ninner() { printf %s "${#1}"; }\nouter() { inner "$1"; }\nouter "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-redefinitions-chain-reverse-inner-later-safe',
+        MUST_FLAG,
+        'outer() { inner "$1"; }\ninner() { echo "$1"; }\nouter "$GH_TOKEN"\ninner() { :; }\n',
+    ),
+    (
+        'helper-redefinitions-chain-false-outer-later-safe',
+        MUST_FLAG,
+        'inner() { echo "$1"; }\nouter() { inner "$1"; }\nouter "$GH_TOKEN"\nif false; then outer() { :; }; fi\n',
+    ),
+    (
+        'helper-redefinitions-chain-before-call-safe',
+        MUST_FLAG,
+        'inner() { echo "$1"; }\nouter() { inner "$1"; }\ninner() { :; }\nouter "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-redefinitions-direct-all-safe',
+        MUST_NOT_FLAG,
+        'log() { :; }\nlog() { printf %s "${#1}"; }\nlog "$GH_TOKEN"\n',
     ),
     # --- multi-physical-line constructs ----------------------------------
     (
@@ -7534,6 +7612,27 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    'helper-redefinitions-direct-later-emitter': (
+        "Every recognized emitting body promotes its helper name; this safe "
+        "runtime call does not execute that body. Textual order, false branches "
+        "and executed safe redefinitions do not prove runtime lookup (#1467)."
+    ),
+    'helper-redefinitions-direct-false-later-emitter': (
+        "Every recognized emitting body promotes its helper name; this safe "
+        "runtime call does not execute that body. Textual order, false branches "
+        "and executed safe redefinitions do not prove runtime lookup (#1467)."
+    ),
+    'helper-redefinitions-direct-before-call-safe': (
+        "Every recognized emitting body promotes its helper name; this safe "
+        "runtime call does not execute that body. Textual order, false branches "
+        "and executed safe redefinitions do not prove runtime lookup (#1467)."
+    ),
+    'helper-redefinitions-chain-before-call-safe': (
+        "Every recognized emitting body promotes its helper name; this safe "
+        "runtime call does not execute that body. Textual order, false branches "
+        "and executed safe redefinitions do not prove runtime lookup (#1467)."
+    ),
+
     "printf-option-a-readline-target": "Option A rejects every uppercase target, including Readline's editable buffer; the noninteractive oracle does not exercise redisplay and no environment/state proof is claimed",
     "printf-option-a-lowercase-special": "Option A explicitly excludes histchars, auto_resume and _ as lowercase managed targets even when this noninteractive fixture emits nothing",
     "printf-option-a-string-conversion-only": "Option A allows only unmodified %s conversions/plain text; a safe attached %b format deliberately retains the conservative verdict",
