@@ -215,12 +215,6 @@ def merge_preflight(argv, command, tools, task):
     for name in ('BREAK_GLASS_MERGE_STATE', 'BREAK_GLASS_REVIEW_DISAGREEMENT'):
         if name in os.environ:
             environment[name] = os.environ[name]
-    environment.update(GH_AS_AUTHOR_IDENTITY=author, GH_PR_GUARD_EXPECTED_AUTHOR=author,
-                       CODEX_CLEARED='1')  # Compatibility with pre-#1609 trusted hooks.
-    payload = json.dumps({'tool_input': {'command': shlex.join(['scripts/gh-as-author.sh', '--', *guard_command])}})
-    subprocess.run([tools['bash'], str(task / 'scripts/hooks/gh-pr-guard.sh')], input=payload,
-                   env=environment, cwd=task, text=True, check=True, timeout=TIMEOUT)
-    environment.pop('CODEX_CLEARED', None)
     environment.update(MERGE_CLEARANCE_EXPECTED_HEAD_SHA=head,
                        MERGE_CLEARANCE_EXPECTED_BASE_SHA=base,
                        MERGE_CLEARANCE_EXPECTED_BASE_REF=pr['baseRefName'],
@@ -230,6 +224,14 @@ def merge_preflight(argv, command, tools, task):
                        MERGE_CLEARANCE_MATERIALIZE_DEFAULT_POLICY='false')
     subprocess.run([tools['bash'], str(task / 'scripts/merge-clearance-gate.sh'), number, repo],
                    env=environment, cwd=task, check=True, timeout=TIMEOUT)
+    # Re-read mutable CI, reviewer and queue predicates only after clearance
+    # has finished, immediately before the final tuple/hold snapshot.
+    environment.update(GH_AS_AUTHOR_IDENTITY=author, GH_PR_GUARD_EXPECTED_AUTHOR=author,
+                       CODEX_CLEARED='1')  # Compatibility with pre-#1609 trusted hooks.
+    payload = json.dumps({'tool_input': {'command': shlex.join(['scripts/gh-as-author.sh', '--', *guard_command])}})
+    subprocess.run([tools['bash'], str(task / 'scripts/hooks/gh-pr-guard.sh')], input=payload,
+                   env=environment, cwd=task, text=True, check=True, timeout=TIMEOUT)
+    environment.pop('CODEX_CLEARED', None)
     fresh = read('pr', 'view', pr['url'], '--repo', repo, '--json', fields + ',labels')
     labels = fresh.pop('labels')
     if not isinstance(labels, list) or any(not isinstance(label, dict) or not isinstance(label.get('name'), str) for label in labels):

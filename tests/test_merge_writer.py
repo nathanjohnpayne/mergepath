@@ -43,13 +43,16 @@ def emit(value): print(json.dumps(value))
 head, base, source = 'a'*40, 'b'*40, 'c'*40
 url='https://github.com/example/repo/pull/123'
 labels=state.get('labels',['needs-external-review'])
+clearance_files_read='repos/example/repo/pulls/123/files' in (root/'calls.jsonl').read_text()
 if args[:2] == ['pr','merge']:
     with (root/'writes.jsonl').open('a') as out: out.write(json.dumps(args)+'\n')
     sys.exit(0)
 if args[:2] == ['pr','view']:
     fields=args[args.index('--json')+1]
     if 'mergeStateStatus' in fields:
-        print('\n'.join(['CLEAN','MERGEABLE','0',url,head,'nathanjohnpayne',*labels]))
+        non_green='1' if state.get('late_check') and clearance_files_read else '0'
+        merge_state='BLOCKED' if non_green=='1' else 'CLEAN'
+        print('\n'.join([merge_state,'MERGEABLE',non_green,url,head,'nathanjohnpayne',*labels]))
     else:
         calls=(root/'calls.jsonl').read_text().count('"pr", "view"')
         value=dict(url=url,headRefOid='d'*40 if state.get('head_moves') and calls>2 else head,
@@ -96,7 +99,7 @@ if endpoint.startswith('repos/example/repo/commits/'):
 if endpoint.endswith('/reviews'):
     reviews=[dict(id=1,user=dict(login='nathanpayne-claude'),state='APPROVED',commit_id=head,
                   submitted_at='2026-09-14T00:05:00Z',body='<!-- mergepath-p4b-request-generation: '+json.dumps(state.get('generation',[123]))+' -->')]
-    if state.get('disagreement'): reviews.append(dict(id=2,user=dict(login='nathanpayne-codex'),state='CHANGES_REQUESTED',commit_id='d'*40))
+    if state.get('disagreement') or state.get('late_disagreement') and clearance_files_read: reviews.append(dict(id=2,user=dict(login='nathanpayne-codex'),state='CHANGES_REQUESTED',commit_id='d'*40))
     emit([reviews] if '--slurp' in args else reviews); sys.exit(0)
 if endpoint.endswith('/issues/123/comments'):
     if state.get('comments_fail'): sys.exit(1)
@@ -231,6 +234,14 @@ class WriterTests(unittest.TestCase):
                       {'labels':['needs-human-review']},{'disagreement':True},{'queue':True}):
             self.state={'generation':[123,124],**state}
             self.assert_blocked(self.run_writer())
+
+    def test_under_threshold_late_review_disagreement_refuses(self):
+        self.state={'labels':[],'late_disagreement':True}
+        self.assert_blocked(self.run_writer())
+
+    def test_under_threshold_late_failing_check_refuses(self):
+        self.state={'labels':[],'late_check':True}
+        self.assert_blocked(self.run_writer())
 
     def test_deferred_auto_refused_and_retraction_unchanged(self):
         self.assert_blocked(self.run_writer(['pr','merge','123','--auto']),'deferred auto-merge')
