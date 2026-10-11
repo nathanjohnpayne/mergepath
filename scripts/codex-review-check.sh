@@ -2910,10 +2910,14 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
         --arg login "$PHASE_4B_LOGIN" --arg at "$PHASE_4B_TIME" --arg sha "$HEAD_SHA" '
           [ .[] | select(.user.login == $login and .submitted_at == $at and .commit_id == $sha) ]
           | last
-          | [ (.body // "") | scan("<!-- mergepath-p4b-request-generation: ([^>]*) -->") | .[0] ]
-          | if length == 0 then "none"
-            elif length > 1 then "invalid"
-            else (last | try (fromjson | select(type == "array" and all(.[]; type == "number")) | tojson) catch "invalid")
+          | (.body // "") as $body
+          # #1619: count prefixes independently: a damaged/unterminated
+          # record is unreadable evidence, never an absent manual record.
+          | [ $body | scan("<!-- mergepath-p4b-request-generation") ] as $prefixes
+          | [ $body | scan("<!-- mergepath-p4b-request-generation: ([^>]*) -->") | .[0] ] as $records
+          | if ($prefixes | length) == 0 then "none"
+            elif ($prefixes | length) != 1 or ($records | length) != 1 then "invalid"
+            else ($records[0] | try (fromjson | select(type == "array" and all(.[]; type == "number")) | tojson) catch "invalid")
                  // "invalid"
             end' 2>/dev/null || printf invalid)
       if ! declare -F crqe_trigger_generation >/dev/null 2>&1 || ! declare -F crqe_latest_trigger_time >/dev/null 2>&1; then
