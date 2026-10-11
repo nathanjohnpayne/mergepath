@@ -216,6 +216,8 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     miss; this eligibility check does not change the output walk.
     Invalid-name indirection remains the measured preexisting #2059 miss;
     credential-value reference selection remains unchanged.
+    Separate-option positional/array error-word diagnostics remain the measured
+    preexisting #2061 misses; #1461 owns the separate numeric-format diagnostic.
     Split-line or continued function headers invalidate attached builtin provenance
     without extending general helper body-span discovery. Prompt-managed
     targets can emit or execute values in interactive shells and stay conservative.
@@ -5909,7 +5911,7 @@ CORPUS = [
     (
         'printf-v-manual-legacy-double-nested-index',
         MUST_FLAG,
-        'GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "$[ a[b[0]] + $GH_TOKEN ]"\n',
+        'GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "$[ a[$[ b[0] ]] + $GH_TOKEN ]"\n',
     ),
     (
         'printf-v-manual-legacy-ordinary-after-index',
@@ -7497,8 +7499,8 @@ CORPUS.extend(_generated_corpus())
 # fails when an undeclared disagreement appears AND when a declared entry stops
 # disagreeing, so neither list can quietly rot.
 KNOWN_MISSES = {
-    'printf-v-round-six-positional-separate-control': 'The preexisting separate -v diagnostic verdict is retained under #1461; attached eligibility metadata does not alter the output walk.',
-    'printf-v-round-six-array-separate-control': 'The preexisting separate -v diagnostic verdict is retained under #1461; attached eligibility metadata does not alter the output walk.',
+    'printf-v-round-six-positional-separate-control': 'Preexisting separate -v positional/array error-word diagnostics are owned by #2061; #1461 is related numeric-format work. Attached eligibility metadata does not alter the output walk.',
+    'printf-v-round-six-array-separate-control': 'Preexisting separate -v positional/array error-word diagnostics are owned by #2061; #1461 is related numeric-format work. Attached eligibility metadata does not alter the output walk.',
 
     "printf-v-manual-indirect-invalid-name": (
         "indirect name evaluation can diagnose an invalid expanded name; "
