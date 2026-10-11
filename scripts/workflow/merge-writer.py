@@ -108,6 +108,8 @@ def merge_preflight(argv, command, tools, task):
                                 capture_output=True, check=True, timeout=TIMEOUT)
         return json.loads(result.stdout)
 
+    if command['selector'] == '' or command['repo'] == '':
+        raise ValueError('an explicitly empty PR selector or repository is not a target')
     query = ['pr', 'view'] + ([command['selector']] if command['selector'] else [])
     if command['repo']:
         query += ['--repo', command['repo']]

@@ -181,6 +181,10 @@ class WriterTests(unittest.TestCase):
                 for value in heads: args+=['--match-head-commit',value]
                 self.assert_blocked(self.run_writer(args),'exactly one matching full')
 
+    def test_explicit_empty_target_is_not_normalized_to_current_branch(self):
+        for args in (['pr','merge',''],['pr','merge','123','--repo=']):
+            self.assert_blocked(self.run_writer(args+['--match-head-commit',HEAD]), 'explicitly empty')
+
     def test_under_threshold_does_not_require_external_clearance(self):
         self.state['labels']=[]
         result=self.run_writer()

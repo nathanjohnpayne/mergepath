@@ -1991,6 +1991,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/workflow/merge-writer.py"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/workflow/owner-admin-override.py"
       - "scripts/workflow/record-merge-queue-authorization.sh"
@@ -2017,6 +2018,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/workflow/merge-writer.py"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/workflow/owner-admin-override.py"
       - "scripts/workflow/record-merge-queue-final-audit.sh"
@@ -2037,6 +2039,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/workflow/merge-writer.py"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/workflow/owner-admin-override.py"
       - "scripts/lib/merge-queue-authorization.sh"
@@ -2252,6 +2255,7 @@ paths:
     # closure gap that surfaced as #264 on the original propagation
     # wave (check_gh_as_author missing its tests on every consumer).
     requires:
+      - "scripts/workflow/merge-writer.py"
       - "scripts/workflow/owner-admin-override.py"
       - "scripts/lib/ci-check-modes.sh"          # shared --check/--self-test selector (#1062)
       - "scripts/lib/blocking-labels.sh"         # check_workflow_parsers shared exact-label predicate (#1062)
@@ -2408,6 +2412,7 @@ paths:
     # helpers (parse_manifest_paths.sh, match_protected_paths.sh) are
     # already inside this kit; the two scripts/lib/ deps are declared here.
     requires:
+      - "scripts/workflow/merge-writer.py"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/workflow/owner-admin-override.py"
       - "scripts/lib/template-substitution.sh"   # verify-propagation-pr.sh templated render (#531)
