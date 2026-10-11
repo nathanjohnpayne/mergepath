@@ -144,6 +144,9 @@ validate_governing_policy() {
 
 validate_governing_policy
 
+# shellcheck source=lib/feedback-archive-identities.sh
+. "$SCRIPT_DIR/lib/feedback-archive-identities.sh"
+
 policy_top_field() {
   local field="$1"
   printf '%s' "$POLICY_JSON" | jq -r --arg field "$field" '.[$field] // empty'
@@ -673,28 +676,11 @@ archive_payload() {
 
 archive_source_comments() {
   local source_kind="$1" source_login="$2"
+  feedback_archive_source_provider "$source_kind" "$source_login" >/dev/null || return 1
   case "$source_kind" in
-    issue-comment)
-      case "$source_login" in
-        "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
-        *) return 1 ;;
-      esac
-      printf '%s' "$ISSUE_COMMENTS"
-      ;;
-    inline)
-      case "$source_login" in
-        "$CODEX_BOT"|"$CODERABBIT_BOT"|"$GHAS_BOT") ;;
-        *) registered_reviewer_login "$source_login" || return 1 ;;
-      esac
-      printf '%s' "$INLINE_COMMENTS"
-      ;;
-    review-body)
-      case "$source_login" in
-        "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
-        *) registered_reviewer_login "$source_login" || return 1 ;;
-      esac
-      printf '%s' "$REVIEWS"
-      ;;
+    issue-comment) printf '%s' "$ISSUE_COMMENTS" ;;
+    inline) printf '%s' "$INLINE_COMMENTS" ;;
+    review-body) printf '%s' "$REVIEWS" ;;
     *) return 1 ;;
   esac
 }
@@ -725,6 +711,15 @@ EOF
 # by source kind + id + fingerprint; a distinct body remains independently
 # dispositionable.
 ARCHIVE_ENTRIES='[]'
+# Enrollment is needed only for archive inventory. Live provider accounting
+# remains available during seed migration; an archive with unknown enrollment
+# must never disappear into an apparently empty inventory.
+if printf '%s' "$ISSUE_COMMENTS" | jq -e 'any(.[];
+  .user.login == "github-actions[bot]" and
+  ((.body // "") | test("^<!-- mergepath-feedback-archive:v[12] ")))' >/dev/null; then
+  feedback_archive_registry_from_json "$POLICY_JSON" || die 2 "could not resolve retained archive identities"
+fi
+
 while IFS= read -r archive_comment; do
   [ -n "$archive_comment" ] || continue
   archive_login=$(printf '%s' "$archive_comment" | jq -r '.user.login // ""')
@@ -940,7 +935,7 @@ append_archive_candidate() {
   local source_kind source_id source_login source_comments source_comment
   local live_source_login live_source_body_json live_source_fingerprint archive_tiers tier
   local body_fingerprint payload_body_json finding_kind ack_token accounted evidence
-  local live_body archived_body
+  local live_body archived_body archive_provider
 
   printf '%s' "$payload" | validate_archive_payload \
     || die 2 "feedback archive payload failed schema validation"
@@ -964,6 +959,7 @@ append_archive_candidate() {
   source_id=$(printf '%s' "$payload" | jq -r '.source_comment_id')
   source_login=$(printf '%s' "$payload" | jq -r '.source_login')
   body_fingerprint=$(printf '%s' "$payload" | jq -r '.body_fingerprint')
+  archive_provider=$(feedback_archive_source_provider "$source_kind" "$source_login") || return 0
   source_comments=$(archive_source_comments "$source_kind" "$source_login") || return 0
 
   source_comment=$(printf '%s' "$source_comments" | jq -c \
@@ -981,7 +977,7 @@ append_archive_candidate() {
     # of #1167. Compare the two revisions with their trailing footer and
     # confirmation runs removed: equal means the archive adds nothing to
     # disposition, and a changed visible content line still archives.
-    if [ "$source_kind" = inline ] && [ "$source_login" = "$CODERABBIT_BOT" ] \
+    if [ "$source_kind" = inline ] && [ "$archive_provider" = coderabbit ] \
       && [ -n "$payload_body_json" ]; then
       live_body=$(printf '%s' "$source_comment" | jq -r '.body // ""')
       archived_body=$(printf '%s' "$payload_body_json" | jq -r '.')
@@ -990,9 +986,9 @@ append_archive_candidate() {
     fi
   fi
 
-  if [ "$source_login" = "$CODERABBIT_BOT" ]; then
+  if [ "$archive_provider" = coderabbit ]; then
     archive_tiers=$(printf '%s' "$payload" | jq -c '.coderabbit_tiers')
-  elif [ "$source_login" = "$GHAS_BOT" ]; then
+  elif [ "$archive_provider" = ghas ]; then
     # Absent on any record archived before #1113 added this field —
     # optional in validate_archive_payload for exactly that reason.
     archive_tiers=$(printf '%s' "$payload" | jq -c '.ghas_tiers // []')

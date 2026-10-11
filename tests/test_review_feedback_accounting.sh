@@ -146,6 +146,15 @@ codex:
   bot_login: "chatgpt-codex-connector[bot]"
 code_scanning:
   bot_login: "github-advanced-security[bot]"
+feedback_archive:
+  identities:
+    - {login: "chatgpt-codex-connector[bot]", provider: codex, status: active}
+    - {login: "coderabbitai[bot]", provider: coderabbit, status: active}
+    - {login: "github-advanced-security[bot]", provider: ghas, status: active}
+    - {login: nathanpayne-claude, provider: reviewer, status: active}
+    - {login: nathanpayne-cursor, provider: reviewer, status: active}
+    - {login: nathanpayne-codex, provider: reviewer, status: active}
+    - {login: nathanpayne-release, provider: reviewer, status: active}
 YAML
 
 reset_fixtures() {
@@ -176,6 +185,15 @@ codex:
   bot_login: "chatgpt-codex-connector[bot]"
 code_scanning:
   bot_login: "github-advanced-security[bot]"
+feedback_archive:
+  identities:
+    - {login: "chatgpt-codex-connector[bot]", provider: codex, status: active}
+    - {login: "coderabbitai[bot]", provider: coderabbit, status: active}
+    - {login: "github-advanced-security[bot]", provider: ghas, status: active}
+    - {login: nathanpayne-claude, provider: reviewer, status: active}
+    - {login: nathanpayne-cursor, provider: reviewer, status: active}
+    - {login: nathanpayne-codex, provider: reviewer, status: active}
+    - {login: nathanpayne-release, provider: reviewer, status: active}
 YAML
   rm -f "$TMP/fixtures"/reactions-*.json
   : >"$TMP/gh-calls.log"
@@ -365,7 +383,7 @@ mv "$TMP/review-policy.valid-enums.yml" "$TMP/review-policy.yml"
 
 cp "$TMP/review-policy.yml" "$TMP/review-policy.block-style.yml"
 cat >"$TMP/review-policy.yml" <<'JSON'
-{"author_identity":"nathanjohnpayne","available_reviewers":["nathanpayne-release"],"coderabbit":{"bot_login":"coderabbitai[bot]"},"codex":{"bot_login":"chatgpt-codex-connector[bot]"},"feedback_policy":{"mode":"by-priority","priorities":{"p1":"required"}}}
+{"author_identity": "nathanjohnpayne", "available_reviewers": ["nathanpayne-release"], "coderabbit": {"bot_login": "coderabbitai[bot]"}, "codex": {"bot_login": "chatgpt-codex-connector[bot]"}, "feedback_policy": {"mode": "by-priority", "priorities": {"p1": "required"}}, "feedback_archive": {"identities": [{"login": "nathanpayne-release", "provider": "reviewer", "status": "active"}]}}
 JSON
 reset_fixtures
 cat >"$TMP/fixtures/inline.json" <<'JSON'
@@ -2654,7 +2672,7 @@ fi
 # preceding the author guard is exactly what let a non-GHAS commenter plant a
 # guessed alert URL and have Actions resolve it.
 P1_GATE_WF="$ROOT/.github/workflows/codex-p1-gate.yml"
-GUARD_LINE=$(grep -n 'if \[ "\$source_kind" = "inline" \] && \[ "\$source_login" = "\$ghas_bot_login" \]; then' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
+GUARD_LINE=$(grep -n 'if \[ "\$source_kind" = "inline" \] && \[ "\$source_provider" = ghas \]; then' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
 EXTRACT_LINE=$(grep -n 'alert_number=\$(ghas_alert_number_from_body' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
 LOOKUP_LINE=$(grep -n 'ghas_severity=\$(ghas_alert_severity "\$REPO" "\$alert_number")' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
 if [ -n "$GUARD_LINE" ] && [ -n "$EXTRACT_LINE" ] && [ -n "$LOOKUP_LINE" ] \
@@ -3114,6 +3132,41 @@ ARCHIVE_OUT=$(PATH="$TMP/bin:$PATH" CODERABBIT_EXTRACT_FAIL=0 "$RENDER_ARCHIVE" 
 assert_match '^<!-- mergepath-feedback-archive:v1 ' "$ARCHIVE_OUT" "archive control: readable Major produces its history record"
 unset CODERABBIT_EXTRACT_FAIL CODERABBIT_EXTRACT_FAIL_LOG
 rm "$TMP/bin/grep"
+
+# #1437: a delayed event after reviewer retirement still inventories the sole
+# old body, even with no live source object. Enrollment cannot acknowledge it.
+cp "$TMP/review-policy.yml" "$TMP/policy-before-retirement.yml"
+sed '/^  - nathanpayne-claude$/d; s/login: nathanpayne-claude, provider: reviewer, status: active/login: nathanpayne-claude, provider: reviewer, status: retired/' \
+  "$TMP/review-policy.yml" >"$TMP/retired-policy.yml"
+mv "$TMP/retired-policy.yml" "$TMP/review-policy.yml"
+reset_fixtures
+printf '**P1** Retired reviewer sole previous body.\n' >"$TMP/retired-body.txt"
+RETIRED_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9090 nathanpayne-claude \
+  '2026-10-11T01:00:00Z' "$TMP/retired-body.txt")
+jq -n --arg body "$RETIRED_ARCHIVE" '[{id:9091,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "a retired reviewer deleted-source archive stays unaccounted without live prior-body fallback"
+assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "retired history uses the archive acknowledgement channel"
+RETIRED_TOKEN=$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')
+jq --arg token "$RETIRED_TOKEN" '. + [{id:9092,user:{login:"nathanpayne-claude"},created_at:"2026-10-11T01:01:00Z",body:($token+"\nI addressed this historical finding.")}]' \
+  "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "retained enrollment grants no current acknowledgement standing"
+jq '.[1].user.login="nathanpayne-codex"' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "a current reviewer can account for the retained historical finding"
+# Missing registry is fatal when there is an archive, but unrelated live
+# feedback keeps its existing accounting semantics during seed migration.
+sed '/^feedback_archive:/,/^    - {login: nathanpayne-release/d' "$TMP/review-policy.yml" >"$TMP/missing-registry.yml"
+mv "$TMP/missing-registry.yml" "$TMP/review-policy.yml"
+run_gate
+assert_eq 2 "$RUN_RC" "an archived source with missing enrollment fails conservatively"
+reset_fixtures
+run_gate
+assert_eq 0 "$RUN_RC" "an unrelated empty live inventory needs no archive registry"
+mv "$TMP/policy-before-retirement.yml" "$TMP/review-policy.yml"
 
 if [ "$FAIL" -ne 0 ]; then
   printf 'review-feedback-accounting: FAIL (%s failed, %s passed)\n' "$FAIL" "$PASS" >&2

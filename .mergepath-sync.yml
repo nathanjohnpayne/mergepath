@@ -592,6 +592,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/feedback-archive-identities.sh"   # #1437, retained source eligibility and bounds
       - "scripts/workflow/verified-relay-markers.py"   # #1546, publisher-run provenance verification
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/lib/preflight-helpers.sh"
@@ -599,10 +600,16 @@ paths:
       - "scripts/lib/gh-api-scalar.sh"   # #1113, hard-sourced by ghas-alert-severity.sh's fetch
       - "scripts/lib/ghas-alert-severity.sh"   # #1113, GHAS severity by alert number
       - "scripts/workflow/resolve_base_policy.sh"   # #1000, governing base-branch policy
+  - path: scripts/lib/feedback-archive-identities.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/feedback-policy-helpers.sh"
   - path: scripts/render-feedback-archive.sh
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/feedback-archive-identities.sh"   # #1437, retained source eligibility and bounds
       - "scripts/lib/feedback-policy-helpers.sh"   # #1000, provider-aware marker snapshot
   - path: scripts/review-feedback-surface-fingerprint.sh
     type: canonical
@@ -1271,6 +1278,13 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - ".github/workflows/codex-p1-gate.yml"
+  - path: tests/test_feedback_archive_identities.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/feedback-archive-identities.sh"
+      - "scripts/render-feedback-archive.sh"
       - ".github/workflows/codex-p1-gate.yml"
   - path: tests/test_feedback_archive_relay_source.sh
     type: canonical
@@ -2091,6 +2105,7 @@ paths:
     # workflow without the script makes the gate fail-closed on
     # `command not found` for every PR in the consumer.
     requires:
+      - "scripts/lib/feedback-archive-identities.sh"   # #1437, retained source eligibility and bounds
       - "scripts/workflow/verified-relay-markers.py"   # #1546, publisher-run provenance verification
       - ".github/workflows/codex-feedback-archive-relay.yml"   # #1000, privileged read-only fork/Dependabot archive persistence
       - "scripts/codex-p1-gate.sh"
@@ -2111,6 +2126,7 @@ paths:
     # feedback archival and the corresponding PR-head check. Its requires
     # edges keep the evaluator and surface fingerprint on the same wave.
     requires:
+      - "scripts/lib/feedback-archive-identities.sh"   # #1437, retained source eligibility and bounds
       - "scripts/workflow/verified-relay-markers.py"   # #1546, publisher-run provenance verification
       - "scripts/codex-p1-gate.sh"
       - "scripts/review-feedback-surface-fingerprint.sh"
@@ -2256,6 +2272,7 @@ paths:
     # closure gap that surfaced as #264 on the original propagation
     # wave (check_gh_as_author missing its tests on every consumer).
     requires:
+      - "tests/test_feedback_archive_identities.sh"   # #1437, offline enrollment and producer/relay cases
       - "scripts/workflow/merge-writer.py"
       - "scripts/workflow/owner-admin-override.py"
       - "scripts/lib/ci-check-modes.sh"          # shared --check/--self-test selector (#1062)

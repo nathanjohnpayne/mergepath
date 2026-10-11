@@ -198,6 +198,8 @@ jobs:
           echo "pr_actor=$pr_actor" >> "$GITHUB_OUTPUT"
 
           source_kind=""
+          source_id=0
+          source_login=""
           if [ "$EVENT_NAME" = issue_comment ] \
             && { [ "$EVENT_ACTION" = edited ] || [ "$EVENT_ACTION" = deleted ]; }; then
             source_kind=issue-comment
@@ -227,6 +229,27 @@ jobs:
               --jq '.created_at')
           fi
 
+          # Only retained verified sources may reach the one-shot body capture
+          # and GHAS read. Current review membership is deliberately separate.
+          . scripts/lib/feedback-policy-helpers.sh
+          . scripts/lib/feedback-archive-identities.sh
+          source_provider=""
+          if [ -n "$source_kind" ]; then
+            feedback_archive_registry_load .github/review-policy.yml
+            case "$source_id" in ''|*[!0-9]*) echo "::error::Ambiguous archive source id"; exit 2 ;; esac
+            [ "$source_id" -gt 0 ] || { echo "::error::Invalid archive source id"; exit 2; }
+            provider_rc=0
+            source_provider=$(feedback_archive_source_provider "$source_kind" "$source_login") || provider_rc=$?
+            if [ "$source_kind" = issue-comment ] && [ "$source_login" = 'github-actions[bot]' ]; then
+              source_provider=restoration
+            elif [ "$provider_rc" -eq 1 ]; then
+              echo "Source is not enrolled for archival; leaving its previous body inert."
+              source_kind=""
+            elif [ "$provider_rc" -ne 0 ]; then
+              exit 2
+            fi
+          fi
+
           previous_file=$(mktemp "${RUNNER_TEMP}/feedback-previous.XXXXXX")
           archive_records_file=$(mktemp "${RUNNER_TEMP}/feedback-archive-records.XXXXXX")
           payload_file=$(mktemp "${RUNNER_TEMP}/feedback-archive-payload.XXXXXX")
@@ -239,56 +262,12 @@ jobs:
               jq -j '.comment.body // ""' "$GITHUB_EVENT_PATH" >"$previous_file"
             fi
 
-            # #1113: a github-advanced-security[bot] body carries no severity
-            # marker render-feedback-archive.sh's text-only classifiers can
-            # find -- only a link to the alert. That script stays pure (no
-            # network calls, per its documented sourcing contract), so THIS
-            # step resolves the tier and hands it in as a 6th argument,
-            # matching how it already hands in the previous body. Matched by
-            # BODY PATTERN, not by comparing source_login against a
-            # configured bot login: render-feedback-archive.sh's own
-            # codex_tiers_of/coderabbit_tiers_of already classify purely by
-            # body content regardless of author, and this keeps the archive
-            # step free of a review-policy.yml dependency.
-            #
-            # Sources the SAME functions review-feedback-accounting.sh and
-            # the surface fingerprint use for this, rather than a third
-            # independent copy of the alert-number regex and severity-tier
-            # mapping.
-            #
-            # Best-effort on a failed read: WARN and fall back to p2 rather
-            # than failing the whole archival. Unlike live accounting (which
-            # re-evaluates every round and should fail loudly on a systemic
-            # permissions gap), this is a one-shot capture of a
-            # disappearing comment -- if the alert read fails here, there is
-            # no scheduled retry, and losing the archive record entirely
-            # would be worse than archiving it under a possibly-too-low
-            # tier with a visible warning.
+            # Resolve severity only for retained GHAS inline sources. A failed
+            # read archives conservatively at p1 because this prior body has no
+            # recovery endpoint. The renderer itself remains network-free.
             ghas_tier=""
-            # shellcheck source=scripts/lib/feedback-policy-helpers.sh
-            . scripts/lib/feedback-policy-helpers.sh
-            # shellcheck source=scripts/lib/gh-api-scalar.sh
             . scripts/lib/gh-api-scalar.sh
-            # shellcheck source=scripts/lib/ghas-alert-severity.sh
             . scripts/lib/ghas-alert-severity.sh
-            # This job runs on a trusted default-branch checkout, so a
-            # local read_policy_block_field read here carries the same
-            # trust this job already places in every other file it reads
-            # from that checkout -- unlike the surface fingerprint's
-            # non-materialized read, which can run from any ref. Falls
-            # back to the well-known default both when unconfigured and
-            # when the read itself fails, so a config problem never
-            # silently drops the common case.
-            # Codex P2, PR #1124: read through the shared YAML->JSON parse so a
-            # flow-style `code_scanning: {bot_login: ...}` resolves here exactly
-            # as it does in accounting. The line-oriented reader could not see
-            # flow style at all, so a consumer's custom GHAS bot was recognized
-            # by accounting but not here -- and an edited/deleted finding of
-            # that bot's was then archived under no tier, or not at all. Falls
-            # back to the line reader when no YAML parser exists on the runner.
-            ghas_configured_bot_login=$(policy_block_field_parsed code_scanning bot_login 2>/dev/null \
-              || read_policy_block_field code_scanning bot_login 2>/dev/null || true)
-            ghas_bot_login="${ghas_configured_bot_login:-github-advanced-security[bot]}"
 
             # Codex P1, PR #1124: `previous_file` is commenter-controlled, so neither
             # the alert-number extraction nor the privileged security-events read may
@@ -299,7 +278,7 @@ jobs:
             # persisted archive record, even though accounting later rejects that
             # source. Inline-only matches accounting's own enumeration rule: GHAS
             # never posts a top-level review body or a PR-level issue comment.
-            if [ "$source_kind" = "inline" ] && [ "$source_login" = "$ghas_bot_login" ]; then
+            if [ "$source_kind" = "inline" ] && [ "$source_provider" = ghas ]; then
               alert_number=$(ghas_alert_number_from_body "$(cat "$previous_file")")
               if [ -n "$alert_number" ]; then
                 # A failed cache_init (disk/permissions) leaves
@@ -384,7 +363,8 @@ jobs:
               --arg repo "$REPO" --argjson pr "$pr" --arg head_sha "$head_sha" \
               --argjson source_run_id "$SOURCE_RUN_ID" --arg event_name "$EVENT_NAME" \
               --argjson is_fork "$is_fork" --arg pr_actor "$pr_actor" \
-              '{version:1,repo:$repo,pr:$pr,head_sha:$head_sha,source_run_id:$source_run_id,event_name:$event_name,is_fork:$is_fork,requires_relay:true,pr_actor:$pr_actor,archive_records:($archive_records | split("\n") | map(select(length > 0)))}' \
+              --arg source_kind "$source_kind" --arg source_login "$source_login" --argjson source_id "$source_id" \
+              '{version:1,repo:$repo,pr:$pr,head_sha:$head_sha,source_run_id:$source_run_id,event_name:$event_name,is_fork:$is_fork,requires_relay:true,pr_actor:$pr_actor,archive_source:{kind:$source_kind,login:$source_login,id:$source_id},archive_records:($archive_records | split("\n") | map(select(length > 0)))}' \
               >"$RUNNER_TEMP/codex-p1-read-only-handoff.json"
           fi
 

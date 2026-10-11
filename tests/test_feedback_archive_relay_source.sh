@@ -538,7 +538,9 @@ awk '
 [ -s "$PERSIST" ] || { echo "could not extract relay persist writer" >&2; exit 1; }
 chmod +x "$PERSIST"
 TRUSTED="$TMP/trusted"
-mkdir -p "$TRUSTED/scripts"
+mkdir -p "$TRUSTED/scripts/lib" "$TRUSTED/.github"
+cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$ROOT/scripts/lib/feedback-archive-identities.sh" "$TRUSTED/scripts/lib/"
+cp "$ROOT/.github/review-policy.yml" "$TRUSTED/.github/review-policy.yml"
 cat >"$TRUSTED/scripts/review-feedback-surface-fingerprint.sh" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "${TEST_FINGERPRINT:-fingerprint}"
@@ -554,7 +556,7 @@ ARCHIVE='<!-- mergepath-feedback-archive-relay:v1 run=777 status=complete -->'
 write_handoff() {
   # event, artifact/source head; persist supplies the rest from trusted binding.
   jq -n --arg repo "$BASE_REPO" --argjson pr 41 --argjson run 501 --arg event "$1" --arg head "$2" \
-    --arg actor alice --arg archive "$ARCHIVE" '{version:1,repo:$repo,pr:$pr,source_run_id:$run,requires_relay:true,is_fork:true,pr_actor:$actor,event_name:$event,head_sha:$head,archive_records:[$archive]}' >"$HANDOFF"
+    --arg actor alice --arg archive "$ARCHIVE" '{version:1,repo:$repo,pr:$pr,source_run_id:$run,requires_relay:true,is_fork:true,pr_actor:$actor,event_name:$event,head_sha:$head,archive_source:{kind:"issue-comment",login:"github-actions[bot]",id:555},archive_records:[$archive]}' >"$HANDOFF"
 }
 run_persist() {
   : >"$GH_LOG"
@@ -585,6 +587,15 @@ assert_empty_writes "wrong artifact event reaches no lease or archive writer"
 
 # A valid delayed archive preserves its historical record but opens and
 # evaluates the lease at the current bound API head, not the handoff source.
+# #1437: source enrollment is checked before either the lease or archive POST.
+write_handoff pull_request "$SRC"
+jq '.archive_source.login="never-registered"' "$HANDOFF" >"$TMP/unregistered-handoff.json"
+mv "$TMP/unregistered-handoff.json" "$HANDOFF"
+printf '%s\n' "$PUBLISH" >"$HEAD_SEQUENCE_FILE"
+run_persist pull_request "$SRC"
+assert_eq "$PERSIST_RC" 2 "actual persist writer rejects an unregistered tier/record source"
+assert_empty_writes "ineligible archived source cannot open a check lease or post records"
+
 write_handoff pull_request "$SRC"
 printf '%s\n' "$PUBLISH" "$PUBLISH" "$PUBLISH" >"$HEAD_SEQUENCE_FILE"
 run_persist pull_request "$SRC"

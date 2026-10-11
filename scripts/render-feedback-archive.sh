@@ -11,6 +11,9 @@ HELPERS="$SCRIPT_DIR/lib/feedback-policy-helpers.sh"
 [ -r "$HELPERS" ] || { echo "render-feedback-archive: missing $HELPERS" >&2; exit 2; }
 # shellcheck source=lib/feedback-policy-helpers.sh
 . "$HELPERS"
+# shellcheck source=lib/feedback-archive-identities.sh
+. "$SCRIPT_DIR/lib/feedback-archive-identities.sh"
+feedback_archive_registry_load "${CONFIG:-$SCRIPT_DIR/../.github/review-policy.yml}" || exit 2
 
 if [ "$#" -lt 5 ] || [ "$#" -gt 6 ]; then
   echo "usage: $0 SOURCE_KIND SOURCE_ID SOURCE_LOGIN ARCHIVED_AT PREVIOUS_BODY_FILE [GHAS_TIER]" >&2
@@ -45,6 +48,7 @@ esac
 case "$SOURCE_ID" in
   ''|*[!0-9]*) echo "render-feedback-archive: source id must be an integer" >&2; exit 2 ;;
 esac
+[ "$SOURCE_ID" -gt 0 ] || { echo "render-feedback-archive: source id must be positive" >&2; exit 2; }
 [ -n "$SOURCE_LOGIN" ] || { echo "render-feedback-archive: source login is required" >&2; exit 2; }
 [ -n "$ARCHIVED_AT" ] || { echo "render-feedback-archive: archived timestamp is required" >&2; exit 2; }
 [ -r "$PREVIOUS_BODY_FILE" ] || { echo "render-feedback-archive: previous body is unreadable" >&2; exit 2; }
@@ -55,7 +59,8 @@ esac
 # record byte-for-byte so the workflow can restore it instead of silently
 # dropping the only durable copy. Never promote a lookalike from another login
 # into a trusted Actions-authored record.
-if [ "$SOURCE_LOGIN" = 'github-actions[bot]' ] && awk '
+RESTORED_RECORD=""
+if [ "$SOURCE_KIND" = issue-comment ] && [ "$SOURCE_LOGIN" = 'github-actions[bot]' ] && RESTORED_RECORD=$(awk '
   NR == 1 && $0 ~ /^<!-- mergepath-feedback-archive:v1 [A-Za-z0-9+\/=]+ -->$/ \
     { record=$0; next }
   NR == 1 && $0 ~ /^<!-- mergepath-feedback-archive:v2 id=[0-9a-f]{64} part=[0-9]+\/[0-9]+ data=[A-Za-z0-9+\/=]+ -->$/ \
@@ -66,9 +71,23 @@ if [ "$SOURCE_LOGIN" = 'github-actions[bot]' ] && awk '
     { record=$0; next }
   { extra=1 }
   END { if (record != "" && !extra) print record; else exit 1 }
-' "$PREVIOUS_BODY_FILE"; then
+' "$PREVIOUS_BODY_FILE"); then
+  jq -n --arg record "$RESTORED_RECORD" '
+    {archive_source:{kind:"issue-comment",login:"github-actions[bot]"},archive_records:[$record]}
+  ' | feedback_archive_validate_records /dev/stdin || exit 2
+  printf '%s\n' "$RESTORED_RECORD"
   exit 0
 fi
+
+# Authorize before classifying or encoding a candidate-controlled prior body.
+# Current reviewer/provider lists cannot replace retained historical enrollment.
+provider_rc=0
+SOURCE_PROVIDER=$(feedback_archive_source_provider "$SOURCE_KIND" "$SOURCE_LOGIN") || provider_rc=$?
+[ "$provider_rc" -ne 1 ] || exit 0
+[ "$provider_rc" -eq 0 ] || exit 2
+[ -z "$GHAS_TIER" ] || [ "$SOURCE_PROVIDER" = ghas ] || {
+  echo "render-feedback-archive: GHAS tier supplied for a non-GHAS source" >&2; exit 2;
+}
 
 # jq raw-input readers can split a multibyte character at their read boundary
 # (#1741). --rawfile preserves the complete body, including trailing newlines,
@@ -91,11 +110,8 @@ else
   GHAS_TIERS='[]'
 fi
 
-# Markerless edits have nothing to preserve. Provider identity is deliberately
-# validated later by accounting against the live source comment + base policy;
-# this renderer only snapshots the marker vocabulary present in the old body
-# (or, for GHAS, the tier the caller resolved from the alert the body links
-# to -- #1113).
+# Markerless enrolled edits have nothing to preserve. The retained registry
+# decides source eligibility; accounting independently binds the source id.
 if [ "$(printf '%s' "$CODEX_TIERS" | jq 'length')" -eq 0 ] \
    && [ "$(printf '%s' "$CODERABBIT_TIERS" | jq 'length')" -eq 0 ] \
    && [ "$(printf '%s' "$GHAS_TIERS" | jq 'length')" -eq 0 ]; then

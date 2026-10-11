@@ -411,6 +411,15 @@ jobs:
                   test("^<!-- mergepath-feedback-archive-relay:v2 run=[0-9]+ publisher=[0-9]+ status=complete -->$")
                 ))
             ' "$HANDOFF_FILE" >/dev/null
+          # Enrollment and per-source bounds apply before any archive POST or
+          # check lease; artifact content remains inert data throughout.
+          . scripts/lib/feedback-policy-helpers.sh
+          . scripts/lib/feedback-archive-identities.sh
+          if [ "$(jq '.archive_records | length' "$HANDOFF_FILE")" -gt 0 ]; then
+            feedback_archive_registry_load .github/review-policy.yml
+            feedback_archive_validate_records "$HANDOFF_FILE"
+          fi
+
           # The artifact's head belongs to the historical source event. It is
           # never a Checks API target. Snapshot the positively bound PR's live
           # API head immediately before opening this invocation's lease.
