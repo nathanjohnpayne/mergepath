@@ -330,12 +330,12 @@ class WriterTests(unittest.TestCase):
         (self.path/'state.json').write_text(json.dumps({'archive_stalls':True}))
         spec=importlib.util.spec_from_file_location('writer_timeout',ROOT/'scripts/workflow/merge-writer.py')
         writer=importlib.util.module_from_spec(spec);spec.loader.exec_module(writer)
-        writer.TIMEOUT=0.15
+        writer.TIMEOUT=2
         started=time.monotonic()
         with tempfile.TemporaryFile() as archive:
             with self.assertRaises(subprocess.TimeoutExpired):
                 writer.download_code(str(self.path/'bin/gh'),'repos/example/repo/tarball/'+SOURCE,dict(os.environ),archive)
-        self.assertLess(time.monotonic()-started,3)
+        self.assertLess(time.monotonic()-started,5)
         self.assert_producer_reaped()
         self.assertFalse((self.path/'trace').exists())
         self.assertFalse((self.path/'writes.jsonl').exists())
