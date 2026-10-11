@@ -403,7 +403,7 @@ The list below mixes TWO KINDS of gap and says which is which.  Most of it is
 the DESIGN LIMIT: this is a single-hop source-text scanner over one logical line
 at a time, with no dataflow, no cross-file analysis, and no knowledge of what a
 variable holds at runtime, so indirection, external commands, interpreters and
-unscanned files are permanently out of reach.  Three bullets are marked (#1035)
+unscanned files are permanently out of reach.  Two bullets are marked (#1035)
 instead: those are `resolve_command` / `classify` mis-deciding what a segment
 RUNS, a repairable seam with an open issue, not a property of the design.  It
 does not catch:
@@ -439,9 +439,6 @@ does not catch:
     option ARGUMENT: `timeout 5 echo "$PAT"` and `nice -n 5 echo "$PAT"` both
     resolve to `5` and read clean.  Wrapper OPTIONS are stepped over; wrapper
     operands are not parsed.
-  * (#1035) A message helper whose opening `{` starts the line AFTER the
-    declaration (`log()` then `{ echo "$1"; }`).  The one-line spelling of the
-    same helper is found and flagged, so this is a spelling gap in discovery.
   * A token handed to an EXTERNAL command -- as an ARGUMENT
     (`curl -H "Authorization: Bearer $CF_API_TOKEN"`), on a HERE-STRING
     (`grep . <<< "$PAT"`), or through a PIPE (`printf '%s' "$PAT" | grep .`).
@@ -3182,9 +3179,10 @@ def _find_compound_close_legacy(text, open_idx):
 _FUNC_DEF_RE = re.compile(
     r"(?m)(?:^|(?<=[;&|(){}!])|(?<=\bif)|(?<=\belif)|(?<=\bwhile)"
     r"|(?<=\buntil)|(?<=\bthen)|(?<=\bdo)|(?<=\belse)|(?<=\bin)"
-    r"|(?<=\btime))[ \t]*(?:function[ \t]+)?"
-    r"([A-Za-z_][A-Za-z0-9_:.-]*)[ \t]*"
-    r"(?:\([ \t]*\))?[ \t]*([\{(])"
+    r"|(?<=\btime))[ \t]*(?P<keyword>function[ \t]+)?"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_:.-]*)[ \t]*"
+    r"(?(keyword)(?:\([ \t]*\))?|\([ \t]*\))[ \t\n]*"
+    r"(?P<opener>\{|\((?![ \t]*\)))"
 )
 
 
@@ -3212,6 +3210,10 @@ def _iter_function_definitions(text):
     three copied regexes drifted together and still omitted those positions,
     letting a positional-emitting helper defined there read as an unknown safe
     command (#1032 external review).
+
+    A completed name() or function-keyword header may precede its brace or
+    subshell body on a following line. Empty header parentheses are never a
+    body opener; the match ends at the actual opener for both consumers.
     """
     # Function-shaped here-doc DATA is not shell structure.  Discover against
     # an offset-preserving masked copy, then return the body from the original
@@ -3219,11 +3221,8 @@ def _iter_function_definitions(text):
     # analysis.
     structural = _mask_heredoc_body_lines(text)
     for m in _FUNC_DEF_RE.finditer(structural):
-        name = m.group(1)
+        name = m.group("name")
         if name in RESERVED_WORDS:
-            continue
-        head = text[m.start() : m.end()]
-        if "(" not in head and not head.lstrip().startswith("function"):
             continue
         open_idx = m.end() - 1
         close_idx = _find_compound_close(structural, open_idx)
@@ -6535,12 +6534,9 @@ CORPUS = [
         "printf '%s\\n' -v \"$GH_TOKEN\"\n",
     ),
     (
-        # Bash accepts the opening brace on the line AFTER the declaration;
-        # helper discovery requires it on the declaration line.  The one-line
-        # spelling of this same helper is `helper-star` above, and IS flagged,
-        # so this is a spelling gap rather than a design gap.
+        # Completed headers and following-line bodies share helper discovery.
         "helper-brace-on-next-line",
-        MUST_NOT_FLAG,
+        MUST_FLAG,
         'log()\n{ echo "$1"; }\nlog "$GH_TOKEN"\n',
     ),
     (
@@ -6808,6 +6804,17 @@ CORPUS = [
         "xtrace-disable-in-called-function",
         MUST_FLAG,
         'set -x\nf() { set +x; }\nf\n: "$GH_TOKEN"\necho ok\n',
+    ),
+    (
+        "xtrace-disable-in-next-line-function",
+        MUST_FLAG,
+        'set -x\nf()\n{\n  set +x\n}\n: "$GH_TOKEN"\n',
+    ),
+    (
+        # A called function still receives no control-flow credit for set +x.
+        "xtrace-disable-in-called-next-line-function",
+        MUST_FLAG,
+        'set -x\nf()\n{\n  set +x\n}\nf\n: "$GH_TOKEN"\n',
     ),
     # --- a credential NAME split by a line continuation ------------------
     #
@@ -7507,11 +7514,6 @@ KNOWN_MISSES = {
         "the same wrapper gap reached through an option's ARGUMENT: `-n` is "
         "stepped over as a lone option, so `5` becomes the command word"
     ),
-    "helper-brace-on-next-line": (
-        "helper discovery requires the opening `{` on the declaration line; "
-        "bash accepts it on the next one.  The one-line spelling of the same "
-        "helper IS found, so this is a spelling gap, not a design gap"
-    ),
     "dumper-bare-set": (
         "`ENV_DUMPERS -> EMIT` lives in `classify()`, and `classify()` is "
         "consulted only for a segment carrying a `$`-reference; a bare `set` "
@@ -7701,6 +7703,15 @@ KNOWN_BROADER = {
         "shadow, which is escapable at the call site with the pragma"
     ),
     "xtrace-disable-in-called-function": (
+        "a function that IS called and turns tracing off gets no credit for "
+        "it, because a source-text scanner cannot tell a called function from "
+        "an uncalled one.  The asymmetry is deliberate and the two directions "
+        "are not symmetric in cost: crediting a disable bash never runs is a "
+        "SILENT FALSE NEGATIVE and is trivially reachable (`set -x; f() { "
+        "set +x; }`), while refusing a real one costs a visible finding the "
+        "author can pragma"
+    ),
+    "xtrace-disable-in-called-next-line-function": (
         "a function that IS called and turns tracing off gets no credit for "
         "it, because a source-text scanner cannot tell a called function from "
         "an uncalled one.  The asymmetry is deliberate and the two directions "
@@ -8263,6 +8274,30 @@ def _printf_allowlist_cases():
     return failures
 
 
+def _function_definition_cases():
+    """Pin shared body discovery, source spans and the production consumers."""
+    failures = []
+    for header in ("log()", "function log", "function log()"):
+        for opener, closer in (("{", "}"), ("(", ")")):
+            body = '\n  echo "$1"\n'
+            text = header + "\n" + opener + body + closer + '\nlog "$GH_TOKEN"\n'
+            definitions = list(_iter_function_definitions(text))
+            if (len(definitions) != 1 or definitions[0][1:] != ("log", body)
+                    or text[definitions[0][0].end() - 1] != opener):
+                failures.append("function body discovery: %r" % text)
+            if _function_body_line_spans(text) != [(2, 4)]:
+                failures.append("function body span: %r" % text)
+            findings, errors = scan_text(PROLOGUE + text)
+            if "log" not in discover_emitter_helpers(text) or not findings or errors:
+                failures.append("next-line helper production scan: %r" % text)
+    for text in ("log()\necho safe\n", "function log()\necho safe\n",
+                 "log\n( echo safe; )\n", "log()\n", "function log\n",
+                 "cat <<'EOF' >/dev/null\nlog()\n{ echo \"$1\"; }\nEOF\n"):
+        if list(_iter_function_definitions(text)) or _function_body_line_spans(text):
+            failures.append("non-definition acquired a body: %r" % text)
+    return failures
+
+
 def self_test():
     failures = []
     passed = 0
@@ -8270,6 +8305,7 @@ def self_test():
 
     failures.extend(_corpus_id_cases())
     failures.extend(_printf_allowlist_cases())
+    failures.extend(_function_definition_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
