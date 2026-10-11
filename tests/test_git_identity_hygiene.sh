@@ -1489,6 +1489,70 @@ else
   fail "Markdown fence state leaked between files: rc=$RC out=$OUT"
 fi
 
+# Case 54f: blockquote and list containers do not make fenced HTML live.
+for PREFIX in '> ' '> > ' '- ' '1. ' '> - '; do
+  CONTINUATION="$PREFIX"
+  case "$PREFIX" in
+    '- ') CONTINUATION='  ' ;;
+    '1. ') CONTINUATION='   ' ;;
+    '> - ') CONTINUATION='>   ' ;;
+  esac
+  run_on_fixture "docs/container-html.md" "$PREFIX"'```bash
+'"$CONTINUATION"'git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+'"$CONTINUATION"'```
+'
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/container-html.md:2"; then
+    pass "HTML marker in $PREFIX container fence: cannot exempt"
+  else
+    fail "HTML marker in $PREFIX container fence: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/container-shell.md" "$PREFIX"'~~~bash
+'"$CONTINUATION"'git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture
+'"$CONTINUATION"'~~~
+
+`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: evidence outside container -->
+git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture outside container
+'
+  if [ "$RC" = "0" ]; then
+    pass "real shell/HTML exemptions inside and after $PREFIX container: allowed"
+  else
+    fail "real exemptions around $PREFIX container: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/container-continued.md" "$PREFIX"'```bash
+'"$CONTINUATION"'git config user.email \
+'"$CONTINUATION"'leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+'"$CONTINUATION"'```
+'
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/container-continued.md:2"; then
+    pass "continued write inside $PREFIX container fence: HTML cannot exempt"
+  else
+    fail "continued write inside $PREFIX container fence: rc=$RC out=$OUT"
+  fi
+  # A container can end without an explicit closing fence. Its context
+  # must not suppress legitimate HTML comments in the following paragraph.
+  run_on_fixture "docs/container-ended.md" "$PREFIX"'```bash
+'"$CONTINUATION"'git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture
+
+`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: outside ended container -->
+'
+  if [ "$RC" = "0" ]; then
+    pass "ended $PREFIX container drops an unclosed fence: real HTML allowed"
+  else
+    fail "ended $PREFIX container kept stale fence state: rc=$RC out=$OUT"
+  fi
+done
+# A list fence may open on a continuation line, below the item text.
+run_on_fixture "docs/list-continuation-html.md" '- Example:
+  ```bash
+  git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+  ```
+'
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/list-continuation-html.md:3"; then
+  pass "fence opened on a list continuation: HTML cannot exempt"
+else
+  fail "list continuation fence: rc=$RC out=$OUT"
+fi
+
 # ── Fail-closed: include paths the walk cannot follow ──────────────────
 
 # Case 55: `~/…` in an include path is expanded against the operator's

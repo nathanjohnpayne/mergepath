@@ -1699,7 +1699,43 @@ scan_unscoped_identity_writes() {
     # HTML markup is literal data inside a Markdown fence. Track the
     # opening delimiter and its width so shorter or mismatched fences
     # cannot restore HTML exemptions before the code block really ends.
-    function markdown_html_context(s,   c, width, rest, was_fenced) {
+    function markdown_html_context(s,   c, width, rest, was_fenced, original, quotes, i) {
+      original = s; quotes = 0
+      # Inside a fence, consume only its actual container prefixes. Extra
+      # quote/list-looking text is code, not another Markdown container.
+      if (fence_char != "") {
+        for (i = 0; i < fence_quotes; i++) {
+          if (!match(s, /^ ? ? ?>[ \t]?/)) break
+          s = substr(s, RLENGTH + 1)
+          quotes++
+        }
+        if (quotes < fence_quotes) { fence_char = ""; s = original }
+        if (fence_char != "" && fence_indent) {
+          match(s, /^ */)
+          if (RLENGTH >= fence_indent) s = substr(s, fence_indent + 1)
+          else if (s !~ /^[[:space:]]*$/) { fence_char = ""; s = original }
+        }
+      }
+      if (fence_char == "") {
+        quotes = 0
+        while (match(s, /^ ? ? ?>[ \t]?/)) {
+          s = substr(s, RLENGTH + 1); quotes++
+        }
+        if (quotes != list_quotes) list_indent = 0
+        list_quotes = quotes
+        # A list marker establishes the continuation indentation. Retain
+        # it for fences on later lines and accumulate nested list markers.
+        if (list_indent) {
+          match(s, /^ */)
+          if (RLENGTH >= list_indent) s = substr(s, list_indent + 1)
+          else if (s !~ /^[[:space:]]*$/) list_indent = 0
+        }
+        if (match(s, /^ ? ? ?([-+*]|[0-9]+[.)])[ \t]+/)) {
+          list_indent += RLENGTH
+          s = substr(s, RLENGTH + 1)
+        }
+      }
+      markdown_text = s
       was_fenced = (fence_char != "")
       sub(/^ ? ? ?/, "", s)
       c = substr(s, 1, 1)
@@ -1715,6 +1751,7 @@ scan_unscoped_identity_writes() {
       }
       if (width >= 3 && (c != "`" || index(rest, "`") == 0)) {
         fence_char = c; fence_width = width
+        fence_quotes = quotes; fence_indent = list_indent
         return 0
       }
       return 1
@@ -1782,7 +1819,10 @@ scan_unscoped_identity_writes() {
     }
     # A group left dangling by a file whose last line ends in `\` must
     # not absorb the first line of the next file.
-    FNR == 1 { flush(); fence_char = ""; fence_width = 0 }
+    FNR == 1 {
+      flush(); fence_char = ""; fence_width = 0
+      fence_quotes = 0; fence_indent = 0; list_quotes = 0; list_indent = 0
+    }
     {
       # Every Markdown spelling the file classifier admits, matched the
       # same case-insensitive way. A doc that reached the scan but was
@@ -1799,7 +1839,7 @@ scan_unscoped_identity_writes() {
         physline[nphys] = FNR
         phystext[nphys] = $0
       }
-      piece = $0
+      piece = (mdfile ? markdown_text : $0)
       if (continued($0)) piece = substr(piece, 1, length(piece) - 1)
       # Shell removes a backslash-newline without adding a byte. Any spacing
       # that separated tokens was already before the backslash and remains in
