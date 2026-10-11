@@ -259,7 +259,11 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     is opaque, so a reference the lexer can see inside one is flagged anyway.
     A `mapfile -C CALLBACK` / `readarray -C CALLBACK` argument is the same
     thing in a NAMED OPTION -- bash evaluates the callback -- and is re-read
-    the same way, without treating the array name beside it as shell.
+    the same way, including bundled short options such as `-tC`. Only the
+    literal callback operand is source: the search stops at `--` or the array
+    operand and skips values consumed by other short options (#1450). An
+    unresolved prefix cannot prove those boundaries, so later known callback
+    operands remain conservative evidence without option dataflow.
   * A reference anywhere XTRACE is in effect.  With `set -x` (or `set -o
     xtrace`, or a `-x` shebang) bash writes every EXPANDED command to stderr,
     so `: "$PAT"` -- the safest command word there is -- puts the value on a
@@ -3593,15 +3597,43 @@ def _deferred_shell_operands(seg):
                 # Reuse the existing bounded reader, not an execution model.
                 out.append(target)
         return out
-    if cmd in DEFERRED_SHELL_OPTIONS:
-        opt = DEFERRED_SHELL_OPTIONS[cmd]
-        lits = [_unquote_command_word(w) for w in seg.words]
+    if cmd in DEFERRED_SHELL_OPTIONS and seg._cmd_index is not None:
+        # Bash short options consume their own cluster remainder or the next
+        # word. A C in that value is data, and operands after -- or the array
+        # name are not callback options (#1450).
+        args = list(_command_arguments(seg.words, seg._cmd_index + 1))
         out = []
-        for k, l in enumerate(lits):
-            if l == opt and k + 1 < len(lits) and lits[k + 1] is not None:
-                out.append(lits[k + 1])
-            elif l is not None and l.startswith(opt) and len(l) > len(opt):
-                out.append(l[len(opt) :])
+        i = 0
+        uncertain_prefix = False
+        while i < len(args):
+            _raw, literal = args[i]
+            if literal is None:
+                # It might be a flag, a value-taking option or the array name.
+                # Preserve known later callbacks rather than infer a clean path.
+                uncertain_prefix = True
+                i += 1
+                continue
+            if literal == "--" or literal == "-" or not literal.startswith("-"):
+                if not uncertain_prefix:
+                    break
+                i += 1
+                continue
+            cluster = literal[1:]
+            for j, option in enumerate(cluster):
+                if option in SHORT_OPTION_OPERAND_LETTERS[cmd]:
+                    value = cluster[j + 1:]
+                    if not value:
+                        value = args[i + 1][1] if i + 1 < len(args) else None
+                        if not uncertain_prefix:
+                            i += 1
+                    if option == "C" and value is not None:
+                        out.append(value)
+                    break
+                if option != "t":
+                    if not uncertain_prefix:
+                        return out  # Unsupported option prevents later callbacks.
+                    break
+            i += 1
         return out
     if cmd not in DEFERRED_SHELL_COMMANDS:
         return []
@@ -6853,6 +6885,200 @@ CORPUS = [
         MUST_NOT_FLAG,
         'mapfile v < <(printf \'x\\n\')\n: "$GH_TOKEN"\necho ok\n',
     ),
+    # #1450: callback short-option prefixes only; values and array names
+    # are not source. Each form is measured by the scrubbed Bash oracle.
+    (
+        'mapfile-callback-options-separated',
+        MUST_FLAG,
+        'mapfile -C \'echo "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'mapfile-callback-options-bundled',
+        MUST_FLAG,
+        'mapfile -tC \'echo "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'mapfile-callback-options-bundled-safe',
+        MUST_NOT_FLAG,
+        "mapfile -tC true -c 1 values < <(printf 'x\\n')\n",
+    ),
+    (
+        'mapfile-callback-options-attached',
+        MUST_FLAG,
+        'mapfile \'-tCecho "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'mapfile-callback-options-after-terminator',
+        MUST_NOT_FLAG,
+        'mapfile -- -C \'echo "$GH_TOKEN"\' < <(printf \'x\\n\')\n',
+    ),
+    (
+        'mapfile-callback-options-after-array',
+        MUST_NOT_FLAG,
+        'mapfile values -C \'echo "$GH_TOKEN"\' < <(printf \'x\\n\')\n',
+    ),
+    (
+        'mapfile-callback-options-delimiter-option-value',
+        MUST_NOT_FLAG,
+        'mapfile -d -C \'echo "$GH_TOKEN"\' < <(printf \'x\\n\')\n',
+    ),
+    (
+        'mapfile-callback-options-numeric-option-value',
+        MUST_NOT_FLAG,
+        'mapfile -n -C \'echo "$GH_TOKEN"\' < <(printf \'x\\n\')\n',
+    ),
+    (
+        'mapfile-callback-options-cluster-delimiter-value',
+        MUST_NOT_FLAG,
+        'mapfile -tdC \'echo "$GH_TOKEN"\' < <(printf \'x\\n\')\n',
+    ),
+    (
+        'mapfile-callback-options-cluster-numeric-value',
+        MUST_NOT_FLAG,
+        'mapfile -tc1C \'echo "$GH_TOKEN"\' < <(printf \'x\\n\')\n',
+    ),
+    (
+        'mapfile-callback-options-cluster-consumed-value-before-callback',
+        MUST_FLAG,
+        'mapfile -tc1 -C \'echo "$GH_TOKEN"\' values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'mapfile-callback-options-delimiter-before-callback',
+        MUST_FLAG,
+        'mapfile -d x -tC \'echo "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'mapfile-callback-options-separated-safe',
+        MUST_NOT_FLAG,
+        "mapfile -C true -c 1 values < <(printf 'x\\n')\n",
+    ),
+    (
+        'mapfile-callback-options-unrelated-literal-array',
+        MUST_NOT_FLAG,
+        'mapfile \'echo "$GH_TOKEN"\' < <(printf \'x\\n\')\n',
+    ),
+    (
+        'readarray-callback-options-separated',
+        MUST_FLAG,
+        'readarray -C \'echo "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'readarray-callback-options-bundled',
+        MUST_FLAG,
+        'readarray -tC \'echo "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'readarray-callback-options-bundled-safe',
+        MUST_NOT_FLAG,
+        "readarray -tC true -c 1 values < <(printf 'x\\n')\n",
+    ),
+    (
+        'readarray-callback-options-attached',
+        MUST_FLAG,
+        'readarray \'-tCecho "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'readarray-callback-options-after-terminator',
+        MUST_NOT_FLAG,
+        'readarray -- -C \'echo "$GH_TOKEN"\' < <(printf \'x\\n\')\n',
+    ),
+    (
+        'readarray-callback-options-after-array',
+        MUST_NOT_FLAG,
+        'readarray values -C \'echo "$GH_TOKEN"\' < <(printf \'x\\n\')\n',
+    ),
+    (
+        'readarray-callback-options-delimiter-option-value',
+        MUST_NOT_FLAG,
+        'readarray -d -C \'echo "$GH_TOKEN"\' < <(printf \'x\\n\')\n',
+    ),
+    (
+        'readarray-callback-options-numeric-option-value',
+        MUST_NOT_FLAG,
+        'readarray -n -C \'echo "$GH_TOKEN"\' < <(printf \'x\\n\')\n',
+    ),
+    (
+        'readarray-callback-options-cluster-delimiter-value',
+        MUST_NOT_FLAG,
+        'readarray -tdC \'echo "$GH_TOKEN"\' < <(printf \'x\\n\')\n',
+    ),
+    (
+        'readarray-callback-options-cluster-numeric-value',
+        MUST_NOT_FLAG,
+        'readarray -tc1C \'echo "$GH_TOKEN"\' < <(printf \'x\\n\')\n',
+    ),
+    (
+        'readarray-callback-options-cluster-consumed-value-before-callback',
+        MUST_FLAG,
+        'readarray -tc1 -C \'echo "$GH_TOKEN"\' values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'readarray-callback-options-delimiter-before-callback',
+        MUST_FLAG,
+        'readarray -d x -tC \'echo "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'readarray-callback-options-separated-safe',
+        MUST_NOT_FLAG,
+        "readarray -C true -c 1 values < <(printf 'x\\n')\n",
+    ),
+    (
+        'readarray-callback-options-unrelated-literal-array',
+        MUST_NOT_FLAG,
+        'readarray \'echo "$GH_TOKEN"\' < <(printf \'x\\n\')\n',
+    ),
+    # Unresolved prefixes cannot prove option consumption or array lookup.
+    # Retain later known callbacks, declaring the safe runtime counterparts.
+    (
+        'mapfile-callback-options-unknown-option-prefix',
+        MUST_FLAG,
+        'opt=-t\nmapfile "$opt" -C \'echo "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'mapfile-callback-options-unknown-delimiter-prefix',
+        MUST_FLAG,
+        'opt=-d\nmapfile "$opt" -C \'echo "$GH_TOKEN"\' < <(printf \'x\\n\')\n',
+    ),
+    (
+        'mapfile-callback-options-unknown-array-prefix',
+        MUST_FLAG,
+        'opt=values\nmapfile "$opt" -C \'echo "$GH_TOKEN"\' < <(printf \'x\\n\')\n',
+    ),
+    (
+        'mapfile-callback-options-unknown-valued-prefix',
+        MUST_FLAG,
+        'opt=-n\nmapfile "$opt" 1 -tC \'echo "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'mapfile-callback-options-unknown-consumes-known-flag',
+        MUST_FLAG,
+        'opt=-d\nmapfile "$opt" -n -C \'echo "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'readarray-callback-options-unknown-option-prefix',
+        MUST_FLAG,
+        'opt=-t\nreadarray "$opt" -C \'echo "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'readarray-callback-options-unknown-delimiter-prefix',
+        MUST_FLAG,
+        'opt=-d\nreadarray "$opt" -C \'echo "$GH_TOKEN"\' < <(printf \'x\\n\')\n',
+    ),
+    (
+        'readarray-callback-options-unknown-array-prefix',
+        MUST_FLAG,
+        'opt=values\nreadarray "$opt" -C \'echo "$GH_TOKEN"\' < <(printf \'x\\n\')\n',
+    ),
+    (
+        'readarray-callback-options-unknown-valued-prefix',
+        MUST_FLAG,
+        'opt=-n\nreadarray "$opt" 1 -tC \'echo "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'readarray-callback-options-unknown-consumes-known-flag',
+        MUST_FLAG,
+        'opt=-d\nreadarray "$opt" -n -C \'echo "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
     # --- xtrace: only an UNCONDITIONAL disable counts --------------------
     #
     # A `set +x` bash never executes is a silent false negative and is
@@ -7631,6 +7857,30 @@ KNOWN_BROADER = {
         "Every recognized emitting body promotes its helper name; this safe "
         "runtime call does not execute that body. Textual order, false branches "
         "and executed safe redefinitions do not prove runtime lookup (#1467)."
+    ),
+    'mapfile-callback-options-unknown-delimiter-prefix': (
+        "An unresolved prefix might allow the later known callback option. "
+        "This sampled runtime value instead consumes -C or names the array; "
+        "without option dataflow the scanner conservatively rescans the "
+        "literal callback (#1450)."
+    ),
+    'mapfile-callback-options-unknown-array-prefix': (
+        "An unresolved prefix might allow the later known callback option. "
+        "This sampled runtime value instead consumes -C or names the array; "
+        "without option dataflow the scanner conservatively rescans the "
+        "literal callback (#1450)."
+    ),
+    'readarray-callback-options-unknown-delimiter-prefix': (
+        "An unresolved prefix might allow the later known callback option. "
+        "This sampled runtime value instead consumes -C or names the array; "
+        "without option dataflow the scanner conservatively rescans the "
+        "literal callback (#1450)."
+    ),
+    'readarray-callback-options-unknown-array-prefix': (
+        "An unresolved prefix might allow the later known callback option. "
+        "This sampled runtime value instead consumes -C or names the array; "
+        "without option dataflow the scanner conservatively rescans the "
+        "literal callback (#1450)."
     ),
 
     "printf-option-a-readline-target": "Option A rejects every uppercase target, including Readline's editable buffer; the noninteractive oracle does not exercise redisplay and no environment/state proof is claimed",
