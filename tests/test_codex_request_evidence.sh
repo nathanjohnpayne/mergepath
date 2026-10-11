@@ -261,6 +261,43 @@ reviewed-generation-covers-request|$COVERED_APPROVAL|0|cleared — Phase 4b subs
 invalid-generation-record|$INVALID_RECORD_APPROVAL|1|its recorded request generation is unreadable
 duplicate-generation-record|$DUP_RECORD_APPROVAL|1|not exactly one record
 CASES
+# #1619: malformed writer records must not become absent/manual records.
+# Both requests predate approval, so the timestamp fallback would wrongly
+# clear every damaged record. Exercise the production checker, not a copied
+# parser, with genuinely absent and valid records as positive controls.
+while IFS='|' read -r name body comments expected; do
+  printf '%s\n' "$comments" >"$DIR/comments"
+  printf '%s\n' "$COVERED_APPROVAL" | jq --arg body "$body" '.[0].body=$body' >"$DIR/reviews"
+  : >"$DIR/calls"
+  rc=0
+  PATH="$DIR/bin:$PATH" GH_TOKEN=stub FIXTURES="$DIR" CALLS="$DIR/calls" ACK_READ="$name" \
+    PR_BODY='Authoring-Agent: claude' PR_AUTHOR=nathanjohnpayne ISSUE_REACTIONS='[]' \
+    MERGEPATH_REVIEW_POLICY_PATH="$DIR/substitute-policy.yml" \
+    bash "$DIR/scripts/codex-review-check.sh" 99 owner/repo >"$DIR/out" 2>&1 || rc=$?
+  pattern='its recorded request generation is unreadable or not exactly one record'
+  [ "$expected" != 0 ] || pattern='cleared — Phase 4b substitute'
+  if [ "$rc" != "$expected" ] || ! grep -q "$pattern" "$DIR/out"; then
+    cat "$DIR/out"; echo "FAIL #1619 $name rc=$rc"; exit 1
+  fi
+  PASS=$((PASS + 1))
+  echo "PASS: #1619 $name"
+done <<CASES
+missing-closing-space|<!-- mergepath-p4b-request-generation: [123]-->|$RACE_COMMENTS|1
+unterminated-record|<!-- mergepath-p4b-request-generation: [123]|$RACE_COMMENTS|1
+missing-opening-space|<!-- mergepath-p4b-request-generation:[123] -->|$RACE_COMMENTS|1
+missing-colon|<!-- mergepath-p4b-request-generation [123] -->|$RACE_COMMENTS|1
+invalid-json|<!-- mergepath-p4b-request-generation: [123,] -->|$RACE_COMMENTS|1
+non-array-json|<!-- mergepath-p4b-request-generation: 123 -->|$RACE_COMMENTS|1
+non-numeric-id|<!-- mergepath-p4b-request-generation: ["123"] -->|$RACE_COMMENTS|1
+valid-plus-malformed|<!-- mergepath-p4b-request-generation: [123,124] --><!-- mergepath-p4b-request-generation: [123]-->|$RACE_COMMENTS|1
+malformed-plus-valid|<!-- mergepath-p4b-request-generation: [123]--><!-- mergepath-p4b-request-generation: [123,124] -->|$RACE_COMMENTS|1
+valid-plus-unterminated|<!-- mergepath-p4b-request-generation: [123,124] --><!-- mergepath-p4b-request-generation: [123]|$RACE_COMMENTS|1
+duplicate-valid-record|<!-- mergepath-p4b-request-generation: [123,124] --><!-- mergepath-p4b-request-generation: [123,124] -->|$RACE_COMMENTS|1
+manual-absent-record|Manual Phase 4b approval|$RACE_COMMENTS|0
+valid-covered-record|<!-- mergepath-p4b-request-generation: [123,124] -->|$RACE_COMMENTS|0
+valid-empty-record|<!-- mergepath-p4b-request-generation: [] -->|[]|0
+CASES
+
 # The supersession re-read failing rejects the candidate (fails closed).
 printf '%s\n' "$RACE_COMMENTS" >"$DIR/comments"
 printf '%s\n' "$COVERED_APPROVAL" >"$DIR/reviews"
