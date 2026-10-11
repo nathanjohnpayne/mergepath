@@ -8,7 +8,7 @@ The read-only credential-isolation audit reports matched authority names from it
 
 The publisher structural fence prevents workflow and job concurrency for all three native required producers. The contract and mutation coverage are in `specs/required_check_publisher.md` and `tests/test_merge_clearance_gate.sh`.
 
-The shared pull-request body parser and its standalone generated runtime are specified in [`specs/pr_body_contract.md`](../../specs/pr_body_contract.md).
+The shared pull-request body parser and its standalone generated runtime are specified in [`specs/pr_body_contract.md`](../../specs/pr_body_contract.md). The weekly audit records per-PR parser timeouts, continues auditing later PRs, reports unaudited PRs when its time budget is spent, and fails incomplete runs.
 
 Explicitly deferred CodeRabbit findings retain the `deferred-to-followup` ledger disposition and resolver tag. The recorder and resolver evidence contract is in `specs/review_feedback_accounting.md`.
 
