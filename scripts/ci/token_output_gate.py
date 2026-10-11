@@ -201,6 +201,11 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     redirections or assignment prefixes, complex/special targets (including Bash locale selectors) or
     integer/nameref declarations, and numeric, ANSI-C, expanded, dynamic or unknown formats. Repeated
     assignment options and the option delimiter precede the inspected format.
+    Attached value operands with credential references inside arithmetic or
+    error-word evaluation retain output verdicts: expansion may diagnose before
+    printf assigns. Ordinary, single-quoted and escaped value data stays eligible.
+    Captured arithmetic diagnostics remain the measured preexisting #2058
+    miss; this eligibility check does not change the output walk.
     Split-line or continued function headers invalidate attached builtin provenance
     without extending general helper body-span discovery. Prompt-managed
     targets can emit or execute values in interactive shells and stay conservative.
@@ -930,7 +935,7 @@ class Segment:
 class Ref:
     __slots__ = (
         "name", "line", "seg", "heredoc_owner", "in_assign_prefix",
-        "in_heredoc_body", "in_error_word",
+        "in_heredoc_body", "in_error_word", "in_arithmetic",
     )
 
     def __init__(self, name, line, seg, in_assign_prefix=False):
@@ -945,6 +950,10 @@ class Ref:
         # Grading it against the command word answered a question that is not
         # the one being asked (#1032 round 5 P1).
         self.in_error_word = False
+        # Used only to withhold the attached printf assignment exemption:
+        # arithmetic evaluation can diagnose an expanded operand before the
+        # builtin captures it. Ordinary expansion remains eligible.
+        self.in_arithmetic = False
         # Set when the reference is body TEXT the here-doc owner writes, so
         # the owner's segment is where the walk starts.  A reference inside a
         # COMMAND SUBSTITUTION in that same body leaves this None and carries
@@ -1481,6 +1490,7 @@ class Lexer:
                                 in_assign_prefix(),
                             )
                             r.in_error_word = "${?" in quotes[:-1]
+                            r.in_arithmetic = "$((" in quotes
                             cur_ll.refs.append(r)
                     i += 2
                     continue
@@ -1495,6 +1505,7 @@ class Lexer:
                             in_assign_prefix(),
                         )
                         r.in_error_word = "${?" in quotes
+                        r.in_arithmetic = "$((" in quotes
                         cur_ll.refs.append(r)
                 cur_level()["word"].append(c)
                 i += 1
@@ -1566,6 +1577,7 @@ class Lexer:
                         # (#1564 review).
                         ref = Ref(r.name, line, r.seg, r.in_assign_prefix)
                         ref.in_error_word = r.in_error_word
+                        ref.in_arithmetic = r.in_arithmetic
                         ref.heredoc_owner = r.heredoc_owner
                         ref.in_heredoc_body = r.in_heredoc_body
                         cur_ll.refs.append(ref)
@@ -2720,6 +2732,17 @@ def _printf_redirection_has_ref(words):
     return False
 
 
+def _printf_value_has_diagnostic_ref(args):
+    """Inspect value expansion contexts without treating quoted data as code."""
+    for raw, literal in args:
+        if literal is not None:
+            continue
+        for logical_line in Lexer(raw).logical:
+            if any(ref.in_arithmetic or ref.in_error_word for ref in logical_line.refs):
+                return True
+    return False
+
+
 def classify(seg, emitter_helpers):
     cmd, _redir = resolve_command(seg)
     if cmd is None:
@@ -2744,6 +2767,7 @@ def classify(seg, emitter_helpers):
                     and cmd not in emitter_helpers and option_index < len(args)
                     and not _printf_redirection_has_ref(seg.words)
                     and not _printf_assignment_prefix_has_ref(seg.words, idx)
+                    and not _printf_value_has_diagnostic_ref(args[option_index + 1:])
                     and _printf_nondiagnostic_format(*args[option_index])):
                 return ASSIGN
         return EMIT
@@ -5585,6 +5609,61 @@ CORPUS = [
         "printf -vout '%s' harmless >\"./absent/$GH_TOKEN\"\n",
     ),
     (
+        'printf-v-value-arithmetic-diagnostic',
+        MUST_FLAG,
+        'GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "$(( $GH_TOKEN ))"\n',
+    ),
+    (
+        'printf-v-value-arithmetic-braced',
+        MUST_FLAG,
+        'GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "$(( ${GH_TOKEN} ))"\n',
+    ),
+    (
+        'printf-v-value-arithmetic-nested',
+        MUST_FLAG,
+        'GH_TOKEN="$GH_TOKEN."; printf -vout \'%s\' "${UNSET:-$(( $GH_TOKEN ))}"\n',
+    ),
+    (
+        'printf-v-value-arithmetic-capture-baseline',
+        MUST_NOT_FLAG,
+        'GH_TOKEN="$GH_TOKEN."; out=$(printf -vother \'%s\' "$(( $GH_TOKEN ))")\n',
+    ),
+    (
+        'printf-v-value-arithmetic-clean-point',
+        MUST_FLAG,
+        'printf -vout \'%s\' "$(( $GH_TOKEN ))"\n',
+    ),
+    (
+        'printf-v-value-error-diagnostic',
+        MUST_FLAG,
+        'printf -vout \'%s\' "${UNSET:?$GH_TOKEN}"\n',
+    ),
+    (
+        'printf-v-value-ordinary-expansion',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-value-ordinary-default',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "${UNSET:-$GH_TOKEN}"\n',
+    ),
+    (
+        'printf-v-value-ordinary-arithmetic',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "$(( 1 + 2 ))$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-value-literal-arithmetic',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' \'$(( $GH_TOKEN ))\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-value-escaped-arithmetic',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "\\$(( $GH_TOKEN ))"\n',
+    ),
+    (
         'printf-v-managed-pwd-prompt',
         MUST_FLAG,
         'PS1=\'\\w> \'\nprintf -vPWD \'%s\' "$GH_TOKEN"\n',
@@ -6960,6 +7039,12 @@ CORPUS.extend(_generated_corpus())
 # fails when an undeclared disagreement appears AND when a declared entry stops
 # disagreeing, so neither list can quietly rot.
 KNOWN_MISSES = {
+    "printf-v-value-arithmetic-capture-baseline": (
+        "the captured expansion-stderr miss is reproduced on main before "
+        "#1645 and on the parent head; the attached eligibility repair does "
+        "not alter the output walk or repair capture descriptors; residual "
+        "owner is https://github.com/nathanjohnpayne/mergepath/issues/2058"
+    ),
     "helper-double-quoted-backtick-quote-context": (
         "a backtick substitution inside a double-quoted word of a helper "
         "body.  The function matcher now finds the helper's real close "
@@ -7094,6 +7179,11 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    "printf-v-value-arithmetic-clean-point": (
+        "arithmetic value expansion may diagnose a credential before attached "
+        "printf assigns; the single letter-leading sentinel happens to "
+        "evaluate cleanly, so eligibility does not infer safety from its value"
+    ),
     "printf-v-managed-pwd-prompt": (
         "interactive directory-prompt expansion can print the assigned PWD; "
         "the standard oracle is noninteractive, while an echo-disabled PTY "
