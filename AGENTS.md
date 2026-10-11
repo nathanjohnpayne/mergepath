@@ -18,6 +18,7 @@ Agent instructions are organized into focused sub-files under `docs/agents/`. Re
 12. **[Cloud Agent Environments](docs/agents/cloud-environments.md)** --- Setting up Claude Code cloud and Codex cloud sessions to write under the right identities, what they still cannot do, and the capability probe that tells a session which case it is in (synced canonical convention)
 13. **[Cloudflare MCP Servers](docs/agents/cloudflare-mcp-servers.md)** --- Capability note: the five remote MCP servers the `cloudflare` plugin ships, their auth model, and the write-capability hazard
 14. **[Operating Rules for `priority:high` Work](https://github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/high-priority-scope-discipline.md)** --- How to decide what a `priority:high` PR should build when automated review keeps finding more (hub-only, so the link is absolute: `AGENTS.md` is mirrored to consumers and this document is not)
+15. **[Runbook: Unblocking Downstream Trackers](https://github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/tracker-unblock-runbook.md)** --- Sequencing a multi-ticket session that unblocks consumer trackers through Mergepath work: live scope refresh, ordering and concurrency, owner-decision proposals, the pre-merge checklist, security evidence, and the run ledger (hub-only, so the link is absolute)
 
 Item 2 is the stable entrypoint for shared rules: it is one canonical file mirrored to every repo, so a new fleet-wide rule lands by editing it at the canonical source, not by editing every repo's index again.
 

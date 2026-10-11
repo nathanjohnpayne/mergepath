@@ -2,15 +2,15 @@
 
 How to run a multi-ticket session whose goal is to unblock one or more consumer-repo trackers through Mergepath work: refresh the live scope, deliver canonical fixes and their reviewed propagation, verify consumer acceptance, and leave honest evidence on every tracker.
 
-**This runbook sequences existing rules. It does not create new ones.** [REVIEW_POLICY.md](../../REVIEW_POLICY.md), `.github/review-policy.yml`, [AGENTS.md](../../AGENTS.md) and the `docs/agents/` files it indexes are the authority. Where this file disagrees with them, they win and this file is out of date. A session prompt that points here should supply only what is specific to the run: the trackers, the starting scope, dated context, owner decisions, authorizations, and limits (see [§ What the session prompt supplies](#what-the-session-prompt-supplies)).
+**This runbook sequences existing rules. It does not create new ones.** It is written for any registered agent: `<agent>` below is the running session's agent (`claude`, `codex` or `cursor`), and `nathanpayne-<agent>` is that agent's reviewer identity. Never substitute another agent's identity or cache. [REVIEW_POLICY.md](../../REVIEW_POLICY.md), `.github/review-policy.yml`, [AGENTS.md](../../AGENTS.md) and the `docs/agents/` files it indexes are the authority. Where this file disagrees with them, they win and this file is out of date. A session prompt that points here should supply only what is specific to the run: the trackers, the starting scope, dated context, owner decisions, authorizations, and limits (see [§ What the session prompt supplies](#what-the-session-prompt-supplies)).
 
 ## 1. Session start
 
 1. **Read the authority first.** Read `AGENTS.md`, the `docs/agents/` files it lists, `REVIEW_POLICY.md`, `.github/review-policy.yml`, [templated-propagation.md](templated-propagation.md), [propagation-ordering.md](propagation-ordering.md), [high-priority-scope-discipline.md](high-priority-scope-discipline.md) for `priority:high` tickets, and any nested instructions under the paths you will touch.
 2. **Verify the checkout.** Check the root (`git rev-parse --show-toplevel`), the `origin` URL, the branch, and write permission. Work only in worktrees placed per [worktree-placement.md](worktree-placement.md). Use `git -C <worktree>` rather than `cd`, because absolute-path edits from a nested worktree can land in the main checkout.
-3. **Verify identity and signing.** Run `scripts/identity-check.sh`. Confirm that `git config user.signingkey` resolves and that a test commit verifies as `nathanjohnpayne`.
-4. **Warm credentials once.** Run `eval "$(scripts/op-preflight.sh --agent claude --mode review)"`. Before every later credentialed call, revalidate with `eval "$(scripts/op-preflight.sh --agent claude --check --print-exports)"`, which never prompts. Never print token values, and never change the gh keyring's active account.
-5. **Find other sessions before touching shared state.** The preflight cache is keyed per agent (`op-preflight-claude.env`), so every Claude session on this machine shares it. List active sessions (`ListAgents` or the app's session list). Refresh the live ownership of any PRs or issues the prompt says another session owns: their author, latest pushes, labels and open comments. Do not alter another session's PRs, branches, holds, review budgets or cache.
+3. **Verify identity and signing.** After step 4 warms the cache, verify both cached tokens: `GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT" scripts/identity-check.sh --expect-token-identity nathanjohnpayne` and `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/identity-check.sh --expect-token-identity nathanpayne-<agent>`. The write wrappers re-verify with `--expect-write-identity` on every write. Confirm that `git config user.signingkey` resolves and that a test commit verifies as `nathanjohnpayne`.
+4. **Warm credentials once.** Run `eval "$(scripts/op-preflight.sh --agent <agent> --mode review)"`. Before every later credentialed call, revalidate with `eval "$(scripts/op-preflight.sh --agent <agent> --check --print-exports)"`, which never prompts. Never print token values, and never change the gh keyring's active account.
+5. **Find other sessions before touching shared state.** The preflight cache is keyed per agent (`op-preflight-<agent>.env`), so every session of the same agent on this machine shares it. List active sessions (`ListAgents` or the app's session list). Refresh the live ownership of any PRs or issues the prompt says another session owns: their author, latest pushes, labels and open comments. Do not alter another session's PRs, branches, holds, review budgets or cache.
 
 ## 2. Building the work set
 
@@ -66,15 +66,15 @@ Follow REVIEW_POLICY.md's workflow. The scripts it relies on are:
 | Step | Script |
 | --- | --- |
 | Author writes (create, edit, comment, merge) | `scripts/gh-as-author.sh -- gh …` |
-| Reviewer writes | `GH_AS_REVIEWER_IDENTITY=nathanpayne-claude scripts/gh-as-reviewer.sh -- gh …` |
-| Should CodeRabbit be invoked? | `scripts/coderabbit-should-invoke.sh` |
+| Reviewer writes | `GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> scripts/gh-as-reviewer.sh -- gh …` |
+| Should CodeRabbit be invoked? | `scripts/coderabbit-should-invoke.sh <PR#> --repo <owner/repo>` |
 | Wait out a CodeRabbit window | `scripts/coderabbit-wait.sh` (sleep only the remaining `retry_after` window) |
 | Request Codex | `scripts/codex-review-request.sh <PR#>` (never hand-roll the `@codex review` trigger) |
 | Read the Codex verdict | `scripts/codex-review-check.sh <PR#>` |
 | Record per-finding verdicts | `scripts/codex-record-feedback.sh`, `scripts/coderabbit-record-feedback.sh` |
 | Complete-history accounting | `scripts/review-feedback-accounting.sh <PR#>` (require exit `0` and `posted == accounted`) |
 | Resolve threads | REVIEW_POLICY.md § Pre-Merge Review Conversation Gate (`scripts/resolve-pr-threads.sh`) |
-| Automated Phase 4b | `scripts/phase-4b-review.sh <PR#> --repo <o/r>`, **only** from a trusted main-ref checkout and only when policy enables it |
+| Automated Phase 4b | `scripts/phase-4b-review.sh <PR#> --repo <owner/repo>`, **only** from a trusted main-ref checkout and only when policy enables it |
 
 Rules that come up repeatedly:
 
@@ -85,10 +85,11 @@ Rules that come up repeatedly:
 
 ### Stop conditions
 
+A spent Codex request ceiling (`CAP_EXHAUSTED`, `kind: request-ceiling`) is cost exhaustion, not a reason to park: route the PR to Phase 4b as REVIEW_POLICY.md directs, and let the Phase 4b barrier decide whether to dispatch the adapter or stop for a human tiebreaker.
+
 Park a PR and move to other work, recording why in the ledger and on the PR, when any of these happen:
 
-- an escalation signal from REVIEW_POLICY.md fires (repeat-after-rebuttal, runaway or a blocking-review ceiling);
-- the policy's Codex round budget is spent;
+- an escalation signal from REVIEW_POLICY.md fires (repeat-after-rebuttal, the Phase 4b barrier's `runaway` stop, or a blocking-review ceiling), or Phase 4b returns a human-tiebreaker outcome;
 - the PR needs a decision that § 4 classifies as an owner decision;
 - review findings are enlarging the contract rather than finding defects in it (see [high-priority-scope-discipline.md](high-priority-scope-discipline.md)).
 
@@ -102,7 +103,7 @@ Do every step, every time, even if you just did it:
 4. Confirm there are no `human-hold` or other blocking labels.
 5. Run both feedback recorders, then `scripts/review-feedback-accounting.sh`, and require `posted == accounted`.
 6. Run the Pre-Merge Review Conversation Gate and require zero unresolved conversations. Resolve actioned bot threads and accepted registered-agent threads only through the identity-checked paths. Never resolve or alter human-authored conversations, and never remove `human-hold`.
-7. Merge: `scripts/gh-as-author.sh -- gh pr merge <PR#> --squash --delete-branch --match-head-commit <full-head-sha>`.
+7. Merge: `scripts/gh-as-author.sh -- gh pr merge <PR#> --repo <owner/repo> --squash --delete-branch --match-head-commit <full-head-sha>`. Always pass `--repo` (or the full PR URL): a session working across repos with `git -C` would otherwise resolve the PR number against whatever checkout the shell is in.
 
 ### Break-glass
 
@@ -145,7 +146,7 @@ Keep one durable ledger per run as a single comment on the run's primary tracker
 
 After each batch's PRs are confirmed merged:
 
-1. Run `scripts/op-preflight.sh --agent claude --check`.
+1. Run `scripts/op-preflight.sh --agent <agent> --check`.
 2. **If valid:** refresh the live closure, update the work table and ledger, and continue with the next actionable batch without asking.
 3. **If missing, stale or invalid:** pause credential-dependent work and report what is done, what is outstanding, and the exact human action needed. Do not re-warm credentials without the human present.
 
@@ -156,7 +157,7 @@ Send a short update when a PR opens, when it merges, when a blocker appears, and
 1. Update the upstream and downstream trackers with linked, current evidence. Close a downstream tracker only when its consumer criteria are verified.
 2. Sync `main`. Preserve recovery evidence, including any necessary ignored files, before cleanup.
 3. Remove only the worktrees and branches this task created (`scripts/worktree-cleanup.sh` audits candidates).
-4. Finalize the credential cache **only if no other Claude session is active**. `scripts/op-preflight.sh --agent claude --purge` deletes the cache that every Claude session shares. Never use `--purge-all`.
+4. Finalize the credential cache **only if no other session of the same agent is active**. `scripts/op-preflight.sh --agent <agent> --purge` deletes the cache that every session of that agent shares; never purge another agent's cache. Never use `--purge-all`.
 
 ## What the session prompt supplies
 
