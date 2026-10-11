@@ -1759,6 +1759,67 @@ else
   fail "tab-indented continued command: rc=$RC out=$OUT"
 fi
 
+# Case 54i: quote and list containers may alternate in either order.
+# Prefix frames must survive continuation lines in that same order, and
+# an inner container can end while its outer containers still continue.
+for PREFIX in '- > ' '> - > ' '- > - '; do
+  case "$PREFIX" in
+    '- > ') CONTINUATION='  > '; OUTER='  ' ;;
+    '> - > ') CONTINUATION='>   > '; OUTER='>   ' ;;
+    '- > - ') CONTINUATION='  >   '; OUTER='  > ' ;;
+  esac
+  run_on_fixture "docs/mixed-container-html.md" "$PREFIX"'```bash
+'"$CONTINUATION"'git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+'"$CONTINUATION"'```
+'
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/mixed-container-html.md:2'; then
+    pass "mixed container $PREFIX fence: HTML cannot exempt"
+  else
+    fail "mixed container $PREFIX HTML exemption: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/mixed-container-continued.md" "$PREFIX"'~~~bash
+'"$CONTINUATION"'git config user.email \
+'"$CONTINUATION"'leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+'"$CONTINUATION"'~~~
+'
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/mixed-container-continued.md:2'; then
+    pass "mixed container $PREFIX continued command: HTML cannot exempt"
+  else
+    fail "mixed container $PREFIX continued HTML exemption: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/mixed-container-shell.md" "$PREFIX"'```bash
+'"$CONTINUATION"'git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture
+'"$CONTINUATION"'```
+
+`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: outside -->
+git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture outside
+'
+  if [ "$RC" = "0" ]; then
+    pass "mixed container $PREFIX preserves shell and outside HTML exemptions"
+  else
+    fail "mixed container $PREFIX real exemptions rejected: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/mixed-container-ended.md" "$PREFIX"'```bash
+'"$CONTINUATION"'git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture
+
+`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: ended container -->
+'
+  if [ "$RC" = "0" ]; then
+    pass "mixed container $PREFIX termination drops its unclosed fence"
+  else
+    fail "ended mixed container $PREFIX stale fence: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/mixed-inner-ended.md" "$PREFIX"'```bash
+'"$CONTINUATION"'git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture
+'"$OUTER"'`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: outside inner container -->
+'
+  if [ "$RC" = "0" ]; then
+    pass "mixed container $PREFIX inner termination preserves outer Markdown"
+  else
+    fail "mixed container $PREFIX inner termination stale fence: rc=$RC out=$OUT"
+  fi
+done
+
 # ── Fail-closed: include paths the walk cannot follow ──────────────────
 
 # Case 55: `~/…` in an include path is expanded against the operator's
