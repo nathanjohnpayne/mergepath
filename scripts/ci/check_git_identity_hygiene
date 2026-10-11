@@ -1696,14 +1696,37 @@ scan_unscoped_identity_writes() {
       }
       return 0
     }
-    function exempt(s, md,   t) {
+    # HTML markup is literal data inside a Markdown fence. Track the
+    # opening delimiter and its width so shorter or mismatched fences
+    # cannot restore HTML exemptions before the code block really ends.
+    function markdown_html_context(s,   c, width, rest, was_fenced) {
+      was_fenced = (fence_char != "")
+      sub(/^ ? ? ?/, "", s)
+      c = substr(s, 1, 1)
+      if (c != "`" && c != "~") return !was_fenced
+      width = 0
+      while (substr(s, width + 1, 1) == c) width++
+      rest = substr(s, width + 1)
+      if (was_fenced) {
+        if (c == fence_char && width >= fence_width && rest ~ /^[[:space:]]*$/) {
+          fence_char = ""; fence_width = 0
+        }
+        return 0
+      }
+      if (width >= 3 && (c != "`" || index(rest, "`") == 0)) {
+        fence_char = c; fence_width = width
+        return 0
+      }
+      return 1
+    }
+    function exempt(s, md, html_context,   t) {
       t = s
       if (md) {
         gsub(/``[^`]*``/, "", t)
         gsub(/`[^`]*`/, "", t)
       }
       if (shell_comment_marker(t)) return 1
-      if (md && html_comment_marker(t)) return 1
+      if (md && html_context && html_comment_marker(t)) return 1
       return 0
     }
     function emit(ln, txt,   rel) {
@@ -1752,23 +1775,26 @@ scan_unscoped_identity_writes() {
       if (nbuf == 0) return
       if (nphys > 0) {
         for (i = 1; i <= nphys; i++) emit(physline[i], phystext[i])
-      } else if (offending(buf, grpmd) && !exempt(buf, grpmd)) {
+      } else if (offending(buf, grpmd) && !exempt(buf, grpmd, grphtml)) {
         emit(start, buf)
       }
       buf = ""; nbuf = 0; nphys = 0
     }
     # A group left dangling by a file whose last line ends in `\` must
     # not absorb the first line of the next file.
-    FNR == 1 { flush() }
+    FNR == 1 { flush(); fence_char = ""; fence_width = 0 }
     {
       # Every Markdown spelling the file classifier admits, matched the
       # same case-insensitive way. A doc that reached the scan but was
       # judged as a shell script would not be cut on backticks, which is
       # the fail-open shape the cut exists to close.
       mdfile = (tolower(FILENAME) ~ /\.(md|markdown|mdown|mkd)$/)
-      if (nbuf == 0) { start = FNR; grpfile = FILENAME; grpmd = mdfile }
+      html_context = (mdfile ? markdown_html_context($0) : 0)
+      if (nbuf == 0) {
+        start = FNR; grpfile = FILENAME; grpmd = mdfile; grphtml = html_context
+      } else if (!html_context) grphtml = 0
       nbuf++
-      if (offending($0, mdfile) && !exempt($0, mdfile)) {
+      if (offending($0, mdfile) && !exempt($0, mdfile, html_context)) {
         nphys++
         physline[nphys] = FNR
         phystext[nphys] = $0

@@ -1440,6 +1440,55 @@ else
   fail "complete Markdown marker: rc=$RC out=$OUT"
 fi
 
+# Case 54e: HTML markers are literal code inside either Markdown fence.
+# A shorter or mismatched delimiter cannot end the fenced-code context.
+for FENCE in '```' '~~~' '````' '~~~~'; do
+  if [[ "$FENCE" == \`* ]]; then MISMATCH='~~~'; else MISMATCH='```'; fi
+  run_on_fixture "docs/fenced-html.md" "$FENCE"'bash
+'"${FENCE%?}"'
+'"$MISMATCH"'
+git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->
+'
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/fenced-html.md:4"; then
+    pass "HTML marker inside $FENCE fence: cannot exempt a write"
+  else
+    fail "HTML marker inside $FENCE fence: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/fenced-shell.md" "$FENCE"'bash
+git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+'"$FENCE"'
+`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: recorded evidence -->
+'
+  if [ "$RC" = "0" ]; then
+    pass "shell marker inside $FENCE fence and HTML marker after closing: allowed"
+  else
+    fail "valid exemptions around $FENCE fence: rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "docs/continued-fenced-html.md" '   ~~~~bash
+git config user.email \
+fixture@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->
+   ~~~~~
+'
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/continued-fenced-html.md:2"; then
+  pass "continued command inside indented Markdown fence: HTML marker cannot exempt"
+else
+  fail "continued fenced HTML marker: rc=$RC out=$OUT"
+fi
+# Fence state belongs to each file, even when the preceding fence never closes.
+run_on_fixture "docs/a-unclosed.md" '```bash
+'
+printf '%s\n' '`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: recorded evidence -->' > "$WORKDIR/fixture-$FIXTURE_SEQ/docs/b-outside.md"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$WORKDIR/fixture-$FIXTURE_SEQ" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "0" ]; then
+  pass "unclosed Markdown fence does not leak into another file"
+else
+  fail "Markdown fence state leaked between files: rc=$RC out=$OUT"
+fi
+
 # ── Fail-closed: include paths the walk cannot follow ──────────────────
 
 # Case 55: `~/…` in an include path is expanded against the operator's
