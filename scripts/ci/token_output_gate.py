@@ -204,6 +204,9 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     Split-line or continued function headers invalidate attached builtin provenance
     without extending general helper body-span discovery. Prompt-managed
     targets can emit or execute values in interactive shells and stay conservative.
+    Timing/history formats, mail-arrival paths and default cd paths likewise
+    stay conservative as finite managed targets. The noninteractive corpus
+    declares mail-arrival checks separately from an independent PTY oracle.
     Credential-bearing prefixes were also missed by the parent scanner;
     their diagnostic check here is limited to attached-option assignments.
     Numeric-conversion diagnostics from the separate assignment form remain
@@ -2656,6 +2659,7 @@ _PRINTF_SPECIAL_TARGETS = frozenset({
     "LC_NUMERIC", "LC_TIME", "LINENO", "LINES", "MAILCHECK", "OPTIND", "PPID",
     "RANDOM", "SECONDS", "SHLVL", "SRANDOM", "TMOUT", "UID", "PIPESTATUS",
     "PS0", "PS1", "PS2", "PS3", "PS4", "PROMPT_COMMAND",
+    "TIMEFORMAT", "HISTTIMEFORMAT", "HOME", "CDPATH", "OLDPWD", "MAIL", "MAILPATH",
     "FUNCNAME", "GROUPS", "DIRSTACK",
 })
 
@@ -5579,6 +5583,66 @@ CORPUS = [
         "printf -vout '%s' harmless >\"./absent/$GH_TOKEN\"\n",
     ),
     (
+        'printf-v-managed-timeformat',
+        MUST_FLAG,
+        'printf -vTIMEFORMAT \'%s\' "$GH_TOKEN"\ntime :\n',
+    ),
+    (
+        'printf-v-managed-histtimeformat',
+        MUST_FLAG,
+        'printf -vHISTTIMEFORMAT \'%s\' "$GH_TOKEN"\nhistory -s entry\nhistory\n',
+    ),
+    (
+        'printf-v-managed-home',
+        MUST_FLAG,
+        'mkdir "$GH_TOKEN"\nprintf -vHOME \'%s\' "$GH_TOKEN"\ncd\npwd\n',
+    ),
+    (
+        'printf-v-managed-cdpath',
+        MUST_FLAG,
+        'mkdir -p "$GH_TOKEN/sub"\nprintf -vCDPATH \'%s\' "$GH_TOKEN"\ncd sub\n',
+    ),
+    (
+        'printf-v-managed-oldpwd',
+        MUST_FLAG,
+        'mkdir "$GH_TOKEN"\nprintf -vOLDPWD \'%s\' "$GH_TOKEN"\ncd -\n',
+    ),
+    (
+        'printf-v-managed-mail',
+        MUST_FLAG,
+        'printf -vMAIL \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-managed-mailpath',
+        MUST_FLAG,
+        'printf -vMAILPATH \'%s\' "$GH_TOKEN"\n',
+    ),
+    (
+        'printf-v-managed-ordinary-time',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "$GH_TOKEN"\ntime :\n',
+    ),
+    (
+        'printf-v-managed-ordinary-history',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "$GH_TOKEN"\nhistory -s entry\nhistory\n',
+    ),
+    (
+        'printf-v-managed-ordinary-home',
+        MUST_NOT_FLAG,
+        'printf -vout \'%s\' "$GH_TOKEN"\ncd\npwd\n',
+    ),
+    (
+        'printf-v-managed-ordinary-cdpath',
+        MUST_NOT_FLAG,
+        'mkdir sub\nprintf -vout \'%s\' "$GH_TOKEN"\ncd sub\n',
+    ),
+    (
+        'printf-v-managed-ordinary-oldpwd',
+        MUST_NOT_FLAG,
+        'mkdir sub\ncd sub\nprintf -vout \'%s\' "$GH_TOKEN"\ncd -\n',
+    ),
+    (
         'printf-v-continued-spaced-prefix',
         MUST_FLAG,
         'command \\\n( ) { echo "$@"; }\ncommand printf -vout \'%s\' "$GH_TOKEN"\n',
@@ -7013,6 +7077,18 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    "printf-v-managed-mail": (
+        "interactive mail-arrival checks can automatically print the assigned "
+        "path; the standard oracle is noninteractive, while an echo-disabled "
+        "PTY oracle with an environment-only fake sentinel measures the leak "
+        "and keeps an ordinary-target control clean"
+    ),
+    "printf-v-managed-mailpath": (
+        "interactive mail-arrival checks can automatically print the assigned "
+        "path; the standard oracle is noninteractive, while an echo-disabled "
+        "PTY oracle with an environment-only fake sentinel measures the leak "
+        "and keeps an ordinary-target control clean"
+    ),
     "printf-v-continued-noop-function": (
         "a continued declaration prevents proving builtin lookup even when "
         "its body emits nothing; retain attached-form conservative provenance"
