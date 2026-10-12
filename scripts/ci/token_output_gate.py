@@ -345,6 +345,15 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     set -- an alias is the relationship a helper already has with its call
     sites -- with bash's own two gates kept: `expand_aliases` must be
     enabled, and only a LITERAL target counts.
+    In actual HD substitution programs, a literal emitter replacement's
+    positional reference is inventoried only at a later command-position
+    invocation after a literal expand_aliases enable. Literal disable,
+    same-line and uninvoked controls remain quiet. This replacement source
+    consumes the existing one-hop child inventory, with no runtime binding
+    or general alias-expansion model. The opt-in arithmetic delimiter role
+    also consumes raw final `for` locally, retaining initialization,
+    condition and update diagnostic operands without changing default
+    lexical output or extending array DATA/ordinary argument admission.
   * The ERROR WORD of a `${VAR:?word}` / `${VAR?word}` expansion.  BASH
     ITSELF writes that word to stderr when VAR is unset, before the enclosing
     command runs and whatever that command is, so `: "${UNSET:?$PAT}"` and
@@ -1455,7 +1464,7 @@ class Lexer:
         def cur_level():
             return levels[-1]
 
-        def arithmetic_command_position(prefix=None):
+        def arithmetic_command_position(prefix=None, for_clause=False):
             # Read only the already-tokenized prefix with the existing resolver.
             # The temporary segment avoids caching a partial real segment.
             probe = Segment(-1, None, False, line)
@@ -1470,6 +1479,11 @@ class Lexer:
                 del probe.words[idx]
                 if probe.words[idx:idx + 1] == ["-p"]:
                     del probe.words[idx]
+            # A raw final `for` opens C-style arithmetic, not an argument.
+            # Keep it local to this delimiter role; indexes/default lexing
+            # still use the unchanged ordinary command-position resolver.
+            if for_clause and probe.words[-1:] == ["for"]:
+                probe.words.pop()
             cmd, _redir = resolve_command(probe)
             return cmd is None
 
@@ -1960,7 +1974,7 @@ class Lexer:
 
             if c == "(":
                 word_so_far = "".join(cur_level()["word"])
-                if self._arithmetic_contexts and (not word_so_far or word_so_far in RESERVED_WORDS or word_so_far == "time") and text.startswith("((", i) and arithmetic_command_position(word_so_far):
+                if self._arithmetic_contexts and (not word_so_far or word_so_far in RESERVED_WORDS or word_so_far in ("time", "for")) and text.startswith("((", i) and arithmetic_command_position(word_so_far, for_clause=True):
                     close = _find_compound_close(text, i)
                     if close is not None and text[close - 1:close + 1] == "))":
                         record_arithmetic_context(i, i + 2, close - 1, close + 1, "command")
@@ -3710,6 +3724,8 @@ def _heredoc_substitution_has_positional(body, _depth=0):
                         return True
     if _depth >= _DEFERRED_SHELL_DEPTH:
         return False
+    if _heredoc_invoked_alias_has_positional(lx):
+        return True
     for hd in lx.heredocs:
         if _heredoc_has_positional(hd, set(), _depth + 1):
             return True
@@ -3718,6 +3734,40 @@ def _heredoc_substitution_has_positional(body, _depth=0):
             for inner in _deferred_shell_operands(seg):
                 if _heredoc_substitution_has_positional(inner, _depth + 1):
                     return True
+    return False
+
+
+
+def _heredoc_invoked_alias_has_positional(lx):
+    """Literal emitter replacement source at a later enabled invocation.
+
+    Reuse the existing alias emitter catalog, then apply the ordinary
+    positional reader only to literal replacement text. This spends the
+    existing child inventory rather than modeling runtime alias bindings.
+    """
+    aliases = _alias_emitters(lx, set())
+    if not aliases:
+        return False
+    positional = {}
+    enabled = False
+    enabled_at = None
+    for ll in lx.logical:
+        for seg in ll.segments:
+            cmd, _redir = resolve_command(seg)
+            lits = [_unquote_command_word(w) for w in seg.words]
+            if cmd == "shopt" and "expand_aliases" in lits:
+                if "-s" in lits:
+                    enabled, enabled_at = True, ll.first_line
+                elif "-u" in lits:
+                    enabled = False
+            elif cmd == "alias":
+                for literal in lits[1:]:
+                    m = _ALIAS_RE.match(literal) if literal is not None else None
+                    if m and m.group(1) in aliases and _word_has_verbatim_positional(m.group(2)):
+                        positional.setdefault(m.group(1), ll.first_line)
+            elif (enabled and cmd in positional
+                  and ll.first_line > max(positional[cmd], enabled_at)):
+                return True
     return False
 
 
@@ -5085,6 +5135,30 @@ MUST_NOT_FLAG = "clean"
 
 # (id, disposition, body)  -- body is appended to PROLOGUE.
 CORPUS = [
+    # Human-bounded regressions: C-for diagnostics and invoked literal aliases.
+    ('helper-hd-bounded-for-init', MUST_FLAG, 'die(){ printf safe <<EOF\n$(for ((x=1/\'$1\'; x; x--)); do :; done)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-condition', MUST_FLAG, 'die(){ printf safe <<EOF\n$(for ((x=1; 1/\'$1\'; x--)); do :; done)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-update', MUST_FLAG, 'die(){ printf safe <<EOF\n$(for ((x=1; x; x=1/\'$1\')); do :; done)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-adjacent', MUST_FLAG, 'die(){ printf safe <<EOF\n$(for((x=1/\'$1\'; x; x--)); do :; done)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-escaped-positional', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(for ((x=1/\\$1; x; x--)); do :; done)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-literal-data', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(printf \'%s\' \'for ((x=1/$1; x; x--)); do :; done\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-array-data', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(args=(\'for ((x=1/$1; x; x--)); do :; done\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-comment', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(# for ((x=1/\'$1\'; x; x--)); do :; done\nprintf safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-tail-data', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(for ((x=1; x; x--)); do :; done; printf \'%s\' \'$1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-expanding', MUST_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias emit_value=\'echo "$1" >&2\'\nemit_value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-disabled', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -u expand_aliases\nalias emit_value=\'echo "$1" >&2\'\nemit_value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-uninvoked', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias emit_value=\'echo "$1" >&2\'\n:)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-before-definition', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nemit_value\nalias emit_value=\'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-same-line', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias emit_value=\'echo "$1" >&2\'; emit_value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-before-enable', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(alias emit_value=\'echo "$1" >&2\'\nemit_value\nshopt -s expand_aliases)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-disable-after-enable', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias emit_value=\'echo "$1" >&2\'\nshopt -u expand_aliases\nemit_value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-literal-positional', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias emit_value=\'echo \'\\\'\'$1\'\\\'\' >&2\'\nemit_value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-escaped-positional', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias emit_value=\'echo "\\$1" >&2\'\nemit_value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-argument', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias emit_value=\'echo "$1" >&2\'\nprintf "%s" emit_value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-init-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(for ((x=1/\'$1\'; x; x--)); do :; done)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-condition-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(for ((x=1; 1/\'$1\'; x--)); do :; done)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-update-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(for ((x=1; x; x=1/\'$1\')); do :; done)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-expanding-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(shopt -s expand_aliases\nalias emit_value=\'echo "$1" >&2\'\nemit_value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
 
     # Measured literal time/-p arithmetic prefixes; split oracle forms stay side evidence.
     ('helper-hd-round11-time-if-time', MUST_FLAG, 'leak() { printf safe <<EOF\n$(if time ((1/\'$1\'));then :;fi)\nEOF\n}\nleak "$GH_TOKEN"\n'),
@@ -11855,6 +11929,31 @@ def _heredoc_command_index_context_cases():
     return failures
 
 
+
+def _heredoc_for_alias_context_cases():
+    """The two bounded regressions retain literal/source and child fences."""
+    failures = []
+    for source in ("for ((x=1/'$1'; x; x--)); do :; done",
+                   "for ((x=1; 1/'$1'; x--)); do :; done",
+                   "for ((x=1; x; x=1/'$1')); do :; done"):
+        if Lexer(source).arithmetic_context_spans:
+            failures.append("default C-for metadata changed: " + source)
+        if not _heredoc_substitution_has_positional(source, _DEFERRED_SHELL_DEPTH):
+            failures.append("reached C-for diagnostic spent a child hop: " + source)
+    source = 'shopt -s expand_aliases\nalias emit_value=\'echo "$1" >&2\'\nemit_value'
+    if not _heredoc_substitution_has_positional(source):
+        failures.append("invoked literal alias replacement missing")
+    if _heredoc_substitution_has_positional(source, _DEFERRED_SHELL_DEPTH):
+        failures.append("alias replacement bypassed the existing child stop")
+    for source in ("printf '%s' 'for ((1/$1;1;1))'",
+                   "args=('for ((1/$1;1;1))')",
+                   'shopt -u expand_aliases\nalias emit_value=\'echo "$1" >&2\'\nemit_value',
+                   'shopt -s expand_aliases\nalias emit_value=\'echo "$1" >&2\'\n:'):
+        if _heredoc_substitution_has_positional(source):
+            failures.append("inert/disabled/uninvoked source changed: " + source)
+    return failures
+
+
 def self_test():
     failures = []
     passed = 0
@@ -11873,6 +11972,7 @@ def self_test():
     failures.extend(_heredoc_guard_nested_attributes_cases())
     failures.extend(_heredoc_indirect_source_arithmetic_cases())
     failures.extend(_heredoc_command_index_context_cases())
+    failures.extend(_heredoc_for_alias_context_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
