@@ -20,6 +20,14 @@ Every consumer handles that failure during the same evaluation: the waiter and f
 
 The migration includes nested waiter predicates and clean-run selection, not only direct callers. Internal classifier failure remains distinguishable from the clean-run selector's existing review-list failure: the latter may still let independently read summary evidence decide under the existing contract, whereas unread tier evidence cannot establish a clean run or use that fallback. The existing raw-body fallback on structural-sanitizer failure is preserved; failure to classify that raw body is an error. No marker grammar, quotation, terminality, publication provenance or archive-recovery policy changes are implied.
 
+### Published included-review retry windows (#2031)
+
+The shared window parser accepts `Next included review available in N minutes/seconds`, an optional colon, Markdown or HTML presentation, mixed minute-and-second durations, and zero-minute availability alongside the legacy fair-usage and `Please wait` wording. The waiter retains its existing mutable-comment freshness anchor, remaining-window subtraction and 30-second safety buffer. It never posts a retry before that deadline, and the existing cross-run trigger deduplication still applies after the wait.
+
+A refusal with no usable duration stalls with exit 5 instead of inventing a 60-second window; its result identifies the missing or malformed deadline. The existing once-per-head Codex failover is attempted before this stall. A recognized availability notice with a malformed or unusably large numeric duration also remains a refusal when it ages beyond the ordinary comment freshness floor, because its expiry cannot be established. Later bot publications and existing real current-head review evidence retain their precedence. This does not change provider spending limits, review ordering, retry caps or the authority of an approval.
+
+Production-parser cases and virtual-clock real-waiter cases in `tests/test_coderabbit_wait_ratelimit_window.sh` cover the exact 21- and 13-minute notices, HTML/Markdown, second and zero-minute forms, mutable timestamps, the safety buffer, cross-run deduplication and malformed/unknown deadlines without making network requests.
+
 ### Polling timeout after a notice-less rate-limit refusal (#940)
 
 At the existing polling timeout boundary, the pause latch and post-status-question terminal-review decision retain their precedence. If neither produces a verdict, a fresh trusted per-head CodeRabbit status of `success` with the exact description `Review rate limited` (case and surrounding whitespace normalized) produces exit 5 / `rate_limit_stalled` and attempts the existing #489 Codex failover once. The result records whether that attempt succeeded; an opted-out or failed request still reports the rate-limit stall with `codex_failover_requested: false`. The status evidence retains its source creation time.

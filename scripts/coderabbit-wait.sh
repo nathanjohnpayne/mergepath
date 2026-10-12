@@ -1324,9 +1324,36 @@ log "status_probe_enabled = $STATUS_PROBE_ENABLED   status_probe_wait = ${STATUS
 # --- state machine ----------------------------------------------------------
 
 # Parse a rate-limit wait window from a CodeRabbit comment body.
-# Emits seconds on stdout. Returns 1 if no window found.
+# Emits seconds on stdout. Returns 1 if absent, 2 for unusable availability.
 parse_rate_limit_window() {
   local body=$1
+  # Included-allowance notices use the same published deadline as the older
+  # fair-usage wording. Strip presentation markup only; never invent a delay
+  # when the provider's duration is missing, malformed or too large to use.
+  local plain value unit tail seconds=0
+  plain=$(sed 's/<[^>]*>//g; s/[*_`]/ /g' <<<"$body") || return 2
+  plain=${plain//&nbsp;/ }
+  local label='[Nn]ext[[:space:]]+(included[[:space:]]+)?review[[:space:]]+available[[:space:]]+in'
+  local availability="$label[[:space:]]*:?[[:space:]]*([0-9]+)[[:space:]]*(minutes?|seconds?)([[:space:][:punct:]]|$)"
+  if [[ "$plain" =~ $availability ]]; then
+    value=${BASH_REMATCH[2]}
+    unit=${BASH_REMATCH[3]}
+    tail=${plain#*"${BASH_REMATCH[0]}"}
+    if [[ "$unit" = minute* && "$tail" =~ ^[[:space:]]*and([[:space:]]|$) ]]; then
+      local extra='^[[:space:]]*and[[:space:]]+([0-9]+)[[:space:]]+seconds?([[:space:][:punct:]]|$)'
+      [[ "$tail" =~ $extra ]] || return 2
+      seconds=${BASH_REMATCH[1]}
+      [ "${#seconds}" -le 7 ] || return 2
+      seconds=$((10#$seconds))
+    fi
+    # Seven decimal digits fit comfortably after the minutes conversion on
+    # every supported Bash. A larger unusable deadline stays a refusal.
+    [ "${#value}" -le 7 ] || return 2
+    value=$((10#$value))
+    case "$unit" in minute*) echo "$((value * 60 + seconds))" ;; *) echo "$value" ;; esac
+    return 0
+  fi
+  if [[ "$plain" =~ $label ]]; then return 2; fi
   # "Please wait X minutes and Y seconds before requesting another review"
   local mins secs total
   if [[ "$body" =~ [Pp]lease\ wait\ +\*?\*?([0-9]+)\*?\*?\ +minutes?\ +and\ +\*?\*?([0-9]+)\*?\*?\ +seconds? ]]; then
@@ -2816,9 +2843,11 @@ newest_bot_comment_for_refusal_guard() {
 #   classifies rate_limit  via the structural-first selected-comment
 #                      classifier, with the legacy marker-first classifier as
 #                      its nonmatch fallback (#593/#956).
-#   window still open  `parse_rate_limit_window` must yield a window AND
-#                      fresh_at + window + buffer must be in the future. A
-#                      notice publishing no parseable window governs nothing
+#   window still open  a parsed window governs through fresh_at + window +
+#                      buffer. Recognized availability with unusable duration
+#                      stays active: its expiry cannot be proved. A generic
+#                      notice without an availability label retains the
+#                      existing comment-freshness handling
 #                      here; it is still handled while it is fresh.
 #
 # rate_limit_window_elapsed_seconds fails SAFE to 0 on an unparseable
@@ -2826,7 +2855,7 @@ newest_bot_comment_for_refusal_guard() {
 # suppressing direction.
 crw_active_rate_limit_notice() {
   local issue_comments=${1:-}
-  local latest body class class_rc=0 window fresh_at elapsed remaining
+  local latest body class class_rc=0 window window_rc=0 fresh_at elapsed remaining
   if [ -z "$issue_comments" ]; then
     issue_comments=$(fetch_api_array_best_effort "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || return 3
   fi
@@ -2839,7 +2868,14 @@ crw_active_rate_limit_notice() {
   class=$(crw_classify_selected_comment "$body") || class_rc=$?
   [ "$class_rc" != "3" ] || return 3
   [ "$class" = "rate_limit" ] || return 1
-  window=$(parse_rate_limit_window "$body") || return 1
+  window=$(parse_rate_limit_window "$body") || window_rc=$?
+  if [ "$window_rc" = "2" ]; then
+    # A recognized availability notice with unusable duration cannot prove
+    # expiry merely by aging out of the normal comment freshness floor.
+    printf '%s' "$latest" | jq -c '. + {rate_limit_remaining_seconds: null, rate_limit_window_unusable: true}'
+    return 0
+  fi
+  [ "$window_rc" = "0" ] || return 1
   fresh_at=$(echo "$latest" | jq -r '.fresh_at // .updated_at // .created_at')
   elapsed=$(rate_limit_window_elapsed_seconds "$fresh_at" "$(date +%s)")
   remaining=$((window + RATE_LIMIT_BUFFER_SECONDS - elapsed))
@@ -5570,8 +5606,9 @@ while :; do
 
       WINDOW_SECONDS=$(parse_rate_limit_window "$COMMENT_BODY" || echo "")
       if [ -z "$WINDOW_SECONDS" ]; then
-        log "could not parse rate-limit window from comment; falling back to 60s"
-        WINDOW_SECONDS=60
+        log "rate-limit notice has no usable published window — stalling without a CodeRabbit retry"
+        RATE_LIMIT_REVIEW=$(echo "$LATEST" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200]), window_parse_reason: "missing-or-malformed"}')
+        emit_json_and_exit "rate_limit_stalled" 5 "$RATE_LIMIT_REVIEW" 0
       fi
       # #727: sleep only the window that REMAINS. The published window runs
       # from the notice's post time (COMMENT_FRESH_AT), so subtract however
