@@ -1174,6 +1174,17 @@ def _find_substitutions(s, quotes_are_literal=False, include_arithmetic=False):
         return _find_substitutions_legacy(s, quotes_are_literal, include_arithmetic)
 
 
+
+def _heredoc_brace_command_span(text, i):
+    """Bash 5.3 command openers under the HD-only inventory opt-in."""
+    if text[i:i + 2] != "${" or text[i + 2:i + 3] not in (" ", "\t", "\n", "|"):
+        return None
+    begin = i + (3 if text[i + 2:i + 3] == "|" else 2)
+    close = _find_compound_close(text, i + 1)
+    end = len(text) if close is None else close + 1
+    return text[begin:close if close is not None else end], i, end
+
+
 def _heredoc_diagnostic_span(text, i):
     """Read a diagnostic candidate with existing bounds, not shell grammar.
 
@@ -1184,6 +1195,9 @@ def _heredoc_diagnostic_span(text, i):
     prove, retain the remaining bounded source conservatively. That tail can
     include inert data; it is not a claim that every retained character runs.
     """
+    brace = _heredoc_brace_command_span(text, i)
+    if brace is not None:
+        return brace
     if text[i : i + 2] == "$[":
         close = _find_compound_close(text, i + 1, bracket_span=True)
         end = len(text) if close is None else close + 1
@@ -3681,6 +3695,7 @@ def _heredoc_has_positional(hd, emitter_helpers, _depth=0):
                 inner = _backtick_positional_source(inner)
             positional = (_word_has_verbatim_positional(inner, in_heredoc=True, _depth=_depth)
                           if body.startswith(("$[", "$((", "${"), start)
+                          and _heredoc_brace_command_span(body, start) is None
                           else _heredoc_substitution_has_positional(inner, _depth))
             if positional:
                 return True
@@ -3719,6 +3734,10 @@ def _heredoc_substitution_has_positional(body, _depth=0):
         for seg in ll.segments:
             executable = " ".join(seg.words)
             for operand, start, _end in _find_substitutions(executable, include_arithmetic=True):
+                if _heredoc_brace_command_span(executable, start) is not None:
+                    if _heredoc_substitution_has_positional(operand, _depth):
+                        return True
+                    continue
                 if executable.startswith(("$[", "$((", "${"), start):
                     if _word_has_verbatim_positional(operand, in_heredoc=True, _depth=_depth):
                         return True
@@ -3731,11 +3750,60 @@ def _heredoc_substitution_has_positional(body, _depth=0):
             return True
     for ll in lx.logical:
         for seg in ll.segments:
-            for inner in _deferred_shell_operands(seg):
+            for inner in (_deferred_shell_operands(seg) + _heredoc_source_herestrings(seg)):
                 if _heredoc_substitution_has_positional(inner, _depth + 1):
                     return True
     return False
 
+
+
+
+def _heredoc_source_herestrings(seg):
+    """Literal stdin supplied to source/. shares the existing child budget."""
+    cmd, _redir = resolve_command(seg)
+    if cmd not in ("source", ".") or seg._cmd_index is None:
+        return []
+    args = list(_command_arguments(seg.words, seg._cmd_index + 1))
+    if args and args[0][1] == "--":
+        args = args[1:]
+    if not args or args[0][1] != "/dev/stdin":
+        return []
+    inputs = []
+    for i, word in enumerate(seg.words):
+        if word == "<<<" and i + 1 < len(seg.words):
+            literal = _unquote_command_word(seg.words[i + 1])
+            if literal is not None:
+                inputs.append(literal)
+    return inputs
+
+
+
+def _shopt_expand_aliases_delta(seg):
+    """Literal valid shopt bundles for this existing alias-enable gate only."""
+    cmd, _redir = resolve_command(seg)
+    if cmd != "shopt" or seg._cmd_index is None:
+        return None
+    flags = set()
+    names = []
+    options = True
+    for _raw, literal in _command_arguments(seg.words, seg._cmd_index + 1):
+        if literal is None:
+            return None
+        if options and literal == "--":
+            options = False
+            continue
+        if options and literal.startswith("-") and literal != "-":
+            if not re.fullmatch(r"-[pqsuo]+", literal):
+                return None
+            flags.update(literal[1:])
+            continue
+        options = False
+        names.append(literal)
+    if "expand_aliases" not in names or "o" in flags or {"s", "u"} <= flags:
+        return None
+    if "u" in flags:
+        return False
+    return True if "s" in flags else None
 
 
 def _heredoc_invoked_alias_has_positional(lx):
@@ -3755,10 +3823,11 @@ def _heredoc_invoked_alias_has_positional(lx):
         for seg in ll.segments:
             cmd, _redir = resolve_command(seg)
             lits = [_unquote_command_word(w) for w in seg.words]
-            if cmd == "shopt" and "expand_aliases" in lits:
-                if "-s" in lits:
+            if cmd == "shopt":
+                delta = _shopt_expand_aliases_delta(seg)
+                if delta is True:
                     enabled, enabled_at = True, ll.first_line
-                elif "-u" in lits:
+                elif delta is False:
                     enabled = False
             elif cmd == "alias":
                 for literal in lits[1:]:
@@ -3812,6 +3881,14 @@ def _word_has_verbatim_positional_exact(w, in_heredoc=False, _depth=0):
     in_double = False
     while i < n:
         c = w[i]
+        if in_heredoc and c == "$":
+            brace = _heredoc_brace_command_span(w, i)
+            if brace is not None:
+                body, _start, end = brace
+                if _heredoc_substitution_has_positional(body, _depth):
+                    return True
+                i = end
+                continue
         if (c == "\\" and i + 1 < n
                 and (not in_heredoc or w[i + 1] in "$`\\\n")):
             i += 2
@@ -3868,6 +3945,14 @@ def _word_has_verbatim_positional_legacy(w, in_heredoc=False, _depth=0):
     n = len(w)
     while i < n:
         c = w[i]
+        if in_heredoc and c == "$":
+            brace = _heredoc_brace_command_span(w, i)
+            if brace is not None:
+                body, _start, end = brace
+                if _heredoc_substitution_has_positional(body, _depth):
+                    return True
+                i = end
+                continue
         if (c == "\\" and i + 1 < n
                 and (not in_heredoc or w[i + 1] in "$`\\\n")):
             i += 2
@@ -4220,7 +4305,7 @@ def _alias_emitters(lx, helpers):
             cmd, _redir = resolve_command(seg)
             lits = [_unquote_command_word(w) for w in seg.words]
             lits = [l for l in lits if l is not None]
-            if cmd == "shopt" and "-s" in lits and "expand_aliases" in lits:
+            if _shopt_expand_aliases_delta(seg) is True:
                 if enabled_at is None:
                     enabled_at = ll.first_line
             elif cmd == "alias":
@@ -5135,6 +5220,39 @@ MUST_NOT_FLAG = "clean"
 
 # (id, disposition, body)  -- body is appended to PROLOGUE.
 CORPUS = [
+    # Owner-bounded bundle/source/brace regression controls.
+    ('helper-hd-three-alias-qs', MUST_FLAG, 'die(){ printf safe <<EOF\n$(shopt -qs expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-sq', MUST_FLAG, 'die(){ printf safe <<EOF\n$(shopt -sq expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-ps', MUST_FLAG, 'die(){ printf safe <<EOF\n$(shopt -ps expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-qu', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -qu expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-uq', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -uq expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-q', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -q expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-p', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -p expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-qsx', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -qsx expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-xqs', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -xqs expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-qsu', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -qsu expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-qus', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -qus expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-os', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -os expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-after-enable-qu', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nshopt -qu expand_aliases\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-after-enable-uq', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nshopt -uq expand_aliases\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-after-enable-q', MUST_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nshopt -q expand_aliases\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-after-enable-qsu', MUST_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nshopt -qsu expand_aliases\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-source', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-dot', MUST_FLAG, 'die(){ printf safe <<EOF\n$(. /dev/stdin <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-source-double-dash', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source -- /dev/stdin <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-printf', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(printf safe <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-read', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(read -r x <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-noop', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(: <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-source-nonstdin', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/null <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-source-literal', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin <<< \'echo \'\\\'\'$1\'\\\'\' >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-source-safe', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin <<< \'printf safe\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-source-redacted', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin <<< \'echo "${#1}" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-brace-literal-positional', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n${ echo \'$1\' >&2; }\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-brace-reply-literal-positional', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n${| echo \'$1\' >&2; }\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-brace-escaped', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n\\${ echo "\\$1" >&2; }\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-brace-reply-escaped', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n\\${| echo "\\$1" >&2; }\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-brace-command-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n${ echo "$1" >&2; }\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-brace-reply-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n${| echo "$1" >&2; }\nEOF\n}\ndie "$GH_TOKEN"\n'),
     # Human-bounded regressions: C-for diagnostics and invoked literal aliases.
     ('helper-hd-bounded-for-init', MUST_FLAG, 'die(){ printf safe <<EOF\n$(for ((x=1/\'$1\'; x; x--)); do :; done)\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ('helper-hd-bounded-for-condition', MUST_FLAG, 'die(){ printf safe <<EOF\n$(for ((x=1; 1/\'$1\'; x--)); do :; done)\nEOF\n}\ndie "$GH_TOKEN"\n'),
@@ -11954,6 +12072,38 @@ def _heredoc_for_alias_context_cases():
     return failures
 
 
+
+def _heredoc_three_regression_cases():
+    """Portable seams and statically inventoried Bash 5.3 source roles."""
+    failures = []
+    for expression in ('${ echo "$1" >&2; }', '${| echo "$1" >&2; }'):
+        body = 'die(){ printf safe <<EOF\n' + expression + '\nEOF\n}\ndie "$GH_TOKEN"\n'
+        if not scan_text(body, "brace-command")[0]:
+            failures.append("Bash 5.3 brace helper source missing: " + expression)
+        if not _heredoc_substitution_has_positional(expression, _DEFERRED_SHELL_DEPTH):
+            failures.append("reached brace source spent/reset child depth: " + expression)
+        if _find_substitutions(expression):
+            failures.append("ordinary substitution-reader default changed: " + expression)
+    for program in ("${ echo '$1' >&2; }", "${| echo '$1' >&2; }",
+                    "printf '%s' '${ echo \"$1\" >&2; }'",
+                    "source /dev/null <<< 'echo \"$1\" >&2'",
+                    "printf safe <<< 'echo \"$1\" >&2'"):
+        if _heredoc_substitution_has_positional(program):
+            failures.append("literal/non-evaluating source boundary changed: " + program)
+    source = 'source /dev/stdin <<< \'echo "$1" >&2\''
+    if not _heredoc_substitution_has_positional(source):
+        failures.append("literal source here-string missing")
+    if _heredoc_substitution_has_positional(source, _DEFERRED_SHELL_DEPTH):
+        failures.append("literal source here-string bypassed child stop")
+    for flags, expected in (("-qs", True), ("-sq", True), ("-qu", False),
+                            ("-q", None), ("-qsx", None), ("-qsu", None), ("-os", None)):
+        lx = Lexer("shopt " + flags + " expand_aliases")
+        seg = lx.logical[0].segments[0]
+        if _shopt_expand_aliases_delta(seg) is not expected:
+            failures.append("literal shopt alias mode changed: " + flags)
+    return failures
+
+
 def self_test():
     failures = []
     passed = 0
@@ -11973,6 +12123,7 @@ def self_test():
     failures.extend(_heredoc_indirect_source_arithmetic_cases())
     failures.extend(_heredoc_command_index_context_cases())
     failures.extend(_heredoc_for_alias_context_cases())
+    failures.extend(_heredoc_three_regression_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
