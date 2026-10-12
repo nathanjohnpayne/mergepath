@@ -3008,6 +3008,129 @@ for SPAN in '`' '``'; do
   done
 done
 
+# Case 65u: literal targets, opaque substitution operands and complete
+# Markdown delimiters retain the same instruction/exemption boundaries.
+for OPENER in '<!-->' '<!--->'; do
+  run_on_fixture "docs/short-html-marker.md" "git config user.email leak@example.invalid $OPENER GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+"
+  if [ "$RC" = "1" ]; then pass "marker after complete empty HTML comment remains ordinary text"; else
+    fail "short HTML opener borrowed later closer: opener='$OPENER' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/short-html-real.md" "git config user.email fixture@example.invalid $OPENER <!-- GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture -->
+"
+  if [ "$RC" = "0" ]; then pass "real comment after complete empty HTML comment remains valid"; else
+    fail "real comment after short HTML rejected: opener='$OPENER' rc=$RC out=$OUT"
+  fi
+done
+for EMPTY in "''" '""' "''\"\""; do
+  run_on_fixture "tests/empty-C.sh" "git -C $EMPTY config user.email leak@example.invalid
+"
+  if [ "$RC" = "1" ]; then pass "literal empty -C path cannot supply a repository target"; else
+    fail "empty C supplied target: operand='$EMPTY' rc=$RC out=$OUT"
+  fi
+  for SOURCE in \
+    "git -C $EMPTY config --global user.email fixture@example.invalid" \
+    "git -C $EMPTY -C \"\$FIX\" config user.email fixture@example.invalid" \
+    "git -C \"\$FIX\" -C $EMPTY config user.email fixture@example.invalid" \
+    "git -C $EMPTY config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture"; do
+    run_on_fixture "tests/empty-C-independent-scope.sh" "$SOURCE
+"
+    if [ "$RC" = "0" ]; then pass "independent real scope/target/comment remains valid with empty -C"; else
+      fail "empty C hid independent scope: source='$SOURCE' rc=$RC out=$OUT"
+    fi
+  done
+done
+run_on_fixture "tests/named-C.sh" 'git -C . config user.email fixture@example.invalid
+'
+if [ "$RC" = "0" ]; then pass "named target remains shape-based without filesystem resolution"; else
+  fail "named target was resolved or rejected: rc=$RC out=$OUT"
+fi
+for OPERAND in \
+  '$(printf a; printf b)' \
+  '$(printf "%s" "$(printf "a;b")")' \
+  '$(printf "%s" ")a;b(")' \
+  '$(printf --global)' \
+  '$(printf "%s" "# GIT_IDENTITY_SCOPE_EXEMPT: string")'; do
+  run_on_fixture "tests/substitution-outer.sh" "git -c foo.bar=$OPERAND config user.email leak@example.invalid
+"
+  if [ "$RC" = "1" ]; then pass "substitution operand cannot split or exempt literal outer identity command"; else
+    fail "substitution hid literal outer command: operand='$OPERAND' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "tests/substitution-targeted.sh" "git -C \"\$FIX\" -c foo.bar=$OPERAND config user.email fixture@example.invalid
+"
+  if [ "$RC" = "0" ]; then pass "real target remains valid beside opaque substitution operand"; else
+    fail "substitution rejected real target: operand='$OPERAND' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "tests/substitution-neighbour.sh" 'git -c foo.bar=$(printf a; printf b) config --global user.email fixture@example.invalid;git config user.email leak@example.invalid
+'
+if [ "$RC" = "1" ]; then pass "real outer separator remains independent after substitution"; else
+  fail "substitution swallowed outer separator: rc=$RC out=$OUT"
+fi
+run_on_fixture "tests/substitution-real-comment.sh" 'git -c foo.bar=$(printf a; printf b) config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture
+'
+if [ "$RC" = "0" ]; then pass "real outer shell comment remains valid after opaque substitution"; else
+  fail "substitution swallowed real outer comment: rc=$RC out=$OUT"
+fi
+for SOURCE in \
+  'echo "$(printf "git config user.email data@example.invalid")"' \
+  "echo '\$(git config user.email data@example.invalid)'" \
+  'echo "\$(git config user.email data@example.invalid)"' \
+  '$(printf git) config user.email data@example.invalid' \
+  'git config $(printf user.email) data@example.invalid'; do
+  run_on_fixture "tests/substitution-no-evaluation.sh" "$SOURCE
+"
+  if [ "$RC" = "0" ]; then pass "substitution output does not derive executable/key or turn printed data into instruction"; else
+    fail "substitution output was interpreted: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  'echo $(git config user.email fixture@example.invalid)' \
+  'echo "$(git config user.email fixture@example.invalid)"' \
+  'echo $(git config user.email fixture@example.invalid'; do
+  run_on_fixture "tests/substitution-literal-body.sh" "$SOURCE
+"
+  if [ "$RC" = "1" ]; then pass "direct literal body writer retains detection with contained/unknown extent"; else
+    fail "opaque output erased direct body instruction: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "tests/substitution-targeted-body.sh" 'echo $(git -C "$FIX" config user.email fixture@example.invalid)
+'
+if [ "$RC" = "0" ]; then pass "literal fixture target remains valid inside contained source body"; else
+  fail "body instruction lost real target: rc=$RC out=$OUT"
+fi
+for SPAN_PREFIX in '``literal ` tick``' '```literal ` tick `` data```'; do
+  run_on_fixture "docs/equal-width-prose.md" "Use $SPAN_PREFIX. If you can't, run git config user.email leak@example.invalid
+"
+  if [ "$RC" = "1" ]; then pass "unequal inner backtick runs cannot shift following prose into shell quoting"; else
+    fail "unequal span run hid prose writer: prefix='$SPAN_PREFIX' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/equal-width-scoped.md" "Use $SPAN_PREFIX. If you can't, run git config --global user.email fixture@example.invalid
+"
+  if [ "$RC" = "0" ]; then pass "real scope survives equal-width span partition"; else
+    fail "equal-width partition rejected scope: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/equal-width-cited-marker.md" "git config user.email leak@example.invalid $SPAN_PREFIX
+"
+  if [ "$RC" = "1" ]; then pass "closed span data cannot hide preceding literal writer"; else
+    fail "closed span data hid writer: rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  'git config user.email leak@example.invalid ``literal ` # GIT_IDENTITY_SCOPE_EXEMPT: citation``' \
+  'git config user.email leak@example.invalid ```literal ` # GIT_IDENTITY_SCOPE_EXEMPT: citation `` data```'; do
+  run_on_fixture "docs/equal-width-marker.md" "$SOURCE
+"
+  if [ "$RC" = "1" ]; then pass "marker inside equal-width span with shorter runs remains cited data"; else
+    fail "inner backtick spilled literal marker: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/equal-width-real-marker.md" "$SOURCE <!-- GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture -->
+"
+  if [ "$RC" = "0" ]; then pass "real comment after equal-width cited-marker span remains valid"; else
+    fail "real equal-width comment rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+
 # Case 65p: the modern rename verb moves a section, not the protected key.
 for ACTION in 'rename-section' '"rename-section"' "'rename-section'" '--rename-section'; do
   run_on_fixture "tests/rename-section.sh" "git config $ACTION user.email archived
