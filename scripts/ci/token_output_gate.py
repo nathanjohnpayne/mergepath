@@ -246,8 +246,8 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     misses late, false-branch and restored-builtin emission, so no runtime
     definition/order/mutation model is added here.
     Continued openers are normalized before independent expansion/error-word
-    searches; positional arithmetic and substring/index operands are retained
-    as diagnostic candidates without evaluation. When the existing exact
+    searches; modern and legacy positional arithmetic and substring/index
+    operands are retained as diagnostic candidates without evaluation. When the existing exact
     reader refuses a real command substitution's end, the remaining bounded
     source is retained conservatively, including possible inert tail data.
     No case grammar or runtime variable binding is inferred. Executable substitution
@@ -1152,12 +1152,17 @@ def _find_substitutions(s, quotes_are_literal=False, include_arithmetic=False):
 def _heredoc_diagnostic_span(text, i):
     """Read a diagnostic candidate with existing bounds, not shell grammar.
 
-    Only the heredoc diagnostic inventory opts in. Arithmetic operands in
-    substring/index expansions use the existing parameter and brace bounds.
+    Only the heredoc diagnostic inventory opts in. Legacy `$[ ]` arithmetic
+    uses compound bounds, including nested brackets; substring/index operands
+    use the existing parameter and brace bounds.
     For a real command-substitution opener whose end the exact reader cannot
     prove, retain the remaining bounded source conservatively. That tail can
     include inert data; it is not a claim that every retained character runs.
     """
+    if text[i : i + 2] == "$[":
+        close = _find_compound_close(text, i + 1, bracket_span=True)
+        end = len(text) if close is None else close + 1
+        return text[i + 2 : close if close is not None else end], i, end
     if text[i : i + 2] == "$(" and text[i + 2 : i + 3] != "(":
         try:
             _simple_substitution_end(text, i)
@@ -3213,8 +3218,11 @@ def _why(note, base):
 # In-file message-helper discovery
 # ==========================================================================
 
-def _find_compound_close(text, open_idx):
+def _find_compound_close(text, open_idx, bracket_span=False):
     """Return the matching close index for a brace group or subshell body.
+
+    Only the heredoc legacy-arithmetic inventory opts into bracket spans;
+    default callers retain the existing brace/subshell reading.
 
     The caller hands this function text whose here-doc body lines have already
     been blanked.  Counting over the raw source treated braces and parentheses
@@ -3223,14 +3231,14 @@ def _find_compound_close(text, open_idx):
     that data.
     """
     try:
-        return _find_compound_close_exact(text, open_idx)
+        return _find_compound_close_exact(text, open_idx, bracket_span)
     except _ExactReadUnavailable:
-        return _find_compound_close_legacy(text, open_idx)
+        return _find_compound_close_legacy(text, open_idx, bracket_span)
 
 
-def _find_compound_close_exact(text, open_idx):
+def _find_compound_close_exact(text, open_idx, bracket_span=False):
     opener = text[open_idx]
-    closer = "}" if opener == "{" else ")"
+    closer = "]" if bracket_span else ("}" if opener == "{" else ")")
     depth = 0
     i = open_idx
     n = len(text)
@@ -3274,9 +3282,9 @@ def _find_compound_close_exact(text, open_idx):
     return None
 
 
-def _find_compound_close_legacy(text, open_idx):
+def _find_compound_close_legacy(text, open_idx, bracket_span=False):
     opener = text[open_idx]
-    closer = "}" if opener == "{" else ")"
+    closer = "]" if bracket_span else ("}" if opener == "{" else ")")
     depth = 0
     i = open_idx
     n = len(text)
@@ -3565,7 +3573,10 @@ def discover_emitter_helpers(text):
                                 body, quotes_are_literal=True, include_arithmetic=True):
                             if body[start] == "`":
                                 inner = _backtick_positional_source(inner)
-                            if _heredoc_substitution_has_positional(inner):
+                            positional = (_word_has_verbatim_positional(inner, in_heredoc=True)
+                                          if body[start : start + 2] == "$["
+                                          else _heredoc_substitution_has_positional(inner))
+                            if positional:
                                 emits = True
                                 break
                     if not emits:
@@ -7779,6 +7790,30 @@ CORPUS = [
     ('helper-hd-round5-initialized-array-length-diagnostic', MUST_FLAG, 'a=(value)\ndie() { printf safe <<EOF\n${#a[1/$1]}\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ('helper-hd-round5-initialized-named-substring-diagnostic', MUST_FLAG, 'a=value\ndie() { printf safe <<EOF\n${a:1/$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ('helper-hd-round5-complex-tail-inert-positional-conservative', MUST_FLAG, 'die() { printf safe <<EOF\n$(case x in x) echo literal;; esac) $1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    # #1496: legacy arithmetic diagnostic inventory stays HD-only.
+    ('helper-hd-round6-legacy-diagnostic', MUST_FLAG, 'die() { printf safe <<EOF\n$[1 / $1]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-echo-diagnostic', MUST_FLAG, 'die() { echo safe <<EOF\n$[1 / $1]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-direct-diagnostic', MUST_FLAG, 'printf safe <<EOF\n$[1 / $GH_TOKEN]\nEOF\n'),
+    ('helper-hd-round6-legacy-safe-positional', MUST_FLAG, 'die() { printf safe <<EOF\n$[0 + $1]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-literal', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$[1 + 2]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-escaped-opener', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n\\$[1 / $1]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-quoted-delimiter', MUST_NOT_FLAG, 'die() { printf safe <<\'EOF\'\n$[1 / $1]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-body-apostrophes', MUST_FLAG, 'die() { printf safe <<EOF\n\'$[1 / $1]\'\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-body-doublequotes', MUST_FLAG, 'die() { printf safe <<EOF\n"$[1 / $1]"\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-continued-opener', MUST_FLAG, 'die() { printf safe <<EOF\n$\\\n[1 / $1]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-nested-legacy', MUST_FLAG, 'die() { printf safe <<EOF\n$[1 / $[0 + $1]]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-array-unset', MUST_FLAG, 'die() { printf safe <<EOF\n$[a[1 / $1]]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-array-initialized', MUST_FLAG, 'a=(value)\ndie() { printf safe <<EOF\n$[a[1 / $1]]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-quote-boundary', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$[1 + 2] "$1"\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-nested-array-boundary', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$[a[0] + 2] $1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-operand-doublequote', MUST_FLAG, 'die() { printf safe <<EOF\n$[1 / "$1"]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-operand-singlequote', MUST_FLAG, 'die() { printf safe <<EOF\n$[1 / \'$1\']\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-operand-escaped', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$[1 / \\$1]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-after-array-close', MUST_FLAG, 'die() { printf safe <<EOF\n$[a[0] + 1 / $1]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-nested-legacy-diagnostic', MUST_FLAG, 'die() { printf safe <<EOF\n$[1 / $[1 / $1]]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-nested-modern-diagnostic', MUST_FLAG, 'die() { printf safe <<EOF\n$[1 / $((1 / $1))]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-quoted-literal-boundary', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$[1 + "]"] $1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-double-escaped-opener', MUST_FLAG, 'die() { printf safe <<EOF\n\\\\$[1 / $1]\nEOF\n}\ndie "$GH_TOKEN"\n'),
     # --- a credential NAME split by a line continuation ------------------
     #
     # Bash removes `\<newline>` before it parses the expansion, so these name
@@ -9331,6 +9366,8 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    'helper-hd-round6-legacy-safe-positional': 'The sampled legacy arithmetic evaluates without a diagnostic. Heredoc positional operands remain conservative candidates; arithmetic is not evaluated (#1496).',
+    'helper-hd-round6-legacy-nested-legacy': 'The sampled inner legacy arithmetic reduces the positional value before the outer diagnostic. Nested operands remain conservative inventory without arithmetic evaluation (#1496).',
     'helper-hd-round5-substring-safe-positional-conservative': 'The sampled offset arithmetic emits no diagnostic. Positional operands remain conservative diagnostic candidates; no arithmetic evaluation is inferred (#1496).',
     'helper-hd-round5-array-safe-positional-conservative': 'The sampled subscript arithmetic emits no diagnostic. Positional operands remain conservative diagnostic candidates; no arithmetic evaluation is inferred (#1496).',
     'helper-hd-round5-array-length-index-diagnostic': 'The sampled unset array length does not evaluate its index. The initialized paired array does diagnose; no array binding/state proof is inferred from this source-only diagnostic candidate (#1496).',
@@ -10713,6 +10750,33 @@ def _heredoc_parameter_case_diagnostic_cases():
     return failures
 
 
+
+def _heredoc_legacy_arithmetic_cases():
+    """Legacy arithmetic is opt-in, bounded and read in heredoc context."""
+    failures = []
+    for expression in ['$[1 / $1]', '$[a[0] + 1 / $1]', '$[1 / "$1"]',
+                       "$[1 / '$1']", '$[1 + "]"]', '$[1 / $[1 / $1]]']:
+        raw = 'x ' + expression + ' $1'
+        start, end = 2, 2 + len(expression)
+        expected = [(expression[2:-1], start, end)]
+        for reader in (_find_substitutions, _find_substitutions_exact,
+                       _find_substitutions_legacy):
+            if reader(raw):
+                failures.append("default legacy inventory changed: " + reader.__name__)
+            if reader(raw, include_arithmetic=True) != expected:
+                failures.append("legacy operand boundary: " + reader.__name__ + expression)
+        for reader in (_find_compound_close, _find_compound_close_exact,
+                       _find_compound_close_legacy):
+            if reader(raw, start + 1) is not None:
+                failures.append("default compound boundary changed: " + reader.__name__)
+            if reader(raw, start + 1, bracket_span=True) != end - 1:
+                failures.append("opt-in bracket boundary: " + reader.__name__ + expression)
+    for raw in [r'\$[1 / $1]', "'$[1 / $1]'"]:
+        if _find_substitutions(raw, include_arithmetic=True):
+            failures.append("quoted/escaped legacy opener admitted: " + raw)
+    return failures
+
+
 def self_test():
     failures = []
     passed = 0
@@ -10725,6 +10789,7 @@ def self_test():
     failures.extend(_heredoc_deferred_positional_cases())
     failures.extend(_heredoc_shadow_continuation_arithmetic_cases())
     failures.extend(_heredoc_parameter_case_diagnostic_cases())
+    failures.extend(_heredoc_legacy_arithmetic_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
