@@ -36,6 +36,7 @@ jobs:
     # default-branch dispatch pass; a feature-branch dispatch is skipped.
     if: github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       # Pin to the trusted default branch (#548): this workflow has a
       # workflow_dispatch trigger and runs the inline actions/github-script
@@ -68,10 +69,13 @@ jobs:
             // Bounded to match PR_BODY_CONTRACT_TIMEOUT_SECONDS in
             // scripts/lib/pr-body-contract.sh (#1281). This call site does not
             // go through that lib, so it carries the bound itself; the parity
-            // suite asserts the two agree. The per-PR catch below rethrows a
-            // timeout so the github-script step fails rather than auditing a
-            // PR whose body it could not parse.
+            // suite asserts the two agree. Timeouts are recorded per PR and
+            // fail the audit after the remaining coverage is reported.
             const PR_BODY_PARSE_TIMEOUT_MS = 120000;
+            // Stop starting PRs before the job's 30-minute bound; leave time
+            // for the parser's full bound and publication of partial coverage.
+            const AUDIT_DEADLINE_MS = Date.now() + 25 * 60 * 1000;
+            const AUDIT_REPORT_RESERVE_MS = 60000;
 
             function parsePrBodyContract(body) {
               return JSON.parse(execFileSync(
@@ -164,6 +168,9 @@ jobs:
 
             const violations = [];
             const recordedOverrides = [];
+            const parserErrors = [];
+            let unauditedPRs = [];
+            let auditedPRCount = 0;
 
             async function labelWasPresentAtMerge(pr, labelName) {
               const events = await github.paginate(
@@ -195,17 +202,27 @@ jobs:
               return present;
             }
 
-            for (const pr of mergedPRs) {
+            for (const [index, pr] of mergedPRs.entries()) {
+              if (Date.now() + PR_BODY_PARSE_TIMEOUT_MS + AUDIT_REPORT_RESERVE_MS >= AUDIT_DEADLINE_MS) {
+                unauditedPRs = mergedPRs.slice(index);
+                break;
+              }
               const prViolations = [];
               const isDependabot = pr.user.login === 'dependabot[bot]';
               let bodyContract = { author: '', authorCount: 0, hasSelfReview: false };
               try {
                 bodyContract = parsePrBodyContract(pr.body);
               } catch (e) {
-                // An execFileSync timeout is a resource-bound failure, not a
-                // body-contract violation. Keep it visible as a failed audit;
-                // the fallback below is only for ordinary parser errors.
-                if (e?.code === 'ETIMEDOUT') throw e;
+                // A timeout makes this PR's policy audit incomplete, even
+                // for Dependabot. Do not classify the unparsed body as a
+                // missing declaration or heading, or let an override excuse it.
+                if (e?.code === 'ETIMEDOUT') {
+                  parserErrors.push({
+                    number: pr.number, title: pr.title, author: pr.user.login,
+                    issues: ['PR body parser timed out (ETIMEDOUT); policy audit incomplete for this PR.'],
+                  });
+                  continue;
+                }
                 if (!isDependabot) {
                   prViolations.push('Could not parse PR body contract');
                 }
@@ -981,18 +998,36 @@ jobs:
                   issues: prViolations,
                 });
               }
+              auditedPRCount += 1;
             }
 
-            if (violations.length > 0 || recordedOverrides.length > 0) {
+            const incomplete = parserErrors.length > 0 || unauditedPRs.length > 0;
+            if (violations.length > 0 || recordedOverrides.length > 0 || incomplete) {
               let body = `## PR Review Policy Violations\n\n`;
               body += `**Audit period:** ${sinceISO.split('T')[0]} to ${today}\n`;
               body += `**Violations found:** ${violations.length}\n\n`;
+              body += `**Audit coverage:** ${incomplete ? 'incomplete' : 'complete'} (${auditedPRCount}/${mergedPRs.length} PRs audited)\n`;
+              body += `**Parser infrastructure errors:** ${parserErrors.length}\n\n`;
               body += `### Details\n\n`;
 
               for (const v of violations) {
                 body += `- **#${v.number}** — ${v.title} (by ${v.author})\n`;
                 for (const issue of v.issues) {
                   body += `  - ${issue}\n`;
+                }
+              }
+
+              if (parserErrors.length > 0) {
+                body += `\n### Parser infrastructure errors\n\n`;
+                for (const error of parserErrors) {
+                  body += `- **#${error.number}** — ${error.title} (by ${error.author})\n`;
+                  for (const issue of error.issues) body += `  - ${issue}\n`;
+                }
+              }
+              if (unauditedPRs.length > 0) {
+                body += `\n### Unaudited PRs — audit time budget exhausted\n\n`;
+                for (const pr of unauditedPRs) {
+                  body += `- **#${pr.number}** — ${pr.title} (by ${pr.user.login})\n`;
                 }
               }
 
@@ -1022,4 +1057,7 @@ jobs:
               console.log(`Created audit issue with ${violations.length} violations.`);
             } else {
               console.log('No policy violations found for the past 7 days.');
+            }
+            if (incomplete) {
+              core.setFailed(`PR audit incomplete: ${parserErrors.length} parser timeouts; ${unauditedPRs.length} PRs unaudited after the time budget.`);
             }

@@ -933,9 +933,23 @@ done
 YQBOOT_SHA256=$(printf '%s\n%s\n' '#!/bin/sh' \
   'echo "yq (https://github.com/mikefarah/yq/) version v4.53.6"' | shasum -a 256)
 YQBOOT_SHA256=${YQBOOT_SHA256%% *}
+YQBOOT_PYTHON=$(command -v python3)
 cat > "$YQBOOT_BIN/sudo" <<SUDO_STUB
 #!/bin/sh
 echo "SUDO: \$*" >> "$YQBOOT_LOG"
+if [ "\$1" = install ] && [ "\${YQBOOT_INSTALL_FAIL:-}" = true ]; then
+  for dest do :; done
+  printf '%s\\n' 'partial staged artifact' > "\$dest"
+  exit 23
+fi
+if [ "\$1" = mv ]; then
+  [ "\${YQBOOT_RENAME_FAIL:-}" != true ] || exit 24
+  shift
+  [ "\$1" = -fT ] || exit 25
+  shift
+  # Model GNU -T's exact-path rename on both Linux and Darwin test hosts.
+  exec "$YQBOOT_PYTHON" -I -S -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2])' "\$@"
+fi
 exec "\$@"
 SUDO_STUB
 chmod +x "$YQBOOT_BIN/sudo"
@@ -1094,6 +1108,62 @@ for rejection in mismatch malformed-hash override-without-hash download-failure;
     echo "$rejected_out" >&2
   fi
 done
+
+# A partial privileged copy must not corrupt the existing executable. A
+# rename failure must also leave it intact, and neither may run the artifact.
+for failure in install rename; do
+  : > "$YQBOOT_LOG"
+  atomic_dest="$SCRATCH/yqboot-dest/atomic-$failure"
+  printf '%s\n' 'existing destination' > "$atomic_dest"
+  failure_env=YQBOOT_INSTALL_FAIL=true
+  [ "$failure" != rename ] || failure_env=YQBOOT_RENAME_FAIL=true
+  set +e
+  atomic_out=$(env GITHUB_ACTIONS=true PATH="$YQBOOT_BIN" \
+    ENSURE_YQ_SHA256="$YQBOOT_SHA256" ENSURE_YQ_DEST="$atomic_dest" \
+    "$failure_env" "$BASH" "$ENSURE_YQ" --ci-only 2>&1)
+  atomic_rc=$?
+  set -e
+  if [ "$atomic_rc" -ne 0 ] \
+     && [ "$(cat "$atomic_dest")" = 'existing destination' ] \
+     && ! grep -q 'version v4.53.6' <<<"$atomic_out" \
+     && ! compgen -G "$atomic_dest.install.*" >/dev/null; then
+    pass=$((pass + 1)); echo "  PASS: #1756 $failure failure preserves the destination without execution or staging residue"
+  else
+    fail=$((fail + 1)); echo "  FAIL: #1756 unsafe $failure failure (rc=$atomic_rc)" >&2
+    echo "$atomic_out" >&2
+  fi
+done
+
+: > "$YQBOOT_LOG"
+atomic_dest="$SCRATCH/yqboot-dest/atomic-success"
+printf '%s\n' 'existing destination' > "$atomic_dest"
+atomic_out=$(env GITHUB_ACTIONS=true PATH="$YQBOOT_BIN" \
+  ENSURE_YQ_SHA256="$YQBOOT_SHA256" ENSURE_YQ_DEST="$atomic_dest" \
+  "$BASH" "$ENSURE_YQ" --ci-only 2>&1)
+if [ "$(shasum -a 256 "$atomic_dest" | cut -d ' ' -f1)" = "$YQBOOT_SHA256" ] \
+   && grep -q "SUDO: mv -fT .* $atomic_dest" "$YQBOOT_LOG" \
+   && grep -q 'version v4.53.6' <<<"$atomic_out" \
+   && ! compgen -G "$atomic_dest.install.*" >/dev/null; then
+  pass=$((pass + 1)); echo "  PASS: #1756 verified artifact replaces the existing destination through exact-path rename"
+else
+  fail=$((fail + 1)); echo "  FAIL: #1756 atomic replacement or cleanup missing" >&2
+fi
+
+atomic_dest="$SCRATCH/yqboot-dest/atomic-directory"
+mkdir "$atomic_dest"
+set +e
+atomic_out=$(env GITHUB_ACTIONS=true PATH="$YQBOOT_BIN" \
+  ENSURE_YQ_SHA256="$YQBOOT_SHA256" ENSURE_YQ_DEST="$atomic_dest" \
+  "$BASH" "$ENSURE_YQ" --ci-only 2>&1)
+atomic_rc=$?
+set -e
+if [ "$atomic_rc" -ne 0 ] && [ ! -e "$atomic_dest/yq" ] \
+   && ! grep -q 'version v4.53.6' <<<"$atomic_out" \
+   && ! compgen -G "$atomic_dest.install.*" >/dev/null; then
+  pass=$((pass + 1)); echo "  PASS: #1756 destination directory refuses exact-path replacement"
+else
+  fail=$((fail + 1)); echo "  FAIL: #1756 directory was treated as an install destination" >&2
+fi
 
 echo
 echo "Test 13: check_resolve_pr_threads wires the CI-only yq bootstrap (#616)"
