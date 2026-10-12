@@ -30,8 +30,10 @@ trap 'rm -rf "$WORKDIR"' EXIT
 
 PASS=0
 FAIL=0
+SKIP=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
+skip() { echo "SKIP: $*"; SKIP=$((SKIP + 1)); }
 
 # Build a markerless consumer fixture plus one file with the given content,
 # then run the shared scan against it. Sets OUT and RC. All Part C cases
@@ -2836,6 +2838,176 @@ else
   fail "option data after terminator exempted writer: rc=$RC out=$OUT"
 fi
 
+# Case 65s: prose punctuation cannot supply shell quote state before Git.
+# Keep argument quotes and independent command/code-span boundaries intact.
+for SOURCE in \
+  "If you can't, run git config user.email leak@example.invalid" \
+  'Use "git config user.email leak@example.invalid"' \
+  "Use 'git config user.email leak@example.invalid'" \
+  "If you can't, run g\\it config user.email leak@example.invalid" \
+  "If you can't, run /usr/bin/git config user.email leak@example.invalid" \
+  "If you can't, run \"git\" config user.email leak@example.invalid" \
+  "Use \"git -c foo.bar='a; --global b' config user.email leak@example.invalid\"" \
+  "Use 'git -c foo.bar=\"a; --get b\" config user.email leak@example.invalid'" \
+  'Use "git -c foo.bar="a; --system b" config user.email leak@example.invalid"'; do
+  run_on_fixture "docs/prose-command.md" "$SOURCE
+"
+  if [ "$RC" = "1" ]; then
+    pass "Markdown prose punctuation cannot hide unscoped literal Git command"
+  else
+    fail "prose swallowed command: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/prose-exempt.md" "$SOURCE <!-- GIT_IDENTITY_SCOPE_EXEMPT: intentional documented fixture -->
+"
+  if [ "$RC" = "0" ]; then
+    pass "true HTML exemption after prose command remains valid"
+  else
+    fail "true prose HTML exemption rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/prose-shell-exempt.md" "$SOURCE # GIT_IDENTITY_SCOPE_EXEMPT: intentional documented fixture
+"
+  if [ "$RC" = "0" ]; then
+    pass "true shell exemption after prose command remains valid"
+  else
+    fail "true prose shell exemption rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  "If you can't, run git -c foo.bar=\"# GIT_IDENTITY_SCOPE_EXEMPT: string\" config user.email leak@example.invalid" \
+  "If you can't, run git config user.email leak@example.invalid; echo \" # GIT_IDENTITY_SCOPE_EXEMPT: string\"" \
+  "If you can't, run git config user.email leak@example.invalid \\# GIT_IDENTITY_SCOPE_EXEMPT: escaped" \
+  'Use "git -c foo.bar=" # GIT_IDENTITY_SCOPE_EXEMPT: string" config user.email leak@example.invalid"'; do
+  run_on_fixture "docs/prose-shell-impostor.md" "$SOURCE
+"
+  if [ "$RC" = "1" ]; then
+    pass "prose command extraction preserves quoted/escaped marker data"
+  else
+    fail "prose marker data exempted writer: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  "If you can't, run git config --global user.email fixture@example.invalid" \
+  'Use "git config --system user.email fixture@example.invalid"'; do
+  run_on_fixture "docs/scoped-prose.md" "$SOURCE
+"
+  if [ "$RC" = "0" ]; then
+    pass "real scope in prose-wrapped command remains valid"
+  else
+    fail "scoped prose command rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  'Use "git config --global user.email fixture@example.invalid"; git config user.email leak@example.invalid' \
+  "Use 'git config --system user.email fixture@example.invalid'; git config user.email leak@example.invalid" \
+  "If you can't use --global, run git config user.email leak@example.invalid"; do
+  run_on_fixture "docs/prose-neighbour.md" "$SOURCE
+"
+  if [ "$RC" = "1" ]; then
+    pass "prose wrappers/preceding flags cannot scope neighbouring unscoped writer"
+  else
+    fail "prose neighbour supplied scope: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "docs/prose-continued.md" "If you can't, run git \\
+config user.email leak@example.invalid
+"
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/prose-continued.md:1:'; then
+  pass "prose quote handling preserves continued-command finding"
+else
+  fail "continued prose command missed: rc=$RC out=$OUT"
+fi
+for SOURCE in 'echo "git config user.email data@example.invalid"' 'echo "git config user.email data@example.invalid'; do
+  run_on_fixture "tests/shell-quote-data.sh" "$SOURCE
+"
+  if [ "$RC" = "0" ]; then
+    pass "shell quoted/open-quote data does not become a Git command"
+  else
+    fail "shell data treated as prose command: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/fenced-quote-data.md" '```bash
+'"$SOURCE"'
+```
+'
+  if [ "$RC" = "0" ]; then
+    pass "fenced shell quote data retains shell-word rules"
+  else
+    fail "fenced data treated as prose command: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/span-quote-data.md" "Use \`$SOURCE\`.
+"
+  if [ "$RC" = "0" ]; then
+    pass "code-span shell quote data retains shell-word rules"
+  else
+    fail "span data treated as prose command: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "docs/span-quoted-option.md" "If you can't, use \`git -c foo.bar='a; --global b' config user.email leak@example.invalid\`.
+"
+if [ "$RC" = "1" ]; then
+  pass "code-span command with quoted option data is still scanned independently"
+else
+  fail "quoted option data in span hid writer: rc=$RC out=$OUT"
+fi
+
+# Case 65t: a standalone Git mention cannot anchor a later prose command.
+for PREFIX in \
+  "Use git if you can't, then " \
+  "Use git status if you can't, then " \
+  "Use git -c foo.bar='config --global' status if you can't, then " \
+  "Use git -c foo.bar='git config --global x' status if you can't, then "; do
+  run_on_fixture "docs/earlier-git.md" "${PREFIX}git config user.email leak@example.invalid
+"
+  if [ "$RC" = "1" ]; then pass "earlier Git mention cannot hide actual prose config writer"; else
+    fail "earlier Git anchored writer: prefix='$PREFIX' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/earlier-git-scoped.md" "${PREFIX}git config --global user.email fixture@example.invalid
+"
+  if [ "$RC" = "0" ]; then pass "actual scope survives earlier Git mention"; else
+    fail "actual prose scope rejected: prefix='$PREFIX' rc=$RC out=$OUT"
+  fi
+  for MARKER in '<!-- GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture -->' '# GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture'; do
+    run_on_fixture "docs/earlier-git-exempt.md" "${PREFIX}git config user.email fixture@example.invalid $MARKER
+"
+    if [ "$RC" = "0" ]; then pass "real exemption survives earlier Git mention"; else
+      fail "actual prose exemption rejected: prefix='$PREFIX' marker='$MARKER' rc=$RC out=$OUT"
+    fi
+  done
+done
+for SPAN in '`' '``'; do
+  SOURCE="If you can't, run ${SPAN}git config user.email fixture@example.invalid${SPAN}"
+  for TAIL in '# GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture' 'echo "ordinary data";# GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture' '# GIT_IDENTITY_SCOPE_EXEMPT: fixture `reason`'; do
+    run_on_fixture "docs/span-trailing-marker.md" "$SOURCE $TAIL
+"
+    if [ "$RC" = "0" ]; then pass "real trailing shell exemption after code span resets prose quote state"; else
+      fail "trailing span comment rejected: span='$SPAN' tail='$TAIL' rc=$RC out=$OUT"
+    fi
+  done
+  for TAIL in 'echo " # GIT_IDENTITY_SCOPE_EXEMPT: string"' '\# GIT_IDENTITY_SCOPE_EXEMPT: escaped' '" # GIT_IDENTITY_SCOPE_EXEMPT: open string' 'echo "data `literal` # GIT_IDENTITY_SCOPE_EXEMPT: string"'; do
+    run_on_fixture "docs/span-trailing-impostor.md" "$SOURCE $TAIL
+"
+    if [ "$RC" = "1" ]; then pass "quoted/escaped trailing markers after code spans cannot exempt"; else
+      fail "trailing span data exempted writer: span='$SPAN' tail='$TAIL' rc=$RC out=$OUT"
+    fi
+  done
+  run_on_fixture "docs/span-cited-marker.md" "If you can't, run ${SPAN}git config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: citation${SPAN}
+"
+  if [ "$RC" = "1" ]; then pass "marker inside code span remains a citation after prose apostrophe"; else
+    fail "cited span marker exempted writer: span='$SPAN' rc=$RC out=$OUT"
+  fi
+  for QUOTE in '"' "'"; do
+    run_on_fixture "docs/span-wrapper-marker.md" "Use ${QUOTE}${SPAN}git config user.email fixture@example.invalid${SPAN} # GIT_IDENTITY_SCOPE_EXEMPT: string${QUOTE}
+"
+    if [ "$RC" = "1" ]; then pass "quote wrapping code span protects literal marker data"; else
+      fail "wrapped span marker exempted writer: span='$SPAN' quote='$QUOTE' rc=$RC out=$OUT"
+    fi
+    run_on_fixture "docs/span-wrapper-real-marker.md" "Use ${QUOTE}${SPAN}git config user.email fixture@example.invalid${SPAN}${QUOTE} # GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture
+"
+    if [ "$RC" = "0" ]; then pass "real shell comment after closed span wrapper remains valid"; else
+      fail "real comment after span wrapper rejected: span='$SPAN' quote='$QUOTE' rc=$RC out=$OUT"
+    fi
+  done
+done
+
 # Case 65p: the modern rename verb moves a section, not the protected key.
 for ACTION in 'rename-section' '"rename-section"' "'rename-section'" '--rename-section'; do
   run_on_fixture "tests/rename-section.sh" "git config $ACTION user.email archived
@@ -2874,15 +3046,88 @@ for SOURCE in "git -c foo.bar='a;b' config user.email fixture@example.invalid" '
   fi
   git -C "$LITERAL_ORACLE" config --local --unset-all user.email
 done
-git -C "$LITERAL_ORACLE" config user.email.old fixture
-(cd "$LITERAL_ORACLE" && git config rename-section user.email archived)
-VALUE="$(git -C "$LITERAL_ORACLE" config --local --get user.email || true)"
-RENAMED="$(git -C "$LITERAL_ORACLE" config --local --get archived.old)"
-if [ -z "$VALUE" ] && [ "$RENAMED" = fixture ]; then
-  pass "private Git oracle confirms modern rename leaves protected key unset"
-else
-  fail "private rename oracle differed: protected='$VALUE' renamed='$RENAMED'"
+# Version gates only this runtime oracle; static modern-syntax assertions
+# above still run on every toolchain. A supported operation/readback failure
+# is a failure, never evidence that the operation is unsupported.
+modern_rename_oracle() {
+  local repo="$1" git_cmd="${2:-git}" version major minor value renamed value_rc renamed_rc rc
+  if ! version="$("$git_cmd" --version 2>&1)"; then
+    fail "modern rename oracle cannot read Git version: $version"; return
+  fi
+  if [[ ! "$version" =~ ^git[[:space:]]version[[:space:]]([0-9]+)\.([0-9]+)(\.|[[:space:]]|$) ]]; then
+    fail "modern rename oracle cannot classify Git version: $version"; return
+  fi
+  major=$((10#${BASH_REMATCH[1]})); minor=$((10#${BASH_REMATCH[2]}))
+  if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 46 ]; }; then
+    skip "modern rename runtime oracle requires Git 2.46+: $version"; return
+  fi
+  if ! "$git_cmd" -C "$repo" config user.email.old fixture; then
+    fail "modern rename oracle fixture setup failed: $version"; return
+  fi
+  if "$git_cmd" -C "$repo" config rename-section user.email archived; then
+    if value="$("$git_cmd" -C "$repo" config --local --get user.email 2>/dev/null)"; then value_rc=0; else value_rc=$?; fi
+    if renamed="$("$git_cmd" -C "$repo" config --local --get archived.old 2>/dev/null)"; then renamed_rc=0; else renamed_rc=$?; fi
+    if [ "$value_rc" = 1 ] && [ "$renamed_rc" = 0 ] && [ -z "$value" ] && [ "$renamed" = fixture ]; then
+      pass "private Git oracle confirms modern rename leaves protected key unset"
+    else
+      fail "private rename oracle readback failed: protected='$value' rc=$value_rc renamed='$renamed' rc=$renamed_rc"
+    fi
+  else
+    rc=$?
+    fail "modern rename operation failed on supported Git: rc=$rc $version"
+  fi
+}
+modern_rename_oracle "$LITERAL_ORACLE"
+
+# Exercise version/operation/readback boundaries without installing Git or
+# altering PATH. Wrappers delegate all actual configuration to private repos.
+ORACLE_REAL_GIT="$(command -v git)"
+for CASE in old-239 old-243 unknown-version supported-failure supported-readback-failure; do
+  ORACLE_WRAPPER="$WORKDIR/oracle-$CASE"
+  cat > "$ORACLE_WRAPPER" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = --version ]; then
+  case "$ORACLE_CASE" in
+    old-239) echo 'git version 2.39.5 (Apple Git-154)' ;;
+    old-243) echo 'git version 2.43.0' ;;
+    unknown-version) echo 'git version unknown' ;;
+    *) echo 'git version 2.54.0' ;;
+  esac
+  exit 0
 fi
+case "$ORACLE_CASE" in
+  old-*) echo unexpected-operation >&2; exit 91 ;;
+  supported-failure)
+    if [ "$4" = rename-section ]; then exit 61; fi ;;
+  supported-readback-failure)
+    if [ "${6:-}" = archived.old ]; then exit 62; fi ;;
+esac
+exec "$ORACLE_REAL_GIT" "$@"
+EOF
+  chmod +x "$ORACLE_WRAPPER"
+  ORACLE_REPO="$WORKDIR/oracle-repo-$CASE"
+  git init -q -b main "$ORACLE_REPO"
+  RESULT="$( {
+    PASS=0; FAIL=0; SKIP=0
+    export ORACLE_CASE="$CASE" ORACLE_REAL_GIT
+    modern_rename_oracle "$ORACLE_REPO" "$ORACLE_WRAPPER"
+    echo "COUNTS:$PASS:$FAIL:$SKIP:AFTER"
+  } 2>&1)"
+  case "$CASE" in
+    old-*)
+      if [[ "$RESULT" == *'COUNTS:0:0:1:AFTER'* ]] && [[ "$RESULT" == *'SKIP:'* ]] && [[ "$RESULT" != *'unexpected-operation'* ]]; then
+        pass "unsupported Git runtime oracle genuinely skips without executing operation or inventing a pass"
+      else
+        fail "unsupported Git oracle did not skip honestly: case=$CASE result=$RESULT"
+      fi ;;
+    *)
+      if [[ "$RESULT" == *'COUNTS:0:1:0:AFTER'* ]] && [[ "$RESULT" == *'FAIL:'* ]]; then
+        pass "supported Git operation/readback failure is recorded and does not abort suite"
+      else
+        fail "supported Git oracle failure hidden or aborted: case=$CASE result=$RESULT"
+      fi ;;
+  esac
+done
 
 # Case 65q: indented Markdown code contains literal HTML, including in
 # list/quote containers. Shell exemptions and real comments after code survive.
@@ -3055,6 +3300,6 @@ fi
 
 # ── Summary ───────────────────────────────────────────────────────────
 echo
-echo "test_git_identity_hygiene: $PASS passed, $FAIL failed"
+echo "test_git_identity_hygiene: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0
