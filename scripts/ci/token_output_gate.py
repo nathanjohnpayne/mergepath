@@ -236,7 +236,9 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     Helper arguments, error words and interpolating here-doc bodies share
     the positional-value decision, with here-doc quotes literal and backslash
     quoting only dollar, backtick, backslash and newline. Quoted delimiters
-    suppress body expansion. A helper is
+    suppress body expansion. Actual backtick substitution bodies remove their
+    source escape layer before the ordinary positional decision; modern
+    substitutions retain ordinary source. A helper is
     graded on what its body writes, not on where that write GOES, so a helper
     whose emitter feeds a pipe is treated as emitting -- declared conservatism
     below.
@@ -3469,6 +3471,15 @@ def discover_emitter_helpers(text):
     return frozenset(helpers)
 
 
+def _backtick_positional_source(body):
+    """Remove the backtick source layer before the ordinary positional read."""
+    return re.sub(
+        r"\\([$`\\]|\n)",
+        lambda m: "" if m.group(1) == "\n" else m.group(1),
+        body,
+    )
+
+
 def _word_has_verbatim_positional(w, in_heredoc=False):
     """True when the word expands a positional parameter's VALUE.
 
@@ -3482,6 +3493,8 @@ def _word_has_verbatim_positional(w, in_heredoc=False):
     only dollar, backtick, backslash and newline. Remove unescaped continued
     newlines before the shared positional decision; an escaped backslash
     pair stays intact and cannot turn the following newline into a join.
+    Actual backtick bodies have their separate source-escape layer removed
+    before recursive ordinary reading; modern substitutions do not.
     """
     if in_heredoc:
         w = re.sub(
@@ -3519,7 +3532,10 @@ def _word_has_verbatim_positional_exact(w, in_heredoc=False):
             end = _double_quoted_construct_end(w, i)
             closed = c != "`" or (end - 1 > i and w[end - 1] == "`")
             lo = i + 1 if c == "`" else i + 2
-            if _word_has_verbatim_positional_exact(w[lo : end - 1 if closed else end]):
+            body = w[lo : end - 1 if closed else end]
+            if c == "`" and in_heredoc:
+                body = _backtick_positional_source(body)
+            if _word_has_verbatim_positional_exact(body):
                 return True
             i = end
             continue
@@ -3559,6 +3575,14 @@ def _word_has_verbatim_positional_legacy(w, in_heredoc=False):
         if c == "'" and not in_heredoc:
             j = w.find("'", i + 1)
             i = n if j == -1 else j + 1
+            continue
+        if c == "`" and in_heredoc:
+            end = _skip_backtick(w, i)
+            closed = end - 1 > i and w[end - 1] == "`"
+            body = _backtick_positional_source(w[i + 1 : end - 1 if closed else end])
+            if _word_has_verbatim_positional(body):
+                return True
+            i = end
             continue
         if c == "$":
             if i + 1 < n and w[i + 1] == "{":
@@ -7391,6 +7415,19 @@ CORPUS = [
         MUST_NOT_FLAG,
         ': \'x\ry\'\ncat <<\'EOF\' >/dev/null\n$(function log\n{ echo "$1"; }\nlog "$GH_TOKEN" >&2)\nEOF\n',
     ),
+    # #1496: backtick source escaping differs from plain heredoc DATA.
+    ('helper-heredoc-escaped-backtick-positional', MUST_FLAG, 'die() { cat <<EOF >&2\n`printf \'%s\' \\$1`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-direct-backtick-positional', MUST_FLAG, 'die() { cat <<EOF >&2\n`printf \'%s\' $1`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-plain-heredoc-escaped-control', MUST_NOT_FLAG, 'die() { cat <<EOF >&2\n\\$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-modern-substitution-escaped-control', MUST_NOT_FLAG, 'die() { cat <<EOF >&2\n$(printf \'%s\' \\$1)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-backtick-quoted-positional-data-control', MUST_NOT_FLAG, 'die() { cat <<EOF >&2\n`printf \'%s\' \'$1\'`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-quoted-delimiter-backtick-control', MUST_NOT_FLAG, 'die() { cat <<\'EOF\' >&2\n`printf \'%s\' \\$1`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-escaped-backtick-opener-control', MUST_NOT_FLAG, 'die() { cat <<EOF >&2\n\\`printf \'%s\' \\$1\\`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-backtick-nonspecial-escape', MUST_NOT_FLAG, 'die() { cat <<EOF >&2\n`printf \'%s\' \'\\x\'`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-fallback-backtick-escaped-positional', MUST_FLAG, 'die() { cat <<EOF >&2\n${A:-${B:-x}} `printf \'%s\' \\$1`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-backtick-2-backslashes', MUST_FLAG, 'die() { cat <<EOF >&2\n`printf \'%s\' \\\\$1`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-backtick-3-backslashes', MUST_NOT_FLAG, 'die() { cat <<EOF >&2\n`printf \'%s\' \\\\\\$1`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-backtick-4-backslashes', MUST_FLAG, 'die() { cat <<EOF >&2\n`printf \'%s\' \\\\\\\\$1`\nEOF\n}\ndie "$GH_TOKEN"\n'),
     # --- a credential NAME split by a line continuation ------------------
     #
     # Bash removes `\<newline>` before it parses the expansion, so these name
@@ -8117,6 +8154,13 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    "helper-heredoc-backtick-2-backslashes": (
+        "Two source backslashes leave an escaped positional in the runtime "
+        "backtick program and the fake oracle is clean. Existing helper "
+        "segment scanning still promotes the raw backtick word; this bounded "
+        "heredoc positional correction preserves that prior conservatism "
+        "rather than changing general backtick tokenization (#1496)."
+    ),
     'helper-redefinitions-direct-later-emitter': (
         "Every recognized emitting body promotes its helper name; this safe "
         "runtime call does not execute that body. Textual order, false branches "
@@ -8969,6 +9013,31 @@ def _function_definition_cases():
     return failures
 
 
+def _heredoc_backtick_positional_cases():
+    """Pin the backtick source layer and ordinary/heredoc boundaries."""
+    failures = []
+    for raw, decoded in [
+        (r"\$1", "$1"), (r"\\$1", r"\$1"),
+        (r"\`", "`"), (r"\x", r"\x"), ("a\\\nb", "ab"),
+    ]:
+        if _backtick_positional_source(raw) != decoded:
+            failures.append("backtick positional source decoding: " + repr(raw))
+    leaking = r"`printf '%s' \$1`"
+    for read in (_word_has_verbatim_positional_exact, _word_has_verbatim_positional_legacy):
+        if not read(leaking, in_heredoc=True):
+            failures.append("backtick heredoc positional lost: " + read.__name__)
+        for raw in [r"\$1", r"$(printf '%s' \$1)", r"`printf '%s' '$1'`"]:
+            if read(raw, in_heredoc=True):
+                failures.append("backtick context consumed plain/quoted DATA: " + read.__name__)
+        if read(leaking):
+            failures.append("backtick repair changed default ordinary reader")
+        if not read(r"`printf '%s' '$1'` $1", in_heredoc=True):
+            failures.append("backtick source boundary swallowed following positional")
+    if not _word_has_verbatim_positional("${A:-${B:-x}} " + leaking, in_heredoc=True):
+        failures.append("backtick positional lost through legacy fallback")
+    return failures
+
+
 def self_test():
     failures = []
     passed = 0
@@ -8977,6 +9046,7 @@ def self_test():
     failures.extend(_corpus_id_cases())
     failures.extend(_printf_allowlist_cases())
     failures.extend(_function_definition_cases())
+    failures.extend(_heredoc_backtick_positional_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
