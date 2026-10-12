@@ -1277,7 +1277,10 @@ scan_unscoped_identity_writes() {
   # time, which is the fail-open shape backtick-cutting exists to close —
   # so the two lists move together, and tests/test_git_identity_hygiene.sh
   # asserts a `.markdown` file gets the Markdown treatment.
-  SHEBANG_RX='^#!.*[/[:space:]](sh|bash|zsh|ksh|dash|ash|mksh|bats)([[:space:]]|$)'
+  SHEBANG_INTERPRETER_RX='(sh|bash|zsh|ksh|dash|ash|mksh|bats)'
+  SHEBANG_RX="^#!.*[/[:space:]]${SHEBANG_INTERPRETER_RX}([[:space:]]|$)"
+  # Add only a literal first split-string interpreter after an env path.
+  SHEBANG_ENV_SPLIT_RX="^#![[:space:]]*/([^[:space:]]*/)?env[[:space:]]+(-S[[:space:]]*|--split-string(=|[[:space:]]+))${SHEBANG_INTERPRETER_RX}([[:space:]]|$)"
   SCAN_FILES=()
   while IFS= read -r -d '' rel; do
     [ -n "$rel" ] || continue
@@ -1304,7 +1307,7 @@ scan_unscoped_identity_writes() {
       # silently drop a file that does carry a shell shebang.
       firstline=""
       IFS= read -r firstline < "$abs" 2>/dev/null || true
-      if [[ "$firstline" =~ $SHEBANG_RX ]]; then
+      if [[ "$firstline" =~ $SHEBANG_RX || "$firstline" =~ $SHEBANG_ENV_SPLIT_RX ]]; then
         in_scope=1
       fi
     fi
@@ -1764,7 +1767,7 @@ scan_unscoped_identity_writes() {
       hint = s; gsub(/[\\"\047]/, "", hint)
       if (hint !~ /config([[:space:]]|$)/) return ""
       for (i = 1; i <= length(s); i++) {
-        if (i > 1 && substr(s, i - 1, 1) !~ /[[:space:]\047"();&|]/) continue
+        if (i > 1 && substr(s, i - 1, 1) !~ /[[:space:]\047"():;&|]/) continue
         end = word_end(s, i); word = dequote_word(substr(s, i, end - i))
         if (word !~ /(^|\/)git$/) continue
         # An earlier prose mention of Git is not the command anchor.

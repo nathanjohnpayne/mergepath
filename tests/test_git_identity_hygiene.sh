@@ -2997,6 +2997,32 @@ else
   fail "quoted option data in span hid writer: rc=$RC out=$OUT"
 fi
 
+# Case 65s1: a literal colon may precede a complete prose Git instruction.
+# Keep option operands, complete words, scopes, spans and genuine markers.
+while IFS='|' read -r EXPECTED LABEL SOURCE; do
+  run_on_fixture docs/colon-instruction.md "$SOURCE
+"
+  if [ "$RC" = "$EXPECTED" ] \
+    && { [ "$EXPECTED" = 0 ] || [[ "$OUT" == *"docs/colon-instruction.md:1:"* ]]; }; then
+    pass "literal-colon prose boundary: $LABEL"
+  else
+    fail "colon prose $LABEL: expected=$EXPECTED rc=$RC out=$OUT"
+  fi
+done <<'COLON_CASES'
+1|compact label before literal writer|Run:git config user.email leak@example.com
+1|compact label before path-qualified writer|Run:/usr/bin/git config user.email leak@example.com
+1|paired command and argument quotes remain literal|Run:"git" "config" "user.email" "leak@example.com"
+1|quoted colon and scope data cannot exempt outer writer|Run:git -c foo.bar="before;git --global" config user.email leak@example.com
+1|adjacent code span remains independently scanned|Run:`git config user.email leak@example.com`
+0|explicit fixture repository remains scoped|Run:git -C "$FIX" config user.email fixture@example.com
+0|global identity instruction remains scoped|Run:git config --global user.email fixture@example.com
+0|read remains a read|Run:git config --get user.email
+0|genuine Markdown comment exemption remains valid|Run:git config user.email fixture@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture -->
+0|quoted prefix operand cannot become another instruction|Run:git -c foo.bar="Run:git config user.email leak@example.com" status
+0|unrelated executable suffix is not Git|Run:mygit config user.email leak@example.com
+0|unprotected complete key remains allowed|Run:git config notuser.email leak@example.com
+COLON_CASES
+
 # Case 65t: a standalone Git mention cannot anchor a later prose command.
 for PREFIX in \
   "Use git if you can't, then " \
@@ -3375,6 +3401,62 @@ run_on_fixture tests/body-comment-printed-data.sh $'value=$(\nprintf "%s" "# som
 if [ "$RC" = 0 ]; then pass "quoted printed comment/command data does not become an instruction"; else
   fail "printed comment data became instruction: rc=$RC out=$OUT"
 fi
+
+# Case 65y1: literal env split-string admission reuses known interpreters.
+# Source is scan-only; neither a shebang nor its dynamic operands executes.
+# Keep a real index, the authentic paired suite and consumer marker gate.
+ENV_CONSUMER="$WORKDIR/consumer-env-split"
+mkdir -p "$ENV_CONSUMER/scripts/ci" "$ENV_CONSUMER/tests"
+git init -q -b main "$ENV_CONSUMER"
+cp "$CHECK" "$ENV_CONSUMER/scripts/ci/check_git_identity_hygiene"
+cp "$ROOT/tests/test_git_identity_hygiene.sh" "$ENV_CONSUMER/tests/"
+cp "$ENV_CONSUMER/.git/config" "$WORKDIR/env-config-before"
+while IFS='|' read -r EXPECTED SHEBANG BODY; do
+  printf '%s\n%s\n' "$SHEBANG" "$BODY" > "$ENV_CONSUMER/tool"
+  git -C "$ENV_CONSUMER" add -A
+  set +e
+  OUT="$(bash "$ENV_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+  set -e
+  if [ "$RC" = "$EXPECTED" ] \
+    && { [ "$EXPECTED" = 0 ] || [[ "$OUT" == *"tool:2:"* ]]; } \
+    && { [ "$EXPECTED" = 1 ] || [[ "$OUT" == *"regression test suite skipped (consumer checkout"* ]]; } \
+    && cmp -s "$WORKDIR/env-config-before" "$ENV_CONSUMER/.git/config"; then
+    pass "literal env split-string admission: $SHEBANG"
+  else
+    fail "env admission $SHEBANG: expected=$EXPECTED rc=$RC out=$OUT"
+  fi
+  [ "$EXPECTED" = 1 ] || continue
+  for SAFE_BODY in \
+    'git -C "$FIX" config user.email fixture@example.com' \
+    'git config --get user.email' \
+    'git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture'; do
+    printf '%s\n%s\n' "$SHEBANG" "$SAFE_BODY" > "$ENV_CONSUMER/tool"
+    git -C "$ENV_CONSUMER" add -A
+    set +e
+    OUT="$(bash "$ENV_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+    set -e
+    if [ "$RC" = 0 ] \
+      && [[ "$OUT" == *"regression test suite skipped (consumer checkout"* ]] \
+      && cmp -s "$WORKDIR/env-config-before" "$ENV_CONSUMER/.git/config"; then
+      pass "literal env split-string preserves scope/read/exemption: $SHEBANG"
+    else
+      fail "env safe body rejected: shebang='$SHEBANG' source='$SAFE_BODY' rc=$RC out=$OUT"
+    fi
+  done
+done <<'ENV_SPLIT_CASES'
+1|#!/usr/bin/env -Sbash|git config user.email leak@example.com
+1|#!/usr/bin/env --split-string=bash|git config user.email leak@example.com
+1|#!/usr/bin/env -Ssh|git config user.name leak
+1|#!/usr/bin/env --split-string=mksh|git config commit.gpgsign false
+1|#!/usr/bin/env -Sbats|git config tag.gpgsign false
+1|#!/usr/bin/env -S bash|git config user.signingkey key
+0|#!/usr/bin/env -Sbashman|git config user.email leak@example.com
+0|#!/usr/bin/env --split-string=bashman|git config user.email leak@example.com
+0|#!/usr/bin/env -S${SHELL}|git config user.email leak@example.com
+0|#!/usr/bin/env --split-string=${SHELL}|git config user.email leak@example.com
+0|#!/usr/bin/env -Spython|git config user.email leak@example.com
+0|#!/usr/bin/notenv -Sbash|git config user.email leak@example.com
+ENV_SPLIT_CASES
 
 # Case 65z: owner-ratified Bats admission is bounded to .bats/env-bats.
 for REL in tests/setup.bats tests/setup.BATS tests/setup; do
