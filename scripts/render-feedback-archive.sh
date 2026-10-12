@@ -15,7 +15,6 @@ ARCHIVE_IDENTITIES_HELPER="$SCRIPT_DIR/lib/feedback-archive-identities.sh"
 [ -r "$ARCHIVE_IDENTITIES_HELPER" ] || { echo "render-feedback-archive: missing $ARCHIVE_IDENTITIES_HELPER" >&2; exit 2; }
 # shellcheck source=lib/feedback-archive-identities.sh
 . "$ARCHIVE_IDENTITIES_HELPER"
-feedback_archive_registry_load "${CONFIG:-$SCRIPT_DIR/../.github/review-policy.yml}" || exit 2
 
 if [ "$#" -lt 5 ] || [ "$#" -gt 6 ]; then
   echo "usage: $0 SOURCE_KIND SOURCE_ID SOURCE_LOGIN ARCHIVED_AT PREVIOUS_BODY_FILE [GHAS_TIER]" >&2
@@ -35,12 +34,12 @@ PREVIOUS_BODY_FILE="$5"
 # documented sourcing contract deliberately excludes ("the render script
 # itself stays pure -- no network calls"). The caller resolves it (see
 # .github/workflows/codex-p1-gate.yml's archive-edited-feedback job) and
-# hands the already-mapped p0-p3 tier here, exactly like it hands the
-# previous body.
+# hands the already-mapped p0-p3 tier or unknown lookup result here,
+# exactly like it hands the previous body.
 GHAS_TIER="${6:-}"
 case "$GHAS_TIER" in
-  ''|p0|p1|p2|p3) ;;
-  *) echo "render-feedback-archive: GHAS_TIER must be p0, p1, p2, p3, or empty; got '$GHAS_TIER'" >&2; exit 2 ;;
+  ''|p0|p1|p2|p3|unknown) ;;
+  *) echo "render-feedback-archive: GHAS_TIER must be p0, p1, p2, p3, unknown, or empty; got '$GHAS_TIER'" >&2; exit 2 ;;
 esac
 
 case "$SOURCE_KIND" in
@@ -81,15 +80,14 @@ if [ "$SOURCE_KIND" = issue-comment ] && [ "$SOURCE_LOGIN" = 'github-actions[bot
   exit 0
 fi
 
+feedback_archive_registry_load "${CONFIG:-$SCRIPT_DIR/../.github/review-policy.yml}" || exit 2
+
 # Authorize before classifying or encoding a candidate-controlled prior body.
 # Current reviewer/provider lists cannot replace retained historical enrollment.
 provider_rc=0
-SOURCE_PROVIDER=$(feedback_archive_source_provider "$SOURCE_KIND" "$SOURCE_LOGIN") || provider_rc=$?
+SOURCE_PROVIDERS=$(feedback_archive_source_providers "$SOURCE_KIND" "$SOURCE_LOGIN") || provider_rc=$?
 [ "$provider_rc" -ne 1 ] || exit 0
 [ "$provider_rc" -eq 0 ] || exit 2
-[ -z "$GHAS_TIER" ] || [ "$SOURCE_PROVIDER" = ghas ] || {
-  echo "render-feedback-archive: GHAS tier supplied for a non-GHAS source" >&2; exit 2;
-}
 
 # jq raw-input readers can split a multibyte character at their read boundary
 # (#1741). --rawfile preserves the complete body, including trailing newlines,
@@ -101,12 +99,32 @@ $BODY_JSON
 EOF
 )
 
+# A delayed enrolled inline source can have lost both its retained/current
+# GHAS role after login reuse. Recognize only the existing alert-link syntax
+# and preserve possible severity without a privileged read or past-provider
+# attribution. Eligible quoted alert links share this conservative burden.
+ALERT_NUMBER=""
+if [ "$SOURCE_KIND" = inline ]; then
+  ALERT_NUMBER=$(ghas_alert_number_from_body "$BODY")
+  if [ -z "$GHAS_TIER" ] && [ -n "$ALERT_NUMBER" ]; then GHAS_TIER=unknown; fi
+fi
+if [ -n "$GHAS_TIER" ] && ! printf '%s' "$SOURCE_PROVIDERS" | jq -e 'index("ghas") != null' >/dev/null; then
+  [ "$GHAS_TIER" = unknown ] && [ "$SOURCE_KIND" = inline ] && [ -n "$ALERT_NUMBER" ] || {
+    echo "render-feedback-archive: known GHAS tier supplied without a GHAS role or unknown inline alert-link evidence" >&2; exit 2;
+  }
+fi
+
 CODEX_TIERS=$(codex_tiers_of "$BODY" | jq -Rsc 'split("\n") | map(select(. != ""))')
 VISIBLE=$(coderabbit_finding_scan "$BODY") \
   || { echo "render-feedback-archive: could not scan CodeRabbit body" >&2; exit 2; }
 CODERABBIT_TIERS=$(coderabbit_tiers_of "$VISIBLE" | jq -Rsc 'split("\n") | map(select(. != ""))') \
   || { echo "render-feedback-archive: could not classify CodeRabbit tier evidence" >&2; exit 2; }
-if [ -n "$GHAS_TIER" ]; then
+if [ "$GHAS_TIER" = unknown ]; then
+  # Possible severities, not a claim that the lookup established any tier.
+  # Existing policy filtering may ignore known tiers; only ignoring every
+  # GHAS tier intentionally removes this unresolved history obligation.
+  GHAS_TIERS='["p0","p1","p2","p3"]'
+elif [ -n "$GHAS_TIER" ]; then
   GHAS_TIERS=$(jq -nc --arg t "$GHAS_TIER" '[$t]')
 else
   GHAS_TIERS='[]'

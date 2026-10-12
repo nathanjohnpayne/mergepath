@@ -6,6 +6,14 @@
 # One eligibility predicate is shared by ordinary lookup and inert record
 # validation, so a relay cannot broaden the renderer/accounting source kinds.
 FEEDBACK_ARCHIVE_ELIGIBILITY_JQ='
+  def current_archive_roles:
+    def current_login($config; $fallback):
+      ($config.bot_login // "") | if . == "" then $fallback else . end;
+    [ {login:current_login(.codex; "chatgpt-codex-connector[bot]"), provider:"codex"},
+      {login:current_login(.coderabbit; "coderabbitai[bot]"), provider:"coderabbit"},
+      {login:current_login(.code_scanning; "github-advanced-security[bot]"), provider:"ghas"},
+      ((.available_reviewers // [])[] | {login:., provider:"reviewer"}) ]
+    | map(.login |= ascii_downcase);
   def archive_provider($identities; $kind; $login):
     $identities[]
     | select((.login | ascii_downcase) == ($login | ascii_downcase))
@@ -24,17 +32,8 @@ feedback_archive_registry_load() {
 
 feedback_archive_registry_from_json() {
   local parsed="$1"
-  FEEDBACK_ARCHIVE_IDENTITIES=$(printf '%s' "$parsed" | jq -ce '
-    # Reuse the trusted parsed policy and the accounting defaults. Empty login
-    # fields have the same default behavior as the existing shell readers.
-    def current_login($config; $fallback):
-      ($config.bot_login // "") | if . == "" then $fallback else . end;
-    . as $policy
-    | [ {login:current_login(.codex; "chatgpt-codex-connector[bot]"), provider:"codex"},
-      {login:current_login(.coderabbit; "coderabbitai[bot]"), provider:"coderabbit"},
-      {login:current_login(.code_scanning; "github-advanced-security[bot]"), provider:"ghas"},
-      ((.available_reviewers // [])[] | {login:., provider:"reviewer"}) ]
-    | map(.login |= ascii_downcase) as $current_roles
+  FEEDBACK_ARCHIVE_IDENTITIES=$(printf '%s' "$parsed" | jq -ce "$FEEDBACK_ARCHIVE_ELIGIBILITY_JQ"'
+    . as $policy | current_archive_roles as $current_roles
     | $policy.feedback_archive.identities
     | select(type == "array" and length > 0 and length <= 128)
     | select(all(.[];
@@ -51,6 +50,8 @@ feedback_archive_registry_from_json() {
         ([$current_roles[] | select(.login == ($identity.login | ascii_downcase))
           | .provider] | unique) == [$identity.provider]))
   ') || { echo 'feedback-archive: missing, invalid, or ambiguous retained identity registry' >&2; return 2; }
+  FEEDBACK_ARCHIVE_CURRENT_ROLES=$(printf '%s' "$parsed" | jq -ce \
+    "$FEEDBACK_ARCHIVE_ELIGIBILITY_JQ"'current_archive_roles') || return 2
 }
 
 # rc 0 = enrolled source, rc 1 = never eligible kind/login, rc 2 = unknown registry.
@@ -67,19 +68,36 @@ feedback_archive_source_provider() {
   printf '%s\n' "$result"
 }
 
+# Bounded classifier candidates are separate from retained source admission.
+# Current roles cannot add enrollment or a kind the retained role never owned.
+feedback_archive_source_providers() {
+  local kind="$1" login="$2" retained
+  retained=$(feedback_archive_source_provider "$kind" "$login") || return $?
+  printf '%s' "$FEEDBACK_ARCHIVE_CURRENT_ROLES" | jq -ce \
+    --arg retained "$retained" --arg kind "$kind" --arg login "$login" \
+    "$FEEDBACK_ARCHIVE_ELIGIBILITY_JQ"'
+      ([$retained] + [archive_provider(.; $kind; $login)]) | unique
+    ' || return 2
+}
+
 # An inert handoff contains at most one source body (32 chunks) or one restored
 # record. Decode only as data; a retained enrollment grants no payload authority.
 feedback_archive_validate_records() {
   # Optional context comes from the relay source resolver AFTER its trusted
   # repository/default-branch binding and handoff tuple check, never the payload.
   local handoff="$1" verified_source_event="${2:-}"
-  jq -e --arg verified_source_event "$verified_source_event" --argjson identities "$FEEDBACK_ARCHIVE_IDENTITIES" "$FEEDBACK_ARCHIVE_ELIGIBILITY_JQ"'
+  jq -e --arg verified_source_event "$verified_source_event" --argjson identities "${FEEDBACK_ARCHIVE_IDENTITIES:-[]}" "$FEEDBACK_ARCHIVE_ELIGIBILITY_JQ"'
     def eligible($kind; $login):
       [archive_provider($identities; $kind; $login)] | length == 1;
-    def payload_ok($p):
+    def payload_shape_ok($p):
       ($p | type == "object") and
       ($p.source_comment_id | type == "number" and . > 0 and floor == .) and
-      ($p.source_login | type == "string") and
+      ($p.source_login | type == "string" and
+        test("^[A-Za-z0-9-]+(_[A-Za-z0-9]+|\\[bot\\])?$")) and
+      (($p.source_kind // "issue-comment") | . == "inline" or
+        . == "issue-comment" or . == "review-body");
+    def payload_ok($p):
+      payload_shape_ok($p) and
       eligible(($p.source_kind // "issue-comment"); $p.source_login);
     # Absolute anchors forbid extra lines; a missing match is an error rather
     # than an empty stream that could silently remove a record from the set.
@@ -90,7 +108,7 @@ feedback_archive_validate_records() {
     def v2:
       exact("\\A<!-- mergepath-feedback-archive:v2 id=(?<id>[0-9a-f]{64}) part=(?<part>[0-9]+)/(?<total>[0-9]+) data=(?<data>[A-Za-z0-9+/=]{1,60000}) -->\\z")
       | .part |= tonumber | .total |= tonumber;
-    .archive_records as $records
+    .archive_records as $records | has("archive_source") as $explicit_source
     | ($records | type == "array" and length <= 32) and
       all($records[]; type == "string") and
       (if ($records | length) == 0 then true
@@ -101,6 +119,11 @@ feedback_archive_validate_records() {
          # Immutable old producers lack archive_source. Only independently
          # verified default-branch issue-comment context permits that legacy
          # restoration. Present invalid metadata never takes this fallback.
+         # Restore an already trusted record independently of current source
+         # enrollment only with explicit Actions source metadata. Legacy
+         # complete bodies still need enrollment: issue-comment run context
+         # alone cannot distinguish a fresh old-producer source body from a
+         # restoration. Accounting refuses missing enrollment after restore.
          .event_name == "issue_comment" and
          (if has("archive_source") then
             (.archive_source.id | type == "number" and . > 0 and floor == .)
@@ -108,10 +131,10 @@ feedback_archive_validate_records() {
          ($records | length == 1) and
          ([$records[] |
            if startswith("<!-- mergepath-feedback-archive:v1 ") then
-             v1 | @base64d | fromjson | payload_ok(.)
+             v1 | @base64d | fromjson | if $explicit_source then payload_shape_ok(.) else payload_ok(.) end
            elif startswith("<!-- mergepath-feedback-archive:v2 ") then
              v2 | .part >= 1 and .part <= .total and .total <= 32 and
-               (if .total == 1 then .data | @base64d | fromjson | payload_ok(.) else true end)
+               (if .total == 1 then .data | @base64d | fromjson | if $explicit_source then payload_shape_ok(.) else payload_ok(.) end else true end)
            else test("\\A<!-- mergepath-feedback-archive-relay:v(1 run=[0-9]+ status=(complete|failed)|2 run=[0-9]+ publisher=[0-9]+ status=complete) -->\\z") end]
            | length == 1 and .[0] == true)
        else

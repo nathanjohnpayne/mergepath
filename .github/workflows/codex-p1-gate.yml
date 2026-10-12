@@ -233,20 +233,24 @@ jobs:
           # and GHAS read. Current review membership is deliberately separate.
           . scripts/lib/feedback-policy-helpers.sh
           . scripts/lib/feedback-archive-identities.sh
-          source_provider=""
+          source_providers="[]"
           if [ -n "$source_kind" ]; then
-            feedback_archive_registry_load .github/review-policy.yml
             case "$source_id" in ''|*[!0-9]*) echo "::error::Ambiguous archive source id"; exit 2 ;; esac
             [ "$source_id" -gt 0 ] || { echo "::error::Invalid archive source id"; exit 2; }
-            provider_rc=0
-            source_provider=$(feedback_archive_source_provider "$source_kind" "$source_login") || provider_rc=$?
             if [ "$source_kind" = issue-comment ] && [ "$source_login" = 'github-actions[bot]' ]; then
-              source_provider=restoration
-            elif [ "$provider_rc" -eq 1 ]; then
-              echo "Source is not enrolled for archival; leaving its previous body inert."
-              source_kind=""
-            elif [ "$provider_rc" -ne 0 ]; then
-              exit 2
+              # Fixed Actions restoration preserves its exact prior record
+              # before enrollment is revalidated by later accounting.
+              source_providers='[]'
+            else
+              feedback_archive_registry_load .github/review-policy.yml
+              provider_rc=0
+              source_providers=$(feedback_archive_source_providers "$source_kind" "$source_login") || provider_rc=$?
+              if [ "$provider_rc" -eq 1 ]; then
+                echo "Source is not enrolled for archival; leaving its previous body inert."
+                source_kind=""
+              elif [ "$provider_rc" -ne 0 ]; then
+                exit 2
+              fi
             fi
           fi
 
@@ -262,15 +266,16 @@ jobs:
               jq -j '.comment.body // ""' "$GITHUB_EVENT_PATH" >"$previous_file"
             fi
 
-            # Resolve severity only for retained GHAS inline sources. A failed
-            # read archives conservatively at p1 because this prior body has no
-            # recovery endpoint. The renderer itself remains network-free.
+            # Resolve severity only for admitted current/retained GHAS inline
+            # roles. A failed read preserves unresolved possibilities. After
+            # later role changes, the network-free renderer can preserve an
+            # admitted inline alert link conservatively without this lookup.
             ghas_tier=""
             . scripts/lib/gh-api-scalar.sh
             . scripts/lib/ghas-alert-severity.sh
 
             # Codex P1, PR #1124: `previous_file` is commenter-controlled, so neither
-            # the alert-number extraction nor the privileged security-events read may
+            # this alert-number extraction nor the privileged security-events read may
             # run before the source is confirmed to be a configured-GHAS INLINE
             # comment. Otherwise any commenter -- including a participant on a public
             # fork PR -- could plant a guessed alert URL, make this job disclose
@@ -278,7 +283,7 @@ jobs:
             # persisted archive record, even though accounting later rejects that
             # source. Inline-only matches accounting's own enumeration rule: GHAS
             # never posts a top-level review body or a PR-level issue comment.
-            if [ "$source_kind" = "inline" ] && [ "$source_provider" = ghas ]; then
+            if [ "$source_kind" = "inline" ] && printf '%s' "$source_providers" | jq -e 'index("ghas") != null' >/dev/null; then
               alert_number=$(ghas_alert_number_from_body "$(cat "$previous_file")")
               if [ -n "$alert_number" ]; then
                 # A failed cache_init (disk/permissions) leaves
@@ -296,26 +301,13 @@ jobs:
                   ghas_tier=$(ghas_severity_tier "$ghas_severity")
                   ghas_tier="${ghas_tier:-p2}"
                 else
-                  # Codex review, PR #1124: a FAILED read (network/rate-limit
-                  # -- distinct from the branch above, where the read
-                  # succeeded and simply found no severity) must NOT default
-                  # to p2. A repo with feedback_policy.priorities.p2: ignore
-                  # would then have strongest_nonignored_archive_tier drop
-                  # the archived record from inventory entirely -- an
-                  # originally p0/p1 finding vanishing not because anyone
-                  # reviewed it, but because of a transient infrastructure
-                  # failure at the exact moment its comment was archived.
-                  # Live evaluation avoids this because a failed read there
-                  # hard-fails the gate (exit 2) rather than ever reaching a
-                  # tier classification an ignore policy could act on.
-                  # Archival can't hard-fail (there is no scheduled retry,
-                  # and the record would be lost forever), so it defaults to
-                  # p1 instead -- required under this repo's own default
-                  # feedback_policy split (P0/P1-required), erring toward
-                  # over-inclusion for a genuinely unresolved severity
-                  # rather than risking silent exclusion.
-                  echo "::warning::could not resolve code-scanning alert #$alert_number severity for archival ($source_kind $source_id); archiving at p1 (unresolved, not p2, so a p2:ignore policy cannot silently drop it)."
-                  ghas_tier=p1
+                  # Archival is one-shot: retain the body even when severity
+                  # cannot be read. Preserve every possible GHAS tier instead
+                  # of guessing one that a valid ignore policy might discard.
+                  # Accounting selects the strongest nonignored possibility;
+                  # all GHAS tiers ignored explicitly excludes this history.
+                  echo "::warning::could not resolve code-scanning alert #$alert_number severity for archival ($source_kind $source_id); archiving unresolved severity possibilities p0-p3."
+                  ghas_tier=unknown
                 fi
               else
                 # Codex review, PR #1124 (two rounds): live accounting's

@@ -87,6 +87,19 @@ case "$endpoint" in
     ;;
 esac
 
+# Only the production-cleanup regression opts into these offline mutations.
+# Ordinary accounting remains read-only; an unexpected write is refused.
+if [[ " $* " == *" --method POST "* ]]; then
+  [ -n "${GH_CAPTURE_FAILURE_MARKER:-}" ] || { echo 'unexpected mutation' >&2; exit 99; }
+  case "$endpoint" in
+    repos/acme/widget/issues/7/comments)
+      cat >"$GH_CAPTURE_FAILURE_MARKER"
+      jq '.+{id:3,user:{login:"github-actions[bot]"},created_at:"2026-08-18T19:00:00Z"}' "$GH_CAPTURE_FAILURE_MARKER"; exit 0 ;;
+    repos/acme/widget/check-runs) printf '{"id":900}\n'; exit 0 ;;
+    *) echo 'unexpected cleanup mutation' >&2; exit 99 ;;
+  esac
+fi
+
 case "$endpoint" in
   repos/acme/widget)
     printf '{"default_branch":"main"}\n' ;;
@@ -241,6 +254,30 @@ reset_fixtures
 run_gate
 assert_eq 0 "$RUN_RC" "empty review history clears"
 assert_eq clear "$(printf '%s' "$RUN_JSON" | jq -r '.status')" "empty history emits clear status"
+
+# Unknown complete legacy bodies are refused before source attribution. The
+# actual relay cleanup then supplies existing non-review durable failure
+# evidence; the real marker verifier and accounting retain it on later sweeps.
+python3 - "$ROOT/.github/workflows/codex-feedback-archive-relay.yml" "$TMP/legacy-failure-cleanup.sh" <<'PYTHON'
+import sys,textwrap
+s=open(sys.argv[1]).read().split('      - name: Close an abandoned read-only relay lease',1)[1]
+s=s.split('        run: |\n',1)[1].split('\n      - name:',1)[0]
+open(sys.argv[2],'w').write(textwrap.dedent(s))
+PYTHON
+(cd "$ROOT" && env PATH="$TMP/bin:$PATH" GH_TOKEN=fake-offline GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  GH_CAPTURE_FAILURE_MARKER="$TMP/legacy-failed-marker.json" REPO=acme/widget PR_NUMBER=7 SOURCE_RUN_ID=12345 \
+  CHECK_ID='' BOUND_HEAD_SHA=cccccccccccccccccccccccccccccccccccccccc CHECK_NAME='Codex P1 unresolved threads' \
+  bash "$TMP/legacy-failure-cleanup.sh") >"$TMP/legacy-cleanup.log" 2>&1
+jq '.+{id:3,user:{login:"github-actions[bot]"},created_at:"2026-08-18T19:00:00Z"} | [.]' \
+  "$TMP/legacy-failed-marker.json" >"$TMP/fixtures/issues.json"
+assert_eq '<!-- mergepath-feedback-archive-relay:v1 run=12345 status=failed -->' "$(jq -r '.[0].body' "$TMP/fixtures/issues.json")" \
+  "production cleanup records failure for the newly refused legacy source with no prior completion"
+for sweep in first repeated; do
+  run_gate
+  assert_eq 2 "$RUN_RC" "$sweep real verified-marker accounting sweep retains the legacy source failure"
+  assert_match 'read-only feedback archive relay failed for source run 12345' "$RUN_ERR" "$sweep sweep names the durable non-review failure record"
+done
+reset_fixtures
 
 # The entrypoint must refuse an unavailable Python runtime before API reads.
 cat >"$TMP/bin/python3" <<'PYTHON'
@@ -2672,7 +2709,7 @@ fi
 # preceding the author guard is exactly what let a non-GHAS commenter plant a
 # guessed alert URL and have Actions resolve it.
 P1_GATE_WF="$ROOT/.github/workflows/codex-p1-gate.yml"
-GUARD_LINE=$(grep -n 'if \[ "\$source_kind" = "inline" \] && \[ "\$source_provider" = ghas \]; then' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
+GUARD_LINE=$(grep -n 'if \[ "\$source_kind" = "inline" \] && printf.*\$source_providers.*index("ghas")' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
 EXTRACT_LINE=$(grep -n 'alert_number=\$(ghas_alert_number_from_body' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
 LOOKUP_LINE=$(grep -n 'ghas_severity=\$(ghas_alert_severity "\$REPO" "\$alert_number")' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
 if [ -n "$GUARD_LINE" ] && [ -n "$EXTRACT_LINE" ] && [ -n "$LOOKUP_LINE" ] \
@@ -2990,7 +3027,7 @@ No alert link in this body at all.
 EOF
 GHAS_ARCHIVE_NO_LINK=$("$RENDER_ARCHIVE" inline 8610 'github-advanced-security[bot]' \
   '2026-08-26T22:10:00Z' "$PREVIOUS_GHAS_NO_LINK")
-assert_eq "" "$GHAS_ARCHIVE_NO_LINK" "render-feedback-archive.sh with no GHAS_TIER argument emits no archive record (pure-function contract)"
+assert_eq "" "$GHAS_ARCHIVE_NO_LINK" "render-feedback-archive.sh with no GHAS_TIER argument emits no archive record for a linkless body (pure-function contract)"
 
 GHAS_ARCHIVE_NO_LINK_WORKFLOW_SHAPE=$("$RENDER_ARCHIVE" inline 8611 'github-advanced-security[bot]' \
   '2026-08-26T22:11:00Z' "$PREVIOUS_GHAS_NO_LINK" p2)
@@ -3040,6 +3077,28 @@ run_gate
 assert_eq 1 "$RUN_RC" "a failed archive-time severity read at p1 survives a p2:ignore policy (#1124)"
 assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "the failed-read archive record carries p1, not p2"
 mv "$TMP/review-policy.ignore-p2-archive.yml" "$TMP/review-policy.yml"
+cp "$TMP/review-policy.yml" "$TMP/policy-before-unknown.yml"
+UNKNOWN_GHAS_ARCHIVE=$("$RENDER_ARCHIVE" inline 8622 'github-advanced-security[bot]' \
+  '2026-08-26T22:20:00Z' "$PREVIOUS_GHAS_READ_FAILED" unknown)
+for selected in p0 p1 p2 p3 none; do
+  cp "$TMP/policy-before-unknown.yml" "$TMP/review-policy.yml"
+  printf '\nfeedback_policy:\n  mode: by-priority\n  priorities:\n' >>"$TMP/review-policy.yml"
+  for priority in p0 p1 p2 p3; do
+    disposition=ignore; [ "$priority" != "$selected" ] || disposition=required
+    printf '    %s: %s\n' "$priority" "$disposition" >>"$TMP/review-policy.yml"
+  done
+  jq -n --arg body "$UNKNOWN_GHAS_ARCHIVE" '[{id:8623,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+  run_gate
+  if [ "$selected" = none ]; then
+    assert_eq 0 "$RUN_RC" "explicit all-GHAS-tiers-ignore policy excludes unknown severity"
+    assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "all-ignore policy has no GHAS history obligation"
+    assert_eq "$UNKNOWN_GHAS_ARCHIVE" "$(jq -r '.[0].body' "$TMP/fixtures/issues.json")" "all-ignore inventory preserves the durable unresolved archive record"
+  else
+    assert_eq 1 "$RUN_RC" "unknown severity survives when only $selected is required"
+    assert_eq "$selected" "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "unknown severity uses strongest permitted possibility $selected"
+  fi
+done
+mv "$TMP/policy-before-unknown.yml" "$TMP/review-policy.yml"
 
 # Two comments linking the SAME alert number must fetch it only ONCE
 # (scripts/lib/ghas-alert-severity.sh's GHAS_SEVERITY_CACHE) -- without
@@ -3208,6 +3267,123 @@ for shape in equal ack-suffix; do
   assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "$shape role reuse retains historical required CodeRabbit tier"
   assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "$shape role reuse retains the archived finding"
   assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$shape role reuse has one historical finding despite the current parser omitting Major"
+done
+# A new Codex revision under the reused login retains its existing classifier
+# evidence, even though the one retained identity still names CodeRabbit.
+printf '**P1** New current Codex revision under a retained CodeRabbit login.\n' >"$TMP/reused-codex-body.txt"
+for kind in inline issue-comment review-body; do
+  for action in edited deleted; do
+    reset_fixtures
+    NEW_ROLE_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" "$kind" 9095 'coderabbitai[bot]' \
+      '2026-10-11T02:00:00Z' "$TMP/reused-codex-body.txt")
+    jq -n --arg body "$NEW_ROLE_ARCHIVE" '[{id:9096,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+    if [ "$action" = edited ]; then
+      case "$kind" in inline) surface=inline ;; issue-comment) surface=issues ;; review-body) surface=reviews ;; esac
+      jq '. + [{id:9095,user:{login:"coderabbitai[bot]"},body:"current markerless rewrite",created_at:"2026-10-11T02:01:00Z",submitted_at:"2026-10-11T02:01:00Z"}]' \
+        "$TMP/fixtures/$surface.json" >"$TMP/rewritten-source.json"
+      mv "$TMP/rewritten-source.json" "$TMP/fixtures/$surface.json"
+    fi
+    run_gate
+    assert_eq 1 "$RUN_RC" "$action $kind new Codex body survives retained CodeRabbit role ambiguity"
+    assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "$action $kind ambiguity retains the new Codex P1 evidence"
+    assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$action $kind new revision creates exactly one history obligation"
+  done
+done
+# Delayed old CodeRabbit body remains visible alongside new Codex history.
+jq --arg body "$ROLE_ARCHIVE" '. + [{id:9097,user:{login:"github-actions[bot]"},body:$body}]' "$TMP/fixtures/issues.json" >"$TMP/both-roles.json"
+mv "$TMP/both-roles.json" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "delayed old and new provider revisions both remain unaccounted"
+assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "role ambiguity preserves both distinct body histories"
+printf '**P1** Never enrolled author quotes a provider tier.\n' >"$TMP/never-enrolled-body.txt"
+assert_eq "" "$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9098 nathanjohnpayne \
+  '2026-10-11T02:00:00Z' "$TMP/never-enrolled-body.txt")" "current classifier evidence grants no archive enrollment to the author"
+# A subsequent provider move must not erase either previously captured role.
+sed 's/bot_login: "coderabbitai\[bot\]"/bot_login: "third-codex[bot]"/' "$TMP/review-policy.yml" >"$TMP/third-policy.yml"
+mv "$TMP/third-policy.yml" "$TMP/review-policy.yml"
+run_gate
+assert_eq 1 "$RUN_RC" "third policy transition retains both old and new captured provider histories"
+assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "third policy transition cannot drop the new Codex-only classifier evidence"
+
+# Explicit precision cost: an enrolled CodeRabbit source quoting a Codex tier
+# creates conservative archive evidence even though CodeRabbit's live parser
+# excludes the fenced example. Equal live text cannot erase that history.
+cp "$TMP/correct-active-policy.yml" "$TMP/review-policy.yml"
+reset_fixtures
+printf 'Example only:\n```text\n**P1** Quoted cross-provider marker.\n```\n' >"$TMP/quoted-provider-body"
+QUOTED_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9099 'coderabbitai[bot]' \
+  '2026-10-11T03:00:00Z' "$TMP/quoted-provider-body")
+jq -n --arg body "$QUOTED_ARCHIVE" '[{id:9109,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+for state in absent equal ack-suffix; do
+  if [ "$state" != absent ]; then
+    jq -n --rawfile body "$TMP/quoted-provider-body" --arg state "$state" '[{id:9099,user:{login:"coderabbitai[bot]"},body:($body + if $state=="ack-suffix" then "\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678\n\n<!-- This is an auto-generated reply by CodeRabbit -->" else "" end)}]' >"$TMP/fixtures/inline.json"
+  fi
+  run_gate
+  assert_eq 1 "$RUN_RC" "$state cross-provider quoted marker retains its conservative archive obligation"
+  assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$state quoted marker adds exactly one archive disposition burden"
+  assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "$state current parser omission cannot suppress conservative history"
+done
+# Same-kind GHAS/text role reuse consumes only existing captured arrays.
+cp "$TMP/correct-active-policy.yml" "$TMP/roles-baseline.yml"
+for provider in codex coderabbit; do
+  reset_fixtures
+  python3 - "$TMP/roles-baseline.yml" "$TMP/review-policy.yml" "$provider" <<'PYTHON'
+import sys
+s=open(sys.argv[1]).read(); p=sys.argv[3]
+old={'codex':'chatgpt-codex-connector[bot]','coderabbit':'coderabbitai[bot]'}[p]
+s=s.replace('bot_login: "github-advanced-security[bot]"','bot_login: "new-ghas[bot]"')
+s=s.replace('login: "github-advanced-security[bot]", provider: ghas, status: active','login: "github-advanced-security[bot]", provider: ghas, status: retired')
+s=s.replace('bot_login: "'+old+'"','bot_login: "github-advanced-security[bot]"')
+s=s.replace('login: "'+old+'", provider: '+p+', status: active','login: "'+old+'", provider: '+p+', status: retired')
+open(sys.argv[2],'w').write(s)
+PYTHON
+  if [ "$provider" = codex ]; then printf '**P1** New Codex body.\n' >"$TMP/ghas-reuse-body";
+  else printf '_🟠 Major_\nNew CodeRabbit body.\n' >"$TMP/ghas-reuse-body"; fi
+  GHAS_REUSE_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9100 'github-advanced-security[bot]' \
+    '2026-10-11T03:00:00Z' "$TMP/ghas-reuse-body")
+  jq -n --arg body "$GHAS_REUSE_ARCHIVE" '[{id:9101,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "retained GHAS/current $provider inline history remains inventoried"
+  assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "retained GHAS/current $provider keeps existing text tier evidence"
+  assert_eq "" "$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" issue-comment 9100 'github-advanced-security[bot]' \
+    '2026-10-11T03:00:00Z' "$TMP/ghas-reuse-body")" "current $provider cannot expand retained GHAS source kinds"
+  # Reverse direction: source-kind admission remains the retired text role;
+  # current GHAS captures only its already-supported one-shot severity result.
+  python3 - "$TMP/roles-baseline.yml" "$TMP/review-policy.yml" "$provider" <<'PYTHON'
+import sys
+s=open(sys.argv[1]).read(); p=sys.argv[3]
+old={'codex':'chatgpt-codex-connector[bot]','coderabbit':'coderabbitai[bot]'}[p]
+s=s.replace('bot_login: "github-advanced-security[bot]"','bot_login: "'+old+'"')
+s=s.replace('login: "github-advanced-security[bot]", provider: ghas, status: active','login: "github-advanced-security[bot]", provider: ghas, status: retired')
+s=s.replace('bot_login: "'+old+'"\n'+('codex:' if p=='coderabbit' else 'code_scanning:'),'bot_login: "new-'+p+'[bot]"\n'+('codex:' if p=='coderabbit' else 'code_scanning:'))
+s=s.replace('login: "'+old+'", provider: '+p+', status: active','login: "'+old+'", provider: '+p+', status: retired')
+open(sys.argv[2],'w').write(s)
+PYTHON
+  source='chatgpt-codex-connector[bot]'; [ "$provider" != coderabbit ] || source='coderabbitai[bot]'
+  GHAS_REUSE_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9102 "$source" \
+    '2026-10-11T03:00:00Z' "$PREVIOUS_GHAS_READ_FAILED" unknown)
+  jq -n --arg body "$GHAS_REUSE_ARCHIVE" '[{id:9103,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "retained $provider/current GHAS inline unknown severity remains inventoried"
+  assert_eq p0 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "retained $provider/current GHAS keeps strongest permitted severity possibility"
+  # Delivery after the current GHAS role moves again must still capture the
+  # disappearing link-only body, without inventing a past provider identity.
+  sed "s/bot_login: \"$source\"/bot_login: \"third-ghas[bot]\"/" "$TMP/review-policy.yml" >"$TMP/delayed-ghas-policy"
+  mv "$TMP/delayed-ghas-policy" "$TMP/review-policy.yml"
+  DELAYED_GHAS_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9104 "$source" \
+    '2026-10-11T04:00:00Z' "$PREVIOUS_GHAS_READ_FAILED")
+  jq -n --arg body "$DELAYED_GHAS_ARCHIVE" '[{id:9105,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "delayed $provider-to-GHAS-to-third-login inline capture retains unresolved history"
+  assert_eq p0 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "delayed $provider source captures conservative severity without a surviving GHAS role"
+  cat >>"$TMP/review-policy.yml" <<'YAML'
+feedback_policy:
+  mode: by-priority
+  priorities: {p0: ignore, p1: ignore, p2: required, p3: ignore}
+YAML
+  run_gate
+  assert_eq 1 "$RUN_RC" "delayed $provider GHAS capture survives p1-ignore/p2-required policy"
+  assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "delayed $provider GHAS capture selects the permitted unresolved p2 possibility"
 done
 mv "$TMP/correct-active-policy.yml" "$TMP/review-policy.yml"
 

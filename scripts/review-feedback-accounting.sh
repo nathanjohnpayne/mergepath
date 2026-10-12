@@ -937,7 +937,7 @@ append_archive_candidate() {
   local source_kind source_id source_login source_comments source_comment
   local live_source_login live_source_body_json live_source_fingerprint archive_tiers tier
   local body_fingerprint payload_body_json finding_kind ack_token accounted evidence
-  local live_body archived_body archive_provider live_source_current=false
+  local live_body archived_body archive_provider live_tier live_source_current=false
 
   printf '%s' "$payload" | validate_archive_payload \
     || die 2 "feedback archive payload failed schema validation"
@@ -963,6 +963,16 @@ append_archive_candidate() {
   body_fingerprint=$(printf '%s' "$payload" | jq -r '.body_fingerprint')
   archive_provider=$(feedback_archive_source_provider "$source_kind" "$source_login") \
     || die 2 "feedback archive source lacks retained enrollment or an eligible source kind: $source_login ($source_kind)"
+  # Once exact retained source-kind admission succeeds, preserve every
+  # serialized classifier result. Present provider configuration cannot erase
+  # captured history after further role changes. These are conservative tier
+  # possibilities, not authenticated per-revision provider attribution; quoted
+  # cross-provider markers may create an extra disposition obligation.
+  archive_tiers=$(printf '%s' "$payload" | jq -c '
+    [.codex_tiers[], .coderabbit_tiers[], (.ghas_tiers // [])[]] | unique
+  ') || die 2 "could not resolve archived classifier tier evidence"
+  tier=$(strongest_nonignored_archive_tier "$archive_tiers")
+  [ -n "$tier" ] || return 0
   source_comments=$(archive_source_comments "$source_kind" "$source_login") \
     || die 2 "could not resolve the feedback archive source inventory"
 
@@ -991,6 +1001,20 @@ append_archive_candidate() {
         fi
         ;;
     esac
+    # A matching current role must actually inventory the selected archive
+    # severity before live equality or a provider acknowledgement can collapse
+    # it. Conservative cross-provider evidence can be absent from that parser.
+    if [ "$live_source_current" = true ]; then
+      if [ "$source_kind" = inline ]; then
+        live_tier=$(finding_tier "$source_login" "$live_body") || exit 2
+        if [ -n "$live_tier" ] && tier_is_ignored "$live_tier"; then live_tier=""; fi
+      else
+        live_tier=$(strongest_nonignored_finding_tier "$source_login" "$live_body") || exit 2
+      fi
+      if [ -z "$live_tier" ] || [ "$(tier_rank "$live_tier")" -gt "$(tier_rank "$tier")" ]; then
+        live_source_current=false
+      fi
+    fi
     if [ "$live_source_current" = true ]; then
       [ "$live_source_fingerprint" != "$body_fingerprint" ] || return 0
     fi
@@ -1010,17 +1034,6 @@ append_archive_candidate() {
     fi
   fi
 
-  if [ "$archive_provider" = coderabbit ]; then
-    archive_tiers=$(printf '%s' "$payload" | jq -c '.coderabbit_tiers')
-  elif [ "$archive_provider" = ghas ]; then
-    # Absent on any record archived before #1113 added this field —
-    # optional in validate_archive_payload for exactly that reason.
-    archive_tiers=$(printf '%s' "$payload" | jq -c '.ghas_tiers // []')
-  else
-    archive_tiers=$(printf '%s' "$payload" | jq -c '.codex_tiers')
-  fi
-  tier=$(strongest_nonignored_archive_tier "$archive_tiers")
-  [ -n "$tier" ] || return 0
 
   case "$source_kind" in
     issue-comment)

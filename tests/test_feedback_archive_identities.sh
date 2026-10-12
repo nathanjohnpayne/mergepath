@@ -80,13 +80,28 @@ check test "$restored" = "$record"
 jq -n --arg record "$record" '{event_name:"issue_comment",archive_source:{kind:"issue-comment",login:"github-actions[bot]",id:8},archive_records:[$record]}' >"$TMP/restored-handoff"
 feedback_archive_validate_records "$TMP/restored-handoff"
 PASS=$((PASS + 1))
+# Removing retained enrollment cannot erase an already trusted Actions record.
+# Fresh producer bodies still require enrollment; restored history instead
+# survives byte-for-byte so accounting can report the missing enrollment.
+sed '/login: retired-reviewer, provider: reviewer, status: retired/d' "$TMP/policy.yml" >"$TMP/omitted-policy.yml"
+feedback_archive_registry_load "$TMP/omitted-policy.yml"
+restored=$(CONFIG="$TMP/omitted-policy.yml" "$ROOT/scripts/render-feedback-archive.sh" issue-comment 8 'github-actions[bot]' 2026-10-11T02:00:00Z "$TMP/restoration")
+check test "$restored" = "$record"
+feedback_archive_validate_records "$TMP/restored-handoff"; PASS=$((PASS + 1))
+rc=0; feedback_archive_validate_records "$TMP/handoff" || rc=$?
+check test "$rc" = 2
+for login in never-registered 'old-codex[bot]'; do
+  out=$(CONFIG="$TMP/omitted-policy.yml" "$ROOT/scripts/render-feedback-archive.sh" issue-comment 8 "$login" 2026-10-11T02:00:00Z "$TMP/restoration")
+  check test -z "$out"
+done
+feedback_archive_registry_load "$TMP/policy.yml"
 # A no-match parser result must not vacuously validate an oversized restored
 # chunk. Restoration is bounded even though only one part can be recovered.
 jq -n '{event_name:"issue_comment",archive_source:{kind:"issue-comment",login:"github-actions[bot]",id:8},archive_records:[("<!-- mergepath-feedback-archive:v2 id=" + ("a" * 64) + " part=1/2 data=" + ("a" * 60001) + " -->")]}' >"$TMP/oversized-restoration"
 rc=0; feedback_archive_validate_records "$TMP/oversized-restoration" || rc=$?
 check test "$rc" = 2
-# A complete v2 singleton always decodes source eligibility, even in legacy
-# handoffs or an Actions restoration. No multiline wrapper may be posted.
+# Complete ordinary v2 singletons decode enrollment. Trusted Actions
+# restoration decodes shape independently of enrollment. No extra lines post.
 encoded=$(printf '%s' "$record" | sed -E 's/^<!-- mergepath-feedback-archive:v1 (.*) -->$/\1/')
 for login in retired-reviewer never-registered; do
   payload=$(printf '%s' "$encoded" | jq -Rr --arg login "$login" '@base64d | fromjson | .source_login=$login | @json | @base64')
@@ -95,7 +110,7 @@ for login in retired-reviewer never-registered; do
     jq -n --arg record "$singleton" --arg mode "$mode" '{archive_records:[$record]} |
       if $mode=="restoration" then .+{event_name:"issue_comment",archive_source:{kind:"issue-comment",login:"github-actions[bot]",id:8}} else . end' >"$TMP/singleton"
     rc=0; feedback_archive_validate_records "$TMP/singleton" || rc=$?
-    if [ "$login" = retired-reviewer ]; then check test "$rc" = 0; else check test "$rc" = 2; fi
+    if [ "$login" = retired-reviewer ] || [ "$mode" = restoration ]; then check test "$rc" = 0; else check test "$rc" = 2; fi
   done
   for extra in prefix suffix; do
     jq -n --arg record "$singleton" --arg extra "$extra" '{archive_source:{kind:"inline",login:"retired-reviewer",id:7},archive_records:[(if $extra=="prefix" then "junk\n"+$record else $record+"\njunk" end)]}' >"$TMP/multiline"
@@ -189,11 +204,24 @@ cat >"$TMP/bin/gh" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$GH_CALL_LOG"
 case "$*" in
-  *--method*POST*) echo 'Unexpected live-write path in offline producer test' >&2; exit 99 ;;
+  *--method*POST*)
+    [ "${GH_NATIVE_RESTORE:-false}" = true ] || { echo 'Unexpected live-write path in offline producer test' >&2; exit 99; }
+    input=""; previous=""
+    for arg in "$@"; do
+      [ "$previous" != --input ] || input="$arg"
+      previous="$arg"
+    done
+    if [ -n "$input" ] && [ "$input" != - ]; then cat "$input" >"$NATIVE_POST_FILE";
+    else cat >"$NATIVE_POST_FILE"; fi
+    jq '. + {id:88,user:{login:"github-actions[bot]"}}' "$NATIVE_POST_FILE" ;;
+  *issues/7/comments*) printf '[]\n' ;;
+  *actions/runs/42*) printf '2026-10-11T01:00:00Z\n' ;;
   *code-scanning/alerts/26*)
     if [ "${GHAS_MOCK:-failed}" = failed ]; then echo 'offline simulated alert read failure' >&2; exit 1; fi
     printf '{"rule":{}}\n' ;;
-  *pulls/7*) printf '{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repo":{"fork":true}},"user":{"login":"author"}}\n' ;;
+  *pulls/7*)
+    fork=true; [ "${GH_NATIVE_RESTORE:-false}" != true ] || fork=false
+    jq -n --argjson fork "$fork" '{head:{sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",repo:{fork:$fork}},user:{login:"author"}}' ;;
   *) echo 'Unexpected API path' >&2; exit 98 ;;
 esac
 SH
@@ -224,6 +252,7 @@ done
 # Real Actions restoration reaches the issue-comment PR binding read and
 # preserves the exact previous v1, partial v2, and terminal records. An empty
 # non-archive event carries no archive source and also has a fresh handoff.
+cp "$TMP/omitted-policy.yml" "$TMP/producer/.github/review-policy.yml"
 for prior in "$record" "$chunk" "$terminal" "plain Actions narration"; do
   jq -n --arg prior "$prior" '{action:"deleted",issue:{number:7},comment:{id:8,user:{login:"github-actions[bot]"},body:$prior,updated_at:"2026-10-11T02:00:00Z"}}' >"$TMP/event"
   : >"$TMP/output"; : >"$TMP/api-calls"
@@ -241,20 +270,78 @@ for prior in "$record" "$chunk" "$terminal" "plain Actions narration"; do
   check test "$(wc -l <"$TMP/api-calls" | tr -d ' ')" = 1
   check grep -Fq 'repos/acme/widget/pulls/7' "$TMP/api-calls"
 done
+# Native same-repository restoration must precede registry loading too: there
+# is no relay marker to hold this path if the sole Actions record disappears.
+for damage in missing malformed invalid-yaml; do
+  case "$damage" in
+    missing) printf 'available_reviewers: []\n' >"$TMP/producer/.github/review-policy.yml" ;;
+    malformed) printf 'feedback_archive: {identities: invalid}\n' >"$TMP/producer/.github/review-policy.yml" ;;
+    invalid-yaml) printf 'feedback_archive: [\n' >"$TMP/producer/.github/review-policy.yml" ;;
+  esac
+  jq -n --arg prior "$record" '{action:"deleted",issue:{number:7},comment:{id:8,user:{login:"github-actions[bot]"},body:$prior,updated_at:"2026-10-11T02:00:00Z"}}' >"$TMP/event"
+  : >"$TMP/output"; : >"$TMP/api-calls"; rm -f "$TMP/native-post"
+  (cd "$TMP/producer" && env PATH="$TMP/bin:$PATH" GH_TOKEN=fake-offline GH_CALL_LOG="$TMP/api-calls" GH_NATIVE_RESTORE=true NATIVE_POST_FILE="$TMP/native-post" \
+    CONFIG="$TMP/producer/.github/review-policy.yml" REPO=acme/widget EVENT_NAME=issue_comment EVENT_ACTION=deleted \
+    GITHUB_EVENT_PATH="$TMP/event" GITHUB_OUTPUT="$TMP/output" RUNNER_TEMP="$TMP" SOURCE_RUN_ID=42 GITHUB_RUN_ID=42 bash "$TMP/producer.sh") >"$TMP/native-$damage.log" 2>&1
+  check test "$(jq -r '.body' "$TMP/native-post")" = "$record"
+  check grep -Fq 'requires_relay=false' "$TMP/output"
+  jq '.comment.user.login="never-registered"' "$TMP/event" >"$TMP/fresh-event"
+  rm -f "$TMP/native-post"
+  rc=0
+  (cd "$TMP/producer" && env PATH="$TMP/bin:$PATH" GH_TOKEN=fake-offline GH_CALL_LOG="$TMP/api-calls" GH_NATIVE_RESTORE=true NATIVE_POST_FILE="$TMP/native-post" \
+    CONFIG="$TMP/producer/.github/review-policy.yml" REPO=acme/widget EVENT_NAME=issue_comment EVENT_ACTION=deleted \
+    GITHUB_EVENT_PATH="$TMP/fresh-event" GITHUB_OUTPUT="$TMP/output" RUNNER_TEMP="$TMP" SOURCE_RUN_ID=42 GITHUB_RUN_ID=42 bash "$TMP/producer.sh") >"$TMP/fresh-$damage.log" 2>&1 || rc=$?
+  check test "$rc" != 0
+  check test ! -e "$TMP/native-post"
+done
 # Archive-time GHAS failed-read and successful markerless-read behavior is
 # exercised through the actual producer, preserving its one-shot API lookup.
-for result in failed empty; do
-  jq -n '{action:"deleted",comment:{id:9,user:{login:"custom-ghas[bot]"},body:"Alert https://github.com/acme/widget/security/code-scanning/26",updated_at:"2026-10-11T01:00:00Z"},pull_request:{number:7,head:{sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",repo:{fork:true}},user:{login:"author"}}}' >"$TMP/event"
+for role in retained current delayed; do
+  cp "$TMP/policy.yml" "$TMP/producer/.github/review-policy.yml"
+  if [ "$role" != retained ]; then
+    sed 's/provider: ghas, status: active/provider: coderabbit, status: retired/' "$TMP/policy.yml" >"$TMP/producer/.github/review-policy.yml"
+  fi
+  if [ "$role" = delayed ]; then
+    sed 's/code_scanning: {bot_login: "custom-ghas\[bot\]"}/code_scanning: {bot_login: "third-ghas[bot]"}/' "$TMP/producer/.github/review-policy.yml" >"$TMP/third-policy.yml"
+    mv "$TMP/third-policy.yml" "$TMP/producer/.github/review-policy.yml"
+  fi
+  for result in failed empty; do
+    jq -n '{action:"deleted",comment:{id:9,user:{login:"custom-ghas[bot]"},body:"Alert https://github.com/acme/widget/security/code-scanning/26",updated_at:"2026-10-11T01:00:00Z"},pull_request:{number:7,head:{sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",repo:{fork:true}},user:{login:"author"}}}' >"$TMP/event"
+    : >"$TMP/output"; : >"$TMP/api-calls"
+    rm -f "$TMP/codex-p1-read-only-handoff.json"
+    (cd "$TMP/producer" && env PATH="$TMP/bin:$PATH" GH_TOKEN=fake-offline GH_CALL_LOG="$TMP/api-calls" GHAS_MOCK="$result" \
+      CONFIG="$TMP/producer/.github/review-policy.yml" REPO=acme/widget EVENT_NAME=pull_request_review_comment EVENT_ACTION=deleted \
+      GITHUB_EVENT_PATH="$TMP/event" GITHUB_OUTPUT="$TMP/output" RUNNER_TEMP="$TMP" SOURCE_RUN_ID=42 GITHUB_RUN_ID=42 bash "$TMP/producer.sh") >"$TMP/ghas-$result.log" 2>&1
+    handoff="$TMP/codex-p1-read-only-handoff.json"
+    tiers='["p2"]'; { [ "$result" != failed ] && [ "$role" != delayed ]; } || tiers='["p0","p1","p2","p3"]'
+    check test "$(jq -c '.archive_records[0] | capture("^<!-- mergepath-feedback-archive:v1 (?<data>.+) -->$").data | @base64d | fromjson | .ghas_tiers' "$handoff")" = "$tiers"
+    feedback_archive_validate_records "$handoff"; PASS=$((PASS + 1))
+    if [ "$role" = delayed ]; then
+      check test ! -s "$TMP/api-calls"
+      check test "$(jq -r '.archive_records[0] | capture("^<!-- mergepath-feedback-archive:v1 (?<data>.+) -->$").data | @base64d | fromjson | .body' "$handoff")" = 'Alert https://github.com/acme/widget/security/code-scanning/26'
+    else
+      check test "$(wc -l <"$TMP/api-calls" | tr -d ' ')" = 1
+      check grep -Fq 'code-scanning/alerts/26' "$TMP/api-calls"
+    fi
+  done
+done
+# Alert-link recognition grants neither fresh enrollment nor new source kinds.
+for boundary in never-enrolled non-inline-retained-cr non-inline-retained-ghas; do
+  cp "$TMP/omitted-policy.yml" "$TMP/producer/.github/review-policy.yml"
+  login='custom-ghas[bot]'; event=pull_request_review; action=edited
+  if [ "$boundary" = never-enrolled ]; then login=never-registered; event=pull_request_review_comment; action=deleted;
+  elif [ "$boundary" = non-inline-retained-cr ]; then
+    sed 's/provider: ghas, status: active/provider: coderabbit, status: retired/' "$TMP/policy.yml" >"$TMP/producer/.github/review-policy.yml"
+  fi
+  jq -n --arg login "$login" --arg action "$action" '{action:$action,comment:{id:9,user:{login:$login},body:"Alert https://github.com/acme/widget/security/code-scanning/26",updated_at:"2026-10-11T01:00:00Z"},review:{id:9,user:{login:$login},body:"Alert https://github.com/acme/widget/security/code-scanning/26",submitted_at:"2026-10-11T01:00:00Z"},changes:{body:{from:"Alert https://github.com/acme/widget/security/code-scanning/26"}},pull_request:{number:7,head:{sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",repo:{fork:true}},user:{login:"author"}}}' >"$TMP/event"
   : >"$TMP/output"; : >"$TMP/api-calls"
   rm -f "$TMP/codex-p1-read-only-handoff.json"
-  (cd "$TMP/producer" && env PATH="$TMP/bin:$PATH" GH_TOKEN=fake-offline GH_CALL_LOG="$TMP/api-calls" GHAS_MOCK="$result" \
-    CONFIG="$TMP/producer/.github/review-policy.yml" REPO=acme/widget EVENT_NAME=pull_request_review_comment EVENT_ACTION=deleted \
-    GITHUB_EVENT_PATH="$TMP/event" GITHUB_OUTPUT="$TMP/output" RUNNER_TEMP="$TMP" SOURCE_RUN_ID=42 GITHUB_RUN_ID=42 bash "$TMP/producer.sh") >"$TMP/ghas-$result.log" 2>&1
-  handoff="$TMP/codex-p1-read-only-handoff.json"
-  tier=p2; [ "$result" != failed ] || tier=p1
-  check test "$(jq -r '.archive_records[0] | capture("^<!-- mergepath-feedback-archive:v1 (?<data>.+) -->$").data | @base64d | fromjson | .ghas_tiers[0]' "$handoff")" = "$tier"
-  feedback_archive_validate_records "$handoff"; PASS=$((PASS + 1))
-  check test "$(wc -l <"$TMP/api-calls" | tr -d ' ')" = 1
-  check grep -Fq 'code-scanning/alerts/26' "$TMP/api-calls"
+  (cd "$TMP/producer" && env PATH="$TMP/bin:$PATH" GH_TOKEN=fake-offline GH_CALL_LOG="$TMP/api-calls" \
+    CONFIG="$TMP/producer/.github/review-policy.yml" REPO=acme/widget EVENT_NAME="$event" EVENT_ACTION="$action" \
+    GITHUB_EVENT_PATH="$TMP/event" GITHUB_OUTPUT="$TMP/output" RUNNER_TEMP="$TMP" SOURCE_RUN_ID=42 GITHUB_RUN_ID=42 bash "$TMP/producer.sh") >"$TMP/boundary-$boundary.log" 2>&1
+  check test "$(jq '.archive_records|length' "$TMP/codex-p1-read-only-handoff.json")" = 0
+  if [ "$boundary" = never-enrolled ]; then check test ! -s "$TMP/api-calls";
+  else check grep -Fq 'actions/runs/42' "$TMP/api-calls"; fi
+  check test "$(grep -c 'code-scanning/alerts/' "$TMP/api-calls" || true)" = 0
 done
 printf 'feedback-archive-identities: PASS (%s assertions)\n' "$PASS"

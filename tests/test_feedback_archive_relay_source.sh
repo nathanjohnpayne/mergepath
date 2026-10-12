@@ -633,6 +633,26 @@ printf '%s\n' "$PUBLISH" "$PUBLISH" "$PUBLISH" >"$HEAD_SEQUENCE_FILE"
 run_persist issue_comment "$SRC"
 assert_eq "$PERSIST_RC" 0 "actual persist accepts a real incomplete Actions restoration chunk"
 if grep -F -- "$RESTORATION_RECORD" "$GH_LOG" >/dev/null; then pass "actual persist preserves the exact restoration chunk"; else fail "restoration chunk was not posted"; fi
+# Explicit Actions restoration bypasses damaged enrollment only after the
+# existing trusted source/tuple binding and still persists the exact record.
+cp "$TRUSTED/.github/review-policy.yml" "$TMP/relay-enrolled-policy.yml"
+for damage in missing malformed; do
+  if [ "$damage" = missing ]; then printf 'available_reviewers: []\n' >"$TRUSTED/.github/review-policy.yml";
+  else printf 'feedback_archive: {identities: invalid}\n' >"$TRUSTED/.github/review-policy.yml"; fi
+  write_handoff issue_comment "$SRC"
+  jq --arg record "$ARCHIVE" '.archive_records=[$record]' "$HANDOFF" >"$TMP/complete-restoration.json"
+  mv "$TMP/complete-restoration.json" "$HANDOFF"
+  printf '%s\n' "$PUBLISH" "$PUBLISH" "$PUBLISH" >"$HEAD_SEQUENCE_FILE"
+  run_persist issue_comment "$SRC"
+  assert_eq "$PERSIST_RC" 0 "actual relay preserves explicit complete Actions restoration with $damage registry"
+  if grep -F -- "$ARCHIVE" "$GH_LOG" >/dev/null; then pass "$damage registry restoration retains exact record bytes"; else fail "$damage restoration omitted its body"; fi
+  jq '.archive_source={kind:"inline",login:"never-registered",id:555}' "$HANDOFF" >"$TMP/fresh-damaged.json"
+  mv "$TMP/fresh-damaged.json" "$HANDOFF"
+  run_persist issue_comment "$SRC"
+  assert_eq "$PERSIST_RC" 2 "$damage registry cannot grant fresh source restoration authority"
+  assert_empty_writes "fresh $damage source opens no lease or archive"
+done
+mv "$TMP/relay-enrolled-policy.yml" "$TRUSTED/.github/review-policy.yml"
 # Feed the existing resolver output to the actual privileged writer: these
 # legacy artifacts came from immutable default-branch issue-comment producers.
 write_run issue_comment "$ISSUE_HEAD" "$BASE_ID" "$BASE_REPO" main '[]' '.github/workflows/codex-p1-gate.yml@refs/heads/main'
@@ -670,8 +690,8 @@ run_case 41
 assert_eq "$RC" 4 "candidate-branch issue-comment source cannot grant legacy restoration context"
 assert_empty_writes "unverified source resolver emits no privileged write"
 
-# A complete one-part v2 decodes enrollment even in old handoffs and the
-# restoration path. Unenrolled sources never reach a privileged write.
+# Explicit Actions source metadata restores complete records independently of
+# enrollment. Legacy complete bodies still bind enrollment; event is not author.
 encoded=$(printf '%s' "$ARCHIVE" | sed -E 's/^<!-- mergepath-feedback-archive:v1 (.*) -->$/\1/')
 for mode in legacy restoration; do
   for login in 'chatgpt-codex-connector[bot]' never-registered; do
@@ -681,12 +701,17 @@ for mode in legacy restoration; do
     mv "$TMP/singleton.json" "$HANDOFF"
     printf '%s\n' "$PUBLISH" "$PUBLISH" "$PUBLISH" >"$HEAD_SEQUENCE_FILE"
     run_persist issue_comment "$SRC"
-    if [ "$login" = never-registered ]; then
-      assert_eq "$PERSIST_RC" 2 "actual persist rejects unenrolled $mode complete v2"
-      assert_empty_writes "unenrolled $mode complete v2 opens no lease or archive"
+    if [ "$mode" = legacy ] && [ "$login" = never-registered ]; then
+      assert_eq "$PERSIST_RC" 2 "legacy complete unknown source cannot claim Actions restoration from event context alone"
+      assert_empty_writes "legacy unknown complete source opens no lease or archive"
     else
-      assert_eq "$PERSIST_RC" 0 "actual persist accepts enrolled $mode complete v2"
+      assert_eq "$PERSIST_RC" 0 "actual persist preserves $login $mode complete v2 from verified Actions restoration"
     fi
+    jq '.archive_source={kind:"inline",login:"never-registered",id:7}' "$HANDOFF" >"$TMP/fresh-unenrolled.json"
+    mv "$TMP/fresh-unenrolled.json" "$HANDOFF"
+    run_persist issue_comment "$SRC"
+    assert_eq "$PERSIST_RC" 2 "fresh $mode source metadata cannot inherit Actions restoration authority"
+    assert_empty_writes "fresh unenrolled $mode complete v2 opens no lease or archive"
   done
 done
 write_handoff pull_request_review_comment "$SRC"
@@ -792,6 +817,33 @@ else
   fail "no-lease cleanup lost its bound-head failure fallback: $(cat "$GH_LOG")"
 fi
 
+# An unknown complete legacy source remains inert, but the existing failure
+# cleanup can durably hold this source run without attributing its old body.
+write_handoff issue_comment "$ISSUE_HEAD"
+unknown_payload=$(printf '%s' "$encoded" | jq -Rr '@base64d | fromjson | .source_login="never-registered" | @json | @base64')
+jq --arg payload "$unknown_payload" 'del(.archive_source) | .archive_records=[("<!-- mergepath-feedback-archive:v1 "+$payload+" -->")]' "$HANDOFF" >"$TMP/unknown-legacy-handoff.json"
+mv "$TMP/unknown-legacy-handoff.json" "$HANDOFF"
+legacy_bytes=$(cat "$HANDOFF")
+run_persist issue_comment "$ISSUE_HEAD"
+assert_eq "$PERSIST_RC" 2 "unknown complete legacy source refuses attribution before any archive write"
+assert_empty_writes "unknown complete legacy source remains inert"
+assert_eq "$(cat "$HANDOFF")" "$legacy_bytes" "rejected legacy handoff still contains the exact prior-body bytes"
+: >"$GH_LOG"
+set +e
+PATH="$BIN:$PATH" GH_LOG="$GH_LOG" CANDIDATES="$CANDIDATES" FAIL_PR_HEAD_READ=true \
+  RUNNER_TEMP="$TMP" REPO="$BASE_REPO" PR_NUMBER=41 SOURCE_RUN_ID=501 CHECK_ID='' \
+  BOUND_HEAD_SHA="$PUBLISH" CHECK_NAME='Codex P1 unresolved threads' "$CLEANUP" \
+  >"$TMP/legacy-cleanup.out" 2>"$TMP/legacy-cleanup.err"
+CLEANUP_RC=$?
+set -e
+assert_eq "$CLEANUP_RC" 0 "existing cleanup retains a conservative failure after legacy source refusal"
+if grep -F -- 'mergepath-feedback-archive-relay:v1 run=501 status=failed' "$GH_LOG" >/dev/null \
+  && grep -F -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG" >/dev/null \
+  && grep -F -- 'conclusion=failure' "$GH_LOG" >/dev/null; then
+  pass "legacy refusal publishes existing non-review failure marker and bound-head failure"
+else
+  fail "legacy refusal failed to persist its conservative blocker"
+fi
 # Completion can suppress the no-lease failure only after provenance proof.
 printf '[{"id":99,"user":{"login":"github-actions[bot]"},"created_at":"2026-09-26T10:00:00Z","body":"<!-- mergepath-feedback-archive-relay:v1 run=501 status=complete -->"}]\n' > "$TMP/raw-completion.json"
 printf '[]\n' > "$TMP/unverified-completion.json"
