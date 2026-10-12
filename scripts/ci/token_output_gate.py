@@ -275,8 +275,11 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     stream.  This is shell STATE, tracked in source order across the file and
     resolved per SEGMENT, so `( set -x; : "$PAT" )` counts and `set +x`,
     `set +o xtrace` and `set -- -x` are all read correctly.  The
-    shared segment detector also reads immediate deferred enablement. Shopt
-    query/disable modes gain no new disable credit in this enabling repair.
+    shared segment detector also reads immediate deferred enablement. Named
+    operands after either sign of `o` retain their option boundaries; an
+    unresolved `-o` operand preserves later literal enable evidence. A lone
+    shopt dash begins its option-name list, including any later xtrace name.
+    Shopt query/disable modes and bundled `+o` gain no new disable credit.
     The directions are ASYMMETRIC on purpose: enabling is believed wherever it is
     written, disabling only from a line that is the whole `set` and is not
     inside a function body.  Crediting a `set +x` bash never runs is a silent
@@ -3721,9 +3724,9 @@ def _segment_sets_xtrace(seg):
                 # Its value is unresolved; retain later literal enable flags.
                 i += 1
                 continue
-            if not word.startswith("-"):
-                break
-            if word == "-" or set(word[1:]) - set("opqsu"):
+            if word == "-" or not word.startswith("-"):
+                break  # A lone dash is an option name, not a flag bundle.
+            if set(word[1:]) - set("opqsu"):
                 return None
             flags.update(word[1:])
             i += 1
@@ -3744,6 +3747,23 @@ def _segment_sets_xtrace(seg):
             break  # Positional input does not prove an option.
         if a in ("-o", "+o"):
             nxt = lits[i + 1] if i + 1 < len(lits) else None
+            if nxt is None:
+                # Preserve the parent's next-literal named enable evidence:
+                # an unresolved word may expand to another option, not a name.
+                j = i + 1
+                while j < len(lits) and lits[j] is None:
+                    j += 1
+                later = lits[j] if j < len(lits) else None
+                if later is not None and not later.startswith(("-", "+")):
+                    if a == "-o" and later == "xtrace":
+                        state = True
+                    i = j + 1  # Keep the parent's named-operand boundary.
+                    continue
+                i += 1
+                continue
+            if nxt.startswith(("-", "+")):
+                i += 1  # No named operand; keep the following option visible.
+                continue
             if nxt == "xtrace":
                 state = a == "-o"
             i += 2
@@ -3766,6 +3786,11 @@ def _segment_sets_xtrace(seg):
         elif a.startswith("+"):
             if "x" in a[1:]:
                 state = False  # Existing +x semantics, no new bundled +o credit.
+            if "o" in a[1:] and not set(a[1:]) - set("abefhkmnptuvxBCEHPTo"):
+                nxt = lits[i + 1] if i + 1 < len(lits) else None
+                if nxt is not None and not nxt.startswith(("-", "+")):
+                    i += 2  # Consume the name without granting disable credit.
+                    continue
         else:
             break  # The first ordinary operand ends set option processing.
         i += 1
@@ -7509,6 +7534,137 @@ CORPUS = [
         "read x <<$'EOF'\nnothing\nEOF\necho ok\n",
     ),
     # #1448: shared direct/deferred bundled trace-option detector.
+    # #1448 second review: unresolved operands, +o boundaries, lone shopt dash.
+    (
+        'xtrace-review2-set-unresolved-next-name-then-enable',
+        MUST_FLAG,
+        'mode=-x; set -o "$mode" pipefail -x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-set-unresolved-next-name-then-enable-deferred',
+        MUST_FLAG,
+        'eval \'mode=-x; set -o "$mode" pipefail -x\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-set-unresolved-next-name-conservative',
+        MUST_FLAG,
+        'mode=pipefail; set -o "$mode" pipefail -x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-set-unresolved-next-name-conservative-deferred',
+        MUST_FLAG,
+        'eval \'mode=pipefail; set -o "$mode" pipefail -x\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-set-unresolved-named-enable',
+        MUST_FLAG,
+        'mode=-x; set -o "$mode" xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-set-unresolved-named-enable-deferred',
+        MUST_FLAG,
+        'eval \'mode=-x; set -o "$mode" xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-set-bundled-plus-named-then-enable',
+        MUST_FLAG,
+        'set +eo xtrace -x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-set-bundled-plus-named-then-enable-deferred',
+        MUST_FLAG,
+        'eval \'set +eo xtrace -x\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-shopt-lone-dash-enable',
+        MUST_FLAG,
+        'shopt -so - xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-shopt-lone-dash-enable-deferred',
+        MUST_FLAG,
+        'eval \'shopt -so - xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-set-plus-option-looking-operand',
+        MUST_FLAG,
+        'set +o -x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-set-plus-option-looking-operand-deferred',
+        MUST_FLAG,
+        'eval \'set +o -x\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-set-minus-option-looking-operand',
+        MUST_FLAG,
+        'set -o -x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-set-minus-option-looking-operand-deferred',
+        MUST_FLAG,
+        'eval \'set -o -x\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-set-bundled-plus-other-name-then-enable',
+        MUST_FLAG,
+        'set +eo pipefail -x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-set-bundled-plus-other-name-then-enable-deferred',
+        MUST_FLAG,
+        'eval \'set +eo pipefail -x\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-set-unresolved-named-e-conservative',
+        MUST_FLAG,
+        'mode=-e; set -o "$mode" xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-set-unresolved-named-pipefail-conservative',
+        MUST_FLAG,
+        'mode=pipefail; set -o "$mode" xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-set-bundled-plus-no-enable',
+        MUST_NOT_FLAG,
+        'set +eo xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-set-bundled-plus-no-disable-credit',
+        MUST_FLAG,
+        'set -x; set +eo xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-set-bundled-plus-positional-stop',
+        MUST_NOT_FLAG,
+        'set +eo xtrace -- -x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-shopt-lone-dash-other-name',
+        MUST_NOT_FLAG,
+        'shopt -so - noclobber || :\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-shopt-lone-dash-query-only',
+        MUST_NOT_FLAG,
+        'shopt -o - xtrace || :\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-shopt-lone-dash-missing-o',
+        MUST_NOT_FLAG,
+        'shopt -s - xtrace || :\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-shopt-lone-dash-query-enable',
+        MUST_FLAG,
+        'shopt -soq - xtrace || :\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review2-shopt-lone-dash-name-list',
+        MUST_FLAG,
+        'shopt -so - xtrace noclobber || :\n: "$GH_TOKEN"\n',
+    ),
     # #1448 current-head feedback: query flags, unknown prefixes and -o boundaries.
     (
         'xtrace-review-shopt-query-q-enables',
@@ -8268,6 +8424,39 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    'xtrace-review2-set-unresolved-next-name-conservative': (
+        "The unresolved set -o word could be an option, so the next literal "
+        "name retains the parent's operand boundary and the following -x "
+        "is conservatively visible. This sampled pipefail value makes that "
+        "same literal name positional input and does not enable tracing "
+        "at runtime; there is no option-value dataflow (#1448)."
+    ),
+    'xtrace-review2-set-unresolved-next-name-conservative-deferred': (
+        "The same unresolved set -o operand conservatism reaches the shared "
+        "detector through literal eval source. This sampled runtime name "
+        "ends option processing before -x, while a sampled -x value really "
+        "does trace; the scanner retains both possibilities (#1448)."
+    ),
+
+    'xtrace-review2-set-unresolved-named-e-conservative': (
+        "An unresolved set -o operand can be another option. Retaining the "
+        "parent scanner's next literal xtrace evidence conservatively flags "
+        "this sampled -e value, which Bash treats as the named errexit option "
+        "and does not trace. No runtime option dataflow is inferred (#1448)."
+    ),
+    'xtrace-review2-set-unresolved-named-pipefail-conservative': (
+        "An unresolved set -o operand can be another option. Retaining the "
+        "parent scanner's next literal xtrace evidence conservatively flags "
+        "this sampled pipefail name, after which xtrace is positional data. "
+        "No runtime option dataflow is inferred (#1448)."
+    ),
+    'xtrace-review2-set-bundled-plus-no-disable-credit': (
+        "The bundled +o xtrace name is consumed so later enabling options "
+        "remain visible, but this enabling repair grants no new bundled "
+        "disable credit. Bash disables actual tracing in this sampled "
+        "command; the scanner conservatively retains prior state (#1448)."
+    ),
+
     "xtrace-review-shopt-unresolved-conflict": (
         "An unresolved shopt prefix retains a later literal -s/-o enable "
         "possibility without value dataflow. This sample resolves it to -u, "
