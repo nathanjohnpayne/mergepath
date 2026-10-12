@@ -80,6 +80,13 @@ if [ "$SOURCE_KIND" = issue-comment ] && [ "$SOURCE_LOGIN" = 'github-actions[bot
   exit 0
 fi
 
+# Actions cannot be enrolled as a reviewer. After the exact restoration path
+# above, unrelated issue-comment text has nothing to archive regardless of
+# registry state; it must not turn an otherwise inert event into a failure.
+if [ "$SOURCE_KIND" = issue-comment ] && [ "$SOURCE_LOGIN" = 'github-actions[bot]' ]; then
+  exit 0
+fi
+
 feedback_archive_registry_load "${CONFIG:-$SCRIPT_DIR/../.github/review-policy.yml}" || exit 2
 
 # Authorize before classifying or encoding a candidate-controlled prior body.

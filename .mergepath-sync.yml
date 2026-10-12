@@ -1292,6 +1292,11 @@ paths:
     consumers: all
     requires:
       - "scripts/workflow/feedback-archive-relay-source.sh"
+      - "scripts/lib/gh-api-array.sh"   # trusted fallback download and resolver startup
+      - "scripts/render-feedback-archive.sh"
+      - "scripts/lib/feedback-archive-identities.sh"   # extracted relay writer sources both helpers
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - ".github/workflows/codex-feedback-archive-relay.yml"
   # Exercises the inline phase-1 publisher step with one-page HTTP fixtures:
   # exact first-attempt deduplication plus every fail-closed fallback (#1130).
   - path: tests/test_required_check_publisher_dedup.sh

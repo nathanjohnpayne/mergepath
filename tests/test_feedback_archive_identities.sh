@@ -278,6 +278,20 @@ for damage in missing malformed invalid-yaml; do
     malformed) printf 'feedback_archive: {identities: invalid}\n' >"$TMP/producer/.github/review-policy.yml" ;;
     invalid-yaml) printf 'feedback_archive: [\n' >"$TMP/producer/.github/review-policy.yml" ;;
   esac
+  # The paired renderer calls prove damaged enrollment cannot change either
+  # the restoration result or the inert result for unrelated Actions text.
+  out=$(CONFIG="$TMP/producer/.github/review-policy.yml" "$ROOT/scripts/render-feedback-archive.sh" issue-comment 8 'github-actions[bot]' 2026-10-11T02:00:00Z "$TMP/restoration")
+  check test "$out" = "$record"
+  printf '**P1** Actions narration is not an enrolled review.\n' >"$TMP/actions-narration"
+  rc=0
+  out=$(CONFIG="$TMP/producer/.github/review-policy.yml" "$ROOT/scripts/render-feedback-archive.sh" issue-comment 8 'github-actions[bot]' 2026-10-11T02:00:00Z "$TMP/actions-narration") || rc=$?
+  check test "$rc" = 0
+  check test -z "$out"
+  printf '<!-- mergepath-feedback-archive:v1 AA== -->\n' >"$TMP/invalid-actions-record"
+  rc=0
+  out=$(CONFIG="$TMP/producer/.github/review-policy.yml" "$ROOT/scripts/render-feedback-archive.sh" issue-comment 8 'github-actions[bot]' 2026-10-11T02:00:00Z "$TMP/invalid-actions-record") || rc=$?
+  check test "$rc" = 2
+  check test -z "$out"
   jq -n --arg prior "$record" '{action:"deleted",issue:{number:7},comment:{id:8,user:{login:"github-actions[bot]"},body:$prior,updated_at:"2026-10-11T02:00:00Z"}}' >"$TMP/event"
   : >"$TMP/output"; : >"$TMP/api-calls"; rm -f "$TMP/native-post"
   (cd "$TMP/producer" && env PATH="$TMP/bin:$PATH" GH_TOKEN=fake-offline GH_CALL_LOG="$TMP/api-calls" GH_NATIVE_RESTORE=true NATIVE_POST_FILE="$TMP/native-post" \
@@ -293,6 +307,19 @@ for damage in missing malformed invalid-yaml; do
     GITHUB_EVENT_PATH="$TMP/fresh-event" GITHUB_OUTPUT="$TMP/output" RUNNER_TEMP="$TMP" SOURCE_RUN_ID=42 GITHUB_RUN_ID=42 bash "$TMP/producer.sh") >"$TMP/fresh-$damage.log" 2>&1 || rc=$?
   check test "$rc" != 0
   check test ! -e "$TMP/native-post"
+  for action in edited deleted; do
+    jq -n --arg action "$action" --rawfile prior "$TMP/actions-narration" '{action:$action,issue:{number:7},comment:{id:8,user:{login:"github-actions[bot]"},body:$prior,updated_at:"2026-10-11T02:00:00Z"},changes:{body:{from:$prior}}}' >"$TMP/event"
+    : >"$TMP/output"; : >"$TMP/api-calls"
+    rc=0
+    (cd "$TMP/producer" && env PATH="$TMP/bin:$PATH" GH_TOKEN=fake-offline GH_CALL_LOG="$TMP/api-calls" GH_NATIVE_RESTORE=true NATIVE_POST_FILE="$TMP/native-post" \
+      CONFIG="$TMP/producer/.github/review-policy.yml" REPO=acme/widget EVENT_NAME=issue_comment EVENT_ACTION="$action" \
+      GITHUB_EVENT_PATH="$TMP/event" GITHUB_OUTPUT="$TMP/output" RUNNER_TEMP="$TMP" SOURCE_RUN_ID=42 GITHUB_RUN_ID=42 bash "$TMP/producer.sh") >"$TMP/narration-$damage-$action.log" 2>&1 || rc=$?
+    check test "$rc" = 0
+    check test ! -e "$TMP/native-post"
+    check grep -Fq 'requires_relay=false' "$TMP/output"
+    check test "$(wc -l <"$TMP/api-calls" | tr -d ' ')" = 1
+    check grep -Fq 'repos/acme/widget/pulls/7' "$TMP/api-calls"
+  done
 done
 # Archive-time GHAS failed-read and successful markerless-read behavior is
 # exercised through the actual producer, preserving its one-shot API lookup.

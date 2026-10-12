@@ -2099,6 +2099,62 @@ echo "$output" | grep -q "requires-closure gate" \
 echo "PASS: templated closure comparison fails closed on staged blob read failure (#1058)"
 
 
+# #1437: run the actual path-filtered sync with the live relay-test manifest
+# row. Global path coverage does not protect a consumer carrying older helper
+# versions; each dependency needs a direct edge on this selected test target.
+relay_target=tests/test_feedback_archive_relay_source.sh
+relay_deps=(
+  scripts/workflow/feedback-archive-relay-source.sh
+  scripts/lib/gh-api-array.sh
+  scripts/render-feedback-archive.sh
+  scripts/lib/feedback-archive-identities.sh
+  scripts/lib/feedback-policy-helpers.sh
+  .github/workflows/codex-feedback-archive-relay.yml
+)
+relay_manifest_backup="$req_workdir/pre-relay-manifest.yml"
+cp "$REQ_MP/.mergepath-sync.yml" "$relay_manifest_backup"
+RELAY_TARGET="$relay_target" yq -o=json '.paths[] | select(.path == strenv(RELAY_TARGET))' "$ROOT/.mergepath-sync.yml" >"$req_workdir/relay-entry.json"
+RELAY_ENTRY="$req_workdir/relay-entry.json" yq -i '.paths += [load(strenv(RELAY_ENTRY))]' "$REQ_MP/.mergepath-sync.yml"
+for dep in "${relay_deps[@]}"; do
+  mkdir -p "$(dirname "$REQ_MP/$dep")"
+  cp "$ROOT/$dep" "$REQ_MP/$dep"
+  RELAY_DEP="$dep" yq -i '.paths += [{"path":strenv(RELAY_DEP),"type":"canonical","consumers":"all"}]' "$REQ_MP/.mergepath-sync.yml"
+done
+mkdir -p "$REQ_MP/tests"
+cp "$ROOT/$relay_target" "$REQ_MP/$relay_target"
+git -C "$REQ_MP" add -A
+git -C "$REQ_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m 'relay archive fixture'
+for state in missing stale current; do
+  for dep in "${relay_deps[@]}"; do
+    remote="$req_workdir/relay-$state-$(basename "$dep").git"
+    seed="$req_workdir/relay-$state-$(basename "$dep")-seed"
+    req_setup_remote "$remote" "$seed"
+    for current in "${relay_deps[@]}"; do
+      mkdir -p "$(dirname "$seed/$current")"
+      cp "$REQ_MP/$current" "$seed/$current"
+    done
+    case "$state" in
+      missing) rm "$seed/$dep" ;;
+      stale) printf '\n# stale consumer version\n' >>"$seed/$dep" ;;
+    esac
+    req_push_seed "$remote" "$seed"
+    run_id="relay-$state-$(basename "$dep")"
+    set +e
+    output=$(req_run_sync_all "$run_id" "$remote" "$relay_target")
+    set -e
+    if [ "$state" = current ]; then
+      [ -f "$REQ_CAPTURE/pr-title-$run_id.txt" ] || fail "current relay dependencies did not permit the test sync: $output"
+      echo "PASS: relay-test sync accepts current runtime dependencies"
+      break
+    fi
+    echo "$output" | grep -q 'requires-closure gate' || fail "relay-test sync accepted $state dependency $dep: $output"
+    echo "$output" | grep -Fq "$dep" || fail "relay-test sync did not name $state dependency $dep: $output"
+    [ ! -f "$REQ_CAPTURE/pr-title-$run_id.txt" ] || fail "relay-test sync opened a PR with $state dependency $dep"
+    echo "PASS: relay-test sync blocks $state dependency $dep"
+  done
+done
+mv "$relay_manifest_backup" "$REQ_MP/.mergepath-sync.yml"
+
 # ===========================================================================
 # .github/workflows/weekly-drift-audit.yml — bounded tracking-issue body (#988)
 # ===========================================================================
