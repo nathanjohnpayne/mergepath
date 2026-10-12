@@ -260,8 +260,11 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     (`_DEFERRED_SHELL_DEPTH`), and a discovery error inside the deferred text
     is REPORTED rather than dropped, for the reason an unterminated here-doc
     is. Known or conservatively retained active tracing at the enclosing
-    segment initializes the literal operand scan; its own unconditional
-    disables still apply. This is not call-time analysis of earlier
+    segment initializes the literal operand scan. Inner disables receive only
+    the existing standalone top-level disable credit; untraced references and
+    references after a credited disable gain no xtrace finding from this
+    bridge. Existing output-path analysis and command-boundary conservatism
+    still apply. This is not call-time analysis of earlier
     function/trap definitions, and separately scanned sourced files do not
     inherit the caller state. An operand that does not reduce to a literal
     is not re-read; `trap`
