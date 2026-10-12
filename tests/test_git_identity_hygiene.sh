@@ -578,6 +578,47 @@ else
   fail "non-value token after the key: rc=$RC out=$OUT"
 fi
 
+# Case 22b: one literal post-key > / >> target is shell data, not the
+# assignment value. Use the real production index without root/suite
+# overrides; the copied hub suite stays present but marker-gated.
+REDIRECT_CONSUMER="$WORKDIR/consumer-redirection"
+mkdir -p "$REDIRECT_CONSUMER/scripts/ci" "$REDIRECT_CONSUMER/tests"
+git init -q -b main "$REDIRECT_CONSUMER"
+cp "$CHECK" "$REDIRECT_CONSUMER/scripts/ci/check_git_identity_hygiene"
+cp "$ROOT/tests/test_git_identity_hygiene.sh" "$REDIRECT_CONSUMER/tests/"
+cp "$REDIRECT_CONSUMER/.git/config" "$WORKDIR/redirection-config-before"
+while IFS='|' read -r EXPECTED LABEL SOURCE; do
+  rm -f "$REDIRECT_CONSUMER/source.sh" "$REDIRECT_CONSUMER/source.md"
+  REDIRECT_REL=source.sh
+  [[ "$SOURCE" != \`* ]] || REDIRECT_REL=source.md
+  printf '%s\n' "$SOURCE" > "$REDIRECT_CONSUMER/$REDIRECT_REL"
+  git -C "$REDIRECT_CONSUMER" add -A
+  set +e
+  OUT="$(bash "$REDIRECT_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+  set -e
+  if [ "$RC" = "$EXPECTED" ] \
+    && { [ "$EXPECTED" = 0 ] || [[ "$OUT" == *"$REDIRECT_REL:1:"* ]]; } \
+    && { [ "$EXPECTED" = 1 ] || [[ "$OUT" == *"regression test suite skipped (consumer checkout"* ]]; } \
+    && cmp -s "$WORKDIR/redirection-config-before" "$REDIRECT_CONSUMER/.git/config"; then
+    pass "literal post-key redirection: $LABEL"
+  else
+    fail "post-key redirection $LABEL: expected=$EXPECTED rc=$RC out=$OUT"
+  fi
+done <<'REDIRECT_CASES'
+1|adjacent output target before value|git config user.email >/dev/null leak@example.com
+1|spaced append target before value|git config user.email >> /dev/null leak@example.com
+1|paired key and target quoting|git config "User.Email" >"sink path" leak@example.com
+1|target option text cannot scope the write|git config user.email >--global leak@example.com
+1|Markdown code span retains the writer|`git config commit.gpgsign > /dev/null false`
+0|explicit read selector remains a read|git config --get user.email > /dev/null
+0|redirection target alone is not a value|git config user.email >> "sink path"
+0|scoped fixture identity setup remains allowed|git -C "$FIX" config user.email >/dev/null fixture@example.com; git config --global user.name >> /dev/null "Real Human"
+0|owning shell-comment exemption remains allowed|git config user.email >/dev/null fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: deliberate fixture
+0|Markdown placeholder stays outside the value grammar|`git config user.email <addr>`
+0|expansion target gains no coverage guarantee|git config user.email >"$SINK" leak@example.com
+0|multiple redirections gain no coverage guarantee|git config user.email >/dev/null >>sink leak@example.com
+REDIRECT_CASES
+
 # Case 23: case 19 in Markdown. A prose sentence carries no shell
 # separator, so the whole paragraph arrives as ONE piece and a `--global`
 # example waves through the forbidden example standing beside it. That

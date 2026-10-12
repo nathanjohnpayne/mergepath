@@ -1578,6 +1578,17 @@ scan_unscoped_identity_writes() {
           # user.email)` has nothing after the key and never matches.
           rest = substr(s, end + 1)
           sub(/^[[:space:]]+/, "", rest)
+          # Skip only one literal output redirection and complete target.
+          # The target is data, never a value or an option-region word.
+          # Expansion syntax and other redirection operators gain no model.
+          if (rest ~ /^>/) {
+            sub(/^>>?[[:space:]]*/, "", rest)
+            end = word_end(rest, 1)
+            word = substr(rest, 1, end - 1)
+            if (dequote_word(word) == "" || word ~ /[$`*?\[\]{}]/ || word ~ /^[#&|~]/) return 0
+            rest = substr(rest, end)
+            sub(/^[[:space:]]+/, "", rest)
+          }
           if (rest == "" || rest ~ /^[#`)<>]/) return 0
           if (rest ~ /^\\[[:space:]]*$/) return 0
           return start
