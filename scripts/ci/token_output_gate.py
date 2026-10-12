@@ -3718,7 +3718,9 @@ def _segment_sets_xtrace(seg):
                 i += 1
                 break
             if word is None:
-                return None
+                # Its value is unresolved; retain later literal enable flags.
+                i += 1
+                continue
             if not word.startswith("-"):
                 break
             if word == "-" or set(word[1:]) - set("opqsu"):
@@ -3727,7 +3729,7 @@ def _segment_sets_xtrace(seg):
             i += 1
         # Only enabling forms are added. Query/disable modes never acquire
         # new disable credit; the existing logical-line asymmetry remains.
-        if {"s", "o"} <= flags and not flags & {"u", "p", "q"}:
+        if {"s", "o"} <= flags and "u" not in flags:
             return True if "xtrace" in lits[i:] else None
         return None
     state = None
@@ -3754,10 +3756,13 @@ def _segment_sets_xtrace(seg):
             # A named -o consumes the next word even inside a short bundle.
             # Restrict new recognition to supported set option letters.
             if "o" in a[1:] and not set(a[1:]) - set("abefhkmnptuvxBCEHPTo"):
-                if i + 1 < len(lits) and lits[i + 1] == "xtrace":
-                    state = True
-                i += 2
-                continue
+                nxt = lits[i + 1] if i + 1 < len(lits) else None
+                if nxt is not None and not nxt.startswith(("-", "+")):
+                    if nxt == "xtrace":
+                        state = True
+                    i += 2
+                    continue
+                # Without a named operand, a following flag remains an option.
         elif a.startswith("+"):
             if "x" in a[1:]:
                 state = False  # Existing +x semantics, no new bundled +o credit.
@@ -7504,6 +7509,77 @@ CORPUS = [
         "read x <<$'EOF'\nnothing\nEOF\necho ok\n",
     ),
     # #1448: shared direct/deferred bundled trace-option detector.
+    # #1448 current-head feedback: query flags, unknown prefixes and -o boundaries.
+    (
+        'xtrace-review-shopt-query-q-enables',
+        MUST_FLAG,
+        'shopt -sqo xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review-shopt-query-q-enables-deferred',
+        MUST_FLAG,
+        'eval \'shopt -sqo xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review-shopt-query-p-enables',
+        MUST_FLAG,
+        'shopt -spo xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review-shopt-query-p-enables-deferred',
+        MUST_FLAG,
+        'eval \'shopt -spo xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review-shopt-unresolved-q',
+        MUST_FLAG,
+        'mode=-q; shopt "$mode" -s -o xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review-shopt-unresolved-q-deferred',
+        MUST_FLAG,
+        'eval \'mode=-q; shopt "$mode" -s -o xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review-set-next-short-option',
+        MUST_FLAG,
+        'set -euo -x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review-set-next-short-option-deferred',
+        MUST_FLAG,
+        'eval \'set -euo -x\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review-set-next-named-option',
+        MUST_FLAG,
+        'set -eo -o xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review-set-next-named-option-deferred',
+        MUST_FLAG,
+        'eval \'set -eo -o xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review-shopt-query-only-q',
+        MUST_NOT_FLAG,
+        'shopt -qo xtrace || :\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review-shopt-conflicting-unset',
+        MUST_NOT_FLAG,
+        'shopt -suo xtrace || :\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review-shopt-unresolved-conflict',
+        MUST_FLAG,
+        'mode=-u; shopt "$mode" -s -o xtrace || :\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review-set-named-then-short-option',
+        MUST_FLAG,
+        'set -eo pipefail -x\n: "$GH_TOKEN"\n',
+    ),
     (
         'xtrace-bundle-unresolved-existing-x',
         MUST_FLAG,
@@ -8192,6 +8268,13 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    "xtrace-review-shopt-unresolved-conflict": (
+        "An unresolved shopt prefix retains a later literal -s/-o enable "
+        "possibility without value dataflow. This sample resolves it to -u, "
+        "which conflicts at runtime and emits no credential; the scanner "
+        "intentionally does not use that sampled value to prove a clean path "
+        "(#1448 finding 4243877249)."
+    ),
     "xtrace-bundle-shopt-disable-conservative": "This enabling-spelling repair preserves prior shopt disable handling: it never grants new disable credit or expands the conditional/function-local disable contract.",
     'helper-redefinitions-direct-later-emitter': (
         "Every recognized emitting body promotes its helper name; this safe "
