@@ -1871,9 +1871,10 @@ scan_unscoped_identity_writes() {
       # Preserve source on a miss; complete shell words still decide.
       return s
     }
-    # One-hop recognition only: literal bash/sh, first standalone -c and
-    # one complete literal command-string word. Ordinary argv stays opaque.
-    function shell_c_source(s,   i, end, word, value) {
+    # One-hop recognition only: supported literal shells, optional literal
+    # wrapper and short options through a word ending in c. Wrapper options,
+    # runtime words and ordinary argv stay opaque.
+    function shell_c_source(s,   i, end, word, value, wrapper, shell) {
       shell_c_valid = 0; i = 1
       while (i <= length(s)) {
         while (substr(s, i, 1) ~ /[[:space:]()]/) i++
@@ -1881,11 +1882,31 @@ scan_unscoped_identity_writes() {
         if (word !~ /^[A-Za-z_][A-Za-z0-9_]*=/) break
       }
       value = literal_word(word)
-      if (!literal_valid || value !~ /(^|\/)(bash|sh)$/) return ""
-      while (substr(s, i, 1) ~ /[[:space:]]/) i++
-      end = word_end(s, i); word = substr(s, i, end - i); i = end
-      value = literal_word(word)
-      if (!literal_valid || value != "-c") return ""
+      if (!literal_valid) return ""
+      if (value ~ /^(sudo|env|exec|command|nohup)$/) {
+        wrapper = value
+        do {
+          while (substr(s, i, 1) ~ /[[:space:]]/) i++
+          end = word_end(s, i); word = substr(s, i, end - i); i = end
+          value = literal_word(word)
+          if (!literal_valid) return ""
+        } while (wrapper == "env" && value ~ /^[A-Za-z_][A-Za-z0-9_]*=/)
+      }
+      if (value !~ /(^|\/)(sh|bash|zsh|ksh|dash|ash|mksh)$/) return ""
+      shell = value; sub(/^.*\//, "", shell)
+      while (1) {
+        while (substr(s, i, 1) ~ /[[:space:]]/) i++
+        end = word_end(s, i); word = substr(s, i, end - i); i = end
+        value = literal_word(word)
+        if (!literal_valid || value !~ /^-[A-Za-z]+$/) return ""
+        # Named-option operands are data. Do not interpret their following
+        # word as a command string, including inside an apparent c bundle.
+        if (index(value, "o") || (shell == "bash" && index(value, "O"))) return ""
+        if (value ~ /c$/) break
+        # A nonterminal c may already consume a command string; do not
+        # infer additional shell option grammar or re-enter its data.
+        if (index(value, "c")) return ""
+      }
       while (substr(s, i, 1) ~ /[[:space:]]/) i++
       end = word_end(s, i); word = substr(s, i, end - i)
       if (word == "") return ""
@@ -2122,6 +2143,24 @@ scan_unscoped_identity_writes() {
       }
       return out
     }
+    # A missing quote marker can continue an open paragraph lazily. Block
+    # starters keep their existing boundary rather than inheriting a span.
+    function markdown_lazy_quote(s,   rest, width, marker) {
+      if (!paragraph || fence_char != "" || s ~ /^[ \t]*$/) return 0
+      sub(/^ ? ? ?/, "", s)
+      if (s ~ /^#{1,6}([ \t]|$)/ || s ~ /^[-=]+[ \t]*$/ ||
+          s ~ /^((\*[ \t]*){3,}|(-[ \t]*){3,}|(_[ \t]*){3,})$/) return 0
+      if (match(s, /^(`{3,}|~{3,})/)) {
+        rest = substr(s, RLENGTH + 1)
+        if (substr(s, 1, 1) == "~" || index(rest, "`") == 0) return 0
+      }
+      if (match(s, /^([-+*]|[0-9]{1,9}[.)])( +|$)/)) {
+        width = RLENGTH; match(s, /^([-+*]|[0-9]{1,9}[.)])/); marker = substr(s, 1, RLENGTH)
+        if (substr(s, width + 1) !~ /^[ \t]*$/ &&
+            (marker ~ /^[-+*]$/ || marker + 0 == 1)) return 0
+      }
+      return 1
+    }
     function markdown_html_context(s,   c, width, rest, was_fenced, path, frames, n, i, indented, marker_width) {
       markdown_inline_reset = 0
       sub(/\r$/, "", s)
@@ -2132,12 +2171,14 @@ scan_unscoped_identity_writes() {
       n = split(container_path, frames, " "); path = ""
       for (i = 1; i <= n; i++) {
         if (frames[i] == ">") {
-          if (!match(s, /^ ? ? ?> ?/)) break
-          s = substr(s, RLENGTH + 1)
+          if (match(s, /^ ? ? ?> ?/)) s = substr(s, RLENGTH + 1)
+          else if (!markdown_lazy_quote(s)) break
         } else {
           match(s, /^ */)
           if (RLENGTH >= frames[i]) s = substr(s, frames[i] + 1)
-          else if (s !~ /^[[:space:]]*$/) break
+          # Quoted paragraphs can omit both quote markers and list indent.
+          else if (s !~ /^[[:space:]]*$/ &&
+              (container_path !~ />/ || !markdown_lazy_quote(s))) break
         }
         path = path frames[i] " "
       }

@@ -3695,6 +3695,24 @@ done
 for SOURCE in \
   "bash -c 'git config user.email fixture@example.invalid'" \
   "sh -c 'git config user.email fixture@example.invalid'" \
+  "sudo bash -c 'git config user.email fixture@example.invalid'" \
+  "env bash -c 'git config user.email fixture@example.invalid'" \
+  "env NAME=literal OTHER='literal value' bash -xc 'git config user.email fixture@example.invalid'" \
+  "exec bash -c 'git config user.email fixture@example.invalid'" \
+  "command bash -c 'git config user.email fixture@example.invalid'" \
+  "nohup bash -c 'git config user.email fixture@example.invalid'" \
+  "bash -ec 'git config user.email fixture@example.invalid'" \
+  "bash -e -c 'git config user.email fixture@example.invalid'" \
+  "bash -x -e -c 'git config user.email fixture@example.invalid'" \
+  "zsh -c 'git config user.email fixture@example.invalid'" \
+  "zsh -O -c 'git config user.email fixture@example.invalid'" \
+  "zsh -Oc 'git config user.email fixture@example.invalid'" \
+  "ksh -c 'git config user.email fixture@example.invalid'" \
+  "dash -c 'git config user.email fixture@example.invalid'" \
+  "ash -c 'git config user.email fixture@example.invalid'" \
+  "mksh -c 'git config user.email fixture@example.invalid'" \
+  "/bin/zsh -c 'git config user.email fixture@example.invalid'" \
+  "bash -lc 'git config user.email fixture@example.invalid'" \
   '/bin/bash -c "git config user.email fixture@example.invalid"' \
   "'sh' '-c' 'git config user.email fixture@example.invalid'" \
   "bash -c 'git config --global user.email allowed@example.invalid; git config user.name Fixture'" \
@@ -3704,7 +3722,7 @@ for SOURCE in \
     TEXT="$SOURCE"; [[ "$REL" != *.md ]] || TEXT="\`$SOURCE\`"
     run_on_fixture "$REL" "$TEXT
 "
-    if [ "$RC" = 1 ]; then pass "one-hop literal bash/sh standalone -c writer caught"; else
+    if [ "$RC" = 1 ]; then pass "one-hop literal supported shell command-string writer caught"; else
       fail "literal shell command hidden: source='$SOURCE' rel=$REL rc=$RC out=$OUT"
     fi
     run_on_fixture "$REL" "$TEXT # GIT_IDENTITY_SCOPE_EXEMPT: owning isolated fixture
@@ -3716,11 +3734,24 @@ for SOURCE in \
 done
 for SOURCE in \
   "printf '%s' 'git config user.email fixture@example.invalid'" \
+  "grep -c 'git config user.email fixture@example.invalid' file" \
   'bash -c "$COMMAND"' \
   'bash -c "git config user.email $EMAIL"' \
   '$SHELL -c '\''git config user.email fixture@example.invalid'\''' \
-  "zsh -c 'git config user.email fixture@example.invalid'" \
-  "bash -lc 'git config user.email fixture@example.invalid'" \
+  "sudo -u somebody bash -c 'git config user.email fixture@example.invalid'" \
+  "env -u NAME bash -c 'git config user.email fixture@example.invalid'" \
+  'env NAME="$VALUE" bash -c '\''git config user.email fixture@example.invalid'\''' \
+  "bash -ce 'git config user.email fixture@example.invalid'" \
+  "bash -o errexit -c 'git config user.email fixture@example.invalid'" \
+  "bash -o -c 'git config user.email fixture@example.invalid'" \
+  "bash -O -c 'git config user.email fixture@example.invalid'" \
+  "bash -oc 'git config user.email fixture@example.invalid'" \
+  "bash -Oc 'git config user.email fixture@example.invalid'" \
+  "zsh -o -c 'git config user.email fixture@example.invalid'" \
+  "zsh -oc 'git config user.email fixture@example.invalid'" \
+  "eval 'git config user.email fixture@example.invalid'" \
+  "ssh host 'git config user.email fixture@example.invalid'" \
+  "docker exec container sh -c 'git config user.email fixture@example.invalid'" \
   "bash --noprofile -c 'git config user.email fixture@example.invalid'" \
   "bash -c 'git -C fixture config user.email fixture@example.invalid'" \
   "bash -c 'git config --global user.email fixture@example.invalid'" \
@@ -3887,12 +3918,19 @@ cp "$CHECK" "$LITERAL_CONSUMER/scripts/ci/check_git_identity_hygiene"
 cp "$ROOT/tests/test_git_identity_hygiene.sh" "$LITERAL_CONSUMER/tests/"
 cp "$LITERAL_CONSUMER/.git/config" "$WORKDIR/literal-config-before"
 LITERAL_PHYSICAL_ROOT="$(cd "$LITERAL_CONSUMER" && pwd -P)"
-for CONTROL in prose opener shell-c escaped-opener negative-selector override-global override-system quoted-data runtime option-data ordinary-global explicit-file absolute-override runtime-glob literal-glob; do
+for CONTROL in prose opener shell-c lazy-quote wrapper-sudo wrapper-env bundled-shell separate-shell zsh-shell grep-data escaped-opener negative-selector override-global override-system quoted-data runtime option-data ordinary-global explicit-file absolute-override runtime-glob literal-glob; do
   REL=REVIEW_POLICY.md; EXPECTED=1
   case "$CONTROL" in
     prose) SOURCE='**git config user.email fixture@example.invalid**' ;;
     opener) SOURCE=$'Use `git config user.email fixture@example.invalid\n<!-- GIT_IDENTITY_SCOPE_EXEMPT: cited -->`' ;;
     shell-c) REL=literal.sh; SOURCE="bash -c 'git config user.email fixture@example.invalid'" ;;
+    lazy-quote) SOURCE=$'> Use `literal\ngit config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: cited -->`' ;;
+    wrapper-sudo) REL=literal.sh; SOURCE="sudo bash -c 'git config user.email fixture@example.invalid'" ;;
+    wrapper-env) REL=literal.sh; SOURCE="env NAME=literal bash -c 'git config user.email fixture@example.invalid'" ;;
+    bundled-shell) REL=literal.sh; SOURCE="bash -ec 'git config user.email fixture@example.invalid'" ;;
+    separate-shell) REL=literal.sh; SOURCE="bash -e -c 'git config user.email fixture@example.invalid'" ;;
+    zsh-shell) REL=literal.sh; SOURCE="zsh -c 'git config user.email fixture@example.invalid'" ;;
+    grep-data) REL=literal.sh; SOURCE="grep -c 'git config user.email fixture@example.invalid' file"; EXPECTED=0 ;;
     escaped-opener) SOURCE='\`literal then `code <!-- GIT_IDENTITY_SCOPE_EXEMPT: cited -->` run git config user.email fixture@example.invalid`' ;;
     negative-selector) REL=literal.sh; SOURCE='git config --list --no-li user.email fixture@example.invalid' ;;
     override-global) SOURCE='GIT_CONFIG_GLOBAL=.git/config git config --global user.email fixture@example.invalid' ;;
@@ -3913,12 +3951,63 @@ for CONTROL in prose opener shell-c escaped-opener negative-selector override-gl
   OUT="$(bash "$LITERAL_PHYSICAL_ROOT/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
   set -e
   if [ "$RC" = "$EXPECTED" ] \
-    && { [ "$EXPECTED" = 0 ] || [[ "$OUT" == *"$REL:1:"* ]]; } \
+    && { [ "$EXPECTED" = 0 ] || [[ "$OUT" == *"$REL:1:"* ]] || { [ "$CONTROL" = lazy-quote ] && [[ "$OUT" == *"$REL:2:"* ]]; }; } \
     && { [ "$EXPECTED" = 1 ] || [[ "$OUT" == *"regression test suite skipped (consumer checkout"* ]]; } \
     && cmp -s "$WORKDIR/literal-config-before" "$LITERAL_CONSUMER/.git/config"; then
     pass "real tracked-index literal repair/control: $CONTROL"
   else fail "tracked-index literal repair: $CONTROL expected=$EXPECTED rc=$RC out=$OUT"; fi
 done
+
+# Case 65aa1: omitted blockquote markers can lazily continue the same
+# paragraph. Complete equal-width spans still make cited markers data;
+# real comments and actual paragraph/block boundaries retain their scope.
+for PREFIX in '> ' '> > ' '- > ' '> - ' '> 1. > '; do
+  for CONTINUATION in '' '  '; do
+  for TICKS in '`' '``'; do
+    UNEQUAL='`'; [ "$TICKS" != '`' ] || UNEQUAL='``'
+    run_on_fixture docs/lazy-quote-citation.md "${PREFIX}Use ${TICKS}literal $UNEQUAL unequal run
+${CONTINUATION}git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: cited -->${TICKS}
+"
+    if [ "$RC" = 1 ] && [[ "$OUT" == *'docs/lazy-quote-citation.md:2:'* ]]; then
+      pass "lazy quote paragraph preserves complete equal-width span citation"
+    else fail "lazy quote cited marker cleared writer: prefix='$PREFIX' ticks='$TICKS' rc=$RC out=$OUT"; fi
+    run_on_fixture docs/lazy-quote-real-comment.md "${PREFIX}Use ${TICKS}literal
+${CONTINUATION}git config user.email fixture@example.invalid${TICKS} <!-- GIT_IDENTITY_SCOPE_EXEMPT: actual comment -->
+"
+    if [ "$RC" = 0 ]; then pass "real comment after lazily continued closed span remains valid"; else
+      fail "lazy quote rejected real outside comment: prefix='$PREFIX' ticks='$TICKS' rc=$RC out=$OUT"
+    fi
+  done
+  done
+done
+run_on_fixture docs/lazy-partial-quote.md $'> > Use `literal\n> git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: cited -->`\n'
+if [ "$RC" = 1 ]; then pass "partially omitted nested quote marker keeps cited marker inside span"; else
+  fail "partial lazy quote accepted citation: rc=$RC out=$OUT"
+fi
+for PREFIX in '> ' '- > ' '> - ' '> 1. > '; do
+  for BOUNDARY in '' '# heading' '---' '===' '- new item' '1. new item'; do
+  run_on_fixture docs/lazy-quote-boundary.md "${PREFIX}Use \`literal
+$BOUNDARY
+git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: actual comment -->\`
+"
+  if [ "$RC" = 0 ]; then pass "actual lazy-quote paragraph/block boundary preserves outside marker"; else
+    fail "lazy quote crossed boundary: boundary='$BOUNDARY' rc=$RC out=$OUT"
+  fi
+  done
+done
+for SOURCE in \
+  $'> Paragraph\ngit config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: actual comment -->' \
+  $'> Use `unmatched\ngit config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: actual comment -->'; do
+  run_on_fixture docs/lazy-quote-unmatched.md "$SOURCE
+"
+  if [ "$RC" = 0 ]; then pass "ordinary or unmatched lazy-quote prose retains real exemption"; else
+    fail "lazy quote unvalidated opener hid real exemption: rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture docs/lazy-quote-fence.md $'> Use `literal\n~~~bash\ngit config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->`\n'
+if [ "$RC" = 1 ]; then pass "actual fence interrupts lazy quote and keeps HTML code marker literal"; else
+  fail "lazy quote absorbed new fenced block: rc=$RC out=$OUT"
+fi
 
 # Case 65aa2: only one through nine digits form an ordered list marker.
 for ENDING in '.' ')'; do
