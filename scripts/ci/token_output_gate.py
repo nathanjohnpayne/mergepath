@@ -238,7 +238,12 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     quoting only dollar, backtick, backslash and newline. Quoted delimiters
     suppress body expansion. Actual backtick substitution bodies remove their
     source escape layer before the ordinary positional decision; modern
-    substitutions retain ordinary source. A helper is
+    substitutions retain ordinary source. Actual substitution source uses the
+    existing literal deferred-operand extractor within its one-hop budget.
+    Direct here-doc DATA promotes stdin consumers only; executable substitution
+    and error-word evidence remains independent of that owner. Helper inventory
+    stays conservative about captured/no-output source and does not infer
+    runtime emission. A helper is
     graded on what its body writes, not on where that write GOES, so a helper
     whose emitter feeds a pipe is treated as emitting -- declared conservatism
     below.
@@ -3458,9 +3463,19 @@ def discover_emitter_helpers(text):
                     if not hd.interpolating:
                         continue
                     cmd, _ = resolve_command(hd.owner)
-                    if cmd in STDIN_ECHOERS or cmd in EMITTERS:
-                        body = "\n".join(raw for _lno, raw in hd.body_lines)
+                    body = "\n".join(raw for _lno, raw in hd.body_lines)
+                    if cmd in STDIN_ECHOERS:
                         emits = _word_has_verbatim_positional(body, in_heredoc=True)
+                    else:
+                        # Direct stdin DATA is inert for argument emitters.
+                        # Actual substitutions still execute independently;
+                        # retain the existing conservative helper inventory.
+                        for inner, start, _end in _find_substitutions(body, quotes_are_literal=True):
+                            if body[start] == "`":
+                                inner = _backtick_positional_source(inner)
+                            if _heredoc_substitution_has_positional(inner):
+                                emits = True
+                                break
                     if emits:
                         break
             if emits:
@@ -3480,6 +3495,20 @@ def _backtick_positional_source(body):
     )
 
 
+def _heredoc_substitution_has_positional(body, _depth=0):
+    """Inventory actual substitution source within the existing deferred bound."""
+    if _word_has_verbatim_positional(body):
+        return True
+    if _depth >= _DEFERRED_SHELL_DEPTH:
+        return False
+    for ll in Lexer(body).logical:
+        for seg in ll.segments:
+            for inner in _deferred_shell_operands(seg):
+                if _heredoc_substitution_has_positional(inner, _depth + 1):
+                    return True
+    return False
+
+
 def _word_has_verbatim_positional(w, in_heredoc=False):
     """True when the word expands a positional parameter's VALUE.
 
@@ -3494,7 +3523,9 @@ def _word_has_verbatim_positional(w, in_heredoc=False):
     newlines before the shared positional decision; an escaped backslash
     pair stays intact and cannot turn the following newline into a join.
     Actual backtick bodies have their separate source-escape layer removed
-    before recursive ordinary reading; modern substitutions do not.
+    before recursive ordinary reading; modern substitutions do not. Actual
+    substitution bodies reuse the literal deferred-source reader within its
+    existing one-hop bound, without interpreting general parameter flow.
     """
     if in_heredoc:
         w = re.sub(
@@ -3535,7 +3566,8 @@ def _word_has_verbatim_positional_exact(w, in_heredoc=False):
             body = w[lo : end - 1 if closed else end]
             if c == "`" and in_heredoc:
                 body = _backtick_positional_source(body)
-            if _word_has_verbatim_positional_exact(body):
+            if (_heredoc_substitution_has_positional(body) if in_heredoc
+                    else _word_has_verbatim_positional_exact(body)):
                 return True
             i = end
             continue
@@ -3580,7 +3612,7 @@ def _word_has_verbatim_positional_legacy(w, in_heredoc=False):
             end = _skip_backtick(w, i)
             closed = end - 1 > i and w[end - 1] == "`"
             body = _backtick_positional_source(w[i + 1 : end - 1 if closed else end])
-            if _word_has_verbatim_positional(body):
+            if _heredoc_substitution_has_positional(body):
                 return True
             i = end
             continue
@@ -7428,6 +7460,31 @@ CORPUS = [
     ('helper-heredoc-backtick-2-backslashes', MUST_FLAG, 'die() { cat <<EOF >&2\n`printf \'%s\' \\\\$1`\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ('helper-heredoc-backtick-3-backslashes', MUST_NOT_FLAG, 'die() { cat <<EOF >&2\n`printf \'%s\' \\\\\\$1`\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ('helper-heredoc-backtick-4-backslashes', MUST_FLAG, 'die() { cat <<EOF >&2\n`printf \'%s\' \\\\\\\\$1`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    # #1496: deferred substitution source and stdin owner boundaries.
+    ('helper-hd-eval-positional', MUST_FLAG, 'die() { cat <<EOF\n$(eval \'echo $1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-backtick-eval-positional', MUST_FLAG, 'die() { cat <<EOF\n`eval \'echo $1\'`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-exit-trap-positional', MUST_FLAG, 'die() { cat <<EOF\n$(trap \'echo $1\' EXIT)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-backtick-trap-positional', MUST_FLAG, 'die() { cat <<EOF\n`trap \'echo $1\' EXIT`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-callback-positional', MUST_FLAG, 'die() { cat <<EOF\n$(mapfile -C \'echo $1;\' -c 1 rows < <(printf \'x\\n\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-eval-redacted-data-control', MUST_NOT_FLAG, 'die() { cat <<EOF\n$(eval \'echo ${1:+set}\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-eval-no-output-conservative', MUST_FLAG, 'die() { cat <<EOF\n$(eval \': $1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-substitution-quoted-data-control', MUST_NOT_FLAG, 'die() { cat <<EOF\n$(printf %s \'$1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-eval-quoted-delimiter-control', MUST_NOT_FLAG, 'die() { cat <<\'EOF\'\n$(eval \'echo $1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-eval-depth-two-boundary', MUST_NOT_FLAG, 'die() { cat <<EOF\n$(eval "eval \'echo \\$1\'")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-default-inert-body', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-echo-default-inert-body', MUST_NOT_FLAG, 'die() { echo safe <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-direct-inert-body', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-cat-default-emits-control', MUST_FLAG, 'die() { cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-default-emits-control', MUST_FLAG, 'die() { tee <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-independent-stderr-substitution', MUST_FLAG, 'die() { printf safe <<EOF\n$(echo "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-independent-error-word', MUST_FLAG, 'die() { printf safe <<EOF\n${UNSET:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-direct-argument-control', MUST_FLAG, 'die() { printf %s "$1" <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-quoted-delimiter-control', MUST_NOT_FLAG, 'die() { printf safe <<\'EOF\'\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-independent-deferred-stderr', MUST_FLAG, 'die() { printf safe <<EOF\n$(eval \'echo $1 >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-captured-deferred-stdout-conservative', MUST_FLAG, 'die() { printf safe <<EOF\n$(eval \'echo $1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-no-output-deferred-conservative', MUST_FLAG, 'die() { printf safe <<EOF\n$(eval \': $1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-captured-direct-stdout-conservative', MUST_FLAG, 'die() { printf safe <<EOF\n$(echo "$1")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-callback-data-control', MUST_NOT_FLAG, 'die() { cat <<EOF\n$(mapfile -C \'printf literal;\' -c 1 rows < <(printf \'x\\n\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
     # --- a credential NAME split by a line continuation ------------------
     #
     # Bash removes `\<newline>` before it parses the expansion, so these name
@@ -8004,6 +8061,12 @@ CORPUS.extend(_generated_corpus())
 # fails when an undeclared disagreement appears AND when a declared entry stops
 # disagreeing, so neither list can quietly rot.
 KNOWN_MISSES = {
+    "helper-hd-eval-depth-two-boundary": (
+        "Two deferred eval layers execute a positional emitter at runtime, "
+        "beyond the existing one-hop _DEFERRED_SHELL_DEPTH budget. This bounded "
+        "heredoc substitution reader preserves that explicit deferred-depth "
+        "limit rather than adding recursive execution modeling (#1496)."
+    ),
     "helper-adjacent-comment-unmatched-quotes": (
         "#2080 preexisting declaration-word lexer gap: without whitespace before "
         "an adjacent # comment, unmatched comment quotes hide the later "
@@ -8154,6 +8217,33 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    'helper-hd-printf-captured-deferred-stdout-conservative': (
+        "The helper inventories a positional in executable substitution "
+        "source, although this sampled source writes no output or its stdout "
+        "is captured into ignored stdin. Existing helper inventory does not "
+        "infer capture/pipeline runtime output; this conservatism is explicit "
+        "rather than weakening independent stderr evidence (#1496)."
+    ),
+    'helper-hd-printf-no-output-deferred-conservative': (
+        "The helper inventories a positional in executable substitution "
+        "source, although this sampled source writes no output or its stdout "
+        "is captured into ignored stdin. Existing helper inventory does not "
+        "infer capture/pipeline runtime output; this conservatism is explicit "
+        "rather than weakening independent stderr evidence (#1496)."
+    ),
+    'helper-hd-printf-captured-direct-stdout-conservative': (
+        "The helper inventories a positional in executable substitution "
+        "source, although this sampled source writes no output or its stdout "
+        "is captured into ignored stdin. Existing helper inventory does not "
+        "infer capture/pipeline runtime output; this conservatism is explicit "
+        "rather than weakening independent stderr evidence (#1496)."
+    ),
+    "helper-hd-eval-no-output-conservative": (
+        "The literal eval operand carries a positional value but the sampled "
+        "colon command writes nothing. Helper discovery inventories positional "
+        "source conservatively within the existing one-hop deferred budget; "
+        "it does not infer execution/output or pipeline effects (#1496)."
+    ),
     "helper-heredoc-backtick-2-backslashes": (
         "Two source backslashes leave an escaped positional in the runtime "
         "backtick program and the fake oracle is clean. Existing helper "
@@ -9038,6 +9128,38 @@ def _heredoc_backtick_positional_cases():
     return failures
 
 
+def _heredoc_deferred_positional_cases():
+    """Pin reuse, one-hop depth and stdin/substitution owner separation."""
+    failures = []
+    for body in ["eval 'echo $1'", "trap 'echo $1' EXIT", "mapfile -C 'echo $1;' -c 1 rows"]:
+        if not _heredoc_substitution_has_positional(body):
+            failures.append("heredoc deferred positional source lost: " + body)
+    for body in ["printf %s '$1'", "eval 'echo ${1:+set}'", "mapfile -C 'printf literal;' -c 1 rows"]:
+        if _heredoc_substitution_has_positional(body):
+            failures.append("heredoc deferred literal/redacted DATA promoted: " + body)
+    if not _heredoc_substitution_has_positional("eval ': $1'"):
+        failures.append("heredoc no-output source lost declared conservatism")
+    if _heredoc_substitution_has_positional('eval "eval \'echo \\$1\'"'):
+        failures.append("heredoc deferred source exceeded the one-hop budget")
+    if _heredoc_substitution_has_positional("eval 'echo $1'", _depth=_DEFERRED_SHELL_DEPTH):
+        failures.append("heredoc deferred boundary admitted another source hop")
+    for read in (_word_has_verbatim_positional_exact, _word_has_verbatim_positional_legacy):
+        if not read("`eval 'echo $1'`", in_heredoc=True):
+            failures.append("heredoc deferred reader seam lost: " + read.__name__)
+    def helper(owner, body):
+        return "die() { " + owner + " <<EOF\n" + body + "\nEOF\n}\n"
+    for owner in ["printf safe", "echo safe"]:
+        if "die" in discover_emitter_helpers(helper(owner, "${1:-unknown}")):
+            failures.append("inert heredoc DATA promoted argument emitter: " + owner)
+        for body in ['$(echo "$1" >&2)', "${UNSET:?$1}", "$(eval 'echo $1 >&2')"]:
+            if "die" not in discover_emitter_helpers(helper(owner, body)):
+                failures.append("independent heredoc source/error evidence lost: " + owner)
+    for owner in ["cat", "tee"]:
+        if "die" not in discover_emitter_helpers(helper(owner, "${1:-unknown}")):
+            failures.append("stdin heredoc positional lost: " + owner)
+    return failures
+
+
 def self_test():
     failures = []
     passed = 0
@@ -9047,6 +9169,7 @@ def self_test():
     failures.extend(_printf_allowlist_cases())
     failures.extend(_function_definition_cases())
     failures.extend(_heredoc_backtick_positional_cases())
+    failures.extend(_heredoc_deferred_positional_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
