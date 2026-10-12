@@ -3556,6 +3556,122 @@ for SOURCE in \
   fi
 done
 
+# Case 65aa1: equal-width spans retain marker-data context across physical
+# lines only inside the existing inline block. An unmatched opener is text.
+for SPAN in '`' '``' '```'; do
+  run_on_fixture docs/crossline-marker.md "Paragraph ${SPAN}marker citation
+<!-- GIT_IDENTITY_SCOPE_EXEMPT: cited data -->${SPAN} then \`git config user.email fixture@example.invalid\`
+"
+  if [ "$RC" = 1 ] && [[ "$OUT" == *"docs/crossline-marker.md:2:"* ]]; then
+    pass "crossline equal-width span cannot supply an HTML exemption"
+  else fail "crossline span cleared writer: span='$SPAN' rc=$RC out=$OUT"; fi
+  run_on_fixture docs/sameline-marker.md "Paragraph ${SPAN}<!-- GIT_IDENTITY_SCOPE_EXEMPT: cited data -->${SPAN} then \`git config user.email fixture@example.invalid\`
+"
+  if [ "$RC" = 1 ]; then pass "same-line cited marker remains data"; else
+    fail "same-line span cleared writer: span='$SPAN' rc=$RC out=$OUT"
+  fi
+  run_on_fixture docs/crossline-real-marker.md "Paragraph ${SPAN}marker citation
+<!-- GIT_IDENTITY_SCOPE_EXEMPT: cited data -->${SPAN} then \`git config user.email fixture@example.invalid\` <!-- GIT_IDENTITY_SCOPE_EXEMPT: genuine outside comment -->
+"
+  if [ "$RC" = 0 ]; then pass "genuine physical-line comment after closed crossline span exempts"; else
+    fail "genuine outside marker rejected: span='$SPAN' rc=$RC out=$OUT"
+  fi
+  run_on_fixture docs/unmatched-marker.md "Paragraph ${SPAN}unmatched opener
+Use git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: genuine outside comment -->
+"
+  if [ "$RC" = 0 ]; then pass "unmatched backtick opener cannot hide a genuine comment"; else
+    fail "unmatched opener consumed marker: span='$SPAN' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture docs/unequal-marker.md $'Paragraph ``unclosed wider opener\nUse git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: genuine comment -->`\n'
+if [ "$RC" = 0 ]; then pass "unequal delimiter runs do not close a span or hide genuine comment"; else
+  fail "unequal opener consumed genuine marker: rc=$RC out=$OUT"
+fi
+run_on_fixture docs/shorter-inner-run.md $'Paragraph ``marker citation with `shorter run\n<!-- GIT_IDENTITY_SCOPE_EXEMPT: cited data -->`` then `git config user.email fixture@example.invalid`\n'
+if [ "$RC" = 1 ]; then pass "shorter inner delimiter stays data in a crossline equal-width span"; else
+  fail "shorter inner run cleared writer: rc=$RC out=$OUT"
+fi
+for BOUNDARY in '' '# Heading' '---' '===' '```bash
+```' '> New container' '- New item'; do
+  run_on_fixture docs/span-boundary.md "Paragraph \`unmatched opener
+$BOUNDARY
+Use git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: genuine comment -->\`
+"
+  if [ "$RC" = 0 ]; then pass "inline span cannot cross existing block boundary"; else
+    fail "span crossed block boundary: boundary='$BOUNDARY' rc=$RC out=$OUT"
+  fi
+done
+for PREFIX in '> ' '- ' '> - '; do
+  case "$PREFIX" in
+    '> ') CONTINUATION='> ' ;;
+    '- ') CONTINUATION='  ' ;;
+    '> - ') CONTINUATION='>   ' ;;
+  esac
+  run_on_fixture docs/span-container.md "${PREFIX}Paragraph \`marker citation
+${CONTINUATION}<!-- GIT_IDENTITY_SCOPE_EXEMPT: cited data -->\` then \`git config user.email fixture@example.invalid\`
+"
+  if [ "$RC" = 1 ]; then pass "crossline span remains inside retained quote/list container"; else
+    fail "container span cleared writer: prefix='$PREFIX' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture docs/span-physical-scope.md $'Paragraph `citation\nclosed` then `git config user.email fixture@example.invalid` <!-- GIT_IDENTITY_SCOPE_EXEMPT: this physical line -->\nUse git config user.name fixture\n'
+if [ "$RC" = 1 ] && [[ "$OUT" == *"docs/span-physical-scope.md:3:"* ]] \
+  && [[ "$OUT" != *"  - docs/span-physical-scope.md:2:"* ]]; then
+  pass "crossline span preserves exact physical-line exemption scope"
+else fail "crossline marker widened line scope: rc=$RC out=$OUT"; fi
+
+run_on_fixture docs/fenced-logical-span.md $'```bash\n`git \\\nconfig user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: cited inside logical backticks`\n```\n'
+if [ "$RC" = 1 ]; then pass "fenced logical command retains original paired-backtick exemption cut"; else
+  fail "fenced logical span gained an exemption: rc=$RC out=$OUT"
+fi
+
+# Independently exercise tracked-index enumeration and the authentic
+# consumer suite skip, without either a fixture-root or suite override.
+SPAN_CONSUMER="$WORKDIR/consumer-crossline-spans"
+mkdir -p "$SPAN_CONSUMER/scripts/ci" "$SPAN_CONSUMER/tests"
+git init -q -b main "$SPAN_CONSUMER"
+cp "$CHECK" "$SPAN_CONSUMER/scripts/ci/check_git_identity_hygiene"
+cp "$ROOT/tests/test_git_identity_hygiene.sh" "$SPAN_CONSUMER/tests/"
+cp "$SPAN_CONSUMER/.git/config" "$WORKDIR/span-config-before"
+for CONTROL in crossline same-line genuine-comment; do
+  case "$CONTROL" in
+    crossline) SOURCE=$'Paragraph `citation\n<!-- GIT_IDENTITY_SCOPE_EXEMPT: cited data -->` then `git config user.email fixture@example.invalid`\n'; EXPECTED=1; HIT_LINE=2 ;;
+    same-line) SOURCE=$'Paragraph `<!-- GIT_IDENTITY_SCOPE_EXEMPT: cited data -->` then `git config user.email fixture@example.invalid`\n'; EXPECTED=1; HIT_LINE=1 ;;
+    genuine-comment) SOURCE=$'Paragraph `citation\nclosed` then `git config user.email fixture@example.invalid` <!-- GIT_IDENTITY_SCOPE_EXEMPT: genuine outside comment -->\n'; EXPECTED=0 ;;
+  esac
+  printf '%s' "$SOURCE" > "$SPAN_CONSUMER/REVIEW_POLICY.md"
+  git -C "$SPAN_CONSUMER" add -A
+  set +e
+  OUT="$(bash "$SPAN_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+  set -e
+  if [ "$RC" = "$EXPECTED" ] \
+    && { [ "$EXPECTED" = 0 ] || [[ "$OUT" == *"REVIEW_POLICY.md:$HIT_LINE:"* ]]; } \
+    && { [ "$EXPECTED" = 1 ] || [[ "$OUT" == *"regression test suite skipped (consumer checkout"* ]]; } \
+    && cmp -s "$WORKDIR/span-config-before" "$SPAN_CONSUMER/.git/config"; then
+    pass "real tracked-index span control: $CONTROL"
+  else fail "tracked-index span control: $CONTROL expected=$EXPECTED rc=$RC out=$OUT"; fi
+done
+
+# Case 65aa2: only one through nine digits form an ordered list marker.
+for ENDING in '.' ')'; do
+  for NUMBER in 123456789 1234567890; do
+    EXPECTED=1; [ "$NUMBER" != 1234567890 ] || EXPECTED=0
+    INDENT="$(printf '%*s' "$((${#NUMBER} + 2))" '')"
+    run_on_fixture docs/ordered-width.md "$NUMBER$ENDING \`\`\`bash
+${INDENT}git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal if valid list fence -->
+"
+    if [ "$RC" = "$EXPECTED" ]; then pass "ordered marker width boundary: $NUMBER$ENDING"; else
+      fail "ordered width wrong: marker=$NUMBER$ENDING expected=$EXPECTED rc=$RC out=$OUT"
+    fi
+    run_on_fixture docs/ordered-width-unexempted.md "$NUMBER$ENDING \`\`\`bash
+${INDENT}git config user.email fixture@example.invalid
+"
+    if [ "$RC" = 1 ]; then pass "ordered width control retains unexempted writer"; else
+      fail "ordered width hid writer: marker=$NUMBER$ENDING rc=$RC out=$OUT"
+    fi
+  done
+done
+
 # Case 65ab: only ordered start 1 can interrupt an open paragraph.
 for NUMBER in 0 2 3 10; do
   ORDERED_INDENT="$(printf '%*s' "$((${#NUMBER} + 2))" '')"

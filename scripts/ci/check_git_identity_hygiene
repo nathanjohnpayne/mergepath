@@ -2024,6 +2024,7 @@ scan_unscoped_identity_writes() {
       return out
     }
     function markdown_html_context(s,   c, width, rest, was_fenced, path, frames, n, i, indented, marker_width) {
+      markdown_inline_reset = 0
       sub(/\r$/, "", s)
       s = markdown_tab_columns(s)
       # Preserve container ORDER: each frame is a quote marker or a list
@@ -2050,20 +2051,20 @@ scan_unscoped_identity_writes() {
           if (s ~ /^ ? ? ?((\*[ \t]*){3,}|(-[ \t]*){3,}|(_[ \t]*){3,})$/) break
           if (match(s, /^ ? ? ?> ?/)) {
             path = path "> "; width = RLENGTH
-          } else if (match(s, /^ ? ? ?([-+*]|[0-9]+[.)])( +|$)/)) {
+          } else if (match(s, /^ ? ? ?([-+*]|[0-9]{1,9}[.)])( +|$)/)) {
             width = RLENGTH
-            match(s, /^ ? ? ?([-+*]|[0-9]+[.)])/); marker_width = RLENGTH
+            match(s, /^ ? ? ?([-+*]|[0-9]{1,9}[.)])/); marker_width = RLENGTH
             # Paragraph interruption requires nonempty first content;
             # an ordered item must also start at 1. Standalone empty
             # children keep the existing marker-width fallback below.
             if (paragraph && (substr(s, marker_width + 1) ~ /^[ \t]*\r?$/ ||
-                (s ~ /^ ? ? ?[0-9]+[.)]/ && substr(s, 1, marker_width) + 0 != 1))) break
+                (s ~ /^ ? ? ?[0-9]{1,9}[.)]/ && substr(s, 1, marker_width) + 0 != 1))) break
             # Empty first children and runs over four blanks use W+1;
             # preserve remaining indentation for the code-block decision.
             if (width - marker_width > 4 || substr(s, width + 1) == "") width = marker_width + 1
             path = path width " "
           } else break
-          s = substr(s, width + 1); paragraph = 0
+          s = substr(s, width + 1); paragraph = 0; markdown_inline_reset = 1
         }
       }
       container_path = path
@@ -2100,12 +2101,49 @@ scan_unscoped_identity_writes() {
       }
       paragraph = 1; return 1
     }
-    function exempt(s, md, html_context,   t, command, parts, modes, n, i) {
+    # Exemption comments are physical-line scoped, but a complete inline
+    # span can cross physical lines in the same existing Markdown block.
+    # Read that block before classifying its lines so unmatched openers
+    # remain literal; carrying an unvalidated opener would hide comments.
+    function markdown_exemption_block(s, first,   parts, modes, n, i, t, piece, lines) {
+      n = markdown_spans(s, parts, modes); t = ""
+      for (i = 1; i <= n; i++) {
+        piece = parts[i]
+        if (!modes[i]) gsub(/[^\n]/, "", piece)
+        t = t piece
+      }
+      n = split(t, lines, "\n")
+      for (i = 1; i <= n; i++) markdown_exemption_line[first + i - 1] = lines[i]
+    }
+    function markdown_exemptions(file,   rc, line, ln, block, first, context, prior_paragraph, prior_path) {
+      split("", markdown_exemption_line)
+      fence_char = ""; fence_width = 0; container_path = ""; paragraph = 0
+      ln = 0; block = ""; first = 1
+      while ((rc = (getline line < file)) > 0) {
+        ln++; prior_paragraph = paragraph; prior_path = container_path
+        context = markdown_html_context(line)
+        if (!context || !paragraph || !prior_paragraph ||
+            prior_path != container_path || markdown_inline_reset) {
+          if (ln > first) markdown_exemption_block(block, first)
+          block = ""; first = ln
+        }
+        block = (ln == first ? line : block "\n" line)
+        if (!context || !paragraph) {
+          markdown_exemption_block(block, first); block = ""; first = ln + 1
+        }
+      }
+      close(file)
+      if (ln >= first) markdown_exemption_block(block, first)
+      if (rc < 0) { found = 1; exit 1 }
+      fence_char = ""; fence_width = 0; container_path = ""; paragraph = 0
+    }
+    function exempt(s, md, html_context, block_context, span_text,   t, command, parts, modes, n, i) {
       # Shell markers were bound to each command by offending_part.
       # Markdown deliberately retains its physical-line exemption scope.
       if (!md) return 0
       t = s
-      if (md) {
+      if (block_context) t = span_text
+      else if (md) {
         n = markdown_spans(s, parts, modes); t = ""
         for (i = 1; i <= n; i++) if (modes[i]) t = t parts[i]
       }
@@ -2162,16 +2200,17 @@ scan_unscoped_identity_writes() {
       if (nbuf == 0) return
       if (nphys > 0) {
         for (i = 1; i <= nphys; i++) emit(physline[i], phystext[i])
-      } else if (offending(buf, grpmd, grphtml) && !exempt(buf, grpmd, grphtml)) {
+      } else if (offending(buf, grpmd, grphtml) && !exempt(buf, grpmd, grphtml, grpmd && grphtml, exemption_buf)) {
         emit(start, buf)
       }
-      buf = ""; nbuf = 0; nphys = 0
+      buf = ""; exemption_buf = ""; nbuf = 0; nphys = 0
     }
     # A group left dangling by a file whose last line ends in `\` must
     # not absorb the first line of the next file.
     FNR == 1 {
       flush(); fence_char = ""; fence_width = 0
       container_path = ""; paragraph = 0
+      if (tolower(FILENAME) ~ /\.(md|markdown|mdown|mkd)$/) markdown_exemptions(FILENAME)
     }
     {
       # Every Markdown spelling the file classifier admits, matched the
@@ -2184,11 +2223,15 @@ scan_unscoped_identity_writes() {
         start = FNR; grpfile = FILENAME; grpmd = mdfile; grphtml = html_context
       } else if (!html_context) grphtml = 0
       nbuf++
-      if (offending($0, mdfile, html_context) && !exempt($0, mdfile, html_context)) {
+      if (offending($0, mdfile, html_context) && !exempt($0, mdfile, html_context, mdfile, markdown_exemption_line[FNR])) {
         nphys++
         physline[nphys] = FNR
         phystext[nphys] = $0
       }
+      exemption_piece = (mdfile ? markdown_exemption_line[FNR] : $0)
+      if (continued($0) && substr(exemption_piece, length(exemption_piece)) == "\\")
+        exemption_piece = substr(exemption_piece, 1, length(exemption_piece) - 1)
+      exemption_buf = (nbuf == 1 ? exemption_piece : exemption_buf exemption_piece)
       piece = (mdfile ? markdown_text : $0)
       if (continued($0)) piece = substr(piece, 1, length(piece) - 1)
       # Shell removes a backslash-newline without adding a byte. Any spacing
@@ -2197,7 +2240,7 @@ scan_unscoped_identity_writes() {
       # (`gi\` + `t` must become `git`, not `gi t`).
       buf = (nbuf == 1 ? piece : buf piece)
       if (continued($0)) next
-      if (open_substitution(buf)) { buf = buf "\n"; next }
+      if (open_substitution(buf)) { buf = buf "\n"; exemption_buf = exemption_buf "\n"; next }
       flush()
     }
     END { flush(); exit found ? 1 : 0 }
