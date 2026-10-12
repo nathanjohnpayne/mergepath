@@ -1682,12 +1682,19 @@ ${FENCE}
   done
 done
 for BLANK in ' ' $'\t'; do
-  run_on_fixture "tests/blank-marker.sh" "git config user.email fixture@example.com;echo X${BLANK}# GIT_IDENTITY_SCOPE_EXEMPT: real shell comment
+  run_on_fixture "tests/blank-marker.sh" "git config user.email fixture@example.com${BLANK}# GIT_IDENTITY_SCOPE_EXEMPT: real shell comment
 "
   if [ "$RC" = "0" ]; then
     pass "shell space/tab still opens a real exemption comment"
   else
     fail "real shell blank rejected: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "tests/blank-marker-neighbour.sh" "git config user.email leak@example.com;echo X${BLANK}# GIT_IDENTITY_SCOPE_EXEMPT: echo only
+"
+  if [ "$RC" = "1" ]; then
+    pass "real shell blank on later comment does not exempt earlier writer"
+  else
+    fail "later space/tab marker widened command exemption: rc=$RC out=$OUT"
   fi
   run_on_fixture "docs/blank-fence.md" '```bash
 '"\`\`\`${BLANK}"$'\r\n'"git config user.email fixture@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: after CRLF closer -->"$'\r\n'
@@ -3346,6 +3353,186 @@ fi
 run_on_fixture tests/other $'#!/usr/bin/env batsman\ngit config user.email fixture@example.invalid\n'
 if [ "$RC" = 0 ]; then pass "Bats admission does not match arbitrary interpreter suffixes"; else
   fail "Bats interpreter matcher broadened: rc=$RC out=$OUT"
+fi
+
+# Case 65aa: a shell-file marker belongs to its terminating command.
+for SEP in ';' '&&' '||' '&' '|'; do
+  for LAST in 'echo ok' 'git config --get user.email' 'git -C "$FIX" config user.name fixture'; do
+    run_on_fixture tests/command-marker-neighbour.sh "git config user.email leak@example.invalid $SEP $LAST # GIT_IDENTITY_SCOPE_EXEMPT: last command only
+"
+    if [ "$RC" = 1 ]; then pass "later harmless/read/targeted command marker cannot exempt earlier writer"; else
+      fail "later marker widened exemption: sep='$SEP' last='$LAST' rc=$RC out=$OUT"
+    fi
+  done
+  run_on_fixture tests/command-marker-last-writer.sh "git config --get user.email $SEP git config user.name fixture # GIT_IDENTITY_SCOPE_EXEMPT: last fixture writer
+"
+  if [ "$RC" = 0 ]; then pass "genuine marker on last writer does not turn preceding read into a finding"; else
+    fail "last writer genuine marker rejected: sep='$SEP' rc=$RC out=$OUT"
+  fi
+  run_on_fixture tests/command-marker-two-writers.sh "git config user.email leak@example.invalid $SEP git config user.name fixture # GIT_IDENTITY_SCOPE_EXEMPT: last fixture writer
+"
+  if [ "$RC" = 1 ]; then pass "exempt last writer cannot clear independent earlier writer"; else
+    fail "last exempt writer cleared earlier writer: sep='$SEP' rc=$RC out=$OUT"
+  fi
+  run_on_fixture tests/command-marker-terminal.sh "git config user.email fixture@example.invalid$SEP# GIT_IDENTITY_SCOPE_EXEMPT: terminal operator
+"
+  if [ "$RC" = 0 ]; then pass "terminal operator without intervening command preserves true exemption"; else
+    fail "terminal operator marker rejected: sep='$SEP' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  $'git \\\nconfig user.email leak@example.invalid; echo ok # GIT_IDENTITY_SCOPE_EXEMPT: echo only' \
+  $'value=$(\ngit \\\nconfig user.email leak@example.invalid; echo ok # GIT_IDENTITY_SCOPE_EXEMPT: echo only\n)' \
+  'git config user.email "fixture # GIT_IDENTITY_SCOPE_EXEMPT: quoted data"' \
+  'git config user.email leak@example.invalid; echo "# GIT_IDENTITY_SCOPE_EXEMPT: quoted data"' \
+  'git config user.email leak@example.invalid; echo \# GIT_IDENTITY_SCOPE_EXEMPT: escaped data'; do
+  run_on_fixture tests/command-marker-continued-data.sh "$SOURCE
+"
+  if [ "$RC" = 1 ]; then pass "continued/multiline writer and quoted/escaped marker data remain findings"; else
+    fail "command marker continuation/data cleared writer: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  $'echo prep; git \\\nconfig user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: fixture writer' \
+  $'value=$(\ngit \\\nconfig user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: fixture writer\n)' \
+  $'value=$(git config user.email fixture@example.invalid;# GIT_IDENTITY_SCOPE_EXEMPT: fixture writer\n)' \
+  'git config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: reason with ; quoted data'; do
+  run_on_fixture tests/command-marker-continued-real.sh "$SOURCE
+"
+  if [ "$RC" = 0 ]; then pass "genuine shell marker retains owning continued/body writer and comment reason"; else
+    fail "owning command marker rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture docs/markdown-physical-marker.md 'Use `git config user.email fixture@example.invalid`; echo ok # GIT_IDENTITY_SCOPE_EXEMPT: intentional physical-line examples
+'
+if [ "$RC" = 0 ]; then pass "Markdown deliberately retains existing physical-line marker scope"; else
+  fail "shell command marker binding changed Markdown exemption contract: rc=$RC out=$OUT"
+fi
+
+# Findings in opaque operands stay pending until the owning command ends:
+# its real marker still applies, while a later command cannot supply one.
+for SOURCE in \
+  'echo $(git config user.email fixture@example.invalid) # GIT_IDENTITY_SCOPE_EXEMPT: intentional owning fixture command' \
+  'value=$(git config user.email fixture@example.invalid) # GIT_IDENTITY_SCOPE_EXEMPT: intentional owning fixture command' \
+  'git config --get user.email; echo $(git config user.email fixture@example.invalid) # GIT_IDENTITY_SCOPE_EXEMPT: intentional owning fixture command' \
+  $'echo $(git \\\nconfig user.email fixture@example.invalid) # GIT_IDENTITY_SCOPE_EXEMPT: intentional owning fixture command'; do
+  run_on_fixture tests/owning-substitution-marker.sh "$SOURCE
+"
+  if [ "$RC" = 0 ]; then pass "real owning-command marker retains direct contained fixture exemption"; else
+    fail "owning substitution marker rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  'echo $(git config user.email leak@example.invalid); echo ok # GIT_IDENTITY_SCOPE_EXEMPT: harmless echo' \
+  'git config user.email leak@example.invalid; echo $(git config user.email fixture@example.invalid) # GIT_IDENTITY_SCOPE_EXEMPT: last owning command' \
+  $'echo $(git \\\nconfig user.email leak@example.invalid); echo ok # GIT_IDENTITY_SCOPE_EXEMPT: harmless echo'; do
+  run_on_fixture tests/later-substitution-marker.sh "$SOURCE
+"
+  if [ "$RC" = 1 ]; then pass "owning-command marker cannot exempt prior independent outer/substitution writer"; else
+    fail "later substitution marker widened: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+
+# Case 65ab: only ordered start 1 can interrupt an open paragraph.
+for NUMBER in 0 2 3 10; do
+  ORDERED_INDENT="$(printf '%*s' "$((${#NUMBER} + 2))" '')"
+  run_on_fixture docs/ordered-paragraph.md "Paragraph
+$NUMBER. \`\`\`bash
+   git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: actual paragraph -->
+"
+  if [ "$RC" = 0 ]; then pass "non-1 ordered marker cannot turn paragraph HTML exemption into code data"; else
+    fail "ordered paragraph interruption rejected genuine marker: number=$NUMBER rc=$RC out=$OUT"
+  fi
+  run_on_fixture docs/ordered-after-blank.md "Paragraph
+
+$NUMBER. \`\`\`bash
+${ORDERED_INDENT}git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->
+"
+  if [ "$RC" = 1 ]; then pass "blank boundary allows non-1 ordered fence; literal HTML remains data"; else
+    fail "blank-separated ordered fence accepted literal marker: number=$NUMBER rc=$RC out=$OUT"
+  fi
+done
+for NUMBER in 1 01; do
+  run_on_fixture docs/ordered-one-paragraph.md "Paragraph
+$NUMBER. \`\`\`bash
+    git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->
+"
+  if [ "$RC" = 1 ]; then pass "ordered start 1 interrupts paragraph and keeps fenced HTML literal"; else
+    fail "ordered1 interruption missed literal writer: number=$NUMBER rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  $'> Paragraph\n> 2. ```bash\n>    git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: paragraph -->' \
+  $'- Paragraph\n  2. ```bash\n     git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: paragraph -->' \
+  $'> - Paragraph\n>   2. ```bash\n>      git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: paragraph -->'; do
+  run_on_fixture docs/nested-ordered-paragraph.md "$SOURCE
+"
+  if [ "$RC" = 0 ]; then pass "numeric interruption uses retained outer quote/list paragraph context"; else
+    fail "nested numeric paragraph became fence: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture docs/nested-ordered-one.md $'> Paragraph\n> 1. ```bash\n>    git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->\n'
+if [ "$RC" = 1 ]; then pass "valid nested ordered1 fence keeps HTML marker literal"; else
+  fail "nested ordered1 fence cleared writer: rc=$RC out=$OUT"
+fi
+run_on_fixture docs/ordered-sibling.md $'1. Paragraph\n2. ```bash\n   git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->\n'
+if [ "$RC" = 1 ]; then pass "sibling ordered item ends prior paragraph container before opening fence"; else
+  fail "sibling ordered2 fence treated as interrupted prose: rc=$RC out=$OUT"
+fi
+run_on_fixture docs/ordered-paragraph-no-exemption.md $'Paragraph\n2. ```bash\n   git config user.email leak@example.invalid\n'
+if [ "$RC" = 1 ]; then pass "corrected paragraph context still flags unexempted literal writer"; else
+  fail "numeric context correction hid writer: rc=$RC out=$OUT"
+fi
+
+# Case 65ac: empty list items cannot interrupt a paragraph either.
+for MARKER in '1.' '01.' '*' '+'; do
+  EMPTY_CODE_INDENT="$(printf '%*s' "$((${#MARKER} + 5))" '')"
+  run_on_fixture docs/empty-list-paragraph.md "Paragraph
+$MARKER
+       git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: genuine paragraph -->
+"
+  if [ "$RC" = 0 ]; then pass "empty numeric/bullet item preserves paragraph and real HTML marker"; else
+    fail "empty marker interrupted paragraph: marker='$MARKER' rc=$RC out=$OUT"
+  fi
+  run_on_fixture docs/empty-list-after-blank.md "Paragraph
+
+$MARKER
+${EMPTY_CODE_INDENT}git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal indented code -->
+"
+  if [ "$RC" = 1 ]; then pass "blank boundary retains standalone empty-child indentation/code behavior"; else
+    fail "empty first child after blank cleared code writer: marker='$MARKER' rc=$RC out=$OUT"
+  fi
+  run_on_fixture docs/empty-list-unexempted.md "Paragraph
+$MARKER
+       git config user.email leak@example.invalid
+"
+  if [ "$RC" = 1 ]; then pass "paragraph preservation still catches unexempted literal instruction"; else
+    fail "empty marker context erased writer: marker='$MARKER' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture docs/empty-list-spaced.md $'Paragraph\n1.   \n       git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: genuine paragraph -->\n'
+if [ "$RC" = 0 ]; then pass "blank-only first content cannot interrupt paragraph"; else
+  fail "space-only list child became code container: rc=$RC out=$OUT"
+fi
+run_on_fixture docs/empty-list-crlf.md $'Paragraph\r\n1.\r\n       git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: genuine paragraph -->\r\n'
+if [ "$RC" = 0 ]; then pass "CRLF empty item preserves actual paragraph comment"; else
+  fail "CRLF empty item interrupted paragraph: rc=$RC out=$OUT"
+fi
+run_on_fixture docs/nonempty-list-seven-spaces.md $'Paragraph\n1. content\n       git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal indented code -->\n'
+if [ "$RC" = 0 ]; then pass "nonempty ordered1 starts its own paragraph; indentation cannot interrupt it"; else
+  fail "nonempty item paragraph comment rejected: rc=$RC out=$OUT"
+fi
+run_on_fixture docs/nonempty-list-fence-seven-spaces.md $'Paragraph\n1. ```bash\n       git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->\n'
+if [ "$RC" = 1 ]; then pass "nonempty ordered1 fence still interrupts outer paragraph with seven-space code"; else
+  fail "nonempty ordered1 fence lost: rc=$RC out=$OUT"
+fi
+run_on_fixture docs/empty-list-01-seven-spaces.md $'Paragraph\n\n01.\n       git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: actual child paragraph -->\n'
+if [ "$RC" = 0 ]; then pass "empty01 child requires eight total spaces for code; seven remains paragraph"; else
+  fail "empty01 seven-space paragraph became code: rc=$RC out=$OUT"
+fi
+run_on_fixture docs/empty-dash-setext.md $'Paragraph\n-\n       git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code after heading -->\n'
+if [ "$RC" = 1 ]; then pass "empty dash retains existing setext heading boundary"; else
+  fail "empty list guard weakened setext/code boundary: rc=$RC out=$OUT"
 fi
 
 # Case 65p: the modern rename verb moves a section, not the protected key.

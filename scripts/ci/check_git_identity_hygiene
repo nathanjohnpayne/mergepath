@@ -1790,14 +1790,14 @@ scan_unscoped_identity_writes() {
       }
       return ""
     }
-    function offending_part(s, prose, body_context,   i, c, piece, quote, ansi, closing, comment) {
+    function offending_part(s, prose, shell_context,   i, c, piece, quote, ansi, closing, comment, after, nested) {
       if (prose) s = prose_command(s)
-      piece = ""; quote = ""; ansi = 0; comment = ""
+      piece = ""; quote = ""; ansi = 0; comment = ""; nested = 0
       for (i = 1; i <= length(s); i++) {
         c = substr(s, i, 1)
-        # In contained source, comment data cannot change command state.
+        # In shell source, comment data cannot change command state.
         # Keep its original bytes only for the same-command exemption.
-        if (body_context && quote == "" && c == "#" && (i == 1 || substr(s, i - 1, 1) ~ /[ \t\n;&|()]/)) {
+        if (shell_context && quote == "" && c == "#" && (i == 1 || substr(s, i - 1, 1) ~ /[ \t\n;&|()]/)) {
           while (i <= length(s) && substr(s, i, 1) != "\n") { comment = comment substr(s, i, 1); i++ }
           i--; continue
         }
@@ -1806,17 +1806,22 @@ scan_unscoped_identity_writes() {
           if (closing) {
             # Preserve direct literal instructions already recognized in
             # the contained source, independently of the opaque output.
-            if (offending_part(substr(s, i + 2, closing - i - 2), 0, 1)) return 1
+            if (offending_part(substr(s, i + 2, closing - i - 2), 0, 1)) nested = 1
             piece = piece substr(s, i, closing - i + 1); i = closing; continue
           } else {
             # Unknown extent falls back to the existing literal classifier;
             # a direct body instruction must not disappear with the extent.
-            if (offending_part(substr(s, i + 2), 0, 1)) return 1
+            if (offending_part(substr(s, i + 2), 0, 1)) nested = 1
           }
         }
         if (quote == "" && (c ~ /[&|;]/ || c == "\n")) {
-          if (offending_one(piece) && (!body_context || !shell_comment_marker(piece comment, 0))) return 1
-          piece = ""; quote = ""; ansi = 0; comment = ""; continue
+          # A terminal operator followed only by a comment still belongs
+          # to this command. An intervening command owns its own marker.
+          after = i + 1
+          while (substr(s, after, 1) ~ /[ \t;&|]/) after++
+          if (shell_context && c != "\n" && substr(s, after, 1) == "#") { piece = piece c; continue }
+          if ((nested || offending_one(piece)) && (!shell_context || !shell_comment_marker(piece comment, 0))) return 1
+          piece = ""; quote = ""; ansi = 0; comment = ""; nested = 0; continue
         }
         if (c == "\\" && (quote != "\047" || ansi)) {
           piece = piece substr(s, i, 2); i++; continue
@@ -1828,7 +1833,7 @@ scan_unscoped_identity_writes() {
         }
         piece = piece c
       }
-      return offending_one(piece) && (!body_context || !shell_comment_marker(piece comment, 0))
+      return (nested || offending_one(piece)) && (!shell_context || !shell_comment_marker(piece comment, 0))
     }
     # Pair complete backtick runs by equal width in the existing line/
     # logical-command scope. Inner runs of another width are span data.
@@ -1857,7 +1862,7 @@ scan_unscoped_identity_writes() {
       return n
     }
     function offending(s, md, prose,   parts, modes, n, i) {
-      if (!md) return offending_part(s, 0)
+      if (!md) return offending_part(s, 0, 1)
       n = markdown_spans(s, parts, modes)
       for (i = 1; i <= n; i++)
         if (offending_part(parts[i], prose && modes[i])) return 1
@@ -2034,6 +2039,11 @@ scan_unscoped_identity_writes() {
           } else if (match(s, /^ ? ? ?([-+*]|[0-9]+[.)])( +|$)/)) {
             width = RLENGTH
             match(s, /^ ? ? ?([-+*]|[0-9]+[.)])/); marker_width = RLENGTH
+            # Paragraph interruption requires nonempty first content;
+            # an ordered item must also start at 1. Standalone empty
+            # children keep the existing marker-width fallback below.
+            if (paragraph && (substr(s, marker_width + 1) ~ /^[ \t]*\r?$/ ||
+                (s ~ /^ ? ? ?[0-9]+[.)]/ && substr(s, 1, marker_width) + 0 != 1))) break
             # Empty first children and runs over four blanks use W+1;
             # preserve remaining indentation for the code-block decision.
             if (width - marker_width > 4 || substr(s, width + 1) == "") width = marker_width + 1
@@ -2077,6 +2087,9 @@ scan_unscoped_identity_writes() {
       paragraph = 1; return 1
     }
     function exempt(s, md, html_context,   t, command, parts, modes, n, i) {
+      # Shell markers were bound to each command by offending_part.
+      # Markdown deliberately retains its physical-line exemption scope.
+      if (!md) return 0
       t = s
       if (md) {
         n = markdown_spans(s, parts, modes); t = ""
