@@ -20,8 +20,8 @@ ORCH="$ROOT/scripts/phase-4b-review.sh"
 AD_CODEX="$ROOT/scripts/phase-4b/adapters/review-via-codex.sh"
 AD_CLAUDE="$ROOT/scripts/phase-4b/adapters/review-via-claude.sh"
 
-# Bounded barrier regressions (#2120): expected about 2s, no orchestrator,
-# adapter CLI, credentials or network. Run with an outer 20s timeout.
+# Bounded barrier/probe regressions (#2120): expected about 12s, no
+# orchestrator, adapter CLI, credentials or network. Use an outer 30s timeout.
 if [ "${1:-}" = --rate-limit-only ]; then
   command -v jq >/dev/null 2>&1 || { echo 'ERROR: jq required' >&2; exit 1; }
   LIB="${P4B_TEST_RATE_LIMIT_LIB:-$LIB}"
@@ -91,6 +91,9 @@ if [ "${1:-}" = --rate-limit-only ]; then
   expect_case 'spent 5/5 request ceiling, no human stop' 0 '.decision == "open" and .codex == "waived" and .codex_evidence == "request-ceiling" and .coderabbit == "rate-limited"'
   CX_ENABLED=false
   expect_case 'Codex disabled, bare rate limit' 0 '.decision == "open" and .codex == "disabled" and .coderabbit == "rate-limited"'
+  SUBSTITUTE=false
+  expect_case 'Codex disabled with substitute forbidden' 2 '.decision == "escalate"'
+  SUBSTITUTE=true
   CX_ENABLED=true CX_RC=0
   expect_case 'Codex reported, bare rate limit' 0 '.decision == "open" and .codex == "reported"'
   CX_RC=2 BUDGET_STATE=available
@@ -177,6 +180,8 @@ Blocking finding on this head."
   fi
   printf '%s cases, %s failures\n' "$COUNT" "$FAIL"
   [ "$FAIL" = 0 ]
+  # Full production --probe selection, including heading-only quota notices.
+  bash "$ROOT/tests/test_coderabbit_wait_status_probe.sh" --phase4b-quota-only
   exit
 fi
 

@@ -2112,6 +2112,15 @@ p4b_same_head_barrier() {
     esac
   fi
 
+  # Disabled Codex also depends on the substitute path to clear gate (c).
+  # Reject an explicitly forbidden substitute before probing/triggering
+  # CodeRabbit or dispatching an adapter that could never clear that gate.
+  if [ "$cls_cx" = disabled ] \
+     && [ "$(p4b_policy_block_field codex allow_phase_4b_substitute)" = false ]; then
+    cls_cx=escalate
+    why="Codex is disabled and codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c)"
+  fi
+
   # CodeRabbit arm: probe (read-only, zero allowance) -> conditional trigger
   # -> bounded retry. The probe resolves the live head itself, so classifying
   # against "$head" is also what catches a push landing mid-run.

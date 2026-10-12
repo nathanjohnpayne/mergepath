@@ -30,7 +30,7 @@ make_case() {
   local dir="$WORKDIR/$name"
 
   mkdir -p "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
-  cp "$ROOT/scripts/coderabbit-wait.sh" "$dir/scripts/coderabbit-wait.sh"
+  cp "${CODERABBIT_TEST_WAITER_SOURCE:-$ROOT/scripts/coderabbit-wait.sh}" "$dir/scripts/coderabbit-wait.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
   cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$dir/scripts/lib/reviewers-helpers.sh"
   # Hard-required by coderabbit-wait.sh since #1008: both fetch wrappers
@@ -296,6 +296,13 @@ case "$endpoint" in
         # #535.1: one CodeRabbit review on HEAD, no inline findings, but the
         # PR-level summary body carries a Potential issue marker.
         printf '[{"id":9921,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
+        ;;
+      phase4b_quota)
+        if [ "${CODERABBIT_TEST_QUOTA_REVIEW:-false}" = true ]; then
+          printf '[{"id":9941,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
+        else
+          printf '[]\n'
+        fi
         ;;
       probe_review_on_head|probe_ack_after_blocking_summary|probe_blocking_summary_no_ack|probe_ack_after_clean_summary|probe_ack_without_summary)
         # #814: a genuine CodeRabbit review already on HEAD. --probe must
@@ -606,6 +613,10 @@ No actionable comments were generated in the recent review.'}
         # it carries no blocking marker of its own: the head's only blocking
         # evidence is the inline finding on run 9401.
         printf '[{"id":8901,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n\\n## Walkthrough\\n\\nReviewed the changes between 1111111111111111111111111111111111111111 and 2222222222222222222222222222222222222222."}]\n' "$bot" "$head_time" "$reply_time"
+        ;;
+      phase4b_quota)
+        jq -nc --arg bot "$bot" --arg body "${CODERABBIT_TEST_QUOTA_BODY:?}" --arg at "$reply_time" \
+          '[{id:7701,user:{login:$bot},created_at:$at,updated_at:$at,body:$body}]'
         ;;
       rate_limit)
         printf '[{"id":7701,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"Rate limit exceeded. Please wait 10 seconds before requesting another review."}]\n' "$bot" "$head_time" "$head_time"
@@ -1584,6 +1595,73 @@ run_probe_case() {  # <dir> <scenario> [flag|env]
 
   printf '%s\n' "$rc"
 }
+
+# #2120: bounded real-probe controls, expected ~12s, outer timeout 20s.
+# Both production branches run: a head-pinned review object present/absent.
+if [ "${1:-}" = --phase4b-quota-only ]; then
+  for has_review in false true; do
+    for shape in heading marker native masked-heading masked-marker quoted fenced unknown; do
+      body='> [!WARNING]
+> ## Review limit reached
+> Included review quota exhausted.'
+      expected_rc=7 expected_observed=rate_limit
+      case "$shape" in
+        native)
+          # Retain any trailing newlines in the observed body exactly.
+          body=$(jq -ej '.body' "$ROOT/tests/fixtures/coderabbit_quota_refusal.json" && printf '__quota_body_end__')
+          body=${body%__quota_body_end__} ;;
+        marker|masked-marker)
+          body='<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->
+Fair Usage Limits: 0 included reviews remain.' ;;
+        quoted) body='A diff example quotes "Review limit reached".' ;;
+        fenced) body='```
+> [!WARNING]
+> ## Review limit reached
+```' ;;
+        unknown) body='<!-- This is an auto-generated comment: quota exhausted by coderabbit.ai -->' ;;
+      esac
+      case "$shape" in
+        masked-*) body="$body
+_⚠️ Potential issue_
+Blocking finding on this head."; expected_rc=2; expected_observed=terminal ;;
+        quoted|fenced|unknown)
+          expected_observed=summary-without-head-review
+          [ "$has_review" = false ] || expected_observed=awaiting-summary ;;
+      esac
+      dir=$(make_case "quota-$has_review-$shape" 1 false 0 0)
+      export CODERABBIT_TEST_QUOTA_BODY="$body" CODERABBIT_TEST_QUOTA_REVIEW="$has_review"
+      rc=$(run_probe_case "$dir" phase4b_quota)
+      if [ "$rc" = "$expected_rc" ] \
+         && [ "$(jq -r '.probe.observed' "$dir/out.json")" = "$expected_observed" ] \
+         && [ "$(probe_count "$dir")" = 0 ] && [ "$(codex_invocations "$dir")" = 0 ]; then
+        pass "quota $shape, head review=$has_review: real probe rc=$rc observed=$expected_observed, no POST"
+      else
+        fail "quota $shape, head review=$has_review: rc=$rc expected=$expected_rc/$expected_observed, output=$(cat "$dir/out.json"), stderr=$(tail -3 "$dir/err.log")"
+      fi
+    done
+    dir=$(make_case "quota-$has_review-reader-failure" 1 false 0 0)
+    CODERABBIT_TEST_REAL_AWK="$(command -v awk)"
+    export CODERABBIT_TEST_REAL_AWK
+    cat >"$dir/bin/awk" <<'SH'
+#!/bin/sh
+case "$*" in *fence_update*) exit 42 ;; esac
+exec "$CODERABBIT_TEST_REAL_AWK" "$@"
+SH
+    chmod +x "$dir/bin/awk"
+    export CODERABBIT_TEST_QUOTA_REVIEW="$has_review"
+    export CODERABBIT_TEST_QUOTA_BODY='> [!WARNING]
+> ## Review limit reached'
+    rc=$(run_probe_case "$dir" phase4b_quota)
+    if [ "$rc" = 3 ] && [ "$(probe_count "$dir")" = 0 ] && [ "$(codex_invocations "$dir")" = 0 ]; then
+      pass "quota reader failure, head review=$has_review: infrastructure exit 3, no POST"
+    else
+      fail "quota reader failure, head review=$has_review: rc=$rc expected=3, stderr=$(tail -3 "$dir/err.log")"
+    fi
+  done
+  echo "phase4b quota production probes: $PASS passed, $FAIL failed"
+  [ "$FAIL" = 0 ]
+  exit
+fi
 
 # <dir> <expected_rc> <expected_observed> <label> — the shared assertion:
 # right rc, right observed surface, status=no_review_yet, skip_reason null,

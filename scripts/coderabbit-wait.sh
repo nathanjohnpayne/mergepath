@@ -4940,7 +4940,10 @@ probe_emit_verdict() {
       while IFS= read -r row; do
         [ -z "$row" ] && continue
         body=$(printf '%s' "$row" | base64 --decode | jq -r '.body // ""')
-        class=$(classify_comment "$body")
+        # The selected configured-bot comment may use the supported
+        # provider-owned quota heading without its HTML rate-limit marker.
+        class=$(crw_classify_selected_comment "$body") \
+          || die 3 "failed to classify the selected probe publication"
         # Narration replies carry no publication state, and the probe.observed
         # enum deliberately omits status_probe — the no-review-object triage
         # drops narration in its jq filter, but this scan classifies every row,
@@ -5172,7 +5175,8 @@ probe_emit_verdict() {
   if [ -n "$cand" ]; then
     body=$(printf '%s' "$cand" | base64 --decode | jq -r '.body')
     latest_json=$(printf '%s' "$cand" | base64 --decode | jq -r '.json')
-    newest_class=$(classify_comment "$body")
+    newest_class=$(crw_classify_selected_comment "$body") \
+      || die 3 "failed to classify the latest probe comment"
     # #1178 guard, site 2 of 3 — the no-review-object triage. Same body, same
     # masking, same answer as site 1.
     # ONE call, EVERY surface (#1178 rounds 3/5/7/9) — replaces the two inline
