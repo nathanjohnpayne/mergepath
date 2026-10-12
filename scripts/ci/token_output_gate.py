@@ -1308,8 +1308,12 @@ def _find_substitutions_legacy(s, quotes_are_literal=False, include_arithmetic=F
 class Lexer:
     """Segment-aware shell lexer.  Never executes anything it reads."""
 
-    def __init__(self, text):
+    def __init__(self, text, arithmetic_contexts=False):
         self.text = text
+        # HD substitution-source diagnostics alone opt into source coordinates.
+        # Default lexical words, references and relationships remain unchanged.
+        self._arithmetic_contexts = arithmetic_contexts
+        self.arithmetic_context_spans = []
         self.logical = []
         self.heredocs = []
         self.func_defs = []  # (name, body_start_index, body_end_index)
@@ -1450,6 +1454,28 @@ class Lexer:
 
         def cur_level():
             return levels[-1]
+
+        def arithmetic_command_position(prefix=None):
+            # Read only the already-tokenized prefix with the existing resolver.
+            # The temporary segment avoids caching a partial real segment.
+            probe = Segment(-1, None, False, line)
+            probe.words = list(cur_level()["seg"].words)
+            if prefix:
+                probe.words.append(prefix)
+            # Only this opt-in arithmetic role consumes measured literal time.
+            idx = 0
+            while idx < len(probe.words) and probe.words[idx] in RESERVED_WORDS:
+                idx += 1
+            if probe.words[idx:idx + 1] == ["time"]:
+                del probe.words[idx]
+                if probe.words[idx:idx + 1] == ["-p"]:
+                    del probe.words[idx]
+            cmd, _redir = resolve_command(probe)
+            return cmd is None
+
+        def record_arithmetic_context(start, operand_start, operand_end, end, kind):
+            if not any(a <= start < z for _k, a, _b, _c, z in self.arithmetic_context_spans):
+                self.arithmetic_context_spans.append((kind, start, operand_start, operand_end, end))
 
         def expanding():
             return "'" not in quotes
@@ -1811,6 +1837,13 @@ class Lexer:
                 i = j
                 continue
 
+            if self._arithmetic_contexts and c == "[":
+                prefix = "".join(cur_level()["word"])
+                if _IDENT_RE.fullmatch(prefix) and arithmetic_command_position():
+                    close = _find_compound_close(text, i, bracket_span=True)
+                    if close is not None and (text[close + 1:close + 2] == "=" or text[close + 1:close + 3] == "+="):
+                        record_arithmetic_context(i, i + 1, close, close + 1, "index")
+
             # ---- structure ----
             if c == "\n":
                 finish_word()
@@ -1927,6 +1960,10 @@ class Lexer:
 
             if c == "(":
                 word_so_far = "".join(cur_level()["word"])
+                if self._arithmetic_contexts and (not word_so_far or word_so_far in RESERVED_WORDS or word_so_far == "time") and text.startswith("((", i) and arithmetic_command_position(word_so_far):
+                    close = _find_compound_close(text, i)
+                    if close is not None and text[close - 1:close + 1] == "))":
+                        record_arithmetic_context(i, i + 2, close - 1, close + 1, "command")
                 if word_so_far.endswith("="):
                     # An ARRAY ASSIGNMENT.  `args=(echo "$PAT")` stores two
                     # strings and writes nothing; reading the `(` as a command
@@ -3657,7 +3694,10 @@ def _heredoc_substitution_has_positional(body, _depth=0):
     """
     if _word_has_verbatim_positional(body):
         return True
-    lx = Lexer(body)
+    lx = Lexer(body, arithmetic_contexts=True)
+    for _kind, _start, begin, end, _stop in lx.arithmetic_context_spans:
+        if _word_has_verbatim_positional(body[begin:end], in_heredoc=True, _depth=_depth):
+            return True
     # Lexer segments retain executable quote/escape context and omit comments
     # and inert HD data. Rejoin words for legacy arithmetic split by spaces;
     # only recognized arithmetic operands receive arithmetic quote semantics.
@@ -5045,6 +5085,83 @@ MUST_NOT_FLAG = "clean"
 
 # (id, disposition, body)  -- body is appended to PROLOGUE.
 CORPUS = [
+
+    # Measured literal time/-p arithmetic prefixes; split oracle forms stay side evidence.
+    ('helper-hd-round11-time-if-time', MUST_FLAG, 'leak() { printf safe <<EOF\n$(if time ((1/\'$1\'));then :;fi)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-negation-time', MUST_FLAG, 'leak() { printf safe <<EOF\n$(! time ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-quoted-time', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(\'time\' ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-escaped-time', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(ti\\me ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-command-time', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(command time ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-time-printf-quoted-data', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(time printf \'%s\' \'((1/$1))\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-time-assignment', MUST_FLAG, 'leak() { printf safe <<EOF\n$(time a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-time-p-assignment', MUST_FLAG, 'leak() { printf safe <<EOF\n$(time -p a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-quoted-time-data', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(printf \'%s\' \'time ((1/$1))\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-unknown-option', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(time -x ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-quoted-p', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(time \'-p\' ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-builtin-time', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(builtin time ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-env-time', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(env time ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-path-time', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(/usr/bin/time ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-later-argument', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(time printf \'%s\' a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+
+    # Reserved prefixes at the same physical arithmetic delimiter.
+    ('helper-hd-round11-prefix-command-index', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(command a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-builtin-index', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(builtin a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-command-arith', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(command ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-builtin-arith', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(builtin ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-if-adjacent', MUST_FLAG, 'leak() { printf safe <<EOF\n$(if((1/\'$1\')); then :; fi)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-while-adjacent', MUST_FLAG, 'leak() { printf safe <<EOF\n$(while((1/\'$1\')); do break; done)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-until-adjacent', MUST_FLAG, 'leak() { printf safe <<EOF\n$(until((1/\'$1\')); do break; done)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-negated-arith', MUST_FLAG, 'leak() { printf safe <<EOF\n$(! ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-arithmetic-after-redir', MUST_FLAG, 'leak() { printf safe <<EOF\n$(>/dev/null ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-if-quoted-prefix', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(\'if\'((1/\'$1\')); then :; fi)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-if-escaped-prefix', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(i\\f((1/\'$1\')); then :; fi)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-function-prefix', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(fake((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-array-DATA-prefix', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(args=((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-time-quoted-data', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(printf \'%s\' \'time ((1/$1))\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-negation-adjacent', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(!((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-if-adjacent-tail', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(if((1+2)); then printf \'%s\' \'$1\'; fi)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+
+    # Actual arithmetic command/index roles in HD substitution source (#1496).
+    ('helper-hd-round11-command', MUST_FLAG, 'leak(){ printf safe <<EOF\n$( ((1/\'$1\')) )\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-spaces', MUST_FLAG, 'leak(){ printf safe <<EOF\n$( ((1 / \'$1\')) )\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-nested', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(a[b[1/\'$1\']]=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-spaces', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(a[1 / \'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-quoted-bracket', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(a[1/\'$1]\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-plus', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(a[\'$1\']+=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-prefix', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(a[\'$1\']=value :)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-argument', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(printf \'%s\' a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-whole-quoted', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(printf \'%s\' \'a[$1]=value\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-escaped-dollar', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(a[\'\\$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-inert', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(printf \'%s\' \'((1/$1))\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-comment', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(printf safe # ((1/\'$1\'))\n)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-comment', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(printf safe # a[\'$1\']=value\n)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-escaped-dollar', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$( ((1/\'\\$1\')) )\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-safe-positional', MUST_FLAG, 'leak(){ printf safe <<EOF\n$( (($1+1)) )\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-in-if', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(if ((1/\'$1\'));then :;fi)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-after-data', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(printf \'%s\' \'((1/$1))\'; ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-tail-inert', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$( ((1+2)); printf \'%s\' \'$1\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-tail-inert', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(a[1+2]=value; printf \'%s\' \'$1\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-value-inert', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(a[1+2]=\'$1\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-in-if', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(if a[\'$1\']=value;then :;fi)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-outer-doublequote', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(printf \'%s\' "((1/\'\\$1\'))")\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-depth-one', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(eval "((1/\'\\$1\'))")\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-depth-two', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(eval "eval \\"((1/\'\\\\\\$1\'))\\"")\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-depth-one', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(eval "a[\'\\$1\']=value")\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-depth-two', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(eval "eval \\"a[\'\\\\\\$1\']=value\\"")\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-declare', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(declare -a a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-subshell', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(( ((1/\'$1\')) ))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-after-redirection', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(>/dev/null a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-quoted-delimiter', MUST_NOT_FLAG, 'leak(){ printf safe <<\'EOF\'\n$( ((1/\'$1\')) )\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-quoted-delimiter', MUST_NOT_FLAG, 'leak(){ printf safe <<\'EOF\'\n$(a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-two-quoted-delimiter', MUST_NOT_FLAG, 'leak(){ printf safe <<\\EOF\n$( ((1/\'$1\')) )\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-plain-inert-nonstdin', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n((1/\'$1\'))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-plain-assignment-inert-nonstdin', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\na[\'$1\']=value\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-adjacent-let', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(let \'1/$1\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-adjacent-let-quoted', MUST_FLAG, 'leak() { printf safe <<EOF\n$(let "1/\'$1\'")\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-adjacent-declare-index', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(declare -a \'a[$1]=value\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-adjacent-declare-quoted-index', MUST_FLAG, 'leak() { printf safe <<EOF\n$(declare -a "a[\'$1\']=value")\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-adjacent-local-index', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(local -a \'a[$1]=value\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
     ('printf-option-a-braced-value', MUST_NOT_FLAG, 'printf -vout \'%s\' "${GH_TOKEN}"\n'),
     ('printf-option-a-readline-target', MUST_FLAG, 'printf -vREADLINE_LINE \'%s\' "$GH_TOKEN"\n'),
     ('printf-option-a-lowercase-special', MUST_FLAG, 'printf -vhistchars \'%s\' "$GH_TOKEN"\n'),
@@ -9919,6 +10036,8 @@ CORPUS.extend(_generated_corpus())
 # fails when an undeclared disagreement appears AND when a declared entry stops
 # disagreeing, so neither list can quietly rot.
 KNOWN_MISSES = {
+    'helper-hd-round11-command-depth-two': 'The real arithmetic diagnostic requires a second literal deferred child, beyond the unchanged shared one-hop inventory. Primitive arithmetic at reached source neither spends nor resets child depth (#1496).',
+    'helper-hd-round11-assignment-depth-two': 'The real arithmetic diagnostic requires a second literal deferred child, beyond the unchanged shared one-hop inventory. Primitive arithmetic at reached source neither spends nor resets child depth (#1496).',
     'helper-hd-round10-sub-arithmetic-deferred-child-two-boundary': 'The fake arithmetic diagnostic leaks only after a second literal deferred child. That child is beyond the unchanged shared one-hop budget; primitive arithmetic checking at a reached source does not spend or reset child depth (#1496).',
     'helper-hd-round9-nested-backtick-depth-two-boundary': 'A nested HD followed by backtick source needing another HD inventory exceeds the shared one-hop source budget. The fake oracle leaks, while this explicitly bounded HD/deferred inventory misses it; direct/legacy source reads can conservatively admit other deeper spellings (#1496).',
     "helper-hd-eval-depth-two-boundary": (
@@ -10081,6 +10200,10 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    'helper-hd-round11-prefix-arithmetic-after-redir': 'The sampled redirection-prefixed arithmetic command is rejected by Bash before positional evaluation. Existing source-only prefix classification conservatively inventories its bounded arithmetic operand without a compound-command grammar/evaluation model (#1496).',
+    'helper-hd-round11-assignment-nested': 'The sampled nested index or assignment prefix evaluates quietly. Actual arithmetic operand inventory retains possible diagnostics without proving runtime binding or evaluation order (#1496).',
+    'helper-hd-round11-assignment-prefix': 'The sampled nested index or assignment prefix evaluates quietly. Actual arithmetic operand inventory retains possible diagnostics without proving runtime binding or evaluation order (#1496).',
+    'helper-hd-round11-command-safe-positional': 'The sampled safe arithmetic retains the existing conservative positional-source decision; no expression evaluation is introduced (#1496).',
     'helper-hd-round10-sub-substring-unset-conservative': 'The sampled unset string does not evaluate its offset. The initialized paired source diagnoses; arithmetic context inventory does not infer runtime binding/state (#1496).',
     'helper-hd-round10-indirect-named-set-control': 'The sampled indirect target is initialized and emits no error word. HD guard admission does not infer ambient indirection or parameter bindings (#1496).',
     'helper-hd-round10-indirect-positional-set-control': 'The sampled indirect positional target names an initialized parameter. HD guard admission retains possible diagnostics without runtime target/binding evaluation (#1496).',
@@ -11697,6 +11820,41 @@ def _heredoc_indirect_source_arithmetic_cases():
     return failures
 
 
+def _heredoc_command_index_context_cases():
+    """Only bounded, already-unquoted arithmetic roles opt into HD semantics."""
+    failures = []
+    samples = ((" ((1/'$1')) ", ("command", 1, 3, 9, 11)),
+               ("a['$1']=value", ("index", 1, 2, 6, 7)),
+               ("a[1/'$1]']=value", ("index", 1, 2, 9, 10)))
+    for source, span in samples:
+        if Lexer(source).arithmetic_context_spans:
+            failures.append("ordinary Lexer admitted arithmetic metadata: " + source)
+        if Lexer(source, arithmetic_contexts=True).arithmetic_context_spans != [span]:
+            failures.append("actual arithmetic coordinate bounds changed: " + source)
+        if not _heredoc_substitution_has_positional(source, _DEFERRED_SHELL_DEPTH):
+            failures.append("reached arithmetic wrongly spends child depth: " + source)
+    for source in ("printf '%s' '((1/$1))'", "printf '%s' a['$1']=value",
+                   "# ((1/'$1'))\nprintf safe", "# a['$1']=value\nprintf safe",
+                   "args=(a['$1']=value)", "a[1+2]='$1'",
+                   "((1+2)); printf '%s' '$1'", "a[1+2]=value; printf '%s' '$1'"):
+        if _heredoc_substitution_has_positional(source):
+            failures.append("literal/argument/RHS/tail arithmetic context changed: " + source)
+    if Lexer("args=(a['$1']=value)", arithmetic_contexts=True).arithmetic_context_spans:
+        failures.append("array assignment DATA admitted as executable index")
+    for program in ("if time ((1/'$1'));then :;fi", "! time ((1/'$1'))",
+                    "time a['$1']=value", "time -p a['$1']=value"):
+        if not _heredoc_substitution_has_positional(program):
+            failures.append("literal time arithmetic role missing: " + program)
+    for program in ("'time' ((1/'$1'))", "ti\\me ((1/'$1'))",
+                    "command time ((1/'$1'))", "builtin time ((1/'$1'))",
+                    "env time ((1/'$1'))", "/usr/bin/time ((1/'$1'))",
+                    "time '-p' ((1/'$1'))", "time -x ((1/'$1'))",
+                    "time printf '%s' '((1/$1))'"):
+        if _heredoc_substitution_has_positional(program):
+            failures.append("opaque/data time prefix admitted as arithmetic: " + program)
+    return failures
+
+
 def self_test():
     failures = []
     passed = 0
@@ -11714,6 +11872,7 @@ def self_test():
     failures.extend(_heredoc_opaque_owner_cases())
     failures.extend(_heredoc_guard_nested_attributes_cases())
     failures.extend(_heredoc_indirect_source_arithmetic_cases())
+    failures.extend(_heredoc_command_index_context_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
