@@ -232,7 +232,11 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     helper reaching it through other helpers is found regardless of definition
     order or chain length. Textual definitions are not proof of execution;
     a later or false-branch emitter can conservatively flag a safe runtime
-    call. No control-flow or runtime function table is inferred. A helper is
+    call. No control-flow or runtime function table is inferred.
+    Helper arguments, error words and interpolating here-doc bodies share
+    the positional-value decision, with here-doc quotes literal and backslash
+    quoting only dollar, backtick, backslash and newline. Quoted delimiters
+    suppress body expansion. A helper is
     graded on what its body writes, not on where that write GOES, so a helper
     whose emitter feeds a pipe is treated as emitting -- declared conservatism
     below.
@@ -3113,9 +3117,6 @@ def _why(note, base):
 # In-file message-helper discovery
 # ==========================================================================
 
-_POSITIONAL_RE = re.compile(r"\$(?:[1-9][0-9]*|[@*]|\{(?:[1-9][0-9]*|[@*])\})")
-
-
 def _find_compound_close(text, open_idx):
     """Return the matching close index for a brace group or subshell body.
 
@@ -3456,10 +3457,8 @@ def discover_emitter_helpers(text):
                         continue
                     cmd, _ = resolve_command(hd.owner)
                     if cmd in STDIN_ECHOERS or cmd in EMITTERS:
-                        for _lno, raw in hd.body_lines:
-                            if _POSITIONAL_RE.search(raw):
-                                emits = True
-                                break
+                        body = "\n".join(raw for _lno, raw in hd.body_lines)
+                        emits = _word_has_verbatim_positional(body, in_heredoc=True)
                     if emits:
                         break
             if emits:
@@ -3470,7 +3469,7 @@ def discover_emitter_helpers(text):
     return frozenset(helpers)
 
 
-def _word_has_verbatim_positional(w):
+def _word_has_verbatim_positional(w, in_heredoc=False):
     """True when the word expands a positional parameter's VALUE.
 
     Single-quoted text never expands, `${1:+set}` is a constant alternate and
@@ -3478,31 +3477,44 @@ def _word_has_verbatim_positional(w):
     forms the check documents for callers.  Inside double quotes an
     apostrophe is literal (#1494); see `_ExactReadUnavailable` for how that
     reading falls back.
+
+    In an interpolating here-doc, quotes are literal and backslash quotes
+    only dollar, backtick, backslash and newline. Remove unescaped continued
+    newlines before the shared positional decision; an escaped backslash
+    pair stays intact and cannot turn the following newline into a join.
     """
+    if in_heredoc:
+        w = re.sub(
+            r"\\([$`\\]|\n)",
+            lambda m: "" if m.group(1) == "\n" else m.group(0),
+            w,
+        )
     try:
-        return _word_has_verbatim_positional_exact(w)
+        return _word_has_verbatim_positional_exact(w, in_heredoc)
     except _ExactReadUnavailable:
-        return _word_has_verbatim_positional_legacy(w)
+        return _word_has_verbatim_positional_legacy(w, in_heredoc)
 
 
-def _word_has_verbatim_positional_exact(w):
+def _word_has_verbatim_positional_exact(w, in_heredoc=False):
     i = 0
     n = len(w)
     in_double = False
     while i < n:
         c = w[i]
-        if c == "\\" and i + 1 < n:
+        if (c == "\\" and i + 1 < n
+                and (not in_heredoc or w[i + 1] in "$`\\\n")):
             i += 2
             continue
-        if c == '"':
+        if c == '"' and not in_heredoc:
             in_double = not in_double
             i += 1
             continue
-        if c == "'" and not in_double:
+        if c == "'" and not in_double and not in_heredoc:
             j = w.find("'", i + 1)
             i = n if j == -1 else j + 1
             continue
-        if in_double and (c == "`" or (c == "$" and w[i + 1 : i + 2] == "(")):
+        if ((in_double or in_heredoc)
+                and (c == "`" or (c == "$" and w[i + 1 : i + 2] == "("))):
             # The body still expands: grade it as a word of its own.
             end = _double_quoted_construct_end(w, i)
             closed = c != "`" or (end - 1 > i and w[end - 1] == "`")
@@ -3511,7 +3523,7 @@ def _word_has_verbatim_positional_exact(w):
                 return True
             i = end
             continue
-        if in_double and c == "$" and w[i + 1 : i + 2] == "{":
+        if (in_double or in_heredoc) and c == "$" and w[i + 1 : i + 2] == "{":
             _simple_parameter_end(w, i)  # raises on a word it cannot read
         if c == "$":
             if i + 1 < n and w[i + 1] == "{":
@@ -3535,15 +3547,16 @@ def _word_has_verbatim_positional_exact(w):
     return False
 
 
-def _word_has_verbatim_positional_legacy(w):
+def _word_has_verbatim_positional_legacy(w, in_heredoc=False):
     i = 0
     n = len(w)
     while i < n:
         c = w[i]
-        if c == "\\" and i + 1 < n:
+        if (c == "\\" and i + 1 < n
+                and (not in_heredoc or w[i + 1] in "$`\\\n")):
             i += 2
             continue
-        if c == "'":
+        if c == "'" and not in_heredoc:
             j = w.find("'", i + 1)
             i = n if j == -1 else j + 1
             continue
@@ -5308,6 +5321,97 @@ CORPUS = [
         "helper-heredoc",
         MUST_FLAG,
         'usage() {\n  cat <<EOF\ntoken=$1\nEOF\n}\nusage "$GH_TOKEN"\n',
+    ),
+    # #1496: one positional-value decision with here-doc quoting rules.
+    (
+        'helper-heredoc-positional-default',
+        MUST_FLAG,
+        'die() { cat <<EOF >&2\nerror: ${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-direct',
+        MUST_FLAG,
+        'die() { cat <<EOF >&2\nerror: $1\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-escaped',
+        MUST_NOT_FLAG,
+        'die() { cat <<EOF >&2\nerror: \\$1\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-single-quotes-literal',
+        MUST_FLAG,
+        'die() { cat <<EOF >&2\nerror: \'$1\'\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-double-quotes-literal',
+        MUST_FLAG,
+        'die() { cat <<EOF >&2\nerror: "$1"\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-nonspecial-escaped-apostrophe',
+        MUST_FLAG,
+        'die() { cat <<EOF >&2\nerror: \\\'$1\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-nonspecial-escaped-quote',
+        MUST_FLAG,
+        'die() { cat <<EOF >&2\nerror: \\"$1\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-paired-backslashes',
+        MUST_FLAG,
+        'die() { cat <<EOF >&2\nerror: \\\\$1\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-escaped-default',
+        MUST_NOT_FLAG,
+        'die() { cat <<EOF >&2\nerror: \\${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-continued-name',
+        MUST_FLAG,
+        'die() { cat <<EOF >&2\nerror: $\\\n1\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-escaped-continued-name',
+        MUST_NOT_FLAG,
+        'die() { cat <<EOF >&2\nerror: \\$\\\n1\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-constant-alternate',
+        MUST_NOT_FLAG,
+        'die() { cat <<EOF >&2\nerror: ${1:+set}\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-length',
+        MUST_NOT_FLAG,
+        'die() { cat <<EOF >&2\nerror: ${#1}\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-substitution-quoted-data',
+        MUST_NOT_FLAG,
+        'die() { cat <<EOF >&2\nerror: $(printf \'%s\' \'$1\')\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-substitution-value',
+        MUST_FLAG,
+        'die() { cat <<EOF >&2\nerror: $(printf \'%s\' "$1")\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-quoted-heredoc-positional-default',
+        MUST_NOT_FLAG,
+        'die() { cat <<\'EOF\' >&2\nerror: ${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-quoted-heredoc-positional-direct',
+        MUST_NOT_FLAG,
+        'die() { cat <<\'EOF\' >&2\nerror: $1\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-quoted-heredoc-positional-escaped',
+        MUST_NOT_FLAG,
+        'die() { cat <<\'EOF\' >&2\nerror: \\$1\nEOF\n}\ndie "$GH_TOKEN"\n',
     ),
     (
         # `cat`/`tee` write their STANDARD INPUT, so a helper handing a
