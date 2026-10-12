@@ -240,7 +240,14 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     source escape layer before the ordinary positional decision; modern
     substitutions retain ordinary source. Actual substitution source uses the
     existing literal deferred-operand extractor within its one-hop budget.
-    Direct here-doc DATA promotes stdin consumers only; executable substitution
+    Direct here-doc DATA retains conservative known-stdin-consumer admission.
+    Quiet cat/tee shadow and command-report forms remain conservative (#1052
+    item 3): textual declarations cannot prove active bindings. A catalog veto
+    misses late, false-branch and restored-builtin emission, so no runtime
+    definition/order/mutation model is added here.
+    Continued openers are normalized before independent expansion/error-word
+    searches; positional arithmetic is conservatively retained for diagnostics
+    without evaluating its value. Executable substitution
     and error-word evidence remains independent of that owner. Helper inventory
     stays conservative about captured/no-output source and does not infer
     runtime emission. A helper is
@@ -1073,7 +1080,7 @@ def redirects_stdout(seg):
     return any(_STDOUT_REDIR_RE.match(w) for w in seg.words)
 
 
-def _find_substitutions(s, quotes_are_literal=False):
+def _find_substitutions(s, quotes_are_literal=False, include_arithmetic=False):
     """Yield (body, start_offset, end_offset) for every COMMAND SUBSTITUTION.
 
     Used for the two places the main loop hands over a span of text WHOLE
@@ -1101,6 +1108,10 @@ def _find_substitutions(s, quotes_are_literal=False):
     newline and leaves it literal elsewhere, and neither reading changes
     where a `$(` or a backtick begins.
 
+    The heredoc diagnostic caller can opt into arithmetic spans using the
+    same balanced bounds. Default callers still inventory command substitutions
+    only; no arithmetic value is evaluated.
+
     Only the outermost span is yielded -- anything nested inside is found
     when that body is lexed on its own.
 
@@ -1108,14 +1119,14 @@ def _find_substitutions(s, quotes_are_literal=False):
     `_ExactReadUnavailable` for how that reading falls back.
     """
     if quotes_are_literal:
-        return _find_substitutions_legacy(s, quotes_are_literal)
+        return _find_substitutions_legacy(s, quotes_are_literal, include_arithmetic)
     try:
-        return _find_substitutions_exact(s)
+        return _find_substitutions_exact(s, include_arithmetic)
     except _ExactReadUnavailable:
-        return _find_substitutions_legacy(s, quotes_are_literal)
+        return _find_substitutions_legacy(s, quotes_are_literal, include_arithmetic)
 
 
-def _find_substitutions_exact(s):
+def _find_substitutions_exact(s, include_arithmetic=False):
     out = []
     i = 0
     n = len(s)
@@ -1142,7 +1153,8 @@ def _find_substitutions_exact(s):
         if in_double and c == "$" and s[i + 1 : i + 2] == "{":
             i = _simple_parameter_end(s, i)
             continue
-        if c == "$" and s[i + 1 : i + 2] == "(" and s[i + 2 : i + 3] != "(":
+        if (c == "$" and s[i + 1 : i + 2] == "("
+                and (include_arithmetic or s[i + 2 : i + 3] != "(")):
             end = _skip_balanced_parens(s, i + 1)
             out.append((s[i + 2 : end - 1], i, end))
             i = end
@@ -1158,7 +1170,7 @@ def _find_substitutions_exact(s):
     return out
 
 
-def _find_substitutions_legacy(s, quotes_are_literal=False):
+def _find_substitutions_legacy(s, quotes_are_literal=False, include_arithmetic=False):
     out = []
     i = 0
     n = len(s)
@@ -1177,7 +1189,8 @@ def _find_substitutions_legacy(s, quotes_are_literal=False):
             in_single = True
             i += 1
             continue
-        if c == "$" and s[i + 1 : i + 2] == "(" and s[i + 2 : i + 3] != "(":
+        if (c == "$" and s[i + 1 : i + 2] == "("
+                and (include_arithmetic or s[i + 2 : i + 3] != "(")):
             end = _skip_balanced_parens(s, i + 1)
             out.append((s[i + 2 : end - 1], i, end))
             i = end
@@ -3463,17 +3476,25 @@ def discover_emitter_helpers(text):
                     if not hd.interpolating:
                         continue
                     cmd, _ = resolve_command(hd.owner)
-                    body = "\n".join(raw for _lno, raw in hd.body_lines)
+                    body = _heredoc_continuation_text(
+                        "\n".join(raw for _lno, raw in hd.body_lines)
+                    )
                     if cmd in STDIN_ECHOERS:
                         emits = _word_has_verbatim_positional(body, in_heredoc=True)
                     else:
                         # Direct stdin DATA is inert for argument emitters.
                         # Actual substitutions still execute independently;
                         # retain the existing conservative helper inventory.
-                        for inner, start, _end in _find_substitutions(body, quotes_are_literal=True):
+                        for inner, start, _end in _find_substitutions(
+                                body, quotes_are_literal=True, include_arithmetic=True):
                             if body[start] == "`":
                                 inner = _backtick_positional_source(inner)
                             if _heredoc_substitution_has_positional(inner):
+                                emits = True
+                                break
+                    if not emits:
+                        for start, end in _error_word_spans(body):
+                            if _word_has_verbatim_positional(body[start:end], in_heredoc=True):
                                 emits = True
                                 break
                     if emits:
@@ -3509,6 +3530,15 @@ def _heredoc_substitution_has_positional(body, _depth=0):
     return False
 
 
+def _heredoc_continuation_text(body):
+    """Apply the existing unquoted-heredoc continuation rule once."""
+    return re.sub(
+        r"\\([$`\\]|\n)",
+        lambda m: "" if m.group(1) == "\n" else m.group(0),
+        body,
+    )
+
+
 def _word_has_verbatim_positional(w, in_heredoc=False):
     """True when the word expands a positional parameter's VALUE.
 
@@ -3528,11 +3558,7 @@ def _word_has_verbatim_positional(w, in_heredoc=False):
     existing one-hop bound, without interpreting general parameter flow.
     """
     if in_heredoc:
-        w = re.sub(
-            r"\\([$`\\]|\n)",
-            lambda m: "" if m.group(1) == "\n" else m.group(0),
-            w,
-        )
+        w = _heredoc_continuation_text(w)
     try:
         return _word_has_verbatim_positional_exact(w, in_heredoc)
     except _ExactReadUnavailable:
@@ -7485,6 +7511,57 @@ CORPUS = [
     ('helper-hd-printf-no-output-deferred-conservative', MUST_FLAG, 'die() { printf safe <<EOF\n$(eval \': $1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ('helper-hd-printf-captured-direct-stdout-conservative', MUST_FLAG, 'die() { printf safe <<EOF\n$(echo "$1")\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ('helper-hd-callback-data-control', MUST_NOT_FLAG, 'die() { cat <<EOF\n$(mapfile -C \'printf literal;\' -c 1 rows < <(printf \'x\\n\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    # #1496: shadowing, continued openers and arithmetic diagnostics.
+    ('helper-hd-round4-shadow-cat-default', MUST_FLAG, 'cat() { :; }\ndie() { cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-tee-default', MUST_FLAG, 'tee() { :; }\ndie() { tee <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-known-cat-default-control', MUST_FLAG, 'die() { cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-known-tee-default-control', MUST_FLAG, 'die() { tee <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-cat-independent-substitution', MUST_FLAG, 'cat() { :; }\ndie() { cat <<EOF\n$(echo "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-cat-independent-error-word', MUST_FLAG, 'cat() { :; }\ndie() { cat <<EOF\n${UNSET:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-continued-command-substitution', MUST_FLAG, 'die() { printf safe <<EOF\n$\\\n(echo "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-continued-error-word', MUST_FLAG, 'die() { printf safe <<EOF\n$\\\n{UNSET:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-continued-command-substitution-direct', MUST_FLAG, 'printf safe <<EOF\n$\\\n(echo "$GH_TOKEN" >&2)\nEOF\n'),
+    ('helper-hd-round4-continued-error-word-direct', MUST_FLAG, 'printf safe <<EOF\n$\\\n{UNSET:?$GH_TOKEN}\nEOF\n'),
+    ('helper-hd-round4-quoted-continued-command-control', MUST_NOT_FLAG, 'die() { printf safe <<\'EOF\'\n$\\\n(echo "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-quoted-continued-error-control', MUST_NOT_FLAG, 'die() { printf safe <<\'EOF\'\n$\\\n{UNSET:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-arithmetic-diagnostic', MUST_FLAG, 'die() { printf safe <<EOF\n$((1 / $1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-arithmetic-diagnostic-echo', MUST_FLAG, 'die() { echo safe <<EOF\n$((1 / $1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-arithmetic-diagnostic-direct', MUST_FLAG, 'printf safe <<EOF\n$((1 / $GH_TOKEN))\nEOF\n'),
+    ('helper-hd-round4-arithmetic-safe-conservative', MUST_FLAG, 'die() { printf safe <<EOF\n$((0 + $1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-arithmetic-escaped-opener-control', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n\\$((1 / $1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-arithmetic-quoted-delimiter-control', MUST_NOT_FLAG, 'die() { printf safe <<\'EOF\'\n$((1 / $1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-arithmetic-literal-control', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$((1 + 2))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-arithmetic-continued-opener', MUST_FLAG, 'die() { printf safe <<EOF\n$\\\n((1 / $1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-continuation-2-backslashes-substitution', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$\\\\\n(echo "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-continuation-2-backslashes-error-word', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$\\\\\n{UNSET:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-continuation-3-backslashes-substitution', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$\\\\\\\n(echo "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-continuation-3-backslashes-error-word', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$\\\\\\\n{UNSET:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-escaped-substitution-control', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n\\$(echo "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-escaped-error-word-control', MUST_FLAG, 'die() { printf safe <<EOF\n\\${UNSET:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-cat-command-bypass', MUST_FLAG, 'cat() { :; }\ndie() { command cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-tee-command-bypass', MUST_FLAG, 'tee() { :; }\ndie() { command tee <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-cat-literal-path-bypass', MUST_FLAG, 'cat() { :; }\ndie() { /bin/cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-tee-literal-path-bypass', MUST_FLAG, 'tee() { :; }\ndie() { /usr/bin/tee <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-cat-command-default-path', MUST_FLAG, 'cat() { :; }\ndie() { command -p -- cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-cat-command-report-control', MUST_FLAG, 'cat() { :; }\ndie() { command -v cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-command-cat-data-control', MUST_FLAG, 'command() { :; }\ncat() { :; }\ndie() { command cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-cat-command-redirection-target-control', MUST_FLAG, 'cat() { :; }\ndie() { >command cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-cat-command-upper-report-control', MUST_FLAG, 'cat() { :; }\ndie() { command -V cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-nested-command-report-control', MUST_FLAG, 'cat() { :; }\ndie() { command -v command cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-inner-command-report-control', MUST_FLAG, 'cat() { :; }\ndie() { command command -V cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-unshadowed-command-report-control', MUST_FLAG, 'die() { command -v cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-unshadowed-command-upper-report-control', MUST_FLAG, 'die() { command -V tee <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-qualified-command-report-control', MUST_FLAG, 'cat() { :; }\ndie() { command -v /bin/cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-command-qualified-target-control', MUST_FLAG, 'command() { :; }\ncat() { :; }\ndie() { command /bin/cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-command-unshadowed-target-control', MUST_FLAG, 'command() { :; }\ndie() { command cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-cat-command-qualified-target-bypass', MUST_FLAG, 'cat() { :; }\ndie() { command /bin/cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-cat-defined-after-call', MUST_FLAG, 'die() { cat <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\ncat() { :; }\n'),
+    ('helper-hd-round4-cat-defined-in-false-branch', MUST_FLAG, 'if false; then cat() { :; }\nfi\ndie() { cat <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-tee-defined-after-call', MUST_FLAG, 'die() { tee <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\ntee() { :; }\n'),
+    ('helper-hd-round4-tee-defined-in-false-branch', MUST_FLAG, 'if false; then tee() { :; }\nfi\ndie() { tee <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-command-defined-after-call', MUST_FLAG, 'die() { command cat <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\ncommand() { :; }\n'),
+    ('helper-hd-round4-command-defined-in-false-branch', MUST_FLAG, 'if false; then command() { :; }\nfi\ndie() { command cat <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-cat-restored-before-call', MUST_FLAG, 'cat() { :; }\nunset -f cat\ndie() { cat <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
     # --- a credential NAME split by a line continuation ------------------
     #
     # Bash removes `\<newline>` before it parses the expansion, so these name
@@ -8217,6 +8294,108 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    'helper-hd-round4-shadow-cat-default': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-shadow-tee-default': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-shadow-cat-command-report-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-shadow-command-cat-data-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-shadow-cat-command-redirection-target-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-shadow-cat-command-upper-report-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-nested-command-report-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-inner-command-report-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-unshadowed-command-report-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-unshadowed-command-upper-report-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-qualified-command-report-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-shadow-command-qualified-target-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-shadow-command-unshadowed-target-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    "helper-hd-round4-arithmetic-safe-conservative": (
+        "Positional arithmetic may diagnose before the stdin owner runs. "
+        "The sampled addition emits nothing; retaining a conservative value "
+        "inventory does not evaluate arithmetic or prove diagnostics (#1496)."
+    ),
+    "helper-hd-round4-escaped-error-word-control": (
+        "The raw helper error-word fallback already grades the positional "
+        "inside an escaped opener conservatively although this runtime heredoc "
+        "is quiet. Preserve this preexisting limit without changing the shared "
+        "error-word reader as part of continuation repair (#1496)."
+    ),
     'helper-hd-printf-captured-deferred-stdout-conservative': (
         "The helper inventories a positional in executable substitution "
         "source, although this sampled source writes no output or its stdout "
@@ -9160,6 +9339,35 @@ def _heredoc_deferred_positional_cases():
     return failures
 
 
+def _heredoc_shadow_continuation_arithmetic_cases():
+    """Pin continuation, diagnostic expansion and unchanged default readers."""
+    failures = []
+    for slashes in [1, 2, 3]:
+        raw = "$" + "\\" * slashes + "\n(echo $1)"
+        wanted = "$(echo $1)" if slashes == 1 else (raw if slashes == 2 else "$\\\\(echo $1)")
+        if _heredoc_continuation_text(raw) != wanted:
+            failures.append("heredoc continuation parity: " + str(slashes))
+    raw = "x $((1 / $1)) y"
+    start, end = raw.index("$"), raw.rindex(")") + 1
+    for read in (_find_substitutions_exact, _find_substitutions_legacy):
+        if read(raw):
+            failures.append("default expansion inventory changed: " + read.__name__)
+        spans = read(raw, include_arithmetic=True)
+        if spans != [(raw[start + 2:end - 1], start, end)]:
+            failures.append("opt-in arithmetic boundary: " + read.__name__)
+    if _find_substitutions(raw):
+        failures.append("default shared expansion inventory admitted arithmetic")
+    seg = Lexer('command true "$GH_TOKEN"').logical[0].segments[0]
+    if classify(seg, set()) != SAFE:
+        failures.append("default command classification changed")
+    def helper(owner, body):
+        return "die() { " + owner + " <<EOF\n" + body + "\nEOF\n}\n"
+    for body in ['$\\\n(echo "$1" >&2)', '$\\\n{UNSET:?$1}', '$((1 / $1))']:
+        if "die" not in discover_emitter_helpers(helper("printf safe", body)):
+            failures.append("independent continued/diagnostic HD evidence lost: " + repr(body))
+    return failures
+
+
 def self_test():
     failures = []
     passed = 0
@@ -9170,6 +9378,7 @@ def self_test():
     failures.extend(_function_definition_cases())
     failures.extend(_heredoc_backtick_positional_cases())
     failures.extend(_heredoc_deferred_positional_cases())
+    failures.extend(_heredoc_shadow_continuation_arithmetic_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
