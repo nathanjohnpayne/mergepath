@@ -3131,6 +3131,223 @@ for SOURCE in \
   fi
 done
 
+# Case 65x: complete literal config words and effective known selectors.
+for CONFIG_WORD in 'c\onfig' 'con"fig"' "'config'"; do
+  for REL in tests/literal-config.sh docs/literal-config.md; do
+    run_on_fixture "$REL" "git $CONFIG_WORD user.email leak@example.invalid
+"
+    if [ "$RC" = 1 ]; then pass "ordinary quoted/escaped config subcommand remains an instruction"; else
+      fail "literal config hidden: word='$CONFIG_WORD' rel=$REL rc=$RC out=$OUT"
+    fi
+    run_on_fixture "$REL" "git -C \"\$FIX\" $CONFIG_WORD user.email fixture@example.invalid
+"
+    if [ "$RC" = 0 ]; then pass "quoted config retains real fixture target"; else
+      fail "quoted config target rejected: rc=$RC out=$OUT"
+    fi
+  done
+  run_on_fixture docs/literal-config-prose.md "If you can't, run git $CONFIG_WORD user.email leak@example.invalid
+"
+  if [ "$RC" = 1 ]; then pass "literal config normalization survives prose punctuation"; else
+    fail "quoted config prose hidden: rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  'git -c foo.bar="config --global" config user.email leak@example.invalid' \
+  'git -c foo.bar="--no-global" config --global --no-global user.email leak@example.invalid' \
+  'git config --global --no-global user.email leak@example.invalid' \
+  'git config --gl --no-global user.email leak@example.invalid' \
+  'git config --system --no-system user.email leak@example.invalid' \
+  'git config --file "$FIX/config" --no-file user.email leak@example.invalid' \
+  'git config --blob HEAD:config --no-blob user.email leak@example.invalid' \
+  'git config --get --no-get user.email leak@example.invalid' \
+  'git config --get-all --no-get-all user.email leak@example.invalid' \
+  'git config --unset --no-unset user.email leak@example.invalid'; do
+  run_on_fixture tests/cancelled-selector.sh "$SOURCE
+"
+  if [ "$RC" = 1 ]; then pass "cancelled known scope/read selector cannot clear literal writer"; else
+    fail "cancelled selector cleared writer: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+  run_on_fixture tests/cancelled-selector-marker.sh "$SOURCE # GIT_IDENTITY_SCOPE_EXEMPT: intentional isolated fixture
+"
+  if [ "$RC" = 0 ]; then pass "cancelled selector retains genuine explicit exemption"; else
+    fail "cancelled selector marker rejected: rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  'git config --global --no-global --global user.email fixture@example.invalid' \
+  'git config --system --no-system --sy user.email fixture@example.invalid' \
+  'git config --get --no-get --get user.email fixture@example.invalid' \
+  'git -C "$FIX" config --global --no-global user.email fixture@example.invalid' \
+  'git config --global --no-global --file "$FIX/config" user.email fixture@example.invalid' \
+  'git config --default "--no-get" --get user.email fixture@example.invalid' \
+  'git -c foo.bar="--no-global" config --global user.email fixture@example.invalid' \
+  'git -C "config" status user.email fixture@example.invalid' \
+  'git status "config" user.email fixture@example.invalid'; do
+  run_on_fixture tests/retained-selector.sh "$SOURCE
+"
+  if [ "$RC" = 0 ]; then pass "real final/independent safety mode survives; config operands stay data"; else
+    fail "retained selector/data rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+
+# Case 65y: only an open ordinary substitution gains physical continuation.
+for SOURCE in \
+  $'git -c foo.bar=$(printf a\nprintf b) config user.email leak@example.invalid' \
+  $'git -c foo.bar="$(printf a\nprintf b)" config user.email leak@example.invalid' \
+  $'git -c foo.bar=$(printf "$(printf a\nprintf b)") config user.email leak@example.invalid' \
+  $'echo $(printf a\ngit config user.email leak@example.invalid\n)' \
+  $'echo $(printf a\ngit config user.email leak@example.invalid'; do
+  run_on_fixture tests/multiline-substitution.sh "$SOURCE
+"
+  if [ "$RC" = 1 ]; then pass "multiline ordinary substitution preserves literal outer/body writer"; else
+    fail "multiline substitution writer hidden: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  $'git -C "$FIX" -c foo.bar=$(printf a\nprintf b) config user.email fixture@example.invalid' \
+  $'git -c foo.bar=$(printf a\nprintf b) config --global user.email fixture@example.invalid' \
+  $'git -c foo.bar=$(printf a\nprintf b) config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture' \
+  $'echo $(printf a\ngit -C "$FIX" config user.email fixture@example.invalid\n)' \
+  $'echo $(printf a\nprintf "git config user.email fixture@example.invalid"\n)' \
+  $'git -c foo.bar=$(printf a\nprintf b) config $(printf user.email) fixture@example.invalid'; do
+  run_on_fixture tests/multiline-substitution-control.sh "$SOURCE
+"
+  if [ "$RC" = 0 ]; then pass "multiline literal target/marker/data boundaries retained without evaluation"; else
+    fail "multiline control rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for PREFIX in "printf '%s' '\$(printf a'" 'printf "%s" \$(printf a' '# $(printf a'; do
+  run_on_fixture tests/literal-dollar-lines.sh "$PREFIX
+git config --global user.email fixture@example.invalid
+git config user.email leak@example.invalid
+"
+  if [ "$RC" = 1 ] && printf '%s' "$OUT" | grep -q 'literal-dollar-lines.sh:3'; then
+    pass "quoted/escaped/comment dollar does not absorb following physical writer"
+  else
+    fail "literal dollar joined unrelated commands: prefix='$PREFIX' rc=$RC out=$OUT"
+  fi
+done
+# EOF must not join a substitution to another tracked source file.
+MULTIFILE="$WORKDIR/multiline-substitution-files"
+mkdir -p "$MULTIFILE"
+printf 'git -c foo.bar=$(printf a\n' > "$MULTIFILE/a.sh"
+printf 'printf b) config user.email fixture@example.invalid\n' > "$MULTIFILE/b.sh"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$MULTIFILE" bash "$CHECK" 2>&1)"; RC=$?
+set -e
+if [ "$RC" = 0 ]; then pass "open substitution buffer resets at file boundary"; else
+  fail "substitution crossed source files: rc=$RC out=$OUT"
+fi
+
+# Independent review controls: comment data cannot close a substitution,
+# and an actual body newline separates a plain read from the next command.
+for SOURCE in \
+  $'git -c foo.bar=$(\nprintf a # )\nprintf b\n) config user.email leak@example.invalid' \
+  $'git -c foo.bar=$(\nprintf "# )"\nprintf b\n) config user.email leak@example.invalid' \
+  $'git -c foo.bar=$(\nprintf a \\#\n) config user.email leak@example.invalid' \
+  $'git -c foo.bar=$(\nprintf a#data\n) config user.email leak@example.invalid' \
+  $'value=$(git config user.email fixture@example.invalid\nprintf "%s" "$suffix")'; do
+  run_on_fixture tests/substitution-comment-and-body.sh "$SOURCE
+"
+  if [ "$RC" = 1 ]; then pass "comment/hash data and genuine closer retain actual literal writer"; else
+    fail "substitution extent/body writer hidden: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+  run_on_fixture tests/substitution-comment-marker.sh "$SOURCE # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+"
+  if [[ "$SOURCE" == value=* ]]; then
+    if [ "$RC" = 1 ]; then pass "later marker cannot exempt an independently offending body physical line"; else
+      fail "later marker widened physical exemption: rc=$RC out=$OUT"
+    fi
+  elif [ "$RC" = 0 ]; then pass "genuine trailing exemption survives comment/body newline handling"; else
+    fail "substitution trailing exemption rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  $'git -C "$FIX" -c foo.bar=$(\nprintf a # )\nprintf b\n) config user.email fixture@example.invalid' \
+  $'value=$(git config user.email\nprintf "%s" "$suffix")' \
+  $'value="$(git config user.email\nprintf "%s" "$suffix")"' \
+  $'value=$(git config user.email\nprintf "%s" "git config user.email fixture@example.invalid")' \
+  $'value=$(git config user.email\ngit -C "$FIX" config user.email fixture@example.invalid)'; do
+  run_on_fixture tests/substitution-newline-read.sh "$SOURCE
+"
+  if [ "$RC" = 0 ]; then pass "unquoted body newline keeps a plain read distinct from later command/data"; else
+    fail "body newline read became assignment: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture tests/substitution-newline-neighbour.sh $'value=$(git config user.email\nprintf "%s" "$suffix"); git config user.email leak@example.invalid\n'
+if [ "$RC" = 1 ]; then pass "body read cannot suppress a following outer identity writer"; else
+  fail "body newline read hid neighbouring writer: rc=$RC out=$OUT"
+fi
+
+run_on_fixture tests/substitution-body-line-marker.sh $'value=$(git config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture\nprintf "%s" "$suffix")\n'
+if [ "$RC" = 0 ]; then pass "actual marker on body writer physical line retains explicit exemption"; else
+  fail "body physical-line marker rejected: rc=$RC out=$OUT"
+fi
+run_on_fixture tests/substitution-body-neighbour-marker.sh $'value=$(git config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture\ngit config user.name leak\n)\n'
+if [ "$RC" = 1 ] && printf '%s' "$OUT" | grep -q 'substitution-body-neighbour-marker.sh:2'; then
+  pass "body physical-line marker cannot exempt a second independent body writer"
+else
+  fail "body marker widened to later writer: rc=$RC out=$OUT"
+fi
+
+# Comment prose in a contained body cannot quote a later continued writer.
+for NOTE in "# someone's note" '# plain note' '# ) ; $( data'; do
+  run_on_fixture tests/body-comment-state.sh "value=\$(
+git config --get user.email $NOTE
+git \\
+config user.name leak
+)
+"
+  if [ "$RC" = 1 ]; then pass "body comment punctuation cannot hide following continued writer"; else
+    fail "body comment changed command state: note='$NOTE' rc=$RC out=$OUT"
+  fi
+  run_on_fixture tests/body-comment-scope.sh "value=\$(
+git config --get user.email $NOTE
+git -C \"\$FIX\" \\
+config user.name fixture
+)
+"
+  if [ "$RC" = 0 ]; then pass "comment punctuation preserves following real fixture target"; else
+    fail "body comment scoped control rejected: note='$NOTE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture tests/body-comment-actual-marker.sh $'value=$(\ngit config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: someone\'s isolated fixture\ngit config --get user.email\n)\n'
+if [ "$RC" = 0 ]; then pass "original body comment bytes retain genuine exemption with apostrophe reason"; else
+  fail "body comment marker lost: rc=$RC out=$OUT"
+fi
+run_on_fixture tests/body-comment-marker-neighbour.sh $'value=$(\ngit config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: someone\'s isolated fixture\ngit \\\nconfig user.name leak\n)\n'
+if [ "$RC" = 1 ]; then pass "body comment exemption does not widen to continued unmarked neighbour"; else
+  fail "body comment marker swallowed neighbour: rc=$RC out=$OUT"
+fi
+run_on_fixture tests/body-comment-quoted-data.sh $'value=$(\ngit -c foo.bar="# someone\'s note" \\\nconfig user.email leak@example.invalid\n)\n'
+if [ "$RC" = 1 ]; then pass "quoted hash/apostrophe stays option data and cannot exempt a writer"; else
+  fail "quoted comment data changed writer: rc=$RC out=$OUT"
+fi
+run_on_fixture tests/body-comment-printed-data.sh $'value=$(\nprintf "%s" "# someone\'s git config user.email fixture@example.invalid"\n)\n'
+if [ "$RC" = 0 ]; then pass "quoted printed comment/command data does not become an instruction"; else
+  fail "printed comment data became instruction: rc=$RC out=$OUT"
+fi
+
+# Case 65z: owner-ratified Bats admission is bounded to .bats/env-bats.
+for REL in tests/setup.bats tests/setup.BATS tests/setup; do
+  run_on_fixture "$REL" $'#!/usr/bin/env bats\n@test "fixture" {\n  git config user.email leak@example.invalid\n}\n'
+  if [ "$RC" = 1 ] && printf '%s' "$OUT" | grep -q "$REL:3"; then pass "Bats extension/shebang admits literal fixture setup"; else
+    fail "Bats source skipped: rel=$REL rc=$RC out=$OUT"
+  fi
+  run_on_fixture "$REL" $'#!/usr/bin/env bats\n@test "fixture" {\n  git -C "$FIX" config user.email fixture@example.invalid\n  git config user.name fixture # GIT_IDENTITY_SCOPE_EXEMPT: intentional isolated fixture\n}\n'
+  if [ "$RC" = 0 ]; then pass "Bats setup retains explicit fixture target and genuine exemption"; else
+    fail "Bats legitimate setup rejected: rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture tests/setup.bats $'@test "fixture" {\n  git config user.email leak@example.invalid\n}\n'
+if [ "$RC" = 1 ]; then pass "Bats extension works independently of shebang"; else
+  fail "extension-only Bats skipped: rc=$RC out=$OUT"
+fi
+run_on_fixture tests/other $'#!/usr/bin/env batsman\ngit config user.email fixture@example.invalid\n'
+if [ "$RC" = 0 ]; then pass "Bats admission does not match arbitrary interpreter suffixes"; else
+  fail "Bats interpreter matcher broadened: rc=$RC out=$OUT"
+fi
+
 # Case 65p: the modern rename verb moves a section, not the protected key.
 for ACTION in 'rename-section' '"rename-section"' "'rename-section'" '--rename-section'; do
   run_on_fixture "tests/rename-section.sh" "git config $ACTION user.email archived
@@ -3159,11 +3376,18 @@ fi
 # Actual Git oracles run only in a private fixture repo, never caller cwd.
 LITERAL_ORACLE="$WORKDIR/literal-git-oracle"
 git init -q -b main "$LITERAL_ORACLE"
-for SOURCE in "git -c foo.bar='a;b' config user.email fixture@example.invalid" 'g\it config user.email fixture@example.invalid'; do
+for SOURCE in \
+  "git -c foo.bar='a;b' config user.email fixture@example.invalid" \
+  'g\it config user.email fixture@example.invalid' \
+  'git c\onfig user.email fixture@example.invalid' \
+  'git con"fig" user.email fixture@example.invalid' \
+  "git 'config' user.email fixture@example.invalid" \
+  'git config --global --no-global user.email fixture@example.invalid' \
+  $'git -c foo.bar=$(printf a\nprintf b) config user.email fixture@example.invalid'; do
   (cd "$LITERAL_ORACLE" && bash -c "$SOURCE")
   VALUE="$(git -C "$LITERAL_ORACLE" config --local --get user.email)"
   if [ "$VALUE" = fixture@example.invalid ]; then
-    pass "private Git oracle confirms literal/quoted-option command writes identity"
+    pass "private Git oracle confirms literal config/selector/substitution command writes identity"
   else
     fail "private Git oracle differed: source='$SOURCE' value='$VALUE'"
   fi
