@@ -264,7 +264,11 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     the existing standalone top-level disable credit; untraced references and
     references after a credited disable gain no xtrace finding from this
     bridge. Existing output-path analysis and command-boundary conservatism
-    still apply. This is not call-time analysis of earlier
+    still apply. Already-retained deferred enables also reach later segments
+    on the same logical line within the existing lexer parent scopes. Function
+    invocation, trap timing and callback input availability are not inferred;
+    safe sampled cases remain declared conservatism. This is not call-time
+    analysis of earlier
     function/trap definitions, and separately scanned sourced files do not
     inherit the caller state. An operand that does not reduce to a literal
     is not re-read; `trap`
@@ -4118,8 +4122,19 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
         # `: "$PAT"` emits nothing and the gate reported a finding (#1032
         # round 7 P2).
         outer = xtrace
+        deferred_xtrace_scopes = set()
         for seg in ll.segments:
-            xtrace_at[seg.sid] = state
+            # Reuse the lexer's parent lineage: a known enable in an outer
+            # scope reaches later children, but a child enable does not escape
+            # its subshell/capture or reach a sibling's shell state.
+            scopes = [None]
+            parent = seg.parent
+            while parent is not None:
+                scopes.append(parent.sid)
+                parent = parent.parent
+            xtrace_at[seg.sid] = state or any(
+                scope in deferred_xtrace_scopes for scope in scopes
+            )
             st = _segment_sets_xtrace(seg)
             if st is True:
                 state = True
@@ -4129,6 +4144,15 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
                 state = False
                 if not seg.parent_is_subshell:
                     outer = False
+            # The same bounded extractor/enable predicate used below must
+            # contribute before later segments consume this map. This retains
+            # written enable evidence, not a claim that a trap/callback ran.
+            if not ll.pragma_reasons and _depth < _DEFERRED_SHELL_DEPTH:
+                if any(_text_enables_xtrace(inner)
+                       for inner in _deferred_shell_operands(seg)):
+                    deferred_xtrace_scopes.add(
+                        seg.parent.sid if seg.parent is not None else None
+                    )
         if ll.pragma_reasons:
             # A pragma'd line is exempt, and so is any xtrace it turns on --
             # the exemption is the author's written statement about THIS line.
@@ -7601,6 +7625,102 @@ CORPUS = [
         MUST_NOT_FLAG,
         "read x <<$'EOF'\nnothing\nEOF\necho ok\n",
     ),
+    # #1454 required same-line known-enable propagation and scope controls.
+    (
+        'deferred-enable-same-line-eval',
+        MUST_FLAG,
+        'eval \'set -x\'; eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-same-line-direct',
+        MUST_FLAG,
+        'eval \'set -x\'; : "$GH_TOKEN"\n',
+    ),
+    (
+        'deferred-enable-multiline-control',
+        MUST_FLAG,
+        'eval \'set -x\'\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-quiet-control',
+        MUST_NOT_FLAG,
+        'eval \':\'; eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-subshell-fence',
+        MUST_NOT_FLAG,
+        '(eval \'set -x\'); eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-in-subshell',
+        MUST_FLAG,
+        '(eval \'set -x\'; eval \': "$GH_TOKEN"\')\n',
+    ),
+    (
+        'deferred-enable-outer-to-subshell',
+        MUST_FLAG,
+        'eval \'set -x\'; (eval \': "$GH_TOKEN"\')\n',
+    ),
+    (
+        'deferred-enable-sibling-subshell-fence',
+        MUST_NOT_FLAG,
+        '(eval \'set -x\'); (eval \': "$GH_TOKEN"\')\n',
+    ),
+    (
+        'deferred-enable-nested-subshell-fence',
+        MUST_NOT_FLAG,
+        '((eval \'set -x\'); eval \': "$GH_TOKEN"\')\n',
+    ),
+    (
+        'deferred-enable-substitution-fence',
+        MUST_NOT_FLAG,
+        'value=$(eval \'set -x\'); eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-debug-trap-same-line',
+        MUST_FLAG,
+        'trap \'set -x\' DEBUG; eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-mapfile-same-line',
+        MUST_FLAG,
+        'mapfile -C \'set -x\' -c 1 values < <(printf \'x\\n\'); eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-readarray-same-line',
+        MUST_FLAG,
+        'readarray -C \'set -x\' -c 1 values < <(printf \'x\\n\'); eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-called-definition',
+        MUST_FLAG,
+        'f() { eval \'set -x\'; eval \': "$GH_TOKEN"\'; }; f\n',
+    ),
+    (
+        'deferred-enable-uncalled-definition',
+        MUST_FLAG,
+        'f() { eval \'set -x\'; eval \': "$GH_TOKEN"\'; }\n',
+    ),
+    (
+        'deferred-enable-depth-control',
+        MUST_NOT_FLAG,
+        'eval \'eval \'"\'"\'set -x\'"\'"\'; eval \'"\'"\': "$GH_TOKEN"\'"\'"\'\'\n',
+    ),
+    (
+        'deferred-enable-exit-trap-timing-conservative',
+        MUST_FLAG,
+        'trap \'set -x\' EXIT; eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-mapfile-empty-input-conservative',
+        MUST_FLAG,
+        'mapfile -C \'set -x\' -c 1 values </dev/null; eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-readarray-empty-input-conservative',
+        MUST_FLAG,
+        'readarray -C \'set -x\' -c 1 values </dev/null; eval \': "$GH_TOKEN"\'\n',
+    ),
     # #1454: known segment tracing and merged-detector integration controls.
     (
         'xtrace-inherited-indexed-literal-conservative',
@@ -8985,6 +9105,10 @@ CORPUS.extend(_generated_corpus())
 # fails when an undeclared disagreement appears AND when a declared entry stops
 # disagreeing, so neither list can quietly rot.
 KNOWN_MISSES = {
+    "deferred-enable-depth-control": (
+        "The existing one-hop deferred depth stops before evaluating nested "
+        "eval operands; same-line propagation does not add recursion depth."
+    ),
     "helper-adjacent-comment-unmatched-quotes": (
         "#2080 preexisting declaration-word lexer gap: without whitespace before "
         "an adjacent # comment, unmatched comment quotes hide the later "
@@ -9135,6 +9259,25 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    "deferred-enable-uncalled-definition": (
+        "Known enable evidence is scanned at its source definition site; "
+        "the scanner does not infer whether this function is invoked."
+    ),
+    "deferred-enable-exit-trap-timing-conservative": (
+        "The existing deferred enable predicate retains a possible trap "
+        "enable without inferring when its signal fires; this EXIT sample "
+        "enables tracing only after the non-emitting reference."
+    ),
+    "deferred-enable-mapfile-empty-input-conservative": (
+        "The existing callback enable predicate retains written enable "
+        "evidence without inferring input availability; this empty-input "
+        "sample never invokes the callback."
+    ),
+    "deferred-enable-readarray-empty-input-conservative": (
+        "The existing callback enable predicate retains written enable "
+        "evidence without inferring input availability; this empty-input "
+        "sample never invokes the callback."
+    ),
     'xtrace-inherited-indexed-literal-conservative': (
         "The existing bounded quoted-target reader conservatively grades an "
         "expanded command word as emitting. Bash evaluates this sampled "
