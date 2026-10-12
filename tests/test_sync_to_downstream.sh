@@ -2155,6 +2155,83 @@ for state in missing stale current; do
 done
 mv "$relay_manifest_backup" "$REQ_MP/.mergepath-sync.yml"
 
+
+# A CI-kit-only sync does not recursively check the test entry's requires.
+# Exercise the live kit row and its complete direct closure, delivering the
+# canonical accounting wrapper from the kit, with the archive
+# test already current, so a missing/stale runtime library cannot hide behind
+# an unrelated missing requirement or a test-target selection.
+ci_archive_lib=scripts/lib/feedback-archive-identities.sh
+ci_archive_test=tests/test_feedback_archive_identities.sh
+ci_manifest_backup="$req_workdir/pre-ci-archive-manifest.yml"
+cp "$REQ_MP/.mergepath-sync.yml" "$ci_manifest_backup"
+yq -o=json '.paths[] | select(.path == "scripts/ci/")' "$ROOT/.mergepath-sync.yml" >"$req_workdir/ci-entry.json"
+CI_ENTRY="$req_workdir/ci-entry.json" yq -i '.paths = (.paths | map(select(.path != "scripts/ci/"))) + [load(strenv(CI_ENTRY))]' "$REQ_MP/.mergepath-sync.yml"
+cp -p "$ROOT/scripts/ci/check_review_feedback_accounting" "$REQ_MP/scripts/ci/check_review_feedback_accounting"
+ci_archive_deps=$(yq -r '.requires[]' "$req_workdir/ci-entry.json")
+ci_archive_deps+=$'\n'"$ci_archive_lib"
+while IFS= read -r dep; do
+  mkdir -p "$(dirname "$REQ_MP/$dep")"
+  if [ -d "$ROOT/$dep" ]; then
+    mkdir -p "$REQ_MP/$dep"
+    cp -R "$ROOT/$dep/." "$REQ_MP/$dep/"
+    dep_type=kit
+  else
+    cp -p "$ROOT/$dep" "$REQ_MP/$dep"
+    dep_type=canonical
+  fi
+  if [ -z "$(CI_DEP="$dep" yq -r '.paths[] | select(.path == strenv(CI_DEP)) | .path' "$REQ_MP/.mergepath-sync.yml")" ]; then
+    CI_DEP="$dep" CI_DEP_TYPE="$dep_type" yq -i '.paths += [{"path":strenv(CI_DEP),"type":strenv(CI_DEP_TYPE),"consumers":"all"}]' "$REQ_MP/.mergepath-sync.yml"
+  fi
+done <<< "$ci_archive_deps"
+# Preserve the live test row too: its existing library edge must not clear
+# a kit-only selection when the library itself is missing or stale.
+CI_ARCHIVE_TEST="$ci_archive_test" yq -o=json ' .paths[] | select(.path == strenv(CI_ARCHIVE_TEST))' "$ROOT/.mergepath-sync.yml" >"$req_workdir/ci-archive-test-entry.json"
+CI_ARCHIVE_TEST="$ci_archive_test" CI_ARCHIVE_ENTRY="$req_workdir/ci-archive-test-entry.json" yq -i ' .paths = (.paths | map(select(.path != strenv(CI_ARCHIVE_TEST)))) + [load(strenv(CI_ARCHIVE_ENTRY))]' "$REQ_MP/.mergepath-sync.yml"
+if ! ci_manifest_validation=$(MERGEPATH_REPO_ROOT="$REQ_MP" MERGEPATH_MANIFEST_PATH="$REQ_MP/.mergepath-sync.yml" "$ROOT/scripts/ci/check_sync_manifest" 2>&1); then
+  fail "live CI-kit archive fixture must satisfy the manifest contract: $ci_manifest_validation"
+fi
+git -C "$REQ_MP" add -A
+git -C "$REQ_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m 'live CI-kit archive closure fixture'
+ci_archive_failures=0
+for state in current missing stale; do
+  remote="$req_workdir/ci-archive-$state.git"
+  seed="$req_workdir/ci-archive-$state-seed"
+  req_setup_remote "$remote" "$seed"
+  while IFS= read -r dep; do
+    mkdir -p "$(dirname "$seed/$dep")"
+    if [ -d "$REQ_MP/$dep" ]; then
+      mkdir -p "$seed/$dep"
+      cp -R "$REQ_MP/$dep/." "$seed/$dep/"
+    else
+      cp -p "$REQ_MP/$dep" "$seed/$dep"
+    fi
+  done <<< "$ci_archive_deps"
+  cmp "$ROOT/$ci_archive_test" "$seed/$ci_archive_test" || fail "CI-kit fixture archive test is not current"
+  case "$state" in
+    missing) rm "$seed/$ci_archive_lib" ;;
+    stale) printf '\n# stale consumer version\n' >>"$seed/$ci_archive_lib" ;;
+  esac
+  req_push_seed "$remote" "$seed"
+  run_id="ci-archive-$state"
+  set +e
+  output=$(req_run_sync_all "$run_id" "$remote" 'scripts/ci/')
+  set -e
+  if [ "$state" = current ]; then
+    [ -f "$REQ_CAPTURE/pr-title-$run_id.txt" ] || fail "all-current CI-kit closure did not permit sync: $output"
+    echo "PASS: CI-kit sync accepts the complete current direct closure"
+  elif echo "$output" | grep -q 'requires-closure gate' \
+    && echo "$output" | grep -Fq "$ci_archive_lib" \
+    && [ ! -f "$REQ_CAPTURE/pr-title-$run_id.txt" ]; then
+    echo "PASS: CI-kit sync blocks $state archive identity library with current archive test"
+  else
+    echo "FAIL: CI-kit sync accepted $state archive identity library with current archive test: $output" >&2
+    ci_archive_failures=$((ci_archive_failures + 1))
+  fi
+done
+[ "$ci_archive_failures" -eq 0 ] || fail "CI-kit archive closure failed $ci_archive_failures controls"
+mv "$ci_manifest_backup" "$REQ_MP/.mergepath-sync.yml"
+
 # ===========================================================================
 # .github/workflows/weekly-drift-audit.yml — bounded tracking-issue body (#988)
 # ===========================================================================

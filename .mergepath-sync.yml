@@ -2280,6 +2280,7 @@ paths:
     # wave (check_gh_as_author missing its tests on every consumer).
     requires:
       - "tests/test_feedback_archive_identities.sh"   # #1437, offline enrollment and producer/relay cases
+      - "scripts/lib/feedback-archive-identities.sh"   # #1437, direct CI-kit runtime closure
       - "scripts/workflow/merge-writer.py"
       - "scripts/workflow/owner-admin-override.py"
       - "scripts/lib/ci-check-modes.sh"          # shared --check/--self-test selector (#1062)
