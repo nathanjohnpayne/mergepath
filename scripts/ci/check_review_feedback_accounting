@@ -42,6 +42,8 @@ fi
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck --severity=warning "$SCRIPT" "$TEST" \
     "$ARCHIVE_RENDERER" "$SURFACE_FINGERPRINT" \
+    "$REPO_ROOT/scripts/lib/feedback-archive-identities.sh" \
+    "$REPO_ROOT/tests/test_feedback_archive_identities.sh" \
     || FAILED=1
 else
   lint_tooling_require_shellcheck || FAILED=1
@@ -52,6 +54,7 @@ if [ "$FAILED" -ne 0 ]; then
   exit 1
 fi
 
+bash "$REPO_ROOT/tests/test_feedback_archive_identities.sh"
 bash "$TEST"
 bash "$HANDOFF_TEST"
 python3 "$MARKER_TEST"

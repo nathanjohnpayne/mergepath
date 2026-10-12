@@ -87,6 +87,19 @@ case "$endpoint" in
     ;;
 esac
 
+# Only the production-cleanup regression opts into these offline mutations.
+# Ordinary accounting remains read-only; an unexpected write is refused.
+if [[ " $* " == *" --method POST "* ]]; then
+  [ -n "${GH_CAPTURE_FAILURE_MARKER:-}" ] || { echo 'unexpected mutation' >&2; exit 99; }
+  case "$endpoint" in
+    repos/acme/widget/issues/7/comments)
+      cat >"$GH_CAPTURE_FAILURE_MARKER"
+      jq '.+{id:3,user:{login:"github-actions[bot]"},created_at:"2026-08-18T19:00:00Z"}' "$GH_CAPTURE_FAILURE_MARKER"; exit 0 ;;
+    repos/acme/widget/check-runs) printf '{"id":900}\n'; exit 0 ;;
+    *) echo 'unexpected cleanup mutation' >&2; exit 99 ;;
+  esac
+fi
+
 case "$endpoint" in
   repos/acme/widget)
     printf '{"default_branch":"main"}\n' ;;
@@ -146,7 +159,17 @@ codex:
   bot_login: "chatgpt-codex-connector[bot]"
 code_scanning:
   bot_login: "github-advanced-security[bot]"
+feedback_archive:
+  identities:
+    - {login: "chatgpt-codex-connector[bot]", provider: codex, status: active}
+    - {login: "coderabbitai[bot]", provider: coderabbit, status: active}
+    - {login: "github-advanced-security[bot]", provider: ghas, status: active}
+    - {login: nathanpayne-claude, provider: reviewer, status: active}
+    - {login: nathanpayne-cursor, provider: reviewer, status: active}
+    - {login: nathanpayne-codex, provider: reviewer, status: active}
+    - {login: nathanpayne-release, provider: reviewer, status: retired}
 YAML
+cp "$TMP/review-policy.yml" "$TMP/dedup-initial-policy.yml"
 
 reset_fixtures() {
   printf '[]\n' >"$TMP/fixtures/inline.json"
@@ -176,6 +199,15 @@ codex:
   bot_login: "chatgpt-codex-connector[bot]"
 code_scanning:
   bot_login: "github-advanced-security[bot]"
+feedback_archive:
+  identities:
+    - {login: "chatgpt-codex-connector[bot]", provider: codex, status: active}
+    - {login: "coderabbitai[bot]", provider: coderabbit, status: active}
+    - {login: "github-advanced-security[bot]", provider: ghas, status: active}
+    - {login: nathanpayne-claude, provider: reviewer, status: retired}
+    - {login: nathanpayne-cursor, provider: reviewer, status: retired}
+    - {login: nathanpayne-codex, provider: reviewer, status: retired}
+    - {login: nathanpayne-release, provider: reviewer, status: active}
 YAML
   rm -f "$TMP/fixtures"/reactions-*.json
   : >"$TMP/gh-calls.log"
@@ -223,6 +255,30 @@ reset_fixtures
 run_gate
 assert_eq 0 "$RUN_RC" "empty review history clears"
 assert_eq clear "$(printf '%s' "$RUN_JSON" | jq -r '.status')" "empty history emits clear status"
+
+# Unknown complete legacy bodies are refused before source attribution. The
+# actual relay cleanup then supplies existing non-review durable failure
+# evidence; the real marker verifier and accounting retain it on later sweeps.
+python3 - "$ROOT/.github/workflows/codex-feedback-archive-relay.yml" "$TMP/legacy-failure-cleanup.sh" <<'PYTHON'
+import sys,textwrap
+s=open(sys.argv[1]).read().split('      - name: Close an abandoned read-only relay lease',1)[1]
+s=s.split('        run: |\n',1)[1].split('\n      - name:',1)[0]
+open(sys.argv[2],'w').write(textwrap.dedent(s))
+PYTHON
+(cd "$ROOT" && env PATH="$TMP/bin:$PATH" GH_TOKEN=fake-offline GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  GH_CAPTURE_FAILURE_MARKER="$TMP/legacy-failed-marker.json" REPO=acme/widget PR_NUMBER=7 SOURCE_RUN_ID=12345 \
+  CHECK_ID='' BOUND_HEAD_SHA=cccccccccccccccccccccccccccccccccccccccc CHECK_NAME='Codex P1 unresolved threads' \
+  bash "$TMP/legacy-failure-cleanup.sh") >"$TMP/legacy-cleanup.log" 2>&1
+jq '.+{id:3,user:{login:"github-actions[bot]"},created_at:"2026-08-18T19:00:00Z"} | [.]' \
+  "$TMP/legacy-failed-marker.json" >"$TMP/fixtures/issues.json"
+assert_eq '<!-- mergepath-feedback-archive-relay:v1 run=12345 status=failed -->' "$(jq -r '.[0].body' "$TMP/fixtures/issues.json")" \
+  "production cleanup records failure for the newly refused legacy source with no prior completion"
+for sweep in first repeated; do
+  run_gate
+  assert_eq 2 "$RUN_RC" "$sweep real verified-marker accounting sweep retains the legacy source failure"
+  assert_match 'read-only feedback archive relay failed for source run 12345' "$RUN_ERR" "$sweep sweep names the durable non-review failure record"
+done
+reset_fixtures
 
 # The entrypoint must refuse an unavailable Python runtime before API reads.
 cat >"$TMP/bin/python3" <<'PYTHON'
@@ -365,7 +421,7 @@ mv "$TMP/review-policy.valid-enums.yml" "$TMP/review-policy.yml"
 
 cp "$TMP/review-policy.yml" "$TMP/review-policy.block-style.yml"
 cat >"$TMP/review-policy.yml" <<'JSON'
-{"author_identity":"nathanjohnpayne","available_reviewers":["nathanpayne-release"],"coderabbit":{"bot_login":"coderabbitai[bot]"},"codex":{"bot_login":"chatgpt-codex-connector[bot]"},"feedback_policy":{"mode":"by-priority","priorities":{"p1":"required"}}}
+{"author_identity": "nathanjohnpayne", "available_reviewers": ["nathanpayne-release"], "coderabbit": {"bot_login": "coderabbitai[bot]"}, "codex": {"bot_login": "chatgpt-codex-connector[bot]"}, "feedback_policy": {"mode": "by-priority", "priorities": {"p1": "required"}}, "feedback_archive": {"identities": [{"login": "nathanpayne-release", "provider": "reviewer", "status": "active"}]}}
 JSON
 reset_fixtures
 cat >"$TMP/fixtures/inline.json" <<'JSON'
@@ -2654,7 +2710,7 @@ fi
 # preceding the author guard is exactly what let a non-GHAS commenter plant a
 # guessed alert URL and have Actions resolve it.
 P1_GATE_WF="$ROOT/.github/workflows/codex-p1-gate.yml"
-GUARD_LINE=$(grep -n 'if \[ "\$source_kind" = "inline" \] && \[ "\$source_login" = "\$ghas_bot_login" \]; then' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
+GUARD_LINE=$(grep -n 'if \[ "\$source_kind" = "inline" \] && printf.*\$source_providers.*index("ghas")' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
 EXTRACT_LINE=$(grep -n 'alert_number=\$(ghas_alert_number_from_body' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
 LOOKUP_LINE=$(grep -n 'ghas_severity=\$(ghas_alert_severity "\$REPO" "\$alert_number")' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
 if [ -n "$GUARD_LINE" ] && [ -n "$EXTRACT_LINE" ] && [ -n "$LOOKUP_LINE" ] \
@@ -2972,7 +3028,7 @@ No alert link in this body at all.
 EOF
 GHAS_ARCHIVE_NO_LINK=$("$RENDER_ARCHIVE" inline 8610 'github-advanced-security[bot]' \
   '2026-08-26T22:10:00Z' "$PREVIOUS_GHAS_NO_LINK")
-assert_eq "" "$GHAS_ARCHIVE_NO_LINK" "render-feedback-archive.sh with no GHAS_TIER argument emits no archive record (pure-function contract)"
+assert_eq "" "$GHAS_ARCHIVE_NO_LINK" "render-feedback-archive.sh with no GHAS_TIER argument emits no archive record for a linkless body (pure-function contract)"
 
 GHAS_ARCHIVE_NO_LINK_WORKFLOW_SHAPE=$("$RENDER_ARCHIVE" inline 8611 'github-advanced-security[bot]' \
   '2026-08-26T22:11:00Z' "$PREVIOUS_GHAS_NO_LINK" p2)
@@ -3022,6 +3078,28 @@ run_gate
 assert_eq 1 "$RUN_RC" "a failed archive-time severity read at p1 survives a p2:ignore policy (#1124)"
 assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "the failed-read archive record carries p1, not p2"
 mv "$TMP/review-policy.ignore-p2-archive.yml" "$TMP/review-policy.yml"
+cp "$TMP/review-policy.yml" "$TMP/policy-before-unknown.yml"
+UNKNOWN_GHAS_ARCHIVE=$("$RENDER_ARCHIVE" inline 8622 'github-advanced-security[bot]' \
+  '2026-08-26T22:20:00Z' "$PREVIOUS_GHAS_READ_FAILED" unknown)
+for selected in p0 p1 p2 p3 none; do
+  cp "$TMP/policy-before-unknown.yml" "$TMP/review-policy.yml"
+  printf '\nfeedback_policy:\n  mode: by-priority\n  priorities:\n' >>"$TMP/review-policy.yml"
+  for priority in p0 p1 p2 p3; do
+    disposition=ignore; [ "$priority" != "$selected" ] || disposition=required
+    printf '    %s: %s\n' "$priority" "$disposition" >>"$TMP/review-policy.yml"
+  done
+  jq -n --arg body "$UNKNOWN_GHAS_ARCHIVE" '[{id:8623,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+  run_gate
+  if [ "$selected" = none ]; then
+    assert_eq 0 "$RUN_RC" "explicit all-GHAS-tiers-ignore policy excludes unknown severity"
+    assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "all-ignore policy has no GHAS history obligation"
+    assert_eq "$UNKNOWN_GHAS_ARCHIVE" "$(jq -r '.[0].body' "$TMP/fixtures/issues.json")" "all-ignore inventory preserves the durable unresolved archive record"
+  else
+    assert_eq 1 "$RUN_RC" "unknown severity survives when only $selected is required"
+    assert_eq "$selected" "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "unknown severity uses strongest permitted possibility $selected"
+  fi
+done
+mv "$TMP/policy-before-unknown.yml" "$TMP/review-policy.yml"
 
 # Two comments linking the SAME alert number must fetch it only ONCE
 # (scripts/lib/ghas-alert-severity.sh's GHAS_SEVERITY_CACHE) -- without
@@ -3114,6 +3192,381 @@ ARCHIVE_OUT=$(PATH="$TMP/bin:$PATH" CODERABBIT_EXTRACT_FAIL=0 "$RENDER_ARCHIVE" 
 assert_match '^<!-- mergepath-feedback-archive:v1 ' "$ARCHIVE_OUT" "archive control: readable Major produces its history record"
 unset CODERABBIT_EXTRACT_FAIL CODERABBIT_EXTRACT_FAIL_LOG
 rm "$TMP/bin/grep"
+
+# #1437: a delayed event after reviewer retirement still inventories the sole
+# old body, even with no live source object. Enrollment cannot acknowledge it.
+cp "$TMP/review-policy.yml" "$TMP/policy-before-retirement.yml"
+sed '/^  - nathanpayne-claude$/d; s/login: nathanpayne-claude, provider: reviewer, status: active/login: nathanpayne-claude, provider: reviewer, status: retired/' \
+  "$TMP/review-policy.yml" >"$TMP/retired-policy.yml"
+mv "$TMP/retired-policy.yml" "$TMP/review-policy.yml"
+reset_fixtures
+printf '**P1** Retired reviewer sole previous body.\n' >"$TMP/retired-body.txt"
+RETIRED_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9090 nathanpayne-claude \
+  '2026-10-11T01:00:00Z' "$TMP/retired-body.txt")
+jq -n --arg body "$RETIRED_ARCHIVE" '[{id:9091,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "a retired reviewer deleted-source archive stays unaccounted without live prior-body fallback"
+assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "retired history uses the archive acknowledgement channel"
+# Delayed delivery can leave an equal live object after policy removal. Since
+# that live object is no longer inventoried, it cannot suppress the archive.
+jq -n --rawfile body "$TMP/retired-body.txt" '[{id:9090,user:{login:"nathanpayne-claude"},body:$body,created_at:"2026-10-11T00:00:00Z"}]' >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "an equal surviving retired source cannot suppress the only inventoried history"
+assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "equal retired live text leaves the archive obligation intact"
+printf '[]\n' >"$TMP/fixtures/inline.json"
+RETIRED_TOKEN=$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')
+jq --arg token "$RETIRED_TOKEN" '. + [{id:9092,user:{login:"nathanpayne-claude"},created_at:"2026-10-11T01:01:00Z",body:($token+"\nI addressed this historical finding.")}]' \
+  "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "retained enrollment grants no current acknowledgement standing"
+jq '.[1].user.login="nathanpayne-codex"' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "a current reviewer can account for the retained historical finding"
+# A valid, parsed Actions archive cannot silently disappear when its retained
+# entry is omitted. This differs from an ordinary never-enrolled live event.
+cp "$TMP/review-policy.yml" "$TMP/policy-with-retired-entry.yml"
+sed '/login: nathanpayne-claude, provider: reviewer, status: retired/d' "$TMP/review-policy.yml" >"$TMP/omitted-entry.yml"
+mv "$TMP/omitted-entry.yml" "$TMP/review-policy.yml"
+run_gate
+assert_eq 2 "$RUN_RC" "omitting an already archived retired identity is an infrastructure failure"
+assert_eq "" "$RUN_JSON" "omitted archive enrollment emits no clean accounting verdict"
+assert_match 'feedback archive source lacks retained enrollment' "$RUN_ERR" "omitted history names the missing retained source"
+mv "$TMP/policy-with-retired-entry.yml" "$TMP/review-policy.yml"
+
+# Wrong active provider roles must fail configuration rather than select an
+# empty tier array and erase a Major. Correct retired roles survive bot rename.
+reset_fixtures
+printf '_🟠 Major_\nSole previous CodeRabbit body.\n' >"$TMP/role-body.txt"
+ROLE_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9093 'coderabbitai[bot]' \
+  '2026-10-11T01:00:00Z' "$TMP/role-body.txt")
+jq -n --arg body "$ROLE_ARCHIVE" '[{id:9094,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+cp "$TMP/review-policy.yml" "$TMP/correct-active-policy.yml"
+sed 's/login: "coderabbitai\[bot\]", provider: coderabbit/login: "coderabbitai[bot]", provider: codex/' "$TMP/correct-active-policy.yml" >"$TMP/review-policy.yml"
+run_gate
+assert_eq 2 "$RUN_RC" "an active CodeRabbit login enrolled as Codex is a configuration failure"
+assert_eq "" "$RUN_JSON" "wrong active role emits no empty-success verdict"
+sed 's/bot_login: "coderabbitai\[bot\]"/bot_login: "new-coderabbit[bot]"/' "$TMP/correct-active-policy.yml" >"$TMP/review-policy.yml"
+run_gate
+assert_eq 2 "$RUN_RC" "a stale active provider absent from current policy fails configuration"
+sed 's/login: "coderabbitai\[bot\]", provider: coderabbit, status: active/login: "coderabbitai[bot]", provider: coderabbit, status: retired/' "$TMP/review-policy.yml" >"$TMP/retired-provider.yml"
+mv "$TMP/retired-provider.yml" "$TMP/review-policy.yml"
+run_gate
+assert_eq 1 "$RUN_RC" "a correctly retired CodeRabbit identity preserves required history after bot rename"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "retired CodeRabbit history retains its specialized Major tier"
+# Reusing the old CodeRabbit login as current Codex cannot let the current
+# Codex parser (which does not inventory Major) suppress retired history.
+sed -e 's/bot_login: "chatgpt-codex-connector\[bot\]"/bot_login: "coderabbitai[bot]"/' \
+  -e 's/login: "chatgpt-codex-connector\[bot\]", provider: codex, status: active/login: "chatgpt-codex-connector[bot]", provider: codex, status: retired/' \
+  "$TMP/review-policy.yml" >"$TMP/reused-login-policy.yml"
+mv "$TMP/reused-login-policy.yml" "$TMP/review-policy.yml"
+for shape in equal ack-suffix; do
+  jq -n --rawfile body "$TMP/role-body.txt" --arg shape "$shape" '[{id:9093,user:{login:"coderabbitai[bot]"},created_at:"2026-10-10T01:00:00Z",updated_at:"2026-10-11T01:01:00Z",commit_id:"cccccccccccccccccccccccccccccccccccccccc",body:($body + if $shape=="ack-suffix" then "\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678\n\n<!-- This is an auto-generated reply by CodeRabbit -->" else "" end)}]' >"$TMP/fixtures/inline.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "$shape live source in another provider role cannot erase retired Major history"
+  assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "$shape role reuse retains historical required CodeRabbit tier"
+  assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "$shape role reuse retains the archived finding"
+  assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$shape role reuse has one historical finding despite the current parser omitting Major"
+done
+# A new Codex revision under the reused login retains its existing classifier
+# evidence, even though the one retained identity still names CodeRabbit.
+printf '**P1** New current Codex revision under a retained CodeRabbit login.\n' >"$TMP/reused-codex-body.txt"
+for kind in inline issue-comment review-body; do
+  for action in edited deleted; do
+    reset_fixtures
+    NEW_ROLE_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" "$kind" 9095 'coderabbitai[bot]' \
+      '2026-10-11T02:00:00Z' "$TMP/reused-codex-body.txt")
+    jq -n --arg body "$NEW_ROLE_ARCHIVE" '[{id:9096,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+    if [ "$action" = edited ]; then
+      case "$kind" in inline) surface=inline ;; issue-comment) surface=issues ;; review-body) surface=reviews ;; esac
+      jq '. + [{id:9095,user:{login:"coderabbitai[bot]"},body:"current markerless rewrite",created_at:"2026-10-11T02:01:00Z",submitted_at:"2026-10-11T02:01:00Z"}]' \
+        "$TMP/fixtures/$surface.json" >"$TMP/rewritten-source.json"
+      mv "$TMP/rewritten-source.json" "$TMP/fixtures/$surface.json"
+    fi
+    run_gate
+    assert_eq 1 "$RUN_RC" "$action $kind new Codex body survives retained CodeRabbit role ambiguity"
+    assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "$action $kind ambiguity retains the new Codex P1 evidence"
+    assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$action $kind new revision creates exactly one history obligation"
+  done
+done
+# Delayed old CodeRabbit body remains visible alongside new Codex history.
+jq --arg body "$ROLE_ARCHIVE" '. + [{id:9097,user:{login:"github-actions[bot]"},body:$body}]' "$TMP/fixtures/issues.json" >"$TMP/both-roles.json"
+mv "$TMP/both-roles.json" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "delayed old and new provider revisions both remain unaccounted"
+assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "role ambiguity preserves both distinct body histories"
+printf '**P1** Never enrolled author quotes a provider tier.\n' >"$TMP/never-enrolled-body.txt"
+assert_eq "" "$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9098 nathanjohnpayne \
+  '2026-10-11T02:00:00Z' "$TMP/never-enrolled-body.txt")" "current classifier evidence grants no archive enrollment to the author"
+# A subsequent provider move must not erase either previously captured role.
+sed 's/bot_login: "coderabbitai\[bot\]"/bot_login: "third-codex[bot]"/' "$TMP/review-policy.yml" >"$TMP/third-policy.yml"
+mv "$TMP/third-policy.yml" "$TMP/review-policy.yml"
+run_gate
+assert_eq 1 "$RUN_RC" "third policy transition retains both old and new captured provider histories"
+assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "third policy transition cannot drop the new Codex-only classifier evidence"
+
+# Explicit precision cost: an enrolled CodeRabbit source quoting a Codex tier
+# creates conservative archive evidence even though CodeRabbit's live parser
+# excludes the fenced example. Equal live text cannot erase that history.
+cp "$TMP/correct-active-policy.yml" "$TMP/review-policy.yml"
+reset_fixtures
+printf 'Example only:\n```text\n**P1** Quoted cross-provider marker.\n```\n' >"$TMP/quoted-provider-body"
+QUOTED_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9099 'coderabbitai[bot]' \
+  '2026-10-11T03:00:00Z' "$TMP/quoted-provider-body")
+jq -n --arg body "$QUOTED_ARCHIVE" '[{id:9109,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+for state in absent equal ack-suffix; do
+  if [ "$state" != absent ]; then
+    jq -n --rawfile body "$TMP/quoted-provider-body" --arg state "$state" '[{id:9099,user:{login:"coderabbitai[bot]"},body:($body + if $state=="ack-suffix" then "\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678\n\n<!-- This is an auto-generated reply by CodeRabbit -->" else "" end)}]' >"$TMP/fixtures/inline.json"
+  fi
+  run_gate
+  assert_eq 1 "$RUN_RC" "$state cross-provider quoted marker retains its conservative archive obligation"
+  assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$state quoted marker adds exactly one archive disposition burden"
+  assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "$state current parser omission cannot suppress conservative history"
+done
+# Same-kind GHAS/text role reuse consumes only existing captured arrays.
+cp "$TMP/correct-active-policy.yml" "$TMP/roles-baseline.yml"
+for provider in codex coderabbit; do
+  reset_fixtures
+  python3 - "$TMP/roles-baseline.yml" "$TMP/review-policy.yml" "$provider" <<'PYTHON'
+import sys
+s=open(sys.argv[1]).read(); p=sys.argv[3]
+old={'codex':'chatgpt-codex-connector[bot]','coderabbit':'coderabbitai[bot]'}[p]
+s=s.replace('bot_login: "github-advanced-security[bot]"','bot_login: "new-ghas[bot]"')
+s=s.replace('login: "github-advanced-security[bot]", provider: ghas, status: active','login: "github-advanced-security[bot]", provider: ghas, status: retired')
+s=s.replace('bot_login: "'+old+'"','bot_login: "github-advanced-security[bot]"')
+s=s.replace('login: "'+old+'", provider: '+p+', status: active','login: "'+old+'", provider: '+p+', status: retired')
+open(sys.argv[2],'w').write(s)
+PYTHON
+  if [ "$provider" = codex ]; then printf '**P1** New Codex body.\n' >"$TMP/ghas-reuse-body";
+  else printf '_🟠 Major_\nNew CodeRabbit body.\n' >"$TMP/ghas-reuse-body"; fi
+  GHAS_REUSE_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9100 'github-advanced-security[bot]' \
+    '2026-10-11T03:00:00Z' "$TMP/ghas-reuse-body")
+  jq -n --arg body "$GHAS_REUSE_ARCHIVE" '[{id:9101,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "retained GHAS/current $provider inline history remains inventoried"
+  assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "retained GHAS/current $provider keeps existing text tier evidence"
+  assert_eq "" "$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" issue-comment 9100 'github-advanced-security[bot]' \
+    '2026-10-11T03:00:00Z' "$TMP/ghas-reuse-body")" "current $provider cannot expand retained GHAS source kinds"
+  # Reverse direction: source-kind admission remains the retired text role;
+  # current GHAS captures only its already-supported one-shot severity result.
+  python3 - "$TMP/roles-baseline.yml" "$TMP/review-policy.yml" "$provider" <<'PYTHON'
+import sys
+s=open(sys.argv[1]).read(); p=sys.argv[3]
+old={'codex':'chatgpt-codex-connector[bot]','coderabbit':'coderabbitai[bot]'}[p]
+s=s.replace('bot_login: "github-advanced-security[bot]"','bot_login: "'+old+'"')
+s=s.replace('login: "github-advanced-security[bot]", provider: ghas, status: active','login: "github-advanced-security[bot]", provider: ghas, status: retired')
+s=s.replace('bot_login: "'+old+'"\n'+('codex:' if p=='coderabbit' else 'code_scanning:'),'bot_login: "new-'+p+'[bot]"\n'+('codex:' if p=='coderabbit' else 'code_scanning:'))
+s=s.replace('login: "'+old+'", provider: '+p+', status: active','login: "'+old+'", provider: '+p+', status: retired')
+open(sys.argv[2],'w').write(s)
+PYTHON
+  source='chatgpt-codex-connector[bot]'; [ "$provider" != coderabbit ] || source='coderabbitai[bot]'
+  GHAS_REUSE_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9102 "$source" \
+    '2026-10-11T03:00:00Z' "$PREVIOUS_GHAS_READ_FAILED" unknown)
+  jq -n --arg body "$GHAS_REUSE_ARCHIVE" '[{id:9103,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "retained $provider/current GHAS inline unknown severity remains inventoried"
+  assert_eq p0 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "retained $provider/current GHAS keeps strongest permitted severity possibility"
+  # Delivery after the current GHAS role moves again must still capture the
+  # disappearing link-only body, without inventing a past provider identity.
+  sed "s/bot_login: \"$source\"/bot_login: \"third-ghas[bot]\"/" "$TMP/review-policy.yml" >"$TMP/delayed-ghas-policy"
+  mv "$TMP/delayed-ghas-policy" "$TMP/review-policy.yml"
+  DELAYED_GHAS_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9104 "$source" \
+    '2026-10-11T04:00:00Z' "$PREVIOUS_GHAS_READ_FAILED")
+  jq -n --arg body "$DELAYED_GHAS_ARCHIVE" '[{id:9105,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "delayed $provider-to-GHAS-to-third-login inline capture retains unresolved history"
+  assert_eq p0 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "delayed $provider source captures conservative severity without a surviving GHAS role"
+  cat >>"$TMP/review-policy.yml" <<'YAML'
+feedback_policy:
+  mode: by-priority
+  priorities: {p0: ignore, p1: ignore, p2: required, p3: ignore}
+YAML
+  run_gate
+  assert_eq 1 "$RUN_RC" "delayed $provider GHAS capture survives p1-ignore/p2-required policy"
+  assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "delayed $provider GHAS capture selects the permitted unresolved p2 possibility"
+done
+mv "$TMP/correct-active-policy.yml" "$TMP/review-policy.yml"
+
+# Missing registry is fatal when there is an archive, but unrelated live
+# feedback keeps its existing accounting semantics during seed migration.
+sed '/^feedback_archive:/,/^    - {login: nathanpayne-release/d' "$TMP/review-policy.yml" >"$TMP/missing-registry.yml"
+mv "$TMP/missing-registry.yml" "$TMP/review-policy.yml"
+run_gate
+assert_eq 2 "$RUN_RC" "an archived source with missing enrollment fails conservatively"
+reset_fixtures
+run_gate
+assert_eq 0 "$RUN_RC" "an unrelated empty live inventory needs no archive registry"
+mv "$TMP/policy-before-retirement.yml" "$TMP/review-policy.yml"
+
+# Current provider standing determines whether the actual live parser can
+# cover an identical archived revision; retained role only admits the source.
+cp "$TMP/review-policy.yml" "$TMP/dedup-policy-before.yml"
+for direction in coderabbit-to-codex codex-to-coderabbit; do
+  source='coderabbitai[bot]'; current_provider=codex
+  if [ "$direction" = codex-to-coderabbit ]; then source='chatgpt-codex-connector[bot]'; current_provider=coderabbit; fi
+  python3 - "$TMP/dedup-initial-policy.yml" "$TMP/dedup-role-policy.yml" "$source" "$current_provider" <<'PYTHON'
+import sys
+s=open(sys.argv[1]).read(); source,current=sys.argv[3:]
+s=s.replace('status: active','status: retired')
+s=s.replace('bot_login: "coderabbitai[bot]"','bot_login: "new-coderabbit[bot]"')
+s=s.replace('bot_login: "chatgpt-codex-connector[bot]"','bot_login: "new-codex[bot]"')
+s=s.replace('bot_login: "new-'+current+'[bot]"','bot_login: "'+source+'"')
+open(sys.argv[2],'w').write(s)
+PYTHON
+  for kind in inline issue-comment review-body; do
+    for standing in current retired weaker; do
+      reset_fixtures
+      cp "$TMP/dedup-role-policy.yml" "$TMP/review-policy.yml"
+      printf '_🟠 Major_\n**P1** Returning identical role-reassigned finding.\n' >"$TMP/dedup-body"
+      if [ "$standing" = weaker ]; then
+        # The current CR parser sees Major/p1 while the captured Codex parser
+        # also saw p0; current Codex's first inline marker sees p1 before p0.
+        if [ "$current_provider" = coderabbit ]; then printf '_🟠 Major_\n**P0** Stronger captured possibility.\n' >"$TMP/dedup-body";
+        else printf '_🟠 Major_\n**P1** First live tier.\n**P0** Stronger captured possibility.\n' >"$TMP/dedup-body"; fi
+      fi
+      DEDUP_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" "$kind" 9201 "$source" '2026-10-11T03:00:00Z' "$TMP/dedup-body")
+      jq -n --arg body "$DEDUP_ARCHIVE" '[{id:9202,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+      if [ "$standing" = retired ]; then
+        python3 - "$TMP/review-policy.yml" "$source" "$current_provider" <<'PYTHON'
+import sys
+p,source,current=sys.argv[1:]
+s=open(p).read().replace('bot_login: "'+source+'"','bot_login: "third-'+current+'[bot]"')
+open(p,'w').write(s)
+PYTHON
+      fi
+      case "$kind" in inline) surface=inline ;; issue-comment) surface=issues ;; review-body) surface=reviews ;; esac
+      jq --arg source "$source" --rawfile body "$TMP/dedup-body" '. + [{id:9201,user:{login:$source},body:$body,created_at:"2026-10-11T01:00:00Z",submitted_at:"2026-10-11T01:00:00Z",commit_id:"cccccccccccccccccccccccccccccccccccccccc"}]' \
+        "$TMP/fixtures/$surface.json" >"$TMP/dedup-live.json"
+      mv "$TMP/dedup-live.json" "$TMP/fixtures/$surface.json"
+      run_gate
+      assert_eq 1 "$RUN_RC" "$direction $kind $standing identical history remains a required obligation"
+      expected=1
+      # Compound top-level current Codex parsing covers its captured p0 too.
+      if [ "$standing" = weaker ] && { [ "$current_provider" = coderabbit ] || [ "$kind" = inline ]; }; then expected=2; fi
+      assert_eq "$expected" "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$direction $kind $standing collapses only a covered live obligation"
+      archives=$(printf '%s' "$RUN_JSON" | jq '[.missing[] | select(.kind|endswith("-archive"))] | length')
+      expected_archives=0
+      if [ "$standing" = retired ] || [ "$expected" = 2 ]; then expected_archives=1; fi
+      assert_eq "$expected_archives" "$archives" "$direction $kind $standing preserves only necessary archive dispositions"
+    done
+  done
+  # Vendor acknowledgment syntax follows the current provider. Applying a
+  # retained CR role's suffix grammar to current Codex text would erase an edit.
+  reset_fixtures
+  cp "$TMP/dedup-role-policy.yml" "$TMP/review-policy.yml"
+  printf '_🟠 Major_\n**P1** Provider-specific acknowledgment handling.\n' >"$TMP/dedup-body"
+  DEDUP_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9211 "$source" '2026-10-11T03:00:00Z' "$TMP/dedup-body")
+  jq -n --arg body "$DEDUP_ARCHIVE" '[{id:9212,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+  jq -n --arg source "$source" --rawfile body "$TMP/dedup-body" '[{id:9211,user:{login:$source},body:($body+"\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678\n\n<!-- This is an auto-generated reply by CodeRabbit -->"),created_at:"2026-10-11T01:00:00Z",updated_at:"2026-10-11T03:00:00Z",commit_id:"cccccccccccccccccccccccccccccccccccccccc"}]' >"$TMP/fixtures/inline.json"
+  run_gate
+  expected=2; [ "$current_provider" != coderabbit ] || expected=1
+  assert_eq 1 "$RUN_RC" "$direction suffix handling preserves the live obligation"
+  assert_eq "$expected" "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$direction suffix equivalence uses only the current CR role"
+  expected_archives=1; [ "$current_provider" != coderabbit ] || expected_archives=0
+  assert_eq "$expected_archives" "$(printf '%s' "$RUN_JSON" | jq '[.missing[]|select(.kind=="inline-archive")]|length')" "$direction vendor suffix cannot invent another provider's equivalence"
+
+  # A -> B -> A collapses only identical A history, while B's later source
+  # edit still advances the live review floor beyond an old A acknowledgment.
+  reset_fixtures
+  cp "$TMP/dedup-role-policy.yml" "$TMP/review-policy.yml"
+  printf '_🟠 Major_\n**P1** Re-raised original body A.\n' >"$TMP/dedup-body-a"
+  printf '_🟠 Major_\n**P1** Intermediate body B.\n' >"$TMP/dedup-body-b"
+  DEDUP_ARCHIVE_A=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" review-body 9221 "$source" '2026-10-11T02:00:00Z' "$TMP/dedup-body-a")
+  DEDUP_ARCHIVE_B=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" review-body 9221 "$source" '2026-10-11T03:00:00Z' "$TMP/dedup-body-b")
+  DEDUP_FINGERPRINT_A=$(printf '%s' "$DEDUP_ARCHIVE_A" | jq -Rr 'capture("^<!-- mergepath-feedback-archive:v1 (?<data>.+) -->$").data|@base64d|fromjson|.body_fingerprint')
+  jq -n --arg a "$DEDUP_ARCHIVE_A" --arg b "$DEDUP_ARCHIVE_B" --arg ack "[mergepath-review-ack: 9221 $DEDUP_FINGERPRINT_A]" '[{id:9222,user:{login:"github-actions[bot]"},body:$a},{id:9223,user:{login:"github-actions[bot]"},body:$b},{id:9224,user:{login:"nathanpayne-codex"},created_at:"2026-10-11T02:30:00Z",body:($ack+"\nDispositioned A before B was re-raised.")}]' >"$TMP/fixtures/issues.json"
+  jq -n --arg source "$source" --rawfile body "$TMP/dedup-body-a" '[{id:9221,user:{login:$source},body:$body,submitted_at:"2026-10-11T01:00:00Z",commit_id:"cccccccccccccccccccccccccccccccccccccccc"}]' >"$TMP/fixtures/reviews.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "$direction re-raised review cannot use its old A acknowledgment"
+  assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$direction A-B-A inventories live A and distinct archived B only"
+  assert_eq '2026-10-11T03:00:00Z' "$(printf '%s' "$RUN_JSON" | jq -r '.missing[]|select(.kind=="review-body")|.updated_at')" "$direction equal-body collapse preserves the latest historical source floor"
+  DEDUP_ACKS=$(printf '%s' "$RUN_JSON" | jq '[.missing[].ack_token]')
+  jq --argjson acks "$DEDUP_ACKS" '. + [$acks[]|{id:9225,user:{login:"nathanpayne-codex"},created_at:"2026-10-11T03:01:00Z",body:(.+"\nDispositioned after the latest edit.")}]' "$TMP/fixtures/issues.json" >"$TMP/dedup-acknowledged.json"
+  mv "$TMP/dedup-acknowledged.json" "$TMP/fixtures/issues.json"
+  run_gate
+  assert_eq 0 "$RUN_RC" "$direction post-floor acknowledgments account for both distinct obligations"
+done
+# Match the existing finding_tier precedence: Codex/current reviewers win
+# over a simultaneous CR login, so those parses never gain CR suffix grammar.
+for precedence in codex reviewer; do
+  reset_fixtures
+  cp "$TMP/dedup-role-policy.yml" "$TMP/review-policy.yml"
+  python3 - "$TMP/review-policy.yml" "$source" "$precedence" <<'PYTHON'
+import sys
+p,source,precedence=sys.argv[1:]; s=open(p).read()
+if precedence=='codex': s=s.replace('bot_login: "new-codex[bot]"','bot_login: "'+source+'"')
+else: s=s.replace('available_reviewers:\n','available_reviewers:\n  - "'+source+'"\n')
+open(p,'w').write(s)
+PYTHON
+  printf '_🟠 Major_\n**P1** Current parser precedence.\n' >"$TMP/dedup-body"
+  DEDUP_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9231 "$source" '2026-10-11T03:00:00Z' "$TMP/dedup-body")
+  jq -n --arg body "$DEDUP_ARCHIVE" '[{id:9232,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+  jq -n --arg source "$source" --rawfile body "$TMP/dedup-body" '[{id:9231,user:{login:$source},body:$body,created_at:"2026-10-11T01:00:00Z"}]' >"$TMP/fixtures/inline.json"
+  run_gate
+  assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$precedence parser precedence still collapses byte-identical history"
+  jq '.[0].body += "\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678\n\n<!-- This is an auto-generated reply by CodeRabbit -->"' "$TMP/fixtures/inline.json" >"$TMP/dedup-precedence-live.json"
+  mv "$TMP/dedup-precedence-live.json" "$TMP/fixtures/inline.json"
+  run_gate
+  assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$precedence parser precedence does not apply simultaneous CR suffix grammar"
+  assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq '[.missing[]|select(.kind=="inline-archive")]|length')" "$precedence parser keeps the distinct edited archive obligation"
+done
+# A GHAS login can also have current reviewer standing. Source-kind live
+# inventory must match the actual review loop, which includes that reviewer.
+for kind in inline review-body; do
+  for standing in current retired weaker; do
+    reset_fixtures
+    python3 - "$TMP/dedup-initial-policy.yml" "$TMP/review-policy.yml" "$standing" <<'PYTHON'
+import sys
+s=open(sys.argv[1]).read().replace('status: active','status: retired')
+s=s.replace('bot_login: "github-advanced-security[bot]"','bot_login: "nathanpayne-codex"')
+if sys.argv[3]=='retired': s=s.replace('  - nathanpayne-codex\n','')
+open(sys.argv[2],'w').write(s)
+PYTHON
+    printf '**P1** Identical GHAS and current reviewer body.\n' >"$TMP/ghas-reviewer-body"
+    if [ "$standing" = weaker ]; then printf '_🟠 Major_\n**P2** Weaker current reviewer tier.\n' >"$TMP/ghas-reviewer-body"; fi
+    GHAS_REVIEWER_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" "$kind" 9241 nathanpayne-codex '2026-10-11T03:00:00Z' "$TMP/ghas-reviewer-body")
+    jq -n --arg body "$GHAS_REVIEWER_ARCHIVE" '[{id:9242,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+    surface=inline; [ "$kind" != review-body ] || surface=reviews
+    jq -n --rawfile body "$TMP/ghas-reviewer-body" '[{id:9241,user:{login:"nathanpayne-codex"},body:$body,created_at:"2026-10-11T01:00:00Z",submitted_at:"2026-10-11T01:00:00Z",commit_id:"cccccccccccccccccccccccccccccccccccccccc"}]' >"$TMP/fixtures/$surface.json"
+    run_gate
+    assert_eq 1 "$RUN_RC" "$kind GHAS/reviewer $standing keeps a finding obligation"
+    expected=1
+    # With reviewer standing removed, the remaining inline GHAS parser uses
+    # its existing p2 default; it cannot cover the stronger archived p1.
+    if [ "$standing" = weaker ] || { [ "$standing" = retired ] && [ "$kind" = inline ]; }; then expected=2; fi
+    assert_eq "$expected" "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$kind GHAS/reviewer $standing collapses only current parser coverage"
+    expected_archives=0; [ "$standing" = current ] || expected_archives=1
+    assert_eq "$expected_archives" "$(printf '%s' "$RUN_JSON" | jq '[.missing[]|select(.kind|endswith("-archive"))]|length')" "$kind GHAS/reviewer $standing respects standing and stronger history"
+  done
+done
+# Preserve the historical floor when A -> B -> A uses reviewer precedence
+# over the same configured GHAS login; only byte-identical A may collapse.
+reset_fixtures
+python3 - "$TMP/dedup-initial-policy.yml" "$TMP/review-policy.yml" <<'PYTHON'
+import sys
+s=open(sys.argv[1]).read().replace('status: active','status: retired')
+s=s.replace('bot_login: "github-advanced-security[bot]"','bot_login: "nathanpayne-codex"')
+open(sys.argv[2],'w').write(s)
+PYTHON
+printf '**P1** Re-raised reviewer body A.\n' >"$TMP/ghas-reviewer-body-a"
+printf '**P1** Intermediate reviewer body B.\n' >"$TMP/ghas-reviewer-body-b"
+GHAS_REVIEWER_A=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" review-body 9251 nathanpayne-codex '2026-10-11T02:00:00Z' "$TMP/ghas-reviewer-body-a")
+GHAS_REVIEWER_B=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" review-body 9251 nathanpayne-codex '2026-10-11T03:00:00Z' "$TMP/ghas-reviewer-body-b")
+GHAS_REVIEWER_FP=$(printf '%s' "$GHAS_REVIEWER_A" | jq -Rr 'capture("^<!-- mergepath-feedback-archive:v1 (?<data>.+) -->$").data|@base64d|fromjson|.body_fingerprint')
+jq -n --arg a "$GHAS_REVIEWER_A" --arg b "$GHAS_REVIEWER_B" --arg ack "[mergepath-review-ack: 9251 $GHAS_REVIEWER_FP]" '[{id:9252,user:{login:"github-actions[bot]"},body:$a},{id:9253,user:{login:"github-actions[bot]"},body:$b},{id:9254,user:{login:"nathanpayne-cursor"},created_at:"2026-10-11T02:30:00Z",body:($ack+"\nOld A disposition before the latest source edit.")}]' >"$TMP/fixtures/issues.json"
+jq -n --rawfile body "$TMP/ghas-reviewer-body-a" '[{id:9251,user:{login:"nathanpayne-codex"},body:$body,submitted_at:"2026-10-11T01:00:00Z",commit_id:"cccccccccccccccccccccccccccccccccccccccc"}]' >"$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 1 "$RUN_RC" "GHAS/reviewer A-B-A keeps the later historical obligations unaccounted"
+assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "GHAS/reviewer A-B-A inventories live A and distinct archived B only"
+assert_eq '2026-10-11T03:00:00Z' "$(printf '%s' "$RUN_JSON" | jq -r '.missing[]|select(.kind=="review-body")|.updated_at')" "GHAS/reviewer collapse preserves the latest historical review floor"
+# Current reviewer standing must not expand a retained GHAS-only source kind.
+sed 's/login: nathanpayne-codex, provider: reviewer/login: nathanpayne-codex, provider: ghas/' "$TMP/review-policy.yml" >"$TMP/ghas-only-retained-policy.yml"
+mv "$TMP/ghas-only-retained-policy.yml" "$TMP/review-policy.yml"
+assert_eq "" "$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" review-body 9251 nathanpayne-codex '2026-10-11T03:00:00Z' "$TMP/ghas-reviewer-body-a")" "current reviewer role does not admit retained GHAS-only review bodies"
+run_gate
+assert_eq 2 "$RUN_RC" "retained GHAS-only review history fails admission before live deduplication"
+mv "$TMP/dedup-policy-before.yml" "$TMP/review-policy.yml"
 
 if [ "$FAIL" -ne 0 ]; then
   printf 'review-feedback-accounting: FAIL (%s failed, %s passed)\n' "$FAIL" "$PASS" >&2
