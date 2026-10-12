@@ -269,12 +269,15 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     unresolved prefix cannot prove those boundaries, so later known callback
     operands remain conservative evidence without option dataflow.
   * A reference anywhere XTRACE is in effect.  With `set -x` (or `set -o
-    xtrace`, or a `-x` shebang) bash writes every EXPANDED command to stderr,
+    xtrace`, bundled `set -eo/-euo xtrace`, `shopt -s -o/-os xtrace`,
+    or a `-x` shebang) bash writes every EXPANDED command to stderr,
     so `: "$PAT"` -- the safest command word there is -- puts the value on a
     stream.  This is shell STATE, tracked in source order across the file and
     resolved per SEGMENT, so `( set -x; : "$PAT" )` counts and `set +x`,
-    `set +o xtrace` and `set -- -x` are all read correctly.  The two
-    directions are ASYMMETRIC on purpose: enabling is believed wherever it is
+    `set +o xtrace` and `set -- -x` are all read correctly.  The
+    shared segment detector also reads immediate deferred enablement. Shopt
+    query/disable modes gain no new disable credit in this enabling repair.
+    The directions are ASYMMETRIC on purpose: enabling is believed wherever it is
     written, disabling only from a line that is the whole `set` and is not
     inside a function body.  Crediting a `set +x` bash never runs is a silent
     false negative and is trivially reachable -- `set -x; f() { set +x; }` --
@@ -3702,34 +3705,64 @@ def _deferred_shell_operands(seg):
 def _segment_sets_xtrace(seg):
     """Return True / False to set xtrace state, or None to leave it alone."""
     cmd, _redir = resolve_command(seg)
-    if cmd != "set":
+    if cmd not in ("set", "shopt") or seg._cmd_index is None:
         return None
-    lits = [_unquote_command_word(w) for w in seg.words]
-    lits = [l for l in lits if l is not None]
+    lits = [literal for _raw, literal in
+            _command_arguments(seg.words, seg._cmd_index + 1)]
+    if cmd == "shopt":
+        flags = set()
+        i = 0
+        while i < len(lits):
+            word = lits[i]
+            if word == "--":
+                i += 1
+                break
+            if word is None:
+                return None
+            if not word.startswith("-"):
+                break
+            if word == "-" or set(word[1:]) - set("opqsu"):
+                return None
+            flags.update(word[1:])
+            i += 1
+        # Only enabling forms are added. Query/disable modes never acquire
+        # new disable credit; the existing logical-line asymmetry remains.
+        if {"s", "o"} <= flags and not flags & {"u", "p", "q"}:
+            return True if "xtrace" in lits[i:] else None
+        return None
     state = None
     i = 0
     while i < len(lits):
         a = lits[i]
+        if a is None:
+            # Preserve prior conservative recognition after unresolved input.
+            i += 1
+            continue
         if a == "--":
-            # `set -- -x` ENDS option processing: `-x` is a positional
-            # parameter from here on, not the xtrace option, and reading it as
-            # one turned tracing on for the rest of the file over a line that
-            # traces nothing.
-            break
+            break  # Positional input does not prove an option.
         if a in ("-o", "+o"):
             nxt = lits[i + 1] if i + 1 < len(lits) else None
             if nxt == "xtrace":
                 state = a == "-o"
-                i += 2
-                continue
             i += 2
             continue
         if a == "--xtrace":
             state = True
-        elif a.startswith("-") and not a.startswith("--") and "x" in a[1:]:
-            state = True
-        elif a.startswith("+") and "x" in a[1:]:
-            state = False
+        elif a.startswith("-") and not a.startswith("--"):
+            if "x" in a[1:]:
+                state = True
+            # A named -o consumes the next word even inside a short bundle.
+            # Restrict new recognition to supported set option letters.
+            if "o" in a[1:] and not set(a[1:]) - set("abefhkmnptuvxBCEHPTo"):
+                if i + 1 < len(lits) and lits[i + 1] == "xtrace":
+                    state = True
+                i += 2
+                continue
+        elif a.startswith("+"):
+            if "x" in a[1:]:
+                state = False  # Existing +x semantics, no new bundled +o credit.
+        else:
+            break  # The first ordinary operand ends set option processing.
         i += 1
     return state
 
@@ -7470,6 +7503,152 @@ CORPUS = [
         MUST_NOT_FLAG,
         "read x <<$'EOF'\nnothing\nEOF\necho ok\n",
     ),
+    # #1448: shared direct/deferred bundled trace-option detector.
+    (
+        'xtrace-bundle-unresolved-existing-x',
+        MUST_FLAG,
+        'opts=-e\nset "$opts" -x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-set-eo',
+        MUST_FLAG,
+        'set -eo xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-set-eo-deferred',
+        MUST_FLAG,
+        'eval \'set -eo xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-set-eo-disable',
+        MUST_NOT_FLAG,
+        'set -eo xtrace\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-set-euo',
+        MUST_FLAG,
+        'set -euo xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-set-euo-deferred',
+        MUST_FLAG,
+        'eval \'set -euo xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-set-euo-disable',
+        MUST_NOT_FLAG,
+        'set -euo xtrace\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-shopt-s-o',
+        MUST_FLAG,
+        'shopt -s -o xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-shopt-s-o-deferred',
+        MUST_FLAG,
+        'eval \'shopt -s -o xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-shopt-s-o-disable',
+        MUST_NOT_FLAG,
+        'shopt -s -o xtrace\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-shopt-os',
+        MUST_FLAG,
+        'shopt -os xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-shopt-os-deferred',
+        MUST_FLAG,
+        'eval \'shopt -os xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-shopt-os-disable',
+        MUST_NOT_FLAG,
+        'shopt -os xtrace\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-set-pipefail',
+        MUST_NOT_FLAG,
+        'set -euo pipefail\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-shopt-pipefail',
+        MUST_NOT_FLAG,
+        'shopt -os pipefail\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-set-positional',
+        MUST_NOT_FLAG,
+        'set ordinary -x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-set-option-then-positional',
+        MUST_NOT_FLAG,
+        'set -eo pipefail ordinary -x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-shopt-query',
+        MUST_NOT_FLAG,
+        'shopt -o xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-shopt-print-query',
+        MUST_NOT_FLAG,
+        'shopt -po xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-shopt-no-shell-options',
+        MUST_NOT_FLAG,
+        'shopt -s xtrace || :\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-shopt-delimiter',
+        MUST_NOT_FLAG,
+        'shopt -- -s -o xtrace || :\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-set-delimiter',
+        MUST_NOT_FLAG,
+        'set -- -eo xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-shopt-named-disable',
+        MUST_NOT_FLAG,
+        'shopt -os xtrace\nset +o xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-set-conditional-disable',
+        MUST_FLAG,
+        'set -eo xtrace\nif false; then set +x; fi\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-shopt-function-disable',
+        MUST_FLAG,
+        'shopt -os xtrace\nf(){ set +x; }\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-set-function-disable',
+        MUST_FLAG,
+        'set -euo xtrace\nf(){ set +o xtrace; }\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-shopt-conditional-disable',
+        MUST_FLAG,
+        'shopt -s -o xtrace\nif false; then set +o xtrace; fi\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-shopt-uncalled-enable',
+        MUST_NOT_FLAG,
+        'f(){ shopt -os xtrace; }\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-bundle-shopt-disable-conservative',
+        MUST_FLAG,
+        'set -x\nshopt -u -o xtrace\n: "$GH_TOKEN"\n',
+    ),
     # --- xtrace turned on by DEFERRED code -------------------------------
     #
     # The deferred text runs in THIS shell, so the state it sets outlives the
@@ -8013,6 +8192,7 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    "xtrace-bundle-shopt-disable-conservative": "This enabling-spelling repair preserves prior shopt disable handling: it never grants new disable credit or expands the conditional/function-local disable contract.",
     'helper-redefinitions-direct-later-emitter': (
         "Every recognized emitting body promotes its helper name; this safe "
         "runtime call does not execute that body. Textual order, false branches "
