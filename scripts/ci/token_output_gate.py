@@ -259,11 +259,27 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     has with its opener and it is handled the same way -- one hop
     (`_DEFERRED_SHELL_DEPTH`), and a discovery error inside the deferred text
     is REPORTED rather than dropped, for the reason an unterminated here-doc
-    is.  An operand that does not reduce to a literal is not re-read; `trap`
+    is. Known or conservatively retained active tracing at the enclosing
+    segment initializes the literal operand scan. Inner disables receive only
+    the existing standalone top-level disable credit; untraced references and
+    references after a credited disable gain no xtrace finding from this
+    bridge. Existing output-path analysis and command-boundary conservatism
+    still apply. Already-retained deferred enables also reach later segments
+    on the same logical line within the existing lexer parent scopes. Function
+    invocation, trap timing and callback input availability are not inferred;
+    safe sampled cases remain declared conservatism. Deferred initialization
+    restores effective parent state after isolated shells; the ordinary
+    reference state walk retains its prior scope. This is not call-time
+    analysis of earlier
+    function/trap definitions, and separately scanned sourced files do not
+    inherit the caller state. An operand that does not reduce to a literal
+    is not re-read; `trap`
     is opaque, so a reference the lexer can see inside one is flagged anyway.
     A `mapfile -C CALLBACK` / `readarray -C CALLBACK` argument is the same
     thing in a NAMED OPTION -- bash evaluates the callback -- and is re-read
     the same way, including bundled short options such as `-tC`. Only the
+    effective final callback is selected for a proven literal option sequence;
+    unknown prefixes or values retain the prior known-callback fallback. The
     literal callback operand is source: the search stops at `--` or the array
     operand and skips values consumed by other short options (#1450). An
     unresolved prefix cannot prove those boundaries, so later known callback
@@ -3669,12 +3685,14 @@ def _deferred_shell_operands(seg):
         out = []
         i = 0
         uncertain_prefix = False
+        final_callback_certain = True
         while i < len(args):
             _raw, literal = args[i]
             if literal is None:
                 # It might be a flag, a value-taking option or the array name.
                 # Preserve known later callbacks rather than infer a clean path.
                 uncertain_prefix = True
+                final_callback_certain = False
                 i += 1
                 continue
             if literal == "--" or literal == "-" or not literal.startswith("-"):
@@ -3690,15 +3708,20 @@ def _deferred_shell_operands(seg):
                         value = args[i + 1][1] if i + 1 < len(args) else None
                         if not uncertain_prefix:
                             i += 1
-                    if option == "C" and value is not None:
-                        out.append(value)
+                    if option == "C":
+                        if value is None:
+                            final_callback_certain = False
+                        else:
+                            out.append(value)
                     break
                 if option != "t":
                     if not uncertain_prefix:
                         return out  # Unsupported option prevents later callbacks.
                     break
             i += 1
-        return out
+        # Only the last C is effective when its option sequence is proven.
+        # Unknown values/prefixes retain the prior per-known-literal fallback.
+        return out[-1:] if final_callback_certain else out
     if cmd not in DEFERRED_SHELL_COMMANDS:
         return []
     out = []
@@ -4034,8 +4057,12 @@ def _shebang_enables_xtrace(text):
     return False
 
 
-def _text_enables_xtrace(text):
+def _text_enables_xtrace(text, outer_only=False):
     """Does this text turn xtrace ON anywhere in it?
+
+    For deferred initialization, outer_only retains only writes in the
+    existing lexer's outer scope. Default callers keep the aggregate source
+    predicate; neither mode infers function invocation or callback timing.
 
     Used on DEFERRED text (`eval`, a trap action, `mapfile -C`), whose effect
     on the CURRENT shell outlives the deferred command.  Deliberately
@@ -4051,12 +4078,14 @@ def _text_enables_xtrace(text):
         return True  # unreadable deferred text: fail CLOSED
     for ll in lx.logical:
         for seg in ll.segments:
-            if _segment_sets_xtrace(seg) is True:
+            if _segment_sets_xtrace(seg) is True and (
+                not outer_only or seg.parent is None
+            ):
                 return True
     return False
 
 
-def scan_text(text, path="<text>", _depth=0):
+def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
     """Return (findings, pragma_errors)."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     helpers = discover_emitter_helpers(text)
@@ -4074,7 +4103,8 @@ def scan_text(text, path="<text>", _depth=0):
             "never found, so the rest of the file was read as body text and "
             "not as code" % (path, opened_at, delim)
         )
-    xtrace = _shebang_enables_xtrace(text)
+    xtrace = _initial_xtrace or _shebang_enables_xtrace(text)
+    effective_xtrace = xtrace
     fn_spans = _function_body_line_spans(text)
     aliases = _alias_emitters(lx, helpers)
     base_helpers = set(helpers)
@@ -4102,6 +4132,8 @@ def scan_text(text, path="<text>", _depth=0):
         in_function = any(lo <= ll.first_line <= hi for lo, hi in fn_spans)
         line_delta = _xtrace_delta(ll, in_function)
         xtrace_at = {}
+        effective_xtrace_at = {}
+        effective_xtrace_scopes = {None: effective_xtrace}
         state = xtrace
         # `state` grades the segments of THIS line, including the ones inside a
         # subshell -- `( set -x; : "$PAT" )` really is traced.  `outer` is what
@@ -4110,17 +4142,52 @@ def scan_text(text, path="<text>", _depth=0):
         # `: "$PAT"` emits nothing and the gate reported a finding (#1032
         # round 7 P2).
         outer = xtrace
+        deferred_xtrace_scopes = set()
         for seg in ll.segments:
-            xtrace_at[seg.sid] = state
+            # Reuse the lexer's parent lineage: a known enable in an outer
+            # scope reaches later children, but a child enable does not escape
+            # its subshell/capture or reach a sibling's shell state.
+            scopes = [None]
+            parent = seg.parent
+            while parent is not None:
+                scopes.append(parent.sid)
+                parent = parent.parent
+            xtrace_at[seg.sid] = state or any(
+                scope in deferred_xtrace_scopes for scope in scopes
+            )
+            # Deferred initialization uses effective parent-scope state;
+            # keep the legacy ordinary-reference map independent.
+            effective_xtrace_at[seg.sid] = next(
+                effective_xtrace_scopes[scope]
+                for scope in scopes[1:] + [None]
+                if scope in effective_xtrace_scopes
+            )
+            current_scope = seg.parent.sid if seg.parent is not None else None
             st = _segment_sets_xtrace(seg)
             if st is True:
+                effective_xtrace_scopes[current_scope] = True
                 state = True
                 if not seg.parent_is_subshell:
                     outer = True
             elif st is False and line_delta is False:
+                effective_xtrace_scopes[current_scope] = False
                 state = False
                 if not seg.parent_is_subshell:
                     outer = False
+            # The same bounded extractor/enable predicate used below must
+            # contribute before later segments consume this map. This retains
+            # written enable evidence, not a claim that a trap/callback ran.
+            if not ll.pragma_reasons and _depth < _DEFERRED_SHELL_DEPTH:
+                deferred_operands = _deferred_shell_operands(seg)
+                if any(_text_enables_xtrace(inner, outer_only=True)
+                       for inner in deferred_operands):
+                    effective_xtrace_scopes[current_scope] = True
+                if any(_text_enables_xtrace(inner)
+                       for inner in deferred_operands):
+                    deferred_xtrace_scopes.add(
+                        seg.parent.sid if seg.parent is not None else None
+                    )
+        effective_xtrace = effective_xtrace_scopes[None]
         if ll.pragma_reasons:
             # A pragma'd line is exempt, and so is any xtrace it turns on --
             # the exemption is the author's written statement about THIS line.
@@ -4141,7 +4208,10 @@ def scan_text(text, path="<text>", _depth=0):
             for seg in ll.segments:
                 for inner in _deferred_shell_operands(seg):
                     sub, sub_errors = scan_text(
-                        inner, path=path, _depth=_depth + 1
+                        inner, path=path, _depth=_depth + 1,
+                        _initial_xtrace=effective_xtrace_at.get(
+                            seg.sid, effective_xtrace
+                        ),
                     )
                     # A discovery error inside the deferred text is discovery
                     # shrinking, exactly as it is at file level, so it is
@@ -7592,6 +7662,444 @@ CORPUS = [
         MUST_NOT_FLAG,
         "read x <<$'EOF'\nnothing\nEOF\necho ok\n",
     ),
+    # #1454: effective deferred scope and certain final-callback controls.
+    (
+        'r4-mapfile-unknown-final-after-known-pair',
+        MUST_FLAG,
+        'CALLBACK=:\nset -x\nmapfile -C \': "$GH_TOKEN"\' -C : -C "$CALLBACK" -c 1 a <<< x\n',
+    ),
+    (
+        'r4-readarray-unknown-final-after-known-pair',
+        MUST_FLAG,
+        'CALLBACK=:\nset -x\nreadarray -C \': "$GH_TOKEN"\' -C : -C "$CALLBACK" -c 1 a <<< x\n',
+    ),
+    (
+        'r4-callback-unknown-prefix-known-final',
+        MUST_FLAG,
+        'PREFIX=\'-C :\'\nset -x\nmapfile -C \': "$GH_TOKEN"\' $PREFIX -C : -c 1 a <<< x\n',
+    ),
+    (
+        'r4-subshell-direct-enable-same-line-deferred',
+        MUST_NOT_FLAG,
+        '(set -x); eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'r4-capture-direct-enable-cross-line-deferred',
+        MUST_NOT_FLAG,
+        'value=$(set -x)\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'r4-subshell-direct-enable-cross-line-deferred',
+        MUST_NOT_FLAG,
+        '(set -x)\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'r4-capture-direct-enable-same-line-deferred',
+        MUST_NOT_FLAG,
+        'value=$(set -x); eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'r4-active-root-subhell-positive',
+        MUST_FLAG,
+        'set -x\n(:); eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'r4-active-root-capture-positive',
+        MUST_FLAG,
+        'set -x\nvalue=$(:)\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'r4-isolated-disable-active-root-positive',
+        MUST_FLAG,
+        'set -x\n(set +x); eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'r4-direct-enable-within-isolate-positive',
+        MUST_FLAG,
+        '(set -x; eval \': "$GH_TOKEN"\')\n',
+    ),
+    (
+        'r4-deferred-enable-isolate-fence-control',
+        MUST_NOT_FLAG,
+        '(eval \'set -x\'); eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'r4-mapfile-discarded-first-traced-callback',
+        MUST_NOT_FLAG,
+        'set -x\nmapfile -C \': "$GH_TOKEN"\' -C : -c 1 a <<< x\n',
+    ),
+    (
+        'r4-mapfile-effective-final-traced-callback',
+        MUST_FLAG,
+        'set -x\nmapfile -C : -C \': "$GH_TOKEN"\' -c 1 a <<< x\n',
+    ),
+    (
+        'r4-mapfile-discarded-first-output-callback',
+        MUST_NOT_FLAG,
+        'mapfile -C \'echo "$GH_TOKEN"\' -C : -c 1 a <<< x\n',
+    ),
+    (
+        'r4-mapfile-effective-final-output-callback',
+        MUST_FLAG,
+        'mapfile -C : -C \'echo "$GH_TOKEN"\' -c 1 a <<< x\n',
+    ),
+    (
+        'r4-mapfile-discarded-first-enable-callback',
+        MUST_NOT_FLAG,
+        'mapfile -C \'set -x\' -C : -c 1 a <<< x; eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'r4-mapfile-effective-final-enable-callback',
+        MUST_FLAG,
+        'mapfile -C : -C \'set -x\' -c 1 a <<< x; eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'r4-mapfile-unknown-final-callback',
+        MUST_FLAG,
+        'CALLBACK=:\nset -x\nmapfile -C \': "$GH_TOKEN"\' -C "$CALLBACK" -c 1 a <<< x\n',
+    ),
+    (
+        'r4-readarray-discarded-first-traced-callback',
+        MUST_NOT_FLAG,
+        'set -x\nreadarray -C \': "$GH_TOKEN"\' -C : -c 1 a <<< x\n',
+    ),
+    (
+        'r4-readarray-effective-final-traced-callback',
+        MUST_FLAG,
+        'set -x\nreadarray -C : -C \': "$GH_TOKEN"\' -c 1 a <<< x\n',
+    ),
+    (
+        'r4-readarray-discarded-first-output-callback',
+        MUST_NOT_FLAG,
+        'readarray -C \'echo "$GH_TOKEN"\' -C : -c 1 a <<< x\n',
+    ),
+    (
+        'r4-readarray-effective-final-output-callback',
+        MUST_FLAG,
+        'readarray -C : -C \'echo "$GH_TOKEN"\' -c 1 a <<< x\n',
+    ),
+    (
+        'r4-readarray-discarded-first-enable-callback',
+        MUST_NOT_FLAG,
+        'readarray -C \'set -x\' -C : -c 1 a <<< x; eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'r4-readarray-effective-final-enable-callback',
+        MUST_FLAG,
+        'readarray -C : -C \'set -x\' -c 1 a <<< x; eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'r4-readarray-unknown-final-callback',
+        MUST_FLAG,
+        'CALLBACK=:\nset -x\nreadarray -C \': "$GH_TOKEN"\' -C "$CALLBACK" -c 1 a <<< x\n',
+    ),
+    (
+        'r4-inner-subshell-enable-fence',
+        MUST_NOT_FLAG,
+        'eval \'(set -x)\'; eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'r4-inner-capture-enable-fence',
+        MUST_NOT_FLAG,
+        'eval \'value=$(set -x)\'\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'r4-inner-root-enable-positive',
+        MUST_FLAG,
+        'eval \'set -x\'; eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'r4-callback-stop-array-control',
+        MUST_NOT_FLAG,
+        'set -x\nmapfile -C : -c 1 a -C \': "$GH_TOKEN"\' <<< x\n',
+    ),
+    (
+        'r4-callback-stop-delimiter-control',
+        MUST_NOT_FLAG,
+        'set -x\nmapfile -C : -c 1 -- a -C \': "$GH_TOKEN"\' <<< x\n',
+    ),
+    (
+        'r4-callback-bundled-final-control',
+        MUST_NOT_FLAG,
+        'set -x\nmapfile -tC \': "$GH_TOKEN"\' -C : -c 1 a <<< x\n',
+    ),
+    (
+        'r4-callback-bundled-final-positive',
+        MUST_FLAG,
+        'set -x\nmapfile -C : -tC \': "$GH_TOKEN"\' -c 1 a <<< x\n',
+    ),
+    (
+        'r4-callback-unknown-prefix-conservative',
+        MUST_FLAG,
+        'PREFIX=\'-C :\'\nset -x\nmapfile -C \': "$GH_TOKEN"\' $PREFIX -c 1 a <<< x\n',
+    ),
+    # #1454 required same-line known-enable propagation and scope controls.
+    (
+        'deferred-enable-same-line-eval',
+        MUST_FLAG,
+        'eval \'set -x\'; eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-same-line-direct',
+        MUST_FLAG,
+        'eval \'set -x\'; : "$GH_TOKEN"\n',
+    ),
+    (
+        'deferred-enable-multiline-control',
+        MUST_FLAG,
+        'eval \'set -x\'\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-quiet-control',
+        MUST_NOT_FLAG,
+        'eval \':\'; eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-subshell-fence',
+        MUST_NOT_FLAG,
+        '(eval \'set -x\'); eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-in-subshell',
+        MUST_FLAG,
+        '(eval \'set -x\'; eval \': "$GH_TOKEN"\')\n',
+    ),
+    (
+        'deferred-enable-outer-to-subshell',
+        MUST_FLAG,
+        'eval \'set -x\'; (eval \': "$GH_TOKEN"\')\n',
+    ),
+    (
+        'deferred-enable-sibling-subshell-fence',
+        MUST_NOT_FLAG,
+        '(eval \'set -x\'); (eval \': "$GH_TOKEN"\')\n',
+    ),
+    (
+        'deferred-enable-nested-subshell-fence',
+        MUST_NOT_FLAG,
+        '((eval \'set -x\'); eval \': "$GH_TOKEN"\')\n',
+    ),
+    (
+        'deferred-enable-substitution-fence',
+        MUST_NOT_FLAG,
+        'value=$(eval \'set -x\'); eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-debug-trap-same-line',
+        MUST_FLAG,
+        'trap \'set -x\' DEBUG; eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-mapfile-same-line',
+        MUST_FLAG,
+        'mapfile -C \'set -x\' -c 1 values < <(printf \'x\\n\'); eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-readarray-same-line',
+        MUST_FLAG,
+        'readarray -C \'set -x\' -c 1 values < <(printf \'x\\n\'); eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-called-definition',
+        MUST_FLAG,
+        'f() { eval \'set -x\'; eval \': "$GH_TOKEN"\'; }; f\n',
+    ),
+    (
+        'deferred-enable-uncalled-definition',
+        MUST_FLAG,
+        'f() { eval \'set -x\'; eval \': "$GH_TOKEN"\'; }\n',
+    ),
+    (
+        'deferred-enable-depth-control',
+        MUST_NOT_FLAG,
+        'eval \'eval \'"\'"\'set -x\'"\'"\'; eval \'"\'"\': "$GH_TOKEN"\'"\'"\'\'\n',
+    ),
+    (
+        'deferred-enable-exit-trap-timing-conservative',
+        MUST_FLAG,
+        'trap \'set -x\' EXIT; eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-mapfile-empty-input-conservative',
+        MUST_FLAG,
+        'mapfile -C \'set -x\' -c 1 values </dev/null; eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'deferred-enable-readarray-empty-input-conservative',
+        MUST_FLAG,
+        'readarray -C \'set -x\' -c 1 values </dev/null; eval \': "$GH_TOKEN"\'\n',
+    ),
+    # #1454: known segment tracing and merged-detector integration controls.
+    (
+        'xtrace-inherited-indexed-literal-conservative',
+        MUST_FLAG,
+        'set -x\nprintf -v\'out[$GH_TOKEN]\' "%s" noop\n',
+    ),
+    (
+        'xtrace-inherited-indexed-substitution',
+        MUST_FLAG,
+        'set -x\nprintf -v\'out[$(: "$GH_TOKEN")]\' "%s" noop\n',
+    ),
+    (
+        'xtrace-inherited-eval',
+        MUST_FLAG,
+        'set -x\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'xtrace-inherited-eval-untraced',
+        MUST_NOT_FLAG,
+        'eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'xtrace-inherited-eval-disabled',
+        MUST_NOT_FLAG,
+        'set -x\nset +x\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'xtrace-inherited-mapfile',
+        MUST_FLAG,
+        'set -x\nmapfile -C \': "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'xtrace-inherited-mapfile-untraced',
+        MUST_NOT_FLAG,
+        'mapfile -C \': "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'xtrace-inherited-mapfile-disabled',
+        MUST_NOT_FLAG,
+        'set -x\nset +x\nmapfile -C \': "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'xtrace-inherited-readarray',
+        MUST_FLAG,
+        'set -x\nreadarray -C \': "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'xtrace-inherited-readarray-untraced',
+        MUST_NOT_FLAG,
+        'readarray -C \': "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'xtrace-inherited-readarray-disabled',
+        MUST_NOT_FLAG,
+        'set -x\nset +x\nreadarray -C \': "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'xtrace-inherited-debug-trap',
+        MUST_FLAG,
+        'set -x\ntrap \': "$GH_TOKEN"\' DEBUG\n:\n',
+    ),
+    (
+        'xtrace-inherited-debug-trap-untraced',
+        MUST_NOT_FLAG,
+        'trap \': "$GH_TOKEN"\' DEBUG\n:\n',
+    ),
+    (
+        'xtrace-inherited-debug-trap-disabled',
+        MUST_NOT_FLAG,
+        'set -x\nset +x\ntrap \': "$GH_TOKEN"\' DEBUG\n:\n',
+    ),
+    (
+        'xtrace-inherited-eval-same-line',
+        MUST_FLAG,
+        'set -x; eval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'xtrace-inherited-eval-inner-disable',
+        MUST_NOT_FLAG,
+        'set -x\neval \'set +x\n: "$GH_TOKEN"\'\n',
+    ),
+    (
+        'xtrace-inherited-eval-inner-named-disable',
+        MUST_NOT_FLAG,
+        'set -x\neval \'set +o xtrace\n: "$GH_TOKEN"\'\n',
+    ),
+    (
+        'xtrace-inherited-eval-subshell',
+        MUST_FLAG,
+        '( set -x; eval \': "$GH_TOKEN"\' )\n',
+    ),
+    (
+        'xtrace-inherited-mapfile-data-operand',
+        MUST_NOT_FLAG,
+        'set -x\nmapfile -d \': "$GH_TOKEN"\' values < <(printf \'x\\n\')\n',
+    ),
+    (
+        'xtrace-inherited-mapfile-no-callback',
+        MUST_NOT_FLAG,
+        "set -x\nmapfile -t values < <(printf 'x\\n')\n",
+    ),
+    (
+        'xtrace-inherited-integration-bundle-enable',
+        MUST_FLAG,
+        'set -eo xtrace\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'xtrace-inherited-integration-invalid-trailing-enable',
+        MUST_FLAG,
+        'set -oz xtrace\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'xtrace-inherited-integration-shopt-lone-dash-enable',
+        MUST_FLAG,
+        'shopt -so - xtrace\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'xtrace-inherited-integration-unknown-set-enable',
+        MUST_FLAG,
+        'opts=-x; set "$opts" ordinary -x\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'xtrace-inherited-integration-unknown-set-safe-conservative',
+        MUST_FLAG,
+        'opts=-e; set "$opts" ordinary -x\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'xtrace-inherited-integration-invalid-preceding-name-no-disable',
+        MUST_FLAG,
+        'set -x +ox ordinary\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'xtrace-inherited-integration-ordered-valid-disable',
+        MUST_NOT_FLAG,
+        'set -x +xo ordinary\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'xtrace-inherited-integration-named-operand-later-enable',
+        MUST_FLAG,
+        'set +eo xtrace -x\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'xtrace-inherited-integration-standalone-named-disable',
+        MUST_NOT_FLAG,
+        'set -x\nset +o xtrace\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'xtrace-inherited-integration-shopt-unknown-flags-enable',
+        MUST_FLAG,
+        'mode=-so; shopt "$mode" xtrace\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'xtrace-inherited-integration-shopt-unknown-name-enable',
+        MUST_FLAG,
+        'mode=xtrace; shopt -so "$mode"\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'xtrace-inherited-integration-shopt-unknown-name-safe-conservative',
+        MUST_FLAG,
+        'mode=pipefail; shopt -so "$mode"\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'xtrace-inherited-integration-shopt-unknown-flags-safe-conservative',
+        MUST_FLAG,
+        'mode=-qo; shopt "$mode" xtrace\neval \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'xtrace-inherited-integration-shopt-query-control',
+        MUST_NOT_FLAG,
+        'shopt -po xtrace\neval \': "$GH_TOKEN"\'\n',
+    ),
     # #1448: shared direct/deferred bundled trace-option detector.
     # #1448 fourth review: unknown shopt inputs and ordered set bundles.
     (
@@ -8805,6 +9313,10 @@ CORPUS.extend(_generated_corpus())
 # fails when an undeclared disagreement appears AND when a declared entry stops
 # disagreeing, so neither list can quietly rot.
 KNOWN_MISSES = {
+    "deferred-enable-depth-control": (
+        "The existing one-hop deferred depth stops before evaluating nested "
+        "eval operands; same-line propagation does not add recursion depth."
+    ),
     "helper-adjacent-comment-unmatched-quotes": (
         "#2080 preexisting declaration-word lexer gap: without whitespace before "
         "an adjacent # comment, unmatched comment quotes hide the later "
@@ -8955,6 +9467,83 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    'r4-mapfile-unknown-final-after-known-pair': (
+        "An unresolved callback value or option prefix retains the existing "
+        "per-known-literal callback scan; no final callback is proved."
+    ),
+    'r4-readarray-unknown-final-after-known-pair': (
+        "An unresolved callback value or option prefix retains the existing "
+        "per-known-literal callback scan; no final callback is proved."
+    ),
+    'r4-callback-unknown-prefix-known-final': (
+        "An unresolved callback value or option prefix retains the existing "
+        "per-known-literal callback scan; no final callback is proved."
+    ),
+    'r4-mapfile-unknown-final-callback': (
+        "An unresolved callback value or option prefix retains the existing "
+        "per-known-literal callback scan; the scanner does not reconstruct "
+        "dynamic callbacks or prove their effective runtime value."
+    ),
+    'r4-readarray-unknown-final-callback': (
+        "An unresolved callback value or option prefix retains the existing "
+        "per-known-literal callback scan; the scanner does not reconstruct "
+        "dynamic callbacks or prove their effective runtime value."
+    ),
+    'r4-callback-unknown-prefix-conservative': (
+        "An unresolved callback value or option prefix retains the existing "
+        "per-known-literal callback scan; the scanner does not reconstruct "
+        "dynamic callbacks or prove their effective runtime value."
+    ),
+    "deferred-enable-uncalled-definition": (
+        "Known enable evidence is scanned at its source definition site; "
+        "the scanner does not infer whether this function is invoked."
+    ),
+    "deferred-enable-exit-trap-timing-conservative": (
+        "The existing deferred enable predicate retains a possible trap "
+        "enable without inferring when its signal fires; this EXIT sample "
+        "enables tracing only after the non-emitting reference."
+    ),
+    "deferred-enable-mapfile-empty-input-conservative": (
+        "The existing callback enable predicate retains written enable "
+        "evidence without inferring input availability; this empty-input "
+        "sample never invokes the callback."
+    ),
+    "deferred-enable-readarray-empty-input-conservative": (
+        "The existing callback enable predicate retains written enable "
+        "evidence without inferring input availability; this empty-input "
+        "sample never invokes the callback."
+    ),
+    'xtrace-inherited-indexed-literal-conservative': (
+        "The existing bounded quoted-target reader conservatively grades an "
+        "expanded command word as emitting. Bash evaluates this sampled "
+        "letter-leading index cleanly and traces only its literal text; "
+        "target eligibility and the reader remain unchanged by #1454. "
+    ),
+    'xtrace-inherited-integration-unknown-set-safe-conservative': (
+        "The merged shared detector conservatively retains possible tracing "
+        "from this unresolved set/shopt input. The state bridge carries that "
+        "same source-known possibility into literal eval text. This sampled "
+        "safe value emits no fake token at runtime; there is no option-value "
+        "evaluation, assignment dataflow or new execution model (#1454, "
+        "preserving the #1448 uncertainty contract). "
+    ),
+    'xtrace-inherited-integration-shopt-unknown-name-safe-conservative': (
+        "The merged shared detector conservatively retains possible tracing "
+        "from this unresolved set/shopt input. The state bridge carries that "
+        "same source-known possibility into literal eval text. This sampled "
+        "safe value emits no fake token at runtime; there is no option-value "
+        "evaluation, assignment dataflow or new execution model (#1454, "
+        "preserving the #1448 uncertainty contract). "
+    ),
+    'xtrace-inherited-integration-shopt-unknown-flags-safe-conservative': (
+        "The merged shared detector conservatively retains possible tracing "
+        "from this unresolved set/shopt input. The state bridge carries that "
+        "same source-known possibility into literal eval text. This sampled "
+        "safe value emits no fake token at runtime; there is no option-value "
+        "evaluation, assignment dataflow or new execution model (#1454, "
+        "preserving the #1448 uncertainty contract). "
+    ),
+
     'xtrace-review4-shopt-unknown-safe-flags-conservative': (
         "An unresolved shopt word may supply missing flags or an xtrace name, "
         "while this sampled query, other name or empty value does not enable "
@@ -10437,6 +11026,21 @@ def _deferred_shell_cases():
                 "deferred %s: well-formed deferred text reported a discovery "
                 "error (%s)" % (cid, errors)
             )
+    # Trace inheritance changes the recursive initial state, not the one-hop,
+    # opaque-operand, pragma or separately-scanned-file boundaries (#1454).
+    for cid, body, kwargs, want in [
+        ("initial-active", ': "$GH_TOKEN"\n', {"_initial_xtrace": True}, True),
+        ("isolated-fragment", ': "$GH_TOKEN"\n', {}, False),
+        ("depth-limit", 'eval \': "$GH_TOKEN"\'\n',
+         {"_depth": _DEFERRED_SHELL_DEPTH, "_initial_xtrace": True}, False),
+        ("opaque-operand", 'program=\': "$GH_TOKEN"\'\nset -x\neval "$program"\n', {}, False),
+        ("earlier-trap-definition", 'trap \': "$GH_TOKEN"\' EXIT\nset -x\n', {}, False),
+        ("inner-pragma", 'set -x\neval \': "$GH_TOKEN" # TOKEN_OUTPUT_EXEMPT: fixture boundary\'\n', {}, False),
+    ]:
+        found, errors = scan_text(body, "deferred/" + cid, **kwargs)
+        if bool(found) != want or errors:
+            failures.append("deferred %s: expected finding=%s, got %s / %s"
+                            % (cid, want, bool(found), errors))
     return failures
 
 
