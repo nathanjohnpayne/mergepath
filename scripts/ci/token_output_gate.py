@@ -1235,7 +1235,8 @@ def _find_substitutions_exact(s, include_arithmetic=False):
             i = end
             continue
         if c == "`":
-            close = s.find("`", i + 1)
+            close = (_skip_backtick(s, i) - 1 if include_arithmetic
+                     else s.find("`", i + 1))
             if close == -1:
                 break
             out.append((s[i + 1 : close], i, close + 1))
@@ -1277,7 +1278,8 @@ def _find_substitutions_legacy(s, quotes_are_literal=False, include_arithmetic=F
             i = end
             continue
         if c == "`":
-            close = s.find("`", i + 1)
+            close = (_skip_backtick(s, i) - 1 if include_arithmetic
+                     else s.find("`", i + 1))
             if close == -1:
                 break
             out.append((s[i + 1 : close], i, close + 1))
@@ -2384,12 +2386,14 @@ def braced_ref_at(text, brace_open):
     return name
 
 
-def _error_word_spans(s):
+def _error_word_spans(s, in_heredoc=False):
     """[start, end) index spans of every `${VAR:?WORD}` / `${VAR?WORD}` WORD.
 
     BASH ITSELF writes that word to stderr when VAR is unset, before the
     enclosing command runs -- so a credential there reaches a stream no matter
-    what the command is.  The ordinary-line path already knows this; the
+    what the command is. The HD-only opt-in uses existing exact/compound
+    parameter bounds, preserving quoted braces and nested expansions; default
+    ordinary callers retain their existing reading. The ordinary-line path knows this; the
     here-doc body path reduced its body to bare NAMES and lost it, so
     `read x <<EOF` / `${UNSET:?$PAT}` / `EOF` attributed the reference to the
     safe `read` owner and reported clean (#1032 round 6 P1).
@@ -2398,10 +2402,21 @@ def _error_word_spans(s):
     i = 0
     n = len(s)
     while i + 1 < n:
+        if in_heredoc and s[i] == "\\":
+            i += 2
+            continue
         if s[i] == "$" and s[i + 1] == "{" and error_word_expansion_at(s, i):
             _name, end = ident_at(s, i + 2)
             rest = s[end:]
             start = end + (2 if rest.startswith(":?") else 1)
+            if in_heredoc:
+                try:
+                    close = _simple_parameter_end(s, i) - 1
+                except _ExactReadUnavailable:
+                    close = _find_compound_close(s, i + 1)
+                spans.append((start, len(s) if close is None else close))
+                i = start
+                continue
             depth = 1
             k = start
             while k < n:
@@ -3574,13 +3589,13 @@ def discover_emitter_helpers(text):
                             if body[start] == "`":
                                 inner = _backtick_positional_source(inner)
                             positional = (_word_has_verbatim_positional(inner, in_heredoc=True)
-                                          if body[start : start + 2] == "$["
+                                          if body.startswith(("$[", "$((", "${"), start)
                                           else _heredoc_substitution_has_positional(inner))
                             if positional:
                                 emits = True
                                 break
                     if not emits:
-                        for start, end in _error_word_spans(body):
+                        for start, end in _error_word_spans(body, in_heredoc=True):
                             if _word_has_verbatim_positional(body[start:end], in_heredoc=True):
                                 emits = True
                                 break
@@ -7814,6 +7829,42 @@ CORPUS = [
     ('helper-hd-round6-legacy-nested-modern-diagnostic', MUST_FLAG, 'die() { printf safe <<EOF\n$[1 / $((1 / $1))]\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ('helper-hd-round6-legacy-quoted-literal-boundary', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$[1 + "]"] $1\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ('helper-hd-round6-legacy-double-escaped-opener', MUST_FLAG, 'die() { printf safe <<EOF\n\\\\$[1 / $1]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    # #1496: HD escape boundaries and diagnostic operand quote context.
+    ('helper-hd-round7-backtick-escaped-comment', MUST_FLAG, 'die() { printf safe <<EOF\n`# \\`\necho "$1" >&2`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-backtick-escaped-comment-quiet', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n`# \\`\necho literal >&2`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-backtick-escaped-comment-captured', MUST_FLAG, 'die() { printf safe <<EOF\n`# \\`\nprintf "%s" "$1"`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-backtick-escaped-comment-quoted-delimiter', MUST_NOT_FLAG, 'die() { printf safe <<\'EOF\'\n`# \\`\necho "$1" >&2`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-backtick-escaped-opener', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n\\`echo "$1" >&2\\`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-quoted-brace', MUST_FLAG, 'die() { printf safe <<EOF\n${UNSET:?"}"$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-singlequoted-brace', MUST_FLAG, 'die() { printf safe <<EOF\n${UNSET:?\' } \'$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-nested-parameter', MUST_FLAG, 'die() { printf safe <<EOF\n${UNSET:?"}"${OTHER:-$1}}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-nested-substitution', MUST_FLAG, 'die() { printf safe <<EOF\n${UNSET:?"}"$(printf "%s" "$1")}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-literal-tail', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n${UNSET:?"}"literal} $1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-set-control', MUST_FLAG, 'SET=value\ndie() { printf safe <<EOF\n${SET:?"}"$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-escaped-opener', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n\\${UNSET:?"}"$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-quoted-delimiter', MUST_NOT_FLAG, 'die() { printf safe <<\'EOF\'\n${UNSET:?"}"$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-modern-singlequote', MUST_FLAG, 'die() { printf safe <<EOF\n$((1 / \'$1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-modern-doublequote', MUST_FLAG, 'die() { printf safe <<EOF\n$((1 / "$1"))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-parameter-array-singlequote', MUST_FLAG, 'die() { printf safe <<EOF\n${a[1/\'$1\']}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-parameter-array-set-singlequote', MUST_FLAG, 'a=(value)\ndie() { printf safe <<EOF\n${a[1/\'$1\']}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-parameter-substring-set-singlequote', MUST_FLAG, 'a=value\ndie() { printf safe <<EOF\n${a:1/\'$1\'}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-parameter-substring-unset-singlequote', MUST_FLAG, 'die() { printf safe <<EOF\n${a:1/\'$1\'}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-modern-escaped-operand', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$((1 / \\$1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-modern-quoted-delimiter', MUST_NOT_FLAG, 'die() { printf safe <<\'EOF\'\n$((1 / \'$1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-modern-literal-boundary', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$((1 + 2)) \'$1\'\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-parameter-literal-boundary', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n${a[1 + 2]} \'$1\'\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-command-substitution-singlequote', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$(printf "%s" \'$1\' >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-command-substitution-doublequote', MUST_FLAG, 'die() { printf safe <<EOF\n$(printf "%s" "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-command-substitution-captured', MUST_FLAG, 'die() { printf safe <<EOF\n$(printf "%s" "$1")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-backtick-singlequote-source', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n`printf \'%s\' \'$1\' >&2`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-nested-quoted-parameter', MUST_FLAG, 'die() { printf safe <<EOF\n${UNSET:?${OTHER:-"}"}$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-nested-quoted-substitution', MUST_FLAG, 'die() { printf safe <<EOF\n${UNSET:?$(printf \'}\')$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-substitution-literal-source', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n${UNSET:?$(printf "%s" \'$1\')}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-nested-literal-tail', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n${UNSET:?${OTHER:-"}"}literal} $1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-modern-body-literal-quotes', MUST_FLAG, 'die() { printf safe <<EOF\n\'$((1 / \'$1\'))\'\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-parameter-body-literal-quotes', MUST_FLAG, 'die() { printf safe <<EOF\n\'${a[1/\'$1\']}\'\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-modern-escaped-opener', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n\\$((1 / \\\'$1\\\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-backtick-comment-nested-parameter', MUST_FLAG, 'die() { printf safe <<EOF\n`# \\`\necho "${1:-unknown}" >&2`\nEOF\n}\ndie "$GH_TOKEN"\n'),
     # --- a credential NAME split by a line continuation ------------------
     #
     # Bash removes `\<newline>` before it parses the expansion, so these name
@@ -9366,6 +9417,10 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    'helper-hd-round7-backtick-escaped-comment-captured': 'Actual backtick source carries a positional but its stdout is captured and discarded by this non-stdin owner. The existing conservative source inventory does not prove runtime emission (#1496).',
+    'helper-hd-round7-error-set-control': 'The sampled parameter is initialized and emits no error word. Source-only HD error-word inventory does not prove runtime variable bindings (#1496).',
+    'helper-hd-round7-parameter-substring-unset-singlequote': 'The sampled unset string does not evaluate its arithmetic offset. The initialized paired string diagnoses; HD operand inventory does not prove runtime bindings (#1496).',
+    'helper-hd-round7-command-substitution-captured': 'The sampled command-substitution stdout is captured and discarded. The existing helper source inventory remains conservative about runtime emission (#1496).',
     'helper-hd-round6-legacy-safe-positional': 'The sampled legacy arithmetic evaluates without a diagnostic. Heredoc positional operands remain conservative candidates; arithmetic is not evaluated (#1496).',
     'helper-hd-round6-legacy-nested-legacy': 'The sampled inner legacy arithmetic reduces the positional value before the outer diagnostic. Nested operands remain conservative inventory without arithmetic evaluation (#1496).',
     'helper-hd-round5-substring-safe-positional-conservative': 'The sampled offset arithmetic emits no diagnostic. Positional operands remain conservative diagnostic candidates; no arithmetic evaluation is inferred (#1496).',
@@ -10777,6 +10832,37 @@ def _heredoc_legacy_arithmetic_cases():
     return failures
 
 
+
+def _heredoc_boundary_context_cases():
+    """Opt-in HD boundaries retain ordinary source and default reader context."""
+    failures = []
+    raw = '`# \\`\necho "$1" >&2`'
+    for reader in (_find_substitutions, _find_substitutions_exact,
+                   _find_substitutions_legacy):
+        if reader(raw, include_arithmetic=True) != [(raw[1:-1], 0, len(raw))]:
+            failures.append("escaped backtick HD boundary: " + reader.__name__)
+        if reader(raw) != [(raw[1:4], 0, 5)]:
+            failures.append("default backtick boundary changed: " + reader.__name__)
+    raw = '${UNSET:?"}"$1}'
+    if _error_word_spans(raw) != [(9, 10)]:
+        failures.append("default error-word boundary changed")
+    if _error_word_spans(raw, in_heredoc=True) != [(9, len(raw) - 1)]:
+        failures.append("quoted error-word HD boundary")
+    for raw in ['${UNSET:?${OTHER:-"}"}$1}', "${UNSET:?$(printf '}')$1}"]:
+        if _error_word_spans(raw, in_heredoc=True)[0] != (9, len(raw) - 1):
+            failures.append("nested error-word HD boundary: " + raw)
+    for raw in ["$((1 / '$1'))", "${a[1/'$1']}"]:
+        text = 'die() { printf safe <<EOF\n' + raw + '\nEOF\n}\n'
+        if 'die' not in discover_emitter_helpers(text):
+            failures.append("arithmetic HD quote context: " + raw)
+    for raw in ["$(printf '%s' '$1' >&2)", "`printf '%s' '$1' >&2`",
+                '${UNSET:?$(printf "%s" \'$1\')}', r'\${UNSET:?"}"$1}']:
+        text = 'die() { printf safe <<EOF\n' + raw + '\nEOF\n}\n'
+        if 'die' in discover_emitter_helpers(text):
+            failures.append("ordinary source/inert HD context changed: " + raw)
+    return failures
+
+
 def self_test():
     failures = []
     passed = 0
@@ -10790,6 +10876,7 @@ def self_test():
     failures.extend(_heredoc_shadow_continuation_arithmetic_cases())
     failures.extend(_heredoc_parameter_case_diagnostic_cases())
     failures.extend(_heredoc_legacy_arithmetic_cases())
+    failures.extend(_heredoc_boundary_context_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
