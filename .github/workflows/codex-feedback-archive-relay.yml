@@ -411,6 +411,27 @@ jobs:
                   test("^<!-- mergepath-feedback-archive-relay:v2 run=[0-9]+ publisher=[0-9]+ status=complete -->$")
                 ))
             ' "$HANDOFF_FILE" >/dev/null
+          # Enrollment and per-source bounds apply before any archive POST or
+          # check lease; artifact content remains inert data throughout.
+          . scripts/lib/feedback-policy-helpers.sh
+          . scripts/lib/feedback-archive-identities.sh
+          if [ "$(jq '.archive_records | length' "$HANDOFF_FILE")" -gt 0 ]; then
+            # Only explicit Actions source metadata can restore exact history
+            # before a missing/damaged registry is revalidated by accounting.
+            # This exception follows the trusted source/tuple check above;
+            # unknown legacy sources never receive it.
+            if ! jq -e '.event_name == "issue_comment" and
+              .archive_source.kind == "issue-comment" and
+              .archive_source.login == "github-actions[bot]" and
+              (.archive_source.id | type == "number" and . > 0 and floor == .)' \
+              "$HANDOFF_FILE" >/dev/null; then
+              feedback_archive_registry_load .github/review-policy.yml
+            fi
+            # The preceding tuple check matches this independently resolved
+            # source event; payload.event_name alone grants no legacy restoration.
+            feedback_archive_validate_records "$HANDOFF_FILE" "$EXPECTED_SOURCE_EVENT"
+          fi
+
           # The artifact's head belongs to the historical source event. It is
           # never a Checks API target. Snapshot the positively bound PR's live
           # API head immediately before opening this invocation's lease.

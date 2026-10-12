@@ -144,6 +144,11 @@ validate_governing_policy() {
 
 validate_governing_policy
 
+ARCHIVE_IDENTITIES_HELPER="$SCRIPT_DIR/lib/feedback-archive-identities.sh"
+[ -r "$ARCHIVE_IDENTITIES_HELPER" ] || die 2 "missing retained archive identity helper"
+# shellcheck source=lib/feedback-archive-identities.sh
+. "$ARCHIVE_IDENTITIES_HELPER"
+
 policy_top_field() {
   local field="$1"
   printf '%s' "$POLICY_JSON" | jq -r --arg field "$field" '.[$field] // empty'
@@ -673,28 +678,11 @@ archive_payload() {
 
 archive_source_comments() {
   local source_kind="$1" source_login="$2"
+  feedback_archive_source_provider "$source_kind" "$source_login" >/dev/null || return 1
   case "$source_kind" in
-    issue-comment)
-      case "$source_login" in
-        "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
-        *) return 1 ;;
-      esac
-      printf '%s' "$ISSUE_COMMENTS"
-      ;;
-    inline)
-      case "$source_login" in
-        "$CODEX_BOT"|"$CODERABBIT_BOT"|"$GHAS_BOT") ;;
-        *) registered_reviewer_login "$source_login" || return 1 ;;
-      esac
-      printf '%s' "$INLINE_COMMENTS"
-      ;;
-    review-body)
-      case "$source_login" in
-        "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
-        *) registered_reviewer_login "$source_login" || return 1 ;;
-      esac
-      printf '%s' "$REVIEWS"
-      ;;
+    issue-comment) printf '%s' "$ISSUE_COMMENTS" ;;
+    inline) printf '%s' "$INLINE_COMMENTS" ;;
+    review-body) printf '%s' "$REVIEWS" ;;
     *) return 1 ;;
   esac
 }
@@ -725,6 +713,15 @@ EOF
 # by source kind + id + fingerprint; a distinct body remains independently
 # dispositionable.
 ARCHIVE_ENTRIES='[]'
+# Enrollment is needed only for archive inventory. Live provider accounting
+# remains available during seed migration; an archive with unknown enrollment
+# must never disappear into an apparently empty inventory.
+if printf '%s' "$ISSUE_COMMENTS" | jq -e 'any(.[];
+  .user.login == "github-actions[bot]" and
+  ((.body // "") | test("^<!-- mergepath-feedback-archive:v[12] ")))' >/dev/null; then
+  feedback_archive_registry_from_json "$POLICY_JSON" || die 2 "could not resolve retained archive identities"
+fi
+
 while IFS= read -r archive_comment; do
   [ -n "$archive_comment" ] || continue
   archive_login=$(printf '%s' "$archive_comment" | jq -r '.user.login // ""')
@@ -940,7 +937,7 @@ append_archive_candidate() {
   local source_kind source_id source_login source_comments source_comment
   local live_source_login live_source_body_json live_source_fingerprint archive_tiers tier
   local body_fingerprint payload_body_json finding_kind ack_token accounted evidence
-  local live_body archived_body
+  local live_body archived_body live_tier live_source_current=false
 
   printf '%s' "$payload" | validate_archive_payload \
     || die 2 "feedback archive payload failed schema validation"
@@ -964,7 +961,20 @@ append_archive_candidate() {
   source_id=$(printf '%s' "$payload" | jq -r '.source_comment_id')
   source_login=$(printf '%s' "$payload" | jq -r '.source_login')
   body_fingerprint=$(printf '%s' "$payload" | jq -r '.body_fingerprint')
-  source_comments=$(archive_source_comments "$source_kind" "$source_login") || return 0
+  feedback_archive_source_provider "$source_kind" "$source_login" >/dev/null \
+    || die 2 "feedback archive source lacks retained enrollment or an eligible source kind: $source_login ($source_kind)"
+  # Once exact retained source-kind admission succeeds, preserve every
+  # serialized classifier result. Present provider configuration cannot erase
+  # captured history after further role changes. These are conservative tier
+  # possibilities, not authenticated per-revision provider attribution; quoted
+  # cross-provider markers may create an extra disposition obligation.
+  archive_tiers=$(printf '%s' "$payload" | jq -c '
+    [.codex_tiers[], .coderabbit_tiers[], (.ghas_tiers // [])[]] | unique
+  ') || die 2 "could not resolve archived classifier tier evidence"
+  tier=$(strongest_nonignored_archive_tier "$archive_tiers")
+  [ -n "$tier" ] || return 0
+  source_comments=$(archive_source_comments "$source_kind" "$source_login") \
+    || die 2 "could not resolve the feedback archive source inventory"
 
   source_comment=$(printf '%s' "$source_comments" | jq -c \
     --argjson id "$source_id" 'first(.[] | select(.id == $id)) // null')
@@ -973,7 +983,44 @@ append_archive_candidate() {
     [ "$live_source_login" = "$source_login" ] || return 0
     live_source_body_json=$(printf '%s' "$source_comment" | jq -c '.body // ""')
     live_source_fingerprint=$(fingerprint "$live_source_body_json")
-    [ "$live_source_fingerprint" != "$body_fingerprint" ] || return 0
+    live_body=$(printf '%s' "$live_source_body_json" | jq -r '.')
+    # Retained enrollment admits history independently of current standing.
+    # Resolve the live role from the same source-kind inventory as the live
+    # finding loops; the tier check below decides whether its parser covers
+    # the archived obligation even after provider reassignment.
+    case "$source_login" in
+      "$CODEX_BOT"|"$CODERABBIT_BOT") live_source_current=true ;;
+      "$GHAS_BOT")
+        # Reviewer standing also inventories review bodies when this login
+        # is configured for GHAS; issue comments remain bot-role only.
+        if [ "$source_kind" = inline ] \
+          || { [ "$source_kind" != issue-comment ] && registered_reviewer_login "$source_login"; }; then
+          live_source_current=true
+        fi
+        ;;
+      *)
+        if [ "$source_kind" != issue-comment ] && registered_reviewer_login "$source_login"; then
+          live_source_current=true
+        fi
+        ;;
+    esac
+    # A matching current role must actually inventory the selected archive
+    # severity before live equality or a provider acknowledgement can collapse
+    # it. Conservative cross-provider evidence can be absent from that parser.
+    if [ "$live_source_current" = true ]; then
+      if [ "$source_kind" = inline ]; then
+        live_tier=$(finding_tier "$source_login" "$live_body") || exit 2
+        if [ -n "$live_tier" ] && tier_is_ignored "$live_tier"; then live_tier=""; fi
+      else
+        live_tier=$(strongest_nonignored_finding_tier "$source_login" "$live_body") || exit 2
+      fi
+      if [ -z "$live_tier" ] || [ "$(tier_rank "$live_tier")" -gt "$(tier_rank "$tier")" ]; then
+        live_source_current=false
+      fi
+    fi
+    if [ "$live_source_current" = true ]; then
+      [ "$live_source_fingerprint" != "$body_fingerprint" ] || return 0
+    fi
     # A CodeRabbit acknowledgement is an edit of the finding, so the relay
     # archives the revision being acknowledged. That revision is the same
     # finding, already dispositioned by the reply the acknowledgement
@@ -982,7 +1029,8 @@ append_archive_candidate() {
     # confirmation runs removed: equal means the archive adds nothing to
     # disposition, and a changed visible content line still archives.
     if [ "$source_kind" = inline ] && [ "$source_login" = "$CODERABBIT_BOT" ] \
-      && [ -n "$payload_body_json" ]; then
+      && [ "$source_login" != "$CODEX_BOT" ] && ! registered_reviewer_login "$source_login" \
+      && [ "$live_source_current" = true ] && [ -n "$payload_body_json" ]; then
       live_body=$(printf '%s' "$source_comment" | jq -r '.body // ""')
       archived_body=$(printf '%s' "$payload_body_json" | jq -r '.')
       [ "$(coderabbit_strip_ack_suffix "$live_body")" != \
@@ -990,17 +1038,6 @@ append_archive_candidate() {
     fi
   fi
 
-  if [ "$source_login" = "$CODERABBIT_BOT" ]; then
-    archive_tiers=$(printf '%s' "$payload" | jq -c '.coderabbit_tiers')
-  elif [ "$source_login" = "$GHAS_BOT" ]; then
-    # Absent on any record archived before #1113 added this field —
-    # optional in validate_archive_payload for exactly that reason.
-    archive_tiers=$(printf '%s' "$payload" | jq -c '.ghas_tiers // []')
-  else
-    archive_tiers=$(printf '%s' "$payload" | jq -c '.codex_tiers')
-  fi
-  tier=$(strongest_nonignored_archive_tier "$archive_tiers")
-  [ -n "$tier" ] || return 0
 
   case "$source_kind" in
     issue-comment)

@@ -11,6 +11,10 @@ HELPERS="$SCRIPT_DIR/lib/feedback-policy-helpers.sh"
 [ -r "$HELPERS" ] || { echo "render-feedback-archive: missing $HELPERS" >&2; exit 2; }
 # shellcheck source=lib/feedback-policy-helpers.sh
 . "$HELPERS"
+ARCHIVE_IDENTITIES_HELPER="$SCRIPT_DIR/lib/feedback-archive-identities.sh"
+[ -r "$ARCHIVE_IDENTITIES_HELPER" ] || { echo "render-feedback-archive: missing $ARCHIVE_IDENTITIES_HELPER" >&2; exit 2; }
+# shellcheck source=lib/feedback-archive-identities.sh
+. "$ARCHIVE_IDENTITIES_HELPER"
 
 if [ "$#" -lt 5 ] || [ "$#" -gt 6 ]; then
   echo "usage: $0 SOURCE_KIND SOURCE_ID SOURCE_LOGIN ARCHIVED_AT PREVIOUS_BODY_FILE [GHAS_TIER]" >&2
@@ -30,12 +34,12 @@ PREVIOUS_BODY_FILE="$5"
 # documented sourcing contract deliberately excludes ("the render script
 # itself stays pure -- no network calls"). The caller resolves it (see
 # .github/workflows/codex-p1-gate.yml's archive-edited-feedback job) and
-# hands the already-mapped p0-p3 tier here, exactly like it hands the
-# previous body.
+# hands the already-mapped p0-p3 tier or unknown lookup result here,
+# exactly like it hands the previous body.
 GHAS_TIER="${6:-}"
 case "$GHAS_TIER" in
-  ''|p0|p1|p2|p3) ;;
-  *) echo "render-feedback-archive: GHAS_TIER must be p0, p1, p2, p3, or empty; got '$GHAS_TIER'" >&2; exit 2 ;;
+  ''|p0|p1|p2|p3|unknown) ;;
+  *) echo "render-feedback-archive: GHAS_TIER must be p0, p1, p2, p3, unknown, or empty; got '$GHAS_TIER'" >&2; exit 2 ;;
 esac
 
 case "$SOURCE_KIND" in
@@ -45,6 +49,7 @@ esac
 case "$SOURCE_ID" in
   ''|*[!0-9]*) echo "render-feedback-archive: source id must be an integer" >&2; exit 2 ;;
 esac
+[ "$SOURCE_ID" -gt 0 ] || { echo "render-feedback-archive: source id must be positive" >&2; exit 2; }
 [ -n "$SOURCE_LOGIN" ] || { echo "render-feedback-archive: source login is required" >&2; exit 2; }
 [ -n "$ARCHIVED_AT" ] || { echo "render-feedback-archive: archived timestamp is required" >&2; exit 2; }
 [ -r "$PREVIOUS_BODY_FILE" ] || { echo "render-feedback-archive: previous body is unreadable" >&2; exit 2; }
@@ -55,7 +60,8 @@ esac
 # record byte-for-byte so the workflow can restore it instead of silently
 # dropping the only durable copy. Never promote a lookalike from another login
 # into a trusted Actions-authored record.
-if [ "$SOURCE_LOGIN" = 'github-actions[bot]' ] && awk '
+RESTORED_RECORD=""
+if [ "$SOURCE_KIND" = issue-comment ] && [ "$SOURCE_LOGIN" = 'github-actions[bot]' ] && RESTORED_RECORD=$(awk '
   NR == 1 && $0 ~ /^<!-- mergepath-feedback-archive:v1 [A-Za-z0-9+\/=]+ -->$/ \
     { record=$0; next }
   NR == 1 && $0 ~ /^<!-- mergepath-feedback-archive:v2 id=[0-9a-f]{64} part=[0-9]+\/[0-9]+ data=[A-Za-z0-9+\/=]+ -->$/ \
@@ -66,9 +72,29 @@ if [ "$SOURCE_LOGIN" = 'github-actions[bot]' ] && awk '
     { record=$0; next }
   { extra=1 }
   END { if (record != "" && !extra) print record; else exit 1 }
-' "$PREVIOUS_BODY_FILE"; then
+' "$PREVIOUS_BODY_FILE"); then
+  jq -n --arg record "$RESTORED_RECORD" --argjson id "$SOURCE_ID" '
+    {event_name:"issue_comment",archive_source:{kind:"issue-comment",login:"github-actions[bot]",id:$id},archive_records:[$record]}
+  ' | feedback_archive_validate_records /dev/stdin || exit 2
+  printf '%s\n' "$RESTORED_RECORD"
   exit 0
 fi
+
+# Actions cannot be enrolled as a reviewer. After the exact restoration path
+# above, unrelated issue-comment text has nothing to archive regardless of
+# registry state; it must not turn an otherwise inert event into a failure.
+if [ "$SOURCE_KIND" = issue-comment ] && [ "$SOURCE_LOGIN" = 'github-actions[bot]' ]; then
+  exit 0
+fi
+
+feedback_archive_registry_load "${CONFIG:-$SCRIPT_DIR/../.github/review-policy.yml}" || exit 2
+
+# Authorize before classifying or encoding a candidate-controlled prior body.
+# Current reviewer/provider lists cannot replace retained historical enrollment.
+provider_rc=0
+SOURCE_PROVIDERS=$(feedback_archive_source_providers "$SOURCE_KIND" "$SOURCE_LOGIN") || provider_rc=$?
+[ "$provider_rc" -ne 1 ] || exit 0
+[ "$provider_rc" -eq 0 ] || exit 2
 
 # jq raw-input readers can split a multibyte character at their read boundary
 # (#1741). --rawfile preserves the complete body, including trailing newlines,
@@ -80,22 +106,39 @@ $BODY_JSON
 EOF
 )
 
+# A delayed enrolled inline source can have lost both its retained/current
+# GHAS role after login reuse. Recognize only the existing alert-link syntax
+# and preserve possible severity without a privileged read or past-provider
+# attribution. Eligible quoted alert links share this conservative burden.
+ALERT_NUMBER=""
+if [ "$SOURCE_KIND" = inline ]; then
+  ALERT_NUMBER=$(ghas_alert_number_from_body "$BODY")
+  if [ -z "$GHAS_TIER" ] && [ -n "$ALERT_NUMBER" ]; then GHAS_TIER=unknown; fi
+fi
+if [ -n "$GHAS_TIER" ] && ! printf '%s' "$SOURCE_PROVIDERS" | jq -e 'index("ghas") != null' >/dev/null; then
+  [ "$GHAS_TIER" = unknown ] && [ "$SOURCE_KIND" = inline ] && [ -n "$ALERT_NUMBER" ] || {
+    echo "render-feedback-archive: known GHAS tier supplied without a GHAS role or unknown inline alert-link evidence" >&2; exit 2;
+  }
+fi
+
 CODEX_TIERS=$(codex_tiers_of "$BODY" | jq -Rsc 'split("\n") | map(select(. != ""))')
 VISIBLE=$(coderabbit_finding_scan "$BODY") \
   || { echo "render-feedback-archive: could not scan CodeRabbit body" >&2; exit 2; }
 CODERABBIT_TIERS=$(coderabbit_tiers_of "$VISIBLE" | jq -Rsc 'split("\n") | map(select(. != ""))') \
   || { echo "render-feedback-archive: could not classify CodeRabbit tier evidence" >&2; exit 2; }
-if [ -n "$GHAS_TIER" ]; then
+if [ "$GHAS_TIER" = unknown ]; then
+  # Possible severities, not a claim that the lookup established any tier.
+  # Existing policy filtering may ignore known tiers; only ignoring every
+  # GHAS tier intentionally removes this unresolved history obligation.
+  GHAS_TIERS='["p0","p1","p2","p3"]'
+elif [ -n "$GHAS_TIER" ]; then
   GHAS_TIERS=$(jq -nc --arg t "$GHAS_TIER" '[$t]')
 else
   GHAS_TIERS='[]'
 fi
 
-# Markerless edits have nothing to preserve. Provider identity is deliberately
-# validated later by accounting against the live source comment + base policy;
-# this renderer only snapshots the marker vocabulary present in the old body
-# (or, for GHAS, the tier the caller resolved from the alert the body links
-# to -- #1113).
+# Markerless enrolled edits have nothing to preserve. The retained registry
+# decides source eligibility; accounting independently binds the source id.
 if [ "$(printf '%s' "$CODEX_TIERS" | jq 'length')" -eq 0 ] \
    && [ "$(printf '%s' "$CODERABBIT_TIERS" | jq 'length')" -eq 0 ] \
    && [ "$(printf '%s' "$GHAS_TIERS" | jq 'length')" -eq 0 ]; then
