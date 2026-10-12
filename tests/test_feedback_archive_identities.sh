@@ -226,6 +226,39 @@ case "$*" in
 esac
 SH
 chmod +x "$TMP/bin/gh"
+# Non-capture events need no archive installation on trusted main. Exercise
+# the actual producer with neither its new helper nor renderer installed;
+# genuine edit/delete captures must still fail closed in that same checkout.
+mkdir -p "$TMP/uninstalled/scripts/lib" "$TMP/uninstalled/.github"
+cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$TMP/uninstalled/scripts/lib/"
+printf 'available_reviewers: []\n' >"$TMP/uninstalled/.github/review-policy.yml"
+for event_action in pull_request:opened pull_request:synchronize pull_request:edited pull_request_review:submitted pull_request_review_comment:created issue_comment:created pull_request_review_comment:edited pull_request_review_comment:deleted; do
+  event=${event_action%:*}; action=${event_action#*:}
+  for route in native fork; do
+    native=false; [ "$route" != native ] || native=true
+    fork=true; [ "$route" != native ] || fork=false
+    jq -n --arg action "$action" --argjson fork "$fork" --rawfile old "$TMP/body" '{action:$action,issue:{number:7},comment:{id:7,user:{login:"retired-reviewer"},body:$old,updated_at:"2026-10-11T01:00:00Z"},changes:{body:{from:$old}},pull_request:{number:7,head:{sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",repo:{fork:$fork}},user:{login:"author"}}}' >"$TMP/event"
+    : >"$TMP/output"; : >"$TMP/api-calls"
+    rm -f "$TMP/codex-p1-read-only-handoff.json" "$TMP/native-post"
+    rc=0
+    (cd "$TMP/uninstalled" && env PATH="$TMP/bin:$PATH" GH_TOKEN=fake-offline GH_CALL_LOG="$TMP/api-calls" GH_NATIVE_RESTORE="$native" NATIVE_POST_FILE="$TMP/native-post" \
+      CONFIG="$TMP/uninstalled/.github/review-policy.yml" REPO=acme/widget EVENT_NAME="$event" EVENT_ACTION="$action" \
+      GITHUB_EVENT_PATH="$TMP/event" GITHUB_OUTPUT="$TMP/output" RUNNER_TEMP="$TMP" SOURCE_RUN_ID=42 GITHUB_RUN_ID=42 bash "$TMP/producer.sh") >"$TMP/uninstalled-$event-$action-$route.log" 2>&1 || rc=$?
+    if [ "$event" = pull_request_review_comment ] && [ "$action" != created ]; then
+      check test "$rc" != 0
+      check test ! -e "$TMP/codex-p1-read-only-handoff.json"
+    else
+      check test "$rc" = 0
+      if [ "$route" = fork ]; then
+        check test "$(jq '.archive_records|length' "$TMP/codex-p1-read-only-handoff.json")" = 0
+      else
+        check grep -Fq 'requires_relay=false' "$TMP/output"
+      fi
+    fi
+    check test ! -e "$TMP/native-post"
+    check test "$(grep -c -- '--method POST' "$TMP/api-calls" || true)" = 0
+  done
+done
 for actor in ordinary 'dependabot[bot]'; do
   for action in edited deleted; do
     for login in never-registered never_acme 'bad login' retired-reviewer octocat_acme; do

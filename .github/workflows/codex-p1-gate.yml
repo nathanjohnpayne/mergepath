@@ -232,9 +232,11 @@ jobs:
           # Only retained verified sources may reach the one-shot body capture
           # and GHAS read. Current review membership is deliberately separate.
           . scripts/lib/feedback-policy-helpers.sh
-          . scripts/lib/feedback-archive-identities.sh
           source_providers="[]"
           if [ -n "$source_kind" ]; then
+            # Non-capture events need no archive installation on trusted main.
+            # Real captures still require this trusted helper and fail closed.
+            . scripts/lib/feedback-archive-identities.sh
             case "$source_id" in ''|*[!0-9]*) echo "::error::Ambiguous archive source id"; exit 2 ;; esac
             [ "$source_id" -gt 0 ] || { echo "::error::Invalid archive source id"; exit 2; }
             if [ "$source_kind" = issue-comment ] && [ "$source_login" = 'github-actions[bot]' ]; then
