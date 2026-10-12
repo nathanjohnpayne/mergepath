@@ -284,7 +284,14 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     boundaries before that word still stop processing; missing `-o`/`+o`
     operands remain queries. A lone shopt dash begins its option-name list,
     including any later xtrace name.
-    Shopt query/disable modes and bundled `+o` gain no new disable credit.
+    An unresolved shopt word can supply missing enable flags or option
+    names; sampled non-enabling values are declared conservative. Named
+    set options before invalid trailing letters retain their written enable
+    evidence. Exact/bundled named operands share a finite literal-name proof
+    before later disable credit; +ox and +xo preserve their option order.
+    This does not infer errexit or general error-path execution, and keeps
+    the legacy short-x conservative claim. Shopt query/disable modes and
+    bundled `+o` gain no new disable credit.
     The directions are ASYMMETRIC on purpose: enabling is believed wherever it is
     written, disabling only from a line that is the whole `set` and is not
     inside a function body.  Crediting a `set +x` bash never runs is a silent
@@ -3719,6 +3726,7 @@ def _segment_sets_xtrace(seg):
             _command_arguments(seg.words, seg._cmd_index + 1)]
     if cmd == "shopt":
         flags = set()
+        unknown_flags = False
         i = 0
         while i < len(lits):
             word = lits[i]
@@ -3726,20 +3734,35 @@ def _segment_sets_xtrace(seg):
                 i += 1
                 break
             if word is None:
-                # Its value is unresolved; retain later literal enable flags.
+                if "u" in flags:
+                    return None  # A preceding literal unset cannot enable.
+                # The word may supply flags or start the option-name list.
+                unknown_flags = True
                 i += 1
                 continue
             if word == "-" or not word.startswith("-"):
                 break  # A lone dash is an option name, not a flag bundle.
             if set(word[1:]) - set("opqsu"):
-                return None
+                return True if unknown_flags else None
             flags.update(word[1:])
             i += 1
         # Only enabling forms are added. Query/disable modes never acquire
         # new disable credit; the existing logical-line asymmetry remains.
+        if unknown_flags:
+            return True  # Missing enabling flags/names cannot be ruled out.
         if {"s", "o"} <= flags and "u" not in flags:
-            return True if "xtrace" in lits[i:] else None
+            return True if "xtrace" in lits[i:] or None in lits[i:] else None
         return None
+    # Finite names shared by installed Bash 5.3/macOS and 5.2/Linux help.
+    # They prove only a literal named operand, never runtime option values.
+    named_options = {
+        "allexport", "braceexpand", "emacs", "errexit", "errtrace",
+        "functrace", "hashall", "histexpand", "history", "ignoreeof",
+        "interactive-comments", "keyword", "monitor", "noclobber", "noexec",
+        "noglob", "nolog", "notify", "nounset", "onecmd", "physical",
+        "pipefail", "posix", "privileged", "verbose", "vi", "xtrace",
+    }
+    short_options = set("abefhkmnptuvxBCEHPTo")
     state = None
     uncertain = False
     i = 0
@@ -3776,6 +3799,8 @@ def _segment_sets_xtrace(seg):
             if nxt.startswith(("-", "+")):
                 i += 1  # No named operand; keep the following option visible.
                 continue
+            if nxt not in named_options:
+                return state  # An invalid name stops before later disables.
             if nxt == "xtrace" and (a == "-o" or not uncertain):
                 state = a == "-o"
             i += 2
@@ -3784,25 +3809,47 @@ def _segment_sets_xtrace(seg):
             state = True
         elif a.startswith("-") and not a.startswith("--"):
             if "x" in a[1:]:
-                state = True
-            # A named -o consumes the next word even inside a short bundle.
-            # Restrict new recognition to supported set option letters.
-            if "o" in a[1:] and not set(a[1:]) - set("abefhkmnptuvxBCEHPTo"):
-                nxt = lits[i + 1] if i + 1 < len(lits) else None
-                if nxt is not None and not nxt.startswith(("-", "+")):
+                state = True  # Preserve legacy conservative short-x evidence.
+            operand_i = i + 1
+            for letter in a[1:]:
+                if letter not in short_options:
+                    return state  # Keep any enable applied before the error.
+                if letter != "o":
+                    continue
+                nxt = lits[operand_i] if operand_i < len(lits) else None
+                if nxt is None:
+                    if operand_i < len(lits):
+                        state = True
+                        uncertain = True
+                        operand_i += 1
+                elif not nxt.startswith(("-", "+")):
                     if nxt == "xtrace":
                         state = True
-                    i += 2
-                    continue
-                # Without a named operand, a following flag remains an option.
+                    if nxt not in named_options:
+                        return state
+                    operand_i += 1
+            i = operand_i
+            continue
         elif a.startswith("+"):
-            if "x" in a[1:] and not uncertain:
-                state = False  # Existing +x semantics, no new bundled +o credit.
-            if "o" in a[1:] and not set(a[1:]) - set("abefhkmnptuvxBCEHPTo"):
-                nxt = lits[i + 1] if i + 1 < len(lits) else None
-                if nxt is not None and not nxt.startswith(("-", "+")):
-                    i += 2  # Consume the name without granting disable credit.
-                    continue
+            operand_i = i + 1
+            for letter in a[1:]:
+                if letter not in short_options:
+                    return state
+                if letter == "o":
+                    nxt = lits[operand_i] if operand_i < len(lits) else None
+                    if nxt is None:
+                        if operand_i < len(lits):
+                            state = True
+                            uncertain = True
+                            operand_i += 1
+                    elif not nxt.startswith(("-", "+")):
+                        if nxt not in named_options:
+                            return state  # A following +x has not run.
+                        operand_i += 1  # No new bundled +o disable credit.
+                elif letter == "x" and not uncertain:
+                    state = False  # Only after preceding options succeeded.
+            i = operand_i
+            continue
         else:
             break  # The first ordinary operand ends set option processing.
         i += 1
@@ -7546,6 +7593,287 @@ CORPUS = [
         "read x <<$'EOF'\nnothing\nEOF\necho ok\n",
     ),
     # #1448: shared direct/deferred bundled trace-option detector.
+    # #1448 fourth review: unknown shopt inputs and ordered set bundles.
+    (
+        'xtrace-review4-set-eoz-error-guarded',
+        MUST_FLAG,
+        'set -eoz xtrace || :\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-set-eoz-error-guarded-deferred',
+        MUST_FLAG,
+        'eval \'set -eoz xtrace || :\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-exact-plus-invalid-before-disable',
+        MUST_FLAG,
+        'set -x +o ordinary +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-exact-plus-invalid-before-disable-deferred',
+        MUST_FLAG,
+        'eval \'set -x +o ordinary +x\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-exact-minus-invalid-before-disable',
+        MUST_FLAG,
+        'set -x -o ordinary +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-exact-minus-invalid-before-disable-deferred',
+        MUST_FLAG,
+        'eval \'set -x -o ordinary +x\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-exact-plus-valid-before-disable',
+        MUST_NOT_FLAG,
+        'set -x +o pipefail +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-exact-plus-valid-before-disable-deferred',
+        MUST_NOT_FLAG,
+        'eval \'set -x +o pipefail +x\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-unknown-flags',
+        MUST_FLAG,
+        'mode=-so; shopt "$mode" xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-unknown-flags-deferred',
+        MUST_FLAG,
+        'eval \'mode=-so; shopt "$mode" xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-unknown-name',
+        MUST_FLAG,
+        'mode=xtrace; shopt -so "$mode"\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-unknown-name-deferred',
+        MUST_FLAG,
+        'eval \'mode=xtrace; shopt -so "$mode"\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-unknown-safe-flags-conservative',
+        MUST_FLAG,
+        'mode=-qo; shopt "$mode" xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-unknown-safe-flags-conservative-deferred',
+        MUST_FLAG,
+        'eval \'mode=-qo; shopt "$mode" xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-unknown-safe-name-conservative',
+        MUST_FLAG,
+        'mode=pipefail; shopt -so "$mode"\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-unknown-safe-name-conservative-deferred',
+        MUST_FLAG,
+        'eval \'mode=pipefail; shopt -so "$mode"\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-known-unset-unknown',
+        MUST_NOT_FLAG,
+        'mode=xtrace; shopt -uo "$mode"\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-known-unset-unknown-deferred',
+        MUST_NOT_FLAG,
+        'eval \'mode=xtrace; shopt -uo "$mode"\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-known-ordinary-unknown',
+        MUST_NOT_FLAG,
+        'mode=-so; shopt ordinary "$mode" xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-known-ordinary-unknown-deferred',
+        MUST_NOT_FLAG,
+        'eval \'mode=-so; shopt ordinary "$mode" xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-no-name',
+        MUST_NOT_FLAG,
+        'shopt -so\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-no-name-deferred',
+        MUST_NOT_FLAG,
+        'eval \'shopt -so\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-query-only',
+        MUST_NOT_FLAG,
+        'shopt -po xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-query-only-deferred',
+        MUST_NOT_FLAG,
+        'eval \'shopt -po xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-unknown-empty-conservative',
+        MUST_FLAG,
+        'mode=""; shopt -so "$mode"\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-unknown-empty-conservative-deferred',
+        MUST_FLAG,
+        'eval \'mode=""; shopt -so "$mode"\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-name-list-unknown',
+        MUST_FLAG,
+        'mode=xtrace; shopt -so ordinary "$mode"\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-name-list-unknown-deferred',
+        MUST_FLAG,
+        'eval \'mode=xtrace; shopt -so ordinary "$mode"\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-delimiter-unknown-name',
+        MUST_FLAG,
+        'mode=xtrace; shopt -so -- "$mode"\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-delimiter-unknown-name-deferred',
+        MUST_FLAG,
+        'eval \'mode=xtrace; shopt -so -- "$mode"\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-delimiter-only-unknown',
+        MUST_NOT_FLAG,
+        'mode=-so; shopt -- "$mode" xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-delimiter-only-unknown-deferred',
+        MUST_NOT_FLAG,
+        'eval \'mode=-so; shopt -- "$mode" xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-set-oz',
+        MUST_FLAG,
+        'set -oz xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-set-oz-deferred',
+        MUST_FLAG,
+        'eval \'set -oz xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-set-zo',
+        MUST_NOT_FLAG,
+        'set -zo xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-set-zo-deferred',
+        MUST_NOT_FLAG,
+        'eval \'set -zo xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-set-eoz-conservative',
+        MUST_FLAG,
+        'set -eoz xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-set-eoz-conservative-deferred',
+        MUST_FLAG,
+        'eval \'set -eoz xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-set-zox-conservative',
+        MUST_FLAG,
+        'set -zox xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-set-zox-conservative-deferred',
+        MUST_FLAG,
+        'eval \'set -zox xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-plus-ox-invalid',
+        MUST_FLAG,
+        'set -x +ox ordinary\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-plus-ox-invalid-deferred',
+        MUST_FLAG,
+        'eval \'set -x +ox ordinary\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-plus-xo-invalid',
+        MUST_NOT_FLAG,
+        'set -x +xo ordinary\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-plus-xo-invalid-deferred',
+        MUST_NOT_FLAG,
+        'eval \'set -x +xo ordinary\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-plus-ox-valid',
+        MUST_NOT_FLAG,
+        'set -x +ox xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-plus-ox-valid-deferred',
+        MUST_NOT_FLAG,
+        'eval \'set -x +ox xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-plus-ox-valid-pipefail',
+        MUST_NOT_FLAG,
+        'set -x +ox pipefail\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-plus-ox-valid-pipefail-deferred',
+        MUST_NOT_FLAG,
+        'eval \'set -x +ox pipefail\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-plus-zox-conservative',
+        MUST_FLAG,
+        'set -x +zox xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-plus-zox-conservative-deferred',
+        MUST_FLAG,
+        'eval \'set -x +zox xtrace\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-minus-o-invalid-name-conservative',
+        MUST_FLAG,
+        'set -ox ordinary\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-minus-o-invalid-name-conservative-deferred',
+        MUST_FLAG,
+        'eval \'set -ox ordinary\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-plus-no-operand',
+        MUST_NOT_FLAG,
+        'set -x +ox\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-plus-no-operand-deferred',
+        MUST_NOT_FLAG,
+        'eval \'set -x +ox\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-query-unknown-conservative',
+        MUST_FLAG,
+        'mode=xtrace; shopt -qo "$mode"\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'xtrace-review4-shopt-query-unknown-conservative-deferred',
+        MUST_FLAG,
+        'eval \'mode=xtrace; shopt -qo "$mode"\'\n: "$GH_TOKEN"\n',
+    ),
     # #1448 third review: uncertainty before positional/disable boundaries.
     (
         'xtrace-review3-ordinary-prefix-no-named-disable',
@@ -8627,6 +8955,125 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    'xtrace-review4-shopt-unknown-safe-flags-conservative': (
+        "An unresolved shopt word may supply missing flags or an xtrace name, "
+        "while this sampled query, other name or empty value does not enable "
+        "tracing. The shared detector conservatively retains possible "
+        "enablement without runtime value or quoted-expansion interpretation; "
+        "preceding literal unset and positional boundaries remain controls "
+        "(#1448). "
+    ),
+    'xtrace-review4-shopt-unknown-safe-flags-conservative-deferred': (
+        "An unresolved shopt word may supply missing flags or an xtrace name, "
+        "while this sampled query, other name or empty value does not enable "
+        "tracing. The shared detector conservatively retains possible "
+        "enablement without runtime value or quoted-expansion interpretation; "
+        "preceding literal unset and positional boundaries remain controls "
+        "(#1448). "
+    ),
+    'xtrace-review4-shopt-unknown-safe-name-conservative': (
+        "An unresolved shopt word may supply missing flags or an xtrace name, "
+        "while this sampled query, other name or empty value does not enable "
+        "tracing. The shared detector conservatively retains possible "
+        "enablement without runtime value or quoted-expansion interpretation; "
+        "preceding literal unset and positional boundaries remain controls "
+        "(#1448). "
+    ),
+    'xtrace-review4-shopt-unknown-safe-name-conservative-deferred': (
+        "An unresolved shopt word may supply missing flags or an xtrace name, "
+        "while this sampled query, other name or empty value does not enable "
+        "tracing. The shared detector conservatively retains possible "
+        "enablement without runtime value or quoted-expansion interpretation; "
+        "preceding literal unset and positional boundaries remain controls "
+        "(#1448). "
+    ),
+    'xtrace-review4-shopt-unknown-empty-conservative': (
+        "An unresolved shopt word may supply missing flags or an xtrace name, "
+        "while this sampled query, other name or empty value does not enable "
+        "tracing. The shared detector conservatively retains possible "
+        "enablement without runtime value or quoted-expansion interpretation; "
+        "preceding literal unset and positional boundaries remain controls "
+        "(#1448). "
+    ),
+    'xtrace-review4-shopt-unknown-empty-conservative-deferred': (
+        "An unresolved shopt word may supply missing flags or an xtrace name, "
+        "while this sampled query, other name or empty value does not enable "
+        "tracing. The shared detector conservatively retains possible "
+        "enablement without runtime value or quoted-expansion interpretation; "
+        "preceding literal unset and positional boundaries remain controls "
+        "(#1448). "
+    ),
+    'xtrace-review4-set-eoz-conservative': (
+        "The named -o xtrace applies before the invalid later z. In this "
+        "sampled unguarded -eoz command, errexit exits before the token "
+        "command; with || : the paired case really leaks. The scanner retains "
+        "written possible enablement without inferring errexit or execution "
+        "control flow (#1448). "
+    ),
+    'xtrace-review4-set-eoz-conservative-deferred': (
+        "The named -o xtrace applies before the invalid later z. In this "
+        "sampled unguarded -eoz command, errexit exits before the token "
+        "command; with || : the paired case really leaks. The scanner retains "
+        "written possible enablement without inferring errexit or execution "
+        "control flow (#1448). "
+    ),
+    'xtrace-review4-set-zox-conservative': (
+        "Legacy short-x recognition conservatively sees x even after an "
+        "invalid preceding z. This sampled Bash command never enables "
+        "tracing. The ordered named-option repair preserves that prior "
+        "conservative verdict rather than changing its legacy enable claim "
+        "(#1448). "
+    ),
+    'xtrace-review4-set-zox-conservative-deferred': (
+        "Legacy short-x recognition conservatively sees x even after an "
+        "invalid preceding z. This sampled Bash command never enables "
+        "tracing. The ordered named-option repair preserves that prior "
+        "conservative verdict rather than changing its legacy enable claim "
+        "(#1448). "
+    ),
+    'xtrace-review4-plus-zox-conservative': (
+        "An unsupported plus-option prefix does not prove that a later +x "
+        "ran, so the detector retains earlier written enablement. This "
+        "sampled invalid bundle actually leaves tracing off; the bounded "
+        "disable-success proof does not infer general Bash error-path "
+        "execution (#1448). "
+    ),
+    'xtrace-review4-plus-zox-conservative-deferred': (
+        "An unsupported plus-option prefix does not prove that a later +x "
+        "ran, so the detector retains earlier written enablement. This "
+        "sampled invalid bundle actually leaves tracing off; the bounded "
+        "disable-success proof does not infer general Bash error-path "
+        "execution (#1448). "
+    ),
+    'xtrace-review4-minus-o-invalid-name-conservative': (
+        "Legacy short-x recognition sees the literal x in -ox even when its "
+        "preceding named operand is invalid and Bash does not apply that x. "
+        "Retaining that existing conservative enable claim avoids introducing "
+        "a new general error-path execution model (#1448). "
+    ),
+    'xtrace-review4-minus-o-invalid-name-conservative-deferred': (
+        "Legacy short-x recognition sees the literal x in -ox even when its "
+        "preceding named operand is invalid and Bash does not apply that x. "
+        "Retaining that existing conservative enable claim avoids introducing "
+        "a new general error-path execution model (#1448). "
+    ),
+    'xtrace-review4-shopt-query-unknown-conservative': (
+        "An unresolved shopt word may supply missing flags or an xtrace name, "
+        "while this sampled query, other name or empty value does not enable "
+        "tracing. The shared detector conservatively retains possible "
+        "enablement without runtime value or quoted-expansion interpretation; "
+        "preceding literal unset and positional boundaries remain controls "
+        "(#1448). "
+    ),
+    'xtrace-review4-shopt-query-unknown-conservative-deferred': (
+        "An unresolved shopt word may supply missing flags or an xtrace name, "
+        "while this sampled query, other name or empty value does not enable "
+        "tracing. The shared detector conservatively retains possible "
+        "enablement without runtime value or quoted-expansion interpretation; "
+        "preceding literal unset and positional boundaries remain controls "
+        "(#1448). "
+    ),
+
     'xtrace-review3-quoted-e-conservative': (
         "An unresolved word in the active set option stream may enable "
         "tracing or stop/abort parsing before later disable words. This "
