@@ -90,6 +90,19 @@ available_reviewers:
   - nathanpayne-cursor
   - nathanpayne-codex
 
+# Retained archival enrollment (#1437). This list grants archival eligibility
+# only, never review/approval/merge standing. Keep verified former identities
+# here as status: retired after removing them from available_reviewers. Enroll
+# custom bot logins here explicitly before changing their current policy login.
+feedback_archive:
+  identities:
+    - {login: "chatgpt-codex-connector[bot]", provider: codex, status: active}
+    - {login: "coderabbitai[bot]", provider: coderabbit, status: active}
+    - {login: "github-advanced-security[bot]", provider: ghas, status: active}
+    - {login: nathanpayne-claude, provider: reviewer, status: active}
+    - {login: nathanpayne-cursor, provider: reviewer, status: active}
+    - {login: nathanpayne-codex, provider: reviewer, status: active}
+
 # ---------------------------------------------------------------------------
 # Non-Reviewer Identities
 # ---------------------------------------------------------------------------
@@ -736,15 +749,12 @@ codex:
 # it to `scripts/render-feedback-archive.sh` as an explicit tier, so the
 # finding stays in accounting's inventory instead of silently vanishing.
 # Archive-time resolution deliberately does NOT share live evaluation's
-# fail-loudly posture: a failed read there WARNS and archives at `p1`
-# rather than failing the archive job, because archival is a one-shot
-# capture of a disappearing comment with no scheduled retry — losing the
-# only surviving record entirely would be worse than archiving it under an
-# unresolved severity with a visible warning. `p1`, not `p2`: a repo whose
-# `feedback_policy` ignores `p2` would otherwise drop an originally
-# p0/p1 record from inventory because of a transient read failure. A read
-# that SUCCEEDS but finds no assigned severity still maps to `p2` — that is
-# a real classification, not a failure.
+# fail-loudly posture: a failed read there WARNS and archives unresolved
+# severity as the possible tiers p0-p3. Archival is a one-shot capture of a
+# disappearing comment with no scheduled retry. These are possibilities,
+# not known severity claims: accounting chooses the strongest nonignored
+# possibility. Only explicitly ignoring every GHAS tier excludes unresolved
+# history. A successful read with no assigned severity still maps to p2.
 # `scripts/review-feedback-surface-fingerprint.sh`'s before/after
 # consistency hash also includes every referenced alert's current severity,
 # so a same-window severity change or newly-resolvable alert is detected
