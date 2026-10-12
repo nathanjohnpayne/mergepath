@@ -2322,7 +2322,22 @@ def _ASCII_NAME_CONT(c):
     return _ASCII_NAME_START(c) or ("0" <= c <= "9")
 
 
-def error_word_expansion_at(text, brace_open):
+def _error_word_parameter_end(text, brace_open, allow_positionals=False):
+    """Guard endpoint; only HD callers opt into positional parameters."""
+    j = brace_open + 2
+    if j < len(text) and text[j] in "#!":
+        return None
+    name, end = ident_at(text, j)
+    if name is not None:
+        return end
+    if allow_positionals:
+        m = re.match(r"(?:[0-9]+|[@*])", text[j:])
+        if m is not None:
+            return j + m.end()
+    return None
+
+
+def error_word_expansion_at(text, brace_open, allow_positionals=False):
     """Is the `${...}` at `brace_open` the ERROR-WORD form, `:?` or `?`?
 
     `${VAR:?word}` and `${VAR?word}` make BASH ITSELF write `word` to stderr
@@ -2335,11 +2350,8 @@ def error_word_expansion_at(text, brace_open):
     plain identifier and NOT required to be a credential name: the credential
     is in the WORD, and the variable being tested is usually something else.
     """
-    j = brace_open + 2
-    if j < len(text) and text[j] in "#!":
-        return False
-    name, end = ident_at(text, j)
-    if name is None:
+    end = _error_word_parameter_end(text, brace_open, allow_positionals)
+    if end is None:
         return False
     rest = text[end:]
     return rest.startswith(":?") or rest.startswith("?")
@@ -2405,8 +2417,8 @@ def _error_word_spans(s, in_heredoc=False):
         if in_heredoc and s[i] == "\\":
             i += 2
             continue
-        if s[i] == "$" and s[i + 1] == "{" and error_word_expansion_at(s, i):
-            _name, end = ident_at(s, i + 2)
+        if s[i] == "$" and s[i + 1] == "{" and error_word_expansion_at(s, i, allow_positionals=in_heredoc):
+            end = _error_word_parameter_end(s, i, allow_positionals=in_heredoc)
             rest = s[end:]
             start = end + (2 if rest.startswith(":?") else 1)
             if in_heredoc:
@@ -3569,44 +3581,42 @@ def discover_emitter_helpers(text):
                 if not emits and _text_enables_xtrace(body_text) \
                         and _word_has_verbatim_positional(body_text):
                     emits = True
-            # a here-doc body inside the helper counts too
+            # A nested or direct HD uses the same bounded admission rule.
             if not emits:
-                for hd in lx.heredocs:
-                    if not hd.interpolating:
-                        continue
-                    cmd, _ = resolve_command(hd.owner)
-                    body = _heredoc_continuation_text(
-                        "\n".join(raw for _lno, raw in hd.body_lines)
-                    )
-                    if cmd in STDIN_ECHOERS:
-                        emits = _word_has_verbatim_positional(body, in_heredoc=True)
-                    else:
-                        # Direct stdin DATA is inert for argument emitters.
-                        # Actual substitutions still execute independently;
-                        # retain the existing conservative helper inventory.
-                        for inner, start, _end in _find_substitutions(
-                                body, quotes_are_literal=True, include_arithmetic=True):
-                            if body[start] == "`":
-                                inner = _backtick_positional_source(inner)
-                            positional = (_word_has_verbatim_positional(inner, in_heredoc=True)
-                                          if body.startswith(("$[", "$((", "${"), start)
-                                          else _heredoc_substitution_has_positional(inner))
-                            if positional:
-                                emits = True
-                                break
-                    if not emits:
-                        for start, end in _error_word_spans(body, in_heredoc=True):
-                            if _word_has_verbatim_positional(body[start:end], in_heredoc=True):
-                                emits = True
-                                break
-                    if emits:
-                        break
+                emits = any(_heredoc_has_positional(hd, helpers) for hd in lx.heredocs)
             if emits:
                 helpers.add(name)
                 grew = True
         if not grew:
             break
     return frozenset(helpers)
+
+
+def _heredoc_has_positional(hd, emitter_helpers, _depth=0):
+    """Shared HD admission; child source consumes the existing one-hop budget."""
+    if not hd.interpolating:
+        return False
+    cmd, _ = resolve_command(hd.owner)
+    body = _heredoc_continuation_text("\n".join(raw for _lno, raw in hd.body_lines))
+    if cmd in STDIN_ECHOERS or classify(hd.owner, emitter_helpers) == OPAQUE:
+        if _word_has_verbatim_positional(body, in_heredoc=True, _depth=_depth):
+            return True
+    else:
+        # Direct stdin DATA is inert for argument emitters. Actual source
+        # and diagnostics retain the existing independent admission.
+        for inner, start, _end in _find_substitutions(
+                body, quotes_are_literal=True, include_arithmetic=True):
+            if body[start] == "`":
+                inner = _backtick_positional_source(inner)
+            positional = (_word_has_verbatim_positional(inner, in_heredoc=True, _depth=_depth)
+                          if body.startswith(("$[", "$((", "${"), start)
+                          else _heredoc_substitution_has_positional(inner, _depth))
+            if positional:
+                return True
+    for start, end in _error_word_spans(body, in_heredoc=True):
+        if _word_has_verbatim_positional(body[start:end], in_heredoc=True, _depth=_depth):
+            return True
+    return False
 
 
 def _backtick_positional_source(body):
@@ -3619,12 +3629,21 @@ def _backtick_positional_source(body):
 
 
 def _heredoc_substitution_has_positional(body, _depth=0):
-    """Inventory actual substitution source within the existing deferred bound."""
+    """Inventory actual source within one shared HD/deferred child hop.
+
+    Keep ordinary source checking first, including its conservative legacy
+    reading. Only discovered-HD and deferred child inventory consume the
+    existing budget; deeper source is not claimed uniformly inert or covered.
+    """
     if _word_has_verbatim_positional(body):
         return True
     if _depth >= _DEFERRED_SHELL_DEPTH:
         return False
-    for ll in Lexer(body).logical:
+    lx = Lexer(body)
+    for hd in lx.heredocs:
+        if _heredoc_has_positional(hd, set(), _depth + 1):
+            return True
+    for ll in lx.logical:
         for seg in ll.segments:
             for inner in _deferred_shell_operands(seg):
                 if _heredoc_substitution_has_positional(inner, _depth + 1):
@@ -3641,11 +3660,11 @@ def _heredoc_continuation_text(body):
     )
 
 
-def _word_has_verbatim_positional(w, in_heredoc=False):
+def _word_has_verbatim_positional(w, in_heredoc=False, _depth=0):
     """True when the word expands a positional parameter's VALUE.
 
     Single-quoted text never expands, `${1:+set}` is a constant alternate and
-    `${#1}` is a length -- a helper is entitled to use the same two redacted
+    `${#1}` is a length and exact `${1@a}` is attributes-only -- a helper uses the same redacted
     forms the check documents for callers.  Inside double quotes an
     apostrophe is literal (#1494); see `_ExactReadUnavailable` for how that
     reading falls back.
@@ -3662,12 +3681,12 @@ def _word_has_verbatim_positional(w, in_heredoc=False):
     if in_heredoc:
         w = _heredoc_continuation_text(w)
     try:
-        return _word_has_verbatim_positional_exact(w, in_heredoc)
+        return _word_has_verbatim_positional_exact(w, in_heredoc, _depth)
     except _ExactReadUnavailable:
-        return _word_has_verbatim_positional_legacy(w, in_heredoc)
+        return _word_has_verbatim_positional_legacy(w, in_heredoc, _depth)
 
 
-def _word_has_verbatim_positional_exact(w, in_heredoc=False):
+def _word_has_verbatim_positional_exact(w, in_heredoc=False, _depth=0):
     i = 0
     n = len(w)
     in_double = False
@@ -3694,7 +3713,7 @@ def _word_has_verbatim_positional_exact(w, in_heredoc=False):
             body = w[lo : end - 1 if closed else end]
             if c == "`" and in_heredoc:
                 body = _backtick_positional_source(body)
-            if (_heredoc_substitution_has_positional(body) if in_heredoc
+            if (_heredoc_substitution_has_positional(body, _depth) if in_heredoc
                     else _word_has_verbatim_positional_exact(body)):
                 return True
             i = end
@@ -3710,7 +3729,8 @@ def _word_has_verbatim_positional_exact(w, in_heredoc=False):
                 m = re.match(r"([1-9][0-9]*|[@*])", w[j:])
                 if m:
                     rest = w[j + m.end() : j + m.end() + 2]
-                    if rest[:1] == "+" or rest[:2] == ":+":
+                    if (rest[:1] == "+" or rest[:2] == ":+"
+                            or (rest == "@a" and w[j + m.end() + 2 : j + m.end() + 3] == "}")):
                         i = j + m.end()
                         continue
                     return True
@@ -3723,7 +3743,7 @@ def _word_has_verbatim_positional_exact(w, in_heredoc=False):
     return False
 
 
-def _word_has_verbatim_positional_legacy(w, in_heredoc=False):
+def _word_has_verbatim_positional_legacy(w, in_heredoc=False, _depth=0):
     i = 0
     n = len(w)
     while i < n:
@@ -3740,7 +3760,7 @@ def _word_has_verbatim_positional_legacy(w, in_heredoc=False):
             end = _skip_backtick(w, i)
             closed = end - 1 > i and w[end - 1] == "`"
             body = _backtick_positional_source(w[i + 1 : end - 1 if closed else end])
-            if _heredoc_substitution_has_positional(body):
+            if _heredoc_substitution_has_positional(body, _depth):
                 return True
             i = end
             continue
@@ -3753,7 +3773,8 @@ def _word_has_verbatim_positional_legacy(w, in_heredoc=False):
                 m = re.match(r"([1-9][0-9]*|[@*])", w[j:])
                 if m:
                     rest = w[j + m.end() : j + m.end() + 2]
-                    if rest[:1] == "+" or rest[:2] == ":+":
+                    if (rest[:1] == "+" or rest[:2] == ":+"
+                            or (rest == "@a" and w[j + m.end() + 2 : j + m.end() + 3] == "}")):
                         i = j + m.end()
                         continue
                     return True
@@ -7865,6 +7886,75 @@ CORPUS = [
     ('helper-hd-round7-parameter-body-literal-quotes', MUST_FLAG, 'die() { printf safe <<EOF\n\'${a[1/\'$1\']}\'\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ('helper-hd-round7-modern-escaped-opener', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n\\$((1 / \\\'$1\\\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ('helper-hd-round7-backtick-comment-nested-parameter', MUST_FLAG, 'die() { printf safe <<EOF\n`# \\`\necho "${1:-unknown}" >&2`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    # #1496: unresolved/opaque owners retain conservative stdin admission.
+    ('helper-hd-round8-unresolved-cat', MUST_FLAG, 'c=cat\ndie(){ "$c" <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-cat-default', MUST_FLAG, 'c=cat\ndie(){ "$c" <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-cat-body-quotes', MUST_FLAG, 'c=cat\ndie(){ "$c" <<EOF\n\'$1\'\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-cat-quoted-delimiter', MUST_NOT_FLAG, 'c=cat\ndie(){ "$c" <<\'EOF\'\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-cat-escaped-positional', MUST_NOT_FLAG, 'c=cat\ndie(){ "$c" <<EOF\n\\$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-cat-redacted-set', MUST_NOT_FLAG, 'c=cat\ndie(){ "$c" <<EOF\n${1:+set}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-cat-redacted-length', MUST_NOT_FLAG, 'c=cat\ndie(){ "$c" <<EOF\n${#1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-printf-safe', MUST_FLAG, 'c=printf\ndie(){ "$c" safe <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-echo-safe', MUST_FLAG, 'c=echo\ndie(){ "$c" safe <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-true-safe', MUST_FLAG, 'c=true\ndie(){ "$c" <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-read-safe', MUST_FLAG, 'c=read\ndie(){ "$c" x <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-quiet-shadow', MUST_FLAG, 'quiet(){ :; }; c=quiet\ndie(){ "$c" <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-known-printf-inert', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-known-echo-inert', MUST_NOT_FLAG, 'die(){ echo safe <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-known-read-stores', MUST_NOT_FLAG, 'die(){ read x <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-known-cat-emits', MUST_FLAG, 'die(){ cat <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-opaque-eval-cat', MUST_FLAG, 'die(){ eval cat <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-opaque-eval-quiet', MUST_FLAG, 'die(){ eval : <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-opaque-source-stdin', MUST_FLAG, 'die(){ source /dev/stdin <<EOF\nprintf "%s" "$1"\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-opaque-source-quiet', MUST_FLAG, 'die(){ source /dev/null <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-opaque-trap-quiet', MUST_FLAG, 'die(){ trap : EXIT <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-opaque-eval-quoted-delimiter', MUST_NOT_FLAG, 'die(){ eval cat <<\'EOF\'\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-opaque-eval-escaped-positional', MUST_NOT_FLAG, 'die(){ eval cat <<EOF\n\\$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-cat-literal', MUST_NOT_FLAG, 'c=cat\ndie(){ "$c" <<EOF\nliteral\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    # #1496: positional guards, shared finite nested HD and attribute-only words.
+    ('helper-hd-round9-positional-error-colon', MUST_FLAG, 'die(){ printf safe <<EOF\n${2:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-nocolon', MUST_FLAG, 'die(){ printf safe <<EOF\n${2?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-ten', MUST_FLAG, 'die(){ printf safe <<EOF\n${10:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-set-control', MUST_FLAG, 'die(){ printf safe <<EOF\n${2:?$1}\nEOF\n}\ndie "$GH_TOKEN" "second"\n'),
+    ('helper-hd-round9-positional-error-quoted-brace', MUST_FLAG, 'die(){ printf safe <<EOF\n${2:?"}"$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-literal', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n${2:?literal}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-escaped-opener', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n\\${2:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-escaped-operand', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n${2:?\\$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-quoted-delimiter', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n${2:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-cat-interpolating', MUST_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER >&2\n\'$1\'\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-cat-quoted-delimiter', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(cat <<\'INNER\' >&2\n\'$1\'\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-cat-escaped-positional', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER >&2\n\\$1\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-cat-literal', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER >&2\nliteral\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-printf-inert', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(printf safe <<INNER >&2\n\'$1\'\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-read-stores', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(read x <<INNER\n\'$1\'\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-cat-captured', MUST_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER\n\'$1\'\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-cat-outer-quoted', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(cat <<INNER >&2\n\'$1\'\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-opaque-eval-cat', MUST_FLAG, 'die(){ printf safe <<EOF\n$(eval cat <<INNER >&2\n\'$1\'\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-error-independent', MUST_FLAG, 'die(){ printf safe <<EOF\n$(printf safe <<INNER\n${UNSET:?"}"$1}\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-arithmetic-independent', MUST_FLAG, 'die(){ printf safe <<EOF\n$(printf safe <<INNER\n$((1/\'$1\'))\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-cat-a', MUST_NOT_FLAG, 'die(){ cat <<EOF\n${1@a}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-tee-a', MUST_NOT_FLAG, 'die(){ tee <<EOF\n${1@a}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-cat-A', MUST_FLAG, 'die(){ cat <<EOF\n${1@A}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-cat-Q', MUST_FLAG, 'die(){ cat <<EOF\n${1@Q}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-cat-two-a', MUST_NOT_FLAG, 'die(){ cat <<EOF\n${2@a}\nEOF\n}\ndie "$GH_TOKEN" "second"\n'),
+    ('helper-hd-round9-attributes-cat-quoted-delimiter', MUST_NOT_FLAG, 'die(){ cat <<\'EOF\'\n${1@a}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-cat-escaped', MUST_NOT_FLAG, 'die(){ cat <<EOF\n\\${1@a}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-direct-ordinary-a', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n${1@a}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-hd-depth-two-boundary', MUST_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER\n$(cat <<DEEP >&2\n\'$1\'\nDEEP\n)\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-hd-deferred-depth-two-boundary', MUST_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER\n$(eval \'echo $1 >&2\')\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-deferred-depth-one-leak', MUST_FLAG, 'die(){ printf safe <<EOF\n$(eval \'echo $1 >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-hd-depth-one-leak', MUST_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER >&2\n\'$1\'\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-hd-depth-two-literal', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER\n$(cat <<DEEP >&2\nliteral\nDEEP\n)\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-ordinary-a', MUST_NOT_FLAG, 'die(){ printf "%s" "${1@a}"; }\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-ordinary-Q', MUST_FLAG, 'die(){ printf "%s" "${1@Q}"; }\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-fallback-a', MUST_NOT_FLAG, 'die(){ printf "%s" "${X:-${Y:-literal}}${1@a}"; }\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-fallback-Q', MUST_FLAG, 'die(){ printf "%s" "${X:-${Y:-literal}}${1@Q}"; }\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-suffix-inert', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n${2:?literal} $1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-special-redacted', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n${2:?${1@a}}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-value-Q', MUST_FLAG, 'die(){ printf safe <<EOF\n${2:?${1@Q}}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-backtick-depth-two-boundary', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER\n`cat <<DEEP >&2\n\'$1\'\nDEEP\n`\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-backtick-deferred-depth-two-boundary', MUST_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER\n`eval \'echo $1 >&2\'`\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-backtick-depth-one-HDstderr', MUST_FLAG, 'die(){ printf safe <<EOF\n`cat <<INNER >&2\n\'$1\'\nINNER\n`\nEOF\n}\ndie "$GH_TOKEN"\n'),
     # --- a credential NAME split by a line continuation ------------------
     #
     # Bash removes `\<newline>` before it parses the expansion, so these name
@@ -9261,6 +9351,7 @@ CORPUS.extend(_generated_corpus())
 # fails when an undeclared disagreement appears AND when a declared entry stops
 # disagreeing, so neither list can quietly rot.
 KNOWN_MISSES = {
+    'helper-hd-round9-nested-backtick-depth-two-boundary': 'A nested HD followed by backtick source needing another HD inventory exceeds the shared one-hop source budget. The fake oracle leaks, while this explicitly bounded HD/deferred inventory misses it; direct/legacy source reads can conservatively admit other deeper spellings (#1496).',
     "helper-hd-eval-depth-two-boundary": (
         "Two deferred eval layers execute a positional emitter at runtime, "
         "beyond the existing one-hop _DEFERRED_SHELL_DEPTH budget. This bounded "
@@ -9417,6 +9508,17 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    'helper-hd-round9-positional-error-set-control': 'The sampled second argument is initialized and emits no error word. Source-only guard admission does not infer runtime parameter bindings (#1496).',
+    'helper-hd-round9-nested-cat-captured': 'The sampled nested cat stdout is captured and discarded by the outer non-stdin owner. Existing conservative helper source inventory does not prove output destinations (#1496).',
+    'helper-hd-round9-attributes-cat-A': 'The sampled positional @A transform emits blank. Its existing value-transform admission remains conservative; only exact attributes-only @a is excluded (#1496).',
+    'helper-hd-round8-unresolved-printf-safe': 'The sampled opaque/unresolved owner consumes no input or emits no credential. Existing fail-closed command classification retains possible stdin emission without runtime owner/binding proof (#1496).',
+    'helper-hd-round8-unresolved-echo-safe': 'The sampled opaque/unresolved owner consumes no input or emits no credential. Existing fail-closed command classification retains possible stdin emission without runtime owner/binding proof (#1496).',
+    'helper-hd-round8-unresolved-true-safe': 'The sampled opaque/unresolved owner consumes no input or emits no credential. Existing fail-closed command classification retains possible stdin emission without runtime owner/binding proof (#1496).',
+    'helper-hd-round8-unresolved-read-safe': 'The sampled opaque/unresolved owner consumes no input or emits no credential. Existing fail-closed command classification retains possible stdin emission without runtime owner/binding proof (#1496).',
+    'helper-hd-round8-unresolved-quiet-shadow': 'The sampled opaque/unresolved owner consumes no input or emits no credential. Existing fail-closed command classification retains possible stdin emission without runtime owner/binding proof (#1496).',
+    'helper-hd-round8-opaque-eval-quiet': 'The sampled opaque/unresolved owner consumes no input or emits no credential. Existing fail-closed command classification retains possible stdin emission without runtime owner/binding proof (#1496).',
+    'helper-hd-round8-opaque-source-quiet': 'The sampled opaque/unresolved owner consumes no input or emits no credential. Existing fail-closed command classification retains possible stdin emission without runtime owner/binding proof (#1496).',
+    'helper-hd-round8-opaque-trap-quiet': 'The sampled opaque/unresolved owner consumes no input or emits no credential. Existing fail-closed command classification retains possible stdin emission without runtime owner/binding proof (#1496).',
     'helper-hd-round7-backtick-escaped-comment-captured': 'Actual backtick source carries a positional but its stdout is captured and discarded by this non-stdin owner. The existing conservative source inventory does not prove runtime emission (#1496).',
     'helper-hd-round7-error-set-control': 'The sampled parameter is initialized and emits no error word. Source-only HD error-word inventory does not prove runtime variable bindings (#1496).',
     'helper-hd-round7-parameter-substring-unset-singlequote': 'The sampled unset string does not evaluate its arithmetic offset. The initialized paired string diagnoses; HD operand inventory does not prove runtime bindings (#1496).',
@@ -10863,6 +10965,56 @@ def _heredoc_boundary_context_cases():
     return failures
 
 
+
+def _heredoc_opaque_owner_cases():
+    """Only existing opaque classification expands direct HD data admission."""
+    failures = []
+    for owner, raw, delimiter, expected in [
+            ('"$c"', '$1', 'EOF', True),
+            ('"$c"', "'$1'", 'EOF', True),
+            ('eval cat', '$1', 'EOF', True),
+            ('"$c"', r'\$1', 'EOF', False),
+            ('"$c"', '$1', "'EOF'", False),
+            ('printf safe', '$1', 'EOF', False),
+            ('echo safe', '$1', 'EOF', False),
+            ('read x', '$1', 'EOF', False)]:
+        text = 'die(){ ' + owner + ' <<' + delimiter + '\n' + raw + '\nEOF\n}\n'
+        if ('die' in discover_emitter_helpers(text)) != expected:
+            failures.append("opaque/direct HD admission boundary: " + repr((owner, raw, delimiter)))
+    return failures
+
+
+
+def _heredoc_guard_nested_attributes_cases():
+    """Positional guards are opt-in; HD and deferred inventory share depth one."""
+    failures = []
+    raw = '${2:?"}"$1}'
+    if error_word_expansion_at(raw, 0) or _error_word_spans(raw):
+        failures.append("ordinary positional error guard changed")
+    if not error_word_expansion_at(raw, 0, allow_positionals=True):
+        failures.append("HD positional error guard missing")
+    if _error_word_spans(raw, in_heredoc=True) != [(5, len(raw) - 1)]:
+        failures.append("HD positional WORD start/boundary missing")
+    for reader in (_word_has_verbatim_positional, _word_has_verbatim_positional_exact,
+                   _word_has_verbatim_positional_legacy):
+        for hd in (False, True):
+            if reader('${1@a}', in_heredoc=hd):
+                failures.append("attributes-only positional admitted: " + reader.__name__)
+            for raw in ('${1@A}', '${1@Q}'):
+                if not reader(raw, in_heredoc=hd):
+                    failures.append("value transform suppressed: " + reader.__name__ + raw)
+    inner = "cat <<INNER >&2\n'$1'\nINNER\n"
+    if not _heredoc_substitution_has_positional(inner):
+        failures.append("nested interpolating HD inventory missing")
+    if _heredoc_substitution_has_positional(inner, _DEFERRED_SHELL_DEPTH):
+        failures.append("nested HD inventory exceeds one-hop budget")
+    if _heredoc_substitution_has_positional("eval 'echo $1'", _DEFERRED_SHELL_DEPTH):
+        failures.append("deferred inventory exceeds shared one-hop budget")
+    if not _heredoc_substitution_has_positional('echo "$1"', _DEFERRED_SHELL_DEPTH):
+        failures.append("existing ordinary-source check/order changed at depth bound")
+    return failures
+
+
 def self_test():
     failures = []
     passed = 0
@@ -10877,6 +11029,8 @@ def self_test():
     failures.extend(_heredoc_parameter_case_diagnostic_cases())
     failures.extend(_heredoc_legacy_arithmetic_cases())
     failures.extend(_heredoc_boundary_context_cases())
+    failures.extend(_heredoc_opaque_owner_cases())
+    failures.extend(_heredoc_guard_nested_attributes_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
