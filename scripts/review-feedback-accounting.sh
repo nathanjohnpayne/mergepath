@@ -937,7 +937,7 @@ append_archive_candidate() {
   local source_kind source_id source_login source_comments source_comment
   local live_source_login live_source_body_json live_source_fingerprint archive_tiers tier
   local body_fingerprint payload_body_json finding_kind ack_token accounted evidence
-  local live_body archived_body archive_provider live_tier live_source_current=false
+  local live_body archived_body live_tier live_source_current=false
 
   printf '%s' "$payload" | validate_archive_payload \
     || die 2 "feedback archive payload failed schema validation"
@@ -961,7 +961,7 @@ append_archive_candidate() {
   source_id=$(printf '%s' "$payload" | jq -r '.source_comment_id')
   source_login=$(printf '%s' "$payload" | jq -r '.source_login')
   body_fingerprint=$(printf '%s' "$payload" | jq -r '.body_fingerprint')
-  archive_provider=$(feedback_archive_source_provider "$source_kind" "$source_login") \
+  feedback_archive_source_provider "$source_kind" "$source_login" >/dev/null \
     || die 2 "feedback archive source lacks retained enrollment or an eligible source kind: $source_login ($source_kind)"
   # Once exact retained source-kind admission succeeds, preserve every
   # serialized classifier result. Present provider configuration cannot erase
@@ -984,19 +984,22 @@ append_archive_candidate() {
     live_source_body_json=$(printf '%s' "$source_comment" | jq -c '.body // ""')
     live_source_fingerprint=$(fingerprint "$live_source_body_json")
     live_body=$(printf '%s' "$live_source_body_json" | jq -r '.')
-    # Equality suppresses history only when the current role matches the
-    # retained provider and inventories this source kind. Reusing an old login
-    # in another provider role cannot let its different parser erase history.
+    # Retained enrollment admits history independently of current standing.
+    # Resolve the live role from the same source-kind inventory as the live
+    # finding loops; the tier check below decides whether its parser covers
+    # the archived obligation even after provider reassignment.
     case "$source_login" in
-      "$CODEX_BOT") [ "$archive_provider" != codex ] || live_source_current=true ;;
-      "$CODERABBIT_BOT") [ "$archive_provider" != coderabbit ] || live_source_current=true ;;
+      "$CODEX_BOT"|"$CODERABBIT_BOT") live_source_current=true ;;
       "$GHAS_BOT")
-        if [ "$archive_provider" = ghas ] && [ "$source_kind" = inline ]; then
+        # Reviewer standing also inventories review bodies when this login
+        # is configured for GHAS; issue comments remain bot-role only.
+        if [ "$source_kind" = inline ] \
+          || { [ "$source_kind" != issue-comment ] && registered_reviewer_login "$source_login"; }; then
           live_source_current=true
         fi
         ;;
       *)
-        if [ "$archive_provider" = reviewer ] && [ "$source_kind" != issue-comment ] && registered_reviewer_login "$source_login"; then
+        if [ "$source_kind" != issue-comment ] && registered_reviewer_login "$source_login"; then
           live_source_current=true
         fi
         ;;
@@ -1025,7 +1028,8 @@ append_archive_candidate() {
     # of #1167. Compare the two revisions with their trailing footer and
     # confirmation runs removed: equal means the archive adds nothing to
     # disposition, and a changed visible content line still archives.
-    if [ "$source_kind" = inline ] && [ "$archive_provider" = coderabbit ] \
+    if [ "$source_kind" = inline ] && [ "$source_login" = "$CODERABBIT_BOT" ] \
+      && [ "$source_login" != "$CODEX_BOT" ] && ! registered_reviewer_login "$source_login" \
       && [ "$live_source_current" = true ] && [ -n "$payload_body_json" ]; then
       live_body=$(printf '%s' "$source_comment" | jq -r '.body // ""')
       archived_body=$(printf '%s' "$payload_body_json" | jq -r '.')
