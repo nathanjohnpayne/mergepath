@@ -12,6 +12,8 @@ The shared pull-request body parser and its standalone generated runtime are spe
 
 Explicitly deferred CodeRabbit findings retain the `deferred-to-followup` ledger disposition and resolver tag. The recorder and resolver evidence contract is in `specs/review_feedback_accounting.md`.
 
+The CodeRabbit waiter honors published included-review availability through the existing mutable-comment freshness anchor and safety buffer. Missing or malformed durations stall without an optimistic retry; the existing Codex failover and retry deduplication remain intact. The timing contract and production-parser/virtual-clock coverage live in `specs/coderabbit_review_sensing.md` and `tests/test_coderabbit_wait_ratelimit_window.sh` (#2031).
+
 The Playground's local simulator and public-repository loader read author-agent declarations at source column zero and fall back to the GitHub login for prose mentions or indented lines. Their reporting contract and regression coverage live in specs/mergepath_playground.md and tests/test_mergepath_playground.sh.
 
 The hub-only Cockpit includes a read-only Fleet audit source: a thirty-minute schedule and authenticated manual refresh share one bounded subprocess and retain last-good rows on failure. Audit workers use the cached reviewer credential in an isolated cache; refresh does not invoke propagation. The separate confirmed-sync flow previews current hub/consumer evidence, requires explicit confirmation and runs the fixed author-wrapped executor; its contract is [Cockpit confirmed sync](https://github.com/nathanjohnpayne/mergepath/blob/main/specs/cockpit_sync.md). Its contract is [Cockpit Fleet](https://github.com/nathanjohnpayne/mergepath/blob/main/specs/cockpit_fleet.md).

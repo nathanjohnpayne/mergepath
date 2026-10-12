@@ -35,6 +35,40 @@ FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
+# Extract the actual parser, rather than a second implementation of its grammar.
+awk '/^parse_rate_limit_window\(\) \{/{copy=1} copy{print} copy && /^\}$/{exit}' \
+  "$ROOT/scripts/coderabbit-wait.sh" >"$WORKDIR/parser.sh"
+. "$WORKDIR/parser.sh"
+parser_case() {
+  local body=$1 expected=$2 actual rc=0
+  actual=$(parse_rate_limit_window "$body") || rc=$?
+  if [ "$expected" = "invalid" ]; then
+    [ "$rc" -ne 0 ] && [ -z "$actual" ] || { fail "parser accepted unusable window: $body"; return; }
+  else
+    [ "$rc" -eq 0 ] && [ "$actual" = "$expected" ] || { fail "parser expected $expected, got '$actual' (rc=$rc): $body"; return; }
+  fi
+  pass "production window parser: $body"
+}
+
+parser_case 'Next included review available in 21 minutes.' 1260
+parser_case '> **Next included review available in:** **13 minutes**.' 780
+parser_case '<blockquote><strong>Next included review available in</strong>: <em>17 seconds</em>.</blockquote>' 17
+parser_case 'Next included review available in 0 minutes.' 0
+parser_case 'Next included review available in 1 minute and 2 seconds.' 62
+parser_case 'Next included review available in **03 minutes and 02 seconds**.' 182
+parser_case 'Next included review available in 1 minute and soon seconds.' invalid
+parser_case 'Next included review available in 1 minute and 99999999999999999 seconds.' invalid
+parser_case 'Next included review available in: 1 second.' 1
+parser_case 'Next review available in: **3 minutes**.' 180
+parser_case 'Next review available in: 9 seconds.' 9
+parser_case 'Please wait **3 minutes and 2 seconds** before requesting another review.' 182
+parser_case 'Please wait 12 seconds before requesting another review.' 12
+parser_case 'Please wait 2 minutes before requesting another review.' 120
+parser_case 'Next included review available in soon minutes.' invalid
+parser_case 'Next included review available in -1 minutes.' invalid
+parser_case 'Next included review available in 1.5 minutes.' invalid
+parser_case 'Next included review available in 999999999999999999999999 minutes.' invalid
+
 # The CodeRabbit rate-limit notice is served with this created_at/updated_at.
 # The head committer date is stamped identically so the notice passes the
 # HEAD-anchor freshness filter (fresh_at >= anchor, inclusive).
@@ -134,6 +168,7 @@ set -euo pipefail
 bot='coderabbitai[bot]'
 state_dir=${CODERABBIT_TEST_STATE_DIR:?}
 head_time=$(cat "$state_dir/comment-time.txt")
+notice_created=$(cat "$state_dir/notice-created-time.txt" 2>/dev/null || printf '%s' "$head_time")
 [ "${1:-}" = "api" ] || { echo "unexpected gh command: $*" >&2; exit 99; }
 shift
 method="GET"
@@ -144,6 +179,7 @@ if [ "$method" = "POST" ]; then
   # Record every write so a test can assert the retry trigger was NOT
   # re-posted when one already exists for this window (#829).
   printf '%s\n' "$endpoint" >>"$state_dir/posts.log"
+  cat "$state_dir/fake-time" >>"$state_dir/post-times.log"
   case "$endpoint" in
     repos/owner/repo/issues/999/comments)
       printf '{"id":9001,"created_at":"%s","body":"ack"}\n' "$head_time" ;;
@@ -177,8 +213,8 @@ case "$endpoint" in
           '[{id:7700,user:{login:"nathanpayne-claude"},created_at:$t,updated_at:$t,body:"@coderabbitai, try again."},
             {id:7701,user:{login:$bot},created_at:$t,updated_at:$t,body:$body}]' ;;
       *)
-        jq -cn --arg bot "$bot" --arg t "$head_time" --arg body "$rl_body" \
-          '[{id:7701,user:{login:$bot},created_at:$t,updated_at:$t,body:$body}]' ;;
+        jq -cn --arg bot "$bot" --arg t "$head_time" --arg created "$notice_created" --arg body "$rl_body" \
+          '[{id:7701,user:{login:$bot},created_at:$created,updated_at:$t,body:$body}]' ;;
     esac ;;
   *) echo "unexpected gh api endpoint: $endpoint" >&2; exit 99 ;;
 esac
@@ -303,6 +339,81 @@ test_same_second_earlier_trigger_does_not_suppress() {
     || fail "6: expected a nudge for the new notice, got $posts"
   [ "$FAIL" -ne "$before" ] || pass "6: #830 P2(b) — a same-second trigger predating the notice is ordered by id, not credited to it"
 }
+
+test_included_window() {
+  local name=$1 body=$2 window=$3 seed=${4:-0} dir rc expected before=$FAIL
+  dir=$(make_case "$name" "$((window + 90))" 5 "$seed")
+  printf '%s\n' "> [!IMPORTANT]
+> ## Rate limit exceeded
+> $body" >"$dir/state/ratelimit-body.txt"
+  rc=$(run_case "$dir")
+  [ "$rc" = "4" ] || fail "$name: expected timeout after permitted retry, got $rc"
+  expected=$((window + 30 - 5))
+  grep -Fq "sleeping ${expected}s (window=${window}s + 30s buffer, 5s already elapsed)" "$dir/err.log" \
+    || fail "$name: did not honor published window and buffer"
+  if [ "$seed" = "1" ]; then
+    [ ! -s "$dir/state/posts.log" ] || fail "$name: duplicated a concurrent retry"
+  else
+    [ "$(wc -l <"$dir/state/posts.log" | tr -d ' ')" = "1" ] || fail "$name: expected exactly one retry"
+    [ "$(cat "$dir/state/post-times.log")" = "$((COMMENT_EPOCH + window + 30))" ] \
+      || fail "$name: retry did not land exactly at the published deadline plus buffer"
+  fi
+  [ "$FAIL" -ne "$before" ] || pass "$name: bounded real waiter respects the published retry deadline"
+}
+
+test_unusable_window() {
+  local name=$1 body=$2 dir rc before=$FAIL
+  dir=$(make_case "$name" 300 5)
+  printf '%s\n' "> [!IMPORTANT]
+> ## Rate limit exceeded
+> $body" >"$dir/state/ratelimit-body.txt"
+  rc=$(run_case "$dir")
+  [ "$rc" = "5" ] && [ "$(jqf "$dir" .status)" = "rate_limit_stalled" ] \
+    || fail "$name: unusable published window must stall with exit5"
+  [ ! -s "$dir/state/posts.log" ] || fail "$name: retried a refusing provider without a usable deadline"
+  ! grep -Fq 'falling back to 60s' "$dir/err.log" || fail "$name: unsafe fallback remains"
+  [ "$FAIL" -ne "$before" ] || pass "$name: no optimistic retry on an unusable refusal window"
+}
+
+test_mutable_included_window() {
+  local dir rc before=$FAIL
+  dir=$(make_case mutable-included 1500 5)
+  printf '%s\n' '> [!IMPORTANT]
+> ## Rate limit exceeded
+> Next included review available in 21 minutes.' >"$dir/state/ratelimit-body.txt"
+  jq -nr --argjson t "$((COMMENT_EPOCH - 1000))" '$t | todateiso8601' >"$dir/state/notice-created-time.txt"
+  rc=$(run_case "$dir")
+  [ "$rc" = "4" ] || fail 'mutable-included: expected timeout after one permitted retry'
+  [ "$(cat "$dir/state/post-times.log")" = "$((COMMENT_EPOCH + 1290))" ] \
+    || fail 'mutable-included: retry must use updated_at, not the older created_at'
+  [ "$FAIL" -ne "$before" ] || pass 'mutable-included: deadline follows the existing mutable-comment freshness anchor'
+}
+
+test_aged_malformed_window() {
+  local dir rc before=$FAIL
+  dir=$(make_case aged-malformed 300 3600)
+  sed 's/wallclock_freshness_window_seconds: 999999999/wallclock_freshness_window_seconds: 30/' \
+    "$dir/.github/review-policy.yml" >"$dir/.github/policy.tmp"
+  mv "$dir/.github/policy.tmp" "$dir/.github/review-policy.yml"
+  printf '%s\n' '> [!IMPORTANT]
+> ## Rate limit exceeded
+> Next included review available in soon minutes.' >"$dir/state/ratelimit-body.txt"
+  rc=$(run_case "$dir")
+  [ "$rc" = "5" ] && [ "$(jqf "$dir" .status)" = "rate_limit_stalled" ] \
+    || fail 'aged-malformed: freshness aging must not invent an expired deadline'
+  [ ! -s "$dir/state/posts.log" ] || fail 'aged-malformed: refusal retried without an expiry proof'
+  [ "$FAIL" -ne "$before" ] || pass 'aged-malformed: recognized malformed availability remains held'
+}
+
+test_included_window included21 'Next included review available in 21 minutes.' 1260
+test_included_window included13 '> **Next included review available in:** **13 minutes**.' 780
+test_included_window included-seconds '<blockquote>Next included review available in: <strong>17 seconds</strong>.</blockquote>' 17
+test_included_window included-zero 'Next included review available in 0 minutes.' 0
+test_included_window included-dedupe 'Next included review available in 21 minutes.' 1260 1
+test_unusable_window malformed-included 'Next included review available in soon minutes.'
+test_unusable_window missing-window 'The included-review allowance is exhausted; availability is unknown.'
+test_mutable_included_window
+test_aged_malformed_window
 
 test_elapsed_window_sleeps_zero
 test_fresh_window_sleeps_remaining
