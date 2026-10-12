@@ -61,15 +61,19 @@ That anchor-free read applies on BOTH probe branches, not only the one with no r
 
 An rc-7 `probe.observed = rate_limit` is a REFUSAL, not a delay, and the classifier names it as its own class rather than folding it into `not-yet`. Three facts make the distinction load-bearing: `p4b_barrier_should_trigger` declines on `rate_limit` by design, so the barrier never re-asks; CodeRabbit does not auto-retry when its published window elapses; and the polling mode's retry-with-backoff is unreachable from `--probe`, which posts nothing. A `not-yet` there therefore bought a wait that nothing in the run could satisfy — measured at roughly half the observed window, so it stalled on arrival — and the observation need not age out at all, because a limit stanza written into the in-place-edited summarize comment keeps `fresh_at` at-or-after the review object.
 
-`rate-limited` is NOT in the family that opens a barrier on its own. It is the one class the classifier cannot resolve alone, because the answer depends on the OTHER provider, and the classifier is pure over a single CodeRabbit probe result. The composer decides:
+`rate-limited` names a bare provider refusal, not a completed review. The composer lets the independent Phase 4b adapter review the head whenever the Codex arm does not itself block (#2120); bot corroboration is not a prerequisite for that external review. The composer decides:
 
 | CodeRabbit | Codex | Barrier outcome |
 |---|---|---|
-| `rate-limited` | `reported` | **open** — a provider has read the exact head about to be approved, which is what the ordering guarantee requires |
+| `rate-limited` | `reported` / `waived` / `disabled` | **open** — the adapter performs the independent external review; the posted body records the bare refusal without claiming a Codex report |
 | `rate-limited` | `not-yet` | **pending**, on the unchanged bound — the wait is on Codex, which clears on its own; an exhausted bound escalates with a reason naming the refusal rather than the clock |
-| `rate-limited` | `waived` / `disabled` | **escalate** immediately — nothing will read this head at all, so no budget has anything to wait on |
+| any | Codex human stop / unreadable budget / `escalate` | **stop** on the Codex arm's own merits — rc 3 / rc 4 / ordinary escalation respectively |
 
-These are BARRIER outcomes, not orchestrator exit statuses: an opened barrier proceeds to the adapter and exits on its verdict.
+These are BARRIER outcomes, not orchestrator exit statuses: an opened barrier proceeds to the adapter and exits on its verdict. A waiver first established by the final-request finishing resample has the same treatment as an initial waiver; no remaining wait or escalation may be caused by the rate limit alone. Substitute-disabled policy, governing-tuple and request-generation fences, feedback accounting, and head-pinned approval requirements remain unchanged.
+
+**Quota decision (#2120).** Recognized included-review quota refusals (the provider-owned `Review limit reached` heading / stable `rate limited by coderabbit.ai` marker) already emit `rate_limit` and receive the same treatment as hourly throttling. Unrecognized quota wording, including a new `quota exhausted by coderabbit.ai` stanza, remains under the existing fail-closed sensing contract: it is not evidence of a bare refusal and is not promoted to `rate-limited` merely because it mentions quota. This change adds no provider grammar or waiter-clearance bypass.
+
+The bounded production-barrier controls run through `tests/test_phase_4b_automation.sh --rate-limit-only` (about 2 seconds; outer timeout 20 seconds). They reproduce the #1296 spent-ceiling and disabled shapes, preserve human stops/unreadable budgets/masked findings, and exercise late final-request waivers and truthful review-body narration without dispatching an adapter.
 
 The `not-yet` row is a deliberate amendment to #1178's original acceptance criteria, which said a rate-limited CodeRabbit must never set `pending`. Escalating while Codex is actively reviewing the exact head spends human attention on a wait that is about to clear itself — the same objection #835 raised against escalating every rate-limited run. The issue was amended to match; the contract is this table.
 

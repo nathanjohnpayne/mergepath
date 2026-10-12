@@ -20,6 +20,166 @@ ORCH="$ROOT/scripts/phase-4b-review.sh"
 AD_CODEX="$ROOT/scripts/phase-4b/adapters/review-via-codex.sh"
 AD_CLAUDE="$ROOT/scripts/phase-4b/adapters/review-via-claude.sh"
 
+# Bounded barrier regressions (#2120): expected about 2s, no orchestrator,
+# adapter CLI, credentials or network. Run with an outer 20s timeout.
+if [ "${1:-}" = --rate-limit-only ]; then
+  command -v jq >/dev/null 2>&1 || { echo 'ERROR: jq required' >&2; exit 1; }
+  LIB="${P4B_TEST_RATE_LIMIT_LIB:-$LIB}"
+  ORCH="${P4B_TEST_RATE_LIMIT_ORCH:-$ORCH}"
+  WORK="$(mktemp -d "${TMPDIR:-/tmp}/p4b-rate-limit.XXXXXX")"
+  trap 'rm -rf "$WORK"' EXIT
+  # shellcheck source=../scripts/phase-4b/lib.sh
+  . "$LIB"
+  HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  CX_ENABLED=true CX_RC=1 CR_RC=7 ELAPSED=0
+  BUDGET_STATE=exhausted BUDGET_RC=0 STOPS_STATE=clear
+  TERMINAL_STATE=none TERMINAL_RC=0 SUBSTITUTE=true
+  CR_JSON="$(jq -nc --arg h "$HEAD" '{head_sha:$h,probe:{observed:"rate_limit"}}')"
+  # Stub transport/budget observations only; execute the production barrier,
+  # classifier, ceiling routing, generation and governing-tuple comparators.
+  p4b_policy_block_field() {
+    case "$1:$2" in
+      codex:enabled) printf '%s' "$CX_ENABLED" ;;
+      codex:allow_phase_4b_substitute) printf '%s' "$SUBSTITUTE" ;;
+      coderabbit:enabled) printf true ;;
+    esac
+  }
+  p4b_codex_timeout_determination() { printf '{"state":"absent"}'; return 1; }
+  p4b_codex_request_budget_state() {
+    jq -nc --arg s "$BUDGET_STATE" --arg h "$HEAD" \
+      '{state:$s,governing_tuple:{head_sha:$h,base_sha:"base"},policy_fingerprint:"1-2",request_generation:[1,2,3,4,5]}'
+    return "$BUDGET_RC"
+  }
+  p4b_codex_terminal_resample() {
+    jq -nc --arg s "$TERMINAL_STATE" '{state:$s}'
+    return "$TERMINAL_RC"
+  }
+  p4b_codex_human_stops() {
+    jq -nc --arg s "$STOPS_STATE" --arg h "$HEAD" \
+      '{state:$s,stops:(if $s == "stop" then ["blocking-review-budget"] else [] end),governing_tuple:{head_sha:$h,base_sha:"base"},policy_fingerprint:"1-2"}'
+  }
+  p4b_codex_available_authority_revalidate() { printf '{}'; }
+  gh_api_scalar() { printf '%s' "$HEAD"; }
+  p4b_barrier_note_pending() { printf '%s' "$ELAPSED"; }
+  p4b_barrier_clear_pending() { :; }
+  p4b_barrier_budget_seconds() { printf 100; }
+  p4b_barrier_maybe_trigger() { printf skipped; }
+  p4b_barrier_maybe_resume() { printf skipped; }
+  p4b_barrier_coderabbit_carryforward() { return 1; }
+  # The provider delegates receive different values within this subshell.
+  barrier_case() (
+    # Override the transport launcher via tiny delegates, not gate logic.
+    printf '#!/bin/sh\nexit %s\n' "$CX_RC" >"$WORK/codex"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$P4B_TEST_JSON"\nexit %s\n' "$CR_RC" >"$WORK/coderabbit"
+    chmod +x "$WORK/codex" "$WORK/coderabbit"
+    export P4B_CODEX_REVIEW_CHECK="$WORK/codex" P4B_CODERABBIT_WAIT="$WORK/coderabbit"
+    export P4B_TEST_JSON="$CR_JSON"
+    p4b_same_head_barrier owner/repo 1296 "$HEAD" nathanpayne-claude true
+  )
+  FAIL=0 COUNT=0
+  expect_case() {
+    local label="$1" expected="$2" predicate="$3" out rc=0
+    COUNT=$((COUNT + 1))
+    out="$(barrier_case)" || rc=$?
+    if [ "$rc" = "$expected" ] && jq -e "$predicate" <<<"$out" >/dev/null; then
+      printf 'PASS: %s\n' "$label"
+    else
+      printf 'FAIL: %s (rc=%s expected=%s) %s\n' "$label" "$rc" "$expected" "$out"
+      FAIL=$((FAIL + 1))
+    fi
+  }
+  expect_case 'spent 5/5 request ceiling, no human stop' 0 '.decision == "open" and .codex == "waived" and .codex_evidence == "request-ceiling" and .coderabbit == "rate-limited"'
+  CX_ENABLED=false
+  expect_case 'Codex disabled, bare rate limit' 0 '.decision == "open" and .codex == "disabled" and .coderabbit == "rate-limited"'
+  CX_ENABLED=true CX_RC=0
+  expect_case 'Codex reported, bare rate limit' 0 '.decision == "open" and .codex == "reported"'
+  CX_RC=2 BUDGET_STATE=available
+  expect_case 'account-blocked Codex with available budget' 0 '.decision == "open" and .codex == "waived"'
+  CX_RC=1
+  expect_case 'Codex still running owns pending wait' 1 '.decision == "pending" and .codex == "not-yet" and .trigger == "skipped" and .resume == "skipped"'
+  ELAPSED=100
+  expect_case 'Codex wait exhausted retains truthful refusal reason' 2 '.decision == "escalate" and (.reason | contains("rate limited"))'
+  BUDGET_STATE=final-request-pending TERMINAL_STATE=timeout
+  expect_case 'final request finishes with timeout waiver' 0 '.decision == "open" and .codex_evidence == "timeout"'
+  TERMINAL_STATE=none
+  expect_case 'final wait expires with no human stop' 0 '.decision == "open" and .codex_evidence == "request-ceiling-final-wait"'
+  STOPS_STATE=stop
+  expect_case 'final wait expires with human stop' 3 '.decision == "human-tiebreaker"'
+  STOPS_STATE=clear TERMINAL_STATE=unsafe TERMINAL_RC=2
+  expect_case 'final finishing evidence unreadable' 4 '.decision == "error"'
+  TERMINAL_STATE=timeout TERMINAL_RC=0 SUBSTITUTE=false
+  expect_case 'late timeout with substitute disabled' 2 '.decision == "escalate"'
+  TERMINAL_STATE=none SUBSTITUTE=true
+  ELAPSED=0 BUDGET_STATE=exhausted STOPS_STATE=stop
+  expect_case 'spent ceiling with human stop' 3 '.decision == "human-tiebreaker"'
+  STOPS_STATE=clear BUDGET_STATE=unreadable BUDGET_RC=2
+  expect_case 'unreadable budget evidence' 4 '.decision == "error"'
+  BUDGET_STATE=exhausted BUDGET_RC=0 STOPS_STATE=unsafe
+  expect_case 'unreadable human-stop evidence' 4 '.decision == "error"'
+  STOPS_STATE=clear
+  BUDGET_STATE=available BUDGET_RC=0 CX_RC=3
+  expect_case 'Codex diagnostic escalation' 2 '.decision == "escalate"'
+  CX_RC=2 SUBSTITUTE=false
+  expect_case 'substitute disabled remains escalation' 2 '.decision == "escalate"'
+  SUBSTITUTE=true CX_ENABLED=false CR_RC=2
+  expect_case 'masked blocking finding still escalates' 2 '.decision == "escalate" and .coderabbit == "escalate"'
+  CR_RC=7
+  CR_JSON='{"head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","probe":{"observed":"rate_limit"}}'
+  expect_case 'provider head drift still escalates' 2 '.decision == "escalate" and .coderabbit == "drift"'
+  CR_JSON="$(jq -nc --arg h "$HEAD" '{head_sha:$h,probe:{observed:"paused"}}')"
+  expect_case 'pause remains pending' 1 '.decision == "pending" and .coderabbit == "not-yet"'
+  # Execute the real waiter predicates to establish the bare-refusal premise.
+  eval "$(grep -E '^(CR_SUMMARY_BENIGN_STANZA_RE|CR_PRE_MERGE_BLOCK_START|CR_PRE_MERGE_BLOCK_END|RATE_LIMIT_MARKER|PAUSED_MARKER|IN_PROGRESS_MARKER|SUMMARY_MARKER)=' "$ROOT/scripts/coderabbit-wait.sh")"
+  # shellcheck source=../scripts/lib/coderabbit-fence.sh
+  . "$ROOT/scripts/lib/coderabbit-fence.sh"
+  awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' "$ROOT/scripts/coderabbit-wait.sh" >"$WORK/summary"
+  awk '/^# BEGIN coderabbit_rate_limit_marker_guard$/{f=1;next} /^# END coderabbit_rate_limit_marker_guard$/{f=0} f' "$ROOT/scripts/coderabbit-wait.sh" >"$WORK/guard"
+  # shellcheck disable=SC1090
+  . "$WORK/summary"
+  # shellcheck disable=SC1090
+  . "$WORK/guard"
+  for notice in '> [!WARNING]
+> ## Review limit reached
+> Included review quota exhausted.' '<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->
+Fair Usage Limits: 0 included reviews remain.'; do
+    observed="$(crw_provider_owned_refusal_class "$notice")"
+    [ "$observed" = rate_limit ]
+    guard_rc=0
+    crw_rate_limit_masks_blocking_marker "$observed" "$notice" "$HEAD" || guard_rc=$?
+    [ "$guard_rc" = 1 ]
+    CR_JSON="$(jq -nc --arg h "$HEAD" --arg o "$observed" '{head_sha:$h,probe:{observed:$o}}')"
+    expect_case 'recognized quota refusal, Codex disabled' 0 '.decision == "open" and .coderabbit == "rate-limited"'
+    masked="$notice
+_⚠️ Potential issue_
+Blocking finding on this head."
+    crw_rate_limit_masks_blocking_marker "$observed" "$masked" "$HEAD"
+    CR_RC=2
+    expect_case 'recognized quota refusal masking blocking marker' 2 '.decision == "escalate" and .coderabbit == "escalate"'
+    CR_RC=7
+  done
+  guard_rc=0
+  crw_provider_owned_refusal_class '<!-- This is an auto-generated comment: quota exhausted by coderabbit.ai -->' >/dev/null || guard_rc=$?
+  [ "$guard_rc" = 1 ]
+  # Render the production review-body block directly: no fake POST or adapter.
+  awk '/^  if \[ "\$BARRIER_CODERABBIT_RATE_LIMITED" = true \]; then$/{f=1} f {print} f && /^  fi$/{exit}' "$ORCH" >"$WORK/body-note"
+  [ -s "$WORK/body-note" ]
+  export BARRIER_CODERABBIT_RATE_LIMITED=true
+  # shellcheck disable=SC1090
+  note="$(. "$WORK/body-note")"
+  COUNT=$((COUNT + 1))
+  if [[ "$note" == *'CodeRabbit was **rate limited**'* ]] \
+     && [[ "$note" == *'independent Phase 4b adapter review'* ]] \
+     && [[ "$note" != *"Codex's head-pinned report"* ]]; then
+    printf 'PASS: production narration records refusal without inventing a Codex report\n'
+  else
+    printf 'FAIL: production narration: %s\n' "$note"
+    FAIL=$((FAIL + 1))
+  fi
+  printf '%s cases, %s failures\n' "$COUNT" "$FAIL"
+  [ "$FAIL" = 0 ]
+  exit
+fi
+
 # Focused lifecycle coverage (expected about 80s; adapter calls capped at 3s).
 # This mode never mutation-tests lib.sh or enters the long legacy suite.
 if [ "${1:-}" = --heartbeat-only ]; then
@@ -5620,15 +5780,12 @@ printf '%s' "$out" | jq -e '.coderabbit == "rate-limited"' >/dev/null 2>&1 || ba
 # nothing to wait for — the #839 routing.
 [ ! -f "$_marker" ] || bad="$bad codexreported-started-budget"
 
-# 2. Codex account-blocked (rc 2 ⇒ waived) ⇒ ESCALATE, not open. This is the
-#    case the whole design turns on: `waived` is in the family that opens the
-#    barrier for the Codex arm, so a naive "CodeRabbit refused, is anyone
-#    else terminal?" test would let an approval post with NOTHING having read
-#    the head. A refusal plus a block is a human's problem.
+# 2. #2120: account-blocked Codex (rc 2 ⇒ waived) permits adapter review.
+#    The adapter itself is the external reviewer; corroboration is optional.
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
 out="$(_barrier 2 7 "$_ratelimited")" && rc=0 || rc=$?
-[ "$rc" = 2 ] || bad="$bad codexwaived-not-escalated"
-printf '%s' "$out" | jq -e '.reason | test("rate limited")' >/dev/null 2>&1 || bad="$bad codexwaived-reason"
+[ "$rc" = 0 ] || bad="$bad codexwaived-not-open"
+printf '%s' "$out" | jq -e '.decision == "open"' >/dev/null 2>&1 || bad="$bad codexwaived-decision"
 printf '%s' "$out" | jq -e '.coderabbit == "rate-limited"' >/dev/null 2>&1 || bad="$bad codexwaived-class"
 [ ! -f "$_marker" ] || bad="$bad codexwaived-started-budget"
 
@@ -5674,7 +5831,7 @@ done
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
 
 if [ -z "$bad" ]; then
-  pass "#1178: a rate-limited CodeRabbit opens on a head-pinned Codex report, escalates when nothing read the head, and never silently holds forever"
+  pass "#1178/#2120: a bare rate limit permits adapter review when Codex is reported or waived, and holds only on Codex"
 else
   fail "#1178 rate-limited routing wrong:$bad"
 fi
