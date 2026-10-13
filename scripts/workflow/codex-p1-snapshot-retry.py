@@ -77,7 +77,10 @@ def main():
             try:
                 out, err = process.communicate(timeout=remaining)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # The process exited between the timeout and kill.
                 process.communicate()
                 raise Exhausted('180-second recovery deadline reached') from None
             if exhausted.exists():
@@ -136,6 +139,9 @@ def main():
             rc = 2
             title = 'Codex feedback gate — infra/config or head error'
             messages.append(str(error))
+        except Exception as error:
+            rc = 2
+            messages.append(f'Unexpected evaluation error: {type(error).__name__}: {error}')
 
         summary = '\n'.join(messages)
         print(summary, flush=True)
@@ -147,13 +153,22 @@ def main():
             command = [real_gh, 'api', '-X', 'PATCH', f'repos/{repo}/check-runs/{lease}',
                        '-f', 'status=completed', '-f', f'conclusion={conclusion}',
                        '-f', f'output[title]={title}', '-f', f'output[summary]={summary[:60000]}']
-            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, start_new_session=True)
             try:
-                status = process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
-                status = 124
+                process = subprocess.Popen(command, stdout=subprocess.DEVNULL, start_new_session=True)
+                try:
+                    status = process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass  # Completion after timeout cannot renew success.
+                    process.wait()
+                    status = 124
+            except Exception as error:
+                status = 1
+                diagnostic = f'Lease publication attempt {close_attempt + 1}/3 failed: {type(error).__name__}: {error}'
+                print(f'::error::{diagnostic}', file=sys.stderr)
+                summary += '\n' + diagnostic
             if status == 0:
                 return rc
             rc = 2
@@ -165,4 +180,9 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(transport() if Path(sys.argv[0]).name == 'gh' else main())
+    try:
+        result = transport() if Path(sys.argv[0]).name == 'gh' else main()
+    except Exception as error:
+        print(f'::error::Unexpected snapshot driver error; lease closure is unconfirmed: {type(error).__name__}: {error}', file=sys.stderr)
+        result = 2
+    sys.exit(result)

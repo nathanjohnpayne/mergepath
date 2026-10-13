@@ -747,6 +747,120 @@ else
   pass 'timed-out evaluator descendants cannot resume after lease failure'
 fi
 
+# Exercise launcher failures and timeout/exit races at the actual driver boundary.
+# The wrapper injects process API failures; the checked-in driver and workflow
+# still own verdict classification, retry count, lease choice and native status.
+for producer in event scheduled; do
+  for fault in launch-once launch-always close-race evaluation-race unexpected clear blocked; do
+    dir="$TMP/$producer-publisher-$fault"
+    make_sweep_fixture "$dir"
+    mv "$dir/scripts/workflow/codex-p1-snapshot-retry.py" "$dir/scripts/workflow/driver-under-test.py"
+    printf '%s' "$fault" > "$dir/fault"
+    cat > "$dir/scripts/workflow/codex-p1-snapshot-retry.py" <<'PYTHON'
+#!/usr/bin/env python3
+from pathlib import Path
+import os
+import runpy
+import subprocess
+import tempfile
+
+root = Path(os.environ['FIXTURE_LOG'])
+fault = (root / 'fault').read_text()
+original_popen = subprocess.Popen
+original_killpg = os.killpg
+attempts = 0
+race_pid = 99999999
+
+class ExitedProcess:
+    pid = race_pid
+    returncode = 0
+    calls = 0
+
+    def wait(self, timeout=None):
+        self.calls += 1
+        if self.calls == 1:
+            raise subprocess.TimeoutExpired('publisher', timeout)
+        return 0
+
+    def communicate(self, timeout=None):
+        self.calls += 1
+        if self.calls == 1:
+            raise subprocess.TimeoutExpired('evaluator', timeout)
+        return '', ''
+
+def popen(command, *args, **kwargs):
+    global attempts
+    if '-X' in command and 'PATCH' in command:
+        attempts += 1
+        with (root / 'launch.log').open('a') as log:
+            log.write(f'{attempts} {command[4]}\n')
+        if fault == 'launch-always' or (fault == 'launch-once' and attempts == 1):
+            raise OSError('fixture publisher launch failed')
+        if fault == 'close-race' and attempts == 1:
+            return ExitedProcess()
+    elif fault == 'evaluation-race' and command[0] == 'scripts/codex-p1-gate.sh':
+        return ExitedProcess()
+    return original_popen(command, *args, **kwargs)
+
+def killpg(pid, sig):
+    if pid == race_pid:
+        raise ProcessLookupError('fixture process exited before killpg')
+    return original_killpg(pid, sig)
+
+def unexpected(*args, **kwargs):
+    raise RuntimeError('fixture unexpected setup error')
+
+subprocess.Popen = popen
+os.killpg = killpg
+if fault == 'unexpected':
+    tempfile.TemporaryDirectory = unexpected
+runpy.run_path(str(Path(__file__).with_name('driver-under-test.py')), run_name='__main__')
+PYTHON
+    chmod +x "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
+    gate=clear
+    [ "$fault" != blocked ] || gate=block
+    if [ "$producer" = event ]; then
+      if run_event "$dir" GATE_MODE="$gate"; then rc=0; else rc=$?; fi
+      lease="lease-41"
+      expected_rc=2
+      [ "$fault" != clear ] || expected_rc=0
+      [ "$fault" != blocked ] || expected_rc=1
+      [ "$fault" != evaluation-race ] || expected_rc=3
+      expected_launches=2
+      [ "$fault" != launch-always ] || expected_launches=3
+    else
+      rc=$(GATE_MODE="$gate" run_sweep "$dir" stable stable)
+      lease="lease-1"
+      expected_rc=1
+      case "$fault" in clear|blocked) expected_rc=0 ;; esac
+      expected_launches=4
+      [ "$fault" != launch-always ] || expected_launches=6
+    fi
+    conclusion=failure
+    [ "$fault" != clear ] || conclusion=success
+    if [ "$rc" -ne "$expected_rc" ]; then
+      fail "$producer $fault keeps honest native status" "rc=$rc expected=$expected_rc"
+    elif [ "$fault" = launch-always ] || [ "$fault" = unexpected ]; then
+      if grep -q '^close ' "$dir/mutations.log" 2>/dev/null \
+        || ! grep -Eq 'Could not close check lease|lease closure is unconfirmed' "$dir/out"; then
+        fail "$producer $fault reports unconfirmed closure without a fabricated close"
+      elif [ "$fault" = launch-always ] && [ "$(wc -l < "$dir/launch.log" | tr -d ' ')" -ne "$expected_launches" ]; then
+        fail "$producer $fault spends only the bounded closing reserve"
+      else
+        pass "$producer $fault remains infrastructure failure with honest unclosed lease"
+      fi
+    elif ! grep -Fxq "close $lease $conclusion" "$dir/mutations.log" \
+      || { [ "$fault" != clear ] && grep -q '^close .* success$' "$dir/mutations.log"; }; then
+      fail "$producer $fault publishes only the permitted original-lease conclusion"
+    elif { [ "$fault" = launch-once ] || [ "$fault" = close-race ]; } \
+      && [ "$(wc -l < "$dir/launch.log" | tr -d ' ')" -ne "$expected_launches" ]; then
+      fail "$producer $fault uses one failure-only retry after the failed launch"
+    else
+      pass "$producer $fault preserves native status and original-lease closure"
+    fi
+  done
+done
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
