@@ -1044,10 +1044,16 @@ def strip_shell_comments_quote_aware(text):
 
 LOOP_AT_STATEMENT = re.compile(
     r"(?m)(?:^[ \t]*|;[ \t]*|&&[ \t]*|\|\|[ \t]*|\bdo[ \t]+|\bthen[ \t]+)"
-    r"(while|until)[ \t]+(?!(?:IFS=[^ \t;]*[ \t]+)?read\b)")
+    # Only `while ... read` is the finite enumeration shape (Codex P2 on
+    # #2171, round 4): `until read -r x </dev/null` never succeeds at EOF and
+    # is an infinite runner-held wait, so `until` is never exempt.
+    r"(?P<kw>while(?=[ \t]+(?!(?:IFS=[^ \t;]*[ \t]+)?read\b))|until(?=[ \t]))")
 WATCH_FLAG = re.compile(r"--watch\b")
-for key, job in ((OPEN_JOB, open_job), (PUBLISH_JOB, publish_job)):
-    if job is None:
+# EVERY job, not just the two known phase jobs (Codex P2 on #2171, round 4):
+# A0 requires `open` and `publish` to exist but does not forbid a third, and
+# a wait in a third job holds a runner just the same.
+for key, job in jobs.items():
+    if not isinstance(job, dict):
         continue
     steps = job.get("steps")
     if not isinstance(steps, list):
@@ -1060,8 +1066,8 @@ for key, job in ((OPEN_JOB, open_job), (PUBLISH_JOB, publish_job)):
         hit = LOOP_AT_STATEMENT.search(body)
         if hit:
             bad("FAIL: [rcp no runner-held wait] job %r step %r contains a `%s` loop"
-                % (key, label, hit.group(1)),
-                "      that is not a `read` loop. The publisher evaluates once and exits;",
+                % (key, label, hit.group("kw")),
+                "      that is not a `while ... read` loop. The publisher evaluates once and exits;",
                 "      a loop around a status read holds a runner for the whole CI run,",
                 "      which is the #1062 shape #2167 removed. CI completion must arrive",
                 "      as a workflow_run delivery from the repo-lint parent, not be",

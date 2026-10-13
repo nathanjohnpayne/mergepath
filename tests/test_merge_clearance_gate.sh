@@ -4562,6 +4562,14 @@ rcp_case publish-quoted-hash-before-loop \
 rcp_case publish-multiline-loop \
   's{^(          if ! PASS_START=)}{          while\n          true; do sleep 15; done\n$1}m' \
   fail '[rcp no runner-held wait]'
+# Round 4 (Codex P2 x2 on #2171): `until read` is an infinite wait at EOF and
+# is not exempt; a wait in a THIRD job is still a runner-held wait.
+rcp_case publish-until-read \
+  's{^(          if ! PASS_START=)}{          until read -r x </dev/null; do sleep 15; done\n$1}m' \
+  fail '[rcp no runner-held wait]'
+rcp_case extra-job-poll \
+  's{\z}{\n  extra:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Extra\n        run: while true; do sleep 15; done\n}' \
+  fail "job 'extra'"
 rcp_case open-watch \
   's{^(          if \[ -z "\$HEAD_SHA" \]; then\n            echo "::error::workflow_run.head_sha is empty)}{          gh pr checks "\$HEAD_SHA" --repo "\$REPO" --watch\n$1}m' \
   fail 'passes `--watch`'
@@ -4604,6 +4612,13 @@ mcg22_case gate-workflow-run-spaced \
   fail '[#2167 lint fan-in]'
 mcg22_case gate-multiline-loop \
   's{^(          output=\$\(scripts/merge-clearance-gate.sh "\$PR_NUMBER" "\$REPO" 2>&1\))}{          while\n          true; do sleep 15; done\n$1}m' \
+  fail '[#2167 no runner-held wait]'
+# Round 4 (Codex P2 x2 on #2171): `--watch=true` and `until read`.
+mcg22_case gate-watch-equals \
+  's{^(          output=\$\(scripts/merge-clearance-gate.sh "\$PR_NUMBER" "\$REPO" 2>&1\))}{          gh pr checks "\$PR_NUMBER" --repo "\$REPO" --watch=true\n$1}m' \
+  fail '[#2167 no runner-held wait]'
+mcg22_case gate-until-read \
+  's{^(          output=\$\(scripts/merge-clearance-gate.sh "\$PR_NUMBER" "\$REPO" 2>&1\))}{          until read -r x </dev/null; do sleep 15; done\n$1}m' \
   fail '[#2167 no runner-held wait]'
 mcg22_case gate-watch \
   's{^(          output=\$\(scripts/merge-clearance-gate.sh "\$PR_NUMBER" "\$REPO" 2>&1\))}{          gh pr checks "\$PR_NUMBER" --repo "\$REPO" --watch --required\n$1}m' \
@@ -4660,6 +4675,12 @@ if [ -x "$AC_CHECK" ] && [ -f "$AC_WF" ]; then
     fail '[#2167 no runner-held wait]'
   ac_case multiline-loop \
     's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          while\n          true; do sleep 15; done\n}m' \
+    fail '[#2167 no runner-held wait]'
+  ac_case watch-equals \
+    's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          gh pr checks "\$PR" --repo "\$REPO" --watch=true\n}m' \
+    fail '[#2167 no runner-held wait]'
+  ac_case until-read \
+    's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          until read -r x </dev/null; do sleep 15; done\n}m' \
     fail '[#2167 no runner-held wait]'
   ac_case watch \
     's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          gh pr checks "\$PR" --repo "\$REPO" --watch\n}m' \

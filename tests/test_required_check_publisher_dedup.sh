@@ -49,7 +49,13 @@ case "$*" in
     if [ "$GH_FIXTURE_MODE" = guard-unreadable ]; then
       exit 1
     fi
-    [ -z "${GH_FIXTURE_NEWER_PASS:-}" ] || printf '%s\n' "$GH_FIXTURE_NEWER_PASS"
+    # GH_FIXTURE_NEWER_FOR narrows the evidence to ONE context (the round-4
+    # partial-pass case); unset means every context has a fresh verdict.
+    if [ -n "${GH_FIXTURE_NEWER_PASS:-}" ]; then
+      if [ -z "${GH_FIXTURE_NEWER_FOR:-}" ] || [[ "$*" == *"check_name=$GH_FIXTURE_NEWER_FOR "* ]]; then
+        printf '%s\n' "$GH_FIXTURE_NEWER_PASS"
+      fi
+    fi
     ;;
   *"/commits/"*"/check-runs"*)
     case " $* " in
@@ -210,7 +216,7 @@ run_case ambiguous-same-time-completed in_progress 1 tied-completed 8 3 2
 
 # Reruns receive no requested event. A new attempt therefore bypasses the
 # first-attempt probe and always opens, even if old attempt markers exist.
-run_case rerun-new-attempt in_progress 2 exact 7 3 1
+run_case rerun-new-attempt in_progress 2 exact 6 3 0
 
 # Requested remains the prompt first-attempt path, and a runner that starts
 # after the parent completed retains the old one-read/no-write behavior.
@@ -226,12 +232,22 @@ run_case partial-pending-write-failure requested 1 write-fails 9 5 1 1
 # verdict that started at or after the parent was created means a full pass
 # already evaluated this head; opening a hold then would re-pend three
 # freshly published contexts until the delayed parent ran (the #2112 shape).
-# Both deliveries skip at the fence: status read, PR list, fence read — and
-# for in_progress the dedup probe before them. No write.
+# Both deliveries skip at the fence: status read, PR list, one fence read
+# per context (three) — and for in_progress the dedup probe before them.
+# No write.
 GH_FIXTURE_NEWER_PASS=301; export GH_FIXTURE_NEWER_PASS
-run_case newer-pass-owns-head-requested requested 1 empty 3 0 1
-run_case newer-pass-owns-head-in-progress in_progress 1 empty 4 0 2
-unset GH_FIXTURE_NEWER_PASS
+run_case newer-pass-owns-head-requested requested 1 empty 5 0 3
+run_case newer-pass-owns-head-in-progress in_progress 1 empty 6 0 4
+# Round 4 (Codex P1): a RERUN must open even when a verdict newer than the
+# reused run's created_at exists — the fence is first-attempt only, so no
+# fence read happens at all.
+run_case rerun-ignores-newer-pass in_progress 2 exact 6 3 0
+# Round 4 (Codex P1): fresh evidence for Merge clearance gate alone is not
+# proof the pass published its siblings. The fence stops at the first context
+# lacking evidence (two fence reads) and opens all three holds.
+GH_FIXTURE_NEWER_FOR="Merge clearance gate"; export GH_FIXTURE_NEWER_FOR
+run_case partial-pass-opens-holds requested 1 empty 8 3 2
+unset GH_FIXTURE_NEWER_FOR GH_FIXTURE_NEWER_PASS
 # A fence read that fails is unknown ordering: open anyway (fail closed).
 run_case ordering-fence-unreadable-opens requested 1 guard-unreadable 7 3 1
 
@@ -245,22 +261,33 @@ if [ "${DEDUP_MUTATION_CHILD:-0}" = 1 ]; then
   exit 0
 fi
 
-# Mutation: disarm the ordering fence in a copy of the live step. The
-# newer-pass cases must then observe three writes and fail, proving the
-# fence (not the fixture) is what withholds the hold.
-python3 - "$WORKFLOW" "$TMP/no-fence.yml" <<'PY'
+# Mutations of the live step. Each must make the suite FAIL, proving the
+# named production property (not the fixture) is what the cases observe:
+#   no-fence    — the skip itself (newer-pass cases then see three writes);
+#   no-attempt  — the first-attempt gate (rerun-ignores-newer-pass then skips);
+#   no-partial  — the per-context stop (partial-pass-opens-holds then skips).
+mutate() {  # <name> <old> <new>
+  python3 - "$WORKFLOW" "$TMP/$1.yml" "$2" "$3" <<'PY'
 from pathlib import Path
 import sys
 text = Path(sys.argv[1]).read_text()
-old = 'if [ -n "$PARENT_CREATED_AT" ] && [ -n "$newer_completed" ]; then'
-assert text.count(old) == 1
-Path(sys.argv[2]).write_text(text.replace(old, 'if false; then', 1))
+old, new = sys.argv[3], sys.argv[4]
+assert text.count(old) == 1, old
+Path(sys.argv[2]).write_text(text.replace(old, new, 1))
 PY
-if REQUIRED_CHECK_PUBLISHER_WORKFLOW="$TMP/no-fence.yml" DEDUP_MUTATION_CHILD=1 \
-    bash "$0" >"$TMP/no-fence.out" 2>&1; then
-  echo "FAIL: dedup suite accepted a publisher with the #2171 ordering fence disarmed"
-  exit 1
-fi
-echo "PASS: dedup suite rejects a publisher with the #2171 ordering fence disarmed"
+  if REQUIRED_CHECK_PUBLISHER_WORKFLOW="$TMP/$1.yml" DEDUP_MUTATION_CHILD=1 \
+      bash "$0" >"$TMP/$1.out" 2>&1; then
+    echo "FAIL: dedup suite accepted the $1 mutation of the #2171 ordering fence"
+    exit 1
+  fi
+  echo "PASS: dedup suite rejects the $1 mutation of the #2171 ordering fence"
+}
+mutate no-fence 'if [ "$fence_owned" -eq 1 ]; then' 'if false; then'
+mutate no-attempt 'if [ "$PARENT_RUN_ATTEMPT" = "1" ] && [ -n "$PARENT_CREATED_AT" ]; then' 'if [ -n "$PARENT_CREATED_AT" ]; then'
+mutate no-partial '              if [ -z "$fresh_ids" ]; then
+                fence_owned=0
+                break
+              fi
+' ''
 
-echo "All $pass required-check publisher dedup tests and 1 mutation passed."
+echo "All $pass required-check publisher dedup tests and 3 mutations passed."

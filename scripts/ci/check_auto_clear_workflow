@@ -704,12 +704,12 @@ ac_poll_loops() {  # <comment-stripped text> -> "<line>: <occurrence>" per non-r
     | while IFS= read -r hit; do
         n=${hit%%:*}; body=${hit#*:}
         grep -oE '(^[[:space:]]*|;[[:space:]]*|&&[[:space:]]*|\|\|[[:space:]]*|(^|[[:space:]])do[[:space:]]+|(^|[[:space:]])then[[:space:]]+)(while|until)[[:space:]]+(IFS=[^[:space:];]*[[:space:]]+)?[^[:space:];]+' <<<"$body" \
-          | grep -vE '(while|until)[[:space:]]+(IFS=[^[:space:];]*[[:space:]]+)?read$' \
+          | grep -vE '(^|[^[:alnum:]_])while[[:space:]]+(IFS=[^[:space:];]*[[:space:]]+)?read$' \
           | sed "s/^[[:space:]]*/$n: /" || true
       done || true
 }
 ac_loop_hits=$(ac_poll_loops "$ac_nowait_text")
-if [ -z "$ac_loop_hits" ] && ! grep -qE -- '--watch([[:space:]]|$)' <<<"$ac_nowait_text"; then
+if [ -z "$ac_loop_hits" ] && ! grep -qE -- '--watch([[:space:]=]|$)' <<<"$ac_nowait_text"; then
   pass=$((pass + 1))
   echo "  PASS: [#2167 no runner-held wait] no while/until poll loop and no --watch in any run block"
 else

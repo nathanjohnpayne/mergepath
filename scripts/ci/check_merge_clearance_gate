@@ -166,7 +166,7 @@ if [ -f "$WORKFLOW" ]; then
       | while IFS= read -r hit; do
           n=${hit%%:*}; body=${hit#*:}
           grep -oE '(^[[:space:]]*|;[[:space:]]*|&&[[:space:]]*|\|\|[[:space:]]*|(^|[[:space:]])do[[:space:]]+|(^|[[:space:]])then[[:space:]]+)(while|until)[[:space:]]+(IFS=[^[:space:];]*[[:space:]]+)?[^[:space:];]+' <<<"$body" \
-            | grep -vE '(while|until)[[:space:]]+(IFS=[^[:space:];]*[[:space:]]+)?read$' \
+            | grep -vE '(^|[^[:alnum:]_])while[[:space:]]+(IFS=[^[:space:];]*[[:space:]]+)?read$' \
             | sed "s/^[[:space:]]*/$n: /" || true
         done || true
   }
@@ -179,7 +179,7 @@ if [ -f "$WORKFLOW" ]; then
     echo "      publisher's repo-lint workflow_run delivery, never be polled for."
     FAILED=1
   fi
-  if grep -qE -- '--watch([[:space:]]|$)' <<<"$mcg_nowait_text"; then
+  if grep -qE -- '--watch([[:space:]=]|$)' <<<"$mcg_nowait_text"; then
     echo "FAIL: [#2167 no runner-held wait] $WORKFLOW passes --watch."
     echo "      A watch holds the runner until the checks finish — the runner-held"
     echo "      poll #2167 removed. Evaluate once; the event re-triggers you."

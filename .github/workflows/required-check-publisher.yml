@@ -233,16 +233,40 @@ jobs:
           # publish title counts as proof (an infra red or a superseded-head
           # red is not a verdict that owns the head). A failed read opens
           # anyway: pending is the fail-closed direction.
-          if newer_completed=$(gh api --paginate -X GET \
-              "repos/$REPO/commits/$HEAD_SHA/check-runs" \
-              -f check_name="$MCG_CONTEXT" -f filter=latest -f per_page=100 \
-              --jq ".check_runs[] | select(.status == \"completed\") | select((.app.slug // \"\") == \"github-actions\") | select(((.output.title // \"\") | endswith(\"(publisher re-evaluation)\"))) | select(.started_at >= \"$PARENT_CREATED_AT\") | .id"); then
-            if [ -n "$PARENT_CREATED_AT" ] && [ -n "$newer_completed" ]; then
-              echo "A publisher pass that started at or after parent $PARENT_RUN_ID was created already published this head (check run(s): $(echo $newer_completed)); not opening — the parent's own completed delivery re-publishes (#2171)."
-              exit 0
-            fi
-          else
-            echo "::warning::could not read completed publisher passes for $HEAD_SHA; opening anyway (fail closed)."
+          #
+          # Two narrowings (Codex P1 x2 on #2171, round 4), both strictly in
+          # the fail-closed direction:
+          #   * EVERY context needs its own fresh verdict. A pass posts the
+          #     three in sequence, and a later one can be withheld (CodeRabbit
+          #     rc 3 awaiting its summary, a failed freshness read) or fail to
+          #     POST; one fresh `Merge clearance gate` entry is then no proof
+          #     that the sibling slots were refreshed, and an old green there
+          #     would stay usable while the parent is still queued.
+          #   * FIRST attempt only. A rerun reuses the run, so its created_at
+          #     still predates the previous attempt's verdicts, and those would
+          #     read as "newer" — suppressing exactly the in_progress hold a
+          #     rerun depends on (`requested` does not fire again).
+          fence_owned=0
+          if [ "$PARENT_RUN_ATTEMPT" = "1" ] && [ -n "$PARENT_CREATED_AT" ]; then
+            fence_owned=1
+            for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
+              if ! fresh_ids=$(gh api --paginate -X GET \
+                  "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+                  -f check_name="$name" -f filter=latest -f per_page=100 \
+                  --jq ".check_runs[] | select(.status == \"completed\") | select((.app.slug // \"\") == \"github-actions\") | select(((.output.title // \"\") | endswith(\"(publisher re-evaluation)\"))) | select(.started_at >= \"$PARENT_CREATED_AT\") | .id"); then
+                echo "::warning::could not read completed publisher passes for $name on $HEAD_SHA; opening anyway (fail closed)."
+                fence_owned=0
+                break
+              fi
+              if [ -z "$fresh_ids" ]; then
+                fence_owned=0
+                break
+              fi
+            done
+          fi
+          if [ "$fence_owned" -eq 1 ]; then
+            echo "A publisher pass that started at or after parent $PARENT_RUN_ID was created already published all three contexts on this head; not opening — the parent's own completed delivery re-publishes (#2171)."
+            exit 0
           fi
           # Second status check IMMEDIATELY before the burst (round 7):
           # the enumeration above took seconds, and a parent that completed
