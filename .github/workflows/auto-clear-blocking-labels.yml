@@ -362,39 +362,56 @@ jobs:
             LANE_HEAD=""
             LANE_BASE=""
             LANE_BASE_REF=""
+            LANE_AUTHOR=""
             if [ -x scripts/workflow/dependabot_pin_bump_exemption.sh ] \
                && [ -x scripts/workflow/resolve_base_policy.sh ]; then
-              # ONE captured live head/base(/ref) feeds everything below:
-              # the policy resolution, the ownership check, the helper's
-              # pinned pair and the pre-delete fence. Resolving the policy
-              # from an unpinned base and then proving a different live
-              # pair would let a retarget between the two reads judge a
+              # ONE captured live head/base/ref/author read feeds everything
+              # below: the policy resolution, the ownership check, the
+              # helper's pinned pair and the pre-delete fence. Resolving the
+              # policy from an unpinned base and then proving a different
+              # live pair would let a retarget between the two reads judge a
               # release-branch PR by the old base's policy.
               set +e
               LANE_TRIPLE=$(GH_TOKEN="$WORKFLOW_TOKEN" gh api "repos/$REPO/pulls/$PR" \
-                --jq '[.head.sha, .base.sha, .base.ref] | @tsv')
+                --jq '[.head.sha, .base.sha, .base.ref, .user.login] | @tsv')
               triple_rc=$?
               set -e
               LANE_HEAD=$(cut -f1 <<<"$LANE_TRIPLE")
               LANE_BASE=$(cut -f2 <<<"$LANE_TRIPLE")
               LANE_BASE_REF=$(cut -f3 <<<"$LANE_TRIPLE")
+              LANE_AUTHOR=$(cut -f4 <<<"$LANE_TRIPLE")
               if [ "$triple_rc" -ne 0 ] || ! [[ "$LANE_HEAD" =~ ^[0-9a-f]{40}$ ]] \
-                 || ! [[ "$LANE_BASE" =~ ^[0-9a-f]{40}$ ]] || [ -z "$LANE_BASE_REF" ]; then
+                 || ! [[ "$LANE_BASE" =~ ^[0-9a-f]{40}$ ]] || [ -z "$LANE_BASE_REF" ] \
+                 || [ -z "$LANE_AUTHOR" ]; then
                 pin_rc=3
-                PIN_JSON='{"reason":"the live PR head, base and base ref could not be read"}'
+                PIN_JSON='{"reason":"the live PR head, base, base ref and author could not be read"}'
+              elif [ "$LANE_AUTHOR" != 'dependabot[bot]' ]; then
+                # Not a Dependabot PR: the lane cannot apply (the helper would
+                # return the same not-exempt verdict), so skip the policy
+                # materialization, the timeline read and the proof instead of
+                # spending installation-token reads on every labeled PR in
+                # every sweep. Falls through to the ordinary merge gate.
+                pin_rc=1
+                PIN_JSON=$(jq -nc --arg a "$LANE_AUTHOR" \
+                  '{reason:("PR author is " + $a + ", not dependabot[bot]; the lane does not apply")}')
               else
                 # The policy that governs a PR is its BASE branch's (#769): a
                 # release branch that opts the lane out must be honored here
-                # exactly as the classifier honors it. Bound to the captured
-                # base SHA: the resolver prints the default-branch path for a
-                # default-base PR (no API call) or a temp file holding the
-                # policy at that exact base; an unknown base policy is exit 2
-                # and fails closed below.
+                # exactly as the classifier honors it. MATERIALIZED at the
+                # captured base SHA even for a default-branch base: without
+                # --materialize-default the resolver returns this checkout's
+                # own copy for a default base and ignores --base-sha, so a
+                # default branch that advanced after this checkout (opting the
+                # lane out, adding a narrower protected path, lowering the
+                # threshold) would be judged by the older policy. The result
+                # is always a temp file; an unknown base policy is exit 2 and
+                # fails closed below.
                 LANE_POLICY=""
                 set +e
                 LANE_POLICY=$(GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/resolve_base_policy.sh \
                   --repo "$REPO" --base-ref "$LANE_BASE_REF" --base-sha "$LANE_BASE" \
-                  --default-branch "$DEFAULT_BRANCH" --default-config .github/review-policy.yml)
+                  --default-branch "$DEFAULT_BRANCH" --default-config .github/review-policy.yml \
+                  --materialize-default)
                 policy_rc=$?
                 set -e
                 if [ "$policy_rc" -ne 0 ] || [ -z "$LANE_POLICY" ] || [ ! -f "$LANE_POLICY" ]; then
@@ -1004,39 +1021,56 @@ jobs:
             LANE_HEAD=""
             LANE_BASE=""
             LANE_BASE_REF=""
+            LANE_AUTHOR=""
             if [ -x scripts/workflow/dependabot_pin_bump_exemption.sh ] \
                && [ -x scripts/workflow/resolve_base_policy.sh ]; then
-              # ONE captured live head/base(/ref) feeds everything below:
-              # the policy resolution, the ownership check, the helper's
-              # pinned pair and the pre-delete fence. Resolving the policy
-              # from an unpinned base and then proving a different live
-              # pair would let a retarget between the two reads judge a
+              # ONE captured live head/base/ref/author read feeds everything
+              # below: the policy resolution, the ownership check, the
+              # helper's pinned pair and the pre-delete fence. Resolving the
+              # policy from an unpinned base and then proving a different
+              # live pair would let a retarget between the two reads judge a
               # release-branch PR by the old base's policy.
               set +e
               LANE_TRIPLE=$(GH_TOKEN="$WORKFLOW_TOKEN" gh api "repos/$REPO/pulls/$PR" \
-                --jq '[.head.sha, .base.sha, .base.ref] | @tsv')
+                --jq '[.head.sha, .base.sha, .base.ref, .user.login] | @tsv')
               triple_rc=$?
               set -e
               LANE_HEAD=$(cut -f1 <<<"$LANE_TRIPLE")
               LANE_BASE=$(cut -f2 <<<"$LANE_TRIPLE")
               LANE_BASE_REF=$(cut -f3 <<<"$LANE_TRIPLE")
+              LANE_AUTHOR=$(cut -f4 <<<"$LANE_TRIPLE")
               if [ "$triple_rc" -ne 0 ] || ! [[ "$LANE_HEAD" =~ ^[0-9a-f]{40}$ ]] \
-                 || ! [[ "$LANE_BASE" =~ ^[0-9a-f]{40}$ ]] || [ -z "$LANE_BASE_REF" ]; then
+                 || ! [[ "$LANE_BASE" =~ ^[0-9a-f]{40}$ ]] || [ -z "$LANE_BASE_REF" ] \
+                 || [ -z "$LANE_AUTHOR" ]; then
                 pin_rc=3
-                PIN_JSON='{"reason":"the live PR head, base and base ref could not be read"}'
+                PIN_JSON='{"reason":"the live PR head, base, base ref and author could not be read"}'
+              elif [ "$LANE_AUTHOR" != 'dependabot[bot]' ]; then
+                # Not a Dependabot PR: the lane cannot apply (the helper would
+                # return the same not-exempt verdict), so skip the policy
+                # materialization, the timeline read and the proof instead of
+                # spending installation-token reads on every labeled PR in
+                # every sweep. Falls through to the ordinary merge gate.
+                pin_rc=1
+                PIN_JSON=$(jq -nc --arg a "$LANE_AUTHOR" \
+                  '{reason:("PR author is " + $a + ", not dependabot[bot]; the lane does not apply")}')
               else
                 # The policy that governs a PR is its BASE branch's (#769): a
                 # release branch that opts the lane out must be honored here
-                # exactly as the classifier honors it. Bound to the captured
-                # base SHA: the resolver prints the default-branch path for a
-                # default-base PR (no API call) or a temp file holding the
-                # policy at that exact base; an unknown base policy is exit 2
-                # and fails closed below.
+                # exactly as the classifier honors it. MATERIALIZED at the
+                # captured base SHA even for a default-branch base: without
+                # --materialize-default the resolver returns this checkout's
+                # own copy for a default base and ignores --base-sha, so a
+                # default branch that advanced after this checkout (opting the
+                # lane out, adding a narrower protected path, lowering the
+                # threshold) would be judged by the older policy. The result
+                # is always a temp file; an unknown base policy is exit 2 and
+                # fails closed below.
                 LANE_POLICY=""
                 set +e
                 LANE_POLICY=$(GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/resolve_base_policy.sh \
                   --repo "$REPO" --base-ref "$LANE_BASE_REF" --base-sha "$LANE_BASE" \
-                  --default-branch "$DEFAULT_BRANCH" --default-config .github/review-policy.yml)
+                  --default-branch "$DEFAULT_BRANCH" --default-config .github/review-policy.yml \
+                  --materialize-default)
                 policy_rc=$?
                 set -e
                 if [ "$policy_rc" -ne 0 ] || [ -z "$LANE_POLICY" ] || [ ! -f "$LANE_POLICY" ]; then

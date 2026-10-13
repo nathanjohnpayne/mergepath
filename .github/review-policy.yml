@@ -859,7 +859,8 @@ dependabot:
   # `mergepath-dependabot-pin-bump:v1` marker per verified pair);
   # auto-clear-blocking-labels.yml REMOVES a label already present on its
   # trusted pull_request_target / workflow_run / scheduled path, under the
-  # policy governing the live BASE (resolve_base_policy.sh), only when the
+  # policy governing the live BASE (resolve_base_policy.sh, materialized at
+  # the captured base SHA even for a default-branch base), only when the
   # latest label event is a github-actions[bot] application (a human
   # force-on is never cleared by the lane), re-proving against the live pair
   # and re-reading it immediately before the DELETE. Neither path reads the

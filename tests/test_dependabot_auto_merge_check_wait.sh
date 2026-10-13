@@ -983,6 +983,27 @@ SHIM
     else
       fail "auto-clear $job: must capture the live triple first, resolve the base policy pinned to it, and check the latest label event before the helper (triple=$triple_line policy=$policy_line owner=$owner_line helper=$helper_line)"
     fi
+    # The resolver's default-base shortcut returns the checkout's own policy
+    # and ignores --base-sha unless --materialize-default is passed, so the
+    # pin is only real with that flag on the SAME call (round-4 finding).
+    resolver_call=$(awk '/LANE_POLICY=\$\(GH_TOKEN="\$WORKFLOW_TOKEN" bash scripts\/workflow\/resolve_base_policy.sh/{f=1} f{print} f && /\)[[:space:]]*$/{exit}' <<<"$LOOP")
+    if grep -Fq -- '--base-sha "$LANE_BASE"' <<<"$resolver_call" \
+       && grep -Fq -- '--materialize-default' <<<"$resolver_call"; then
+      pass "auto-clear $job: the base policy is materialized at the captured base SHA, including for a default-branch base"
+    else
+      fail "auto-clear $job: the resolver call must pass --materialize-default with --base-sha, or a default-base PR is judged by the checkout's policy: $resolver_call"
+    fi
+    # Non-Dependabot PRs short-circuit from the same single PR read, before
+    # the policy materialization and the timeline read, so the sweep spends
+    # no extra installation-token reads on ordinary labeled PRs.
+    author_line=$(grep -n -F "elif [ \"\$LANE_AUTHOR\" != 'dependabot[bot]' ]; then" <<<"$LOOP" | head -1 | cut -d: -f1)
+    if grep -Fq "[.head.sha, .base.sha, .base.ref, .user.login] | @tsv" <<<"$LOOP" \
+       && [ -n "$author_line" ] && [ -n "$triple_line" ] && [ -n "$policy_line" ] \
+       && [ "$triple_line" -lt "$author_line" ] && [ "$author_line" -lt "$policy_line" ]; then
+      pass "auto-clear $job: a non-Dependabot PR leaves the lane from the single PR read, before any policy or timeline read"
+    else
+      fail "auto-clear $job: the author check must come from the captured PR read and precede the policy materialization (triple=$triple_line author=$author_line policy=$policy_line)"
+    fi
     # The pre-delete fence re-reads BOTH the pair (against the captured one)
     # and the label ownership.
     fence_owner_line=$(grep -n 'live_owner=$(lane_latest_label_event)' <<<"$LOOP" | head -1 | cut -d: -f1)
