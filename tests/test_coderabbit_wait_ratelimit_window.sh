@@ -21,7 +21,8 @@
 #      case.
 #
 # Runs the real helper from a temp repo with stubbed gh/date/sleep. Makes no
-# GitHub writes. Bash 3.2 portable. Mirrors tests/test_coderabbit_wait_codex_failover.sh.
+# GitHub writes. The extracted parser runs on Bash 3.2; the real waiter needs
+# its supported modern Bash. Mirrors tests/test_coderabbit_wait_codex_failover.sh.
 
 set -euo pipefail
 
@@ -68,6 +69,8 @@ parser_case 'Next included review available in soon minutes.' invalid
 parser_case 'Next included review available in -1 minutes.' invalid
 parser_case 'Next included review available in 1.5 minutes.' invalid
 parser_case 'Next included review available in 999999999999999999999999 minutes.' invalid
+parser_case 'Next included review available in 5 minutes and will retry automatically.' invalid
+parser_case 'Next included review available in 5 Minutes.' invalid
 
 # The CodeRabbit rate-limit notice is served with this created_at/updated_at.
 # The head committer date is stamped identically so the notice passes the
@@ -226,13 +229,14 @@ EOF
 
 run_case() {
   local dir=$1 rc=0
+  shift
   (
     cd "$dir"
     PATH="$dir/bin:$PATH" \
       GH_TOKEN=test-token \
       CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
       CODERABBIT_TEST_STATE_DIR="$dir/state" \
-      ./scripts/coderabbit-wait.sh 999 owner/repo \
+      ./scripts/coderabbit-wait.sh "$@" 999 owner/repo \
       >"$dir/out.json" 2>"$dir/err.log"
   ) || rc=$?
   printf '%s\n' "$rc"
@@ -395,6 +399,8 @@ test_aged_malformed_window() {
   sed 's/wallclock_freshness_window_seconds: 999999999/wallclock_freshness_window_seconds: 30/' \
     "$dir/.github/review-policy.yml" >"$dir/.github/policy.tmp"
   mv "$dir/.github/policy.tmp" "$dir/.github/review-policy.yml"
+  grep -Fxq '  wallclock_freshness_window_seconds: 30' "$dir/.github/review-policy.yml" \
+    || { fail 'aged-malformed: freshness fixture rewrite did not happen'; return; }
   printf '%s\n' '> [!IMPORTANT]
 > ## Rate limit exceeded
 > Next included review available in soon minutes.' >"$dir/state/ratelimit-body.txt"
@@ -402,7 +408,51 @@ test_aged_malformed_window() {
   [ "$rc" = "5" ] && [ "$(jqf "$dir" .status)" = "rate_limit_stalled" ] \
     || fail 'aged-malformed: freshness aging must not invent an expired deadline'
   [ ! -s "$dir/state/posts.log" ] || fail 'aged-malformed: refusal retried without an expiry proof'
+  grep -Fq 'unknowns left on the published window' "$dir/err.log" \
+    || fail 'aged-malformed: polling did not consume the null remaining duration'
+  rc=$(run_case "$dir" --probe)
+  [ "$rc" = "7" ] && [ "$(jqf "$dir" .probe.observed)" = "rate_limit" ] \
+    || fail 'aged-malformed: real probe must retain the unusable-window refusal'
+  grep -Fq 'unknowns left on its published window' "$dir/err.log" \
+    || fail 'aged-malformed: probe did not consume the null remaining duration'
+  [ ! -s "$dir/state/posts.log" ] || fail 'aged-malformed: probe posted a retry'
   [ "$FAIL" -ne "$before" ] || pass 'aged-malformed: recognized malformed availability remains held'
+}
+
+test_unusable_window_failover() {
+  local name=$1 enabled=$2 request_rc=$3 expected=$4 dir rc before=$FAIL
+  dir=$(make_case "$name" 300 5)
+  sed "s/codex_failover_on_rate_limit: false/codex_failover_on_rate_limit: $enabled/" \
+    "$dir/.github/review-policy.yml" >"$dir/.github/policy.tmp"
+  mv "$dir/.github/policy.tmp" "$dir/.github/review-policy.yml"
+  grep -Fxq "  codex_failover_on_rate_limit: $enabled" "$dir/.github/review-policy.yml" \
+    || { fail "$name: failover fixture rewrite did not happen"; return; }
+  printf '%s\n' '> [!IMPORTANT]
+> ## Rate limit exceeded
+> Next included review available in soon minutes.' >"$dir/state/ratelimit-body.txt"
+  printf '%s\n' "$request_rc" >"$dir/state/codex-request-rc"
+  cat >"$dir/scripts/codex-review-request.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+state_dir=${CODERABBIT_TEST_STATE_DIR:?}
+printf '%s|%s\n' "${MERGEPATH_PHASE_4A_GATED:-}" "$*" >>"$state_dir/codex-requests.log"
+exit "$(cat "$state_dir/codex-request-rc")"
+EOF
+  chmod +x "$dir/scripts/codex-review-request.sh"
+  rc=$(run_case "$dir")
+  [ "$rc" = "5" ] && [ "$(jqf "$dir" .status)" = "rate_limit_stalled" ] \
+    || fail "$name: missing deadline must still stall"
+  [ "$(jqf "$dir" .codex_failover_requested)" = "$expected" ] \
+    || fail "$name: failover result misreported"
+  if [ "$enabled" = "true" ]; then
+    [ "$(wc -l <"$dir/state/codex-requests.log" | tr -d ' ')" = "1" ] \
+      && grep -Fxq 'true|--trigger-only 999 owner/repo' "$dir/state/codex-requests.log" \
+      || fail "$name: expected one correctly gated trigger-only request"
+  else
+    [ ! -e "$dir/state/codex-requests.log" ] || fail "$name: opt-out invoked Codex"
+  fi
+  [ ! -s "$dir/state/posts.log" ] || fail "$name: posted a CodeRabbit retry"
+  [ "$FAIL" -ne "$before" ] || pass "$name: unusable deadline retains truthful once-per-head failover"
 }
 
 test_included_window included21 'Next included review available in 21 minutes.' 1260
@@ -414,6 +464,9 @@ test_unusable_window malformed-included 'Next included review available in soon 
 test_unusable_window missing-window 'The included-review allowance is exhausted; availability is unknown.'
 test_mutable_included_window
 test_aged_malformed_window
+test_unusable_window_failover unusable-failover-success true 0 true
+test_unusable_window_failover unusable-failover-failure true 5 false
+test_unusable_window_failover unusable-failover-opt-out false 0 false
 
 test_elapsed_window_sleeps_zero
 test_fresh_window_sleeps_remaining
