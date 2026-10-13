@@ -1340,6 +1340,10 @@ class Lexer:
         if arithmetic_contexts:
             self.herestring_source_positions = []
             self.herestring_source_terminators = []
+            self.literal_source_process_positions = []
+            self.arithmetic_context_owners = []
+            self.diagnostic_null_terminators = []
+            self.literal_source_receiver_terminators = []
         self.logical = []
         self.heredocs = []
         self.func_defs = []  # (name, body_start_index, body_end_index)
@@ -1507,6 +1511,7 @@ class Lexer:
         def record_arithmetic_context(start, operand_start, operand_end, end, kind):
             if not any(a <= start < z for _k, a, _b, _c, z in self.arithmetic_context_spans):
                 self.arithmetic_context_spans.append((kind, start, operand_start, operand_end, end))
+                self.arithmetic_context_owners.append(cur_level()["seg"])
 
         def expanding():
             return "'" not in quotes
@@ -1933,6 +1938,11 @@ class Lexer:
                         "saved_quotes": quotes,
                     }
                 )
+                if self._arithmetic_contexts:
+                    levels[-1]["literal_source_process_open"] = (
+                        parent_seg, len(parent_seg.words),
+                        "".join(levels[-2]["word"]), c, i + 2,
+                    )
                 quotes = []
                 i += 2
                 continue
@@ -2077,6 +2087,10 @@ class Lexer:
                 if len(levels) > 1:
                     finish_word()
                     kind = levels[-1]["kind"]
+                    if self._arithmetic_contexts and kind == "procsub":
+                        record = levels[-1].get("literal_source_process_open")
+                        if record is not None:
+                            self.literal_source_process_positions.append(record + (i,))
                     quotes = levels[-1]["saved_quotes"]
                     levels.pop()
                     if kind == "cmdsub":
@@ -2095,8 +2109,20 @@ class Lexer:
                     start_segment()
                     i += 1
                     continue
+                if self._arithmetic_contexts:
+                    pending = "".join(cur_level()["word"])
+                    seg = cur_level()["seg"]
+                    probe = Segment(-1, None, False, line)
+                    probe.words = list(seg.words) + ([pending] if pending else [])
+                    if resolve_command(probe)[0] in ("source", "."):
+                        self.literal_source_receiver_terminators.append((seg, len(seg.words), i))
+                    redir = _REDIR_RE.match(pending)
+                    target = pending[redir.end():] if redir is not None else pending
+                    if _unquote_command_word(target) in _NULL_SINKS | {"/dev/stderr"}:
+                        seg = cur_level()["seg"]
+                        self.diagnostic_null_terminators.append((seg, len(seg.words), i))
                 if (self._arithmetic_contexts
-                        and _unquote_command_word("".join(cur_level()["word"])) == "/dev/stdin"):
+                        and _unquote_command_word("".join(cur_level()["word"])) in ("/dev/stdin", "/dev/fd/0")):
                     seg = cur_level()["seg"]
                     self.herestring_source_terminators.append((seg, len(seg.words), i))
                 cur_level()["word"].append(c)
@@ -3710,7 +3736,10 @@ def _heredoc_has_positional(hd, emitter_helpers, _depth=0):
                           if body.startswith(("$[", "$((", "${"), start)
                           and _heredoc_brace_command_span(body, start) is None
                           else _heredoc_substitution_has_positional(
-                              inner, _depth, _outer_substitution=body.startswith("$(", start)))
+                              inner, _depth, _outer_substitution=body.startswith("$(", start),
+                              _source_capture=(body[start] == "`" or body.startswith("$(", start)
+                                               or (body.startswith("${", start)
+                                                   and body[start + 2:start + 3] != "|"))))
             if positional:
                 return True
     for start, end in _error_word_spans(body, in_heredoc=True):
@@ -3728,26 +3757,51 @@ def _backtick_positional_source(body):
     )
 
 
-def _heredoc_substitution_has_positional(body, _depth=0, _outer_substitution=False):
+def _heredoc_substitution_has_positional(body, _depth=0, _outer_substitution=False,
+                                          _source_capture=False, _literal_source_context=None,
+                                          _literal_seen=frozenset(), _literal_definitions=None):
     """Inventory actual source within one shared HD/deferred child hop.
 
     Keep ordinary source checking first, including its conservative legacy
     reading. Only discovered-HD and deferred child inventory consume the
     existing budget; deeper source is not claimed uniformly inert or covered.
     """
-    if _word_has_verbatim_positional(body):
+    if _literal_source_context is None and _word_has_verbatim_positional(body):
         return True
-    lx = Lexer(body, arithmetic_contexts=True)
-    for _kind, _start, begin, end, _stop in lx.arithmetic_context_spans:
-        if _word_has_verbatim_positional(body[begin:end], in_heredoc=True, _depth=_depth):
+    executable_body = body
+    if _literal_source_context is not None:
+        # Recognized definition bodies are catalogue data until a literal call.
+        # Preserve physical coordinates; never choose an active definition.
+        chars = list(body)
+        for match, _name, program in _iter_function_definitions(body):
+            for offset in range(match.end(), match.end() + len(program)):
+                if chars[offset] != "\n":
+                    chars[offset] = " "
+        executable_body = "".join(chars)
+    lx = Lexer(executable_body, arithmetic_contexts=True)
+    positions = _literal_source_context[4] if _literal_source_context is not None else None
+    if (_literal_source_context is not None
+            and _heredoc_literal_source_output(lx, body, _literal_source_context[:4], _depth,
+                                                _positions=positions, _seen=_literal_seen,
+                                                _definitions=_literal_definitions)):
+        return True
+    for index, (_kind, _start, begin, end, _stop) in enumerate(lx.arithmetic_context_spans):
+        if (_literal_source_context is not None and _kind == "command"
+                and _heredoc_stderr_null(lx.arithmetic_context_owners[index])):
+            continue
+        if _word_has_verbatim_positional(
+                _heredoc_literal_parameter_word(body[begin:end], positions),
+                in_heredoc=True, _depth=_depth):
             return True
     # Lexer segments retain executable quote/escape context and omit comments
     # and inert HD data. Rejoin words for legacy arithmetic split by spaces;
     # only recognized arithmetic operands receive arithmetic quote semantics.
     for ll in lx.logical:
         for seg in ll.segments:
-            for operand in _heredoc_builtin_index_operands(seg):
-                if _word_has_verbatim_positional(operand, in_heredoc=True, _depth=_depth):
+            for operand in _heredoc_builtin_index_operands(seg, lx, _outer_substitution):
+                if _word_has_verbatim_positional(
+                        _heredoc_literal_parameter_word(operand, positions),
+                        in_heredoc=True, _depth=_depth):
                     return True
             executable = " ".join(seg.words)
             for operand, start, _end in _find_substitutions(executable, include_arithmetic=True):
@@ -3756,7 +3810,13 @@ def _heredoc_substitution_has_positional(body, _depth=0, _outer_substitution=Fal
                         return True
                     continue
                 if executable.startswith(("$[", "$((", "${"), start):
-                    if _word_has_verbatim_positional(operand, in_heredoc=True, _depth=_depth):
+                    if (_literal_source_context is not None
+                            and executable.startswith(("$[", "$(("), start)
+                            and _heredoc_stderr_null(seg.parent)):
+                        continue
+                    if _word_has_verbatim_positional(
+                            _heredoc_literal_parameter_word(operand, positions),
+                            in_heredoc=True, _depth=_depth):
                         return True
     if _depth >= _DEFERRED_SHELL_DEPTH:
         return False
@@ -3767,22 +3827,67 @@ def _heredoc_substitution_has_positional(body, _depth=0, _outer_substitution=Fal
             return True
     for ll in lx.logical:
         for seg in ll.segments:
-            for inner in (_deferred_shell_operands(seg) + _heredoc_source_herestrings(seg, lx, _outer_substitution)):
+            for inner in _deferred_shell_operands(seg):
                 if _heredoc_substitution_has_positional(inner, _depth + 1):
+                    return True
+            for inner, receiver in _heredoc_source_herestrings(seg, lx, _outer_substitution, with_context=True):
+                context = (seg, receiver, lx, _source_capture,
+                           _heredoc_literal_receiver_positions(receiver)) if receiver is not None else None
+                if _heredoc_substitution_has_positional(inner, _depth + 1, _literal_source_context=context):
+                    return True
+            for inner, receiver in _heredoc_source_process_operands(seg, lx, _outer_substitution):
+                context = (seg, receiver, lx, _source_capture,
+                           _heredoc_literal_receiver_positions(receiver))
+                if _heredoc_substitution_has_positional(inner, _depth + 1, _literal_source_context=context):
                     return True
     return False
 
 
 
 
-def _heredoc_builtin_index_operands(seg):
+def _heredoc_builtin_index_operands(seg, _source_lexer=None, _outer_substitution=False):
     """Literal indexed names at finite builtin operand positions, HD only."""
     cmd, _redir = resolve_command(seg)
-    if cmd not in ("test", "[", "[[", "unset", "read") or seg._cmd_index is None:
+    if cmd not in ("test", "[", "[[", "unset", "read", "printf", "declare", "typeset") or seg._cmd_index is None:
         return []
-    args = [literal for _raw, literal in _command_arguments(seg.words, seg._cmd_index + 1)]
+    arguments = list(_command_arguments(seg.words, seg._cmd_index + 1))
+    args = [literal for _raw, literal in arguments]
     names = []
-    if cmd in ("test", "[", "[["):
+    declaration = cmd in ("declare", "typeset")
+    if (cmd in ("printf", "declare", "typeset")
+            and _heredoc_stderr_null(seg, _source_lexer, _outer_substitution)):
+        return []
+    if cmd == "printf":
+        options, stop, _assigned, _separate, _allowed = _printf_assignment_options(seg)
+        i = 0
+        while i < stop:
+            _raw, literal = options[i]
+            if literal == "-v":
+                names = [options[i + 1][1]]
+                i += 2
+            elif literal is not None and literal.startswith("-v") and len(literal) > 2:
+                names = [literal[2:]]
+                i += 1
+            else:
+                break
+    elif declaration:
+        i = 0
+        while i < len(args):
+            literal = args[i]
+            if literal == "--":
+                i += 1
+                break
+            if literal is None:
+                return []
+            if not literal.startswith(("-", "+")) or literal in ("-", "+"):
+                break
+            if not literal[1:] or any(c not in "aAgilnrtuxfFp" for c in literal[1:]):
+                return []
+            if set(literal[1:]) & {"f", "F", "p", "A"}:
+                return []
+            i += 1
+        names = args[i:]
+    elif cmd in ("test", "[", "[["):
         if cmd in ("[", "[[") and args and args[-1] == ("]" if cmd == "[" else "]]"):
             args = args[:-1]
         if args[:1] == ["!"]:
@@ -3829,14 +3934,67 @@ def _heredoc_builtin_index_operands(seg):
         if opening <= 0 or not _IDENT_RE.fullmatch(name[:opening]):
             continue
         close = _find_compound_close(name, opening, bracket_span=True)
-        if close == len(name) - 1:
+        if close is None:
+            continue
+        if declaration:
+            if name[close + 1:close + 2] != "=":
+                continue
+            operand = name[opening + 1:close]
+            # Preserve the existing value-only declaration DATA boundary.
+            # Compound subscripts retain their actual diagnostic inventory;
+            # no RHS or runtime array/variable binding is evaluated here.
+            if re.fullmatch(r"\$(?:[1-9][0-9]*|[@*]|\{(?:[1-9][0-9]*|[@*])\})", operand):
+                continue
+            out.append(operand)
+        elif close == len(name) - 1:
             out.append(name[opening + 1:close])
     return out
 
 
-def _heredoc_source_herestrings(seg, source_lexer=None, outer_substitution=False):
-    """Literal stdin supplied to source/. shares the existing child budget."""
+def _heredoc_literal_null_words(seg, lx, outer_substitution):
+    """Private null-target boundary with actual source-frame/word coordinates."""
     words = list(seg.words)
+    if lx is not None and outer_substitution:
+        for owner, index, close in lx.diagnostic_null_terminators:
+            if (owner is seg and index < len(words) and words[index].endswith(")")
+                    and lx.text[close:close + 1] == ")"
+                    and close not in lx.quoted_data_offsets and close not in lx.comment_offsets):
+                words[index] = words[index][:-1]
+    return words
+
+
+def _heredoc_stderr_null(seg, _source_lexer=None, _outer_substitution=False):
+    """A finite explicit fd2 null route, only for newly admitted diagnostics.
+
+    Reuse redirection/literal boundaries; unknown or later fd2 routes withhold
+    this credit. No descriptor variables, dup-state or runtime paths are inferred.
+    """
+    for _hop in range(32):
+        if seg is None:
+            return False
+        null = None
+        words = _heredoc_literal_null_words(seg, _source_lexer, _outer_substitution)
+        for i, word in enumerate(words):
+            match = _REDIR_RE.match(word)
+            if not match or not re.fullmatch(r"0*2", word[:match.start(1)]):
+                continue
+            tail = word[match.end():]
+            raw = tail if tail else (words[i + 1] if i + 1 < len(words) else "")
+            target = _unquote_command_word(raw)
+            if match.group(1) in (">", ">>", ">|") and target == "/dev/stderr":
+                continue  # literal fd2 self-route preserves only existing proof
+            null = (match.group(1) in (">", ">>", ">|") and target in _NULL_SINKS)
+        if null is not None:
+            return null
+        seg = seg.parent
+    return False
+
+
+def _heredoc_literal_input_view(seg, source_lexer=None, outer_substitution=False, _receiver=False):
+    """Existing owned input projection shared by these literal source readers."""
+    words = (_heredoc_literal_receiver_words(seg, source_lexer, outer_substitution)
+             if _receiver and source_lexer is not None
+             else _heredoc_literal_null_words(seg, source_lexer, outer_substitution))
     bound_inputs = None
     if source_lexer is not None:
         bound_inputs = []
@@ -3847,7 +4005,7 @@ def _heredoc_source_herestrings(seg, source_lexer=None, outer_substitution=False
                         and close not in source_lexer.quoted_data_offsets
                         and close not in source_lexer.comment_offsets
                         and words[index].endswith(")")
-                        and _unquote_command_word(words[index][:-1]) == "/dev/stdin"):
+                        and _unquote_command_word(words[index][:-1]) in ("/dev/stdin", "/dev/fd/0")):
                     words[index] = words[index][:-1]
         positions = [record for record in source_lexer.herestring_source_positions
                      if record[0] is seg]
@@ -3872,6 +4030,13 @@ def _heredoc_source_herestrings(seg, source_lexer=None, outer_substitution=False
                 literal = _unquote_command_word(raw)
                 if literal is not None:
                     bound_inputs.append(literal)
+    return words, bound_inputs
+
+
+def _heredoc_source_herestrings(seg, source_lexer=None, outer_substitution=False, with_context=False):
+    """Literal stdin supplied to source/. shares the existing child budget."""
+    words, bound_inputs = _heredoc_literal_input_view(
+        seg, source_lexer, outer_substitution, _receiver=with_context)
     probe = Segment(-1, None, False, seg.line)
     probe.words = words
     cmd, _redir = resolve_command(probe)
@@ -3880,9 +4045,12 @@ def _heredoc_source_herestrings(seg, source_lexer=None, outer_substitution=False
     args = list(_command_arguments(words, probe._cmd_index + 1))
     if args and args[0][1] == "--":
         args = args[1:]
-    if not args or args[0][1] != "/dev/stdin":
+    if not args or args[0][1] not in ("/dev/stdin", "/dev/fd/0"):
         return []
     if bound_inputs is not None:
+        if with_context:
+            return [(inner, probe if args[0][1] == "/dev/fd/0" else None)
+                    for inner in bound_inputs]
         return bound_inputs
     inputs = []
     for i, word in enumerate(seg.words):
@@ -3890,8 +4058,329 @@ def _heredoc_source_herestrings(seg, source_lexer=None, outer_substitution=False
             literal = _unquote_command_word(seg.words[i + 1])
             if literal is not None:
                 inputs.append(literal)
-    return inputs
+    return [(inner, None) for inner in inputs] if with_context else inputs
 
+
+
+def _heredoc_literal_receiver_words(seg, lx, outer_substitution):
+    """Actual outer close belongs to this private source receiver word slot."""
+    words = _heredoc_literal_null_words(seg, lx, outer_substitution)
+    if outer_substitution:
+        for owner, index, close in reversed(lx.literal_source_receiver_terminators):
+            if (owner is seg and index < len(words) and words[index].endswith(")")
+                    and lx.text[close:close + 1] == ")"
+                    and close not in lx.quoted_data_offsets and close not in lx.comment_offsets):
+                # Null-target projection may already have removed this close.
+                if any(o is owner and j == index and k == close
+                       for o, j, k in lx.diagnostic_null_terminators):
+                    continue
+                words[index] = words[index][:-1]
+                if not words[index]:
+                    del words[index]
+    return words
+
+
+def _heredoc_literal_receiver_positions(receiver):
+    """Complete literal script arguments prove no credential parameter input."""
+    resolve_command(receiver)
+    args = list(_command_arguments(receiver.words, receiver._cmd_index + 1))
+    if args and args[0][1] == "--":
+        args = args[1:]
+    scripts = args[1:]
+    if scripts and all(literal is not None or raw in ("''", '""')
+                       for raw, literal in scripts):
+        return frozenset()
+    return None  # no arguments inherit parameters; opaque arguments retain facts
+
+
+def _heredoc_literal_parameter_word(word, positions):
+    """Private literal helper-argument facts, followed by the ordinary reader.
+
+    This projection changes no tokens or quote semantics. Only literal numeric
+    parameter heads lacking a credential-bearing actual argument are masked;
+    guards, attributes and quote/escape handling remain with the ordinary reader.
+    """
+    if positions is None:
+        return word
+
+    def head(match):
+        brace, plain = match.groups()
+        name = brace or plain
+        if name in ("@", "*") or int(name) in positions:
+            return match.group(0)
+        return "${_mergepath_unused" if brace else "$_mergepath_unused"
+
+    return re.sub(r"\$(?:\{([1-9][0-9]*|[@*])|([1-9]|[@*]))", head, word)
+
+
+def _heredoc_literal_reaches_output(seg, helpers):
+    """Existing walk with finite stdout roles, only for literal source input.
+
+    Fd2-only redirects do not move captured stdout. A literal fd1 duplication
+    into a proven-null fd2 counts only at its written position; later null
+    routing cannot retroactively suppress the copied stream.
+    """
+    originals = []
+    current = seg
+    while current is not None and len(originals) < 32:
+        originals.append(current)
+        current = current.parent
+    frames = {s: Segment(s.sid, None, False, s.line) for s in originals}
+    for original, frame in frames.items():
+        frame.parent = frames.get(original.parent)
+        frame.parent_is_capture = original.parent_is_capture
+        frame.parent_is_subshell = original.parent_is_subshell
+        frame.pipe_to = original.pipe_to
+        words = original.words
+        projected = []
+        stdout_null = None
+        skip = False
+        for i, word in enumerate(words):
+            if skip:
+                skip = False
+                continue
+            match = _REDIR_RE.match(word)
+            if not match:
+                projected.append(word)
+                continue
+            tail = word[match.end():]
+            raw = tail if tail else (words[i + 1] if i + 1 < len(words) else "")
+            skip = not tail and i + 1 < len(words)
+            target = _unquote_command_word(raw)
+            stdout = bool(_STDOUT_REDIR_RE.match(word))
+            if stdout:
+                if match.group(1) == ">&" and target == "2":
+                    prefix = Segment(original.sid, original.parent, False, original.line)
+                    prefix.words = words[:i]
+                    stdout_null = _heredoc_stderr_null(prefix)
+                elif match.group(1) in (">", ">>", ">|") and target in _NULL_SINKS:
+                    stdout_null = True
+                else:
+                    stdout_null = False
+                projected.append(word)
+                if skip:
+                    projected.append(raw)
+            elif match.group(1) not in (">", ">>", ">|", ">&", "&>", "&>>"):
+                projected.append(word)
+                if skip:
+                    projected.append(raw)
+        if stdout_null:
+            return False
+        frame.words = projected
+    return reaches_output(Ref("1", seg.line, frames[seg]), helpers)[0]
+
+
+def _heredoc_literal_source_output(lx, body, context, _depth, _seen=frozenset(), _positions=None,
+                                   _definitions=None):
+    """Existing output walk on a private transparent literal-source frame."""
+    owner, receiver, source_lexer, captured = context
+    originals = [seg for line in source_lexer.logical for seg in line.segments]
+    frames = {seg: Segment(seg.sid, None, False, seg.line) for seg in originals}
+    boundary = Segment(-1, None, False, owner.line)
+    # The owning non-stdin HD command discards this captured body output.
+    boundary.words = [":"]
+    for seg, frame in frames.items():
+        frame.words = list(receiver.words if seg is owner else seg.words)
+        if seg is owner:
+            # This proven literal source input is transparent to the output
+            # already produced by its program. Keep its actual redirections
+            # and parent links, without the general opaque-source verdict.
+            resolve_command(frame)
+            frame.words[frame._cmd_index] = ":"
+            frame._resolved = False
+        frame.parent = frames.get(seg.parent, seg.parent if seg.parent is not None
+                                  else boundary if captured else None)
+        frame.parent_is_capture = seg.parent_is_capture or (captured and seg.parent is None)
+        frame.parent_is_subshell = seg.parent_is_subshell
+        frame.pipe_to = frames.get(seg.pipe_to)
+    for line in lx.logical:
+        for seg in line.segments:
+            if seg.parent is None:
+                seg.parent = frames[owner]
+                seg.parent_is_subshell = True
+    helpers = discover_emitter_helpers(body)
+    definitions = {name: list(programs) for name, programs in (_definitions or {}).items()}
+    for _match, name, program in _iter_function_definitions(body):
+        definitions.setdefault(name, []).append(program)
+
+    null_commands = {owner for span, owner in zip(lx.arithmetic_context_spans, lx.arithmetic_context_owners)
+                     if span[0] == "command" and _heredoc_stderr_null(owner)}
+
+    def literal_call(seg, program, positions=_positions, alias=False):
+        # Definitions and literal alias graph edges belong to this reached
+        # program. They add no deferred/HD recursion and spend no new child hop.
+        if program in _seen:
+            return False
+        receiver = seg
+        if alias:
+            # Literal replacement redirects precede written invocation redirects.
+            # Project their existing token roles into this private source text;
+            # do not make an invocation's later fd2 null route an ancestor route.
+            receiver = Segment(seg.sid, seg.parent, False, seg.line)
+            receiver.words = []
+            redirects = []
+            skip = False
+            for i, word in enumerate(seg.words):
+                if skip:
+                    skip = False
+                    continue
+                match = _REDIR_RE.match(word)
+                if match:
+                    redirects.append(word)
+                    if match.end() == len(word) and i + 1 < len(seg.words):
+                        redirects.append(seg.words[i + 1])
+                        skip = True
+                else:
+                    receiver.words.append(word)
+            if redirects:
+                program += " " + " ".join(redirects)
+        return _heredoc_substitution_has_positional(
+            program, _depth, _literal_source_context=(seg, receiver, lx, False, positions),
+            _literal_seen=_seen | {program}, _literal_definitions=definitions)
+
+    trace_scopes = {}
+    for line in lx.logical:
+        trace_delta = _xtrace_delta(line, False)
+        for seg in line.segments:
+            lineage = []
+            ancestor = seg.parent
+            while ancestor is not None:
+                lineage.append(ancestor)
+                ancestor = ancestor.parent
+            traced = next((trace_scopes[p] for p in lineage if p in trace_scopes), False)
+            trace_change = _segment_sets_xtrace(seg)
+            if trace_change is True or (trace_change is False and trace_delta is False):
+                trace_scopes[seg.parent] = trace_change
+            if traced and not _heredoc_stderr_null(seg.parent):
+                if any(_word_has_verbatim_positional(
+                        _heredoc_literal_parameter_word(word, _positions), _depth=_depth)
+                       for word in seg.words):
+                    return True
+            parent = seg
+            while parent is not None and parent not in null_commands:
+                parent = parent.parent
+            if parent in null_commands:
+                continue
+            cmd, _redir = resolve_command(seg)
+            if (cmd in definitions and seg._cmd_index is not None
+                    and seg._function_binding is None):
+                positions = {i for i, (raw, _literal) in enumerate(
+                    _command_arguments(seg.words, seg._cmd_index + 1), 1)
+                    if _word_has_verbatim_positional(
+                        _heredoc_literal_parameter_word(raw, _positions), _depth=_depth)}
+                if positions and any(literal_call(seg, program, positions)
+                                     for program in definitions[cmd]):
+                    return True
+                continue
+            for word in seg.words:
+                word = _heredoc_literal_parameter_word(word, _positions)
+                # Expansion arithmetic diagnoses before this command's own
+                # redirects. The independent diagnostic loop reads it below.
+                for _operand, start, end in reversed(_find_substitutions(word, include_arithmetic=True)):
+                    if word.startswith(("$((", "$["), start):
+                        word = word[:start] + word[end:]
+                if (_word_has_verbatim_positional(word, _depth=_depth)
+                        and _heredoc_literal_reaches_output(seg, helpers)):
+                    return True
+    return _heredoc_invoked_alias_has_positional(
+        lx, lambda seg, program: literal_call(seg, program, alias=True), set(definitions) | helpers)
+
+
+def _heredoc_literal_emitter_program(body):
+    """Finite literal printf/echo/stdin-emitter data, without execution."""
+    lx = Lexer(body, arithmetic_contexts=True)
+    if lx.heredocs or lx.literal_source_process_positions:
+        return None
+    parts = [seg for line in lx.logical for seg in line.segments if seg.words]
+    if len(parts) != 1:
+        return None
+    seg = parts[0]
+    if any(_OUT_REDIR_RE.match(word) for word in seg.words) or seg.pipe_to is not None:
+        return None
+    words, inputs = _heredoc_literal_input_view(seg, lx)
+    probe = Segment(-1, None, False, seg.line)
+    probe.words = words
+    # A literal builtin prefix does not introduce a lookup/binding model.
+    if probe.words[:1] == ["builtin"]:
+        probe.words = probe.words[1:]
+    cmd, _redir = resolve_command(probe)
+    if cmd not in EMITTERS | STDIN_ECHOERS or probe._cmd_index is None:
+        return None
+    args = list(_command_arguments(probe.words, probe._cmd_index + 1))
+    if cmd in STDIN_ECHOERS:
+        if (len(lx.herestring_source_positions) != 1 or len(inputs or []) != 1
+                or args):
+            return None
+        return inputs[0]
+    if lx.herestring_source_positions or any(_REDIR_RE.match(word) for word in probe.words):
+        return None
+    if not all(_printf_literal(raw, literal) for raw, literal in args):
+        return None
+    values = [literal for _raw, literal in args]
+    if cmd == "echo":
+        newline = True
+        while values and re.fullmatch(r"-[neE]+", values[0]):
+            if any(c in "eE" for c in values[0][1:]) and "/" in probe._cmd_literal:
+                return None
+            newline = newline and "n" not in values.pop(0)[1:]
+        if any("\\" in value for value in values):
+            return None  # xpg_echo/escape modes are runtime state, not inferred.
+        return " ".join(values) + ("\n" if newline else "")
+    if not values or values[0].startswith("-v"):
+        return None
+    if values[:1] == ["--"]:
+        values = values[1:]
+    if not values:
+        return None
+    fmt, values = values[0], values[1:]
+    # Only unmodified string conversions and literal format text. Recognized
+    # newline/backslash spelling is fixed data; other escapes/formats stay opaque.
+    if re.search(r"\\(?!n|\\)", fmt):
+        return None
+    fmt = fmt.replace("\\\\", "\x00").replace("\\n", "\n").replace("\x00", "\\")
+    pieces = re.split(r"(%[sb])", fmt)
+    if any("%" in text for text in pieces[::2]):
+        return None
+    if "%b" in pieces and any("\\" in value for value in values):
+        return None
+    conversions = len(pieces) // 2
+    if not conversions:
+        return fmt
+    output = []
+    while True:
+        output.append(pieces[0])
+        for i in range(conversions):
+            output.append(values.pop(0) if values else "")
+            output.append(pieces[2 * i + 2])
+        if not values:
+            return "".join(output)
+
+
+def _heredoc_source_process_operands(seg, lx, _outer_substitution=False):
+    """Actual standalone input-process filename feeding literal source/."""
+    records = [record for record in lx.literal_source_process_positions if record[0] is seg]
+    if len(records) != 1:
+        return []
+    _owner, index, prefix, direction, begin, close = records[0]
+    if (direction != "<" or prefix or lx.text[close + 1:close + 2] not in
+            ("", " ", "\t", "\n", ";", "|", "&", ")")):
+        return []
+    # Identity of this private marker proves the owning argument slot; no
+    # spelling search can bind a duplicate word from elsewhere in the source.
+    marker = "".join(["__mergepath_literal_", "source_process__"])
+    receiver = Segment(-1, None, False, seg.line)
+    receiver.words = _heredoc_literal_receiver_words(seg, lx, _outer_substitution)
+    receiver.words[index:index] = [marker]
+    cmd, _redir = resolve_command(receiver)
+    if cmd not in ("source", ".") or receiver._cmd_index is None:
+        return []
+    args = list(_command_arguments(receiver.words, receiver._cmd_index + 1))
+    if args and args[0][1] == "--":
+        args = args[1:]
+    if not args or args[0][0] is not marker:
+        return []
+    program = _heredoc_literal_emitter_program(lx.text[begin:close])
+    return [(program, receiver)] if program is not None else []
 
 
 def _shopt_expand_aliases_delta(seg):
@@ -3922,18 +4411,20 @@ def _shopt_expand_aliases_delta(seg):
     return True if "s" in flags else None
 
 
-def _heredoc_invoked_alias_has_positional(lx):
+def _heredoc_invoked_alias_has_positional(lx, _literal_output=None, _literal_helpers=frozenset()):
     """Literal emitter replacement source at a later enabled invocation.
 
     Reuse the existing alias emitter catalog, then apply the ordinary
     positional reader only to literal replacement text. This spends the
     existing child inventory rather than modeling runtime alias bindings.
     """
-    aliases = _alias_emitters(lx, set(), _HEREDOC_ALIAS_RE)
+    aliases = _alias_emitters(lx, _literal_helpers, _HEREDOC_ALIAS_RE)
     if not aliases:
         return False
     positional = {}
+    programs = {}
     definitions = []
+    trailing_wrappers = {}
     enabled = False
     enabled_at = None
     for ll in lx.logical:
@@ -3949,10 +4440,18 @@ def _heredoc_invoked_alias_has_positional(lx):
             elif cmd == "alias":
                 for literal in lits[1:]:
                     m = _HEREDOC_ALIAS_RE.match(literal) if literal is not None else None
-                    if m and m.group(1) in aliases:
-                        definitions.append((ll.first_line, m.group(1), _alias_target_commands(m.group(2))))
-                        if _word_has_verbatim_positional(m.group(2)):
-                            positional.setdefault(m.group(1), ll.first_line)
+                    if m:
+                        name, target = m.groups()
+                        definitions.append((ll.first_line, name, _alias_target_commands(target)))
+                        if name in aliases and _word_has_verbatim_positional(target):
+                            positional.setdefault(name, ll.first_line)
+                            programs.setdefault(name, set()).add(target)
+                        if target.endswith((" ", "\t")):
+                            replacement = Lexer(target)
+                            parts = [s for line in replacement.logical for s in line.segments if s.words]
+                            if (len(parts) == 1 and len(parts[0].words) == 1
+                                    and _unquote_command_word(parts[0].words[0]) in ("command", "builtin")):
+                                trailing_wrappers.setdefault(name, ll.first_line)
                 # The catalog already resolves literal alias targets to a
                 # fixed point. Carry positional evidence over those same
                 # edges, retaining every required definition-line boundary.
@@ -3964,12 +4463,37 @@ def _heredoc_invoked_alias_has_positional(lx):
                         required = [max(line, positional[h]) for h in heads if h in positional]
                         if required:
                             positional[name] = min(required)
+                            programs[name] = {program for head in heads if head in positional
+                                              for program in programs.get(head, ())}
                             grew = True
                     if not grew:
                         break
             elif (enabled and cmd in positional
                   and ll.first_line > max(positional[cmd], enabled_at)):
-                return True
+                if (_literal_output is None or any(_literal_output(seg, program)
+                        for program in programs.get(cmd, ()))):
+                    return True
+            elif enabled and seg._cmd_index is not None:
+                # A trailing blank on a literal command/builtin replacement
+                # makes the next written command word eligible. Walk only
+                # actual unquoted/unescaped words, bounded by this argument
+                # list; quoted aliases and safe argument prefixes stay inert.
+                words = list(_command_arguments(seg.words, seg._cmd_index))
+                i = 0
+                while i < len(words):
+                    raw, literal = words[i]
+                    if raw != literal:
+                        break
+                    if (literal in positional
+                            and ll.first_line > max(positional[literal], enabled_at)):
+                        if (_literal_output is None or any(_literal_output(seg, program)
+                                for program in programs.get(literal, ()))):
+                            return True
+                        break
+                    if (literal not in trailing_wrappers
+                            or ll.first_line <= max(trailing_wrappers[literal], enabled_at)):
+                        break
+                    i += 1
     return False
 
 
@@ -10451,6 +10975,189 @@ def _generated_corpus():
     return out
 
 
+# Owner-admitted sibling families: literal indexed roles, blank aliases and source inputs.
+CORPUS.extend([
+    ('helper-hd-siblings-printf-v-separate', 'flag', 'die(){ printf safe <<EOF\n$(declare -a a; printf -v \'a[1/$1]\' x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-printf-v-attached', 'flag', 'die(){ printf safe <<EOF\n$(declare -a a; printf -v\'a[1/$1]\' x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-printf-v-no-array-declaration', 'flag', 'die(){ printf safe <<EOF\n$(printf -v \'a[1/$1]\' x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-declare-plain', 'flag', 'die(){ printf safe <<EOF\n$(declare  \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-declare--g', 'flag', 'die(){ printf safe <<EOF\n$(declare -g \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-declare--a', 'flag', 'die(){ printf safe <<EOF\n$(declare -a \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-declare--ga', 'flag', 'die(){ printf safe <<EOF\n$(declare -ga \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-declare-with-array-declaration', 'flag', 'die(){ printf safe <<EOF\n$(declare -a a; declare \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-typeset-plain', 'flag', 'die(){ printf safe <<EOF\n$(typeset  \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-typeset--g', 'flag', 'die(){ printf safe <<EOF\n$(typeset -g \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-typeset--a', 'flag', 'die(){ printf safe <<EOF\n$(typeset -a \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-typeset--ga', 'flag', 'die(){ printf safe <<EOF\n$(typeset -ga \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-typeset-with-array-declaration', 'flag', 'die(){ printf safe <<EOF\n$(typeset -a a; typeset \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-let', 'clean', 'die(){ printf safe <<EOF\n$(let \'1/$1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-getopts', 'clean', 'die(){ printf safe <<EOF\n$(getopts x \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-wait-n-p', 'clean', 'die(){ printf safe <<EOF\n$(wait -n -p \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-read-a', 'clean', 'die(){ printf safe <<EOF\n$(read -a \'a[1/$1]\' <<<x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-readonly', 'clean', 'die(){ printf safe <<EOF\n$(readonly \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-export', 'clean', 'die(){ printf safe <<EOF\n$(export \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-printf-v-literal-index', 'clean', 'die(){ printf safe <<EOF\n$(printf -v \'a[1]\' x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-declare-value-data', 'clean', 'die(){ printf safe <<EOF\n$(declare \'a[1]="$1"\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-declare-p', 'clean', 'die(){ printf safe <<EOF\n$(declare -p \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-declare-f', 'clean', 'die(){ printf safe <<EOF\n$(declare -f \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-typeset-p', 'clean', 'die(){ printf safe <<EOF\n$(typeset -p \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-typeset-f', 'clean', 'die(){ printf safe <<EOF\n$(typeset -f \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-local-existing-covered', 'flag', 'die(){ printf safe <<EOF\n$(f(){ local \'a[1/$1]=x\'; }; f "$1")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-trailing-command', 'flag', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'command \'\nalias leak=\'echo "$1" >&2\'\nouter leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-trailing-command-builtin-two-hop', 'flag', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias o1=\'command \'\nalias o2=\'builtin \'\nalias leak=\'echo "$1" >&2\'\no1 o2 leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-trailing-builtin', 'flag', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'builtin \'\nalias leak=\'echo "$1" >&2\'\nouter leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-trailing-disabled', 'clean', 'die(){ printf safe <<EOF\n$(shopt -u expand_aliases\nalias outer=\'command \'\nalias leak=\'echo "$1" >&2\'\nouter leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-trailing-uninvoked', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'command \'\nalias leak=\'echo "$1" >&2\'\n: safe\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-trailing-same-line', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'command \'; alias leak=\'echo "$1" >&2\'; outer leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-trailing-forward-use', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'command \'\nouter leak\nalias leak=\'echo "$1" >&2\'\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-trailing-escaped', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'command \'\nalias leak=\'echo "$1" >&2\'\nouter \\leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-trailing-no-trailing-blank', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'command\'\nalias leak=\'echo "$1" >&2\'\nouter leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-trailing-safe-prefix', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\': \'\nalias leak=\'echo "$1" >&2\'\nouter leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-trailing-cycle', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'inner \'\nalias inner=\'outer \'\nouter safe\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-source-herestring-/dev/fd/0', 'flag', 'die(){ printf safe <<EOF\n$(source /dev/fd/0 <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-source-literal-process-printf', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-source-quiet-process-printf-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'printf safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-source-quiet-fd3', 'clean', 'die(){ printf safe <<EOF\n$(source /dev/fd/0 3<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-.-herestring-/dev/fd/0', 'flag', 'die(){ printf safe <<EOF\n$(. /dev/fd/0 <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-.-literal-process-printf', 'flag', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-.-quiet-process-printf-safe', 'clean', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'printf safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-.-quiet-fd3', 'clean', 'die(){ printf safe <<EOF\n$(. /dev/fd/0 3<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-nonconsumer-fd0', 'clean', 'die(){ printf safe <<EOF\n$(printf safe /dev/fd/0 <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-printf-v-quiet-quotedHD', 'clean', 'die(){ printf safe <<\'EOF\'\n$(printf -v \'a[1/$1]\' x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-declare-quiet-quotedHD', 'clean', 'die(){ printf safe <<\'EOF\'\n$(declare \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-trailing-quiet-quotedHD', 'clean', 'die(){ printf safe <<\'EOF\'\n$(shopt -s expand_aliases\nalias outer=\'command \'\nalias leak=\'echo "$1" >&2\'\nouter leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-fd0-quiet-quotedHD', 'clean', 'die(){ printf safe <<\'EOF\'\n$(source /dev/fd/0 <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-declare-existing-DATA', 'clean', 'die(){ printf safe <<EOF\n$(declare -a a[\'$1\']=value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-declare-mixed-index-quoting', 'flag', 'die(){ printf safe <<EOF\n$(declare -a a[1/\'$1\']=value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-typeset-mixed-index-quoting', 'flag', 'die(){ printf safe <<EOF\n$(typeset -a a[1/\'$1\']=value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-fd0-before-filename', 'flag', 'die(){ printf safe <<EOF\n$(source 0<<< \'echo "$1" >&2\' /dev/fd/0)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-fd0-before-command', 'flag', 'die(){ printf safe <<EOF\n$(0<<< \'echo "$1" >&2\' source /dev/fd/0)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-fd0-source-attached', 'flag', 'die(){ printf safe <<EOF\n$(source<<< \'echo "$1" >&2\' /dev/fd/0)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-fd0-filename-attached', 'flag', 'die(){ printf safe <<EOF\n$(source /dev/fd/0<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-trailing-quoted-nextword', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'command \'\nalias leak=\'echo "$1" >&2\'\nouter \'leak\'\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-trailing-tab', 'flag', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'command\t\'\nalias leak=\'echo "$1" >&2\'\nouter leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-printf-literal-format', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'echo "$1" >&2\\n\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-printf-b-no-escape', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%b\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-echo-e-no-escape', 'flag', 'die(){ printf safe <<EOF\n$(source <(echo -e \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-tee-literal-hs', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-cat-attached-zero-hs', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat 0<<<\'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-process-program-noop-positional', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \': "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-process-program-stdout-captured', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-devfd0-program-noop-positional', 'clean', 'die(){ printf safe <<EOF\n$(source /dev/fd/0 <<< \': "$1"\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-devfd0-program-stdout-captured', 'clean', 'die(){ printf safe <<EOF\n$(source /dev/fd/0 <<< \'echo "$1"\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-process-program-runtime-value', 'clean', 'die(){ printf safe <<EOF\n$(program=\'printf safe\'; source <(printf \'%s\\n\' "$program"))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-process-printf-assigned', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf -v output \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-process-other-filename', 'clean', 'die(){ printf safe <<EOF\n$(source /dev/null <(printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-process-prefix-path-concatenation', 'clean', 'die(){ printf safe <<EOF\n$(source prefix<(printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-process-suffix-path-concatenation', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\')suffix)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-cat-fd3-producer', 'clean', 'die(){ printf safe <<EOF\n$(source <(cat 3<<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-declare-associative-explicit', 'clean', 'die(){ printf safe <<EOF\n$(declare -A \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-printf-repeated-safe-last', 'clean', 'die(){ printf safe <<EOF\n$(declare -a a; printf -v \'a[1/$1]\' -v out x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-printf-repeated-indexed-last', 'flag', 'die(){ printf safe <<EOF\n$(declare -a a; printf -v out -v \'a[1/$1]\' x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-printf-s-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-printf-s-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-command-printf-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(command printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-command-printf-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(command printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-builtin-printf-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(builtin printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-builtin-printf-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(builtin printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-path-printf-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(/usr/bin/printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-path-printf-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(/usr/bin/printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-echo-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(echo \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-echo-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(echo \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-echo-n-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(echo -n \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-echo-n-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(echo -n \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-path-echo-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(/bin/echo \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-path-echo-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(/bin/echo \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-cat-here-string-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-cat-here-string-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(cat <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-cat-quoted-hd-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat <<\'PROGRAM\'\necho "$1" >&2\nPROGRAM\n))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-cat-quoted-hd-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(cat <<\'PROGRAM\'\necho "$1" >&2\nPROGRAM\n))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-nonconsumer-cat', 'clean', 'die(){ printf safe <<EOF\n$(cat <(echo \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-nonconsumer-printf', 'clean', 'die(){ printf safe <<EOF\n$(printf safe <(printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-safe-source-echo', 'clean', 'die(){ printf safe <<EOF\n$(source <(echo \'printf safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-safe-dot-cat', 'clean', 'die(){ printf safe <<EOF\n$(. <(cat <<< \'printf safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-routing-saved-fd-overwrite-leak', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'((1/$1)) 3>&2 2>/dev/null 2>&3\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-direct-stdout-fd2-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-helper-stderr-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f "$1" 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-stderr-null', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'shopt -s expand_aliases\nalias leak=\'"\'"\'echo "$1" >&2\'"\'"\'\nleak 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-dup-to-fd2-null-before', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" 2>/dev/null >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-dup-to-fd2-null-after', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-quoted-redirection-data', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" \'"\'"\'2>/dev/null\'"\'"\'\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-uninvoked-helper-two-statements', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ :; echo "$1" >&2; }; :\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-uninvoked-helper-arithmetic', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ ((1/$1)); }; :\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-helper-index-diagnostic', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ printf -v \'"\'"\'a[1/$1]\'"\'"\' x; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-to-helper', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; shopt -s expand_aliases\nalias leak=\'"\'"\'f "$1"\'"\'"\'\nleak\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-program-xtrace', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'set -x; : "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-program-xtrace-self-null', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'set -x; : "$1" 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-program-xtrace-future', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo safe; : "$1"; set -x\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-stdout-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1"\') 2>/dev/null)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-printf-index-stderr-null', 'clean', 'die(){ printf safe <<EOF\n$(declare -a a; printf -v \'a[1/$1]\' x 2>/dev/null)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-declare-index-stderr-null', 'clean', 'die(){ printf safe <<EOF\n$(declare \'a[1/$1]=x\' 2>/dev/null)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-typeset-index-stderr-null', 'clean', 'die(){ printf safe <<EOF\n$(typeset \'a[1/$1]=x\' 2>/dev/null)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-stdout-dot', 'clean', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'echo "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-colon-dot', 'clean', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \': "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-assign-printf-source', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'printf -v x %s "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-assign-printf-dot', 'clean', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'printf -v x %s "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-stdout-source', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'shopt -s expand_aliases\nalias leak=\'"\'"\'echo "$1"\'"\'"\'\nleak\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-stdout-dot', 'clean', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'shopt -s expand_aliases\nalias leak=\'"\'"\'echo "$1"\'"\'"\'\nleak\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-stderr-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'shopt -s expand_aliases\nalias leak=\'"\'"\'echo "$1" >&2\'"\'"\'\nleak\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-stderr-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'shopt -s expand_aliases\nalias leak=\'"\'"\'echo "$1" >&2\'"\'"\'\nleak\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-func-stdout-source', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1"; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-func-stdout-dot', 'clean', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'f(){ echo "$1"; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-func-stderr-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-func-stderr-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-arith-null-source', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'((1/$1)) 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-arith-null-dot', 'clean', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'((1/$1)) 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-index-null-source', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'declare -a a; printf -v \'"\'"\'a[1/$1]\'"\'"\' x 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-index-null-dot', 'clean', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'declare -a a; printf -v \'"\'"\'a[1/$1]\'"\'"\' x 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-nested-capture-source', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'x=$(echo "$1")\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-nested-capture-dot', 'clean', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'x=$(echo "$1")\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-duplicate-last-safe', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f "$1"; f(){ :; }\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-duplicate-first-safe', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ :; }; f(){ echo "$1" >&2; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-literal-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\') safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-token-first', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\') "$1")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-index-mismatch', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$2" >&2\') "$1" safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-second-token', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$2" >&2\') safe "$1")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-helper-repeated-safe', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f safe; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-helper-quoted-guard-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "${1:+fixed}" >&2; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-override-before-call-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f(){ :; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-emit-uninvoked-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; :\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-false-safe-redefinition-leak', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; if false; then f(){ :; }; fi; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-later-emitter-definition-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ :; }; f "$1"; f(){ echo "$1" >&2; }\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-expansion-self-null', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$((1/$1))" 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-command-other-null', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \': 2>/dev/null; ((1/$1))\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-command-overwritten-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'((1/$1)) 2>/dev/null 2>/dev/stderr\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-function-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-function-uninvoked', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; : safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-function-cyclic', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ g "$1"; }; g(){ f "$1"; }; : safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-function-index-mismatch', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-function-index2-positive', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f safe "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-function-index1-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f safe "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-uninvoked', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'shopt -s expand_aliases\nalias leak=\'"\'"\'echo "$1" >&2\'"\'"\'\n: safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-disabled', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'shopt -u expand_aliases\nalias leak=\'"\'"\'echo "$1" >&2\'"\'"\'\nleak\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-cycle', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'shopt -s expand_aliases\nalias outer=inner\nalias inner=outer\nouter safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-chain', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'shopt -s expand_aliases\nalias outer=inner\nalias inner=\'"\'"\'echo "$1" >&2\'"\'"\'\nouter\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-command-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'((1/$1))\') 2>/dev/null)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-expansion-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$((1/$1))"\') 2>/dev/null)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-empty-arg', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\') \'\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-safe-quoted-close', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\') \'safe)\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-safe-escaped-close', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\') safe\\))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-multiple-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\') safe other)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-token-arg', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\') "$GH_TOKEN")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-token-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\') safe "$GH_TOKEN")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-trace-sibling-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'(set -x); : "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-trace-child-leak', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'(set -x; : "$1")\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-trace-disable-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'set -x\nset +x\n: "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-null-quoted-path-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" "2>/dev/null"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-helper-index-null-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ printf -v \'"\'"\'a[1/$1]\'"\'"\' x; }; f "$1" 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-helper-arith-null-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ ((1/$1)); }; f "$1" 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-chain-null-after-leak', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'shopt -s expand_aliases\nalias last=\'"\'"\'echo "$1" >&2\'"\'"\'\nalias first=last\nfirst 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-nonconsumer-trace-quiet', 'clean', 'die(){ printf safe <<EOF\n$(printf safe <(printf \'%s\\n\' \'set -x; : "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
 CORPUS.extend(_generated_corpus())
 
 # Disagreements with the oracle, DECLARED.  Each entry is a corpus id and the
@@ -10622,6 +11329,11 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    'helper-hd-routing-receiver-index-mismatch': 'The sampled source receiver positional-index mismatch is quiet. The published scanner already flags the outer credential argument; its conservative ordinary source reading remains unchanged and does not infer runtime parameter binding (#1496).',
+    'helper-hd-routing-override-before-call-quiet': 'The sampled safe redefinition or later emitting definition is quiet. Owner decision https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6138172803 retains every recognized helper body conservatively, without runtime function lookup, definition dominance or branch execution.',
+    'helper-hd-routing-later-emitter-definition-quiet': 'The sampled safe redefinition or later emitting definition is quiet. Owner decision https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6138172803 retains every recognized helper body conservatively, without runtime function lookup, definition dominance or branch execution.',
+    'helper-hd-routing-receiver-token-second': 'The sampled source receiver positional-index mismatch is quiet. The published scanner already flags the outer credential argument; its conservative ordinary source reading remains unchanged and does not infer runtime parameter binding (#1496).',
+
     'helper-hd-round11-prefix-arithmetic-after-redir': 'The sampled redirection-prefixed arithmetic command is rejected by Bash before positional evaluation. Existing source-only prefix classification conservatively inventories its bounded arithmetic operand without a compound-command grammar/evaluation model (#1496).',
     'helper-hd-round11-assignment-nested': 'The sampled nested index or assignment prefix evaluates quietly. Actual arithmetic operand inventory retains possible diagnostics without proving runtime binding or evaluation order (#1496).',
     'helper-hd-round11-assignment-prefix': 'The sampled nested index or assignment prefix evaluates quietly. Actual arithmetic operand inventory retains possible diagnostics without proving runtime binding or evaluation order (#1496).',
