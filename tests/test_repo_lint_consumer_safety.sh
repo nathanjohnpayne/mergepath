@@ -543,10 +543,36 @@ echo "test_repo_lint_consumer_safety: running $WIRED_COUNT wired checks against 
 # wrapper selection (a partial deep lane replays only the selected
 # wrappers; the complete replay admits them all) and the shard
 # (REPO_LINT_SHARD="<index>/<count>" splits the complete replay over
-# independent legs). The ordinal is the wrapper's position in the sorted
-# WIRED list, so every shard numbers the same wrapper the same way and the
-# shards partition the set exactly.
+# independent legs). The ordinal is the wrapper's position in REPLAY_ORDER,
+# so every shard numbers the same wrapper the same way and the shards
+# partition the set exactly.
+#
+# REPLAY_ORDER is the sorted WIRED list with the measured-heavy wrappers
+# moved to the front, in descending cost. Round-robin over a list whose
+# heavy members sit first spreads them one per shard (the LPT heuristic);
+# plain alphabetical round-robin put check_codex_scripts (164s) and
+# check_gh_as_author (144s) on the same shard, 604s against 229s for the
+# lightest (PR #2172 run 38451869092). Costs are the consumer-fixture
+# replay times from that run; a wrapper named here but not wired is
+# ignored, and a new heavy wrapper simply joins the sorted tail until it
+# is measured and listed.
 # ---------------------------------------------------------------------------
+REPLAY_HEAVY=(
+  check_codex_scripts               # 164s
+  check_gh_as_author                # 144s
+  check_review_feedback_accounting  # 107s
+  check_codex_p1_gate               #  85s
+  check_git_identity_hygiene        #  49s
+  check_op_preflight_contract       #  41s
+)
+REPLAY_ORDER=""
+for heavy in "${REPLAY_HEAVY[@]}"; do
+  if grep -Fxq "$heavy" <<<"$WIRED"; then
+    REPLAY_ORDER="${REPLAY_ORDER}${heavy}"$'\n'
+  fi
+done
+REPLAY_ORDER="${REPLAY_ORDER}$(grep -Fxv -f <(printf '%s\n' "${REPLAY_HEAVY[@]}") <<<"$WIRED" || true)"
+
 REPLAYED=0
 ordinal=-1
 while IFS= read -r name; do
@@ -581,7 +607,7 @@ while IFS= read -r name; do
     fail "$name: exit $rc on the consumer fixture — would red every consumer repo-lint. Output tail:"
     echo "$out" | tail -15 >&2
   fi
-done <<< "$WIRED"
+done <<< "$REPLAY_ORDER"
 echo "test_repo_lint_consumer_safety: replayed $REPLAYED of $WIRED_COUNT wired checks (selection full=$REPO_LINT_SELECTION_FULL, shard $REPO_LINT_SELECTION_SHARD)"
 
 # ---------------------------------------------------------------------------

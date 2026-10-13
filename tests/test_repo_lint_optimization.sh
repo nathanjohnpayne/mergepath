@@ -1122,18 +1122,35 @@ for harness in "$CONSUMER_HARNESS" "$RESIDUE_HARNESS"; do
   fi
 done
 
-# The replay loop numbers wrappers in the sorted WIRED order and asks the
-# shared shard selector before running one, so the three replay legs
-# partition the set the way the selector's own tests prove.
+# The replay loop numbers wrappers in REPLAY_ORDER (measured-heavy wrappers
+# first, then the sorted WIRED tail) and asks the shared shard selector
+# before running one, so the three replay legs partition the set the way the
+# selector's own tests prove and the heavy wrappers land one per shard.
 if [ ! -f "$CONSUMER_HARNESS" ]; then
   : # consumer checkout: the hub-only replay harness is deliberately absent
-elif sed -n '/^while IFS= read -r name; do$/,/^done <<< "\$WIRED"$/p' "$CONSUMER_HARNESS" \
-       | grep -Fq 'repo_lint_shard_owns "$ordinal"' \
-     && sed -n '/^while IFS= read -r name; do$/,/^done <<< "\$WIRED"$/p' "$CONSUMER_HARNESS" \
-       | grep -Fq 'ordinal=$((ordinal + 1))'; then
-  pass "the consumer replay loop shards wired wrappers through the shared shard selector"
+elif replay_loop=$(sed -n '/^while IFS= read -r name; do$/,/^done <<< "\$REPLAY_ORDER"$/p' "$CONSUMER_HARNESS") \
+     && grep -Fq 'repo_lint_shard_owns "$ordinal"' <<<"$replay_loop" \
+     && grep -Fq 'ordinal=$((ordinal + 1))' <<<"$replay_loop" \
+     && sed -n '/^REPLAY_HEAVY=(/,/^)/p' "$CONSUMER_HARNESS" | grep -Fq 'check_codex_scripts' \
+     && sed -n '/^REPLAY_HEAVY=(/,/^)/p' "$CONSUMER_HARNESS" | grep -Fq 'check_gh_as_author'; then
+  pass "the consumer replay loop shards REPLAY_ORDER (heavy wrappers first) through the shared shard selector"
 else
-  fail "tests/test_repo_lint_consumer_safety.sh must number wired wrappers and consult repo_lint_shard_owns inside the replay loop"
+  fail "tests/test_repo_lint_consumer_safety.sh must order heavy wrappers first, number them, and consult repo_lint_shard_owns inside the replay loop"
+fi
+
+# The heavy-first order must actually separate the two heaviest wrappers
+# over three shards: with REPLAY_HEAVY listed in cost order, ordinals 0 and
+# 1 are owned by shards 1 and 2 respectively. Executed against the real
+# selector rather than assumed from the list.
+if [ -f "$CONSUMER_HARNESS" ] && [ -f "$SELECTION_HELPER" ]; then
+  first_heavy=$(sed -n '/^REPLAY_HEAVY=(/,/^)/p' "$CONSUMER_HARNESS" | grep -o 'check_[a-z0-9_]*' | head -2 | tr '\n' ' ')
+  if [ "$first_heavy" = "check_codex_scripts check_gh_as_author " ] \
+     && REPO_LINT_SHARD=1/3 bash -c '. "$1"; repo_lint_shard_owns 0 && ! repo_lint_shard_owns 1' _ "$SELECTION_HELPER" \
+     && REPO_LINT_SHARD=2/3 bash -c '. "$1"; repo_lint_shard_owns 1 && ! repo_lint_shard_owns 0' _ "$SELECTION_HELPER"; then
+    pass "the two heaviest replay wrappers land on different shards"
+  else
+    fail "REPLAY_HEAVY must list check_codex_scripts then check_gh_as_author first so round-robin puts them on shards 1 and 2 (got '$first_heavy')"
+  fi
 fi
 
 if sed -n '/Stale-ratchet sweep/,/Same ratchet/p' "$RESIDUE_HARNESS" \
