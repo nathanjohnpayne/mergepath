@@ -2117,11 +2117,10 @@ paths:
   - path: .github/workflows/codex-p1-gate.yml
     type: canonical
     consumers: all
-    # The workflow's only job runs `scripts/codex-p1-gate.sh` directly
-    # (see the `Run scripts/codex-p1-gate.sh` step). Propagating the
-    # workflow without the script makes the gate fail-closed on
-    # `command not found` for every PR in the consumer.
+    # Event and scheduled producers share the bounded snapshot driver.
+    # Deliver its gate and full fingerprint dependencies atomically.
     requires:
+      - "scripts/workflow/codex-p1-snapshot-retry.py" # #1825, bounded native recovery
       - "scripts/lib/feedback-archive-identities.sh"   # #1437, retained source eligibility and bounds
       - "scripts/workflow/verified-relay-markers.py"   # #1546, publisher-run provenance verification
       - ".github/workflows/codex-feedback-archive-relay.yml"   # #1000, privileged read-only fork/Dependabot archive persistence
