@@ -43,7 +43,8 @@
 # push remote is another repository (a fork), and is refused when the branch
 # has no push remote; --base defaults to the branch's gh-merge-base, then the
 # repository's default branch, as gh does. --delete-branch deletes the remote
-# head ref and the local branch, unless that branch is checked out. Repeatable options also take comma-separated
+# head ref only: gh skips the local branch whenever --repo is given, and this
+# grammar always takes --repo. Repeatable options also take comma-separated
 # values, as gh does. Refused: short options, --web, --editor, --edit-last,
 # --create-if-none, @me, org/team reviewers, `--body-file -`, a URL or branch
 # where N is expected, and any option not listed. Every other `gh pr …` or
@@ -148,42 +149,24 @@ gh_transport_select() {
 
 # --- caller-supplied credential re-routing (#1542) ----------------------------
 
-gh_payload_check_repo_arg() { # <label> <value>
-  case "$2" in
-    */*/*)
-      echo "$1: refusing a host-qualified --repo ('$2'): guarded writes go to github.com only, where the token was verified; pass OWNER/REPO (#1542)." >&2
-      return 1
-      ;;
-  esac
-  return 0
-}
-
-gh_payload_check_header_arg() { # <label> <value>
-  if [[ "$2" =~ ^[[:space:]]*[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn][[:space:]]*: ]]; then
-    echo "$1: refusing an explicit Authorization header: gh would send it in place of the verified token (#1542)." >&2
-    return 1
-  fi
-  return 0
-}
-
-gh_payload_check_endpoint_arg() { # <label> <value>
-  case "$2" in
-    http://*|https://*|HTTP://*|HTTPS://*)
-      case "$2" in
-        https://api.github.com/*|https://api.github.com) return 0 ;;
-      esac
-      echo "$1: refusing an api endpoint on another host ('$2'): guarded writes go to api.github.com only (#1542)." >&2
-      return 1
-      ;;
-  esac
-  return 0
+# gh_payload_is_hosted_repo <value>: 0 iff <value> is HOST/OWNER/REPO with a
+# dotted host (github.com, *.ghe.com, github.localhost and the like).
+gh_payload_is_hosted_repo() {
+  [[ "$1" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+/[^/[:space:]]+/[^/[:space:]]+$ ]]
 }
 
 # gh_payload_refuse_credential_overrides <label> <gh argv...>
 # Exit 0 when argv carries none of the arguments that would send the verified
 # token to another host or replace it; otherwise explain and exit 1.
+#
+# Every argument is checked on its own, whatever precedes it. Following which
+# options consume the next argument would mean enumerating gh's value-taking
+# options, and an argument the enumeration misses shifts every later one:
+# `--preview --header --header 'Authorization: ...'` hid the real header from
+# a positional check (Codex on #2178). Checking each argument by its shape
+# instead can only over-refuse, never miss.
 gh_payload_refuse_credential_overrides() {
-  local label="$1" is_api=0 arg expect_header=0 expect_repo=0
+  local label="$1" is_api=0 arg prev="" value
   shift
   case "${1:-}" in gh|*/gh) ;; *) return 0 ;; esac
   shift
@@ -193,34 +176,55 @@ gh_payload_refuse_credential_overrides() {
       return 1
       ;;
   esac
-  [ "${1:-}" = "api" ] && is_api=1
-  while [ "$#" -gt 0 ]; do
-    arg="$1"
-    shift
-    if [ "$expect_header" -eq 1 ]; then
-      expect_header=0
-      gh_payload_check_header_arg "$label" "$arg" || return 1
-      continue
-    fi
-    if [ "$expect_repo" -eq 1 ]; then
-      expect_repo=0
-      gh_payload_check_repo_arg "$label" "$arg" || return 1
-      continue
-    fi
+  for arg in "$@"; do
+    [ "$arg" != "api" ] || is_api=1
+  done
+  for arg in "$@"; do
     case "$arg" in
       --hostname|--hostname=*)
         echo "$label: refusing --hostname: guarded writes go to github.com only, where the token was verified (#1542)." >&2
         return 1
         ;;
-      -R|--repo) expect_repo=1 ;;
-      --repo=*) gh_payload_check_repo_arg "$label" "${arg#--repo=}" || return 1 ;;
-      -R?*) gh_payload_check_repo_arg "$label" "${arg#-R}" || return 1 ;;
-      -H|--header) [ "$is_api" -eq 0 ] || expect_header=1 ;;
-      --header=*) [ "$is_api" -eq 0 ] || { gh_payload_check_header_arg "$label" "${arg#--header=}" || return 1; } ;;
-      -H?*) [ "$is_api" -eq 0 ] || { gh_payload_check_header_arg "$label" "${arg#-H}" || return 1; } ;;
-      -*) ;;
-      *) [ "$is_api" -eq 0 ] || { gh_payload_check_endpoint_arg "$label" "$arg" || return 1; } ;;
     esac
+    value=""
+    case "$arg" in
+      --repo=*) value="${arg#--repo=}" ;;
+      -R?*) value="${arg#-R}"; value="${value#=}" ;;
+    esac
+    case "$prev" in --repo|-R) value="$arg" ;; esac
+    case "$value" in
+      */*/*)
+        echo "$label: refusing a host-qualified --repo ('$value'): guarded writes go to github.com only, where the token was verified; pass OWNER/REPO (#1542)." >&2
+        return 1
+        ;;
+    esac
+    if gh_payload_is_hosted_repo "$arg"; then
+      echo "$label: refusing the host-qualified repository '$arg': whatever option it belongs to, gh could send the verified token to that host; pass OWNER/REPO (#1542)." >&2
+      return 1
+    fi
+    if [ "$is_api" -eq 1 ]; then
+      value="$arg"
+      case "$value" in
+        --header=*) value="${value#--header=}" ;;
+        -H?*) value="${value#-H}" ;;
+      esac
+      if [[ "$value" =~ ^[[:space:]]*[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn][[:space:]]*: ]]; then
+        echo "$label: refusing an explicit Authorization header: gh would send it in place of the verified token (#1542)." >&2
+        return 1
+      fi
+      case "$arg" in
+        [Hh][Tt][Tt][Pp]://*|[Hh][Tt][Tt][Pp][Ss]://*)
+          case "$arg" in
+            https://api.github.com/*|https://api.github.com) ;;
+            *)
+              echo "$label: refusing an api endpoint on another host ('$arg'): guarded writes go to api.github.com only (#1542)." >&2
+              return 1
+              ;;
+          esac
+          ;;
+      esac
+    fi
+    prev="$arg"
   done
   return 0
 }
@@ -1082,18 +1086,10 @@ gh_rest_pr_close() {
     else
       gh_rest_err "PR #$number is closed; its head branch is on another repository (${head_repo:-unknown}) and was not deleted."
     fi
-    # gh also deletes the local branch. A checked-out branch is left alone and
-    # reported: switching this session's checkout is not this write's to do.
-    if [ -n "$head_ref" ] && git show-ref --verify --quiet "refs/heads/$head_ref" 2>/dev/null; then
-      if [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)" = "$head_ref" ]; then
-        gh_rest_err "local branch $head_ref is checked out here, so it was not deleted; switch away and run git branch -D $head_ref."
-      elif git branch -D "$head_ref" >/dev/null 2>&1; then
-        gh_rest_err "deleted local branch $head_ref."
-      else
-        gh_rest_err "PR #$number is closed, but local branch $head_ref could not be deleted."
-        return 1
-      fi
-    fi
+    # No local branch is deleted. gh skips local deletion whenever --repo is
+    # given, because the checkout may belong to another repository with a
+    # same-named branch, and this grammar always takes --repo (Codex on #2178).
+    gh_rest_err "no local branch was deleted: as gh does when --repo is given, only the remote head ref is."
   fi
   gh_rest_err "Closed pull request #$number ($url)"
   return 0

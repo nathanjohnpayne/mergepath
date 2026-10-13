@@ -838,27 +838,20 @@ else
   fail "pr close fork head: rc=$rc"; cat "$LOGF" "$WORKDIR/err" >&2
 fi
 
-# --delete-branch also deletes the local branch, as gh does, unless it is
-# the branch checked out here.
+# --delete-branch never deletes a local branch: gh skips that whenever --repo
+# is given, and the checkout may hold another repository's same-named branch.
 git -C "$GITREPO" branch feature
 new_case
 set +e
 RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr close 42 --repo o/r --delete-branch >/dev/null 2>"$WORKDIR/err"; rc=$?
 set -e
-if [ "$rc" -eq 0 ] && ! git -C "$GITREPO" show-ref --verify --quiet refs/heads/feature && grep -q 'deleted local branch feature' "$WORKDIR/err"; then
-  pass "pr close --delete-branch: the local branch is deleted too"
+if [ "$rc" -eq 0 ] && git -C "$GITREPO" show-ref --verify --quiet refs/heads/feature \
+   && log_has $'DELETE\trepos/o/r/git/refs/heads/feature' && grep -q 'no local branch was deleted' "$WORKDIR/err"; then
+  pass "pr close --delete-branch: the remote ref is deleted and a same-named local branch is left, as gh does with --repo"
 else
-  fail "pr close local delete: rc=$rc"; cat "$WORKDIR/err" >&2
+  fail "pr close local branch kept: rc=$rc"; cat "$WORKDIR/err" >&2
 fi
-new_case
-set +e
-RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest STUB_PR_HEAD_REF=topic/z as_author -- gh pr close 42 --repo o/r --delete-branch >/dev/null 2>"$WORKDIR/err"; rc=$?
-set -e
-if [ "$rc" -eq 0 ] && git -C "$GITREPO" show-ref --verify --quiet refs/heads/topic/z && grep -q 'local branch topic/z is checked out here, so it was not deleted' "$WORKDIR/err"; then
-  pass "pr close --delete-branch: a checked-out local branch is kept and reported"
-else
-  fail "pr close checked-out branch: rc=$rc"; cat "$WORKDIR/err" >&2
-fi
+git -C "$GITREPO" branch -D feature >/dev/null
 new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_EVENT_ACTOR='claude[bot]' as_author -- gh pr close 42 --repo o/r 2>&1 >/dev/null)"; rc=$?
@@ -987,6 +980,12 @@ override_refused "Authorization header on gh api" as_reviewer gh api -H 'Authori
 override_refused "Authorization header, long attached form" as_reviewer gh api --header='authorization: Bearer x' repos/o/r
 override_refused "Authorization header, short attached form" as_reviewer gh api -HAuthorization:x repos/o/r
 override_refused "gh api endpoint on another host" as_reviewer gh api https://evil.example/repos/o/r/issues/1/comments -f body=x
+# Option values cannot hide a re-routing argument: each argument is checked on
+# its own, so a value-taking option in front cannot shift the real one.
+override_refused "Authorization header behind a --preview value" as_reviewer gh api repos/o/r/issues/1/comments --preview --header --header 'Authorization: Bearer x' -f body=x
+override_refused "host-qualified repo behind a --body value" as_reviewer gh pr comment 1 --body --repo --repo tenant.ghe.com/o/r
+override_refused "host-qualified repo behind a -H value on pr create" as_author gh pr create -H --repo --repo github.localhost/o/r --title t --body-file /dev/null
+override_refused "Authorization header behind a --jq value" as_reviewer gh api repos/o/r --jq --header --header 'authorization:x'
 for t in gh rest; do
   new_case
   set +e
@@ -1008,6 +1007,15 @@ else
   fail "plain GH_REPO: rc=$rc"; cat "$LOGF" >&2
 fi
 
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest as_reviewer -- gh pr comment 1 --repo o/r --body https://example.com/a/b >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/issues/1/comments'; then
+  pass "a URL in a pr comment body is not mistaken for an api endpoint or a hosted repo"
+else
+  fail "url body false positive: rc=$rc"; cat "$LOGF" >&2
+fi
 new_case
 set +e
 MERGEPATH_GH_TRANSPORT=gh as_author -- gh pr create -H feature --title t --body-file "$VALID_BODY" >/dev/null 2>&1; rc=$?
