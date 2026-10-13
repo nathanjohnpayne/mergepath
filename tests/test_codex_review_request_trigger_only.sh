@@ -105,6 +105,8 @@ old='2026-06-03T00:00:00Z'
 [ "${1:-}" = "api" ] || { echo "unexpected gh command: $*" >&2; exit 99; }
 shift
 [ "${1:-}" = "--paginate" ] && shift
+# The #2166 check-runs read is `gh api -X GET <endpoint> -f check_name=... -F per_page=100`.
+[ "${1:-}" = "-X" ] && shift 2
 endpoint=${1:-}
 case "$endpoint" in
   repos/owner/repo/pulls/999)            jq -cn --arg h "$head_sha" '{head:{sha:$h},base:{ref:"main",sha:"base-sha",repo:{default_branch:"main"}}}' ;;
@@ -116,7 +118,7 @@ case "$endpoint" in
     fi
     cat "$CODEX_TEST_STATE_DIR/base-review-policy.yml"
     ;;
-  repos/owner/repo/commits/*/check-runs*)
+  repos/owner/repo/commits/*/check-runs)
     # #2166 moving-head guard: the `lint-fast`-scheduled signal. Default is the
     # ordinary production shape (a completed run) so the guard passes on
     # every pre-existing case through its intended branch, not the
@@ -128,6 +130,10 @@ case "$endpoint" in
       # The deep `lint` job alone must not satisfy the default: it is created
       # only after its predecessors finish, which is not the signal.
       deeplint)   printf '{"total_count":1,"check_runs":[{"id":1,"name":"lint","status":"queued"}]}\n' ;;
+      # Push-dispatch anchor: two runs of the check (the first dispatch and a
+      # later rerun); the EARLIEST started_at is the push time.
+      dispatched) jq -cn --arg a "${CODEX_TEST_CHECK_STARTED:?}" --arg b "${CODEX_TEST_CHECK_RERUN:-$CODEX_TEST_CHECK_STARTED}" \
+                    '{total_count:2,check_runs:[{id:7,name:"lint-fast",status:"completed",started_at:$b},{id:5,name:"lint-fast",status:"completed",started_at:$a}]}' ;;
       garbage)    printf 'not json\n' ;;
       *)          jq -cn --arg st "${CODEX_TEST_CHECK_RUNS:-completed}" '{total_count:1,check_runs:[{id:1,name:"lint-fast",status:$st}]}' ;;
     esac ;;
@@ -1356,6 +1362,58 @@ test_guard_applies_in_polling_mode() {
   [ "$FAIL" -ne "$before" ] || pass "MH10: the guard refuses in polling mode too"
 }
 
+# MH11 (Codex P2 on #2175): the age signal is anchored on the PUSH, not only
+# on the commit. An ordinary push of a commit created an hour earlier must read
+# as a fresh head while its required check was dispatched a minute ago.
+test_guard_anchors_on_push_dispatch() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-dispatch-recent")
+  rc=$(CODEX_TEST_CHECK_STARTED="$YOUNG_HEAD" CODEX_TEST_CHECK_RERUN="$(jq -rn 'now - 5 | floor | todate')" \
+    run_guard "$dir" fresh "$OLD_HEAD" dispatched "" --trigger-only)
+  [ "$rc" = "8" ] || fail "MH11: an old commit pushed a minute ago must be refused (exit 8), got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "0" ] || fail "MH11: expected 0 posts, got $(trig_count "$dir")"
+  [ "$(jqf "$dir" '.moving_head.reasons | join(",")')" = "head-age" ] || fail "MH11: reasons=$(jqf "$dir" '.moving_head.reasons'), expected [head-age]"
+  [ "$(jqf "$dir" '.moving_head.head_pushed_at')" = "$YOUNG_HEAD" ] || fail "MH11: anchor=$(jqf "$dir" '.moving_head.head_pushed_at'), expected the EARLIEST dispatch $YOUNG_HEAD (not the rerun, not the commit date)"
+  grep -q 'source: earliest .lint-fast. run on HEAD' "$dir/err.log" || fail "MH11: the push-dispatch anchor source must be logged"
+  # A dispatch OLDER than the commit date never makes a head look older: the
+  # later of the two governs.
+  dir=$(make_case "guard-dispatch-older")
+  rc=$(CODEX_TEST_CHECK_STARTED="$(jq -rn 'now - 7200 | floor | todate')" \
+    run_guard "$dir" fresh "$YOUNG_HEAD" dispatched "" --trigger-only)
+  [ "$rc" = "8" ] && [ "$(jqf "$dir" '.moving_head.head_pushed_at')" = "$YOUNG_HEAD" ] \
+    || fail "MH11b: an older dispatch must not override a younger commit anchor (rc=$rc anchor=$(jqf "$dir" '.moving_head.head_pushed_at'))"
+  # Old commit, old dispatch: a settled head posts.
+  dir=$(make_case "guard-dispatch-settled")
+  rc=$(CODEX_TEST_CHECK_STARTED="$OLD_HEAD" run_guard "$dir" fresh "$OLD_HEAD" dispatched "" --trigger-only)
+  [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "1" ] || fail "MH11c: a settled head must post (rc=$rc posts=$(trig_count "$dir"))"
+  [ "$FAIL" -ne "$before" ] || pass "MH11: the age signal is anchored on the push dispatch (earliest required-check run), not only the commit date"
+}
+
+# MH12 (Codex P2 on #2175): the policy is read from the SCRIPT's checkout.
+# Launched from a subdirectory, or by absolute path from another directory,
+# a cwd-relative read found no policy and silently restored
+# request_by_default: true. Under-threshold (not gated) + false => exit 5.
+test_policy_resolved_from_script_checkout() {
+  local dir rc before=$FAIL
+  dir=$(make_case "policy-subdir")
+  printf '  request_by_default: false\n' >>"$dir/.github/review-policy.yml"
+  rc=0
+  ( cd "$dir/scripts" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
+      CODEX_TEST_SCENARIO=fresh ./codex-review-request.sh --trigger-only 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
+  [ "$rc" = "5" ] && [ "$(trig_count "$dir")" = "0" ] \
+    || fail "MH12: run from scripts/, request_by_default: false must skip with exit 5 (rc=$rc posts=$(trig_count "$dir")); err=$(cat "$dir/err.log")"
+  dir=$(make_case "policy-foreign-cwd")
+  printf '  request_by_default: false\n' >>"$dir/.github/review-policy.yml"
+  rc=0
+  ( cd "$WORKDIR" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
+      CODEX_TEST_SCENARIO=fresh "$dir/scripts/codex-review-request.sh" --trigger-only 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
+  [ "$rc" = "5" ] && [ "$(trig_count "$dir")" = "0" ] \
+    || fail "MH12b: by absolute path from a foreign cwd, request_by_default: false must skip with exit 5 (rc=$rc posts=$(trig_count "$dir"))"
+  [ "$FAIL" -ne "$before" ] || pass "MH12: the requester reads the policy from its own checkout, not the caller cwd"
+}
+
 test_fresh_posts_once_no_poll
 test_dup_author_skips
 test_uppercase_author_command_skips
@@ -1402,6 +1460,8 @@ test_guard_policy_knobs_disable_signals
 test_guard_exempts_automatic_caller
 test_guard_does_not_run_on_no_write_paths
 test_guard_applies_in_polling_mode
+test_guard_anchors_on_push_dispatch
+test_policy_resolved_from_script_checkout
 
 echo "----"
 echo "test_codex_review_request_trigger_only: $PASS passed, $FAIL failed"

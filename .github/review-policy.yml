@@ -268,15 +268,16 @@ coderabbit:
 
   # Whether the AGENT blocks in Phase 2.5 for CodeRabbit's review of the
   # current head before proceeding to Phase 3 (#2166). Default false: Phase
-  # 2.5 is NON-BLOCKING. The agent used to hold for up to max_wait_seconds
-  # plus post_clearance_max_wait_seconds while the required `CodeRabbit
-  # unresolved blocking findings` check already enforced every p0/p1 finding
-  # on the merge head; the wait bought no safety the gate does not provide
-  # and was a measurable share of every review round on a large PR.
-  # Findings that arrive are still dispositioned before merge (the
-  # pre-merge conversation gate and the accounting gate block on them), and
-  # scripts/coderabbit-wait.sh remains available for diagnostics and stays
-  # the rate-limit failover path regardless of this value.
+  # 2.5 is NON-BLOCKING. The agent used to hold every round's Codex request
+  # for up to max_wait_seconds plus post_clearance_max_wait_seconds. The
+  # wait is MOVED, not removed: the required `CodeRabbit unresolved blocking
+  # findings` check is arrival-independent (green until CodeRabbit publishes
+  # a run on the head), so the agent confirms CodeRabbit's arrival on the
+  # merge head with scripts/coderabbit-wait.sh at the pre-merge step
+  # regardless of this value, closing the #136 pre-review merge race. That
+  # runs after CI, which outlasts CodeRabbit's measured p99, so it normally
+  # returns at once. The helper also stays the diagnostic and the rate-limit
+  # failover path.
   #
   #   false  -- do not wait (the default; absent means false)
   #   true   -- wait, as before #2166 (scripts/coderabbit-wait.sh governs)

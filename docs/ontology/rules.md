@@ -49,7 +49,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **R-13.** On a PR meeting the external-review threshold or matching a protected path, the authoring agent's own reviewer identity must post comments only and must never approve. ● — REVIEW_POLICY.md § No-self-approve scoping
 
-**R-14.** On an under-threshold PR, reviewer-identity self-approval is the intended path, not a violation; it does not wait on CodeRabbit (Phase 2.5 is non-blocking, #2166), and the required gates plus the pre-merge conversation gate enforce whatever CodeRabbit has posted by merge time. ● — REVIEW_POLICY.md § No-self-approve scoping
+**R-14.** On an under-threshold PR, reviewer-identity self-approval is the intended path, not a violation; it does not wait on CodeRabbit before Phase 3 (Phase 2.5 is non-blocking, #2166), and CodeRabbit's arrival on the merge head is confirmed at the pre-merge step before the required gates and the conversation gate decide. ● — REVIEW_POLICY.md § No-self-approve scoping
 
 **R-15.** A same-agent approve on an over-threshold PR is hard-blocked by the guard hook. ● — REVIEW_POLICY.md § Operation-to-Identity Matrix
 
@@ -105,7 +105,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 ### CodeRabbit (Phase 2.5)
 
-**R-39.** The agent dispositions CodeRabbit's findings as a Phase 2.5 pass exactly when `scripts/coderabbit-should-invoke.sh <PR#>` exits 0, and does not wait for CodeRabbit's review before proceeding to Phase 3 unless `coderabbit.wait_for_review` is `true` (the decider reports the resolved value as `wait`; default `false`, #2166). `coderabbit.enabled: true` is necessary but not sufficient—the `coderabbit.invoke` mode (`always` / `complex-changes` / `never`) decides whether THIS PR gets the pass, and the decider resolves every ambiguous policy to invoking, while an ambiguous `wait_for_review` resolves to waiting. The required severity gate and the pre-merge conversation and accounting gates are the enforcement point for findings that arrive later. ○ — REVIEW_POLICY.md § Phase 2.5
+**R-39.** The agent dispositions CodeRabbit's findings as a Phase 2.5 pass exactly when `scripts/coderabbit-should-invoke.sh <PR#>` exits 0, and does not wait for CodeRabbit's review before proceeding to Phase 3 unless `coderabbit.wait_for_review` is `true` (the decider reports the resolved value as `wait`; default `false`, #2166). `coderabbit.enabled: true` is necessary but not sufficient—the `coderabbit.invoke` mode (`always` / `complex-changes` / `never`) decides whether THIS PR gets the pass, and the decider resolves every ambiguous policy to invoking, while an ambiguous `wait_for_review` resolves to waiting. Whenever the decider exits 0, the agent confirms CodeRabbit's arrival on the merge head with the wait helper at the pre-merge step, because the required severity gate is arrival-independent; the severity, conversation and accounting gates then enforce the findings. ○ — REVIEW_POLICY.md § Phase 2.5
 
 **R-40.** The agent must not hand-wait a folkloric interval and escalate early; the wait helper's measured windows govern. ○ — review-policy.yml § CodeRabbit
 

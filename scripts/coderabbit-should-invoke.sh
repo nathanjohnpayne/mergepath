@@ -27,16 +27,17 @@
 #
 # PHASE 2.5 IS NON-BLOCKING (#2166). The decision also carries `wait`: whether
 # the agent holds in Phase 2.5 for CodeRabbit's review of the current head
-# before moving to Phase 3. The default is NOT to wait. The agent used to
-# block for up to `coderabbit.max_wait_seconds` plus
-# `post_clearance_max_wait_seconds` while the required
-# `CodeRabbit unresolved blocking findings` check already enforced every
-# p0/p1 finding on the merge head; the wait bought nothing the gate did not
-# already provide, and on a large PR it was a measurable share of each
-# review round. `coderabbit.wait_for_review: true` restores the blocking wait
-# for a repo that wants it (for instance one whose severity gate is off).
-# `scripts/coderabbit-wait.sh` stays available for diagnostics and remains
-# the rate-limit failover path regardless of this value.
+# before moving to Phase 3. The default is NOT to wait there. The agent used
+# to hold every round's Codex request for up to `coderabbit.max_wait_seconds`
+# plus `post_clearance_max_wait_seconds`. The wait is MOVED, not removed:
+# the required `CodeRabbit unresolved blocking findings` check is
+# arrival-independent (green until CodeRabbit publishes a run on the head),
+# so whenever this script exits 0 the agent confirms CodeRabbit's arrival on
+# the MERGE head with `scripts/coderabbit-wait.sh` at the pre-merge step,
+# whatever `wait` says -- that closes the #136 pre-review merge race, and it
+# runs after CI, which outlasts CodeRabbit's p99, so it normally returns at
+# once. `coderabbit.wait_for_review: true` additionally restores the wait
+# before Phase 3 for a repo that wants it.
 #
 # The decision is deliberately a SCRIPT rather than agent judgement: "is this
 # PR complex enough for CodeRabbit" must be reproducible across sessions and

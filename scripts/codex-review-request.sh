@@ -222,8 +222,9 @@
 #       status is not Phase 4b's exit-7 contract.
 #   8   MOVING_HEAD — the head does not look final for a review round
 #       (#2166): it is younger than codex.request_min_head_age_seconds
-#       (measured from the HEAD pushed-at anchor: the later of the committer
-#       date and the last force-push), or no check-run named
+#       (measured from the later of the HEAD pushed-at anchor -- committer
+#       date or last force-push -- and the earliest run of the required check
+#       on the head, i.e. the push dispatch), or no check-run named
 #       codex.request_requires_check has been scheduled on it. No trigger is
 #       posted. A Codex request is posted once per BATCH -- every known
 #       finding addressed, local tests green, no further push planned --
@@ -388,7 +389,15 @@ fi
 
 # --- config readers ---------------------------------------------------------
 
-CONFIG=".github/review-policy.yml"
+# Resolve the policy from the SCRIPT's checkout, not $PWD (Codex P2 on #2175),
+# the way coderabbit-should-invoke.sh and phase-4b-classifier.sh already do.
+# A cwd-relative path read no file at all when the script ran from a
+# subdirectory or by absolute path from elsewhere, and every codex: key then
+# took its default -- request_by_default silently back to true, the
+# moving-head knobs to their defaults. A hand install with no policy beside
+# it keeps the cwd-relative read it always had.
+CONFIG="$__CODEX_REQUEST_DIR/../.github/review-policy.yml"
+[ -f "$CONFIG" ] || CONFIG=".github/review-policy.yml"
 
 # Extract a scalar field from the codex: block in review-policy.yml.
 # Uses the state-machine awk pattern established in #54 (stops at the next
@@ -653,9 +662,13 @@ fi
 # cleared head):
 #
 #   codex.request_min_head_age_seconds  the head must be at least this old,
-#                                       measured from the HEAD pushed-at anchor
-#                                       (the later of the committer date and
-#                                       the last force-push). Default 300: the
+#                                       measured from the push: the latest of
+#                                       the committer date, the last
+#                                       force-push, and the earliest run of
+#                                       request_requires_check on the head
+#                                       (created at push dispatch, so an
+#                                       ordinary push of an old commit still
+#                                       reads as new). Default 300: the
 #                                       measured push-to-next-request p50 was
 #                                       3 minutes, i.e. requests went out on
 #                                       heads the agent was still amending.
@@ -1645,6 +1658,7 @@ check_blocking_budget() { # <request_count> <max_review_rounds>
 # on a push the agent is still amending), turns the refusal into a warning.
 MOVING_HEAD_AGE_SECONDS=null
 MOVING_HEAD_CHECK_STATUS=""
+MOVING_HEAD_ANCHOR=""
 refuse_moving_head_unless_allowed() {
   local reasons="" pushed_epoch now_epoch age runs status allow=false
   case "${MERGEPATH_CODEX_AUTO_TRIGGER:-}" in
@@ -1652,28 +1666,16 @@ refuse_moving_head_unless_allowed() {
   esac
   [ "$ALLOW_MOVING_HEAD" = true ] && allow=true
 
-  if [ "$REQUEST_MIN_HEAD_AGE_SECONDS" -gt 0 ]; then
-    pushed_epoch=$(jq -rn --arg t "$HEAD_PUSHED_AT" \
-      '$t | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null) || pushed_epoch=""
-    now_epoch=$(date +%s)
-    if [[ "$pushed_epoch" =~ ^[0-9]+$ ]]; then
-      age=$((now_epoch - pushed_epoch))
-      [ "$age" -ge 0 ] || age=0
-      MOVING_HEAD_AGE_SECONDS=$age
-      if [ "$age" -lt "$REQUEST_MIN_HEAD_AGE_SECONDS" ]; then
-        reasons="head-age"
-        log "moving-head guard: HEAD was pushed ${age}s ago (anchor $HEAD_PUSHED_AT, source: $ANCHOR_SOURCE), under codex.request_min_head_age_seconds=$REQUEST_MIN_HEAD_AGE_SECONDS"
-      fi
-    else
-      log "moving-head guard: HEAD pushed-at anchor '$HEAD_PUSHED_AT' is not parseable; head-age signal unavailable, not enforced"
-    fi
-  fi
-
+  # The scheduled-check read comes first: it also supplies the push-time
+  # anchor for the age signal below.
+  local dispatched_at="" anchor="$HEAD_PUSHED_AT" anchor_source="$ANCHOR_SOURCE" check_reason=""
   if [ -n "$REQUEST_REQUIRES_CHECK" ]; then
     # Exact server-side name filter; the client-side select repeats it so a
     # server that ignores the filter cannot pass a differently named run off
     # as this one. Any run counts, whatever its status.
-    runs=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs?check_name=$REQUEST_REQUIRES_CHECK&per_page=100" 2>/dev/null) || runs=""
+    # -f encodes the name: a configured check name may carry spaces.
+    runs=$(gh api -X GET "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+      -f check_name="$REQUEST_REQUIRES_CHECK" -F per_page=100 2>/dev/null) || runs=""
     status=$(printf '%s' "$runs" | jq -r --arg n "$REQUEST_REQUIRES_CHECK" '
       if (type == "object") and ((.check_runs | type) == "array")
       then ([.check_runs[] | select((.name // "") == $n)] | sort_by(.id) | last | .status // "missing")
@@ -1684,12 +1686,45 @@ refuse_moving_head_unless_allowed() {
       unreadable)
         log "moving-head guard: check-runs for $HEAD_SHA unreadable; '$REQUEST_REQUIRES_CHECK'-scheduled signal unavailable, not enforced" ;;
       missing)
-        reasons="${reasons:+$reasons,}check-missing"
+        check_reason="check-missing"
         log "moving-head guard: no check-run named '$REQUEST_REQUIRES_CHECK' has been scheduled on HEAD $HEAD_SHA (codex.request_requires_check)" ;;
       *)
-        log "moving-head guard: check-run '$REQUEST_REQUIRES_CHECK' is $status on HEAD" ;;
+        log "moving-head guard: check-run '$REQUEST_REQUIRES_CHECK' is $status on HEAD"
+        # Push-time anchor (Codex P2 on #2175). HEAD_PUSHED_AT is the commit's
+        # committer date unless a force-push replaced it, so an ordinary push
+        # of a commit created long before reads as an old head the moment it
+        # lands. The EARLIEST run of the required check on this head was
+        # created when GitHub dispatched workflows for the push, which is the
+        # push time this signal means. Use whichever is later. A missing or
+        # unparseable timestamp keeps the commit-based anchor.
+        dispatched_at=$(printf '%s' "$runs" | jq -r --arg n "$REQUEST_REQUIRES_CHECK" '
+          [.check_runs[] | select((.name // "") == $n) | (.started_at // empty)
+           | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))] | min // ""' 2>/dev/null) || dispatched_at=""
+        if [ -n "$dispatched_at" ] && [[ "$dispatched_at" > "$anchor" ]]; then
+          anchor="$dispatched_at"
+          anchor_source="earliest '$REQUEST_REQUIRES_CHECK' run on HEAD (push dispatch)"
+        fi ;;
     esac
   fi
+
+  if [ "$REQUEST_MIN_HEAD_AGE_SECONDS" -gt 0 ]; then
+    pushed_epoch=$(jq -rn --arg t "$anchor" \
+      '$t | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null) || pushed_epoch=""
+    now_epoch=$(date +%s)
+    if [[ "$pushed_epoch" =~ ^[0-9]+$ ]]; then
+      age=$((now_epoch - pushed_epoch))
+      [ "$age" -ge 0 ] || age=0
+      MOVING_HEAD_AGE_SECONDS=$age
+      if [ "$age" -lt "$REQUEST_MIN_HEAD_AGE_SECONDS" ]; then
+        reasons="head-age"
+        log "moving-head guard: HEAD was pushed ${age}s ago (anchor $anchor, source: $anchor_source), under codex.request_min_head_age_seconds=$REQUEST_MIN_HEAD_AGE_SECONDS"
+      fi
+    else
+      log "moving-head guard: HEAD pushed-at anchor '$anchor' is not parseable; head-age signal unavailable, not enforced"
+    fi
+  fi
+  [ -z "$check_reason" ] || reasons="${reasons:+$reasons,}$check_reason"
+  MOVING_HEAD_ANCHOR="$anchor"
 
   [ -n "$reasons" ] || return 0
   if [ "$allow" = true ]; then
@@ -1707,7 +1742,7 @@ refuse_moving_head_unless_allowed() {
     --arg reasons "$reasons" \
     --argjson age "$MOVING_HEAD_AGE_SECONDS" \
     --argjson min_age "$REQUEST_MIN_HEAD_AGE_SECONDS" \
-    --arg pushed_at "$HEAD_PUSHED_AT" \
+    --arg pushed_at "$MOVING_HEAD_ANCHOR" \
     --arg check_name "$REQUEST_REQUIRES_CHECK" \
     --arg check_status "$MOVING_HEAD_CHECK_STATUS" '
     {

@@ -391,17 +391,29 @@ detect_cross_cutting_refactor() {
   # the prior `awk -F/ '{print $1}'` over-counting root files as dirs,
   # which spuriously triggered cross-cutting on docs-only PRs.
   #
-  # Then drop the entries that are not implementation (#2166). The
-  # <root> sentinel (a manifest, a README, a policy file) and the
-  # companion dirs that ride along with ANY change -- tests/, docs/,
-  # specs/ -- say nothing about how many callers a contract has: a
-  # cohesive one-script fix here routinely lands as scripts/ + tests/ +
-  # a root manifest, which the raw distinct-dir count read as a
-  # cross-cutting refactor and sent to a Phase 4b round it did not need.
-  # Only the dirs that carry implementation count toward the >=3 bar.
+  # Then drop the entries that are not implementation (#2166). The companion
+  # dirs that ride along with ANY change -- tests/, test/, docs/, specs/ --
+  # and the companion ROOT files (docs, licences, dotfiles, manifests and
+  # config) say nothing about how many callers a contract has: a cohesive
+  # one-script fix here routinely lands as scripts/ + tests/ + a root
+  # manifest, which the raw distinct-dir count read as a cross-cutting
+  # refactor and sent to a Phase 4b round it did not need. Only the dirs that
+  # carry implementation count toward the >=3 bar.
+  #
+  # A root-level file is excluded by WHAT it is, not by where it sits (Codex
+  # P2 on #2175): a consumer may keep an implementation entrypoint at the
+  # root -- main.go, app.py, server.js, a Makefile -- and a refactor touching
+  # it plus two implementation dirs spans three implementation areas. Such a
+  # file still counts, as the single <root> area.
   distinct_impl_dirs=$(echo "$FILE_PATHS" \
-    | awk -F/ 'NF>1 {print $1; next} {print "<root>"}' \
-    | grep -vxE '<root>|tests?|docs|specs' \
+    | awk -F/ '
+        NF > 1 { print $1; next }
+        $0 ~ /^\./ { next }
+        $0 ~ /\.(md|markdown|mdx|txt|rst|adoc)$/ { next }
+        $0 ~ /^(LICENSE|LICENCE|COPYING|NOTICE|CHANGELOG|AUTHORS|CODEOWNERS|CONTRIBUTORS)(\..*)?$/ { next }
+        $0 ~ /\.(ya?ml|json|jsonc|toml|lock|cfg|ini|conf)$/ { next }
+        { print "<root>" }' \
+    | grep -vxE 'tests?|docs|specs' \
     | sort -u | wc -l | tr -d ' ')
   has_types=$(echo "$FILE_PATHS" | grep -cE '(^|/)types/' || true)
   has_services=$(echo "$FILE_PATHS" | grep -cE '(^|/)services/' || true)
