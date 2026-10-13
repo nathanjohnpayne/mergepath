@@ -27,6 +27,14 @@
 #  18. non-npm ecosystems are ignored                                     → PASS
 #  19. both members dev dependencies in one type group (no family group)  → PASS (false-positive guard)
 #  20. existing group named after the family but ordered late             → FAIL, no --fix insertion
+#  21. peerDependencies-only member (Dependabot never updates peers)      → PASS
+#  22. allow: production only drops the dev member                       → PASS
+#  23. allow by name keeps both members eligible                         → FAIL
+#  24. flow-style groups: --fix fails closed, file untouched             → exit 2
+#  25. members declared only inside an npm workspace                     → FAIL
+#  26. group-by: dependency-name is one PR per member                    → FAIL
+#  27. multi-ecosystem-group with patterns ["*"] is one shared PR        → PASS
+#  28. only * is a wildcard (firebas? is literal)                        → FAIL
 #
 # Needs python3 with PyYAML. repo_lint provisions PyYAML for every
 # self-test leg; a bare local shell without it SKIPs loudly (and CI fails).
@@ -260,6 +268,78 @@ expect "non-npm ecosystems are ignored" 0 "$r" "PASS"
 
 r="$(new_repo same-type-group)"; pkg "$r" "react" "eslint @eslint/js vitest"; write_config "$r" "$TYPE_GROUPS"
 expect "members already sharing one type group pass with no family group" 0 "$r" "PASS"
+
+# Review round 1 on #2170 — one case per finding.
+
+r="$(new_repo peer-only)"
+printf '{"name":"lib","peerDependencies":{"vite":"^8.0.0"},"devDependencies":{"vitest":"^5.0.0"},"dependencies":{"react":"^19.0.0"}}\n' > "$r/package.json"
+write_config "$r" '      dev-dependencies:
+        dependency-type: "development"
+      production-dependencies:
+        dependency-type: "production"'
+expect "peerDependencies-only member is not updatable (dependabot-core DEPENDENCY_TYPES)" 0 "$r" "PASS"
+
+r="$(new_repo allow-production)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "$r" "$TYPE_GROUPS" '    allow:
+      - dependency-type: "production"'
+expect "allow filters drop the dev member before grouping" 0 "$r" "PASS"
+
+r="$(new_repo allow-by-name)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "$r" "$TYPE_GROUPS" '    allow:
+      - dependency-name: "firebase"
+      - dependency-name: "@firebase/*"'
+expect "allow rules naming both members keep the split visible" 1 "$r" "firebase-sdk"
+
+r="$(new_repo flow-groups)"; pkg "$r" "$FB_PROD" "$FB_DEV"
+cat > "$r/.github/dependabot.yml" <<'YAML'
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups: { dev-dependencies: { dependency-type: development }, production-dependencies: { dependency-type: production } }
+YAML
+cp "$r/.github/dependabot.yml" "$WORKDIR/flow-groups.yml"
+expect "--fix fails closed on a flow-style groups mapping" 2 "$r" "flow-style 'groups:' mapping" --fix
+N=$((N + 1))
+if cmp -s "$r/.github/dependabot.yml" "$WORKDIR/flow-groups.yml"; then
+  PASS=$((PASS + 1)); echo "  PASS [$N] flow-style config left byte-identical"
+else
+  FAIL=$((FAIL + 1)); echo "  FAIL [$N] --fix edited a flow-style config" >&2
+fi
+
+r="$(new_repo workspaces)"
+printf '{"name":"root","private":true,"workspaces":["packages/*"],"devDependencies":{"vitest":"^5.0.0"}}\n' > "$r/package.json"
+pkg "$r/packages/app" "$FB_PROD" "$FB_DEV"
+write_config "$r" "$TYPE_GROUPS"
+expect "members declared only in a workspace manifest are evaluated" 1 "$r" "firebase-sdk"
+
+r="$(new_repo group-by-name)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "$r" '      per-dependency:
+        group-by: dependency-name
+        patterns:
+          - "*"'
+expect "group-by: dependency-name opens one PR per member" 1 "$r" "per-dependency[firebase]"
+
+r="$(new_repo multi-ecosystem)"; pkg "$r" "$FB_PROD" "$FB_DEV"
+cat > "$r/.github/dependabot.yml" <<'YAML'
+version: 2
+multi-ecosystem-groups:
+  infrastructure:
+    schedule:
+      interval: "weekly"
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    patterns: ["*"]
+    multi-ecosystem-group: "infrastructure"
+YAML
+expect "a multi-ecosystem group is one shared PR target" 0 "$r" "PASS"
+
+r="$(new_repo literal-question-mark)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "$r" '      firebase-sdk:
+        patterns:
+          - "firebas?"
+          - "@firebase/*"'"
+$TYPE_GROUPS"
+expect "only * is a wildcard: firebas? does not match firebase" 1 "$r" "family 'firebase-sdk' is split"
 
 r="$(new_repo named-late)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "$r" "$TYPE_GROUPS
 $FAMILY_GROUP"
