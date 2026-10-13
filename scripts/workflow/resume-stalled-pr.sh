@@ -120,7 +120,9 @@ fi
 number=$(printf '%s' "$SELECTED" | jq -r '.number')
 head_sha=$(printf '%s' "$SELECTED" | jq -r '.head_sha')
 head_ref=$(printf '%s' "$SELECTED" | jq -r '.head_ref')
-title=$(printf '%s' "$SELECTED" | jq -r '.title')
+# The title is PR-controlled display text: strip control characters (newlines
+# included) so it cannot add lines to the work order a session consumes.
+title=$(printf '%s' "$SELECTED" | jq -r '.title | gsub("[\\x00-\\x1f\\x7f]"; " ")')
 url=$(printf '%s' "$SELECTED" | jq -r '.url')
 reason=$(printf '%s' "$SELECTED" | jq -r '.reason')
 next_action=$(printf '%s' "$SELECTED" | jq -r '.next_action')

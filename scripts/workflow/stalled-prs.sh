@@ -224,7 +224,7 @@ else
   : > "$WORK/records.jsonl"
   while IFS= read -r number; do
     [ -n "$number" ] || continue
-    jq -c --argjson n "$number" '.[] | select(.number == $n)' "$WORK/pulls.json" > "$WORK/pr.json"
+    jq -c --argjson n "$number" 'first(.[] | select(.number == $n))' "$WORK/pulls.json" > "$WORK/pr.json"
     head_sha=$(jq -r '.head.sha' "$WORK/pr.json")
     fetch_api_array "repos/$REPO/pulls/$number/reviews?per_page=100" "PR #$number reviews" > "$WORK/reviews.json"
     fetch_api_array "repos/$REPO/issues/$number/comments?per_page=100" "PR #$number issue comments" > "$WORK/issue_comments.json"
@@ -292,7 +292,10 @@ else
                                                    user: {login: (.user.login // ""), type: (.user.type // "")}}],
         gate: null
       }' >> "$WORK/records.jsonl" || infra "could not assemble the record for PR #$number"
-  done < <(jq -r '.[] | .number' "$WORK/pulls.json")
+  # Pagination has no snapshot guarantee: a PR that moved between pages
+  # appears twice, so the loop input is deduplicated and one object is
+  # selected per number.
+  done < <(jq -r '[.[] | .number] | unique[]' "$WORK/pulls.json")
 
   SNAPSHOT=$(jq -cs --arg repo "$REPO" --arg now "$NOW" \
     '{schema: "stalled-prs/v1", repo: $repo, fetched_at: $now, prs: .}' "$WORK/records.jsonl") \
