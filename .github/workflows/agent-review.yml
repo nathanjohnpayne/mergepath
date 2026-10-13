@@ -945,8 +945,9 @@ jobs:
   # self-peer review is performed by the authoring agent in its own
   # session — the identity-checked reviewer wrapper selects API attribution
   # (e.g., nathanpayne-claude) using the session's reviewer credential;
-  # Git commit identity stays fixed. See REVIEW_POLICY.md § Phase 2 and CLAUDE.md
-  # "After opening the PR" steps 4–7. A headless Claude/Codex CLI
+  # Human Git author identity stays fixed; retain the local human committer
+  # or the approved signed Claude cloud committer. See REVIEW_POLICY.md § Phase 2
+  # and the AGENTS.md reading order. A headless Claude/Codex CLI
   # invocation in CI is intentionally NOT used: it (a) bypasses the
   # in-session tool context the agent already has, (b) adds a stale
   # API-key failure surface unrelated to the PR, and (c) duplicates

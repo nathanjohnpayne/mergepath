@@ -21,6 +21,11 @@ The MUX Video Integration initiative ([Project #5](https://github.com/users/nath
 # Local session setup — preflight populates OP_PREFLIGHT_AUTHOR_PAT.
 # Select the running agent; claude is this example's local agent.
 eval "$(scripts/op-preflight.sh --agent claude --mode review)"
+```
+
+Select the author PAT before calling these helpers in a prepared local session or a cloud session with GraphQL transport and the required `repo` + `project` PAT scopes. The capability probe tests GraphQL transport; it does not verify Project scopes or mutations. In cloud this selects the provisioned credential; do not run local preflight there. Exporting a token does not remove a transport ceiling, so Claude cloud still hands these operations to a capable session.
+
+```bash
 export GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT"
 ```
 
