@@ -379,21 +379,34 @@ detect_prompt_design() {
 }
 
 detect_cross_cutting_refactor() {
-  # Heuristic: count distinct top-level dirs in the changed-files list.
-  # If ≥3 distinct dirs OR diff includes BOTH src/types/ AND src/services/
-  # (or analogous layer pair), match.
-  local distinct_top_dirs has_types has_services
+  # Heuristic: count distinct top-level IMPLEMENTATION dirs in the
+  # changed-files list. If >=3 distinct implementation dirs OR the diff
+  # includes BOTH src/types/ AND src/services/ (or an analogous layer
+  # pair), match.
+  local distinct_impl_dirs has_types has_services
   # Count distinct top-level DIRECTORIES, not filenames. A path with no
   # `/` is a root-level file; collapse all such files to a single
   # sentinel ("<root>") so a docs-only PR touching N root files counts
   # as 1 distinct entry, not N. Codex P2 + CR Minor on PR #190 caught
   # the prior `awk -F/ '{print $1}'` over-counting root files as dirs,
   # which spuriously triggered cross-cutting on docs-only PRs.
-  distinct_top_dirs=$(echo "$FILE_PATHS" | awk -F/ 'NF>1 {print $1; next} {print "<root>"}' | sort -u | wc -l | tr -d ' ')
+  #
+  # Then drop the entries that are not implementation (#2166). The
+  # <root> sentinel (a manifest, a README, a policy file) and the
+  # companion dirs that ride along with ANY change -- tests/, docs/,
+  # specs/ -- say nothing about how many callers a contract has: a
+  # cohesive one-script fix here routinely lands as scripts/ + tests/ +
+  # a root manifest, which the raw distinct-dir count read as a
+  # cross-cutting refactor and sent to a Phase 4b round it did not need.
+  # Only the dirs that carry implementation count toward the >=3 bar.
+  distinct_impl_dirs=$(echo "$FILE_PATHS" \
+    | awk -F/ 'NF>1 {print $1; next} {print "<root>"}' \
+    | grep -vxE '<root>|tests?|docs|specs' \
+    | sort -u | wc -l | tr -d ' ')
   has_types=$(echo "$FILE_PATHS" | grep -cE '(^|/)types/' || true)
   has_services=$(echo "$FILE_PATHS" | grep -cE '(^|/)services/' || true)
-  if [ "$distinct_top_dirs" -ge 3 ]; then
-    printf 'cross-cutting refactor (changes span %s distinct top-level dirs)' "$distinct_top_dirs"
+  if [ "$distinct_impl_dirs" -ge 3 ]; then
+    printf 'cross-cutting refactor (changes span %s distinct top-level implementation dirs)' "$distinct_impl_dirs"
     return 0
   fi
   if [ "$has_types" -gt 0 ] && [ "$has_services" -gt 0 ]; then

@@ -3614,7 +3614,14 @@ request_codex_rate_limit_failover() {
   if [ "$CODEX_FAILOVER_ON_RATE_LIMIT" != "false" ] && [ "$CODEX_FAILOVER_FIRED" != "true" ]; then
     CODEX_FAILOVER_FIRED=true
     log "codex failover: CodeRabbit rate-limited — requesting @codex review (trigger-only)"
-    if MERGEPATH_PHASE_4A_GATED=true "$CODEX_REQUEST_CMD" --trigger-only "$PR_NUMBER" "$REPO" >&2; then
+    # --allow-moving-head (#2166): the requester refuses a head that does not
+    # look final for a review round (younger than
+    # codex.request_min_head_age_seconds, or no scheduled check-run). This
+    # failover is the exceptional path that MUST be able to request: it hands
+    # a head CodeRabbit refused to Codex so the PR is not stranded, and it
+    # fires on the provider's refusal, not on a push the agent is amending.
+    # The requester still warns, and its dedup/idempotency is untouched.
+    if MERGEPATH_PHASE_4A_GATED=true "$CODEX_REQUEST_CMD" --trigger-only --allow-moving-head "$PR_NUMBER" "$REPO" >&2; then
       CODEX_FAILOVER_REQUESTED=true
       log "codex failover: @codex review requested (or already present) on HEAD"
     else

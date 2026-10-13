@@ -116,6 +116,18 @@ case "$endpoint" in
     fi
     cat "$CODEX_TEST_STATE_DIR/base-review-policy.yml"
     ;;
+  repos/owner/repo/commits/*/check-runs*)
+    # #2166 moving-head guard: the `lint`-scheduled signal. Default is the
+    # ordinary production shape (a completed run) so the guard passes on
+    # every pre-existing case through its intended branch, not the
+    # unreadable one.
+    case "${CODEX_TEST_CHECK_RUNS:-completed}" in
+      unreadable) echo 'simulated check-runs read failure' >&2; exit 1 ;;
+      missing)    printf '{"total_count":0,"check_runs":[]}\n' ;;
+      othername)  printf '{"total_count":1,"check_runs":[{"id":1,"name":"not-lint","status":"completed"}]}\n' ;;
+      garbage)    printf 'not json\n' ;;
+      *)          jq -cn --arg st "${CODEX_TEST_CHECK_RUNS:-completed}" '{total_count:1,check_runs:[{id:1,name:"lint",status:$st}]}' ;;
+    esac ;;
   repos/owner/repo/commits/*)     printf '%s\n' "$t" ;;
   repos/owner/repo/issues/999/timeline)  printf '[]\n' ;;
   repos/owner/repo/pulls/999/reviews)
@@ -174,6 +186,33 @@ run_trigger_only() {
 
 trig_count() { if [ -f "$1/state/trigger-count" ]; then cat "$1/state/trigger-count"; else printf '0\n'; fi; }
 jqf() { jq -r "$2" "$1/out.json"; }
+
+# #2166 moving-head guard runner. Same shape as run_trigger_only, plus the
+# guard inputs: CODEX_TEST_HEAD_DATE (the head's pushed-at anchor in these
+# stubs), CODEX_TEST_CHECK_RUNS (the check-runs stub shape above), and any
+# extra script flags.
+run_guard() {
+  local dir=$1 scenario=$2 head_date=$3 check_runs=$4 auto=$5; shift 5
+  local rc=0
+  (
+    cd "$dir"
+    PATH="$dir/bin:$PATH" \
+      GH_TOKEN=test-token \
+      CODEX_TEST_STATE_DIR="$dir/state" \
+      CODEX_TEST_SCENARIO="$scenario" \
+      CODEX_TEST_HEAD_DATE="$head_date" \
+      CODEX_TEST_CHECK_RUNS="$check_runs" \
+      MERGEPATH_CODEX_AUTO_TRIGGER="$auto" \
+      ./scripts/codex-review-request.sh "$@" 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log"
+  ) || rc=$?
+  printf '%s\n' "$rc"
+}
+# A head pushed one minute ago (under the 300s default) and one pushed an hour
+# ago (over it). Computed with jq so the suite stays portable across BSD and
+# GNU date on every consumer.
+YOUNG_HEAD=$(jq -rn 'now - 60 | floor | todate')
+OLD_HEAD=$(jq -rn 'now - 3600 | floor | todate')
 
 # #1276: losing the shared selector cannot turn a known trigger into a new POST.
 dir=$(make_case missing-selector)
@@ -1156,6 +1195,161 @@ for scenario in reply-only body-P1 body-P2; do
   fi
 done
 
+# --- #2166: the moving-head guard ------------------------------------------
+# A Codex request goes out once per batch, on a head that is final for the
+# round. The requester enforces two proxies before a NEW trigger write and
+# refuses with exit 8 (no write) unless the caller allows a moving head.
+
+# MH1: a head pushed 60s ago is under the 300s default → exit 8, no post
+test_guard_refuses_young_head() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-young")
+  rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" completed "" --trigger-only)
+  [ "$rc" = "8" ] || fail "MH1: expected exit 8, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "0" ] || fail "MH1: expected 0 posts on a young head, got $(trig_count "$dir")"
+  [ "$(jqf "$dir" '.trigger_posted')" = "false" ] || fail "MH1: trigger_posted must be false"
+  [ "$(jqf "$dir" '.moving_head.reasons | join(",")')" = "head-age" ] || fail "MH1: reasons=$(jqf "$dir" '.moving_head.reasons'), expected [head-age]"
+  [ "$(jqf "$dir" '.moving_head.min_age_seconds')" = "300" ] || fail "MH1: min_age_seconds=$(jqf "$dir" '.moving_head.min_age_seconds'), expected the 300 default"
+  jq -e '.moving_head.age_seconds | type == "number" and . < 300' "$dir/out.json" >/dev/null || fail "MH1: age_seconds should be a number under 300: $(jqf "$dir" '.moving_head.age_seconds')"
+  [ "$(jqf "$dir" '.moving_head.check_status')" = "completed" ] || fail "MH1: check_status=$(jqf "$dir" '.moving_head.check_status'), expected completed"
+  grep -q 'refusing to post' "$dir/err.log" || fail "MH1: refusal not logged"
+  [ "$FAIL" -ne "$before" ] || pass "MH1: a head younger than request_min_head_age_seconds is refused with exit 8 and no post"
+}
+
+# MH2: same young head, --allow-moving-head → warns and posts once
+test_guard_allow_flag_posts_with_warning() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-allow")
+  rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" completed "" --trigger-only --allow-moving-head)
+  [ "$rc" = "0" ] || fail "MH2: expected exit 0, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "1" ] || fail "MH2: expected 1 post with --allow-moving-head, got $(trig_count "$dir")"
+  grep -q 'WARNING: head does not look final' "$dir/err.log" || fail "MH2: the allow path must still warn"
+  [ "$FAIL" -ne "$before" ] || pass "MH2: --allow-moving-head downgrades the refusal to a warning and posts"
+}
+
+# MH3: old head but no `lint` check-run scheduled on it → exit 8 (check-missing)
+test_guard_refuses_unscheduled_check() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-nolint")
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" missing "" --trigger-only)
+  [ "$rc" = "8" ] || fail "MH3: expected exit 8, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "0" ] || fail "MH3: expected 0 posts, got $(trig_count "$dir")"
+  [ "$(jqf "$dir" '.moving_head.reasons | join(",")')" = "check-missing" ] || fail "MH3: reasons=$(jqf "$dir" '.moving_head.reasons'), expected [check-missing]"
+  [ "$(jqf "$dir" '.moving_head.check_name')" = "lint" ] || fail "MH3: check_name=$(jqf "$dir" '.moving_head.check_name'), expected the lint default"
+  [ "$(jqf "$dir" '.moving_head.check_status')" = "missing" ] || fail "MH3: check_status=$(jqf "$dir" '.moving_head.check_status'), expected missing"
+  # A run under another name is not this check: the client-side filter must
+  # not accept it on the server's behalf.
+  dir=$(make_case "guard-othername")
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" othername "" --trigger-only)
+  [ "$rc" = "8" ] && [ "$(trig_count "$dir")" = "0" ] || fail "MH3b: a differently named run must not satisfy the check (rc=$rc posts=$(trig_count "$dir"))"
+  [ "$FAIL" -ne "$before" ] || pass "MH3: an old head with no scheduled lint run is refused with exit 8 (check-missing)"
+}
+
+# MH4: both signals at once are reported together
+test_guard_reports_both_reasons() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-both")
+  rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" missing "" --trigger-only)
+  [ "$rc" = "8" ] || fail "MH4: expected exit 8, got $rc"
+  [ "$(jqf "$dir" '.moving_head.reasons | join(",")')" = "head-age,check-missing" ] || fail "MH4: reasons=$(jqf "$dir" '.moving_head.reasons'), expected both"
+  [ "$FAIL" -ne "$before" ] || pass "MH4: a young head with no scheduled check reports both reasons"
+}
+
+# MH5: a queued run counts as scheduled (the Actions backlog is not the signal);
+# an old head with one posts.
+test_guard_accepts_queued_check() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-queued")
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" queued "" --trigger-only)
+  [ "$rc" = "0" ] || fail "MH5: expected exit 0, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "1" ] || fail "MH5: expected 1 post, got $(trig_count "$dir")"
+  grep -q "check-run 'lint' is queued" "$dir/err.log" || fail "MH5: queued status not logged"
+  [ "$FAIL" -ne "$before" ] || pass "MH5: a queued lint run satisfies the scheduled-check signal"
+}
+
+# MH6: an unreadable check-runs read fails OPEN with a distinct log line (this
+# is a cycle-time guard, not a merge gate); the age signal still decides.
+test_guard_unreadable_check_runs_fails_open() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-unreadable")
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" unreadable "" --trigger-only)
+  [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "1" ] || fail "MH6: unreadable check-runs must not refuse (rc=$rc posts=$(trig_count "$dir"))"
+  grep -q 'signal unavailable, not enforced' "$dir/err.log" || fail "MH6: fail-open must be logged distinctly"
+  dir=$(make_case "guard-garbage")
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" garbage "" --trigger-only)
+  [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "1" ] || fail "MH6b: a non-JSON check-runs body must not refuse (rc=$rc posts=$(trig_count "$dir"))"
+  # ...but an unreadable check read never masks a young head.
+  dir=$(make_case "guard-unreadable-young")
+  rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" unreadable "" --trigger-only)
+  [ "$rc" = "8" ] && [ "$(trig_count "$dir")" = "0" ] || fail "MH6c: a young head is refused even when check-runs are unreadable (rc=$rc posts=$(trig_count "$dir"))"
+  [ "$(jqf "$dir" '.moving_head.check_status')" = "unreadable" ] || fail "MH6c: check_status should report unreadable"
+  [ "$FAIL" -ne "$before" ] || pass "MH6: an unreadable check-runs read fails open and is logged; it never masks the age signal"
+}
+
+# MH7: the policy knobs disable each signal: age 0 and an empty check name
+test_guard_policy_knobs_disable_signals() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-knobs-off")
+  printf '  request_min_head_age_seconds: 0\n  request_requires_check: ""\n' >>"$dir/.github/review-policy.yml"
+  rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" missing "" --trigger-only)
+  [ "$rc" = "0" ] || fail "MH7: expected exit 0 with both knobs off, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "1" ] || fail "MH7: expected 1 post, got $(trig_count "$dir")"
+  grep -q 'moving-head guard' "$dir/err.log" && fail "MH7: no guard signal should be evaluated with both knobs off"
+  # A raised age floor is honoured: an hour-old head is young under 7200s.
+  dir=$(make_case "guard-knob-age")
+  printf '  request_min_head_age_seconds: 7200\n' >>"$dir/.github/review-policy.yml"
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" completed "" --trigger-only)
+  [ "$rc" = "8" ] && [ "$(jqf "$dir" '.moving_head.min_age_seconds')" = "7200" ] || fail "MH7b: a configured age floor must be enforced (rc=$rc)"
+  # A renamed check is looked up by its configured name.
+  dir=$(make_case "guard-knob-name")
+  printf '  request_requires_check: not-lint\n' >>"$dir/.github/review-policy.yml"
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" othername "" --trigger-only)
+  [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "1" ] || fail "MH7c: a configured check name must be the one looked up (rc=$rc posts=$(trig_count "$dir"))"
+  # A malformed age floor is a config error, not a silent default.
+  dir=$(make_case "guard-knob-bad")
+  printf '  request_min_head_age_seconds: soon\n' >>"$dir/.github/review-policy.yml"
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" completed "" --trigger-only)
+  [ "$rc" = "3" ] && [ "$(trig_count "$dir")" = "0" ] || fail "MH7d: a non-integer age floor must exit 3 before any write (rc=$rc)"
+  [ "$FAIL" -ne "$before" ] || pass "MH7: request_min_head_age_seconds / request_requires_check are honoured, and 0 / empty disable each signal"
+}
+
+# MH8: an automatic caller (CI failover on a provider event) is exempt. It
+# fires on CodeRabbit's rate limit, not on a push the agent is amending, and a
+# refusal would strand the head with no caller left to re-request.
+test_guard_exempts_automatic_caller() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-auto")
+  rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" missing true --trigger-only)
+  [ "$rc" = "0" ] || fail "MH8: expected exit 0 for an automatic caller, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "1" ] || fail "MH8: expected 1 post, got $(trig_count "$dir")"
+  grep -q 'WARNING: head does not look final' "$dir/err.log" || fail "MH8: the exemption must still warn"
+  [ "$FAIL" -ne "$before" ] || pass "MH8: MERGEPATH_CODEX_AUTO_TRIGGER exempts the automatic caller (warns, posts)"
+}
+
+# MH9: the guard protects a NEW write only. A head Codex already cleared, or
+# one that already carries a fresh author trigger, posts nothing and is never
+# refused -- the dedup/idempotency contract is untouched.
+test_guard_does_not_run_on_no_write_paths() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-dup")
+  rc=$(run_guard "$dir" dup_author "$YOUNG_HEAD" missing "" --trigger-only)
+  [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "0" ] || fail "MH9: an existing trigger on a young head must still be the idempotent skip (rc=$rc posts=$(trig_count "$dir"))"
+  [ "$(jqf "$dir" '.trigger_posted')" = "false" ] || fail "MH9: trigger_posted must be false on the dedup path"
+  grep -q 'moving-head guard' "$dir/err.log" && fail "MH9: the guard must not be evaluated on the dedup path"
+  [ "$FAIL" -ne "$before" ] || pass "MH9: dedup and clearance paths never reach the guard"
+}
+
+# MH10: the guard also covers the full (polling) mode, which the agent runs in
+# Phase 4a -- not only --trigger-only.
+test_guard_applies_in_polling_mode() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-poll")
+  rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" completed "")
+  [ "$rc" = "8" ] || fail "MH10: expected exit 8 in polling mode, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "0" ] || fail "MH10: expected 0 posts, got $(trig_count "$dir")"
+  [ "$FAIL" -ne "$before" ] || pass "MH10: the guard refuses in polling mode too"
+}
+
 test_fresh_posts_once_no_poll
 test_dup_author_skips
 test_uppercase_author_command_skips
@@ -1192,6 +1386,16 @@ test_wiring_manual_caller_ignores_gate
 test_wiring_missing_gate_fails_open
 test_feedback_accounting_blocks_trigger
 test_workflow_declares_auto_trigger_flag
+test_guard_refuses_young_head
+test_guard_allow_flag_posts_with_warning
+test_guard_refuses_unscheduled_check
+test_guard_reports_both_reasons
+test_guard_accepts_queued_check
+test_guard_unreadable_check_runs_fails_open
+test_guard_policy_knobs_disable_signals
+test_guard_exempts_automatic_caller
+test_guard_does_not_run_on_no_write_paths
+test_guard_applies_in_polling_mode
 
 echo "----"
 echo "test_codex_review_request_trigger_only: $PASS passed, $FAIL failed"

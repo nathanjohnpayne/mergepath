@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # coderabbit-should-invoke.sh — decide whether Phase 2.5 (CodeRabbit) runs
-# for a given PR.
+# for a given PR, and whether the agent waits for it.
 #
 # SCOPE -- read this before assuming what the knob buys you (#1084 r1).
 #
-# This governs PHASE 2.5, the AGENT's wait-and-disposition phase. It does NOT
-# stop the CodeRabbit App from reviewing: the shipped `.coderabbit.yml` sets
+# This governs PHASE 2.5, the AGENT's disposition phase. It does NOT stop the
+# CodeRabbit App from reviewing: the shipped `.coderabbit.yml` sets
 # `auto_review.enabled: true`, so the App starts on PR open, before this script
 # ever runs. Skipping therefore:
 #
-#   * DOES save the agent the Phase 2.5 wait (bounded by
-#     `coderabbit.max_wait_seconds`, 1245s here).
+#   * DOES skip the agent's CodeRabbit disposition pass (and, where the wait
+#     is enabled, the Phase 2.5 wait bounded by `coderabbit.max_wait_seconds`,
+#     1245s here).
 #   * Does NOT reduce provider invocations, and so does NOT reduce rate-limit
 #     pressure. Reading this as a rate-limit remedy is reading it wrong.
 #   * Leaves findings the App posts later UNWATCHED. Those are still
@@ -24,6 +25,19 @@
 # gate is a clean no-op wherever `coderabbit.severity_gate.enabled` is false
 # (the default on every consumer).
 #
+# PHASE 2.5 IS NON-BLOCKING (#2166). The decision also carries `wait`: whether
+# the agent holds in Phase 2.5 for CodeRabbit's review of the current head
+# before moving to Phase 3. The default is NOT to wait. The agent used to
+# block for up to `coderabbit.max_wait_seconds` plus
+# `post_clearance_max_wait_seconds` while the required
+# `CodeRabbit unresolved blocking findings` check already enforced every
+# p0/p1 finding on the merge head; the wait bought nothing the gate did not
+# already provide, and on a large PR it was a measurable share of each
+# review round. `coderabbit.wait_for_review: true` restores the blocking wait
+# for a repo that wants it (for instance one whose severity gate is off).
+# `scripts/coderabbit-wait.sh` stays available for diagnostics and remains
+# the rate-limit failover path regardless of this value.
+#
 # The decision is deliberately a SCRIPT rather than agent judgement: "is this
 # PR complex enough for CodeRabbit" must be reproducible across sessions and
 # agents, and must be answerable the same way in CI as at the keyboard.
@@ -34,9 +48,14 @@
 #   scripts/coderabbit-should-invoke.sh <PR#> --json
 #
 # Exit codes:
-#   0 — INVOKE CodeRabbit for this PR
+#   0 — INVOKE CodeRabbit for this PR (disposition its findings; wait only
+#       when `wait` is true)
 #   1 — SKIP CodeRabbit for this PR
 #   3 — bad arguments
+#
+# Output: one text line `[coderabbit-should-invoke] <decision> — <reason>
+# (wait_for_review: <true|false>)`, or with --json an object carrying
+# `decision`, `reason`, `invoke_mode`, `coderabbit_enabled` and `wait`.
 #
 # There is deliberately no config-error exit. An unreadable config, an
 # unparseable knob, or a classifier that fails all resolve to INVOKE, because
@@ -53,6 +72,17 @@
 #   coderabbit.invoke absent         -> `always`, preserving the pre-#1084
 #                                       behaviour for a repo that has not
 #                                       adopted the knob.
+#   coderabbit.wait_for_review: true -> `wait: true` (block in Phase 2.5 for
+#                                       the current head's review, the
+#                                       pre-#2166 behaviour)
+#   coderabbit.wait_for_review absent / false
+#                                    -> `wait: false` (proceed to Phase 3;
+#                                       the required severity gate enforces)
+#   coderabbit.wait_for_review other / ambiguous
+#                                    -> `wait: true`, with a warning: an
+#                                       unclear instruction about the wait
+#                                       falls back to the older, slower
+#                                       behaviour, never to a faster one.
 #
 # Bash 3.2 portable.
 
@@ -347,13 +377,36 @@ emit() {  # <decision> <reason>
     # where a machine reader most needs a parseable answer (#1084 r2).
     jq -n --arg pr "$PR_NUM" --arg d "$decision" --arg r "$reason" \
           --arg m "${INVOKE_MODE:-}" --arg e "${CR_ENABLED:-}" \
+          --argjson w "${WAIT_FOR_REVIEW:-true}" \
       '{pr_number: ($pr|tonumber), decision: $d, reason: $r,
-        invoke_mode: $m, coderabbit_enabled: $e}'
+        invoke_mode: $m, coderabbit_enabled: $e, wait: $w}'
   else
-    echo "[coderabbit-should-invoke] $decision — $reason"
+    echo "[coderabbit-should-invoke] $decision — $reason (wait_for_review: ${WAIT_FOR_REVIEW:-true})"
   fi
   exit "$code"
 }
+
+# Resolve `wait` (#2166) before any decision path can emit. Read through the
+# same strict field reader as the other two keys so a duplicate or malformed
+# key is seen. Only the exact literal `false` (the default) means no wait;
+# `true`, an unrecognized value, or an ambiguous read all mean wait, because
+# an unclear instruction about the wait must fall back to the slower, older
+# behaviour and never to a faster one. The ambiguity markers that describe the
+# whole FILE (tabs, non-literal keys, a non-mapping block) are handled below
+# on the enabled/invoke read and resolve the DECISION to invoke; here they
+# only ever make `wait` true.
+WAIT_FOR_REVIEW=false
+_wait_raw=$(coderabbit_field wait_for_review)
+case "$_wait_raw" in
+  ""|false) WAIT_FOR_REVIEW=false ;;
+  true) WAIT_FOR_REVIEW=true ;;
+  *"<<ambiguous:"*)
+    echo "[coderabbit-should-invoke] WARN: ambiguous coderabbit.wait_for_review read ('${_wait_raw}'); waiting (the pre-#2166 behaviour)" >&2
+    WAIT_FOR_REVIEW=true ;;
+  *)
+    echo "[coderabbit-should-invoke] WARN: unrecognized coderabbit.wait_for_review='${_wait_raw}'; waiting (the pre-#2166 behaviour)" >&2
+    WAIT_FOR_REVIEW=true ;;
+esac
 
 # Read BOTH fields before acting on either. Honouring `enabled: false` first
 # let one well-formed field mask the other field's ambiguity: a policy with

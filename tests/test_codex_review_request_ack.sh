@@ -92,6 +92,11 @@ make_case() {
   cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$dir/scripts/workflow/resolve_base_policy.sh"
   chmod +x "$dir/scripts/workflow/resolve_base_policy.sh"
 
+  # request_min_head_age_seconds: 0 -- these cases model acknowledgement,
+  # resume and expiry mechanics under a FAKE clock that places "now" seconds
+  # after the stubbed head date, so every head here reads as just pushed.
+  # The moving-head guard (#2166) is not under test in this suite; it is
+  # covered by tests/test_codex_review_request_trigger_only.sh (MH1-MH10).
   cat >"$dir/.github/review-policy.yml" <<EOF
 codex:
   bot_login: "chatgpt-codex-connector[bot]"
@@ -99,6 +104,7 @@ codex:
   reaction_freshness_window_seconds: 999999999
   ack_wait_seconds: $ack_wait
   max_ack_retries: $max_retries
+  request_min_head_age_seconds: 0
 EOF
   cp "$dir/.github/review-policy.yml" "$dir/state/base-review-policy.yml"
 

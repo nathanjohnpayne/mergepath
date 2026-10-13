@@ -192,6 +192,35 @@ else
   fail "--json shape wrong: $out"
 fi
 
+echo "--- #2166: Phase 2.5 is non-blocking; wait_for_review carries the wait ---"
+# The decision JSON and the text line both say whether the agent holds in
+# Phase 2.5 for the current head's CodeRabbit review. Default: no wait.
+wait_is() {  # <name> <body> <expect_wait> [expect_rc]
+  local name=$1 body=$2 want=$3 want_rc=${4:-0} dir out rc
+  dir=$(scratch "$body" 0)
+  out=$( cd "$dir" && ./scripts/coderabbit-should-invoke.sh 99 --json 2>/dev/null ); rc=$?
+  if [ "$rc" = "$want_rc" ] && printf '%s' "$out" | jq -e --argjson w "$want" '.wait == $w' >/dev/null 2>&1; then
+    pass "$name (wait=$want, rc=$rc)"
+  else
+    fail "$name: expected wait=$want rc=$want_rc, got rc=$rc out=$out"
+  fi
+  out=$( cd "$dir" && ./scripts/coderabbit-should-invoke.sh 99 2>/dev/null )
+  printf '%s' "$out" | grep -q "(wait_for_review: $want)" \
+    && pass "$name: text line carries wait_for_review: $want" \
+    || fail "$name: text line should carry '(wait_for_review: $want)', got: $out"
+}
+wait_is "absent wait_for_review does not wait (default)"    "$ON"$'\n'"  invoke: always"                                 false
+wait_is "wait_for_review: false does not wait"               "$ON"$'\n'"  invoke: always"$'\n'"  wait_for_review: false" false
+wait_is "wait_for_review: true waits (pre-#2166 behaviour)"  "$ON"$'\n'"  invoke: always"$'\n'"  wait_for_review: true"  true
+wait_is "a quoted true still waits"                           "$ON"$'\n'"  invoke: always"$'\n'"  wait_for_review: 'true'" true
+wait_is "an unrecognized value falls back to waiting"        "$ON"$'\n'"  invoke: always"$'\n'"  wait_for_review: maybe" true
+wait_is "a duplicate wait_for_review key falls back to waiting" "$ON"$'\n'"  invoke: always"$'\n'"  wait_for_review: false"$'\n'"  wait_for_review: false" true
+# `wait` rides along on a skip too, so a machine reader always has the field.
+wait_is "wait is reported on a skip decision as well"        "$ON"$'\n'"  invoke: never"                                  false 1
+# The wait knob never changes the DECISION: an explicit wait on a routine PR
+# under complex-changes still skips, and never on an ambiguous file invokes.
+case_is "wait_for_review: true does not turn a skip into an invoke" "$CX"$'\n'"  wait_for_review: true" 0 1
+
 echo "--- #1084 r1: the classifier is a DISPOSITION function, not a detector ---"
 # With phase_4b_default: fallback-only the classifier short-circuits and exits 0
 # WITHOUT inspecting the diff. Reading that as "routine" would skip CodeRabbit on

@@ -1,0 +1,9 @@
+{
+  "body": "Docs, spec and test-only follow-up; no implementation change.",
+  "files": [
+    {"filename": "docs/agents/example.md", "patch": "@@ -1,1 +1,2 @@\n # Example\n+Clarified wording."},
+    {"filename": "specs/example.md", "patch": "@@ -1,1 +1,2 @@\n Feature: example\n+Scenario: clarified."},
+    {"filename": "tests/test_example.sh", "patch": "@@ -1,1 +1,2 @@\n #!/usr/bin/env bash\n+run_case clarified 0"},
+    {"filename": "CONTRIBUTING.md", "patch": "@@ -1,1 +1,2 @@\n # Contributing\n+Read the spec first."}
+  ]
+}
