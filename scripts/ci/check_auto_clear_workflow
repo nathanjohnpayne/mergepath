@@ -668,7 +668,26 @@ done
 # position, and a wait respelled as a bounded `for` with a long `sleep` is a
 # stated residual (#977's parsed-shell substrate). Same assertion shape as
 # scripts/ci/check_merge_clearance_gate and check_required_check_publisher.
-ac_nowait_text=$(grep -v '^[[:space:]]*#' "$WORKFLOW" | sed 's/[[:space:]]#.*$//')
+# Comment stripping is SHELL-QUOTE AWARE for this scan (Codex P2 on #2171,
+# round 2): a plain "strip from whitespace-#" treats the hash inside
+# `echo "state #"; while true; ...` as a comment and hides the loop. Quote
+# state resets per line — a quoted string spanning lines is the stated
+# residual (#977). Same stripper as scripts/ci/check_merge_clearance_gate.
+ac_nowait_text=$(awk -v sqc="'" '
+    /^[[:space:]]*#/ { next }
+    {
+      line = $0; out = ""; sq = 0; dq = 0; esc = 0; prev = " "; n = length(line)
+      for (i = 1; i <= n; i++) {
+        c = substr(line, i, 1)
+        if (esc) { out = out c; esc = 0; prev = c; continue }
+        if (c == "\\" && !sq) { out = out c; esc = 1; prev = c; continue }
+        if (c == sqc && !dq) { sq = !sq }
+        else if (c == "\"" && !sq) { dq = !dq }
+        else if (c == "#" && !sq && !dq && prev ~ /[[:space:]]/) { break }
+        out = out c; prev = c
+      }
+      print out
+    }' "$WORKFLOW")
 # Classified per OCCURRENCE, not per line (Codex P2 on #2171): a line that
 # carries `while true; do sleep 15; done; while read -r x; ...` must still
 # trip on its first loop. Each statement-position loop keyword is extracted

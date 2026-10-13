@@ -106,7 +106,11 @@ if [ -f "$WORKFLOW" ]; then
   # publisher's existing gate parent. The gate's verdict does not read `lint`
   # (CI gate (a) is skipped to avoid the required-check self-deadlock), so
   # the only correct place to react to lint is the single Checks-API writer.
-  if grep -qE "^[[:space:]]*workflow_run:" "$WORKFLOW"; then
+  # Spelling-tolerant pre-check (bare, single- or double-quoted key, optional
+  # space before the colon). The #850 parsed tier below asserts the same
+  # property by KEY VALUE over the loaded `on` mapping, which is what catches
+  # flow-style and other spellings this text scan cannot (Codex P2 on #2171).
+  if grep -qE "^[[:space:]]*[\"']?workflow_run[\"']?[[:space:]]*:" "$WORKFLOW"; then
     echo "FAIL: [#2167 lint fan-in] $WORKFLOW declares a workflow_run trigger."
     echo "      Lint completion is fanned in by required-check-publisher.yml (its"
     echo "      second workflow_run parent is repo-lint). A workflow_run here runs"
@@ -124,7 +128,28 @@ if [ -f "$WORKFLOW" ]; then
   # respelled as a bounded `for` with a long `sleep` is a stated residual
   # (#977's parsed-shell substrate is where that closes). The two spellings
   # that have actually shipped in this repo cannot return silently.
-  mcg_nowait_text=$(grep -v '^[[:space:]]*#' "$WORKFLOW" | sed 's/[[:space:]]#.*$//')
+  # Comment stripping is SHELL-QUOTE AWARE for this scan (Codex P2 on #2171,
+  # round 2): a plain "strip from whitespace-#" treats the hash inside
+  # `echo "state #"; while true; ...` as a comment and hides the loop. The
+  # per-line state machine tracks single quotes, double quotes and
+  # backslash escapes; a `#` opens a comment only outside both quote kinds
+  # and after whitespace (or at line start). Quote state resets per line —
+  # a quoted string spanning lines is the stated residual (#977).
+  mcg_nowait_text=$(awk -v sqc="'" '
+    /^[[:space:]]*#/ { next }
+    {
+      line = $0; out = ""; sq = 0; dq = 0; esc = 0; prev = " "; n = length(line)
+      for (i = 1; i <= n; i++) {
+        c = substr(line, i, 1)
+        if (esc) { out = out c; esc = 0; prev = c; continue }
+        if (c == "\\" && !sq) { out = out c; esc = 1; prev = c; continue }
+        if (c == sqc && !dq) { sq = !sq }
+        else if (c == "\"" && !sq) { dq = !dq }
+        else if (c == "#" && !sq && !dq && prev ~ /[[:space:]]/) { break }
+        out = out c; prev = c
+      }
+      print out
+    }' "$WORKFLOW")
   # Classified per OCCURRENCE, not per line (Codex P2 on #2171): a line that
   # carries `while true; do sleep 15; done; while read -r x; ...` must still
   # trip on its first loop. Each statement-position loop keyword is extracted
@@ -910,6 +935,25 @@ if not isinstance(jobs, dict):
     print("FAIL: %s parses but has no jobs: mapping — the #850 structural" % WORKFLOW)
     print("      assertions have nothing to scope to and would pass vacuously.")
     sys.exit(1)
+
+# #2167 — no workflow_run trigger on this workflow, decided over the PARSED
+# `on` mapping so a quoted, flow-style or otherwise respelled key cannot
+# slip past the text pre-check (Codex P2 on #2171). PyYAML resolves a bare
+# `on` key to True; a quoted `"on"` stays a string, so both are read.
+triggers = doc.get("on") if "on" in doc else doc.get(True)
+trigger_keys = ()
+if isinstance(triggers, dict):
+    trigger_keys = tuple(str(k) for k in triggers)
+elif isinstance(triggers, list):
+    trigger_keys = tuple(str(k) for k in triggers)
+elif isinstance(triggers, str):
+    trigger_keys = (triggers,)
+if "workflow_run" in trigger_keys:
+    bad("FAIL: [#2167 lint fan-in] %s declares a workflow_run trigger (parsed on: mapping)." % WORKFLOW,
+        "      Lint completion is fanned in by required-check-publisher.yml (its",
+        "      second workflow_run parent is repo-lint). A workflow_run here runs",
+        "      the event job on main's tip and doubles the publisher pass per lint",
+        "      completion. Add CI-side parents to the publisher instead.")
 
 # Property 1 — phase 1 is the FIRST step, unconditional, with its own bindings.
 event_job = jobs.get("merge-clearance-gate")

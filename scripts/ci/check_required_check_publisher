@@ -993,6 +993,40 @@ if GITHUB_SHA_REF.search(raw_text):
 # something other than `;`, `&&`, `||`, `do` or `then`, passes. Closing that
 # needs the parsed-shell substrate tracked in #977; what this buys is that
 # the two spellings that have actually shipped here cannot return silently.
+def strip_shell_comments_quote_aware(text):
+    """Comment stripping that respects shell quoting (Codex P2 on #2171, r2).
+
+    strip_shell_comments above cuts from any whitespace-`#`, which treats the
+    hash inside `echo "state #"; while true; ...` as a comment and hides the
+    loop. This per-line state machine tracks single quotes, double quotes and
+    backslash escapes; a `#` opens a comment only outside both quote kinds and
+    after whitespace (or at line start). Quote state resets per line — a quoted
+    string spanning lines is the stated residual (#977). Used by A14 only; the
+    other text assertions keep the simpler stripper they were verified with.
+    """
+    kept = []
+    for line in text.splitlines():
+        if re.match(r"^[ \t]*#", line):
+            continue
+        out = []
+        sq = dq = esc = False
+        prev = " "
+        for ch in line:
+            if esc:
+                out.append(ch); esc = False; prev = ch; continue
+            if ch == "\\" and not sq:
+                out.append(ch); esc = True; prev = ch; continue
+            if ch == "'" and not dq:
+                sq = not sq
+            elif ch == '"' and not sq:
+                dq = not dq
+            elif ch == "#" and not sq and not dq and prev in " \t":
+                break
+            out.append(ch); prev = ch
+        kept.append("".join(out))
+    return "\n".join(kept)
+
+
 LOOP_AT_STATEMENT = re.compile(
     r"(?m)(?:^[ \t]*|;[ \t]*|&&[ \t]*|\|\|[ \t]*|\bdo[ \t]+|\bthen[ \t]+)"
     r"(while|until)[ \t]+(?!(?:IFS=[^ \t;]*[ \t]+)?read\b)")
@@ -1006,7 +1040,7 @@ for key, job in ((OPEN_JOB, open_job), (PUBLISH_JOB, publish_job)):
     for step in steps:
         if not isinstance(step, dict) or not isinstance(step.get("run"), str):
             continue
-        body = strip_shell_comments(step["run"])
+        body = strip_shell_comments_quote_aware(step["run"])
         label = step.get("name") or step.get("id") or "<unnamed step>"
         hit = LOOP_AT_STATEMENT.search(body)
         if hit:

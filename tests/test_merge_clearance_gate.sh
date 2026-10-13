@@ -4552,6 +4552,11 @@ rcp_case publish-mid-line-poll \
 rcp_case publish-mixed-loop-line \
   's{^(          if ! PASS_START=)}{          while true; do sleep 15; done; while IFS= read -r x; do :; done <<<""\n$1}m' \
   fail '[rcp no runner-held wait]'
+# Quote-aware stripping (Codex P2 on #2171, round 2): a quoted hash before the
+# loop must not hide it as an inline comment.
+rcp_case publish-quoted-hash-before-loop \
+  's{^(          if ! PASS_START=)}{          echo "state #"; while true; do sleep 15; done\n$1}m' \
+  fail '[rcp no runner-held wait]'
 rcp_case open-watch \
   's{^(          if \[ -z "\$HEAD_SHA" \]; then\n            echo "::error::workflow_run.head_sha is empty)}{          gh pr checks "\$HEAD_SHA" --repo "\$REPO" --watch\n$1}m' \
   fail 'passes `--watch`'
@@ -4577,6 +4582,21 @@ mcg22_case gate-while-poll \
 mcg22_case gate-mixed-loop-line \
   's{^(          output=\$\(scripts/merge-clearance-gate.sh "\$PR_NUMBER" "\$REPO" 2>&1\))}{          while true; do sleep 15; done; while IFS= read -r x; do :; done <<<""\n$1}m' \
   fail '[#2167 no runner-held wait]'
+mcg22_case gate-quoted-hash-before-loop \
+  's{^(          output=\$\(scripts/merge-clearance-gate.sh "\$PR_NUMBER" "\$REPO" 2>&1\))}{          echo "state #"; while true; do sleep 15; done\n$1}m' \
+  fail '[#2167 no runner-held wait]'
+# The trigger key respelled: double-quoted, single-quoted with a flow value,
+# and with a space before the colon. The text pre-check and the parsed tier
+# must agree; the needle is the shared tag.
+mcg22_case gate-workflow-run-dquoted \
+  's{^  schedule:\n}{  "workflow_run":\n    workflows: ["repo-lint"]\n    types: [completed]\n  schedule:\n}m' \
+  fail '[#2167 lint fan-in]'
+mcg22_case gate-workflow-run-squoted-flow \
+  's{^  schedule:\n}{  \x27workflow_run\x27: {workflows: ["repo-lint"], types: [completed]}\n  schedule:\n}m' \
+  fail '[#2167 lint fan-in]'
+mcg22_case gate-workflow-run-spaced \
+  's{^  schedule:\n}{  workflow_run :\n    workflows: ["repo-lint"]\n    types: [completed]\n  schedule:\n}m' \
+  fail '[#2167 lint fan-in]'
 mcg22_case gate-watch \
   's{^(          output=\$\(scripts/merge-clearance-gate.sh "\$PR_NUMBER" "\$REPO" 2>&1\))}{          gh pr checks "\$PR_NUMBER" --repo "\$REPO" --watch --required\n$1}m' \
   fail '[#2167 no runner-held wait]'
@@ -4626,6 +4646,9 @@ if [ -x "$AC_CHECK" ] && [ -f "$AC_WF" ]; then
     fail '[#2167 no runner-held wait]'
   ac_case mixed-loop-line \
     's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          while true; do sleep 15; done; while IFS= read -r x; do :; done <<<""\n}m' \
+    fail '[#2167 no runner-held wait]'
+  ac_case quoted-hash-before-loop \
+    's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          echo "state #"; while true; do sleep 15; done\n}m' \
     fail '[#2167 no runner-held wait]'
   ac_case watch \
     's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          gh pr checks "\$PR" --repo "\$REPO" --watch\n}m' \
