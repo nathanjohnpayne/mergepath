@@ -210,7 +210,7 @@ if [ -n "$existing" ]; then
   fi
   if [ "${#label_args[@]}" -gt 0 ]; then
     add_labels="$(printf '%s\n' "${label_args[@]}" | grep -v -- '^--label$' | paste -sd, -)"
-    gh issue edit "$existing" --repo "$REPO" --add-label "$add_labels" >/dev/null 2>&1 || echo "::warning::Could not re-apply labels to #${existing}."  # NO_BARE_GH_WRITE_EXEMPT: CI reporting surface run under the workflow GITHUB_TOKEN (issues:write), no agent identity to verify — same class as daily-feedback-rollup.sh (#412)
+    gh issue edit "$existing" --repo "$REPO" --add-label "$add_labels" >/dev/null 2>&1 || { echo "::warning::Could not re-apply labels to #${existing}."; label_degraded=1; }  # NO_BARE_GH_WRITE_EXEMPT: CI reporting surface run under the workflow GITHUB_TOKEN (issues:write), no agent identity to verify — same class as daily-feedback-rollup.sh (#412)
   fi
   if [ "$previous_alerts" != "$alerts" ]; then
     change_note=":warning: Alert set changed as of ${today} (UTC): now **${alerts//,/, }** (was: ${previous_alerts:-unknown}). Issue body refreshed — see [latest run](${RUN_URL})."

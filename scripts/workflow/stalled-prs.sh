@@ -80,8 +80,8 @@
 #     the head commit; GitHub no longer exposes a push timestamp, and the
 #     commit's own committer date is author-controlled metadata (a future-dated
 #     commit would read as perpetually live). The commit date is used only when
-#     the head has no check runs at all, clamped to the run's own clock, and
-#     the source is reported.
+#     the head has no check runs at all, bounded by the PR's server-set
+#     updated_at (stable across runs), and the source is reported.
 #   - Codex evidence (review objects, inline findings, verdict and Review
 #     Summary comments) is restricted to the Codex bot login; a CodeRabbit or
 #     code-scanning review on the head is a verdict, never a Codex signal.
@@ -234,15 +234,19 @@ else
     head_pushed_at_source="check-run"
     if [ -z "$head_pushed_at" ]; then
       # No check run on the head at all: fall back to the commit's committer
-      # date, clamped to this run's clock so a future-dated commit cannot
-      # read as a push that has not happened yet.
+      # date, bounded by the PR's server-set updated_at. A future-dated
+      # commit therefore reads as pushed no later than the PR last changed —
+      # a STABLE value across runs, unlike this run's clock, which would
+      # re-date the push on every invocation and keep the PR live forever.
       head_pushed_at=$(gh_api_scalar --shape timestamp "PR #$number head commit date" \
         "repos/$REPO/commits/$head_sha" --jq '.commit.committer.date') \
         || infra "could not read the head commit date for PR #$number"
       head_pushed_at_source="commit-date"
-      if [ "$(jq -rn --arg a "$head_pushed_at" --arg b "$NOW" '($a | fromdateiso8601) > ($b | fromdateiso8601)')" = "true" ]; then
-        head_pushed_at="$NOW"
-        head_pushed_at_source="commit-date-clamped"
+      pr_updated_at=$(jq -r '.updated_at // ""' "$WORK/pr.json")
+      if [ -n "$pr_updated_at" ] \
+         && [ "$(jq -rn --arg a "$head_pushed_at" --arg b "$pr_updated_at" '($a | fromdateiso8601) > ($b | fromdateiso8601)')" = "true" ]; then
+        head_pushed_at="$pr_updated_at"
+        head_pushed_at_source="pr-updated-at"
       fi
     fi
     merge_gate_check=$(jq -r --arg name "$MERGE_GATE_CHECK_NAME" '
@@ -346,9 +350,17 @@ CLASSIFY_JQ='
        + [ $pr.reviews[]
            | select((.state // "PENDING") != "PENDING")
            | (actor_class($author)) as $cls
-           | {kind: ("review:" + (.state | ascii_downcase)),
-              side: (if $cls == "author" then "author" else "verdict" end),
-              actor: login, at: .submitted_at, state: .state, commit_id: .commit_id} ]
+           # A body-less COMMENTED review from a bot is the wrapper GitHub puts
+           # around a single inline reply (the CodeRabbit resolve
+           # acknowledgement, nathanjohnpayne/mergepath#919) — activity, not
+           # a verdict. Real bot rounds carry a body.
+           | if $cls == "bot" and (.state == "COMMENTED") and ((.body | norm | gsub("[[:space:]]"; "")) == "") then
+               {kind: "bot-review-wrapper", side: "bot-activity", actor: login, at: .submitted_at}
+             else
+               {kind: ("review:" + (.state | ascii_downcase)),
+                side: (if $cls == "author" then "author" else "verdict" end),
+                actor: login, at: .submitted_at, state: .state, commit_id: .commit_id}
+             end ]
        + [ $pr.issue_comments[]
            | (actor_class($author)) as $cls
            | if (.body | is_handoff) and $cls != "bot" then
@@ -416,13 +428,17 @@ CLASSIFY_JQ='
     | ([ $pr.review_comments[] | select((actor_class($author)) != "author") | select(.in_reply_to_id == null)
          | select(.commit_id == $head or .original_commit_id == $head)
          | .id as $id
+         # Fix and rebuttal replies are posted under a registered reviewer
+         # identity (nathanpayne-*), not the author login: any non-bot reply
+         # answers the finding.
          | select(([ $pr.review_comments[] | select(.in_reply_to_id == $id)
-                     | select((actor_class($author)) == "author") ] | length) == 0)
+                     | select((actor_class($author)) != "bot") ] | length) == 0)
          | {id, actor: login, url: (.html_url // "")} ]) as $unanswered
     # A change request counts only against THIS head: one anchored to the head
     # commit, or submitted after the head was pushed. A CHANGES_REQUESTED from
     # an older round is answered by the push that followed it.
     | ([ $pr.reviews[] | select((actor_class($author)) != "author") | select((.state // "PENDING") != "PENDING")
+         | select((actor_class($author)) != "bot" or ((.body | norm | gsub("[[:space:]]"; "")) != ""))
          | select(.commit_id == $head or ((.submitted_at | ts) >= $head_ts)) ]
        | max_by(.submitted_at | ts) | (.state // null)) as $latest_verdict_state
     # A handoff stays in force until an author-side event or a verdict lands
@@ -447,6 +463,8 @@ CLASSIFY_JQ='
             {class: "waiting-on-bot", reason: (if $request_outstanding then "review request outstanding on head"
                                                elif $summary_running then "Codex reports the head Running"
                                                else "bot activity, no verdict yet" end)}
+          elif ($request_outstanding | not) and $newest.kind == "bot-rate-limited" then
+            {class: "stalled", reason: "rate-limit-stale"}
           else {class: "stalled", reason: "request-unanswered"} end)
        elif $age < $threshold_seconds then {class: "live", reason: "newest event younger than the threshold"}
        elif $newest.side == "verdict" then {class: "stalled", reason: "unanswered-verdict"}
@@ -458,6 +476,11 @@ CLASSIFY_JQ='
        elif $verdict.reason == "ci-pending-stale" then {next_action: "investigate", detail: "head check rollup PENDING for longer than the threshold"}
        # A red head is fixed before anything is re-requested on it.
        elif ($pr.ci_state == "FAILURE" or $pr.ci_state == "ERROR") then {next_action: "push fix", detail: ("head check rollup " + $pr.ci_state)}
+       # A provider rate limit is handled by its own wait (coderabbit-wait.sh
+       # parses the window and requests the sanctioned Codex failover itself);
+       # an unexplained stall there is for a session to look at, never an
+       # automatic Codex request.
+       elif $verdict.reason == "rate-limit-stale" then {next_action: "investigate", detail: "provider rate-limit notice outlived the threshold with no failover request; run scripts/coderabbit-wait.sh"}
        elif $verdict.reason == "request-unanswered" then {next_action: "request codex", detail: "review request outlived the threshold with no verdict"}
        elif ($unanswered | length) > 0 then {next_action: "push fix", detail: (($unanswered | length | tostring) + " unanswered finding(s) on head")}
        elif $latest_verdict_state == "CHANGES_REQUESTED" then {next_action: "push fix", detail: "latest verdict requested changes on head"}

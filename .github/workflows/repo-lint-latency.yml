@@ -85,10 +85,12 @@ jobs:
           if-no-files-found: error
 
       - name: Route the audit verdict to the tracking issue
-        # Runs on a verdict only (rc 0 or 1). Ordered BEFORE the enforce
-        # step so an alert is filed before the job turns red; a routing
-        # failure fails this step on its own and names what was lost.
-        if: steps.latency.outputs.rc == '0' || steps.latency.outputs.rc == '1'
+        # Runs on a verdict only (rc 0 or 1), and `always()` so a transient
+        # failure in the artifact upload above cannot skip the routing of a
+        # verdict that was produced. Ordered BEFORE the enforce step so an
+        # alert is filed before the job turns red; a routing failure fails
+        # this step on its own and names what was lost.
+        if: always() && (steps.latency.outputs.rc == '0' || steps.latency.outputs.rc == '1')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OUT_DIR: ${{ runner.temp }}/repo-lint-latency

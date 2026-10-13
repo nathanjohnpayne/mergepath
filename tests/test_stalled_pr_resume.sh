@@ -58,9 +58,12 @@ pr() {
      merge_gate_check: "absent", ci_state: $ci, reviews: [], issue_comments: [], review_comments: [], gate: null}
     | '"$overrides"
 }
-review() { # <id> <login> <state> <at> <commit>
-  jq -cn --argjson id "$1" --arg login "$2" --arg state "$3" --arg at "$4" --arg commit "$5" \
-    '{id: $id, state: $state, submitted_at: $at, commit_id: $commit, body: "", user: {login: $login, type: (if ($login | endswith("[bot]")) then "Bot" else "User" end)}}'
+review() { # <id> <login> <state> <at> <commit> [body]
+  # A real review round carries a body (Codex: "### 💡 Codex Review", CodeRabbit:
+  # "Actionable comments posted: N"); only the wrapper GitHub emits around a
+  # bot's inline reply is body-less, and a test passes "" for that shape.
+  jq -cn --argjson id "$1" --arg login "$2" --arg state "$3" --arg at "$4" --arg commit "$5" --arg body "${6-review round body}" \
+    '{id: $id, state: $state, submitted_at: $at, commit_id: $commit, body: $body, user: {login: $login, type: (if ($login | endswith("[bot]")) then "Bot" else "User" end)}}'
 }
 comment() { # <id> <login> <at> <body> [updated_at]
   jq -cn --argjson id "$1" --arg login "$2" --arg at "$3" --arg body "$4" --arg updated "${5:-$3}" \
@@ -150,13 +153,25 @@ NBSP_VERDICT="Codex Review: Didn't find any major issues.${NBSP}Reviewed${NBSP}c
   # 122: stale @codex review on a RED head → push fix, not another request
   pr 122 "2026-10-13T05:00:00Z" FAILURE '.issue_comments = [$c]' \
     --argjson c "$(comment 19 "$AUTHOR" "2026-10-13T05:10:00Z" '@codex review')"
+  # 124: handoff, then a BODY-LESS bot review wrapper (CodeRabbit acknowledging a resolve) → still waiting-on-human
+  pr 124 "2026-10-13T05:00:00Z" SUCCESS '.issue_comments = [$h] | .reviews = [$w]' \
+    --argjson h "$(comment 20 "nathanpayne-claude" "2026-10-13T06:00:00Z" '[mergepath-handoff] owner decision needed')" \
+    --argjson w "$(review 11 "$RABBIT" COMMENTED "2026-10-13T07:00:00Z" "$(sha 124)" "")"
+  # 125: Codex finding answered by a registered reviewer identity, not the author login → not unanswered
+  pr 125 "2026-10-13T05:00:00Z" SUCCESS '.reviews = [$rev] | .review_comments = [$f, $r] | .gate = {exit: 1, reason: "gate (b): no APPROVED review"}' \
+    --argjson rev "$(review 12 "$CODEX" COMMENTED "2026-10-13T05:30:00Z" "$(sha 125)")" \
+    --argjson f "$(inline 13 "$CODEX" "2026-10-13T05:30:00Z" "$(sha 125)" null)" \
+    --argjson r "$(inline 14 "nathanpayne-claude" "2026-10-13T05:40:00Z" "$(sha 125)" 13)"
+  # 126: CodeRabbit rate-limit notice hours old, no failover request → investigate, never an automatic Codex request
+  pr 126 "2026-10-13T05:00:00Z" SUCCESS '.issue_comments = [$c]' \
+    --argjson c "$(comment 21 "$RABBIT" "2026-10-13T05:10:00Z" 'Rate limit exceeded; please try again in 12 minutes.')"
   # 123: only a CodeRabbit review on the head, CI green, hours old → head-unrequested / request codex (not a Codex signal)
   pr 123 "2026-10-13T05:00:00Z" SUCCESS '.reviews = [$rev] | .review_comments = [$f]' \
     --argjson rev "$(review 10 "$RABBIT" COMMENTED "2026-10-13T05:20:00Z" "$(sha 123)")" \
     --argjson f "$(inline 12 "$RABBIT" "2026-10-13T05:20:00Z" "$(sha 123)" null)"
 } | jq -s --arg repo "$REPO" --arg now "$NOW" '{schema: "stalled-prs/v1", repo: $repo, fetched_at: $now, prs: .}' > "$TMP/snapshot.json"
 
-if ! jq -e '.prs | length == 23' "$TMP/snapshot.json" >/dev/null; then
+if ! jq -e '.prs | length == 26' "$TMP/snapshot.json" >/dev/null; then
   echo "FAIL: fixture snapshot did not assemble: $(jq -c . "$TMP/snapshot.json" 2>&1 | head -c 300)" >&2
   exit 1
 fi
@@ -218,8 +233,11 @@ expect 121 '.class == "stalled" and .reason == "head-unrequested"'
 expect 122 '.class == "stalled" and .reason == "request-unanswered" and .next_action == "push fix" and .next_action_detail == "head check rollup FAILURE"'
 expect 123 '.class == "stalled" and .reason == "unanswered-verdict" and .codex_signal_on_head == false and .next_action == "push fix" and .next_action_detail == "1 unanswered finding(s) on head"'
 expect 105 '.next_action_detail | startswith("no Merge clearance gate check in this repo")'
+expect 124 '.class == "waiting-on-human" and .reason == "handoff posted"'
+expect 125 '.class == "stalled" and (.unanswered_findings | length) == 0 and .next_action == "investigate"'
+expect 126 '.class == "stalled" and .reason == "rate-limit-stale" and .next_action == "investigate" and (.next_action_detail | contains("coderabbit-wait.sh"))'
 
-if jq -e '[.prs[] | .number] == [101, 116, 111, 122, 123, 110, 112, 119, 105, 114, 117, 118, 121, 106, 108, 120, 107, 104, 102, 113, 103, 115]' "$TMP/report.json" >/dev/null; then
+if jq -e '[.prs[] | .number] == [101, 116, 111, 122, 126, 123, 125, 110, 112, 119, 105, 114, 117, 118, 121, 106, 108, 124, 120, 107, 104, 102, 113, 103, 115]' "$TMP/report.json" >/dev/null; then
   pass "report is ordered stalled-first, oldest newest-event first"
 else
   fail "report order: $(jq -c '[.prs[] | .number]' "$TMP/report.json")"
@@ -230,7 +248,7 @@ bash "$FINDER" --input "$TMP/snapshot.json" --now "$NOW" > "$TMP/human.txt" 2>&1
 rc=$?
 set -e
 if [ "$rc" -eq 1 ] && grep -Fq '#101  stalled  10h15m  review:commented by chatgpt-codex-connector[bot] at 2026-10-13T01:45:00Z  head 0000000  next: push fix — 2 unanswered finding(s) on head' "$TMP/human.txt" \
-   && grep -Fq 'stalled-prs: octo/demo — 22 open non-draft PR(s), threshold 60m, now 2026-10-13T12:00:00Z' "$TMP/human.txt"; then
+   && grep -Fq 'stalled-prs: octo/demo — 25 open non-draft PR(s), threshold 60m, now 2026-10-13T12:00:00Z' "$TMP/human.txt"; then
   pass "human output carries one line per PR with class, age, newest event, head and next action"
 else
   fail "human output (rc=$rc): $(head -3 "$TMP/human.txt")"
@@ -377,15 +395,16 @@ cat > "$TMP/fixture/pulls.json" <<'JSON'
   "user":{"login":"nathanjohnpayne"},"head":{"sha":"4242424242424242424242424242424242424242","ref":"feat/42","repo":{"full_name":"fork/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]},
  {"number":43,"title":"Draft","html_url":"https://github.com/octo/demo/pull/43","draft":true,
   "user":{"login":"nathanjohnpayne"},"head":{"sha":"4343434343434343434343434343434343434343","ref":"feat/43","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]},
- {"number":44,"title":"Future-dated head, no checks","html_url":"https://github.com/octo/demo/pull/44","draft":false,
+ {"number":44,"title":"Future-dated head, no checks","html_url":"https://github.com/octo/demo/pull/44","draft":false,"updated_at":"2026-10-13T05:00:00Z",
   "user":{"login":"nathanjohnpayne"},"head":{"sha":"4444444444444444444444444444444444444444","ref":"feat/44","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]},
  {"number":42,"title":"Pushed and forgotten (repeated by a page boundary)","html_url":"https://github.com/octo/demo/pull/42","draft":false,
   "user":{"login":"nathanjohnpayne"},"head":{"sha":"4242424242424242424242424242424242424242","ref":"feat/42","repo":{"full_name":"fork/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]}]
 JSON
 # 41: three check runs on the head, the merge gate newest and green; 42: no
 # check runs at all (push time falls back to the commit date); 43: draft;
-# 44: no check runs and a FUTURE-dated commit (clamped to --now, so it reads
-# as a fresh push rather than as a head that stays live until that date).
+# 44: no check runs and a FUTURE-dated commit (bounded by the PR's server-set
+# updated_at, a stable value, so it neither stays live until that date nor
+# re-dates itself to each run's clock).
 cat > "$TMP/fixture/check-runs-41.json" <<'JSON'
 {"name":"lint","status":"completed","conclusion":"success","started_at":"2026-10-13T06:00:00Z","completed_at":"2026-10-13T06:20:00Z"}
 {"name":"Merge clearance gate","status":"completed","conclusion":"failure","started_at":"2026-10-13T06:01:00Z","completed_at":"2026-10-13T06:02:00Z"}
@@ -406,17 +425,18 @@ PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fix
 rc=$?
 set -e
 if [ "$rc" -eq 1 ] \
-   && jq -e '[.prs[] | .number] == [42, 41, 44]' "$TMP/live.json" >/dev/null \
+   && jq -e '[.prs[] | .number] == [44, 42, 41]' "$TMP/live.json" >/dev/null \
    && jq -e '[.prs[] | select(.number == 41)][0] | .class == "stalled" and .next_action == "merge" and .gate.exit == 0 and .head_ref == "feat/41" and .merge_gate_check == "success" and .head_pushed_at == "2026-10-13T06:00:00Z" and .head_pushed_at_source == "check-run" and .fork == false' "$TMP/live.json" >/dev/null \
    && jq -e '[.prs[] | select(.number == 42)][0] | .class == "stalled" and .reason == "head-unrequested" and .next_action == "request codex" and .gate.exit == 1 and (.gate.reason | contains("gate (c)")) and .merge_gate_check == "absent" and .head_pushed_at == "2026-10-13T06:00:00Z" and .head_pushed_at_source == "commit-date" and .fork == true and .head_repo == "fork/demo"' "$TMP/live.json" >/dev/null \
-   && jq -e '[.prs[] | select(.number == 44)][0] | .class == "live" and .head_pushed_at == "2026-10-13T12:00:00Z" and .head_pushed_at_source == "commit-date-clamped" and .gate == null' "$TMP/live.json" >/dev/null; then
+   && jq -e '[.prs[] | select(.number == 44)][0] | .class == "stalled" and .reason == "head-unrequested" and .head_pushed_at == "2026-10-13T05:00:00Z" and .head_pushed_at_source == "pr-updated-at"' "$TMP/live.json" >/dev/null; then
   pass "live fetch normalizes the open PRs, delegates merge readiness to the gate, and records its reason"
 else
   fail "live fetch (rc=$rc): $(cat "$TMP/live.err") $(jq -c '[.prs[] | {number, class, next_action, gate}]' "$TMP/live.json" 2>/dev/null)"
 fi
 
-if [ "$(grep -c 'gate-called' "$TMP/gate.log")" -eq 2 ] \
+if [ "$(grep -c 'gate-called' "$TMP/gate.log")" -eq 3 ] \
    && grep -Fq 'gate-called 41 octo/demo' "$TMP/gate.log" \
+   && grep -Fq 'gate-called 44 octo/demo' "$TMP/gate.log" \
    && [ "$(grep -c -- '--paginate repos/octo/demo/pulls?state=open' "$TMP/gh.log")" -eq 1 ] \
    && [ "$(grep -c -- '--paginate repos/octo/demo/pulls/41/reviews' "$TMP/gh.log")" -eq 1 ] \
    && [ "$(grep -c -- '--paginate repos/octo/demo/issues/41/comments' "$TMP/gh.log")" -eq 1 ] \

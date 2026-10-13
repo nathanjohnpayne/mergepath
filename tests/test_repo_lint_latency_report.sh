@@ -228,11 +228,11 @@ fi
 if command -v yq >/dev/null 2>&1 \
    && yq -o=json '.' "$WORKFLOW" | jq -e '.permissions.issues == "write" and .permissions.actions == "read"
              and ([.jobs.report.steps[] | select(.name == "Route the audit verdict to the tracking issue")
-                   | select((.if | contains("steps.latency.outputs.rc == '\''0'\''")) and (.if | contains("steps.latency.outputs.rc == '\''1'\''")))
+                   | select((.if | startswith("always() && ")) and (.if | contains("steps.latency.outputs.rc == '\''0'\''")) and (.if | contains("steps.latency.outputs.rc == '\''1'\''")))
                    | select((.run | contains("scripts/repo-lint-latency-issue.sh")) and (.run | contains("--labels \"area:ci-infra,audit\"")) and (.run | contains("--rc \"$AUDIT_RC\"")))
                    | select(.env.GH_TOKEN == "${{ secrets.GITHUB_TOKEN }}")] | length == 1)
              and (([.jobs.report.steps[] | .name] | index("Route the audit verdict to the tracking issue")) < ([.jobs.report.steps[] | .name] | index("Enforce latency and duplication alerts")))' >/dev/null; then
-  pass "workflow routes rc 0/1 to the tracking-issue script with GITHUB_TOKEN issues:write before enforcing the alert"
+  pass "workflow routes rc 0/1 to the tracking-issue script under always() with GITHUB_TOKEN issues:write before enforcing the alert"
 else
   fail "workflow must carry the marker-keyed tracking-issue step (issues:write, both verdict rcs, before the enforce step)"
 fi
@@ -256,6 +256,7 @@ case "$1 $2" in
     while [ "$#" -gt 0 ]; do [ "$1" = "--body-file" ] && cp "$2" "$SHIM_STATE/created-body.md"; shift; done
     echo "https://github.com/octo/demo/issues/123" ;;
   "issue edit")
+    if [ -f "$SHIM_STATE/add-label-fail" ] && printf '%s' "$*" | grep -q -- '--add-label'; then echo "gh: label not found" >&2; exit 1; fi
     while [ "$#" -gt 0 ]; do [ "$1" = "--body-file" ] && cp "$2" "$SHIM_STATE/edited-body.md"; shift; done ;;
   "issue comment"|"issue close") ;;
   *) echo "gh shim: unhandled: $*" >&2; exit 1 ;;
@@ -325,6 +326,17 @@ if [ "$rc" -eq 0 ] && grep -Fq 'issue edit 77 --repo octo/demo --title' "$S3/cal
   pass "a changed alert set is commented on the refreshed issue"
 else
   fail "alert change comment (rc=$rc): $out $(calls "$S3")"
+fi
+
+# 3b. labels that cannot be re-applied to the existing tracker degrade the step to exit 1 after the refresh
+S3B="$SHIM/s3b"; mkdir -p "$S3B"
+cp "$S3/issues.json" "$S3B/issues.json"; printf 'audit\narea:ci-infra\n' > "$S3B/labels.txt"; : > "$S3B/add-label-fail"
+set +e; out=$(route "$S3B" 1 2>&1); rc=$?; set -e
+if [ "$rc" -eq 1 ] && grep -Fq 'issue edit 77 --repo octo/demo --title' "$S3B/calls.log" \
+   && printf '%s' "$out" | grep -Fq '::error::A tracking label could not be ensured'; then
+  pass "a failed label re-apply on the existing tracker still refreshes it and then fails the step"
+else
+  fail "add-label failure (rc=$rc): $out $(calls "$S3B")"
 fi
 
 # 4. recovery with an open tracking issue → closed with a recovery comment; nothing created
