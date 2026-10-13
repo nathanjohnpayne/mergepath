@@ -1,0 +1,825 @@
+#!/usr/bin/env bash
+# tests/test_gh_rest_transport.sh
+#
+# Regression suite for scripts/lib/gh-rest-transport.sh (#1057 item A,
+# #1542): the REST transport the write wrappers use on a cloud surface, where
+# every `gh pr` / `gh issue` subcommand is GraphQL and the proxy refuses it.
+#
+# The gh stub below serves REST fixtures by method and endpoint, synthesizes
+# the issue events a real write produces (so the event-based readback is
+# exercised against what GitHub would return), and records every call with
+# the token it carried. STUB_WRITE_LOGIN, STUB_PR_AUTHOR, STUB_EVENT_ACTOR and
+# STUB_DUPLICATE_ACTOR make a write land under another login, which is the
+# mutation each readback must catch.
+#
+# Bash 3.2 portable.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LIB="$ROOT/scripts/lib/gh-rest-transport.sh"
+AUTHOR="$ROOT/scripts/gh-as-author.sh"
+REVIEWER="$ROOT/scripts/gh-as-reviewer.sh"
+
+[ -r "$LIB" ] || { echo "missing $LIB" >&2; exit 1; }
+[ -x "$AUTHOR" ] || { echo "missing or non-executable $AUTHOR" >&2; exit 1; }
+[ -x "$REVIEWER" ] || { echo "missing or non-executable $REVIEWER" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "jq is required" >&2; exit 1; }
+command -v node >/dev/null 2>&1 || { echo "SKIP: node not available (the PR-body contract needs it)" >&2; exit 0; }
+
+# The stub records the token each call carried, and failing cases print that
+# log, so the ambient credential environment is scrubbed here (#996). Every
+# case pins its own fixture token.
+unset OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT GH_TOKEN GITHUB_TOKEN GH_HOST GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+unset CLAUDE_CODE_REMOTE MERGEPATH_AGENT_SURFACE MERGEPATH_GH_TRANSPORT MERGEPATH_AGENT OP_PREFLIGHT_AGENT GH_REPO GH_AS_AUTHOR_TRACE_MARKER
+
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/gh-rest-transport-test.XXXXXX")"
+trap 'rm -rf "$WORKDIR"' EXIT
+
+PASS=0
+FAIL=0
+pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
+
+# ---------------------------------------------------------------------------
+# gh stub
+# ---------------------------------------------------------------------------
+STUB_DIR="$WORKDIR/stub-bin"
+mkdir -p "$STUB_DIR"
+cat >"$STUB_DIR/gh" <<'STUB'
+#!/usr/bin/env bash
+LOG="${GH_CALLS_LOG:-/dev/null}"
+STATE="${STUB_STATE:-/tmp}"
+line="GH_TOKEN=${GH_TOKEN:-} GITHUB_TOKEN=${GITHUB_TOKEN:-} ENT=${GH_ENTERPRISE_TOKEN:-}|${GITHUB_ENTERPRISE_TOKEN:-} gh"  # TOKEN_OUTPUT_EXEMPT: records the fixture token the wrapper selected; every case pins it inline and the ambient credential env is scrubbed above (#996)
+input=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--input" ]; then
+    # The JSON the wrapper sent, in place of its private temp path.
+    input="$(jq -c . "$a")"
+    line="$line"$'\t'"$input"
+  else
+    line="$line"$'\t'"$a"
+  fi
+  prev="$a"
+done
+printf '%s\n' "$line" >>"$LOG"
+
+case "${GH_TOKEN:-}" in
+  ghp_author-token|gho_fallback-author-token) login=nathanjohnpayne ;;
+  ghp_reviewer-token|gho_fallback-claude-token) login=nathanpayne-claude ;;
+  ghp_codex-token|gho_fallback-codex-token) login=nathanpayne-codex ;;
+  proxy-injected) login=nathanjohnpayne ;;
+  *) login="" ;;
+esac
+write_login="${STUB_WRITE_LOGIN:-$login}"
+actor="${STUB_EVENT_ACTOR:-$login}"
+
+if [ "${1:-}" = auth ] && [ "${2:-}" = switch ]; then
+  echo "gh auth switch must not be called" >&2
+  exit 90
+fi
+if [ "${1:-}" = auth ] && [ "${2:-}" = token ]; then
+  [ -n "${STUB_NO_KEYRING:-}" ] && exit 1
+  user=""
+  shift 2
+  while [ "$#" -gt 0 ]; do
+    [ "$1" = "--user" ] && { user="${2:-}"; break; }
+    shift
+  done
+  case "$user" in
+    nathanjohnpayne) echo gho_fallback-author-token ;;
+    nathanpayne-claude) echo gho_fallback-claude-token ;;
+    nathanpayne-codex) echo gho_fallback-codex-token ;;
+    *) exit 3 ;;
+  esac
+  exit 0
+fi
+if [ "${1:-}" = api ] && [ "${2:-}" = user ]; then
+  [ -n "$login" ] || exit 4
+  echo "$login"
+  exit 0
+fi
+
+# Not `gh api`: the gh transport ran the wrapped command. Record and succeed.
+if [ "${1:-}" != api ]; then
+  case "${1:-} ${2:-}" in
+    "pr create"|"pr new") echo "${GH_CREATE_PR_URL:-https://github.com/o/r/pull/42}" ;;
+    "pr view") echo "${GH_VIEW_AUTHOR:-nathanjohnpayne}" ;;
+  esac
+  exit "${GH_GENERIC_RC:-0}"
+fi
+
+shift
+method=GET
+endpoint=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --method|-X) method="$2"; shift 2 ;;
+    --input|--jq|--hostname|-f|-F|-H|--header) shift 2 ;;
+    -*) shift ;;
+    *) endpoint="$1"; shift ;;
+  esac
+done
+REPO="${STUB_REPO:-o/r}"
+events_file="$STATE/events.json"
+[ -f "$events_file" ] || echo '[]' >"$events_file"
+
+add_event() { # <event> <extra json object>
+  local n who
+  for who in "$actor" "${STUB_DUPLICATE_ACTOR:-}"; do
+    [ -n "$who" ] || continue
+    n="$(jq 'length' "$events_file")"
+    jq --arg ev "$1" --argjson extra "$2" --arg who "$who" --argjson id "$((1000 + n))" \
+      '. + [($extra + {event: $ev, id: $id, actor: {login: $who}})]' "$events_file" >"$events_file.tmp" \
+      && mv "$events_file.tmp" "$events_file"
+  done
+}
+number_of() { printf '%s' "$1" | sed -E 's#^repos/[^/]+/[^/]+/(pulls|issues)/([0-9]+).*#\2#'; }
+url_of() { printf 'https://github.com/%s/pull/%s' "$REPO" "$1"; }
+
+case "$method $endpoint" in
+  "GET repos/$REPO")
+    jq -n --arg r "$REPO" '{full_name: $r, default_branch: "main"}' ;;
+  "GET repos/$REPO/pulls/"*)
+    [ -z "${STUB_PR_MISSING:-}" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+    num="$(number_of "$endpoint")"
+    jq -n --arg num "$num" --arg url "$(url_of "$num")" --arg title "${STUB_PR_TITLE:-Old title}" \
+      --arg body "${STUB_PR_BODY:-old body}" --arg base "${STUB_PR_BASE:-main}" \
+      --arg labels "${STUB_PR_LABELS:-}" --arg reviewers "${STUB_PR_REVIEWERS:-}" --arg assignees "${STUB_PR_ASSIGNEES:-}" \
+      --arg state "${STUB_PR_STATE:-open}" --arg href "${STUB_PR_HEAD_REF:-feature}" --arg hrepo "${STUB_PR_HEAD_REPO:-$REPO}" \
+      --arg author "${STUB_PR_AUTHOR:-$write_login}" '
+      {number: ($num | tonumber), html_url: $url, state: $state, title: $title, body: $body,
+       user: {login: $author}, base: {ref: $base}, head: {ref: $href, repo: {full_name: $hrepo}},
+       labels: ($labels | split(",") | map(select(length > 0)) | map({name: .})),
+       requested_reviewers: ($reviewers | split(",") | map(select(length > 0)) | map({login: .})),
+       assignees: ($assignees | split(",") | map(select(length > 0)) | map({login: .}))}' ;;
+  "GET repos/$REPO/issues/"*"/events?per_page=100")
+    [ -z "${STUB_EVENTS_FAIL:-}" ] || { echo "gh: HTTP 502" >&2; exit 1; }
+    jq -n --argjson before "${STUB_EVENTS_BEFORE:-[]}" --slurpfile ev "$events_file" '[$before + $ev[0]]' ;;
+  "POST repos/$REPO/pulls")
+    [ -z "${STUB_CREATE_FAIL:-}" ] || { echo "gh: Validation Failed (HTTP 422)" >&2; exit 1; }
+    jq -n --arg url "$(url_of 42)" --arg login "$write_login" '{number: 42, html_url: $url, user: {login: $login}}' ;;
+  "POST repos/$REPO/issues/"*"/comments")
+    [ -z "${STUB_COMMENT_FAIL:-}" ] || { echo "gh: Forbidden (HTTP 403)" >&2; exit 1; }
+    num="$(number_of "$endpoint")"
+    jq -n --arg url "$(url_of "$num")#issuecomment-900" --arg login "$write_login" '{id: 900, html_url: $url, user: {login: $login}}' ;;
+  "POST repos/$REPO/pulls/"*"/reviews")
+    num="$(number_of "$endpoint")"
+    jq -n --arg url "$(url_of "$num")#pullrequestreview-77" --arg login "$write_login" --arg ev "$(printf '%s' "$input" | jq -r '.event')" \
+      '{id: 77, html_url: $url, user: {login: $login}, state: (if $ev == "APPROVE" then "APPROVED" elif $ev == "REQUEST_CHANGES" then "CHANGES_REQUESTED" else "COMMENTED" end)}' ;;
+  "PATCH repos/$REPO/pulls/"*)
+    [ -z "${STUB_PATCH_FAIL:-}" ] || { echo "gh: Validation Failed (HTTP 422)" >&2; exit 1; }
+    t="$(printf '%s' "$input" | jq -r '.title // empty')"
+    [ -z "$t" ] || add_event renamed "$(jq -n --arg t "$t" '{rename: {from: "Old title", to: $t}}')"
+    b="$(printf '%s' "$input" | jq -r '.base // empty')"
+    [ -z "$b" ] || add_event base_ref_changed '{}'
+    s="$(printf '%s' "$input" | jq -r '.state // empty')"
+    [ "$s" != "closed" ] || add_event closed '{}'
+    echo '{"ok": true}' ;;
+  "POST repos/$REPO/issues/"*"/labels")
+    printf '%s' "$input" | jq -r '.labels[]' | while IFS= read -r l; do
+      add_event labeled "$(jq -n --arg l "$l" '{label: {name: $l}}')"
+    done
+    echo '[]' ;;
+  "DELETE repos/$REPO/issues/"*"/labels/"*)
+    name="${endpoint##*/labels/}"
+    # shellcheck disable=SC2059  # %XX escapes become \xXX for printf %b
+    decoded="$(printf '%b' "$(printf '%s' "$name" | sed 's/%/\\x/g')")"
+    add_event unlabeled "$(jq -n --arg l "$decoded" '{label: {name: $l}}')"
+    echo '[]' ;;
+  "POST repos/$REPO/pulls/"*"/requested_reviewers")
+    printf '%s' "$input" | jq -r '.reviewers[]' | while IFS= read -r u; do
+      add_event review_requested "$(jq -n --arg u "$u" '{requested_reviewer: {login: $u}}')"
+    done
+    echo '{}' ;;
+  "DELETE repos/$REPO/pulls/"*"/requested_reviewers")
+    printf '%s' "$input" | jq -r '.reviewers[]' | while IFS= read -r u; do
+      add_event review_request_removed "$(jq -n --arg u "$u" '{requested_reviewer: {login: $u}}')"
+    done
+    echo '{}' ;;
+  "POST repos/$REPO/issues/"*"/assignees")
+    printf '%s' "$input" | jq -r '.assignees[]' | while IFS= read -r u; do
+      add_event assigned "$(jq -n --arg u "$u" '{assignee: {login: $u}}')"
+    done
+    echo '{}' ;;
+  "DELETE repos/$REPO/issues/"*"/assignees")
+    printf '%s' "$input" | jq -r '.assignees[]' | while IFS= read -r u; do
+      add_event unassigned "$(jq -n --arg u "$u" '{assignee: {login: $u}}')"
+    done
+    echo '{}' ;;
+  "DELETE repos/$REPO/git/refs/heads/"*)
+    [ -z "${STUB_DELETE_REF_FAIL:-}" ] || { echo "gh: Unprocessable (HTTP 422)" >&2; exit 1; }
+    exit 0 ;;
+  *)
+    echo "stub gh: unhandled $method $endpoint" >&2
+    exit "${GH_GENERIC_RC:-1}" ;;
+esac
+exit 0
+STUB
+chmod +x "$STUB_DIR/gh"
+
+LOGF="$WORKDIR/calls.log"
+STATE="$WORKDIR/state"
+new_case() { : >"$LOGF"; rm -rf "$STATE"; mkdir -p "$STATE"; }
+as_author() {
+  PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$LOGF" STUB_STATE="$STATE" OP_PREFLIGHT_AUTHOR_PAT="${OP_PREFLIGHT_AUTHOR_PAT:-ghp_author-token}" bash "$AUTHOR" "$@"
+}
+as_reviewer() {
+  PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$LOGF" STUB_STATE="$STATE" OP_PREFLIGHT_REVIEWER_PAT="${OP_PREFLIGHT_REVIEWER_PAT:-ghp_reviewer-token}" bash "$REVIEWER" "$@"
+}
+log_has() { grep -qF -- "$1" "$LOGF"; }
+log_lacks() { ! grep -qF -- "$1" "$LOGF"; }
+# Every api call under the REST transport carries the verified token alone.
+log_token_clean() { # <token>; the identity check's `api user` runs before the transport, outside its environment
+  ! grep -F $'gh\tapi' "$LOGF" | grep -v -F $'gh\tapi\tuser' | grep -v -F "GH_TOKEN=$1 GITHUB_TOKEN= ENT=mergepath-guarded-write-github-com-only|mergepath-guarded-write-github-com-only gh" | grep -q .
+}
+
+VALID_BODY="$WORKDIR/valid-body.md"
+printf '%s\n' 'Authoring-Agent: codex' '' '## Self-Review' '' '- Correctness: verified.' >"$VALID_BODY"
+INVALID_BODY="$WORKDIR/invalid-body.md"
+printf '%s\n' 'no agent line here' >"$INVALID_BODY"
+COMMENT_FILE="$WORKDIR/comment.md"
+printf '%s\n' 'line one' 'line two' >"$COMMENT_FILE"
+
+# ---------------------------------------------------------------------------
+# gh_transport_select
+# ---------------------------------------------------------------------------
+select_is() { # <expected> <env assignments...>
+  local expected="$1" got rc=0
+  shift
+  # shellcheck disable=SC2016  # $1 is expanded by the inner bash
+  got="$(env -u CLAUDE_CODE_REMOTE -u MERGEPATH_AGENT_SURFACE -u MERGEPATH_GH_TRANSPORT "$@" bash -c '. "$1"; gh_transport_select' _ "$LIB" 2>/dev/null)" || rc=$?
+  if [ "$expected" = "refused" ]; then
+    if [ "$rc" -ne 0 ] && [ -z "$got" ]; then
+      pass "transport select: $* -> refused"
+    else
+      fail "transport select: $* -> rc=$rc got=$got, expected refusal"
+    fi
+  elif [ "$rc" -eq 0 ] && [ "$got" = "$expected" ]; then
+    pass "transport select: ${*:-(no env)} -> $expected"
+  else
+    fail "transport select: ${*:-(no env)} -> rc=$rc got=$got, expected $expected"
+  fi
+}
+select_is gh
+select_is rest CLAUDE_CODE_REMOTE=true
+select_is rest MERGEPATH_AGENT_SURFACE=claude-cloud
+select_is rest MERGEPATH_AGENT_SURFACE=codex-cloud
+select_is gh MERGEPATH_AGENT_SURFACE=local CLAUDE_CODE_REMOTE=true
+select_is gh MERGEPATH_AGENT_SURFACE=ci
+select_is gh MERGEPATH_GH_TRANSPORT=gh CLAUDE_CODE_REMOTE=true
+select_is rest MERGEPATH_GH_TRANSPORT=rest
+select_is refused MERGEPATH_GH_TRANSPORT=graphql
+select_is refused MERGEPATH_AGENT_SURFACE=somewhere
+
+# ---------------------------------------------------------------------------
+# Transport through the wrappers
+# ---------------------------------------------------------------------------
+new_case
+set +e
+out="$(as_reviewer -- gh pr comment 123 --repo o/r --body hi 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'gh\tpr\tcomment\t123' && log_lacks $'api\t--method'; then
+  pass "local session: the wrapped gh command runs, no REST call"
+else
+  fail "local session: rc=$rc"; cat "$LOGF" >&2
+fi
+
+new_case
+set +e
+out="$(CLAUDE_CODE_REMOTE=true as_reviewer -- gh pr comment 123 --repo o/r --body hi 2>"$WORKDIR/err")"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ "$out" = "https://github.com/o/r/pull/123#issuecomment-900" ] \
+   && log_has $'gh\tapi\trepos/o/r/pulls/123' \
+   && log_has $'gh\tapi\t--method\tPOST\trepos/o/r/issues/123/comments\t--input\t'"$(printf '%s' '{"body":"hi"}')" \
+   && log_lacks $'gh\tpr\tcomment' && log_token_clean ghp_reviewer-token \
+   && grep -q 'verified comment https://github.com/o/r/pull/123#issuecomment-900 author=nathanpayne-claude' "$WORKDIR/err"; then
+  pass "Claude cloud: pr comment runs as a REST POST under the verified token, reads the byline back, prints gh's URL"
+else
+  fail "Claude cloud pr comment: rc=$rc out=$out"; cat "$LOGF" "$WORKDIR/err" >&2
+fi
+
+new_case
+set +e
+out="$(MERGEPATH_AGENT_SURFACE=codex-cloud MERGEPATH_AGENT=codex OP_PREFLIGHT_REVIEWER_PAT=ghp_codex-token as_reviewer -- gh issue comment 7 --repo o/r --body-file "$COMMENT_FILE" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ "$out" = "https://github.com/o/r/pull/7#issuecomment-900" ] \
+   && log_has $'POST\trepos/o/r/issues/7/comments\t--input\t'"$(printf '%s' '{"body":"line one\nline two"}')" \
+   && log_lacks 'repos/o/r/pulls/7' && log_token_clean ghp_codex-token; then
+  pass "Codex cloud: issue comment runs as REST from --body-file, as nathanpayne-codex, with no PR read"
+else
+  fail "Codex cloud issue comment: rc=$rc out=$out"; cat "$LOGF" >&2
+fi
+
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr comment 5 --repo=o/r --body '@codex review' >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/issues/5/comments\t--input\t'"$(printf '%s' '{"body":"@codex review"}')" && log_token_clean ghp_author-token; then
+  pass "forced REST locally: the author's Codex trigger comment posts with --repo=OWNER/REPO attached"
+else
+  fail "forced REST author comment: rc=$rc"; cat "$LOGF" >&2
+fi
+
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=graphql as_reviewer -- gh pr comment 5 --repo o/r --body x 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'MERGEPATH_GH_TRANSPORT must be auto, gh or rest' && log_lacks $'pr\tcomment' && log_lacks 'POST'; then
+  pass "unknown transport value: refused, nothing written"
+else
+  fail "unknown transport: rc=$rc err=$err"
+fi
+
+# ---------------------------------------------------------------------------
+# Closed grammar: comment
+# ---------------------------------------------------------------------------
+refused_rest() { # <label> <wrapper fn> <args...>; expects rc 1, the form in the message, and no write
+  local label="$1" fn="$2" rc=0 err
+  shift 2
+  new_case
+  set +e
+  err="$(MERGEPATH_GH_TRANSPORT=rest "$fn" -- "$@" 2>&1 >/dev/null)"; rc=$?
+  set -e
+  if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'the REST transport accepts exactly' && log_lacks $'--method\tPOST' && log_lacks $'--method\tPATCH' && log_lacks $'--method\tDELETE'; then
+    pass "refused before any write: $label"
+  else
+    fail "$label: rc=$rc err=$err"; cat "$LOGF" >&2
+  fi
+}
+refused_rest "comment without a body" as_reviewer gh pr comment 1 --repo o/r
+refused_rest "comment without --repo" as_reviewer gh pr comment 1 --body x
+refused_rest "comment by URL" as_reviewer gh pr comment https://github.com/o/r/pull/1 --repo o/r --body x
+refused_rest "comment by branch" as_reviewer gh pr comment feature --repo o/r --body x
+refused_rest "comment with a short option" as_reviewer gh pr comment 1 -R o/r --body x
+refused_rest "comment --edit-last" as_reviewer gh pr comment 1 --repo o/r --body x --edit-last
+refused_rest "comment --body-file -" as_reviewer gh pr comment 1 --repo o/r --body-file -
+refused_rest "comment with two bodies" as_reviewer gh pr comment 1 --repo o/r --body x --body-file "$COMMENT_FILE"
+refused_rest "comment with a missing body file" as_reviewer gh pr comment 1 --repo o/r --body-file "$WORKDIR/absent.md"
+refused_rest "comment with a --repo that is not OWNER/REPO" as_reviewer gh pr comment 1 --repo r --body x
+refused_rest "options before the verb" as_reviewer gh pr --repo o/r comment 1 --body x
+refused_rest "a pr verb the transport does not run (view)" as_reviewer gh pr view 1 --repo o/r
+refused_rest "a pr verb the transport does not run (ready)" as_author gh pr ready 1 --repo o/r
+refused_rest "an issue verb the transport does not run (close)" as_author gh issue close 1 --repo o/r
+
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_WRITE_LOGIN='claude[bot]' as_reviewer -- gh pr comment 123 --repo o/r --body hi 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "landed under 'claude\[bot\]', expected 'nathanpayne-claude'" && printf '%s' "$err" | grep -q '#241'; then
+  pass "comment readback: a bot byline exits 5 with the #241 recovery"
+else
+  fail "comment readback mutation: rc=$rc err=$err"
+fi
+
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_PR_MISSING=1 as_reviewer -- gh pr comment 404 --repo o/r --body hi 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'could not read pull request o/r#404' && log_lacks 'POST'; then
+  pass "pr comment on a missing PR: refused before the write"
+else
+  fail "pr comment missing PR: rc=$rc err=$err"
+fi
+
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_COMMENT_FAIL=1 as_reviewer -- gh pr comment 1 --repo o/r --body hi 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'HTTP 403'; then
+  pass "comment POST failure: gh's error and exit status propagate"
+else
+  fail "comment POST failure: rc=$rc err=$err"
+fi
+
+# ---------------------------------------------------------------------------
+# review
+# ---------------------------------------------------------------------------
+new_case
+set +e
+out="$(MERGEPATH_GH_TRANSPORT=rest as_reviewer -- gh pr review 9 --repo o/r --approve 2>"$WORKDIR/err")"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ -z "$out" ] && log_has $'POST\trepos/o/r/pulls/9/reviews\t--input\t'"$(printf '%s' '{"event":"APPROVE"}')" \
+   && grep -q 'verified review https://github.com/o/r/pull/9#pullrequestreview-77 (APPROVED) author=nathanpayne-claude' "$WORKDIR/err"; then
+  pass "review --approve: POST with the APPROVE event, no body, nothing on stdout (gh parity), byline verified"
+else
+  fail "review approve: rc=$rc out=$out"; cat "$LOGF" "$WORKDIR/err" >&2
+fi
+
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest as_reviewer -- gh pr review 9 --repo o/r --request-changes --body-file "$COMMENT_FILE" >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/pulls/9/reviews\t--input\t'"$(printf '%s' '{"event":"REQUEST_CHANGES","body":"line one\nline two"}')"; then
+  pass "review --request-changes: POST with the event and the body file"
+else
+  fail "review request-changes: rc=$rc"; cat "$LOGF" >&2
+fi
+
+refused_rest "review --comment without a body" as_reviewer gh pr review 9 --repo o/r --comment
+refused_rest "review with two events" as_reviewer gh pr review 9 --repo o/r --approve --comment --body x
+refused_rest "review with no event" as_reviewer gh pr review 9 --repo o/r --body x
+refused_rest "review --approve=yes" as_reviewer gh pr review 9 --repo o/r --approve=yes
+
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_WRITE_LOGIN='claude[bot]' as_reviewer -- gh pr review 9 --repo o/r --approve 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "review https://github.com/o/r/pull/9#pullrequestreview-77 landed under 'claude\[bot\]'"; then
+  pass "review readback: a bot byline exits 5"
+else
+  fail "review readback mutation: rc=$rc err=$err"
+fi
+
+# ---------------------------------------------------------------------------
+# create
+# ---------------------------------------------------------------------------
+new_case
+set +e
+out="$(MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --title 'T' --body-file "$VALID_BODY" --head feature/x --base main --draft --label a --label 'b c,d' --reviewer nathanpayne-codex --assignee nathanjohnpayne 2>"$WORKDIR/err")"; rc=$?
+set -e
+expected_body="$(cat "$VALID_BODY")"
+create_input="$(jq -nc --arg body "$expected_body" '{title: "T", body: $body, head: "feature/x", base: "main", draft: true}')"
+if [ "$rc" -eq 0 ] && [ "$out" = "https://github.com/o/r/pull/42" ] \
+   && log_has $'POST\trepos/o/r/pulls\t--input\t'"$create_input" \
+   && log_has $'gh\tapi\trepos/o/r/pulls/42' \
+   && log_has $'POST\trepos/o/r/issues/42/labels\t--input\t'"$(printf '%s' '{"labels":["a","b c","d"]}')" \
+   && log_has $'POST\trepos/o/r/pulls/42/requested_reviewers\t--input\t'"$(printf '%s' '{"reviewers":["nathanpayne-codex"]}')" \
+   && log_has $'POST\trepos/o/r/issues/42/assignees\t--input\t'"$(printf '%s' '{"assignees":["nathanjohnpayne"]}')" \
+   && log_has 'repos/o/r/issues/42/events?per_page=100' \
+   && log_lacks $'gh\tpr\tcreate' && log_lacks 'repos/o/r'$'\t' && log_token_clean ghp_author-token \
+   && grep -q 'verified PR #42 author=nathanjohnpayne (matches expected nathanjohnpayne)' "$WORKDIR/err" \
+   && grep -q "verified on PR #42 by nathanjohnpayne: labeled:a, labeled:b c, labeled:d, review_requested:nathanpayne-codex, assigned:nathanjohnpayne" "$WORKDIR/err"; then
+  pass "pr create: REST POST with the validated body, the #241 re-read, labels/reviewers/assignees as follow-ups attributed through events, gh's URL on stdout"
+else
+  fail "pr create: rc=$rc out=$out"; cat "$LOGF" "$WORKDIR/err" >&2
+fi
+
+# --base defaults to the repository's default branch; --head to the checked-out branch.
+GITREPO="$WORKDIR/gitrepo"
+mkdir -p "$GITREPO"
+( cd "$GITREPO" && git init -q && git checkout -q -b topic/z 2>/dev/null \
+  && git -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -q --allow-empty --no-gpg-sign -m init )
+new_case
+set +e
+out="$(cd "$GITREPO" && MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" 2>/dev/null)"; rc=$?
+set -e
+create_input="$(jq -nc --arg body "$expected_body" '{title: "T", body: $body, head: "topic/z", base: "main", draft: false}')"
+if [ "$rc" -eq 0 ] && log_has $'gh\tapi\trepos/o/r\n' && log_has $'POST\trepos/o/r/pulls\t--input\t'"$create_input" && log_lacks 'events?per_page'; then
+  pass "pr create defaults: --head from the checked-out branch, --base from GET repos, no event read without follow-ups"
+else
+  fail "pr create defaults: rc=$rc"; cat "$LOGF" >&2
+fi
+
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --title T --body-file "$INVALID_BODY" --head h 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'Authoring-Agent' && log_lacks 'POST'; then
+  pass "pr create: the PR-body contract still refuses an invalid body before any REST call"
+else
+  fail "pr create invalid body: rc=$rc err=$err"
+fi
+
+refused_rest "create without --title" as_author gh pr create --repo o/r --body-file "$VALID_BODY" --head h
+refused_rest "create without --repo" as_author gh pr create --title T --body-file "$VALID_BODY" --head h
+refused_rest "create with a team reviewer" as_author gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --reviewer org/team
+refused_rest "create with an @me assignee" as_author gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --assignee @me
+refused_rest "create with --fill" as_author gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --fill
+refused_rest "create with a positional" as_author gh pr create 5 --repo o/r --title T --body-file "$VALID_BODY" --head h
+
+new_case
+set +e
+out="$(MERGEPATH_GH_TRANSPORT=rest STUB_PR_AUTHOR='claude[bot]' as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h 2>"$WORKDIR/err")"; rc=$?
+set -e
+if [ "$rc" -eq 5 ] && [ "$out" = "https://github.com/o/r/pull/42" ] && grep -q "PR #42 on o/r landed under 'claude\[bot\]', expected 'nathanjohnpayne'" "$WORKDIR/err" && grep -q '#241' "$WORKDIR/err"; then
+  pass "pr create readback: the #241 re-read catches a bot author, exit 5, URL still printed for recovery"
+else
+  fail "pr create readback mutation: rc=$rc out=$out"; cat "$WORKDIR/err" >&2
+fi
+
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_EVENT_ACTOR='claude[bot]' as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label a 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "the label 'a' landed under 'claude\[bot\]'"; then
+  pass "pr create follow-ups: a label applied by another login exits 5"
+else
+  fail "pr create label actor mutation: rc=$rc err=$err"
+fi
+
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_CREATE_FAIL=1 as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'HTTP 422' && log_lacks 'repos/o/r/pulls/42'; then
+  pass "pr create POST failure: propagates, no readback attempted"
+else
+  fail "pr create POST failure: rc=$rc err=$err"
+fi
+
+# ---------------------------------------------------------------------------
+# edit
+# ---------------------------------------------------------------------------
+new_case
+set +e
+out="$(MERGEPATH_GH_TRANSPORT=rest STUB_PR_LABELS='y,z' as_author -- gh pr edit 42 --repo o/r --add-label x --add-label z --remove-label y --remove-label absent 2>"$WORKDIR/err")"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ "$out" = "https://github.com/o/r/pull/42" ] \
+   && log_has $'POST\trepos/o/r/issues/42/labels\t--input\t'"$(printf '%s' '{"labels":["x"]}')" \
+   && log_has $'DELETE\trepos/o/r/issues/42/labels/y' && log_lacks 'labels/absent' \
+   && [ "$(grep -c 'events?per_page=100' "$LOGF")" -eq 2 ] \
+   && grep -q 'verified edit of PR #42 by nathanjohnpayne: labeled:x, unlabeled:y' "$WORKDIR/err"; then
+  pass "pr edit labels: no-ops dropped (z present, absent not present), add and remove attributed through new events"
+else
+  fail "pr edit labels: rc=$rc out=$out"; cat "$LOGF" "$WORKDIR/err" >&2
+fi
+
+new_case
+set +e
+out="$(MERGEPATH_GH_TRANSPORT=rest STUB_PR_LABELS='z' as_author -- gh pr edit 42 --repo o/r --add-label z --title 'Old title' 2>"$WORKDIR/err")"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ "$out" = "https://github.com/o/r/pull/42" ] && log_lacks 'POST' && log_lacks 'PATCH' && grep -q 'no change' "$WORKDIR/err"; then
+  pass "pr edit no-op: nothing written, URL printed"
+else
+  fail "pr edit no-op: rc=$rc"; cat "$LOGF" "$WORKDIR/err" >&2
+fi
+
+new_case
+set +e
+out="$(MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr edit 42 --repo o/r --title 'New title' --base dev --body-file "$COMMENT_FILE" 2>"$WORKDIR/err")"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'PATCH\trepos/o/r/pulls/42\t--input\t'"$(printf '%s' '{"title":"New title","body":"line one\nline two","base":"dev"}')" \
+   && grep -q 'verified edit of PR #42 by nathanjohnpayne: title, base' "$WORKDIR/err" \
+   && grep -q 'body edit of PR #42 is not attributable over REST' "$WORKDIR/err"; then
+  pass "pr edit title/body/base: one PATCH; title and base attributed through events, the body edit reported as not attributable"
+else
+  fail "pr edit patch: rc=$rc"; cat "$LOGF" "$WORKDIR/err" >&2
+fi
+
+new_case
+set +e
+out="$(MERGEPATH_GH_TRANSPORT=rest STUB_PR_REVIEWERS='nathanpayne-codex' STUB_PR_ASSIGNEES='nathanjohnpayne' as_author -- gh pr edit 42 --repo o/r --add-reviewer nathanpayne-claude --remove-reviewer nathanpayne-codex --add-assignee nathanpayne-codex --remove-assignee nathanjohnpayne 2>"$WORKDIR/err")"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] \
+   && log_has $'POST\trepos/o/r/pulls/42/requested_reviewers\t--input\t'"$(printf '%s' '{"reviewers":["nathanpayne-claude"]}')" \
+   && log_has $'DELETE\trepos/o/r/pulls/42/requested_reviewers\t--input\t'"$(printf '%s' '{"reviewers":["nathanpayne-codex"]}')" \
+   && log_has $'POST\trepos/o/r/issues/42/assignees\t--input\t'"$(printf '%s' '{"assignees":["nathanpayne-codex"]}')" \
+   && log_has $'DELETE\trepos/o/r/issues/42/assignees\t--input\t'"$(printf '%s' '{"assignees":["nathanjohnpayne"]}')" \
+   && grep -q 'review_requested:nathanpayne-claude, review_request_removed:nathanpayne-codex, assigned:nathanpayne-codex, unassigned:nathanjohnpayne' "$WORKDIR/err"; then
+  pass "pr edit reviewers and assignees: each change its own REST call, each attributed"
+else
+  fail "pr edit reviewers/assignees: rc=$rc"; cat "$LOGF" "$WORKDIR/err" >&2
+fi
+
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest STUB_PR_LABELS='b c' as_author -- gh pr edit 42 --repo o/r --remove-label 'b c' >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'DELETE\trepos/o/r/issues/42/labels/b%20c' && grep -q 'unlabeled:b c' "$WORKDIR/err"; then
+  pass "pr edit: a label with a space is percent-encoded in the DELETE and attributed by its name"
+else
+  fail "pr edit label encoding: rc=$rc"; cat "$LOGF" "$WORKDIR/err" >&2
+fi
+
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_EVENT_ACTOR='claude[bot]' as_author -- gh pr edit 42 --repo o/r --add-label x 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "the label 'x' landed under 'claude\[bot\]', expected 'nathanjohnpayne'"; then
+  pass "pr edit readback: a label event by another login exits 5"
+else
+  fail "pr edit actor mutation: rc=$rc err=$err"
+fi
+
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_DUPLICATE_ACTOR='claude[bot]' as_author -- gh pr edit 42 --repo o/r --add-label x 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "the label 'x' landed under 'claude\[bot\],nathanjohnpayne'"; then
+  pass "pr edit readback: a concurrent bot event beside the expected one is not told apart; exits 5"
+else
+  fail "pr edit concurrent mutation: rc=$rc err=$err"
+fi
+
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_EVENTS_FAIL=1 as_author -- gh pr edit 42 --repo o/r --add-label x 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'refusing a write that could not be attributed' && log_lacks 'POST'; then
+  pass "pr edit: an unreadable event log before the write refuses the write"
+else
+  fail "pr edit events pre-read failure: rc=$rc err=$err"; cat "$LOGF" >&2
+fi
+
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_PATCH_FAIL=1 as_author -- gh pr edit 42 --repo o/r --title New --add-label x 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'later edits were not attempted' && log_lacks $'POST\trepos/o/r/issues/42/labels'; then
+  pass "pr edit: a failed PATCH stops before the later label write and says so"
+else
+  fail "pr edit PATCH failure: rc=$rc err=$err"; cat "$LOGF" >&2
+fi
+
+refused_rest "edit with nothing to edit" as_author gh pr edit 42 --repo o/r
+refused_rest "edit --milestone" as_author gh pr edit 42 --repo o/r --milestone m
+refused_rest "edit with an empty title" as_author gh pr edit 42 --repo o/r --title ''
+
+# ---------------------------------------------------------------------------
+# close
+# ---------------------------------------------------------------------------
+new_case
+set +e
+out="$(MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr close 42 --repo o/r --comment bye --delete-branch 2>"$WORKDIR/err")"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ -z "$out" ] \
+   && log_has $'POST\trepos/o/r/issues/42/comments\t--input\t'"$(printf '%s' '{"body":"bye"}')" \
+   && log_has $'PATCH\trepos/o/r/pulls/42\t--input\t'"$(printf '%s' '{"state":"closed"}')" \
+   && log_has $'DELETE\trepos/o/r/git/refs/heads/feature' \
+   && grep -q 'verified close of PR #42 by nathanjohnpayne' "$WORKDIR/err" \
+   && grep -q 'deleted branch feature on o/r (a ref delete has no byline; not attributed)' "$WORKDIR/err"; then
+  pass "pr close: comment, PATCH closed attributed through the closed event, head ref deleted and reported as unattributed"
+else
+  fail "pr close: rc=$rc out=$out"; cat "$LOGF" "$WORKDIR/err" >&2
+fi
+
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_PR_STATE=closed as_author -- gh pr close 42 --repo o/r 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'already closed' && log_lacks 'PATCH'; then
+  pass "pr close on a closed PR: refused, nothing written"
+else
+  fail "pr close already closed: rc=$rc err=$err"
+fi
+
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest STUB_PR_HEAD_REPO=fork/r as_author -- gh pr close 42 --repo o/r --delete-branch >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_lacks 'git/refs' && grep -q 'head branch is on another repository (fork/r) and was not deleted' "$WORKDIR/err"; then
+  pass "pr close --delete-branch on a fork head: the ref on the other repository is left alone"
+else
+  fail "pr close fork head: rc=$rc"; cat "$LOGF" "$WORKDIR/err" >&2
+fi
+
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_EVENT_ACTOR='claude[bot]' as_author -- gh pr close 42 --repo o/r 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "closing PR #42 landed under 'claude\[bot\]'"; then
+  pass "pr close readback: a closed event by another login exits 5"
+else
+  fail "pr close actor mutation: rc=$rc err=$err"
+fi
+
+# ---------------------------------------------------------------------------
+# merge is a ceiling on this transport
+# ---------------------------------------------------------------------------
+new_case
+set +e
+err="$(CLAUDE_CODE_REMOTE=true as_author -- gh pr merge 42 --repo o/r --squash --delete-branch --match-head-commit 0123456789012345678901234567890123456789 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 6 ] && printf '%s' "$err" | grep -q 'CEILING: gh pr merge does not run on the REST transport' \
+   && printf '%s' "$err" | grep -q 'post-local-agent-handback.sh <PR#> --blocked graphql' \
+   && log_lacks $'pr\tmerge' && log_lacks 'POST' && log_lacks 'PUT'; then
+  pass "pr merge on a cloud surface: refused with the ceiling code (6) and the handback command; nothing written"
+else
+  fail "pr merge ceiling: rc=$rc err=$err"; cat "$LOGF" >&2
+fi
+
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=gh CLAUDE_CODE_REMOTE=true as_author -- gh pr merge 42 --repo o/r --disable-auto >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'gh\tpr\tmerge\t42\t--repo\to/r\t--disable-auto'; then
+  pass "MERGEPATH_GH_TRANSPORT=gh on a cloud surface: the gh path runs the wrapped merge as before"
+else
+  fail "forced gh transport merge: rc=$rc"; cat "$LOGF" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# pass-through: gh api is REST already; other commands run unchanged
+# ---------------------------------------------------------------------------
+new_case
+set +e
+out="$(MERGEPATH_GH_TRANSPORT=rest as_reviewer -- gh api -X POST repos/o/r/issues/1/comments -f body=x 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'GH_TOKEN=ghp_reviewer-token GITHUB_TOKEN= ENT=mergepath-guarded-write-github-com-only|mergepath-guarded-write-github-com-only gh\tapi\t-X\tPOST\trepos/o/r/issues/1/comments\t-f\tbody=x'; then
+  pass "gh api payload on the REST transport: passed through under the verified token"
+else
+  fail "gh api passthrough: rc=$rc"; cat "$LOGF" >&2
+fi
+
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest as_reviewer -- gh repo view o/r >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'GH_TOKEN=ghp_reviewer-token GITHUB_TOKEN= ENT=mergepath-guarded-write-github-com-only|mergepath-guarded-write-github-com-only gh\trepo\tview\to/r'; then
+  pass "a non-pr, non-issue gh command on the REST transport: passed through unchanged"
+else
+  fail "gh repo view passthrough: rc=$rc"; cat "$LOGF" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# caller-supplied credential re-routing is refused on both transports (#1542)
+# ---------------------------------------------------------------------------
+override_refused() { # <label> <wrapper fn> <args...>
+  local label="$1" fn="$2" rc=0 err t
+  shift 2
+  for t in gh rest; do
+    new_case
+    set +e
+    err="$(MERGEPATH_GH_TRANSPORT=$t "$fn" -- "$@" 2>&1 >/dev/null)"; rc=$?
+    set -e
+    if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q '#1542' && [ ! -s "$LOGF" ]; then
+      pass "$label ($t transport): refused before any gh call"
+    else
+      fail "$label ($t transport): rc=$rc err=$err"; cat "$LOGF" >&2
+    fi
+  done
+}
+override_refused "--hostname" as_reviewer gh pr comment 1 --repo o/r --body x --hostname ghe.example.com
+override_refused "--hostname= on gh api" as_reviewer gh api --hostname=ghe.example.com repos/o/r
+override_refused "host-qualified --repo" as_reviewer gh pr comment 1 --repo ghe.example.com/o/r --body x
+override_refused "host-qualified --repo= on the author wrapper" as_author gh pr edit 1 --repo=ghe.example.com/o/r --add-label x
+override_refused "host-qualified -R" as_reviewer gh pr review 1 -R ghe.example.com/o/r --approve
+override_refused "Authorization header on gh api" as_reviewer gh api -H 'Authorization: token ghp_other' repos/o/r/issues/1/comments -f body=x
+override_refused "Authorization header, long attached form" as_reviewer gh api --header='authorization: Bearer x' repos/o/r
+override_refused "Authorization header, short attached form" as_reviewer gh api -HAuthorization:x repos/o/r
+override_refused "gh api endpoint on another host" as_reviewer gh api https://evil.example/repos/o/r/issues/1/comments -f body=x
+
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=gh as_author -- gh pr create -H feature --title t --body-file "$VALID_BODY" >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'gh\tpr\tcreate\t-H\tfeature'; then
+  pass "-H on gh pr create is --head, not a header: accepted on the gh transport"
+else
+  fail "-H head on gh transport: rc=$rc"; cat "$LOGF" >&2
+fi
+
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=gh GH_GENERIC_RC=0 as_reviewer -- gh api -H 'Accept: application/vnd.github+json' https://api.github.com/repos/o/r >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'gh\tapi\t-H\tAccept: application/vnd.github+json\thttps://api.github.com/repos/o/r'; then
+  pass "a non-Authorization header and an api.github.com URL pass"
+else
+  fail "benign header: rc=$rc"; cat "$LOGF" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# trace marker (bootstrap's "did the write run" signal) on the REST transport
+# ---------------------------------------------------------------------------
+new_case
+MARKER="$WORKDIR/marker"
+rm -f "$MARKER"
+set +e
+MERGEPATH_GH_TRANSPORT=rest GH_AS_AUTHOR_TRACE_MARKER="$MARKER" as_author -- gh pr comment 5 --repo o/r --body '@codex review' >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ -e "$MARKER" ] && log_lacks 'GH_AS_AUTHOR_TRACE_MARKER'; then
+  pass "trace marker: created before the REST write"
+else
+  fail "trace marker REST: rc=$rc marker=$([ -e "$MARKER" ] && echo present || echo absent)"
+fi
+rm -f "$MARKER"
+set +e
+MERGEPATH_GH_TRANSPORT=rest GH_AS_AUTHOR_TRACE_MARKER="$MARKER" as_author -- gh pr comment 5 --repo o/r >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && [ ! -e "$MARKER" ]; then
+  pass "trace marker: absent when the form is refused before the write"
+else
+  fail "trace marker refusal: rc=$rc marker=$([ -e "$MARKER" ] && echo present || echo absent)"
+fi
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest GH_AS_AUTHOR_TRACE_MARKER="$WORKDIR/no-such-dir/marker" as_author -- gh pr comment 5 --repo o/r --body x >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 70 ] && log_lacks 'POST'; then
+  pass "trace marker: unwritable, so exit 70 and the REST write never runs"
+else
+  fail "trace marker unwritable: rc=$rc"; cat "$LOGF" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# the brokered placeholder is still refused before the transport is chosen
+# ---------------------------------------------------------------------------
+new_case
+set +e
+err="$(CLAUDE_CODE_REMOTE=true GITHUB_TOKEN='' GH_TOKEN=proxy-injected STUB_NO_KEYRING=1 PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$LOGF" STUB_STATE="$STATE" bash "$AUTHOR" -- gh pr comment 5 --repo o/r --body x 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 3 ] && log_lacks 'POST' && log_lacks $'pr\tcomment'; then
+  pass "cloud session with only the proxy placeholder: refused before any write, on either transport"
+else
+  fail "placeholder on cloud: rc=$rc err=$err"; cat "$LOGF" >&2
+fi
+
+echo ""
+echo "test_gh_rest_transport: $PASS passed, $FAIL failed"
+if [ "$FAIL" -gt 0 ]; then
+  exit 1
+fi
+exit 0

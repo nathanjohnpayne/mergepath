@@ -312,10 +312,12 @@ fi
 
 # #1539: the surface does not select the reviewer, so the wrapper, the
 # capability probe and gh-pr-guard.sh (which never reads the surface) resolve
-# the same one. MERGEPATH_AGENT=codex selects the Codex reviewer.
+# the same one. MERGEPATH_AGENT=codex selects the Codex reviewer. The surface
+# does select the REST transport (#1057 item A, tests/test_gh_rest_transport.sh);
+# this case pins the gh transport so the stub sees the wrapped command.
 reset_log
 set +e
-MERGEPATH_AGENT_SURFACE=codex-cloud MERGEPATH_AGENT=codex OP_PREFLIGHT_REVIEWER_PAT="ghp_codex-token" \
+MERGEPATH_AGENT_SURFACE=codex-cloud MERGEPATH_AGENT=codex MERGEPATH_GH_TRANSPORT=gh OP_PREFLIGHT_REVIEWER_PAT="ghp_codex-token" \
   run_wrapper -- gh pr comment 123 --body "x" >/dev/null 2>&1
 rc=$?
 set -e

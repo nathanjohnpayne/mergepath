@@ -36,6 +36,12 @@ case "${1:-} ${2:-}" in
     exit 0
     ;;
   "pr view")
+    # The Claude cloud proxy's refusal of every GraphQL call (#1057).
+    if [ "${STUB_GRAPHQL_CEILING:-0}" = 1 ]; then
+      echo "GitHub GraphQL is not available from Claude Code sessions; use the REST API instead (HTTP 403)" >&2
+      exit 1
+    fi
+    [ "${STUB_PR_VIEW_FAIL:-0}" = 0 ] || { echo "HTTP 502: Bad Gateway" >&2; exit 1; }
     if [ -n "${STUB_EXPECT_REPO:-}" ]; then
       case " $* " in *" --repo $STUB_EXPECT_REPO "*) ;; *) exit 9 ;; esac
     fi
@@ -88,6 +94,22 @@ case "${1:-} ${2:-}" in
     fi
     case "$*" in *"--paginate --slurp"*) ;; *) exit 1 ;; esac
     if [ -n "${STUB_REVIEW_PAGES:-}" ]; then printf '%s\n' "$STUB_REVIEW_PAGES"; else echo '[[]]'; fi
+    ;;
+  "api repos/"*)
+    # The guard's REST read of the PR for the self-approve check (#1057).
+    [ -z "${STUB_API_LOG:-}" ] || printf '%s\n' "$*" >>"$STUB_API_LOG"
+    [ "${STUB_REST_FAIL:-0}" = 0 ] || { echo "HTTP 404: Not Found" >&2; exit 1; }
+    jq -n \
+      --arg body "${STUB_PR_BODY:-}" \
+      --argjson additions "${STUB_PR_ADDITIONS:-0}" \
+      --argjson deletions "${STUB_PR_DELETIONS:-0}" \
+      --arg head "${STUB_PR_HEAD:-feature/some-branch}" \
+      --arg author "${STUB_PR_AUTHOR-nathanjohnpayne}" \
+      '{number: 123, body: $body, additions: $additions, deletions: $deletions, head: {ref: $head}, user: {login: $author}}'
+    ;;
+  "api --paginate")
+    [ -z "${STUB_API_LOG:-}" ] || printf '%s\n' "$*" >>"$STUB_API_LOG"
+    echo '[[{"filename":"scripts/x.sh"}],[{"filename":"docs/y.md"}]]'
     ;;
   *)
     exit 0
@@ -524,6 +546,35 @@ assert_rc_contains "real declaration wins over a later prose mention (#927)" 2 "
 
 assert_rc_contains "indented author line is not a declaration (#927)" 2 "exactly one visible Authoring-Agent" \
   'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "  Authoring-Agent: claude" "5000" "0"
+
+# --- #1057 item A: in a Claude cloud session `gh pr view` is GraphQL and the
+# proxy refuses it, so the self-approve read falls back to REST, only for the
+# canonical `<number> --repo OWNER/REPO` form. Any other read failure still
+# blocks.
+API_LOG="$WORKDIR/guard-api.log"
+: >"$API_LOG"
+STUB_GRAPHQL_CEILING=1 STUB_API_LOG="$API_LOG" assert_rc_contains "GraphQL ceiling: same-agent over-threshold approve still blocked from the REST read" 2 "self-approve detected" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+if grep -qx 'api repos/example/repo/pulls/123' "$API_LOG" \
+   && grep -qx 'api --paginate --slurp repos/example/repo/pulls/123/files?per_page=100' "$API_LOG"; then
+  pass "GraphQL ceiling: the REST read targets the PR and repository the review names"
+else
+  fail "GraphQL ceiling REST read targets: $(cat "$API_LOG")"
+fi
+STUB_GRAPHQL_CEILING=1 assert_rc_contains "GraphQL ceiling: under-threshold approve allowed from the REST read" 0 "" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo=example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0"
+STUB_GRAPHQL_CEILING=1 assert_rc_contains "GraphQL ceiling: cross-agent approve allowed from the REST read" 0 "" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "Authoring-Agent: claude" "5000" "0"
+STUB_GRAPHQL_CEILING=1 assert_rc_contains "GraphQL ceiling: propagation-lane bypass works from the REST read" 0 "" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0" "mergepath-sync/abc" "nathanjohnpayne"
+STUB_GRAPHQL_CEILING=1 assert_rc_contains "GraphQL ceiling: approve without --repo is refused with the canonical form" 2 "gh pr review <number> --repo OWNER/REPO" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0"
+STUB_GRAPHQL_CEILING=1 assert_rc_contains "GraphQL ceiling: approve by URL is refused with the canonical form" 2 "gh pr review <number> --repo OWNER/REPO" \
+  'scripts/gh-as-reviewer.sh -- gh pr review https://github.com/example/repo/pull/123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0"
+STUB_GRAPHQL_CEILING=1 STUB_REST_FAIL=1 assert_rc_contains "GraphQL ceiling: a failed REST read blocks" 2 "could not read example/repo#123 over REST" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0"
+STUB_PR_VIEW_FAIL=1 assert_rc_contains "a read failure that is not the GraphQL ceiling still blocks, with no REST fallback" 2 "could not fetch PR metadata" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0"
 
 # --- #671: the self-approve sub-guard resolves the reviewer the same way
 # the wrapper will (GH_AS_REVIEWER_IDENTITY, then MERGEPATH_AGENT, then

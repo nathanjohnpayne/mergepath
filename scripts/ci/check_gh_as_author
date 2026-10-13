@@ -23,6 +23,11 @@ TESTS=(
   # a local regex, which is exactly how the divergence arose.
   "tests/test_pr_body_contract_parity.sh"
   "tests/test_gh_as_reviewer.sh"
+  # The REST transport both wrappers take on a cloud surface, where every
+  # `gh pr` / `gh issue` subcommand is GraphQL and the proxy refuses it
+  # (#1057 item A, #1542): the closed argv grammar, each verb's REST calls,
+  # and the byline readback that is the only call-time enforcement on Codex.
+  "tests/test_gh_rest_transport.sh"
   "tests/test_gh_wrapper_parallel.sh"
   "tests/test_gh_pr_guard.sh"
   "tests/test_check_no_bare_gh_writes.sh"

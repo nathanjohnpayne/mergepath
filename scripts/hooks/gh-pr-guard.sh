@@ -1375,6 +1375,48 @@ prefix_flag_takes_value() {
 # shellcheck source=../lib/pr-body-contract.sh
 . "$GUARD_REPO_ROOT/scripts/lib/pr-body-contract.sh"
 
+# The Claude cloud proxy refuses GitHub GraphQL whatever the credential, and
+# `gh pr view` is GraphQL (#1057). graphql-ceiling.sh recognizes that refusal.
+# It is optional here: without it no refusal is recognized, and a failed read
+# blocks exactly as it did before.
+if [ -r "$GUARD_REPO_ROOT/scripts/lib/graphql-ceiling.sh" ]; then
+  # shellcheck source=../lib/graphql-ceiling.sh
+  . "$GUARD_REPO_ROOT/scripts/lib/graphql-ceiling.sh"
+fi
+
+guard_graphql_refused() { # <stderr file>
+  declare -F graphql_ceiling_hit >/dev/null 2>&1 || return 1
+  graphql_ceiling_hit "$(cat "$1" 2>/dev/null)"
+}
+
+# The self-approve read below over REST, for a session whose proxy refused
+# `gh pr view`. Only the canonical form the wrappers' REST transport accepts
+# is read (a PR number and --repo OWNER/REPO), so the read targets exactly
+# the PR the write will. Prints the same JSON shape as the GraphQL read.
+guard_review_pr_json_rest() { # <selector> <repo>
+  local sel="$1" repo="$2" pr pages
+  case "$sel" in ''|*[!0-9]*|0*) sel="" ;; esac
+  case "$repo" in ''|*/*/*|/*|*/|*[!A-Za-z0-9._/-]*) repo="" ;; */*) ;; *) repo="" ;; esac
+  if [ -z "$sel" ] || [ -z "$repo" ]; then
+    echo "BLOCKED: this session's proxy does not serve GitHub GraphQL, so gh-pr-guard reads the PR for the self-approve check over REST, which needs the canonical form:" >&2
+    echo "    scripts/gh-as-reviewer.sh -- gh pr review <number> --repo OWNER/REPO --approve ..." >&2
+    return 1
+  fi
+  if ! pr=$(gh api "repos/$repo/pulls/$sel" 2>&1) \
+     || ! printf '%s' "$pr" | jq -e '(.number | type == "number") and (.user.login | type == "string") and (.head.ref | type == "string") and (.additions | type == "number") and (.deletions | type == "number")' >/dev/null 2>&1; then
+    echo "BLOCKED: gh-pr-guard could not read $repo#$sel over REST for the self-approve check." >&2
+    echo "  output: $pr" >&2
+    return 1
+  fi
+  if ! pages=$(gh api --paginate --slurp "repos/$repo/pulls/$sel/files?per_page=100" 2>&1) \
+     || ! printf '%s' "$pages" | jq -e 'type == "array" and all(.[]; type == "array")' >/dev/null 2>&1; then
+    echo "BLOCKED: gh-pr-guard could not read the files of $repo#$sel over REST for the self-approve check." >&2
+    return 1
+  fi
+  jq -cn --argjson pr "$pr" --argjson pages "$pages" \
+    '{body: ($pr.body // ""), additions: $pr.additions, deletions: $pr.deletions, files: [$pages[][] | .filename], head: $pr.head.ref, author: $pr.user.login}'
+}
+
 # Locate the governing review-policy.yml without trusting the caller's
 # cwd to BE the repo root (Codex P2 on PR #442 r21): walk upward from
 # the cwd (covers subdirectory invocations and out-of-tree fixture
@@ -3057,10 +3099,17 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
       # path too).
       trap 'rm -f "$TMP_TOKENS" "$TMP_TOKENS_ERR" "$REVIEW_GH_STDERR"' EXIT
       if ! REVIEW_PR_JSON=$(gh "${review_gh_args[@]}" 2>"$REVIEW_GH_STDERR"); then
-        echo "BLOCKED: gh-pr-guard could not fetch PR metadata for self-approve check." >&2
-        echo "  stderr: $(cat "$REVIEW_GH_STDERR")" >&2
-        echo "  command: gh ${review_gh_args[*]}" >&2
-        exit 2
+        # A Claude cloud proxy refuses the GraphQL read whatever the
+        # credential (#1057); read the same fields over REST there. Any
+        # other failure blocks, as before.
+        if guard_graphql_refused "$REVIEW_GH_STDERR"; then
+          REVIEW_PR_JSON=$(guard_review_pr_json_rest "$REVIEW_PR_SELECTOR" "$REVIEW_REPO") || exit 2
+        else
+          echo "BLOCKED: gh-pr-guard could not fetch PR metadata for self-approve check." >&2
+          echo "  stderr: $(cat "$REVIEW_GH_STDERR")" >&2
+          echo "  command: gh ${review_gh_args[*]}" >&2
+          exit 2
+        fi
       fi
 
       # Propagation-lane bypass (#334). The lane criteria are:
