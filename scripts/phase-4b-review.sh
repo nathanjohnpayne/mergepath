@@ -811,7 +811,7 @@ stop_for_barrier_error() {
 
 # A barrier that opened over a rate-limited CodeRabbit (#1178). Set when the
 # barrier's CodeRabbit arm classified `rate-limited` and it opened anyway on a
-# head-pinned Codex report. Read only by the review-body renderer below.
+# a Codex arm that permits adapter review. Read by the body renderer below.
 BARRIER_CODERABBIT_RATE_LIMITED=false
 # A barrier whose CodeRabbit arm CARRIED an earlier head's review forward
 # (#1335): "<source-commit> <fingerprint>" when set, empty otherwise. Read only
@@ -842,17 +842,12 @@ run_same_head_barrier() {
             jq -c 'select(.state == "available") | .request_generation // empty')"
           ;;
       esac
-      # An open barrier is normally silent — every enabled provider reported
-      # and there is nothing to say. #1178 adds one shape that opens on a
-      # PARTIAL quorum: CodeRabbit refused this head, and Codex alone carries
-      # the ordering. That is a deliberate policy trade, not a fact to leave
-      # in a JSON field nobody reads, so it is narrated here and recorded in
-      # the posted review body below. Both, because they reach different
-      # people: the warn reaches whoever ran the orchestrator, the body line
-      # reaches whoever reads the approval afterwards.
+      # #2120: disclose the missing CodeRabbit report without claiming Codex
+      # reported — its arm may be waived or disabled. The independent adapter
+      # still performs the external review, and its verdict decides the run.
       if [ "$(printf '%s' "$out" | jq -r '.coderabbit // empty' 2>/dev/null || true)" = "rate-limited" ]; then
         BARRIER_CODERABBIT_RATE_LIMITED=true
-        p4b_warn "CodeRabbit refused $HEAD as rate limited and cannot be re-asked; the barrier opened on Codex's head-pinned report alone, so this review is ordered against Codex only"
+        p4b_warn "CodeRabbit refused $HEAD as rate limited and cannot be re-asked; the Codex arm permits the independent Phase 4b adapter review"
       fi
       # #1335: the other shape that opens without CodeRabbit speaking on this
       # exact head. Narrated for the same two readers, for the same reason.
@@ -1627,12 +1622,10 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
     printf -- '- Token usage: not exposed by adapter/CLI\n'
   fi
   printf -- '- Model-internal turn count: not exposed by the adapter contract\n'
-  # #1178: an approval posted over a refusing provider must say so on the PR
-  # itself. The barrier opened on a partial quorum, and a reader who assumes
-  # the usual both-providers ordering would draw a stronger conclusion from
-  # this review than it supports.
+  # #2120: report the refusal without inventing a Codex report. This adapter
+  # is the independent external reviewer even when Codex is waived/disabled.
   if [ "$BARRIER_CODERABBIT_RATE_LIMITED" = true ]; then
-    printf -- '- Provider ordering: CodeRabbit was **rate limited** on this head and could not be re-asked, so the same-head barrier opened on Codex'"'"'s head-pinned report alone (#1178)\n'
+    printf -- '- Provider ordering: CodeRabbit was **rate limited** on this head and could not be re-asked; the Codex arm permitted this independent Phase 4b adapter review (#2120)\n'
   fi
   # #1560 slice 3: a review dispatched over a spent Codex request ceiling ran
   # without a Codex report on this head. Say so, and that no human stop held.

@@ -30,7 +30,7 @@ make_case() {
   local dir="$WORKDIR/$name"
 
   mkdir -p "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
-  cp "$ROOT/scripts/coderabbit-wait.sh" "$dir/scripts/coderabbit-wait.sh"
+  cp "${CODERABBIT_TEST_WAITER_SOURCE:-$ROOT/scripts/coderabbit-wait.sh}" "$dir/scripts/coderabbit-wait.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
   cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$dir/scripts/lib/reviewers-helpers.sh"
   # Hard-required by coderabbit-wait.sh since #1008: both fetch wrappers
@@ -213,6 +213,10 @@ case "$endpoint" in
     # `absent` — the fixture has to be able to tell them apart before the
     # script can.
     printf 'read\n' >>"$state_dir/status-reads"
+    if [ "${CODERABBIT_TEST_NATIVE_REFUSAL:-false}" = true ]; then
+      jq -c '.statuses' "${CODERABBIT_TEST_STATUS_FIXTURE:?}"
+      exit 0
+    fi
     # #1335 (Codex P1 on #1340): CODERABBIT_TEST_STATUS2[_TIME|_DESCRIPTION],
     # when set, replace the served status from the SECOND statuses read on —
     # a run starting between the probe's first sample and its re-sample.
@@ -224,7 +228,7 @@ case "$endpoint" in
     st_desc=${CODERABBIT_TEST_STATUS_DESCRIPTION:-}
     st_id=1
     old_record=""
-    if [ -n "${CODERABBIT_TEST_STATUS2:-}" ] && [ "$(wc -l <"$state_dir/status-reads" | tr -d ' ')" -ge 2 ]; then
+    if [ -n "${CODERABBIT_TEST_STATUS2:-}" ] && [ "$(wc -l <"$state_dir/status-reads" | tr -d ' ')" -ge "${CODERABBIT_TEST_STATUS2_AFTER:-2}" ]; then
       if [ "${CODERABBIT_TEST_STATUS2_KEEP_OLD:-false}" = true ]; then
         old_record=$(printf ',{"id":1,"context":"CodeRabbit","state":"%s","created_at":"%s","updated_at":"%s","creator":{"login":"%s"},"description":%s}' \
           "$st" "$st_time" "$st_time" "$bot" "$(json_string "$st_desc")")
@@ -296,6 +300,22 @@ case "$endpoint" in
         # #535.1: one CodeRabbit review on HEAD, no inline findings, but the
         # PR-level summary body carries a Potential issue marker.
         printf '[{"id":9921,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
+        ;;
+      status_refusal)
+        n=0
+        [ ! -f "$state_dir/status-reads" ] || n=$(wc -l <"$state_dir/status-reads" | tr -d ' ')
+        if [ "$n" -ge 3 ] && [ "${CODERABBIT_TEST_REFUSAL_REVIEWS_FAIL:-false}" = true ]; then exit 1; fi
+        if [ "${CODERABBIT_TEST_REFUSAL_REVIEW:-false}" = true ] || { [ "$n" -ge 3 ] && [ "${CODERABBIT_TEST_REFUSAL_REVIEW_LATE:-false}" = true ]; }; then
+          jq -nc --arg bot "$bot" --arg at "${CODERABBIT_TEST_REFUSAL_REVIEW_TIME:-$head_time}" --arg body "${CODERABBIT_TEST_REFUSAL_REVIEW_BODY:-$run_body}" \
+            '[{id:9941,user:{login:$bot},submitted_at:$at,commit_id:"head-sha",body:$body}]'
+        else printf '[]\n'; fi
+        ;;
+      phase4b_quota)
+        if [ "${CODERABBIT_TEST_QUOTA_REVIEW:-false}" = true ]; then
+          printf '[{"id":9941,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
+        else
+          printf '[]\n'
+        fi
         ;;
       probe_review_on_head|probe_ack_after_blocking_summary|probe_blocking_summary_no_ack|probe_ack_after_clean_summary|probe_ack_without_summary)
         # #814: a genuine CodeRabbit review already on HEAD. --probe must
@@ -606,6 +626,19 @@ No actionable comments were generated in the recent review.'}
         # it carries no blocking marker of its own: the head's only blocking
         # evidence is the inline finding on run 9401.
         printf '[{"id":8901,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n\\n## Walkthrough\\n\\nReviewed the changes between 1111111111111111111111111111111111111111 and 2222222222222222222222222222222222222222."}]\n' "$bot" "$head_time" "$reply_time"
+        ;;
+      status_refusal)
+        n=0
+        [ ! -f "$state_dir/status-reads" ] || n=$(wc -l <"$state_dir/status-reads" | tr -d ' ')
+        if [ "$n" -ge 3 ] && [ "${CODERABBIT_TEST_REFUSAL_COMMENTS_FAIL:-false}" = true ]; then exit 1; fi
+        body=${CODERABBIT_TEST_REFUSAL_BODY:?}
+        if [ "$n" -ge "${CODERABBIT_TEST_REFUSAL_BODY2_AFTER:-3}" ] && [ -n "${CODERABBIT_TEST_REFUSAL_BODY2:-}" ]; then body=$CODERABBIT_TEST_REFUSAL_BODY2; fi
+        jq -nc --arg bot "$bot" --arg body "$body" --arg at "${CODERABBIT_TEST_REFUSAL_COMMENT_TIME:-$reply_time}" \
+          '[{id:7701,user:{login:$bot},created_at:$at,updated_at:$at,body:$body}]'
+        ;;
+      phase4b_quota)
+        jq -nc --arg bot "$bot" --arg body "${CODERABBIT_TEST_QUOTA_BODY:?}" --arg at "$reply_time" \
+          '[{id:7701,user:{login:$bot},created_at:$at,updated_at:$at,body:$body}]'
         ;;
       rate_limit)
         printf '[{"id":7701,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"Rate limit exceeded. Please wait 10 seconds before requesting another review."}]\n' "$bot" "$head_time" "$head_time"
@@ -1281,8 +1314,8 @@ test_446_newer_comment_suppresses_stale_status() {
 # is worth anything is a content question only the Phase 4b barrier answers.
 # What the probe adds is `probe.carryforward`: the commit a completed, benign,
 # marker-free summary last reviewed, plus this head's StatusContext. Every
-# case asserts the verdict is UNCHANGED (rc and observed) and 0 writes, so the
-# evidence can never become a verdict by the back door.
+# case preserves its established verdict and 0 writes, except the explicit
+# #2120 refusal state; carry-forward evidence never manufactures clearance.
 test_1335_probe_carryforward_evidence() {
   local marker='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
   local a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -1316,10 +1349,14 @@ $notes"
   # 1. The #1318 shape: completed prior-head summary, this head's run finished.
   _cf_case merge-head true success 'Review completed' "$clean" 7 summary-without-head-review \
     ". == {reviewed_head:\"$b\", head_context_state:\"success\", head_context_description:\"Review completed\", head_context_updated_at:\"2026-06-04T00:00:00Z\", head_context_permits_clearance:true}"
-  # 2. A spurious success that names its own refusal (#891) is carried as
-  #    evidence but says it permits no clearance.
-  _cf_case ratelimited-success true success 'Review rate limited' "$clean" 7 summary-without-head-review \
-    '.reviewed_head != null and .head_context_permits_clearance == false'
+  # 2. An explicit trusted current-head refusal (#2120) is rate_limit,
+  #    never review clearance or same-content carry-forward evidence.
+  _cf_case ratelimited-success true success 'Review rate limited' "$clean" 7 rate_limit '. == null'
+  if ! jq -e '.status == "no_review_yet" and .head_sha == "head-sha" and
+    .review.endpoint == "status_context" and .review.description == "Review rate limited" and
+    .review.disposition == "rate_limit" and .review.permits_clearance == false' "$dir/out.json" >/dev/null 2>&1; then
+    bad="$bad ratelimited-success-refusal-provenance"
+  fi
   # 3. A run still underway on this head is reported as such.
   _cf_case run-pending true pending 'Review in progress' "$clean" 7 summary-without-head-review \
     '.head_context_state == "pending"'
@@ -1584,6 +1621,325 @@ run_probe_case() {  # <dir> <scenario> [flag|env]
 
   printf '%s\n' "$rc"
 }
+
+# #2120: status-only refusal controls, expected ~20s, outer timeout 45s.
+if [ "${1:-}" = --status-refusal-only ]; then
+  helpers="$WORKDIR/status-refusal-helpers.sh"
+  sed -n '/^# BEGIN coderabbit_status_description_helpers$/,/^# END coderabbit_status_description_helpers$/p' "${CODERABBIT_TEST_WAITER_SOURCE:-$ROOT/scripts/coderabbit-wait.sh}" >"$helpers"
+  sed -n '/^# BEGIN coderabbit_probe_status_refusal_helpers$/,/^# END coderabbit_probe_status_refusal_helpers$/p' "${CODERABBIT_TEST_WAITER_SOURCE:-$ROOT/scripts/coderabbit-wait.sh}" >>"$helpers"
+  # shellcheck disable=SC1090
+  . "$helpers"
+  BOT_LOGIN='coderabbitai[bot]'
+  native_statuses=$(jq -c '.statuses' "$ROOT/tests/fixtures/coderabbit_status_refusal.json")
+  for shape in ${CODERABBIT_TEST_STATUS_SELECTOR_CASES:-exact normalized latest-pending latest-failure latest-error unknown wrong-author wrong-context missing malformed-id malformed-time}; do
+    statuses="$native_statuses" expected=1
+    case "$shape" in
+      exact) expected=0 ;;
+      normalized) statuses=$(jq -c 'map(.description = "  REVIEW RATE LIMITED  ")' <<<"$statuses"); expected=0 ;;
+      latest-pending|latest-failure|latest-error)
+        state=${shape#latest-}
+        statuses=$(jq -c --arg state "$state" '(max_by(.id) | .id += 1 | .state = $state) as $new | [$new] + .' <<<"$statuses") ;;
+      unknown) statuses=$(jq -c 'map(.description = "Review rate limited or completed")' <<<"$statuses") ;;
+      wrong-author) statuses=$(jq -c 'map(.creator.login = "another-bot")' <<<"$statuses") ;;
+      wrong-context) statuses=$(jq -c 'map(.context = "another-context")' <<<"$statuses") ;;
+      missing) statuses='[]' ;;
+      malformed-id) statuses=$(jq -c '. + [(max_by(.id) | .id = "bad")]' <<<"$statuses"); expected=3 ;;
+      malformed-time) statuses=$(jq -c 'map(.updated_at = "bad")' <<<"$statuses"); expected=3 ;;
+    esac
+    rc=0; crw_probe_select_status_refusal "$statuses" >"$WORKDIR/selected-status.json" || rc=$?
+    if [ "$rc" = "$expected" ]; then pass "status-refusal selector $shape: rc=$rc"; else fail "status-refusal selector $shape: rc=$rc expected=$expected"; fi
+  done
+  old_body=$(jq -r '.prior_summary.body' "$ROOT/tests/fixtures/coderabbit_status_refusal.json")
+  fresh_body='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+Reviewed changes between bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb and head-sha.'
+  for shape in ${CODERABBIT_TEST_STATUS_REFUSAL_CASES:-native awaiting masked-summary masked-run clean-head in-progress pause fresh-run trigger late-marker late-in-progress late-pending late-run late-comments-error late-reviews-error changed-refusal unknown trust-off unreadable}; do
+    export CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_DESCRIPTION='Review rate limited'
+    export CODERABBIT_TEST_STATUS_TIME='2026-10-12T22:44:25Z'
+    export CODERABBIT_TEST_REFUSAL_BODY="$old_body" CODERABBIT_TEST_REFUSAL_REVIEW=false
+    export CODERABBIT_TEST_NATIVE_REFUSAL=false
+    unset CODERABBIT_TEST_REFUSAL_BODY2 CODERABBIT_TEST_STATUS2 CODERABBIT_TEST_REFUSAL_REVIEW_BODY CODERABBIT_TEST_REFUSAL_REVIEW_TIME CODERABBIT_TEST_REFUSAL_COMMENT_TIME CODERABBIT_TEST_STATUS2_KEEP_OLD CODERABBIT_TEST_REFUSAL_REVIEW_LATE CODERABBIT_TEST_REFUSAL_COMMENTS_FAIL CODERABBIT_TEST_REFUSAL_REVIEWS_FAIL
+    export CODERABBIT_TEST_STATUS2_AFTER=2
+    expected_rc=7 expected_observed=rate_limit
+    case "$shape" in
+      native)
+        export CODERABBIT_TEST_NATIVE_REFUSAL=true
+        export CODERABBIT_TEST_STATUS_FIXTURE="$ROOT/tests/fixtures/coderabbit_status_refusal.json" ;;
+      awaiting|masked-run)
+        export CODERABBIT_TEST_REFUSAL_REVIEW=true
+        export CODERABBIT_TEST_REFUSAL_BODY='No summary publication yet.'
+        if [ "$shape" = masked-run ]; then
+          CODERABBIT_TEST_REFUSAL_REVIEW_BODY="$(printf '%0300d' 0)
+_🟠 Major_
+Required finding beyond the logging excerpt."
+          export CODERABBIT_TEST_REFUSAL_REVIEW_BODY
+        fi ;;
+      masked-summary) export CODERABBIT_TEST_REFUSAL_BODY="$fresh_body
+_🟠 Major_
+Required current-head summary finding." ;;
+      clean-head) export CODERABBIT_TEST_REFUSAL_REVIEW=true CODERABBIT_TEST_REFUSAL_BODY="$fresh_body"; expected_rc=0; expected_observed=terminal ;;
+      in-progress) export CODERABBIT_TEST_REFUSAL_COMMENT_TIME='2026-10-12T22:54:39Z' CODERABBIT_TEST_REFUSAL_BODY='<!-- This is an auto-generated comment: review in progress by coderabbit.ai -->'; expected_observed=in_progress ;;
+      pause) export CODERABBIT_TEST_REFUSAL_BODY='<!-- This is an auto-generated comment: review paused by coderabbit.ai -->'; expected_observed=paused ;;
+      fresh-run) export CODERABBIT_TEST_REFUSAL_REVIEW=true CODERABBIT_TEST_REFUSAL_REVIEW_TIME='2026-10-12T22:54:39Z'; expected_observed=in_progress ;;
+      trigger) export CODERABBIT_TEST_REFUSAL_COMMENT_TIME='2026-10-12T22:54:39Z' CODERABBIT_TEST_REFUSAL_BODY='<details><summary>✅ Actions performed</summary>
+Review triggered.
+</details>'; expected_observed=in_progress ;;
+      late-marker) export CODERABBIT_TEST_REFUSAL_BODY2="$fresh_body
+_🟠 Major_
+Late required finding." ;;
+      late-in-progress)
+        export CODERABBIT_TEST_REFUSAL_COMMENT_TIME='2026-10-12T22:54:39Z'
+        export CODERABBIT_TEST_REFUSAL_BODY2="$old_body
+<!-- This is an auto-generated comment: review in progress by coderabbit.ai -->"; expected_observed=in_progress ;;
+      late-pending) export CODERABBIT_TEST_STATUS2=pending CODERABBIT_TEST_STATUS2_DESCRIPTION='Review in progress' CODERABBIT_TEST_STATUS2_AFTER=4 CODERABBIT_TEST_STATUS2_KEEP_OLD=true; expected_observed='summary-without-head-review' ;;
+      late-run) export CODERABBIT_TEST_REFUSAL_REVIEW_LATE=true CODERABBIT_TEST_REFUSAL_REVIEW_TIME='2026-10-12T22:54:39Z' CODERABBIT_TEST_REFUSAL_REVIEW_BODY='_🟠 Major_
+Late current-head run finding.' ;;
+      late-comments-error) export CODERABBIT_TEST_REFUSAL_COMMENTS_FAIL=true; expected_rc=3; expected_observed='' ;;
+      late-reviews-error) export CODERABBIT_TEST_REFUSAL_REVIEWS_FAIL=true; expected_rc=3; expected_observed='' ;;
+      changed-refusal) export CODERABBIT_TEST_STATUS2=success CODERABBIT_TEST_STATUS2_DESCRIPTION='Review rate limited' CODERABBIT_TEST_STATUS2_AFTER=4; expected_observed='summary-without-head-review' ;;
+      unknown) export CODERABBIT_TEST_STATUS_DESCRIPTION='Review rate limited, or completed'; expected_observed='summary-without-head-review' ;;
+      trust-off) expected_observed='summary-without-head-review' ;;
+      unreadable) export CODERABBIT_TEST_STATUS=unreadable; expected_rc=3; expected_observed='' ;;
+    esac
+    case "$shape" in masked-summary|masked-run|late-marker|late-run) expected_rc=2; expected_observed=terminal ;; esac
+    dir=$(make_case "status-refusal-$shape" 1 false 0 0)
+    if [ "$shape" != trust-off ]; then
+      sed -i.bak 's/trust_status_context_for_clearance: false/trust_status_context_for_clearance: true/' "$dir/.github/review-policy.yml"
+    fi
+    rc=$(run_probe_case "$dir" status_refusal)
+    got=$(jq -r '.probe.observed // ""' "$dir/out.json" 2>/dev/null || true)
+    reads=0
+    [ ! -f "$dir/state/status-reads" ] || reads=$(wc -l <"$dir/state/status-reads" | tr -d ' ')
+    if [ "$rc" = "$expected_rc" ] && [ "$got" = "$expected_observed" ] \
+       && [ "$(probe_count "$dir")" = 0 ] && [ "$(codex_invocations "$dir")" = 0 ] \
+       && { [ "$shape" != trust-off ] || [ "$reads" = 0 ]; }; then
+      pass "status-only $shape: rc=$rc observed=$got, no POST"
+    else
+      fail "status-only $shape: rc=$rc expected=$expected_rc/$expected_observed got=$got status-reads=$reads; $(tail -2 "$dir/err.log")"
+    fi
+  done
+  echo "status-only production probes: $PASS passed, $FAIL failed"
+  [ "$FAIL" = 0 ]
+  exit
+fi
+
+# Marker-led included-quota warnings (#2120), expected ~20s, outer 35s.
+if [ "${1:-}" = --marker-led-heading-only ]; then
+  summary='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
+  range='Reviewed changes between bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb and head-sha.'
+  for has_review in false true; do
+    for shape in ${CODERABBIT_TEST_MARKER_HEADING_CASES:-warning tight double-blank overflow many-blanks tab-blanks untrusted masked fenced quoted interior unknown reader-failure}; do
+      body="$summary
+
+> [!WARNING]
+> ## Review limit reached
+> Included review quota exhausted.
+
+$range"
+      expected_rc=7 expected_observed=rate_limit
+      export CODERABBIT_TEST_STATUS=absent
+      unset CODERABBIT_TEST_STATUS_DESCRIPTION CODERABBIT_TEST_STATUS2
+      case "$shape" in
+        tight) body="$summary
+> [!WARNING]
+> ## Review limit reached
+$range" ;;
+        double-blank) body="$summary
+
+
+> [!WARNING]
+> ## Review limit reached
+$range" ;;
+        overflow) body="$summary
+
+
+
+> [!WARNING]
+> ## Review limit reached
+$range" ;;
+        many-blanks)
+          blanks=$(printf '%032d' 0)
+          blanks=${blanks//0/$'\n'}
+          body="$summary
+$blanks
+> [!WARNING]
+> ## Review limit reached
+$range" ;;
+        tab-blanks)
+          body="$summary"$'\n\t\n \t\n\t \n'"> [!WARNING]
+> ## Review limit reached
+$range" ;;
+        masked) body="$body
+_🟠 Major_
+Required current-head summary finding."; expected_rc=2; expected_observed=terminal ;;
+        fenced) body="$summary
+\`\`\`
+> [!WARNING]
+> ## Review limit reached
+\`\`\`
+$range"; expected_rc=0; expected_observed=terminal ;;
+        quoted) body="$summary
+A diff example quotes a warning:
+>> [!WARNING]
+>> ## Review limit reached
+$range"; expected_rc=0; expected_observed=terminal ;;
+        interior) body="$summary
+Review narration cites a quota warning from documentation:
+> [!WARNING]
+> ## Review limit reached
+$range"; expected_rc=0; expected_observed=terminal ;;
+        unknown) body="$summary
+> [!WARNING]
+> ## Unknown quota notice
+$range"; expected_rc=0; expected_observed=terminal ;;
+        reader-failure) expected_rc=3; expected_observed='' ;;
+      esac
+      dir=$(make_case "marker-heading-$has_review-$shape" 1 false 0 0)
+      if [ "$shape" != untrusted ]; then
+        sed -i.bak 's/trust_status_context_for_clearance: false/trust_status_context_for_clearance: true/' "$dir/.github/review-policy.yml"
+      fi
+      if [ "$shape" = reader-failure ]; then
+        CODERABBIT_TEST_REAL_AWK="$(command -v awk)"
+        export CODERABBIT_TEST_REAL_AWK
+        cat >"$dir/bin/awk" <<'SH'
+#!/bin/sh
+case "$*" in *fence_update*) exit 42 ;; esac
+exec "$CODERABBIT_TEST_REAL_AWK" "$@"
+SH
+        chmod +x "$dir/bin/awk"
+      fi
+      export CODERABBIT_TEST_QUOTA_BODY="$body" CODERABBIT_TEST_QUOTA_REVIEW="$has_review"
+      rc=$(run_probe_case "$dir" phase4b_quota)
+      got=$(jq -r '.probe.observed // ""' "$dir/out.json" 2>/dev/null || true)
+      if [ "$rc" = "$expected_rc" ] && [ "$got" = "$expected_observed" ] \
+         && [ "$(probe_count "$dir")" = 0 ] && [ "$(codex_invocations "$dir")" = 0 ]; then
+        pass "marker-led $shape, head review=$has_review: rc=$rc observed=$got, no POST"
+      else
+        fail "marker-led $shape, head review=$has_review: rc=$rc expected=$expected_rc/$expected_observed got=$got"
+      fi
+    done
+  done
+  echo "marker-led quota production probes: $PASS passed, $FAIL failed"
+  [ "$FAIL" = 0 ]
+  exit
+fi
+
+# Older progress versus a later status-only refusal: expected ~25s, outer 45s.
+if [ "${1:-}" = --status-active-only ]; then
+  for has_review in false true; do
+    for shape in ${CODERABBIT_TEST_STATUS_ACTIVE_CASES:-before equal after untrusted missing unknown unreadable pause-before pause-after masked-notice masked-run}; do
+      export CODERABBIT_TEST_REFUSAL_REVIEW="$has_review" CODERABBIT_TEST_NATIVE_REFUSAL=false
+      export CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_DESCRIPTION='Review rate limited' CODERABBIT_TEST_STATUS_TIME='2026-10-12T22:44:25Z'
+      export CODERABBIT_TEST_REFUSAL_COMMENT_TIME='2026-10-12T22:44:18Z'
+      export CODERABBIT_TEST_REFUSAL_BODY='<!-- This is an auto-generated comment: review in progress by coderabbit.ai -->'
+      unset CODERABBIT_TEST_REFUSAL_BODY2 CODERABBIT_TEST_STATUS2 CODERABBIT_TEST_REFUSAL_REVIEW_BODY CODERABBIT_TEST_REFUSAL_REVIEW_TIME
+      expected_rc=7 expected_observed=rate_limit
+      case "$shape" in
+        equal) export CODERABBIT_TEST_REFUSAL_COMMENT_TIME='2026-10-12T22:44:25Z'; expected_observed=in_progress ;;
+        after) export CODERABBIT_TEST_REFUSAL_COMMENT_TIME='2026-10-12T22:54:39Z'; expected_observed=in_progress ;;
+        untrusted) expected_observed=in_progress ;;
+        missing) export CODERABBIT_TEST_STATUS=absent; expected_observed=in_progress ;;
+        unknown) export CODERABBIT_TEST_STATUS_DESCRIPTION='Review might be rate limited'; expected_observed=in_progress ;;
+        unreadable) export CODERABBIT_TEST_STATUS=unreadable; expected_rc=3; expected_observed='' ;;
+        pause-before) export CODERABBIT_TEST_REFUSAL_BODY='<!-- This is an auto-generated comment: review paused by coderabbit.ai -->'; expected_observed=paused ;;
+        pause-after) export CODERABBIT_TEST_REFUSAL_BODY='<!-- This is an auto-generated comment: review paused by coderabbit.ai -->' CODERABBIT_TEST_REFUSAL_COMMENT_TIME='2026-10-12T22:54:39Z'; expected_observed=paused ;;
+        masked-notice) export CODERABBIT_TEST_REFUSAL_BODY='<!-- This is an auto-generated comment: review in progress by coderabbit.ai -->
+Reviewed changes between bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb and head-sha.
+_🟠 Major_
+Required current-head notice finding.'; expected_rc=2; expected_observed=terminal ;;
+        masked-run)
+          if [ "$has_review" = false ]; then continue; fi
+          export CODERABBIT_TEST_REFUSAL_REVIEW_BODY='_🟠 Major_
+Current-head run finding.'; expected_rc=2; expected_observed=terminal ;;
+      esac
+      dir=$(make_case "status-active-$has_review-$shape" 1 false 0 0)
+      if [ "$shape" != untrusted ]; then
+        sed -i.bak 's/trust_status_context_for_clearance: false/trust_status_context_for_clearance: true/' "$dir/.github/review-policy.yml"
+      fi
+      rc=$(run_probe_case "$dir" status_refusal)
+      got=$(jq -r '.probe.observed // ""' "$dir/out.json" 2>/dev/null || true)
+      reads=0
+      [ ! -f "$dir/state/status-reads" ] || reads=$(wc -l <"$dir/state/status-reads" | tr -d ' ')
+      if [ "$rc" = "$expected_rc" ] && [ "$got" = "$expected_observed" ] \
+         && [ "$(probe_count "$dir")" = 0 ] && [ "$(codex_invocations "$dir")" = 0 ] \
+         && { [ "$shape" != untrusted ] || [ "$reads" = 0 ]; } \
+         && { [ "$shape:$has_review" != masked-notice:false ] || jq -e '.review.id == 7701 and .review.endpoint == "issues"' "$dir/out.json" >/dev/null; }; then
+        pass "status-active $shape, head review=$has_review: rc=$rc observed=$got, no POST"
+      else
+        fail "status-active $shape, head review=$has_review: rc=$rc expected=$expected_rc/$expected_observed got=$got status-reads=$reads"
+      fi
+    done
+  done
+  echo "active-status production probes: $PASS passed, $FAIL failed"
+  [ "$FAIL" = 0 ]
+  exit
+fi
+
+# #2120: bounded real-probe controls, expected ~12s, outer timeout 20s.
+# Both production branches run: a head-pinned review object present/absent.
+if [ "${1:-}" = --phase4b-quota-only ]; then
+  for has_review in false true; do
+    for shape in heading marker native masked-heading masked-marker quoted fenced unknown; do
+      body='> [!WARNING]
+> ## Review limit reached
+> Included review quota exhausted.'
+      expected_rc=7 expected_observed=rate_limit
+      case "$shape" in
+        native)
+          # Retain any trailing newlines in the observed body exactly.
+          body=$(jq -ej '.body' "$ROOT/tests/fixtures/coderabbit_quota_refusal.json" && printf '__quota_body_end__')
+          body=${body%__quota_body_end__} ;;
+        marker|masked-marker)
+          body='<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->
+Fair Usage Limits: 0 included reviews remain.' ;;
+        quoted) body='A diff example quotes "Review limit reached".' ;;
+        fenced) body='```
+> [!WARNING]
+> ## Review limit reached
+```' ;;
+        unknown) body='<!-- This is an auto-generated comment: quota exhausted by coderabbit.ai -->' ;;
+      esac
+      case "$shape" in
+        masked-*) body="$body
+_⚠️ Potential issue_
+Blocking finding on this head."; expected_rc=2; expected_observed=terminal ;;
+        quoted|fenced|unknown)
+          expected_observed='summary-without-head-review'
+          [ "$has_review" = false ] || expected_observed=awaiting-summary ;;
+      esac
+      dir=$(make_case "quota-$has_review-$shape" 1 false 0 0)
+      export CODERABBIT_TEST_QUOTA_BODY="$body" CODERABBIT_TEST_QUOTA_REVIEW="$has_review"
+      rc=$(run_probe_case "$dir" phase4b_quota)
+      if [ "$rc" = "$expected_rc" ] \
+         && [ "$(jq -r '.probe.observed' "$dir/out.json")" = "$expected_observed" ] \
+         && [ "$(probe_count "$dir")" = 0 ] && [ "$(codex_invocations "$dir")" = 0 ]; then
+        pass "quota $shape, head review=$has_review: real probe rc=$rc observed=$expected_observed, no POST"
+      else
+        fail "quota $shape, head review=$has_review: rc=$rc expected=$expected_rc/$expected_observed, output=$(cat "$dir/out.json"), stderr=$(tail -3 "$dir/err.log")"
+      fi
+    done
+    dir=$(make_case "quota-$has_review-reader-failure" 1 false 0 0)
+    CODERABBIT_TEST_REAL_AWK="$(command -v awk)"
+    export CODERABBIT_TEST_REAL_AWK
+    cat >"$dir/bin/awk" <<'SH'
+#!/bin/sh
+case "$*" in *fence_update*) exit 42 ;; esac
+exec "$CODERABBIT_TEST_REAL_AWK" "$@"
+SH
+    chmod +x "$dir/bin/awk"
+    export CODERABBIT_TEST_QUOTA_REVIEW="$has_review"
+    export CODERABBIT_TEST_QUOTA_BODY='> [!WARNING]
+> ## Review limit reached'
+    rc=$(run_probe_case "$dir" phase4b_quota)
+    if [ "$rc" = 3 ] && [ "$(probe_count "$dir")" = 0 ] && [ "$(codex_invocations "$dir")" = 0 ]; then
+      pass "quota reader failure, head review=$has_review: infrastructure exit 3, no POST"
+    else
+      fail "quota reader failure, head review=$has_review: rc=$rc expected=3, stderr=$(tail -3 "$dir/err.log")"
+    fi
+  done
+  echo "phase4b quota production probes: $PASS passed, $FAIL failed"
+  [ "$FAIL" = 0 ]
+  exit
+fi
 
 # <dir> <expected_rc> <expected_observed> <label> — the shared assertion:
 # right rc, right observed surface, status=no_review_yet, skip_reason null,
@@ -3634,22 +3990,19 @@ test_936_unreadable_status_is_not_an_absent_status() {
     sed 's/^/      /' "$dir2/err.log" >&2 || true
   fi
 
-  # Route 3 — the OTHER consumer of the same record: the #869 rc-7 sample that
-  # feeds probe.context_state to the barrier. This one was already fail-closed
-  # (the barrier opens only on "success"), so it deliberately keeps its bounded
-  # not-yet instead of escalating to rc 3 — but it must report the failure
-  # HONESTLY rather than as the absent case, so the barrier's input distinguishes
-  # "CodeRabbit published no status" from "we could not read the statuses".
-  local dir3 rc3 obs3 ctx3
+  # Route 3: the #869 awaiting-summary sample remains distinct from absence.
+  # Its #2120 status-refusal decision now requires a readable trusted status;
+  # a failed read exits infrastructure3, never a refusal or review clearance.
+  local dir3 rc3
   dir3=$(make_case probe-936-ctx-unreadable 600 true 30 3 2)
   enable_trust_status_context "$dir3"
   rc3=$(CODERABBIT_TEST_STATUS=unreadable run_probe_case "$dir3" probe_summary_lags_review)
-  obs3=$(jq -r '.probe.observed // "MISSING"' "$dir3/out.json" 2>/dev/null || echo PARSE_ERROR)
-  ctx3=$(jq -r '.probe.context_state // "MISSING"' "$dir3/out.json" 2>/dev/null || echo PARSE_ERROR)
-  if [ "$rc3" = "7" ] && [ "$obs3" = "awaiting-summary" ] && [ "$ctx3" = "unreadable" ]; then
-    pass "#936: the rc-7 barrier sample emits context_state=unreadable (never 'missing', never 'success') so the barrier stays closed on a failed read"
+  if [ "$rc3" = "3" ] && [ ! -s "$dir3/out.json" ] \
+     && [ "$(probe_count "$dir3")" = 0 ] && [ "$(codex_invocations "$dir3")" = 0 ] \
+     && grep -q 'could not read trusted current-head status refusal evidence' "$dir3/err.log"; then
+    pass "#936: unreadable required status-refusal evidence exits3 without a verdict, carry-forward or POST"
   else
-    fail "#936 route 3 (rc-7 barrier sample) → rc=$rc3 observed=$obs3 context_state=$ctx3 (expected 7/awaiting-summary/unreadable)"
+    fail "#936 route 3 (required status-refusal read) → rc=$rc3 (expected infra3, no verdict/carry-forward/POST)"
     sed 's/^/      /' "$dir3/err.log" >&2 || true
   fi
 

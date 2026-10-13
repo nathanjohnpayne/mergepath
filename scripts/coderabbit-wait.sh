@@ -1672,7 +1672,7 @@ crw_unfenced_body() {
 # unfenced, unquoted line keeps prose, diff excerpts, and fenced examples from
 # becoming provider state.
 crw_provider_owned_refusal_class() {
-  local body=$1 unfenced first_line narration_lead narration_first_line
+  local body=$1 unfenced heading_body first_line narration_lead narration_first_line
   unfenced=$(crw_unfenced_body "$body") || return 3
   if grep -Fxq "<!-- This is an auto-generated comment: $RATE_LIMIT_MARKER -->" <<<"$unfenced"; then
     printf 'rate_limit\n'
@@ -1686,12 +1686,22 @@ crw_provider_owned_refusal_class() {
     printf 'in_progress\n'
     return 0
   fi
-  case "$unfenced" in
+  # Reuse the supported heading forms after ONE exact leading summary
+  # wrapper. Blank presentation lines are skipped before the two nonempty
+  # heading lines; interior prose/quoted/fenced examples stay review content.
+  heading_body=$unfenced
+  case "$heading_body" in
+    "$SUMMARY_MARKER"$'\n'*)
+      heading_body=${heading_body#*$'\n'}
+      heading_body=$(awk 'NF { print; if (++n == 2) exit }' <<<"$heading_body") || return 3
+      ;;
+  esac
+  case "$heading_body" in
     "> [!WARNING]"$'\n'"> ## Rate limit exceeded"*) printf 'rate_limit\n'; return 0 ;;
     "> [!WARNING]"$'\n'"> ## Review limit reached"*) printf 'rate_limit\n'; return 0 ;;
     "> [!WARNING]"$'\n'"> ## Reviews paused"*) printf 'paused\n'; return 0 ;;
   esac
-  first_line=$(awk 'NF { sub(/[[:space:]]+$/, ""); print; exit }' <<<"$unfenced") || return 3
+  first_line=$(awk 'NF { sub(/[[:space:]]+$/, ""); print; exit }' <<<"$heading_body") || return 3
   first_line=$(printf '%s' "$first_line" | tr '[:upper:]' '[:lower:]') || return 3
   case "$first_line" in
     'rate limit exceeded'|'rate-limit exceeded'|'## rate limit exceeded'|'## rate-limit exceeded'|'review limit reached'|'## review limit reached')
@@ -4469,6 +4479,124 @@ crw_carry_status_record() {
   printf '%s\n' "$out"
 }
 
+# BEGIN coderabbit_probe_status_refusal_helpers
+# Probe-only refusal evidence, never review clearance. The current-SHA endpoint
+# and configured producer/context own this assertion; ids order same-second
+# updates. Unusable producer records cannot leave an older refusal authoritative.
+crw_probe_select_status_refusal() {
+  local out
+  out=$(jq -ce --arg bot "$BOT_LOGIN" '
+    [ .[] | select(.context == "CodeRabbit" and .creator.login == $bot) ] as $owned
+    | if any($owned[]; (.id | type) != "number" or .id <= 0 or .id != (.id | floor))
+      then error("unusable provider status id") else $owned end
+    | sort_by(.id) | last
+    | if . == null then {state: "missing"} else . end
+    | {id, state, description, created_at, updated_at: (.updated_at // .created_at)}
+  ' <<<"$1") || return 3
+  [ "$(jq -r '.state' <<<"$out")" = success ] || return 1
+  [ "$(crw_normalize_status_description "$(jq -r '.description // ""' <<<"$out")")" = 'review rate limited' ] || return 1
+  jq -e '
+    (.description | type) == "string" and
+    (.created_at | type) == "string" and (.updated_at | type) == "string" and
+    (.created_at | fromdateiso8601) <= (.updated_at | fromdateiso8601)
+  ' <<<"$out" >/dev/null 2>&1 || return 3
+  printf '%s\n' "$out"
+}
+
+crw_probe_status_refusal_record() {
+  local statuses
+  [ "$TRUST_STATUS_CONTEXT" = true ] || return 1
+  statuses=$(fetch_api_array "repos/$REPO/commits/$HEAD_SHA/statuses" "statuses (probe refusal)") || return 3
+  crw_probe_select_status_refusal "$statuses"
+}
+# END coderabbit_probe_status_refusal_helpers
+
+# Called at the two nonterminal probe fallbacks and before progress holds. A positive first sample
+# repeats the ordinary verdict selection once, refreshing comments AND reviews.
+# That pass revalidates the latest status and all marker surfaces before emitting
+# a refusal. It preserves clean-report precedence and never posts or grants a
+# review verdict. Provider publication after this bounded sample is outside this
+# guarantee, just as it is for the existing probe's publication rescan.
+crw_probe_maybe_emit_status_refusal() {
+  local reviews=$1 comments=$2 review=$3 resampled=$4 prior=$5 notice=${6:-} notice_evidence=${7:-null} record rc=0
+  local review_body="" rid rows row body class at evidence
+  record=$(crw_probe_status_refusal_record) || rc=$?
+  case "$rc" in
+    1) return 0 ;;
+    3) die 3 "could not read trusted current-head status refusal evidence" ;;
+    0) ;;
+    *) die 3 "unusable current-head status refusal result" ;;
+  esac
+  if [ "$resampled" != true ]; then
+    PROBE_CONTEXT_STATE=""; PROBE_CONTEXT_UPDATED_AT=""; PROBE_CARRYFORWARD_JSON=null
+    probe_emit_verdict true "$record"
+    die 3 "internal: status-refusal resample returned without a verdict"
+  fi
+  # A changed status sample needs a new probe cycle, even if the replacement
+  # also refuses. A single bounded resample cannot grade publication after it.
+  [ "$record" = "$prior" ] || return 0
+  if [ -n "$review" ]; then
+    rid=$(jq -r '.id // empty' <<<"$review") || die 3 "could not read the status-refusal review id"
+    [ -n "$rid" ] || die 3 "status-refusal review carries no usable id"
+    review_body=$(jq -r --argjson id "$rid" '[.[] | select(.id == $id) | .body] | first // ""' <<<"$reviews") \
+      || die 3 "could not re-read the full status-refusal review body"
+    [ -n "$review_body" ] || die 3 "status-refusal review body did not round-trip"
+  fi
+  rc=0
+  crw_rate_limit_hides_a_finding "$HEAD_SHA" "$notice" "$review_body" "$comments" || rc=$?
+  case "$rc" in
+    0)
+      PROBE_CONTEXT_STATE=""; PROBE_CONTEXT_UPDATED_AT=""; PROBE_CARRYFORWARD_JSON=null
+      PROBE_OBSERVED=terminal
+      emit_json_and_exit findings 2 "${CRW_HIDDEN_FINDING_JSON:-${review:-$notice_evidence}}" 1 ;;
+    1) ;;
+    *) die 3 "could not scan every status-refusal marker surface" ;;
+  esac
+  # A newly accepted trigger or provider-owned active/pause publication supersedes
+  # the older refusal even when its mutable summary still names the prior head.
+  at=$(jq -r '.updated_at' <<<"$record") || die 3 "unreadable refusal timestamp"
+  PROBE_CONTEXT_STATE=""; PROBE_CONTEXT_UPDATED_AT=""; PROBE_CARRYFORWARD_JSON=null
+  if [ -n "$review" ]; then
+    rc=0
+    jq -e --arg at "$at" '(.submitted_at | fromdateiso8601) >= ($at | fromdateiso8601)' <<<"$review" >/dev/null 2>&1 || rc=$?
+    case "$rc" in
+      0) probe_not_yet in_progress "$review" ;;
+      1) ;;
+      *) die 3 "could not order the current-head review run against the refusal" ;;
+    esac
+  fi
+  rc=0; crw_newer_review_trigger_accepted "$comments" "$at" || rc=$?
+  case "$rc" in
+    0) probe_not_yet in_progress null ;;
+    1) ;;
+    *) die 3 "could not order review-trigger evidence against the refusal" ;;
+  esac
+  rows=$(jq -r --arg bot "$BOT_LOGIN" --arg at "$at" '
+    ($at | fromdateiso8601) as $epoch
+    | [.[] | select(.user.login == $bot)
+      | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
+      | select((.fresh_at | fromdateiso8601) >= $epoch)]
+    | sort_by(.fresh_at, .id) | reverse | .[] | @base64
+  ' <<<"$comments") || die 3 "could not order provider publications against the refusal"
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    body=$(printf '%s' "$row" | base64 --decode | jq -r '.body // ""') || die 3 "unreadable provider publication"
+    class=$(crw_classify_selected_comment "$body") || die 3 "unclassifiable provider publication"
+    case "$class" in
+      in_progress|paused)
+        evidence=$(printf '%s' "$row" | base64 --decode | jq -c '{id, created_at, updated_at, endpoint: "issue_comments", body_excerpt: (.body[0:200])}') \
+          || die 3 "unreadable active-publication evidence"
+        PROBE_CONTEXT_STATE=""; PROBE_CONTEXT_UPDATED_AT=""; PROBE_CARRYFORWARD_JSON=null
+        probe_not_yet "$class" "$evidence" ;;
+    esac
+  done <<<"$rows"
+  evidence=$(jq -c '. + {endpoint: "status_context", disposition: "rate_limit", permits_clearance: false}' <<<"$record") \
+    || die 3 "unreadable refusal provenance"
+  PROBE_CONTEXT_STATE=""; PROBE_CONTEXT_UPDATED_AT=""; PROBE_CARRYFORWARD_JSON=null
+  log "probe: configured provider explicitly refused current-head review in its latest trusted status; reporting rate_limit, not review clearance (#2120)"
+  probe_not_yet rate_limit "$evidence"
+}
+
 # True (0) when <body> is CodeRabbit's SUCCESSFUL review-trigger
 # acknowledgement ("✅ Actions performed" / "Review triggered", including the
 # "Full review triggered" form); 1 when it is not; 3 when the body could not be
@@ -4870,6 +4998,7 @@ crw_probe_carryforward_evidence() {
 # to rc 7 when the per-SHA status reads exactly `pending`. It is the same
 # posture — the status can only ever REFUSE a claim here, never make one.
 probe_emit_verdict() {
+  local status_refusal_resampled=${1:-false} status_refusal_initial=${2:-}
   local reviews review review_at issue_comments cand row body class ctx_record
   local active_notice active_rc
   local summary sbody sjson sclass
@@ -4940,7 +5069,10 @@ probe_emit_verdict() {
       while IFS= read -r row; do
         [ -z "$row" ] && continue
         body=$(printf '%s' "$row" | base64 --decode | jq -r '.body // ""')
-        class=$(classify_comment "$body")
+        # The selected configured-bot comment may use the supported
+        # provider-owned quota heading without its HTML rate-limit marker.
+        class=$(crw_classify_selected_comment "$body") \
+          || die 3 "failed to classify the selected probe publication"
         # Narration replies carry no publication state, and the probe.observed
         # enum deliberately omits status_probe — the no-review-object triage
         # drops narration in its jq filter, but this scan classifies every row,
@@ -5108,6 +5240,11 @@ probe_emit_verdict() {
           emit_json_and_exit "findings" 2 "${CRW_HIDDEN_FINDING_JSON:-$review}" 1
         fi
       fi
+      case "$PROBE_OBSERVED" in
+        awaiting-summary|in_progress)
+          crw_probe_maybe_emit_status_refusal "$reviews" "$issue_comments" "$review" "$status_refusal_resampled" "$status_refusal_initial" "$newest_body"
+          ;;
+      esac
       log "probe: review object on $HEAD_SHA but no terminal summary yet (newest=${newest_class:-none}, context_state=${PROBE_CONTEXT_STATE:-unsampled}, context_updated_at=${PROBE_CONTEXT_UPDATED_AT:-unsampled})"
       probe_not_yet "$PROBE_OBSERVED" "$review"
     done
@@ -5172,7 +5309,8 @@ probe_emit_verdict() {
   if [ -n "$cand" ]; then
     body=$(printf '%s' "$cand" | base64 --decode | jq -r '.body')
     latest_json=$(printf '%s' "$cand" | base64 --decode | jq -r '.json')
-    newest_class=$(classify_comment "$body")
+    newest_class=$(crw_classify_selected_comment "$body") \
+      || die 3 "failed to classify the latest probe comment"
     # #1178 guard, site 2 of 3 — the no-review-object triage. Same body, same
     # masking, same answer as site 1.
     # ONE call, EVERY surface (#1178 rounds 3/5/7/9) — replaces the two inline
@@ -5186,6 +5324,11 @@ probe_emit_verdict() {
         log "probe: the rate-limit notice on $HEAD_SHA hides a blocking finding — escalating (#1178)"
         emit_json_and_exit "findings" 2 "${CRW_HIDDEN_FINDING_JSON:-$latest_json}" 1
       fi
+    fi
+    # A later trusted per-SHA refusal can finish an older progress notice.
+    # Equal/newer progress and durable pause recovery keep their own holds.
+    if [ "$newest_class" = in_progress ]; then
+      crw_probe_maybe_emit_status_refusal "$reviews" "$issue_comments" "" "$status_refusal_resampled" "$status_refusal_initial" "$body" "$latest_json"
     fi
     case "$newest_class" in
       in_progress|rate_limit|paused)
@@ -5281,7 +5424,12 @@ probe_emit_verdict() {
     # Not a report on this head. What it DID last report on rides along as
     # evidence for the barrier's same-content test (#1335); no verdict below
     # reads it.
-    crw_probe_carryforward_evidence "$sbody"
+    # A status-refusal resample is reclassifying fresh provider publication;
+    # carry-forward has no authority on this path and would add further snapshots
+    # after the arrays whose marker surfaces this pass is about to grade.
+    if [ "$status_refusal_resampled" != true ]; then
+      crw_probe_carryforward_evidence "$sbody"
+    fi
   fi
 
   # Nothing active. Only NOW does auto-review eligibility settle it.
@@ -5356,6 +5504,7 @@ probe_emit_verdict() {
       "$(printf '%s' "$active_notice" | jq -c '{id, created_at, updated_at, fresh_at, endpoint, body_excerpt: ((.body // "")[0:200])}')"
   fi
 
+  crw_probe_maybe_emit_status_refusal "$reviews" "$issue_comments" "" "$status_refusal_resampled" "$status_refusal_initial"
   if [ -z "$cand" ]; then
     probe_not_yet "none" "null"
   fi

@@ -136,6 +136,10 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 echo "check_phase_4b_automation: running $TEST"
+bash "$REPO_ROOT/$TEST" --rate-limit-only
+bash "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh" --status-refusal-only
+bash "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh" --marker-led-heading-only
+bash "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh" --status-active-only
 "$REPO_ROOT/$TEST"
 bash "$REPO_ROOT/$TEST" --heartbeat-only
 bash "$REPO_ROOT/tests/test_phase_4b_immutable_input.sh"

@@ -1,0 +1,37 @@
+{
+  "source_repository": "nathanjohnpayne/mergepath",
+  "source_pr": 2130,
+  "head_sha": "cc0966cae5c835f0eca8c471e9b6e19929cf463c",
+  "source_statuses_sha256": "f1a8b344e2905f36a9bf5887f830a3f2443a469e74286f32fefb5977cbdae15c",
+  "source_comments_sha256": "5bd12ff116708b0954f1e760e1309bfab9fbfd3431ad71fdffc4e4b25ddd2807",
+  "statuses": [
+    {
+      "id": 56178662655,
+      "context": "CodeRabbit",
+      "state": "success",
+      "description": "Review rate limited",
+      "created_at": "2026-10-12T22:44:25Z",
+      "updated_at": "2026-10-12T22:44:25Z",
+      "creator": {
+        "login": "coderabbitai[bot]"
+      }
+    },
+    {
+      "id": 56178656816,
+      "context": "CodeRabbit",
+      "state": "pending",
+      "description": "Review in progress",
+      "created_at": "2026-10-12T22:44:18Z",
+      "updated_at": "2026-10-12T22:44:18Z",
+      "creator": {
+        "login": "coderabbitai[bot]"
+      }
+    }
+  ],
+  "prior_summary": {
+    "id": 6133454490,
+    "created_at": "2026-10-12T22:04:14Z",
+    "updated_at": "2026-10-12T22:45:20Z",
+    "body": "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\nReviewing files that changed from the base of the PR and between 9f8c92ac31687e020784f8a49e260fcdf58a45a7 and bb6b4891ec0b08aac5c00b71ee7c39bed7dfc4f3."
+  }
+}

@@ -1208,6 +1208,15 @@ paths:
   - path: tests/test_coderabbit_wait_status_probe.sh
     type: canonical
     consumers: all
+    requires:
+      - "tests/fixtures/coderabbit_quota_refusal.json"
+      - "tests/fixtures/coderabbit_status_refusal.json"
+  - path: tests/fixtures/coderabbit_status_refusal.json
+    type: canonical
+    consumers: all
+  - path: tests/fixtures/coderabbit_quota_refusal.json
+    type: canonical
+    consumers: all
   # Locks the #490 auto-pause `paused` state + static skip contract: the
   # #485 "Reviews paused" marker is recognized, `@coderabbitai resume` is
   # posted (bounded by max_resume_retries) and never exits 4, and a
@@ -1566,6 +1575,8 @@ paths:
       - "scripts/lib/preflight-helpers.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "tests/fixtures/phase_4b_verdicts.jsonl"
+      - "tests/test_coderabbit_wait_status_probe.sh" # bounded quota production probes (#2120)
+      - "tests/fixtures/coderabbit_quota_refusal.json" # exact native consumer refusal body
   # Advisory heartbeat tests execute the real orchestrator with fake boundaries.
   # Core assertions run on consumers; curated-wave fixtures run only on the hub.
   - path: tests/test_phase_4b_immutable_input.sh
@@ -2305,6 +2316,8 @@ paths:
       - "tests/test_cloud_environment.sh"      # check_op_preflight_contract (#1057 F)
       - "tests/test_local_agent_handback.sh"   # check_op_preflight_contract (#1057 D, G)
       - "tests/test_coderabbit_wait_status_probe.sh"  # check_coderabbit_wait
+      - "tests/fixtures/coderabbit_quota_refusal.json"  # check_phase_4b_automation quota probes (#2120)
+      - "tests/fixtures/coderabbit_status_refusal.json" # check_phase_4b_automation status probes (#2120)
       - "tests/test_coderabbit_wait_identity_derivation.sh"  # check_coderabbit_wait (#438)
       - "tests/test_coderabbit_wait_paused.sh"  # check_coderabbit_wait (#490)
       - "tests/test_coderabbit_wait_codex_failover.sh"  # check_coderabbit_wait (#489/#521)

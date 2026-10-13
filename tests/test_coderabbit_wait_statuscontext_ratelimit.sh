@@ -854,7 +854,7 @@ test_legacy_one_line_refusal_quote_and_fence_stay_nonprovider() {
 
 test_legacy_refusal_classifier_unit() {
   local snip="$WORKDIR/legacy-refusal-classifier.sh" body class bad="" before=$FAIL
-  eval "$(grep -E '^(RATE_LIMIT_MARKER|PAUSED_MARKER|IN_PROGRESS_MARKER)=' \
+  eval "$(grep -E '^(RATE_LIMIT_MARKER|PAUSED_MARKER|IN_PROGRESS_MARKER|SUMMARY_MARKER)=' \
     "$ROOT/scripts/coderabbit-wait.sh")"
   # shellcheck source=../scripts/lib/coderabbit-fence.sh
   . "$ROOT/scripts/lib/coderabbit-fence.sh"

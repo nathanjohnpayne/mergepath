@@ -1,0 +1,20 @@
+{
+  "source_repository": "nathanjohnpayne/nathanpaynedotcom",
+  "source_pr": 1296,
+  "source_comment_id": 6114502126,
+  "source_author": "coderabbitai[bot]",
+  "source_raw_body_sha256": "e694780a94917fec5eeddd850c0d7343352dba985e40ac855c6341d7d850973f",
+  "source_stanza_sha256": "be7481afb9d83a4a96ef0fabc0724304714aac997b99ada7af5440a8f693ef5f",
+  "source_stanza_lines": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    8,
+    9,
+    17
+  ],
+  "body_sha256": "8bf0c436820b68f9f48d5ac3b955689934e84abeab7c4f51813c5b2d840c2b5d",
+  "body": "<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\n\n> [!WARNING]\n> ## Review limit reached\n> \n> **Next included review available in 6 minutes.**\n> \n> **Limit details:** You’ve used the included review currently available. Your 68 included PR review attempts over the past 7 days set your current allowance at 1 review per hour."
+}
