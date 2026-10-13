@@ -814,8 +814,20 @@ paths:
     consumers: all
     requires:
       - "scripts/repo-lint-latency-report.sh"
+      - "scripts/repo-lint-latency-issue.sh"      # alert → tracking-issue router (#2165)
       - "scripts/ci/check_repo_lint_latency_report"
       - ".github/workflows/repo-lint-latency.yml"
+  - path: tests/test_stalled_pr_resume.sh
+    # Hermetic suite for the stalled-PR finder + resume entry point (#2165).
+    # Both subjects live in the scripts/workflow/ kit; the two API helpers
+    # they source are declared so a partial kit cannot strand the suite.
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/"
+      - "scripts/ci/check_stalled_pr_resume"
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/gh-api-scalar.sh"
   - path: tests/test_check_doc_ownership.sh
     type: canonical
     consumers: all
@@ -2097,11 +2109,36 @@ paths:
     consumers: all
     requires:
       - "scripts/repo-lint-latency-report.sh"
+      - "scripts/repo-lint-latency-issue.sh"      # alert → tracking-issue router (#2165)
   - path: scripts/repo-lint-latency-report.sh
     type: canonical
     consumers: all
     requires:
       - "scripts/lib/gh-retry-helpers.sh"
+  - path: scripts/repo-lint-latency-issue.sh
+    # Routes the daily latency verdict to ONE marker-keyed tracking issue
+    # (open/refresh on alert, comment + close on recovery) — #2165. Needs
+    # only gh + jq; the workflow's GITHUB_TOKEN carries issues:write.
+    type: canonical
+    consumers: all
+  - path: scripts/workflow/stalled-prs.sh
+    # Read-only stalled-PR finder (#2165). In the scripts/workflow/ kit; the
+    # entry declares the two fail-closed API readers it sources.
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/gh-api-scalar.sh"
+      - "scripts/codex-review-check.sh"          # merge-readiness delegate (gate), run only for stalled PRs
+  - path: scripts/workflow/resume-stalled-pr.sh
+    # Resume entry point for a scheduled routine (#2165): runs the finder,
+    # prints the work order, and under --execute posts ONLY the Codex request
+    # through codex-review-request.sh (author wrapper inside). Never merges.
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/stalled-prs.sh"
+      - "scripts/codex-review-request.sh"
   - path: tests/test_marker_provenance.py
     type: canonical
     consumers: all
