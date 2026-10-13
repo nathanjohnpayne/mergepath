@@ -105,7 +105,9 @@
 #      and the shells scripts actually get written in, and classifies an
 #      extensionless file by shebang — including `#!/usr/bin/env sh`,
 #      which has no slash before the interpreter word and so was missed
-#      by a `/sh` substring test. A surface the classifier skips is a
+#      by a `/sh` substring test. Exact startup basenames and immediate
+#      `.husky` hook files additionally admit shebangless shell source.
+#      A surface the classifier skips is a
 #      surface with no gate on it at all.
 #
 #      Keys are matched case-insensitively, because a git config key is
@@ -1256,7 +1258,7 @@ scan_unscoped_identity_writes() {
     return 1
   }
 
-  # Which files are in scope, by extension or by shebang. The check
+  # Which files are in scope, by extension, startup/hook path or shebang. The check
   # claims to cover "any tracked shell script or Markdown doc", so the
   # classification has to reach every spelling of those two things:
   #
@@ -1301,6 +1303,17 @@ scan_unscoped_identity_writes() {
       *.sh|*.bash|*.zsh|*.ksh|*.dash|*.bats|*.md|*.markdown|*.mdown|*.mkd) in_scope=1 ;;
     esac
     shopt -u nocasematch
+    # Exact shell-startup basenames apply anywhere in the regular corpus.
+    # Husky admits only one basename after an exact .husky component;
+    # deeper helper paths retain independent extension/shebang admission.
+    case "${rel##*/}" in
+      .profile|.bashrc|.bash_profile|.bash_login|.bash_logout|.zshenv|.zprofile|.zshrc|.zlogin|.zlogout|.kshrc|.mkshrc|.ashrc|.envrc|.bash_aliases|.shrc) in_scope=1 ;;
+    esac
+    if [[ "$rel" == */* ]]; then
+      case "${rel%/*}" in
+        .husky|*/.husky) in_scope=1 ;;
+      esac
+    fi
     if [ "$in_scope" -eq 0 ]; then
       # `read` rather than `head`, so no pipeline and no SIGPIPE: with
       # `pipefail` set, `head -n1 | grep -q` can fail on the WRITER and

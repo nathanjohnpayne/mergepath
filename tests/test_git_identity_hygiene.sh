@@ -378,6 +378,117 @@ else
   fail "symlinked parent directory followed: rc=$RC out=$OUT"
 fi
 
+# BEGIN STARTUP_ADMISSION_CONTROLS
+# Case 10d: shell-startup basenames and immediate Husky hook files need no
+# shebang. Exercise every admitted name at root and nested paths through a
+# genuine private Git index, with no root/suite override or hub marker.
+STARTUP_CONSUMER="$WORKDIR/consumer-startup-admission"
+mkdir -p "$STARTUP_CONSUMER/scripts/ci" "$STARTUP_CONSUMER/tests"
+git init -q -b main "$STARTUP_CONSUMER"
+cp "$CHECK" "$STARTUP_CONSUMER/scripts/ci/check_git_identity_hygiene"
+printf '#!/usr/bin/env bash\nexit 91\n' > "$STARTUP_CONSUMER/tests/test_git_identity_hygiene.sh"
+cp "$STARTUP_CONSUMER/.git/config" "$WORKDIR/startup-config-before"
+STARTUP_PATHS=()
+for NAME in .profile .bashrc .bash_profile .bash_login .bash_logout .zshenv .zprofile .zshrc .zlogin .zlogout .kshrc .mkshrc .ashrc .envrc .bash_aliases .shrc; do
+  STARTUP_PATHS+=("$NAME" "packages/demo/$NAME")
+done
+STARTUP_PATHS+=(.husky/pre-commit packages/demo/.husky/pre-push)
+for CONTROL in writer scoped exempt quoted-data; do
+  case "$CONTROL" in
+    writer) SOURCE='git config user.email startup@example.invalid'; EXPECTED=1 ;;
+    scoped) SOURCE='git -C "$FIXTURE" config user.email startup@example.invalid'; EXPECTED=0 ;;
+    exempt) SOURCE='git config user.email startup@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: owning fixture'; EXPECTED=0 ;;
+    quoted-data) SOURCE="printf '%s' 'git config user.email startup@example.invalid'"; EXPECTED=0 ;;
+  esac
+  for REL in "${STARTUP_PATHS[@]}"; do
+    mkdir -p "$STARTUP_CONSUMER/$(dirname "$REL")"
+    printf '%s\n' "$SOURCE" > "$STARTUP_CONSUMER/$REL"
+  done
+  git -C "$STARTUP_CONSUMER" add -A
+  if git -C "$STARTUP_CONSUMER" ls-files --error-unmatch -- "${STARTUP_PATHS[@]}" >/dev/null 2>&1; then
+    pass "all startup/Husky $CONTROL paths are genuinely tracked"
+  else fail "startup/Husky control paths missing from private index: $CONTROL"; fi
+  set +e
+  OUT="$(bash "$STARTUP_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+  set -e
+  for REL in "${STARTUP_PATHS[@]}"; do
+    if [ "$RC" = "$EXPECTED" ] \
+      && { [ "$EXPECTED" = 0 ] || [[ "$OUT" == *"  - $REL:1:"* ]]; } \
+      && { [ "$EXPECTED" = 1 ] || [[ "$OUT" == *"regression test suite skipped (consumer checkout"* ]]; } \
+      && cmp -s "$WORKDIR/startup-config-before" "$STARTUP_CONSUMER/.git/config"; then
+      pass "tracked startup/Husky $CONTROL control: $REL"
+    else fail "startup/Husky $CONTROL: path='$REL' expected=$EXPECTED rc=$RC out=$OUT"; fi
+  done
+done
+
+# Case and suffix variants, other components, helper/deeper paths and a
+# .husky basename without a following component gain no new admission.
+STARTUP_NEGATIVES=(case-hooks/.HUSKY/pre-commit packages/case-hooks/.HUSKY/pre-push
+  foo.husky/pre-commit .husky-helper/pre-commit
+  .husky/_/pre-commit .husky/child/pre-commit packages/demo/.husky/_/pre-push
+  packages/demo/.husky/child/pre-push packages/literal/.husky
+  docs/projects/app/prds/.bashrc docs/projects/app/prds/.husky/pre-commit)
+for NAME in .profile .bashrc .bash_profile .bash_login .bash_logout .zshenv .zprofile .zshrc .zlogin .zlogout .kshrc .mkshrc .ashrc .envrc .bash_aliases .shrc; do
+  UPPER_NAME="$(printf '%s' "$NAME" | tr '[:lower:]' '[:upper:]')"
+  # Separate directories avoid aliasing the positive names on macOS.
+  STARTUP_NEGATIVES+=("case-startup/$UPPER_NAME" "packages/case-startup/$UPPER_NAME" "$NAME.backup" "packages/demo/$NAME.backup")
+done
+for REL in "${STARTUP_NEGATIVES[@]}"; do
+  mkdir -p "$STARTUP_CONSUMER/$(dirname "$REL")"
+  printf 'git config user.email negative@example.invalid\n' > "$STARTUP_CONSUMER/$REL"
+done
+git -C "$STARTUP_CONSUMER" add -A
+if git -C "$STARTUP_CONSUMER" ls-files --error-unmatch -- "${STARTUP_NEGATIVES[@]}" >/dev/null 2>&1; then
+  pass "startup case/suffix and Husky component/depth negatives are genuinely tracked"
+else fail "startup/Husky negative paths missing from private index"; fi
+printf 'git config user.email untracked@example.invalid\n' > "$STARTUP_CONSUMER/.husky/untracked-hook"
+set +e
+OUT="$(bash "$STARTUP_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+set -e
+if [ "$RC" = 0 ] && [[ "$OUT" == *"regression test suite skipped (consumer checkout"* ]] \
+  && cmp -s "$WORKDIR/startup-config-before" "$STARTUP_CONSUMER/.git/config"; then
+  pass "tracked startup case/suffix and Husky component/depth negatives; exclusions retained"
+else fail "startup/Husky negative admission: rc=$RC out=$OUT"; fi
+
+# New path admission is additive: helper/deeper paths already admitted
+# by extensions or shebangs must continue to expose their writer.
+for REL in .husky/_/file.sh packages/demo/.husky/child/file.sh .husky/_/shebang-hook; do
+  mkdir -p "$STARTUP_CONSUMER/$(dirname "$REL")"
+  printf '#!/usr/bin/env bash\ngit config user.email inherited@example.invalid\n' > "$STARTUP_CONSUMER/$REL"
+  git -C "$STARTUP_CONSUMER" add -- "$REL"
+  set +e
+  OUT="$(bash "$STARTUP_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+  set -e
+  if [ "$RC" = 1 ] && [[ "$OUT" == *"  - $REL:2:"* ]]; then
+    pass "existing extension/shebang admission remains additive: $REL"
+  else fail "existing Husky source globally exempted: path='$REL' rc=$RC out=$OUT"; fi
+  printf '#!/usr/bin/env bash\ngit -C "$FIXTURE" config user.email inherited@example.invalid\n' > "$STARTUP_CONSUMER/$REL"
+done
+
+# Track actual link objects for both new families, then replace a tracked
+# regular parent directory with a link. Neither may read external bytes.
+mkdir -p "$WORKDIR/startup-external/.husky"
+printf 'git config user.email external@example.invalid\n' > "$WORKDIR/startup-external/.zshrc"
+printf 'git config user.email external@example.invalid\n' > "$WORKDIR/startup-external/.husky/pre-push"
+for REL in .zshrc .husky/pre-commit; do
+  rm "$STARTUP_CONSUMER/$REL"
+  ln -s "$WORKDIR/startup-external/.zshrc" "$STARTUP_CONSUMER/$REL"
+  git -C "$STARTUP_CONSUMER" add -- "$REL"
+  if [[ "$(git -C "$STARTUP_CONSUMER" ls-files --stage -- "$REL")" == 120000* ]]; then
+    pass "startup/Husky link is a genuine tracked symlink: $REL"
+  else fail "startup symlink fixture mode not verified: $REL"; fi
+done
+mv "$STARTUP_CONSUMER/packages/demo" "$WORKDIR/startup-original-package"
+ln -s "$WORKDIR/startup-external" "$STARTUP_CONSUMER/packages/demo"
+set +e
+OUT="$(bash "$STARTUP_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+set -e
+if [ "$RC" = 0 ] && [[ "$OUT" == *"regression test suite skipped (consumer checkout"* ]] \
+  && cmp -s "$WORKDIR/startup-config-before" "$STARTUP_CONSUMER/.git/config"; then
+  pass "startup/Husky symlink files and symlinked parents retain regular-source boundary"
+else fail "startup/Husky followed external link bytes: rc=$RC out=$OUT"; fi
+# END STARTUP_ADMISSION_CONTROLS
+
 # Case 11: a backslash continuation between `git` and `config`. Neither
 # physical line matches on its own — the first carries no `config`, the
 # second no `git` — so a line-at-a-time scan waves through exactly the
