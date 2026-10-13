@@ -3780,6 +3780,12 @@ def _heredoc_substitution_has_positional(body, _depth=0, _outer_substitution=Fal
         executable_body = "".join(chars)
     lx = Lexer(executable_body, arithmetic_contexts=True)
     positions = _literal_source_context[4] if _literal_source_context is not None else None
+    if (_literal_source_context is not None and len(_literal_source_context) > 5
+            and (positions is None or positions)):
+        if any(_word_has_verbatim_positional(
+                _heredoc_literal_parameter_word(fragment, positions), _depth=_depth)
+               for fragment in _literal_source_context[5]):
+            return True
     if (_literal_source_context is not None
             and _heredoc_literal_source_output(lx, body, _literal_source_context[:4], _depth,
                                                 _positions=positions, _seen=_literal_seen,
@@ -3836,9 +3842,9 @@ def _heredoc_substitution_has_positional(body, _depth=0, _outer_substitution=Fal
                            _heredoc_literal_receiver_positions(receiver)) if receiver is not None else None
                 if _heredoc_substitution_has_positional(inner, _depth + 1, _literal_source_context=context):
                     return True
-            for inner, receiver in _heredoc_source_process_operands(seg, lx, _outer_substitution):
+            for inner, receiver, fragments in _heredoc_source_process_operands(seg, lx, _outer_substitution):
                 context = (seg, receiver, lx, _source_capture,
-                           _heredoc_literal_receiver_positions(receiver))
+                           _heredoc_literal_receiver_positions(receiver), fragments)
                 if _heredoc_substitution_has_positional(inner, _depth + 1, _literal_source_context=context):
                     return True
     return False
@@ -4110,7 +4116,8 @@ def _heredoc_literal_parameter_word(word, positions):
     def head(match):
         brace, plain = match.groups()
         name = brace or plain
-        if (name in ("@", "*") or int(name) in positions
+        if ((name in ("@", "*") and (positions or possible_tail is not None))
+                or (name not in ("@", "*") and int(name) in positions)
                 or (possible_tail is not None and int(name) >= possible_tail)):
             return match.group(0)
         return "${_mergepath_unused" if brace else "$_mergepath_unused"
@@ -4135,6 +4142,18 @@ def _heredoc_literal_at_argument(word, _depth):
         return "${_mergepath_unused" if brace else "$_mergepath_unused"
 
     projected = re.sub(r"\$(?:\{([1-9][0-9]*|[@*])|([1-9]|[@*]))", other_head, word)
+    if _word_has_verbatim_positional(projected, _depth=_depth):
+        return True
+    # Only an unquoted expanding * can populate subsequent argument slots.
+    # Quoted scalar results, guards, attributes and escapes stay with the
+    # ordinary reader; captured command outputs were removed above.
+    quoted = Lexer(word).quoted_data_offsets
+    def star_head(match):
+        brace, plain = match.groups()
+        if ((brace or plain) == "*" and match.start() not in quoted):
+            return "${@" if brace else "$@"
+        return "${_mergepath_unused" if brace else "$_mergepath_unused"
+    projected = re.sub(r"\$(?:\{([1-9][0-9]*|[@*])|([1-9]|[@*]))", star_head, word)
     return _word_has_verbatim_positional(projected, _depth=_depth)
 
 
@@ -4193,6 +4212,76 @@ def _heredoc_literal_reaches_output(seg, helpers):
             return False
         frame.words = projected
     return reaches_output(Ref("1", seg.line, frames[seg]), helpers)[0]
+
+
+def _heredoc_literal_diagnostic(seg, positions, depth):
+    """Existing helper-body numeric inventories on reached parameters."""
+    probe = Segment(seg.sid, None, False, seg.line)
+    probe.words = []
+    for word in seg.words:
+        projected = _heredoc_literal_parameter_word(word, positions)
+        if _word_has_verbatim_positional(projected, _depth=depth):
+            projected = re.sub(r"\$(?:\{([1-9][0-9]*|[@*])|([1-9]|[@*]))",
+                               lambda m: "${GH_TOKEN" if m.group(1) else "$GH_TOKEN", projected)
+        probe.words.append(projected)
+    cmd, _redir = resolve_command(probe)
+    if probe._cmd_index is None:
+        return False
+    if cmd in NUMERIC_OPERAND_DIAGNOSTIC:
+        return any("GH_TOKEN" in _iter_refs(raw)
+                   for raw, _literal in _command_arguments(probe.words, probe._cmd_index + 1))
+    options = NUMERIC_OPTION_LETTERS.get(cmd, frozenset())
+    if options and _short_option_operand_has_ref(probe, "GH_TOKEN", options):
+        return True
+    return cmd in ("test", "[") and _test_numeric_operand(probe, "GH_TOKEN")
+
+
+def _heredoc_literal_diagnostic_output(seg, helpers):
+    """Finite literal stderr destinations, with existing stdout capture facts."""
+    current = seg
+    for _hop in range(32):
+        if current is None:
+            return True  # stderr is not captured by command substitution
+        destination = None
+        for i, word in enumerate(current.words):
+            match = _REDIR_RE.match(word)
+            if not match or not (re.fullmatch(r"0*2", word[:match.start(1)])
+                                  or (not word[:match.start(1)] and match.group(1) in ("&>", "&>>"))):
+                continue
+            tail = word[match.end():]
+            raw = tail if tail else (current.words[i + 1] if i + 1 < len(current.words) else "")
+            target = _unquote_command_word(raw)
+            if match.group(1) in (">", ">>", ">|") and target == "/dev/stderr":
+                continue
+            destination = (match.group(1), target, i)
+        if destination is not None:
+            operator, target, route_index = destination
+            if operator in (">", ">>", ">|", "&>", "&>>") and target in _NULL_SINKS:
+                return False
+            if operator == ">&" and target == "1":
+                probe = Segment(current.sid, current.parent, False, current.line)
+                probe.parent_is_capture = current.parent_is_capture
+                probe.parent_is_subshell = current.parent_is_subshell
+                probe.pipe_to = current.pipe_to
+                probe.words = ["echo"]
+                skip = False
+                for i, word in enumerate(current.words[:route_index]):
+                    if skip:
+                        skip = False
+                        continue
+                    match = _REDIR_RE.match(word)
+                    if not match:
+                        continue
+                    skip = match.end() == len(word) and i + 1 < len(current.words)
+                    if re.fullmatch(r"0*2", word[:match.start(1)]):
+                        continue
+                    probe.words.append(word)
+                    if skip:
+                        probe.words.append(current.words[i + 1])
+                return _heredoc_literal_reaches_output(probe, helpers)
+            return True  # no saved-fd or unknown destination model
+        current = current.parent
+    return True
 
 
 def _heredoc_literal_source_output(lx, body, context, _depth, _seen=frozenset(), _positions=None,
@@ -4287,8 +4376,16 @@ def _heredoc_literal_source_output(lx, body, context, _depth, _seen=frozenset(),
             if parent in null_commands:
                 continue
             cmd, _redir = resolve_command(seg)
+            # Expansion diagnostics precede this command's own redirects.
+            for word in seg.words:
+                projected = _heredoc_literal_parameter_word(word, _positions)
+                if (any(_word_has_verbatim_positional(projected[a:b], _depth=_depth)
+                        for a, b in _error_word_spans(projected))
+                        and _heredoc_literal_diagnostic_output(seg.parent, helpers)):
+                    return True
+            builtin_bypass = (seg._cmd_index == 1 and seg.words[:1] in (["builtin"], ["command"]))
             if (cmd in definitions and seg._cmd_index is not None
-                    and seg._function_binding is None):
+                    and seg._function_binding is None and not builtin_bypass):
                 arguments = list(_command_arguments(seg.words, seg._cmd_index + 1))
                 positions = {i for i, (raw, _literal) in enumerate(arguments, 1)
                              if _word_has_verbatim_positional(
@@ -4302,6 +4399,9 @@ def _heredoc_literal_source_output(lx, body, context, _depth, _seen=frozenset(),
                                      for program in definitions[cmd]):
                     return True
                 continue
+            if (_heredoc_literal_diagnostic(seg, _positions, _depth)
+                    and _heredoc_literal_diagnostic_output(seg, helpers)):
+                return True
             for word in seg.words:
                 word = _heredoc_literal_parameter_word(word, _positions)
                 # Expansion arithmetic diagnoses before this command's own
@@ -4316,114 +4416,314 @@ def _heredoc_literal_source_output(lx, body, context, _depth, _seen=frozenset(),
         lx, lambda seg, program: literal_call(seg, program, alias=True), set(definitions) | helpers)
 
 
-def _heredoc_literal_emitter_program(body):
+def _heredoc_literal_emitter_program(body, _fragments=None):
     """Finite literal printf/echo/stdin-emitter data, without execution."""
-    def tee_arguments(args):
-        options = True
-        for raw, literal in args:
-            if not _printf_literal(raw, literal):
-                return False
-            if options and literal == "--":
-                options = False
-            elif options and literal.startswith("-") and literal != "-":
-                if (not re.fullmatch(r"-[aip]+", literal)
-                        and literal not in ("--append", "--ignore-interrupts", "-p",
-                                            "--output-error", "--output-error=warn",
-                                            "--output-error=warn-nopipe",
-                                            "--output-error=exit",
-                                            "--output-error=exit-nopipe")):
-                    return False
-            # Retain a possible stdout copy under the owner's bounded
-            # conservatism; no filesystem success or descriptor state is read.
-        return True
-
     lx = Lexer(body, arithmetic_contexts=True)
     if lx.heredocs or lx.literal_source_process_positions:
         return None
     parts = [seg for line in lx.logical for seg in line.segments if seg.words]
-    if len(parts) == 2:
-        head, relay = parts
-        if (head.pipe_to is not relay or relay.pipe_to is not None
-                or head.parent is not None or relay.parent is not None
-                or lx.herestring_source_positions
-                or any(_REDIR_RE.match(word) for part in parts for word in part.words)):
+    if any(part._function_binding is not None for part in parts):
+        return None  # stored producer definitions are not an invocation
+    legacy_nested = any(part.parent is not None for part in parts)
+    if legacy_nested:
+        # The published singleton decoder covered one known nested producer.
+        # Retain that finite exception; unknown/multi-part nested producers
+        # acquire no new inventory or deferred child hop.
+        if len(parts) != 1:
             return None
-        head_cmd, _redir = resolve_command(head)
-        relay_cmd, _redir = resolve_command(relay)
-        if (head_cmd not in ("printf", "echo") or relay_cmd != "tee"
-                or relay._cmd_index != 0):
+        words, inputs = _heredoc_literal_input_view(parts[0], lx)
+        probe = Segment(-1, None, False, parts[0].line)
+        probe.words = words[1:] if words[:1] == ["builtin"] else words
+        cmd, _redir = resolve_command(probe)
+        if cmd not in EMITTERS | STDIN_ECHOERS or probe._cmd_index is None:
             return None
-        relay_args = list(_command_arguments(relay.words, relay._cmd_index + 1))
-        if not tee_arguments(relay_args):
+        args = list(_command_arguments(probe.words, probe._cmd_index + 1))
+        if any(_OUT_REDIR_RE.match(word) for word in parts[0].words):
             return None
-        # Decode only this literal head through the same finite inventory.
-        # Actual quoted words retain their data; the relay adds no child hop.
-        return _heredoc_literal_emitter_program(" ".join(head.words))
-    if len(parts) != 1:
-        return None
-    seg = parts[0]
-    if any(_OUT_REDIR_RE.match(word) for word in seg.words) or seg.pipe_to is not None:
-        return None
-    words, inputs = _heredoc_literal_input_view(seg, lx)
-    probe = Segment(-1, None, False, seg.line)
-    probe.words = words
-    # A literal builtin prefix does not introduce a lookup/binding model.
-    if probe.words[:1] == ["builtin"]:
-        probe.words = probe.words[1:]
-    cmd, _redir = resolve_command(probe)
-    if cmd not in EMITTERS | STDIN_ECHOERS or probe._cmd_index is None:
-        return None
-    args = list(_command_arguments(probe.words, probe._cmd_index + 1))
-    if cmd in STDIN_ECHOERS:
-        if (len(lx.herestring_source_positions) != 1 or len(inputs or []) != 1
-                or (cmd != "tee" and args)):
-            return None
-        if cmd == "tee":
-            if not tee_arguments(args):
+        if cmd in STDIN_ECHOERS:
+            if cmd != "tee" and args:
                 return None
-        return inputs[0]
-    if lx.herestring_source_positions or any(_REDIR_RE.match(word) for word in probe.words):
-        return None
-    if not all(_printf_literal(raw, literal) for raw, literal in args):
-        return None
-    values = [literal for _raw, literal in args]
-    if cmd == "echo":
-        newline = True
-        while values and re.fullmatch(r"-[neE]+", values[0]):
-            if any(c in "eE" for c in values[0][1:]) and "/" in probe._cmd_literal:
+            options = True
+            for raw, literal in args:
+                if not _printf_literal(raw, literal):
+                    return None
+                if options and literal == "--":
+                    options = False
+                elif options and literal.startswith("-") and literal != "-":
+                    if (not re.fullmatch(r"-[aip]+", literal)
+                            and literal not in ("--append", "--ignore-interrupts", "--output-error",
+                                                "--output-error=warn", "--output-error=warn-nopipe",
+                                                "--output-error=exit", "--output-error=exit-nopipe")):
+                        return None
+        elif lx.herestring_source_positions or any(_REDIR_RE.match(word) for word in probe.words):
+            return None
+    def component(parts, _fragments):
+        pipeline = len(parts) > 1
+        if not parts:
+            return None
+        if pipeline:
+            if any(part.pipe_to is not following for part, following in zip(parts, parts[1:])):
                 return None
-            newline = newline and "n" not in values.pop(0)[1:]
-        if any("\\" in value for value in values):
-            return None  # xpg_echo/escape modes are runtime state, not inferred.
-        return " ".join(values) + ("\n" if newline else "")
-    if not values or values[0].startswith("-v"):
-        return None
-    if values[:1] == ["--"]:
-        values = values[1:]
-    if not values:
-        return None
-    fmt, values = values[0], values[1:]
-    # Only unmodified string conversions and literal format text. Recognized
-    # newline/backslash spelling is fixed data; other escapes/formats stay opaque.
-    if re.search(r"\\(?!n|\\)", fmt):
-        return None
-    fmt = fmt.replace("\\\\", "\x00").replace("\\n", "\n").replace("\x00", "\\")
-    pieces = re.split(r"(%[sb])", fmt)
-    if any("%" in text for text in pieces[::2]):
-        return None
-    if "%b" in pieces and any("\\" in value for value in values):
-        return None
-    conversions = len(pieces) // 2
-    if not conversions:
-        return fmt
-    output = []
-    while True:
-        output.append(pieces[0])
-        for i in range(conversions):
-            output.append(values.pop(0) if values else "")
-            output.append(pieces[2 * i + 2])
+            if parts[-1].pipe_to is not None:
+                return None
+        final = parts[-1]
+        final_cmd, _redir = resolve_command(final)
+        final_args = list(_command_arguments(final.words, final._cmd_index + 1)) if final._cmd_index is not None else []
+        if final_cmd in ("true", ":"):
+            return None
+        diagnostic_copy = False
+        for i, word in enumerate(final.words):
+            match = _REDIR_RE.match(word)
+            if not match or not (re.fullmatch(r"0*2", word[:match.start(1)])
+                                  or (not word[:match.start(1)] and match.group(1) in ("&>", "&>>"))):
+                continue
+            tail = word[match.end():]
+            raw = tail if tail else (final.words[i + 1] if i + 1 < len(final.words) else "")
+            target = _unquote_command_word(raw)
+            operator = match.group(1)
+            if ((operator == ">&" and target == "2")
+                    or (operator in (">", ">>", ">|") and target in
+                        ("/dev/stderr", "/dev/fd/2", "/proc/self/fd/2"))):
+                continue
+            if ((operator == ">&" and target == "1")
+                    or (operator in (">", ">>", ">|") and target in
+                        ("/dev/stdout", "/dev/fd/1", "/proc/self/fd/1"))):
+                probe = Segment(final.sid, None, False, final.line)
+                probe.words = final.words[:i] + ["2>&1"]
+                diagnostic_copy = _heredoc_literal_diagnostic_output(probe, set())
+            else:
+                diagnostic_copy = not (operator in (">", ">>", ">|", "&>", "&>>")
+                                       and _printf_literal(raw, target)) and target != "-"
+        diagnostic_labels = False
+        # Counts suppress stdin program text only when literal filename/label
+        # roles cannot themselves carry it. Pattern/option operands are not
+        # filename labels; these are finite written roles, not stage execution.
+        if final_cmd == "wc" and all(_printf_literal(*arg) for arg in final_args):
+            options = True
+            labels = False
+            for raw, literal in final_args:
+                if options and literal == "--":
+                    options = False
+                elif options and (literal == "--files0-from" or literal.startswith("--files0-from=")):
+                    labels = True  # literal stdin may be a filename list
+                elif options and literal.startswith("-") and literal != "-":
+                    continue
+                elif literal != "-" and _word_has_verbatim_positional(literal):
+                    labels = True
+            if not labels:
+                return None
+        if final_cmd == "grep":
+            # -- ends options; -e/-f consume pattern data, never a filename
+            # label. Keep their attached forms and long literal counterparts.
+            count = False
+            skip = False
+            pattern = False
+            options = True
+            filename_labels = []
+            input_labels = []
+            label_option = False
+            label_mode = None
+            filename_list = False
+            complete = True
+            pattern_file = False
+            diagnostic_values = []
+            for raw, literal in final_args:
+                if skip:
+                    if label_option and _printf_literal(raw, literal):
+                        input_labels.append(literal)
+                    if pattern_file and _printf_literal(raw, literal):
+                        diagnostic_values.append(literal)
+                    skip = False
+                    label_option = False
+                    pattern_file = False
+                    continue
+                if not _printf_literal(raw, literal):
+                    complete = False
+                    break
+                if options and literal == "--":
+                    options = False
+                    continue
+                if options and literal in ("-e", "-f", "--regexp", "--file"):
+                    skip = True
+                    pattern = True
+                    pattern_file = literal in ("-f", "--file")
+                    continue
+                if options and literal == "--label":
+                    skip = True
+                    label_option = True
+                    continue
+                if options and literal.startswith(("--regexp=", "--file=")):
+                    pattern = True
+                    if literal.startswith("--file="):
+                        diagnostic_values.append(literal.split("=", 1)[1])
+                    continue
+                if options and literal.startswith("--label="):
+                    input_labels.append(literal.split("=", 1)[1])
+                    continue
+                if options and literal == "--count":
+                    count = True
+                    continue
+                if options and literal in ("--files-with-matches", "--files-without-match"):
+                    filename_list = True
+                    continue
+                if options and literal in ("--with-filename", "--no-filename"):
+                    label_mode = literal == "--with-filename"
+                    continue
+                if options and literal.startswith("-") and literal != "-":
+                    for offset, letter in enumerate(literal[1:], 1):
+                        if letter == "c":
+                            count = True
+                        if letter in "Hh":
+                            label_mode = letter == "H"
+                        if letter in "lL":
+                            filename_list = True
+                        if letter in "ef":
+                            pattern = True
+                            skip = offset == len(literal) - 1
+                            pattern_file = letter == "f" and skip
+                            if letter == "f" and not skip:
+                                diagnostic_values.append(literal[offset + 1:])
+                            break
+                    continue
+                if not pattern:
+                    pattern = True
+                elif literal != "-":
+                    filename_labels.append(literal)
+            labels = filename_labels if label_mode is not False or filename_list else []
+            if label_mode is True or labels or filename_list:
+                labels = labels + input_labels
+            diagnostic_labels = diagnostic_copy and any(
+                _word_has_verbatim_positional(value) for value in filename_labels + diagnostic_values)
+            if complete and count and not diagnostic_labels and not any(
+                    _word_has_verbatim_positional(value) for value in labels):
+                return None
+        away = None
+        for i, word in enumerate(final.words):
+            match = _STDOUT_REDIR_RE.match(word)
+            if not match:
+                continue
+            tail = word[match.end():]
+            raw = tail if tail else (final.words[i + 1] if i + 1 < len(final.words) else "")
+            target = _unquote_command_word(raw)
+            if ((match.group(1) == ">&" and target == "1")
+                    or (match.group(1) in (">", ">>", ">|")
+                        and target in ("/dev/stdout", "/dev/fd/1", "/proc/self/fd/1"))):
+                continue  # a literal fd1 self-route preserves only prior proof
+            away = (match.group(1) in (">", ">>", ">|", "&>", "&>>")
+                    and _printf_literal(raw, target)) or (match.group(1) == ">&" and target == "-")
+            if match.group(1) == ">&" and target == "2":
+                prefix = Segment(final.sid, None, False, final.line)
+                prefix.words = final.words[:i]
+                # No stderr-to-stdout or saved-descriptor credit. A known
+                # null fd2, or untouched fd2, proves this copy leaves the pipe.
+                away = (_heredoc_stderr_null(prefix) or not any(
+                    (m is not None and (re.fullmatch(r"0*2", word[:m.start(1)])
+                     or m.group(1) in ("&>", "&>>")))
+                    for word in prefix.words for m in [_REDIR_RE.match(word)]))
+        if away and not diagnostic_labels:
+            return None
+        seg = parts[0]
+        words, inputs = _heredoc_literal_input_view(seg, lx)
+        probe = Segment(-1, None, False, seg.line)
+        probe.words = words
+        if probe.words[:1] == ["builtin"]:
+            probe.words = probe.words[1:]
+        cmd, _redir = resolve_command(probe)
+        if probe._cmd_index is None:
+            return None
+        args = list(_command_arguments(probe.words, probe._cmd_index + 1))
+        head_inputs = sum(owner is seg for owner, *_rest in lx.herestring_source_positions)
+        stdin_program = None
+        if head_inputs:
+            # This actual owning input certificate fixes the program bytes. The
+            # command/argv may possibly deliver them without a stage evaluator.
+            if (head_inputs != 1 or len(inputs or []) != 1
+                    or sum(bool(m and m.group(1) in ("<", "<>", "<<", "<<<"))
+                           for word in words for m in [_REDIR_RE.match(word)]) != 1):
+                return None
+            stdin_program = inputs[0]
+        if _fragments is not None:
+            stages = parts if stdin_program is not None else parts[1:]
+            for stage in stages:
+                stage_words, stage_inputs = _heredoc_literal_input_view(stage, lx)
+                view = Segment(stage.sid, None, False, stage.line)
+                view.words = stage_words
+                resolve_command(view)
+                if view._cmd_index is not None:
+                    _fragments.extend(literal for raw, literal in
+                        _command_arguments(stage_words, view._cmd_index + 1)
+                        if _printf_literal(raw, literal))
+                if stage is not seg:
+                    _fragments.extend(stage_inputs or [])
+        if stdin_program is not None:
+            return stdin_program
+        if head_inputs or cmd not in EMITTERS:
+            return None
+        if not all(_printf_literal(raw, literal) for raw, literal in args):
+            return None
+        values = [literal for _raw, literal in args]
+        if cmd == "echo":
+            newline = True
+            while values and re.fullmatch(r"-[neE]+", values[0]):
+                if any(c in "eE" for c in values[0][1:]) and "/" in probe._cmd_literal:
+                    return None
+                newline = newline and "n" not in values.pop(0)[1:]
+            if any("\\" in value for value in values):
+                return None  # xpg_echo/escape modes are runtime state, not inferred.
+            return " ".join(values) + ("\n" if newline else "")
+        if not values or values[0].startswith("-v"):
+            return None
+        if values[:1] == ["--"]:
+            values = values[1:]
         if not values:
-            return "".join(output)
+            return None
+        fmt, values = values[0], values[1:]
+        # Only unmodified string conversions and literal format text. Recognized
+        # newline/backslash spelling is fixed data; other escapes/formats stay opaque.
+        if re.search(r"\\(?!n|\\)", fmt):
+            return None
+        fmt = fmt.replace("\\\\", "\x00").replace("\\n", "\n").replace("\x00", "\\")
+        pieces = re.split(r"(%[sb])", fmt)
+        if any("%" in text for text in pieces[::2]):
+            return None
+        if "%b" in pieces and any("\\" in value for value in values):
+            return None
+        conversions = len(pieces) // 2
+        if not conversions:
+            return fmt
+        output = []
+        while True:
+            output.append(pieces[0])
+            for i in range(conversions):
+                output.append(values.pop(0) if values else "")
+                output.append(pieces[2 * i + 2])
+            if not values:
+                return "".join(output)
+
+    incoming = {part.pipe_to for part in parts if part.pipe_to is not None}
+    roots = [part for part in parts if part not in incoming]
+    visited = set()
+    programs = []
+    for root in roots:
+        chain = []
+        current = root
+        while current is not None:
+            if current not in parts or current in visited:
+                return None  # no guessed connection across a source frame
+            visited.add(current)
+            chain.append(current)
+            current = current.pipe_to
+        fragments = []
+        program = component(chain, fragments)
+        if program is not None:
+            programs.append(program)
+            if _fragments is not None:
+                _fragments.extend(fragments)
+    if len(visited) != len(parts):
+        return None
+    # These are fixed outputs from existing finite literal decoders, possibly
+    # delivered in source order. No branch execution or stage evaluator is used.
+    return "".join(programs) if programs else None
 
 
 def _heredoc_source_process_operands(seg, lx, _outer_substitution=False):
@@ -4449,8 +4749,9 @@ def _heredoc_source_process_operands(seg, lx, _outer_substitution=False):
         args = args[1:]
     if not args or args[0][0] is not marker:
         return []
-    program = _heredoc_literal_emitter_program(lx.text[begin:close])
-    return [(program, receiver)] if program is not None else []
+    fragments = []
+    program = _heredoc_literal_emitter_program(lx.text[begin:close], fragments)
+    return [(program, receiver, tuple(fragments))] if program is not None else []
 
 
 def _shopt_expand_aliases_delta(seg):
@@ -11253,9 +11554,25 @@ CORPUS.extend([
 
 # Later literal-inventory regressions; genuine fake-sentinel oracle bodies.
 CORPUS.extend([
-    ('helper-hd-tee-relay-pipeline-nontee-consumer', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat /dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-    ('helper-hd-tee-relay-pipeline-unsupported-builtin-relay', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | builtin tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-    ('helper-hd-tee-relay-pipeline-bound-invalid-runtime-option', 'clean', 'option=--bogus\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee "$option" .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-plain-cat-extra-hop-non-stdin-terminal-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | printf))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-plain-cat-extra-hop-builtin-cat-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | builtin cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-plain-cat-pipeline-extra-hop', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-plain-cat-extra-hop-echo', 'flag', 'die(){ printf safe <<EOF\n$(source <(echo \'echo "$1" >&2\' | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-plain-cat-extra-hop-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-plain-cat-extra-hop-cat-file-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | cat /dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-plain-cat-extra-hop-cat-null-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | cat >/dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-plain-cat-extra-hop-safe-program', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'printf safe\' | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-plain-cat-extra-hop-quoted-HD', 'clean', 'die(){ printf safe <<\'EOF\'\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-plain-cat-extra-hop-nonconsumer', 'clean', 'die(){ printf safe <<EOF\n$(printf safe <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-tee-relay-pipeline-nontee-consumer', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat /dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-unsupported-builtin-relay', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | builtin tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-bound-invalid-runtime-option', 'flag', 'option=--bogus\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee "$option" .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
 ])
 
 CORPUS.extend([
@@ -11265,11 +11582,11 @@ CORPUS.extend([
     ('helper-hd-tee-relay-pipeline-printf-percent-s', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\' \'echo "$1" >&2\' | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ('helper-hd-tee-relay-pipeline-nonconsumer', 'clean', 'die(){ printf safe <<EOF\n$(printf safe <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ('helper-hd-tee-relay-pipeline-safeprogram', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'printf safe\' | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-    ('helper-hd-tee-relay-pipeline-invalidoption', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --bogus .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-    ('helper-hd-tee-relay-pipeline-help', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --help))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-invalidoption', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --bogus .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-help', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --help))\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ('helper-hd-tee-relay-pipeline-quotedHD', 'clean', 'die(){ printf safe <<\'EOF\'\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ('helper-hd-tee-relay-pipeline-nullrelay', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy >/dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-    ('helper-hd-tee-relay-pipeline-inputoverride', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy <<< \'printf safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-inputoverride', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy <<< \'printf safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ('helper-hd-tee-relay-pipeline-runtimeprogram', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' "$program" | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
 ])
 
@@ -11333,13 +11650,265 @@ CORPUS.extend([
     ('helper-hd-later-four-tee-file-after-double-dash', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee -- --bogus <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
 ])
 
+# The owner structural source-path decision: genuine before/after/runtime
+# controls retain argument, capture, route and shared-depth boundaries.
+CORPUS.extend([
+    ('helper-hd-owner-structural-unsolicited-star-unquoted-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f $*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-braced-unquoted-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f ${*}\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-quoted-scalar-second', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$*"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-braced-quoted-scalar-second', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "${*}"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-quoted-first-positive', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f "$*"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-middle-third', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$3" >&2; }; f x $*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-prefix-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f x$*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-suffix-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f $*safe\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-high-ninth-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$9" >&2; }; f $*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-mixed-third-safe-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$3" >&2; }; f $* safe\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-fixed-first-safe-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f safe $*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-quoted-prefix-scalar-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "x$*"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-singlequoted-inert', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f \'"\'"\'$*\'"\'"\'\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-escaped-inert', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f \\$\\*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-length-scalar', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "${#*}"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-scalar-one-second-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$1"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-captured-scalar', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$(printf \'"\'"\'%s \'"\'"\' "$*")"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-stdout-captured-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2"; }; f $*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-stderr-null-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f $* 2>/dev/null\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-uninvoked-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; : $*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-IFS-empty-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'IFS=; f(){ echo "$2" >&2; }; f $*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-return', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-exit', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'exit "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-shift', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'shift "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-read-timeout', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'read -t "$1" value </dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-test-left', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'test "$1" -eq 1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-test-right', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'test 1 -eq "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-bracket', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'[ "$1" -eq 1 ]\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-read-count', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'read -n "$1" value </dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-mapfile-count', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'mapfile -n "$1" value </dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-return-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$1" 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-exit-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'exit "$1" 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-read-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'read -t "$1" value </dev/null 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-test-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'test "$1" -eq 1 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-return-stderr-captured', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$1" 2>&1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-read-stderr-captured', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'read -t "$1" value </dev/null 2>&1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-test-stderr-captured', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'test "$1" -eq 1 2>&1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-inner-captured-error', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'value=$(return "$1")\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-inner-captured-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'value=$(return "$1" 2>/dev/null)\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-test-string-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'test "$1" = 1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-read-nonnumeric-option-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'read -d "$1" value </dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-literal-status-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return 0\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-uninvoked-helper', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ return "$1"; }; :\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-helper-safe-arg', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ return "$1"; }; f safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-helper-token', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ return "$1"; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-unreached-after-return', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return 0; return "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-if-false-unreached', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'if false; then return "$1"; fi\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-inert-data', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'data=\'"\'"\'return "$1"\'"\'"\'; :\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-safe-receiver', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$1"\') safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-receiver-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$1"\') 2>/dev/null)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-quoted-HD', 'clean', 'die(){ printf safe <<\'EOF\'\n$(source <(printf \'%s\\n\' \'return "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-nonconsumer', 'clean', 'die(){ printf safe <<EOF\n$(printf safe <(printf \'%s\\n\' \'return "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-second-deferred-child', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'eval \'"\'"\'return "$1"\'"\'"\'\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-second-deferred-child', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'eval \'"\'"\'f(){ echo "$2" >&2; }; f $*\'"\'"\'\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-direct-printf-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-direct-echo-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(echo \'echo "$1" >&2\' | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-repeated-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-tee-repeated-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | cat | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-repeated-tee', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | tee .tee-second-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-mixed-cat-tee-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-repeated-mixed-echo', 'flag', 'die(){ printf safe <<EOF\n$(source <(echo \'echo "$1" >&2\' | cat | tee .tee-private-copy | cat | tee .tee-second-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-dot-mixed', 'flag', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'echo "$1" >&2\' | cat | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-file-bearing-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat /dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-file-bearing-middle-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat /dev/null | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-wrapped-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | builtin cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-wrapped-tee', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | builtin tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-terminal-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat | tee .tee-private-copy | cat >/dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-input-override', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat <<< \'printf safe\' | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-unknown-consumer', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat | printf))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-invalid-tee-option', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat | tee --bogus .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-runtime-tee-option', 'flag', 'option=--bogus\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat | tee "$option" .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-runtime-cat-operand', 'flag', 'operand=/dev/null\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat "$operand"))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-nonconsumer', 'clean', 'die(){ printf safe <<EOF\n$(printf safe <(printf \'%s\\n\' \'echo "$1" >&2\' | cat | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-quoted-HD', 'clean', 'die(){ printf safe <<\'EOF\'\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-safe-program', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'printf safe\' | cat | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-captured-stdout-program', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1"\' | cat | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-printf-assignment-head', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf -v value \'%s\' \'echo "$1" >&2\' | cat | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-cat-HS-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat <<< \'echo "$1" >&2\' | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-tee-file-HS-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee .tee-private-copy <<< \'echo "$1" >&2\' | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-tee-file-HS-tee', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee .tee-private-copy <<< \'echo "$1" >&2\' | tee .tee-second-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-cat-HS-mixed', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat <<< \'echo "$1" >&2\' | cat | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-cat-FD0-tight-HS-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat 0<<<\'echo "$1" >&2\' | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-cat-FD00-HS-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat 00<<< \'echo "$1" >&2\' | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-cat-FD3-HS-cat', 'clean', 'die(){ printf safe <<EOF\n$(source <(cat 3<<< \'echo "$1" >&2\' | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-cat-named-FD-HS-cat', 'clean', 'die(){ printf safe <<EOF\n$(source <(cat {fd}<<< \'echo "$1" >&2\' | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-relay-HS-override', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat <<< \'echo "$1" >&2\' | cat <<< \'printf safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-head-extra-input-override', 'clean', 'die(){ printf safe <<EOF\n$(source <(cat <<< \'echo "$1" >&2\' </dev/null | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-head-output-null', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat <<< \'echo "$1" >&2\' >/dev/null | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-cat-file-head', 'clean', 'die(){ printf safe <<EOF\n$(source <(cat /dev/null | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-nonliteral-HS-head', 'clean', 'die(){ printf safe <<EOF\n$(source <(cat <<< "$program" | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-owner-cat-stdin', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat -))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-owner-cat-u', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat -u))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-owner-tr', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tr x x))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-owner-head', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | head -n 5))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-owner-sed', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | sed \'\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-required-true', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | true))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-required-colon', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | :))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-required-wc-lines', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-required-wc-bundle', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -cl))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-required-grep-count', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c echo))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-required-output-file', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat > .private-captured-program))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$2"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-mixed-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ return "$2"; }; f x$*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-second-timeout', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'read -t "$2" value </dev/null\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-second-test', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'test "$2" -gt 1\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-return-to-captured-before-later-stderr', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$2" 2>&1 1>&2\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-return-to-stderr-before-copy', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$2" 1>&2 2>&1\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-ordered-null-overwrite', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$2" 3>&2 2>/dev/null 2>&3\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-existing-error-word', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'unset no_value; : "${no_value:?$2}"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-existing-error-word-null', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'unset no_value; : "${no_value:?$2}" 2>/dev/null\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-existing-error-word-parent-null', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'{ unset no_value; : "${no_value:?$2}"; } 2>/dev/null\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-read-p-nontty', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'read -p "$2" value </dev/null\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-required-output-stderr', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat >&2))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-required-output-closed', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat >&-))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-positive-output-stdout-self', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat >/dev/stdout))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-positive-output-fd1-self', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat >/dev/fd/1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-owner-structural-star-mixed-third-positive', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$3" >&2; }; f x $*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-star-mixed-second-safe-conservative', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ return "$2"; }; f x $*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-shadowed-return-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return(){ :; }; return "$2"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-shadowed-return-token', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return(){ echo "$1" >&2; }; return "$2"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-shadowed-return-builtin', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return(){ :; }; builtin return "$2"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-shadowed-return-command', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return(){ :; }; command return "$2"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-amp-null', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$2" &>/dev/null\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-amp-append-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'read -t "$2" x </dev/null &>>/dev/null\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-amp-null-overwrite', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$2" &>/dev/null 2>/dev/stderr\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-amp-unknown-overwrite', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$2" &>/dev/null 2>&3\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-null-to-captured-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$2" >/dev/null 2>&1\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-uninvoked-numeric-shadow', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return(){ return "$1"; }; :\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-grep-after-delimiter', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2 # -c\' | grep -- -c))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-grep-pattern-operand', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2 # -c\' | grep -e -c))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-grep-count-pattern-operand', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2 # -c\' | grep -ce -c))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-final-null-self-dup', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat >/dev/null 1>&1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-final-null-self-path', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat >/dev/null >/dev/stdout))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-final-stdout-copy-stderr-back', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat 2>&1 1>&2))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-final-stderr-null-copy', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat 2>/dev/null 1>&2))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-final-null-saved-overwrite', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat 3>&1 >/dev/null 1>&3))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-owner-structural-constant-sed-leak', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' safe | sed \'s/safe/echo "$1" >\\&2/\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-constant-sed-nonmatch-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' safe | sed \'s/other/echo "$1" >\\&2/\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-constant-sed-final-true-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' safe | sed \'s/safe/echo "$1" >\\&2/\' | true))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-constant-sed-final-wc-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' safe | sed \'s/safe/echo "$1" >\\&2/\' | wc -l))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-constant-relay-HS-program', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' safe | cat <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-constant-relay-HS-fd3-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' safe | cat 3<<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-constant-sed-safe-receiver', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' safe | sed \'s/safe/echo "$1" >\\&2/\') safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-owner-structural-fragment-safe-receiver-@', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' safe | sed \'s/safe/echo "$@" >\\&2/\') safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-fragment-safe-receiver-*', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' safe | sed \'s/safe/echo "$*" >\\&2/\') safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-owner-structural-singleton-cat-u', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat -u <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-head', 'flag', 'die(){ printf safe <<EOF\n$(source <(head -n 5 <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-sed', 'flag', 'die(){ printf safe <<EOF\n$(source <(sed \'\' <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-true-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(true <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-colon-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(: <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-wc-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(wc -l <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-grep-count-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(grep -c echo <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-cat-file-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat /dev/null <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-printf-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf safe <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-sed-nonmatch-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(sed \'s/other/echo "$1" >\\&2/\' <<< safe))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-unknown-fd3-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(head -n 5 3<<< \'echo "$1" >&2\' </dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-unknown-override-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(head -n 5 <<< \'echo "$1" >&2\' </dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-head-output-null-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(head -n 5 <<< \'echo "$1" >&2\' >/dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-head-stderr-null-positive', 'flag', 'die(){ printf safe <<EOF\n$(source <(head -n 5 <<< \'echo "$1" >&2\' 2>/dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-printf-stderr-null-positive', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' 2>/dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-tee-invalid-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee --bogus <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-unknown-runtime-program-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(head -n 5 <<< "$program"))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-owner-structural-singleton-constant-transformer-match', 'flag', 'die(){ printf safe <<EOF\n$(source <(sed \'s/safe/echo "$1" >\\&2/\' <<< safe))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-constant-transformer-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(sed \'s/safe/echo "$1" >\\&2/\' <<< safe) safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-constant-transformer-wc', 'clean', 'die(){ printf safe <<EOF\n$(source <(sed \'s/safe/echo "$1" >\\&2/\' <<< safe | wc -l))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-owner-structural-sequence-tee', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\'; tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-sequence-true', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\'; true))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-sequence-wc', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\'; wc -l))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-sequence-echo-true', 'flag', 'die(){ printf safe <<EOF\n$(source <(echo \'echo "$1" >&2\'; true))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-sequence-safe-receiver', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\'; tee .tee-private-copy) safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-sequence-output-away', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' >/dev/null; tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-sequence-connected-final', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | true; wc -l))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-sequence-safe-program', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'printf safe\'; tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-sequence-split-helper-positive', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; };\'; printf \'%s\\n\' \'f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-sequence-split-uninvoked-helper', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; };\'; printf \'%s\\n\' \': "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-scalar-star-safe-receiver', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \' return "$*"\') safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-helper-scalar-star-safe-receiver', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \' f(){ return "$1"; }; f "$*"\') safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-nested-capture-opaque', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' "$(printf \'%s\\n\' \'echo \\"$1\\" >&2\')"))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-nested-group-opaque', 'flag', 'die(){ printf safe <<EOF\n$(source <((printf \'%s\\n\' \'echo "$1" >&2\')))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-stored-definition-inert', 'clean', 'die(){ printf safe <<EOF\n$(source <(f(){ printf \'%s\\n\' \'echo "$1" >&2\'; }; true))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
 CORPUS.extend(_generated_corpus())
 
 # Disagreements with the oracle, DECLARED.  Each entry is a corpus id and the
 # reason the scanner's verdict differs from what bash actually does.  The suite
 # fails when an undeclared disagreement appears AND when a declared entry stops
 # disagreeing, so neither list can quietly rot.
+
+# Literal count filename/label data uses the existing source-fragment inventory.
+CORPUS += [
+    ('helper-hd-owner-structural-count-wc-file', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-wc-delimited-file', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l -- \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-wc-stdin', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-wc-safe-file', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l .count-patterns))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-forced-file', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -H -c echo \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-Hc-file', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -Hc echo \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-two-file', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c echo .count-patterns \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-single-file-conservative', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c echo \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-suppressed-file', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc echo \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-Hh-file', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -Hhc echo \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-stdin', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c echo))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-pattern-positional', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c \'$1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-e-pattern-positional', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c -e \'$1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-attached-e-pattern', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -ce\'$1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-f-pattern', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c -f .count-patterns))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-attached-f-pattern', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -cf.count-patterns))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-long-pattern', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep --count --regexp=\'$1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-long-pattern-file', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep --count --file=.count-patterns))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-label', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -Hc --label=\'x; echo "$1" >&2;#\' echo))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-label-separate', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -Hc --label \'x; echo "$1" >&2;#\' echo))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-label-no-H', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c --label=\'x; echo "$1" >&2;#\' echo))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-label-suppressed', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc --label=\'x; echo "$1" >&2;#\' echo))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-safe-receiver', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l \'x; echo "$1" >&2;#\') safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-dot-file', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-output-away', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l \'x; echo "$1" >&2;#\' >/dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-list-with-match', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hcl echo \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-list-without-match', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hcL missing \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-list-long', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc --files-with-matches echo \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-list-long-L', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc --files-without-match missing \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-unknown-list', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\nOPTS=-l\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc "$OPTS" echo \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-unknown-quiet', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\nOPTS=\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc "$OPTS" echo \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-diagnostic-copy', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc echo \'missing; echo "$1" >&2;#\' 2>&1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-diagnostic-copy-before-null', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc echo \'missing; echo "$1" >&2;#\' 2>&1 >/dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-diagnostic-copy-after-null', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc echo \'missing; echo "$1" >&2;#\' >/dev/null 2>&1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-diagnostic-null-overwrite', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc echo \'missing; echo "$1" >&2;#\' 2>&1 2>/dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-count-pattern-copy', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c \'$1\' 2>&1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-count-e-pattern-copy', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -ce\'$1\' 2>&1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-count-stdin-copy', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c echo 2>&1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-wc-count-stdin-copy', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l 2>&1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+]
+
 KNOWN_MISSES = {
+    'helper-hd-owner-structural-nested-capture-opaque': 'The sampled nested/captured producer emits a literal program at runtime. It remains outside the unchanged finite producer/source certificate and shared child inventory; no extra nested producer or child depth is admitted. Actual main flags it; published d1cb also misses it. This limit is not claimed repaired by #1496.',
+
+    'helper-hd-owner-structural-unsolicited-numeric-second-deferred-child': 'A second deferred source child leaks at runtime but exceeds the unchanged shared depth-one inventory; retained for deeper-source work #2114, not claimed repaired by #1496.',
+    'helper-hd-owner-structural-unsolicited-star-second-deferred-child': 'A second deferred source child leaks at runtime but exceeds the unchanged shared depth-one inventory; retained for deeper-source work #2114, not claimed repaired by #1496.',
+
     'helper-hd-round11-command-depth-two': 'The real arithmetic diagnostic requires a second literal deferred child, beyond the unchanged shared one-hop inventory. Primitive arithmetic at reached source neither spends nor resets child depth (#1496).',
     'helper-hd-round11-assignment-depth-two': 'The real arithmetic diagnostic requires a second literal deferred child, beyond the unchanged shared one-hop inventory. Primitive arithmetic at reached source neither spends nor resets child depth (#1496).',
     'helper-hd-round10-sub-arithmetic-deferred-child-two-boundary': 'The fake arithmetic diagnostic leaks only after a second literal deferred child. That child is beyond the unchanged shared one-hop budget; primitive arithmetic checking at a reached source does not spend or reset child depth (#1496).',
@@ -11504,6 +12073,48 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    'helper-hd-owner-structural-count-grep-unknown-quiet': 'The sampled empty runtime option word leaves a count-only stream, but incomplete literal argv cannot prove that a file-list mode was absent. The fixed literal input/program remains possibly delivered without a stage-semantics or option-binding model (owner6151456891).',
+    'helper-hd-owner-structural-count-grep-single-file-conservative': 'The literal filename contains positional program text. Sampled grep count with one file omits its filename label and is quiet; possible literal labels retain the owner default without a stage-semantics model (#1496 owner6151456891).',
+    'helper-hd-owner-structural-plain-head-output-null': 'The sampled initial stage sends its output to null, but only the final stage receives non-forwarding proof in this source path: no stage-semantics model. The owner explicitly inverts possible delivery without evaluating intermediate stages. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+
+    'helper-hd-owner-structural-singleton-cat-file-quiet': 'This fixed literal stdin/argument program is quiet in the sampled consumer, but no proven final non-forwarding role applies: no stage-semantics model. Owner process/pipeline default inversion: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-singleton-printf-quiet': 'This fixed literal stdin/argument program is quiet in the sampled consumer, but no proven final non-forwarding role applies: no stage-semantics model. Owner process/pipeline default inversion: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-singleton-sed-nonmatch-quiet': 'This fixed literal stdin/argument program is quiet in the sampled consumer, but no proven final non-forwarding role applies: no stage-semantics model. Owner process/pipeline default inversion: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-singleton-tee-invalid-quiet': 'This fixed literal stdin/argument program is quiet in the sampled consumer, but no proven final non-forwarding role applies: no stage-semantics model. Owner process/pipeline default inversion: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+
+    'helper-hd-owner-structural-constant-sed-nonmatch-quiet': 'The fixed literal replacement contains possibly delivered positional program text; the sampled replacement does not match. No stage-semantics model proves matching or transformation. Owner source-only inversion: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+
+    'helper-hd-owner-structural-star-mixed-second-safe-conservative': 'The sampled f x $* has safe data at $2; expanding unquoted $* makes that argument position and every later one possibly populated. Establishing this actual count/binding needs the excluded argument-count model. Whole-family owner authority: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151479135',
+    'helper-hd-owner-structural-numeric-amp-null': 'The sampled ampersand/null routing quiet flag is inherited on actual main and published d1cb. The new private numeric diagnostic check honors its null destination, while the existing conservative ordinary output classifier remains unchanged; no new FD model or inherited repair is claimed.',
+    'helper-hd-owner-structural-numeric-amp-null-overwrite': 'The sampled ampersand/null routing quiet flag is inherited on actual main and published d1cb. The new private numeric diagnostic check honors its null destination, while the existing conservative ordinary output classifier remains unchanged; no new FD model or inherited repair is claimed.',
+    'helper-hd-owner-structural-numeric-amp-unknown-overwrite': 'The sampled ampersand/null routing quiet flag is inherited on actual main and published d1cb. The new private numeric diagnostic check honors its null destination, while the existing conservative ordinary output classifier remains unchanged; no new FD model or inherited repair is claimed.',
+
+    'helper-hd-owner-structural-unsolicited-star-high-ninth-quiet': 'The sampled positional slot is empty or holds safe literal data. Unquoted $* can populate this and subsequent positions; proving this invocation quiet needs an excluded argument-count model. Owner conservatism: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151479135',
+    'helper-hd-owner-structural-unsolicited-star-mixed-third-safe-quiet': 'The sampled positional slot is empty or holds safe literal data. Unquoted $* can populate this and subsequent positions; proving this invocation quiet needs an excluded argument-count model. Owner conservatism: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151479135',
+    'helper-hd-owner-structural-unsolicited-numeric-unreached-after-return': 'The sampled numeric diagnostic is unreachable. Existing inventory does not evaluate return termination or branch execution; proving it quiet needs excluded control-flow facts. Owner conservatism: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151479135',
+    'helper-hd-owner-structural-unsolicited-numeric-if-false-unreached': 'The sampled numeric diagnostic is unreachable. Existing inventory does not evaluate return termination or branch execution; proving it quiet needs excluded control-flow facts. Owner conservatism: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151479135',
+    'helper-hd-owner-structural-plain-file-bearing-cat': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-plain-file-bearing-middle-cat': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-plain-wrapped-cat': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-plain-wrapped-tee': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-plain-input-override': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-plain-unknown-consumer': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-plain-invalid-tee-option': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-plain-runtime-tee-option': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-plain-runtime-cat-operand': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-plain-relay-HS-override': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-numeric-return-to-captured-before-later-stderr': 'This sampled quiet flag is already present on actual main and published d1cb. The ordinary conservative source/descriptor reading remains unchanged; the new structural diagnostic inventory does not claim it repaired or introduce a binding/FD model.',
+    'helper-hd-owner-structural-existing-error-word-parent-null': 'This sampled quiet flag is already present on actual main and published d1cb. The ordinary conservative source/descriptor reading remains unchanged; the new structural diagnostic inventory does not claim it repaired or introduce a binding/FD model.',
+    'helper-hd-tee-relay-pipeline-nontee-consumer': 'The sampled pipeline is quiet but no final-stage non-forwarding proof applies: no stage-semantics model. The owner replaces the earlier closed relay certificate with possible delivery of a literal program in source/. only. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-tee-relay-pipeline-unsupported-builtin-relay': 'The sampled pipeline is quiet but no final-stage non-forwarding proof applies: no stage-semantics model. The owner replaces the earlier closed relay certificate with possible delivery of a literal program in source/. only. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-tee-relay-pipeline-bound-invalid-runtime-option': 'The sampled pipeline is quiet but no final-stage non-forwarding proof applies: no stage-semantics model. The owner replaces the earlier closed relay certificate with possible delivery of a literal program in source/. only. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-tee-relay-pipeline-invalidoption': 'The sampled pipeline is quiet but no final-stage non-forwarding proof applies: no stage-semantics model. The owner replaces the earlier closed relay certificate with possible delivery of a literal program in source/. only. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-tee-relay-pipeline-help': 'The sampled pipeline is quiet but no final-stage non-forwarding proof applies: no stage-semantics model. The owner replaces the earlier closed relay certificate with possible delivery of a literal program in source/. only. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-tee-relay-pipeline-inputoverride': 'The sampled pipeline is quiet but no final-stage non-forwarding proof applies: no stage-semantics model. The owner replaces the earlier closed relay certificate with possible delivery of a literal program in source/. only. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-plain-cat-extra-hop-non-stdin-terminal-quiet': 'The sampled pipeline is quiet, but lacks the proven final non-forwarding role: no stage-semantics model. Owner source-only default inversion: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-plain-cat-extra-hop-builtin-cat-quiet': 'The sampled pipeline is quiet, but lacks the proven final non-forwarding role: no stage-semantics model. Owner source-only default inversion: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-plain-cat-extra-hop-cat-file-quiet': 'The sampled pipeline is quiet, but lacks the proven final non-forwarding role: no stage-semantics model. Owner source-only default inversion: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+
     'helper-hd-later-four-neighbor-cardinality-suffix-at-last-safe': 'An expanding $@ word makes its argument position and all later positions possibly populated. The sampled one-value call plus one literal safe suffix leaves $3 empty; the owner explicitly accepts this bounded conservatism instead of inferring argument counts or bindings. Authority: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6147485488',
     'helper-hd-later-four-neighbor-cardinality-at-out-of-range-quiet': 'An expanding $@ word makes its argument position and all later positions possibly populated. The sampled one-value call leaves $9 empty; the owner explicitly accepts this bounded conservatism instead of inferring argument counts or bindings. Authority: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6147485488',
     'helper-hd-routing-receiver-index-mismatch': 'The sampled source receiver positional-index mismatch is quiet. The published scanner already flags the outer credential argument; its conservative ordinary source reading remains unchanged and does not infer runtime parameter binding (#1496).',
@@ -13291,10 +13902,10 @@ def _heredoc_later_four_tee_inventory_cases():
         ('tee-option-__output_error_warn_nopipe', True, 'die(){ printf safe <<EOF\n$(source <(tee --output-error=warn-nopipe .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
         ('tee-option-__output_error_exit', True, 'die(){ printf safe <<EOF\n$(source <(tee --output-error=exit .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
         ('tee-option-__output_error_exit_nopipe', True, 'die(){ printf safe <<EOF\n$(source <(tee --output-error=exit-nopipe .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-option-__bogus', False, 'die(){ printf safe <<EOF\n$(source <(tee --bogus .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-option-__help', False, 'die(){ printf safe <<EOF\n$(source <(tee --help .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-option-__version', False, 'die(){ printf safe <<EOF\n$(source <(tee --version .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-runtime-option-quiet', False, 'die(){ printf safe <<EOF\n$(source <(tee "$option" .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-option-__bogus', True, 'die(){ printf safe <<EOF\n$(source <(tee --bogus .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-option-__help', True, 'die(){ printf safe <<EOF\n$(source <(tee --help .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-option-__version', True, 'die(){ printf safe <<EOF\n$(source <(tee --version .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-runtime-option-quiet', True, 'die(){ printf safe <<EOF\n$(source <(tee "$option" .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
         ('tee-known-directory-__output_error_exit', True, 'die(){ printf safe <<EOF\n$(source <(tee --output-error=exit . <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
         ('tee-known-directory-__output_error_exit_nopipe', True, 'die(){ printf safe <<EOF\n$(source <(tee --output-error=exit-nopipe . <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ]
@@ -13302,8 +13913,8 @@ def _heredoc_later_four_tee_inventory_cases():
         ('tee-bundle-ap', True, 'die(){ printf safe <<EOF\n$(source <(tee -ap .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
         ('tee-bundle-ip', True, 'die(){ printf safe <<EOF\n$(source <(tee -ip .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
         ('tee-bundle-pai', True, 'die(){ printf safe <<EOF\n$(source <(tee -pai .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-bundle-ax', False, 'die(){ printf safe <<EOF\n$(source <(tee -ax .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-bound-invalid-runtime-option', False, 'option=--bogus\ndie(){ printf safe <<EOF\n$(source <(tee "$option" .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-bundle-ax', True, 'die(){ printf safe <<EOF\n$(source <(tee -ax .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-bound-invalid-runtime-option', True, 'option=--bogus\ndie(){ printf safe <<EOF\n$(source <(tee "$option" .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ]
     controls += [
         ('pipeline-source---output-error=exit', True, 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --output-error=exit .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
@@ -13312,6 +13923,12 @@ def _heredoc_later_four_tee_inventory_cases():
         ('pipeline-source---output-error=exit-nopipe', True, 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --output-error=exit-nopipe .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
         ('pipeline-.---output-error=exit-nopipe', True, 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --output-error=exit-nopipe .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
         ('pipeline-directory---output-error=exit-nopipe', True, 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --output-error=exit-nopipe .))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ]
+    # GNU filename-list counts can label literal input; BSD wc rejects this
+    # option. Static inventory plus qualified Mac/Linux raw runtime evidence.
+    controls += [
+        ('count-wc-files0-equals', True, 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l --files0-from=.count-files0))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('count-wc-files0-separate', True, 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l --files0-from .count-files0))\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ]
     qualified_broader = {
         "tee-known-directory-__output_error_exit": (
@@ -13329,6 +13946,17 @@ def _heredoc_later_four_tee_inventory_cases():
             " Owner decision: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6148928148"
         ),
     }
+    # Singleton fixed stdin now shares the source-only possible-delivery
+    # default. Invalid/arg-only stages can be quiet: no stage-semantics model.
+    # An unset runtime option can instead forward the literal program; its
+    # historical label is not a claim of a quiet runtime oracle.
+    for name in ("tee-option-__bogus", "tee-option-__help", "tee-option-__version",
+                 "tee-bundle-ax", "tee-bound-invalid-runtime-option"):
+        qualified_broader[name] = (
+            "The sampled literal-input stage is quiet: no stage-semantics model. "
+            "Its fixed stdin program is possibly delivered to source/. under "
+            "https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891"
+        )
     qualified_broader.update({
         "pipeline-directory---output-error=exit": qualified_broader["tee-known-directory-__output_error_exit"],
         "pipeline-directory---output-error=exit-nopipe": qualified_broader["tee-known-directory-__output_error_exit_nopipe"],
@@ -13339,12 +13967,6 @@ def _heredoc_later_four_tee_inventory_cases():
             failures.append("literal tee inventory: " + name)
         if name in qualified_broader and (not expected or not qualified_broader[name]):
             failures.append("undeclared GNU tee conservatism: " + name)
-    for producer in (
-        "printf '%s\\n' 'echo \"$1\" >&2'; tee .tee-private-copy",
-        "printf '%s\\n' 'echo \"$1\" >&2' | tee .tee-private-copy | cat",
-    ):
-        if _heredoc_literal_emitter_program(producer) is not None:
-            failures.append("uncertified additional producer/relay edge")
     return failures
 
 
