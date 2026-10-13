@@ -4579,6 +4579,22 @@ rcp_case publish-loop-in-comment \
   's{^(          if ! PASS_START=)}{          # while true; do sleep 15; done -- documented, not executed\n$1}m' \
   pass
 
+# ── native sweep cadence pinned at */30 (A15) ──────────────────────────
+# Each native producer reverted to */15, a slower */60, and the schedule
+# deleted outright must all trip the pin, naming its own cause.
+rcp_dir_case cadence-gate-fast \
+  'perl -0777 -i -pe "s{cron: \"\*/30 \* \* \* \*\"}{cron: \"*/15 * * * *\"}" merge-clearance-gate.yml' \
+  fail '[rcp native sweep cadence]'
+rcp_dir_case cadence-codex-fast \
+  'perl -0777 -i -pe "s{cron: \"\*/30 \* \* \* \*\"}{cron: \"*/15 * * * *\"}" codex-p1-gate.yml' \
+  fail '[rcp native sweep cadence]'
+rcp_dir_case cadence-coderabbit-slow \
+  'perl -0777 -i -pe "s{cron: \"\*/30 \* \* \* \*\"}{cron: \"*/60 * * * *\"}" coderabbit-severity-gate.yml' \
+  fail '[rcp native sweep cadence]'
+rcp_dir_case cadence-gate-schedule-removed \
+  'perl -0777 -i -pe "s{^  schedule:\n    - cron: \"\*/30 \* \* \* \*\"\n}{}m" merge-clearance-gate.yml' \
+  fail '[rcp native sweep cadence]'
+
 # ── gate workflow: no own workflow_run, no wait loop ───────────────────
 # Tests 20-24 (and the mcg22_case harness) sit inside the re-entrancy guard:
 # when the check runs this suite as its own self-test they are skipped, so

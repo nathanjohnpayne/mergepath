@@ -129,7 +129,7 @@ jobs:
           # The resolver's rc 3 means an API read was indeterminate and may be
           # retried; rc 0 (bound) and rc 4 (positively not bound) are verdicts.
           # A single transient 5xx here used to fail the whole relay and leave
-          # the required gate to the 15-minute sweep, so retry on the same
+          # the required gate to the scheduled sweep, so retry on the same
           # bounded schedule the failure publisher below already uses.
           binding=""
           bind_rc=3
@@ -224,7 +224,7 @@ jobs:
           # This POST is the one write that retracts a stale successful
           # required check from the PR head. A single transient API failure
           # would leave that success standing and open a merge window until
-          # the 15-minute sweep, so retry on the same bounded schedule the
+          # the scheduled sweep, so retry on the same bounded schedule the
           # PR re-read above and the lease publisher below already use
           # (CodeRabbit, review 4978993986). The step still exits 1 either
           # way — the retry protects the check retraction, not this run.
@@ -303,7 +303,7 @@ jobs:
           # workflow for an already-archived source run finds no artifact and
           # lands here — where it would publish a failing required check over a
           # generation that was archived and published correctly, blocking the
-          # PR until the 15-minute sweep undoes it (#1000 Codex P2). A durable
+          # PR until the scheduled sweep undoes it (#1000 Codex P2). A durable
           # completion marker for THIS run is proof the archive was persisted,
           # so honour it and publish nothing. The marker is only evidence when
           # `github-actions[bot]` wrote it: an unauthenticated author check
@@ -522,7 +522,7 @@ jobs:
               || [ "$publish_head" != "$head_sha" ]; then
               conclusion=failure
               title="Codex feedback gate — source changed before trusted read-only publication"
-              output="${output}"$'\n'"Feedback or the PR head changed between trusted read-only evaluation and publication, or the surface could not be re-read; refusing the stale clearance. The next event or the 15-minute sweep re-evaluates the current head."
+              output="${output}"$'\n'"Feedback or the PR head changed between trusted read-only evaluation and publication, or the surface could not be re-read; refusing the stale clearance. The next event or the scheduled sweep re-evaluates the current head."
             fi
           fi
 
@@ -606,7 +606,7 @@ jobs:
           # and got the answer wrong in BOTH directions. A `complete` marker
           # with a failed publication PATCH read as "already concluded", so the
           # still-`in_progress` required check was left pending until another
-          # event or the 15-minute sweep superseded it, blocking the PR for no
+          # event or the scheduled sweep superseded it, blocking the PR for no
           # reason (#1000 Codex P2). And an unreadable comment listing left
           # `latest_status` empty, which read as "not concluded" and overwrote
           # an already-PUBLISHED success with failure (#1049). One proxy, two

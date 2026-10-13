@@ -73,7 +73,7 @@ on:
     # unchanged); required-check-republish covers all three on a named PR.
     types: [merge-clearance-recheck, required-check-republish]
   # NO schedule of its own until PR 4 (cross-agent round 11): the Merge
-  # Clearance Gate's */15 cron already reaches this file through the
+  # Clearance Gate's */30 cron already reaches this file through the
   # workflow_run chain — a schedule-parent delivery whose head matches no
   # open PR degrades to a full-coverage pass below — so an own cron would
   # run a SECOND full pass every interval. PR 4 re-adds it in the same

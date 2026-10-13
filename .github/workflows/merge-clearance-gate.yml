@@ -95,9 +95,14 @@ on:
     types: [merge-clearance-recheck]
   # Periodic sweep — the only backstop for transitions that fire no
   # Actions event (👍 reaction, UI label resolve, GITHUB_TOKEN relabel).
-  # 15-min cadence mirrors codex-p1-gate.yml.
+  # */30 since #2167 (was */15, mirroring codex-p1-gate.yml): each tick runs
+  # this sweep job AND chains one publisher full pass, about 390 installation-
+  # token requests at 8 open PRs, and the three */15 sweeps together spent
+  # about twice the 1,000/hr budget. Lint completion is event-driven through
+  # the publisher's repo-lint parent, so only no-event transitions wait for
+  # this tick: up to 30 minutes. Pinned by check_required_check_publisher.
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/30 * * * *"
 
 # Least-privilege default for the whole workflow: read-only. `checks: write`
 # is granted, job-scoped, to every job that EVALUATES the gate — the
@@ -144,7 +149,7 @@ jobs:
     # blocker, on a PR that emits several review events in quick succession.
     # The clobber race stays open and is recorded as residual risk instead:
     # the native producer still carries the correct verdict for the later run,
-    # and the */15 sweep re-evaluates. Serialization is only safe once the
+    # and the scheduled sweep re-evaluates. Serialization is only safe once the
     # required context has a single producer that is not a cancelable job.
     #
     # #841: this job now ALSO publishes its verdict as a Checks-API check_run
@@ -218,7 +223,7 @@ jobs:
             # PRs, and Dependabot PRs — which are same-repo, so IS_FORK is
             # false for them. Degrade to the pre-#841 shape in both: this job's
             # NATIVE check still carries the verdict under the required name on
-            # the PR head, and the */15 sweep still refreshes the Checks-API
+            # the PR head, and the scheduled sweep still refreshes the Checks-API
             # entry. Not fixed, but not regressed either.
             #
             # `[ = ]` rather than a case pattern: "dependabot[bot]" in a case
@@ -372,7 +377,7 @@ jobs:
               -f "output[summary]=$summary" >/dev/null && exit 0
             sleep $((attempt * 5))
           done
-          echo "::warning::Could not close check_run $CHECK_ID; the required context stays PENDING until the */15 sweep supersedes it (#841)."
+          echo "::warning::Could not close check_run $CHECK_ID; the required context stays PENDING until the scheduled sweep supersedes it (#841)."
           exit 0
 
       - name: Report gate verdict
@@ -569,7 +574,7 @@ jobs:
     # v2 head/base-pinned marker. The marker itself is a GITHUB_TOKEN
     # issue comment, which creates no workflow run — so the lane nudges the
     # gate with a PAT-driven dispatch instead (best-effort; if it never
-    # arrives, the */15 sweep still recovers the gate). This job does NOT
+    # arrives, the scheduled sweep still recovers the gate). This job does NOT
     # trust the diagnostic marker or dispatch for clearance: it only re-runs
     # scripts/merge-clearance-gate.sh, which re-derives clearance from the
     # trusted live byte verification via lane_verified() on the

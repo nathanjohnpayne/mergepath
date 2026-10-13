@@ -974,19 +974,19 @@ jobs:
             # for this freshly verified head. Nudge it directly with a
             # repository_dispatch (its `merge-clearance-recheck` trigger) so a
             # verified sync PR clears the Merge clearance gate promptly instead
-            # of waiting up to 15 min for the scheduled sweep. PAT-driven: the
+            # of waiting for the scheduled sweep (up to 30 min since #2167). PAT-driven: the
             # workflow token is contents:read (cannot POST /dispatches), and
             # keeping the dispatch on the PAT avoids widening the GITHUB_TOKEN
             # scope. Best-effort — the gate independently byte-verifies its live
             # head/base pair and never trusts the marker or dispatch payload,
-            # so on any failure the */15 sweep still recovers the gate; a failed
+            # so on any failure the scheduled sweep still recovers the gate; a failed
             # dispatch must never fail the lane. Keep the event type in sync with
             # merge-clearance-gate.yml's repository_dispatch trigger.
             GH_TOKEN="$LABEL_REMOVAL_TOKEN" gh api -X POST \
               "repos/${{ github.repository }}/dispatches" \
               -f event_type=merge-clearance-recheck \
               -F "client_payload[pr]=$PR_NUMBER" \
-              || echo "note: merge-clearance-recheck dispatch failed (#658); the */15 scheduled sweep will recover the Merge clearance gate."
+              || echo "note: merge-clearance-recheck dispatch failed (#658); the scheduled sweep will recover the Merge clearance gate."
           fi
 
           # If a prior run (or a stale label-prefixed edit) applied

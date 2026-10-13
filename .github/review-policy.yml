@@ -1095,6 +1095,7 @@ auto_clear_labels:
   # listened workflow, and a consumer annex with a custom display name
   # cannot be enumerated in workflow_run.workflows. Relaxing to 15 adds
   # 10-15 min to Phase 4 clearance when no agent session is nudging. The
-  # three gate sweeps (*/15) and their trade-offs are tabled in
+  # three gate sweeps (*/30 since mergepath#2167, from */15) and their
+  # measured request cost are tabled in
   # REVIEW_POLICY.md § Event-driven lint fan-in and sweep cadence.
   scheduled_sweep_interval_minutes: 5

@@ -267,11 +267,13 @@ NATIVE_PRODUCERS = {
 #     required-check-republish: PAT-gated, always the default-branch
 #     definition.
 #   * schedule is absent until PR 4 (cross-agent round 11): the parent's
-#     */15 cron already reaches this file through the workflow_run chain,
+#     */30 cron already reaches this file through the workflow_run chain,
 #     so an own cron would run a SECOND full-fleet pass every interval.
 #     PR 4 re-adds it in the same diff that deletes the gate workflows'
 #     schedules, so every stage keeps exactly one cron path.
 EXPECTED_TRIGGERS = {"workflow_run", "repository_dispatch"}
+# A15 — the cadence every native producer's sweep must carry (#2167).
+EXPECTED_NATIVE_SWEEP_CRON = "*/30 * * * *"
 EXPECTED_WORKFLOW_RUN_TYPES = ["requested", "in_progress", "completed"]
 EXPECTED_DISPATCH_TYPES = ["merge-clearance-recheck", "required-check-republish"]
 
@@ -599,7 +601,7 @@ else:
             "      exactly %s is required. workflow_dispatch must stay ABSENT" % sorted(EXPECTED_TRIGGERS),
             "      (a manual dispatch runs the SELECTED ref's copy of this file, so a",
             "      PR branch could be run with checks: write — P1a through the manual",
-            "      path); schedule must stay ABSENT until #845 PR 4 (the parent's */15",
+            "      path); schedule must stay ABSENT until #845 PR 4 (the parent's */30",
             "      cron already reaches this file through the workflow_run chain, so an",
             "      own cron would run a second full-fleet pass every interval).")
     wr = triggers.get("workflow_run")
@@ -1119,6 +1121,23 @@ for basename, (job_key, context, expected_display) in NATIVE_PRODUCERS.items():
         bad("FAIL: [rcp native producer] %s does not parse: %s"
             % (path, " ".join(str(exc).split())))
         continue
+    # A15 (#2167) — the native producers' sweep cadence, pinned exactly. Each
+    # tick walks every open PR against the shared 1,000/hr installation-token
+    # budget (the gate's also chains a publisher full pass); at */15 the three
+    # spent about twice that budget at 8 open PRs. Pinned in BOTH directions:
+    # a faster cron re-exhausts the budget, a slower or absent one widens the
+    # no-event stuck window past the 30 minutes REVIEW_POLICY.md states.
+    gate_on = gate_doc.get("on") if isinstance(gate_doc, dict) else None
+    sched = gate_on.get("schedule") if isinstance(gate_on, dict) else None
+    crons = [e.get("cron") for e in sched if isinstance(e, dict)] if isinstance(sched, list) else None
+    if crons != [EXPECTED_NATIVE_SWEEP_CRON]:
+        bad("FAIL: [rcp native sweep cadence] %s schedule crons are %r, not exactly [%r]."
+            % (path, crons, EXPECTED_NATIVE_SWEEP_CRON),
+            "      #2167 set the three native producers' sweeps to */30: every tick walks",
+            "      every open PR against the 1,000/hr installation-token budget, and at",
+            "      */15 the three spent about twice that at 8 open PRs. Changing the",
+            "      cadence is a REVIEW_POLICY.md decision (stuck window vs budget), so it",
+            "      must arrive here as a diff.")
     if isinstance(gate_doc, dict) and "concurrency" in gate_doc:
         bad("FAIL: [rcp native workflow concurrency] %s must not declare workflow concurrency."
             % path,
