@@ -23,6 +23,17 @@ external_review_threshold: 300
 # File paths that always require external review regardless of line count.
 # Glob patterns are supported. If any file in the PR diff matches a pattern
 # listed here, external review is mandatory.
+#
+# One carve-out, proven not configured (mergepath#2164): a Dependabot PR
+# whose diff is confined to `uses:` action-pin lines in
+# `.github/workflows/*.yml` is not labeled for the `.github/**` match, and
+# a label already present is cleared by the trusted auto-clear path, once
+# `scripts/workflow/dependabot_pin_bump_exemption.sh` proves BOTH that
+# every commit on the PR is Dependabot-authored, GitHub-committed and
+# signature-verified AND that every changed line is a pin ref or its
+# `# vX.Y.Z` comment. Any other hunk under `.github/**` keeps the label.
+# Opt out under `dependabot.pin_bump_exemption` below. See REVIEW_POLICY.md
+# § Dependabot action-pin bump lane.
 external_review_paths:
   - "src/auth/**"
   - "src/payments/**"
@@ -816,6 +827,52 @@ code_scanning:
 # codex.p1_gate / codex.external_review_gate.
 dependabot:
   reviewer_gate:
+    enabled: true
+
+  # Dependabot action-pin bump lane (mergepath#2164). When enabled, a
+  # Dependabot PR is exempt from the `.github/**` entry in
+  # external_review_paths above IFF scripts/workflow/
+  # dependabot_pin_bump_exemption.sh proves, on the live head/base pair:
+  #   1. commit provenance — every commit on the PR, the current head
+  #      included, is authored by dependabot[bot], committed by GitHub and
+  #      signature-verified (scripts/lib/dependabot-commit-provenance.sh,
+  #      the same predicate reviewer_gate and dependabot-auto-merge.yml use);
+  #   2. diff shape — every changed file is `.github/workflows/*.yml`, every
+  #      hunk replaces lines one for one, and every replaced line is a
+  #      `uses: owner/repo[/path]@<ref>` pin (optional `# vX.Y.Z` comment)
+  #      whose text up to the `@` is unchanged. A new step, a `with:` value,
+  #      a `permissions:` block, a rename, any other file, or an end-of-file
+  #      newline change fails the proof and the PR keeps the label.
+  # The proof is never the author login or the file name alone. It carves
+  # out only the BROAD protected-path rule (`.github/**` or
+  # `.github/workflows/**`): a changed file that also matches any narrower
+  # or different pattern above (a specific workflow, `**/*secret*`) keeps the
+  # label, and a Dependabot diff that crosses external_review_threshold
+  # (counted with the same generated-file exclusion as the labeler) still
+  # gets the label. It does not touch
+  # reviewer_gate: the Merge clearance gate still requires a reviewer-
+  # identity APPROVED on the current head, and dependabot-auto-merge.yml
+  # still decides merge by semver.
+  #
+  # Where it runs: pr-review-policy.yml's External Review Check declines to
+  # APPLY the label (trusted helper from the PR base, a diagnostic
+  # `mergepath-dependabot-pin-bump:v1` marker per verified pair);
+  # auto-clear-blocking-labels.yml REMOVES a label already present on its
+  # trusted pull_request_target / workflow_run / scheduled path, under the
+  # policy governing the live BASE (resolve_base_policy.sh, materialized at
+  # the captured base SHA even for a default-branch base), only when the
+  # latest label event is a github-actions[bot] application (a human
+  # force-on is never cleared by the lane), re-proving against the live pair
+  # and re-reading it immediately before the DELETE. Neither path reads the
+  # other's marker as authority.
+  #
+  # Absent block or key => enabled (the fleet default; this file is not
+  # propagated, so the default must not live only here). An explicit false
+  # opts out: every Dependabot workflow edit then takes the ordinary
+  # protected-path review. Read through the shared structured YAML parser,
+  # so flow style and quoted keys count; any other value, or a policy that
+  # cannot be parsed, fails closed (not exempt).
+  pin_bump_exemption:
     enabled: true
 
 # ---------------------------------------------------------------------------

@@ -276,6 +276,8 @@ jobs:
           QUEUE_SOURCE_TOKEN: ${{ secrets.MERGE_QUEUE_SOURCE_TOKEN }}
           PR_NUMBERS: ${{ steps.pr.outputs.numbers }}
           REPO: ${{ github.repository }}
+          # For resolve_base_policy.sh's base-pinned form in the pin-bump lane.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           # Source the gh-retry helper (#324). with_gh_retry wraps gh
@@ -324,10 +326,151 @@ jobs:
               continue
             fi
 
-            set +e
-            scripts/codex-review-check.sh "$PR"
-            rc=$?
-            set -e
+            # --- Dependabot action-pin bump lane (mergepath#2164) --------
+            # A Dependabot PR that only bumps action pins under
+            # .github/workflows/ carries needs-external-review solely because
+            # `.github/**` is a protected path, and codex-review-check.sh can
+            # never clear it (Codex does not review Dependabot PRs). This is
+            # the TRUSTED removal authority for that label: default-branch
+            # code, a trusted trigger, and the proof re-derived here against
+            # the LIVE head/base pair by scripts/workflow/
+            # dependabot_pin_bump_exemption.sh — Dependabot-only, GitHub-
+            # committed, signature-verified commits, and a diff confined to
+            # `uses:` pin lines. The labeler's own non-application and its
+            # diagnostic marker grant nothing here. rc 1 (not a pin-only
+            # Dependabot PR, including every non-Dependabot PR) falls through
+            # to the ordinary merge-gate evaluation; rc 3 (no verdict
+            # reachable) is an infrastructure error like a gate rc 3, so the
+            # job fails loudly and the next event or sweep retries. The
+            # helper reads under the workflow token: three GET reads, no PAT
+            # quota. See REVIEW_POLICY.md § Dependabot action-pin bump lane.
+            # Latest needs-external-review label event as "<event>:<actor>"
+            # ("none" when there is none); nonzero on a failed read.
+            # Paginated: a long-lived PR's timeline exceeds one page. Used
+            # before the proof and again immediately before the DELETE.
+            lane_latest_label_event() {
+              GH_TOKEN="$WORKFLOW_TOKEN" gh api --paginate "repos/$REPO/issues/$PR/timeline" \
+                | jq -rs '[ (add // []) | .[]
+                            | select((.event == "labeled" or .event == "unlabeled")
+                                     and (.label.name // "") == "needs-external-review") ]
+                          | sort_by(.created_at, .id) | last
+                          | if . == null then "none" else "\(.event):\(.actor.login // "<unknown>")" end'
+            }
+            gate_source=codex
+            PIN_JSON=""
+            pin_rc=1
+            LANE_HEAD=""
+            LANE_BASE=""
+            LANE_BASE_REF=""
+            LANE_AUTHOR=""
+            if [ -x scripts/workflow/dependabot_pin_bump_exemption.sh ] \
+               && [ -x scripts/workflow/resolve_base_policy.sh ]; then
+              # ONE captured live head/base/ref/author read feeds everything
+              # below: the policy resolution, the ownership check, the
+              # helper's pinned pair and the pre-delete fence. Resolving the
+              # policy from an unpinned base and then proving a different
+              # live pair would let a retarget between the two reads judge a
+              # release-branch PR by the old base's policy.
+              set +e
+              LANE_TRIPLE=$(GH_TOKEN="$WORKFLOW_TOKEN" gh api "repos/$REPO/pulls/$PR" \
+                --jq '[.head.sha, .base.sha, .base.ref, .user.login] | @tsv')
+              triple_rc=$?
+              set -e
+              LANE_HEAD=$(cut -f1 <<<"$LANE_TRIPLE")
+              LANE_BASE=$(cut -f2 <<<"$LANE_TRIPLE")
+              LANE_BASE_REF=$(cut -f3 <<<"$LANE_TRIPLE")
+              LANE_AUTHOR=$(cut -f4 <<<"$LANE_TRIPLE")
+              if [ "$triple_rc" -ne 0 ] || ! [[ "$LANE_HEAD" =~ ^[0-9a-f]{40}$ ]] \
+                 || ! [[ "$LANE_BASE" =~ ^[0-9a-f]{40}$ ]] || [ -z "$LANE_BASE_REF" ] \
+                 || [ -z "$LANE_AUTHOR" ]; then
+                pin_rc=3
+                PIN_JSON='{"reason":"the live PR head, base, base ref and author could not be read"}'
+              elif [ "$LANE_AUTHOR" != 'dependabot[bot]' ]; then
+                # Not a Dependabot PR: the lane cannot apply (the helper would
+                # return the same not-exempt verdict), so skip the policy
+                # materialization, the timeline read and the proof instead of
+                # spending installation-token reads on every labeled PR in
+                # every sweep. Falls through to the ordinary merge gate.
+                pin_rc=1
+                PIN_JSON=$(jq -nc --arg a "$LANE_AUTHOR" \
+                  '{reason:("PR author is " + $a + ", not dependabot[bot]; the lane does not apply")}')
+              else
+                # The policy that governs a PR is its BASE branch's (#769): a
+                # release branch that opts the lane out must be honored here
+                # exactly as the classifier honors it. MATERIALIZED at the
+                # captured base SHA even for a default-branch base: without
+                # --materialize-default the resolver returns this checkout's
+                # own copy for a default base and ignores --base-sha, so a
+                # default branch that advanced after this checkout (opting the
+                # lane out, adding a narrower protected path, lowering the
+                # threshold) would be judged by the older policy. The result
+                # is always a temp file; an unknown base policy is exit 2 and
+                # fails closed below.
+                LANE_POLICY=""
+                set +e
+                LANE_POLICY=$(GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/resolve_base_policy.sh \
+                  --repo "$REPO" --base-ref "$LANE_BASE_REF" --base-sha "$LANE_BASE" \
+                  --default-branch "$DEFAULT_BRANCH" --default-config .github/review-policy.yml \
+                  --materialize-default)
+                policy_rc=$?
+                set -e
+                if [ "$policy_rc" -ne 0 ] || [ -z "$LANE_POLICY" ] || [ ! -f "$LANE_POLICY" ]; then
+                  pin_rc=3
+                  PIN_JSON='{"reason":"the governing base policy could not be resolved"}'
+                else
+                  # Only a POLICY-APPLIED label is the lane's to clear: the
+                  # latest needs-external-review label event must be a
+                  # github-actions[bot] application. A human force-on, or a
+                  # human re-application after an automated removal, is
+                  # Phase 4 by decision and stays until the merge gate clears
+                  # it or the human removes it. Re-checked at the DELETE.
+                  set +e
+                  LANE_OWNER=$(lane_latest_label_event)
+                  owner_rc=$?
+                  set -e
+                  if [ "$owner_rc" -ne 0 ] || [ -z "$LANE_OWNER" ]; then
+                    pin_rc=3
+                    PIN_JSON='{"reason":"the needs-external-review label timeline could not be read"}'
+                  elif [ "$LANE_OWNER" != 'labeled:github-actions[bot]' ]; then
+                    pin_rc=1
+                    PIN_JSON=$(jq -nc --arg o "$LANE_OWNER" \
+                      '{reason:("the latest needs-external-review label event is " + $o + ", not a policy-workflow application; the lane clears only a policy-applied label")}')
+                  else
+                    set +e
+                    PIN_JSON=$(GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/dependabot_pin_bump_exemption.sh \
+                      --repo "$REPO" --pr "$PR" --head "$LANE_HEAD" --base "$LANE_BASE" --config "$LANE_POLICY")
+                    pin_rc=$?
+                    set -e
+                  fi
+                fi
+                # The resolver hands back a temp file only for a non-default
+                # base; the default path is the checkout's own file.
+                if [ -n "$LANE_POLICY" ] && [ "$LANE_POLICY" != .github/review-policy.yml ]; then
+                  rm -f "$LANE_POLICY"
+                fi
+              fi
+            else
+              echo "Dependabot pin-bump lane: trusted helper or base-policy resolver absent on the default branch (pre-mergepath#2164 checkout); evaluating the merge gate only."
+            fi
+            PIN_REASON=$(jq -r '.reason // "no reason reported"' <<<"$PIN_JSON" 2>/dev/null || echo "no reason reported")
+            case "$pin_rc" in
+              0)
+                rc=0
+                gate_source=dependabot-pin-bump
+                echo "Dependabot pin-bump lane: VERIFIED on the live head/base pair — $PIN_REASON"
+                ;;
+              1)
+                echo "Dependabot pin-bump lane: not applicable — $PIN_REASON"
+                set +e
+                scripts/codex-review-check.sh "$PR"
+                rc=$?
+                set -e
+                ;;
+              *)
+                echo "::error::Dependabot pin-bump lane could not reach a verdict on PR #$PR (rc=$pin_rc): $PIN_REASON"
+                rc=3
+                ;;
+            esac
 
             case "$rc" in
               0)
@@ -373,6 +516,54 @@ jobs:
                   echo "::endgroup::"
                   continue
                 fi
+                # Pin-bump lane: the helper fenced the live pair at the end of
+                # its proof, but the protective retraction above made several
+                # API calls since. A non-pin push onto the Dependabot branch in
+                # that window would otherwise have the label removed for a
+                # head the proof never covered, and the resulting `unlabeled`
+                # event does not re-add it (#969). Re-read the pair under the
+                # workflow token immediately before the DELETE and require it
+                # to equal the PROVEN pair; a move leaves the label for the
+                # next evaluation, an unreadable pair is an infrastructure
+                # error. Bounds the write without claiming atomicity.
+                if [ "$gate_source" = dependabot-pin-bump ]; then
+                  if ! live_pair=$(GH_TOKEN="$WORKFLOW_TOKEN" gh api "repos/$REPO/pulls/$PR" \
+                       --jq '[.head.sha, .base.sha] | @tsv'); then
+                    echo "::error::Could not re-read the live head/base of PR #$PR before removing needs-external-review for the pin-bump lane."
+                    had_infra_error=1
+                    failing_prs="$failing_prs $PR"
+                    echo "::endgroup::"
+                    continue
+                  fi
+                  proven_pair=$(jq -r '[.head, .base] | @tsv' <<<"$PIN_JSON")
+                  captured_pair=$(printf '%s\t%s' "$LANE_HEAD" "$LANE_BASE")
+                  if [ -z "$live_pair" ] || [ "$live_pair" != "$proven_pair" ] \
+                     || [ "$live_pair" != "$captured_pair" ]; then
+                    echo "PR #$PR head/base moved after the pin-bump proof (proven: $proven_pair; live: ${live_pair:-unreadable}); leaving needs-external-review for the next evaluation."
+                    echo "::endgroup::"
+                    continue
+                  fi
+                  # Ownership too: a human who removed and re-applied the
+                  # label while the proof and retraction ran leaves the pair
+                  # unchanged, and that re-application is a force-on this
+                  # lane must not clear.
+                  set +e
+                  live_owner=$(lane_latest_label_event)
+                  live_owner_rc=$?
+                  set -e
+                  if [ "$live_owner_rc" -ne 0 ] || [ -z "$live_owner" ]; then
+                    echo "::error::Could not re-read the needs-external-review label timeline of PR #$PR before removal for the pin-bump lane."
+                    had_infra_error=1
+                    failing_prs="$failing_prs $PR"
+                    echo "::endgroup::"
+                    continue
+                  fi
+                  if [ "$live_owner" != 'labeled:github-actions[bot]' ]; then
+                    echo "PR #$PR needs-external-review was re-applied by $live_owner after the pin-bump proof; leaving it for the next evaluation."
+                    echo "::endgroup::"
+                    continue
+                  fi
+                fi
                 echo "Gate passes — removing needs-external-review label."
                 # Single (non-retried) removal, then verify end state with a
                 # retried READ (#465): retrying the removal can double-fire
@@ -414,7 +605,21 @@ jobs:
                     # Direct string body (NOT a heredoc — heredoc closing
                     # delimiter must be column-0 unless using `<<-` with
                     # tabs; YAML run blocks make that brittle).
-                    comment_body='**Automated label removal.** `scripts/codex-review-check.sh` cleared the merge gate on this HEAD (CI green + reviewer-identity APPROVED + Codex cleared). Removed `needs-external-review` so Label Gate passes and the PR can merge. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#195) for the trigger doctrine.'
+                    if [ "$gate_source" = dependabot-pin-bump ]; then
+                      # The evidence the lane acted on: the verified pair, the
+                      # provenance verdict and the pinned files. Diagnostic
+                      # marker; no reader treats it as authority.
+                      comment_body=$(printf '%s\n%s\n\n%s\n\n%s\n%s\n%s\n\n%s' \
+                        "<!-- mergepath-dependabot-pin-bump:v1 verified-head=$(jq -r '.head' <<<"$PIN_JSON") verified-base=$(jq -r '.base' <<<"$PIN_JSON") -->" \
+                        "**Automated label removal — Dependabot action-pin bump lane** ✅ (head \`$(jq -r '.head' <<<"$PIN_JSON")\`, base \`$(jq -r '.base' <<<"$PIN_JSON")\`)" \
+                        "This Dependabot PR touches \`.github/workflows/\` only through action pins, so it is exempt from the \`.github/**\` protected-path external-review rule (REVIEW_POLICY.md § Dependabot action-pin bump lane). Removed \`needs-external-review\` so Label Gate passes. Proven on the live head/base pair by the trusted \`scripts/workflow/dependabot_pin_bump_exemption.sh\`:" \
+                        "- Commit provenance: $(jq -r '.provenance' <<<"$PIN_JSON")" \
+                        "- Diff shape: $(jq -r '.pins' <<<"$PIN_JSON") action pin line(s) across $(jq -r '.files | length' <<<"$PIN_JSON") workflow file(s); every changed line is a \`uses:\` ref or its pin comment, and nothing else changed" \
+                        "$(jq -r '.files[] | "  - `\(.filename)`: \(.pins) pin line(s)"' <<<"$PIN_JSON")" \
+                        "The PR still needs CI green and the Dependabot reviewer-identity \`APPROVED\` on this head (Merge clearance gate). See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) for the trigger doctrine.")
+                    else
+                      comment_body='**Automated label removal.** `scripts/codex-review-check.sh` cleared the merge gate on this HEAD (CI green + reviewer-identity APPROVED + Codex cleared). Removed `needs-external-review` so Label Gate passes and the PR can merge. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#195) for the trigger doctrine.'
+                    fi
                     # #530 (IMPLEMENTED — was DEFER+DOCUMENT, human-ratified
                     # 2026-06-28): this attribution-comment POST is
                     # NON-idempotent, so it is deliberately NOT wrapped in
@@ -756,6 +961,8 @@ jobs:
           QUEUE_SOURCE_TOKEN: ${{ secrets.MERGE_QUEUE_SOURCE_TOKEN }}
           PRS: ${{ steps.find.outputs.prs }}
           REPO: ${{ github.repository }}
+          # For resolve_base_policy.sh's base-pinned form in the pin-bump lane.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           source scripts/lib/gh-retry-helpers.sh
@@ -790,10 +997,139 @@ jobs:
               continue
             fi
 
-            set +e
-            scripts/codex-review-check.sh "$PR"
-            rc=$?
-            set -e
+            # Dependabot action-pin bump lane (mergepath#2164) — the sweep is
+            # the backstop for this lane: the labeler applies the label with
+            # GITHUB_TOKEN, which fires no `labeled` run here, so a pin-only
+            # Dependabot PR labeled by an older or fail-closed labeler is
+            # cleared by this sweep within one interval. Same proof, same
+            # verdict mapping as the event-driven job above.
+            # Latest needs-external-review label event as "<event>:<actor>"
+            # ("none" when there is none); nonzero on a failed read.
+            # Paginated: a long-lived PR's timeline exceeds one page. Used
+            # before the proof and again immediately before the DELETE.
+            lane_latest_label_event() {
+              GH_TOKEN="$WORKFLOW_TOKEN" gh api --paginate "repos/$REPO/issues/$PR/timeline" \
+                | jq -rs '[ (add // []) | .[]
+                            | select((.event == "labeled" or .event == "unlabeled")
+                                     and (.label.name // "") == "needs-external-review") ]
+                          | sort_by(.created_at, .id) | last
+                          | if . == null then "none" else "\(.event):\(.actor.login // "<unknown>")" end'
+            }
+            gate_source=codex
+            PIN_JSON=""
+            pin_rc=1
+            LANE_HEAD=""
+            LANE_BASE=""
+            LANE_BASE_REF=""
+            LANE_AUTHOR=""
+            if [ -x scripts/workflow/dependabot_pin_bump_exemption.sh ] \
+               && [ -x scripts/workflow/resolve_base_policy.sh ]; then
+              # ONE captured live head/base/ref/author read feeds everything
+              # below: the policy resolution, the ownership check, the
+              # helper's pinned pair and the pre-delete fence. Resolving the
+              # policy from an unpinned base and then proving a different
+              # live pair would let a retarget between the two reads judge a
+              # release-branch PR by the old base's policy.
+              set +e
+              LANE_TRIPLE=$(GH_TOKEN="$WORKFLOW_TOKEN" gh api "repos/$REPO/pulls/$PR" \
+                --jq '[.head.sha, .base.sha, .base.ref, .user.login] | @tsv')
+              triple_rc=$?
+              set -e
+              LANE_HEAD=$(cut -f1 <<<"$LANE_TRIPLE")
+              LANE_BASE=$(cut -f2 <<<"$LANE_TRIPLE")
+              LANE_BASE_REF=$(cut -f3 <<<"$LANE_TRIPLE")
+              LANE_AUTHOR=$(cut -f4 <<<"$LANE_TRIPLE")
+              if [ "$triple_rc" -ne 0 ] || ! [[ "$LANE_HEAD" =~ ^[0-9a-f]{40}$ ]] \
+                 || ! [[ "$LANE_BASE" =~ ^[0-9a-f]{40}$ ]] || [ -z "$LANE_BASE_REF" ] \
+                 || [ -z "$LANE_AUTHOR" ]; then
+                pin_rc=3
+                PIN_JSON='{"reason":"the live PR head, base, base ref and author could not be read"}'
+              elif [ "$LANE_AUTHOR" != 'dependabot[bot]' ]; then
+                # Not a Dependabot PR: the lane cannot apply (the helper would
+                # return the same not-exempt verdict), so skip the policy
+                # materialization, the timeline read and the proof instead of
+                # spending installation-token reads on every labeled PR in
+                # every sweep. Falls through to the ordinary merge gate.
+                pin_rc=1
+                PIN_JSON=$(jq -nc --arg a "$LANE_AUTHOR" \
+                  '{reason:("PR author is " + $a + ", not dependabot[bot]; the lane does not apply")}')
+              else
+                # The policy that governs a PR is its BASE branch's (#769): a
+                # release branch that opts the lane out must be honored here
+                # exactly as the classifier honors it. MATERIALIZED at the
+                # captured base SHA even for a default-branch base: without
+                # --materialize-default the resolver returns this checkout's
+                # own copy for a default base and ignores --base-sha, so a
+                # default branch that advanced after this checkout (opting the
+                # lane out, adding a narrower protected path, lowering the
+                # threshold) would be judged by the older policy. The result
+                # is always a temp file; an unknown base policy is exit 2 and
+                # fails closed below.
+                LANE_POLICY=""
+                set +e
+                LANE_POLICY=$(GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/resolve_base_policy.sh \
+                  --repo "$REPO" --base-ref "$LANE_BASE_REF" --base-sha "$LANE_BASE" \
+                  --default-branch "$DEFAULT_BRANCH" --default-config .github/review-policy.yml \
+                  --materialize-default)
+                policy_rc=$?
+                set -e
+                if [ "$policy_rc" -ne 0 ] || [ -z "$LANE_POLICY" ] || [ ! -f "$LANE_POLICY" ]; then
+                  pin_rc=3
+                  PIN_JSON='{"reason":"the governing base policy could not be resolved"}'
+                else
+                  # Only a POLICY-APPLIED label is the lane's to clear: the
+                  # latest needs-external-review label event must be a
+                  # github-actions[bot] application. A human force-on, or a
+                  # human re-application after an automated removal, is
+                  # Phase 4 by decision and stays until the merge gate clears
+                  # it or the human removes it. Re-checked at the DELETE.
+                  set +e
+                  LANE_OWNER=$(lane_latest_label_event)
+                  owner_rc=$?
+                  set -e
+                  if [ "$owner_rc" -ne 0 ] || [ -z "$LANE_OWNER" ]; then
+                    pin_rc=3
+                    PIN_JSON='{"reason":"the needs-external-review label timeline could not be read"}'
+                  elif [ "$LANE_OWNER" != 'labeled:github-actions[bot]' ]; then
+                    pin_rc=1
+                    PIN_JSON=$(jq -nc --arg o "$LANE_OWNER" \
+                      '{reason:("the latest needs-external-review label event is " + $o + ", not a policy-workflow application; the lane clears only a policy-applied label")}')
+                  else
+                    set +e
+                    PIN_JSON=$(GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/dependabot_pin_bump_exemption.sh \
+                      --repo "$REPO" --pr "$PR" --head "$LANE_HEAD" --base "$LANE_BASE" --config "$LANE_POLICY")
+                    pin_rc=$?
+                    set -e
+                  fi
+                fi
+                # The resolver hands back a temp file only for a non-default
+                # base; the default path is the checkout's own file.
+                if [ -n "$LANE_POLICY" ] && [ "$LANE_POLICY" != .github/review-policy.yml ]; then
+                  rm -f "$LANE_POLICY"
+                fi
+              fi
+            else
+              echo "Dependabot pin-bump lane: trusted helper or base-policy resolver absent on the default branch (pre-mergepath#2164 checkout); evaluating the merge gate only."
+            fi
+            PIN_REASON=$(jq -r '.reason // "no reason reported"' <<<"$PIN_JSON" 2>/dev/null || echo "no reason reported")
+            case "$pin_rc" in
+              0)
+                rc=0
+                gate_source=dependabot-pin-bump
+                echo "Dependabot pin-bump lane: VERIFIED on the live head/base pair — $PIN_REASON"
+                ;;
+              1)
+                echo "Dependabot pin-bump lane: not applicable — $PIN_REASON"
+                set +e
+                scripts/codex-review-check.sh "$PR"
+                rc=$?
+                set -e
+                ;;
+              *)
+                echo "::error::Dependabot pin-bump lane could not reach a verdict on PR #$PR (rc=$pin_rc): $PIN_REASON"
+                rc=3
+                ;;
+            esac
             case "$rc" in
               0)
                 # Match the event-driven clear path: remove any unsafe durable
@@ -836,6 +1172,54 @@ jobs:
                   echo "::endgroup::"
                   continue
                 fi
+                # Pin-bump lane: the helper fenced the live pair at the end of
+                # its proof, but the protective retraction above made several
+                # API calls since. A non-pin push onto the Dependabot branch in
+                # that window would otherwise have the label removed for a
+                # head the proof never covered, and the resulting `unlabeled`
+                # event does not re-add it (#969). Re-read the pair under the
+                # workflow token immediately before the DELETE and require it
+                # to equal the PROVEN pair; a move leaves the label for the
+                # next evaluation, an unreadable pair is an infrastructure
+                # error. Bounds the write without claiming atomicity.
+                if [ "$gate_source" = dependabot-pin-bump ]; then
+                  if ! live_pair=$(GH_TOKEN="$WORKFLOW_TOKEN" gh api "repos/$REPO/pulls/$PR" \
+                       --jq '[.head.sha, .base.sha] | @tsv'); then
+                    echo "::error::Could not re-read the live head/base of PR #$PR before removing needs-external-review for the pin-bump lane."
+                    had_infra_error=1
+                    failing_prs="$failing_prs $PR"
+                    echo "::endgroup::"
+                    continue
+                  fi
+                  proven_pair=$(jq -r '[.head, .base] | @tsv' <<<"$PIN_JSON")
+                  captured_pair=$(printf '%s\t%s' "$LANE_HEAD" "$LANE_BASE")
+                  if [ -z "$live_pair" ] || [ "$live_pair" != "$proven_pair" ] \
+                     || [ "$live_pair" != "$captured_pair" ]; then
+                    echo "PR #$PR head/base moved after the pin-bump proof (proven: $proven_pair; live: ${live_pair:-unreadable}); leaving needs-external-review for the next evaluation."
+                    echo "::endgroup::"
+                    continue
+                  fi
+                  # Ownership too: a human who removed and re-applied the
+                  # label while the proof and retraction ran leaves the pair
+                  # unchanged, and that re-application is a force-on this
+                  # lane must not clear.
+                  set +e
+                  live_owner=$(lane_latest_label_event)
+                  live_owner_rc=$?
+                  set -e
+                  if [ "$live_owner_rc" -ne 0 ] || [ -z "$live_owner" ]; then
+                    echo "::error::Could not re-read the needs-external-review label timeline of PR #$PR before removal for the pin-bump lane."
+                    had_infra_error=1
+                    failing_prs="$failing_prs $PR"
+                    echo "::endgroup::"
+                    continue
+                  fi
+                  if [ "$live_owner" != 'labeled:github-actions[bot]' ]; then
+                    echo "PR #$PR needs-external-review was re-applied by $live_owner after the pin-bump proof; leaving it for the next evaluation."
+                    echo "::endgroup::"
+                    continue
+                  fi
+                fi
                 echo "Gate passes — removing needs-external-review label."
                 # Single (non-retried) REST DELETE + retried verify (#465/#827)
                 # — see the evaluate-and-clear job above for the full rationale
@@ -848,7 +1232,18 @@ jobs:
                   # Comment ONLY if THIS sweep performed the removal (#827).
                   case "$del_status" in
                     200|204)
-                      comment_body='**Automated label removal (scheduled sweep).** `scripts/codex-review-check.sh` cleared the merge gate on this HEAD between event triggers (for example, an anchored Codex verdict or review arriving between event-driven evaluations). Removed `needs-external-review`. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#197) for the sweep doctrine.'
+                      if [ "$gate_source" = dependabot-pin-bump ]; then
+                        comment_body=$(printf '%s\n%s\n\n%s\n\n%s\n%s\n%s\n\n%s' \
+                          "<!-- mergepath-dependabot-pin-bump:v1 verified-head=$(jq -r '.head' <<<"$PIN_JSON") verified-base=$(jq -r '.base' <<<"$PIN_JSON") -->" \
+                          "**Automated label removal (scheduled sweep) — Dependabot action-pin bump lane** ✅ (head \`$(jq -r '.head' <<<"$PIN_JSON")\`, base \`$(jq -r '.base' <<<"$PIN_JSON")\`)" \
+                          "This Dependabot PR touches \`.github/workflows/\` only through action pins, so it is exempt from the \`.github/**\` protected-path external-review rule (REVIEW_POLICY.md § Dependabot action-pin bump lane). Removed \`needs-external-review\` so Label Gate passes. Proven on the live head/base pair by the trusted \`scripts/workflow/dependabot_pin_bump_exemption.sh\`:" \
+                          "- Commit provenance: $(jq -r '.provenance' <<<"$PIN_JSON")" \
+                          "- Diff shape: $(jq -r '.pins' <<<"$PIN_JSON") action pin line(s) across $(jq -r '.files | length' <<<"$PIN_JSON") workflow file(s); every changed line is a \`uses:\` ref or its pin comment, and nothing else changed" \
+                          "$(jq -r '.files[] | "  - `\(.filename)`: \(.pins) pin line(s)"' <<<"$PIN_JSON")" \
+                          "The PR still needs CI green and the Dependabot reviewer-identity \`APPROVED\` on this head (Merge clearance gate). See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) for the sweep doctrine.")
+                      else
+                        comment_body='**Automated label removal (scheduled sweep).** `scripts/codex-review-check.sh` cleared the merge gate on this HEAD between event triggers (for example, an anchored Codex verdict or review arriving between event-driven evaluations). Removed `needs-external-review`. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#197) for the sweep doctrine.'
+                      fi
                       # #530: non-idempotent comment POST — deliberately
                       # unretried (a single attempt cannot duplicate); see the
                       # event-driven job above for the full rationale. Failure

@@ -194,6 +194,10 @@ if ! [[ "$THRESHOLD" =~ ^[0-9]+$ ]]; then
   THRESHOLD=300
 fi
 
+# The canonical generated-file exclusion for the threshold count.
+# dependabot_pin_bump_exemption.sh (same kit) reads this exact
+# `EXCLUDE_RE='...'` line so its threshold count cannot drift from this one;
+# keep the single-quoted one-line shape when editing it.
 EXCLUDE_RE='(\.lock$)|(lock\.json$)|(\.min\.js$)|(\.min\.css$)|(\.generated\.)|(\.g\.dart$)|(\.freezed\.dart$)'
 FILES_COUNT=$(printf '%s' "$FILES_JSON" | jq 'length')
 FILES_COUNT=${FILES_COUNT:-0}
