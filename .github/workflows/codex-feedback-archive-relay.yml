@@ -234,7 +234,7 @@ jobs:
               -f name="$CHECK_NAME" -f head_sha="$head_sha" \
               -f status=completed -f conclusion=failure \
               -f "output[title]=Codex feedback gate — trusted read-only relay setup failed" \
-              -f "output[summary]=The trusted relay for source run $SOURCE_RUN_ID failed after positively binding PR #$pr. Rerun the relay; the scheduled sweep also re-evaluates every 15 minutes." \
+              -f "output[summary]=The trusted relay for source run $SOURCE_RUN_ID failed after positively binding PR #$pr. Rerun the relay; the scheduled sweep also re-evaluates every 30 minutes." \
               >/dev/null; then
               published=true
               break
@@ -653,7 +653,7 @@ jobs:
             # check_id` is then empty, so the branch above closes nothing and
             # this job's own native check attaches to the default branch, not
             # to the PR head. An older successful `Codex P1 unresolved threads`
-            # run stays authoritative on the unchanged head until the 15-minute
+            # run stays authoritative on the unchanged head until the scheduled
             # sweep, and the durable `status=failed` marker posted above is
             # written with GITHUB_TOKEN, so it triggers no workflow run to
             # correct it. Re-read the positively bound PR and publish the
@@ -673,7 +673,7 @@ jobs:
                   -f name="$CHECK_NAME" -f head_sha="$current_head" \
                   -f status=completed -f conclusion=failure \
                   -f "output[title]=Codex feedback gate — trusted read-only relay failed before it opened its lease" \
-                  -f "output[summary]=The trusted relay for source run $SOURCE_RUN_ID failed before it published a PR-head check lease. Rerun the relay before merge; the scheduled sweep also re-evaluates every 15 minutes." \
+                  -f "output[summary]=The trusted relay for source run $SOURCE_RUN_ID failed before it published a PR-head check lease. Rerun the relay before merge; the scheduled sweep also re-evaluates every 30 minutes." \
                   >/dev/null; then
                   close_rc=0
                   break

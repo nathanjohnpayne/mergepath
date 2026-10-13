@@ -461,7 +461,7 @@ jobs:
             fi
             case "$recovered_head" in
               [0-9a-f]*)
-                summary="The reviewer-feedback archive job failed before it could bind this run to a PR head, so the feedback history for $recovered_head was never evaluated. Rerun the Codex P1 Gate workflow; the scheduled sweep also re-evaluates every 15 minutes."
+                summary="The reviewer-feedback archive job failed before it could bind this run to a PR head, so the feedback history for $recovered_head was never evaluated. Rerun the Codex P1 Gate workflow; the scheduled sweep also re-evaluates every 30 minutes."
                 gh api --method POST "repos/$REPO/check-runs" \
                   -f name="$CHECK_NAME" -f head_sha="$recovered_head" \
                   -f status=completed -f conclusion=failure \
