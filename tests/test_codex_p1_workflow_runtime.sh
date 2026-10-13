@@ -100,18 +100,19 @@ run_event() {
     export FIXTURE_LOG="$dir" PR_NUMBER=41 REPO=owner/repo
     export EXPECTED_HEAD_SHA=head-41 HEAD_SHA=head-41 CHECK_ID=lease-41
     export GITHUB_OUTPUT="$dir/github-output" RUNNER_TEMP="$dir/runner"
+    # Actions uses bash -e for these unspecified Linux shell steps.
     # Reflect the native job: any failed preparation stays failed even if the
     # always-run closing step succeeds. Recoverable drift must never do that.
     : > "$GITHUB_OUTPUT"
     prep_rc=0
-    env "$@" bash "$EVENT_STEP" || prep_rc=$?
+    env "$@" bash -e "$EVENT_STEP" || prep_rc=$?
     GATE_READY="$(sed -n 's/^ready=//p' "$GITHUB_OUTPUT")"
     FINGERPRINT_AVAILABLE="$(sed -n 's/^fingerprint_available=//p' "$GITHUB_OUTPUT")"
     ARCHIVE_RESULT="${EVENT_ARCHIVE_RESULT:-success}"
     LEGACY_BOOTSTRAP="$(sed -n 's/^legacy_bootstrap=//p' "$GITHUB_OUTPUT")"
     export GATE_READY FINGERPRINT_AVAILABLE ARCHIVE_RESULT LEGACY_BOOTSTRAP
     close_rc=0
-    env "$@" bash "$CLOSE_STEP" || close_rc=$?
+    env "$@" bash -e "$CLOSE_STEP" || close_rc=$?
     printf 'preparation=%s closing=%s\n' "$prep_rc" "$close_rc" > "$dir/native-status"
     [ "$prep_rc" -eq 0 ] || exit "$prep_rc"
     exit "$close_rc"
@@ -395,7 +396,7 @@ run_sweep() {
       RUNNER_TEMP="$dir/runner" SWEEP_MODE="$sweep_mode" FP_MODE="$fp_mode" \
       RELAY_MODE="${4:-empty}" \
       GATE_MODE="${GATE_MODE:-clear}" PATCH_MODE="${PATCH_MODE:-ok}" \
-      bash "$SWEEP_STEP"
+      bash -e "$SWEEP_STEP"
   ) >"$dir/out" 2>&1
   local rc=$?
   set -e
@@ -859,6 +860,61 @@ PYTHON
       pass "$producer $fault preserves native status and original-lease closure"
     fi
   done
+done
+
+# First delivery uses the old trusted gate, whose ordinary nonzero verdict
+# must be captured even with the Actions default bash -e invocation.
+for driver_state in missing nonexec; do
+  for verdict in clear block config; do
+    dir="$TMP/bootstrap-$driver_state-$verdict"
+    make_sweep_fixture "$dir"
+    if [ "$driver_state" = missing ]; then
+      rm "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
+    else
+      chmod -x "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
+    fi
+    # Positive trusted-workflow reference absence is the bootstrap authority.
+    echo 'run: scripts/codex-p1-gate.sh' > "$dir/.github/workflows/codex-p1-gate.yml"
+    if run_event "$dir" GATE_MODE="$verdict"; then rc=0; else rc=$?; fi
+    expected_rc=0
+    conclusion=success
+    case "$verdict" in
+      block) expected_rc=1; conclusion=failure ;;
+      config) expected_rc=2; conclusion=failure ;;
+    esac
+    if [ "$rc" -eq "$expected_rc" ] \
+      && grep -Fxq "close lease-41 $conclusion" "$dir/mutations.log" \
+      && grep -Fq 'using the legacy fenced evaluation' "$dir/out"; then
+      pass "Actions shell bootstrap $driver_state $verdict closes its original lease"
+    else
+      fail "Actions shell bootstrap $driver_state $verdict closes its original lease" "rc=$rc expected=$expected_rc"
+    fi
+  done
+done
+
+# Installed scheduled helpers share the workflow revision. Both unavailable
+# driver shapes must reach the existing per-PR failure publisher before eval.
+for driver_state in missing nonexec; do
+  dir="$TMP/scheduled-driver-$driver_state"
+  make_sweep_fixture "$dir"
+  if [ "$driver_state" = missing ]; then
+    rm "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
+  else
+    chmod -x "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
+  fi
+  rc=$(run_sweep "$dir" stable stable)
+  if [ "$rc" -ne 1 ] || [ -e "$dir/gate.log" ] \
+    || ! grep -Fq 'Installed feedback snapshot retry driver is missing or not executable' "$dir/out"; then
+    fail "Actions shell scheduled $driver_state driver reports infrastructure failure" "rc=$rc"
+  elif ! grep -Fxq 'open 1 lease-1' "$dir/mutations.log" \
+    || ! grep -Fxq 'close lease-1 failure' "$dir/mutations.log" \
+    || ! grep -Fxq 'open 2 lease-2' "$dir/mutations.log" \
+    || ! grep -Fxq 'close lease-2 failure' "$dir/mutations.log" \
+    || grep -q '^close .* success$' "$dir/mutations.log"; then
+    fail "Actions shell scheduled $driver_state driver closes each readable original lease"
+  else
+    pass "Actions shell scheduled $driver_state driver fails each original lease and processes later PRs"
+  fi
 done
 
 echo ""

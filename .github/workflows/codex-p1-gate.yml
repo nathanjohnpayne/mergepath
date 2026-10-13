@@ -644,8 +644,11 @@ jobs:
               rc=2
               before=bootstrap-unavailable
               if [ "$mode" = bootstrap ] || before=$(scripts/review-feedback-surface-fingerprint.sh "$PR_NUMBER" "$REPO"); then
-                output=$(CODEX_P1_EXPECTED_HEAD_SHA="$HEAD_SHA" scripts/codex-p1-gate.sh "$PR_NUMBER" "$REPO" 2>&1)
-                rc=$?
+                if output=$(CODEX_P1_EXPECTED_HEAD_SHA="$HEAD_SHA" scripts/codex-p1-gate.sh "$PR_NUMBER" "$REPO" 2>&1); then
+                  rc=0
+                else
+                  rc=$?
+                fi
                 current=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha') || rc=2
                 [ "$current" = "$HEAD_SHA" ] || rc=2
                 if [ "$mode" = fingerprint ]; then
