@@ -1090,4 +1090,11 @@ auto_clear_labels:
   # .github/workflows/auto-clear-blocking-labels.yml. Tightened from
   # 15→5 minutes in mergepath#324 for delayed provider signals. The
   # historical reaction-clearance path was retired by mergepath#1751.
+  # Still load-bearing after the mergepath#2167 lint fan-in (which only
+  # covers repo-lint completions): a Codex verdict issue comment fires no
+  # listened workflow, and a consumer annex with a custom display name
+  # cannot be enumerated in workflow_run.workflows. Relaxing to 15 adds
+  # 10-15 min to Phase 4 clearance when no agent session is nudging. The
+  # three gate sweeps (*/15) and their trade-offs are tabled in
+  # REVIEW_POLICY.md § Event-driven lint fan-in and sweep cadence.
   scheduled_sweep_interval_minutes: 5

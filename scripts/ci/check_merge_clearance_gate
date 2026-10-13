@@ -97,6 +97,51 @@ if [ -f "$WORKFLOW" ]; then
     FAILED=1
   fi
 
+  # #2167: the CI-side fan-in lives in required-check-publisher.yml, which
+  # lists repo-lint as its second workflow_run parent, NOT here. A
+  # workflow_run trigger on THIS file would (a) run the event job on a run
+  # whose head_sha is main's tip (every workflow_run-triggered run is), so it
+  # exits 1 on "No PR head SHA" and leaves a failed native check on main, and
+  # (b) chain a SECOND publisher full pass per lint completion through the
+  # publisher's existing gate parent. The gate's verdict does not read `lint`
+  # (CI gate (a) is skipped to avoid the required-check self-deadlock), so
+  # the only correct place to react to lint is the single Checks-API writer.
+  if grep -qE "^[[:space:]]*workflow_run:" "$WORKFLOW"; then
+    echo "FAIL: [#2167 lint fan-in] $WORKFLOW declares a workflow_run trigger."
+    echo "      Lint completion is fanned in by required-check-publisher.yml (its"
+    echo "      second workflow_run parent is repo-lint). A workflow_run here runs"
+    echo "      the event job on main's tip and doubles the publisher pass per"
+    echo "      lint completion. Add CI-side parents to the publisher instead."
+    FAILED=1
+  fi
+
+  # #2167: no runner-held waiting. Every job here evaluates once and exits;
+  # a `while`/`until` loop that is not a `read` loop over enumerated PRs, or
+  # a `--watch`, is the shape that held a runner for a whole CI run (#1062
+  # finding 5: 1,200 s at 15 s intervals). Text-level, disclosed: comments
+  # are stripped (full-line and inline), the loop keyword must sit at a
+  # statement position (`^`, `;`, `&&`, `||`, `do`, `then`), and a wait
+  # respelled as a bounded `for` with a long `sleep` is a stated residual
+  # (#977's parsed-shell substrate is where that closes). The two spellings
+  # that have actually shipped in this repo cannot return silently.
+  mcg_nowait_text=$(grep -v '^[[:space:]]*#' "$WORKFLOW" | sed 's/[[:space:]]#.*$//')
+  mcg_loop_hits=$(grep -nE '(^[[:space:]]*|;[[:space:]]*|&&[[:space:]]*|\|\|[[:space:]]*|(^|[[:space:]])do[[:space:]]+|(^|[[:space:]])then[[:space:]]+)(while|until)[[:space:]]' <<<"$mcg_nowait_text" \
+    | grep -vE '(while|until)[[:space:]]+(IFS=[^[:space:];]*[[:space:]]+)?read([[:space:]]|$)' || true)
+  if [ -n "$mcg_loop_hits" ]; then
+    echo "FAIL: [#2167 no runner-held wait] $WORKFLOW contains a while/until loop that is not a read loop:"
+    printf '%s\n' "$mcg_loop_hits" | sed 's/^/      /' | head -5
+    echo "      The gate evaluates once and exits. A loop around a status read holds"
+    echo "      a runner for the whole CI run; lint completion must arrive as the"
+    echo "      publisher's repo-lint workflow_run delivery, never be polled for."
+    FAILED=1
+  fi
+  if grep -qE -- '--watch([[:space:]]|$)' <<<"$mcg_nowait_text"; then
+    echo "FAIL: [#2167 no runner-held wait] $WORKFLOW passes --watch."
+    echo "      A watch holds the runner until the checks finish — the runner-held"
+    echo "      poll #2167 removed. Evaluate once; the event re-triggers you."
+    FAILED=1
+  fi
+
   # #658: the propagation lane's head/base-pinned v2 marker is posted as
   # a GITHUB_TOKEN github-actions[bot] ISSUE comment, and GITHUB_TOKEN-authored
   # events create no workflow runs — so an issue_comment trigger could never

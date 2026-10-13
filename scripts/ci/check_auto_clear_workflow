@@ -10,7 +10,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-WORKFLOW="$ROOT/.github/workflows/auto-clear-blocking-labels.yml"
+# Overridable so tests/test_merge_clearance_gate.sh (Test 26, #2167) can aim
+# the structural assertions at a mutated copy without touching the canonical
+# workflow on disk — the same contract as MERGE_CLEARANCE_WORKFLOW and
+# REQUIRED_CHECK_PUBLISHER_WORKFLOW in the sibling checks.
+WORKFLOW="${AUTO_CLEAR_WORKFLOW:-$ROOT/.github/workflows/auto-clear-blocking-labels.yml}"
 CONTINUATION_TEST="$ROOT/tests/test_approval_merge_continuation.sh"
 CONTINUATION="$ROOT/scripts/workflow/approval-merge-continuation.sh"
 CONTINUATION_REPORTER="$ROOT/scripts/workflow/report-approval-continuation-failures.sh"
@@ -654,6 +658,27 @@ for wf in 'PR Review Policy' 'Agent Review Pipeline' 'Merge Clearance Gate' 'rep
     echo "  FAIL: workflow_run missing '$wf'" >&2
   fi
 done
+
+# #2167: no runner-held waiting. This workflow is re-entered by workflow_run
+# (repo-lint, the gate, the policy workflow) and by its sweep; every job
+# evaluates once and exits. A `while`/`until` loop that is not a `read` loop
+# over enumerated PRs, or a `--watch`, is the shape that held a runner for a
+# whole CI run (#1062 finding 5). Text-level and disclosed: comments are
+# stripped (full-line and inline), the loop keyword must sit at a statement
+# position, and a wait respelled as a bounded `for` with a long `sleep` is a
+# stated residual (#977's parsed-shell substrate). Same assertion shape as
+# scripts/ci/check_merge_clearance_gate and check_required_check_publisher.
+ac_nowait_text=$(grep -v '^[[:space:]]*#' "$WORKFLOW" | sed 's/[[:space:]]#.*$//')
+ac_loop_hits=$(grep -nE '(^[[:space:]]*|;[[:space:]]*|&&[[:space:]]*|\|\|[[:space:]]*|(^|[[:space:]])do[[:space:]]+|(^|[[:space:]])then[[:space:]]+)(while|until)[[:space:]]' <<<"$ac_nowait_text" \
+  | grep -vE '(while|until)[[:space:]]+(IFS=[^[:space:];]*[[:space:]]+)?read([[:space:]]|$)' || true)
+if [ -z "$ac_loop_hits" ] && ! grep -qE -- '--watch([[:space:]]|$)' <<<"$ac_nowait_text"; then
+  pass=$((pass + 1))
+  echo "  PASS: [#2167 no runner-held wait] no while/until poll loop and no --watch in any run block"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: [#2167 no runner-held wait] a while/until loop that is not a read loop, or a --watch, holds a runner while CI executes:" >&2
+  printf '%s\n' "$ac_loop_hits" | sed 's/^/        /' | head -5 >&2
+fi
 
 # A consumer annex may use any top-level workflow name, which cannot be
 # enumerated in workflow_run.workflows. The existing five-minute sweep must

@@ -40,6 +40,27 @@ name: Merge Clearance Gate
 # check_run per open PR head SHA — covering the no-event transitions
 # (a 👍 reaction, a UI label resolve, the bot-relabel-doesn't-retrigger
 # case that produced #428). See scripts/ci/check_merge_clearance_gate.
+#
+# Lint completion is NOT a trigger here, by design (#2167). This gate's
+# verdict never reads `lint`: scripts/merge-clearance-gate.sh skips
+# codex-review-check.sh's CI gate (a) because a required check that waited
+# on the required-check rollup would deadlock on itself. The `lint` context
+# represents its own pending state. What a lint completion needs is a fresh
+# head-pinned re-publish of the Checks-API slot, and the single writer of
+# that slot — required-check-publisher.yml — lists repo-lint as its second
+# workflow_run parent for exactly that. A workflow_run on THIS file would
+# run the event job on a run whose head_sha is main's tip (every
+# workflow_run-triggered run is) and chain a second publisher pass per lint
+# completion. check_merge_clearance_gate fences workflow_run ABSENT here.
+#
+# No job in this file holds a runner waiting for CI (#2167): each path
+# evaluates once and exits, the only loops are the sweep's `read` loop over
+# open PRs and bounded three-attempt API retries, and the fence rejects any
+# other `while`/`until` or `--watch`. On #2112 the approval-fired run of this
+# workflow was QUEUED for 38 minutes behind account-wide runner contention and
+# then ran for 12 seconds; that queueing is the Actions scheduler's, not a
+# poll in this file, and the publisher's lint parent is what re-derives the
+# slot once `lint` lands regardless of where this run sits in the queue.
 
 on:
   pull_request:

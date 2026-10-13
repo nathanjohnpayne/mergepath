@@ -138,6 +138,9 @@ fi
 # contract as MERGE_CLEARANCE_WORKFLOW in check_merge_clearance_gate.
 PUBLISHER="${REQUIRED_CHECK_PUBLISHER_WORKFLOW:-.github/workflows/required-check-publisher.yml}"
 PARENT_WORKFLOW="${REQUIRED_CHECK_PUBLISHER_PARENT:-.github/workflows/merge-clearance-gate.yml}"
+# The CI-side parent (#2167): repo-lint completion re-publishes the head's
+# three verdicts. Overridable for the same fixture reason as PARENT_WORKFLOW.
+LINT_PARENT_WORKFLOW="${REQUIRED_CHECK_PUBLISHER_LINT_PARENT:-.github/workflows/repo_lint.yml}"
 WORKFLOW_DIR="${REQUIRED_CHECK_PUBLISHER_WORKFLOW_DIR:-.github/workflows}"
 DEDUP_TEST="tests/test_required_check_publisher_dedup.sh"
 SUMMARY_HOLD_TEST="tests/test_required_check_publisher_summary_hold.sh"
@@ -196,7 +199,7 @@ fi
 TIER_SKIPPED=0
 if ! python3 -c "import yaml" >/dev/null 2>&1; then
   TIER_SKIPPED=1
-elif ! python3 - "$PUBLISHER" "$PARENT_WORKFLOW" "$WORKFLOW_DIR" <<'PY'
+elif ! python3 - "$PUBLISHER" "$PARENT_WORKFLOW" "$WORKFLOW_DIR" "$LINT_PARENT_WORKFLOW" <<'PY'
 import os
 import re
 import sys
@@ -204,6 +207,7 @@ import sys
 import yaml
 
 PUBLISHER, PARENT_WORKFLOW, WORKFLOW_DIR = sys.argv[1], sys.argv[2], sys.argv[3]
+LINT_PARENT_WORKFLOW = sys.argv[4]
 
 # The two publisher jobs, by key. The split into two jobs is what makes
 # every failure after phase 1 fail CLOSED; one job cannot carry both.
@@ -317,15 +321,28 @@ EXPECTED_TOP_LEVEL_KEYS = {"name", "on", "permissions", "env", "jobs"}
 # `${{ }}` wrapper, reordered operands) trips it too, and that is the
 # assertion rather than a defect in it — the single condition deciding
 # whether each phase runs has to arrive here as a diff.
+#
+# #2167 added the second (CI-side) parent and the two parent-name arms
+# pinned below. `open` admits only the gate parent: a repo-lint `requested`
+# duplicates the gate's at push time, and on a lint rerun it would pend
+# three lint-independent contexts for the whole run. `publish` admits a
+# repo-lint parent only for a `pull_request` lint run: push-to-main,
+# schedule and dispatch lint runs carry main's tip as head_sha, match no
+# open PR, and must not enter the rcp-publish queue (a member that enters
+# must run the full coalescing pass). The literal parent names inside these
+# conditions are cross-checked against the parent files by A6 below.
 EXPECTED_JOB_IF = {
     OPEN_JOB: (
         "github.event_name == 'workflow_run' && "
+        "github.event.workflow_run.name == 'Merge Clearance Gate' && "
         "(github.event.action == 'requested' || "
         "github.event.action == 'in_progress')"
     ),
     PUBLISH_JOB: (
         "github.event_name != 'workflow_run' || "
-        "github.event.action == 'completed'"
+        "(github.event.action == 'completed' && "
+        "(github.event.workflow_run.name != 'repo-lint' || "
+        "github.event.workflow_run.event == 'pull_request'))"
     ),
 }
 
@@ -632,12 +649,27 @@ else:
                 "      operator break-glass and the only on-demand remedy the two sibling",
                 "      contexts have ever had.")
 
-# ── A6 — the parent name is read from the parent file, not asserted ─────
+# ── A6 — each parent name is read from its parent file, not asserted ────
 #
-# workflow_run fires only on the parent's EXACT top-level `name:`, so a
-# rename there silently orphans every event-driven publish — with no error
-# anywhere, because a workflow that never fires looks identical to one
-# that fires and finds nothing to do.
+# workflow_run fires only on a parent's EXACT top-level `name:`, so a
+# rename there silently orphans every delivery from that parent — with no
+# error anywhere, because a workflow that never fires looks identical to
+# one that fires and finds nothing to do.
+#
+# Two parents since #2167, in a FIXED order: the Merge Clearance Gate
+# (review-side signals) and repo-lint (CI-side fan-in). The list is pinned
+# whole against the two names read out of the two parent files: a dropped
+# entry orphans one signal class, an added entry is a third pass per event,
+# and a reordering is a diff that has to arrive here on purpose. The same
+# two names are then cross-checked against the literals inside the pinned
+# job conditions (A4a): a parent renamed consistently in its file AND in
+# `workflows:` would otherwise leave an `if:` arm comparing against a name
+# no delivery ever carries — `open` would then open no hold at all and
+# `publish` would admit every lint run, main's tip included.
+PARENTS = (
+    ("gate", PARENT_WORKFLOW),
+    ("lint", LINT_PARENT_WORKFLOW),
+)
 if isinstance(triggers, dict):
     listed = (triggers.get("workflow_run") or {}).get("workflows") \
         if isinstance(triggers.get("workflow_run"), dict) else None
@@ -646,47 +678,79 @@ if isinstance(triggers, dict):
     # parent (already reported here) with a parent that parses cleanly and
     # declares no top-level `name:` — and the second is exactly the shape
     # this assertion exists to catch. Actions names an unnamed workflow
-    # after its PATH, so `workflows: ["Merge Clearance Gate"]` would then
-    # match no workflow and every event-driven publish is orphaned. Under
-    # a single `is not None` guard, DELETING one line from the parent
-    # disarms A6 instead of tripping it.
-    parent_loaded = True
-    parent_name = None
-    try:
-        parent_doc = load(PARENT_WORKFLOW)
-        parent_name = (parent_doc or {}).get("name")
-    except Exception as exc:
-        parent_loaded = False
-        bad("FAIL: [rcp parent name] could not read %s: %s"
-            % (PARENT_WORKFLOW, " ".join(str(exc).split())),
-            "      The publisher's workflow_run source must be verified against the",
-            "      parent's own top-level name:, not against a string in this check.")
-    if not parent_loaded:
-        pass  # already reported above; a second failure would just be noise
-    elif not isinstance(parent_name, str) or not parent_name.strip():
-        bad("FAIL: [rcp parent name] %s declares no usable top-level name:"
-            % PARENT_WORKFLOW,
-            "      (read as %r). Actions then names that workflow after its PATH," % parent_name,
-            "      so this publisher's workflow_run.workflows entry matches nothing",
-            "      and every event-driven publish is orphaned — silently, because a",
-            "      workflow that never fires looks identical to one that fires and",
-            "      finds nothing to do. A missing parent name: must trip this",
-            "      assertion, not disarm it.")
-    elif (not isinstance(listed, list) or len(listed) != 1
-          or not isinstance(listed[0], str)):
+    # after its PATH, so the `workflows:` entry would then match no
+    # workflow and every delivery from that parent is orphaned. Under a
+    # single `is not None` guard, DELETING one line from the parent disarms
+    # A6 instead of tripping it.
+    parent_names = []
+    parents_ok = True
+    for role, parent_path in PARENTS:
+        parent_loaded = True
+        parent_name = None
+        try:
+            parent_doc = load(parent_path)
+            parent_name = (parent_doc or {}).get("name")
+        except Exception as exc:
+            parent_loaded = False
+            parents_ok = False
+            bad("FAIL: [rcp parent name] could not read %s: %s"
+                % (parent_path, " ".join(str(exc).split())),
+                "      The publisher's workflow_run sources must be verified against",
+                "      each parent's own top-level name:, not against a string in this",
+                "      check.")
+        if not parent_loaded:
+            continue  # already reported above; a second failure would just be noise
+        if not isinstance(parent_name, str) or not parent_name.strip():
+            parents_ok = False
+            bad("FAIL: [rcp parent name] %s declares no usable top-level name:"
+                % parent_path,
+                "      (read as %r). Actions then names that workflow after its PATH," % parent_name,
+                "      so this publisher's workflow_run.workflows entry matches nothing",
+                "      and every delivery from the %s parent is orphaned — silently," % role,
+                "      because a workflow that never fires looks identical to one that",
+                "      fires and finds nothing to do. A missing parent name: must trip",
+                "      this assertion, not disarm it.")
+            continue
+        parent_names.append(parent_name)
+    if not parents_ok:
+        pass  # a comparison against a half-read list would name the wrong cause
+    elif (not isinstance(listed, list) or len(listed) != len(PARENTS)
+          or not all(isinstance(entry, str) for entry in listed)):
         bad("FAIL: [rcp parent name] workflow_run.workflows is %r, not a list"
             % listed,
-            "      containing exactly one workflow-name string. Actions requires a",
+            "      containing exactly %d workflow-name strings. Actions requires a" % len(PARENTS),
             "      scalar top-level name: and a list of scalar workflow names; a",
-            "      matching pair of non-scalar YAML values cannot deliver this chain.")
-    elif listed != [parent_name]:
-        bad("FAIL: [rcp parent name] workflow_run.workflows is %r but %s"
-            % (listed, PARENT_WORKFLOW),
-            "      declares name: %r. ONE parent is deliberate — the Merge" % parent_name,
+            "      matching pair of non-scalar YAML values cannot deliver this chain.",
+            "      The two parents (#2167) are the Merge Clearance Gate — every",
+            "      review-side refresh signal — and repo-lint, the CI-side fan-in that",
+            "      re-publishes a head's verdicts when `lint` lands. Dropping either",
+            "      orphans that signal class; a third is a third full pass per event.")
+    elif listed != parent_names:
+        bad("FAIL: [rcp parent name] workflow_run.workflows is %r but the parent"
+            % listed,
+            "      files declare %r (gate: %s; lint: %s)." % (parent_names, PARENT_WORKFLOW, LINT_PARENT_WORKFLOW),
+            "      TWO parents in THIS order are deliberate (#867, #2167): the Merge",
             "      Clearance Gate's trigger set is a measured strict superset of both",
-            "      siblings', so a single delivery per PR event carries every refresh",
-            "      signal. And workflow_run matches on the exact top-level name, so a",
-            "      rename on either side orphans every event-driven publish silently.")
+            "      siblings', so one delivery per PR event carries every review-side",
+            "      refresh signal, and repo-lint completion is the one CI-side event",
+            "      that re-publishes a head's verdicts the moment `lint` lands. And",
+            "      workflow_run matches on the exact top-level name, so a rename on",
+            "      either side orphans every delivery from that parent silently.")
+    else:
+        # Cross-check the literals the pinned conditions compare against.
+        # A4a pins the conditions verbatim, so this fires only when the
+        # parent files and `workflows:` were renamed together while the
+        # constant above was not — the one consistent rename that would leave
+        # an `if:` arm dead with every other assertion green.
+        gate_name, lint_name = parent_names
+        if "github.event.workflow_run.name == '%s'" % gate_name not in EXPECTED_JOB_IF[OPEN_JOB]:
+            bad("FAIL: [rcp parent name] the pinned `open` condition does not admit the",
+                "      gate parent %r by name. `open` would open no hold on any" % gate_name,
+                "      delivery, and every verdict would land with no pending cover.")
+        if "github.event.workflow_run.name != '%s'" % lint_name not in EXPECTED_JOB_IF[PUBLISH_JOB]:
+            bad("FAIL: [rcp parent name] the pinned `publish` condition does not filter",
+                "      the lint parent %r by name. Every lint completion — push-to-main" % lint_name,
+                "      included — would then enter the rcp-publish queue as a full pass.")
 
 # A7 — "nothing may observe the publisher via workflow_run" — is REMOVED
 # here rather than deferred for coverage, because its stated cause is
@@ -910,6 +974,55 @@ if GITHUB_SHA_REF.search(raw_text):
 # count never sees, and appearing-before is not executing-before. #977
 # reinstates both over a parsed shell AST, where the property is the one
 # actually asserted.
+
+# ── A14 — no runner-held waiting in either phase job (#2167) ───────────
+#
+# CI completion reaches this workflow as an EVENT (the repo-lint parent),
+# so no `run:` body may sit on a runner waiting for a check to finish. The
+# shape that used to do that elsewhere in this repo (#1062 finding 5, a
+# 1,200 s wait at 15 s intervals) is a shell loop around a status read —
+# `while`/`until` with a `sleep` — or `gh pr checks --watch`. The only loops
+# the publisher legitimately contains are `read` loops over enumerated PRs
+# and bounded `for attempt in 1 2 3` API retries.
+#
+# ASSERTION KIND, disclosed: this reads the `run:` bodies as TEXT (the same
+# disclosed exception as A2), because a loop has no YAML-level expression.
+# It rejects a `while`/`until` keyword at statement position whose command
+# is not `read`, and any `--watch`. Residual, stated: a wait respelled as a
+# `for` over a long range with a `sleep`, or a loop keyword mid-line after
+# something other than `;`, `&&`, `||`, `do` or `then`, passes. Closing that
+# needs the parsed-shell substrate tracked in #977; what this buys is that
+# the two spellings that have actually shipped here cannot return silently.
+LOOP_AT_STATEMENT = re.compile(
+    r"(?m)(?:^[ \t]*|;[ \t]*|&&[ \t]*|\|\|[ \t]*|\bdo[ \t]+|\bthen[ \t]+)"
+    r"(while|until)[ \t]+(?!(?:IFS=[^ \t;]*[ \t]+)?read\b)")
+WATCH_FLAG = re.compile(r"--watch\b")
+for key, job in ((OPEN_JOB, open_job), (PUBLISH_JOB, publish_job)):
+    if job is None:
+        continue
+    steps = job.get("steps")
+    if not isinstance(steps, list):
+        continue
+    for step in steps:
+        if not isinstance(step, dict) or not isinstance(step.get("run"), str):
+            continue
+        body = strip_shell_comments(step["run"])
+        label = step.get("name") or step.get("id") or "<unnamed step>"
+        hit = LOOP_AT_STATEMENT.search(body)
+        if hit:
+            bad("FAIL: [rcp no runner-held wait] job %r step %r contains a `%s` loop"
+                % (key, label, hit.group(1)),
+                "      that is not a `read` loop. The publisher evaluates once and exits;",
+                "      a loop around a status read holds a runner for the whole CI run,",
+                "      which is the #1062 shape #2167 removed. CI completion must arrive",
+                "      as a workflow_run delivery from the repo-lint parent, not be",
+                "      polled for on a runner.")
+        if WATCH_FLAG.search(body):
+            bad("FAIL: [rcp no runner-held wait] job %r step %r passes `--watch`."
+                % (key, label),
+                "      A watch holds the runner until the checks finish — the runner-held",
+                "      poll #2167 removed. Evaluate once; let the repo-lint parent's",
+                "      completed delivery bring the publisher back.")
 
 # The body/label gate's native contexts must never run on dispatch or cron
 # (#1249): skipped jobs still satisfy required checks. Reuse ActionsLoader

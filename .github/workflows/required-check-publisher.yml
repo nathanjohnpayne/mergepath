@@ -12,17 +12,56 @@ name: Required Check Publisher
 # resolution and rc mapping under shadow names. These names now match the
 # required contexts; the native producers remain as independent fallbacks
 # through the post-live observation window and the later removal stage.
+#
+# NO RUNNER-HELD WAITING (#2167). Every job here evaluates once and exits;
+# the only loops in this file are `read` loops over enumerated PRs and
+# bounded three-attempt API retries. CI completion reaches this workflow as
+# an EVENT (the repo-lint parent below), never as a sleep-poll on a runner.
+# scripts/ci/check_required_check_publisher fences that shape.
 
 on:
   workflow_run:
-    # ONE parent, not three (cross-agent round 2 on #867): the Merge
-    # Clearance Gate trigger set is a measured strict superset of both
-    # siblings' (it adds labeled/unlabeled and repository_dispatch), so a
-    # single delivery per PR event carries every refresh signal and the
-    # per-event fan-in stays at one pass instead of three. Must match that
-    # workflow's top-level `name:` exactly; a rename there silently orphans
-    # this trigger (fence assertion, PR 2).
-    workflows: ["Merge Clearance Gate"]
+    # TWO parents, by role (cross-agent round 2 on #867; #2167):
+    #
+    #   "Merge Clearance Gate" carries every REVIEW-side refresh signal. Its
+    #   trigger set is a measured strict superset of both sibling gates' (it
+    #   adds labeled/unlabeled and repository_dispatch), so one delivery per
+    #   PR event covers all three contexts and the per-event fan-in stays at
+    #   one pass instead of three.
+    #
+    #   "repo-lint" is the CI-side fan-in (#2167). None of the three contexts
+    #   reads `lint` — scripts/merge-clearance-gate.sh deliberately skips
+    #   codex-review-check.sh's CI gate (a), because a required check that
+    #   waited on the required-check rollup would deadlock on itself — so a
+    #   `lint` completion changes no verdict. What it changes is the MERGE
+    #   decision: `lint` is normally the last required context to land, and
+    #   before #2167 nothing re-published the three Checks-API slots for that
+    #   head once it did; a verdict published at push time stayed the newest
+    #   entry, and a gate run queued behind a late approval could sit behind
+    #   30-minute lint jobs (on #2112 the approval-fired gate run queued for
+    #   38 min and then ran for 12 s). Listening to repo-lint completion
+    #   re-publishes a fresh, head-pinned verdict within one publisher pass of
+    #   `lint` landing — for EVERY open PR head, under-threshold or not — and
+    #   no job anywhere reserves a runner while CI executes. The parent's
+    #   `requested` / `in_progress` deliveries open no hold (see the open job):
+    #   a hold spanning the whole lint run would pend three contexts that do
+    #   not depend on it, and the completed pass claims its own head first.
+    #
+    #   The main-SHA confounder: repo-lint also runs on `push` to main, and a
+    #   merge therefore floods completions whose head_sha is main's tip. Those
+    #   match no open PR, so a pass on them is a wasted full sweep (or, worse,
+    #   a cancelled queued member — the rcp-publish queue cancels the PENDING
+    #   member when a third arrives). The publish job's `if:` admits a
+    #   repo-lint parent only when its own event was `pull_request`, so push,
+    #   schedule and dispatch lint runs never enter the queue. A PR-head lint
+    #   run whose head moved on before the pass is the existing
+    #   "superseded head" path below: pendings on it close red, the pass still
+    #   covers every open PR.
+    #
+    # Both entries must match the parent's top-level `name:` exactly; a rename
+    # on either side silently orphans that trigger (fence assertion A6 reads
+    # each name out of its parent file).
+    workflows: ["Merge Clearance Gate", "repo-lint"]
     # in_progress is the rerun cue: a rerun re-uses the run, so `requested`
     # never re-fires, and without it no pending entry would cover the
     # re-evaluation window (cross-agent P1 on #867). Ordinary runs emit
@@ -66,9 +105,13 @@ jobs:
     name: open
     # `requested` fires at parent-run creation, before its jobs execute, so
     # pending entries land within seconds of the PR event; `in_progress`
-    # covers reruns. The workflows: list above already narrows the parent.
+    # covers reruns. Holds open ONLY for the gate parent (#2167): a repo-lint
+    # `requested` arrives at push time alongside the gate's own (duplicate),
+    # and on a lint rerun it would pend three lint-independent contexts for
+    # the whole lint run. The completed pass claims its head itself.
     if: >-
       github.event_name == 'workflow_run' &&
+      github.event.workflow_run.name == 'Merge Clearance Gate' &&
       (github.event.action == 'requested' || github.event.action == 'in_progress')
     runs-on: ubuntu-latest
     # GROUPLESS, on purpose (cross-agent round 3 on #867, superseding the
@@ -228,7 +271,16 @@ jobs:
     # Re-evaluates from scratch on every path; never reads
     # workflow_run.conclusion (deliveries drop and conclusion can be null
     # upstream — the verdict must not depend on how the parent finished).
-    if: github.event_name != 'workflow_run' || github.event.action == 'completed'
+    # A repo-lint parent is admitted only for a `pull_request` lint run
+    # (#2167): push-to-main, schedule and dispatch lint runs carry main's tip
+    # as head_sha, match no open PR, and must not enter the rcp-publish queue
+    # at all — a member that enters must run the full pass (coalescing), so
+    # the filter has to live here, at the expression level.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.action == 'completed' &&
+       (github.event.workflow_run.name != 'repo-lint' ||
+        github.event.workflow_run.event == 'pull_request'))
     runs-on: ubuntu-latest
     # ONE global queue for every publish pass, not a per-head group
     # (cross-agent P1 on #867): a sweep or dispatch run outside the head's
