@@ -1126,7 +1126,7 @@ def redirects_stdout(seg):
     return any(_STDOUT_REDIR_RE.match(w) for w in seg.words)
 
 
-def _find_substitutions(s, quotes_are_literal=False, include_arithmetic=False):
+def _find_substitutions(s, quotes_are_literal=False):
     """Yield (body, start_offset, end_offset) for every COMMAND SUBSTITUTION.
 
     Used for the two places the main loop hands over a span of text WHOLE
@@ -1154,12 +1154,6 @@ def _find_substitutions(s, quotes_are_literal=False, include_arithmetic=False):
     newline and leaves it literal elsewhere, and neither reading changes
     where a `$(` or a backtick begins.
 
-    The heredoc diagnostic caller can opt into arithmetic spans, parameter
-    arithmetic operands and conservative tails when the existing exact reader
-    cannot prove a command substitution's end. Existing bounded readers supply
-    the spans; no arithmetic value or case grammar is evaluated. Default callers
-    still inventory command substitutions only.
-
     Only the outermost span is yielded -- anything nested inside is found
     when that body is lexed on its own.
 
@@ -1167,12 +1161,11 @@ def _find_substitutions(s, quotes_are_literal=False, include_arithmetic=False):
     `_ExactReadUnavailable` for how that reading falls back.
     """
     if quotes_are_literal:
-        return _find_substitutions_legacy(s, quotes_are_literal, include_arithmetic)
+        return _find_substitutions_legacy(s, quotes_are_literal)
     try:
-        return _find_substitutions_exact(s, include_arithmetic)
+        return _find_substitutions_exact(s)
     except _ExactReadUnavailable:
-        return _find_substitutions_legacy(s, quotes_are_literal, include_arithmetic)
-
+        return _find_substitutions_legacy(s, quotes_are_literal)
 
 
 def _heredoc_brace_command_span(text, i):
@@ -1199,7 +1192,7 @@ def _heredoc_diagnostic_span(text, i):
     if brace is not None:
         return brace
     if text[i : i + 2] == "$[":
-        close = _find_compound_close(text, i + 1, bracket_span=True)
+        close = _heredoc_bracket_close(text, i + 1)
         end = len(text) if close is None else close + 1
         return text[i + 2 : close if close is not None else end], i, end
     if text[i : i + 2] == "$(" and text[i + 2 : i + 3] != "(":
@@ -1234,7 +1227,7 @@ def _heredoc_diagnostic_span(text, i):
     return text[j + 1 : end - 1], i, end
 
 
-def _find_substitutions_exact(s, include_arithmetic=False):
+def _find_substitutions_exact(s):
     out = []
     i = 0
     n = len(s)
@@ -1258,24 +1251,16 @@ def _find_substitutions_exact(s, include_arithmetic=False):
             in_single = True
             i += 1
             continue
-        if include_arithmetic and c == "$":
-            span = _heredoc_diagnostic_span(s, i)
-            if span is not None:
-                out.append(span)
-                i = span[2]
-                continue
         if in_double and c == "$" and s[i + 1 : i + 2] == "{":
             i = _simple_parameter_end(s, i)
             continue
-        if (c == "$" and s[i + 1 : i + 2] == "("
-                and (include_arithmetic or s[i + 2 : i + 3] != "(")):
+        if c == "$" and s[i + 1 : i + 2] == "(" and s[i + 2 : i + 3] != "(":
             end = _skip_balanced_parens(s, i + 1)
             out.append((s[i + 2 : end - 1], i, end))
             i = end
             continue
         if c == "`":
-            close = (_skip_backtick(s, i) - 1 if include_arithmetic
-                     else s.find("`", i + 1))
+            close = s.find("`", i + 1)
             if close == -1:
                 break
             out.append((s[i + 1 : close], i, close + 1))
@@ -1285,7 +1270,7 @@ def _find_substitutions_exact(s, include_arithmetic=False):
     return out
 
 
-def _find_substitutions_legacy(s, quotes_are_literal=False, include_arithmetic=False):
+def _find_substitutions_legacy(s, quotes_are_literal=False):
     out = []
     i = 0
     n = len(s)
@@ -1304,21 +1289,13 @@ def _find_substitutions_legacy(s, quotes_are_literal=False, include_arithmetic=F
             in_single = True
             i += 1
             continue
-        if include_arithmetic and c == "$":
-            span = _heredoc_diagnostic_span(s, i)
-            if span is not None:
-                out.append(span)
-                i = span[2]
-                continue
-        if (c == "$" and s[i + 1 : i + 2] == "("
-                and (include_arithmetic or s[i + 2 : i + 3] != "(")):
+        if c == "$" and s[i + 1 : i + 2] == "(" and s[i + 2 : i + 3] != "(":
             end = _skip_balanced_parens(s, i + 1)
             out.append((s[i + 2 : end - 1], i, end))
             i = end
             continue
         if c == "`":
-            close = (_skip_backtick(s, i) - 1 if include_arithmetic
-                     else s.find("`", i + 1))
+            close = s.find("`", i + 1)
             if close == -1:
                 break
             out.append((s[i + 1 : close], i, close + 1))
@@ -1331,19 +1308,8 @@ def _find_substitutions_legacy(s, quotes_are_literal=False, include_arithmetic=F
 class Lexer:
     """Segment-aware shell lexer.  Never executes anything it reads."""
 
-    def __init__(self, text, arithmetic_contexts=False):
+    def __init__(self, text):
         self.text = text
-        # HD substitution-source diagnostics alone opt into source coordinates.
-        # Default lexical words, references and relationships remain unchanged.
-        self._arithmetic_contexts = arithmetic_contexts
-        self.arithmetic_context_spans = []
-        if arithmetic_contexts:
-            self.herestring_source_positions = []
-            self.herestring_source_terminators = []
-            self.literal_source_process_positions = []
-            self.arithmetic_context_owners = []
-            self.diagnostic_null_terminators = []
-            self.literal_source_receiver_terminators = []
         self.logical = []
         self.heredocs = []
         self.func_defs = []  # (name, body_start_index, body_end_index)
@@ -1484,34 +1450,6 @@ class Lexer:
 
         def cur_level():
             return levels[-1]
-
-        def arithmetic_command_position(prefix=None, for_clause=False):
-            # Read only the already-tokenized prefix with the existing resolver.
-            # The temporary segment avoids caching a partial real segment.
-            probe = Segment(-1, None, False, line)
-            probe.words = list(cur_level()["seg"].words)
-            if prefix:
-                probe.words.append(prefix)
-            # Only this opt-in arithmetic role consumes measured literal time.
-            idx = 0
-            while idx < len(probe.words) and probe.words[idx] in RESERVED_WORDS:
-                idx += 1
-            if probe.words[idx:idx + 1] == ["time"]:
-                del probe.words[idx]
-                if probe.words[idx:idx + 1] == ["-p"]:
-                    del probe.words[idx]
-            # A raw final `for` opens C-style arithmetic, not an argument.
-            # Keep it local to this delimiter role; indexes/default lexing
-            # still use the unchanged ordinary command-position resolver.
-            if for_clause and probe.words[-1:] == ["for"]:
-                probe.words.pop()
-            cmd, _redir = resolve_command(probe)
-            return cmd is None
-
-        def record_arithmetic_context(start, operand_start, operand_end, end, kind):
-            if not any(a <= start < z for _k, a, _b, _c, z in self.arithmetic_context_spans):
-                self.arithmetic_context_spans.append((kind, start, operand_start, operand_end, end))
-                self.arithmetic_context_owners.append(cur_level()["seg"])
 
         def expanding():
             return "'" not in quotes
@@ -1804,12 +1742,6 @@ class Lexer:
             # ---- here-doc / here-string openers ----
             if c == "<" and i + 1 < n and text[i + 1] == "<":
                 if i + 2 < n and text[i + 2] == "<":
-                    if self._arithmetic_contexts:
-                        prefix = "".join(cur_level()["word"])
-                        seg = cur_level()["seg"]
-                        self.herestring_source_positions.append(
-                            (seg, len(seg.words), prefix, i + 3)
-                        )
                     # here-string: the following word belongs to this segment
                     cur_level()["seg"].words.append("<<<")
                     i += 3
@@ -1879,13 +1811,6 @@ class Lexer:
                 i = j
                 continue
 
-            if self._arithmetic_contexts and c == "[":
-                prefix = "".join(cur_level()["word"])
-                if _IDENT_RE.fullmatch(prefix) and arithmetic_command_position():
-                    close = _find_compound_close(text, i, bracket_span=True)
-                    if close is not None and (text[close + 1:close + 2] == "=" or text[close + 1:close + 3] == "+="):
-                        record_arithmetic_context(i, i + 1, close, close + 1, "index")
-
             # ---- structure ----
             if c == "\n":
                 finish_word()
@@ -1938,11 +1863,6 @@ class Lexer:
                         "saved_quotes": quotes,
                     }
                 )
-                if self._arithmetic_contexts:
-                    levels[-1]["literal_source_process_open"] = (
-                        parent_seg, len(parent_seg.words),
-                        "".join(levels[-2]["word"]), c, i + 2,
-                    )
                 quotes = []
                 i += 2
                 continue
@@ -2007,10 +1927,6 @@ class Lexer:
 
             if c == "(":
                 word_so_far = "".join(cur_level()["word"])
-                if self._arithmetic_contexts and (not word_so_far or word_so_far in RESERVED_WORDS or word_so_far in ("time", "for")) and text.startswith("((", i) and arithmetic_command_position(word_so_far, for_clause=True):
-                    close = _find_compound_close(text, i)
-                    if close is not None and text[close - 1:close + 1] == "))":
-                        record_arithmetic_context(i, i + 2, close - 1, close + 1, "command")
                 if word_so_far.endswith("="):
                     # An ARRAY ASSIGNMENT.  `args=(echo "$PAT")` stores two
                     # strings and writes nothing; reading the `(` as a command
@@ -2087,10 +2003,6 @@ class Lexer:
                 if len(levels) > 1:
                     finish_word()
                     kind = levels[-1]["kind"]
-                    if self._arithmetic_contexts and kind == "procsub":
-                        record = levels[-1].get("literal_source_process_open")
-                        if record is not None:
-                            self.literal_source_process_positions.append(record + (i,))
                     quotes = levels[-1]["saved_quotes"]
                     levels.pop()
                     if kind == "cmdsub":
@@ -2109,22 +2021,6 @@ class Lexer:
                     start_segment()
                     i += 1
                     continue
-                if self._arithmetic_contexts:
-                    pending = "".join(cur_level()["word"])
-                    seg = cur_level()["seg"]
-                    probe = Segment(-1, None, False, line)
-                    probe.words = list(seg.words) + ([pending] if pending else [])
-                    if resolve_command(probe)[0] in ("source", "."):
-                        self.literal_source_receiver_terminators.append((seg, len(seg.words), i))
-                    redir = _REDIR_RE.match(pending)
-                    target = pending[redir.end():] if redir is not None else pending
-                    if _unquote_command_word(target) in _NULL_SINKS | {"/dev/stderr"}:
-                        seg = cur_level()["seg"]
-                        self.diagnostic_null_terminators.append((seg, len(seg.words), i))
-                if (self._arithmetic_contexts
-                        and _unquote_command_word("".join(cur_level()["word"])) in ("/dev/stdin", "/dev/fd/0")):
-                    seg = cur_level()["seg"]
-                    self.herestring_source_terminators.append((seg, len(seg.words), i))
                 cur_level()["word"].append(c)
                 i += 1
                 continue
@@ -2442,26 +2338,7 @@ def _ASCII_NAME_CONT(c):
     return _ASCII_NAME_START(c) or ("0" <= c <= "9")
 
 
-def _error_word_parameter_end(text, brace_open, allow_positionals=False):
-    """Guard endpoint; only HD callers opt into positional/indirect guards."""
-    j = brace_open + 2
-    if text[j : j + 1] == "#":
-        return None
-    if text[j : j + 1] == "!":
-        if not allow_positionals:
-            return None
-        j += 1
-    name, end = ident_at(text, j)
-    if name is not None:
-        return end
-    if allow_positionals:
-        m = re.match(r"(?:[0-9]+|[@*])", text[j:])
-        if m is not None:
-            return j + m.end()
-    return None
-
-
-def error_word_expansion_at(text, brace_open, allow_positionals=False):
+def error_word_expansion_at(text, brace_open):
     """Is the `${...}` at `brace_open` the ERROR-WORD form, `:?` or `?`?
 
     `${VAR:?word}` and `${VAR?word}` make BASH ITSELF write `word` to stderr
@@ -2474,13 +2351,14 @@ def error_word_expansion_at(text, brace_open, allow_positionals=False):
     plain identifier and NOT required to be a credential name: the credential
     is in the WORD, and the variable being tested is usually something else.
     """
-    end = _error_word_parameter_end(text, brace_open, allow_positionals)
-    if end is None:
+    j = brace_open + 2
+    if j < len(text) and text[j] in "#!":
+        return False
+    name, end = ident_at(text, j)
+    if name is None:
         return False
     rest = text[end:]
     return rest.startswith(":?") or rest.startswith("?")
-
-
 
 
 def braced_ref_at(text, brace_open):
@@ -2522,14 +2400,12 @@ def braced_ref_at(text, brace_open):
     return name
 
 
-def _error_word_spans(s, in_heredoc=False):
+def _error_word_spans(s):
     """[start, end) index spans of every `${VAR:?WORD}` / `${VAR?WORD}` WORD.
 
     BASH ITSELF writes that word to stderr when VAR is unset, before the
     enclosing command runs -- so a credential there reaches a stream no matter
-    what the command is. The HD-only opt-in uses existing exact/compound
-    parameter bounds, preserving quoted braces and nested expansions; default
-    ordinary callers retain their existing reading. The ordinary-line path knows this; the
+    what the command is.  The ordinary-line path already knows this; the
     here-doc body path reduced its body to bare NAMES and lost it, so
     `read x <<EOF` / `${UNSET:?$PAT}` / `EOF` attributed the reference to the
     safe `read` owner and reported clean (#1032 round 6 P1).
@@ -2538,21 +2414,10 @@ def _error_word_spans(s, in_heredoc=False):
     i = 0
     n = len(s)
     while i + 1 < n:
-        if in_heredoc and s[i] == "\\":
-            i += 2
-            continue
-        if s[i] == "$" and s[i + 1] == "{" and error_word_expansion_at(s, i, allow_positionals=in_heredoc):
-            end = _error_word_parameter_end(s, i, allow_positionals=in_heredoc)
+        if s[i] == "$" and s[i + 1] == "{" and error_word_expansion_at(s, i):
+            _name, end = ident_at(s, i + 2)
             rest = s[end:]
             start = end + (2 if rest.startswith(":?") else 1)
-            if in_heredoc:
-                try:
-                    close = _simple_parameter_end(s, i) - 1
-                except _ExactReadUnavailable:
-                    close = _find_compound_close(s, i + 1)
-                spans.append((start, len(s) if close is None else close))
-                i = start
-                continue
             depth = 1
             k = start
             while k < n:
@@ -2945,7 +2810,7 @@ def _printf_literal(raw, literal):
     try:
         return shlex.split(raw) == [literal]
     except ValueError:
-        return False  # Unproven quoting/escaping never authorizes admission.
+        return False
 
 
 def _printf_text_target(raw, target):
@@ -3055,7 +2920,7 @@ def classify(seg, emitter_helpers):
         return EMIT
     if cmd in SAFE_COMMANDS:
         return SAFE
-    return SAFE  # an external command: see "does NOT catch" in the header
+    return SAFE
 
 
 def _short_option_operand_has_ref(seg, name, option_letters):
@@ -3369,11 +3234,8 @@ def _why(note, base):
 # In-file message-helper discovery
 # ==========================================================================
 
-def _find_compound_close(text, open_idx, bracket_span=False):
+def _find_compound_close(text, open_idx):
     """Return the matching close index for a brace group or subshell body.
-
-    Only the heredoc legacy-arithmetic inventory opts into bracket spans;
-    default callers retain the existing brace/subshell reading.
 
     The caller hands this function text whose here-doc body lines have already
     been blanked.  Counting over the raw source treated braces and parentheses
@@ -3382,14 +3244,14 @@ def _find_compound_close(text, open_idx, bracket_span=False):
     that data.
     """
     try:
-        return _find_compound_close_exact(text, open_idx, bracket_span)
+        return _find_compound_close_exact(text, open_idx)
     except _ExactReadUnavailable:
-        return _find_compound_close_legacy(text, open_idx, bracket_span)
+        return _find_compound_close_legacy(text, open_idx)
 
 
-def _find_compound_close_exact(text, open_idx, bracket_span=False):
+def _find_compound_close_exact(text, open_idx):
     opener = text[open_idx]
-    closer = "]" if bracket_span else ("}" if opener == "{" else ")")
+    closer = "}" if opener == "{" else ")"
     depth = 0
     i = open_idx
     n = len(text)
@@ -3433,9 +3295,9 @@ def _find_compound_close_exact(text, open_idx, bracket_span=False):
     return None
 
 
-def _find_compound_close_legacy(text, open_idx, bracket_span=False):
+def _find_compound_close_legacy(text, open_idx):
     opener = text[open_idx]
-    closer = "]" if bracket_span else ("}" if opener == "{" else ")")
+    closer = "}" if opener == "{" else ")"
     depth = 0
     i = open_idx
     n = len(text)
@@ -3578,7 +3440,6 @@ def _printf_callback_changes_lookup(seg):
     return False
 
 
-
 def discover_emitter_helpers(text):
     """Names with any recognized body writing their positionals VERBATIM."""
     bodies = {}
@@ -3716,1177 +3577,267 @@ def discover_emitter_helpers(text):
     return frozenset(helpers)
 
 
-def _heredoc_has_positional(hd, emitter_helpers, _depth=0):
-    """Shared HD admission; child source consumes the existing one-hop budget."""
-    if not hd.interpolating:
-        return False
-    cmd, _ = resolve_command(hd.owner)
-    body = _heredoc_continuation_text("\n".join(raw for _lno, raw in hd.body_lines))
-    if cmd in STDIN_ECHOERS or classify(hd.owner, emitter_helpers) == OPAQUE:
-        if _word_has_verbatim_positional(body, in_heredoc=True, _depth=_depth):
-            return True
-    else:
-        # Direct stdin DATA is inert for argument emitters. Actual source
-        # and diagnostics retain the existing independent admission.
-        for inner, start, _end in _find_substitutions(
-                body, quotes_are_literal=True, include_arithmetic=True):
-            if body[start] == "`":
-                inner = _backtick_positional_source(inner)
-            positional = (_word_has_verbatim_positional(inner, in_heredoc=True, _depth=_depth)
-                          if body.startswith(("$[", "$((", "${"), start)
-                          and _heredoc_brace_command_span(body, start) is None
-                          else _heredoc_substitution_has_positional(
-                              inner, _depth, _outer_substitution=body.startswith("$(", start),
-                              _source_capture=(body[start] == "`" or body.startswith("$(", start)
-                                               or (body.startswith("${", start)
-                                                   and body[start + 2:start + 3] != "|"))))
-            if positional:
-                return True
-    for start, end in _error_word_spans(body, in_heredoc=True):
-        if _word_has_verbatim_positional(body[start:end], in_heredoc=True, _depth=_depth):
-            return True
-    return False
+def _heredoc_bracket_close(text, open_idx):
+    """Existing bracket bounds, isolated from the ordinary compound reader."""
+    try:
+        return _heredoc_bracket_close_exact(text, open_idx)
+    except _ExactReadUnavailable:
+        return _heredoc_bracket_close_legacy(text, open_idx)
 
-
-def _backtick_positional_source(body):
-    """Remove the backtick source layer before the ordinary positional read."""
-    return re.sub(
-        r"\\([$`\\]|\n)",
-        lambda m: "" if m.group(1) == "\n" else m.group(1),
-        body,
-    )
-
-
-def _heredoc_substitution_has_positional(body, _depth=0, _outer_substitution=False,
-                                          _source_capture=False, _literal_source_context=None,
-                                          _literal_seen=frozenset(), _literal_definitions=None):
-    """Inventory actual source within one shared HD/deferred child hop.
-
-    Keep ordinary source checking first, including its conservative legacy
-    reading. Only discovered-HD and deferred child inventory consume the
-    existing budget; deeper source is not claimed uniformly inert or covered.
-    """
-    if _literal_source_context is None and _word_has_verbatim_positional(body):
-        return True
-    executable_body = body
-    if _literal_source_context is not None:
-        # Recognized definition bodies are catalogue data until a literal call.
-        # Preserve physical coordinates; never choose an active definition.
-        chars = list(body)
-        for match, _name, program in _iter_function_definitions(body):
-            for offset in range(match.end(), match.end() + len(program)):
-                if chars[offset] != "\n":
-                    chars[offset] = " "
-        executable_body = "".join(chars)
-    lx = Lexer(executable_body, arithmetic_contexts=True)
-    positions = _literal_source_context[4] if _literal_source_context is not None else None
-    if (_literal_source_context is not None and len(_literal_source_context) > 5
-            and (positions is None or positions)):
-        if any(_word_has_verbatim_positional(
-                _heredoc_literal_parameter_word(fragment, positions), _depth=_depth)
-               for fragment in _literal_source_context[5]):
-            return True
-    if (_literal_source_context is not None
-            and _heredoc_literal_source_output(lx, body, _literal_source_context[:4], _depth,
-                                                _positions=positions, _seen=_literal_seen,
-                                                _definitions=_literal_definitions)):
-        return True
-    for index, (_kind, _start, begin, end, _stop) in enumerate(lx.arithmetic_context_spans):
-        if (_literal_source_context is not None and _kind == "command"
-                and _heredoc_stderr_null(lx.arithmetic_context_owners[index])):
+def _heredoc_bracket_close_exact(text, open_idx):
+    opener = text[open_idx]
+    closer = "]"
+    depth = 0
+    i = open_idx
+    n = len(text)
+    quotes = []
+    while i < n:
+        c = text[i]
+        if quotes and quotes[-1] == "'":
+            if c == "'":
+                quotes.pop()
+            i += 1
             continue
-        if _word_has_verbatim_positional(
-                _heredoc_literal_parameter_word(body[begin:end], positions),
-                in_heredoc=True, _depth=_depth):
-            return True
-    # Lexer segments retain executable quote/escape context and omit comments
-    # and inert HD data. Rejoin words for legacy arithmetic split by spaces;
-    # only recognized arithmetic operands receive arithmetic quote semantics.
-    for ll in lx.logical:
-        for seg in ll.segments:
-            for operand in _heredoc_builtin_index_operands(seg, lx, _outer_substitution):
-                if _word_has_verbatim_positional(
-                        _heredoc_literal_parameter_word(operand, positions),
-                        in_heredoc=True, _depth=_depth):
-                    return True
-            executable = " ".join(seg.words)
-            for operand, start, _end in _find_substitutions(executable, include_arithmetic=True):
-                if _heredoc_brace_command_span(executable, start) is not None:
-                    if _heredoc_substitution_has_positional(operand, _depth):
-                        return True
-                    continue
-                if executable.startswith(("$[", "$((", "${"), start):
-                    if (_literal_source_context is not None
-                            and executable.startswith(("$[", "$(("), start)
-                            and _heredoc_stderr_null(seg.parent)):
-                        continue
-                    if _word_has_verbatim_positional(
-                            _heredoc_literal_parameter_word(operand, positions),
-                            in_heredoc=True, _depth=_depth):
-                        return True
-    if _depth >= _DEFERRED_SHELL_DEPTH:
-        return False
-    if _heredoc_invoked_alias_has_positional(
-            lx, _captured=_source_capture, _literal_depth=_depth):
-        return True
-    for hd in lx.heredocs:
-        if _heredoc_has_positional(hd, set(), _depth + 1):
-            return True
-    for ll in lx.logical:
-        for seg in ll.segments:
-            for inner in _deferred_shell_operands(seg):
-                if _heredoc_substitution_has_positional(inner, _depth + 1):
-                    return True
-            for inner, receiver in _heredoc_source_herestrings(seg, lx, _outer_substitution, with_context=True):
-                context = (seg, receiver, lx, _source_capture,
-                           _heredoc_literal_receiver_positions(receiver)) if receiver is not None else None
-                if _heredoc_substitution_has_positional(inner, _depth + 1, _literal_source_context=context):
-                    return True
-            for inner, receiver, fragments in _heredoc_source_process_operands(seg, lx, _outer_substitution):
-                context = (seg, receiver, lx, _source_capture,
-                           _heredoc_literal_receiver_positions(receiver), fragments)
-                if _heredoc_substitution_has_positional(inner, _depth + 1, _literal_source_context=context):
-                    return True
-    return False
-
-
-
-
-def _heredoc_builtin_index_operands(seg, _source_lexer=None, _outer_substitution=False):
-    """Literal indexed names at finite builtin operand positions, HD only."""
-    cmd, _redir = resolve_command(seg)
-    if cmd not in ("test", "[", "[[", "unset", "read", "printf", "declare", "typeset") or seg._cmd_index is None:
-        return []
-    arguments = list(_command_arguments(seg.words, seg._cmd_index + 1))
-    args = [literal for _raw, literal in arguments]
-    names = []
-    declaration = cmd in ("declare", "typeset")
-    if (cmd in ("printf", "declare", "typeset")
-            and _heredoc_stderr_null(seg, _source_lexer, _outer_substitution)):
-        return []
-    if cmd == "printf":
-        options, stop, _assigned, _separate, _allowed = _printf_assignment_options(seg)
-        i = 0
-        while i < stop:
-            _raw, literal = options[i]
-            if literal == "-v":
-                names = [options[i + 1][1]]
-                i += 2
-            elif literal is not None and literal.startswith("-v") and len(literal) > 2:
-                names = [literal[2:]]
-                i += 1
-            else:
-                break
-    elif declaration:
-        i = 0
-        while i < len(args):
-            literal = args[i]
-            if literal == "--":
-                i += 1
-                break
-            if literal is None:
-                return []
-            if not literal.startswith(("-", "+")) or literal in ("-", "+"):
-                break
-            if not literal[1:] or any(c not in "aAgilnrtuxfFp" for c in literal[1:]):
-                return []
-            if set(literal[1:]) & {"f", "F", "p", "A"}:
-                return []
+        if c == "\\":
+            i += 2
+            continue
+        if c == "#" and not quotes and (i == 0 or text[i - 1] in _WORD_BREAK_BEFORE_COMMENT):
+            eol = text.find("\n", i)
+            i = n if eol == -1 else eol
+            continue
+        if c == "'" and not quotes:
+            quotes.append("'")
             i += 1
-        names = args[i:]
-    elif cmd in ("test", "[", "[["):
-        if cmd in ("[", "[[") and args and args[-1] == ("]" if cmd == "[" else "]]"):
-            args = args[:-1]
-        if args[:1] == ["!"]:
-            args = args[1:]
-        if len(args) == 2 and args[0] == "-v":
-            names = args[1:]
-    else:
-        i = 0
-        array_read = False
-        while i < len(args):
-            literal = args[i]
-            if literal == "--":
-                i += 1
-                break
-            if literal is None:
-                return []
-            if not literal.startswith("-") or literal == "-":
-                break
-            if cmd == "unset":
-                if not literal[1:] or any(c not in "fvn" for c in literal[1:]) or "f" in literal[1:]:
-                    return []
+            continue
+        if c == '"':
+            if quotes:
+                quotes.pop()
             else:
-                letters = literal[1:]
-                if not letters:
-                    return []
-                for j, letter in enumerate(letters):
-                    if letter not in "ersadinNptu":
-                        return []
-                    if letter in SHORT_OPTION_OPERAND_LETTERS["read"]:
-                        array_read = array_read or letter == "a"
-                        if j + 1 == len(letters):
-                            i += 1
-                            if i >= len(args):
-                                return []
-                        break
+                quotes.append('"')
             i += 1
-        if not array_read:
-            names = args[i:]
+            continue
+        if quotes:
+            end = _double_quoted_construct_end(text, i)
+            i = i + 1 if end is None else end
+            continue
+        if c == opener:
+            depth += 1
+        elif c == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+def _heredoc_bracket_close_legacy(text, open_idx):
+    opener = text[open_idx]
+    closer = "]"
+    depth = 0
+    i = open_idx
+    n = len(text)
+    quotes = []
+    while i < n:
+        c = text[i]
+        if quotes and quotes[-1] == "'":
+            if c == "'":
+                quotes.pop()
+            i += 1
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        if c == "#" and not quotes and (i == 0 or text[i - 1] in _WORD_BREAK_BEFORE_COMMENT):
+            eol = text.find("\n", i)
+            i = n if eol == -1 else eol
+            continue
+        if c == "'":
+            quotes.append("'")
+            i += 1
+            continue
+        if c == '"':
+            if quotes and quotes[-1] == '"':
+                quotes.pop()
+            else:
+                quotes.append('"')
+            i += 1
+            continue
+        if quotes:
+            i += 1
+            continue
+        if c == opener:
+            depth += 1
+        elif c == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+def _heredoc_expansions(s):
+    """Existing HD-only command/arithmetic/parameter span inventory."""
+    quotes_are_literal = True
+    include_arithmetic = True
     out = []
-    for name in names:
-        if name is None:
+    i = 0
+    n = len(s)
+    in_single = False
+    while i < n:
+        c = s[i]
+        if c == "\\" and i + 1 < n:
+            i += 2
             continue
-        opening = name.find("[")
-        if opening <= 0 or not _IDENT_RE.fullmatch(name[:opening]):
+        if in_single:
+            if c == "'":
+                in_single = False
+            i += 1
             continue
-        close = _find_compound_close(name, opening, bracket_span=True)
-        if close is None:
+        if c == "'" and not quotes_are_literal:
+            in_single = True
+            i += 1
             continue
-        if declaration:
-            if name[close + 1:close + 2] != "=" and name[close + 1:close + 3] != "+=":
+        if include_arithmetic and c == "$":
+            span = _heredoc_diagnostic_span(s, i)
+            if span is not None:
+                out.append(span)
+                i = span[2]
                 continue
-            operand = name[opening + 1:close]
-            # Preserve the existing value-only declaration DATA boundary.
-            # Compound subscripts retain their actual diagnostic inventory;
-            # no RHS or runtime array/variable binding is evaluated here.
-            if re.fullmatch(r"\$(?:[1-9][0-9]*|[@*]|\{(?:[1-9][0-9]*|[@*])\})", operand):
-                continue
-            out.append(operand)
-        elif close == len(name) - 1:
-            out.append(name[opening + 1:close])
+        if (c == "$" and s[i + 1 : i + 2] == "("
+                and (include_arithmetic or s[i + 2 : i + 3] != "(")):
+            end = _skip_balanced_parens(s, i + 1)
+            out.append((s[i + 2 : end - 1], i, end))
+            i = end
+            continue
+        if c == "`":
+            close = (_skip_backtick(s, i) - 1 if include_arithmetic
+                     else s.find("`", i + 1))
+            if close == -1:
+                break
+            out.append((s[i + 1 : close], i, close + 1))
+            i = close + 1
+            continue
+        i += 1
     return out
 
+def _heredoc_error_word_parameter_end(text, brace_open, allow_positionals=False):
+    """Guard endpoint; only HD callers opt into positional/indirect guards."""
+    j = brace_open + 2
+    if text[j : j + 1] == "#":
+        return None
+    if text[j : j + 1] == "!":
+        if not allow_positionals:
+            return None
+        j += 1
+    name, end = ident_at(text, j)
+    if name is not None:
+        return end
+    if allow_positionals:
+        m = re.match(r"(?:[0-9]+|[@*])", text[j:])
+        if m is not None:
+            return j + m.end()
+    return None
 
-def _heredoc_literal_null_words(seg, lx, outer_substitution):
-    """Private null-target boundary with actual source-frame/word coordinates."""
-    words = list(seg.words)
-    if lx is not None and outer_substitution:
-        for owner, index, close in lx.diagnostic_null_terminators:
-            if (owner is seg and index < len(words) and words[index].endswith(")")
-                    and lx.text[close:close + 1] == ")"
-                    and close not in lx.quoted_data_offsets and close not in lx.comment_offsets):
-                words[index] = words[index][:-1]
-    return words
+def _heredoc_error_word_spans(s):
+    in_heredoc = True
+    """[start, end) index spans of every `${VAR:?WORD}` / `${VAR?WORD}` WORD.
 
-
-def _heredoc_stderr_null(seg, _source_lexer=None, _outer_substitution=False):
-    """A finite explicit fd2 null route, only for newly admitted diagnostics.
-
-    Reuse redirection/literal boundaries; unknown or later fd2 routes withhold
-    this credit. No descriptor variables, dup-state or runtime paths are inferred.
+    BASH ITSELF writes that word to stderr when VAR is unset, before the
+    enclosing command runs -- so a credential there reaches a stream no matter
+    what the command is. The HD-only opt-in uses existing exact/compound
+    parameter bounds, preserving quoted braces and nested expansions; default
+    ordinary callers retain their existing reading. The ordinary-line path knows this; the
+    here-doc body path reduced its body to bare NAMES and lost it, so
+    `read x <<EOF` / `${UNSET:?$PAT}` / `EOF` attributed the reference to the
+    safe `read` owner and reported clean (#1032 round 6 P1).
     """
-    for _hop in range(32):
-        if seg is None:
-            return False
-        null = None
-        words = _heredoc_literal_null_words(seg, _source_lexer, _outer_substitution)
-        for i, word in enumerate(words):
-            match = _REDIR_RE.match(word)
-            if not match or not re.fullmatch(r"0*2", word[:match.start(1)]):
+    spans = []
+    i = 0
+    n = len(s)
+    while i + 1 < n:
+        if in_heredoc and s[i] == "\\":
+            i += 2
+            continue
+        if s[i] == "$" and s[i + 1] == "{" and (_heredoc_error_word_parameter_end(s, i, True) is not None and s[_heredoc_error_word_parameter_end(s, i, True):].startswith((":?", "?"))):
+            end = _heredoc_error_word_parameter_end(s, i, allow_positionals=in_heredoc)
+            rest = s[end:]
+            start = end + (2 if rest.startswith(":?") else 1)
+            if in_heredoc:
+                try:
+                    close = _simple_parameter_end(s, i) - 1
+                except _ExactReadUnavailable:
+                    close = _find_compound_close(s, i + 1)
+                spans.append((start, len(s) if close is None else close))
+                i = start
                 continue
-            tail = word[match.end():]
-            raw = tail if tail else (words[i + 1] if i + 1 < len(words) else "")
-            target = _unquote_command_word(raw)
-            if match.group(1) in (">", ">>", ">|") and target == "/dev/stderr":
-                continue  # literal fd2 self-route preserves only existing proof
-            null = (match.group(1) in (">", ">>", ">|") and target in _NULL_SINKS)
-        if null is not None:
-            return null
-        seg = seg.parent
-    return False
-
-
-def _heredoc_literal_input_view(seg, source_lexer=None, outer_substitution=False, _receiver=False):
-    """Existing owned input projection shared by these literal source readers."""
-    words = (_heredoc_literal_receiver_words(seg, source_lexer, outer_substitution)
-             if _receiver and source_lexer is not None
-             else _heredoc_literal_null_words(seg, source_lexer, outer_substitution))
-    bound_inputs = None
-    if source_lexer is not None:
-        bound_inputs = []
-        if outer_substitution:
-            for owner, index, close in source_lexer.herestring_source_terminators:
-                if (owner is seg and index < len(words)
-                        and source_lexer.text[close:close + 1] == ")"
-                        and close not in source_lexer.quoted_data_offsets
-                        and close not in source_lexer.comment_offsets
-                        and words[index].endswith(")")
-                        and _unquote_command_word(words[index][:-1]) in ("/dev/stdin", "/dev/fd/0")):
-                    words[index] = words[index][:-1]
-        positions = [record for record in source_lexer.herestring_source_positions
-                     if record[0] is seg]
-        for _owner, index, prefix, end in reversed(positions):
-            # Read the actual following operand from its physical source
-            # position. A quoted/numeric operand is never an FD prefix.
-            suffix = source_lexer.text[end:]
-            reader = Lexer(suffix)
-            following = reader.logical[0].segments[0].words
-            if not following:
-                continue
-            raw = following[0]
-            # Existing resolver/argument readers already consume an input
-            # redirection pair. This private projection never executes it.
-            count = 2 if prefix and suffix[:1] in (" ", "\t", "\n") else 1
-            if prefix and not _is_fd_prefix(prefix):
-                words[index:index + 1 + count] = [prefix, "<", raw]
-            else:
-                words[index:index + 1 + count] = ["<", raw]
-            if (not _is_fd_prefix(prefix) or prefix == ""
-                    or (prefix.isdigit() and not prefix.strip("0"))):
-                literal = _unquote_command_word(raw)
-                if literal is not None:
-                    bound_inputs.append(literal)
-    return words, bound_inputs
-
-
-def _heredoc_source_herestrings(seg, source_lexer=None, outer_substitution=False, with_context=False):
-    """Literal stdin supplied to source/. shares the existing child budget."""
-    words, bound_inputs = _heredoc_literal_input_view(
-        seg, source_lexer, outer_substitution, _receiver=with_context)
-    probe = Segment(-1, None, False, seg.line)
-    probe.words = words
-    cmd, _redir = resolve_command(probe)
-    if cmd not in ("source", ".") or probe._cmd_index is None:
-        return []
-    args = list(_command_arguments(words, probe._cmd_index + 1))
-    if args and args[0][1] == "--":
-        args = args[1:]
-    if not args or args[0][1] not in ("/dev/stdin", "/dev/fd/0"):
-        return []
-    if bound_inputs is not None:
-        if with_context:
-            return [(inner, probe if args[0][1] == "/dev/fd/0" else None)
-                    for inner in bound_inputs]
-        return bound_inputs
-    inputs = []
-    for i, word in enumerate(seg.words):
-        if word == "<<<" and i + 1 < len(seg.words):
-            literal = _unquote_command_word(seg.words[i + 1])
-            if literal is not None:
-                inputs.append(literal)
-    return [(inner, None) for inner in inputs] if with_context else inputs
-
-
-
-def _heredoc_literal_receiver_words(seg, lx, outer_substitution):
-    """Actual outer close belongs to this private source receiver word slot."""
-    words = _heredoc_literal_null_words(seg, lx, outer_substitution)
-    if outer_substitution:
-        for owner, index, close in reversed(lx.literal_source_receiver_terminators):
-            if (owner is seg and index < len(words) and words[index].endswith(")")
-                    and lx.text[close:close + 1] == ")"
-                    and close not in lx.quoted_data_offsets and close not in lx.comment_offsets):
-                # Null-target projection may already have removed this close.
-                if any(o is owner and j == index and k == close
-                       for o, j, k in lx.diagnostic_null_terminators):
+            depth = 1
+            k = start
+            while k < n:
+                if s[k] == "\\":
+                    k += 2
                     continue
-                words[index] = words[index][:-1]
-                if not words[index]:
-                    del words[index]
-    return words
+                if s[k] == "{":
+                    depth += 1
+                elif s[k] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            spans.append((start, k))
+            i = start
+            continue
+        i += 1
+    return spans
+
+_POSITIONAL_RE = re.compile(r"\$(?:[1-9][0-9]*|[@*]|\{(?:[1-9][0-9]*|[@*])\})")
 
 
-def _heredoc_literal_receiver_positions(receiver):
-    """Complete literal script arguments prove no credential parameter input."""
-    resolve_command(receiver)
-    args = list(_command_arguments(receiver.words, receiver._cmd_index + 1))
-    if args and args[0][1] == "--":
-        args = args[1:]
-    scripts = args[1:]
-    if scripts and all(literal is not None or raw in ("''", '""')
-                       for raw, literal in scripts):
-        return frozenset()
-    return None  # no arguments inherit parameters; opaque arguments retain facts
+def _heredoc_has_positional(hd, emitter_helpers):
+    """Conservative substitutions; precision only for proven non-emitting DATA.
 
-
-def _heredoc_literal_parameter_word(word, positions):
-    """Private literal helper-argument facts, followed by the ordinary reader.
-
-    This projection changes no tokens or quote semantics. Only literal numeric
-    parameter heads lacking a credential-bearing actual argument are masked;
-    guards, attributes and quote/escape handling remain with the ordinary reader.
+    Main's raw positional predicate deliberately applies inside actual command
+    substitutions without interpreting commands, quoting, output routes or
+    helper argument binding. Arithmetic and error expansions are executable,
+    not plain DATA. No child source or runtime role model is used.
     """
-    if positions is None:
-        return word
-    possible_tail = None
-    if isinstance(positions, tuple):
-        positions, possible_tail = positions
-
-    def head(match):
-        brace, plain = match.groups()
-        name = brace or plain
-        if ((name in ("@", "*") and (positions or possible_tail is not None))
-                or (name not in ("@", "*") and int(name) in positions)
-                or (possible_tail is not None and int(name) >= possible_tail)):
-            return match.group(0)
-        return "${_mergepath_unused" if brace else "$_mergepath_unused"
-
-    return re.sub(r"\$(?:\{([1-9][0-9]*|[@*])|([1-9]|[@*]))", head, word)
-
-
-def _heredoc_literal_at_argument(word, _depth):
-    """Expanding @ value in this written argument, through ordinary readers.
-
-    Mask other positional heads only in this private test view. Substitution
-    outputs are scalar source data here, not a claim about an inner argv list.
-    """
-    for _body, start, end in reversed(_find_substitutions(word, include_arithmetic=True)):
-        if word[start:start + 1] == "`" or word.startswith(("$(", "$["), start):
-            word = word[:start] + word[end:]
-
-    def other_head(match):
-        brace, plain = match.groups()
-        if (brace or plain) == "@":
-            return match.group(0)
-        return "${_mergepath_unused" if brace else "$_mergepath_unused"
-
-    projected = re.sub(r"\$(?:\{([1-9][0-9]*|[@*])|([1-9]|[@*]))", other_head, word)
-    if _word_has_verbatim_positional(projected, _depth=_depth):
-        return True
-    # Only an unquoted expanding * can populate subsequent argument slots.
-    # Quoted scalar results, guards, attributes and escapes stay with the
-    # ordinary reader; captured command outputs were removed above.
-    quoted = Lexer(word).quoted_data_offsets
-    def star_head(match):
-        brace, plain = match.groups()
-        if ((brace or plain) == "*" and match.start() not in quoted):
-            return "${@" if brace else "$@"
-        return "${_mergepath_unused" if brace else "$_mergepath_unused"
-    projected = re.sub(r"\$(?:\{([1-9][0-9]*|[@*])|([1-9]|[@*]))", star_head, word)
-    return _word_has_verbatim_positional(projected, _depth=_depth)
-
-
-def _heredoc_literal_reaches_output(seg, helpers):
-    """Existing walk with finite stdout roles, only for literal source input.
-
-    Fd2-only redirects do not move captured stdout. A literal fd1 duplication
-    into a proven-null fd2 counts only at its written position; later null
-    routing cannot retroactively suppress the copied stream.
-    """
-    originals = []
-    current = seg
-    while current is not None and len(originals) < 32:
-        originals.append(current)
-        current = current.parent
-    frames = {s: Segment(s.sid, None, False, s.line) for s in originals}
-    for original, frame in frames.items():
-        frame.parent = frames.get(original.parent)
-        frame.parent_is_capture = original.parent_is_capture
-        frame.parent_is_subshell = original.parent_is_subshell
-        frame.pipe_to = original.pipe_to
-        words = original.words
-        projected = []
-        stdout_null = None
-        skip = False
-        for i, word in enumerate(words):
-            if skip:
-                skip = False
-                continue
-            match = _REDIR_RE.match(word)
-            if not match:
-                projected.append(word)
-                continue
-            tail = word[match.end():]
-            raw = tail if tail else (words[i + 1] if i + 1 < len(words) else "")
-            skip = not tail and i + 1 < len(words)
-            target = _unquote_command_word(raw)
-            stdout = bool(_STDOUT_REDIR_RE.match(word))
-            if stdout:
-                if match.group(1) == ">&" and target == "2":
-                    prefix = Segment(original.sid, original.parent, False, original.line)
-                    prefix.words = words[:i]
-                    stdout_null = _heredoc_stderr_null(prefix)
-                elif match.group(1) in (">", ">>", ">|") and target in _NULL_SINKS:
-                    stdout_null = True
-                else:
-                    stdout_null = False
-                projected.append(word)
-                if skip:
-                    projected.append(raw)
-            elif match.group(1) not in (">", ">>", ">|", ">&", "&>", "&>>"):
-                projected.append(word)
-                if skip:
-                    projected.append(raw)
-        if stdout_null:
-            return False
-        frame.words = projected
-    return reaches_output(Ref("1", seg.line, frames[seg]), helpers)[0]
-
-
-def _heredoc_literal_diagnostic(seg, positions, depth):
-    """Existing helper-body numeric inventories on reached parameters."""
-    probe = Segment(seg.sid, None, False, seg.line)
-    probe.words = []
-    for word in seg.words:
-        projected = _heredoc_literal_parameter_word(word, positions)
-        if _word_has_verbatim_positional(projected, _depth=depth):
-            projected = re.sub(r"\$(?:\{([1-9][0-9]*|[@*])|([1-9]|[@*]))",
-                               lambda m: "${GH_TOKEN" if m.group(1) else "$GH_TOKEN", projected)
-        probe.words.append(projected)
-    cmd, _redir = resolve_command(probe)
-    if probe._cmd_index is None:
+    if not hd.interpolating:
         return False
-    if cmd in NUMERIC_OPERAND_DIAGNOSTIC:
-        return any("GH_TOKEN" in _iter_refs(raw)
-                   for raw, _literal in _command_arguments(probe.words, probe._cmd_index + 1))
-    options = NUMERIC_OPTION_LETTERS.get(cmd, frozenset())
-    if options and _short_option_operand_has_ref(probe, "GH_TOKEN", options):
-        return True
-    return cmd in ("test", "[") and _test_numeric_operand(probe, "GH_TOKEN")
+    body = _heredoc_continuation_text("\n".join(raw for _line, raw in hd.body_lines))
+    for inner, _start, _end in _heredoc_expansions(body):
+        if _POSITIONAL_RE.search(inner):
+            return True
+    for begin, end in _heredoc_error_word_spans(body):
+        if _heredoc_data_has_positional(body[begin:end]):
+            return True
+    cmd, _redir = resolve_command(hd.owner)
+    # SAFE is also the default for unknown external commands; only explicit
+    # existing literal builtin facts prove the plain DATA is not emitted.
+    inert = (cmd in EMITTERS | SAFE_COMMANDS | ENV_DUMPERS
+             and cmd not in emitter_helpers
+             and hd.owner._function_binding is None)
+    return not inert and _heredoc_data_has_positional(body)
 
 
-def _heredoc_literal_diagnostic_output(seg, helpers):
-    """Finite literal stderr destinations, with existing stdout capture facts."""
-    current = seg
-    for _hop in range(32):
-        if current is None:
-            return True  # stderr is not captured by command substitution
-        destination = None
-        for i, word in enumerate(current.words):
-            match = _REDIR_RE.match(word)
-            if not match or not (re.fullmatch(r"0*2", word[:match.start(1)])
-                                  or (not word[:match.start(1)] and match.group(1) in ("&>", "&>>"))):
-                continue
-            tail = word[match.end():]
-            raw = tail if tail else (current.words[i + 1] if i + 1 < len(current.words) else "")
-            target = _unquote_command_word(raw)
-            if match.group(1) in (">", ">>", ">|") and target == "/dev/stderr":
-                continue
-            destination = (match.group(1), target, i)
-        if destination is not None:
-            operator, target, route_index = destination
-            if operator in (">", ">>", ">|", "&>", "&>>") and target in _NULL_SINKS:
-                return False
-            if operator == ">&" and target == "1":
-                probe = Segment(current.sid, current.parent, False, current.line)
-                probe.parent_is_capture = current.parent_is_capture
-                probe.parent_is_subshell = current.parent_is_subshell
-                probe.pipe_to = current.pipe_to
-                probe.words = ["echo"]
-                skip = False
-                for i, word in enumerate(current.words[:route_index]):
-                    if skip:
-                        skip = False
-                        continue
-                    match = _REDIR_RE.match(word)
-                    if not match:
-                        continue
-                    skip = match.end() == len(word) and i + 1 < len(current.words)
-                    if re.fullmatch(r"0*2", word[:match.start(1)]):
-                        continue
-                    probe.words.append(word)
-                    if skip:
-                        probe.words.append(current.words[i + 1])
-                return _heredoc_literal_reaches_output(probe, helpers)
-            return True  # no saved-fd or unknown destination model
-        current = current.parent
-    return True
-
-
-def _heredoc_literal_source_output(lx, body, context, _depth, _seen=frozenset(), _positions=None,
-                                   _definitions=None):
-    """Existing output walk on a private transparent literal-source frame."""
-    owner, receiver, source_lexer, captured = context
-    originals = [seg for line in source_lexer.logical for seg in line.segments]
-    frames = {seg: Segment(seg.sid, None, False, seg.line) for seg in originals}
-    boundary = Segment(-1, None, False, owner.line)
-    # The owning non-stdin HD command discards this captured body output.
-    boundary.words = [":"]
-    for seg, frame in frames.items():
-        frame.words = list(receiver.words if seg is owner else seg.words)
-        if seg is owner:
-            # This proven literal source input is transparent to the output
-            # already produced by its program. Keep its actual redirections
-            # and parent links, without the general opaque-source verdict.
-            resolve_command(frame)
-            frame.words[frame._cmd_index] = ":"
-            frame._resolved = False
-        frame.parent = frames.get(seg.parent, seg.parent if seg.parent is not None
-                                  else boundary if captured else None)
-        frame.parent_is_capture = seg.parent_is_capture or (captured and seg.parent is None)
-        frame.parent_is_subshell = seg.parent_is_subshell
-        frame.pipe_to = frames.get(seg.pipe_to)
-    for line in lx.logical:
-        for seg in line.segments:
-            if seg.parent is None:
-                seg.parent = frames[owner]
-                seg.parent_is_subshell = True
-    helpers = discover_emitter_helpers(body)
-    definitions = {name: list(programs) for name, programs in (_definitions or {}).items()}
-    for _match, name, program in _iter_function_definitions(body):
-        definitions.setdefault(name, []).append(program)
-
-    null_commands = {owner for span, owner in zip(lx.arithmetic_context_spans, lx.arithmetic_context_owners)
-                     if span[0] == "command" and _heredoc_stderr_null(owner)}
-
-    def literal_call(seg, program, positions=_positions, alias=False):
-        # Definitions and literal alias graph edges belong to this reached
-        # program. They add no deferred/HD recursion and spend no new child hop.
-        if program in _seen:
-            return False
-        receiver = seg
-        if alias:
-            # Literal replacement redirects precede written invocation redirects.
-            # Project their existing token roles into this private source text;
-            # do not make an invocation's later fd2 null route an ancestor route.
-            receiver = Segment(seg.sid, seg.parent, False, seg.line)
-            receiver.words = []
-            redirects = []
-            skip = False
-            for i, word in enumerate(seg.words):
-                if skip:
-                    skip = False
-                    continue
-                match = _REDIR_RE.match(word)
-                if match:
-                    redirects.append(word)
-                    if match.end() == len(word) and i + 1 < len(seg.words):
-                        redirects.append(seg.words[i + 1])
-                        skip = True
-                else:
-                    receiver.words.append(word)
-            if redirects:
-                program += " " + " ".join(redirects)
-        return _heredoc_substitution_has_positional(
-            program, _depth, _literal_source_context=(seg, receiver, lx, False, positions),
-            _literal_seen=_seen | {program}, _literal_definitions=definitions)
-
-    trace_scopes = {}
-    for line in lx.logical:
-        trace_delta = _xtrace_delta(line, False)
-        for seg in line.segments:
-            lineage = []
-            ancestor = seg.parent
-            while ancestor is not None:
-                lineage.append(ancestor)
-                ancestor = ancestor.parent
-            traced = next((trace_scopes[p] for p in lineage if p in trace_scopes), False)
-            trace_change = _segment_sets_xtrace(seg)
-            if trace_change is True or (trace_change is False and trace_delta is False):
-                trace_scopes[seg.parent] = trace_change
-            if traced and not _heredoc_stderr_null(seg.parent):
-                if any(_word_has_verbatim_positional(
-                        _heredoc_literal_parameter_word(word, _positions), _depth=_depth)
-                       for word in seg.words):
-                    return True
-            parent = seg
-            while parent is not None and parent not in null_commands:
-                parent = parent.parent
-            if parent in null_commands:
-                continue
-            cmd, _redir = resolve_command(seg)
-            # Expansion diagnostics precede this command's own redirects.
-            for word in seg.words:
-                projected = _heredoc_literal_parameter_word(word, _positions)
-                if (any(_word_has_verbatim_positional(projected[a:b], _depth=_depth)
-                        for a, b in _error_word_spans(projected))
-                        and _heredoc_literal_diagnostic_output(seg.parent, helpers)):
-                    return True
-            builtin_bypass = (seg._cmd_index == 1 and seg.words[:1] in (["builtin"], ["command"]))
-            if (cmd in definitions and seg._cmd_index is not None
-                    and seg._function_binding is None and not builtin_bypass):
-                arguments = list(_command_arguments(seg.words, seg._cmd_index + 1))
-                positions = {i for i, (raw, _literal) in enumerate(arguments, 1)
-                             if _word_has_verbatim_positional(
-                                 _heredoc_literal_parameter_word(raw, _positions), _depth=_depth)}
-                possible_tail = next((i for i, (raw, _literal) in enumerate(arguments, 1)
-                                      if (_positions is None or _positions)
-                                      and _heredoc_literal_at_argument(raw, _depth)), None)
-                if possible_tail is not None:
-                    positions = (positions, possible_tail)
-                if positions and any(literal_call(seg, program, positions)
-                                     for program in definitions[cmd]):
-                    return True
-                continue
-            if (_heredoc_literal_diagnostic(seg, _positions, _depth)
-                    and _heredoc_literal_diagnostic_output(seg, helpers)):
+def _heredoc_data_has_positional(body):
+    """Existing HD escape/value boundary for data delivered to stdin consumers."""
+    i = 0
+    while i < len(body):
+        if body[i] == "\\" and body[i + 1:i + 2] in ("$", "`", "\\", "\n"):
+            i += 2
+            continue
+        if body.startswith("${", i):
+            try:
+                end = _simple_parameter_end(body, i)
+            except _ExactReadUnavailable:
+                close = _find_compound_close(body, i + 1)
+                end = len(body) if close is None else close + 1
+            word = body[i:end]
+            if (not re.fullmatch(r"\$\{(?:[1-9][0-9]*|[@*])@a\}", word)
+                    and _word_has_verbatim_positional(word)):
                 return True
-            for word in seg.words:
-                word = _heredoc_literal_parameter_word(word, _positions)
-                # Expansion arithmetic diagnoses before this command's own
-                # redirects. The independent diagnostic loop reads it below.
-                for _operand, start, end in reversed(_find_substitutions(word, include_arithmetic=True)):
-                    if word.startswith(("$((", "$["), start):
-                        word = word[:start] + word[end:]
-                if (_word_has_verbatim_positional(word, _depth=_depth)
-                        and _heredoc_literal_reaches_output(seg, helpers)):
-                    return True
-    return _heredoc_invoked_alias_has_positional(
-        lx, lambda seg, program: literal_call(seg, program, alias=True), set(definitions) | helpers)
-
-
-def _heredoc_literal_emitter_program(body, _fragments=None):
-    """Finite literal printf/echo/stdin-emitter data, without execution."""
-    lx = Lexer(body, arithmetic_contexts=True)
-    if lx.heredocs or lx.literal_source_process_positions:
-        return None
-    parts = [seg for line in lx.logical for seg in line.segments if seg.words]
-    if any(part._function_binding is not None for part in parts):
-        return None  # stored producer definitions are not an invocation
-    legacy_nested = any(part.parent is not None for part in parts)
-    if legacy_nested:
-        # The published singleton decoder covered one known nested producer.
-        # Retain that finite exception; unknown/multi-part nested producers
-        # acquire no new inventory or deferred child hop.
-        if len(parts) != 1:
-            return None
-        words, inputs = _heredoc_literal_input_view(parts[0], lx)
-        probe = Segment(-1, None, False, parts[0].line)
-        probe.words = words[1:] if words[:1] == ["builtin"] else words
-        cmd, _redir = resolve_command(probe)
-        if cmd not in EMITTERS | STDIN_ECHOERS or probe._cmd_index is None:
-            return None
-        args = list(_command_arguments(probe.words, probe._cmd_index + 1))
-        if any(_OUT_REDIR_RE.match(word) for word in parts[0].words):
-            return None
-        if cmd in STDIN_ECHOERS:
-            if cmd != "tee" and args:
-                return None
-            options = True
-            for raw, literal in args:
-                if not _printf_literal(raw, literal):
-                    return None
-                if options and literal == "--":
-                    options = False
-                elif options and literal.startswith("-") and literal != "-":
-                    if (not re.fullmatch(r"-[aip]+", literal)
-                            and literal not in ("--append", "--ignore-interrupts", "--output-error",
-                                                "--output-error=warn", "--output-error=warn-nopipe",
-                                                "--output-error=exit", "--output-error=exit-nopipe")):
-                        return None
-        elif lx.herestring_source_positions or any(_REDIR_RE.match(word) for word in probe.words):
-            return None
-    def component(parts, _fragments):
-        pipeline = len(parts) > 1
-        if not parts:
-            return None
-        if pipeline:
-            if any(part.pipe_to is not following for part, following in zip(parts, parts[1:])):
-                return None
-            if parts[-1].pipe_to is not None:
-                return None
-        final = parts[-1]
-        final_cmd, _redir = resolve_command(final)
-        final_args = list(_command_arguments(final.words, final._cmd_index + 1)) if final._cmd_index is not None else []
-        if final_cmd in ("true", ":"):
-            return None
-        diagnostic_copy = False
-        for i, word in enumerate(final.words):
-            match = _REDIR_RE.match(word)
-            if not match or not (re.fullmatch(r"0*2", word[:match.start(1)])
-                                  or (not word[:match.start(1)] and match.group(1) in ("&>", "&>>"))):
-                continue
-            tail = word[match.end():]
-            raw = tail if tail else (final.words[i + 1] if i + 1 < len(final.words) else "")
-            target = _unquote_command_word(raw)
-            operator = match.group(1)
-            if ((operator == ">&" and target == "2")
-                    or (operator in (">", ">>", ">|") and target in
-                        ("/dev/stderr", "/dev/fd/2", "/proc/self/fd/2"))):
-                continue
-            if ((operator == ">&" and target == "1")
-                    or (operator in (">", ">>", ">|") and target in
-                        ("/dev/stdout", "/dev/fd/1", "/proc/self/fd/1"))):
-                probe = Segment(final.sid, None, False, final.line)
-                probe.words = final.words[:i] + ["2>&1"]
-                diagnostic_copy = _heredoc_literal_diagnostic_output(probe, set())
-            else:
-                diagnostic_copy = not (operator in (">", ">>", ">|", "&>", "&>>")
-                                       and _printf_literal(raw, target)) and target != "-"
-        diagnostic_labels = False
-        # Counts suppress stdin program text only when literal filename/label
-        # roles cannot themselves carry it. Pattern/option operands are not
-        # filename labels; these are finite written roles, not stage execution.
-        if final_cmd == "wc" and all(_printf_literal(*arg) for arg in final_args):
-            options = True
-            labels = False
-            for raw, literal in final_args:
-                if options and literal == "--":
-                    options = False
-                elif options and (literal == "--files0-from" or literal.startswith("--files0-from=")):
-                    labels = True  # literal stdin may be a filename list
-                elif options and literal.startswith("-") and literal != "-":
-                    continue
-                elif literal != "-" and _word_has_verbatim_positional(literal):
-                    labels = True
-            if not labels:
-                return None
-        if final_cmd == "grep":
-            # -- ends options; -e/-f consume pattern data, never a filename
-            # label. Keep their attached forms and long literal counterparts.
-            count = False
-            skip = False
-            pattern = False
-            options = True
-            filename_labels = []
-            input_labels = []
-            label_option = False
-            label_mode = None
-            filename_list = False
-            complete = True
-            pattern_file = False
-            diagnostic_values = []
-            for raw, literal in final_args:
-                if skip:
-                    if label_option and _printf_literal(raw, literal):
-                        input_labels.append(literal)
-                    if pattern_file and _printf_literal(raw, literal):
-                        diagnostic_values.append(literal)
-                    skip = False
-                    label_option = False
-                    pattern_file = False
-                    continue
-                if not _printf_literal(raw, literal):
-                    complete = False
-                    break
-                if options and literal == "--":
-                    options = False
-                    continue
-                if options and literal in ("-e", "-f", "--regexp", "--file"):
-                    skip = True
-                    pattern = True
-                    pattern_file = literal in ("-f", "--file")
-                    continue
-                if options and literal == "--label":
-                    skip = True
-                    label_option = True
-                    continue
-                if options and literal.startswith(("--regexp=", "--file=")):
-                    pattern = True
-                    if literal.startswith("--file="):
-                        diagnostic_values.append(literal.split("=", 1)[1])
-                    continue
-                if options and literal.startswith("--label="):
-                    input_labels.append(literal.split("=", 1)[1])
-                    continue
-                if options and literal == "--count":
-                    count = True
-                    continue
-                if options and literal in ("--files-with-matches", "--files-without-match"):
-                    filename_list = True
-                    continue
-                if options and literal in ("--with-filename", "--no-filename"):
-                    label_mode = literal == "--with-filename"
-                    continue
-                if options and literal.startswith("-") and literal != "-":
-                    for offset, letter in enumerate(literal[1:], 1):
-                        if letter == "c":
-                            count = True
-                        if letter in "Hh":
-                            label_mode = letter == "H"
-                        if letter in "lL":
-                            filename_list = True
-                        if letter in "ef":
-                            pattern = True
-                            skip = offset == len(literal) - 1
-                            pattern_file = letter == "f" and skip
-                            if letter == "f" and not skip:
-                                diagnostic_values.append(literal[offset + 1:])
-                            break
-                    continue
-                if not pattern:
-                    pattern = True
-                elif literal != "-":
-                    filename_labels.append(literal)
-            labels = filename_labels if label_mode is not False or filename_list else []
-            if label_mode is True or labels or filename_list:
-                labels = labels + input_labels
-            diagnostic_labels = diagnostic_copy and any(
-                _word_has_verbatim_positional(value) for value in filename_labels + diagnostic_values)
-            if complete and count and not diagnostic_labels and not any(
-                    _word_has_verbatim_positional(value) for value in labels):
-                return None
-        away = None
-        for i, word in enumerate(final.words):
-            match = _STDOUT_REDIR_RE.match(word)
-            if not match:
-                continue
-            tail = word[match.end():]
-            raw = tail if tail else (final.words[i + 1] if i + 1 < len(final.words) else "")
-            target = _unquote_command_word(raw)
-            if ((match.group(1) == ">&" and target == "1")
-                    or (match.group(1) in (">", ">>", ">|")
-                        and target in ("/dev/stdout", "/dev/fd/1", "/proc/self/fd/1"))):
-                continue  # a literal fd1 self-route preserves only prior proof
-            away = (match.group(1) in (">", ">>", ">|", "&>", "&>>")
-                    and _printf_literal(raw, target)) or (match.group(1) == ">&" and target == "-")
-            if match.group(1) == ">&" and target == "2":
-                prefix = Segment(final.sid, None, False, final.line)
-                prefix.words = final.words[:i]
-                # No stderr-to-stdout or saved-descriptor credit. A known
-                # null fd2, or untouched fd2, proves this copy leaves the pipe.
-                away = (_heredoc_stderr_null(prefix) or not any(
-                    (m is not None and (re.fullmatch(r"0*2", word[:m.start(1)])
-                     or m.group(1) in ("&>", "&>>")))
-                    for word in prefix.words for m in [_REDIR_RE.match(word)]))
-        if away and not diagnostic_labels:
-            return None
-        seg = parts[0]
-        words, inputs = _heredoc_literal_input_view(seg, lx)
-        probe = Segment(-1, None, False, seg.line)
-        probe.words = words
-        if probe.words[:1] == ["builtin"]:
-            probe.words = probe.words[1:]
-        cmd, _redir = resolve_command(probe)
-        if probe._cmd_index is None:
-            return None
-        args = list(_command_arguments(probe.words, probe._cmd_index + 1))
-        head_inputs = sum(owner is seg for owner, *_rest in lx.herestring_source_positions)
-        stdin_program = None
-        if head_inputs:
-            # This actual owning input certificate fixes the program bytes. The
-            # command/argv may possibly deliver them without a stage evaluator.
-            if (head_inputs != 1 or len(inputs or []) != 1
-                    or sum(bool(m and m.group(1) in ("<", "<>", "<<", "<<<"))
-                           for word in words for m in [_REDIR_RE.match(word)]) != 1):
-                return None
-            stdin_program = inputs[0]
-        if _fragments is not None:
-            stages = parts if stdin_program is not None else parts[1:]
-            for stage in stages:
-                stage_words, stage_inputs = _heredoc_literal_input_view(stage, lx)
-                view = Segment(stage.sid, None, False, stage.line)
-                view.words = stage_words
-                resolve_command(view)
-                if view._cmd_index is not None:
-                    _fragments.extend(literal for raw, literal in
-                        _command_arguments(stage_words, view._cmd_index + 1)
-                        if _printf_literal(raw, literal))
-                if stage is not seg:
-                    _fragments.extend(stage_inputs or [])
-        if stdin_program is not None:
-            return stdin_program
-        if head_inputs or cmd not in EMITTERS:
-            return None
-        if not all(_printf_literal(raw, literal) for raw, literal in args):
-            return None
-        values = [literal for _raw, literal in args]
-        if cmd == "echo":
-            newline = True
-            while values and re.fullmatch(r"-[neE]+", values[0]):
-                if any(c in "eE" for c in values[0][1:]) and "/" in probe._cmd_literal:
-                    return None
-                newline = newline and "n" not in values.pop(0)[1:]
-            if any("\\" in value for value in values):
-                return None  # xpg_echo/escape modes are runtime state, not inferred.
-            return " ".join(values) + ("\n" if newline else "")
-        if not values or values[0].startswith("-v"):
-            return None
-        if values[:1] == ["--"]:
-            values = values[1:]
-        if not values:
-            return None
-        fmt, values = values[0], values[1:]
-        # Only unmodified string conversions and literal format text. Recognized
-        # newline/backslash spelling is fixed data; other escapes/formats stay opaque.
-        if re.search(r"\\(?!n|\\)", fmt):
-            return None
-        fmt = fmt.replace("\\\\", "\x00").replace("\\n", "\n").replace("\x00", "\\")
-        pieces = re.split(r"(%[sb])", fmt)
-        if any("%" in text for text in pieces[::2]):
-            return None
-        if "%b" in pieces and any("\\" in value for value in values):
-            return None
-        conversions = len(pieces) // 2
-        if not conversions:
-            return fmt
-        output = []
-        while True:
-            output.append(pieces[0])
-            for i in range(conversions):
-                output.append(values.pop(0) if values else "")
-                output.append(pieces[2 * i + 2])
-            if not values:
-                return "".join(output)
-
-    incoming = {part.pipe_to for part in parts if part.pipe_to is not None}
-    roots = [part for part in parts if part not in incoming]
-    visited = set()
-    programs = []
-    for root in roots:
-        chain = []
-        current = root
-        while current is not None:
-            if current not in parts or current in visited:
-                return None  # no guessed connection across a source frame
-            visited.add(current)
-            chain.append(current)
-            current = current.pipe_to
-        fragments = []
-        program = component(chain, fragments)
-        if program is not None:
-            programs.append(program)
-            if _fragments is not None:
-                _fragments.extend(fragments)
-    if len(visited) != len(parts):
-        return None
-    # These are fixed outputs from existing finite literal decoders, possibly
-    # delivered in source order. No branch execution or stage evaluator is used.
-    return "".join(programs) if programs else None
-
-
-def _heredoc_source_process_operands(seg, lx, _outer_substitution=False):
-    """Actual standalone input-process filename feeding literal source/."""
-    records = [record for record in lx.literal_source_process_positions if record[0] is seg]
-    if len(records) != 1:
-        return []
-    _owner, index, prefix, direction, begin, close = records[0]
-    if (direction != "<" or prefix or lx.text[close + 1:close + 2] not in
-            ("", " ", "\t", "\n", ";", "|", "&", ")")):
-        return []
-    # Identity of this private marker proves the owning argument slot; no
-    # spelling search can bind a duplicate word from elsewhere in the source.
-    marker = "".join(["__mergepath_literal_", "source_process__"])
-    receiver = Segment(-1, None, False, seg.line)
-    receiver.words = _heredoc_literal_receiver_words(seg, lx, _outer_substitution)
-    receiver.words[index:index] = [marker]
-    cmd, _redir = resolve_command(receiver)
-    if cmd not in ("source", ".") or receiver._cmd_index is None:
-        return []
-    args = list(_command_arguments(receiver.words, receiver._cmd_index + 1))
-    if args and args[0][1] == "--":
-        args = args[1:]
-    if not args or args[0][0] is not marker:
-        return []
-    fragments = []
-    program = _heredoc_literal_emitter_program(lx.text[begin:close], fragments)
-    return [(program, receiver, tuple(fragments))] if program is not None else []
-
-
-def _shopt_expand_aliases_delta(seg):
-    """Literal valid shopt bundles for this existing alias-enable gate only."""
-    cmd, _redir = resolve_command(seg)
-    if cmd != "shopt" or seg._cmd_index is None:
-        return None
-    flags = set()
-    names = []
-    options = True
-    for _raw, literal in _command_arguments(seg.words, seg._cmd_index + 1):
-        if literal is None:
-            return None
-        if options and literal == "--":
-            options = False
+            i = max(i + 2, end)
             continue
-        if options and literal.startswith("-") and literal != "-":
-            if not re.fullmatch(r"-[pqsuo]+", literal):
-                return None
-            flags.update(literal[1:])
-            continue
-        options = False
-        names.append(literal)
-    if "expand_aliases" not in names or "o" in flags or {"s", "u"} <= flags:
-        return None
-    if "u" in flags:
-        return False
-    return True if "s" in flags else None
-
-
-def _heredoc_invoked_alias_has_positional(lx, _literal_output=None, _literal_helpers=frozenset(),
-                                          _captured=False, _literal_depth=0):
-    """Literal emitter replacement source at a later enabled invocation.
-
-    Reuse the existing alias emitter catalog, then apply the ordinary
-    positional reader only to literal replacement text. This spends the
-    existing child inventory rather than modeling runtime alias bindings.
-    """
-    aliases = _alias_emitters(lx, _literal_helpers, _HEREDOC_ALIAS_RE)
-    if not aliases:
-        return False
-    positional = {}
-    programs = {}
-    definitions = []
-    trailing_wrappers = {}
-    trailing_prefixes = {}
-    enabled = False
-    enabled_at = None
-    for ll in lx.logical:
-        for seg in ll.segments:
-            cmd, _redir = resolve_command(seg)
-            lits = [_unquote_command_word(w) for w in seg.words]
-            if cmd == "shopt":
-                delta = _shopt_expand_aliases_delta(seg)
-                if delta is True:
-                    enabled, enabled_at = True, ll.first_line
-                elif delta is False:
-                    enabled = False
-            elif cmd == "alias":
-                for literal in lits[1:]:
-                    m = _HEREDOC_ALIAS_RE.match(literal) if literal is not None else None
-                    if m:
-                        name, target = m.groups()
-                        definitions.append((ll.first_line, name, _alias_target_commands(target)))
-                        if name in aliases and _word_has_verbatim_positional(target):
-                            positional.setdefault(name, ll.first_line)
-                            programs.setdefault(name, set()).add(target)
-                        if target.endswith((" ", "\t")):
-                            replacement = Lexer(target)
-                            parts = [s for line in replacement.logical for s in line.segments if s.words]
-                            if (len(parts) == 1 and len(parts[0].words) == 1
-                                    and _unquote_command_word(parts[0].words[0]) in ("command", "builtin")):
-                                trailing_wrappers.setdefault(name, ll.first_line)
-                            trailing_prefixes.setdefault(name, (ll.first_line, target))
-                # The catalog already resolves literal alias targets to a
-                # fixed point. Carry positional evidence over those same
-                # edges, retaining every required definition-line boundary.
-                while True:
-                    grew = False
-                    for line, name, heads in definitions:
-                        if name in positional:
-                            continue
-                        required = [max(line, positional[h]) for h in heads if h in positional]
-                        if required:
-                            positional[name] = min(required)
-                            programs[name] = {program for head in heads if head in positional
-                                              for program in programs.get(head, ())}
-                            grew = True
-                    if not grew:
-                        break
-            elif (enabled and cmd in positional
-                  and ll.first_line > max(positional[cmd], enabled_at)):
-                if (_literal_output is None or any(_literal_output(seg, program)
-                        for program in programs.get(cmd, ()))):
-                    return True
-            elif enabled and seg._cmd_index is not None:
-                # A trailing blank on a literal alias replacement makes
-                # the next written command word eligible. Walk only
-                # actual unquoted/unescaped words, bounded by this argument
-                # list; quoted aliases and safe argument prefixes stay inert.
-                words = list(_command_arguments(seg.words, seg._cmd_index))
-                i = 0
-                prefix = ""
-                new_prefix = False
-                while i < len(words):
-                    raw, literal = words[i]
-                    if raw != literal:
-                        break
-                    if (literal in positional
-                            and ll.first_line > max(positional[literal], enabled_at)):
-                        if not new_prefix:
-                            if (_literal_output is None or any(_literal_output(seg, program)
-                                    for program in programs.get(literal, ()))):
-                                return True
-                        else:
-                            for program in programs.get(literal, ()):
-                                combined = prefix + program
-                                if _literal_output is not None:
-                                    hit = _literal_output(seg, combined)
-                                else:
-                                    # Only the newly admitted literal prefix uses
-                                    # private output roles; legacy aliases keep
-                                    # their existing conservative source verdict.
-                                    hit = _heredoc_substitution_has_positional(
-                                        combined, _literal_depth + 1,
-                                        _literal_source_context=(seg, seg, lx, _captured, None))
-                                if hit:
-                                    return True
-                        break
-                    if (literal not in trailing_prefixes
-                            or ll.first_line <= max(trailing_prefixes[literal][0], enabled_at)):
-                        break
-                    prefix += trailing_prefixes[literal][1]
-                    new_prefix = new_prefix or literal not in trailing_wrappers
-                    i += 1
+        if _POSITIONAL_RE.match(body, i):
+            return True
+        i += 1
     return False
 
 
@@ -4899,73 +3850,48 @@ def _heredoc_continuation_text(body):
     )
 
 
-def _word_has_verbatim_positional(w, in_heredoc=False, _depth=0):
+def _word_has_verbatim_positional(w):
     """True when the word expands a positional parameter's VALUE.
 
     Single-quoted text never expands, `${1:+set}` is a constant alternate and
-    `${#1}` is a length and exact `${1@a}` is attributes-only -- a helper uses the same redacted
+    `${#1}` is a length -- a helper is entitled to use the same two redacted
     forms the check documents for callers.  Inside double quotes an
     apostrophe is literal (#1494); see `_ExactReadUnavailable` for how that
     reading falls back.
-
-    In an interpolating here-doc, quotes are literal and backslash quotes
-    only dollar, backtick, backslash and newline. Remove unescaped continued
-    newlines before the shared positional decision; an escaped backslash
-    pair stays intact and cannot turn the following newline into a join.
-    Actual backtick bodies have their separate source-escape layer removed
-    before recursive ordinary reading; modern substitutions do not. Actual
-    substitution bodies reuse the literal deferred-source reader within its
-    existing one-hop bound, without interpreting general parameter flow.
     """
-    if in_heredoc:
-        w = _heredoc_continuation_text(w)
     try:
-        return _word_has_verbatim_positional_exact(w, in_heredoc, _depth)
+        return _word_has_verbatim_positional_exact(w)
     except _ExactReadUnavailable:
-        return _word_has_verbatim_positional_legacy(w, in_heredoc, _depth)
+        return _word_has_verbatim_positional_legacy(w)
 
 
-def _word_has_verbatim_positional_exact(w, in_heredoc=False, _depth=0):
+def _word_has_verbatim_positional_exact(w):
     i = 0
     n = len(w)
     in_double = False
     while i < n:
         c = w[i]
-        if in_heredoc and c == "$":
-            brace = _heredoc_brace_command_span(w, i)
-            if brace is not None:
-                body, _start, end = brace
-                if _heredoc_substitution_has_positional(body, _depth):
-                    return True
-                i = end
-                continue
-        if (c == "\\" and i + 1 < n
-                and (not in_heredoc or w[i + 1] in "$`\\\n")):
+        if c == "\\" and i + 1 < n:
             i += 2
             continue
-        if c == '"' and not in_heredoc:
+        if c == '"':
             in_double = not in_double
             i += 1
             continue
-        if c == "'" and not in_double and not in_heredoc:
+        if c == "'" and not in_double:
             j = w.find("'", i + 1)
             i = n if j == -1 else j + 1
             continue
-        if ((in_double or in_heredoc)
-                and (c == "`" or (c == "$" and w[i + 1 : i + 2] == "("))):
+        if in_double and (c == "`" or (c == "$" and w[i + 1 : i + 2] == "(")):
             # The body still expands: grade it as a word of its own.
             end = _double_quoted_construct_end(w, i)
             closed = c != "`" or (end - 1 > i and w[end - 1] == "`")
             lo = i + 1 if c == "`" else i + 2
-            body = w[lo : end - 1 if closed else end]
-            if c == "`" and in_heredoc:
-                body = _backtick_positional_source(body)
-            if (_heredoc_substitution_has_positional(body, _depth) if in_heredoc
-                    else _word_has_verbatim_positional_exact(body)):
+            if _word_has_verbatim_positional_exact(w[lo : end - 1 if closed else end]):
                 return True
             i = end
             continue
-        if (in_double or in_heredoc) and c == "$" and w[i + 1 : i + 2] == "{":
+        if in_double and c == "$" and w[i + 1 : i + 2] == "{":
             _simple_parameter_end(w, i)  # raises on a word it cannot read
         if c == "$":
             if i + 1 < n and w[i + 1] == "{":
@@ -4976,8 +3902,7 @@ def _word_has_verbatim_positional_exact(w, in_heredoc=False, _depth=0):
                 m = re.match(r"([1-9][0-9]*|[@*])", w[j:])
                 if m:
                     rest = w[j + m.end() : j + m.end() + 2]
-                    if (rest[:1] == "+" or rest[:2] == ":+"
-                            or (rest == "@a" and w[j + m.end() + 2 : j + m.end() + 3] == "}")):
+                    if rest[:1] == "+" or rest[:2] == ":+":
                         i = j + m.end()
                         continue
                     return True
@@ -4990,34 +3915,17 @@ def _word_has_verbatim_positional_exact(w, in_heredoc=False, _depth=0):
     return False
 
 
-def _word_has_verbatim_positional_legacy(w, in_heredoc=False, _depth=0):
+def _word_has_verbatim_positional_legacy(w):
     i = 0
     n = len(w)
     while i < n:
         c = w[i]
-        if in_heredoc and c == "$":
-            brace = _heredoc_brace_command_span(w, i)
-            if brace is not None:
-                body, _start, end = brace
-                if _heredoc_substitution_has_positional(body, _depth):
-                    return True
-                i = end
-                continue
-        if (c == "\\" and i + 1 < n
-                and (not in_heredoc or w[i + 1] in "$`\\\n")):
+        if c == "\\" and i + 1 < n:
             i += 2
             continue
-        if c == "'" and not in_heredoc:
+        if c == "'":
             j = w.find("'", i + 1)
             i = n if j == -1 else j + 1
-            continue
-        if c == "`" and in_heredoc:
-            end = _skip_backtick(w, i)
-            closed = end - 1 > i and w[end - 1] == "`"
-            body = _backtick_positional_source(w[i + 1 : end - 1 if closed else end])
-            if _heredoc_substitution_has_positional(body, _depth):
-                return True
-            i = end
             continue
         if c == "$":
             if i + 1 < n and w[i + 1] == "{":
@@ -5028,8 +3936,7 @@ def _word_has_verbatim_positional_legacy(w, in_heredoc=False, _depth=0):
                 m = re.match(r"([1-9][0-9]*|[@*])", w[j:])
                 if m:
                     rest = w[j + m.end() : j + m.end() + 2]
-                    if (rest[:1] == "+" or rest[:2] == ":+"
-                            or (rest == "@a" and w[j + m.end() + 2 : j + m.end() + 3] == "}")):
+                    if rest[:1] == "+" or rest[:2] == ":+":
                         i = j + m.end()
                         continue
                     return True
@@ -5324,7 +4231,7 @@ _ALIAS_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_:.-]*)=(.*)$", re.S)
 _HEREDOC_ALIAS_RE = re.compile(r"^([^/=$`'\"\\ \t\n|&;()<>]+)=(.*)$", re.S)
 
 
-def _alias_emitters(lx, helpers, alias_pattern=_ALIAS_RE):
+def _alias_emitters(lx, helpers):
     """Alias names that resolve to an emitter, when `expand_aliases` is on.
 
     `shopt -s expand_aliases` + `alias leak=echo` makes `leak "$PAT"` an
@@ -5358,12 +4265,12 @@ def _alias_emitters(lx, helpers, alias_pattern=_ALIAS_RE):
             cmd, _redir = resolve_command(seg)
             lits = [_unquote_command_word(w) for w in seg.words]
             lits = [l for l in lits if l is not None]
-            if _shopt_expand_aliases_delta(seg) is True:
+            if cmd == "shopt" and "-s" in lits and "expand_aliases" in lits:
                 if enabled_at is None:
                     enabled_at = ll.first_line
             elif cmd == "alias":
                 for l in lits[1:]:
-                    m = alias_pattern.match(l)
+                    m = _ALIAS_RE.match(l)
                     if m:
                         defs.append((ll.first_line, m.group(1), m.group(2)))
     if enabled_at is None or not defs:
@@ -13318,6 +12225,470 @@ def _oracle_interpreter_cases():
     return failures
 
 
+
+
+# Owner replaces per-family precision with one conservative substitution class.
+CORPUS += [('helper-hd-central-dollar', 'flag', 'die(){ printf safe <<EOF\n$(printf %s \'$1\')\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-backtick', 'flag', 'die(){ printf safe <<EOF\n`printf %s \'$1\'`\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-brace-command', 'flag', 'die(){ printf safe <<EOF\n${ printf %s \'$1\'; }\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-brace-reply', 'flag', 'die(){ printf safe <<EOF\n${| REPLY=\'$1\'; }\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-unused-helper-argument', 'flag', 'die(){ printf safe <<EOF\n$(f(){ :; }; f "$9")\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-argument-index-mismatch', 'flag', 'die(){ printf safe <<EOF\n$(f(){ echo "$2" >&2; }; f "$1")\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-plain-printf-data', 'clean', 'die(){ printf safe <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-plain-read-data', 'clean', 'die(){ read x <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-escaped-stdin-data', 'clean', 'die(){ cat <<EOF\n\\$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-escaped-command-opener', 'clean', 'die(){ printf safe <<EOF\n\\$(echo "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-noninterpolating-command', 'clean', 'die(){ printf safe <<\'EOF\'\n$(echo "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-safe-helper-call', 'clean', 'die(){ printf safe <<EOF\n$(echo "$1" >&2)\nEOF\n}\ndie safe\n'), ('helper-hd-central-stdin-data', 'flag', 'die(){ cat <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-unknown-stdin-data', 'flag', 'die(){ unknown_consumer <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-arithmetic-expansion', 'flag', 'die(){ printf safe <<EOF\n$((1/$1))\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-error-expansion', 'flag', 'die(){ printf safe <<EOF\n${MISSING:?${1@Q}}\nEOF\n}\ndie "$GH_TOKEN"\n')]
+
+HEREDOC_SUBSTITUTION_CONSERVATISM = "Owner-approved substitution conservatism: main's unchanged raw positional predicate is retained inside an actual command substitution in an interpolating helper heredoc, regardless of command roles, quoting within the substitution, output routing, invocation or positional argument binding. The retained historical/sample quiet body intentionally flags; no execution, binding, FD, stage or count model is introduced. Decision: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6156188282"
+HEREDOC_SUBSTITUTION_CONSERVATIVE_CASES = frozenset({
+    'helper-hd-bounded-alias-argument',
+    'helper-hd-bounded-alias-before-definition',
+    'helper-hd-bounded-alias-before-enable',
+    'helper-hd-bounded-alias-disable-after-enable',
+    'helper-hd-bounded-alias-disabled',
+    'helper-hd-bounded-alias-escaped-positional',
+    'helper-hd-bounded-alias-literal-positional',
+    'helper-hd-bounded-alias-same-line',
+    'helper-hd-bounded-alias-uninvoked',
+    'helper-hd-bounded-for-array-data',
+    'helper-hd-bounded-for-comment',
+    'helper-hd-bounded-for-escaped-positional',
+    'helper-hd-bounded-for-literal-data',
+    'helper-hd-bounded-for-tail-data',
+    'helper-hd-central-argument-index-mismatch',
+    'helper-hd-central-backtick',
+    'helper-hd-central-brace-command',
+    'helper-hd-central-brace-reply',
+    'helper-hd-central-dollar',
+    'helper-hd-central-unused-helper-argument',
+    'helper-hd-eval-no-output-conservative',
+    'helper-hd-fd0-dot-fd3',
+    'helper-hd-fd0-multiple-capture-duplicate',
+    'helper-hd-fd0-multiple-command-duplicate',
+    'helper-hd-fd0-printf-before-filename',
+    'helper-hd-fd0-printf-fd0',
+    'helper-hd-fd0-printf-path-fd0',
+    'helper-hd-fd0-source-FD3-before-filename',
+    'helper-hd-fd0-source-doublequoted-zero-input',
+    'helper-hd-fd0-source-fd0-argument-not-program',
+    'helper-hd-fd0-source-fd0-literal-positional',
+    'helper-hd-fd0-source-fd0-quoted-zero-input',
+    'helper-hd-fd0-source-fd0-trailing-DATA',
+    'helper-hd-fd0-source-fd10',
+    'helper-hd-fd0-source-fd3',
+    'helper-hd-fd0-source-fd3-attached',
+    'helper-hd-fd0-source-named-fd',
+    'helper-hd-fd0-source-plain-zero-input',
+    'helper-hd-fd0-source-prefilename-duplicate-argument',
+    'helper-hd-fd0-source-prefilename-escaped-parenthesis',
+    'helper-hd-fd0-source-prefilename-literal-input',
+    'helper-hd-fd0-source-prefilename-literal-parenthesis',
+    'helper-hd-fd0-source-quoted-zero-input',
+    'helper-hd-later-four-alias-disabled',
+    'helper-hd-later-four-alias-escaped-next',
+    'helper-hd-later-four-alias-no-trailing-blank',
+    'helper-hd-later-four-alias-quoted-next',
+    'helper-hd-later-four-alias-safe-next',
+    'helper-hd-later-four-alias-uninvoked',
+    'helper-hd-later-four-cardinality-prefix-first-safe',
+    'helper-hd-later-four-cardinality-quoted-star-second-quiet',
+    'helper-hd-later-four-cardinality-uninvoked-at-quiet',
+    'helper-hd-later-four-indexed-associative-quiet',
+    'helper-hd-later-four-indexed-null-quiet',
+    'helper-hd-later-four-indexed-rhs-data-quiet',
+    'helper-hd-later-four-neighbor-alias-colon-next-stderr-quiet',
+    'helper-hd-later-four-neighbor-alias-echo-next-stdout-quiet',
+    'helper-hd-later-four-neighbor-alias-false-next-stderr-quiet',
+    'helper-hd-later-four-neighbor-cardinality-at-out-of-range-quiet',
+    'helper-hd-later-four-neighbor-cardinality-suffix-at-last-safe',
+    'helper-hd-later-four-owner-at-attributes-data',
+    'helper-hd-later-four-owner-at-constant-guard',
+    'helper-hd-later-four-owner-at-double-escaped-literal',
+    'helper-hd-later-four-owner-at-empty-receiver',
+    'helper-hd-later-four-owner-at-escaped-literal',
+    'helper-hd-later-four-owner-at-length-scalar',
+    'helper-hd-later-four-owner-at-null-routing',
+    'helper-hd-later-four-owner-at-safe-receiver',
+    'helper-hd-later-four-owner-at-scalar-no-at',
+    'helper-hd-later-four-owner-at-singlequoted-literal',
+    'helper-hd-later-four-owner-at-stdout-captured',
+    'helper-hd-later-four-producer-tee-fd3-quiet',
+    'helper-hd-later-four-producer-tee-nonconsumer',
+    'helper-hd-later-three-alias-chain-uninvoked',
+    'helper-hd-later-three-alias-invalid-slash',
+    'helper-hd-later-three-alias-invalid-space',
+    'helper-hd-later-three-alias-punctuation-disabled',
+    'helper-hd-later-three-bracket-n-data',
+    'helper-hd-later-three-chain-disabled',
+    'helper-hd-later-three-chain-forward-use',
+    'helper-hd-later-three-chain-safe-positional-data',
+    'helper-hd-later-three-chain-same-line',
+    'helper-hd-later-three-printf-indexed-data',
+    'helper-hd-later-three-read-array-other-name-ignored',
+    'helper-hd-later-three-read-delimiter-data',
+    'helper-hd-later-three-read-initial-data',
+    'helper-hd-later-three-read-invalid-option',
+    'helper-hd-later-three-test-string-data',
+    'helper-hd-later-three-test-v-RHS-data',
+    'helper-hd-later-three-unset-function',
+    'helper-hd-owner-structural-constant-relay-HS-fd3-quiet',
+    'helper-hd-owner-structural-constant-sed-final-true-quiet',
+    'helper-hd-owner-structural-constant-sed-final-wc-quiet',
+    'helper-hd-owner-structural-constant-sed-nonmatch-quiet',
+    'helper-hd-owner-structural-constant-sed-safe-receiver',
+    'helper-hd-owner-structural-count-grep-Hh-file',
+    'helper-hd-owner-structural-count-grep-attached-e-pattern',
+    'helper-hd-owner-structural-count-grep-attached-f-pattern',
+    'helper-hd-owner-structural-count-grep-count-e-pattern-copy',
+    'helper-hd-owner-structural-count-grep-count-pattern-copy',
+    'helper-hd-owner-structural-count-grep-count-stdin-copy',
+    'helper-hd-owner-structural-count-grep-diagnostic-copy-after-null',
+    'helper-hd-owner-structural-count-grep-diagnostic-null-overwrite',
+    'helper-hd-owner-structural-count-grep-e-pattern-positional',
+    'helper-hd-owner-structural-count-grep-f-pattern',
+    'helper-hd-owner-structural-count-grep-label-no-H',
+    'helper-hd-owner-structural-count-grep-label-suppressed',
+    'helper-hd-owner-structural-count-grep-long-pattern',
+    'helper-hd-owner-structural-count-grep-long-pattern-file',
+    'helper-hd-owner-structural-count-grep-pattern-positional',
+    'helper-hd-owner-structural-count-grep-single-file-conservative',
+    'helper-hd-owner-structural-count-grep-stdin',
+    'helper-hd-owner-structural-count-grep-suppressed-file',
+    'helper-hd-owner-structural-count-grep-unknown-quiet',
+    'helper-hd-owner-structural-count-output-away',
+    'helper-hd-owner-structural-count-safe-receiver',
+    'helper-hd-owner-structural-count-wc-count-stdin-copy',
+    'helper-hd-owner-structural-count-wc-safe-file',
+    'helper-hd-owner-structural-count-wc-stdin',
+    'helper-hd-owner-structural-existing-error-word-parent-null',
+    'helper-hd-owner-structural-final-null-self-dup',
+    'helper-hd-owner-structural-final-null-self-path',
+    'helper-hd-owner-structural-final-stderr-null-copy',
+    'helper-hd-owner-structural-fragment-safe-receiver-*',
+    'helper-hd-owner-structural-fragment-safe-receiver-@',
+    'helper-hd-owner-structural-grep-count-pattern-operand',
+    'helper-hd-owner-structural-numeric-amp-append-null',
+    'helper-hd-owner-structural-numeric-amp-null',
+    'helper-hd-owner-structural-numeric-amp-null-overwrite',
+    'helper-hd-owner-structural-numeric-amp-unknown-overwrite',
+    'helper-hd-owner-structural-numeric-helper-scalar-star-safe-receiver',
+    'helper-hd-owner-structural-numeric-null-to-captured-null',
+    'helper-hd-owner-structural-numeric-return-to-captured-before-later-stderr',
+    'helper-hd-owner-structural-numeric-scalar-star-safe-receiver',
+    'helper-hd-owner-structural-numeric-shadowed-return-safe',
+    'helper-hd-owner-structural-numeric-uninvoked-numeric-shadow',
+    'helper-hd-owner-structural-plain-captured-stdout-program',
+    'helper-hd-owner-structural-plain-cat-FD3-HS-cat',
+    'helper-hd-owner-structural-plain-cat-named-FD-HS-cat',
+    'helper-hd-owner-structural-plain-file-bearing-cat',
+    'helper-hd-owner-structural-plain-file-bearing-middle-cat',
+    'helper-hd-owner-structural-plain-head-extra-input-override',
+    'helper-hd-owner-structural-plain-head-output-null',
+    'helper-hd-owner-structural-plain-input-override',
+    'helper-hd-owner-structural-plain-invalid-tee-option',
+    'helper-hd-owner-structural-plain-nonconsumer',
+    'helper-hd-owner-structural-plain-printf-assignment-head',
+    'helper-hd-owner-structural-plain-relay-HS-override',
+    'helper-hd-owner-structural-plain-runtime-cat-operand',
+    'helper-hd-owner-structural-plain-runtime-tee-option',
+    'helper-hd-owner-structural-plain-terminal-null',
+    'helper-hd-owner-structural-plain-unknown-consumer',
+    'helper-hd-owner-structural-plain-wrapped-cat',
+    'helper-hd-owner-structural-plain-wrapped-tee',
+    'helper-hd-owner-structural-read-p-nontty',
+    'helper-hd-owner-structural-required-colon',
+    'helper-hd-owner-structural-required-grep-count',
+    'helper-hd-owner-structural-required-output-closed',
+    'helper-hd-owner-structural-required-output-file',
+    'helper-hd-owner-structural-required-output-stderr',
+    'helper-hd-owner-structural-required-true',
+    'helper-hd-owner-structural-required-wc-bundle',
+    'helper-hd-owner-structural-required-wc-lines',
+    'helper-hd-owner-structural-sequence-connected-final',
+    'helper-hd-owner-structural-sequence-output-away',
+    'helper-hd-owner-structural-sequence-safe-receiver',
+    'helper-hd-owner-structural-sequence-split-uninvoked-helper',
+    'helper-hd-owner-structural-singleton-cat-file-quiet',
+    'helper-hd-owner-structural-singleton-colon-quiet',
+    'helper-hd-owner-structural-singleton-constant-transformer-safe',
+    'helper-hd-owner-structural-singleton-constant-transformer-wc',
+    'helper-hd-owner-structural-singleton-grep-count-quiet',
+    'helper-hd-owner-structural-singleton-head-output-null-quiet',
+    'helper-hd-owner-structural-singleton-printf-quiet',
+    'helper-hd-owner-structural-singleton-sed-nonmatch-quiet',
+    'helper-hd-owner-structural-singleton-tee-invalid-quiet',
+    'helper-hd-owner-structural-singleton-true-quiet',
+    'helper-hd-owner-structural-singleton-unknown-fd3-quiet',
+    'helper-hd-owner-structural-singleton-unknown-override-quiet',
+    'helper-hd-owner-structural-singleton-wc-quiet',
+    'helper-hd-owner-structural-star-mixed-second-safe-conservative',
+    'helper-hd-owner-structural-stored-definition-inert',
+    'helper-hd-owner-structural-unsolicited-numeric-exit-null',
+    'helper-hd-owner-structural-unsolicited-numeric-helper-safe-arg',
+    'helper-hd-owner-structural-unsolicited-numeric-if-false-unreached',
+    'helper-hd-owner-structural-unsolicited-numeric-inert-data',
+    'helper-hd-owner-structural-unsolicited-numeric-inner-captured-null',
+    'helper-hd-owner-structural-unsolicited-numeric-nonconsumer',
+    'helper-hd-owner-structural-unsolicited-numeric-read-nonnumeric-option-quiet',
+    'helper-hd-owner-structural-unsolicited-numeric-read-null',
+    'helper-hd-owner-structural-unsolicited-numeric-read-stderr-captured',
+    'helper-hd-owner-structural-unsolicited-numeric-receiver-null',
+    'helper-hd-owner-structural-unsolicited-numeric-return-null',
+    'helper-hd-owner-structural-unsolicited-numeric-return-stderr-captured',
+    'helper-hd-owner-structural-unsolicited-numeric-safe-receiver',
+    'helper-hd-owner-structural-unsolicited-numeric-test-null',
+    'helper-hd-owner-structural-unsolicited-numeric-test-stderr-captured',
+    'helper-hd-owner-structural-unsolicited-numeric-test-string-quiet',
+    'helper-hd-owner-structural-unsolicited-numeric-uninvoked-helper',
+    'helper-hd-owner-structural-unsolicited-numeric-unreached-after-return',
+    'helper-hd-owner-structural-unsolicited-star-braced-quoted-scalar-second',
+    'helper-hd-owner-structural-unsolicited-star-captured-scalar',
+    'helper-hd-owner-structural-unsolicited-star-escaped-inert',
+    'helper-hd-owner-structural-unsolicited-star-fixed-first-safe-quiet',
+    'helper-hd-owner-structural-unsolicited-star-high-ninth-quiet',
+    'helper-hd-owner-structural-unsolicited-star-length-scalar',
+    'helper-hd-owner-structural-unsolicited-star-mixed-third-safe-quiet',
+    'helper-hd-owner-structural-unsolicited-star-quoted-prefix-scalar-quiet',
+    'helper-hd-owner-structural-unsolicited-star-quoted-scalar-second',
+    'helper-hd-owner-structural-unsolicited-star-scalar-one-second-quiet',
+    'helper-hd-owner-structural-unsolicited-star-singlequoted-inert',
+    'helper-hd-owner-structural-unsolicited-star-stderr-null-quiet',
+    'helper-hd-owner-structural-unsolicited-star-stdout-captured-quiet',
+    'helper-hd-owner-structural-unsolicited-star-uninvoked-quiet',
+    'helper-hd-plain-cat-extra-hop-builtin-cat-quiet',
+    'helper-hd-plain-cat-extra-hop-cat-file-quiet',
+    'helper-hd-plain-cat-extra-hop-cat-null-quiet',
+    'helper-hd-plain-cat-extra-hop-non-stdin-terminal-quiet',
+    'helper-hd-plain-cat-extra-hop-nonconsumer',
+    'helper-hd-printf-captured-deferred-stdout-conservative',
+    'helper-hd-printf-captured-direct-stdout-conservative',
+    'helper-hd-printf-no-output-deferred-conservative',
+    'helper-hd-round10-sub-arithmetic-comment-control',
+    'helper-hd-round10-sub-arithmetic-escaped-opener',
+    'helper-hd-round10-sub-arithmetic-escaped-operand',
+    'helper-hd-round10-sub-arithmetic-literal-singlequote',
+    'helper-hd-round10-sub-arithmetic-safe-positional',
+    'helper-hd-round10-sub-arithmetic-valid-escaped-opener',
+    'helper-hd-round10-sub-array-escaped-opener',
+    'helper-hd-round10-sub-array-literal-singlequote',
+    'helper-hd-round10-sub-legacy-comment-control',
+    'helper-hd-round10-sub-legacy-escaped-opener',
+    'helper-hd-round10-sub-legacy-inert-suffix',
+    'helper-hd-round10-sub-legacy-literal-singlequote',
+    'helper-hd-round10-sub-nonarithmetic-quoted-positional',
+    'helper-hd-round10-sub-primitive-inert-suffix',
+    'helper-hd-round10-sub-substring-unset-conservative',
+    'helper-hd-round11-adjacent-declare-index',
+    'helper-hd-round11-adjacent-let',
+    'helper-hd-round11-adjacent-local-index',
+    'helper-hd-round11-assignment-argument',
+    'helper-hd-round11-assignment-comment',
+    'helper-hd-round11-assignment-declare',
+    'helper-hd-round11-assignment-escaped-dollar',
+    'helper-hd-round11-assignment-nested',
+    'helper-hd-round11-assignment-prefix',
+    'helper-hd-round11-assignment-tail-inert',
+    'helper-hd-round11-assignment-value-inert',
+    'helper-hd-round11-assignment-whole-quoted',
+    'helper-hd-round11-command-comment',
+    'helper-hd-round11-command-escaped-dollar',
+    'helper-hd-round11-command-inert',
+    'helper-hd-round11-command-outer-doublequote',
+    'helper-hd-round11-command-safe-positional',
+    'helper-hd-round11-command-tail-inert',
+    'helper-hd-round11-prefix-arithmetic-after-redir',
+    'helper-hd-round11-prefix-array-DATA-prefix',
+    'helper-hd-round11-prefix-builtin-arith',
+    'helper-hd-round11-prefix-builtin-index',
+    'helper-hd-round11-prefix-command-arith',
+    'helper-hd-round11-prefix-command-index',
+    'helper-hd-round11-prefix-function-prefix',
+    'helper-hd-round11-prefix-if-adjacent-tail',
+    'helper-hd-round11-prefix-if-escaped-prefix',
+    'helper-hd-round11-prefix-if-quoted-prefix',
+    'helper-hd-round11-prefix-time-quoted-data',
+    'helper-hd-round11-time-builtin-time',
+    'helper-hd-round11-time-command-time',
+    'helper-hd-round11-time-env-time',
+    'helper-hd-round11-time-escaped-time',
+    'helper-hd-round11-time-later-argument',
+    'helper-hd-round11-time-path-time',
+    'helper-hd-round11-time-quoted-p',
+    'helper-hd-round11-time-quoted-time',
+    'helper-hd-round11-time-quoted-time-data',
+    'helper-hd-round11-time-time-printf-quoted-data',
+    'helper-hd-round11-time-unknown-option',
+    'helper-hd-round4-arithmetic-safe-conservative',
+    'helper-hd-round5-array-length-index-diagnostic',
+    'helper-hd-round5-array-safe-positional-conservative',
+    'helper-hd-round5-case-captured-stdout-conservative',
+    'helper-hd-round5-case-no-output-conservative',
+    'helper-hd-round5-complex-tail-inert-positional-conservative',
+    'helper-hd-round5-named-substring-diagnostic',
+    'helper-hd-round5-substring-safe-positional-conservative',
+    'helper-hd-round6-legacy-nested-legacy',
+    'helper-hd-round6-legacy-operand-escaped',
+    'helper-hd-round6-legacy-safe-positional',
+    'helper-hd-round7-backtick-escaped-comment-captured',
+    'helper-hd-round7-backtick-singlequote-source',
+    'helper-hd-round7-command-substitution-captured',
+    'helper-hd-round7-command-substitution-singlequote',
+    'helper-hd-round7-error-substitution-literal-source',
+    'helper-hd-round7-modern-escaped-operand',
+    'helper-hd-round7-parameter-substring-unset-singlequote',
+    'helper-hd-round9-nested-cat-captured',
+    'helper-hd-round9-nested-cat-escaped-positional',
+    'helper-hd-round9-nested-cat-quoted-delimiter',
+    'helper-hd-round9-nested-printf-inert',
+    'helper-hd-round9-nested-read-stores',
+    'helper-hd-routing-alias-disabled',
+    'helper-hd-routing-alias-stdout-dot',
+    'helper-hd-routing-alias-stdout-source',
+    'helper-hd-routing-alias-uninvoked',
+    'helper-hd-routing-arith-null-dot',
+    'helper-hd-routing-arith-null-source',
+    'helper-hd-routing-assign-printf-dot',
+    'helper-hd-routing-assign-printf-source',
+    'helper-hd-routing-colon-dot',
+    'helper-hd-routing-command-overwritten-null',
+    'helper-hd-routing-declare-index-stderr-null',
+    'helper-hd-routing-direct-stdout-fd2-null',
+    'helper-hd-routing-dup-to-fd2-null-before',
+    'helper-hd-routing-emit-uninvoked-quiet',
+    'helper-hd-routing-func-stdout-dot',
+    'helper-hd-routing-func-stdout-source',
+    'helper-hd-routing-function-cyclic',
+    'helper-hd-routing-function-index-mismatch',
+    'helper-hd-routing-function-index1-safe',
+    'helper-hd-routing-function-safe',
+    'helper-hd-routing-function-uninvoked',
+    'helper-hd-routing-helper-arith-null-quiet',
+    'helper-hd-routing-helper-index-null-quiet',
+    'helper-hd-routing-helper-quoted-guard-safe',
+    'helper-hd-routing-helper-stderr-null',
+    'helper-hd-routing-index-null-dot',
+    'helper-hd-routing-index-null-source',
+    'helper-hd-routing-later-emitter-definition-quiet',
+    'helper-hd-routing-nested-capture-dot',
+    'helper-hd-routing-nested-capture-source',
+    'helper-hd-routing-nonconsumer-trace-quiet',
+    'helper-hd-routing-null-quoted-path-quiet',
+    'helper-hd-routing-override-before-call-quiet',
+    'helper-hd-routing-printf-index-stderr-null',
+    'helper-hd-routing-program-xtrace-future',
+    'helper-hd-routing-quoted-redirection-data',
+    'helper-hd-routing-receiver-command-null',
+    'helper-hd-routing-receiver-empty-arg',
+    'helper-hd-routing-receiver-expansion-null',
+    'helper-hd-routing-receiver-index-mismatch',
+    'helper-hd-routing-receiver-literal-safe',
+    'helper-hd-routing-receiver-multiple-safe',
+    'helper-hd-routing-receiver-safe-escaped-close',
+    'helper-hd-routing-receiver-safe-quoted-close',
+    'helper-hd-routing-receiver-stdout-null',
+    'helper-hd-routing-receiver-token-second',
+    'helper-hd-routing-stdout-dot',
+    'helper-hd-routing-trace-disable-quiet',
+    'helper-hd-routing-trace-sibling-quiet',
+    'helper-hd-routing-typeset-index-stderr-null',
+    'helper-hd-routing-uninvoked-helper-arithmetic',
+    'helper-hd-routing-uninvoked-helper-two-statements',
+    'helper-hd-siblings-.-quiet-fd3',
+    'helper-hd-siblings-declare-existing-DATA',
+    'helper-hd-siblings-nonconsumer-cat',
+    'helper-hd-siblings-nonconsumer-printf',
+    'helper-hd-siblings-printf-repeated-safe-last',
+    'helper-hd-siblings-quiet-cat-fd3-producer',
+    'helper-hd-siblings-quiet-declare-associative-explicit',
+    'helper-hd-siblings-quiet-declare-f',
+    'helper-hd-siblings-quiet-declare-p',
+    'helper-hd-siblings-quiet-declare-value-data',
+    'helper-hd-siblings-quiet-devfd0-program-noop-positional',
+    'helper-hd-siblings-quiet-devfd0-program-stdout-captured',
+    'helper-hd-siblings-quiet-export',
+    'helper-hd-siblings-quiet-getopts',
+    'helper-hd-siblings-quiet-let',
+    'helper-hd-siblings-quiet-nonconsumer-fd0',
+    'helper-hd-siblings-quiet-process-other-filename',
+    'helper-hd-siblings-quiet-process-prefix-path-concatenation',
+    'helper-hd-siblings-quiet-process-printf-assigned',
+    'helper-hd-siblings-quiet-process-program-noop-positional',
+    'helper-hd-siblings-quiet-process-program-stdout-captured',
+    'helper-hd-siblings-quiet-process-suffix-path-concatenation',
+    'helper-hd-siblings-quiet-read-a',
+    'helper-hd-siblings-quiet-readonly',
+    'helper-hd-siblings-quiet-trailing-disabled',
+    'helper-hd-siblings-quiet-trailing-escaped',
+    'helper-hd-siblings-quiet-trailing-forward-use',
+    'helper-hd-siblings-quiet-trailing-no-trailing-blank',
+    'helper-hd-siblings-quiet-trailing-safe-prefix',
+    'helper-hd-siblings-quiet-trailing-same-line',
+    'helper-hd-siblings-quiet-trailing-uninvoked',
+    'helper-hd-siblings-quiet-typeset-f',
+    'helper-hd-siblings-quiet-typeset-p',
+    'helper-hd-siblings-quiet-wait-n-p',
+    'helper-hd-siblings-source-quiet-fd3',
+    'helper-hd-siblings-trailing-quoted-nextword',
+    'helper-hd-substitution-quoted-data-control',
+    'helper-hd-tee-relay-pipeline-bound-invalid-runtime-option',
+    'helper-hd-tee-relay-pipeline-help',
+    'helper-hd-tee-relay-pipeline-inputoverride',
+    'helper-hd-tee-relay-pipeline-invalidoption',
+    'helper-hd-tee-relay-pipeline-nonconsumer',
+    'helper-hd-tee-relay-pipeline-nontee-consumer',
+    'helper-hd-tee-relay-pipeline-nullrelay',
+    'helper-hd-tee-relay-pipeline-unsupported-builtin-relay',
+    'helper-hd-three-alias-after-enable-qu',
+    'helper-hd-three-alias-after-enable-uq',
+    'helper-hd-three-alias-os',
+    'helper-hd-three-alias-p',
+    'helper-hd-three-alias-q',
+    'helper-hd-three-alias-qsu',
+    'helper-hd-three-alias-qsx',
+    'helper-hd-three-alias-qu',
+    'helper-hd-three-alias-qus',
+    'helper-hd-three-alias-uq',
+    'helper-hd-three-alias-xqs',
+    'helper-hd-three-brace-literal-positional',
+    'helper-hd-three-brace-reply-literal-positional',
+    'helper-hd-three-herestring-noop',
+    'helper-hd-three-herestring-printf',
+    'helper-hd-three-herestring-read',
+    'helper-hd-three-herestring-source-literal',
+    'helper-hd-three-herestring-source-nonstdin',
+    'helper-heredoc-backtick-2-backslashes',
+    'helper-heredoc-backtick-3-backslashes',
+    'helper-heredoc-backtick-quoted-positional-data-control',
+    'helper-heredoc-modern-substitution-escaped-control',
+    'helper-heredoc-positional-substitution-quoted-data',
+})
+
+CORPUS = [
+    (cid, MUST_FLAG if cid in HEREDOC_SUBSTITUTION_CONSERVATIVE_CASES or cid in ('helper-hd-round9-attributes-ordinary-a', 'helper-hd-round9-attributes-fallback-a') or cid in ('helper-hd-round11-command-depth-two', 'helper-hd-round11-assignment-depth-two', 'helper-hd-eval-depth-two-boundary', 'helper-hd-round9-nested-backtick-depth-two-boundary', 'helper-hd-round10-sub-arithmetic-deferred-child-two-boundary', 'helper-hd-owner-structural-unsolicited-numeric-second-deferred-child', 'helper-hd-owner-structural-unsolicited-star-second-deferred-child', 'helper-hd-owner-structural-nested-capture-opaque') else rule, body)
+    for cid, rule, body in CORPUS
+]
+KNOWN_BROADER.update({cid: HEREDOC_SUBSTITUTION_CONSERVATISM
+                      for cid in HEREDOC_SUBSTITUTION_CONSERVATIVE_CASES})
+for _resolved_hd_miss in ('helper-hd-round11-command-depth-two', 'helper-hd-round11-assignment-depth-two', 'helper-hd-eval-depth-two-boundary', 'helper-hd-round9-nested-backtick-depth-two-boundary', 'helper-hd-round10-sub-arithmetic-deferred-child-two-boundary', 'helper-hd-owner-structural-unsolicited-numeric-second-deferred-child', 'helper-hd-owner-structural-unsolicited-star-second-deferred-child', 'helper-hd-owner-structural-nested-capture-opaque'):
+    KNOWN_MISSES.pop(_resolved_hd_miss, None)
+KNOWN_MISSES["helper-hd-round7-backtick-comment-nested-parameter"] = (
+    "Inherited-main positional-regex limit: ${1:-unknown} alone inside this "
+    "backtick does not match main9f _POSITIONAL_RE. The unchanged predicate "
+    "is restored under owner decision6156188282; no parameter-evaluation "
+    "fallback is added inside substitutions. "
+    "https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6156188282"
+)
+KNOWN_BROADER["helper-hd-central-unknown-stdin-data"] = (
+    "Unknown consumer DATA is not proven inert; the literal owner has no "
+    "known stdin behavior. The sampled missing command is quiet, but the "
+    "owner-approved outer boundary stays conservative without a runtime "
+    "binding/input model. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6156188282"
+)
+CORPUS = [(cid, MUST_NOT_FLAG if cid == "helper-hd-round7-backtick-comment-nested-parameter" else rule, body)
+          for cid, rule, body in CORPUS]
+
+
+KNOWN_BROADER.update({cid: (
+    "Inherited-main ordinary-reader conservatism: exact positional @a is "
+    "attributes-only in the sampled runtime, but main9f positional readers "
+    "retain it. Their unchanged AST/signatures are restored under owner "
+    "decision6156188282; this is outside the substitution class and no "
+    "ordinary redaction cleanup is retained by #1496. "
+    "https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6156188282"
+) for cid in ('helper-hd-round9-attributes-ordinary-a', 'helper-hd-round9-attributes-fallback-a')})
+
+
 def _corpus_id_cases():
     """Every corpus id is UNIQUE, and every declared id names a real case.
 
@@ -13493,480 +12864,15 @@ def _function_definition_cases():
     return failures
 
 
-def _heredoc_backtick_positional_cases():
-    """Pin the backtick source layer and ordinary/heredoc boundaries."""
+def _heredoc_conservatism_cases():
+    """The central contract has no role, invocation, argument or depth model."""
     failures = []
-    for raw, decoded in [
-        (r"\$1", "$1"), (r"\\$1", r"\$1"),
-        (r"\`", "`"), (r"\x", r"\x"), ("a\\\nb", "ab"),
-    ]:
-        if _backtick_positional_source(raw) != decoded:
-            failures.append("backtick positional source decoding: " + repr(raw))
-    leaking = r"`printf '%s' \$1`"
-    for read in (_word_has_verbatim_positional_exact, _word_has_verbatim_positional_legacy):
-        if not read(leaking, in_heredoc=True):
-            failures.append("backtick heredoc positional lost: " + read.__name__)
-        for raw in [r"\$1", r"$(printf '%s' \$1)", r"`printf '%s' '$1'`"]:
-            if read(raw, in_heredoc=True):
-                failures.append("backtick context consumed plain/quoted DATA: " + read.__name__)
-        if read(leaking):
-            failures.append("backtick repair changed default ordinary reader")
-        if not read(r"`printf '%s' '$1'` $1", in_heredoc=True):
-            failures.append("backtick source boundary swallowed following positional")
-    if not _word_has_verbatim_positional("${A:-${B:-x}} " + leaking, in_heredoc=True):
-        failures.append("backtick positional lost through legacy fallback")
-    return failures
-
-
-def _heredoc_deferred_positional_cases():
-    """Pin reuse, one-hop depth and stdin/substitution owner separation."""
-    failures = []
-    for body in ["eval 'echo $1'", "trap 'echo $1' EXIT", "mapfile -C 'echo $1;' -c 1 rows"]:
-        if not _heredoc_substitution_has_positional(body):
-            failures.append("heredoc deferred positional source lost: " + body)
-    for body in ["printf %s '$1'", "eval 'echo ${1:+set}'", "mapfile -C 'printf literal;' -c 1 rows"]:
-        if _heredoc_substitution_has_positional(body):
-            failures.append("heredoc deferred literal/redacted DATA promoted: " + body)
-    if not _heredoc_substitution_has_positional("eval ': $1'"):
-        failures.append("heredoc no-output source lost declared conservatism")
-    if _heredoc_substitution_has_positional('eval "eval \'echo \\$1\'"'):
-        failures.append("heredoc deferred source exceeded the one-hop budget")
-    if _heredoc_substitution_has_positional("eval 'echo $1'", _depth=_DEFERRED_SHELL_DEPTH):
-        failures.append("heredoc deferred boundary admitted another source hop")
-    for read in (_word_has_verbatim_positional_exact, _word_has_verbatim_positional_legacy):
-        if not read("`eval 'echo $1'`", in_heredoc=True):
-            failures.append("heredoc deferred reader seam lost: " + read.__name__)
-    def helper(owner, body):
-        return "die() { " + owner + " <<EOF\n" + body + "\nEOF\n}\n"
-    for owner in ["printf safe", "echo safe"]:
-        if "die" in discover_emitter_helpers(helper(owner, "${1:-unknown}")):
-            failures.append("inert heredoc DATA promoted argument emitter: " + owner)
-        for body in ['$(echo "$1" >&2)', "${UNSET:?$1}", "$(eval 'echo $1 >&2')"]:
-            if "die" not in discover_emitter_helpers(helper(owner, body)):
-                failures.append("independent heredoc source/error evidence lost: " + owner)
-    for owner in ["cat", "tee"]:
-        if "die" not in discover_emitter_helpers(helper(owner, "${1:-unknown}")):
-            failures.append("stdin heredoc positional lost: " + owner)
-    return failures
-
-
-def _heredoc_shadow_continuation_arithmetic_cases():
-    """Pin continuation, diagnostic expansion and unchanged default readers."""
-    failures = []
-    for slashes in [1, 2, 3]:
-        raw = "$" + "\\" * slashes + "\n(echo $1)"
-        wanted = "$(echo $1)" if slashes == 1 else (raw if slashes == 2 else "$\\\\(echo $1)")
-        if _heredoc_continuation_text(raw) != wanted:
-            failures.append("heredoc continuation parity: " + str(slashes))
-    raw = "x $((1 / $1)) y"
-    start, end = raw.index("$"), raw.rindex(")") + 1
-    for read in (_find_substitutions_exact, _find_substitutions_legacy):
-        if read(raw):
-            failures.append("default expansion inventory changed: " + read.__name__)
-        spans = read(raw, include_arithmetic=True)
-        if spans != [(raw[start + 2:end - 1], start, end)]:
-            failures.append("opt-in arithmetic boundary: " + read.__name__)
-    if _find_substitutions(raw):
-        failures.append("default shared expansion inventory admitted arithmetic")
-    seg = Lexer('command true "$GH_TOKEN"').logical[0].segments[0]
-    if classify(seg, set()) != SAFE:
-        failures.append("default command classification changed")
-    def helper(owner, body):
-        return "die() { " + owner + " <<EOF\n" + body + "\nEOF\n}\n"
-    for body in ['$\\\n(echo "$1" >&2)', '$\\\n{UNSET:?$1}', '$((1 / $1))']:
-        if "die" not in discover_emitter_helpers(helper("printf safe", body)):
-            failures.append("independent continued/diagnostic HD evidence lost: " + repr(body))
-    return failures
-
-
-def _heredoc_parameter_case_diagnostic_cases():
-    """Pin the bounded diagnostic opt-in and conservative refusal evidence."""
-    failures = []
-    parameter = "${1:1/$1}"
-    case = '$(case x in x) echo "$1" >&2;; esac)'
-    for reader in (_find_substitutions_exact, _find_substitutions_legacy):
-        if reader(parameter):
-            failures.append("default parameter inventory changed: " + reader.__name__)
-        if reader(parameter, include_arithmetic=True) != [("1/$1", 0, len(parameter))]:
-            failures.append("parameter operand boundary: " + reader.__name__)
-        if reader(case, include_arithmetic=True) != [(case[2:], 0, len(case))]:
-            failures.append("unproven command tail boundary: " + reader.__name__)
-    for raw in ["${1}", "${1:-unknown}", "${1:+literal}"]:
-        if _heredoc_diagnostic_span(raw, 0) is not None:
-            failures.append("inert parameter DATA admitted as arithmetic: " + raw)
-    for raw in ['${1:1/$1}', '${a[1/$1]}', case, "'${1:1/$1}'"]:
-        text = "die() { printf safe <<EOF\n" + raw + "\nEOF\n}\n"
-        if "die" not in discover_emitter_helpers(text):
-            failures.append("parameter/case diagnostic source lost: " + raw)
-    # A known command-substitution opener does not make the whole tail executable.
-    # This deliberately pins conservative refusal, including inert trailing DATA.
-    quiet = '$(case x in x) echo literal;; esac) $1'
-    span = _heredoc_diagnostic_span(quiet, 0)
-    if span != (quiet[2:], 0, len(quiet)):
-        failures.append("conservative tail boundary changed")
-    return failures
-
-
-
-def _heredoc_legacy_arithmetic_cases():
-    """Legacy arithmetic is opt-in, bounded and read in heredoc context."""
-    failures = []
-    for expression in ['$[1 / $1]', '$[a[0] + 1 / $1]', '$[1 / "$1"]',
-                       "$[1 / '$1']", '$[1 + "]"]', '$[1 / $[1 / $1]]']:
-        raw = 'x ' + expression + ' $1'
-        start, end = 2, 2 + len(expression)
-        expected = [(expression[2:-1], start, end)]
-        for reader in (_find_substitutions, _find_substitutions_exact,
-                       _find_substitutions_legacy):
-            if reader(raw):
-                failures.append("default legacy inventory changed: " + reader.__name__)
-            if reader(raw, include_arithmetic=True) != expected:
-                failures.append("legacy operand boundary: " + reader.__name__ + expression)
-        for reader in (_find_compound_close, _find_compound_close_exact,
-                       _find_compound_close_legacy):
-            if reader(raw, start + 1) is not None:
-                failures.append("default compound boundary changed: " + reader.__name__)
-            if reader(raw, start + 1, bracket_span=True) != end - 1:
-                failures.append("opt-in bracket boundary: " + reader.__name__ + expression)
-    for raw in [r'\$[1 / $1]', "'$[1 / $1]'"]:
-        if _find_substitutions(raw, include_arithmetic=True):
-            failures.append("quoted/escaped legacy opener admitted: " + raw)
-    return failures
-
-
-
-def _heredoc_boundary_context_cases():
-    """Opt-in HD boundaries retain ordinary source and default reader context."""
-    failures = []
-    raw = '`# \\`\necho "$1" >&2`'
-    for reader in (_find_substitutions, _find_substitutions_exact,
-                   _find_substitutions_legacy):
-        if reader(raw, include_arithmetic=True) != [(raw[1:-1], 0, len(raw))]:
-            failures.append("escaped backtick HD boundary: " + reader.__name__)
-        if reader(raw) != [(raw[1:4], 0, 5)]:
-            failures.append("default backtick boundary changed: " + reader.__name__)
-    raw = '${UNSET:?"}"$1}'
-    if _error_word_spans(raw) != [(9, 10)]:
-        failures.append("default error-word boundary changed")
-    if _error_word_spans(raw, in_heredoc=True) != [(9, len(raw) - 1)]:
-        failures.append("quoted error-word HD boundary")
-    for raw in ['${UNSET:?${OTHER:-"}"}$1}', "${UNSET:?$(printf '}')$1}"]:
-        if _error_word_spans(raw, in_heredoc=True)[0] != (9, len(raw) - 1):
-            failures.append("nested error-word HD boundary: " + raw)
-    for raw in ["$((1 / '$1'))", "${a[1/'$1']}"]:
-        text = 'die() { printf safe <<EOF\n' + raw + '\nEOF\n}\n'
-        if 'die' not in discover_emitter_helpers(text):
-            failures.append("arithmetic HD quote context: " + raw)
-    for raw in ["$(printf '%s' '$1' >&2)", "`printf '%s' '$1' >&2`",
-                '${UNSET:?$(printf "%s" \'$1\')}', r'\${UNSET:?"}"$1}']:
-        text = 'die() { printf safe <<EOF\n' + raw + '\nEOF\n}\n'
-        if 'die' in discover_emitter_helpers(text):
-            failures.append("ordinary source/inert HD context changed: " + raw)
-    return failures
-
-
-
-def _heredoc_opaque_owner_cases():
-    """Only existing opaque classification expands direct HD data admission."""
-    failures = []
-    for owner, raw, delimiter, expected in [
-            ('"$c"', '$1', 'EOF', True),
-            ('"$c"', "'$1'", 'EOF', True),
-            ('eval cat', '$1', 'EOF', True),
-            ('"$c"', r'\$1', 'EOF', False),
-            ('"$c"', '$1', "'EOF'", False),
-            ('printf safe', '$1', 'EOF', False),
-            ('echo safe', '$1', 'EOF', False),
-            ('read x', '$1', 'EOF', False)]:
-        text = 'die(){ ' + owner + ' <<' + delimiter + '\n' + raw + '\nEOF\n}\n'
-        if ('die' in discover_emitter_helpers(text)) != expected:
-            failures.append("opaque/direct HD admission boundary: " + repr((owner, raw, delimiter)))
-    return failures
-
-
-
-def _heredoc_guard_nested_attributes_cases():
-    """Positional guards are opt-in; HD and deferred inventory share depth one."""
-    failures = []
-    raw = '${2:?"}"$1}'
-    if error_word_expansion_at(raw, 0) or _error_word_spans(raw):
-        failures.append("ordinary positional error guard changed")
-    if not error_word_expansion_at(raw, 0, allow_positionals=True):
-        failures.append("HD positional error guard missing")
-    if _error_word_spans(raw, in_heredoc=True) != [(5, len(raw) - 1)]:
-        failures.append("HD positional WORD start/boundary missing")
-    for reader in (_word_has_verbatim_positional, _word_has_verbatim_positional_exact,
-                   _word_has_verbatim_positional_legacy):
-        for hd in (False, True):
-            if reader('${1@a}', in_heredoc=hd):
-                failures.append("attributes-only positional admitted: " + reader.__name__)
-            for raw in ('${1@A}', '${1@Q}'):
-                if not reader(raw, in_heredoc=hd):
-                    failures.append("value transform suppressed: " + reader.__name__ + raw)
-    inner = "cat <<INNER >&2\n'$1'\nINNER\n"
-    if not _heredoc_substitution_has_positional(inner):
-        failures.append("nested interpolating HD inventory missing")
-    if _heredoc_substitution_has_positional(inner, _DEFERRED_SHELL_DEPTH):
-        failures.append("nested HD inventory exceeds one-hop budget")
-    if _heredoc_substitution_has_positional("eval 'echo $1'", _DEFERRED_SHELL_DEPTH):
-        failures.append("deferred inventory exceeds shared one-hop budget")
-    if not _heredoc_substitution_has_positional('echo "$1"', _DEFERRED_SHELL_DEPTH):
-        failures.append("existing ordinary-source check/order changed at depth bound")
-    return failures
-
-
-
-def _heredoc_indirect_source_arithmetic_cases():
-    """Only HD guards opt into !; only executable arithmetic gets its context."""
-    failures = []
-    for raw in ('${!x:?$1}', '${!2:?$1}'):
-        if error_word_expansion_at(raw, 0) or _error_word_spans(raw):
-            failures.append("ordinary indirect guard defaults changed: " + raw)
-        if not error_word_expansion_at(raw, 0, allow_positionals=True):
-            failures.append("HD indirect guard missing: " + raw)
-        if _error_word_spans(raw, in_heredoc=True) != [(6, len(raw) - 1)]:
-            failures.append("HD indirect WORD endpoint changed: " + raw)
-    for raw in ('${#x:?$1}', '${!x:-$1}'):
-        if error_word_expansion_at(raw, 0, allow_positionals=True):
-            failures.append("nonguard admitted by HD opt-in: " + raw)
-    for source in ("echo $((1/'$1'))", "echo $[1 / '$1']", "echo ${a[1/'$1']}"):
-        if not _heredoc_substitution_has_positional(source):
-            failures.append("actual arithmetic source context missing: " + source)
-        if not _heredoc_substitution_has_positional(source, _DEFERRED_SHELL_DEPTH):
-            failures.append("primitive arithmetic wrongly spends a child hop: " + source)
-    for source in ("echo '$((1/$1))'", "echo '$[1/$1]'", "echo '${a[1/$1]}'",
-                   "# $((1/'$1'))\necho literal", "# $[1/'$1']\necho literal",
-                   "echo $[1 + 2] '$1'", "echo '$1'", r'echo $((1/\$1))'):
-        if _heredoc_substitution_has_positional(source):
-            failures.append("nonexecuting/literal arithmetic context changed: " + source)
-    return failures
-
-
-def _heredoc_command_index_context_cases():
-    """Only bounded, already-unquoted arithmetic roles opt into HD semantics."""
-    failures = []
-    samples = ((" ((1/'$1')) ", ("command", 1, 3, 9, 11)),
-               ("a['$1']=value", ("index", 1, 2, 6, 7)),
-               ("a[1/'$1]']=value", ("index", 1, 2, 9, 10)))
-    for source, span in samples:
-        if Lexer(source).arithmetic_context_spans:
-            failures.append("ordinary Lexer admitted arithmetic metadata: " + source)
-        if Lexer(source, arithmetic_contexts=True).arithmetic_context_spans != [span]:
-            failures.append("actual arithmetic coordinate bounds changed: " + source)
-        if not _heredoc_substitution_has_positional(source, _DEFERRED_SHELL_DEPTH):
-            failures.append("reached arithmetic wrongly spends child depth: " + source)
-    for source in ("printf '%s' '((1/$1))'", "printf '%s' a['$1']=value",
-                   "# ((1/'$1'))\nprintf safe", "# a['$1']=value\nprintf safe",
-                   "args=(a['$1']=value)", "a[1+2]='$1'",
-                   "((1+2)); printf '%s' '$1'", "a[1+2]=value; printf '%s' '$1'"):
-        if _heredoc_substitution_has_positional(source):
-            failures.append("literal/argument/RHS/tail arithmetic context changed: " + source)
-    if Lexer("args=(a['$1']=value)", arithmetic_contexts=True).arithmetic_context_spans:
-        failures.append("array assignment DATA admitted as executable index")
-    for program in ("if time ((1/'$1'));then :;fi", "! time ((1/'$1'))",
-                    "time a['$1']=value", "time -p a['$1']=value"):
-        if not _heredoc_substitution_has_positional(program):
-            failures.append("literal time arithmetic role missing: " + program)
-    for program in ("'time' ((1/'$1'))", "ti\\me ((1/'$1'))",
-                    "command time ((1/'$1'))", "builtin time ((1/'$1'))",
-                    "env time ((1/'$1'))", "/usr/bin/time ((1/'$1'))",
-                    "time '-p' ((1/'$1'))", "time -x ((1/'$1'))",
-                    "time printf '%s' '((1/$1))'"):
-        if _heredoc_substitution_has_positional(program):
-            failures.append("opaque/data time prefix admitted as arithmetic: " + program)
-    return failures
-
-
-
-def _heredoc_for_alias_context_cases():
-    """The two bounded regressions retain literal/source and child fences."""
-    failures = []
-    for source in ("for ((x=1/'$1'; x; x--)); do :; done",
-                   "for ((x=1; 1/'$1'; x--)); do :; done",
-                   "for ((x=1; x; x=1/'$1')); do :; done"):
-        if Lexer(source).arithmetic_context_spans:
-            failures.append("default C-for metadata changed: " + source)
-        if not _heredoc_substitution_has_positional(source, _DEFERRED_SHELL_DEPTH):
-            failures.append("reached C-for diagnostic spent a child hop: " + source)
-    source = 'shopt -s expand_aliases\nalias emit_value=\'echo "$1" >&2\'\nemit_value'
-    if not _heredoc_substitution_has_positional(source):
-        failures.append("invoked literal alias replacement missing")
-    if _heredoc_substitution_has_positional(source, _DEFERRED_SHELL_DEPTH):
-        failures.append("alias replacement bypassed the existing child stop")
-    for source in ("printf '%s' 'for ((1/$1;1;1))'",
-                   "args=('for ((1/$1;1;1))')",
-                   'shopt -u expand_aliases\nalias emit_value=\'echo "$1" >&2\'\nemit_value',
-                   'shopt -s expand_aliases\nalias emit_value=\'echo "$1" >&2\'\n:'):
-        if _heredoc_substitution_has_positional(source):
-            failures.append("inert/disabled/uninvoked source changed: " + source)
-    return failures
-
-
-
-def _heredoc_three_regression_cases():
-    """Portable seams and statically inventoried Bash 5.3 source roles."""
-    failures = []
-    for expression in ('${ echo "$1" >&2; }', '${| echo "$1" >&2; }'):
-        body = 'die(){ printf safe <<EOF\n' + expression + '\nEOF\n}\ndie "$GH_TOKEN"\n'
-        if not scan_text(body, "brace-command")[0]:
-            failures.append("Bash 5.3 brace helper source missing: " + expression)
-        if not _heredoc_substitution_has_positional(expression, _DEFERRED_SHELL_DEPTH):
-            failures.append("reached brace source spent/reset child depth: " + expression)
-        if _find_substitutions(expression):
-            failures.append("ordinary substitution-reader default changed: " + expression)
-    for program in ("${ echo '$1' >&2; }", "${| echo '$1' >&2; }",
-                    "printf '%s' '${ echo \"$1\" >&2; }'",
-                    "source /dev/null <<< 'echo \"$1\" >&2'",
-                    "printf safe <<< 'echo \"$1\" >&2'"):
-        if _heredoc_substitution_has_positional(program):
-            failures.append("literal/non-evaluating source boundary changed: " + program)
-    source = 'source /dev/stdin <<< \'echo "$1" >&2\''
-    if not _heredoc_substitution_has_positional(source):
-        failures.append("literal source here-string missing")
-    if _heredoc_substitution_has_positional(source, _DEFERRED_SHELL_DEPTH):
-        failures.append("literal source here-string bypassed child stop")
-    for flags, expected in (("-qs", True), ("-sq", True), ("-qu", False),
-                            ("-q", None), ("-qsx", None), ("-qsu", None), ("-os", None)):
-        lx = Lexer("shopt " + flags + " expand_aliases")
-        seg = lx.logical[0].segments[0]
-        if _shopt_expand_aliases_delta(seg) is not expected:
-            failures.append("literal shopt alias mode changed: " + flags)
-    return failures
-
-
-
-def _heredoc_later_three_cases():
-    """Finite builtin roles and existing alias graph retain their boundaries."""
-    failures = []
-    for program in ("declare -a a; test -v 'a[1/$1]'",
-                    "declare -a a; [[ -v 'a[1/$1]' ]]",
-                    "declare -a a; unset 'a[1/$1]'",
-                    "declare -a a; read -r 'a[1/$1]' <<<x"):
-        if not _heredoc_substitution_has_positional(program, _DEFERRED_SHELL_DEPTH):
-            failures.append("builtin diagnostic wrongly spent a child hop: " + program)
-    for name in ("leak+", "leak@", "leak%", "leak,", "1", "!", "{name}"):
-        if _HEREDOC_ALIAS_RE.match(name + "=echo") is None:
-            failures.append("valid literal alias name rejected: " + name)
-    for name in ("bad/name", "bad name", "bad$name", "bad`name", "bad\\name",
-                 "bad'name", 'bad"name', "bad|name", "bad&name", "bad;name",
-                 "bad(name", "bad)name", "bad<name", "bad>name"):
-        if _HEREDOC_ALIAS_RE.match(name + "=echo") is not None:
-            failures.append("invalid literal alias name accepted: " + name)
-    program = "shopt -s expand_aliases\nalias outer=inner\nalias inner='echo \"$1\" >&2'\nouter\n"
-    if _heredoc_substitution_has_positional(program, _DEFERRED_SHELL_DEPTH):
-        failures.append("alias graph bypassed existing child stop")
-    return failures
-
-
-def _heredoc_fd0_binding_cases():
-    """Physical IO_NUMBER context never consumes a numeric input as a prefix."""
-    failures = []
-    for program in ("source /dev/stdin 0<<< 'echo \"$1\" >&2'",
-                    ". /dev/stdin 0<<<'echo \"$1\" >&2'",
-                    "source /dev/stdin 00<<< 'echo \"$1\" >&2'"):
-        if not _heredoc_substitution_has_positional(program):
-            failures.append("physical stdin here-string missing: " + program)
-        if _heredoc_substitution_has_positional(program, _DEFERRED_SHELL_DEPTH):
-            failures.append("physical stdin here-string bypassed child stop: " + program)
-        if hasattr(Lexer(program), "herestring_source_positions"):
-            failures.append("default Lexer metadata changed: " + program)
-    for program in ("source /dev/stdin 3<<< 'echo \"$1\" >&2'",
-                    "source /dev/stdin {fd}<<< 'echo \"$1\" >&2'",
-                    "source /dev/stdin <<< '0' 'echo \"$1\" >&2'",
-                    "source /dev/stdin <<< 0 'echo \"$1\" >&2'",
-                    "source /dev/stdin 0<<< '0' 'echo \"$1\" >&2'",
-                    "printf /dev/stdin 0<<< 'echo \"$1\" >&2'"):
-        if _heredoc_substitution_has_positional(program):
-            failures.append("nonstdin/non-evaluating/actual numeric operand changed: " + program)
-    program = "source 0<<< 'echo \"$1\" >&2' /dev/stdin)"
-    if _heredoc_substitution_has_positional(program):
-        failures.append("naked close gained an actual-substitution certificate")
-    if not _heredoc_substitution_has_positional(program, _outer_substitution=True):
-        failures.append("owned filename boundary missing in actual substitution")
-    for path in ("'/dev/stdin)'", "/dev/stdin\\)"):
-        program = "source 0<<< 'echo \"$1\" >&2' " + path + ")"
-        if _heredoc_substitution_has_positional(program, _outer_substitution=True):
-            failures.append("quoted/escaped filename boundary promoted: " + path)
-    return failures
-
-
-def _heredoc_later_four_tee_inventory_cases():
-    """Exact literal GNU options; BSD rejection is not a portable leak claim."""
-    failures = []
-    controls = [
-        ('tee-option-__append', True, 'die(){ printf safe <<EOF\n$(source <(tee --append .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-option-__ignore_interrupts', True, 'die(){ printf safe <<EOF\n$(source <(tee --ignore-interrupts .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-option-_p', True, 'die(){ printf safe <<EOF\n$(source <(tee -p .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-option-__output_error', True, 'die(){ printf safe <<EOF\n$(source <(tee --output-error .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-option-__output_error_warn', True, 'die(){ printf safe <<EOF\n$(source <(tee --output-error=warn .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-option-__output_error_warn_nopipe', True, 'die(){ printf safe <<EOF\n$(source <(tee --output-error=warn-nopipe .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-option-__output_error_exit', True, 'die(){ printf safe <<EOF\n$(source <(tee --output-error=exit .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-option-__output_error_exit_nopipe', True, 'die(){ printf safe <<EOF\n$(source <(tee --output-error=exit-nopipe .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-option-__bogus', True, 'die(){ printf safe <<EOF\n$(source <(tee --bogus .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-option-__help', True, 'die(){ printf safe <<EOF\n$(source <(tee --help .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-option-__version', True, 'die(){ printf safe <<EOF\n$(source <(tee --version .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-runtime-option-quiet', True, 'die(){ printf safe <<EOF\n$(source <(tee "$option" .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-known-directory-__output_error_exit', True, 'die(){ printf safe <<EOF\n$(source <(tee --output-error=exit . <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-known-directory-__output_error_exit_nopipe', True, 'die(){ printf safe <<EOF\n$(source <(tee --output-error=exit-nopipe . <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-    ]
-    controls += [
-        ('tee-bundle-ap', True, 'die(){ printf safe <<EOF\n$(source <(tee -ap .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-bundle-ip', True, 'die(){ printf safe <<EOF\n$(source <(tee -ip .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-bundle-pai', True, 'die(){ printf safe <<EOF\n$(source <(tee -pai .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-bundle-ax', True, 'die(){ printf safe <<EOF\n$(source <(tee -ax .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('tee-bound-invalid-runtime-option', True, 'option=--bogus\ndie(){ printf safe <<EOF\n$(source <(tee "$option" .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-    ]
-    controls += [
-        ('pipeline-source---output-error=exit', True, 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --output-error=exit .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('pipeline-.---output-error=exit', True, 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --output-error=exit .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('pipeline-directory---output-error=exit', True, 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --output-error=exit .))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('pipeline-source---output-error=exit-nopipe', True, 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --output-error=exit-nopipe .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('pipeline-.---output-error=exit-nopipe', True, 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --output-error=exit-nopipe .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('pipeline-directory---output-error=exit-nopipe', True, 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --output-error=exit-nopipe .))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-    ]
-    # GNU filename-list counts can label literal input; BSD wc rejects this
-    # option. Static inventory plus qualified Mac/Linux raw runtime evidence.
-    controls += [
-        ('count-wc-files0-equals', True, 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l --files0-from=.count-files0))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-        ('count-wc-files0-separate', True, 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l --files0-from .count-files0))\nEOF\n}\ndie "$GH_TOKEN"\n'),
-    ]
-    qualified_broader = {
-        "tee-known-directory-__output_error_exit": (
-            "GNU tee exits before copying stdin when the literal directory . "
-            "cannot be opened as an output file. The owner retains the bounded "
-            "literal producer certificate and accepts this quiet flag instead "
-            "of a filesystem-success/binding model. BSD rejects the option."
-            " Owner decision: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6148928148"
-        ),
-        "tee-known-directory-__output_error_exit_nopipe": (
-            "GNU tee exit-nopipe also exits on this literal directory file-open "
-            "error before copying stdin. The owner accepts this quiet flag "
-            "under the same finite inventory; no filesystem model is added. "
-            "BSD rejects the option."
-            " Owner decision: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6148928148"
-        ),
-    }
-    # Singleton fixed stdin now shares the source-only possible-delivery
-    # default. Invalid/arg-only stages can be quiet: no stage-semantics model.
-    # An unset runtime option can instead forward the literal program; its
-    # historical label is not a claim of a quiet runtime oracle.
-    for name in ("tee-option-__bogus", "tee-option-__help", "tee-option-__version",
-                 "tee-bundle-ax", "tee-bound-invalid-runtime-option"):
-        qualified_broader[name] = (
-            "The sampled literal-input stage is quiet: no stage-semantics model. "
-            "Its fixed stdin program is possibly delivered to source/. under "
-            "https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891"
-        )
-    qualified_broader.update({
-        "pipeline-directory---output-error=exit": qualified_broader["tee-known-directory-__output_error_exit"],
-        "pipeline-directory---output-error=exit-nopipe": qualified_broader["tee-known-directory-__output_error_exit_nopipe"],
-    })
-    for name, expected, body in controls:
-        findings, errors = scan_text(PROLOGUE + body, name)
-        if bool(findings) != expected or errors:
-            failures.append("literal tee inventory: " + name)
-        if name in qualified_broader and (not expected or not qualified_broader[name]):
-            failures.append("undeclared GNU tee conservatism: " + name)
+    for cid, rule, body in CORPUS:
+        if not cid.startswith("helper-hd-central-"):
+            continue
+        findings, errors = scan_text(PROLOGUE + body, cid)
+        if bool(findings) != (rule == MUST_FLAG) or errors:
+            failures.append("central heredoc conservatism: " + cid)
     return failures
 
 
@@ -13978,21 +12884,7 @@ def self_test():
     failures.extend(_corpus_id_cases())
     failures.extend(_printf_allowlist_cases())
     failures.extend(_function_definition_cases())
-    failures.extend(_heredoc_backtick_positional_cases())
-    failures.extend(_heredoc_deferred_positional_cases())
-    failures.extend(_heredoc_shadow_continuation_arithmetic_cases())
-    failures.extend(_heredoc_parameter_case_diagnostic_cases())
-    failures.extend(_heredoc_legacy_arithmetic_cases())
-    failures.extend(_heredoc_boundary_context_cases())
-    failures.extend(_heredoc_opaque_owner_cases())
-    failures.extend(_heredoc_guard_nested_attributes_cases())
-    failures.extend(_heredoc_indirect_source_arithmetic_cases())
-    failures.extend(_heredoc_command_index_context_cases())
-    failures.extend(_heredoc_for_alias_context_cases())
-    failures.extend(_heredoc_three_regression_cases())
-    failures.extend(_heredoc_fd0_binding_cases())
-    failures.extend(_heredoc_later_three_cases())
-    failures.extend(_heredoc_later_four_tee_inventory_cases())
+    failures.extend(_heredoc_conservatism_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
