@@ -1,3 +1,11 @@
+---
+tags:
+  - mergepath
+  - prd
+  - ai-agents
+  - infrastructure
+  - ci-cd
+---
 <!--
 generated_by: scripts/project-doc-sync.sh
 do_not_edit: true
@@ -10,14 +18,6 @@ document_slug: mergepath
 sync_direction: central-to-repo
 -->
 
----
-tags:
-  - mergepath
-  - prd
-  - ai-agents
-  - infrastructure
-  - ci-cd
----
 # Product Requirements Document: Mergepath
 
 **Author:** Nathan Payne
