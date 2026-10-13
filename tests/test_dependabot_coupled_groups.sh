@@ -35,6 +35,10 @@
 #  26. group-by: dependency-name is one PR per member                    → FAIL
 #  27. multi-ecosystem-group with patterns ["*"] is one shared PR        → PASS
 #  28. only * is a wildcard (firebas? is literal)                        → FAIL
+#  29. pnpm-workspace.yaml packages are evaluated                        → FAIL
+#  30. one effective dependency type per package (production wins)      → PASS
+#  31. exclude-paths drops an excluded workspace manifest                → PASS
+#  32. open-pull-requests-limit: 0 skips the entry                       → PASS
 #
 # Needs python3 with PyYAML. repo_lint provisions PyYAML for every
 # self-test leg; a bare local shell without it SKIPs loudly (and CI fails).
@@ -340,6 +344,32 @@ r="$(new_repo literal-question-mark)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_conf
           - "@firebase/*"'"
 $TYPE_GROUPS"
 expect "only * is a wildcard: firebas? does not match firebase" 1 "$r" "family 'firebase-sdk' is split"
+
+# Review round 2 on #2170.
+
+r="$(new_repo pnpm-workspace)"
+printf '{"name":"root","private":true,"devDependencies":{"vitest":"^5.0.0"}}\n' > "$r/package.json"
+printf 'packages:\n  - "apps/*"\n' > "$r/pnpm-workspace.yaml"
+pkg "$r/apps/web" "$FB_PROD" "$FB_DEV"
+write_config "$r" "$TYPE_GROUPS"
+expect "pnpm-workspace.yaml members are evaluated (root declares none)" 1 "$r" "firebase-sdk"
+
+r="$(new_repo mixed-type)"
+printf '{"name":"root","private":true,"workspaces":["packages/*"]}\n' > "$r/package.json"
+pkg "$r/packages/app" "firebase @firebase/rules-unit-testing" ""
+pkg "$r/packages/tests" "" "@firebase/rules-unit-testing vitest"
+write_config "$r" "$TYPE_GROUPS"
+expect "a package declared as production anywhere is production (one type per package)" 0 "$r" "PASS"
+
+r="$(new_repo exclude-paths)"
+printf '{"name":"root","private":true,"workspaces":["packages/*"],"dependencies":{"firebase":"^13.0.0"}}\n' > "$r/package.json"
+pkg "$r/packages/fixture" "" "@firebase/rules-unit-testing"
+write_config "$r" "$TYPE_GROUPS" '    exclude-paths:
+      - "packages/fixture"'
+expect "exclude-paths drops an excluded workspace manifest" 0 "$r" "PASS"
+
+r="$(new_repo prs-disabled)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "$r" "$TYPE_GROUPS" '    open-pull-requests-limit: 0'
+expect "open-pull-requests-limit: 0 disables the entry" 0 "$r" "version updates disabled"
 
 r="$(new_repo named-late)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "$r" "$TYPE_GROUPS
 $FAMILY_GROUP"

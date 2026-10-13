@@ -16,11 +16,18 @@ members a directory actually declares would be split. For each npm entry in
 member the entry can update must land in the same, non-empty PR target. The
 simulation follows what Dependabot does:
 
-* Manifests: the directory's ``package.json`` plus the manifests its
-  ``workspaces`` field selects. Only ``dependencies``, ``devDependencies`` and
-  ``optionalDependencies`` count. dependabot-core's npm parser reads exactly
-  those (``DEPENDENCY_TYPES`` in ``npm_and_yarn/file_parser.rb``), so a
-  ``peerDependencies``-only declaration is never updated and cannot be split.
+* Entries: an entry with ``open-pull-requests-limit: 0`` has version updates
+  disabled and is skipped.
+* Manifests: the directory's ``package.json`` plus the workspace manifests
+  selected by its ``workspaces`` field or by ``pnpm-workspace.yaml``, minus any
+  that the entry's ``exclude-paths`` drops. Only ``dependencies``,
+  ``devDependencies`` and ``optionalDependencies`` count. dependabot-core's npm
+  parser reads exactly those (``DEPENDENCY_TYPES`` in
+  ``npm_and_yarn/file_parser.rb``), so a ``peerDependencies``-only
+  declaration is never updated and cannot be split.
+* Dependency type: one per package, as Dependabot merges requirements. It is
+  production when any manifest declares the package in ``dependencies`` or
+  ``optionalDependencies``, and development otherwise.
 * Eligibility: ``allow`` rules are applied first, then ``ignore`` rules.
 * Targets: the first matching ``groups`` entry. A group with
   ``group-by: dependency-name`` opens one PR per dependency. An entry in a
@@ -48,12 +55,13 @@ under CI).
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import glob
 import json
 import os
 import re
 import sys
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 NAME = "check_dependabot_coupled_groups"
 UPDATE_TYPES = ("major", "minor", "patch")
@@ -107,35 +115,69 @@ def match(name: str, pattern: str) -> bool:
     return rx.fullmatch(name) is not None
 
 
-def workspace_dirs(root: str, rel: str, pkg: dict) -> List[str]:
+def workspace_patterns(root: str, rel: str, pkg: dict) -> List[str]:
+    patterns: List[str] = []
     spec = pkg.get("workspaces")
     if isinstance(spec, dict):
         spec = spec.get("packages")
-    if not isinstance(spec, list):
-        return []
+    if isinstance(spec, list):
+        patterns += [p for p in spec if isinstance(p, str)]
+    pnpm = os.path.join(root, rel, "pnpm-workspace.yaml")
+    if os.path.isfile(pnpm):
+        import yaml  # type: ignore  # main() proved PyYAML importable
+        try:
+            with open(pnpm, encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+        except yaml.YAMLError as exc:
+            raise ConfigError(f"{pnpm}: YAML parse error: {exc}") from exc
+        packages = data.get("packages") if isinstance(data, dict) else None
+        if isinstance(packages, list):
+            patterns += [p for p in packages if isinstance(p, str)]
+    return patterns
+
+
+def excluded(entry: dict, rel_to_entry: str) -> bool:
+    """Dependabot ``exclude-paths`` (globs relative to the entry directory)."""
+    for pattern in entry.get("exclude-paths") or []:
+        if not isinstance(pattern, str):
+            continue
+        pat = pattern.strip("/").replace("**", "*")
+        for candidate in (rel_to_entry, f"{rel_to_entry}/package.json"):
+            if fnmatch.fnmatchcase(candidate, pat) or fnmatch.fnmatchcase(candidate, pat + "/*"):
+                return True
+    return False
+
+
+def workspace_dirs(root: str, rel: str, pkg: dict, entry: dict) -> List[str]:
     out: List[str] = []
     base = os.path.join(root, rel)
-    for pattern in spec:
-        if not isinstance(pattern, str) or pattern.startswith("!"):
+    for pattern in workspace_patterns(root, rel, pkg):
+        if pattern.startswith("!"):
             continue
         for hit in sorted(glob.glob(os.path.join(base, pattern))):
-            if os.path.isfile(os.path.join(hit, "package.json")):
-                out.append(os.path.relpath(hit, root))
+            if not os.path.isfile(os.path.join(hit, "package.json")):
+                continue
+            if excluded(entry, os.path.relpath(hit, base)):
+                continue
+            ws = os.path.relpath(hit, root)
+            if ws not in out:
+                out.append(ws)
     return out
 
 
-def declared_dependencies(root: str, rel: str) -> Dict[str, Set[str]]:
-    """Map package name -> dependency types across the directory's manifests."""
+def declared_dependencies(root: str, rel: str, entry: dict) -> Dict[str, str]:
+    """Map package name -> its one effective Dependabot dependency type."""
     pkg = load_json(os.path.join(root, rel, "package.json"))
     manifests = [pkg] + [
         load_json(os.path.join(root, ws, "package.json"))
-        for ws in workspace_dirs(root, rel, pkg)
+        for ws in workspace_dirs(root, rel, pkg, entry)
     ]
-    out: Dict[str, Set[str]] = {}
+    out: Dict[str, str] = {}
     for manifest in manifests:
         for field, dep_type in DEPENDENCY_FIELDS.items():
             for name in (manifest.get(field) or {}):
-                out.setdefault(name, set()).add(dep_type)
+                if dep_type == "production" or name not in out:
+                    out[name] = dep_type
     return out
 
 
@@ -245,31 +287,29 @@ def find_violations(root: str, config: dict, families: List[dict]):
     for idx, entry in enumerate(config.get("updates") or []):
         if not isinstance(entry, dict) or entry.get("package-ecosystem") != "npm":
             continue
+        if entry.get("open-pull-requests-limit") == 0:
+            notes.append(f"entry {idx}: open-pull-requests-limit is 0 (version updates disabled), skipped")
+            continue
         groups = [(k, v) for k, v in (entry.get("groups") or {}).items()]
         for rel in entry_directories(root, entry):
             if not os.path.isfile(os.path.join(root, rel, "package.json")):
                 notes.append(f"entry {idx} directory '/{rel.lstrip('.')}': no package.json, skipped")
                 continue
-            deps = declared_dependencies(root, rel)
+            deps = declared_dependencies(root, rel, entry)
             for family in families:
                 members = sorted(
                     n for n in deps if any(match(n, p) for p in family["patterns"])
                 )
                 for update_type in UPDATE_TYPES:
-                    assigned: Dict[str, Set[Optional[str]]] = {}
-                    for m in members:
-                        if ignored(entry, m, update_type):
-                            continue
-                        targets = {
-                            pr_target(entry, groups, m, t, update_type)
-                            for t in sorted(deps[m]) if allowed(entry, m, t)
-                        }
-                        if targets:
-                            assigned[m] = targets
+                    assigned: Dict[str, Optional[str]] = {
+                        m: pr_target(entry, groups, m, deps[m], update_type)
+                        for m in members
+                        if allowed(entry, m, deps[m]) and not ignored(entry, m, update_type)
+                    }
                     if len(assigned) < 2:
                         continue
-                    union = set().union(*assigned.values())
-                    if len(union) == 1 and None not in union:
+                    targets = set(assigned.values())
+                    if len(targets) == 1 and None not in targets:
                         continue
                     violations.append({
                         "entry": idx,
@@ -284,11 +324,10 @@ def find_violations(root: str, config: dict, families: List[dict]):
 
 
 def describe(v: dict) -> List[str]:
-    def label(targets: Set[Optional[str]]) -> str:
-        names = sorted(t if t else "(ungrouped: its own PR)" for t in targets)
-        return " + ".join(names)
-
-    split = ", ".join(f"{m} -> {label(t)}" for m, t in sorted(v["assigned"].items()))
+    split = ", ".join(
+        f"{m} -> {t if t else '(ungrouped: its own PR)'}"
+        for m, t in sorted(v["assigned"].items())
+    )
     out = [
         f"FAIL: .github/dependabot.yml npm entry for directory \"{v['directory']}\": "
         f"family '{v['family']['group']}' is split for {v['update_type']} updates: {split}.",
