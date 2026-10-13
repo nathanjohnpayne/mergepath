@@ -479,7 +479,9 @@ GITREPO="$WORKDIR/gitrepo"
 mkdir -p "$GITREPO"
 ( cd "$GITREPO" && git init -q && git checkout -q -b topic/z 2>/dev/null \
   && git -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -q --allow-empty --no-gpg-sign -m init \
-  && git remote add origin https://github.com/o/r.git && git config branch.topic/z.remote origin )
+  && git remote add origin https://github.com/o/r.git && git config branch.topic/z.remote origin \
+  && git config branch.topic/z.merge refs/heads/topic/z && git config push.default current \
+  && git update-ref refs/remotes/origin/topic/z HEAD )
 new_case
 set +e
 out="$(RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" 2>/dev/null)"; rc=$?
@@ -511,6 +513,7 @@ git -C "$GITREPO" config --unset branch.topic/z.gh-merge-base
 # refused when the branch has no push remote.
 git -C "$GITREPO" remote add fork git@github.com:forker/r.git
 git -C "$GITREPO" config branch.topic/z.pushRemote fork
+git -C "$GITREPO" update-ref refs/remotes/fork/topic/z HEAD
 new_case
 set +e
 RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --base main --title T --body-file "$VALID_BODY" >/dev/null 2>&1; rc=$?
@@ -545,6 +548,30 @@ else
   fail "pr create no push remote: rc=$rc err=$err"
 fi
 git -C "$GITREPO" config branch.topic/z.remote origin
+
+# An inferred head must be fully pushed: a PR from a ref behind HEAD would
+# leave out the latest commits, and gh asks to push first.
+git -C "$GITREPO" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -q --allow-empty --no-gpg-sign -m ahead
+new_case
+set +e
+err="$(RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --base main --title T --body-file "$VALID_BODY" 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'branch topic/z is not fully pushed: origin/topic/z differs from HEAD' && log_lacks 'POST'; then
+  pass "pr create: an inferred head behind the local HEAD is refused"
+else
+  fail "pr create not fully pushed: rc=$rc err=$err"; cat "$LOGF" >&2
+fi
+git -C "$GITREPO" update-ref -d refs/remotes/origin/topic/z
+new_case
+set +e
+err="$(RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --base main --title T --body-file "$VALID_BODY" 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'has no pushed ref on origin' && log_lacks 'POST'; then
+  pass "pr create: a branch never pushed to its push remote is refused"
+else
+  fail "pr create never pushed: rc=$rc err=$err"; cat "$LOGF" >&2
+fi
+git -C "$GITREPO" update-ref refs/remotes/origin/topic/z HEAD
 
 # A body far larger than one argument may be reaches jq through a file.
 BIG_BODY="$WORKDIR/big-body.md"
@@ -910,6 +937,22 @@ if [ "$rc" -eq 2 ] && printf '%s' "$err" | grep -q 'merge API mutations are forb
 else
   fail "graphql merge: rc=$rc err=$err"; cat "$LOGF" >&2
 fi
+# Arming auto-merge or entering the merge queue merges later without the
+# gates, so those GraphQL mutations are refused like the merge itself, on
+# both transports of the author wrapper.
+for mutation in enablePullRequestAutoMerge disablePullRequestAutoMerge addPullRequestToMergeQueue enqueuePullRequest dequeuePullRequest; do
+  for t in rest gh; do
+    new_case
+    set +e
+    err="$(MERGEPATH_GH_TRANSPORT=$t as_author -- gh api graphql -f "query=mutation { $mutation(input: {pullRequestId: \"x\"}) { clientMutationId } }" 2>&1 >/dev/null)"; rc=$?
+    set -e
+    if [ "$rc" -eq 2 ] && printf '%s' "$err" | grep -q 'merge API mutations are forbidden' && log_lacks 'graphql'; then
+      pass "$mutation through gh api ($t transport): refused before the call"
+    else
+      fail "$mutation ($t transport): rc=$rc err=$err"; cat "$LOGF" >&2
+    fi
+  done
+done
 new_case
 set +e
 err="$(CLAUDE_CODE_REMOTE=true as_reviewer -- gh --repo o/r pr comment 1 --body x 2>&1 >/dev/null)"; rc=$?
@@ -982,6 +1025,8 @@ override_refused "Authorization header, short attached form" as_reviewer gh api 
 override_refused "gh api endpoint on another host" as_reviewer gh api https://evil.example/repos/o/r/issues/1/comments -f body=x
 # Option values cannot hide a re-routing argument: each argument is checked on
 # its own, so a value-taking option in front cannot shift the real one.
+override_refused "short header flag with an equals sign" as_reviewer gh api repos/o/r/issues/1/comments -H='Authorization: Bearer x' -f body=x
+override_refused "header flag clustered after another short flag" as_reviewer gh api repos/o/r/issues/1/comments -iHAuthorization:x -f body=x
 override_refused "Authorization header behind a --preview value" as_reviewer gh api repos/o/r/issues/1/comments --preview --header --header 'Authorization: Bearer x' -f body=x
 override_refused "host-qualified repo behind a --body value" as_reviewer gh pr comment 1 --body --repo --repo tenant.ghe.com/o/r
 override_refused "host-qualified repo behind a -H value on pr create" as_author gh pr create -H --repo --repo github.localhost/o/r --title t --body-file /dev/null

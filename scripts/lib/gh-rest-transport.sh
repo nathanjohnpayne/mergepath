@@ -203,10 +203,13 @@ gh_payload_refuse_credential_overrides() {
       return 1
     fi
     if [ "$is_api" -eq 1 ]; then
-      value="$arg"
-      case "$value" in
-        --header=*) value="${value#--header=}" ;;
-        -H?*) value="${value#-H}" ;;
+      # The header value as gh would read it: after --header=, or after the
+      # H of a short-option cluster (-H=, -HX, -iHX), with an optional '='.
+      case "$arg" in
+        --header=*) value="${arg#--header=}" ;;
+        --*) value="$arg" ;;
+        -*H*) value="${arg#*H}"; value="${value#=}" ;;
+        *) value="$arg" ;;
       esac
       if [[ "$value" =~ ^[[:space:]]*[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn][[:space:]]*: ]]; then
         echo "$label: refusing an explicit Authorization header: gh would send it in place of the verified token (#1542)." >&2
@@ -652,7 +655,7 @@ gh_rest_repo_of_url() {
 # different repository than <repo> (a fork). A branch with no push remote is
 # refused, as gh refuses one it has not pushed.
 gh_rest_default_head() {
-  local repo="$1" branch remote url pushed
+  local repo="$1" branch remote url pushed push_ref remote_branch
   branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   if [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
     gh_rest_refuse "pass --head BRANCH: no branch is checked out here"
@@ -665,10 +668,25 @@ gh_rest_default_head() {
     gh_rest_refuse "pass --head: branch $branch has no push remote to tell which repository holds it (use owner:branch for a fork)"
     return 1
   fi
+  # The branch must be fully pushed: a PR from a ref behind HEAD would leave
+  # out the latest commits. @{push} is where git would push this branch; gh
+  # asks to push when it is not current, and this transport refuses.
+  push_ref="$(git rev-parse --abbrev-ref --symbolic-full-name '@{push}' 2>/dev/null || true)"
+  case "$push_ref" in
+    "$remote"/?*) remote_branch="${push_ref#"$remote"/}" ;;
+    *)
+      gh_rest_refuse "pass --head: branch $branch has no pushed ref on $remote to open a PR from; push it first"
+      return 1
+      ;;
+  esac
+  if [ "$(git rev-parse '@{push}' 2>/dev/null || true)" != "$(git rev-parse HEAD 2>/dev/null)" ]; then
+    gh_rest_refuse "branch $branch is not fully pushed: $push_ref differs from HEAD; push it first, or pass --head to open the PR from the pushed ref"
+    return 1
+  fi
   if [ "$(printf '%s' "$pushed" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]')" ]; then
-    printf '%s\n' "$branch"
+    printf '%s\n' "$remote_branch"
   else
-    printf '%s:%s\n' "${pushed%%/*}" "$branch"
+    printf '%s:%s\n' "${pushed%%/*}" "$remote_branch"
   fi
 }
 
