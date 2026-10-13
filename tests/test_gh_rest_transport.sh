@@ -156,7 +156,15 @@ case "$method $endpoint" in
        assignees: ($assignees | split(",") | map(select(length > 0)) | map({login: .}))}' ;;
   "GET repos/$REPO/issues/"*"/events?per_page=100")
     [ -z "${STUB_EVENTS_FAIL:-}" ] || { echo "gh: HTTP 502" >&2; exit 1; }
-    jq -n --argjson before "${STUB_EVENTS_BEFORE:-[]}" --slurpfile ev "$events_file" '[$before + $ev[0]]' ;;
+    reads=$(( $(cat "$STATE/event-reads" 2>/dev/null || echo 0) + 1 ))
+    echo "$reads" >"$STATE/event-reads"
+    # STUB_EVENTS_HIDE_READS=N: the first N reads do not yet show the events
+    # the writes produced, as GitHub may record an event after the write.
+    if [ "$reads" -le "${STUB_EVENTS_HIDE_READS:-0}" ]; then
+      jq -n --argjson before "${STUB_EVENTS_BEFORE:-[]}" '[$before]'
+    else
+      jq -n --argjson before "${STUB_EVENTS_BEFORE:-[]}" --slurpfile ev "$events_file" '[$before + $ev[0]]'
+    fi ;;
   "POST repos/$REPO/pulls")
     [ -z "${STUB_CREATE_FAIL:-}" ] || { echo "gh: Validation Failed (HTTP 422)" >&2; exit 1; }
     jq -n --arg url "$(url_of 42)" --arg login "$write_login" '{number: 42, html_url: $url, user: {login: $login}}' ;;
@@ -222,12 +230,17 @@ chmod +x "$STUB_DIR/gh"
 LOGF="$WORKDIR/calls.log"
 STATE="$WORKDIR/state"
 new_case() { : >"$LOGF"; rm -rf "$STATE"; mkdir -p "$STATE"; }
+# A zero readback delay keeps the retry cases fast; the attempt count is the
+# production default unless a case sets it.
 as_author() {
-  PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$LOGF" STUB_STATE="$STATE" OP_PREFLIGHT_AUTHOR_PAT="${OP_PREFLIGHT_AUTHOR_PAT:-ghp_author-token}" bash "$AUTHOR" "$@"
+  PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$LOGF" STUB_STATE="$STATE" MERGEPATH_GH_READBACK_DELAY="${MERGEPATH_GH_READBACK_DELAY:-0}" \
+    OP_PREFLIGHT_AUTHOR_PAT="${OP_PREFLIGHT_AUTHOR_PAT:-ghp_author-token}" bash "$AUTHOR" "$@"
 }
 as_reviewer() {
-  PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$LOGF" STUB_STATE="$STATE" OP_PREFLIGHT_REVIEWER_PAT="${OP_PREFLIGHT_REVIEWER_PAT:-ghp_reviewer-token}" bash "$REVIEWER" "$@"
+  PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$LOGF" STUB_STATE="$STATE" MERGEPATH_GH_READBACK_DELAY="${MERGEPATH_GH_READBACK_DELAY:-0}" \
+    OP_PREFLIGHT_REVIEWER_PAT="${OP_PREFLIGHT_REVIEWER_PAT:-ghp_reviewer-token}" bash "$REVIEWER" "$@"
 }
+event_reads() { cat "$STATE/event-reads" 2>/dev/null || echo 0; }
 log_has() { grep -qF -- "$1" "$LOGF"; }
 log_lacks() { ! grep -qF -- "$1" "$LOGF"; }
 # Every api call under the REST transport carries the verified token alone.
@@ -623,6 +636,65 @@ else
   fail "pr edit PATCH failure: rc=$rc err=$err"; cat "$LOGF" >&2
 fi
 
+# GitHub may record an event a moment after the write: a missing event is
+# re-read, an event by another login is not.
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest STUB_EVENTS_HIDE_READS=2 as_author -- gh pr edit 42 --repo o/r --add-label x >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ "$(event_reads)" -eq 3 ] && grep -q 'labeled:x' "$WORKDIR/err" && ! grep -q 'ERROR' "$WORKDIR/err"; then
+  pass "edit readback: a lagging event is re-read and attributed, with no error printed for the early miss"
+else
+  fail "edit readback lag: rc=$rc reads=$(event_reads)"; cat "$WORKDIR/err" >&2
+fi
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_EVENTS_HIDE_READS=99 MERGEPATH_GH_READBACK_ATTEMPTS=3 as_author -- gh pr edit 42 --repo o/r --add-label x 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 5 ] && [ "$(event_reads)" -eq 4 ] && [ "$(printf '%s\n' "$err" | grep -c "no labeled event appeared")" -eq 1 ]; then
+  pass "edit readback: an event that never appears is reported once, after the configured attempts, and exits 5"
+else
+  fail "edit readback never appears: rc=$rc reads=$(event_reads) err=$err"
+fi
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_EVENT_ACTOR='claude[bot]' as_author -- gh pr edit 42 --repo o/r --add-label x 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 5 ] && [ "$(event_reads)" -eq 2 ]; then
+  pass "edit readback: an event by another login fails on the first read, with no retry"
+else
+  fail "edit readback wrong actor retry: rc=$rc reads=$(event_reads) err=$err"
+fi
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest STUB_EVENTS_HIDE_READS=1 as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label a >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ "$(event_reads)" -eq 2 ] && grep -q 'labeled:a' "$WORKDIR/err"; then
+  pass "create readback: a lagging label event is re-read and attributed"
+else
+  fail "create readback lag: rc=$rc reads=$(event_reads)"; cat "$WORKDIR/err" >&2
+fi
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest STUB_EVENTS_HIDE_READS=2 as_author -- gh pr close 42 --repo o/r >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ "$(event_reads)" -eq 3 ] && grep -q 'verified close of PR #42' "$WORKDIR/err"; then
+  pass "close readback: a lagging closed event is re-read and attributed"
+else
+  fail "close readback lag: rc=$rc reads=$(event_reads)"; cat "$WORKDIR/err" >&2
+fi
+for bad in x 0 21; do
+  new_case
+  set +e
+  MERGEPATH_GH_TRANSPORT=rest STUB_EVENTS_HIDE_READS=99 MERGEPATH_GH_READBACK_ATTEMPTS=$bad as_author -- gh pr edit 42 --repo o/r --add-label x >/dev/null 2>&1; rc=$?
+  set -e
+  if [ "$rc" -eq 5 ] && [ "$(event_reads)" -eq 6 ]; then
+    pass "readback attempts '$bad' is out of range: the default of 5 applies"
+  else
+    fail "readback attempts '$bad': rc=$rc reads=$(event_reads)"
+  fi
+done
+
 refused_rest "edit with nothing to edit" as_author gh pr edit 42 --repo o/r
 refused_rest "edit --milestone" as_author gh pr edit 42 --repo o/r --milestone m
 refused_rest "edit with an empty title" as_author gh pr edit 42 --repo o/r --title ''
@@ -750,6 +822,26 @@ override_refused "Authorization header on gh api" as_reviewer gh api -H 'Authori
 override_refused "Authorization header, long attached form" as_reviewer gh api --header='authorization: Bearer x' repos/o/r
 override_refused "Authorization header, short attached form" as_reviewer gh api -HAuthorization:x repos/o/r
 override_refused "gh api endpoint on another host" as_reviewer gh api https://evil.example/repos/o/r/issues/1/comments -f body=x
+for t in gh rest; do
+  new_case
+  set +e
+  err="$(GH_REPO=tenant.ghe.com/o/r MERGEPATH_GH_TRANSPORT=$t as_reviewer -- gh pr comment 1 --repo o/r --body x 2>&1 >/dev/null)"; rc=$?
+  set -e
+  if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'inherited host-qualified GH_REPO' && [ ! -s "$LOGF" ]; then
+    pass "inherited host-qualified GH_REPO ($t transport): refused before any gh call"
+  else
+    fail "inherited GH_REPO ($t transport): rc=$rc err=$err"; cat "$LOGF" >&2
+  fi
+done
+new_case
+set +e
+GH_REPO=o/r MERGEPATH_GH_TRANSPORT=rest as_reviewer -- gh pr comment 1 --repo o/r --body x >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/issues/1/comments'; then
+  pass "an inherited OWNER/REPO GH_REPO with no host is not refused"
+else
+  fail "plain GH_REPO: rc=$rc"; cat "$LOGF" >&2
+fi
 
 new_case
 set +e

@@ -69,7 +69,11 @@
 #
 # A new event of the expected kind by any other login fails the readback: a
 # concurrent write by the expected login beside a bot-attributed one cannot
-# be told apart from a wrong-byline write, and must not be (#1542).
+# be told apart from a wrong-byline write, and must not be (#1542). GitHub
+# may record an event a moment after the write that produced it, so a missing
+# event is re-read (MERGEPATH_GH_READBACK_ATTEMPTS, default 5, 1 to 20;
+# MERGEPATH_GH_READBACK_DELAY seconds apart, default 2, 0 to 30) before it is
+# reported as unattributed. An event by the wrong login fails at once.
 #
 # `gh pr merge` is refused on this transport with exit 6, the ceiling code:
 # the gates that keep a merge honest (merge-writer.py, merge-clearance-gate.sh
@@ -81,9 +85,9 @@
 #
 # gh_payload_refuse_credential_overrides is transport-independent: it refuses
 # the caller-supplied arguments that could send the verified token elsewhere
-# or replace it (--hostname, a host-qualified --repo, an `api` endpoint on
-# another host, an Authorization header on `gh api`), the two #1542 inputs
-# that only argv inspection can bound.
+# or replace it (--hostname, a host-qualified --repo or inherited GH_REPO,
+# an `api` endpoint on another host, an Authorization header on `gh api`),
+# the two #1542 inputs that only argv and environment inspection can bound.
 #
 # Needs gh 2.41 or later (--slurp) and jq. Bash 3.2 portable; no top-level
 # side effects beyond defining functions and constants.
@@ -177,6 +181,12 @@ gh_payload_refuse_credential_overrides() {
   shift
   case "${1:-}" in gh|*/gh) ;; *) return 0 ;; esac
   shift
+  case "${GH_REPO:-}" in
+    */*/*)
+      echo "$label: refusing an inherited host-qualified GH_REPO ('$GH_REPO'): gh would send the verified token to that host; unset it and pass --repo OWNER/REPO (#1542)." >&2
+      return 1
+      ;;
+  esac
   [ "${1:-}" = "api" ] && is_api=1
   while [ "$#" -gt 0 ]; do
     arg="$1"
@@ -470,7 +480,7 @@ gh_rest_attribute() {
   actors="$(printf '%s' "$1" | jq -r --arg t "$2" --arg v "$4" \
     "[.[] | select(.event == \$t) | select($3) | (.actor.login // \"<unknown>\")] | unique | .[]")" || actors=""
   if [ -z "$actors" ]; then
-    gh_rest_err "ERROR could not attribute $5: no $2 event appeared for it."
+    [ "${GH_REST_QUIET_MISSING:-0}" = 1 ] || gh_rest_err "ERROR could not attribute $5: no $2 event appeared for it."
     return 1
   fi
   if [ "$actors" != "$GH_REST_EXPECTED" ]; then
@@ -489,6 +499,83 @@ gh_rest_attribute_each() { # <events> <event> <jq match> <what prefix> <item>
   gh_rest_attribute "$1" "$2" "$3" "$5" "$4 '$5'" || return $?
   GH_REST_VERIFIED="$GH_REST_VERIFIED $2:$5,"
   return 0
+}
+
+# gh_rest_worse <a> <b>: the worse of two readback statuses (2 beats 1 beats 0).
+gh_rest_worse() {
+  if [ "$1" -eq 2 ] || [ "$2" -eq 2 ]; then echo 2
+  elif [ "$1" -eq 1 ] || [ "$2" -eq 1 ]; then echo 1
+  else echo 0; fi
+}
+
+# gh_rest_readback <repo> <N> <events before the write, or "" for all> <checker>
+# Reads the issue events, keeps those absent from <before>, and calls
+# <checker> <events>, which returns 0 (attributed), 1 (an expected event is
+# missing) or 2 (an event by another login). A missing event is re-read, since
+# GitHub may record it a moment after the write; the last attempt reports it.
+# Returns the checker's status, or 3 when the events cannot be read.
+gh_rest_readback() {
+  local repo="$1" number="$2" before="$3" checker="$4"
+  local attempts="${MERGEPATH_GH_READBACK_ATTEMPTS:-5}" delay="${MERGEPATH_GH_READBACK_DELAY:-2}"
+  local attempt=1 after events rc
+  case "$attempts" in ''|*[!0-9]*) attempts=5 ;; esac
+  { [ "$attempts" -ge 1 ] && [ "$attempts" -le 20 ]; } || attempts=5
+  case "$delay" in ''|*[!0-9]*) delay=2 ;; esac
+  [ "$delay" -le 30 ] || delay=2
+  while :; do
+    after="$(gh_rest_events "$repo" "$number")" || return 3
+    if [ -n "$before" ]; then
+      events="$(gh_rest_new_events "$before" "$after")" || events="[]"
+    else
+      events="$after"
+    fi
+    GH_REST_VERIFIED=""
+    GH_REST_QUIET_MISSING=0
+    [ "$attempt" -ge "$attempts" ] || GH_REST_QUIET_MISSING=1
+    rc=0
+    "$checker" "$events" || rc=$?
+    GH_REST_QUIET_MISSING=0
+    if [ "$rc" -ne 1 ] || [ "$attempt" -ge "$attempts" ]; then
+      return "$rc"
+    fi
+    sleep "$delay"
+    attempt=$((attempt + 1))
+  done
+}
+
+# Checkers for gh_rest_readback. Each reads its caller's locals (bash scopes
+# a function's locals dynamically into the functions it calls).
+gh_rest_check_create_events() { # <events>
+  local ev="$1" worst=0 r
+  r=0; gh_rest_each "$labels_json" gh_rest_attribute_each "$ev" labeled '.label.name == $v' "the label" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
+  r=0; gh_rest_each "$reviewers_json" gh_rest_attribute_each "$ev" review_requested '.requested_reviewer.login == $v' "the review request to" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
+  r=0; gh_rest_each "$assignees_json" gh_rest_attribute_each "$ev" assigned '.assignee.login == $v' "the assignment to" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
+  return "$worst"
+}
+
+gh_rest_check_edit_events() { # <events>
+  local ev="$1" worst=0 r
+  if [ "$title_op" -eq 1 ]; then
+    r=0; gh_rest_attribute "$ev" renamed '.rename.to == $v' "$title" "the title edit" || r=$?
+    [ "$r" -ne 0 ] || GH_REST_VERIFIED="$GH_REST_VERIFIED title,"
+    worst=$(gh_rest_worse "$worst" "$r")
+  fi
+  if [ "$base_op" -eq 1 ]; then
+    r=0; gh_rest_attribute "$ev" base_ref_changed 'true' "" "the base edit" || r=$?
+    [ "$r" -ne 0 ] || GH_REST_VERIFIED="$GH_REST_VERIFIED base,"
+    worst=$(gh_rest_worse "$worst" "$r")
+  fi
+  r=0; gh_rest_each "$add_labels_json" gh_rest_attribute_each "$ev" labeled '.label.name == $v' "the label" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
+  r=0; gh_rest_each "$remove_labels_json" gh_rest_attribute_each "$ev" unlabeled '.label.name == $v' "removing the label" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
+  r=0; gh_rest_each "$add_reviewers_json" gh_rest_attribute_each "$ev" review_requested '.requested_reviewer.login == $v' "the review request to" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
+  r=0; gh_rest_each "$remove_reviewers_json" gh_rest_attribute_each "$ev" review_request_removed '.requested_reviewer.login == $v' "removing the review request to" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
+  r=0; gh_rest_each "$add_assignees_json" gh_rest_attribute_each "$ev" assigned '.assignee.login == $v' "the assignment to" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
+  r=0; gh_rest_each "$remove_assignees_json" gh_rest_attribute_each "$ev" unassigned '.assignee.login == $v' "unassigning" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
+  return "$worst"
+}
+
+gh_rest_check_close_events() { # <events>
+  gh_rest_attribute "$1" closed 'true' "" "closing PR #$number"
 }
 
 gh_rest_remove_label() { # <repo> <N> <label>
@@ -620,16 +707,12 @@ gh_rest_pr_create() {
     followed=1
   fi
   if [ "$followed" -eq 1 ]; then
-    local events
-    GH_REST_VERIFIED=""
-    events="$(gh_rest_events "$repo" "$number")" || {
+    gh_rest_readback "$repo" "$number" "" gh_rest_check_create_events || rc=$?
+    if [ "$rc" -eq 3 ]; then
       gh_rest_err "ERROR PR #$number was created ($url) but its events could not be read, so the label, reviewer and assignee writes are unattributed."
       printf '%s\n' "$url"
       return 5
-    }
-    gh_rest_each "$labels_json" gh_rest_attribute_each "$events" labeled '.label.name == $v' "the label" || rc=5
-    gh_rest_each "$reviewers_json" gh_rest_attribute_each "$events" review_requested '.requested_reviewer.login == $v' "the review request to" || rc=5
-    gh_rest_each "$assignees_json" gh_rest_attribute_each "$events" assigned '.assignee.login == $v' "the assignment to" || rc=5
+    fi
     if [ "$rc" -ne 0 ]; then
       gh_rest_recovery "the mis-attributed label, reviewer or assignee changes" "$url"
       printf '%s\n' "$url"
@@ -836,26 +919,12 @@ gh_rest_pr_edit() {
     gh_rest_api DELETE "repos/$repo/issues/$number/assignees" "$input" >/dev/null || { gh_rest_err "unassigning PR #$number failed; earlier edits were applied."; return 1; }
   fi
 
-  local after new
-  after="$(gh_rest_events "$repo" "$number")" || {
+  gh_rest_readback "$repo" "$number" "$before" gh_rest_check_edit_events || rc=$?
+  if [ "$rc" -eq 3 ]; then
     gh_rest_err "ERROR the edit of PR #$number was applied but its events could not be read back, so it is unattributed."
     printf '%s\n' "$url"
     return 5
-  }
-  new="$(gh_rest_new_events "$before" "$after")" || new="[]"
-  GH_REST_VERIFIED=""
-  if [ "$title_op" -eq 1 ]; then
-    gh_rest_attribute "$new" renamed '.rename.to == $v' "$title" "the title edit" && GH_REST_VERIFIED="$GH_REST_VERIFIED title," || rc=5
   fi
-  if [ "$base_op" -eq 1 ]; then
-    gh_rest_attribute "$new" base_ref_changed 'true' "" "the base edit" && GH_REST_VERIFIED="$GH_REST_VERIFIED base," || rc=5
-  fi
-  gh_rest_each "$add_labels_json" gh_rest_attribute_each "$new" labeled '.label.name == $v' "the label" || rc=5
-  gh_rest_each "$remove_labels_json" gh_rest_attribute_each "$new" unlabeled '.label.name == $v' "removing the label" || rc=5
-  gh_rest_each "$add_reviewers_json" gh_rest_attribute_each "$new" review_requested '.requested_reviewer.login == $v' "the review request to" || rc=5
-  gh_rest_each "$remove_reviewers_json" gh_rest_attribute_each "$new" review_request_removed '.requested_reviewer.login == $v' "removing the review request to" || rc=5
-  gh_rest_each "$add_assignees_json" gh_rest_attribute_each "$new" assigned '.assignee.login == $v' "the assignment to" || rc=5
-  gh_rest_each "$remove_assignees_json" gh_rest_attribute_each "$new" unassigned '.assignee.login == $v' "unassigning" || rc=5
   if [ "$body_op" -eq 1 ]; then
     gh_rest_err "note: the body edit of PR #$number is not attributable over REST (no event records who edited a body); the PATCH succeeded, and nothing here verified its byline."
   fi
@@ -909,19 +978,18 @@ gh_rest_pr_close() {
   if [ "$comment_set" -eq 1 ]; then
     gh_rest_post_comment "$repo" "$number" "$comment" >/dev/null || return $?
   fi
-  local before input after new rc=0
+  local before input rc=0
   before="$(gh_rest_events "$repo" "$number")" || {
     gh_rest_err "could not read the events of PR #$number before closing it; refusing a write that could not be attributed."
     return 5
   }
   input="$(gh_rest_json_file '{state: "closed"}')" || return 1
   gh_rest_api PATCH "repos/$repo/pulls/$number" "$input" >/dev/null || return $?
-  after="$(gh_rest_events "$repo" "$number")" || {
+  gh_rest_readback "$repo" "$number" "$before" gh_rest_check_close_events || rc=$?
+  if [ "$rc" -eq 3 ]; then
     gh_rest_err "ERROR PR #$number was closed but its events could not be read back, so the close is unattributed."
     return 5
-  }
-  new="$(gh_rest_new_events "$before" "$after")" || new="[]"
-  gh_rest_attribute "$new" closed 'true' "" "closing PR #$number" || rc=5
+  fi
   if [ "$rc" -ne 0 ]; then
     gh_rest_recovery "the close (reopen the pull request)" "$url"
     return 5
