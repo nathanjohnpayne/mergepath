@@ -231,14 +231,19 @@ LOGF="$WORKDIR/calls.log"
 STATE="$WORKDIR/state"
 new_case() { : >"$LOGF"; rm -rf "$STATE"; mkdir -p "$STATE"; }
 # A zero readback delay keeps the retry cases fast; the attempt count is the
-# production default unless a case sets it.
+# production default unless a case sets it. Every call runs from a directory
+# that is not a git repository unless a case names its fixture repository in
+# RUN_CWD, so the transport's local git steps (head resolution, local branch
+# deletion) can never act on the checkout running this suite.
+NOGIT="$WORKDIR/nogit"
+mkdir -p "$NOGIT"
 as_author() {
-  PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$LOGF" STUB_STATE="$STATE" MERGEPATH_GH_READBACK_DELAY="${MERGEPATH_GH_READBACK_DELAY:-0}" \
-    OP_PREFLIGHT_AUTHOR_PAT="${OP_PREFLIGHT_AUTHOR_PAT:-ghp_author-token}" bash "$AUTHOR" "$@"
+  ( cd "${RUN_CWD:-$NOGIT}" && PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$LOGF" STUB_STATE="$STATE" MERGEPATH_GH_READBACK_DELAY="${MERGEPATH_GH_READBACK_DELAY:-0}" \
+    OP_PREFLIGHT_AUTHOR_PAT="${OP_PREFLIGHT_AUTHOR_PAT:-ghp_author-token}" bash "$AUTHOR" "$@" )
 }
 as_reviewer() {
-  PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$LOGF" STUB_STATE="$STATE" MERGEPATH_GH_READBACK_DELAY="${MERGEPATH_GH_READBACK_DELAY:-0}" \
-    OP_PREFLIGHT_REVIEWER_PAT="${OP_PREFLIGHT_REVIEWER_PAT:-ghp_reviewer-token}" bash "$REVIEWER" "$@"
+  ( cd "${RUN_CWD:-$NOGIT}" && PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$LOGF" STUB_STATE="$STATE" MERGEPATH_GH_READBACK_DELAY="${MERGEPATH_GH_READBACK_DELAY:-0}" \
+    OP_PREFLIGHT_REVIEWER_PAT="${OP_PREFLIGHT_REVIEWER_PAT:-ghp_reviewer-token}" bash "$REVIEWER" "$@" )
 }
 event_reads() { cat "$STATE/event-reads" 2>/dev/null || echo 0; }
 log_has() { grep -qF -- "$1" "$LOGF"; }
@@ -473,14 +478,15 @@ fi
 GITREPO="$WORKDIR/gitrepo"
 mkdir -p "$GITREPO"
 ( cd "$GITREPO" && git init -q && git checkout -q -b topic/z 2>/dev/null \
-  && git -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -q --allow-empty --no-gpg-sign -m init )
+  && git -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -q --allow-empty --no-gpg-sign -m init \
+  && git remote add origin https://github.com/o/r.git && git config branch.topic/z.remote origin )
 new_case
 set +e
-out="$(cd "$GITREPO" && MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" 2>/dev/null)"; rc=$?
+out="$(RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" 2>/dev/null)"; rc=$?
 set -e
 create_input="$(jq -nc --arg body "$expected_body" '{title: "T", body: $body, head: "topic/z", base: "main", draft: false}')"
 if [ "$rc" -eq 0 ] && grep -q $'\tapi\trepos/o/r$' "$LOGF" && log_has $'POST\trepos/o/r/pulls\t--input\t'"$create_input" && log_lacks 'events?per_page'; then
-  pass "pr create defaults: --head from the checked-out branch, --base from GET repos, no event read without follow-ups"
+  pass "pr create defaults: --head from the checked-out branch pushed to --repo, --base from GET repos, no event read without follow-ups"
 else
   fail "pr create defaults: rc=$rc"; cat "$LOGF" >&2
 fi
@@ -490,7 +496,7 @@ fi
 git -C "$GITREPO" config branch.topic/z.gh-merge-base release/2
 new_case
 set +e
-(cd "$GITREPO" && MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" >/dev/null 2>&1); rc=$?
+RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" >/dev/null 2>&1; rc=$?
 set -e
 create_input="$(jq -nc --arg body "$expected_body" '{title: "T", body: $body, head: "topic/z", base: "release/2", draft: false}')"
 if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/pulls\t--input\t'"$create_input" && ! grep -q $'\tapi\trepos/o/r$' "$LOGF"; then
@@ -499,6 +505,46 @@ else
   fail "pr create gh-merge-base: rc=$rc"; cat "$LOGF" >&2
 fi
 git -C "$GITREPO" config --unset branch.topic/z.gh-merge-base
+
+# An omitted --head is qualified owner:branch when the branch is pushed to a
+# fork, kept bare for the session proxy's remote of --repo itself, and
+# refused when the branch has no push remote.
+git -C "$GITREPO" remote add fork git@github.com:forker/r.git
+git -C "$GITREPO" config branch.topic/z.pushRemote fork
+new_case
+set +e
+RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --base main --title T --body-file "$VALID_BODY" >/dev/null 2>&1; rc=$?
+set -e
+create_input="$(jq -nc --arg body "$expected_body" '{title: "T", body: $body, head: "forker:topic/z", base: "main", draft: false}')"
+if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/pulls\t--input\t'"$create_input"; then
+  pass "pr create: a branch pushed to a fork gets the owner-qualified head"
+else
+  fail "pr create fork head: rc=$rc"; cat "$LOGF" >&2
+fi
+git -C "$GITREPO" config --unset branch.topic/z.pushRemote
+git -C "$GITREPO" remote set-url origin http://local_proxy@127.0.0.1:9/git/O/R
+new_case
+set +e
+RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --base main --title T --body-file "$VALID_BODY" >/dev/null 2>&1; rc=$?
+set -e
+create_input="$(jq -nc --arg body "$expected_body" '{title: "T", body: $body, head: "topic/z", base: "main", draft: false}')"
+if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/pulls\t--input\t'"$create_input"; then
+  pass "pr create: a proxy remote URL ending in --repo (any case) keeps the bare head"
+else
+  fail "pr create proxy remote head: rc=$rc"; cat "$LOGF" >&2
+fi
+git -C "$GITREPO" remote set-url origin https://github.com/o/r.git
+git -C "$GITREPO" config --unset branch.topic/z.remote
+new_case
+set +e
+err="$(RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --base main --title T --body-file "$VALID_BODY" 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'branch topic/z has no push remote' && log_lacks 'POST'; then
+  pass "pr create: a branch with no push remote is refused, as gh refuses an unpushed branch"
+else
+  fail "pr create no push remote: rc=$rc err=$err"
+fi
+git -C "$GITREPO" config branch.topic/z.remote origin
 
 # A body far larger than one argument may be reaches jq through a file.
 BIG_BODY="$WORKDIR/big-body.md"
@@ -792,6 +838,27 @@ else
   fail "pr close fork head: rc=$rc"; cat "$LOGF" "$WORKDIR/err" >&2
 fi
 
+# --delete-branch also deletes the local branch, as gh does, unless it is
+# the branch checked out here.
+git -C "$GITREPO" branch feature
+new_case
+set +e
+RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr close 42 --repo o/r --delete-branch >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && ! git -C "$GITREPO" show-ref --verify --quiet refs/heads/feature && grep -q 'deleted local branch feature' "$WORKDIR/err"; then
+  pass "pr close --delete-branch: the local branch is deleted too"
+else
+  fail "pr close local delete: rc=$rc"; cat "$WORKDIR/err" >&2
+fi
+new_case
+set +e
+RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest STUB_PR_HEAD_REF=topic/z as_author -- gh pr close 42 --repo o/r --delete-branch >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && git -C "$GITREPO" show-ref --verify --quiet refs/heads/topic/z && grep -q 'local branch topic/z is checked out here, so it was not deleted' "$WORKDIR/err"; then
+  pass "pr close --delete-branch: a checked-out local branch is kept and reported"
+else
+  fail "pr close checked-out branch: rc=$rc"; cat "$WORKDIR/err" >&2
+fi
 new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_EVENT_ACTOR='claude[bot]' as_author -- gh pr close 42 --repo o/r 2>&1 >/dev/null)"; rc=$?
@@ -815,6 +882,49 @@ if [ "$rc" -eq 6 ] && printf '%s' "$err" | grep -q 'CEILING: gh pr merge does no
   pass "pr merge on a cloud surface: refused with the ceiling code (6) and the handback command; nothing written"
 else
   fail "pr merge ceiling: rc=$rc err=$err"; cat "$LOGF" >&2
+fi
+
+for spelling in "gh --repo o/r pr merge 42 --squash" "gh -R o/r pr merge 42" "gh pr --repo o/r merge 42"; do
+  new_case
+  set +e
+  # shellcheck disable=SC2086  # the spelling is split into argv on purpose
+  err="$(CLAUDE_CODE_REMOTE=true as_author -- $spelling 2>&1 >/dev/null)"; rc=$?
+  set -e
+  if [ "$rc" -eq 6 ] && printf '%s' "$err" | grep -q 'CEILING: gh pr merge' && log_lacks $'merge\t'; then
+    pass "pr merge spelled '$spelling' on a cloud surface: the same ceiling refusal"
+  else
+    fail "merge spelling '$spelling': rc=$rc err=$err"; cat "$LOGF" >&2
+  fi
+done
+for api_merge in "gh api -X PUT repos/o/r/pulls/42/merge" "gh api --method=PUT repos/o/r/pulls/42/merge -f merge_method=squash"; do
+  new_case
+  set +e
+  # shellcheck disable=SC2086  # the spelling is split into argv on purpose
+  err="$(CLAUDE_CODE_REMOTE=true as_author -- $api_merge 2>&1 >/dev/null)"; rc=$?
+  set -e
+  if [ "$rc" -eq 2 ] && printf '%s' "$err" | grep -q 'merge API mutations are forbidden' && log_lacks 'PUT'; then
+    pass "REST merge endpoint through gh api ('$api_merge') on a cloud surface: refused, never passed through"
+  else
+    fail "api merge '$api_merge': rc=$rc err=$err"; cat "$LOGF" >&2
+  fi
+done
+new_case
+set +e
+err="$(CLAUDE_CODE_REMOTE=true as_reviewer -- gh api graphql -f 'query=mutation { mergePullRequest(input: {pullRequestId: "x"}) { clientMutationId } }' 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 2 ] && printf '%s' "$err" | grep -q 'merge API mutations are forbidden' && log_lacks 'graphql'; then
+  pass "GraphQL merge mutation through gh api on a cloud surface: refused for the reviewer wrapper too"
+else
+  fail "graphql merge: rc=$rc err=$err"; cat "$LOGF" >&2
+fi
+new_case
+set +e
+err="$(CLAUDE_CODE_REMOTE=true as_reviewer -- gh --repo o/r pr comment 1 --body x 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q "option '--repo' before the command group" && log_lacks $'pr\tcomment' && log_lacks 'POST'; then
+  pass "an option before the command group on the REST transport: refused, not passed to native gh"
+else
+  fail "leading option: rc=$rc err=$err"; cat "$LOGF" >&2
 fi
 
 new_case

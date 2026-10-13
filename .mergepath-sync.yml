@@ -293,6 +293,8 @@ paths:
   - path: scripts/lib/gh-rest-transport.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/workflow/owner-admin-override.py"  # classifies every merge spelling before dispatch
   # Capability probe (#1057): measures what an agent session (local, Claude
   # cloud, Codex cloud, CI) can do on GitHub before it tries, and caches a
   # tier `--check --print-exports` re-exports. It resolves write tokens
@@ -663,6 +665,7 @@ paths:
     requires:
       - "scripts/gh-as-reviewer.sh"
       - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
       - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
@@ -689,6 +692,7 @@ paths:
       - "scripts/lib/gh-api-array.sh"   # #1008/#1085, strict paginated timeout-evidence read
       - "scripts/gh-as-reviewer.sh"
       - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/post-phase-4b-handoff.sh"
       # The #814 same-head barrier invokes both of these directly, by path,
       # on every non-dry run. A consumer that receives the orchestrator
@@ -981,6 +985,7 @@ paths:
     requires:
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/lib/gh-rest-transport.sh"  # sourced; the REST transport and readback on a cloud surface (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/identity-check.sh"         # gh-token-resolver.sh executes it before any write
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it
   # Pre-action identity check (#284) — the assertion helper that every
@@ -1068,6 +1073,7 @@ paths:
       - "scripts/codex-review-check.sh"     # scanned for Authoring-Agent parse parity
       - "scripts/gh-as-author.sh"           # is_pr_create_command() is extracted and sourced
       - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/hooks/gh-pr-guard.sh"      # self-approval refusal string is asserted
   - path: scripts/hooks/label-removal-guard.sh
     type: canonical
@@ -1132,6 +1138,7 @@ paths:
     requires:
       - "scripts/gh-as-author.sh"
       - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/identity-check.sh"
       - "scripts/hooks/gh-pr-guard.sh"
       - "scripts/merge-clearance-gate.sh"
@@ -1153,6 +1160,7 @@ paths:
       - "scripts/gh-as-author.sh"                         # changed by #1057 A2; the test asserts its new behavior
       - "scripts/lib/gh-token-resolver.sh"                # changed by #1057 A2; the test asserts its new behavior
       - "scripts/lib/gh-rest-transport.sh"                # the wrapper sources it; the pin fixture copies it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
   - path: tests/test_gh_as_reviewer.sh
     type: canonical
     consumers: all
@@ -1162,6 +1170,7 @@ paths:
       - "scripts/gh-as-reviewer.sh"                       # changed by #1057 A2; the test asserts its new behavior
       - "scripts/lib/gh-token-resolver.sh"                # changed by #1057 A2; the test asserts its new behavior
       - "scripts/lib/gh-rest-transport.sh"                # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
   # The REST transport suite (#1057 A, #1542): the closed argv grammar, each
   # verb's REST calls and the byline readback, run through both wrappers
   # against a gh stub. The create cases go through the author wrapper's
@@ -1171,6 +1180,7 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/gh-rest-transport.sh"
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/gh-as-author.sh"
       - "scripts/gh-as-reviewer.sh"
       - "scripts/lib/gh-token-resolver.sh"
@@ -1517,6 +1527,7 @@ paths:
       - "scripts/codex-record-feedback.sh"                # changed by #1057 A2; the test asserts its new behavior
       - "scripts/gh-as-reviewer.sh"                       # changed by #1057 A2; the test asserts its new behavior
       - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/lib/gh-token-resolver.sh"                # changed by #1057 A2; the test asserts its new behavior
   # Codex usage-limit / not-connected marker detection (#722): the shared
   # scripts/lib/codex-failure-markers.sh regexes, codex-review-request.sh's
@@ -1604,6 +1615,7 @@ paths:
       - "scripts/lib/coderabbit-fence.sh"
       - "scripts/gh-as-reviewer.sh"
       - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/post-phase-4b-handoff.sh"
       - "scripts/coderabbit-wait.sh"
       - "scripts/codex-review-check.sh"
@@ -1645,6 +1657,7 @@ paths:
       - "scripts/lib/coderabbit-fence.sh"
       - "scripts/gh-as-reviewer.sh"
       - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/post-phase-4b-handoff.sh"
       - "scripts/coderabbit-wait.sh"
       - "scripts/codex-review-check.sh"
@@ -1717,6 +1730,7 @@ paths:
     requires:
       - "scripts/gh-as-reviewer.sh"
       - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/lib/gh-token-resolver.sh"
   # Dispatches the thread-resolution lane and waits for its own run (#1057
   # G). Dispatches through the author wrapper, so it repeats that wrapper's
@@ -1728,6 +1742,7 @@ paths:
       - ".github/workflows/thread-resolution-lane.yml"
       - "scripts/gh-as-author.sh"
       - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/identity-check.sh"
       - "scripts/lib/gh-command-classifier.sh"
@@ -1748,6 +1763,7 @@ paths:
       - "scripts/lib/reviewers-helpers.sh"
       - "scripts/gh-as-reviewer.sh"
       - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/identity-check.sh"
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/lib/credential-class.sh"

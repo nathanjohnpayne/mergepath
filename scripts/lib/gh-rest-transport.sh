@@ -39,8 +39,11 @@
 #   gh pr close N --repo OWNER/REPO [--comment TEXT] [--delete-branch]
 #   gh issue comment N --repo OWNER/REPO (--body B | --body-file F)
 #
-# --head defaults to the checked-out branch and --base to the repository's
-# default branch, as gh does. Repeatable options also take comma-separated
+# --head defaults to the checked-out branch, qualified owner:branch when its
+# push remote is another repository (a fork), and is refused when the branch
+# has no push remote; --base defaults to the branch's gh-merge-base, then the
+# repository's default branch, as gh does. --delete-branch deletes the remote
+# head ref and the local branch, unless that branch is checked out. Repeatable options also take comma-separated
 # values, as gh does. Refused: short options, --web, --editor, --edit-last,
 # --create-if-none, @me, org/team reviewers, `--body-file -`, a URL or branch
 # where N is expected, and any option not listed. Every other `gh pr …` or
@@ -78,8 +81,11 @@
 # `gh pr merge` is refused on this transport with exit 6, the ceiling code:
 # the gates that keep a merge honest (merge-writer.py, merge-clearance-gate.sh
 # and gh-pr-guard.sh's merge branch) read GraphQL, and a REST merge that
-# skipped them would not be the same merge. Park it with
-# scripts/post-local-agent-handback.sh. `gh api` payloads pass through under
+# skipped them would not be the same merge. Every spelling the shared merge
+# classifier (scripts/workflow/owner-admin-override.py) recognizes is refused
+# the same way: options before the group, the REST merge endpoint, and a
+# GraphQL merge mutation through `gh api`. Any other option before the command
+# group is refused too. Park a merge with scripts/post-local-agent-handback.sh. `gh api` payloads pass through under
 # the verified token: they are REST already. Any other gh command passes
 # through unchanged; a GraphQL read fails at the proxy with its own message.
 #
@@ -621,6 +627,47 @@ gh_rest_post_comment() {
 
 # --- verbs --------------------------------------------------------------------------
 
+# gh_rest_repo_of_url <remote URL> -> owner/repo, from the URL's last two path
+# segments. That covers https, scp-style and ssh GitHub URLs and the cloud
+# session proxy's remote, whose path ends in the repository too.
+gh_rest_repo_of_url() {
+  local url="$1" path
+  case "$url" in
+    *://*) path="${url#*://}"; path="${path#*/}" ;;
+    *:*) path="${url#*:}" ;;
+    *) return 1 ;;
+  esac
+  path="${path%/}"
+  path="${path%.git}"
+  case "$path" in */*) ;; *) return 1 ;; esac
+  printf '%s/%s\n' "$(basename "$(dirname "$path")")" "$(basename "$path")"
+}
+
+# gh_rest_default_head <repo>: the head for an omitted --head, as gh resolves
+# it: the checked-out branch, qualified owner:branch when it is pushed to a
+# different repository than <repo> (a fork). A branch with no push remote is
+# refused, as gh refuses one it has not pushed.
+gh_rest_default_head() {
+  local repo="$1" branch remote url pushed
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
+    gh_rest_refuse "pass --head BRANCH: no branch is checked out here"
+    return 1
+  fi
+  remote="$(git config --get "branch.$branch.pushRemote" 2>/dev/null || git config --get remote.pushDefault 2>/dev/null || git config --get "branch.$branch.remote" 2>/dev/null || true)"
+  url=""
+  [ -z "$remote" ] || url="$(git remote get-url --push "$remote" 2>/dev/null || true)"
+  if [ -z "$url" ] || ! pushed="$(gh_rest_repo_of_url "$url")"; then
+    gh_rest_refuse "pass --head: branch $branch has no push remote to tell which repository holds it (use owner:branch for a fork)"
+    return 1
+  fi
+  if [ "$(printf '%s' "$pushed" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]')" ]; then
+    printf '%s\n' "$branch"
+  else
+    printf '%s:%s\n' "${pushed%%/*}" "$branch"
+  fi
+}
+
 gh_rest_pr_create() {
   GH_REST_FORM='gh pr create --repo OWNER/REPO --title T (--body B | --body-file F) [--head BRANCH] [--base BRANCH] [--draft] [--label L]... [--reviewer USER]... [--assignee USER]...' # NO_BARE_GH_WRITE_EXEMPT: usage text printed in a refusal, never executed
   local repo="" title="" title_set=0 head="" base="" draft=false labels="" reviewers="" assignees=""
@@ -654,11 +701,7 @@ gh_rest_pr_create() {
     return 1
   fi
   if [ -z "$head" ]; then
-    head="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-    if [ -z "$head" ] || [ "$head" = "HEAD" ]; then
-      gh_rest_refuse "pass --head BRANCH: no branch is checked out here"
-      return 1
-    fi
+    head="$(gh_rest_default_head "$repo")" || return 1
   fi
   gh_rest_check_branch "$head" "--head" || return 1
   gh_rest_each "$(gh_rest_lines_json "$reviewers")" gh_rest_check_login_what "--reviewer" || return 1
@@ -1039,6 +1082,18 @@ gh_rest_pr_close() {
     else
       gh_rest_err "PR #$number is closed; its head branch is on another repository (${head_repo:-unknown}) and was not deleted."
     fi
+    # gh also deletes the local branch. A checked-out branch is left alone and
+    # reported: switching this session's checkout is not this write's to do.
+    if [ -n "$head_ref" ] && git show-ref --verify --quiet "refs/heads/$head_ref" 2>/dev/null; then
+      if [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)" = "$head_ref" ]; then
+        gh_rest_err "local branch $head_ref is checked out here, so it was not deleted; switch away and run git branch -D $head_ref."
+      elif git branch -D "$head_ref" >/dev/null 2>&1; then
+        gh_rest_err "deleted local branch $head_ref."
+      else
+        gh_rest_err "PR #$number is closed, but local branch $head_ref could not be deleted."
+        return 1
+      fi
+    fi
   fi
   gh_rest_err "Closed pull request #$number ($url)"
   return 0
@@ -1087,6 +1142,38 @@ gh_rest_run() {
   }
   chmod 700 "$GH_REST_TMPDIR" 2>/dev/null || true
   local rc=0
+  # Every merge spelling, including the REST merge endpoint and a GraphQL merge
+  # mutation through `gh api`, is classified by the same helper the gh
+  # transport uses, so none of them can pass through below. A spelling it
+  # refuses outright is refused here too.
+  local classifier action
+  classifier="$(cd "$(dirname "${BASH_SOURCE[0]}")/../workflow" 2>/dev/null && pwd -P)/owner-admin-override.py"
+  if [ ! -r "$classifier" ] || ! command -v python3 >/dev/null 2>&1; then
+    gh_rest_err "the merge classifier ($classifier) or python3 is missing, so a merge cannot be told apart from another write; refusing."
+    gh_rest_cleanup
+    return 1
+  fi
+  if ! action="$(python3 -I -S "$classifier" classify gh "$@")"; then
+    gh_rest_cleanup
+    return 2
+  fi
+  if [ -n "$action" ]; then
+    gh_rest_merge_refused
+    gh_rest_cleanup
+    return "$GH_REST_MERGE_CEILING_EXIT"
+  fi
+  # Options ahead of the command group (`gh --repo X pr comment`) are legal gh,
+  # but the dispatch below keys on the group and verb, so every option must
+  # follow the verb. Refused rather than passed through, which would run the
+  # native GraphQL command with no readback.
+  case "${1:-}" in
+    -*)
+      GH_REST_FORM='gh <group> <verb> ..., with every option after the verb' # NO_BARE_GH_WRITE_EXEMPT: usage text printed in a refusal, never executed
+      gh_rest_refuse "option '${1}' before the command group is not accepted"
+      gh_rest_cleanup
+      return 1
+      ;;
+  esac
   case "${1:-} ${2:-}" in
     "pr create"|"pr new") shift 2; gh_rest_pr_create "$@" || rc=$? ;;
     "pr comment") shift 2; gh_rest_comment pr "$@" || rc=$? ;;
