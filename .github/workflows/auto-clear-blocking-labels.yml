@@ -324,10 +324,55 @@ jobs:
               continue
             fi
 
-            set +e
-            scripts/codex-review-check.sh "$PR"
-            rc=$?
-            set -e
+            # --- Dependabot action-pin bump lane (mergepath#2164) --------
+            # A Dependabot PR that only bumps action pins under
+            # .github/workflows/ carries needs-external-review solely because
+            # `.github/**` is a protected path, and codex-review-check.sh can
+            # never clear it (Codex does not review Dependabot PRs). This is
+            # the TRUSTED removal authority for that label: default-branch
+            # code, a trusted trigger, and the proof re-derived here against
+            # the LIVE head/base pair by scripts/workflow/
+            # dependabot_pin_bump_exemption.sh — Dependabot-only, GitHub-
+            # committed, signature-verified commits, and a diff confined to
+            # `uses:` pin lines. The labeler's own non-application and its
+            # diagnostic marker grant nothing here. rc 1 (not a pin-only
+            # Dependabot PR, including every non-Dependabot PR) falls through
+            # to the ordinary merge-gate evaluation; rc 3 (no verdict
+            # reachable) is an infrastructure error like a gate rc 3, so the
+            # job fails loudly and the next event or sweep retries. The
+            # helper reads under the workflow token: three GET reads, no PAT
+            # quota. See REVIEW_POLICY.md § Dependabot action-pin bump lane.
+            gate_source=codex
+            PIN_JSON=""
+            if [ -x scripts/workflow/dependabot_pin_bump_exemption.sh ]; then
+              set +e
+              PIN_JSON=$(GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/dependabot_pin_bump_exemption.sh \
+                --repo "$REPO" --pr "$PR" --config .github/review-policy.yml)
+              pin_rc=$?
+              set -e
+            else
+              pin_rc=1
+              echo "Dependabot pin-bump lane: trusted helper absent on the default branch (pre-mergepath#2164 checkout); evaluating the merge gate only."
+            fi
+            PIN_REASON=$(jq -r '.reason // "no reason reported"' <<<"$PIN_JSON" 2>/dev/null || echo "no reason reported")
+            case "$pin_rc" in
+              0)
+                rc=0
+                gate_source=dependabot-pin-bump
+                echo "Dependabot pin-bump lane: VERIFIED on the live head/base pair — $PIN_REASON"
+                ;;
+              1)
+                echo "Dependabot pin-bump lane: not applicable — $PIN_REASON"
+                set +e
+                scripts/codex-review-check.sh "$PR"
+                rc=$?
+                set -e
+                ;;
+              *)
+                echo "::error::Dependabot pin-bump lane could not reach a verdict on PR #$PR (rc=$pin_rc): $PIN_REASON"
+                rc=3
+                ;;
+            esac
 
             case "$rc" in
               0)
@@ -414,7 +459,21 @@ jobs:
                     # Direct string body (NOT a heredoc — heredoc closing
                     # delimiter must be column-0 unless using `<<-` with
                     # tabs; YAML run blocks make that brittle).
-                    comment_body='**Automated label removal.** `scripts/codex-review-check.sh` cleared the merge gate on this HEAD (CI green + reviewer-identity APPROVED + Codex cleared). Removed `needs-external-review` so Label Gate passes and the PR can merge. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#195) for the trigger doctrine.'
+                    if [ "$gate_source" = dependabot-pin-bump ]; then
+                      # The evidence the lane acted on: the verified pair, the
+                      # provenance verdict and the pinned files. Diagnostic
+                      # marker; no reader treats it as authority.
+                      comment_body=$(printf '%s\n%s\n\n%s\n\n%s\n%s\n%s\n\n%s' \
+                        "<!-- mergepath-dependabot-pin-bump:v1 verified-head=$(jq -r '.head' <<<"$PIN_JSON") verified-base=$(jq -r '.base' <<<"$PIN_JSON") -->" \
+                        "**Automated label removal — Dependabot action-pin bump lane** ✅ (head \`$(jq -r '.head' <<<"$PIN_JSON")\`, base \`$(jq -r '.base' <<<"$PIN_JSON")\`)" \
+                        "This Dependabot PR touches \`.github/workflows/\` only through action pins, so it is exempt from the \`.github/**\` protected-path external-review rule (REVIEW_POLICY.md § Dependabot action-pin bump lane). Removed \`needs-external-review\` so Label Gate passes. Proven on the live head/base pair by the trusted \`scripts/workflow/dependabot_pin_bump_exemption.sh\`:" \
+                        "- Commit provenance: $(jq -r '.provenance' <<<"$PIN_JSON")" \
+                        "- Diff shape: $(jq -r '.pins' <<<"$PIN_JSON") action pin line(s) across $(jq -r '.files | length' <<<"$PIN_JSON") workflow file(s); every changed line is a \`uses:\` ref or its pin comment, and nothing else changed" \
+                        "$(jq -r '.files[] | "  - `\(.filename)`: \(.pins) pin line(s)"' <<<"$PIN_JSON")" \
+                        "The PR still needs CI green and the Dependabot reviewer-identity \`APPROVED\` on this head (Merge clearance gate). See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) for the trigger doctrine.")
+                    else
+                      comment_body='**Automated label removal.** `scripts/codex-review-check.sh` cleared the merge gate on this HEAD (CI green + reviewer-identity APPROVED + Codex cleared). Removed `needs-external-review` so Label Gate passes and the PR can merge. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#195) for the trigger doctrine.'
+                    fi
                     # #530 (IMPLEMENTED — was DEFER+DOCUMENT, human-ratified
                     # 2026-06-28): this attribution-comment POST is
                     # NON-idempotent, so it is deliberately NOT wrapped in
@@ -790,10 +849,43 @@ jobs:
               continue
             fi
 
-            set +e
-            scripts/codex-review-check.sh "$PR"
-            rc=$?
-            set -e
+            # Dependabot action-pin bump lane (mergepath#2164) — the sweep is
+            # the backstop for this lane: the labeler applies the label with
+            # GITHUB_TOKEN, which fires no `labeled` run here, so a pin-only
+            # Dependabot PR labeled by an older or fail-closed labeler is
+            # cleared by this sweep within one interval. Same proof, same
+            # verdict mapping as the event-driven job above.
+            gate_source=codex
+            PIN_JSON=""
+            if [ -x scripts/workflow/dependabot_pin_bump_exemption.sh ]; then
+              set +e
+              PIN_JSON=$(GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/dependabot_pin_bump_exemption.sh \
+                --repo "$REPO" --pr "$PR" --config .github/review-policy.yml)
+              pin_rc=$?
+              set -e
+            else
+              pin_rc=1
+              echo "Dependabot pin-bump lane: trusted helper absent on the default branch (pre-mergepath#2164 checkout); evaluating the merge gate only."
+            fi
+            PIN_REASON=$(jq -r '.reason // "no reason reported"' <<<"$PIN_JSON" 2>/dev/null || echo "no reason reported")
+            case "$pin_rc" in
+              0)
+                rc=0
+                gate_source=dependabot-pin-bump
+                echo "Dependabot pin-bump lane: VERIFIED on the live head/base pair — $PIN_REASON"
+                ;;
+              1)
+                echo "Dependabot pin-bump lane: not applicable — $PIN_REASON"
+                set +e
+                scripts/codex-review-check.sh "$PR"
+                rc=$?
+                set -e
+                ;;
+              *)
+                echo "::error::Dependabot pin-bump lane could not reach a verdict on PR #$PR (rc=$pin_rc): $PIN_REASON"
+                rc=3
+                ;;
+            esac
             case "$rc" in
               0)
                 # Match the event-driven clear path: remove any unsafe durable
@@ -848,7 +940,18 @@ jobs:
                   # Comment ONLY if THIS sweep performed the removal (#827).
                   case "$del_status" in
                     200|204)
-                      comment_body='**Automated label removal (scheduled sweep).** `scripts/codex-review-check.sh` cleared the merge gate on this HEAD between event triggers (for example, an anchored Codex verdict or review arriving between event-driven evaluations). Removed `needs-external-review`. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#197) for the sweep doctrine.'
+                      if [ "$gate_source" = dependabot-pin-bump ]; then
+                        comment_body=$(printf '%s\n%s\n\n%s\n\n%s\n%s\n%s\n\n%s' \
+                          "<!-- mergepath-dependabot-pin-bump:v1 verified-head=$(jq -r '.head' <<<"$PIN_JSON") verified-base=$(jq -r '.base' <<<"$PIN_JSON") -->" \
+                          "**Automated label removal (scheduled sweep) — Dependabot action-pin bump lane** ✅ (head \`$(jq -r '.head' <<<"$PIN_JSON")\`, base \`$(jq -r '.base' <<<"$PIN_JSON")\`)" \
+                          "This Dependabot PR touches \`.github/workflows/\` only through action pins, so it is exempt from the \`.github/**\` protected-path external-review rule (REVIEW_POLICY.md § Dependabot action-pin bump lane). Removed \`needs-external-review\` so Label Gate passes. Proven on the live head/base pair by the trusted \`scripts/workflow/dependabot_pin_bump_exemption.sh\`:" \
+                          "- Commit provenance: $(jq -r '.provenance' <<<"$PIN_JSON")" \
+                          "- Diff shape: $(jq -r '.pins' <<<"$PIN_JSON") action pin line(s) across $(jq -r '.files | length' <<<"$PIN_JSON") workflow file(s); every changed line is a \`uses:\` ref or its pin comment, and nothing else changed" \
+                          "$(jq -r '.files[] | "  - `\(.filename)`: \(.pins) pin line(s)"' <<<"$PIN_JSON")" \
+                          "The PR still needs CI green and the Dependabot reviewer-identity \`APPROVED\` on this head (Merge clearance gate). See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) for the sweep doctrine.")
+                      else
+                        comment_body='**Automated label removal (scheduled sweep).** `scripts/codex-review-check.sh` cleared the merge gate on this HEAD between event triggers (for example, an anchored Codex verdict or review arriving between event-driven evaluations). Removed `needs-external-review`. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#197) for the sweep doctrine.'
+                      fi
                       # #530: non-idempotent comment POST — deliberately
                       # unretried (a single attempt cannot duplicate); see the
                       # event-driven job above for the full rationale. Failure

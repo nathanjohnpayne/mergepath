@@ -528,6 +528,79 @@ jobs:
             echo "classification=external-required" >> "$GITHUB_OUTPUT"
           fi
 
+          # --- Dependabot action-pin bump lane (mergepath#2164) ----------
+          # `.github/**` is a protected path so a human-authored workflow
+          # edit gets a cross-agent review. A Dependabot bump of a pinned
+          # action matches that rule too, and Codex never reviews Dependabot
+          # PRs, so the label sat until a human admin override (#2131/#2132/
+          # #2133, ~17h each). Same shape as the propagation lane above:
+          # exempt on PROOF, never on the author login or the file name. The
+          # proof is the trusted helper's: every commit on the PR is
+          # Dependabot-authored, GitHub-committed and signature-verified
+          # (scripts/lib/dependabot-commit-provenance.sh), and every changed
+          # line is a `uses: owner/repo@<ref> # vX.Y.Z` pin whose text up to
+          # the `@` is unchanged, in `.github/workflows/*.yml` and nowhere
+          # else. The helper and the libs it sources come from the TRUSTED
+          # tree (base, or default-branch fallback), never the PR checkout.
+          #
+          # Scope: only the protected-path reason is carved out. A diff that
+          # also crosses the line threshold, or a files read GitHub capped,
+          # keeps the label. This path only DECLINES TO APPLY the label and
+          # publishes a diagnostic; it removes nothing. The authority that
+          # clears a label already present (an older labeler, a fail-closed
+          # earlier head, a race) is the trusted pull_request_target /
+          # workflow_run / scheduled path in auto-clear-blocking-labels.yml,
+          # which re-runs this same helper from the default branch against
+          # the LIVE head/base pair. See REVIEW_POLICY.md § Dependabot
+          # action-pin bump lane.
+          echo "dependabot_pin_bump=false" >> "$GITHUB_OUTPUT"
+          if [ "$NEEDS_REVIEW" = "true" ] && [ "$PR_AUTHOR" = 'dependabot[bot]' ]; then
+            PIN_HELPER="$TRUSTED_HELPER_DIR/dependabot_pin_bump_exemption.sh"
+            if [ ! -f "$PIN_HELPER" ]; then
+              echo "Dependabot pin-bump lane: no trusted helper at $PIN_HELPER (helpers from $TRUSTED_SOURCE predate mergepath#2164) — not lane-eligible; falls through to normal review."
+            elif ! jq -e '(.lines_changed < .threshold) and (.reasons | length) == 1 and (.reasons[0] | startswith("protected paths modified: "))' <<<"$FINGERPRINT_JSON" >/dev/null; then
+              echo "Dependabot pin-bump lane: external review is required for more than the protected-path rule ($(jq -r '.reasons | join("; ")' <<<"$FINGERPRINT_JSON")) — not lane-eligible."
+            else
+              set +e
+              PIN_JSON=$(bash "$PIN_HELPER" \
+                --repo "$REPO" \
+                --pr "$PR_NUMBER" \
+                --head "$HEAD_SHA" \
+                --base "$BASE_SHA" \
+                --config "$TRUSTED_CONFIG" \
+                --files-json "$FILES_JSON")
+              pin_rc=$?
+              set -e
+              PIN_REASON=$(jq -r '.reason // ""' <<<"$PIN_JSON" 2>/dev/null || true)
+              case "$pin_rc" in
+                0)
+                  echo "Dependabot pin-bump lane: VERIFIED at head $HEAD_SHA / base $BASE_SHA — $PIN_REASON"
+                  {
+                    echo "### Dependabot action-pin bump lane"
+                    echo
+                    echo "Exempt from the \`.github/**\` protected-path external-review rule at head \`$HEAD_SHA\` / base \`$BASE_SHA\` (REVIEW_POLICY.md § Dependabot action-pin bump lane):"
+                    echo
+                    echo "- Commit provenance: $(jq -r '.provenance' <<<"$PIN_JSON")"
+                    echo "- Diff shape: $(jq -r '.pins' <<<"$PIN_JSON") action pin line(s) across $(jq -r '.files | length' <<<"$PIN_JSON") workflow file(s); every changed line is a \`uses:\` ref or its pin comment"
+                    jq -r '.files[] | "  - `\(.filename)`: \(.pins) pin line(s)"' <<<"$PIN_JSON"
+                  } >> "${GITHUB_STEP_SUMMARY:-/dev/stderr}"
+                  echo "needs_review=false" >> "$GITHUB_OUTPUT"
+                  echo "reasons=" >> "$GITHUB_OUTPUT"
+                  echo "classification=dependabot-pin-bump" >> "$GITHUB_OUTPUT"
+                  echo "dependabot_pin_bump=true" >> "$GITHUB_OUTPUT"
+                  echo "dependabot_pin_bump_evidence=$PIN_JSON" >> "$GITHUB_OUTPUT"
+                  exit 0
+                  ;;
+                1)
+                  echo "Dependabot pin-bump lane: not exempt — $PIN_REASON. Normal external review applies."
+                  ;;
+                *)
+                  echo "Dependabot pin-bump lane: the proof could not be reached (rc=$pin_rc${PIN_REASON:+: $PIN_REASON}); requiring review fail-closed. The next head or label event re-evaluates it."
+                  ;;
+              esac
+            fi
+          fi
+
           # A label delivery can arrive after Phase 4 already
           # cleared this exact head. Ask the canonical merge predicate rather
           # than reimplementing Codex / Phase 4b authority here. Its normal
@@ -1012,3 +1085,62 @@ jobs:
               --repo "${{ github.repository }}"
             echo "Removed needs-external-review — PR qualifies for the propagation review lane."
           fi
+
+      - name: Dependabot action-pin bump lane
+        if: steps.check.outputs.dependabot_pin_bump == 'true'
+        env:
+          # Diagnostic only: this step writes one github-actions[bot] marker
+          # comment per verified head/base pair and nothing else. It removes
+          # no label (auto-clear-blocking-labels.yml owns that, on a trusted
+          # trigger, against the live pair) and it grants no clearance — the
+          # Merge clearance gate judges a Dependabot PR by its own provenance
+          # arm. A copied marker, an old pair, or a bot byline exempts nothing.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVIDENCE: ${{ steps.check.outputs.dependabot_pin_bump_evidence }}
+        run: |
+          set -euo pipefail
+          MARKER="<!-- mergepath-dependabot-pin-bump:v1 verified-head=$HEAD_SHA verified-base=$BASE_SHA -->"
+          # Paginated read: a long-lived PR's comments routinely exceed one page.
+          ALREADY=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" --jq '.[].body' | grep -F "$MARKER" || true)
+          if [ -n "$ALREADY" ]; then
+            echo "Diagnostic marker already posted for head $HEAD_SHA / base $BASE_SHA; nothing to do."
+            exit 0
+          fi
+          # Fence the event pair against the live PR before publishing. An
+          # unreadable or malformed pair fails this step closed; a confirmed
+          # move is a successful stale-run no-op.
+          if ! LIVE_PAIR=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '{head:.head.sha,base:.base.sha}'); then
+            echo "::error::Could not read the live PR head/base before publishing the pin-bump marker." >&2
+            exit 1
+          fi
+          if ! jq -e '
+              select((.head | type) == "string" and (.head | test("^[0-9a-fA-F]{40}$")))
+              | select((.base | type) == "string" and (.base | test("^[0-9a-fA-F]{40}$")))
+            ' <<<"$LIVE_PAIR" >/dev/null; then
+            echo "::error::Live PR head/base is malformed; refusing to publish the pin-bump marker." >&2
+            exit 1
+          fi
+          if [ "$(jq -r '.head' <<<"$LIVE_PAIR")" != "$HEAD_SHA" ] || [ "$(jq -r '.base' <<<"$LIVE_PAIR")" != "$BASE_SHA" ]; then
+            echo "PR head/base moved from $HEAD_SHA/$BASE_SHA; skipping the stale pin-bump marker."
+            exit 0
+          fi
+          if ! jq -e '.exempt == true and (.provenance | type) == "string" and (.files | type) == "array"' <<<"$EVIDENCE" >/dev/null; then
+            echo "::error::Pin-bump evidence from the check step is malformed; refusing to publish a marker." >&2
+            exit 1
+          fi
+          BODY=$(mktemp)
+          {
+            printf '%s\n' "$MARKER"
+            printf '**Dependabot action-pin bump lane** — verified pin-only bump ✅ (head `%s`, base `%s`)\n\n' "$HEAD_SHA" "$BASE_SHA"
+            printf 'This Dependabot PR touches `.github/workflows/` only through action pins, so it is **exempt from the `.github/**` protected-path external-review rule** (REVIEW_POLICY.md § Dependabot action-pin bump lane) and is not labeled `needs-external-review`. Proven at this head/base pair by the trusted `scripts/workflow/dependabot_pin_bump_exemption.sh`:\n\n'
+            printf -- '- Commit provenance: %s\n' "$(jq -r '.provenance' <<<"$EVIDENCE")"
+            printf -- '- Diff shape: %s action pin line(s) across %s workflow file(s); every changed line is a `uses:` ref or its pin comment, and nothing else changed\n' "$(jq -r '.pins' <<<"$EVIDENCE")" "$(jq -r '.files | length' <<<"$EVIDENCE")"
+            jq -r '.files[] | "  - `\(.filename)`: \(.pins) pin line(s)"' <<<"$EVIDENCE"
+            printf '\nThis marker is diagnostic. Any other change under `.github/**`, a commit not produced by Dependabot, or a new head re-enters the ordinary protected-path review. The PR still needs CI green and the Dependabot reviewer-identity `APPROVED` on this head (Merge clearance gate).\n\n> Automated check per .github/review-policy.yml\n'
+          } >"$BODY"
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$BODY"
+          rm -f "$BODY"

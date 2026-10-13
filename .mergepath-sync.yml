@@ -1173,6 +1173,14 @@ paths:
   - path: tests/test_dependabot_auto_merge_check_wait.sh
     type: canonical
     consumers: all
+    # The suite also drives the Dependabot action-pin bump lane helper
+    # (#2164) with a PATH-shimmed gh; shipped ahead of the helper it would
+    # fail on every consumer, so the helper and the libs it sources travel
+    # with it.
+    requires:
+      - "scripts/workflow/dependabot_pin_bump_exemption.sh"
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/dependabot-commit-provenance.sh"
   # Pairs with scripts/ci/check_git_identity_hygiene (#777), the guard
   # against a repo-local git identity override silently reattributing and
   # unsigning every commit made from the checkout (and from every worktree
@@ -1978,6 +1986,14 @@ paths:
       # every PR. Declared directly, as the manifest already does for the
       # parity test's same transitive dependency.
       - "scripts/lib/reviewers-helpers.sh"
+      # The External Review Check runs the Dependabot action-pin bump lane
+      # helper from the trusted base tree (#2164); the helper hard-sources
+      # both libs from its own tree and exits 2 without them. The helper is
+      # inside the scripts/workflow/ kit above; the libs are declared here so
+      # the commit-path closure keeps them in lockstep with this workflow.
+      - "scripts/workflow/dependabot_pin_bump_exemption.sh"
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/dependabot-commit-provenance.sh"
   - path: .github/workflows/dependabot-auto-merge.yml
     type: canonical
     consumers: all
@@ -2011,6 +2027,13 @@ paths:
       - "scripts/lib/blocking-labels.sh"
       - "scripts/workflow/approval-merge-continuation.sh"
       - "scripts/workflow/report-approval-continuation-failures.sh"
+      # Both label-clearing loops run the Dependabot action-pin bump lane
+      # helper from the default-branch checkout before the merge-gate
+      # evaluation (#2164). The workflow tolerates its absence (falls through
+      # to the gate), but the helper itself hard-sources the two libs.
+      - "scripts/workflow/dependabot_pin_bump_exemption.sh"
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/dependabot-commit-provenance.sh"
       - "scripts/merge-clearance-gate.sh"
       - "scripts/codex-review-check.sh"
       - "scripts/review-feedback-accounting.sh"
@@ -2463,6 +2486,7 @@ paths:
       - "scripts/lib/gh-api-scalar.sh"           # #799, fail-closed scalar API reads
       - "scripts/lib/review-policy-scalar.sh"    # #1062, shared governing-policy identity parse
       - "scripts/lib/gh-api-array.sh"             # #1094, final live review pagination
+      - "scripts/lib/dependabot-commit-provenance.sh"  # #2164, dependabot_pin_bump_exemption.sh provenance arm
       - "scripts/lib/reviewers-helpers.sh"        # #1094, governing reviewer allow-list
       - "scripts/lib/blocking-labels.sh"          # #1094, final mutable label recheck
       - "scripts/lib/merge-queue-protection.sh"   # #1058, safe native-arm preservation + bridge topology
