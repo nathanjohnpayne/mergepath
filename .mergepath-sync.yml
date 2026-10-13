@@ -1181,6 +1181,7 @@ paths:
       - "scripts/workflow/dependabot_pin_bump_exemption.sh"
       - "scripts/lib/gh-api-array.sh"
       - "scripts/lib/dependabot-commit-provenance.sh"
+      - "scripts/lib/feedback-policy-helpers.sh"
   # Pairs with scripts/ci/check_git_identity_hygiene (#777), the guard
   # against a repo-local git identity override silently reattributing and
   # unsigning every commit made from the checkout (and from every worktree
@@ -1994,6 +1995,7 @@ paths:
       - "scripts/workflow/dependabot_pin_bump_exemption.sh"
       - "scripts/lib/gh-api-array.sh"
       - "scripts/lib/dependabot-commit-provenance.sh"
+      - "scripts/lib/feedback-policy-helpers.sh"   # helper's structured policy read (policy_yaml_to_json)
   - path: .github/workflows/dependabot-auto-merge.yml
     type: canonical
     consumers: all
@@ -2029,11 +2031,14 @@ paths:
       - "scripts/workflow/report-approval-continuation-failures.sh"
       # Both label-clearing loops run the Dependabot action-pin bump lane
       # helper from the default-branch checkout before the merge-gate
-      # evaluation (#2164). The workflow tolerates its absence (falls through
-      # to the gate), but the helper itself hard-sources the two libs.
+      # evaluation (#2164), after resolving the governing base policy with
+      # resolve_base_policy.sh. The workflow tolerates their absence (falls
+      # through to the gate), but the helper hard-sources the three libs.
       - "scripts/workflow/dependabot_pin_bump_exemption.sh"
+      - "scripts/workflow/resolve_base_policy.sh"
       - "scripts/lib/gh-api-array.sh"
       - "scripts/lib/dependabot-commit-provenance.sh"
+      - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/merge-clearance-gate.sh"
       - "scripts/codex-review-check.sh"
       - "scripts/review-feedback-accounting.sh"

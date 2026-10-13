@@ -854,14 +854,19 @@ dependabot:
   # APPLY the label (trusted helper from the PR base, a diagnostic
   # `mergepath-dependabot-pin-bump:v1` marker per verified pair);
   # auto-clear-blocking-labels.yml REMOVES a label already present on its
-  # trusted pull_request_target / workflow_run / scheduled path, re-proving
-  # against the live pair. Neither path reads the other's marker as
-  # authority.
+  # trusted pull_request_target / workflow_run / scheduled path, under the
+  # policy governing the live BASE (resolve_base_policy.sh), only when the
+  # latest label event is a github-actions[bot] application (a human
+  # force-on is never cleared by the lane), re-proving against the live pair
+  # and re-reading it immediately before the DELETE. Neither path reads the
+  # other's marker as authority.
   #
   # Absent block or key => enabled (the fleet default; this file is not
   # propagated, so the default must not live only here). An explicit false
   # opts out: every Dependabot workflow edit then takes the ordinary
-  # protected-path review. Any other value fails closed (not exempt).
+  # protected-path review. Read through the shared structured YAML parser,
+  # so flow style and quoted keys count; any other value, or a policy that
+  # cannot be parsed, fails closed (not exempt).
   pin_bump_exemption:
     enabled: true
 

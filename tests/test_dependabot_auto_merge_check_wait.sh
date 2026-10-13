@@ -719,6 +719,31 @@ pin_case "an absent pin_bump_exemption block defaults to enabled" 0 exempt "1 pi
 printf 'dependabot:\n  pin_bump_exemption:\n    enabled: maybe\n' >"$PIN_DIR/policy-bad.yml"
 pin_case "a malformed enabled: value fails closed as unreadable" 3 unreadable "must be true or false" \
   "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-bad.yml" >/dev/null
+# The opt-out is read through the shared structured parser: flow style and
+# quoted keys are valid YAML and must be honored, not silently defaulted.
+printf 'dependabot: { reviewer_gate: { enabled: true }, pin_bump_exemption: { enabled: false } }\n' >"$PIN_DIR/policy-flow.yml"
+pin_case "a flow-style opt-out is honored" 1 not-exempt "opted out" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-flow.yml" >/dev/null
+printf '"dependabot":\n  "pin_bump_exemption":\n    "enabled": false\n' >"$PIN_DIR/policy-quoted-keys.yml"
+pin_case "a quoted-key opt-out is honored" 1 not-exempt "opted out" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-quoted-keys.yml" >/dev/null
+printf 'dependabot: [not, a, mapping]\n' >"$PIN_DIR/policy-shape.yml"
+pin_case "a dependabot block of the wrong shape fails closed as unreadable" 3 unreadable "must be true or false" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-shape.yml" >/dev/null
+printf 'dependabot: {pin_bump_exemption: {enabled: false}\n' >"$PIN_DIR/policy-broken.yml"
+pin_case "an unparseable policy fails closed as unreadable rather than defaulting to enabled" 3 unreadable "could not be parsed" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-broken.yml" >/dev/null
+# The lane carves out only the protected-path rule: a diff at or above the
+# governing threshold is not exempt however pin-shaped it is.
+printf 'external_review_threshold: 2\n' >"$PIN_DIR/policy-threshold.yml"
+pin_case "a pin-only diff at or above external_review_threshold is not exempt" 1 not-exempt "at or above external_review_threshold 2" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-threshold.yml" >/dev/null
+printf 'external_review_threshold: 3\n' >"$PIN_DIR/policy-threshold-3.yml"
+pin_case "a pin-only diff under the threshold stays exempt" 0 exempt "1 pin(s)" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-threshold-3.yml" >/dev/null
+printf 'external_review_threshold: lots\n' >"$PIN_DIR/policy-threshold-bad.yml"
+pin_case "a malformed threshold fails closed as unreadable" 3 unreadable "external_review_threshold must be a non-negative integer" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-threshold-bad.yml" >/dev/null
 
 # --- unreadable: no verdict, fail closed ----------------------------------
 pin_case "an unreadable commits list is not a verdict" 3 unreadable "could not be verified" \
@@ -895,16 +920,36 @@ SHIM
     fi
     helper_line=$(grep -n 'bash scripts/workflow/dependabot_pin_bump_exemption.sh' <<<"$LOOP" | head -1 | cut -d: -f1)
     gate_line=$(grep -n 'scripts/codex-review-check.sh "$PR"' <<<"$LOOP" | head -1 | cut -d: -f1)
+    retract_line=$(grep -n -- '--retract-unsafe-only "$PR" "$REPO"' <<<"$LOOP" | head -1 | cut -d: -f1)
+    fence_line=$(grep -n -F "live_pair=\$(GH_TOKEN=\"\$WORKFLOW_TOKEN\" gh api \"repos/\$REPO/pulls/\$PR\"" <<<"$LOOP" | head -1 | cut -d: -f1)
     delete_line=$(grep -n -- '-X DELETE -i --silent' <<<"$LOOP" | head -1 | cut -d: -f1)
     if [ -n "$helper_line" ] && [ -n "$gate_line" ] && [ -n "$delete_line" ] \
        && [ "$helper_line" -lt "$gate_line" ] && [ "$gate_line" -lt "$delete_line" ] \
+       && [ -n "$retract_line" ] && [ -n "$fence_line" ] \
+       && [ "$retract_line" -lt "$fence_line" ] && [ "$fence_line" -lt "$delete_line" ] \
+       && grep -Fq "proven_pair=\$(jq -r '[.head, .base] | @tsv' <<<\"\$PIN_JSON\")" <<<"$LOOP" \
+       && grep -Fq '[ "$live_pair" != "$proven_pair" ]' <<<"$LOOP" \
        && grep -Fq 'PIN_JSON=$(GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/dependabot_pin_bump_exemption.sh' <<<"$LOOP" \
-       && grep -Fq -- '--config .github/review-policy.yml' <<<"$LOOP" \
+       && grep -Fq -- '--repo "$REPO" --pr "$PR" --config "$LANE_POLICY")' <<<"$LOOP" \
+       && ! grep -Fq -- '--config .github/review-policy.yml)' <<<"$LOOP" \
        && grep -Fq 'gate_source=dependabot-pin-bump' <<<"$LOOP" \
        && grep -Fq 'mergepath-dependabot-pin-bump:v1 verified-head=' <<<"$LOOP"; then
-      pass "auto-clear $job: runs the trusted pin-bump helper under the workflow token before the merge gate, and attributes the removal to the lane"
+      pass "auto-clear $job: runs the trusted pin-bump helper under the workflow token before the merge gate, re-fences the proven pair before the DELETE, and attributes the removal to the lane"
     else
-      fail "auto-clear $job: the pin-bump lane must run before codex-review-check.sh and before the DELETE, under WORKFLOW_TOKEN with the default-branch policy (helper=$helper_line gate=$gate_line delete=$delete_line)"
+      fail "auto-clear $job: the pin-bump lane must run before codex-review-check.sh, re-fence before the DELETE, and read the governing base policy (helper=$helper_line gate=$gate_line retract=$retract_line fence=$fence_line delete=$delete_line)"
+    fi
+    # The governing policy is the live base's, and only a policy-applied label
+    # is the lane's to clear: both are established BEFORE the helper runs.
+    policy_line=$(grep -n 'bash scripts/workflow/resolve_base_policy.sh' <<<"$LOOP" | head -1 | cut -d: -f1)
+    owner_line=$(grep -n 'gh api --paginate "repos/$REPO/issues/$PR/timeline"' <<<"$LOOP" | head -1 | cut -d: -f1)
+    if [ -n "$policy_line" ] && [ -n "$owner_line" ] && [ -n "$helper_line" ] \
+       && [ "$policy_line" -lt "$owner_line" ] && [ "$owner_line" -lt "$helper_line" ] \
+       && grep -Fq -- '--repo "$REPO" --pr "$PR" --default-config .github/review-policy.yml' <<<"$LOOP" \
+       && grep -Fq "[ \"\$LANE_OWNER\" != 'labeled:github-actions[bot]' ]" <<<"$LOOP" \
+       && grep -Fq '"\(.event):\(.actor.login // "<unknown>")"' <<<"$LOOP"; then
+      pass "auto-clear $job: resolves the governing base policy and requires a policy-applied label before consulting the lane"
+    else
+      fail "auto-clear $job: must resolve the base policy (resolve_base_policy.sh) and check the latest label event is a github-actions[bot] application before the helper (policy=$policy_line owner=$owner_line helper=$helper_line)"
     fi
     # rc 3 → infra sentinel; rc 1 → ordinary merge-gate evaluation.
     arm=$(awk '/case "\$pin_rc" in/{f=1} f{print} f && /^[[:space:]]*esac[[:space:]]*$/{exit}' <<<"$LOOP")

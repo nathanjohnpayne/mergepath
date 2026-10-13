@@ -31,7 +31,11 @@
 #      commits to a Dependabot branch and the PR stays "authored by
 #      dependabot[bot]".
 #   2. The governing policy (`--config`) does not opt out:
-#      `dependabot.pin_bump_exemption.enabled` is absent or `true`.
+#      `dependabot.pin_bump_exemption.enabled` is absent or `true` — read
+#      through the shared structured YAML parser, so flow style and quoted
+#      keys count and an unparseable policy is "unknown", never "enabled" —
+#      and the diff stays under its `external_review_threshold`: the lane
+#      carves out only the protected-path rule, never the size rule.
 #   3. Commit provenance: EVERY commit on the PR, the pinned head included, is
 #      authored by `dependabot[bot]`, committed by GitHub and
 #      signature-verified — the shared predicate in
@@ -152,7 +156,7 @@ command -v jq >/dev/null 2>&1 || { echo "dependabot_pin_bump_exemption.sh: jq is
 # Hard-required, not existence-guarded (same posture as
 # external_review_fingerprint.sh, #799): the proof is a review exemption, so a
 # tree missing either lib must error rather than reach a verdict without it.
-for lib in gh-api-array.sh dependabot-commit-provenance.sh; do
+for lib in gh-api-array.sh dependabot-commit-provenance.sh feedback-policy-helpers.sh; do
   if [ ! -r "$SCRIPT_DIR/../lib/$lib" ]; then
     echo "dependabot_pin_bump_exemption.sh: missing helper: $SCRIPT_DIR/../lib/$lib" >&2
     exit 2
@@ -162,6 +166,8 @@ done
 . "$SCRIPT_DIR/../lib/gh-api-array.sh"
 # shellcheck source=../lib/dependabot-commit-provenance.sh
 . "$SCRIPT_DIR/../lib/dependabot-commit-provenance.sh"
+# shellcheck source=../lib/feedback-policy-helpers.sh
+. "$SCRIPT_DIR/../lib/feedback-policy-helpers.sh"
 
 # Report channel. Every exit path prints one JSON object so a caller can log
 # the reason without parsing stderr; the exit code is the verdict.
@@ -246,36 +252,45 @@ if [ "$AUTHOR" != 'dependabot[bot]' ]; then
   not_exempt "PR author is '$AUTHOR', not dependabot[bot]; the action-pin bump lane applies only to Dependabot-opened PRs"
 fi
 
-# Policy opt-out, read from the caller's TRUSTED config (the governing base
-# policy in pr-review-policy.yml; the default-branch copy in the auto-clear
-# workflow). Absent block or key => enabled; only an explicit `false` opts
-# out. Three-level reader mirroring merge-clearance-gate.sh's nested_field,
-# quote- and comment-stripped.
-policy_pin_bump_enabled() {  # prints the raw scalar, or nothing when absent
-  [ -n "$CONFIG" ] || return 0
-  awk '
-    /^dependabot:/ { in_top=1; in_sub=0; next }
-    in_top && /^[^[:space:]#]/ { in_top=0; in_sub=0 }
-    in_top && $1 == "pin_bump_exemption:" { in_sub=1; next }
-    in_sub && /^[[:space:]]{0,3}[^[:space:]#]/ { in_sub=0 }
-    in_sub && $1 == "enabled:" {
-      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-      gsub(/^["\047]/, "", $0)
-      gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
-      gsub(/[[:space:]]*#.*$/, "", $0)
-      sub(/[[:space:]]+$/, "", $0)
-      print
-      exit
-    }
-  ' "$CONFIG"
-}
-ENABLED=$(policy_pin_bump_enabled)
-ENABLED=${ENABLED:-true}
+# Governing policy, read from the caller's TRUSTED config (the PR-base policy
+# in pr-review-policy.yml and, via resolve_base_policy.sh, in the auto-clear
+# workflow) through the ONE structured parser the repo already shares
+# (scripts/lib/feedback-policy-helpers.sh policy_yaml_to_json), so block
+# style, flow style and quoted keys all resolve. A line-oriented reader
+# would miss `"dependabot":` or `dependabot: {pin_bump_exemption: {enabled:
+# false}}` and silently default an explicit opt-out to enabled; a policy
+# that cannot be parsed at all is therefore "unknown", never "enabled".
+#
+#   dependabot.pin_bump_exemption.enabled  absent => true; true/false (bare
+#                                          or quoted) honored; anything else
+#                                          is unreadable.
+#   external_review_threshold              absent => 300; a non-negative
+#                                          integer; anything else unreadable.
+POLICY_JSON='{}'
+if [ -n "$CONFIG" ]; then
+  POLICY_JSON=$(policy_yaml_to_json "$CONFIG") || POLICY_JSON=""
+  if [ -z "$POLICY_JSON" ] || ! jq -e 'type == "object"' <<<"$POLICY_JSON" >/dev/null 2>&1; then
+    unreadable "governing policy $CONFIG could not be parsed as a YAML mapping (no parser available, or malformed); the lane cannot establish its opt-out"
+  fi
+fi
+ENABLED=$(jq -r '
+  (try (.dependabot.pin_bump_exemption.enabled) catch "<malformed>")
+  | if . == null then "true"
+    elif . == true or . == "true" then "true"
+    elif . == false or . == "false" then "false"
+    else "<invalid:" + tostring + ">" end' <<<"$POLICY_JSON")
 case "$ENABLED" in
   true) ;;
   false) not_exempt "dependabot.pin_bump_exemption.enabled is false in the governing policy; the lane is opted out" ;;
-  *) unreadable "dependabot.pin_bump_exemption.enabled must be true or false; got '$ENABLED'" ;;
+  *) unreadable "dependabot.pin_bump_exemption.enabled must be true or false; got $ENABLED" ;;
 esac
+THRESHOLD=$(jq -r '
+  (try (.external_review_threshold) catch "<malformed>")
+  | if . == null then 300
+    elif (type == "number" and . == floor and . >= 0) then .
+    elif (type == "string" and test("^[0-9]+$")) then tonumber
+    else "<invalid:" + tostring + ">" end' <<<"$POLICY_JSON")
+[[ "$THRESHOLD" =~ ^[0-9]+$ ]] || unreadable "external_review_threshold must be a non-negative integer; got $THRESHOLD"
 
 # Commit provenance — the shared predicate. rc 1 is a positive "not
 # Dependabot-only" verdict; rc 3 establishes nothing and fails closed.
@@ -312,6 +327,15 @@ FILES_COUNT=$(printf '%s' "$FILES_JSON" | jq 'length')
 # The files endpoint stops at 3000 entries; a diff that large cannot be
 # enumerated, so it cannot be proven pin-only.
 [ "$FILES_COUNT" -lt 3000 ] || not_exempt "PR lists $FILES_COUNT files; the pulls files endpoint stops at 3000, so every hunk cannot be verified"
+
+# The lane carves out ONLY the protected-path rule. A diff at or above the
+# governing external_review_threshold needs review for its size whatever its
+# shape, so it is not exempt — the same eligibility the labeler applies before
+# consulting this helper, enforced here so every caller gets it.
+LINES_CHANGED=$(printf '%s' "$FILES_JSON" | jq '[ .[] | ((.additions // 0) + (.deletions // 0)) ] | add // 0')
+if [ "$LINES_CHANGED" -ge "$THRESHOLD" ]; then
+  not_exempt "PR changes $LINES_CHANGED line(s), at or above external_review_threshold $THRESHOLD; the lane carves out only the protected-path rule, not the size threshold"
+fi
 
 UNBOUND=$(printf '%s' "$FILES_JSON" | jq -r --arg head "$HEAD" '
   [ .[] | select(((.contents_url // "") | type) != "string"

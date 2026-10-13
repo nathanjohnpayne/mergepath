@@ -344,15 +344,63 @@ jobs:
             # quota. See REVIEW_POLICY.md § Dependabot action-pin bump lane.
             gate_source=codex
             PIN_JSON=""
-            if [ -x scripts/workflow/dependabot_pin_bump_exemption.sh ]; then
+            pin_rc=1
+            if [ -x scripts/workflow/dependabot_pin_bump_exemption.sh ] \
+               && [ -x scripts/workflow/resolve_base_policy.sh ]; then
+              # The policy that governs a PR is its BASE branch's (#769): a
+              # release branch that opts the lane out must be honored here
+              # exactly as the classifier honors it. resolve_base_policy.sh
+              # prints the default-branch path for a default-base PR (no API
+              # call) or a temp file holding the base's policy; an unknown
+              # base policy is exit 2 and fails closed below.
+              LANE_POLICY=""
               set +e
-              PIN_JSON=$(GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/dependabot_pin_bump_exemption.sh \
-                --repo "$REPO" --pr "$PR" --config .github/review-policy.yml)
-              pin_rc=$?
+              LANE_POLICY=$(GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/resolve_base_policy.sh \
+                --repo "$REPO" --pr "$PR" --default-config .github/review-policy.yml)
+              policy_rc=$?
               set -e
+              if [ "$policy_rc" -ne 0 ] || [ -z "$LANE_POLICY" ] || [ ! -f "$LANE_POLICY" ]; then
+                pin_rc=3
+                PIN_JSON='{"reason":"the governing base policy could not be resolved"}'
+              else
+                # Only a POLICY-APPLIED label is the lane's to clear: the
+                # latest needs-external-review label event must be a
+                # github-actions[bot] application. A human force-on, or a
+                # human re-application after an automated removal, is Phase 4
+                # by decision and stays until the merge gate clears it or the
+                # human removes it. Paginated: a long-lived PR's timeline
+                # exceeds one page.
+                set +e
+                LANE_OWNER=$(GH_TOKEN="$WORKFLOW_TOKEN" gh api --paginate "repos/$REPO/issues/$PR/timeline" \
+                  | jq -rs '[ (add // []) | .[]
+                              | select((.event == "labeled" or .event == "unlabeled")
+                                       and (.label.name // "") == "needs-external-review") ]
+                            | sort_by(.created_at, .id) | last
+                            | if . == null then "none" else "\(.event):\(.actor.login // "<unknown>")" end')
+                owner_rc=$?
+                set -e
+                if [ "$owner_rc" -ne 0 ] || [ -z "$LANE_OWNER" ]; then
+                  pin_rc=3
+                  PIN_JSON='{"reason":"the needs-external-review label timeline could not be read"}'
+                elif [ "$LANE_OWNER" != 'labeled:github-actions[bot]' ]; then
+                  pin_rc=1
+                  PIN_JSON=$(jq -nc --arg o "$LANE_OWNER" \
+                    '{reason:("the latest needs-external-review label event is " + $o + ", not a policy-workflow application; the lane clears only a policy-applied label")}')
+                else
+                  set +e
+                  PIN_JSON=$(GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/dependabot_pin_bump_exemption.sh \
+                    --repo "$REPO" --pr "$PR" --config "$LANE_POLICY")
+                  pin_rc=$?
+                  set -e
+                fi
+              fi
+              # The resolver hands back a temp file only for a non-default
+              # base; the default path is the checkout's own file.
+              if [ -n "$LANE_POLICY" ] && [ "$LANE_POLICY" != .github/review-policy.yml ]; then
+                rm -f "$LANE_POLICY"
+              fi
             else
-              pin_rc=1
-              echo "Dependabot pin-bump lane: trusted helper absent on the default branch (pre-mergepath#2164 checkout); evaluating the merge gate only."
+              echo "Dependabot pin-bump lane: trusted helper or base-policy resolver absent on the default branch (pre-mergepath#2164 checkout); evaluating the merge gate only."
             fi
             PIN_REASON=$(jq -r '.reason // "no reason reported"' <<<"$PIN_JSON" 2>/dev/null || echo "no reason reported")
             case "$pin_rc" in
@@ -417,6 +465,32 @@ jobs:
                   failing_prs="$failing_prs $PR"
                   echo "::endgroup::"
                   continue
+                fi
+                # Pin-bump lane: the helper fenced the live pair at the end of
+                # its proof, but the protective retraction above made several
+                # API calls since. A non-pin push onto the Dependabot branch in
+                # that window would otherwise have the label removed for a
+                # head the proof never covered, and the resulting `unlabeled`
+                # event does not re-add it (#969). Re-read the pair under the
+                # workflow token immediately before the DELETE and require it
+                # to equal the PROVEN pair; a move leaves the label for the
+                # next evaluation, an unreadable pair is an infrastructure
+                # error. Bounds the write without claiming atomicity.
+                if [ "$gate_source" = dependabot-pin-bump ]; then
+                  if ! live_pair=$(GH_TOKEN="$WORKFLOW_TOKEN" gh api "repos/$REPO/pulls/$PR" \
+                       --jq '[.head.sha, .base.sha] | @tsv'); then
+                    echo "::error::Could not re-read the live head/base of PR #$PR before removing needs-external-review for the pin-bump lane."
+                    had_infra_error=1
+                    failing_prs="$failing_prs $PR"
+                    echo "::endgroup::"
+                    continue
+                  fi
+                  proven_pair=$(jq -r '[.head, .base] | @tsv' <<<"$PIN_JSON")
+                  if [ -z "$live_pair" ] || [ "$live_pair" != "$proven_pair" ]; then
+                    echo "PR #$PR head/base moved after the pin-bump proof (proven: $proven_pair; live: ${live_pair:-unreadable}); leaving needs-external-review for the next evaluation."
+                    echo "::endgroup::"
+                    continue
+                  fi
                 fi
                 echo "Gate passes — removing needs-external-review label."
                 # Single (non-retried) removal, then verify end state with a
@@ -857,15 +931,63 @@ jobs:
             # verdict mapping as the event-driven job above.
             gate_source=codex
             PIN_JSON=""
-            if [ -x scripts/workflow/dependabot_pin_bump_exemption.sh ]; then
+            pin_rc=1
+            if [ -x scripts/workflow/dependabot_pin_bump_exemption.sh ] \
+               && [ -x scripts/workflow/resolve_base_policy.sh ]; then
+              # The policy that governs a PR is its BASE branch's (#769): a
+              # release branch that opts the lane out must be honored here
+              # exactly as the classifier honors it. resolve_base_policy.sh
+              # prints the default-branch path for a default-base PR (no API
+              # call) or a temp file holding the base's policy; an unknown
+              # base policy is exit 2 and fails closed below.
+              LANE_POLICY=""
               set +e
-              PIN_JSON=$(GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/dependabot_pin_bump_exemption.sh \
-                --repo "$REPO" --pr "$PR" --config .github/review-policy.yml)
-              pin_rc=$?
+              LANE_POLICY=$(GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/resolve_base_policy.sh \
+                --repo "$REPO" --pr "$PR" --default-config .github/review-policy.yml)
+              policy_rc=$?
               set -e
+              if [ "$policy_rc" -ne 0 ] || [ -z "$LANE_POLICY" ] || [ ! -f "$LANE_POLICY" ]; then
+                pin_rc=3
+                PIN_JSON='{"reason":"the governing base policy could not be resolved"}'
+              else
+                # Only a POLICY-APPLIED label is the lane's to clear: the
+                # latest needs-external-review label event must be a
+                # github-actions[bot] application. A human force-on, or a
+                # human re-application after an automated removal, is Phase 4
+                # by decision and stays until the merge gate clears it or the
+                # human removes it. Paginated: a long-lived PR's timeline
+                # exceeds one page.
+                set +e
+                LANE_OWNER=$(GH_TOKEN="$WORKFLOW_TOKEN" gh api --paginate "repos/$REPO/issues/$PR/timeline" \
+                  | jq -rs '[ (add // []) | .[]
+                              | select((.event == "labeled" or .event == "unlabeled")
+                                       and (.label.name // "") == "needs-external-review") ]
+                            | sort_by(.created_at, .id) | last
+                            | if . == null then "none" else "\(.event):\(.actor.login // "<unknown>")" end')
+                owner_rc=$?
+                set -e
+                if [ "$owner_rc" -ne 0 ] || [ -z "$LANE_OWNER" ]; then
+                  pin_rc=3
+                  PIN_JSON='{"reason":"the needs-external-review label timeline could not be read"}'
+                elif [ "$LANE_OWNER" != 'labeled:github-actions[bot]' ]; then
+                  pin_rc=1
+                  PIN_JSON=$(jq -nc --arg o "$LANE_OWNER" \
+                    '{reason:("the latest needs-external-review label event is " + $o + ", not a policy-workflow application; the lane clears only a policy-applied label")}')
+                else
+                  set +e
+                  PIN_JSON=$(GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/dependabot_pin_bump_exemption.sh \
+                    --repo "$REPO" --pr "$PR" --config "$LANE_POLICY")
+                  pin_rc=$?
+                  set -e
+                fi
+              fi
+              # The resolver hands back a temp file only for a non-default
+              # base; the default path is the checkout's own file.
+              if [ -n "$LANE_POLICY" ] && [ "$LANE_POLICY" != .github/review-policy.yml ]; then
+                rm -f "$LANE_POLICY"
+              fi
             else
-              pin_rc=1
-              echo "Dependabot pin-bump lane: trusted helper absent on the default branch (pre-mergepath#2164 checkout); evaluating the merge gate only."
+              echo "Dependabot pin-bump lane: trusted helper or base-policy resolver absent on the default branch (pre-mergepath#2164 checkout); evaluating the merge gate only."
             fi
             PIN_REASON=$(jq -r '.reason // "no reason reported"' <<<"$PIN_JSON" 2>/dev/null || echo "no reason reported")
             case "$pin_rc" in
@@ -927,6 +1049,32 @@ jobs:
                   failing_prs="$failing_prs $PR"
                   echo "::endgroup::"
                   continue
+                fi
+                # Pin-bump lane: the helper fenced the live pair at the end of
+                # its proof, but the protective retraction above made several
+                # API calls since. A non-pin push onto the Dependabot branch in
+                # that window would otherwise have the label removed for a
+                # head the proof never covered, and the resulting `unlabeled`
+                # event does not re-add it (#969). Re-read the pair under the
+                # workflow token immediately before the DELETE and require it
+                # to equal the PROVEN pair; a move leaves the label for the
+                # next evaluation, an unreadable pair is an infrastructure
+                # error. Bounds the write without claiming atomicity.
+                if [ "$gate_source" = dependabot-pin-bump ]; then
+                  if ! live_pair=$(GH_TOKEN="$WORKFLOW_TOKEN" gh api "repos/$REPO/pulls/$PR" \
+                       --jq '[.head.sha, .base.sha] | @tsv'); then
+                    echo "::error::Could not re-read the live head/base of PR #$PR before removing needs-external-review for the pin-bump lane."
+                    had_infra_error=1
+                    failing_prs="$failing_prs $PR"
+                    echo "::endgroup::"
+                    continue
+                  fi
+                  proven_pair=$(jq -r '[.head, .base] | @tsv' <<<"$PIN_JSON")
+                  if [ -z "$live_pair" ] || [ "$live_pair" != "$proven_pair" ]; then
+                    echo "PR #$PR head/base moved after the pin-bump proof (proven: $proven_pair; live: ${live_pair:-unreadable}); leaving needs-external-review for the next evaluation."
+                    echo "::endgroup::"
+                    continue
+                  fi
                 fi
                 echo "Gate passes — removing needs-external-review label."
                 # Single (non-retried) REST DELETE + retried verify (#465/#827)
