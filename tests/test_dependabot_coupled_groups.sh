@@ -39,6 +39,12 @@
 #  30. one effective dependency type per package (production wins)      → PASS
 #  31. exclude-paths drops an excluded workspace manifest                → PASS
 #  32. open-pull-requests-limit: 0 skips the entry                       → PASS
+#  33. one target across SemVer levels (major/non-major family groups)  → FAIL
+#  34. allow update-types limit a member's eligible levels               → PASS
+#  35. exclude-paths * is single-segment                                 → FAIL
+#  36. exclude-paths ** is recursive                                     → PASS
+#  37. recursive workspace patterns reach nested manifests               → FAIL
+#  38. lerna.json packages are evaluated                                 → FAIL
 #
 # Needs python3 with PyYAML. repo_lint provisions PyYAML for every
 # self-test leg; a bare local shell without it SKIPs loudly (and CI fails).
@@ -142,7 +148,7 @@ expect() {
 echo "dependabot coupled-family group tests"
 
 r="$(new_repo split)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "$r" "$TYPE_GROUPS"
-expect "dev/prod split is reported" 1 "$r" "family 'firebase-sdk' is split for major updates"
+expect "dev/prod split is reported" 1 "$r" "firebase -> production-dependencies [major, minor, patch]"
 
 r="$(new_repo family-first)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "$r" "$FAMILY_GROUP
 $TYPE_GROUPS"
@@ -166,7 +172,7 @@ r="$(new_repo family-minor-only)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "
           - "firebase"
           - "@firebase/*"'"
 $TYPE_GROUPS"
-expect "minor/patch-only family group fails on majors" 1 "$r" "split for major updates"
+expect "minor/patch-only family group fails on majors" 1 "$r" "firebase -> production-dependencies [major] + firebase-sdk [minor, patch]"
 
 r="$(new_repo one-member)"; pkg "$r" "firebase react" "vitest"; write_config "$r" "$TYPE_GROUPS"
 expect "single present member is a no-op" 0 "$r" "PASS"
@@ -179,7 +185,7 @@ r="$(new_repo majors-ignored)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "$r"
         update-types: ["version-update:semver-major"]
       - dependency-name: "@firebase/rules-unit-testing"
         update-types: ["version-update:semver-major"]'
-expect "majors ignored, minors still split" 1 "$r" "split for minor updates"
+expect "majors ignored, minors still split" 1 "$r" "firebase -> production-dependencies [minor, patch]"
 
 r="$(new_repo member-ignored)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "$r" "$TYPE_GROUPS" '    ignore:
       - dependency-name: "@firebase/rules-unit-testing"'
@@ -370,6 +376,57 @@ expect "exclude-paths drops an excluded workspace manifest" 0 "$r" "PASS"
 
 r="$(new_repo prs-disabled)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "$r" "$TYPE_GROUPS" '    open-pull-requests-limit: 0'
 expect "open-pull-requests-limit: 0 disables the entry" 0 "$r" "version updates disabled"
+
+# Review round 3 on #2170.
+
+r="$(new_repo cross-level)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "$r" '      firebase-majors:
+        update-types: ["major"]
+        patterns:
+          - "firebase"
+          - "@firebase/*"
+      firebase-rest:
+        update-types: ["minor", "patch"]
+        patterns:
+          - "firebase"
+          - "@firebase/*"'"
+$TYPE_GROUPS"
+expect "separate family-wide major and non-major groups still split across levels" 1 "$r" "firebase-majors [major] + firebase-rest [minor, patch]"
+
+r="$(new_repo allow-update-types)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "$r" "$TYPE_GROUPS" '    allow:
+      - dependency-name: "firebase"
+      - dependency-name: "@firebase/rules-unit-testing"
+        update-types: ["version-update:semver-patch"]
+    ignore:
+      - dependency-name: "@firebase/rules-unit-testing"
+        update-types: ["version-update:semver-patch"]'
+expect "allow update-types limits a member's levels (none left here)" 0 "$r" "PASS"
+
+r="$(new_repo exclude-single-segment)"
+printf '{"name":"root","private":true,"workspaces":["packages/**"],"dependencies":{"firebase":"^13.0.0"}}\n' > "$r/package.json"
+pkg "$r/packages/team/nested" "" "@firebase/rules-unit-testing"
+write_config "$r" "$TYPE_GROUPS" '    exclude-paths:
+      - "packages/*/package.json"'
+expect "exclude-paths * is one segment: a nested manifest stays in" 1 "$r" "firebase-sdk"
+
+r="$(new_repo exclude-recursive)"
+printf '{"name":"root","private":true,"workspaces":["packages/**"],"dependencies":{"firebase":"^13.0.0"}}\n' > "$r/package.json"
+pkg "$r/packages/team/nested" "" "@firebase/rules-unit-testing"
+write_config "$r" "$TYPE_GROUPS" '    exclude-paths:
+      - "packages/**"'
+expect "exclude-paths ** spans any depth" 0 "$r" "PASS"
+
+r="$(new_repo recursive-workspace)"
+printf '{"name":"root","private":true,"workspaces":["packages/**"]}\n' > "$r/package.json"
+pkg "$r/packages/team/app" "$FB_PROD" "$FB_DEV"
+write_config "$r" "$TYPE_GROUPS"
+expect "recursive workspace patterns reach nested manifests" 1 "$r" "firebase-sdk"
+
+r="$(new_repo lerna)"
+printf '{"name":"root","private":true,"devDependencies":{"lerna":"^9.0.0"}}\n' > "$r/package.json"
+printf '{"packages":["packages/*"]}\n' > "$r/lerna.json"
+pkg "$r/packages/app" "$FB_PROD" "$FB_DEV"
+write_config "$r" "$TYPE_GROUPS"
+expect "lerna.json packages are evaluated (root declares none)" 1 "$r" "firebase-sdk"
 
 r="$(new_repo named-late)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "$r" "$TYPE_GROUPS
 $FAMILY_GROUP"

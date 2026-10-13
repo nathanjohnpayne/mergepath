@@ -12,15 +12,18 @@ both fail ``npm ci`` with ERESOLVE.
 This module simulates Dependabot's pull-request targeting for every family
 listed in ``scripts/ci/dependabot-coupled-families.json`` and fails when the
 members a directory actually declares would be split. For each npm entry in
-``.github/dependabot.yml`` and each update type (major, minor, patch), every
-member the entry can update must land in the same, non-empty PR target. The
+``.github/dependabot.yml``, every update a family member can receive, at any
+SemVer level, must land in one and the same non-empty PR target. Members can
+receive different levels at once (a firebase major alongside a rules-harness
+minor), so a target is compared across levels, not per level. The
 simulation follows what Dependabot does:
 
 * Entries: an entry with ``open-pull-requests-limit: 0`` has version updates
   disabled and is skipped.
 * Manifests: the directory's ``package.json`` plus the workspace manifests
-  selected by its ``workspaces`` field or by ``pnpm-workspace.yaml``, minus any
-  that the entry's ``exclude-paths`` drops. Only ``dependencies``,
+  selected by its ``workspaces`` field, ``pnpm-workspace.yaml`` or
+  ``lerna.json`` (``**`` expands recursively), minus any that the entry's
+  ``exclude-paths`` drops (``*`` is one path segment, ``**`` any depth). Only ``dependencies``,
   ``devDependencies`` and ``optionalDependencies`` count. dependabot-core's npm
   parser reads exactly those (``DEPENDENCY_TYPES`` in
   ``npm_and_yarn/file_parser.rb``), so a ``peerDependencies``-only
@@ -28,7 +31,8 @@ simulation follows what Dependabot does:
 * Dependency type: one per package, as Dependabot merges requirements. It is
   production when any manifest declares the package in ``dependencies`` or
   ``optionalDependencies``, and development otherwise.
-* Eligibility: ``allow`` rules are applied first, then ``ignore`` rules.
+* Eligibility: ``allow`` rules (name, dependency type and update types) are
+  applied first, then ``ignore`` rules.
 * Targets: the first matching ``groups`` entry. A group with
   ``group-by: dependency-name`` opens one PR per dependency. An entry in a
   ``multi-ecosystem-group`` sends otherwise-ungrouped updates that match its
@@ -55,7 +59,6 @@ under CI).
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import glob
 import json
 import os
@@ -133,7 +136,29 @@ def workspace_patterns(root: str, rel: str, pkg: dict) -> List[str]:
         packages = data.get("packages") if isinstance(data, dict) else None
         if isinstance(packages, list):
             patterns += [p for p in packages if isinstance(p, str)]
+    lerna = os.path.join(root, rel, "lerna.json")
+    if os.path.isfile(lerna):
+        packages = load_json(lerna).get("packages")
+        if isinstance(packages, list):
+            patterns += [p for p in packages if isinstance(p, str)]
     return patterns
+
+
+def path_glob(pattern: str) -> "re.Pattern[str]":
+    """Path glob: ``*``/``?`` stay within one segment, ``**`` spans any depth."""
+    out, i = [], 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?"); i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*"); i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*"); i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]"); i += 1
+        else:
+            out.append(re.escape(pattern[i])); i += 1
+    return re.compile("".join(out))
 
 
 def excluded(entry: dict, rel_to_entry: str) -> bool:
@@ -141,10 +166,14 @@ def excluded(entry: dict, rel_to_entry: str) -> bool:
     for pattern in entry.get("exclude-paths") or []:
         if not isinstance(pattern, str):
             continue
-        pat = pattern.strip("/").replace("**", "*")
-        for candidate in (rel_to_entry, f"{rel_to_entry}/package.json"):
-            if fnmatch.fnmatchcase(candidate, pat) or fnmatch.fnmatchcase(candidate, pat + "/*"):
-                return True
+        rx = path_glob(pattern.strip("/"))
+        parts = rel_to_entry.split("/")
+        # A pattern naming the manifest, its directory, or any ancestor
+        # directory excludes it.
+        candidates = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+        candidates.append(f"{rel_to_entry}/package.json")
+        if any(rx.fullmatch(c) for c in candidates):
+            return True
     return False
 
 
@@ -154,7 +183,7 @@ def workspace_dirs(root: str, rel: str, pkg: dict, entry: dict) -> List[str]:
     for pattern in workspace_patterns(root, rel, pkg):
         if pattern.startswith("!"):
             continue
-        for hit in sorted(glob.glob(os.path.join(base, pattern))):
+        for hit in sorted(glob.glob(os.path.join(base, pattern), recursive=True)):
             if not os.path.isfile(os.path.join(hit, "package.json")):
                 continue
             if excluded(entry, os.path.relpath(hit, base)):
@@ -181,7 +210,7 @@ def declared_dependencies(root: str, rel: str, entry: dict) -> Dict[str, str]:
     return out
 
 
-def allowed(entry: dict, name: str, dep_type: str) -> bool:
+def allowed(entry: dict, name: str, dep_type: str, update_type: str) -> bool:
     """Dependabot ``allow``: absent means everything; otherwise any rule must match."""
     rules = entry.get("allow")
     if not rules:
@@ -193,8 +222,12 @@ def allowed(entry: dict, name: str, dep_type: str) -> bool:
         if isinstance(dep, str) and not match(name, dep):
             continue
         kind = rule.get("dependency-type")
-        if kind in (None, "all", "direct") or kind == dep_type:
-            return True
+        if kind not in (None, "all", "direct") and kind != dep_type:
+            continue
+        types = rule.get("update-types")
+        if types and IGNORE_UPDATE_TYPE[update_type] not in types and update_type not in types:
+            continue
+        return True
     return False
 
 
@@ -300,37 +333,43 @@ def find_violations(root: str, config: dict, families: List[dict]):
                 members = sorted(
                     n for n in deps if any(match(n, p) for p in family["patterns"])
                 )
-                for update_type in UPDATE_TYPES:
-                    assigned: Dict[str, Optional[str]] = {
-                        m: pr_target(entry, groups, m, deps[m], update_type)
-                        for m in members
-                        if allowed(entry, m, deps[m]) and not ignored(entry, m, update_type)
+                # member -> {update type -> PR target}, over the levels it can receive.
+                assigned: Dict[str, Dict[str, Optional[str]]] = {}
+                for m in members:
+                    levels = {
+                        u: pr_target(entry, groups, m, deps[m], u)
+                        for u in UPDATE_TYPES
+                        if allowed(entry, m, deps[m], u) and not ignored(entry, m, u)
                     }
-                    if len(assigned) < 2:
-                        continue
-                    targets = set(assigned.values())
-                    if len(targets) == 1 and None not in targets:
-                        continue
-                    violations.append({
-                        "entry": idx,
-                        "directory": "/" + ("" if rel == "." else rel),
-                        "family": family,
-                        "update_type": update_type,
-                        "assigned": assigned,
-                        "has_named_group": family["group"] in dict(groups),
-                    })
-                    break  # one report per family per directory is enough
+                    if levels:
+                        assigned[m] = levels
+                if len(assigned) < 2:
+                    continue
+                targets = {t for levels in assigned.values() for t in levels.values()}
+                if len(targets) == 1 and None not in targets:
+                    continue
+                violations.append({
+                    "entry": idx,
+                    "directory": "/" + ("" if rel == "." else rel),
+                    "family": family,
+                    "assigned": assigned,
+                    "has_named_group": family["group"] in dict(groups),
+                })
     return violations, notes
 
 
 def describe(v: dict) -> List[str]:
-    split = ", ".join(
-        f"{m} -> {t if t else '(ungrouped: its own PR)'}"
-        for m, t in sorted(v["assigned"].items())
-    )
+    def label(levels: Dict[str, Optional[str]]) -> str:
+        by_target: Dict[str, List[str]] = {}
+        for u in UPDATE_TYPES:
+            if u in levels:
+                by_target.setdefault(levels[u] or "(ungrouped: its own PR)", []).append(u)
+        return " + ".join(f"{t} [{', '.join(us)}]" for t, us in by_target.items())
+
+    split = ", ".join(f"{m} -> {label(levels)}" for m, levels in sorted(v["assigned"].items()))
     out = [
         f"FAIL: .github/dependabot.yml npm entry for directory \"{v['directory']}\": "
-        f"family '{v['family']['group']}' is split for {v['update_type']} updates: {split}.",
+        f"family '{v['family']['group']}' is split across PRs: {split}.",
         f"      Why: {v['family']['rationale']}",
     ]
     if v["has_named_group"]:
