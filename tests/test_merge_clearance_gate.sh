@@ -4557,6 +4557,11 @@ rcp_case publish-mixed-loop-line \
 rcp_case publish-quoted-hash-before-loop \
   's{^(          if ! PASS_START=)}{          echo "state #"; while true; do sleep 15; done\n$1}m' \
   fail '[rcp no runner-held wait]'
+# A loop keyword split from its condition by a newline (Codex P2 on #2171,
+# round 3) is one shell statement and must still trip.
+rcp_case publish-multiline-loop \
+  's{^(          if ! PASS_START=)}{          while\n          true; do sleep 15; done\n$1}m' \
+  fail '[rcp no runner-held wait]'
 rcp_case open-watch \
   's{^(          if \[ -z "\$HEAD_SHA" \]; then\n            echo "::error::workflow_run.head_sha is empty)}{          gh pr checks "\$HEAD_SHA" --repo "\$REPO" --watch\n$1}m' \
   fail 'passes `--watch`'
@@ -4597,6 +4602,9 @@ mcg22_case gate-workflow-run-squoted-flow \
 mcg22_case gate-workflow-run-spaced \
   's{^  schedule:\n}{  workflow_run :\n    workflows: ["repo-lint"]\n    types: [completed]\n  schedule:\n}m' \
   fail '[#2167 lint fan-in]'
+mcg22_case gate-multiline-loop \
+  's{^(          output=\$\(scripts/merge-clearance-gate.sh "\$PR_NUMBER" "\$REPO" 2>&1\))}{          while\n          true; do sleep 15; done\n$1}m' \
+  fail '[#2167 no runner-held wait]'
 mcg22_case gate-watch \
   's{^(          output=\$\(scripts/merge-clearance-gate.sh "\$PR_NUMBER" "\$REPO" 2>&1\))}{          gh pr checks "\$PR_NUMBER" --repo "\$REPO" --watch --required\n$1}m' \
   fail '[#2167 no runner-held wait]'
@@ -4649,6 +4657,9 @@ if [ -x "$AC_CHECK" ] && [ -f "$AC_WF" ]; then
     fail '[#2167 no runner-held wait]'
   ac_case quoted-hash-before-loop \
     's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          echo "state #"; while true; do sleep 15; done\n}m' \
+    fail '[#2167 no runner-held wait]'
+  ac_case multiline-loop \
+    's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          while\n          true; do sleep 15; done\n}m' \
     fail '[#2167 no runner-held wait]'
   ac_case watch \
     's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          gh pr checks "\$PR" --repo "\$REPO" --watch\n}m' \

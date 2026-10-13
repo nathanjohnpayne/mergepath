@@ -141,6 +141,10 @@ jobs:
           EVENT_ACTION: ${{ github.event.action }}
           PARENT_RUN_ID: ${{ github.event.workflow_run.id }}
           PARENT_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          # Server-issued creation time of the parent run (#2171 round 3):
+          # the ordering fence below compares it against completed
+          # publisher verdicts' server-issued started_at, same clock.
+          PARENT_CREATED_AT: ${{ github.event.workflow_run.created_at }}
         run: |
           set -euo pipefail
           if [ -z "$HEAD_SHA" ]; then
@@ -213,6 +217,32 @@ jobs:
             fi
           else
             echo "::warning::open-PR list read failed; opening pending entries anyway (fail closed)."
+          fi
+          # Delayed-open ordering fence (Codex P2 on #2171, round 3). Under
+          # account-wide runner contention this job can reach a runner AFTER
+          # a lint-parent publish pass has already evaluated this head (the
+          # #2112 shape: the approval-fired parent sat queued for 38 min).
+          # Opening holds then re-pends three contexts a fresher pass just
+          # published, until the delayed parent and ITS completed pass run —
+          # recreating the exact post-lint delay the lint parent removes. A
+          # completed publisher verdict for this head whose server-issued
+          # started_at is at or after this parent's server-issued created_at
+          # proves a full pass already evaluated the head on state at least
+          # as new as the parent's event; the parent's own completed delivery
+          # will re-publish again, so the hold adds nothing. Only the normal
+          # publish title counts as proof (an infra red or a superseded-head
+          # red is not a verdict that owns the head). A failed read opens
+          # anyway: pending is the fail-closed direction.
+          if newer_completed=$(gh api --paginate -X GET \
+              "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+              -f check_name="$MCG_CONTEXT" -f filter=latest -f per_page=100 \
+              --jq ".check_runs[] | select(.status == \"completed\") | select((.app.slug // \"\") == \"github-actions\") | select(((.output.title // \"\") | endswith(\"(publisher re-evaluation)\"))) | select(.started_at >= \"$PARENT_CREATED_AT\") | .id"); then
+            if [ -n "$PARENT_CREATED_AT" ] && [ -n "$newer_completed" ]; then
+              echo "A publisher pass that started at or after parent $PARENT_RUN_ID was created already published this head (check run(s): $(echo $newer_completed)); not opening — the parent's own completed delivery re-publishes (#2171)."
+              exit 0
+            fi
+          else
+            echo "::warning::could not read completed publisher passes for $HEAD_SHA; opening anyway (fail closed)."
           fi
           # Second status check IMMEDIATELY before the burst (round 7):
           # the enumeration above took seconds, and a parent that completed

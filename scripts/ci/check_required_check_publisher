@@ -1024,7 +1024,22 @@ def strip_shell_comments_quote_aware(text):
                 break
             out.append(ch); prev = ch
         kept.append("".join(out))
-    return "\n".join(kept)
+    # A loop keyword ending a line continues on the next (Codex P2 on
+    # #2171, round 3): `while` / newline / `true; do ...` is one statement
+    # to the shell, so the two lines are joined before the scan.
+    joined = []
+    pending = None
+    for line in kept:
+        if pending is not None:
+            line = pending + " " + line
+            pending = None
+        if re.search(r"(^|[ \t])(while|until)[ \t]*$", line):
+            pending = line
+            continue
+        joined.append(line)
+    if pending is not None:
+        joined.append(pending)
+    return "\n".join(joined)
 
 
 LOOP_AT_STATEMENT = re.compile(

@@ -148,8 +148,14 @@ if [ -f "$WORKFLOW" ]; then
         else if (c == "#" && !sq && !dq && prev ~ /[[:space:]]/) { break }
         out = out c; prev = c
       }
+      # A loop keyword ending a line continues on the next (Codex P2 on
+      # #2171, round 3): `while` / newline / `true; do ...` is one statement
+      # to the shell, so the two lines are joined before the scan.
+      if (pending != "") { out = pending " " out; pending = "" }
+      if (out ~ /(^|[[:space:]])(while|until)[[:space:]]*$/) { pending = out; next }
       print out
-    }' "$WORKFLOW")
+    }
+    END { if (pending != "") print pending }' "$WORKFLOW")
   # Classified per OCCURRENCE, not per line (Codex P2 on #2171): a line that
   # carries `while true; do sleep 15; done; while read -r x; ...` must still
   # trip on its first loop. Each statement-position loop keyword is extracted

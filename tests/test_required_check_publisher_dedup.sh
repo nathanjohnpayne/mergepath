@@ -43,6 +43,14 @@ case "$*" in
       printf '%s\n' in_progress
     fi
     ;;
+  *"/commits/"*"/check-runs"*" -f filter=latest "*)
+    # The #2171 delayed-open ordering fence: completed publisher verdict ids
+    # that started at or after the parent was created. Empty by default.
+    if [ "$GH_FIXTURE_MODE" = guard-unreadable ]; then
+      exit 1
+    fi
+    [ -z "${GH_FIXTURE_NEWER_PASS:-}" ] || printf '%s\n' "$GH_FIXTURE_NEWER_PASS"
+    ;;
   *"/commits/"*"/check-runs"*)
     case " $* " in
       *" -f filter=all "*) ;;
@@ -95,7 +103,7 @@ case "$*" in
       unreadable)
         exit 1
         ;;
-      empty|race|parent-completed|complete-before-burst|write-fails)
+      empty|race|parent-completed|complete-before-burst|write-fails|guard-unreadable)
         ;;
       *)
         echo "unknown fixture mode: $GH_FIXTURE_MODE" >&2
@@ -136,6 +144,7 @@ run_case() {
       GH_CALL_LOG="$dir/calls" GH_FIXTURE_MODE="$mode" \
       REPO="example/repo" HEAD_SHA="abc123" PARENT_RUN_ID="4242" \
       PARENT_RUN_ATTEMPT="$attempt" EVENT_ACTION="$action" \
+      PARENT_CREATED_AT="2026-09-20T11:59:00Z" \
       MCG_CONTEXT="Merge clearance gate" \
       CODEX_P1_CONTEXT="Codex P1 unresolved threads" \
       CODERABBIT_CONTEXT="CodeRabbit unresolved blocking findings" \
@@ -185,35 +194,73 @@ run_case() {
 run_case first-attempt-already-covered in_progress 1 exact 2 0 1
 
 # Any incomplete or untrustworthy evidence falls through to the full open
-# path. The extra probe makes these seven one-page HTTP fixtures instead of
-# the six-call ordinary path; preserving pending cover is the deliberate failure direction.
-run_case partial-requested-publication in_progress 1 partial 7 3 1
-run_case delayed-or-failed-requested in_progress 1 empty 7 3 1
-run_case both-events-race-before-publication in_progress 1 race 7 3 1
-run_case unreadable-dedup-probe in_progress 1 unreadable 7 3 1
-run_case foreign-same-name-runs in_progress 1 foreign 7 3 1
-run_case foreign-app-exact-marker in_progress 1 foreign-app 7 3 1
-run_case completed-same-marker-runs in_progress 1 completed-markers 7 3 1
-run_case newer-completed-after-exact-pending in_progress 1 newer-completed 7 3 1
-run_case ambiguous-same-time-completed in_progress 1 tied-completed 7 3 1
+# path. The extra probe makes these eight one-page HTTP fixtures instead of
+# the seven-call ordinary path (the #2171 ordering-fence read is one of the
+# seven and also hits the commits/check-runs endpoint, so probes=2);
+# preserving pending cover is the deliberate failure direction.
+run_case partial-requested-publication in_progress 1 partial 8 3 2
+run_case delayed-or-failed-requested in_progress 1 empty 8 3 2
+run_case both-events-race-before-publication in_progress 1 race 8 3 2
+run_case unreadable-dedup-probe in_progress 1 unreadable 8 3 2
+run_case foreign-same-name-runs in_progress 1 foreign 8 3 2
+run_case foreign-app-exact-marker in_progress 1 foreign-app 8 3 2
+run_case completed-same-marker-runs in_progress 1 completed-markers 8 3 2
+run_case newer-completed-after-exact-pending in_progress 1 newer-completed 8 3 2
+run_case ambiguous-same-time-completed in_progress 1 tied-completed 8 3 2
 
 # Reruns receive no requested event. A new attempt therefore bypasses the
 # first-attempt probe and always opens, even if old attempt markers exist.
-run_case rerun-new-attempt in_progress 2 exact 6 3 0
+run_case rerun-new-attempt in_progress 2 exact 7 3 1
 
 # Requested remains the prompt first-attempt path, and a runner that starts
 # after the parent completed retains the old one-read/no-write behavior.
-run_case requested-event requested 1 empty 6 3 0
+run_case requested-event requested 1 empty 7 3 1
 run_case delayed-runner-after-completion in_progress 1 parent-completed 1 0 0
 # Completion between the early optimization and the burst still owns the
 # head: the second status fence prevents late pending entries.
-run_case completion-during-enumeration in_progress 1 complete-before-burst 4 0 1
+run_case completion-during-enumeration in_progress 1 complete-before-burst 5 0 2
 # Exhausted retries on one context still open its siblings and fail red.
-run_case partial-pending-write-failure requested 1 write-fails 8 5 0 1
+run_case partial-pending-write-failure requested 1 write-fails 9 5 1 1
+
+# #2171 round 3 — the delayed-open ordering fence. A completed publisher
+# verdict that started at or after the parent was created means a full pass
+# already evaluated this head; opening a hold then would re-pend three
+# freshly published contexts until the delayed parent ran (the #2112 shape).
+# Both deliveries skip at the fence: status read, PR list, fence read — and
+# for in_progress the dedup probe before them. No write.
+GH_FIXTURE_NEWER_PASS=301; export GH_FIXTURE_NEWER_PASS
+run_case newer-pass-owns-head-requested requested 1 empty 3 0 1
+run_case newer-pass-owns-head-in-progress in_progress 1 empty 4 0 2
+unset GH_FIXTURE_NEWER_PASS
+# A fence read that fails is unknown ordering: open anyway (fail closed).
+run_case ordering-fence-unreadable-opens requested 1 guard-unreadable 7 3 1
 
 if [ "$fail" -ne 0 ]; then
   echo "$fail failed, $pass passed"
   exit 1
 fi
 
-echo "All $pass required-check publisher dedup tests passed."
+if [ "${DEDUP_MUTATION_CHILD:-0}" = 1 ]; then
+  echo "All $pass required-check publisher dedup tests passed."
+  exit 0
+fi
+
+# Mutation: disarm the ordering fence in a copy of the live step. The
+# newer-pass cases must then observe three writes and fail, proving the
+# fence (not the fixture) is what withholds the hold.
+python3 - "$WORKFLOW" "$TMP/no-fence.yml" <<'PY'
+from pathlib import Path
+import sys
+text = Path(sys.argv[1]).read_text()
+old = 'if [ -n "$PARENT_CREATED_AT" ] && [ -n "$newer_completed" ]; then'
+assert text.count(old) == 1
+Path(sys.argv[2]).write_text(text.replace(old, 'if false; then', 1))
+PY
+if REQUIRED_CHECK_PUBLISHER_WORKFLOW="$TMP/no-fence.yml" DEDUP_MUTATION_CHILD=1 \
+    bash "$0" >"$TMP/no-fence.out" 2>&1; then
+  echo "FAIL: dedup suite accepted a publisher with the #2171 ordering fence disarmed"
+  exit 1
+fi
+echo "PASS: dedup suite rejects a publisher with the #2171 ordering fence disarmed"
+
+echo "All $pass required-check publisher dedup tests and 1 mutation passed."
