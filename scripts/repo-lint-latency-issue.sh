@@ -27,7 +27,10 @@
 # Usage:
 #   scripts/repo-lint-latency-issue.sh --repo owner/repo --rc N --run-url URL
 #                                      --summary summary.json [--summary-md summary.md]
-#                                      [--labels a,b]
+#                                      [--labels a,b] [--author LOGIN]
+#
+#   --author  the login the tracking issue must have been opened by (default
+#             github-actions[bot], the identity GITHUB_TOKEN writes as).
 #
 # Environment: GH_TOKEN with issues:write on the repository (the workflow's
 # GITHUB_TOKEN is enough; its writes trigger no workflow runs, which is fine
@@ -43,6 +46,10 @@ set -euo pipefail
 
 REPO=""; RC=""; RUN_URL=""; SUMMARY=""; SUMMARY_MD=""
 LABELS="area:ci-infra,audit"
+# Only an issue the workflow identity itself opened is a tracker: the marker
+# is public, so a body match alone would let any issue author pick the issue
+# this script rewrites and closes.
+AUTHOR="github-actions[bot]"
 MARKER='<!-- mergepath-repo-lint-latency-audit -->'
 ALERTS_PREFIX='<!-- repo-lint-latency-alerts: '
 ISSUE_TITLE='Repo-lint latency audit alert'
@@ -60,6 +67,7 @@ while [ "$#" -gt 0 ]; do
     --summary) [ "$#" -ge 2 ] || usage; SUMMARY="$2"; shift 2 ;;
     --summary-md) [ "$#" -ge 2 ] || usage; SUMMARY_MD="$2"; shift 2 ;;
     --labels) [ "$#" -ge 2 ] || usage; LABELS="$2"; shift 2 ;;
+    --author) [ "$#" -ge 2 ] || usage; AUTHOR="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) usage ;;
   esac
@@ -79,15 +87,24 @@ esac
 
 today="$(date -u '+%Y-%m-%d')"
 
-# --- lookup: marker-keyed, lowest open match wins ---------------------------
-# Plain command substitution on purpose: a failing list must fail the step,
-# never read as "no tracking issue exists" and open a duplicate.
-if ! open_json="$(gh issue list --repo "$REPO" --state open --limit 500 --json number,body 2>&1)"; then
-  echo "::error::Could not list open issues in $REPO; refusing to route the verdict without a dedupe read: $open_json"
+# --- lookup: marker-keyed, author-verified, lowest open match wins ---------
+# The whole open-issue list is read with --paginate (a `--limit` would
+# truncate silently and the tracker could fall off the end). Plain command
+# substitution on purpose: a failing list must fail the step, never read as
+# "no tracking issue exists" and open a duplicate.
+lookup_err="$(mktemp "${TMPDIR:-/tmp}/repo-lint-latency-lookup.XXXXXX")"
+if ! open_raw="$(gh api --paginate "repos/$REPO/issues?state=open&per_page=100" 2>"$lookup_err")"; then
+  echo "::error::Could not list open issues in $REPO; refusing to route the verdict without a dedupe read: $(tr '\n' ' ' < "$lookup_err")"
+  rm -f "$lookup_err"
   exit 1
 fi
-if ! tracked="$(printf '%s' "$open_json" | jq -r --arg m "$MARKER" \
-      '[.[] | select((.body // "") | contains($m))] | sort_by(.number) | .[] | .number' 2>&1)"; then
+rm -f "$lookup_err"
+if ! open_json="$(printf '%s\n' "$open_raw" | jq -s 'add // [] | [.[] | select(.pull_request == null)]' 2>&1)"; then
+  echo "::error::Could not parse the open-issue list: $open_json"
+  exit 1
+fi
+if ! tracked="$(printf '%s' "$open_json" | jq -r --arg m "$MARKER" --arg a "$AUTHOR" \
+      '[.[] | select((.user.login // "") == $a) | select((.body // "") | contains($m))] | sort_by(.number) | .[] | .number' 2>&1)"; then
   echo "::error::Could not parse the open-issue list: $tracked"
   exit 1
 fi

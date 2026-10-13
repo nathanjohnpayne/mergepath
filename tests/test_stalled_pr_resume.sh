@@ -54,7 +54,8 @@ pr() {
   jq -cn --argjson n "$number" --arg pushed "$pushed" --arg ci "$ci" --arg head "$(sha "$number")" --arg author "$AUTHOR" "$@" '
     {number: $n, title: ("PR " + ($n|tostring)), url: ("https://github.com/octo/demo/pull/" + ($n|tostring)),
      author: $author, draft: false, head_sha: $head, head_ref: ("feat/" + ($n|tostring)), labels: [],
-     head_pushed_at: $pushed, ci_state: $ci, reviews: [], issue_comments: [], review_comments: [], gate: null}
+     head_repo: "octo/demo", fork: false, head_pushed_at: $pushed, head_pushed_at_source: "check-run",
+     merge_gate_check: "absent", ci_state: $ci, reviews: [], issue_comments: [], review_comments: [], gate: null}
     | '"$overrides"
 }
 review() { # <id> <login> <state> <at> <commit>
@@ -127,9 +128,35 @@ NBSP_VERDICT="Codex Review: Didn't find any major issues.${NBSP}Reviewed${NBSP}c
   # 115: CodeRabbit rate-limit notice 10 minutes ago → waiting-on-bot (bot activity, no verdict)
   pr 115 "2026-10-13T11:40:00Z" SUCCESS '.issue_comments = [$c]' \
     --argjson c "$(comment 15 "$RABBIT" "2026-10-13T11:50:00Z" 'Rate limit exceeded; please try again in 12 minutes.')"
+  # 117: Merge clearance gate check succeeded on head although the Phase 4 gate fails (under-threshold lane) → merge
+  pr 117 "2026-10-13T06:00:00Z" SUCCESS '.reviews = [$rev] | .merge_gate_check = "success" | .gate = {exit: 1, reason: "gate (c): no Codex signal on HEAD"}' \
+    --argjson rev "$(review 7 "nathanpayne-claude" APPROVED "2026-10-13T07:00:00Z" "$(sha 117)")"
+  # 118: Phase 4 gate passes but the Merge clearance gate check failed on head → investigate, never merge
+  pr 118 "2026-10-13T06:00:00Z" SUCCESS '.reviews = [$rev] | .merge_gate_check = "failure" | .gate = {exit: 0, reason: ""}' \
+    --argjson rev "$(review 8 "nathanpayne-claude" APPROVED "2026-10-13T07:00:00Z" "$(sha 118)")"
+  # 119: CHANGES_REQUESTED on an older commit, answered by a later push; nothing requested on the new head → request codex
+  pr 119 "2026-10-13T06:00:00Z" SUCCESS '.reviews = [$rev]' \
+    --argjson rev "$(review 9 "nathanpayne-codex" CHANGES_REQUESTED "2026-10-13T04:00:00Z" "$(sha 219)")"
+  # 120: handoff, then a Codex summary edit and a CodeRabbit acknowledgement after it → still waiting-on-human
+  pr 120 "2026-10-13T05:00:00Z" SUCCESS '.issue_comments = [$h, $s] | .review_comments = [$f, $r, $ack]' \
+    --argjson h "$(comment 16 "nathanpayne-claude" "2026-10-13T06:00:00Z" $'Next action: owner decision on the schema.\n\n[mergepath-handoff]')" \
+    --argjson s "$(comment 17 "$CODEX" "2026-10-13T05:30:00Z" "$SUMMARY_RUNNING" "2026-10-13T07:00:00Z")" \
+    --argjson f "$(inline 9 "$RABBIT" "2026-10-13T05:10:00Z" "$(sha 120)" null)" \
+    --argjson r "$(inline 10 "$AUTHOR" "2026-10-13T05:20:00Z" "$(sha 120)" 9)" \
+    --argjson ack "$(inline 11 "$RABBIT" "2026-10-13T07:30:00Z" "$(sha 120)" 9)"
+  # 121: handoff superseded by a later push → the handoff no longer holds
+  pr 121 "2026-10-13T07:00:00Z" SUCCESS '.issue_comments = [$h]' \
+    --argjson h "$(comment 18 "nathanpayne-claude" "2026-10-13T06:00:00Z" '[mergepath-handoff] next: rebase')"
+  # 122: stale @codex review on a RED head → push fix, not another request
+  pr 122 "2026-10-13T05:00:00Z" FAILURE '.issue_comments = [$c]' \
+    --argjson c "$(comment 19 "$AUTHOR" "2026-10-13T05:10:00Z" '@codex review')"
+  # 123: only a CodeRabbit review on the head, CI green, hours old → head-unrequested / request codex (not a Codex signal)
+  pr 123 "2026-10-13T05:00:00Z" SUCCESS '.reviews = [$rev] | .review_comments = [$f]' \
+    --argjson rev "$(review 10 "$RABBIT" COMMENTED "2026-10-13T05:20:00Z" "$(sha 123)")" \
+    --argjson f "$(inline 12 "$RABBIT" "2026-10-13T05:20:00Z" "$(sha 123)" null)"
 } | jq -s --arg repo "$REPO" --arg now "$NOW" '{schema: "stalled-prs/v1", repo: $repo, fetched_at: $now, prs: .}' > "$TMP/snapshot.json"
 
-if ! jq -e '.prs | length == 16' "$TMP/snapshot.json" >/dev/null; then
+if ! jq -e '.prs | length == 23' "$TMP/snapshot.json" >/dev/null; then
   echo "FAIL: fixture snapshot did not assemble: $(jq -c . "$TMP/snapshot.json" 2>&1 | head -c 300)" >&2
   exit 1
 fi
@@ -181,10 +208,18 @@ expect 110 '.next_action == "investigate" and (.next_action_detail | contains("g
 expect 111 '.class == "stalled" and .reason == "request-unanswered" and .turn == "machine" and .next_action == "request codex"'
 expect 112 '.class == "stalled" and .next_action == "push fix" and .next_action_detail == "head check rollup FAILURE"'
 expect 113 '.class == "waiting-on-bot" and .reason == "Codex reports the head Running" and .codex_signal_on_head == true'
-expect 114 '.class == "stalled" and .next_action == "push fix" and .next_action_detail == "latest verdict requested changes"'
+expect 114 '.class == "stalled" and .next_action == "push fix" and .next_action_detail == "latest verdict requested changes on head"'
 expect 115 '.class == "waiting-on-bot" and .newest.kind == "bot-rate-limited"'
+expect 117 '.class == "stalled" and .next_action == "merge" and (.next_action_detail | startswith("Merge clearance gate check success"))'
+expect 118 '.class == "stalled" and .next_action == "investigate" and (.next_action_detail | contains("Merge clearance gate check failed"))'
+expect 119 '.class == "stalled" and .reason == "head-unrequested" and .next_action == "request codex"'
+expect 120 '.class == "waiting-on-human" and .reason == "handoff posted" and .next_action == "wait"'
+expect 121 '.class == "stalled" and .reason == "head-unrequested"'
+expect 122 '.class == "stalled" and .reason == "request-unanswered" and .next_action == "push fix" and .next_action_detail == "head check rollup FAILURE"'
+expect 123 '.class == "stalled" and .reason == "unanswered-verdict" and .codex_signal_on_head == false and .next_action == "push fix" and .next_action_detail == "1 unanswered finding(s) on head"'
+expect 105 '.next_action_detail | startswith("no Merge clearance gate check in this repo")'
 
-if jq -e '[.prs[] | .number] == [101, 116, 111, 110, 112, 105, 114, 106, 108, 107, 104, 102, 113, 103, 115]' "$TMP/report.json" >/dev/null; then
+if jq -e '[.prs[] | .number] == [101, 116, 111, 122, 123, 110, 112, 119, 105, 114, 117, 118, 121, 106, 108, 120, 107, 104, 102, 113, 103, 115]' "$TMP/report.json" >/dev/null; then
   pass "report is ordered stalled-first, oldest newest-event first"
 else
   fail "report order: $(jq -c '[.prs[] | .number]' "$TMP/report.json")"
@@ -195,7 +230,7 @@ bash "$FINDER" --input "$TMP/snapshot.json" --now "$NOW" > "$TMP/human.txt" 2>&1
 rc=$?
 set -e
 if [ "$rc" -eq 1 ] && grep -Fq '#101  stalled  10h15m  review:commented by chatgpt-codex-connector[bot] at 2026-10-13T01:45:00Z  head 0000000  next: push fix — 2 unanswered finding(s) on head' "$TMP/human.txt" \
-   && grep -Fq 'stalled-prs: octo/demo — 15 open non-draft PR(s), threshold 60m, now 2026-10-13T12:00:00Z' "$TMP/human.txt"; then
+   && grep -Fq 'stalled-prs: octo/demo — 22 open non-draft PR(s), threshold 60m, now 2026-10-13T12:00:00Z' "$TMP/human.txt"; then
   pass "human output carries one line per PR with class, age, newest event, head and next action"
 else
   fail "human output (rc=$rc): $(head -3 "$TMP/human.txt")"
@@ -237,7 +272,7 @@ if [ "$rc" -eq 0 ] && grep -Fq 'PR:          octo/demo#101 — PR 101' "$TMP/res
    && grep -Fq 'Next action: push fix — 2 unanswered finding(s) on head' "$TMP/resume.txt" \
    && grep -Fq 'scripts/resolve-pr-threads.sh 101 --resolve-actioned' "$TMP/resume.txt" \
    && grep -Fq 'https://github.com/octo/demo/pull/1#discussion_r1' "$TMP/resume.txt" \
-   && grep -Fq 'worktree add ~/GitHub/.demo-worktrees/pr-101 origin/feat/101' "$TMP/resume.txt" \
+   && grep -Fq 'worktree add $HOME/GitHub/.demo-worktrees/pr-101 feat/101' "$TMP/resume.txt" \
    && grep -Fq '[mergepath-handoff]' "$TMP/resume.txt"; then
   pass "resume picks the oldest stalled PR and prints its push-fix work order"
 else
@@ -250,6 +285,7 @@ rc=$?
 set -e
 if [ "$rc" -eq 0 ] && grep -Fq "gh pr merge 105 --repo octo/demo --squash --delete-branch --match-head-commit $(sha 105)" "$TMP/resume-105.txt" \
    && grep -Fq 'scripts/review-feedback-accounting.sh 105' "$TMP/resume-105.txt" \
+   && grep -Fq 'scripts/phase-4b-classifier.sh 105' "$TMP/resume-105.txt" \
    && grep -Fq 'this script never merges' "$TMP/resume-105.txt" \
    && grep -Fq '"next_action": "merge"' "$TMP/resume-105.txt"; then
   pass "--pr selects a specific stalled PR and the merge work order names the gates before the author merge"
@@ -270,6 +306,24 @@ if [ "$rc_live" -eq 1 ] && grep -Fq 'is not stalled' "$TMP/resume-102.err" \
   pass "resume exits 1 with nothing to resume, refuses --execute on a replay, and never executes a merge"
 else
   fail "resume exit contract (live=$rc_live none=$rc_none exec=$rc_exec exec-merge=$rc_exec_merge)"
+fi
+
+# A PR-controlled branch name is rendered shell-escaped, and a fork PR is
+# checked out through the pull-request ref rather than a branch origin lacks.
+jq '.prs |= map(if .number == 101 then .head_ref = "topic;touch /tmp/pwned" elif .number == 116 then (.fork = true | .head_repo = "evil/demo" | .head_ref = "feat/116") else . end)' \
+  "$TMP/snapshot.json" > "$TMP/snapshot-hostile.json"
+set +e
+bash "$RESUME" --input "$TMP/snapshot-hostile.json" --now "$NOW" --pr 101 > "$TMP/resume-hostile.txt" 2>&1; rc_h=$?
+bash "$RESUME" --input "$TMP/snapshot-hostile.json" --now "$NOW" --pr 116 > "$TMP/resume-fork.txt" 2>&1; rc_f=$?
+set -e
+if [ "$rc_h" -eq 0 ] && grep -Fq 'fetch origin topic\;touch\ /tmp/pwned' "$TMP/resume-hostile.txt" \
+   && ! grep -Fq 'fetch origin topic;touch' "$TMP/resume-hostile.txt" \
+   && [ "$rc_f" -eq 0 ] && grep -Fq 'fetch origin +refs/pull/116/head:refs/remotes/origin/pr-116' "$TMP/resume-fork.txt" \
+   && grep -Fq 'worktree add --detach $HOME/GitHub/.demo-worktrees/pr-116 refs/remotes/origin/pr-116' "$TMP/resume-fork.txt" \
+   && grep -Fq 'lives in evil/demo' "$TMP/resume-fork.txt"; then
+  pass "work orders shell-escape the head ref and fetch fork heads through the pull-request ref"
+else
+  fail "hostile ref / fork work order (rc_h=$rc_h rc_f=$rc_f): $(grep -F 'fetch origin' "$TMP/resume-hostile.txt" "$TMP/resume-fork.txt")"
 fi
 
 # --- live fetch path against a shimmed gh ----------------------------------
@@ -302,6 +356,8 @@ args="$*"
 echo "$args" >> "$GH_LOG"
 case "$args" in
   *"api graphql"*)          printf '%s' "$(cat "$FIXTURE/rollup-$(printf '%s' "$args" | sed -n 's/.*number=\([0-9]*\).*/\1/p')")" ;;
+  *"/check-runs"*)          n=$(printf '%s' "$args" | sed -n 's/.*commits\/\([0-9]\)\{2\}.*/\1/p'); cat "$FIXTURE/check-runs-$(printf '%s' "$args" | sed -n 's/.*commits\/\(..\).*/\1/p').json" ;;
+  *"/commits/4444"*)        printf '2026-10-14T06:00:00Z' ;;
   *"/commits/"*)            printf '2026-10-13T06:00:00Z' ;;
   *"/pulls?state=open"*)    cat "$FIXTURE/pulls.json" ;;
   *"/pulls/41/reviews"*)    echo '[{"id":9,"state":"APPROVED","submitted_at":"2026-10-13T07:00:00Z","commit_id":"4141414141414141414141414141414141414141","body":"LGTM","user":{"login":"nathanpayne-claude","type":"User"}}]' ;;
@@ -314,12 +370,27 @@ SH
 chmod +x "$TMP/bin/gh"
 cat > "$TMP/fixture/pulls.json" <<'JSON'
 [{"number":41,"title":"Approved and idle","html_url":"https://github.com/octo/demo/pull/41","draft":false,
-  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4141414141414141414141414141414141414141","ref":"feat/41"},"labels":[{"name":"size:S"}]},
+  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4141414141414141414141414141414141414141","ref":"feat/41","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[{"name":"size:S"}]},
  {"number":42,"title":"Pushed and forgotten","html_url":"https://github.com/octo/demo/pull/42","draft":false,
-  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4242424242424242424242424242424242424242","ref":"feat/42"},"labels":[]},
+  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4242424242424242424242424242424242424242","ref":"feat/42","repo":{"full_name":"fork/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]},
  {"number":43,"title":"Draft","html_url":"https://github.com/octo/demo/pull/43","draft":true,
-  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4343434343434343434343434343434343434343","ref":"feat/43"},"labels":[]}]
+  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4343434343434343434343434343434343434343","ref":"feat/43","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]},
+ {"number":44,"title":"Future-dated head, no checks","html_url":"https://github.com/octo/demo/pull/44","draft":false,
+  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4444444444444444444444444444444444444444","ref":"feat/44","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]}]
 JSON
+# 41: three check runs on the head, the merge gate newest and green; 42: no
+# check runs at all (push time falls back to the commit date); 43: draft;
+# 44: no check runs and a FUTURE-dated commit (clamped to --now, so it reads
+# as a fresh push rather than as a head that stays live until that date).
+cat > "$TMP/fixture/check-runs-41.json" <<'JSON'
+{"name":"lint","status":"completed","conclusion":"success","started_at":"2026-10-13T06:00:00Z","completed_at":"2026-10-13T06:20:00Z"}
+{"name":"Merge clearance gate","status":"completed","conclusion":"failure","started_at":"2026-10-13T06:01:00Z","completed_at":"2026-10-13T06:02:00Z"}
+{"name":"Merge clearance gate","status":"completed","conclusion":"success","started_at":"2026-10-13T07:05:00Z","completed_at":"2026-10-13T07:06:00Z"}
+JSON
+: > "$TMP/fixture/check-runs-42.json"
+: > "$TMP/fixture/check-runs-43.json"
+: > "$TMP/fixture/check-runs-44.json"
+printf 'SUCCESS' > "$TMP/fixture/rollup-44"
 printf 'SUCCESS' > "$TMP/fixture/rollup-41"
 printf 'SUCCESS' > "$TMP/fixture/rollup-42"
 printf 'PENDING' > "$TMP/fixture/rollup-43"
@@ -331,9 +402,10 @@ PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fix
 rc=$?
 set -e
 if [ "$rc" -eq 1 ] \
-   && jq -e '[.prs[] | .number] == [42, 41]' "$TMP/live.json" >/dev/null \
-   && jq -e '[.prs[] | select(.number == 41)][0] | .class == "stalled" and .next_action == "merge" and .gate.exit == 0 and .head_ref == "feat/41"' "$TMP/live.json" >/dev/null \
-   && jq -e '[.prs[] | select(.number == 42)][0] | .class == "stalled" and .reason == "head-unrequested" and .next_action == "request codex" and .gate.exit == 1 and (.gate.reason | contains("gate (c)"))' "$TMP/live.json" >/dev/null; then
+   && jq -e '[.prs[] | .number] == [42, 41, 44]' "$TMP/live.json" >/dev/null \
+   && jq -e '[.prs[] | select(.number == 41)][0] | .class == "stalled" and .next_action == "merge" and .gate.exit == 0 and .head_ref == "feat/41" and .merge_gate_check == "success" and .head_pushed_at == "2026-10-13T06:00:00Z" and .head_pushed_at_source == "check-run" and .fork == false' "$TMP/live.json" >/dev/null \
+   && jq -e '[.prs[] | select(.number == 42)][0] | .class == "stalled" and .reason == "head-unrequested" and .next_action == "request codex" and .gate.exit == 1 and (.gate.reason | contains("gate (c)")) and .merge_gate_check == "absent" and .head_pushed_at == "2026-10-13T06:00:00Z" and .head_pushed_at_source == "commit-date" and .fork == true and .head_repo == "fork/demo"' "$TMP/live.json" >/dev/null \
+   && jq -e '[.prs[] | select(.number == 44)][0] | .class == "live" and .head_pushed_at == "2026-10-13T12:00:00Z" and .head_pushed_at_source == "commit-date-clamped" and .gate == null' "$TMP/live.json" >/dev/null; then
   pass "live fetch normalizes the open PRs, delegates merge readiness to the gate, and records its reason"
 else
   fail "live fetch (rc=$rc): $(cat "$TMP/live.err") $(jq -c '[.prs[] | {number, class, next_action, gate}]' "$TMP/live.json" 2>/dev/null)"
@@ -344,13 +416,14 @@ if [ "$(grep -c 'gate-called' "$TMP/gate.log")" -eq 2 ] \
    && [ "$(grep -c -- '--paginate repos/octo/demo/pulls?state=open' "$TMP/gh.log")" -eq 1 ] \
    && [ "$(grep -c -- '--paginate repos/octo/demo/pulls/41/reviews' "$TMP/gh.log")" -eq 1 ] \
    && [ "$(grep -c -- '--paginate repos/octo/demo/issues/41/comments' "$TMP/gh.log")" -eq 1 ] \
-   && [ "$(grep -c -- '--paginate repos/octo/demo/pulls/41/comments' "$TMP/gh.log")" -eq 1 ]; then
+   && [ "$(grep -c -- '--paginate repos/octo/demo/pulls/41/comments' "$TMP/gh.log")" -eq 1 ] \
+   && [ "$(grep -c -- '--paginate repos/octo/demo/commits/4141414141414141414141414141414141414141/check-runs' "$TMP/gh.log")" -eq 1 ]; then
   pass "every list read is paginated and the gate runs once per stalled agent-turn PR"
 else
   fail "read discipline: $(cat "$TMP/gh.log" "$TMP/gate.log")"
 fi
 
-if jq -e '.schema == "stalled-prs/v1" and .repo == "octo/demo" and ([.prs[] | .number] == [41, 42, 43]) and ([.prs[] | select(.number == 41)][0].gate.exit == 0)' "$TMP/live-dump.json" >/dev/null; then
+if jq -e '.schema == "stalled-prs/v1" and .repo == "octo/demo" and ([.prs[] | .number] == [41, 42, 43, 44]) and ([.prs[] | select(.number == 41)][0].gate.exit == 0)' "$TMP/live-dump.json" >/dev/null; then
   : > "$TMP/gate.log"
   set +e
   bash "$FINDER" --input "$TMP/live-dump.json" --json --now "$NOW" > "$TMP/replay.json" 2>/dev/null

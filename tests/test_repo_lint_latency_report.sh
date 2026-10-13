@@ -244,9 +244,9 @@ cat > "$SHIM/bin/gh" <<'SH'
 # Records every call; serves canned reads from $SHIM_STATE.
 printf '%s\n' "$*" >> "$SHIM_STATE/calls.log"
 case "$1 $2" in
-  "issue list")
+  "api --paginate")
     [ ! -f "$SHIM_STATE/list-fail" ] || { echo "gh: HTTP 500" >&2; exit 1; }
-    cat "$SHIM_STATE/issues.json" ;;
+    case "$3" in repos/octo/demo/issues?state=open*) cat "$SHIM_STATE/issues.json" ;; *) echo "gh shim: unhandled: $*" >&2; exit 1 ;; esac ;;
   "label list")
     cat "$SHIM_STATE/labels.txt" ;;
   "label create")
@@ -277,7 +277,7 @@ ALERTS="$(jq -r '.alerts | join(",")' "$TMP/slow/summary.json")"
 
 # 1. alert, no tracking issue, labels present → create with both labels, marker + alerts marker in the body
 S1="$SHIM/s1"; mkdir -p "$S1"
-printf '[{"number":5,"body":"unrelated"}]' > "$S1/issues.json"
+printf '[{"number":5,"body":"unrelated","user":{"login":"github-actions[bot]"}}]' > "$S1/issues.json"
 printf 'audit\narea:ci-infra\nbug\n' > "$S1/labels.txt"
 set +e; out=$(route "$S1" 1 2>&1); rc=$?; set -e
 if [ "$rc" -eq 0 ] && grep -Fq 'issue create --repo octo/demo --title Repo-lint latency audit alert --label area:ci-infra --label audit --body-file ' "$S1/calls.log" \
@@ -295,9 +295,11 @@ fi
 
 # 2. alert, existing marker issue with the same alert set → body refreshed, no comment, no create
 S2="$SHIM/s2"; mkdir -p "$S2"
-jq -n --arg m "$MARKER" --arg a "$ALERTS" '[{number: 90, body: ($m + "\n<!-- repo-lint-latency-alerts: " + $a + " -->\nold")},
-                         {number: 77, body: ($m + "\n<!-- repo-lint-latency-alerts: " + $a + " -->\nold")},
-                         {number: 5, body: "Repo-lint latency audit alert (hand-written, no marker)"}]' > "$S2/issues.json"
+jq -n --arg m "$MARKER" --arg a "$ALERTS" '[{number: 90, user: {login: "github-actions[bot]"}, body: ($m + "\n<!-- repo-lint-latency-alerts: " + $a + " -->\nold")},
+                         {number: 77, user: {login: "github-actions[bot]"}, body: ($m + "\n<!-- repo-lint-latency-alerts: " + $a + " -->\nold")},
+                         {number: 60, user: {login: "mallory"}, body: ($m + "\nplanted by a third party; must never be rewritten or closed")},
+                         {number: 70, user: {login: "github-actions[bot]"}, pull_request: {url: "x"}, body: ($m + "\na PR body carrying the marker is not an issue")},
+                         {number: 5, user: {login: "github-actions[bot]"}, body: "Repo-lint latency audit alert (hand-written, no marker)"}]' > "$S2/issues.json"
 printf 'audit\narea:ci-infra\n' > "$S2/labels.txt"
 set +e; out=$(route "$S2" 1 2>&1); rc=$?; set -e
 if [ "$rc" -eq 0 ] && grep -Fq 'issue edit 77 --repo octo/demo --title Repo-lint latency audit alert --body-file' "$S2/calls.log" \
@@ -305,15 +307,16 @@ if [ "$rc" -eq 0 ] && grep -Fq 'issue edit 77 --repo octo/demo --title Repo-lint
    && ! grep -Fq 'issue create' "$S2/calls.log" \
    && ! grep -Fq 'issue comment' "$S2/calls.log" \
    && ! grep -Fq 'issue edit 90' "$S2/calls.log" \
+   && ! grep -Fq 'issue edit 60' "$S2/calls.log" \
    && printf '%s\n' "$out" | grep -Fxq 'issue=77'; then
-  pass "alert with an existing marker issue refreshes the lowest-numbered one in place and posts no comment when the alert set is unchanged"
+  pass "alert with an existing marker issue refreshes the lowest-numbered workflow-authored one in place, ignores a planted marker and a PR, and posts no comment when the alert set is unchanged"
 else
   fail "alert refresh (rc=$rc): $out $(calls "$S2")"
 fi
 
 # 3. alert, existing issue with a different alert set → refreshed AND commented
 S3="$SHIM/s3"; mkdir -p "$S3"
-jq -n --arg m "$MARKER" '[{number: 77, body: ($m + "\n<!-- repo-lint-latency-alerts: deep_pr_p95_regression -->\nold")}]' > "$S3/issues.json"
+jq -n --arg m "$MARKER" '[{number: 77, user: {login: "github-actions[bot]"}, body: ($m + "\n<!-- repo-lint-latency-alerts: deep_pr_p95_regression -->\nold")}]' > "$S3/issues.json"
 printf 'audit\narea:ci-infra\n' > "$S3/labels.txt"
 set +e; out=$(route "$S3" 1 2>&1); rc=$?; set -e
 if [ "$rc" -eq 0 ] && grep -Fq 'issue edit 77 --repo octo/demo --title' "$S3/calls.log" \
@@ -326,13 +329,14 @@ fi
 
 # 4. recovery with an open tracking issue → closed with a recovery comment; nothing created
 S4="$SHIM/s4"; mkdir -p "$S4"
-jq -n --arg m "$MARKER" '[{number: 77, body: ($m + "\nold")}, {number: 5, body: "unrelated"}]' > "$S4/issues.json"
+jq -n --arg m "$MARKER" '[{number: 77, user: {login: "github-actions[bot]"}, body: ($m + "\nold")}, {number: 60, user: {login: "mallory"}, body: ($m + "\nplanted")}, {number: 5, user: {login: "github-actions[bot]"}, body: "unrelated"}]' > "$S4/issues.json"
 printf 'audit\narea:ci-infra\n' > "$S4/labels.txt"
 set +e; out=$(route "$S4" 0 2>&1); rc=$?; set -e
 if [ "$rc" -eq 0 ] && grep -Fq 'issue close 77 --repo octo/demo --comment :white_check_mark: Repo-lint latency audit recovered' "$S4/calls.log" \
    && ! grep -Fq 'issue close 5' "$S4/calls.log" \
+   && ! grep -Fq 'issue close 60' "$S4/calls.log" \
    && ! grep -Fq 'issue create' "$S4/calls.log"; then
-  pass "a clean verdict comments on and closes the open tracking issue"
+  pass "a clean verdict comments on and closes the workflow-authored tracking issue only"
 else
   fail "recovery close (rc=$rc): $out $(calls "$S4")"
 fi
@@ -356,8 +360,9 @@ fi
 S6="$SHIM/s6"; mkdir -p "$S6"
 printf '[]' > "$S6/issues.json"; printf 'audit\narea:ci-infra\n' > "$S6/labels.txt"; : > "$S6/list-fail"
 set +e; out=$(route "$S6" 1 2>&1); rc=$?; set -e
-if [ "$rc" -eq 1 ] && ! grep -Fq 'issue create' "$S6/calls.log" && printf '%s' "$out" | grep -Fq '::error::Could not list open issues'; then
-  pass "a failed dedupe read exits 1 without opening a duplicate"
+if [ "$rc" -eq 1 ] && ! grep -Fq 'issue create' "$S6/calls.log" && printf '%s' "$out" | grep -Fq '::error::Could not list open issues' \
+   && grep -Fq 'api --paginate repos/octo/demo/issues?state=open&per_page=100' "$S6/calls.log"; then
+  pass "the dedupe read is paginated, and when it fails the step exits 1 without opening a duplicate"
 else
   fail "list failure (rc=$rc): $out $(calls "$S6")"
 fi

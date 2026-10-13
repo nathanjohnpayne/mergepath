@@ -125,8 +125,17 @@ url=$(printf '%s' "$SELECTED" | jq -r '.url')
 reason=$(printf '%s' "$SELECTED" | jq -r '.reason')
 next_action=$(printf '%s' "$SELECTED" | jq -r '.next_action')
 detail=$(printf '%s' "$SELECTED" | jq -r '.next_action_detail')
+fork=$(printf '%s' "$SELECTED" | jq -r '.fork // false')
+head_repo=$(printf '%s' "$SELECTED" | jq -r '.head_repo // ""')
+merge_gate_check=$(printf '%s' "$SELECTED" | jq -r '.merge_gate_check // "absent"')
 newest_line=$(printf '%s' "$SELECTED" | jq -r '.newest | .kind + " by " + .actor + " at " + .at + " (" + ((.age_seconds / 60) | floor | tostring) + "m ago)"')
 repo_slug=${REPO#*/}
+# Every PR-controlled value that lands in a printed command is shell-escaped:
+# a branch may legally be named `topic;rm -rf ~`, and the work order is
+# advertised as copy-paste-ready.
+q_ref=$(printf '%q' "$head_ref")
+q_slug=$(printf '%q' "$repo_slug")
+q_wt="\$HOME/GitHub/.${q_slug}-worktrees/pr-${number}"
 
 echo "## Stalled PR work order"
 echo
@@ -137,8 +146,16 @@ echo "Stalled:     $reason — newest event: $newest_line"
 echo "Next action: $next_action — $detail"
 echo
 echo "Checkout (hidden per-repo worktree folder, docs/agents/worktree-placement.md):"
-echo "  git -C ~/GitHub/$repo_slug fetch origin $head_ref"
-echo "  git -C ~/GitHub/$repo_slug worktree add ~/GitHub/.$repo_slug-worktrees/pr-$number origin/$head_ref"
+if [ "$fork" = "true" ]; then
+  # A fork's branch is not on origin; the PR ref is. The worktree is detached
+  # at the fetched head, and a fix has to be pushed to the fork (${head_repo}).
+  echo "  git -C \$HOME/GitHub/${q_slug} fetch origin +refs/pull/${number}/head:refs/remotes/origin/pr-${number}"
+  echo "  git -C \$HOME/GitHub/${q_slug} worktree add --detach ${q_wt} refs/remotes/origin/pr-${number}"
+  echo "  (fork PR: the head branch ${q_ref} lives in ${head_repo}; push fixes there, not to origin)"
+else
+  echo "  git -C \$HOME/GitHub/${q_slug} fetch origin ${q_ref}"
+  echo "  git -C \$HOME/GitHub/${q_slug} worktree add ${q_wt} ${q_ref}"
+fi
 echo
 
 case "$next_action" in
@@ -158,12 +175,14 @@ case "$next_action" in
     echo "  (idempotent on an existing head trigger; exit 6 means review feedback is unaccounted — disposition it first)"
     ;;
   merge)
-    echo "Pre-merge gates (AGENTS.md § Workflow Summary steps 6 and 10) — run in this order, then merge as the author:"
-    echo "  scripts/review-feedback-accounting.sh $number"
-    echo "  scripts/resolve-pr-threads.sh $number --list        # zero unresolved threads required"
-    echo "  scripts/codex-review-check.sh $number $REPO            # must still exit 0 on $head_sha"
+    echo "Pre-merge sequence (AGENTS.md § Workflow Summary steps 6, 8 and 10) — every gate clean, then merge as the author:"
+    echo "  scripts/review-feedback-accounting.sh $number         # posted == accounted"
+    echo "  scripts/resolve-pr-threads.sh $number --list          # zero unresolved threads required"
+    echo "  scripts/phase-4b-classifier.sh $number               # exit 1 = post the Phase 4b handoff first (above-threshold PRs)"
+    echo "  scripts/codex-review-check.sh $number $REPO            # Phase 4 gate on $head_sha"
+    echo "  Merge clearance gate check on head: $merge_gate_check"
     echo "  scripts/gh-as-author.sh -- gh pr merge $number --repo $REPO --squash --delete-branch --match-head-commit $head_sha"
-    echo "  (this script never merges; the author identity does, after the gates above are clean)"
+    echo "  (this script never merges; the author identity does, only after every gate above is clean)"
     ;;
   investigate)
     echo "The gate did not decide the next step: $detail"

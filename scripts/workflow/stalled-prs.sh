@@ -75,6 +75,26 @@
 # posts NBSP inside some of its comments (`Reviewed commit:` lines included),
 # and a byte-exact match would miss the head anchor.
 #
+# Evidence sources, and why:
+#   - The head's push time is the earliest server-generated check-run start on
+#     the head commit; GitHub no longer exposes a push timestamp, and the
+#     commit's own committer date is author-controlled metadata (a future-dated
+#     commit would read as perpetually live). The commit date is used only when
+#     the head has no check runs at all, clamped to the run's own clock, and
+#     the source is reported.
+#   - Codex evidence (review objects, inline findings, verdict and Review
+#     Summary comments) is restricted to the Codex bot login; a CodeRabbit or
+#     code-scanning review on the head is a verdict, never a Codex signal.
+#   - `merge` is recommended only when the repository's own complete policy
+#     agrees: the newest `Merge clearance gate` check run on the head is
+#     `success` (that required check encodes the threshold, protected-path,
+#     Phase 4 and Phase 4b lanes), or that check does not exist in the repo
+#     and scripts/codex-review-check.sh exits 0. The merge itself is never
+#     performed here.
+#   - A posted handoff stays in force until an author-side event or a verdict
+#     lands after it; bot activity (a summary edit, an acknowledgement) does
+#     not clear it.
+#
 # Read-only. The only GitHub calls are GETs (and a read-only GraphQL query for
 # the head's check rollup); the gate it delegates to is itself read-only.
 #
@@ -91,6 +111,10 @@ SCRIPT_DIR="$ROOT/scripts"
 
 REPO=""
 THRESHOLD_MINUTES=60
+# The repository's complete merge policy is encoded in this required check
+# (scripts/merge-clearance-gate.sh via merge-clearance-gate.yml); `merge` is
+# recommended only when its newest run on the head succeeded.
+MERGE_GATE_CHECK_NAME="Merge clearance gate"
 JSON_OUT=0
 RUN_GATE=1
 DUMP_FILE=""
@@ -171,6 +195,21 @@ else
 
   fetch_api_array() { gh_api_array "$1" "$2" || infra "$GH_API_ARRAY_ERROR"; }
 
+  # The check-runs endpoint wraps its list in an object, so gh_api_array's
+  # array-stream contract does not fit; same failure discipline (a failed
+  # read is a status, never an empty list), applied here.
+  fetch_check_runs() {  # <sha> <label>
+    local raw err rc=0
+    err=$(mktemp "${TMPDIR:-/tmp}/stalled-prs-cr.XXXXXX") || infra "mktemp failed"
+    raw=$(gh api --paginate "repos/$REPO/commits/$1/check-runs?per_page=100" \
+            --jq '.check_runs[] | {name, status, conclusion, started_at, completed_at}' 2>"$err") || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      infra "failed to fetch $2: $(tr '\n' ' ' < "$err")"
+    fi
+    rm -f "$err"
+    printf '%s\n' "$raw" | jq -s '.' 2>/dev/null || infra "failed to parse $2"
+  }
+
   # Large PR histories overflow the exec argument limit when passed as
   # `--argjson` (a long-lived PR carries hundreds of comments), so every
   # per-PR payload goes through a file and jq reads it with --slurpfile.
@@ -190,9 +229,27 @@ else
     fetch_api_array "repos/$REPO/pulls/$number/reviews?per_page=100" "PR #$number reviews" > "$WORK/reviews.json"
     fetch_api_array "repos/$REPO/issues/$number/comments?per_page=100" "PR #$number issue comments" > "$WORK/issue_comments.json"
     fetch_api_array "repos/$REPO/pulls/$number/comments?per_page=100" "PR #$number inline comments" > "$WORK/review_comments.json"
-    head_pushed_at=$(gh_api_scalar --shape timestamp "PR #$number head commit date" \
-      "repos/$REPO/commits/$head_sha" --jq '.commit.committer.date') \
-      || infra "could not read the head commit date for PR #$number"
+    fetch_check_runs "$head_sha" "PR #$number head check runs" > "$WORK/check_runs.json"
+    head_pushed_at=$(jq -r '[.[] | .started_at // empty] | min // ""' "$WORK/check_runs.json")
+    head_pushed_at_source="check-run"
+    if [ -z "$head_pushed_at" ]; then
+      # No check run on the head at all: fall back to the commit's committer
+      # date, clamped to this run's clock so a future-dated commit cannot
+      # read as a push that has not happened yet.
+      head_pushed_at=$(gh_api_scalar --shape timestamp "PR #$number head commit date" \
+        "repos/$REPO/commits/$head_sha" --jq '.commit.committer.date') \
+        || infra "could not read the head commit date for PR #$number"
+      head_pushed_at_source="commit-date"
+      if [ "$(jq -rn --arg a "$head_pushed_at" --arg b "$NOW" '($a | fromdateiso8601) > ($b | fromdateiso8601)')" = "true" ]; then
+        head_pushed_at="$NOW"
+        head_pushed_at_source="commit-date-clamped"
+      fi
+    fi
+    merge_gate_check=$(jq -r --arg name "$MERGE_GATE_CHECK_NAME" '
+      [.[] | select(.name == $name)] | sort_by(.started_at // "") | last
+      | if . == null then "absent"
+        elif .status != "completed" then "pending"
+        else (.conclusion // "pending") end' "$WORK/check_runs.json")
     # statusCheckRollup is ONE scalar for the head, so no pagination trap
     # (the per-check list would need a cursor loop; the state does not). A
     # head with no check runs at all has a null rollup, reported as NONE.
@@ -207,6 +264,8 @@ else
       --slurpfile issue_comments "$WORK/issue_comments.json" \
       --slurpfile review_comments "$WORK/review_comments.json" \
       --arg head_pushed_at "$head_pushed_at" \
+      --arg head_pushed_at_source "$head_pushed_at_source" \
+      --arg merge_gate_check "$merge_gate_check" \
       --arg ci_state "$ci_state" '
       $pr[0] as $pr
       | {
@@ -217,8 +276,12 @@ else
         draft: ($pr.draft // false),
         head_sha: ($pr.head.sha // ""),
         head_ref: ($pr.head.ref // ""),
+        head_repo: ($pr.head.repo.full_name // ""),
+        fork: (($pr.head.repo.full_name // "") != ($pr.base.repo.full_name // "")),
         labels: [($pr.labels // [])[] | .name],
         head_pushed_at: $head_pushed_at,
+        head_pushed_at_source: $head_pushed_at_source,
+        merge_gate_check: $merge_gate_check,
         ci_state: $ci_state,
         reviews: [$reviews[0][] | {id, state, submitted_at, commit_id, body: (.body // ""),
                                    user: {login: (.user.login // ""), type: (.user.type // "")}}],
@@ -246,6 +309,7 @@ CLASSIFY_JQ='
   def strip_markup: norm | gsub("[`*_~>]"; "");
   def login: (.user.login // "");
   def is_bot: ((.user.type // "") == "Bot") or (login | endswith("[bot]"));
+  def is_codex: login | startswith("chatgpt-codex-connector");
   def actor_class($author): if is_bot then "bot" elif login == $author then "author" else "human" end;
   def is_trigger:
     (strip_markup | test("@codex[[:space:]]+review"; "i"))
@@ -287,7 +351,7 @@ CLASSIFY_JQ='
            | if (.body | is_handoff) and $cls != "bot" then
                {kind: "handoff", side: "handoff", actor: login, at: .created_at}
              elif $cls == "bot" then
-               if (.body | is_codex_summary) then
+               if is_codex and (.body | is_codex_summary) then
                  ((.body | summary_status) as $st
                   | (.body | summary_commit) as $sc
                   | if $st == "completed" and $sc != "" and ($head | startswith($sc)) then
@@ -297,7 +361,7 @@ CLASSIFY_JQ='
                     else
                       {kind: "codex-summary-stale", side: "bot-activity", actor: login, at: (.updated_at // .created_at)}
                     end)
-               elif (.body | is_codex_verdict) then
+               elif is_codex and (.body | is_codex_verdict) then
                  {kind: "verdict-comment", side: "verdict", actor: login, at: .created_at,
                   names_head: (.body | norm | contains($head))}
                elif (.body | is_rate_limited) then
@@ -340,10 +404,10 @@ CLASSIFY_JQ='
        elif $newest.side == "bot-activity" then "bot"
        else null end) as $machine_wait
     # ---- head evidence --------------------------------------------------------
-    | ([ $pr.reviews[] | select(is_bot) | select(.commit_id == $head) ] | length > 0
+    | ([ $pr.reviews[] | select(is_codex) | select(.commit_id == $head) ] | length > 0
        or ([ $events[] | select(.kind == "verdict-comment" and .names_head == true) ] | length > 0)
        or ([ $events[] | select(.kind == "codex-summary-completed" or .kind == "codex-summary-running") ] | length > 0)
-       or ([ $pr.review_comments[] | select(is_bot) | select(.in_reply_to_id == null)
+       or ([ $pr.review_comments[] | select(is_codex) | select(.in_reply_to_id == null)
              | select(.commit_id == $head or .original_commit_id == $head) ] | length > 0)
       ) as $codex_signal_on_head
     | ([ $pr.review_comments[] | select((actor_class($author)) != "author") | select(.in_reply_to_id == null)
@@ -352,12 +416,26 @@ CLASSIFY_JQ='
          | select(([ $pr.review_comments[] | select(.in_reply_to_id == $id)
                      | select((actor_class($author)) == "author") ] | length) == 0)
          | {id, actor: login, url: (.html_url // "")} ]) as $unanswered
-    | ([ $pr.reviews[] | select((actor_class($author)) != "author") | select((.state // "PENDING") != "PENDING") ]
+    # A change request counts only against THIS head: one anchored to the head
+    # commit, or submitted after the head was pushed. A CHANGES_REQUESTED from
+    # an older round is answered by the push that followed it.
+    | ([ $pr.reviews[] | select((actor_class($author)) != "author") | select((.state // "PENDING") != "PENDING")
+         | select(.commit_id == $head or ((.submitted_at | ts) >= $head_ts)) ]
        | max_by(.submitted_at | ts) | (.state // null)) as $latest_verdict_state
+    # A handoff stays in force until an author-side event or a verdict lands
+    # after it; bot activity after it (a summary edit, an acknowledgement)
+    # changes nothing about who is expected to act.
+    | ([ $events[] | select(.side == "handoff") ] | max_by(.at | ts)) as $last_handoff
+    | ($last_handoff != null
+       and ([ $events[] | select(.side == "author" or .side == "verdict")
+              | select((.at | ts) > ($last_handoff.at | ts)) ] | length) == 0) as $handoff_in_force
+    | ($pr.merge_gate_check // "absent") as $merge_gate_check
+    | ($merge_gate_check == "success"
+       or ($merge_gate_check == "absent" and $pr.gate != null and $pr.gate.exit == 0)) as $merge_ready
     | ([ $pr.labels[] | select(. as $l | human_labels | index($l)) ]) as $human_stop
     # ---- class --------------------------------------------------------------
     | (if ($human_stop | length) > 0 then {class: "waiting-on-human", reason: ("label " + ($human_stop | join(", ")))}
-       elif $newest.side == "handoff" then {class: "waiting-on-human", reason: "handoff posted"}
+       elif $handoff_in_force then {class: "waiting-on-human", reason: "handoff posted"}
        elif $machine_wait == "ci" then
          (if $age < $threshold_seconds then {class: "waiting-on-ci", reason: "head check rollup PENDING"}
           else {class: "stalled", reason: "ci-pending-stale"} end)
@@ -375,17 +453,21 @@ CLASSIFY_JQ='
     | (if $verdict.class == "waiting-on-human" then {next_action: "wait", detail: $verdict.reason}
        elif $verdict.class == "waiting-on-ci" or $verdict.class == "waiting-on-bot" then {next_action: "wait", detail: $verdict.reason}
        elif $verdict.reason == "ci-pending-stale" then {next_action: "investigate", detail: "head check rollup PENDING for longer than the threshold"}
-       elif $verdict.reason == "request-unanswered" then {next_action: "request codex", detail: "review request outlived the threshold with no verdict"}
+       # A red head is fixed before anything is re-requested on it.
        elif ($pr.ci_state == "FAILURE" or $pr.ci_state == "ERROR") then {next_action: "push fix", detail: ("head check rollup " + $pr.ci_state)}
+       elif $verdict.reason == "request-unanswered" then {next_action: "request codex", detail: "review request outlived the threshold with no verdict"}
        elif ($unanswered | length) > 0 then {next_action: "push fix", detail: (($unanswered | length | tostring) + " unanswered finding(s) on head")}
-       elif $latest_verdict_state == "CHANGES_REQUESTED" then {next_action: "push fix", detail: "latest verdict requested changes"}
-       elif ($pr.gate != null and $pr.gate.exit == 0) then {next_action: "merge", detail: "codex-review-check.sh exit 0 on head"}
+       elif $latest_verdict_state == "CHANGES_REQUESTED" then {next_action: "push fix", detail: "latest verdict requested changes on head"}
+       elif $merge_ready then {next_action: "merge", detail: (if $merge_gate_check == "success" then "Merge clearance gate check success on head" else "no Merge clearance gate check in this repo; codex-review-check.sh exit 0 on head" end)}
+       elif ($merge_gate_check == "failure" and $pr.gate != null and $pr.gate.exit == 0) then {next_action: "investigate", detail: "codex-review-check.sh exit 0 but the Merge clearance gate check failed on head"}
        elif ($codex_signal_on_head | not) and $pr.ci_state == "SUCCESS" then {next_action: "request codex", detail: "no Codex signal on head; CI green"}
        elif $pr.gate != null then {next_action: "investigate", detail: ("codex-review-check.sh exit " + ($pr.gate.exit | tostring) + ": " + ($pr.gate.reason // ""))}
        else {next_action: "investigate", detail: "gate not run"} end) as $action
     | {
         number: $pr.number, title: $pr.title, url: $pr.url, author: $author,
-        head_sha: $head, head_ref: $pr.head_ref, ci_state: $pr.ci_state, labels: $pr.labels,
+        head_sha: $head, head_ref: $pr.head_ref, head_repo: ($pr.head_repo // ""), fork: ($pr.fork // false),
+        head_pushed_at: $pr.head_pushed_at, head_pushed_at_source: ($pr.head_pushed_at_source // "unknown"),
+        ci_state: $pr.ci_state, merge_gate_check: $merge_gate_check, labels: $pr.labels,
         class: $verdict.class, reason: $verdict.reason,
         turn: (if $verdict.class == "waiting-on-human" then "human" elif $machine_wait != null then "machine" else "agent" end),
         newest: {kind: $newest.kind, side: $newest.side, actor: $newest.actor, at: $newest.at, age_seconds: $age},
