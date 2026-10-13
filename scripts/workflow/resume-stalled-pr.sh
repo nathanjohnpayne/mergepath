@@ -44,7 +44,17 @@
 #      --execute, the request step ran and exited 0)
 #   1  nothing is stalled — nothing to resume
 #   2  usage error
-#   3  the finder could not read the repository, or the --execute step failed
+#   3  the finder could not read the repository, or the --execute step hit an
+#      infrastructure error
+#   4  --execute: the Codex request was REFUSED BY POLICY, not by an outage —
+#      the requester exited 6 (feedback unaccounted) or 7 (request budget
+#      exhausted). The routing outcome is printed as a `next:` line and in the
+#      `--json` record (`execute.requester_exit`, `execute.cap_kind`,
+#      `execute.next_action`): `disposition findings` (6), `phase 4b`
+#      (7 request-ceiling: run scripts/phase-4b-review.sh from a trusted main
+#      checkout) or `human tiebreaker` (7 blocking-reviews: escalate per
+#      REVIEW_POLICY.md § Disagreements). A routine must act on that line, not
+#      retry the request: the requester will keep refusing.
 
 set -euo pipefail
 
@@ -127,8 +137,6 @@ url=$(printf '%s' "$SELECTED" | jq -r '.url')
 reason=$(printf '%s' "$SELECTED" | jq -r '.reason')
 next_action=$(printf '%s' "$SELECTED" | jq -r '.next_action')
 detail=$(printf '%s' "$SELECTED" | jq -r '.next_action_detail')
-fork=$(printf '%s' "$SELECTED" | jq -r '.fork // false')
-head_repo=$(printf '%s' "$SELECTED" | jq -r '.head_repo // ""')
 merge_gate_check=$(printf '%s' "$SELECTED" | jq -r '.merge_gate_check // "absent"')
 newest_line=$(printf '%s' "$SELECTED" | jq -r '.newest | .kind + " by " + .actor + " at " + .at + " (" + ((.age_seconds / 60) | floor | tostring) + "m ago)"')
 repo_slug=${REPO#*/}
@@ -148,16 +156,10 @@ echo "Stalled:     $reason — newest event: $newest_line"
 echo "Next action: $next_action — $detail"
 echo
 echo "Checkout (hidden per-repo worktree folder, docs/agents/worktree-placement.md):"
-if [ "$fork" = "true" ]; then
-  # A fork's branch is not on origin; the PR ref is. The worktree is detached
-  # at the fetched head, and a fix has to be pushed to the fork (${head_repo}).
-  echo "  git -C \$HOME/GitHub/${q_slug} fetch origin +refs/pull/${number}/head:refs/remotes/origin/pr-${number}"
-  echo "  git -C \$HOME/GitHub/${q_slug} worktree add --detach ${q_wt} refs/remotes/origin/pr-${number}"
-  echo "  (fork PR: the head branch ${q_ref} lives in ${head_repo}; push fixes there, not to origin)"
-else
-  echo "  git -C \$HOME/GitHub/${q_slug} fetch origin ${q_ref}"
-  echo "  git -C \$HOME/GitHub/${q_slug} worktree add ${q_wt} ${q_ref}"
-fi
+# Fork and contributor-owned PRs never classify as stalled (the finder routes
+# them to waiting-on-human), so the head branch is always on origin here.
+echo "  git -C \$HOME/GitHub/${q_slug} fetch origin ${q_ref}"
+echo "  git -C \$HOME/GitHub/${q_slug} worktree add ${q_wt} ${q_ref}"
 echo
 
 case "$next_action" in
@@ -220,12 +222,40 @@ if [ "$EXECUTE" = "1" ]; then
   [ -x "$REQUESTER" ] || { echo "resume-stalled-pr: requester missing or not executable: $REQUESTER" >&2; exit 3; }
   echo
   echo "resume-stalled-pr: posting the Codex request through the author wrapper (trigger-only, idempotent)"
+  req_out=$(mktemp "${TMPDIR:-/tmp}/resume-stalled-pr-req.XXXXXX") || { echo "resume-stalled-pr: mktemp failed" >&2; exit 3; }
+  trap 'rm -f "$req_out"' EXIT
   set +e
-  MERGEPATH_PHASE_4A_GATED=true "$REQUESTER" --trigger-only "$number" "$REPO"
+  MERGEPATH_PHASE_4A_GATED=true "$REQUESTER" --trigger-only "$number" "$REPO" > "$req_out"
   rc=$?
   set -e
-  if [ "$rc" -ne 0 ]; then
-    echo "resume-stalled-pr: codex-review-request.sh exited $rc (6 = feedback unaccounted, 7 = request cap)" >&2
-    exit 3
+  cat "$req_out"
+  # The requester's policy refusals are routing outcomes, preserved as such:
+  # collapsing them into an infrastructure failure would leave a scheduled
+  # caller retrying a request the policy has already said to stop making.
+  cap_kind=$(jq -r '.cap_exhausted.kind // ""' "$req_out" 2>/dev/null || true)
+  case "$rc" in
+    0) exit_next="" ;;
+    6) exit_next="disposition findings" ;;
+    7)
+      case "$cap_kind" in
+        request-ceiling) exit_next="phase 4b" ;;
+        blocking-reviews) exit_next="human tiebreaker" ;;
+        *) exit_next="human tiebreaker" ;;  # unknown kind: the conservative route
+      esac ;;
+    *) echo "resume-stalled-pr: codex-review-request.sh exited $rc (infrastructure); nothing was decided" >&2; exit 3 ;;
+  esac
+  if [ -n "$exit_next" ]; then
+    case "$exit_next" in
+      "disposition findings") how="disposition every earlier finding (scripts/review-feedback-accounting.sh $number), then rerun" ;;
+      "phase 4b") how="the request ceiling is spent: run scripts/phase-4b-review.sh $number --repo $REPO from a trusted main checkout" ;;
+      *) how="the blocking-review budget is spent: stop, post the escalation comment carrying [mergepath-handoff] per REVIEW_POLICY.md § Disagreements and Tiebreaking, and alert the human" ;;
+    esac
+    echo
+    echo "next: $exit_next — $how"
+    if [ "$JSON_OUT" = "1" ]; then
+      jq -n --argjson rc "$rc" --arg kind "$cap_kind" --arg next "$exit_next" --arg how "$how" \
+        '{execute: {requester_exit: $rc, cap_kind: (if $kind == "" then null else $kind end), next_action: $next, detail: $how}}'
+    fi
+    exit 4
   fi
 fi

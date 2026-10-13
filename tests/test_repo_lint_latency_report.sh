@@ -258,7 +258,9 @@ case "$1 $2" in
   "issue edit")
     if [ -f "$SHIM_STATE/add-label-fail" ] && printf '%s' "$*" | grep -q -- '--add-label'; then echo "gh: label not found" >&2; exit 1; fi
     while [ "$#" -gt 0 ]; do [ "$1" = "--body-file" ] && cp "$2" "$SHIM_STATE/edited-body.md"; shift; done ;;
-  "issue comment"|"issue close") ;;
+  "issue comment")
+    [ ! -f "$SHIM_STATE/comment-fail" ] || { echo "gh: HTTP 502" >&2; exit 1; } ;;
+  "issue close") ;;
   *) echo "gh shim: unhandled: $*" >&2; exit 1 ;;
 esac
 SH
@@ -326,6 +328,22 @@ if [ "$rc" -eq 0 ] && grep -Fq 'issue edit 77 --repo octo/demo --title' "$S3/cal
   pass "a changed alert set is commented on the refreshed issue"
 else
   fail "alert change comment (rc=$rc): $out $(calls "$S3")"
+fi
+
+# 3a. the alert-change comment fails: the body is still refreshed but KEEPS the
+#     previous alert set in its marker (so the next run retries the comment),
+#     the comment is attempted before the body edit, and the step fails.
+S3A="$SHIM/s3a"; mkdir -p "$S3A"
+cp "$S3/issues.json" "$S3A/issues.json"; printf 'audit\narea:ci-infra\n' > "$S3A/labels.txt"; : > "$S3A/comment-fail"
+set +e; out=$(route "$S3A" 1 2>&1); rc=$?; set -e
+first_write=$(grep -n -E 'issue (comment|edit) 77' "$S3A/calls.log" | head -n 1)
+if [ "$rc" -eq 1 ] && printf '%s' "$first_write" | grep -Fq 'issue comment 77' \
+   && grep -Fq 'issue edit 77 --repo octo/demo --title' "$S3A/calls.log" \
+   && grep -Fxq '<!-- repo-lint-latency-alerts: deep_pr_p95_regression -->' "$S3A/edited-body.md" \
+   && printf '%s' "$out" | grep -Fq '::error::The alert-set change on #77 could not be commented; the next run retries it.'; then
+  pass "a failed alert-change comment keeps the previous alert set in the marker for a retry and fails the step"
+else
+  fail "comment failure (rc=$rc): $out $(calls "$S3A")"
 fi
 
 # 3b. labels that cannot be re-applied to the existing tracker degrade the step to exit 1 after the refresh

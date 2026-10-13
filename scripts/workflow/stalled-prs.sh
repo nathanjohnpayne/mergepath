@@ -76,12 +76,17 @@
 # and a byte-exact match would miss the head anchor.
 #
 # Evidence sources, and why:
-#   - The head's push time is the earliest server-generated check-run start on
-#     the head commit; GitHub no longer exposes a push timestamp, and the
-#     commit's own committer date is author-controlled metadata (a future-dated
-#     commit would read as perpetually live). The commit date is used only when
-#     the head has no check runs at all, bounded by the PR's server-set
-#     updated_at (stable across runs), and the source is reported.
+#   - The head's push time is server-generated, never the commit's own
+#     committer date (author-controlled metadata: a future-dated commit would
+#     read as perpetually live, a cherry-picked old one as instantly stale).
+#     In order: the repository activity API's push entry for the head SHA;
+#     else the earliest check-run start on the head; else the PR's server-set
+#     updated_at (stable across runs, never earlier than the push). The source
+#     is reported as head_pushed_at_source.
+#   - Only pull requests an agent can drive are picked up: a fork PR, or one
+#     not authored by the configured author identity (`author_identity` in
+#     .github/review-policy.yml, default nathanjohnpayne), is classified
+#     waiting-on-human — the agent cannot push to a contributor's branch.
 #   - Codex evidence (review objects, inline findings, verdict and Review
 #     Summary comments) is restricted to the Codex bot login; a CodeRabbit or
 #     code-scanning review on the head is a verdict, never a Codex signal.
@@ -185,6 +190,16 @@ else
   # shellcheck source=../lib/gh-api-scalar.sh
   . "$SCRIPT_DIR/lib/gh-api-scalar.sh"
 
+  # The configured author identity: the only login whose PRs an agent drives.
+  # Read from the local policy file (same key codex-review-check.sh honours);
+  # an absent key keeps the fleet default.
+  # A missing policy file is the default, not an error: under pipefail an
+  # unguarded read of an absent file would abort the run silently.
+  AGENT_AUTHOR=""
+  if [ -r "$ROOT/.github/review-policy.yml" ]; then
+    AGENT_AUTHOR=$(sed -n 's/^author_identity:[[:space:]]*["'"'"']\{0,1\}\([^"'"'"'[:space:]#]*\).*/\1/p' "$ROOT/.github/review-policy.yml" | head -n 1) || AGENT_AUTHOR=""
+  fi
+  [ -n "$AGENT_AUTHOR" ] || AGENT_AUTHOR="nathanjohnpayne"
   if [ -z "$REPO" ]; then
     REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)
     [ -n "$REPO" ] || infra "could not detect the current repo; pass --repo"
@@ -230,24 +245,29 @@ else
     fetch_api_array "repos/$REPO/issues/$number/comments?per_page=100" "PR #$number issue comments" > "$WORK/issue_comments.json"
     fetch_api_array "repos/$REPO/pulls/$number/comments?per_page=100" "PR #$number inline comments" > "$WORK/review_comments.json"
     fetch_check_runs "$head_sha" "PR #$number head check runs" > "$WORK/check_runs.json"
-    head_pushed_at=$(jq -r '[.[] | .started_at // empty] | min // ""' "$WORK/check_runs.json")
-    head_pushed_at_source="check-run"
+    # Push time, server-generated only (see the header). The activity API
+    # covers same-repository heads; a fork's push lives in the fork.
+    head_pushed_at=""
+    head_pushed_at_source=""
+    head_ref=$(jq -r '.head.ref // ""' "$WORK/pr.json")
+    is_fork=$(jq -r '((.head.repo.full_name // "") != (.base.repo.full_name // ""))' "$WORK/pr.json")
+    if [ "$is_fork" = "false" ] && [ -n "$head_ref" ]; then
+      fetch_api_array "repos/$REPO/activity?ref=$(jq -rn --arg r "refs/heads/$head_ref" '$r | @uri')&activity_type=push&per_page=100" \
+        "PR #$number head push activity" > "$WORK/activity.json"
+      head_pushed_at=$(jq -r --arg sha "$head_sha" '[.[] | select(.after == $sha) | .timestamp // empty] | max // ""' "$WORK/activity.json")
+      [ -z "$head_pushed_at" ] || head_pushed_at_source="push-activity"
+    fi
     if [ -z "$head_pushed_at" ]; then
-      # No check run on the head at all: fall back to the commit's committer
-      # date, bounded by the PR's server-set updated_at. A future-dated
-      # commit therefore reads as pushed no later than the PR last changed —
-      # a STABLE value across runs, unlike this run's clock, which would
-      # re-date the push on every invocation and keep the PR live forever.
-      head_pushed_at=$(gh_api_scalar --shape timestamp "PR #$number head commit date" \
-        "repos/$REPO/commits/$head_sha" --jq '.commit.committer.date') \
-        || infra "could not read the head commit date for PR #$number"
-      head_pushed_at_source="commit-date"
-      pr_updated_at=$(jq -r '.updated_at // ""' "$WORK/pr.json")
-      if [ -n "$pr_updated_at" ] \
-         && [ "$(jq -rn --arg a "$head_pushed_at" --arg b "$pr_updated_at" '($a | fromdateiso8601) > ($b | fromdateiso8601)')" = "true" ]; then
-        head_pushed_at="$pr_updated_at"
-        head_pushed_at_source="pr-updated-at"
-      fi
+      head_pushed_at=$(jq -r '[.[] | .started_at // empty] | min // ""' "$WORK/check_runs.json")
+      [ -z "$head_pushed_at" ] || head_pushed_at_source="check-run"
+    fi
+    if [ -z "$head_pushed_at" ]; then
+      # Neither source knows this push: the PR's server-set updated_at is a
+      # stable value no earlier than the push, so a fresh push is never read
+      # as old and an old one is never re-dated to this run's clock.
+      head_pushed_at=$(jq -r '.updated_at // ""' "$WORK/pr.json")
+      head_pushed_at_source="pr-updated-at"
+      [ -n "$head_pushed_at" ] || infra "PR #$number has no push activity, no check run and no updated_at"
     fi
     merge_gate_check=$(jq -r --arg name "$MERGE_GATE_CHECK_NAME" '
       [.[] | select(.name == $name)] | sort_by(.started_at // "") | last
@@ -291,7 +311,7 @@ else
                                    user: {login: (.user.login // ""), type: (.user.type // "")}}],
         issue_comments: [$issue_comments[0][] | {id, created_at, updated_at, body: (.body // ""),
                                                  user: {login: (.user.login // ""), type: (.user.type // "")}}],
-        review_comments: [$review_comments[0][] | {id, created_at, commit_id, original_commit_id, in_reply_to_id,
+        review_comments: [$review_comments[0][] | {id, created_at, updated_at, commit_id, original_commit_id, in_reply_to_id,
                                                    html_url, body: (.body // ""),
                                                    user: {login: (.user.login // ""), type: (.user.type // "")}}],
         gate: null
@@ -301,8 +321,8 @@ else
   # selected per number.
   done < <(jq -r '[.[] | .number] | unique[]' "$WORK/pulls.json")
 
-  SNAPSHOT=$(jq -cs --arg repo "$REPO" --arg now "$NOW" \
-    '{schema: "stalled-prs/v1", repo: $repo, fetched_at: $now, prs: .}' "$WORK/records.jsonl") \
+  SNAPSHOT=$(jq -cs --arg repo "$REPO" --arg now "$NOW" --arg agent "$AGENT_AUTHOR" \
+    '{schema: "stalled-prs/v1", repo: $repo, fetched_at: $now, author_identity: $agent, prs: .}' "$WORK/records.jsonl") \
     || infra "could not assemble the snapshot"
 fi
 
@@ -340,7 +360,7 @@ CLASSIFY_JQ='
   def ts: (. // "1970-01-01T00:00:00Z") | fromdateiso8601;
   def human_labels: ["human-hold", "needs-human-review", "policy-violation"];
 
-  def classify($now; $threshold_seconds):
+  def classify($now; $threshold_seconds; $agent_author):
     . as $pr
     | $pr.author as $author
     | $pr.head_sha as $head
@@ -428,11 +448,14 @@ CLASSIFY_JQ='
     | ([ $pr.review_comments[] | select((actor_class($author)) != "author") | select(.in_reply_to_id == null)
          | select(.commit_id == $head or .original_commit_id == $head)
          | .id as $id
+         | ((.updated_at // .created_at) | ts) as $revised
          # Fix and rebuttal replies are posted under a registered reviewer
          # identity (nathanpayne-*), not the author login: any non-bot reply
-         # answers the finding.
+         # answers the finding — but only one posted after the finding was
+         # last edited or re-raised.
          | select(([ $pr.review_comments[] | select(.in_reply_to_id == $id)
-                     | select((actor_class($author)) != "bot") ] | length) == 0)
+                     | select((actor_class($author)) != "bot")
+                     | select((.created_at | ts) >= $revised) ] | length) == 0)
          | {id, actor: login, url: (.html_url // "")} ]) as $unanswered
     # A change request counts only against THIS head: one anchored to the head
     # commit, or submitted after the head was pushed. A CHANGES_REQUESTED from
@@ -454,6 +477,8 @@ CLASSIFY_JQ='
     | ([ $pr.labels[] | select(. as $l | human_labels | index($l)) ]) as $human_stop
     # ---- class --------------------------------------------------------------
     | (if ($human_stop | length) > 0 then {class: "waiting-on-human", reason: ("label " + ($human_stop | join(", ")))}
+       elif ($pr.fork // false) then {class: "waiting-on-human", reason: "fork PR: the contributor owns the head"}
+       elif $author != $agent_author then {class: "waiting-on-human", reason: ("not agent-authored (" + $author + ")")}
        elif $handoff_in_force then {class: "waiting-on-human", reason: "handoff posted"}
        elif $machine_wait == "ci" then
          (if $age < $threshold_seconds then {class: "waiting-on-ci", reason: "head check rollup PENDING"}
@@ -486,7 +511,8 @@ CLASSIFY_JQ='
        elif $latest_verdict_state == "CHANGES_REQUESTED" then {next_action: "push fix", detail: "latest verdict requested changes on head"}
        elif $merge_ready then {next_action: "merge", detail: (if $merge_gate_check == "success" then "Merge clearance gate check success on head" else "no Merge clearance gate check in this repo; codex-review-check.sh exit 0 on head" end)}
        elif ($merge_gate_check == "failure" and $pr.gate != null and $pr.gate.exit == 0) then {next_action: "investigate", detail: "codex-review-check.sh exit 0 but the Merge clearance gate check failed on head"}
-       elif ($codex_signal_on_head | not) and $pr.ci_state == "SUCCESS" then {next_action: "request codex", detail: "no Codex signal on head; CI green"}
+       elif ($codex_signal_on_head | not) and ($pr.ci_state == "SUCCESS" or $pr.ci_state == "NONE") then
+         {next_action: "request codex", detail: (if $pr.ci_state == "NONE" then "no Codex signal on head; no CI on head" else "no Codex signal on head; CI green" end)}
        elif $pr.gate != null then {next_action: "investigate", detail: ("codex-review-check.sh exit " + ($pr.gate.exit | tostring) + ": " + ($pr.gate.reason // ""))}
        else {next_action: "investigate", detail: "gate not run"} end) as $action
     | {
@@ -510,7 +536,8 @@ CLASSIFY_JQ='
       repo: .repo,
       generated_at: $now,
       threshold_minutes: $threshold_minutes,
-      prs: ([ .prs[] | select(.draft != true) | classify($now; $threshold_minutes * 60) ]
+      prs: ((.author_identity // "nathanjohnpayne") as $agent
+            | [ .prs[] | select(.draft != true) | classify($now; $threshold_minutes * 60; $agent) ]
             | sort_by([(if .class == "stalled" then 0 else 1 end), (.newest.at | ts)]))
     };
 '

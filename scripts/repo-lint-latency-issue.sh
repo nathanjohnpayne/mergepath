@@ -204,6 +204,20 @@ if [ -n "$existing" ]; then
   previous_alerts="$(printf '%s' "$open_json" | jq -r --argjson n "$existing" --arg p "$ALERTS_PREFIX" \
     '[.[] | select(.number == $n)][0].body // "" | split("\n") | map(select(startswith($p))) | (.[0] // "") | ltrimstr($p) | rtrimstr(" -->")' 2>/dev/null || true)"
   echo "Refreshing tracking issue #${existing} (alerts: ${alerts}; previously: ${previous_alerts:-unknown})."
+  # The transition comment is posted BEFORE the body refresh. If it fails,
+  # the refreshed body keeps the PREVIOUS alert set in its marker, so the
+  # next run still sees a change and retries the comment instead of losing
+  # it; the step then fails to say so.
+  comment_failed=0
+  if [ "$previous_alerts" != "$alerts" ]; then
+    change_note=":warning: Alert set changed as of ${today} (UTC): now **${alerts//,/, }** (was: ${previous_alerts:-unknown}). The issue body is refreshed in the same run — see [latest run](${RUN_URL})."
+    if ! gh issue comment "$existing" --repo "$REPO" --body "$change_note"; then  # NO_BARE_GH_WRITE_EXEMPT: CI reporting surface run under the workflow GITHUB_TOKEN (issues:write), no agent identity to verify — same class as daily-feedback-rollup.sh (#412)
+      echo "::warning::Could not comment the alert change on #${existing}; keeping the previous alert set in the marker so the next run retries."
+      comment_failed=1
+      prev_line="${ALERTS_PREFIX}${previous_alerts} -->"
+      awk -v p="$ALERTS_PREFIX" -v l="$prev_line" 'index($0, p) == 1 { print l; next } { print }' "$body" > "$body.retry" && mv "$body.retry" "$body"
+    fi
+  fi
   if ! gh issue edit "$existing" --repo "$REPO" --title "$ISSUE_TITLE" --body-file "$body"; then  # NO_BARE_GH_WRITE_EXEMPT: CI reporting surface run under the workflow GITHUB_TOKEN (issues:write), no agent identity to verify — same class as daily-feedback-rollup.sh (#412)
     echo "::error::Alert WAS raised, but tracking issue #${existing} could not be refreshed. The report is in this run's job summary only: ${RUN_URL}"
     exit 1
@@ -212,13 +226,11 @@ if [ -n "$existing" ]; then
     add_labels="$(printf '%s\n' "${label_args[@]}" | grep -v -- '^--label$' | paste -sd, -)"
     gh issue edit "$existing" --repo "$REPO" --add-label "$add_labels" >/dev/null 2>&1 || { echo "::warning::Could not re-apply labels to #${existing}."; label_degraded=1; }  # NO_BARE_GH_WRITE_EXEMPT: CI reporting surface run under the workflow GITHUB_TOKEN (issues:write), no agent identity to verify — same class as daily-feedback-rollup.sh (#412)
   fi
-  if [ "$previous_alerts" != "$alerts" ]; then
-    change_note=":warning: Alert set changed as of ${today} (UTC): now **${alerts//,/, }** (was: ${previous_alerts:-unknown}). Issue body refreshed — see [latest run](${RUN_URL})."
-    if ! gh issue comment "$existing" --repo "$REPO" --body "$change_note"; then  # NO_BARE_GH_WRITE_EXEMPT: CI reporting surface run under the workflow GITHUB_TOKEN (issues:write), no agent identity to verify — same class as daily-feedback-rollup.sh (#412)
-      echo "::warning::Could not comment the alert change on #${existing}."
-    fi
-  fi
   echo "issue=${existing}"
+  if [ "$comment_failed" -eq 1 ]; then
+    echo "::error::The alert-set change on #${existing} could not be commented; the next run retries it."
+    exit 1
+  fi
 else
   echo "No open tracking issue — opening one (alerts: ${alerts})."
   if ! created="$(gh issue create --repo "$REPO" --title "$ISSUE_TITLE" ${label_args[@]+"${label_args[@]}"} --body-file "$body" 2>&1)"; then  # NO_BARE_GH_WRITE_EXEMPT: CI reporting surface run under the workflow GITHUB_TOKEN (issues:write), no agent identity to verify — same class as daily-feedback-rollup.sh (#412)
