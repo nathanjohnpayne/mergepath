@@ -581,15 +581,19 @@ codex:
   #                                    scheduled on the head (queued counts:
   #                                    the Actions backlog is not the signal;
   #                                    a MISSING run is a head GitHub has not
-  #                                    dispatched workflows for yet). The
-  #                                    propagated repo_lint.yml `lint` job
-  #                                    exists on every consumer. Empty
-  #                                    disables.
+  #                                    dispatched workflows for yet). `lint-fast`
+  #                                    is the entry job of the propagated
+  #                                    repo_lint.yml workflow, created at
+  #                                    dispatch on every consumer; the deep
+  #                                    `lint` job is created only after
+  #                                    scope, lint-fast and deep-safety
+  #                                    finish, so it would hold the request
+  #                                    for most of the CI run. Empty disables.
   #
   # Both signals fail OPEN on an unreadable input with a distinct log line:
   # this is a cycle-time guard, not a merge gate.
   request_min_head_age_seconds: 300
-  request_requires_check: lint
+  request_requires_check: lint-fast
 
   # GitHub login of the Codex GitHub App bot. Reviews posted by this login
   # satisfy the external-review requirement in `.github/workflows/pr-audit.yml`.

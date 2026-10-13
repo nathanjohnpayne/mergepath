@@ -117,7 +117,7 @@ case "$endpoint" in
     cat "$CODEX_TEST_STATE_DIR/base-review-policy.yml"
     ;;
   repos/owner/repo/commits/*/check-runs*)
-    # #2166 moving-head guard: the `lint`-scheduled signal. Default is the
+    # #2166 moving-head guard: the `lint-fast`-scheduled signal. Default is the
     # ordinary production shape (a completed run) so the guard passes on
     # every pre-existing case through its intended branch, not the
     # unreadable one.
@@ -125,8 +125,11 @@ case "$endpoint" in
       unreadable) echo 'simulated check-runs read failure' >&2; exit 1 ;;
       missing)    printf '{"total_count":0,"check_runs":[]}\n' ;;
       othername)  printf '{"total_count":1,"check_runs":[{"id":1,"name":"not-lint","status":"completed"}]}\n' ;;
+      # The deep `lint` job alone must not satisfy the default: it is created
+      # only after its predecessors finish, which is not the signal.
+      deeplint)   printf '{"total_count":1,"check_runs":[{"id":1,"name":"lint","status":"queued"}]}\n' ;;
       garbage)    printf 'not json\n' ;;
-      *)          jq -cn --arg st "${CODEX_TEST_CHECK_RUNS:-completed}" '{total_count:1,check_runs:[{id:1,name:"lint",status:$st}]}' ;;
+      *)          jq -cn --arg st "${CODEX_TEST_CHECK_RUNS:-completed}" '{total_count:1,check_runs:[{id:1,name:"lint-fast",status:$st}]}' ;;
     esac ;;
   repos/owner/repo/commits/*)     printf '%s\n' "$t" ;;
   repos/owner/repo/issues/999/timeline)  printf '[]\n' ;;
@@ -1227,7 +1230,7 @@ test_guard_allow_flag_posts_with_warning() {
   [ "$FAIL" -ne "$before" ] || pass "MH2: --allow-moving-head downgrades the refusal to a warning and posts"
 }
 
-# MH3: old head but no `lint` check-run scheduled on it → exit 8 (check-missing)
+# MH3: old head but no `lint-fast` check-run scheduled on it → exit 8 (check-missing)
 test_guard_refuses_unscheduled_check() {
   local dir rc before=$FAIL
   dir=$(make_case "guard-nolint")
@@ -1235,14 +1238,17 @@ test_guard_refuses_unscheduled_check() {
   [ "$rc" = "8" ] || fail "MH3: expected exit 8, got $rc; err=$(cat "$dir/err.log")"
   [ "$(trig_count "$dir")" = "0" ] || fail "MH3: expected 0 posts, got $(trig_count "$dir")"
   [ "$(jqf "$dir" '.moving_head.reasons | join(",")')" = "check-missing" ] || fail "MH3: reasons=$(jqf "$dir" '.moving_head.reasons'), expected [check-missing]"
-  [ "$(jqf "$dir" '.moving_head.check_name')" = "lint" ] || fail "MH3: check_name=$(jqf "$dir" '.moving_head.check_name'), expected the lint default"
+  [ "$(jqf "$dir" '.moving_head.check_name')" = "lint-fast" ] || fail "MH3: check_name=$(jqf "$dir" '.moving_head.check_name'), expected the lint-fast default"
   [ "$(jqf "$dir" '.moving_head.check_status')" = "missing" ] || fail "MH3: check_status=$(jqf "$dir" '.moving_head.check_status'), expected missing"
   # A run under another name is not this check: the client-side filter must
   # not accept it on the server's behalf.
   dir=$(make_case "guard-othername")
   rc=$(run_guard "$dir" fresh "$OLD_HEAD" othername "" --trigger-only)
   [ "$rc" = "8" ] && [ "$(trig_count "$dir")" = "0" ] || fail "MH3b: a differently named run must not satisfy the check (rc=$rc posts=$(trig_count "$dir"))"
-  [ "$FAIL" -ne "$before" ] || pass "MH3: an old head with no scheduled lint run is refused with exit 8 (check-missing)"
+  dir=$(make_case "guard-deeplint")
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" deeplint "" --trigger-only)
+  [ "$rc" = "8" ] && [ "$(trig_count "$dir")" = "0" ] || fail "MH3c: the deep lint job alone must not satisfy the lint-fast default (rc=$rc posts=$(trig_count "$dir"))"
+  [ "$FAIL" -ne "$before" ] || pass "MH3: an old head with no scheduled lint-fast run is refused with exit 8 (check-missing)"
 }
 
 # MH4: both signals at once are reported together
@@ -1263,8 +1269,8 @@ test_guard_accepts_queued_check() {
   rc=$(run_guard "$dir" fresh "$OLD_HEAD" queued "" --trigger-only)
   [ "$rc" = "0" ] || fail "MH5: expected exit 0, got $rc; err=$(cat "$dir/err.log")"
   [ "$(trig_count "$dir")" = "1" ] || fail "MH5: expected 1 post, got $(trig_count "$dir")"
-  grep -q "check-run 'lint' is queued" "$dir/err.log" || fail "MH5: queued status not logged"
-  [ "$FAIL" -ne "$before" ] || pass "MH5: a queued lint run satisfies the scheduled-check signal"
+  grep -q "check-run 'lint-fast' is queued" "$dir/err.log" || fail "MH5: queued status not logged"
+  [ "$FAIL" -ne "$before" ] || pass "MH5: a queued lint-fast run satisfies the scheduled-check signal"
 }
 
 # MH6: an unreadable check-runs read fails OPEN with a distinct log line (this

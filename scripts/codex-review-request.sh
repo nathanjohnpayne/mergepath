@@ -663,14 +663,23 @@ fi
 #   codex.request_requires_check        a check-run by this exact name must
 #                                       have been scheduled on the head
 #                                       (queued, in progress or completed).
-#                                       Default `lint`, the propagated
-#                                       repo_lint.yml job that every consumer
-#                                       carries. A missing run means GitHub has
-#                                       not dispatched workflows for this head
-#                                       yet -- the shape of a head pushed
-#                                       seconds ago. A queued run counts: the
-#                                       Actions backlog is not the agent's
-#                                       signal. Empty disables the check.
+#                                       Default `lint-fast`: the entry job of
+#                                       the propagated repo_lint.yml workflow
+#                                       that every consumer carries, created
+#                                       the moment GitHub dispatches the
+#                                       workflow for a head. The deep `lint`
+#                                       job is created only after `scope`,
+#                                       `lint-fast` and `deep-safety` finish,
+#                                       so keying on it would hold the request
+#                                       for most of the CI duration -- the
+#                                       opposite of running Codex and CI on
+#                                       the same final head. A missing run
+#                                       means GitHub has not dispatched
+#                                       workflows for this head yet -- the
+#                                       shape of a head pushed seconds ago. A
+#                                       queued run counts: the Actions backlog
+#                                       is not the agent's signal. Empty
+#                                       disables the check.
 #
 # Both are read from the checkout's policy: this guard protects the agent's
 # own cycle time, not a merge decision, so a candidate-controlled value costs
@@ -687,7 +696,7 @@ fi
 REQUEST_REQUIRES_CHECK=$(codex_field request_requires_check)
 if [ -z "$REQUEST_REQUIRES_CHECK" ] \
    && ! { [ -f "$CONFIG" ] && awk '/^codex:/{b=1;next} b&&/^[^[:space:]#]/{b=0} b&&$1=="request_requires_check:"{f=1} END{exit !f}' "$CONFIG"; }; then
-  REQUEST_REQUIRES_CHECK=lint
+  REQUEST_REQUIRES_CHECK=lint-fast
 fi
 
 POLL_INTERVAL_SECONDS=15
