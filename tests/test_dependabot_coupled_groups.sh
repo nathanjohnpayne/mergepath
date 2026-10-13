@@ -45,6 +45,11 @@
 #  36. exclude-paths ** is recursive                                     → PASS
 #  37. recursive workspace patterns reach nested manifests               → FAIL
 #  38. lerna.json packages are evaluated                                 → FAIL
+#  39. target-branch reads that branch's ref; unavailable fails closed; base-ref reads the checkout
+#  40. Yarn !(a|b) extglob and !-prefixed workspace negations
+#  41. pnpm catalog / catalogs entries are production dependencies
+#  42. directories **/* reaches nested projects
+#  43. --fix integrity check fails closed on a malformed re-parse
 #
 # Needs python3 with PyYAML. repo_lint provisions PyYAML for every
 # self-test leg; a bare local shell without it SKIPs loudly (and CI fails).
@@ -427,6 +432,111 @@ printf '{"packages":["packages/*"]}\n' > "$r/lerna.json"
 pkg "$r/packages/app" "$FB_PROD" "$FB_DEV"
 write_config "$r" "$TYPE_GROUPS"
 expect "lerna.json packages are evaluated (root declares none)" 1 "$r" "firebase-sdk"
+
+# #2177: remaining Dependabot npm features.
+
+gitc() { git -C "$1" -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false "${@:2}"; }
+
+# CI exports these; the target-branch cases below control them explicitly.
+saved_base_ref="${GITHUB_BASE_REF-}"; saved_ref_name="${GITHUB_REF_NAME-}"
+unset GITHUB_BASE_REF GITHUB_REF_NAME
+
+r="$(new_repo target-branch)"; pkg "$r" "react" "vitest"; write_config "$r" "$TYPE_GROUPS" '    target-branch: "develop"'
+gitc "$r" init -q -b main && gitc "$r" add -A && gitc "$r" commit -q -m main
+gitc "$r" checkout -q -b develop && pkg "$r" "$FB_PROD" "$FB_DEV" && gitc "$r" commit -qam develop && gitc "$r" checkout -q main
+expect "target-branch manifests are read from that branch's ref" 1 "$r" "reading manifests from target-branch ref refs/heads/develop"
+N=$((N + 1))
+tb_out="$(python3 "$CHECKER" --root "$r" 2>&1 || true)"
+if grep -q "family 'firebase-sdk'" <<<"$tb_out"; then
+  PASS=$((PASS + 1)); echo "  PASS [$N] the split exists only on the target branch and is reported"
+else FAIL=$((FAIL + 1)); echo "  FAIL [$N] target-branch split not reported" >&2; fi
+
+r="$(new_repo target-branch-missing)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "$r" "$TYPE_GROUPS" '    target-branch: "release"'
+gitc "$r" init -q -b main && gitc "$r" add -A && gitc "$r" commit -q -m main
+expect "an unavailable target-branch fails closed" 2 "$r" "target-branch 'release' is not available"
+
+r="$(new_repo target-branch-is-base)"; pkg "$r" "react" "vitest"; write_config "$r" "$TYPE_GROUPS" '    target-branch: "release"'
+gitc "$r" init -q -b main && gitc "$r" add -A && gitc "$r" commit -q -m main
+N=$((N + 1))
+tb_out="$(GITHUB_BASE_REF=release python3 "$CHECKER" --root "$r" 2>&1 || true)"
+if grep -q "PASS" <<<"$tb_out"; then
+  PASS=$((PASS + 1)); echo "  PASS [$N] target-branch equal to the PR base reads the checkout"
+else FAIL=$((FAIL + 1)); echo "  FAIL [$N] target-branch == GITHUB_BASE_REF should read the checkout" >&2; fi
+
+[ -n "$saved_base_ref" ] && export GITHUB_BASE_REF="$saved_base_ref"
+[ -n "$saved_ref_name" ] && export GITHUB_REF_NAME="$saved_ref_name"
+
+r="$(new_repo yarn-extglob)"
+printf '{"name":"root","private":true,"workspaces":["packages/!(docs)"]}\n' > "$r/package.json"
+pkg "$r/packages/app" "$FB_PROD" "$FB_DEV"; pkg "$r/packages/docs" "react" ""
+write_config "$r" "$TYPE_GROUPS"
+expect "Yarn !(docs) still selects packages/app" 1 "$r" 'directory "/": family '"'"'firebase-sdk'"'"
+
+r="$(new_repo yarn-extglob-negated)"
+printf '{"name":"root","private":true,"workspaces":["packages/!(docs|site)"],"dependencies":{"firebase":"^13.0.0"}}\n' > "$r/package.json"
+pkg "$r/packages/docs" "" "@firebase/rules-unit-testing"; pkg "$r/packages/site" "" "@firebase/rules-unit-testing"; pkg "$r/packages/app" "react" ""
+write_config "$r" "$TYPE_GROUPS"
+expect "Yarn !(docs|site) drops both negated workspaces" 0 "$r" "PASS"
+
+r="$(new_repo pnpm-negation)"
+printf '{"name":"root","private":true,"dependencies":{"firebase":"^13.0.0"}}\n' > "$r/package.json"
+printf 'packages:\n  - "packages/*"\n  - "!packages/fixture"\n' > "$r/pnpm-workspace.yaml"
+pkg "$r/packages/fixture" "" "@firebase/rules-unit-testing"; pkg "$r/packages/app" "react" ""
+write_config "$r" "$TYPE_GROUPS"
+expect "a !-prefixed workspace pattern excludes that workspace" 0 "$r" "PASS"
+
+r="$(new_repo pnpm-catalog)"
+printf '{"name":"root","private":true,"dependencies":{"firebase":"catalog:"},"devDependencies":{"@firebase/rules-unit-testing":"catalog:"}}\n' > "$r/package.json"
+printf 'catalog:\n  firebase: ^13.0.0\n  "@firebase/rules-unit-testing": ^6.0.0\n' > "$r/pnpm-workspace.yaml"
+write_config "$r" "$TYPE_GROUPS"
+expect "pnpm catalog entries are production, so both share the production group" 0 "$r" "PASS"
+
+r="$(new_repo pnpm-catalogs-named)"
+printf '{"name":"root","private":true,"dependencies":{"firebase":"catalog:web"},"devDependencies":{"@firebase/rules-unit-testing":"^6.0.0"}}\n' > "$r/package.json"
+printf 'catalogs:\n  web:\n    firebase: ^13.0.0\n' > "$r/pnpm-workspace.yaml"
+write_config "$r" "$TYPE_GROUPS"
+expect "a named catalog member still splits from a plain dev member" 1 "$r" "@firebase/rules-unit-testing -> dev-dependencies"
+
+r="$(new_repo recursive-directories)"
+pkg "$r" "react" "vitest"; pkg "$r/services/team/web" "$FB_PROD" "$FB_DEV"
+cat > "$r/.github/dependabot.yml" <<'YAML'
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directories:
+      - "**/*"
+    schedule:
+      interval: "weekly"
+    groups:
+      dev-dependencies:
+        dependency-type: "development"
+      production-dependencies:
+        dependency-type: "production"
+YAML
+expect "directories **/* reaches nested projects" 1 "$r" 'directory "/services/team/web"'
+
+N=$((N + 1))
+if python3 - "$CHECKER" <<'PYT'
+import importlib.util, sys, tempfile, os
+spec = importlib.util.spec_from_file_location("dcg", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+import yaml
+d = tempfile.mkdtemp(); path = os.path.join(d, "dependabot.yml")
+open(path, "w").write('version: 2\nupdates:\n  - package-ecosystem: "npm"\n    directory: "/"\n    groups:\n      dev-dependencies:\n        dependency-type: "development"\n')
+config = yaml.safe_load(open(path))
+fam = {"group": "firebase-sdk", "patterns": ["firebase"], "rationale": "x"}
+real = yaml.safe_load
+yaml.safe_load = lambda text: ["not", "a", "mapping"]
+try:
+    m.apply_fix(path, config, [{"entry": 0, "family": fam, "has_named_group": False}])
+except m.ConfigError as exc:
+    assert "file left unchanged" in str(exc), exc
+    sys.exit(0)
+finally:
+    yaml.safe_load = real
+sys.exit(1)
+PYT
+then PASS=$((PASS + 1)); echo "  PASS [$N] --fix integrity check fails closed on a malformed re-parse"
+else FAIL=$((FAIL + 1)); echo "  FAIL [$N] --fix integrity check did not raise ConfigError" >&2; fi
 
 r="$(new_repo named-late)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "$r" "$TYPE_GROUPS
 $FAMILY_GROUP"
