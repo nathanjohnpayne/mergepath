@@ -405,6 +405,13 @@ case "${1-}" in
   */external_review_carryforward.sh)
     [ "${CARRY_RC:-0}" -eq 0 ] || exit "$CARRY_RC"
     printf '%s\n' "${CARRY_JSON:?}" ;;
+  */dependabot_pin_bump_exemption.sh)
+    # The Dependabot action-pin bump lane helper (#2164): record the exact
+    # invocation so the suite can prove the trusted-tree path and the pinned
+    # pair, then answer with the scripted verdict.
+    printf '%s\n' "$*" >"$GH_STUB_DIR/pin-call"
+    printf '%s\n' "${PIN_JSON-}"
+    exit "${PIN_RC:-1}" ;;
   *) exec "$REAL_BASH" "$@" ;;
 esac
 SH
@@ -640,6 +647,7 @@ printf '%s\n' 'external_review_threshold: 100' >"$CLASSIFIER_REPO/.github/review
 for helper in \
   scripts/workflow/external_review_fingerprint.sh \
   scripts/workflow/external_review_carryforward.sh \
+  scripts/workflow/dependabot_pin_bump_exemption.sh \
   scripts/codex-review-check.sh; do
   printf '%s\n' '#!/usr/bin/env bash' 'exit 99' >"$CLASSIFIER_REPO/$helper"
   chmod +x "$CLASSIFIER_REPO/$helper"
@@ -668,10 +676,10 @@ run_classifier() { # <fixture-dir> <fingerprint-rc> <carry-rc> <carry-json> [cle
     env PATH="$WORK/bin:$PATH" REAL_BASH="$REAL_BASH" GH_STUB_DIR="$dir" \
       GITHUB_OUTPUT="$dir/output" PR_NUMBER=42 EVENT_ACTION="${EVENT_ACTION_OVERRIDE:-labeled}" \
       BASE_SHA="$EVENT_BASE" HEAD_SHA="$EVENT_HEAD" \
-      HEAD_REF=codex/test-carry-forward PR_AUTHOR=fixture-author \
+      HEAD_REF=codex/test-carry-forward PR_AUTHOR="${PR_AUTHOR_OVERRIDE:-fixture-author}" \
       REPO=o/r DEFAULT_BRANCH=main \
       FINGERPRINT_RC="$fingerprint_rc" \
-      FINGERPRINT_JSON='{"requires_review":true,"fingerprint":"fp-1","reasons":["protected path"]}' \
+      FINGERPRINT_JSON="${FINGERPRINT_JSON_OVERRIDE:-{\"requires_review\":true,\"fingerprint\":\"fp-1\",\"reasons\":[\"protected path\"]\}}" \
       CARRY_RC="$carry_rc" CARRY_JSON="$carry_json" CLEARANCE_RC="$clearance_rc" \
       "$REAL_BASH" "$WORK/classifier.sh"
   ) >"$dir/out" 2>"$dir/err" || rc=$?
@@ -833,6 +841,90 @@ if [ "$rc" -eq 0 ] \
   pass "a failed fingerprint remains fail-closed"
 else
   fail "fingerprint failure weakened fail-closed classification (rc=$rc output=$(cat "$C3/output" 2>/dev/null) err=$(cat "$C3/err"))"
+fi
+
+# Dependabot action-pin bump lane (#2164): the classifier consults the trusted
+# helper only for a dependabot[bot] PR whose sole external-review reason is the
+# protected-path rule, pins it to the event pair and the governing base config,
+# and turns an exempt verdict into a no-review classification. Every other
+# verdict keeps the ordinary path.
+PIN_FP='{"requires_review":true,"fingerprint":"fp-1","lines_changed":2,"threshold":100,"reasons":["protected paths modified: .github/workflows/ci.yml"]}'
+PIN_EXEMPT_JSON=$(jq -nc --arg h "$EVENT_HEAD" --arg b "$EVENT_BASE" '{exempt:true,status:"exempt",reason:"every changed line is a Dependabot action pin bump",head:$h,base:$b,author:"dependabot[bot]",provenance:"all 1 commit(s) authored by dependabot[bot], committed by GitHub, signature verified",files:[{filename:".github/workflows/ci.yml",pins:1}],pins:1}')
+
+D1="$WORK/classifier-pin-bump-exempt"
+rc=$(PR_AUTHOR_OVERRIDE='dependabot[bot]' FINGERPRINT_JSON_OVERRIDE="$PIN_FP" PIN_RC=0 PIN_JSON="$PIN_EXEMPT_JSON" \
+  run_classifier "$D1" 0 0 '{"carried":false}')
+if [ "$rc" -eq 0 ] \
+   && [ "$(last_output "$D1/output" needs_review)" = false ] \
+   && [ "$(last_output "$D1/output" classification)" = dependabot-pin-bump ] \
+   && [ "$(last_output "$D1/output" dependabot_pin_bump)" = true ] \
+   && [ "$(last_output "$D1/output" dependabot_pin_bump_evidence)" = "$PIN_EXEMPT_JSON" ] \
+   && [ ! -f "$D1/clearance-call" ]; then
+  pass "a verified Dependabot pin-only bump classifies dependabot-pin-bump with its evidence and skips the clearance scan"
+else
+  fail "pin-bump exempt verdict did not publish a no-review classification (rc=$rc output=$(cat "$D1/output" 2>/dev/null) err=$(cat "$D1/err"))"
+fi
+pin_call=$(cat "$D1/pin-call" 2>/dev/null || true)
+if [[ "$pin_call" == *"--head $EVENT_HEAD --base $EVENT_BASE --config "*"/.github/review-policy.yml --files-json "* ]] \
+   && [[ "$pin_call" != *"--config $CLASSIFIER_REPO/.github/review-policy.yml"* ]] \
+   && [[ "$pin_call" != "$CLASSIFIER_REPO/scripts/workflow/dependabot_pin_bump_exemption.sh "* ]] \
+   && [[ "$pin_call" == *"/scripts/workflow/dependabot_pin_bump_exemption.sh --repo o/r --pr 42 "* ]]; then
+  pass "the lane helper runs from the trusted base worktree, pinned to the event pair, with the base config and the fetched files payload"
+else
+  fail "lane helper invocation is wrong: $pin_call"
+fi
+
+D2="$WORK/classifier-pin-bump-not-exempt"
+rc=$(PR_AUTHOR_OVERRIDE='dependabot[bot]' FINGERPRINT_JSON_OVERRIDE="$PIN_FP" PIN_RC=1 \
+  PIN_JSON='{"exempt":false,"status":"not-exempt","reason":"file .github/workflows/ci.yml: hunk 1 adds a line that is not an action pin"}' \
+  run_classifier "$D2" 0 0 '{"carried":false}')
+if [ "$rc" -eq 0 ] \
+   && [ "$(last_output "$D2/output" needs_review)" = true ] \
+   && [ "$(last_output "$D2/output" classification)" = external-required ] \
+   && [ "$(last_output "$D2/output" dependabot_pin_bump)" = false ] \
+   && grep -Fq 'not an action pin' "$D2/out"; then
+  pass "a Dependabot diff with a non-pin hunk keeps the ordinary external-required classification"
+else
+  fail "pin-bump not-exempt verdict changed classification (rc=$rc output=$(cat "$D2/output" 2>/dev/null) err=$(cat "$D2/err"))"
+fi
+
+D3="$WORK/classifier-pin-bump-unreadable"
+rc=$(PR_AUTHOR_OVERRIDE='dependabot[bot]' FINGERPRINT_JSON_OVERRIDE="$PIN_FP" PIN_RC=3 \
+  PIN_JSON='{"exempt":false,"status":"unreadable","reason":"commit provenance could not be verified"}' \
+  run_classifier "$D3" 0 0 '{"carried":false}')
+if [ "$rc" -eq 0 ] \
+   && [ "$(last_output "$D3/output" needs_review)" = true ] \
+   && [ "$(last_output "$D3/output" dependabot_pin_bump)" = false ] \
+   && grep -Fq 'could not be reached' "$D3/out"; then
+  pass "an unreachable pin-bump verdict requires review fail-closed"
+else
+  fail "unreachable pin-bump verdict weakened the classification (rc=$rc output=$(cat "$D3/output" 2>/dev/null) err=$(cat "$D3/err"))"
+fi
+
+D4="$WORK/classifier-pin-bump-over-threshold"
+rc=$(PR_AUTHOR_OVERRIDE='dependabot[bot]' \
+  FINGERPRINT_JSON_OVERRIDE='{"requires_review":true,"fingerprint":"fp-1","lines_changed":400,"threshold":100,"reasons":["400 lines changed >= threshold 100","protected paths modified: .github/workflows/ci.yml"]}' \
+  PIN_RC=0 PIN_JSON="$PIN_EXEMPT_JSON" \
+  run_classifier "$D4" 0 0 '{"carried":false}')
+if [ "$rc" -eq 0 ] \
+   && [ "$(last_output "$D4/output" needs_review)" = true ] \
+   && [ ! -f "$D4/pin-call" ] \
+   && grep -Fq 'more than the protected-path rule' "$D4/out"; then
+  pass "a Dependabot diff that also crosses the threshold is not lane-eligible and never consults the helper"
+else
+  fail "threshold-crossing Dependabot diff reached the lane (rc=$rc output=$(cat "$D4/output" 2>/dev/null) err=$(cat "$D4/err"))"
+fi
+
+D5="$WORK/classifier-pin-bump-human-author"
+rc=$(FINGERPRINT_JSON_OVERRIDE="$PIN_FP" PIN_RC=0 PIN_JSON="$PIN_EXEMPT_JSON" \
+  run_classifier "$D5" 0 0 '{"carried":false}')
+if [ "$rc" -eq 0 ] \
+   && [ "$(last_output "$D5/output" needs_review)" = true ] \
+   && [ "$(last_output "$D5/output" dependabot_pin_bump)" = false ] \
+   && [ ! -f "$D5/pin-call" ]; then
+  pass "a non-Dependabot author never reaches the lane, whatever the helper would say"
+else
+  fail "non-Dependabot author reached the lane (rc=$rc output=$(cat "$D5/output" 2>/dev/null) err=$(cat "$D5/err"))"
 fi
 
 RECONCILE_IF=$(yq -r '.jobs."external-review-labeling".steps[] | select(.name == "Reconcile a policy-owned fail-closed label") | .if' "$WORKFLOW")
