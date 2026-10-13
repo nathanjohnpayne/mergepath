@@ -1337,6 +1337,9 @@ class Lexer:
         # Default lexical words, references and relationships remain unchanged.
         self._arithmetic_contexts = arithmetic_contexts
         self.arithmetic_context_spans = []
+        if arithmetic_contexts:
+            self.herestring_source_positions = []
+            self.herestring_source_terminators = []
         self.logical = []
         self.heredocs = []
         self.func_defs = []  # (name, body_start_index, body_end_index)
@@ -1796,6 +1799,12 @@ class Lexer:
             # ---- here-doc / here-string openers ----
             if c == "<" and i + 1 < n and text[i + 1] == "<":
                 if i + 2 < n and text[i + 2] == "<":
+                    if self._arithmetic_contexts:
+                        prefix = "".join(cur_level()["word"])
+                        seg = cur_level()["seg"]
+                        self.herestring_source_positions.append(
+                            (seg, len(seg.words), prefix, i + 3)
+                        )
                     # here-string: the following word belongs to this segment
                     cur_level()["seg"].words.append("<<<")
                     i += 3
@@ -2086,6 +2095,10 @@ class Lexer:
                     start_segment()
                     i += 1
                     continue
+                if (self._arithmetic_contexts
+                        and _unquote_command_word("".join(cur_level()["word"])) == "/dev/stdin"):
+                    seg = cur_level()["seg"]
+                    self.herestring_source_terminators.append((seg, len(seg.words), i))
                 cur_level()["word"].append(c)
                 i += 1
                 continue
@@ -3696,7 +3709,8 @@ def _heredoc_has_positional(hd, emitter_helpers, _depth=0):
             positional = (_word_has_verbatim_positional(inner, in_heredoc=True, _depth=_depth)
                           if body.startswith(("$[", "$((", "${"), start)
                           and _heredoc_brace_command_span(body, start) is None
-                          else _heredoc_substitution_has_positional(inner, _depth))
+                          else _heredoc_substitution_has_positional(
+                              inner, _depth, _outer_substitution=body.startswith("$(", start)))
             if positional:
                 return True
     for start, end in _error_word_spans(body, in_heredoc=True):
@@ -3714,7 +3728,7 @@ def _backtick_positional_source(body):
     )
 
 
-def _heredoc_substitution_has_positional(body, _depth=0):
+def _heredoc_substitution_has_positional(body, _depth=0, _outer_substitution=False):
     """Inventory actual source within one shared HD/deferred child hop.
 
     Keep ordinary source checking first, including its conservative legacy
@@ -3750,7 +3764,7 @@ def _heredoc_substitution_has_positional(body, _depth=0):
             return True
     for ll in lx.logical:
         for seg in ll.segments:
-            for inner in (_deferred_shell_operands(seg) + _heredoc_source_herestrings(seg)):
+            for inner in (_deferred_shell_operands(seg) + _heredoc_source_herestrings(seg, lx, _outer_substitution)):
                 if _heredoc_substitution_has_positional(inner, _depth + 1):
                     return True
     return False
@@ -3758,16 +3772,56 @@ def _heredoc_substitution_has_positional(body, _depth=0):
 
 
 
-def _heredoc_source_herestrings(seg):
+def _heredoc_source_herestrings(seg, source_lexer=None, outer_substitution=False):
     """Literal stdin supplied to source/. shares the existing child budget."""
-    cmd, _redir = resolve_command(seg)
-    if cmd not in ("source", ".") or seg._cmd_index is None:
+    words = list(seg.words)
+    bound_inputs = None
+    if source_lexer is not None:
+        bound_inputs = []
+        if outer_substitution:
+            for owner, index, close in source_lexer.herestring_source_terminators:
+                if (owner is seg and index < len(words)
+                        and source_lexer.text[close:close + 1] == ")"
+                        and close not in source_lexer.quoted_data_offsets
+                        and close not in source_lexer.comment_offsets
+                        and words[index].endswith(")")
+                        and _unquote_command_word(words[index][:-1]) == "/dev/stdin"):
+                    words[index] = words[index][:-1]
+        positions = [record for record in source_lexer.herestring_source_positions
+                     if record[0] is seg]
+        for _owner, index, prefix, end in reversed(positions):
+            # Read the actual following operand from its physical source
+            # position. A quoted/numeric operand is never an FD prefix.
+            suffix = source_lexer.text[end:]
+            reader = Lexer(suffix)
+            following = reader.logical[0].segments[0].words
+            if not following:
+                continue
+            raw = following[0]
+            # Existing resolver/argument readers already consume an input
+            # redirection pair. This private projection never executes it.
+            count = 2 if prefix and suffix[:1] in (" ", "\t", "\n") else 1
+            if prefix and not _is_fd_prefix(prefix):
+                words[index:index + 1 + count] = [prefix, "<", raw]
+            else:
+                words[index:index + 1 + count] = ["<", raw]
+            if (not _is_fd_prefix(prefix) or prefix == ""
+                    or (prefix.isdigit() and not prefix.strip("0"))):
+                literal = _unquote_command_word(raw)
+                if literal is not None:
+                    bound_inputs.append(literal)
+    probe = Segment(-1, None, False, seg.line)
+    probe.words = words
+    cmd, _redir = resolve_command(probe)
+    if cmd not in ("source", ".") or probe._cmd_index is None:
         return []
-    args = list(_command_arguments(seg.words, seg._cmd_index + 1))
+    args = list(_command_arguments(words, probe._cmd_index + 1))
     if args and args[0][1] == "--":
         args = args[1:]
     if not args or args[0][1] != "/dev/stdin":
         return []
+    if bound_inputs is not None:
+        return bound_inputs
     inputs = []
     for i, word in enumerate(seg.words):
         if word == "<<<" and i + 1 < len(seg.words):
@@ -5220,6 +5274,54 @@ MUST_NOT_FLAG = "clean"
 
 # (id, disposition, body)  -- body is appended to PROLOGUE.
 CORPUS = [
+    # Same source-input repair: literal filename/command attachments and order.
+    ('helper-hd-fd0-source-FD0-before-filename', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source 0<<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-FD0-before-filename', MUST_FLAG, 'die(){ printf safe <<EOF\n$(. 0<<<\'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-bare-before-filename', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source <<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-bare-before-filename', MUST_FLAG, 'die(){ printf safe <<EOF\n$(. <<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-attached-command', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source<<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-attached-command', MUST_FLAG, 'die(){ printf safe <<EOF\n$(.<<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-attached-filename', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-before-command', MUST_FLAG, 'die(){ printf safe <<EOF\n$(<<< \'echo "$1" >&2\' source /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-FD0-before-command', MUST_FLAG, 'die(){ printf safe <<EOF\n$(0<<< \'echo "$1" >&2\' source /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-prefilename-quoted-path', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source 0<<< \'echo "$1" >&2\' \'/dev/stdin\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-prefilename-literal-parenthesis', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source 0<<< \'echo "$1" >&2\' \'/dev/stdin)\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-prefilename-escaped-parenthesis', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source 0<<< \'echo "$1" >&2\' /dev/stdin\\))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-FD3-before-filename', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source 3<<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-printf-before-filename', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(printf 0<<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-prefilename-literal-input', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source 0<<< \'echo \'\\\'\'$1\'\\\'\' >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-prefilename-duplicate-argument', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(printf \'%s\' \'/dev/stdin)\'; source 0<<< \'echo "$1" >&2\' \'/dev/stdin)\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-multiple-capture-duplicate', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source 0<<< \'printf safe\' /dev/stdin) $(source 0<<< \'echo "$1" >&2\' \'/dev/stdin)\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-multiple-command-duplicate', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source 0<<< \'printf safe\' /dev/stdin; source 0<<< \'echo "$1" >&2\' \'/dev/stdin)\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-FD0-before-filename-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(source 0<<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-FD0-before-filename-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(. 0<<<\'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-bare-before-filename-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(source <<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-bare-before-filename-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(. <<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    # Narrow physical FD0 here-string operand binding.
+    ('helper-hd-fd0-source-fd0-spaced', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 0<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd0-attached', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 0<<<\'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-fd0-spaced', MUST_FLAG, 'die(){ printf safe <<EOF\n$(. /dev/stdin 0<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-fd0-attached', MUST_FLAG, 'die(){ printf safe <<EOF\n$(. /dev/stdin 0<<<\'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-zeroes', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 00<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd3', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 3<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd3-attached', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 3<<<\'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd10', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 10<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-fd3', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(. /dev/stdin 3<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-printf-fd0', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(printf safe /dev/stdin 0<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-printf-path-fd0', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(printf /dev/stdin 0<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-quoted-zero-input', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin <<< \'0\' \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-doublequoted-zero-input', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin <<< "0" \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-plain-zero-input', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin <<< 0 \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd0-quoted-zero-input', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 0<<< \'0\' \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd0-safe', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 0<<< \'printf safe\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd0-literal-positional', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 0<<< \'echo \'\\\'\'$1\'\\\'\' >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd0-trailing-DATA', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 0<<< \'printf safe\'; printf \'%s\' \'$1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd0-argument-not-program', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(printf \'%s\' \'source /dev/stdin 0<<< echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd0-spaced-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(source /dev/stdin 0<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd0-attached-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(source /dev/stdin 0<<<\'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-fd0-spaced-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(. /dev/stdin 0<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-fd0-attached-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(. /dev/stdin 0<<<\'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-named-fd', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin {fd}<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
     # Owner-bounded bundle/source/brace regression controls.
     ('helper-hd-three-alias-qs', MUST_FLAG, 'die(){ printf safe <<EOF\n$(shopt -qs expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
     ('helper-hd-three-alias-sq', MUST_FLAG, 'die(){ printf safe <<EOF\n$(shopt -sq expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
@@ -12104,6 +12206,39 @@ def _heredoc_three_regression_cases():
     return failures
 
 
+
+def _heredoc_fd0_binding_cases():
+    """Physical IO_NUMBER context never consumes a numeric input as a prefix."""
+    failures = []
+    for program in ("source /dev/stdin 0<<< 'echo \"$1\" >&2'",
+                    ". /dev/stdin 0<<<'echo \"$1\" >&2'",
+                    "source /dev/stdin 00<<< 'echo \"$1\" >&2'"):
+        if not _heredoc_substitution_has_positional(program):
+            failures.append("physical stdin here-string missing: " + program)
+        if _heredoc_substitution_has_positional(program, _DEFERRED_SHELL_DEPTH):
+            failures.append("physical stdin here-string bypassed child stop: " + program)
+        if hasattr(Lexer(program), "herestring_source_positions"):
+            failures.append("default Lexer metadata changed: " + program)
+    for program in ("source /dev/stdin 3<<< 'echo \"$1\" >&2'",
+                    "source /dev/stdin {fd}<<< 'echo \"$1\" >&2'",
+                    "source /dev/stdin <<< '0' 'echo \"$1\" >&2'",
+                    "source /dev/stdin <<< 0 'echo \"$1\" >&2'",
+                    "source /dev/stdin 0<<< '0' 'echo \"$1\" >&2'",
+                    "printf /dev/stdin 0<<< 'echo \"$1\" >&2'"):
+        if _heredoc_substitution_has_positional(program):
+            failures.append("nonstdin/non-evaluating/actual numeric operand changed: " + program)
+    program = "source 0<<< 'echo \"$1\" >&2' /dev/stdin)"
+    if _heredoc_substitution_has_positional(program):
+        failures.append("naked close gained an actual-substitution certificate")
+    if not _heredoc_substitution_has_positional(program, _outer_substitution=True):
+        failures.append("owned filename boundary missing in actual substitution")
+    for path in ("'/dev/stdin)'", "/dev/stdin\\)"):
+        program = "source 0<<< 'echo \"$1\" >&2' " + path + ")"
+        if _heredoc_substitution_has_positional(program, _outer_substitution=True):
+            failures.append("quoted/escaped filename boundary promoted: " + path)
+    return failures
+
+
 def self_test():
     failures = []
     passed = 0
@@ -12124,6 +12259,7 @@ def self_test():
     failures.extend(_heredoc_command_index_context_cases())
     failures.extend(_heredoc_for_alias_context_cases())
     failures.extend(_heredoc_three_regression_cases())
+    failures.extend(_heredoc_fd0_binding_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
