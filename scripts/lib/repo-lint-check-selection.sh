@@ -32,3 +32,35 @@ repo_lint_check_is_selected() {
   jq -e --arg wrapper "$wrapper" 'index($wrapper) != null' \
     <<<"$REPO_LINT_SELECTION_JSON" >/dev/null
 }
+
+# Sharding (#1655). REPO_LINT_SHARD="<index>/<count>" splits a replay over
+# independent legs: a caller numbers its candidates in one stable order and
+# runs those `repo_lint_shard_owns <ordinal>` admits. The default 1/1 owns
+# everything; a malformed value fails closed rather than silently running an
+# empty or a duplicate shard.
+REPO_LINT_SELECTION_SHARD="${REPO_LINT_SHARD:-1/1}"
+case "$REPO_LINT_SELECTION_SHARD" in
+  [1-9]/[1-9]|[1-9]/[1-9][0-9]|[1-9][0-9]/[1-9][0-9]) ;;
+  *)
+    echo "repo-lint selection: REPO_LINT_SHARD must be <index>/<count> (got '$REPO_LINT_SELECTION_SHARD')" >&2
+    return 1 2>/dev/null || exit 1
+    ;;
+esac
+REPO_LINT_SELECTION_SHARD_INDEX="${REPO_LINT_SELECTION_SHARD%%/*}"
+REPO_LINT_SELECTION_SHARD_COUNT="${REPO_LINT_SELECTION_SHARD##*/}"
+if [ "$REPO_LINT_SELECTION_SHARD_INDEX" -gt "$REPO_LINT_SELECTION_SHARD_COUNT" ]; then
+  echo "repo-lint selection: REPO_LINT_SHARD index exceeds count (got '$REPO_LINT_SELECTION_SHARD')" >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+# $1 = 0-based ordinal of a candidate in the caller's stable order.
+repo_lint_shard_owns() {
+  local ordinal="$1"
+  case "$ordinal" in
+    ''|*[!0-9]*)
+      echo "repo-lint selection: shard ordinal must be a non-negative integer (got '$ordinal')" >&2
+      return 2
+      ;;
+  esac
+  [ $((ordinal % REPO_LINT_SELECTION_SHARD_COUNT)) -eq $((REPO_LINT_SELECTION_SHARD_INDEX - 1)) ]
+}
