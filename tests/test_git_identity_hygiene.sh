@@ -15,8 +15,8 @@
 # what extends the "nothing moved .git/config" guarantee to the end of
 # the CI job rather than to the step before its last one.
 #
-# Every case pivots the check onto a fixture tree via
-# MERGEPATH_GIT_IDENTITY_ROOT, so nothing here touches the real repo.
+# Cases use isolated fixture roots or a copied check inside a fixture repo.
+# No fixture setup targets the real repo.
 
 set -euo pipefail
 
@@ -30,19 +30,20 @@ trap 'rm -rf "$WORKDIR"' EXIT
 
 PASS=0
 FAIL=0
+SKIP=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
+skip() { echo "SKIP: $*"; SKIP=$((SKIP + 1)); }
 
-# Build a fixture tree containing the mergepath hub marker (so Part C's
-# static scan is active) plus one file with the given content, then run
-# the check against it. Sets OUT and RC.
+# Build a markerless consumer fixture plus one file with the given content,
+# then run the shared scan against it. Sets OUT and RC. All Part C cases
+# therefore protect consumers as well as the hub.
 FIXTURE_SEQ=0
 run_on_fixture() {
   local rel="$1" content="$2"
   FIXTURE_SEQ=$((FIXTURE_SEQ + 1))
   local tree="$WORKDIR/fixture-$FIXTURE_SEQ"
   mkdir -p "$tree/scripts" "$tree/$(dirname "$rel")"
-  printf '#!/usr/bin/env bash\n' > "$tree/scripts/sync-to-downstream.sh"
   printf '%s' "$content" > "$tree/$rel"
   set +e
   OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$tree" bash "$CHECK" 2>&1)"
@@ -110,6 +111,41 @@ else
   fail "--global writes: rc=$RC out=$OUT"
 fi
 
+# Case 4b: Git accepts the unique long-option prefixes --gl/--sy and up.
+# Scan-only snippets do not write any global or system configuration.
+for SCOPE in --gl --glo --glob --globa --global --sy --sys --syst --syste --system; do
+  run_on_fixture "tests/scope-prefix.sh" "git config $SCOPE user.email fixture@example.com
+"
+  if [ "$RC" = "0" ]; then
+    pass "Git-supported out-of-repo scope prefix $SCOPE: allowed"
+  else
+    fail "Git scope prefix $SCOPE rejected: rc=$RC out=$OUT"
+  fi
+done
+for SCOPE in --g --s --glued --systematic; do
+  run_on_fixture "tests/not-scope-prefix.sh" "git config $SCOPE user.email leak@example.com
+"
+  if [ "$RC" = "1" ]; then
+    pass "ambiguous/non-option scope spelling $SCOPE: cannot suppress a writer"
+  else
+    fail "unsupported scope spelling $SCOPE suppressed writer: rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "tests/neighbour-prefix.sh" 'git config --gl user.email fixture@example.com; git config user.email leak@example.com
+'
+if [ "$RC" = "1" ]; then
+  pass "short scope prefix on neighbouring command cannot suppress unscoped writer"
+else
+  fail "neighbouring scope prefix hid writer: rc=$RC out=$OUT"
+fi
+run_on_fixture "tests/trailing-prefix.sh" 'git config user.email leak@example.com --sy
+'
+if [ "$RC" = "1" ]; then
+  pass "short scope prefix after the value cannot suppress unscoped writer"
+else
+  fail "trailing scope prefix hid writer: rc=$RC out=$OUT"
+fi
+
 # Case 5: `git -c key=value <cmd>` is an ephemeral per-command override.
 # It writes no file, so it must never be flagged. Note the lowercase -c
 # is a different flag from the -C the check accepts as a repo target.
@@ -175,24 +211,283 @@ else
   fail "generated PRD mirror: rc=$RC out=$OUT"
 fi
 
-# Case 10: consumer safety — scripts/ci/ is a propagated kit, and
-# consumers carry bootstrap-frozen copies of the files fixed upstream.
-# Without the mergepath marker the static scan must not run at all.
+# Case 10: consumers need the SAME scan on repo-owned scripts and policy.
+# Use a real index and the production path, without a fixture-root override,
+# to cover tracked enumeration and the separate hub-suite gate together.
 CONSUMER="$WORKDIR/consumer"
-mkdir -p "$CONSUMER/tests"
+mkdir -p "$CONSUMER/scripts/ci" "$CONSUMER/tests" "$CONSUMER/docs/projects/app/prds"
+git init -q -b main "$CONSUMER"
+cp "$CHECK" "$CONSUMER/scripts/ci/check_git_identity_hygiene"
 cat > "$CONSUMER/tests/leaky.sh" <<'EOF'
 #!/usr/bin/env bash
 git config user.email "test@example.com"
 EOF
+cat > "$CONSUMER/REVIEW_POLICY.md" <<'EOF'
+# Frozen consumer policy
+git config user.name "fixture"
+EOF
+# This hub suite must remain excluded from the scan AND never run here.
+cat > "$CONSUMER/tests/test_git_identity_hygiene.sh" <<'EOF'
+#!/usr/bin/env bash
+git config user.email "suite@example.com"
+exit 91
+EOF
+cp "$CONSUMER/REVIEW_POLICY.md" "$CONSUMER/docs/projects/app/prds/app.md"
+git -C "$CONSUMER" add .
 set +e
-OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$CONSUMER" bash "$CHECK" 2>&1)"
+OUT="$(bash "$CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"
 RC=$?
 set -e
-if [ "$RC" = "0" ] && printf '%s' "$OUT" | grep -q "Part C skipped (consumer checkout"; then
-  pass "consumer checkout (no sync-to-downstream.sh): static scan skipped"
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "tests/leaky.sh:2" \
+  && printf '%s' "$OUT" | grep -q "REVIEW_POLICY.md:2" \
+  && ! printf '%s' "$OUT" | grep -q "test_git_identity_hygiene.sh:" \
+  && ! printf '%s' "$OUT" | grep -q "docs/projects/app/prds/app.md:"; then
+  pass "markerless consumer: tracked script and policy writes caught; fixture and generated paths excluded"
 else
-  fail "consumer checkout: rc=$RC out=$OUT"
+  fail "consumer tracked scan: rc=$RC out=$OUT"
 fi
+cat > "$CONSUMER/tests/leaky.sh" <<'EOF'
+#!/usr/bin/env bash
+git -C "$FIXTURE" config user.email "fixture@example.com"
+git config user.name "fixture" # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture subshell
+EOF
+printf '# Policy\nLegacy byte: \377\n`git config user.name <name>`\n' > "$CONSUMER/REVIEW_POLICY.md"
+# Untracked source is not part of the production scan's contract.
+printf 'git config user.email "untracked@example.com"\n' > "$CONSUMER/untracked.sh"
+set +e
+OUT="$(bash "$CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "0" ] \
+  && printf '%s' "$OUT" | grep -q "regression test suite skipped (consumer checkout" \
+  && ! printf '%s' "$OUT" | grep -q "Part C skipped"; then
+  pass "markerless consumer: targeted fixture writes and explicit exemptions pass; hub suite remains skipped"
+else
+  fail "clean consumer with frozen hub-suite fixture: rc=$RC out=$OUT"
+fi
+# The hub marker changes only suite eligibility, not the scanner's verdict.
+# Replace the scan-only input before executing it: suites run from the
+# caller's cwd, so the forbidden fixture command must never be executed.
+printf '#!/usr/bin/env bash\nexit 91\n' > "$CONSUMER/tests/test_git_identity_hygiene.sh"
+printf '#!/usr/bin/env bash\n' > "$CONSUMER/scripts/sync-to-downstream.sh"
+git -C "$CONSUMER" add scripts/sync-to-downstream.sh
+set +e
+OUT="$(bash "$CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "regression test suite failed"; then
+  pass "hub marker: paired regression suite runs and failure is retained"
+else
+  fail "hub suite gate: rc=$RC out=$OUT"
+fi
+
+# Case 10b: the real Git index must preserve names Git normally C-quotes.
+# The copied production check runs markerless; all commands below are scan
+# input, never executed. Clear each writer before probing the next path so
+# a previous finding cannot mask a skipped file.
+PATHS_CONSUMER="$WORKDIR/consumer-paths"
+mkdir -p "$PATHS_CONSUMER/scripts/ci" "$PATHS_CONSUMER/docs" "$PATHS_CONSUMER/tests" "$PATHS_CONSUMER/tools"
+git init -q -b main "$PATHS_CONSUMER"
+cp "$CHECK" "$PATHS_CONSUMER/scripts/ci/check_git_identity_hygiene"
+for REL in 'docs/résumé.md' 'tests/署名.sh' $'docs/line\nbreak.md' $'docs/tab\tname.md' 'docs/quote"name.md' 'tools/हुक'; do
+  printf '#!/usr/bin/env bash\ngit config user.email leak@example.com\n' > "$PATHS_CONSUMER/$REL"
+  git -C "$PATHS_CONSUMER" add -- "$REL"
+  set +e
+  OUT="$(bash "$PATHS_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"
+  RC=$?
+  set -e
+  # The human-readable report prefixes every output line, including
+  # embedded newlines in a path. Assert the complete displayed pathname.
+  REPORTED_REL="${REL//$'\n'/$'\n  - '}"
+  if [ "$RC" = "1" ] && [[ "$OUT" == *"$REPORTED_REL:2:"* ]]; then
+    pass "tracked C-quoted path retains its finding: $REL"
+  else
+    fail "tracked pathname skipped: '$REL' rc=$RC out=$OUT"
+  fi
+  printf '#!/usr/bin/env bash\ngit -C "$FIXTURE" config user.email fixture@example.com\n' > "$PATHS_CONSUMER/$REL"
+done
+printf 'git config user.email untracked@example.com\n' > "$PATHS_CONSUMER/docs/non-suivi-署名.md"
+set +e
+OUT="$(bash "$PATHS_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "0" ]; then
+  pass "scoped tracked paths pass; untracked Unicode source stays excluded"
+else
+  fail "clean tracked pathname corpus: rc=$RC out=$OUT"
+fi
+for REL in 'docs/résumé.md' $'docs/line\nbreak.md'; do
+  run_on_fixture "$REL" 'git config user.email leak@example.com
+'
+  REPORTED_REL="${REL//$'\n'/$'\n  - '}"
+  if [ "$RC" = "1" ] && [[ "$OUT" == *"$REPORTED_REL:1:"* ]]; then
+    pass "fixture enumeration preserves pathname: $REL"
+  else
+    fail "fixture pathname skipped: '$REL' rc=$RC out=$OUT"
+  fi
+done
+
+# Case 10c: tracked symlinks name link objects, not source on this machine.
+# Exercise missing, clean and offending external targets in a real index.
+# The companion regular source must still be scanned in every state.
+LINKS_CONSUMER="$WORKDIR/consumer-links"
+mkdir -p "$LINKS_CONSUMER/scripts/ci" "$LINKS_CONSUMER/docs" "$WORKDIR/external-source"
+git init -q -b main "$LINKS_CONSUMER"
+cp "$CHECK" "$LINKS_CONSUMER/scripts/ci/check_git_identity_hygiene"
+for REL in linked.md linked.sh linked-hook; do
+  ln -s "$WORKDIR/external-source/target" "$LINKS_CONSUMER/$REL"
+done
+printf 'git -C "$FIXTURE" config user.email fixture@example.com\n' > "$LINKS_CONSUMER/docs/regular.md"
+git -C "$LINKS_CONSUMER" add .
+for STATE in absent clean writer; do
+  case "$STATE" in
+    clean) printf '#!/usr/bin/env bash\ngit -C "$FIXTURE" config user.email fixture@example.com\n' > "$WORKDIR/external-source/target" ;;
+    writer) printf '#!/usr/bin/env bash\ngit config user.email external@example.com\n' > "$WORKDIR/external-source/target" ;;
+  esac
+  set +e
+  OUT="$(bash "$LINKS_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+  set -e
+  if [ "$RC" = "0" ]; then
+    pass "tracked symlink targets excluded when external source is $STATE"
+  else
+    fail "symlink target affected tracked-source scan ($STATE): rc=$RC out=$OUT"
+  fi
+  printf 'git config user.email regular@example.com\n' > "$LINKS_CONSUMER/docs/regular.md"
+  set +e
+  OUT="$(bash "$LINKS_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+  set -e
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/regular.md:1:' \
+    && ! printf '%s' "$OUT" | grep -q 'linked.*:2:'; then
+    pass "regular tracked companion still scanned with $STATE symlink target"
+  else
+    fail "regular source beside $STATE symlink: rc=$RC out=$OUT"
+  fi
+  printf 'git -C "$FIXTURE" config user.email fixture@example.com\n' > "$LINKS_CONSUMER/docs/regular.md"
+done
+# A tracked directory replaced with a symlink must not redirect regular paths.
+mv "$LINKS_CONSUMER/docs" "$WORKDIR/original-source"
+printf 'git config user.email external@example.com\n' > "$WORKDIR/external-source/regular.md"
+ln -s "$WORKDIR/external-source" "$LINKS_CONSUMER/docs"
+set +e
+OUT="$(bash "$LINKS_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+set -e
+if [ "$RC" = "0" ]; then
+  pass "symlinked directory cannot redirect tracked source to machine-local bytes"
+else
+  fail "symlinked parent directory followed: rc=$RC out=$OUT"
+fi
+
+# BEGIN STARTUP_ADMISSION_CONTROLS
+# Case 10d: shell-startup basenames and immediate Husky hook files need no
+# shebang. Exercise every admitted name at root and nested paths through a
+# genuine private Git index, with no root/suite override or hub marker.
+STARTUP_CONSUMER="$WORKDIR/consumer-startup-admission"
+mkdir -p "$STARTUP_CONSUMER/scripts/ci" "$STARTUP_CONSUMER/tests"
+git init -q -b main "$STARTUP_CONSUMER"
+cp "$CHECK" "$STARTUP_CONSUMER/scripts/ci/check_git_identity_hygiene"
+printf '#!/usr/bin/env bash\nexit 91\n' > "$STARTUP_CONSUMER/tests/test_git_identity_hygiene.sh"
+cp "$STARTUP_CONSUMER/.git/config" "$WORKDIR/startup-config-before"
+STARTUP_PATHS=()
+for NAME in .profile .bashrc .bash_profile .bash_login .bash_logout .zshenv .zprofile .zshrc .zlogin .zlogout .kshrc .mkshrc .ashrc .envrc .bash_aliases .shrc; do
+  STARTUP_PATHS+=("$NAME" "packages/demo/$NAME")
+done
+STARTUP_PATHS+=(.husky/pre-commit packages/demo/.husky/pre-push)
+for CONTROL in writer scoped exempt quoted-data; do
+  case "$CONTROL" in
+    writer) SOURCE='git config user.email startup@example.invalid'; EXPECTED=1 ;;
+    scoped) SOURCE='git -C "$FIXTURE" config user.email startup@example.invalid'; EXPECTED=0 ;;
+    exempt) SOURCE='git config user.email startup@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: owning fixture'; EXPECTED=0 ;;
+    quoted-data) SOURCE="printf '%s' 'git config user.email startup@example.invalid'"; EXPECTED=0 ;;
+  esac
+  for REL in "${STARTUP_PATHS[@]}"; do
+    mkdir -p "$STARTUP_CONSUMER/$(dirname "$REL")"
+    printf '%s\n' "$SOURCE" > "$STARTUP_CONSUMER/$REL"
+  done
+  git -C "$STARTUP_CONSUMER" add -A
+  if git -C "$STARTUP_CONSUMER" ls-files --error-unmatch -- "${STARTUP_PATHS[@]}" >/dev/null 2>&1; then
+    pass "all startup/Husky $CONTROL paths are genuinely tracked"
+  else fail "startup/Husky control paths missing from private index: $CONTROL"; fi
+  set +e
+  OUT="$(bash "$STARTUP_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+  set -e
+  for REL in "${STARTUP_PATHS[@]}"; do
+    if [ "$RC" = "$EXPECTED" ] \
+      && { [ "$EXPECTED" = 0 ] || [[ "$OUT" == *"  - $REL:1:"* ]]; } \
+      && { [ "$EXPECTED" = 1 ] || [[ "$OUT" == *"regression test suite skipped (consumer checkout"* ]]; } \
+      && cmp -s "$WORKDIR/startup-config-before" "$STARTUP_CONSUMER/.git/config"; then
+      pass "tracked startup/Husky $CONTROL control: $REL"
+    else fail "startup/Husky $CONTROL: path='$REL' expected=$EXPECTED rc=$RC out=$OUT"; fi
+  done
+done
+
+# Case and suffix variants, other components, helper/deeper paths and a
+# .husky basename without a following component gain no new admission.
+STARTUP_NEGATIVES=(case-hooks/.HUSKY/pre-commit packages/case-hooks/.HUSKY/pre-push
+  foo.husky/pre-commit .husky-helper/pre-commit
+  .husky/_/pre-commit .husky/child/pre-commit packages/demo/.husky/_/pre-push
+  packages/demo/.husky/child/pre-push packages/literal/.husky
+  docs/projects/app/prds/.bashrc docs/projects/app/prds/.husky/pre-commit)
+for NAME in .profile .bashrc .bash_profile .bash_login .bash_logout .zshenv .zprofile .zshrc .zlogin .zlogout .kshrc .mkshrc .ashrc .envrc .bash_aliases .shrc; do
+  UPPER_NAME="$(printf '%s' "$NAME" | tr '[:lower:]' '[:upper:]')"
+  # Separate directories avoid aliasing the positive names on macOS.
+  STARTUP_NEGATIVES+=("case-startup/$UPPER_NAME" "packages/case-startup/$UPPER_NAME" "$NAME.backup" "packages/demo/$NAME.backup")
+done
+for REL in "${STARTUP_NEGATIVES[@]}"; do
+  mkdir -p "$STARTUP_CONSUMER/$(dirname "$REL")"
+  printf 'git config user.email negative@example.invalid\n' > "$STARTUP_CONSUMER/$REL"
+done
+git -C "$STARTUP_CONSUMER" add -A
+if git -C "$STARTUP_CONSUMER" ls-files --error-unmatch -- "${STARTUP_NEGATIVES[@]}" >/dev/null 2>&1; then
+  pass "startup case/suffix and Husky component/depth negatives are genuinely tracked"
+else fail "startup/Husky negative paths missing from private index"; fi
+printf 'git config user.email untracked@example.invalid\n' > "$STARTUP_CONSUMER/.husky/untracked-hook"
+set +e
+OUT="$(bash "$STARTUP_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+set -e
+if [ "$RC" = 0 ] && [[ "$OUT" == *"regression test suite skipped (consumer checkout"* ]] \
+  && cmp -s "$WORKDIR/startup-config-before" "$STARTUP_CONSUMER/.git/config"; then
+  pass "tracked startup case/suffix and Husky component/depth negatives; exclusions retained"
+else fail "startup/Husky negative admission: rc=$RC out=$OUT"; fi
+
+# New path admission is additive: helper/deeper paths already admitted
+# by extensions or shebangs must continue to expose their writer.
+for REL in .husky/_/file.sh packages/demo/.husky/child/file.sh .husky/_/shebang-hook; do
+  mkdir -p "$STARTUP_CONSUMER/$(dirname "$REL")"
+  printf '#!/usr/bin/env bash\ngit config user.email inherited@example.invalid\n' > "$STARTUP_CONSUMER/$REL"
+  git -C "$STARTUP_CONSUMER" add -- "$REL"
+  set +e
+  OUT="$(bash "$STARTUP_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+  set -e
+  if [ "$RC" = 1 ] && [[ "$OUT" == *"  - $REL:2:"* ]]; then
+    pass "existing extension/shebang admission remains additive: $REL"
+  else fail "existing Husky source globally exempted: path='$REL' rc=$RC out=$OUT"; fi
+  printf '#!/usr/bin/env bash\ngit -C "$FIXTURE" config user.email inherited@example.invalid\n' > "$STARTUP_CONSUMER/$REL"
+done
+
+# Track actual link objects for both new families, then replace a tracked
+# regular parent directory with a link. Neither may read external bytes.
+mkdir -p "$WORKDIR/startup-external/.husky"
+printf 'git config user.email external@example.invalid\n' > "$WORKDIR/startup-external/.zshrc"
+printf 'git config user.email external@example.invalid\n' > "$WORKDIR/startup-external/.husky/pre-push"
+for REL in .zshrc .husky/pre-commit; do
+  rm "$STARTUP_CONSUMER/$REL"
+  ln -s "$WORKDIR/startup-external/.zshrc" "$STARTUP_CONSUMER/$REL"
+  git -C "$STARTUP_CONSUMER" add -- "$REL"
+  if [[ "$(git -C "$STARTUP_CONSUMER" ls-files --stage -- "$REL")" == 120000* ]]; then
+    pass "startup/Husky link is a genuine tracked symlink: $REL"
+  else fail "startup symlink fixture mode not verified: $REL"; fi
+done
+mv "$STARTUP_CONSUMER/packages/demo" "$WORKDIR/startup-original-package"
+ln -s "$WORKDIR/startup-external" "$STARTUP_CONSUMER/packages/demo"
+set +e
+OUT="$(bash "$STARTUP_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+set -e
+if [ "$RC" = 0 ] && [[ "$OUT" == *"regression test suite skipped (consumer checkout"* ]] \
+  && cmp -s "$WORKDIR/startup-config-before" "$STARTUP_CONSUMER/.git/config"; then
+  pass "startup/Husky symlink files and symlinked parents retain regular-source boundary"
+else fail "startup/Husky followed external link bytes: rc=$RC out=$OUT"; fi
+# END STARTUP_ADMISSION_CONTROLS
 
 # Case 11: a backslash continuation between `git` and `config`. Neither
 # physical line matches on its own — the first carries no `config`, the
@@ -393,6 +688,47 @@ if [ "$RC" = "0" ]; then
 else
   fail "non-value token after the key: rc=$RC out=$OUT"
 fi
+
+# Case 22b: one literal post-key > / >> target is shell data, not the
+# assignment value. Use the real production index without root/suite
+# overrides; the copied hub suite stays present but marker-gated.
+REDIRECT_CONSUMER="$WORKDIR/consumer-redirection"
+mkdir -p "$REDIRECT_CONSUMER/scripts/ci" "$REDIRECT_CONSUMER/tests"
+git init -q -b main "$REDIRECT_CONSUMER"
+cp "$CHECK" "$REDIRECT_CONSUMER/scripts/ci/check_git_identity_hygiene"
+cp "$ROOT/tests/test_git_identity_hygiene.sh" "$REDIRECT_CONSUMER/tests/"
+cp "$REDIRECT_CONSUMER/.git/config" "$WORKDIR/redirection-config-before"
+while IFS='|' read -r EXPECTED LABEL SOURCE; do
+  rm -f "$REDIRECT_CONSUMER/source.sh" "$REDIRECT_CONSUMER/source.md"
+  REDIRECT_REL=source.sh
+  [[ "$SOURCE" != \`* ]] || REDIRECT_REL=source.md
+  printf '%s\n' "$SOURCE" > "$REDIRECT_CONSUMER/$REDIRECT_REL"
+  git -C "$REDIRECT_CONSUMER" add -A
+  set +e
+  OUT="$(bash "$REDIRECT_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+  set -e
+  if [ "$RC" = "$EXPECTED" ] \
+    && { [ "$EXPECTED" = 0 ] || [[ "$OUT" == *"$REDIRECT_REL:1:"* ]]; } \
+    && { [ "$EXPECTED" = 1 ] || [[ "$OUT" == *"regression test suite skipped (consumer checkout"* ]]; } \
+    && cmp -s "$WORKDIR/redirection-config-before" "$REDIRECT_CONSUMER/.git/config"; then
+    pass "literal post-key redirection: $LABEL"
+  else
+    fail "post-key redirection $LABEL: expected=$EXPECTED rc=$RC out=$OUT"
+  fi
+done <<'REDIRECT_CASES'
+1|adjacent output target before value|git config user.email >/dev/null leak@example.com
+1|spaced append target before value|git config user.email >> /dev/null leak@example.com
+1|paired key and target quoting|git config "User.Email" >"sink path" leak@example.com
+1|target option text cannot scope the write|git config user.email >--global leak@example.com
+1|Markdown code span retains the writer|`git config commit.gpgsign > /dev/null false`
+0|explicit read selector remains a read|git config --get user.email > /dev/null
+0|redirection target alone is not a value|git config user.email >> "sink path"
+0|scoped fixture identity setup remains allowed|git -C "$FIX" config user.email >/dev/null fixture@example.com; git config --global user.name >> /dev/null "Real Human"
+0|owning shell-comment exemption remains allowed|git config user.email >/dev/null fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: deliberate fixture
+0|Markdown placeholder stays outside the value grammar|`git config user.email <addr>`
+0|expansion target gains no coverage guarantee|git config user.email >"$SINK" leak@example.com
+0|multiple redirections gain no coverage guarantee|git config user.email >/dev/null >>sink leak@example.com
+REDIRECT_CASES
 
 # Case 23: case 19 in Markdown. A prose sentence carries no shell
 # separator, so the whole paragraph arrives as ONE piece and a `--global`
@@ -1331,6 +1667,455 @@ else
   fail "marker in a Markdown code block not honoured: rc=$RC out=$OUT"
 fi
 
+# Case 54b: quoted or escaped shell data cannot forge a comment marker.
+# These are scan-only inputs; none of the fixture commands are executed.
+while IFS= read -r LINE; do
+  run_on_fixture "tests/quoted-marker.sh" "$LINE
+"
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "tests/quoted-marker.sh:1"; then
+    pass "quoted/escaped comment-shaped marker does not exempt: $LINE"
+  else
+    fail "quoted/escaped marker exemption: rc=$RC out=$OUT"
+  fi
+done <<'EOF'
+git config user.email leak@example.com; echo " # GIT_IDENTITY_SCOPE_EXEMPT: x"
+git config user.email leak@example.com; echo ' # GIT_IDENTITY_SCOPE_EXEMPT: x'
+git config user.email leak@example.com; echo \# GIT_IDENTITY_SCOPE_EXEMPT: x
+git config user.email leak@example.com; echo \ # GIT_IDENTITY_SCOPE_EXEMPT: x
+git config user.email leak@example.com; echo "escaped \" # GIT_IDENTITY_SCOPE_EXEMPT: x"
+git config user.email leak@example.com; echo $'escaped \' # GIT_IDENTITY_SCOPE_EXEMPT: x'
+EOF
+
+# Case 54c: closed strings and escaped data do not hide a later real comment.
+while IFS= read -r LINE; do
+  run_on_fixture "tests/comment-marker.sh" "$LINE
+"
+  if [ "$RC" = "0" ]; then
+    pass "real comment after quoted/escaped data still exempts: $LINE"
+  else
+    fail "real marker after quoted/escaped data: rc=$RC out=$OUT"
+  fi
+done <<'EOF'
+git config user.email "fixture@example.com" # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+git config user.email 'fixture@example.com' # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+git config user.email fixture\ value # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+git config user.email "escaped \" value" # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+git config user.email $'escaped \' value' # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+EOF
+
+# Case 54ca: a control operator opens a real comment boundary even when
+# no space precedes the #. Quoted or escaped operators remain string data.
+while IFS= read -r LINE; do
+  run_on_fixture "tests/operator-comment.sh" "$LINE
+"
+  if [ "$RC" = "0" ]; then
+    pass "real exemption after a control operator: $LINE"
+  else
+    fail "control-operator exemption rejected: rc=$RC out=$OUT"
+  fi
+done <<'EOF'
+git config user.email fixture@example.com;# GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+git config user.email fixture@example.com&&# GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+git config user.email fixture@example.com||# GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+git config user.email fixture@example.com&# GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+git config user.email fixture@example.com|# GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+(git config user.email fixture@example.com)# GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+EOF
+while IFS= read -r LINE; do
+  run_on_fixture "tests/operator-data.sh" "$LINE
+"
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'tests/operator-data.sh:1'; then
+    pass "quoted/escaped control operator cannot forge exemption: $LINE"
+  else
+    fail "control-operator data exempted writer: rc=$RC out=$OUT"
+  fi
+done <<'EOF'
+git config user.email leak@example.com; echo ";# GIT_IDENTITY_SCOPE_EXEMPT: literal"
+git config user.email leak@example.com; echo '|# GIT_IDENTITY_SCOPE_EXEMPT: literal'
+git config user.email leak@example.com; echo \;# GIT_IDENTITY_SCOPE_EXEMPT: literal
+EOF
+
+# Case 54d: Markdown exemptions need a complete comment with its reason inside.
+while IFS= read -r LINE; do
+  run_on_fixture "docs/broken-marker.md" "$LINE
+"
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/broken-marker.md:1"; then
+    pass "invalid Markdown comment does not exempt: $LINE"
+  else
+    fail "invalid Markdown comment exemption: rc=$RC out=$OUT"
+  fi
+done <<'EOF'
+git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: x
+git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: -->
+git config user.email leak@example.com <!-- other --> GIT_IDENTITY_SCOPE_EXEMPT: x <!-- other -->
+EOF
+run_on_fixture "docs/closed-marker.md" '`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: fixture value > only -->
+'
+if [ "$RC" = "0" ]; then
+  pass "complete HTML exemption after a code span: allowed, including > in the reason"
+else
+  fail "complete Markdown marker: rc=$RC out=$OUT"
+fi
+
+# Case 54e: HTML markers are literal code inside either Markdown fence.
+# A shorter or mismatched delimiter cannot end the fenced-code context.
+for FENCE in '```' '~~~' '````' '~~~~'; do
+  if [[ "$FENCE" == \`* ]]; then MISMATCH='~~~'; else MISMATCH='```'; fi
+  run_on_fixture "docs/fenced-html.md" "$FENCE"'bash
+'"${FENCE%?}"'
+'"$MISMATCH"'
+git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->
+'
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/fenced-html.md:4"; then
+    pass "HTML marker inside $FENCE fence: cannot exempt a write"
+  else
+    fail "HTML marker inside $FENCE fence: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/fenced-shell.md" "$FENCE"'bash
+git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+'"$FENCE"'
+`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: recorded evidence -->
+'
+  if [ "$RC" = "0" ]; then
+    pass "shell marker inside $FENCE fence and HTML marker after closing: allowed"
+  else
+    fail "valid exemptions around $FENCE fence: rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "docs/continued-fenced-html.md" '   ~~~~bash
+git config user.email \
+fixture@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->
+   ~~~~~
+'
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/continued-fenced-html.md:2"; then
+  pass "continued command inside indented Markdown fence: HTML marker cannot exempt"
+else
+  fail "continued fenced HTML marker: rc=$RC out=$OUT"
+fi
+# Fence state belongs to each file, even when the preceding fence never closes.
+run_on_fixture "docs/a-unclosed.md" '```bash
+'
+printf '%s\n' '`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: recorded evidence -->' > "$WORKDIR/fixture-$FIXTURE_SEQ/docs/b-outside.md"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$WORKDIR/fixture-$FIXTURE_SEQ" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "0" ]; then
+  pass "unclosed Markdown fence does not leak into another file"
+else
+  fail "Markdown fence state leaked between files: rc=$RC out=$OUT"
+fi
+
+# Case 54j: VT/FF are neither fence-closing blanks nor shell blanks.
+# These are scan-only source bytes, never executed fixture commands.
+for CONTROL in $'\v' $'\f' $'\r'; do
+  run_on_fixture "tests/control-marker.sh" "git config user.email leak@example.com;echo X${CONTROL}# GIT_IDENTITY_SCOPE_EXEMPT: printed data
+"
+  if [ "$RC" = "1" ]; then
+    pass "non-shell blank before hash cannot forge a comment exemption"
+  else
+    fail "control byte forged shell comment: rc=$RC out=$OUT"
+  fi
+done
+for CONTROL in $'\v' $'\f'; do
+  for FENCE in '```' '~~~'; do
+    run_on_fixture "docs/control-fence.md" "${FENCE}bash
+${FENCE}${CONTROL}
+git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: fenced data -->
+${FENCE}
+"'`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: real outside comment -->
+'
+    if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/control-fence.md:3:' \
+      && ! printf '%s' "$OUT" | grep -q 'docs/control-fence.md:5:'; then
+      pass "control byte cannot close $FENCE fence; real closer restores HTML comments"
+    else
+      fail "control-byte $FENCE fence boundary: rc=$RC out=$OUT"
+    fi
+  done
+done
+for BLANK in ' ' $'\t'; do
+  run_on_fixture "tests/blank-marker.sh" "git config user.email fixture@example.com${BLANK}# GIT_IDENTITY_SCOPE_EXEMPT: real shell comment
+"
+  if [ "$RC" = "0" ]; then
+    pass "shell space/tab still opens a real exemption comment"
+  else
+    fail "real shell blank rejected: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "tests/blank-marker-neighbour.sh" "git config user.email leak@example.com;echo X${BLANK}# GIT_IDENTITY_SCOPE_EXEMPT: echo only
+"
+  if [ "$RC" = "1" ]; then
+    pass "real shell blank on later comment does not exempt earlier writer"
+  else
+    fail "later space/tab marker widened command exemption: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/blank-fence.md" '```bash
+'"\`\`\`${BLANK}"$'\r\n'"git config user.email fixture@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: after CRLF closer -->"$'\r\n'
+  if [ "$RC" = "0" ]; then
+    pass "space/tab fence closer accepts CRLF and restores real HTML exemptions"
+  else
+    fail "real CRLF fence closer rejected: rc=$RC out=$OUT"
+  fi
+done
+
+# Case 54k: comment-shaped text in inline links and HTML attributes is data.
+# Quote styles, balanced/escaped parentheses, and markup escapes share the
+# real lexer. A real comment after each closed construct still exempts.
+for DATA in \
+  '[marker](https://example.invalid "<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal title -->")' \
+  "[marker](https://example.invalid '<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal title -->')" \
+  '[marker](https://example.invalid (<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal title -->))' \
+  '[marker](<https://example.invalid/a)> "<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal title -->")' \
+  "[marker](<https://example.invalid/a)> '<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal title -->')" \
+  '[marker]( <https://example.invalid/a(b)> (<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal title -->))' \
+  '[marker](<https://example.invalid/a\>b)> "<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal title -->")' \
+  '[marker](https://example.invalid/a(b) "<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal ) title -->")' \
+  '[marker](https://example.invalid/a\(b\) "<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal title -->")' \
+  '<span title="<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal attribute -->">text</span>' \
+  "<span title='<!-- GIT_IDENTITY_SCOPE_EXEMPT: literal attribute -->'>text</span>" \
+  '<span title="literal > <!-- GIT_IDENTITY_SCOPE_EXEMPT: attribute -->">text</span>' \
+  '\<!-- GIT_IDENTITY_SCOPE_EXEMPT: escaped markup -->'; do
+  run_on_fixture "docs/data-marker.md" "git config user.email leak@example.com ${DATA}
+"
+  if [ "$RC" = "1" ]; then
+    pass "HTML marker in link/attribute/escaped data cannot exempt a writer"
+  else
+    fail "comment-shaped Markdown data accepted: '$DATA' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/data-then-comment.md" "git config user.email fixture@example.com ${DATA} <!-- GIT_IDENTITY_SCOPE_EXEMPT: real comment after data -->
+"
+  if [ "$RC" = "0" ]; then
+    pass "real HTML comment after closed link/attribute/escaped data still exempts"
+  else
+    fail "real comment after Markdown data rejected: '$DATA' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "docs/comments-with-quotes.md" 'git config user.email fixture@example.com "quoted prose" <!-- GIT_IDENTITY_SCOPE_EXEMPT: "real quoted reason" -->
+git config user.email fixture@example.com <!-- ordinary comment --> <!-- GIT_IDENTITY_SCOPE_EXEMPT: second real comment -->
+'
+if [ "$RC" = "0" ]; then
+  pass "prose quotes and preceding ordinary comments do not mask a true HTML exemption"
+else
+  fail "true HTML comment over-masked: rc=$RC out=$OUT"
+fi
+
+# Case 54f: blockquote and list containers do not make fenced HTML live.
+for PREFIX in '> ' '> > ' '- ' '1. ' '> - '; do
+  CONTINUATION="$PREFIX"
+  case "$PREFIX" in
+    '- ') CONTINUATION='  ' ;;
+    '1. ') CONTINUATION='   ' ;;
+    '> - ') CONTINUATION='>   ' ;;
+  esac
+  run_on_fixture "docs/container-html.md" "$PREFIX"'```bash
+'"$CONTINUATION"'git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+'"$CONTINUATION"'```
+'
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/container-html.md:2"; then
+    pass "HTML marker in $PREFIX container fence: cannot exempt"
+  else
+    fail "HTML marker in $PREFIX container fence: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/container-shell.md" "$PREFIX"'~~~bash
+'"$CONTINUATION"'git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture
+'"$CONTINUATION"'~~~
+
+`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: evidence outside container -->
+git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture outside container
+'
+  if [ "$RC" = "0" ]; then
+    pass "real shell/HTML exemptions inside and after $PREFIX container: allowed"
+  else
+    fail "real exemptions around $PREFIX container: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/container-continued.md" "$PREFIX"'```bash
+'"$CONTINUATION"'git config user.email \
+'"$CONTINUATION"'leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+'"$CONTINUATION"'```
+'
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/container-continued.md:2"; then
+    pass "continued write inside $PREFIX container fence: HTML cannot exempt"
+  else
+    fail "continued write inside $PREFIX container fence: rc=$RC out=$OUT"
+  fi
+  # A container can end without an explicit closing fence. Its context
+  # must not suppress legitimate HTML comments in the following paragraph.
+  run_on_fixture "docs/container-ended.md" "$PREFIX"'```bash
+'"$CONTINUATION"'git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture
+
+`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: outside ended container -->
+'
+  if [ "$RC" = "0" ]; then
+    pass "ended $PREFIX container drops an unclosed fence: real HTML allowed"
+  else
+    fail "ended $PREFIX container kept stale fence state: rc=$RC out=$OUT"
+  fi
+done
+# A list fence may open on a continuation line, below the item text.
+run_on_fixture "docs/list-continuation-html.md" '- Example:
+  ```bash
+  git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+  ```
+'
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/list-continuation-html.md:3"; then
+  pass "fence opened on a list continuation: HTML cannot exempt"
+else
+  fail "list continuation fence: rc=$RC out=$OUT"
+fi
+
+# Case 54g: every same-line nested list marker precedes the fence.
+for PREFIX in '- - ' '1. - ' '> - - '; do
+  case "$PREFIX" in
+    '- - ') CONTINUATION='    ' ;;
+    '1. - ') CONTINUATION='     ' ;;
+    '> - - ') CONTINUATION='>     ' ;;
+  esac
+  run_on_fixture "docs/nested-list-html.md" "$PREFIX"'```bash
+'"$CONTINUATION"'git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+'"$CONTINUATION"'```
+'
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/nested-list-html.md:2'; then
+    pass "same-line nested list $PREFIX fence: HTML cannot exempt"
+  else
+    fail "nested list $PREFIX fence: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/nested-list-shell.md" "$PREFIX"'~~~bash
+'"$CONTINUATION"'git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture
+'"$CONTINUATION"'~~~
+
+`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: evidence outside -->
+'
+  if [ "$RC" = "0" ]; then
+    pass "same-line nested list $PREFIX preserves real shell/HTML exemptions"
+  else
+    fail "nested list $PREFIX real exemptions rejected: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/nested-list-continued.md" "$PREFIX"'```bash
+'"$CONTINUATION"'git config user.email \
+'"$CONTINUATION"'leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+'"$CONTINUATION"'```
+'
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/nested-list-continued.md:2'; then
+    pass "same-line nested list $PREFIX continued command: HTML cannot exempt"
+  else
+    fail "nested list $PREFIX continued command: rc=$RC out=$OUT"
+  fi
+done
+
+# Case 54h: list indentation is measured in columns, including tab stops.
+run_on_fixture "docs/tab-list-html.md" $'- Example:
+\t```bash
+\tgit config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+\t```
+'
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/tab-list-html.md:3'; then
+  pass "tab-indented list fence: HTML cannot exempt"
+else
+  fail "tab-indented list fence: rc=$RC out=$OUT"
+fi
+run_on_fixture "docs/tab-nested-list-html.md" $'-\t-\t~~~bash
+\t\tgit config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+\t\t~~~
+'
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/tab-nested-list-html.md:2'; then
+  pass "tab-separated nested list markers preserve column indentation"
+else
+  fail "tab-separated nested list fence: rc=$RC out=$OUT"
+fi
+run_on_fixture "docs/tab-list-shell.md" $'- Example:
+\t```bash
+\tgit config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture
+\t```
+
+`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: evidence outside -->
+'
+if [ "$RC" = "0" ]; then
+  pass "tab-indented list preserves real shell and outside HTML exemptions"
+else
+  fail "tab-indented list real exemptions rejected: rc=$RC out=$OUT"
+fi
+run_on_fixture "docs/tab-list-ended.md" $'- Example:
+\t```bash
+\tgit config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture
+
+`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: outside ended list -->
+'
+if [ "$RC" = "0" ]; then
+  pass "tab-indented list ending drops unclosed fence context"
+else
+  fail "ended tab-indented list kept stale fence: rc=$RC out=$OUT"
+fi
+run_on_fixture "docs/tab-list-continued.md" $'- Example:
+\t```bash
+\tgit config user.email \\\n\tleak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+\t```
+'
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/tab-list-continued.md:3'; then
+  pass "tab-indented continued command: HTML cannot exempt"
+else
+  fail "tab-indented continued command: rc=$RC out=$OUT"
+fi
+
+# Case 54i: quote and list containers may alternate in either order.
+# Prefix frames must survive continuation lines in that same order, and
+# an inner container can end while its outer containers still continue.
+for PREFIX in '- > ' '> - > ' '- > - '; do
+  case "$PREFIX" in
+    '- > ') CONTINUATION='  > '; OUTER='  ' ;;
+    '> - > ') CONTINUATION='>   > '; OUTER='>   ' ;;
+    '- > - ') CONTINUATION='  >   '; OUTER='  > ' ;;
+  esac
+  run_on_fixture "docs/mixed-container-html.md" "$PREFIX"'```bash
+'"$CONTINUATION"'git config user.email leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+'"$CONTINUATION"'```
+'
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/mixed-container-html.md:2'; then
+    pass "mixed container $PREFIX fence: HTML cannot exempt"
+  else
+    fail "mixed container $PREFIX HTML exemption: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/mixed-container-continued.md" "$PREFIX"'~~~bash
+'"$CONTINUATION"'git config user.email \
+'"$CONTINUATION"'leak@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+'"$CONTINUATION"'~~~
+'
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/mixed-container-continued.md:2'; then
+    pass "mixed container $PREFIX continued command: HTML cannot exempt"
+  else
+    fail "mixed container $PREFIX continued HTML exemption: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/mixed-container-shell.md" "$PREFIX"'```bash
+'"$CONTINUATION"'git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture
+'"$CONTINUATION"'```
+
+`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: outside -->
+git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture outside
+'
+  if [ "$RC" = "0" ]; then
+    pass "mixed container $PREFIX preserves shell and outside HTML exemptions"
+  else
+    fail "mixed container $PREFIX real exemptions rejected: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/mixed-container-ended.md" "$PREFIX"'```bash
+'"$CONTINUATION"'git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture
+
+`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: ended container -->
+'
+  if [ "$RC" = "0" ]; then
+    pass "mixed container $PREFIX termination drops its unclosed fence"
+  else
+    fail "ended mixed container $PREFIX stale fence: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/mixed-inner-ended.md" "$PREFIX"'```bash
+'"$CONTINUATION"'git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: fixture
+'"$OUTER"'`git config user.email fixture@example.com` <!-- GIT_IDENTITY_SCOPE_EXEMPT: outside inner container -->
+'
+  if [ "$RC" = "0" ]; then
+    pass "mixed container $PREFIX inner termination preserves outer Markdown"
+  else
+    fail "mixed container $PREFIX inner termination stale fence: rc=$RC out=$OUT"
+  fi
+done
+
 # ── Fail-closed: include paths the walk cannot follow ──────────────────
 
 # Case 55: `~/…` in an include path is expanded against the operator's
@@ -2087,6 +2872,1568 @@ else
   fail "unmatched-quote dequoting wrong: hits=$N_UNMATCHED_HITS rc=$RC out=$OUT"
 fi
 
+# Case 65n: literal Git executable words dequote exactly, without expanding
+# variables or guessing executable lookup. All snippets below are scan input.
+for GIT_WORD in 'g\it' 'gi\t' 'g"i"t' "g'it'" '/usr/bin/g\it'; do
+  run_on_fixture "tests/literal-git.sh" "$GIT_WORD config user.email leak@example.invalid
+"
+  if [ "$RC" = "1" ]; then
+    pass "literal escaped/partially quoted Git word still reports its writer"
+  else
+    fail "literal Git executable missed: '$GIT_WORD' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "tests/scoped-literal-git.sh" "$GIT_WORD -C \"\$FIXTURE\" config user.email fixture@example.invalid
+"
+  if [ "$RC" = "0" ]; then
+    pass "literal Git word retains explicit fixture target"
+  else
+    fail "scoped literal Git rejected: '$GIT_WORD' rc=$RC out=$OUT"
+  fi
+done
+for GIT_WORD in "'g\it'" '"g\it"' 'notgit' 'git-helper' '$GIT'; do
+  run_on_fixture "tests/not-literal-git.sh" "$GIT_WORD config user.email leak@example.invalid
+"
+  if [ "$RC" = "0" ]; then
+    pass "non-Git/unresolved executable token is not rewritten to Git"
+  else
+    fail "non-Git word overmatched: '$GIT_WORD' rc=$RC out=$OUT"
+  fi
+done
+
+# Case 65o: quoted/escaped command separators before config are option data.
+for VALUE in "'a;b'" '"a&b"' "'a|b'" 'a\;b' '"a ; b"'; do
+  run_on_fixture "tests/quoted-option.sh" "git -c foo.bar=$VALUE config user.email leak@example.invalid
+"
+  if [ "$RC" = "1" ]; then
+    pass "quoted/escaped option separator keeps executable and config together"
+  else
+    fail "option separator hid writer: '$VALUE' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "tests/targeted-quoted-option.sh" "git -c foo.bar=$VALUE -C \"\$FIXTURE\" config user.email fixture@example.invalid
+"
+  if [ "$RC" = "0" ]; then
+    pass "quoted option separator retains explicit repository target"
+  else
+    fail "targeted option data rejected: '$VALUE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "tests/quoted-neighbour.sh" "git -c foo.bar='a;b' -C \"\$FIXTURE\" config user.email fixture@example.invalid; g\\it config user.name leak
+"
+if [ "$RC" = "1" ]; then
+  pass "real separator still isolates neighbouring targeted and unscoped commands"
+else
+  fail "real command boundary suppressed neighbour: rc=$RC out=$OUT"
+fi
+run_on_fixture "tests/quoted-continued.sh" "git -c foo.bar='a;b' \\
+config user.email leak@example.invalid
+"
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'tests/quoted-continued.sh:1:'; then
+  pass "quoted option separator preserves continued-command finding"
+else
+  fail "continued quoted-option writer missed: rc=$RC out=$OUT"
+fi
+run_on_fixture "docs/quoted-spans.md" "Use \`git -c foo.bar='a;b' config --global user.email fixture@example.invalid\`, never \`git -c foo.bar='a;b' config user.email leak@example.invalid\`.
+"
+if [ "$RC" = "1" ]; then
+  pass "quoted shell separators do not merge independent Markdown code spans"
+else
+  fail "Markdown spans merged through quoted option: rc=$RC out=$OUT"
+fi
+
+# Case 65r: scope/read spellings inside complete option-value words are
+# data. Paired real options still exempt, including quoted option tokens.
+for FLAG in --global --system --get --get-all --list --unset --unset-all --remove-section --rename-section; do
+  for QUOTE in "'" '"'; do
+    run_on_fixture "tests/quoted-flag-data.sh" "git -c foo.bar=${QUOTE}a; $FLAG b${QUOTE} config user.email leak@example.invalid
+"
+    if [ "$RC" = "1" ]; then
+      pass "quoted option value containing $FLAG cannot supply scope/read exemption"
+    else
+      fail "quoted data became an option: flag='$FLAG' quote='$QUOTE' rc=$RC out=$OUT"
+    fi
+  done
+  run_on_fixture "tests/real-flag.sh" "git -c foo.bar='a;b' config \"$FLAG\" user.email fixture@example.invalid
+"
+  if [ "$RC" = "0" ]; then
+    pass "complete real scope/read option $FLAG retains exemption"
+  else
+    fail "real quoted option rejected: flag='$FLAG' rc=$RC out=$OUT"
+  fi
+done
+for VALUE in "'a; git -C b'" "'a; git --global b'" "'a; config --get b'"; do
+  run_on_fixture "tests/quoted-command-data.sh" "git -c foo.bar=$VALUE config user.email leak@example.invalid
+"
+  if [ "$RC" = "1" ]; then
+    pass "Git/config words inside quoted data cannot move the option-region start"
+  else
+    fail "quoted command data replaced real prefix: value='$VALUE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  "git --namespace '--global' config user.email leak@example.invalid" \
+  "git --work-tree '--get' config user.email leak@example.invalid" \
+  "git config --type '--global' user.email leak@example.invalid" \
+  "git config set --comment '--get' user.email leak@example.invalid"; do
+  run_on_fixture "tests/option-operand.sh" "$SOURCE
+"
+  if [ "$RC" = "1" ]; then
+    pass "separate option operand cannot masquerade as scope/read flag"
+  else
+    fail "option operand supplied exemption: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "tests/git-directory-operand.sh" 'git -C "git" config user.email fixture@example.invalid
+'
+if [ "$RC" = "0" ]; then
+  pass "repository directory named Git does not replace the executable prefix"
+else
+  fail "Git-named target operand clipped actual -C option: rc=$RC out=$OUT"
+fi
+run_on_fixture "tests/options-ended.sh" 'git config -- "--global" user.email leak@example.invalid
+'
+if [ "$RC" = "1" ]; then
+  pass "option terminator prevents later word from supplying a scope exemption"
+else
+  fail "option data after terminator exempted writer: rc=$RC out=$OUT"
+fi
+
+# Case 65s: prose punctuation cannot supply shell quote state before Git.
+# Keep argument quotes and independent command/code-span boundaries intact.
+for SOURCE in \
+  "If you can't, run git config user.email leak@example.invalid" \
+  'Use "git config user.email leak@example.invalid"' \
+  "Use 'git config user.email leak@example.invalid'" \
+  "If you can't, run g\\it config user.email leak@example.invalid" \
+  "If you can't, run /usr/bin/git config user.email leak@example.invalid" \
+  "If you can't, run \"git\" config user.email leak@example.invalid" \
+  "Use \"git -c foo.bar='a; --global b' config user.email leak@example.invalid\"" \
+  "Use 'git -c foo.bar=\"a; --get b\" config user.email leak@example.invalid'" \
+  'Use "git -c foo.bar="a; --system b" config user.email leak@example.invalid"'; do
+  run_on_fixture "docs/prose-command.md" "$SOURCE
+"
+  if [ "$RC" = "1" ]; then
+    pass "Markdown prose punctuation cannot hide unscoped literal Git command"
+  else
+    fail "prose swallowed command: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/prose-exempt.md" "$SOURCE <!-- GIT_IDENTITY_SCOPE_EXEMPT: intentional documented fixture -->
+"
+  if [ "$RC" = "0" ]; then
+    pass "true HTML exemption after prose command remains valid"
+  else
+    fail "true prose HTML exemption rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/prose-shell-exempt.md" "$SOURCE # GIT_IDENTITY_SCOPE_EXEMPT: intentional documented fixture
+"
+  if [ "$RC" = "0" ]; then
+    pass "true shell exemption after prose command remains valid"
+  else
+    fail "true prose shell exemption rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  "If you can't, run git -c foo.bar=\"# GIT_IDENTITY_SCOPE_EXEMPT: string\" config user.email leak@example.invalid" \
+  "If you can't, run git config user.email leak@example.invalid; echo \" # GIT_IDENTITY_SCOPE_EXEMPT: string\"" \
+  "If you can't, run git config user.email leak@example.invalid \\# GIT_IDENTITY_SCOPE_EXEMPT: escaped" \
+  'Use "git -c foo.bar=" # GIT_IDENTITY_SCOPE_EXEMPT: string" config user.email leak@example.invalid"'; do
+  run_on_fixture "docs/prose-shell-impostor.md" "$SOURCE
+"
+  if [ "$RC" = "1" ]; then
+    pass "prose command extraction preserves quoted/escaped marker data"
+  else
+    fail "prose marker data exempted writer: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  "If you can't, run git config --global user.email fixture@example.invalid" \
+  'Use "git config --system user.email fixture@example.invalid"'; do
+  run_on_fixture "docs/scoped-prose.md" "$SOURCE
+"
+  if [ "$RC" = "0" ]; then
+    pass "real scope in prose-wrapped command remains valid"
+  else
+    fail "scoped prose command rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  'Use "git config --global user.email fixture@example.invalid"; git config user.email leak@example.invalid' \
+  "Use 'git config --system user.email fixture@example.invalid'; git config user.email leak@example.invalid" \
+  "If you can't use --global, run git config user.email leak@example.invalid"; do
+  run_on_fixture "docs/prose-neighbour.md" "$SOURCE
+"
+  if [ "$RC" = "1" ]; then
+    pass "prose wrappers/preceding flags cannot scope neighbouring unscoped writer"
+  else
+    fail "prose neighbour supplied scope: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "docs/prose-continued.md" "If you can't, run git \\
+config user.email leak@example.invalid
+"
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/prose-continued.md:1:'; then
+  pass "prose quote handling preserves continued-command finding"
+else
+  fail "continued prose command missed: rc=$RC out=$OUT"
+fi
+for SOURCE in 'echo "git config user.email data@example.invalid"' 'echo "git config user.email data@example.invalid'; do
+  run_on_fixture "tests/shell-quote-data.sh" "$SOURCE
+"
+  if [ "$RC" = "0" ]; then
+    pass "shell quoted/open-quote data does not become a Git command"
+  else
+    fail "shell data treated as prose command: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/fenced-quote-data.md" '```bash
+'"$SOURCE"'
+```
+'
+  if [ "$RC" = "0" ]; then
+    pass "fenced shell quote data retains shell-word rules"
+  else
+    fail "fenced data treated as prose command: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/span-quote-data.md" "Use \`$SOURCE\`.
+"
+  if [ "$RC" = "0" ]; then
+    pass "code-span shell quote data retains shell-word rules"
+  else
+    fail "span data treated as prose command: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "docs/span-quoted-option.md" "If you can't, use \`git -c foo.bar='a; --global b' config user.email leak@example.invalid\`.
+"
+if [ "$RC" = "1" ]; then
+  pass "code-span command with quoted option data is still scanned independently"
+else
+  fail "quoted option data in span hid writer: rc=$RC out=$OUT"
+fi
+
+# Case 65s1: a literal colon may precede a complete prose Git instruction.
+# Keep option operands, complete words, scopes, spans and genuine markers.
+while IFS='|' read -r EXPECTED LABEL SOURCE; do
+  run_on_fixture docs/colon-instruction.md "$SOURCE
+"
+  if [ "$RC" = "$EXPECTED" ] \
+    && { [ "$EXPECTED" = 0 ] || [[ "$OUT" == *"docs/colon-instruction.md:1:"* ]]; }; then
+    pass "literal-colon prose boundary: $LABEL"
+  else
+    fail "colon prose $LABEL: expected=$EXPECTED rc=$RC out=$OUT"
+  fi
+done <<'COLON_CASES'
+1|compact label before literal writer|Run:git config user.email leak@example.com
+1|compact label before path-qualified writer|Run:/usr/bin/git config user.email leak@example.com
+1|paired command and argument quotes remain literal|Run:"git" "config" "user.email" "leak@example.com"
+1|quoted colon and scope data cannot exempt outer writer|Run:git -c foo.bar="before;git --global" config user.email leak@example.com
+1|adjacent code span remains independently scanned|Run:`git config user.email leak@example.com`
+0|explicit fixture repository remains scoped|Run:git -C "$FIX" config user.email fixture@example.com
+0|global identity instruction remains scoped|Run:git config --global user.email fixture@example.com
+0|read remains a read|Run:git config --get user.email
+0|genuine Markdown comment exemption remains valid|Run:git config user.email fixture@example.com <!-- GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture -->
+0|quoted prefix operand cannot become another instruction|Run:git -c foo.bar="Run:git config user.email leak@example.com" status
+0|unrelated executable suffix is not Git|Run:mygit config user.email leak@example.com
+0|unprotected complete key remains allowed|Run:git config notuser.email leak@example.com
+COLON_CASES
+
+# Case 65t: a standalone Git mention cannot anchor a later prose command.
+for PREFIX in \
+  "Use git if you can't, then " \
+  "Use git status if you can't, then " \
+  "Use git -c foo.bar='config --global' status if you can't, then " \
+  "Use git -c foo.bar='git config --global x' status if you can't, then "; do
+  run_on_fixture "docs/earlier-git.md" "${PREFIX}git config user.email leak@example.invalid
+"
+  if [ "$RC" = "1" ]; then pass "earlier Git mention cannot hide actual prose config writer"; else
+    fail "earlier Git anchored writer: prefix='$PREFIX' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/earlier-git-scoped.md" "${PREFIX}git config --global user.email fixture@example.invalid
+"
+  if [ "$RC" = "0" ]; then pass "actual scope survives earlier Git mention"; else
+    fail "actual prose scope rejected: prefix='$PREFIX' rc=$RC out=$OUT"
+  fi
+  for MARKER in '<!-- GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture -->' '# GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture'; do
+    run_on_fixture "docs/earlier-git-exempt.md" "${PREFIX}git config user.email fixture@example.invalid $MARKER
+"
+    if [ "$RC" = "0" ]; then pass "real exemption survives earlier Git mention"; else
+      fail "actual prose exemption rejected: prefix='$PREFIX' marker='$MARKER' rc=$RC out=$OUT"
+    fi
+  done
+done
+for SPAN in '`' '``'; do
+  SOURCE="If you can't, run ${SPAN}git config user.email fixture@example.invalid${SPAN}"
+  for TAIL in '# GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture' 'echo "ordinary data";# GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture' '# GIT_IDENTITY_SCOPE_EXEMPT: fixture `reason`'; do
+    run_on_fixture "docs/span-trailing-marker.md" "$SOURCE $TAIL
+"
+    if [ "$RC" = "0" ]; then pass "real trailing shell exemption after code span resets prose quote state"; else
+      fail "trailing span comment rejected: span='$SPAN' tail='$TAIL' rc=$RC out=$OUT"
+    fi
+  done
+  for TAIL in 'echo " # GIT_IDENTITY_SCOPE_EXEMPT: string"' '\# GIT_IDENTITY_SCOPE_EXEMPT: escaped' '" # GIT_IDENTITY_SCOPE_EXEMPT: open string' 'echo "data `literal` # GIT_IDENTITY_SCOPE_EXEMPT: string"'; do
+    run_on_fixture "docs/span-trailing-impostor.md" "$SOURCE $TAIL
+"
+    if [ "$RC" = "1" ]; then pass "quoted/escaped trailing markers after code spans cannot exempt"; else
+      fail "trailing span data exempted writer: span='$SPAN' tail='$TAIL' rc=$RC out=$OUT"
+    fi
+  done
+  run_on_fixture "docs/span-cited-marker.md" "If you can't, run ${SPAN}git config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: citation${SPAN}
+"
+  if [ "$RC" = "1" ]; then pass "marker inside code span remains a citation after prose apostrophe"; else
+    fail "cited span marker exempted writer: span='$SPAN' rc=$RC out=$OUT"
+  fi
+  for QUOTE in '"' "'"; do
+    run_on_fixture "docs/span-wrapper-marker.md" "Use ${QUOTE}${SPAN}git config user.email fixture@example.invalid${SPAN} # GIT_IDENTITY_SCOPE_EXEMPT: string${QUOTE}
+"
+    if [ "$RC" = "1" ]; then pass "quote wrapping code span protects literal marker data"; else
+      fail "wrapped span marker exempted writer: span='$SPAN' quote='$QUOTE' rc=$RC out=$OUT"
+    fi
+    run_on_fixture "docs/span-wrapper-real-marker.md" "Use ${QUOTE}${SPAN}git config user.email fixture@example.invalid${SPAN}${QUOTE} # GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture
+"
+    if [ "$RC" = "0" ]; then pass "real shell comment after closed span wrapper remains valid"; else
+      fail "real comment after span wrapper rejected: span='$SPAN' quote='$QUOTE' rc=$RC out=$OUT"
+    fi
+  done
+done
+
+# Case 65u: literal targets, opaque substitution operands and complete
+# Markdown delimiters retain the same instruction/exemption boundaries.
+for OPENER in '<!-->' '<!--->'; do
+  run_on_fixture "docs/short-html-marker.md" "git config user.email leak@example.invalid $OPENER GIT_IDENTITY_SCOPE_EXEMPT: literal -->
+"
+  if [ "$RC" = "1" ]; then pass "marker after complete empty HTML comment remains ordinary text"; else
+    fail "short HTML opener borrowed later closer: opener='$OPENER' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/short-html-real.md" "git config user.email fixture@example.invalid $OPENER <!-- GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture -->
+"
+  if [ "$RC" = "0" ]; then pass "real comment after complete empty HTML comment remains valid"; else
+    fail "real comment after short HTML rejected: opener='$OPENER' rc=$RC out=$OUT"
+  fi
+done
+for EMPTY in "''" '""' "''\"\""; do
+  run_on_fixture "tests/empty-C.sh" "git -C $EMPTY config user.email leak@example.invalid
+"
+  if [ "$RC" = "1" ]; then pass "literal empty -C path cannot supply a repository target"; else
+    fail "empty C supplied target: operand='$EMPTY' rc=$RC out=$OUT"
+  fi
+  for SOURCE in \
+    "git -C $EMPTY config --global user.email fixture@example.invalid" \
+    "git -C $EMPTY -C \"\$FIX\" config user.email fixture@example.invalid" \
+    "git -C \"\$FIX\" -C $EMPTY config user.email fixture@example.invalid" \
+    "git -C $EMPTY config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture"; do
+    run_on_fixture "tests/empty-C-independent-scope.sh" "$SOURCE
+"
+    if [ "$RC" = "0" ]; then pass "independent real scope/target/comment remains valid with empty -C"; else
+      fail "empty C hid independent scope: source='$SOURCE' rc=$RC out=$OUT"
+    fi
+  done
+done
+run_on_fixture "tests/named-C.sh" 'git -C . config user.email fixture@example.invalid
+'
+if [ "$RC" = "0" ]; then pass "named target remains shape-based without filesystem resolution"; else
+  fail "named target was resolved or rejected: rc=$RC out=$OUT"
+fi
+for OPERAND in \
+  '$(printf a; printf b)' \
+  '$(printf "%s" "$(printf "a;b")")' \
+  '$(printf "%s" ")a;b(")' \
+  '$(printf --global)' \
+  '$(printf "%s" "# GIT_IDENTITY_SCOPE_EXEMPT: string")'; do
+  run_on_fixture "tests/substitution-outer.sh" "git -c foo.bar=$OPERAND config user.email leak@example.invalid
+"
+  if [ "$RC" = "1" ]; then pass "substitution operand cannot split or exempt literal outer identity command"; else
+    fail "substitution hid literal outer command: operand='$OPERAND' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "tests/substitution-targeted.sh" "git -C \"\$FIX\" -c foo.bar=$OPERAND config user.email fixture@example.invalid
+"
+  if [ "$RC" = "0" ]; then pass "real target remains valid beside opaque substitution operand"; else
+    fail "substitution rejected real target: operand='$OPERAND' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "tests/substitution-neighbour.sh" 'git -c foo.bar=$(printf a; printf b) config --global user.email fixture@example.invalid;git config user.email leak@example.invalid
+'
+if [ "$RC" = "1" ]; then pass "real outer separator remains independent after substitution"; else
+  fail "substitution swallowed outer separator: rc=$RC out=$OUT"
+fi
+run_on_fixture "tests/substitution-real-comment.sh" 'git -c foo.bar=$(printf a; printf b) config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture
+'
+if [ "$RC" = "0" ]; then pass "real outer shell comment remains valid after opaque substitution"; else
+  fail "substitution swallowed real outer comment: rc=$RC out=$OUT"
+fi
+for SOURCE in \
+  'echo "$(printf "git config user.email data@example.invalid")"' \
+  "echo '\$(git config user.email data@example.invalid)'" \
+  'echo "\$(git config user.email data@example.invalid)"' \
+  '$(printf git) config user.email data@example.invalid' \
+  'git config $(printf user.email) data@example.invalid'; do
+  run_on_fixture "tests/substitution-no-evaluation.sh" "$SOURCE
+"
+  if [ "$RC" = "0" ]; then pass "substitution output does not derive executable/key or turn printed data into instruction"; else
+    fail "substitution output was interpreted: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  'echo $(git config user.email fixture@example.invalid)' \
+  'echo "$(git config user.email fixture@example.invalid)"' \
+  'echo $(git config user.email fixture@example.invalid'; do
+  run_on_fixture "tests/substitution-literal-body.sh" "$SOURCE
+"
+  if [ "$RC" = "1" ]; then pass "direct literal body writer retains detection with contained/unknown extent"; else
+    fail "opaque output erased direct body instruction: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "tests/substitution-targeted-body.sh" 'echo $(git -C "$FIX" config user.email fixture@example.invalid)
+'
+if [ "$RC" = "0" ]; then pass "literal fixture target remains valid inside contained source body"; else
+  fail "body instruction lost real target: rc=$RC out=$OUT"
+fi
+for SPAN_PREFIX in '``literal ` tick``' '```literal ` tick `` data```'; do
+  run_on_fixture "docs/equal-width-prose.md" "Use $SPAN_PREFIX. If you can't, run git config user.email leak@example.invalid
+"
+  if [ "$RC" = "1" ]; then pass "unequal inner backtick runs cannot shift following prose into shell quoting"; else
+    fail "unequal span run hid prose writer: prefix='$SPAN_PREFIX' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/equal-width-scoped.md" "Use $SPAN_PREFIX. If you can't, run git config --global user.email fixture@example.invalid
+"
+  if [ "$RC" = "0" ]; then pass "real scope survives equal-width span partition"; else
+    fail "equal-width partition rejected scope: rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/equal-width-cited-marker.md" "git config user.email leak@example.invalid $SPAN_PREFIX
+"
+  if [ "$RC" = "1" ]; then pass "closed span data cannot hide preceding literal writer"; else
+    fail "closed span data hid writer: rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  'git config user.email leak@example.invalid ``literal ` # GIT_IDENTITY_SCOPE_EXEMPT: citation``' \
+  'git config user.email leak@example.invalid ```literal ` # GIT_IDENTITY_SCOPE_EXEMPT: citation `` data```'; do
+  run_on_fixture "docs/equal-width-marker.md" "$SOURCE
+"
+  if [ "$RC" = "1" ]; then pass "marker inside equal-width span with shorter runs remains cited data"; else
+    fail "inner backtick spilled literal marker: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/equal-width-real-marker.md" "$SOURCE <!-- GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture -->
+"
+  if [ "$RC" = "0" ]; then pass "real comment after equal-width cited-marker span remains valid"; else
+    fail "real equal-width comment rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+
+# Case 65x: complete literal config words and effective known selectors.
+for CONFIG_WORD in 'c\onfig' 'con"fig"' "'config'"; do
+  for REL in tests/literal-config.sh docs/literal-config.md; do
+    run_on_fixture "$REL" "git $CONFIG_WORD user.email leak@example.invalid
+"
+    if [ "$RC" = 1 ]; then pass "ordinary quoted/escaped config subcommand remains an instruction"; else
+      fail "literal config hidden: word='$CONFIG_WORD' rel=$REL rc=$RC out=$OUT"
+    fi
+    run_on_fixture "$REL" "git -C \"\$FIX\" $CONFIG_WORD user.email fixture@example.invalid
+"
+    if [ "$RC" = 0 ]; then pass "quoted config retains real fixture target"; else
+      fail "quoted config target rejected: rc=$RC out=$OUT"
+    fi
+  done
+  run_on_fixture docs/literal-config-prose.md "If you can't, run git $CONFIG_WORD user.email leak@example.invalid
+"
+  if [ "$RC" = 1 ]; then pass "literal config normalization survives prose punctuation"; else
+    fail "quoted config prose hidden: rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  'git -c foo.bar="config --global" config user.email leak@example.invalid' \
+  'git -c foo.bar="--no-global" config --global --no-global user.email leak@example.invalid' \
+  'git config --global --no-global user.email leak@example.invalid' \
+  'git config --gl --no-global user.email leak@example.invalid' \
+  'git config --system --no-system user.email leak@example.invalid' \
+  'git config --file "$FIX/config" --no-file user.email leak@example.invalid' \
+  'git config --blob HEAD:config --no-blob user.email leak@example.invalid' \
+  'git config --get --no-get user.email leak@example.invalid' \
+  'git config --get-all --no-get-all user.email leak@example.invalid' \
+  'git config --unset --no-unset user.email leak@example.invalid'; do
+  run_on_fixture tests/cancelled-selector.sh "$SOURCE
+"
+  if [ "$RC" = 1 ]; then pass "cancelled known scope/read selector cannot clear literal writer"; else
+    fail "cancelled selector cleared writer: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+  run_on_fixture tests/cancelled-selector-marker.sh "$SOURCE # GIT_IDENTITY_SCOPE_EXEMPT: intentional isolated fixture
+"
+  if [ "$RC" = 0 ]; then pass "cancelled selector retains genuine explicit exemption"; else
+    fail "cancelled selector marker rejected: rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  'git config --global --no-global --global user.email fixture@example.invalid' \
+  'git config --system --no-system --sy user.email fixture@example.invalid' \
+  'git config --get --no-get --get user.email fixture@example.invalid' \
+  'git -C "$FIX" config --global --no-global user.email fixture@example.invalid' \
+  'git config --global --no-global --file "$FIX/config" user.email fixture@example.invalid' \
+  'git config --default "--no-get" --get user.email fixture@example.invalid' \
+  'git -c foo.bar="--no-global" config --global user.email fixture@example.invalid' \
+  'git -C "config" status user.email fixture@example.invalid' \
+  'git status "config" user.email fixture@example.invalid'; do
+  run_on_fixture tests/retained-selector.sh "$SOURCE
+"
+  if [ "$RC" = 0 ]; then pass "real final/independent safety mode survives; config operands stay data"; else
+    fail "retained selector/data rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+
+# Case 65y: only an open ordinary substitution gains physical continuation.
+for SOURCE in \
+  $'git -c foo.bar=$(printf a\nprintf b) config user.email leak@example.invalid' \
+  $'git -c foo.bar="$(printf a\nprintf b)" config user.email leak@example.invalid' \
+  $'git -c foo.bar=$(printf "$(printf a\nprintf b)") config user.email leak@example.invalid' \
+  $'echo $(printf a\ngit config user.email leak@example.invalid\n)' \
+  $'echo $(printf a\ngit config user.email leak@example.invalid'; do
+  run_on_fixture tests/multiline-substitution.sh "$SOURCE
+"
+  if [ "$RC" = 1 ]; then pass "multiline ordinary substitution preserves literal outer/body writer"; else
+    fail "multiline substitution writer hidden: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  $'git -C "$FIX" -c foo.bar=$(printf a\nprintf b) config user.email fixture@example.invalid' \
+  $'git -c foo.bar=$(printf a\nprintf b) config --global user.email fixture@example.invalid' \
+  $'git -c foo.bar=$(printf a\nprintf b) config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture' \
+  $'echo $(printf a\ngit -C "$FIX" config user.email fixture@example.invalid\n)' \
+  $'echo $(printf a\nprintf "git config user.email fixture@example.invalid"\n)' \
+  $'git -c foo.bar=$(printf a\nprintf b) config $(printf user.email) fixture@example.invalid'; do
+  run_on_fixture tests/multiline-substitution-control.sh "$SOURCE
+"
+  if [ "$RC" = 0 ]; then pass "multiline literal target/marker/data boundaries retained without evaluation"; else
+    fail "multiline control rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for PREFIX in "printf '%s' '\$(printf a'" 'printf "%s" \$(printf a' '# $(printf a'; do
+  run_on_fixture tests/literal-dollar-lines.sh "$PREFIX
+git config --global user.email fixture@example.invalid
+git config user.email leak@example.invalid
+"
+  if [ "$RC" = 1 ] && printf '%s' "$OUT" | grep -q 'literal-dollar-lines.sh:3'; then
+    pass "quoted/escaped/comment dollar does not absorb following physical writer"
+  else
+    fail "literal dollar joined unrelated commands: prefix='$PREFIX' rc=$RC out=$OUT"
+  fi
+done
+# EOF must not join a substitution to another tracked source file.
+MULTIFILE="$WORKDIR/multiline-substitution-files"
+mkdir -p "$MULTIFILE"
+printf 'git -c foo.bar=$(printf a\n' > "$MULTIFILE/a.sh"
+printf 'printf b) config user.email fixture@example.invalid\n' > "$MULTIFILE/b.sh"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$MULTIFILE" bash "$CHECK" 2>&1)"; RC=$?
+set -e
+if [ "$RC" = 0 ]; then pass "open substitution buffer resets at file boundary"; else
+  fail "substitution crossed source files: rc=$RC out=$OUT"
+fi
+
+# Independent review controls: comment data cannot close a substitution,
+# and an actual body newline separates a plain read from the next command.
+for SOURCE in \
+  $'git -c foo.bar=$(\nprintf a # )\nprintf b\n) config user.email leak@example.invalid' \
+  $'git -c foo.bar=$(\nprintf "# )"\nprintf b\n) config user.email leak@example.invalid' \
+  $'git -c foo.bar=$(\nprintf a \\#\n) config user.email leak@example.invalid' \
+  $'git -c foo.bar=$(\nprintf a#data\n) config user.email leak@example.invalid' \
+  $'value=$(git config user.email fixture@example.invalid\nprintf "%s" "$suffix")'; do
+  run_on_fixture tests/substitution-comment-and-body.sh "$SOURCE
+"
+  if [ "$RC" = 1 ]; then pass "comment/hash data and genuine closer retain actual literal writer"; else
+    fail "substitution extent/body writer hidden: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+  run_on_fixture tests/substitution-comment-marker.sh "$SOURCE # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+"
+  if [[ "$SOURCE" == value=* ]]; then
+    if [ "$RC" = 1 ]; then pass "later marker cannot exempt an independently offending body physical line"; else
+      fail "later marker widened physical exemption: rc=$RC out=$OUT"
+    fi
+  elif [ "$RC" = 0 ]; then pass "genuine trailing exemption survives comment/body newline handling"; else
+    fail "substitution trailing exemption rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  $'git -C "$FIX" -c foo.bar=$(\nprintf a # )\nprintf b\n) config user.email fixture@example.invalid' \
+  $'value=$(git config user.email\nprintf "%s" "$suffix")' \
+  $'value="$(git config user.email\nprintf "%s" "$suffix")"' \
+  $'value=$(git config user.email\nprintf "%s" "git config user.email fixture@example.invalid")' \
+  $'value=$(git config user.email\ngit -C "$FIX" config user.email fixture@example.invalid)'; do
+  run_on_fixture tests/substitution-newline-read.sh "$SOURCE
+"
+  if [ "$RC" = 0 ]; then pass "unquoted body newline keeps a plain read distinct from later command/data"; else
+    fail "body newline read became assignment: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture tests/substitution-newline-neighbour.sh $'value=$(git config user.email\nprintf "%s" "$suffix"); git config user.email leak@example.invalid\n'
+if [ "$RC" = 1 ]; then pass "body read cannot suppress a following outer identity writer"; else
+  fail "body newline read hid neighbouring writer: rc=$RC out=$OUT"
+fi
+
+run_on_fixture tests/substitution-body-line-marker.sh $'value=$(git config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture\nprintf "%s" "$suffix")\n'
+if [ "$RC" = 0 ]; then pass "actual marker on body writer physical line retains explicit exemption"; else
+  fail "body physical-line marker rejected: rc=$RC out=$OUT"
+fi
+run_on_fixture tests/substitution-body-neighbour-marker.sh $'value=$(git config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture\ngit config user.name leak\n)\n'
+if [ "$RC" = 1 ] && printf '%s' "$OUT" | grep -q 'substitution-body-neighbour-marker.sh:2'; then
+  pass "body physical-line marker cannot exempt a second independent body writer"
+else
+  fail "body marker widened to later writer: rc=$RC out=$OUT"
+fi
+
+# Comment prose in a contained body cannot quote a later continued writer.
+for NOTE in "# someone's note" '# plain note' '# ) ; $( data'; do
+  run_on_fixture tests/body-comment-state.sh "value=\$(
+git config --get user.email $NOTE
+git \\
+config user.name leak
+)
+"
+  if [ "$RC" = 1 ]; then pass "body comment punctuation cannot hide following continued writer"; else
+    fail "body comment changed command state: note='$NOTE' rc=$RC out=$OUT"
+  fi
+  run_on_fixture tests/body-comment-scope.sh "value=\$(
+git config --get user.email $NOTE
+git -C \"\$FIX\" \\
+config user.name fixture
+)
+"
+  if [ "$RC" = 0 ]; then pass "comment punctuation preserves following real fixture target"; else
+    fail "body comment scoped control rejected: note='$NOTE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture tests/body-comment-actual-marker.sh $'value=$(\ngit config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: someone\'s isolated fixture\ngit config --get user.email\n)\n'
+if [ "$RC" = 0 ]; then pass "original body comment bytes retain genuine exemption with apostrophe reason"; else
+  fail "body comment marker lost: rc=$RC out=$OUT"
+fi
+run_on_fixture tests/body-comment-marker-neighbour.sh $'value=$(\ngit config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: someone\'s isolated fixture\ngit \\\nconfig user.name leak\n)\n'
+if [ "$RC" = 1 ]; then pass "body comment exemption does not widen to continued unmarked neighbour"; else
+  fail "body comment marker swallowed neighbour: rc=$RC out=$OUT"
+fi
+run_on_fixture tests/body-comment-quoted-data.sh $'value=$(\ngit -c foo.bar="# someone\'s note" \\\nconfig user.email leak@example.invalid\n)\n'
+if [ "$RC" = 1 ]; then pass "quoted hash/apostrophe stays option data and cannot exempt a writer"; else
+  fail "quoted comment data changed writer: rc=$RC out=$OUT"
+fi
+run_on_fixture tests/body-comment-printed-data.sh $'value=$(\nprintf "%s" "# someone\'s git config user.email fixture@example.invalid"\n)\n'
+if [ "$RC" = 0 ]; then pass "quoted printed comment/command data does not become an instruction"; else
+  fail "printed comment data became instruction: rc=$RC out=$OUT"
+fi
+
+# Case 65y1: literal env split-string admission reuses known interpreters.
+# Source is scan-only; neither a shebang nor its dynamic operands executes.
+# Keep a real index, the authentic paired suite and consumer marker gate.
+ENV_CONSUMER="$WORKDIR/consumer-env-split"
+mkdir -p "$ENV_CONSUMER/scripts/ci" "$ENV_CONSUMER/tests"
+git init -q -b main "$ENV_CONSUMER"
+cp "$CHECK" "$ENV_CONSUMER/scripts/ci/check_git_identity_hygiene"
+cp "$ROOT/tests/test_git_identity_hygiene.sh" "$ENV_CONSUMER/tests/"
+cp "$ENV_CONSUMER/.git/config" "$WORKDIR/env-config-before"
+while IFS='|' read -r EXPECTED SHEBANG BODY; do
+  printf '%s\n%s\n' "$SHEBANG" "$BODY" > "$ENV_CONSUMER/tool"
+  git -C "$ENV_CONSUMER" add -A
+  set +e
+  OUT="$(bash "$ENV_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+  set -e
+  if [ "$RC" = "$EXPECTED" ] \
+    && { [ "$EXPECTED" = 0 ] || [[ "$OUT" == *"tool:2:"* ]]; } \
+    && { [ "$EXPECTED" = 1 ] || [[ "$OUT" == *"regression test suite skipped (consumer checkout"* ]]; } \
+    && cmp -s "$WORKDIR/env-config-before" "$ENV_CONSUMER/.git/config"; then
+    pass "literal env split-string admission: $SHEBANG"
+  else
+    fail "env admission $SHEBANG: expected=$EXPECTED rc=$RC out=$OUT"
+  fi
+  [ "$EXPECTED" = 1 ] || continue
+  for SAFE_BODY in \
+    'git -C "$FIX" config user.email fixture@example.com' \
+    'git config --get user.email' \
+    'git config user.email fixture@example.com # GIT_IDENTITY_SCOPE_EXEMPT: intentional fixture'; do
+    printf '%s\n%s\n' "$SHEBANG" "$SAFE_BODY" > "$ENV_CONSUMER/tool"
+    git -C "$ENV_CONSUMER" add -A
+    set +e
+    OUT="$(bash "$ENV_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+    set -e
+    if [ "$RC" = 0 ] \
+      && [[ "$OUT" == *"regression test suite skipped (consumer checkout"* ]] \
+      && cmp -s "$WORKDIR/env-config-before" "$ENV_CONSUMER/.git/config"; then
+      pass "literal env split-string preserves scope/read/exemption: $SHEBANG"
+    else
+      fail "env safe body rejected: shebang='$SHEBANG' source='$SAFE_BODY' rc=$RC out=$OUT"
+    fi
+  done
+done <<'ENV_SPLIT_CASES'
+1|#!/usr/bin/env -Sbash|git config user.email leak@example.com
+1|#!/usr/bin/env --split-string=bash|git config user.email leak@example.com
+1|#!/usr/bin/env -Ssh|git config user.name leak
+1|#!/usr/bin/env --split-string=mksh|git config commit.gpgsign false
+1|#!/usr/bin/env -Sbats|git config tag.gpgsign false
+1|#!/usr/bin/env -S bash|git config user.signingkey key
+0|#!/usr/bin/env -Sbashman|git config user.email leak@example.com
+0|#!/usr/bin/env --split-string=bashman|git config user.email leak@example.com
+0|#!/usr/bin/env -S${SHELL}|git config user.email leak@example.com
+0|#!/usr/bin/env --split-string=${SHELL}|git config user.email leak@example.com
+0|#!/usr/bin/env -Spython|git config user.email leak@example.com
+0|#!/usr/bin/notenv -Sbash|git config user.email leak@example.com
+ENV_SPLIT_CASES
+
+# Case 65z: owner-ratified Bats admission is bounded to .bats/env-bats.
+for REL in tests/setup.bats tests/setup.BATS tests/setup; do
+  run_on_fixture "$REL" $'#!/usr/bin/env bats\n@test "fixture" {\n  git config user.email leak@example.invalid\n}\n'
+  if [ "$RC" = 1 ] && printf '%s' "$OUT" | grep -q "$REL:3"; then pass "Bats extension/shebang admits literal fixture setup"; else
+    fail "Bats source skipped: rel=$REL rc=$RC out=$OUT"
+  fi
+  run_on_fixture "$REL" $'#!/usr/bin/env bats\n@test "fixture" {\n  git -C "$FIX" config user.email fixture@example.invalid\n  git config user.name fixture # GIT_IDENTITY_SCOPE_EXEMPT: intentional isolated fixture\n}\n'
+  if [ "$RC" = 0 ]; then pass "Bats setup retains explicit fixture target and genuine exemption"; else
+    fail "Bats legitimate setup rejected: rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture tests/setup.bats $'@test "fixture" {\n  git config user.email leak@example.invalid\n}\n'
+if [ "$RC" = 1 ]; then pass "Bats extension works independently of shebang"; else
+  fail "extension-only Bats skipped: rc=$RC out=$OUT"
+fi
+run_on_fixture tests/other $'#!/usr/bin/env batsman\ngit config user.email fixture@example.invalid\n'
+if [ "$RC" = 0 ]; then pass "Bats admission does not match arbitrary interpreter suffixes"; else
+  fail "Bats interpreter matcher broadened: rc=$RC out=$OUT"
+fi
+
+# Case 65aa: a shell-file marker belongs to its terminating command.
+for SEP in ';' '&&' '||' '&' '|'; do
+  for LAST in 'echo ok' 'git config --get user.email' 'git -C "$FIX" config user.name fixture'; do
+    run_on_fixture tests/command-marker-neighbour.sh "git config user.email leak@example.invalid $SEP $LAST # GIT_IDENTITY_SCOPE_EXEMPT: last command only
+"
+    if [ "$RC" = 1 ]; then pass "later harmless/read/targeted command marker cannot exempt earlier writer"; else
+      fail "later marker widened exemption: sep='$SEP' last='$LAST' rc=$RC out=$OUT"
+    fi
+  done
+  run_on_fixture tests/command-marker-last-writer.sh "git config --get user.email $SEP git config user.name fixture # GIT_IDENTITY_SCOPE_EXEMPT: last fixture writer
+"
+  if [ "$RC" = 0 ]; then pass "genuine marker on last writer does not turn preceding read into a finding"; else
+    fail "last writer genuine marker rejected: sep='$SEP' rc=$RC out=$OUT"
+  fi
+  run_on_fixture tests/command-marker-two-writers.sh "git config user.email leak@example.invalid $SEP git config user.name fixture # GIT_IDENTITY_SCOPE_EXEMPT: last fixture writer
+"
+  if [ "$RC" = 1 ]; then pass "exempt last writer cannot clear independent earlier writer"; else
+    fail "last exempt writer cleared earlier writer: sep='$SEP' rc=$RC out=$OUT"
+  fi
+  run_on_fixture tests/command-marker-terminal.sh "git config user.email fixture@example.invalid$SEP# GIT_IDENTITY_SCOPE_EXEMPT: terminal operator
+"
+  if [ "$RC" = 0 ]; then pass "terminal operator without intervening command preserves true exemption"; else
+    fail "terminal operator marker rejected: sep='$SEP' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  $'git \\\nconfig user.email leak@example.invalid; echo ok # GIT_IDENTITY_SCOPE_EXEMPT: echo only' \
+  $'value=$(\ngit \\\nconfig user.email leak@example.invalid; echo ok # GIT_IDENTITY_SCOPE_EXEMPT: echo only\n)' \
+  'git config user.email "fixture # GIT_IDENTITY_SCOPE_EXEMPT: quoted data"' \
+  'git config user.email leak@example.invalid; echo "# GIT_IDENTITY_SCOPE_EXEMPT: quoted data"' \
+  'git config user.email leak@example.invalid; echo \# GIT_IDENTITY_SCOPE_EXEMPT: escaped data'; do
+  run_on_fixture tests/command-marker-continued-data.sh "$SOURCE
+"
+  if [ "$RC" = 1 ]; then pass "continued/multiline writer and quoted/escaped marker data remain findings"; else
+    fail "command marker continuation/data cleared writer: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  $'echo prep; git \\\nconfig user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: fixture writer' \
+  $'value=$(\ngit \\\nconfig user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: fixture writer\n)' \
+  $'value=$(git config user.email fixture@example.invalid;# GIT_IDENTITY_SCOPE_EXEMPT: fixture writer\n)' \
+  'git config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: reason with ; quoted data'; do
+  run_on_fixture tests/command-marker-continued-real.sh "$SOURCE
+"
+  if [ "$RC" = 0 ]; then pass "genuine shell marker retains owning continued/body writer and comment reason"; else
+    fail "owning command marker rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture docs/markdown-physical-marker.md 'Use `git config user.email fixture@example.invalid`; echo ok # GIT_IDENTITY_SCOPE_EXEMPT: intentional physical-line examples
+'
+if [ "$RC" = 0 ]; then pass "Markdown deliberately retains existing physical-line marker scope"; else
+  fail "shell command marker binding changed Markdown exemption contract: rc=$RC out=$OUT"
+fi
+
+# Findings in opaque operands stay pending until the owning command ends:
+# its real marker still applies, while a later command cannot supply one.
+for SOURCE in \
+  'echo $(git config user.email fixture@example.invalid) # GIT_IDENTITY_SCOPE_EXEMPT: intentional owning fixture command' \
+  'value=$(git config user.email fixture@example.invalid) # GIT_IDENTITY_SCOPE_EXEMPT: intentional owning fixture command' \
+  'git config --get user.email; echo $(git config user.email fixture@example.invalid) # GIT_IDENTITY_SCOPE_EXEMPT: intentional owning fixture command' \
+  $'echo $(git \\\nconfig user.email fixture@example.invalid) # GIT_IDENTITY_SCOPE_EXEMPT: intentional owning fixture command'; do
+  run_on_fixture tests/owning-substitution-marker.sh "$SOURCE
+"
+  if [ "$RC" = 0 ]; then pass "real owning-command marker retains direct contained fixture exemption"; else
+    fail "owning substitution marker rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  'echo $(git config user.email leak@example.invalid); echo ok # GIT_IDENTITY_SCOPE_EXEMPT: harmless echo' \
+  'git config user.email leak@example.invalid; echo $(git config user.email fixture@example.invalid) # GIT_IDENTITY_SCOPE_EXEMPT: last owning command' \
+  $'echo $(git \\\nconfig user.email leak@example.invalid); echo ok # GIT_IDENTITY_SCOPE_EXEMPT: harmless echo'; do
+  run_on_fixture tests/later-substitution-marker.sh "$SOURCE
+"
+  if [ "$RC" = 1 ]; then pass "owning-command marker cannot exempt prior independent outer/substitution writer"; else
+    fail "later substitution marker widened: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+
+# Case 65aa1: equal-width spans retain marker-data context across physical
+# lines only inside the existing inline block. An unmatched opener is text.
+for SPAN in '`' '``' '```'; do
+  run_on_fixture docs/crossline-marker.md "Paragraph ${SPAN}marker citation
+<!-- GIT_IDENTITY_SCOPE_EXEMPT: cited data -->${SPAN} then \`git config user.email fixture@example.invalid\`
+"
+  if [ "$RC" = 1 ] && [[ "$OUT" == *"docs/crossline-marker.md:2:"* ]]; then
+    pass "crossline equal-width span cannot supply an HTML exemption"
+  else fail "crossline span cleared writer: span='$SPAN' rc=$RC out=$OUT"; fi
+  run_on_fixture docs/sameline-marker.md "Paragraph ${SPAN}<!-- GIT_IDENTITY_SCOPE_EXEMPT: cited data -->${SPAN} then \`git config user.email fixture@example.invalid\`
+"
+  if [ "$RC" = 1 ]; then pass "same-line cited marker remains data"; else
+    fail "same-line span cleared writer: span='$SPAN' rc=$RC out=$OUT"
+  fi
+  run_on_fixture docs/crossline-real-marker.md "Paragraph ${SPAN}marker citation
+<!-- GIT_IDENTITY_SCOPE_EXEMPT: cited data -->${SPAN} then \`git config user.email fixture@example.invalid\` <!-- GIT_IDENTITY_SCOPE_EXEMPT: genuine outside comment -->
+"
+  if [ "$RC" = 0 ]; then pass "genuine physical-line comment after closed crossline span exempts"; else
+    fail "genuine outside marker rejected: span='$SPAN' rc=$RC out=$OUT"
+  fi
+  run_on_fixture docs/unmatched-marker.md "Paragraph ${SPAN}unmatched opener
+Use git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: genuine outside comment -->
+"
+  if [ "$RC" = 0 ]; then pass "unmatched backtick opener cannot hide a genuine comment"; else
+    fail "unmatched opener consumed marker: span='$SPAN' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture docs/unequal-marker.md $'Paragraph ``unclosed wider opener\nUse git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: genuine comment -->`\n'
+if [ "$RC" = 0 ]; then pass "unequal delimiter runs do not close a span or hide genuine comment"; else
+  fail "unequal opener consumed genuine marker: rc=$RC out=$OUT"
+fi
+run_on_fixture docs/shorter-inner-run.md $'Paragraph ``marker citation with `shorter run\n<!-- GIT_IDENTITY_SCOPE_EXEMPT: cited data -->`` then `git config user.email fixture@example.invalid`\n'
+if [ "$RC" = 1 ]; then pass "shorter inner delimiter stays data in a crossline equal-width span"; else
+  fail "shorter inner run cleared writer: rc=$RC out=$OUT"
+fi
+for BOUNDARY in '' '# Heading' '---' '===' '```bash
+```' '> New container' '- New item'; do
+  run_on_fixture docs/span-boundary.md "Paragraph \`unmatched opener
+$BOUNDARY
+Use git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: genuine comment -->\`
+"
+  if [ "$RC" = 0 ]; then pass "inline span cannot cross existing block boundary"; else
+    fail "span crossed block boundary: boundary='$BOUNDARY' rc=$RC out=$OUT"
+  fi
+done
+for PREFIX in '> ' '- ' '> - '; do
+  case "$PREFIX" in
+    '> ') CONTINUATION='> ' ;;
+    '- ') CONTINUATION='  ' ;;
+    '> - ') CONTINUATION='>   ' ;;
+  esac
+  run_on_fixture docs/span-container.md "${PREFIX}Paragraph \`marker citation
+${CONTINUATION}<!-- GIT_IDENTITY_SCOPE_EXEMPT: cited data -->\` then \`git config user.email fixture@example.invalid\`
+"
+  if [ "$RC" = 1 ]; then pass "crossline span remains inside retained quote/list container"; else
+    fail "container span cleared writer: prefix='$PREFIX' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture docs/span-physical-scope.md $'Paragraph `citation\nclosed` then `git config user.email fixture@example.invalid` <!-- GIT_IDENTITY_SCOPE_EXEMPT: this physical line -->\nUse git config user.name fixture\n'
+if [ "$RC" = 1 ] && [[ "$OUT" == *"docs/span-physical-scope.md:3:"* ]] \
+  && [[ "$OUT" != *"  - docs/span-physical-scope.md:2:"* ]]; then
+  pass "crossline span preserves exact physical-line exemption scope"
+else fail "crossline marker widened line scope: rc=$RC out=$OUT"; fi
+
+run_on_fixture docs/fenced-logical-span.md $'```bash\n`git \\\nconfig user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: cited inside logical backticks`\n```\n'
+if [ "$RC" = 1 ]; then pass "fenced logical command retains original paired-backtick exemption cut"; else
+  fail "fenced logical span gained an exemption: rc=$RC out=$OUT"
+fi
+
+# Independently exercise tracked-index enumeration and the authentic
+# consumer suite skip, without either a fixture-root or suite override.
+SPAN_CONSUMER="$WORKDIR/consumer-crossline-spans"
+mkdir -p "$SPAN_CONSUMER/scripts/ci" "$SPAN_CONSUMER/tests"
+git init -q -b main "$SPAN_CONSUMER"
+cp "$CHECK" "$SPAN_CONSUMER/scripts/ci/check_git_identity_hygiene"
+cp "$ROOT/tests/test_git_identity_hygiene.sh" "$SPAN_CONSUMER/tests/"
+cp "$SPAN_CONSUMER/.git/config" "$WORKDIR/span-config-before"
+for CONTROL in crossline same-line genuine-comment; do
+  case "$CONTROL" in
+    crossline) SOURCE=$'Paragraph `citation\n<!-- GIT_IDENTITY_SCOPE_EXEMPT: cited data -->` then `git config user.email fixture@example.invalid`\n'; EXPECTED=1; HIT_LINE=2 ;;
+    same-line) SOURCE=$'Paragraph `<!-- GIT_IDENTITY_SCOPE_EXEMPT: cited data -->` then `git config user.email fixture@example.invalid`\n'; EXPECTED=1; HIT_LINE=1 ;;
+    genuine-comment) SOURCE=$'Paragraph `citation\nclosed` then `git config user.email fixture@example.invalid` <!-- GIT_IDENTITY_SCOPE_EXEMPT: genuine outside comment -->\n'; EXPECTED=0 ;;
+  esac
+  printf '%s' "$SOURCE" > "$SPAN_CONSUMER/REVIEW_POLICY.md"
+  git -C "$SPAN_CONSUMER" add -A
+  set +e
+  OUT="$(bash "$SPAN_CONSUMER/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+  set -e
+  if [ "$RC" = "$EXPECTED" ] \
+    && { [ "$EXPECTED" = 0 ] || [[ "$OUT" == *"REVIEW_POLICY.md:$HIT_LINE:"* ]]; } \
+    && { [ "$EXPECTED" = 1 ] || [[ "$OUT" == *"regression test suite skipped (consumer checkout"* ]]; } \
+    && cmp -s "$WORKDIR/span-config-before" "$SPAN_CONSUMER/.git/config"; then
+    pass "real tracked-index span control: $CONTROL"
+  else fail "tracked-index span control: $CONTROL expected=$EXPECTED rc=$RC out=$OUT"; fi
+done
+
+# Case 65aa1b: owner-admitted literal repairs after the bounded contract review.
+# Every SOURCE below is inert scanner input, never an executed command.
+for SOURCE in \
+  '**git config user.email fixture@example.invalid**' \
+  '<code>git config user.email fixture@example.invalid</code>' \
+  'Then:<br>git config user.email fixture@example.invalid' \
+  '[git config user.email fixture@example.invalid](https://example.invalid)' \
+  '~~git config user.email fixture@example.invalid~~' \
+  '{git config user.email fixture@example.invalid}' \
+  'First,git config user.email fixture@example.invalid' \
+  'Setup—git config user.email fixture@example.invalid' \
+  '*git config user.email fixture@example.invalid' \
+  $'Use `git config user.email fixture@example.invalid\n<!-- GIT_IDENTITY_SCOPE_EXEMPT: cited -->` here'; do
+  run_on_fixture docs/literal-prose-anchor.md "$SOURCE
+"
+  if [ "$RC" = 1 ] && [[ "$OUT" == *'docs/literal-prose-anchor.md:1:'* ]]; then
+    pass "punctuation/markup or crossline opener retains literal instruction"
+  else fail "literal prose anchor erased writer: source='$SOURCE' rc=$RC out=$OUT"; fi
+  run_on_fixture docs/literal-prose-real-marker.md "$SOURCE <!-- GIT_IDENTITY_SCOPE_EXEMPT: deliberate isolated fixture -->
+"
+  # The crossline case places the real marker on line 2, so line 1 remains
+  # unexempted by the documented physical-line scope.
+  EXPECTED=0; [[ "$SOURCE" != *$'\n'* ]] || EXPECTED=1
+  if [ "$RC" = "$EXPECTED" ]; then pass "real prose marker retains physical-line scope"; else
+    fail "prose marker scope changed: expected=$EXPECTED rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  'Run $git config user.email fixture@example.invalid' \
+  'Run ${git} config user.email fixture@example.invalid' \
+  'Run mygit config user.email fixture@example.invalid' \
+  "Run git -c core.editor='git config user.email fixture@example.invalid' status" \
+  '**git -C fixture config user.email fixture@example.invalid**' \
+  '<code>git config --global user.email fixture@example.invalid</code>'; do
+  run_on_fixture docs/literal-prose-control.md "$SOURCE
+"
+  if [ "$RC" = 0 ]; then pass "prose executable/option-data/scoping boundary retained"; else
+    fail "prose control rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  "bash -c 'git config user.email fixture@example.invalid'" \
+  "sh -c 'git config user.email fixture@example.invalid'" \
+  "sudo bash -c 'git config user.email fixture@example.invalid'" \
+  "env bash -c 'git config user.email fixture@example.invalid'" \
+  "env NAME=literal OTHER='literal value' bash -xc 'git config user.email fixture@example.invalid'" \
+  "exec bash -c 'git config user.email fixture@example.invalid'" \
+  "command bash -c 'git config user.email fixture@example.invalid'" \
+  "nohup bash -c 'git config user.email fixture@example.invalid'" \
+  "bash -ec 'git config user.email fixture@example.invalid'" \
+  "bash -e -c 'git config user.email fixture@example.invalid'" \
+  "bash -x -e -c 'git config user.email fixture@example.invalid'" \
+  "zsh -c 'git config user.email fixture@example.invalid'" \
+  "zsh -O -c 'git config user.email fixture@example.invalid'" \
+  "zsh -Oc 'git config user.email fixture@example.invalid'" \
+  "ksh -c 'git config user.email fixture@example.invalid'" \
+  "dash -c 'git config user.email fixture@example.invalid'" \
+  "ash -c 'git config user.email fixture@example.invalid'" \
+  "mksh -c 'git config user.email fixture@example.invalid'" \
+  "/bin/zsh -c 'git config user.email fixture@example.invalid'" \
+  "bash -lc 'git config user.email fixture@example.invalid'" \
+  '/bin/bash -c "git config user.email fixture@example.invalid"' \
+  "'sh' '-c' 'git config user.email fixture@example.invalid'" \
+  "bash -c 'git config --global user.email allowed@example.invalid; git config user.name Fixture'" \
+  'bash -c "git config user.email \$EMAIL"'; do
+  for REL in tests/literal-shell-c.sh docs/literal-shell-c.md; do
+    # Markdown uses a complete code span, preserving the shell argv model.
+    TEXT="$SOURCE"; [[ "$REL" != *.md ]] || TEXT="\`$SOURCE\`"
+    run_on_fixture "$REL" "$TEXT
+"
+    if [ "$RC" = 1 ]; then pass "one-hop literal supported shell command-string writer caught"; else
+      fail "literal shell command hidden: source='$SOURCE' rel=$REL rc=$RC out=$OUT"
+    fi
+    run_on_fixture "$REL" "$TEXT # GIT_IDENTITY_SCOPE_EXEMPT: owning isolated fixture
+"
+    if [ "$RC" = 0 ]; then pass "owning marker retains literal shell-command exemption"; else
+      fail "owning literal shell marker rejected: source='$SOURCE' rc=$RC out=$OUT"
+    fi
+  done
+done
+for SOURCE in \
+  "printf '%s' 'git config user.email fixture@example.invalid'" \
+  "grep -c 'git config user.email fixture@example.invalid' file" \
+  'bash -c "$COMMAND"' \
+  'bash -c "git config user.email $EMAIL"' \
+  '$SHELL -c '\''git config user.email fixture@example.invalid'\''' \
+  "sudo -u somebody bash -c 'git config user.email fixture@example.invalid'" \
+  "env -u NAME bash -c 'git config user.email fixture@example.invalid'" \
+  'env NAME="$VALUE" bash -c '\''git config user.email fixture@example.invalid'\''' \
+  "bash -ce 'git config user.email fixture@example.invalid'" \
+  "bash -o errexit -c 'git config user.email fixture@example.invalid'" \
+  "bash -o -c 'git config user.email fixture@example.invalid'" \
+  "bash -O -c 'git config user.email fixture@example.invalid'" \
+  "bash -oc 'git config user.email fixture@example.invalid'" \
+  "bash -Oc 'git config user.email fixture@example.invalid'" \
+  "zsh -o -c 'git config user.email fixture@example.invalid'" \
+  "zsh -oc 'git config user.email fixture@example.invalid'" \
+  "eval 'git config user.email fixture@example.invalid'" \
+  "ssh host 'git config user.email fixture@example.invalid'" \
+  "docker exec container sh -c 'git config user.email fixture@example.invalid'" \
+  "bash --noprofile -c 'git config user.email fixture@example.invalid'" \
+  "bash -c 'git -C fixture config user.email fixture@example.invalid'" \
+  "bash -c 'git config --global user.email fixture@example.invalid'" \
+  "bash -c 'git config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: child fixture'" \
+  "bash -c \"bash -c 'git config user.email fixture@example.invalid'\""; do
+  for REL in tests/literal-shell-c-control.sh docs/literal-shell-c-control.md; do
+    TEXT="$SOURCE"; [[ "$REL" != *.md ]] || TEXT="\`$SOURCE\`"
+    run_on_fixture "$REL" "$TEXT
+"
+    if [ "$RC" = 0 ]; then pass "shell-c data/runtime/scope/depth boundaries retained"; else
+      fail "literal shell-c control rejected: source='$SOURCE' rel=$REL rc=$RC out=$OUT"
+    fi
+  done
+done
+# Literal-word admission must distinguish runtime expansion from protected
+# source bytes; these fake paths and command strings are never executed.
+for EXECUTABLE in '*/bash' '~/bin/bash' '?/bash' '[ab]/bash' '{a,b}/bash'; do
+  for QUOTING in unquoted single double; do
+    EXPECTED=1; WORD="$EXECUTABLE"
+    case "$QUOTING" in
+      unquoted) EXPECTED=0 ;;
+      single) WORD="'$EXECUTABLE'" ;;
+      double) WORD="\"$EXECUTABLE\"" ;;
+    esac
+    for REL in tests/shell-c-expansion-executable.sh docs/shell-c-expansion-executable.md; do
+      SOURCE="$WORD -c 'git config user.email fixture@example.invalid'"
+      [[ "$REL" != *.md ]] || SOURCE="\`$SOURCE\`"
+      run_on_fixture "$REL" "$SOURCE
+"
+      if [ "$RC" = "$EXPECTED" ]; then pass "shell-c executable expansion/quote boundary: $QUOTING $EXECUTABLE"; else
+        fail "shell-c executable boundary: source='$SOURCE' expected=$EXPECTED rc=$RC out=$OUT"
+      fi
+    done
+  done
+done
+for EXECUTABLE in '\*/bash' '\~/bin/bash' '\?/bash' '\[ab\]/bash' '\{a,b\}/bash'; do
+  run_on_fixture tests/shell-c-escaped-executable.sh "$EXECUTABLE -c 'git config user.email fixture@example.invalid'
+"
+  if [ "$RC" = 1 ]; then pass "escaped executable metacharacters remain literal"; else
+    fail "escaped literal executable lost: word='$EXECUTABLE' rc=$RC out=$OUT"
+  fi
+done
+for VALUE in 'fixture*' 'fixture?' 'fixture[ab]' 'fixture{a,b}' '~fixture'; do
+  for QUOTING in unquoted single double; do
+    EXPECTED=1
+    case "$QUOTING" in
+      unquoted) WORD="git\ config\ user.email\ $VALUE"; EXPECTED=0 ;;
+      single) WORD="'git config user.email $VALUE'" ;;
+      double) WORD="\"git config user.email $VALUE\"" ;;
+    esac
+    # A tilde in the middle of an unquoted word does not expand. Only a
+    # leading tilde is excluded; the value is already part of the command.
+    [ "$VALUE" != '~fixture' ] || EXPECTED=1
+    for REL in tests/shell-c-expansion-command.sh docs/shell-c-expansion-command.md; do
+      SOURCE="bash -c $WORD"; [[ "$REL" != *.md ]] || SOURCE="\`$SOURCE\`"
+      run_on_fixture "$REL" "$SOURCE
+"
+      if [ "$RC" = "$EXPECTED" ]; then pass "shell-c command-word expansion/quote boundary: $QUOTING $VALUE"; else
+        fail "shell-c command-word boundary: source='$SOURCE' expected=$EXPECTED rc=$RC out=$OUT"
+      fi
+    done
+  done
+done
+for SOURCE in \
+  'bash -c git\ config\ user.email\ fixture\*' \
+  'bash -c git\ config\ user.email\ fixture\?' \
+  'bash -c git\ config\ user.email\ fixture\[ab\]' \
+  'bash -c git\ config\ user.email\ fixture\{a,b\}' \
+  "bash -c 'git config user.email fixture'*" \
+  "bash -c 'git config user.email fixture'{a,b}"; do
+  EXPECTED=1; [[ "$SOURCE" != *"'"* ]] || EXPECTED=0
+  run_on_fixture tests/shell-c-escaped-command.sh "$SOURCE
+"
+  if [ "$RC" = "$EXPECTED" ]; then pass "escaped command bytes stay literal; unquoted suffix expansion stays opaque"; else
+    fail "shell-c mixed/escape boundary: source='$SOURCE' expected=$EXPECTED rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture tests/shell-c-leading-tilde.sh 'bash -c ~/git\ config\ user.email\ fixture@example.invalid
+'
+if [ "$RC" = 0 ]; then pass "leading tilde command word remains runtime-derived and opaque"; else
+  fail "leading tilde command value was evaluated: rc=$RC out=$OUT"
+fi
+
+for SOURCE in \
+  'git config --blob HEAD:config --no-bl user.email fixture@example.invalid' \
+  'git config --blob HEAD:config --no-blo user.email fixture@example.invalid' \
+  'git config --list --no-li user.email fixture@example.invalid' \
+  'git config --remove-section --no-rem user.email fixture@example.invalid' \
+  'git config --get-all --no-get-a user.email fixture@example.invalid' \
+  'git config --unset-all --no-unset-a user.email fixture@example.invalid' \
+  'git config --system --no-sy user.email fixture@example.invalid'; do
+  run_on_fixture tests/negative-selector-prefix.sh "$SOURCE
+"
+  if [ "$RC" = 1 ]; then pass "unique negative prefix cancels existing selector"; else
+    fail "unique negative prefix hid writer: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  'git config --blob HEAD:config --no-bl --blob HEAD:config user.email fixture@example.invalid' \
+  'git config --list --no-li --list user.email fixture@example.invalid' \
+  'git config --global --no-g user.email fixture@example.invalid' \
+  'git config --list --no-unknown user.email fixture@example.invalid' \
+  'git config --default "--no-li" --list user.email fixture@example.invalid' \
+  'git -C fixture config --list --no-li user.email fixture@example.invalid'; do
+  run_on_fixture tests/negative-selector-control.sh "$SOURCE
+"
+  if [ "$RC" = 0 ]; then pass "ambiguous/data/final/independent selector boundary retained"; else
+    fail "negative selector control rejected: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+for ESCAPES in '\' '\\\'; do
+  run_on_fixture docs/escaped-span-opener.md "${ESCAPES}\`literal then \`code <!-- GIT_IDENTITY_SCOPE_EXEMPT: cited -->\` and run git config user.email fixture@example.invalid\`
+"
+  if [ "$RC" = 1 ]; then pass "odd escaped opener cannot expose cited HTML marker"; else
+    fail "odd escape parity hid writer: escapes='$ESCAPES' rc=$RC out=$OUT"
+  fi
+done
+for ESCAPES in '\\' '\\\\'; do
+  run_on_fixture docs/even-span-opener.md "${ESCAPES}\`literal then \`code <!-- GIT_IDENTITY_SCOPE_EXEMPT: genuine outside span -->\` and run git config user.email fixture@example.invalid\`
+"
+  if [ "$RC" = 0 ]; then pass "even opener escape parity retains actual outside HTML comment"; else
+    fail "even escape parity rejected real marker: escapes='$ESCAPES' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture docs/escaped-span-closer.md '`citation\` git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: genuine outside span -->
+'
+if [ "$RC" = 0 ]; then pass "backslash inside span cannot escape its equal-width closer"; else
+  fail "closing delimiter used opener escape rule: rc=$RC out=$OUT"
+fi
+for SCOPE in GLOBAL SYSTEM; do
+  FLAG="$(printf '%s' "$SCOPE" | tr '[:upper:]' '[:lower:]')"
+  for TARGET in .git/config ./.git/config .git/config.worktree '".git/config"' "'$ROOT/.git/config'"; do
+    for REL in tests/scope-file-override.sh docs/scope-file-override.md; do
+      run_on_fixture "$REL" "GIT_CONFIG_$SCOPE=$TARGET git config --$FLAG user.email fixture@example.invalid
+"
+      # Absolute paths are matched against the scanned root, not the source
+      # checkout; this fixture path is an independent explicit target.
+      EXPECTED=1; [[ "$TARGET" != *"$ROOT"* ]] || EXPECTED=0
+      if [ "$RC" = "$EXPECTED" ]; then pass "literal leading scope-file assignment honors repository target boundary"; else
+        fail "scope-file override: target='$TARGET' expected=$EXPECTED rc=$RC out=$OUT"
+      fi
+    done
+  done
+  for SOURCE in \
+    "GIT_CONFIG_$SCOPE=fixture/config git config --$FLAG user.email fixture@example.invalid" \
+    "GIT_CONFIG_$SCOPE=\"\$FIX/.git/config\" git config --$FLAG user.email fixture@example.invalid" \
+    "GIT_CONFIG_$SCOPE=.git/config git -C fixture config --$FLAG user.email fixture@example.invalid" \
+    "GIT_CONFIG_$SCOPE=.git/config git config --file=.git/config user.email fixture@example.invalid" \
+    "GIT_CONFIG_$SCOPE=.git/config git config --$FLAG user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: owning fixture"; do
+    run_on_fixture tests/scope-file-control.sh "$SOURCE
+"
+    if [ "$RC" = 0 ]; then pass "ordinary/dynamic/explicit-target/exempt scope-file control retained"; else
+      fail "scope-file control rejected: source='$SOURCE' rc=$RC out=$OUT"
+    fi
+  done
+done
+
+# These private tracked-index controls exercise the production enumeration
+# and authentic consumer skip without root/suite overrides or a hub marker.
+LITERAL_CONSUMER="$WORKDIR/consumer-literal-repairs"
+mkdir -p "$LITERAL_CONSUMER/scripts/ci" "$LITERAL_CONSUMER/tests"
+git init -q -b main "$LITERAL_CONSUMER"
+cp "$CHECK" "$LITERAL_CONSUMER/scripts/ci/check_git_identity_hygiene"
+cp "$ROOT/tests/test_git_identity_hygiene.sh" "$LITERAL_CONSUMER/tests/"
+cp "$LITERAL_CONSUMER/.git/config" "$WORKDIR/literal-config-before"
+LITERAL_PHYSICAL_ROOT="$(cd "$LITERAL_CONSUMER" && pwd -P)"
+for CONTROL in prose opener shell-c lazy-quote wrapper-sudo wrapper-env bundled-shell separate-shell zsh-shell grep-data escaped-opener negative-selector override-global override-system quoted-data runtime option-data ordinary-global explicit-file absolute-override runtime-glob literal-glob; do
+  REL=REVIEW_POLICY.md; EXPECTED=1
+  case "$CONTROL" in
+    prose) SOURCE='**git config user.email fixture@example.invalid**' ;;
+    opener) SOURCE=$'Use `git config user.email fixture@example.invalid\n<!-- GIT_IDENTITY_SCOPE_EXEMPT: cited -->`' ;;
+    shell-c) REL=literal.sh; SOURCE="bash -c 'git config user.email fixture@example.invalid'" ;;
+    lazy-quote) SOURCE=$'> Use `literal\ngit config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: cited -->`' ;;
+    wrapper-sudo) REL=literal.sh; SOURCE="sudo bash -c 'git config user.email fixture@example.invalid'" ;;
+    wrapper-env) REL=literal.sh; SOURCE="env NAME=literal bash -c 'git config user.email fixture@example.invalid'" ;;
+    bundled-shell) REL=literal.sh; SOURCE="bash -ec 'git config user.email fixture@example.invalid'" ;;
+    separate-shell) REL=literal.sh; SOURCE="bash -e -c 'git config user.email fixture@example.invalid'" ;;
+    zsh-shell) REL=literal.sh; SOURCE="zsh -c 'git config user.email fixture@example.invalid'" ;;
+    grep-data) REL=literal.sh; SOURCE="grep -c 'git config user.email fixture@example.invalid' file"; EXPECTED=0 ;;
+    escaped-opener) SOURCE='\`literal then `code <!-- GIT_IDENTITY_SCOPE_EXEMPT: cited -->` run git config user.email fixture@example.invalid`' ;;
+    negative-selector) REL=literal.sh; SOURCE='git config --list --no-li user.email fixture@example.invalid' ;;
+    override-global) SOURCE='GIT_CONFIG_GLOBAL=.git/config git config --global user.email fixture@example.invalid' ;;
+    override-system) REL=literal.sh; SOURCE='GIT_CONFIG_SYSTEM=.git/config git config --system user.email fixture@example.invalid' ;;
+    absolute-override) REL=literal.sh; SOURCE="GIT_CONFIG_GLOBAL='$LITERAL_PHYSICAL_ROOT/.git/config' git config --global user.email fixture@example.invalid" ;;
+    runtime-glob) REL=literal.sh; SOURCE="*/bash -c 'git config user.email fixture@example.invalid'"; EXPECTED=0 ;;
+    literal-glob) REL=literal.sh; SOURCE="'*/bash' -c 'git config user.email fixture@example.invalid'" ;;
+    quoted-data) REL=literal.sh; SOURCE="printf '%s' 'git config user.email fixture@example.invalid'"; EXPECTED=0 ;;
+    runtime) SOURCE='Run $git config user.email fixture@example.invalid'; EXPECTED=0 ;;
+    option-data) SOURCE="Run git -c core.editor='git config user.email fixture@example.invalid' status"; EXPECTED=0 ;;
+    ordinary-global) SOURCE='git config --global user.email fixture@example.invalid'; EXPECTED=0 ;;
+    explicit-file) SOURCE='git config --file=.git/config user.email fixture@example.invalid'; EXPECTED=0 ;;
+  esac
+  rm -f "$LITERAL_CONSUMER/REVIEW_POLICY.md" "$LITERAL_CONSUMER/literal.sh"
+  printf '%s\n' "$SOURCE" > "$LITERAL_CONSUMER/$REL"
+  git -C "$LITERAL_CONSUMER" add -A
+  set +e
+  OUT="$(bash "$LITERAL_PHYSICAL_ROOT/scripts/ci/check_git_identity_hygiene" 2>&1)"; RC=$?
+  set -e
+  if [ "$RC" = "$EXPECTED" ] \
+    && { [ "$EXPECTED" = 0 ] || [[ "$OUT" == *"$REL:1:"* ]] || { [ "$CONTROL" = lazy-quote ] && [[ "$OUT" == *"$REL:2:"* ]]; }; } \
+    && { [ "$EXPECTED" = 1 ] || [[ "$OUT" == *"regression test suite skipped (consumer checkout"* ]]; } \
+    && cmp -s "$WORKDIR/literal-config-before" "$LITERAL_CONSUMER/.git/config"; then
+    pass "real tracked-index literal repair/control: $CONTROL"
+  else fail "tracked-index literal repair: $CONTROL expected=$EXPECTED rc=$RC out=$OUT"; fi
+done
+
+# Case 65aa1: omitted blockquote markers can lazily continue the same
+# paragraph. Complete equal-width spans still make cited markers data;
+# real comments and actual paragraph/block boundaries retain their scope.
+for PREFIX in '> ' '> > ' '- > ' '> - ' '> 1. > '; do
+  for CONTINUATION in '' '  '; do
+  for TICKS in '`' '``'; do
+    UNEQUAL='`'; [ "$TICKS" != '`' ] || UNEQUAL='``'
+    run_on_fixture docs/lazy-quote-citation.md "${PREFIX}Use ${TICKS}literal $UNEQUAL unequal run
+${CONTINUATION}git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: cited -->${TICKS}
+"
+    if [ "$RC" = 1 ] && [[ "$OUT" == *'docs/lazy-quote-citation.md:2:'* ]]; then
+      pass "lazy quote paragraph preserves complete equal-width span citation"
+    else fail "lazy quote cited marker cleared writer: prefix='$PREFIX' ticks='$TICKS' rc=$RC out=$OUT"; fi
+    run_on_fixture docs/lazy-quote-real-comment.md "${PREFIX}Use ${TICKS}literal
+${CONTINUATION}git config user.email fixture@example.invalid${TICKS} <!-- GIT_IDENTITY_SCOPE_EXEMPT: actual comment -->
+"
+    if [ "$RC" = 0 ]; then pass "real comment after lazily continued closed span remains valid"; else
+      fail "lazy quote rejected real outside comment: prefix='$PREFIX' ticks='$TICKS' rc=$RC out=$OUT"
+    fi
+  done
+  done
+done
+run_on_fixture docs/lazy-partial-quote.md $'> > Use `literal\n> git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: cited -->`\n'
+if [ "$RC" = 1 ]; then pass "partially omitted nested quote marker keeps cited marker inside span"; else
+  fail "partial lazy quote accepted citation: rc=$RC out=$OUT"
+fi
+for PREFIX in '> ' '- > ' '> - ' '> 1. > '; do
+  for BOUNDARY in '' '# heading' '---' '===' '- new item' '1. new item'; do
+  run_on_fixture docs/lazy-quote-boundary.md "${PREFIX}Use \`literal
+$BOUNDARY
+git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: actual comment -->\`
+"
+  if [ "$RC" = 0 ]; then pass "actual lazy-quote paragraph/block boundary preserves outside marker"; else
+    fail "lazy quote crossed boundary: boundary='$BOUNDARY' rc=$RC out=$OUT"
+  fi
+  done
+done
+for SOURCE in \
+  $'> Paragraph\ngit config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: actual comment -->' \
+  $'> Use `unmatched\ngit config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: actual comment -->'; do
+  run_on_fixture docs/lazy-quote-unmatched.md "$SOURCE
+"
+  if [ "$RC" = 0 ]; then pass "ordinary or unmatched lazy-quote prose retains real exemption"; else
+    fail "lazy quote unvalidated opener hid real exemption: rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture docs/lazy-quote-fence.md $'> Use `literal\n~~~bash\ngit config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->`\n'
+if [ "$RC" = 1 ]; then pass "actual fence interrupts lazy quote and keeps HTML code marker literal"; else
+  fail "lazy quote absorbed new fenced block: rc=$RC out=$OUT"
+fi
+
+# Case 65aa2: only one through nine digits form an ordered list marker.
+for ENDING in '.' ')'; do
+  for NUMBER in 123456789 1234567890; do
+    EXPECTED=1; [ "$NUMBER" != 1234567890 ] || EXPECTED=0
+    INDENT="$(printf '%*s' "$((${#NUMBER} + 2))" '')"
+    run_on_fixture docs/ordered-width.md "$NUMBER$ENDING \`\`\`bash
+${INDENT}git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal if valid list fence -->
+"
+    if [ "$RC" = "$EXPECTED" ]; then pass "ordered marker width boundary: $NUMBER$ENDING"; else
+      fail "ordered width wrong: marker=$NUMBER$ENDING expected=$EXPECTED rc=$RC out=$OUT"
+    fi
+    run_on_fixture docs/ordered-width-unexempted.md "$NUMBER$ENDING \`\`\`bash
+${INDENT}git config user.email fixture@example.invalid
+"
+    if [ "$RC" = 1 ]; then pass "ordered width control retains unexempted writer"; else
+      fail "ordered width hid writer: marker=$NUMBER$ENDING rc=$RC out=$OUT"
+    fi
+  done
+done
+
+# Case 65ab: only ordered start 1 can interrupt an open paragraph.
+for NUMBER in 0 2 3 10; do
+  ORDERED_INDENT="$(printf '%*s' "$((${#NUMBER} + 2))" '')"
+  run_on_fixture docs/ordered-paragraph.md "Paragraph
+$NUMBER. \`\`\`bash
+   git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: actual paragraph -->
+"
+  if [ "$RC" = 0 ]; then pass "non-1 ordered marker cannot turn paragraph HTML exemption into code data"; else
+    fail "ordered paragraph interruption rejected genuine marker: number=$NUMBER rc=$RC out=$OUT"
+  fi
+  run_on_fixture docs/ordered-after-blank.md "Paragraph
+
+$NUMBER. \`\`\`bash
+${ORDERED_INDENT}git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->
+"
+  if [ "$RC" = 1 ]; then pass "blank boundary allows non-1 ordered fence; literal HTML remains data"; else
+    fail "blank-separated ordered fence accepted literal marker: number=$NUMBER rc=$RC out=$OUT"
+  fi
+done
+for NUMBER in 1 01; do
+  run_on_fixture docs/ordered-one-paragraph.md "Paragraph
+$NUMBER. \`\`\`bash
+    git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->
+"
+  if [ "$RC" = 1 ]; then pass "ordered start 1 interrupts paragraph and keeps fenced HTML literal"; else
+    fail "ordered1 interruption missed literal writer: number=$NUMBER rc=$RC out=$OUT"
+  fi
+done
+for SOURCE in \
+  $'> Paragraph\n> 2. ```bash\n>    git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: paragraph -->' \
+  $'- Paragraph\n  2. ```bash\n     git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: paragraph -->' \
+  $'> - Paragraph\n>   2. ```bash\n>      git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: paragraph -->'; do
+  run_on_fixture docs/nested-ordered-paragraph.md "$SOURCE
+"
+  if [ "$RC" = 0 ]; then pass "numeric interruption uses retained outer quote/list paragraph context"; else
+    fail "nested numeric paragraph became fence: source='$SOURCE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture docs/nested-ordered-one.md $'> Paragraph\n> 1. ```bash\n>    git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->\n'
+if [ "$RC" = 1 ]; then pass "valid nested ordered1 fence keeps HTML marker literal"; else
+  fail "nested ordered1 fence cleared writer: rc=$RC out=$OUT"
+fi
+run_on_fixture docs/ordered-sibling.md $'1. Paragraph\n2. ```bash\n   git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->\n'
+if [ "$RC" = 1 ]; then pass "sibling ordered item ends prior paragraph container before opening fence"; else
+  fail "sibling ordered2 fence treated as interrupted prose: rc=$RC out=$OUT"
+fi
+run_on_fixture docs/ordered-paragraph-no-exemption.md $'Paragraph\n2. ```bash\n   git config user.email leak@example.invalid\n'
+if [ "$RC" = 1 ]; then pass "corrected paragraph context still flags unexempted literal writer"; else
+  fail "numeric context correction hid writer: rc=$RC out=$OUT"
+fi
+
+# Case 65ac: empty list items cannot interrupt a paragraph either.
+for MARKER in '1.' '01.' '*' '+'; do
+  EMPTY_CODE_INDENT="$(printf '%*s' "$((${#MARKER} + 5))" '')"
+  run_on_fixture docs/empty-list-paragraph.md "Paragraph
+$MARKER
+       git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: genuine paragraph -->
+"
+  if [ "$RC" = 0 ]; then pass "empty numeric/bullet item preserves paragraph and real HTML marker"; else
+    fail "empty marker interrupted paragraph: marker='$MARKER' rc=$RC out=$OUT"
+  fi
+  run_on_fixture docs/empty-list-after-blank.md "Paragraph
+
+$MARKER
+${EMPTY_CODE_INDENT}git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal indented code -->
+"
+  if [ "$RC" = 1 ]; then pass "blank boundary retains standalone empty-child indentation/code behavior"; else
+    fail "empty first child after blank cleared code writer: marker='$MARKER' rc=$RC out=$OUT"
+  fi
+  run_on_fixture docs/empty-list-unexempted.md "Paragraph
+$MARKER
+       git config user.email leak@example.invalid
+"
+  if [ "$RC" = 1 ]; then pass "paragraph preservation still catches unexempted literal instruction"; else
+    fail "empty marker context erased writer: marker='$MARKER' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture docs/empty-list-spaced.md $'Paragraph\n1.   \n       git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: genuine paragraph -->\n'
+if [ "$RC" = 0 ]; then pass "blank-only first content cannot interrupt paragraph"; else
+  fail "space-only list child became code container: rc=$RC out=$OUT"
+fi
+run_on_fixture docs/empty-list-crlf.md $'Paragraph\r\n1.\r\n       git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: genuine paragraph -->\r\n'
+if [ "$RC" = 0 ]; then pass "CRLF empty item preserves actual paragraph comment"; else
+  fail "CRLF empty item interrupted paragraph: rc=$RC out=$OUT"
+fi
+run_on_fixture docs/nonempty-list-seven-spaces.md $'Paragraph\n1. content\n       git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal indented code -->\n'
+if [ "$RC" = 0 ]; then pass "nonempty ordered1 starts its own paragraph; indentation cannot interrupt it"; else
+  fail "nonempty item paragraph comment rejected: rc=$RC out=$OUT"
+fi
+run_on_fixture docs/nonempty-list-fence-seven-spaces.md $'Paragraph\n1. ```bash\n       git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->\n'
+if [ "$RC" = 1 ]; then pass "nonempty ordered1 fence still interrupts outer paragraph with seven-space code"; else
+  fail "nonempty ordered1 fence lost: rc=$RC out=$OUT"
+fi
+run_on_fixture docs/empty-list-01-seven-spaces.md $'Paragraph\n\n01.\n       git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: actual child paragraph -->\n'
+if [ "$RC" = 0 ]; then pass "empty01 child requires eight total spaces for code; seven remains paragraph"; else
+  fail "empty01 seven-space paragraph became code: rc=$RC out=$OUT"
+fi
+run_on_fixture docs/empty-dash-setext.md $'Paragraph\n-\n       git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code after heading -->\n'
+if [ "$RC" = 1 ]; then pass "empty dash retains existing setext heading boundary"; else
+  fail "empty list guard weakened setext/code boundary: rc=$RC out=$OUT"
+fi
+
+# Case 65p: the modern rename verb moves a section, not the protected key.
+for ACTION in 'rename-section' '"rename-section"' "'rename-section'" '--rename-section'; do
+  run_on_fixture "tests/rename-section.sh" "git config $ACTION user.email archived
+"
+  if [ "$RC" = "0" ]; then
+    pass "literal modern/legacy rename-section is a nonwrite"
+  else
+    fail "section rename misclassified: '$ACTION' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "tests/rename-neighbour.sh" 'git config rename-section user.email archived; git config user.email leak@example.invalid
+'
+if [ "$RC" = "1" ]; then
+  pass "section rename cannot suppress neighbouring identity assignment"
+else
+  fail "rename suppressed neighbouring writer: rc=$RC out=$OUT"
+fi
+run_on_fixture "tests/rename-value.sh" "git -c foo.bar='config rename-section value' config user.email leak@example.invalid
+"
+if [ "$RC" = "1" ]; then
+  pass "rename-section inside quoted option value is not a subcommand"
+else
+  fail "quoted rename data suppressed writer: rc=$RC out=$OUT"
+fi
+
+# Actual Git oracles run only in a private fixture repo, never caller cwd.
+LITERAL_ORACLE="$WORKDIR/literal-git-oracle"
+git init -q -b main "$LITERAL_ORACLE"
+for SOURCE in \
+  "git -c foo.bar='a;b' config user.email fixture@example.invalid" \
+  'g\it config user.email fixture@example.invalid' \
+  'git c\onfig user.email fixture@example.invalid' \
+  'git con"fig" user.email fixture@example.invalid' \
+  "git 'config' user.email fixture@example.invalid" \
+  'git config --global --no-global user.email fixture@example.invalid' \
+  $'git -c foo.bar=$(printf a\nprintf b) config user.email fixture@example.invalid'; do
+  (cd "$LITERAL_ORACLE" && bash -c "$SOURCE")
+  VALUE="$(git -C "$LITERAL_ORACLE" config --local --get user.email)"
+  if [ "$VALUE" = fixture@example.invalid ]; then
+    pass "private Git oracle confirms literal config/selector/substitution command writes identity"
+  else
+    fail "private Git oracle differed: source='$SOURCE' value='$VALUE'"
+  fi
+  git -C "$LITERAL_ORACLE" config --local --unset-all user.email
+done
+# Version gates only this runtime oracle; static modern-syntax assertions
+# above still run on every toolchain. A supported operation/readback failure
+# is a failure, never evidence that the operation is unsupported.
+modern_rename_oracle() {
+  local repo="$1" git_cmd="${2:-git}" version major minor value renamed value_rc renamed_rc rc
+  if ! version="$("$git_cmd" --version 2>&1)"; then
+    fail "modern rename oracle cannot read Git version: $version"; return
+  fi
+  if [[ ! "$version" =~ ^git[[:space:]]version[[:space:]]([0-9]+)\.([0-9]+)(\.|[[:space:]]|$) ]]; then
+    fail "modern rename oracle cannot classify Git version: $version"; return
+  fi
+  major=$((10#${BASH_REMATCH[1]})); minor=$((10#${BASH_REMATCH[2]}))
+  if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 46 ]; }; then
+    skip "modern rename runtime oracle requires Git 2.46+: $version"; return
+  fi
+  if ! "$git_cmd" -C "$repo" config user.email.old fixture; then
+    fail "modern rename oracle fixture setup failed: $version"; return
+  fi
+  if "$git_cmd" -C "$repo" config rename-section user.email archived; then
+    if value="$("$git_cmd" -C "$repo" config --local --get user.email 2>/dev/null)"; then value_rc=0; else value_rc=$?; fi
+    if renamed="$("$git_cmd" -C "$repo" config --local --get archived.old 2>/dev/null)"; then renamed_rc=0; else renamed_rc=$?; fi
+    if [ "$value_rc" = 1 ] && [ "$renamed_rc" = 0 ] && [ -z "$value" ] && [ "$renamed" = fixture ]; then
+      pass "private Git oracle confirms modern rename leaves protected key unset"
+    else
+      fail "private rename oracle readback failed: protected='$value' rc=$value_rc renamed='$renamed' rc=$renamed_rc"
+    fi
+  else
+    rc=$?
+    fail "modern rename operation failed on supported Git: rc=$rc $version"
+  fi
+}
+modern_rename_oracle "$LITERAL_ORACLE"
+
+# Exercise version/operation/readback boundaries without installing Git or
+# altering PATH. Wrappers delegate all actual configuration to private repos.
+ORACLE_REAL_GIT="$(command -v git)"
+for CASE in old-239 old-243 unknown-version supported-failure supported-readback-failure; do
+  ORACLE_WRAPPER="$WORKDIR/oracle-$CASE"
+  cat > "$ORACLE_WRAPPER" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = --version ]; then
+  case "$ORACLE_CASE" in
+    old-239) echo 'git version 2.39.5 (Apple Git-154)' ;;
+    old-243) echo 'git version 2.43.0' ;;
+    unknown-version) echo 'git version unknown' ;;
+    *) echo 'git version 2.54.0' ;;
+  esac
+  exit 0
+fi
+case "$ORACLE_CASE" in
+  old-*) echo unexpected-operation >&2; exit 91 ;;
+  supported-failure)
+    if [ "$4" = rename-section ]; then exit 61; fi ;;
+  supported-readback-failure)
+    if [ "${6:-}" = archived.old ]; then exit 62; fi ;;
+esac
+exec "$ORACLE_REAL_GIT" "$@"
+EOF
+  chmod +x "$ORACLE_WRAPPER"
+  ORACLE_REPO="$WORKDIR/oracle-repo-$CASE"
+  git init -q -b main "$ORACLE_REPO"
+  RESULT="$( {
+    PASS=0; FAIL=0; SKIP=0
+    export ORACLE_CASE="$CASE" ORACLE_REAL_GIT
+    modern_rename_oracle "$ORACLE_REPO" "$ORACLE_WRAPPER"
+    echo "COUNTS:$PASS:$FAIL:$SKIP:AFTER"
+  } 2>&1)"
+  case "$CASE" in
+    old-*)
+      if [[ "$RESULT" == *'COUNTS:0:0:1:AFTER'* ]] && [[ "$RESULT" == *'SKIP:'* ]] && [[ "$RESULT" != *'unexpected-operation'* ]]; then
+        pass "unsupported Git runtime oracle genuinely skips without executing operation or inventing a pass"
+      else
+        fail "unsupported Git oracle did not skip honestly: case=$CASE result=$RESULT"
+      fi ;;
+    *)
+      if [[ "$RESULT" == *'COUNTS:0:1:0:AFTER'* ]] && [[ "$RESULT" == *'FAIL:'* ]]; then
+        pass "supported Git operation/readback failure is recorded and does not abort suite"
+      else
+        fail "supported Git oracle failure hidden or aborted: case=$CASE result=$RESULT"
+      fi ;;
+  esac
+done
+
+# Case 65q: indented Markdown code contains literal HTML, including in
+# list/quote containers. Shell exemptions and real comments after code survive.
+for PREFIX in '    ' $'\t' '>     ' '-     ' '1.     ' '> -     '; do
+  run_on_fixture "docs/indented-html.md" "${PREFIX}git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->
+"
+  if [ "$RC" = "1" ]; then
+    pass "HTML marker in indented/container code cannot exempt a writer"
+  else
+    fail "indented code exempted writer: prefix='$PREFIX' rc=$RC out=$OUT"
+  fi
+  run_on_fixture "docs/indented-shell.md" "${PREFIX}git config user.email fixture@example.invalid # GIT_IDENTITY_SCOPE_EXEMPT: isolated fixture
+
+"'git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: outside code -->
+'
+  if [ "$RC" = "0" ]; then
+    pass "real shell marker in indented code and outside HTML marker remain valid"
+  else
+    fail "true comment around indented code rejected: prefix='$PREFIX' rc=$RC out=$OUT"
+  fi
+done
+for BEFORE in '# Heading' '- # Heading' '- ' '-' '* * *' '> # Heading'; do
+  INDENT='    '
+  case "$BEFORE" in '- '|'--'|'-'|'- # Heading') INDENT='      ' ;; '> # Heading') INDENT='>     ' ;; esac
+  run_on_fixture "docs/indented-boundary.md" "${BEFORE}
+${INDENT}git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->
+"
+  if [ "$RC" = "1" ]; then
+    pass "heading/empty-item/thematic boundary permits indented code, not HTML exemptions"
+  else
+    fail "indented block boundary missed: before='$BEFORE' rc=$RC out=$OUT"
+  fi
+done
+for BEFORE in 'Paragraph' '- Paragraph' '> Paragraph'; do
+  INDENT='    '
+  case "$BEFORE" in '- Paragraph') INDENT='      ' ;; '> Paragraph') INDENT='>     ' ;; esac
+  run_on_fixture "docs/paragraph-continuation.md" "${BEFORE}
+${INDENT}git config user.email fixture@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: true paragraph comment -->
+"
+  if [ "$RC" = "0" ]; then
+    pass "four-column indentation cannot interrupt a paragraph; true HTML comment remains valid"
+  else
+    fail "paragraph continuation treated as code: before='$BEFORE' rc=$RC out=$OUT"
+  fi
+done
+run_on_fixture "docs/indented-continued.md" '    git \
+    config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->
+'
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/indented-continued.md:1:'; then
+  pass "continued command in indented code cannot use literal HTML exemption"
+else
+  fail "continued indented writer missed: rc=$RC out=$OUT"
+fi
+run_on_fixture "docs/a-paragraph.md" 'Paragraph
+'
+printf '    git config user.email leak@example.invalid <!-- GIT_IDENTITY_SCOPE_EXEMPT: literal code -->\n' > "$WORKDIR/fixture-$FIXTURE_SEQ/docs/b-code.md"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$WORKDIR/fixture-$FIXTURE_SEQ" bash "$CHECK" 2>&1)"; RC=$?
+set -e
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q 'docs/b-code.md:1:'; then
+  pass "paragraph context resets between Markdown files"
+else
+  fail "paragraph state leaked between files: rc=$RC out=$OUT"
+fi
+
 # ── Linked worktrees: identity lives in every one of them (#806) ───────
 
 # Case 66: `git config --worktree` reads the INVOKING worktree's
@@ -2194,6 +4541,6 @@ fi
 
 # ── Summary ───────────────────────────────────────────────────────────
 echo
-echo "test_git_identity_hygiene: $PASS passed, $FAIL failed"
+echo "test_git_identity_hygiene: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

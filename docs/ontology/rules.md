@@ -811,7 +811,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **G-158.** The git config file is byte-identical across a lint run. ● — rules/repo_rules.md § check_git_identity_hygiene
 
-**G-159.** No tracked hub script or doc writes an identity key without naming a target repo or an out-of-repo scope. ● — rules/repo_rules.md § check_git_identity_hygiene
+**G-159.** No tracked shell script or Markdown doc in a hub or consumer checkout writes an identity key without naming a target repo or an out-of-repo scope. ● — rules/repo_rules.md § check_git_identity_hygiene
 
 **G-160.** The include-graph walk fails closed on an unexpandable include: unreadable is never nothing-there. ● — rules/repo_rules.md § check_git_identity_hygiene
 
