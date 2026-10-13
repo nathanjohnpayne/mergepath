@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "description": "Peer-coupled npm package families that must share one Dependabot group (mergepath#2162). Dependabot assigns each update to the first group it matches; when members of one family land in different groups, each PR bumps one half of a peer-coupled pair and fails npm ci. Read by scripts/ci/dependabot_coupled_groups.py.",
+  "families": [
+    {
+      "group": "firebase-sdk",
+      "patterns": ["firebase", "@firebase/*"],
+      "rationale": "@firebase/rules-unit-testing peers on the matching firebase major, and firebase is a production dependency while the test harness is a dev dependency.",
+      "evidence": "2026-10-13: firebase 13 and @firebase/rules-unit-testing 6 split across five repos (friends-and-family-billing#491/#490 and siblings)."
+    },
+    {
+      "group": "firebase-server",
+      "patterns": ["firebase-admin", "firebase-functions", "firebase-functions-test"],
+      "rationale": "firebase-functions caps its firebase-admin peer range, and firebase-functions-test peers on both; the test package is a dev dependency.",
+      "evidence": "friends-and-family-billing /functions and fiveacross hold firebase-admin majors by hand behind the firebase-functions cap."
+    },
+    {
+      "group": "eslint-core",
+      "patterns": ["eslint", "@eslint/*"],
+      "rationale": "@eslint/js peers on the matching eslint major.",
+      "evidence": "friends-and-family-billing#475 bumped @eslint/js to 10 while eslint stayed on 9; held by #477."
+    },
+    {
+      "group": "typescript-toolchain",
+      "patterns": ["typescript", "typescript-eslint", "@typescript-eslint/*"],
+      "rationale": "typescript-eslint caps its typescript peer range.",
+      "evidence": "matchline, overridebroadway, tadlockpsychiatry and nathanpaynedotcom hold typescript majors behind the typescript-eslint peer ceiling."
+    },
+    {
+      "group": "vite-toolchain",
+      "patterns": ["vite", "vitest", "@vitest/*", "@vitejs/*", "vite-plugin-pwa"],
+      "rationale": "vitest, @vitejs/plugin-react and vite-plugin-pwa peer on the vite major.",
+      "evidence": "fiveacross holds vite, vitest, @vitejs/plugin-react and vite-plugin-pwa majors together by hand."
+    }
+  ]
+}
