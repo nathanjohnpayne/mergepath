@@ -379,7 +379,8 @@ CLASSIFY_JQ='
              else
                {kind: ("review:" + (.state | ascii_downcase)),
                 side: (if $cls == "author" then "author" else "verdict" end),
-                actor: login, at: .submitted_at, state: .state, commit_id: .commit_id}
+                actor: login, at: .submitted_at, state: .state, commit_id: .commit_id,
+                codex: (is_codex and .commit_id == $head)}
              end ]
        + [ $pr.issue_comments[]
            | (actor_class($author)) as $cls
@@ -390,7 +391,7 @@ CLASSIFY_JQ='
                  ((.body | summary_status) as $st
                   | (.body | summary_commit) as $sc
                   | if $st == "completed" and $sc != "" and ($head | startswith($sc)) then
-                      {kind: "codex-summary-completed", side: "verdict", actor: login, at: (.updated_at // .created_at)}
+                      {kind: "codex-summary-completed", side: "verdict", actor: login, at: (.updated_at // .created_at), codex: true}
                     elif $st == "running" and $sc != "" and ($head | startswith($sc)) then
                       {kind: "codex-summary-running", side: "bot-activity", actor: login, at: (.updated_at // .created_at), running: true}
                     else
@@ -398,14 +399,15 @@ CLASSIFY_JQ='
                     end)
                elif is_codex and (.body | is_codex_verdict) then
                  {kind: "verdict-comment", side: "verdict", actor: login, at: .created_at,
-                  names_head: (.body | norm | contains($head))}
+                  names_head: (.body | norm | contains($head)), codex: (.body | norm | contains($head))}
                elif (.body | is_rate_limited) then
                  {kind: "bot-rate-limited", side: "bot-activity", actor: login, at: .created_at}
                else
                  {kind: "bot-comment", side: "bot-activity", actor: login, at: .created_at}
                end
              elif (.body | is_trigger) then
-               {kind: "trigger", side: "author", actor: login, at: .created_at, trigger: true}
+               {kind: "trigger", side: "author", actor: login, at: .created_at, trigger: true,
+                provider: (if (.body | strip_markup | test("@codex[[:space:]]+review"; "i")) then "codex" else "coderabbit" end)}
              elif $cls == "author" then
                {kind: "author-comment", side: "author", actor: login, at: .created_at}
              else
@@ -432,10 +434,23 @@ CLASSIFY_JQ='
     | ([ $events[] | select(.trigger == true) | select((.at | ts) >= $head_ts) ] | max_by(.at | ts)) as $last_trigger
     | ($last_trigger != null
        and ([ $events[] | select(.side == "verdict") | select((.at | ts) > ($last_trigger.at | ts)) ] | length) == 0) as $request_outstanding
-    | ([ $events[] | select(.running == true) ] | length > 0) as $summary_running
+    # A Running summary is superseded by any head-anchored Codex verdict that
+    # landed at or after it (a findings review while the mutable summary was
+    # never flipped to Completed must not read as "still running").
+    | ([ $events[] | select(.running == true) | (.at | ts) as $r
+         | select(([ $events[] | select(.codex == true and .side == "verdict") | select((.at | ts) >= $r) ] | length) == 0)
+       ] | length > 0) as $summary_running
+    # A provider rate limit on this head stands until a verdict lands after it
+    # or the sanctioned failover (a Codex request posted after it) exists —
+    # whether or not the trigger it refused is still outstanding.
+    | ([ $events[] | select(.kind == "bot-rate-limited") | select((.at | ts) >= $head_ts) ] | max_by(.at | ts)) as $last_rate_limit
+    | ($last_rate_limit != null
+       and ([ $events[] | select(.side == "verdict") | select((.at | ts) > ($last_rate_limit.at | ts)) ] | length) == 0
+       and ([ $events[] | select(.trigger == true and .provider == "codex") | select((.at | ts) > ($last_rate_limit.at | ts)) ] | length) == 0
+      ) as $rate_limited
     | ($pr.ci_state == "PENDING") as $ci_pending
     | (if $ci_pending then "ci"
-       elif $request_outstanding or $summary_running then "bot"
+       elif $request_outstanding or $summary_running or $rate_limited then "bot"
        elif $newest.side == "bot-activity" then "bot"
        else null end) as $machine_wait
     # ---- head evidence --------------------------------------------------------
@@ -485,11 +500,11 @@ CLASSIFY_JQ='
           else {class: "stalled", reason: "ci-pending-stale"} end)
        elif $machine_wait == "bot" then
          (if $age < $threshold_seconds then
-            {class: "waiting-on-bot", reason: (if $request_outstanding then "review request outstanding on head"
+            {class: "waiting-on-bot", reason: (if $rate_limited then "provider rate-limited; no failover request yet"
+                                               elif $request_outstanding then "review request outstanding on head"
                                                elif $summary_running then "Codex reports the head Running"
                                                else "bot activity, no verdict yet" end)}
-          elif ($request_outstanding | not) and $newest.kind == "bot-rate-limited" then
-            {class: "stalled", reason: "rate-limit-stale"}
+          elif $rate_limited then {class: "stalled", reason: "rate-limit-stale"}
           else {class: "stalled", reason: "request-unanswered"} end)
        elif $age < $threshold_seconds then {class: "live", reason: "newest event younger than the threshold"}
        elif $newest.side == "verdict" then {class: "stalled", reason: "unanswered-verdict"}
@@ -526,6 +541,7 @@ CLASSIFY_JQ='
         next_action: $action.next_action, next_action_detail: $action.detail,
         codex_signal_on_head: $codex_signal_on_head,
         request_outstanding: $request_outstanding,
+        rate_limited: $rate_limited,
         unanswered_findings: $unanswered,
         gate: $pr.gate
       };

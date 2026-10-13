@@ -245,10 +245,15 @@ cat > "$SHIM/bin/gh" <<'SH'
 printf '%s\n' "$*" >> "$SHIM_STATE/calls.log"
 case "$1 $2" in
   "api --paginate")
-    [ ! -f "$SHIM_STATE/list-fail" ] || { echo "gh: HTTP 500" >&2; exit 1; }
-    case "$3" in repos/octo/demo/issues?state=open*) cat "$SHIM_STATE/issues.json" ;; *) echo "gh shim: unhandled: $*" >&2; exit 1 ;; esac ;;
+    case "$3" in
+      repos/octo/demo/issues?state=open*)
+        [ ! -f "$SHIM_STATE/list-fail" ] || { echo "gh: HTTP 500" >&2; exit 1; }
+        cat "$SHIM_STATE/issues.json" ;;
+      repos/octo/demo/labels?per_page=100) cat "$SHIM_STATE/labels.txt" ;;
+      *) echo "gh shim: unhandled: $*" >&2; exit 1 ;;
+    esac ;;
   "label list")
-    cat "$SHIM_STATE/labels.txt" ;;
+    echo "gh shim: the bounded label list must not be used" >&2; exit 1 ;;
   "label create")
     [ ! -f "$SHIM_STATE/label-create-fail" ] || { echo "gh: forbidden" >&2; exit 1; }
     echo "$3" >> "$SHIM_STATE/labels.txt" ;;
@@ -355,6 +360,20 @@ if [ "$rc" -eq 1 ] && grep -Fq 'issue edit 77 --repo octo/demo --title' "$S3B/ca
   pass "a failed label re-apply on the existing tracker still refreshes it and then fails the step"
 else
   fail "add-label failure (rc=$rc): $out $(calls "$S3B")"
+fi
+
+# 3c. a tracking label beyond any fixed page bound (600 labels) is still found
+#     through the paginated read: no create attempt, the issue is labelled, exit 0.
+S3C="$SHIM/s3c"; mkdir -p "$S3C"
+printf '[]' > "$S3C/issues.json"
+{ for i in $(seq 1 598); do echo "filler-$i"; done; echo "area:ci-infra"; echo "audit"; } > "$S3C/labels.txt"
+set +e; out=$(route "$S3C" 1 2>&1); rc=$?; set -e
+if [ "$rc" -eq 0 ] && ! grep -Fq 'label create' "$S3C/calls.log" && ! grep -Fq 'label list' "$S3C/calls.log" \
+   && grep -Fq 'api --paginate repos/octo/demo/labels?per_page=100' "$S3C/calls.log" \
+   && grep -Fq -- '--label area:ci-infra --label audit --body-file' "$S3C/calls.log"; then
+  pass "labels are read with --paginate, so a label past the first 500 is found and not re-created"
+else
+  fail "paginated label lookup (rc=$rc): $out $(calls "$S3C" | head -5)"
 fi
 
 # 4. recovery with an open tracking issue → closed with a recovery comment; nothing created

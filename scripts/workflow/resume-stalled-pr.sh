@@ -47,10 +47,13 @@
 #   3  the finder could not read the repository, or the --execute step hit an
 #      infrastructure error
 #   4  --execute: the Codex request was REFUSED BY POLICY, not by an outage —
-#      the requester exited 6 (feedback unaccounted) or 7 (request budget
-#      exhausted). The routing outcome is printed as a `next:` line and in the
+#      the requester exited 5 (no request by policy: an under-threshold PR in a
+#      repo with codex.request_by_default false), 6 (feedback unaccounted) or
+#      7 (request budget exhausted). --execute flags the request
+#      Phase-4a-gated only for a PR labelled `needs-external-review`. The routing outcome is printed as a `next:` line and in the
 #      `--json` record (`execute.requester_exit`, `execute.cap_kind`,
-#      `execute.next_action`): `disposition findings` (6), `phase 4b`
+#      `execute.next_action`): `under-threshold path` (5),
+#      `disposition findings` (6), `phase 4b`
 #      (7 request-ceiling: run scripts/phase-4b-review.sh from a trusted main
 #      checkout) or `human tiebreaker` (7 blocking-reviews: escalate per
 #      REVIEW_POLICY.md § Disagreements). A routine must act on that line, not
@@ -157,9 +160,12 @@ echo "Next action: $next_action — $detail"
 echo
 echo "Checkout (hidden per-repo worktree folder, docs/agents/worktree-placement.md):"
 # Fork and contributor-owned PRs never classify as stalled (the finder routes
-# them to waiting-on-human), so the head branch is always on origin here.
+# them to waiting-on-human), so the head branch is always on origin here. The
+# worktree branch is (re)set to the recorded head SHA: a stale local branch of
+# the same name would otherwise be checked out as-is, and the session would
+# edit the wrong revision. `-B` refuses if that branch is checked out elsewhere.
 echo "  git -C \$HOME/GitHub/${q_slug} fetch origin ${q_ref}"
-echo "  git -C \$HOME/GitHub/${q_slug} worktree add ${q_wt} ${q_ref}"
+echo "  git -C \$HOME/GitHub/${q_slug} worktree add -B ${q_ref} ${q_wt} ${head_sha}"
 echo
 
 case "$next_action" in
@@ -225,7 +231,17 @@ if [ "$EXECUTE" = "1" ]; then
   req_out=$(mktemp "${TMPDIR:-/tmp}/resume-stalled-pr-req.XXXXXX") || { echo "resume-stalled-pr: mktemp failed" >&2; exit 3; }
   trap 'rm -f "$req_out"' EXIT
   set +e
-  MERGEPATH_PHASE_4A_GATED=true "$REQUESTER" --trigger-only "$number" "$REPO" > "$req_out"
+  # Phase 4a scope is the repository's own triage verdict: agent-review.yml
+  # labels a PR `needs-external-review` exactly when it meets the external
+  # review threshold or a protected path. Only such a PR is flagged
+  # Phase-4a-gated; any other PR is left to the requester's own entry decision
+  # (codex.request_by_default), which may decline with exit 5.
+  if printf '%s' "$SELECTED" | jq -e '.labels | index("needs-external-review")' >/dev/null; then
+    gated=true
+  else
+    gated=""
+  fi
+  MERGEPATH_PHASE_4A_GATED="$gated" "$REQUESTER" --trigger-only "$number" "$REPO" > "$req_out"
   rc=$?
   set -e
   cat "$req_out"
@@ -235,6 +251,7 @@ if [ "$EXECUTE" = "1" ]; then
   cap_kind=$(jq -r '.cap_exhausted.kind // ""' "$req_out" 2>/dev/null || true)
   case "$rc" in
     0) exit_next="" ;;
+    5) exit_next="under-threshold path" ;;
     6) exit_next="disposition findings" ;;
     7)
       case "$cap_kind" in
@@ -246,6 +263,7 @@ if [ "$EXECUTE" = "1" ]; then
   esac
   if [ -n "$exit_next" ]; then
     case "$exit_next" in
+      "under-threshold path") how="the policy does not request Codex on this PR (codex.request_by_default false, not Phase-4a scope): take the under-threshold reviewer-identity approval and merge path, AGENTS.md § Workflow Summary step 7" ;;
       "disposition findings") how="disposition every earlier finding (scripts/review-feedback-accounting.sh $number), then rerun" ;;
       "phase 4b") how="the request ceiling is spent: run scripts/phase-4b-review.sh $number --repo $REPO from a trusted main checkout" ;;
       *) how="the blocking-review budget is spent: stop, post the escalation comment carrying [mergepath-handoff] per REVIEW_POLICY.md § Disagreements and Tiebreaking, and alert the human" ;;

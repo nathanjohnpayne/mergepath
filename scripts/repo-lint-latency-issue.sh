@@ -179,7 +179,9 @@ body="$tmpdir/issue-body.md"
 # the issue is still written and the step fails afterwards to say so.
 label_args=()
 label_degraded=0
-if ! label_names="$(gh label list --repo "$REPO" --limit 500 --json name --jq '.[].name' 2>&1)"; then
+# Paginated, so a configured label beyond any fixed page bound is still seen
+# (a bounded list would misread it as missing and degrade every run).
+if ! label_names="$(gh api --paginate "repos/$REPO/labels?per_page=100" --jq '.[].name' 2>&1)"; then
   echo "::warning::Could not list labels in $REPO: $label_names"
   label_names=""
 fi

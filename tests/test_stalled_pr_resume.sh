@@ -177,13 +177,28 @@ NBSP_VERDICT="Codex Review: Didn't find any major issues.${NBSP}Reviewed${NBSP}c
     --argjson rev "$(review 14 "$CODEX" COMMENTED "2026-10-13T05:30:00Z" "$(sha 130)")" \
     --argjson f "$(inline 15 "$CODEX" "2026-10-13T05:30:00Z" "$(sha 130)" null "2026-10-13T06:30:00Z")" \
     --argjson r "$(inline 16 "nathanpayne-claude" "2026-10-13T05:40:00Z" "$(sha 130)" 15)"
+  # 131: @coderabbitai review, then CodeRabbit refuses on a rate limit; hours later nothing → rate-limit-stale / investigate
+  #      (the outstanding trigger must not turn into an automatic Codex request)
+  pr 131 "2026-10-13T05:00:00Z" SUCCESS '.issue_comments = [$t, $c]' \
+    --argjson t "$(comment 22 "$AUTHOR" "2026-10-13T05:05:00Z" '@coderabbitai review')" \
+    --argjson c "$(comment 23 "$RABBIT" "2026-10-13T05:06:00Z" 'Rate limit exceeded; please try again in 30 minutes.')"
+  # 132: same, but the sanctioned failover posted @codex review after the refusal and Codex never answered → request codex
+  pr 132 "2026-10-13T05:00:00Z" SUCCESS '.issue_comments = [$t, $c, $f]' \
+    --argjson t "$(comment 24 "$AUTHOR" "2026-10-13T05:05:00Z" '@coderabbitai review')" \
+    --argjson c "$(comment 25 "$RABBIT" "2026-10-13T05:06:00Z" 'Rate limit exceeded; please try again in 30 minutes.')" \
+    --argjson f "$(comment 26 "$AUTHOR" "2026-10-13T05:07:00Z" '@codex review')"
+  # 133: Codex Review Summary left at Running, but a head-anchored Codex findings review landed after it → push fix
+  pr 133 "2026-10-13T05:00:00Z" SUCCESS '.issue_comments = [$sum] | .reviews = [$rev] | .review_comments = [$f]' \
+    --argjson sum "$(comment 27 "$CODEX" "2026-10-13T05:10:00Z" "${SUMMARY_RUNNING//$(sha 113 | cut -c1-7)/$(sha 133 | cut -c1-7)}" "2026-10-13T05:11:00Z")" \
+    --argjson rev "$(review 15 "$CODEX" COMMENTED "2026-10-13T05:20:00Z" "$(sha 133)")" \
+    --argjson f "$(inline 17 "$CODEX" "2026-10-13T05:20:00Z" "$(sha 133)" null)"
   # 123: only a CodeRabbit review on the head, CI green, hours old → head-unrequested / request codex (not a Codex signal)
   pr 123 "2026-10-13T05:00:00Z" SUCCESS '.reviews = [$rev] | .review_comments = [$f]' \
     --argjson rev "$(review 10 "$RABBIT" COMMENTED "2026-10-13T05:20:00Z" "$(sha 123)")" \
     --argjson f "$(inline 12 "$RABBIT" "2026-10-13T05:20:00Z" "$(sha 123)" null)"
 } | jq -s --arg repo "$REPO" --arg now "$NOW" '{schema: "stalled-prs/v1", repo: $repo, fetched_at: $now, prs: .}' > "$TMP/snapshot.json"
 
-if ! jq -e '.prs | length == 30' "$TMP/snapshot.json" >/dev/null; then
+if ! jq -e '.prs | length == 33' "$TMP/snapshot.json" >/dev/null; then
   echo "FAIL: fixture snapshot did not assemble: $(jq -c . "$TMP/snapshot.json" 2>&1 | head -c 300)" >&2
   exit 1
 fi
@@ -252,8 +267,12 @@ expect 127 '.class == "waiting-on-human" and .reason == "fork PR: the contributo
 expect 128 '.class == "waiting-on-human" and .reason == "not agent-authored (octocat)" and .next_action == "wait"'
 expect 129 '.class == "stalled" and .reason == "head-unrequested" and .next_action == "request codex" and .next_action_detail == "no Codex signal on head; no CI on head"'
 expect 130 '.class == "stalled" and (.unanswered_findings | map(.id)) == [15] and .next_action == "push fix"'
+expect 131 '.class == "stalled" and .reason == "rate-limit-stale" and .rate_limited == true and .request_outstanding == true and .next_action == "investigate"'
+expect 132 '.class == "stalled" and .reason == "request-unanswered" and .rate_limited == false and .next_action == "request codex"'
+expect 133 '.class == "stalled" and .reason == "unanswered-verdict" and .next_action == "push fix" and (.unanswered_findings | map(.id)) == [17]'
+expect 115 '.reason == "provider rate-limited; no failover request yet"'
 
-if jq -e '[.prs[] | .number] == [101, 116, 129, 111, 122, 126, 123, 125, 130, 110, 112, 119, 105, 114, 117, 118, 121, 106, 128, 127, 108, 124, 120, 107, 104, 102, 113, 103, 115]' "$TMP/report.json" >/dev/null; then
+if jq -e '[.prs[] | .number] == [101, 116, 129, 131, 132, 111, 122, 126, 133, 123, 125, 130, 110, 112, 119, 105, 114, 117, 118, 121, 106, 128, 127, 108, 124, 120, 107, 104, 102, 113, 103, 115]' "$TMP/report.json" >/dev/null; then
   pass "report is ordered stalled-first, oldest newest-event first"
 else
   fail "report order: $(jq -c '[.prs[] | .number]' "$TMP/report.json")"
@@ -264,7 +283,7 @@ bash "$FINDER" --input "$TMP/snapshot.json" --now "$NOW" > "$TMP/human.txt" 2>&1
 rc=$?
 set -e
 if [ "$rc" -eq 1 ] && grep -Fq '#101  stalled  10h15m  review:commented by chatgpt-codex-connector[bot] at 2026-10-13T01:45:00Z  head 0000000  next: push fix — 2 unanswered finding(s) on head' "$TMP/human.txt" \
-   && grep -Fq 'stalled-prs: octo/demo — 29 open non-draft PR(s), threshold 60m, now 2026-10-13T12:00:00Z' "$TMP/human.txt"; then
+   && grep -Fq 'stalled-prs: octo/demo — 32 open non-draft PR(s), threshold 60m, now 2026-10-13T12:00:00Z' "$TMP/human.txt"; then
   pass "human output carries one line per PR with class, age, newest event, head and next action"
 else
   fail "human output (rc=$rc): $(head -3 "$TMP/human.txt")"
@@ -306,7 +325,7 @@ if [ "$rc" -eq 0 ] && grep -Fq 'PR:          octo/demo#101 — PR 101' "$TMP/res
    && grep -Fq 'Next action: push fix — 2 unanswered finding(s) on head' "$TMP/resume.txt" \
    && grep -Fq 'scripts/resolve-pr-threads.sh 101 --resolve-actioned' "$TMP/resume.txt" \
    && grep -Fq 'https://github.com/octo/demo/pull/1#discussion_r1' "$TMP/resume.txt" \
-   && grep -Fq 'worktree add $HOME/GitHub/.demo-worktrees/pr-101 feat/101' "$TMP/resume.txt" \
+   && grep -Fq "worktree add -B feat/101 \$HOME/GitHub/.demo-worktrees/pr-101 $(sha 101)" "$TMP/resume.txt" \
    && grep -Fq '[mergepath-handoff]' "$TMP/resume.txt"; then
   pass "resume picks the oldest stalled PR and prints its push-fix work order"
 else
@@ -351,7 +370,7 @@ bash "$RESUME" --input "$TMP/snapshot-hostile.json" --now "$NOW" --pr 101 > "$TM
 bash "$RESUME" --input "$TMP/snapshot-hostile.json" --now "$NOW" --pr 116 > "$TMP/resume-fork.txt" 2>&1; rc_f=$?
 set -e
 if [ "$rc_h" -eq 0 ] && grep -Fq 'fetch origin topic\;touch\ /tmp/pwned' "$TMP/resume-hostile.txt" \
-   && grep -Fq 'worktree add $HOME/GitHub/.demo-worktrees/pr-101 topic\;touch\ /tmp/pwned' "$TMP/resume-hostile.txt" \
+   && grep -Fq "worktree add -B topic\\;touch\\ /tmp/pwned \$HOME/GitHub/.demo-worktrees/pr-101 $(sha 101)" "$TMP/resume-hostile.txt" \
    && grep -Fq 'PR:          octo/demo#101 — Real title Next action: merge now [0m' "$TMP/resume-hostile.txt" \
    && ! grep -Fxq 'Next action: merge now' "$TMP/resume-hostile.txt" \
    && ! grep -Fq 'fetch origin topic;touch' "$TMP/resume-hostile.txt" \
@@ -412,13 +431,13 @@ cat > "$TMP/fixture/pulls.json" <<'JSON'
 [{"number":41,"title":"Approved and idle","html_url":"https://github.com/octo/demo/pull/41","draft":false,
   "user":{"login":"nathanjohnpayne"},"head":{"sha":"4141414141414141414141414141414141414141","ref":"feat/41","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[{"name":"size:S"}]},
  {"number":42,"title":"Pushed and forgotten","html_url":"https://github.com/octo/demo/pull/42","draft":false,
-  "user":{"login":"nathanjohnpayne"},"updated_at":"2026-10-13T06:00:00Z","head":{"sha":"4242424242424242424242424242424242424242","ref":"feat/42","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]},
+  "user":{"login":"nathanjohnpayne"},"updated_at":"2026-10-13T06:00:00Z","head":{"sha":"4242424242424242424242424242424242424242","ref":"feat/42","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[{"name":"needs-external-review"}]},
  {"number":43,"title":"Draft","html_url":"https://github.com/octo/demo/pull/43","draft":true,
   "user":{"login":"nathanjohnpayne"},"updated_at":"2026-10-13T06:00:00Z","head":{"sha":"4343434343434343434343434343434343434343","ref":"feat/43","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]},
  {"number":44,"title":"Future-dated head, no checks","html_url":"https://github.com/octo/demo/pull/44","draft":false,"updated_at":"2026-10-13T05:00:00Z",
   "user":{"login":"nathanjohnpayne"},"head":{"sha":"4444444444444444444444444444444444444444","ref":"feat/44","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]},
  {"number":42,"title":"Pushed and forgotten (repeated by a page boundary)","html_url":"https://github.com/octo/demo/pull/42","draft":false,
-  "user":{"login":"nathanjohnpayne"},"updated_at":"2026-10-13T06:00:00Z","head":{"sha":"4242424242424242424242424242424242424242","ref":"feat/42","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]}]
+  "user":{"login":"nathanjohnpayne"},"updated_at":"2026-10-13T06:00:00Z","head":{"sha":"4242424242424242424242424242424242424242","ref":"feat/42","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[{"name":"needs-external-review"}]}]
 JSON
 # 41: three check runs on the head, the merge gate newest and green; 42: no
 # check runs at all (push time falls back to the commit date); 43: draft;
@@ -501,9 +520,23 @@ rc=$?
 set -e
 if [ "$rc" -eq 0 ] && grep -Fxq 'requester-called MERGEPATH_PHASE_4A_GATED=true --trigger-only 42 octo/demo' "$TMP/request.log" \
    && grep -Fq 'Next action: request codex' "$TMP/resume-live.txt"; then
-  pass "--execute posts the Codex request through the requester with the Phase 4a gate flag, trigger-only"
+  pass "--execute posts the Codex request through the requester, trigger-only, Phase-4a-gated for a needs-external-review PR"
 else
   fail "resume --execute (rc=$rc): $(cat "$TMP/request.log") $(tail -5 "$TMP/resume-live.txt")"
+fi
+
+# A PR outside Phase 4a scope (no needs-external-review label) is NOT flagged
+# gated: the requester applies codex.request_by_default itself.
+: > "$TMP/request.log"
+set +e
+PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fixture" GATE_LOG="$TMP/gate.log" REQUEST_LOG="$TMP/request.log" \
+  bash "$TREE/scripts/workflow/resume-stalled-pr.sh" --repo "$REPO" --now "$NOW" --pr 44 --execute > "$TMP/resume-live-44.txt" 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -Fxq 'requester-called MERGEPATH_PHASE_4A_GATED=unset --trigger-only 44 octo/demo' "$TMP/request.log"; then
+  pass "--execute leaves an unlabelled (under-threshold) PR ungated so the requester applies request_by_default"
+else
+  fail "ungated execute (rc=$rc): $(cat "$TMP/request.log") $(tail -3 "$TMP/resume-live-44.txt")"
 fi
 
 : > "$TMP/request.log"
@@ -536,14 +569,16 @@ rc_c=0; run_exec 7 request-ceiling "$TMP/exec-ceiling.txt" || rc_c=$?
 rc_b=0; run_exec 7 blocking-reviews "$TMP/exec-blocking.txt" || rc_b=$?
 rc_u=0; run_exec 6 "" "$TMP/exec-unaccounted.txt" || rc_u=$?
 rc_i=0; run_exec 3 "" "$TMP/exec-infra.txt" || rc_i=$?
+rc_n=0; run_exec 5 "" "$TMP/exec-notrigger.txt" || rc_n=$?
 if [ "$rc_c" -eq 4 ] && grep -Fq 'next: phase 4b — the request ceiling is spent: run scripts/phase-4b-review.sh 42 --repo octo/demo' "$TMP/exec-ceiling.txt" \
    && grep -Fq '"requester_exit": 7' "$TMP/exec-ceiling.txt" && grep -Fq '"cap_kind": "request-ceiling"' "$TMP/exec-ceiling.txt" \
    && [ "$rc_b" -eq 4 ] && grep -Fq 'next: human tiebreaker' "$TMP/exec-blocking.txt" && grep -Fq '[mergepath-handoff]' "$TMP/exec-blocking.txt" \
    && [ "$rc_u" -eq 4 ] && grep -Fq 'next: disposition findings' "$TMP/exec-unaccounted.txt" \
-   && [ "$rc_i" -eq 3 ] && grep -Fq 'exited 3 (infrastructure)' "$TMP/exec-infra.txt"; then
-  pass "--execute maps requester exit 7 (by cap kind) and 6 to routing outcomes (exit 4) and keeps a real failure at exit 3"
+   && [ "$rc_i" -eq 3 ] && grep -Fq 'exited 3 (infrastructure)' "$TMP/exec-infra.txt" \
+   && [ "$rc_n" -eq 4 ] && grep -Fq 'next: under-threshold path' "$TMP/exec-notrigger.txt"; then
+  pass "--execute maps requester exits 5, 6 and 7 (by cap kind) to routing outcomes (exit 4) and keeps a real failure at exit 3"
 else
-  fail "requester exit mapping (ceiling=$rc_c blocking=$rc_b unaccounted=$rc_u infra=$rc_i): $(tail -3 "$TMP/exec-ceiling.txt")"
+  fail "requester exit mapping (ceiling=$rc_c blocking=$rc_b unaccounted=$rc_u infra=$rc_i notrigger=$rc_n): $(tail -3 "$TMP/exec-ceiling.txt")"
 fi
 
 # A failed list read must be a status, never an empty report (#831 contract).
