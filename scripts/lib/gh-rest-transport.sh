@@ -290,6 +290,16 @@ gh_rest_api() {
   esac
 }
 
+# gh_rest_text_file <text>: a private file holding <text> exactly. Bodies reach
+# jq through it (--rawfile), never as an argument: one argument is limited to
+# about 128 KiB, which a multibyte body near GitHub's limit can exceed.
+gh_rest_text_file() {
+  local file
+  file="$(umask 077; mktemp "$GH_REST_TMPDIR/text.XXXXXX")" || return 1
+  printf '%s' "$1" >"$file" || return 1
+  printf '%s\n' "$file"
+}
+
 # gh_rest_json_file <jq args...>: a private file holding `jq -n <args>`.
 gh_rest_json_file() {
   local file
@@ -466,10 +476,10 @@ gh_rest_events() {
 
 # gh_rest_new_events <before> <after> -> the events in <after> absent from <before>.
 gh_rest_new_events() {
-  local before_ids
-  before_ids="$(printf '%s' "$1" | jq -c '[.[].id]')" || return 1
-  printf '%s' "$2" | jq -c --argjson before "$before_ids" \
-    '[.[] | select(.id as $i | ($before | map(. == $i) | any) | not)]'
+  # Both lists reach jq on stdin: a long event history must not become one
+  # oversized argument.
+  { printf '%s\n' "$1"; printf '%s\n' "$2"; } | jq -cs \
+    '(.[0] | map(.id)) as $before | [.[1][] | select(.id as $i | ($before | index($i)) == null)]'
 }
 
 # gh_rest_attribute <new-events> <event> <jq match on the event> <value> <what>
@@ -589,7 +599,9 @@ gh_rest_remove_label() { # <repo> <N> <label>
 # wrong byline.
 gh_rest_post_comment() {
   local input response login url
-  input="$(gh_rest_json_file --arg body "$3" '{body: $body}')" || return 1
+  local text
+  text="$(gh_rest_text_file "$3")" || return 1
+  input="$(gh_rest_json_file --rawfile body "$text" '{body: $body}')" || return 1
   response="$(gh_rest_api POST "repos/$1/issues/$2/comments" "$input")" || return $?
   login="$(printf '%s' "$response" | jq -r '.user.login // empty' 2>/dev/null)"
   url="$(printf '%s' "$response" | jq -r '.html_url // empty' 2>/dev/null)"
@@ -652,6 +664,14 @@ gh_rest_pr_create() {
   gh_rest_each "$(gh_rest_lines_json "$reviewers")" gh_rest_check_login_what "--reviewer" || return 1
   gh_rest_each "$(gh_rest_lines_json "$assignees")" gh_rest_check_login_what "--assignee" || return 1
   if [ -z "$base" ]; then
+    # gh's order: the checked-out branch's gh-merge-base, then the default.
+    local current
+    current="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    if [ -n "$current" ] && [ "$current" != "HEAD" ]; then
+      base="$(git config --get "branch.$current.gh-merge-base" 2>/dev/null || true)"
+    fi
+  fi
+  if [ -z "$base" ]; then
     base="$(gh_rest_api GET "repos/$repo" | jq -r '.default_branch // empty' 2>/dev/null)"
     if [ -z "$base" ]; then
       gh_rest_err "could not read the default branch of $repo; pass --base BRANCH. Nothing was written."
@@ -661,7 +681,9 @@ gh_rest_pr_create() {
   gh_rest_check_branch "$base" "--base" || return 1
 
   local input response number url actual rc=0
-  input="$(gh_rest_json_file --arg title "$title" --arg body "$GH_REST_BODY" --arg head "$head" --arg base "$base" --argjson draft "$draft" \
+  local text
+  text="$(gh_rest_text_file "$GH_REST_BODY")" || return 1
+  input="$(gh_rest_json_file --arg title "$title" --rawfile body "$text" --arg head "$head" --arg base "$base" --argjson draft "$draft" \
     '{title: $title, body: $body, head: $head, base: $base, draft: $draft}')" || return 1
   response="$(gh_rest_api POST "repos/$repo/pulls" "$input")" || return $?
   number="$(printf '%s' "$response" | jq -r '.number // empty' 2>/dev/null)"
@@ -792,7 +814,9 @@ gh_rest_pr_review() {
 
   local input response login url state
   if [ "$GH_REST_BODY_SET" -eq 1 ]; then
-    input="$(gh_rest_json_file --arg event "$event" --arg body "$GH_REST_BODY" '{event: $event, body: $body}')" || return 1
+    local text
+    text="$(gh_rest_text_file "$GH_REST_BODY")" || return 1
+    input="$(gh_rest_json_file --arg event "$event" --rawfile body "$text" '{event: $event, body: $body}')" || return 1
   else
     input="$(gh_rest_json_file --arg event "$event" '{event: $event}')" || return 1
   fi
@@ -892,7 +916,9 @@ gh_rest_pr_edit() {
 
   local input rc=0
   if [ "$title_op" -eq 1 ] || [ "$body_op" -eq 1 ] || [ "$base_op" -eq 1 ]; then
-    input="$(gh_rest_json_file --arg title "$title" --arg body "$GH_REST_BODY" --arg base "$base" \
+    local text
+    text="$(gh_rest_text_file "$GH_REST_BODY")" || return 1
+    input="$(gh_rest_json_file --arg title "$title" --rawfile body "$text" --arg base "$base" \
       --argjson t "$title_op" --argjson b "$body_op" --argjson r "$base_op" \
       '({} | if $t == 1 then .title = $title else . end | if $b == 1 then .body = $body else . end | if $r == 1 then .base = $base else . end)')" || return 1
     gh_rest_api PATCH "repos/$repo/pulls/$number" "$input" >/dev/null || { gh_rest_err "the title/body/base edit of PR #$number failed; later edits were not attempted."; return 1; }
@@ -975,16 +1001,22 @@ gh_rest_pr_close() {
     gh_rest_err "pull request #$number ($url) is already $state; nothing was written."
     return 1
   fi
-  if [ "$comment_set" -eq 1 ]; then
-    gh_rest_post_comment "$repo" "$number" "$comment" >/dev/null || return $?
-  fi
-  local before input rc=0
+  # The pre-close events are read before anything is written, so a failed
+  # read leaves the PR untouched rather than commented and still open.
+  local before input rc=0 comment_url=""
   before="$(gh_rest_events "$repo" "$number")" || {
-    gh_rest_err "could not read the events of PR #$number before closing it; refusing a write that could not be attributed."
+    gh_rest_err "could not read the events of PR #$number before closing it; refusing a write that could not be attributed. Nothing was written."
     return 5
   }
+  if [ "$comment_set" -eq 1 ]; then
+    comment_url="$(gh_rest_post_comment "$repo" "$number" "$comment")" || return $?
+  fi
   input="$(gh_rest_json_file '{state: "closed"}')" || return 1
-  gh_rest_api PATCH "repos/$repo/pulls/$number" "$input" >/dev/null || return $?
+  gh_rest_api PATCH "repos/$repo/pulls/$number" "$input" >/dev/null || {
+    rc=$?
+    [ -z "$comment_url" ] || gh_rest_err "the closing comment was posted ($comment_url), but closing PR #$number failed; retry the close without --comment."
+    return "$rc"
+  }
   gh_rest_readback "$repo" "$number" "$before" gh_rest_check_close_events || rc=$?
   if [ "$rc" -eq 3 ]; then
     gh_rest_err "ERROR PR #$number was closed but its events could not be read back, so the close is unattributed."
@@ -996,7 +1028,8 @@ gh_rest_pr_close() {
   fi
   gh_rest_err "verified close of PR #$number by $GH_REST_EXPECTED"
   if [ "$delete_branch" -eq 1 ]; then
-    if [ -n "$head_ref" ] && [ "$head_repo" = "$repo" ]; then
+    # GitHub repository names are case-insensitive.
+    if [ -n "$head_ref" ] && [ "$(printf '%s' "$head_repo" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]')" ]; then
       if gh_rest_api DELETE "repos/$repo/git/refs/heads/$(gh_rest_uri "$head_ref")" >/dev/null; then
         gh_rest_err "deleted branch $head_ref on $repo (a ref delete has no byline; not attributed)."
       else

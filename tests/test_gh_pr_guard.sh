@@ -109,6 +109,7 @@ case "${1:-} ${2:-}" in
     ;;
   "api --paginate")
     [ -z "${STUB_API_LOG:-}" ] || printf '%s\n' "$*" >>"$STUB_API_LOG"
+    if [ -n "${STUB_FILES_PAGES_FILE:-}" ]; then cat "$STUB_FILES_PAGES_FILE"; exit 0; fi
     echo '[[{"filename":"scripts/x.sh"}],[{"filename":"docs/y.md"}]]'
     ;;
   *)
@@ -572,6 +573,11 @@ STUB_GRAPHQL_CEILING=1 assert_rc_contains "GraphQL ceiling: approve without --re
 STUB_GRAPHQL_CEILING=1 assert_rc_contains "GraphQL ceiling: approve by URL is refused with the canonical form" 2 "gh pr review <number> --repo OWNER/REPO" \
   'scripts/gh-as-reviewer.sh -- gh pr review https://github.com/example/repo/pull/123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0"
 STUB_GRAPHQL_CEILING=1 STUB_REST_FAIL=1 assert_rc_contains "GraphQL ceiling: a failed REST read blocks" 2 "could not read example/repo#123 over REST" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0"
+BIG_FILES="$WORKDIR/big-files.json"
+# Streamed into the file: as one argument it would hit the very limit tested.
+{ printf '[[{"filename":"scripts/x.sh","patch":"'; head -c 1200000 /dev/zero | tr '\0' 'x'; printf '"}]]\n'; } >"$BIG_FILES"
+STUB_GRAPHQL_CEILING=1 STUB_FILES_PAGES_FILE="$BIG_FILES" assert_rc_contains "GraphQL ceiling: a 1.2 MB files response is read (never passed as one argument)" 0 "" \
   'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0"
 STUB_PR_VIEW_FAIL=1 assert_rc_contains "a read failure that is not the GraphQL ceiling still blocks, with no REST fallback" 2 "could not fetch PR metadata" \
   'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0"

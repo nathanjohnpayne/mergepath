@@ -479,10 +479,38 @@ set +e
 out="$(cd "$GITREPO" && MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" 2>/dev/null)"; rc=$?
 set -e
 create_input="$(jq -nc --arg body "$expected_body" '{title: "T", body: $body, head: "topic/z", base: "main", draft: false}')"
-if [ "$rc" -eq 0 ] && log_has $'gh\tapi\trepos/o/r\n' && log_has $'POST\trepos/o/r/pulls\t--input\t'"$create_input" && log_lacks 'events?per_page'; then
+if [ "$rc" -eq 0 ] && grep -q $'\tapi\trepos/o/r$' "$LOGF" && log_has $'POST\trepos/o/r/pulls\t--input\t'"$create_input" && log_lacks 'events?per_page'; then
   pass "pr create defaults: --head from the checked-out branch, --base from GET repos, no event read without follow-ups"
 else
   fail "pr create defaults: rc=$rc"; cat "$LOGF" >&2
+fi
+
+# gh's order for an omitted --base: the branch's gh-merge-base, then the
+# repository default.
+git -C "$GITREPO" config branch.topic/z.gh-merge-base release/2
+new_case
+set +e
+(cd "$GITREPO" && MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" >/dev/null 2>&1); rc=$?
+set -e
+create_input="$(jq -nc --arg body "$expected_body" '{title: "T", body: $body, head: "topic/z", base: "release/2", draft: false}')"
+if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/pulls\t--input\t'"$create_input" && ! grep -q $'\tapi\trepos/o/r$' "$LOGF"; then
+  pass "pr create: an omitted --base takes the branch's gh-merge-base before the repository default"
+else
+  fail "pr create gh-merge-base: rc=$rc"; cat "$LOGF" >&2
+fi
+git -C "$GITREPO" config --unset branch.topic/z.gh-merge-base
+
+# A body far larger than one argument may be reaches jq through a file.
+BIG_BODY="$WORKDIR/big-body.md"
+{ printf 'Authoring-Agent: codex\n\n## Self-Review\n\n- Correctness: verified.\n\n'; head -c 1200000 /dev/zero | tr '\0' 'x'; printf '\n'; } >"$BIG_BODY"
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest as_reviewer -- gh pr comment 1 --repo o/r --body-file "$BIG_BODY" >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -F $'POST\trepos/o/r/issues/1/comments' "$LOGF" | grep -q 'xxxxxxxxxx'; then
+  pass "a 1.2 MB comment body is posted (it never travels as a single argument)"
+else
+  fail "big comment body: rc=$rc"; head -c 600 "$WORKDIR/err" >&2
 fi
 
 new_case
@@ -717,6 +745,33 @@ else
   fail "pr close: rc=$rc out=$out"; cat "$LOGF" "$WORKDIR/err" >&2
 fi
 
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_EVENTS_FAIL=1 as_author -- gh pr close 42 --repo o/r --comment bye 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'Nothing was written' && log_lacks 'POST' && log_lacks 'PATCH'; then
+  pass "pr close: an unreadable event log refuses before the closing comment is posted"
+else
+  fail "pr close events-first: rc=$rc err=$err"; cat "$LOGF" >&2
+fi
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_PATCH_FAIL=1 as_author -- gh pr close 42 --repo o/r --comment bye 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'the closing comment was posted (https://github.com/o/r/pull/42#issuecomment-900), but closing PR #42 failed'; then
+  pass "pr close: a close that fails after the comment says the comment was posted"
+else
+  fail "pr close partial: rc=$rc err=$err"
+fi
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest STUB_PR_HEAD_REPO=O/R as_author -- gh pr close 42 --repo o/r --delete-branch >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'DELETE\trepos/o/r/git/refs/heads/feature'; then
+  pass "pr close --delete-branch: the head repository matches --repo case-insensitively"
+else
+  fail "pr close case-insensitive repo: rc=$rc"; cat "$LOGF" >&2
+fi
 new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_PR_STATE=closed as_author -- gh pr close 42 --repo o/r 2>&1 >/dev/null)"; rc=$?

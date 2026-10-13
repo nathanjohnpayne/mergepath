@@ -1394,7 +1394,7 @@ guard_graphql_refused() { # <stderr file>
 # is read (a PR number and --repo OWNER/REPO), so the read targets exactly
 # the PR the write will. Prints the same JSON shape as the GraphQL read.
 guard_review_pr_json_rest() { # <selector> <repo>
-  local sel="$1" repo="$2" pr pages
+  local sel="$1" repo="$2" pr pages err
   case "$sel" in ''|*[!0-9]*|0*) sel="" ;; esac
   case "$repo" in ''|*/*/*|/*|*/|*[!A-Za-z0-9._/-]*) repo="" ;; */*) ;; *) repo="" ;; esac
   if [ -z "$sel" ] || [ -z "$repo" ]; then
@@ -1402,19 +1402,27 @@ guard_review_pr_json_rest() { # <selector> <repo>
     echo "    scripts/gh-as-reviewer.sh -- gh pr review <number> --repo OWNER/REPO --approve ..." >&2
     return 1
   fi
-  if ! pr=$(gh api "repos/$repo/pulls/$sel" 2>&1) \
+  err=$(mktemp) || return 1
+  if ! pr=$(gh api "repos/$repo/pulls/$sel" 2>"$err") \
      || ! printf '%s' "$pr" | jq -e '(.number | type == "number") and (.user.login | type == "string") and (.head.ref | type == "string") and (.additions | type == "number") and (.deletions | type == "number")' >/dev/null 2>&1; then
     echo "BLOCKED: gh-pr-guard could not read $repo#$sel over REST for the self-approve check." >&2
-    echo "  output: $pr" >&2
+    echo "  stderr: $(head -c 500 "$err")" >&2
+    rm -f "$err"
     return 1
   fi
-  if ! pages=$(gh api --paginate --slurp "repos/$repo/pulls/$sel/files?per_page=100" 2>&1) \
+  # --slurp needs gh 2.41 or later, as the merge path's review read does.
+  if ! pages=$(gh api --paginate --slurp "repos/$repo/pulls/$sel/files?per_page=100" 2>"$err") \
      || ! printf '%s' "$pages" | jq -e 'type == "array" and all(.[]; type == "array")' >/dev/null 2>&1; then
     echo "BLOCKED: gh-pr-guard could not read the files of $repo#$sel over REST for the self-approve check." >&2
+    echo "  stderr: $(head -c 500 "$err")" >&2
+    rm -f "$err"
     return 1
   fi
-  jq -cn --argjson pr "$pr" --argjson pages "$pages" \
-    '{body: ($pr.body // ""), additions: $pr.additions, deletions: $pr.deletions, files: [$pages[][] | .filename], head: $pr.head.ref, author: $pr.user.login}'
+  rm -f "$err"
+  # Both documents reach jq on stdin: the files pages carry every patch, and a
+  # large PR's would exceed the size limit of a single argument.
+  { printf '%s\n' "$pr"; printf '%s\n' "$pages"; } | jq -cs \
+    '.[0] as $pr | .[1] as $pages | {body: ($pr.body // ""), additions: $pr.additions, deletions: $pr.deletions, files: [$pages[][] | .filename], head: $pr.head.ref, author: $pr.user.login}'
 }
 
 # Locate the governing review-policy.yml without trusting the caller's
