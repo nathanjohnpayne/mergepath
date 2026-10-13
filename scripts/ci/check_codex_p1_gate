@@ -29,11 +29,12 @@ RELAY_SOURCE="scripts/workflow/feedback-archive-relay-source.sh"
 TEST="tests/test_codex_p1_gate.sh"
 RELAY_TEST="tests/test_feedback_archive_relay_source.sh"
 WORKFLOW_RUNTIME_TEST="tests/test_codex_p1_workflow_runtime.sh"
+SNAPSHOT_DRIVER="scripts/workflow/codex-p1-snapshot-retry.py"
 
 FAILED=0
 
 # Existence + executability checks.
-for rel in "$SCRIPT" "$RELAY_SOURCE" "$TEST" "$RELAY_TEST" "$WORKFLOW_RUNTIME_TEST"; do
+for rel in "$SCRIPT" "$RELAY_SOURCE" "$TEST" "$RELAY_TEST" "$WORKFLOW_RUNTIME_TEST" "$SNAPSHOT_DRIVER"; do
   if [ ! -f "$rel" ]; then
     echo "FAIL: Missing required file: $rel"
     FAILED=1
@@ -263,7 +264,7 @@ if gate.is_a?(Hash)
   end
 
   gate_run = steps.map { |step| step["run"] }.compact.find do |run|
-    run.include?("CODEX_P1_EXPECTED_HEAD_SHA") && run.include?("scripts/codex-p1-gate.sh")
+    run.include?('echo "ready=true" >> "$GITHUB_OUTPUT"')
   end
   require_shape.call(!gate_run.nil?, "codex-p1-gate has no gate publisher step")
   if gate_run
@@ -278,29 +279,6 @@ if gate.is_a?(Hash)
         gate_run.include?("::warning::"),
       "codex-p1-gate does not fail closed when an installed fingerprint helper is missing"
     )
-    before = gate_run.index("feedback_fp_before=")
-    evaluate = gate_run.index("scripts/codex-p1-gate.sh")
-    after = gate_run.index("feedback_fp_after=")
-    compare = gate_run.index('if [ "$feedback_fp_after" != "$feedback_fp_before" ]')
-    reject = compare && gate_run.index("rc=2", compare)
-    require_shape.call(
-      [before, evaluate, after, compare, reject].all? && before < evaluate && evaluate < after && after < compare && compare < reject,
-      "codex-p1-gate does not fingerprint before evaluation and reject drift before publication"
-    )
-    # #1091: printing the raw evaluation output BEFORE the drift comparison
-    # appends its refusal sentence means a stale-surface refusal (rc=2 set by
-    # THIS step, not by codex-p1-gate.sh) logs only the generic "exited 2
-    # (config/usage error)" line -- the actual explanation lands solely in
-    # $RUNNER_TEMP/codex-p1-summary.txt, sending a debugger on a log dig for a
-    # benign fresh-PR race. Require the echo strictly after the drift
-    # rejection this fixed, not merely after `compare` -- an echo placed
-    # between `compare` and `reject` would still miss an append that happens
-    # only inside the `rc=2` branch.
-    echo_output = gate_run.index('echo "$output"')
-    require_shape.call(
-      echo_output && reject && echo_output > reject,
-      "codex-p1-gate echoes the evaluated output before the fingerprint drift rejection can append its refusal reason"
-    )
   end
   close_index = steps.index do |step|
     run = step["run"].to_s
@@ -313,30 +291,19 @@ if gate.is_a?(Hash)
     "codex-p1-gate does not close its own check lease after evaluation"
   )
 
-  # The evaluation step's fingerprint pair fences the gate script, not the
-  # publication. A PR-level finding that lands after that pair and before the
-  # closing PATCH moves no SHA, so the head re-read in the closing step cannot
-  # see it and success is published over it. Require the closing step to carry
-  # the evaluated surface and re-read it against the live one before it writes.
   close_step = close_index ? steps.fetch(close_index) : nil
   close_run = close_step&.fetch("run", "").to_s
   close_env = close_step&.fetch("env", {}) || {}
-  # Anchor on the invocation, not on the variable: assigning the evaluated
-  # fingerprint to the publish-time variable satisfies every name-based test
-  # while deleting the live re-read this assertion exists to require.
-  close_revalidate = close_run.index("feedback_fp_publish=$(scripts/review-feedback-surface-fingerprint.sh")
-  close_publish = close_run.index('-X PATCH "repos/$REPO/check-runs/$CHECK_ID"')
-  close_reject = close_revalidate && close_run.index("conclusion=failure", close_revalidate)
   require_shape.call(
-    gate_run.to_s.include?('echo "fingerprint_available=$fingerprint_available" >> "$GITHUB_OUTPUT"') &&
-      gate_run.to_s.include?('echo "feedback_fp=$feedback_fp_after" >> "$GITHUB_OUTPUT"') &&
+    close_env.fetch("GATE_READY", "").to_s.include?("steps.gate.outputs.ready") &&
       close_env.fetch("FINGERPRINT_AVAILABLE", "").to_s.include?("steps.gate.outputs.fingerprint_available") &&
-      close_env.fetch("FEEDBACK_FP", "").to_s.include?("steps.gate.outputs.feedback_fp") &&
-      close_run.include?('[ "$feedback_fp_publish" != "$FEEDBACK_FP" ]') &&
-      [close_revalidate, close_publish, close_reject].all? &&
-      close_revalidate < close_publish && close_reject < close_publish,
-    "codex-p1-gate publishes a leased success without re-reading the feedback surface inside the publishing step"
+      close_run.include?('scripts/workflow/codex-p1-snapshot-retry.py') &&
+      close_run.include?('"$PR_NUMBER" "$REPO" "$HEAD_SHA" "$CHECK_ID" "$mode"') &&
+      close_run.include?('exit "$?"') && close_run.include?('"$GATE_READY" = true') &&
+      close_run.include?('"$ARCHIVE_RESULT" != failure') && close_run.include?('"$ARCHIVE_RESULT" != cancelled'),
+    "codex-p1-gate does not bind native completion and its original lease to bounded snapshot recovery"
   )
+
 end
 
 if sweep.is_a?(Hash)
@@ -345,7 +312,7 @@ if sweep.is_a?(Hash)
     "scheduled-sweep must not use Actions concurrency for a required native check"
   )
   sweep_run = Array(sweep["steps"]).map { |step| step["run"] }.compact.find do |run|
-    run.include?("scripts/codex-p1-gate.sh") && run.include?("repos/$REPO/check-runs")
+    run.include?("scripts/workflow/codex-p1-snapshot-retry.py") && run.include?("repos/$REPO/check-runs")
   end
   require_shape.call(!sweep_run.nil?, "scheduled-sweep has no gate publisher step")
   if sweep_run
@@ -392,18 +359,13 @@ if sweep.is_a?(Hash)
         sweep_run.include?(%q{bound_run=$(jq -c '.source_run_id' <<<"$binding")}),
       "scheduled-sweep does not split API-ceiling windows and bound its positively bound target-PR inventory"
     )
-    before = sweep_run.index("feedback_fp_before=")
     lease = sweep_run.index('-f status="in_progress"')
-    evaluate = sweep_run.index("scripts/codex-p1-gate.sh")
-    after = sweep_run.index("feedback_fp_after=")
-    compare = sweep_run.index('if [ "$feedback_fp_after" != "$feedback_fp_before" ]')
-    reject = compare && sweep_run.index("rc=2", compare)
-    close = reject && sweep_run.index('-X PATCH "repos/$REPO/check-runs/$check_id"', reject)
+    evaluate = sweep_run.index('scripts/workflow/codex-p1-snapshot-retry.py', lease || 0)
     require_shape.call(
-      [lease, before, evaluate, after, compare, reject, close].all? &&
-        lease < before && before < evaluate && evaluate < after && after < compare &&
-        compare < reject && reject < close,
-      "scheduled-sweep does not lease, evaluate, reject drift, and close the same check generation"
+      lease && evaluate && lease < evaluate &&
+        sweep_run.include?('"$PR" "$REPO" "$head_sha" "$check_id" fingerprint') &&
+        sweep_run.include?('if [ "$rc" -gt 1 ]; then had_infra_error=1; fi'),
+      "scheduled-sweep does not recover the same original lease with bounded snapshot evaluation"
     )
     pr_read = sweep_run.index('if ! pr_json=$(gh api "repos/$REPO/pulls/$PR"); then')
     head_read = sweep_run.index(%q{if ! head_sha=$(jq -r '.head.sha' <<<"$pr_json")})
@@ -415,40 +377,7 @@ if sweep.is_a?(Hash)
         sweep_run.index("continue", pr_read + 1) < lease,
       "scheduled-sweep can abort later PRs or mutate a check lease after an unreadable or malformed per-PR read"
     )
-    before_read = sweep_run.index("if ! feedback_fp_before=$(scripts/review-feedback-surface-fingerprint.sh")
-    after_read = sweep_run.index("if ! feedback_fp_after=$(scripts/review-feedback-surface-fingerprint.sh")
-    require_shape.call(
-      [lease, before_read, evaluate, after_read, close].all? &&
-        lease < before_read && before_read < evaluate && evaluate < after_read && after_read < close &&
-        sweep_run.include?('Could not read the feedback surface before evaluating PR #$PR; closing this generation as failure.') &&
-        sweep_run.include?('Could not read the feedback surface after evaluating PR #$PR; closing this generation as failure.'),
-      "scheduled-sweep can strand a lease or publish success after a failed feedback-surface read"
-    )
-    # #1091: same reordering as the event-driven gate above, in the scheduled
-    # re-evaluation's own copy of the fence. The pre-fix form echoed the raw
-    # evaluation output before this comparison could append its own refusal
-    # sentence, so a stale-surface rc=2 here logged as an unexplained
-    # "infra/config error" instead.
-    echo_output = sweep_run.index('echo "$output"')
-    require_shape.call(
-      echo_output && reject && close && echo_output > reject && echo_output < close,
-      "scheduled-sweep echoes the evaluated output before the fingerprint drift rejection can append its refusal reason"
-    )
-    republish = sweep_run.index("feedback_fp_publish=$(scripts/review-feedback-surface-fingerprint.sh")
-    # The re-read is only half the requirement. A sweep that reads the live
-    # fingerprint, compares it, and then still PATCHes `success` satisfies
-    # every ordering above while publishing over the finding the re-read
-    # exists to catch. Require the downgrade itself, between the re-read and
-    # the PATCH — the same shape the event-driven and relay assertions carry.
-    # The sweep writes the assignment quoted (`conclusion="failure"`), unlike
-    # the relay's bare form, so match its literal.
-    republish_reject = republish && sweep_run.index('conclusion="failure"', republish)
-    require_shape.call(
-      [republish, republish_reject, close].all? &&
-        after < republish && republish < close && republish_reject < close &&
-        sweep_run.include?('[ "$feedback_fp_publish" != "${feedback_fp_after:-}" ]'),
-      "scheduled-sweep publishes a leased success without re-reading the feedback surface immediately before the PATCH"
-    )
+
   end
 end
 

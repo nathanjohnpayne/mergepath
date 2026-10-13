@@ -8,7 +8,22 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKFLOW="${CODEX_P1_WORKFLOW:-$ROOT/.github/workflows/codex-p1-gate.yml}"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/codex-p1-workflow-runtime.XXXXXX")"
-trap 'rm -rf "$TMP"' EXIT
+cleanup() {
+  if [ -n "${CODEX_P1_RUNTIME_RECEIPTS:-}" ]; then
+    python3 - "$TMP" "$CODEX_P1_RUNTIME_RECEIPTS" <<'PYTHON'
+from pathlib import Path
+import shutil, sys
+source, target = map(Path, sys.argv[1:])
+for path in source.rglob('*'):
+    if path.is_file() and (path.name in ('out', 'github-output', 'native-status') or path.suffix in ('.log', '.count')):
+        dest = target / path.relative_to(source)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, dest)
+PYTHON
+  fi
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
 
 PASS=0
 FAIL=0
@@ -42,18 +57,38 @@ RUBY
 
 EVENT_STEP="$TMP/event-step.sh"
 SWEEP_STEP="$TMP/sweep-step.sh"
-extract_step "codex-p1-gate" "Run scripts/codex-p1-gate.sh" "$EVENT_STEP"
+CLOSE_STEP="$TMP/close-step.sh"
+extract_step "codex-p1-gate" "Prepare Codex feedback snapshot evaluation" "$EVENT_STEP"
+extract_step "codex-p1-gate" "Close the PR-head check lease" "$CLOSE_STEP"
 extract_step "scheduled-sweep" "Re-evaluate gate per PR and post check_run" "$SWEEP_STEP"
 
 make_common_fixture() {
   local dir="$1"
-  mkdir -p "$dir/scripts" "$dir/.github/workflows" "$dir/bin" "$dir/runner"
+  mkdir -p "$dir/scripts/workflow" "$dir/scripts" "$dir/.github/workflows" "$dir/bin" "$dir/runner"
   cat > "$dir/scripts/codex-p1-gate.sh" <<'SH'
 #!/usr/bin/env bash
 printf 'gate %s\n' "$1" >> "$FIXTURE_LOG/gate.log"
 echo "gate clear for PR #$1"
+case "${GATE_MODE:-clear}" in
+  config) exit 2 ;;
+  block) echo 'Required-tier finding or disposition missing'; exit 1 ;;
+  late-block)
+    count=$(cat "$FIXTURE_LOG/fingerprint-$1.count")
+    if [ "$count" -ge 2 ]; then echo 'New required-tier finding or disposition missing'; exit 1; fi ;;
+  newer-generation)
+    printf 'open-newer %s newer-lease-%s\n' "$1" "$1" >> "$FIXTURE_LOG/mutations.log" ;;
+esac
 SH
   chmod +x "$dir/scripts/codex-p1-gate.sh"
+  cp "${CODEX_P1_SNAPSHOT_DRIVER:-$ROOT/scripts/workflow/codex-p1-snapshot-retry.py}" "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
+  cat > "$dir/bin/gh" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"-X PATCH"*) exit 0 ;;
+  *) echo head-41 ;;
+esac
+SH
+  chmod +x "$dir/bin/gh"
 }
 
 run_event() {
@@ -61,9 +96,26 @@ run_event() {
   shift
   (
     cd "$dir"
-    env FIXTURE_LOG="$dir" PR_NUMBER=41 REPO=owner/repo \
-      EXPECTED_HEAD_SHA=head-41 GITHUB_OUTPUT="$dir/github-output" \
-      RUNNER_TEMP="$dir/runner" "$@" bash "$EVENT_STEP"
+    export PATH="$dir/bin:$PATH"
+    export FIXTURE_LOG="$dir" PR_NUMBER=41 REPO=owner/repo
+    export EXPECTED_HEAD_SHA=head-41 HEAD_SHA=head-41 CHECK_ID=lease-41
+    export GITHUB_OUTPUT="$dir/github-output" RUNNER_TEMP="$dir/runner"
+    # Actions uses bash -e for these unspecified Linux shell steps.
+    # Reflect the native job: any failed preparation stays failed even if the
+    # always-run closing step succeeds. Recoverable drift must never do that.
+    : > "$GITHUB_OUTPUT"
+    prep_rc=0
+    env "$@" bash -e "$EVENT_STEP" || prep_rc=$?
+    GATE_READY="$(sed -n 's/^ready=//p' "$GITHUB_OUTPUT")"
+    FINGERPRINT_AVAILABLE="$(sed -n 's/^fingerprint_available=//p' "$GITHUB_OUTPUT")"
+    ARCHIVE_RESULT="${EVENT_ARCHIVE_RESULT:-success}"
+    LEGACY_BOOTSTRAP="$(sed -n 's/^legacy_bootstrap=//p' "$GITHUB_OUTPUT")"
+    export GATE_READY FINGERPRINT_AVAILABLE ARCHIVE_RESULT LEGACY_BOOTSTRAP
+    close_rc=0
+    env "$@" bash -e "$CLOSE_STEP" || close_rc=$?
+    printf 'preparation=%s closing=%s\n' "$prep_rc" "$close_rc" > "$dir/native-status"
+    [ "$prep_rc" -eq 0 ] || exit "$prep_rc"
+    exit "$close_rc"
   ) >"$dir/out" 2>&1
 }
 
@@ -164,10 +216,9 @@ SH
 chmod +x "$dir/scripts/review-feedback-surface-fingerprint.sh"
 if ! run_event "$dir"; then
   fail "installed event helper fences the gate" "workflow step failed"
-elif [ "$(grep -Fc 'fingerprint 41' "$dir/fingerprint.log")" -ne 2 ]; then
+elif [ "$(grep -Fc 'fingerprint 41' "$dir/fingerprint.log")" -ne 3 ]; then
   fail "installed event helper fences the gate" "expected pre/post fingerprint reads"
-elif ! grep -Fxq 'fingerprint_available=true' "$dir/github-output" \
-  || ! grep -Fxq 'feedback_fp=stable-fingerprint' "$dir/github-output"; then
+elif ! grep -Fxq 'fingerprint_available=true' "$dir/github-output"; then
   fail "installed event helper fences the gate" "fingerprint outputs missing"
 else
   pass "installed event helper fences the gate"
@@ -197,7 +248,19 @@ fi
 if [ "${FP_MODE:-stable}" = publish-fail-1 ] && [ "$pr" = 1 ] && [ "$count" -eq 3 ]; then
   exit 1
 fi
-echo "fp-$pr"
+if [ "${FP_MODE:-stable}" = churn ]; then
+  echo "fp-$pr-$count"
+  exit 0
+fi
+if [ "${FP_MODE:-stable}" = publish-change ] && [ "$count" -le 2 ]; then
+  echo "old-$pr"
+  exit 0
+fi
+if [ "${FP_MODE:-stable}" = change-once ] && [ "$count" -eq 1 ]; then
+  echo "old-$pr"
+else
+  echo "fp-$pr"
+fi
 SH
   chmod +x "$dir/scripts/review-feedback-surface-fingerprint.sh"
   cat > "$dir/bin/gh" <<'SH'
@@ -237,6 +300,7 @@ if [ "${2:-}" = -X ] && [ "${3:-}" = PATCH ]; then
     fi
     previous="$arg"
   done
+  if [ "${PATCH_MODE:-ok}" = fail ]; then exit 1; fi
   lease="${endpoint##*/}"
   printf 'close %s %s\n' "$lease" "$conclusion" >> "$FIXTURE_LOG/mutations.log"
   printf '%s\n' "$summary" > "$FIXTURE_LOG/summary-$lease.log"
@@ -331,7 +395,8 @@ run_sweep() {
       REPO=owner/repo CHECK_NAME='Codex P1 unresolved threads' \
       RUNNER_TEMP="$dir/runner" SWEEP_MODE="$sweep_mode" FP_MODE="$fp_mode" \
       RELAY_MODE="${4:-empty}" \
-      bash "$SWEEP_STEP"
+      GATE_MODE="${GATE_MODE:-clear}" PATCH_MODE="${PATCH_MODE:-ok}" \
+      bash -e "$SWEEP_STEP"
   ) >"$dir/out" 2>&1
   local rc=$?
   set -e
@@ -482,6 +547,373 @@ SH
     fail "relay $relay_mode inventory permits gate evaluation" "first PR was not evaluated"
   else
     pass "relay $relay_mode inventory yields its verdict and continues the sweep"
+  fi
+done
+
+# #1825: a bot posts once while the gate evaluates, then the full surface
+# stays clear. The same native execution and lease must recover automatically.
+dir="$TMP/sweep-one-change"
+make_sweep_fixture "$dir"
+rc=$(run_sweep "$dir" stable change-once)
+if [ "$rc" -ne 0 ] || ! grep -Fxq 'close lease-1 success' "$dir/mutations.log"; then
+  fail "one feedback change recovers scheduled native execution and its lease" "native rc=$rc"
+else
+  pass "one feedback change recovers scheduled native execution and its lease"
+fi
+
+dir="$TMP/event-one-change"
+make_sweep_fixture "$dir"
+printf '%s\n' 'run: scripts/review-feedback-surface-fingerprint.sh' > "$dir/.github/workflows/codex-p1-gate.yml"
+if run_event "$dir" PATH="$dir/bin:$PATH" FP_MODE=change-once; then
+  event_rc=0
+else
+  event_rc=$?
+fi
+if [ "$event_rc" -ne 0 ]; then
+  fail "one feedback change keeps native event eligible for automatic recovery" "native evaluation rc=$event_rc"
+else
+  pass "one feedback change keeps native event eligible for automatic recovery"
+fi
+
+# Exercise the real native preparation + closing steps, and the same driver
+# under the complete scheduled loop. No step has continue-on-error semantics.
+for producer in event scheduled; do
+  for scenario in publish-change change-block eval-block churn config archive-failed patch-failed newer-generation; do
+    dir="$TMP/$producer-$scenario"
+    make_sweep_fixture "$dir"
+    fp=stable; gate=clear; archive=success; patch=ok; expected=failure
+    case "$scenario" in
+      publish-change) fp=publish-change; expected=success ;;
+      change-block) fp=publish-change; gate=late-block ;;
+      eval-block) fp=change-once; gate=late-block ;;
+      newer-generation) fp=change-once; gate=newer-generation; expected=success ;;
+      churn) fp=churn ;;
+      config) gate=config ;;
+      archive-failed) archive=failure ;;
+      patch-failed) patch=fail ;;
+    esac
+    if [ "$producer" = event ]; then
+      if run_event "$dir" FP_MODE="$fp" GATE_MODE="$gate" ARCHIVE_RESULT="$archive" PATCH_MODE="$patch"; then rc=0; else rc=$?; fi
+      lease="lease-41"
+    else
+      # Scheduled relay preparation failures are already covered above.
+      [ "$scenario" != archive-failed ] || continue
+      rc=$(GATE_MODE="$gate" PATCH_MODE="$patch" run_sweep "$dir" stable "$fp")
+      lease="lease-1"
+    fi
+    if [ "$scenario" = newer-generation ] && grep -q '^close newer-lease-' "$dir/mutations.log"; then
+      fail "$producer cannot close a competing generation"
+    elif [ "$scenario" = patch-failed ]; then
+      if [ "$rc" -ne 0 ] && ! grep -q '^close ' "$dir/mutations.log" && grep -Fq 'remains pending' "$dir/out"; then
+        pass "$producer exhausted publication reserve stays pending and reports failure"
+      else
+        fail "$producer exhausted publication reserve stays pending and reports failure" "rc=$rc"
+      fi
+    elif ! grep -Fxq "close $lease $expected" "$dir/mutations.log"; then
+      fail "$producer $scenario closes original lease as $expected" "rc=$rc"
+    elif [ "$expected" = success ] && [ "$rc" -ne 0 ]; then
+      fail "$producer recovery also clears its native execution" "rc=$rc"
+    elif [ "$producer" = event ] && [ "$expected" = failure ] && [ "$rc" -eq 0 ]; then
+      fail "$producer blocked lease also fails its native execution"
+    elif [ "$scenario" = churn ] && { ! grep -Fq '3 snapshot attempts exhausted' "$dir/out" || grep -Fq 'config/usage error' "$dir/out"; }; then
+      fail "$producer churn has actionable, distinct budget diagnostics"
+    else
+      pass "$producer $scenario returns native rc=$rc and closes original lease as $expected"
+    fi
+  done
+done
+
+# A trusted old default branch may lack the newly introduced driver; once its
+# own workflow references it, absence/non-executable is an installation error.
+for state in pre-reference installed-missing installed-nonexec; do
+  dir="$TMP/driver-skew-$state"
+  make_sweep_fixture "$dir"
+  if [ "$state" = installed-nonexec ]; then
+    chmod -x "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
+  else
+    rm "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
+  fi
+  if [ "$state" != pre-reference ]; then
+    echo 'run: scripts/workflow/codex-p1-snapshot-retry.py' > "$dir/.github/workflows/codex-p1-gate.yml"
+  fi
+  if run_event "$dir"; then rc=0; else rc=$?; fi
+  if [ "$state" = pre-reference ] && [ "$rc" -eq 0 ] && grep -Fxq 'close lease-41 success' "$dir/mutations.log"; then
+    pass 'first delivery retains fenced native evaluation on pre-reference main'
+  elif [ "$state" != pre-reference ] && [ "$rc" -ne 0 ] && ! [ -e "$dir/gate.log" ]; then
+    pass "$state driver fails before gate evaluation"
+  else
+    fail "$state driver skew control" "rc=$rc"
+  fi
+done
+
+
+# Exercise the unchanged REAL fingerprint over edited/deleted/review/archive
+# bodies and consumed GHAS severity. Only transport + the gate verdict is faked;
+# accounting's real finding/disposition semantics have their own existing suite.
+for surface in inline-edit review-edit deletion-archive severity malformed; do
+  dir="$TMP/real-fingerprint-$surface"
+  make_sweep_fixture "$dir"
+  cp "$ROOT/scripts/review-feedback-surface-fingerprint.sh" "$dir/scripts/"
+  cp -R "$ROOT/scripts/lib" "$dir/scripts/"
+  echo 'code_scanning: {bot_login: "github-advanced-security[bot]"}' > "$dir/.github/review-policy.yml"
+  mv "$dir/bin/gh" "$dir/bin/transport"
+  cat > "$dir/bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+endpoint=""
+for arg in "$@"; do
+  case "$arg" in repos/*) endpoint="$arg" ;; esac
+done
+case "$endpoint" in
+  repos/owner/repo/pulls/41/comments)
+    count_file="$FIXTURE_LOG/fingerprint-41.count"
+    count=0; [ ! -f "$count_file" ] || count=$(cat "$count_file")
+    count=$((count + 1)); echo "$count" > "$count_file"
+    if [ "$REAL_SURFACE" = malformed ] && [ "$count" -gt 1 ]; then echo '{'; exit 0; fi
+    body=before
+    [ "$count" -eq 1 ] || body='P1 edited finding'
+    case "$REAL_SURFACE" in
+      inline-edit) jq -cn --arg body "$body" '[{id:1,user:{login:"coderabbitai[bot]"},body:$body}]' ;;
+      deletion-archive)
+        if [ "$count" -eq 1 ]; then echo '[{"id":1,"user":{"login":"coderabbitai[bot]"},"body":"P1 original"}]'; else echo '[]'; fi ;;
+      severity) echo '[{"id":1,"user":{"login":"github-advanced-security[bot]"},"body":"https://github.com/owner/repo/security/code-scanning/7"}]' ;;
+      *) echo '[]' ;;
+    esac
+    exit 0 ;;
+  repos/owner/repo/pulls/41/reviews)
+    if [ "$REAL_SURFACE" = review-edit ]; then
+      count=$(cat "$FIXTURE_LOG/fingerprint-41.count")
+      jq -cn --arg body "review-$((count > 1))" '[{id:2,user:{login:"chatgpt-codex-connector[bot]"},body:$body}]'
+    else echo '[]'; fi
+    exit 0 ;;
+  repos/owner/repo/issues/41/comments)
+    if [ "$REAL_SURFACE" = deletion-archive ] && [ "$(cat "$FIXTURE_LOG/fingerprint-41.count")" -gt 1 ]; then
+      echo '[{"id":3,"user":{"login":"github-actions[bot]"},"body":"archived original finding"}]'
+    else echo '[]'; fi
+    exit 0 ;;
+  repos/owner/repo/code-scanning/alerts/7)
+    if [ "$(cat "$FIXTURE_LOG/fingerprint-41.count")" -eq 1 ]; then echo low; else echo high; fi
+    exit 0 ;;
+esac
+exec "$FIXTURE_LOG/bin/transport" "$@"
+SH
+  chmod +x "$dir/bin/gh"
+  if run_event "$dir" GH_TOKEN=fixture REAL_SURFACE="$surface" GATE_MODE=late-block; then rc=0; else rc=$?; fi
+  expected_rc=1; [ "$surface" != malformed ] || expected_rc=2
+  if [ "$rc" -eq "$expected_rc" ] && grep -Fxq 'close lease-41 failure' "$dir/mutations.log"; then
+    pass "real fingerprint $surface cannot clear a stale native verdict"
+  else
+    fail "real fingerprint $surface cannot clear a stale native verdict" "rc=$rc: $(tail -3 "$dir/out")"
+  fi
+done
+
+# Shorten only the clock constant in an isolated copy to make the real process-
+# group deadline observable quickly; do not wait three minutes in every CI run.
+dir="$TMP/deadline"
+make_sweep_fixture "$dir"
+sed 's/^SECONDS = 180$/SECONDS = 1/' "$dir/scripts/workflow/codex-p1-snapshot-retry.py" > "$dir/short-driver"
+mv "$dir/short-driver" "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
+chmod +x "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
+cat > "$dir/scripts/codex-p1-gate.sh" <<'SH'
+#!/usr/bin/env bash
+sleep 5
+# If the descendant survived timeout it would leave this evidence later.
+touch "$FIXTURE_LOG/escaped-deadline"
+SH
+if run_event "$dir"; then rc=0; else rc=$?; fi
+if [ "$rc" -eq 3 ] && grep -Fxq 'close lease-41 failure' "$dir/mutations.log" && ! [ -e "$dir/escaped-deadline" ]; then
+  pass 'shared deadline kills evaluation and reserves fail-closed lease closure'
+else
+  fail 'shared deadline kills evaluation and reserves fail-closed lease closure' "rc=$rc"
+fi
+
+# Real transaction ceiling: force more than 200 commands from one evaluator.
+dir="$TMP/api-budget"
+make_sweep_fixture "$dir"
+cat > "$dir/scripts/codex-p1-gate.sh" <<'SH'
+#!/usr/bin/env bash
+set -e
+for ((i=0; i<210; i++)); do gh api repos/owner/repo/pulls/41 --jq .head.sha >/dev/null; done
+SH
+if run_event "$dir"; then rc=0; else rc=$?; fi
+if [ "$rc" -eq 3 ] && grep -Fq '200 GitHub API-command budget reached' "$dir/out" && grep -Fxq 'close lease-41 failure' "$dir/mutations.log"; then
+  pass 'nested transport command budget closes lease without clearing a stale result'
+else
+  fail 'nested transport command budget closes lease without clearing a stale result' "rc=$rc"
+fi
+
+if [ -e "$TMP/deadline/escaped-deadline" ]; then
+  fail 'timed-out evaluator descendants cannot resume after lease failure'
+else
+  pass 'timed-out evaluator descendants cannot resume after lease failure'
+fi
+
+# Exercise launcher failures and timeout/exit races at the actual driver boundary.
+# The wrapper injects process API failures; the checked-in driver and workflow
+# still own verdict classification, retry count, lease choice and native status.
+for producer in event scheduled; do
+  for fault in launch-once launch-always close-race evaluation-race unexpected clear blocked; do
+    dir="$TMP/$producer-publisher-$fault"
+    make_sweep_fixture "$dir"
+    mv "$dir/scripts/workflow/codex-p1-snapshot-retry.py" "$dir/scripts/workflow/driver-under-test.py"
+    printf '%s' "$fault" > "$dir/fault"
+    cat > "$dir/scripts/workflow/codex-p1-snapshot-retry.py" <<'PYTHON'
+#!/usr/bin/env python3
+from pathlib import Path
+import os
+import runpy
+import subprocess
+import tempfile
+
+root = Path(os.environ['FIXTURE_LOG'])
+fault = (root / 'fault').read_text()
+original_popen = subprocess.Popen
+original_killpg = os.killpg
+attempts = 0
+race_pid = 99999999
+
+class ExitedProcess:
+    pid = race_pid
+    returncode = 0
+    calls = 0
+
+    def wait(self, timeout=None):
+        self.calls += 1
+        if self.calls == 1:
+            raise subprocess.TimeoutExpired('publisher', timeout)
+        return 0
+
+    def communicate(self, timeout=None):
+        self.calls += 1
+        if self.calls == 1:
+            raise subprocess.TimeoutExpired('evaluator', timeout)
+        return '', ''
+
+def popen(command, *args, **kwargs):
+    global attempts
+    if '-X' in command and 'PATCH' in command:
+        attempts += 1
+        with (root / 'launch.log').open('a') as log:
+            log.write(f'{attempts} {command[4]}\n')
+        if fault == 'launch-always' or (fault == 'launch-once' and attempts == 1):
+            raise OSError('fixture publisher launch failed')
+        if fault == 'close-race' and attempts == 1:
+            return ExitedProcess()
+    elif fault == 'evaluation-race' and command[0] == 'scripts/codex-p1-gate.sh':
+        return ExitedProcess()
+    return original_popen(command, *args, **kwargs)
+
+def killpg(pid, sig):
+    if pid == race_pid:
+        raise ProcessLookupError('fixture process exited before killpg')
+    return original_killpg(pid, sig)
+
+def unexpected(*args, **kwargs):
+    raise RuntimeError('fixture unexpected setup error')
+
+subprocess.Popen = popen
+os.killpg = killpg
+if fault == 'unexpected':
+    tempfile.TemporaryDirectory = unexpected
+runpy.run_path(str(Path(__file__).with_name('driver-under-test.py')), run_name='__main__')
+PYTHON
+    chmod +x "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
+    gate=clear
+    [ "$fault" != blocked ] || gate=block
+    if [ "$producer" = event ]; then
+      if run_event "$dir" GATE_MODE="$gate"; then rc=0; else rc=$?; fi
+      lease="lease-41"
+      expected_rc=2
+      [ "$fault" != clear ] || expected_rc=0
+      [ "$fault" != blocked ] || expected_rc=1
+      [ "$fault" != evaluation-race ] || expected_rc=3
+      expected_launches=2
+      [ "$fault" != launch-always ] || expected_launches=3
+    else
+      rc=$(GATE_MODE="$gate" run_sweep "$dir" stable stable)
+      lease="lease-1"
+      expected_rc=1
+      case "$fault" in clear|blocked) expected_rc=0 ;; esac
+      expected_launches=4
+      [ "$fault" != launch-always ] || expected_launches=6
+    fi
+    conclusion=failure
+    [ "$fault" != clear ] || conclusion=success
+    if [ "$rc" -ne "$expected_rc" ]; then
+      fail "$producer $fault keeps honest native status" "rc=$rc expected=$expected_rc"
+    elif [ "$fault" = launch-always ] || [ "$fault" = unexpected ]; then
+      if grep -q '^close ' "$dir/mutations.log" 2>/dev/null \
+        || ! grep -Eq 'Could not close check lease|lease closure is unconfirmed' "$dir/out"; then
+        fail "$producer $fault reports unconfirmed closure without a fabricated close"
+      elif [ "$fault" = launch-always ] && [ "$(wc -l < "$dir/launch.log" | tr -d ' ')" -ne "$expected_launches" ]; then
+        fail "$producer $fault spends only the bounded closing reserve"
+      else
+        pass "$producer $fault remains infrastructure failure with honest unclosed lease"
+      fi
+    elif ! grep -Fxq "close $lease $conclusion" "$dir/mutations.log" \
+      || { [ "$fault" != clear ] && grep -q '^close .* success$' "$dir/mutations.log"; }; then
+      fail "$producer $fault publishes only the permitted original-lease conclusion"
+    elif { [ "$fault" = launch-once ] || [ "$fault" = close-race ]; } \
+      && [ "$(wc -l < "$dir/launch.log" | tr -d ' ')" -ne "$expected_launches" ]; then
+      fail "$producer $fault uses one failure-only retry after the failed launch"
+    else
+      pass "$producer $fault preserves native status and original-lease closure"
+    fi
+  done
+done
+
+# First delivery uses the old trusted gate, whose ordinary nonzero verdict
+# must be captured even with the Actions default bash -e invocation.
+for driver_state in missing nonexec; do
+  for verdict in clear block config; do
+    dir="$TMP/bootstrap-$driver_state-$verdict"
+    make_sweep_fixture "$dir"
+    if [ "$driver_state" = missing ]; then
+      rm "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
+    else
+      chmod -x "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
+    fi
+    # Positive trusted-workflow reference absence is the bootstrap authority.
+    echo 'run: scripts/codex-p1-gate.sh' > "$dir/.github/workflows/codex-p1-gate.yml"
+    if run_event "$dir" GATE_MODE="$verdict"; then rc=0; else rc=$?; fi
+    expected_rc=0
+    conclusion=success
+    case "$verdict" in
+      block) expected_rc=1; conclusion=failure ;;
+      config) expected_rc=2; conclusion=failure ;;
+    esac
+    if [ "$rc" -eq "$expected_rc" ] \
+      && grep -Fxq "close lease-41 $conclusion" "$dir/mutations.log" \
+      && grep -Fq 'using the legacy fenced evaluation' "$dir/out"; then
+      pass "Actions shell bootstrap $driver_state $verdict closes its original lease"
+    else
+      fail "Actions shell bootstrap $driver_state $verdict closes its original lease" "rc=$rc expected=$expected_rc"
+    fi
+  done
+done
+
+# Installed scheduled helpers share the workflow revision. Both unavailable
+# driver shapes must reach the existing per-PR failure publisher before eval.
+for driver_state in missing nonexec; do
+  dir="$TMP/scheduled-driver-$driver_state"
+  make_sweep_fixture "$dir"
+  if [ "$driver_state" = missing ]; then
+    rm "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
+  else
+    chmod -x "$dir/scripts/workflow/codex-p1-snapshot-retry.py"
+  fi
+  rc=$(run_sweep "$dir" stable stable)
+  if [ "$rc" -ne 1 ] || [ -e "$dir/gate.log" ] \
+    || ! grep -Fq 'Installed feedback snapshot retry driver is missing or not executable' "$dir/out"; then
+    fail "Actions shell scheduled $driver_state driver reports infrastructure failure" "rc=$rc"
+  elif ! grep -Fxq 'open 1 lease-1' "$dir/mutations.log" \
+    || ! grep -Fxq 'close lease-1 failure' "$dir/mutations.log" \
+    || ! grep -Fxq 'open 2 lease-2' "$dir/mutations.log" \
+    || ! grep -Fxq 'close lease-2 failure' "$dir/mutations.log" \
+    || grep -q '^close .* success$' "$dir/mutations.log"; then
+    fail "Actions shell scheduled $driver_state driver closes each readable original lease"
+  else
+    pass "Actions shell scheduled $driver_state driver fails each original lease and processes later PRs"
   fi
 done
 
