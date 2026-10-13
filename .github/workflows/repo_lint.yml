@@ -68,6 +68,8 @@ jobs:
       deep: ${{ steps.classify.outputs.deep }}
       full: ${{ steps.classify.outputs.full }}
       checks: ${{ steps.classify.outputs.checks }}
+      consumer_replay: ${{ steps.classify.outputs.consumer_replay }}
+      self_tests: ${{ steps.classify.outputs.self_tests }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -80,6 +82,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.head_ref }}
         run: |
           set -euo pipefail
           classifier=scripts/ci/repo-lint-scope.sh
@@ -92,6 +95,8 @@ jobs:
               echo "deep=false" >> "$GITHUB_OUTPUT"
               echo "full=false" >> "$GITHUB_OUTPUT"
               echo "checks=[]" >> "$GITHUB_OUTPUT"
+              echo "consumer_replay=false" >> "$GITHUB_OUTPUT"
+              echo "self_tests=false" >> "$GITHUB_OUTPUT"
             fi
             echo "repo-lint scope: consumer skipped the scripts/ci kit"
             exit 0
@@ -101,12 +106,14 @@ jobs:
           elif git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null \
               && git cat-file -e "$HEAD_SHA^{commit}" 2>/dev/null \
               && changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA"); then
-            printf '%s\n' "$changed" | bash "$classifier" --event "$EVENT_NAME"
+            printf '%s\n' "$changed" | bash "$classifier" --event "$EVENT_NAME" --head-ref "$HEAD_REF"
           else
             {
               echo "deep=true"
               echo "full=true"
               echo "checks=[]"
+              echo "consumer_replay=true"
+              echo "self_tests=true"
             } >> "$GITHUB_OUTPUT"
             echo "repo-lint scope: PR diff unavailable; failing closed to deep CI"
           fi
@@ -831,6 +838,20 @@ jobs:
       - name: check_git_identity_hygiene
         run: ./scripts/ci/check_git_identity_hygiene || { rc=$?; if [ ! -f scripts/ci/check_git_identity_hygiene ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_git_identity_hygiene not in this tree yet; soft-pass (bootstrap skew)"; else exit "$rc"; fi; }
 
+  # Deep lane (#1062, #1655). Three jobs share the `deep-safety (...)` name
+  # prefix the latency audit keys on, and the `lint` aggregator below reads
+  # each job's result explicitly against the scope decision:
+  #   deep_safety          consumer smoke (selected wrappers + structural
+  #                        guards) and the residue lattice — any deep run.
+  #   deep_consumer_replay the complete 68-wrapper consumer-shaped replay,
+  #                        sharded over independent fixture copies so its
+  #                        critical path is one shard, not the whole set —
+  #                        main pushes, the schedule, propagation-lane heads
+  #                        and PRs that change the consumer shape.
+  #   deep_self_tests      the enrolled `--self-test` suites, split into two
+  #                        legs so the critical path is the slowest suite —
+  #                        only when a selected wrapper is enrolled.
+  # Every leg carries the same kit-less setup and #777 hygiene bookends.
   deep_safety:
     name: deep-safety (${{ matrix.safety }})
     needs: scope
@@ -885,52 +906,15 @@ jobs:
             exit 1
           fi
 
-      - name: check_no_token_in_output --self-test
-        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_no_token_in_output'))
-        run: ./scripts/ci/check_no_token_in_output --self-test || { rc=$?; if [ ! -f scripts/ci/check_no_token_in_output ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_no_token_in_output not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
-
-      - name: check_doc_ownership --self-test
-        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_doc_ownership'))
-        run: ./scripts/ci/check_doc_ownership --self-test || { rc=$?; if [ ! -f scripts/ci/check_doc_ownership ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_doc_ownership not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
-
-      - name: check_coderabbit_wait --self-test
-        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_coderabbit_wait'))
-        run: ./scripts/ci/check_coderabbit_wait --self-test || { rc=$?; if [ ! -f scripts/ci/check_coderabbit_wait ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_coderabbit_wait not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
-
-      - name: check_merge_clearance_gate --self-test
-        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_merge_clearance_gate'))
-        run: ./scripts/ci/check_merge_clearance_gate --self-test || { rc=$?; if [ ! -f scripts/ci/check_merge_clearance_gate ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_merge_clearance_gate not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
-
-      - name: check_required_check_publisher --self-test
-        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_required_check_publisher'))
-        run: ./scripts/ci/check_required_check_publisher --self-test || { rc=$?; if [ ! -f scripts/ci/check_required_check_publisher ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_required_check_publisher not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
-
-      - name: check_pr_review_policy_nudge --self-test
-        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_pr_review_policy_nudge'))
-        run: ./scripts/ci/check_pr_review_policy_nudge --self-test || { rc=$?; if [ ! -f scripts/ci/check_pr_review_policy_nudge ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_pr_review_policy_nudge not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
-
-      - name: check_gh_projects_move_item --self-test
-        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_gh_projects_move_item'))
-        run: ./scripts/ci/check_gh_projects_move_item --self-test || { rc=$?; if [ ! -f scripts/ci/check_gh_projects_move_item ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_gh_projects_move_item not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
-
-      - name: check_cockpit --self-test
-        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_cockpit'))
-        run: ./scripts/ci/check_cockpit --self-test || { rc=$?; if [ ! -f scripts/ci/check_cockpit ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_cockpit not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
-
-      - name: check_phase_4b_automation --self-test
-        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_phase_4b_automation'))
-        run: ./scripts/ci/check_phase_4b_automation --self-test || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_automation ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_phase_4b_automation not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
-
-      - name: check_phase_4b_accounting --self-test
-        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_phase_4b_accounting'))
-        run: ./scripts/ci/check_phase_4b_accounting --self-test || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_accounting ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_phase_4b_accounting not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
-
-      - name: check_auto_clear_workflow --self-test
-        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_auto_clear_workflow'))
-        run: ./scripts/ci/check_auto_clear_workflow --self-test || { rc=$?; if [ ! -f scripts/ci/check_auto_clear_workflow ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_auto_clear_workflow not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
-
+      # Consumer SMOKE (#1655): the selected wrappers on the consumer-shaped
+      # fixture plus the harness's structural #979/#1256 guards over every
+      # wired step. REPO_LINT_FULL is pinned false here on purpose — the
+      # complete replay is the sharded deep_consumer_replay job below, so a
+      # full selection must not run it a second time serially on this leg.
       - name: check_repo_lint_consumer_safety
         if: matrix.safety == 'consumer'
+        env:
+          REPO_LINT_FULL: "false"
         run: ./scripts/ci/check_repo_lint_consumer_safety || { rc=$?; if [ ! -f scripts/ci/check_repo_lint_consumer_safety ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_repo_lint_consumer_safety not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_consumer_residue_safety
@@ -940,31 +924,206 @@ jobs:
       - name: check_git_identity_hygiene
         run: ./scripts/ci/check_git_identity_hygiene || { rc=$?; if [ ! -f scripts/ci/check_git_identity_hygiene ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_git_identity_hygiene not in this tree yet; soft-pass (bootstrap skew)"; else exit "$rc"; fi; }
 
+  deep_consumer_replay:
+    name: deep-safety (replay ${{ matrix.shard }}/3)
+    needs: scope
+    if: needs.scope.outputs.deep == 'true' && needs.scope.outputs.consumer_replay == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      REPO_LINT_FULL: "true"
+      REPO_LINT_CHECKS_JSON: "[]"
+      REPO_LINT_SHARD: ${{ matrix.shard }}/3
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: make_ci_scripts_executable
+        run: |
+          if [ -d scripts/ci ]; then
+            find scripts/ci -maxdepth 1 -type f -exec chmod +x {} +
+          fi
+
+      - name: check_git_identity_hygiene --snapshot
+        run: ./scripts/ci/check_git_identity_hygiene --snapshot || { rc=$?; if [ ! -f scripts/ci/check_git_identity_hygiene ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_git_identity_hygiene not in this tree yet; soft-pass (bootstrap skew)"; else exit "$rc"; fi; }
+
+      - name: install_python_ci_dependencies
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/ci-pyenv"
+          "$RUNNER_TEMP/ci-pyenv/bin/pip" install --quiet 'PyYAML==6.0.3' 'markdown-it-py==4.2.0'
+          echo "$RUNNER_TEMP/ci-pyenv/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/ci-pyenv/bin/python3" -c "import yaml, markdown_it"
+
+      - name: install_yq_for_deep_safety
+        run: |
+          if [ -f scripts/lib/ensure-yq.sh ]; then
+            bash scripts/lib/ensure-yq.sh
+          elif command -v yq >/dev/null 2>&1 \
+              && yq --version 2>&1 | grep -q "mikefarah/yq"; then
+            echo "scripts/lib/ensure-yq.sh not synced yet — using preinstalled $(yq --version)"
+          else
+            echo "FAIL: no mikefarah/yq available for deep safety" >&2
+            exit 1
+          fi
+
+      - name: check_repo_lint_consumer_safety
+        run: ./scripts/ci/check_repo_lint_consumer_safety || { rc=$?; if [ ! -f scripts/ci/check_repo_lint_consumer_safety ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_repo_lint_consumer_safety not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_git_identity_hygiene
+        run: ./scripts/ci/check_git_identity_hygiene || { rc=$?; if [ ! -f scripts/ci/check_git_identity_hygiene ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_git_identity_hygiene not in this tree yet; soft-pass (bootstrap skew)"; else exit "$rc"; fi; }
+
+  deep_self_tests:
+    name: deep-safety (${{ matrix.suite }})
+    needs: scope
+    if: needs.scope.outputs.deep == 'true' && needs.scope.outputs.self_tests == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      REPO_LINT_FULL: ${{ needs.scope.outputs.full }}
+      REPO_LINT_CHECKS_JSON: ${{ needs.scope.outputs.checks }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Legs are balanced by measured step time (run 38433656174,
+        # 2026-10-13): phase-4b = automation 6.0m + accounting 1.1m; gates =
+        # CodeRabbit wait 3.5m, token output 1.4m, doc ownership 1.1m,
+        # merge clearance 1.0m, Cockpit 0.6m, nudge/auto-clear/publisher/
+        # projects under 0.5m together. A suite's enrolment here must also be
+        # listed in repo-lint-dependencies.json `self_tests`, which the scope
+        # job uses to decide whether these legs have work.
+        suite: [phase-4b, gates]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: make_ci_scripts_executable
+        run: |
+          if [ -d scripts/ci ]; then
+            find scripts/ci -maxdepth 1 -type f -exec chmod +x {} +
+          fi
+
+      - name: check_git_identity_hygiene --snapshot
+        run: ./scripts/ci/check_git_identity_hygiene --snapshot || { rc=$?; if [ ! -f scripts/ci/check_git_identity_hygiene ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_git_identity_hygiene not in this tree yet; soft-pass (bootstrap skew)"; else exit "$rc"; fi; }
+
+      - name: install_python_ci_dependencies
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/ci-pyenv"
+          "$RUNNER_TEMP/ci-pyenv/bin/pip" install --quiet 'PyYAML==6.0.3' 'markdown-it-py==4.2.0'
+          echo "$RUNNER_TEMP/ci-pyenv/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/ci-pyenv/bin/python3" -c "import yaml, markdown_it"
+
+      - name: install_yq_for_deep_safety
+        run: |
+          if [ -f scripts/lib/ensure-yq.sh ]; then
+            bash scripts/lib/ensure-yq.sh
+          elif command -v yq >/dev/null 2>&1 \
+              && yq --version 2>&1 | grep -q "mikefarah/yq"; then
+            echo "scripts/lib/ensure-yq.sh not synced yet — using preinstalled $(yq --version)"
+          else
+            echo "FAIL: no mikefarah/yq available for deep safety" >&2
+            exit 1
+          fi
+
+      - name: check_phase_4b_automation --self-test
+        if: matrix.suite == 'phase-4b' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_phase_4b_automation'))
+        run: ./scripts/ci/check_phase_4b_automation --self-test || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_automation ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_phase_4b_automation not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_phase_4b_accounting --self-test
+        if: matrix.suite == 'phase-4b' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_phase_4b_accounting'))
+        run: ./scripts/ci/check_phase_4b_accounting --self-test || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_accounting ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_phase_4b_accounting not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_coderabbit_wait --self-test
+        if: matrix.suite == 'gates' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_coderabbit_wait'))
+        run: ./scripts/ci/check_coderabbit_wait --self-test || { rc=$?; if [ ! -f scripts/ci/check_coderabbit_wait ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_coderabbit_wait not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_no_token_in_output --self-test
+        if: matrix.suite == 'gates' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_no_token_in_output'))
+        run: ./scripts/ci/check_no_token_in_output --self-test || { rc=$?; if [ ! -f scripts/ci/check_no_token_in_output ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_no_token_in_output not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_doc_ownership --self-test
+        if: matrix.suite == 'gates' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_doc_ownership'))
+        run: ./scripts/ci/check_doc_ownership --self-test || { rc=$?; if [ ! -f scripts/ci/check_doc_ownership ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_doc_ownership not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_merge_clearance_gate --self-test
+        if: matrix.suite == 'gates' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_merge_clearance_gate'))
+        run: ./scripts/ci/check_merge_clearance_gate --self-test || { rc=$?; if [ ! -f scripts/ci/check_merge_clearance_gate ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_merge_clearance_gate not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_cockpit --self-test
+        if: matrix.suite == 'gates' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_cockpit'))
+        run: ./scripts/ci/check_cockpit --self-test || { rc=$?; if [ ! -f scripts/ci/check_cockpit ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_cockpit not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_required_check_publisher --self-test
+        if: matrix.suite == 'gates' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_required_check_publisher'))
+        run: ./scripts/ci/check_required_check_publisher --self-test || { rc=$?; if [ ! -f scripts/ci/check_required_check_publisher ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_required_check_publisher not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_pr_review_policy_nudge --self-test
+        if: matrix.suite == 'gates' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_pr_review_policy_nudge'))
+        run: ./scripts/ci/check_pr_review_policy_nudge --self-test || { rc=$?; if [ ! -f scripts/ci/check_pr_review_policy_nudge ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_pr_review_policy_nudge not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_gh_projects_move_item --self-test
+        if: matrix.suite == 'gates' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_gh_projects_move_item'))
+        run: ./scripts/ci/check_gh_projects_move_item --self-test || { rc=$?; if [ ! -f scripts/ci/check_gh_projects_move_item ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_gh_projects_move_item not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_auto_clear_workflow --self-test
+        if: matrix.suite == 'gates' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_auto_clear_workflow'))
+        run: ./scripts/ci/check_auto_clear_workflow --self-test || { rc=$?; if [ ! -f scripts/ci/check_auto_clear_workflow ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_auto_clear_workflow not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_git_identity_hygiene
+        run: ./scripts/ci/check_git_identity_hygiene || { rc=$?; if [ ! -f scripts/ci/check_git_identity_hygiene ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_git_identity_hygiene not in this tree yet; soft-pass (bootstrap skew)"; else exit "$rc"; fi; }
+
   lint:
     name: lint
     if: always()
-    needs: [scope, lint_fast, deep_safety]
+    needs: [scope, lint_fast, deep_safety, deep_consumer_replay, deep_self_tests]
     runs-on: ubuntu-latest
     steps:
       - name: publish aggregate lint result
         env:
           DEEP: ${{ needs.scope.outputs.deep }}
+          CONSUMER_REPLAY: ${{ needs.scope.outputs.consumer_replay }}
+          SELF_TESTS: ${{ needs.scope.outputs.self_tests }}
           SCOPE_RESULT: ${{ needs.scope.result }}
           FAST_RESULT: ${{ needs.lint_fast.result }}
           DEEP_RESULT: ${{ needs.deep_safety.result }}
+          REPLAY_RESULT: ${{ needs.deep_consumer_replay.result }}
+          SELF_TESTS_RESULT: ${{ needs.deep_self_tests.result }}
         run: |
           set -euo pipefail
           if [ "$SCOPE_RESULT" != "success" ] || [ "$FAST_RESULT" != "success" ]; then
             echo "FAIL: scope=$SCOPE_RESULT lint-fast=$FAST_RESULT" >&2
             exit 1
           fi
-          if [ "$DEEP" = "true" ]; then
-            if [ "$DEEP_RESULT" != "success" ]; then
-              echo "FAIL: deep CI required; deep-safety=$DEEP_RESULT" >&2
+          # Each deep job is read against the scope decision that selected
+          # it: a selected job must have succeeded (failure, cancellation and
+          # an unexpected skip all fail), and an unselected job must have been
+          # skipped. A skipped job satisfies branch protection on its own, so
+          # this is the only place the lane's completeness is asserted.
+          expect() {  # $1 = job label, $2 = selected (true/false), $3 = result
+            if [ "$2" = "true" ]; then
+              if [ "$3" != "success" ]; then
+                echo "FAIL: deep CI required $1; result=$3" >&2
+                exit 1
+              fi
+            elif [ "$3" != "skipped" ]; then
+              echo "FAIL: $1 was not selected but ran; result=$3" >&2
               exit 1
             fi
-          elif [ "$DEEP_RESULT" != "skipped" ]; then
-            echo "FAIL: fast CI expected deep safety to skip; deep-safety=$DEEP_RESULT" >&2
-            exit 1
+          }
+          if [ "$DEEP" = "true" ]; then
+            expect "deep-safety" true "$DEEP_RESULT"
+            expect "deep-safety replay" "$CONSUMER_REPLAY" "$REPLAY_RESULT"
+            expect "deep-safety self-tests" "$SELF_TESTS" "$SELF_TESTS_RESULT"
+          else
+            expect "deep-safety" false "$DEEP_RESULT"
+            expect "deep-safety replay" false "$REPLAY_RESULT"
+            expect "deep-safety self-tests" false "$SELF_TESTS_RESULT"
           fi
-          echo "lint: PASS (deep=$DEEP, fast=$FAST_RESULT, deep-safety=$DEEP_RESULT)"
+          echo "lint: PASS (deep=$DEEP, fast=$FAST_RESULT, deep-safety=$DEEP_RESULT, replay=$REPLAY_RESULT, self-tests=$SELF_TESTS_RESULT)"

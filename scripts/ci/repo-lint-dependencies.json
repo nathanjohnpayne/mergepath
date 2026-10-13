@@ -6,10 +6,20 @@
     "scripts/ci/repo-lint-dependencies.json",
     "scripts/ci/check_repo_lint_consumer_safety",
     "scripts/ci/check_consumer_residue_safety",
+    "scripts/lib/repo-lint-check-selection.sh",
+    "scripts/sync-to-downstream.sh",
     "tests/test_repo_lint_consumer_safety.sh",
     "tests/test_consumer_residue_safety.sh",
-    "tests/test_repo_lint_optimization.sh",
+    "tests/test_repo_lint_optimization.sh"
+  ],
+  "consumer_replay_triggers": [
     ".mergepath-sync.yml",
+    "scripts/bootstrap/template-mirror.sh",
+    "scripts/ci/check_propagation_closure",
+    "scripts/ci/repo-lint-consumer-verdict.sh",
+    "scripts/lib/ci-check-modes.sh"
+  ],
+  "deep_triggers": [
     ".repo-template.yml",
     "AGENTS.md",
     "REVIEW_POLICY.md",
@@ -19,7 +29,70 @@
     "docs/agents/*",
     "docs/architecture/*"
   ],
+  "self_tests": [
+    "check_auto_clear_workflow",
+    "check_cockpit",
+    "check_coderabbit_wait",
+    "check_doc_ownership",
+    "check_gh_projects_move_item",
+    "check_merge_clearance_gate",
+    "check_no_token_in_output",
+    "check_phase_4b_accounting",
+    "check_phase_4b_automation",
+    "check_pr_review_policy_nudge",
+    "check_required_check_publisher"
+  ],
   "wrappers": {
+    "check_admin_merge_codeowners_blocked": [
+      "tests/test_admin_merge_codeowners_blocked.sh"
+    ],
+    "check_audit_canonical_mirrors": [
+      "tests/test_audit_canonical_mirrors.sh"
+    ],
+    "check_audit_codex_latency": [
+      "tests/test_audit_codex_latency.sh"
+    ],
+    "check_audit_review_latency": [
+      "tests/test_audit_review_latency.sh"
+    ],
+    "check_auto_clear_workflow": [
+      ".github/workflows/agent-review.yml",
+      ".github/workflows/auto-clear-blocking-labels.yml",
+      "scripts/lib/ci-check-modes.sh",
+      "scripts/lib/blocking-labels.sh",
+      "scripts/lib/gh-command-classifier.sh",
+      "scripts/lib/gh-retry-helpers.sh",
+      "scripts/lib/review-policy-scalar.sh",
+      "scripts/workflow/approval-merge-continuation.sh",
+      "scripts/workflow/report-approval-continuation-failures.sh",
+      "tests/test_approval_merge_continuation.sh"
+    ],
+    "check_bootstrap_board_and_summary": [
+      "tests/test_bootstrap_board_and_summary.sh"
+    ],
+    "check_bootstrap_firebase_and_codereview": [
+      "tests/test_bootstrap_firebase_and_codereview.sh"
+    ],
+    "check_bootstrap_github_infra": [
+      "tests/test_bootstrap_github_infra.sh"
+    ],
+    "check_bootstrap_sh": [
+      "tests/test_bootstrap_sh.sh"
+    ],
+    "check_bootstrap_template_mirror": [
+      "tests/test_bootstrap_template_mirror.sh",
+      "scripts/bootstrap/template-mirror.sh"
+    ],
+    "check_bootstrap_wizard": [
+      "tests/test_bootstrap_wizard.sh"
+    ],
+    "check_branch_protection_audit": [
+      "tests/test_audit_branch_protection.sh",
+      "tests/test_audit_branch_protection_workflow.sh",
+      "tests/test_credential_isolation.py",
+      ".github/workflows/branch-protection-audit.yml",
+      "scripts/audit-credential-isolation.py"
+    ],
     "check_cockpit": [
       "scripts/cockpit.sh",
       "scripts/op-preflight.sh",
@@ -54,12 +127,80 @@
       "tests/test_cockpit_live_agents_ui.cjs",
       "specs/cockpit_live_agents.md"
     ],
-    "check_no_token_in_output": [
-      "scripts/ci/token_output_gate.py"
+    "check_coderabbit_config_tests": [
+      "tests/test_check_coderabbit_config.sh"
+    ],
+    "check_coderabbit_record_feedback": [
+      "tests/test_coderabbit_record_feedback.sh"
+    ],
+    "check_coderabbit_severity_gate": [
+      "tests/test_coderabbit_severity_gate.sh"
+    ],
+    "check_coderabbit_wait": [
+      "scripts/lib/ci-check-modes.sh",
+      "scripts/coderabbit-wait.sh",
+      "tests/test_coderabbit_wait_*.sh",
+      "tests/test_coderabbit_automerge_rate_limit_gate.sh"
+    ],
+    "check_codex_p1_gate": [
+      "tests/test_codex_p1_gate.sh",
+      "tests/test_codex_p1_workflow_runtime.sh",
+      "tests/test_feedback_archive_relay_source.sh",
+      ".github/workflows/codex-p1-gate.yml",
+      ".github/workflows/codex-feedback-archive-relay.yml",
+      "scripts/workflow/codex-p1-snapshot-retry.py",
+      "scripts/workflow/feedback-archive-relay-source.sh",
+      "scripts/render-feedback-archive.sh",
+      "scripts/review-feedback-surface-fingerprint.sh",
+      "scripts/lib/feedback-archive-identities.sh"
+    ],
+    "check_codex_scripts": [
+      "scripts/lib/codex-request-evidence.sh",
+      "tests/test_codex_request_evidence.sh",
+      "scripts/codex-review-ledger.sh",
+      "scripts/lib/codex-review-ledger.sh",
+      "tests/test_codex_review_ledger.sh",
+      "tests/test_465_fail_closed.sh",
+      "tests/test_655_repo_lint_local_observed.sh",
+      "tests/test_branch_requirements.sh",
+      "tests/test_codex_record_feedback.sh",
+      "tests/test_codex_review_check_required_checks.sh",
+      "tests/test_codex_review_check_resolution.sh",
+      "tests/test_codex_review_check_verdict.sh",
+      "tests/test_codex_review_request_ack.sh",
+      "tests/test_codex_review_request_entry.sh",
+      "tests/test_codex_review_request_token_fallback.sh",
+      "tests/test_codex_review_request_trigger_only.sh",
+      "tests/test_codex_review_request_verdict.sh",
+      "tests/test_codex_usage_limit_marker.sh",
+      "tests/test_codex_verdict_anchor_resolution.py"
+    ],
+    "check_daily_feedback_rollup": [
+      "tests/test_daily_feedback_rollup.sh"
+    ],
+    "check_disagreement_detector": [
+      "tests/test_disagreement_detector.sh",
+      "scripts/ci/fixtures/disagreement-detector/*",
+      "scripts/disagreement-detector.cjs"
     ],
     "check_doc_ownership": [
       "scripts/lib/ci-check-modes.sh",
       "tests/test_check_doc_ownership.sh"
+    ],
+    "check_eslint_config_policy": [
+      "tests/test_eslint_policy_check.sh"
+    ],
+    "check_export_consumer_facts": [
+      "tests/test_export_consumer_facts.sh"
+    ],
+    "check_external_review_helpers": [
+      "tests/test_external_review_gh_stderr.sh",
+      "tests/test_external_review_rename_protection.sh",
+      "tests/test_load_review_config.sh",
+      "tests/test_resolve_base_policy.sh"
+    ],
+    "check_feedback_policy_helpers": [
+      "tests/test_feedback_policy_helpers.sh"
     ],
     "check_gh_as_author": [
       ".claude/settings.json",
@@ -71,32 +212,24 @@
       "scripts/lib/pr-body-contract.sh",
       "scripts/lib/pr-body-contract.source.mjs",
       "scripts/lib/pr-body-contract.bundle/*",
-      "tests/test_pr_body_contract_parity.sh"
+      "tests/test_pr_body_contract_parity.sh",
+      "tests/test_check_no_bare_gh_writes.sh",
+      "tests/test_gh_as_author.sh",
+      "tests/test_gh_as_reviewer.sh",
+      "tests/test_gh_pr_guard.sh",
+      "tests/test_gh_wrapper_parallel.sh",
+      "tests/test_identity_check_fail_closed.sh",
+      "tests/test_owner_admin_override.py"
     ],
-    "check_auto_clear_workflow": [
-      ".github/workflows/agent-review.yml",
-      ".github/workflows/auto-clear-blocking-labels.yml",
-      "scripts/lib/ci-check-modes.sh",
-      "scripts/lib/blocking-labels.sh",
-      "scripts/lib/gh-command-classifier.sh",
-      "scripts/lib/gh-retry-helpers.sh",
-      "scripts/lib/review-policy-scalar.sh",
-      "scripts/workflow/approval-merge-continuation.sh",
-      "scripts/workflow/report-approval-continuation-failures.sh",
-      "tests/test_approval_merge_continuation.sh"
+    "check_gh_projects_move_item": [
+      "scripts/gh-projects/move-item.sh",
+      "scripts/lib/ci-check-modes.sh"
     ],
-    "check_codex_scripts": [
-      "scripts/lib/codex-request-evidence.sh",
-      "tests/test_codex_request_evidence.sh",
-      "scripts/codex-review-ledger.sh",
-      "scripts/lib/codex-review-ledger.sh",
-      "tests/test_codex_review_ledger.sh"
+    "check_git_identity_hygiene": [
+      "tests/test_git_identity_hygiene.sh"
     ],
-    "check_coderabbit_wait": [
-      "scripts/lib/ci-check-modes.sh",
-      "scripts/coderabbit-wait.sh",
-      "tests/test_coderabbit_wait_*.sh",
-      "tests/test_coderabbit_automerge_rate_limit_gate.sh"
+    "check_lint_tooling": [
+      "tests/test_lint_tooling.sh"
     ],
     "check_merge_clearance_gate": [
       "scripts/lib/ci-check-modes.sh",
@@ -106,11 +239,32 @@
       "tests/test_merge_clearance_gate.sh",
       "tests/test_465_fail_closed.sh"
     ],
-    "check_required_check_publisher": [
-      ".github/workflows/required-check-publisher.yml",
+    "check_merge_group_required_checks": [
+      "tests/test_merge_group_required_checks.sh"
+    ],
+    "check_mktemp_portability": [
+      "tests/test_check_mktemp_portability.sh"
+    ],
+    "check_no_token_in_output": [
+      "scripts/ci/token_output_gate.py"
+    ],
+    "check_op_preflight_contract": [
+      "tests/test_agent_capability_probe.sh",
+      "tests/test_cloud_environment.sh",
+      "tests/test_helper_autosource.sh",
+      "tests/test_local_agent_handback.sh",
+      "tests/test_op_preflight_check.sh",
+      "tests/test_op_preflight_token_mode.sh",
+      "tests/test_preflight_agent_name.sh"
+    ],
+    "check_phase_4b_accounting": [
       "scripts/lib/ci-check-modes.sh",
-      "tests/test_required_check_publisher_dedup.sh",
-      "tests/test_required_check_publisher_summary_hold.sh"
+      "scripts/phase-4b-review.sh",
+      "scripts/phase-4b/*",
+      "scripts/phase-4b/accounting.sh",
+      "scripts/phase-4b/accounting.schema.json",
+      "scripts/phase-4b/prices.json",
+      "tests/test_phase_4b_accounting.sh"
     ],
     "check_phase_4b_automation": [
       "scripts/lib/ci-check-modes.sh",
@@ -123,16 +277,56 @@
       "scripts/lib/codex-failure-markers.sh",
       "scripts/lib/gh-api-array.sh",
       "tests/test_phase_4b_automation.sh",
-      "tests/test_phase_4b_heartbeat.sh"
+      "tests/test_phase_4b_heartbeat.sh",
+      "tests/test_coderabbit_wait_status_probe.sh",
+      "tests/test_phase_4b_immutable_input.sh"
     ],
-    "check_phase_4b_accounting": [
+    "check_phase_4b_classifier": [
+      "scripts/ci/fixtures/phase-4b/*",
+      "scripts/phase-4b-classifier.sh"
+    ],
+    "check_pr_audit_codex_clearance": [
+      "scripts/ci/fixtures/pr-audit-codex-clearance/*"
+    ],
+    "check_pr_review_policy_nudge": [
+      "scripts/pr-review-policy-nudge.sh",
+      "scripts/lib/blocking-labels.sh",
+      "tests/test_pr_review_policy_nudge.sh",
       "scripts/lib/ci-check-modes.sh",
-      "scripts/phase-4b-review.sh",
-      "scripts/phase-4b/*",
-      "scripts/phase-4b/accounting.sh",
-      "scripts/phase-4b/accounting.schema.json",
-      "scripts/phase-4b/prices.json",
-      "tests/test_phase_4b_accounting.sh"
+      ".github/workflows/pr-review-policy.yml",
+      "tests/test_label_gate_live_labels.sh"
+    ],
+    "check_project_doc_sync": [
+      "tests/test_project_doc_sync.sh"
+    ],
+    "check_propagation_lane_audit": [
+      "tests/test_audit_propagation_lane.sh"
+    ],
+    "check_repo_lint_latency_report": [
+      "tests/test_repo_lint_latency_report.sh"
+    ],
+    "check_required_check_publisher": [
+      ".github/workflows/required-check-publisher.yml",
+      "scripts/lib/ci-check-modes.sh",
+      "tests/test_required_check_publisher_dedup.sh",
+      "tests/test_required_check_publisher_summary_hold.sh"
+    ],
+    "check_resolve_pr_threads": [
+      "tests/test_resolve_pr_threads_rationale_tag.sh",
+      "tests/test_resolve_pr_threads_read_failure.sh",
+      "tests/test_resolve_pr_threads_staleness_pagination.sh",
+      "tests/test_resolve_pr_threads_verified_propagation.sh"
+    ],
+    "check_review_feedback_accounting": [
+      "tests/test_feedback_archive_identities.sh",
+      "tests/test_marker_provenance.py",
+      "tests/test_post_phase_4b_handoff.sh",
+      "tests/test_review_feedback_accounting.sh",
+      ".github/workflows/codex-feedback-archive-relay.yml",
+      "scripts/lib/feedback-archive-identities.sh",
+      "scripts/render-feedback-archive.sh",
+      "scripts/review-feedback-surface-fingerprint.sh",
+      "scripts/workflow/verified-relay-markers.py"
     ],
     "check_self_approval_detector": [
       ".github/workflows/agent-review.yml",
@@ -151,17 +345,44 @@
       "tests/test_approval_merge_continuation.sh",
       "tests/test_merge_clearance_gate.sh"
     ],
-    "check_gh_projects_move_item": [
-      "scripts/gh-projects/move-item.sh",
-      "scripts/lib/ci-check-modes.sh"
+    "check_session_finalization": [
+      "tests/test_session_finalization_check.sh",
+      "scripts/session-finalization-check.sh"
     ],
-    "check_pr_review_policy_nudge": [
-      "scripts/pr-review-policy-nudge.sh",
-      "scripts/lib/blocking-labels.sh",
-      "tests/test_pr_review_policy_nudge.sh",
-      "scripts/lib/ci-check-modes.sh",
-      ".github/workflows/pr-review-policy.yml",
-      "tests/test_label_gate_live_labels.sh"
+    "check_sweep_unresolved_feedback": [
+      "tests/test_backfill_unresolved_feedback.sh",
+      "tests/test_sweep_unresolved_feedback.sh",
+      "scripts/sweep-unresolved-feedback/*"
+    ],
+    "check_sync_manifest": [
+      "tests/test_check_sync_manifest.sh",
+      "scripts/lib/template-substitution.sh"
+    ],
+    "check_sync_overrides": [
+      "tests/test_sync_overrides.sh"
+    ],
+    "check_sync_to_downstream": [
+      "tests/test_project_doc_sync.sh",
+      "tests/test_sync_audit_json.sh",
+      "tests/test_sync_to_downstream.sh"
+    ],
+    "check_template_substitution": [
+      "tests/test_template_substitution.sh",
+      "scripts/lib/template-substitution.sh"
+    ],
+    "check_verify_propagation_pr": [
+      "tests/test_match_protected_paths.sh",
+      "tests/test_verify_propagation_pr.sh"
+    ],
+    "check_wave_audit": [
+      "tests/test_wave_audit.sh"
+    ],
+    "check_workflow_parsers": [
+      "tests/test_dependabot_auto_merge_check_wait.sh",
+      "scripts/ci/fixtures/workflow-parsers/*"
+    ],
+    "check_workflow_verify_propagation_templated": [
+      "tests/test_verify_propagation_pr_templated.sh"
     ]
   }
 }
