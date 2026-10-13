@@ -3820,7 +3820,8 @@ def _heredoc_substitution_has_positional(body, _depth=0, _outer_substitution=Fal
                         return True
     if _depth >= _DEFERRED_SHELL_DEPTH:
         return False
-    if _heredoc_invoked_alias_has_positional(lx):
+    if _heredoc_invoked_alias_has_positional(
+            lx, _captured=_source_capture, _literal_depth=_depth):
         return True
     for hd in lx.heredocs:
         if _heredoc_has_positional(hd, set(), _depth + 1):
@@ -3937,7 +3938,7 @@ def _heredoc_builtin_index_operands(seg, _source_lexer=None, _outer_substitution
         if close is None:
             continue
         if declaration:
-            if name[close + 1:close + 2] != "=":
+            if name[close + 1:close + 2] != "=" and name[close + 1:close + 3] != "+=":
                 continue
             operand = name[opening + 1:close]
             # Preserve the existing value-only declaration DATA boundary.
@@ -4102,15 +4103,39 @@ def _heredoc_literal_parameter_word(word, positions):
     """
     if positions is None:
         return word
+    possible_tail = None
+    if isinstance(positions, tuple):
+        positions, possible_tail = positions
 
     def head(match):
         brace, plain = match.groups()
         name = brace or plain
-        if name in ("@", "*") or int(name) in positions:
+        if (name in ("@", "*") or int(name) in positions
+                or (possible_tail is not None and int(name) >= possible_tail)):
             return match.group(0)
         return "${_mergepath_unused" if brace else "$_mergepath_unused"
 
     return re.sub(r"\$(?:\{([1-9][0-9]*|[@*])|([1-9]|[@*]))", head, word)
+
+
+def _heredoc_literal_at_argument(word, _depth):
+    """Expanding @ value in this written argument, through ordinary readers.
+
+    Mask other positional heads only in this private test view. Substitution
+    outputs are scalar source data here, not a claim about an inner argv list.
+    """
+    for _body, start, end in reversed(_find_substitutions(word, include_arithmetic=True)):
+        if word[start:start + 1] == "`" or word.startswith(("$(", "$["), start):
+            word = word[:start] + word[end:]
+
+    def other_head(match):
+        brace, plain = match.groups()
+        if (brace or plain) == "@":
+            return match.group(0)
+        return "${_mergepath_unused" if brace else "$_mergepath_unused"
+
+    projected = re.sub(r"\$(?:\{([1-9][0-9]*|[@*])|([1-9]|[@*]))", other_head, word)
+    return _word_has_verbatim_positional(projected, _depth=_depth)
 
 
 def _heredoc_literal_reaches_output(seg, helpers):
@@ -4264,10 +4289,15 @@ def _heredoc_literal_source_output(lx, body, context, _depth, _seen=frozenset(),
             cmd, _redir = resolve_command(seg)
             if (cmd in definitions and seg._cmd_index is not None
                     and seg._function_binding is None):
-                positions = {i for i, (raw, _literal) in enumerate(
-                    _command_arguments(seg.words, seg._cmd_index + 1), 1)
-                    if _word_has_verbatim_positional(
-                        _heredoc_literal_parameter_word(raw, _positions), _depth=_depth)}
+                arguments = list(_command_arguments(seg.words, seg._cmd_index + 1))
+                positions = {i for i, (raw, _literal) in enumerate(arguments, 1)
+                             if _word_has_verbatim_positional(
+                                 _heredoc_literal_parameter_word(raw, _positions), _depth=_depth)}
+                possible_tail = next((i for i, (raw, _literal) in enumerate(arguments, 1)
+                                      if (_positions is None or _positions)
+                                      and _heredoc_literal_at_argument(raw, _depth)), None)
+                if possible_tail is not None:
+                    positions = (positions, possible_tail)
                 if positions and any(literal_call(seg, program, positions)
                                      for program in definitions[cmd]):
                     return True
@@ -4288,10 +4318,47 @@ def _heredoc_literal_source_output(lx, body, context, _depth, _seen=frozenset(),
 
 def _heredoc_literal_emitter_program(body):
     """Finite literal printf/echo/stdin-emitter data, without execution."""
+    def tee_arguments(args):
+        options = True
+        for raw, literal in args:
+            if not _printf_literal(raw, literal):
+                return False
+            if options and literal == "--":
+                options = False
+            elif options and literal.startswith("-") and literal != "-":
+                if (not re.fullmatch(r"-[aip]+", literal)
+                        and literal not in ("--append", "--ignore-interrupts", "-p",
+                                            "--output-error", "--output-error=warn",
+                                            "--output-error=warn-nopipe",
+                                            "--output-error=exit",
+                                            "--output-error=exit-nopipe")):
+                    return False
+            # Retain a possible stdout copy under the owner's bounded
+            # conservatism; no filesystem success or descriptor state is read.
+        return True
+
     lx = Lexer(body, arithmetic_contexts=True)
     if lx.heredocs or lx.literal_source_process_positions:
         return None
     parts = [seg for line in lx.logical for seg in line.segments if seg.words]
+    if len(parts) == 2:
+        head, relay = parts
+        if (head.pipe_to is not relay or relay.pipe_to is not None
+                or head.parent is not None or relay.parent is not None
+                or lx.herestring_source_positions
+                or any(_REDIR_RE.match(word) for part in parts for word in part.words)):
+            return None
+        head_cmd, _redir = resolve_command(head)
+        relay_cmd, _redir = resolve_command(relay)
+        if (head_cmd not in ("printf", "echo") or relay_cmd != "tee"
+                or relay._cmd_index != 0):
+            return None
+        relay_args = list(_command_arguments(relay.words, relay._cmd_index + 1))
+        if not tee_arguments(relay_args):
+            return None
+        # Decode only this literal head through the same finite inventory.
+        # Actual quoted words retain their data; the relay adds no child hop.
+        return _heredoc_literal_emitter_program(" ".join(head.words))
     if len(parts) != 1:
         return None
     seg = parts[0]
@@ -4309,8 +4376,11 @@ def _heredoc_literal_emitter_program(body):
     args = list(_command_arguments(probe.words, probe._cmd_index + 1))
     if cmd in STDIN_ECHOERS:
         if (len(lx.herestring_source_positions) != 1 or len(inputs or []) != 1
-                or args):
+                or (cmd != "tee" and args)):
             return None
+        if cmd == "tee":
+            if not tee_arguments(args):
+                return None
         return inputs[0]
     if lx.herestring_source_positions or any(_REDIR_RE.match(word) for word in probe.words):
         return None
@@ -4411,7 +4481,8 @@ def _shopt_expand_aliases_delta(seg):
     return True if "s" in flags else None
 
 
-def _heredoc_invoked_alias_has_positional(lx, _literal_output=None, _literal_helpers=frozenset()):
+def _heredoc_invoked_alias_has_positional(lx, _literal_output=None, _literal_helpers=frozenset(),
+                                          _captured=False, _literal_depth=0):
     """Literal emitter replacement source at a later enabled invocation.
 
     Reuse the existing alias emitter catalog, then apply the ordinary
@@ -4425,6 +4496,7 @@ def _heredoc_invoked_alias_has_positional(lx, _literal_output=None, _literal_hel
     programs = {}
     definitions = []
     trailing_wrappers = {}
+    trailing_prefixes = {}
     enabled = False
     enabled_at = None
     for ll in lx.logical:
@@ -4452,6 +4524,7 @@ def _heredoc_invoked_alias_has_positional(lx, _literal_output=None, _literal_hel
                             if (len(parts) == 1 and len(parts[0].words) == 1
                                     and _unquote_command_word(parts[0].words[0]) in ("command", "builtin")):
                                 trailing_wrappers.setdefault(name, ll.first_line)
+                            trailing_prefixes.setdefault(name, (ll.first_line, target))
                 # The catalog already resolves literal alias targets to a
                 # fixed point. Carry positional evidence over those same
                 # edges, retaining every required definition-line boundary.
@@ -4474,25 +4547,44 @@ def _heredoc_invoked_alias_has_positional(lx, _literal_output=None, _literal_hel
                         for program in programs.get(cmd, ()))):
                     return True
             elif enabled and seg._cmd_index is not None:
-                # A trailing blank on a literal command/builtin replacement
-                # makes the next written command word eligible. Walk only
+                # A trailing blank on a literal alias replacement makes
+                # the next written command word eligible. Walk only
                 # actual unquoted/unescaped words, bounded by this argument
                 # list; quoted aliases and safe argument prefixes stay inert.
                 words = list(_command_arguments(seg.words, seg._cmd_index))
                 i = 0
+                prefix = ""
+                new_prefix = False
                 while i < len(words):
                     raw, literal = words[i]
                     if raw != literal:
                         break
                     if (literal in positional
                             and ll.first_line > max(positional[literal], enabled_at)):
-                        if (_literal_output is None or any(_literal_output(seg, program)
-                                for program in programs.get(literal, ()))):
-                            return True
+                        if not new_prefix:
+                            if (_literal_output is None or any(_literal_output(seg, program)
+                                    for program in programs.get(literal, ()))):
+                                return True
+                        else:
+                            for program in programs.get(literal, ()):
+                                combined = prefix + program
+                                if _literal_output is not None:
+                                    hit = _literal_output(seg, combined)
+                                else:
+                                    # Only the newly admitted literal prefix uses
+                                    # private output roles; legacy aliases keep
+                                    # their existing conservative source verdict.
+                                    hit = _heredoc_substitution_has_positional(
+                                        combined, _literal_depth + 1,
+                                        _literal_source_context=(seg, seg, lx, _captured, None))
+                                if hit:
+                                    return True
                         break
-                    if (literal not in trailing_wrappers
-                            or ll.first_line <= max(trailing_wrappers[literal], enabled_at)):
+                    if (literal not in trailing_prefixes
+                            or ll.first_line <= max(trailing_prefixes[literal][0], enabled_at)):
                         break
+                    prefix += trailing_prefixes[literal][1]
+                    new_prefix = new_prefix or literal not in trailing_wrappers
                     i += 1
     return False
 
@@ -11158,6 +11250,89 @@ CORPUS.extend([
     ('helper-hd-routing-nonconsumer-trace-quiet', 'clean', 'die(){ printf safe <<EOF\n$(printf safe <(printf \'%s\\n\' \'set -x; : "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
 ])
 
+
+# Later literal-inventory regressions; genuine fake-sentinel oracle bodies.
+CORPUS.extend([
+    ('helper-hd-tee-relay-pipeline-nontee-consumer', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat /dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-unsupported-builtin-relay', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | builtin tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-bound-invalid-runtime-option', 'clean', 'option=--bogus\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee "$option" .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-tee-relay-pipeline-source-plain', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-.-plain', 'flag', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-echo-plain', 'flag', 'die(){ printf safe <<EOF\n$(source <(echo \'echo "$1" >&2\' | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-printf-percent-s', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\' \'echo "$1" >&2\' | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-nonconsumer', 'clean', 'die(){ printf safe <<EOF\n$(printf safe <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-safeprogram', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'printf safe\' | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-invalidoption', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --bogus .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-help', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --help))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-quotedHD', 'clean', 'die(){ printf safe <<\'EOF\'\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-nullrelay', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy >/dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-inputoverride', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy <<< \'printf safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-runtimeprogram', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' "$program" | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-later-four-alias-env', 'flag', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'env \'\nouter leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-alias-env-tab', 'flag', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'env\t\'\nouter leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-alias-no-trailing-blank', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=env\nouter leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-alias-quoted-next', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'env \'\nouter \'leak\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-alias-escaped-next', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'env \'\nouter \\leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-alias-disabled', 'clean', 'die(){ printf safe <<EOF\n$(shopt -u expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'env \'\nouter leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-alias-uninvoked', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'env \'\n:)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-alias-safe-next', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'env \'\nouter printf safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-alias-multiword-env', 'flag', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'env -- \'\nouter leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-alias-echo-consumes-next', 'flag', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'echo \'\nouter leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-indexed-declare-array-plus', 'flag', 'die(){ printf safe <<EOF\n$(declare -a \'a[1/$1]+=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-indexed-declare-plus', 'flag', 'die(){ printf safe <<EOF\n$(declare \'a[1/$1]+=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-indexed-declare-global-plus', 'flag', 'die(){ printf safe <<EOF\n$(declare -g \'a[1/$1]+=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-indexed-typeset-plus', 'flag', 'die(){ printf safe <<EOF\n$(typeset \'a[1/$1]+=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-indexed-literal-index-quiet', 'clean', 'die(){ printf safe <<EOF\n$(declare -a \'a[1]+=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-indexed-associative-quiet', 'clean', 'die(){ printf safe <<EOF\n$(declare -A \'a[1/$1]+=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-indexed-rhs-data-quiet', 'clean', 'die(){ printf safe <<EOF\n$(declare -a \'a[1]+=$1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-indexed-null-quiet', 'clean', 'die(){ printf safe <<EOF\n$(declare -a \'a[1/$1]+=x\' 2>/dev/null)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-cardinality-at-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$@"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-cardinality-braced-at-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "${@}"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-cardinality-prefix-at-third', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$3" >&2; }; f prefix "$@"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-cardinality-prefix-first-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f safe "$@"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-cardinality-quoted-star-second-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$*"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-cardinality-uninvoked-at-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; : "$@"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-producer-tee-file', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee .tee-fake-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-producer-dot-tee-file', 'flag', 'die(){ printf safe <<EOF\n$(. <(tee .tee-fake-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-producer-tee-append-file', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee -a .tee-fake-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-producer-tee-two-files', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee .tee-fake-copy .tee-fake-copy2 <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-producer-tee-safe-program', 'clean', 'die(){ printf safe <<EOF\n$(source <(tee .tee-fake-copy <<< \'printf safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-producer-tee-nonconsumer', 'clean', 'die(){ printf safe <<EOF\n$(printf safe <(tee .tee-fake-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-producer-tee-fd3-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(tee .tee-fake-copy 3<<< \'echo "$1" >&2\' </dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-neighbor-alias-colon-next-stderr-quiet', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\': \'\nouter leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-neighbor-alias-false-next-stderr-quiet', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'false \'\nouter leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-neighbor-alias-echo-next-stdout-quiet', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1"\'\nalias outer=\'echo \'\nouter leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-neighbor-cardinality-at-out-of-range-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$9" >&2; }; f "$@"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-neighbor-cardinality-suffix-at-last-safe', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$3" >&2; }; f "$@" safe\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-suffix-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$@" safe\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-middle-third', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$3" >&2; }; f x "$@"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-within-word-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f x"$@"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-slice-first-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "${@:1}"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-slice-second-first', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f "${@:2}"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-unquoted-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f $@\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-braced-unquoted-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f ${@}\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-singlequoted-literal', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f \'"\'"\'$@\'"\'"\'\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-escaped-literal', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f \\$@\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-double-escaped-literal', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "\\$@"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-length-scalar', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "${#@}"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-attributes-data', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "${@@a}"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-constant-guard', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "${@:+set}"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-scalar-no-at', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$1"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-stdout-captured', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2"; }; f "$@"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-null-routing', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$@" 2>/dev/null\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-safe-receiver', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$@"\') safe)\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-empty-receiver', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$@"\') \'\')\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-tee-option-_i', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee -i .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-tee-option-_ai', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee -ai .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-tee-file-after-double-dash', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee -- --bogus <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
 CORPUS.extend(_generated_corpus())
 
 # Disagreements with the oracle, DECLARED.  Each entry is a corpus id and the
@@ -11329,6 +11504,8 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    'helper-hd-later-four-neighbor-cardinality-suffix-at-last-safe': 'An expanding $@ word makes its argument position and all later positions possibly populated. The sampled one-value call plus one literal safe suffix leaves $3 empty; the owner explicitly accepts this bounded conservatism instead of inferring argument counts or bindings. Authority: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6147485488',
+    'helper-hd-later-four-neighbor-cardinality-at-out-of-range-quiet': 'An expanding $@ word makes its argument position and all later positions possibly populated. The sampled one-value call leaves $9 empty; the owner explicitly accepts this bounded conservatism instead of inferring argument counts or bindings. Authority: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6147485488',
     'helper-hd-routing-receiver-index-mismatch': 'The sampled source receiver positional-index mismatch is quiet. The published scanner already flags the outer credential argument; its conservative ordinary source reading remains unchanged and does not infer runtime parameter binding (#1496).',
     'helper-hd-routing-override-before-call-quiet': 'The sampled safe redefinition or later emitting definition is quiet. Owner decision https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6138172803 retains every recognized helper body conservatively, without runtime function lookup, definition dominance or branch execution.',
     'helper-hd-routing-later-emitter-definition-quiet': 'The sampled safe redefinition or later emitting definition is quiet. Owner decision https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6138172803 retains every recognized helper body conservatively, without runtime function lookup, definition dominance or branch execution.',
@@ -13102,6 +13279,75 @@ def _heredoc_fd0_binding_cases():
     return failures
 
 
+def _heredoc_later_four_tee_inventory_cases():
+    """Exact literal GNU options; BSD rejection is not a portable leak claim."""
+    failures = []
+    controls = [
+        ('tee-option-__append', True, 'die(){ printf safe <<EOF\n$(source <(tee --append .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-option-__ignore_interrupts', True, 'die(){ printf safe <<EOF\n$(source <(tee --ignore-interrupts .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-option-_p', True, 'die(){ printf safe <<EOF\n$(source <(tee -p .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-option-__output_error', True, 'die(){ printf safe <<EOF\n$(source <(tee --output-error .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-option-__output_error_warn', True, 'die(){ printf safe <<EOF\n$(source <(tee --output-error=warn .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-option-__output_error_warn_nopipe', True, 'die(){ printf safe <<EOF\n$(source <(tee --output-error=warn-nopipe .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-option-__output_error_exit', True, 'die(){ printf safe <<EOF\n$(source <(tee --output-error=exit .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-option-__output_error_exit_nopipe', True, 'die(){ printf safe <<EOF\n$(source <(tee --output-error=exit-nopipe .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-option-__bogus', False, 'die(){ printf safe <<EOF\n$(source <(tee --bogus .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-option-__help', False, 'die(){ printf safe <<EOF\n$(source <(tee --help .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-option-__version', False, 'die(){ printf safe <<EOF\n$(source <(tee --version .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-runtime-option-quiet', False, 'die(){ printf safe <<EOF\n$(source <(tee "$option" .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-known-directory-__output_error_exit', True, 'die(){ printf safe <<EOF\n$(source <(tee --output-error=exit . <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-known-directory-__output_error_exit_nopipe', True, 'die(){ printf safe <<EOF\n$(source <(tee --output-error=exit-nopipe . <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ]
+    controls += [
+        ('tee-bundle-ap', True, 'die(){ printf safe <<EOF\n$(source <(tee -ap .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-bundle-ip', True, 'die(){ printf safe <<EOF\n$(source <(tee -ip .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-bundle-pai', True, 'die(){ printf safe <<EOF\n$(source <(tee -pai .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-bundle-ax', False, 'die(){ printf safe <<EOF\n$(source <(tee -ax .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('tee-bound-invalid-runtime-option', False, 'option=--bogus\ndie(){ printf safe <<EOF\n$(source <(tee "$option" .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ]
+    controls += [
+        ('pipeline-source---output-error=exit', True, 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --output-error=exit .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('pipeline-.---output-error=exit', True, 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --output-error=exit .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('pipeline-directory---output-error=exit', True, 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --output-error=exit .))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('pipeline-source---output-error=exit-nopipe', True, 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --output-error=exit-nopipe .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('pipeline-.---output-error=exit-nopipe', True, 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --output-error=exit-nopipe .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+        ('pipeline-directory---output-error=exit-nopipe', True, 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --output-error=exit-nopipe .))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ]
+    qualified_broader = {
+        "tee-known-directory-__output_error_exit": (
+            "GNU tee exits before copying stdin when the literal directory . "
+            "cannot be opened as an output file. The owner retains the bounded "
+            "literal producer certificate and accepts this quiet flag instead "
+            "of a filesystem-success/binding model. BSD rejects the option."
+            " Owner decision: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6148928148"
+        ),
+        "tee-known-directory-__output_error_exit_nopipe": (
+            "GNU tee exit-nopipe also exits on this literal directory file-open "
+            "error before copying stdin. The owner accepts this quiet flag "
+            "under the same finite inventory; no filesystem model is added. "
+            "BSD rejects the option."
+            " Owner decision: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6148928148"
+        ),
+    }
+    qualified_broader.update({
+        "pipeline-directory---output-error=exit": qualified_broader["tee-known-directory-__output_error_exit"],
+        "pipeline-directory---output-error=exit-nopipe": qualified_broader["tee-known-directory-__output_error_exit_nopipe"],
+    })
+    for name, expected, body in controls:
+        findings, errors = scan_text(PROLOGUE + body, name)
+        if bool(findings) != expected or errors:
+            failures.append("literal tee inventory: " + name)
+        if name in qualified_broader and (not expected or not qualified_broader[name]):
+            failures.append("undeclared GNU tee conservatism: " + name)
+    for producer in (
+        "printf '%s\\n' 'echo \"$1\" >&2'; tee .tee-private-copy",
+        "printf '%s\\n' 'echo \"$1\" >&2' | tee .tee-private-copy | cat",
+    ):
+        if _heredoc_literal_emitter_program(producer) is not None:
+            failures.append("uncertified additional producer/relay edge")
+    return failures
+
+
 def self_test():
     failures = []
     passed = 0
@@ -13124,6 +13370,7 @@ def self_test():
     failures.extend(_heredoc_three_regression_cases())
     failures.extend(_heredoc_fd0_binding_cases())
     failures.extend(_heredoc_later_three_cases())
+    failures.extend(_heredoc_later_four_tee_inventory_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
