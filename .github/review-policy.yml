@@ -575,26 +575,31 @@ codex:
   # acknowledgement retry, a dedup skip, or a head Codex already cleared.
   #
   #   request_min_head_age_seconds  -- the head must be at least this old,
-  #                                    measured from its pushed-at anchor (the
-  #                                    later of the committer date and the
-  #                                    last force-push). 0 disables.
-  #   request_requires_check        -- a check-run by this exact name must be
-  #                                    scheduled on the head (queued counts:
-  #                                    the Actions backlog is not the signal;
-  #                                    a MISSING run is a head GitHub has not
-  #                                    dispatched workflows for yet). `lint-fast`
-  #                                    is the entry job of the propagated
-  #                                    repo_lint.yml workflow, created at
-  #                                    dispatch on every consumer; the deep
-  #                                    `lint` job is created only after
-  #                                    scope, lint-fast and deep-safety
-  #                                    finish, so it would hold the request
-  #                                    for most of the CI run. Empty disables.
+  #                                    measured from the push: the latest of
+  #                                    the committer date, the last
+  #                                    force-push and the push dispatch (the
+  #                                    earliest repo-lint run on the head).
+  #                                    0 disables.
+  #   CI has picked the head up     -- by default, a run of the `repo-lint`
+  #                                    workflow (repo_lint.yml, canonical on
+  #                                    every consumer) exists for the head
+  #                                    SHA, in any status. Keyed on the
+  #                                    workflow RUN, not a job's check-run, so
+  #                                    job renames and sharding (lint-fast
+  #                                    becoming lint-fast (1)..(4)) cannot
+  #                                    break it, and it holds from the moment
+  #                                    GitHub dispatches the push, before any
+  #                                    job exists. A repo with no repo-lint
+  #                                    workflow is warned about and NOT
+  #                                    refused on this signal.
+  #   request_requires_check        -- OVERRIDE, absent by default. A name
+  #                                    makes the signal "a check-run by
+  #                                    exactly this name is scheduled on the
+  #                                    head" instead; "" disables the signal.
   #
   # Both signals fail OPEN on an unreadable input with a distinct log line:
   # this is a cycle-time guard, not a merge gate.
   request_min_head_age_seconds: 300
-  request_requires_check: lint-fast
 
   # GitHub login of the Codex GitHub App bot. Reviews posted by this login
   # satisfy the external-review requirement in `.github/workflows/pr-audit.yml`.

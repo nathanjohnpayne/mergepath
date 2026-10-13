@@ -223,10 +223,12 @@
 #   8   MOVING_HEAD — the head does not look final for a review round
 #       (#2166): it is younger than codex.request_min_head_age_seconds
 #       (measured from the later of the HEAD pushed-at anchor -- committer
-#       date or last force-push -- and the earliest run of the required check
-#       on the head, i.e. the push dispatch), or no check-run named
-#       codex.request_requires_check has been scheduled on it. No trigger is
-#       posted. A Codex request is posted once per BATCH -- every known
+#       date or last force-push -- and the push dispatch, i.e. the earliest
+#       CI run on the head), or CI has not picked the head up yet: no
+#       `repo-lint` workflow run exists for the head SHA (or, with the
+#       codex.request_requires_check override, no check-run by that exact
+#       name). A repo with no repo-lint workflow at all is not refused on
+#       that signal. No trigger is posted. A Codex request is posted once per BATCH -- every known
 #       finding addressed, local tests green, no further push planned --
 #       because a request on a head that is still moving draws findings
 #       against a commit the agent has already replaced, and each such round
@@ -351,7 +353,7 @@ if [ $# -lt 1 ] || [ $# -gt 2 ]; then
   echo "Usage: $0 [--trigger-only] [--allow-moving-head] <PR_NUMBER> [REPO]" >&2
   echo "  --trigger-only       post/confirm the @codex trigger, then exit 0 (no clearance poll)" >&2
   echo "  --allow-moving-head  post even when the head is younger than codex.request_min_head_age_seconds" >&2
-  echo "                       or codex.request_requires_check has not been scheduled on it (warns instead of exit 8)" >&2
+  echo "                       or CI has not picked it up yet (warns instead of exit 8)" >&2
   echo "  PR_NUMBER       pull request number (integer)" >&2
   echo "  REPO            owner/repo (optional; defaults to current repo)" >&2
   exit 3
@@ -664,35 +666,34 @@ fi
 #   codex.request_min_head_age_seconds  the head must be at least this old,
 #                                       measured from the push: the latest of
 #                                       the committer date, the last
-#                                       force-push, and the earliest run of
-#                                       request_requires_check on the head
-#                                       (created at push dispatch, so an
-#                                       ordinary push of an old commit still
-#                                       reads as new). Default 300: the
+#                                       force-push, and the push dispatch
+#                                       (the earliest CI run on the head, so
+#                                       an ordinary push of an old commit
+#                                       still reads as new). Default 300: the
 #                                       measured push-to-next-request p50 was
 #                                       3 minutes, i.e. requests went out on
 #                                       heads the agent was still amending.
 #                                       0 disables the age check.
-#   codex.request_requires_check        a check-run by this exact name must
-#                                       have been scheduled on the head
-#                                       (queued, in progress or completed).
-#                                       Default `lint-fast`: the entry job of
-#                                       the propagated repo_lint.yml workflow
-#                                       that every consumer carries, created
-#                                       the moment GitHub dispatches the
-#                                       workflow for a head. The deep `lint`
-#                                       job is created only after `scope`,
-#                                       `lint-fast` and `deep-safety` finish,
-#                                       so keying on it would hold the request
-#                                       for most of the CI duration -- the
-#                                       opposite of running Codex and CI on
-#                                       the same final head. A missing run
-#                                       means GitHub has not dispatched
-#                                       workflows for this head yet -- the
-#                                       shape of a head pushed seconds ago. A
-#                                       queued run counts: the Actions backlog
-#                                       is not the agent's signal. Empty
-#                                       disables the check.
+#
+#   "CI has picked this head up" -- by default, a run of the `repo-lint`
+#   workflow (repo_lint.yml, manifest-canonical, so on every consumer) exists
+#   for the head SHA, in any status. Keyed on the WORKFLOW RUN, not on a job's
+#   check-run: job names change and shard (`lint-fast` becoming `lint-fast
+#   (1)`..`(4)` would refuse every request under an exact-name match), and a
+#   run exists the moment GitHub dispatches the push, before any job is
+#   created. A queued run counts: the Actions backlog is not the agent's
+#   signal. A missing run is a head GitHub has not dispatched workflows for
+#   yet. A repo with NO repo-lint workflow at all cannot produce the signal,
+#   so it is skipped with a warning rather than refusing forever -- the guard
+#   fails toward requesting, the same asymmetry coderabbit-should-invoke.sh
+#   applies.
+#
+#   codex.request_requires_check        OVERRIDE. Absent (the default): the
+#                                       repo-lint workflow-run signal above.
+#                                       Set to a name: a check-run by exactly
+#                                       that name must have been scheduled on
+#                                       the head instead. Set to "": the
+#                                       signal is disabled.
 #
 # Both are read from the checkout's policy: this guard protects the agent's
 # own cycle time, not a merge decision, so a candidate-controlled value costs
@@ -703,13 +704,18 @@ if ! [[ "$REQUEST_MIN_HEAD_AGE_SECONDS" =~ ^[0-9]+$ ]]; then
   echo "ERROR: codex.request_min_head_age_seconds must be a non-negative integer; got '$REQUEST_MIN_HEAD_AGE_SECONDS'" >&2
   exit 3
 fi
-# A key that is PRESENT with an empty value disables the check; an ABSENT key
-# takes the default. codex_field returns empty for both, so the presence test
-# is made separately.
+# REQUEST_SIGNAL_MODE: workflow (key absent), check (key set to a name) or
+# off (key present and empty). codex_field returns empty for both absent and
+# empty, so the presence test is made separately.
+REQUEST_WORKFLOW_NAME=repo-lint
+REQUEST_WORKFLOW_PATH=.github/workflows/repo_lint.yml
 REQUEST_REQUIRES_CHECK=$(codex_field request_requires_check)
-if [ -z "$REQUEST_REQUIRES_CHECK" ] \
-   && ! { [ -f "$CONFIG" ] && awk '/^codex:/{b=1;next} b&&/^[^[:space:]#]/{b=0} b&&$1=="request_requires_check:"{f=1} END{exit !f}' "$CONFIG"; }; then
-  REQUEST_REQUIRES_CHECK=lint-fast
+if [ -n "$REQUEST_REQUIRES_CHECK" ]; then
+  REQUEST_SIGNAL_MODE=check
+elif [ -f "$CONFIG" ] && awk '/^codex:/{b=1;next} b&&/^[^[:space:]#]/{b=0} b&&$1=="request_requires_check:"{f=1} END{exit !f}' "$CONFIG"; then
+  REQUEST_SIGNAL_MODE=off
+else
+  REQUEST_SIGNAL_MODE=workflow
 fi
 
 POLL_INTERVAL_SECONDS=15
@@ -1652,7 +1658,9 @@ check_blocking_budget() { # <request_count> <max_review_rounds>
 #
 # Two signals, each independently refusing:
 #   head-age       age of the HEAD pushed-at anchor < request_min_head_age_seconds
-#   check-missing  no check-run named request_requires_check on the head
+#   check-missing  CI has not picked the head up: no repo-lint workflow run
+#                  for the head SHA (or, under the request_requires_check
+#                  override, no check-run by that exact name)
 # Refusal is exit 8 with no write. --allow-moving-head, or an automatic caller
 # (MERGEPATH_CODEX_AUTO_TRIGGER, which fires on a provider event rather than
 # on a push the agent is still amending), turns the refusal into a warning.
@@ -1666,43 +1674,89 @@ refuse_moving_head_unless_allowed() {
   esac
   [ "$ALLOW_MOVING_HEAD" = true ] && allow=true
 
-  # The scheduled-check read comes first: it also supplies the push-time
-  # anchor for the age signal below.
+  # The CI-pickup read comes first: it also supplies the push-time anchor for
+  # the age signal below.
   local dispatched_at="" anchor="$HEAD_PUSHED_AT" anchor_source="$ANCHOR_SOURCE" check_reason=""
-  if [ -n "$REQUEST_REQUIRES_CHECK" ]; then
-    # Exact server-side name filter; the client-side select repeats it so a
-    # server that ignores the filter cannot pass a differently named run off
-    # as this one. Any run counts, whatever its status.
-    # -f encodes the name: a configured check name may carry spaces.
-    runs=$(gh api -X GET "repos/$REPO/commits/$HEAD_SHA/check-runs" \
-      -f check_name="$REQUEST_REQUIRES_CHECK" -F per_page=100 2>/dev/null) || runs=""
-    status=$(printf '%s' "$runs" | jq -r --arg n "$REQUEST_REQUIRES_CHECK" '
-      if (type == "object") and ((.check_runs | type) == "array")
-      then ([.check_runs[] | select((.name // "") == $n)] | sort_by(.id) | last | .status // "missing")
-      else "unreadable" end' 2>/dev/null) || status=unreadable
+  local signal_label="" wf
+  case "$REQUEST_SIGNAL_MODE" in
+    workflow)
+      signal_label="$REQUEST_WORKFLOW_NAME"
+      # Every workflow run for the head SHA, paginated (one head collects a
+      # run per triggering event, which can exceed a page), filtered to
+      # repo-lint by name or by its canonical path.
+      runs=$(gh api --paginate -X GET "repos/$REPO/actions/runs" \
+        -f head_sha="$HEAD_SHA" -F per_page=100 2>/dev/null) || runs=""
+      runs=$(printf '%s' "$runs" | jq -c -s --arg n "$REQUEST_WORKFLOW_NAME" --arg p "$REQUEST_WORKFLOW_PATH" '
+        if length > 0 and all(.[]; type == "object" and ((.workflow_runs | type) == "array"))
+        then [ .[].workflow_runs[]
+               | select((.name // "") == $n or ((.path // "") | startswith($p))) ]
+        else "unreadable" end' 2>/dev/null) || runs='"unreadable"'
+      if [ "$runs" = '"unreadable"' ] || [ -z "$runs" ]; then
+        status=unreadable
+      elif [ "$(printf '%s' "$runs" | jq 'length')" -gt 0 ]; then
+        status=$(printf '%s' "$runs" | jq -r 'sort_by(.id) | last | .status // "unknown"')
+        dispatched_at=$(printf '%s' "$runs" | jq -r '
+          [.[] | (.created_at // empty)
+           | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))] | min // ""')
+      else
+        # No repo-lint run on this head. Either CI has not picked it up yet,
+        # or this repo has no repo-lint workflow and never will: tell the two
+        # apart, because the second must not refuse forever.
+        wf=$(gh api --paginate -X GET "repos/$REPO/actions/workflows" -F per_page=100 2>/dev/null) || wf=""
+        status=$(printf '%s' "$wf" | jq -r -s --arg n "$REQUEST_WORKFLOW_NAME" --arg p "$REQUEST_WORKFLOW_PATH" '
+          if length > 0 and all(.[]; type == "object" and ((.workflows | type) == "array"))
+          then (if any(.[].workflows[]; (.name // "") == $n or (.path // "") == $p)
+                then "missing" else "no-workflow" end)
+          else "unreadable" end' 2>/dev/null) || status=unreadable
+      fi
+      ;;
+    check)
+      signal_label="$REQUEST_REQUIRES_CHECK"
+      # Exact server-side name filter; the client-side select repeats it so a
+      # server that ignores the filter cannot pass a differently named run off
+      # as this one. Any run counts, whatever its status. -f encodes the name:
+      # a configured check name may carry spaces.
+      runs=$(gh api -X GET "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+        -f check_name="$REQUEST_REQUIRES_CHECK" -F per_page=100 2>/dev/null) || runs=""
+      status=$(printf '%s' "$runs" | jq -r --arg n "$REQUEST_REQUIRES_CHECK" '
+        if (type == "object") and ((.check_runs | type) == "array")
+        then ([.check_runs[] | select((.name // "") == $n)] | sort_by(.id) | last | .status // "missing")
+        else "unreadable" end' 2>/dev/null) || status=unreadable
+      if [ "$status" != unreadable ] && [ "$status" != missing ]; then
+        dispatched_at=$(printf '%s' "$runs" | jq -r --arg n "$REQUEST_REQUIRES_CHECK" '
+          [.check_runs[] | select((.name // "") == $n) | (.started_at // empty)
+           | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))] | min // ""' 2>/dev/null) || dispatched_at=""
+      fi
+      ;;
+    *) status="" ;;
+  esac
+  if [ "$REQUEST_SIGNAL_MODE" != off ]; then
     [ -n "$status" ] && [ "$status" != null ] || status=unreadable
     MOVING_HEAD_CHECK_STATUS=$status
     case "$status" in
       unreadable)
-        log "moving-head guard: check-runs for $HEAD_SHA unreadable; '$REQUEST_REQUIRES_CHECK'-scheduled signal unavailable, not enforced" ;;
+        log "moving-head guard: CI-pickup signal ('$signal_label') for $HEAD_SHA unreadable; not enforced" ;;
+      no-workflow)
+        log "WARNING: moving-head guard: this repository has no '$REQUEST_WORKFLOW_NAME' workflow ($REQUEST_WORKFLOW_PATH), so the CI-pickup signal cannot be observed; not enforced (set codex.request_requires_check to name another check)" ;;
       missing)
         check_reason="check-missing"
-        log "moving-head guard: no check-run named '$REQUEST_REQUIRES_CHECK' has been scheduled on HEAD $HEAD_SHA (codex.request_requires_check)" ;;
+        if [ "$REQUEST_SIGNAL_MODE" = workflow ]; then
+          log "moving-head guard: no '$REQUEST_WORKFLOW_NAME' workflow run exists for HEAD $HEAD_SHA yet: CI has not picked this head up"
+        else
+          log "moving-head guard: no check-run named '$REQUEST_REQUIRES_CHECK' has been scheduled on HEAD $HEAD_SHA (codex.request_requires_check)"
+        fi ;;
       *)
-        log "moving-head guard: check-run '$REQUEST_REQUIRES_CHECK' is $status on HEAD"
+        log "moving-head guard: '$signal_label' is $status on HEAD"
         # Push-time anchor (Codex P2 on #2175). HEAD_PUSHED_AT is the commit's
         # committer date unless a force-push replaced it, so an ordinary push
         # of a commit created long before reads as an old head the moment it
-        # lands. The EARLIEST run of the required check on this head was
-        # created when GitHub dispatched workflows for the push, which is the
-        # push time this signal means. Use whichever is later. A missing or
-        # unparseable timestamp keeps the commit-based anchor.
-        dispatched_at=$(printf '%s' "$runs" | jq -r --arg n "$REQUEST_REQUIRES_CHECK" '
-          [.check_runs[] | select((.name // "") == $n) | (.started_at // empty)
-           | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))] | min // ""' 2>/dev/null) || dispatched_at=""
+        # lands. The EARLIEST run of the signal on this head was created when
+        # GitHub dispatched the push, which is the push time this signal
+        # means. Use whichever is later. A missing or unparseable timestamp
+        # keeps the commit-based anchor.
         if [ -n "$dispatched_at" ] && [[ "$dispatched_at" > "$anchor" ]]; then
           anchor="$dispatched_at"
-          anchor_source="earliest '$REQUEST_REQUIRES_CHECK' run on HEAD (push dispatch)"
+          anchor_source="earliest '$signal_label' run on HEAD (push dispatch)"
         fi ;;
     esac
   fi
@@ -1743,7 +1797,8 @@ refuse_moving_head_unless_allowed() {
     --argjson age "$MOVING_HEAD_AGE_SECONDS" \
     --argjson min_age "$REQUEST_MIN_HEAD_AGE_SECONDS" \
     --arg pushed_at "$MOVING_HEAD_ANCHOR" \
-    --arg check_name "$REQUEST_REQUIRES_CHECK" \
+    --arg check_name "$signal_label" \
+    --arg check_kind "$REQUEST_SIGNAL_MODE" \
     --arg check_status "$MOVING_HEAD_CHECK_STATUS" '
     {
       pr_number: $pr_number,
@@ -1762,6 +1817,7 @@ refuse_moving_head_unless_allowed() {
         head_pushed_at: $pushed_at,
         age_seconds: $age,
         min_age_seconds: $min_age,
+        check_kind: (if $check_kind == "off" then null else $check_kind end),
         check_name: (if $check_name == "" then null else $check_name end),
         check_status: (if $check_status == "" then null else $check_status end)
       },
