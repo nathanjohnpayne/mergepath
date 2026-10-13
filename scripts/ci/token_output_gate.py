@@ -3746,6 +3746,9 @@ def _heredoc_substitution_has_positional(body, _depth=0, _outer_substitution=Fal
     # only recognized arithmetic operands receive arithmetic quote semantics.
     for ll in lx.logical:
         for seg in ll.segments:
+            for operand in _heredoc_builtin_index_operands(seg):
+                if _word_has_verbatim_positional(operand, in_heredoc=True, _depth=_depth):
+                    return True
             executable = " ".join(seg.words)
             for operand, start, _end in _find_substitutions(executable, include_arithmetic=True):
                 if _heredoc_brace_command_span(executable, start) is not None:
@@ -3770,6 +3773,65 @@ def _heredoc_substitution_has_positional(body, _depth=0, _outer_substitution=Fal
     return False
 
 
+
+
+def _heredoc_builtin_index_operands(seg):
+    """Literal indexed names at finite builtin operand positions, HD only."""
+    cmd, _redir = resolve_command(seg)
+    if cmd not in ("test", "[", "[[", "unset", "read") or seg._cmd_index is None:
+        return []
+    args = [literal for _raw, literal in _command_arguments(seg.words, seg._cmd_index + 1)]
+    names = []
+    if cmd in ("test", "[", "[["):
+        if cmd in ("[", "[[") and args and args[-1] == ("]" if cmd == "[" else "]]"):
+            args = args[:-1]
+        if args[:1] == ["!"]:
+            args = args[1:]
+        if len(args) == 2 and args[0] == "-v":
+            names = args[1:]
+    else:
+        i = 0
+        array_read = False
+        while i < len(args):
+            literal = args[i]
+            if literal == "--":
+                i += 1
+                break
+            if literal is None:
+                return []
+            if not literal.startswith("-") or literal == "-":
+                break
+            if cmd == "unset":
+                if not literal[1:] or any(c not in "fvn" for c in literal[1:]) or "f" in literal[1:]:
+                    return []
+            else:
+                letters = literal[1:]
+                if not letters:
+                    return []
+                for j, letter in enumerate(letters):
+                    if letter not in "ersadinNptu":
+                        return []
+                    if letter in SHORT_OPTION_OPERAND_LETTERS["read"]:
+                        array_read = array_read or letter == "a"
+                        if j + 1 == len(letters):
+                            i += 1
+                            if i >= len(args):
+                                return []
+                        break
+            i += 1
+        if not array_read:
+            names = args[i:]
+    out = []
+    for name in names:
+        if name is None:
+            continue
+        opening = name.find("[")
+        if opening <= 0 or not _IDENT_RE.fullmatch(name[:opening]):
+            continue
+        close = _find_compound_close(name, opening, bracket_span=True)
+        if close == len(name) - 1:
+            out.append(name[opening + 1:close])
+    return out
 
 
 def _heredoc_source_herestrings(seg, source_lexer=None, outer_substitution=False):
@@ -3867,10 +3929,11 @@ def _heredoc_invoked_alias_has_positional(lx):
     positional reader only to literal replacement text. This spends the
     existing child inventory rather than modeling runtime alias bindings.
     """
-    aliases = _alias_emitters(lx, set())
+    aliases = _alias_emitters(lx, set(), _HEREDOC_ALIAS_RE)
     if not aliases:
         return False
     positional = {}
+    definitions = []
     enabled = False
     enabled_at = None
     for ll in lx.logical:
@@ -3885,9 +3948,25 @@ def _heredoc_invoked_alias_has_positional(lx):
                     enabled = False
             elif cmd == "alias":
                 for literal in lits[1:]:
-                    m = _ALIAS_RE.match(literal) if literal is not None else None
-                    if m and m.group(1) in aliases and _word_has_verbatim_positional(m.group(2)):
-                        positional.setdefault(m.group(1), ll.first_line)
+                    m = _HEREDOC_ALIAS_RE.match(literal) if literal is not None else None
+                    if m and m.group(1) in aliases:
+                        definitions.append((ll.first_line, m.group(1), _alias_target_commands(m.group(2))))
+                        if _word_has_verbatim_positional(m.group(2)):
+                            positional.setdefault(m.group(1), ll.first_line)
+                # The catalog already resolves literal alias targets to a
+                # fixed point. Carry positional evidence over those same
+                # edges, retaining every required definition-line boundary.
+                while True:
+                    grew = False
+                    for line, name, heads in definitions:
+                        if name in positional:
+                            continue
+                        required = [max(line, positional[h]) for h in heads if h in positional]
+                        if required:
+                            positional[name] = min(required)
+                            grew = True
+                    if not grew:
+                        break
             elif (enabled and cmd in positional
                   and ll.first_line > max(positional[cmd], enabled_at)):
                 return True
@@ -4323,9 +4402,12 @@ def _segment_sets_xtrace(seg):
 
 
 _ALIAS_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_:.-]*)=(.*)$", re.S)
+# Bash alias names exclude slash, dollar, backtick, equals, shell
+# metacharacters and quoting characters. Ordinary catalog defaults stay above.
+_HEREDOC_ALIAS_RE = re.compile(r"^([^/=$`'\"\\ \t\n|&;()<>]+)=(.*)$", re.S)
 
 
-def _alias_emitters(lx, helpers):
+def _alias_emitters(lx, helpers, alias_pattern=_ALIAS_RE):
     """Alias names that resolve to an emitter, when `expand_aliases` is on.
 
     `shopt -s expand_aliases` + `alias leak=echo` makes `leak "$PAT"` an
@@ -4364,7 +4446,7 @@ def _alias_emitters(lx, helpers):
                     enabled_at = ll.first_line
             elif cmd == "alias":
                 for l in lits[1:]:
-                    m = _ALIAS_RE.match(l)
+                    m = alias_pattern.match(l)
                     if m:
                         defs.append((ll.first_line, m.group(1), m.group(2)))
     if enabled_at is None or not defs:
@@ -10127,6 +10209,52 @@ CORPUS = [
     ),
 ]
 
+CORPUS.extend([
+    ('helper-hd-later-three-test-v', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; test -v \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-bracket-v', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; [[ -v \'a[1/$1]\' ]])\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-unset', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; unset \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-read', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; read -r \'a[1/$1]\' <<<x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-alias-leak+', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak+=\'echo "$1" >&2\'\nleak+\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-alias-leak@', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak@=\'echo "$1" >&2\'\nleak@\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-alias-leak%', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak%=\'echo "$1" >&2\'\nleak%\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-alias-leak,', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak,=\'echo "$1" >&2\'\nleak,\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-alias-chain', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=inner\nalias inner=\'echo "$1" >&2\'\nouter\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-alias-punctuation-disabled', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(shopt -u expand_aliases\nalias leak+=\'echo "$1" >&2\'\nleak+\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-alias-chain-uninvoked', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=inner\nalias inner=\'echo "$1" >&2\'\n: safe\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-test-bracket', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; [ -v \'a[1/$1]\' ])\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-test-negation', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; test ! -v \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-unset-v', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; unset -v \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-unset-double-dash', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; unset -- \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-read-double-dash', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; read -- \'a[1/$1]\' <<<x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-read-delimiter-then-name', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; read -rd x \'a[1/$1]\' <<<safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-chain-long', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=middle\nalias middle=inner\nalias inner=\'echo "$1" >&2\'\nouter\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-chain-reverse', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias inner=\'echo "$1" >&2\'\nalias outer=inner\nouter\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-chain-punctuation', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer+=inner@\nalias inner@=\'echo "$1" >&2\'\nouter+\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-test-string-data', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; test \'a[1/$1]\' = \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-test-v-RHS-data', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(test safe = -v \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-bracket-n-data', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$([[ -n \'a[1/$1]\' ]])\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-unset-function', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(unset -f \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-unset-literal-name', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; unset \'a[1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-test-literal-name', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; test -v \'a[1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-read-literal-name', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; read -r \'a[1]\' <<<x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-read-delimiter-data', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(read -d \'a[1/$1]\' safe <<<x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-read-array-other-name-ignored', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(read -a a \'b[1/$1]\' <<<x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-read-initial-data', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(read -ri \'a[1/$1]\' safe <<<x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-read-invalid-option', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(read -z \'a[1/$1]\' <<<x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-printf-indexed-data', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(printf \'%s\' \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-alias-invalid-slash', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias \'bad/name=echo "$1" >&2\'\nbad/name\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-alias-invalid-space', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias \'bad name=echo "$1" >&2\'\n\'bad name\'\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-chain-disabled', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(shopt -u expand_aliases\nalias outer=inner\nalias inner=\'echo "$1" >&2\'\nouter\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-chain-cycle', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=inner\nalias inner=outer\nouter\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-chain-same-line', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=inner; alias inner=\'echo "$1" >&2\'; outer\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-chain-forward-use', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=inner\nouter\nalias inner=\'echo "$1" >&2\'\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-chain-safe-positional-data', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=inner\nalias inner=\'echo \'\\\'\'$1\'\\\'\' >&2\'\nouter\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-test-v-quoted-hd', 'MUST_NOT_FLAG', 'die(){ printf safe <<\'EOF\'\n$(declare -a a; test -v \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-read-quoted-hd', 'MUST_NOT_FLAG', 'die(){ printf safe <<\'EOF\'\n$(declare -a a; read -r \'a[1/$1]\' <<<x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-punctuation-quoted-hd', 'MUST_NOT_FLAG', 'die(){ printf safe <<\'EOF\'\n$(shopt -s expand_aliases\nalias leak+=\'echo "$1" >&2\'\nleak+\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-chain-quoted-hd', 'MUST_NOT_FLAG', 'die(){ printf safe <<\'EOF\'\n$(shopt -s expand_aliases\nalias outer=inner\nalias inner=\'echo "$1" >&2\'\nouter\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
 # --------------------------------------------------------------------------
 # The GENERATED corpus.
 #
@@ -12207,6 +12335,29 @@ def _heredoc_three_regression_cases():
 
 
 
+def _heredoc_later_three_cases():
+    """Finite builtin roles and existing alias graph retain their boundaries."""
+    failures = []
+    for program in ("declare -a a; test -v 'a[1/$1]'",
+                    "declare -a a; [[ -v 'a[1/$1]' ]]",
+                    "declare -a a; unset 'a[1/$1]'",
+                    "declare -a a; read -r 'a[1/$1]' <<<x"):
+        if not _heredoc_substitution_has_positional(program, _DEFERRED_SHELL_DEPTH):
+            failures.append("builtin diagnostic wrongly spent a child hop: " + program)
+    for name in ("leak+", "leak@", "leak%", "leak,", "1", "!", "{name}"):
+        if _HEREDOC_ALIAS_RE.match(name + "=echo") is None:
+            failures.append("valid literal alias name rejected: " + name)
+    for name in ("bad/name", "bad name", "bad$name", "bad`name", "bad\\name",
+                 "bad'name", 'bad"name', "bad|name", "bad&name", "bad;name",
+                 "bad(name", "bad)name", "bad<name", "bad>name"):
+        if _HEREDOC_ALIAS_RE.match(name + "=echo") is not None:
+            failures.append("invalid literal alias name accepted: " + name)
+    program = "shopt -s expand_aliases\nalias outer=inner\nalias inner='echo \"$1\" >&2'\nouter\n"
+    if _heredoc_substitution_has_positional(program, _DEFERRED_SHELL_DEPTH):
+        failures.append("alias graph bypassed existing child stop")
+    return failures
+
+
 def _heredoc_fd0_binding_cases():
     """Physical IO_NUMBER context never consumes a numeric input as a prefix."""
     failures = []
@@ -12260,6 +12411,7 @@ def self_test():
     failures.extend(_heredoc_for_alias_context_cases())
     failures.extend(_heredoc_three_regression_cases())
     failures.extend(_heredoc_fd0_binding_cases())
+    failures.extend(_heredoc_later_three_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
