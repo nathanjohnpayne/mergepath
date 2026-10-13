@@ -3443,6 +3443,8 @@ def _printf_callback_changes_lookup(seg):
 def discover_emitter_helpers(text):
     """Names with any recognized body writing their positionals VERBATIM."""
     bodies = {}
+    definitions = list(_iter_function_definitions(text))
+    echo_alias_reads = _heredoc_echo_alias_read_facts(text, definitions)
     # NOT `^[ \t]*`.  A function definition is valid at any COMMAND POSITION,
     # not only at the start of a physical line: `true; log(){ echo "$1"; }`
     # defines `log`, and the anchored form never discovered it, so the later
@@ -3451,14 +3453,14 @@ def discover_emitter_helpers(text):
     # the `function`-form check below still sees the head it expects.
     # Textual order cannot establish which definitions executed (#1467).
     # Preserve every body, including definitions after calls or in false branches.
-    for _match, name, body in _iter_function_definitions(text):
+    for _match, name, body in definitions:
         bodies.setdefault(name, []).append(body)
 
     # Lex each body ONCE.  What a body does never changes between rounds; only
     # the `helpers` set a call inside it is graded against does, and that is
     # what the fixed point below iterates.
-    lexed = [(name, body, Lexer(body))
-             for name, definitions in bodies.items() for body in definitions]
+    lexed = [(name, body, Lexer(body), echo_alias_reads.get(match.start(), False))
+             for match, name, body in definitions]
 
     # A local printf or passthrough-prefix definition invalidates the new
     # attached-option builtin exemption even for a non-emitting body.
@@ -3518,7 +3520,7 @@ def discover_emitter_helpers(text):
     # is bounded by the number of functions in the file, so this terminates.
     while True:
         grew = False
-        for name, body_text, lx in lexed:
+        for name, body_text, lx, echo_alias_read in lexed:
             if name in helpers:
                 continue
             emits = False
@@ -3568,7 +3570,9 @@ def discover_emitter_helpers(text):
                     emits = True
             # A nested or direct HD uses the same bounded admission rule.
             if not emits:
-                emits = any(_heredoc_has_positional(hd, helpers) for hd in lx.heredocs)
+                emits = any(_heredoc_has_positional(
+                    hd, helpers, "echo" in bodies, echo_alias_read
+                ) for hd in lx.heredocs)
             if emits:
                 helpers.add(name)
                 grew = True
@@ -3790,7 +3794,76 @@ def _heredoc_error_word_spans(s):
 _POSITIONAL_RE = re.compile(r"\$(?:[1-9][0-9]*|[@*]|\{(?:[1-9][0-9]*|[@*])\})")
 
 
-def _heredoc_has_positional(hd, emitter_helpers):
+def _heredoc_echo_alias_read_facts(text, definitions):
+    """Echo alias identity at recognized helper READ boundaries, not execution.
+
+    Mask only already-recognized function bodies in a private setup view.
+    Their source length/newlines stay exact; uninvoked bodies cannot create
+    file-level alias evidence. Ordinary Lexer output and metadata are untouched.
+    """
+    setup = list(text)
+    for match, _name, body in definitions:
+        begin = match.end()
+        setup[begin:begin + len(body)] = re.sub(r"[^\n]", " ", body)
+    logical = Lexer("".join(setup)).logical
+    enabled = False
+    echo_alias = False
+    before = {}
+    for line in logical:
+        # Aliases expand as the entire logical line is READ, before any of
+        # its declarations run. A same-line definition/enable supplies no fact.
+        before[line.first_line] = enabled and echo_alias
+        for seg in line.segments:
+            if seg.parent is not None:
+                continue  # Child setup does not establish outer alias state.
+            cmd, _redir = resolve_command(seg)
+            if cmd == "shopt":
+                delta = _heredoc_echo_expand_aliases(seg)
+                if delta is not None:
+                    enabled = delta
+            elif cmd == "alias" and seg._cmd_index is not None:
+                for _raw, literal in _command_arguments(seg.words, seg._cmd_index + 1):
+                    assignment = _ALIAS_RE.match(literal) if literal is not None else None
+                    if assignment is not None and assignment.group(1) == "echo":
+                        echo_alias = True  # No target roles or alias expansion.
+    facts = {}
+    for match, _name, _body in definitions:
+        physical = text.count("\n", 0, match.start()) + 1
+        read_line = max((line.first_line for line in logical
+                         if line.first_line <= physical), default=1)
+        facts[match.start()] = before.get(read_line, False)
+    return facts
+
+
+def _heredoc_echo_expand_aliases(seg):
+    """Finite literal shopt prefix facts for the private echo identity proof."""
+    if seg._cmd_index is None:
+        return None
+    arguments = [literal for _raw, literal in
+                 _command_arguments(seg.words, seg._cmd_index + 1)]
+    flags = set()
+    i = 0
+    while i < len(arguments):
+        word = arguments[i]
+        if word is None:
+            return None  # No dynamic flag/name reconstruction.
+        if word == "--":
+            i += 1
+            break
+        if word == "-" or not word.startswith("-"):
+            break
+        if not word[1:] or set(word[1:]) - set("pqsu"):
+            return None  # Invalid/o-mode options do not alter prior proof.
+        flags.update(word[1:])
+        i += 1
+    if (any(word is None for word in arguments[i:])
+            or "expand_aliases" not in arguments[i:]
+            or ("s" in flags) == ("u" in flags)):
+        return None  # Queries and contradictory flags retain prior state.
+    return "s" in flags
+
+
+def _heredoc_has_positional(hd, emitter_helpers, echo_function=False, echo_alias=False):
     """Conservative substitutions; precision only for proven non-emitting DATA.
 
     Main's raw positional predicate deliberately applies inside actual command
@@ -3810,9 +3883,20 @@ def _heredoc_has_positional(hd, emitter_helpers):
     cmd, _redir = resolve_command(hd.owner)
     # SAFE is also the default for unknown external commands; only explicit
     # existing literal builtin facts prove the plain DATA is not emitted.
+    # Echo DATA is harmless only while its literal builtin identity is proved.
+    # Written builtin/command dispatch and paths bypass function lookup; a
+    # quoted/escaped command word bypasses aliases but can still call a function.
+    index = hd.owner._cmd_index
+    echo_identity_unknown = (
+        cmd == "echo" and hd.owner._cmd_literal == "echo" and index is not None
+        and not any(_unquote_command_word(word) in ("builtin", "command")
+                    for word in hd.owner.words[:index])
+        and (echo_function or (echo_alias and hd.owner.words[index] == "echo"))
+    )
     inert = (cmd in EMITTERS | SAFE_COMMANDS | ENV_DUMPERS
              and cmd not in emitter_helpers
-             and hd.owner._function_binding is None)
+             and hd.owner._function_binding is None
+             and not echo_identity_unknown)
     return not inert and _heredoc_data_has_positional(body)
 
 
@@ -12689,6 +12773,18 @@ KNOWN_BROADER.update({cid: (
 ) for cid in ('helper-hd-round9-attributes-ordinary-a', 'helper-hd-round9-attributes-fallback-a')})
 
 
+
+
+# Echo owner identity is separate from substitution conservatism.
+CORPUS += [('helper-hd-echo-owner-owner-enabled-earlier-alias', 'flag', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-function-shadow', 'flag', 'echo(){ cat; }\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-function-shadow-with-argv', 'flag', 'echo(){ cat; }\ndie(){ echo safe <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-bundled-enable-alias', 'flag', 'shopt -qs expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-separate-query-enable-alias', 'flag', 'shopt -q -s expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-alias-before-enable', 'flag', 'alias echo=cat\nshopt -s expand_aliases\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-no-enable', 'clean', 'alias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-late-alias', 'clean', 'shopt -s expand_aliases\ndie(){ echo <<EOF\n$1\nEOF\n}\nalias echo=cat\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-late-enable', 'clean', 'alias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\nshopt -s expand_aliases\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-plain-builtin', 'clean', 'die(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-builtin-dispatch', 'clean', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ builtin echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-command-dispatch', 'clean', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ command echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-escaped-command', 'clean', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ \\echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-absolute-command', 'clean', 'echo(){ cat; }\ndie(){ /bin/echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-safe-alias', 'flag', 'shopt -s expand_aliases\nalias echo=true\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-safe-function', 'flag', 'echo(){ printf safe; }\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-late-function-leak', 'flag', 'die(){ echo <<EOF\n$1\nEOF\n}\necho(){ cat; }\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-after-call-function', 'flag', 'die(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\necho(){ cat; }\n'), ('helper-hd-echo-owner-owner-quiet-noninterpolating-alias', 'clean', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ echo <<\'EOF\'\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-escaped-data-alias', 'clean', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n\\$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-plain-s', 'flag', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-bundle-qs', 'flag', 'shopt -qs expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-bundle-sq', 'flag', 'shopt -sq expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-bundle-ps', 'flag', 'shopt -ps expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-query-only', 'clean', 'shopt -q expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-print-only', 'clean', 'shopt -p expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-unset-only', 'clean', 'shopt -u expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-bundle-qu', 'clean', 'shopt -qu expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-enable-then-disable', 'clean', 'shopt -s expand_aliases\nshopt -u expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-enable-then-bundle-disable', 'clean', 'shopt -s expand_aliases\nshopt -qu expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-enable-then-query', 'flag', 'shopt -s expand_aliases\nshopt -q expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-conflicting-default-off', 'clean', 'shopt -su expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-conflicting-default-on', 'flag', 'shopt -s expand_aliases\nshopt -su expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-invalid-default-off', 'clean', 'shopt -zs expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-invalid-default-on', 'flag', 'shopt -s expand_aliases\nshopt -zu expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-o-mode-default-off', 'clean', 'shopt -os expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-o-mode-default-on', 'flag', 'shopt -s expand_aliases\nshopt -ou expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-post-body-enable', 'clean', 'alias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\nshopt -s expand_aliases\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-post-body-disable', 'flag', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\nshopt -u expand_aliases\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-catalogue-function-keyword', 'flag', 'function echo { cat; }\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-catalogue-function-keyword-next-line', 'flag', 'function echo\n{ cat; }\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-catalogue-header-next-line', 'flag', 'echo()\n{\ncat\n}\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-catalogue-subshell-body', 'flag', 'echo() ( cat; )\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-read-uninvoked-setup', 'clean', 'setup(){ shopt -s expand_aliases; alias echo=cat; }\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-read-captured-setup', 'clean', 'v=$(shopt -s expand_aliases; alias echo=cat)\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-read-same-read-line', 'clean', 'shopt -s expand_aliases; alias echo=cat; die(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-read-continued-read-line', 'clean', 'shopt -s expand_aliases; alias echo=cat; \\\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n')]
+
+KNOWN_BROADER.update({'helper-hd-echo-owner-owner-quiet-safe-alias': 'An active earlier literal alias echo=true makes builtin echo identity unproved. The sampled runtime is quiet; the private proof does not execute alias targets. Owner identity decision: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6157491263', 'helper-hd-echo-owner-owner-quiet-safe-function': 'A recognized literal echo function uses printf safe in the sample and is quiet. The existing function catalogue does not infer function stdin flow, so builtin echo identity is withheld. Owner identity decision: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6157491263', 'helper-hd-echo-owner-owner-quiet-after-call-function': 'The sampled echo(){cat;} is written after the helper call and runtime is quiet. The all-recognized function catalogue cannot prove which definitions executed or runtime lookup order; restricting definitions before the helper would miss late-function-before-call leakage. Owner identity decision: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6157491263'})
+
+
+
+# Literal quoted builtin/command dispatch retains the existing bypass proof.
+CORPUS += [('helper-hd-echo-owner-quiet-quoted-single-builtin', 'clean', 'echo(){ cat; }\ndie(){ \'builtin\' echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-quiet-quoted-double-builtin', 'clean', 'echo(){ cat; }\ndie(){ "builtin" echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-quiet-quoted-single-command', 'clean', 'echo(){ cat; }\ndie(){ \'command\' echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-quiet-quoted-double-command', 'clean', 'echo(){ cat; }\ndie(){ "command" echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n')]
+
 def _corpus_id_cases():
     """Every corpus id is UNIQUE, and every declared id names a real case.
 
@@ -12876,6 +12972,18 @@ def _heredoc_conservatism_cases():
     return failures
 
 
+def _heredoc_echo_owner_cases():
+    """Pin echo identity, existing read boundaries and literal bypass controls."""
+    failures = []
+    for cid, rule, body in CORPUS:
+        if not cid.startswith("helper-hd-echo-owner-"):
+            continue
+        findings, errors = scan_text(PROLOGUE + body, cid)
+        if bool(findings) != (rule == MUST_FLAG) or errors:
+            failures.append("echo heredoc owner identity: " + cid)
+    return failures
+
+
 def self_test():
     failures = []
     passed = 0
@@ -12885,6 +12993,7 @@ def self_test():
     failures.extend(_printf_allowlist_cases())
     failures.extend(_function_definition_cases())
     failures.extend(_heredoc_conservatism_cases())
+    failures.extend(_heredoc_echo_owner_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
