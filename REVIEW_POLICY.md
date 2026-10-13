@@ -1018,7 +1018,7 @@ Measured before this change (2026-10-12, #2112, head `73aa510d`, 1 commit / 10 l
 - **CI-side fan-in in the publisher.** `required-check-publisher.yml` lists `repo-lint` as its second `workflow_run` parent (`specs/required_check_publisher.md` § Trigger model). A `pull_request` lint run completing re-publishes the three Checks-API slots for that head within one publisher pass, for every open PR regardless of label state. None of the three contexts reads `lint` (the clearance gate skips the CI gate to avoid the required-check self-deadlock), so this changes no verdict; it guarantees a fresh, head-pinned verdict is the newest entry the moment the last required context lands. Push-to-main lint runs — the main-SHA confounder a merge floods — are filtered at the expression level and never enter the publish queue. The gate workflow deliberately carries no `workflow_run` of its own, and no job in the gate, the publisher or `auto-clear-blocking-labels.yml` holds a runner waiting for CI; all three are fenced (`check_merge_clearance_gate`, `check_required_check_publisher`, `check_auto_clear_workflow`: no non-`read` `while`/`until`, no `--watch`). `agent-review.yml`'s approval-readiness path has been a one-shot probe since #1066; the 1,200-second shape survives only in `dependabot-auto-merge.yml`, which is outside this change.
 - **Agent-side immediate merge.** Step 18a above and `AGENTS.md` step 10: once the last required check is green the author merge is attempted immediately, with a live session watching required checks at a 60-second cadence and `--match-head-commit` unchanged.
 
-**Sweep cadence after #2167.** Every remaining sweep covers a transition that fires no Actions event, which the lint fan-in does not change, so none is relaxed in this change. The knob and the trade-off are recorded here so the next relaxation is a one-line decision:
+**Sweep cadence after #2167.** Every remaining sweep covers a transition that fires no Actions event, which the lint fan-in does not change, so none is relaxed in this change. The knob, the trade-off and the measured request cost are recorded here so the next relaxation is a one-line decision:
 
 | Sweep | Cadence | Still load-bearing for | Stuck window if relaxed to double the interval |
 |---|---|---|---|
@@ -1026,7 +1026,18 @@ Measured before this change (2026-10-12, #2112, head `73aa510d`, 1 commit / 10 l
 | `codex-p1-gate.yml` and `coderabbit-severity-gate.yml` sweeps | `*/15` | UI "Resolve conversation" on a bot thread (no event) on the native lineage; the publisher's chained pass covers the Checks-API lineage | up to 30 minutes on a UI-resolved thread |
 | `auto-clear-blocking-labels.yml` sweep | `*/5` — `auto_clear_labels.scheduled_sweep_interval_minutes` in `.github/review-policy.yml` is the documentary knob; the cron lives in the workflow | a Codex verdict issue comment (fires no listened workflow), a consumer annex with a custom display name (cannot be enumerated in `workflow_run.workflows`), re-entering the approval continuation | 10–15 minutes added to Phase 4 clearance when no agent session is nudging |
 
-The relaxation that becomes safe once #845 PR 4 lands (publisher-owned cron, gate sweeps deleted) is a single `*/15` cron on the publisher and no gate sweeps at all; until then the gate's cron is the only path that refreshes the Checks-API lineage on the no-event transitions, and halving any of the three gate sweeps buys ~2% of daily run volume (52 of ~2,500 runs) for a doubled stuck window.
+**What a sweep costs.** The budget these sweeps spend is API requests against the repository's Actions installation token (1,000 per hour), not workflow runs, so counting runs understates it. Measured on 2026-10-13 by running the publisher's exact per-PR gate set (`merge-clearance-gate.sh`, `codex-p1-gate.sh`, and `coderabbit-severity-gate.sh` with the summary hold) over the 8 then-open PRs through a read-only counting `gh` shim: 243 `gh` invocations per full pass, about 30 per open PR (147, 63 and 33 by script; 122 of them paginated, so the HTTP request count is at least that). Every sweep tick and every publisher pass walks every open PR, so the cost scales with the open-PR count:
+
+| Source | Passes per hour | Requests per hour at 8 open PRs |
+|---|---|---|
+| Gate `*/15` tick: its own sweep job (clearance script only, about 147) plus the chained publisher full pass (about 243) | 4 | about 1,560 |
+| `codex-p1-gate.yml` `*/15` sweep (about 63) | 4 | about 250 |
+| `coderabbit-severity-gate.yml` `*/15` sweep (about 33) | 4 | about 130 |
+| #2167 lint parent: one full pass per `pull_request` lint completion (about 26 per day) | about 1.1 | about 265 |
+
+The scheduled sweeps alone come to roughly 1,900 requests per hour at 8 open PRs, about twice the installation budget before any event-driven pass, which matches the two exhaustions observed on 2026-10-13 (19:36Z and 21:38Z). The lint parent adds about a quarter of the hourly budget; what justifies it is that it makes the most common post-push transition event-driven, which is what makes relaxing the gate sweep tolerable.
+
+**Recommended relaxation (owner decision, not applied in #2167).** Moving the gate cron from `*/15` to `*/30` saves about 780 requests per hour at 8 open PRs, roughly three times what the lint parent adds; moving the two sibling sweeps to `*/30` saves about 190 more. The cost is the doubled stuck window in the table above, on no-event transitions only: lint completion, review submission, label changes and pushes stay event-driven. Once #845 PR 4 lands (publisher-owned cron, gate sweep jobs deleted), the duplicated per-tick clearance evaluation (about 147 requests) disappears outright.
 
 ### `resolveReviewThread`
 
