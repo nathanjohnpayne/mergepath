@@ -4547,6 +4547,11 @@ rcp_case publish-while-poll \
 rcp_case publish-mid-line-poll \
   's{^(          if ! PASS_START=)}{          true; while [ "\$(date +%s)" -lt 0 ]; do sleep 15; done\n$1}m' \
   fail '[rcp no runner-held wait]'
+# Per-OCCURRENCE classification (Codex P2 on #2171): a poll loop sharing a
+# line with a legitimate read loop must still trip.
+rcp_case publish-mixed-loop-line \
+  's{^(          if ! PASS_START=)}{          while true; do sleep 15; done; while IFS= read -r x; do :; done <<<""\n$1}m' \
+  fail '[rcp no runner-held wait]'
 rcp_case open-watch \
   's{^(          if \[ -z "\$HEAD_SHA" \]; then\n            echo "::error::workflow_run.head_sha is empty)}{          gh pr checks "\$HEAD_SHA" --repo "\$REPO" --watch\n$1}m' \
   fail 'passes `--watch`'
@@ -4568,6 +4573,9 @@ mcg22_case gate-workflow-run \
   fail '[#2167 lint fan-in]'
 mcg22_case gate-while-poll \
   's{^(          output=\$\(scripts/merge-clearance-gate.sh "\$PR_NUMBER" "\$REPO" 2>&1\))}{          while ! gh pr view "\$PR_NUMBER" --json statusCheckRollup | grep -q lint; do sleep 15; done\n$1}m' \
+  fail '[#2167 no runner-held wait]'
+mcg22_case gate-mixed-loop-line \
+  's{^(          output=\$\(scripts/merge-clearance-gate.sh "\$PR_NUMBER" "\$REPO" 2>&1\))}{          while true; do sleep 15; done; while IFS= read -r x; do :; done <<<""\n$1}m' \
   fail '[#2167 no runner-held wait]'
 mcg22_case gate-watch \
   's{^(          output=\$\(scripts/merge-clearance-gate.sh "\$PR_NUMBER" "\$REPO" 2>&1\))}{          gh pr checks "\$PR_NUMBER" --repo "\$REPO" --watch --required\n$1}m' \
@@ -4615,6 +4623,9 @@ if [ -x "$AC_CHECK" ] && [ -f "$AC_WF" ]; then
   }
   ac_case while-poll \
     's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          while ! gh pr view "\$PR" --json statusCheckRollup | grep -q lint; do sleep 15; done\n}m' \
+    fail '[#2167 no runner-held wait]'
+  ac_case mixed-loop-line \
+    's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          while true; do sleep 15; done; while IFS= read -r x; do :; done <<<""\n}m' \
     fail '[#2167 no runner-held wait]'
   ac_case watch \
     's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          gh pr checks "\$PR" --repo "\$REPO" --watch\n}m' \

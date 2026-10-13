@@ -125,8 +125,21 @@ if [ -f "$WORKFLOW" ]; then
   # (#977's parsed-shell substrate is where that closes). The two spellings
   # that have actually shipped in this repo cannot return silently.
   mcg_nowait_text=$(grep -v '^[[:space:]]*#' "$WORKFLOW" | sed 's/[[:space:]]#.*$//')
-  mcg_loop_hits=$(grep -nE '(^[[:space:]]*|;[[:space:]]*|&&[[:space:]]*|\|\|[[:space:]]*|(^|[[:space:]])do[[:space:]]+|(^|[[:space:]])then[[:space:]]+)(while|until)[[:space:]]' <<<"$mcg_nowait_text" \
-    | grep -vE '(while|until)[[:space:]]+(IFS=[^[:space:];]*[[:space:]]+)?read([[:space:]]|$)' || true)
+  # Classified per OCCURRENCE, not per line (Codex P2 on #2171): a line that
+  # carries `while true; do sleep 15; done; while read -r x; ...` must still
+  # trip on its first loop. Each statement-position loop keyword is extracted
+  # with its optional `IFS=` prefix and first command word; only an
+  # occurrence whose command word is `read` is exempt.
+  mcg_poll_loops() {  # <comment-stripped text> -> "<line>: <occurrence>" per non-read loop
+    grep -nE '(^[[:space:]]*|;[[:space:]]*|&&[[:space:]]*|\|\|[[:space:]]*|(^|[[:space:]])do[[:space:]]+|(^|[[:space:]])then[[:space:]]+)(while|until)[[:space:]]' <<<"$1" \
+      | while IFS= read -r hit; do
+          n=${hit%%:*}; body=${hit#*:}
+          grep -oE '(^[[:space:]]*|;[[:space:]]*|&&[[:space:]]*|\|\|[[:space:]]*|(^|[[:space:]])do[[:space:]]+|(^|[[:space:]])then[[:space:]]+)(while|until)[[:space:]]+(IFS=[^[:space:];]*[[:space:]]+)?[^[:space:];]+' <<<"$body" \
+            | grep -vE '(while|until)[[:space:]]+(IFS=[^[:space:];]*[[:space:]]+)?read$' \
+            | sed "s/^[[:space:]]*/$n: /" || true
+        done || true
+  }
+  mcg_loop_hits=$(mcg_poll_loops "$mcg_nowait_text")
   if [ -n "$mcg_loop_hits" ]; then
     echo "FAIL: [#2167 no runner-held wait] $WORKFLOW contains a while/until loop that is not a read loop:"
     printf '%s\n' "$mcg_loop_hits" | sed 's/^/      /' | head -5

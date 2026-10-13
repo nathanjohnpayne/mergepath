@@ -669,8 +669,21 @@ done
 # stated residual (#977's parsed-shell substrate). Same assertion shape as
 # scripts/ci/check_merge_clearance_gate and check_required_check_publisher.
 ac_nowait_text=$(grep -v '^[[:space:]]*#' "$WORKFLOW" | sed 's/[[:space:]]#.*$//')
-ac_loop_hits=$(grep -nE '(^[[:space:]]*|;[[:space:]]*|&&[[:space:]]*|\|\|[[:space:]]*|(^|[[:space:]])do[[:space:]]+|(^|[[:space:]])then[[:space:]]+)(while|until)[[:space:]]' <<<"$ac_nowait_text" \
-  | grep -vE '(while|until)[[:space:]]+(IFS=[^[:space:];]*[[:space:]]+)?read([[:space:]]|$)' || true)
+# Classified per OCCURRENCE, not per line (Codex P2 on #2171): a line that
+# carries `while true; do sleep 15; done; while read -r x; ...` must still
+# trip on its first loop. Each statement-position loop keyword is extracted
+# with its optional `IFS=` prefix and first command word; only an occurrence
+# whose command word is `read` is exempt.
+ac_poll_loops() {  # <comment-stripped text> -> "<line>: <occurrence>" per non-read loop
+  grep -nE '(^[[:space:]]*|;[[:space:]]*|&&[[:space:]]*|\|\|[[:space:]]*|(^|[[:space:]])do[[:space:]]+|(^|[[:space:]])then[[:space:]]+)(while|until)[[:space:]]' <<<"$1" \
+    | while IFS= read -r hit; do
+        n=${hit%%:*}; body=${hit#*:}
+        grep -oE '(^[[:space:]]*|;[[:space:]]*|&&[[:space:]]*|\|\|[[:space:]]*|(^|[[:space:]])do[[:space:]]+|(^|[[:space:]])then[[:space:]]+)(while|until)[[:space:]]+(IFS=[^[:space:];]*[[:space:]]+)?[^[:space:];]+' <<<"$body" \
+          | grep -vE '(while|until)[[:space:]]+(IFS=[^[:space:];]*[[:space:]]+)?read$' \
+          | sed "s/^[[:space:]]*/$n: /" || true
+      done || true
+}
+ac_loop_hits=$(ac_poll_loops "$ac_nowait_text")
 if [ -z "$ac_loop_hits" ] && ! grep -qE -- '--watch([[:space:]]|$)' <<<"$ac_nowait_text"; then
   pass=$((pass + 1))
   echo "  PASS: [#2167 no runner-held wait] no while/until poll loop and no --watch in any run block"
