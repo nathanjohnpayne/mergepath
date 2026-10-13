@@ -1672,7 +1672,7 @@ crw_unfenced_body() {
 # unfenced, unquoted line keeps prose, diff excerpts, and fenced examples from
 # becoming provider state.
 crw_provider_owned_refusal_class() {
-  local body=$1 unfenced first_line narration_lead narration_first_line
+  local body=$1 unfenced heading_body first_line narration_lead narration_first_line
   unfenced=$(crw_unfenced_body "$body") || return 3
   if grep -Fxq "<!-- This is an auto-generated comment: $RATE_LIMIT_MARKER -->" <<<"$unfenced"; then
     printf 'rate_limit\n'
@@ -1686,12 +1686,22 @@ crw_provider_owned_refusal_class() {
     printf 'in_progress\n'
     return 0
   fi
-  case "$unfenced" in
+  # Reuse the supported heading forms after ONE exact leading summary
+  # wrapper. Blank presentation lines are skipped before the two nonempty
+  # heading lines; interior prose/quoted/fenced examples stay review content.
+  heading_body=$unfenced
+  case "$heading_body" in
+    "$SUMMARY_MARKER"$'\n'*)
+      heading_body=${heading_body#*$'\n'}
+      heading_body=$(awk 'NF { print; if (++n == 2) exit }' <<<"$heading_body") || return 3
+      ;;
+  esac
+  case "$heading_body" in
     "> [!WARNING]"$'\n'"> ## Rate limit exceeded"*) printf 'rate_limit\n'; return 0 ;;
     "> [!WARNING]"$'\n'"> ## Review limit reached"*) printf 'rate_limit\n'; return 0 ;;
     "> [!WARNING]"$'\n'"> ## Reviews paused"*) printf 'paused\n'; return 0 ;;
   esac
-  first_line=$(awk 'NF { sub(/[[:space:]]+$/, ""); print; exit }' <<<"$unfenced") || return 3
+  first_line=$(awk 'NF { sub(/[[:space:]]+$/, ""); print; exit }' <<<"$heading_body") || return 3
   first_line=$(printf '%s' "$first_line" | tr '[:upper:]' '[:lower:]') || return 3
   case "$first_line" in
     'rate limit exceeded'|'rate-limit exceeded'|'## rate limit exceeded'|'## rate-limit exceeded'|'review limit reached'|'## review limit reached')
@@ -4501,14 +4511,14 @@ crw_probe_status_refusal_record() {
 }
 # END coderabbit_probe_status_refusal_helpers
 
-# Only called at the two nonterminal probe fallbacks. A positive first sample
+# Called at the two nonterminal probe fallbacks and before progress holds. A positive first sample
 # repeats the ordinary verdict selection once, refreshing comments AND reviews.
 # That pass revalidates the latest status and all marker surfaces before emitting
 # a refusal. It preserves clean-report precedence and never posts or grants a
 # review verdict. Provider publication after this bounded sample is outside this
 # guarantee, just as it is for the existing probe's publication rescan.
 crw_probe_maybe_emit_status_refusal() {
-  local reviews=$1 comments=$2 review=$3 resampled=$4 prior=$5 record rc=0
+  local reviews=$1 comments=$2 review=$3 resampled=$4 prior=$5 notice=${6:-} notice_evidence=${7:-null} record rc=0
   local review_body="" rid rows row body class at evidence
   record=$(crw_probe_status_refusal_record) || rc=$?
   case "$rc" in
@@ -4533,12 +4543,12 @@ crw_probe_maybe_emit_status_refusal() {
     [ -n "$review_body" ] || die 3 "status-refusal review body did not round-trip"
   fi
   rc=0
-  crw_rate_limit_hides_a_finding "$HEAD_SHA" "" "$review_body" "$comments" || rc=$?
+  crw_rate_limit_hides_a_finding "$HEAD_SHA" "$notice" "$review_body" "$comments" || rc=$?
   case "$rc" in
     0)
       PROBE_CONTEXT_STATE=""; PROBE_CONTEXT_UPDATED_AT=""; PROBE_CARRYFORWARD_JSON=null
       PROBE_OBSERVED=terminal
-      emit_json_and_exit findings 2 "${CRW_HIDDEN_FINDING_JSON:-$review}" 1 ;;
+      emit_json_and_exit findings 2 "${CRW_HIDDEN_FINDING_JSON:-${review:-$notice_evidence}}" 1 ;;
     1) ;;
     *) die 3 "could not scan every status-refusal marker surface" ;;
   esac
@@ -5230,9 +5240,11 @@ probe_emit_verdict() {
           emit_json_and_exit "findings" 2 "${CRW_HIDDEN_FINDING_JSON:-$review}" 1
         fi
       fi
-      if [ "$PROBE_OBSERVED" = awaiting-summary ]; then
-        crw_probe_maybe_emit_status_refusal "$reviews" "$issue_comments" "$review" "$status_refusal_resampled" "$status_refusal_initial"
-      fi
+      case "$PROBE_OBSERVED" in
+        awaiting-summary|in_progress)
+          crw_probe_maybe_emit_status_refusal "$reviews" "$issue_comments" "$review" "$status_refusal_resampled" "$status_refusal_initial" "$newest_body"
+          ;;
+      esac
       log "probe: review object on $HEAD_SHA but no terminal summary yet (newest=${newest_class:-none}, context_state=${PROBE_CONTEXT_STATE:-unsampled}, context_updated_at=${PROBE_CONTEXT_UPDATED_AT:-unsampled})"
       probe_not_yet "$PROBE_OBSERVED" "$review"
     done
@@ -5312,6 +5324,11 @@ probe_emit_verdict() {
         log "probe: the rate-limit notice on $HEAD_SHA hides a blocking finding — escalating (#1178)"
         emit_json_and_exit "findings" 2 "${CRW_HIDDEN_FINDING_JSON:-$latest_json}" 1
       fi
+    fi
+    # A later trusted per-SHA refusal can finish an older progress notice.
+    # Equal/newer progress and durable pause recovery keep their own holds.
+    if [ "$newest_class" = in_progress ]; then
+      crw_probe_maybe_emit_status_refusal "$reviews" "$issue_comments" "" "$status_refusal_resampled" "$status_refusal_initial" "$body" "$latest_json"
     fi
     case "$newest_class" in
       in_progress|rate_limit|paused)
