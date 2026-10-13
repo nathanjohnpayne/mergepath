@@ -328,11 +328,49 @@ FILES_COUNT=$(printf '%s' "$FILES_JSON" | jq 'length')
 # enumerated, so it cannot be proven pin-only.
 [ "$FILES_COUNT" -lt 3000 ] || not_exempt "PR lists $FILES_COUNT files; the pulls files endpoint stops at 3000, so every hunk cannot be verified"
 
-# The lane carves out ONLY the protected-path rule. A diff at or above the
-# governing external_review_threshold needs review for its size whatever its
-# shape, so it is not exempt — the same eligibility the labeler applies before
-# consulting this helper, enforced here so every caller gets it.
-LINES_CHANGED=$(printf '%s' "$FILES_JSON" | jq '[ .[] | ((.additions // 0) + (.deletions // 0)) ] | add // 0')
+# The lane carves out ONLY the broad `.github/**` protected-path rule (and
+# its `.github/workflows/**` spelling). A consumer that lists a narrower or
+# different pattern — a specific workflow such as
+# `.github/workflows/deploy.yml`, or `**/*secret*` — has asked for review of
+# exactly that file, so any match against such a pattern keeps the label.
+# Patterns come from the governing policy and are matched with the same
+# slash-aware matcher the labeler uses, over both sides of a rename.
+MATCHER="$SCRIPT_DIR/match_protected_paths.sh"
+if [ ! -f "$MATCHER" ]; then
+  echo "dependabot_pin_bump_exemption.sh: missing helper: $MATCHER" >&2
+  exit 2
+fi
+PATTERNS_JSON=$(jq -c '(try .external_review_paths catch "<malformed>") // []' <<<"$POLICY_JSON")
+if ! jq -e 'type == "array" and all(.[]; type == "string")' <<<"$PATTERNS_JSON" >/dev/null 2>&1; then
+  unreadable "external_review_paths in $CONFIG is not a list of strings; the lane cannot tell the broad rule from a narrower one"
+fi
+CHANGED_NAMES=$(printf '%s' "$FILES_JSON" | jq -r '.[] | (.filename // empty), (.previous_filename // empty)')
+while IFS= read -r pattern; do
+  [ -n "$pattern" ] || continue
+  case "$pattern" in
+    '.github/**'|'.github/workflows/**') continue ;;
+  esac
+  narrow_match=$(printf '%s\n' "$CHANGED_NAMES" | bash "$MATCHER" "$pattern" 2>/dev/null || true)
+  narrow_match=${narrow_match%%$'\n'*}
+  if [ -n "$narrow_match" ]; then
+    not_exempt "file $narrow_match matches protected path pattern '$pattern', which is not the broad .github/** rule the lane carves out; that protection is retained"
+  fi
+done < <(jq -r '.[]' <<<"$PATTERNS_JSON")
+
+# A diff at or above the governing external_review_threshold needs review for
+# its size whatever its shape, so it is not exempt — the same eligibility the
+# labeler applies before consulting this helper, enforced here so every caller
+# gets it. The count uses the labeler's own exclusion of generated files, read
+# from the canonical constant in external_review_fingerprint.sh (same trusted
+# kit) rather than a second copy that could drift from it.
+FINGERPRINT_HELPER="$SCRIPT_DIR/external_review_fingerprint.sh"
+EXCLUDE_RE=$(sed -n "s/^EXCLUDE_RE='\(.*\)'\$/\1/p" "$FINGERPRINT_HELPER" 2>/dev/null | head -1)
+if [ -z "$EXCLUDE_RE" ]; then
+  echo "dependabot_pin_bump_exemption.sh: cannot read EXCLUDE_RE from $FINGERPRINT_HELPER" >&2
+  exit 2
+fi
+LINES_CHANGED=$(printf '%s' "$FILES_JSON" | jq --arg re "$EXCLUDE_RE" '
+  [ .[] | select(((.filename // "") | test($re)) | not) | ((.additions // 0) + (.deletions // 0)) ] | add // 0')
 if [ "$LINES_CHANGED" -ge "$THRESHOLD" ]; then
   not_exempt "PR changes $LINES_CHANGED line(s), at or above external_review_threshold $THRESHOLD; the lane carves out only the protected-path rule, not the size threshold"
 fi

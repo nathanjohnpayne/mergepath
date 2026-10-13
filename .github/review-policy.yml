@@ -844,8 +844,12 @@ dependabot:
   #      a `permissions:` block, a rename, any other file, or an end-of-file
   #      newline change fails the proof and the PR keeps the label.
   # The proof is never the author login or the file name alone. It carves
-  # out only the protected-path reason: a Dependabot diff that also crosses
-  # external_review_threshold still gets the label. It does not touch
+  # out only the BROAD protected-path rule (`.github/**` or
+  # `.github/workflows/**`): a changed file that also matches any narrower
+  # or different pattern above (a specific workflow, `**/*secret*`) keeps the
+  # label, and a Dependabot diff that crosses external_review_threshold
+  # (counted with the same generated-file exclusion as the labeler) still
+  # gets the label. It does not touch
   # reviewer_gate: the Merge clearance gate still requires a reviewer-
   # identity APPROVED on the current head, and dependabot-auto-merge.yml
   # still decides merge by semver.

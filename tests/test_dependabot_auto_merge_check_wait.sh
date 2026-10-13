@@ -741,6 +741,34 @@ pin_case "a pin-only diff at or above external_review_threshold is not exempt" 1
 printf 'external_review_threshold: 3\n' >"$PIN_DIR/policy-threshold-3.yml"
 pin_case "a pin-only diff under the threshold stays exempt" 0 exempt "1 pin(s)" \
   "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-threshold-3.yml" >/dev/null
+# The count honors the labeler's generated-file exclusion, read from the
+# canonical constant in external_review_fingerprint.sh rather than a copy.
+EXCLUDE_FROM_FINGERPRINT=$(sed -n "s/^EXCLUDE_RE='\(.*\)'\$/\1/p" "$ROOT/scripts/workflow/external_review_fingerprint.sh" | head -1)
+if [ -n "$EXCLUDE_FROM_FINGERPRINT" ] && [[ "$EXCLUDE_FROM_FINGERPRINT" == *'generated'* ]]; then
+  pass "pin-bump: the fingerprint exclusion constant is readable in the shape the helper expects"
+else
+  fail "pin-bump: could not read EXCLUDE_RE from external_review_fingerprint.sh (got '$EXCLUDE_FROM_FINGERPRINT')"
+fi
+pin_case "a pin bump in a generated workflow is excluded from the threshold count, as the labeler excludes it" 0 exempt "1 pin(s)" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
+  "$(pin_fixture generated "$(pin_file .github/workflows/deploy.generated.yml "$PATCH_REAL" 1 1)")" ok --config "$PIN_DIR/policy-threshold.yml" >/dev/null
+# Only the broad .github/** rule is carved out: a consumer that protects a
+# specific workflow, or any other pattern, keeps that review.
+printf 'external_review_paths:\n  - ".github/**"\n  - ".github/workflows/deploy.yml"\n' >"$PIN_DIR/policy-narrow.yml"
+pin_case "a pin bump in a separately protected workflow is not exempt" 1 not-exempt "matches protected path pattern '.github/workflows/deploy.yml'" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
+  "$(pin_fixture deploy "$(pin_file .github/workflows/deploy.yml "$PATCH_REAL" 1 1)")" ok --config "$PIN_DIR/policy-narrow.yml" >/dev/null
+pin_case "a pin bump in a workflow covered only by the broad rule stays exempt beside a narrower pattern" 0 exempt "1 pin(s)" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-narrow.yml" >/dev/null
+printf 'external_review_paths:\n  - ".github/workflows/**"\n  - "**/*secret*"\n' >"$PIN_DIR/policy-secret.yml"
+pin_case "a pin bump in a workflow matching another protected pattern is not exempt" 1 not-exempt "matches protected path pattern '**/*secret*'" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" \
+  "$(pin_fixture secrets "$(pin_file .github/workflows/rotate-secrets.yml "$PATCH_REAL" 1 1)")" ok --config "$PIN_DIR/policy-secret.yml" >/dev/null
+pin_case "the .github/workflows/** spelling of the broad rule is carved out too" 0 exempt "1 pin(s)" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-secret.yml" >/dev/null
+printf 'external_review_paths: everything\n' >"$PIN_DIR/policy-paths-bad.yml"
+pin_case "a malformed external_review_paths fails closed as unreadable" 3 unreadable "not a list of strings" \
+  "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-paths-bad.yml" >/dev/null
 printf 'external_review_threshold: lots\n' >"$PIN_DIR/policy-threshold-bad.yml"
 pin_case "a malformed threshold fails closed as unreadable" 3 unreadable "external_review_threshold must be a non-negative integer" \
   "$PIN_DIR/pr.json" "$PIN_DIR/commits-trusted.json" "$PIN_DIR/files-real.json" ok --config "$PIN_DIR/policy-threshold-bad.yml" >/dev/null
@@ -930,7 +958,7 @@ SHIM
        && grep -Fq "proven_pair=\$(jq -r '[.head, .base] | @tsv' <<<\"\$PIN_JSON\")" <<<"$LOOP" \
        && grep -Fq '[ "$live_pair" != "$proven_pair" ]' <<<"$LOOP" \
        && grep -Fq 'PIN_JSON=$(GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/dependabot_pin_bump_exemption.sh' <<<"$LOOP" \
-       && grep -Fq -- '--repo "$REPO" --pr "$PR" --config "$LANE_POLICY")' <<<"$LOOP" \
+       && grep -Fq -- '--repo "$REPO" --pr "$PR" --head "$LANE_HEAD" --base "$LANE_BASE" --config "$LANE_POLICY")' <<<"$LOOP" \
        && ! grep -Fq -- '--config .github/review-policy.yml)' <<<"$LOOP" \
        && grep -Fq 'gate_source=dependabot-pin-bump' <<<"$LOOP" \
        && grep -Fq 'mergepath-dependabot-pin-bump:v1 verified-head=' <<<"$LOOP"; then
@@ -942,14 +970,36 @@ SHIM
     # is the lane's to clear: both are established BEFORE the helper runs.
     policy_line=$(grep -n 'bash scripts/workflow/resolve_base_policy.sh' <<<"$LOOP" | head -1 | cut -d: -f1)
     owner_line=$(grep -n 'gh api --paginate "repos/$REPO/issues/$PR/timeline"' <<<"$LOOP" | head -1 | cut -d: -f1)
-    if [ -n "$policy_line" ] && [ -n "$owner_line" ] && [ -n "$helper_line" ] \
-       && [ "$policy_line" -lt "$owner_line" ] && [ "$owner_line" -lt "$helper_line" ] \
-       && grep -Fq -- '--repo "$REPO" --pr "$PR" --default-config .github/review-policy.yml' <<<"$LOOP" \
+    triple_line=$(grep -n -F 'LANE_TRIPLE=$(GH_TOKEN="$WORKFLOW_TOKEN" gh api "repos/$REPO/pulls/$PR"' <<<"$LOOP" | head -1 | cut -d: -f1)
+    owner_line=$(grep -n 'LANE_OWNER=$(lane_latest_label_event)' <<<"$LOOP" | head -1 | cut -d: -f1)
+    if [ -n "$triple_line" ] && [ -n "$policy_line" ] && [ -n "$owner_line" ] && [ -n "$helper_line" ] \
+       && [ "$triple_line" -lt "$policy_line" ] && [ "$policy_line" -lt "$owner_line" ] && [ "$owner_line" -lt "$helper_line" ] \
+       && grep -Fq -- '--repo "$REPO" --base-ref "$LANE_BASE_REF" --base-sha "$LANE_BASE"' <<<"$LOOP" \
+       && grep -Fq -- '--default-branch "$DEFAULT_BRANCH" --default-config .github/review-policy.yml' <<<"$LOOP" \
+       && ! grep -Fq -- 'resolve_base_policy.sh --repo "$REPO" --pr' <<<"$LOOP" \
        && grep -Fq "[ \"\$LANE_OWNER\" != 'labeled:github-actions[bot]' ]" <<<"$LOOP" \
        && grep -Fq '"\(.event):\(.actor.login // "<unknown>")"' <<<"$LOOP"; then
-      pass "auto-clear $job: resolves the governing base policy and requires a policy-applied label before consulting the lane"
+      pass "auto-clear $job: captures one live pair, resolves the policy at that base, and requires a policy-applied label before consulting the lane"
     else
-      fail "auto-clear $job: must resolve the base policy (resolve_base_policy.sh) and check the latest label event is a github-actions[bot] application before the helper (policy=$policy_line owner=$owner_line helper=$helper_line)"
+      fail "auto-clear $job: must capture the live triple first, resolve the base policy pinned to it, and check the latest label event before the helper (triple=$triple_line policy=$policy_line owner=$owner_line helper=$helper_line)"
+    fi
+    # The pre-delete fence re-reads BOTH the pair (against the captured one)
+    # and the label ownership.
+    fence_owner_line=$(grep -n 'live_owner=$(lane_latest_label_event)' <<<"$LOOP" | head -1 | cut -d: -f1)
+    if [ -n "$fence_owner_line" ] && [ -n "$fence_line" ] && [ -n "$delete_line" ] \
+       && [ "$fence_line" -lt "$fence_owner_line" ] && [ "$fence_owner_line" -lt "$delete_line" ] \
+       && grep -Fq "[ \"\$live_owner\" != 'labeled:github-actions[bot]' ]" <<<"$LOOP" \
+       && grep -Fq 'captured_pair=$(printf '"'"'%s\t%s'"'"' "$LANE_HEAD" "$LANE_BASE")' <<<"$LOOP" \
+       && grep -Fq '[ "$live_pair" != "$captured_pair" ]' <<<"$LOOP"; then
+      pass "auto-clear $job: the pre-delete fence re-reads the pair against the captured one and the label ownership"
+    else
+      fail "auto-clear $job: the pre-delete fence must re-check both the captured pair and the label ownership (fence=$fence_line owner=$fence_owner_line delete=$delete_line)"
+    fi
+    STEP_ENV=$(yq -r ".jobs.\"$job\".steps[] | select(.run != null) | select(.run | test(\"codex-review-check.sh \\\"\\\\\$PR\\\"\")) | .env.DEFAULT_BRANCH // \"\"" "$AUTO_CLEAR_WORKFLOW")
+    if [ "$STEP_ENV" = '${{ github.event.repository.default_branch }}' ]; then
+      pass "auto-clear $job: the clearing step exports DEFAULT_BRANCH for the base-pinned policy resolution"
+    else
+      fail "auto-clear $job: DEFAULT_BRANCH env missing on the clearing step (got '$STEP_ENV')"
     fi
     # rc 3 → infra sentinel; rc 1 → ordinary merge-gate evaluation.
     arm=$(awk '/case "\$pin_rc" in/{f=1} f{print} f && /^[[:space:]]*esac[[:space:]]*$/{exit}' <<<"$LOOP")
