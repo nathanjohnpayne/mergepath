@@ -938,7 +938,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REVIEWERS_FAIL=1 STUB_EVENT_ACTOR='claude[bot]' as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label a --reviewer nathanpayne-codex 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'its reviewers could not be requested' && printf '%s' "$err" | grep -q "attributed to another login: labeled by claude\\[bot\\]"; then
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'its reviewers could not be requested' && printf '%s' "$err" | grep -q "the label 'a' landed under 'claude\\[bot\\]'" && printf '%s' "$err" | grep -q 'not attributed to'; then
   pass "create: a label that landed under another login before a failed reviewer request is caught (5)"
 else
   fail "create partial foreign: rc=$rc err=$err"
@@ -947,7 +947,7 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REVIEWERS_FAIL=1 as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label a --reviewer nathanpayne-codex 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'show no event by another login'; then
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'are attributed to nathanjohnpayne, and no event by another login appeared'; then
   pass "create: a failed reviewer request after a correctly attributed label is reported as a failure (1)"
 else
   fail "create partial clean: rc=$rc err=$err"
@@ -956,10 +956,33 @@ new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REVIEWERS_FAIL=1 STUB_EVENT_ACTOR='claude[bot]' as_author -- gh pr edit 42 --repo o/r --add-label x --add-reviewer nathanpayne-codex 2>&1 >/dev/null)"; rc=$?
 set -e
-if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'requesting reviewers on PR #42 failed' && printf '%s' "$err" | grep -q 'attributed to another login'; then
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'requesting reviewers on PR #42 failed' && printf '%s' "$err" | grep -q 'not attributed to'; then
   pass "edit: a label that landed under another login before a failed reviewer request is caught (5)"
 else
   fail "edit partial foreign: rc=$rc err=$err"
+fi
+# A write that succeeded must show its own expected-login event: when the
+# label's event never appears before the reviewer request fails, the label is
+# unattributed (5), not merely "no foreign actor seen" (Codex on #2178).
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REVIEWERS_FAIL=1 STUB_EVENTS_HIDE_READS=99 MERGEPATH_GH_READBACK_ATTEMPTS=2 as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label a --reviewer nathanpayne-codex 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "no labeled event appeared" && printf '%s' "$err" | grep -q 'not attributed to'; then
+  pass "create: a label that succeeded but never shows its event before a failed reviewer request is unattributed (5)"
+else
+  fail "create partial missing event: rc=$rc err=$err"
+fi
+# Only the writes that succeeded are attributed: a reviewer request that
+# failed is not demanded, so a clean label still reports the failure (1).
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REVIEWERS_FAIL=1 MERGEPATH_GH_READBACK_ATTEMPTS=2 as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label a --reviewer nathanpayne-codex 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && ! printf '%s' "$err" | grep -q 'no review_requested event appeared'; then
+  pass "create: the failed reviewer request itself is not demanded as an event"
+else
+  fail "create partial only-done: rc=$rc err=$err"
 fi
 # Logins and label names compare without case, as GitHub compares them.
 new_case
