@@ -227,6 +227,11 @@ exit 0
 STUB
 chmod +x "$STUB_DIR/gh"
 
+ALT_DIR="$WORKDIR/alt-bin"
+mkdir -p "$ALT_DIR"
+# shellcheck disable=SC2016  # the $-expressions belong to the generated stub
+printf '#!/usr/bin/env bash\necho ALT-GH-USED >>"${GH_CALLS_LOG:-/dev/null}"\nexec %q "$@"\n' "$STUB_DIR/gh" >"$ALT_DIR/gh"
+chmod +x "$ALT_DIR/gh"
 LOGF="$WORKDIR/calls.log"
 STATE="$WORKDIR/state"
 new_case() { : >"$LOGF"; rm -rf "$STATE"; mkdir -p "$STATE"; }
@@ -323,9 +328,9 @@ set +e
 out="$(MERGEPATH_AGENT_SURFACE=codex-cloud MERGEPATH_AGENT=codex OP_PREFLIGHT_REVIEWER_PAT=ghp_codex-token as_reviewer -- gh issue comment 7 --repo o/r --body-file "$COMMENT_FILE" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" -eq 0 ] && [ "$out" = "https://github.com/o/r/pull/7#issuecomment-900" ] \
-   && log_has $'POST\trepos/o/r/issues/7/comments\t--input\t'"$(printf '%s' '{"body":"line one\nline two"}')" \
+   && log_has $'POST\trepos/o/r/issues/7/comments\t--input\t'"$(printf '%s' '{"body":"line one\nline two\n"}')" \
    && log_lacks 'repos/o/r/pulls/7' && log_token_clean ghp_codex-token; then
-  pass "Codex cloud: issue comment runs as REST from --body-file, as nathanpayne-codex, with no PR read"
+  pass "Codex cloud: issue comment runs as REST from --body-file (byte-exact, trailing newline kept), as nathanpayne-codex, with no PR read"
 else
   fail "Codex cloud issue comment: rc=$rc out=$out"; cat "$LOGF" >&2
 fi
@@ -429,7 +434,7 @@ new_case
 set +e
 MERGEPATH_GH_TRANSPORT=rest as_reviewer -- gh pr review 9 --repo o/r --request-changes --body-file "$COMMENT_FILE" >/dev/null 2>&1; rc=$?
 set -e
-if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/pulls/9/reviews\t--input\t'"$(printf '%s' '{"event":"REQUEST_CHANGES","body":"line one\nline two"}')"; then
+if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/pulls/9/reviews\t--input\t'"$(printf '%s' '{"event":"REQUEST_CHANGES","body":"line one\nline two\n"}')"; then
   pass "review --request-changes: POST with the event and the body file"
 else
   fail "review request-changes: rc=$rc"; cat "$LOGF" >&2
@@ -535,6 +540,16 @@ if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/pulls\t--input\t'"$create_input"
   pass "pr create: a proxy remote URL ending in --repo (any case) keeps the bare head"
 else
   fail "pr create proxy remote head: rc=$rc"; cat "$LOGF" >&2
+fi
+git -C "$GITREPO" remote set-url origin https://gitlab.com/o/r.git
+new_case
+set +e
+err="$(RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --base main --title T --body-file "$VALID_BODY" 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'has no push remote on GitHub' && log_lacks 'POST'; then
+  pass "pr create: a push remote that is not on GitHub is refused, even when its path matches --repo"
+else
+  fail "pr create gitlab remote: rc=$rc err=$err"; cat "$LOGF" >&2
 fi
 git -C "$GITREPO" remote set-url origin https://github.com/o/r.git
 git -C "$GITREPO" config --unset branch.topic/z.remote
@@ -664,7 +679,7 @@ new_case
 set +e
 out="$(MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr edit 42 --repo o/r --title 'New title' --base dev --body-file "$COMMENT_FILE" 2>"$WORKDIR/err")"; rc=$?
 set -e
-if [ "$rc" -eq 0 ] && log_has $'PATCH\trepos/o/r/pulls/42\t--input\t'"$(printf '%s' '{"title":"New title","body":"line one\nline two","base":"dev"}')" \
+if [ "$rc" -eq 0 ] && log_has $'PATCH\trepos/o/r/pulls/42\t--input\t'"$(printf '%s' '{"title":"New title","body":"line one\nline two\n","base":"dev"}')" \
    && grep -q 'verified edit of PR #42 by nathanjohnpayne: title, base' "$WORKDIR/err" \
    && grep -q 'body edit of PR #42 is not attributable over REST' "$WORKDIR/err"; then
   pass "pr edit title/body/base: one PATCH; title and base attributed through events, the body edit reported as not attributable"
@@ -887,6 +902,58 @@ if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "closing PR #42 landed under 
   pass "pr close readback: a closed event by another login exits 5"
 else
   fail "pr close actor mutation: rc=$rc err=$err"
+fi
+
+# --- round-five parity cases ------------------------------------------------
+# Removal wins when one login or label is both added and removed, as gh
+# computes (current + added) - removed.
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr edit 42 --repo o/r --add-reviewer nathanpayne-codex --remove-reviewer nathanpayne-codex --add-label x --remove-label x >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_lacks 'requested_reviewers' && log_lacks 'issues/42/labels' && grep -q 'no change' "$WORKDIR/err"; then
+  pass "pr edit: a reviewer and a label both added and removed end up absent, so nothing is written"
+else
+  fail "pr edit add+remove absent: rc=$rc"; cat "$LOGF" "$WORKDIR/err" >&2
+fi
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest STUB_PR_REVIEWERS=nathanpayne-codex as_author -- gh pr edit 42 --repo o/r --add-reviewer nathanpayne-codex --remove-reviewer nathanpayne-codex >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'DELETE\trepos/o/r/pulls/42/requested_reviewers\t--input\t'"$(printf '%s' '{"reviewers":["nathanpayne-codex"]}')" && log_lacks $'POST\trepos/o/r/pulls/42/requested_reviewers'; then
+  pass "pr edit: a requested reviewer both added and removed is removed, as gh does"
+else
+  fail "pr edit add+remove present: rc=$rc"; cat "$LOGF" "$WORKDIR/err" >&2
+fi
+# A body-file edit compares bytes: the same body with its trailing newline is
+# a no-op, and a trailing newline is not stripped from the PATCH.
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest STUB_PR_BODY=$'line one\nline two\n' as_author -- gh pr edit 42 --repo o/r --body-file "$COMMENT_FILE" >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_lacks 'PATCH' && grep -q 'no change' "$WORKDIR/err"; then
+  pass "pr edit: a body file identical to the current body, trailing newline included, is a no-op"
+else
+  fail "pr edit byte-exact no-op: rc=$rc"; cat "$LOGF" "$WORKDIR/err" >&2
+fi
+# The gh the caller names runs the REST calls.
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest as_reviewer -- "$ALT_DIR/gh" pr comment 1 --repo o/r --body x >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ "$(grep -c '^ALT-GH-USED$' "$LOGF")" -ge 2 ] && log_has $'POST\trepos/o/r/issues/1/comments'; then
+  pass "an absolute gh path in the payload runs every REST call"
+else
+  fail "explicit gh path: rc=$rc"; cat "$LOGF" >&2
+fi
+new_case
+set +e
+err="$(RUN_CWD="$ALT_DIR/.." MERGEPATH_GH_TRANSPORT=rest as_reviewer -- alt-bin/gh pr comment 1 --repo o/r --body x 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -ne 0 ] && log_lacks 'POST'; then
+  pass "a relative gh path in the payload is refused before any write"
+else
+  fail "relative gh path: rc=$rc err=$err"; cat "$LOGF" >&2
 fi
 
 # ---------------------------------------------------------------------------

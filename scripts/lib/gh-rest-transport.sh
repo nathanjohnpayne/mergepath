@@ -107,9 +107,10 @@ GH_REST_LABEL="gh-rest-transport"
 GH_REST_EXPECTED=""
 GH_REST_TOKEN=""
 GH_REST_GH_BIN=""
+GH_REST_PAYLOAD_GH=""
 GH_REST_WROTE=0
 GH_REST_FORM=""
-GH_REST_BODY=""
+GH_REST_BODY_FILE=""
 GH_REST_BODY_SET=0
 GH_REST_ARGS=()
 GH_REST_I=0
@@ -446,8 +447,11 @@ gh_rest_body_from() { # <--body|--body-file> <value>
     gh_rest_refuse "pass one of --body or --body-file, once"
     return 1
   fi
+  # The body is snapshotted into a private file, byte for byte: a later edit
+  # of the caller's file cannot change it between check and write, and
+  # command substitution would strip its trailing newlines.
   case "$1" in
-    --body) GH_REST_BODY="$2" ;;
+    --body) GH_REST_BODY_FILE="$(gh_rest_text_file "$2")" || return 1 ;;
     --body-file)
       if [ "$2" = "-" ]; then
         gh_rest_refuse "--body-file - is not accepted: the body is read before the write, so write it to a file first"
@@ -457,7 +461,8 @@ gh_rest_body_from() { # <--body|--body-file> <value>
         gh_rest_refuse "body file is not readable: $2"
         return 1
       fi
-      GH_REST_BODY="$(cat "$2")" || return 1
+      GH_REST_BODY_FILE="$(umask 077; mktemp "$GH_REST_TMPDIR/body.XXXXXX")" || return 1
+      cat -- "$2" >"$GH_REST_BODY_FILE" || return 1
       ;;
   esac
   GH_REST_BODY_SET=1
@@ -608,13 +613,11 @@ gh_rest_remove_label() { # <repo> <N> <label>
   }
 }
 
-# gh_rest_post_comment <repo> <N> <body> -> prints the comment URL; 5 on a
-# wrong byline.
+# gh_rest_post_comment <repo> <N> <body file> -> prints the comment URL; 5 on
+# a wrong byline.
 gh_rest_post_comment() {
   local input response login url
-  local text
-  text="$(gh_rest_text_file "$3")" || return 1
-  input="$(gh_rest_json_file --rawfile body "$text" '{body: $body}')" || return 1
+  input="$(gh_rest_json_file --rawfile body "$3" '{body: $body}')" || return 1
   response="$(gh_rest_api POST "repos/$1/issues/$2/comments" "$input")" || return $?
   login="$(printf '%s' "$response" | jq -r '.user.login // empty' 2>/dev/null)"
   url="$(printf '%s' "$response" | jq -r '.html_url // empty' 2>/dev/null)"
@@ -635,13 +638,23 @@ gh_rest_post_comment() {
 # --- verbs --------------------------------------------------------------------------
 
 # gh_rest_repo_of_url <remote URL> -> owner/repo, from the URL's last two path
-# segments. That covers https, scp-style and ssh GitHub URLs and the cloud
-# session proxy's remote, whose path ends in the repository too.
+# segments, when the URL points at github.com or a loopback host (a Claude
+# cloud session's git proxy, whose path ends in the repository too). Any
+# other host fails: its owner/repo says nothing about a GitHub repository.
 gh_rest_repo_of_url() {
-  local url="$1" path
+  local url="$1" path host
   case "$url" in
-    *://*) path="${url#*://}"; path="${path#*/}" ;;
-    *:*) path="${url#*:}" ;;
+    *://*) host="${url#*://}"; path="${host#*/}"; host="${host%%/*}" ;;
+    *:*) host="${url%%:*}"; path="${url#*:}" ;;
+    *) return 1 ;;
+  esac
+  host="${host##*@}"
+  case "$host" in
+    \[*\]*) host="${host%%]*}]" ;;
+    *) host="${host%%:*}" ;;
+  esac
+  case "$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')" in
+    github.com|www.github.com|ssh.github.com|127.0.0.1|localhost|\[::1\]) ;;
     *) return 1 ;;
   esac
   path="${path%/}"
@@ -665,7 +678,7 @@ gh_rest_default_head() {
   url=""
   [ -z "$remote" ] || url="$(git remote get-url --push "$remote" 2>/dev/null || true)"
   if [ -z "$url" ] || ! pushed="$(gh_rest_repo_of_url "$url")"; then
-    gh_rest_refuse "pass --head: branch $branch has no push remote to tell which repository holds it (use owner:branch for a fork)"
+    gh_rest_refuse "pass --head: branch $branch has no push remote on GitHub to tell which repository holds it (use owner:branch for a fork)"
     return 1
   fi
   # The branch must be fully pushed: a PR from a ref behind HEAD would leave
@@ -693,7 +706,7 @@ gh_rest_default_head() {
 gh_rest_pr_create() {
   GH_REST_FORM='gh pr create --repo OWNER/REPO --title T (--body B | --body-file F) [--head BRANCH] [--base BRANCH] [--draft] [--label L]... [--reviewer USER]... [--assignee USER]...' # NO_BARE_GH_WRITE_EXEMPT: usage text printed in a refusal, never executed
   local repo="" title="" title_set=0 head="" base="" draft=false labels="" reviewers="" assignees=""
-  GH_REST_BODY=""
+  GH_REST_BODY_FILE=""
   GH_REST_BODY_SET=0
   gh_rest_parse_init "$@"
   while [ "$GH_REST_I" -lt "${#GH_REST_ARGS[@]}" ]; do
@@ -746,9 +759,7 @@ gh_rest_pr_create() {
   gh_rest_check_branch "$base" "--base" || return 1
 
   local input response number url actual rc=0
-  local text
-  text="$(gh_rest_text_file "$GH_REST_BODY")" || return 1
-  input="$(gh_rest_json_file --arg title "$title" --rawfile body "$text" --arg head "$head" --arg base "$base" --argjson draft "$draft" \
+  input="$(gh_rest_json_file --arg title "$title" --rawfile body "$GH_REST_BODY_FILE" --arg head "$head" --arg base "$base" --argjson draft "$draft" \
     '{title: $title, body: $body, head: $head, base: $base, draft: $draft}')" || return 1
   response="$(gh_rest_api POST "repos/$repo/pulls" "$input")" || return $?
   number="$(printf '%s' "$response" | jq -r '.number // empty' 2>/dev/null)"
@@ -815,7 +826,7 @@ gh_rest_comment() { # <pr|issue> <args...>
   local kind="$1" number="" repo=""
   shift
   GH_REST_FORM="gh $kind comment N --repo OWNER/REPO (--body B | --body-file F)" # NO_BARE_GH_WRITE_EXEMPT: usage text printed in a refusal, never executed
-  GH_REST_BODY=""
+  GH_REST_BODY_FILE=""
   GH_REST_BODY_SET=0
   gh_rest_parse_init "$@"
   while [ "$GH_REST_I" -lt "${#GH_REST_ARGS[@]}" ]; do
@@ -840,13 +851,13 @@ gh_rest_comment() { # <pr|issue> <args...>
   if [ "$kind" = "pr" ]; then
     gh_rest_read_pr "$repo" "$number" >/dev/null || return 1
   fi
-  gh_rest_post_comment "$repo" "$number" "$GH_REST_BODY"
+  gh_rest_post_comment "$repo" "$number" "$GH_REST_BODY_FILE"
 }
 
 gh_rest_pr_review() {
   GH_REST_FORM='gh pr review N --repo OWNER/REPO (--approve | --comment | --request-changes) [--body B | --body-file F]' # NO_BARE_GH_WRITE_EXEMPT: usage text printed in a refusal, never executed
   local number="" repo="" event="" events=0
-  GH_REST_BODY=""
+  GH_REST_BODY_FILE=""
   GH_REST_BODY_SET=0
   gh_rest_parse_init "$@"
   while [ "$GH_REST_I" -lt "${#GH_REST_ARGS[@]}" ]; do
@@ -871,7 +882,7 @@ gh_rest_pr_review() {
     gh_rest_refuse "pass exactly one of --approve, --comment or --request-changes"
     return 1
   fi
-  if [ "$event" != "APPROVE" ] && { [ "$GH_REST_BODY_SET" -eq 0 ] || [ -z "$GH_REST_BODY" ]; }; then
+  if [ "$event" != "APPROVE" ] && { [ "$GH_REST_BODY_SET" -eq 0 ] || [ ! -s "$GH_REST_BODY_FILE" ]; }; then
     gh_rest_refuse "a --comment or --request-changes review needs a non-empty --body or --body-file"
     return 1
   fi
@@ -879,9 +890,7 @@ gh_rest_pr_review() {
 
   local input response login url state
   if [ "$GH_REST_BODY_SET" -eq 1 ]; then
-    local text
-    text="$(gh_rest_text_file "$GH_REST_BODY")" || return 1
-    input="$(gh_rest_json_file --arg event "$event" --rawfile body "$text" '{event: $event, body: $body}')" || return 1
+    input="$(gh_rest_json_file --arg event "$event" --rawfile body "$GH_REST_BODY_FILE" '{event: $event, body: $body}')" || return 1
   else
     input="$(gh_rest_json_file --arg event "$event" '{event: $event}')" || return 1
   fi
@@ -903,11 +912,23 @@ gh_rest_pr_review() {
   return 0
 }
 
+# gh_rest_set_ops <add|remove> <current JSON array> <added lines> <removed lines>
+# The REST operations that turn <current> into gh's final set,
+# (current + added) - removed.
+gh_rest_set_ops() {
+  local add_json remove_json
+  add_json="$(gh_rest_lines_json "$3")"
+  remove_json="$(gh_rest_lines_json "$4")"
+  { printf '%s\n' "$2"; printf '%s\n' "$add_json"; printf '%s\n' "$remove_json"; } | jq -cs --arg op "$1" '
+    .[0] as $cur | ((.[0] + .[1] | unique) - .[2]) as $final
+    | if $op == "add" then ($final - $cur) else ($cur - $final) end'
+}
+
 gh_rest_pr_edit() {
   GH_REST_FORM='gh pr edit N --repo OWNER/REPO [--title T] [--body B | --body-file F] [--base BRANCH] [--add-label L]... [--remove-label L]... [--add-reviewer USER]... [--remove-reviewer USER]... [--add-assignee USER]... [--remove-assignee USER]...' # NO_BARE_GH_WRITE_EXEMPT: usage text printed in a refusal, never executed
   local number="" repo="" title="" title_set=0 base="" base_set=0
   local add_labels="" remove_labels="" add_reviewers="" remove_reviewers="" add_assignees="" remove_assignees=""
-  GH_REST_BODY=""
+  GH_REST_BODY_FILE=""
   GH_REST_BODY_SET=0
   gh_rest_parse_init "$@"
   while [ "$GH_REST_I" -lt "${#GH_REST_ARGS[@]}" ]; do
@@ -953,19 +974,30 @@ gh_rest_pr_edit() {
   url="$(printf '%s' "$pre" | jq -r '.html_url')"
   local title_op=0 body_op=0 base_op=0
   if [ "$title_set" -eq 1 ] && [ "$title" != "$(printf '%s' "$pre" | jq -r '.title // ""')" ]; then title_op=1; fi
-  if [ "$GH_REST_BODY_SET" -eq 1 ] && [ "$GH_REST_BODY" != "$(printf '%s' "$pre" | jq -r '.body // ""')" ]; then body_op=1; fi
+  if [ "$GH_REST_BODY_SET" -eq 1 ]; then
+    # Byte comparison: the current body is written out exactly, not through
+    # command substitution, which would strip trailing newlines.
+    local current_body
+    current_body="$(umask 077; mktemp "$GH_REST_TMPDIR/current.XXXXXX")" || return 1
+    printf '%s' "$pre" | jq -j '.body // ""' >"$current_body" || return 1
+    cmp -s "$current_body" "$GH_REST_BODY_FILE" || body_op=1
+  fi
   if [ "$base_set" -eq 1 ] && [ "$base" != "$(printf '%s' "$pre" | jq -r '.base.ref // ""')" ]; then base_op=1; fi
   local cur_labels cur_reviewers cur_assignees
   cur_labels="$(printf '%s' "$pre" | jq -c '[.labels[]?.name]')"
   cur_reviewers="$(printf '%s' "$pre" | jq -c '[.requested_reviewers[]?.login]')"
   cur_assignees="$(printf '%s' "$pre" | jq -c '[.assignees[]?.login]')"
   local add_labels_json remove_labels_json add_reviewers_json remove_reviewers_json add_assignees_json remove_assignees_json
-  add_labels_json="$(gh_rest_lines_json "$add_labels" | jq -c --argjson cur "$cur_labels" '. - $cur')"
-  remove_labels_json="$(gh_rest_lines_json "$remove_labels" | jq -c --argjson cur "$cur_labels" '. - (. - $cur)')"
-  add_reviewers_json="$(gh_rest_lines_json "$add_reviewers" | jq -c --argjson cur "$cur_reviewers" '. - $cur')"
-  remove_reviewers_json="$(gh_rest_lines_json "$remove_reviewers" | jq -c --argjson cur "$cur_reviewers" '. - (. - $cur)')"
-  add_assignees_json="$(gh_rest_lines_json "$add_assignees" | jq -c --argjson cur "$cur_assignees" '. - $cur')"
-  remove_assignees_json="$(gh_rest_lines_json "$remove_assignees" | jq -c --argjson cur "$cur_assignees" '. - (. - $cur)')"
+  # gh builds each final set as (current + added) - removed, so a login or
+  # label in both lists ends up removed. The REST operations are the
+  # difference between that final set and the current one, which also drops
+  # every no-op.
+  add_labels_json="$(gh_rest_set_ops add "$cur_labels" "$add_labels" "$remove_labels")"
+  remove_labels_json="$(gh_rest_set_ops remove "$cur_labels" "$add_labels" "$remove_labels")"
+  add_reviewers_json="$(gh_rest_set_ops add "$cur_reviewers" "$add_reviewers" "$remove_reviewers")"
+  remove_reviewers_json="$(gh_rest_set_ops remove "$cur_reviewers" "$add_reviewers" "$remove_reviewers")"
+  add_assignees_json="$(gh_rest_set_ops add "$cur_assignees" "$add_assignees" "$remove_assignees")"
+  remove_assignees_json="$(gh_rest_set_ops remove "$cur_assignees" "$add_assignees" "$remove_assignees")"
   if [ "$title_op" -eq 0 ] && [ "$body_op" -eq 0 ] && [ "$base_op" -eq 0 ] \
      && [ "$add_labels_json$remove_labels_json$add_reviewers_json$remove_reviewers_json$add_assignees_json$remove_assignees_json" = "[][][][][][]" ]; then
     gh_rest_err "no change: every requested edit matches the current state of PR #$number; nothing was written."
@@ -981,8 +1013,8 @@ gh_rest_pr_edit() {
 
   local input rc=0
   if [ "$title_op" -eq 1 ] || [ "$body_op" -eq 1 ] || [ "$base_op" -eq 1 ]; then
-    local text
-    text="$(gh_rest_text_file "$GH_REST_BODY")" || return 1
+    local text="$GH_REST_BODY_FILE"
+    [ -n "$text" ] || text="$(gh_rest_text_file "")" || return 1
     input="$(gh_rest_json_file --arg title "$title" --rawfile body "$text" --arg base "$base" \
       --argjson t "$title_op" --argjson b "$body_op" --argjson r "$base_op" \
       '({} | if $t == 1 then .title = $title else . end | if $b == 1 then .body = $body else . end | if $r == 1 then .base = $base else . end)')" || return 1
@@ -1074,7 +1106,9 @@ gh_rest_pr_close() {
     return 5
   }
   if [ "$comment_set" -eq 1 ]; then
-    comment_url="$(gh_rest_post_comment "$repo" "$number" "$comment")" || return $?
+    local comment_file
+    comment_file="$(gh_rest_text_file "$comment")" || return 1
+    comment_url="$(gh_rest_post_comment "$repo" "$number" "$comment_file")" || return $?
   fi
   input="$(gh_rest_json_file '{state: "closed"}')" || return 1
   gh_rest_api PATCH "repos/$repo/pulls/$number" "$input" >/dev/null || {
@@ -1133,7 +1167,7 @@ gh_rest_run() {
   shift 3
   GH_REST_WROTE=0
   case "${1:-}" in
-    gh|*/gh) ;;
+    gh|*/gh) GH_REST_PAYLOAD_GH="$1" ;;
     *) gh_rest_err "the wrapped command must start with gh (got '${1:-}')."; return 1 ;;
   esac
   shift
@@ -1141,9 +1175,15 @@ gh_rest_run() {
     gh_rest_err "an expected login and a verified token are required; refusing."
     return 1
   fi
-  GH_REST_GH_BIN="$(command -v gh 2>/dev/null || true)"
+  # The gh the caller named runs every REST call: bare gh is resolved through
+  # PATH, an absolute path is used as given, and a relative one is refused.
+  case "$GH_REST_PAYLOAD_GH" in
+    gh) GH_REST_GH_BIN="$(command -v gh 2>/dev/null || true)" ;;
+    /*) GH_REST_GH_BIN="$GH_REST_PAYLOAD_GH" ;;
+    *) gh_rest_err "the wrapped gh must be bare gh or an absolute path (got '$GH_REST_PAYLOAD_GH'); refusing."; return 1 ;;
+  esac
   case "$GH_REST_GH_BIN" in
-    /*) ;;
+    /*) [ -x "$GH_REST_GH_BIN" ] || { gh_rest_err "gh at '$GH_REST_GH_BIN' is not executable; refusing."; return 1; } ;;
     *) gh_rest_err "gh does not resolve to an absolute path ('${GH_REST_GH_BIN:-not found}'); refusing."; return 1 ;;
   esac
   if ! command -v jq >/dev/null 2>&1; then
