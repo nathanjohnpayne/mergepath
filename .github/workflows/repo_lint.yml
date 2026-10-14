@@ -741,6 +741,7 @@ jobs:
       # them, or their coupled majors open as separate PRs that each fail npm ci.
       # Needs the PyYAML provisioned by install_python_ci_dependencies above.
       - name: check_dependabot_coupled_groups
+        if: matrix.shard == 1
         run: ./scripts/ci/check_dependabot_coupled_groups --check || { rc=$?; if [ ! -f scripts/ci/check_dependabot_coupled_groups ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_dependabot_coupled_groups not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_auto_clear_workflow
