@@ -32,6 +32,61 @@ fail() {
   FAIL=$((FAIL + 1))
 }
 
+# Print a shell source file with its comments removed, for the derived
+# reference checks below (#2176). A `#` opens a comment only outside quotes
+# and at the start of a word (line start, whitespace, or one of `;&|()`), so
+# `"#1234"`, `'#x'`, `$#`, `${#a[@]}` and `foo#bar` are kept. Heredoc bodies
+# are data and pass through unchanged, which keeps a reference rather than
+# dropping it. The former `sed 's/[[:space:]]*#.*$//'` truncated every line
+# at its first `#`, quoted or not, so a description such as
+# "... (#1234) ... tests/test_x.sh" lost its reference and the completeness
+# check passed for the wrong reason (8 of 9 references in check_coderabbit_wait).
+strip_shell_comments() {
+  python3 - "$1" <<'PY'
+import re, sys
+# `<<` not part of `<<<`, optional `-`, optional quoted delimiter word.
+HEREDOC = re.compile(r"(?<!<)<<(?!<)(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+out, quote, pending = [], None, []
+for line in open(sys.argv[1], encoding="utf-8", errors="replace").read().split("\n"):
+    if pending:  # inside a heredoc body: data, kept verbatim
+        out.append(line)
+        strip_tabs, delim = pending[0]
+        if (line.lstrip("\t") if strip_tabs else line) == delim:
+            pending.pop(0)
+        continue
+    end, i, prev = len(line), 0, "\n"
+    opened_in_quote = quote is not None
+    unquoted = [False] * len(line)  # True where the char is live shell syntax
+    while i < len(line):
+        c = line[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+        elif quote == '"':
+            if c == "\\":
+                i += 1
+            elif c == '"':
+                quote = None
+        elif c == "\\":
+            i += 1
+        elif c in "'\"":
+            quote = c
+        elif c == "#" and prev in " \t\n;&|()":
+            end = i
+            break
+        else:
+            unquoted[i] = True
+        prev = c
+        i += 1
+    out.append(line[:end].rstrip())
+    if not opened_in_quote:
+        for m in HEREDOC.finditer(line[:end]):
+            if unquoted[m.start()] and unquoted[m.start() + 1]:
+                pending.append((m.group(1) == "-", m.group(3)))
+print("\n".join(out))
+PY
+}
+
 # The classifier changes behaviour with the checkout it sits in (hub vs
 # consumer mode), and this suite also runs on consumers, so its assertions
 # run against explicit fixture roots rather than "$SCOPE" in place:
@@ -191,7 +246,8 @@ else
     fi
   fi
 
-  # Every test a declared wrapper references (comments stripped) must be a
+  # Every test a declared wrapper references (comments stripped by
+  # strip_shell_comments, which keeps a quoted `#`; #2176) must be a
   # declared dependency of that wrapper, so a suite a wrapper gains cannot
   # route to the wrong partial selection. Hub-only: the wrappers are read
   # from the tree. check_propagation_closure is exempt because its
@@ -207,7 +263,7 @@ else
         check_propagation_closure|check_repo_lint_consumer_safety|check_consumer_residue_safety|check_repo_lint_optimization) continue ;;
       esac
       wrapper_patterns=$(jq -r --arg w "$wrapper" '.wrappers[$w][]' "$DEPENDENCIES")
-      referenced=$(sed 's/[[:space:]]*#.*$//' "$ROOT/scripts/ci/$wrapper" \
+      referenced=$(strip_shell_comments "$ROOT/scripts/ci/$wrapper" \
         | grep -o 'tests/test_[A-Za-z0-9_]*\.\(sh\|py\|cjs\)' | LC_ALL=C sort -u || true)
       while IFS= read -r ref; do
         [ -n "$ref" ] || continue
@@ -219,12 +275,53 @@ else
         done <<<"$wrapper_patterns"
         [ "$declared" -eq 1 ] || undeclared_refs="$undeclared_refs $wrapper:$ref"
       done <<<"$referenced"
+      [ "$wrapper" != "check_coderabbit_wait" ] || coderabbit_wait_refs="$referenced"
     done <<<"$declared_wrappers"
     if [ -z "$undeclared_refs" ]; then
       pass "every test a declared wrapper references is a declared dependency of that wrapper"
     else
       fail "wrapper test references missing from repo-lint-dependencies.json:$undeclared_refs"
     fi
+    # Non-vacuity witness (#2176): check_coderabbit_wait names this suite
+    # only after a quoted "(#…)" description, so it is visible exactly when
+    # the extraction above keeps live text past a quoted `#`. If the
+    # extraction regresses to a first-`#` truncation, this witness vanishes
+    # while the completeness check still passes. Should the wrapper stop
+    # running the suite, move the witness to another quoted-hash reference.
+    if grep -Fxq 'tests/test_coderabbit_should_invoke.sh' <<<"${coderabbit_wait_refs:-}"; then
+      pass "the reference extraction sees past a quoted # (check_coderabbit_wait witness)"
+    else
+      fail "the reference extraction lost tests/test_coderabbit_should_invoke.sh from check_coderabbit_wait; it is truncating at a quoted # again (#2176)"
+    fi
+  fi
+
+  # #2176: the check above is only as strong as its comment stripper. A
+  # stripper that drops live text makes it pass for the wrong reason, so the
+  # stripper is pinned on its own: every kept_* reference below sits in live
+  # shell text (after a quoted `#`, `$#`, `${#…}`, a mid-word `#`, inside a
+  # heredoc or a multi-line quote, after a `<<<` here-string) and must
+  # survive; every dropped_* reference sits in a real comment and must not.
+  strip_fixture="$SCOPE_FIXTURES/strip-fixture.sh"
+  cat >"$strip_fixture" <<'FIXTURE'
+run "suite (#1234)" tests/test_kept_quoted.sh  # comment tests/test_dropped_trailing.sh
+echo '#x' tests/test_kept_single.sh
+n=$# ; m=${#arr[@]} tests/test_kept_dollar.sh
+foo#bar tests/test_kept_midword.sh
+# whole line tests/test_dropped_line.sh
+cat <<'DOC'
+# heredoc data tests/test_kept_heredoc.sh
+DOC
+x=$(cat <<<"$y") tests/test_kept_herestring.sh # c tests/test_dropped_after_herestring.sh
+echo "multi
+# still quoted tests/test_kept_multiline.sh
+" tests/test_kept_after_multiline.sh
+FIXTURE
+  stripped_refs=$(strip_shell_comments "$strip_fixture" | grep -o 'tests/test_[a-z_]*\.sh' | LC_ALL=C sort -u | tr '\n' ' ')
+  expected_refs="tests/test_kept_after_multiline.sh tests/test_kept_dollar.sh tests/test_kept_heredoc.sh tests/test_kept_herestring.sh tests/test_kept_midword.sh tests/test_kept_multiline.sh tests/test_kept_quoted.sh tests/test_kept_single.sh "
+  if [ "$stripped_refs" = "$expected_refs" ]; then
+    pass "the comment stripper keeps quoted, heredoc and mid-word hashes and drops only real comments"
+  else
+    fail "strip_shell_comments must keep every kept_* and drop every dropped_* reference (got: $stripped_refs)"
   fi
 
   if [ "$(scope_value full push docs/README.md)" = "true" ] \
@@ -287,7 +384,7 @@ else
       # assertion below passing for the wrong reason. Counting consumes the
       # whole stream. `|| true` because a non-matching wrapper is the common
       # case and its exit 1 would abort the suite under `set -e`.
-      hits=$(sed 's/[[:space:]]*#.*$//' "$f" | grep -c 'ci-check-modes\.sh' || true)
+      hits=$(strip_shell_comments "$f" | grep -c 'ci-check-modes\.sh' || true)
       [ "${hits:-0}" -gt 0 ] && basename "$f" || true
     done | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')
   # A SUBSET check, matching the assertion's own words: every sourcing wrapper
@@ -1128,7 +1225,12 @@ done
 # selector's own tests prove and the heavy wrappers land one per shard.
 if [ ! -f "$CONSUMER_HARNESS" ]; then
   : # consumer checkout: the hub-only replay harness is deliberately absent
-elif replay_loop=$(sed -n '/^while IFS= read -r name; do$/,/^done <<< "\$REPLAY_ORDER"$/p' "$CONSUMER_HARNESS") \
+# The loop is cut at its OWN first `done <<<` terminator (awk stops there),
+# and that terminator must feed REPLAY_ORDER: a range that ended at a
+# literal `done <<< "$REPLAY_ORDER"` ran to EOF when the loop was fed
+# `$WIRED` instead, and still found the strings it looked for.
+elif replay_loop=$(awk '/^while IFS= read -r name; do$/ {f=1} f {print} f && /^done <<< / {exit}' "$CONSUMER_HARNESS") \
+     && [ "$(tail -n 1 <<<"$replay_loop")" = 'done <<< "$REPLAY_ORDER"' ] \
      && grep -Fq 'repo_lint_shard_owns "$ordinal"' <<<"$replay_loop" \
      && grep -Fq 'ordinal=$((ordinal + 1))' <<<"$replay_loop" \
      && sed -n '/^REPLAY_HEAVY=(/,/^)/p' "$CONSUMER_HARNESS" | grep -Fq 'check_codex_scripts' \
