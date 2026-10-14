@@ -1056,14 +1056,24 @@ What the stuck window covers: only transitions that fire no Actions event. Pushe
 
 **What a sweep costs.** The budget these sweeps spend is API requests against the repository's Actions installation token (1,000 per hour), not workflow runs, so counting runs understates it. Measured on 2026-10-13 by running the publisher's exact per-PR gate set (`merge-clearance-gate.sh`, `codex-p1-gate.sh`, and `coderabbit-severity-gate.sh` with the summary hold) over the 8 then-open PRs through a read-only counting `gh` shim: 243 `gh` invocations per full pass, about 30 per open PR (147, 63 and 33 by script; 122 of them paginated, so the HTTP request count is at least that). Every sweep tick and every publisher pass walks every open PR, so the cost scales with the open-PR count:
 
-| Source | Requests per tick at 8 open PRs | Per hour at `*/15` (before) | Per hour at `*/30` (after) |
-|---|---|---|---|
-| Gate tick: its own sweep job (clearance script only) plus the chained publisher full pass | about 390 (147 + 243) | about 1,560 | about 780 |
-| `codex-p1-gate.yml` sweep | about 63 | about 250 | about 125 |
-| `coderabbit-severity-gate.yml` sweep | about 33 | about 130 | about 65 |
-| #2167 lint parent: one full pass per `pull_request` lint completion (about 26 per day, event-driven) | about 243 | about 265 | about 265 |
+| Source | Requests per tick at 8 open PRs | Per hour at `*/15` (before #2167) | Per hour at `*/30` (#2167) | Per hour after #2220 |
+|---|---|---|---|---|
+| Gate tick: its own sweep job (clearance script only) plus the chained publisher full pass | about 390 (147 + 243) | about 1,560 | about 780 | about 780 (#2224) |
+| `codex-p1-gate.yml` sweep | about 63 | about 250 | about 125 | about 125 |
+| `coderabbit-severity-gate.yml` sweep | about 33 | about 130 | about 65 | about 65 |
+| #2167 lint parent: at most one full pass per `pull_request` lint completion (about 26 per day, event-driven; due-only, so usually less) | about 243 | about 265 | about 265 | about 265 |
+| Event passes re-evaluating quiet green PRs whose verdict aged past `DUE_MAX_AGE_SECONDS` (7 non-head PRs at about 30 each, once per sweep interval, when PR events arrive continuously) | about 210 | about 0 (900 s matched the sweep) | about 420 (the threshold stayed at 900 s) | about 0 (1,800 s: the chained pass refreshes every verdict before it ages out) |
 
-Before #2167 the scheduled sweeps alone came to roughly 1,900 requests per hour at 8 open PRs, about twice the installation budget before any event-driven pass, which matches the two exhaustions observed on 2026-10-13 (19:36Z and 21:38Z). After it they come to roughly 970, and with the lint parent's event-driven passes about 1,240: still over budget at 8 open PRs, so the budget remains contended when many PR loops run at once, but about 700 requests per hour lower than before. Once #845 PR 4 lands (publisher-owned cron, gate sweep jobs deleted), the duplicated per-tick clearance evaluation (about 147 requests) disappears as well.
+Before #2167 the scheduled sweeps alone came to roughly 1,900 requests per hour at 8 open PRs, about twice the installation budget before any event-driven pass, which matches the two exhaustions observed on 2026-10-13 (19:36Z and 21:38Z). After it they come to roughly 970, and with the lint parent's event-driven passes about 1,240: still over budget at 8 open PRs. The budget then ran out at least nine times between 2026-10-13 19:36Z and 2026-10-14 05:06Z (#2220), once overnight with almost no PR activity, and each exhaustion fed itself, because every pass that ran during it turned each PR it reached into an infra red the next pass re-evaluated.
+
+**After #2220.** Four changes, all in `required-check-publisher.yml` (`specs/required_check_publisher.md` § Coverage and the installation budget):
+
+- `DUE_MAX_AGE_SECONDS` is 1800, the sweep interval (fence assertion A16 keeps them equal). At 900 every quiet green PR fell due again 15 minutes after each scheduled refresh, so under continuous PR traffic event passes re-evaluated each of them once more per interval, about 420 requests per hour at 8 open PRs; at 1800 the chained pass refreshes every verdict before it ages out.
+- Every pass reads `GET /rate_limit` (free) and budgets both buckets the gates spend: 40 REST requests per PR it would evaluate plus a 100-request reserve, and 10 GraphQL points per PR plus a 50-point reserve. Its own due-proof reads are charged per page. A pass the budget cannot cover evaluates its claimed head plus a rotating batch of what the budget does cover, so it never starts work it cannot finish and the scheduled backstop still reaches every PR at any open-PR count; a head the budget cannot cover at all is closed with the budget red instead of evaluated (and a lint-only refresh leaves it alone).
+- The first installation rate-limit failure (REST or GraphQL) stops the pass, and the red it writes backs that PR off event passes until the reset of the bucket that ran out, after which the first pass re-evaluates it with no manual rerun.
+- The scheduled floor is unchanged at about 970 requests per hour at 8 open PRs: the gate's own `scheduled-sweep` still duplicates the chained pass's clearance evaluation (about 290 per hour), and the Codex P1 and CodeRabbit sweeps duplicate its other two scripts (about 190 per hour). Removing them needs a scheduled path that does not depend on a `workflow_run` delivery, because a dropped delivery is one of the transitions the sweep covers; that is #845 PR 4's publisher-owned cron, tracked in #2224.
+
+What changes is the outage dynamics. With 8 open PRs the floor still takes most of the budget, so a busy hour can still run it out; the guard is what keeps that hour from turning into a self-sustaining outage, and the threshold fix removes about 420 requests per hour of event-pass re-evaluation under traffic.
 
 ### `resolveReviewThread`
 

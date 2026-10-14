@@ -1175,6 +1175,64 @@ for basename, (job_key, context, expected_display) in NATIVE_PRODUCERS.items():
                 "      that job's requires_relay output; without the dependency the expression",
                 "      cannot reliably select the non-required handoff name.")
 
+# ── A16 — the due threshold IS the gate sweep interval (#2220) ─────────
+#
+# DUE_MAX_AGE_SECONDS decides when an event pass re-evaluates a PR whose
+# green slot shows no activity, and it is documented as "a verdict older
+# than the sweep interval". It stayed at 900 when #2167 moved the sweep from
+# */15 to */30, so every green PR fell due again after 15 minutes and event
+# passes re-evaluated it twice as often as designed — one of the four causes
+# of the installation-budget exhaustion #2220 measured. The two values live
+# in different files, so only an assertion over both keeps them equal. The
+# cron is read from the GATE PARENT, the workflow whose schedule fires the
+# publisher's chained pass; a cron not of the form `*/N * * * *` fails here
+# rather than being guessed at. The two budget-guard knobs on the same step
+# are required non-negative integers (the per-PR cost must be positive): a
+# missing or malformed knob makes the pass fall back to evaluating without
+# a guard, which is silent.
+PUBLISH_STEP_NAME = REQUIRED_HEAD_ENV[PUBLISH_JOB][0]
+publish_step = None
+if publish_job is not None:
+    named = [s for s in (publish_job.get("steps") or [])
+             if isinstance(s, dict) and s.get("name") == PUBLISH_STEP_NAME]
+    publish_step = named[0] if len(named) == 1 else None
+publish_env = (publish_step or {}).get("env") if isinstance((publish_step or {}).get("env"), dict) else {}
+try:
+    gate_parent_doc = load(PARENT_WORKFLOW)
+except Exception:
+    gate_parent_doc = None  # unreadable parent is already reported by A6
+gate_parent_on = gate_parent_doc.get("on") if isinstance(gate_parent_doc, dict) else None
+gate_sched = gate_parent_on.get("schedule") if isinstance(gate_parent_on, dict) else None
+gate_crons = [e.get("cron") for e in gate_sched if isinstance(e, dict)] if isinstance(gate_sched, list) else []
+sweep_seconds = None
+if len(gate_crons) == 1 and isinstance(gate_crons[0], str):
+    m = re.fullmatch(r"\*/([1-9][0-9]*) \* \* \* \*", gate_crons[0].strip())
+    if m:
+        sweep_seconds = int(m.group(1)) * 60
+due_age = publish_env.get("DUE_MAX_AGE_SECONDS")
+if gate_parent_doc is not None and sweep_seconds is None:
+    bad("FAIL: [rcp due threshold] %s carries no single `*/N * * * *` schedule cron"
+        % PARENT_WORKFLOW,
+        "      (read %r), so the sweep interval DUE_MAX_AGE_SECONDS must equal" % gate_crons,
+        "      cannot be derived (#2220).")
+elif sweep_seconds is not None and str(due_age) != str(sweep_seconds):
+    bad("FAIL: [rcp due threshold] the publish step's DUE_MAX_AGE_SECONDS is %r, but the"
+        % due_age,
+        "      gate parent's sweep cron %r is every %d seconds. An event pass" % (gate_crons[0], sweep_seconds),
+        "      treats a quiet green as current only for this long, and it is defined",
+        "      as the sweep interval: shorter re-evaluates every green PR more often",
+        "      than the sweep (the 900-at-*/30 drift behind #2220), longer lets a",
+        "      verdict outlive a quiet period the sweep already allowed.")
+for knob, minimum in (("BUDGET_PER_PR_REQUESTS", 1), ("BUDGET_RESERVE_REQUESTS", 0),
+                      ("BUDGET_PER_PR_GRAPHQL_POINTS", 1), ("BUDGET_GRAPHQL_RESERVE_POINTS", 0)):
+    value = publish_env.get(knob)
+    if not (isinstance(value, str) and value.isdigit() and int(value) >= minimum):
+        bad("FAIL: [rcp budget guard] the publish step's %s is %r, not a quoted" % (knob, value),
+            "      integer >= %d. The budget guard (#2220) reads it to decide whether a" % minimum,
+            "      pass can afford every PR it would evaluate; a missing or malformed",
+            "      knob silently turns the guard off and lets a pass exhaust the",
+            "      installation budget again.")
+
 if failures:
     print("\n".join(failures))
     sys.exit(1)
