@@ -273,7 +273,12 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     sync with the file, and the remainder must not vanish into a body in
     silence.
   * The word of a here-STRING given to one of those same commands.
-  * The LITERAL operand of `trap` or `eval`, re-read AS SHELL.  The operand is
+  * The LITERAL deferred source of `trap` or `eval`, re-read AS SHELL.
+    Eval's proven literal arguments form one space-joined program, with an
+    empty-literal opt-in only for eval arguments; default command-word
+    decoding stays unchanged. Irreducible eval operands retain independent
+    scanning of known literal fragments. Trap actions and callback operands
+    remain separate. The operand is
     source the shell runs later, so quoting inside it quotes the TEXT and not
     an expansion: `trap 'echo "$PAT"' EXIT` prints the credential when the
     trap fires.  This is the same relationship an interpolating here-doc body
@@ -2570,7 +2575,7 @@ _ANSI_C_ESCAPES = {
 }
 
 
-def _unquote_command_word(w):
+def _unquote_command_word(w, allow_empty=False):
     """Reduce a command word to a literal, or return None if it is not one."""
     out = []
     i = 0
@@ -2631,7 +2636,7 @@ def _unquote_command_word(w):
         out.append(c)
         i += 1
     lit = "".join(out)
-    if not lit:
+    if not lit and not allow_empty:
         return None
     return lit
 
@@ -4023,7 +4028,7 @@ _XTRACE_OFF = ("+x", "+o")
 
 
 def _deferred_shell_operands(seg):
-    """LITERAL operands of a `trap` / `eval` segment, as shell source text."""
+    """Literal deferred source; eval's literal arguments form one program."""
     cmd, _redir = resolve_command(seg)
     if cmd == "printf" and seg._cmd_index is not None:
         out = []
@@ -4085,6 +4090,17 @@ def _deferred_shell_operands(seg):
         return out[-1:] if final_callback_certain else out
     if cmd not in DEFERRED_SHELL_COMMANDS:
         return []
+    if cmd == "eval" and seg._cmd_index is not None:
+        literals = [
+            _unquote_command_word(raw, allow_empty=True)
+            for raw, _literal in _command_arguments(seg.words, seg._cmd_index + 1)
+        ]
+        if all(literal is not None for literal in literals):
+            if literals[:1] == ["--"]:
+                literals = literals[1:]  # The builtin's optional delimiter.
+            return [" ".join(literals)] if literals else []
+        # An unknown operand keeps the existing per-literal boundary: do not
+        # invent adjacency across source that cannot be reconstructed.
     out = []
     seen_command_word = False
     for w in seg.words:
@@ -7620,6 +7636,158 @@ CORPUS = [
         MUST_FLAG,
         "eval 'echo \"$GH_TOKEN\"'\n",
     ),
+    # #1465: merged active-trace bridge and literal-joining seam.
+    (
+        'eval-cross-seam-unknown-empty-prefix-emitter',
+        MUST_FLAG,
+        'DYNAMIC=\'\'\neval "$DYNAMIC" \'echo "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-cross-seam-joined-newline-disable',
+        MUST_NOT_FLAG,
+        'set -x\neval \'set +x\n\' \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-cross-seam-joined-named-newline-disable',
+        MUST_NOT_FLAG,
+        'set -x\neval \'set +o xtrace\n\' \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-cross-seam-joined-newline-enable',
+        MUST_FLAG,
+        'eval \'set -x\n\' \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-cross-seam-joined-named-newline-enable',
+        MUST_FLAG,
+        'eval \'set -o xtrace\n\' \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-cross-seam-empty-between-disable-operands',
+        MUST_NOT_FLAG,
+        'set -x\neval \'set +x\n\' \'\' \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-cross-seam-double-empty-between-disable-operands',
+        MUST_NOT_FLAG,
+        'set -x\neval \'set +x\n\' "" \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-cross-seam-empty-between-enable-operands',
+        MUST_FLAG,
+        'eval \'set -x\n\' \'\' \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-cross-seam-traced-quoted-token-data',
+        MUST_NOT_FLAG,
+        'set -x\neval \'printf %s\' \'\'"\'"\'$GH_TOKEN\'"\'"\'\'\n',
+    ),
+    # #1465: eval joins literal arguments as one shell program.
+    (
+        'eval-joined-literal-emitter',
+        MUST_FLAG,
+        'eval echo \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-colon',
+        MUST_NOT_FLAG,
+        'eval : \'"$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-printf',
+        MUST_FLAG,
+        'eval printf %s \'"$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-plain-control',
+        MUST_NOT_FLAG,
+        'eval printf %s literal\n',
+    ),
+    (
+        'eval-joined-literal-empty-argument',
+        MUST_FLAG,
+        'eval echo \'\' \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-ordinary-printf-data',
+        MUST_NOT_FLAG,
+        'printf %s \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-input-redirection',
+        MUST_FLAG,
+        'eval echo \': "$GH_TOKEN"\' </dev/null\n',
+    ),
+    (
+        'eval-joined-literal-option-delimiter',
+        MUST_FLAG,
+        'eval -- echo \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-option-delimiter-colon',
+        MUST_NOT_FLAG,
+        'eval -- : \'"$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-irreducible-operand-keeps-literal-conservatism',
+        MUST_FLAG,
+        'DYNAMIC=\':\'\neval "$DYNAMIC" \'echo "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-double-quoted-empty-argument',
+        MUST_FLAG,
+        'eval echo "" \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-empty-colon-control',
+        MUST_NOT_FLAG,
+        'eval : \'\' \'"$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-double-quoted-empty-colon-control',
+        MUST_NOT_FLAG,
+        'eval : "" \'"$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-command-word-quote-concat',
+        MUST_FLAG,
+        'eval \'e\'"cho" \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-colon-quote-concat',
+        MUST_NOT_FLAG,
+        'eval \':\'"" \'"$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-list-emitter',
+        MUST_FLAG,
+        'eval : \'; printf %s "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-list-colon',
+        MUST_NOT_FLAG,
+        'eval \'echo;\' \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-source-output-redirection',
+        MUST_FLAG,
+        'eval \'printf %s "$GH_TOKEN"\' \'>/dev/null\'\n',
+    ),
+    (
+        'eval-joined-source-stderr-redirection',
+        MUST_FLAG,
+        'eval \'printf %s "$GH_TOKEN"\' \'>&2\'\n',
+    ),
+    (
+        'eval-joined-empty-only-program',
+        MUST_NOT_FLAG,
+        'eval \'\' ""\n',
+    ),
+    (
+        'eval-joined-quoted-literal-data',
+        MUST_NOT_FLAG,
+        'eval echo "\'literal GH_TOKEN\'"\n',
+    ),
     # --- xtrace (#1032 round 4) ------------------------------------------
     #
     # With tracing on, bash writes every expanded command to stderr, so the
@@ -10995,6 +11163,12 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    'eval-joined-source-output-redirection': (
+        'Joined literal eval source preserves the existing emitter verdict when the emitted command redirects to /dev/null. Main also flags the separated literal emitter; this bounded join does not infer normal-command sink behavior beyond the existing capture model (#1465).'
+    ),
+    'eval-irreducible-operand-keeps-literal-conservatism': (
+        'An irreducible eval operand retains the existing independent scan of known literal source fragments; no dynamic argument reconstruction proves that the runtime prefix makes the literal emitter silent.'
+    ),
     'helper-hd-owner-structural-count-grep-unknown-quiet': 'The sampled empty runtime option word leaves a count-only stream, but incomplete literal argv cannot prove that a file-list mode was absent. The fixed literal input/program remains possibly delivered without a stage-semantics or option-binding model (owner6151456891).',
     'helper-hd-owner-structural-count-grep-single-file-conservative': 'The literal filename contains positional program text. Sampled grep count with one file omits its filename label and is quiet; possible literal labels retain the owner default without a stage-semantics model (#1496 owner6151456891).',
     'helper-hd-owner-structural-plain-head-output-null': 'The sampled initial stage sends its output to null, but only the final stage receives non-forwarding proof in this source path: no stage-semantics model. The owner explicitly inverts possible delivery without evaluating intermediate stages. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
@@ -13928,6 +14102,31 @@ def _deferred_shell_cases():
     cannot read the source the one place that admission is invisible.
     """
     failures = []
+    for raw in ("''", '""'):
+        if (_unquote_command_word(raw) is not None
+                or _unquote_command_word(raw, allow_empty=True) != ""):
+            failures.append("eval empty-literal opt-in: " + raw)
+    for raw in ("$DYNAMIC", '"$DYNAMIC"'):
+        if _unquote_command_word(raw, allow_empty=True) is not None:
+            failures.append("eval reconstructed a dynamic argument: " + raw)
+    extraction_cases = [
+        ("eval echo ': \"$GH_TOKEN\"'", ['echo : "$GH_TOKEN"']),
+        ("eval : '\"$GH_TOKEN\"'", [': "$GH_TOKEN"']),
+        ("eval '' \"\"", [" "]),
+        ("eval --", []),
+        ("eval echo ': \"$GH_TOKEN\"' </dev/null", ['echo : "$GH_TOKEN"']),
+        ("eval \"$DYNAMIC\" 'echo \"$GH_TOKEN\"' literal", ['echo "$GH_TOKEN"', 'literal']),
+        ("trap ': \"$GH_TOKEN\"' EXIT", [': "$GH_TOKEN"', 'EXIT']),
+        ("mapfile -tC ': \"$GH_TOKEN\"' rows", [': "$GH_TOKEN"']),
+        ("readarray -tC': \"$GH_TOKEN\"' rows", [': "$GH_TOKEN"']),
+        ("printf %s ': \"$GH_TOKEN\"'", []),
+    ]
+    for text, expected in extraction_cases:
+        lx = Lexer(text + "\n")
+        actual = [inner for ll in lx.logical for seg in ll.segments
+                  for inner in _deferred_shell_operands(seg)]
+        if actual != expected:
+            failures.append("deferred source extraction: %r -> %r" % (text, actual))
     cases = [
         (
             "trap-heredoc-unterminated",
