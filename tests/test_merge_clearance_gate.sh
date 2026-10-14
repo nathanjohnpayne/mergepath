@@ -2027,13 +2027,6 @@ mcg22_case b 's{(      - name: Open the required check_run[^\n]*\n)}{$1        i
 #     intact; only the parse sees that the job is unreachable.
 mcg22_case c 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: false}sm' \
   fail "[#850 producer eligibility] job 'scheduled-sweep'"
-# c2 — #2220: the sweep's find step defers to the required-check publisher
-#     only when the sweep's own state step reports it ACTIVE. An inverted
-#     condition sweeps exactly when the publisher already evaluates and stops
-#     when it does not, so it must trip the step pin; the canonical condition
-#     is the positive control above (case I).
-mcg22_case c2 's{steps\.publisher\.outputs\.active != \x27true\x27}{steps.publisher.outputs.active == \x27true\x27}' \
-  fail "[#850 producer eligibility] step 'Find open PRs' in job 'scheduled-sweep'"
 # d — #849 hole 1: phase 2 loses its own HEAD_SHA. A job-scoped grep for the
 #     binding is satisfied by phase 1's.
 mcg22_case d 's{(      - name: Close the required check_run.*?)^          HEAD_SHA: [^\n]*\n}{$1}sm' \
@@ -4718,18 +4711,15 @@ fi
 # ---------------------------------------------------------------------------
 # Test 28 (#2220): the installation-budget fences.
 #
-# Two assertions in scripts/ci/check_required_check_publisher, each read
-# across two files, and the budget-guard knobs:
+# One assertion in scripts/ci/check_required_check_publisher read across two
+# files, and the four budget-guard knobs:
 #
 #   * A16 — the publish step's DUE_MAX_AGE_SECONDS equals the gate parent's
 #     sweep interval. It was left at 900 when #2167 moved the sweep to */30,
 #     so every green PR fell due again after 15 minutes. Either side drifting
 #     must trip it, and a cron it cannot read must trip it too.
-#   * A16 knobs — BUDGET_PER_PR_REQUESTS and BUDGET_RESERVE_REQUESTS are
-#     required integers; a missing one silently turns the guard off.
-#   * A17 — the gate sweep's `Find open PRs` step defers to the publisher on
-#     the publisher's exact path, required and exact: deleting the condition
-#     doubles the clearance evaluation per scheduled tick with nothing red.
+#   * A16 knobs — the REST and GraphQL per-PR costs and reserves are required
+#     integers; a missing one silently turns the guard off.
 #
 # Same posture as Tests 25 and 27: fixtures are derived from the canonical
 # files, every mutation has a no-op guard, and every negative case names
@@ -4742,7 +4732,7 @@ elif ! python3 -c "import yaml" >/dev/null 2>&1; then
 elif ! command -v perl >/dev/null 2>&1 || ! declare -f rcp_dir_case >/dev/null 2>&1; then
   echo; echo "SKIP: Test 28 (#2220) — perl or the Test 25 harness unavailable"
 else
-echo; echo "--- Test 28 (#2220): due threshold, budget knobs, one scheduled evaluation per PR"
+echo; echo "--- Test 28 (#2220): due threshold equals the sweep interval, budget knobs"
 RCP_TAG='#2220'
 RCP_DIR="${RCP_DIR:-$WORKDIR/rcp}"
 mkdir -p "$RCP_DIR"
@@ -4771,22 +4761,6 @@ rcp_case budget-per-pr-zero \
 rcp_case budget-reserve-missing \
   's{^          BUDGET_RESERVE_REQUESTS: "100"\n}{}m' \
   fail '[rcp budget guard]'
-# ── A17: the gate sweep defers to the publisher ─────────────────────────
-rcp_dir_case sweep-defer-removed \
-  'perl -0777 -i -pe "s{^        if: steps\.publisher\.outputs\.active != \x27true\x27\n}{}m" merge-clearance-gate.yml' \
-  fail '[rcp single scheduled evaluation]'
-rcp_dir_case sweep-defer-inverted \
-  'perl -0777 -i -pe "s{active != \x27true\x27}{active == \x27true\x27}" merge-clearance-gate.yml' \
-  fail '[rcp single scheduled evaluation]'
-# The state step must exist before the find step, and must read the
-# publisher's WORKFLOW STATE rather than only its file: a file survives a UI
-# disable that stops every chained delivery (Codex P2 on #2225).
-rcp_dir_case sweep-state-step-missing \
-  'perl -0777 -i -pe "s{^        id: publisher\n}{        id: publisher_state\n}m" merge-clearance-gate.yml' \
-  fail 'with id `publisher` before `Find open PRs`'
-rcp_dir_case sweep-state-file-only \
-  'perl -0777 -i -pe "s{\[ \"\\\$state\" = \"active\" \]}{[ -f .github/workflows/required-check-publisher.yml ]}" merge-clearance-gate.yml' \
-  fail 'publisher-state step'
 rcp_case budget-gql-per-pr-missing \
   's{^          BUDGET_PER_PR_GRAPHQL_POINTS: "10"\n}{}m' \
   fail '[rcp budget guard]'

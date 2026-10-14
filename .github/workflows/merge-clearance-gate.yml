@@ -95,15 +95,14 @@ on:
     types: [merge-clearance-recheck]
   # Periodic sweep — the only backstop for transitions that fire no
   # Actions event (👍 reaction, UI label resolve, GITHUB_TOKEN relabel).
-  # */30 since #2167 (was */15, mirroring codex-p1-gate.yml). Each tick
-  # chains one publisher full pass (about 243 installation-token requests at
-  # 8 open PRs); since #2220 the scheduled-sweep job below defers to that
-  # pass wherever the publisher exists, instead of evaluating the clearance
-  # script a second time (about 147 more). Lint completion is event-driven
-  # through the publisher's repo-lint parent, so only no-event transitions
-  # wait for this tick: up to 30 minutes. Pinned by
-  # check_required_check_publisher, which also pins the publisher's
-  # DUE_MAX_AGE_SECONDS to this interval (A16).
+  # */30 since #2167 (was */15, mirroring codex-p1-gate.yml): each tick runs
+  # this sweep job AND chains one publisher full pass, about 390 installation-
+  # token requests at 8 open PRs, and the three */15 sweeps together spent
+  # about twice the 1,000/hr budget. Lint completion is event-driven through
+  # the publisher's repo-lint parent, so only no-event transitions wait for
+  # this tick: up to 30 minutes. Pinned by check_required_check_publisher,
+  # which also pins the publisher's DUE_MAX_AGE_SECONDS to this interval
+  # (A16, #2220): change the two together.
   schedule:
     - cron: "*/30 * * * *"
 
@@ -415,22 +414,17 @@ jobs:
     # coalesces into the push-time suite — so a job-native completion can
     # never retire a Checks-API entry (#841). Since #841 the event-driven job
     # publishes into this same slot, so every producer of this context carries
-    # the same verdict. Idempotent. Since #2220 it evaluates only where the
-    # required-check publisher is absent or inactive: elsewhere that
-    # publisher's chained schedule-parent pass is the one scheduled evaluation
-    # of every open PR (see the publisher-state step).
+    # the same verdict. Idempotent.
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     # Only this job needs checks:write — it POSTs a check_run per open PR.
     # issues:read for the same /issues/{pr}/comments + /issues/{pr}/reactions
     # reads the event-driven job needs (Codex P2 on PR #429).
-    # actions:read for the publisher-state read below (#2220).
     permissions:
       contents: read
       pull-requests: read
       issues: read
       checks: write
-      actions: read
     steps:
       - name: Checkout repo (default branch — trusted scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -439,53 +433,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Check whether the required-check publisher runs here
-        id: publisher
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -uo pipefail
-          # The sweep below defers ONLY to a publisher that will actually
-          # receive this run's workflow_run delivery (#2220; Codex P2 on
-          # #2225): the file must exist on the default branch AND the
-          # workflow must be `active`. A publisher disabled in the Actions
-          # UI still has its file, but gets no chained delivery, so file
-          # presence alone would leave no scheduled clearance refresh at all.
-          # Absent, disabled, renamed or unreadable all mean: sweep here
-          # (fail toward evaluating). One request per tick.
-          state=""
-          if [ -f .github/workflows/required-check-publisher.yml ]; then
-            state=$(gh api "repos/$REPO/actions/workflows/required-check-publisher.yml" \
-                      --jq .state 2>/dev/null) || state=""
-          fi
-          if [ "$state" = "active" ]; then
-            echo "active=true" >> "$GITHUB_OUTPUT"
-            echo "The required-check publisher is active; its chained schedule-parent pass is this tick's one evaluation of every open PR (#2220)."
-          else
-            echo "active=false" >> "$GITHUB_OUTPUT"
-            echo "Required-check publisher state is '${state:-absent or unreadable}'; sweeping here (#2220)."
-          fi
-
       - name: Find open PRs
         id: find
-        # ONE scheduled evaluation per PR per tick (#2220, the sweep half of
-        # #845 PR 4). Wherever the required-check publisher exists on the
-        # default branch, this run's completion chains its schedule-parent
-        # pass, which evaluates every open PR with all three gate scripts and
-        # writes this same Checks-API slot — so evaluating the clearance
-        # script here as well spent about 147 more installation-budget
-        # requests per tick (8 open PRs) for a verdict the publisher
-        # overwrites moments later. Skipping this step leaves
-        # steps.find.outputs.prs empty, so the evaluate step below skips on
-        # its own pinned condition. A repository without an ACTIVE publisher
-        # (a consumer mid-rollout, or one disabled in the Actions UI) keeps
-        # this sweep exactly as it was: the previous step decides from the
-        # publisher's file and its workflow state, so a renamed, deleted or
-        # disabled publisher fails back to sweeping. The schedule itself
-        # stays: it is what fires the publisher's chained pass (the
-        # publisher carries no cron of its own until PR 4).
-        if: steps.publisher.outputs.active != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}

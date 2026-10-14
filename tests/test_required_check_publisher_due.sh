@@ -29,9 +29,11 @@
 #   8. Budget guard: below the threshold an event pass evaluates only the
 #      event head (whose holds it still closes), spends no due() read on the
 #      rest, and writes nothing on any skipped PR; a budget that covers the
-#      head but not every due PR does the same after the due reads; a
-#      schedule-parent pass and a dispatch evaluate nothing new (the dispatch
-#      opens no holds); an unreadable /rate_limit evaluates as before.
+#      head and some due PRs evaluates the head plus a batch of that size; a
+#      schedule-parent pass or dispatch with no capacity evaluates nothing new
+#      (the dispatch opens no holds), and with some capacity evaluates a
+#      ROTATING batch that covers every PR within ceil(PRs / batch) ticks; an
+#      unreadable /rate_limit evaluates as before.
 #   9. Stop at the first installation rate-limit failure: no later PR is
 #      evaluated or written; on the event head itself the remaining contexts
 #      are closed with the rate-limit red without being evaluated.
@@ -39,9 +41,10 @@
 #      due before the reset its title records and due after it; an ordinary
 #      infra red stays due; a red whose title records no reset backs off for
 #      at most one hour.
-#  11. One evaluation per PR per scheduled tick: the gate sweep defers to the
-#      publisher (its find step is skipped wherever the publisher exists), and
-#      the schedule-parent pass runs each gate exactly once per PR.
+#  11. The schedule-parent pass runs each gate exactly once per open PR.
+#  12. Codex rounds on #2225: the GraphQL bucket, page-counted proof reads, a
+#      head too expensive to evaluate, a lint-only refresh that must not write,
+#      and a token so empty that no write after the failure lands.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -161,7 +164,18 @@ elif method == "GET" and re.fullmatch(r"/commits/[^/]+/check-runs", path):
     if fields.get("filter") == "all":
         if sha in fx.get("fail_reads", []):
             sys.stderr.write("HTTP 502\n"); sys.exit(1)
-        body = {"check_runs": fx["runs"].get(sha, [])}
+        runs_for = fx["runs"].get(sha, [])
+        if sha in fx.get("two_pages", []) and jq:
+            # Two HTTP pages: gh applies --jq to each page separately.
+            outs = []
+            for page in (runs_for[:len(runs_for) // 2], runs_for[len(runs_for) // 2:]):
+                r = subprocess.run(["jq", "-r", jq], input=json.dumps({"check_runs": page}),
+                                   capture_output=True, text=True)
+                if r.returncode:
+                    sys.stderr.write(r.stderr); sys.exit(r.returncode)
+                outs.append(r.stdout.rstrip("\n"))
+            print("\n".join(o for o in outs if o)); sys.exit(0)
+        body = {"check_runs": runs_for}
     else:
         body = {"check_runs": []}  # freshness / superseded-head probes: nothing newer
 elif method == "POST" and path == "/check-runs":
@@ -236,6 +250,7 @@ run_pass() {  # run_pass <label> <event_name> <run_head> <parent_event> <dispatc
     export PATH="$TMP/bin:$PATH" FIXTURE="$TMP/fixture.json" GH_LOG="$TMP/gh.log" GATE_LOG="$TMP/gates.log"
     export REPO="acme/widget" GITHUB_RUN_ID=4242 GH_TOKEN=x EXHAUST_FLAG="$TMP/exhausted"
     export EVENT_NAME="$2" RUN_HEAD="$3" PARENT_EVENT="$4" DISPATCH_PR="$5"
+    export PARENT_NAME="${CASE_PARENT_NAME:-Merge Clearance Gate}"
     [ -z "${CASE_FIXTURE:-}" ] || FIXTURE="$CASE_FIXTURE"
     export MCG_CONTEXT="Merge clearance gate" CODEX_P1_CONTEXT="Codex P1 unresolved threads"
     export CODERABBIT_CONTEXT="CodeRabbit unresolved blocking findings"
@@ -349,23 +364,52 @@ check "short budget: the pass says what it skipped" \
 
 # 300 remaining: covers the head plus one (180), so the due reads run, but
 # not the nine due PRs (460): still only the event head.
+# 300 remaining: covers the head plus some, but not the nine due PRs.
 RL_REMAINING=300 run_pass budget-after-due workflow_run h1 pull_request ""
 unset RL_REMAINING
-expect_eval "budget short of every due PR: still only the event head" "1"
-check "budget short of every due PR: the due reads ran, and nothing outside h1 was written" \
-  eval '! no_due_reads && [ -z "$(writes_outside h1)" ]'
+evaluated_list() { awk -F'\t' '$1=="merge-clearance-gate.sh"{print $2}' "$TMP/gates.log"; }
+check "budget short of every due PR: the head plus a batch the budget covers, all of them due" \
+  eval '[ "$(evaluated_list | head -1)" = 1 ] && [ "$(evaluated_list | wc -l | tr -d " ")" = 4 ] && ! evaluated_list | grep -qx -e 2 -e 6'
+check "budget short of every due PR: writes land only on evaluated heads" \
+  eval '[ -z "$(writes_outside $(evaluated_list | sed "s/^/h/"))" ]'
 
-RL_REMAINING=150 run_pass budget-schedule workflow_run maintip schedule ""
+# 130 remaining: below one evaluation plus the reserve, so no capacity.
+RL_REMAINING=130 run_pass budget-schedule workflow_run maintip schedule ""
 unset RL_REMAINING
-expect_eval "short budget: a schedule-parent pass evaluates nothing new" ""
-check "short budget: the schedule-parent pass writes nothing and says so" \
+expect_eval "no capacity: a schedule-parent pass evaluates nothing new" ""
+check "no capacity: the schedule-parent pass writes nothing and says so" \
   eval '[ -z "$(writes_outside)" ] && grep -q "evaluating nothing new" "$TMP/out.log"'
 
-RL_REMAINING=150 run_pass budget-dispatch repository_dispatch "" "" 2
+RL_REMAINING=130 run_pass budget-dispatch repository_dispatch "" "" 2
 unset RL_REMAINING
-expect_eval "short budget: a dispatch evaluates nothing new" ""
-check "short budget: the dispatch opens no hold it could not close" \
+expect_eval "no capacity: a dispatch evaluates nothing new" ""
+check "no capacity: the dispatch opens no hold it could not close" \
   [ -z "$(writes_outside)" ]
+
+# 150: capacity for one. The dispatch spends it on the named PR.
+RL_REMAINING=150 run_pass budget-dispatch-one repository_dispatch "" "" 2
+unset RL_REMAINING
+expect_eval "capacity for one: a dispatch evaluates exactly its named PR" "2"
+
+# Rotating batches (Codex P1 on #2225): at a capacity of 3, a schedule-parent
+# pass evaluates exactly three PRs, and four consecutive ticks cover all 11.
+: >"$TMP/rotation.log"
+for k in 0 1 2 3; do
+  python3 - "$TMP/fixture.json" "$TMP/fx-tick.json" "$k" <<'PY2'
+import json, sys, datetime as d
+fx = json.load(open(sys.argv[1]))
+t = d.datetime(2026, 10, 14, 3, 0, tzinfo=d.timezone.utc) + d.timedelta(seconds=1800 * int(sys.argv[3]))
+fx["pass_start"] = t.strftime("%Y-%m-%dT%H:%M:%SZ")
+json.dump(fx, open(sys.argv[2], "w"))
+PY2
+  RL_REMAINING=220 CASE_FIXTURE="$TMP/fx-tick.json" run_pass "rotate-$k" workflow_run maintip schedule ""
+  awk -F'\t' '$1=="merge-clearance-gate.sh"{print $2}' "$TMP/gates.log" | tr '\n' ' ' >>"$TMP/rotation.log"
+  echo >>"$TMP/rotation.log"
+done
+check "rotating batch: each tick evaluates exactly the three PRs the budget covers" \
+  eval '! awk "NF != 3" "$TMP/rotation.log" | grep -q .'
+check "rotating batch: four consecutive ticks cover all eleven open PRs" \
+  [ "$(tr ' ' '\n' <"$TMP/rotation.log" | grep . | sort -un | wc -l | tr -d ' ')" = 11 ]
 
 RL_REMAINING=fail run_pass budget-unreadable workflow_run h1 pull_request ""
 unset RL_REMAINING
@@ -443,41 +487,6 @@ unset CASE_FIXTURE
 run_pass tick workflow_run maintip schedule ""
 check "scheduled tick: the publisher runs each gate exactly once per open PR" \
   eval '[ "$(wc -l <"$TMP/gates.log" | tr -d " ")" = 33 ] && [ -z "$(sort "$TMP/gates.log" | uniq -d)" ]'
-GATE_WF="$ROOT/.github/workflows/merge-clearance-gate.yml"
-check "scheduled tick: the gate sweep's find step defers on the publisher-state step's output" \
-  ruby -ryaml -e '
-    wf = YAML.load_file(ARGV[0])
-    steps = wf.dig("jobs", "scheduled-sweep", "steps") || []
-    find = steps.index { |s| s["name"] == "Find open PRs" }
-    state = steps.index { |s| s["id"] == "publisher" }
-    evaluate = steps.select { |s| s["name"] == "Re-evaluate gate per PR and post check_run" }
-    ok = find && state && state < find &&
-         steps[find]["if"] == "steps.publisher.outputs.active != \x27true\x27" &&
-         evaluate.length == 1 && evaluate[0]["if"] == "steps.find.outputs.prs != \x27\x27"
-    File.write(ARGV[1], steps[state]["run"]) if state
-    exit(ok ? 0 : 1)' "$GATE_WF" "$TMP/state-step.sh"
-# Run the extracted publisher-state step against each workflow state: it
-# reports active (the sweep defers) only for an existing, `active` publisher.
-mkdir -p "$TMP/state/.github/workflows" "$TMP/state-bin"
-cat >"$TMP/state-bin/gh" <<'SH'
-#!/usr/bin/env bash
-[ "$PUB_STATE" = fail ] && { echo "HTTP 502" >&2; exit 1; }
-printf '%s\n' "$PUB_STATE"
-SH
-chmod +x "$TMP/state-bin/gh"
-state_says() {  # state_says <state> <file present 1|0>
-  [ "$2" = 1 ] && : >"$TMP/state/.github/workflows/required-check-publisher.yml" \
-    || rm -f "$TMP/state/.github/workflows/required-check-publisher.yml"
-  : >"$TMP/state-out"
-  ( cd "$TMP/state" && PATH="$TMP/state-bin:$PATH" PUB_STATE="$1" REPO=acme/widget \
-      GITHUB_OUTPUT="$TMP/state-out" bash "$TMP/state-step.sh" >/dev/null 2>&1 )
-  sed -n 's/^active=//p' "$TMP/state-out"
-}
-check "scheduled tick: an active publisher makes the sweep defer" [ "$(state_says active 1)" = true ]
-check "scheduled tick: a publisher disabled in the UI keeps the sweep" [ "$(state_says disabled_manually 1)" = false ]
-check "scheduled tick: an absent publisher keeps the sweep" [ "$(state_says active 0)" = false ]
-check "scheduled tick: an unreadable workflow state keeps the sweep" [ "$(state_says fail 1)" = false ]
-
 # ── Codex round 1 on #2225 ─────────────────────────────────────────────
 # The GraphQL bucket is budgeted too: a healthy REST core with an empty
 # GraphQL bucket still evaluates only the event head.
@@ -512,6 +521,21 @@ unset RL_EXHAUST_BUCKET
 # The production path once the token is empty: every write after the failure
 # fails as well. Nothing is written green, the event head's holds stay
 # PENDING (fail closed), and the pass ends red rather than hanging.
+# A lint-parent refresh opened no holds, so a budget short of one evaluation
+# must leave the head untouched rather than close it red (Codex P1 on #2225).
+RL_REMAINING=120 CASE_PARENT_NAME=repo-lint run_pass lint-prestop workflow_run h1 pull_request ""
+check "budget short of one evaluation on a repo-lint refresh: no gate runs and nothing is written" \
+  eval '[ ! -s "$TMP/gates.log" ] && [ -z "$(writes_outside)" ]'
+# A proof read is charged per PAGE (Codex P2 on #2225): h3's runs span two
+# pages, so at 185 the reads stop one PR earlier than the six above.
+python3 - "$TMP/fixture.json" "$TMP/fx-pages.json" <<'PY2'
+import json, sys
+fx = json.load(open(sys.argv[1])); fx["two_pages"] = ["h3"]
+json.dump(fx, open(sys.argv[2], "w"))
+PY2
+RL_REMAINING=185 CASE_FIXTURE="$TMP/fx-pages.json" run_pass due-pages workflow_run h1 pull_request ""
+check "a two-page proof read is charged two requests" \
+  [ "$(grep -c '"filter": "all"' "$TMP/gh.log")" = 5 ]
 RL_FAIL_PR=1 RL_EXHAUST_WRITES=1 run_pass stop-no-writes workflow_run h1 pull_request ""
 check "exhausted token after the failure: no write lands and the holds stay pending" \
   eval '[ "$(posts h1 in_progress)" = 3 ] && [ "$(posts h1 completed)" = 0 ] && [ -z "$(writes_outside h1)" ] && [ "$RC" -ne 0 ] && ! grep -q "\"conclusion\": \"success\"" "$TMP/gh.log" "$TMP/gh.log.rejected"'

@@ -338,6 +338,11 @@ jobs:
           # The parent run's own trigger: `schedule` marks the sweep pass,
           # which keeps full coverage (#1130 due-only targeting below).
           PARENT_EVENT: ${{ github.event.workflow_run.event }}
+          # Which parent delivered this pass (#2220, Codex P1 on #2225): a
+          # repo-lint parent opened no holds (the open job admits only the
+          # gate parent), so a lint-only refresh must never close the head
+          # with a budget red.
+          PARENT_NAME: ${{ github.event.workflow_run.name }}
           # An event pass skips an open PR only while its published verdicts
           # are younger than this — the parent sweep's own cadence, so no
           # verdict outlives what a quiet period already allowed. EQUAL to
@@ -537,6 +542,19 @@ jobs:
             [ "$gql_known" -eq 1 ] || return 0
             [ "$gql_remaining" -ge $(( gql_per_pr * $1 + gql_reserve )) ]
           }
+          # capacity: how many PR evaluations the budget covers beyond the
+          # reserves (a large number when the budget is unknown).
+          capacity() {
+            local k g
+            if [ "$budget_known" -ne 1 ]; then echo 1000000; return 0; fi
+            k=$(( (rl_remaining - spent - reserve) / per_pr ))
+            if [ "$gql_known" -eq 1 ]; then
+              g=$(( (gql_remaining - gql_reserve) / gql_per_pr ))
+              [ "$g" -ge "$k" ] || k="$g"
+            fi
+            [ "$k" -ge 0 ] || k=0
+            echo "$k"
+          }
           # The reset to stamp on a budget red: the later reset of the
           # bucket(s) that cannot cover one evaluation, so the back-off ends
           # when the bucket that actually ran out refills (Codex P1 on
@@ -602,14 +620,14 @@ jobs:
               fi
             done
           }
-          # A dispatch is a full pass, so its budget is decided here, BEFORE
-          # it claims the named head (#2220): a dispatch the budget cannot
-          # cover evaluates nothing new, and holds it opened anyway would
-          # have no verdict to close them.
+          # A dispatch decides here, BEFORE it claims the named head (#2220):
+          # one that cannot afford even the named PR evaluates nothing new,
+          # because holds it opened anyway would have no verdict to close
+          # them. One that can claims it, and the batch below fills the rest.
           budget_low=0
           if [ -n "$dispatch_matched" ]; then
             dispatch_head=$(awk -F'\t' 'NR==1{print $2}' <<<"$dispatch_matched")
-            if ! affordable "$n_targets"; then
+            if ! affordable 1; then
               budget_low=1
             elif [ -n "$dispatch_head" ]; then
               open_holds "$dispatch_head"
@@ -634,6 +652,12 @@ jobs:
               && [ "$(awk -F'\t' 'NR==1{print $2}' <<<"$targets")" = "$RUN_HEAD" ]; then
             if affordable 1; then
               open_holds "$RUN_HEAD"
+            elif [ "${PARENT_NAME:-}" = "repo-lint" ]; then
+              # A lint-parent pass opened no holds and the gates do not
+              # read `lint`, so there is nothing to close and nothing new to
+              # learn: leave the head's verdicts exactly as they are (Codex
+              # P1 on #2225). The batch below then evaluates nothing.
+              echo "::notice::Budget guard (#2220): short of one evaluation on a repo-lint refresh; leaving $RUN_HEAD as it is."
             else
               CLAIMED_HEADS="$CLAIMED_HEADS $RUN_HEAD"
               RATE_LIMITED=1
@@ -693,11 +717,6 @@ jobs:
             echo "::warning::Could not compute the due-only cutoff; running a full pass (fail closed)."
             due_only=0
           fi
-          # A full pass (schedule parent, dispatch, superseded event head)
-          # evaluates every open PR, so its budget is known now (#2220).
-          if [ "$due_only" -eq 0 ] && ! affordable "$n_targets"; then
-            budget_low=1
-          fi
           # retry_after <title> <completed_at>: the time before which a
           # rate-limit red is backed off — the reset its title records,
           # capped at one hour after the red (a rate-limit window is never
@@ -721,12 +740,21 @@ jobs:
           due() {
             local hd="$1" updated="$2" rows ctx newest d_status d_concl d_done d_title retry backoff=""
             DUE_REASON=""
+            DUE_PAGES=0
             case "$updated" in ''|null) return 0 ;; esac
+            # --jq runs once per fetched page, so the `__page__` line it
+            # emits counts the HTTP requests this read cost: a head with
+            # more than 100 check runs costs one per page (Codex P2 on
+            # #2225), and the caller charges every one to the budget.
+            DUE_PAGES=1
             if ! rows=$(gh api --paginate -X GET "repos/$REPO/commits/$hd/check-runs" \
                 -f filter=all -f per_page=100 \
-                --jq '.check_runs[] | select(((.details_url // "") | test("/actions/runs/")) | not) | [.name, (.id | tostring), .status, (.conclusion // "-"), (.completed_at // "-"), (.output.title // "-")] | @tsv'); then
+                --jq '"__page__", (.check_runs[] | select(((.details_url // "") | test("/actions/runs/")) | not) | [.name, (.id | tostring), .status, (.conclusion // "-"), (.completed_at // "-"), (.output.title // "-")] | @tsv)'); then
               return 0
             fi
+            DUE_PAGES=$(grep -c '^__page__$' <<<"$rows" || true)
+            [ "${DUE_PAGES:-0}" -ge 1 ] || DUE_PAGES=1
+            rows=$(grep -v '^__page__$' <<<"$rows" || true)
             for ctx in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
               newest=$(awk -F'\t' -v n="$ctx" '$1 == n && ($2 + 0) > max { max = $2 + 0; row = $0 } END { print row }' <<<"$rows")
               [ -n "$newest" ] || return 0
@@ -977,8 +1005,9 @@ jobs:
                 budget_skipped="$budget_skipped #$PR"
                 continue
               fi
-              spent=$((spent + 1))
+              DUE_PAGES=1
               if ! due "$head_sha" "${pr_updated:-}"; then
+                spent=$((spent + DUE_PAGES))
                 if [ "${DUE_REASON%% *}" = backoff ]; then
                   echo "PR #$PR @ $head_sha: newest verdict is an installation rate-limit red; backed off until ${DUE_REASON#backoff }, after which the first pass re-evaluates it (#2220)."
                 else
@@ -987,6 +1016,7 @@ jobs:
                 skipped=$((skipped + 1))
                 continue
               fi
+              spent=$((spent + DUE_PAGES))
             fi
             selected="$selected$PR"$'\t'"$head_sha"$'\n'
           done <<<"$targets"
@@ -997,19 +1027,44 @@ jobs:
             budget_low=1
           fi
           if [ "$budget_low" -eq 1 ]; then
+            # Claimed heads always stay (their holds must close). The rest
+            # of the capacity goes to a ROTATING batch of the other PRs
+            # (Codex P1 on #2225): an all-or-nothing rule could never run a
+            # full pass once 40 x open PRs + 100 exceeds the whole bucket
+            # (23 PRs), leaving the scheduled backstop dead indefinitely.
+            # The offset advances by the batch size every sweep interval,
+            # so at a steady budget every PR is evaluated within
+            # ceil(PRs / batch) ticks.
             kept=""
+            others=""
+            n_claimed_kept=0
             while IFS=$'\t' read -r PR head_sha; do
               [ -z "$PR" ] && continue
               case " $CLAIMED_HEADS " in
-                *" $head_sha "*) kept="$kept$PR"$'\t'"$head_sha"$'\n' ;;
-                *) budget_skipped="$budget_skipped #$PR" ;;
+                *" $head_sha "*) kept="$kept$PR"$'\t'"$head_sha"$'\n'; n_claimed_kept=$((n_claimed_kept + 1)) ;;
+                *) others="$others$PR"$'\t'"$head_sha"$'\n' ;;
               esac
             done <<<"$selected"
-            selected="$kept"
-            if [ -n "$CLAIMED_HEADS" ]; then
-              scope="evaluating only the head(s) this pass claimed with holds"
-            else
+            slots=$(( $(capacity) - n_claimed_kept ))
+            [ "$slots" -ge 0 ] || slots=0
+            n_others=$(awk 'NF { n++ } END { print n + 0 }' <<<"$others")
+            batch=""
+            if [ "$slots" -gt 0 ] && [ "$n_others" -gt 0 ]; then
+              tick=$(jq -nr --arg t "$PASS_START" --argjson i "${DUE_MAX_AGE_SECONDS:-1800}" \
+                       '($t | fromdateiso8601) / $i | floor' 2>/dev/null || echo 0)
+              batch=$(awk -v off=$(( (tick * slots) % n_others )) -v take="$slots" \
+                        'NF { a[n++] = $0 } END { for (i = 0; i < take && i < n; i++) print a[(off + i) % n] }' <<<"$others")
+            fi
+            while IFS=$'\t' read -r PR head_sha; do
+              [ -z "$PR" ] && continue
+              grep -qxF "$PR"$'\t'"$head_sha" <<<"$batch" || budget_skipped="$budget_skipped #$PR"
+            done <<<"$others"
+            selected="$kept$batch"
+            n_batch=$(awk 'NF { n++ } END { print n + 0 }' <<<"$batch")
+            if [ "$n_claimed_kept" -eq 0 ] && [ "$n_batch" -eq 0 ]; then
               scope="evaluating nothing new"
+            else
+              scope="evaluating $n_claimed_kept claimed head(s) and a rotating batch of $n_batch of $n_others other PR(s)"
             fi
             echo "::notice::Budget guard (#2220): $(( rl_remaining - spent )) REST request(s) and ${gql_remaining} GraphQL point(s) remain until ${RATE_LIMIT_RESET_ISO:-the window resets}, short of $per_pr requests and $gql_per_pr points per PR to evaluate plus reserves of $reserve and $gql_reserve; $scope. Skipped:${budget_skipped:- none}. Each skipped PR keeps its previous verdict on its own head."
           fi
