@@ -271,8 +271,12 @@ test_request_by_default_false_skips_under_threshold() {
     fail "rbd false ungated: head_sha=$head, expected null (skipped before PR fetch)"
   elif [ "$terminal_shape" != "true" ]; then
     fail "rbd false ungated: terminal_determination must be present and null"
+  elif ! grep -q 'Codex is mandatory: rerun with MERGEPATH_PHASE_4A_GATED=true' "$dir/err.log"; then
+    # Codex P1 on #2175: a Phase 4 caller that forgot the gate flag must be
+    # told, not left to read the skip as "Codex not needed".
+    fail "rbd false ungated: the skip must name MERGEPATH_PHASE_4A_GATED=true for a Phase 4 PR; stderr=$(cat "$dir/err.log")"
   else
-    pass "request_by_default:false + under-threshold ⇒ skip with exit 5"
+    pass "request_by_default:false + under-threshold ⇒ skip with exit 5, naming the Phase 4 gate flag"
   fi
 }
 

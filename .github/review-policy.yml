@@ -225,16 +225,20 @@ feedback_policy:
 #
 # Phase 2.5 runs only when scripts/coderabbit-should-invoke.sh <PR#> exits 0
 # (#1084). `coderabbit.enabled: true` is necessary but NOT sufficient: the
-# `invoke` mode below decides whether THIS PR gets the wait. Run the decider
-# rather than reading `enabled` directly, or a repo set to `never` or to a
-# routine `complex-changes` result still gets waited on.
+# `invoke` mode below decides whether THIS PR gets the Phase 2.5 pass. Run the
+# decider rather than reading `enabled` directly, or a repo set to `never` or
+# to a routine `complex-changes` result still gets reviewed and waited on.
 #
 # When the decider says invoke, the agent MUST:
-#   1. Wait for CodeRabbit to post before proceeding — prefer
+#   1. Confirm CodeRabbit has posted on the MERGE head before merge, with
 #      scripts/coderabbit-wait.sh, whose max_wait_seconds ceiling (1245s,
 #      the measured full-fleet max + one poll interval; #623) covers the real latency
 #      (p50 ~6 min, p99 ~19 min). Do NOT hand-wait a folkloric ~3 min and
-#      escalate early: that reopens the #136 pre-review-merge race.
+#      escalate early: that reopens the #136 pre-review-merge race. Wait
+#      BEFORE Phase 3 only when the decider reports `wait: true`
+#      (wait_for_review below; default false, #2166): the pre-merge check
+#      runs after CI, which outlasts CodeRabbit's p99, so it normally returns
+#      at once, while a pre-Phase-3 wait held every round's Codex request.
 #   2. Read BOTH API endpoints:
 #      - gh api repos/{owner}/{repo}/issues/{pr}/comments  (PR-level summary)
 #      - gh api repos/{owner}/{repo}/pulls/{pr}/comments    (inline diff comments)
@@ -251,8 +255,9 @@ feedback_policy:
 # CodeRabbit GitHub App. All agent instructions use conditional language
 # and will skip Phase 2.5 automatically.
 coderabbit:
-  # When PHASE 2.5 runs at all (#1084) -- whether the AGENT waits for
-  # CodeRabbit and dispositions its findings.
+  # When PHASE 2.5 runs at all (#1084) -- whether the AGENT dispositions
+  # CodeRabbit's findings as a Phase 2.5 pass (and, only when wait_for_review
+  # below is true, waits for them).
   #
   # It does NOT stop the App from reviewing. .coderabbit.yml sets
   # auto_review.enabled: true, so the App starts on PR open, before this
@@ -276,14 +281,36 @@ coderabbit:
   invoke: complex-changes
   enabled: true
 
+  # Whether the AGENT blocks in Phase 2.5 for CodeRabbit's review of the
+  # current head before proceeding to Phase 3 (#2166). Default false: Phase
+  # 2.5 is NON-BLOCKING. The agent used to hold every round's Codex request
+  # for up to max_wait_seconds plus post_clearance_max_wait_seconds. The
+  # wait is MOVED, not removed: the required `CodeRabbit unresolved blocking
+  # findings` check is arrival-independent (green until CodeRabbit publishes
+  # a run on the head), so the agent confirms CodeRabbit's arrival on the
+  # merge head with scripts/coderabbit-wait.sh at the pre-merge step
+  # regardless of this value, closing the #136 pre-review merge race. That
+  # runs after CI, which outlasts CodeRabbit's measured p99, so it normally
+  # returns at once. The helper also stays the diagnostic and the rate-limit
+  # failover path.
+  #
+  #   false  -- do not wait (the default; absent means false)
+  #   true   -- wait, as before #2166 (scripts/coderabbit-wait.sh governs)
+  #
+  # scripts/coderabbit-should-invoke.sh reports the resolved value as `wait`.
+  # Any other or ambiguous value falls back to waiting -- an unclear
+  # instruction about the wait resolves to the slower, older behaviour.
+  wait_for_review: false
+
   # GitHub login of the CodeRabbit bot. Comments by this login are what
   # `scripts/coderabbit-wait.sh` filters on when classifying PR activity.
   bot_login: "coderabbitai[bot]"
 
   # Maximum total seconds `scripts/coderabbit-wait.sh` will poll before
-  # timing out. Used by Phase 2.5 grace window + the auto-merge-on-approval
-  # workflow that blocks merge until CodeRabbit has reviewed the current
-  # HEAD (the #136 race).
+  # timing out. Used by the Phase 2.5 grace window (only when
+  # wait_for_review above is true, #2166), by the Phase 4b barrier's bounded
+  # CodeRabbit hold, and by the auto-merge-on-approval workflow that blocks
+  # merge until CodeRabbit has reviewed the current HEAD (the #136 race).
   #
   # 1245s is measured, not folklore (#623). The "typical ~2–3 min" belief
   # was wrong: the mined CodeRabbit review latency (commit → the first
@@ -539,7 +566,57 @@ codex:
   # block uses. Absent ⇒ true. The script learns whether a PR is
   # threshold-gated from the caller's `MERGEPATH_PHASE_4A_GATED` env, so
   # it does not recompute the threshold itself.
-  request_by_default: true
+  #
+  # Set to false by owner decision on 2026-10-13 (#2166). This narrows the
+  # owner rule of 2026-07-04 ("Codex must always be invoked"): Codex remains
+  # mandatory on EVERY Phase 4 PR (lines ≥ external_review_threshold or a
+  # protected-path match), and the Phase 4 trigger is unchanged. An
+  # under-threshold PR clears by reviewer-identity approval plus the
+  # required gates. The measurement behind it: 88 of 223 under-300-line PRs
+  # (39%) drew a Codex round the under-threshold path never required.
+  request_by_default: false
+
+  # The moving-head guard (#2166). A Codex request is posted once per BATCH,
+  # on a head that is final for the round: every known finding addressed,
+  # local tests green, no further push planned. Measured over the 14 most
+  # recent large PRs, push-to-next-request was 3 minutes at p50, so requests
+  # went out on heads the agent was still amending and the next finding
+  # landed on a commit already replaced -- each such round costing about 50
+  # minutes (Codex answer + fix push + the lint run on the new head).
+  # `scripts/codex-review-request.sh` enforces two proxies immediately before
+  # a NEW `@codex review` write and refuses with exit 8 (no write) unless the
+  # caller passes --allow-moving-head; the CodeRabbit rate-limit failover and
+  # the CI automatic caller are exempt by construction. Never evaluated on an
+  # acknowledgement retry, a dedup skip, or a head Codex already cleared.
+  #
+  #   request_min_head_age_seconds  -- the head must be at least this old,
+  #                                    measured from the push: the latest of
+  #                                    the committer date, the last
+  #                                    force-push and the push dispatch (the
+  #                                    LATEST repo-lint dispatch for the head
+  #                                    on the PR's branch; an earlier run of
+  #                                    the same SHA must not date this push).
+  #                                    0 disables.
+  #   CI has picked the head up     -- by default, a run of the `repo-lint`
+  #                                    workflow (repo_lint.yml, canonical on
+  #                                    every consumer) exists for the head
+  #                                    SHA, in any status. Keyed on the
+  #                                    workflow RUN, not a job's check-run, so
+  #                                    job renames and sharding (lint-fast
+  #                                    becoming lint-fast (1)..(4)) cannot
+  #                                    break it, and it holds from the moment
+  #                                    GitHub dispatches the push, before any
+  #                                    job exists. A repo with no repo-lint
+  #                                    workflow is warned about and NOT
+  #                                    refused on this signal.
+  #   request_requires_check        -- OVERRIDE, absent by default. A name
+  #                                    makes the signal "a check-run by
+  #                                    exactly this name is scheduled on the
+  #                                    head" instead; "" disables the signal.
+  #
+  # Both signals fail OPEN on an unreadable input with a distinct log line:
+  # this is a cycle-time guard, not a merge gate.
+  request_min_head_age_seconds: 300
 
   # GitHub login of the Codex GitHub App bot. Reviews posted by this login
   # satisfy the external-review requirement in `.github/workflows/pr-audit.yml`.

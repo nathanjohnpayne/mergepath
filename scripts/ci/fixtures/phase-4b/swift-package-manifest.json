@@ -1,0 +1,8 @@
+{
+  "body": "Add a build plugin and declare it in the package manifest.",
+  "files": [
+    {"filename": "Package.swift", "patch": "@@ -10,1 +10,2 @@\n     targets: [\n+        .plugin(name: \"Codegen\", capability: .buildTool()),"},
+    {"filename": "Sources/App/main.swift", "patch": "@@ -1,1 +1,2 @@\n import Foundation\n+import Generated"},
+    {"filename": "Plugins/Codegen/plugin.swift", "patch": "@@ -1,1 +1,2 @@\n import PackagePlugin\n+@main struct Codegen: BuildToolPlugin {}"}
+  ]
+}

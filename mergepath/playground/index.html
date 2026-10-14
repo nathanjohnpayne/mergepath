@@ -961,7 +961,7 @@
           </div>
           <p class="hint">Beyond this, Mergepath stops the loop and pings a human.</p>
           <label class="check-row" for="codexRequestByDefault">
-            <input type="checkbox" id="codexRequestByDefault" data-toggle="codexRequestByDefault" checked aria-label="Request @codex review on every PR" />
+            <input type="checkbox" id="codexRequestByDefault" data-toggle="codexRequestByDefault" aria-label="Request @codex review on every PR" />
             <span class="check-copy">
               <span class="ttl">Request <span class="mono">@codex</span> on every PR</span>
               <span class="sub">Trigger Phase 4a on all PRs, not just above-threshold.</span>
@@ -1140,9 +1140,14 @@
     codexRounds: 10,
     coderabbitInvoke: 'complex-changes',
     // Request `@codex review` on every PR, not only above-threshold ones
-    // (#486). Mirrors codex.request_by_default in review-policy.yml; the
-    // owner-decided default is on (#483).
-    codexRequestByDefault: true,
+    // (#486). Mirrors codex.request_by_default in review-policy.yml. Off by
+    // default and in the Standard preset since #2166 (owner decision
+    // 2026-10-13): under-threshold PRs clear by reviewer approval plus the
+    // required gates, and Codex stays mandatory on every Phase 4 PR. Strict
+    // keeps it on as an explicit opt-in. A repo whose policy omits the key
+    // still reads the script default (true), so existing repos are unchanged
+    // until they set it.
+    codexRequestByDefault: false,
     reviewers: { claude: true, cursor: true, codex: true },
     // Feedback disposition policy (#574/#578). Mirrors the `feedback_policy`
     // block in .github/review-policy.yml. `by-priority` consults the per-tier
@@ -1154,7 +1159,7 @@
 
   const PRESETS = {
     strict:   { threshold: 100, coderabbit: true,  coderabbitInvoke: 'always',          postClearanceWait: 240, codex: true,  codexRounds: 12, codexRequestByDefault: true,  feedbackMode: 'address-all', feedbackPriorities: { p0: true, p1: true, p2: true,  p3: true  } },
-    standard: { threshold: 300, coderabbit: true,  coderabbitInvoke: 'complex-changes', postClearanceWait: 240, codex: true,  codexRounds: 10, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: true, p2: false, p3: false } },
+    standard: { threshold: 300, coderabbit: true,  coderabbitInvoke: 'complex-changes', postClearanceWait: 240, codex: true,  codexRounds: 10, codexRequestByDefault: false, feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: true, p2: false, p3: false } },
     loose:    { threshold: 800, coderabbit: false, coderabbitInvoke: 'never',           postClearanceWait: 240, codex: false, codexRounds: 5, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: false, p2: false, p3: false } },
   };
 

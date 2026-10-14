@@ -7,7 +7,17 @@
 # caller (e.g. an authoring agent) can reason over it.
 #
 # Usage:
-#   scripts/codex-review-request.sh <PR_NUMBER> [REPO]
+#   scripts/codex-review-request.sh [--trigger-only] [--allow-moving-head] <PR_NUMBER> [REPO]
+#
+# Flags:
+#   --trigger-only       Post (or confirm) the `@codex review` trigger and
+#                        exit 0 without polling for clearance (#489).
+#   --allow-moving-head  Downgrade the moving-head refusal (exit 8, below) to
+#                        a warning and post anyway. For the exceptional
+#                        callers that must request on a head the agent has
+#                        not declared final: the CodeRabbit rate-limit
+#                        failover in scripts/coderabbit-wait.sh, or an agent
+#                        that has verified by hand that the head is final.
 #
 # Arguments:
 #   PR_NUMBER  Required. The pull request number (integer).
@@ -210,6 +220,26 @@
 #       merge authority. Any observed provider block is diagnostic-only and
 #       never grants Phase 4b routing authority. This requester-specific
 #       status is not Phase 4b's exit-7 contract.
+#   8   MOVING_HEAD — the head does not look final for a review round
+#       (#2166): it is younger than codex.request_min_head_age_seconds
+#       (measured from the later of the HEAD pushed-at anchor -- committer
+#       date or last force-push -- and the push dispatch, i.e. the latest
+#       repo-lint run for the head on the PR branch), or CI has not picked
+#       the head up yet: no `repo-lint` workflow run exists for the head SHA
+#       on the PR's branch (or, with the
+#       codex.request_requires_check override, no check-run by that exact
+#       name). A repo with no repo-lint workflow at all is not refused on
+#       that signal. No trigger is posted. A Codex request is posted once per BATCH -- every known
+#       finding addressed, local tests green, no further push planned --
+#       because a request on a head that is still moving draws findings
+#       against a commit the agent has already replaced, and each such round
+#       costs about fifty minutes of wall-clock (Codex answer + fix push +
+#       the lint run on the new head). Rerun once the head has settled, or
+#       pass --allow-moving-head to post with a warning. JSON on stdout
+#       carries the observations under `moving_head`. An automatic caller
+#       (MERGEPATH_CODEX_AUTO_TRIGGER) is exempt: it fires on a provider
+#       event, not on a push the agent is still amending, and a refusal
+#       there would strand the head with no caller left to re-request.
 #
 # Design notes:
 #   - Writes only author-attributed PR comments: the `@codex review` trigger,
@@ -306,19 +336,25 @@ __CRR_ORIGINAL_ARGS=("$@")
 # returns WITHOUT polling for clearance. coderabbit-wait.sh's rate-limit
 # failover uses it so a rate-limited PR advances via Codex without the wait
 # helper blocking on Codex's full review. Extract the flag, leave positionals.
+# #2166: --allow-moving-head downgrades the moving-head refusal (exit 8) to a
+# warning. See refuse_moving_head_unless_allowed below.
 TRIGGER_ONLY=false
+ALLOW_MOVING_HEAD=false
 __POSITIONAL=()
 for __arg in "$@"; do
   case "$__arg" in
     --trigger-only) TRIGGER_ONLY=true ;;
+    --allow-moving-head) ALLOW_MOVING_HEAD=true ;;
     *) __POSITIONAL+=("$__arg") ;;
   esac
 done
 set -- ${__POSITIONAL[@]+"${__POSITIONAL[@]}"}
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-  echo "Usage: $0 [--trigger-only] <PR_NUMBER> [REPO]" >&2
-  echo "  --trigger-only  post/confirm the @codex trigger, then exit 0 (no clearance poll)" >&2
+  echo "Usage: $0 [--trigger-only] [--allow-moving-head] <PR_NUMBER> [REPO]" >&2
+  echo "  --trigger-only       post/confirm the @codex trigger, then exit 0 (no clearance poll)" >&2
+  echo "  --allow-moving-head  post even when the head is younger than codex.request_min_head_age_seconds" >&2
+  echo "                       or CI has not picked it up yet (warns instead of exit 8)" >&2
   echo "  PR_NUMBER       pull request number (integer)" >&2
   echo "  REPO            owner/repo (optional; defaults to current repo)" >&2
   exit 3
@@ -356,7 +392,15 @@ fi
 
 # --- config readers ---------------------------------------------------------
 
-CONFIG=".github/review-policy.yml"
+# Resolve the policy from the SCRIPT's checkout, not $PWD (Codex P2 on #2175),
+# the way coderabbit-should-invoke.sh and phase-4b-classifier.sh already do.
+# A cwd-relative path read no file at all when the script ran from a
+# subdirectory or by absolute path from elsewhere, and every codex: key then
+# took its default -- request_by_default silently back to true, the
+# moving-head knobs to their defaults. A hand install with no policy beside
+# it keeps the cwd-relative read it always had.
+CONFIG="$__CODEX_REQUEST_DIR/../.github/review-policy.yml"
+[ -f "$CONFIG" ] || CONFIG=".github/review-policy.yml"
 
 # Extract a scalar field from the codex: block in review-policy.yml.
 # Uses the state-machine awk pattern established in #54 (stops at the next
@@ -614,6 +658,68 @@ if ! [[ "$MAX_ACK_RETRIES" =~ ^[0-9]+$ ]]; then
   exit 3
 fi
 
+# --- moving-head guard knobs (#2166) ---------------------------------------
+# A Codex request is posted once per batch, on a head that is final for the
+# round. Two observable proxies for "final" are enforced immediately before a
+# NEW trigger write (never on an acknowledgement retry, a dedup skip, or a
+# cleared head):
+#
+#   codex.request_min_head_age_seconds  the head must be at least this old,
+#                                       measured from the push: the latest of
+#                                       the committer date, the last
+#                                       force-push, and the push dispatch
+#                                       (the latest repo-lint run for the head
+#                                       on the PR's branch, so
+#                                       an ordinary push of an old commit
+#                                       still reads as new). Default 300: the
+#                                       measured push-to-next-request p50 was
+#                                       3 minutes, i.e. requests went out on
+#                                       heads the agent was still amending.
+#                                       0 disables the age check.
+#
+#   "CI has picked this head up" -- by default, a run of the `repo-lint`
+#   workflow (repo_lint.yml, manifest-canonical, so on every consumer) exists
+#   for the head SHA, in any status. Keyed on the WORKFLOW RUN, not on a job's
+#   check-run: job names change and shard (`lint-fast` becoming `lint-fast
+#   (1)`..`(4)` would refuse every request under an exact-name match), and a
+#   run exists the moment GitHub dispatches the push, before any job is
+#   created. A queued run counts: the Actions backlog is not the agent's
+#   signal. A missing run is a head GitHub has not dispatched workflows for
+#   yet. A repo with NO repo-lint workflow at all cannot produce the signal,
+#   so it is skipped with a warning rather than refusing forever -- the guard
+#   fails toward requesting, the same asymmetry coderabbit-should-invoke.sh
+#   applies.
+#
+#   codex.request_requires_check        OVERRIDE. Absent (the default): the
+#                                       repo-lint workflow-run signal above.
+#                                       Set to a name: a check-run by exactly
+#                                       that name must have been scheduled on
+#                                       the head instead. Set to "": the
+#                                       signal is disabled.
+#
+# Both are read from the checkout's policy: this guard protects the agent's
+# own cycle time, not a merge decision, so a candidate-controlled value costs
+# the candidate only wasted rounds.
+REQUEST_MIN_HEAD_AGE_SECONDS=$(codex_field request_min_head_age_seconds)
+REQUEST_MIN_HEAD_AGE_SECONDS=${REQUEST_MIN_HEAD_AGE_SECONDS:-300}
+if ! [[ "$REQUEST_MIN_HEAD_AGE_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: codex.request_min_head_age_seconds must be a non-negative integer; got '$REQUEST_MIN_HEAD_AGE_SECONDS'" >&2
+  exit 3
+fi
+# REQUEST_SIGNAL_MODE: workflow (key absent), check (key set to a name) or
+# off (key present and empty). codex_field returns empty for both absent and
+# empty, so the presence test is made separately.
+REQUEST_WORKFLOW_NAME=repo-lint
+REQUEST_WORKFLOW_PATH=.github/workflows/repo_lint.yml
+REQUEST_REQUIRES_CHECK=$(codex_field request_requires_check)
+if [ -n "$REQUEST_REQUIRES_CHECK" ]; then
+  REQUEST_SIGNAL_MODE=check
+elif [ -f "$CONFIG" ] && awk '/^codex:/{b=1;next} b&&/^[^[:space:]#]/{b=0} b&&$1=="request_requires_check:"{f=1} END{exit !f}' "$CONFIG"; then
+  REQUEST_SIGNAL_MODE=off
+else
+  REQUEST_SIGNAL_MODE=workflow
+fi
+
 POLL_INTERVAL_SECONDS=15
 ACK_POLL_INTERVAL_SECONDS=5
 
@@ -729,6 +835,10 @@ if ! should_request_codex; then
     log "codex.enabled is false — Phase 4a is off; not requesting a Codex review (route to Phase 4b)"
   else
     log "codex.request_by_default is false and this PR is not Phase-4a-gated (MERGEPATH_PHASE_4A_GATED!=true) — not requesting a Codex review"
+    # Codex P1 on #2175: with request_by_default false, a Phase 4 caller that
+    # omits the gate flag gets this skip instead of the mandatory review.
+    # Say so, so the skip is never mistaken for "Codex not needed".
+    log "if this PR meets external_review_threshold or touches external_review_paths (a Phase 4 PR), Codex is mandatory: rerun with MERGEPATH_PHASE_4A_GATED=true"
   fi
   jq -n \
     --argjson pr_number "$PR_NUMBER" \
@@ -761,6 +871,10 @@ log "PR $REPO#$PR_NUMBER — fetching HEAD commit metadata"
 PR_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>&1) || die 3 "failed to fetch PR metadata: $PR_JSON"
 
 HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha')
+# The PR's head branch scopes the moving-head guard's push-dispatch anchor to
+# runs dispatched for THIS branch (Codex P2 on #2175). Empty when unreadable;
+# the guard then falls back to every run for the SHA.
+HEAD_REF=$(echo "$PR_JSON" | jq -r '.head.ref // empty' 2>/dev/null) || HEAD_REF=""
 if [ -z "$HEAD_SHA" ] || [ "$HEAD_SHA" = "null" ]; then
   die 3 "could not determine HEAD sha for PR #$PR_NUMBER"
 fi
@@ -1544,6 +1658,223 @@ check_blocking_budget() { # <request_count> <max_review_rounds>
   fi
 }
 
+# The moving-head guard (#2166). Runs once per run, immediately before the
+# FIRST new trigger write: not on an acknowledgement retry (the head was
+# accepted when the first trigger of this run went out), not on a dedup skip
+# or a cleared head (those post nothing). It is a cycle-time guard, not a
+# merge gate: every merge requirement is enforced elsewhere, so each signal
+# fails OPEN on an unreadable input with a distinct log line, and the
+# observations are reported rather than silently coerced.
+#
+# Two signals, each independently refusing:
+#   head-age       age of the HEAD pushed-at anchor < request_min_head_age_seconds
+#   check-missing  CI has not picked the head up: no repo-lint workflow run
+#                  for the head SHA (or, under the request_requires_check
+#                  override, no check-run by that exact name)
+# Refusal is exit 8 with no write. --allow-moving-head, or an automatic caller
+# (MERGEPATH_CODEX_AUTO_TRIGGER, which fires on a provider event rather than
+# on a push the agent is still amending), turns the refusal into a warning.
+MOVING_HEAD_AGE_SECONDS=null
+MOVING_HEAD_CHECK_STATUS=""
+MOVING_HEAD_ANCHOR=""
+refuse_moving_head_unless_allowed() {
+  local reasons="" pushed_epoch now_epoch age runs status allow=false
+  case "${MERGEPATH_CODEX_AUTO_TRIGGER:-}" in
+    true|TRUE|True|1|yes|YES) allow=true ;;
+  esac
+  [ "$ALLOW_MOVING_HEAD" = true ] && allow=true
+
+  # The CI-pickup read comes first: it also supplies the push-time anchor for
+  # the age signal below.
+  local dispatched_at="" anchor="$HEAD_PUSHED_AT" anchor_source="$ANCHOR_SOURCE" check_reason=""
+  local signal_label="" wf
+  case "$REQUEST_SIGNAL_MODE" in
+    workflow)
+      signal_label="$REQUEST_WORKFLOW_NAME"
+      # Every workflow run for the head SHA, paginated (one head collects a
+      # run per triggering event, which can exceed a page), filtered to
+      # repo-lint by name or by its canonical path.
+      runs=$(gh api --paginate -X GET "repos/$REPO/actions/runs" \
+        -f head_sha="$HEAD_SHA" -F per_page=100 2>/dev/null) || runs=""
+      # Scoped to the PR's head branch (Codex P2 on #2175): the same SHA can
+      # carry runs from another branch it was pushed to earlier, and those
+      # neither prove CI picked up THIS push nor date it.
+      runs=$(printf '%s' "$runs" | jq -c -s --arg n "$REQUEST_WORKFLOW_NAME" --arg p "$REQUEST_WORKFLOW_PATH" --arg b "$HEAD_REF" '
+        if length > 0 and all(.[]; type == "object" and ((.workflow_runs | type) == "array"))
+        then [ .[].workflow_runs[]
+               | select((.name // "") == $n or ((.path // "") | startswith($p)))
+               | select($b == "" or (.head_branch // "") == $b) ]
+        else "unreadable" end' 2>/dev/null) || runs='"unreadable"'
+      if [ "$runs" = '"unreadable"' ] || [ -z "$runs" ]; then
+        status=unreadable
+      elif [ "$(printf '%s' "$runs" | jq 'length')" -gt 0 ]; then
+        status=$(printf '%s' "$runs" | jq -r 'sort_by(.id) | last | .status // "unknown"')
+        # The LATEST dispatch on this branch is the current push: a re-run
+        # keeps its run's original created_at (it bumps run_attempt), so it
+        # cannot move this, and an earlier push of the same SHA to this branch
+        # is older by construction (Codex P2 on #2175).
+        dispatched_at=$(printf '%s' "$runs" | jq -r '
+          [.[] | (.created_at // empty)
+           | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))] | max // ""')
+      else
+        # No repo-lint run on this head. Either CI has not picked it up yet,
+        # or this repo has no repo-lint workflow and never will: tell the two
+        # apart, because the second must not refuse forever.
+        wf=$(gh api --paginate -X GET "repos/$REPO/actions/workflows" -F per_page=100 2>/dev/null) || wf=""
+        status=$(printf '%s' "$wf" | jq -r -s --arg n "$REQUEST_WORKFLOW_NAME" --arg p "$REQUEST_WORKFLOW_PATH" '
+          if length > 0 and all(.[]; type == "object" and ((.workflows | type) == "array"))
+          then (if any(.[].workflows[]; (.name // "") == $n or (.path // "") == $p)
+                then "missing" else "no-workflow" end)
+          else "unreadable" end' 2>/dev/null) || status=unreadable
+      fi
+      ;;
+    check)
+      signal_label="$REQUEST_REQUIRES_CHECK"
+      # Exact server-side name filter; the client-side select repeats it so a
+      # server that ignores the filter cannot pass a differently named run off
+      # as this one. Any run counts, whatever its status. -f encodes the name:
+      # a configured check name may carry spaces. PAGINATED and slurped
+      # (Codex P1 on #2175): per_page caps at 100, and a long-lived head
+      # carries more check runs than that.
+      runs=$(gh api --paginate -X GET "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+        -f check_name="$REQUEST_REQUIRES_CHECK" -F per_page=100 2>/dev/null) || runs=""
+      # Check runs are attached to the COMMIT, not the branch (Codex P2 on
+      # #2175): a SHA checked before on another branch carries that old run.
+      # Scope to the check suites GitHub created for the PR's head branch;
+      # with no head ref there is nothing to scope by and every suite counts.
+      local suites='null'
+      if [ -n "$HEAD_REF" ]; then
+        suites=$(gh api --paginate -X GET "repos/$REPO/commits/$HEAD_SHA/check-suites" \
+          -F per_page=100 2>/dev/null) || suites=""
+        suites=$(printf '%s' "$suites" | jq -c -s --arg b "$HEAD_REF" '
+          if length > 0 and all(.[]; type == "object" and ((.check_suites | type) == "array"))
+          then [ .[].check_suites[] | select((.head_branch // "") == $b) | .id ]
+          else "unreadable" end' 2>/dev/null) || suites='"unreadable"'
+        [ -n "$suites" ] || suites='"unreadable"'
+      fi
+      if [ "$suites" = '"unreadable"' ]; then
+        status=unreadable
+      else
+        runs=$(printf '%s' "$runs" | jq -c -s --arg n "$REQUEST_REQUIRES_CHECK" --argjson ids "$suites" '
+          if length > 0 and all(.[]; type == "object" and ((.check_runs | type) == "array"))
+          then [ .[].check_runs[] | select((.name // "") == $n)
+                 | select($ids == null or ((.check_suite.id // null) as $s | ($ids | index($s)) != null)) ]
+          else "unreadable" end' 2>/dev/null) || runs='"unreadable"'
+        if [ "$runs" = '"unreadable"' ] || [ -z "$runs" ]; then
+          status=unreadable
+        else
+          status=$(printf '%s' "$runs" | jq -r 'sort_by(.id) | last | .status // "missing"' 2>/dev/null) || status=unreadable
+          [ "$status" != null ] || status=missing
+        fi
+      fi
+      # Latest run, as in the workflow path: an earlier run of the same SHA
+      # must not date the current push.
+      if [ "$status" != unreadable ] && [ "$status" != missing ]; then
+        dispatched_at=$(printf '%s' "$runs" | jq -r '
+          [.[] | (.started_at // empty)
+           | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))] | max // ""' 2>/dev/null) || dispatched_at=""
+      fi
+      ;;
+    *) status="" ;;
+  esac
+  if [ "$REQUEST_SIGNAL_MODE" != off ]; then
+    [ -n "$status" ] && [ "$status" != null ] || status=unreadable
+    MOVING_HEAD_CHECK_STATUS=$status
+    case "$status" in
+      unreadable)
+        log "moving-head guard: CI-pickup signal ('$signal_label') for $HEAD_SHA unreadable; not enforced" ;;
+      no-workflow)
+        log "WARNING: moving-head guard: this repository has no '$REQUEST_WORKFLOW_NAME' workflow ($REQUEST_WORKFLOW_PATH), so the CI-pickup signal cannot be observed; not enforced (set codex.request_requires_check to name another check)" ;;
+      missing)
+        check_reason="check-missing"
+        if [ "$REQUEST_SIGNAL_MODE" = workflow ]; then
+          log "moving-head guard: no '$REQUEST_WORKFLOW_NAME' workflow run exists for HEAD $HEAD_SHA yet: CI has not picked this head up"
+        else
+          log "moving-head guard: no check-run named '$REQUEST_REQUIRES_CHECK' has been scheduled on HEAD $HEAD_SHA (codex.request_requires_check)"
+        fi ;;
+      *)
+        log "moving-head guard: '$signal_label' is $status on HEAD"
+        # Push-time anchor (Codex P2 on #2175). HEAD_PUSHED_AT is the commit's
+        # committer date unless a force-push replaced it, so an ordinary push
+        # of a commit created long before reads as an old head the moment it
+        # lands. The latest run of the signal for this head on the PR branch
+        # was created when GitHub dispatched the current push, which is the
+        # push time this signal means. Use whichever is later. A missing or unparseable timestamp
+        # keeps the commit-based anchor.
+        if [ -n "$dispatched_at" ] && [[ "$dispatched_at" > "$anchor" ]]; then
+          anchor="$dispatched_at"
+          anchor_source="latest '$signal_label' dispatch for HEAD on the PR branch (push dispatch)"
+        fi ;;
+    esac
+  fi
+
+  if [ "$REQUEST_MIN_HEAD_AGE_SECONDS" -gt 0 ]; then
+    pushed_epoch=$(jq -rn --arg t "$anchor" \
+      '$t | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null) || pushed_epoch=""
+    now_epoch=$(date +%s)
+    if [[ "$pushed_epoch" =~ ^[0-9]+$ ]]; then
+      age=$((now_epoch - pushed_epoch))
+      [ "$age" -ge 0 ] || age=0
+      MOVING_HEAD_AGE_SECONDS=$age
+      if [ "$age" -lt "$REQUEST_MIN_HEAD_AGE_SECONDS" ]; then
+        reasons="head-age"
+        log "moving-head guard: HEAD was pushed ${age}s ago (anchor $anchor, source: $anchor_source), under codex.request_min_head_age_seconds=$REQUEST_MIN_HEAD_AGE_SECONDS"
+      fi
+    else
+      log "moving-head guard: HEAD pushed-at anchor '$anchor' is not parseable; head-age signal unavailable, not enforced"
+    fi
+  fi
+  [ -z "$check_reason" ] || reasons="${reasons:+$reasons,}$check_reason"
+  MOVING_HEAD_ANCHOR="$anchor"
+
+  [ -n "$reasons" ] || return 0
+  if [ "$allow" = true ]; then
+    log "WARNING: head does not look final for a review round ($reasons); posting anyway because the caller allowed a moving head"
+    return 0
+  fi
+  log "refusing to post '@codex review' on a moving head ($reasons); a Codex request goes out once per batch, when the head is final: every known finding addressed, local tests green, no further push planned. Rerun once the head has settled, or pass --allow-moving-head (exit 8)"
+  jq -n \
+    --argjson pr_number "$PR_NUMBER" \
+    --arg repo "$REPO" \
+    --arg head_sha "$HEAD_SHA" \
+    --arg head_committer_date "$HEAD_COMMITTER_DATE" \
+    --arg bot_login "$BOT_LOGIN" \
+    --argjson scan "$INITIAL_SCAN" \
+    --arg reasons "$reasons" \
+    --argjson age "$MOVING_HEAD_AGE_SECONDS" \
+    --argjson min_age "$REQUEST_MIN_HEAD_AGE_SECONDS" \
+    --arg pushed_at "$MOVING_HEAD_ANCHOR" \
+    --arg check_name "$signal_label" \
+    --arg check_kind "$REQUEST_SIGNAL_MODE" \
+    --arg check_status "$MOVING_HEAD_CHECK_STATUS" '
+    {
+      pr_number: $pr_number,
+      repo: $repo,
+      head_sha: $head_sha,
+      head_committer_date: $head_committer_date,
+      bot_login: $bot_login,
+      review: $scan.review,
+      findings: $scan.findings,
+      reaction: $scan.reaction,
+      verdict: $scan.verdict,
+      blocked_reason: null,
+      terminal_determination: null,
+      moving_head: {
+        reasons: ($reasons | split(",")),
+        head_pushed_at: $pushed_at,
+        age_seconds: $age,
+        min_age_seconds: $min_age,
+        check_kind: (if $check_kind == "off" then null else $check_kind end),
+        check_name: (if $check_name == "" then null else $check_name end),
+        check_status: (if $check_status == "" then null else $check_status end)
+      },
+      trigger_posted: false,
+      trigger_requested: true,
+      rounds_waited_seconds: 0
+    }'
+  exit 8
+}
+
 post_codex_trigger() {
   # Check immediately before every author-attributed trigger write, including
   # an acknowledgement retry. Current-head clearance and idempotency return
@@ -1554,6 +1885,9 @@ post_codex_trigger() {
   # idempotently-reused paths spend no request attempt and retain their
   # established behavior even if a later budget edit is malformed.
   local max_review_rounds request_comments request_count
+  # The moving-head guard (#2166) runs before any budget read: a refused
+  # request spends nothing and must not be counted against anything.
+  [ "$TRIGGER_POSTED" = "true" ] || refuse_moving_head_unless_allowed
   governing_request_attempt_cap
   max_review_rounds="$GOVERNING_REQUEST_ATTEMPT_CAP"
   request_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "Codex request-attempt evidence") \

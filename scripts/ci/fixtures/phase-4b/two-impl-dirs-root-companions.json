@@ -1,0 +1,29 @@
+{
+  "body": "Wire the new helper into the workflow; manifest and package metadata updated.",
+  "files": [
+    {
+      "filename": "scripts/example-helper.sh",
+      "patch": "@@ -1,2 +1,3 @@\n helper() { :; }\n+helper_v2() { :; }"
+    },
+    {
+      "filename": ".github/workflows/example.yml",
+      "patch": "@@ -10,2 +10,2 @@\n-        run: scripts/example-helper.sh\n+        run: scripts/example-helper.sh --v2"
+    },
+    {
+      "filename": ".mergepath-sync.yml",
+      "patch": "@@ -1,1 +1,2 @@\n entries:\n+  - path: scripts/example-helper.sh"
+    },
+    {
+      "filename": "package.json",
+      "patch": "@@ -2,1 +2,1 @@\n-  \"version\": \"1.0.0\",\n+  \"version\": \"1.1.0\","
+    },
+    {
+      "filename": "CHANGELOG.md",
+      "patch": "@@ -1,1 +1,2 @@\n # Changelog\n+- helper v2"
+    },
+    {
+      "filename": ".gitignore",
+      "patch": "@@ -1,1 +1,2 @@\n node_modules/\n+.mergepath/"
+    }
+  ]
+}
