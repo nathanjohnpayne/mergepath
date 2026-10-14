@@ -451,12 +451,15 @@ CLASSIFY_JQ='
     | ([ $events[] | select(.running == true) | (.at | ts) as $r
          | select(([ $events[] | select(.codex == true and .side == "verdict") | select((.at | ts) >= $r) ] | length) == 0)
        ] | length > 0) as $summary_running
-    # A provider rate limit on this head stands until a verdict lands after it
-    # or the sanctioned failover (a Codex request posted after it) exists —
-    # whether or not the trigger it refused is still outstanding.
+    # A provider rate limit on this head stands until that provider recovers
+    # (its own verdict lands after the notice) or the sanctioned failover (a
+    # Codex request posted after it) exists — whether or not the trigger it
+    # refused is still outstanding, and whatever else is said meanwhile.
     | ([ $events[] | select(.kind == "bot-rate-limited") | select((.at | ts) >= $head_ts) ] | max_by(.at | ts)) as $last_rate_limit
     | ($last_rate_limit != null
-       and ([ $events[] | select(.side == "verdict") | select((.at | ts) > ($last_rate_limit.at | ts)) ] | length) == 0
+       # Only a recovery by the refusing provider itself (a verdict from the same
+       # bot) clears it — an unrelated human or reviewer comment does not.
+       and ([ $events[] | select(.side == "verdict" and .actor == $last_rate_limit.actor) | select((.at | ts) > ($last_rate_limit.at | ts)) ] | length) == 0
        and ([ $events[] | select(.trigger == true and .provider == "codex") | select((.at | ts) > ($last_rate_limit.at | ts)) ] | length) == 0
       ) as $rate_limited
     | ($pr.ci_state == "PENDING") as $ci_pending

@@ -192,13 +192,24 @@ NBSP_VERDICT="Codex Review: Didn't find any major issues.${NBSP}Reviewed${NBSP}c
     --argjson sum "$(comment 27 "$CODEX" "2026-10-13T05:10:00Z" "${SUMMARY_RUNNING//$(sha 113 | cut -c1-7)/$(sha 133 | cut -c1-7)}" "2026-10-13T05:11:00Z")" \
     --argjson rev "$(review 15 "$CODEX" COMMENTED "2026-10-13T05:20:00Z" "$(sha 133)")" \
     --argjson f "$(inline 17 "$CODEX" "2026-10-13T05:20:00Z" "$(sha 133)" null)"
+  # 134: CodeRabbit refuses on a rate limit, then an UNRELATED human comment lands; hours later →
+  #      still rate-limit-stale / investigate (the comment is not the provider recovering)
+  pr 134 "2026-10-13T05:00:00Z" SUCCESS '.issue_comments = [$t, $c, $h]' \
+    --argjson t "$(comment 28 "$AUTHOR" "2026-10-13T05:05:00Z" '@coderabbitai review')" \
+    --argjson c "$(comment 29 "$RABBIT" "2026-10-13T05:06:00Z" 'Rate limit exceeded; please try again in 30 minutes.')" \
+    --argjson h "$(comment 30 "octocat" "2026-10-13T05:30:00Z" 'Looks reasonable to me, waiting on the bots.')"
+  # 135: same, but CodeRabbit itself recovers with a review after the notice → no longer rate-limited
+  pr 135 "2026-10-13T05:00:00Z" SUCCESS '.issue_comments = [$t, $c] | .reviews = [$rev]' \
+    --argjson t "$(comment 31 "$AUTHOR" "2026-10-13T05:05:00Z" '@coderabbitai review')" \
+    --argjson c "$(comment 32 "$RABBIT" "2026-10-13T05:06:00Z" 'Rate limit exceeded; please try again in 30 minutes.')" \
+    --argjson rev "$(review 16 "$RABBIT" COMMENTED "2026-10-13T05:40:00Z" "$(sha 135)")"
   # 123: only a CodeRabbit review on the head, CI green, hours old → head-unrequested / request codex (not a Codex signal)
   pr 123 "2026-10-13T05:00:00Z" SUCCESS '.reviews = [$rev] | .review_comments = [$f]' \
     --argjson rev "$(review 10 "$RABBIT" COMMENTED "2026-10-13T05:20:00Z" "$(sha 123)")" \
     --argjson f "$(inline 12 "$RABBIT" "2026-10-13T05:20:00Z" "$(sha 123)" null)"
 } | jq -s --arg repo "$REPO" --arg now "$NOW" '{schema: "stalled-prs/v1", repo: $repo, fetched_at: $now, prs: .}' > "$TMP/snapshot.json"
 
-if ! jq -e '.prs | length == 33' "$TMP/snapshot.json" >/dev/null; then
+if ! jq -e '.prs | length == 35' "$TMP/snapshot.json" >/dev/null; then
   echo "FAIL: fixture snapshot did not assemble: $(jq -c . "$TMP/snapshot.json" 2>&1 | head -c 300)" >&2
   exit 1
 fi
@@ -271,8 +282,10 @@ expect 131 '.class == "stalled" and .reason == "rate-limit-stale" and .rate_limi
 expect 132 '.class == "stalled" and .reason == "request-unanswered" and .rate_limited == false and .next_action == "request codex"'
 expect 133 '.class == "stalled" and .reason == "unanswered-verdict" and .next_action == "push fix" and (.unanswered_findings | map(.id)) == [17]'
 expect 115 '.reason == "provider rate-limited; no failover request yet"'
+expect 134 '.class == "stalled" and .reason == "rate-limit-stale" and .rate_limited == true and .next_action == "investigate"'
+expect 135 '.class == "stalled" and .rate_limited == false and .reason == "unanswered-verdict"'
 
-if jq -e '[.prs[] | .number] == [101, 116, 129, 131, 132, 111, 122, 126, 133, 123, 125, 130, 110, 112, 119, 105, 114, 117, 118, 121, 106, 128, 127, 108, 124, 120, 107, 104, 102, 113, 103, 115]' "$TMP/report.json" >/dev/null; then
+if jq -e '[.prs[] | .number] == [101, 116, 129, 131, 132, 111, 122, 126, 133, 123, 134, 125, 130, 135, 110, 112, 119, 105, 114, 117, 118, 121, 106, 128, 127, 108, 124, 120, 107, 104, 102, 113, 103, 115]' "$TMP/report.json" >/dev/null; then
   pass "report is ordered stalled-first, oldest newest-event first"
 else
   fail "report order: $(jq -c '[.prs[] | .number]' "$TMP/report.json")"
@@ -283,7 +296,7 @@ bash "$FINDER" --input "$TMP/snapshot.json" --now "$NOW" > "$TMP/human.txt" 2>&1
 rc=$?
 set -e
 if [ "$rc" -eq 1 ] && grep -Fq '#101  stalled  10h15m  review:commented by chatgpt-codex-connector[bot] at 2026-10-13T01:45:00Z  head 0000000  next: push fix — 2 unanswered finding(s) on head' "$TMP/human.txt" \
-   && grep -Fq 'stalled-prs: octo/demo — 32 open non-draft PR(s), threshold 60m, now 2026-10-13T12:00:00Z' "$TMP/human.txt"; then
+   && grep -Fq 'stalled-prs: octo/demo — 34 open non-draft PR(s), threshold 60m, now 2026-10-13T12:00:00Z' "$TMP/human.txt"; then
   pass "human output carries one line per PR with class, age, newest event, head and next action"
 else
   fail "human output (rc=$rc): $(head -3 "$TMP/human.txt")"
