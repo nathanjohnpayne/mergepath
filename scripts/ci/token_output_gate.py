@@ -273,7 +273,24 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     sync with the file, and the remainder must not vanish into a body in
     silence.
   * The word of a here-STRING given to one of those same commands.
-  * The LITERAL operand of `trap` or `eval`, re-read AS SHELL.  The operand is
+  * The LITERAL deferred source of `trap` or `eval`, re-read AS SHELL.
+    Eval's proven literal arguments form one space-joined program, with an
+    empty-literal and double-quote escape opt-ins only for eval arguments;
+    default command-word decoding stays unchanged. Existing unquoted glob,
+    brace, leading-tilde, assignment-tilde, extglob and ANSI-C inventories refuse
+    the joined path. The inherited per-literal fallback remains unchanged.
+    Eval-only extglob refusal uses unquoted operator/open-parenthesis inventory;
+    quoted and escaped patterns stay literal. Safe or unmatched path samples
+    retain the opaque fallback's declared conservatism without resolving paths.
+    Opener refusal covers later whitespace splits within an eval segment.
+    Existing pipe-separated alternation misses remain inherited (#2234); no
+    extglob grammar or fragment reconstruction is added.
+    Four inherited assignment-tilde misses are version-qualified: Linux
+    Bash 5.2.15 leaked; the observed Mac Bash 5.3.20 build was quiet. The owner
+    preserves #1465's literal-only boundary; #2228 tracks the actual leak fix.
+    Irreducible eval operands retain independent
+    scanning of known literal fragments. Trap actions and callback operands
+    remain separate. The operand is
     source the shell runs later, so quoting inside it quotes the TEXT and not
     an expansion: `trap 'echo "$PAT"' EXIT` prints the credential when the
     trap fires.  This is the same relationship an interpolating here-doc body
@@ -2491,7 +2508,7 @@ def _iter_refs_at(s):
 UNRESOLVED = "<unresolved>"
 
 
-def _command_word_expands(w):
+def _command_word_expands(w, eval_assignment_tilde=False, eval_extglob=False):
     """Does this command word carry an UNQUOTED expansion the shell performs?
 
     `_unquote_command_word` reduces a word to its literal text, which is the
@@ -2522,6 +2539,11 @@ def _command_word_expands(w):
     A word carrying `$` or a backquote never reaches here: it is UNRESOLVED
     already.
     """
+    # Eval's proof excludes assignment tilde prefixes without resolving them.
+    # Ordinary command-word callers retain their existing inventory unchanged.
+    if eval_assignment_tilde or eval_extglob:
+        w = w.replace("\\\n", "")
+    assignment = _ASSIGN_RE.match(w) if eval_assignment_tilde else None
     meta = []  # (char, index) for unquoted metacharacters only
     i = 0
     n = len(w)
@@ -2542,9 +2564,25 @@ def _command_word_expands(w):
                 j += 2 if w[j] == "\\" else 1
             i = j + 1
             continue
-        if c in "*?[]{}":
+        if (c in "*?[]{}" or (eval_assignment_tilde and c in "=:~")
+                or (eval_extglob and c in "+@!(")):
             meta.append((c, i))
         i += 1
+    if assignment is not None:
+        unquoted = {index: char for char, index in meta}
+        if (unquoted.get(assignment.end() - 1) == "="
+                and any(char == "~" and index >= assignment.end()
+                        and (index == assignment.end()
+                             or unquoted.get(index - 1) == ":")
+                        for char, index in meta)):
+            return True
+    if eval_extglob:
+        # Refuse an unquoted extglob opener even when the existing lexer
+        # splits its later whitespace; no path or option state is reconstructed.
+        unquoted = {index: char for char, index in meta}
+        if any(char in "?*+@!" and unquoted.get(index + 1) == "("
+               for char, index in meta):
+            return True
     kinds = [c for c, _ in meta]
     if "*" in kinds or "?" in kinds:
         return True
@@ -2570,15 +2608,19 @@ _ANSI_C_ESCAPES = {
 }
 
 
-def _unquote_command_word(w):
-    """Reduce a command word to a literal, or return None if it is not one."""
+def _unquote_command_word(w, allow_empty=False, eval_literal=False):
+    """Reduce a command word; eval's opt-in proves its pre-evaluation value."""
+    if eval_literal and ("$'" in w or w.replace("\\\n", "").startswith("~")
+                         or _command_word_expands(w, eval_assignment_tilde=True, eval_extglob=True)):
+        return None  # Existing expansion inventories; no runtime reconstruction.
     out = []
     i = 0
     n = len(w)
     while i < n:
         c = w[i]
         if c == "\\" and i + 1 < n:
-            out.append(w[i + 1])
+            if not eval_literal or w[i + 1] != "\n":
+                out.append(w[i + 1])
             i += 2
             continue
         if c == "'":
@@ -2593,7 +2635,12 @@ def _unquote_command_word(w):
             buf = []
             while j < n and w[j] != '"':
                 if w[j] == "\\" and j + 1 < n:
-                    buf.append(w[j + 1])
+                    escaped = w[j + 1]
+                    if not eval_literal or escaped in '$`"\\':
+                        buf.append(escaped)
+                    elif escaped != "\n":
+                        buf.extend(("\\", escaped))
+                    # A quoted backslash-newline is removed before eval.
                     j += 2
                     continue
                 if w[j] in "$`":
@@ -2631,7 +2678,7 @@ def _unquote_command_word(w):
         out.append(c)
         i += 1
     lit = "".join(out)
-    if not lit:
+    if not lit and not allow_empty:
         return None
     return lit
 
@@ -4023,7 +4070,7 @@ _XTRACE_OFF = ("+x", "+o")
 
 
 def _deferred_shell_operands(seg):
-    """LITERAL operands of a `trap` / `eval` segment, as shell source text."""
+    """Literal deferred source; eval's literal arguments form one program."""
     cmd, _redir = resolve_command(seg)
     if cmd == "printf" and seg._cmd_index is not None:
         out = []
@@ -4085,6 +4132,17 @@ def _deferred_shell_operands(seg):
         return out[-1:] if final_callback_certain else out
     if cmd not in DEFERRED_SHELL_COMMANDS:
         return []
+    if cmd == "eval" and seg._cmd_index is not None:
+        literals = [
+            _unquote_command_word(raw, allow_empty=True, eval_literal=True)
+            for raw, _literal in _command_arguments(seg.words, seg._cmd_index + 1)
+        ]
+        if all(literal is not None for literal in literals):
+            if literals[:1] == ["--"]:
+                literals = literals[1:]  # The builtin's optional delimiter.
+            return [" ".join(literals)] if literals else []
+        # An unknown operand keeps the existing per-literal boundary: do not
+        # invent adjacency across source that cannot be reconstructed.
     out = []
     seen_command_word = False
     for w in seg.words:
@@ -7620,6 +7678,167 @@ CORPUS = [
         MUST_FLAG,
         "eval 'echo \"$GH_TOKEN\"'\n",
     ),
+    # #1465 review: pre-eval expansion refusal and double-quote escapes.
+    ('eval-review-brace-expansion-leak', MUST_FLAG, 'eval : {x,\\;echo} \'"$GH_TOKEN"\'\n'),
+    ('eval-review-brace-single-quoted-control', MUST_NOT_FLAG, 'eval : \'{x,\\;echo}\' \'"$GH_TOKEN"\'\n'),
+    ('eval-review-brace-double-quoted-control', MUST_NOT_FLAG, 'eval : "{x,\\;echo}" \'"$GH_TOKEN"\'\n'),
+    ('eval-review-dquote-nonspecial-backslash-control', MUST_NOT_FLAG, 'eval ": \\; echo" \'"$GH_TOKEN"\'\n'),
+    ('eval-review-dquote-semicolon-emitter', MUST_FLAG, 'eval ": ; echo" \'"$GH_TOKEN"\'\n'),
+    ('eval-review-single-quoted-backslash-control', MUST_NOT_FLAG, 'eval \': \\; echo\' \'"$GH_TOKEN"\'\n'),
+    ('eval-review-quoted-glob-control', MUST_NOT_FLAG, 'eval : \'*\' \'"$GH_TOKEN"\'\n'),
+    ('eval-review-quoted-tilde-control', MUST_NOT_FLAG, 'eval : \'~\' \'"$GH_TOKEN"\'\n'),
+    # #1465: merged active-trace bridge and literal-joining seam.
+    (
+        'eval-cross-seam-unknown-empty-prefix-emitter',
+        MUST_FLAG,
+        'DYNAMIC=\'\'\neval "$DYNAMIC" \'echo "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-cross-seam-joined-newline-disable',
+        MUST_NOT_FLAG,
+        'set -x\neval \'set +x\n\' \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-cross-seam-joined-named-newline-disable',
+        MUST_NOT_FLAG,
+        'set -x\neval \'set +o xtrace\n\' \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-cross-seam-joined-newline-enable',
+        MUST_FLAG,
+        'eval \'set -x\n\' \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-cross-seam-joined-named-newline-enable',
+        MUST_FLAG,
+        'eval \'set -o xtrace\n\' \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-cross-seam-empty-between-disable-operands',
+        MUST_NOT_FLAG,
+        'set -x\neval \'set +x\n\' \'\' \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-cross-seam-double-empty-between-disable-operands',
+        MUST_NOT_FLAG,
+        'set -x\neval \'set +x\n\' "" \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-cross-seam-empty-between-enable-operands',
+        MUST_FLAG,
+        'eval \'set -x\n\' \'\' \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-cross-seam-traced-quoted-token-data',
+        MUST_NOT_FLAG,
+        'set -x\neval \'printf %s\' \'\'"\'"\'$GH_TOKEN\'"\'"\'\'\n',
+    ),
+    # #1465: eval joins literal arguments as one shell program.
+    (
+        'eval-joined-literal-emitter',
+        MUST_FLAG,
+        'eval echo \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-colon',
+        MUST_NOT_FLAG,
+        'eval : \'"$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-printf',
+        MUST_FLAG,
+        'eval printf %s \'"$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-plain-control',
+        MUST_NOT_FLAG,
+        'eval printf %s literal\n',
+    ),
+    (
+        'eval-joined-literal-empty-argument',
+        MUST_FLAG,
+        'eval echo \'\' \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-ordinary-printf-data',
+        MUST_NOT_FLAG,
+        'printf %s \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-input-redirection',
+        MUST_FLAG,
+        'eval echo \': "$GH_TOKEN"\' </dev/null\n',
+    ),
+    (
+        'eval-joined-literal-option-delimiter',
+        MUST_FLAG,
+        'eval -- echo \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-option-delimiter-colon',
+        MUST_NOT_FLAG,
+        'eval -- : \'"$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-irreducible-operand-keeps-literal-conservatism',
+        MUST_FLAG,
+        'DYNAMIC=\':\'\neval "$DYNAMIC" \'echo "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-double-quoted-empty-argument',
+        MUST_FLAG,
+        'eval echo "" \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-empty-colon-control',
+        MUST_NOT_FLAG,
+        'eval : \'\' \'"$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-double-quoted-empty-colon-control',
+        MUST_NOT_FLAG,
+        'eval : "" \'"$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-command-word-quote-concat',
+        MUST_FLAG,
+        'eval \'e\'"cho" \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-colon-quote-concat',
+        MUST_NOT_FLAG,
+        'eval \':\'"" \'"$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-list-emitter',
+        MUST_FLAG,
+        'eval : \'; printf %s "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-literal-list-colon',
+        MUST_NOT_FLAG,
+        'eval \'echo;\' \': "$GH_TOKEN"\'\n',
+    ),
+    (
+        'eval-joined-source-output-redirection',
+        MUST_FLAG,
+        'eval \'printf %s "$GH_TOKEN"\' \'>/dev/null\'\n',
+    ),
+    (
+        'eval-joined-source-stderr-redirection',
+        MUST_FLAG,
+        'eval \'printf %s "$GH_TOKEN"\' \'>&2\'\n',
+    ),
+    (
+        'eval-joined-empty-only-program',
+        MUST_NOT_FLAG,
+        'eval \'\' ""\n',
+    ),
+    (
+        'eval-joined-quoted-literal-data',
+        MUST_NOT_FLAG,
+        'eval echo "\'literal GH_TOKEN\'"\n',
+    ),
     # --- xtrace (#1032 round 4) ------------------------------------------
     #
     # With tracing on, bash writes every expanded command to stderr, so the
@@ -10995,6 +11214,12 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    'eval-joined-source-output-redirection': (
+        'Joined literal eval source preserves the existing emitter verdict when the emitted command redirects to /dev/null. Main also flags the separated literal emitter; this bounded join does not infer normal-command sink behavior beyond the existing capture model (#1465).'
+    ),
+    'eval-irreducible-operand-keeps-literal-conservatism': (
+        'An irreducible eval operand retains the existing independent scan of known literal source fragments; no dynamic argument reconstruction proves that the runtime prefix makes the literal emitter silent.'
+    ),
     'helper-hd-owner-structural-count-grep-unknown-quiet': 'The sampled empty runtime option word leaves a count-only stream, but incomplete literal argv cannot prove that a file-list mode was absent. The fixed literal input/program remains possibly delivered without a stage-semantics or option-binding model (owner6151456891).',
     'helper-hd-owner-structural-count-grep-single-file-conservative': 'The literal filename contains positional program text. Sampled grep count with one file omits its filename label and is quiet; possible literal labels retain the owner default without a stage-semantics model (#1496 owner6151456891).',
     'helper-hd-owner-structural-plain-head-output-null': 'The sampled initial stage sends its output to null, but only the final stage receives non-forwarding proof in this source path: no stage-semantics model. The owner explicitly inverts possible delivery without evaluating intermediate stages. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
@@ -13385,6 +13610,56 @@ CORPUS = [(cid, MUST_FLAG if cid in HEREDOC_ECHO_RULE_CHANGES else rule, body)
 KNOWN_BROADER.update({cid: HEREDOC_ECHO_CONSERVATISM
                       for cid in HEREDOC_ECHO_CONSERVATIVE_CASES})
 
+# Owner-approved #1465 scope: these inherited misses remain tracked in #2228.
+# Qualification is the exact quiet build measured, not every Bash 5.3 release.
+EVAL_ASSIGNMENT_TILDE_MISSES = frozenset(('eval-assignment-tilde-inherited-tilde-equal', 'eval-assignment-tilde-inherited-tilde-colon', 'eval-assignment-tilde-inherited-tilde-append', 'eval-assignment-tilde-inherited-tilde-escaped-continuation'))
+EVAL_ASSIGNMENT_TILDE_QUIET_ORACLE = (
+    "GNU bash, version 5.3.20(1)-release (aarch64-apple-darwin27.0.0)"
+)
+CORPUS += [('eval-assignment-tilde-inherited-tilde-equal', 'clean', 'HOME=\'; echo\'\neval X=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-colon', 'clean', 'HOME=\'; echo\'\neval X=prefix:~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-append', 'clean', 'HOME=\'; echo\'\neval X+=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-escaped-continuation', 'clean', 'HOME=\'; echo\'\neval X=\\\n~ \': "$GH_TOKEN"\'\n')]
+KNOWN_MISSES.update({cid: (
+    "Inherited assignment-tilde eval miss: Linux Bash 5.2.15 leaked in the "
+    "paired sample; the measured Mac Bash 5.3.20 build was quiet. Main and "
+    "the pre-guard candidate both missed the Linux leak. The literal-only "
+    "#1465 contract refuses joining, preserving independent known-literal "
+    "fragment fallback; no dynamic prefix reconstruction or leak fix is "
+    "claimed. Owner-approved scope disposition; actual repair is tracked in "
+    "https://github.com/nathanjohnpayne/mergepath/issues/2228"
+) for cid in EVAL_ASSIGNMENT_TILDE_MISSES})
+
+# Eval-only extglob proof refuses potentially expanded words without modelling
+# enabled options or matching paths; retain per-known-literal fallback.
+CORPUS += [
+    ('eval-extglob-extglob-plus', 'flag', 'shopt -s extglob\ntouch \';echo\'\neval : +(\\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-extglob-at', 'flag', 'shopt -s extglob\ntouch \';echo\'\neval : @(\\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-extglob-not', 'flag', 'shopt -s extglob\ntouch \';echo\'\neval : !(\\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-extglob-star', 'flag', 'shopt -s extglob\ntouch \';echo\'\neval : *(\\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-extglob-optional', 'flag', 'shopt -s extglob\ntouch \';echo\'\neval : ?(\\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-extglob-prefixed-at', 'flag', 'shopt -s extglob\ntouch \'x;echo\'\neval : x@(\\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-extglob-newline-plus', 'flag', 'shopt -s extglob\ntouch \';echo\'\neval : +\\\n(\\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-quoted-plus', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : \'+(;echo)\' \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-quoted-at', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : \'@(;echo)\' \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-quoted-not', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : \'!(;echo)\' \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-safe-matched-plus', 'flag', 'shopt -s extglob\ntouch safe\neval : +(safe) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-safe-unmatched-at', 'flag', 'shopt -s extglob\neval : @(absent) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-escaped-whole-plus', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : \\+\\(\\;echo\\) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-ordinary-plus-data', 'clean', 'shopt -s extglob\ntouch \';echo\'\nprintf \'%s\\n\' +(\\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-extglob-not-positive', 'flag', 'shopt -s extglob\ntouch \';echo\'\neval : !(safe) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-quoted-only-plus', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : \'+\'(\\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-escaped-parens-plus', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : +\\(\\;echo\\) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-double-quoted-plus', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : "+(;echo)" \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-opener-at-space', 'flag', 'shopt -s extglob\ntouch \' ;echo\'\neval : @( \\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-opener-plus-space', 'flag', 'shopt -s extglob\ntouch \' ;echo\'\neval : +( \\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-opener-not-space', 'flag', 'shopt -s extglob\ntouch \' ;echo\'\neval : !( \\;echo) \'"$GH_TOKEN"\'\n'),
+]
+KNOWN_BROADER.update({cid: (
+    "Eval extglob words withhold literal joining and retain independent known-"
+    "literal fragment scans. The sampled pattern excludes the malicious file, "
+    "matches only safe DATA, or has no match, so runtime is quiet while the "
+    "opaque fallback remains conservative. No filesystem matches or extglob "
+    "option state are reconstructed (#1465 extglob review repair)."
+) for cid in ('eval-extglob-extglob-not', 'eval-extglob-safe-matched-plus', 'eval-extglob-safe-unmatched-at', 'eval-extglob-opener-not-space')})
+
 def _corpus_id_cases():
     """Every corpus id is UNIQUE, and every declared id names a real case.
 
@@ -13598,6 +13873,7 @@ def self_test():
     passed = 0
     tp = fn = fp = tn = 0
     bash_path, bash_text, _bash_ver = oracle_bash()
+    quiet_eval_tilde_samples = set()
 
     failures.extend(_corpus_id_cases())
     failures.extend(_printf_allowlist_cases())
@@ -13677,9 +13953,15 @@ def self_test():
             else:
                 tn += 1
 
+            # Only the four inherited tilde cases on the exact observed quiet
+            # build qualify; every other declaration retains normal stale checks.
+            if (cid in EVAL_ASSIGNMENT_TILDE_MISSES
+                    and bash_text == EVAL_ASSIGNMENT_TILDE_QUIET_ORACLE
+                    and not leaked and not flagged):
+                quiet_eval_tilde_samples.add(cid)
             minimum_bash = KNOWN_MISS_MIN_BASH.get(cid)
             unsupported_miss = (minimum_bash is not None and _bash_ver is not None
-                                and _bash_ver < minimum_bash)
+                                and _bash_ver < minimum_bash) or cid in quiet_eval_tilde_samples
             if cid in KNOWN_MISSES and not unsupported_miss and not (leaked and not flagged):
                 failures.append(
                     "STALE KNOWN_MISSES entry %r: it no longer disagrees with "
@@ -13749,6 +14031,8 @@ def self_test():
         unsupported_miss = (minimum_bash is not None and _bash_ver is not None
                             and _bash_ver < minimum_bash)
         label = "unsupported version-qualified miss" if unsupported_miss else "measured miss"
+        if cid in quiet_eval_tilde_samples:
+            label = "quiet observed Bash 5.3.20 sample; inherited Linux Bash 5.2 miss"
         print(
             "check_no_token_in_output:   %s: %s -- %s"
             % (label, cid, KNOWN_MISSES[cid])
@@ -13928,6 +14212,100 @@ def _deferred_shell_cases():
     cannot read the source the one place that admission is invisible.
     """
     failures = []
+    # Extglob prefixes withhold eval joining; ordinary inventory stays exact.
+    for operator in "?*+@!":
+        raw = operator + "(x)"
+        if (_command_word_expands(raw) != (operator in "?*")
+                or not _command_word_expands(raw, eval_extglob=True)
+                or _unquote_command_word(raw, eval_literal=True) is not None):
+            failures.append("eval extglob literal proof: " + raw)
+    for raw in ("'@(x)'", '"+(x)"', r"\+\(x\)", "'+'(x)", r"+\(x\)",
+                "name@part", "+value", "!literal"):
+        if (_command_word_expands(raw, eval_extglob=True)
+                or _unquote_command_word(raw, eval_literal=True) is None):
+            failures.append("eval extglob literal control: " + raw)
+    for raw in ("prefix@(x)", "+\\\n(x)", "@(", "+(", "!("):
+        if (_command_word_expands(raw)
+                or not _command_word_expands(raw, eval_extglob=True)
+                or _unquote_command_word(raw, eval_literal=True) is not None):
+            failures.append("eval extglob prefix/continuation: " + repr(raw))
+    # Assignment-shaped tilde refusal changes literal proof, not fallback.
+    for raw, expands in [
+        ('X=~', True),
+        ('X=prefix:~', True),
+        ('X+=~', True),
+        ('X=\\\n~', True),
+        ("X='~'", False),
+        ('X="~"', False),
+        ('X=\\~', False),
+        ("'X=~'", False),
+        ("X=prefix:'~'", False),
+        ('X=prefix:\\~', False),
+        ('"X"=~', False),
+        ('X\\=~', False),
+        ('X=prefix~', False),
+        ('X=foo:~', True),
+        ('X=foo\\:~', False),
+        ('X=foo:\\\n~', True),
+        ('X=foo\\:\\\n~', False),
+        ('X=prefix\\:~', False),
+        ("X=prefix':'~", False),
+        ('X=prefix":"~', False),
+        ("X'='~", False),
+        ("'X'=~", False),
+        ('X\\Y=~', False),
+    ]:
+        if _command_word_expands(raw) or _command_word_expands(raw, eval_assignment_tilde=True) != expands:
+            failures.append("eval assignment tilde inventory: " + repr(raw))
+        literal = _unquote_command_word(raw, allow_empty=True, eval_literal=True)
+        if (literal is None) != expands:
+            failures.append("eval assignment tilde literal proof: " + repr(raw))
+    # Ordinary decoding remains exact; only proven eval arguments opt in.
+    if (_unquote_command_word(r'": \; echo"') != ': ; echo'
+            or _unquote_command_word(r'": \; echo"', eval_literal=True) != r': \; echo'):
+        failures.append("eval double-quoted nonspecial backslash")
+    for raw in ("*", "?", "[x]", "{x,y}", "~", "$'literal'"):
+        if _unquote_command_word(raw, eval_literal=True) is not None:
+            failures.append("eval expandable argument admitted: " + raw)
+    for raw, expected in [("'*'", "*"), ('"?"', "?"), ("'[x]'", "[x]"),
+                          ("'{x,y}'", "{x,y}"), ("'~'", "~"),
+                          (r"\*", "*"), (r"\~", "~")]:
+        if _unquote_command_word(raw, eval_literal=True) != expected:
+            failures.append("eval quoted argument refused: " + raw)
+    for raw, expected in [('"\\$GH_TOKEN"', '$GH_TOKEN'), ('"\\`"', '`'), ('"\\""', '"'), ('"\\\\"', '\\'), ('"a\\\nb"', 'ab'), ('a\\\nb', 'ab')]:
+        if _unquote_command_word(raw, eval_literal=True) != expected:
+            failures.append("eval double-quote escape boundary: " + repr(raw))
+    for raw in ("''", '""'):
+        if (_unquote_command_word(raw) is not None
+                or _unquote_command_word(raw, allow_empty=True) != ""):
+            failures.append("eval empty-literal opt-in: " + raw)
+    for raw in ("$DYNAMIC", '"$DYNAMIC"'):
+        if _unquote_command_word(raw, allow_empty=True) is not None:
+            failures.append("eval reconstructed a dynamic argument: " + raw)
+    extraction_cases = [
+        ('eval : {x,\\;echo} \'"$GH_TOKEN"\'', [':', '{x,;echo}', '"$GH_TOKEN"']),
+        ('eval ": \\; echo" \'"$GH_TOKEN"\'', [': \\; echo "$GH_TOKEN"']),
+        ('eval : \'*\' \'"$GH_TOKEN"\'', [': * "$GH_TOKEN"']),
+        ('eval : \'~\' \'"$GH_TOKEN"\'', [': ~ "$GH_TOKEN"']),
+        ('eval : * \'"$GH_TOKEN"\'', [':', '*', '"$GH_TOKEN"']),
+        ('eval : ~ \'"$GH_TOKEN"\'', [':', '~', '"$GH_TOKEN"']),
+        ("eval echo ': \"$GH_TOKEN\"'", ['echo : "$GH_TOKEN"']),
+        ("eval : '\"$GH_TOKEN\"'", [': "$GH_TOKEN"']),
+        ("eval '' \"\"", [" "]),
+        ("eval --", []),
+        ("eval echo ': \"$GH_TOKEN\"' </dev/null", ['echo : "$GH_TOKEN"']),
+        ("eval \"$DYNAMIC\" 'echo \"$GH_TOKEN\"' literal", ['echo "$GH_TOKEN"', 'literal']),
+        ("trap ': \"$GH_TOKEN\"' EXIT", [': "$GH_TOKEN"', 'EXIT']),
+        ("mapfile -tC ': \"$GH_TOKEN\"' rows", [': "$GH_TOKEN"']),
+        ("readarray -tC': \"$GH_TOKEN\"' rows", [': "$GH_TOKEN"']),
+        ("printf %s ': \"$GH_TOKEN\"'", []),
+    ]
+    for text, expected in extraction_cases:
+        lx = Lexer(text + "\n")
+        actual = [inner for ll in lx.logical for seg in ll.segments
+                  for inner in _deferred_shell_operands(seg)]
+        if actual != expected:
+            failures.append("deferred source extraction: %r -> %r" % (text, actual))
     cases = [
         (
             "trap-heredoc-unterminated",
