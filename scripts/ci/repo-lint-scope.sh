@@ -7,6 +7,40 @@
 # deep lane. Every non-PR event and every unknown governance change runs the
 # complete surface.
 #
+# Outputs (one `key=value` line each, also appended to $GITHUB_OUTPUT):
+#   deep            - any deep-safety leg runs.
+#   full            - every enrolled self-test and both harness lattices run
+#                     in full (the fail-closed catch-all).
+#   checks          - JSON array of the selected check_* wrappers.
+#   consumer_replay - the sharded replay legs re-run EVERY wired wrapper on
+#                     the consumer-shaped fixture. Otherwise the consumer leg
+#                     runs the harness in smoke mode: only the selected
+#                     wrappers plus its structural #979 guards (#1655).
+#   self_tests      - at least one selected wrapper has an enrolled
+#                     `--self-test` step (the graph's `self_tests` list), so
+#                     the self-test legs have work to do.
+#
+# Trigger classes in the graph, from widest to narrowest effect:
+#   full_triggers            - the lane's own definition (workflow, this
+#                              classifier, the graph, the harnesses and the
+#                              shared selector). Fail closed to everything.
+#   consumer_replay_triggers - inputs that define the consumer SHAPE (sync
+#                              manifest, bootstrap exclusions, the fixture
+#                              model and the wrapper contract). Select the
+#                              full consumer replay without forcing every
+#                              self-test.
+#   deep_triggers            - governance documents. Their only deep-lane
+#                              readers are the harnesses, so they request the
+#                              deep legs in smoke mode; the complete replay
+#                              runs for them on push to main and on the
+#                              daily schedule.
+#   wrappers                 - changed path -> owning wrapper(s).
+# A propagation-lane head (`--head-ref mergepath-sync/...`) runs the complete
+# surface: that is the PR whose delivered shape matters, on every repo.
+# The replay harness itself is hub-only (marker-first SKIP elsewhere), so
+# consumer mode always reports `consumer_replay=false` and the replay legs
+# never spin up on a consumer for nothing.
+#
 # Consumer mode. On a consumer checkout the deep lane is only the kit's
 # --self-test suites: the consumer-safety and residue harnesses SKIP there
 # (marker-first), and the self-tests build their own fixtures rather than
@@ -15,8 +49,8 @@
 # the hub-shaped fail-closed rules below would send to the full deep net on
 # almost every feature PR (26 of 34 green fiveacross PR runs measured
 # 2026-10-09 ran the full deep lane, 23-36 min each). So on a consumer:
-#   - the governance-document full triggers (CONSUMER_DOC_ONLY) stop forcing
-#     the full surface — their only deep readers are the hub-only harnesses;
+#   - the governance-document triggers (CONSUMER_DOC_ONLY) stop requesting
+#     deep CI at all — their only deep readers are the hub-only harnesses;
 #   - the unknown-path catch-all is narrowed to the kit-delivered CI shapes
 #     (consumer_ci_surface), so consumer-local specs, app tests, and .mjs
 #     scripts take the fast lane while any delivered CI file still fails
@@ -33,21 +67,64 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: repo-lint-scope.sh --event <event-name>" >&2
+  echo "usage: repo-lint-scope.sh --event <event-name> [--head-ref <ref>]" >&2
   exit 2
 }
 
-[ "$#" -eq 2 ] || usage
-[ "$1" = "--event" ] || usage
-EVENT="$2"
+EVENT=''
+HEAD_REF=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --event)
+      [ "$#" -ge 2 ] || usage
+      EVENT="$2"
+      shift 2
+      ;;
+    --head-ref)
+      [ "$#" -ge 2 ] || usage
+      HEAD_REF="$2"
+      shift 2
+      ;;
+    *) usage ;;
+  esac
+done
+[ -n "$EVENT" ] || usage
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 GRAPH="$ROOT/scripts/ci/repo-lint-dependencies.json"
+
+emit() {
+  printf 'deep=%s\nfull=%s\nchecks=%s\nconsumer_replay=%s\nself_tests=%s\n' "$1" "$2" "$3" "$4" "$5"
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    printf 'deep=%s\nfull=%s\nchecks=%s\nconsumer_replay=%s\nself_tests=%s\n' "$1" "$2" "$3" "$4" "$5" >> "$GITHUB_OUTPUT"
+  fi
+}
+
+MODE=hub
+if [ ! -f "$ROOT/scripts/sync-to-downstream.sh" ] && [ ! -f "$ROOT/.mergepath-sync.yml" ]; then
+  MODE=consumer
+fi
+
+# Fail closed: every leg, including the replay — except on a consumer, which
+# has no replay harness to run (it SKIPs marker-first), so spinning the
+# replay legs up there would only burn runners.
+fail_closed() {
+  local replay=true
+  [ "$MODE" = "hub" ] || replay=false
+  emit true true '[]' "$replay" true
+  exit 0
+}
 
 if [ ! -f "$GRAPH" ] || ! command -v jq >/dev/null 2>&1 \
    || ! jq -e '
      .version == 1
      and (.full_triggers | type == "array")
      and all(.full_triggers[]; type == "string")
+     and ((.consumer_replay_triggers // []) | type == "array")
+     and all((.consumer_replay_triggers // [])[]; type == "string")
+     and ((.deep_triggers // []) | type == "array")
+     and all((.deep_triggers // [])[]; type == "string")
+     and ((.self_tests // []) | type == "array")
+     and all((.self_tests // [])[]; type == "string" and test("^check_[A-Za-z0-9_]+$"))
      and (.wrappers | type == "object")
      and all(.wrappers | keys[]; test("^check_[A-Za-z0-9_]+$"))
      and all(.wrappers | to_entries[];
@@ -55,32 +132,16 @@ if [ ! -f "$GRAPH" ] || ! command -v jq >/dev/null 2>&1 \
        and all(.value[]; type == "string"))
    ' "$GRAPH" >/dev/null 2>&1; then
   echo "repo-lint scope: dependency graph unavailable or invalid; failing closed" >&2
-  deep=true
-  full=true
-  checks='[]'
-  printf 'deep=%s\nfull=%s\nchecks=%s\n' "$deep" "$full" "$checks"
-  if [ -n "${GITHUB_OUTPUT:-}" ]; then
-    printf 'deep=%s\nfull=%s\nchecks=%s\n' "$deep" "$full" "$checks" >> "$GITHUB_OUTPUT"
-  fi
-  exit 0
+  fail_closed
 fi
 
 if ! full_patterns=$(jq -r '.full_triggers[]' "$GRAPH") \
+   || ! replay_patterns=$(jq -r '(.consumer_replay_triggers // [])[]' "$GRAPH") \
+   || ! deep_patterns=$(jq -r '(.deep_triggers // [])[]' "$GRAPH") \
+   || ! self_test_wrappers=$(jq -r '(.self_tests // [])[]' "$GRAPH") \
    || ! wrapper_patterns=$(jq -r '.wrappers | to_entries[] | .key as $wrapper | .value[] | [$wrapper, .] | @tsv' "$GRAPH"); then
   echo "repo-lint scope: dependency graph parsing failed; failing closed" >&2
-  deep=true
-  full=true
-  checks='[]'
-  printf 'deep=%s\nfull=%s\nchecks=%s\n' "$deep" "$full" "$checks"
-  if [ -n "${GITHUB_OUTPUT:-}" ]; then
-    printf 'deep=%s\nfull=%s\nchecks=%s\n' "$deep" "$full" "$checks" >> "$GITHUB_OUTPUT"
-  fi
-  exit 0
-fi
-
-MODE=hub
-if [ ! -f "$ROOT/scripts/sync-to-downstream.sh" ] && [ ! -f "$ROOT/.mergepath-sync.yml" ]; then
-  MODE=consumer
+  fail_closed
 fi
 
 # Governance documents whose only deep-lane readers are the hub-only
@@ -101,12 +162,33 @@ consumer_ci_surface() {
   return 1
 }
 
+# Prose beside the implementation (scripts/**/README.md and the like). No
+# wrapper executes it, so it never requests the deep lane by shape alone.
+implementation_doc() {
+  case "$1" in
+    scripts/*.md|tests/*.md) return 0 ;;
+  esac
+  return 1
+}
+
 matches_pattern() {
   local candidate="$1" pattern="$2"
+  # shellcheck disable=SC2254 # graph entries are case globs by design
   case "$candidate" in
     $pattern) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+matches_any() {
+  local candidate="$1" patterns="$2" pattern
+  while IFS= read -r pattern; do
+    [ -n "$pattern" ] || continue
+    if matches_pattern "$candidate" "$pattern"; then
+      return 0
+    fi
+  done <<<"$patterns"
+  return 1
 }
 
 selected=''
@@ -125,26 +207,56 @@ $wrapper
 
 deep=false
 full=false
+consumer_replay=false
 if [ "$EVENT" != "pull_request" ]; then
   deep=true
   full=true
+  consumer_replay=true
 else
-  while IFS= read -r path; do
-    [ -n "$path" ] || continue
+  case "$HEAD_REF" in
+    mergepath-sync/*)
+      deep=true
+      full=true
+      consumer_replay=true
+      ;;
+  esac
 
-    while IFS= read -r pattern; do
-      if matches_pattern "$path" "$pattern"; then
-        if [ "$MODE" = "consumer" ] && consumer_doc_only "$path"; then
-          break
-        fi
+  while IFS= read -r path; do
+    [ "$full" = "false" ] || break
+    [ -n "$path" ] || continue
+    # Prose beside the implementation is checked first: a README inside a
+    # declared directory glob (scripts/phase-4b/*) is still prose.
+    if implementation_doc "$path"; then
+      continue
+    fi
+
+    if matches_any "$path" "$full_patterns"; then
+      if [ "$MODE" = "consumer" ] && consumer_doc_only "$path"; then
+        :
+      else
         deep=true
         full=true
+        consumer_replay=true
         break
       fi
-    done <<<"$full_patterns"
-    [ "$full" = "false" ] || break
+    fi
 
     matched=false
+    if matches_any "$path" "$replay_patterns"; then
+      deep=true
+      consumer_replay=true
+      matched=true
+    fi
+
+    if matches_any "$path" "$deep_patterns"; then
+      if [ "$MODE" = "consumer" ] && consumer_doc_only "$path"; then
+        :
+      else
+        deep=true
+      fi
+      matched=true
+    fi
+
     case "$path" in
       scripts/ci/check_*)
         select_wrapper "${path##*/}"
@@ -169,6 +281,7 @@ else
         if consumer_ci_surface "$path"; then
           deep=true
           full=true
+          consumer_replay=true
           break
         fi
       else
@@ -176,6 +289,7 @@ else
           .github/*|scripts/*|tests/*|specs/*|rules/*|docs/agents/*|docs/architecture/*|.mergepath-sync.yml|.repo-template.yml|AGENTS.md|REVIEW_POLICY.md|ai_agent_tooling_standard.md)
             deep=true
             full=true
+            consumer_replay=true
             break
             ;;
         esac
@@ -190,7 +304,27 @@ else
   checks='[]'
 fi
 
-printf 'deep=%s\nfull=%s\nchecks=%s\n' "$deep" "$full" "$checks"
-if [ -n "${GITHUB_OUTPUT:-}" ]; then
-  printf 'deep=%s\nfull=%s\nchecks=%s\n' "$deep" "$full" "$checks" >> "$GITHUB_OUTPUT"
+# The self-test legs run for a full selection, or when a selected wrapper is
+# enrolled in them. A selection of lint-fast-only wrappers leaves those legs
+# idle, so they are not started.
+self_tests=false
+if [ "$full" = "true" ]; then
+  self_tests=true
+elif [ -n "$selected" ]; then
+  while IFS= read -r wrapper; do
+    [ -n "$wrapper" ] || continue
+    case "
+$selected
+" in
+      *"
+$wrapper
+"*) self_tests=true ;;
+    esac
+  done <<<"$self_test_wrappers"
 fi
+
+if [ "$MODE" = "consumer" ]; then
+  consumer_replay=false
+fi
+
+emit "$deep" "$full" "$checks" "$consumer_replay" "$self_tests"

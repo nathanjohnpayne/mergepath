@@ -538,12 +538,27 @@ echo "test_repo_lint_consumer_safety: running $WIRED_COUNT wired checks against 
 
 # ---------------------------------------------------------------------------
 # Run every wired check from the fixture root; each must exit 0.
+#
+# Two filters, both from the shared selector (#1655): the classifier's
+# wrapper selection (a partial deep lane replays only the selected
+# wrappers; the complete replay admits them all) and the shard
+# (REPO_LINT_SHARD="<index>/<count>" splits the complete replay over
+# independent legs). The ordinal is the wrapper's position in the sorted
+# WIRED list, so every shard numbers the same wrapper the same way and the
+# shards partition the set exactly.
 # ---------------------------------------------------------------------------
+REPLAYED=0
+ordinal=-1
 while IFS= read -r name; do
   [ -z "$name" ] && continue
+  ordinal=$((ordinal + 1))
   if ! repo_lint_check_is_selected "$name"; then
     continue
   fi
+  if ! repo_lint_shard_owns "$ordinal"; then
+    continue
+  fi
+  REPLAYED=$((REPLAYED + 1))
   set +e
   out=$(
     cd "$FIX" && \
@@ -567,6 +582,7 @@ while IFS= read -r name; do
     echo "$out" | tail -15 >&2
   fi
 done <<< "$WIRED"
+echo "test_repo_lint_consumer_safety: replayed $REPLAYED of $WIRED_COUNT wired checks (selection full=$REPO_LINT_SELECTION_FULL, shard $REPO_LINT_SELECTION_SHARD)"
 
 # ---------------------------------------------------------------------------
 # #979 — KIT-LESS consumer safety.

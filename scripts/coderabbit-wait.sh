@@ -504,9 +504,10 @@ if [ -z "$REPO" ]; then
 fi
 
 if [ -z "${GH_TOKEN:-}" ]; then
-  echo "ERROR: GH_TOKEN is required. Either:" >&2
-  echo "  - Run: eval \"\$(scripts/op-preflight.sh --agent <agent> --mode all)\"" >&2
-  echo "    so this helper auto-sources OP_PREFLIGHT_REVIEWER_PAT, OR" >&2
+  echo "ERROR: GH_TOKEN is required. Use the credential path for this session:" >&2
+  echo "  - Local: canonical preflight uses --agent <agent> --mode review." >&2
+  echo "    After an authentication failure, wait for fresh human readiness before one refresh." >&2
+  echo "  - Cloud: use provisioned reviewer credentials and the capability probe in docs/agents/cloud-environments.md; do not invoke local 1Password preflight." >&2
   echo "  - Set GH_TOKEN to the expected reviewer PAT." >&2
   exit 3
 fi
