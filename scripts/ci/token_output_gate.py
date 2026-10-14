@@ -277,8 +277,14 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     Eval's proven literal arguments form one space-joined program, with an
     empty-literal and double-quote escape opt-ins only for eval arguments;
     default command-word decoding stays unchanged. Existing unquoted glob,
-    brace, leading-tilde, assignment-tilde and ANSI-C inventories refuse
+    brace, leading-tilde, assignment-tilde, extglob and ANSI-C inventories refuse
     the joined path. The inherited per-literal fallback remains unchanged.
+    Eval-only extglob refusal uses unquoted operator/open-parenthesis inventory;
+    quoted and escaped patterns stay literal. Safe or unmatched path samples
+    retain the opaque fallback's declared conservatism without resolving paths.
+    Opener refusal covers later whitespace splits within an eval segment.
+    Existing pipe-separated alternation misses remain inherited (#2234); no
+    extglob grammar or fragment reconstruction is added.
     Four inherited assignment-tilde misses are version-qualified: Linux
     Bash 5.2.15 leaked; the observed Mac Bash 5.3.20 build was quiet. The owner
     preserves #1465's literal-only boundary; #2228 tracks the actual leak fix.
@@ -2502,7 +2508,7 @@ def _iter_refs_at(s):
 UNRESOLVED = "<unresolved>"
 
 
-def _command_word_expands(w, eval_assignment_tilde=False):
+def _command_word_expands(w, eval_assignment_tilde=False, eval_extglob=False):
     """Does this command word carry an UNQUOTED expansion the shell performs?
 
     `_unquote_command_word` reduces a word to its literal text, which is the
@@ -2535,7 +2541,7 @@ def _command_word_expands(w, eval_assignment_tilde=False):
     """
     # Eval's proof excludes assignment tilde prefixes without resolving them.
     # Ordinary command-word callers retain their existing inventory unchanged.
-    if eval_assignment_tilde:
+    if eval_assignment_tilde or eval_extglob:
         w = w.replace("\\\n", "")
     assignment = _ASSIGN_RE.match(w) if eval_assignment_tilde else None
     meta = []  # (char, index) for unquoted metacharacters only
@@ -2558,7 +2564,8 @@ def _command_word_expands(w, eval_assignment_tilde=False):
                 j += 2 if w[j] == "\\" else 1
             i = j + 1
             continue
-        if c in "*?[]{}" or (eval_assignment_tilde and c in "=:~"):
+        if (c in "*?[]{}" or (eval_assignment_tilde and c in "=:~")
+                or (eval_extglob and c in "+@!(")):
             meta.append((c, i))
         i += 1
     if assignment is not None:
@@ -2568,6 +2575,13 @@ def _command_word_expands(w, eval_assignment_tilde=False):
                         and (index == assignment.end()
                              or unquoted.get(index - 1) == ":")
                         for char, index in meta)):
+            return True
+    if eval_extglob:
+        # Refuse an unquoted extglob opener even when the existing lexer
+        # splits its later whitespace; no path or option state is reconstructed.
+        unquoted = {index: char for char, index in meta}
+        if any(char in "?*+@!" and unquoted.get(index + 1) == "("
+               for char, index in meta):
             return True
     kinds = [c for c, _ in meta]
     if "*" in kinds or "?" in kinds:
@@ -2597,7 +2611,7 @@ _ANSI_C_ESCAPES = {
 def _unquote_command_word(w, allow_empty=False, eval_literal=False):
     """Reduce a command word; eval's opt-in proves its pre-evaluation value."""
     if eval_literal and ("$'" in w or w.replace("\\\n", "").startswith("~")
-                         or _command_word_expands(w, eval_assignment_tilde=True)):
+                         or _command_word_expands(w, eval_assignment_tilde=True, eval_extglob=True)):
         return None  # Existing expansion inventories; no runtime reconstruction.
     out = []
     i = 0
@@ -13613,6 +13627,39 @@ KNOWN_MISSES.update({cid: (
     "https://github.com/nathanjohnpayne/mergepath/issues/2228"
 ) for cid in EVAL_ASSIGNMENT_TILDE_MISSES})
 
+# Eval-only extglob proof refuses potentially expanded words without modelling
+# enabled options or matching paths; retain per-known-literal fallback.
+CORPUS += [
+    ('eval-extglob-extglob-plus', 'flag', 'shopt -s extglob\ntouch \';echo\'\neval : +(\\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-extglob-at', 'flag', 'shopt -s extglob\ntouch \';echo\'\neval : @(\\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-extglob-not', 'flag', 'shopt -s extglob\ntouch \';echo\'\neval : !(\\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-extglob-star', 'flag', 'shopt -s extglob\ntouch \';echo\'\neval : *(\\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-extglob-optional', 'flag', 'shopt -s extglob\ntouch \';echo\'\neval : ?(\\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-extglob-prefixed-at', 'flag', 'shopt -s extglob\ntouch \'x;echo\'\neval : x@(\\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-extglob-newline-plus', 'flag', 'shopt -s extglob\ntouch \';echo\'\neval : +\\\n(\\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-quoted-plus', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : \'+(;echo)\' \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-quoted-at', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : \'@(;echo)\' \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-quoted-not', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : \'!(;echo)\' \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-safe-matched-plus', 'flag', 'shopt -s extglob\ntouch safe\neval : +(safe) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-safe-unmatched-at', 'flag', 'shopt -s extglob\neval : @(absent) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-escaped-whole-plus', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : \\+\\(\\;echo\\) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-ordinary-plus-data', 'clean', 'shopt -s extglob\ntouch \';echo\'\nprintf \'%s\\n\' +(\\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-extglob-not-positive', 'flag', 'shopt -s extglob\ntouch \';echo\'\neval : !(safe) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-quoted-only-plus', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : \'+\'(\\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-escaped-parens-plus', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : +\\(\\;echo\\) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-double-quoted-plus', 'clean', 'shopt -s extglob\ntouch \';echo\'\neval : "+(;echo)" \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-opener-at-space', 'flag', 'shopt -s extglob\ntouch \' ;echo\'\neval : @( \\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-opener-plus-space', 'flag', 'shopt -s extglob\ntouch \' ;echo\'\neval : +( \\;echo) \'"$GH_TOKEN"\'\n'),
+    ('eval-extglob-opener-not-space', 'flag', 'shopt -s extglob\ntouch \' ;echo\'\neval : !( \\;echo) \'"$GH_TOKEN"\'\n'),
+]
+KNOWN_BROADER.update({cid: (
+    "Eval extglob words withhold literal joining and retain independent known-"
+    "literal fragment scans. The sampled pattern excludes the malicious file, "
+    "matches only safe DATA, or has no match, so runtime is quiet while the "
+    "opaque fallback remains conservative. No filesystem matches or extglob "
+    "option state are reconstructed (#1465 extglob review repair)."
+) for cid in ('eval-extglob-extglob-not', 'eval-extglob-safe-matched-plus', 'eval-extglob-safe-unmatched-at', 'eval-extglob-opener-not-space')})
+
 def _corpus_id_cases():
     """Every corpus id is UNIQUE, and every declared id names a real case.
 
@@ -14165,6 +14212,23 @@ def _deferred_shell_cases():
     cannot read the source the one place that admission is invisible.
     """
     failures = []
+    # Extglob prefixes withhold eval joining; ordinary inventory stays exact.
+    for operator in "?*+@!":
+        raw = operator + "(x)"
+        if (_command_word_expands(raw) != (operator in "?*")
+                or not _command_word_expands(raw, eval_extglob=True)
+                or _unquote_command_word(raw, eval_literal=True) is not None):
+            failures.append("eval extglob literal proof: " + raw)
+    for raw in ("'@(x)'", '"+(x)"', r"\+\(x\)", "'+'(x)", r"+\(x\)",
+                "name@part", "+value", "!literal"):
+        if (_command_word_expands(raw, eval_extglob=True)
+                or _unquote_command_word(raw, eval_literal=True) is None):
+            failures.append("eval extglob literal control: " + raw)
+    for raw in ("prefix@(x)", "+\\\n(x)", "@(", "+(", "!("):
+        if (_command_word_expands(raw)
+                or not _command_word_expands(raw, eval_extglob=True)
+                or _unquote_command_word(raw, eval_literal=True) is not None):
+            failures.append("eval extglob prefix/continuation: " + repr(raw))
     # Assignment-shaped tilde refusal changes literal proof, not fallback.
     for raw, expands in [
         ('X=~', True),

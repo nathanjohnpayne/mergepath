@@ -100,7 +100,9 @@ on:
   # token requests at 8 open PRs, and the three */15 sweeps together spent
   # about twice the 1,000/hr budget. Lint completion is event-driven through
   # the publisher's repo-lint parent, so only no-event transitions wait for
-  # this tick: up to 30 minutes. Pinned by check_required_check_publisher.
+  # this tick: up to 30 minutes. Pinned by check_required_check_publisher,
+  # which also pins the publisher's DUE_MAX_AGE_SECONDS to this interval
+  # (A16, #2220): change the two together.
   schedule:
     - cron: "*/30 * * * *"
 

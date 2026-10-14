@@ -237,13 +237,11 @@ const core = { warning: message => warnings.push(message) };
 const needsExternal = true;
 const policyReadFailed = Boolean(scenario.policyReadFailed);
 const policyConfigPath = '/trusted/governing-policy.yml';
-const childProcess = {
-  execFileSync(file, args, options) {
-    calls.push({file, args, options});
-    if (scenario.verifierFails) throw new Error('live byte verification refused');
-    return '';
-  },
-};
+async function execFileAsync(file, args, options) {
+  calls.push({file, args, options});
+  if (scenario.verifierFails) throw new Error('live byte verification refused');
+  return '';
+}
 const pr = {
   number: 42,
   head: { ref: 'mergepath-sync/deadbee', sha: scenario.head },
@@ -254,9 +252,9 @@ let laneVerifiedHead = null;
 try {
   laneVerifiedHead = await new AsyncFunction(
     'github', 'context', 'core', 'needsExternal', 'pr',
-    'childProcess', 'policyReadFailed', 'policyConfigPath', body
+    'execFileAsync', 'policyReadFailed', 'policyConfigPath', body
   )(github, context, core, needsExternal, pr,
-    childProcess, policyReadFailed, policyConfigPath);
+    execFileAsync, policyReadFailed, policyConfigPath);
 } catch (err) {
   crashed = err.message;
 }

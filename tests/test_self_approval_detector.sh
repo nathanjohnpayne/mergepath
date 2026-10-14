@@ -18,8 +18,10 @@ PROTECTION_MODULE="$(mktemp "${TMPDIR:-/tmp}/durable-approval-protection.XXXXXX.
 SNAPSHOT_MODULE="$(mktemp "${TMPDIR:-/tmp}/stable-review-snapshot.XXXXXX.cjs")"
 TRIAGE_POLICY_MODULE="$(mktemp "${TMPDIR:-/tmp}/triage-policy-materialization.XXXXXX.cjs")"
 APPROVAL_PHASE4_MODULE="$(mktemp "${TMPDIR:-/tmp}/approval-phase4-decision.XXXXXX.cjs")"
+TRIAGE_IO_MODULE="$(mktemp "${TMPDIR:-/tmp}/triage-event-loop-io.XXXXXX.cjs")"
 RENDER_FIXTURE="$(mktemp -d "${TMPDIR:-/tmp}/self-approval-renderer.XXXXXX")"
-trap 'rm -f "$BOOTSTRAP_MODULE" "$DISMISS_MODULE" "$PROTECTION_MODULE" "$SNAPSHOT_MODULE" "$TRIAGE_POLICY_MODULE" "$APPROVAL_PHASE4_MODULE"; rm -rf "$RENDER_FIXTURE"' EXIT
+TRIAGE_STEP_TMP="$(mktemp -d "${TMPDIR:-/tmp}/triage-step.XXXXXX")"
+trap 'rm -f "$BOOTSTRAP_MODULE" "$DISMISS_MODULE" "$PROTECTION_MODULE" "$SNAPSHOT_MODULE" "$TRIAGE_POLICY_MODULE" "$APPROVAL_PHASE4_MODULE" "$TRIAGE_IO_MODULE"; rm -rf "$RENDER_FIXTURE" "$TRIAGE_STEP_TMP"' EXIT
 
 # JavaScript replacement strings interpret $&, $`, $', $1, $<name>, and $$.
 # Canonical detector source is arbitrary text, so the renderer must preserve
@@ -1159,6 +1161,254 @@ async function main() {
     if (mode === 'EPIPE') assert.equal(reads, 3);
   }
   console.log('Approval triage: 10 bounded-retry, 3 canonical-loader and 18 production-guard cases passed');
+}
+main().catch(error => { console.error(error); process.exitCode = 1; });
+NODE
+
+# #2178: a blocking execFileSync before the label write froze the event loop,
+# so undici reused a keep-alive socket the server had already closed and the
+# POST failed with "other side closed". Triage helpers must run without
+# blocking, and the one idempotent label write retries once.
+printf "let childProcess = require('child_process');\n" >"$TRIAGE_IO_MODULE"
+awk '
+  /BEGIN TRIAGE EVENT-LOOP-SAFE IO/ { capture=1; next }
+  /END TRIAGE EVENT-LOOP-SAFE IO/   { capture=0 }
+  capture {
+    sub(/^            /, "")
+    print
+  }
+' "$WORKFLOW" >>"$TRIAGE_IO_MODULE"
+if ! grep -qF 'function execFileAsync(' "$TRIAGE_IO_MODULE" ||
+  ! grep -qF 'function retryIdempotentLabelWrite(' "$TRIAGE_IO_MODULE"; then
+  echo "FAIL: could not extract the triage event-loop-safe IO helpers from $WORKFLOW" >&2
+  exit 1
+fi
+printf '\nmodule.exports = { execFileAsync, retryIdempotentLabelWrite, useChildProcess: value => { childProcess = value; } };\n' >>"$TRIAGE_IO_MODULE"
+
+TRIAGE_IO_PATH="$TRIAGE_IO_MODULE" TRIAGE_ROOT="$ROOT" TRIAGE_WORKFLOW="$WORKFLOW" \
+TRIAGE_STEP_TMP="$TRIAGE_STEP_TMP" node <<'NODE'
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const {EventEmitter} = require('node:events');
+const {execFileAsync, retryIdempotentLabelWrite, useChildProcess} = require(process.env.TRIAGE_IO_PATH);
+const node = process.execPath;
+
+async function quietStderr(run) {
+  const chunks = [];
+  const write = process.stderr.write;
+  process.stderr.write = chunk => { chunks.push(String(chunk)); return true; };
+  try { await run(); } finally { process.stderr.write = write; }
+  return chunks.join('');
+}
+
+// Octokit wraps a fetch transport failure as status 500 whose cause chain
+// ends in undici's SocketError, exactly as the #2178 runs logged it.
+const socketClosed = () => Object.assign(new Error('other side closed'), {
+  status: 500,
+  cause: Object.assign(new TypeError('fetch failed'), {
+    cause: Object.assign(new Error('other side closed'), {code: 'UND_ERR_SOCKET'}),
+  }),
+});
+const httpError = status => Object.assign(new Error(`HTTP ${status}`), {status, response: {status}});
+
+async function helperCases() {
+  let ticks = 0;
+  const ticker = setInterval(() => { ticks += 1; }, 10);
+  const out = await execFileAsync(node, ['-e', 'setTimeout(() => process.stdout.write("done"), 300)'],
+    {encoding: 'utf8'});
+  clearInterval(ticker);
+  assert.equal(out, 'done');
+  assert.ok(ticks >= 5, `the event loop must keep running while a helper runs (ticked ${ticks})`);
+
+  assert.equal(await execFileAsync(node, ['-e', 'process.stdin.pipe(process.stdout)'],
+    {input: '{"number":2178}', encoding: 'utf8'}), '{"number":2178}');
+  assert.equal(await execFileAsync(node, ['-e',
+    'let n = 0; process.stdin.on("data", c => { n += c.length; }).on("end", () => process.stdout.write(String(n)))'],
+    {encoding: 'utf8', timeout: 10000}), '0', 'a helper without input must see EOF, not hang');
+
+  const forwarded = await quietStderr(() => assert.rejects(
+    execFileAsync(node, ['-e', 'process.stderr.write("refused"); process.exit(3)'], {encoding: 'utf8'}),
+    error => error.code === 3 && /refused/.test(error.message)));
+  assert.match(forwarded, /refused/, 'helper stderr must still reach the job log');
+
+  await assert.rejects(execFileAsync(node, ['-e', 'setTimeout(() => {}, 5000)'],
+    {encoding: 'utf8', timeout: 200}), error => error.killed === true);
+  await assert.rejects(execFileAsync(node, ['-e', 'process.exit(0)'],
+    {input: 'x'.repeat(4 * 1024 * 1024), encoding: 'utf8'}), error => error.code === 'EPIPE',
+    'an input the helper never read must reject, as execFileSync does');
+
+  // Node calls back once stdout and stderr close; stdin is not awaited. Force
+  // the late ordering: exit 0 first, then EPIPE on the unread input.
+  useChildProcess({execFile(file, args, options, callback) {
+    const stdin = Object.assign(new EventEmitter(), {closed: false, end() {}});
+    setTimeout(() => callback(null, 'verified', ''), 1);
+    setTimeout(() => {
+      stdin.emit('error', Object.assign(new Error('write EPIPE'), {code: 'EPIPE'}));
+      stdin.closed = true;
+      stdin.emit('close');
+    }, 20);
+    return {stdin, stderr: new EventEmitter()};
+  }});
+  try {
+    await assert.rejects(execFileAsync('bash', ['verify'], {input: '{}', encoding: 'utf8'}),
+      error => error.code === 'EPIPE', 'an EPIPE after the exit callback must still reject');
+  } finally {
+    useChildProcess(require('node:child_process'));
+  }
+  return 7;
+}
+
+async function retryCases() {
+  let cases = 0;
+  for (const make of [socketClosed,
+    () => Object.assign(new TypeError('fetch failed'), {cause: {code: 'UND_ERR_SOCKET', message: 'other side closed'}}),
+    () => Object.assign(new Error('read ECONNRESET'), {code: 'ECONNRESET'}),
+    () => httpError(502)]) {
+    let calls = 0; const waits = []; const warnings = [];
+    assert.deepEqual(await retryIdempotentLabelWrite(async () => {
+      if (++calls === 1) throw make();
+      return {data: [{name: 'needs-external-review'}]};
+    }, {wait: async ms => waits.push(ms), warn: message => warnings.push(message)}),
+    {data: [{name: 'needs-external-review'}]});
+    assert.equal(calls, 2); assert.deepEqual(waits, [500]); assert.equal(warnings.length, 1);
+    cases += 1;
+  }
+  for (const make of [() => httpError(401), () => httpError(403), () => httpError(404),
+    () => httpError(422), () => new TypeError('github.rest.issues.addLabels is not a function')]) {
+    let calls = 0;
+    await assert.rejects(retryIdempotentLabelWrite(async () => { calls += 1; throw make(); },
+      {wait: async () => {}, warn: () => {}}));
+    assert.equal(calls, 1, 'a 4xx or a non-transport error must not be retried');
+    cases += 1;
+  }
+  let calls = 0;
+  await assert.rejects(retryIdempotentLabelWrite(async () => { calls += 1; throw socketClosed(); },
+    {wait: async () => {}, warn: () => {}}), /other side closed/);
+  assert.equal(calls, 2, 'exactly one retry, then fail closed');
+  return cases + 1;
+}
+
+// Run the real triage step with fake GitHub APIs and a child_process whose
+// execFileSync throws, so any blocking helper call left in the step either
+// fails it or turns into a fail-closed result the assertions catch.
+async function productionStepCases() {
+  const root = process.env.TRIAGE_ROOT;
+  const source = fs.readFileSync(process.env.TRIAGE_WORKFLOW, 'utf8');
+  const step = source.slice(source.indexOf('      - name: Evaluate PR against review-policy.yml'));
+  const scriptLines = step.slice(step.indexOf('          script: |\n') + '          script: |\n'.length).split('\n');
+  const script = [];
+  for (const line of scriptLines) {
+    if (line && !line.startsWith('            ')) break;
+    script.push(line.replace(/^ {12}/, ''));
+  }
+  const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
+  const triage = new AsyncFunction('github', 'context', 'core', 'require', script.join('\n'));
+  const head = 'a'.repeat(40);
+  const base = 'b'.repeat(40);
+  const pr = {number: 2178, head: {sha: head}, base: {ref: 'main', sha: base},
+    user: {login: 'nathanjohnpayne'}, body: 'Authoring-Agent: claude', labels: []};
+  const clone = value => JSON.parse(JSON.stringify(value));
+  Object.assign(process.env, {GITHUB_WORKSPACE: root, TMPDIR: process.env.TRIAGE_STEP_TMP,
+    THRESHOLD: '300', PROTECTED_PATHS: '[".github/**"]'});
+  const allHelpers = ['git', 'resolve_base_policy.sh', 'load_review_config.sh',
+    'external_review_fingerprint.sh', 'verify-live-propagation.sh', 'external_review_carryforward.sh'];
+  const scenarios = [
+    {name: 'socket closed once', labelFailures: [socketClosed], resolves: true, labelCalls: 2, needsExternal: 'true'},
+    {name: 'approved review, socket closed once', event: 'pull_request_review', labelFailures: [socketClosed],
+      resolves: true, labelCalls: 2, needsExternal: 'true'},
+    {name: 'socket closed twice', labelFailures: [socketClosed, socketClosed], resolves: false, labelCalls: 2},
+    {name: 'forbidden', labelFailures: [() => httpError(403)], resolves: false, labelCalls: 1},
+    {name: 'carried forward', carried: true, labelFailures: [], resolves: true, labelCalls: 0, needsExternal: 'false'},
+  ];
+  for (const scenario of scenarios) {
+    const record = {sync: 0, helpers: [], verifierInput: null, labelCalls: 0};
+    const outputs = {}; const warnings = [];
+    const childProcess = {
+      execFileSync() {
+        record.sync += 1;
+        throw new Error('execFileSync blocks the event loop before the label write (#2178)');
+      },
+      execFile(file, args, options, callback) {
+        const helper = file === 'git' ? 'git' : path.basename(args[0]);
+        record.helpers.push(helper);
+        const stdin = {closed: false, on() { return this; }, once() { return this; },
+          end(data) { if (helper === 'verify-live-propagation.sh') record.verifierInput = data; this.closed = true; }};
+        let error = null; let stdout = '';
+        if (helper === 'git') stdout = `${base}\n`;
+        if (helper === 'resolve_base_policy.sh') stdout = '.github/review-policy.yml\n';
+        if (helper === 'load_review_config.sh') {
+          fs.writeFileSync(args[args.indexOf('--output') + 1],
+            'reviewers=["nathanpayne-claude","nathanpayne-codex"]\nauthor_identity=nathanjohnpayne\n');
+        }
+        if (helper === 'external_review_fingerprint.sh') stdout = JSON.stringify({requires_review: true, fingerprint: 'fp-2178'});
+        if (helper === 'verify-live-propagation.sh') {
+          error = Object.assign(new Error('Command failed: bash scripts/workflow/verify-live-propagation.sh'), {code: 1});
+        }
+        if (helper === 'external_review_carryforward.sh') {
+          stdout = JSON.stringify(scenario.carried
+            ? {carried: true, source_commit: 'c'.repeat(40), source_time: '2026-10-14T00:00:00Z'}
+            : {carried: false});
+        }
+        setTimeout(() => callback(error, stdout, ''), 5);
+        return {stdin, stderr: {on() { return this; }}};
+      },
+    };
+    const failures = [...scenario.labelFailures];
+    const github = {
+      paginate: async () => [{filename: '.github/workflows/agent-review.yml', additions: 10, deletions: 2}],
+      rest: {
+        pulls: {get: async () => ({data: clone(pr)}), listFiles() {}},
+        issues: {addLabels: async params => {
+          record.labelCalls += 1;
+          assert.deepEqual(params.labels, ['needs-external-review']);
+          const failure = failures.shift();
+          if (failure) throw failure();
+          return {data: [{name: 'needs-external-review'}]};
+        }},
+      },
+    };
+    const eventName = scenario.event || 'pull_request';
+    const context = {eventName, repo: {owner: 'o', repo: 'r'}, payload: {
+      action: eventName === 'pull_request' ? 'synchronize' : 'submitted',
+      pull_request: clone(pr), repository: {default_branch: 'main'},
+      review: eventName === 'pull_request' ? undefined : {id: 1, state: 'approved', commit_id: head}}};
+    const core = {setOutput: (key, value) => { outputs[key] = value; }, warning: message => warnings.push(message),
+      notice: () => {}, info: () => {}, setFailed: () => {}};
+    const fakeRequire = name => name === 'child_process' ? childProcess : require(name);
+    const log = console.log;
+    console.log = () => {};
+    let rejection = null;
+    try {
+      await triage(github, context, core, fakeRequire);
+    } catch (error) {
+      rejection = error;
+    } finally {
+      console.log = log;
+    }
+    assert.equal(rejection === null, scenario.resolves, `${scenario.name}: ${rejection && rejection.message}`);
+    assert.equal(record.sync, 0, `${scenario.name}: triage called execFileSync`);
+    assert.deepEqual(record.helpers, allHelpers, `${scenario.name}: every helper must run through execFile`);
+    assert.equal(JSON.parse(record.verifierInput).number, 2178, `${scenario.name}: verifier input`);
+    assert.equal(record.labelCalls, scenario.labelCalls, scenario.name);
+    assert.ok(!warnings.some(message => /fingerprint|carry-forward|governing/i.test(message)),
+      `${scenario.name}: a helper fell back fail-closed: ${warnings.join(' | ')}`);
+    if (scenario.resolves) {
+      assert.equal(outputs.needs_external, scenario.needsExternal, scenario.name);
+      assert.equal(outputs.phase_4_intrinsic_required, 'true', scenario.name);
+      assert.equal(outputs.reviewers, '["nathanpayne-claude","nathanpayne-codex"]', scenario.name);
+    } else {
+      assert.equal(outputs.needs_external, undefined, `${scenario.name}: a failed label write must not export a result`);
+    }
+  }
+  return scenarios.length;
+}
+
+async function main() {
+  const helpers = await helperCases();
+  const retries = await retryCases();
+  const steps = await productionStepCases();
+  console.log(`Triage IO: ${helpers} non-blocking helper, ${retries} label-retry and ${steps} production-step cases passed`);
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });
 NODE

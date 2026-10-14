@@ -4709,6 +4709,65 @@ unset RCP_TAG
 fi
 
 # ---------------------------------------------------------------------------
+# Test 28 (#2220): the installation-budget fences.
+#
+# One assertion in scripts/ci/check_required_check_publisher read across two
+# files, and the four budget-guard knobs:
+#
+#   * A16 — the publish step's DUE_MAX_AGE_SECONDS equals the gate parent's
+#     sweep interval. It was left at 900 when #2167 moved the sweep to */30,
+#     so every green PR fell due again after 15 minutes. Either side drifting
+#     must trip it, and a cron it cannot read must trip it too.
+#   * A16 knobs — the REST and GraphQL per-PR costs and reserves are required
+#     integers; a missing one silently turns the guard off.
+#
+# Same posture as Tests 25 and 27: fixtures are derived from the canonical
+# files, every mutation has a no-op guard, and every negative case names
+# the assertion it expects.
+# ---------------------------------------------------------------------------
+if [ ! -x "$RCP_CHECK" ] || [ ! -f "$RCP_WF" ]; then
+  echo; echo "SKIP: Test 28 (#2220) — publisher or its fence absent"
+elif ! python3 -c "import yaml" >/dev/null 2>&1; then
+  echo; echo "SKIP: Test 28 (#2220) — PyYAML unavailable, the fence's tier does not run"
+elif ! command -v perl >/dev/null 2>&1 || ! declare -f rcp_dir_case >/dev/null 2>&1; then
+  echo; echo "SKIP: Test 28 (#2220) — perl or the Test 25 harness unavailable"
+else
+echo; echo "--- Test 28 (#2220): due threshold equals the sweep interval, budget knobs"
+RCP_TAG='#2220'
+RCP_DIR="${RCP_DIR:-$WORKDIR/rcp}"
+mkdir -p "$RCP_DIR"
+
+rcp_case due-canonical '' pass
+# ── A16: the due threshold follows the sweep interval, both directions ──
+rcp_case due-stale-900 \
+  's{DUE_MAX_AGE_SECONDS: "1800"}{DUE_MAX_AGE_SECONDS: "900"}' \
+  fail '[rcp due threshold]'
+rcp_case due-missing \
+  's{^          DUE_MAX_AGE_SECONDS: "1800"\n}{}m' \
+  fail '[rcp due threshold]'
+rcp_dir_case due-cron-moved \
+  'perl -0777 -i -pe "s{cron: \"\*/30 \* \* \* \*\"}{cron: \"*/15 * * * *\"}" merge-clearance-gate.yml' \
+  fail '[rcp due threshold]'
+rcp_dir_case due-cron-unreadable \
+  'perl -0777 -i -pe "s{cron: \"\*/30 \* \* \* \*\"}{cron: \"0,30 * * * *\"}" merge-clearance-gate.yml' \
+  fail 'carries no single'
+# ── budget-guard knobs ──────────────────────────────────────────────────
+rcp_case budget-per-pr-malformed \
+  's{BUDGET_PER_PR_REQUESTS: "40"}{BUDGET_PER_PR_REQUESTS: "forty"}' \
+  fail '[rcp budget guard]'
+rcp_case budget-per-pr-zero \
+  's{BUDGET_PER_PR_REQUESTS: "40"}{BUDGET_PER_PR_REQUESTS: "0"}' \
+  fail '[rcp budget guard]'
+rcp_case budget-reserve-missing \
+  's{^          BUDGET_RESERVE_REQUESTS: "100"\n}{}m' \
+  fail '[rcp budget guard]'
+rcp_case budget-gql-per-pr-missing \
+  's{^          BUDGET_PER_PR_GRAPHQL_POINTS: "10"\n}{}m' \
+  fail '[rcp budget guard]'
+unset RCP_TAG
+fi
+
+# ---------------------------------------------------------------------------
 echo
 echo "============================================"
 echo "test_merge_clearance_gate.sh: $PASS passed, $FAIL failed"

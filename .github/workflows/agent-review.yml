@@ -342,6 +342,70 @@ jobs:
             });
             const {retryGithubRead} = approvalTriage;
 
+            // BEGIN TRIAGE EVENT-LOOP-SAFE IO
+            // Trusted helpers run without blocking the event loop (#2178). A
+            // blocking execFileSync froze it for the whole helper run, about
+            // 30s for the carry-forward on a large PR. The server closed the
+            // idle keep-alive socket in that window, undici never saw the
+            // close, and the next label POST went out on the dead socket
+            // ("other side closed"). Same contract as execFileSync: resolves
+            // stdout, takes `input`, echoes stderr to the log, and rejects on
+            // a non-zero exit, a timeout, or an `input` the helper never read.
+            function execFileAsync(file, args, options = {}) {
+              const {input, ...execOptions} = options;
+              return new Promise((resolve, reject) => {
+                let inputError = null;
+                const child = childProcess.execFile(file, args, execOptions,
+                  (error, stdout) => {
+                    // Settle once stdin has closed, so an EPIPE on `input`
+                    // that lands after the exit still rejects.
+                    const settle = () => {
+                      if (error || inputError) reject(error || inputError);
+                      else resolve(stdout);
+                    };
+                    if (child.stdin.closed) settle();
+                    else child.stdin.once('close', settle);
+                  });
+                child.stderr.on('data', chunk => process.stderr.write(chunk));
+                child.stdin.on('error', error => {
+                  if (input !== undefined) inputError = error;
+                });
+                child.stdin.end(input);
+              });
+            }
+
+            // Adding a label that is already present changes nothing, so a
+            // label add lost in transport or answered with a 5xx is safe to
+            // send again. One retry only: a 4xx or a second failure still
+            // throws, and the step fails closed as before.
+            async function retryIdempotentLabelWrite(write, {
+              wait = ms => new Promise(resolve => setTimeout(resolve, ms)),
+              warn = message => console.log(message),
+            } = {}) {
+              try {
+                return await write();
+              } catch (error) {
+                if (!labelWriteMayRetry(error)) throw error;
+                warn(`Label write failed (${error.message}); retrying once.`);
+                await wait(500);
+                return await write();
+              }
+            }
+
+            function labelWriteMayRetry(error) {
+              const status = Number(error && error.status || 0);
+              if (status >= 400 && status < 500) return false;
+              if (status >= 500 && status <= 599) return true;
+              const detail = [];
+              for (let cause = error, depth = 0; cause && depth < 4;
+                cause = cause.cause, depth += 1) {
+                detail.push(cause.code, cause.message);
+              }
+              return /UND_ERR_SOCKET|other side closed|ECONNRESET|EPIPE|ETIMEDOUT|fetch failed/i
+                .test(detail.join(' '));
+            }
+            // END TRIAGE EVENT-LOOP-SAFE IO
+
             function parseReviewerList(raw, label) {
               let reviewers;
               try {
@@ -418,14 +482,14 @@ jobs:
             }
             // END TRIAGE PHASE 4 DECISION
 
-            function loadGoverningIdentities(pr, policyConfigPath) {
+            async function loadGoverningIdentities(pr, policyConfigPath) {
               const outputPath = path.join(
                 os.tmpdir(),
                 `mergepath-live-policy-${process.pid}-${Date.now()}.out`,
               );
               try {
                 fs.writeFileSync(outputPath, '');
-                childProcess.execFileSync(
+                await execFileAsync(
                   'bash',
                   [
                     'scripts/workflow/load_review_config.sh',
@@ -549,11 +613,11 @@ jobs:
             try {
               let checkoutSha = '';
               try {
-                checkoutSha = childProcess.execFileSync(
+                checkoutSha = (await execFileAsync(
                   'git',
                   ['rev-parse', 'HEAD'],
                   {encoding: 'utf8'},
-                ).trim();
+                )).trim();
               } catch (error) {
                 core.warning(
                   `Could not prove the trusted checkout SHA (${error.message}); ` +
@@ -576,11 +640,11 @@ jobs:
               })) {
                 policyResolverArgs.push('--materialize-default');
               }
-              policyConfigPath = childProcess.execFileSync(
+              policyConfigPath = (await execFileAsync(
                 'bash',
                 policyResolverArgs,
                 {encoding: 'utf8', env: process.env}
-              ).trim();
+              )).trim();
               console.log(`Governing review policy: ${policyConfigPath}`);
             } catch (e) {
               policyReadFailed = true;
@@ -594,7 +658,7 @@ jobs:
             let governingIdentities = {reviewers: [], authorIdentity: ''};
             if (!policyReadFailed) {
               try {
-                governingIdentities = loadGoverningIdentities(
+                governingIdentities = await loadGoverningIdentities(
                   pr,
                   policyConfigPath,
                 );
@@ -661,7 +725,7 @@ jobs:
               try {
                 filesPath = path.join(os.tmpdir(), `mergepath-pr-${pr.number}-files.json`);
                 fs.writeFileSync(filesPath, JSON.stringify(files));
-                const fingerprintRaw = childProcess.execFileSync(
+                const fingerprintRaw = await execFileAsync(
                   'bash',
                   [
                     'scripts/workflow/external_review_fingerprint.sh',
@@ -692,7 +756,7 @@ jobs:
             let laneVerifiedHead = false;
             if (needsExternal && !policyReadFailed) {
               try {
-                childProcess.execFileSync('bash', [
+                await execFileAsync('bash', [
                   'scripts/workflow/verify-live-propagation.sh',
                   `${context.repo.owner}/${context.repo.repo}`,
                   String(pr.number), pr.head.sha, pr.base.sha, policyConfigPath,
@@ -733,7 +797,7 @@ jobs:
               let carried = false;
               try {
                 if (needsExternal && externalReviewFingerprint && filesPath) {
-                  const carryRaw = childProcess.execFileSync(
+                  const carryRaw = await execFileAsync(
                     'bash',
                     [
                       'scripts/workflow/external_review_carryforward.sh',
@@ -765,12 +829,15 @@ jobs:
               }
 
               if (!carried && mayMutateLabels && needsExternal) {
-                await github.rest.issues.addLabels({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: pr.number,
-                  labels: ['needs-external-review'],
-                });
+                await retryIdempotentLabelWrite(
+                  () => github.rest.issues.addLabels({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: pr.number,
+                    labels: ['needs-external-review'],
+                  }),
+                  {warn: message => core.warning(message)},
+                );
               } else if (!mayMutateLabels && needsExternal) {
                 console.log(
                   `Computed Phase 4 applicability for the ` +
