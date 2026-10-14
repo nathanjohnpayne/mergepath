@@ -311,19 +311,30 @@ def class_body(body: str) -> str:
     """Translate an fnmatch ``[...]`` body into a Python regex class body.
 
     Ruby treats ``\\x`` inside a class as the literal ``x`` (so ``[a\\-c]`` is
-    ``a``, ``-`` or ``c``). Ranges ``a-z`` pass through, and every other
-    character is literal, including regex-only metacharacters such as ``^``
-    and ``[``.
+    ``a``, ``-`` or ``c``), ``a-z`` as a range, and a reversed range such as
+    ``z-a`` as matching only its two endpoints. Every other character is
+    literal, including regex-only metacharacters such as ``^`` and ``[``.
     """
+    def take(k: int) -> Tuple[str, int]:
+        if body[k] == "\\" and k + 1 < len(body):
+            return body[k + 1], k + 2
+        return body[k], k + 1
+
     out: List[str] = []
     i = 0
     while i < len(body):
-        c = body[i]
-        if c == "\\" and i + 1 < len(body):
-            out.append(re.escape(body[i + 1])); i += 2; continue
-        if c == "-" and out and i + 1 < len(body):
-            out.append("-"); i += 1; continue
-        out.append(re.escape(c)); i += 1
+        lo, j = take(i)
+        # A range needs a character on both sides of an unescaped "-".
+        if j < len(body) - 1 and body[j] == "-":
+            hi, k = take(j + 1)
+            if ord(lo) <= ord(hi):
+                out.append(re.escape(lo) + "-" + re.escape(hi))
+            else:
+                out.append(re.escape(lo) + re.escape(hi))
+            i = k
+            continue
+        out.append(re.escape(lo))
+        i = j
     return "".join(out)
 
 
@@ -366,7 +377,11 @@ def fnmatch_glob(pattern: str) -> "re.Pattern[str]":
         if c == "\\" and i + 1 < len(pattern):
             out.append(re.escape(pattern[i + 1])); i += 2; seg_start = False; continue
         out.append(re.escape(c)); seg_start = c == "/"; i += 1
-    return re.compile("".join(out))
+    try:
+        return re.compile("".join(out))
+    except re.error as exc:
+        # Fail closed through the documented exit 2, never a traceback.
+        raise ConfigError(f"unsupported workspace glob {pattern!r}: {exc}") from exc
 
 
 def workspace_pattern(pattern: str) -> str:

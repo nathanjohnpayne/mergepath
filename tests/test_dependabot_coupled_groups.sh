@@ -526,6 +526,12 @@ pkg "$r/packages/-app" "$FB_PROD" "$FB_DEV"
 write_config "$r" "$TYPE_GROUPS"
 expect "an escaped \\- inside a class is a literal hyphen, as Ruby fnmatch reads it" 1 "$r" "firebase-sdk"
 
+r="$(new_repo ws-class-reversed)"
+printf '{"name":"root","private":true,"workspaces":["packages/[z-a]*"]}\n' > "$r/package.json"
+pkg "$r/packages/app" "$FB_PROD" "$FB_DEV"; pkg "$r/packages/moo" "react" ""
+write_config "$r" "$TYPE_GROUPS"
+expect "a reversed range [z-a] matches only its endpoints (Ruby) and never crashes" 1 "$r" "firebase-sdk"
+
 r="$(new_repo pnpm-ancestor-catalog)"
 printf '{"name":"root","private":true}\n' > "$r/package.json"
 printf 'catalog:\n  firebase: ^13.0.0\n' > "$r/pnpm-workspace.yaml"
