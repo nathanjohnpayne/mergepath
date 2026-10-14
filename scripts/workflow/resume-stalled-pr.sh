@@ -42,12 +42,14 @@
 # Exit codes:
 #   0  a stalled PR was selected and its work order printed (and, under
 #      --execute, the request step ran and exited 0)
-#   1  nothing is stalled — nothing to resume
+#   1  nothing is stalled — nothing to resume (also: under --execute, the
+#      selected PR's head moved after it was classified, so nothing was posted)
 #   2  usage error
 #   3  the finder could not read the repository, or the --execute step hit an
 #      infrastructure error
 #   4  --execute: the Codex request was REFUSED BY POLICY, not by an outage —
-#      the requester exited 5 (no request by policy: an under-threshold PR in a
+#      the requester exited 4 (polling mode only: no Codex answer within its
+#      timeout, the Phase 4b fallback), 5 (no request by policy: an under-threshold PR in a
 #      repo with codex.request_by_default false), 6 (feedback unaccounted) or
 #      7 (request budget exhausted). --execute flags the request
 #      Phase-4a-gated only for a PR labelled `needs-external-review`. The routing outcome is printed as a `next:` line and in the
@@ -143,6 +145,32 @@ detail=$(printf '%s' "$SELECTED" | jq -r '.next_action_detail')
 merge_gate_check=$(printf '%s' "$SELECTED" | jq -r '.merge_gate_check // "absent"')
 newest_line=$(printf '%s' "$SELECTED" | jq -r '.newest | .kind + " by " + .actor + " at " + .at + " (" + ((.age_seconds / 60) | floor | tostring) + "m ago)"')
 repo_slug=${REPO#*/}
+
+# Phase 4a scope is the repository's own triage verdict: agent-review.yml
+# labels a PR `needs-external-review` exactly when it meets the external review
+# threshold or a protected path. Only such a PR is flagged Phase-4a-gated; any
+# other PR is left to the requester's own entry decision
+# (codex.request_by_default), which may decline with exit 5.
+if printf '%s' "$SELECTED" | jq -e '.labels | index("needs-external-review")' >/dev/null; then
+  gated=true
+else
+  gated=""
+fi
+# A head nobody asked about gets a trigger-only request (idempotent). A request
+# that already outlived the threshold unanswered would make trigger-only a
+# no-op — it dedups on the existing trigger — so that case runs the requester's
+# polling mode, which re-posts an unanswered request and waits up to
+# codex.review_timeout_seconds for the answer.
+if [ "$reason" = "request-unanswered" ]; then
+  req_mode=()
+  req_flag=""
+  mode_note="polling mode: re-posts the unanswered request and waits for the answer"
+else
+  req_mode=(--trigger-only)
+  req_flag="--trigger-only"
+  mode_note="trigger-only, idempotent"
+fi
+request_cmd="${gated:+MERGEPATH_PHASE_4A_GATED=true }scripts/codex-review-request.sh${req_flag:+ $req_flag} $number $REPO"
 # Every PR-controlled value that lands in a printed command is shell-escaped:
 # a branch may legally be named `topic;rm -rf ~`, and the work order is
 # advertised as copy-paste-ready.
@@ -177,12 +205,12 @@ case "$next_action" in
     echo "  3. Record each disposition: scripts/codex-record-feedback.sh $number ... / scripts/coderabbit-record-feedback.sh $number ..."
     echo "  4. Resolve the actioned threads: scripts/resolve-pr-threads.sh $number --resolve-actioned"
     echo "  5. Re-request the review on the new head:"
-    echo "       MERGEPATH_PHASE_4A_GATED=true scripts/codex-review-request.sh --trigger-only $number $REPO"
+    echo "       ${gated:+MERGEPATH_PHASE_4A_GATED=true }scripts/codex-review-request.sh --trigger-only $number $REPO"
     ;;
   "request codex")
     echo "Round to run:"
-    echo "  MERGEPATH_PHASE_4A_GATED=true scripts/codex-review-request.sh --trigger-only $number $REPO"
-    echo "  (idempotent on an existing head trigger; exit 6 means review feedback is unaccounted — disposition it first)"
+    echo "  $request_cmd"
+    echo "  ($mode_note; exit 6 means review feedback is unaccounted — disposition it first)"
     ;;
   merge)
     echo "Pre-merge sequence (AGENTS.md § Workflow Summary steps 6, 8 and 10) — every gate clean, then merge as the author:"
@@ -226,22 +254,22 @@ if [ "$EXECUTE" = "1" ]; then
     exit 2
   fi
   [ -x "$REQUESTER" ] || { echo "resume-stalled-pr: requester missing or not executable: $REQUESTER" >&2; exit 3; }
+  # Head fence: the snapshot can be minutes old by now. If another session
+  # pushed in the meantime, the PR is no longer stalled on the head that was
+  # classified, and requesting a review there would spend a round on (and
+  # interfere with) a live session's work.
+  live_head=$(gh api "repos/$REPO/pulls/$number" --jq .head.sha 2>/dev/null) || {
+    echo "resume-stalled-pr: could not re-read the head of $REPO#$number; not requesting" >&2; exit 3; }
+  if [ "$live_head" != "$head_sha" ]; then
+    echo "resume-stalled-pr: $REPO#$number moved from $head_sha to $live_head since it was classified; not stalled any more, nothing requested" >&2
+    exit 1
+  fi
   echo
-  echo "resume-stalled-pr: posting the Codex request through the author wrapper (trigger-only, idempotent)"
+  echo "resume-stalled-pr: posting the Codex request through the author wrapper ($mode_note)"
   req_out=$(mktemp "${TMPDIR:-/tmp}/resume-stalled-pr-req.XXXXXX") || { echo "resume-stalled-pr: mktemp failed" >&2; exit 3; }
   trap 'rm -f "$req_out"' EXIT
   set +e
-  # Phase 4a scope is the repository's own triage verdict: agent-review.yml
-  # labels a PR `needs-external-review` exactly when it meets the external
-  # review threshold or a protected path. Only such a PR is flagged
-  # Phase-4a-gated; any other PR is left to the requester's own entry decision
-  # (codex.request_by_default), which may decline with exit 5.
-  if printf '%s' "$SELECTED" | jq -e '.labels | index("needs-external-review")' >/dev/null; then
-    gated=true
-  else
-    gated=""
-  fi
-  MERGEPATH_PHASE_4A_GATED="$gated" "$REQUESTER" --trigger-only "$number" "$REPO" > "$req_out"
+  MERGEPATH_PHASE_4A_GATED="$gated" "$REQUESTER" ${req_mode[@]+"${req_mode[@]}"} "$number" "$REPO" > "$req_out"
   rc=$?
   set -e
   cat "$req_out"
@@ -251,6 +279,7 @@ if [ "$EXECUTE" = "1" ]; then
   cap_kind=$(jq -r '.cap_exhausted.kind // ""' "$req_out" 2>/dev/null || true)
   case "$rc" in
     0) exit_next="" ;;
+    4) exit_next="phase 4b" ;;   # polling mode: FALLBACK_REQUIRED, no Codex signal after the full wait
     5) exit_next="under-threshold path" ;;
     6) exit_next="disposition findings" ;;
     7)
@@ -265,7 +294,12 @@ if [ "$EXECUTE" = "1" ]; then
     case "$exit_next" in
       "under-threshold path") how="the policy does not request Codex on this PR (codex.request_by_default false, not Phase-4a scope): take the under-threshold reviewer-identity approval and merge path, AGENTS.md § Workflow Summary step 7" ;;
       "disposition findings") how="disposition every earlier finding (scripts/review-feedback-accounting.sh $number), then rerun" ;;
-      "phase 4b") how="the request ceiling is spent: run scripts/phase-4b-review.sh $number --repo $REPO from a trusted main checkout" ;;
+      "phase 4b")
+        if [ "$rc" -eq 4 ]; then
+          how="Codex did not answer within its review timeout (or is account-blocked): run scripts/phase-4b-review.sh $number --repo $REPO from a trusted main checkout"
+        else
+          how="the request ceiling is spent: run scripts/phase-4b-review.sh $number --repo $REPO from a trusted main checkout"
+        fi ;;
       *) how="the blocking-review budget is spent: stop, post the escalation comment carrying [mergepath-handoff] per REVIEW_POLICY.md § Disagreements and Tiebreaking, and alert the human" ;;
     esac
     echo

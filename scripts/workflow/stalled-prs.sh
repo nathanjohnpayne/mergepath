@@ -46,7 +46,7 @@
 #   live             The ball is in an agent's court and the newest event is
 #                    younger than the threshold: a session may be acting on it.
 #   waiting-on-ci    The newest event is author-side and the head's check
-#                    rollup is still PENDING.
+#                    required head checks are still PENDING.
 #   waiting-on-bot   The head is CI-complete and a review request is
 #                    outstanding on it (an `@codex review` / `@coderabbitai`
 #                    command newer than the head with no verdict after it, or
@@ -100,8 +100,8 @@
 #     lands after it; bot activity (a summary edit, an acknowledgement) does
 #     not clear it.
 #
-# Read-only. The only GitHub calls are GETs (and a read-only GraphQL query for
-# the head's check rollup); the gate it delegates to is itself read-only.
+# Read-only. The only GitHub calls are paginated GETs (plus the read-only
+# required-head-checks resolution); the gate it delegates to is read-only too.
 #
 # Exit codes:
 #   0  ran; no stalled PR
@@ -162,8 +162,8 @@ infra() { echo "stalled-prs: ERROR — $*" >&2; exit 3; }
 
 # --- snapshot ---------------------------------------------------------------
 # One JSON document per run. In fixture mode it is read verbatim from --input;
-# in live mode it is assembled below from paginated REST reads and one
-# read-only GraphQL scalar. The classification never touches the network.
+# in live mode it is assembled below from paginated REST reads. The
+# classification never touches the network.
 
 SNAPSHOT=""
 
@@ -182,13 +182,17 @@ else
     preflight_require_token reviewer || true
   fi
   [ -n "${GH_TOKEN:-}" ] || infra "GH_TOKEN is required for live collection (a read-only token is enough)"
-  for lib in gh-api-array.sh gh-api-scalar.sh; do
-    [ -r "$SCRIPT_DIR/lib/$lib" ] || infra "missing helper scripts/lib/$lib"
-  done
+  [ -r "$SCRIPT_DIR/lib/gh-api-array.sh" ] || infra "missing helper scripts/lib/gh-api-array.sh"
   # shellcheck source=../lib/gh-api-array.sh
   . "$SCRIPT_DIR/lib/gh-api-array.sh"
-  # shellcheck source=../lib/gh-api-scalar.sh
-  . "$SCRIPT_DIR/lib/gh-api-scalar.sh"
+  # CI state is judged on the repository's own required head checks (the
+  # build/test checks scripts/required-head-checks.sh resolves from the
+  # default branch, `lint` by default), never on the aggregate check rollup:
+  # the rollup also carries review-policy checks — Label Gate, Merge
+  # clearance gate — that fail BY DESIGN until external review clears, so it
+  # reads FAILURE on every threshold PR and would route each one to a CI
+  # "fix" that does not exist.
+  [ -x "$SCRIPT_DIR/required-head-checks.sh" ] || infra "missing scripts/required-head-checks.sh"
 
   # The configured author identity: the only login whose PRs an agent drives.
   # Read from the local policy file (same key codex-review-check.sh honours);
@@ -205,8 +209,8 @@ else
     [ -n "$REPO" ] || infra "could not detect the current repo; pass --repo"
   fi
   [[ "$REPO" =~ ^[^/[:space:]]+/[^/[:space:]]+$ ]] || infra "--repo must be owner/repo; got '$REPO'"
-  OWNER=${REPO%%/*}
-  NAME=${REPO#*/}
+  REQUIRED_CHECKS_JSON=$("$SCRIPT_DIR/required-head-checks.sh" --repo "$REPO" --list | jq -R . | jq -cs '[.[] | select(length > 0)]') \
+    || infra "could not resolve the required head checks for $REPO"
 
   fetch_api_array() { gh_api_array "$1" "$2" || infra "$GH_API_ARRAY_ERROR"; }
 
@@ -274,14 +278,21 @@ else
       | if . == null then "absent"
         elif .status != "completed" then "pending"
         else (.conclusion // "pending") end' "$WORK/check_runs.json")
-    # statusCheckRollup is ONE scalar for the head, so no pagination trap
-    # (the per-check list would need a cursor loop; the state does not). A
-    # head with no check runs at all has a null rollup, reported as NONE.
-    ci_state=$(gh_api_scalar "PR #$number head check rollup" graphql \
-      -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){commits(last:1){nodes{commit{statusCheckRollup{state}}}}}}}' \
-      -F owner="$OWNER" -F name="$NAME" -F number="$number" \
-      --jq '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.state // "NONE"') \
-      || infra "could not read the check rollup for PR #$number"
+    # Required head checks only, newest run per name. A head with no check
+    # runs at all is NONE (a repository without CI); a required check that
+    # has not reported yet on a head that has other runs is PENDING.
+    ci_state=$(jq -r --argjson req "$REQUIRED_CHECKS_JSON" '
+      if length == 0 then "NONE"
+      else
+        [ $req[] as $n
+          | ([.[] | select(.name == $n)] | sort_by(.started_at // "") | last) as $run
+          | if $run == null or $run.status != "completed" then "PENDING"
+            elif ($run.conclusion // "") | IN("success", "neutral", "skipped") then "SUCCESS"
+            else "FAILURE" end ]
+        | if index("FAILURE") != null then "FAILURE"
+          elif index("PENDING") != null then "PENDING"
+          else "SUCCESS" end
+      end' "$WORK/check_runs.json") || infra "could not derive the CI state for PR #$number"
     jq -cn \
       --slurpfile pr "$WORK/pr.json" \
       --slurpfile reviews "$WORK/reviews.json" \
@@ -496,7 +507,7 @@ CLASSIFY_JQ='
        elif $author != $agent_author then {class: "waiting-on-human", reason: ("not agent-authored (" + $author + ")")}
        elif $handoff_in_force then {class: "waiting-on-human", reason: "handoff posted"}
        elif $machine_wait == "ci" then
-         (if $age < $threshold_seconds then {class: "waiting-on-ci", reason: "head check rollup PENDING"}
+         (if $age < $threshold_seconds then {class: "waiting-on-ci", reason: "required head checks PENDING"}
           else {class: "stalled", reason: "ci-pending-stale"} end)
        elif $machine_wait == "bot" then
          (if $age < $threshold_seconds then
@@ -513,9 +524,9 @@ CLASSIFY_JQ='
     # ---- next action --------------------------------------------------------
     | (if $verdict.class == "waiting-on-human" then {next_action: "wait", detail: $verdict.reason}
        elif $verdict.class == "waiting-on-ci" or $verdict.class == "waiting-on-bot" then {next_action: "wait", detail: $verdict.reason}
-       elif $verdict.reason == "ci-pending-stale" then {next_action: "investigate", detail: "head check rollup PENDING for longer than the threshold"}
+       elif $verdict.reason == "ci-pending-stale" then {next_action: "investigate", detail: "required head checks PENDING for longer than the threshold"}
        # A red head is fixed before anything is re-requested on it.
-       elif ($pr.ci_state == "FAILURE" or $pr.ci_state == "ERROR") then {next_action: "push fix", detail: ("head check rollup " + $pr.ci_state)}
+       elif ($pr.ci_state == "FAILURE" or $pr.ci_state == "ERROR") then {next_action: "push fix", detail: ("required head checks " + $pr.ci_state)}
        # A provider rate limit is handled by its own wait (coderabbit-wait.sh
        # parses the window and requests the sanctioned Codex failover itself);
        # an unexplained stall there is for a session to look at, never an
@@ -583,10 +594,21 @@ if [ -z "$INPUT_FILE" ] && [ "$RUN_GATE" = "1" ]; then
       [ -n "$number" ] || continue
       gate_err=$(mktemp "${TMPDIR:-/tmp}/stalled-prs-gate.XXXXXX") || infra "mktemp failed"
       rc=0
-      if command -v timeout >/dev/null 2>&1; then
+      # The gate is always bounded: GNU timeout where present, else perl's
+      # alarm (present on macOS by default). With neither, the gate is not
+      # run at all — an unbounded gate could hang the scheduled routine
+      # before it reaches any later PR — and the PR reports "gate not run".
+      # STALLED_PRS_NO_GNU_TIMEOUT=1 forces the perl branch (regression-suite
+      # seam: every CI runner has GNU timeout, a default macOS install does not).
+      if [ "${STALLED_PRS_NO_GNU_TIMEOUT:-0}" != "1" ] && command -v timeout >/dev/null 2>&1; then
         timeout "$GATE_TIMEOUT" "$GATE" "$number" "$REPO" >/dev/null 2>"$gate_err" || rc=$?
+      elif command -v perl >/dev/null 2>&1; then
+        perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "$GATE_TIMEOUT" "$GATE" "$number" "$REPO" >/dev/null 2>"$gate_err" || rc=$?
+        [ "$rc" -ne 142 ] || rc=124
       else
-        "$GATE" "$number" "$REPO" >/dev/null 2>"$gate_err" || rc=$?
+        echo "stalled-prs: WARN neither timeout nor perl is available; not running the unbounded gate for PR #$number" >&2
+        rm -f "$gate_err"
+        continue
       fi
       reason=$(grep -v '^\[codex-review-check\]' "$gate_err" | tail -n 1 | tr -d '\r' || true)
       [ -n "$reason" ] || reason=$(tail -n 1 "$gate_err" | tr -d '\r' || true)

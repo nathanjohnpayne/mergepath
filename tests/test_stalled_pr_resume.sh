@@ -248,7 +248,7 @@ fi
 expect 110 '.class == "stalled" and .codex_signal_on_head == true and .newest.kind == "verdict-comment"'
 expect 110 '.next_action == "investigate" and (.next_action_detail | contains("gate (b)"))'
 expect 111 '.class == "stalled" and .reason == "request-unanswered" and .turn == "machine" and .next_action == "request codex"'
-expect 112 '.class == "stalled" and .next_action == "push fix" and .next_action_detail == "head check rollup FAILURE"'
+expect 112 '.class == "stalled" and .next_action == "push fix" and .next_action_detail == "required head checks FAILURE"'
 expect 113 '.class == "waiting-on-bot" and .reason == "Codex reports the head Running" and .codex_signal_on_head == true'
 expect 114 '.class == "stalled" and .next_action == "push fix" and .next_action_detail == "latest verdict requested changes on head"'
 expect 115 '.class == "waiting-on-bot" and .newest.kind == "bot-rate-limited"'
@@ -257,7 +257,7 @@ expect 118 '.class == "stalled" and .next_action == "investigate" and (.next_act
 expect 119 '.class == "stalled" and .reason == "head-unrequested" and .next_action == "request codex"'
 expect 120 '.class == "waiting-on-human" and .reason == "handoff posted" and .next_action == "wait"'
 expect 121 '.class == "stalled" and .reason == "head-unrequested"'
-expect 122 '.class == "stalled" and .reason == "request-unanswered" and .next_action == "push fix" and .next_action_detail == "head check rollup FAILURE"'
+expect 122 '.class == "stalled" and .reason == "request-unanswered" and .next_action == "push fix" and .next_action_detail == "required head checks FAILURE"'
 expect 123 '.class == "stalled" and .reason == "unanswered-verdict" and .codex_signal_on_head == false and .next_action == "push fix" and .next_action_detail == "1 unanswered finding(s) on head"'
 expect 105 '.next_action_detail | startswith("no Merge clearance gate check in this repo")'
 expect 124 '.class == "waiting-on-human" and .reason == "handoff posted"'
@@ -388,12 +388,20 @@ fi
 TREE="$TMP/tree"
 mkdir -p "$TREE/scripts/workflow" "$TREE/scripts/lib" "$TMP/bin" "$TMP/fixture"
 cp "$FINDER" "$RESUME" "$TREE/scripts/workflow/"
-cp "$ROOT/scripts/lib/gh-api-array.sh" "$ROOT/scripts/lib/gh-api-scalar.sh" "$TREE/scripts/lib/"
+cp "$ROOT/scripts/lib/gh-api-array.sh" "$TREE/scripts/lib/"
+# The repository's required head checks: `lint` only. Review-policy checks
+# (Label Gate, Merge clearance gate) are deliberately NOT in this list.
+cat > "$TREE/scripts/required-head-checks.sh" <<'SH'
+#!/usr/bin/env bash
+[ "$3" = "--list" ] || { echo "stub: only --list" >&2; exit 2; }
+echo lint
+SH
 cat > "$TREE/scripts/codex-review-check.sh" <<'SH'
 #!/usr/bin/env bash
 echo "gate-called $1 $2" >> "$GATE_LOG"
 echo "[codex-review-check] PR $2#$1 — fetching metadata" >&2
 if [ "$1" = "41" ]; then exit 0; fi
+if [ -n "${GATE_SLEEP:-}" ] && [ "$1" = "$GATE_SLEEP" ]; then sleep 5; fi
 echo "gate (c): no Codex signal on HEAD" >&2
 exit 1
 SH
@@ -414,13 +422,15 @@ cat > "$TMP/bin/gh" <<'SH'
 args="$*"
 echo "$args" >> "$GH_LOG"
 case "$args" in
-  *"api graphql"*)          printf '%s' "$(cat "$FIXTURE/rollup-$(printf '%s' "$args" | sed -n 's/.*number=\([0-9]*\).*/\1/p')")" ;;
+  *"api graphql"*)          echo "gh shim: no GraphQL read is expected (CI state comes from the check runs)" >&2; exit 1 ;;
+  *"--jq .head.sha"*)       if [ -n "${HEAD_OVERRIDE:-}" ]; then echo "$HEAD_OVERRIDE"; else n=$(printf '%s' "$args" | sed -n 's/.*pulls\/\([0-9]*\) .*/\1/p'); jq -r --argjson n "$n" 'first(.[] | select(.number == $n)).head.sha' "$FIXTURE/pulls.json"; fi ;;
   *"/activity?"*)          cat "$FIXTURE/activity-$(printf '%s' "$args" | sed -n 's/.*feat%2F\([0-9]*\).*/\1/p').json" ;;
   *"/check-runs"*)          cat "$FIXTURE/check-runs-$(printf '%s' "$args" | sed -n 's/.*commits\/\(..\).*/\1/p').json" ;;
   *"/commits/"*)            echo "gh shim: the commit date must never be read for push time" >&2; exit 1 ;;
   *"/pulls?state=open"*)    cat "$FIXTURE/pulls.json" ;;
   *"/pulls/41/reviews"*)    echo '[{"id":9,"state":"APPROVED","submitted_at":"2026-10-13T07:00:00Z","commit_id":"4141414141414141414141414141414141414141","body":"LGTM","user":{"login":"nathanpayne-claude","type":"User"}}]' ;;
   *"/reviews"*)             echo '[]' ;;
+  *"/issues/45/comments"*)  echo '[{"id":451,"created_at":"2026-10-13T05:10:00Z","updated_at":"2026-10-13T05:10:00Z","body":"@codex review","user":{"login":"nathanjohnpayne","type":"User"}}]' ;;
   *"/issues/"*"/comments"*) echo '[]' ;;
   *"/pulls/"*"/comments"*)  echo '[]' ;;
   *) echo "gh shim: unhandled request: $args" >&2; exit 1 ;;
@@ -436,6 +446,10 @@ cat > "$TMP/fixture/pulls.json" <<'JSON'
   "user":{"login":"nathanjohnpayne"},"updated_at":"2026-10-13T06:00:00Z","head":{"sha":"4343434343434343434343434343434343434343","ref":"feat/43","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]},
  {"number":44,"title":"Future-dated head, no checks","html_url":"https://github.com/octo/demo/pull/44","draft":false,"updated_at":"2026-10-13T05:00:00Z",
   "user":{"login":"nathanjohnpayne"},"head":{"sha":"4444444444444444444444444444444444444444","ref":"feat/44","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]},
+ {"number":45,"title":"Request never answered","html_url":"https://github.com/octo/demo/pull/45","draft":false,"updated_at":"2026-10-13T05:10:00Z",
+  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4545454545454545454545454545454545454545","ref":"feat/45","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[]},
+ {"number":46,"title":"Lint red, review gates red by design","html_url":"https://github.com/octo/demo/pull/46","draft":false,"updated_at":"2026-10-13T05:30:00Z",
+  "user":{"login":"nathanjohnpayne"},"head":{"sha":"4646464646464646464646464646464646464646","ref":"feat/46","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[{"name":"needs-external-review"}]},
  {"number":42,"title":"Pushed and forgotten (repeated by a page boundary)","html_url":"https://github.com/octo/demo/pull/42","draft":false,
   "user":{"login":"nathanjohnpayne"},"updated_at":"2026-10-13T06:00:00Z","head":{"sha":"4242424242424242424242424242424242424242","ref":"feat/42","repo":{"full_name":"octo/demo"}},"base":{"repo":{"full_name":"octo/demo"}},"labels":[{"name":"needs-external-review"}]}]
 JSON
@@ -448,7 +462,20 @@ cat > "$TMP/fixture/check-runs-41.json" <<'JSON'
 {"name":"lint","status":"completed","conclusion":"success","started_at":"2026-10-13T06:00:00Z","completed_at":"2026-10-13T06:20:00Z"}
 {"name":"Merge clearance gate","status":"completed","conclusion":"failure","started_at":"2026-10-13T06:01:00Z","completed_at":"2026-10-13T06:02:00Z"}
 {"name":"Merge clearance gate","status":"completed","conclusion":"success","started_at":"2026-10-13T07:05:00Z","completed_at":"2026-10-13T07:06:00Z"}
+{"name":"Label Gate","status":"completed","conclusion":"failure","started_at":"2026-10-13T06:00:30Z","completed_at":"2026-10-13T06:00:40Z"}
 JSON
+# 45: lint green, an author @codex review that was never answered (request-unanswered).
+cat > "$TMP/fixture/check-runs-45.json" <<'JSON'
+{"name":"lint","status":"completed","conclusion":"success","started_at":"2026-10-13T05:00:00Z","completed_at":"2026-10-13T05:05:00Z"}
+JSON
+# 46: lint RED, and the review-policy gates red by design.
+cat > "$TMP/fixture/check-runs-46.json" <<'JSON'
+{"name":"lint","status":"completed","conclusion":"failure","started_at":"2026-10-13T05:30:00Z","completed_at":"2026-10-13T05:50:00Z"}
+{"name":"Label Gate","status":"completed","conclusion":"failure","started_at":"2026-10-13T05:30:10Z","completed_at":"2026-10-13T05:30:20Z"}
+{"name":"Merge clearance gate","status":"completed","conclusion":"failure","started_at":"2026-10-13T05:30:15Z","completed_at":"2026-10-13T05:30:40Z"}
+JSON
+printf '[]' > "$TMP/fixture/activity-45.json"
+printf '[]' > "$TMP/fixture/activity-46.json"
 : > "$TMP/fixture/check-runs-42.json"
 # Push activity: 41 has a server push entry for its head (05:58) plus one for
 # an older SHA; 42-44 have none for their heads, so 42 and 44 fall through to
@@ -459,10 +486,6 @@ printf '[]' > "$TMP/fixture/activity-43.json"
 printf '[]' > "$TMP/fixture/activity-44.json"
 : > "$TMP/fixture/check-runs-43.json"
 : > "$TMP/fixture/check-runs-44.json"
-printf 'SUCCESS' > "$TMP/fixture/rollup-44"
-printf 'SUCCESS' > "$TMP/fixture/rollup-41"
-printf 'SUCCESS' > "$TMP/fixture/rollup-42"
-printf 'PENDING' > "$TMP/fixture/rollup-43"
 
 : > "$TMP/gh.log"; : > "$TMP/gate.log"; : > "$TMP/request.log"
 set +e
@@ -471,16 +494,22 @@ PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fix
 rc=$?
 set -e
 if [ "$rc" -eq 1 ] \
-   && jq -e '[.prs[] | .number] == [44, 42, 41]' "$TMP/live.json" >/dev/null \
+   && jq -e '[.prs[] | .number] == [44, 45, 46, 42, 41]' "$TMP/live.json" >/dev/null \
+   && jq -e '[.prs[] | select(.number == 41)][0] | .ci_state == "SUCCESS"' "$TMP/live.json" >/dev/null \
+   && jq -e '[.prs[] | select(.number == 46)][0] | .ci_state == "FAILURE" and .next_action == "push fix" and .next_action_detail == "required head checks FAILURE"' "$TMP/live.json" >/dev/null \
+   && jq -e '[.prs[] | select(.number == 45)][0] | .class == "stalled" and .reason == "request-unanswered" and .next_action == "request codex" and .ci_state == "SUCCESS"' "$TMP/live.json" >/dev/null \
+   && jq -e '[.prs[] | select(.number == 42 or .number == 44)] | all(.ci_state == "NONE")' "$TMP/live.json" >/dev/null \
    && jq -e '[.prs[] | select(.number == 41)][0] | .class == "stalled" and .next_action == "merge" and .gate.exit == 0 and .head_ref == "feat/41" and .merge_gate_check == "success" and .head_pushed_at == "2026-10-13T05:58:00Z" and .head_pushed_at_source == "push-activity" and .fork == false' "$TMP/live.json" >/dev/null \
    && jq -e '[.prs[] | select(.number == 42)][0] | .class == "stalled" and .reason == "head-unrequested" and .next_action == "request codex" and .gate.exit == 1 and (.gate.reason | contains("gate (c)")) and .merge_gate_check == "absent" and .head_pushed_at == "2026-10-13T06:00:00Z" and .head_pushed_at_source == "pr-updated-at" and .fork == false' "$TMP/live.json" >/dev/null \
    && jq -e '[.prs[] | select(.number == 44)][0] | .class == "stalled" and .reason == "head-unrequested" and .head_pushed_at == "2026-10-13T05:00:00Z" and .head_pushed_at_source == "pr-updated-at"' "$TMP/live.json" >/dev/null; then
-  pass "live fetch normalizes the open PRs, delegates merge readiness to the gate, and records its reason"
+  pass "live fetch normalizes the open PRs, judges CI on the required head checks only (red review-policy gates are not a CI failure), delegates merge readiness to the gate, and records its reason"
 else
   fail "live fetch (rc=$rc): $(cat "$TMP/live.err") $(jq -c '[.prs[] | {number, class, next_action, gate}]' "$TMP/live.json" 2>/dev/null)"
 fi
 
-if [ "$(grep -c 'gate-called' "$TMP/gate.log")" -eq 3 ] \
+if [ "$(grep -c 'gate-called' "$TMP/gate.log")" -eq 4 ] \
+   && grep -Fq 'gate-called 46 octo/demo' "$TMP/gate.log" && ! grep -Fq 'gate-called 45 ' "$TMP/gate.log" \
+   && ! grep -Fq 'api graphql' "$TMP/gh.log" \
    && grep -Fq 'gate-called 41 octo/demo' "$TMP/gate.log" \
    && grep -Fq 'gate-called 44 octo/demo' "$TMP/gate.log" \
    && [ "$(grep -c -- '--paginate repos/octo/demo/pulls?state=open' "$TMP/gh.log")" -eq 1 ] \
@@ -496,7 +525,7 @@ else
   fail "read discipline: $(cat "$TMP/gh.log" "$TMP/gate.log")"
 fi
 
-if jq -e '.schema == "stalled-prs/v1" and .repo == "octo/demo" and ([.prs[] | .number] == [41, 42, 43, 44]) and ([.prs[] | select(.number == 41)][0].gate.exit == 0)' "$TMP/live-dump.json" >/dev/null; then
+if jq -e '.schema == "stalled-prs/v1" and .repo == "octo/demo" and ([.prs[] | .number] == [41, 42, 43, 44, 45, 46]) and ([.prs[] | select(.number == 41)][0].gate.exit == 0)' "$TMP/live-dump.json" >/dev/null; then
   : > "$TMP/gate.log"
   set +e
   bash "$FINDER" --input "$TMP/live-dump.json" --json --now "$NOW" > "$TMP/replay.json" 2>/dev/null
@@ -579,6 +608,58 @@ if [ "$rc_c" -eq 4 ] && grep -Fq 'next: phase 4b — the request ceiling is spen
   pass "--execute maps requester exits 5, 6 and 7 (by cap kind) to routing outcomes (exit 4) and keeps a real failure at exit 3"
 else
   fail "requester exit mapping (ceiling=$rc_c blocking=$rc_b unaccounted=$rc_u infra=$rc_i notrigger=$rc_n): $(tail -3 "$TMP/exec-ceiling.txt")"
+fi
+
+# Head fence: a PR whose head moved after classification is not requested on.
+: > "$TMP/request.log"
+set +e
+PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fixture" GATE_LOG="$TMP/gate.log" REQUEST_LOG="$TMP/request.log" \
+  HEAD_OVERRIDE=9999999999999999999999999999999999999999 \
+  bash "$TREE/scripts/workflow/resume-stalled-pr.sh" --repo "$REPO" --now "$NOW" --pr 42 --execute > "$TMP/resume-moved.txt" 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 1 ] && [ ! -s "$TMP/request.log" ] && grep -Fq 'moved from 4242424242424242424242424242424242424242 to 9999999999999999999999999999999999999999' "$TMP/resume-moved.txt"; then
+  pass "--execute re-reads the head and requests nothing when it moved after classification"
+else
+  fail "head fence (rc=$rc): $(cat "$TMP/request.log") $(tail -3 "$TMP/resume-moved.txt")"
+fi
+
+# An unanswered request is retried in the requester's polling mode (trigger-only
+# would dedup on the existing trigger and post nothing); its exit 4 (no answer
+# within the review timeout) routes to Phase 4b.
+: > "$TMP/request.log"
+set +e
+PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fixture" GATE_LOG="$TMP/gate.log" REQUEST_LOG="$TMP/request.log" \
+  bash "$TREE/scripts/workflow/resume-stalled-pr.sh" --repo "$REPO" --now "$NOW" --pr 45 --execute > "$TMP/resume-45.txt" 2>&1
+rc_ok=$?
+: > "$TMP/request.log.4"
+PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fixture" GATE_LOG="$TMP/gate.log" REQUEST_LOG="$TMP/request.log.4" \
+  REQUEST_RC=4 bash "$TREE/scripts/workflow/resume-stalled-pr.sh" --repo "$REPO" --now "$NOW" --pr 45 --execute > "$TMP/resume-45-timeout.txt" 2>&1
+rc_to=$?
+set -e
+if [ "$rc_ok" -eq 0 ] && grep -Fxq 'requester-called MERGEPATH_PHASE_4A_GATED=unset 45 octo/demo' "$TMP/request.log" \
+   && grep -Fq 'scripts/codex-review-request.sh 45 octo/demo' "$TMP/resume-45.txt" && grep -Fq 'polling mode' "$TMP/resume-45.txt" \
+   && [ "$rc_to" -eq 4 ] && grep -Fq 'next: phase 4b — Codex did not answer within its review timeout' "$TMP/resume-45-timeout.txt"; then
+  pass "an unanswered request is retried in polling mode (not trigger-only), and its timeout routes to phase 4b"
+else
+  fail "polling retry (ok=$rc_ok timeout=$rc_to): $(cat "$TMP/request.log") $(tail -3 "$TMP/resume-45-timeout.txt")"
+fi
+
+# The gate is always bounded: GNU timeout, or perl's alarm where GNU timeout is
+# absent (forced here through the suite seam).
+for forced in 0 1; do
+  : > "$TMP/gate.log"
+  set +e
+  PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fixture" GATE_LOG="$TMP/gate.log" \
+    GATE_SLEEP=46 STALLED_PRS_GATE_TIMEOUT_SECONDS=1 STALLED_PRS_NO_GNU_TIMEOUT="$forced" \
+    bash "$TREE/scripts/workflow/stalled-prs.sh" --repo "$REPO" --json --now "$NOW" > "$TMP/live-bounded-$forced.json" 2>/dev/null
+  set -e
+done
+if jq -e '[.prs[] | select(.number == 46)][0].gate | .exit == 124 and .reason == "codex-review-check.sh timed out after 1s"' "$TMP/live-bounded-0.json" >/dev/null \
+   && jq -e '[.prs[] | select(.number == 46)][0].gate | .exit == 124 and .reason == "codex-review-check.sh timed out after 1s"' "$TMP/live-bounded-1.json" >/dev/null; then
+  pass "a hung gate is cut off at the configured bound with GNU timeout and with the perl fallback"
+else
+  fail "bounded gate: gnu=$(jq -c '[.prs[] | select(.number == 46)][0].gate' "$TMP/live-bounded-0.json" 2>/dev/null) perl=$(jq -c '[.prs[] | select(.number == 46)][0].gate' "$TMP/live-bounded-1.json" 2>/dev/null)"
 fi
 
 # A failed list read must be a status, never an empty report (#831 contract).
