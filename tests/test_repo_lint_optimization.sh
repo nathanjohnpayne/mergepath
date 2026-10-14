@@ -37,7 +37,7 @@ fail() {
 # and at the start of a word (line start, whitespace, or one of `;&|()`), so
 # `"#1234"`, `'#x'`, `$#`, `${#a[@]}` and `foo#bar` are kept. Heredoc bodies
 # are data and pass through unchanged, which keeps a reference rather than
-# dropping it. The former `sed 's/[[:space:]]*#.*$//'` truncated every line
+# dropping it; a `<<` inside `((`…`))` is an arithmetic shift, not a heredoc. The former `sed 's/[[:space:]]*#.*$//'` truncated every line
 # at its first `#`, quoted or not, so a description such as
 # "... (#1234) ... tests/test_x.sh" lost its reference and the completeness
 # check passed for the wrong reason (8 of 9 references in check_coderabbit_wait).
@@ -57,6 +57,11 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace").read().split("
     end, i, prev = len(line), 0, "\n"
     opened_in_quote = quote is not None
     unquoted = [False] * len(line)  # True where the char is live shell syntax
+    # `((`…`))` nesting at each char, so `<<` inside `(( … ))` / `$(( … ))`
+    # is read as an arithmetic shift, not a heredoc opener. Tracked per
+    # line: an unbalanced `((` cannot suppress heredocs on later lines.
+    arith = [0] * len(line)
+    depth = 0
     while i < len(line):
         c = line[i]
         if quote == "'":
@@ -74,14 +79,29 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace").read().split("
         elif c == "#" and prev in " \t\n;&|()":
             end = i
             break
+        elif line.startswith("((", i):
+            depth += 1
+            unquoted[i] = unquoted[i + 1] = True
+            arith[i] = arith[i + 1] = depth
+            prev = "("
+            i += 2
+            continue
+        elif line.startswith("))", i) and depth:
+            arith[i] = arith[i + 1] = depth
+            depth -= 1
+            unquoted[i] = unquoted[i + 1] = True
+            prev = ")"
+            i += 2
+            continue
         else:
             unquoted[i] = True
+            arith[i] = depth
         prev = c
         i += 1
     out.append(line[:end].rstrip())
     if not opened_in_quote:
         for m in HEREDOC.finditer(line[:end]):
-            if unquoted[m.start()] and unquoted[m.start() + 1]:
+            if unquoted[m.start()] and unquoted[m.start() + 1] and not arith[m.start()]:
                 pending.append((m.group(1) == "-", m.group(3)))
 print("\n".join(out))
 PY
@@ -299,7 +319,8 @@ else
   # stripper that drops live text makes it pass for the wrong reason, so the
   # stripper is pinned on its own: every kept_* reference below sits in live
   # shell text (after a quoted `#`, `$#`, `${#…}`, a mid-word `#`, inside a
-  # heredoc or a multi-line quote, after a `<<<` here-string) and must
+  # heredoc or a multi-line quote, after a `<<<` here-string or an
+  # arithmetic `<<` shift, which opens no heredoc) and must
   # survive; every dropped_* reference sits in a real comment and must not.
   strip_fixture="$SCOPE_FIXTURES/strip-fixture.sh"
   cat >"$strip_fixture" <<'FIXTURE'
@@ -315,9 +336,13 @@ x=$(cat <<<"$y") tests/test_kept_herestring.sh # c tests/test_dropped_after_here
 echo "multi
 # still quoted tests/test_kept_multiline.sh
 " tests/test_kept_after_multiline.sh
+x=$(( 1 << WIDTH )) tests/test_kept_arith.sh
+(( mask = value << WIDTH ))
+# after an arithmetic shift tests/test_dropped_after_arith.sh
+WIDTH
 FIXTURE
   stripped_refs=$(strip_shell_comments "$strip_fixture" | grep -o 'tests/test_[a-z_]*\.sh' | LC_ALL=C sort -u | tr '\n' ' ')
-  expected_refs="tests/test_kept_after_multiline.sh tests/test_kept_dollar.sh tests/test_kept_heredoc.sh tests/test_kept_herestring.sh tests/test_kept_midword.sh tests/test_kept_multiline.sh tests/test_kept_quoted.sh tests/test_kept_single.sh "
+  expected_refs="tests/test_kept_after_multiline.sh tests/test_kept_arith.sh tests/test_kept_dollar.sh tests/test_kept_heredoc.sh tests/test_kept_herestring.sh tests/test_kept_midword.sh tests/test_kept_multiline.sh tests/test_kept_quoted.sh tests/test_kept_single.sh "
   if [ "$stripped_refs" = "$expected_refs" ]; then
     pass "the comment stripper keeps quoted, heredoc and mid-word hashes and drops only real comments"
   else
