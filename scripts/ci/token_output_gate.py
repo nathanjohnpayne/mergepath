@@ -455,6 +455,12 @@ under an array assignment's `$( )` was flagged with no capture at all
 An array assignment's parenthesised list is data, and a `$( )` among its
 elements is a capture under that assignment.
 
+Inside double quotes, the bounded ordinary-name `:-` default-word reader treats
+apostrophes as literal and retains plain named or positional expansions (#1452).
+Unquoted single-quote suppression and the measured non-expanding `:?` diagnostic
+forms remain unchanged. Nested quotes, substitutions, braces and other parameter
+operators retain the previous fallback; this is not general parameter parsing.
+
 REDACTION IS NOT EMISSION.  `${#VAR}` is a length and `${VAR:+set}` is a
 constant alternate; neither is a value reference, so both are legal with no
 pragma -- they are the #993 remediation and adopting it never trips the gate.
@@ -1443,7 +1449,8 @@ class Lexer:
         cur_ll.segments.append(top["seg"])
         levels = [top]
 
-        # Quote stack, innermost last.  Entries: "'", '"', "${", "$((".
+        # Quote stack, innermost last. ${d preserves a bounded double-quoted
+        # :- default word; apostrophes there are literal (#1452).
         #
         # Quoting is PER LEVEL: inside `$( ... )` bash restarts it, so the
         # inner `"` of `"$(f "${VAR:-}")"` OPENS a string rather than closing
@@ -1642,7 +1649,16 @@ class Lexer:
                     # WORD the expansion itself writes.  It is a distinct
                     # marker rather than a parallel counter because the pop on
                     # `}` has to stay exactly symmetric with the push.
+                    double_default = False
+                    if quotes and quotes[-1] == '"' \
+                            and _DOUBLE_QUOTED_DEFAULT_HEAD_RE.match(text, i):
+                        try:
+                            _simple_parameter_end(text, i)
+                            double_default = True
+                        except _ExactReadUnavailable:
+                            pass  # Unsupported words retain their prior reading.
                     quotes.append(
+                        "${d" if double_default else
                         "${?" if error_word_expansion_at(text, i) else "${"
                     )
                     cur_level()["word"].append("${")
@@ -1680,7 +1696,7 @@ class Lexer:
                 i += 1
                 continue
 
-            if c == "}" and quotes and quotes[-1] in ("${", "${?"):
+            if c == "}" and quotes and quotes[-1] in ("${", "${?", "${d"):
                 quotes.pop()
                 cur_level()["word"].append(c)
                 i += 1
@@ -2188,14 +2204,32 @@ def _simple_arithmetic_end(text, i):
     raise _ExactReadUnavailable()
 
 
+_DOUBLE_QUOTED_DEFAULT_HEAD_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:-")
+
+
 def _simple_parameter_end(text, i):
-    """End of the `${ }` at `i`, or raise when its word holds quotes or expansions."""
+    """End of a double-quoted `${ }` span, with bounded :- word support.
+
+    Only ordinary-name defaults admit literal apostrophes and plain named or
+    positional expansions. Nested constructs retain the exact-reader fallback.
+    """
+    head = _DOUBLE_QUOTED_DEFAULT_HEAD_RE.match(text, i)
+    word_start = head.end() if head else len(text)
     j = i + 2
     n = len(text)
     while j < n:
         c = text[j]
         if c == "}":
             return j + 1
+        if j >= word_start:
+            if c == "'":
+                j += 1  # Literal inside the demonstrated double-quoted default.
+                continue
+            if c == "$":
+                plain = re.match(r"(?:[A-Za-z_][A-Za-z0-9_]*|[1-9][0-9]*)", text[j + 1:])
+                if plain:
+                    j += 1 + plain.end()
+                    continue
         if c in "'\"`\\${":
             raise _ExactReadUnavailable()
         j += 1
@@ -5543,6 +5577,130 @@ CORPUS = [
     ("and-list-echo", MUST_FLAG, 'true && echo "$GH_TOKEN"\n'),
     ("pipe-into-cat-no-newline", MUST_FLAG, "printf '%s' \"$GH_TOKEN\" | cat\n"),
     # --- parameter-expansion operators ----------------------------------
+    # #1452 integration: adjacent arithmetic and a distinct :? word must
+    # retain their boundaries after the demonstrated :- default.
+    (
+        'quoted-default-word-arithmetic-named-quoted',
+        MUST_FLAG,
+        'echo "${UNSET_VALUE:-\'$GH_TOKEN\'}:$((1+2))"\n',
+    ),
+    (
+        'quoted-default-word-arithmetic-named-unquoted',
+        MUST_NOT_FLAG,
+        "echo ${UNSET_VALUE:-'$GH_TOKEN'}:$((1+2))\n",
+    ),
+    (
+        'quoted-default-word-arithmetic-helper-quoted',
+        MUST_FLAG,
+        'leak() { echo "${UNSET_VALUE:-\'$1\'}:$((1+2))"; }\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        'quoted-default-word-arithmetic-helper-unquoted',
+        MUST_NOT_FLAG,
+        'leak() { echo ${UNSET_VALUE:-\'$1\'}:$((1+2)); }\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        'quoted-default-word-error-sibling-quoted',
+        MUST_FLAG,
+        'SET_VALUE=present\necho "${UNSET_VALUE:-\'$GH_TOKEN\'} ${SET_VALUE:?\'$GH_TOKEN\'}"\n',
+    ),
+    (
+        'quoted-default-word-error-sibling-unquoted',
+        MUST_NOT_FLAG,
+        "SET_VALUE=present\necho ${UNSET_VALUE:-'$GH_TOKEN'} ${SET_VALUE:?'$GH_TOKEN'}\n",
+    ),
+    # #1452: apostrophes in a demonstrated double-quoted :- default word
+    # are literal; unquoted defaults and :? diagnostics keep their own rules.
+    (
+        'quoted-default-word-named-quoted',
+        MUST_FLAG,
+        'echo "${UNSET_VALUE:-\'$GH_TOKEN\'}"\n',
+    ),
+    (
+        'quoted-default-word-named-unquoted',
+        MUST_NOT_FLAG,
+        "echo ${UNSET_VALUE:-'$GH_TOKEN'}\n",
+    ),
+    (
+        'quoted-default-word-helper-quoted',
+        MUST_FLAG,
+        'leak() { echo "${UNSET_VALUE:-\'$1\'}"; }\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        'quoted-default-word-helper-unquoted',
+        MUST_NOT_FLAG,
+        'leak() { echo ${UNSET_VALUE:-\'$1\'}; }\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        'quoted-default-word-diagnostic-quoted',
+        MUST_NOT_FLAG,
+        ': "${UNSET_VALUE:?\'$GH_TOKEN\'}"\n',
+    ),
+    (
+        'quoted-default-word-diagnostic-unquoted',
+        MUST_NOT_FLAG,
+        ": ${UNSET_VALUE:?'$GH_TOKEN'}\n",
+    ),
+    (
+        'quoted-default-word-helper-diagnostic-quoted',
+        MUST_NOT_FLAG,
+        'leak() { : "${UNSET_VALUE:?\'$1\'}"; }\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        'quoted-default-word-helper-diagnostic-unquoted',
+        MUST_NOT_FLAG,
+        'leak() { : ${UNSET_VALUE:?\'$1\'}; }\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        'quoted-default-word-quoted-later-emitter',
+        MUST_FLAG,
+        'echo "${UNSET_VALUE:-\'$GH_TOKEN\'}"\necho "$GH_TOKEN"\n',
+    ),
+    (
+        'quoted-default-word-unquoted-later-emitter',
+        MUST_FLAG,
+        'echo ${UNSET_VALUE:-\'$GH_TOKEN\'}\necho "$GH_TOKEN"\n',
+    ),
+    (
+        'quoted-default-word-named-no-apostrophe',
+        MUST_FLAG,
+        'echo "${UNSET_VALUE:-$GH_TOKEN}"\n',
+    ),
+    (
+        'quoted-default-word-helper-no-apostrophe',
+        MUST_FLAG,
+        'leak() { echo "${UNSET_VALUE:-$1}"; }\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        'quoted-default-word-named-assignment',
+        MUST_NOT_FLAG,
+        'v="${UNSET_VALUE:-\'$GH_TOKEN\'}"\necho "len=${#v}"\n',
+    ),
+    (
+        'quoted-default-word-named-capture',
+        MUST_NOT_FLAG,
+        'v=$(echo "${UNSET_VALUE:-\'$GH_TOKEN\'}")\necho "len=${#v}"\n',
+    ),
+    (
+        'quoted-default-word-diagnostic-emitter-quoted',
+        MUST_NOT_FLAG,
+        'echo "${UNSET_VALUE:?\'$GH_TOKEN\'}"\n',
+    ),
+    (
+        'quoted-default-word-diagnostic-emitter-unquoted',
+        MUST_NOT_FLAG,
+        "echo ${UNSET_VALUE:?'$GH_TOKEN'}\n",
+    ),
+    (
+        'quoted-default-word-helper-diagnostic-emitter-quoted',
+        MUST_NOT_FLAG,
+        'leak() { echo "${UNSET_VALUE:?\'$1\'}"; }\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        'quoted-default-word-helper-diagnostic-emitter-unquoted',
+        MUST_NOT_FLAG,
+        'leak() { echo ${UNSET_VALUE:?\'$1\'}; }\nleak "$GH_TOKEN"\n',
+    ),
     ("expansion-dash", MUST_FLAG, 'echo "${UNSET_VALUE:-$GH_TOKEN}"\n'),
     ("expansion-plus", MUST_FLAG, 'SET_VALUE=x; echo "${SET_VALUE:+$GH_TOKEN}"\n'),
     ("expansion-assign", MUST_FLAG, 'echo "${UNSET_VALUE:=$GH_TOKEN}"\n'),
