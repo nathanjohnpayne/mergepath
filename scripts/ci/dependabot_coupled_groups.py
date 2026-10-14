@@ -300,9 +300,10 @@ def glob_dirs(tree: Tree, base: str, pattern: str) -> List[str]:
         target = join(base, pat)
         return [target] if target in tree.dirs() else []
     rx = path_glob(join(base, pat) if base else pat)
-    # `**/*` and friends also select the base directory itself.
+    # The globstar forms (`**`, `**/*`) also select the base directory itself;
+    # a lone `*` is only the layer below it (GitHub reserves `/` for the root).
     hits = [d for d in tree.dirs() if rx.fullmatch(d)]
-    if base not in hits and re.fullmatch(r"(\*\*/)*\*{1,2}", pat):
+    if base not in hits and re.fullmatch(r"\*\*(/\*{1,2})*", pat):
         hits.insert(0, base)
     return hits
 

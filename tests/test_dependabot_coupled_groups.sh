@@ -550,6 +550,24 @@ pkg "$r/packages/app" "$FB_PROD" "$FB_DEV"
 write_config "$r" "$TYPE_GROUPS"
 expect "a workspace pattern without * is a literal path (dependabot-core fast path)" 0 "$r" "PASS"
 
+r="$(new_repo dirs-single-star)"
+pkg "$r" "$FB_PROD" "$FB_DEV"; pkg "$r/web" "react" ""
+cat > "$r/.github/dependabot.yml" <<'YAML'
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directories:
+      - "*"
+    schedule:
+      interval: "weekly"
+    groups:
+      dev-dependencies:
+        dependency-type: "development"
+      production-dependencies:
+        dependency-type: "production"
+YAML
+expect "directories: [\"*\"] is the layer below the root, not the root itself" 0 "$r" "PASS"
+
 r="$(new_repo pnpm-ancestor-catalog)"
 printf '{"name":"root","private":true}\n' > "$r/package.json"
 printf 'catalog:\n  firebase: ^13.0.0\n' > "$r/pnpm-workspace.yaml"
