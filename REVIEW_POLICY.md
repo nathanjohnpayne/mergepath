@@ -1073,7 +1073,7 @@ Before #2167 the scheduled sweeps alone came to roughly 1,900 requests per hour 
 - Every pass reads `GET /rate_limit` (free) and, when the remaining budget cannot cover 40 requests per PR it would evaluate plus a 100-request reserve, evaluates only the head it claimed with holds; a schedule-parent pass or dispatch evaluates nothing new. A pass therefore never starts non-head work it cannot finish.
 - The first `rate limit exceeded for installation` failure stops the pass, and the red it writes backs that PR off event passes until the budget's reset, after which the first pass re-evaluates it with no manual rerun.
 
-The scheduled floor is still well over half the budget at 8 open PRs, so the budget remains contended when many PR loops run at once; the guard is what keeps a contended hour from turning into a self-sustaining outage. The `codex-p1-gate.yml` and `coderabbit-severity-gate.yml` sweeps (about 190 requests per hour) still run alongside the chained pass, which evaluates the same two scripts; folding them into the publisher is the remainder of #845 PR 4.
+The scheduled floor is still well over half the budget at 8 open PRs, so the budget remains contended when many PR loops run at once; the guard is what keeps a contended hour from turning into a self-sustaining outage. The `codex-p1-gate.yml` and `coderabbit-severity-gate.yml` sweeps (about 190 requests per hour) still run alongside the chained pass, which evaluates the same two scripts; folding them into the publisher is the remainder of #845 PR 4 (#2224).
 
 ### `resolveReviewThread`
 
