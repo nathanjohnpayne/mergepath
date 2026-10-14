@@ -984,6 +984,10 @@ if [ "$rc" -eq 1 ] && ! printf '%s' "$err" | grep -q 'no review_requested event 
 else
   fail "create partial only-done: rc=$rc err=$err"
 fi
+# gh reads repeatable values as CSV, so a quoted value can hold a comma;
+# the transport refuses one rather than split it into the wrong names.
+refused_rest "a quoted CSV label on edit" as_author gh pr edit 42 --repo o/r --add-label '"area,backend"'
+refused_rest "a quoted CSV label on create" as_author gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label '"area,backend"'
 # Logins and label names compare without case, as GitHub compares them.
 new_case
 set +e
@@ -1201,6 +1205,8 @@ override_refused "Authorization header, short attached form" as_reviewer gh api 
 override_refused "gh api endpoint on another host" as_reviewer gh api https://evil.example/repos/o/r/issues/1/comments -f body=x
 # Option values cannot hide a re-routing argument: each argument is checked on
 # its own, so a value-taking option in front cannot shift the real one.
+override_refused "a PR URL selector on github.localhost" as_reviewer gh pr comment https://github.localhost/o/r/pull/123 --body x
+override_refused "an issue URL selector on a ghe.com tenant" as_reviewer gh issue comment https://tenant.ghe.com/o/r/issues/7 --body x
 override_refused "short header flag with an equals sign" as_reviewer gh api repos/o/r/issues/1/comments -H='Authorization: Bearer x' -f body=x
 override_refused "header flag clustered after another short flag" as_reviewer gh api repos/o/r/issues/1/comments -iHAuthorization:x -f body=x
 override_refused "Authorization header behind a --preview value" as_reviewer gh api repos/o/r/issues/1/comments --preview --header --header 'Authorization: Bearer x' -f body=x
@@ -1228,6 +1234,15 @@ else
   fail "plain GH_REPO: rc=$rc"; cat "$LOGF" >&2
 fi
 
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=gh as_reviewer -- gh pr comment https://github.com/o/r/pull/9 --body x >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'gh\tpr\tcomment\thttps://github.com/o/r/pull/9'; then
+  pass "a github.com PR URL selector still passes on the gh transport"
+else
+  fail "github.com URL selector: rc=$rc"; cat "$LOGF" >&2
+fi
 new_case
 set +e
 MERGEPATH_GH_TRANSPORT=rest as_reviewer -- gh pr comment 1 --repo o/r --body https://example.com/a/b >/dev/null 2>&1; rc=$?

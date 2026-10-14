@@ -159,6 +159,18 @@ gh_payload_is_hosted_repo() {
   [[ "$1" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+/[^/[:space:]]+/[^/[:space:]]+$ ]]
 }
 
+# gh_payload_is_foreign_item_url <value>: 0 iff <value> is a pull request or
+# issue URL whose host is not github.com.
+gh_payload_is_foreign_item_url() {
+  local host
+  [[ "$1" =~ ^[Hh][Tt][Tt][Pp][Ss]?://([^/]+)/[^/]+/[^/]+/(pull|pulls|issues)/[0-9]+ ]] || return 1
+  host="$(printf '%s' "${BASH_REMATCH[1]##*@}" | tr '[:upper:]' '[:lower:]')"
+  case "$host" in
+    github.com|www.github.com) return 1 ;;
+  esac
+  return 0
+}
+
 # gh_payload_refuse_credential_overrides <label> <gh argv...>
 # Exit 0 when argv carries none of the arguments that would send the verified
 # token to another host or replace it; otherwise explain and exit 1.
@@ -204,6 +216,13 @@ gh_payload_refuse_credential_overrides() {
     esac
     if gh_payload_is_hosted_repo "$arg"; then
       echo "$label: refusing the host-qualified repository '$arg': whatever option it belongs to, gh could send the verified token to that host; pass OWNER/REPO (#1542)." >&2
+      return 1
+    fi
+    # A pull request or issue URL is a selector: gh takes the destination
+    # host from it, and sends GH_TOKEN to github.localhost and *.ghe.com as
+    # well as github.com. Checked by shape in every position, like the rest.
+    if gh_payload_is_foreign_item_url "$arg"; then
+      echo "$label: refusing the pull request or issue URL '$arg' on a host other than github.com: gh would send the verified token there; select by number with --repo OWNER/REPO (#1542)." >&2
       return 1
     fi
     if [ "$is_api" -eq 1 ]; then
@@ -336,6 +355,20 @@ gh_rest_lines_json() {
 
 gh_rest_split_csv() { # <value> -> one item per line
   printf '%s\n' "$1" | tr ',' '\n' | sed '/^[[:space:]]*$/d'
+}
+
+# gh reads repeatable values (labels, reviewers, assignees) as CSV, so a
+# quoted field can hold a comma ('"area,backend"' is one label). Splitting on
+# every comma would name the wrong labels, so a quoted value is refused
+# before any write.
+gh_rest_check_csv() { # <option> <value>
+  case "$2" in
+    *'"'*)
+      gh_rest_refuse "a quoted value for $1 ('$2') is not accepted: pass each name in its own $1, without quotes"
+      return 1
+      ;;
+  esac
+  return 0
 }
 
 # gh_rest_each <json array> <function> [args...]: call <function> [args...]
@@ -818,9 +851,9 @@ gh_rest_pr_create() {
       --head) gh_rest_value || return 1; head="$GH_REST_VAL" ;;
       --base) gh_rest_value || return 1; base="$GH_REST_VAL" ;;
       --draft) gh_rest_flag || return 1; draft=true ;;
-      --label) gh_rest_value || return 1; labels="$labels$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
-      --reviewer) gh_rest_value || return 1; reviewers="$reviewers$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
-      --assignee) gh_rest_value || return 1; assignees="$assignees$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
+      --label) gh_rest_value || return 1; gh_rest_check_csv --label "$GH_REST_VAL" || return 1; labels="$labels$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
+      --reviewer) gh_rest_value || return 1; gh_rest_check_csv --reviewer "$GH_REST_VAL" || return 1; reviewers="$reviewers$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
+      --assignee) gh_rest_value || return 1; gh_rest_check_csv --assignee "$GH_REST_VAL" || return 1; assignees="$assignees$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
       '') gh_rest_refuse "unexpected argument '$GH_REST_VAL'"; return 1 ;;
       *) gh_rest_refuse "option $GH_REST_OPT is not accepted"; return 1 ;;
     esac
@@ -1090,12 +1123,12 @@ gh_rest_pr_edit() {
       --title) gh_rest_value || return 1; title="$GH_REST_VAL"; title_set=1 ;;
       --body|--body-file) gh_rest_value || return 1; gh_rest_body_from "$GH_REST_OPT" "$GH_REST_VAL" || return 1 ;;
       --base) gh_rest_value || return 1; base="$GH_REST_VAL"; base_set=1 ;;
-      --add-label) gh_rest_value || return 1; add_labels="$add_labels$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
-      --remove-label) gh_rest_value || return 1; remove_labels="$remove_labels$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
-      --add-reviewer) gh_rest_value || return 1; add_reviewers="$add_reviewers$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
-      --remove-reviewer) gh_rest_value || return 1; remove_reviewers="$remove_reviewers$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
-      --add-assignee) gh_rest_value || return 1; add_assignees="$add_assignees$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
-      --remove-assignee) gh_rest_value || return 1; remove_assignees="$remove_assignees$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
+      --add-label) gh_rest_value || return 1; gh_rest_check_csv --add-label "$GH_REST_VAL" || return 1; add_labels="$add_labels$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
+      --remove-label) gh_rest_value || return 1; gh_rest_check_csv --remove-label "$GH_REST_VAL" || return 1; remove_labels="$remove_labels$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
+      --add-reviewer) gh_rest_value || return 1; gh_rest_check_csv --add-reviewer "$GH_REST_VAL" || return 1; add_reviewers="$add_reviewers$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
+      --remove-reviewer) gh_rest_value || return 1; gh_rest_check_csv --remove-reviewer "$GH_REST_VAL" || return 1; remove_reviewers="$remove_reviewers$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
+      --add-assignee) gh_rest_value || return 1; gh_rest_check_csv --add-assignee "$GH_REST_VAL" || return 1; add_assignees="$add_assignees$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
+      --remove-assignee) gh_rest_value || return 1; gh_rest_check_csv --remove-assignee "$GH_REST_VAL" || return 1; remove_assignees="$remove_assignees$(gh_rest_split_csv "$GH_REST_VAL")"$'\n' ;;
       *) gh_rest_refuse "option $GH_REST_OPT is not accepted"; return 1 ;;
     esac
     GH_REST_I=$((GH_REST_I + 1))

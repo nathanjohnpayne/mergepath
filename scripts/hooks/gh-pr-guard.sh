@@ -1391,11 +1391,29 @@ fi
 # (Codex on #2178). The PAT is used for this read only, and only when gh has
 # no token of its own.
 guard_review_gh() {
-  if [ -z "${GH_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ] && [ -n "${OP_PREFLIGHT_REVIEWER_PAT:-}" ]; then
-    GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh "$@"
+  if [ -z "${GH_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ] && [ -n "${OP_PREFLIGHT_REVIEWER_PAT:-}" ] \
+     && guard_review_reads_github_com; then
+    GH_HOST=github.com GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh "$@"
   else
     gh "$@"
   fi
+}
+
+# guard_review_reads_github_com: 0 iff the self-approve read goes to
+# github.com, so lending it the reviewer PAT cannot send the PAT elsewhere.
+# gh sends GH_TOKEN to github.localhost and *.ghe.com too, and takes the host
+# from GH_HOST, a host-qualified --repo or GH_REPO, or a URL selector (Phase
+# 4b on #2178). Anything else keeps gh's own credentials, which fail closed.
+guard_review_reads_github_com() {
+  case "${GH_HOST:-github.com}" in github.com) ;; *) return 1 ;; esac
+  case "${GH_REPO:-}" in */*/*) return 1 ;; esac
+  case "${REVIEW_REPO:-}" in */*/*) return 1 ;; esac
+  case "${REVIEW_PR_SELECTOR:-}" in
+    [Hh][Tt][Tt][Pp]://*|[Hh][Tt][Tt][Pp][Ss]://*)
+      case "$REVIEW_PR_SELECTOR" in https://github.com/*) ;; *) return 1 ;; esac
+      ;;
+  esac
+  return 0
 }
 
 guard_graphql_refused() { # <stderr file>

@@ -608,6 +608,29 @@ if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q 'could not fetch PR metadata'
 else
   fail "self-approve read no token: rc=$rc out=$out"
 fi
+# The PAT is lent only to a read that goes to github.com: a host-qualified
+# --repo, a GH_HOST elsewhere, or a URL selector on another host keeps gh's
+# own (absent) credentials, so the read fails closed without sending the PAT
+# (Phase 4b on #2178).
+for variant in "--repo github.localhost/o/r" "GH_HOST=tenant.ghe.com" "https://github.localhost/o/r/pull/123"; do
+  : >"$API_LOG"
+  case "$variant" in
+    GH_HOST=*) cmd='scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"'; host="${variant#GH_HOST=}" ;;
+    https://*) cmd="scripts/gh-as-reviewer.sh -- gh pr review $variant --approve --body lgtm"; host="" ;;
+    *) cmd="scripts/gh-as-reviewer.sh -- gh pr review 123 $variant --approve --body lgtm"; host="" ;;
+  esac
+  set +e
+  out=$(unset GH_TOKEN GITHUB_TOKEN; if [ -n "$host" ]; then export GH_HOST="$host"; fi; \
+    OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-pat STUB_EXPECT_TOKEN=fixture-reviewer-pat STUB_REQUIRE_TOKEN=1 STUB_API_LOG="$API_LOG" \
+    run_hook "$cmd" "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0" 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" -eq 2 ] && ! grep -q 'authenticated with the expected token' "$API_LOG"; then
+    pass "self-approve read toward another host ($variant): the reviewer PAT is not lent, and the read fails closed"
+  else
+    fail "self-approve PAT withheld ($variant): rc=$rc out=$out"
+  fi
+done
 STUB_PR_VIEW_FAIL=1 assert_rc_contains "a read failure that is not the GraphQL ceiling still blocks, with no REST fallback" 2 "could not fetch PR metadata" \
   'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0"
 
