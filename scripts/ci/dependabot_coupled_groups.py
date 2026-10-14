@@ -307,6 +307,26 @@ def glob_dirs(tree: Tree, base: str, pattern: str) -> List[str]:
     return hits
 
 
+def class_body(body: str) -> str:
+    """Translate an fnmatch ``[...]`` body into a Python regex class body.
+
+    Ruby treats ``\\x`` inside a class as the literal ``x`` (so ``[a\\-c]`` is
+    ``a``, ``-`` or ``c``). Ranges ``a-z`` pass through, and every other
+    character is literal, including regex-only metacharacters such as ``^``
+    and ``[``.
+    """
+    out: List[str] = []
+    i = 0
+    while i < len(body):
+        c = body[i]
+        if c == "\\" and i + 1 < len(body):
+            out.append(re.escape(body[i + 1])); i += 2; continue
+        if c == "-" and out and i + 1 < len(body):
+            out.append("-"); i += 1; continue
+        out.append(re.escape(c)); i += 1
+    return "".join(out)
+
+
 def fnmatch_glob(pattern: str) -> "re.Pattern[str]":
     """Ruby ``File.fnmatch(pattern, path, File::FNM_PATHNAME)``, as
     dependabot-core matches workspace paths: ``*``, ``?`` and ``[set]`` stay
@@ -327,11 +347,18 @@ def fnmatch_glob(pattern: str) -> "re.Pattern[str]":
             out.append(r"[^/.]" if seg_start else r"[^/]"); i += 1; seg_start = False; continue
         if c == "[":
             start = i + 2 if pattern[i + 1:i + 2] in ("!", "^") else i + 1
-            j = pattern.find("]", start + 1 if pattern[start:start + 1] == "]" else start)
+            # First unescaped "]" after at least one class character.
+            j, k = -1, start + 1 if pattern[start:start + 1] == "]" else start
+            while k < len(pattern):
+                if pattern[k] == "\\":
+                    k += 2; continue
+                if pattern[k] == "]":
+                    j = k; break
+                k += 1
             if j != -1:
                 body = pattern[i + 1:j]
                 negate = body[:1] in ("!", "^")
-                body = (body[1:] if negate else body).replace("\\", "\\\\")
+                body = class_body(body[1:] if negate else body)
                 lead = r"(?!\.)" if seg_start else ""
                 out.append(lead + ("[^/" + body + "]" if negate else "(?!/)[" + body + "]"))
                 i, seg_start = j + 1, False
