@@ -277,7 +277,11 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     Eval's proven literal arguments form one space-joined program, with an
     empty-literal and double-quote escape opt-ins only for eval arguments;
     default command-word decoding stays unchanged. Existing unquoted glob,
-    brace, leading-tilde and ANSI-C inventories refuse the joined path.
+    brace, leading-tilde, assignment-tilde and ANSI-C inventories refuse
+    the joined path. The inherited per-literal fallback remains unchanged.
+    Four inherited assignment-tilde misses are version-qualified: Linux
+    Bash 5.2.15 leaked; the observed Mac Bash 5.3.20 build was quiet. The owner
+    preserves #1465's literal-only boundary; #2228 tracks the actual leak fix.
     Irreducible eval operands retain independent
     scanning of known literal fragments. Trap actions and callback operands
     remain separate. The operand is
@@ -2498,7 +2502,7 @@ def _iter_refs_at(s):
 UNRESOLVED = "<unresolved>"
 
 
-def _command_word_expands(w):
+def _command_word_expands(w, eval_assignment_tilde=False):
     """Does this command word carry an UNQUOTED expansion the shell performs?
 
     `_unquote_command_word` reduces a word to its literal text, which is the
@@ -2529,6 +2533,11 @@ def _command_word_expands(w):
     A word carrying `$` or a backquote never reaches here: it is UNRESOLVED
     already.
     """
+    # Eval's proof excludes assignment tilde prefixes without resolving them.
+    # Ordinary command-word callers retain their existing inventory unchanged.
+    if eval_assignment_tilde:
+        w = w.replace("\\\n", "")
+    assignment = _ASSIGN_RE.match(w) if eval_assignment_tilde else None
     meta = []  # (char, index) for unquoted metacharacters only
     i = 0
     n = len(w)
@@ -2549,9 +2558,17 @@ def _command_word_expands(w):
                 j += 2 if w[j] == "\\" else 1
             i = j + 1
             continue
-        if c in "*?[]{}":
+        if c in "*?[]{}" or (eval_assignment_tilde and c in "=:~"):
             meta.append((c, i))
         i += 1
+    if assignment is not None:
+        unquoted = {index: char for char, index in meta}
+        if (unquoted.get(assignment.end() - 1) == "="
+                and any(char == "~" and index >= assignment.end()
+                        and (index == assignment.end()
+                             or unquoted.get(index - 1) == ":")
+                        for char, index in meta)):
+            return True
     kinds = [c for c, _ in meta]
     if "*" in kinds or "?" in kinds:
         return True
@@ -2580,7 +2597,7 @@ _ANSI_C_ESCAPES = {
 def _unquote_command_word(w, allow_empty=False, eval_literal=False):
     """Reduce a command word; eval's opt-in proves its pre-evaluation value."""
     if eval_literal and ("$'" in w or w.replace("\\\n", "").startswith("~")
-                         or _command_word_expands(w)):
+                         or _command_word_expands(w, eval_assignment_tilde=True)):
         return None  # Existing expansion inventories; no runtime reconstruction.
     out = []
     i = 0
@@ -13579,6 +13596,23 @@ CORPUS = [(cid, MUST_FLAG if cid in HEREDOC_ECHO_RULE_CHANGES else rule, body)
 KNOWN_BROADER.update({cid: HEREDOC_ECHO_CONSERVATISM
                       for cid in HEREDOC_ECHO_CONSERVATIVE_CASES})
 
+# Owner-approved #1465 scope: these inherited misses remain tracked in #2228.
+# Qualification is the exact quiet build measured, not every Bash 5.3 release.
+EVAL_ASSIGNMENT_TILDE_MISSES = frozenset(('eval-assignment-tilde-inherited-tilde-equal', 'eval-assignment-tilde-inherited-tilde-colon', 'eval-assignment-tilde-inherited-tilde-append', 'eval-assignment-tilde-inherited-tilde-escaped-continuation'))
+EVAL_ASSIGNMENT_TILDE_QUIET_ORACLE = (
+    "GNU bash, version 5.3.20(1)-release (aarch64-apple-darwin27.0.0)"
+)
+CORPUS += [('eval-assignment-tilde-inherited-tilde-equal', 'clean', 'HOME=\'; echo\'\neval X=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-colon', 'clean', 'HOME=\'; echo\'\neval X=prefix:~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-append', 'clean', 'HOME=\'; echo\'\neval X+=~ \': "$GH_TOKEN"\'\n'), ('eval-assignment-tilde-inherited-tilde-escaped-continuation', 'clean', 'HOME=\'; echo\'\neval X=\\\n~ \': "$GH_TOKEN"\'\n')]
+KNOWN_MISSES.update({cid: (
+    "Inherited assignment-tilde eval miss: Linux Bash 5.2.15 leaked in the "
+    "paired sample; the measured Mac Bash 5.3.20 build was quiet. Main and "
+    "the pre-guard candidate both missed the Linux leak. The literal-only "
+    "#1465 contract refuses joining, preserving independent known-literal "
+    "fragment fallback; no dynamic prefix reconstruction or leak fix is "
+    "claimed. Owner-approved scope disposition; actual repair is tracked in "
+    "https://github.com/nathanjohnpayne/mergepath/issues/2228"
+) for cid in EVAL_ASSIGNMENT_TILDE_MISSES})
+
 def _corpus_id_cases():
     """Every corpus id is UNIQUE, and every declared id names a real case.
 
@@ -13792,6 +13826,7 @@ def self_test():
     passed = 0
     tp = fn = fp = tn = 0
     bash_path, bash_text, _bash_ver = oracle_bash()
+    quiet_eval_tilde_samples = set()
 
     failures.extend(_corpus_id_cases())
     failures.extend(_printf_allowlist_cases())
@@ -13871,9 +13906,15 @@ def self_test():
             else:
                 tn += 1
 
+            # Only the four inherited tilde cases on the exact observed quiet
+            # build qualify; every other declaration retains normal stale checks.
+            if (cid in EVAL_ASSIGNMENT_TILDE_MISSES
+                    and bash_text == EVAL_ASSIGNMENT_TILDE_QUIET_ORACLE
+                    and not leaked and not flagged):
+                quiet_eval_tilde_samples.add(cid)
             minimum_bash = KNOWN_MISS_MIN_BASH.get(cid)
             unsupported_miss = (minimum_bash is not None and _bash_ver is not None
-                                and _bash_ver < minimum_bash)
+                                and _bash_ver < minimum_bash) or cid in quiet_eval_tilde_samples
             if cid in KNOWN_MISSES and not unsupported_miss and not (leaked and not flagged):
                 failures.append(
                     "STALE KNOWN_MISSES entry %r: it no longer disagrees with "
@@ -13943,6 +13984,8 @@ def self_test():
         unsupported_miss = (minimum_bash is not None and _bash_ver is not None
                             and _bash_ver < minimum_bash)
         label = "unsupported version-qualified miss" if unsupported_miss else "measured miss"
+        if cid in quiet_eval_tilde_samples:
+            label = "quiet observed Bash 5.3.20 sample; inherited Linux Bash 5.2 miss"
         print(
             "check_no_token_in_output:   %s: %s -- %s"
             % (label, cid, KNOWN_MISSES[cid])
@@ -14122,6 +14165,37 @@ def _deferred_shell_cases():
     cannot read the source the one place that admission is invisible.
     """
     failures = []
+    # Assignment-shaped tilde refusal changes literal proof, not fallback.
+    for raw, expands in [
+        ('X=~', True),
+        ('X=prefix:~', True),
+        ('X+=~', True),
+        ('X=\\\n~', True),
+        ("X='~'", False),
+        ('X="~"', False),
+        ('X=\\~', False),
+        ("'X=~'", False),
+        ("X=prefix:'~'", False),
+        ('X=prefix:\\~', False),
+        ('"X"=~', False),
+        ('X\\=~', False),
+        ('X=prefix~', False),
+        ('X=foo:~', True),
+        ('X=foo\\:~', False),
+        ('X=foo:\\\n~', True),
+        ('X=foo\\:\\\n~', False),
+        ('X=prefix\\:~', False),
+        ("X=prefix':'~", False),
+        ('X=prefix":"~', False),
+        ("X'='~", False),
+        ("'X'=~", False),
+        ('X\\Y=~', False),
+    ]:
+        if _command_word_expands(raw) or _command_word_expands(raw, eval_assignment_tilde=True) != expands:
+            failures.append("eval assignment tilde inventory: " + repr(raw))
+        literal = _unquote_command_word(raw, allow_empty=True, eval_literal=True)
+        if (literal is None) != expands:
+            failures.append("eval assignment tilde literal proof: " + repr(raw))
     # Ordinary decoding remains exact; only proven eval arguments opt in.
     if (_unquote_command_word(r'": \; echo"') != ': ; echo'
             or _unquote_command_word(r'": \; echo"', eval_literal=True) != r': \; echo'):
