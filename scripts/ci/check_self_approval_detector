@@ -122,7 +122,7 @@ if grep -qF 'function stableLabelNames' "$WORKFLOW" ||
 fi
 
 policy_resolve_line=$(grep -nF '              const policyResolverArgs = [' "$WORKFLOW" | head -1 | cut -d: -f1)
-identity_load_line=$(grep -nF '                governingIdentities = loadGoverningIdentities(' "$WORKFLOW" | head -1 | cut -d: -f1)
+identity_load_line=$(grep -nF '                governingIdentities = await loadGoverningIdentities(' "$WORKFLOW" | head -1 | cut -d: -f1)
 if [ -z "$policy_resolve_line" ] || [ -z "$identity_load_line" ] ||
   [ "$policy_resolve_line" -ge "$identity_load_line" ]; then
   echo "check_self_approval_detector: triage must materialize its exact base policy before loading identities from it" >&2
