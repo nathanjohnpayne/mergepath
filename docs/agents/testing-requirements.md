@@ -10,6 +10,8 @@ The required `lint` context is an aggregator over a fast live-assertion lane and
 
 When you add a `tests/test_*` reference to a wrapper that the graph declares, declare that test under the wrapper in `scripts/ci/repo-lint-dependencies.json`; when you enrol a new `--self-test` step in the workflow, add the wrapper to the graph's `self_tests` list. `tests/test_repo_lint_optimization.sh` fails lint-fast on the hub until both are in step.
 
+The fast lane is itself a shard matrix balanced by measured step time: a new check step in `lint_fast` is pinned to exactly one shard with `if: matrix.shard == N` (pick the shard with the smallest measured sum), and `tests/test_repo_lint_optimization.sh` fails on an unpinned check or a pin naming a shard the matrix does not declare.
+
 Checks with separable repository assertions and implementation regression suites should expose explicit live and self-test modes. The fast lane invokes the live mode, deep CI invokes the self-test mode, and the no-argument behavior remains compatible for consumers during propagation skew. The canonical contract and regression coverage live in `specs/repo_lint_execution.md` and `tests/test_repo_lint_optimization.sh`.
 
 ## Feedback snapshot recovery

@@ -278,6 +278,9 @@ jobs:
           REPO: ${{ github.repository }}
           # For resolve_base_policy.sh's base-pinned form in the pin-bump lane.
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          # #2193: selects which label-absent PRs are heal candidates below.
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
         run: |
           set -euo pipefail
           # Source the gh-retry helper (#324). with_gh_retry wraps gh
@@ -300,6 +303,11 @@ jobs:
           had_infra_error=0
           failing_prs=""
           cleared_prs=""
+          # #2193: PRs this pass evaluated without an infrastructure error and
+          # left with needs-external-review absent. The "Heal stale auto-clear
+          # infra-failure check-runs" step supersedes a stale failed
+          # auto-clear-blocking-labels check-run on each one's head.
+          heal_prs=""
           while IFS= read -r PR; do
             [ -z "$PR" ] && continue
             echo "::group::Evaluating PR #$PR"
@@ -322,6 +330,20 @@ jobs:
             fi
             if [ "$HAS_LABEL" != "true" ]; then
               echo "Label needs-external-review not present; nothing to clear."
+              # #2193: a PR whose label is already gone can still carry a
+              # stale failed auto-clear-blocking-labels check-run, and the
+              # scheduled sweep visits only PRs the search index still lists
+              # as labeled, so this event is often its only heal path (a
+              # body-edit `edited` nudge being the deliberate one). Limited to
+              # pull_request_target actions other than `synchronize`: a fresh
+              # push carries a head no infra failure was posted on, and
+              # workflow_run fires several times per push, so either would
+              # spend installation-token reads for nothing. The heal step
+              # itself posts only when the newest run on the head is a failure.
+              if [ "${EVENT_NAME:-}" = "pull_request_target" ] \
+                 && [ "${EVENT_ACTION:-}" != "synchronize" ]; then
+                heal_prs="$heal_prs $PR"
+              fi
               echo "::endgroup::"
               continue
             fi
@@ -596,6 +618,9 @@ jobs:
                   echo "::endgroup::"
                   continue
                 fi
+                # #2193: the label is confirmed absent after a clean pass, so
+                # this head is a heal candidate whoever performed the removal.
+                heal_prs="$heal_prs $PR"
                 # End state is correct. Comment ONLY if THIS run performed the
                 # removal (#827) — a 404 means another run or an earlier sweep
                 # already cleared it, and the desired end state holds either way.
@@ -675,6 +700,18 @@ jobs:
           # The continuation step skips it until that later workflow_run.
           # shellcheck disable=SC2086  # intentional word-splitting to trim
           echo "cleared_prs=$(echo $cleared_prs)" >> "$GITHUB_OUTPUT"
+          # #2193: deduplicated heal candidates, minus any PR that also hit an
+          # infrastructure error in this pass (a repeated PR number), which
+          # the surfacing step owns.
+          heal_out=""
+          for heal_pr in $heal_prs; do
+            case " $failing_prs $heal_out " in
+              *" $heal_pr "*) ;;
+              *) heal_out="$heal_out $heal_pr" ;;
+            esac
+          done
+          # shellcheck disable=SC2086  # intentional word-splitting to trim
+          echo "heal_prs=$(echo $heal_out)" >> "$GITHUB_OUTPUT"
           exit "$had_infra_error"
 
       - name: Continue approved PRs after completed checks
@@ -842,6 +879,32 @@ jobs:
             echo "::endgroup::"
           done
 
+      - name: Heal stale auto-clear infra-failure check-runs
+        # #2193: a clean pass that leaves needs-external-review absent
+        # supersedes a stale failed auto-clear-blocking-labels check-run, which
+        # otherwise stays the newest run on the head, drives the PR UNSTABLE
+        # and makes gh-pr-guard.sh refuse the merge. The helper posts only
+        # when the newest such run on the live head is a failure, and fences
+        # the POST on a fresh head/label read. Last in the job so a helper
+        # fault can never skip the label-clear or continuation steps;
+        # !cancelled() so it still runs when the clear step exited non-zero
+        # for a DIFFERENT PR's infrastructure error.
+        if: ${{ !cancelled() && steps.clear.outputs.heal_prs != '' }}
+        env:
+          # Check-runs can only be created by a GitHub App: GITHUB_TOKEN with
+          # `checks: write`, never a PAT.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEAL_PRS: ${{ steps.clear.outputs.heal_prs }}
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/workflow/heal-auto-clear-infra-check.sh ]; then
+            echo "::notice::Auto-clear heal helper is not on the trusted default branch yet; skipping this first-rollout pass."
+            exit 0
+          fi
+          bash scripts/workflow/heal-auto-clear-infra-check.sh "$REPO" "$RUN_URL" event "$HEAL_PRS"
+
   scheduled-sweep:
     name: Periodic sweep for stale needs-external-review labels
     # Catches the 👍-after-last-push case (#197). Only fires on
@@ -943,6 +1006,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Re-evaluate gate per PR
+        id: sweep
         if: steps.find.outputs.prs != ''
         env:
           # PAT-driven label removal (#315/#324). See
@@ -968,6 +1032,8 @@ jobs:
           source scripts/lib/gh-retry-helpers.sh
           had_infra_error=0
           failing_prs=""
+          # #2193: heal candidates — see the evaluate-and-clear job above.
+          heal_prs=""
           while IFS= read -r PR; do
             [ -z "$PR" ] && continue
             echo "::group::Sweep PR #$PR"
@@ -993,6 +1059,13 @@ jobs:
             fi
             if [ "$HAS_LABEL" != "true" ]; then
               echo "Label needs-external-review not present (stale search-index hit); nothing to clear."
+              # #2193: the index lags a removal for hours (#827), which is
+              # exactly the window in which a stale failed check-run from the
+              # pre-removal outage needs superseding (for example after a
+              # human removal, whose `unlabeled` event the event-driven job
+              # skips). The heal step reads two endpoints and posts only when
+              # the newest run on the head is a failure.
+              heal_prs="$heal_prs $PR"
               echo "::endgroup::"
               continue
             fi
@@ -1229,6 +1302,8 @@ jobs:
                 del_status=$(printf '%s\n' "$del_out" | awk 'NR==1{print $2; exit}')
                 still_present=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json labels --jq 'any(.labels[]?; .name == "needs-external-review")' || echo "unknown")
                 if [ "$still_present" = "false" ]; then
+                  # #2193: confirmed absent after a clean pass — heal candidate.
+                  heal_prs="$heal_prs $PR"
                   # Comment ONLY if THIS sweep performed the removal (#827).
                   case "$del_status" in
                     200|204)
@@ -1280,6 +1355,16 @@ jobs:
           echo "HAD_INFRA_ERROR=$had_infra_error" >> "$GITHUB_ENV"
           # shellcheck disable=SC2086  # intentional word-splitting to trim
           echo "HAD_INFRA_ERROR_PRS=$(echo $failing_prs)" >> "$GITHUB_ENV"
+          # #2193: deduplicated heal candidates minus this pass's infra failures.
+          heal_out=""
+          for heal_pr in $heal_prs; do
+            case " $failing_prs $heal_out " in
+              *" $heal_pr "*) ;;
+              *) heal_out="$heal_out $heal_pr" ;;
+            esac
+          done
+          # shellcheck disable=SC2086  # intentional word-splitting to trim
+          echo "heal_prs=$(echo $heal_out)" >> "$GITHUB_OUTPUT"
           exit "$had_infra_error"
 
       - name: Find open approved PRs for the continuation backstop
@@ -1451,3 +1536,22 @@ jobs:
               || echo "::warning::Failed to post check-run for PR #$PR (annotation lost; workflow log still surfaces the failure)."
             echo "::endgroup::"
           done
+
+      - name: Heal stale auto-clear infra-failure check-runs (sweep)
+        # #2193: mirrors the evaluate-and-clear job's heal step; see its
+        # comments. Last in the job for the same reason.
+        if: ${{ !cancelled() && steps.sweep.outputs.heal_prs != '' }}
+        env:
+          # Check-runs can only be created by a GitHub App: GITHUB_TOKEN with
+          # `checks: write`, never a PAT.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEAL_PRS: ${{ steps.sweep.outputs.heal_prs }}
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/workflow/heal-auto-clear-infra-check.sh ]; then
+            echo "::notice::Auto-clear heal helper is not on the trusted default branch yet; skipping this first-rollout sweep."
+            exit 0
+          fi
+          bash scripts/workflow/heal-auto-clear-infra-check.sh "$REPO" "$RUN_URL" sweep "$HEAL_PRS"

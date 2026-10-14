@@ -379,21 +379,50 @@ detect_prompt_design() {
 }
 
 detect_cross_cutting_refactor() {
-  # Heuristic: count distinct top-level dirs in the changed-files list.
-  # If ≥3 distinct dirs OR diff includes BOTH src/types/ AND src/services/
-  # (or analogous layer pair), match.
-  local distinct_top_dirs has_types has_services
+  # Heuristic: count distinct top-level IMPLEMENTATION dirs in the
+  # changed-files list. If >=3 distinct implementation dirs OR the diff
+  # includes BOTH src/types/ AND src/services/ (or an analogous layer
+  # pair), match.
+  local distinct_impl_dirs has_types has_services
   # Count distinct top-level DIRECTORIES, not filenames. A path with no
   # `/` is a root-level file; collapse all such files to a single
   # sentinel ("<root>") so a docs-only PR touching N root files counts
   # as 1 distinct entry, not N. Codex P2 + CR Minor on PR #190 caught
   # the prior `awk -F/ '{print $1}'` over-counting root files as dirs,
   # which spuriously triggered cross-cutting on docs-only PRs.
-  distinct_top_dirs=$(echo "$FILE_PATHS" | awk -F/ 'NF>1 {print $1; next} {print "<root>"}' | sort -u | wc -l | tr -d ' ')
+  #
+  # Then drop the entries that are not implementation (#2166). The companion
+  # dirs that ride along with ANY change -- tests/, test/, docs/, specs/ --
+  # and the companion ROOT files (docs, licences, dotfiles, manifests and
+  # config) say nothing about how many callers a contract has: a cohesive
+  # one-script fix here routinely lands as scripts/ + tests/ + a root
+  # manifest, which the raw distinct-dir count read as a cross-cutting
+  # refactor and sent to a Phase 4b round it did not need. Only the dirs that
+  # carry implementation count toward the >=3 bar.
+  #
+  # A root-level file is excluded by WHAT it is, not by where it sits (Codex
+  # P2 x2 on #2175): a consumer may keep an implementation entrypoint at the
+  # root -- main.go, app.py, server.js -- and a refactor touching it plus two
+  # implementation dirs spans three implementation areas. Such a file still
+  # counts, as the single <root> area. Manifests and build files are
+  # companions by NAME as well as by suffix: go.mod beside cmd/ and internal/
+  # is a dependency bump riding along, not a third implementation area.
+  distinct_impl_dirs=$(echo "$FILE_PATHS" \
+    | awk -F/ '
+        NF > 1 { print $1; next }
+        $0 ~ /^\./ { next }
+        $0 ~ /\.(md|markdown|mdx|txt|rst|adoc)$/ { next }
+        $0 ~ /^(LICENSE|LICENCE|COPYING|NOTICE|CHANGELOG|AUTHORS|CODEOWNERS|CONTRIBUTORS)(\..*)?$/ { next }
+        $0 ~ /\.(ya?ml|json|jsonc|toml|lock|cfg|ini|conf|properties|gradle|gradle\.kts|sum|mod)$/ { next }
+        $0 ~ /^(go\.work|Gemfile|Rakefile|Podfile|Cartfile|Brewfile|Pipfile|Procfile|pom\.xml|setup\.py|MANIFEST\.in|Makefile|GNUmakefile|makefile|Dockerfile|Containerfile|Vagrantfile|Justfile|justfile|Taskfile|BUILD|BUILD\.bazel|WORKSPACE|WORKSPACE\.bazel|MODULE\.bazel|CMakeLists\.txt|meson\.build|flake\.nix|default\.nix|shell\.nix|Package\.swift|Package\.resolved|build\.sbt|mix\.exs|project\.clj|build\.zig|build\.zig\.zon|DESCRIPTION|NAMESPACE)$/ { next }
+        $0 ~ /\.(gemspec|cabal|nimble|csproj|fsproj|vbproj|sln|props|targets)$/ { next }
+        { print "<root>" }' \
+    | grep -vxE 'tests?|docs|specs' \
+    | sort -u | wc -l | tr -d ' ')
   has_types=$(echo "$FILE_PATHS" | grep -cE '(^|/)types/' || true)
   has_services=$(echo "$FILE_PATHS" | grep -cE '(^|/)services/' || true)
-  if [ "$distinct_top_dirs" -ge 3 ]; then
-    printf 'cross-cutting refactor (changes span %s distinct top-level dirs)' "$distinct_top_dirs"
+  if [ "$distinct_impl_dirs" -ge 3 ]; then
+    printf 'cross-cutting refactor (changes span %s distinct top-level implementation dirs)' "$distinct_impl_dirs"
     return 0
   fi
   if [ "$has_types" -gt 0 ] && [ "$has_services" -gt 0 ]; then

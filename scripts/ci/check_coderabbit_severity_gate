@@ -91,7 +91,7 @@ if [ -f "$WORKFLOW" ]; then
     END {exit (found ? 0 : 1)}
   ' "$WORKFLOW"; then
     echo "FAIL: $WORKFLOW schedule: block missing a 'cron:' entry."
-    echo "      The schedule trigger needs a cron expression (e.g. '*/15 * * * *')."
+    echo "      The schedule trigger needs a cron expression (e.g. '*/30 * * * *')."
     FAILED=1
   fi
 fi

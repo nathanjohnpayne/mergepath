@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # coderabbit-should-invoke.sh — decide whether Phase 2.5 (CodeRabbit) runs
-# for a given PR.
+# for a given PR, and whether the agent waits for it.
 #
 # SCOPE -- read this before assuming what the knob buys you (#1084 r1).
 #
-# This governs PHASE 2.5, the AGENT's wait-and-disposition phase. It does NOT
-# stop the CodeRabbit App from reviewing: the shipped `.coderabbit.yml` sets
+# This governs PHASE 2.5, the AGENT's disposition phase. It does NOT stop the
+# CodeRabbit App from reviewing: the shipped `.coderabbit.yml` sets
 # `auto_review.enabled: true`, so the App starts on PR open, before this script
 # ever runs. Skipping therefore:
 #
-#   * DOES save the agent the Phase 2.5 wait (bounded by
-#     `coderabbit.max_wait_seconds`, 1245s here).
+#   * DOES skip the agent's CodeRabbit disposition pass (and, where the wait
+#     is enabled, the Phase 2.5 wait bounded by `coderabbit.max_wait_seconds`,
+#     1245s here).
 #   * Does NOT reduce provider invocations, and so does NOT reduce rate-limit
 #     pressure. Reading this as a rate-limit remedy is reading it wrong.
 #   * Leaves findings the App posts later UNWATCHED. Those are still
@@ -24,6 +25,20 @@
 # gate is a clean no-op wherever `coderabbit.severity_gate.enabled` is false
 # (the default on every consumer).
 #
+# PHASE 2.5 IS NON-BLOCKING (#2166). The decision also carries `wait`: whether
+# the agent holds in Phase 2.5 for CodeRabbit's review of the current head
+# before moving to Phase 3. The default is NOT to wait there. The agent used
+# to hold every round's Codex request for up to `coderabbit.max_wait_seconds`
+# plus `post_clearance_max_wait_seconds`. The wait is MOVED, not removed:
+# the required `CodeRabbit unresolved blocking findings` check is
+# arrival-independent (green until CodeRabbit publishes a run on the head),
+# so whenever this script exits 0 the agent confirms CodeRabbit's arrival on
+# the MERGE head with `scripts/coderabbit-wait.sh` at the pre-merge step,
+# whatever `wait` says -- that closes the #136 pre-review merge race, and it
+# runs after CI, which outlasts CodeRabbit's p99, so it normally returns at
+# once. `coderabbit.wait_for_review: true` additionally restores the wait
+# before Phase 3 for a repo that wants it.
+#
 # The decision is deliberately a SCRIPT rather than agent judgement: "is this
 # PR complex enough for CodeRabbit" must be reproducible across sessions and
 # agents, and must be answerable the same way in CI as at the keyboard.
@@ -34,9 +49,14 @@
 #   scripts/coderabbit-should-invoke.sh <PR#> --json
 #
 # Exit codes:
-#   0 — INVOKE CodeRabbit for this PR
+#   0 — INVOKE CodeRabbit for this PR (disposition its findings; wait only
+#       when `wait` is true)
 #   1 — SKIP CodeRabbit for this PR
 #   3 — bad arguments
+#
+# Output: one text line `[coderabbit-should-invoke] <decision> — <reason>
+# (wait_for_review: <true|false>)`, or with --json an object carrying
+# `decision`, `reason`, `invoke_mode`, `coderabbit_enabled` and `wait`.
 #
 # There is deliberately no config-error exit. An unreadable config, an
 # unparseable knob, or a classifier that fails all resolve to INVOKE, because
@@ -53,6 +73,21 @@
 #   coderabbit.invoke absent         -> `always`, preserving the pre-#1084
 #                                       behaviour for a repo that has not
 #                                       adopted the knob.
+#   coderabbit.wait_for_review: true -> `wait: true` (block in Phase 2.5 for
+#                                       the current head's review, the
+#                                       pre-#2166 behaviour)
+#   coderabbit.wait_for_review absent / false
+#                                    -> `wait: false` (proceed to Phase 3;
+#                                       the required severity gate enforces)
+#   coderabbit.wait_for_review other / ambiguous
+#                                    -> `wait: true`, with a warning: an
+#                                       unclear instruction about the wait
+#                                       falls back to the older, slower
+#                                       behaviour, never to a faster one.
+#   a policy DOCUMENT the decider cannot trust (ambiguous, invalid YAML,
+#   several documents, no parser, unrecognized enabled/invoke)
+#                                    -> invoke with `wait: true`, whatever
+#                                       wait_for_review reads.
 #
 # Bash 3.2 portable.
 
@@ -94,7 +129,9 @@ while [ "$#" -gt 0 ]; do
       fi
       REPO="$2"; shift 2 ;;
     --json) JSON=true; shift ;;
-    --help|-h) sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # The whole leading comment block, up to the first code line, so --help
+    # cannot be truncated by a header that grows (Codex P2 on #2175).
+    --help|-h) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"; exit 0 ;;
     -*) echo "Error: unknown flag '$1'" >&2; exit 3 ;;
     *) if [ -z "$PR_NUM" ]; then PR_NUM="$1"; else echo "Error: unexpected argument '$1'" >&2; exit 3; fi; shift ;;
   esac
@@ -347,13 +384,47 @@ emit() {  # <decision> <reason>
     # where a machine reader most needs a parseable answer (#1084 r2).
     jq -n --arg pr "$PR_NUM" --arg d "$decision" --arg r "$reason" \
           --arg m "${INVOKE_MODE:-}" --arg e "${CR_ENABLED:-}" \
+          --argjson w "${WAIT_FOR_REVIEW:-true}" \
       '{pr_number: ($pr|tonumber), decision: $d, reason: $r,
-        invoke_mode: $m, coderabbit_enabled: $e}'
+        invoke_mode: $m, coderabbit_enabled: $e, wait: $w}'
   else
-    echo "[coderabbit-should-invoke] $decision — $reason"
+    echo "[coderabbit-should-invoke] $decision — $reason (wait_for_review: ${WAIT_FOR_REVIEW:-true})"
   fi
   exit "$code"
 }
+
+# Resolve `wait` (#2166) before any decision path can emit. Read through the
+# same strict field reader as the other two keys so a duplicate or malformed
+# key is seen. Only the exact literal `false` (the default) means no wait;
+# `true`, an unrecognized value, or an ambiguous read all mean wait, because
+# an unclear instruction about the wait must fall back to the slower, older
+# behaviour and never to a faster one. The ambiguity markers that describe the
+# whole FILE (tabs, non-literal keys, a non-mapping block) are handled below
+# on the enabled/invoke read and resolve the DECISION to invoke; here they
+# only ever make `wait` true.
+# A policy the decider cannot trust as a whole is ambiguous about the wait too,
+# even when the wait_for_review line itself reads cleanly (Codex P2 on #2175):
+# every invoke that is FORCED by the document -- ambiguity, an unparseable or
+# multi-document file, a missing parser, an unrecognized enabled/invoke value
+# -- reports wait:true, the slower pre-#2166 behaviour. Classifier failures are
+# about the diff, not the policy, and keep the value read.
+emit_policy_failsafe() {  # <reason>
+  WAIT_FOR_REVIEW=true
+  emit invoke "$1"
+}
+
+WAIT_FOR_REVIEW=false
+_wait_raw=$(coderabbit_field wait_for_review)
+case "$_wait_raw" in
+  ""|false) WAIT_FOR_REVIEW=false ;;
+  true) WAIT_FOR_REVIEW=true ;;
+  *"<<ambiguous:"*)
+    echo "[coderabbit-should-invoke] WARN: ambiguous coderabbit.wait_for_review read ('${_wait_raw}'); waiting (the pre-#2166 behaviour)" >&2
+    WAIT_FOR_REVIEW=true ;;
+  *)
+    echo "[coderabbit-should-invoke] WARN: unrecognized coderabbit.wait_for_review='${_wait_raw}'; waiting (the pre-#2166 behaviour)" >&2
+    WAIT_FOR_REVIEW=true ;;
+esac
 
 # Read BOTH fields before acting on either. Honouring `enabled: false` first
 # let one well-formed field mask the other field's ambiguity: a policy with
@@ -375,7 +446,7 @@ case "${CR_ENABLED}${INVOKE_MODE}" in
     # r13, same class as the r11 diagnosis split).
     case "$CR_ENABLED" in *"<<ambiguous:"*) AMB=$CR_ENABLED ;; *) AMB=$INVOKE_MODE ;; esac
     AMB=${AMB#*<<ambiguous:}; AMB=${AMB%%>>*}
-    emit invoke "ambiguous coderabbit policy block ($AMB)"
+    emit_policy_failsafe "ambiguous coderabbit policy block ($AMB)"
     ;;
 esac
 
@@ -412,7 +483,7 @@ if ! command -v "$YQ_BIN" >/dev/null 2>&1 \
   bash "$SCRIPT_DIR/lib/ensure-yq.sh" --ci-only >/dev/null 2>&1 || true
 fi
 if [ -f "$CONFIG" ] && ! command -v "$YQ_BIN" >/dev/null 2>&1; then
-  emit invoke "YAML parser unavailable — policy cannot safely suppress review"
+  emit_policy_failsafe "YAML parser unavailable — policy cannot safely suppress review"
 fi
 if [ -f "$CONFIG" ]; then
   # Validate and count the stream in one parse. Plain `yq .` accepts a
@@ -422,10 +493,10 @@ if [ -f "$CONFIG" ]; then
   DOC_COUNT=$("$YQ_BIN" eval-all -o=json \
     '[.] as $item ireduce ([]; . + $item) | length' "$CONFIG" 2>/dev/null)
   if [ $? -ne 0 ]; then
-    emit invoke "policy file is not valid YAML (rejected by yq); ambiguity resolves toward invoking"
+    emit_policy_failsafe "policy file is not valid YAML (rejected by yq); ambiguity resolves toward invoking"
   fi
   if [ "$DOC_COUNT" != "1" ]; then
-    emit invoke "policy file must contain exactly one YAML document; ambiguity resolves toward invoking"
+    emit_policy_failsafe "policy file must contain exactly one YAML document; ambiguity resolves toward invoking"
   fi
   # NOTE: yq rules on VALIDITY ONLY. An earlier revision also re-read the two
   # fields through yq, to honour a consistently indented root mapping the
@@ -453,7 +524,7 @@ case "$CR_ENABLED" in
   ""|true|false) ;;
   *)
     echo "[coderabbit-should-invoke] WARN: unrecognized coderabbit.enabled='$CR_ENABLED'; treating policy as unsafe" >&2
-    emit invoke "unrecognized coderabbit.enabled='$CR_ENABLED' — policy cannot safely suppress review"
+    emit_policy_failsafe "unrecognized coderabbit.enabled='$CR_ENABLED' — policy cannot safely suppress review"
     ;;
 esac
 
@@ -473,7 +544,7 @@ case "$INVOKE_MODE" in
     # Unrecognized value: invoke, and say so loudly. Silently treating an
     # unknown mode as `never` would suppress a reviewer on a typo.
     echo "[coderabbit-should-invoke] WARN: unrecognized coderabbit.invoke='$INVOKE_MODE'; treating as 'always'" >&2
-    emit invoke "unrecognized coderabbit.invoke='$INVOKE_MODE' (defaulted to always)"
+    emit_policy_failsafe "unrecognized coderabbit.invoke='$INVOKE_MODE' (defaulted to always)"
     ;;
 esac
 

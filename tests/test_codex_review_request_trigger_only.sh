@@ -104,10 +104,13 @@ t=${CODEX_TEST_HEAD_DATE:-2026-06-04T00:00:00Z}
 old='2026-06-03T00:00:00Z'
 [ "${1:-}" = "api" ] || { echo "unexpected gh command: $*" >&2; exit 99; }
 shift
-[ "${1:-}" = "--paginate" ] && shift
+paginated=0
+[ "${1:-}" = "--paginate" ] && { paginated=1; shift; }
+# The #2166 check-runs read is `gh api -X GET <endpoint> -f check_name=... -F per_page=100`.
+[ "${1:-}" = "-X" ] && shift 2
 endpoint=${1:-}
 case "$endpoint" in
-  repos/owner/repo/pulls/999)            jq -cn --arg h "$head_sha" '{head:{sha:$h},base:{ref:"main",sha:"base-sha",repo:{default_branch:"main"}}}' ;;
+  repos/owner/repo/pulls/999)            jq -cn --arg h "$head_sha" '{head:{sha:$h,ref:"feature"},base:{ref:"main",sha:"base-sha",repo:{default_branch:"main"}}}' ;;
   'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha')
     printf '1\n' >>"$CODEX_TEST_STATE_DIR/base-policy-read-count"
     if [ "${CODEX_TEST_BASE_POLICY_MODE:-ok}" = fail ]; then
@@ -116,6 +119,65 @@ case "$endpoint" in
     fi
     cat "$CODEX_TEST_STATE_DIR/base-review-policy.yml"
     ;;
+  repos/owner/repo/actions/runs)
+    # #2166 moving-head guard, default signal: a repo-lint workflow RUN for the
+    # head SHA. Default is the ordinary production shape (a completed run) so
+    # the guard passes on every pre-existing case through its intended branch.
+    case "${CODEX_TEST_LINT_RUNS:-completed}" in
+      unreadable) echo 'simulated actions/runs read failure' >&2; exit 1 ;;
+      garbage)    printf 'not json\n' ;;
+      missing|noworkflow|wfunreadable)
+                  printf '{"total_count":0,"workflow_runs":[]}\n' ;;
+      # Another workflow's run on the head is not repo-lint.
+      otherworkflow) printf '{"total_count":1,"workflow_runs":[{"id":3,"name":"CodeQL","path":".github/workflows/codeql.yml","head_branch":"feature","status":"completed"}]}\n' ;;
+      # The same SHA ran repo-lint on ANOTHER branch only: not this PR's push.
+      otherbranch)  printf '{"total_count":1,"workflow_runs":[{"id":5,"name":"repo-lint","path":".github/workflows/repo_lint.yml","head_branch":"other","status":"completed"}]}\n' ;;
+      # Matched by canonical path even when the display name differs.
+      bypath)     printf '{"total_count":1,"workflow_runs":[{"id":4,"name":"renamed lint","path":".github/workflows/repo_lint.yml","head_branch":"feature","status":"queued"}]}\n' ;;
+      # Push-dispatch anchor (Codex P2 x2 on #2175): an old run of the SAME SHA
+      # on another branch (OTHER), plus two dispatches on the PR branch
+      # (STARTED, and a later push of the same SHA, LATER). The anchor is the
+      # LATEST dispatch on the PR branch.
+      dispatched) jq -cn --arg o "${CODEX_TEST_CHECK_OTHER:-$(jq -rn 'now - 10800 | floor | todate')}" \
+                    --arg a "${CODEX_TEST_CHECK_STARTED:?}" --arg b "${CODEX_TEST_CHECK_RERUN:-$CODEX_TEST_CHECK_STARTED}" \
+                    '{total_count:3,workflow_runs:[
+                      {id:6,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"other",status:"completed",created_at:$o},
+                      {id:8,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"feature",status:"completed",created_at:$a},
+                      {id:9,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"feature",status:"completed",created_at:$b}]}' ;;
+      *)          jq -cn --arg st "${CODEX_TEST_LINT_RUNS:-completed}" '{total_count:1,workflow_runs:[{id:2,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"feature",status:$st}]}' ;;
+    esac ;;
+  repos/owner/repo/actions/workflows)
+    case "${CODEX_TEST_LINT_RUNS:-completed}" in
+      wfunreadable) echo 'simulated actions/workflows read failure' >&2; exit 1 ;;
+      noworkflow)   printf '{"total_count":1,"workflows":[{"id":30,"name":"CodeQL","path":".github/workflows/codeql.yml"}]}\n' ;;
+      *)            printf '{"total_count":2,"workflows":[{"id":30,"name":"CodeQL","path":".github/workflows/codeql.yml"},{"id":31,"name":"repo-lint","path":".github/workflows/repo_lint.yml"}]}\n' ;;
+    esac ;;
+  repos/owner/repo/commits/*/check-suites)
+    # Suite 100 is the PR branch (head.ref "feature"); suite 200 another branch.
+    printf '{"total_count":2,"check_suites":[{"id":100,"head_branch":"feature"},{"id":200,"head_branch":"other"}]}\n' ;;
+  repos/owner/repo/commits/*/check-runs)
+    # The codex.request_requires_check OVERRIDE path (exact check-run name).
+    # Runs carry check_suite.id 100 (the PR branch) unless the shape says not.
+    case "${CODEX_TEST_CHECK_RUNS:-completed}" in
+      unreadable) echo 'simulated check-runs read failure' >&2; exit 1 ;;
+      missing)    printf '{"total_count":0,"check_runs":[]}\n' ;;
+      othername)  printf '{"total_count":1,"check_runs":[{"id":1,"name":"not-lint","status":"completed","check_suite":{"id":100}}]}\n' ;;
+      # The deep `lint` job alone must not satisfy an exact `lint-fast`.
+      deeplint)   printf '{"total_count":1,"check_runs":[{"id":1,"name":"lint","status":"queued","check_suite":{"id":100}}]}\n' ;;
+      # #2173 shards lint-fast into a matrix: lint-fast (1)..(4).
+      sharded)    printf '{"total_count":4,"check_runs":[{"id":11,"name":"lint-fast (1)","status":"queued","check_suite":{"id":100}},{"id":12,"name":"lint-fast (2)","status":"queued","check_suite":{"id":100}},{"id":13,"name":"lint-fast (3)","status":"queued","check_suite":{"id":100}},{"id":14,"name":"lint-fast (4)","status":"queued","check_suite":{"id":100}}]}\n' ;;
+      # An old exact-name run from the SHA's earlier use on ANOTHER branch.
+      othersuite) printf '{"total_count":1,"check_runs":[{"id":21,"name":"lint-fast","status":"completed","started_at":"2026-01-01T00:00:00Z","check_suite":{"id":200}}]}\n' ;;
+      # Codex P1 on #2175: the matching run is on PAGE 2, behind a full page of
+      # other runs. Emitted only when the caller paginates, the way gh does.
+      paged)      jq -cn '{total_count:101,check_runs:[range(100) | {id:(500 + .),name:"other-\(.)",status:"completed",check_suite:{id:100}}]}'
+                  # if/fi, not `&&`: a false test must not become the stub's exit
+                  # status, or an unpaginated caller reads "unreadable" and the
+                  # guard's fail-open masks the missing page.
+                  if [ "$paginated" = 1 ]; then printf '{"total_count":101,"check_runs":[{"id":700,"name":"lint-fast","status":"queued","check_suite":{"id":100}}]}\n'; fi ;;
+      garbage)    printf 'not json\n' ;;
+      *)          jq -cn --arg st "${CODEX_TEST_CHECK_RUNS:-completed}" '{total_count:1,check_runs:[{id:1,name:"lint-fast",status:$st,check_suite:{id:100}}]}' ;;
+    esac ;;
   repos/owner/repo/commits/*)     printf '%s\n' "$t" ;;
   repos/owner/repo/issues/999/timeline)  printf '[]\n' ;;
   repos/owner/repo/pulls/999/reviews)
@@ -174,6 +236,35 @@ run_trigger_only() {
 
 trig_count() { if [ -f "$1/state/trigger-count" ]; then cat "$1/state/trigger-count"; else printf '0\n'; fi; }
 jqf() { jq -r "$2" "$1/out.json"; }
+
+# #2166 moving-head guard runner. Same shape as run_trigger_only, plus the
+# guard inputs: CODEX_TEST_HEAD_DATE (the head's pushed-at anchor in these
+# stubs), the repo-lint workflow-run shape (4th argument, CODEX_TEST_LINT_RUNS),
+# CODEX_TEST_CHECK_RUNS from the caller's env (the override path), and any
+# extra script flags.
+run_guard() {
+  local dir=$1 scenario=$2 head_date=$3 lint_runs=$4 auto=$5; shift 5
+  local rc=0
+  (
+    cd "$dir"
+    PATH="$dir/bin:$PATH" \
+      GH_TOKEN=test-token \
+      CODEX_TEST_STATE_DIR="$dir/state" \
+      CODEX_TEST_SCENARIO="$scenario" \
+      CODEX_TEST_HEAD_DATE="$head_date" \
+      CODEX_TEST_LINT_RUNS="$lint_runs" \
+      CODEX_TEST_CHECK_RUNS="${CODEX_TEST_CHECK_RUNS:-completed}" \
+      MERGEPATH_CODEX_AUTO_TRIGGER="$auto" \
+      ./scripts/codex-review-request.sh "$@" 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log"
+  ) || rc=$?
+  printf '%s\n' "$rc"
+}
+# A head pushed one minute ago (under the 300s default) and one pushed an hour
+# ago (over it). Computed with jq so the suite stays portable across BSD and
+# GNU date on every consumer.
+YOUNG_HEAD=$(jq -rn 'now - 60 | floor | todate')
+OLD_HEAD=$(jq -rn 'now - 3600 | floor | todate')
 
 # #1276: losing the shared selector cannot turn a known trigger into a new POST.
 dir=$(make_case missing-selector)
@@ -1156,6 +1247,296 @@ for scenario in reply-only body-P1 body-P2; do
   fi
 done
 
+# --- #2166: the moving-head guard ------------------------------------------
+# A Codex request goes out once per batch, on a head that is final for the
+# round. The requester enforces two proxies before a NEW trigger write and
+# refuses with exit 8 (no write) unless the caller allows a moving head.
+
+# MH1: a head pushed 60s ago is under the 300s default → exit 8, no post
+test_guard_refuses_young_head() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-young")
+  rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" completed "" --trigger-only)
+  [ "$rc" = "8" ] || fail "MH1: expected exit 8, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "0" ] || fail "MH1: expected 0 posts on a young head, got $(trig_count "$dir")"
+  [ "$(jqf "$dir" '.trigger_posted')" = "false" ] || fail "MH1: trigger_posted must be false"
+  [ "$(jqf "$dir" '.moving_head.reasons | join(",")')" = "head-age" ] || fail "MH1: reasons=$(jqf "$dir" '.moving_head.reasons'), expected [head-age]"
+  [ "$(jqf "$dir" '.moving_head.min_age_seconds')" = "300" ] || fail "MH1: min_age_seconds=$(jqf "$dir" '.moving_head.min_age_seconds'), expected the 300 default"
+  jq -e '.moving_head.age_seconds | type == "number" and . < 300' "$dir/out.json" >/dev/null || fail "MH1: age_seconds should be a number under 300: $(jqf "$dir" '.moving_head.age_seconds')"
+  [ "$(jqf "$dir" '.moving_head.check_status')" = "completed" ] || fail "MH1: check_status=$(jqf "$dir" '.moving_head.check_status'), expected completed"
+  [ "$(jqf "$dir" '.moving_head.check_kind')/$(jqf "$dir" '.moving_head.check_name')" = "workflow/repo-lint" ] || fail "MH1: signal=$(jqf "$dir" '.moving_head.check_kind')/$(jqf "$dir" '.moving_head.check_name'), expected workflow/repo-lint by default"
+  grep -q 'refusing to post' "$dir/err.log" || fail "MH1: refusal not logged"
+  [ "$FAIL" -ne "$before" ] || pass "MH1: a head younger than request_min_head_age_seconds is refused with exit 8 and no post"
+}
+
+# MH2: same young head, --allow-moving-head → warns and posts once
+test_guard_allow_flag_posts_with_warning() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-allow")
+  rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" completed "" --trigger-only --allow-moving-head)
+  [ "$rc" = "0" ] || fail "MH2: expected exit 0, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "1" ] || fail "MH2: expected 1 post with --allow-moving-head, got $(trig_count "$dir")"
+  grep -q 'WARNING: head does not look final' "$dir/err.log" || fail "MH2: the allow path must still warn"
+  [ "$FAIL" -ne "$before" ] || pass "MH2: --allow-moving-head downgrades the refusal to a warning and posts"
+}
+
+# MH3: old head, the repo has a repo-lint workflow, but no run of it exists for
+# the head yet → exit 8 (check-missing)
+test_guard_refuses_unscheduled_check() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-nolint")
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" missing "" --trigger-only)
+  [ "$rc" = "8" ] || fail "MH3: expected exit 8, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "0" ] || fail "MH3: expected 0 posts, got $(trig_count "$dir")"
+  [ "$(jqf "$dir" '.moving_head.reasons | join(",")')" = "check-missing" ] || fail "MH3: reasons=$(jqf "$dir" '.moving_head.reasons'), expected [check-missing]"
+  [ "$(jqf "$dir" '.moving_head.check_name')" = "repo-lint" ] || fail "MH3: check_name=$(jqf "$dir" '.moving_head.check_name'), expected the repo-lint workflow default"
+  [ "$(jqf "$dir" '.moving_head.check_status')" = "missing" ] || fail "MH3: check_status=$(jqf "$dir" '.moving_head.check_status'), expected missing"
+  # Another workflow's run on the head is not repo-lint: the client-side
+  # filter must not accept it.
+  dir=$(make_case "guard-otherworkflow")
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" otherworkflow "" --trigger-only)
+  [ "$rc" = "8" ] && [ "$(trig_count "$dir")" = "0" ] || fail "MH3b: another workflow's run must not satisfy the repo-lint signal (rc=$rc posts=$(trig_count "$dir"))"
+  # Under the exact-name OVERRIDE, a run under another name is not this check.
+  dir=$(make_case "guard-override-deeplint")
+  printf '  request_requires_check: lint-fast\n' >>"$dir/.github/review-policy.yml"
+  rc=$(CODEX_TEST_CHECK_RUNS=deeplint run_guard "$dir" fresh "$OLD_HEAD" completed "" --trigger-only)
+  [ "$rc" = "8" ] && [ "$(trig_count "$dir")" = "0" ] && [ "$(jqf "$dir" '.moving_head.check_kind')" = "check" ] \
+    || fail "MH3c: under request_requires_check: lint-fast, a check-run named lint must not satisfy it (rc=$rc posts=$(trig_count "$dir"))"
+  [ "$FAIL" -ne "$before" ] || pass "MH3: an old head with no repo-lint run yet is refused with exit 8 (check-missing)"
+}
+
+# MH4: both signals at once are reported together
+test_guard_reports_both_reasons() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-both")
+  rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" missing "" --trigger-only)
+  [ "$rc" = "8" ] || fail "MH4: expected exit 8, got $rc"
+  [ "$(jqf "$dir" '.moving_head.reasons | join(",")')" = "head-age,check-missing" ] || fail "MH4: reasons=$(jqf "$dir" '.moving_head.reasons'), expected both"
+  [ "$FAIL" -ne "$before" ] || pass "MH4: a young head with no scheduled check reports both reasons"
+}
+
+# MH5: a queued run counts as scheduled (the Actions backlog is not the signal);
+# an old head with one posts.
+test_guard_accepts_queued_check() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-queued")
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" queued "" --trigger-only)
+  [ "$rc" = "0" ] || fail "MH5: expected exit 0, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "1" ] || fail "MH5: expected 1 post, got $(trig_count "$dir")"
+  grep -q "'repo-lint' is queued on HEAD" "$dir/err.log" || fail "MH5: queued status not logged"
+  [ "$FAIL" -ne "$before" ] || pass "MH5: a queued repo-lint run satisfies the CI-pickup signal"
+}
+
+# MH6: an unreadable check-runs read fails OPEN with a distinct log line (this
+# is a cycle-time guard, not a merge gate); the age signal still decides.
+test_guard_unreadable_check_runs_fails_open() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-unreadable")
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" unreadable "" --trigger-only)
+  [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "1" ] || fail "MH6: unreadable check-runs must not refuse (rc=$rc posts=$(trig_count "$dir"))"
+  grep -q 'unreadable; not enforced' "$dir/err.log" || fail "MH6: fail-open must be logged distinctly"
+  dir=$(make_case "guard-garbage")
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" garbage "" --trigger-only)
+  [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "1" ] || fail "MH6b: a non-JSON check-runs body must not refuse (rc=$rc posts=$(trig_count "$dir"))"
+  # ...but an unreadable check read never masks a young head.
+  dir=$(make_case "guard-unreadable-young")
+  rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" unreadable "" --trigger-only)
+  [ "$rc" = "8" ] && [ "$(trig_count "$dir")" = "0" ] || fail "MH6c: a young head is refused even when check-runs are unreadable (rc=$rc posts=$(trig_count "$dir"))"
+  [ "$(jqf "$dir" '.moving_head.check_status')" = "unreadable" ] || fail "MH6c: check_status should report unreadable"
+  [ "$FAIL" -ne "$before" ] || pass "MH6: an unreadable CI-pickup read fails open and is logged; it never masks the age signal"
+}
+
+# MH7: the policy knobs disable each signal: age 0 and an empty check name
+test_guard_policy_knobs_disable_signals() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-knobs-off")
+  printf '  request_min_head_age_seconds: 0\n  request_requires_check: ""\n' >>"$dir/.github/review-policy.yml"
+  rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" missing "" --trigger-only)
+  [ "$rc" = "0" ] || fail "MH7: expected exit 0 with both knobs off, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "1" ] || fail "MH7: expected 1 post, got $(trig_count "$dir")"
+  grep -q 'moving-head guard' "$dir/err.log" && fail "MH7: no guard signal should be evaluated with both knobs off"
+  # A raised age floor is honoured: an hour-old head is young under 7200s.
+  dir=$(make_case "guard-knob-age")
+  printf '  request_min_head_age_seconds: 7200\n' >>"$dir/.github/review-policy.yml"
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" completed "" --trigger-only)
+  [ "$rc" = "8" ] && [ "$(jqf "$dir" '.moving_head.min_age_seconds')" = "7200" ] || fail "MH7b: a configured age floor must be enforced (rc=$rc)"
+  # A renamed check is looked up by its configured name.
+  dir=$(make_case "guard-knob-name")
+  printf '  request_requires_check: not-lint\n' >>"$dir/.github/review-policy.yml"
+  # The repo-lint run is MISSING here: the override replaces the workflow
+  # signal rather than adding to it.
+  rc=$(CODEX_TEST_CHECK_RUNS=othername run_guard "$dir" fresh "$OLD_HEAD" missing "" --trigger-only)
+  [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "1" ] || fail "MH7c: a configured check name must be the one looked up, replacing the repo-lint signal (rc=$rc posts=$(trig_count "$dir"))"
+  # A malformed age floor is a config error, not a silent default.
+  dir=$(make_case "guard-knob-bad")
+  printf '  request_min_head_age_seconds: soon\n' >>"$dir/.github/review-policy.yml"
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" completed "" --trigger-only)
+  [ "$rc" = "3" ] && [ "$(trig_count "$dir")" = "0" ] || fail "MH7d: a non-integer age floor must exit 3 before any write (rc=$rc)"
+  [ "$FAIL" -ne "$before" ] || pass "MH7: request_min_head_age_seconds / request_requires_check are honoured, and 0 / empty disable each signal"
+}
+
+# MH8: an automatic caller (CI failover on a provider event) is exempt. It
+# fires on CodeRabbit's rate limit, not on a push the agent is amending, and a
+# refusal would strand the head with no caller left to re-request.
+test_guard_exempts_automatic_caller() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-auto")
+  rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" missing true --trigger-only)
+  [ "$rc" = "0" ] || fail "MH8: expected exit 0 for an automatic caller, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "1" ] || fail "MH8: expected 1 post, got $(trig_count "$dir")"
+  grep -q 'WARNING: head does not look final' "$dir/err.log" || fail "MH8: the exemption must still warn"
+  [ "$FAIL" -ne "$before" ] || pass "MH8: MERGEPATH_CODEX_AUTO_TRIGGER exempts the automatic caller (warns, posts)"
+}
+
+# MH9: the guard protects a NEW write only. A head Codex already cleared, or
+# one that already carries a fresh author trigger, posts nothing and is never
+# refused -- the dedup/idempotency contract is untouched.
+test_guard_does_not_run_on_no_write_paths() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-dup")
+  rc=$(run_guard "$dir" dup_author "$YOUNG_HEAD" missing "" --trigger-only)
+  [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "0" ] || fail "MH9: an existing trigger on a young head must still be the idempotent skip (rc=$rc posts=$(trig_count "$dir"))"
+  [ "$(jqf "$dir" '.trigger_posted')" = "false" ] || fail "MH9: trigger_posted must be false on the dedup path"
+  grep -q 'moving-head guard' "$dir/err.log" && fail "MH9: the guard must not be evaluated on the dedup path"
+  [ "$FAIL" -ne "$before" ] || pass "MH9: dedup and clearance paths never reach the guard"
+}
+
+# MH10: the guard also covers the full (polling) mode, which the agent runs in
+# Phase 4a -- not only --trigger-only.
+test_guard_applies_in_polling_mode() {
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-poll")
+  rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" completed "")
+  [ "$rc" = "8" ] || fail "MH10: expected exit 8 in polling mode, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "0" ] || fail "MH10: expected 0 posts, got $(trig_count "$dir")"
+  [ "$FAIL" -ne "$before" ] || pass "MH10: the guard refuses in polling mode too"
+}
+
+# MH11 (Codex P2 x2 on #2175): the age signal is anchored on the CURRENT PUSH,
+# not only on the commit: the latest repo-lint dispatch for the head on the
+# PR's branch. Runs of the same SHA on another branch, and earlier pushes of
+# it to this branch, must not make the head look settled.
+test_guard_anchors_on_push_dispatch() {
+  local dir rc before=$FAIL
+  # (a) Old commit; the SHA ran repo-lint on another branch 3h ago; this
+  # branch dispatched it a minute ago. Anchor = the minute-old dispatch.
+  dir=$(make_case "guard-dispatch-recent")
+  rc=$(CODEX_TEST_CHECK_STARTED="$YOUNG_HEAD" run_guard "$dir" fresh "$OLD_HEAD" dispatched "" --trigger-only)
+  [ "$rc" = "8" ] || fail "MH11a: an old commit pushed a minute ago must be refused (exit 8) despite an old run on another branch, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "0" ] || fail "MH11a: expected 0 posts, got $(trig_count "$dir")"
+  [ "$(jqf "$dir" '.moving_head.reasons | join(",")')" = "head-age" ] || fail "MH11a: reasons=$(jqf "$dir" '.moving_head.reasons'), expected [head-age]"
+  [ "$(jqf "$dir" '.moving_head.head_pushed_at')" = "$YOUNG_HEAD" ] || fail "MH11a: anchor=$(jqf "$dir" '.moving_head.head_pushed_at'), expected the PR-branch dispatch $YOUNG_HEAD (not the other-branch run, not the commit date)"
+  grep -q 'source: latest .repo-lint. dispatch for HEAD on the PR branch' "$dir/err.log" || fail "MH11a: the push-dispatch anchor source must be logged"
+  # (b) The same SHA was pushed to this branch 2h ago and again a minute ago:
+  # the latest dispatch is the current push.
+  dir=$(make_case "guard-dispatch-repush")
+  rc=$(CODEX_TEST_CHECK_STARTED="$(jq -rn 'now - 7200 | floor | todate')" CODEX_TEST_CHECK_RERUN="$YOUNG_HEAD" \
+    run_guard "$dir" fresh "$OLD_HEAD" dispatched "" --trigger-only)
+  [ "$rc" = "8" ] && [ "$(jqf "$dir" '.moving_head.head_pushed_at')" = "$YOUNG_HEAD" ] \
+    || fail "MH11b: a re-push of the same SHA must be dated by its own dispatch (rc=$rc anchor=$(jqf "$dir" '.moving_head.head_pushed_at'))"
+  # (c) A dispatch OLDER than the commit date never makes a head look older:
+  # the later of the two governs.
+  dir=$(make_case "guard-dispatch-older")
+  rc=$(CODEX_TEST_CHECK_STARTED="$(jq -rn 'now - 7200 | floor | todate')" \
+    run_guard "$dir" fresh "$YOUNG_HEAD" dispatched "" --trigger-only)
+  [ "$rc" = "8" ] && [ "$(jqf "$dir" '.moving_head.head_pushed_at')" = "$YOUNG_HEAD" ] \
+    || fail "MH11c: an older dispatch must not override a younger commit anchor (rc=$rc anchor=$(jqf "$dir" '.moving_head.head_pushed_at'))"
+  # (d) Old commit, old dispatch on this branch: a settled head posts.
+  dir=$(make_case "guard-dispatch-settled")
+  rc=$(CODEX_TEST_CHECK_STARTED="$OLD_HEAD" run_guard "$dir" fresh "$OLD_HEAD" dispatched "" --trigger-only)
+  [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "1" ] || fail "MH11d: a settled head must post (rc=$rc posts=$(trig_count "$dir"))"
+  [ "$FAIL" -ne "$before" ] || pass "MH11: the age signal is anchored on the latest repo-lint dispatch for the head on the PR branch, not only the commit date"
+}
+
+# MH12 (Codex P2 on #2175): the policy is read from the SCRIPT's checkout.
+# Launched from a subdirectory, or by absolute path from another directory,
+# a cwd-relative read found no policy and silently restored
+# request_by_default: true. Under-threshold (not gated) + false => exit 5.
+test_policy_resolved_from_script_checkout() {
+  local dir rc before=$FAIL
+  dir=$(make_case "policy-subdir")
+  printf '  request_by_default: false\n' >>"$dir/.github/review-policy.yml"
+  rc=0
+  ( cd "$dir/scripts" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
+      CODEX_TEST_SCENARIO=fresh ./codex-review-request.sh --trigger-only 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
+  [ "$rc" = "5" ] && [ "$(trig_count "$dir")" = "0" ] \
+    || fail "MH12: run from scripts/, request_by_default: false must skip with exit 5 (rc=$rc posts=$(trig_count "$dir")); err=$(cat "$dir/err.log")"
+  dir=$(make_case "policy-foreign-cwd")
+  printf '  request_by_default: false\n' >>"$dir/.github/review-policy.yml"
+  rc=0
+  ( cd "$WORKDIR" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
+      CODEX_TEST_SCENARIO=fresh "$dir/scripts/codex-review-request.sh" --trigger-only 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
+  [ "$rc" = "5" ] && [ "$(trig_count "$dir")" = "0" ] \
+    || fail "MH12b: by absolute path from a foreign cwd, request_by_default: false must skip with exit 5 (rc=$rc posts=$(trig_count "$dir"))"
+  [ "$FAIL" -ne "$before" ] || pass "MH12: the requester reads the policy from its own checkout, not the caller cwd"
+}
+
+# MH13: the CI-pickup signal is the repo-lint WORKFLOW RUN, which survives job
+# renames and sharding; a repo without the workflow is not refused forever.
+test_guard_workflow_signal_shapes() {
+  local dir rc before=$FAIL
+  # (a) #2173 shards lint-fast into lint-fast (1)..(4). An exact check-name
+  # match on `lint-fast` would refuse every request; the run signal does not
+  # look at job names.
+  dir=$(make_case "guard-sharded")
+  rc=$(CODEX_TEST_CHECK_RUNS=sharded run_guard "$dir" fresh "$OLD_HEAD" queued "" --trigger-only)
+  [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "1" ] || fail "MH13a: sharded lint-fast (1..4) check names must not refuse while a repo-lint run exists (rc=$rc posts=$(trig_count "$dir")); err=$(cat "$dir/err.log")"
+  # (b) The run exists (queued) but no job has been created yet: no check-run
+  # of any name. Picked up is picked up.
+  dir=$(make_case "guard-nojobs")
+  rc=$(CODEX_TEST_CHECK_RUNS=missing run_guard "$dir" fresh "$OLD_HEAD" queued "" --trigger-only)
+  [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "1" ] || fail "MH13b: a repo-lint run with no jobs yet must satisfy the signal (rc=$rc posts=$(trig_count "$dir"))"
+  # (c) The repository has no repo-lint workflow at all: warn and proceed,
+  # never exit 8 on this signal.
+  dir=$(make_case "guard-noworkflow")
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" noworkflow "" --trigger-only)
+  [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "1" ] || fail "MH13c: a repo with no repo-lint workflow must not be refused (rc=$rc posts=$(trig_count "$dir")); err=$(cat "$dir/err.log")"
+  grep -q "WARNING: moving-head guard: this repository has no 'repo-lint' workflow" "$dir/err.log" || fail "MH13c: the missing workflow must be warned about"
+  # ...and the age signal still applies there.
+  dir=$(make_case "guard-noworkflow-young")
+  rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" noworkflow "" --trigger-only)
+  [ "$rc" = "8" ] && [ "$(jqf "$dir" '.moving_head.reasons | join(",")')" = "head-age" ] && [ "$(jqf "$dir" '.moving_head.check_status')" = "no-workflow" ] \
+    || fail "MH13d: with no repo-lint workflow, a young head is still refused on age alone (rc=$rc reasons=$(jqf "$dir" '.moving_head.reasons'))"
+  # (e) An unreadable workflows list fails open, like every other read here.
+  dir=$(make_case "guard-wfunreadable")
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" wfunreadable "" --trigger-only)
+  [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "1" ] || fail "MH13e: an unreadable workflows list must not refuse (rc=$rc posts=$(trig_count "$dir"))"
+  # (f) Matched by canonical path when the display name differs.
+  dir=$(make_case "guard-bypath")
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" bypath "" --trigger-only)
+  [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "1" ] || fail "MH13f: a run of .github/workflows/repo_lint.yml must count whatever its display name (rc=$rc posts=$(trig_count "$dir"))"
+  # (g) A repo-lint run of the same SHA on ANOTHER branch only is not this
+  # PR's push being picked up.
+  dir=$(make_case "guard-otherbranch")
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" otherbranch "" --trigger-only)
+  [ "$rc" = "8" ] && [ "$(jqf "$dir" '.moving_head.check_status')" = "missing" ] \
+    || fail "MH13g: a repo-lint run on another branch only must read as not picked up (rc=$rc status=$(jqf "$dir" '.moving_head.check_status'))"
+  [ "$FAIL" -ne "$before" ] || pass "MH13: repo-lint run signal survives sharded/absent job names, and a repo without the workflow warns instead of refusing"
+}
+
+# MH14 (Codex P1 + P2 on #2175): the exact-name OVERRIDE reads every page of
+# check runs, and only runs from the PR branch's check suites count.
+test_guard_override_paginates_and_scopes() {
+  local dir rc before=$FAIL
+  # (a) The matching run is on page 2 behind 100 other runs: found.
+  dir=$(make_case "guard-override-paged")
+  printf '  request_requires_check: lint-fast\n' >>"$dir/.github/review-policy.yml"
+  rc=$(CODEX_TEST_CHECK_RUNS=paged run_guard "$dir" fresh "$OLD_HEAD" missing "" --trigger-only)
+  [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "1" ] || fail "MH14a: a matching check run on page 2 must be found (rc=$rc posts=$(trig_count "$dir")); err=$(cat "$dir/err.log")"
+  [ "$(jqf "$dir" '.moving_head // "none"')" = "none" ] && grep -q "'lint-fast' is queued on HEAD" "$dir/err.log" \
+    || fail "MH14a: the page-2 run must be READ (queued), not fail open as unreadable"
+  # (b) The only exact-name run belongs to another branch's suite: the SHA was
+  # checked before, but CI has not scheduled THIS push.
+  dir=$(make_case "guard-override-othersuite")
+  printf '  request_requires_check: lint-fast\n' >>"$dir/.github/review-policy.yml"
+  rc=$(CODEX_TEST_CHECK_RUNS=othersuite run_guard "$dir" fresh "$OLD_HEAD" completed "" --trigger-only)
+  [ "$rc" = "8" ] && [ "$(trig_count "$dir")" = "0" ] && [ "$(jqf "$dir" '.moving_head.check_status')" = "missing" ] \
+    || fail "MH14b: an exact-name run from another branch's check suite must not satisfy the override (rc=$rc status=$(jqf "$dir" '.moving_head.check_status'))"
+  [ "$FAIL" -ne "$before" ] || pass "MH14: the check-run override paginates and counts only the PR branch's check suites"
+}
+
 test_fresh_posts_once_no_poll
 test_dup_author_skips
 test_uppercase_author_command_skips
@@ -1192,6 +1573,20 @@ test_wiring_manual_caller_ignores_gate
 test_wiring_missing_gate_fails_open
 test_feedback_accounting_blocks_trigger
 test_workflow_declares_auto_trigger_flag
+test_guard_refuses_young_head
+test_guard_allow_flag_posts_with_warning
+test_guard_refuses_unscheduled_check
+test_guard_reports_both_reasons
+test_guard_accepts_queued_check
+test_guard_unreadable_check_runs_fails_open
+test_guard_policy_knobs_disable_signals
+test_guard_exempts_automatic_caller
+test_guard_does_not_run_on_no_write_paths
+test_guard_applies_in_polling_mode
+test_guard_anchors_on_push_dispatch
+test_policy_resolved_from_script_checkout
+test_guard_workflow_signal_shapes
+test_guard_override_paginates_and_scopes
 
 echo "----"
 echo "test_codex_review_request_trigger_only: $PASS passed, $FAIL failed"

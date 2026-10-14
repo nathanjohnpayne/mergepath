@@ -1,0 +1,11 @@
+{
+  "body": "Tighten the request helper and cover it; manifest entry for the new test.",
+  "files": [
+    {"filename": "scripts/example-helper.sh", "patch": "@@ -10,3 +10,4 @@\n   local x=$1\n+  [ -n \"$x\" ] || return 1\n   printf '%s' \"$x\""},
+    {"filename": "scripts/lib/example-lib.sh", "patch": "@@ -1,2 +1,3 @@\n helper_a() { :; }\n+helper_b() { :; }"},
+    {"filename": "tests/test_example_helper.sh", "patch": "@@ -1,2 +1,3 @@\n #!/usr/bin/env bash\n+run_case empty-arg 1"},
+    {"filename": "docs/agents/example.md", "patch": "@@ -1,1 +1,2 @@\n # Example\n+The helper refuses an empty argument."},
+    {"filename": ".mergepath-sync.yml", "patch": "@@ -100,2 +100,4 @@\n   - path: tests/test_example.sh\n+  - path: tests/test_example_helper.sh\n+    type: canonical"},
+    {"filename": "README.md", "patch": "@@ -5,1 +5,2 @@\n Intro.\n+See scripts/example-helper.sh."}
+  ]
+}

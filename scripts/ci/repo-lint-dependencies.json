@@ -65,6 +65,7 @@
       "scripts/lib/gh-retry-helpers.sh",
       "scripts/lib/review-policy-scalar.sh",
       "scripts/workflow/approval-merge-continuation.sh",
+      "scripts/workflow/heal-auto-clear-infra-check.sh",
       "scripts/workflow/report-approval-continuation-failures.sh",
       "tests/test_approval_merge_continuation.sh"
     ],

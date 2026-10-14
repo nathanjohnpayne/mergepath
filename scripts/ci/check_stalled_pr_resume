@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# check_stalled_pr_resume
+#
+# Runs tests/test_stalled_pr_resume.sh — the hermetic regression suite for
+# the stalled pull-request finder (scripts/workflow/stalled-prs.sh) and the
+# resume entry point (scripts/workflow/resume-stalled-pr.sh), #2165. Both
+# scripts travel with the scripts/workflow/ kit and the suite is manifest-
+# delivered, so this wrapper runs on the hub and on every consumer. The
+# suite replays fixture snapshots and a PATH-shimmed `gh`: no token, no
+# network.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_stalled_pr_resume.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  echo "check_stalled_pr_resume: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "check_stalled_pr_resume: ERROR (jq is required — the wrapped suite cannot assert without it)" >&2
+  exit 1
+fi
+
+if [ "${MERGEPATH_CONSUMER_SAFETY:-0}" = "1" ]; then
+  bash -n "$REPO_ROOT/scripts/workflow/stalled-prs.sh"
+  bash -n "$REPO_ROOT/scripts/workflow/resume-stalled-pr.sh"
+  echo "check_stalled_pr_resume: PASS (consumer syntax smoke)"
+  exit 0
+fi
+
+bash "$TEST_SCRIPT"
+echo "check_stalled_pr_resume: PASS"

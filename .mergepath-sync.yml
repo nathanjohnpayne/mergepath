@@ -829,8 +829,20 @@ paths:
     consumers: all
     requires:
       - "scripts/repo-lint-latency-report.sh"
+      - "scripts/repo-lint-latency-issue.sh"      # alert → tracking-issue router (#2165)
       - "scripts/ci/check_repo_lint_latency_report"
       - ".github/workflows/repo-lint-latency.yml"
+  - path: tests/test_stalled_pr_resume.sh
+    # Hermetic suite for the stalled-PR finder + resume entry point (#2165).
+    # Both subjects live in the scripts/workflow/ kit; the helpers the suite
+    # copies into its fixture tree are declared so a partial kit cannot strand
+    # it.
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/"
+      - "scripts/ci/check_stalled_pr_resume"
+      - "scripts/lib/gh-api-array.sh"
   - path: tests/test_check_doc_ownership.sh
     type: canonical
     consumers: all
@@ -2098,6 +2110,9 @@ paths:
       - "scripts/lib/blocking-labels.sh"
       - "scripts/workflow/approval-merge-continuation.sh"
       - "scripts/workflow/report-approval-continuation-failures.sh"
+      # Both jobs' final step supersedes a stale failed
+      # auto-clear-blocking-labels check-run after a clean pass (#2193).
+      - "scripts/workflow/heal-auto-clear-infra-check.sh"
       # Both label-clearing loops run the Dependabot action-pin bump lane
       # helper from the default-branch checkout before the merge-gate
       # evaluation (#2164), after resolving the governing base policy with
@@ -2192,16 +2207,48 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/gh-retry-helpers.sh"
+  - path: scripts/workflow/heal-auto-clear-infra-check.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/gh-retry-helpers.sh"
   - path: .github/workflows/repo-lint-latency.yml
     type: canonical
     consumers: all
     requires:
       - "scripts/repo-lint-latency-report.sh"
+      - "scripts/repo-lint-latency-issue.sh"      # alert → tracking-issue router (#2165)
   - path: scripts/repo-lint-latency-report.sh
     type: canonical
     consumers: all
     requires:
       - "scripts/lib/gh-retry-helpers.sh"
+  - path: scripts/repo-lint-latency-issue.sh
+    # Routes the daily latency verdict to ONE marker-keyed tracking issue
+    # (open/refresh on alert, comment + close on recovery) — #2165. Needs
+    # only gh + jq; the workflow's GITHUB_TOKEN carries issues:write.
+    type: canonical
+    consumers: all
+  - path: scripts/workflow/stalled-prs.sh
+    # Read-only stalled-PR finder (#2165). In the scripts/workflow/ kit; the
+    # entry declares the fail-closed list reader it sources and the two
+    # scripts it delegates to.
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/required-head-checks.sh"        # which checks count as CI (not the review-policy gates)
+      - "scripts/codex-review-check.sh"          # merge-readiness delegate (gate), run only for stalled PRs
+  - path: scripts/workflow/resume-stalled-pr.sh
+    # Resume entry point for a scheduled routine (#2165): runs the finder and
+    # prints the work order. Read-only: the agent session performs every
+    # write, including the printed codex-review-request.sh call, which is
+    # declared because the work order directs the session to run it.
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/stalled-prs.sh"
+      - "scripts/codex-review-request.sh"
   - path: tests/test_marker_provenance.py
     type: canonical
     consumers: all
@@ -2287,6 +2334,10 @@ paths:
       # it gets no event-driven publishes at all (cross-agent round 3 on
       # #867). Forward edge of the same coupling PR 4 adds in reverse.
       - ".github/workflows/merge-clearance-gate.yml"
+      # The CI-side parent (#2167): repo-lint completion re-publishes a head's
+      # verdicts. Same orphaning failure as the gate parent if a scoped wave
+      # ships the publisher without it (Codex P2 on #2171).
+      - ".github/workflows/repo_lint.yml"
       - "scripts/merge-clearance-gate.sh"
       - "scripts/codex-p1-gate.sh"
       - "scripts/coderabbit-severity-gate.sh"
@@ -2466,6 +2517,7 @@ paths:
       - "tests/test_655_repo_lint_local_observed.sh"  # check_codex_scripts (#655)
       - "tests/test_approval_merge_continuation.sh"  # check_auto_clear_workflow (#1062)
       - "tests/test_repo_lint_latency_report.sh"  # check_repo_lint_latency_report (#1062)
+      - "tests/test_stalled_pr_resume.sh"         # check_stalled_pr_resume (#2165)
       - "tests/test_codex_record_feedback.sh"  # check_codex_scripts (#487)
       - "tests/test_codex_usage_limit_marker.sh"  # check_codex_scripts (#722)
       - "tests/test_coderabbit_record_feedback.sh"  # check_coderabbit_record_feedback (#584)
