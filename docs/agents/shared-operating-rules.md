@@ -156,6 +156,19 @@ Which issue to act on:
 
 The rollup is per-repo: the workflow runs in the repository it is installed in and opens its issues there. Cross-repo aggregation is an explicit non-goal; the per-repo design preserves operator focus on the repo whose context they are currently in.
 
+## End of session: no pull request left on an unanswered verdict
+
+Measured in the hub (nathanjohnpayne/mergepath#2165): across the fourteen most recently merged multi-commit pull requests, 57% of created-to-merged wall-clock was idle gaps of ninety minutes or more, and every gap between nine and thirteen and a half hours began with a reviewer verdict — a Codex or CodeRabbit review, or a reviewer-identity comment — that no session was alive to act on. The verdict was ready within minutes; the pull request then waited for someone to open a session. The review loop itself is fast when a session is driving it; the cost is the session ending with the ball in the agent's court.
+
+A session therefore does not end with a pull request in either of these states unless it has posted a handoff:
+
+- the pull request's newest event is a verdict — a bot review, a bot verdict comment, a reviewer-identity review or comment, or a human reply — with no push, reply or review request after it; or
+- the pull request's head is CI-green, approved and unmerged.
+
+Finish the round instead: fix or rebut the findings and push, request the next review, or run the pre-merge gates and merge, in the order `REVIEW_POLICY.md` § Workflow prescribes. When the round genuinely cannot be finished in the session — the fix needs a human decision, the external reviewer has not answered, or the session has hit a capability ceiling — post a pull-request comment that names the next action and the identity expected to take it, and carries the tag `[mergepath-handoff]` on its own line so tooling can recognize it. The Phase 4b handoff (the `## External Review Required` comment) and the local-agent handback (`<!-- mergepath-handback: … -->`) already count as handoffs; the `human-hold`, `needs-human-review` and `policy-violation` labels already count as a human stop.
+
+A pull request with no handoff is fair game for any later session, including a scheduled resume routine, to pick up and continue from its newest event; a pull request with a handoff is left to the identity the handoff names. A handoff stays in force for as long as its marker is on the pull request, whatever happens after it; no later push, review or comment clears it. The identity it names clears it when the round is taken back, by editing or deleting the handoff comment so it no longer carries the marker. This rule is about the state a session leaves behind, not about who caused the wait: a session that is waiting on CI or on a requested review may end, because a machine acts next; a session that is holding an answered-for verdict may not.
+
 ## Link the issue a pull request resolves
 
 When a pull request resolves an issue, its body names that issue with a closing keyword: `Closes #N` on its own line, one line per issue, or `Closes OWNER/REPO#N` for an issue in another repository (the same qualification applies to `Refs`). An issue number in the title, a `(#N)` suffix, or `Refs #N` mentions the issue without linking it. GitHub honors a closing keyword only when the pull request targets the repository's default branch; for a pull request into any other branch the keyword links nothing, so move the issue between lanes by hand.
