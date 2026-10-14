@@ -539,13 +539,33 @@ git -C "$GITREPO" config --unset branch.topic/z.pushRemote
 git -C "$GITREPO" remote set-url origin http://local_proxy@127.0.0.1:9/git/O/R
 new_case
 set +e
-RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --base main --title T --body-file "$VALID_BODY" >/dev/null 2>&1; rc=$?
+RUN_CWD="$GITREPO" CLAUDE_CODE_REMOTE=true as_author -- gh pr create --repo o/r --base main --title T --body-file "$VALID_BODY" >/dev/null 2>&1; rc=$?
 set -e
 create_input="$(jq -nc --arg body "$expected_body" '{title: "T", body: $body, head: "topic/z", base: "main", draft: false}')"
 if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/pulls\t--input\t'"$create_input"; then
-  pass "pr create: a proxy remote URL ending in --repo (any case) keeps the bare head"
+  pass "pr create in a Claude cloud session: the git proxy's loopback remote ending in --repo (any case) keeps the bare head"
 else
   fail "pr create proxy remote head: rc=$rc"; cat "$LOGF" >&2
+fi
+# Outside a Claude cloud session a loopback remote is just a local git
+# server: it says nothing about GitHub, so the head is not inferred from it.
+new_case
+set +e
+err="$(RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --base main --title T --body-file "$VALID_BODY" 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'has no push remote on GitHub' && log_lacks 'POST'; then
+  pass "pr create outside Claude cloud: a loopback remote is refused, not taken for GitHub"
+else
+  fail "pr create local loopback: rc=$rc err=$err"; cat "$LOGF" >&2
+fi
+new_case
+set +e
+err="$(RUN_CWD="$GITREPO" CLAUDE_CODE_REMOTE=true MERGEPATH_AGENT_SURFACE=codex-cloud as_author -- gh pr create --repo o/r --base main --title T --body-file "$VALID_BODY" 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'has no push remote on GitHub'; then
+  pass "pr create: the surface variable wins, so a Codex cloud surface does not accept a loopback remote"
+else
+  fail "pr create surface wins: rc=$rc err=$err"; cat "$LOGF" >&2
 fi
 git -C "$GITREPO" remote set-url origin https://gitlab.com/o/r.git
 new_case

@@ -681,10 +681,22 @@ gh_rest_post_comment() {
 
 # --- verbs --------------------------------------------------------------------------
 
+# gh_rest_on_claude_cloud: 0 iff this is a Claude cloud session, the surface
+# whose git proxy is the one loopback remote that stands for GitHub. The
+# surface variable wins when set, as it does for transport selection.
+gh_rest_on_claude_cloud() {
+  case "${MERGEPATH_AGENT_SURFACE:-}" in
+    claude-cloud) return 0 ;;
+    '') [ "${CLAUDE_CODE_REMOTE:-}" = "true" ] ;;
+    *) return 1 ;;
+  esac
+}
+
 # gh_rest_repo_of_url <remote URL> -> owner/repo, from the URL's last two path
-# segments, when the URL points at github.com or a loopback host (a Claude
-# cloud session's git proxy, whose path ends in the repository too). Any
-# other host fails: its owner/repo says nothing about a GitHub repository.
+# segments, when the URL points at github.com, or at a loopback host in a
+# Claude cloud session (its git proxy, whose path ends in the repository
+# too). Any other host fails, and so does loopback elsewhere: a local git
+# server's owner/repo says nothing about a GitHub repository.
 gh_rest_repo_of_url() {
   local url="$1" path host
   case "$url" in
@@ -698,7 +710,8 @@ gh_rest_repo_of_url() {
     *) host="${host%%:*}" ;;
   esac
   case "$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')" in
-    github.com|www.github.com|ssh.github.com|127.0.0.1|localhost|\[::1\]) ;;
+    github.com|www.github.com|ssh.github.com) ;;
+    127.0.0.1|localhost|\[::1\]) gh_rest_on_claude_cloud || return 1 ;;
     *) return 1 ;;
   esac
   path="${path%/}"
