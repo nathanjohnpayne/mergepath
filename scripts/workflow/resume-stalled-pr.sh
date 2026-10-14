@@ -7,32 +7,27 @@
 # review rounds outside working hours. It runs the read-only finder
 # (scripts/workflow/stalled-prs.sh), selects the stalled PR whose newest
 # event is oldest, and prints a WORK ORDER: the PR, its head, why it is
-# stalled, the next action, and the exact commands the review policy
-# prescribes for that action. The calling session then executes the round
-# per AGENTS.md § Workflow Summary.
+# stalled, the next action, a non-destructive checkout, and the exact
+# commands the review policy prescribes for that action. The calling agent
+# session then performs the round — every write included (a fix push, the
+# Codex request, thread resolution, the merge) — per AGENTS.md § Workflow
+# Summary, through the repository's identity-verified wrappers.
 #
-# The only action this script will perform itself is the mechanical,
-# idempotent, wrapper-verified one — posting `@codex review` through
-# scripts/codex-review-request.sh --trigger-only — and only under --execute.
-# Pushing a fix needs code; merging needs the accounting and thread gates and
-# the author identity; both stay with the agent session. This script never
-# merges.
+# Read-only. This script performs no GitHub write of any kind: it never
+# requests a review, comments, labels, pushes or merges. Keeping every write
+# in the session keeps each one behind the session's own fresh reads and the
+# wrappers' identity checks, instead of behind a snapshot taken minutes
+# earlier.
 #
 # Usage:
 #   scripts/workflow/resume-stalled-pr.sh [--repo owner/repo] [--threshold-minutes N]
-#                                         [--pr N] [--execute] [--json]
+#                                         [--pr N] [--json]
 #                                         [--input FILE] [--now ISO8601]
 #
 #   --repo               Repository to inspect (default: current repo).
 #   --threshold-minutes  Passed to the finder (default 60).
 #   --pr N               Resume this PR instead of the oldest stalled one. It
 #                        must still classify as stalled.
-#   --execute            Perform the `request codex` action when that is the
-#                        next action. Posts through the author wrapper, so it
-#                        needs the author credential the wrapper resolves
-#                        (OP_PREFLIGHT_AUTHOR_PAT from preflight, or the gh
-#                        keyring). Without --execute every action is printed,
-#                        none is performed.
 #   --json               Print the selected PR's finder record as JSON after
 #                        the work order (machine-readable handoff).
 #   --input FILE         Replay a finder snapshot instead of fetching one
@@ -40,43 +35,25 @@
 #   --now ISO8601        Passed to the finder (fixture runs).
 #
 # Exit codes:
-#   0  a stalled PR was selected and its work order printed (and, under
-#      --execute, the request step ran and exited 0)
-#   1  nothing is stalled — nothing to resume (also: under --execute, the
-#      selected PR's head moved after it was classified, so nothing was posted)
+#   0  a stalled PR was selected and its work order printed
+#   1  nothing is stalled — nothing to resume
 #   2  usage error
-#   3  the finder could not read the repository, or the --execute step hit an
-#      infrastructure error
-#   4  --execute: the Codex request was REFUSED BY POLICY, not by an outage —
-#      the requester exited 4 (polling mode only: no Codex answer within its
-#      timeout, the Phase 4b fallback), 5 (no request by policy: an under-threshold PR in a
-#      repo with codex.request_by_default false), 6 (feedback unaccounted) or
-#      7 (request budget exhausted). --execute flags the request
-#      Phase-4a-gated only for a PR labelled `needs-external-review`. The routing outcome is printed as a `next:` line and in the
-#      `--json` record (`execute.requester_exit`, `execute.cap_kind`,
-#      `execute.next_action`): `under-threshold path` (5),
-#      `disposition findings` (6), `phase 4b`
-#      (7 request-ceiling: run scripts/phase-4b-review.sh from a trusted main
-#      checkout) or `human tiebreaker` (7 blocking-reviews: escalate per
-#      REVIEW_POLICY.md § Disagreements). A routine must act on that line, not
-#      retry the request: the requester will keep refusing.
+#   3  the finder could not read the repository
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FINDER="$ROOT/scripts/workflow/stalled-prs.sh"
-REQUESTER="$ROOT/scripts/codex-review-request.sh"
 
 REPO=""
 THRESHOLD_MINUTES=60
 PICK_PR=""
-EXECUTE=0
 JSON_OUT=0
 INPUT_FILE=""
 NOW=""
 
 usage() {
-  echo "usage: resume-stalled-pr.sh [--repo owner/repo] [--threshold-minutes N] [--pr N] [--execute] [--json] [--input FILE] [--now ISO8601]" >&2
+  echo "usage: resume-stalled-pr.sh [--repo owner/repo] [--threshold-minutes N] [--pr N] [--json] [--input FILE] [--now ISO8601]" >&2
   exit 2
 }
 
@@ -85,7 +62,6 @@ while [ "$#" -gt 0 ]; do
     --repo) [ "$#" -ge 2 ] || usage; REPO="$2"; shift 2 ;;
     --threshold-minutes) [ "$#" -ge 2 ] || usage; THRESHOLD_MINUTES="$2"; shift 2 ;;
     --pr) [ "$#" -ge 2 ] || usage; PICK_PR="$2"; shift 2 ;;
-    --execute) EXECUTE=1; shift ;;
     --json) JSON_OUT=1; shift ;;
     --input) [ "$#" -ge 2 ] || usage; INPUT_FILE="$2"; shift 2 ;;
     --now) [ "$#" -ge 2 ] || usage; NOW="$2"; shift 2 ;;
@@ -97,16 +73,6 @@ done
 case "$PICK_PR" in ''|*[!0-9]*) [ -z "$PICK_PR" ] || usage ;; esac
 [ -x "$FINDER" ] || { echo "resume-stalled-pr: finder missing or not executable: $FINDER" >&2; exit 3; }
 command -v jq >/dev/null 2>&1 || { echo "resume-stalled-pr: jq is required" >&2; exit 3; }
-
-# Read credential, resolved HERE rather than inside the finder: a token the
-# finder exports lives only in its command-substitution child, and the
-# --execute step below reads the PR again from this process. Preflight cache
-# first (reviewer scope; read-only use), then whatever GH_TOKEN already holds.
-if [ -z "$INPUT_FILE" ] && [ -r "$ROOT/scripts/lib/preflight-helpers.sh" ]; then
-  # shellcheck source=../lib/preflight-helpers.sh
-  . "$ROOT/scripts/lib/preflight-helpers.sh"
-  preflight_require_token reviewer || true
-fi
 
 finder_args=(--json --threshold-minutes "$THRESHOLD_MINUTES")
 [ -z "$REPO" ] || finder_args+=(--repo "$REPO")
@@ -156,27 +122,25 @@ merge_gate_check=$(printf '%s' "$SELECTED" | jq -r '.merge_gate_check // "absent
 newest_line=$(printf '%s' "$SELECTED" | jq -r '.newest | .kind + " by " + .actor + " at " + .at + " (" + ((.age_seconds / 60) | floor | tostring) + "m ago)"')
 repo_slug=${REPO#*/}
 
-# Phase 4a scope is the repository's own triage verdict: agent-review.yml
-# labels a PR `needs-external-review` exactly when it meets the external review
-# threshold or a protected path. Only such a PR is flagged Phase-4a-gated; any
-# other PR is left to the requester's own entry decision
-# (codex.request_by_default), which may decline with exit 5.
+# The printed Codex request mirrors the policy exactly, so the session can run
+# it as shown. Phase 4a scope is the repository's own triage verdict:
+# agent-review.yml labels a PR `needs-external-review` exactly when it meets
+# the external review threshold or a protected path; only such a PR is flagged
+# Phase-4a-gated, and any other PR is left to the requester's own entry
+# decision (codex.request_by_default). A head nobody asked about gets a
+# trigger-only request (idempotent). A request that already outlived the
+# threshold unanswered would make trigger-only a no-op (it dedups on the
+# existing trigger), so that case prints the requester's polling mode, which
+# re-posts the unanswered request and waits up to codex.review_timeout_seconds.
 if printf '%s' "$SELECTED" | jq -e '.labels | index("needs-external-review")' >/dev/null; then
   gated=true
 else
   gated=""
 fi
-# A head nobody asked about gets a trigger-only request (idempotent). A request
-# that already outlived the threshold unanswered would make trigger-only a
-# no-op — it dedups on the existing trigger — so that case runs the requester's
-# polling mode, which re-posts an unanswered request and waits up to
-# codex.review_timeout_seconds for the answer.
 if [ "$reason" = "request-unanswered" ]; then
-  req_mode=()
   req_flag=""
   mode_note="polling mode: re-posts the unanswered request and waits for the answer"
 else
-  req_mode=(--trigger-only)
   req_flag="--trigger-only"
   mode_note="trigger-only, idempotent"
 fi
@@ -197,13 +161,18 @@ echo "Stalled:     $reason — newest event: $newest_line"
 echo "Next action: $next_action — $detail"
 echo
 echo "Checkout (hidden per-repo worktree folder, docs/agents/worktree-placement.md):"
-# Fork and contributor-owned PRs never classify as stalled (the finder routes
-# them to waiting-on-human), so the head branch is always on origin here. The
-# worktree branch is (re)set to the recorded head SHA: a stale local branch of
-# the same name would otherwise be checked out as-is, and the session would
-# edit the wrong revision. `-B` refuses if that branch is checked out elsewhere.
+# Non-destructive: a DETACHED worktree at the recorded head SHA. No local
+# branch is created, moved or reset, so unpublished commits on a local branch
+# of the same name are never orphaned; fixes go back with a plain (non-force)
+# push to the PR branch, which fails safely if the remote moved. Fork and
+# contributor-owned PRs never classify as stalled (the finder routes them to
+# waiting-on-human), so the head branch is always on origin here. Run the
+# policy commands below from that worktree: the delegates read the governing
+# policy of the repository they run in.
 echo "  git -C \$HOME/GitHub/${q_slug} fetch origin ${q_ref}"
-echo "  git -C \$HOME/GitHub/${q_slug} worktree add -B ${q_ref} ${q_wt} ${head_sha}"
+echo "  git -C \$HOME/GitHub/${q_slug} worktree add --detach ${q_wt} ${head_sha}"
+echo "  cd ${q_wt}"
+echo "  # push fixes with: git push origin HEAD:refs/heads/${q_ref}   (non-force; refuses if the remote moved)"
 echo
 
 case "$next_action" in
@@ -218,9 +187,19 @@ case "$next_action" in
     echo "       ${gated:+MERGEPATH_PHASE_4A_GATED=true }scripts/codex-review-request.sh --trigger-only $number $REPO"
     ;;
   "request codex")
-    echo "Round to run:"
+    echo "Round to run (the session posts this; it goes through the author wrapper):"
     echo "  $request_cmd"
-    echo "  ($mode_note; exit 6 means review feedback is unaccounted — disposition it first)"
+    echo "  ($mode_note)"
+    echo "  Requester exits that are routing outcomes, not failures — act on them, do not retry:"
+    if [ "$gated" = "true" ]; then
+      echo "    5  Codex is disabled here (codex.enabled false) and this PR is in Phase 4a scope: run Phase 4b"
+    else
+      echo "    5  no Codex request by policy (codex.request_by_default false): take the under-threshold approval-and-merge path"
+    fi
+    echo "    6  earlier review feedback is unaccounted: scripts/review-feedback-accounting.sh $number $REPO, disposition, rerun"
+    echo "    7  request budget spent: cap_exhausted.kind request-ceiling = run Phase 4b; blocking-reviews = human tiebreaker"
+    [ -n "$req_flag" ] || echo "    4  (polling mode) no answer within the review timeout: run Phase 4b"
+    echo "  Phase 4b: scripts/phase-4b-review.sh $number --repo $REPO, from a trusted main checkout"
     ;;
   merge)
     echo "Pre-merge sequence (AGENTS.md § Workflow Summary steps 6, 8 and 10) — every gate clean, then merge as the author:"
@@ -251,100 +230,4 @@ echo "[mergepath-handoff] that names the next action."
 if [ "$JSON_OUT" = "1" ]; then
   echo
   printf '%s' "$SELECTED" | jq '.'
-fi
-
-if [ "$EXECUTE" = "1" ]; then
-  if [ "$next_action" != "request codex" ]; then
-    echo
-    echo "resume-stalled-pr: --execute performs only 'request codex'; '$next_action' is left to the session." >&2
-    exit 0
-  fi
-  if [ -n "$INPUT_FILE" ]; then
-    echo
-    echo "resume-stalled-pr: --execute is refused on a replayed --input snapshot (no live head to request on)." >&2
-    exit 2
-  fi
-  [ -x "$REQUESTER" ] || { echo "resume-stalled-pr: requester missing or not executable: $REQUESTER" >&2; exit 3; }
-  # Head fence: the snapshot can be minutes old by now. If another session
-  # pushed in the meantime, the PR is no longer stalled on the head that was
-  # classified, and requesting a review there would spend a round on (and
-  # interfere with) a live session's work.
-  # The same re-read also revalidates the human stops: a human-hold /
-  # needs-human-review / policy-violation label, or a handoff comment, can
-  # arrive while collection and the per-PR gate calls run without moving the
-  # head, and the requester itself does not check them.
-  live_pr=$(gh api "repos/$REPO/pulls/$number" --jq '{head: .head.sha, labels: [.labels[].name]}' 2>/dev/null) || {
-    echo "resume-stalled-pr: could not re-read $REPO#$number; not requesting" >&2; exit 3; }
-  live_head=$(printf '%s' "$live_pr" | jq -r '.head')
-  if [ "$live_head" != "$head_sha" ]; then
-    echo "resume-stalled-pr: $REPO#$number moved from $head_sha to $live_head since it was classified; not stalled any more, nothing requested" >&2
-    exit 1
-  fi
-  live_stop=$(printf '%s' "$live_pr" | jq -r '[.labels[] | select(. == "human-hold" or . == "needs-human-review" or . == "policy-violation")] | join(", ")')
-  if [ -n "$live_stop" ]; then
-    echo "resume-stalled-pr: $REPO#$number now carries $live_stop; waiting on a human, nothing requested" >&2
-    exit 1
-  fi
-  classified_at=$(printf '%s' "$REPORT" | jq -r '.generated_at')
-  late_handoffs=$(gh api --paginate "repos/$REPO/issues/$number/comments?since=$classified_at&per_page=100" \
-      --jq '[.[] | select(((.user.type // "") != "Bot") and ((.user.login // "") | endswith("[bot]") | not))
-                 | select((.body // "") | test("\\[mergepath-handoff|<!-- mergepath-handback:|(?m)^#+[[:space:]]*External Review Required"; "i"))] | length' 2>/dev/null) || {
-    echo "resume-stalled-pr: could not re-read the comments on $REPO#$number; not requesting" >&2; exit 3; }
-  if [ "$(printf '%s\n' "$late_handoffs" | awk '{s += $1} END {print s + 0}')" -gt 0 ]; then
-    echo "resume-stalled-pr: a handoff was posted on $REPO#$number after it was classified; waiting on the named identity, nothing requested" >&2
-    exit 1
-  fi
-  echo
-  echo "resume-stalled-pr: posting the Codex request through the author wrapper ($mode_note)"
-  req_out=$(mktemp "${TMPDIR:-/tmp}/resume-stalled-pr-req.XXXXXX") || { echo "resume-stalled-pr: mktemp failed" >&2; exit 3; }
-  trap 'rm -f "$req_out"' EXIT
-  set +e
-  MERGEPATH_PHASE_4A_GATED="$gated" "$REQUESTER" ${req_mode[@]+"${req_mode[@]}"} "$number" "$REPO" > "$req_out"
-  rc=$?
-  set -e
-  cat "$req_out"
-  # The requester's policy refusals are routing outcomes, preserved as such:
-  # collapsing them into an infrastructure failure would leave a scheduled
-  # caller retrying a request the policy has already said to stop making.
-  cap_kind=$(jq -r '.cap_exhausted.kind // ""' "$req_out" 2>/dev/null || true)
-  case "$rc" in
-    0) exit_next="" ;;
-    4) exit_next="phase 4b" ;;   # polling mode: FALLBACK_REQUIRED, no Codex signal after the full wait
-    # Exit 5 has two causes. For a Phase-4a-gated PR (needs-external-review)
-    # the requester declines ONLY when codex.enabled is false, which routes
-    # the mandatory external review to Phase 4b; for any other PR it is the
-    # under-threshold path (request_by_default false, or Codex off on a PR
-    # that never needed external review).
-    5) if [ "$gated" = "true" ]; then exit_next="phase 4b"; else exit_next="under-threshold path"; fi ;;
-    6) exit_next="disposition findings" ;;
-    7)
-      case "$cap_kind" in
-        request-ceiling) exit_next="phase 4b" ;;
-        blocking-reviews) exit_next="human tiebreaker" ;;
-        *) exit_next="human tiebreaker" ;;  # unknown kind: the conservative route
-      esac ;;
-    *) echo "resume-stalled-pr: codex-review-request.sh exited $rc (infrastructure); nothing was decided" >&2; exit 3 ;;
-  esac
-  if [ -n "$exit_next" ]; then
-    case "$exit_next" in
-      "under-threshold path") how="the policy does not request Codex on this PR (codex.request_by_default false, not Phase-4a scope): take the under-threshold reviewer-identity approval and merge path, AGENTS.md § Workflow Summary step 7" ;;
-      "disposition findings") how="disposition every earlier finding (scripts/review-feedback-accounting.sh $number $REPO), then rerun" ;;
-      "phase 4b")
-        if [ "$rc" -eq 5 ]; then
-          how="Codex is disabled here (codex.enabled false) and this PR is in Phase 4a scope, so its external review runs as Phase 4b: run scripts/phase-4b-review.sh $number --repo $REPO from a trusted main checkout"
-        elif [ "$rc" -eq 4 ]; then
-          how="Codex did not answer within its review timeout (or is account-blocked): run scripts/phase-4b-review.sh $number --repo $REPO from a trusted main checkout"
-        else
-          how="the request ceiling is spent: run scripts/phase-4b-review.sh $number --repo $REPO from a trusted main checkout"
-        fi ;;
-      *) how="the blocking-review budget is spent: stop, post the escalation comment carrying [mergepath-handoff] per REVIEW_POLICY.md § Disagreements and Tiebreaking, and alert the human" ;;
-    esac
-    echo
-    echo "next: $exit_next — $how"
-    if [ "$JSON_OUT" = "1" ]; then
-      jq -n --argjson rc "$rc" --arg kind "$cap_kind" --arg next "$exit_next" --arg how "$how" \
-        '{execute: {requester_exit: $rc, cap_kind: (if $kind == "" then null else $kind end), next_action: $next, detail: $how}}'
-    fi
-    exit 4
-  fi
 fi

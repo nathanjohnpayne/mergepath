@@ -2132,9 +2132,10 @@ paths:
       - "scripts/required-head-checks.sh"        # which checks count as CI (not the review-policy gates)
       - "scripts/codex-review-check.sh"          # merge-readiness delegate (gate), run only for stalled PRs
   - path: scripts/workflow/resume-stalled-pr.sh
-    # Resume entry point for a scheduled routine (#2165): runs the finder,
-    # prints the work order, and under --execute posts ONLY the Codex request
-    # through codex-review-request.sh (author wrapper inside). Never merges.
+    # Resume entry point for a scheduled routine (#2165): runs the finder and
+    # prints the work order. Read-only: the agent session performs every
+    # write, including the printed codex-review-request.sh call, which is
+    # declared because the work order directs the session to run it.
     type: canonical
     consumers: all
     requires:

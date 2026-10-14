@@ -53,10 +53,17 @@
 #                    Codex's Review Summary reports the head Running), or the
 #                    newest event is bot activity that is not a verdict.
 #   waiting-on-human A human stop is in force: a `human-hold`,
-#                    `needs-human-review` or `policy-violation` label, or the
-#                    newest event is a posted handoff (a comment carrying
-#                    `[mergepath-handoff]`, `<!-- mergepath-handback:` or the
-#                    `## External Review Required` heading). Never picked up.
+#                    `needs-human-review` or `policy-violation` label, or ANY
+#                    comment, review body or inline comment on the PR that
+#                    currently carries a handoff marker (`[mergepath-handoff]`,
+#                    `<!-- mergepath-handback:` or the `## External Review
+#                    Required` heading) — by anyone, posted at any time. Never
+#                    picked up. Deliberately conservative: there is no timestamp
+#                    comparison, because every rule deciding whether a later
+#                    event supersedes a handoff has had an edge that resumed a
+#                    PR reserved for a human. A person clears it by removing the
+#                    label, or by editing or deleting the handoff comment so it
+#                    no longer carries the marker.
 #
 # Next action, reported for every PR (and the only automation hook):
 #
@@ -96,9 +103,8 @@
 #     Phase 4 and Phase 4b lanes), or that check does not exist in the repo
 #     and scripts/codex-review-check.sh exits 0. The merge itself is never
 #     performed here.
-#   - A posted handoff stays in force until an author-side event or a verdict
-#     lands after it; bot activity (a summary edit, an acknowledgement) does
-#     not clear it.
+#   - A handoff marker anywhere on the PR keeps it waiting-on-human for as
+#     long as the marker is there (see waiting-on-human above).
 #
 # Read-only. The only GitHub calls are paginated GETs (plus the read-only
 # required-head-checks resolution); the gate it delegates to is read-only too.
@@ -493,13 +499,12 @@ CLASSIFY_JQ='
          | select((actor_class($author)) != "bot" or ((.body | norm | gsub("[[:space:]]"; "")) != ""))
          | select(.commit_id == $head or ((.submitted_at | ts) >= $head_ts)) ]
        | max_by(.submitted_at | ts) | (.state // null)) as $latest_verdict_state
-    # A handoff stays in force until an author-side event or a verdict lands
-    # after it; bot activity after it (a summary edit, an acknowledgement)
-    # changes nothing about who is expected to act.
-    | ([ $events[] | select(.side == "handoff") ] | max_by(.at | ts)) as $last_handoff
-    | ($last_handoff != null
-       and ([ $events[] | select(.side == "author" or .side == "verdict")
-              | select((.at | ts) > ($last_handoff.at | ts)) ] | length) == 0) as $handoff_in_force
+    # A handoff is in force for as long as ANY comment, review body or inline
+    # comment on the PR carries a handoff marker — whoever wrote it, whenever
+    # it was posted or edited. No timestamp is compared: there is no later
+    # event that clears it, only a person removing the marker.
+    | (([ $pr.issue_comments[], $pr.reviews[], $pr.review_comments[] ]
+        | map(select(.body | is_handoff)) | length) > 0) as $handoff_in_force
     | ($pr.merge_gate_check // "absent") as $merge_gate_check
     | ($merge_gate_check == "success"
        or ($merge_gate_check == "absent" and $pr.gate != null and $pr.gate.exit == 0)) as $merge_ready
