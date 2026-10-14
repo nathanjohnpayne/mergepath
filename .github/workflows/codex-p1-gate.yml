@@ -33,12 +33,12 @@ run-name: >-
 #   - pull_request + pull_request_review + pull_request_review_comment
 #     for the event-driven path (push, review submit/edit/dismiss,
 #     inline comment activity).
-#   - schedule (every 15 minutes) as the safety net for the
+#   - schedule (every 30 minutes since #2167) as the safety net for the
 #     UI-resolve case, since no other event fires when a human
 #     clicks "Resolve conversation" on a thread. Same pattern as
 #     auto-clear-blocking-labels.yml § scheduled-sweep (#197).
 # The schedule job is read-only and idempotent (no-op when no open
-# PRs match), so the 15-min cadence is safe to run unconditionally
+# PRs match), so the 30-min cadence is safe to run unconditionally
 # across this repo.
 
 on:
@@ -60,10 +60,12 @@ on:
   # on a Codex P1 thread" case. The thread-resolution webhook fires
   # but does NOT trigger Actions workflows (no Actions event for it
   # per GitHub docs), so without the schedule the required check
-  # would stay red until the next push or manual rerun. 15-min
-  # cadence mirrors auto-clear-blocking-labels.yml § scheduled-sweep.
+  # would stay red until the next push or manual rerun. */30 since #2167
+  # (was */15): every tick walks every open PR against the shared 1,000/hr
+  # installation-token budget, and a UI-resolved thread now waits up to 30
+  # minutes on the native lineage. Pinned by check_required_check_publisher.
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/30 * * * *"
 
 permissions:
   actions: read
@@ -416,7 +418,7 @@ jobs:
             # default-branch events) this job's NATIVE check attaches to the
             # default branch, not the PR head, so a bare failure leaves the
             # older successful "Codex P1 unresolved threads" check authoritative
-            # on an unchanged PR head until the 15-minute sweep. Recover the PR
+            # on an unchanged PR head until the scheduled sweep. Recover the PR
             # head from the webhook payload — which is independent of the failed
             # job's outputs — and publish the PR-head failure ourselves, the same
             # always-run posture the relay uses for a missing handoff. Publishing
@@ -459,7 +461,7 @@ jobs:
             fi
             case "$recovered_head" in
               [0-9a-f]*)
-                summary="The reviewer-feedback archive job failed before it could bind this run to a PR head, so the feedback history for $recovered_head was never evaluated. Rerun the Codex P1 Gate workflow; the scheduled sweep also re-evaluates every 15 minutes."
+                summary="The reviewer-feedback archive job failed before it could bind this run to a PR head, so the feedback history for $recovered_head was never evaluated. Rerun the Codex P1 Gate workflow; the scheduled sweep also re-evaluates every 30 minutes."
                 gh api --method POST "repos/$REPO/check-runs" \
                   -f name="$CHECK_NAME" -f head_sha="$recovered_head" \
                   -f status=completed -f conclusion=failure \

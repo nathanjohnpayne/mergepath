@@ -43,6 +43,13 @@ case "$*" in
       printf '%s\n' in_progress
     fi
     ;;
+  *"/commits/"*"/check-runs"*" -f filter=latest "*)
+    # Bait for a reintroduced delayed-open fence (#2171): when
+    # GH_FIXTURE_NEWER_PASS is set, every filter=latest read reports a fresh
+    # completed publisher verdict on every context. The open path must ignore
+    # it and still open all three holds.
+    [ -z "${GH_FIXTURE_NEWER_PASS:-}" ] || printf '%s\n' "$GH_FIXTURE_NEWER_PASS"
+    ;;
   *"/commits/"*"/check-runs"*)
     case " $* " in
       *" -f filter=all "*) ;;
@@ -210,6 +217,16 @@ run_case delayed-runner-after-completion in_progress 1 parent-completed 1 0 0
 run_case completion-during-enumeration in_progress 1 complete-before-burst 4 0 1
 # Exhausted retries on one context still open its siblings and fail red.
 run_case partial-pending-write-failure requested 1 write-fails 8 5 0 1
+
+# #2171 (Codex round 5): no delayed-open fence. A newer completed publisher
+# verdict on the head does NOT let the open job skip its holds, because a
+# verdict's started_at is its POST time, not when it read PR state. With the
+# bait armed, both deliveries must still open all three holds exactly as
+# without it; a reintroduced timestamp fence would read the bait and skip.
+GH_FIXTURE_NEWER_PASS=301; export GH_FIXTURE_NEWER_PASS
+run_case newer-verdict-does-not-skip-requested requested 1 empty 6 3 0
+run_case newer-verdict-does-not-skip-in-progress in_progress 1 empty 7 3 1
+unset GH_FIXTURE_NEWER_PASS
 
 if [ "$fail" -ne 0 ]; then
   echo "$fail failed, $pass passed"
