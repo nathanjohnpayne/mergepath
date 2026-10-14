@@ -36,32 +36,65 @@ fail() {
 # reference checks below (#2176). A `#` opens a comment only outside quotes
 # and at the start of a word (line start, whitespace, or one of `;&|()`), so
 # `"#1234"`, `'#x'`, `$#`, `${#a[@]}` and `foo#bar` are kept. Heredoc bodies
-# are data and pass through unchanged, which keeps a reference rather than
-# dropping it; a `<<` inside `((`…`))` is an arithmetic shift, not a heredoc. The former `sed 's/[[:space:]]*#.*$//'` truncated every line
-# at its first `#`, quoted or not, so a description such as
-# "... (#1234) ... tests/test_x.sh" lost its reference and the completeness
-# check passed for the wrong reason (8 of 9 references in check_coderabbit_wait).
+# are data and pass through unchanged. A `<<` inside `((`…`))` is an
+# arithmetic shift, not a heredoc; the nesting carries across lines because
+# a wrapper with an unbalanced `((` fails to parse and reds lint anyway.
+# The former `sed 's/[[:space:]]*#.*$//'` truncated every line at its first
+# `#`, quoted or not, so a description such as "... (#1234) ...
+# tests/test_x.sh" lost its reference and the completeness check passed for
+# the wrong reason (8 of 9 references in check_coderabbit_wait).
+#
+# Rule for anything the scanner cannot classify: keep the text. Keeping too
+# much can only make the completeness check ask for a graph entry (loud);
+# dropping text would let it miss a reference (silent). So a heredoc opener
+# whose delimiter cannot be read keeps everything after it.
 strip_shell_comments() {
   python3 - "$1" <<'PY'
-import re, sys
-# `<<` not part of `<<<`, optional `-`, optional quoted delimiter word.
-HEREDOC = re.compile(r"(?<!<)<<(?!<)(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
-out, quote, pending = [], None, []
+import sys
+WORD_END = " \t;&|<>()"
+
+def read_delimiter(line, j):
+    """Shell word at line[j:], quotes and backslashes removed; None if empty."""
+    while j < len(line) and line[j] in " \t":
+        j += 1
+    word, quoted = [], None
+    while j < len(line):
+        c = line[j]
+        if quoted:
+            if c == quoted:
+                quoted = None
+            elif quoted == '"' and c == "\\" and j + 1 < len(line):
+                j += 1
+                word.append(line[j])
+            else:
+                word.append(c)
+        elif c in "'\"":
+            quoted = c
+        elif c == "\\" and j + 1 < len(line):
+            j += 1
+            word.append(line[j])
+        elif c in WORD_END:
+            break
+        else:
+            word.append(c)
+        j += 1
+    if quoted or not word:
+        return None
+    return "".join(word)
+
+UNREADABLE = object()  # sentinel delimiter: never matches, keeps the rest
+out, quote, pending, depth = [], None, [], 0
 for line in open(sys.argv[1], encoding="utf-8", errors="replace").read().split("\n"):
     if pending:  # inside a heredoc body: data, kept verbatim
         out.append(line)
         strip_tabs, delim = pending[0]
-        if (line.lstrip("\t") if strip_tabs else line) == delim:
+        if delim is not UNREADABLE and (line.lstrip("\t") if strip_tabs else line) == delim:
             pending.pop(0)
         continue
     end, i, prev = len(line), 0, "\n"
     opened_in_quote = quote is not None
     unquoted = [False] * len(line)  # True where the char is live shell syntax
-    # `((`…`))` nesting at each char, so `<<` inside `(( … ))` / `$(( … ))`
-    # is read as an arithmetic shift, not a heredoc opener. Tracked per
-    # line: an unbalanced `((` cannot suppress heredocs on later lines.
-    arith = [0] * len(line)
-    depth = 0
+    arith = [0] * len(line)         # `((`…`))` nesting at each char
     while i < len(line):
         c = line[i]
         if quote == "'":
@@ -100,9 +133,24 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace").read().split("
         i += 1
     out.append(line[:end].rstrip())
     if not opened_in_quote:
-        for m in HEREDOC.finditer(line[:end]):
-            if unquoted[m.start()] and unquoted[m.start() + 1] and not arith[m.start()]:
-                pending.append((m.group(1) == "-", m.group(3)))
+        k = 0
+        while k + 1 < end:
+            is_opener = (
+                line.startswith("<<", k)
+                and unquoted[k] and unquoted[k + 1] and not arith[k]
+                and (k == 0 or line[k - 1] != "<")           # not `<<<`
+                and not line.startswith("<<<", k)
+            )
+            if not is_opener:
+                k += 1
+                continue
+            j = k + 2
+            strip_tabs = j < len(line) and line[j] == "-"
+            if strip_tabs:
+                j += 1
+            delim = read_delimiter(line[:end], j)
+            pending.append((strip_tabs, UNREADABLE if delim is None else delim))
+            k = j
 print("\n".join(out))
 PY
 }
@@ -320,7 +368,8 @@ else
   # stripper is pinned on its own: every kept_* reference below sits in live
   # shell text (after a quoted `#`, `$#`, `${#…}`, a mid-word `#`, inside a
   # heredoc or a multi-line quote, after a `<<<` here-string or an
-  # arithmetic `<<` shift, which opens no heredoc) and must
+  # arithmetic `<<` shift on one line or continued, inside `<<\EOF` or
+  # `<<"END-1"` heredocs, after an unreadable `<<` opener) and must
   # survive; every dropped_* reference sits in a real comment and must not.
   strip_fixture="$SCOPE_FIXTURES/strip-fixture.sh"
   cat >"$strip_fixture" <<'FIXTURE'
@@ -340,9 +389,22 @@ x=$(( 1 << WIDTH )) tests/test_kept_arith.sh
 (( mask = value << WIDTH ))
 # after an arithmetic shift tests/test_dropped_after_arith.sh
 WIDTH
+(( mask = value
+   << WIDTH ))
+# after a continued shift tests/test_dropped_after_continued_arith.sh
+WIDTH
+cat <<\EOF
+# escaped-delimiter data tests/test_kept_escaped_heredoc.sh
+EOF
+cat <<"END-1"
+# quoted-delimiter data tests/test_kept_quoted_heredoc.sh
+END-1
+# after the heredocs tests/test_dropped_after_heredocs.sh
+odd <<
+# an unreadable opener keeps the rest tests/test_kept_after_unreadable.sh
 FIXTURE
   stripped_refs=$(strip_shell_comments "$strip_fixture" | grep -o 'tests/test_[a-z_]*\.sh' | LC_ALL=C sort -u | tr '\n' ' ')
-  expected_refs="tests/test_kept_after_multiline.sh tests/test_kept_arith.sh tests/test_kept_dollar.sh tests/test_kept_heredoc.sh tests/test_kept_herestring.sh tests/test_kept_midword.sh tests/test_kept_multiline.sh tests/test_kept_quoted.sh tests/test_kept_single.sh "
+  expected_refs="tests/test_kept_after_multiline.sh tests/test_kept_after_unreadable.sh tests/test_kept_arith.sh tests/test_kept_dollar.sh tests/test_kept_escaped_heredoc.sh tests/test_kept_heredoc.sh tests/test_kept_herestring.sh tests/test_kept_midword.sh tests/test_kept_multiline.sh tests/test_kept_quoted.sh tests/test_kept_quoted_heredoc.sh tests/test_kept_single.sh "
   if [ "$stripped_refs" = "$expected_refs" ]; then
     pass "the comment stripper keeps quoted, heredoc and mid-word hashes and drops only real comments"
   else
