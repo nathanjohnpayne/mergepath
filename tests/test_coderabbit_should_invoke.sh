@@ -221,6 +221,37 @@ wait_is "wait is reported on a skip decision as well"        "$ON"$'\n'"  invoke
 # under complex-changes still skips, and never on an ambiguous file invokes.
 case_is "wait_for_review: true does not turn a skip into an invoke" "$CX"$'\n'"  wait_for_review: true" 0 1
 
+# Codex P2 on #2175: a policy DOCUMENT the decider cannot trust forces invoke,
+# and it must force wait:true with it, even when `wait_for_review: false` reads
+# cleanly on its own line. Each shape below sets wait_for_review: false.
+failsafe_waits() {  # <name> <body> [yq-bin]
+  local name=$1 body=$2 yq=${3:-} dir out
+  dir=$(scratch "$body" 0)
+  if [ -n "$yq" ]; then
+    out=$( cd "$dir" && MERGEPATH_YQ_BIN="$yq" ./scripts/coderabbit-should-invoke.sh 99 --json 2>/dev/null )
+  else
+    out=$( cd "$dir" && ./scripts/coderabbit-should-invoke.sh 99 --json 2>/dev/null )
+  fi
+  if printf '%s' "$out" | jq -e '.decision == "invoke" and .wait == true' >/dev/null 2>&1; then
+    pass "$name: fail-safe invoke reports wait:true"
+  else
+    fail "$name: fail-safe invoke must report wait:true, got: $out"
+  fi
+}
+WF="  wait_for_review: false"
+REJECTING_YQ="$WORKDIR/yq-rejects"
+printf '#!/usr/bin/env bash\necho "Error: bad yaml" >&2\nexit 1\n' >"$REJECTING_YQ"; chmod +x "$REJECTING_YQ"
+TWO_DOC_YQ="$WORKDIR/yq-two-docs"
+printf '#!/usr/bin/env bash\nprintf "2\\n"\n' >"$TWO_DOC_YQ"; chmod +x "$TWO_DOC_YQ"
+failsafe_waits "parser rejects the document"     "$ON"$'\n'"  invoke: never"$'\n'"$WF" "$REJECTING_YQ"
+failsafe_waits "document stream is not one doc"  "$ON"$'\n'"  invoke: never"$'\n'"$WF" "$TWO_DOC_YQ"
+failsafe_waits "no YAML parser available"        "$ON"$'\n'"  invoke: never"$'\n'"$WF" "__absent_yq__"
+failsafe_waits "duplicate invoke keys"           "$ON"$'\n'"  invoke: never"$'\n'"  invoke: never"$'\n'"$WF"
+failsafe_waits "unrecognized enabled value"      "  enabled: maybe"$'\n'"  invoke: never"$'\n'"$WF"
+failsafe_waits "unrecognized invoke mode"        "$ON"$'\n'"  invoke: sometimes"$'\n'"$WF"
+# The control: a clean document keeps the value it reads.
+wait_is "a clean document keeps wait_for_review: false" "$ON"$'\n'"  invoke: always"$'\n'"$WF" false
+
 echo "--- #1084 r1: the classifier is a DISPOSITION function, not a detector ---"
 # With phase_4b_default: fallback-only the classifier short-circuits and exits 0
 # WITHOUT inspecting the diff. Reading that as "routine" would skip CodeRabbit on

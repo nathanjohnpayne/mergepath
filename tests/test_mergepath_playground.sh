@@ -574,4 +574,25 @@ for row, case in zip(rows, cases):
 print("OK: local simulator and public loader author-declaration corpus passed")
 PY
 
+# #2166 (Codex P2 on #2175): the Standard preset and the initial state generate
+# `codex.request_by_default: false`, matching mergepath's own policy, so a
+# policy copied from the normal preset does not re-enable under-threshold Codex
+# rounds. Strict keeps it on as an explicit opt-in; the checkbox starts
+# unchecked to agree with the state it renders.
+python3 - "$PAGE" <<'PY_RBD'
+import re, sys
+s = open(sys.argv[1]).read()
+def preset(name):
+    m = re.search(r"\b" + name + r":\s*\{[^}]*?codexRequestByDefault:\s*(true|false)", s)
+    assert m, "preset %s has no codexRequestByDefault" % name
+    return m.group(1)
+state = re.search(r"^\s*codexRequestByDefault:\s*(true|false),", s, re.M)
+assert state and state.group(1) == "false", "initial codexRequestByDefault must be false (#2166)"
+assert preset("standard") == "false", "Standard preset must set codexRequestByDefault: false (#2166)"
+assert preset("strict") == "true", "Strict preset keeps codexRequestByDefault: true as the opt-in"
+box = re.search(r'<input[^>]*id="codexRequestByDefault"[^>]*>', s)
+assert box and " checked" not in box.group(0), "the request-by-default checkbox must start unchecked (#2166)"
+print("OK: request_by_default playground defaults (#2166)")
+PY_RBD
+
 echo "OK: Mergepath Playground checks passed"

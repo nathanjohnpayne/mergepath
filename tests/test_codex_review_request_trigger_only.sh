@@ -109,7 +109,7 @@ shift
 [ "${1:-}" = "-X" ] && shift 2
 endpoint=${1:-}
 case "$endpoint" in
-  repos/owner/repo/pulls/999)            jq -cn --arg h "$head_sha" '{head:{sha:$h},base:{ref:"main",sha:"base-sha",repo:{default_branch:"main"}}}' ;;
+  repos/owner/repo/pulls/999)            jq -cn --arg h "$head_sha" '{head:{sha:$h,ref:"feature"},base:{ref:"main",sha:"base-sha",repo:{default_branch:"main"}}}' ;;
   'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha')
     printf '1\n' >>"$CODEX_TEST_STATE_DIR/base-policy-read-count"
     if [ "${CODEX_TEST_BASE_POLICY_MODE:-ok}" = fail ]; then
@@ -128,14 +128,22 @@ case "$endpoint" in
       missing|noworkflow|wfunreadable)
                   printf '{"total_count":0,"workflow_runs":[]}\n' ;;
       # Another workflow's run on the head is not repo-lint.
-      otherworkflow) printf '{"total_count":1,"workflow_runs":[{"id":3,"name":"CodeQL","path":".github/workflows/codeql.yml","status":"completed"}]}\n' ;;
+      otherworkflow) printf '{"total_count":1,"workflow_runs":[{"id":3,"name":"CodeQL","path":".github/workflows/codeql.yml","head_branch":"feature","status":"completed"}]}\n' ;;
+      # The same SHA ran repo-lint on ANOTHER branch only: not this PR's push.
+      otherbranch)  printf '{"total_count":1,"workflow_runs":[{"id":5,"name":"repo-lint","path":".github/workflows/repo_lint.yml","head_branch":"other","status":"completed"}]}\n' ;;
       # Matched by canonical path even when the display name differs.
-      bypath)     printf '{"total_count":1,"workflow_runs":[{"id":4,"name":"renamed lint","path":".github/workflows/repo_lint.yml","status":"queued"}]}\n' ;;
-      # Push-dispatch anchor: the first dispatch and a later rerun; the
-      # EARLIEST created_at is the push time.
-      dispatched) jq -cn --arg a "${CODEX_TEST_CHECK_STARTED:?}" --arg b "${CODEX_TEST_CHECK_RERUN:-$CODEX_TEST_CHECK_STARTED}" \
-                    '{total_count:2,workflow_runs:[{id:9,name:"repo-lint",path:".github/workflows/repo_lint.yml",status:"completed",created_at:$b},{id:6,name:"repo-lint",path:".github/workflows/repo_lint.yml",status:"completed",created_at:$a}]}' ;;
-      *)          jq -cn --arg st "${CODEX_TEST_LINT_RUNS:-completed}" '{total_count:1,workflow_runs:[{id:2,name:"repo-lint",path:".github/workflows/repo_lint.yml",status:$st}]}' ;;
+      bypath)     printf '{"total_count":1,"workflow_runs":[{"id":4,"name":"renamed lint","path":".github/workflows/repo_lint.yml","head_branch":"feature","status":"queued"}]}\n' ;;
+      # Push-dispatch anchor (Codex P2 x2 on #2175): an old run of the SAME SHA
+      # on another branch (OTHER), plus two dispatches on the PR branch
+      # (STARTED, and a later push of the same SHA, LATER). The anchor is the
+      # LATEST dispatch on the PR branch.
+      dispatched) jq -cn --arg o "${CODEX_TEST_CHECK_OTHER:-$(jq -rn 'now - 10800 | floor | todate')}" \
+                    --arg a "${CODEX_TEST_CHECK_STARTED:?}" --arg b "${CODEX_TEST_CHECK_RERUN:-$CODEX_TEST_CHECK_STARTED}" \
+                    '{total_count:3,workflow_runs:[
+                      {id:6,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"other",status:"completed",created_at:$o},
+                      {id:8,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"feature",status:"completed",created_at:$a},
+                      {id:9,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"feature",status:"completed",created_at:$b}]}' ;;
+      *)          jq -cn --arg st "${CODEX_TEST_LINT_RUNS:-completed}" '{total_count:1,workflow_runs:[{id:2,name:"repo-lint",path:".github/workflows/repo_lint.yml",head_branch:"feature",status:$st}]}' ;;
     esac ;;
   repos/owner/repo/actions/workflows)
     case "${CODEX_TEST_LINT_RUNS:-completed}" in
@@ -1391,31 +1399,40 @@ test_guard_applies_in_polling_mode() {
   [ "$FAIL" -ne "$before" ] || pass "MH10: the guard refuses in polling mode too"
 }
 
-# MH11 (Codex P2 on #2175): the age signal is anchored on the PUSH, not only
-# on the commit. An ordinary push of a commit created an hour earlier must read
-# as a fresh head while its required check was dispatched a minute ago.
+# MH11 (Codex P2 x2 on #2175): the age signal is anchored on the CURRENT PUSH,
+# not only on the commit: the latest repo-lint dispatch for the head on the
+# PR's branch. Runs of the same SHA on another branch, and earlier pushes of
+# it to this branch, must not make the head look settled.
 test_guard_anchors_on_push_dispatch() {
   local dir rc before=$FAIL
+  # (a) Old commit; the SHA ran repo-lint on another branch 3h ago; this
+  # branch dispatched it a minute ago. Anchor = the minute-old dispatch.
   dir=$(make_case "guard-dispatch-recent")
-  rc=$(CODEX_TEST_CHECK_STARTED="$YOUNG_HEAD" CODEX_TEST_CHECK_RERUN="$(jq -rn 'now - 5 | floor | todate')" \
+  rc=$(CODEX_TEST_CHECK_STARTED="$YOUNG_HEAD" run_guard "$dir" fresh "$OLD_HEAD" dispatched "" --trigger-only)
+  [ "$rc" = "8" ] || fail "MH11a: an old commit pushed a minute ago must be refused (exit 8) despite an old run on another branch, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "0" ] || fail "MH11a: expected 0 posts, got $(trig_count "$dir")"
+  [ "$(jqf "$dir" '.moving_head.reasons | join(",")')" = "head-age" ] || fail "MH11a: reasons=$(jqf "$dir" '.moving_head.reasons'), expected [head-age]"
+  [ "$(jqf "$dir" '.moving_head.head_pushed_at')" = "$YOUNG_HEAD" ] || fail "MH11a: anchor=$(jqf "$dir" '.moving_head.head_pushed_at'), expected the PR-branch dispatch $YOUNG_HEAD (not the other-branch run, not the commit date)"
+  grep -q 'source: latest .repo-lint. dispatch for HEAD on the PR branch' "$dir/err.log" || fail "MH11a: the push-dispatch anchor source must be logged"
+  # (b) The same SHA was pushed to this branch 2h ago and again a minute ago:
+  # the latest dispatch is the current push.
+  dir=$(make_case "guard-dispatch-repush")
+  rc=$(CODEX_TEST_CHECK_STARTED="$(jq -rn 'now - 7200 | floor | todate')" CODEX_TEST_CHECK_RERUN="$YOUNG_HEAD" \
     run_guard "$dir" fresh "$OLD_HEAD" dispatched "" --trigger-only)
-  [ "$rc" = "8" ] || fail "MH11: an old commit pushed a minute ago must be refused (exit 8), got $rc; err=$(cat "$dir/err.log")"
-  [ "$(trig_count "$dir")" = "0" ] || fail "MH11: expected 0 posts, got $(trig_count "$dir")"
-  [ "$(jqf "$dir" '.moving_head.reasons | join(",")')" = "head-age" ] || fail "MH11: reasons=$(jqf "$dir" '.moving_head.reasons'), expected [head-age]"
-  [ "$(jqf "$dir" '.moving_head.head_pushed_at')" = "$YOUNG_HEAD" ] || fail "MH11: anchor=$(jqf "$dir" '.moving_head.head_pushed_at'), expected the EARLIEST dispatch $YOUNG_HEAD (not the rerun, not the commit date)"
-  grep -q 'source: earliest .repo-lint. run on HEAD' "$dir/err.log" || fail "MH11: the push-dispatch anchor source must be logged"
-  # A dispatch OLDER than the commit date never makes a head look older: the
-  # later of the two governs.
+  [ "$rc" = "8" ] && [ "$(jqf "$dir" '.moving_head.head_pushed_at')" = "$YOUNG_HEAD" ] \
+    || fail "MH11b: a re-push of the same SHA must be dated by its own dispatch (rc=$rc anchor=$(jqf "$dir" '.moving_head.head_pushed_at'))"
+  # (c) A dispatch OLDER than the commit date never makes a head look older:
+  # the later of the two governs.
   dir=$(make_case "guard-dispatch-older")
   rc=$(CODEX_TEST_CHECK_STARTED="$(jq -rn 'now - 7200 | floor | todate')" \
     run_guard "$dir" fresh "$YOUNG_HEAD" dispatched "" --trigger-only)
   [ "$rc" = "8" ] && [ "$(jqf "$dir" '.moving_head.head_pushed_at')" = "$YOUNG_HEAD" ] \
-    || fail "MH11b: an older dispatch must not override a younger commit anchor (rc=$rc anchor=$(jqf "$dir" '.moving_head.head_pushed_at'))"
-  # Old commit, old dispatch: a settled head posts.
+    || fail "MH11c: an older dispatch must not override a younger commit anchor (rc=$rc anchor=$(jqf "$dir" '.moving_head.head_pushed_at'))"
+  # (d) Old commit, old dispatch on this branch: a settled head posts.
   dir=$(make_case "guard-dispatch-settled")
   rc=$(CODEX_TEST_CHECK_STARTED="$OLD_HEAD" run_guard "$dir" fresh "$OLD_HEAD" dispatched "" --trigger-only)
-  [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "1" ] || fail "MH11c: a settled head must post (rc=$rc posts=$(trig_count "$dir"))"
-  [ "$FAIL" -ne "$before" ] || pass "MH11: the age signal is anchored on the push dispatch (earliest repo-lint run), not only the commit date"
+  [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "1" ] || fail "MH11d: a settled head must post (rc=$rc posts=$(trig_count "$dir"))"
+  [ "$FAIL" -ne "$before" ] || pass "MH11: the age signal is anchored on the latest repo-lint dispatch for the head on the PR branch, not only the commit date"
 }
 
 # MH12 (Codex P2 on #2175): the policy is read from the SCRIPT's checkout.
@@ -1477,6 +1494,12 @@ test_guard_workflow_signal_shapes() {
   dir=$(make_case "guard-bypath")
   rc=$(run_guard "$dir" fresh "$OLD_HEAD" bypath "" --trigger-only)
   [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "1" ] || fail "MH13f: a run of .github/workflows/repo_lint.yml must count whatever its display name (rc=$rc posts=$(trig_count "$dir"))"
+  # (g) A repo-lint run of the same SHA on ANOTHER branch only is not this
+  # PR's push being picked up.
+  dir=$(make_case "guard-otherbranch")
+  rc=$(run_guard "$dir" fresh "$OLD_HEAD" otherbranch "" --trigger-only)
+  [ "$rc" = "8" ] && [ "$(jqf "$dir" '.moving_head.check_status')" = "missing" ] \
+    || fail "MH13g: a repo-lint run on another branch only must read as not picked up (rc=$rc status=$(jqf "$dir" '.moving_head.check_status'))"
   [ "$FAIL" -ne "$before" ] || pass "MH13: repo-lint run signal survives sharded/absent job names, and a repo without the workflow warns instead of refusing"
 }
 

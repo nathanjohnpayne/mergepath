@@ -214,16 +214,20 @@ feedback_policy:
 #
 # Phase 2.5 runs only when scripts/coderabbit-should-invoke.sh <PR#> exits 0
 # (#1084). `coderabbit.enabled: true` is necessary but NOT sufficient: the
-# `invoke` mode below decides whether THIS PR gets the wait. Run the decider
-# rather than reading `enabled` directly, or a repo set to `never` or to a
-# routine `complex-changes` result still gets waited on.
+# `invoke` mode below decides whether THIS PR gets the Phase 2.5 pass. Run the
+# decider rather than reading `enabled` directly, or a repo set to `never` or
+# to a routine `complex-changes` result still gets reviewed and waited on.
 #
 # When the decider says invoke, the agent MUST:
-#   1. Wait for CodeRabbit to post before proceeding — prefer
+#   1. Confirm CodeRabbit has posted on the MERGE head before merge, with
 #      scripts/coderabbit-wait.sh, whose max_wait_seconds ceiling (1245s,
 #      the measured full-fleet max + one poll interval; #623) covers the real latency
 #      (p50 ~6 min, p99 ~19 min). Do NOT hand-wait a folkloric ~3 min and
-#      escalate early: that reopens the #136 pre-review-merge race.
+#      escalate early: that reopens the #136 pre-review-merge race. Wait
+#      BEFORE Phase 3 only when the decider reports `wait: true`
+#      (wait_for_review below; default false, #2166): the pre-merge check
+#      runs after CI, which outlasts CodeRabbit's p99, so it normally returns
+#      at once, while a pre-Phase-3 wait held every round's Codex request.
 #   2. Read BOTH API endpoints:
 #      - gh api repos/{owner}/{repo}/issues/{pr}/comments  (PR-level summary)
 #      - gh api repos/{owner}/{repo}/pulls/{pr}/comments    (inline diff comments)

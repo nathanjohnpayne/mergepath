@@ -401,17 +401,20 @@ detect_cross_cutting_refactor() {
   # carry implementation count toward the >=3 bar.
   #
   # A root-level file is excluded by WHAT it is, not by where it sits (Codex
-  # P2 on #2175): a consumer may keep an implementation entrypoint at the
-  # root -- main.go, app.py, server.js, a Makefile -- and a refactor touching
-  # it plus two implementation dirs spans three implementation areas. Such a
-  # file still counts, as the single <root> area.
+  # P2 x2 on #2175): a consumer may keep an implementation entrypoint at the
+  # root -- main.go, app.py, server.js -- and a refactor touching it plus two
+  # implementation dirs spans three implementation areas. Such a file still
+  # counts, as the single <root> area. Manifests and build files are
+  # companions by NAME as well as by suffix: go.mod beside cmd/ and internal/
+  # is a dependency bump riding along, not a third implementation area.
   distinct_impl_dirs=$(echo "$FILE_PATHS" \
     | awk -F/ '
         NF > 1 { print $1; next }
         $0 ~ /^\./ { next }
         $0 ~ /\.(md|markdown|mdx|txt|rst|adoc)$/ { next }
         $0 ~ /^(LICENSE|LICENCE|COPYING|NOTICE|CHANGELOG|AUTHORS|CODEOWNERS|CONTRIBUTORS)(\..*)?$/ { next }
-        $0 ~ /\.(ya?ml|json|jsonc|toml|lock|cfg|ini|conf)$/ { next }
+        $0 ~ /\.(ya?ml|json|jsonc|toml|lock|cfg|ini|conf|properties|gradle|gradle\.kts|sum|mod)$/ { next }
+        $0 ~ /^(go\.work|Gemfile|Rakefile|Podfile|Cartfile|Brewfile|Pipfile|Procfile|pom\.xml|setup\.py|MANIFEST\.in|Makefile|GNUmakefile|makefile|Dockerfile|Containerfile|Vagrantfile|Justfile|justfile|Taskfile|BUILD|BUILD\.bazel|WORKSPACE|WORKSPACE\.bazel|MODULE\.bazel|CMakeLists\.txt|meson\.build|flake\.nix|default\.nix|shell\.nix)$/ { next }
         { print "<root>" }' \
     | grep -vxE 'tests?|docs|specs' \
     | sort -u | wc -l | tr -d ' ')

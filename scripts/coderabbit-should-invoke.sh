@@ -84,6 +84,10 @@
 #                                       unclear instruction about the wait
 #                                       falls back to the older, slower
 #                                       behaviour, never to a faster one.
+#   a policy DOCUMENT the decider cannot trust (ambiguous, invalid YAML,
+#   several documents, no parser, unrecognized enabled/invoke)
+#                                    -> invoke with `wait: true`, whatever
+#                                       wait_for_review reads.
 #
 # Bash 3.2 portable.
 
@@ -396,6 +400,17 @@ emit() {  # <decision> <reason>
 # whole FILE (tabs, non-literal keys, a non-mapping block) are handled below
 # on the enabled/invoke read and resolve the DECISION to invoke; here they
 # only ever make `wait` true.
+# A policy the decider cannot trust as a whole is ambiguous about the wait too,
+# even when the wait_for_review line itself reads cleanly (Codex P2 on #2175):
+# every invoke that is FORCED by the document -- ambiguity, an unparseable or
+# multi-document file, a missing parser, an unrecognized enabled/invoke value
+# -- reports wait:true, the slower pre-#2166 behaviour. Classifier failures are
+# about the diff, not the policy, and keep the value read.
+emit_policy_failsafe() {  # <reason>
+  WAIT_FOR_REVIEW=true
+  emit invoke "$1"
+}
+
 WAIT_FOR_REVIEW=false
 _wait_raw=$(coderabbit_field wait_for_review)
 case "$_wait_raw" in
@@ -429,7 +444,7 @@ case "${CR_ENABLED}${INVOKE_MODE}" in
     # r13, same class as the r11 diagnosis split).
     case "$CR_ENABLED" in *"<<ambiguous:"*) AMB=$CR_ENABLED ;; *) AMB=$INVOKE_MODE ;; esac
     AMB=${AMB#*<<ambiguous:}; AMB=${AMB%%>>*}
-    emit invoke "ambiguous coderabbit policy block ($AMB)"
+    emit_policy_failsafe "ambiguous coderabbit policy block ($AMB)"
     ;;
 esac
 
@@ -466,7 +481,7 @@ if ! command -v "$YQ_BIN" >/dev/null 2>&1 \
   bash "$SCRIPT_DIR/lib/ensure-yq.sh" --ci-only >/dev/null 2>&1 || true
 fi
 if [ -f "$CONFIG" ] && ! command -v "$YQ_BIN" >/dev/null 2>&1; then
-  emit invoke "YAML parser unavailable — policy cannot safely suppress review"
+  emit_policy_failsafe "YAML parser unavailable — policy cannot safely suppress review"
 fi
 if [ -f "$CONFIG" ]; then
   # Validate and count the stream in one parse. Plain `yq .` accepts a
@@ -476,10 +491,10 @@ if [ -f "$CONFIG" ]; then
   DOC_COUNT=$("$YQ_BIN" eval-all -o=json \
     '[.] as $item ireduce ([]; . + $item) | length' "$CONFIG" 2>/dev/null)
   if [ $? -ne 0 ]; then
-    emit invoke "policy file is not valid YAML (rejected by yq); ambiguity resolves toward invoking"
+    emit_policy_failsafe "policy file is not valid YAML (rejected by yq); ambiguity resolves toward invoking"
   fi
   if [ "$DOC_COUNT" != "1" ]; then
-    emit invoke "policy file must contain exactly one YAML document; ambiguity resolves toward invoking"
+    emit_policy_failsafe "policy file must contain exactly one YAML document; ambiguity resolves toward invoking"
   fi
   # NOTE: yq rules on VALIDITY ONLY. An earlier revision also re-read the two
   # fields through yq, to honour a consistently indented root mapping the
@@ -507,7 +522,7 @@ case "$CR_ENABLED" in
   ""|true|false) ;;
   *)
     echo "[coderabbit-should-invoke] WARN: unrecognized coderabbit.enabled='$CR_ENABLED'; treating policy as unsafe" >&2
-    emit invoke "unrecognized coderabbit.enabled='$CR_ENABLED' — policy cannot safely suppress review"
+    emit_policy_failsafe "unrecognized coderabbit.enabled='$CR_ENABLED' — policy cannot safely suppress review"
     ;;
 esac
 
@@ -527,7 +542,7 @@ case "$INVOKE_MODE" in
     # Unrecognized value: invoke, and say so loudly. Silently treating an
     # unknown mode as `never` would suppress a reviewer on a typo.
     echo "[coderabbit-should-invoke] WARN: unrecognized coderabbit.invoke='$INVOKE_MODE'; treating as 'always'" >&2
-    emit invoke "unrecognized coderabbit.invoke='$INVOKE_MODE' (defaulted to always)"
+    emit_policy_failsafe "unrecognized coderabbit.invoke='$INVOKE_MODE' (defaulted to always)"
     ;;
 esac
 

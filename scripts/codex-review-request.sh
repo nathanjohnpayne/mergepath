@@ -223,9 +223,10 @@
 #   8   MOVING_HEAD — the head does not look final for a review round
 #       (#2166): it is younger than codex.request_min_head_age_seconds
 #       (measured from the later of the HEAD pushed-at anchor -- committer
-#       date or last force-push -- and the push dispatch, i.e. the earliest
-#       CI run on the head), or CI has not picked the head up yet: no
-#       `repo-lint` workflow run exists for the head SHA (or, with the
+#       date or last force-push -- and the push dispatch, i.e. the latest
+#       repo-lint run for the head on the PR branch), or CI has not picked
+#       the head up yet: no `repo-lint` workflow run exists for the head SHA
+#       on the PR's branch (or, with the
 #       codex.request_requires_check override, no check-run by that exact
 #       name). A repo with no repo-lint workflow at all is not refused on
 #       that signal. No trigger is posted. A Codex request is posted once per BATCH -- every known
@@ -667,7 +668,8 @@ fi
 #                                       measured from the push: the latest of
 #                                       the committer date, the last
 #                                       force-push, and the push dispatch
-#                                       (the earliest CI run on the head, so
+#                                       (the latest repo-lint run for the head
+#                                       on the PR's branch, so
 #                                       an ordinary push of an old commit
 #                                       still reads as new). Default 300: the
 #                                       measured push-to-next-request p50 was
@@ -833,6 +835,10 @@ if ! should_request_codex; then
     log "codex.enabled is false — Phase 4a is off; not requesting a Codex review (route to Phase 4b)"
   else
     log "codex.request_by_default is false and this PR is not Phase-4a-gated (MERGEPATH_PHASE_4A_GATED!=true) — not requesting a Codex review"
+    # Codex P1 on #2175: with request_by_default false, a Phase 4 caller that
+    # omits the gate flag gets this skip instead of the mandatory review.
+    # Say so, so the skip is never mistaken for "Codex not needed".
+    log "if this PR meets external_review_threshold or touches external_review_paths (a Phase 4 PR), Codex is mandatory: rerun with MERGEPATH_PHASE_4A_GATED=true"
   fi
   jq -n \
     --argjson pr_number "$PR_NUMBER" \
@@ -865,6 +871,10 @@ log "PR $REPO#$PR_NUMBER — fetching HEAD commit metadata"
 PR_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>&1) || die 3 "failed to fetch PR metadata: $PR_JSON"
 
 HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha')
+# The PR's head branch scopes the moving-head guard's push-dispatch anchor to
+# runs dispatched for THIS branch (Codex P2 on #2175). Empty when unreadable;
+# the guard then falls back to every run for the SHA.
+HEAD_REF=$(echo "$PR_JSON" | jq -r '.head.ref // empty' 2>/dev/null) || HEAD_REF=""
 if [ -z "$HEAD_SHA" ] || [ "$HEAD_SHA" = "null" ]; then
   die 3 "could not determine HEAD sha for PR #$PR_NUMBER"
 fi
@@ -1686,18 +1696,26 @@ refuse_moving_head_unless_allowed() {
       # repo-lint by name or by its canonical path.
       runs=$(gh api --paginate -X GET "repos/$REPO/actions/runs" \
         -f head_sha="$HEAD_SHA" -F per_page=100 2>/dev/null) || runs=""
-      runs=$(printf '%s' "$runs" | jq -c -s --arg n "$REQUEST_WORKFLOW_NAME" --arg p "$REQUEST_WORKFLOW_PATH" '
+      # Scoped to the PR's head branch (Codex P2 on #2175): the same SHA can
+      # carry runs from another branch it was pushed to earlier, and those
+      # neither prove CI picked up THIS push nor date it.
+      runs=$(printf '%s' "$runs" | jq -c -s --arg n "$REQUEST_WORKFLOW_NAME" --arg p "$REQUEST_WORKFLOW_PATH" --arg b "$HEAD_REF" '
         if length > 0 and all(.[]; type == "object" and ((.workflow_runs | type) == "array"))
         then [ .[].workflow_runs[]
-               | select((.name // "") == $n or ((.path // "") | startswith($p))) ]
+               | select((.name // "") == $n or ((.path // "") | startswith($p)))
+               | select($b == "" or (.head_branch // "") == $b) ]
         else "unreadable" end' 2>/dev/null) || runs='"unreadable"'
       if [ "$runs" = '"unreadable"' ] || [ -z "$runs" ]; then
         status=unreadable
       elif [ "$(printf '%s' "$runs" | jq 'length')" -gt 0 ]; then
         status=$(printf '%s' "$runs" | jq -r 'sort_by(.id) | last | .status // "unknown"')
+        # The LATEST dispatch on this branch is the current push: a re-run
+        # keeps its run's original created_at (it bumps run_attempt), so it
+        # cannot move this, and an earlier push of the same SHA to this branch
+        # is older by construction (Codex P2 on #2175).
         dispatched_at=$(printf '%s' "$runs" | jq -r '
           [.[] | (.created_at // empty)
-           | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))] | min // ""')
+           | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))] | max // ""')
       else
         # No repo-lint run on this head. Either CI has not picked it up yet,
         # or this repo has no repo-lint workflow and never will: tell the two
@@ -1722,10 +1740,12 @@ refuse_moving_head_unless_allowed() {
         if (type == "object") and ((.check_runs | type) == "array")
         then ([.check_runs[] | select((.name // "") == $n)] | sort_by(.id) | last | .status // "missing")
         else "unreadable" end' 2>/dev/null) || status=unreadable
+      # Latest run, as in the workflow path: check-runs are per commit, so an
+      # earlier push of the same SHA elsewhere must not date this one.
       if [ "$status" != unreadable ] && [ "$status" != missing ]; then
         dispatched_at=$(printf '%s' "$runs" | jq -r --arg n "$REQUEST_REQUIRES_CHECK" '
           [.check_runs[] | select((.name // "") == $n) | (.started_at // empty)
-           | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))] | min // ""' 2>/dev/null) || dispatched_at=""
+           | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))] | max // ""' 2>/dev/null) || dispatched_at=""
       fi
       ;;
     *) status="" ;;
@@ -1750,13 +1770,13 @@ refuse_moving_head_unless_allowed() {
         # Push-time anchor (Codex P2 on #2175). HEAD_PUSHED_AT is the commit's
         # committer date unless a force-push replaced it, so an ordinary push
         # of a commit created long before reads as an old head the moment it
-        # lands. The EARLIEST run of the signal on this head was created when
-        # GitHub dispatched the push, which is the push time this signal
-        # means. Use whichever is later. A missing or unparseable timestamp
+        # lands. The latest run of the signal for this head on the PR branch
+        # was created when GitHub dispatched the current push, which is the
+        # push time this signal means. Use whichever is later. A missing or unparseable timestamp
         # keeps the commit-based anchor.
         if [ -n "$dispatched_at" ] && [[ "$dispatched_at" > "$anchor" ]]; then
           anchor="$dispatched_at"
-          anchor_source="earliest '$signal_label' run on HEAD (push dispatch)"
+          anchor_source="latest '$signal_label' dispatch for HEAD on the PR branch (push dispatch)"
         fi ;;
     esac
   fi
