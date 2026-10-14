@@ -271,6 +271,13 @@ jobs:
           REPO: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
           RUN_HEAD: ${{ github.event.workflow_run.head_sha }}
+          # The parent run's own trigger: `schedule` marks the sweep pass,
+          # which keeps full coverage (#1130 due-only targeting below).
+          PARENT_EVENT: ${{ github.event.workflow_run.event }}
+          # An event pass skips an open PR only while its published verdicts
+          # are younger than this — the parent sweep's own cadence, so no
+          # verdict outlives what a quiet period already allowed.
+          DUE_MAX_AGE_SECONDS: "900"
           # Validated as a positive integer below, so an arbitrary
           # client_payload cannot inject shell (same posture as
           # merge-clearance-gate.yml's dispatch-recheck job).
@@ -298,7 +305,7 @@ jobs:
           # resolve call can fail independently (#465).
           if ! prs_raw=$(gh api --paginate -X GET "repos/$REPO/pulls" -f state=open \
               -f per_page=100 \
-              --jq '.[] | "\(.number)\t\(.head.sha)"'); then
+              --jq '.[] | "\(.number)\t\(.head.sha)\t\(.updated_at)"'); then
             echo "::error::Failed to list open PRs on $REPO; leaving any pending entries standing (fail closed)."
             exit 1
           fi
@@ -443,6 +450,63 @@ jobs:
           # so red-until-disambiguated is the only verdict that cannot be
           # wrong for either PR. Detected once, posted once per head.
           dup_heads=$(cut -f2 <<<"$prs_raw" | sort | uniq -d)
+          # Due-only coverage on PR-event passes (#1130). A full pass costs
+          # every gate script on every open PR (about 40 installation-budget
+          # requests per PR), and PR events arrive faster than passes finish,
+          # so the queue kept full passes running back to back and exhausted
+          # the 1,000/hr installation budget. An event pass now evaluates its
+          # own head, and every other open PR unless there is POSITIVE proof
+          # that the PR's slot is current. Proof is read from the Checks-API
+          # suite the required contexts resolve against (API-posted runs:
+          # publisher holds and verdicts, native gate leases; job runs carry
+          # an /actions/runs/ details URL and live in their own suites). For
+          # EACH of the three contexts, the newest such run (by id) must be a
+          # completed SUCCESS, completed after the PR's last activity
+          # (updated_at), and inside DUE_MAX_AGE_SECONDS. Anything else makes
+          # the PR due:
+          #   * a hold left by phase 1 or by a cancelled pass (still pending),
+          #     which keeps the subsume-all property for coalesced members;
+          #   * a red or infra verdict, a missing context, a missing
+          #     updated_at, or a failed read (unknown is due);
+          #   * activity since the verdict, or a verdict older than the
+          #     sweep interval (time-based gate inputs such as reaction
+          #     freshness are refreshed no less often than a quiet period).
+          # Schedule-parent passes and dispatches keep full coverage, so the
+          # sweep and the operator remedy behave exactly as before.
+          due_only=0
+          if [ "$EVENT_NAME" = "workflow_run" ] && [ -n "$RUN_HEAD" ] \
+              && [ "${PARENT_EVENT:-}" != "schedule" ] \
+              && awk -F'\t' -v h="$RUN_HEAD" '$2 == h { found=1 } END { exit !found }' <<<"$prs_raw"; then
+            due_only=1
+          fi
+          stale_before=""
+          if [ "$due_only" -eq 1 ] && ! stale_before=$(jq -nr --arg t "$PASS_START" \
+              --argjson age "${DUE_MAX_AGE_SECONDS:-900}" \
+              '($t | fromdateiso8601) - $age | todateiso8601'); then
+            echo "::warning::Could not compute the due-only cutoff; running a full pass (fail closed)."
+            due_only=0
+          fi
+          # due <head> <updated_at>: exit 0 when the PR must be evaluated.
+          due() {
+            local hd="$1" updated="$2" rows ctx newest d_status d_concl d_done
+            case "$updated" in ''|null) return 0 ;; esac
+            if ! rows=$(gh api --paginate -X GET "repos/$REPO/commits/$hd/check-runs" \
+                -f filter=all -f per_page=100 \
+                --jq '.check_runs[] | select(((.details_url // "") | test("/actions/runs/")) | not) | [.name, (.id | tostring), .status, (.conclusion // "-"), (.completed_at // "-")] | @tsv'); then
+              return 0
+            fi
+            for ctx in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
+              newest=$(awk -F'\t' -v n="$ctx" '$1 == n && ($2 + 0) > max { max = $2 + 0; row = $0 } END { print row }' <<<"$rows")
+              [ -n "$newest" ] || return 0
+              d_status=$(cut -f3 <<<"$newest"); d_concl=$(cut -f4 <<<"$newest"); d_done=$(cut -f5 <<<"$newest")
+              [ "$d_status" = "completed" ] && [ "$d_concl" = "success" ] || return 0
+              [[ "$d_done" > "$updated" ]] || return 0
+              [[ "$d_done" > "$stale_before" ]] || return 0
+            done
+            return 1
+          }
+          evaluated=0
+          skipped=0
           handled_dups=""
           # gate <script> <context> <sentinel-or-empty> <pr> <head>
           #      [require-review-summary]: evaluate one gate for one PR and
@@ -581,7 +645,7 @@ jobs:
             fi
           }
 
-          while IFS=$'\t' read -r PR head_sha; do
+          while IFS=$'\t' read -r PR head_sha pr_updated; do
             [ -z "$PR" ] && continue
             if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
               echo "::error::No head SHA for PR #$PR from the open-PR list; cannot refresh its contexts."
@@ -606,6 +670,13 @@ jobs:
               fi
               continue
             fi
+            if [ "$due_only" -eq 1 ] && [ "$head_sha" != "$RUN_HEAD" ] \
+                && ! due "$head_sha" "${pr_updated:-}"; then
+              echo "PR #$PR @ $head_sha: green, newer than its last activity and under ${DUE_MAX_AGE_SECONDS}s old; skipped on this event pass (#1130)."
+              skipped=$((skipped + 1))
+              continue
+            fi
+            evaluated=$((evaluated + 1))
             echo "::group::Publish PR #$PR @ $head_sha"
             gate scripts/merge-clearance-gate.sh   "$MCG_CONTEXT"        "Merge clearance: PASS" "$PR" "$head_sha"
             gate scripts/codex-p1-gate.sh          "$CODEX_P1_CONTEXT"   ""                      "$PR" "$head_sha"
@@ -613,6 +684,9 @@ jobs:
             echo "::endgroup::"
           done <<<"$targets"
 
+          if [ "$due_only" -eq 1 ]; then
+            echo "Due-only event pass: evaluated $evaluated open PR(s), skipped $skipped current one(s)."
+          fi
           if [ "$had_infra_error" -ne 0 ]; then
             echo "::error::Publisher finished with one or more infra errors"
             exit 1

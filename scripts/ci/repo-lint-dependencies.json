@@ -317,7 +317,8 @@
       ".github/workflows/required-check-publisher.yml",
       "scripts/lib/ci-check-modes.sh",
       "tests/test_required_check_publisher_dedup.sh",
-      "tests/test_required_check_publisher_summary_hold.sh"
+      "tests/test_required_check_publisher_summary_hold.sh",
+      "tests/test_required_check_publisher_due.sh"
     ],
     "check_resolve_pr_threads": [
       "tests/test_resolve_pr_threads_rationale_tag.sh",
