@@ -275,8 +275,10 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
   * The word of a here-STRING given to one of those same commands.
   * The LITERAL deferred source of `trap` or `eval`, re-read AS SHELL.
     Eval's proven literal arguments form one space-joined program, with an
-    empty-literal opt-in only for eval arguments; default command-word
-    decoding stays unchanged. Irreducible eval operands retain independent
+    empty-literal and double-quote escape opt-ins only for eval arguments;
+    default command-word decoding stays unchanged. Existing unquoted glob,
+    brace, leading-tilde and ANSI-C inventories refuse the joined path.
+    Irreducible eval operands retain independent
     scanning of known literal fragments. Trap actions and callback operands
     remain separate. The operand is
     source the shell runs later, so quoting inside it quotes the TEXT and not
@@ -2575,15 +2577,19 @@ _ANSI_C_ESCAPES = {
 }
 
 
-def _unquote_command_word(w, allow_empty=False):
-    """Reduce a command word to a literal, or return None if it is not one."""
+def _unquote_command_word(w, allow_empty=False, eval_literal=False):
+    """Reduce a command word; eval's opt-in proves its pre-evaluation value."""
+    if eval_literal and ("$'" in w or w.replace("\\\n", "").startswith("~")
+                         or _command_word_expands(w)):
+        return None  # Existing expansion inventories; no runtime reconstruction.
     out = []
     i = 0
     n = len(w)
     while i < n:
         c = w[i]
         if c == "\\" and i + 1 < n:
-            out.append(w[i + 1])
+            if not eval_literal or w[i + 1] != "\n":
+                out.append(w[i + 1])
             i += 2
             continue
         if c == "'":
@@ -2598,7 +2604,12 @@ def _unquote_command_word(w, allow_empty=False):
             buf = []
             while j < n and w[j] != '"':
                 if w[j] == "\\" and j + 1 < n:
-                    buf.append(w[j + 1])
+                    escaped = w[j + 1]
+                    if not eval_literal or escaped in '$`"\\':
+                        buf.append(escaped)
+                    elif escaped != "\n":
+                        buf.extend(("\\", escaped))
+                    # A quoted backslash-newline is removed before eval.
                     j += 2
                     continue
                 if w[j] in "$`":
@@ -4092,7 +4103,7 @@ def _deferred_shell_operands(seg):
         return []
     if cmd == "eval" and seg._cmd_index is not None:
         literals = [
-            _unquote_command_word(raw, allow_empty=True)
+            _unquote_command_word(raw, allow_empty=True, eval_literal=True)
             for raw, _literal in _command_arguments(seg.words, seg._cmd_index + 1)
         ]
         if all(literal is not None for literal in literals):
@@ -7636,6 +7647,15 @@ CORPUS = [
         MUST_FLAG,
         "eval 'echo \"$GH_TOKEN\"'\n",
     ),
+    # #1465 review: pre-eval expansion refusal and double-quote escapes.
+    ('eval-review-brace-expansion-leak', MUST_FLAG, 'eval : {x,\\;echo} \'"$GH_TOKEN"\'\n'),
+    ('eval-review-brace-single-quoted-control', MUST_NOT_FLAG, 'eval : \'{x,\\;echo}\' \'"$GH_TOKEN"\'\n'),
+    ('eval-review-brace-double-quoted-control', MUST_NOT_FLAG, 'eval : "{x,\\;echo}" \'"$GH_TOKEN"\'\n'),
+    ('eval-review-dquote-nonspecial-backslash-control', MUST_NOT_FLAG, 'eval ": \\; echo" \'"$GH_TOKEN"\'\n'),
+    ('eval-review-dquote-semicolon-emitter', MUST_FLAG, 'eval ": ; echo" \'"$GH_TOKEN"\'\n'),
+    ('eval-review-single-quoted-backslash-control', MUST_NOT_FLAG, 'eval \': \\; echo\' \'"$GH_TOKEN"\'\n'),
+    ('eval-review-quoted-glob-control', MUST_NOT_FLAG, 'eval : \'*\' \'"$GH_TOKEN"\'\n'),
+    ('eval-review-quoted-tilde-control', MUST_NOT_FLAG, 'eval : \'~\' \'"$GH_TOKEN"\'\n'),
     # #1465: merged active-trace bridge and literal-joining seam.
     (
         'eval-cross-seam-unknown-empty-prefix-emitter',
@@ -14102,6 +14122,21 @@ def _deferred_shell_cases():
     cannot read the source the one place that admission is invisible.
     """
     failures = []
+    # Ordinary decoding remains exact; only proven eval arguments opt in.
+    if (_unquote_command_word(r'": \; echo"') != ': ; echo'
+            or _unquote_command_word(r'": \; echo"', eval_literal=True) != r': \; echo'):
+        failures.append("eval double-quoted nonspecial backslash")
+    for raw in ("*", "?", "[x]", "{x,y}", "~", "$'literal'"):
+        if _unquote_command_word(raw, eval_literal=True) is not None:
+            failures.append("eval expandable argument admitted: " + raw)
+    for raw, expected in [("'*'", "*"), ('"?"', "?"), ("'[x]'", "[x]"),
+                          ("'{x,y}'", "{x,y}"), ("'~'", "~"),
+                          (r"\*", "*"), (r"\~", "~")]:
+        if _unquote_command_word(raw, eval_literal=True) != expected:
+            failures.append("eval quoted argument refused: " + raw)
+    for raw, expected in [('"\\$GH_TOKEN"', '$GH_TOKEN'), ('"\\`"', '`'), ('"\\""', '"'), ('"\\\\"', '\\'), ('"a\\\nb"', 'ab'), ('a\\\nb', 'ab')]:
+        if _unquote_command_word(raw, eval_literal=True) != expected:
+            failures.append("eval double-quote escape boundary: " + repr(raw))
     for raw in ("''", '""'):
         if (_unquote_command_word(raw) is not None
                 or _unquote_command_word(raw, allow_empty=True) != ""):
@@ -14110,6 +14145,12 @@ def _deferred_shell_cases():
         if _unquote_command_word(raw, allow_empty=True) is not None:
             failures.append("eval reconstructed a dynamic argument: " + raw)
     extraction_cases = [
+        ('eval : {x,\\;echo} \'"$GH_TOKEN"\'', [':', '{x,;echo}', '"$GH_TOKEN"']),
+        ('eval ": \\; echo" \'"$GH_TOKEN"\'', [': \\; echo "$GH_TOKEN"']),
+        ('eval : \'*\' \'"$GH_TOKEN"\'', [': * "$GH_TOKEN"']),
+        ('eval : \'~\' \'"$GH_TOKEN"\'', [': ~ "$GH_TOKEN"']),
+        ('eval : * \'"$GH_TOKEN"\'', [':', '*', '"$GH_TOKEN"']),
+        ('eval : ~ \'"$GH_TOKEN"\'', [':', '~', '"$GH_TOKEN"']),
         ("eval echo ': \"$GH_TOKEN\"'", ['echo : "$GH_TOKEN"']),
         ("eval : '\"$GH_TOKEN\"'", [': "$GH_TOKEN"']),
         ("eval '' \"\"", [" "]),
