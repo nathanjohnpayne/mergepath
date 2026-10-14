@@ -36,6 +36,11 @@ case "${1:-} ${2:-}" in
     exit 0
     ;;
   "pr view")
+    # STUB_REQUIRE_TOKEN: a session with no gh keyring, where gh needs GH_TOKEN.
+    if [ "${STUB_REQUIRE_TOKEN:-0}" = 1 ]; then
+      [ -n "${GH_TOKEN:-}" ] || { echo "To get started with GitHub CLI, please run:  gh auth login" >&2; exit 4; }
+      [ "${GH_TOKEN:-}" = "${STUB_EXPECT_TOKEN:-}" ] && echo "pr view authenticated with the expected token" >>"${STUB_API_LOG:-/dev/null}"
+    fi
     # The Claude cloud proxy's refusal of every GraphQL call (#1057).
     if [ "${STUB_GRAPHQL_CEILING:-0}" = 1 ]; then
       echo "GitHub GraphQL is not available from Claude Code sessions; use the REST API instead (HTTP 403)" >&2
@@ -579,6 +584,30 @@ BIG_FILES="$WORKDIR/big-files.json"
 { printf '[[{"filename":"scripts/x.sh","patch":"'; head -c 1200000 /dev/zero | tr '\0' 'x'; printf '"}]]\n'; } >"$BIG_FILES"
 STUB_GRAPHQL_CEILING=1 STUB_FILES_PAGES_FILE="$BIG_FILES" assert_rc_contains "GraphQL ceiling: a 1.2 MB files response is read (never passed as one argument)" 0 "" \
   'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0"
+# Codex cloud: no keyring and no ambient GH_TOKEN, only the provisioned
+# reviewer PAT. The self-approve read must authenticate with it, or every
+# approval is blocked before the wrapper runs (Codex on #2178).
+: >"$API_LOG"
+set +e
+out=$(unset GH_TOKEN GITHUB_TOKEN; OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-pat STUB_EXPECT_TOKEN=fixture-reviewer-pat STUB_REQUIRE_TOKEN=1 STUB_API_LOG="$API_LOG" \
+  run_hook 'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q 'pr view authenticated with the expected token' "$API_LOG"; then
+  pass "self-approve read with no ambient token authenticates with the provisioned reviewer PAT"
+else
+  fail "self-approve read reviewer PAT: rc=$rc out=$out"
+fi
+set +e
+out=$(unset GH_TOKEN GITHUB_TOKEN OP_PREFLIGHT_REVIEWER_PAT; STUB_REQUIRE_TOKEN=1 \
+  run_hook 'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q 'could not fetch PR metadata'; then
+  pass "self-approve read with no token at all still blocks"
+else
+  fail "self-approve read no token: rc=$rc out=$out"
+fi
 STUB_PR_VIEW_FAIL=1 assert_rc_contains "a read failure that is not the GraphQL ceiling still blocks, with no REST fallback" 2 "could not fetch PR metadata" \
   'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0"
 

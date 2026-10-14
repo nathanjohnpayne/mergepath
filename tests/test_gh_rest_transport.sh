@@ -466,7 +466,9 @@ new_case
 set +e
 out="$(MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --title 'T' --body-file "$VALID_BODY" --head feature/x --base main --draft --label a --label 'b c,d' --reviewer nathanpayne-codex --assignee nathanjohnpayne 2>"$WORKDIR/err")"; rc=$?
 set -e
-expected_body="$(cat "$VALID_BODY")"
+# Byte-exact, trailing newline included, as gh --body-file sends it.
+expected_body="$(cat "$VALID_BODY"; printf x)"
+expected_body="${expected_body%x}"
 create_input="$(jq -nc --arg body "$expected_body" '{title: "T", body: $body, head: "feature/x", base: "main", draft: true}')"
 if [ "$rc" -eq 0 ] && [ "$out" = "https://github.com/o/r/pull/42" ] \
    && log_has $'POST\trepos/o/r/pulls\t--input\t'"$create_input" \

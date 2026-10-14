@@ -14,6 +14,10 @@ WRAPPER="$ROOT/scripts/gh-as-reviewer.sh"
 # be a candidate. Per-case `VAR=...` prefixes still apply.
 unset OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT GH_TOKEN GITHUB_TOKEN GH_HOST GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
 
+# These cases drive the gh transport. Pin it so a cloud session's
+# CLAUDE_CODE_REMOTE (or MERGEPATH_AGENT_SURFACE) cannot switch the wrappers
+# to the REST transport, which tests/test_gh_rest_transport.sh covers.
+export MERGEPATH_GH_TRANSPORT=gh
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/gh-as-reviewer-test.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
 

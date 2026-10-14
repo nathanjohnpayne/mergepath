@@ -17,8 +17,9 @@
 # gh_transport_select picks one. MERGEPATH_GH_TRANSPORT=gh|rest|auto (default
 # auto): auto is rest on a cloud surface (MERGEPATH_AGENT_SURFACE claude-cloud
 # or codex-cloud, or CLAUDE_CODE_REMOTE=true with the surface unset) and gh
-# everywhere else. Codex cloud takes rest too: it runs no PreToolUse hooks,
-# so the readback is the only call-time enforcement there.
+# everywhere else. Codex cloud takes rest too, for the byline readback the gh
+# transport does not do; its PreToolUse guards (.codex/hooks.json) still run
+# before the wrapper, as Claude's do.
 #
 # Closed grammar. The rest transport accepts one canonical argv shape per
 # verb and refuses anything else before any write, naming the form it does

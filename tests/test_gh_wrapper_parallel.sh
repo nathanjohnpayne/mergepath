@@ -10,6 +10,10 @@ REVIEWER_WRAPPER="$ROOT/scripts/gh-as-reviewer.sh"
 [[ -x "$AUTHOR_WRAPPER" ]] || { echo "missing or non-executable $AUTHOR_WRAPPER" >&2; exit 1; }
 [[ -x "$REVIEWER_WRAPPER" ]] || { echo "missing or non-executable $REVIEWER_WRAPPER" >&2; exit 1; }
 
+# These cases drive the gh transport. Pin it so a cloud session's
+# CLAUDE_CODE_REMOTE (or MERGEPATH_AGENT_SURFACE) cannot switch the wrappers
+# to the REST transport, which tests/test_gh_rest_transport.sh covers.
+export MERGEPATH_GH_TRANSPORT=gh
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/gh-wrapper-parallel.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
 

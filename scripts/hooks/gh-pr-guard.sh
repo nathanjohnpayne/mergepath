@@ -1384,6 +1384,20 @@ if [ -r "$GUARD_REPO_ROOT/scripts/lib/graphql-ceiling.sh" ]; then
   . "$GUARD_REPO_ROOT/scripts/lib/graphql-ceiling.sh"
 fi
 
+# guard_review_gh <gh args...>: gh for the self-approve read. A cloud session
+# configured as docs/agents/cloud-environments.md describes has no gh keyring
+# and no ambient GH_TOKEN, only the provisioned OP_PREFLIGHT_REVIEWER_PAT, so
+# without it this read fails authentication before the wrapper ever runs
+# (Codex on #2178). The PAT is used for this read only, and only when gh has
+# no token of its own.
+guard_review_gh() {
+  if [ -z "${GH_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ] && [ -n "${OP_PREFLIGHT_REVIEWER_PAT:-}" ]; then
+    GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh "$@"
+  else
+    gh "$@"
+  fi
+}
+
 guard_graphql_refused() { # <stderr file>
   declare -F graphql_ceiling_hit >/dev/null 2>&1 || return 1
   graphql_ceiling_hit "$(cat "$1" 2>/dev/null)"
@@ -1403,7 +1417,7 @@ guard_review_pr_json_rest() { # <selector> <repo>
     return 1
   fi
   err=$(mktemp) || return 1
-  if ! pr=$(gh api "repos/$repo/pulls/$sel" 2>"$err") \
+  if ! pr=$(guard_review_gh api "repos/$repo/pulls/$sel" 2>"$err") \
      || ! printf '%s' "$pr" | jq -e '(.number | type == "number") and (.user.login | type == "string") and (.head.ref | type == "string") and (.additions | type == "number") and (.deletions | type == "number")' >/dev/null 2>&1; then
     echo "BLOCKED: gh-pr-guard could not read $repo#$sel over REST for the self-approve check." >&2
     echo "  stderr: $(head -c 500 "$err")" >&2
@@ -1411,7 +1425,7 @@ guard_review_pr_json_rest() { # <selector> <repo>
     return 1
   fi
   # --slurp needs gh 2.41 or later, as the merge path's review read does.
-  if ! pages=$(gh api --paginate --slurp "repos/$repo/pulls/$sel/files?per_page=100" 2>"$err") \
+  if ! pages=$(guard_review_gh api --paginate --slurp "repos/$repo/pulls/$sel/files?per_page=100" 2>"$err") \
      || ! printf '%s' "$pages" | jq -e 'type == "array" and all(.[]; type == "array")' >/dev/null 2>&1; then
     echo "BLOCKED: gh-pr-guard could not read the files of $repo#$sel over REST for the self-approve check." >&2
     echo "  stderr: $(head -c 500 "$err")" >&2
@@ -3106,7 +3120,7 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
       # below; we do this here so it works on the review-only exit
       # path too).
       trap 'rm -f "$TMP_TOKENS" "$TMP_TOKENS_ERR" "$REVIEW_GH_STDERR"' EXIT
-      if ! REVIEW_PR_JSON=$(gh "${review_gh_args[@]}" 2>"$REVIEW_GH_STDERR"); then
+      if ! REVIEW_PR_JSON=$(guard_review_gh "${review_gh_args[@]}" 2>"$REVIEW_GH_STDERR"); then
         # A Claude cloud proxy refuses the GraphQL read whatever the
         # credential (#1057); read the same fields over REST there. Any
         # other failure blocks, as before.

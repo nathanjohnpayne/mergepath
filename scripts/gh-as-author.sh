@@ -169,7 +169,10 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
       echo "gh-as-author: PR body file is not readable: $body_file" >&2
       exit 1
     fi
-    PR_BODY="$(cat "$body_file")"
+    # Byte-exact: command substitution would strip trailing newlines, and
+    # the body sent must be the file's, as gh --body-file sends it.
+    PR_BODY="$(cat "$body_file"; printf x)"
+    PR_BODY="${PR_BODY%x}"
   }
 
   while [ "$#" -gt 0 ]; do
