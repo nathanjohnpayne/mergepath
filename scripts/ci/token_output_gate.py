@@ -3459,7 +3459,7 @@ def discover_emitter_helpers(text):
     # Lex each body ONCE.  What a body does never changes between rounds; only
     # the `helpers` set a call inside it is graded against does, and that is
     # what the fixed point below iterates.
-    lexed = [(name, body, Lexer(body), echo_alias_reads.get(match.start(), False))
+    lexed = [(name, body, Lexer(body), echo_alias_reads.get(match.start(), frozenset()))
              for match, name, body in definitions]
 
     # A local printf or passthrough-prefix definition invalidates the new
@@ -3571,7 +3571,8 @@ def discover_emitter_helpers(text):
             # A nested or direct HD uses the same bounded admission rule.
             if not emits:
                 emits = any(_heredoc_has_positional(
-                    hd, helpers, "echo" in bodies, echo_alias_read
+                    hd, helpers, frozenset(bodies) & {"echo", "command", "builtin"},
+                    echo_alias_read
                 ) for hd in lx.heredocs)
             if emits:
                 helpers.add(name)
@@ -3795,7 +3796,7 @@ _POSITIONAL_RE = re.compile(r"\$(?:[1-9][0-9]*|[@*]|\{(?:[1-9][0-9]*|[@*])\})")
 
 
 def _heredoc_echo_alias_read_facts(text, definitions):
-    """Echo alias identity at recognized helper READ boundaries, not execution.
+    """Echo/dispatch alias identities at helper READ boundaries, not execution.
 
     Mask only already-recognized function bodies in a private setup view.
     Their source length/newlines stay exact; uninvoked bodies cannot create
@@ -3807,12 +3808,12 @@ def _heredoc_echo_alias_read_facts(text, definitions):
         setup[begin:begin + len(body)] = re.sub(r"[^\n]", " ", body)
     logical = Lexer("".join(setup)).logical
     enabled = False
-    echo_alias = False
+    aliases = set()
     before = {}
     for line in logical:
         # Aliases expand as the entire logical line is READ, before any of
         # its declarations run. A same-line definition/enable supplies no fact.
-        before[line.first_line] = enabled and echo_alias
+        before[line.first_line] = frozenset(aliases) if enabled else frozenset()
         for seg in line.segments:
             if seg.parent is not None:
                 continue  # Child setup does not establish outer alias state.
@@ -3824,14 +3825,14 @@ def _heredoc_echo_alias_read_facts(text, definitions):
             elif cmd == "alias" and seg._cmd_index is not None:
                 for _raw, literal in _command_arguments(seg.words, seg._cmd_index + 1):
                     assignment = _ALIAS_RE.match(literal) if literal is not None else None
-                    if assignment is not None and assignment.group(1) == "echo":
-                        echo_alias = True  # No target roles or alias expansion.
+                    if assignment is not None and assignment.group(1) in {"echo", "command", "builtin"}:
+                        aliases.add(assignment.group(1))  # No target evaluation.
     facts = {}
     for match, _name, _body in definitions:
         physical = text.count("\n", 0, match.start()) + 1
         read_line = max((line.first_line for line in logical
                          if line.first_line <= physical), default=1)
-        facts[match.start()] = before.get(read_line, False)
+        facts[match.start()] = before.get(read_line, frozenset())
     return facts
 
 
@@ -3863,7 +3864,28 @@ def _heredoc_echo_expand_aliases(seg):
     return "s" in flags
 
 
-def _heredoc_has_positional(hd, emitter_helpers, echo_function=False, echo_alias=False):
+def _heredoc_first_dispatch(owner):
+    """Expose the first command/builtin role through the unchanged resolver.
+
+    Opaque private words stop prefix stripping at the actual dispatch role;
+    assignments, redirects and wrapper option arguments keep their ordinary
+    positions. Only the original literal command/builtin identity is credited.
+    """
+    marker = "__heredoc_dispatch_identity__"
+    probe = Segment(-1, None, False, owner.line)
+    probe.words = [marker if _unquote_command_word(word) in {"command", "builtin"}
+                   else word for word in owner.words]
+    command, _redir = resolve_command(probe)
+    index = probe._cmd_index
+    if command != marker or index is None:
+        return None
+    raw = owner.words[index]
+    identity = _unquote_command_word(raw)
+    return (identity, raw) if identity in {"command", "builtin"} else None
+
+
+def _heredoc_has_positional(hd, emitter_helpers, owner_functions=frozenset(),
+                            owner_aliases=frozenset()):
     """Conservative substitutions; precision only for proven non-emitting DATA.
 
     Main's raw positional predicate deliberately applies inside actual command
@@ -3883,20 +3905,25 @@ def _heredoc_has_positional(hd, emitter_helpers, echo_function=False, echo_alias
     cmd, _redir = resolve_command(hd.owner)
     # SAFE is also the default for unknown external commands; only explicit
     # existing literal builtin facts prove the plain DATA is not emitted.
-    # Echo DATA is harmless only while its literal builtin identity is proved.
-    # Written builtin/command dispatch and paths bypass function lookup; a
-    # quoted/escaped command word bypasses aliases but can still call a function.
+    # Only a proved FIRST dispatcher shields later function names. An unknown
+    # dispatch may itself consume DATA before a later word is ever reached.
+    dispatch = _heredoc_first_dispatch(hd.owner)
+    dispatch_unknown = (dispatch is not None and (
+        dispatch[0] in owner_functions
+        or (dispatch[1] == dispatch[0] and dispatch[0] in owner_aliases)
+    ))
+    dispatch_proved = dispatch is not None and not dispatch_unknown
     index = hd.owner._cmd_index
     echo_identity_unknown = (
         cmd == "echo" and hd.owner._cmd_literal == "echo" and index is not None
-        and not any(_unquote_command_word(word) in ("builtin", "command")
-                    for word in hd.owner.words[:index])
-        and (echo_function or (echo_alias and hd.owner.words[index] == "echo"))
+        and not dispatch_proved
+        and ("echo" in owner_functions
+             or ("echo" in owner_aliases and hd.owner.words[index] == "echo"))
     )
     inert = (cmd in EMITTERS | SAFE_COMMANDS | ENV_DUMPERS
              and cmd not in emitter_helpers
              and hd.owner._function_binding is None
-             and not echo_identity_unknown)
+             and not dispatch_unknown and not echo_identity_unknown)
     return not inert and _heredoc_data_has_positional(body)
 
 
@@ -12785,6 +12812,290 @@ KNOWN_BROADER.update({'helper-hd-echo-owner-owner-quiet-safe-alias': 'An active 
 # Literal quoted builtin/command dispatch retains the existing bypass proof.
 CORPUS += [('helper-hd-echo-owner-quiet-quoted-single-builtin', 'clean', 'echo(){ cat; }\ndie(){ \'builtin\' echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-quiet-quoted-double-builtin', 'clean', 'echo(){ cat; }\ndie(){ "builtin" echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-quiet-quoted-single-command', 'clean', 'echo(){ cat; }\ndie(){ \'command\' echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-quiet-quoted-double-command', 'clean', 'echo(){ cat; }\ndie(){ "command" echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n')]
 
+
+# Dispatch identity uses the same finite READ/catalogue facts; no target execution.
+CORPUS += [('helper-hd-dispatch-owner-command-active-alias',
+  'flag',
+  'shopt -s expand_aliases\n'
+  "alias command='cat -'\n"
+  'die(){ command echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-function-shadow',
+  'flag',
+  'command(){ cat; }\ndie(){ command echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-quoted-function-shadow',
+  'flag',
+  'command(){ cat; }\ndie(){ \'command\' echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-late-function-before-call',
+  'flag',
+  '\ndie(){ command echo <<EOF\n$1\nEOF\n}\ncommand(){ cat; }\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-safe-alias-quiet',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias command=true\n'
+  'die(){ command echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-safe-function-quiet',
+  'flag',
+  'command(){ printf safe; }\ndie(){ command echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-after-call-function-quiet',
+  'flag',
+  'die(){ command echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\ncommand(){ cat; }\n'),
+ ('helper-hd-dispatch-owner-command-no-enable-quiet',
+  'clean',
+  'alias command=\'cat -\'\ndie(){ command echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-late-alias-quiet',
+  'clean',
+  'shopt -s expand_aliases\n'
+  'die(){ command echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  "alias command='cat -'\n"
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-escaped-alias-quiet',
+  'clean',
+  'shopt -s expand_aliases\n'
+  "alias command='cat -'\n"
+  'die(){ \\command echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-quoted-alias-quiet',
+  'clean',
+  'shopt -s expand_aliases\n'
+  "alias command='cat -'\n"
+  "die(){ 'command' echo <<EOF\n"
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-plain-dispatch-quiet',
+  'clean',
+  'echo(){ cat; }\ndie(){ command echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-printf-active-alias',
+  'flag',
+  'shopt -s expand_aliases\n'
+  "alias command='cat -'\n"
+  'die(){ command printf safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-printf-function-shadow',
+  'flag',
+  'command(){ cat; }\ndie(){ command printf safe <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-active-alias',
+  'flag',
+  'shopt -s expand_aliases\n'
+  "alias builtin='cat -'\n"
+  'die(){ builtin echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-function-shadow',
+  'flag',
+  'builtin(){ cat; }\ndie(){ builtin echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-quoted-function-shadow',
+  'flag',
+  'builtin(){ cat; }\ndie(){ \'builtin\' echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-late-function-before-call',
+  'flag',
+  '\ndie(){ builtin echo <<EOF\n$1\nEOF\n}\nbuiltin(){ cat; }\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-safe-alias-quiet',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias builtin=true\n'
+  'die(){ builtin echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-safe-function-quiet',
+  'flag',
+  'builtin(){ printf safe; }\ndie(){ builtin echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-after-call-function-quiet',
+  'flag',
+  'die(){ builtin echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\nbuiltin(){ cat; }\n'),
+ ('helper-hd-dispatch-owner-builtin-no-enable-quiet',
+  'clean',
+  'alias builtin=\'cat -\'\ndie(){ builtin echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-late-alias-quiet',
+  'clean',
+  'shopt -s expand_aliases\n'
+  'die(){ builtin echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  "alias builtin='cat -'\n"
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-escaped-alias-quiet',
+  'clean',
+  'shopt -s expand_aliases\n'
+  "alias builtin='cat -'\n"
+  'die(){ \\builtin echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-quoted-alias-quiet',
+  'clean',
+  'shopt -s expand_aliases\n'
+  "alias builtin='cat -'\n"
+  "die(){ 'builtin' echo <<EOF\n"
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-plain-dispatch-quiet',
+  'clean',
+  'echo(){ cat; }\ndie(){ builtin echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-printf-active-alias',
+  'flag',
+  'shopt -s expand_aliases\n'
+  "alias builtin='cat -'\n"
+  'die(){ builtin printf safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-printf-function-shadow',
+  'flag',
+  'builtin(){ cat; }\ndie(){ builtin printf safe <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-command-bypasses-command-function',
+  'clean',
+  'command(){ cat; }\ndie(){ builtin command echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-builtin-bypasses-builtin-function',
+  'clean',
+  'builtin(){ cat; }\ndie(){ command builtin echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-command-bypasses-both-functions',
+  'clean',
+  'command(){ cat; }\n'
+  'echo(){ cat; }\n'
+  'die(){ builtin command echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-absolute-echo-with-all-shadow-functions',
+  'clean',
+  'echo(){ cat; }\n'
+  'command(){ cat; }\n'
+  'builtin(){ cat; }\n'
+  'die(){ /bin/echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-brace-modified-positional',
+  'clean',
+  '\ndie(){ echo <<EOF\n${ echo "${1:-fallback}" >&2; }\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-dollar-modified-positional',
+  'flag',
+  '\ndie(){ echo <<EOF\n$(echo "${1:-fallback}" >&2)\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-backtick-modified-positional',
+  'flag',
+  '\ndie(){ echo <<EOF\n`echo "${1:-fallback}" >&2`\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-dollar-trimmed-positional',
+  'flag',
+  '\ndie(){ echo <<EOF\n$(echo "${1#x}" >&2)\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-dollar-length-quiet',
+  'clean',
+  '\ndie(){ echo <<EOF\n$(echo "${#1}" >&2)\nEOF\n}\n\ndie "$GH_TOKEN"\n')]
+
+KNOWN_BROADER.update({'helper-hd-dispatch-owner-command-safe-alias-quiet': 'An earlier active literal dispatch alias '
+                                                      'targets true in this quiet sample. Its '
+                                                      'command/builtin identity is unproved; the '
+                                                      'private owner check does not execute alias '
+                                                      'targets. These are bounded '
+                                                      'dispatch-identity consequences, separate '
+                                                      'from echo/substitution conservatism. Owner '
+                                                      'direction: '
+                                                      'https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6158118173',
+ 'helper-hd-dispatch-owner-command-safe-function-quiet': 'A recognized dispatch function prints '
+                                                         'safe in this quiet sample. The existing '
+                                                         'catalogue withholds builtin identity '
+                                                         'without evaluating function input flow. '
+                                                         'These are bounded dispatch-identity '
+                                                         'consequences, separate from '
+                                                         'echo/substitution conservatism. Owner '
+                                                         'direction: '
+                                                         'https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6158118173',
+ 'helper-hd-dispatch-owner-command-after-call-function-quiet': 'The stdin-forwarding dispatch '
+                                                               'function is defined after the '
+                                                               'helper call, so this sample is '
+                                                               'quiet. The all-recognized '
+                                                               'catalogue does not infer runtime '
+                                                               'lookup order; excluding later '
+                                                               'definitions would miss '
+                                                               'definition-before-call leakage. '
+                                                               'These are bounded '
+                                                               'dispatch-identity consequences, '
+                                                               'separate from echo/substitution '
+                                                               'conservatism. Owner direction: '
+                                                               'https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6158118173',
+ 'helper-hd-dispatch-owner-builtin-safe-alias-quiet': 'An earlier active literal dispatch alias '
+                                                      'targets true in this quiet sample. Its '
+                                                      'command/builtin identity is unproved; the '
+                                                      'private owner check does not execute alias '
+                                                      'targets. These are bounded '
+                                                      'dispatch-identity consequences, separate '
+                                                      'from echo/substitution conservatism. Owner '
+                                                      'direction: '
+                                                      'https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6158118173',
+ 'helper-hd-dispatch-owner-builtin-safe-function-quiet': 'A recognized dispatch function prints '
+                                                         'safe in this quiet sample. The existing '
+                                                         'catalogue withholds builtin identity '
+                                                         'without evaluating function input flow. '
+                                                         'These are bounded dispatch-identity '
+                                                         'consequences, separate from '
+                                                         'echo/substitution conservatism. Owner '
+                                                         'direction: '
+                                                         'https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6158118173',
+ 'helper-hd-dispatch-owner-builtin-after-call-function-quiet': 'The stdin-forwarding dispatch '
+                                                               'function is defined after the '
+                                                               'helper call, so this sample is '
+                                                               'quiet. The all-recognized '
+                                                               'catalogue does not infer runtime '
+                                                               'lookup order; excluding later '
+                                                               'definitions would miss '
+                                                               'definition-before-call leakage. '
+                                                               'These are bounded '
+                                                               'dispatch-identity consequences, '
+                                                               'separate from echo/substitution '
+                                                               'conservatism. Owner direction: '
+                                                               'https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6158118173'})
+
+KNOWN_MISSES['helper-hd-dispatch-owner-brace-modified-positional'] = (
+    "Inherited main9f raw positional-regex miss: ${1:-fallback} alone in the "
+    "Bash5.3 brace command substitution is not matched. Main,350 and b271 "
+    "all miss the sampled Mac5.3 leak; Linux5.2 rejects this syntax. The "
+    "unchanged central predicate is retained, with no parameter fallback. "
+    "https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6158118173; "
+    "https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6156188282"
+)
+KNOWN_MISS_MIN_BASH = {'helper-hd-dispatch-owner-brace-modified-positional': (5, 3)}
+
 def _corpus_id_cases():
     """Every corpus id is UNIQUE, and every declared id names a real case.
 
@@ -12973,10 +13284,10 @@ def _heredoc_conservatism_cases():
 
 
 def _heredoc_echo_owner_cases():
-    """Pin echo identity, existing read boundaries and literal bypass controls."""
+    """Pin echo/dispatch identities, read boundaries and proved bypass controls."""
     failures = []
     for cid, rule, body in CORPUS:
-        if not cid.startswith("helper-hd-echo-owner-"):
+        if not cid.startswith(("helper-hd-echo-owner-", "helper-hd-dispatch-owner-")):
             continue
         findings, errors = scan_text(PROLOGUE + body, cid)
         if bool(findings) != (rule == MUST_FLAG) or errors:
@@ -12988,6 +13299,7 @@ def self_test():
     failures = []
     passed = 0
     tp = fn = fp = tn = 0
+    bash_path, bash_text, _bash_ver = oracle_bash()
 
     failures.extend(_corpus_id_cases())
     failures.extend(_printf_allowlist_cases())
@@ -13067,7 +13379,10 @@ def self_test():
             else:
                 tn += 1
 
-            if cid in KNOWN_MISSES and not (leaked and not flagged):
+            minimum_bash = KNOWN_MISS_MIN_BASH.get(cid)
+            unsupported_miss = (minimum_bash is not None and _bash_ver is not None
+                                and _bash_ver < minimum_bash)
+            if cid in KNOWN_MISSES and not unsupported_miss and not (leaked and not flagged):
                 failures.append(
                     "STALE KNOWN_MISSES entry %r: it no longer disagrees with "
                     "the oracle (leaked=%s flagged=%s) -- delete it"
@@ -13132,9 +13447,13 @@ def self_test():
     # disagreement with bash was measured on this run.  An absence from it is
     # not coverage.
     for cid in sorted(KNOWN_MISSES):
+        minimum_bash = KNOWN_MISS_MIN_BASH.get(cid)
+        unsupported_miss = (minimum_bash is not None and _bash_ver is not None
+                            and _bash_ver < minimum_bash)
+        label = "unsupported version-qualified miss" if unsupported_miss else "measured miss"
         print(
-            "check_no_token_in_output:   measured miss: %s -- %s"
-            % (cid, KNOWN_MISSES[cid])
+            "check_no_token_in_output:   %s: %s -- %s"
+            % (label, cid, KNOWN_MISSES[cid])
         )
     for cid in sorted(KNOWN_BROADER):
         print(
