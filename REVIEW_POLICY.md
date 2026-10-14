@@ -1058,7 +1058,7 @@ What the stuck window covers: only transitions that fire no Actions event. Pushe
 
 | Source | Requests per tick at 8 open PRs | Per hour at `*/15` (before #2167) | Per hour at `*/30` (#2167) | Per hour after #2220 |
 |---|---|---|---|---|
-| Gate tick: its own sweep job (clearance script only) plus the chained publisher full pass; after #2220 the chained pass alone (243) | about 390 (147 + 243) | about 1,560 | about 780 | about 486 |
+| Gate tick: its own sweep job (clearance script only) plus the chained publisher full pass; after #2220 the chained pass plus one publisher-state read (244) | about 390 (147 + 243) | about 1,560 | about 780 | about 488 |
 | `codex-p1-gate.yml` sweep | about 63 | about 250 | about 125 | about 125 |
 | `coderabbit-severity-gate.yml` sweep | about 33 | about 130 | about 65 | about 65 |
 | #2167 lint parent: at most one full pass per `pull_request` lint completion (about 26 per day, event-driven; due-only, so usually less) | about 243 | about 265 | about 265 | about 265 |
@@ -1068,7 +1068,7 @@ Before #2167 the scheduled sweeps alone came to roughly 1,900 requests per hour 
 
 **After #2220.** Four changes, all in `required-check-publisher.yml` and the gate sweep (`specs/required_check_publisher.md` § Coverage and the installation budget):
 
-- The gate's `scheduled-sweep` job defers to the publisher's chained full pass wherever the publisher is active (one request per tick reads its workflow state; an absent or disabled publisher keeps the sweep), so each tick evaluates each open PR once: the scheduled cost drops from about 970 to about 676 requests per hour at 8 open PRs (about 940 with the lint parent's passes, against about 1,240 before).
+- The gate's `scheduled-sweep` job defers to the publisher's chained full pass wherever the publisher is active (one request per tick reads its workflow state; an absent or disabled publisher keeps the sweep), so each tick evaluates each open PR once: the scheduled cost drops from about 970 to about 678 requests per hour at 8 open PRs (about 940 with the lint parent's passes, against about 1,240 before).
 - `DUE_MAX_AGE_SECONDS` is 1800, the sweep interval (fence assertion A16 keeps them equal). At 900 every quiet green PR fell due again 15 minutes after each scheduled refresh, so under continuous PR traffic event passes re-evaluated each of them once more per interval, about 420 requests per hour at 8 open PRs; at 1800 the chained pass refreshes every verdict before it ages out.
 - Every pass reads `GET /rate_limit` (free) and budgets both buckets the gates spend: when the REST budget cannot cover 40 requests per PR it would evaluate plus a 100-request reserve, or the GraphQL budget 10 points per PR plus a 50-point reserve, it evaluates only the head it claimed with holds; a schedule-parent pass or dispatch evaluates nothing new. Its own due-proof reads are charged to the budget, and a head the budget cannot cover at all is closed with the budget red instead of evaluated. A pass therefore never starts work it cannot finish.
 - The first installation rate-limit failure (REST or GraphQL) stops the pass, and the red it writes backs that PR off event passes until the reset of the bucket that ran out, after which the first pass re-evaluates it with no manual rerun.
