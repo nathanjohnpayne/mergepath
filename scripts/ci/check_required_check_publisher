@@ -141,6 +141,7 @@ PARENT_WORKFLOW="${REQUIRED_CHECK_PUBLISHER_PARENT:-.github/workflows/merge-clea
 WORKFLOW_DIR="${REQUIRED_CHECK_PUBLISHER_WORKFLOW_DIR:-.github/workflows}"
 DEDUP_TEST="tests/test_required_check_publisher_dedup.sh"
 SUMMARY_HOLD_TEST="tests/test_required_check_publisher_summary_hold.sh"
+DUE_TEST="tests/test_required_check_publisher_due.sh"
 HUB_MARKER="scripts/sync-to-downstream.sh"
 
 FAILED=0
@@ -1032,6 +1033,15 @@ if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ] \
   fi
   if ! bash "$SUMMARY_HOLD_TEST"; then
     echo "check_required_check_publisher: FAIL (CodeRabbit summary-hold behavior suite)"
+    exit 1
+  fi
+  if [ ! -f "$DUE_TEST" ]; then
+    echo "FAIL: $DUE_TEST is missing; due-only event-pass targeting (#1130) is untested."
+    echo "check_required_check_publisher: FAIL"
+    exit 1
+  fi
+  if ! bash "$DUE_TEST"; then
+    echo "check_required_check_publisher: FAIL (due-only targeting behavior suite)"
     exit 1
   fi
 fi

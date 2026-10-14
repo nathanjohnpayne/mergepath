@@ -1227,6 +1227,11 @@ paths:
       - "scripts/lib/gh-api-array.sh"
       - "scripts/lib/dependabot-commit-provenance.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
+  # Pairs with scripts/ci/check_dependabot_coupled_groups (#2162): the
+  # fixture suite its --self-test runs in every consumer's deep lane.
+  - path: tests/test_dependabot_coupled_groups.sh
+    type: canonical
+    consumers: all
   # Pairs with scripts/ci/check_git_identity_hygiene (#777), the guard
   # against a repo-local git identity override silently reattributing and
   # unsigning every commit made from the checkout (and from every worktree
@@ -1369,6 +1374,13 @@ paths:
       - ".github/workflows/required-check-publisher.yml"
   # Exercises the live publisher's CodeRabbit-only #886 summary hold by
   # extracting and running its shipped gate helper and live caller lines.
+  # Exercises the live publish step's due-only event-pass targeting (#1130)
+  # against JSON fixtures, applying the step's own --jq filters.
+  - path: tests/test_required_check_publisher_due.sh
+    type: canonical
+    consumers: all
+    requires:
+      - ".github/workflows/required-check-publisher.yml"
   - path: tests/test_required_check_publisher_summary_hold.sh
     type: canonical
     consumers: all
@@ -2386,6 +2398,7 @@ paths:
       - "scripts/lib/gh-command-classifier.sh"   # shared native/API mutation guard (#1058)
       - "tests/test_repo_lint_optimization.sh"   # check_repo_lint_optimization
       - "tests/test_check_doc_ownership.sh"      # check_doc_ownership
+      - "tests/test_dependabot_coupled_groups.sh"   # check_dependabot_coupled_groups --self-test (#2162)
       - "tests/test_gh_pr_guard.sh"            # check_gh_as_author
       - "tests/test_pr_body_contract_parity.sh"  # check_gh_as_author (#1121) — invoked by the wrapper, so a path-scoped kit sync without it reds the consumer lint
       - "tests/test_gh_as_author.sh"           # check_gh_as_author
@@ -2512,6 +2525,7 @@ paths:
       - ".github/workflows/pr-review-policy.yml"  # #1249 parsed native gate trigger fence
       - "tests/test_required_check_publisher_dedup.sh"  # check_required_check_publisher behavior suite (#1130)
       - "tests/test_required_check_publisher_summary_hold.sh"  # CodeRabbit rc-3 publication hold (#886)
+      - "tests/test_required_check_publisher_due.sh"  # due-only event-pass targeting (#1130)
       - ".github/workflows/pr-audit.yml"       # check_pr_audit_codex_clearance
       - ".github/workflows/repo_lint.yml"      # check_ci_scripts_wired scans it; bidirectional with its requires: scripts/ci/ (#601)
       - "scripts/coderabbit-should-invoke.sh"   # check_coderabbit_wait (#1084)

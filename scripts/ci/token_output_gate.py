@@ -232,7 +232,28 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     helper reaching it through other helpers is found regardless of definition
     order or chain length. Textual definitions are not proof of execution;
     a later or false-branch emitter can conservatively flag a safe runtime
-    call. No control-flow or runtime function table is inferred. A helper is
+    call. No control-flow or runtime function table is inferred.
+    Helper arguments, error words and interpolating here-doc bodies share
+    the positional-value decision, with here-doc quotes literal and backslash
+    quoting only dollar, backtick, backslash and newline. Quoted delimiters
+    suppress body expansion. Actual backtick substitution bodies remove their
+    source escape layer before the ordinary positional decision; modern
+    substitutions retain ordinary source. Actual substitution source uses the
+    existing literal deferred-operand extractor within its one-hop budget.
+    Direct here-doc DATA retains conservative known-stdin-consumer admission.
+    Quiet cat/tee shadow and command-report forms remain conservative (#1052
+    item 3): textual declarations cannot prove active bindings. A catalog veto
+    misses late, false-branch and restored-builtin emission, so no runtime
+    definition/order/mutation model is added here.
+    Continued openers are normalized before independent expansion/error-word
+    searches; modern and legacy positional arithmetic and substring/index
+    operands are retained as diagnostic candidates without evaluation. When the existing exact
+    reader refuses a real command substitution's end, the remaining bounded
+    source is retained conservatively, including possible inert tail data.
+    No case grammar or runtime variable binding is inferred. Executable substitution
+    and error-word evidence remains independent of that owner. Helper inventory
+    stays conservative about captured/no-output source and does not infer
+    runtime emission. A helper is
     graded on what its body writes, not on where that write GOES, so a helper
     whose emitter feeds a pipe is treated as emitting -- declared conservatism
     below.
@@ -324,6 +345,15 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     set -- an alias is the relationship a helper already has with its call
     sites -- with bash's own two gates kept: `expand_aliases` must be
     enabled, and only a LITERAL target counts.
+    In actual HD substitution programs, a literal emitter replacement's
+    positional reference is inventoried only at a later command-position
+    invocation after a literal expand_aliases enable. Literal disable,
+    same-line and uninvoked controls remain quiet. This replacement source
+    consumes the existing one-hop child inventory, with no runtime binding
+    or general alias-expansion model. The opt-in arithmetic delimiter role
+    also consumes raw final `for` locally, retaining initialization,
+    condition and update diagnostic operands without changing default
+    lexical output or extending array DATA/ordinary argument admission.
   * The ERROR WORD of a `${VAR:?word}` / `${VAR?word}` expansion.  BASH
     ITSELF writes that word to stderr when VAR is unset, before the enclosing
     command runs and whatever that command is, so `: "${UNSET:?$PAT}"` and
@@ -1136,6 +1166,65 @@ def _find_substitutions(s, quotes_are_literal=False):
         return _find_substitutions_exact(s)
     except _ExactReadUnavailable:
         return _find_substitutions_legacy(s, quotes_are_literal)
+
+
+def _heredoc_brace_command_span(text, i):
+    """Bash 5.3 command openers under the HD-only inventory opt-in."""
+    if text[i:i + 2] != "${" or text[i + 2:i + 3] not in (" ", "\t", "\n", "|"):
+        return None
+    begin = i + (3 if text[i + 2:i + 3] == "|" else 2)
+    close = _find_compound_close(text, i + 1)
+    end = len(text) if close is None else close + 1
+    return text[begin:close if close is not None else end], i, end
+
+
+def _heredoc_diagnostic_span(text, i):
+    """Read a diagnostic candidate with existing bounds, not shell grammar.
+
+    Only the heredoc diagnostic inventory opts in. Legacy `$[ ]` arithmetic
+    uses compound bounds, including nested brackets; substring/index operands
+    use the existing parameter and brace bounds.
+    For a real command-substitution opener whose end the exact reader cannot
+    prove, retain the remaining bounded source conservatively. That tail can
+    include inert data; it is not a claim that every retained character runs.
+    """
+    brace = _heredoc_brace_command_span(text, i)
+    if brace is not None:
+        return brace
+    if text[i : i + 2] == "$[":
+        close = _heredoc_bracket_close(text, i + 1)
+        end = len(text) if close is None else close + 1
+        return text[i + 2 : close if close is not None else end], i, end
+    if text[i : i + 2] == "$(" and text[i + 2 : i + 3] != "(":
+        try:
+            _simple_substitution_end(text, i)
+        except _ExactReadUnavailable:
+            return text[i + 2 :], i, len(text)
+    if text[i : i + 2] != "${":
+        return None
+    j = i + 2
+    prefix = text[j : j + 1]
+    if prefix in ("#", "!"):
+        j += 1
+    positional = re.match(r"(?:[0-9]+|[@*])", text[j:])
+    if positional:
+        j += positional.end()
+    else:
+        name, j = ident_at(text, j)
+        if name is None:
+            return None
+    op = text[j : j + 1]
+    if op != "[" and not (prefix not in ("#", "!") and op == ":"
+                             and text[j + 1 : j + 2] not in ("-", "+", "=", "?")):
+        return None
+    try:
+        end = _simple_parameter_end(text, i)
+    except _ExactReadUnavailable:
+        close = _find_compound_close(text, i + 1)
+        if close is None:
+            return text[j + 1 :], i, len(text)
+        end = close + 1
+    return text[j + 1 : end - 1], i, end
 
 
 def _find_substitutions_exact(s):
@@ -2272,8 +2361,6 @@ def error_word_expansion_at(text, brace_open):
     return rest.startswith(":?") or rest.startswith("?")
 
 
-
-
 def braced_ref_at(text, brace_open):
     """Decide a `${...}` expansion at `brace_open` (the index of the `$`).
 
@@ -2723,7 +2810,7 @@ def _printf_literal(raw, literal):
     try:
         return shlex.split(raw) == [literal]
     except ValueError:
-        return False  # Unproven quoting/escaping never authorizes admission.
+        return False
 
 
 def _printf_text_target(raw, target):
@@ -2833,7 +2920,7 @@ def classify(seg, emitter_helpers):
         return EMIT
     if cmd in SAFE_COMMANDS:
         return SAFE
-    return SAFE  # an external command: see "does NOT catch" in the header
+    return SAFE
 
 
 def _short_option_operand_has_ref(seg, name, option_letters):
@@ -3147,9 +3234,6 @@ def _why(note, base):
 # In-file message-helper discovery
 # ==========================================================================
 
-_POSITIONAL_RE = re.compile(r"\$(?:[1-9][0-9]*|[@*]|\{(?:[1-9][0-9]*|[@*])\})")
-
-
 def _find_compound_close(text, open_idx):
     """Return the matching close index for a brace group or subshell body.
 
@@ -3356,10 +3440,10 @@ def _printf_callback_changes_lookup(seg):
     return False
 
 
-
 def discover_emitter_helpers(text):
     """Names with any recognized body writing their positionals VERBATIM."""
     bodies = {}
+    definitions = list(_iter_function_definitions(text))
     # NOT `^[ \t]*`.  A function definition is valid at any COMMAND POSITION,
     # not only at the start of a physical line: `true; log(){ echo "$1"; }`
     # defines `log`, and the anchored form never discovered it, so the later
@@ -3368,14 +3452,13 @@ def discover_emitter_helpers(text):
     # the `function`-form check below still sees the head it expects.
     # Textual order cannot establish which definitions executed (#1467).
     # Preserve every body, including definitions after calls or in false branches.
-    for _match, name, body in _iter_function_definitions(text):
+    for _match, name, body in definitions:
         bodies.setdefault(name, []).append(body)
 
     # Lex each body ONCE.  What a body does never changes between rounds; only
     # the `helpers` set a call inside it is graded against does, and that is
     # what the fixed point below iterates.
-    lexed = [(name, body, Lexer(body))
-             for name, definitions in bodies.items() for body in definitions]
+    lexed = [(name, body, Lexer(body)) for _match, name, body in definitions]
 
     # A local printf or passthrough-prefix definition invalidates the new
     # attached-option builtin exemption even for a non-emitting body.
@@ -3483,25 +3566,303 @@ def discover_emitter_helpers(text):
                 if not emits and _text_enables_xtrace(body_text) \
                         and _word_has_verbatim_positional(body_text):
                     emits = True
-            # a here-doc body inside the helper counts too
+            # A nested or direct HD uses the same bounded admission rule.
             if not emits:
-                for hd in lx.heredocs:
-                    if not hd.interpolating:
-                        continue
-                    cmd, _ = resolve_command(hd.owner)
-                    if cmd in STDIN_ECHOERS or cmd in EMITTERS:
-                        for _lno, raw in hd.body_lines:
-                            if _POSITIONAL_RE.search(raw):
-                                emits = True
-                                break
-                    if emits:
-                        break
+                emits = any(_heredoc_has_positional(hd, helpers) for hd in lx.heredocs)
             if emits:
                 helpers.add(name)
                 grew = True
         if not grew:
             break
     return frozenset(helpers)
+
+
+def _heredoc_bracket_close(text, open_idx):
+    """Existing bracket bounds, isolated from the ordinary compound reader."""
+    try:
+        return _heredoc_bracket_close_exact(text, open_idx)
+    except _ExactReadUnavailable:
+        return _heredoc_bracket_close_legacy(text, open_idx)
+
+def _heredoc_bracket_close_exact(text, open_idx):
+    opener = text[open_idx]
+    closer = "]"
+    depth = 0
+    i = open_idx
+    n = len(text)
+    quotes = []
+    while i < n:
+        c = text[i]
+        if quotes and quotes[-1] == "'":
+            if c == "'":
+                quotes.pop()
+            i += 1
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        if c == "#" and not quotes and (i == 0 or text[i - 1] in _WORD_BREAK_BEFORE_COMMENT):
+            eol = text.find("\n", i)
+            i = n if eol == -1 else eol
+            continue
+        if c == "'" and not quotes:
+            quotes.append("'")
+            i += 1
+            continue
+        if c == '"':
+            if quotes:
+                quotes.pop()
+            else:
+                quotes.append('"')
+            i += 1
+            continue
+        if quotes:
+            end = _double_quoted_construct_end(text, i)
+            i = i + 1 if end is None else end
+            continue
+        if c == opener:
+            depth += 1
+        elif c == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+def _heredoc_bracket_close_legacy(text, open_idx):
+    opener = text[open_idx]
+    closer = "]"
+    depth = 0
+    i = open_idx
+    n = len(text)
+    quotes = []
+    while i < n:
+        c = text[i]
+        if quotes and quotes[-1] == "'":
+            if c == "'":
+                quotes.pop()
+            i += 1
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        if c == "#" and not quotes and (i == 0 or text[i - 1] in _WORD_BREAK_BEFORE_COMMENT):
+            eol = text.find("\n", i)
+            i = n if eol == -1 else eol
+            continue
+        if c == "'":
+            quotes.append("'")
+            i += 1
+            continue
+        if c == '"':
+            if quotes and quotes[-1] == '"':
+                quotes.pop()
+            else:
+                quotes.append('"')
+            i += 1
+            continue
+        if quotes:
+            i += 1
+            continue
+        if c == opener:
+            depth += 1
+        elif c == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+def _heredoc_expansions(s):
+    """Existing HD-only command/arithmetic/parameter span inventory."""
+    quotes_are_literal = True
+    include_arithmetic = True
+    out = []
+    i = 0
+    n = len(s)
+    in_single = False
+    while i < n:
+        c = s[i]
+        if c == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if in_single:
+            if c == "'":
+                in_single = False
+            i += 1
+            continue
+        if c == "'" and not quotes_are_literal:
+            in_single = True
+            i += 1
+            continue
+        if include_arithmetic and c == "$":
+            span = _heredoc_diagnostic_span(s, i)
+            if span is not None:
+                out.append(span)
+                i = span[2]
+                continue
+        if (c == "$" and s[i + 1 : i + 2] == "("
+                and (include_arithmetic or s[i + 2 : i + 3] != "(")):
+            end = _skip_balanced_parens(s, i + 1)
+            out.append((s[i + 2 : end - 1], i, end))
+            i = end
+            continue
+        if c == "`":
+            close = (_skip_backtick(s, i) - 1 if include_arithmetic
+                     else s.find("`", i + 1))
+            if close == -1:
+                break
+            out.append((s[i + 1 : close], i, close + 1))
+            i = close + 1
+            continue
+        i += 1
+    return out
+
+def _heredoc_error_word_parameter_end(text, brace_open, allow_positionals=False):
+    """Guard endpoint; only HD callers opt into positional/indirect guards."""
+    j = brace_open + 2
+    if text[j : j + 1] == "#":
+        return None
+    if text[j : j + 1] == "!":
+        if not allow_positionals:
+            return None
+        j += 1
+    name, end = ident_at(text, j)
+    if name is not None:
+        return end
+    if allow_positionals:
+        m = re.match(r"(?:[0-9]+|[@*])", text[j:])
+        if m is not None:
+            return j + m.end()
+    return None
+
+def _heredoc_error_word_spans(s):
+    in_heredoc = True
+    """[start, end) index spans of every `${VAR:?WORD}` / `${VAR?WORD}` WORD.
+
+    BASH ITSELF writes that word to stderr when VAR is unset, before the
+    enclosing command runs -- so a credential there reaches a stream no matter
+    what the command is. The HD-only opt-in uses existing exact/compound
+    parameter bounds, preserving quoted braces and nested expansions; default
+    ordinary callers retain their existing reading. The ordinary-line path knows this; the
+    here-doc body path reduced its body to bare NAMES and lost it, so
+    `read x <<EOF` / `${UNSET:?$PAT}` / `EOF` attributed the reference to the
+    safe `read` owner and reported clean (#1032 round 6 P1).
+    """
+    spans = []
+    i = 0
+    n = len(s)
+    while i + 1 < n:
+        if in_heredoc and s[i] == "\\":
+            i += 2
+            continue
+        if s[i] == "$" and s[i + 1] == "{" and (_heredoc_error_word_parameter_end(s, i, True) is not None and s[_heredoc_error_word_parameter_end(s, i, True):].startswith((":?", "?"))):
+            end = _heredoc_error_word_parameter_end(s, i, allow_positionals=in_heredoc)
+            rest = s[end:]
+            start = end + (2 if rest.startswith(":?") else 1)
+            if in_heredoc:
+                try:
+                    close = _simple_parameter_end(s, i) - 1
+                except _ExactReadUnavailable:
+                    close = _find_compound_close(s, i + 1)
+                spans.append((start, len(s) if close is None else close))
+                i = start
+                continue
+            depth = 1
+            k = start
+            while k < n:
+                if s[k] == "\\":
+                    k += 2
+                    continue
+                if s[k] == "{":
+                    depth += 1
+                elif s[k] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            spans.append((start, k))
+            i = start
+            continue
+        i += 1
+    return spans
+
+_POSITIONAL_RE = re.compile(r"\$(?:[1-9][0-9]*|[@*]|\{(?:[1-9][0-9]*|[@*])\})")
+
+
+def _heredoc_has_positional(hd, emitter_helpers):
+    """Conservative substitutions; precision only for proven non-emitting DATA.
+
+    Main's raw positional predicate deliberately applies inside actual command
+    substitutions without interpreting commands, quoting, output routes or
+    helper argument binding. Arithmetic and error expansions are executable,
+    not plain DATA. No child source or runtime role model is used.
+    """
+    if not hd.interpolating:
+        return False
+    body = _heredoc_continuation_text("\n".join(raw for _line, raw in hd.body_lines))
+    for inner, _start, _end in _heredoc_expansions(body):
+        if _POSITIONAL_RE.search(inner):
+            return True
+    for begin, end in _heredoc_error_word_spans(body):
+        if _heredoc_data_has_positional(body[begin:end]):
+            return True
+    cmd, _redir = resolve_command(hd.owner)
+    # SAFE is also the default for unknown external commands; only explicit
+    # existing literal builtin facts prove the plain DATA is not emitted.
+    # Echo retains main's conservatism, including resolved dispatch/path forms.
+    # No alias, builtin availability or runtime command lookup is inferred.
+    inert = (cmd in (EMITTERS | SAFE_COMMANDS | ENV_DUMPERS) - {"echo"}
+             and cmd not in emitter_helpers
+             and hd.owner._function_binding is None)
+    data_body = body
+    if cmd == "echo":
+        # The raw substitution decision above is final. Do not re-read its
+        # contents as plain DATA and accidentally add a parameter fallback.
+        data = list(body)
+        for _inner, start, end in _heredoc_expansions(body):
+            command_span = (body[start:start + 1] == "`"
+                            or (body.startswith("$(", start)
+                                and not body.startswith("$((", start))
+                            or _heredoc_brace_command_span(body, start) is not None)
+            if command_span:
+                data[start:end] = " " * (end - start)
+        data_body = "".join(data)
+    return not inert and _heredoc_data_has_positional(data_body)
+
+
+def _heredoc_data_has_positional(body):
+    """Existing HD escape/value boundary for data delivered to stdin consumers."""
+    i = 0
+    while i < len(body):
+        if body[i] == "\\" and body[i + 1:i + 2] in ("$", "`", "\\", "\n"):
+            i += 2
+            continue
+        if body.startswith("${", i):
+            try:
+                end = _simple_parameter_end(body, i)
+            except _ExactReadUnavailable:
+                close = _find_compound_close(body, i + 1)
+                end = len(body) if close is None else close + 1
+            word = body[i:end]
+            if (not re.fullmatch(r"\$\{(?:[1-9][0-9]*|[@*])@a\}", word)
+                    and _word_has_verbatim_positional(word)):
+                return True
+            i = max(i + 2, end)
+            continue
+        if _POSITIONAL_RE.match(body, i):
+            return True
+        i += 1
+    return False
+
+
+def _heredoc_continuation_text(body):
+    """Apply the existing unquoted-heredoc continuation rule once."""
+    return re.sub(
+        r"\\([$`\\]|\n)",
+        lambda m: "" if m.group(1) == "\n" else m.group(0),
+        body,
+    )
 
 
 def _word_has_verbatim_positional(w):
@@ -3880,6 +4241,9 @@ def _segment_sets_xtrace(seg):
 
 
 _ALIAS_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_:.-]*)=(.*)$", re.S)
+# Bash alias names exclude slash, dollar, backtick, equals, shell
+# metacharacters and quoting characters. Ordinary catalog defaults stay above.
+_HEREDOC_ALIAS_RE = re.compile(r"^([^/=$`'\"\\ \t\n|&;()<>]+)=(.*)$", re.S)
 
 
 def _alias_emitters(lx, helpers):
@@ -4831,6 +5195,188 @@ MUST_NOT_FLAG = "clean"
 
 # (id, disposition, body)  -- body is appended to PROLOGUE.
 CORPUS = [
+    # Same source-input repair: literal filename/command attachments and order.
+    ('helper-hd-fd0-source-FD0-before-filename', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source 0<<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-FD0-before-filename', MUST_FLAG, 'die(){ printf safe <<EOF\n$(. 0<<<\'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-bare-before-filename', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source <<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-bare-before-filename', MUST_FLAG, 'die(){ printf safe <<EOF\n$(. <<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-attached-command', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source<<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-attached-command', MUST_FLAG, 'die(){ printf safe <<EOF\n$(.<<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-attached-filename', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-before-command', MUST_FLAG, 'die(){ printf safe <<EOF\n$(<<< \'echo "$1" >&2\' source /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-FD0-before-command', MUST_FLAG, 'die(){ printf safe <<EOF\n$(0<<< \'echo "$1" >&2\' source /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-prefilename-quoted-path', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source 0<<< \'echo "$1" >&2\' \'/dev/stdin\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-prefilename-literal-parenthesis', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source 0<<< \'echo "$1" >&2\' \'/dev/stdin)\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-prefilename-escaped-parenthesis', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source 0<<< \'echo "$1" >&2\' /dev/stdin\\))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-FD3-before-filename', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source 3<<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-printf-before-filename', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(printf 0<<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-prefilename-literal-input', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source 0<<< \'echo \'\\\'\'$1\'\\\'\' >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-prefilename-duplicate-argument', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(printf \'%s\' \'/dev/stdin)\'; source 0<<< \'echo "$1" >&2\' \'/dev/stdin)\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-multiple-capture-duplicate', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source 0<<< \'printf safe\' /dev/stdin) $(source 0<<< \'echo "$1" >&2\' \'/dev/stdin)\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-multiple-command-duplicate', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source 0<<< \'printf safe\' /dev/stdin; source 0<<< \'echo "$1" >&2\' \'/dev/stdin)\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-FD0-before-filename-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(source 0<<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-FD0-before-filename-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(. 0<<<\'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-bare-before-filename-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(source <<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-bare-before-filename-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(. <<< \'echo "$1" >&2\' /dev/stdin)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    # Narrow physical FD0 here-string operand binding.
+    ('helper-hd-fd0-source-fd0-spaced', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 0<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd0-attached', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 0<<<\'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-fd0-spaced', MUST_FLAG, 'die(){ printf safe <<EOF\n$(. /dev/stdin 0<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-fd0-attached', MUST_FLAG, 'die(){ printf safe <<EOF\n$(. /dev/stdin 0<<<\'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-zeroes', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 00<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd3', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 3<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd3-attached', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 3<<<\'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd10', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 10<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-fd3', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(. /dev/stdin 3<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-printf-fd0', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(printf safe /dev/stdin 0<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-printf-path-fd0', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(printf /dev/stdin 0<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-quoted-zero-input', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin <<< \'0\' \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-doublequoted-zero-input', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin <<< "0" \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-plain-zero-input', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin <<< 0 \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd0-quoted-zero-input', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 0<<< \'0\' \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd0-safe', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 0<<< \'printf safe\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd0-literal-positional', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 0<<< \'echo \'\\\'\'$1\'\\\'\' >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd0-trailing-DATA', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin 0<<< \'printf safe\'; printf \'%s\' \'$1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd0-argument-not-program', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(printf \'%s\' \'source /dev/stdin 0<<< echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd0-spaced-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(source /dev/stdin 0<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-fd0-attached-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(source /dev/stdin 0<<<\'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-fd0-spaced-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(. /dev/stdin 0<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-dot-fd0-attached-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(. /dev/stdin 0<<<\'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-fd0-source-named-fd', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin {fd}<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    # Owner-bounded bundle/source/brace regression controls.
+    ('helper-hd-three-alias-qs', MUST_FLAG, 'die(){ printf safe <<EOF\n$(shopt -qs expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-sq', MUST_FLAG, 'die(){ printf safe <<EOF\n$(shopt -sq expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-ps', MUST_FLAG, 'die(){ printf safe <<EOF\n$(shopt -ps expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-qu', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -qu expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-uq', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -uq expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-q', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -q expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-p', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -p expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-qsx', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -qsx expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-xqs', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -xqs expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-qsu', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -qsu expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-qus', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -qus expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-os', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -os expand_aliases\nalias leak=\'echo "$1" >&2\'\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-after-enable-qu', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nshopt -qu expand_aliases\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-after-enable-uq', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nshopt -uq expand_aliases\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-after-enable-q', MUST_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nshopt -q expand_aliases\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-alias-after-enable-qsu', MUST_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nshopt -qsu expand_aliases\nleak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-source', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-dot', MUST_FLAG, 'die(){ printf safe <<EOF\n$(. /dev/stdin <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-source-double-dash', MUST_FLAG, 'die(){ printf safe <<EOF\n$(source -- /dev/stdin <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-printf', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(printf safe <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-read', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(read -r x <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-noop', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(: <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-source-nonstdin', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/null <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-source-literal', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin <<< \'echo \'\\\'\'$1\'\\\'\' >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-source-safe', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin <<< \'printf safe\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-herestring-source-redacted', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(source /dev/stdin <<< \'echo "${#1}" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-brace-literal-positional', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n${ echo \'$1\' >&2; }\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-brace-reply-literal-positional', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n${| echo \'$1\' >&2; }\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-brace-escaped', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n\\${ echo "\\$1" >&2; }\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-brace-reply-escaped', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n\\${| echo "\\$1" >&2; }\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-brace-command-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n${ echo "$1" >&2; }\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-three-brace-reply-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n${| echo "$1" >&2; }\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    # Human-bounded regressions: C-for diagnostics and invoked literal aliases.
+    ('helper-hd-bounded-for-init', MUST_FLAG, 'die(){ printf safe <<EOF\n$(for ((x=1/\'$1\'; x; x--)); do :; done)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-condition', MUST_FLAG, 'die(){ printf safe <<EOF\n$(for ((x=1; 1/\'$1\'; x--)); do :; done)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-update', MUST_FLAG, 'die(){ printf safe <<EOF\n$(for ((x=1; x; x=1/\'$1\')); do :; done)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-adjacent', MUST_FLAG, 'die(){ printf safe <<EOF\n$(for((x=1/\'$1\'; x; x--)); do :; done)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-escaped-positional', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(for ((x=1/\\$1; x; x--)); do :; done)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-literal-data', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(printf \'%s\' \'for ((x=1/$1; x; x--)); do :; done\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-array-data', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(args=(\'for ((x=1/$1; x; x--)); do :; done\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-comment', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(# for ((x=1/\'$1\'; x; x--)); do :; done\nprintf safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-tail-data', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(for ((x=1; x; x--)); do :; done; printf \'%s\' \'$1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-expanding', MUST_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias emit_value=\'echo "$1" >&2\'\nemit_value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-disabled', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -u expand_aliases\nalias emit_value=\'echo "$1" >&2\'\nemit_value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-uninvoked', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias emit_value=\'echo "$1" >&2\'\n:)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-before-definition', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nemit_value\nalias emit_value=\'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-same-line', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias emit_value=\'echo "$1" >&2\'; emit_value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-before-enable', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(alias emit_value=\'echo "$1" >&2\'\nemit_value\nshopt -s expand_aliases)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-disable-after-enable', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias emit_value=\'echo "$1" >&2\'\nshopt -u expand_aliases\nemit_value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-literal-positional', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias emit_value=\'echo \'\\\'\'$1\'\\\'\' >&2\'\nemit_value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-escaped-positional', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias emit_value=\'echo "\\$1" >&2\'\nemit_value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-argument', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias emit_value=\'echo "$1" >&2\'\nprintf "%s" emit_value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-init-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(for ((x=1/\'$1\'; x; x--)); do :; done)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-condition-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(for ((x=1; 1/\'$1\'; x--)); do :; done)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-for-update-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(for ((x=1; x; x=1/\'$1\')); do :; done)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-bounded-alias-expanding-quoted-hd', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(shopt -s expand_aliases\nalias emit_value=\'echo "$1" >&2\'\nemit_value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+
+    # Measured literal time/-p arithmetic prefixes; split oracle forms stay side evidence.
+    ('helper-hd-round11-time-if-time', MUST_FLAG, 'leak() { printf safe <<EOF\n$(if time ((1/\'$1\'));then :;fi)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-negation-time', MUST_FLAG, 'leak() { printf safe <<EOF\n$(! time ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-quoted-time', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(\'time\' ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-escaped-time', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(ti\\me ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-command-time', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(command time ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-time-printf-quoted-data', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(time printf \'%s\' \'((1/$1))\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-time-assignment', MUST_FLAG, 'leak() { printf safe <<EOF\n$(time a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-time-p-assignment', MUST_FLAG, 'leak() { printf safe <<EOF\n$(time -p a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-quoted-time-data', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(printf \'%s\' \'time ((1/$1))\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-unknown-option', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(time -x ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-quoted-p', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(time \'-p\' ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-builtin-time', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(builtin time ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-env-time', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(env time ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-path-time', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(/usr/bin/time ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-time-later-argument', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(time printf \'%s\' a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+
+    # Reserved prefixes at the same physical arithmetic delimiter.
+    ('helper-hd-round11-prefix-command-index', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(command a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-builtin-index', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(builtin a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-command-arith', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(command ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-builtin-arith', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(builtin ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-if-adjacent', MUST_FLAG, 'leak() { printf safe <<EOF\n$(if((1/\'$1\')); then :; fi)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-while-adjacent', MUST_FLAG, 'leak() { printf safe <<EOF\n$(while((1/\'$1\')); do break; done)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-until-adjacent', MUST_FLAG, 'leak() { printf safe <<EOF\n$(until((1/\'$1\')); do break; done)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-negated-arith', MUST_FLAG, 'leak() { printf safe <<EOF\n$(! ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-arithmetic-after-redir', MUST_FLAG, 'leak() { printf safe <<EOF\n$(>/dev/null ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-if-quoted-prefix', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(\'if\'((1/\'$1\')); then :; fi)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-if-escaped-prefix', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(i\\f((1/\'$1\')); then :; fi)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-function-prefix', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(fake((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-array-DATA-prefix', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(args=((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-time-quoted-data', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(printf \'%s\' \'time ((1/$1))\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-negation-adjacent', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(!((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-prefix-if-adjacent-tail', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(if((1+2)); then printf \'%s\' \'$1\'; fi)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+
+    # Actual arithmetic command/index roles in HD substitution source (#1496).
+    ('helper-hd-round11-command', MUST_FLAG, 'leak(){ printf safe <<EOF\n$( ((1/\'$1\')) )\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-spaces', MUST_FLAG, 'leak(){ printf safe <<EOF\n$( ((1 / \'$1\')) )\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-nested', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(a[b[1/\'$1\']]=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-spaces', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(a[1 / \'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-quoted-bracket', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(a[1/\'$1]\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-plus', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(a[\'$1\']+=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-prefix', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(a[\'$1\']=value :)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-argument', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(printf \'%s\' a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-whole-quoted', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(printf \'%s\' \'a[$1]=value\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-escaped-dollar', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(a[\'\\$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-inert', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(printf \'%s\' \'((1/$1))\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-comment', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(printf safe # ((1/\'$1\'))\n)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-comment', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(printf safe # a[\'$1\']=value\n)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-escaped-dollar', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$( ((1/\'\\$1\')) )\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-safe-positional', MUST_FLAG, 'leak(){ printf safe <<EOF\n$( (($1+1)) )\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-in-if', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(if ((1/\'$1\'));then :;fi)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-after-data', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(printf \'%s\' \'((1/$1))\'; ((1/\'$1\')))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-tail-inert', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$( ((1+2)); printf \'%s\' \'$1\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-tail-inert', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(a[1+2]=value; printf \'%s\' \'$1\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-value-inert', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(a[1+2]=\'$1\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-in-if', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(if a[\'$1\']=value;then :;fi)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-outer-doublequote', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(printf \'%s\' "((1/\'\\$1\'))")\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-depth-one', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(eval "((1/\'\\$1\'))")\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-depth-two', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(eval "eval \\"((1/\'\\\\\\$1\'))\\"")\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-depth-one', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(eval "a[\'\\$1\']=value")\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-depth-two', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(eval "eval \\"a[\'\\\\\\$1\']=value\\"")\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-declare', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n$(declare -a a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-subshell', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(( ((1/\'$1\')) ))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-after-redirection', MUST_FLAG, 'leak(){ printf safe <<EOF\n$(>/dev/null a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-quoted-delimiter', MUST_NOT_FLAG, 'leak(){ printf safe <<\'EOF\'\n$( ((1/\'$1\')) )\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-assignment-quoted-delimiter', MUST_NOT_FLAG, 'leak(){ printf safe <<\'EOF\'\n$(a[\'$1\']=value)\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-command-two-quoted-delimiter', MUST_NOT_FLAG, 'leak(){ printf safe <<\\EOF\n$( ((1/\'$1\')) )\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-plain-inert-nonstdin', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\n((1/\'$1\'))\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-plain-assignment-inert-nonstdin', MUST_NOT_FLAG, 'leak(){ printf safe <<EOF\na[\'$1\']=value\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-adjacent-let', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(let \'1/$1\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-adjacent-let-quoted', MUST_FLAG, 'leak() { printf safe <<EOF\n$(let "1/\'$1\'")\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-adjacent-declare-index', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(declare -a \'a[$1]=value\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-adjacent-declare-quoted-index', MUST_FLAG, 'leak() { printf safe <<EOF\n$(declare -a "a[\'$1\']=value")\nEOF\n}\nleak "$GH_TOKEN"\n'),
+    ('helper-hd-round11-adjacent-local-index', MUST_NOT_FLAG, 'leak() { printf safe <<EOF\n$(local -a \'a[$1]=value\')\nEOF\n}\nleak "$GH_TOKEN"\n'),
     ('printf-option-a-braced-value', MUST_NOT_FLAG, 'printf -vout \'%s\' "${GH_TOKEN}"\n'),
     ('printf-option-a-readline-target', MUST_FLAG, 'printf -vREADLINE_LINE \'%s\' "$GH_TOKEN"\n'),
     ('printf-option-a-lowercase-special', MUST_FLAG, 'printf -vhistchars \'%s\' "$GH_TOKEN"\n'),
@@ -5500,6 +6046,97 @@ CORPUS = [
         "helper-heredoc",
         MUST_FLAG,
         'usage() {\n  cat <<EOF\ntoken=$1\nEOF\n}\nusage "$GH_TOKEN"\n',
+    ),
+    # #1496: one positional-value decision with here-doc quoting rules.
+    (
+        'helper-heredoc-positional-default',
+        MUST_FLAG,
+        'die() { cat <<EOF >&2\nerror: ${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-direct',
+        MUST_FLAG,
+        'die() { cat <<EOF >&2\nerror: $1\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-escaped',
+        MUST_NOT_FLAG,
+        'die() { cat <<EOF >&2\nerror: \\$1\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-single-quotes-literal',
+        MUST_FLAG,
+        'die() { cat <<EOF >&2\nerror: \'$1\'\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-double-quotes-literal',
+        MUST_FLAG,
+        'die() { cat <<EOF >&2\nerror: "$1"\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-nonspecial-escaped-apostrophe',
+        MUST_FLAG,
+        'die() { cat <<EOF >&2\nerror: \\\'$1\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-nonspecial-escaped-quote',
+        MUST_FLAG,
+        'die() { cat <<EOF >&2\nerror: \\"$1\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-paired-backslashes',
+        MUST_FLAG,
+        'die() { cat <<EOF >&2\nerror: \\\\$1\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-escaped-default',
+        MUST_NOT_FLAG,
+        'die() { cat <<EOF >&2\nerror: \\${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-continued-name',
+        MUST_FLAG,
+        'die() { cat <<EOF >&2\nerror: $\\\n1\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-escaped-continued-name',
+        MUST_NOT_FLAG,
+        'die() { cat <<EOF >&2\nerror: \\$\\\n1\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-constant-alternate',
+        MUST_NOT_FLAG,
+        'die() { cat <<EOF >&2\nerror: ${1:+set}\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-length',
+        MUST_NOT_FLAG,
+        'die() { cat <<EOF >&2\nerror: ${#1}\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-substitution-quoted-data',
+        MUST_NOT_FLAG,
+        'die() { cat <<EOF >&2\nerror: $(printf \'%s\' \'$1\')\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-heredoc-positional-substitution-value',
+        MUST_FLAG,
+        'die() { cat <<EOF >&2\nerror: $(printf \'%s\' "$1")\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-quoted-heredoc-positional-default',
+        MUST_NOT_FLAG,
+        'die() { cat <<\'EOF\' >&2\nerror: ${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-quoted-heredoc-positional-direct',
+        MUST_NOT_FLAG,
+        'die() { cat <<\'EOF\' >&2\nerror: $1\nEOF\n}\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-quoted-heredoc-positional-escaped',
+        MUST_NOT_FLAG,
+        'die() { cat <<\'EOF\' >&2\nerror: \\$1\nEOF\n}\ndie "$GH_TOKEN"\n',
     ),
     (
         # `cat`/`tee` write their STANDARD INPUT, so a helper handing a
@@ -7479,6 +8116,307 @@ CORPUS = [
         MUST_NOT_FLAG,
         ': \'x\ry\'\ncat <<\'EOF\' >/dev/null\n$(function log\n{ echo "$1"; }\nlog "$GH_TOKEN" >&2)\nEOF\n',
     ),
+    # #1496: backtick source escaping differs from plain heredoc DATA.
+    ('helper-heredoc-escaped-backtick-positional', MUST_FLAG, 'die() { cat <<EOF >&2\n`printf \'%s\' \\$1`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-direct-backtick-positional', MUST_FLAG, 'die() { cat <<EOF >&2\n`printf \'%s\' $1`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-plain-heredoc-escaped-control', MUST_NOT_FLAG, 'die() { cat <<EOF >&2\n\\$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-modern-substitution-escaped-control', MUST_NOT_FLAG, 'die() { cat <<EOF >&2\n$(printf \'%s\' \\$1)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-backtick-quoted-positional-data-control', MUST_NOT_FLAG, 'die() { cat <<EOF >&2\n`printf \'%s\' \'$1\'`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-quoted-delimiter-backtick-control', MUST_NOT_FLAG, 'die() { cat <<\'EOF\' >&2\n`printf \'%s\' \\$1`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-escaped-backtick-opener-control', MUST_NOT_FLAG, 'die() { cat <<EOF >&2\n\\`printf \'%s\' \\$1\\`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-backtick-nonspecial-escape', MUST_NOT_FLAG, 'die() { cat <<EOF >&2\n`printf \'%s\' \'\\x\'`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-fallback-backtick-escaped-positional', MUST_FLAG, 'die() { cat <<EOF >&2\n${A:-${B:-x}} `printf \'%s\' \\$1`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-backtick-2-backslashes', MUST_FLAG, 'die() { cat <<EOF >&2\n`printf \'%s\' \\\\$1`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-backtick-3-backslashes', MUST_NOT_FLAG, 'die() { cat <<EOF >&2\n`printf \'%s\' \\\\\\$1`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-heredoc-backtick-4-backslashes', MUST_FLAG, 'die() { cat <<EOF >&2\n`printf \'%s\' \\\\\\\\$1`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    # #1496: deferred substitution source and stdin owner boundaries.
+    ('helper-hd-eval-positional', MUST_FLAG, 'die() { cat <<EOF\n$(eval \'echo $1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-backtick-eval-positional', MUST_FLAG, 'die() { cat <<EOF\n`eval \'echo $1\'`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-exit-trap-positional', MUST_FLAG, 'die() { cat <<EOF\n$(trap \'echo $1\' EXIT)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-backtick-trap-positional', MUST_FLAG, 'die() { cat <<EOF\n`trap \'echo $1\' EXIT`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-callback-positional', MUST_FLAG, 'die() { cat <<EOF\n$(mapfile -C \'echo $1;\' -c 1 rows < <(printf \'x\\n\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-eval-redacted-data-control', MUST_NOT_FLAG, 'die() { cat <<EOF\n$(eval \'echo ${1:+set}\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-eval-no-output-conservative', MUST_FLAG, 'die() { cat <<EOF\n$(eval \': $1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-substitution-quoted-data-control', MUST_NOT_FLAG, 'die() { cat <<EOF\n$(printf %s \'$1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-eval-quoted-delimiter-control', MUST_NOT_FLAG, 'die() { cat <<\'EOF\'\n$(eval \'echo $1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-eval-depth-two-boundary', MUST_NOT_FLAG, 'die() { cat <<EOF\n$(eval "eval \'echo \\$1\'")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-default-inert-body', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-echo-default-inert-body', MUST_NOT_FLAG, 'die() { echo safe <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-direct-inert-body', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-cat-default-emits-control', MUST_FLAG, 'die() { cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-default-emits-control', MUST_FLAG, 'die() { tee <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-independent-stderr-substitution', MUST_FLAG, 'die() { printf safe <<EOF\n$(echo "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-independent-error-word', MUST_FLAG, 'die() { printf safe <<EOF\n${UNSET:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-direct-argument-control', MUST_FLAG, 'die() { printf %s "$1" <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-quoted-delimiter-control', MUST_NOT_FLAG, 'die() { printf safe <<\'EOF\'\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-independent-deferred-stderr', MUST_FLAG, 'die() { printf safe <<EOF\n$(eval \'echo $1 >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-captured-deferred-stdout-conservative', MUST_FLAG, 'die() { printf safe <<EOF\n$(eval \'echo $1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-no-output-deferred-conservative', MUST_FLAG, 'die() { printf safe <<EOF\n$(eval \': $1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-printf-captured-direct-stdout-conservative', MUST_FLAG, 'die() { printf safe <<EOF\n$(echo "$1")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-callback-data-control', MUST_NOT_FLAG, 'die() { cat <<EOF\n$(mapfile -C \'printf literal;\' -c 1 rows < <(printf \'x\\n\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    # #1496: shadowing, continued openers and arithmetic diagnostics.
+    ('helper-hd-round4-shadow-cat-default', MUST_FLAG, 'cat() { :; }\ndie() { cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-tee-default', MUST_FLAG, 'tee() { :; }\ndie() { tee <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-known-cat-default-control', MUST_FLAG, 'die() { cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-known-tee-default-control', MUST_FLAG, 'die() { tee <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-cat-independent-substitution', MUST_FLAG, 'cat() { :; }\ndie() { cat <<EOF\n$(echo "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-cat-independent-error-word', MUST_FLAG, 'cat() { :; }\ndie() { cat <<EOF\n${UNSET:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-continued-command-substitution', MUST_FLAG, 'die() { printf safe <<EOF\n$\\\n(echo "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-continued-error-word', MUST_FLAG, 'die() { printf safe <<EOF\n$\\\n{UNSET:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-continued-command-substitution-direct', MUST_FLAG, 'printf safe <<EOF\n$\\\n(echo "$GH_TOKEN" >&2)\nEOF\n'),
+    ('helper-hd-round4-continued-error-word-direct', MUST_FLAG, 'printf safe <<EOF\n$\\\n{UNSET:?$GH_TOKEN}\nEOF\n'),
+    ('helper-hd-round4-quoted-continued-command-control', MUST_NOT_FLAG, 'die() { printf safe <<\'EOF\'\n$\\\n(echo "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-quoted-continued-error-control', MUST_NOT_FLAG, 'die() { printf safe <<\'EOF\'\n$\\\n{UNSET:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-arithmetic-diagnostic', MUST_FLAG, 'die() { printf safe <<EOF\n$((1 / $1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-arithmetic-diagnostic-echo', MUST_FLAG, 'die() { echo safe <<EOF\n$((1 / $1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-arithmetic-diagnostic-direct', MUST_FLAG, 'printf safe <<EOF\n$((1 / $GH_TOKEN))\nEOF\n'),
+    ('helper-hd-round4-arithmetic-safe-conservative', MUST_FLAG, 'die() { printf safe <<EOF\n$((0 + $1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-arithmetic-escaped-opener-control', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n\\$((1 / $1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-arithmetic-quoted-delimiter-control', MUST_NOT_FLAG, 'die() { printf safe <<\'EOF\'\n$((1 / $1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-arithmetic-literal-control', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$((1 + 2))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-arithmetic-continued-opener', MUST_FLAG, 'die() { printf safe <<EOF\n$\\\n((1 / $1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-continuation-2-backslashes-substitution', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$\\\\\n(echo "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-continuation-2-backslashes-error-word', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$\\\\\n{UNSET:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-continuation-3-backslashes-substitution', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$\\\\\\\n(echo "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-continuation-3-backslashes-error-word', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$\\\\\\\n{UNSET:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-escaped-substitution-control', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n\\$(echo "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-escaped-error-word-control', MUST_FLAG, 'die() { printf safe <<EOF\n\\${UNSET:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-cat-command-bypass', MUST_FLAG, 'cat() { :; }\ndie() { command cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-tee-command-bypass', MUST_FLAG, 'tee() { :; }\ndie() { command tee <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-cat-literal-path-bypass', MUST_FLAG, 'cat() { :; }\ndie() { /bin/cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-tee-literal-path-bypass', MUST_FLAG, 'tee() { :; }\ndie() { /usr/bin/tee <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-cat-command-default-path', MUST_FLAG, 'cat() { :; }\ndie() { command -p -- cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-cat-command-report-control', MUST_FLAG, 'cat() { :; }\ndie() { command -v cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-command-cat-data-control', MUST_FLAG, 'command() { :; }\ncat() { :; }\ndie() { command cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-cat-command-redirection-target-control', MUST_FLAG, 'cat() { :; }\ndie() { >command cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-cat-command-upper-report-control', MUST_FLAG, 'cat() { :; }\ndie() { command -V cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-nested-command-report-control', MUST_FLAG, 'cat() { :; }\ndie() { command -v command cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-inner-command-report-control', MUST_FLAG, 'cat() { :; }\ndie() { command command -V cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-unshadowed-command-report-control', MUST_FLAG, 'die() { command -v cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-unshadowed-command-upper-report-control', MUST_FLAG, 'die() { command -V tee <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-qualified-command-report-control', MUST_FLAG, 'cat() { :; }\ndie() { command -v /bin/cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-command-qualified-target-control', MUST_FLAG, 'command() { :; }\ncat() { :; }\ndie() { command /bin/cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-command-unshadowed-target-control', MUST_FLAG, 'command() { :; }\ndie() { command cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-shadow-cat-command-qualified-target-bypass', MUST_FLAG, 'cat() { :; }\ndie() { command /bin/cat <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-cat-defined-after-call', MUST_FLAG, 'die() { cat <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\ncat() { :; }\n'),
+    ('helper-hd-round4-cat-defined-in-false-branch', MUST_FLAG, 'if false; then cat() { :; }\nfi\ndie() { cat <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-tee-defined-after-call', MUST_FLAG, 'die() { tee <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\ntee() { :; }\n'),
+    ('helper-hd-round4-tee-defined-in-false-branch', MUST_FLAG, 'if false; then tee() { :; }\nfi\ndie() { tee <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-command-defined-after-call', MUST_FLAG, 'die() { command cat <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\ncommand() { :; }\n'),
+    ('helper-hd-round4-command-defined-in-false-branch', MUST_FLAG, 'if false; then command() { :; }\nfi\ndie() { command cat <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round4-cat-restored-before-call', MUST_FLAG, 'cat() { :; }\nunset -f cat\ndie() { cat <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-substring-offset-diagnostic', MUST_FLAG, 'die() { printf safe <<EOF\n${1:1/$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-array-index-diagnostic', MUST_FLAG, 'die() { printf safe <<EOF\n${a[1/$1]}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-substring-length-diagnostic', MUST_FLAG, 'die() { printf safe <<EOF\n${1:0:1/$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-substring-safe-positional-conservative', MUST_FLAG, 'die() { printf safe <<EOF\n${1:0+$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-array-safe-positional-conservative', MUST_FLAG, 'die() { printf safe <<EOF\n${a[0+$1]}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-substring-literal-control', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n${1:1:2}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-array-literal-control', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n${a[1]}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-parameter-value-inert-control', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n${1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-parameter-default-inert-control', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-parameter-alternate-inert-control', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n${1:+literal}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-escaped-substring-control', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n\\${1:1/$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-escaped-array-control', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n\\${a[1/$1]}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-substring-echo-diagnostic', MUST_FLAG, 'die() { echo safe <<EOF\n${1:1/$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-substring-quoted-delimiter-control', MUST_NOT_FLAG, 'die() { printf safe <<\'EOF\'\n${1:1/$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-array-quoted-delimiter-control', MUST_NOT_FLAG, 'die() { printf safe <<\'EOF\'\n${a[1/$1]}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-substring-heredoc-apostrophe-literal', MUST_FLAG, 'die() { printf safe <<EOF\n\'${1:1/$1}\'\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-array-direct-diagnostic', MUST_FLAG, 'printf safe <<EOF\n${a[1/$GH_TOKEN]}\nEOF\n'),
+    ('helper-hd-round5-case-arm-stderr', MUST_FLAG, 'die() { printf safe <<EOF\n$(case x in x) echo "$1" >&2;; esac)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-case-parenthesized-pattern', MUST_FLAG, 'die() { printf safe <<EOF\n$(case x in (x) echo "$1" >&2;; esac)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-case-no-output-conservative', MUST_FLAG, 'die() { printf safe <<EOF\n$(case x in x) : "$1";; esac)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-case-captured-stdout-conservative', MUST_FLAG, 'die() { printf safe <<EOF\n$(case x in x) echo "$1";; esac)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-case-literal-arm-control', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$(case x in x) echo literal >&2;; esac)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-case-nested-arm-stderr', MUST_FLAG, 'die() { printf safe <<EOF\n$(case x in x) case y in y) echo "$1" >&2;; esac;; esac)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-case-backtick-source-control', MUST_FLAG, 'die() { printf safe <<EOF\n`case x in x) echo "$1" >&2;; esac`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-case-escaped-opener-control', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n\\$(case x in x) echo "$1" >&2;; esac)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-comment-closer-stderr', MUST_FLAG, 'die() { printf safe <<EOF\n$(# ignored )\necho "$1" >&2\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-case-quoted-delimiter-control', MUST_NOT_FLAG, 'die() { printf safe <<\'EOF\'\n$(case x in x) echo "$1" >&2;; esac)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-case-direct-stderr', MUST_FLAG, 'printf safe <<EOF\n$(case x in x) echo "$GH_TOKEN" >&2;; esac)\nEOF\n'),
+    ('helper-hd-round5-adjacent-ordinary-case-helper', MUST_FLAG, 'die() { v=$(case x in x) echo "$1" >&2;; esac); }\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-ordinary-case-quoted-data-control', MUST_NOT_FLAG, "v='$(case x in x) echo $GH_TOKEN >&2;; esac)'\n"),
+    ('helper-hd-round5-array-length-index-diagnostic', MUST_FLAG, 'die() { printf safe <<EOF\n${#a[1/$1]}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-named-substring-diagnostic', MUST_FLAG, 'die() { printf safe <<EOF\n${a:1/$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-zero-substring-diagnostic', MUST_FLAG, 'die() { printf safe <<EOF\n${0:1/$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-array-indirect-index-diagnostic', MUST_FLAG, 'die() { printf safe <<EOF\n${!a[1/$1]}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-initialized-array-length-diagnostic', MUST_FLAG, 'a=(value)\ndie() { printf safe <<EOF\n${#a[1/$1]}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-initialized-named-substring-diagnostic', MUST_FLAG, 'a=value\ndie() { printf safe <<EOF\n${a:1/$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round5-complex-tail-inert-positional-conservative', MUST_FLAG, 'die() { printf safe <<EOF\n$(case x in x) echo literal;; esac) $1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    # #1496: legacy arithmetic diagnostic inventory stays HD-only.
+    ('helper-hd-round6-legacy-diagnostic', MUST_FLAG, 'die() { printf safe <<EOF\n$[1 / $1]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-echo-diagnostic', MUST_FLAG, 'die() { echo safe <<EOF\n$[1 / $1]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-direct-diagnostic', MUST_FLAG, 'printf safe <<EOF\n$[1 / $GH_TOKEN]\nEOF\n'),
+    ('helper-hd-round6-legacy-safe-positional', MUST_FLAG, 'die() { printf safe <<EOF\n$[0 + $1]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-literal', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$[1 + 2]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-escaped-opener', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n\\$[1 / $1]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-quoted-delimiter', MUST_NOT_FLAG, 'die() { printf safe <<\'EOF\'\n$[1 / $1]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-body-apostrophes', MUST_FLAG, 'die() { printf safe <<EOF\n\'$[1 / $1]\'\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-body-doublequotes', MUST_FLAG, 'die() { printf safe <<EOF\n"$[1 / $1]"\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-continued-opener', MUST_FLAG, 'die() { printf safe <<EOF\n$\\\n[1 / $1]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-nested-legacy', MUST_FLAG, 'die() { printf safe <<EOF\n$[1 / $[0 + $1]]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-array-unset', MUST_FLAG, 'die() { printf safe <<EOF\n$[a[1 / $1]]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-array-initialized', MUST_FLAG, 'a=(value)\ndie() { printf safe <<EOF\n$[a[1 / $1]]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-quote-boundary', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$[1 + 2] "$1"\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-nested-array-boundary', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$[a[0] + 2] $1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-operand-doublequote', MUST_FLAG, 'die() { printf safe <<EOF\n$[1 / "$1"]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-operand-singlequote', MUST_FLAG, 'die() { printf safe <<EOF\n$[1 / \'$1\']\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-operand-escaped', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$[1 / \\$1]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-after-array-close', MUST_FLAG, 'die() { printf safe <<EOF\n$[a[0] + 1 / $1]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-nested-legacy-diagnostic', MUST_FLAG, 'die() { printf safe <<EOF\n$[1 / $[1 / $1]]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-nested-modern-diagnostic', MUST_FLAG, 'die() { printf safe <<EOF\n$[1 / $((1 / $1))]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-quoted-literal-boundary', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$[1 + "]"] $1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round6-legacy-double-escaped-opener', MUST_FLAG, 'die() { printf safe <<EOF\n\\\\$[1 / $1]\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    # #1496: HD escape boundaries and diagnostic operand quote context.
+    ('helper-hd-round7-backtick-escaped-comment', MUST_FLAG, 'die() { printf safe <<EOF\n`# \\`\necho "$1" >&2`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-backtick-escaped-comment-quiet', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n`# \\`\necho literal >&2`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-backtick-escaped-comment-captured', MUST_FLAG, 'die() { printf safe <<EOF\n`# \\`\nprintf "%s" "$1"`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-backtick-escaped-comment-quoted-delimiter', MUST_NOT_FLAG, 'die() { printf safe <<\'EOF\'\n`# \\`\necho "$1" >&2`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-backtick-escaped-opener', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n\\`echo "$1" >&2\\`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-quoted-brace', MUST_FLAG, 'die() { printf safe <<EOF\n${UNSET:?"}"$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-singlequoted-brace', MUST_FLAG, 'die() { printf safe <<EOF\n${UNSET:?\' } \'$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-nested-parameter', MUST_FLAG, 'die() { printf safe <<EOF\n${UNSET:?"}"${OTHER:-$1}}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-nested-substitution', MUST_FLAG, 'die() { printf safe <<EOF\n${UNSET:?"}"$(printf "%s" "$1")}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-literal-tail', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n${UNSET:?"}"literal} $1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-set-control', MUST_FLAG, 'SET=value\ndie() { printf safe <<EOF\n${SET:?"}"$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-escaped-opener', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n\\${UNSET:?"}"$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-quoted-delimiter', MUST_NOT_FLAG, 'die() { printf safe <<\'EOF\'\n${UNSET:?"}"$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-modern-singlequote', MUST_FLAG, 'die() { printf safe <<EOF\n$((1 / \'$1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-modern-doublequote', MUST_FLAG, 'die() { printf safe <<EOF\n$((1 / "$1"))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-parameter-array-singlequote', MUST_FLAG, 'die() { printf safe <<EOF\n${a[1/\'$1\']}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-parameter-array-set-singlequote', MUST_FLAG, 'a=(value)\ndie() { printf safe <<EOF\n${a[1/\'$1\']}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-parameter-substring-set-singlequote', MUST_FLAG, 'a=value\ndie() { printf safe <<EOF\n${a:1/\'$1\'}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-parameter-substring-unset-singlequote', MUST_FLAG, 'die() { printf safe <<EOF\n${a:1/\'$1\'}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-modern-escaped-operand', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$((1 / \\$1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-modern-quoted-delimiter', MUST_NOT_FLAG, 'die() { printf safe <<\'EOF\'\n$((1 / \'$1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-modern-literal-boundary', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$((1 + 2)) \'$1\'\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-parameter-literal-boundary', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n${a[1 + 2]} \'$1\'\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-command-substitution-singlequote', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n$(printf "%s" \'$1\' >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-command-substitution-doublequote', MUST_FLAG, 'die() { printf safe <<EOF\n$(printf "%s" "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-command-substitution-captured', MUST_FLAG, 'die() { printf safe <<EOF\n$(printf "%s" "$1")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-backtick-singlequote-source', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n`printf \'%s\' \'$1\' >&2`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-nested-quoted-parameter', MUST_FLAG, 'die() { printf safe <<EOF\n${UNSET:?${OTHER:-"}"}$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-nested-quoted-substitution', MUST_FLAG, 'die() { printf safe <<EOF\n${UNSET:?$(printf \'}\')$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-substitution-literal-source', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n${UNSET:?$(printf "%s" \'$1\')}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-error-nested-literal-tail', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n${UNSET:?${OTHER:-"}"}literal} $1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-modern-body-literal-quotes', MUST_FLAG, 'die() { printf safe <<EOF\n\'$((1 / \'$1\'))\'\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-parameter-body-literal-quotes', MUST_FLAG, 'die() { printf safe <<EOF\n\'${a[1/\'$1\']}\'\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-modern-escaped-opener', MUST_NOT_FLAG, 'die() { printf safe <<EOF\n\\$((1 / \\\'$1\\\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round7-backtick-comment-nested-parameter', MUST_FLAG, 'die() { printf safe <<EOF\n`# \\`\necho "${1:-unknown}" >&2`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    # #1496: unresolved/opaque owners retain conservative stdin admission.
+    ('helper-hd-round8-unresolved-cat', MUST_FLAG, 'c=cat\ndie(){ "$c" <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-cat-default', MUST_FLAG, 'c=cat\ndie(){ "$c" <<EOF\n${1:-unknown}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-cat-body-quotes', MUST_FLAG, 'c=cat\ndie(){ "$c" <<EOF\n\'$1\'\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-cat-quoted-delimiter', MUST_NOT_FLAG, 'c=cat\ndie(){ "$c" <<\'EOF\'\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-cat-escaped-positional', MUST_NOT_FLAG, 'c=cat\ndie(){ "$c" <<EOF\n\\$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-cat-redacted-set', MUST_NOT_FLAG, 'c=cat\ndie(){ "$c" <<EOF\n${1:+set}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-cat-redacted-length', MUST_NOT_FLAG, 'c=cat\ndie(){ "$c" <<EOF\n${#1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-printf-safe', MUST_FLAG, 'c=printf\ndie(){ "$c" safe <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-echo-safe', MUST_FLAG, 'c=echo\ndie(){ "$c" safe <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-true-safe', MUST_FLAG, 'c=true\ndie(){ "$c" <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-read-safe', MUST_FLAG, 'c=read\ndie(){ "$c" x <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-quiet-shadow', MUST_FLAG, 'quiet(){ :; }; c=quiet\ndie(){ "$c" <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-known-printf-inert', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-known-echo-inert', MUST_NOT_FLAG, 'die(){ echo safe <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-known-read-stores', MUST_NOT_FLAG, 'die(){ read x <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-known-cat-emits', MUST_FLAG, 'die(){ cat <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-opaque-eval-cat', MUST_FLAG, 'die(){ eval cat <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-opaque-eval-quiet', MUST_FLAG, 'die(){ eval : <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-opaque-source-stdin', MUST_FLAG, 'die(){ source /dev/stdin <<EOF\nprintf "%s" "$1"\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-opaque-source-quiet', MUST_FLAG, 'die(){ source /dev/null <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-opaque-trap-quiet', MUST_FLAG, 'die(){ trap : EXIT <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-opaque-eval-quoted-delimiter', MUST_NOT_FLAG, 'die(){ eval cat <<\'EOF\'\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-opaque-eval-escaped-positional', MUST_NOT_FLAG, 'die(){ eval cat <<EOF\n\\$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round8-unresolved-cat-literal', MUST_NOT_FLAG, 'c=cat\ndie(){ "$c" <<EOF\nliteral\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    # #1496: positional guards, shared finite nested HD and attribute-only words.
+    ('helper-hd-round9-positional-error-colon', MUST_FLAG, 'die(){ printf safe <<EOF\n${2:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-nocolon', MUST_FLAG, 'die(){ printf safe <<EOF\n${2?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-ten', MUST_FLAG, 'die(){ printf safe <<EOF\n${10:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-set-control', MUST_FLAG, 'die(){ printf safe <<EOF\n${2:?$1}\nEOF\n}\ndie "$GH_TOKEN" "second"\n'),
+    ('helper-hd-round9-positional-error-quoted-brace', MUST_FLAG, 'die(){ printf safe <<EOF\n${2:?"}"$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-literal', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n${2:?literal}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-escaped-opener', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n\\${2:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-escaped-operand', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n${2:?\\$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-quoted-delimiter', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n${2:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-cat-interpolating', MUST_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER >&2\n\'$1\'\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-cat-quoted-delimiter', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(cat <<\'INNER\' >&2\n\'$1\'\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-cat-escaped-positional', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER >&2\n\\$1\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-cat-literal', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER >&2\nliteral\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-printf-inert', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(printf safe <<INNER >&2\n\'$1\'\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-read-stores', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(read x <<INNER\n\'$1\'\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-cat-captured', MUST_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER\n\'$1\'\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-cat-outer-quoted', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(cat <<INNER >&2\n\'$1\'\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-opaque-eval-cat', MUST_FLAG, 'die(){ printf safe <<EOF\n$(eval cat <<INNER >&2\n\'$1\'\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-error-independent', MUST_FLAG, 'die(){ printf safe <<EOF\n$(printf safe <<INNER\n${UNSET:?"}"$1}\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-arithmetic-independent', MUST_FLAG, 'die(){ printf safe <<EOF\n$(printf safe <<INNER\n$((1/\'$1\'))\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-cat-a', MUST_NOT_FLAG, 'die(){ cat <<EOF\n${1@a}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-tee-a', MUST_NOT_FLAG, 'die(){ tee <<EOF\n${1@a}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-cat-A', MUST_FLAG, 'die(){ cat <<EOF\n${1@A}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-cat-Q', MUST_FLAG, 'die(){ cat <<EOF\n${1@Q}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-cat-two-a', MUST_NOT_FLAG, 'die(){ cat <<EOF\n${2@a}\nEOF\n}\ndie "$GH_TOKEN" "second"\n'),
+    ('helper-hd-round9-attributes-cat-quoted-delimiter', MUST_NOT_FLAG, 'die(){ cat <<\'EOF\'\n${1@a}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-cat-escaped', MUST_NOT_FLAG, 'die(){ cat <<EOF\n\\${1@a}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-direct-ordinary-a', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n${1@a}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-hd-depth-two-boundary', MUST_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER\n$(cat <<DEEP >&2\n\'$1\'\nDEEP\n)\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-hd-deferred-depth-two-boundary', MUST_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER\n$(eval \'echo $1 >&2\')\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-deferred-depth-one-leak', MUST_FLAG, 'die(){ printf safe <<EOF\n$(eval \'echo $1 >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-hd-depth-one-leak', MUST_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER >&2\n\'$1\'\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-hd-depth-two-literal', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER\n$(cat <<DEEP >&2\nliteral\nDEEP\n)\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-ordinary-a', MUST_NOT_FLAG, 'die(){ printf "%s" "${1@a}"; }\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-ordinary-Q', MUST_FLAG, 'die(){ printf "%s" "${1@Q}"; }\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-fallback-a', MUST_NOT_FLAG, 'die(){ printf "%s" "${X:-${Y:-literal}}${1@a}"; }\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-attributes-fallback-Q', MUST_FLAG, 'die(){ printf "%s" "${X:-${Y:-literal}}${1@Q}"; }\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-suffix-inert', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n${2:?literal} $1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-special-redacted', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n${2:?${1@a}}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-positional-error-value-Q', MUST_FLAG, 'die(){ printf safe <<EOF\n${2:?${1@Q}}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-backtick-depth-two-boundary', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER\n`cat <<DEEP >&2\n\'$1\'\nDEEP\n`\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-nested-backtick-deferred-depth-two-boundary', MUST_FLAG, 'die(){ printf safe <<EOF\n$(cat <<INNER\n`eval \'echo $1 >&2\'`\nINNER\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round9-backtick-depth-one-HDstderr', MUST_FLAG, 'die(){ printf safe <<EOF\n`cat <<INNER >&2\n\'$1\'\nINNER\n`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    # #1496: opt-in indirect guards and arithmetic in executable source context.
+    ('helper-hd-round10-indirect-named-error', MUST_FLAG, 'x=MISSING\ndie(){ printf safe <<EOF\n${!x:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-indirect-named-error-no-colon', MUST_FLAG, 'x=MISSING\ndie(){ printf safe <<EOF\n${!x?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-indirect-named-set-control', MUST_FLAG, 'x=KNOWN; KNOWN=value\ndie(){ printf safe <<EOF\n${!x:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-indirect-positional-error', MUST_FLAG, 'die(){ printf safe <<EOF\n${!2:?$1}\nEOF\n}\ndie "$GH_TOKEN" "MISSING"\n'),
+    ('helper-hd-round10-indirect-positional-set-control', MUST_FLAG, 'KNOWN=value\ndie(){ printf safe <<EOF\n${!2:?$1}\nEOF\n}\ndie "$GH_TOKEN" "KNOWN"\n'),
+    ('helper-hd-round10-indirect-error-quoted-brace', MUST_FLAG, 'x=MISSING\ndie(){ printf safe <<EOF\n${!x:?"}"$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-indirect-error-quoted-delimiter', MUST_NOT_FLAG, 'x=MISSING\ndie(){ printf safe <<\'EOF\'\n${!x:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-indirect-error-escaped-opener', MUST_NOT_FLAG, 'x=MISSING\ndie(){ printf safe <<EOF\n\\${!x:?$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-indirect-error-escaped-word', MUST_NOT_FLAG, 'x=MISSING\ndie(){ printf safe <<EOF\n${!x:?\\$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-indirect-default-inert', MUST_NOT_FLAG, 'x=MISSING\ndie(){ printf safe <<EOF\n${!x:-$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-indirect-length-inert', MUST_NOT_FLAG, 'x=MISSING\ndie(){ printf safe <<EOF\n${#x}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-modern-arithmetic', MUST_FLAG, 'die(){ printf safe <<EOF\n$(echo $((1/\'$1\')))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-modern-arithmetic-spaces', MUST_FLAG, 'die(){ printf safe <<EOF\n$(echo $((1 / \'$1\')))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-legacy-arithmetic', MUST_FLAG, 'die(){ printf safe <<EOF\n$(echo $[1/\'$1\'])\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-legacy-arithmetic-spaces', MUST_FLAG, 'die(){ printf safe <<EOF\n$(echo $[1 / \'$1\'])\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-array-arithmetic', MUST_FLAG, 'die(){ printf safe <<EOF\n$(echo ${a[1/\'$1\']})\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-array-arithmetic-spaces', MUST_FLAG, 'die(){ printf safe <<EOF\n$(echo ${a[1 / \'$1\']})\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-arithmetic-doublequote', MUST_FLAG, 'die(){ printf safe <<EOF\n$(echo "$((1/\'$1\'))")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-arithmetic-literal-singlequote', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(echo \'$((1/$1))\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-legacy-literal-singlequote', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(echo \'$[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-array-literal-singlequote', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(echo \'${a[1/$1]}\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-arithmetic-escaped-opener', MUST_FLAG, 'die(){ printf safe <<EOF\n$(echo \\$((1/$1)))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-arithmetic-escaped-operand', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(echo $((1/\\$1)))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-arithmetic-comment-control', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(# $((1/\'$1\'))\necho literal)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-legacy-comment-control', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(# $[1/\'$1\']\necho literal)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-nonarithmetic-quoted-positional', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(echo \'$1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-arithmetic-safe-positional', MUST_FLAG, 'die(){ printf safe <<EOF\n$(echo $((0 + $1)))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-arithmetic-quoted-delimiter', MUST_NOT_FLAG, 'die(){ printf safe <<\'EOF\'\n$(echo $((1/\'$1\')))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-arithmetic-backtick', MUST_FLAG, 'die(){ printf safe <<EOF\n`echo $((1/\'$1\'))`\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-arithmetic-deferred-one-hop', MUST_FLAG, 'die(){ printf safe <<EOF\n$(eval \'echo $((1/"$1"))\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-modern-safe-owner', MUST_FLAG, 'die(){ printf safe <<EOF\n$(true $((1/\'$1\')))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-arithmetic-valid-escaped-opener', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(echo "\\$((1/\\$1))")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-legacy-escaped-opener', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(echo \\$[1/\'$1\'])\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-array-escaped-opener', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(echo "\\${a[1/\\$1]}")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-indirect-positional-ten', MUST_FLAG, 'die(){ printf safe <<EOF\n${!10:?$1}\nEOF\n}\ndie "$GH_TOKEN" "p2" "p3" "p4" "p5" "p6" "p7" "p8" "p9" "MISSING"\n'),
+    ('helper-hd-round10-indirect-error-redacted-attributes', MUST_NOT_FLAG, 'x=MISSING\ndie(){ printf safe <<EOF\n${!x:?${1@a}}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-indirect-error-value-Q', MUST_FLAG, 'x=MISSING\ndie(){ printf safe <<EOF\n${!x:?${1@Q}}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-indirect-error-literal', MUST_NOT_FLAG, 'x=MISSING\ndie(){ printf safe <<EOF\n${!x:?literal}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-substring-initialized', MUST_FLAG, 'a=value\ndie(){ printf safe <<EOF\n$(echo ${a:1/\'$1\'})\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-substring-unset-conservative', MUST_FLAG, 'die(){ printf safe <<EOF\n$(echo ${a:1/\'$1\'})\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-primitive-inert-suffix', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(echo $((1 + 2)) \'$1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-legacy-inert-suffix', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(echo $[1 + 2] \'$1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-arithmetic-deferred-child-one', MUST_FLAG, 'die(){ printf safe <<EOF\n$(eval "echo \\$((1/\\$1))")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-arithmetic-deferred-child-two-boundary', MUST_NOT_FLAG, 'die(){ printf safe <<EOF\n$(eval "eval \\\'echo \\$((1/\\$1))\\\'")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-round10-sub-arithmetic-deferred-quoted-child-one', MUST_FLAG, 'die(){ printf safe <<EOF\n$(eval "echo \\$((1/\'\\$1\'))")\nEOF\n}\ndie "$GH_TOKEN"\n'),
     # --- a credential NAME split by a line continuation ------------------
     #
     # Bash removes `\<newline>` before it parses the expansion, so these name
@@ -9110,6 +10048,52 @@ CORPUS = [
     ),
 ]
 
+CORPUS.extend([
+    ('helper-hd-later-three-test-v', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; test -v \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-bracket-v', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; [[ -v \'a[1/$1]\' ]])\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-unset', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; unset \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-read', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; read -r \'a[1/$1]\' <<<x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-alias-leak+', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak+=\'echo "$1" >&2\'\nleak+\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-alias-leak@', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak@=\'echo "$1" >&2\'\nleak@\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-alias-leak%', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak%=\'echo "$1" >&2\'\nleak%\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-alias-leak,', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak,=\'echo "$1" >&2\'\nleak,\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-alias-chain', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=inner\nalias inner=\'echo "$1" >&2\'\nouter\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-alias-punctuation-disabled', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(shopt -u expand_aliases\nalias leak+=\'echo "$1" >&2\'\nleak+\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-alias-chain-uninvoked', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=inner\nalias inner=\'echo "$1" >&2\'\n: safe\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-test-bracket', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; [ -v \'a[1/$1]\' ])\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-test-negation', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; test ! -v \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-unset-v', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; unset -v \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-unset-double-dash', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; unset -- \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-read-double-dash', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; read -- \'a[1/$1]\' <<<x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-read-delimiter-then-name', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; read -rd x \'a[1/$1]\' <<<safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-chain-long', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=middle\nalias middle=inner\nalias inner=\'echo "$1" >&2\'\nouter\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-chain-reverse', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias inner=\'echo "$1" >&2\'\nalias outer=inner\nouter\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-chain-punctuation', 'MUST_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer+=inner@\nalias inner@=\'echo "$1" >&2\'\nouter+\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-test-string-data', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; test \'a[1/$1]\' = \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-test-v-RHS-data', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(test safe = -v \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-bracket-n-data', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$([[ -n \'a[1/$1]\' ]])\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-unset-function', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(unset -f \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-unset-literal-name', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; unset \'a[1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-test-literal-name', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; test -v \'a[1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-read-literal-name', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(declare -a a; read -r \'a[1]\' <<<x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-read-delimiter-data', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(read -d \'a[1/$1]\' safe <<<x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-read-array-other-name-ignored', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(read -a a \'b[1/$1]\' <<<x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-read-initial-data', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(read -ri \'a[1/$1]\' safe <<<x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-read-invalid-option', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(read -z \'a[1/$1]\' <<<x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-printf-indexed-data', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(printf \'%s\' \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-alias-invalid-slash', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias \'bad/name=echo "$1" >&2\'\nbad/name\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-alias-invalid-space', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias \'bad name=echo "$1" >&2\'\n\'bad name\'\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-chain-disabled', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(shopt -u expand_aliases\nalias outer=inner\nalias inner=\'echo "$1" >&2\'\nouter\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-chain-cycle', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=inner\nalias inner=outer\nouter\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-chain-same-line', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=inner; alias inner=\'echo "$1" >&2\'; outer\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-chain-forward-use', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=inner\nouter\nalias inner=\'echo "$1" >&2\'\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-chain-safe-positional-data', 'MUST_NOT_FLAG', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=inner\nalias inner=\'echo \'\\\'\'$1\'\\\'\' >&2\'\nouter\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-test-v-quoted-hd', 'MUST_NOT_FLAG', 'die(){ printf safe <<\'EOF\'\n$(declare -a a; test -v \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-read-quoted-hd', 'MUST_NOT_FLAG', 'die(){ printf safe <<\'EOF\'\n$(declare -a a; read -r \'a[1/$1]\' <<<x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-punctuation-quoted-hd', 'MUST_NOT_FLAG', 'die(){ printf safe <<\'EOF\'\n$(shopt -s expand_aliases\nalias leak+=\'echo "$1" >&2\'\nleak+\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-three-chain-quoted-hd', 'MUST_NOT_FLAG', 'die(){ printf safe <<\'EOF\'\n$(shopt -s expand_aliases\nalias outer=inner\nalias inner=\'echo "$1" >&2\'\nouter\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
 # --------------------------------------------------------------------------
 # The GENERATED corpus.
 #
@@ -9306,13 +10290,557 @@ def _generated_corpus():
     return out
 
 
+# Owner-admitted sibling families: literal indexed roles, blank aliases and source inputs.
+CORPUS.extend([
+    ('helper-hd-siblings-printf-v-separate', 'flag', 'die(){ printf safe <<EOF\n$(declare -a a; printf -v \'a[1/$1]\' x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-printf-v-attached', 'flag', 'die(){ printf safe <<EOF\n$(declare -a a; printf -v\'a[1/$1]\' x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-printf-v-no-array-declaration', 'flag', 'die(){ printf safe <<EOF\n$(printf -v \'a[1/$1]\' x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-declare-plain', 'flag', 'die(){ printf safe <<EOF\n$(declare  \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-declare--g', 'flag', 'die(){ printf safe <<EOF\n$(declare -g \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-declare--a', 'flag', 'die(){ printf safe <<EOF\n$(declare -a \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-declare--ga', 'flag', 'die(){ printf safe <<EOF\n$(declare -ga \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-declare-with-array-declaration', 'flag', 'die(){ printf safe <<EOF\n$(declare -a a; declare \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-typeset-plain', 'flag', 'die(){ printf safe <<EOF\n$(typeset  \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-typeset--g', 'flag', 'die(){ printf safe <<EOF\n$(typeset -g \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-typeset--a', 'flag', 'die(){ printf safe <<EOF\n$(typeset -a \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-typeset--ga', 'flag', 'die(){ printf safe <<EOF\n$(typeset -ga \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-typeset-with-array-declaration', 'flag', 'die(){ printf safe <<EOF\n$(typeset -a a; typeset \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-let', 'clean', 'die(){ printf safe <<EOF\n$(let \'1/$1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-getopts', 'clean', 'die(){ printf safe <<EOF\n$(getopts x \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-wait-n-p', 'clean', 'die(){ printf safe <<EOF\n$(wait -n -p \'a[1/$1]\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-read-a', 'clean', 'die(){ printf safe <<EOF\n$(read -a \'a[1/$1]\' <<<x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-readonly', 'clean', 'die(){ printf safe <<EOF\n$(readonly \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-export', 'clean', 'die(){ printf safe <<EOF\n$(export \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-printf-v-literal-index', 'clean', 'die(){ printf safe <<EOF\n$(printf -v \'a[1]\' x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-declare-value-data', 'clean', 'die(){ printf safe <<EOF\n$(declare \'a[1]="$1"\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-declare-p', 'clean', 'die(){ printf safe <<EOF\n$(declare -p \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-declare-f', 'clean', 'die(){ printf safe <<EOF\n$(declare -f \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-typeset-p', 'clean', 'die(){ printf safe <<EOF\n$(typeset -p \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-typeset-f', 'clean', 'die(){ printf safe <<EOF\n$(typeset -f \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-local-existing-covered', 'flag', 'die(){ printf safe <<EOF\n$(f(){ local \'a[1/$1]=x\'; }; f "$1")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-trailing-command', 'flag', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'command \'\nalias leak=\'echo "$1" >&2\'\nouter leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-trailing-command-builtin-two-hop', 'flag', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias o1=\'command \'\nalias o2=\'builtin \'\nalias leak=\'echo "$1" >&2\'\no1 o2 leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-trailing-builtin', 'flag', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'builtin \'\nalias leak=\'echo "$1" >&2\'\nouter leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-trailing-disabled', 'clean', 'die(){ printf safe <<EOF\n$(shopt -u expand_aliases\nalias outer=\'command \'\nalias leak=\'echo "$1" >&2\'\nouter leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-trailing-uninvoked', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'command \'\nalias leak=\'echo "$1" >&2\'\n: safe\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-trailing-same-line', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'command \'; alias leak=\'echo "$1" >&2\'; outer leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-trailing-forward-use', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'command \'\nouter leak\nalias leak=\'echo "$1" >&2\'\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-trailing-escaped', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'command \'\nalias leak=\'echo "$1" >&2\'\nouter \\leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-trailing-no-trailing-blank', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'command\'\nalias leak=\'echo "$1" >&2\'\nouter leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-trailing-safe-prefix', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\': \'\nalias leak=\'echo "$1" >&2\'\nouter leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-trailing-cycle', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'inner \'\nalias inner=\'outer \'\nouter safe\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-source-herestring-/dev/fd/0', 'flag', 'die(){ printf safe <<EOF\n$(source /dev/fd/0 <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-source-literal-process-printf', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-source-quiet-process-printf-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'printf safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-source-quiet-fd3', 'clean', 'die(){ printf safe <<EOF\n$(source /dev/fd/0 3<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-.-herestring-/dev/fd/0', 'flag', 'die(){ printf safe <<EOF\n$(. /dev/fd/0 <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-.-literal-process-printf', 'flag', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-.-quiet-process-printf-safe', 'clean', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'printf safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-.-quiet-fd3', 'clean', 'die(){ printf safe <<EOF\n$(. /dev/fd/0 3<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-nonconsumer-fd0', 'clean', 'die(){ printf safe <<EOF\n$(printf safe /dev/fd/0 <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-printf-v-quiet-quotedHD', 'clean', 'die(){ printf safe <<\'EOF\'\n$(printf -v \'a[1/$1]\' x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-declare-quiet-quotedHD', 'clean', 'die(){ printf safe <<\'EOF\'\n$(declare \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-trailing-quiet-quotedHD', 'clean', 'die(){ printf safe <<\'EOF\'\n$(shopt -s expand_aliases\nalias outer=\'command \'\nalias leak=\'echo "$1" >&2\'\nouter leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-fd0-quiet-quotedHD', 'clean', 'die(){ printf safe <<\'EOF\'\n$(source /dev/fd/0 <<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-declare-existing-DATA', 'clean', 'die(){ printf safe <<EOF\n$(declare -a a[\'$1\']=value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-declare-mixed-index-quoting', 'flag', 'die(){ printf safe <<EOF\n$(declare -a a[1/\'$1\']=value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-typeset-mixed-index-quoting', 'flag', 'die(){ printf safe <<EOF\n$(typeset -a a[1/\'$1\']=value)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-fd0-before-filename', 'flag', 'die(){ printf safe <<EOF\n$(source 0<<< \'echo "$1" >&2\' /dev/fd/0)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-fd0-before-command', 'flag', 'die(){ printf safe <<EOF\n$(0<<< \'echo "$1" >&2\' source /dev/fd/0)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-fd0-source-attached', 'flag', 'die(){ printf safe <<EOF\n$(source<<< \'echo "$1" >&2\' /dev/fd/0)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-fd0-filename-attached', 'flag', 'die(){ printf safe <<EOF\n$(source /dev/fd/0<<< \'echo "$1" >&2\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-trailing-quoted-nextword', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'command \'\nalias leak=\'echo "$1" >&2\'\nouter \'leak\'\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-trailing-tab', 'flag', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias outer=\'command\t\'\nalias leak=\'echo "$1" >&2\'\nouter leak\n)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-printf-literal-format', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'echo "$1" >&2\\n\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-printf-b-no-escape', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%b\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-echo-e-no-escape', 'flag', 'die(){ printf safe <<EOF\n$(source <(echo -e \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-tee-literal-hs', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-cat-attached-zero-hs', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat 0<<<\'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-process-program-noop-positional', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \': "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-process-program-stdout-captured', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-devfd0-program-noop-positional', 'clean', 'die(){ printf safe <<EOF\n$(source /dev/fd/0 <<< \': "$1"\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-devfd0-program-stdout-captured', 'clean', 'die(){ printf safe <<EOF\n$(source /dev/fd/0 <<< \'echo "$1"\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-process-program-runtime-value', 'clean', 'die(){ printf safe <<EOF\n$(program=\'printf safe\'; source <(printf \'%s\\n\' "$program"))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-process-printf-assigned', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf -v output \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-process-other-filename', 'clean', 'die(){ printf safe <<EOF\n$(source /dev/null <(printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-process-prefix-path-concatenation', 'clean', 'die(){ printf safe <<EOF\n$(source prefix<(printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-process-suffix-path-concatenation', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\')suffix)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-cat-fd3-producer', 'clean', 'die(){ printf safe <<EOF\n$(source <(cat 3<<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-quiet-declare-associative-explicit', 'clean', 'die(){ printf safe <<EOF\n$(declare -A \'a[1/$1]=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-printf-repeated-safe-last', 'clean', 'die(){ printf safe <<EOF\n$(declare -a a; printf -v \'a[1/$1]\' -v out x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-printf-repeated-indexed-last', 'flag', 'die(){ printf safe <<EOF\n$(declare -a a; printf -v out -v \'a[1/$1]\' x)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-printf-s-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-printf-s-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-command-printf-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(command printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-command-printf-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(command printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-builtin-printf-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(builtin printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-builtin-printf-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(builtin printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-path-printf-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(/usr/bin/printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-path-printf-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(/usr/bin/printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-echo-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(echo \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-echo-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(echo \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-echo-n-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(echo -n \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-echo-n-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(echo -n \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-path-echo-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(/bin/echo \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-path-echo-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(/bin/echo \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-cat-here-string-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-cat-here-string-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(cat <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-cat-quoted-hd-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat <<\'PROGRAM\'\necho "$1" >&2\nPROGRAM\n))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-cat-quoted-hd-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(cat <<\'PROGRAM\'\necho "$1" >&2\nPROGRAM\n))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-nonconsumer-cat', 'clean', 'die(){ printf safe <<EOF\n$(cat <(echo \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-nonconsumer-printf', 'clean', 'die(){ printf safe <<EOF\n$(printf safe <(printf \'%s\\n\' \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-safe-source-echo', 'clean', 'die(){ printf safe <<EOF\n$(source <(echo \'printf safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-siblings-safe-dot-cat', 'clean', 'die(){ printf safe <<EOF\n$(. <(cat <<< \'printf safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-routing-saved-fd-overwrite-leak', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'((1/$1)) 3>&2 2>/dev/null 2>&3\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-direct-stdout-fd2-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-helper-stderr-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f "$1" 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-stderr-null', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'shopt -s expand_aliases\nalias leak=\'"\'"\'echo "$1" >&2\'"\'"\'\nleak 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-dup-to-fd2-null-before', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" 2>/dev/null >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-dup-to-fd2-null-after', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-quoted-redirection-data', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" \'"\'"\'2>/dev/null\'"\'"\'\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-uninvoked-helper-two-statements', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ :; echo "$1" >&2; }; :\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-uninvoked-helper-arithmetic', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ ((1/$1)); }; :\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-helper-index-diagnostic', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ printf -v \'"\'"\'a[1/$1]\'"\'"\' x; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-to-helper', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; shopt -s expand_aliases\nalias leak=\'"\'"\'f "$1"\'"\'"\'\nleak\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-program-xtrace', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'set -x; : "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-program-xtrace-self-null', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'set -x; : "$1" 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-program-xtrace-future', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo safe; : "$1"; set -x\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-stdout-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1"\') 2>/dev/null)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-printf-index-stderr-null', 'clean', 'die(){ printf safe <<EOF\n$(declare -a a; printf -v \'a[1/$1]\' x 2>/dev/null)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-declare-index-stderr-null', 'clean', 'die(){ printf safe <<EOF\n$(declare \'a[1/$1]=x\' 2>/dev/null)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-typeset-index-stderr-null', 'clean', 'die(){ printf safe <<EOF\n$(typeset \'a[1/$1]=x\' 2>/dev/null)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-stdout-dot', 'clean', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'echo "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-colon-dot', 'clean', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \': "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-assign-printf-source', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'printf -v x %s "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-assign-printf-dot', 'clean', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'printf -v x %s "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-stdout-source', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'shopt -s expand_aliases\nalias leak=\'"\'"\'echo "$1"\'"\'"\'\nleak\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-stdout-dot', 'clean', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'shopt -s expand_aliases\nalias leak=\'"\'"\'echo "$1"\'"\'"\'\nleak\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-stderr-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'shopt -s expand_aliases\nalias leak=\'"\'"\'echo "$1" >&2\'"\'"\'\nleak\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-stderr-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'shopt -s expand_aliases\nalias leak=\'"\'"\'echo "$1" >&2\'"\'"\'\nleak\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-func-stdout-source', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1"; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-func-stdout-dot', 'clean', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'f(){ echo "$1"; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-func-stderr-source', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-func-stderr-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-arith-null-source', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'((1/$1)) 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-arith-null-dot', 'clean', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'((1/$1)) 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-index-null-source', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'declare -a a; printf -v \'"\'"\'a[1/$1]\'"\'"\' x 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-index-null-dot', 'clean', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'declare -a a; printf -v \'"\'"\'a[1/$1]\'"\'"\' x 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-nested-capture-source', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'x=$(echo "$1")\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-nested-capture-dot', 'clean', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'x=$(echo "$1")\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-duplicate-last-safe', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f "$1"; f(){ :; }\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-duplicate-first-safe', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ :; }; f(){ echo "$1" >&2; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-literal-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\') safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-token-first', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\') "$1")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-index-mismatch', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$2" >&2\') "$1" safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-second-token', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$2" >&2\') safe "$1")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-helper-repeated-safe', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f safe; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-helper-quoted-guard-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "${1:+fixed}" >&2; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-override-before-call-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f(){ :; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-emit-uninvoked-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; :\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-false-safe-redefinition-leak', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; if false; then f(){ :; }; fi; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-later-emitter-definition-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ :; }; f "$1"; f(){ echo "$1" >&2; }\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-expansion-self-null', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$((1/$1))" 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-command-other-null', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \': 2>/dev/null; ((1/$1))\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-command-overwritten-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'((1/$1)) 2>/dev/null 2>/dev/stderr\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-function-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-function-uninvoked', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; : safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-function-cyclic', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ g "$1"; }; g(){ f "$1"; }; : safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-function-index-mismatch', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-function-index2-positive', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f safe "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-function-index1-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f safe "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-uninvoked', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'shopt -s expand_aliases\nalias leak=\'"\'"\'echo "$1" >&2\'"\'"\'\n: safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-disabled', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'shopt -u expand_aliases\nalias leak=\'"\'"\'echo "$1" >&2\'"\'"\'\nleak\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-cycle', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'shopt -s expand_aliases\nalias outer=inner\nalias inner=outer\nouter safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-chain', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'shopt -s expand_aliases\nalias outer=inner\nalias inner=\'"\'"\'echo "$1" >&2\'"\'"\'\nouter\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-command-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'((1/$1))\') 2>/dev/null)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-expansion-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$((1/$1))"\') 2>/dev/null)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-empty-arg', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\') \'\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-safe-quoted-close', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\') \'safe)\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-safe-escaped-close', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\') safe\\))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-multiple-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\') safe other)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-token-arg', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\') "$GH_TOKEN")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-receiver-token-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\') safe "$GH_TOKEN")\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-trace-sibling-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'(set -x); : "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-trace-child-leak', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'(set -x; : "$1")\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-trace-disable-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'set -x\nset +x\n: "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-null-quoted-path-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" "2>/dev/null"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-helper-index-null-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ printf -v \'"\'"\'a[1/$1]\'"\'"\' x; }; f "$1" 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-helper-arith-null-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ ((1/$1)); }; f "$1" 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-alias-chain-null-after-leak', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'shopt -s expand_aliases\nalias last=\'"\'"\'echo "$1" >&2\'"\'"\'\nalias first=last\nfirst 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-routing-nonconsumer-trace-quiet', 'clean', 'die(){ printf safe <<EOF\n$(printf safe <(printf \'%s\\n\' \'set -x; : "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+
+# Later literal-inventory regressions; genuine fake-sentinel oracle bodies.
+CORPUS.extend([
+    ('helper-hd-plain-cat-extra-hop-non-stdin-terminal-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | printf))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-plain-cat-extra-hop-builtin-cat-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | builtin cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-plain-cat-pipeline-extra-hop', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-plain-cat-extra-hop-echo', 'flag', 'die(){ printf safe <<EOF\n$(source <(echo \'echo "$1" >&2\' | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-plain-cat-extra-hop-dot', 'flag', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-plain-cat-extra-hop-cat-file-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | cat /dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-plain-cat-extra-hop-cat-null-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | cat >/dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-plain-cat-extra-hop-safe-program', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'printf safe\' | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-plain-cat-extra-hop-quoted-HD', 'clean', 'die(){ printf safe <<\'EOF\'\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-plain-cat-extra-hop-nonconsumer', 'clean', 'die(){ printf safe <<EOF\n$(printf safe <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-tee-relay-pipeline-nontee-consumer', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat /dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-unsupported-builtin-relay', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | builtin tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-bound-invalid-runtime-option', 'flag', 'option=--bogus\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee "$option" .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-tee-relay-pipeline-source-plain', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-.-plain', 'flag', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-echo-plain', 'flag', 'die(){ printf safe <<EOF\n$(source <(echo \'echo "$1" >&2\' | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-printf-percent-s', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\' \'echo "$1" >&2\' | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-nonconsumer', 'clean', 'die(){ printf safe <<EOF\n$(printf safe <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-safeprogram', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'printf safe\' | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-invalidoption', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --bogus .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-help', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee --help))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-quotedHD', 'clean', 'die(){ printf safe <<\'EOF\'\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-nullrelay', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy >/dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-inputoverride', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy <<< \'printf safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-tee-relay-pipeline-runtimeprogram', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' "$program" | tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-later-four-alias-env', 'flag', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'env \'\nouter leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-alias-env-tab', 'flag', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'env\t\'\nouter leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-alias-no-trailing-blank', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=env\nouter leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-alias-quoted-next', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'env \'\nouter \'leak\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-alias-escaped-next', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'env \'\nouter \\leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-alias-disabled', 'clean', 'die(){ printf safe <<EOF\n$(shopt -u expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'env \'\nouter leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-alias-uninvoked', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'env \'\n:)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-alias-safe-next', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'env \'\nouter printf safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-alias-multiword-env', 'flag', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'env -- \'\nouter leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-alias-echo-consumes-next', 'flag', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'echo \'\nouter leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-indexed-declare-array-plus', 'flag', 'die(){ printf safe <<EOF\n$(declare -a \'a[1/$1]+=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-indexed-declare-plus', 'flag', 'die(){ printf safe <<EOF\n$(declare \'a[1/$1]+=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-indexed-declare-global-plus', 'flag', 'die(){ printf safe <<EOF\n$(declare -g \'a[1/$1]+=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-indexed-typeset-plus', 'flag', 'die(){ printf safe <<EOF\n$(typeset \'a[1/$1]+=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-indexed-literal-index-quiet', 'clean', 'die(){ printf safe <<EOF\n$(declare -a \'a[1]+=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-indexed-associative-quiet', 'clean', 'die(){ printf safe <<EOF\n$(declare -A \'a[1/$1]+=x\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-indexed-rhs-data-quiet', 'clean', 'die(){ printf safe <<EOF\n$(declare -a \'a[1]+=$1\')\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-indexed-null-quiet', 'clean', 'die(){ printf safe <<EOF\n$(declare -a \'a[1/$1]+=x\' 2>/dev/null)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-cardinality-at-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$@"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-cardinality-braced-at-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "${@}"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-cardinality-prefix-at-third', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$3" >&2; }; f prefix "$@"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-cardinality-prefix-first-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f safe "$@"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-cardinality-quoted-star-second-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$*"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-cardinality-uninvoked-at-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; : "$@"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-producer-tee-file', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee .tee-fake-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-producer-dot-tee-file', 'flag', 'die(){ printf safe <<EOF\n$(. <(tee .tee-fake-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-producer-tee-append-file', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee -a .tee-fake-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-producer-tee-two-files', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee .tee-fake-copy .tee-fake-copy2 <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-producer-tee-safe-program', 'clean', 'die(){ printf safe <<EOF\n$(source <(tee .tee-fake-copy <<< \'printf safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-producer-tee-nonconsumer', 'clean', 'die(){ printf safe <<EOF\n$(printf safe <(tee .tee-fake-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-producer-tee-fd3-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(tee .tee-fake-copy 3<<< \'echo "$1" >&2\' </dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-neighbor-alias-colon-next-stderr-quiet', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\': \'\nouter leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-neighbor-alias-false-next-stderr-quiet', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1" >&2\'\nalias outer=\'false \'\nouter leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-neighbor-alias-echo-next-stdout-quiet', 'clean', 'die(){ printf safe <<EOF\n$(shopt -s expand_aliases\nalias leak=\'echo "$1"\'\nalias outer=\'echo \'\nouter leak)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-neighbor-cardinality-at-out-of-range-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$9" >&2; }; f "$@"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-neighbor-cardinality-suffix-at-last-safe', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$3" >&2; }; f "$@" safe\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-suffix-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$@" safe\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-middle-third', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$3" >&2; }; f x "$@"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-within-word-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f x"$@"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-slice-first-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "${@:1}"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-slice-second-first', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f "${@:2}"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-unquoted-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f $@\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-braced-unquoted-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f ${@}\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-singlequoted-literal', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f \'"\'"\'$@\'"\'"\'\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-escaped-literal', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f \\$@\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-double-escaped-literal', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "\\$@"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-length-scalar', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "${#@}"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-attributes-data', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "${@@a}"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-constant-guard', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "${@:+set}"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-scalar-no-at', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$1"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-stdout-captured', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2"; }; f "$@"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-null-routing', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$@" 2>/dev/null\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-safe-receiver', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$@"\') safe)\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-owner-at-empty-receiver', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$@"\') \'\')\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-tee-option-_i', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee -i .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-tee-option-_ai', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee -ai .tee-private-copy <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-later-four-tee-file-after-double-dash', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee -- --bogus <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+# The owner structural source-path decision: genuine before/after/runtime
+# controls retain argument, capture, route and shared-depth boundaries.
+CORPUS.extend([
+    ('helper-hd-owner-structural-unsolicited-star-unquoted-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f $*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-braced-unquoted-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f ${*}\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-quoted-scalar-second', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$*"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-braced-quoted-scalar-second', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "${*}"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-quoted-first-positive', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f "$*"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-middle-third', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$3" >&2; }; f x $*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-prefix-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f x$*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-suffix-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f $*safe\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-high-ninth-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$9" >&2; }; f $*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-mixed-third-safe-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$3" >&2; }; f $* safe\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-fixed-first-safe-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; }; f safe $*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-quoted-prefix-scalar-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "x$*"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-singlequoted-inert', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f \'"\'"\'$*\'"\'"\'\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-escaped-inert', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f \\$\\*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-length-scalar', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "${#*}"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-scalar-one-second-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$1"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-captured-scalar', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f "$(printf \'"\'"\'%s \'"\'"\' "$*")"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-stdout-captured-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2"; }; f $*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-stderr-null-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; f $* 2>/dev/null\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-uninvoked-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$2" >&2; }; : $*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-IFS-empty-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'IFS=; f(){ echo "$2" >&2; }; f $*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-return', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-exit', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'exit "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-shift', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'shift "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-read-timeout', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'read -t "$1" value </dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-test-left', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'test "$1" -eq 1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-test-right', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'test 1 -eq "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-bracket', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'[ "$1" -eq 1 ]\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-read-count', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'read -n "$1" value </dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-mapfile-count', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'mapfile -n "$1" value </dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-return-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$1" 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-exit-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'exit "$1" 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-read-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'read -t "$1" value </dev/null 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-test-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'test "$1" -eq 1 2>/dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-return-stderr-captured', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$1" 2>&1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-read-stderr-captured', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'read -t "$1" value </dev/null 2>&1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-test-stderr-captured', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'test "$1" -eq 1 2>&1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-inner-captured-error', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'value=$(return "$1")\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-inner-captured-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'value=$(return "$1" 2>/dev/null)\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-test-string-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'test "$1" = 1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-read-nonnumeric-option-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'read -d "$1" value </dev/null\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-literal-status-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return 0\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-uninvoked-helper', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ return "$1"; }; :\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-helper-safe-arg', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ return "$1"; }; f safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-helper-token', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ return "$1"; }; f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-unreached-after-return', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return 0; return "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-if-false-unreached', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'if false; then return "$1"; fi\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-inert-data', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'data=\'"\'"\'return "$1"\'"\'"\'; :\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-safe-receiver', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$1"\') safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-receiver-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$1"\') 2>/dev/null)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-quoted-HD', 'clean', 'die(){ printf safe <<\'EOF\'\n$(source <(printf \'%s\\n\' \'return "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-nonconsumer', 'clean', 'die(){ printf safe <<EOF\n$(printf safe <(printf \'%s\\n\' \'return "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-numeric-second-deferred-child', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'eval \'"\'"\'return "$1"\'"\'"\'\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-unsolicited-star-second-deferred-child', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'eval \'"\'"\'f(){ echo "$2" >&2; }; f $*\'"\'"\'\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-direct-printf-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-direct-echo-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(echo \'echo "$1" >&2\' | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-repeated-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-tee-repeated-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | cat | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-repeated-tee', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tee .tee-private-copy | tee .tee-second-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-mixed-cat-tee-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-repeated-mixed-echo', 'flag', 'die(){ printf safe <<EOF\n$(source <(echo \'echo "$1" >&2\' | cat | tee .tee-private-copy | cat | tee .tee-second-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-dot-mixed', 'flag', 'die(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'echo "$1" >&2\' | cat | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-file-bearing-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat /dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-file-bearing-middle-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat /dev/null | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-wrapped-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | builtin cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-wrapped-tee', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | builtin tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-terminal-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat | tee .tee-private-copy | cat >/dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-input-override', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat <<< \'printf safe\' | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-unknown-consumer', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat | printf))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-invalid-tee-option', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat | tee --bogus .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-runtime-tee-option', 'flag', 'option=--bogus\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat | tee "$option" .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-runtime-cat-operand', 'flag', 'operand=/dev/null\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat "$operand"))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-nonconsumer', 'clean', 'die(){ printf safe <<EOF\n$(printf safe <(printf \'%s\\n\' \'echo "$1" >&2\' | cat | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-quoted-HD', 'clean', 'die(){ printf safe <<\'EOF\'\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-safe-program', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'printf safe\' | cat | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-captured-stdout-program', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1"\' | cat | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-printf-assignment-head', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf -v value \'%s\' \'echo "$1" >&2\' | cat | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-cat-HS-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat <<< \'echo "$1" >&2\' | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-tee-file-HS-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee .tee-private-copy <<< \'echo "$1" >&2\' | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-tee-file-HS-tee', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee .tee-private-copy <<< \'echo "$1" >&2\' | tee .tee-second-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-cat-HS-mixed', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat <<< \'echo "$1" >&2\' | cat | tee .tee-private-copy | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-cat-FD0-tight-HS-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat 0<<<\'echo "$1" >&2\' | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-cat-FD00-HS-cat', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat 00<<< \'echo "$1" >&2\' | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-cat-FD3-HS-cat', 'clean', 'die(){ printf safe <<EOF\n$(source <(cat 3<<< \'echo "$1" >&2\' | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-cat-named-FD-HS-cat', 'clean', 'die(){ printf safe <<EOF\n$(source <(cat {fd}<<< \'echo "$1" >&2\' | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-relay-HS-override', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat <<< \'echo "$1" >&2\' | cat <<< \'printf safe\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-head-extra-input-override', 'clean', 'die(){ printf safe <<EOF\n$(source <(cat <<< \'echo "$1" >&2\' </dev/null | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-head-output-null', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat <<< \'echo "$1" >&2\' >/dev/null | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-cat-file-head', 'clean', 'die(){ printf safe <<EOF\n$(source <(cat /dev/null | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-plain-nonliteral-HS-head', 'clean', 'die(){ printf safe <<EOF\n$(source <(cat <<< "$program" | cat))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-owner-cat-stdin', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat -))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-owner-cat-u', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat -u))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-owner-tr', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | tr x x))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-owner-head', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | head -n 5))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-owner-sed', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | sed \'\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-required-true', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | true))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-required-colon', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | :))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-required-wc-lines', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-required-wc-bundle', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -cl))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-required-grep-count', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c echo))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-required-output-file', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat > .private-captured-program))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$2"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-mixed-second', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ return "$2"; }; f x$*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-second-timeout', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'read -t "$2" value </dev/null\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-second-test', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'test "$2" -gt 1\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-return-to-captured-before-later-stderr', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$2" 2>&1 1>&2\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-return-to-stderr-before-copy', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$2" 1>&2 2>&1\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-ordered-null-overwrite', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$2" 3>&2 2>/dev/null 2>&3\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-existing-error-word', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'unset no_value; : "${no_value:?$2}"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-existing-error-word-null', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'unset no_value; : "${no_value:?$2}" 2>/dev/null\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-existing-error-word-parent-null', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'{ unset no_value; : "${no_value:?$2}"; } 2>/dev/null\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-read-p-nontty', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'read -p "$2" value </dev/null\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-required-output-stderr', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat >&2))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-required-output-closed', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat >&-))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-positive-output-stdout-self', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat >/dev/stdout))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-positive-output-fd1-self', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat >/dev/fd/1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-owner-structural-star-mixed-third-positive', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$3" >&2; }; f x $*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-star-mixed-second-safe-conservative', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ return "$2"; }; f x $*\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-shadowed-return-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return(){ :; }; return "$2"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-shadowed-return-token', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return(){ echo "$1" >&2; }; return "$2"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-shadowed-return-builtin', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return(){ :; }; builtin return "$2"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-shadowed-return-command', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return(){ :; }; command return "$2"\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-amp-null', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$2" &>/dev/null\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-amp-append-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'read -t "$2" x </dev/null &>>/dev/null\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-amp-null-overwrite', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$2" &>/dev/null 2>/dev/stderr\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-amp-unknown-overwrite', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$2" &>/dev/null 2>&3\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-null-to-captured-null', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return "$2" >/dev/null 2>&1\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-uninvoked-numeric-shadow', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'return(){ return "$1"; }; :\'))\nEOF\n}\ndie safe "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-grep-after-delimiter', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2 # -c\' | grep -- -c))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-grep-pattern-operand', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2 # -c\' | grep -e -c))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-grep-count-pattern-operand', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2 # -c\' | grep -ce -c))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-final-null-self-dup', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat >/dev/null 1>&1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-final-null-self-path', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat >/dev/null >/dev/stdout))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-final-stdout-copy-stderr-back', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat 2>&1 1>&2))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-final-stderr-null-copy', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat 2>/dev/null 1>&2))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-final-null-saved-overwrite', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | cat 3>&1 >/dev/null 1>&3))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-owner-structural-constant-sed-leak', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' safe | sed \'s/safe/echo "$1" >\\&2/\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-constant-sed-nonmatch-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' safe | sed \'s/other/echo "$1" >\\&2/\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-constant-sed-final-true-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' safe | sed \'s/safe/echo "$1" >\\&2/\' | true))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-constant-sed-final-wc-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' safe | sed \'s/safe/echo "$1" >\\&2/\' | wc -l))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-constant-relay-HS-program', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' safe | cat <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-constant-relay-HS-fd3-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' safe | cat 3<<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-constant-sed-safe-receiver', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' safe | sed \'s/safe/echo "$1" >\\&2/\') safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-owner-structural-fragment-safe-receiver-@', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' safe | sed \'s/safe/echo "$@" >\\&2/\') safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-fragment-safe-receiver-*', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' safe | sed \'s/safe/echo "$*" >\\&2/\') safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-owner-structural-singleton-cat-u', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat -u <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-head', 'flag', 'die(){ printf safe <<EOF\n$(source <(head -n 5 <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-sed', 'flag', 'die(){ printf safe <<EOF\n$(source <(sed \'\' <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-true-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(true <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-colon-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(: <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-wc-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(wc -l <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-grep-count-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(grep -c echo <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-cat-file-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(cat /dev/null <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-printf-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf safe <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-sed-nonmatch-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(sed \'s/other/echo "$1" >\\&2/\' <<< safe))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-unknown-fd3-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(head -n 5 3<<< \'echo "$1" >&2\' </dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-unknown-override-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(head -n 5 <<< \'echo "$1" >&2\' </dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-head-output-null-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(head -n 5 <<< \'echo "$1" >&2\' >/dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-head-stderr-null-positive', 'flag', 'die(){ printf safe <<EOF\n$(source <(head -n 5 <<< \'echo "$1" >&2\' 2>/dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-printf-stderr-null-positive', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' 2>/dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-tee-invalid-quiet', 'flag', 'die(){ printf safe <<EOF\n$(source <(tee --bogus <<< \'echo "$1" >&2\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-unknown-runtime-program-quiet', 'clean', 'die(){ printf safe <<EOF\n$(source <(head -n 5 <<< "$program"))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-owner-structural-singleton-constant-transformer-match', 'flag', 'die(){ printf safe <<EOF\n$(source <(sed \'s/safe/echo "$1" >\\&2/\' <<< safe))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-constant-transformer-safe', 'clean', 'die(){ printf safe <<EOF\n$(source <(sed \'s/safe/echo "$1" >\\&2/\' <<< safe) safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-singleton-constant-transformer-wc', 'clean', 'die(){ printf safe <<EOF\n$(source <(sed \'s/safe/echo "$1" >\\&2/\' <<< safe | wc -l))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
+CORPUS.extend([
+    ('helper-hd-owner-structural-sequence-tee', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\'; tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-sequence-true', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\'; true))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-sequence-wc', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\'; wc -l))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-sequence-echo-true', 'flag', 'die(){ printf safe <<EOF\n$(source <(echo \'echo "$1" >&2\'; true))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-sequence-safe-receiver', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\'; tee .tee-private-copy) safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-sequence-output-away', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' >/dev/null; tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-sequence-connected-final', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | true; wc -l))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-sequence-safe-program', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'printf safe\'; tee .tee-private-copy))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-sequence-split-helper-positive', 'flag', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; };\'; printf \'%s\\n\' \'f "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-sequence-split-uninvoked-helper', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'f(){ echo "$1" >&2; };\'; printf \'%s\\n\' \': "$1"\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-scalar-star-safe-receiver', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \' return "$*"\') safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-numeric-helper-scalar-star-safe-receiver', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \' f(){ return "$1"; }; f "$*"\') safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-nested-capture-opaque', 'clean', 'die(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' "$(printf \'%s\\n\' \'echo \\"$1\\" >&2\')"))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-nested-group-opaque', 'flag', 'die(){ printf safe <<EOF\n$(source <((printf \'%s\\n\' \'echo "$1" >&2\')))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-stored-definition-inert', 'clean', 'die(){ printf safe <<EOF\n$(source <(f(){ printf \'%s\\n\' \'echo "$1" >&2\'; }; true))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+])
+
 CORPUS.extend(_generated_corpus())
 
 # Disagreements with the oracle, DECLARED.  Each entry is a corpus id and the
 # reason the scanner's verdict differs from what bash actually does.  The suite
 # fails when an undeclared disagreement appears AND when a declared entry stops
 # disagreeing, so neither list can quietly rot.
+
+# Literal count filename/label data uses the existing source-fragment inventory.
+CORPUS += [
+    ('helper-hd-owner-structural-count-wc-file', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-wc-delimited-file', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l -- \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-wc-stdin', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-wc-safe-file', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l .count-patterns))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-forced-file', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -H -c echo \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-Hc-file', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -Hc echo \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-two-file', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c echo .count-patterns \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-single-file-conservative', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c echo \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-suppressed-file', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc echo \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-Hh-file', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -Hhc echo \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-stdin', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c echo))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-pattern-positional', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c \'$1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-e-pattern-positional', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c -e \'$1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-attached-e-pattern', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -ce\'$1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-f-pattern', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c -f .count-patterns))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-attached-f-pattern', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -cf.count-patterns))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-long-pattern', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep --count --regexp=\'$1\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-long-pattern-file', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep --count --file=.count-patterns))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-label', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -Hc --label=\'x; echo "$1" >&2;#\' echo))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-label-separate', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -Hc --label \'x; echo "$1" >&2;#\' echo))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-label-no-H', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c --label=\'x; echo "$1" >&2;#\' echo))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-label-suppressed', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc --label=\'x; echo "$1" >&2;#\' echo))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-safe-receiver', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l \'x; echo "$1" >&2;#\') safe)\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-dot-file', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(. <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-output-away', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l \'x; echo "$1" >&2;#\' >/dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-list-with-match', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hcl echo \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-list-without-match', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hcL missing \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-list-long', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc --files-with-matches echo \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-list-long-L', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc --files-without-match missing \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-unknown-list', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\nOPTS=-l\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc "$OPTS" echo \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-unknown-quiet', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\nOPTS=\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc "$OPTS" echo \'x; echo "$1" >&2;#\'))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-diagnostic-copy', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc echo \'missing; echo "$1" >&2;#\' 2>&1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-diagnostic-copy-before-null', 'flag', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc echo \'missing; echo "$1" >&2;#\' 2>&1 >/dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-diagnostic-copy-after-null', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc echo \'missing; echo "$1" >&2;#\' >/dev/null 2>&1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-diagnostic-null-overwrite', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -hc echo \'missing; echo "$1" >&2;#\' 2>&1 2>/dev/null))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-count-pattern-copy', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c \'$1\' 2>&1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-count-e-pattern-copy', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -ce\'$1\' 2>&1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-grep-count-stdin-copy', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | grep -c echo 2>&1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('helper-hd-owner-structural-count-wc-count-stdin-copy', 'clean', 'printf \'echo\\n\' > \'x; echo "$1" >&2;#\'\nprintf \'x; echo "$1" >&2;#\\0\' > .count-files0\nprintf \'echo\\n\' > .count-patterns\ndie(){ printf safe <<EOF\n$(source <(printf \'%s\\n\' \'echo "$1" >&2\' | wc -l 2>&1))\nEOF\n}\ndie "$GH_TOKEN"\n'),
+]
+
 KNOWN_MISSES = {
+    'helper-hd-owner-structural-nested-capture-opaque': 'The sampled nested/captured producer emits a literal program at runtime. It remains outside the unchanged finite producer/source certificate and shared child inventory; no extra nested producer or child depth is admitted. Actual main flags it; published d1cb also misses it. This limit is not claimed repaired by #1496.',
+
+    'helper-hd-owner-structural-unsolicited-numeric-second-deferred-child': 'A second deferred source child leaks at runtime but exceeds the unchanged shared depth-one inventory; retained for deeper-source work #2114, not claimed repaired by #1496.',
+    'helper-hd-owner-structural-unsolicited-star-second-deferred-child': 'A second deferred source child leaks at runtime but exceeds the unchanged shared depth-one inventory; retained for deeper-source work #2114, not claimed repaired by #1496.',
+
+    'helper-hd-round11-command-depth-two': 'The real arithmetic diagnostic requires a second literal deferred child, beyond the unchanged shared one-hop inventory. Primitive arithmetic at reached source neither spends nor resets child depth (#1496).',
+    'helper-hd-round11-assignment-depth-two': 'The real arithmetic diagnostic requires a second literal deferred child, beyond the unchanged shared one-hop inventory. Primitive arithmetic at reached source neither spends nor resets child depth (#1496).',
+    'helper-hd-round10-sub-arithmetic-deferred-child-two-boundary': 'The fake arithmetic diagnostic leaks only after a second literal deferred child. That child is beyond the unchanged shared one-hop budget; primitive arithmetic checking at a reached source does not spend or reset child depth (#1496).',
+    'helper-hd-round9-nested-backtick-depth-two-boundary': 'A nested HD followed by backtick source needing another HD inventory exceeds the shared one-hop source budget. The fake oracle leaks, while this explicitly bounded HD/deferred inventory misses it; direct/legacy source reads can conservatively admit other deeper spellings (#1496).',
+    "helper-hd-eval-depth-two-boundary": (
+        "Two deferred eval layers execute a positional emitter at runtime, "
+        "beyond the existing one-hop _DEFERRED_SHELL_DEPTH budget. This bounded "
+        "heredoc substitution reader preserves that explicit deferred-depth "
+        "limit rather than adding recursive execution modeling (#1496)."
+    ),
     "deferred-enable-depth-control": (
         "The existing one-hop deferred depth stops before evaluating nested "
         "eval operands; same-line propagation does not add recursion depth."
@@ -9467,6 +10995,224 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    'helper-hd-owner-structural-count-grep-unknown-quiet': 'The sampled empty runtime option word leaves a count-only stream, but incomplete literal argv cannot prove that a file-list mode was absent. The fixed literal input/program remains possibly delivered without a stage-semantics or option-binding model (owner6151456891).',
+    'helper-hd-owner-structural-count-grep-single-file-conservative': 'The literal filename contains positional program text. Sampled grep count with one file omits its filename label and is quiet; possible literal labels retain the owner default without a stage-semantics model (#1496 owner6151456891).',
+    'helper-hd-owner-structural-plain-head-output-null': 'The sampled initial stage sends its output to null, but only the final stage receives non-forwarding proof in this source path: no stage-semantics model. The owner explicitly inverts possible delivery without evaluating intermediate stages. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+
+    'helper-hd-owner-structural-singleton-cat-file-quiet': 'This fixed literal stdin/argument program is quiet in the sampled consumer, but no proven final non-forwarding role applies: no stage-semantics model. Owner process/pipeline default inversion: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-singleton-printf-quiet': 'This fixed literal stdin/argument program is quiet in the sampled consumer, but no proven final non-forwarding role applies: no stage-semantics model. Owner process/pipeline default inversion: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-singleton-sed-nonmatch-quiet': 'This fixed literal stdin/argument program is quiet in the sampled consumer, but no proven final non-forwarding role applies: no stage-semantics model. Owner process/pipeline default inversion: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-singleton-tee-invalid-quiet': 'This fixed literal stdin/argument program is quiet in the sampled consumer, but no proven final non-forwarding role applies: no stage-semantics model. Owner process/pipeline default inversion: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+
+    'helper-hd-owner-structural-constant-sed-nonmatch-quiet': 'The fixed literal replacement contains possibly delivered positional program text; the sampled replacement does not match. No stage-semantics model proves matching or transformation. Owner source-only inversion: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+
+    'helper-hd-owner-structural-star-mixed-second-safe-conservative': 'The sampled f x $* has safe data at $2; expanding unquoted $* makes that argument position and every later one possibly populated. Establishing this actual count/binding needs the excluded argument-count model. Whole-family owner authority: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151479135',
+    'helper-hd-owner-structural-numeric-amp-null': 'The sampled ampersand/null routing quiet flag is inherited on actual main and published d1cb. The new private numeric diagnostic check honors its null destination, while the existing conservative ordinary output classifier remains unchanged; no new FD model or inherited repair is claimed.',
+    'helper-hd-owner-structural-numeric-amp-null-overwrite': 'The sampled ampersand/null routing quiet flag is inherited on actual main and published d1cb. The new private numeric diagnostic check honors its null destination, while the existing conservative ordinary output classifier remains unchanged; no new FD model or inherited repair is claimed.',
+    'helper-hd-owner-structural-numeric-amp-unknown-overwrite': 'The sampled ampersand/null routing quiet flag is inherited on actual main and published d1cb. The new private numeric diagnostic check honors its null destination, while the existing conservative ordinary output classifier remains unchanged; no new FD model or inherited repair is claimed.',
+
+    'helper-hd-owner-structural-unsolicited-star-high-ninth-quiet': 'The sampled positional slot is empty or holds safe literal data. Unquoted $* can populate this and subsequent positions; proving this invocation quiet needs an excluded argument-count model. Owner conservatism: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151479135',
+    'helper-hd-owner-structural-unsolicited-star-mixed-third-safe-quiet': 'The sampled positional slot is empty or holds safe literal data. Unquoted $* can populate this and subsequent positions; proving this invocation quiet needs an excluded argument-count model. Owner conservatism: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151479135',
+    'helper-hd-owner-structural-unsolicited-numeric-unreached-after-return': 'The sampled numeric diagnostic is unreachable. Existing inventory does not evaluate return termination or branch execution; proving it quiet needs excluded control-flow facts. Owner conservatism: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151479135',
+    'helper-hd-owner-structural-unsolicited-numeric-if-false-unreached': 'The sampled numeric diagnostic is unreachable. Existing inventory does not evaluate return termination or branch execution; proving it quiet needs excluded control-flow facts. Owner conservatism: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151479135',
+    'helper-hd-owner-structural-plain-file-bearing-cat': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-plain-file-bearing-middle-cat': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-plain-wrapped-cat': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-plain-wrapped-tee': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-plain-input-override': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-plain-unknown-consumer': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-plain-invalid-tee-option': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-plain-runtime-tee-option': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-plain-runtime-cat-operand': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-plain-relay-HS-override': 'The sampled pipeline is quiet, but its final stage is not in the proven non-forwarding inventory: no stage-semantics model. The owner explicitly adopts possible delivery of this literal program within the source/. path. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-owner-structural-numeric-return-to-captured-before-later-stderr': 'This sampled quiet flag is already present on actual main and published d1cb. The ordinary conservative source/descriptor reading remains unchanged; the new structural diagnostic inventory does not claim it repaired or introduce a binding/FD model.',
+    'helper-hd-owner-structural-existing-error-word-parent-null': 'This sampled quiet flag is already present on actual main and published d1cb. The ordinary conservative source/descriptor reading remains unchanged; the new structural diagnostic inventory does not claim it repaired or introduce a binding/FD model.',
+    'helper-hd-tee-relay-pipeline-nontee-consumer': 'The sampled pipeline is quiet but no final-stage non-forwarding proof applies: no stage-semantics model. The owner replaces the earlier closed relay certificate with possible delivery of a literal program in source/. only. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-tee-relay-pipeline-unsupported-builtin-relay': 'The sampled pipeline is quiet but no final-stage non-forwarding proof applies: no stage-semantics model. The owner replaces the earlier closed relay certificate with possible delivery of a literal program in source/. only. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-tee-relay-pipeline-bound-invalid-runtime-option': 'The sampled pipeline is quiet but no final-stage non-forwarding proof applies: no stage-semantics model. The owner replaces the earlier closed relay certificate with possible delivery of a literal program in source/. only. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-tee-relay-pipeline-invalidoption': 'The sampled pipeline is quiet but no final-stage non-forwarding proof applies: no stage-semantics model. The owner replaces the earlier closed relay certificate with possible delivery of a literal program in source/. only. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-tee-relay-pipeline-help': 'The sampled pipeline is quiet but no final-stage non-forwarding proof applies: no stage-semantics model. The owner replaces the earlier closed relay certificate with possible delivery of a literal program in source/. only. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-tee-relay-pipeline-inputoverride': 'The sampled pipeline is quiet but no final-stage non-forwarding proof applies: no stage-semantics model. The owner replaces the earlier closed relay certificate with possible delivery of a literal program in source/. only. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-plain-cat-extra-hop-non-stdin-terminal-quiet': 'The sampled pipeline is quiet, but lacks the proven final non-forwarding role: no stage-semantics model. Owner source-only default inversion: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-plain-cat-extra-hop-builtin-cat-quiet': 'The sampled pipeline is quiet, but lacks the proven final non-forwarding role: no stage-semantics model. Owner source-only default inversion: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+    'helper-hd-plain-cat-extra-hop-cat-file-quiet': 'The sampled pipeline is quiet, but lacks the proven final non-forwarding role: no stage-semantics model. Owner source-only default inversion: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6151456891',
+
+    'helper-hd-later-four-neighbor-cardinality-suffix-at-last-safe': 'An expanding $@ word makes its argument position and all later positions possibly populated. The sampled one-value call plus one literal safe suffix leaves $3 empty; the owner explicitly accepts this bounded conservatism instead of inferring argument counts or bindings. Authority: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6147485488',
+    'helper-hd-later-four-neighbor-cardinality-at-out-of-range-quiet': 'An expanding $@ word makes its argument position and all later positions possibly populated. The sampled one-value call leaves $9 empty; the owner explicitly accepts this bounded conservatism instead of inferring argument counts or bindings. Authority: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6147485488',
+    'helper-hd-routing-receiver-index-mismatch': 'The sampled source receiver positional-index mismatch is quiet. The published scanner already flags the outer credential argument; its conservative ordinary source reading remains unchanged and does not infer runtime parameter binding (#1496).',
+    'helper-hd-routing-override-before-call-quiet': 'The sampled safe redefinition or later emitting definition is quiet. Owner decision https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6138172803 retains every recognized helper body conservatively, without runtime function lookup, definition dominance or branch execution.',
+    'helper-hd-routing-later-emitter-definition-quiet': 'The sampled safe redefinition or later emitting definition is quiet. Owner decision https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6138172803 retains every recognized helper body conservatively, without runtime function lookup, definition dominance or branch execution.',
+    'helper-hd-routing-receiver-token-second': 'The sampled source receiver positional-index mismatch is quiet. The published scanner already flags the outer credential argument; its conservative ordinary source reading remains unchanged and does not infer runtime parameter binding (#1496).',
+
+    'helper-hd-round11-prefix-arithmetic-after-redir': 'The sampled redirection-prefixed arithmetic command is rejected by Bash before positional evaluation. Existing source-only prefix classification conservatively inventories its bounded arithmetic operand without a compound-command grammar/evaluation model (#1496).',
+    'helper-hd-round11-assignment-nested': 'The sampled nested index or assignment prefix evaluates quietly. Actual arithmetic operand inventory retains possible diagnostics without proving runtime binding or evaluation order (#1496).',
+    'helper-hd-round11-assignment-prefix': 'The sampled nested index or assignment prefix evaluates quietly. Actual arithmetic operand inventory retains possible diagnostics without proving runtime binding or evaluation order (#1496).',
+    'helper-hd-round11-command-safe-positional': 'The sampled safe arithmetic retains the existing conservative positional-source decision; no expression evaluation is introduced (#1496).',
+    'helper-hd-round10-sub-substring-unset-conservative': 'The sampled unset string does not evaluate its offset. The initialized paired source diagnoses; arithmetic context inventory does not infer runtime binding/state (#1496).',
+    'helper-hd-round10-indirect-named-set-control': 'The sampled indirect target is initialized and emits no error word. HD guard admission does not infer ambient indirection or parameter bindings (#1496).',
+    'helper-hd-round10-indirect-positional-set-control': 'The sampled indirect positional target names an initialized parameter. HD guard admission retains possible diagnostics without runtime target/binding evaluation (#1496).',
+    'helper-hd-round10-sub-arithmetic-escaped-opener': 'The sampled escaped opener is invalid shell syntax and emits no credential. This preexisting conservative ordinary-source verdict is retained; the new arithmetic context pass does not admit its escaped opener (#1496).',
+    'helper-hd-round10-sub-arithmetic-safe-positional': 'The sampled arithmetic evaluates safely and emits no credential. Existing source inventory stays conservative; no arithmetic value evaluation is inferred (#1496).',
+    'helper-hd-round9-positional-error-set-control': 'The sampled second argument is initialized and emits no error word. Source-only guard admission does not infer runtime parameter bindings (#1496).',
+    'helper-hd-round9-nested-cat-captured': 'The sampled nested cat stdout is captured and discarded by the outer non-stdin owner. Existing conservative helper source inventory does not prove output destinations (#1496).',
+    'helper-hd-round9-attributes-cat-A': 'The sampled positional @A transform emits blank. Its existing value-transform admission remains conservative; only exact attributes-only @a is excluded (#1496).',
+    'helper-hd-round8-unresolved-printf-safe': 'The sampled opaque/unresolved owner consumes no input or emits no credential. Existing fail-closed command classification retains possible stdin emission without runtime owner/binding proof (#1496).',
+    'helper-hd-round8-unresolved-echo-safe': 'The sampled opaque/unresolved owner consumes no input or emits no credential. Existing fail-closed command classification retains possible stdin emission without runtime owner/binding proof (#1496).',
+    'helper-hd-round8-unresolved-true-safe': 'The sampled opaque/unresolved owner consumes no input or emits no credential. Existing fail-closed command classification retains possible stdin emission without runtime owner/binding proof (#1496).',
+    'helper-hd-round8-unresolved-read-safe': 'The sampled opaque/unresolved owner consumes no input or emits no credential. Existing fail-closed command classification retains possible stdin emission without runtime owner/binding proof (#1496).',
+    'helper-hd-round8-unresolved-quiet-shadow': 'The sampled opaque/unresolved owner consumes no input or emits no credential. Existing fail-closed command classification retains possible stdin emission without runtime owner/binding proof (#1496).',
+    'helper-hd-round8-opaque-eval-quiet': 'The sampled opaque/unresolved owner consumes no input or emits no credential. Existing fail-closed command classification retains possible stdin emission without runtime owner/binding proof (#1496).',
+    'helper-hd-round8-opaque-source-quiet': 'The sampled opaque/unresolved owner consumes no input or emits no credential. Existing fail-closed command classification retains possible stdin emission without runtime owner/binding proof (#1496).',
+    'helper-hd-round8-opaque-trap-quiet': 'The sampled opaque/unresolved owner consumes no input or emits no credential. Existing fail-closed command classification retains possible stdin emission without runtime owner/binding proof (#1496).',
+    'helper-hd-round7-backtick-escaped-comment-captured': 'Actual backtick source carries a positional but its stdout is captured and discarded by this non-stdin owner. The existing conservative source inventory does not prove runtime emission (#1496).',
+    'helper-hd-round7-error-set-control': 'The sampled parameter is initialized and emits no error word. Source-only HD error-word inventory does not prove runtime variable bindings (#1496).',
+    'helper-hd-round7-parameter-substring-unset-singlequote': 'The sampled unset string does not evaluate its arithmetic offset. The initialized paired string diagnoses; HD operand inventory does not prove runtime bindings (#1496).',
+    'helper-hd-round7-command-substitution-captured': 'The sampled command-substitution stdout is captured and discarded. The existing helper source inventory remains conservative about runtime emission (#1496).',
+    'helper-hd-round6-legacy-safe-positional': 'The sampled legacy arithmetic evaluates without a diagnostic. Heredoc positional operands remain conservative candidates; arithmetic is not evaluated (#1496).',
+    'helper-hd-round6-legacy-nested-legacy': 'The sampled inner legacy arithmetic reduces the positional value before the outer diagnostic. Nested operands remain conservative inventory without arithmetic evaluation (#1496).',
+    'helper-hd-round5-substring-safe-positional-conservative': 'The sampled offset arithmetic emits no diagnostic. Positional operands remain conservative diagnostic candidates; no arithmetic evaluation is inferred (#1496).',
+    'helper-hd-round5-array-safe-positional-conservative': 'The sampled subscript arithmetic emits no diagnostic. Positional operands remain conservative diagnostic candidates; no arithmetic evaluation is inferred (#1496).',
+    'helper-hd-round5-array-length-index-diagnostic': 'The sampled unset array length does not evaluate its index. The initialized paired array does diagnose; no array binding/state proof is inferred from this source-only diagnostic candidate (#1496).',
+    'helper-hd-round5-named-substring-diagnostic': 'The sampled unset named string does not evaluate its offset. The initialized paired string does diagnose; no variable binding/state proof is inferred from this source-only diagnostic candidate (#1496).',
+    'helper-hd-round5-case-no-output-conservative': 'An actual command substitution has a case boundary the existing exact reader refuses. Its bounded remaining source contains a positional, although the sampled arm writes no output. Conservative inventory does not infer arm emission or parse case grammar (#1496).',
+    'helper-hd-round5-case-captured-stdout-conservative': 'An actual command substitution has a case boundary the existing exact reader refuses. Its sampled stdout is captured into ignored stdin. The bounded source inventory preserves stderr candidates without capture/routing inference (#1496).',
+    'helper-hd-round5-complex-tail-inert-positional-conservative': 'The retained tail starts at an actual command substitution whose exact end is unproven. In this quiet sample the positional follows the real close and is inert ignored stdin data. The bounded conservative tail may include data; it is not a claim that every retained character executes (#1496).',
+    'helper-hd-round4-shadow-cat-default': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-shadow-tee-default': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-shadow-cat-command-report-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-shadow-command-cat-data-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-shadow-cat-command-redirection-target-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-shadow-cat-command-upper-report-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-nested-command-report-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-inner-command-report-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-unshadowed-command-report-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-unshadowed-command-upper-report-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-qualified-command-report-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-shadow-command-qualified-target-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    'helper-hd-round4-shadow-command-unshadowed-target-control': (
+        "Published helper stdin inventory remains conservative for this quiet "
+        "shadow/report spelling. Textual declarations cannot prove active "
+        "function binding; the rejected catalog veto misses late, false-branch "
+        "and restored builtin emission. Valid cleanup is deferred to #1052 "
+        "item 3 and its authoritative comment 5852139000, not fixed here."
+    ),
+    "helper-hd-round4-arithmetic-safe-conservative": (
+        "Positional arithmetic may diagnose before the stdin owner runs. "
+        "The sampled addition emits nothing; retaining a conservative value "
+        "inventory does not evaluate arithmetic or prove diagnostics (#1496)."
+    ),
+    "helper-hd-round4-escaped-error-word-control": (
+        "The raw helper error-word fallback already grades the positional "
+        "inside an escaped opener conservatively although this runtime heredoc "
+        "is quiet. Preserve this preexisting limit without changing the shared "
+        "error-word reader as part of continuation repair (#1496)."
+    ),
+    'helper-hd-printf-captured-deferred-stdout-conservative': (
+        "The helper inventories a positional in executable substitution "
+        "source, although this sampled source writes no output or its stdout "
+        "is captured into ignored stdin. Existing helper inventory does not "
+        "infer capture/pipeline runtime output; this conservatism is explicit "
+        "rather than weakening independent stderr evidence (#1496)."
+    ),
+    'helper-hd-printf-no-output-deferred-conservative': (
+        "The helper inventories a positional in executable substitution "
+        "source, although this sampled source writes no output or its stdout "
+        "is captured into ignored stdin. Existing helper inventory does not "
+        "infer capture/pipeline runtime output; this conservatism is explicit "
+        "rather than weakening independent stderr evidence (#1496)."
+    ),
+    'helper-hd-printf-captured-direct-stdout-conservative': (
+        "The helper inventories a positional in executable substitution "
+        "source, although this sampled source writes no output or its stdout "
+        "is captured into ignored stdin. Existing helper inventory does not "
+        "infer capture/pipeline runtime output; this conservatism is explicit "
+        "rather than weakening independent stderr evidence (#1496)."
+    ),
+    "helper-hd-eval-no-output-conservative": (
+        "The literal eval operand carries a positional value but the sampled "
+        "colon command writes nothing. Helper discovery inventories positional "
+        "source conservatively within the existing one-hop deferred budget; "
+        "it does not infer execution/output or pipeline effects (#1496)."
+    ),
+    "helper-heredoc-backtick-2-backslashes": (
+        "Two source backslashes leave an escaped positional in the runtime "
+        "backtick program and the fake oracle is clean. Existing helper "
+        "segment scanning still promotes the raw backtick word; this bounded "
+        "heredoc positional correction preserves that prior conservatism "
+        "rather than changing general backtick tokenization (#1496)."
+    ),
     'r4-mapfile-unknown-final-after-known-pair': (
         "An unresolved callback value or option prefix retains the existing "
         "per-known-literal callback scan; no final callback is proved."
@@ -10494,6 +12240,1151 @@ def _oracle_interpreter_cases():
     return failures
 
 
+
+
+# Owner replaces per-family precision with one conservative substitution class.
+CORPUS += [('helper-hd-central-dollar', 'flag', 'die(){ printf safe <<EOF\n$(printf %s \'$1\')\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-backtick', 'flag', 'die(){ printf safe <<EOF\n`printf %s \'$1\'`\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-brace-command', 'flag', 'die(){ printf safe <<EOF\n${ printf %s \'$1\'; }\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-brace-reply', 'flag', 'die(){ printf safe <<EOF\n${| REPLY=\'$1\'; }\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-unused-helper-argument', 'flag', 'die(){ printf safe <<EOF\n$(f(){ :; }; f "$9")\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-argument-index-mismatch', 'flag', 'die(){ printf safe <<EOF\n$(f(){ echo "$2" >&2; }; f "$1")\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-plain-printf-data', 'clean', 'die(){ printf safe <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-plain-read-data', 'clean', 'die(){ read x <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-escaped-stdin-data', 'clean', 'die(){ cat <<EOF\n\\$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-escaped-command-opener', 'clean', 'die(){ printf safe <<EOF\n\\$(echo "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-noninterpolating-command', 'clean', 'die(){ printf safe <<\'EOF\'\n$(echo "$1" >&2)\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-safe-helper-call', 'clean', 'die(){ printf safe <<EOF\n$(echo "$1" >&2)\nEOF\n}\ndie safe\n'), ('helper-hd-central-stdin-data', 'flag', 'die(){ cat <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-unknown-stdin-data', 'flag', 'die(){ unknown_consumer <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-arithmetic-expansion', 'flag', 'die(){ printf safe <<EOF\n$((1/$1))\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-central-error-expansion', 'flag', 'die(){ printf safe <<EOF\n${MISSING:?${1@Q}}\nEOF\n}\ndie "$GH_TOKEN"\n')]
+
+HEREDOC_SUBSTITUTION_CONSERVATISM = "Owner-approved substitution conservatism: main's unchanged raw positional predicate is retained inside an actual command substitution in an interpolating helper heredoc, regardless of command roles, quoting within the substitution, output routing, invocation or positional argument binding. The retained historical/sample quiet body intentionally flags; no execution, binding, FD, stage or count model is introduced. Decision: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6156188282"
+HEREDOC_SUBSTITUTION_CONSERVATIVE_CASES = frozenset({
+    'helper-hd-bounded-alias-argument',
+    'helper-hd-bounded-alias-before-definition',
+    'helper-hd-bounded-alias-before-enable',
+    'helper-hd-bounded-alias-disable-after-enable',
+    'helper-hd-bounded-alias-disabled',
+    'helper-hd-bounded-alias-escaped-positional',
+    'helper-hd-bounded-alias-literal-positional',
+    'helper-hd-bounded-alias-same-line',
+    'helper-hd-bounded-alias-uninvoked',
+    'helper-hd-bounded-for-array-data',
+    'helper-hd-bounded-for-comment',
+    'helper-hd-bounded-for-escaped-positional',
+    'helper-hd-bounded-for-literal-data',
+    'helper-hd-bounded-for-tail-data',
+    'helper-hd-central-argument-index-mismatch',
+    'helper-hd-central-backtick',
+    'helper-hd-central-brace-command',
+    'helper-hd-central-brace-reply',
+    'helper-hd-central-dollar',
+    'helper-hd-central-unused-helper-argument',
+    'helper-hd-eval-no-output-conservative',
+    'helper-hd-fd0-dot-fd3',
+    'helper-hd-fd0-multiple-capture-duplicate',
+    'helper-hd-fd0-multiple-command-duplicate',
+    'helper-hd-fd0-printf-before-filename',
+    'helper-hd-fd0-printf-fd0',
+    'helper-hd-fd0-printf-path-fd0',
+    'helper-hd-fd0-source-FD3-before-filename',
+    'helper-hd-fd0-source-doublequoted-zero-input',
+    'helper-hd-fd0-source-fd0-argument-not-program',
+    'helper-hd-fd0-source-fd0-literal-positional',
+    'helper-hd-fd0-source-fd0-quoted-zero-input',
+    'helper-hd-fd0-source-fd0-trailing-DATA',
+    'helper-hd-fd0-source-fd10',
+    'helper-hd-fd0-source-fd3',
+    'helper-hd-fd0-source-fd3-attached',
+    'helper-hd-fd0-source-named-fd',
+    'helper-hd-fd0-source-plain-zero-input',
+    'helper-hd-fd0-source-prefilename-duplicate-argument',
+    'helper-hd-fd0-source-prefilename-escaped-parenthesis',
+    'helper-hd-fd0-source-prefilename-literal-input',
+    'helper-hd-fd0-source-prefilename-literal-parenthesis',
+    'helper-hd-fd0-source-quoted-zero-input',
+    'helper-hd-later-four-alias-disabled',
+    'helper-hd-later-four-alias-escaped-next',
+    'helper-hd-later-four-alias-no-trailing-blank',
+    'helper-hd-later-four-alias-quoted-next',
+    'helper-hd-later-four-alias-safe-next',
+    'helper-hd-later-four-alias-uninvoked',
+    'helper-hd-later-four-cardinality-prefix-first-safe',
+    'helper-hd-later-four-cardinality-quoted-star-second-quiet',
+    'helper-hd-later-four-cardinality-uninvoked-at-quiet',
+    'helper-hd-later-four-indexed-associative-quiet',
+    'helper-hd-later-four-indexed-null-quiet',
+    'helper-hd-later-four-indexed-rhs-data-quiet',
+    'helper-hd-later-four-neighbor-alias-colon-next-stderr-quiet',
+    'helper-hd-later-four-neighbor-alias-echo-next-stdout-quiet',
+    'helper-hd-later-four-neighbor-alias-false-next-stderr-quiet',
+    'helper-hd-later-four-neighbor-cardinality-at-out-of-range-quiet',
+    'helper-hd-later-four-neighbor-cardinality-suffix-at-last-safe',
+    'helper-hd-later-four-owner-at-attributes-data',
+    'helper-hd-later-four-owner-at-constant-guard',
+    'helper-hd-later-four-owner-at-double-escaped-literal',
+    'helper-hd-later-four-owner-at-empty-receiver',
+    'helper-hd-later-four-owner-at-escaped-literal',
+    'helper-hd-later-four-owner-at-length-scalar',
+    'helper-hd-later-four-owner-at-null-routing',
+    'helper-hd-later-four-owner-at-safe-receiver',
+    'helper-hd-later-four-owner-at-scalar-no-at',
+    'helper-hd-later-four-owner-at-singlequoted-literal',
+    'helper-hd-later-four-owner-at-stdout-captured',
+    'helper-hd-later-four-producer-tee-fd3-quiet',
+    'helper-hd-later-four-producer-tee-nonconsumer',
+    'helper-hd-later-three-alias-chain-uninvoked',
+    'helper-hd-later-three-alias-invalid-slash',
+    'helper-hd-later-three-alias-invalid-space',
+    'helper-hd-later-three-alias-punctuation-disabled',
+    'helper-hd-later-three-bracket-n-data',
+    'helper-hd-later-three-chain-disabled',
+    'helper-hd-later-three-chain-forward-use',
+    'helper-hd-later-three-chain-safe-positional-data',
+    'helper-hd-later-three-chain-same-line',
+    'helper-hd-later-three-printf-indexed-data',
+    'helper-hd-later-three-read-array-other-name-ignored',
+    'helper-hd-later-three-read-delimiter-data',
+    'helper-hd-later-three-read-initial-data',
+    'helper-hd-later-three-read-invalid-option',
+    'helper-hd-later-three-test-string-data',
+    'helper-hd-later-three-test-v-RHS-data',
+    'helper-hd-later-three-unset-function',
+    'helper-hd-owner-structural-constant-relay-HS-fd3-quiet',
+    'helper-hd-owner-structural-constant-sed-final-true-quiet',
+    'helper-hd-owner-structural-constant-sed-final-wc-quiet',
+    'helper-hd-owner-structural-constant-sed-nonmatch-quiet',
+    'helper-hd-owner-structural-constant-sed-safe-receiver',
+    'helper-hd-owner-structural-count-grep-Hh-file',
+    'helper-hd-owner-structural-count-grep-attached-e-pattern',
+    'helper-hd-owner-structural-count-grep-attached-f-pattern',
+    'helper-hd-owner-structural-count-grep-count-e-pattern-copy',
+    'helper-hd-owner-structural-count-grep-count-pattern-copy',
+    'helper-hd-owner-structural-count-grep-count-stdin-copy',
+    'helper-hd-owner-structural-count-grep-diagnostic-copy-after-null',
+    'helper-hd-owner-structural-count-grep-diagnostic-null-overwrite',
+    'helper-hd-owner-structural-count-grep-e-pattern-positional',
+    'helper-hd-owner-structural-count-grep-f-pattern',
+    'helper-hd-owner-structural-count-grep-label-no-H',
+    'helper-hd-owner-structural-count-grep-label-suppressed',
+    'helper-hd-owner-structural-count-grep-long-pattern',
+    'helper-hd-owner-structural-count-grep-long-pattern-file',
+    'helper-hd-owner-structural-count-grep-pattern-positional',
+    'helper-hd-owner-structural-count-grep-single-file-conservative',
+    'helper-hd-owner-structural-count-grep-stdin',
+    'helper-hd-owner-structural-count-grep-suppressed-file',
+    'helper-hd-owner-structural-count-grep-unknown-quiet',
+    'helper-hd-owner-structural-count-output-away',
+    'helper-hd-owner-structural-count-safe-receiver',
+    'helper-hd-owner-structural-count-wc-count-stdin-copy',
+    'helper-hd-owner-structural-count-wc-safe-file',
+    'helper-hd-owner-structural-count-wc-stdin',
+    'helper-hd-owner-structural-existing-error-word-parent-null',
+    'helper-hd-owner-structural-final-null-self-dup',
+    'helper-hd-owner-structural-final-null-self-path',
+    'helper-hd-owner-structural-final-stderr-null-copy',
+    'helper-hd-owner-structural-fragment-safe-receiver-*',
+    'helper-hd-owner-structural-fragment-safe-receiver-@',
+    'helper-hd-owner-structural-grep-count-pattern-operand',
+    'helper-hd-owner-structural-numeric-amp-append-null',
+    'helper-hd-owner-structural-numeric-amp-null',
+    'helper-hd-owner-structural-numeric-amp-null-overwrite',
+    'helper-hd-owner-structural-numeric-amp-unknown-overwrite',
+    'helper-hd-owner-structural-numeric-helper-scalar-star-safe-receiver',
+    'helper-hd-owner-structural-numeric-null-to-captured-null',
+    'helper-hd-owner-structural-numeric-return-to-captured-before-later-stderr',
+    'helper-hd-owner-structural-numeric-scalar-star-safe-receiver',
+    'helper-hd-owner-structural-numeric-shadowed-return-safe',
+    'helper-hd-owner-structural-numeric-uninvoked-numeric-shadow',
+    'helper-hd-owner-structural-plain-captured-stdout-program',
+    'helper-hd-owner-structural-plain-cat-FD3-HS-cat',
+    'helper-hd-owner-structural-plain-cat-named-FD-HS-cat',
+    'helper-hd-owner-structural-plain-file-bearing-cat',
+    'helper-hd-owner-structural-plain-file-bearing-middle-cat',
+    'helper-hd-owner-structural-plain-head-extra-input-override',
+    'helper-hd-owner-structural-plain-head-output-null',
+    'helper-hd-owner-structural-plain-input-override',
+    'helper-hd-owner-structural-plain-invalid-tee-option',
+    'helper-hd-owner-structural-plain-nonconsumer',
+    'helper-hd-owner-structural-plain-printf-assignment-head',
+    'helper-hd-owner-structural-plain-relay-HS-override',
+    'helper-hd-owner-structural-plain-runtime-cat-operand',
+    'helper-hd-owner-structural-plain-runtime-tee-option',
+    'helper-hd-owner-structural-plain-terminal-null',
+    'helper-hd-owner-structural-plain-unknown-consumer',
+    'helper-hd-owner-structural-plain-wrapped-cat',
+    'helper-hd-owner-structural-plain-wrapped-tee',
+    'helper-hd-owner-structural-read-p-nontty',
+    'helper-hd-owner-structural-required-colon',
+    'helper-hd-owner-structural-required-grep-count',
+    'helper-hd-owner-structural-required-output-closed',
+    'helper-hd-owner-structural-required-output-file',
+    'helper-hd-owner-structural-required-output-stderr',
+    'helper-hd-owner-structural-required-true',
+    'helper-hd-owner-structural-required-wc-bundle',
+    'helper-hd-owner-structural-required-wc-lines',
+    'helper-hd-owner-structural-sequence-connected-final',
+    'helper-hd-owner-structural-sequence-output-away',
+    'helper-hd-owner-structural-sequence-safe-receiver',
+    'helper-hd-owner-structural-sequence-split-uninvoked-helper',
+    'helper-hd-owner-structural-singleton-cat-file-quiet',
+    'helper-hd-owner-structural-singleton-colon-quiet',
+    'helper-hd-owner-structural-singleton-constant-transformer-safe',
+    'helper-hd-owner-structural-singleton-constant-transformer-wc',
+    'helper-hd-owner-structural-singleton-grep-count-quiet',
+    'helper-hd-owner-structural-singleton-head-output-null-quiet',
+    'helper-hd-owner-structural-singleton-printf-quiet',
+    'helper-hd-owner-structural-singleton-sed-nonmatch-quiet',
+    'helper-hd-owner-structural-singleton-tee-invalid-quiet',
+    'helper-hd-owner-structural-singleton-true-quiet',
+    'helper-hd-owner-structural-singleton-unknown-fd3-quiet',
+    'helper-hd-owner-structural-singleton-unknown-override-quiet',
+    'helper-hd-owner-structural-singleton-wc-quiet',
+    'helper-hd-owner-structural-star-mixed-second-safe-conservative',
+    'helper-hd-owner-structural-stored-definition-inert',
+    'helper-hd-owner-structural-unsolicited-numeric-exit-null',
+    'helper-hd-owner-structural-unsolicited-numeric-helper-safe-arg',
+    'helper-hd-owner-structural-unsolicited-numeric-if-false-unreached',
+    'helper-hd-owner-structural-unsolicited-numeric-inert-data',
+    'helper-hd-owner-structural-unsolicited-numeric-inner-captured-null',
+    'helper-hd-owner-structural-unsolicited-numeric-nonconsumer',
+    'helper-hd-owner-structural-unsolicited-numeric-read-nonnumeric-option-quiet',
+    'helper-hd-owner-structural-unsolicited-numeric-read-null',
+    'helper-hd-owner-structural-unsolicited-numeric-read-stderr-captured',
+    'helper-hd-owner-structural-unsolicited-numeric-receiver-null',
+    'helper-hd-owner-structural-unsolicited-numeric-return-null',
+    'helper-hd-owner-structural-unsolicited-numeric-return-stderr-captured',
+    'helper-hd-owner-structural-unsolicited-numeric-safe-receiver',
+    'helper-hd-owner-structural-unsolicited-numeric-test-null',
+    'helper-hd-owner-structural-unsolicited-numeric-test-stderr-captured',
+    'helper-hd-owner-structural-unsolicited-numeric-test-string-quiet',
+    'helper-hd-owner-structural-unsolicited-numeric-uninvoked-helper',
+    'helper-hd-owner-structural-unsolicited-numeric-unreached-after-return',
+    'helper-hd-owner-structural-unsolicited-star-braced-quoted-scalar-second',
+    'helper-hd-owner-structural-unsolicited-star-captured-scalar',
+    'helper-hd-owner-structural-unsolicited-star-escaped-inert',
+    'helper-hd-owner-structural-unsolicited-star-fixed-first-safe-quiet',
+    'helper-hd-owner-structural-unsolicited-star-high-ninth-quiet',
+    'helper-hd-owner-structural-unsolicited-star-length-scalar',
+    'helper-hd-owner-structural-unsolicited-star-mixed-third-safe-quiet',
+    'helper-hd-owner-structural-unsolicited-star-quoted-prefix-scalar-quiet',
+    'helper-hd-owner-structural-unsolicited-star-quoted-scalar-second',
+    'helper-hd-owner-structural-unsolicited-star-scalar-one-second-quiet',
+    'helper-hd-owner-structural-unsolicited-star-singlequoted-inert',
+    'helper-hd-owner-structural-unsolicited-star-stderr-null-quiet',
+    'helper-hd-owner-structural-unsolicited-star-stdout-captured-quiet',
+    'helper-hd-owner-structural-unsolicited-star-uninvoked-quiet',
+    'helper-hd-plain-cat-extra-hop-builtin-cat-quiet',
+    'helper-hd-plain-cat-extra-hop-cat-file-quiet',
+    'helper-hd-plain-cat-extra-hop-cat-null-quiet',
+    'helper-hd-plain-cat-extra-hop-non-stdin-terminal-quiet',
+    'helper-hd-plain-cat-extra-hop-nonconsumer',
+    'helper-hd-printf-captured-deferred-stdout-conservative',
+    'helper-hd-printf-captured-direct-stdout-conservative',
+    'helper-hd-printf-no-output-deferred-conservative',
+    'helper-hd-round10-sub-arithmetic-comment-control',
+    'helper-hd-round10-sub-arithmetic-escaped-opener',
+    'helper-hd-round10-sub-arithmetic-escaped-operand',
+    'helper-hd-round10-sub-arithmetic-literal-singlequote',
+    'helper-hd-round10-sub-arithmetic-safe-positional',
+    'helper-hd-round10-sub-arithmetic-valid-escaped-opener',
+    'helper-hd-round10-sub-array-escaped-opener',
+    'helper-hd-round10-sub-array-literal-singlequote',
+    'helper-hd-round10-sub-legacy-comment-control',
+    'helper-hd-round10-sub-legacy-escaped-opener',
+    'helper-hd-round10-sub-legacy-inert-suffix',
+    'helper-hd-round10-sub-legacy-literal-singlequote',
+    'helper-hd-round10-sub-nonarithmetic-quoted-positional',
+    'helper-hd-round10-sub-primitive-inert-suffix',
+    'helper-hd-round10-sub-substring-unset-conservative',
+    'helper-hd-round11-adjacent-declare-index',
+    'helper-hd-round11-adjacent-let',
+    'helper-hd-round11-adjacent-local-index',
+    'helper-hd-round11-assignment-argument',
+    'helper-hd-round11-assignment-comment',
+    'helper-hd-round11-assignment-declare',
+    'helper-hd-round11-assignment-escaped-dollar',
+    'helper-hd-round11-assignment-nested',
+    'helper-hd-round11-assignment-prefix',
+    'helper-hd-round11-assignment-tail-inert',
+    'helper-hd-round11-assignment-value-inert',
+    'helper-hd-round11-assignment-whole-quoted',
+    'helper-hd-round11-command-comment',
+    'helper-hd-round11-command-escaped-dollar',
+    'helper-hd-round11-command-inert',
+    'helper-hd-round11-command-outer-doublequote',
+    'helper-hd-round11-command-safe-positional',
+    'helper-hd-round11-command-tail-inert',
+    'helper-hd-round11-prefix-arithmetic-after-redir',
+    'helper-hd-round11-prefix-array-DATA-prefix',
+    'helper-hd-round11-prefix-builtin-arith',
+    'helper-hd-round11-prefix-builtin-index',
+    'helper-hd-round11-prefix-command-arith',
+    'helper-hd-round11-prefix-command-index',
+    'helper-hd-round11-prefix-function-prefix',
+    'helper-hd-round11-prefix-if-adjacent-tail',
+    'helper-hd-round11-prefix-if-escaped-prefix',
+    'helper-hd-round11-prefix-if-quoted-prefix',
+    'helper-hd-round11-prefix-time-quoted-data',
+    'helper-hd-round11-time-builtin-time',
+    'helper-hd-round11-time-command-time',
+    'helper-hd-round11-time-env-time',
+    'helper-hd-round11-time-escaped-time',
+    'helper-hd-round11-time-later-argument',
+    'helper-hd-round11-time-path-time',
+    'helper-hd-round11-time-quoted-p',
+    'helper-hd-round11-time-quoted-time',
+    'helper-hd-round11-time-quoted-time-data',
+    'helper-hd-round11-time-time-printf-quoted-data',
+    'helper-hd-round11-time-unknown-option',
+    'helper-hd-round4-arithmetic-safe-conservative',
+    'helper-hd-round5-array-length-index-diagnostic',
+    'helper-hd-round5-array-safe-positional-conservative',
+    'helper-hd-round5-case-captured-stdout-conservative',
+    'helper-hd-round5-case-no-output-conservative',
+    'helper-hd-round5-complex-tail-inert-positional-conservative',
+    'helper-hd-round5-named-substring-diagnostic',
+    'helper-hd-round5-substring-safe-positional-conservative',
+    'helper-hd-round6-legacy-nested-legacy',
+    'helper-hd-round6-legacy-operand-escaped',
+    'helper-hd-round6-legacy-safe-positional',
+    'helper-hd-round7-backtick-escaped-comment-captured',
+    'helper-hd-round7-backtick-singlequote-source',
+    'helper-hd-round7-command-substitution-captured',
+    'helper-hd-round7-command-substitution-singlequote',
+    'helper-hd-round7-error-substitution-literal-source',
+    'helper-hd-round7-modern-escaped-operand',
+    'helper-hd-round7-parameter-substring-unset-singlequote',
+    'helper-hd-round9-nested-cat-captured',
+    'helper-hd-round9-nested-cat-escaped-positional',
+    'helper-hd-round9-nested-cat-quoted-delimiter',
+    'helper-hd-round9-nested-printf-inert',
+    'helper-hd-round9-nested-read-stores',
+    'helper-hd-routing-alias-disabled',
+    'helper-hd-routing-alias-stdout-dot',
+    'helper-hd-routing-alias-stdout-source',
+    'helper-hd-routing-alias-uninvoked',
+    'helper-hd-routing-arith-null-dot',
+    'helper-hd-routing-arith-null-source',
+    'helper-hd-routing-assign-printf-dot',
+    'helper-hd-routing-assign-printf-source',
+    'helper-hd-routing-colon-dot',
+    'helper-hd-routing-command-overwritten-null',
+    'helper-hd-routing-declare-index-stderr-null',
+    'helper-hd-routing-direct-stdout-fd2-null',
+    'helper-hd-routing-dup-to-fd2-null-before',
+    'helper-hd-routing-emit-uninvoked-quiet',
+    'helper-hd-routing-func-stdout-dot',
+    'helper-hd-routing-func-stdout-source',
+    'helper-hd-routing-function-cyclic',
+    'helper-hd-routing-function-index-mismatch',
+    'helper-hd-routing-function-index1-safe',
+    'helper-hd-routing-function-safe',
+    'helper-hd-routing-function-uninvoked',
+    'helper-hd-routing-helper-arith-null-quiet',
+    'helper-hd-routing-helper-index-null-quiet',
+    'helper-hd-routing-helper-quoted-guard-safe',
+    'helper-hd-routing-helper-stderr-null',
+    'helper-hd-routing-index-null-dot',
+    'helper-hd-routing-index-null-source',
+    'helper-hd-routing-later-emitter-definition-quiet',
+    'helper-hd-routing-nested-capture-dot',
+    'helper-hd-routing-nested-capture-source',
+    'helper-hd-routing-nonconsumer-trace-quiet',
+    'helper-hd-routing-null-quoted-path-quiet',
+    'helper-hd-routing-override-before-call-quiet',
+    'helper-hd-routing-printf-index-stderr-null',
+    'helper-hd-routing-program-xtrace-future',
+    'helper-hd-routing-quoted-redirection-data',
+    'helper-hd-routing-receiver-command-null',
+    'helper-hd-routing-receiver-empty-arg',
+    'helper-hd-routing-receiver-expansion-null',
+    'helper-hd-routing-receiver-index-mismatch',
+    'helper-hd-routing-receiver-literal-safe',
+    'helper-hd-routing-receiver-multiple-safe',
+    'helper-hd-routing-receiver-safe-escaped-close',
+    'helper-hd-routing-receiver-safe-quoted-close',
+    'helper-hd-routing-receiver-stdout-null',
+    'helper-hd-routing-receiver-token-second',
+    'helper-hd-routing-stdout-dot',
+    'helper-hd-routing-trace-disable-quiet',
+    'helper-hd-routing-trace-sibling-quiet',
+    'helper-hd-routing-typeset-index-stderr-null',
+    'helper-hd-routing-uninvoked-helper-arithmetic',
+    'helper-hd-routing-uninvoked-helper-two-statements',
+    'helper-hd-siblings-.-quiet-fd3',
+    'helper-hd-siblings-declare-existing-DATA',
+    'helper-hd-siblings-nonconsumer-cat',
+    'helper-hd-siblings-nonconsumer-printf',
+    'helper-hd-siblings-printf-repeated-safe-last',
+    'helper-hd-siblings-quiet-cat-fd3-producer',
+    'helper-hd-siblings-quiet-declare-associative-explicit',
+    'helper-hd-siblings-quiet-declare-f',
+    'helper-hd-siblings-quiet-declare-p',
+    'helper-hd-siblings-quiet-declare-value-data',
+    'helper-hd-siblings-quiet-devfd0-program-noop-positional',
+    'helper-hd-siblings-quiet-devfd0-program-stdout-captured',
+    'helper-hd-siblings-quiet-export',
+    'helper-hd-siblings-quiet-getopts',
+    'helper-hd-siblings-quiet-let',
+    'helper-hd-siblings-quiet-nonconsumer-fd0',
+    'helper-hd-siblings-quiet-process-other-filename',
+    'helper-hd-siblings-quiet-process-prefix-path-concatenation',
+    'helper-hd-siblings-quiet-process-printf-assigned',
+    'helper-hd-siblings-quiet-process-program-noop-positional',
+    'helper-hd-siblings-quiet-process-program-stdout-captured',
+    'helper-hd-siblings-quiet-process-suffix-path-concatenation',
+    'helper-hd-siblings-quiet-read-a',
+    'helper-hd-siblings-quiet-readonly',
+    'helper-hd-siblings-quiet-trailing-disabled',
+    'helper-hd-siblings-quiet-trailing-escaped',
+    'helper-hd-siblings-quiet-trailing-forward-use',
+    'helper-hd-siblings-quiet-trailing-no-trailing-blank',
+    'helper-hd-siblings-quiet-trailing-safe-prefix',
+    'helper-hd-siblings-quiet-trailing-same-line',
+    'helper-hd-siblings-quiet-trailing-uninvoked',
+    'helper-hd-siblings-quiet-typeset-f',
+    'helper-hd-siblings-quiet-typeset-p',
+    'helper-hd-siblings-quiet-wait-n-p',
+    'helper-hd-siblings-source-quiet-fd3',
+    'helper-hd-siblings-trailing-quoted-nextword',
+    'helper-hd-substitution-quoted-data-control',
+    'helper-hd-tee-relay-pipeline-bound-invalid-runtime-option',
+    'helper-hd-tee-relay-pipeline-help',
+    'helper-hd-tee-relay-pipeline-inputoverride',
+    'helper-hd-tee-relay-pipeline-invalidoption',
+    'helper-hd-tee-relay-pipeline-nonconsumer',
+    'helper-hd-tee-relay-pipeline-nontee-consumer',
+    'helper-hd-tee-relay-pipeline-nullrelay',
+    'helper-hd-tee-relay-pipeline-unsupported-builtin-relay',
+    'helper-hd-three-alias-after-enable-qu',
+    'helper-hd-three-alias-after-enable-uq',
+    'helper-hd-three-alias-os',
+    'helper-hd-three-alias-p',
+    'helper-hd-three-alias-q',
+    'helper-hd-three-alias-qsu',
+    'helper-hd-three-alias-qsx',
+    'helper-hd-three-alias-qu',
+    'helper-hd-three-alias-qus',
+    'helper-hd-three-alias-uq',
+    'helper-hd-three-alias-xqs',
+    'helper-hd-three-brace-literal-positional',
+    'helper-hd-three-brace-reply-literal-positional',
+    'helper-hd-three-herestring-noop',
+    'helper-hd-three-herestring-printf',
+    'helper-hd-three-herestring-read',
+    'helper-hd-three-herestring-source-literal',
+    'helper-hd-three-herestring-source-nonstdin',
+    'helper-heredoc-backtick-2-backslashes',
+    'helper-heredoc-backtick-3-backslashes',
+    'helper-heredoc-backtick-quoted-positional-data-control',
+    'helper-heredoc-modern-substitution-escaped-control',
+    'helper-heredoc-positional-substitution-quoted-data',
+})
+
+CORPUS = [
+    (cid, MUST_FLAG if cid in HEREDOC_SUBSTITUTION_CONSERVATIVE_CASES or cid in ('helper-hd-round9-attributes-ordinary-a', 'helper-hd-round9-attributes-fallback-a') or cid in ('helper-hd-round11-command-depth-two', 'helper-hd-round11-assignment-depth-two', 'helper-hd-eval-depth-two-boundary', 'helper-hd-round9-nested-backtick-depth-two-boundary', 'helper-hd-round10-sub-arithmetic-deferred-child-two-boundary', 'helper-hd-owner-structural-unsolicited-numeric-second-deferred-child', 'helper-hd-owner-structural-unsolicited-star-second-deferred-child', 'helper-hd-owner-structural-nested-capture-opaque') else rule, body)
+    for cid, rule, body in CORPUS
+]
+KNOWN_BROADER.update({cid: HEREDOC_SUBSTITUTION_CONSERVATISM
+                      for cid in HEREDOC_SUBSTITUTION_CONSERVATIVE_CASES})
+for _resolved_hd_miss in ('helper-hd-round11-command-depth-two', 'helper-hd-round11-assignment-depth-two', 'helper-hd-eval-depth-two-boundary', 'helper-hd-round9-nested-backtick-depth-two-boundary', 'helper-hd-round10-sub-arithmetic-deferred-child-two-boundary', 'helper-hd-owner-structural-unsolicited-numeric-second-deferred-child', 'helper-hd-owner-structural-unsolicited-star-second-deferred-child', 'helper-hd-owner-structural-nested-capture-opaque'):
+    KNOWN_MISSES.pop(_resolved_hd_miss, None)
+KNOWN_MISSES["helper-hd-round7-backtick-comment-nested-parameter"] = (
+    "Inherited-main positional-regex limit: ${1:-unknown} alone inside this "
+    "backtick does not match main9f _POSITIONAL_RE. The unchanged predicate "
+    "is restored under owner decision6156188282; no parameter-evaluation "
+    "fallback is added inside substitutions. "
+    "https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6156188282"
+)
+KNOWN_BROADER["helper-hd-central-unknown-stdin-data"] = (
+    "Unknown consumer DATA is not proven inert; the literal owner has no "
+    "known stdin behavior. The sampled missing command is quiet, but the "
+    "owner-approved outer boundary stays conservative without a runtime "
+    "binding/input model. https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6156188282"
+)
+CORPUS = [(cid, MUST_NOT_FLAG if cid == "helper-hd-round7-backtick-comment-nested-parameter" else rule, body)
+          for cid, rule, body in CORPUS]
+
+
+KNOWN_BROADER.update({cid: (
+    "Inherited-main ordinary-reader conservatism: exact positional @a is "
+    "attributes-only in the sampled runtime, but main9f positional readers "
+    "retain it. Their unchanged AST/signatures are restored under owner "
+    "decision6156188282; this is outside the substitution class and no "
+    "ordinary redaction cleanup is retained by #1496. "
+    "https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6156188282"
+) for cid in ('helper-hd-round9-attributes-ordinary-a', 'helper-hd-round9-attributes-fallback-a')})
+
+
+
+
+# Historical echo-owner fixture bodies remain exact; the class below supersedes identity reasons.
+CORPUS += [('helper-hd-echo-owner-owner-enabled-earlier-alias', 'flag', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-function-shadow', 'flag', 'echo(){ cat; }\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-function-shadow-with-argv', 'flag', 'echo(){ cat; }\ndie(){ echo safe <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-bundled-enable-alias', 'flag', 'shopt -qs expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-separate-query-enable-alias', 'flag', 'shopt -q -s expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-alias-before-enable', 'flag', 'alias echo=cat\nshopt -s expand_aliases\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-no-enable', 'clean', 'alias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-late-alias', 'clean', 'shopt -s expand_aliases\ndie(){ echo <<EOF\n$1\nEOF\n}\nalias echo=cat\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-late-enable', 'clean', 'alias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\nshopt -s expand_aliases\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-plain-builtin', 'clean', 'die(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-builtin-dispatch', 'clean', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ builtin echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-command-dispatch', 'clean', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ command echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-escaped-command', 'clean', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ \\echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-absolute-command', 'clean', 'echo(){ cat; }\ndie(){ /bin/echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-safe-alias', 'flag', 'shopt -s expand_aliases\nalias echo=true\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-safe-function', 'flag', 'echo(){ printf safe; }\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-late-function-leak', 'flag', 'die(){ echo <<EOF\n$1\nEOF\n}\necho(){ cat; }\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-after-call-function', 'flag', 'die(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\necho(){ cat; }\n'), ('helper-hd-echo-owner-owner-quiet-noninterpolating-alias', 'clean', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ echo <<\'EOF\'\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-escaped-data-alias', 'clean', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n\\$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-plain-s', 'flag', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-bundle-qs', 'flag', 'shopt -qs expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-bundle-sq', 'flag', 'shopt -sq expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-bundle-ps', 'flag', 'shopt -ps expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-query-only', 'clean', 'shopt -q expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-print-only', 'clean', 'shopt -p expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-unset-only', 'clean', 'shopt -u expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-bundle-qu', 'clean', 'shopt -qu expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-enable-then-disable', 'clean', 'shopt -s expand_aliases\nshopt -u expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-enable-then-bundle-disable', 'clean', 'shopt -s expand_aliases\nshopt -qu expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-enable-then-query', 'flag', 'shopt -s expand_aliases\nshopt -q expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-conflicting-default-off', 'clean', 'shopt -su expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-conflicting-default-on', 'flag', 'shopt -s expand_aliases\nshopt -su expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-invalid-default-off', 'clean', 'shopt -zs expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-invalid-default-on', 'flag', 'shopt -s expand_aliases\nshopt -zu expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-o-mode-default-off', 'clean', 'shopt -os expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-o-mode-default-on', 'flag', 'shopt -s expand_aliases\nshopt -ou expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-post-body-enable', 'clean', 'alias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\nshopt -s expand_aliases\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-post-body-disable', 'flag', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\nshopt -u expand_aliases\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-catalogue-function-keyword', 'flag', 'function echo { cat; }\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-catalogue-function-keyword-next-line', 'flag', 'function echo\n{ cat; }\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-catalogue-header-next-line', 'flag', 'echo()\n{\ncat\n}\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-catalogue-subshell-body', 'flag', 'echo() ( cat; )\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-read-uninvoked-setup', 'clean', 'setup(){ shopt -s expand_aliases; alias echo=cat; }\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-read-captured-setup', 'clean', 'v=$(shopt -s expand_aliases; alias echo=cat)\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-read-same-read-line', 'clean', 'shopt -s expand_aliases; alias echo=cat; die(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-read-continued-read-line', 'clean', 'shopt -s expand_aliases; alias echo=cat; \\\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n')]
+
+
+
+
+# Historical literal quoted-dispatch fixture bodies remain exact under echo conservatism.
+CORPUS += [('helper-hd-echo-owner-quiet-quoted-single-builtin', 'clean', 'echo(){ cat; }\ndie(){ \'builtin\' echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-quiet-quoted-double-builtin', 'clean', 'echo(){ cat; }\ndie(){ "builtin" echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-quiet-quoted-single-command', 'clean', 'echo(){ cat; }\ndie(){ \'command\' echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-quiet-quoted-double-command', 'clean', 'echo(){ cat; }\ndie(){ "command" echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n')]
+
+
+# Historical dispatch fixture bodies remain exact; no lookup facts are retained.
+CORPUS += [('helper-hd-dispatch-owner-command-active-alias',
+  'flag',
+  'shopt -s expand_aliases\n'
+  "alias command='cat -'\n"
+  'die(){ command echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-function-shadow',
+  'flag',
+  'command(){ cat; }\ndie(){ command echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-quoted-function-shadow',
+  'flag',
+  'command(){ cat; }\ndie(){ \'command\' echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-late-function-before-call',
+  'flag',
+  '\ndie(){ command echo <<EOF\n$1\nEOF\n}\ncommand(){ cat; }\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-safe-alias-quiet',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias command=true\n'
+  'die(){ command echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-safe-function-quiet',
+  'flag',
+  'command(){ printf safe; }\ndie(){ command echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-after-call-function-quiet',
+  'flag',
+  'die(){ command echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\ncommand(){ cat; }\n'),
+ ('helper-hd-dispatch-owner-command-no-enable-quiet',
+  'clean',
+  'alias command=\'cat -\'\ndie(){ command echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-late-alias-quiet',
+  'clean',
+  'shopt -s expand_aliases\n'
+  'die(){ command echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  "alias command='cat -'\n"
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-escaped-alias-quiet',
+  'clean',
+  'shopt -s expand_aliases\n'
+  "alias command='cat -'\n"
+  'die(){ \\command echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-quoted-alias-quiet',
+  'clean',
+  'shopt -s expand_aliases\n'
+  "alias command='cat -'\n"
+  "die(){ 'command' echo <<EOF\n"
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-plain-dispatch-quiet',
+  'clean',
+  'echo(){ cat; }\ndie(){ command echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-printf-active-alias',
+  'flag',
+  'shopt -s expand_aliases\n'
+  "alias command='cat -'\n"
+  'die(){ command printf safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-printf-function-shadow',
+  'flag',
+  'command(){ cat; }\ndie(){ command printf safe <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-active-alias',
+  'flag',
+  'shopt -s expand_aliases\n'
+  "alias builtin='cat -'\n"
+  'die(){ builtin echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-function-shadow',
+  'flag',
+  'builtin(){ cat; }\ndie(){ builtin echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-quoted-function-shadow',
+  'flag',
+  'builtin(){ cat; }\ndie(){ \'builtin\' echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-late-function-before-call',
+  'flag',
+  '\ndie(){ builtin echo <<EOF\n$1\nEOF\n}\nbuiltin(){ cat; }\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-safe-alias-quiet',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias builtin=true\n'
+  'die(){ builtin echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-safe-function-quiet',
+  'flag',
+  'builtin(){ printf safe; }\ndie(){ builtin echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-after-call-function-quiet',
+  'flag',
+  'die(){ builtin echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\nbuiltin(){ cat; }\n'),
+ ('helper-hd-dispatch-owner-builtin-no-enable-quiet',
+  'clean',
+  'alias builtin=\'cat -\'\ndie(){ builtin echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-late-alias-quiet',
+  'clean',
+  'shopt -s expand_aliases\n'
+  'die(){ builtin echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  "alias builtin='cat -'\n"
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-escaped-alias-quiet',
+  'clean',
+  'shopt -s expand_aliases\n'
+  "alias builtin='cat -'\n"
+  'die(){ \\builtin echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-quoted-alias-quiet',
+  'clean',
+  'shopt -s expand_aliases\n'
+  "alias builtin='cat -'\n"
+  "die(){ 'builtin' echo <<EOF\n"
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-plain-dispatch-quiet',
+  'clean',
+  'echo(){ cat; }\ndie(){ builtin echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-printf-active-alias',
+  'flag',
+  'shopt -s expand_aliases\n'
+  "alias builtin='cat -'\n"
+  'die(){ builtin printf safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-printf-function-shadow',
+  'flag',
+  'builtin(){ cat; }\ndie(){ builtin printf safe <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-command-bypasses-command-function',
+  'clean',
+  'command(){ cat; }\ndie(){ builtin command echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-command-builtin-bypasses-builtin-function',
+  'clean',
+  'builtin(){ cat; }\ndie(){ command builtin echo <<EOF\n$1\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-builtin-command-bypasses-both-functions',
+  'clean',
+  'command(){ cat; }\n'
+  'echo(){ cat; }\n'
+  'die(){ builtin command echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-absolute-echo-with-all-shadow-functions',
+  'clean',
+  'echo(){ cat; }\n'
+  'command(){ cat; }\n'
+  'builtin(){ cat; }\n'
+  'die(){ /bin/echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  '\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-brace-modified-positional',
+  'clean',
+  '\ndie(){ echo <<EOF\n${ echo "${1:-fallback}" >&2; }\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-dollar-modified-positional',
+  'flag',
+  '\ndie(){ echo <<EOF\n$(echo "${1:-fallback}" >&2)\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-backtick-modified-positional',
+  'flag',
+  '\ndie(){ echo <<EOF\n`echo "${1:-fallback}" >&2`\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-dollar-trimmed-positional',
+  'flag',
+  '\ndie(){ echo <<EOF\n$(echo "${1#x}" >&2)\nEOF\n}\n\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-dispatch-owner-dollar-length-quiet',
+  'clean',
+  '\ndie(){ echo <<EOF\n$(echo "${#1}" >&2)\nEOF\n}\n\ndie "$GH_TOKEN"\n')]
+
+
+KNOWN_MISSES['helper-hd-dispatch-owner-brace-modified-positional'] = (
+    "Inherited main9f raw positional-regex miss: ${1:-fallback} alone in the "
+    "Bash5.3 brace command substitution is not matched. Main,350 and b271 "
+    "all miss the sampled Mac5.3 leak; Linux5.2 rejects this syntax. The "
+    "unchanged central predicate is retained, with no parameter fallback. "
+    "https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6158118173; "
+    "https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6156188282"
+)
+KNOWN_MISS_MIN_BASH = {'helper-hd-dispatch-owner-brace-modified-positional': (5, 3)}
+
+
+# Blanket echo conservatism replaces private alias/function/lookup identity proofs.
+CORPUS += [('helper-hd-echo-removal-skipped-and-disable',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias echo=cat\n'
+  'false && shopt -u expand_aliases\n'
+  'die(){\n'
+  ' echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-skipped-or-disable',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias echo=cat\n'
+  'true || shopt -u expand_aliases\n'
+  'die(){\n'
+  ' echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-skipped-if-disable',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias echo=cat\n'
+  'if false; then shopt -u expand_aliases; fi\n'
+  'die(){\n'
+  ' echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-plain-disable-control',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias echo=cat\n'
+  'shopt -u expand_aliases\n'
+  'die(){\n'
+  ' echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-executed-and-disable-quiet',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias echo=cat\n'
+  'true && shopt -u expand_aliases\n'
+  'die(){\n'
+  ' echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-command-skipped-disable',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias command="cat -"\n'
+  'false && shopt -u expand_aliases\n'
+  'die(){\n'
+  ' command echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-builtin-skipped-disable',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias builtin="cat -"\n'
+  'false && shopt -u expand_aliases\n'
+  'die(){\n'
+  ' builtin echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-lookup-bare',
+  'flag',
+  'enable -n echo\nhash -p /bin/cat echo\ndie(){\n echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-lookup-command',
+  'flag',
+  'enable -n echo\n'
+  'hash -p /bin/cat echo\n'
+  'die(){\n'
+  ' command echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-lookup-builtin-quiet',
+  'flag',
+  'enable -n echo\n'
+  'hash -p /bin/cat echo\n'
+  'die(){\n'
+  ' builtin echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-lookup-hash-only-quiet',
+  'flag',
+  'hash -p /bin/cat echo\ndie(){\n echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-lookup-reenabled-quiet',
+  'flag',
+  'enable -n echo\n'
+  'hash -p /bin/cat echo\n'
+  'enable echo\n'
+  'die(){\n'
+  ' echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-lookup-disable-only-quiet',
+  'flag',
+  'enable -n echo\ndie(){\n echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-lookup-path-quiet',
+  'flag',
+  'enable -n echo\nhash -p /bin/cat echo\ndie(){\n /bin/echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-lookup-after-helper-before-call',
+  'flag',
+  'die(){\n echo <<EOF\n$1\nEOF\n}\nenable -n echo\nhash -p /bin/cat echo\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-lookup-after-call-quiet',
+  'flag',
+  'die(){\n echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\nenable -n echo\nhash -p /bin/cat echo\n'),
+ ('helper-hd-echo-removal-startup-echo',
+  'flag',
+  '#!/usr/bin/env -S bash -O expand_aliases\n'
+  'alias echo=cat\n'
+  'die(){\n'
+  ' echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-startup-command',
+  'flag',
+  '#!/usr/bin/env -S bash -O expand_aliases\n'
+  "alias command='cat -'\n"
+  'die(){\n'
+  ' command echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-startup-builtin',
+  'flag',
+  '#!/usr/bin/env -S bash -O expand_aliases\n'
+  "alias builtin='cat -'\n"
+  'die(){\n'
+  ' builtin echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-startup-no-enable-quiet',
+  'flag',
+  '#!/usr/bin/env -S bash\nalias echo=cat\ndie(){\n echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-startup-disabled-quiet',
+  'flag',
+  '#!/usr/bin/env -S bash -O expand_aliases\n'
+  'alias echo=cat\n'
+  'shopt -u expand_aliases\n'
+  'die(){\n'
+  ' echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-startup-expanded-pair',
+  'flag',
+  '#!/usr/bin/env -S bash -O expand_aliases\n'
+  'alias echo=cat\n'
+  'die(){\n'
+  ' \\echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-same-line-executed-disable-quiet',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias echo=cat\n'
+  ':; shopt -u expand_aliases\n'
+  'die(){\n'
+  ' echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-source-function-echo',
+  'flag',
+  "cat > setup <<'SH'\n"
+  'echo(){ cat; }\n'
+  'SH\n'
+  'source ./setup\n'
+  'die(){ echo safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-source-alias-echo',
+  'flag',
+  'shopt -s expand_aliases\n'
+  "cat > setup <<'SH'\n"
+  "alias echo='cat -'\n"
+  'SH\n'
+  'source ./setup\n'
+  'die(){ echo safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-dot-function-echo',
+  'flag',
+  "cat > setup <<'SH'\n"
+  'echo(){ cat; }\n'
+  'SH\n'
+  '. ./setup\n'
+  'die(){ echo safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-dot-alias-echo',
+  'flag',
+  'shopt -s expand_aliases\n'
+  "cat > setup <<'SH'\n"
+  "alias echo='cat -'\n"
+  'SH\n'
+  '. ./setup\n'
+  'die(){ echo safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-eval-function-echo',
+  'flag',
+  'eval \'echo(){ cat; }\'\ndie(){ echo safe <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-eval-alias-echo',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'eval \'alias echo="cat -"\'\n'
+  'die(){ echo safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-source-function-printf',
+  'flag',
+  "cat > setup <<'SH'\n"
+  'printf(){ cat; }\n'
+  'SH\n'
+  'source ./setup\n'
+  'die(){ printf safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-source-alias-printf',
+  'flag',
+  'shopt -s expand_aliases\n'
+  "cat > setup <<'SH'\n"
+  "alias printf='cat -'\n"
+  'SH\n'
+  'source ./setup\n'
+  'die(){ printf safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-dot-function-printf',
+  'flag',
+  "cat > setup <<'SH'\n"
+  'printf(){ cat; }\n'
+  'SH\n'
+  '. ./setup\n'
+  'die(){ printf safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-dot-alias-printf',
+  'flag',
+  'shopt -s expand_aliases\n'
+  "cat > setup <<'SH'\n"
+  "alias printf='cat -'\n"
+  'SH\n'
+  '. ./setup\n'
+  'die(){ printf safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-eval-function-printf',
+  'flag',
+  'eval \'printf(){ cat; }\'\ndie(){ printf safe <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-eval-alias-printf',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'eval \'alias printf="cat -"\'\n'
+  'die(){ printf safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-span-dollar',
+  'clean',
+  'die(){ echo <<EOF\n$( : "${1:-fallback}" )\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-span-backtick',
+  'clean',
+  'die(){ echo <<EOF\n` : "${1:-fallback}" `\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-span-brace-command',
+  'clean',
+  'die(){ echo <<EOF\n${ : "${1:-fallback}"; }\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-span-brace-reply',
+  'clean',
+  'die(){ echo <<EOF\n${| : "${1:-fallback}"; }\nEOF\n}\ndie "$GH_TOKEN"\n')]
+
+HEREDOC_ECHO_RULE_CHANGES = frozenset(('helper-hd-echo-default-inert-body',
+ 'helper-hd-round8-known-echo-inert',
+ 'helper-hd-echo-owner-owner-quiet-no-enable',
+ 'helper-hd-echo-owner-owner-quiet-late-alias',
+ 'helper-hd-echo-owner-owner-quiet-late-enable',
+ 'helper-hd-echo-owner-owner-quiet-plain-builtin',
+ 'helper-hd-echo-owner-owner-quiet-builtin-dispatch',
+ 'helper-hd-echo-owner-owner-quiet-command-dispatch',
+ 'helper-hd-echo-owner-owner-quiet-escaped-command',
+ 'helper-hd-echo-owner-owner-quiet-absolute-command',
+ 'helper-hd-echo-owner-shopt-query-only',
+ 'helper-hd-echo-owner-shopt-print-only',
+ 'helper-hd-echo-owner-shopt-unset-only',
+ 'helper-hd-echo-owner-shopt-bundle-qu',
+ 'helper-hd-echo-owner-shopt-enable-then-disable',
+ 'helper-hd-echo-owner-shopt-enable-then-bundle-disable',
+ 'helper-hd-echo-owner-shopt-conflicting-default-off',
+ 'helper-hd-echo-owner-shopt-invalid-default-off',
+ 'helper-hd-echo-owner-shopt-o-mode-default-off',
+ 'helper-hd-echo-owner-shopt-post-body-enable',
+ 'helper-hd-echo-owner-read-uninvoked-setup',
+ 'helper-hd-echo-owner-read-captured-setup',
+ 'helper-hd-echo-owner-read-same-read-line',
+ 'helper-hd-echo-owner-read-continued-read-line',
+ 'helper-hd-echo-owner-quiet-quoted-single-builtin',
+ 'helper-hd-echo-owner-quiet-quoted-double-builtin',
+ 'helper-hd-echo-owner-quiet-quoted-single-command',
+ 'helper-hd-echo-owner-quiet-quoted-double-command',
+ 'helper-hd-dispatch-owner-command-no-enable-quiet',
+ 'helper-hd-dispatch-owner-command-late-alias-quiet',
+ 'helper-hd-dispatch-owner-command-escaped-alias-quiet',
+ 'helper-hd-dispatch-owner-command-quoted-alias-quiet',
+ 'helper-hd-dispatch-owner-command-plain-dispatch-quiet',
+ 'helper-hd-dispatch-owner-builtin-no-enable-quiet',
+ 'helper-hd-dispatch-owner-builtin-late-alias-quiet',
+ 'helper-hd-dispatch-owner-builtin-escaped-alias-quiet',
+ 'helper-hd-dispatch-owner-builtin-quoted-alias-quiet',
+ 'helper-hd-dispatch-owner-builtin-plain-dispatch-quiet',
+ 'helper-hd-dispatch-owner-builtin-command-bypasses-command-function',
+ 'helper-hd-dispatch-owner-command-builtin-bypasses-builtin-function',
+ 'helper-hd-dispatch-owner-builtin-command-bypasses-both-functions',
+ 'helper-hd-dispatch-owner-absolute-echo-with-all-shadow-functions'))
+HEREDOC_ECHO_CONSERVATIVE_CASES = frozenset(('helper-hd-echo-default-inert-body',
+ 'helper-hd-round8-known-echo-inert',
+ 'helper-hd-echo-owner-owner-quiet-no-enable',
+ 'helper-hd-echo-owner-owner-quiet-late-alias',
+ 'helper-hd-echo-owner-owner-quiet-late-enable',
+ 'helper-hd-echo-owner-owner-quiet-plain-builtin',
+ 'helper-hd-echo-owner-owner-quiet-builtin-dispatch',
+ 'helper-hd-echo-owner-owner-quiet-command-dispatch',
+ 'helper-hd-echo-owner-owner-quiet-escaped-command',
+ 'helper-hd-echo-owner-owner-quiet-absolute-command',
+ 'helper-hd-echo-owner-shopt-query-only',
+ 'helper-hd-echo-owner-shopt-print-only',
+ 'helper-hd-echo-owner-shopt-unset-only',
+ 'helper-hd-echo-owner-shopt-bundle-qu',
+ 'helper-hd-echo-owner-shopt-enable-then-disable',
+ 'helper-hd-echo-owner-shopt-enable-then-bundle-disable',
+ 'helper-hd-echo-owner-shopt-conflicting-default-off',
+ 'helper-hd-echo-owner-shopt-invalid-default-off',
+ 'helper-hd-echo-owner-shopt-o-mode-default-off',
+ 'helper-hd-echo-owner-shopt-post-body-enable',
+ 'helper-hd-echo-owner-read-uninvoked-setup',
+ 'helper-hd-echo-owner-read-captured-setup',
+ 'helper-hd-echo-owner-read-same-read-line',
+ 'helper-hd-echo-owner-read-continued-read-line',
+ 'helper-hd-echo-owner-quiet-quoted-single-builtin',
+ 'helper-hd-echo-owner-quiet-quoted-double-builtin',
+ 'helper-hd-echo-owner-quiet-quoted-single-command',
+ 'helper-hd-echo-owner-quiet-quoted-double-command',
+ 'helper-hd-dispatch-owner-command-no-enable-quiet',
+ 'helper-hd-dispatch-owner-command-late-alias-quiet',
+ 'helper-hd-dispatch-owner-command-escaped-alias-quiet',
+ 'helper-hd-dispatch-owner-command-quoted-alias-quiet',
+ 'helper-hd-dispatch-owner-command-plain-dispatch-quiet',
+ 'helper-hd-dispatch-owner-builtin-no-enable-quiet',
+ 'helper-hd-dispatch-owner-builtin-late-alias-quiet',
+ 'helper-hd-dispatch-owner-builtin-escaped-alias-quiet',
+ 'helper-hd-dispatch-owner-builtin-quoted-alias-quiet',
+ 'helper-hd-dispatch-owner-builtin-plain-dispatch-quiet',
+ 'helper-hd-dispatch-owner-builtin-command-bypasses-command-function',
+ 'helper-hd-dispatch-owner-command-builtin-bypasses-builtin-function',
+ 'helper-hd-dispatch-owner-builtin-command-bypasses-both-functions',
+ 'helper-hd-dispatch-owner-absolute-echo-with-all-shadow-functions',
+ 'helper-hd-echo-owner-owner-quiet-safe-alias',
+ 'helper-hd-echo-owner-owner-quiet-safe-function',
+ 'helper-hd-echo-owner-owner-quiet-after-call-function',
+ 'helper-hd-dispatch-owner-command-safe-alias-quiet',
+ 'helper-hd-dispatch-owner-command-safe-function-quiet',
+ 'helper-hd-dispatch-owner-command-after-call-function-quiet',
+ 'helper-hd-dispatch-owner-builtin-safe-alias-quiet',
+ 'helper-hd-dispatch-owner-builtin-safe-function-quiet',
+ 'helper-hd-dispatch-owner-builtin-after-call-function-quiet',
+ 'helper-hd-echo-removal-plain-disable-control',
+ 'helper-hd-echo-removal-executed-and-disable-quiet',
+ 'helper-hd-echo-removal-lookup-builtin-quiet',
+ 'helper-hd-echo-removal-lookup-hash-only-quiet',
+ 'helper-hd-echo-removal-lookup-reenabled-quiet',
+ 'helper-hd-echo-removal-lookup-disable-only-quiet',
+ 'helper-hd-echo-removal-lookup-path-quiet',
+ 'helper-hd-echo-removal-lookup-after-call-quiet',
+ 'helper-hd-echo-removal-startup-echo',
+ 'helper-hd-echo-removal-startup-command',
+ 'helper-hd-echo-removal-startup-builtin',
+ 'helper-hd-echo-removal-startup-no-enable-quiet',
+ 'helper-hd-echo-removal-startup-disabled-quiet',
+ 'helper-hd-echo-removal-startup-expanded-pair',
+ 'helper-hd-echo-removal-same-line-executed-disable-quiet'))
+HEREDOC_ECHO_CONSERVATISM = (
+    "Owner-directed resolved echo heredoc DATA conservatism, including command, "
+    "builtin, quoted, escaped and path spellings resolved as echo. The sampled "
+    "runtime is quiet, but echo is excluded from the inert owner set without "
+    "alias/function/source/eval/startup/enable/hash lookup or execution modelling. "
+    "Startup bodies in ordinary CORPUS run under its plain-bash PROLOGUE; native "
+    "shebang leaks are independently qualified in paired proof, not claimed for "
+    "that ordinary sample. One plain parameter-default DATA case is also missed "
+    "by main's raw regex; this decision explicitly covers resolved echo DATA "
+    "rather than claiming main flags every parameter form. Central substitution "
+    "conservatism and unchanged inherited brace misses remain separate. "
+    "https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6158711314"
+)
+CORPUS = [(cid, MUST_FLAG if cid in HEREDOC_ECHO_RULE_CHANGES else rule, body)
+          for cid, rule, body in CORPUS]
+KNOWN_BROADER.update({cid: HEREDOC_ECHO_CONSERVATISM
+                      for cid in HEREDOC_ECHO_CONSERVATIVE_CASES})
+
 def _corpus_id_cases():
     """Every corpus id is UNIQUE, and every declared id names a real case.
 
@@ -10669,14 +13560,50 @@ def _function_definition_cases():
     return failures
 
 
+def _heredoc_conservatism_cases():
+    """The central contract has no role, invocation, argument or depth model."""
+    failures = []
+    for cid, rule, body in CORPUS:
+        if not cid.startswith("helper-hd-central-"):
+            continue
+        findings, errors = scan_text(PROLOGUE + body, cid)
+        if bool(findings) != (rule == MUST_FLAG) or errors:
+            failures.append("central heredoc conservatism: " + cid)
+    return failures
+
+
+def _heredoc_echo_conservatism_cases():
+    """Pin resolved echo conservatism and unchanged printf/plain DATA precision."""
+    failures = []
+    for cid, rule, body in CORPUS:
+        if not (cid.startswith(("helper-hd-echo-owner-", "helper-hd-dispatch-owner-",
+                               "helper-hd-echo-removal-"))
+                or cid in ("helper-hd-central-plain-printf-data",
+                           "helper-hd-central-plain-read-data")):
+            continue
+        findings, errors = scan_text(PROLOGUE + body, cid)
+        if bool(findings) != (rule == MUST_FLAG) or errors:
+            failures.append("echo heredoc conservatism: " + cid)
+        if cid.startswith("helper-hd-echo-removal-") and body.startswith("#!"):
+            # Ordinary corpus uses PROLOGUE; pin native first-line source too.
+            # This is a scanner assertion, not a claim of native runtime here.
+            native_findings, native_errors = scan_text(body, cid + "/first-line")
+            if not native_findings or native_errors:
+                failures.append("echo heredoc first-line source: " + cid)
+    return failures
+
+
 def self_test():
     failures = []
     passed = 0
     tp = fn = fp = tn = 0
+    bash_path, bash_text, _bash_ver = oracle_bash()
 
     failures.extend(_corpus_id_cases())
     failures.extend(_printf_allowlist_cases())
     failures.extend(_function_definition_cases())
+    failures.extend(_heredoc_conservatism_cases())
+    failures.extend(_heredoc_echo_conservatism_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
@@ -10750,7 +13677,10 @@ def self_test():
             else:
                 tn += 1
 
-            if cid in KNOWN_MISSES and not (leaked and not flagged):
+            minimum_bash = KNOWN_MISS_MIN_BASH.get(cid)
+            unsupported_miss = (minimum_bash is not None and _bash_ver is not None
+                                and _bash_ver < minimum_bash)
+            if cid in KNOWN_MISSES and not unsupported_miss and not (leaked and not flagged):
                 failures.append(
                     "STALE KNOWN_MISSES entry %r: it no longer disagrees with "
                     "the oracle (leaked=%s flagged=%s) -- delete it"
@@ -10815,9 +13745,13 @@ def self_test():
     # disagreement with bash was measured on this run.  An absence from it is
     # not coverage.
     for cid in sorted(KNOWN_MISSES):
+        minimum_bash = KNOWN_MISS_MIN_BASH.get(cid)
+        unsupported_miss = (minimum_bash is not None and _bash_ver is not None
+                            and _bash_ver < minimum_bash)
+        label = "unsupported version-qualified miss" if unsupported_miss else "measured miss"
         print(
-            "check_no_token_in_output:   measured miss: %s -- %s"
-            % (cid, KNOWN_MISSES[cid])
+            "check_no_token_in_output:   %s: %s -- %s"
+            % (label, cid, KNOWN_MISSES[cid])
         )
     for cid in sorted(KNOWN_BROADER):
         print(

@@ -643,6 +643,13 @@ jobs:
       - name: check_eslint_config_policy
         run: ./scripts/ci/check_eslint_config_policy || { rc=$?; if [ ! -f scripts/ci/check_eslint_config_policy ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_eslint_config_policy not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
+      # #2162: peer-coupled npm families (scripts/ci/dependabot-coupled-families.json)
+      # must share one Dependabot group, listed before any group that would split
+      # them, or their coupled majors open as separate PRs that each fail npm ci.
+      # Needs the PyYAML provisioned by install_python_ci_dependencies above.
+      - name: check_dependabot_coupled_groups
+        run: ./scripts/ci/check_dependabot_coupled_groups --check || { rc=$?; if [ ! -f scripts/ci/check_dependabot_coupled_groups ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_dependabot_coupled_groups not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
       - name: check_auto_clear_workflow
         run: ./scripts/ci/check_auto_clear_workflow --check || { rc=$?; if [ ! -f scripts/ci/check_auto_clear_workflow ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_auto_clear_workflow not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
@@ -1075,6 +1082,10 @@ jobs:
       - name: check_auto_clear_workflow --self-test
         if: matrix.suite == 'gates' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_auto_clear_workflow'))
         run: ./scripts/ci/check_auto_clear_workflow --self-test || { rc=$?; if [ ! -f scripts/ci/check_auto_clear_workflow ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_auto_clear_workflow not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_dependabot_coupled_groups --self-test
+        if: matrix.suite == 'gates' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_dependabot_coupled_groups'))
+        run: ./scripts/ci/check_dependabot_coupled_groups --self-test || { rc=$?; if [ ! -f scripts/ci/check_dependabot_coupled_groups ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_dependabot_coupled_groups not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_git_identity_hygiene
         run: ./scripts/ci/check_git_identity_hygiene || { rc=$?; if [ ! -f scripts/ci/check_git_identity_hygiene ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_git_identity_hygiene not in this tree yet; soft-pass (bootstrap skew)"; else exit "$rc"; fi; }
