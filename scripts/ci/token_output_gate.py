@@ -3444,7 +3444,6 @@ def discover_emitter_helpers(text):
     """Names with any recognized body writing their positionals VERBATIM."""
     bodies = {}
     definitions = list(_iter_function_definitions(text))
-    echo_alias_reads = _heredoc_echo_alias_read_facts(text, definitions)
     # NOT `^[ \t]*`.  A function definition is valid at any COMMAND POSITION,
     # not only at the start of a physical line: `true; log(){ echo "$1"; }`
     # defines `log`, and the anchored form never discovered it, so the later
@@ -3459,8 +3458,7 @@ def discover_emitter_helpers(text):
     # Lex each body ONCE.  What a body does never changes between rounds; only
     # the `helpers` set a call inside it is graded against does, and that is
     # what the fixed point below iterates.
-    lexed = [(name, body, Lexer(body), echo_alias_reads.get(match.start(), frozenset()))
-             for match, name, body in definitions]
+    lexed = [(name, body, Lexer(body)) for _match, name, body in definitions]
 
     # A local printf or passthrough-prefix definition invalidates the new
     # attached-option builtin exemption even for a non-emitting body.
@@ -3520,7 +3518,7 @@ def discover_emitter_helpers(text):
     # is bounded by the number of functions in the file, so this terminates.
     while True:
         grew = False
-        for name, body_text, lx, echo_alias_read in lexed:
+        for name, body_text, lx in lexed:
             if name in helpers:
                 continue
             emits = False
@@ -3570,10 +3568,7 @@ def discover_emitter_helpers(text):
                     emits = True
             # A nested or direct HD uses the same bounded admission rule.
             if not emits:
-                emits = any(_heredoc_has_positional(
-                    hd, helpers, frozenset(bodies) & {"echo", "command", "builtin"},
-                    echo_alias_read
-                ) for hd in lx.heredocs)
+                emits = any(_heredoc_has_positional(hd, helpers) for hd in lx.heredocs)
             if emits:
                 helpers.add(name)
                 grew = True
@@ -3795,97 +3790,7 @@ def _heredoc_error_word_spans(s):
 _POSITIONAL_RE = re.compile(r"\$(?:[1-9][0-9]*|[@*]|\{(?:[1-9][0-9]*|[@*])\})")
 
 
-def _heredoc_echo_alias_read_facts(text, definitions):
-    """Echo/dispatch alias identities at helper READ boundaries, not execution.
-
-    Mask only already-recognized function bodies in a private setup view.
-    Their source length/newlines stay exact; uninvoked bodies cannot create
-    file-level alias evidence. Ordinary Lexer output and metadata are untouched.
-    """
-    setup = list(text)
-    for match, _name, body in definitions:
-        begin = match.end()
-        setup[begin:begin + len(body)] = re.sub(r"[^\n]", " ", body)
-    logical = Lexer("".join(setup)).logical
-    enabled = False
-    aliases = set()
-    before = {}
-    for line in logical:
-        # Aliases expand as the entire logical line is READ, before any of
-        # its declarations run. A same-line definition/enable supplies no fact.
-        before[line.first_line] = frozenset(aliases) if enabled else frozenset()
-        for seg in line.segments:
-            if seg.parent is not None:
-                continue  # Child setup does not establish outer alias state.
-            cmd, _redir = resolve_command(seg)
-            if cmd == "shopt":
-                delta = _heredoc_echo_expand_aliases(seg)
-                if delta is not None:
-                    enabled = delta
-            elif cmd == "alias" and seg._cmd_index is not None:
-                for _raw, literal in _command_arguments(seg.words, seg._cmd_index + 1):
-                    assignment = _ALIAS_RE.match(literal) if literal is not None else None
-                    if assignment is not None and assignment.group(1) in {"echo", "command", "builtin"}:
-                        aliases.add(assignment.group(1))  # No target evaluation.
-    facts = {}
-    for match, _name, _body in definitions:
-        physical = text.count("\n", 0, match.start()) + 1
-        read_line = max((line.first_line for line in logical
-                         if line.first_line <= physical), default=1)
-        facts[match.start()] = before.get(read_line, frozenset())
-    return facts
-
-
-def _heredoc_echo_expand_aliases(seg):
-    """Finite literal shopt prefix facts for the private echo identity proof."""
-    if seg._cmd_index is None:
-        return None
-    arguments = [literal for _raw, literal in
-                 _command_arguments(seg.words, seg._cmd_index + 1)]
-    flags = set()
-    i = 0
-    while i < len(arguments):
-        word = arguments[i]
-        if word is None:
-            return None  # No dynamic flag/name reconstruction.
-        if word == "--":
-            i += 1
-            break
-        if word == "-" or not word.startswith("-"):
-            break
-        if not word[1:] or set(word[1:]) - set("pqsu"):
-            return None  # Invalid/o-mode options do not alter prior proof.
-        flags.update(word[1:])
-        i += 1
-    if (any(word is None for word in arguments[i:])
-            or "expand_aliases" not in arguments[i:]
-            or ("s" in flags) == ("u" in flags)):
-        return None  # Queries and contradictory flags retain prior state.
-    return "s" in flags
-
-
-def _heredoc_first_dispatch(owner):
-    """Expose the first command/builtin role through the unchanged resolver.
-
-    Opaque private words stop prefix stripping at the actual dispatch role;
-    assignments, redirects and wrapper option arguments keep their ordinary
-    positions. Only the original literal command/builtin identity is credited.
-    """
-    marker = "__heredoc_dispatch_identity__"
-    probe = Segment(-1, None, False, owner.line)
-    probe.words = [marker if _unquote_command_word(word) in {"command", "builtin"}
-                   else word for word in owner.words]
-    command, _redir = resolve_command(probe)
-    index = probe._cmd_index
-    if command != marker or index is None:
-        return None
-    raw = owner.words[index]
-    identity = _unquote_command_word(raw)
-    return (identity, raw) if identity in {"command", "builtin"} else None
-
-
-def _heredoc_has_positional(hd, emitter_helpers, owner_functions=frozenset(),
-                            owner_aliases=frozenset()):
+def _heredoc_has_positional(hd, emitter_helpers):
     """Conservative substitutions; precision only for proven non-emitting DATA.
 
     Main's raw positional predicate deliberately applies inside actual command
@@ -3905,26 +3810,25 @@ def _heredoc_has_positional(hd, emitter_helpers, owner_functions=frozenset(),
     cmd, _redir = resolve_command(hd.owner)
     # SAFE is also the default for unknown external commands; only explicit
     # existing literal builtin facts prove the plain DATA is not emitted.
-    # Only a proved FIRST dispatcher shields later function names. An unknown
-    # dispatch may itself consume DATA before a later word is ever reached.
-    dispatch = _heredoc_first_dispatch(hd.owner)
-    dispatch_unknown = (dispatch is not None and (
-        dispatch[0] in owner_functions
-        or (dispatch[1] == dispatch[0] and dispatch[0] in owner_aliases)
-    ))
-    dispatch_proved = dispatch is not None and not dispatch_unknown
-    index = hd.owner._cmd_index
-    echo_identity_unknown = (
-        cmd == "echo" and hd.owner._cmd_literal == "echo" and index is not None
-        and not dispatch_proved
-        and ("echo" in owner_functions
-             or ("echo" in owner_aliases and hd.owner.words[index] == "echo"))
-    )
-    inert = (cmd in EMITTERS | SAFE_COMMANDS | ENV_DUMPERS
+    # Echo retains main's conservatism, including resolved dispatch/path forms.
+    # No alias, builtin availability or runtime command lookup is inferred.
+    inert = (cmd in (EMITTERS | SAFE_COMMANDS | ENV_DUMPERS) - {"echo"}
              and cmd not in emitter_helpers
-             and hd.owner._function_binding is None
-             and not dispatch_unknown and not echo_identity_unknown)
-    return not inert and _heredoc_data_has_positional(body)
+             and hd.owner._function_binding is None)
+    data_body = body
+    if cmd == "echo":
+        # The raw substitution decision above is final. Do not re-read its
+        # contents as plain DATA and accidentally add a parameter fallback.
+        data = list(body)
+        for _inner, start, end in _heredoc_expansions(body):
+            command_span = (body[start:start + 1] == "`"
+                            or (body.startswith("$(", start)
+                                and not body.startswith("$((", start))
+                            or _heredoc_brace_command_span(body, start) is not None)
+            if command_span:
+                data[start:end] = " " * (end - start)
+        data_body = "".join(data)
+    return not inert and _heredoc_data_has_positional(data_body)
 
 
 def _heredoc_data_has_positional(body):
@@ -12802,18 +12706,17 @@ KNOWN_BROADER.update({cid: (
 
 
 
-# Echo owner identity is separate from substitution conservatism.
+# Historical echo-owner fixture bodies remain exact; the class below supersedes identity reasons.
 CORPUS += [('helper-hd-echo-owner-owner-enabled-earlier-alias', 'flag', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-function-shadow', 'flag', 'echo(){ cat; }\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-function-shadow-with-argv', 'flag', 'echo(){ cat; }\ndie(){ echo safe <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-bundled-enable-alias', 'flag', 'shopt -qs expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-separate-query-enable-alias', 'flag', 'shopt -q -s expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-alias-before-enable', 'flag', 'alias echo=cat\nshopt -s expand_aliases\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-no-enable', 'clean', 'alias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-late-alias', 'clean', 'shopt -s expand_aliases\ndie(){ echo <<EOF\n$1\nEOF\n}\nalias echo=cat\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-late-enable', 'clean', 'alias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\nshopt -s expand_aliases\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-plain-builtin', 'clean', 'die(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-builtin-dispatch', 'clean', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ builtin echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-command-dispatch', 'clean', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ command echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-escaped-command', 'clean', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ \\echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-absolute-command', 'clean', 'echo(){ cat; }\ndie(){ /bin/echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-safe-alias', 'flag', 'shopt -s expand_aliases\nalias echo=true\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-safe-function', 'flag', 'echo(){ printf safe; }\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-late-function-leak', 'flag', 'die(){ echo <<EOF\n$1\nEOF\n}\necho(){ cat; }\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-after-call-function', 'flag', 'die(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\necho(){ cat; }\n'), ('helper-hd-echo-owner-owner-quiet-noninterpolating-alias', 'clean', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ echo <<\'EOF\'\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-owner-quiet-escaped-data-alias', 'clean', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n\\$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-plain-s', 'flag', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-bundle-qs', 'flag', 'shopt -qs expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-bundle-sq', 'flag', 'shopt -sq expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-bundle-ps', 'flag', 'shopt -ps expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-query-only', 'clean', 'shopt -q expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-print-only', 'clean', 'shopt -p expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-unset-only', 'clean', 'shopt -u expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-bundle-qu', 'clean', 'shopt -qu expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-enable-then-disable', 'clean', 'shopt -s expand_aliases\nshopt -u expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-enable-then-bundle-disable', 'clean', 'shopt -s expand_aliases\nshopt -qu expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-enable-then-query', 'flag', 'shopt -s expand_aliases\nshopt -q expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-conflicting-default-off', 'clean', 'shopt -su expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-conflicting-default-on', 'flag', 'shopt -s expand_aliases\nshopt -su expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-invalid-default-off', 'clean', 'shopt -zs expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-invalid-default-on', 'flag', 'shopt -s expand_aliases\nshopt -zu expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-o-mode-default-off', 'clean', 'shopt -os expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-o-mode-default-on', 'flag', 'shopt -s expand_aliases\nshopt -ou expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-post-body-enable', 'clean', 'alias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\nshopt -s expand_aliases\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-shopt-post-body-disable', 'flag', 'shopt -s expand_aliases\nalias echo=cat\ndie(){ echo <<EOF\n$1\nEOF\n}\nshopt -u expand_aliases\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-catalogue-function-keyword', 'flag', 'function echo { cat; }\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-catalogue-function-keyword-next-line', 'flag', 'function echo\n{ cat; }\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-catalogue-header-next-line', 'flag', 'echo()\n{\ncat\n}\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-catalogue-subshell-body', 'flag', 'echo() ( cat; )\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-read-uninvoked-setup', 'clean', 'setup(){ shopt -s expand_aliases; alias echo=cat; }\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-read-captured-setup', 'clean', 'v=$(shopt -s expand_aliases; alias echo=cat)\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-read-same-read-line', 'clean', 'shopt -s expand_aliases; alias echo=cat; die(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-read-continued-read-line', 'clean', 'shopt -s expand_aliases; alias echo=cat; \\\ndie(){ echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n')]
 
-KNOWN_BROADER.update({'helper-hd-echo-owner-owner-quiet-safe-alias': 'An active earlier literal alias echo=true makes builtin echo identity unproved. The sampled runtime is quiet; the private proof does not execute alias targets. Owner identity decision: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6157491263', 'helper-hd-echo-owner-owner-quiet-safe-function': 'A recognized literal echo function uses printf safe in the sample and is quiet. The existing function catalogue does not infer function stdin flow, so builtin echo identity is withheld. Owner identity decision: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6157491263', 'helper-hd-echo-owner-owner-quiet-after-call-function': 'The sampled echo(){cat;} is written after the helper call and runtime is quiet. The all-recognized function catalogue cannot prove which definitions executed or runtime lookup order; restricting definitions before the helper would miss late-function-before-call leakage. Owner identity decision: https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6157491263'})
 
 
 
-# Literal quoted builtin/command dispatch retains the existing bypass proof.
+# Historical literal quoted-dispatch fixture bodies remain exact under echo conservatism.
 CORPUS += [('helper-hd-echo-owner-quiet-quoted-single-builtin', 'clean', 'echo(){ cat; }\ndie(){ \'builtin\' echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-quiet-quoted-double-builtin', 'clean', 'echo(){ cat; }\ndie(){ "builtin" echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-quiet-quoted-single-command', 'clean', 'echo(){ cat; }\ndie(){ \'command\' echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'), ('helper-hd-echo-owner-quiet-quoted-double-command', 'clean', 'echo(){ cat; }\ndie(){ "command" echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n')]
 
 
-# Dispatch identity uses the same finite READ/catalogue facts; no target execution.
+# Historical dispatch fixture bodies remain exact; no lookup facts are retained.
 CORPUS += [('helper-hd-dispatch-owner-command-active-alias',
   'flag',
   'shopt -s expand_aliases\n'
@@ -13023,68 +12926,6 @@ CORPUS += [('helper-hd-dispatch-owner-command-active-alias',
   'clean',
   '\ndie(){ echo <<EOF\n$(echo "${#1}" >&2)\nEOF\n}\n\ndie "$GH_TOKEN"\n')]
 
-KNOWN_BROADER.update({'helper-hd-dispatch-owner-command-safe-alias-quiet': 'An earlier active literal dispatch alias '
-                                                      'targets true in this quiet sample. Its '
-                                                      'command/builtin identity is unproved; the '
-                                                      'private owner check does not execute alias '
-                                                      'targets. These are bounded '
-                                                      'dispatch-identity consequences, separate '
-                                                      'from echo/substitution conservatism. Owner '
-                                                      'direction: '
-                                                      'https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6158118173',
- 'helper-hd-dispatch-owner-command-safe-function-quiet': 'A recognized dispatch function prints '
-                                                         'safe in this quiet sample. The existing '
-                                                         'catalogue withholds builtin identity '
-                                                         'without evaluating function input flow. '
-                                                         'These are bounded dispatch-identity '
-                                                         'consequences, separate from '
-                                                         'echo/substitution conservatism. Owner '
-                                                         'direction: '
-                                                         'https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6158118173',
- 'helper-hd-dispatch-owner-command-after-call-function-quiet': 'The stdin-forwarding dispatch '
-                                                               'function is defined after the '
-                                                               'helper call, so this sample is '
-                                                               'quiet. The all-recognized '
-                                                               'catalogue does not infer runtime '
-                                                               'lookup order; excluding later '
-                                                               'definitions would miss '
-                                                               'definition-before-call leakage. '
-                                                               'These are bounded '
-                                                               'dispatch-identity consequences, '
-                                                               'separate from echo/substitution '
-                                                               'conservatism. Owner direction: '
-                                                               'https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6158118173',
- 'helper-hd-dispatch-owner-builtin-safe-alias-quiet': 'An earlier active literal dispatch alias '
-                                                      'targets true in this quiet sample. Its '
-                                                      'command/builtin identity is unproved; the '
-                                                      'private owner check does not execute alias '
-                                                      'targets. These are bounded '
-                                                      'dispatch-identity consequences, separate '
-                                                      'from echo/substitution conservatism. Owner '
-                                                      'direction: '
-                                                      'https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6158118173',
- 'helper-hd-dispatch-owner-builtin-safe-function-quiet': 'A recognized dispatch function prints '
-                                                         'safe in this quiet sample. The existing '
-                                                         'catalogue withholds builtin identity '
-                                                         'without evaluating function input flow. '
-                                                         'These are bounded dispatch-identity '
-                                                         'consequences, separate from '
-                                                         'echo/substitution conservatism. Owner '
-                                                         'direction: '
-                                                         'https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6158118173',
- 'helper-hd-dispatch-owner-builtin-after-call-function-quiet': 'The stdin-forwarding dispatch '
-                                                               'function is defined after the '
-                                                               'helper call, so this sample is '
-                                                               'quiet. The all-recognized '
-                                                               'catalogue does not infer runtime '
-                                                               'lookup order; excluding later '
-                                                               'definitions would miss '
-                                                               'definition-before-call leakage. '
-                                                               'These are bounded '
-                                                               'dispatch-identity consequences, '
-                                                               'separate from echo/substitution '
-                                                               'conservatism. Owner direction: '
-                                                               'https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6158118173'})
 
 KNOWN_MISSES['helper-hd-dispatch-owner-brace-modified-positional'] = (
     "Inherited main9f raw positional-regex miss: ${1:-fallback} alone in the "
@@ -13095,6 +12936,454 @@ KNOWN_MISSES['helper-hd-dispatch-owner-brace-modified-positional'] = (
     "https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6156188282"
 )
 KNOWN_MISS_MIN_BASH = {'helper-hd-dispatch-owner-brace-modified-positional': (5, 3)}
+
+
+# Blanket echo conservatism replaces private alias/function/lookup identity proofs.
+CORPUS += [('helper-hd-echo-removal-skipped-and-disable',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias echo=cat\n'
+  'false && shopt -u expand_aliases\n'
+  'die(){\n'
+  ' echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-skipped-or-disable',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias echo=cat\n'
+  'true || shopt -u expand_aliases\n'
+  'die(){\n'
+  ' echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-skipped-if-disable',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias echo=cat\n'
+  'if false; then shopt -u expand_aliases; fi\n'
+  'die(){\n'
+  ' echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-plain-disable-control',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias echo=cat\n'
+  'shopt -u expand_aliases\n'
+  'die(){\n'
+  ' echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-executed-and-disable-quiet',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias echo=cat\n'
+  'true && shopt -u expand_aliases\n'
+  'die(){\n'
+  ' echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-command-skipped-disable',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias command="cat -"\n'
+  'false && shopt -u expand_aliases\n'
+  'die(){\n'
+  ' command echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-builtin-skipped-disable',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias builtin="cat -"\n'
+  'false && shopt -u expand_aliases\n'
+  'die(){\n'
+  ' builtin echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-lookup-bare',
+  'flag',
+  'enable -n echo\nhash -p /bin/cat echo\ndie(){\n echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-lookup-command',
+  'flag',
+  'enable -n echo\n'
+  'hash -p /bin/cat echo\n'
+  'die(){\n'
+  ' command echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-lookup-builtin-quiet',
+  'flag',
+  'enable -n echo\n'
+  'hash -p /bin/cat echo\n'
+  'die(){\n'
+  ' builtin echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-lookup-hash-only-quiet',
+  'flag',
+  'hash -p /bin/cat echo\ndie(){\n echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-lookup-reenabled-quiet',
+  'flag',
+  'enable -n echo\n'
+  'hash -p /bin/cat echo\n'
+  'enable echo\n'
+  'die(){\n'
+  ' echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-lookup-disable-only-quiet',
+  'flag',
+  'enable -n echo\ndie(){\n echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-lookup-path-quiet',
+  'flag',
+  'enable -n echo\nhash -p /bin/cat echo\ndie(){\n /bin/echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-lookup-after-helper-before-call',
+  'flag',
+  'die(){\n echo <<EOF\n$1\nEOF\n}\nenable -n echo\nhash -p /bin/cat echo\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-lookup-after-call-quiet',
+  'flag',
+  'die(){\n echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\nenable -n echo\nhash -p /bin/cat echo\n'),
+ ('helper-hd-echo-removal-startup-echo',
+  'flag',
+  '#!/usr/bin/env -S bash -O expand_aliases\n'
+  'alias echo=cat\n'
+  'die(){\n'
+  ' echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-startup-command',
+  'flag',
+  '#!/usr/bin/env -S bash -O expand_aliases\n'
+  "alias command='cat -'\n"
+  'die(){\n'
+  ' command echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-startup-builtin',
+  'flag',
+  '#!/usr/bin/env -S bash -O expand_aliases\n'
+  "alias builtin='cat -'\n"
+  'die(){\n'
+  ' builtin echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-startup-no-enable-quiet',
+  'flag',
+  '#!/usr/bin/env -S bash\nalias echo=cat\ndie(){\n echo <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-startup-disabled-quiet',
+  'flag',
+  '#!/usr/bin/env -S bash -O expand_aliases\n'
+  'alias echo=cat\n'
+  'shopt -u expand_aliases\n'
+  'die(){\n'
+  ' echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-startup-expanded-pair',
+  'flag',
+  '#!/usr/bin/env -S bash -O expand_aliases\n'
+  'alias echo=cat\n'
+  'die(){\n'
+  ' \\echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-same-line-executed-disable-quiet',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'alias echo=cat\n'
+  ':; shopt -u expand_aliases\n'
+  'die(){\n'
+  ' echo <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-source-function-echo',
+  'flag',
+  "cat > setup <<'SH'\n"
+  'echo(){ cat; }\n'
+  'SH\n'
+  'source ./setup\n'
+  'die(){ echo safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-source-alias-echo',
+  'flag',
+  'shopt -s expand_aliases\n'
+  "cat > setup <<'SH'\n"
+  "alias echo='cat -'\n"
+  'SH\n'
+  'source ./setup\n'
+  'die(){ echo safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-dot-function-echo',
+  'flag',
+  "cat > setup <<'SH'\n"
+  'echo(){ cat; }\n'
+  'SH\n'
+  '. ./setup\n'
+  'die(){ echo safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-dot-alias-echo',
+  'flag',
+  'shopt -s expand_aliases\n'
+  "cat > setup <<'SH'\n"
+  "alias echo='cat -'\n"
+  'SH\n'
+  '. ./setup\n'
+  'die(){ echo safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-eval-function-echo',
+  'flag',
+  'eval \'echo(){ cat; }\'\ndie(){ echo safe <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-eval-alias-echo',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'eval \'alias echo="cat -"\'\n'
+  'die(){ echo safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-source-function-printf',
+  'flag',
+  "cat > setup <<'SH'\n"
+  'printf(){ cat; }\n'
+  'SH\n'
+  'source ./setup\n'
+  'die(){ printf safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-source-alias-printf',
+  'flag',
+  'shopt -s expand_aliases\n'
+  "cat > setup <<'SH'\n"
+  "alias printf='cat -'\n"
+  'SH\n'
+  'source ./setup\n'
+  'die(){ printf safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-dot-function-printf',
+  'flag',
+  "cat > setup <<'SH'\n"
+  'printf(){ cat; }\n'
+  'SH\n'
+  '. ./setup\n'
+  'die(){ printf safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-dot-alias-printf',
+  'flag',
+  'shopt -s expand_aliases\n'
+  "cat > setup <<'SH'\n"
+  "alias printf='cat -'\n"
+  'SH\n'
+  '. ./setup\n'
+  'die(){ printf safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-eval-function-printf',
+  'flag',
+  'eval \'printf(){ cat; }\'\ndie(){ printf safe <<EOF\n$1\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-eval-alias-printf',
+  'flag',
+  'shopt -s expand_aliases\n'
+  'eval \'alias printf="cat -"\'\n'
+  'die(){ printf safe <<EOF\n'
+  '$1\n'
+  'EOF\n'
+  '}\n'
+  'die "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-span-dollar',
+  'clean',
+  'die(){ echo <<EOF\n$( : "${1:-fallback}" )\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-span-backtick',
+  'clean',
+  'die(){ echo <<EOF\n` : "${1:-fallback}" `\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-span-brace-command',
+  'clean',
+  'die(){ echo <<EOF\n${ : "${1:-fallback}"; }\nEOF\n}\ndie "$GH_TOKEN"\n'),
+ ('helper-hd-echo-removal-span-brace-reply',
+  'clean',
+  'die(){ echo <<EOF\n${| : "${1:-fallback}"; }\nEOF\n}\ndie "$GH_TOKEN"\n')]
+
+HEREDOC_ECHO_RULE_CHANGES = frozenset(('helper-hd-echo-default-inert-body',
+ 'helper-hd-round8-known-echo-inert',
+ 'helper-hd-echo-owner-owner-quiet-no-enable',
+ 'helper-hd-echo-owner-owner-quiet-late-alias',
+ 'helper-hd-echo-owner-owner-quiet-late-enable',
+ 'helper-hd-echo-owner-owner-quiet-plain-builtin',
+ 'helper-hd-echo-owner-owner-quiet-builtin-dispatch',
+ 'helper-hd-echo-owner-owner-quiet-command-dispatch',
+ 'helper-hd-echo-owner-owner-quiet-escaped-command',
+ 'helper-hd-echo-owner-owner-quiet-absolute-command',
+ 'helper-hd-echo-owner-shopt-query-only',
+ 'helper-hd-echo-owner-shopt-print-only',
+ 'helper-hd-echo-owner-shopt-unset-only',
+ 'helper-hd-echo-owner-shopt-bundle-qu',
+ 'helper-hd-echo-owner-shopt-enable-then-disable',
+ 'helper-hd-echo-owner-shopt-enable-then-bundle-disable',
+ 'helper-hd-echo-owner-shopt-conflicting-default-off',
+ 'helper-hd-echo-owner-shopt-invalid-default-off',
+ 'helper-hd-echo-owner-shopt-o-mode-default-off',
+ 'helper-hd-echo-owner-shopt-post-body-enable',
+ 'helper-hd-echo-owner-read-uninvoked-setup',
+ 'helper-hd-echo-owner-read-captured-setup',
+ 'helper-hd-echo-owner-read-same-read-line',
+ 'helper-hd-echo-owner-read-continued-read-line',
+ 'helper-hd-echo-owner-quiet-quoted-single-builtin',
+ 'helper-hd-echo-owner-quiet-quoted-double-builtin',
+ 'helper-hd-echo-owner-quiet-quoted-single-command',
+ 'helper-hd-echo-owner-quiet-quoted-double-command',
+ 'helper-hd-dispatch-owner-command-no-enable-quiet',
+ 'helper-hd-dispatch-owner-command-late-alias-quiet',
+ 'helper-hd-dispatch-owner-command-escaped-alias-quiet',
+ 'helper-hd-dispatch-owner-command-quoted-alias-quiet',
+ 'helper-hd-dispatch-owner-command-plain-dispatch-quiet',
+ 'helper-hd-dispatch-owner-builtin-no-enable-quiet',
+ 'helper-hd-dispatch-owner-builtin-late-alias-quiet',
+ 'helper-hd-dispatch-owner-builtin-escaped-alias-quiet',
+ 'helper-hd-dispatch-owner-builtin-quoted-alias-quiet',
+ 'helper-hd-dispatch-owner-builtin-plain-dispatch-quiet',
+ 'helper-hd-dispatch-owner-builtin-command-bypasses-command-function',
+ 'helper-hd-dispatch-owner-command-builtin-bypasses-builtin-function',
+ 'helper-hd-dispatch-owner-builtin-command-bypasses-both-functions',
+ 'helper-hd-dispatch-owner-absolute-echo-with-all-shadow-functions'))
+HEREDOC_ECHO_CONSERVATIVE_CASES = frozenset(('helper-hd-echo-default-inert-body',
+ 'helper-hd-round8-known-echo-inert',
+ 'helper-hd-echo-owner-owner-quiet-no-enable',
+ 'helper-hd-echo-owner-owner-quiet-late-alias',
+ 'helper-hd-echo-owner-owner-quiet-late-enable',
+ 'helper-hd-echo-owner-owner-quiet-plain-builtin',
+ 'helper-hd-echo-owner-owner-quiet-builtin-dispatch',
+ 'helper-hd-echo-owner-owner-quiet-command-dispatch',
+ 'helper-hd-echo-owner-owner-quiet-escaped-command',
+ 'helper-hd-echo-owner-owner-quiet-absolute-command',
+ 'helper-hd-echo-owner-shopt-query-only',
+ 'helper-hd-echo-owner-shopt-print-only',
+ 'helper-hd-echo-owner-shopt-unset-only',
+ 'helper-hd-echo-owner-shopt-bundle-qu',
+ 'helper-hd-echo-owner-shopt-enable-then-disable',
+ 'helper-hd-echo-owner-shopt-enable-then-bundle-disable',
+ 'helper-hd-echo-owner-shopt-conflicting-default-off',
+ 'helper-hd-echo-owner-shopt-invalid-default-off',
+ 'helper-hd-echo-owner-shopt-o-mode-default-off',
+ 'helper-hd-echo-owner-shopt-post-body-enable',
+ 'helper-hd-echo-owner-read-uninvoked-setup',
+ 'helper-hd-echo-owner-read-captured-setup',
+ 'helper-hd-echo-owner-read-same-read-line',
+ 'helper-hd-echo-owner-read-continued-read-line',
+ 'helper-hd-echo-owner-quiet-quoted-single-builtin',
+ 'helper-hd-echo-owner-quiet-quoted-double-builtin',
+ 'helper-hd-echo-owner-quiet-quoted-single-command',
+ 'helper-hd-echo-owner-quiet-quoted-double-command',
+ 'helper-hd-dispatch-owner-command-no-enable-quiet',
+ 'helper-hd-dispatch-owner-command-late-alias-quiet',
+ 'helper-hd-dispatch-owner-command-escaped-alias-quiet',
+ 'helper-hd-dispatch-owner-command-quoted-alias-quiet',
+ 'helper-hd-dispatch-owner-command-plain-dispatch-quiet',
+ 'helper-hd-dispatch-owner-builtin-no-enable-quiet',
+ 'helper-hd-dispatch-owner-builtin-late-alias-quiet',
+ 'helper-hd-dispatch-owner-builtin-escaped-alias-quiet',
+ 'helper-hd-dispatch-owner-builtin-quoted-alias-quiet',
+ 'helper-hd-dispatch-owner-builtin-plain-dispatch-quiet',
+ 'helper-hd-dispatch-owner-builtin-command-bypasses-command-function',
+ 'helper-hd-dispatch-owner-command-builtin-bypasses-builtin-function',
+ 'helper-hd-dispatch-owner-builtin-command-bypasses-both-functions',
+ 'helper-hd-dispatch-owner-absolute-echo-with-all-shadow-functions',
+ 'helper-hd-echo-owner-owner-quiet-safe-alias',
+ 'helper-hd-echo-owner-owner-quiet-safe-function',
+ 'helper-hd-echo-owner-owner-quiet-after-call-function',
+ 'helper-hd-dispatch-owner-command-safe-alias-quiet',
+ 'helper-hd-dispatch-owner-command-safe-function-quiet',
+ 'helper-hd-dispatch-owner-command-after-call-function-quiet',
+ 'helper-hd-dispatch-owner-builtin-safe-alias-quiet',
+ 'helper-hd-dispatch-owner-builtin-safe-function-quiet',
+ 'helper-hd-dispatch-owner-builtin-after-call-function-quiet',
+ 'helper-hd-echo-removal-plain-disable-control',
+ 'helper-hd-echo-removal-executed-and-disable-quiet',
+ 'helper-hd-echo-removal-lookup-builtin-quiet',
+ 'helper-hd-echo-removal-lookup-hash-only-quiet',
+ 'helper-hd-echo-removal-lookup-reenabled-quiet',
+ 'helper-hd-echo-removal-lookup-disable-only-quiet',
+ 'helper-hd-echo-removal-lookup-path-quiet',
+ 'helper-hd-echo-removal-lookup-after-call-quiet',
+ 'helper-hd-echo-removal-startup-echo',
+ 'helper-hd-echo-removal-startup-command',
+ 'helper-hd-echo-removal-startup-builtin',
+ 'helper-hd-echo-removal-startup-no-enable-quiet',
+ 'helper-hd-echo-removal-startup-disabled-quiet',
+ 'helper-hd-echo-removal-startup-expanded-pair',
+ 'helper-hd-echo-removal-same-line-executed-disable-quiet'))
+HEREDOC_ECHO_CONSERVATISM = (
+    "Owner-directed resolved echo heredoc DATA conservatism, including command, "
+    "builtin, quoted, escaped and path spellings resolved as echo. The sampled "
+    "runtime is quiet, but echo is excluded from the inert owner set without "
+    "alias/function/source/eval/startup/enable/hash lookup or execution modelling. "
+    "Startup bodies in ordinary CORPUS run under its plain-bash PROLOGUE; native "
+    "shebang leaks are independently qualified in paired proof, not claimed for "
+    "that ordinary sample. One plain parameter-default DATA case is also missed "
+    "by main's raw regex; this decision explicitly covers resolved echo DATA "
+    "rather than claiming main flags every parameter form. Central substitution "
+    "conservatism and unchanged inherited brace misses remain separate. "
+    "https://github.com/nathanjohnpayne/mergepath/issues/1496#issuecomment-6158711314"
+)
+CORPUS = [(cid, MUST_FLAG if cid in HEREDOC_ECHO_RULE_CHANGES else rule, body)
+          for cid, rule, body in CORPUS]
+KNOWN_BROADER.update({cid: HEREDOC_ECHO_CONSERVATISM
+                      for cid in HEREDOC_ECHO_CONSERVATIVE_CASES})
 
 def _corpus_id_cases():
     """Every corpus id is UNIQUE, and every declared id names a real case.
@@ -13283,15 +13572,24 @@ def _heredoc_conservatism_cases():
     return failures
 
 
-def _heredoc_echo_owner_cases():
-    """Pin echo/dispatch identities, read boundaries and proved bypass controls."""
+def _heredoc_echo_conservatism_cases():
+    """Pin resolved echo conservatism and unchanged printf/plain DATA precision."""
     failures = []
     for cid, rule, body in CORPUS:
-        if not cid.startswith(("helper-hd-echo-owner-", "helper-hd-dispatch-owner-")):
+        if not (cid.startswith(("helper-hd-echo-owner-", "helper-hd-dispatch-owner-",
+                               "helper-hd-echo-removal-"))
+                or cid in ("helper-hd-central-plain-printf-data",
+                           "helper-hd-central-plain-read-data")):
             continue
         findings, errors = scan_text(PROLOGUE + body, cid)
         if bool(findings) != (rule == MUST_FLAG) or errors:
-            failures.append("echo heredoc owner identity: " + cid)
+            failures.append("echo heredoc conservatism: " + cid)
+        if cid.startswith("helper-hd-echo-removal-") and body.startswith("#!"):
+            # Ordinary corpus uses PROLOGUE; pin native first-line source too.
+            # This is a scanner assertion, not a claim of native runtime here.
+            native_findings, native_errors = scan_text(body, cid + "/first-line")
+            if not native_findings or native_errors:
+                failures.append("echo heredoc first-line source: " + cid)
     return failures
 
 
@@ -13305,7 +13603,7 @@ def self_test():
     failures.extend(_printf_allowlist_cases())
     failures.extend(_function_definition_cases())
     failures.extend(_heredoc_conservatism_cases())
-    failures.extend(_heredoc_echo_owner_cases())
+    failures.extend(_heredoc_echo_conservatism_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
