@@ -46,8 +46,10 @@
 #  37. recursive workspace patterns reach nested manifests               → FAIL
 #  38. lerna.json packages are evaluated                                 → FAIL
 #  39. target-branch reads that branch's ref; unavailable fails closed; base-ref reads the checkout
-#  40. Yarn !(a|b) extglob and !-prefixed workspace negations
-#  41. pnpm catalog / catalogs entries are production dependencies
+#  40. negations as dependabot-core applies them: !(x) ignores the literal x;
+#      !(a|b) and !-prefixed patterns exclude nothing
+#  41. pnpm catalog / catalogs entries are production dependencies, read
+#      from the nearest pnpm-workspace.yaml (entry dir, then its parents)
 #  42. directories **/* reaches nested projects
 #  43. --fix integrity check fails closed on a malformed re-parse
 #
@@ -476,14 +478,39 @@ r="$(new_repo yarn-extglob-negated)"
 printf '{"name":"root","private":true,"workspaces":["packages/!(docs|site)"],"dependencies":{"firebase":"^13.0.0"}}\n' > "$r/package.json"
 pkg "$r/packages/docs" "" "@firebase/rules-unit-testing"; pkg "$r/packages/site" "" "@firebase/rules-unit-testing"; pkg "$r/packages/app" "react" ""
 write_config "$r" "$TYPE_GROUPS"
-expect "Yarn !(docs|site) drops both negated workspaces" 0 "$r" "PASS"
+expect "Yarn !(docs|site) is one literal ignored glob, so neither workspace is dropped" 1 "$r" "firebase-sdk"
 
 r="$(new_repo pnpm-negation)"
 printf '{"name":"root","private":true,"dependencies":{"firebase":"^13.0.0"}}\n' > "$r/package.json"
 printf 'packages:\n  - "packages/*"\n  - "!packages/fixture"\n' > "$r/pnpm-workspace.yaml"
 pkg "$r/packages/fixture" "" "@firebase/rules-unit-testing"; pkg "$r/packages/app" "react" ""
 write_config "$r" "$TYPE_GROUPS"
-expect "a !-prefixed workspace pattern excludes that workspace" 0 "$r" "PASS"
+expect "a !-prefixed workspace pattern excludes nothing (dependabot-core fetches it literally)" 1 "$r" "firebase-sdk"
+
+r="$(new_repo yarn-extglob-single)"
+printf '{"name":"root","private":true,"workspaces":["packages/!(docs)"],"dependencies":{"firebase":"^13.0.0"}}\n' > "$r/package.json"
+pkg "$r/packages/docs" "" "@firebase/rules-unit-testing"; pkg "$r/packages/app" "react" ""
+write_config "$r" "$TYPE_GROUPS"
+expect "Yarn !(docs) drops packages/docs" 0 "$r" "PASS"
+
+r="$(new_repo pnpm-ancestor-catalog)"
+printf '{"name":"root","private":true}\n' > "$r/package.json"
+printf 'catalog:\n  firebase: ^13.0.0\n' > "$r/pnpm-workspace.yaml"
+printf '{"name":"app","dependencies":{"firebase":"catalog:"},"devDependencies":{"@firebase/rules-unit-testing":"^6.0.0"}}\n' > "$r/packages/app/package.json" 2>/dev/null || { mkdir -p "$r/packages/app"; printf '{"name":"app","dependencies":{"firebase":"catalog:"},"devDependencies":{"@firebase/rules-unit-testing":"^6.0.0"}}\n' > "$r/packages/app/package.json"; }
+cat > "$r/.github/dependabot.yml" <<'YAML'
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/packages/app"
+    schedule:
+      interval: "weekly"
+    groups:
+      dev-dependencies:
+        dependency-type: "development"
+      production-dependencies:
+        dependency-type: "production"
+YAML
+expect "an entry below the root reads its ancestor's pnpm catalog" 1 "$r" 'directory "/packages/app": family '"'"'firebase-sdk'"'"
 
 r="$(new_repo pnpm-catalog)"
 printf '{"name":"root","private":true,"dependencies":{"firebase":"catalog:"},"devDependencies":{"@firebase/rules-unit-testing":"catalog:"}}\n' > "$r/package.json"

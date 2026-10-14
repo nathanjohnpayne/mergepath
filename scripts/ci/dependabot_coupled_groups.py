@@ -26,11 +26,17 @@ simulation follows what Dependabot does:
 * Directories: ``directory`` / ``directories``, with ``*`` one path segment and
   ``**`` any depth, so ``**/*`` is the entry directory and everything below.
 * Manifests: the directory's ``package.json`` plus the workspace manifests
-  selected by its ``workspaces`` field, ``pnpm-workspace.yaml`` or
-  ``lerna.json``. ``!``-prefixed and Yarn ``!(a|b)`` negations are honoured,
-  minus any that the entry's ``exclude-paths`` drops.
-* pnpm catalogs: ``catalog`` / ``catalogs`` entries are production
-  dependencies, and a manifest's ``catalog:`` requirement defers to them. Only ``dependencies``,
+  selected by its ``workspaces`` field, the nearest ``pnpm-workspace.yaml``
+  (the entry directory, then each parent, as dependabot-core's
+  ``fetch_file_from_parent_directories``) or ``lerna.json``, minus any that
+  the entry's ``exclude-paths`` drops. Negations follow dependabot-core
+  exactly: a ``!``-prefixed pattern adds nothing and subtracts nothing (it is
+  fetched as a literal path that has no manifest), and Yarn's ``!(x)`` ignores
+  the single literal glob ``x`` (``yarn_ignored_glob``), so ``!(docs)`` drops
+  ``docs`` while ``!(docs|site)`` drops nothing.
+* pnpm catalogs: ``catalog`` / ``catalogs`` entries in that same nearest
+  workspace file are production dependencies, and a manifest's ``catalog:``
+  requirement defers to them. Only ``dependencies``,
   ``devDependencies`` and ``optionalDependencies`` count. dependabot-core's npm
   parser reads exactly those (``DEPENDENCY_TYPES`` in
   ``npm_and_yarn/file_parser.rb``), so a ``peerDependencies``-only
@@ -265,18 +271,19 @@ EXTGLOB = re.compile(r"!\(([^()]*)\)")
 
 
 def expand_pattern(pattern: str) -> Tuple[str, List[str]]:
-    """Split a workspace pattern into (positive glob, negated globs).
+    """Split a workspace pattern into (positive glob, ignored globs).
 
-    Yarn's ``packages/!(docs|site)`` is the positive ``packages/*`` minus
-    ``packages/docs`` and ``packages/site`` (dependabot-core
-    ``yarn_ignored_glob``).
+    Mirrors dependabot-core: every ``!(x)`` becomes ``*`` in the positive
+    glob (``matching_paths``), and the ignored glob is the pattern with each
+    ``!(x)`` replaced by ``x`` verbatim (``yarn_ignored_glob``), matched as a
+    plain path glob. ``|`` has no meaning there, so ``!(docs|site)`` ignores
+    the literal path ``docs|site``, which matches nothing.
     """
-    m = EXTGLOB.search(pattern)
-    if not m:
+    if not EXTGLOB.search(pattern):
         return pattern, []
-    positive = pattern[:m.start()] + "*" + pattern[m.end():]
-    negated = [pattern[:m.start()] + alt + pattern[m.end():] for alt in m.group(1).split("|")]
-    return positive, negated
+    positive = EXTGLOB.sub("*", pattern)
+    ignored = EXTGLOB.sub(lambda m: m.group(1), pattern)
+    return positive, [ignored]
 
 
 def join(rel: str, sub: str) -> str:
@@ -316,6 +323,18 @@ def excluded(entry: dict, rel_to_entry: str) -> bool:
     return False
 
 
+def nearest(tree: Tree, rel: str, filename: str) -> Optional[str]:
+    """The entry directory's own file, else the closest parent's."""
+    cur = rel
+    while True:
+        candidate = join(cur, filename)
+        if tree.isfile(candidate):
+            return candidate
+        if not cur:
+            return None
+        cur = posixpath.dirname(cur)
+
+
 def workspace_config(tree: Tree, rel: str, pkg: dict) -> Tuple[List[str], Dict[str, str]]:
     """Workspace patterns and pnpm catalog dependencies for a directory."""
     patterns: List[str] = []
@@ -325,8 +344,8 @@ def workspace_config(tree: Tree, rel: str, pkg: dict) -> Tuple[List[str], Dict[s
         spec = spec.get("packages")
     if isinstance(spec, list):
         patterns += [p for p in spec if isinstance(p, str)]
-    pnpm = join(rel, "pnpm-workspace.yaml")
-    if tree.isfile(pnpm):
+    pnpm = nearest(tree, rel, "pnpm-workspace.yaml")
+    if pnpm is not None:
         data = tree.yaml(pnpm) or {}
         if isinstance(data, dict):
             if isinstance(data.get("packages"), list):
@@ -352,7 +371,8 @@ def workspace_dirs(tree: Tree, rel: str, patterns: List[str], entry: dict) -> Li
     exclude: List["re.Pattern[str]"] = []
     for pattern in patterns:
         if pattern.startswith("!"):
-            exclude.append(path_glob(join(rel, pattern[1:]) if rel else pattern[1:].strip("/")))
+            # dependabot-core fetches "!x" as a literal path with no manifest:
+            # it contributes nothing and, unlike pnpm itself, excludes nothing.
             continue
         positive, negated = expand_pattern(pattern)
         exclude += [path_glob(join(rel, n) if rel else n.strip("/")) for n in negated]
