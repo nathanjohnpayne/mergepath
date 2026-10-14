@@ -407,7 +407,7 @@ PY2
   echo >>"$TMP/rotation.log"
 done
 check "rotating batch: each tick evaluates exactly the three PRs the budget covers" \
-  eval '! awk "NF != 3" "$TMP/rotation.log" | grep -q .'
+  awk 'NF != 3 { bad = 1 } END { exit bad + (NR != 4) }' "$TMP/rotation.log"
 check "rotating batch: four consecutive ticks cover all eleven open PRs" \
   [ "$(tr ' ' '\n' <"$TMP/rotation.log" | grep . | sort -un | wc -l | tr -d ' ')" = 11 ]
 
