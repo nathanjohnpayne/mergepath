@@ -1,11 +1,11 @@
 # CodeRabbit Phase 2.5 Invocation
 
-Feature: `scripts/coderabbit-should-invoke.sh` decides whether Phase 2.5 runs for a given PR, so that the agent's CodeRabbit wait is spent on changes that warrant it instead of on every one-line docs PR. The decision is a script rather than agent judgement because it must be reproducible across sessions, across agents, and identically in CI and at the keyboard. This spec pins the decision contract, the parsing rules that feed it, and the boundary of what the knob does and does not control.
+Feature: `scripts/coderabbit-should-invoke.sh` decides whether Phase 2.5 runs for a given PR, and whether the agent waits for CodeRabbit before Phase 3, so that the agent's CodeRabbit disposition pass is spent on changes that warrant it instead of on every one-line docs PR. The decision is a script rather than agent judgement because it must be reproducible across sessions, across agents, and identically in CI and at the keyboard. This spec pins the decision contract, the parsing rules that feed it, and the boundary of what the knob does and does not control.
 
 ## Scope boundary
 
-- The knob gates **Phase 2.5**: the agent's wait and disposition. It does **not** stop the CodeRabbit App from reviewing. The shipped `.coderabbit.yml` sets `auto_review.enabled: true`, so the App starts on PR open, before this decision runs.
-- Skipping therefore saves the agent's wait (bounded by `coderabbit.max_wait_seconds`). It does **not** reduce provider invocations or rate-limit pressure, and findings the App posts afterwards remain unresolved review conversations that the pre-merge conversation gate blocks on — a skipped PR can still need thread triage.
+- The knob gates **Phase 2.5**: the agent's disposition pass (and, only when `wait` is true, its wait before Phase 3; see Wait contract below). It does **not** stop the CodeRabbit App from reviewing. The shipped `.coderabbit.yml` sets `auto_review.enabled: true`, so the App starts on PR open, before this decision runs.
+- Skipping therefore saves the agent's disposition pass and the pre-merge arrival check. It does not change the wait before Phase 3, which is governed by `wait` alone. It does **not** reduce provider invocations or rate-limit pressure, and findings the App posts afterwards remain unresolved review conversations that the pre-merge conversation gate blocks on — a skipped PR can still need thread triage.
 - Reducing invocations requires an App-side opt-out (`auto_review` off, or path filters) and is out of scope for this contract.
 
 ## Acceptance criteria
@@ -17,6 +17,15 @@ Feature: `scripts/coderabbit-should-invoke.sh` decides whether Phase 2.5 runs fo
 - `coderabbit.invoke` accepts exactly three literals: `always`, `complex-changes`, `never`. An absent key means `always`, so a repo that has not adopted the knob is unaffected.
 - Any value that is not exactly one of those three literals invokes, and says so on stderr. Normalization must never manufacture a valid mode out of input that does not unambiguously contain one.
 - `--json` is emitted by a JSON encoder, never by string interpolation, and requires `jq`; its absence is exit `3` rather than a decision code with empty output.
+- `--help` prints the script's whole leading comment block, including `Usage`, exit codes and the output contract.
+
+### Wait contract (#2166)
+
+- Phase 2.5 is non-blocking. Every decision (invoke or skip, text or `--json`) carries `wait`: whether the agent holds for CodeRabbit's review of the current head **before Phase 3**. It is read from `coderabbit.wait_for_review`; absent or `false` means `false`, `true` means `true`.
+- An unrecognized or ambiguous `wait_for_review` resolves to `true`, the slower pre-#2166 behaviour, never to a faster one.
+- Every invoke forced by a policy document the decider cannot trust (an ambiguous block, a document the parser rejects, more than one document, no parser available, an unrecognized `enabled` or `invoke` value) reports `wait: true` whatever `wait_for_review` reads. Classifier failures concern the diff, not the policy, and keep the value read.
+- `wait` never changes the invoke/skip decision.
+- `wait: false` does not remove the wait; it moves it. When the decider exits 0, the agent confirms CodeRabbit has posted on the **merge head** with `scripts/coderabbit-wait.sh <PR#>` at the pre-merge step, because the required severity gate is arrival-independent (green until CodeRabbit publishes a run on the head). That check closes the #136 pre-review merge race and runs after CI, which outlasts CodeRabbit's measured p99.
 
 ### Fail-toward-invoking parsing
 

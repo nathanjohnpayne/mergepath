@@ -221,6 +221,20 @@ wait_is "wait is reported on a skip decision as well"        "$ON"$'\n'"  invoke
 # under complex-changes still skips, and never on an ambiguous file invokes.
 case_is "wait_for_review: true does not turn a skip into an invoke" "$CX"$'\n'"  wait_for_review: true" 0 1
 
+# Codex P2 on #2175: --help prints the WHOLE leading comment block. A fixed
+# `sed -n 2,40p` range was cut short by the #2166 header and lost Usage,
+# exit codes and the output contract.
+_help=$("$SCRIPT" --help 2>/dev/null); _rc=$?
+if [ "$_rc" = 0 ] && printf '%s\n' "$_help" | grep -q '^Usage:' \
+   && printf '%s\n' "$_help" | grep -q '^Exit codes:' \
+   && printf '%s\n' "$_help" | grep -q '^Output:' \
+   && printf '%s\n' "$_help" | grep -q 'Bash 3.2 portable' \
+   && ! printf '%s\n' "$_help" | grep -q '^set -uo pipefail'; then
+  pass "--help prints the whole header (Usage, exit codes, output) and stops before code"
+else
+  fail "--help is truncated or runs into code (rc=$_rc): $(printf '%s' "$_help" | tail -3)"
+fi
+
 # Codex P2 on #2175: a policy DOCUMENT the decider cannot trust forces invoke,
 # and it must force wait:true with it, even when `wait_for_review: false` reads
 # cleanly on its own line. Each shape below sets wait_for_review: false.

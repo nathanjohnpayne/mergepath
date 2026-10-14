@@ -104,7 +104,8 @@ t=${CODEX_TEST_HEAD_DATE:-2026-06-04T00:00:00Z}
 old='2026-06-03T00:00:00Z'
 [ "${1:-}" = "api" ] || { echo "unexpected gh command: $*" >&2; exit 99; }
 shift
-[ "${1:-}" = "--paginate" ] && shift
+paginated=0
+[ "${1:-}" = "--paginate" ] && { paginated=1; shift; }
 # The #2166 check-runs read is `gh api -X GET <endpoint> -f check_name=... -F per_page=100`.
 [ "${1:-}" = "-X" ] && shift 2
 endpoint=${1:-}
@@ -151,19 +152,31 @@ case "$endpoint" in
       noworkflow)   printf '{"total_count":1,"workflows":[{"id":30,"name":"CodeQL","path":".github/workflows/codeql.yml"}]}\n' ;;
       *)            printf '{"total_count":2,"workflows":[{"id":30,"name":"CodeQL","path":".github/workflows/codeql.yml"},{"id":31,"name":"repo-lint","path":".github/workflows/repo_lint.yml"}]}\n' ;;
     esac ;;
+  repos/owner/repo/commits/*/check-suites)
+    # Suite 100 is the PR branch (head.ref "feature"); suite 200 another branch.
+    printf '{"total_count":2,"check_suites":[{"id":100,"head_branch":"feature"},{"id":200,"head_branch":"other"}]}\n' ;;
   repos/owner/repo/commits/*/check-runs)
     # The codex.request_requires_check OVERRIDE path (exact check-run name).
+    # Runs carry check_suite.id 100 (the PR branch) unless the shape says not.
     case "${CODEX_TEST_CHECK_RUNS:-completed}" in
       unreadable) echo 'simulated check-runs read failure' >&2; exit 1 ;;
       missing)    printf '{"total_count":0,"check_runs":[]}\n' ;;
-      othername)  printf '{"total_count":1,"check_runs":[{"id":1,"name":"not-lint","status":"completed"}]}\n' ;;
-      # The deep `lint` job alone must not satisfy the default: it is created
-      # only after its predecessors finish, which is not the signal.
-      deeplint)   printf '{"total_count":1,"check_runs":[{"id":1,"name":"lint","status":"queued"}]}\n' ;;
+      othername)  printf '{"total_count":1,"check_runs":[{"id":1,"name":"not-lint","status":"completed","check_suite":{"id":100}}]}\n' ;;
+      # The deep `lint` job alone must not satisfy an exact `lint-fast`.
+      deeplint)   printf '{"total_count":1,"check_runs":[{"id":1,"name":"lint","status":"queued","check_suite":{"id":100}}]}\n' ;;
       # #2173 shards lint-fast into a matrix: lint-fast (1)..(4).
-      sharded)    printf '{"total_count":4,"check_runs":[{"id":11,"name":"lint-fast (1)","status":"queued"},{"id":12,"name":"lint-fast (2)","status":"queued"},{"id":13,"name":"lint-fast (3)","status":"queued"},{"id":14,"name":"lint-fast (4)","status":"queued"}]}\n' ;;
+      sharded)    printf '{"total_count":4,"check_runs":[{"id":11,"name":"lint-fast (1)","status":"queued","check_suite":{"id":100}},{"id":12,"name":"lint-fast (2)","status":"queued","check_suite":{"id":100}},{"id":13,"name":"lint-fast (3)","status":"queued","check_suite":{"id":100}},{"id":14,"name":"lint-fast (4)","status":"queued","check_suite":{"id":100}}]}\n' ;;
+      # An old exact-name run from the SHA's earlier use on ANOTHER branch.
+      othersuite) printf '{"total_count":1,"check_runs":[{"id":21,"name":"lint-fast","status":"completed","started_at":"2026-01-01T00:00:00Z","check_suite":{"id":200}}]}\n' ;;
+      # Codex P1 on #2175: the matching run is on PAGE 2, behind a full page of
+      # other runs. Emitted only when the caller paginates, the way gh does.
+      paged)      jq -cn '{total_count:101,check_runs:[range(100) | {id:(500 + .),name:"other-\(.)",status:"completed",check_suite:{id:100}}]}'
+                  # if/fi, not `&&`: a false test must not become the stub's exit
+                  # status, or an unpaginated caller reads "unreadable" and the
+                  # guard's fail-open masks the missing page.
+                  if [ "$paginated" = 1 ]; then printf '{"total_count":101,"check_runs":[{"id":700,"name":"lint-fast","status":"queued","check_suite":{"id":100}}]}\n'; fi ;;
       garbage)    printf 'not json\n' ;;
-      *)          jq -cn --arg st "${CODEX_TEST_CHECK_RUNS:-completed}" '{total_count:1,check_runs:[{id:1,name:"lint-fast",status:$st}]}' ;;
+      *)          jq -cn --arg st "${CODEX_TEST_CHECK_RUNS:-completed}" '{total_count:1,check_runs:[{id:1,name:"lint-fast",status:$st,check_suite:{id:100}}]}' ;;
     esac ;;
   repos/owner/repo/commits/*)     printf '%s\n' "$t" ;;
   repos/owner/repo/issues/999/timeline)  printf '[]\n' ;;
@@ -1503,6 +1516,27 @@ test_guard_workflow_signal_shapes() {
   [ "$FAIL" -ne "$before" ] || pass "MH13: repo-lint run signal survives sharded/absent job names, and a repo without the workflow warns instead of refusing"
 }
 
+# MH14 (Codex P1 + P2 on #2175): the exact-name OVERRIDE reads every page of
+# check runs, and only runs from the PR branch's check suites count.
+test_guard_override_paginates_and_scopes() {
+  local dir rc before=$FAIL
+  # (a) The matching run is on page 2 behind 100 other runs: found.
+  dir=$(make_case "guard-override-paged")
+  printf '  request_requires_check: lint-fast\n' >>"$dir/.github/review-policy.yml"
+  rc=$(CODEX_TEST_CHECK_RUNS=paged run_guard "$dir" fresh "$OLD_HEAD" missing "" --trigger-only)
+  [ "$rc" = "0" ] && [ "$(trig_count "$dir")" = "1" ] || fail "MH14a: a matching check run on page 2 must be found (rc=$rc posts=$(trig_count "$dir")); err=$(cat "$dir/err.log")"
+  [ "$(jqf "$dir" '.moving_head // "none"')" = "none" ] && grep -q "'lint-fast' is queued on HEAD" "$dir/err.log" \
+    || fail "MH14a: the page-2 run must be READ (queued), not fail open as unreadable"
+  # (b) The only exact-name run belongs to another branch's suite: the SHA was
+  # checked before, but CI has not scheduled THIS push.
+  dir=$(make_case "guard-override-othersuite")
+  printf '  request_requires_check: lint-fast\n' >>"$dir/.github/review-policy.yml"
+  rc=$(CODEX_TEST_CHECK_RUNS=othersuite run_guard "$dir" fresh "$OLD_HEAD" completed "" --trigger-only)
+  [ "$rc" = "8" ] && [ "$(trig_count "$dir")" = "0" ] && [ "$(jqf "$dir" '.moving_head.check_status')" = "missing" ] \
+    || fail "MH14b: an exact-name run from another branch's check suite must not satisfy the override (rc=$rc status=$(jqf "$dir" '.moving_head.check_status'))"
+  [ "$FAIL" -ne "$before" ] || pass "MH14: the check-run override paginates and counts only the PR branch's check suites"
+}
+
 test_fresh_posts_once_no_poll
 test_dup_author_skips
 test_uppercase_author_command_skips
@@ -1552,6 +1586,7 @@ test_guard_applies_in_polling_mode
 test_guard_anchors_on_push_dispatch
 test_policy_resolved_from_script_checkout
 test_guard_workflow_signal_shapes
+test_guard_override_paginates_and_scopes
 
 echo "----"
 echo "test_codex_review_request_trigger_only: $PASS passed, $FAIL failed"

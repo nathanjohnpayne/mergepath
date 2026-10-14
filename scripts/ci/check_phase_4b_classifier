@@ -148,6 +148,11 @@ assert_triggers "scripts + .github + root companions (manifest, package.json, CH
 assert_triggers "cmd + internal + root manifests/build files (go.mod, Gemfile, pom.xml, Makefile, Dockerfile) do not trigger cross-cutting-refactor (#2175)" \
   "root-manifests-companions.json" "" "0"
 
+# Codex P2 (round 3) on #2175: Package.swift is the Swift package manifest.
+# Sources/ + Plugins/ + Package.swift is two implementation areas.
+assert_triggers "Sources + Plugins + Package.swift (Swift manifest) does not trigger cross-cutting-refactor (#2175)" \
+  "swift-package-manifest.json" "" "0"
+
 # A changed file with no patch was previously counted as inspected even though
 # the content-based detectors saw nothing. That let an incomplete one-file diff
 # return a confident no-match and suppress review. The classifier must report

@@ -582,7 +582,9 @@ codex:
   #                                    measured from the push: the latest of
   #                                    the committer date, the last
   #                                    force-push and the push dispatch (the
-  #                                    earliest repo-lint run on the head).
+  #                                    LATEST repo-lint dispatch for the head
+  #                                    on the PR's branch; an earlier run of
+  #                                    the same SHA must not date this push).
   #                                    0 disables.
   #   CI has picked the head up     -- by default, a run of the `repo-lint`
   #                                    workflow (repo_lint.yml, canonical on

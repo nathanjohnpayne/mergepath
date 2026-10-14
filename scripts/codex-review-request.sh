@@ -1733,18 +1733,45 @@ refuse_moving_head_unless_allowed() {
       # Exact server-side name filter; the client-side select repeats it so a
       # server that ignores the filter cannot pass a differently named run off
       # as this one. Any run counts, whatever its status. -f encodes the name:
-      # a configured check name may carry spaces.
-      runs=$(gh api -X GET "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+      # a configured check name may carry spaces. PAGINATED and slurped
+      # (Codex P1 on #2175): per_page caps at 100, and a long-lived head
+      # carries more check runs than that.
+      runs=$(gh api --paginate -X GET "repos/$REPO/commits/$HEAD_SHA/check-runs" \
         -f check_name="$REQUEST_REQUIRES_CHECK" -F per_page=100 2>/dev/null) || runs=""
-      status=$(printf '%s' "$runs" | jq -r --arg n "$REQUEST_REQUIRES_CHECK" '
-        if (type == "object") and ((.check_runs | type) == "array")
-        then ([.check_runs[] | select((.name // "") == $n)] | sort_by(.id) | last | .status // "missing")
-        else "unreadable" end' 2>/dev/null) || status=unreadable
-      # Latest run, as in the workflow path: check-runs are per commit, so an
-      # earlier push of the same SHA elsewhere must not date this one.
+      # Check runs are attached to the COMMIT, not the branch (Codex P2 on
+      # #2175): a SHA checked before on another branch carries that old run.
+      # Scope to the check suites GitHub created for the PR's head branch;
+      # with no head ref there is nothing to scope by and every suite counts.
+      local suites='null'
+      if [ -n "$HEAD_REF" ]; then
+        suites=$(gh api --paginate -X GET "repos/$REPO/commits/$HEAD_SHA/check-suites" \
+          -F per_page=100 2>/dev/null) || suites=""
+        suites=$(printf '%s' "$suites" | jq -c -s --arg b "$HEAD_REF" '
+          if length > 0 and all(.[]; type == "object" and ((.check_suites | type) == "array"))
+          then [ .[].check_suites[] | select((.head_branch // "") == $b) | .id ]
+          else "unreadable" end' 2>/dev/null) || suites='"unreadable"'
+        [ -n "$suites" ] || suites='"unreadable"'
+      fi
+      if [ "$suites" = '"unreadable"' ]; then
+        status=unreadable
+      else
+        runs=$(printf '%s' "$runs" | jq -c -s --arg n "$REQUEST_REQUIRES_CHECK" --argjson ids "$suites" '
+          if length > 0 and all(.[]; type == "object" and ((.check_runs | type) == "array"))
+          then [ .[].check_runs[] | select((.name // "") == $n)
+                 | select($ids == null or ((.check_suite.id // null) as $s | ($ids | index($s)) != null)) ]
+          else "unreadable" end' 2>/dev/null) || runs='"unreadable"'
+        if [ "$runs" = '"unreadable"' ] || [ -z "$runs" ]; then
+          status=unreadable
+        else
+          status=$(printf '%s' "$runs" | jq -r 'sort_by(.id) | last | .status // "missing"' 2>/dev/null) || status=unreadable
+          [ "$status" != null ] || status=missing
+        fi
+      fi
+      # Latest run, as in the workflow path: an earlier run of the same SHA
+      # must not date the current push.
       if [ "$status" != unreadable ] && [ "$status" != missing ]; then
-        dispatched_at=$(printf '%s' "$runs" | jq -r --arg n "$REQUEST_REQUIRES_CHECK" '
-          [.check_runs[] | select((.name // "") == $n) | (.started_at // empty)
+        dispatched_at=$(printf '%s' "$runs" | jq -r '
+          [.[] | (.started_at // empty)
            | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))] | max // ""' 2>/dev/null) || dispatched_at=""
       fi
       ;;

@@ -414,7 +414,8 @@ detect_cross_cutting_refactor() {
         $0 ~ /\.(md|markdown|mdx|txt|rst|adoc)$/ { next }
         $0 ~ /^(LICENSE|LICENCE|COPYING|NOTICE|CHANGELOG|AUTHORS|CODEOWNERS|CONTRIBUTORS)(\..*)?$/ { next }
         $0 ~ /\.(ya?ml|json|jsonc|toml|lock|cfg|ini|conf|properties|gradle|gradle\.kts|sum|mod)$/ { next }
-        $0 ~ /^(go\.work|Gemfile|Rakefile|Podfile|Cartfile|Brewfile|Pipfile|Procfile|pom\.xml|setup\.py|MANIFEST\.in|Makefile|GNUmakefile|makefile|Dockerfile|Containerfile|Vagrantfile|Justfile|justfile|Taskfile|BUILD|BUILD\.bazel|WORKSPACE|WORKSPACE\.bazel|MODULE\.bazel|CMakeLists\.txt|meson\.build|flake\.nix|default\.nix|shell\.nix)$/ { next }
+        $0 ~ /^(go\.work|Gemfile|Rakefile|Podfile|Cartfile|Brewfile|Pipfile|Procfile|pom\.xml|setup\.py|MANIFEST\.in|Makefile|GNUmakefile|makefile|Dockerfile|Containerfile|Vagrantfile|Justfile|justfile|Taskfile|BUILD|BUILD\.bazel|WORKSPACE|WORKSPACE\.bazel|MODULE\.bazel|CMakeLists\.txt|meson\.build|flake\.nix|default\.nix|shell\.nix|Package\.swift|Package\.resolved|build\.sbt|mix\.exs|project\.clj|build\.zig|build\.zig\.zon|DESCRIPTION|NAMESPACE)$/ { next }
+        $0 ~ /\.(gemspec|cabal|nimble|csproj|fsproj|vbproj|sln|props|targets)$/ { next }
         { print "<root>" }' \
     | grep -vxE 'tests?|docs|specs' \
     | sort -u | wc -l | tr -d ' ')

@@ -129,7 +129,9 @@ while [ "$#" -gt 0 ]; do
       fi
       REPO="$2"; shift 2 ;;
     --json) JSON=true; shift ;;
-    --help|-h) sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # The whole leading comment block, up to the first code line, so --help
+    # cannot be truncated by a header that grows (Codex P2 on #2175).
+    --help|-h) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"; exit 0 ;;
     -*) echo "Error: unknown flag '$1'" >&2; exit 3 ;;
     *) if [ -z "$PR_NUM" ]; then PR_NUM="$1"; else echo "Error: unexpected argument '$1'" >&2; exit 3; fi; shift ;;
   esac
