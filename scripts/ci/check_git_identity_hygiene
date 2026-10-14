@@ -90,6 +90,17 @@
 #      the config file it was taken from and a run that finds one naming
 #      some other checkout's config leaves it alone.
 #
+#      `--verify` is the per-shard form of that closing run (#2163). The
+#      fast lane is a shard matrix, and every shard is its own runner
+#      with its own checkout, snapshot and suites — so every shard must
+#      close by re-asserting Parts A and B against ITS baseline. Part C
+#      and the paired regression suite read the checkout, which is the
+#      same bytes on every shard, so they run once, on the shard whose
+#      closing step is the plain call. `--verify` runs Parts A and B,
+#      nothing else, and FAILS CLOSED when no snapshot was recorded for
+#      this checkout: a verify with nothing to compare against is not a
+#      verdict that the config stayed unchanged.
+#
 #   C. Static scan for the idiom that produces the corruption (EVERY repo).
 #      Flags any tracked shell script or Markdown doc that writes one of
 #      the five identity/signing keys through `git config` without
@@ -246,6 +257,7 @@ REPO_ROOT="${FIXTURE_ROOT:-$SELF_ROOT}"
 MODE="report"
 case "${1:-}" in
   --snapshot) MODE="snapshot" ;;
+  --verify) MODE="verify" ;;
   "") ;;
   *) echo "check_git_identity_hygiene: unknown argument '$1'" >&2; exit 2 ;;
 esac
@@ -1193,6 +1205,7 @@ EOF
   # produce a diff of nothing against nothing.
   cfg="$(config_path 2>/dev/null)" || return 0
   [ -f "$cfg" ] || return 0
+  CONFIG_COMPARED=1
   if cmp -s "$base" "$cfg"; then
     if [ "$phase" = "post-suite" ]; then
       echo "check_git_identity_hygiene: .git/config unchanged by the regression suite"
@@ -1221,8 +1234,42 @@ EOF
   return 1
 }
 
+# Set by assert_config_unchanged only when it reached the byte-comparison.
+# Every early `return 0` above it is a "nothing to compare" exit, and under
+# `--verify` that is a failure, not a pass.
+CONFIG_COMPARED=0
 assert_no_local_identity pre-suite || FAILED=1
 assert_config_unchanged pre-suite || FAILED=1
+
+# ── --verify: Parts A and B only (#2163) ──────────────────────────────
+# The closing step of every fast-lane shard that does NOT run the full
+# check. Part C and the regression suite are checkout-static and run once
+# on the shard that calls this script plainly; what is per-shard is "the
+# suites THIS runner executed left .git/config alone", and that is Part B
+# against the baseline this shard's own --snapshot step recorded, plus the
+# Part A live assertion. Fail closed when there was nothing to compare:
+# a snapshot that was never taken, or whose subject or baseline is gone,
+# is exactly the silence Part B's fail-closed arms exist to refuse, and
+# a verify that passed over it would bless a shard with no evidence.
+if [ "$MODE" = "verify" ]; then
+  if [ "$FAILED" -eq 0 ] && [ "$CONFIG_COMPARED" -ne 1 ]; then
+    cat >&2 <<EOF
+check_git_identity_hygiene: FAIL (--verify: no snapshot was recorded for this checkout)
+
+--verify re-asserts the .git/config baseline that an earlier --snapshot call
+recorded for $REPO_ROOT, and no such baseline exists. A verify with nothing
+to compare against is not evidence that the config stayed unchanged. Run
+--snapshot first (the fast-lane shards do so in their first steps) and only
+after confirming the current config is the intended clean baseline.
+EOF
+    FAILED=1
+  fi
+  if [ "$FAILED" -ne 0 ]; then
+    exit 1
+  fi
+  echo "check_git_identity_hygiene: PASS (--verify: Parts A and B only; the tree scan and regression suite run with the plain call)"
+  exit 0
+fi
 
 # ── Part C: static scan for the unscoped-write idiom (every repo) ─────
 HUB_MARKER="$REPO_ROOT/scripts/sync-to-downstream.sh"

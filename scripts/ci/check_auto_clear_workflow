@@ -10,7 +10,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-WORKFLOW="$ROOT/.github/workflows/auto-clear-blocking-labels.yml"
+# Overridable so tests/test_merge_clearance_gate.sh (Test 26, #2167) can aim
+# the structural assertions at a mutated copy without touching the canonical
+# workflow on disk — the same contract as MERGE_CLEARANCE_WORKFLOW and
+# REQUIRED_CHECK_PUBLISHER_WORKFLOW in the sibling checks.
+WORKFLOW="${AUTO_CLEAR_WORKFLOW:-$ROOT/.github/workflows/auto-clear-blocking-labels.yml}"
 CONTINUATION_TEST="$ROOT/tests/test_approval_merge_continuation.sh"
 CONTINUATION="$ROOT/scripts/workflow/approval-merge-continuation.sh"
 CONTINUATION_REPORTER="$ROOT/scripts/workflow/report-approval-continuation-failures.sh"
@@ -655,6 +659,65 @@ for wf in 'PR Review Policy' 'Agent Review Pipeline' 'Merge Clearance Gate' 'rep
   fi
 done
 
+# #2167: no runner-held waiting. This workflow is re-entered by workflow_run
+# (repo-lint, the gate, the policy workflow) and by its sweep; every job
+# evaluates once and exits. A `while`/`until` loop that is not a `read` loop
+# over enumerated PRs, or a `--watch`, is the shape that held a runner for a
+# whole CI run (#1062 finding 5). Text-level and disclosed: comments are
+# stripped (full-line and inline), the loop keyword must sit at a statement
+# position, and a wait respelled as a bounded `for` with a long `sleep` is a
+# stated residual (#977's parsed-shell substrate). Same assertion shape as
+# scripts/ci/check_merge_clearance_gate and check_required_check_publisher.
+# Comment stripping is SHELL-QUOTE AWARE for this scan (Codex P2 on #2171,
+# round 2): a plain "strip from whitespace-#" treats the hash inside
+# `echo "state #"; while true; ...` as a comment and hides the loop. Quote
+# state resets per line — a quoted string spanning lines is the stated
+# residual (#977). Same stripper as scripts/ci/check_merge_clearance_gate.
+ac_nowait_text=$(awk -v sqc="'" '
+    /^[[:space:]]*#/ { next }
+    {
+      line = $0; out = ""; sq = 0; dq = 0; esc = 0; prev = " "; n = length(line)
+      for (i = 1; i <= n; i++) {
+        c = substr(line, i, 1)
+        if (esc) { out = out c; esc = 0; prev = c; continue }
+        if (c == "\\" && !sq) { out = out c; esc = 1; prev = c; continue }
+        if (c == sqc && !dq) { sq = !sq }
+        else if (c == "\"" && !sq) { dq = !dq }
+        else if (c == "#" && !sq && !dq && prev ~ /[[:space:]]/) { break }
+        out = out c; prev = c
+      }
+      # A loop keyword ending a line continues on the next (Codex P2 on
+      # #2171, round 3): `while` / newline / `true; do ...` is one statement
+      # to the shell, so the two lines are joined before the scan.
+      if (pending != "") { out = pending " " out; pending = "" }
+      if (out ~ /(^|[[:space:]])(while|until)[[:space:]]*$/) { pending = out; next }
+      print out
+    }
+    END { if (pending != "") print pending }' "$WORKFLOW")
+# Classified per OCCURRENCE, not per line (Codex P2 on #2171): a line that
+# carries `while true; do sleep 15; done; while read -r x; ...` must still
+# trip on its first loop. Each statement-position loop keyword is extracted
+# with its optional `IFS=` prefix and first command word; only an occurrence
+# whose command word is `read` is exempt.
+ac_poll_loops() {  # <comment-stripped text> -> "<line>: <occurrence>" per non-read loop
+  grep -nE '(^[[:space:]]*|;[[:space:]]*|&&[[:space:]]*|\|\|[[:space:]]*|(^|[[:space:]])do[[:space:]]+|(^|[[:space:]])then[[:space:]]+)(while|until)[[:space:]]' <<<"$1" \
+    | while IFS= read -r hit; do
+        n=${hit%%:*}; body=${hit#*:}
+        grep -oE '(^[[:space:]]*|;[[:space:]]*|&&[[:space:]]*|\|\|[[:space:]]*|(^|[[:space:]])do[[:space:]]+|(^|[[:space:]])then[[:space:]]+)(while|until)[[:space:]]+(IFS=[^[:space:];]*[[:space:]]+)?[^[:space:];]+' <<<"$body" \
+          | grep -vE '(^|[^[:alnum:]_])while[[:space:]]+(IFS=[^[:space:];]*[[:space:]]+)?read$' \
+          | sed "s/^[[:space:]]*/$n: /" || true
+      done || true
+}
+ac_loop_hits=$(ac_poll_loops "$ac_nowait_text")
+if [ -z "$ac_loop_hits" ] && ! grep -qE -- '--watch([[:space:]=]|$)' <<<"$ac_nowait_text"; then
+  pass=$((pass + 1))
+  echo "  PASS: [#2167 no runner-held wait] no while/until poll loop and no --watch in any run block"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: [#2167 no runner-held wait] a while/until loop that is not a read loop, or a --watch, holds a runner while CI executes:" >&2
+  printf '%s\n' "$ac_loop_hits" | sed 's/^/        /' | head -5 >&2
+fi
+
 # A consumer annex may use any top-level workflow name, which cannot be
 # enumerated in workflow_run.workflows. The existing five-minute sweep must
 # therefore re-enter the exact-head approval continuation for open approved
@@ -795,8 +858,11 @@ chmod +x "$clear_harness_dir/bin/gh" \
   "$clear_harness_dir/scripts/workflow/approval-merge-continuation.sh"
 
 run_clear_harness() {
+  # Optional 4th-6th arguments (#2193): the initial label state and the
+  # triggering event name and action the event-driven block reads.
   local script="$1" input_name="$2" protective_rc="$3"
-  printf 'present\n' >"$clear_harness_dir/label-state"
+  local label_state="${4:-present}" event_name="${5:-}" event_action="${6:-}"
+  printf '%s\n' "$label_state" >"$clear_harness_dir/label-state"
   : >"$clear_harness_dir/calls.log"
   : >"$clear_harness_dir/github-env"
   : >"$clear_harness_dir/github-output"
@@ -813,6 +879,8 @@ run_clear_harness() {
       PR_NUMBERS="$([ "$input_name" = PR_NUMBERS ] && printf 7)" \
       PRS="$([ "$input_name" = PRS ] && printf 7)" \
       CLEAR_PROTECT_RC="$protective_rc" \
+      EVENT_NAME="$event_name" \
+      EVENT_ACTION="$event_action" \
       CLEAR_STUB_LOG="$clear_harness_dir/calls.log" \
       CLEAR_LABEL_STATE="$clear_harness_dir/label-state" \
       GITHUB_ENV="$clear_harness_dir/github-env" \
@@ -822,6 +890,7 @@ run_clear_harness() {
 }
 
 clear_execution_ok=1
+heal_candidates_ok=1
 for clear_case in event scheduled; do
   if [ "$clear_case" = event ]; then
     clear_script="$clear_harness_dir/event-clear.sh"
@@ -845,6 +914,13 @@ for clear_case in event scheduled; do
     sed 's/^/        /' "$clear_harness_dir/run.out" >&2
     clear_execution_ok=0
   fi
+  # #2193: a clean removal makes the PR a heal candidate for the job's heal
+  # step, whichever job removed it.
+  if ! grep -Fxq 'heal_prs=7' "$clear_harness_dir/github-output"; then
+    echo "  INFO: $clear_case clean removal did not emit heal_prs=7" >&2
+    sed 's/^/        output: /' "$clear_harness_dir/github-output" >&2
+    heal_candidates_ok=0
+  fi
 
   set +e
   run_clear_harness "$clear_script" "$clear_input" 3
@@ -858,6 +934,13 @@ for clear_case in event scheduled; do
     sed 's/^/        /' "$clear_harness_dir/run.out" >&2
     clear_execution_ok=0
   fi
+  # #2193: an infrastructure error never makes the PR a heal candidate; the
+  # surfacing step owns it.
+  if ! grep -Fxq 'heal_prs=' "$clear_harness_dir/github-output"; then
+    echo "  INFO: $clear_case infra-error pass emitted a heal candidate" >&2
+    sed 's/^/        output: /' "$clear_harness_dir/github-output" >&2
+    heal_candidates_ok=0
+  fi
 done
 
 if [ "$clear_execution_ok" -eq 1 ]; then
@@ -867,7 +950,294 @@ else
   fail=$((fail + 1))
   echo "  FAIL: label-clear execution must use read-only arm classification, PAT deletion, and no writes after classification failure" >&2
 fi
+
+# #2193: label already absent. The event-driven block nominates the PR on a
+# pull_request_target action other than synchronize (the `edited` nudge is
+# the case that matters: the sweep may never list a PR whose label is gone),
+# and never on synchronize or workflow_run. The sweep nominates a stale
+# search-index hit. Neither touches the protective helper, the DELETE or the
+# comment when the label is absent.
+clear_absent_case() {
+  local script="$1" input_name="$2" event_name="$3" event_action="$4" expected="$5"
+  set +e
+  run_clear_harness "$script" "$input_name" 0 absent "$event_name" "$event_action"
+  local rc=$?
+  set -e
+  if [ "$rc" -ne 0 ] \
+     || grep -Eq '^(protect|delete|comment):' "$clear_harness_dir/calls.log" \
+     || ! grep -Fxq "heal_prs=$expected" "$clear_harness_dir/github-output"; then
+    echo "  INFO: label-absent case ($input_name $event_name/$event_action) rc=$rc expected heal_prs=$expected" >&2
+    sed 's/^/        output: /' "$clear_harness_dir/github-output" >&2
+    sed 's/^/        /' "$clear_harness_dir/run.out" >&2
+    heal_candidates_ok=0
+  fi
+}
+clear_absent_case "$clear_harness_dir/event-clear.sh" PR_NUMBERS pull_request_target edited 7
+clear_absent_case "$clear_harness_dir/event-clear.sh" PR_NUMBERS pull_request_target labeled 7
+clear_absent_case "$clear_harness_dir/event-clear.sh" PR_NUMBERS pull_request_target synchronize ''
+clear_absent_case "$clear_harness_dir/event-clear.sh" PR_NUMBERS workflow_run completed ''
+clear_absent_case "$clear_harness_dir/scheduled-clear.sh" PRS '' '' 7
+
+if [ "$heal_candidates_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: both clear blocks nominate a PR left label-absent by a clean pass for the stale-check heal, and never one that hit an infra error (#2193)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: clear blocks must emit heal_prs for clean label-absent passes (removal in both jobs, edited/labeled event path, stale sweep hit) and not for infra errors, synchronize or workflow_run (#2193)" >&2
+fi
 rm -rf "$clear_harness_dir"
+fi
+
+# ── #2193: heal a stale failed auto-clear-blocking-labels check-run
+# Executes both jobs' literal heal-step run blocks against the real helper and
+# a gh stub that applies the helper's own --jq filters to fixture JSON. The
+# stub serves a PR whose head and label can change between the helper's two
+# reads, and a check-run list whose ARRAY order disagrees with its time
+# order, so an implementation that trusts array order fails one direction.
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ]; then
+heal_dir=$(mktemp -d "${TMPDIR:-/tmp}/auto-clear-heal.XXXXXX")
+mkdir -p "$heal_dir/bin" "$heal_dir/scripts/lib" "$heal_dir/scripts/workflow"
+cp "$ROOT/scripts/lib/gh-retry-helpers.sh" "$heal_dir/scripts/lib/"
+if [ -f "$ROOT/scripts/workflow/heal-auto-clear-infra-check.sh" ]; then
+  cp "$ROOT/scripts/workflow/heal-auto-clear-infra-check.sh" "$heal_dir/scripts/workflow/"
+fi
+extract_heal_block() {
+  local name="$1" destination="$2"
+  awk -v target="$name" '
+    $0 == "      - name: " target { in_step=1; next }
+    in_step && $0 == "        run: |" { in_run=1; next }
+    in_run && /^          / { sub(/^          /, ""); print; next }
+    in_run && /^[[:space:]]*$/ { print; next }
+    in_run { exit }
+  ' "$WORKFLOW" >"$destination"
+}
+extract_heal_block 'Heal stale auto-clear infra-failure check-runs' "$heal_dir/event-heal.sh"
+extract_heal_block 'Heal stale auto-clear infra-failure check-runs (sweep)' "$heal_dir/sweep-heal.sh"
+
+heal_sha_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+heal_sha_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+cat >"$heal_dir/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "${1:-}" = api ] || { printf 'unexpected gh call: %s\n' "$*" >&2; exit 90; }
+shift
+endpoint="" jq_filter="" method=GET
+args=("$@")
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --jq) jq_filter="$2"; shift 2 ;;
+    -X) method="$2"; shift 2 ;;
+    --paginate) shift ;;
+    -f|-F) shift 2 ;;
+    *) [ -z "$endpoint" ] && endpoint="$1"; shift ;;
+  esac
+done
+case "$method $endpoint" in
+  'GET repos/owner/repo/pulls/7')
+    reads=$(cat "$HEAL_STUB_DIR/pr-reads")
+    reads=$((reads + 1))
+    printf '%s\n' "$reads" >"$HEAL_STUB_DIR/pr-reads"
+    if [ "$reads" -gt 1 ] && [ -f "$HEAL_STUB_DIR/pr-after-first-read.json" ]; then
+      jq -r "$jq_filter" "$HEAL_STUB_DIR/pr-after-first-read.json"
+    else
+      jq -r "$jq_filter" "$HEAL_STUB_DIR/pr.json"
+    fi
+    ;;
+  GET\ repos/owner/repo/commits/*/check-runs\?*)
+    printf 'runs-read:%s\n' "$endpoint" >>"$HEAL_STUB_DIR/calls.log"
+    jq -r "$jq_filter" "$HEAL_STUB_DIR/runs.json"
+    ;;
+  'POST repos/owner/repo/check-runs')
+    printf 'post:%s:%s\n' "${GH_TOKEN:-unset}" "${args[*]}" >>"$HEAL_STUB_DIR/calls.log"
+    printf '{}\n'
+    ;;
+  *)
+    printf 'unexpected gh api call: %s %s\n' "$method" "$endpoint" >&2
+    exit 90
+    ;;
+esac
+STUB
+chmod +x "$heal_dir/bin/gh"
+
+heal_pr_json() {
+  local sha="$1" label="$2"
+  if [ "$label" = present ]; then
+    jq -nc --arg s "$sha" '{head:{sha:$s},labels:[{name:"needs-external-review"},{name:"other"}]}'
+  else
+    jq -nc --arg s "$sha" '{head:{sha:$s},labels:[{name:"other"}]}'
+  fi
+}
+heal_run() {
+  local block="$1"; shift
+  local pr_label="$1" runs_json="$2" moved_sha="${3:-}"
+  heal_pr_json "$heal_sha_a" "$pr_label" >"$heal_dir/pr.json"
+  rm -f "$heal_dir/pr-after-first-read.json"
+  if [ -n "$moved_sha" ]; then
+    heal_pr_json "$moved_sha" absent >"$heal_dir/pr-after-first-read.json"
+  fi
+  printf '%s\n' "$runs_json" >"$heal_dir/runs.json"
+  printf '0\n' >"$heal_dir/pr-reads"
+  : >"$heal_dir/calls.log"
+  (
+    cd "$heal_dir"
+    env \
+      PATH="$heal_dir/bin:$PATH" \
+      GH_TOKEN=workflow-token \
+      GH_RETRY_ATTEMPTS=1 \
+      GH_RETRY_BACKOFF_SECONDS=0 \
+      HEAL_STUB_DIR="$heal_dir" \
+      REPO=owner/repo \
+      RUN_URL=https://example.test/run/1 \
+      HEAL_PRS=7 \
+      bash "$block" >"$heal_dir/run.out" 2>&1
+  )
+}
+heal_runs() {
+  # heal_runs <conclusion@completed_at@id>... -> a check-runs page JSON
+  local spec items=()
+  for spec in "$@"; do
+    items+=("$(jq -nc --arg c "${spec%%@*}" --arg t "$(cut -d@ -f2 <<<"$spec")" \
+      --argjson i "${spec##*@}" \
+      '{name:"auto-clear-blocking-labels",status:"completed",conclusion:$c,completed_at:$t,started_at:$t,id:$i}')")
+  done
+  if [ "${#items[@]}" -eq 0 ]; then
+    printf '{"total_count":0,"check_runs":[]}'
+  else
+    printf '%s\n' "${items[@]}" | jq -sc '{total_count:length,check_runs:.}'
+  fi
+}
+heal_expect_post() {
+  local label="$1" block="$2" title="$3"
+  if ! grep -q '^post:' "$heal_dir/calls.log" \
+     || [ "$(grep -c '^post:' "$heal_dir/calls.log")" -ne 1 ] \
+     || ! grep -Fq "post:workflow-token:" "$heal_dir/calls.log" \
+     || ! grep -Fq "head_sha=$heal_sha_a" "$heal_dir/calls.log" \
+     || ! grep -Fq 'name=auto-clear-blocking-labels' "$heal_dir/calls.log" \
+     || ! grep -Fq 'conclusion=success' "$heal_dir/calls.log" \
+     || ! grep -Fq 'status=completed' "$heal_dir/calls.log" \
+     || ! grep -Fq "output[title]=$title" "$heal_dir/calls.log" \
+     || ! grep -Fq 'https://example.test/run/1' "$heal_dir/calls.log" \
+     || ! grep -Fq "runs-read:repos/owner/repo/commits/$heal_sha_a/check-runs?check_name=auto-clear-blocking-labels" "$heal_dir/calls.log"; then
+    echo "  INFO: $block $label: expected exactly one success POST on $heal_sha_a" >&2
+    sed 's/^/        call: /' "$heal_dir/calls.log" >&2
+    sed 's/^/        /' "$heal_dir/run.out" >&2
+    return 1
+  fi
+}
+heal_expect_no_post() {
+  local label="$1" block="$2"
+  if grep -q '^post:' "$heal_dir/calls.log"; then
+    echo "  INFO: $block $label: expected no POST" >&2
+    sed 's/^/        call: /' "$heal_dir/calls.log" >&2
+    sed 's/^/        /' "$heal_dir/run.out" >&2
+    return 1
+  fi
+}
+
+heal_stale_failure_ok=1
+heal_quiet_ok=1
+heal_fence_ok=1
+for heal_case in event sweep; do
+  block="$heal_dir/$heal_case-heal.sh"
+  title='Auto-clear confirmed needs-external-review absent'
+  [ "$heal_case" = sweep ] && title='Auto-clear confirmed needs-external-review absent (scheduled sweep)'
+  if [ ! -s "$block" ] || [ ! -f "$heal_dir/scripts/workflow/heal-auto-clear-infra-check.sh" ]; then
+    echo "  INFO: $heal_case heal step or helper missing" >&2
+    heal_stale_failure_ok=0; heal_quiet_ok=0; heal_fence_ok=0
+    continue
+  fi
+  # Stale failure newest, label absent: one success POST on the live head.
+  # Array order lists the newer failure FIRST, so array-last would skip.
+  heal_run "$block" absent "$(heal_runs failure@2026-10-14T00:50:00Z@20 success@2026-10-13T20:00:00Z@10)"
+  heal_expect_post 'stale failure' "$heal_case" "$title" || heal_stale_failure_ok=0
+  # A same-second tie resolves by id: the later (higher id) failure wins.
+  heal_run "$block" absent "$(heal_runs failure@2026-10-14T00:50:00Z@21 success@2026-10-14T00:50:00Z@20)"
+  heal_expect_post 'same-second tie' "$heal_case" "$title" || heal_stale_failure_ok=0
+  # No prior run at all: nothing to supersede, no POST.
+  heal_run "$block" absent "$(heal_runs)"
+  heal_expect_no_post 'no prior run' "$heal_case" || heal_quiet_ok=0
+  # Newest already success (an older failure listed LAST): no POST.
+  heal_run "$block" absent "$(heal_runs success@2026-10-14T01:13:00Z@30 failure@2026-10-14T00:50:00Z@20)"
+  heal_expect_no_post 'newest already success' "$heal_case" || heal_quiet_ok=0
+  # Label present on the live head: never claim absence.
+  heal_run "$block" present "$(heal_runs failure@2026-10-14T00:50:00Z@20)"
+  heal_expect_no_post 'label present' "$heal_case" || heal_quiet_ok=0
+  # Head moved between the first read and the pre-POST fence: no POST.
+  heal_run "$block" absent "$(heal_runs failure@2026-10-14T00:50:00Z@20)" "$heal_sha_b"
+  heal_expect_no_post 'head moved' "$heal_case" || heal_fence_ok=0
+  if ! grep -Fq 'head moved' "$heal_dir/run.out"; then
+    echo "  INFO: $heal_case head-moved case did not reach the fence" >&2
+    heal_fence_ok=0
+  fi
+done
+
+if [ "$heal_stale_failure_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: both heal steps post one GITHUB_TOKEN success check-run on the live head when the newest auto-clear run is a stale failure (#2193)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: a clean label-absent pass must supersede a stale failed auto-clear-blocking-labels check-run in both jobs (#2193)" >&2
+fi
+if [ "$heal_quiet_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: heal steps post nothing when there is no prior run, the newest run is green, or the label is present (#2193)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: heal steps must add no check-run unless the newest auto-clear run on a label-absent head is a failure (#2193)" >&2
+fi
+if [ "$heal_fence_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: heal steps re-read the head immediately before the POST and skip when it moved (#2193)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: heal steps must fence the POST on a fresh head read (#2193)" >&2
+fi
+rm -rf "$heal_dir"
+fi
+
+# #2193 structural: both heal steps run last, survive another PR's infra
+# error (!cancelled), read the clear step's heal output, and post with the
+# workflow GITHUB_TOKEN (a PAT cannot create check-runs).
+heal_step_ok=1
+for heal_step in 'Heal stale auto-clear infra-failure check-runs|steps.clear.outputs.heal_prs|event' \
+                 'Heal stale auto-clear infra-failure check-runs (sweep)|steps.sweep.outputs.heal_prs|sweep'; do
+  heal_name=${heal_step%%|*}
+  heal_rest=${heal_step#*|}
+  heal_output=${heal_rest%%|*}
+  heal_ctx=${heal_rest#*|}
+  heal_block=$(awk -v target="$heal_name" '
+    $0 == "      - name: " target { in_step=1; print; next }
+    in_step && /^      - name: / { exit }
+    in_step && /^  [^ ]/ { exit }
+    in_step { print }
+  ' "$WORKFLOW")
+  if ! grep -Fq "if: \${{ !cancelled() && $heal_output != '' }}" <<<"$heal_block" \
+     || ! grep -Fq 'GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}' <<<"$heal_block" \
+     || ! grep -Fq "HEAL_PRS: \${{ $heal_output }}" <<<"$heal_block" \
+     || ! grep -Fq "bash scripts/workflow/heal-auto-clear-infra-check.sh \"\$REPO\" \"\$RUN_URL\" $heal_ctx \"\$HEAL_PRS\"" <<<"$heal_block"; then
+    echo "  INFO: heal step '$heal_name' is missing its guard, token, input or helper call" >&2
+    heal_step_ok=0
+  fi
+done
+# Last step of each job: the next non-comment line after each heal step's
+# run block is either the next job or EOF.
+if ! awk '
+  /^      - name: Heal stale auto-clear infra-failure check-runs$/ { seen=1; next }
+  seen && /^      - name: / { bad=1 }
+  seen && /^  scheduled-sweep:/ { seen=0 }
+  END { exit bad }
+' "$WORKFLOW" \
+   || [ "$(awk '/^      - name: Heal stale auto-clear infra-failure check-runs \(sweep\)$/ { s=1; next } s && /^      - name: / { print }' "$WORKFLOW")" != "" ] \
+   || ! grep -qE '^        id: sweep$' "$WORKFLOW"; then
+  echo "  INFO: a heal step is not the last step of its job, or the sweep step lacks id: sweep" >&2
+  heal_step_ok=0
+fi
+if [ "$heal_step_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: both heal steps run last under !cancelled() with GITHUB_TOKEN on their job's heal output (#2193)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: heal steps must be last in their job, guarded by !cancelled() on the heal output, and post with GITHUB_TOKEN (#2193)" >&2
 fi
 
 event_protect_line=$(grep -nF -- '--retract-unsafe-only "$PR" "$REPO"' <<<"$event_continuation_block" | head -1 | cut -d: -f1 || true)

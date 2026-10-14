@@ -8,7 +8,8 @@
 # The check has three parts and each is exercised here:
 #   A. the live-repo assertion (a local/worktree identity override fails);
 #   B. the `--snapshot` baseline comparison (.git/config must not move
-#      while the suite runs);
+#      while the suite runs), and its per-shard `--verify` form (#2163):
+#      Parts A and B only, failing closed with no snapshot to compare to;
 #   C. the static scan for unscoped `git config <identity-key> <value>`.
 #
 # Plus the re-run of A and B AFTER the paired regression suite, which is
@@ -1257,6 +1258,120 @@ if [ "$RC" = "1" ] \
   pass "mutated .git/config: caught, with the diff"
 else
   fail "mutated .git/config: rc=$RC out=$OUT"
+fi
+
+# ── Part B, --verify: the per-shard closing form (#2163) ───────────────
+
+# Case 39v: `--verify` is what every fast-lane shard that does NOT run the
+# full check closes with. It must run Parts A and B against the snapshot
+# and NOTHING else: the fixture carries a Part C offender in a tracked
+# script and names a suite stub that leaves a sentinel, so a verify that
+# scanned the tree or ran the suite is visible as either a hit or a file.
+# The contrast run proves the fixture is not vacuous: the plain call on
+# the same tree DOES fail on the offender.
+VERIFY_REPO="$WORKDIR/verify-repo"
+git init -q -b main "$VERIFY_REPO"
+mkdir -p "$VERIFY_REPO/scripts"
+printf '#!/usr/bin/env bash
+git config user.email "verify-offender@example.com"
+'   > "$VERIFY_REPO/scripts/offender.sh"
+VERIFY_SUITE="$WORKDIR/verify-suite.sh"
+VERIFY_SENTINEL="$WORKDIR/verify-suite-ran"
+printf '#!/usr/bin/env bash
+touch "%s"
+' "$VERIFY_SENTINEL" > "$VERIFY_SUITE"
+MERGEPATH_GIT_IDENTITY_ROOT="$VERIFY_REPO" bash "$CHECK" --snapshot >/dev/null 2>&1
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$VERIFY_REPO" MERGEPATH_GIT_IDENTITY_SUITE="$VERIFY_SUITE" bash "$CHECK" --verify 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "0" ] \
+  && printf '%s' "$OUT" | grep -q "unchanged since snapshot" \
+  && printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS (--verify" \
+  && ! printf '%s' "$OUT" | grep -q "verify-offender" \
+  && [ ! -e "$VERIFY_SENTINEL" ]; then
+  pass "--verify: Parts A and B pass against the snapshot; no tree scan, no suite"
+else
+  fail "--verify ran more than Parts A and B: rc=$RC sentinel=$([ -e "$VERIFY_SENTINEL" ] && echo present || echo absent) out=$OUT"
+fi
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$VERIFY_REPO" MERGEPATH_GIT_IDENTITY_SUITE="$VERIFY_SUITE" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "verify-offender"; then
+  pass "--verify contrast: the plain call on the same tree still fails the Part C offender"
+else
+  fail "--verify contrast fixture is vacuous: the plain call did not fail on the offender (rc=$RC out=$OUT)"
+fi
+
+# Case 39w: `--verify` still catches a config write after the snapshot —
+# the per-shard invariant it exists to assert.
+git -C "$VERIFY_REPO" config --local core.bigFileThreshold 456m
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$VERIFY_REPO" bash "$CHECK" --verify 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "changed since the snapshot" \
+  && printf '%s' "$OUT" | grep -q "bigFileThreshold" \
+  && ! printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  pass "--verify: a config write since the snapshot fails, with the diff"
+else
+  fail "--verify missed a config write: rc=$RC out=$OUT"
+fi
+
+# Case 39x: `--verify` still runs Part A. The override is written BEFORE
+# the snapshot so Part B is clean and only the live assertion can fail.
+VERIFY_IDREPO="$WORKDIR/verify-identity-repo"
+git init -q -b main "$VERIFY_IDREPO"
+git -C "$VERIFY_IDREPO" config --local user.email "verify-local@example.com"
+MERGEPATH_GIT_IDENTITY_ROOT="$VERIFY_IDREPO" bash "$CHECK" --snapshot >/dev/null 2>&1
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$VERIFY_IDREPO" bash "$CHECK" --verify 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "user.email = verify-local@example.com" \
+  && printf '%s' "$OUT" | grep -q "unchanged since snapshot" \
+  && ! printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  pass "--verify: a repo-local identity override still fails Part A"
+else
+  fail "--verify skipped Part A: rc=$RC out=$OUT"
+fi
+
+# Case 39y: `--verify` with no snapshot fails closed. A shard whose
+# snapshot step never recorded a baseline has nothing to compare, and a
+# verify that passed over that would bless the shard with no evidence.
+VERIFY_NOSNAP="$WORKDIR/verify-nosnapshot-repo"
+git init -q -b main "$VERIFY_NOSNAP"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$VERIFY_NOSNAP" bash "$CHECK" --verify 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "no snapshot was recorded for this checkout" \
+  && ! printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  pass "--verify: no recorded snapshot fails closed"
+else
+  fail "--verify passed with nothing to compare against: rc=$RC out=$OUT"
+fi
+
+# Case 39z: and the same when the snapshot was requested but its baseline
+# is gone — Part B's own fail-closed arm, reached through --verify.
+VERIFY_GONE="$WORKDIR/verify-baseline-gone-repo"
+git init -q -b main "$VERIFY_GONE"
+MERGEPATH_GIT_IDENTITY_ROOT="$VERIFY_GONE" bash "$CHECK" --snapshot >/dev/null 2>&1
+rm -f "$VERIFY_GONE/.git/mergepath-gitconfig-baseline"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$VERIFY_GONE" bash "$CHECK" --verify 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "snapshot baseline is missing" \
+  && ! printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  pass "--verify: a deleted baseline fails closed"
+else
+  fail "--verify forgot a requested comparison: rc=$RC out=$OUT"
 fi
 
 # Case 39b: linked worktrees share `.git/config` but must not share the

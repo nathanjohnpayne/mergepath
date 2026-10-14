@@ -816,6 +816,125 @@ else
     fail "the lint aggregator must fail on a failed, cancelled or unexpectedly skipped deep leg and pass only on the selected set"
   fi
 
+  # -------------------------------------------------------------------------
+  # #2163: the fast lane is a shard matrix. Every check step is pinned to one
+  # shard; the prelude is not. Two silent failure shapes are closed here: a
+  # pin naming a shard outside the matrix never runs anywhere (the check is
+  # switched off while `lint` stays green), and an unpinned check runs on
+  # every leg (minutes wasted, and a false reading of the balance).
+  # -------------------------------------------------------------------------
+  shard_members=$(yq -r '.jobs.lint_fast.strategy.matrix.shard[]?' "$REPO_LINT")
+  shard_count=$(printf '%s\n' "$shard_members" | sed '/^$/d' | wc -l | tr -d ' ')
+  if [ "$shard_count" -ge 2 ] && [ "$shard_count" -le 4 ] \
+     && printf '%s\n' "$shard_members" | sed '/^$/d' | grep -Eqx '[0-9]+' \
+     && ! printf '%s\n' "$shard_members" | sed '/^$/d' | grep -Evq '^[0-9]+$' \
+     && yq -e '.jobs.lint_fast.strategy."fail-fast" == false and .jobs.lint_fast.if == null and .jobs.lint_fast.name == "lint-fast" and (.jobs.lint_fast."timeout-minutes" | tag == "!!int")' "$REPO_LINT" >/dev/null; then
+    pass "lint-fast is a 2-4 shard matrix that reports every leg, is never skipped, and is time-bounded"
+  else
+    fail "lint-fast must declare a 2-4 integer shard matrix with fail-fast: false, no job-level if:, and a timeout (got shards: $(printf '%s' "$shard_members" | tr '\n' ' '))"
+  fi
+
+  pins_ok=1
+  pinned_steps=0
+  unpinned_steps=""
+  bad_pins=""
+  hygiene_full_shard=""
+  hygiene_verify_shard=""
+  while IFS=$'\t' read -r step_name step_if; do
+    [ -n "$step_name" ] || continue
+    case "$step_name" in
+      "check_git_identity_hygiene --snapshot")
+        # Unpinned by design: every leg records its own baseline.
+        if [ -n "$step_if" ]; then
+          pins_ok=0
+          bad_pins="$bad_pins ${step_name}(pinned)"
+        fi
+        continue
+        ;;
+    esac
+    if [ -z "$step_if" ]; then
+      pins_ok=0
+      unpinned_steps="$unpinned_steps $step_name"
+      continue
+    fi
+    if ! printf '%s' "$step_if" | grep -Eq '^matrix\.shard (==|!=) [0-9]+$'; then
+      pins_ok=0
+      bad_pins="$bad_pins ${step_name}(${step_if})"
+      continue
+    fi
+    pin_value="${step_if##* }"
+    if ! printf '%s\n' "$shard_members" | grep -Fxq "$pin_value"; then
+      pins_ok=0
+      bad_pins="$bad_pins ${step_name}(shard $pin_value is not in the matrix)"
+      continue
+    fi
+    case "$step_name" in
+      check_git_identity_hygiene)
+        case "$step_if" in *"== "*) hygiene_full_shard="$pin_value" ;; esac ;;
+      "check_git_identity_hygiene --verify")
+        case "$step_if" in *"!= "*) hygiene_verify_shard="$pin_value" ;; esac ;;
+      *)
+        # Every other check is pinned to exactly one leg: `!=` would run it
+        # on all but one, which is the duplication the matrix exists to end.
+        case "$step_if" in
+          *"!= "*) pins_ok=0; bad_pins="$bad_pins ${step_name}(!= pins run on every other leg)" ;;
+        esac ;;
+    esac
+    pinned_steps=$((pinned_steps + 1))
+  done < <(yq -r '.jobs.lint_fast.steps[] | select(.name | test("^check_")) | [.name, (.if // "")] | @tsv' "$REPO_LINT")
+  if [ "$pins_ok" -eq 1 ] && [ "$pinned_steps" -ge 60 ]; then
+    pass "every lint-fast check step ($pinned_steps) is pinned to one shard that exists in the matrix"
+  else
+    fail "lint-fast shard pins are broken (unpinned:$unpinned_steps) (bad:$bad_pins) (pinned=$pinned_steps)"
+  fi
+
+  shard_coverage_ok=1
+  for member in $shard_members; do
+    member="$member" yq -e '[.jobs.lint_fast.steps[] | select(.if == ("matrix.shard == " + strenv(member)))] | length > 0' "$REPO_LINT" >/dev/null 2>&1 || shard_coverage_ok=0
+  done
+  if [ "$shard_coverage_ok" -eq 1 ]; then
+    pass "every declared shard carries at least one pinned check"
+  else
+    fail "a declared shard carries no pinned check (a leg that does nothing but setup)"
+  fi
+
+  # The #777 closing pair: the plain call (Parts A-C + suite) on one shard and
+  # `--verify` (Parts A and B against this leg's own snapshot) on every other,
+  # pinned to the SAME number so exactly one of them closes every leg, and
+  # both as the job's final two steps so no suite runs after them.
+  last_two=$(yq -r '.jobs.lint_fast.steps[-2:] | map(.name) | join("|")' "$REPO_LINT")
+  if [ -n "$hygiene_full_shard" ] && [ "$hygiene_full_shard" = "$hygiene_verify_shard" ] \
+     && [ "$last_two" = "check_git_identity_hygiene|check_git_identity_hygiene --verify" ] \
+     && yq -e '.jobs.lint_fast.steps[] | select(.name == "check_git_identity_hygiene --verify") | .run | test("check_git_identity_hygiene --verify")' "$REPO_LINT" >/dev/null \
+     && yq -e '.jobs.lint_fast.steps[] | select(.name == "check_git_identity_hygiene --snapshot") | .if == null' "$REPO_LINT" >/dev/null; then
+    pass "every shard snapshots .git/config first and closes with the full hygiene check or --verify (full on shard $hygiene_full_shard)"
+  else
+    fail "the identity-hygiene closing pair must be the last two lint-fast steps, pinned == and != to one shard (full=$hygiene_full_shard verify=$hygiene_verify_shard last=$last_two)"
+  fi
+
+  # Lint-fast shard rows for the aggregator oracle above (#2163). They reuse
+  # its `aggregate` (DEEP REPLAY SELF SCOPE FAST DEEP_RESULT REPLAY_RESULT
+  # SELF_RESULT) rather than defining a second one, so there is one driver
+  # for the published step body. FAST_RESULT is the matrix job's ROLLED-UP
+  # result: one failed or cancelled shard makes it non-success, and skipped
+  # can only mean the job never ran. Each shape is paired with its passing
+  # control, so a negative row cannot pass because the shape itself is bad.
+  fast_shard_ok=1
+  aggregate false false false success success skipped skipped skipped || fast_shard_ok=0
+  aggregate true true true success success success success success || fast_shard_ok=0
+  aggregate true false false success success success skipped skipped || fast_shard_ok=0
+  for fast in failure cancelled skipped; do
+    aggregate false false false success "$fast" skipped skipped skipped && fast_shard_ok=0
+    aggregate true true true success "$fast" success success success && fast_shard_ok=0
+    aggregate true false false success "$fast" success skipped skipped && fast_shard_ok=0
+  done
+  if [ "$fast_shard_ok" -eq 1 ] \
+     && yq -e '(.jobs.lint.steps[] | select(.name == "publish aggregate lint result") | .env.FAST_RESULT) == "${{ needs.lint_fast.result }}"' "$REPO_LINT" >/dev/null; then
+    pass "a failed, cancelled or skipped lint-fast shard fails the aggregator on fast and deep heads, which reads needs.lint_fast.result"
+  else
+    fail "the aggregator must fail on any non-success lint-fast result (failure, cancelled, skipped) on every scope shape and read needs.lint_fast.result"
+  fi
+
   agent_review_probe=$(yq -r '.jobs."auto-merge-on-approval".steps[] | select(.name == "Probe current-head check readiness once") | .run' "$AGENT_REVIEW")
   if ! grep -Fq 'for readiness_probe in 1; do' <<<"$agent_review_probe" \
      && grep -Fq 'ready=false' <<<"$agent_review_probe" \

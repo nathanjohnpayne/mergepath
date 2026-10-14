@@ -37,12 +37,12 @@ name: CodeRabbit Severity Gate
 #   - pull_request + pull_request_review + pull_request_review_comment
 #     for the event-driven path (push, review submit/edit/dismiss,
 #     inline comment activity).
-#   - schedule (every 15 minutes) as the safety net for the UI-resolve
+#   - schedule (every 30 minutes since #2167) as the safety net for the UI-resolve
 #     case, since no other event fires when a human clicks "Resolve
 #     conversation" on a thread.
 # The schedule job is read-only and idempotent (no-op when no open PRs
 # match — and a no-op when the gate is disabled, which is the default), so
-# the 15-min cadence is safe to run unconditionally across this repo.
+# the 30-min cadence is safe to run unconditionally across this repo.
 
 on:
   pull_request:
@@ -60,7 +60,7 @@ on:
   # blocking finding can appear, change, or disappear with no pull_request*
   # event firing at all — and so can the acknowledgement token that clears one.
   # Without this trigger a previously-green required check stays green for up
-  # to 15 minutes after CodeRabbit publishes a summary-only finding, and the
+  # to one sweep interval (30 minutes) after CodeRabbit publishes a summary-only finding, and the
   # PR is mergeable through that window; symmetrically, an ack cannot turn a
   # red check green promptly.
   #
@@ -76,10 +76,12 @@ on:
   # CodeRabbit blocking-tier thread" case. The thread-resolution webhook
   # fires but does NOT trigger Actions workflows (no Actions event for it
   # per GitHub docs), so without the schedule the required check would stay
-  # red until the next push or manual rerun. 15-min cadence mirrors
-  # codex-p1-gate.yml § scheduled-sweep.
+  # red until the next push or manual rerun. */30 since #2167 (was */15,
+  # mirroring codex-p1-gate.yml): every tick walks every open PR against the
+  # shared 1,000/hr installation-token budget; a UI-resolved thread now waits
+  # up to 30 minutes. Pinned by check_required_check_publisher.
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/30 * * * *"
 
 permissions:
   contents: read

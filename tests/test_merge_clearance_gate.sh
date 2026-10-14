@@ -3502,7 +3502,7 @@ mkdir -p "$RCP_DIR"
 RCP_WFDIR="$RCP_DIR/workflows"
 mkdir -p "$RCP_WFDIR"
 for _f in required-check-publisher.yml merge-clearance-gate.yml pr-review-policy.yml \
-          codex-p1-gate.yml coderabbit-severity-gate.yml; do
+          codex-p1-gate.yml coderabbit-severity-gate.yml repo_lint.yml; do
   cp "$ROOT/.github/workflows/$_f" "$RCP_WFDIR/$_f"
 done
 
@@ -3555,13 +3555,15 @@ else
   fail "#845 Stage B: shadow-name fixture failed for the wrong reason: $OUT"
 fi
 
-# <fixture-workflow> [workflow-dir] [parent] -> echoes rc, output to <fixture>.out
+# <fixture-workflow> [workflow-dir] [parent] [lint-parent] -> echoes rc,
+# output to <fixture>.out. The lint parent is the #2167 CI-side parent.
 rcp_run() {
   local out rc
   set +e
   out=$(REQUIRED_CHECK_PUBLISHER_WORKFLOW="$1" \
         REQUIRED_CHECK_PUBLISHER_WORKFLOW_DIR="${2:-$RCP_WFDIR}" \
         REQUIRED_CHECK_PUBLISHER_PARENT="${3:-$RCP_WFDIR/merge-clearance-gate.yml}" \
+        REQUIRED_CHECK_PUBLISHER_LINT_PARENT="${4:-$RCP_WFDIR/repo_lint.yml}" \
         "$RCP_CHECK" 2>&1)
   rc=$?
   set -e
@@ -3583,7 +3585,7 @@ rcp_case() {
     cp "$RCP_WF" "$f"
   fi
   if [ -n "$prog" ] && cmp -s "$RCP_WF" "$f"; then
-    fail "#845 rcp case $name: the mutation changed nothing — anchor drifted"
+    fail "${RCP_TAG:-#845} rcp case $name: the mutation changed nothing — anchor drifted"
     return
   fi
   rc=$(rcp_run "$f")
@@ -3594,20 +3596,20 @@ rcp_verdict() {  # <name> <rc> <expect> <want> <out-file>
   local name="$1" rc="$2" expect="$3" want="$4" outf="$5"
   if [ "$expect" = pass ]; then
     if [ "$rc" -eq 0 ]; then
-      pass "#845 rcp case $name: positive control — the canonical publisher is accepted"
+      pass "${RCP_TAG:-#845} rcp case $name: positive control — the canonical publisher is accepted"
     else
-      fail "#845 rcp case $name: expected pass, got rc=$rc"
+      fail "${RCP_TAG:-#845} rcp case $name: expected pass, got rc=$rc"
       sed 's/^/      /' "$outf" | head -4 >&2
     fi
     return
   fi
   if [ "$rc" -eq 0 ]; then
-    fail "#845 rcp case $name: expected the fence to reject this shape, got rc=0"
+    fail "${RCP_TAG:-#845} rcp case $name: expected the fence to reject this shape, got rc=0"
   elif [ -n "$want" ] && ! grep -qF -- "$want" "$outf"; then
-    fail "#845 rcp case $name: rejected, but not for its own reason (wanted: $want)"
+    fail "${RCP_TAG:-#845} rcp case $name: rejected, but not for its own reason (wanted: $want)"
     grep '^FAIL' "$outf" | sed 's/^/      /' | head -3 >&2
   else
-    pass "#845 rcp case $name: the fence rejects it, naming the right cause"
+    pass "${RCP_TAG:-#845} rcp case $name: the fence rejects it, naming the right cause"
   fi
 }
 
@@ -3746,7 +3748,7 @@ rcp_case rd-not-mapping \
 # either side orphans every event-driven publish — silently, because a
 # workflow that never fires looks identical to one that finds nothing to do.
 rcp_case parent-name \
-  's{workflows: \["Merge Clearance Gate"\]}{workflows: ["Merge Clearance Gate Renamed"]}' \
+  's{workflows: \["Merge Clearance Gate", "repo-lint"\]}{workflows: ["Merge Clearance Gate Renamed", "repo-lint"]}' \
   fail 'workflow_run.workflows is'
 
 # A rename is only HALF the shape. The parent name is read out of the
@@ -3809,14 +3811,14 @@ rcp_parent_case parent-name-blank 's{^name: Merge Clearance Gate$}{name: ""}m' \
 # The old `list(listed) == [parent_name]` comparison accepted matching nested
 # lists, even though that trigger cannot deliver the publisher at all.
 rcp_parent_pair_case parent-name-nonscalar \
-  's{workflows: \["Merge Clearance Gate"\]}{workflows: [[Merge Clearance Gate]]}' \
+  's{workflows: \["Merge Clearance Gate", "repo-lint"\]}{workflows: [[Merge Clearance Gate], "repo-lint"]}' \
   's{^name: Merge Clearance Gate$}{name: [Merge Clearance Gate]}m' \
   fail 'declares no usable top-level name:'
 # `workflows:` itself must be a list of strings. A one-character scalar name
 # was another old false clear: `list("M") == ["M"]` held even though Actions
 # treats the scalar as an invalid trigger value.
 rcp_parent_pair_case workflow-name-not-list \
-  's{workflows: \["Merge Clearance Gate"\]}{workflows: M}' \
+  's{workflows: \["Merge Clearance Gate", "repo-lint"\]}{workflows: M}' \
   's{^name: Merge Clearance Gate$}{name: M}m' \
   fail 'not a list'
 # The third outcome, and the regression guard for the round-1 fix: an
@@ -3938,21 +3940,21 @@ rcp_case head-sha-case \
 #
 # 1. A literal-false condition (what the screen did catch).
 rcp_case publish-falsy \
-  's{^    if: github.event_name != .workflow_run. \|\| github.event.action == .completed.$}{    if: \$\{\{ false \}\}}m' \
+  's{^    if: >-\n      github.event_name != .workflow_run. \|\|\n(      .*\n)+?(?=    runs-on:)}{    if: \$\{\{ false \}\}\n}m' \
   fail '[rcp job eligibility]'
 # 2. A NON-literal condition Actions can never satisfy. No falsiness screen
 #    terminates against this class: an event name that never occurs is one
 #    spelling of infinitely many, which is why the condition is pinned
 #    verbatim instead of screened.
 rcp_case publish-impossible \
-  's{^    if: github.event_name != .workflow_run. \|\| github.event.action == .completed.$}{    if: github.event_name == \x27never-an-event\x27}m' \
+  's{^    if: >-\n      github.event_name != .workflow_run. \|\|\n(      .*\n)+?(?=    runs-on:)}{    if: github.event_name == \x27never-an-event\x27\n}m' \
   fail '[rcp job eligibility]'
 # 3. DELETING the `if:`. The screen was guarded on the key's presence, so a
 #    one-line deletion disarmed it — the identical defect A6 carried. The
 #    publisher would then publish on `requested` too, on a head phase 1 has
 #    not finished claiming.
 rcp_case publish-if-absent \
-  's{^    if: github.event_name != .workflow_run. \|\| github.event.action == .completed.\n}{}m' \
+  's{^    if: >-\n      github.event_name != .workflow_run. \|\|\n(      .*\n)+?(?=    runs-on:)}{}m' \
   fail '[rcp job eligibility]'
 # 4. The `open` job, which the screen never looked at AT ALL. Drifting its
 #    condition to the publish cue means no hold is ever opened: every
@@ -4433,6 +4435,278 @@ done
 nonrev_case "block-list key parses and gates normally" "$DENY" \
   "$(jq -n --arg sha "$HEAD_SHA" --arg who "$ROBOT" '
     [{user:{login:$who},state:"APPROVED",commit_id:$sha,submitted_at:"2026-08-22T04:46:19Z"}]')" block
+
+# ---------------------------------------------------------------------------
+# Test 27 (#2167): event-driven lint fan-in and no runner-held waiting.
+#
+# Three checks changed together, and each new assertion gets the mutation
+# that proves it is armed:
+#
+#   * scripts/ci/check_required_check_publisher — the publisher now lists
+#     repo-lint as its second workflow_run parent. A6 pins the parent list
+#     whole, in order, against BOTH parent files; A4a pins the two job
+#     conditions that split the deliveries (open: gate parent only; publish:
+#     a repo-lint parent only for a `pull_request` lint run — the main-SHA
+#     confounder, where a merge floods push-to-main lint completions whose
+#     head_sha is main's tip); A14 rejects a runner-held wait loop.
+#   * scripts/ci/check_merge_clearance_gate — the gate workflow must NOT grow
+#     its own workflow_run (the fan-in is the publisher's), and must carry no
+#     wait loop.
+#   * scripts/ci/check_auto_clear_workflow — the same no-wait assertion.
+#
+# Same posture as Test 25: every fixture is derived from the canonical file
+# by a mutation whose no-op guard trips when its anchor drifts, and every
+# negative case names the assertion it expects to trip.
+# ---------------------------------------------------------------------------
+if [ ! -x "$RCP_CHECK" ] || [ ! -f "$RCP_WF" ]; then
+  echo; echo "SKIP: Test 27 (#2167) — publisher or its fence absent"
+elif ! python3 -c "import yaml" >/dev/null 2>&1; then
+  echo; echo "SKIP: Test 27 (#2167) — PyYAML unavailable, the fence's tier does not run"
+elif ! command -v perl >/dev/null 2>&1; then
+  echo; echo "SKIP: Test 27 (#2167) — perl unavailable (fixtures are perl-derived)"
+else
+echo; echo "--- Test 27 (#2167): lint fan-in parent, main-SHA confounder, no runner-held wait"
+RCP_TAG='#2167'
+RCP_DIR="${RCP_DIR:-$WORKDIR/rcp}"
+mkdir -p "$RCP_DIR"
+
+# ── publisher: the parent list is pinned whole, in order ───────────────
+rcp_case lint-parent-dropped \
+  's{workflows: \["Merge Clearance Gate", "repo-lint"\]}{workflows: ["Merge Clearance Gate"]}' \
+  fail 'workflow_run.workflows is'
+rcp_case lint-parent-extra \
+  's{workflows: \["Merge Clearance Gate", "repo-lint"\]}{workflows: ["Merge Clearance Gate", "repo-lint", "PR Review Policy"]}' \
+  fail 'workflow_run.workflows is'
+rcp_case lint-parent-reordered \
+  's{workflows: \["Merge Clearance Gate", "repo-lint"\]}{workflows: ["repo-lint", "Merge Clearance Gate"]}' \
+  fail 'workflow_run.workflows is'
+
+# The lint parent's name is read out of ITS file, with the same three
+# outcomes the gate parent has (missing, renamed, unreadable).
+rcp_lint_parent_case() {  # <name> <perl-program-on-publisher-or-empty> <perl-program-on-lint-parent> <expect> [needle]
+  local name="$1" pub_prog="$2" lint_prog="$3" expect="$4" want="${5:-}" f p rc
+  f="$RCP_DIR/wf-$name.yml"
+  p="$RCP_DIR/lint-parent-$name.yml"
+  if [ -n "$pub_prog" ]; then
+    perl -0777 -pe "$pub_prog" "$RCP_WF" > "$f"
+    if cmp -s "$RCP_WF" "$f"; then
+      fail "#2167 rcp case $name: the publisher mutation changed nothing — anchor drifted"
+      return
+    fi
+  else
+    cp "$RCP_WF" "$f"
+  fi
+  perl -0777 -pe "$lint_prog" "$RCP_WFDIR/repo_lint.yml" > "$p"
+  if cmp -s "$RCP_WFDIR/repo_lint.yml" "$p"; then
+    fail "#2167 rcp case $name: the lint-parent mutation changed nothing — anchor drifted"
+    return
+  fi
+  rc=$(rcp_run "$f" "$RCP_WFDIR" "$RCP_WFDIR/merge-clearance-gate.yml" "$p")
+  rcp_verdict "$name" "$rc" "$expect" "$want" "$f.out"
+}
+rcp_lint_parent_case lint-parent-name-missing '' 's{^name: repo-lint\n}{}m' \
+  fail 'declares no usable top-level name:'
+rcp_lint_parent_case lint-parent-renamed '' 's{^name: repo-lint$}{name: repo-lint-renamed}m' \
+  fail 'workflow_run.workflows is'
+rcp_lint_parent_case lint-parent-unreadable '' 's{^name: repo-lint$}{name: [unclosed}m' \
+  fail 'could not read'
+# The one consistent rename that leaves every other assertion green: parent
+# file AND `workflows:` entry renamed together while the pinned `publish`
+# condition still filters on the old name. That arm is then dead — every
+# lint completion, push-to-main included, enters the queue as a full pass.
+rcp_lint_parent_case lint-parent-renamed-consistently \
+  's{workflows: \["Merge Clearance Gate", "repo-lint"\]}{workflows: ["Merge Clearance Gate", "repo-lint-x"]}' \
+  's{^name: repo-lint$}{name: repo-lint-x}m' \
+  fail 'the pinned `publish` condition does not filter'
+
+# ── publisher: the two delivery-splitting conditions ───────────────────
+# The main-SHA confounder: dropping the `pull_request` arm admits every
+# repo-lint completion, so a merge's push-to-main lint run (head_sha =
+# main's tip, no open PR) enters the rcp-publish queue as a full pass and
+# can cancel a queued PR-head member.
+rcp_case publish-admits-push \
+  's{^    if: >-\n      github.event_name != .workflow_run. \|\|\n(      .*\n)+?(?=    runs-on:)}{    if: github.event_name != \x27workflow_run\x27 || github.event.action == \x27completed\x27\n}m' \
+  fail '[rcp job eligibility]'
+# Dropping the gate-name arm lets a repo-lint `requested` open holds at
+# push time (duplicating the gate parent's) and on every lint rerun.
+rcp_case open-admits-lint \
+  's{^      github.event.workflow_run.name == .Merge Clearance Gate. &&\n}{}m' \
+  fail '[rcp job eligibility]'
+
+# ── publisher: no runner-held wait (A14) ────────────────────────────────
+# Injected immediately before the pass-start stamp, i.e. inside the publish
+# step's run: body. A `read` loop is the one loop shape the publisher
+# legitimately carries, and the canonical file (already accepted by the
+# positive control in Test 25) has two of them.
+rcp_case publish-until-poll \
+  's{^(          if ! PASS_START=)}{          until gh api "repos/\$REPO/commits/\$RUN_HEAD/status" --jq .state | grep -q success; do sleep 30; done\n$1}m' \
+  fail '[rcp no runner-held wait]'
+rcp_case publish-while-poll \
+  's{^(          if ! PASS_START=)}{          while true; do sleep 15; done\n$1}m' \
+  fail '[rcp no runner-held wait]'
+rcp_case publish-mid-line-poll \
+  's{^(          if ! PASS_START=)}{          true; while [ "\$(date +%s)" -lt 0 ]; do sleep 15; done\n$1}m' \
+  fail '[rcp no runner-held wait]'
+# Per-OCCURRENCE classification (Codex P2 on #2171): a poll loop sharing a
+# line with a legitimate read loop must still trip.
+rcp_case publish-mixed-loop-line \
+  's{^(          if ! PASS_START=)}{          while true; do sleep 15; done; while IFS= read -r x; do :; done <<<""\n$1}m' \
+  fail '[rcp no runner-held wait]'
+# Quote-aware stripping (Codex P2 on #2171, round 2): a quoted hash before the
+# loop must not hide it as an inline comment.
+rcp_case publish-quoted-hash-before-loop \
+  's{^(          if ! PASS_START=)}{          echo "state #"; while true; do sleep 15; done\n$1}m' \
+  fail '[rcp no runner-held wait]'
+# A loop keyword split from its condition by a newline (Codex P2 on #2171,
+# round 3) is one shell statement and must still trip.
+rcp_case publish-multiline-loop \
+  's{^(          if ! PASS_START=)}{          while\n          true; do sleep 15; done\n$1}m' \
+  fail '[rcp no runner-held wait]'
+# Round 4 (Codex P2 x2 on #2171): `until read` is an infinite wait at EOF and
+# is not exempt; a wait in a THIRD job is still a runner-held wait.
+rcp_case publish-until-read \
+  's{^(          if ! PASS_START=)}{          until read -r x </dev/null; do sleep 15; done\n$1}m' \
+  fail '[rcp no runner-held wait]'
+rcp_case extra-job-poll \
+  's{\z}{\n  extra:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Extra\n        run: while true; do sleep 15; done\n}' \
+  fail "job 'extra'"
+rcp_case open-watch \
+  's{^(          if \[ -z "\$HEAD_SHA" \]; then\n            echo "::error::workflow_run.head_sha is empty)}{          gh pr checks "\$HEAD_SHA" --repo "\$REPO" --watch\n$1}m' \
+  fail 'passes `--watch`'
+# A loop keyword inside a COMMENT is prose, not a wait; stripping must keep it
+# from tripping A14 (the #689 class, in the opposite direction).
+rcp_case publish-loop-in-comment \
+  's{^(          if ! PASS_START=)}{          # while true; do sleep 15; done -- documented, not executed\n$1}m' \
+  pass
+
+# ── native sweep cadence pinned at */30 (A15) ──────────────────────────
+# Each native producer reverted to */15, a slower */60, and the schedule
+# deleted outright must all trip the pin, naming its own cause.
+rcp_dir_case cadence-gate-fast \
+  'perl -0777 -i -pe "s{cron: \"\*/30 \* \* \* \*\"}{cron: \"*/15 * * * *\"}" merge-clearance-gate.yml' \
+  fail '[rcp native sweep cadence]'
+rcp_dir_case cadence-codex-fast \
+  'perl -0777 -i -pe "s{cron: \"\*/30 \* \* \* \*\"}{cron: \"*/15 * * * *\"}" codex-p1-gate.yml' \
+  fail '[rcp native sweep cadence]'
+rcp_dir_case cadence-coderabbit-slow \
+  'perl -0777 -i -pe "s{cron: \"\*/30 \* \* \* \*\"}{cron: \"*/60 * * * *\"}" coderabbit-severity-gate.yml' \
+  fail '[rcp native sweep cadence]'
+rcp_dir_case cadence-gate-schedule-removed \
+  'perl -0777 -i -pe "s{^  schedule:\n    - cron: \"\*/30 \* \* \* \*\"\n}{}m" merge-clearance-gate.yml' \
+  fail '[rcp native sweep cadence]'
+
+# ── gate workflow: no own workflow_run, no wait loop ───────────────────
+# Tests 20-24 (and the mcg22_case harness) sit inside the re-entrancy guard:
+# when the check runs this suite as its own self-test they are skipped, so
+# these cases are guarded the same way rather than calling an undefined
+# function in the nested run.
+if [ -z "${MCG_SKIP_FIX3_SELFTEST:-}" ] && declare -f mcg22_case >/dev/null 2>&1; then
+MCG_TAG='#2167'
+mcg22_case gate-workflow-run \
+  's{^  schedule:\n}{  workflow_run:\n    workflows: ["repo-lint"]\n    types: [completed]\n  schedule:\n}m' \
+  fail '[#2167 lint fan-in]'
+mcg22_case gate-while-poll \
+  's{^(          output=\$\(scripts/merge-clearance-gate.sh "\$PR_NUMBER" "\$REPO" 2>&1\))}{          while ! gh pr view "\$PR_NUMBER" --json statusCheckRollup | grep -q lint; do sleep 15; done\n$1}m' \
+  fail '[#2167 no runner-held wait]'
+mcg22_case gate-mixed-loop-line \
+  's{^(          output=\$\(scripts/merge-clearance-gate.sh "\$PR_NUMBER" "\$REPO" 2>&1\))}{          while true; do sleep 15; done; while IFS= read -r x; do :; done <<<""\n$1}m' \
+  fail '[#2167 no runner-held wait]'
+mcg22_case gate-quoted-hash-before-loop \
+  's{^(          output=\$\(scripts/merge-clearance-gate.sh "\$PR_NUMBER" "\$REPO" 2>&1\))}{          echo "state #"; while true; do sleep 15; done\n$1}m' \
+  fail '[#2167 no runner-held wait]'
+# The trigger key respelled: double-quoted, single-quoted with a flow value,
+# and with a space before the colon. The text pre-check and the parsed tier
+# must agree; the needle is the shared tag.
+mcg22_case gate-workflow-run-dquoted \
+  's{^  schedule:\n}{  "workflow_run":\n    workflows: ["repo-lint"]\n    types: [completed]\n  schedule:\n}m' \
+  fail '[#2167 lint fan-in]'
+mcg22_case gate-workflow-run-squoted-flow \
+  's{^  schedule:\n}{  \x27workflow_run\x27: {workflows: ["repo-lint"], types: [completed]}\n  schedule:\n}m' \
+  fail '[#2167 lint fan-in]'
+mcg22_case gate-workflow-run-spaced \
+  's{^  schedule:\n}{  workflow_run :\n    workflows: ["repo-lint"]\n    types: [completed]\n  schedule:\n}m' \
+  fail '[#2167 lint fan-in]'
+mcg22_case gate-multiline-loop \
+  's{^(          output=\$\(scripts/merge-clearance-gate.sh "\$PR_NUMBER" "\$REPO" 2>&1\))}{          while\n          true; do sleep 15; done\n$1}m' \
+  fail '[#2167 no runner-held wait]'
+# Round 4 (Codex P2 x2 on #2171): `--watch=true` and `until read`.
+mcg22_case gate-watch-equals \
+  's{^(          output=\$\(scripts/merge-clearance-gate.sh "\$PR_NUMBER" "\$REPO" 2>&1\))}{          gh pr checks "\$PR_NUMBER" --repo "\$REPO" --watch=true\n$1}m' \
+  fail '[#2167 no runner-held wait]'
+mcg22_case gate-until-read \
+  's{^(          output=\$\(scripts/merge-clearance-gate.sh "\$PR_NUMBER" "\$REPO" 2>&1\))}{          until read -r x </dev/null; do sleep 15; done\n$1}m' \
+  fail '[#2167 no runner-held wait]'
+mcg22_case gate-watch \
+  's{^(          output=\$\(scripts/merge-clearance-gate.sh "\$PR_NUMBER" "\$REPO" 2>&1\))}{          gh pr checks "\$PR_NUMBER" --repo "\$REPO" --watch --required\n$1}m' \
+  fail '[#2167 no runner-held wait]'
+# The sweep's `while IFS=$'"'"'\t'"'"' read` loop is the accepted shape — the
+# canonical gate job is the positive control (Test 22 case I).
+mcg22_case gate-canonical-with-read-loop '' pass
+unset MCG_TAG
+else
+  echo "SKIP: Test 27 (#2167) gate-workflow cases — nested self-test run (re-entrancy guard)"
+fi
+
+# ── auto-clear: the same no-wait assertion ──────────────────────────────
+AC_CHECK="$ROOT/scripts/ci/check_auto_clear_workflow"
+AC_WF="$ROOT/.github/workflows/auto-clear-blocking-labels.yml"
+if [ -x "$AC_CHECK" ] && [ -f "$AC_WF" ]; then
+  ac_case() {  # <name> <perl-program-or-empty> <expect: fail|pass> [needle]
+    local name="$1" prog="$2" expect="$3" want="${4:-}" f out rc
+    f="$RCP_DIR/ac-$name.yml"
+    if [ -n "$prog" ]; then perl -0777 -pe "$prog" "$AC_WF" > "$f"; else cp "$AC_WF" "$f"; fi
+    if [ -n "$prog" ] && cmp -s "$AC_WF" "$f"; then
+      fail "#2167 auto-clear case $name: the mutation changed nothing — anchor drifted"
+      return
+    fi
+    set +e
+    out=$(AUTO_CLEAR_WORKFLOW="$f" "$AC_CHECK" --check 2>&1)
+    rc=$?
+    set -e
+    printf '%s' "$out" > "$f.out"
+    if [ "$expect" = pass ]; then
+      if [ "$rc" -eq 0 ]; then
+        pass "#2167 auto-clear case $name: positive control — the canonical workflow is accepted"
+      else
+        fail "#2167 auto-clear case $name: expected pass, got rc=$rc"
+        grep 'FAIL' "$f.out" | sed 's/^/      /' | head -3 >&2
+      fi
+    elif [ "$rc" -eq 0 ]; then
+      fail "#2167 auto-clear case $name: expected the check to reject this shape, got rc=0"
+    elif [ -n "$want" ] && ! grep -qF -- "$want" "$f.out"; then
+      fail "#2167 auto-clear case $name: rejected, but not for its own reason (wanted: $want)"
+      grep 'FAIL' "$f.out" | sed 's/^/      /' | head -3 >&2
+    else
+      pass "#2167 auto-clear case $name: the check rejects it, naming the right cause"
+    fi
+  }
+  ac_case while-poll \
+    's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          while ! gh pr view "\$PR" --json statusCheckRollup | grep -q lint; do sleep 15; done\n}m' \
+    fail '[#2167 no runner-held wait]'
+  ac_case mixed-loop-line \
+    's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          while true; do sleep 15; done; while IFS= read -r x; do :; done <<<""\n}m' \
+    fail '[#2167 no runner-held wait]'
+  ac_case quoted-hash-before-loop \
+    's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          echo "state #"; while true; do sleep 15; done\n}m' \
+    fail '[#2167 no runner-held wait]'
+  ac_case multiline-loop \
+    's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          while\n          true; do sleep 15; done\n}m' \
+    fail '[#2167 no runner-held wait]'
+  ac_case watch-equals \
+    's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          gh pr checks "\$PR" --repo "\$REPO" --watch=true\n}m' \
+    fail '[#2167 no runner-held wait]'
+  ac_case until-read \
+    's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          until read -r x </dev/null; do sleep 15; done\n}m' \
+    fail '[#2167 no runner-held wait]'
+  ac_case watch \
+    's{^(          source scripts/lib/gh-retry-helpers.sh\n)}{$1          gh pr checks "\$PR" --repo "\$REPO" --watch\n}m' \
+    fail '[#2167 no runner-held wait]'
+  ac_case canonical '' pass
+else
+  echo "SKIP: Test 27 (#2167) auto-clear cases — check_auto_clear_workflow or its workflow absent"
+fi
+unset RCP_TAG
+fi
 
 # ---------------------------------------------------------------------------
 echo

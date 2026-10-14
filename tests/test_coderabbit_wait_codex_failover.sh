@@ -205,6 +205,10 @@ test_failover_fires() {
   [ "$(stub_calls "$dir")" = "1" ] || fail "A: Codex helper invoked $(stub_calls "$dir") time(s), expected 1"
   grep -q -- '--trigger-only' "$dir/state/codex-stub.log" || fail "A: Codex helper not called with --trigger-only; log=$(cat "$dir/state/codex-stub.log")"
   grep -q 'phase4a=true' "$dir/state/codex-stub.log" || fail "A: MERGEPATH_PHASE_4A_GATED not set true; log=$(cat "$dir/state/codex-stub.log")"
+  # #2166: the requester refuses a head that does not look final (exit 8)
+  # unless the caller allows a moving head. The failover must always be able
+  # to hand a rate-limited head to Codex, so it passes the flag explicitly.
+  grep -q -- '--allow-moving-head' "$dir/state/codex-stub.log" || fail "A: Codex helper not called with --allow-moving-head (#2166); log=$(cat "$dir/state/codex-stub.log")"
   grep -q '999' "$dir/state/codex-stub.log" || fail "A: PR number not forwarded; log=$(cat "$dir/state/codex-stub.log")"
   [ "$FAIL" -ne "$before" ] || pass "A: rate-limit fires Codex failover once (--trigger-only, phase4a, PR#) → exit 5, requested:true"
 }

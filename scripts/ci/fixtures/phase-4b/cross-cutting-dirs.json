@@ -1,0 +1,9 @@
+{
+  "body": "Rename the review-policy loader entrypoint across the workflow, the helper and the function host.",
+  "files": [
+    {"filename": "scripts/workflow/load_review_config.sh", "patch": "@@ -3,2 +3,2 @@\n-load_review_config() {\n+load_review_policy() {"},
+    {"filename": ".github/workflows/agent-review.yml", "patch": "@@ -40,2 +40,2 @@\n-        run: scripts/workflow/load_review_config.sh\n+        run: scripts/workflow/load_review_policy.sh"},
+    {"filename": "functions/src/policy.ts", "patch": "@@ -1,2 +1,2 @@\n-import { loadReviewConfig } from \"./load\";\n+import { loadReviewPolicy } from \"./load\";"},
+    {"filename": "tests/test_load_review_config.sh", "patch": "@@ -1,2 +1,2 @@\n-load_review_config\n+load_review_policy"}
+  ]
+}

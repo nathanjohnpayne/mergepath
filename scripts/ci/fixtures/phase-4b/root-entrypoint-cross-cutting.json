@@ -1,0 +1,10 @@
+{
+  "body": "Rename the server bootstrap across the root entrypoint, the server package and the CLI.",
+  "files": [
+    {"filename": "main.go", "patch": "@@ -5,2 +5,2 @@\n-\tserver.Start(cfg)\n+\tserver.Run(cfg)"},
+    {"filename": "internal/server/server.go", "patch": "@@ -10,2 +10,2 @@\n-func Start(cfg Config) error {\n+func Run(cfg Config) error {"},
+    {"filename": "cmd/tool/main.go", "patch": "@@ -8,2 +8,2 @@\n-\tserver.Start(cfg)\n+\tserver.Run(cfg)"},
+    {"filename": "README.md", "patch": "@@ -3,1 +3,1 @@\n-Call server.Start.\n+Call server.Run."},
+    {"filename": "go.mod", "patch": "@@ -1,1 +1,1 @@\n-module example.com/app\n+module example.com/app"}
+  ]
+}
