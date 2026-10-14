@@ -64,6 +64,7 @@ for a in "$@"; do
   prev="$a"
 done
 printf '%s\n' "$line" >>"$LOG"
+[ -z "${STUB_HOST_LOG:-}" ] || printf '%s\t%s\n' "${GH_HOST:-<unset>}" "$*" >>"$STUB_HOST_LOG"
 
 case "${GH_TOKEN:-}" in
   ghp_author-token|gho_fallback-author-token) login=nathanjohnpayne ;;
@@ -534,6 +535,21 @@ if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/pulls\t--input\t'"$create_input"
   pass "pr create: a branch pushed to a fork gets the owner-qualified head"
 else
   fail "pr create fork head: rc=$rc"; cat "$LOGF" >&2
+fi
+# A fork with the same owner as --repo makes owner:branch ambiguous, so
+# GitHub requires head_repo naming the fork.
+git -C "$GITREPO" remote add samefork https://github.com/o/r-fork.git
+git -C "$GITREPO" config branch.topic/z.pushRemote samefork
+git -C "$GITREPO" update-ref refs/remotes/samefork/topic/z HEAD
+new_case
+set +e
+RUN_CWD="$GITREPO" MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr create --repo o/r --base main --title T --body-file "$VALID_BODY" >/dev/null 2>&1; rc=$?
+set -e
+create_input="$(jq -nc --arg body "$expected_body" '{title: "T", body: $body, head: "o:topic/z", base: "main", draft: false, head_repo: "r-fork"}')"
+if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/pulls\t--input\t'"$create_input"; then
+  pass "pr create: a branch pushed to a same-owner fork sends head_repo with the qualified head"
+else
+  fail "pr create same-owner fork: rc=$rc"; cat "$LOGF" >&2
 fi
 git -C "$GITREPO" config --unset branch.topic/z.pushRemote
 git -C "$GITREPO" remote set-url origin http://local_proxy@127.0.0.1:9/git/O/R
@@ -1015,6 +1031,81 @@ if [ "$rc" -eq 0 ] && grep -q "labeled:bug" "$WORKDIR/err"; then
   pass "edit: a label event GitHub spells in another case is still attributed"
 else
   fail "edit case-insensitive attribution: rc=$rc"; cat "$LOGF" "$WORKDIR/err" >&2
+fi
+
+# --- Phase 4b round two ------------------------------------------------------
+# Every call the wrappers make with the verified token is pinned to
+# github.com, on both transports: with GH_HOST unset, gh targets the only host
+# in its hosts file, and sends GH_TOKEN to github.localhost and *.ghe.com too.
+HOST_LOG="$WORKDIR/hosts.log"
+for t in rest gh; do
+  new_case
+  : >"$HOST_LOG"
+  set +e
+  (unset GH_HOST; MERGEPATH_GH_TRANSPORT=$t STUB_HOST_LOG="$HOST_LOG" as_reviewer -- gh pr comment 1 --repo o/r --body x >/dev/null 2>&1); rc=$?
+  set -e
+  writes=$(grep -v $'\tapi user' "$HOST_LOG" | grep -c . || true)
+  pinned=$(grep -v $'\tapi user' "$HOST_LOG" | grep -c $'^github.com\t' || true)
+  if [ "$rc" -eq 0 ] && [ "$writes" -ge 1 ] && [ "$writes" -eq "$pinned" ]; then
+    pass "$t transport: every call under the verified token runs with GH_HOST=github.com"
+  else
+    fail "$t transport GH_HOST pin: rc=$rc writes=$writes pinned=$pinned"; cat "$HOST_LOG" >&2
+  fi
+done
+new_case
+: >"$HOST_LOG"
+set +e
+(unset GH_HOST; MERGEPATH_GH_TRANSPORT=gh STUB_HOST_LOG="$HOST_LOG" as_author -- gh pr comment 5 --repo o/r --body '@codex review' >/dev/null 2>&1); rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q $'^github.com\tpr comment 5' "$HOST_LOG"; then
+  pass "gh transport, author wrapper: the wrapped write runs with GH_HOST=github.com"
+else
+  fail "author gh transport GH_HOST pin: rc=$rc"; cat "$HOST_LOG" >&2
+fi
+# Create follow-ups are taken against the created pull request's state, and
+# attributed only from events after a snapshot: automation that labeled the
+# new PR first makes that label a no-op, and its own event is not read as
+# this wrapper's write.
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest STUB_PR_LABELS=a STUB_EVENTS_BEFORE='[{"id":1,"event":"labeled","label":{"name":"a"},"actor":{"login":"automation[bot]"}}]' \
+  as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label a --label b >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/issues/42/labels\t--input\t'"$(printf '%s' '{"labels":["b"]}')" && grep -q 'labeled:b' "$WORKDIR/err"; then
+  pass "create follow-ups: a label automation already applied is dropped, and its earlier event is not attributed to this write"
+else
+  fail "create follow-up no-op filter: rc=$rc"; cat "$LOGF" "$WORKDIR/err" >&2
+fi
+# History before the snapshot is not this write: a label another account
+# applied and removed earlier, then requested again here, is attributed only
+# from the event this write produced.
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest STUB_EVENTS_BEFORE='[{"id":1,"event":"labeled","label":{"name":"b"},"actor":{"login":"automation[bot]"}},{"id":2,"event":"unlabeled","label":{"name":"b"},"actor":{"login":"automation[bot]"}}]' \
+  as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label b >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q 'labeled:b' "$WORKDIR/err"; then
+  pass "create follow-ups: an earlier event for the same label by another account is outside the snapshot"
+else
+  fail "create follow-up snapshot: rc=$rc"; cat "$WORKDIR/err" >&2
+fi
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest STUB_PR_LABELS=a as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label a >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_lacks 'issues/42/labels' && log_lacks 'events?per_page'; then
+  pass "create follow-ups: when every requested label is already present, nothing is written and no events are read"
+else
+  fail "create follow-up all present: rc=$rc"; cat "$LOGF" "$WORKDIR/err" >&2
+fi
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_EVENTS_FAIL=1 as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label b 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'were not attempted' && log_lacks 'issues/42/labels'; then
+  pass "create follow-ups: an unreadable event snapshot stops before the follow-up writes"
+else
+  fail "create follow-up snapshot failure: rc=$rc err=$err"; cat "$LOGF" >&2
 fi
 
 # --- round-five parity cases ------------------------------------------------

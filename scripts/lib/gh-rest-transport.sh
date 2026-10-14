@@ -121,6 +121,8 @@ GH_REST_HASVAL=0
 GH_REST_VERIFIED=""
 GH_REST_DONE=" "
 GH_REST_REMOVED_LABELS=""
+GH_REST_DEFAULT_HEAD=""
+GH_REST_DEFAULT_HEAD_REPO=""
 
 # --- transport selection ------------------------------------------------------
 
@@ -293,11 +295,14 @@ gh_rest_trace_marker() {
 
 # Run gh under the verified token and nothing else: GITHUB_TOKEN is unset so
 # it cannot shadow GH_TOKEN, and both Enterprise variables carry the
-# resolver's non-credential sentinel (see gh-token-resolver.sh).
+# resolver's non-credential sentinel (see gh-token-resolver.sh). GH_HOST is
+# pinned to github.com, where the token was verified: with GH_HOST unset, gh
+# targets the only host in its hosts file, and it sends GH_TOKEN to
+# github.localhost and *.ghe.com hosts as well (Phase 4b on #2178).
 gh_rest_exec_gh() {
   (
     unset GITHUB_TOKEN
-    GH_TOKEN="$GH_REST_TOKEN" \
+    GH_HOST=github.com GH_TOKEN="$GH_REST_TOKEN" \
       GH_ENTERPRISE_TOKEN="${GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL:-mergepath-guarded-write-github-com-only}" \
       GITHUB_ENTERPRISE_TOKEN="${GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL:-mergepath-guarded-write-github-com-only}" \
       "$GH_REST_GH_BIN" "$@"
@@ -766,9 +771,12 @@ gh_rest_repo_of_url() {
   printf '%s/%s\n' "$(basename "$(dirname "$path")")" "$(basename "$path")"
 }
 
-# gh_rest_default_head <repo>: the head for an omitted --head, as gh resolves
-# it: the checked-out branch, qualified owner:branch when it is pushed to a
-# different repository than <repo> (a fork). A branch with no push remote is
+# gh_rest_default_head <repo>: sets GH_REST_DEFAULT_HEAD to the head for an
+# omitted --head, as gh resolves it: the checked-out branch, qualified
+# owner:branch when it is pushed to a different repository than <repo> (a
+# fork). When the fork has the same owner as <repo>, owner:branch is
+# ambiguous, so GH_REST_DEFAULT_HEAD_REPO names the fork repository, which
+# GitHub requires as head_repo for that case. A branch with no push remote is
 # refused, as gh refuses one it has not pushed.
 gh_rest_default_head() {
   local repo="$1" branch remote url pushed push_ref remote_branch
@@ -799,11 +807,17 @@ gh_rest_default_head() {
     gh_rest_refuse "branch $branch is not fully pushed: $push_ref differs from HEAD; push it first, or pass --head to open the PR from the pushed ref"
     return 1
   fi
-  if [ "$(printf '%s' "$pushed" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]')" ]; then
-    printf '%s\n' "$remote_branch"
+  local lc_pushed lc_repo
+  lc_pushed="$(printf '%s' "$pushed" | tr '[:upper:]' '[:lower:]')"
+  lc_repo="$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]')"
+  GH_REST_DEFAULT_HEAD_REPO=""
+  if [ "$lc_pushed" = "$lc_repo" ]; then
+    GH_REST_DEFAULT_HEAD="$remote_branch"
   else
-    printf '%s:%s\n' "${pushed%%/*}" "$remote_branch"
+    GH_REST_DEFAULT_HEAD="${pushed%%/*}:$remote_branch"
+    [ "${lc_pushed%%/*}" != "${lc_repo%%/*}" ] || GH_REST_DEFAULT_HEAD_REPO="${pushed#*/}"
   fi
+  return 0
 }
 
 # The follow-up writes of a create, in order; stops at the first failure.
@@ -868,8 +882,11 @@ gh_rest_pr_create() {
     gh_rest_refuse "--body or --body-file is required"
     return 1
   fi
+  local head_repo=""
   if [ -z "$head" ]; then
-    head="$(gh_rest_default_head "$repo")" || return 1
+    gh_rest_default_head "$repo" || return 1
+    head="$GH_REST_DEFAULT_HEAD"
+    head_repo="$GH_REST_DEFAULT_HEAD_REPO"
   fi
   gh_rest_check_branch "$head" "--head" || return 1
   gh_rest_each "$(gh_rest_lines_json "$reviewers")" gh_rest_check_login_what "--reviewer" || return 1
@@ -893,7 +910,8 @@ gh_rest_pr_create() {
 
   local input response number url actual rc=0
   input="$(gh_rest_json_file --arg title "$title" --rawfile body "$GH_REST_BODY_FILE" --arg head "$head" --arg base "$base" --argjson draft "$draft" \
-    '{title: $title, body: $body, head: $head, base: $base, draft: $draft}')" || return 1
+    --arg head_repo "$head_repo" \
+    '{title: $title, body: $body, head: $head, base: $base, draft: $draft} + (if $head_repo == "" then {} else {head_repo: $head_repo} end)')" || return 1
   response="$(gh_rest_api POST "repos/$repo/pulls" "$input")" || return $?
   number="$(printf '%s' "$response" | jq -r '.number // empty' 2>/dev/null)"
   url="$(printf '%s' "$response" | jq -r '.html_url // empty' 2>/dev/null)"
@@ -903,7 +921,9 @@ gh_rest_pr_create() {
     return 5
   fi
   # The #241 re-read: the created object's author, under the same token.
-  actual="$(gh_rest_api GET "repos/$repo/pulls/$number" | jq -r '.user.login // empty' 2>/dev/null)"
+  local created
+  created="$(gh_rest_api GET "repos/$repo/pulls/$number" 2>/dev/null || true)"
+  actual="$(printf '%s' "$created" | jq -r '.user.login // empty' 2>/dev/null)"
   if [ -z "$actual" ]; then
     gh_rest_err "ERROR could not read the author of $url back; refusing to treat the create as verified."
     gh_rest_err "Verify manually: GH_TOKEN=<author-token> gh api repos/$repo/pulls/$number --jq .user.login"
@@ -918,11 +938,23 @@ gh_rest_pr_create() {
   fi
   gh_rest_err "verified PR #$number author=$actual (matches expected $GH_REST_EXPECTED)"
 
-  local labels_json reviewers_json assignees_json followed=0
-  labels_json="$(gh_rest_lines_json "$labels")"
-  reviewers_json="$(gh_rest_lines_json "$reviewers")"
-  assignees_json="$(gh_rest_lines_json "$assignees")"
+  # Follow-ups are taken against the created pull request's state, as edits
+  # are: automation that runs on open may already have applied a requested
+  # label, and a no-op write produces no event to attribute. The events are
+  # snapshotted before the follow-ups, so an event that automation produced
+  # earlier is never read as this wrapper's write (Phase 4b on #2178).
+  local labels_json reviewers_json assignees_json followed=0 before=""
+  labels_json="$(gh_rest_set_ops add "$(printf '%s' "$created" | jq -c '[.labels[]?.name]' 2>/dev/null || echo '[]')" "$labels" "")"
+  reviewers_json="$(gh_rest_set_ops add "$(printf '%s' "$created" | jq -c '[.requested_reviewers[]?.login]' 2>/dev/null || echo '[]')" "$reviewers" "")"
+  assignees_json="$(gh_rest_set_ops add "$(printf '%s' "$created" | jq -c '[.assignees[]?.login]' 2>/dev/null || echo '[]')" "$assignees" "")"
   [ "$labels_json$reviewers_json$assignees_json" = "[][][]" ] || followed=1
+  if [ "$followed" -eq 1 ]; then
+    before="$(gh_rest_events "$repo" "$number")" || {
+      gh_rest_err "ERROR PR #$number was created ($url), but its events could not be read before the label, reviewer and assignee writes, so they were not attempted: they could not be attributed."
+      printf '%s\n' "$url"
+      return 5
+    }
+  fi
   if [ "$followed" -eq 1 ] && ! gh_rest_create_followups; then
     # Labels may have landed before the reviewers failed. Only the follow-ups
     # that succeeded are attributed positively; the rest are scanned.
@@ -930,12 +962,12 @@ gh_rest_pr_create() {
     gh_rest_done reviewers || reviewers_json="[]"
     gh_rest_done assignees || assignees_json="[]"
     rc=0
-    gh_rest_partial_failure "$repo" "$number" "" "$url" gh_rest_check_create_events || rc=$?
+    gh_rest_partial_failure "$repo" "$number" "$before" "$url" gh_rest_check_create_events || rc=$?
     printf '%s\n' "$url"
     return "$rc"
   fi
   if [ "$followed" -eq 1 ]; then
-    gh_rest_readback "$repo" "$number" "" gh_rest_check_create_events || rc=$?
+    gh_rest_readback "$repo" "$number" "$before" gh_rest_check_create_events || rc=$?
     if [ "$rc" -eq 3 ]; then
       gh_rest_err "ERROR PR #$number was created ($url) but its events could not be read, so the label, reviewer and assignee writes are unattributed."
       printf '%s\n' "$url"

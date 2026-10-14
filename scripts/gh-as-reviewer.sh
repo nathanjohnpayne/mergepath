@@ -87,7 +87,9 @@ set +e
 # it can neither carry the write nor receive the PAT (see gh-token-resolver.sh).
 (
   unset GITHUB_TOKEN
-  GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+  # GH_HOST is pinned to github.com, where the token was verified: with it
+  # unset, gh targets the only host in its hosts file (Phase 4b on #2178).
+  GH_HOST=github.com GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
     GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" "$@"
 )
 WRAPPED_RC=$?

@@ -296,7 +296,9 @@ run_with_author_token() {
     echo "gh-as-author: cannot write the trace marker $TRACE_MARKER; refusing to run the write unrecorded." >&2
     exit 70
   fi
-  GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+  # GH_HOST is pinned to github.com, where the token was verified: with it
+  # unset, gh targets the only host in its hosts file (Phase 4b on #2178).
+  GH_HOST=github.com GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
     GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" "$@"
 }
 
@@ -332,7 +334,7 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
 
   ACTUAL_AUTHOR=$(
     unset GITHUB_TOKEN
-    GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+    GH_HOST=github.com GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
       GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" gh pr view "$PR_NUM" --repo "$PR_REPO" --json author --jq .author.login 2>/dev/null || echo ""
   )
   if [ -z "$ACTUAL_AUTHOR" ]; then
