@@ -315,6 +315,12 @@
     "check_repo_lint_latency_report": [
       "tests/test_repo_lint_latency_report.sh"
     ],
+    "check_repo_lint_prepush": [
+      "scripts/repo-lint-prepush.sh",
+      "scripts/install-git-hooks.sh",
+      "scripts/git-hooks/*",
+      "tests/test_repo_lint_prepush.sh"
+    ],
     "check_required_check_publisher": [
       ".github/workflows/required-check-publisher.yml",
       "scripts/lib/ci-check-modes.sh",

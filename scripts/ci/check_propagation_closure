@@ -453,6 +453,13 @@ ALLOW_LIST=(
   # propagated, so a consumer carrying this test as bootstrap residue must
   # still SKIP. Its own reasoning is in the wrapper's header.
   "tests/test_consumer_residue_safety.sh"
+
+  # The #2221 git pre-push mirror of repo-lint is hub-only first: no
+  # consumer receives the hook, its runner or its installer until a
+  # propagation decision is made. check_repo_lint_prepush ships in the CI
+  # kit and SKIPs on consumers via the both-absent marker idiom, so its
+  # parity suite never needs to travel.
+  "tests/test_repo_lint_prepush.sh"
 )
 
 is_allow_listed() {
