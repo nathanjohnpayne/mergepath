@@ -1,5 +1,25 @@
 name: Repo-lint Latency Audit
 
+# Daily rolling repo-lint timing audit. scripts/repo-lint-latency-report.sh
+# computes the verdict; this workflow publishes it three ways:
+#   1. the job summary and a retained artifact (every run);
+#   2. ONE tracked issue (labels `area:ci-infra`, `audit`), opened on an
+#      alert and refreshed in place on later alerts, keyed on a hidden HTML
+#      marker in its body rather than its title, commented and closed on
+#      recovery — scripts/repo-lint-latency-issue.sh, following the
+#      weekly-drift-audit / branch-protection-audit pattern (#2165). Before
+#      that step existed the only alert surface was a red scheduled run,
+#      which the deep-lane regression that started 2026-09-02 proved nobody
+#      reads;
+#   3. a failed run while the alert stands (unchanged — the issue is
+#      additive, not a replacement for the red check).
+# A collection failure (exit other than 0/1) produces no verdict and leaves
+# the tracking issue untouched, so an API outage never reads as recovery.
+#
+# The issue writes use GITHUB_TOKEN with `issues: write`: the issue lives in
+# this repository, so that is the least-privilege choice. GITHUB_TOKEN
+# writes trigger no workflow runs, which is fine for a terminal notification.
+
 on:
   schedule:
     - cron: "47 8 * * *"
@@ -12,6 +32,7 @@ concurrency:
 permissions:
   actions: read
   contents: read
+  issues: write
 
 jobs:
   report:
@@ -62,6 +83,27 @@ jobs:
           path: ${{ runner.temp }}/repo-lint-latency
           retention-days: 30
           if-no-files-found: error
+
+      - name: Route the audit verdict to the tracking issue
+        # Runs on a verdict only (rc 0 or 1), and `always()` so a transient
+        # failure in the artifact upload above cannot skip the routing of a
+        # verdict that was produced. Ordered BEFORE the enforce step so an
+        # alert is filed before the job turns red; a routing failure fails
+        # this step on its own and names what was lost.
+        if: always() && (steps.latency.outputs.rc == '0' || steps.latency.outputs.rc == '1')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OUT_DIR: ${{ runner.temp }}/repo-lint-latency
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          AUDIT_RC: ${{ steps.latency.outputs.rc }}
+        run: |
+          scripts/repo-lint-latency-issue.sh \
+            --repo "${{ github.repository }}" \
+            --rc "$AUDIT_RC" \
+            --run-url "$RUN_URL" \
+            --summary "$OUT_DIR/summary.json" \
+            --summary-md "$OUT_DIR/summary.md" \
+            --labels "area:ci-infra,audit"
 
       - name: Enforce latency and duplication alerts
         if: steps.latency.outputs.rc == '1'

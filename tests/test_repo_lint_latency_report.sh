@@ -215,5 +215,222 @@ else
   fail "live collection must request created>=WINDOW_START and the workflow must pass --window-days"
 fi
 
+# --- alert → tracking issue routing (#2165) ----------------------------------
+# The verdict reaches ONE marker-keyed issue through
+# scripts/repo-lint-latency-issue.sh. The workflow is asserted structurally;
+# the router runs against a PATH-shimmed gh that records every call.
+
+ROUTER="$ROOT/scripts/repo-lint-latency-issue.sh"
+if [ ! -x "$ROUTER" ]; then
+  fail "missing executable $ROUTER"
+fi
+
+if command -v yq >/dev/null 2>&1 \
+   && yq -o=json '.' "$WORKFLOW" | jq -e '.permissions.issues == "write" and .permissions.actions == "read"
+             and ([.jobs.report.steps[] | select(.name == "Route the audit verdict to the tracking issue")
+                   | select((.if | startswith("always() && ")) and (.if | contains("steps.latency.outputs.rc == '\''0'\''")) and (.if | contains("steps.latency.outputs.rc == '\''1'\''")))
+                   | select((.run | contains("scripts/repo-lint-latency-issue.sh")) and (.run | contains("--labels \"area:ci-infra,audit\"")) and (.run | contains("--rc \"$AUDIT_RC\"")))
+                   | select(.env.GH_TOKEN == "${{ secrets.GITHUB_TOKEN }}")] | length == 1)
+             and (([.jobs.report.steps[] | .name] | index("Route the audit verdict to the tracking issue")) < ([.jobs.report.steps[] | .name] | index("Enforce latency and duplication alerts")))' >/dev/null; then
+  pass "workflow routes rc 0/1 to the tracking-issue script under always() with GITHUB_TOKEN issues:write before enforcing the alert"
+else
+  fail "workflow must carry the marker-keyed tracking-issue step (issues:write, both verdict rcs, before the enforce step)"
+fi
+
+SHIM="$TMP/router-shim"
+mkdir -p "$SHIM/bin"
+cat > "$SHIM/bin/gh" <<'SH'
+#!/usr/bin/env bash
+# Records every call; serves canned reads from $SHIM_STATE.
+printf '%s\n' "$*" >> "$SHIM_STATE/calls.log"
+case "$1 $2" in
+  "api --paginate")
+    case "$3" in
+      repos/octo/demo/issues?state=open*)
+        [ ! -f "$SHIM_STATE/list-fail" ] || { echo "gh: HTTP 500" >&2; exit 1; }
+        cat "$SHIM_STATE/issues.json" ;;
+      repos/octo/demo/labels?per_page=100) cat "$SHIM_STATE/labels.txt" ;;
+      *) echo "gh shim: unhandled: $*" >&2; exit 1 ;;
+    esac ;;
+  "label list")
+    echo "gh shim: the bounded label list must not be used" >&2; exit 1 ;;
+  "label create")
+    [ ! -f "$SHIM_STATE/label-create-fail" ] || { echo "gh: forbidden" >&2; exit 1; }
+    echo "$3" >> "$SHIM_STATE/labels.txt" ;;
+  "issue create")
+    while [ "$#" -gt 0 ]; do [ "$1" = "--body-file" ] && cp "$2" "$SHIM_STATE/created-body.md"; shift; done
+    echo "https://github.com/octo/demo/issues/123" ;;
+  "issue edit")
+    if [ -f "$SHIM_STATE/add-label-fail" ] && printf '%s' "$*" | grep -q -- '--add-label'; then echo "gh: label not found" >&2; exit 1; fi
+    while [ "$#" -gt 0 ]; do [ "$1" = "--body-file" ] && cp "$2" "$SHIM_STATE/edited-body.md"; shift; done ;;
+  "issue comment")
+    [ ! -f "$SHIM_STATE/comment-fail" ] || { echo "gh: HTTP 502" >&2; exit 1; } ;;
+  "issue close") ;;
+  *) echo "gh shim: unhandled: $*" >&2; exit 1 ;;
+esac
+SH
+chmod +x "$SHIM/bin/gh"
+
+# route <state-dir> <rc> [extra args]  — runs the router against a fresh state
+route() {
+  local state="$1" rc="$2"; shift 2
+  : > "$state/calls.log"
+  PATH="$SHIM/bin:$PATH" SHIM_STATE="$state" GH_TOKEN=test-token \
+    bash "$ROUTER" --repo octo/demo --rc "$rc" --run-url "https://example.test/run/1" \
+      --summary "$TMP/slow/summary.json" --summary-md "$TMP/slow/summary.md" "$@"
+}
+calls() { cat "$1/calls.log"; }
+MARKER='<!-- mergepath-repo-lint-latency-audit -->'
+ALERTS="$(jq -r '.alerts | join(",")' "$TMP/slow/summary.json")"
+
+# 1. alert, no tracking issue, labels present → create with both labels, marker + alerts marker in the body
+S1="$SHIM/s1"; mkdir -p "$S1"
+printf '[{"number":5,"body":"unrelated","user":{"login":"github-actions[bot]"}}]' > "$S1/issues.json"
+printf 'audit\narea:ci-infra\nbug\n' > "$S1/labels.txt"
+set +e; out=$(route "$S1" 1 2>&1); rc=$?; set -e
+if [ "$rc" -eq 0 ] && grep -Fq 'issue create --repo octo/demo --title Repo-lint latency audit alert --label area:ci-infra --label audit --body-file ' "$S1/calls.log" \
+   && grep -Fxq "$MARKER" "$S1/created-body.md" \
+   && grep -Fxq "<!-- repo-lint-latency-alerts: ${ALERTS} -->" "$S1/created-body.md" \
+   && [ "$ALERTS" = "ordinary_pr_p50_regression,ordinary_pr_p95_regression,deep_pr_p95_regression" ] \
+   && grep -Fq '| ordinary PR |' "$S1/created-body.md" \
+   && grep -Fq 'https://example.test/run/1' "$S1/created-body.md" \
+   && ! grep -Fq 'label create' "$S1/calls.log" \
+   && printf '%s\n' "$out" | grep -Fxq 'issue=123'; then
+  pass "alert with no tracking issue opens one, labelled, marker-keyed, carrying the report"
+else
+  fail "alert create (rc=$rc): $out $(calls "$S1")"
+fi
+
+# 2. alert, existing marker issue with the same alert set → body refreshed, no comment, no create
+S2="$SHIM/s2"; mkdir -p "$S2"
+jq -n --arg m "$MARKER" --arg a "$ALERTS" '[{number: 90, user: {login: "github-actions[bot]"}, body: ($m + "\n<!-- repo-lint-latency-alerts: " + $a + " -->\nold")},
+                         {number: 77, user: {login: "github-actions[bot]"}, body: ($m + "\n<!-- repo-lint-latency-alerts: " + $a + " -->\nold")},
+                         {number: 60, user: {login: "mallory"}, body: ($m + "\nplanted by a third party; must never be rewritten or closed")},
+                         {number: 70, user: {login: "github-actions[bot]"}, pull_request: {url: "x"}, body: ($m + "\na PR body carrying the marker is not an issue")},
+                         {number: 5, user: {login: "github-actions[bot]"}, body: "Repo-lint latency audit alert (hand-written, no marker)"}]' > "$S2/issues.json"
+printf 'audit\narea:ci-infra\n' > "$S2/labels.txt"
+set +e; out=$(route "$S2" 1 2>&1); rc=$?; set -e
+if [ "$rc" -eq 0 ] && grep -Fq 'issue edit 77 --repo octo/demo --title Repo-lint latency audit alert --body-file' "$S2/calls.log" \
+   && grep -Fxq "$MARKER" "$S2/edited-body.md" \
+   && ! grep -Fq 'issue create' "$S2/calls.log" \
+   && ! grep -Fq 'issue comment' "$S2/calls.log" \
+   && ! grep -Fq 'issue edit 90' "$S2/calls.log" \
+   && ! grep -Fq 'issue edit 60' "$S2/calls.log" \
+   && printf '%s\n' "$out" | grep -Fxq 'issue=77'; then
+  pass "alert with an existing marker issue refreshes the lowest-numbered workflow-authored one in place, ignores a planted marker and a PR, and posts no comment when the alert set is unchanged"
+else
+  fail "alert refresh (rc=$rc): $out $(calls "$S2")"
+fi
+
+# 3. alert, existing issue with a different alert set → refreshed AND commented
+S3="$SHIM/s3"; mkdir -p "$S3"
+jq -n --arg m "$MARKER" '[{number: 77, user: {login: "github-actions[bot]"}, body: ($m + "\n<!-- repo-lint-latency-alerts: deep_pr_p95_regression -->\nold")}]' > "$S3/issues.json"
+printf 'audit\narea:ci-infra\n' > "$S3/labels.txt"
+set +e; out=$(route "$S3" 1 2>&1); rc=$?; set -e
+if [ "$rc" -eq 0 ] && grep -Fq 'issue edit 77 --repo octo/demo --title' "$S3/calls.log" \
+   && grep -Fq 'issue comment 77 --repo octo/demo --body :warning: Alert set changed' "$S3/calls.log" \
+   && grep -Fq '(was: deep_pr_p95_regression)' "$S3/calls.log"; then
+  pass "a changed alert set is commented on the refreshed issue"
+else
+  fail "alert change comment (rc=$rc): $out $(calls "$S3")"
+fi
+
+# 3a. the alert-change comment fails: the body is still refreshed but KEEPS the
+#     previous alert set in its marker (so the next run retries the comment),
+#     the comment is attempted before the body edit, and the step fails.
+S3A="$SHIM/s3a"; mkdir -p "$S3A"
+cp "$S3/issues.json" "$S3A/issues.json"; printf 'audit\narea:ci-infra\n' > "$S3A/labels.txt"; : > "$S3A/comment-fail"
+set +e; out=$(route "$S3A" 1 2>&1); rc=$?; set -e
+first_write=$(grep -n -E 'issue (comment|edit) 77' "$S3A/calls.log" | head -n 1)
+if [ "$rc" -eq 1 ] && printf '%s' "$first_write" | grep -Fq 'issue comment 77' \
+   && grep -Fq 'issue edit 77 --repo octo/demo --title' "$S3A/calls.log" \
+   && grep -Fxq '<!-- repo-lint-latency-alerts: deep_pr_p95_regression -->' "$S3A/edited-body.md" \
+   && printf '%s' "$out" | grep -Fq '::error::The alert-set change on #77 could not be commented; the next run retries it.'; then
+  pass "a failed alert-change comment keeps the previous alert set in the marker for a retry and fails the step"
+else
+  fail "comment failure (rc=$rc): $out $(calls "$S3A")"
+fi
+
+# 3b. labels that cannot be re-applied to the existing tracker degrade the step to exit 1 after the refresh
+S3B="$SHIM/s3b"; mkdir -p "$S3B"
+cp "$S3/issues.json" "$S3B/issues.json"; printf 'audit\narea:ci-infra\n' > "$S3B/labels.txt"; : > "$S3B/add-label-fail"
+set +e; out=$(route "$S3B" 1 2>&1); rc=$?; set -e
+if [ "$rc" -eq 1 ] && grep -Fq 'issue edit 77 --repo octo/demo --title' "$S3B/calls.log" \
+   && printf '%s' "$out" | grep -Fq '::error::A tracking label could not be ensured'; then
+  pass "a failed label re-apply on the existing tracker still refreshes it and then fails the step"
+else
+  fail "add-label failure (rc=$rc): $out $(calls "$S3B")"
+fi
+
+# 3c. a tracking label beyond any fixed page bound (600 labels) is still found
+#     through the paginated read: no create attempt, the issue is labelled, exit 0.
+S3C="$SHIM/s3c"; mkdir -p "$S3C"
+printf '[]' > "$S3C/issues.json"
+{ for i in $(seq 1 598); do echo "filler-$i"; done; echo "area:ci-infra"; echo "audit"; } > "$S3C/labels.txt"
+set +e; out=$(route "$S3C" 1 2>&1); rc=$?; set -e
+if [ "$rc" -eq 0 ] && ! grep -Fq 'label create' "$S3C/calls.log" && ! grep -Fq 'label list' "$S3C/calls.log" \
+   && grep -Fq 'api --paginate repos/octo/demo/labels?per_page=100' "$S3C/calls.log" \
+   && grep -Fq -- '--label area:ci-infra --label audit --body-file' "$S3C/calls.log"; then
+  pass "labels are read with --paginate, so a label past the first 500 is found and not re-created"
+else
+  fail "paginated label lookup (rc=$rc): $out $(calls "$S3C" | head -5)"
+fi
+
+# 4. recovery with an open tracking issue → closed with a recovery comment; nothing created
+S4="$SHIM/s4"; mkdir -p "$S4"
+jq -n --arg m "$MARKER" '[{number: 77, user: {login: "github-actions[bot]"}, body: ($m + "\nold")}, {number: 60, user: {login: "mallory"}, body: ($m + "\nplanted")}, {number: 5, user: {login: "github-actions[bot]"}, body: "unrelated"}]' > "$S4/issues.json"
+printf 'audit\narea:ci-infra\n' > "$S4/labels.txt"
+set +e; out=$(route "$S4" 0 2>&1); rc=$?; set -e
+if [ "$rc" -eq 0 ] && grep -Fq 'issue close 77 --repo octo/demo --comment :white_check_mark: Repo-lint latency audit recovered' "$S4/calls.log" \
+   && ! grep -Fq 'issue close 5' "$S4/calls.log" \
+   && ! grep -Fq 'issue close 60' "$S4/calls.log" \
+   && ! grep -Fq 'issue create' "$S4/calls.log"; then
+  pass "a clean verdict comments on and closes the workflow-authored tracking issue only"
+else
+  fail "recovery close (rc=$rc): $out $(calls "$S4")"
+fi
+
+# 5. recovery with nothing open, and a no-verdict rc → no writes at all
+S5="$SHIM/s5"; mkdir -p "$S5"
+printf '[]' > "$S5/issues.json"; printf 'audit\n' > "$S5/labels.txt"
+set +e
+route "$S5" 0 >/dev/null 2>&1; rc_clean=$?
+writes_clean=$(grep -c -E 'issue (create|edit|comment|close)|label create' "$S5/calls.log" || true)
+route "$S5" 3 >/dev/null 2>&1; rc_none=$?
+reads_none=$(grep -c . "$S5/calls.log" || true)
+set -e
+if [ "$rc_clean" -eq 0 ] && [ "$writes_clean" -eq 0 ] && [ "$rc_none" -eq 0 ] && [ "$reads_none" -eq 0 ]; then
+  pass "a clean verdict with no open issue and a no-verdict exit write nothing (and the latter reads nothing)"
+else
+  fail "no-op paths (clean=$rc_clean writes=$writes_clean none=$rc_none reads=$reads_none)"
+fi
+
+# 6. an unreadable dedupe read fails closed: no issue is created on top of one that may exist
+S6="$SHIM/s6"; mkdir -p "$S6"
+printf '[]' > "$S6/issues.json"; printf 'audit\narea:ci-infra\n' > "$S6/labels.txt"; : > "$S6/list-fail"
+set +e; out=$(route "$S6" 1 2>&1); rc=$?; set -e
+if [ "$rc" -eq 1 ] && ! grep -Fq 'issue create' "$S6/calls.log" && printf '%s' "$out" | grep -Fq '::error::Could not list open issues' \
+   && grep -Fq 'api --paginate repos/octo/demo/issues?state=open&per_page=100' "$S6/calls.log"; then
+  pass "the dedupe read is paginated, and when it fails the step exits 1 without opening a duplicate"
+else
+  fail "list failure (rc=$rc): $out $(calls "$S6")"
+fi
+
+# 7. a missing label is created; one that cannot be created degrades the filter, not the issue, and fails the step
+S7="$SHIM/s7"; mkdir -p "$S7"
+printf '[]' > "$S7/issues.json"; printf 'bug\n' > "$S7/labels.txt"
+set +e; out=$(route "$S7" 1 2>&1); rc=$?; set -e
+S8="$SHIM/s8"; mkdir -p "$S8"
+printf '[]' > "$S8/issues.json"; printf 'audit\n' > "$S8/labels.txt"; : > "$S8/label-create-fail"
+set +e; out8=$(route "$S8" 1 2>&1); rc8=$?; set -e
+if [ "$rc" -eq 0 ] && grep -Fq 'label create area:ci-infra --repo octo/demo' "$S7/calls.log" && grep -Fq 'label create audit --repo octo/demo' "$S7/calls.log" \
+   && grep -Fq -- '--label area:ci-infra --label audit --body-file' "$S7/calls.log" \
+   && [ "$rc8" -eq 1 ] && grep -Fq 'issue create --repo octo/demo --title Repo-lint latency audit alert --label audit --body-file' "$S8/calls.log" \
+   && printf '%s' "$out8" | grep -Fq '::error::A tracking label could not be ensured'; then
+  pass "missing labels are created; an unensurable label still files the issue and then fails the step"
+else
+  fail "label handling (rc=$rc rc8=$rc8): $(calls "$S7") --- $(calls "$S8") $out8"
+fi
+
 echo "test_repo_lint_latency_report: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

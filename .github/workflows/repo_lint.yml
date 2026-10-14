@@ -662,6 +662,13 @@ jobs:
         if: matrix.shard == 4
         run: ./scripts/ci/check_repo_lint_latency_report || { rc=$?; if [ ! -f scripts/ci/check_repo_lint_latency_report ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_repo_lint_latency_report not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
+      # Hermetic suite for the stalled-PR finder + resume entry point
+      # (scripts/workflow/stalled-prs.sh, resume-stalled-pr.sh; #2165).
+      # Both travel with the scripts/workflow/ kit, so the suite runs on
+      # every consumer too; it is fixture-driven with a PATH-shimmed gh.
+      - name: check_stalled_pr_resume
+        run: ./scripts/ci/check_stalled_pr_resume || { rc=$?; if [ ! -f scripts/ci/check_stalled_pr_resume ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_stalled_pr_resume not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
       - name: check_resolve_pr_threads
         if: matrix.shard == 3
         # Requires yq via the delegated verified-propagation suite —
