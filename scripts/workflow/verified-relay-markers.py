@@ -12,6 +12,12 @@ import time
 
 PATH = '.github/workflows/codex-feedback-archive-relay.yml'
 STEP = 'Persist archive and publish the exact-head gate'
+# gh >= 2.102.0 refuses to print an API response that contains terminal
+# escape sequences unless this flag is passed, exiting 1 instead. Job logs
+# always carry ANSI colour codes, so without it every relay log read fails
+# (#2159). The log is captured here and parsed with escapes stripped, never
+# written to a terminal, so allowing them is safe. Older gh lacks the flag.
+ESCAPE_FLAG = '--allow-escape-sequences'
 MARKER = re.compile(r'^<!-- mergepath-feedback-archive-relay:v(?P<version>[12]) run=(?P<source>[1-9][0-9]*)(?: publisher=(?P<publisher>[1-9][0-9]*))? status=(?P<status>complete|failed) -->$')
 
 
@@ -24,10 +30,13 @@ def log_binds_persist(log, source, pr):
     clean = re.sub(r'\x1b\[[0-9;]*m', '', log)
     clean = re.sub(r'(?m)^\d{4}-\d\d-\d\dT\S+ ', '', clean)
     for block in re.findall(r'(?ms)^##\[group\]Run .*?^##\[endgroup\]', clean):
-        env = block.rsplit('\n  env:\n', 1)
-        if len(env) != 2:
+        # The runner writes `env:` at column 0 with keys two spaces deeper
+        # (`shell:` / `env:` / `  KEY: value`); accept that and the nested
+        # form, but only the step's own trailing env block, one level deep.
+        envs = list(re.finditer(r'(?m)^( {0,2})env:\n((?:\1  [A-Z_]+: [^\n]*\n)+)##\[endgroup\]', block))
+        if not envs:
             continue
-        values = dict(re.findall(r'(?m)^    ([A-Z_]+): ([^\n]*)$', env[1]))
+        values = dict(re.findall(r'(?m)^ +([A-Z_]+): ([^\n]*)$', envs[-1].group(2)))
         if (values.get('SOURCE_RUN_ID') == str(source) and values.get('PR_NUMBER') == str(pr)
                 and values.get('HANDOFF_FILE', '').endswith('/codex-p1-read-only-handoff.json')):
             return True
@@ -44,6 +53,16 @@ class Evidence:
         self.cache = {}
         self.read_cache = {}
         self.workflow = None
+        self._escape_flag = None
+
+    def escape_flag(self):
+        if self._escape_flag is None:
+            try:
+                usage = subprocess.run([self.gh, 'api', '--help'], capture_output=True, text=True, timeout=10)
+                self._escape_flag = ESCAPE_FLAG in usage.stdout + usage.stderr
+            except (OSError, subprocess.TimeoutExpired):
+                self._escape_flag = False
+        return self._escape_flag
 
     def api(self, endpoint, *, pages=False, text=False):
         key = endpoint, pages, text
@@ -52,13 +71,18 @@ class Evidence:
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise ReadBudgetExhausted('relay provenance read budget exhausted')
-        argv = [self.gh, 'api'] + (['--paginate', '--slurp'] if pages else []) + [f'repos/{self.repo}' + ('/' + endpoint if endpoint else '')]
+        argv = ([self.gh, 'api'] + (['--paginate', '--slurp'] if pages else [])
+                + ([ESCAPE_FLAG] if text and self.escape_flag() else [])
+                + [f'repos/{self.repo}' + ('/' + endpoint if endpoint else '')])
         result = subprocess.run(argv, capture_output=True, text=True, timeout=min(remaining, 20))
         if result.returncode:
             if 'HTTP 404' in result.stderr or 'HTTP 410' in result.stderr:
                 self.read_cache[key] = None
                 return None
-            raise ValueError(f'could not read relay provenance endpoint {endpoint}')
+            # Name the refusal: an opaque failure here hid #2159 for days.
+            detail = ''.join(ch if ch.isprintable() else '?' for ch in ' '.join(result.stderr.split()))[:200]
+            raise ValueError(f'could not read relay provenance endpoint {endpoint} '
+                             f'(gh exit {result.returncode}: {detail or "no stderr"})')
         value = result.stdout if text else json.loads(result.stdout)
         self.read_cache[key] = value
         return value
