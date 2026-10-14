@@ -499,6 +499,25 @@ pkg "$r/packages/docs" "" "@firebase/rules-unit-testing"; pkg "$r/packages/app" 
 write_config "$r" "$TYPE_GROUPS"
 expect "a later pattern re-includes what an earlier !(docs) ignored (per-pattern scope)" 1 "$r" "firebase-sdk"
 
+# Workspace globs use Ruby File.fnmatch(FNM_PATHNAME), as dependabot-core does.
+r="$(new_repo ws-dot-slash)"
+printf '{"name":"root","private":true,"workspaces":["./packages/*"]}\n' > "$r/package.json"
+pkg "$r/packages/app" "$FB_PROD" "$FB_DEV"
+write_config "$r" "$TYPE_GROUPS"
+expect "a leading ./ in a workspace glob is normalised away" 1 "$r" "firebase-sdk"
+
+r="$(new_repo ws-hidden)"
+printf '{"name":"root","private":true,"workspaces":["packages/*"],"dependencies":{"firebase":"^13.0.0"}}\n' > "$r/package.json"
+pkg "$r/packages/.fixture" "" "@firebase/rules-unit-testing"; pkg "$r/packages/app" "react" ""
+write_config "$r" "$TYPE_GROUPS"
+expect "packages/* does not match a hidden packages/.fixture (no FNM_DOTMATCH)" 0 "$r" "PASS"
+
+r="$(new_repo ws-char-class)"
+printf '{"name":"root","private":true,"workspaces":["packages/[af]*"]}\n' > "$r/package.json"
+pkg "$r/packages/app" "$FB_PROD" "$FB_DEV"
+write_config "$r" "$TYPE_GROUPS"
+expect "a [set] character class in a workspace glob is honoured" 1 "$r" "firebase-sdk"
+
 r="$(new_repo pnpm-ancestor-catalog)"
 printf '{"name":"root","private":true}\n' > "$r/package.json"
 printf 'catalog:\n  firebase: ^13.0.0\n' > "$r/pnpm-workspace.yaml"

@@ -307,6 +307,58 @@ def glob_dirs(tree: Tree, base: str, pattern: str) -> List[str]:
     return hits
 
 
+def fnmatch_glob(pattern: str) -> "re.Pattern[str]":
+    """Ruby ``File.fnmatch(pattern, path, File::FNM_PATHNAME)``, as
+    dependabot-core matches workspace paths: ``*``, ``?`` and ``[set]`` stay
+    within one segment and never match a leading ``.`` (no FNM_DOTMATCH), and
+    ``**/`` spans zero or more non-hidden directories.
+    """
+    out: List[str] = []
+    i, seg_start = 0, True
+    while i < len(pattern):
+        c = pattern[i]
+        if seg_start and pattern.startswith("**/", i):
+            out.append(r"(?:[^/.][^/]*/)*"); i += 3; continue
+        if c == "*":
+            while i < len(pattern) and pattern[i] == "*":
+                i += 1
+            out.append(r"(?!\.)[^/]*" if seg_start else r"[^/]*"); seg_start = False; continue
+        if c == "?":
+            out.append(r"[^/.]" if seg_start else r"[^/]"); i += 1; seg_start = False; continue
+        if c == "[":
+            start = i + 2 if pattern[i + 1:i + 2] in ("!", "^") else i + 1
+            j = pattern.find("]", start + 1 if pattern[start:start + 1] == "]" else start)
+            if j != -1:
+                body = pattern[i + 1:j]
+                negate = body[:1] in ("!", "^")
+                body = (body[1:] if negate else body).replace("\\", "\\\\")
+                lead = r"(?!\.)" if seg_start else ""
+                out.append(lead + ("[^/" + body + "]" if negate else "(?!/)[" + body + "]"))
+                i, seg_start = j + 1, False
+                continue
+        if c == "\\" and i + 1 < len(pattern):
+            out.append(re.escape(pattern[i + 1])); i += 2; seg_start = False; continue
+        out.append(re.escape(c)); seg_start = c == "/"; i += 1
+    return re.compile("".join(out))
+
+
+def workspace_pattern(pattern: str) -> str:
+    """dependabot-core's normalisation before matching: drop a leading ``./``,
+    and a trailing ``**`` means ``**/*`` (``matching_paths``)."""
+    pat = re.sub(r"^\./", "", pattern).strip("/")
+    return pat + "/*" if pat.endswith("**") else pat
+
+
+def workspace_glob_dirs(tree: Tree, base: str, pattern: str) -> List[str]:
+    """Workspace directories under ``base`` matching ``pattern`` with fnmatch semantics."""
+    pat = workspace_pattern(pattern)
+    if not any(ch in pat for ch in "*?["):
+        target = join(base, pat)
+        return [target] if target in tree.dirs() else []
+    rx = fnmatch_glob(f"{base}/{pat}" if base else pat)
+    return [d for d in tree.dirs() if d != base and rx.fullmatch(d)]
+
+
 def excluded(entry: dict, rel_to_entry: str) -> bool:
     """Dependabot ``exclude-paths`` (globs relative to the entry directory)."""
     for pattern in entry.get("exclude-paths") or []:
@@ -376,8 +428,8 @@ def workspace_dirs(tree: Tree, rel: str, patterns: List[str], entry: dict) -> Li
         positive, negated = expand_pattern(pattern)
         # Each pattern's own !(x) ignore filters only that pattern's matches,
         # as dependabot-core's flat_map does; a later pattern can re-include.
-        ignore = [path_glob(join(rel, n) if rel else n.strip("/")) for n in negated]
-        for hit in glob_dirs(tree, rel, positive):
+        ignore = [fnmatch_glob(f"{rel}/{workspace_pattern(n)}" if rel else workspace_pattern(n)) for n in negated]
+        for hit in workspace_glob_dirs(tree, rel, positive):
             if hit != rel and hit not in include and not any(rx.fullmatch(hit) for rx in ignore):
                 include.append(hit)
     out = []
