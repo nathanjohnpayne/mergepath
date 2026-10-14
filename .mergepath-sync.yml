@@ -2041,6 +2041,9 @@ paths:
       - "scripts/lib/blocking-labels.sh"
       - "scripts/workflow/approval-merge-continuation.sh"
       - "scripts/workflow/report-approval-continuation-failures.sh"
+      # Both jobs' final step supersedes a stale failed
+      # auto-clear-blocking-labels check-run after a clean pass (#2193).
+      - "scripts/workflow/heal-auto-clear-infra-check.sh"
       # Both label-clearing loops run the Dependabot action-pin bump lane
       # helper from the default-branch checkout before the merge-gate
       # evaluation (#2164), after resolving the governing base policy with
@@ -2128,6 +2131,11 @@ paths:
       - "scripts/lib/reviewers-helpers.sh"
       - "scripts/lib/credential-class.sh"    # identity-check.sh --expect-write-identity (#1057)
   - path: scripts/workflow/report-approval-continuation-failures.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/gh-retry-helpers.sh"
+  - path: scripts/workflow/heal-auto-clear-infra-check.sh
     type: canonical
     consumers: all
     requires:
