@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# scripts/ci/check_dependabot_coupled_groups
+#
+# Fails when .github/dependabot.yml would split a peer-coupled npm family
+# across Dependabot groups (#2162). Dependabot assigns each update to the
+# FIRST group that matches it, and the fleet groups npm updates by
+# dependency type, so `firebase` (production) and
+# `@firebase/rules-unit-testing` (dev) opened their coupled majors as two
+# PRs on 2026-10-13. Each bumped one half of the pair and failed `npm ci`
+# with ERESOLVE, in five repositories at once.
+#
+# The family list is data: scripts/ci/dependabot-coupled-families.json. The
+# logic is scripts/ci/dependabot_coupled_groups.py, which simulates
+# Dependabot's first-match assignment per npm entry, per directory and per
+# update type, against the members that directory's package.json actually
+# declares. A family a repository does not use is a no-op, so the check is
+# safe in every consumer.
+#
+# Modes (scripts/lib/ci-check-modes.sh):
+#   --check      live assertion against this checkout (fast lane)
+#   --self-test  live assertion + tests/test_dependabot_coupled_groups.sh
+#   (none)       both; under MERGEPATH_CONSUMER_SAFETY=1, --check only
+#   --fix        insert the missing family groups into
+#                .github/dependabot.yml, then re-check (local use)
+#
+# Exit codes: 0 pass / not applicable, 1 violation, 2 usage or
+# environment error.
+#
+# Synced to consumer repos via the `scripts/ci/` kit entry in
+# .mergepath-sync.yml.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+NAME="check_dependabot_coupled_groups"
+CHECKER="$REPO_ROOT/scripts/ci/dependabot_coupled_groups.py"
+TEST="$REPO_ROOT/tests/test_dependabot_coupled_groups.sh"
+MODE_HELPER="$REPO_ROOT/scripts/lib/ci-check-modes.sh"
+
+if [ "${1:-}" = "--fix" ]; then
+  [ "$#" -eq 1 ] || { echo "usage: $NAME [--check | --self-test | --fix]" >&2; exit 2; }
+  exec python3 "$CHECKER" --root "$REPO_ROOT" --fix
+fi
+
+[ -r "$MODE_HELPER" ] || {
+  echo "$NAME: missing $MODE_HELPER" >&2
+  exit 1
+}
+# shellcheck source=../lib/ci-check-modes.sh
+. "$MODE_HELPER"
+if ! ci_check_select_mode "$@"; then
+  echo "usage: $NAME [--check | --self-test | --fix]" >&2
+  exit 2
+fi
+
+for f in "$CHECKER" "$REPO_ROOT/scripts/ci/dependabot-coupled-families.json"; do
+  if [ ! -f "$f" ]; then
+    echo "$NAME: ERROR (missing ${f#"$REPO_ROOT"/})" >&2
+    exit 1
+  fi
+done
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "$NAME: ERROR (python3 is not on PATH)" >&2
+  exit 2
+fi
+
+FAILED=0
+python3 "$CHECKER" --root "$REPO_ROOT" --check || FAILED=$?
+
+if [ "$CI_CHECK_RUN_SELF_TEST" = "1" ]; then
+  # The suite travels to every consumer with this wrapper (manifest entry +
+  # scripts/ci/ kit requires:), so a missing file is a deletion, not skew.
+  if [ ! -f "$TEST" ]; then
+    echo "$NAME: ERROR (missing tests/test_dependabot_coupled_groups.sh)" >&2
+    exit 1
+  fi
+  echo "$NAME: running tests/test_dependabot_coupled_groups.sh"
+  if ! bash "$TEST"; then
+    echo "$NAME: FAIL (tests/test_dependabot_coupled_groups.sh)" >&2
+    [ "$FAILED" -ne 0 ] || FAILED=1
+  fi
+fi
+
+exit "$FAILED"

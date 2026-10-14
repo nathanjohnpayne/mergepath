@@ -33,6 +33,7 @@
     "check_auto_clear_workflow",
     "check_cockpit",
     "check_coderabbit_wait",
+    "check_dependabot_coupled_groups",
     "check_doc_ownership",
     "check_gh_projects_move_item",
     "check_merge_clearance_gate",
@@ -177,6 +178,13 @@
     ],
     "check_daily_feedback_rollup": [
       "tests/test_daily_feedback_rollup.sh"
+    ],
+    "check_dependabot_coupled_groups": [
+      ".github/dependabot.yml",
+      "scripts/ci/dependabot_coupled_groups.py",
+      "scripts/ci/dependabot-coupled-families.json",
+      "scripts/lib/ci-check-modes.sh",
+      "tests/test_dependabot_coupled_groups.sh"
     ],
     "check_disagreement_detector": [
       "tests/test_disagreement_detector.sh",
