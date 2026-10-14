@@ -65,9 +65,13 @@
 #   MERGEPATH_PREPUSH_LIVE=all  run the unselected graph wrappers too
 #   MERGEPATH_PREPUSH_JOBS=N    concurrency cap, default 2
 #   MERGEPATH_PREPUSH_NICE=N    nice level for every check, default 10
-#   MERGEPATH_PREPUSH_PYTHON=P  interpreter to expose as python3 (needs PyYAML)
+#   MERGEPATH_PREPUSH_PYTHON=P  interpreter to expose as python3 (needs PyYAML,
+#                               and markdown-it-py for the deep lane)
 #   MERGEPATH_PREPUSH_KEEP_LOGS=1  keep the per-check logs of a passing run
-# Exit: 0 pass or skipped, 1 a selected check failed, 2 usage or environment.
+# The checks run on the checkout, so a hook run refuses a push whose tip is
+# not HEAD or a checkout with uncommitted changes to tracked files.
+# Exit: 0 pass or skipped, 1 a selected check failed or the checkout is not
+# the pushed commit, 2 usage or environment (including missing CI packages).
 
 set -euo pipefail
 
@@ -208,11 +212,14 @@ case "$MODE" in
     default_ref=$(remote_default_ref "$remote") || default_ref=''
     default_branch="${default_ref#*/}"
     saw=0
+    PUSHED=''
     while read -r local_ref local_sha remote_ref _remote_sha; do
       [ -n "${local_ref:-}" ] || continue
       [ "$local_sha" != "$ZERO" ] || continue      # deletion: nothing to lint
       case "$remote_ref" in refs/heads/*) ;; *) continue ;; esac   # tags, notes
       saw=1
+      PUSHED="${PUSHED}${local_sha} ${remote_ref}
+"
       branch="${remote_ref#refs/heads/}"
       if [ -n "$default_branch" ] && [ "$branch" = "$default_branch" ]; then
         [ -n "$EVENT" ] || EVENT=push            # CI's main-push run
@@ -230,6 +237,27 @@ case "$MODE" in
     if [ "$saw" -eq 0 ]; then
       echo "$PREFIX: no branch updates in this push; nothing to lint"
       exit 0
+    fi
+    # The checks run on this checkout, so it must hold exactly the bytes
+    # being pushed; otherwise a pass or a failure would be about something
+    # else. A plan runs nothing, so it is exempt.
+    if [ "$PLAN" -eq 0 ]; then
+      head_sha=$(git rev-parse HEAD)
+      while read -r sha ref; do
+        [ -n "$sha" ] || continue
+        if [ "$sha" != "$head_sha" ]; then
+          echo "$PREFIX: this push updates ${ref#refs/heads/} to ${sha:0:12}, but the checkout is at ${head_sha:0:12}; the checks run on the checkout and would not test what is pushed." >&2
+          echo "$PREFIX: check out the branch being pushed and push from there (one branch per push), or bypass with --no-verify / MERGEPATH_PREPUSH_SKIP=1 (CI lint still gates the merge)." >&2
+          exit 1
+        fi
+      done <<<"$PUSHED"
+      if ! git diff --quiet HEAD -- 2>/dev/null; then
+        echo "$PREFIX: the checkout has uncommitted changes to tracked files, so the checks would not test the pushed commit; commit or stash them first (or bypass with --no-verify / MERGEPATH_PREPUSH_SKIP=1)." >&2
+        exit 1
+      fi
+      if [ -n "$(git ls-files --others --exclude-standard | head -n 1)" ]; then
+        echo "$PREFIX: note: untracked files are present; checks that read the working tree may see them, CI will not"
+      fi
     fi
     ;;
   range)
@@ -335,18 +363,33 @@ fi
 
 echo "$PREFIX: scope deep=$S_DEEP full=$S_FULL consumer_replay=$S_REPLAY self_tests=$S_SELF checks=$S_CHECKS"
 
-# python3 with PyYAML, as CI provisions it. Prefer the PATH one; otherwise
-# expose the first interpreter that imports yaml as python3 for the checks.
+# The Python packages CI provisions (PyYAML, markdown-it-py). Several checks
+# skip assertions, and exit 0, when a module is missing, so running without
+# them would report a pass CI does not give: that is an environment error.
+# The live and selected lanes need PyYAML; markdown-it-py is read only by
+# deep-lane suites, so it is required when the deep lane runs. The first
+# interpreter that has what this run needs is exposed as python3.
+PY_PKGS='import yaml'
+[ "$DEEP" -eq 1 ] && PY_PKGS='import yaml, markdown_it'
 PY_SHIM=''
-if ! python3 -c 'import yaml' >/dev/null 2>&1; then
-  for cand in "${MERGEPATH_PREPUSH_PYTHON:-}" python3.13 python3.12 python3.11 /usr/bin/python3; do
-    [ -n "$cand" ] || continue
-    if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'import yaml' >/dev/null 2>&1; then
-      PY_SHIM=$(command -v "$cand")
-      break
-    fi
-  done
-  [ -n "$PY_SHIM" ] || echo "$PREFIX: WARN no python3 with PyYAML found; checks that need it will fail as they would on a runner without the CI venv (set MERGEPATH_PREPUSH_PYTHON)" >&2
+PY_OK=0
+# An explicit MERGEPATH_PREPUSH_PYTHON is the only candidate when set.
+if [ -n "${MERGEPATH_PREPUSH_PYTHON:-}" ]; then
+  PY_CANDIDATES="$MERGEPATH_PREPUSH_PYTHON"
+else
+  PY_CANDIDATES='python3 python3.14 python3.13 python3.12 python3.11 /usr/bin/python3'
+fi
+for cand in $PY_CANDIDATES; do
+  if command -v "$cand" >/dev/null 2>&1 && "$cand" -c "$PY_PKGS" >/dev/null 2>&1; then
+    PY_SHIM=$(command -v "$cand")
+    PY_OK=1
+    break
+  fi
+done
+if [ "$PY_OK" -ne 1 ]; then
+  echo "$PREFIX: no python3 with the CI packages ($PY_PKGS) was found; without them several checks skip assertions and pass, so the run would not mean what CI means." >&2
+  echo "$PREFIX: install CI's pinned versions for some python3 (for example python3 -m pip install --user 'PyYAML==6.0.3' 'markdown-it-py==4.2.0') and point MERGEPATH_PREPUSH_PYTHON at it, or bypass with --no-verify / MERGEPATH_PREPUSH_SKIP=1." >&2
+  exit 2
 fi
 
 RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/repo-lint-prepush.XXXXXX")

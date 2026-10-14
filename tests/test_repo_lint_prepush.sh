@@ -478,6 +478,13 @@ rc=0; (cd "$FIX" && bash scripts/install-git-hooks.sh --check >/dev/null) || rc=
 check "installer --uninstall removes it" "$rc" "1"
 (cd "$FIX" && bash scripts/install-git-hooks.sh >/dev/null)
 
+# The fixture checks need no Python; a stub stands in for an interpreter
+# with CI's packages, and a failing one for an interpreter without them.
+printf '#!/bin/sh\nexit 0\n' > "$TMP/python-ok"
+printf '#!/bin/sh\nexit 1\n' > "$TMP/python-bad"
+chmod +x "$TMP/python-ok" "$TMP/python-bad"
+export MERGEPATH_PREPUSH_PYTHON="$TMP/python-ok"
+
 export PROBE_DIR="$TMP/probe"
 reset_probe() { rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"; }
 remote_tip() { git -C "$FIXREMOTE" rev-parse -q --verify "refs/heads/$1" 2>/dev/null || echo none; }
@@ -530,6 +537,30 @@ rc=0; out=$(cd "$FIX" && git push origin feat/fail 2>&1) || rc=$?
 check "failing check: remote not updated" "$(remote_tip feat/fail)" "none"
 case "$out" in *"FAIL  check_flag"*) ok "failing check is named" ;; *) bad "failing check not named: $out" ;; esac
 case "$out" in *"--no-verify"*"MERGEPATH_PREPUSH_SKIP=1"*) ok "bypass is documented in the failure" ;; *) bad "bypass hint missing" ;; esac
+
+# The checkout must be the pushed commit: a dirty tracked file, or a push
+# of a branch other than HEAD, is refused rather than tested.
+reset_probe
+rm -f "$PROBE_DIR/FLAG"
+git -C "$FIX" checkout -q feat/pass
+printf 'dirty\n' >> "$FIX/README.md"
+rc=0; out=$(cd "$FIX" && git push origin feat/pass:refs/heads/feat/dirty 2>&1) || rc=$?
+check "dirty tracked file: push refused" "$rc" "1"
+case "$out" in *"uncommitted changes"*) ok "dirty refusal says why" ;; *) bad "dirty refusal output: $out" ;; esac
+check "dirty tracked file: remote not updated" "$(remote_tip feat/dirty)" "none"
+git -C "$FIX" checkout -q -- README.md
+git -C "$FIX" checkout -q main
+rc=0; out=$(cd "$FIX" && git push origin feat/pass:refs/heads/feat/other 2>&1) || rc=$?
+check "push of a non-HEAD tip: refused" "$rc" "1"
+case "$out" in *"the checkout is at"*) ok "non-HEAD refusal says why" ;; *) bad "non-HEAD refusal output: $out" ;; esac
+[ ! -f "$PROBE_DIR/ran.check_ok" ] && ok "refused pushes run no checks" || bad "a refused push ran checks"
+git -C "$FIX" checkout -q feat/fail
+touch "$PROBE_DIR/FLAG"
+
+# Missing CI Python packages are an environment error, not a pass.
+rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_PYTHON="$TMP/python-bad" git push origin feat/fail:refs/heads/feat/nopy 2>&1) || rc=$?
+check "missing CI Python packages: push refused" "$rc" "1"
+case "$out" in *"no python3 with the CI packages"*) ok "missing packages are named" ;; *) bad "missing packages output: $out" ;; esac
 
 # Both bypasses.
 rc=0; out=$(cd "$FIX" && MERGEPATH_PREPUSH_SKIP=1 git push origin feat/fail 2>&1) || rc=$?
