@@ -142,7 +142,8 @@
       "scripts/lib/ci-check-modes.sh",
       "scripts/coderabbit-wait.sh",
       "tests/test_coderabbit_wait_*.sh",
-      "tests/test_coderabbit_automerge_rate_limit_gate.sh"
+      "tests/test_coderabbit_automerge_rate_limit_gate.sh",
+      "tests/test_coderabbit_should_invoke.sh"
     ],
     "check_codex_p1_gate": [
       "tests/test_codex_p1_gate.sh",
