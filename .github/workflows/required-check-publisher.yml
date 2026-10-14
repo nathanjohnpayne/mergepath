@@ -738,7 +738,7 @@ jobs:
           # On exit 1, DUE_REASON says why not: `current`, or `backoff <time>`.
           DUE_REASON=""
           due() {
-            local hd="$1" updated="$2" rows ctx newest d_status d_concl d_done d_title retry backoff=""
+            local hd="$1" updated="$2" rows ctx newest d_status d_concl d_done d_title retry backoff="" read_rc=0
             DUE_REASON=""
             DUE_PAGES=0
             case "$updated" in ''|null) return 0 ;; esac
@@ -747,12 +747,18 @@ jobs:
             # more than 100 check runs costs one per page (Codex P2 on
             # #2225), and the caller charges every one to the budget.
             DUE_PAGES=1
-            if ! rows=$(gh api --paginate -X GET "repos/$REPO/commits/$hd/check-runs" \
+            rows=$(gh api --paginate -X GET "repos/$REPO/commits/$hd/check-runs" \
                 -f filter=all -f per_page=100 \
-                --jq '"__page__", (.check_runs[] | select(((.details_url // "") | test("/actions/runs/")) | not) | [.name, (.id | tostring), .status, (.conclusion // "-"), (.completed_at // "-"), (.output.title // "-")] | @tsv)'); then
+                --jq '"__page__", (.check_runs[] | select(((.details_url // "") | test("/actions/runs/")) | not) | [.name, (.id | tostring), .status, (.conclusion // "-"), (.completed_at // "-"), (.output.title // "-")] | @tsv)') \
+              || read_rc=$?
+            DUE_PAGES=$(grep -c '^__page__$' <<<"$rows" || true)
+            if [ "$read_rc" -ne 0 ]; then
+              # A read that fails partway (page 1 fetched, page 2 a 5xx or
+              # a rate limit) has still spent every page it printed, plus
+              # the request that failed (#2229). The PR stays due.
+              DUE_PAGES=$(( ${DUE_PAGES:-0} + 1 ))
               return 0
             fi
-            DUE_PAGES=$(grep -c '^__page__$' <<<"$rows" || true)
             [ "${DUE_PAGES:-0}" -ge 1 ] || DUE_PAGES=1
             rows=$(grep -v '^__page__$' <<<"$rows" || true)
             for ctx in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
@@ -1032,9 +1038,14 @@ jobs:
             # (Codex P1 on #2225): an all-or-nothing rule could never run a
             # full pass once 40 x open PRs + 100 exceeds the whole bucket
             # (23 PRs), leaving the scheduled backstop dead indefinitely.
-            # The offset advances by the batch size every sweep interval,
-            # so at a steady budget every PR is evaluated within
-            # ceil(PRs / batch) ticks.
+            # The batch starts at tick % n_others, an offset that advances by
+            # ONE every sweep interval whatever the capacity, so every
+            # position is a batch start once per n_others ticks and each of
+            # a stable set of PRs is evaluated within n_others ticks under
+            # any positive capacity (#2229). Scaling the offset by the batch
+            # size covered PRs faster at a steady capacity but let a
+            # capacity that changed between ticks jump over the same
+            # position indefinitely.
             kept=""
             others=""
             n_claimed_kept=0
@@ -1052,7 +1063,7 @@ jobs:
             if [ "$slots" -gt 0 ] && [ "$n_others" -gt 0 ]; then
               tick=$(jq -nr --arg t "$PASS_START" --argjson i "${DUE_MAX_AGE_SECONDS:-1800}" \
                        '($t | fromdateiso8601) / $i | floor' 2>/dev/null || echo 0)
-              batch=$(awk -v off=$(( (tick * slots) % n_others )) -v take="$slots" \
+              batch=$(awk -v off=$(( tick % n_others )) -v take="$slots" \
                         'NF { a[n++] = $0 } END { for (i = 0; i < take && i < n; i++) print a[(off + i) % n] }' <<<"$others")
             fi
             while IFS=$'\t' read -r PR head_sha; do

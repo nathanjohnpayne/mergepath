@@ -32,8 +32,9 @@
 #      head and some due PRs evaluates the head plus a batch of that size; a
 #      schedule-parent pass or dispatch with no capacity evaluates nothing new
 #      (the dispatch opens no holds), and with some capacity evaluates a
-#      ROTATING batch that covers every PR within ceil(PRs / batch) ticks; an
-#      unreadable /rate_limit evaluates as before.
+#      ROTATING batch whose start advances by one per tick, so it covers every
+#      PR within n ticks even when the capacity changes between ticks (#2229);
+#      an unreadable /rate_limit evaluates as before.
 #   9. Stop at the first installation rate-limit failure: no later PR is
 #      evaluated or written; on the event head itself the remaining contexts
 #      are closed with the rate-limit red without being evaluated.
@@ -45,6 +46,7 @@
 #  12. Codex rounds on #2225: the GraphQL bucket, page-counted proof reads, a
 #      head too expensive to evaluate, a lint-only refresh that must not write,
 #      and a token so empty that no write after the failure lands.
+#  13. #2229: a proof read that fails after one page is charged two requests.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -165,6 +167,12 @@ elif method == "GET" and re.fullmatch(r"/commits/[^/]+/check-runs", path):
         if sha in fx.get("fail_reads", []):
             sys.stderr.write("HTTP 502\n"); sys.exit(1)
         runs_for = fx["runs"].get(sha, [])
+        if sha in fx.get("page_then_fail", []) and jq:
+            # Page 1 arrives (gh prints its --jq output), page 2 fails (#2229).
+            r = subprocess.run(["jq", "-r", jq], input=json.dumps({"check_runs": runs_for[:len(runs_for) // 2]}),
+                               capture_output=True, text=True)
+            sys.stdout.write(r.stdout); sys.stdout.flush()
+            sys.stderr.write("HTTP 502 on page 2\n"); sys.exit(1)
         if sha in fx.get("two_pages", []) and jq:
             # Two HTTP pages: gh applies --jq to each page separately.
             outs = []
@@ -362,8 +370,6 @@ check "short budget: no skipped PR receives any write (keeps its previous verdic
 check "short budget: the pass says what it skipped" \
   grep -q 'Budget guard (#2220): 150 REST request(s) and 1000 GraphQL point(s) remain until 2026-10-14T03:20:00Z.*Skipped: #2 #3 #4 #5 #6 #7 #8 #9 #10 #11' "$TMP/out.log"
 
-# 300 remaining: covers the head plus one (180), so the due reads run, but
-# not the nine due PRs (460): still only the event head.
 # 300 remaining: covers the head plus some, but not the nine due PRs.
 RL_REMAINING=300 run_pass budget-after-due workflow_run h1 pull_request ""
 unset RL_REMAINING
@@ -392,24 +398,51 @@ unset RL_REMAINING
 expect_eval "capacity for one: a dispatch evaluates exactly its named PR" "2"
 
 # Rotating batches (Codex P1 on #2225): at a capacity of 3, a schedule-parent
-# pass evaluates exactly three PRs, and four consecutive ticks cover all 11.
-: >"$TMP/rotation.log"
-for k in 0 1 2 3; do
-  python3 - "$TMP/fixture.json" "$TMP/fx-tick.json" "$k" <<'PY2'
+# pass evaluates exactly three PRs, and each tick's batch starts one position
+# after the previous tick's (#2229).
+# tick_fixture <k> <out>: the base fixture with PASS_START k sweep intervals
+# after 03:00Z; prints that tick's index modulo the 11 open PRs.
+tick_fixture() {
+  python3 - "$TMP/fixture.json" "$2" "$1" "$DUE_MAX_AGE_SECONDS" <<'PY2'
 import json, sys, datetime as d
 fx = json.load(open(sys.argv[1]))
-t = d.datetime(2026, 10, 14, 3, 0, tzinfo=d.timezone.utc) + d.timedelta(seconds=1800 * int(sys.argv[3]))
+step = int(sys.argv[4])
+t = d.datetime(2026, 10, 14, 3, 0, tzinfo=d.timezone.utc) + d.timedelta(seconds=step * int(sys.argv[3]))
 fx["pass_start"] = t.strftime("%Y-%m-%dT%H:%M:%SZ")
 json.dump(fx, open(sys.argv[2], "w"))
+print(int(t.timestamp()) // step % len(fx["prs"]))
 PY2
+}
+: >"$TMP/rotation.log"
+for k in 0 1 2 3; do
+  tick_fixture "$k" "$TMP/fx-tick.json" >/dev/null
   RL_REMAINING=220 CASE_FIXTURE="$TMP/fx-tick.json" run_pass "rotate-$k" workflow_run maintip schedule ""
   awk -F'\t' '$1=="merge-clearance-gate.sh"{print $2}' "$TMP/gates.log" | tr '\n' ' ' >>"$TMP/rotation.log"
   echo >>"$TMP/rotation.log"
 done
 check "rotating batch: each tick evaluates exactly the three PRs the budget covers" \
   awk 'NF != 3 { bad = 1 } END { exit bad + (NR != 4) }' "$TMP/rotation.log"
-check "rotating batch: four consecutive ticks cover all eleven open PRs" \
-  [ "$(tr ' ' '\n' <"$TMP/rotation.log" | grep . | sort -un | wc -l | tr -d ' ')" = 11 ]
+check "rotating batch: each tick's batch starts one position after the last" \
+  awk 'NR > 1 && ($1 != p2 || $2 != p3) { bad = 1 } { p2 = $2; p3 = $3 } END { exit bad }' "$TMP/rotation.log"
+
+# Varying capacity (#2229): one PR per tick, except two at the tick whose
+# index modulo 11 is 5. Scaling the start by the batch size put that tick's
+# batch at positions 10 and 0, so position 5 was never evaluated; a start
+# that advances by one per tick covers all eleven within eleven ticks.
+: >"$TMP/rotation-vary.log"
+for k in 0 1 2 3 4 5 6 7 8 9 10; do
+  pos=$(tick_fixture "$k" "$TMP/fx-tick.json")
+  rem=150
+  [ "$pos" != 5 ] || rem=190
+  RL_REMAINING=$rem CASE_FIXTURE="$TMP/fx-tick.json" run_pass "rotate-vary-$k" workflow_run maintip schedule ""
+  awk -F'\t' '$1=="merge-clearance-gate.sh"{print $2}' "$TMP/gates.log" | tr '\n' ' ' >>"$TMP/rotation-vary.log"
+  echo >>"$TMP/rotation-vary.log"
+done
+check "rotating batch, varying capacity: each tick evaluates what the budget covers" \
+  [ "$(tr ' ' '\n' <"$TMP/rotation-vary.log" | grep -c .)" = 12 ]
+check "rotating batch, varying capacity: eleven ticks cover all eleven open PRs" \
+  [ "$(tr ' ' '\n' <"$TMP/rotation-vary.log" | grep . | sort -un | wc -l | tr -d ' ')" = 11 ]
+unset CASE_FIXTURE
 
 RL_REMAINING=fail run_pass budget-unreadable workflow_run h1 pull_request ""
 unset RL_REMAINING
@@ -536,6 +569,20 @@ PY2
 RL_REMAINING=185 CASE_FIXTURE="$TMP/fx-pages.json" run_pass due-pages workflow_run h1 pull_request ""
 check "a two-page proof read is charged two requests" \
   [ "$(grep -c '"filter": "all"' "$TMP/gh.log")" = 5 ]
+# ── 13. #2229: a read that fails after one page ────────────────────────
+# h3's read prints page 1 and then fails on page 2: that is one page fetched
+# plus the failed request, so it is charged two and, as with the two-page
+# read above, the reads stop one PR earlier than the six at one per read.
+python3 - "$TMP/fixture.json" "$TMP/fx-page-fail.json" <<'PY2'
+import json, sys
+fx = json.load(open(sys.argv[1])); fx["page_then_fail"] = ["h3"]
+json.dump(fx, open(sys.argv[2], "w"))
+PY2
+RL_REMAINING=185 CASE_FIXTURE="$TMP/fx-page-fail.json" run_pass due-page-fail workflow_run h1 pull_request ""
+check "a proof read that fails after one page is charged two requests" \
+  [ "$(grep -c '"filter": "all"' "$TMP/gh.log")" = 5 ]
+check "a proof read that fails after one page is not reported as current" \
+  eval '! grep -q "PR #3 @ h3:" "$TMP/out.log"'
 RL_FAIL_PR=1 RL_EXHAUST_WRITES=1 run_pass stop-no-writes workflow_run h1 pull_request ""
 check "exhausted token after the failure: no write lands and the holds stay pending" \
   eval '[ "$(posts h1 in_progress)" = 3 ] && [ "$(posts h1 completed)" = 0 ] && [ -z "$(writes_outside h1)" ] && [ "$RC" -ne 0 ] && ! grep -q "\"conclusion\": \"success\"" "$TMP/gh.log" "$TMP/gh.log.rejected"'
