@@ -323,7 +323,9 @@ rc=$?
 set -e
 if [ "$rc" -eq 0 ] && grep -Fq 'PR:          octo/demo#101 — PR 101' "$TMP/resume.txt" \
    && grep -Fq 'Next action: push fix — 2 unanswered finding(s) on head' "$TMP/resume.txt" \
-   && grep -Fq 'scripts/resolve-pr-threads.sh 101 --resolve-actioned' "$TMP/resume.txt" \
+   && grep -Fq 'scripts/resolve-pr-threads.sh 101 --repo octo/demo --resolve-actioned' "$TMP/resume.txt" \
+   && grep -Fq 'scripts/codex-record-feedback.sh 101 octo/demo' "$TMP/resume.txt" \
+   && grep -Fq 'scripts/coderabbit-record-feedback.sh 101 --repo octo/demo' "$TMP/resume.txt" \
    && grep -Fq 'https://github.com/octo/demo/pull/1#discussion_r1' "$TMP/resume.txt" \
    && grep -Fq "worktree add -B feat/101 \$HOME/GitHub/.demo-worktrees/pr-101 $(sha 101)" "$TMP/resume.txt" \
    && grep -Fq '[mergepath-handoff]' "$TMP/resume.txt"; then
@@ -337,8 +339,10 @@ bash "$RESUME" --input "$TMP/snapshot.json" --now "$NOW" --pr 105 --json > "$TMP
 rc=$?
 set -e
 if [ "$rc" -eq 0 ] && grep -Fq "gh pr merge 105 --repo octo/demo --squash --delete-branch --match-head-commit $(sha 105)" "$TMP/resume-105.txt" \
-   && grep -Fq 'scripts/review-feedback-accounting.sh 105' "$TMP/resume-105.txt" \
-   && grep -Fq 'scripts/phase-4b-classifier.sh 105' "$TMP/resume-105.txt" \
+   && grep -Fq 'scripts/review-feedback-accounting.sh 105 octo/demo' "$TMP/resume-105.txt" \
+   && grep -Fq 'scripts/resolve-pr-threads.sh 105 --repo octo/demo --list' "$TMP/resume-105.txt" \
+   && grep -Fq 'scripts/phase-4b-classifier.sh 105 --repo octo/demo' "$TMP/resume-105.txt" \
+   && grep -Fq "scripts/required-head-checks.sh --repo octo/demo --verify --sha $(sha 105)" "$TMP/resume-105.txt" \
    && grep -Fq 'this script never merges' "$TMP/resume-105.txt" \
    && grep -Fq '"next_action": "merge"' "$TMP/resume-105.txt"; then
   pass "--pr selects a specific stalled PR and the merge work order names the gates before the author merge"
@@ -388,7 +392,7 @@ fi
 TREE="$TMP/tree"
 mkdir -p "$TREE/scripts/workflow" "$TREE/scripts/lib" "$TMP/bin" "$TMP/fixture"
 cp "$FINDER" "$RESUME" "$TREE/scripts/workflow/"
-cp "$ROOT/scripts/lib/gh-api-array.sh" "$TREE/scripts/lib/"
+cp "$ROOT/scripts/lib/gh-api-array.sh" "$ROOT/scripts/lib/preflight-helpers.sh" "$TREE/scripts/lib/"
 # The repository's required head checks: `lint` only. Review-policy checks
 # (Label Gate, Merge clearance gate) are deliberately NOT in this list.
 cat > "$TREE/scripts/required-head-checks.sh" <<'SH'
@@ -421,9 +425,15 @@ cat > "$TMP/bin/gh" <<'SH'
 # Hermetic gh shim: canned responses keyed on the request shape.
 args="$*"
 echo "$args" >> "$GH_LOG"
+[ -n "${GH_TOKEN:-}" ] || { echo "gh shim: no GH_TOKEN in this process" >&2; exit 1; }
 case "$args" in
   *"api graphql"*)          echo "gh shim: no GraphQL read is expected (CI state comes from the check runs)" >&2; exit 1 ;;
-  *"--jq .head.sha"*)       if [ -n "${HEAD_OVERRIDE:-}" ]; then echo "$HEAD_OVERRIDE"; else n=$(printf '%s' "$args" | sed -n 's/.*pulls\/\([0-9]*\) .*/\1/p'); jq -r --argjson n "$n" 'first(.[] | select(.number == $n)).head.sha' "$FIXTURE/pulls.json"; fi ;;
+  *"--jq {head: .head.sha"*)
+    n=$(printf '%s' "$args" | sed -n 's/.*pulls\/\([0-9]*\) .*/\1/p')
+    jq -c --argjson n "$n" --arg ho "${HEAD_OVERRIDE:-}" --arg lo "${LABEL_OVERRIDE:-}" \
+      'first(.[] | select(.number == $n)) | {head: (if $ho == "" then .head.sha else $ho end),
+                                              labels: ([.labels[].name] + (if $lo == "" then [] else [$lo] end))}' "$FIXTURE/pulls.json" ;;
+  *"/comments?since="*)     if [ -n "${LATE_HANDOFF:-}" ]; then echo 1; else echo 0; fi ;;
   *"/activity?"*)          cat "$FIXTURE/activity-$(printf '%s' "$args" | sed -n 's/.*feat%2F\([0-9]*\).*/\1/p').json" ;;
   *"/check-runs"*)          cat "$FIXTURE/check-runs-$(printf '%s' "$args" | sed -n 's/.*commits\/\(..\).*/\1/p').json" ;;
   *"/commits/"*)            echo "gh shim: the commit date must never be read for push time" >&2; exit 1 ;;
@@ -584,12 +594,12 @@ fi
 # --execute preserves the requester's policy refusals as routing outcomes
 # (exit 4 + a `next:` line + the --json execute record), never as an
 # infrastructure failure; a genuine requester failure stays exit 3.
-run_exec() { # <rc> <kind> <out>
+run_exec() { # <rc> <kind> <out> [pr]
   : > "$TMP/request.log"
   set +e
   PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fixture" GATE_LOG="$TMP/gate.log" REQUEST_LOG="$TMP/request.log" \
     REQUEST_RC="$1" REQUEST_KIND="$2" \
-    bash "$TREE/scripts/workflow/resume-stalled-pr.sh" --repo "$REPO" --now "$NOW" --pr 42 --execute --json > "$3" 2>&1
+    bash "$TREE/scripts/workflow/resume-stalled-pr.sh" --repo "$REPO" --now "$NOW" --pr "${4:-42}" --execute --json > "$3" 2>&1
   local r=$?
   set -e
   return "$r"
@@ -598,16 +608,18 @@ rc_c=0; run_exec 7 request-ceiling "$TMP/exec-ceiling.txt" || rc_c=$?
 rc_b=0; run_exec 7 blocking-reviews "$TMP/exec-blocking.txt" || rc_b=$?
 rc_u=0; run_exec 6 "" "$TMP/exec-unaccounted.txt" || rc_u=$?
 rc_i=0; run_exec 3 "" "$TMP/exec-infra.txt" || rc_i=$?
-rc_n=0; run_exec 5 "" "$TMP/exec-notrigger.txt" || rc_n=$?
+rc_n=0; run_exec 5 "" "$TMP/exec-notrigger.txt" 44 || rc_n=$?
+rc_d=0; run_exec 5 "" "$TMP/exec-codex-disabled.txt" 42 || rc_d=$?
 if [ "$rc_c" -eq 4 ] && grep -Fq 'next: phase 4b — the request ceiling is spent: run scripts/phase-4b-review.sh 42 --repo octo/demo' "$TMP/exec-ceiling.txt" \
    && grep -Fq '"requester_exit": 7' "$TMP/exec-ceiling.txt" && grep -Fq '"cap_kind": "request-ceiling"' "$TMP/exec-ceiling.txt" \
    && [ "$rc_b" -eq 4 ] && grep -Fq 'next: human tiebreaker' "$TMP/exec-blocking.txt" && grep -Fq '[mergepath-handoff]' "$TMP/exec-blocking.txt" \
    && [ "$rc_u" -eq 4 ] && grep -Fq 'next: disposition findings' "$TMP/exec-unaccounted.txt" \
    && [ "$rc_i" -eq 3 ] && grep -Fq 'exited 3 (infrastructure)' "$TMP/exec-infra.txt" \
-   && [ "$rc_n" -eq 4 ] && grep -Fq 'next: under-threshold path' "$TMP/exec-notrigger.txt"; then
-  pass "--execute maps requester exits 5, 6 and 7 (by cap kind) to routing outcomes (exit 4) and keeps a real failure at exit 3"
+   && [ "$rc_n" -eq 4 ] && grep -Fq 'next: under-threshold path' "$TMP/exec-notrigger.txt" \
+   && [ "$rc_d" -eq 4 ] && grep -Fq 'next: phase 4b — Codex is disabled here (codex.enabled false)' "$TMP/exec-codex-disabled.txt"; then
+  pass "--execute maps requester exits 5 (by Phase 4a scope: gated means Codex is disabled, so phase 4b), 6 and 7 (by cap kind) to routing outcomes (exit 4) and keeps a real failure at exit 3"
 else
-  fail "requester exit mapping (ceiling=$rc_c blocking=$rc_b unaccounted=$rc_u infra=$rc_i notrigger=$rc_n): $(tail -3 "$TMP/exec-ceiling.txt")"
+  fail "requester exit mapping (ceiling=$rc_c blocking=$rc_b unaccounted=$rc_u infra=$rc_i notrigger=$rc_n codex-disabled=$rc_d): $(tail -3 "$TMP/exec-ceiling.txt")"
 fi
 
 # Head fence: a PR whose head moved after classification is not requested on.
@@ -622,6 +634,43 @@ if [ "$rc" -eq 1 ] && [ ! -s "$TMP/request.log" ] && grep -Fq 'moved from 424242
   pass "--execute re-reads the head and requests nothing when it moved after classification"
 else
   fail "head fence (rc=$rc): $(cat "$TMP/request.log") $(tail -3 "$TMP/resume-moved.txt")"
+fi
+
+# The pre-write re-read also revalidates the human stops: a blocking label or a
+# handoff that arrived after classification stops the request without a write.
+: > "$TMP/request.log"
+set +e
+PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fixture" GATE_LOG="$TMP/gate.log" REQUEST_LOG="$TMP/request.log" \
+  LABEL_OVERRIDE=human-hold bash "$TREE/scripts/workflow/resume-stalled-pr.sh" --repo "$REPO" --now "$NOW" --pr 42 --execute > "$TMP/resume-held.txt" 2>&1
+rc_hold=$?
+PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fixture" GATE_LOG="$TMP/gate.log" REQUEST_LOG="$TMP/request.log" \
+  LATE_HANDOFF=1 bash "$TREE/scripts/workflow/resume-stalled-pr.sh" --repo "$REPO" --now "$NOW" --pr 42 --execute > "$TMP/resume-handoff.txt" 2>&1
+rc_ho=$?
+set -e
+if [ "$rc_hold" -eq 1 ] && grep -Fq 'now carries human-hold' "$TMP/resume-held.txt" \
+   && [ "$rc_ho" -eq 1 ] && grep -Fq 'a handoff was posted on octo/demo#42 after it was classified' "$TMP/resume-handoff.txt" \
+   && grep -Fq '/issues/42/comments?since=2026-10-13T12:00:00Z' "$TMP/gh.log" \
+   && [ ! -s "$TMP/request.log" ]; then
+  pass "--execute revalidates human stops (a new blocking label, a handoff since classification) and requests nothing"
+else
+  fail "human-stop fence (hold=$rc_hold handoff=$rc_ho): $(cat "$TMP/request.log") $(tail -2 "$TMP/resume-held.txt") $(tail -2 "$TMP/resume-handoff.txt")"
+fi
+
+# The read credential is resolved in the resume process itself: with no
+# GH_TOKEN, only the preflight reviewer PAT, the --execute re-read still has a
+# token (the finder's own resolution lives in its command-substitution child).
+: > "$TMP/request.log"
+mkdir -p "$TMP/empty-preflight-cache"
+set +e
+env -u GH_TOKEN -u GITHUB_TOKEN PATH="$TMP/bin:$PATH" OP_PREFLIGHT_CACHE_DIR="$TMP/empty-preflight-cache" OP_PREFLIGHT_REVIEWER_PAT=test-reviewer-pat \
+  GH_LOG="$TMP/gh.log" FIXTURE="$TMP/fixture" GATE_LOG="$TMP/gate.log" REQUEST_LOG="$TMP/request.log" \
+  bash "$TREE/scripts/workflow/resume-stalled-pr.sh" --repo "$REPO" --now "$NOW" --pr 42 --execute > "$TMP/resume-pat.txt" 2>&1
+rc_pat=$?
+set -e
+if [ "$rc_pat" -eq 0 ] && grep -Fq 'requester-called MERGEPATH_PHASE_4A_GATED=true --trigger-only 42 octo/demo' "$TMP/request.log"; then
+  pass "with only the preflight reviewer PAT, --execute reads the PR from its own process and proceeds to the request"
+else
+  fail "in-process credential (rc=$rc_pat): $(tail -3 "$TMP/resume-pat.txt")"
 fi
 
 # An unanswered request is retried in the requester's polling mode (trigger-only

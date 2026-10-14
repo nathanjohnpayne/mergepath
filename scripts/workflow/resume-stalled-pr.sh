@@ -98,6 +98,16 @@ case "$PICK_PR" in ''|*[!0-9]*) [ -z "$PICK_PR" ] || usage ;; esac
 [ -x "$FINDER" ] || { echo "resume-stalled-pr: finder missing or not executable: $FINDER" >&2; exit 3; }
 command -v jq >/dev/null 2>&1 || { echo "resume-stalled-pr: jq is required" >&2; exit 3; }
 
+# Read credential, resolved HERE rather than inside the finder: a token the
+# finder exports lives only in its command-substitution child, and the
+# --execute step below reads the PR again from this process. Preflight cache
+# first (reviewer scope; read-only use), then whatever GH_TOKEN already holds.
+if [ -z "$INPUT_FILE" ] && [ -r "$ROOT/scripts/lib/preflight-helpers.sh" ]; then
+  # shellcheck source=../lib/preflight-helpers.sh
+  . "$ROOT/scripts/lib/preflight-helpers.sh"
+  preflight_require_token reviewer || true
+fi
+
 finder_args=(--json --threshold-minutes "$THRESHOLD_MINUTES")
 [ -z "$REPO" ] || finder_args+=(--repo "$REPO")
 [ -z "$INPUT_FILE" ] || finder_args+=(--input "$INPUT_FILE")
@@ -202,8 +212,8 @@ case "$next_action" in
     echo "  1. Read every unanswered finding on the head and fix or rebut each one:"
     printf '%s' "$SELECTED" | jq -r '.unanswered_findings[] | "       - " + .actor + "  " + .url'
     echo "  2. Push the fix commits (author identity; commits sign via local git config)."
-    echo "  3. Record each disposition: scripts/codex-record-feedback.sh $number ... / scripts/coderabbit-record-feedback.sh $number ..."
-    echo "  4. Resolve the actioned threads: scripts/resolve-pr-threads.sh $number --resolve-actioned"
+    echo "  3. Record each disposition: scripts/codex-record-feedback.sh $number $REPO ... / scripts/coderabbit-record-feedback.sh $number --repo $REPO ..."
+    echo "  4. Resolve the actioned threads: scripts/resolve-pr-threads.sh $number --repo $REPO --resolve-actioned"
     echo "  5. Re-request the review on the new head:"
     echo "       ${gated:+MERGEPATH_PHASE_4A_GATED=true }scripts/codex-review-request.sh --trigger-only $number $REPO"
     ;;
@@ -214,10 +224,11 @@ case "$next_action" in
     ;;
   merge)
     echo "Pre-merge sequence (AGENTS.md § Workflow Summary steps 6, 8 and 10) — every gate clean, then merge as the author:"
-    echo "  scripts/review-feedback-accounting.sh $number         # posted == accounted"
-    echo "  scripts/resolve-pr-threads.sh $number --list          # zero unresolved threads required"
-    echo "  scripts/phase-4b-classifier.sh $number               # exit 1 = post the Phase 4b handoff first (above-threshold PRs)"
-    echo "  scripts/codex-review-check.sh $number $REPO            # Phase 4 gate on $head_sha"
+    echo "  scripts/review-feedback-accounting.sh $number $REPO              # posted == accounted"
+    echo "  scripts/resolve-pr-threads.sh $number --repo $REPO --list        # zero unresolved threads required"
+    echo "  scripts/required-head-checks.sh --repo $REPO --verify --sha $head_sha   # configured build checks green on the head"
+    echo "  scripts/phase-4b-classifier.sh $number --repo $REPO             # exit 1 = post the Phase 4b handoff first (above-threshold PRs)"
+    echo "  scripts/codex-review-check.sh $number $REPO                     # Phase 4 gate on $head_sha"
     echo "  Merge clearance gate check on head: $merge_gate_check"
     echo "  scripts/gh-as-author.sh -- gh pr merge $number --repo $REPO --squash --delete-branch --match-head-commit $head_sha"
     echo "  (this script never merges; the author identity does, only after every gate above is clean)"
@@ -258,10 +269,29 @@ if [ "$EXECUTE" = "1" ]; then
   # pushed in the meantime, the PR is no longer stalled on the head that was
   # classified, and requesting a review there would spend a round on (and
   # interfere with) a live session's work.
-  live_head=$(gh api "repos/$REPO/pulls/$number" --jq .head.sha 2>/dev/null) || {
-    echo "resume-stalled-pr: could not re-read the head of $REPO#$number; not requesting" >&2; exit 3; }
+  # The same re-read also revalidates the human stops: a human-hold /
+  # needs-human-review / policy-violation label, or a handoff comment, can
+  # arrive while collection and the per-PR gate calls run without moving the
+  # head, and the requester itself does not check them.
+  live_pr=$(gh api "repos/$REPO/pulls/$number" --jq '{head: .head.sha, labels: [.labels[].name]}' 2>/dev/null) || {
+    echo "resume-stalled-pr: could not re-read $REPO#$number; not requesting" >&2; exit 3; }
+  live_head=$(printf '%s' "$live_pr" | jq -r '.head')
   if [ "$live_head" != "$head_sha" ]; then
     echo "resume-stalled-pr: $REPO#$number moved from $head_sha to $live_head since it was classified; not stalled any more, nothing requested" >&2
+    exit 1
+  fi
+  live_stop=$(printf '%s' "$live_pr" | jq -r '[.labels[] | select(. == "human-hold" or . == "needs-human-review" or . == "policy-violation")] | join(", ")')
+  if [ -n "$live_stop" ]; then
+    echo "resume-stalled-pr: $REPO#$number now carries $live_stop; waiting on a human, nothing requested" >&2
+    exit 1
+  fi
+  classified_at=$(printf '%s' "$REPORT" | jq -r '.generated_at')
+  late_handoffs=$(gh api --paginate "repos/$REPO/issues/$number/comments?since=$classified_at&per_page=100" \
+      --jq '[.[] | select(((.user.type // "") != "Bot") and ((.user.login // "") | endswith("[bot]") | not))
+                 | select((.body // "") | test("\\[mergepath-handoff|<!-- mergepath-handback:|(?m)^#+[[:space:]]*External Review Required"; "i"))] | length' 2>/dev/null) || {
+    echo "resume-stalled-pr: could not re-read the comments on $REPO#$number; not requesting" >&2; exit 3; }
+  if [ "$(printf '%s\n' "$late_handoffs" | awk '{s += $1} END {print s + 0}')" -gt 0 ]; then
+    echo "resume-stalled-pr: a handoff was posted on $REPO#$number after it was classified; waiting on the named identity, nothing requested" >&2
     exit 1
   fi
   echo
@@ -280,7 +310,12 @@ if [ "$EXECUTE" = "1" ]; then
   case "$rc" in
     0) exit_next="" ;;
     4) exit_next="phase 4b" ;;   # polling mode: FALLBACK_REQUIRED, no Codex signal after the full wait
-    5) exit_next="under-threshold path" ;;
+    # Exit 5 has two causes. For a Phase-4a-gated PR (needs-external-review)
+    # the requester declines ONLY when codex.enabled is false, which routes
+    # the mandatory external review to Phase 4b; for any other PR it is the
+    # under-threshold path (request_by_default false, or Codex off on a PR
+    # that never needed external review).
+    5) if [ "$gated" = "true" ]; then exit_next="phase 4b"; else exit_next="under-threshold path"; fi ;;
     6) exit_next="disposition findings" ;;
     7)
       case "$cap_kind" in
@@ -293,9 +328,11 @@ if [ "$EXECUTE" = "1" ]; then
   if [ -n "$exit_next" ]; then
     case "$exit_next" in
       "under-threshold path") how="the policy does not request Codex on this PR (codex.request_by_default false, not Phase-4a scope): take the under-threshold reviewer-identity approval and merge path, AGENTS.md § Workflow Summary step 7" ;;
-      "disposition findings") how="disposition every earlier finding (scripts/review-feedback-accounting.sh $number), then rerun" ;;
+      "disposition findings") how="disposition every earlier finding (scripts/review-feedback-accounting.sh $number $REPO), then rerun" ;;
       "phase 4b")
-        if [ "$rc" -eq 4 ]; then
+        if [ "$rc" -eq 5 ]; then
+          how="Codex is disabled here (codex.enabled false) and this PR is in Phase 4a scope, so its external review runs as Phase 4b: run scripts/phase-4b-review.sh $number --repo $REPO from a trusted main checkout"
+        elif [ "$rc" -eq 4 ]; then
           how="Codex did not answer within its review timeout (or is account-blocked): run scripts/phase-4b-review.sh $number --repo $REPO from a trusted main checkout"
         else
           how="the request ceiling is spent: run scripts/phase-4b-review.sh $number --repo $REPO from a trusted main checkout"
