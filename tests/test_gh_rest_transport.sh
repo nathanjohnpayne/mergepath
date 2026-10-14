@@ -187,6 +187,9 @@ case "$method $endpoint" in
     echo '{"ok": true}' ;;
   "POST repos/$REPO/issues/"*"/labels")
     printf '%s' "$input" | jq -r '.labels[]' | while IFS= read -r l; do
+      # STUB_LABEL_UPCASE: the repository's label is spelled in upper case,
+      # and GitHub records the event under its own spelling.
+      [ -z "${STUB_LABEL_UPCASE:-}" ] || l="$(printf '%s' "$l" | tr '[:lower:]' '[:upper:]')"
       add_event labeled "$(jq -n --arg l "$l" '{label: {name: $l}}')"
     done
     echo '[]' ;;
@@ -197,6 +200,7 @@ case "$method $endpoint" in
     add_event unlabeled "$(jq -n --arg l "$decoded" '{label: {name: $l}}')"
     echo '[]' ;;
   "POST repos/$REPO/pulls/"*"/requested_reviewers")
+    [ -z "${STUB_REVIEWERS_FAIL:-}" ] || { echo "gh: Reviews may only be requested from collaborators (HTTP 422)" >&2; exit 1; }
     printf '%s' "$input" | jq -r '.reviewers[]' | while IFS= read -r u; do
       add_event review_requested "$(jq -n --arg u "$u" '{requested_reviewer: {login: $u}}')"
     done
@@ -902,6 +906,66 @@ if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q "closing PR #42 landed under 
   pass "pr close readback: a closed event by another login exits 5"
 else
   fail "pr close actor mutation: rc=$rc err=$err"
+fi
+
+# --- partial failures and case ---------------------------------------------
+# A write sequence that stops partway still checks the writes that landed:
+# a label applied under another login before the reviewer request failed is
+# caught (5); applied under the expected login, the failure is reported (1).
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REVIEWERS_FAIL=1 STUB_EVENT_ACTOR='claude[bot]' as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label a --reviewer nathanpayne-codex 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'its reviewers could not be requested' && printf '%s' "$err" | grep -q "attributed to another login: labeled by claude\\[bot\\]"; then
+  pass "create: a label that landed under another login before a failed reviewer request is caught (5)"
+else
+  fail "create partial foreign: rc=$rc err=$err"
+fi
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REVIEWERS_FAIL=1 as_author -- gh pr create --repo o/r --title T --body-file "$VALID_BODY" --head h --label a --reviewer nathanpayne-codex 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'show no event by another login'; then
+  pass "create: a failed reviewer request after a correctly attributed label is reported as a failure (1)"
+else
+  fail "create partial clean: rc=$rc err=$err"
+fi
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REVIEWERS_FAIL=1 STUB_EVENT_ACTOR='claude[bot]' as_author -- gh pr edit 42 --repo o/r --add-label x --add-reviewer nathanpayne-codex 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'requesting reviewers on PR #42 failed' && printf '%s' "$err" | grep -q 'attributed to another login'; then
+  pass "edit: a label that landed under another login before a failed reviewer request is caught (5)"
+else
+  fail "edit partial foreign: rc=$rc err=$err"
+fi
+# Logins and label names compare without case, as GitHub compares them.
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest STUB_PR_REVIEWERS=MixedCase as_author -- gh pr edit 42 --repo o/r --remove-reviewer mixedcase >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'DELETE\trepos/o/r/pulls/42/requested_reviewers\t--input\t'"$(printf '%s' '{"reviewers":["MixedCase"]}')"; then
+  pass "edit: removing a reviewer in another case removes the current one, spelled as GitHub spells it"
+else
+  fail "edit case-insensitive removal: rc=$rc"; cat "$LOGF" "$WORKDIR/err" >&2
+fi
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest STUB_PR_LABELS=Bug as_author -- gh pr edit 42 --repo o/r --add-label bug >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_lacks 'issues/42/labels' && grep -q 'no change' "$WORKDIR/err"; then
+  pass "edit: adding a label already present in another case is a no-op"
+else
+  fail "edit case-insensitive label no-op: rc=$rc"; cat "$LOGF" "$WORKDIR/err" >&2
+fi
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest STUB_LABEL_UPCASE=1 as_author -- gh pr edit 42 --repo o/r --add-label bug >/dev/null 2>"$WORKDIR/err"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q "labeled:bug" "$WORKDIR/err"; then
+  pass "edit: a label event GitHub spells in another case is still attributed"
+else
+  fail "edit case-insensitive attribution: rc=$rc"; cat "$LOGF" "$WORKDIR/err" >&2
 fi
 
 # --- round-five parity cases ------------------------------------------------

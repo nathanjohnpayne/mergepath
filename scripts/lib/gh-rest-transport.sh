@@ -575,9 +575,9 @@ gh_rest_readback() {
 # a function's locals dynamically into the functions it calls).
 gh_rest_check_create_events() { # <events>
   local ev="$1" worst=0 r
-  r=0; gh_rest_each "$labels_json" gh_rest_attribute_each "$ev" labeled '.label.name == $v' "the label" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
-  r=0; gh_rest_each "$reviewers_json" gh_rest_attribute_each "$ev" review_requested '.requested_reviewer.login == $v' "the review request to" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
-  r=0; gh_rest_each "$assignees_json" gh_rest_attribute_each "$ev" assigned '.assignee.login == $v' "the assignment to" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
+  r=0; gh_rest_each "$labels_json" gh_rest_attribute_each "$ev" labeled '(.label.name | ascii_downcase) == ($v | ascii_downcase)' "the label" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
+  r=0; gh_rest_each "$reviewers_json" gh_rest_attribute_each "$ev" review_requested '(.requested_reviewer.login | ascii_downcase) == ($v | ascii_downcase)' "the review request to" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
+  r=0; gh_rest_each "$assignees_json" gh_rest_attribute_each "$ev" assigned '(.assignee.login | ascii_downcase) == ($v | ascii_downcase)' "the assignment to" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
   return "$worst"
 }
 
@@ -593,17 +593,60 @@ gh_rest_check_edit_events() { # <events>
     [ "$r" -ne 0 ] || GH_REST_VERIFIED="$GH_REST_VERIFIED base,"
     worst=$(gh_rest_worse "$worst" "$r")
   fi
-  r=0; gh_rest_each "$add_labels_json" gh_rest_attribute_each "$ev" labeled '.label.name == $v' "the label" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
-  r=0; gh_rest_each "$remove_labels_json" gh_rest_attribute_each "$ev" unlabeled '.label.name == $v' "removing the label" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
-  r=0; gh_rest_each "$add_reviewers_json" gh_rest_attribute_each "$ev" review_requested '.requested_reviewer.login == $v' "the review request to" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
-  r=0; gh_rest_each "$remove_reviewers_json" gh_rest_attribute_each "$ev" review_request_removed '.requested_reviewer.login == $v' "removing the review request to" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
-  r=0; gh_rest_each "$add_assignees_json" gh_rest_attribute_each "$ev" assigned '.assignee.login == $v' "the assignment to" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
-  r=0; gh_rest_each "$remove_assignees_json" gh_rest_attribute_each "$ev" unassigned '.assignee.login == $v' "unassigning" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
+  r=0; gh_rest_each "$add_labels_json" gh_rest_attribute_each "$ev" labeled '(.label.name | ascii_downcase) == ($v | ascii_downcase)' "the label" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
+  r=0; gh_rest_each "$remove_labels_json" gh_rest_attribute_each "$ev" unlabeled '(.label.name | ascii_downcase) == ($v | ascii_downcase)' "removing the label" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
+  r=0; gh_rest_each "$add_reviewers_json" gh_rest_attribute_each "$ev" review_requested '(.requested_reviewer.login | ascii_downcase) == ($v | ascii_downcase)' "the review request to" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
+  r=0; gh_rest_each "$remove_reviewers_json" gh_rest_attribute_each "$ev" review_request_removed '(.requested_reviewer.login | ascii_downcase) == ($v | ascii_downcase)' "removing the review request to" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
+  r=0; gh_rest_each "$add_assignees_json" gh_rest_attribute_each "$ev" assigned '(.assignee.login | ascii_downcase) == ($v | ascii_downcase)' "the assignment to" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
+  r=0; gh_rest_each "$remove_assignees_json" gh_rest_attribute_each "$ev" unassigned '(.assignee.login | ascii_downcase) == ($v | ascii_downcase)' "unassigning" || r=$?; worst=$(gh_rest_worse "$worst" "$r")
   return "$worst"
 }
 
 gh_rest_check_close_events() { # <events>
   gh_rest_attribute "$1" closed 'true' "" "closing PR #$number"
+}
+
+# gh_rest_partial_failure <repo> <N> <events before, or ""> <url>
+# After a write sequence stopped partway, the writes that landed must still
+# not stand under another login. Without knowing which landed, scan the new
+# events of every kind these verbs produce for an actor other than the
+# expected login, re-reading for lag as gh_rest_readback does. Returns 5 when
+# one is found or the events cannot be read, 1 otherwise.
+gh_rest_partial_failure() {
+  local repo="$1" number="$2" before="$3" url="$4"
+  local attempts="${MERGEPATH_GH_READBACK_ATTEMPTS:-5}" delay="${MERGEPATH_GH_READBACK_DELAY:-2}"
+  local attempt=1 after events wrong
+  case "$attempts" in ''|*[!0-9]*) attempts=5 ;; esac
+  { [ "$attempts" -ge 1 ] && [ "$attempts" -le 20 ]; } || attempts=5
+  case "$delay" in ''|*[!0-9]*) delay=2 ;; esac
+  [ "$delay" -le 30 ] || delay=2
+  while :; do
+    after="$(gh_rest_events "$repo" "$number")" || {
+      gh_rest_err "ERROR the events of PR #$number could not be read, so the writes that landed before the failure are unattributed."
+      gh_rest_recovery "any change those writes made" "$url"
+      return 5
+    }
+    if [ -n "$before" ]; then
+      events="$(gh_rest_new_events "$before" "$after")" || events="[]"
+    else
+      events="$after"
+    fi
+    wrong="$(printf '%s' "$events" | jq -r --arg me "$GH_REST_EXPECTED" '
+      ["labeled","unlabeled","review_requested","review_request_removed","assigned","unassigned","renamed","base_ref_changed","closed"] as $kinds
+      | [.[] | select(.event as $e | ($kinds | index($e)) != null)
+             | select((.actor.login // "<unknown>") != $me)
+             | "\(.event) by \(.actor.login // "<unknown>")"] | unique | join(", ")')" || wrong="unreadable events"
+    if [ -n "$wrong" ]; then
+      gh_rest_err "ERROR writes that landed before the failure are attributed to another login: $wrong (expected '$GH_REST_EXPECTED')."
+      gh_rest_recovery "those changes" "$url"
+      return 5
+    fi
+    [ "$attempt" -lt "$attempts" ] || break
+    sleep "$delay"
+    attempt=$((attempt + 1))
+  done
+  gh_rest_err "the writes that landed before the failure show no event by another login."
+  return 1
 }
 
 gh_rest_remove_label() { # <repo> <N> <label>
@@ -703,6 +746,26 @@ gh_rest_default_head() {
   fi
 }
 
+# The follow-up writes of a create, in order; stops at the first failure.
+# Reads its caller's locals (labels_json, reviewers_json, assignees_json,
+# repo, number, url).
+gh_rest_create_followups() {
+  local input
+  if [ "$labels_json" != "[]" ]; then
+    input="$(gh_rest_json_file --argjson labels "$labels_json" '{labels: $labels}')" || return 1
+    gh_rest_api POST "repos/$repo/issues/$number/labels" "$input" >/dev/null || { gh_rest_err "PR #$number was created ($url) but its labels could not be added."; return 1; }
+  fi
+  if [ "$reviewers_json" != "[]" ]; then
+    input="$(gh_rest_json_file --argjson reviewers "$reviewers_json" '{reviewers: $reviewers}')" || return 1
+    gh_rest_api POST "repos/$repo/pulls/$number/requested_reviewers" "$input" >/dev/null || { gh_rest_err "PR #$number was created ($url) but its reviewers could not be requested."; return 1; }
+  fi
+  if [ "$assignees_json" != "[]" ]; then
+    input="$(gh_rest_json_file --argjson assignees "$assignees_json" '{assignees: $assignees}')" || return 1
+    gh_rest_api POST "repos/$repo/issues/$number/assignees" "$input" >/dev/null || { gh_rest_err "PR #$number was created ($url) but its assignees could not be set."; return 1; }
+  fi
+  return 0
+}
+
 gh_rest_pr_create() {
   GH_REST_FORM='gh pr create --repo OWNER/REPO --title T (--body B | --body-file F) [--head BRANCH] [--base BRANCH] [--draft] [--label L]... [--reviewer USER]... [--assignee USER]...' # NO_BARE_GH_WRITE_EXEMPT: usage text printed in a refusal, never executed
   local repo="" title="" title_set=0 head="" base="" draft=false labels="" reviewers="" assignees=""
@@ -789,20 +852,14 @@ gh_rest_pr_create() {
   labels_json="$(gh_rest_lines_json "$labels")"
   reviewers_json="$(gh_rest_lines_json "$reviewers")"
   assignees_json="$(gh_rest_lines_json "$assignees")"
-  if [ "$labels_json" != "[]" ]; then
-    input="$(gh_rest_json_file --argjson labels "$labels_json" '{labels: $labels}')" || { printf '%s\n' "$url"; return 1; }
-    gh_rest_api POST "repos/$repo/issues/$number/labels" "$input" >/dev/null || { gh_rest_err "PR #$number was created ($url) but its labels could not be added."; printf '%s\n' "$url"; return 1; }
-    followed=1
-  fi
-  if [ "$reviewers_json" != "[]" ]; then
-    input="$(gh_rest_json_file --argjson reviewers "$reviewers_json" '{reviewers: $reviewers}')" || { printf '%s\n' "$url"; return 1; }
-    gh_rest_api POST "repos/$repo/pulls/$number/requested_reviewers" "$input" >/dev/null || { gh_rest_err "PR #$number was created ($url) but its reviewers could not be requested."; printf '%s\n' "$url"; return 1; }
-    followed=1
-  fi
-  if [ "$assignees_json" != "[]" ]; then
-    input="$(gh_rest_json_file --argjson assignees "$assignees_json" '{assignees: $assignees}')" || { printf '%s\n' "$url"; return 1; }
-    gh_rest_api POST "repos/$repo/issues/$number/assignees" "$input" >/dev/null || { gh_rest_err "PR #$number was created ($url) but its assignees could not be set."; printf '%s\n' "$url"; return 1; }
-    followed=1
+  [ "$labels_json$reviewers_json$assignees_json" = "[][][]" ] || followed=1
+  if [ "$followed" -eq 1 ] && ! gh_rest_create_followups; then
+    # Labels may have landed before the reviewers failed: they are scanned
+    # for another login before the failure is reported.
+    rc=0
+    gh_rest_partial_failure "$repo" "$number" "" "$url" || rc=$?
+    printf '%s\n' "$url"
+    return "$rc"
   fi
   if [ "$followed" -eq 1 ]; then
     gh_rest_readback "$repo" "$number" "" gh_rest_check_create_events || rc=$?
@@ -914,14 +971,60 @@ gh_rest_pr_review() {
 
 # gh_rest_set_ops <add|remove> <current JSON array> <added lines> <removed lines>
 # The REST operations that turn <current> into gh's final set,
-# (current + added) - removed.
+# (current + added) - removed. Logins and label names compare without case,
+# as GitHub compares them: an addition keeps the caller's spelling, a removal
+# names the current entry as GitHub spells it.
 gh_rest_set_ops() {
   local add_json remove_json
   add_json="$(gh_rest_lines_json "$3")"
   remove_json="$(gh_rest_lines_json "$4")"
   { printf '%s\n' "$2"; printf '%s\n' "$add_json"; printf '%s\n' "$remove_json"; } | jq -cs --arg op "$1" '
-    .[0] as $cur | ((.[0] + .[1] | unique) - .[2]) as $final
-    | if $op == "add" then ($final - $cur) else ($cur - $final) end'
+    .[0] as $cur | .[1] as $add
+    | ($cur | map(ascii_downcase)) as $curl | (.[2] | map(ascii_downcase)) as $reml
+    | if $op == "add" then
+        [$add[] | select(ascii_downcase as $l | ($curl | index($l)) == null and ($reml | index($l)) == null)]
+        | unique_by(ascii_downcase)
+      else
+        [$cur[] | select(ascii_downcase as $l | ($reml | index($l)) != null)]
+      end'
+}
+
+# The writes of an edit, in order; stops at the first failure. Reads its
+# caller's locals (the *_op flags, the *_json operation lists, title, base,
+# repo, number).
+gh_rest_edit_writes() {
+  local input
+  if [ "$title_op" -eq 1 ] || [ "$body_op" -eq 1 ] || [ "$base_op" -eq 1 ]; then
+    local text="$GH_REST_BODY_FILE"
+    [ -n "$text" ] || text="$(gh_rest_text_file "")" || return 1
+    input="$(gh_rest_json_file --arg title "$title" --rawfile body "$text" --arg base "$base" \
+      --argjson t "$title_op" --argjson b "$body_op" --argjson r "$base_op" \
+      '({} | if $t == 1 then .title = $title else . end | if $b == 1 then .body = $body else . end | if $r == 1 then .base = $base else . end)')" || return 1
+    gh_rest_api PATCH "repos/$repo/pulls/$number" "$input" >/dev/null || { gh_rest_err "the title/body/base edit of PR #$number failed; later edits were not attempted."; return 1; }
+  fi
+  if [ "$add_labels_json" != "[]" ]; then
+    input="$(gh_rest_json_file --argjson labels "$add_labels_json" '{labels: $labels}')" || return 1
+    gh_rest_api POST "repos/$repo/issues/$number/labels" "$input" >/dev/null || { gh_rest_err "adding labels to PR #$number failed; earlier edits were applied, later ones were not attempted."; return 1; }
+  fi
+  gh_rest_each "$remove_labels_json" gh_rest_remove_label "$repo" "$number" || return 1
+  if [ "$add_reviewers_json" != "[]" ]; then
+    input="$(gh_rest_json_file --argjson reviewers "$add_reviewers_json" '{reviewers: $reviewers}')" || return 1
+    gh_rest_api POST "repos/$repo/pulls/$number/requested_reviewers" "$input" >/dev/null || { gh_rest_err "requesting reviewers on PR #$number failed; earlier edits were applied, later ones were not attempted."; return 1; }
+  fi
+  if [ "$remove_reviewers_json" != "[]" ]; then
+    input="$(gh_rest_json_file --argjson reviewers "$remove_reviewers_json" '{reviewers: $reviewers}')" || return 1
+    gh_rest_api DELETE "repos/$repo/pulls/$number/requested_reviewers" "$input" >/dev/null || { gh_rest_err "removing review requests on PR #$number failed; earlier edits were applied, later ones were not attempted."; return 1; }
+  fi
+  if [ "$add_assignees_json" != "[]" ]; then
+    input="$(gh_rest_json_file --argjson assignees "$add_assignees_json" '{assignees: $assignees}')" || return 1
+    gh_rest_api POST "repos/$repo/issues/$number/assignees" "$input" >/dev/null || { gh_rest_err "assigning PR #$number failed; earlier edits were applied, later ones were not attempted."; return 1; }
+  fi
+  if [ "$remove_assignees_json" != "[]" ]; then
+    input="$(gh_rest_json_file --argjson assignees "$remove_assignees_json" '{assignees: $assignees}')" || return 1
+    gh_rest_api DELETE "repos/$repo/issues/$number/assignees" "$input" >/dev/null || { gh_rest_err "unassigning PR #$number failed; earlier edits were applied."; return 1; }
+  fi
+
+  return 0
 }
 
 gh_rest_pr_edit() {
@@ -1012,34 +1115,12 @@ gh_rest_pr_edit() {
   }
 
   local input rc=0
-  if [ "$title_op" -eq 1 ] || [ "$body_op" -eq 1 ] || [ "$base_op" -eq 1 ]; then
-    local text="$GH_REST_BODY_FILE"
-    [ -n "$text" ] || text="$(gh_rest_text_file "")" || return 1
-    input="$(gh_rest_json_file --arg title "$title" --rawfile body "$text" --arg base "$base" \
-      --argjson t "$title_op" --argjson b "$body_op" --argjson r "$base_op" \
-      '({} | if $t == 1 then .title = $title else . end | if $b == 1 then .body = $body else . end | if $r == 1 then .base = $base else . end)')" || return 1
-    gh_rest_api PATCH "repos/$repo/pulls/$number" "$input" >/dev/null || { gh_rest_err "the title/body/base edit of PR #$number failed; later edits were not attempted."; return 1; }
-  fi
-  if [ "$add_labels_json" != "[]" ]; then
-    input="$(gh_rest_json_file --argjson labels "$add_labels_json" '{labels: $labels}')" || return 1
-    gh_rest_api POST "repos/$repo/issues/$number/labels" "$input" >/dev/null || { gh_rest_err "adding labels to PR #$number failed; earlier edits were applied, later ones were not attempted."; return 1; }
-  fi
-  gh_rest_each "$remove_labels_json" gh_rest_remove_label "$repo" "$number" || return 1
-  if [ "$add_reviewers_json" != "[]" ]; then
-    input="$(gh_rest_json_file --argjson reviewers "$add_reviewers_json" '{reviewers: $reviewers}')" || return 1
-    gh_rest_api POST "repos/$repo/pulls/$number/requested_reviewers" "$input" >/dev/null || { gh_rest_err "requesting reviewers on PR #$number failed; earlier edits were applied, later ones were not attempted."; return 1; }
-  fi
-  if [ "$remove_reviewers_json" != "[]" ]; then
-    input="$(gh_rest_json_file --argjson reviewers "$remove_reviewers_json" '{reviewers: $reviewers}')" || return 1
-    gh_rest_api DELETE "repos/$repo/pulls/$number/requested_reviewers" "$input" >/dev/null || { gh_rest_err "removing review requests on PR #$number failed; earlier edits were applied, later ones were not attempted."; return 1; }
-  fi
-  if [ "$add_assignees_json" != "[]" ]; then
-    input="$(gh_rest_json_file --argjson assignees "$add_assignees_json" '{assignees: $assignees}')" || return 1
-    gh_rest_api POST "repos/$repo/issues/$number/assignees" "$input" >/dev/null || { gh_rest_err "assigning PR #$number failed; earlier edits were applied, later ones were not attempted."; return 1; }
-  fi
-  if [ "$remove_assignees_json" != "[]" ]; then
-    input="$(gh_rest_json_file --argjson assignees "$remove_assignees_json" '{assignees: $assignees}')" || return 1
-    gh_rest_api DELETE "repos/$repo/issues/$number/assignees" "$input" >/dev/null || { gh_rest_err "unassigning PR #$number failed; earlier edits were applied."; return 1; }
+  if ! gh_rest_edit_writes; then
+    # Earlier writes may have landed: they are scanned for another login
+    # before the failure is reported.
+    rc=0
+    gh_rest_partial_failure "$repo" "$number" "$before" "$url" || rc=$?
+    return "$rc"
   fi
 
   gh_rest_readback "$repo" "$number" "$before" gh_rest_check_edit_events || rc=$?
