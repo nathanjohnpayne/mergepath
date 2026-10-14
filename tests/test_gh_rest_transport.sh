@@ -977,6 +977,39 @@ if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'requesting reviewers on PR #
 else
   fail "edit partial foreign: rc=$rc err=$err"
 fi
+# A body edit that landed before a later write failed has no event to be
+# attributed by, so it is named as unattributed, and the closing line claims
+# attribution only for the evented writes (Codex on #2178).
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REVIEWERS_FAIL=1 MERGEPATH_GH_READBACK_ATTEMPTS=1 as_author -- gh pr edit 42 --repo o/r --body-file "$COMMENT_FILE" --add-reviewer nathanpayne-codex 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'note: the body edit of PR #42 landed before the failure and is not attributable over REST' \
+   && printf '%s' "$err" | grep -q 'no write that GitHub records as an event landed before the failure' \
+   && ! printf '%s' "$err" | grep -q 'are attributed to nathanjohnpayne'; then
+  pass "edit: a body-only PATCH before a failed reviewer request is reported as unattributed, not verified"
+else
+  fail "edit partial body-only: rc=$rc err=$err"
+fi
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REVIEWERS_FAIL=1 MERGEPATH_GH_READBACK_ATTEMPTS=1 as_author -- gh pr edit 42 --repo o/r --body-file "$COMMENT_FILE" --add-label x --add-reviewer nathanpayne-codex 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'note: the body edit of PR #42 landed before the failure' \
+   && printf '%s' "$err" | grep -q 'the other writes that succeeded before the failure are attributed to nathanjohnpayne'; then
+  pass "edit: a body PATCH and a label before a failed reviewer request report the body unattributed and the label attributed"
+else
+  fail "edit partial body and label: rc=$rc err=$err"
+fi
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REVIEWERS_FAIL=1 STUB_EVENT_ACTOR='claude[bot]' as_author -- gh pr edit 42 --repo o/r --body-file "$COMMENT_FILE" --add-label x --add-reviewer nathanpayne-codex 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'note: the body edit of PR #42 landed before the failure' && printf '%s' "$err" | grep -q 'not attributed to'; then
+  pass "edit: the unattributed body is still named when a foreign label event fails the partial readback (5)"
+else
+  fail "edit partial body foreign: rc=$rc err=$err"
+fi
 # A write that succeeded must show its own expected-login event: when the
 # label's event never appears before the reviewer request fails, the label is
 # unattributed (5), not merely "no foreign actor seen" (Codex on #2178).

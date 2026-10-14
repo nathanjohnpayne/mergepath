@@ -648,6 +648,7 @@ gh_rest_check_close_events() { # <events>
 }
 
 # gh_rest_partial_failure <repo> <N> <events before, or ""> <url> <checker>
+#                         [<unattributed write> [<evented: 1|0>]]
 # After a write sequence stopped partway, the writes that landed must still be
 # attributed. First the writes known to have succeeded must show their
 # expected-login events, through <checker> and gh_rest_readback, which the
@@ -655,9 +656,13 @@ gh_rest_check_close_events() { # <events>
 # is unattributed (Codex on #2178). Then, because the write that failed may
 # have landed anyway, the new events of every kind these verbs produce are
 # scanned for an actor other than the expected login. Returns 5 when either
-# check fails, 1 when both pass.
+# check fails, 1 when both pass. A write that landed but produces no event (a
+# body edit) is named as unattributed on every path rather than folded into
+# the attributed ones, and <evented> 0 says no evented write landed at all, so
+# the closing line claims no attribution (Codex on #2178).
 gh_rest_partial_failure() {
-  local repo="$1" number="$2" before="$3" url="$4" checker="$5" positive=0
+  local repo="$1" number="$2" before="$3" url="$4" checker="$5" unattributed="${6:-}" evented="${7:-1}" positive=0
+  [ -z "$unattributed" ] || gh_rest_err "note: $unattributed landed before the failure and is not attributable over REST (no event records who edited a body); nothing here verified its byline."
   gh_rest_readback "$repo" "$number" "$before" "$checker" || positive=$?
   if [ "$positive" -ne 0 ]; then
     [ "$positive" -ne 3 ] || gh_rest_err "ERROR the events of PR #$number could not be read."
@@ -696,7 +701,13 @@ gh_rest_partial_failure() {
     sleep "$delay"
     attempt=$((attempt + 1))
   done
-  gh_rest_err "the writes that succeeded before the failure are attributed to $GH_REST_EXPECTED, and no event by another login appeared."
+  if [ "$evented" = "0" ]; then
+    gh_rest_err "no write that GitHub records as an event landed before the failure, and no event by another login appeared."
+  elif [ -n "$unattributed" ]; then
+    gh_rest_err "the other writes that succeeded before the failure are attributed to $GH_REST_EXPECTED, and no event by another login appeared."
+  else
+    gh_rest_err "the writes that succeeded before the failure are attributed to $GH_REST_EXPECTED, and no event by another login appeared."
+  fi
   return 1
 }
 
@@ -1231,15 +1242,26 @@ gh_rest_pr_edit() {
   if ! gh_rest_edit_writes; then
     # Earlier writes may have landed. Only the writes that succeeded are
     # attributed positively; the rest are scanned for another login.
-    gh_rest_done patch || { title_op=0; base_op=0; }
+    # A body that landed has no event to attribute it by, so it is reported
+    # as unattributed rather than counted among the verified writes.
+    local body_landed="" evented=1
+    if gh_rest_done patch; then
+      [ "$body_op" -eq 0 ] || body_landed="the body edit of PR #$number"
+    else
+      title_op=0; base_op=0
+    fi
     gh_rest_done add-labels || add_labels_json="[]"
-    remove_labels_json="$(gh_rest_lines_json "$GH_REST_REMOVED_LABELS")"
+    remove_labels_json="$(gh_rest_lines_json "$GH_REST_REMOVED_LABELS" | jq -c .)"
     gh_rest_done add-reviewers || add_reviewers_json="[]"
     gh_rest_done remove-reviewers || remove_reviewers_json="[]"
     gh_rest_done add-assignees || add_assignees_json="[]"
     gh_rest_done remove-assignees || remove_assignees_json="[]"
+    if [ "$title_op" -eq 0 ] && [ "$base_op" -eq 0 ] \
+       && [ "$add_labels_json$remove_labels_json$add_reviewers_json$remove_reviewers_json$add_assignees_json$remove_assignees_json" = "[][][][][][]" ]; then
+      evented=0
+    fi
     rc=0
-    gh_rest_partial_failure "$repo" "$number" "$before" "$url" gh_rest_check_edit_events || rc=$?
+    gh_rest_partial_failure "$repo" "$number" "$before" "$url" gh_rest_check_edit_events "$body_landed" "$evented" || rc=$?
     return "$rc"
   fi
 
