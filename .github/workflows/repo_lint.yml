@@ -667,6 +667,7 @@ jobs:
       # Both travel with the scripts/workflow/ kit, so the suite runs on
       # every consumer too; it is fixture-driven with a PATH-shimmed gh.
       - name: check_stalled_pr_resume
+        if: matrix.shard == 2
         run: ./scripts/ci/check_stalled_pr_resume || { rc=$?; if [ ! -f scripts/ci/check_stalled_pr_resume ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_stalled_pr_resume not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_resolve_pr_threads
