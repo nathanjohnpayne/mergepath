@@ -1329,6 +1329,13 @@ paths:
       - ".github/workflows/required-check-publisher.yml"
   # Exercises the live publisher's CodeRabbit-only #886 summary hold by
   # extracting and running its shipped gate helper and live caller lines.
+  # Exercises the live publish step's due-only event-pass targeting (#1130)
+  # against JSON fixtures, applying the step's own --jq filters.
+  - path: tests/test_required_check_publisher_due.sh
+    type: canonical
+    consumers: all
+    requires:
+      - ".github/workflows/required-check-publisher.yml"
   - path: tests/test_required_check_publisher_summary_hold.sh
     type: canonical
     consumers: all
@@ -2456,6 +2463,7 @@ paths:
       - ".github/workflows/pr-review-policy.yml"  # #1249 parsed native gate trigger fence
       - "tests/test_required_check_publisher_dedup.sh"  # check_required_check_publisher behavior suite (#1130)
       - "tests/test_required_check_publisher_summary_hold.sh"  # CodeRabbit rc-3 publication hold (#886)
+      - "tests/test_required_check_publisher_due.sh"  # due-only event-pass targeting (#1130)
       - ".github/workflows/pr-audit.yml"       # check_pr_audit_codex_clearance
       - ".github/workflows/repo_lint.yml"      # check_ci_scripts_wired scans it; bidirectional with its requires: scripts/ci/ (#601)
       - "scripts/coderabbit-should-invoke.sh"   # check_coderabbit_wait (#1084)
