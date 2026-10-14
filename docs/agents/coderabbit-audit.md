@@ -35,7 +35,7 @@ The docs confirm `chill` is the default and that `assertive` is the "more feedba
 
 ### `auto_incremental_review: true` — pinned explicitly (config change)
 
-Default is `true` ("re-run the review on each push"). We previously inherited it implicitly. The audit pins it explicitly because the fix-up-commit loop (reviewer identity posts a fix commit → expects a fresh CodeRabbit pass on the new HEAD) depends on it, and `scripts/coderabbit-wait.sh` anchors clearance on the current HEAD committer date. An accidental `false` (or a future default flip) would mean CodeRabbit reviews only the opening commit and ignores subsequent pushes — `coderabbit-wait.sh` would then time out (exit 4) waiting for a HEAD review that never comes. Explicit `true` removes that ambiguity.
+Default is `true` ("re-run the review on each push"). We previously inherited it implicitly. The audit pins it explicitly because the fix-up-commit loop (the agent pushes a fix commit authored as `nathanjohnpayne` → expects a fresh CodeRabbit pass on the new HEAD) depends on it; the reviewer identity attributes review API activity, not fix commits. `scripts/coderabbit-wait.sh` anchors clearance on the current HEAD committer date. An accidental `false` (or a future default flip) would mean CodeRabbit reviews only the opening commit and ignores subsequent pushes — `coderabbit-wait.sh` would then time out (exit 4) waiting for a HEAD review that never comes. Explicit `true` removes that ambiguity.
 
 ### `auto_pause_after_reviewed_commits` — deliberate hub threshold and resume safety net
 
