@@ -532,6 +532,18 @@ pkg "$r/packages/app" "$FB_PROD" "$FB_DEV"; pkg "$r/packages/moo" "react" ""
 write_config "$r" "$TYPE_GROUPS"
 expect "a reversed range [z-a] matches only its endpoints (Ruby) and never crashes" 1 "$r" "firebase-sdk"
 
+r="$(new_repo ws-root-extglob)"
+printf '{"name":"root","private":true,"workspaces":["!(docs)"]}\n' > "$r/package.json"
+pkg "$r/app" "$FB_PROD" "$FB_DEV"; pkg "$r/docs" "react" ""
+write_config "$r" "$TYPE_GROUPS"
+expect "a root-level !(docs) is a Yarn extglob, not a skipped !-pattern" 1 "$r" "firebase-sdk"
+
+r="$(new_repo ws-nohoist)"
+printf '{"name":"root","private":true,"workspaces":{"packages":["packages/*"],"nohoist":["tools/*"]}}\n' > "$r/package.json"
+pkg "$r/packages/app" "react" ""; pkg "$r/tools/rules" "$FB_PROD" "$FB_DEV"
+write_config "$r" "$TYPE_GROUPS"
+expect "object-form workspaces also read nohoist (dependabot-core values_at)" 1 "$r" "firebase-sdk"
+
 r="$(new_repo pnpm-ancestor-catalog)"
 printf '{"name":"root","private":true}\n' > "$r/package.json"
 printf 'catalog:\n  firebase: ^13.0.0\n' > "$r/pnpm-workspace.yaml"

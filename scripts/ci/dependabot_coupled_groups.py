@@ -435,7 +435,8 @@ def workspace_config(tree: Tree, rel: str, pkg: dict) -> Tuple[List[str], Dict[s
     catalog: Dict[str, str] = {}
     spec = pkg.get("workspaces")
     if isinstance(spec, dict):
-        spec = spec.get("packages")
+        # dependabot-core reads both keys: values_at("packages", "nohoist").
+        spec = [p for key in ("packages", "nohoist") if isinstance(spec.get(key), list) for p in spec[key]]
     if isinstance(spec, list):
         patterns += [p for p in spec if isinstance(p, str)]
     pnpm = nearest(tree, rel, "pnpm-workspace.yaml")
@@ -463,9 +464,11 @@ def workspace_config(tree: Tree, rel: str, pkg: dict) -> Tuple[List[str], Dict[s
 def workspace_dirs(tree: Tree, rel: str, patterns: List[str], entry: dict) -> List[str]:
     include: List[str] = []
     for pattern in patterns:
-        if pattern.startswith("!"):
+        if pattern.startswith("!") and not EXTGLOB.match(pattern):
             # dependabot-core fetches "!x" as a literal path with no manifest:
             # it contributes nothing and, unlike pnpm itself, excludes nothing.
+            # A leading Yarn extglob such as "!(docs)" is NOT that: it falls
+            # through and expands like any other !(x) pattern.
             continue
         positive, negated = expand_pattern(pattern)
         # Each pattern's own !(x) ignore filters only that pattern's matches,
