@@ -667,6 +667,7 @@ jobs:
       # Both travel with the scripts/workflow/ kit, so the suite runs on
       # every consumer too; it is fixture-driven with a PATH-shimmed gh.
       - name: check_stalled_pr_resume
+        if: matrix.shard == 2
         run: ./scripts/ci/check_stalled_pr_resume || { rc=$?; if [ ! -f scripts/ci/check_stalled_pr_resume ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_stalled_pr_resume not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_resolve_pr_threads
@@ -748,6 +749,7 @@ jobs:
       # them, or their coupled majors open as separate PRs that each fail npm ci.
       # Needs the PyYAML provisioned by install_python_ci_dependencies above.
       - name: check_dependabot_coupled_groups
+        if: matrix.shard == 1
         run: ./scripts/ci/check_dependabot_coupled_groups --check || { rc=$?; if [ ! -f scripts/ci/check_dependabot_coupled_groups ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_dependabot_coupled_groups not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_auto_clear_workflow
