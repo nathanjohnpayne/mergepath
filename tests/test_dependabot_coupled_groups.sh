@@ -45,6 +45,13 @@
 #  36. exclude-paths ** is recursive                                     → PASS
 #  37. recursive workspace patterns reach nested manifests               → FAIL
 #  38. lerna.json packages are evaluated                                 → FAIL
+#  39. target-branch reads that branch's ref; unavailable fails closed; base-ref reads the checkout
+#  40. negations as dependabot-core applies them: !(x) ignores the literal x;
+#      !(a|b) and !-prefixed patterns exclude nothing
+#  41. pnpm catalog / catalogs entries are production dependencies, read
+#      from the nearest pnpm-workspace.yaml (entry dir, then its parents)
+#  42. directories **/* reaches nested projects
+#  43. --fix integrity check fails closed on a malformed re-parse
 #
 # Needs python3 with PyYAML. repo_lint provisions PyYAML for every
 # self-test leg; a bare local shell without it SKIPs loudly (and CI fails).
@@ -427,6 +434,211 @@ printf '{"packages":["packages/*"]}\n' > "$r/lerna.json"
 pkg "$r/packages/app" "$FB_PROD" "$FB_DEV"
 write_config "$r" "$TYPE_GROUPS"
 expect "lerna.json packages are evaluated (root declares none)" 1 "$r" "firebase-sdk"
+
+# #2177: remaining Dependabot npm features.
+
+gitc() { git -C "$1" -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false "${@:2}"; }
+
+# CI exports these; the target-branch cases below control them explicitly.
+saved_base_ref="${GITHUB_BASE_REF-}"; saved_ref_name="${GITHUB_REF_NAME-}"
+unset GITHUB_BASE_REF GITHUB_REF_NAME
+
+r="$(new_repo target-branch)"; pkg "$r" "react" "vitest"; write_config "$r" "$TYPE_GROUPS" '    target-branch: "develop"'
+gitc "$r" init -q -b main && gitc "$r" add -A && gitc "$r" commit -q -m main
+gitc "$r" checkout -q -b develop && pkg "$r" "$FB_PROD" "$FB_DEV" && gitc "$r" commit -qam develop && gitc "$r" checkout -q main
+expect "target-branch manifests are read from that branch's ref" 1 "$r" "reading manifests from target-branch ref refs/heads/develop"
+N=$((N + 1))
+tb_out="$(python3 "$CHECKER" --root "$r" 2>&1 || true)"
+if grep -q "family 'firebase-sdk'" <<<"$tb_out"; then
+  PASS=$((PASS + 1)); echo "  PASS [$N] the split exists only on the target branch and is reported"
+else FAIL=$((FAIL + 1)); echo "  FAIL [$N] target-branch split not reported" >&2; fi
+
+r="$(new_repo target-branch-missing)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "$r" "$TYPE_GROUPS" '    target-branch: "release"'
+gitc "$r" init -q -b main && gitc "$r" add -A && gitc "$r" commit -q -m main
+expect "an unavailable target-branch fails closed" 2 "$r" "target-branch 'release' is not available"
+
+r="$(new_repo target-branch-is-base)"; pkg "$r" "react" "vitest"; write_config "$r" "$TYPE_GROUPS" '    target-branch: "release"'
+gitc "$r" init -q -b main && gitc "$r" add -A && gitc "$r" commit -q -m main
+N=$((N + 1))
+tb_out="$(GITHUB_BASE_REF=release python3 "$CHECKER" --root "$r" 2>&1 || true)"
+if grep -q "PASS" <<<"$tb_out"; then
+  PASS=$((PASS + 1)); echo "  PASS [$N] target-branch equal to the PR base reads the checkout"
+else FAIL=$((FAIL + 1)); echo "  FAIL [$N] target-branch == GITHUB_BASE_REF should read the checkout" >&2; fi
+
+[ -n "$saved_base_ref" ] && export GITHUB_BASE_REF="$saved_base_ref"
+[ -n "$saved_ref_name" ] && export GITHUB_REF_NAME="$saved_ref_name"
+
+r="$(new_repo yarn-extglob)"
+printf '{"name":"root","private":true,"workspaces":["packages/!(docs)"]}\n' > "$r/package.json"
+pkg "$r/packages/app" "$FB_PROD" "$FB_DEV"; pkg "$r/packages/docs" "react" ""
+write_config "$r" "$TYPE_GROUPS"
+expect "Yarn !(docs) still selects packages/app" 1 "$r" 'directory "/": family '"'"'firebase-sdk'"'"
+
+r="$(new_repo yarn-extglob-negated)"
+printf '{"name":"root","private":true,"workspaces":["packages/!(docs|site)"],"dependencies":{"firebase":"^13.0.0"}}\n' > "$r/package.json"
+pkg "$r/packages/docs" "" "@firebase/rules-unit-testing"; pkg "$r/packages/site" "" "@firebase/rules-unit-testing"; pkg "$r/packages/app" "react" ""
+write_config "$r" "$TYPE_GROUPS"
+expect "Yarn !(docs|site) is one literal ignored glob, so neither workspace is dropped" 1 "$r" "firebase-sdk"
+
+r="$(new_repo pnpm-negation)"
+printf '{"name":"root","private":true,"dependencies":{"firebase":"^13.0.0"}}\n' > "$r/package.json"
+printf 'packages:\n  - "packages/*"\n  - "!packages/fixture"\n' > "$r/pnpm-workspace.yaml"
+pkg "$r/packages/fixture" "" "@firebase/rules-unit-testing"; pkg "$r/packages/app" "react" ""
+write_config "$r" "$TYPE_GROUPS"
+expect "a !-prefixed workspace pattern excludes nothing (dependabot-core fetches it literally)" 1 "$r" "firebase-sdk"
+
+r="$(new_repo yarn-extglob-single)"
+printf '{"name":"root","private":true,"workspaces":["packages/!(docs)"],"dependencies":{"firebase":"^13.0.0"}}\n' > "$r/package.json"
+pkg "$r/packages/docs" "" "@firebase/rules-unit-testing"; pkg "$r/packages/app" "react" ""
+write_config "$r" "$TYPE_GROUPS"
+expect "Yarn !(docs) drops packages/docs" 0 "$r" "PASS"
+
+r="$(new_repo yarn-extglob-reincluded)"
+printf '{"name":"root","private":true,"workspaces":["packages/!(docs)","packages/docs"],"dependencies":{"firebase":"^13.0.0"}}\n' > "$r/package.json"
+pkg "$r/packages/docs" "" "@firebase/rules-unit-testing"; pkg "$r/packages/app" "react" ""
+write_config "$r" "$TYPE_GROUPS"
+expect "a later pattern re-includes what an earlier !(docs) ignored (per-pattern scope)" 1 "$r" "firebase-sdk"
+
+# Workspace globs use Ruby File.fnmatch(FNM_PATHNAME), as dependabot-core does.
+r="$(new_repo ws-dot-slash)"
+printf '{"name":"root","private":true,"workspaces":["./packages/*"]}\n' > "$r/package.json"
+pkg "$r/packages/app" "$FB_PROD" "$FB_DEV"
+write_config "$r" "$TYPE_GROUPS"
+expect "a leading ./ in a workspace glob is normalised away" 1 "$r" "firebase-sdk"
+
+r="$(new_repo ws-hidden)"
+printf '{"name":"root","private":true,"workspaces":["packages/*"],"dependencies":{"firebase":"^13.0.0"}}\n' > "$r/package.json"
+pkg "$r/packages/.fixture" "" "@firebase/rules-unit-testing"; pkg "$r/packages/app" "react" ""
+write_config "$r" "$TYPE_GROUPS"
+expect "packages/* does not match a hidden packages/.fixture (no FNM_DOTMATCH)" 0 "$r" "PASS"
+
+r="$(new_repo ws-char-class)"
+printf '{"name":"root","private":true,"workspaces":["packages/[af]*"]}\n' > "$r/package.json"
+pkg "$r/packages/app" "$FB_PROD" "$FB_DEV"
+write_config "$r" "$TYPE_GROUPS"
+expect "a [set] character class in a workspace glob is honoured" 1 "$r" "firebase-sdk"
+
+r="$(new_repo ws-class-escape)"
+cat > "$r/package.json" <<'JSON'
+{"name":"root","private":true,"workspaces":["packages/[a\\-c]*"]}
+JSON
+pkg "$r/packages/-app" "$FB_PROD" "$FB_DEV"
+write_config "$r" "$TYPE_GROUPS"
+expect "an escaped \\- inside a class is a literal hyphen, as Ruby fnmatch reads it" 1 "$r" "firebase-sdk"
+
+r="$(new_repo ws-class-reversed)"
+printf '{"name":"root","private":true,"workspaces":["packages/[z-a]*"]}\n' > "$r/package.json"
+pkg "$r/packages/app" "$FB_PROD" "$FB_DEV"; pkg "$r/packages/moo" "react" ""
+write_config "$r" "$TYPE_GROUPS"
+expect "a reversed range [z-a] matches only its endpoints (Ruby) and never crashes" 1 "$r" "firebase-sdk"
+
+r="$(new_repo ws-root-extglob)"
+printf '{"name":"root","private":true,"workspaces":["!(docs)"]}\n' > "$r/package.json"
+pkg "$r/app" "$FB_PROD" "$FB_DEV"; pkg "$r/docs" "react" ""
+write_config "$r" "$TYPE_GROUPS"
+expect "a root-level !(docs) is a Yarn extglob, not a skipped !-pattern" 1 "$r" "firebase-sdk"
+
+r="$(new_repo ws-nohoist)"
+printf '{"name":"root","private":true,"workspaces":{"packages":["packages/*"],"nohoist":["tools/*"]}}\n' > "$r/package.json"
+pkg "$r/packages/app" "react" ""; pkg "$r/tools/rules" "$FB_PROD" "$FB_DEV"
+write_config "$r" "$TYPE_GROUPS"
+expect "object-form workspaces also read nohoist (dependabot-core values_at)" 1 "$r" "firebase-sdk"
+
+r="$(new_repo ws-no-star-literal)"
+printf '{"name":"root","private":true,"workspaces":["packages/ap?"]}\n' > "$r/package.json"
+pkg "$r/packages/app" "$FB_PROD" "$FB_DEV"
+write_config "$r" "$TYPE_GROUPS"
+expect "a workspace pattern without * is a literal path (dependabot-core fast path)" 0 "$r" "PASS"
+
+r="$(new_repo dirs-single-star)"
+pkg "$r" "$FB_PROD" "$FB_DEV"; pkg "$r/web" "react" ""
+cat > "$r/.github/dependabot.yml" <<'YAML'
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directories:
+      - "*"
+    schedule:
+      interval: "weekly"
+    groups:
+      dev-dependencies:
+        dependency-type: "development"
+      production-dependencies:
+        dependency-type: "production"
+YAML
+expect "directories: [\"*\"] is the layer below the root, not the root itself" 0 "$r" "PASS"
+
+r="$(new_repo pnpm-ancestor-catalog)"
+printf '{"name":"root","private":true}\n' > "$r/package.json"
+printf 'catalog:\n  firebase: ^13.0.0\n' > "$r/pnpm-workspace.yaml"
+printf '{"name":"app","dependencies":{"firebase":"catalog:"},"devDependencies":{"@firebase/rules-unit-testing":"^6.0.0"}}\n' > "$r/packages/app/package.json" 2>/dev/null || { mkdir -p "$r/packages/app"; printf '{"name":"app","dependencies":{"firebase":"catalog:"},"devDependencies":{"@firebase/rules-unit-testing":"^6.0.0"}}\n' > "$r/packages/app/package.json"; }
+cat > "$r/.github/dependabot.yml" <<'YAML'
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/packages/app"
+    schedule:
+      interval: "weekly"
+    groups:
+      dev-dependencies:
+        dependency-type: "development"
+      production-dependencies:
+        dependency-type: "production"
+YAML
+expect "an entry below the root reads its ancestor's pnpm catalog" 1 "$r" 'directory "/packages/app": family '"'"'firebase-sdk'"'"
+
+r="$(new_repo pnpm-catalog)"
+printf '{"name":"root","private":true,"dependencies":{"firebase":"catalog:"},"devDependencies":{"@firebase/rules-unit-testing":"catalog:"}}\n' > "$r/package.json"
+printf 'catalog:\n  firebase: ^13.0.0\n  "@firebase/rules-unit-testing": ^6.0.0\n' > "$r/pnpm-workspace.yaml"
+write_config "$r" "$TYPE_GROUPS"
+expect "pnpm catalog entries are production, so both share the production group" 0 "$r" "PASS"
+
+r="$(new_repo pnpm-catalogs-named)"
+printf '{"name":"root","private":true,"dependencies":{"firebase":"catalog:web"},"devDependencies":{"@firebase/rules-unit-testing":"^6.0.0"}}\n' > "$r/package.json"
+printf 'catalogs:\n  web:\n    firebase: ^13.0.0\n' > "$r/pnpm-workspace.yaml"
+write_config "$r" "$TYPE_GROUPS"
+expect "a named catalog member still splits from a plain dev member" 1 "$r" "@firebase/rules-unit-testing -> dev-dependencies"
+
+r="$(new_repo recursive-directories)"
+pkg "$r" "react" "vitest"; pkg "$r/services/team/web" "$FB_PROD" "$FB_DEV"
+cat > "$r/.github/dependabot.yml" <<'YAML'
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directories:
+      - "**/*"
+    schedule:
+      interval: "weekly"
+    groups:
+      dev-dependencies:
+        dependency-type: "development"
+      production-dependencies:
+        dependency-type: "production"
+YAML
+expect "directories **/* reaches nested projects" 1 "$r" 'directory "/services/team/web"'
+
+N=$((N + 1))
+if python3 - "$CHECKER" <<'PYT'
+import importlib.util, sys, tempfile, os
+spec = importlib.util.spec_from_file_location("dcg", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+import yaml
+d = tempfile.mkdtemp(); path = os.path.join(d, "dependabot.yml")
+open(path, "w").write('version: 2\nupdates:\n  - package-ecosystem: "npm"\n    directory: "/"\n    groups:\n      dev-dependencies:\n        dependency-type: "development"\n')
+config = yaml.safe_load(open(path))
+fam = {"group": "firebase-sdk", "patterns": ["firebase"], "rationale": "x"}
+real = yaml.safe_load
+yaml.safe_load = lambda text: ["not", "a", "mapping"]
+try:
+    m.apply_fix(path, config, [{"entry": 0, "family": fam, "has_named_group": False}])
+except m.ConfigError as exc:
+    assert "file left unchanged" in str(exc), exc
+    sys.exit(0)
+finally:
+    yaml.safe_load = real
+sys.exit(1)
+PYT
+then PASS=$((PASS + 1)); echo "  PASS [$N] --fix integrity check fails closed on a malformed re-parse"
+else FAIL=$((FAIL + 1)); echo "  FAIL [$N] --fix integrity check did not raise ConfigError" >&2; fi
 
 r="$(new_repo named-late)"; pkg "$r" "$FB_PROD" "$FB_DEV"; write_config "$r" "$TYPE_GROUPS
 $FAMILY_GROUP"
