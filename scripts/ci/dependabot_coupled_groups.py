@@ -368,22 +368,21 @@ def workspace_config(tree: Tree, rel: str, pkg: dict) -> Tuple[List[str], Dict[s
 
 def workspace_dirs(tree: Tree, rel: str, patterns: List[str], entry: dict) -> List[str]:
     include: List[str] = []
-    exclude: List["re.Pattern[str]"] = []
     for pattern in patterns:
         if pattern.startswith("!"):
             # dependabot-core fetches "!x" as a literal path with no manifest:
             # it contributes nothing and, unlike pnpm itself, excludes nothing.
             continue
         positive, negated = expand_pattern(pattern)
-        exclude += [path_glob(join(rel, n) if rel else n.strip("/")) for n in negated]
+        # Each pattern's own !(x) ignore filters only that pattern's matches,
+        # as dependabot-core's flat_map does; a later pattern can re-include.
+        ignore = [path_glob(join(rel, n) if rel else n.strip("/")) for n in negated]
         for hit in glob_dirs(tree, rel, positive):
-            if hit != rel and hit not in include:
+            if hit != rel and hit not in include and not any(rx.fullmatch(hit) for rx in ignore):
                 include.append(hit)
     out = []
     for ws in include:
         if not tree.isfile(join(ws, "package.json")):
-            continue
-        if any(rx.fullmatch(ws) for rx in exclude):
             continue
         rel_to_entry = posixpath.relpath(ws, rel) if rel else ws
         if excluded(entry, rel_to_entry):

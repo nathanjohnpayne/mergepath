@@ -493,6 +493,12 @@ pkg "$r/packages/docs" "" "@firebase/rules-unit-testing"; pkg "$r/packages/app" 
 write_config "$r" "$TYPE_GROUPS"
 expect "Yarn !(docs) drops packages/docs" 0 "$r" "PASS"
 
+r="$(new_repo yarn-extglob-reincluded)"
+printf '{"name":"root","private":true,"workspaces":["packages/!(docs)","packages/docs"],"dependencies":{"firebase":"^13.0.0"}}\n' > "$r/package.json"
+pkg "$r/packages/docs" "" "@firebase/rules-unit-testing"; pkg "$r/packages/app" "react" ""
+write_config "$r" "$TYPE_GROUPS"
+expect "a later pattern re-includes what an earlier !(docs) ignored (per-pattern scope)" 1 "$r" "firebase-sdk"
+
 r="$(new_repo pnpm-ancestor-catalog)"
 printf '{"name":"root","private":true}\n' > "$r/package.json"
 printf 'catalog:\n  firebase: ^13.0.0\n' > "$r/pnpm-workspace.yaml"
