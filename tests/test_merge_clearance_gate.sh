@@ -2027,6 +2027,12 @@ mcg22_case b 's{(      - name: Open the required check_run[^\n]*\n)}{$1        i
 #     intact; only the parse sees that the job is unreachable.
 mcg22_case c 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: false}sm' \
   fail "[#850 producer eligibility] job 'scheduled-sweep'"
+# c2 — #2220: the sweep's find step defers to the required-check publisher
+#     only on that publisher's EXACT path. A condition naming any other file
+#     could switch the sweep off where no publisher runs, so it must trip the
+#     step pin; the canonical condition is the positive control above (case I).
+mcg22_case c2 's{required-check-publisher\.yml\x27\) == \x27\x27}{some-other-workflow.yml\x27) == \x27\x27}' \
+  fail "[#850 producer eligibility] step 'Find open PRs' in job 'scheduled-sweep'"
 # d — #849 hole 1: phase 2 loses its own HEAD_SHA. A job-scoped grep for the
 #     binding is satisfied by phase 1's.
 mcg22_case d 's{(      - name: Close the required check_run.*?)^          HEAD_SHA: [^\n]*\n}{$1}sm' \
@@ -4705,6 +4711,72 @@ if [ -x "$AC_CHECK" ] && [ -f "$AC_WF" ]; then
 else
   echo "SKIP: Test 27 (#2167) auto-clear cases — check_auto_clear_workflow or its workflow absent"
 fi
+unset RCP_TAG
+fi
+
+# ---------------------------------------------------------------------------
+# Test 28 (#2220): the installation-budget fences.
+#
+# Two assertions in scripts/ci/check_required_check_publisher, each read
+# across two files, and the budget-guard knobs:
+#
+#   * A16 — the publish step's DUE_MAX_AGE_SECONDS equals the gate parent's
+#     sweep interval. It was left at 900 when #2167 moved the sweep to */30,
+#     so every green PR fell due again after 15 minutes. Either side drifting
+#     must trip it, and a cron it cannot read must trip it too.
+#   * A16 knobs — BUDGET_PER_PR_REQUESTS and BUDGET_RESERVE_REQUESTS are
+#     required integers; a missing one silently turns the guard off.
+#   * A17 — the gate sweep's `Find open PRs` step defers to the publisher on
+#     the publisher's exact path, required and exact: deleting the condition
+#     doubles the clearance evaluation per scheduled tick with nothing red.
+#
+# Same posture as Tests 25 and 27: fixtures are derived from the canonical
+# files, every mutation has a no-op guard, and every negative case names
+# the assertion it expects.
+# ---------------------------------------------------------------------------
+if [ ! -x "$RCP_CHECK" ] || [ ! -f "$RCP_WF" ]; then
+  echo; echo "SKIP: Test 28 (#2220) — publisher or its fence absent"
+elif ! python3 -c "import yaml" >/dev/null 2>&1; then
+  echo; echo "SKIP: Test 28 (#2220) — PyYAML unavailable, the fence's tier does not run"
+elif ! command -v perl >/dev/null 2>&1 || ! declare -f rcp_dir_case >/dev/null 2>&1; then
+  echo; echo "SKIP: Test 28 (#2220) — perl or the Test 25 harness unavailable"
+else
+echo; echo "--- Test 28 (#2220): due threshold, budget knobs, one scheduled evaluation per PR"
+RCP_TAG='#2220'
+RCP_DIR="${RCP_DIR:-$WORKDIR/rcp}"
+mkdir -p "$RCP_DIR"
+
+rcp_case due-canonical '' pass
+# ── A16: the due threshold follows the sweep interval, both directions ──
+rcp_case due-stale-900 \
+  's{DUE_MAX_AGE_SECONDS: "1800"}{DUE_MAX_AGE_SECONDS: "900"}' \
+  fail '[rcp due threshold]'
+rcp_case due-missing \
+  's{^          DUE_MAX_AGE_SECONDS: "1800"\n}{}m' \
+  fail '[rcp due threshold]'
+rcp_dir_case due-cron-moved \
+  'perl -0777 -i -pe "s{cron: \"\*/30 \* \* \* \*\"}{cron: \"*/15 * * * *\"}" merge-clearance-gate.yml' \
+  fail '[rcp due threshold]'
+rcp_dir_case due-cron-unreadable \
+  'perl -0777 -i -pe "s{cron: \"\*/30 \* \* \* \*\"}{cron: \"0,30 * * * *\"}" merge-clearance-gate.yml' \
+  fail 'carries no single'
+# ── budget-guard knobs ──────────────────────────────────────────────────
+rcp_case budget-per-pr-malformed \
+  's{BUDGET_PER_PR_REQUESTS: "40"}{BUDGET_PER_PR_REQUESTS: "forty"}' \
+  fail '[rcp budget guard]'
+rcp_case budget-per-pr-zero \
+  's{BUDGET_PER_PR_REQUESTS: "40"}{BUDGET_PER_PR_REQUESTS: "0"}' \
+  fail '[rcp budget guard]'
+rcp_case budget-reserve-missing \
+  's{^          BUDGET_RESERVE_REQUESTS: "100"\n}{}m' \
+  fail '[rcp budget guard]'
+# ── A17: the gate sweep defers to the publisher ─────────────────────────
+rcp_dir_case sweep-defer-removed \
+  'perl -0777 -i -pe "s{^        if: hashFiles\(\x27\.github/workflows/required-check-publisher\.yml\x27\) == \x27\x27\n}{}m" merge-clearance-gate.yml' \
+  fail '[rcp single scheduled evaluation]'
+rcp_dir_case sweep-defer-other-path \
+  'perl -0777 -i -pe "s{required-check-publisher\.yml\x27\) == }{other-publisher.yml\x27) == }" merge-clearance-gate.yml' \
+  fail '[rcp single scheduled evaluation]'
 unset RCP_TAG
 fi
 

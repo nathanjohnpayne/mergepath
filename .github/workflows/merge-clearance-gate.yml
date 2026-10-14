@@ -95,12 +95,15 @@ on:
     types: [merge-clearance-recheck]
   # Periodic sweep — the only backstop for transitions that fire no
   # Actions event (👍 reaction, UI label resolve, GITHUB_TOKEN relabel).
-  # */30 since #2167 (was */15, mirroring codex-p1-gate.yml): each tick runs
-  # this sweep job AND chains one publisher full pass, about 390 installation-
-  # token requests at 8 open PRs, and the three */15 sweeps together spent
-  # about twice the 1,000/hr budget. Lint completion is event-driven through
-  # the publisher's repo-lint parent, so only no-event transitions wait for
-  # this tick: up to 30 minutes. Pinned by check_required_check_publisher.
+  # */30 since #2167 (was */15, mirroring codex-p1-gate.yml). Each tick
+  # chains one publisher full pass (about 243 installation-token requests at
+  # 8 open PRs); since #2220 the scheduled-sweep job below defers to that
+  # pass wherever the publisher exists, instead of evaluating the clearance
+  # script a second time (about 147 more). Lint completion is event-driven
+  # through the publisher's repo-lint parent, so only no-event transitions
+  # wait for this tick: up to 30 minutes. Pinned by
+  # check_required_check_publisher, which also pins the publisher's
+  # DUE_MAX_AGE_SECONDS to this interval (A16).
   schedule:
     - cron: "*/30 * * * *"
 
@@ -412,7 +415,10 @@ jobs:
     # coalesces into the push-time suite — so a job-native completion can
     # never retire a Checks-API entry (#841). Since #841 the event-driven job
     # publishes into this same slot, so every producer of this context carries
-    # the same verdict. Idempotent.
+    # the same verdict. Idempotent. Since #2220 it evaluates only where the
+    # required-check publisher is absent: elsewhere that publisher's chained
+    # schedule-parent pass is the one scheduled evaluation of every open PR
+    # (see the `Find open PRs` step condition).
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     # Only this job needs checks:write — it POSTs a check_run per open PR.
@@ -433,6 +439,22 @@ jobs:
 
       - name: Find open PRs
         id: find
+        # ONE scheduled evaluation per PR per tick (#2220, the sweep half of
+        # #845 PR 4). Wherever the required-check publisher exists on the
+        # default branch, this run's completion chains its schedule-parent
+        # pass, which evaluates every open PR with all three gate scripts and
+        # writes this same Checks-API slot — so evaluating the clearance
+        # script here as well spent about 147 more installation-budget
+        # requests per tick (8 open PRs) for a verdict the publisher
+        # overwrites moments later. Skipping this step leaves
+        # steps.find.outputs.prs empty, so the evaluate step below skips on
+        # its own pinned condition. A repository without the publisher (a
+        # consumer mid-rollout) keeps this sweep exactly as it was: the
+        # deferral is decided by the file the chained pass would run, so a
+        # renamed or deleted publisher fails back to sweeping. The schedule
+        # itself stays: it is what fires the publisher's chained pass (the
+        # publisher carries no cron of its own until PR 4).
+        if: hashFiles('.github/workflows/required-check-publisher.yml') == ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}

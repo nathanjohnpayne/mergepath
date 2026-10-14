@@ -1101,7 +1101,20 @@ for key in PRODUCERS:
 # close step carrying the sweep's find-guard would pass a global allowlist
 # while that expression is false in a job with no `find` step — every pinned
 # condition is valid only where its referenced outputs exist.
+#
+# The sweep's find step is the one deliberate exception to "a producer step
+# always runs" (#2220, the sweep half of #845 PR 4): where the required-check
+# publisher exists on the default branch, this workflow's scheduled run
+# chains that publisher's full pass, which evaluates every open PR with the
+# same script and writes the same Checks-API slot, so the sweep defers to it
+# rather than evaluating each PR twice per tick. The condition is pinned to
+# the publisher's exact path, so it can only switch the sweep off where that
+# file is present, and a renamed or deleted publisher fails back to sweeping.
+# check_required_check_publisher pins the same condition from the
+# publisher's side (A17), required and exact, so deleting it is a diff too.
 STEP_IF_ALLOWED = {
+    ("scheduled-sweep", "Find open PRs"):
+        "hashFiles('.github/workflows/required-check-publisher.yml') == ''",
     ("scheduled-sweep", "Re-evaluate gate per PR and post check_run"):
         "steps.find.outputs.prs != ''",
     ("merge-clearance-gate", "Close the required check_run (#841 phase 2)"):
