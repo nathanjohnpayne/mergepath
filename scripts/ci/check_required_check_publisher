@@ -1223,7 +1223,8 @@ elif sweep_seconds is not None and str(due_age) != str(sweep_seconds):
         "      as the sweep interval: shorter re-evaluates every green PR more often",
         "      than the sweep (the 900-at-*/30 drift behind #2220), longer lets a",
         "      verdict outlive a quiet period the sweep already allowed.")
-for knob, minimum in (("BUDGET_PER_PR_REQUESTS", 1), ("BUDGET_RESERVE_REQUESTS", 0)):
+for knob, minimum in (("BUDGET_PER_PR_REQUESTS", 1), ("BUDGET_RESERVE_REQUESTS", 0),
+                      ("BUDGET_PER_PR_GRAPHQL_POINTS", 1), ("BUDGET_GRAPHQL_RESERVE_POINTS", 0)):
     value = publish_env.get(knob)
     if not (isinstance(value, str) and value.isdigit() and int(value) >= minimum):
         bad("FAIL: [rcp budget guard] the publish step's %s is %r, not a quoted" % (knob, value),
@@ -1234,30 +1235,55 @@ for knob, minimum in (("BUDGET_PER_PR_REQUESTS", 1), ("BUDGET_RESERVE_REQUESTS",
 
 # ── A17 — the gate sweep defers to this publisher (#2220) ──────────────
 #
-# One scheduled evaluation per PR per tick. Where this publisher exists, the
-# gate parent's scheduled run chains its full pass, which evaluates every
-# open PR and writes the same Checks-API slot as the gate's own sweep; the
-# sweep's `Find open PRs` step therefore skips on the publisher's presence
-# (and its evaluate step, pinned on steps.find.outputs.prs by
-# check_merge_clearance_gate, skips with it). Required and exact: deleting
+# One scheduled evaluation per PR per tick. Where this publisher is active,
+# the gate parent's scheduled run chains its full pass, which evaluates
+# every open PR and writes the same Checks-API slot as the gate's own sweep;
+# the sweep's `Find open PRs` step therefore skips when the sweep's
+# publisher-state step (id `publisher`, earlier in the same job) reports the
+# publisher active, and its evaluate step (pinned on steps.find.outputs.prs
+# by check_merge_clearance_gate) skips with it. Required and exact: deleting
 # the condition doubles the clearance evaluation per tick (about 147
-# requests at 8 open PRs) with nothing else going red, and a condition
-# naming any other path could switch the sweep off where no publisher runs.
-SWEEP_DEFER_IF = "hashFiles('.github/workflows/required-check-publisher.yml') == ''"
+# requests at 8 open PRs) with nothing else going red. The state step must
+# read THIS publisher's workflow state and defer only on `active` — a file
+# check alone survives a UI disable that stops every chained delivery (Codex
+# P2 on #2225). That last property is read from the step's shell TEXT (the
+# same disclosed exception as A2): it proves the read and the comparison are
+# present, not how the shell combines them.
+SWEEP_DEFER_IF = "steps.publisher.outputs.active != 'true'"
+SWEEP_STATE_NEEDLES = (
+    'repos/$REPO/actions/workflows/required-check-publisher.yml',
+    '[ "$state" = "active" ]',
+)
 if isinstance(gate_parent_doc, dict):
     sweep_job = (gate_parent_doc.get("jobs") or {}).get("scheduled-sweep")
-    find_steps = [s for s in ((sweep_job or {}).get("steps") or [])
-                  if isinstance(s, dict) and s.get("name") == "Find open PRs"] \
+    sweep_steps = [s for s in ((sweep_job or {}).get("steps") or []) if isinstance(s, dict)] \
         if isinstance(sweep_job, dict) else []
-    got_if = find_steps[0].get("if") if len(find_steps) == 1 else None
+    find_idx = [i for i, s in enumerate(sweep_steps) if s.get("name") == "Find open PRs"]
+    state_idx = [i for i, s in enumerate(sweep_steps) if s.get("id") == "publisher"]
+    got_if = sweep_steps[find_idx[0]].get("if") if len(find_idx) == 1 else None
     if got_if is None or " ".join(str(got_if).split()) != SWEEP_DEFER_IF:
         bad("FAIL: [rcp single scheduled evaluation] %s scheduled-sweep's `Find open"
             % PARENT_WORKFLOW,
             "      PRs` step has if: %r, not exactly %r." % (got_if, SWEEP_DEFER_IF),
             "      Each scheduled tick must evaluate each open PR once (#2220): the",
             "      gate's scheduled run chains this publisher's full pass, so the gate",
-            "      sweep defers wherever this file exists and sweeps only where it",
-            "      does not.")
+            "      sweep defers wherever this publisher is active and sweeps only",
+            "      where it is not.")
+    elif len(state_idx) != 1 or state_idx[0] > find_idx[0]:
+        bad("FAIL: [rcp single scheduled evaluation] %s scheduled-sweep has %d step(s)"
+            % (PARENT_WORKFLOW, len(state_idx)),
+            "      with id `publisher` before `Find open PRs`; exactly one is required,",
+            "      because the find step's pinned condition reads its output. Without",
+            "      it the output is empty and the sweep always runs.")
+    else:
+        body = strip_shell_comments(str(sweep_steps[state_idx[0]].get("run") or ""))
+        missing = [n for n in SWEEP_STATE_NEEDLES if n not in body]
+        if missing:
+            bad("FAIL: [rcp single scheduled evaluation] the sweep's publisher-state step",
+                "      lacks %r. It must read this publisher's workflow state and" % missing,
+                "      report active only for `active`: a file check alone survives a",
+                "      UI disable, after which no chained pass runs and the clearance",
+                "      context has no scheduled refresh at all (Codex P2 on #2225).")
 
 if failures:
     print("\n".join(failures))

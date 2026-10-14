@@ -1108,13 +1108,16 @@ for key in PRODUCERS:
 # chains that publisher's full pass, which evaluates every open PR with the
 # same script and writes the same Checks-API slot, so the sweep defers to it
 # rather than evaluating each PR twice per tick. The condition is pinned to
-# the publisher's exact path, so it can only switch the sweep off where that
-# file is present, and a renamed or deleted publisher fails back to sweeping.
-# check_required_check_publisher pins the same condition from the
-# publisher's side (A17), required and exact, so deleting it is a diff too.
+# the output of the sweep's own publisher-state step, which reports active
+# only when the publisher's file exists AND its workflow state is `active`,
+# so a deleted, renamed or disabled publisher fails back to sweeping (Codex
+# P2 on #2225: a file alone survives a UI disable that stops the chain).
+# check_required_check_publisher pins the same condition and that step from
+# the publisher's side (A17), required and exact, so deleting either is a
+# diff too.
 STEP_IF_ALLOWED = {
     ("scheduled-sweep", "Find open PRs"):
-        "hashFiles('.github/workflows/required-check-publisher.yml') == ''",
+        "steps.publisher.outputs.active != 'true'",
     ("scheduled-sweep", "Re-evaluate gate per PR and post check_run"):
         "steps.find.outputs.prs != ''",
     ("merge-clearance-gate", "Close the required check_run (#841 phase 2)"):

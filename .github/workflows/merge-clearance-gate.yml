@@ -416,19 +416,21 @@ jobs:
     # never retire a Checks-API entry (#841). Since #841 the event-driven job
     # publishes into this same slot, so every producer of this context carries
     # the same verdict. Idempotent. Since #2220 it evaluates only where the
-    # required-check publisher is absent: elsewhere that publisher's chained
-    # schedule-parent pass is the one scheduled evaluation of every open PR
-    # (see the `Find open PRs` step condition).
+    # required-check publisher is absent or inactive: elsewhere that
+    # publisher's chained schedule-parent pass is the one scheduled evaluation
+    # of every open PR (see the publisher-state step).
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     # Only this job needs checks:write — it POSTs a check_run per open PR.
     # issues:read for the same /issues/{pr}/comments + /issues/{pr}/reactions
     # reads the event-driven job needs (Codex P2 on PR #429).
+    # actions:read for the publisher-state read below (#2220).
     permissions:
       contents: read
       pull-requests: read
       issues: read
       checks: write
+      actions: read
     steps:
       - name: Checkout repo (default branch — trusted scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -436,6 +438,34 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Check whether the required-check publisher runs here
+        id: publisher
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          # The sweep below defers ONLY to a publisher that will actually
+          # receive this run's workflow_run delivery (#2220; Codex P2 on
+          # #2225): the file must exist on the default branch AND the
+          # workflow must be `active`. A publisher disabled in the Actions
+          # UI still has its file, but gets no chained delivery, so file
+          # presence alone would leave no scheduled clearance refresh at all.
+          # Absent, disabled, renamed or unreadable all mean: sweep here
+          # (fail toward evaluating). One request per tick.
+          state=""
+          if [ -f .github/workflows/required-check-publisher.yml ]; then
+            state=$(gh api "repos/$REPO/actions/workflows/required-check-publisher.yml" \
+                      --jq .state 2>/dev/null) || state=""
+          fi
+          if [ "$state" = "active" ]; then
+            echo "active=true" >> "$GITHUB_OUTPUT"
+            echo "The required-check publisher is active; its chained schedule-parent pass is this tick's one evaluation of every open PR (#2220)."
+          else
+            echo "active=false" >> "$GITHUB_OUTPUT"
+            echo "Required-check publisher state is '${state:-absent or unreadable}'; sweeping here (#2220)."
+          fi
 
       - name: Find open PRs
         id: find
@@ -448,13 +478,14 @@ jobs:
         # requests per tick (8 open PRs) for a verdict the publisher
         # overwrites moments later. Skipping this step leaves
         # steps.find.outputs.prs empty, so the evaluate step below skips on
-        # its own pinned condition. A repository without the publisher (a
-        # consumer mid-rollout) keeps this sweep exactly as it was: the
-        # deferral is decided by the file the chained pass would run, so a
-        # renamed or deleted publisher fails back to sweeping. The schedule
-        # itself stays: it is what fires the publisher's chained pass (the
+        # its own pinned condition. A repository without an ACTIVE publisher
+        # (a consumer mid-rollout, or one disabled in the Actions UI) keeps
+        # this sweep exactly as it was: the previous step decides from the
+        # publisher's file and its workflow state, so a renamed, deleted or
+        # disabled publisher fails back to sweeping. The schedule itself
+        # stays: it is what fires the publisher's chained pass (the
         # publisher carries no cron of its own until PR 4).
-        if: hashFiles('.github/workflows/required-check-publisher.yml') == ''
+        if: steps.publisher.outputs.active != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}

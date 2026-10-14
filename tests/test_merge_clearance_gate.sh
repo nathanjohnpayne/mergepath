@@ -2028,10 +2028,11 @@ mcg22_case b 's{(      - name: Open the required check_run[^\n]*\n)}{$1        i
 mcg22_case c 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: false}sm' \
   fail "[#850 producer eligibility] job 'scheduled-sweep'"
 # c2 — #2220: the sweep's find step defers to the required-check publisher
-#     only on that publisher's EXACT path. A condition naming any other file
-#     could switch the sweep off where no publisher runs, so it must trip the
-#     step pin; the canonical condition is the positive control above (case I).
-mcg22_case c2 's{required-check-publisher\.yml\x27\) == \x27\x27}{some-other-workflow.yml\x27) == \x27\x27}' \
+#     only when the sweep's own state step reports it ACTIVE. An inverted
+#     condition sweeps exactly when the publisher already evaluates and stops
+#     when it does not, so it must trip the step pin; the canonical condition
+#     is the positive control above (case I).
+mcg22_case c2 's{steps\.publisher\.outputs\.active != \x27true\x27}{steps.publisher.outputs.active == \x27true\x27}' \
   fail "[#850 producer eligibility] step 'Find open PRs' in job 'scheduled-sweep'"
 # d — #849 hole 1: phase 2 loses its own HEAD_SHA. A job-scoped grep for the
 #     binding is satisfied by phase 1's.
@@ -4772,11 +4773,23 @@ rcp_case budget-reserve-missing \
   fail '[rcp budget guard]'
 # ── A17: the gate sweep defers to the publisher ─────────────────────────
 rcp_dir_case sweep-defer-removed \
-  'perl -0777 -i -pe "s{^        if: hashFiles\(\x27\.github/workflows/required-check-publisher\.yml\x27\) == \x27\x27\n}{}m" merge-clearance-gate.yml' \
+  'perl -0777 -i -pe "s{^        if: steps\.publisher\.outputs\.active != \x27true\x27\n}{}m" merge-clearance-gate.yml' \
   fail '[rcp single scheduled evaluation]'
-rcp_dir_case sweep-defer-other-path \
-  'perl -0777 -i -pe "s{required-check-publisher\.yml\x27\) == }{other-publisher.yml\x27) == }" merge-clearance-gate.yml' \
+rcp_dir_case sweep-defer-inverted \
+  'perl -0777 -i -pe "s{active != \x27true\x27}{active == \x27true\x27}" merge-clearance-gate.yml' \
   fail '[rcp single scheduled evaluation]'
+# The state step must exist before the find step, and must read the
+# publisher's WORKFLOW STATE rather than only its file: a file survives a UI
+# disable that stops every chained delivery (Codex P2 on #2225).
+rcp_dir_case sweep-state-step-missing \
+  'perl -0777 -i -pe "s{^        id: publisher\n}{        id: publisher_state\n}m" merge-clearance-gate.yml' \
+  fail 'with id `publisher` before `Find open PRs`'
+rcp_dir_case sweep-state-file-only \
+  'perl -0777 -i -pe "s{\[ \"\\\$state\" = \"active\" \]}{[ -f .github/workflows/required-check-publisher.yml ]}" merge-clearance-gate.yml' \
+  fail 'publisher-state step'
+rcp_case budget-gql-per-pr-missing \
+  's{^          BUDGET_PER_PR_GRAPHQL_POINTS: "10"\n}{}m' \
+  fail '[rcp budget guard]'
 unset RCP_TAG
 fi
 
