@@ -544,6 +544,12 @@ pkg "$r/packages/app" "react" ""; pkg "$r/tools/rules" "$FB_PROD" "$FB_DEV"
 write_config "$r" "$TYPE_GROUPS"
 expect "object-form workspaces also read nohoist (dependabot-core values_at)" 1 "$r" "firebase-sdk"
 
+r="$(new_repo ws-no-star-literal)"
+printf '{"name":"root","private":true,"workspaces":["packages/ap?"]}\n' > "$r/package.json"
+pkg "$r/packages/app" "$FB_PROD" "$FB_DEV"
+write_config "$r" "$TYPE_GROUPS"
+expect "a workspace pattern without * is a literal path (dependabot-core fast path)" 0 "$r" "PASS"
+
 r="$(new_repo pnpm-ancestor-catalog)"
 printf '{"name":"root","private":true}\n' > "$r/package.json"
 printf 'catalog:\n  firebase: ^13.0.0\n' > "$r/pnpm-workspace.yaml"

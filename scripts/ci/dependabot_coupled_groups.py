@@ -394,10 +394,17 @@ def workspace_pattern(pattern: str) -> str:
 def workspace_glob_dirs(tree: Tree, base: str, pattern: str) -> List[str]:
     """Workspace directories under ``base`` matching ``pattern`` with fnmatch semantics."""
     pat = workspace_pattern(pattern)
-    if not any(ch in pat for ch in "*?["):
+    # dependabot-core's find_directories fast path: a pattern (and, through
+    # recursive_find_directories, each path segment) without "*" is a literal
+    # path even if it contains "?" or "[". Only "*" segments are globbed.
+    if "*" not in pat:
         target = join(base, pat)
         return [target] if target in tree.dirs() else []
-    rx = fnmatch_glob(f"{base}/{pat}" if base else pat)
+    def literal(seg: str) -> str:
+        return re.sub(r"([?\[\]\\])", r"\\\1", seg)
+    segs = [seg if "*" in seg else literal(seg) for seg in pat.split("/")]
+    head = [literal(seg) for seg in base.split("/")] if base else []
+    rx = fnmatch_glob("/".join(head + segs))
     return [d for d in tree.dirs() if d != base and rx.fullmatch(d)]
 
 
