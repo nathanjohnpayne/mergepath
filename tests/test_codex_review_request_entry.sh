@@ -140,8 +140,8 @@ case "$endpoint" in
     # timings (an 1800s poll), so it ends the run at the first read past
     # the entry decision instead. Reaching this read at all proves the
     # decision was to request. CODEX_TEST_FAIL_PR_FETCH=N refuses the Nth
-    # metadata read: 1 for a decision that reads nothing, 2 when the #2257
-    # derivation reads the metadata once inside the decision.
+    # metadata read: 1 for a decision that reads nothing, 3 when the #2257
+    # derivation reads the metadata and re-reads the head inside it.
     n=0
     [ -f "$CODEX_TEST_STATE_DIR/pr-fetch-count" ] && n=$(cat "$CODEX_TEST_STATE_DIR/pr-fetch-count")
     n=$((n + 1))
@@ -165,6 +165,7 @@ case "$endpoint" in
          labels:$labels, changed_files:$changed}
         | if $mode == "no-labels" then del(.labels)
           elif $mode == "no-changed-files" then del(.changed_files)
+          elif $mode == "no-base" then del(.base)
           else . end'
     fi ;;
   repos/owner/repo/pulls/999/files)
@@ -176,7 +177,12 @@ case "$endpoint" in
     fi
     default_files='[{"filename":"src/app.ts","additions":10,"deletions":2}]'
     printf '%s\n' "${CODEX_TEST_FILES_JSON:-$default_files}" ;;
-  'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha') cat "$CODEX_TEST_STATE_DIR/base-review-policy.yml" ;;
+  'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha')
+    if [ "${CODEX_TEST_BASE_POLICY:-ok}" = fail ]; then
+      echo "stub: base policy read refused" >&2
+      exit 1
+    fi
+    cat "$CODEX_TEST_STATE_DIR/base-review-policy.yml" ;;
   repos/owner/repo/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa) printf '%s\n' "$now" ;;
   repos/owner/repo/issues/999/timeline)      printf '[]\n' ;;
   repos/owner/repo/pulls/999/reviews)        printf '[]\n' ;;
@@ -393,7 +399,8 @@ assert_policy_skips_unset() {
   local name=$1 policy=$2 dir rc
   dir=$(make_case "rbd-$name" "  enabled: true")
   printf '%s\n' "$policy" >"$dir/.github/review-policy.yml"
-  rc=$(CODEX_TEST_FAIL_PR_FETCH=2 run_case "$dir" false)
+  # Reads 1 and 2 are the #2257 derivation (metadata, head re-read).
+  rc=$(CODEX_TEST_FAIL_PR_FETCH=3 run_case "$dir" false)
   if [ "$rc" != "5" ]; then
     fail "rbd $name: exit $rc, expected 5 (unset ⇒ false); stderr=$(cat "$dir/err.log")"
   elif grep -q 'WARN: cannot read codex.request_by_default' "$dir/err.log"; then
@@ -568,10 +575,10 @@ test_malformed_head_age_fails_only_the_write_path() {
 files_reads() {
   if [ -f "$1/state/files-reads" ]; then wc -l <"$1/state/files-reads" | tr -d ' '; else printf '0\n'; fi
 }
-derive_case() {  # <name> [top-level policy lines]
+derive_case() {  # <name> [top-level lines for the GOVERNING base policy]
   local dir
   dir=$(make_case "derive-$1" "  enabled: true")
-  [ -z "${2:-}" ] || printf '%s\n' "$2" >>"$dir/.github/review-policy.yml"
+  [ -z "${2:-}" ] || printf '%s\n' "$2" >>"$dir/state/base-review-policy.yml"
   printf '%s\n' "$dir"
 }
 # Args: <label> <dir> <rc> <reason substring>
@@ -598,6 +605,18 @@ assert_failsafe_request() {
     fail "derive fail-safe $label: missing a warning naming '$cause'; stderr=$(cat "$dir/err.log")"
   else
     pass "#2257 derive fail-safe: $label ⇒ requested with a warning naming the cause"
+  fi
+}
+# A fail-safe whose cause also breaks the reads after the decision ends at
+# exit 3 past "fetching HEAD commit metadata", which still proves the
+# decision was to request. Args: <label> <dir> <rc> <cause substring>
+assert_failsafe_request_at_fetch() {
+  local label=$1 dir=$2 rc=$3 cause=$4
+  if [ "$rc" = "3" ] && grep -q 'fetching HEAD commit metadata' "$dir/err.log" \
+     && grep -F 'WARN: cannot derive the Phase 4 gate:' "$dir/err.log" | grep -Fq "$cause"; then
+    pass "#2257 derive fail-safe: $label ⇒ requested with a warning naming the cause"
+  else
+    fail "derive fail-safe $label: exit $rc, expected 3 past a request decision with a warning naming '$cause'; stderr=$(cat "$dir/err.log")"
   fi
 }
 # Args: <label> <dir> <rc>
@@ -728,6 +747,39 @@ test_derive_failsafe() {
   rm -f "$dir/scripts/workflow/external_review_fingerprint.sh"
   rc=$(run_case "$dir" false)
   assert_failsafe_request "a missing generated-file exclusion" "$dir" "$rc" "cannot read the generated-file exclusion"
+  dir=$(derive_case base-policy-unread)
+  rc=$(CODEX_TEST_BASE_POLICY=fail run_case "$dir" false)
+  assert_failsafe_request_at_fetch "an unreadable governing base policy" "$dir" "$rc" "could not resolve the governing review policy at main@base-sha"
+  dir=$(derive_case meta-no-base)
+  rc=$(CODEX_TEST_PR_META=no-base run_case "$dir" false)
+  assert_failsafe_request_at_fetch "PR metadata without a base" "$dir" "$rc" "has no readable head sha, base ref, base sha or default branch"
+  # Head fence: the re-read before a skip sees another head, so the verdict
+  # (an under-threshold PR) no longer describes the PR.
+  local count
+  dir=$(derive_case head-moved)
+  rc=$(run_case "$dir" false bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)
+  count=$(trigger_count "$dir")
+  if [ "$count" = "1" ] && [ "$rc" != "5" ] \
+     && grep -q 'WARN: cannot derive the Phase 4 gate: the PR head moved from aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa to bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' "$dir/err.log"; then
+    pass "#2257 derive fail-safe: a head that moves during the derivation ⇒ requested with a warning naming the cause"
+  else
+    fail "derive fail-safe head-moved: exit $rc / trigger count $count, expected a request with the head-moved warning; stderr=$(cat "$dir/err.log")"
+  fi
+}
+
+# The threshold and paths come from the GOVERNING base policy, not the
+# script checkout's copy (Codex P1 on #2258).
+test_derive_reads_governing_policy() {
+  local dir rc
+  # The checkout lowers the threshold to 50; the base keeps the default 300.
+  dir=$(derive_case governing-threshold)
+  printf '%s\n' "external_review_threshold: 50" >>"$dir/.github/review-policy.yml"
+  rc=$(CODEX_TEST_FILES_JSON='[{"filename":"src/a.ts","additions":40,"deletions":20}]' run_case "$dir" false)
+  assert_derived_skip "a lower threshold in the checkout only" "$dir" "$rc"
+  # The base protects a path the checkout does not list.
+  dir=$(derive_case governing-paths 'external_review_paths:'$'\n''  - "src/**"')
+  rc=$(run_case "$dir" false)
+  assert_derived_request "a protected path in the base policy only" "$dir" "$rc" "protected paths changed: src/app.ts"
 }
 
 # The derivation never runs where the decision is already made: a caller
@@ -831,6 +883,7 @@ test_enabled_false_never_triggers
 test_malformed_head_age_fails_only_the_write_path
 test_derive_signals
 test_derive_failsafe
+test_derive_reads_governing_policy
 test_derive_not_run_when_decided
 test_timeout_head_drift_fails_closed_without_marker
 test_new_trigger_replaces_superseded_timeout_marker

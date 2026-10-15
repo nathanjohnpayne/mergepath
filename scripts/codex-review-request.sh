@@ -796,11 +796,12 @@ esac
 # the PR is requested with a WARN naming the cause. That includes the PR
 # metadata, its label list, the paginated file list, a file list that is
 # EMPTY or disagrees with the PR's changed_files count (a short read is not a
-# small PR), the threshold or the path list in the policy, the exclusion
-# constant, and the matcher. A skip therefore needs every signal positively
-# read as "not gated". Threshold and paths come from the checkout's policy,
-# like request_by_default: this decides the agent's request, not the merge,
-# which the merge clearance gate re-derives under the governing policy.
+# small PR), the governing base policy or its threshold or path list, the
+# exclusion constant, the matcher, and a head that moved during the reads. A
+# skip therefore needs every signal positively read as "not gated" for one
+# head. Threshold and paths come from the policy that governs the PR (its
+# base, at the base sha), as the labeler and the merge clearance gate read
+# them, not from this checkout's copy.
 phase_4a_gate_failsafe() {  # <cause>
   PHASE_4A_GATED=true
   PHASE_4A_GATE_REASON="$1"
@@ -812,8 +813,8 @@ phase_4a_gate_derived() {  # <reason>
   log "Phase 4 gate derived from the PR: $1 — requesting Codex (#2257)"
 }
 derive_phase_4a_gate() {
-  local yq_bin=${MERGEPATH_YQ_BIN:-yq} pr_json has_label changed_files files_json files_tmp files_count
-  local present tag threshold exclude_re lines paths_type patterns_json pattern_count pattern matcher changed matched rc=0
+  local pr_json has_label changed_files files_json files_tmp files_count head_sha base_ref base_sha default_branch
+  local policy_json threshold exclude_re lines patterns_json pattern_count pattern matcher changed matched live_head rc=0
   local -a patterns=()
 
   pr_json=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>/dev/null) || {
@@ -826,6 +827,16 @@ derive_phase_4a_gate() {
       and all(.labels[]; type == "object" and ((.name | type) == "string"))
       and (.changed_files | type) == "number"' >/dev/null 2>&1; then
     phase_4a_gate_failsafe "the PR metadata for $REPO#$PR_NUMBER has no readable labels or changed_files count"
+    return 0
+  fi
+  # The snapshot every later read is bound to: the head the decision is about
+  # and the base whose policy governs it.
+  head_sha=$(printf '%s' "$pr_json" | jq -r '.head.sha // "" | strings') || head_sha=""
+  base_ref=$(printf '%s' "$pr_json" | jq -r '.base.ref // "" | strings') || base_ref=""
+  base_sha=$(printf '%s' "$pr_json" | jq -r '.base.sha // "" | strings') || base_sha=""
+  default_branch=$(printf '%s' "$pr_json" | jq -r '.base.repo.default_branch // "" | strings') || default_branch=""
+  if [ -z "$head_sha" ] || [ -z "$base_ref" ] || [ -z "$base_sha" ] || [ -z "$default_branch" ]; then
+    phase_4a_gate_failsafe "the PR metadata for $REPO#$PR_NUMBER has no readable head sha, base ref, base sha or default branch"
     return 0
   fi
   has_label=$(printf '%s' "$pr_json" | jq -r '[.labels[].name] | index("needs-external-review") != null') || has_label=""
@@ -877,21 +888,30 @@ derive_phase_4a_gate() {
     return 0
   fi
 
-  # Threshold: absent means the documented default 300; present must be a
-  # non-negative YAML integer. resolve_request_by_default has already proved
-  # that $CONFIG parses with $yq_bin before this runs.
-  present=$("$yq_bin" 'has("external_review_threshold")' "$CONFIG" 2>/dev/null) || present=""
-  case "$present" in
-    false) threshold=300 ;;
-    true)
-      tag=$("$yq_bin" '.external_review_threshold | tag' "$CONFIG" 2>/dev/null) || tag=""
-      threshold=$("$yq_bin" '.external_review_threshold' "$CONFIG" 2>/dev/null) || threshold=""
-      if [ "$tag" != "!!int" ] || ! [[ "$threshold" =~ ^[0-9]+$ ]]; then
-        phase_4a_gate_failsafe "external_review_threshold in $CONFIG is not a non-negative integer ('$threshold', tag ${tag:-unknown})"
-        return 0
-      fi ;;
-    *) phase_4a_gate_failsafe "could not read external_review_threshold from $CONFIG"; return 0 ;;
-  esac
+  # Threshold and protected paths come from the policy that GOVERNS the PR:
+  # its base, fetched at the base sha of the snapshot above (Codex P1 on
+  # #2258). The script's own checkout may be another repository, or the
+  # candidate's own edited policy.
+  policy_json=$(crqe_governing_policy_json "$REPO" "$PR_NUMBER" "$CONFIG" \
+    "$__CODEX_REQUEST_DIR/workflow/resolve_base_policy.sh" \
+    "$base_ref" "$base_sha" "$default_branch") || policy_json=""
+  if [ -z "$policy_json" ]; then
+    phase_4a_gate_failsafe "could not resolve the governing review policy at $base_ref@$base_sha"
+    return 0
+  fi
+  # Absent means the documented default 300; present must be a non-negative
+  # integer (a quoted "300" is a string, not a number).
+  threshold=$(printf '%s' "$policy_json" | jq -r '
+    if has("external_review_threshold") | not then 300
+    elif (.external_review_threshold | type) == "number"
+         and .external_review_threshold >= 0
+         and (.external_review_threshold | floor) == .external_review_threshold
+    then .external_review_threshold
+    else "invalid" end' 2>/dev/null) || threshold=""
+  if ! [[ "$threshold" =~ ^[0-9]+$ ]]; then
+    phase_4a_gate_failsafe "external_review_threshold in the governing policy is not a non-negative integer"
+    return 0
+  fi
   exclude_re=$(sed -n "s/^EXCLUDE_RE='\(.*\)'\$/\1/p" "$__CODEX_REQUEST_DIR/workflow/external_review_fingerprint.sh" 2>/dev/null | head -1) || exclude_re=""
   if [ -z "$exclude_re" ]; then
     phase_4a_gate_failsafe "cannot read the generated-file exclusion (EXCLUDE_RE) from scripts/workflow/external_review_fingerprint.sh"
@@ -908,28 +928,18 @@ derive_phase_4a_gate() {
     return 0
   fi
 
-  # Paths: absent or empty means no protected paths; anything other than a
+  # Paths: absent or null means no protected paths; anything other than a
   # list of non-empty strings is unreadable.
-  present=$("$yq_bin" 'has("external_review_paths")' "$CONFIG" 2>/dev/null) || present=""
-  case "$present" in
-    false) patterns_json='[]' ;;
-    true)
-      paths_type=$("$yq_bin" '.external_review_paths | type' "$CONFIG" 2>/dev/null) || paths_type=""
-      case "$paths_type" in
-        '!!null') patterns_json='[]' ;;
-        '!!seq')
-          patterns_json=$("$yq_bin" -o=json -I=0 '.external_review_paths' "$CONFIG" 2>/dev/null) || patterns_json=""
-          if ! printf '%s' "$patterns_json" | jq -e 'type == "array" and all(.[]; type == "string" and length > 0)' >/dev/null 2>&1; then
-            phase_4a_gate_failsafe "external_review_paths in $CONFIG is not a list of non-empty strings"
-            return 0
-          fi ;;
-        *) phase_4a_gate_failsafe "external_review_paths in $CONFIG is not a list (${paths_type:-unreadable})"; return 0 ;;
-      esac ;;
-    *) phase_4a_gate_failsafe "could not read external_review_paths from $CONFIG"; return 0 ;;
-  esac
-  pattern_count=$(printf '%s' "$patterns_json" | jq 'length') || pattern_count=""
+  patterns_json=$(printf '%s' "$policy_json" | jq -c '
+    if has("external_review_paths") | not then []
+    elif .external_review_paths == null then []
+    elif (.external_review_paths | type) == "array"
+         and all(.external_review_paths[]; type == "string" and length > 0)
+    then .external_review_paths
+    else "invalid" end' 2>/dev/null) || patterns_json=""
+  pattern_count=$(printf '%s' "$patterns_json" | jq 'if type == "array" then length else "invalid" end' 2>/dev/null) || pattern_count=""
   if ! [[ "$pattern_count" =~ ^[0-9]+$ ]]; then
-    phase_4a_gate_failsafe "could not count external_review_paths"
+    phase_4a_gate_failsafe "external_review_paths in the governing policy is not a list of non-empty strings"
     return 0
   fi
   if [ "$pattern_count" -gt 0 ]; then
@@ -955,8 +965,23 @@ derive_phase_4a_gate() {
     fi
   fi
 
+  # Head fence (Codex P1 on #2258): every read above describes $head_sha. A
+  # push landing during them could put a gated head behind an under-threshold
+  # verdict, and this skip path never reaches the moving-head guard. Re-read
+  # the head immediately before reporting "not gated"; drift or an unreadable
+  # head counts as gated.
+  live_head=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha' 2>/dev/null) || live_head=""
+  if [ -z "$live_head" ]; then
+    phase_4a_gate_failsafe "could not re-read the PR head before skipping"
+    return 0
+  fi
+  if [ "$live_head" != "$head_sha" ]; then
+    phase_4a_gate_failsafe "the PR head moved from $head_sha to $live_head during the derivation"
+    return 0
+  fi
+
   PHASE_4A_GATED=false
-  PHASE_4A_GATE_REASON="no needs-external-review label, $lines lines changed < external_review_threshold $threshold, no file matches external_review_paths"
+  PHASE_4A_GATE_REASON="no needs-external-review label, $lines lines changed < external_review_threshold $threshold, no file matches external_review_paths (head $head_sha)"
   log "Phase 4 gate derived from the PR: not gated ($PHASE_4A_GATE_REASON) — #2257"
 }
 
