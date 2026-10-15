@@ -364,6 +364,10 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     inside a function body.  Crediting a `set +x` bash never runs is a silent
     false negative and is trivially reachable -- `set -x; f() { set +x; }` --
     while refusing a real one costs a visible finding a pragma settles.
+    Multiline if/case/do-done/brace source nesting and continued &&/|| lists
+    likewise refuse disable credit (#1458), without evaluating execution. The
+    shared function iterator retains function exclusions and physical offsets;
+    independent subshell behavior and standalone disables remain unchanged.
   * A credential NAME split by a LINE CONTINUATION.  Bash removes
     `\\<newline>` before it parses the expansion, so `$GH_\\<newline>TOKEN`
     names GH_TOKEN and prints its value; matching the raw text stopped at the
@@ -1460,6 +1464,7 @@ class Lexer:
         self.unsupported_ansi_sources = []  # Non-alias source-proof failures.
         self.ansi_c_quote_spans = []  # Literal DATA ranges, including child source.
         self.comment_offsets = set()
+        self.xtrace_context_events = []  # (physical offset, segment, token, keyword position)
         self.function_source_children = []  # (original body offset, child Lexer)
         # Set when the text ends while a here-doc body is still open.  The
         # scanner has lost sync with the file at that point, and a silent
@@ -1474,6 +1479,10 @@ class Lexer:
             body_offset + i for i in sub.quoted_data_offsets
         )
         self.comment_offsets.update(body_offset + i for i in sub.comment_offsets)
+        self.xtrace_context_events.extend(
+            (body_offset + pos, seg, word, eligible)
+            for pos, seg, word, eligible in sub.xtrace_context_events
+        )
         self.function_source_children.append((body_offset, sub))
         self.unsupported_ansi_aliases.extend(
             body_offset + i for i in sub.unsupported_ansi_aliases
@@ -1634,6 +1643,7 @@ class Lexer:
         # --with-token` is one command list, and ending the logical line at
         # the newline would strand the emitter with no consumer.
         pipe_open = [False]
+        list_open = [False]  # A trailing &&/|| continues the same logical list.
 
         def cur_level():
             return levels[-1]
@@ -1645,9 +1655,15 @@ class Lexer:
             lv = cur_level()
             if lv["word"]:
                 w = "".join(lv["word"])
+                eligible = lv.get("xtrace_keyword_prefix", True)
+                self.xtrace_context_events.append((i, lv["seg"], w, eligible))
+                lv["xtrace_keyword_prefix"] = eligible and (
+                    w in RESERVED_WORDS or w == "time"
+                )
                 lv["seg"].words.append(w)
                 lv["word"] = []
                 pipe_open[0] = False
+                list_open[0] = False
                 if w == "case":
                     case_depth[0] += 1
                 elif w == "esac" and case_depth[0] > 0:
@@ -1670,9 +1686,11 @@ class Lexer:
                     return False
             return bool(_ASSIGN_RE.match("".join(lv["word"])))
 
-        def start_segment(pipe=False):
+        def start_segment(pipe=False, xtrace_boundary=True):
             finish_word()
             lv = cur_level()
+            if xtrace_boundary:
+                lv["xtrace_keyword_prefix"] = True
             prev = lv["seg"]
             seg = self._new_segment(lv["seg"].parent, lv["capture"], line)
             seg.parent = lv["seg"].parent
@@ -1692,6 +1710,7 @@ class Lexer:
             cur_ll = LogicalLine(next_line)
             self.logical.append(cur_ll)
             lv = levels[0]
+            lv["xtrace_keyword_prefix"] = True
             seg = self._new_segment(None, False, next_line)
             lv["seg"] = seg
             cur_ll.segments.append(seg)
@@ -2064,7 +2083,7 @@ class Lexer:
                 if pending_heredocs:
                     in_heredoc = pending_heredocs.pop(0)
                     continue
-                if pipe_open[0] and not cur_level()["seg"].words:
+                if (pipe_open[0] or list_open[0]) and not cur_level()["seg"].words:
                     # A trailing `|` continues the command list onto the next
                     # physical line, exactly as a trailing `\` does.  Ending
                     # the logical line here would drop the pipe link and read
@@ -2084,6 +2103,9 @@ class Lexer:
                 continue
 
             if c == ";":
+                if text[i:i + 2] in (";;", ";&") and text[i - 1:i] != ";":
+                    end_op = text[i:i + 3] if text.startswith(";;&", i) else text[i:i + 2]
+                    self.xtrace_context_events.append((i, cur_level()["seg"], end_op, True))
                 start_segment()
                 i += 1
                 continue
@@ -2139,6 +2161,7 @@ class Lexer:
             if c == "&":
                 if text[i + 1 : i + 2] == "&":
                     start_segment()
+                    list_open[0] = True
                     i += 2
                     continue
                 if text[i + 1 : i + 2] == ">":
@@ -2159,6 +2182,7 @@ class Lexer:
             if c == "|":
                 if i + 1 < n and text[i + 1] == "|":
                     start_segment()
+                    list_open[0] = True
                     i += 2
                     continue
                 # `|&` is `2>&1 |`.  Its consumer is a real command, but the
@@ -2204,6 +2228,11 @@ class Lexer:
                     line += inner.count("\n")
                     i = j
                     continue
+                # Admission metadata keeps pattern parens independent of the
+                # legacy case_depth counter, without changing Lexer tokens.
+                self.xtrace_context_events.append(
+                    (i, cur_level()["seg"], "(", not word_so_far)
+                )
                 # Record declarations only for builtin provenance; body-span
                 # discovery remains the independent #1647 seam.
                 if re.match(r"\((?:[ \t]|\\\n)*\)", text[i:]):
@@ -2277,6 +2306,9 @@ class Lexer:
                         # the pattern, and the command after it is its own
                         # segment.
                         start_segment()
+                        self.xtrace_context_events.append((i, cur_level()["seg"], ")", True))
+                    else:
+                        self.xtrace_context_events.append((i, cur_level()["seg"], ")", True))
                     i += 1
                     continue
                 if case_depth[0] > 0:
@@ -2284,8 +2316,10 @@ class Lexer:
                     # case body is a pattern terminator, never part of the
                     # command, so the emitter after it heads its own segment.
                     start_segment()
+                    self.xtrace_context_events.append((i, cur_level()["seg"], ")", True))
                     i += 1
                     continue
+                self.xtrace_context_events.append((i, cur_level()["seg"], ")", True))
                 cur_level()["word"].append(c)
                 i += 1
                 continue
@@ -2304,8 +2338,10 @@ class Lexer:
                 # redirection operator -- one rule for both.
                 nxt = text[i + 1 : i + 2]
                 if nxt == "" or nxt.isspace() or nxt in ";&|()<>":
+                    eligible = cur_level().get("xtrace_keyword_prefix", True)
+                    self.xtrace_context_events.append((i, cur_level()["seg"], "{", eligible))
                     cur_level()["seg"].words.append("{")
-                    start_segment()
+                    start_segment(xtrace_boundary=eligible)
                     i += 1
                     continue
                 cur_level()["word"].append(c)
@@ -2313,7 +2349,11 @@ class Lexer:
                 continue
 
             if c == "}" and not cur_level()["word"]:
-                start_segment()
+                eligible = cur_level().get("xtrace_keyword_prefix", True)
+                nxt = text[i + 1:i + 2]
+                if nxt == "" or nxt.isspace() or nxt in ";&|()<>":
+                    self.xtrace_context_events.append((i, cur_level()["seg"], "}", eligible))
+                start_segment(xtrace_boundary=eligible)
                 i += 1
                 continue
 
@@ -4745,7 +4785,7 @@ def _alias_target_commands(target):
     return out
 
 
-def _function_body_line_spans(text):
+def _function_body_line_spans(text, with_offsets=False):
     """1-based line spans of every function BODY in this text.
 
     A `set +x` in a function body runs only if the function is CALLED, and
@@ -4753,6 +4793,7 @@ def _function_body_line_spans(text):
     Used to refuse an xtrace DISABLE from inside one -- see `_xtrace_delta`.
     """
     spans = []
+    offsets = []
     # Same command-position rule as `discover_emitter_helpers` (#1032 round 6
     # P1).  Here the cost of missing a definition runs the OTHER way: a body
     # this does not see is not a span, so a `set +x` inside it would be
@@ -4761,10 +4802,97 @@ def _function_body_line_spans(text):
     for m, _name, body in _iter_function_definitions(text):
         start_line = text.count("\n", 0, m.end()) + 1
         spans.append((start_line, start_line + body.count("\n")))
+        offsets.append((m.end() - 1, m.end() + len(body)))
+    if with_offsets:
+        return spans, offsets
     return spans
 
 
-def _xtrace_delta(ll, in_function):
+def _conditional_xtrace_segments(lx, function_offsets):
+    """Source-nested segments, using Lexer events; never evaluate execution."""
+    guarded = set()
+    scopes = {}
+    intervals = sorted(function_offsets)
+    interval = 0
+
+    def close(stack, kind):
+        for j in range(len(stack) - 1, -1, -1):
+            if stack[j][0] == kind:
+                del stack[j:]
+                break
+
+    def case_of(stack):
+        return next((f[1] for f in reversed(stack) if f[0] == "case"), None)
+
+    for pos, seg, word, eligible in sorted(lx.xtrace_context_events, key=lambda e: e[0]):
+        while interval < len(intervals) and intervals[interval][1] < pos:
+            interval += 1
+        if interval < len(intervals) and intervals[interval][0] <= pos <= intervals[interval][1]:
+            continue  # Shared function-span consumer owns these source positions.
+        stack = scopes.setdefault(seg.parent, [])
+        if stack:
+            guarded.add(seg)
+        case = case_of(stack)
+        # Optional pattern parens use existing subshell-shaped Lexer levels.
+        # Inherit only their source role, never a command substitution's role.
+        ancestor = seg
+        while case is None and ancestor.parent is not None and not ancestor.parent_is_capture:
+            candidate = case_of(scopes.get(ancestor.parent.parent, []))
+            if candidate is not None and candidate["phase"] == "patterns" and candidate["depth"]:
+                case = candidate
+            ancestor = ancestor.parent
+        if word == "(":
+            if case is not None and case["phase"] == "patterns":
+                if not case["started"] and not case["depth"]:
+                    case["optional"] = eligible
+                case["depth"] += 1
+                case["started"] = True
+            continue
+        if word == ")":
+            if case is not None and case["phase"] == "patterns":
+                if case["depth"]:
+                    case["depth"] -= 1
+                    if case["depth"] or not case["optional"]:
+                        continue
+                case["phase"] = "body"
+            continue
+        if word in (";;", ";&", ";;&"):
+            if case is not None and case["phase"] == "body":
+                case.update(phase="patterns", started=False, depth=0, optional=False)
+            continue
+        if case is not None and case["phase"] != "body":
+            if case["phase"] == "word":
+                case["phase"] = "in"  # One case operand is data.
+            elif case["phase"] == "in":
+                if word == "in":
+                    case["phase"] = "patterns"
+            elif not case["started"] and word == "esac":
+                close(stack, "case")  # Between arms, never inside an alternative.
+            else:
+                case["started"] = True
+            continue
+        if stack and stack[-1][0] == "loop" and stack[-1][1]:
+            if eligible and word == "do":
+                stack[-1][1] = False
+            continue  # A for/select header's operands are not commands.
+        if not eligible:
+            continue
+        if word == "if":
+            stack.append(["if", False])
+        elif word in ("while", "until", "for", "select"):
+            stack.append(["loop", word in ("for", "select")])
+        elif word == "case":
+            stack.append(["case", dict(phase="word", started=False, depth=0, optional=False)])
+        elif word == "{":
+            stack.append(["brace", False])
+        elif word in ("fi", "done", "esac", "}"):
+            close(stack, {"fi": "if", "done": "loop", "esac": "case", "}": "brace"}[word])
+        if stack:
+            guarded.add(seg)
+    return guarded
+
+
+def _xtrace_delta(ll, in_function, in_conditional=False):
     """The xtrace state change this LOGICAL LINE makes, or None.
 
     ASYMMETRIC on purpose, because the two directions have opposite risk:
@@ -4792,7 +4920,7 @@ def _xtrace_delta(ll, in_function):
     if True in deltas:
         return True
     # Every delta on this line is a disable.
-    if len(real) != 1 or in_function:
+    if len(real) != 1 or in_function or in_conditional:
         return None
     return False
 
@@ -4892,7 +5020,8 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
         )
     xtrace = _initial_xtrace or _shebang_enables_xtrace(text)
     effective_xtrace = xtrace
-    fn_spans = _function_body_line_spans(text)
+    fn_spans, fn_offsets = _function_body_line_spans(text, with_offsets=True)
+    conditional_segments = _conditional_xtrace_segments(lx, fn_offsets)
     aliases = _alias_emitters(lx, helpers)
     base_helpers = set(helpers)
     for ll in lx.logical:
@@ -4922,7 +5051,11 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
             n for n, dl in aliases.items() if dl <= ll.first_line
         }
         in_function = any(lo <= ll.first_line <= hi for lo, hi in fn_spans)
-        line_delta = _xtrace_delta(ll, in_function)
+        in_conditional = any(
+            seg in conditional_segments and _segment_sets_xtrace(seg) is False
+            for seg in ll.segments
+        )
+        line_delta = _xtrace_delta(ll, in_function, in_conditional)
         xtrace_at = {}
         effective_xtrace_at = {}
         effective_xtrace_scopes = {None: effective_xtrace}
@@ -11284,6 +11417,441 @@ CORPUS = [
     ('pragma-b9-quoted-marker-retains-deferred', MUST_FLAG, '(\n: \'# TOKEN_OUTPUT_EXEMPT: quoted data\'\nset -x\neval \': "$GH_TOKEN"\'\n)\n'),
     ('pragma-review-child-foreign-deferred-owner', MUST_FLAG, 'eval "$(true # TOKEN_OUTPUT_EXEMPT: child only\n)" \'echo "$GH_TOKEN"\''),
     ('pragma-review-child-direct-xtrace-isolation', MUST_NOT_FLAG, 'echo "$(set -x # TOKEN_OUTPUT_EXEMPT: child only\ntrue\n)"; : "$GH_TOKEN"'),
+    (
+        'conditional-xtrace-middle-esac-raw',
+        MUST_FLAG,
+        'set -x\ncase no in\n case-arm|esac|miss)\n set +x\n ;;\nesac\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-middle-esac-raw-standalone',
+        MUST_NOT_FLAG,
+        'set -x\ncase no in\n case-arm|esac|miss)\n set +x\n ;;\nesac\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-middle-esac-spaced',
+        MUST_FLAG,
+        'set -x\ncase no in\n case-arm | esac | miss)\n set +x\n ;;\nesac\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-middle-esac-spaced-standalone',
+        MUST_NOT_FLAG,
+        'set -x\ncase no in\n case-arm | esac | miss)\n set +x\n ;;\nesac\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-middle-esac-quoted',
+        MUST_FLAG,
+        'set -x\ncase no in\n case-arm|"esac"|miss)\n set +x\n ;;\nesac\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-middle-esac-quoted-standalone',
+        MUST_NOT_FLAG,
+        'set -x\ncase no in\n case-arm|"esac"|miss)\n set +x\n ;;\nesac\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-middle-esac-continued',
+        MUST_FLAG,
+        'set -x\ncase no in\n case-arm|\\\n esac|miss)\n set +x\n ;;\nesac\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-middle-esac-continued-standalone',
+        MUST_NOT_FLAG,
+        'set -x\ncase no in\n case-arm|\\\n esac|miss)\n set +x\n ;;\nesac\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-middle-esac-comment',
+        MUST_FLAG,
+        'set -x\ncase no in\n # esac in comment is data\n case-arm|esac|miss) # esac after the real pattern close is comment data\n set +x\n ;;\nesac\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-middle-esac-comment-standalone',
+        MUST_NOT_FLAG,
+        'set -x\ncase no in\n # esac in comment is data\n case-arm|esac|miss) # esac after the real pattern close is comment data\n set +x\n ;;\nesac\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-middle-esac-after-word-continuation',
+        MUST_FLAG,
+        'set -x\ncase no in\n case-arm|esac \\\n |miss)\n set +x\n ;;\nesac\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-middle-esac-after-word-continuation-standalone',
+        MUST_NOT_FLAG,
+        'set -x\ncase no in\n case-arm|esac \\\n |miss)\n set +x\n ;;\nesac\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-middle-esac-nested',
+        MUST_FLAG,
+        'set -x\ncase outer in\n case-arm|esac|miss)\n case inner in\n case-arm|esac|miss) : ;;\nesac\n set +x\n ;;\nesac\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-middle-esac-nested-standalone',
+        MUST_NOT_FLAG,
+        'set -x\ncase outer in\n case-arm|esac|miss)\n case inner in\n case-arm|esac|miss) : ;;\nesac\n set +x\n ;;\nesac\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-empty-case-same-line-standalone',
+        MUST_NOT_FLAG,
+        'set -x\ncase no in esac\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-empty-case-newlines-standalone',
+        MUST_NOT_FLAG,
+        'set -x\ncase no\nin\nesac\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-case-esac-operand-standalone',
+        MUST_NOT_FLAG,
+        'set -x\ncase esac in\n no) set +x ;;\nesac\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-case-captured-operand-standalone',
+        MUST_NOT_FLAG,
+        'set -x\ncase $(printf %s no) in\n yes) set +x ;;\nesac\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-middle-esac-extglob',
+        MUST_FLAG,
+        'shopt -s extglob\nset -x\ncase no in\n @(case-arm|esac|miss))\n set +x\n ;;\nesac\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-middle-esac-extglob-standalone',
+        MUST_NOT_FLAG,
+        'shopt -s extglob\nset -x\ncase no in\n @(case-arm|esac|miss))\n set +x\n ;;\nesac\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-middle-esac-optional-extglob',
+        MUST_FLAG,
+        'shopt -s extglob\nset -x\ncase no in\n (@(case-arm|esac|miss))\n set +x\n ;;\nesac\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-middle-esac-optional-extglob-standalone',
+        MUST_NOT_FLAG,
+        'shopt -s extglob\nset -x\ncase no in\n (@(case-arm|esac|miss))\n set +x\n ;;\nesac\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-case-marker-word-pattern',
+        MUST_FLAG,
+        'set -x\ncase no in\n case-arm|esac)\n set +x\n ;;\nesac\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-case-marker-word-pattern-standalone-disable',
+        MUST_NOT_FLAG,
+        'set -x\ncase no in\n case-arm|esac)\n set +x\n ;;\nesac\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-case-quoted-escaped-operator-patterns',
+        MUST_FLAG,
+        'set -x\ncase no in\n \')\'|\\)|\';;\'|\\;\\;|\';;&\'|\\;\\;\\&|esac)\n set +x\n ;;\nesac\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-case-quoted-escaped-operator-patterns-standalone',
+        MUST_NOT_FLAG,
+        'set -x\ncase no in\n \')\'|\\)|\';;\'|\\;\\;|\';;&\'|\\;\\;\\&|esac)\n set +x\n ;;\nesac\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-case-quoted-escaped-operator-arguments',
+        MUST_FLAG,
+        'set -x\ncase no in\n yes)\n echo \')\' \';;\' \';;&\' \\) \\;\\; \\;\\;\\&\n set +x\n ;;\nesac\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-case-quoted-escaped-operator-arguments-standalone',
+        MUST_NOT_FLAG,
+        'set -x\ncase no in\n yes)\n echo \')\' \';;\' \';;&\' \\) \\;\\; \\;\\;\\&\n set +x\n ;;\nesac\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-case-fallthrough-operator',
+        MUST_FLAG,
+        'set -x\ncase no in\n yes)\n set +x\n ;&\n no) : ;;\nesac\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-case-retest-operator',
+        MUST_FLAG,
+        'set -x\ncase no in\n yes)\n set +x\n ;;&\n no) : ;;\nesac\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-nested-case-operators',
+        MUST_FLAG,
+        'set -x\ncase outer in\n miss)\n case inner in\n skip)\n set +x\n ;;&\n *) : ;;\nesac\n ;&\n *) : ;;\nesac\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-bundle-set-if-false',
+        MUST_FLAG,
+        'set -euo xtrace\nif false; then\n set +x\nfi\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-bundle-shopt-if-false',
+        MUST_FLAG,
+        'shopt -os xtrace\nif false; then\n set +x\nfi\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-bundle-set-while-false',
+        MUST_FLAG,
+        'set -eo xtrace\nwhile false; do\n set +x\ndone\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-bundle-set-standalone-disable',
+        MUST_NOT_FLAG,
+        'set -euo xtrace\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-bundle-shopt-standalone-disable',
+        MUST_NOT_FLAG,
+        'shopt -os xtrace\nset +o xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-deferred-enable-if-false',
+        MUST_FLAG,
+        'eval \'set -euo xtrace\'\nif false; then\n set +x\nfi\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-deferred-explicit-enable-and-if',
+        MUST_FLAG,
+        'eval \'set -eo xtrace\nif false; then\n set +x\nfi\n: "$GH_TOKEN"\'\n',
+    ),
+    (
+        'conditional-xtrace-deferred-disable-unchanged',
+        MUST_FLAG,
+        'set -x\neval \'if false; then\n set +x\nfi\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-shared-function-bundle-disable',
+        MUST_FLAG,
+        'set -euo xtrace\nf()\n{\n set +x\n}\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-shared-function-then-standalone',
+        MUST_NOT_FLAG,
+        'shopt -os xtrace\nf()\n{\n set +x\n}\nset +o xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-bundle-quoted-heredoc-data',
+        MUST_NOT_FLAG,
+        'shopt -os xtrace\ncat <<\'EOF\'\nif false; then\n set +x\nfi\nEOF\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-heredoc-executable-child',
+        MUST_FLAG,
+        'cat <<EOF\n$(set -eo xtrace\nif false; then\n set +x\nfi\n: "$GH_TOKEN")\nEOF\n',
+    ),
+    (
+        'conditional-xtrace-heredoc-quoted-child-data',
+        MUST_NOT_FLAG,
+        'cat <<\'EOF\'\n$(set -eo xtrace\nif false; then\n set +x\nfi\n: "$GH_TOKEN")\nEOF\n',
+    ),
+    (
+        'conditional-xtrace-bundle-independent-subshell',
+        MUST_NOT_FLAG,
+        '( shopt -os xtrace )\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-bundle-executed-if-conservative',
+        MUST_FLAG,
+        'set -euo xtrace\nif true; then\n set +x\nfi\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-if-false',
+        MUST_FLAG,
+        'set -x\nif false; then\n set +x\nfi\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-while-false',
+        MUST_FLAG,
+        'set -x\nwhile false; do\n set +x\ndone\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-case-inactive',
+        MUST_FLAG,
+        'set -x\ncase no in\n yes)\n set +x\n ;;\nesac\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-until-inactive',
+        MUST_FLAG,
+        'set -x\nuntil true; do\n set +x\ndone\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-for-empty',
+        MUST_FLAG,
+        'set -x\nfor item in; do\n set +x\ndone\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-nested-if-while-case',
+        MUST_FLAG,
+        'set -x\nif false; then\n while true; do\n case yes in\n yes)\n set +x\n ;;\nesac\n break\ndone\nfi\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-nested-for-until',
+        MUST_FLAG,
+        'set -x\nfor item in; do\n until false; do\n set +x\n break\ndone\ndone\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-brace-in-false-if',
+        MUST_FLAG,
+        'set -x\nif false; then\n {\n set +x\n }\nfi\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-and-newline',
+        MUST_FLAG,
+        'set -x\nfalse &&\n set +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-or-newline',
+        MUST_FLAG,
+        'set -x\ntrue ||\n set +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-and-comment-newline',
+        MUST_FLAG,
+        'set -x\nfalse &&\n # not executed\n set +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-nested-and-newline',
+        MUST_FLAG,
+        'set -x\nif false; then\n true &&\n set +x\nfi\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-standalone-plus-x',
+        MUST_NOT_FLAG,
+        'set -x\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-standalone-plus-o',
+        MUST_NOT_FLAG,
+        'set -x\nset +o xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-standalone-after-if',
+        MUST_NOT_FLAG,
+        'set -x\nif false; then\n :\nfi\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-standalone-after-nested',
+        MUST_NOT_FLAG,
+        'set -x\nif false; then\n while true; do\n :\n break\ndone\nfi\nset +o xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-executed-if',
+        MUST_FLAG,
+        'set -x\nif true; then\n set +x\nfi\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-executed-while',
+        MUST_FLAG,
+        'set -x\nwhile true; do\n set +x\n break\ndone\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-executed-case',
+        MUST_FLAG,
+        'set -x\ncase yes in\n yes)\n set +x\n ;;\nesac\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-executed-for',
+        MUST_FLAG,
+        'set -x\nfor item in one; do\n set +x\ndone\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-executed-until',
+        MUST_FLAG,
+        'set -x\nuntil false; do\n set +x\n break\ndone\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-executed-brace',
+        MUST_FLAG,
+        'set -x\n{\n set +x\n}\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-executed-and-newline',
+        MUST_FLAG,
+        'set -x\ntrue &&\n set +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-executed-or-newline',
+        MUST_FLAG,
+        'set -x\nfalse ||\n set +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-function-next-brace',
+        MUST_FLAG,
+        'set -x\nf()\n{\n set +x\n}\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-function-next-subshell',
+        MUST_FLAG,
+        'set -x\nf()\n(\n set +x\n)\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-subshell-disable',
+        MUST_FLAG,
+        'set -x\n(\n set +x\n)\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-subshell-then-standalone',
+        MUST_NOT_FLAG,
+        'set -x\n(\n set +x\n)\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-quoted-keyword-data',
+        MUST_NOT_FLAG,
+        'set -x\nv="if while until for case then fi done esac { }"\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-argument-keyword-data',
+        MUST_NOT_FLAG,
+        'set -x\necho if while until for case then fi done esac\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-argument-brace-data',
+        MUST_NOT_FLAG,
+        'set -x\necho { }\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-array-keyword-data',
+        MUST_NOT_FLAG,
+        'set -x\nvalues=(if while until for case fi done esac "{" "}")\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-heredoc-keyword-data',
+        MUST_NOT_FLAG,
+        'set -x\ncat <<\'EOF\'\nif false; then\n {\n set +x\n }\nfi\nEOF\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-case-pattern-keywords',
+        MUST_NOT_FLAG,
+        'set -x\ncase no in\n if|for|while|until|"esac") : ;;\n no) : ;;\nesac\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-case-parenthesis-pattern',
+        MUST_FLAG,
+        'set -x\ncase no in\n (yes)\n set +x\n ;;\nesac\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-brace-argument-in-brace',
+        MUST_FLAG,
+        'set -x\n{\n echo { }\n set +x\n}\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-brace-close-then-disable',
+        MUST_NOT_FLAG,
+        'set -x\n{\n :\n}; set +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-if-in-function-scope',
+        MUST_NOT_FLAG,
+        'set -x\nf()\n{\n if false; then\n set +x\n fi\n}\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-ordinary-command-substitution',
+        MUST_NOT_FLAG,
+        'set -x\nv=$(if false; then :; fi)\nset +x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-select-empty',
+        MUST_FLAG,
+        'set -x\nselect item in; do\n set +x\ndone\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'conditional-xtrace-select-executed',
+        MUST_FLAG,
+        'set -x\nselect item in one; do\n set +x\n break\ndone <<< 1\n: "$GH_TOKEN"\n',
+    ),
 ]
 
 CORPUS.extend([
@@ -13290,6 +13858,17 @@ KNOWN_BROADER = {
     'helper-routing-caller-shields-stderr-pipeline': 'Helper routing unions existing output-redirection facts from all recognized emitting bodies. It does not prove descriptor ordering, later call-site shielding or which definition executed; file writes and the existing any-redirection capture rule remain conservative (#1495; #1042).',
     'helper-routing-later-stderr-body': 'Helper routing unions existing output-redirection facts from all recognized emitting bodies. It does not prove descriptor ordering, later call-site shielding or which definition executed; file writes and the existing any-redirection capture rule remain conservative (#1495; #1042).',
     'helper-routing-stdout-stderr-redirection-capture': 'Helper routing unions existing output-redirection facts from all recognized emitting bodies. It does not prove descriptor ordering, later call-site shielding or which definition executed; file writes and the existing any-redirection capture rule remain conservative (#1495; #1042).',
+    'conditional-xtrace-bundle-executed-if-conservative': 'An executed nested disable receives no credit under the source-nesting rule, including after the shared bundled set detector enables tracing. The scanner deliberately does not evaluate branch truth (#1458).',
+    'conditional-xtrace-brace-argument-in-brace': 'A source-nested or continued-list disable is not credited even when this fake program actually executes it. Lexical nesting does not evaluate conditions, iterations or command truth (#1458).',
+    'conditional-xtrace-executed-and-newline': 'A source-nested or continued-list disable is not credited even when this fake program actually executes it. Lexical nesting does not evaluate conditions, iterations or command truth (#1458).',
+    'conditional-xtrace-executed-brace': 'A source-nested or continued-list disable is not credited even when this fake program actually executes it. Lexical nesting does not evaluate conditions, iterations or command truth (#1458).',
+    'conditional-xtrace-executed-case': 'A source-nested or continued-list disable is not credited even when this fake program actually executes it. Lexical nesting does not evaluate conditions, iterations or command truth (#1458).',
+    'conditional-xtrace-executed-for': 'A source-nested or continued-list disable is not credited even when this fake program actually executes it. Lexical nesting does not evaluate conditions, iterations or command truth (#1458).',
+    'conditional-xtrace-executed-if': 'A source-nested or continued-list disable is not credited even when this fake program actually executes it. Lexical nesting does not evaluate conditions, iterations or command truth (#1458).',
+    'conditional-xtrace-executed-or-newline': 'A source-nested or continued-list disable is not credited even when this fake program actually executes it. Lexical nesting does not evaluate conditions, iterations or command truth (#1458).',
+    'conditional-xtrace-executed-until': 'A source-nested or continued-list disable is not credited even when this fake program actually executes it. Lexical nesting does not evaluate conditions, iterations or command truth (#1458).',
+    'conditional-xtrace-executed-while': 'A source-nested or continued-list disable is not credited even when this fake program actually executes it. Lexical nesting does not evaluate conditions, iterations or command truth (#1458).',
+    'conditional-xtrace-select-executed': 'A source-nested or continued-list disable is not credited even when this fake program actually executes it. Lexical nesting does not evaluate conditions, iterations or command truth (#1458).',
 }
 
 
