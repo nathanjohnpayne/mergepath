@@ -1331,6 +1331,19 @@ override_refused "gh api endpoint on another host" as_reviewer gh api https://ev
 # its own, so a value-taking option in front cannot shift the real one.
 override_refused "a PR URL selector on github.localhost" as_reviewer gh pr comment https://github.localhost/o/r/pull/123 --body x
 override_refused "an issue URL selector on a ghe.com tenant" as_reviewer gh issue comment https://tenant.ghe.com/o/r/issues/7 --body x
+# Any URL gh can read as a selector is checked, for every command the
+# wrappers pass through, not only pull request and issue URLs (Phase 4b on
+# #2178): gh repo view takes its host from a repository URL.
+override_refused "a repository URL on a ghe.com tenant (gh repo view)" as_reviewer gh repo view https://tenant.ghe.com/o/r --json name
+override_refused "an scp-like git@ repository URL" as_author gh repo clone git@tenant.ghe.com:o/r
+override_refused "an ssh:// repository URL with userinfo" as_reviewer gh repo view ssh://git@tenant.ghe.com/o/r
+override_refused "a git+https:// repository URL on github.localhost" as_reviewer gh repo view git+https://github.localhost/o/r
+override_refused "an ssh: URL without slashes" as_reviewer gh repo view ssh:tenant.ghe.com/o/r
+override_refused "a mixed-case scheme and host" as_reviewer gh repo view HTTPS://Tenant.GHE.com/o/r
+override_refused "userinfo that names github.com" as_reviewer gh repo view https://github.com@tenant.ghe.com/o/r
+override_refused "a port on the foreign host" as_reviewer gh repo view https://tenant.ghe.com:443/o/r
+override_refused "a repository URL behind a --jq value" as_reviewer gh repo view --jq https://tenant.ghe.com/o/r
+override_refused "an argument that begins with a foreign URL" as_reviewer gh repo view 'https://tenant.ghe.com/o/r extra'
 override_refused "short header flag with an equals sign" as_reviewer gh api repos/o/r/issues/1/comments -H='Authorization: Bearer x' -f body=x
 override_refused "header flag clustered after another short flag" as_reviewer gh api repos/o/r/issues/1/comments -iHAuthorization:x -f body=x
 override_refused "Authorization header behind a --preview value" as_reviewer gh api repos/o/r/issues/1/comments --preview --header --header 'Authorization: Bearer x' -f body=x
@@ -1358,6 +1371,45 @@ else
   fail "plain GH_REPO: rc=$rc"; cat "$LOGF" >&2
 fi
 
+# GitHub's own hosts, and text that merely contains a URL, are not refused.
+for t in gh rest; do
+  new_case
+  set +e
+  MERGEPATH_GH_TRANSPORT=$t as_reviewer -- gh repo view HTTPS://GitHub.com/o/r --json name >/dev/null 2>&1; rc=$?
+  set -e
+  if [ "$rc" -eq 0 ] && log_has $'gh\trepo\tview\tHTTPS://GitHub.com/o/r'; then
+    pass "a github.com repository URL in any case passes through ($t transport)"
+  else
+    fail "github.com repo URL ($t transport): rc=$rc"; cat "$LOGF" >&2
+  fi
+  new_case
+  set +e
+  MERGEPATH_GH_TRANSPORT=$t as_reviewer -- gh repo clone git@github.com:o/r >/dev/null 2>&1; rc=$?
+  set -e
+  if [ "$rc" -eq 0 ] && log_has $'gh\trepo\tclone\tgit@github.com:o/r'; then
+    pass "an scp-like github.com URL passes through ($t transport)"
+  else
+    fail "github.com scp URL ($t transport): rc=$rc"; cat "$LOGF" >&2
+  fi
+done
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest as_reviewer -- gh pr comment 1 --repo o/r --body 'see https://tenant.ghe.com/o/r for context' >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/issues/1/comments'; then
+  pass "a body that contains a foreign URL after other text is not refused"
+else
+  fail "body containing a URL: rc=$rc"; cat "$LOGF" >&2
+fi
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr edit 42 --repo o/r --title fix:typo >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'PATCH\trepos/o/r/pulls/42'; then
+  pass "a title shaped like word:word is not read as a URL"
+else
+  fail "word:word title: rc=$rc"; cat "$LOGF" >&2
+fi
 new_case
 set +e
 MERGEPATH_GH_TRANSPORT=gh as_reviewer -- gh pr comment https://github.com/o/r/pull/9 --body x >/dev/null 2>&1; rc=$?
@@ -1367,14 +1419,39 @@ if [ "$rc" -eq 0 ] && log_has $'gh\tpr\tcomment\thttps://github.com/o/r/pull/9';
 else
   fail "github.com URL selector: rc=$rc"; cat "$LOGF" >&2
 fi
+# An argument that is a foreign URL is refused whatever option precedes it:
+# `--title --body https://tenant.ghe.com/o/r` makes gh read the URL as the
+# selector, so a position-based exemption for body values could be bypassed
+# (Phase 4b on #2178). A body that is only a URL goes through --body-file,
+# and a github.com URL body is not refused.
 new_case
 set +e
-MERGEPATH_GH_TRANSPORT=rest as_reviewer -- gh pr comment 1 --repo o/r --body https://example.com/a/b >/dev/null 2>&1; rc=$?
+err="$(MERGEPATH_GH_TRANSPORT=rest as_reviewer -- gh pr comment 1 --repo o/r --body https://example.com/a/b 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q -- '--body-file' && log_lacks 'issues/1/comments'; then
+  pass "a body that is only a foreign URL is refused with the --body-file route"
+else
+  fail "foreign URL body: rc=$rc err=$err"; cat "$LOGF" >&2
+fi
+override_refused "a foreign URL behind a --title that swallows --body" as_reviewer gh pr create --title --body https://tenant.ghe.com/o/r
+printf 'https://example.com/a/b' >"$WORKDIR/url-body.md"
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest as_reviewer -- gh pr comment 1 --repo o/r --body-file "$WORKDIR/url-body.md" >/dev/null 2>&1; rc=$?
 set -e
 if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/issues/1/comments'; then
-  pass "a URL in a pr comment body is not mistaken for an api endpoint or a hosted repo"
+  pass "the same URL-only body through --body-file is posted"
 else
-  fail "url body false positive: rc=$rc"; cat "$LOGF" >&2
+  fail "URL body through --body-file: rc=$rc"; cat "$LOGF" >&2
+fi
+new_case
+set +e
+MERGEPATH_GH_TRANSPORT=rest as_reviewer -- gh pr comment 1 --repo o/r --body https://github.com/o/r/pull/1 >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/issues/1/comments'; then
+  pass "a body that is only a github.com URL is not refused"
+else
+  fail "github.com URL body: rc=$rc"; cat "$LOGF" >&2
 fi
 new_case
 set +e

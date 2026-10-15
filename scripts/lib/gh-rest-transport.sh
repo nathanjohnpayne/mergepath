@@ -161,14 +161,32 @@ gh_payload_is_hosted_repo() {
   [[ "$1" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+/[^/[:space:]]+/[^/[:space:]]+$ ]]
 }
 
-# gh_payload_is_foreign_item_url <value>: 0 iff <value> is a pull request or
-# issue URL whose host is not github.com.
-gh_payload_is_foreign_item_url() {
+# gh_payload_is_foreign_url <value>: 0 iff <value> begins with a URL whose
+# host is not GitHub's own (github.com, www.github.com, api.github.com).
+# gh reads a repository selector as a URL when it starts with git@ or with
+# one of the schemes https:, http:, ssh:, git:, git+ssh: and git+https:, and
+# a pull request or issue selector when it starts with http(s)://. It then
+# takes the destination host from it, and sends GH_TOKEN to github.localhost
+# and *.ghe.com as well as github.com. So every scheme form counts, for every
+# command, not only the pull request and issue URLs of the commands this
+# transport implements (Phase 4b on #2178). The host is what follows the
+# last '@' of the authority, without a port, compared case-insensitively.
+gh_payload_is_foreign_url() {
   local host
-  [[ "$1" =~ ^[Hh][Tt][Tt][Pp][Ss]?://([^/]+)/[^/]+/[^/]+/(pull|pulls|issues)/[0-9]+ ]] || return 1
-  host="$(printf '%s' "${BASH_REMATCH[1]##*@}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$1" =~ ^[Gg][Ii][Tt]@([^:/]*): ]]; then
+    host="${BASH_REMATCH[1]}"
+  elif [[ "$1" =~ ^[A-Za-z][A-Za-z0-9+.-]*://([^/?#]*) ]]; then
+    host="${BASH_REMATCH[1]}"
+  elif [[ "$1" =~ ^([Hh][Tt][Tt][Pp][Ss]?|[Ss][Ss][Hh]|[Gg][Ii][Tt]|[Gg][Ii][Tt]\+[Ss][Ss][Hh]|[Gg][Ii][Tt]\+[Hh][Tt][Tt][Pp][Ss]):([^/?#]*) ]]; then
+    host="${BASH_REMATCH[2]}"
+  else
+    return 1
+  fi
+  host="${host##*@}"
+  host="${host%%:*}"
+  host="$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')"
   case "$host" in
-    github.com|www.github.com) return 1 ;;
+    github.com|www.github.com|api.github.com) return 1 ;;
   esac
   return 0
 }
@@ -220,11 +238,13 @@ gh_payload_refuse_credential_overrides() {
       echo "$label: refusing the host-qualified repository '$arg': whatever option it belongs to, gh could send the verified token to that host; pass OWNER/REPO (#1542)." >&2
       return 1
     fi
-    # A pull request or issue URL is a selector: gh takes the destination
-    # host from it, and sends GH_TOKEN to github.localhost and *.ghe.com as
-    # well as github.com. Checked by shape in every position, like the rest.
-    if gh_payload_is_foreign_item_url "$arg"; then
-      echo "$label: refusing the pull request or issue URL '$arg' on a host other than github.com: gh would send the verified token there; select by number with --repo OWNER/REPO (#1542)." >&2
+    # A repository, pull request or issue URL is a selector for any gh
+    # command these wrappers pass through: gh takes the destination host from
+    # it. Checked by shape in every position, like the rest, so an argument
+    # that only begins with such a URL is refused too; text goes through
+    # --body-file.
+    if gh_payload_is_foreign_url "$arg"; then
+      echo "$label: refusing the URL '$arg' on a host other than github.com: gh can take the destination host from a repository, pull request or issue URL and would send the verified token there; select with --repo OWNER/REPO, and pass text that begins with a URL through --body-file (#1542)." >&2
       return 1
     fi
     if [ "$is_api" -eq 1 ]; then
