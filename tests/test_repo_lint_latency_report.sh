@@ -41,6 +41,49 @@ fi
 AS_OF="2026-09-28T00:00:00Z"
 run_report() { bash "$SUBJECT" --as-of "$AS_OF" "$@"; }
 
+# A historical live query must bound the one returned page at both ends. The
+# stub models a first page filled by newer runs unless the request has the
+# closed range; only the bounded request returns the two eligible runs.
+LIVE_SHIM="$TMP/live-shim"
+mkdir -p "$LIVE_SHIM"
+cat > "$LIVE_SHIM/gh" <<'SH'
+#!/usr/bin/env bash
+if [ "$1" = api ] && [ "$2" != --paginate ]; then
+  printf '%s\n' "$2" >> "$LIVE_CALLS"
+  case "$2" in
+    *created=2026-09-14T00:00:00Z..2026-09-28T00:00:00Z)
+      for id in 1 2; do
+        jq -nc --argjson id "$id" '{id:$id,head_sha:("live-"+($id|tostring)),event:"pull_request",conclusion:"success",created_at:"2026-09-27T00:00:00Z",run_started_at:"2026-09-27T00:01:00Z",updated_at:"2026-09-27T00:02:00Z"}'
+      done ;;
+    *created=%3E%3D2026-09-14T00:00:00Z)
+      for id in 1 2; do
+        jq -nc --argjson id "$id" '{id:$id,head_sha:("newer-"+($id|tostring)),event:"pull_request",conclusion:"success",created_at:"2026-10-01T00:00:00Z",run_started_at:"2026-10-01T00:01:00Z",updated_at:"2026-10-01T00:02:00Z"}'
+      done ;;
+    *) echo "unexpected workflow-runs URL: $2" >&2; exit 1 ;;
+  esac
+elif [ "$1" = api ] && [ "$2" = --paginate ]; then
+  printf '%s\n' "$3" >> "$LIVE_CALLS"
+  case "$3" in
+    repos/octo/demo/actions/runs/*/jobs?per_page=100) echo '{"id":1,"name":"lint","conclusion":"success","started_at":"2026-09-27T00:01:00Z","completed_at":"2026-09-27T00:02:00Z","steps":[]}' ;;
+    *) echo "unexpected jobs URL: $3" >&2; exit 1 ;;
+  esac
+else
+  echo "unexpected gh invocation: $*" >&2
+  exit 1
+fi
+SH
+chmod +x "$LIVE_SHIM/gh"
+LIVE_OUT="$TMP/live-bounded"
+: > "$TMP/live-calls.log"
+if PATH="$LIVE_SHIM:$PATH" LIVE_CALLS="$TMP/live-calls.log" GH_TOKEN=test-token \
+   bash "$SUBJECT" --repo octo/demo --as-of "$AS_OF" --limit 2 --min-sample 1 --out-dir "$LIVE_OUT" >/dev/null 2>&1 \
+   && grep -Fq 'created=2026-09-14T00:00:00Z..2026-09-28T00:00:00Z' "$TMP/live-calls.log" \
+   && jq -e '.window.runs == 2 and .ordinary_pr.n == 2 and .status == "insufficient-sample" and (.alerts | length) == 0' "$LIVE_OUT/summary.json" >/dev/null; then
+  pass "historical live collection bounds the first page at both ends and retains the eligible runs"
+else
+  fail "historical live collection must send a closed created range and report the in-window page"
+fi
+
 jq -n '{runs:[range(0;20) as $i | {
   id: ($i + 1), head_sha:("sha" + ($i|tostring)), event:"pull_request",
   created_at:("2026-09-20T00:" + (if $i < 10 then "0" else "" end) + ($i|tostring) + ":00Z"),
@@ -208,11 +251,11 @@ else
   fail "created_at/window validation (missing=$rc_missing bad=$rc_bad window=$rc_window asof=$rc_asof)"
 fi
 
-if grep -Fq 'created=%3E%3D$WINDOW_START' "$SUBJECT" \
+if grep -Fq 'created=$WINDOW_START..$AS_OF_BOUND' "$SUBJECT" \
    && grep -Fq -- '--window-days 14' "$WORKFLOW"; then
-  pass "live collection filters by created>= and the workflow pins the 14-day window"
+  pass "live collection filters by the closed created range and the workflow pins the 14-day window"
 else
-  fail "live collection must request created>=WINDOW_START and the workflow must pass --window-days"
+  fail "live collection must request both created bounds and the workflow must pass --window-days"
 fi
 
 # --- alert → tracking issue routing (#2165) ----------------------------------
