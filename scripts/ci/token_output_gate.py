@@ -1219,11 +1219,11 @@ def _ansi_c_index_prefix(word):
                 i += 2 if quote == '"' and word[i] == "\\" else 1
             i += 1
             continue
-        if depth and word[i:i + 2] == "${":
+        if depth and (word[i:i + 2] in ("${", "$(") or c == "`"):
             try:
-                i = _simple_parameter_end(word, i)
+                i = _double_quoted_construct_end(word, i)
             except _ExactReadUnavailable:
-                return True  # An unknown nested WORD cannot prove index closure.
+                return True  # An unknown nested extent cannot prove index closure.
             continue
         if word[i:i + 2] == "${":
             start = i + 2
@@ -1444,6 +1444,7 @@ class Lexer:
         self.quoted_data_offsets = set()  # Read-only function-header context.
         self.unterminated_ansi_c_quotes = []  # Original source offsets.
         self.unsupported_ansi_aliases = []  # Executable-context failure offsets.
+        self.unsupported_ansi_sources = []  # Non-alias source-proof failures.
         self.ansi_c_quote_spans = []  # Literal DATA ranges, including child source.
         self.comment_offsets = set()
         self.function_source_children = []  # (original body offset, child Lexer)
@@ -1464,11 +1465,15 @@ class Lexer:
         self.unsupported_ansi_aliases.extend(
             body_offset + i for i in sub.unsupported_ansi_aliases
         )
+        self.unsupported_ansi_sources.extend(
+            body_offset + i for i in sub.unsupported_ansi_sources
+        )
         self._absorb_ansi_context(sub, body_offset)
 
     def _ansi_alias_operand(self, seg, word, line):
         """Existing literal alias operand seam, without caching a live segment."""
-        if _ALIAS_RE.match(word) is None:
+        literal = _unquote_command_word(word)
+        if literal is None or _ALIAS_RE.match(literal) is None:
             return False
         probe = Segment(-1, None, False, line)
         probe.words = list(seg.words)
@@ -1774,12 +1779,14 @@ class Lexer:
                             and not _ansi_c_index_prefix("".join(cur_level()["word"]))):
                         token = text[i:end]
                         if (closed and token.find("'", 2) < len(token) - 1
-                                and _iter_refs(token)
-                                and self._ansi_alias_operand(
-                                    cur_level()["seg"], "".join(cur_level()["word"]), line)):
-                            # Keep correct boundary/synchronization, but fail
-                            # closed on a replacement that can execute later.
-                            self.unsupported_ansi_aliases.append(i)
+                                and _iter_refs(token)):
+                            # Correct consume/sync is independent of whether
+                            # this raw-sensitive source can be proved inert.
+                            if self._ansi_alias_operand(
+                                    cur_level()["seg"], "".join(cur_level()["word"]), line):
+                                self.unsupported_ansi_aliases.append(i)
+                            else:
+                                self.unsupported_ansi_sources.append(i)
                         self.ansi_c_quote_spans.append((i, end))
                         self.quoted_data_offsets.update(range(i + 2, end - 1 if closed else end))
                         cur_level()["word"].append(token)
@@ -2137,7 +2144,7 @@ class Lexer:
             if c == "(":
                 word_so_far = "".join(cur_level()["word"])
                 if (text[i:i + 2] == "(("
-                        and word_so_far in RESERVED_WORDS | SAFE_COMMANDS):
+                        and word_so_far in RESERVED_WORDS | SAFE_COMMANDS | PASSTHRU):
                     cur_level()["ansi_arithmetic_until"] = max(
                         cur_level().get("ansi_arithmetic_until", -1),
                         _skip_balanced_parens(text, i) - 1,
@@ -3927,8 +3934,9 @@ def _heredoc_bracket_close_exact(text, open_idx, parameter_words=False):
             eol = text.find("\n", i)
             i = n if eol == -1 else eol
             continue
-        if parameter_words and not quotes and text[i:i + 2] == "${":
-            i = _simple_parameter_end(text, i)
+        if (parameter_words and not quotes
+                and (text[i:i + 2] in ("${", "$(") or c == "`")):
+            i = _double_quoted_construct_end(text, i)
             continue
         if c == "'" and not quotes:
             quotes.append("'")
@@ -4807,6 +4815,15 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
             "%s:%d: unsupported ANSI-C alias replacement with a raw sensitive "
             "reference and escaped apostrophe; rewrite as an ordinary shell function "
             "or direct command (rewriting does not make secret output safe)"
+            % (path, opened_at)
+        )
+    for offset in lx.unsupported_ansi_sources:
+        opened_at = 1 + text[:offset].count("\n")
+        pragma_errors.append(
+            "%s:%d: unsupported ANSI-C source token with a raw sensitive "
+            "reference and escaped apostrophe; separate source from the ANSI literal "
+            "using an ordinary shell function or direct command "
+            "(rewriting does not make secret output safe)"
             % (path, opened_at)
         )
     for offset in lx.unterminated_ansi_c_quotes:
@@ -10851,6 +10868,10 @@ CORPUS = [
         MUST_NOT_FLAG,
         'shopt -s expand_aliases; alias leak=$\'echo "$GH_TOKEN" >&2\'\nleak\n',
     ),
+    # Owner-admitted inherited ANSI indexed-name limits; separate design #2246.
+    ('read-helper-positional-index-inherited', MUST_NOT_FLAG, 'leak() { read $\'a[$(: \\\\\\\'; echo "$1" >&2)]\' <<< x; }\nleak "$GH_TOKEN"\n'),
+    ('printf-v-helper-positional-index-inherited', MUST_NOT_FLAG, 'leak() { printf -v $\'a[$(: \\\\\\\'; echo "$1" >&2)]\' %s x; }\nleak "$GH_TOKEN"\n'),
+    ('read-ansi-index-no-apostrophe-inherited', MUST_NOT_FLAG, 'read $\'a[$(echo "$GH_TOKEN" >&2)]\' <<< x\n'),
 ]
 
 CORPUS.extend([
@@ -11798,6 +11819,9 @@ KNOWN_MISSES = {
         "neither segment names a `$`-reference"
     ),
     'ansi-c-plain-alias-invoked-inherited': 'Inherited on actual parent fb09 and the owner-approved quote repair: an enabled plain ANSI alias replacement can execute its own raw credential reference on a following physical line, while the ordinary alias catalogue tracks emitter heads rather than replacement references. No escaped apostrophe means this remains outside the approved unsupported-source boundary. Both measured Mac/Linux fake-data samples leak while the scanner stays clean. Separate alias/source-proof design: https://github.com/nathanjohnpayne/mergepath/issues/2242 (#1453 owner decision).',
+    'read-helper-positional-index-inherited': 'Inherited on actual main cb69 (scanner fb09), published bf9a and frozen 1638 in the measured Mac/Linux fake-data samples: an invoked helper passes a positional-only ANSI indexed target to read and emits its argument, while all three scanners report clean. The approved global source-proof boundary uses existing raw sensitive names, not positional source reconstruction. Separate design: https://github.com/nathanjohnpayne/mergepath/issues/2246; owner acceptance #1453 comment6183821891.',
+    'printf-v-helper-positional-index-inherited': 'Inherited on actual main cb69 (scanner fb09), published bf9a and frozen 1638 in the measured Mac/Linux fake-data samples: an invoked helper passes a positional-only ANSI indexed target to separate printf -v and emits its argument, while all three scanners report clean. The approved global source-proof boundary uses existing raw sensitive names, not positional source reconstruction. Separate design: https://github.com/nathanjohnpayne/mergepath/issues/2246; owner acceptance #1453 comment6183821891.',
+    'read-ansi-index-no-apostrophe-inherited': 'Inherited on actual main cb69 (scanner fb09), published bf9a and frozen 1638 in the measured Mac/Linux fake-data samples: the ANSI indexed read target has a raw credential reference but no interior apostrophe and emits the fake value, while all three scanners report clean. It remains outside the approved two-conjunct raw source-proof boundary. Separate design: https://github.com/nathanjohnpayne/mergepath/issues/2246; owner acceptance #1453 comment6183821891.',
 }
 
 KNOWN_BROADER = {
@@ -14658,6 +14682,39 @@ def _ansi_c_quote_cases():
     ]:
         if Lexer(prefix + literal + suffix).ansi_c_quote_spans:
             failures.append("ANSI-C adjacent/arithmetic interval DATA proof")
+    # Harmless parser-only siblings: nested executable extents do not close
+    # an outer index, and local wrapper refusal includes the existing `time`.
+    for nested in ("[$( : ]) + 0]", "[` : ]` + 0]", "[$(( 1 )) + 0]"):
+        for read in (_heredoc_bracket_close, _heredoc_bracket_close_exact):
+            if read(nested, 0, parameter_words=True) != nested.rindex("]"):
+                failures.append("ANSI-C nested executable extent closed index")
+            if read(nested, 0) != read(nested, 0, False):
+                failures.append("ANSI-C nested extent changed default bracket mode")
+        if not _ansi_c_index_prefix("array" + nested[:-1]):
+            failures.append("ANSI-C nested executable extent lost open prefix")
+        if _ansi_c_index_prefix("array" + nested + "="):
+            failures.append("ANSI-C closed executable index retained refusal")
+        parameter = "${array" + nested + ":-value}"
+        if _ansi_c_parameter_word_start(parameter, 0) != parameter.index("value"):
+            failures.append("ANSI-C nested executable index lost WORD offset")
+    for nested in ("[$( ( ) ) + 0]", "[$( : ]", "[` : ]"):
+        if _heredoc_bracket_close(nested, 0, parameter_words=True) is not None:
+            failures.append("ANSI-C unavailable nested extent proved index close")
+        if not _ansi_c_index_prefix("array" + nested):
+            failures.append("ANSI-C unavailable nested extent lost refusal")
+    for prefix, suffix, literal_data in [
+        ("time(( ", " ))", False),
+        ("time(( $( : ", " ) ))", True),
+        ("array[$( : ]) + ", "]=value", False),
+        ("array[` : ]` + ", "]=value", False),
+        ("array[$( : ])]=", "", True),
+        ("array[` : ]`]=", "", True),
+    ]:
+        text = prefix + literal + suffix
+        start = len(prefix)
+        expected = [(start, start + len(literal))] if literal_data else []
+        if Lexer(text).ansi_c_quote_spans != expected:
+            failures.append("ANSI-C wrapper/nested index source span: " + repr(text))
     # Narrow proof proposal: raw-sensitive escaped-apostrophe replacements.
     prefix = "alias sample="
     alias_token = '$\'printf "$GH_TOKEN" \\\'safe\\\'\''
@@ -14675,6 +14732,34 @@ def _ansi_c_quote_cases():
     for alias_data in ["$'printf safe'", "$'printf \\'safe\\''", '$\'printf "$GH_TOKEN"\'']:
         if Lexer(prefix + alias_data).unsupported_ansi_aliases:
             failures.append("ANSI-C narrow alias proof rejected a preserved control")
+    # Quoted/escaped literal names share the existing alias boundary. These
+    # are parser-only uninvoked controls, including its deliberate refusal.
+    for alias_name in ("'sample'", "\\sample"):
+        alias_prefix = "alias " + alias_name + "="
+        text = alias_prefix + alias_token
+        if Lexer(text).unsupported_ansi_aliases != [len(alias_prefix)]:
+            failures.append("ANSI-C literal alias name bypassed refusal")
+        safe_text = alias_prefix + token
+        if Lexer(safe_text).unsupported_ansi_aliases:
+            failures.append("ANSI-C literal alias name rejected safe replacement")
+    # Owner-approved global raw-sensitive/apostrophe proof boundary. These
+    # are nonexecuting parser controls, not an operand execution model.
+    text = ": " + alias_token + '\n: "$GH_TOKEN"\n'
+    lx = Lexer(text)
+    refs = [r for ll in lx.logical for r in ll.refs if r.name == "GH_TOKEN"]
+    if (lx.unsupported_ansi_sources != [2] or lx.unsupported_ansi_aliases
+            or len(refs) != 1 or refs[0].line != 2):
+        failures.append("ANSI-C global source refusal lost later-line synchronization")
+    text = "v=$( : " + alias_token + ")"
+    if Lexer(text).unsupported_ansi_sources != [text.index(alias_token)]:
+        failures.append("ANSI-C executable child lost global source failure offset")
+    if Lexer("a=( " + alias_token + " )").unsupported_ansi_sources:
+        failures.append("ANSI-C array DATA imported global source failure")
+    if Lexer(prefix + alias_token).unsupported_ansi_sources:
+        failures.append("ANSI-C alias refusal duplicated a global source failure")
+    for preserved in (token, '$\'printf "$GH_TOKEN"\''):
+        if Lexer(": " + preserved).unsupported_ansi_sources:
+            failures.append("ANSI-C global source refusal exceeded raw conjunction")
     return failures
 
 
