@@ -152,6 +152,36 @@ class TriggerGuardTests(unittest.TestCase):
                 self.assertTrue(meta["guarded"])
                 self.assertFalse(meta["trigger"])
 
+    def test_pre_command_options_and_closing_comments(self):
+        body = "Avoid @codex review in prose"
+        payload = self.root / "prefix.json"
+        payload.write_text(json.dumps({"body": body}))
+        blocked = (["-X", "POST", "api", "repos/o/r/issues/123/comments", "-f", "body=" + body],
+                   ["--method", "POST", "--input", str(payload), "api", "repos/o/r/issues/123/comments"],
+                   ["-f", "body=" + body, "api", "repos/o/r/issues/123/comments"],
+                   ["-b", body, "pr", "comment", "123"],
+                   ["pr", "-b", body, "comment", "123"],
+                   ["pr", "close", "123", "--comment", body],
+                   ["--comment", body, "pr", "close", "123"],
+                   ["issue", "close", "123", "-c", body],
+                   ["pr", "--comment", "--body", body, "review", "123"],
+                   ["--reason", "completed", "issue", "close", "123", "--comment", body],
+                   ["-r", "completed", "issue", "close", "123", "--comment", body],
+                   ["--duplicate-of", "456", "issue", "close", "123", "--comment", body],
+                   ["--comment", "--body", body, "pr", "review", "123"])
+        for args in blocked:
+            with self.subTest(args=args), self.assertRaises(guard.Refused):
+                self.check(args)
+        original = ["gh", "-X", "GET", "api", "repos/o/r/issues/123/comments", "-f", "body=" + body]
+        normalized, meta = guard.inspect(original, "author", self.state)
+        self.assertEqual(original, normalized)
+        self.assertFalse(meta["guarded"])
+        for args in (["pr", "close", "123"], ["pr", "close", "123", "--comment", "Done"],
+                     ["-b", "Safe body", "pr", "comment", "123"]):
+            _, meta = self.check(args)
+            self.assertTrue(meta["guarded"])
+            self.assertFalse(meta["trigger"])
+
     def test_authorization_metadata_errors_cannot_dispatch(self):
         fixture = self.root / "authorization"
         (fixture / "scripts").mkdir(parents=True)

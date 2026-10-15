@@ -17,6 +17,7 @@ class Refused(ValueError):
 
 
 def inspect(argv, role, state=None):
+    original_args = list(argv)
     args = list(argv)
     bodies = []
     command_source = None
@@ -68,6 +69,24 @@ def inspect(argv, role, state=None):
                 return (value[3:] if value[2:3] == "=" else value[2:]), index, name, index + 1
         return None
 
+    prefix_options = []
+
+    def take_prefix(index):
+        value = args[index]
+        if value == "--":
+            raise Refused("Place the command before the end-of-options marker.")
+        # Review flags overlap closing-comment and issue-reason options.
+        # Require those ambiguous prefix forms after the command verb.
+        if value == "--comment" or value.startswith("--comment=") or value.startswith(("-c", "-r")):
+            raise Refused("Place ambiguous comment/reason options after their command verb.")
+        found = option(index, ("--method", "-X", "--field", "-F", "--raw-field", "-f", "--input",
+                               "--header", "-H", "--hostname", "--jq", "-q", "--template", "-t",
+                               "--preview", "-p", "--cache", "--body", "-b", "--body-file",
+                               "--attach", "--reason", "--duplicate-of"))
+        end = found[3] if found else index + 1
+        prefix_options.extend(args[index:end])
+        del args[index:end]
+
     # Wrappers already require a literal built-in gh payload. Allow its global
     # repository option before either command noun or verb.
     i = 1
@@ -79,25 +98,29 @@ def inspect(argv, role, state=None):
         elif args[i] in ("pr", "issue", "api"):
             break
         elif args[i].startswith("-"):
-            i += 1
+            take_prefix(i)
         else:
-            return args, {"guarded": False, "trigger": False}
+            return original_args, {"guarded": False, "trigger": False}
     if i >= len(args):
-        return args, {"guarded": False, "trigger": False}
+        return original_args, {"guarded": False, "trigger": False}
     noun = args[i]
     i += 1
     while noun != "api" and i < len(args):
         found = option(i, ("--repo", "-R"))
-        if not found:
+        if found:
+            repo, _, _, i = found
+        elif args[i].startswith("-"):
+            take_prefix(i)
+        else:
             break
-        repo, _, _, i = found
     verb = args[i] if i < len(args) else ""
     channel = ""
     pr = ""
-    if noun in ("pr", "issue") and verb in ("comment", "review"):
+    if noun in ("pr", "issue") and verb in ("comment", "review", "close"):
         channel = f"{noun}-{verb}"
         has_text = False
         i += 1
+        args[i:i] = prefix_options
         while i < len(args):
             value = args[i]
             found = option(i, ("--repo", "-R"))
@@ -115,7 +138,7 @@ def inspect(argv, role, state=None):
                 command_source = ("file", at, prefix, replacement)
                 args[at] = prefix + replacement
                 continue
-            found = option(i, ("--body", "-b", "--attach"))
+            found = option(i, ("--body", "-b", "--attach") + (("--comment", "-c") if verb == "close" else ()))
             if found:
                 value, at, prefix, end = found
                 attachment = args[i].startswith("--attach")
@@ -129,10 +152,11 @@ def inspect(argv, role, state=None):
             if not value.startswith("-") and not pr:
                 pr = value
             i += 1
-        if not has_text and not deferred and "--delete-last" not in args:
+        if verb != "close" and not has_text and not deferred and "--delete-last" not in args:
             if channel != "pr-review" or not any(x in args for x in ("--approve", "-a")):
                 raise Refused("Provide an explicit comment body or body file before writing.")
     elif noun == "api":
+        args[i:i] = prefix_options
         endpoint = ""
         method = ""
         fields = []
@@ -166,7 +190,7 @@ def inspect(argv, role, state=None):
         if method not in ("POST", "PATCH", "PUT") or not re.fullmatch(
             r"repos/[^/]+/[^/]+/(?:issues/(?:[0-9]+/comments|comments/[0-9]+)|pulls/(?:[0-9]+/(?:comments(?:/[0-9]+/replies)?|reviews(?:/[0-9]+(?:/events)?)?)|comments/[0-9]+))", path
         ):
-            return args, {"guarded": False, "trigger": False}
+            return original_args, {"guarded": False, "trigger": False}
         channel = "api-comment"
         for value, at, prefix, typed in fields:
             key, separator, body = value.partition("=")
@@ -183,7 +207,7 @@ def inspect(argv, role, state=None):
                 json_bodies(body)
             args[at] = prefix + replacement
     else:
-        return args, {"guarded": False, "trigger": False}
+        return original_args, {"guarded": False, "trigger": False}
 
     hits = [body for body in bodies if PHRASE.search(body)]
     metadata = {"guarded": True, "trigger": False, "deferred": deferred, "cli_stdin": cli_stdin}
