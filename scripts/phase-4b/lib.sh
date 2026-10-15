@@ -2529,6 +2529,9 @@ p4b_feedback_policy_mode() {
 # p4b_feedback_priority_value <p0|p1|p2|p3|nitpick>
 # Returns the configured disposition value under feedback_policy.priorities,
 # or the parser default if absent: P0/P1 required, lower tiers discretionary.
+# This answers disposition policy, not the legacy merge-gate blocking set.
+# See the resolve_required_tiers header in scripts/lib/feedback-policy-helpers.sh:
+# its absent-block p1-only default is intentional; keep these parsers separate.
 p4b_feedback_priority_value() {
   local tier="$1" cfg value
   cfg="$(p4b_config)"

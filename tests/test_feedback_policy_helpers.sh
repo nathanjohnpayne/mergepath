@@ -163,6 +163,168 @@ eq "p0"             "$(resolve_required_tiers "$CFG_NO_MODE")"               "re
 expect_rc 2 "resolve: malformed mode -> rc 2" -- resolve_required_tiers "$CFG_BAD_MODE"
 expect_rc 2 "resolve: malformed tier -> rc 2" -- resolve_required_tiers "$CFG_BAD_TIER"
 
+# --- resolve_tiers_by_disposition (#1672) ----------------------------------
+# Exact stdout bytes matter: eq normalizes newlines and expect_rc drops output.
+disposition_result() {
+  local want_rc=$1 want_stdout=$2 label=$3 rc=0
+  shift 3
+  "$@" > "$WORKDIR/disposition.out" 2> "$WORKDIR/disposition.err" || rc=$?
+  printf '%s' "$want_stdout" > "$WORKDIR/disposition.expected"
+  if [ "$rc" -eq "$want_rc" ] && cmp -s "$WORKDIR/disposition.expected" "$WORKDIR/disposition.out"; then
+    pass "$label"
+  else
+    fail "$label (expected rc=$want_rc and exact stdout, got rc=$rc)"
+  fi
+}
+
+DISP_CFG_5="$WORKDIR/disposition-empty-block.yml"
+cat > "$DISP_CFG_5" <<'YAML'
+feedback_policy:
+YAML
+
+DISP_CFG_6="$WORKDIR/disposition-partial.yml"
+cat > "$DISP_CFG_6" <<'YAML'
+feedback_policy:
+  priorities:
+    p1: required
+    p2: ignore
+YAML
+
+DISP_CFG_7="$WORKDIR/disposition-mixed.yml"
+cat > "$DISP_CFG_7" <<'YAML'
+feedback_policy:
+  mode: "by-priority" # existing normalization
+  priorities:
+    p0: "ignore"
+    p1: required
+    p2: discretionary
+    p3: ignore
+    nitpick: required
+YAML
+
+DISP_CFG_8="$WORKDIR/disposition-address-all-ignored-valid-priorities.yml"
+cat > "$DISP_CFG_8" <<'YAML'
+feedback_policy:
+  mode: address-all
+  priorities:
+    p0: ignore
+    p1: discretionary
+YAML
+
+DISP_CFG_9="$WORKDIR/disposition-late-bad-tier.yml"
+cat > "$DISP_CFG_9" <<'YAML'
+feedback_policy:
+  mode: by-priority
+  priorities:
+    p0: required
+    p1: discretionary
+    p2: ignore
+    p3: required
+    nitpick: mandatory
+YAML
+
+disposition_result 0 $'p0\np1\n' $'disposition: absent-file/required' \
+  resolve_tiers_by_disposition $'required' "$WORKDIR/does-not-exist.yml"
+disposition_result 0 $'p2\np3\nnitpick\n' $'disposition: absent-file/discretionary' \
+  resolve_tiers_by_disposition $'discretionary' "$WORKDIR/does-not-exist.yml"
+disposition_result 0 $'' $'disposition: absent-file/ignore' \
+  resolve_tiers_by_disposition $'ignore' "$WORKDIR/does-not-exist.yml"
+disposition_result 0 $'p0\np1\n' $'disposition: no-block/required' \
+  resolve_tiers_by_disposition $'required' "$CFG_NO_BLOCK"
+disposition_result 0 $'p2\np3\nnitpick\n' $'disposition: no-block/discretionary' \
+  resolve_tiers_by_disposition $'discretionary' "$CFG_NO_BLOCK"
+disposition_result 0 $'' $'disposition: no-block/ignore' \
+  resolve_tiers_by_disposition $'ignore' "$CFG_NO_BLOCK"
+disposition_result 0 $'' $'disposition: empty-block/required' \
+  resolve_tiers_by_disposition $'required' "$DISP_CFG_5"
+disposition_result 0 $'p0\np1\np2\np3\nnitpick\n' $'disposition: empty-block/discretionary' \
+  resolve_tiers_by_disposition $'discretionary' "$DISP_CFG_5"
+disposition_result 0 $'' $'disposition: empty-block/ignore' \
+  resolve_tiers_by_disposition $'ignore' "$DISP_CFG_5"
+disposition_result 0 $'p0\np1\n' $'disposition: hub-defaults/required' \
+  resolve_tiers_by_disposition $'required' "$CFG_BYPRI"
+disposition_result 0 $'p2\np3\nnitpick\n' $'disposition: hub-defaults/discretionary' \
+  resolve_tiers_by_disposition $'discretionary' "$CFG_BYPRI"
+disposition_result 0 $'' $'disposition: hub-defaults/ignore' \
+  resolve_tiers_by_disposition $'ignore' "$CFG_BYPRI"
+disposition_result 0 $'p1\n' $'disposition: partial/required' \
+  resolve_tiers_by_disposition $'required' "$DISP_CFG_6"
+disposition_result 0 $'p0\np3\nnitpick\n' $'disposition: partial/discretionary' \
+  resolve_tiers_by_disposition $'discretionary' "$DISP_CFG_6"
+disposition_result 0 $'p2\n' $'disposition: partial/ignore' \
+  resolve_tiers_by_disposition $'ignore' "$DISP_CFG_6"
+disposition_result 0 $'p1\nnitpick\n' $'disposition: mixed/required' \
+  resolve_tiers_by_disposition $'required' "$DISP_CFG_7"
+disposition_result 0 $'p2\n' $'disposition: mixed/discretionary' \
+  resolve_tiers_by_disposition $'discretionary' "$DISP_CFG_7"
+disposition_result 0 $'p0\np3\n' $'disposition: mixed/ignore' \
+  resolve_tiers_by_disposition $'ignore' "$DISP_CFG_7"
+disposition_result 0 $'p0\np1\np2\np3\nnitpick\n' $'disposition: address-all/required' \
+  resolve_tiers_by_disposition $'required' "$CFG_ALL"
+disposition_result 0 $'' $'disposition: address-all/discretionary' \
+  resolve_tiers_by_disposition $'discretionary' "$CFG_ALL"
+disposition_result 0 $'' $'disposition: address-all/ignore' \
+  resolve_tiers_by_disposition $'ignore' "$CFG_ALL"
+disposition_result 0 $'p0\np1\np2\np3\nnitpick\n' $'disposition: address-all-ignored-valid-priorities/required' \
+  resolve_tiers_by_disposition $'required' "$DISP_CFG_8"
+disposition_result 0 $'' $'disposition: address-all-ignored-valid-priorities/discretionary' \
+  resolve_tiers_by_disposition $'discretionary' "$DISP_CFG_8"
+disposition_result 0 $'' $'disposition: address-all-ignored-valid-priorities/ignore' \
+  resolve_tiers_by_disposition $'ignore' "$DISP_CFG_8"
+disposition_result 2 $'' $'disposition: bad-mode/required' \
+  resolve_tiers_by_disposition $'required' "$CFG_BAD_MODE"
+disposition_result 2 $'' $'disposition: bad-mode/discretionary' \
+  resolve_tiers_by_disposition $'discretionary' "$CFG_BAD_MODE"
+disposition_result 2 $'' $'disposition: bad-mode/ignore' \
+  resolve_tiers_by_disposition $'ignore' "$CFG_BAD_MODE"
+disposition_result 2 $'' $'disposition: late-bad-tier/required' \
+  resolve_tiers_by_disposition $'required' "$DISP_CFG_9"
+disposition_result 2 $'' $'disposition: late-bad-tier/discretionary' \
+  resolve_tiers_by_disposition $'discretionary' "$DISP_CFG_9"
+disposition_result 2 $'' $'disposition: late-bad-tier/ignore' \
+  resolve_tiers_by_disposition $'ignore' "$DISP_CFG_9"
+disposition_result 2 $'' $'disposition: invalid-disposition/\'\'/no-block' \
+  resolve_tiers_by_disposition $'' "$CFG_NO_BLOCK"
+disposition_result 2 $'' $'disposition: invalid-disposition/\'\'/hub-defaults' \
+  resolve_tiers_by_disposition $'' "$CFG_BYPRI"
+disposition_result 2 $'' $'disposition: invalid-disposition/\'Required\'/no-block' \
+  resolve_tiers_by_disposition $'Required' "$CFG_NO_BLOCK"
+disposition_result 2 $'' $'disposition: invalid-disposition/\'Required\'/hub-defaults' \
+  resolve_tiers_by_disposition $'Required' "$CFG_BYPRI"
+disposition_result 2 $'' $'disposition: invalid-disposition/\'unknown\'/no-block' \
+  resolve_tiers_by_disposition $'unknown' "$CFG_NO_BLOCK"
+disposition_result 2 $'' $'disposition: invalid-disposition/\'unknown\'/hub-defaults' \
+  resolve_tiers_by_disposition $'unknown' "$CFG_BYPRI"
+
+# A missing argument is distinct from an explicit invalid value under nounset.
+disposition_result 2 '' 'disposition: missing argument' resolve_tiers_by_disposition
+disposition_result 0 $'p2\np3\nnitpick\n' 'disposition: actual hub discretionary set' \
+  resolve_tiers_by_disposition discretionary "$ROOT/.github/review-policy.yml"
+# Pin intentional absent-block divergence; do not migrate the legacy gates.
+disposition_result 0 $'p1\n' 'legacy: absent block remains p1 only' \
+  resolve_required_tiers "$CFG_NO_BLOCK"
+disposition_result 0 $'p1\n' 'legacy: absent file remains p1 only' \
+  resolve_required_tiers "$WORKDIR/does-not-exist.yml"
+
+# Scope CONFIG/cwd within subprocesses; keep PASS/FAIL accounting in this shell.
+disposition_with_config() (
+  CONFIG="$CFG_NO_BLOCK"
+  resolve_tiers_by_disposition "$@"
+)
+disposition_result 0 $'p0\np1\n' 'disposition: CONFIG default' \
+  disposition_with_config required
+disposition_result 0 $'p0\np1\np2\np3\nnitpick\n' 'disposition: explicit cfg overrides CONFIG' \
+  disposition_with_config required "$CFG_ALL"
+mkdir -p "$WORKDIR/disposition-default/.github"
+cp "$CFG_BYPRI" "$WORKDIR/disposition-default/.github/review-policy.yml"
+disposition_in_default_dir() (
+  unset CONFIG
+  cd "$WORKDIR/disposition-default"
+  resolve_tiers_by_disposition "$@"
+)
+disposition_result 0 $'p2\np3\nnitpick\n' 'disposition: relative default cfg' \
+  disposition_in_default_dir discretionary
+
 # --- codex_tier_of ---------------------------------------------------------
 eq "p0" "$(codex_tier_of '![P0 Badge] Critical: nullptr deref')" "codex_tier_of: P0 badge"
 eq "p1" "$(codex_tier_of 'foo ![P1 Badge] bar')"                 "codex_tier_of: P1 badge"
