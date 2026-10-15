@@ -191,24 +191,28 @@ else
     fi
   fi
 
-  # Every test a declared wrapper references (comments stripped) must be a
-  # declared dependency of that wrapper, so a suite a wrapper gains cannot
-  # route to the wrong partial selection. Hub-only: the wrappers are read
-  # from the tree. check_propagation_closure is exempt because its
-  # references are an allow-list of hub-only paths, not executions, and the
-  # harness wrappers because their suites are full triggers.
+  # Every test a declared wrapper names must be a declared dependency of
+  # that wrapper, so a suite a wrapper gains cannot route to the wrong
+  # partial selection. References are read from the RAW wrapper text,
+  # comments included (#2227): a comment stripper has to model shell syntax
+  # (quotes, heredocs, `$#`, continuations, `${…}`), and every construct it
+  # misreads hides a live reference silently (#2176). Scanning raw text can
+  # only over-ask, and an over-ask is loud. A test a wrapper names only in a
+  # comment is therefore declared under it, or the comment is reworded so it
+  # no longer names a test path. There are deliberately no per-wrapper or
+  # per-path exemptions: one that fits a comment today would hide an
+  # executable reference added beside it later. Hub-only: the wrappers are
+  # read from the tree.
   if [ -f "$ROOT/scripts/sync-to-downstream.sh" ] && [ -f "$DEPENDENCIES" ]; then
     undeclared_refs=""
+    witness_refs=""
     declared_wrappers=$(jq -r '.wrappers | keys[]' "$DEPENDENCIES")
     while IFS= read -r wrapper; do
       [ -n "$wrapper" ] || continue
       [ -f "$ROOT/scripts/ci/$wrapper" ] || continue
-      case "$wrapper" in
-        check_propagation_closure|check_repo_lint_consumer_safety|check_consumer_residue_safety|check_repo_lint_optimization) continue ;;
-      esac
       wrapper_patterns=$(jq -r --arg w "$wrapper" '.wrappers[$w][]' "$DEPENDENCIES")
-      referenced=$(sed 's/[[:space:]]*#.*$//' "$ROOT/scripts/ci/$wrapper" \
-        | grep -o 'tests/test_[A-Za-z0-9_]*\.\(sh\|py\|cjs\)' | LC_ALL=C sort -u || true)
+      referenced=$(grep -o 'tests/test_[A-Za-z0-9_]*\.\(sh\|py\|cjs\)' "$ROOT/scripts/ci/$wrapper" \
+        | LC_ALL=C sort -u || true)
       while IFS= read -r ref; do
         [ -n "$ref" ] || continue
         declared=0
@@ -219,11 +223,23 @@ else
         done <<<"$wrapper_patterns"
         [ "$declared" -eq 1 ] || undeclared_refs="$undeclared_refs $wrapper:$ref"
       done <<<"$referenced"
+      [ "$wrapper" != "check_merge_clearance_gate" ] || witness_refs="$referenced"
     done <<<"$declared_wrappers"
     if [ -z "$undeclared_refs" ]; then
-      pass "every test a declared wrapper references is a declared dependency of that wrapper"
+      pass "every test a declared wrapper names, in code or in a comment, is a declared dependency of that wrapper"
     else
-      fail "wrapper test references missing from repo-lint-dependencies.json:$undeclared_refs"
+      fail "wrapper test references missing from repo-lint-dependencies.json (declare each under its wrapper, or reword the comment that names it; #2227):$undeclared_refs"
+    fi
+    # Non-vacuity witness (#2227): check_merge_clearance_gate names this
+    # suite only inside a `#` comment, so it is visible exactly when the
+    # extraction above reads raw text. Any comment stripper reintroduced at
+    # the call site, naive or quote-aware, drops it while the completeness
+    # check still passes. Should the comment change, move the witness to
+    # another test path a wrapper names only in a comment.
+    if grep -Fxq 'tests/test_465_fail_closed.sh' <<<"$witness_refs"; then
+      pass "the reference extraction reads comments too (check_merge_clearance_gate witness)"
+    else
+      fail "the reference extraction lost tests/test_465_fail_closed.sh, which check_merge_clearance_gate names only in a comment; references must be read from the raw wrapper text (#2227)"
     fi
   fi
 
@@ -277,18 +293,17 @@ else
   # wrapper that sources the helper is selected", and a fixed list of six
   # names asserted a snapshot of that instead: the seventh such wrapper
   # (#931's check_pr_review_policy_nudge) failed it while satisfying it.
-  # Comments are stripped first so a wrapper that merely mentions the helper
-  # in prose is not counted as sourcing it.
+  # The raw wrapper text is read, comments included, for the same reason as
+  # the test-reference completeness check above (#2227): a wrapper that
+  # names the helper only in prose counts as sourcing it, which can only
+  # demand a graph entry, never hide one.
   sourcing=$(for f in "$ROOT"/scripts/ci/check_*; do
-      # `grep -c`, not `grep -q`: under this suite's `set -o pipefail`, a
-      # quiet grep exits at the first match and `sed` takes SIGPIPE (141),
-      # which failed the `&&` and silently dropped check_doc_ownership and
-      # check_merge_clearance_gate from the derived set — leaving the subset
-      # assertion below passing for the wrong reason. Counting consumes the
-      # whole stream. `|| true` because a non-matching wrapper is the common
-      # case and its exit 1 would abort the suite under `set -e`.
-      hits=$(sed 's/[[:space:]]*#.*$//' "$f" | grep -c 'ci-check-modes\.sh' || true)
-      [ "${hits:-0}" -gt 0 ] && basename "$f" || true
+      # No pipeline, so a quiet grep cannot SIGPIPE a reader under this
+      # suite's `set -o pipefail` (the earlier `sed | grep -q` form silently
+      # dropped check_doc_ownership and check_merge_clearance_gate). `|| true`
+      # because a non-matching wrapper is the common case and its exit 1
+      # would abort the suite under `set -e`.
+      grep -q 'ci-check-modes\.sh' "$f" && basename "$f" || true
     done | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')
   # A SUBSET check, matching the assertion's own words: every sourcing wrapper
   # must be selected. Equality would be wrong — the graph also declares this
@@ -1122,18 +1137,40 @@ for harness in "$CONSUMER_HARNESS" "$RESIDUE_HARNESS"; do
   fi
 done
 
-# The replay loop numbers wrappers in the sorted WIRED order and asks the
-# shared shard selector before running one, so the three replay legs
-# partition the set the way the selector's own tests prove.
+# The replay loop numbers wrappers in REPLAY_ORDER (measured-heavy wrappers
+# first, then the sorted WIRED tail) and asks the shared shard selector
+# before running one, so the three replay legs partition the set the way the
+# selector's own tests prove and the heavy wrappers land one per shard.
 if [ ! -f "$CONSUMER_HARNESS" ]; then
   : # consumer checkout: the hub-only replay harness is deliberately absent
-elif sed -n '/^while IFS= read -r name; do$/,/^done <<< "\$WIRED"$/p' "$CONSUMER_HARNESS" \
-       | grep -Fq 'repo_lint_shard_owns "$ordinal"' \
-     && sed -n '/^while IFS= read -r name; do$/,/^done <<< "\$WIRED"$/p' "$CONSUMER_HARNESS" \
-       | grep -Fq 'ordinal=$((ordinal + 1))'; then
-  pass "the consumer replay loop shards wired wrappers through the shared shard selector"
+# The loop is cut at its OWN first `done <<<` terminator (awk stops there),
+# and that terminator must feed REPLAY_ORDER: a range that ended at a
+# literal `done <<< "$REPLAY_ORDER"` ran to EOF when the loop was fed
+# `$WIRED` instead, and still found the strings it looked for.
+elif replay_loop=$(awk '/^while IFS= read -r name; do$/ {f=1} f {print} f && /^done <<< / {exit}' "$CONSUMER_HARNESS") \
+     && [ "$(tail -n 1 <<<"$replay_loop")" = 'done <<< "$REPLAY_ORDER"' ] \
+     && grep -Fq 'repo_lint_shard_owns "$ordinal"' <<<"$replay_loop" \
+     && grep -Fq 'ordinal=$((ordinal + 1))' <<<"$replay_loop" \
+     && sed -n '/^REPLAY_HEAVY=(/,/^)/p' "$CONSUMER_HARNESS" | grep -Fq 'check_codex_scripts' \
+     && sed -n '/^REPLAY_HEAVY=(/,/^)/p' "$CONSUMER_HARNESS" | grep -Fq 'check_gh_as_author'; then
+  pass "the consumer replay loop shards REPLAY_ORDER (heavy wrappers first) through the shared shard selector"
 else
-  fail "tests/test_repo_lint_consumer_safety.sh must number wired wrappers and consult repo_lint_shard_owns inside the replay loop"
+  fail "tests/test_repo_lint_consumer_safety.sh must order heavy wrappers first, number them, and consult repo_lint_shard_owns inside the replay loop"
+fi
+
+# The heavy-first order must actually separate the two heaviest wrappers
+# over three shards: with REPLAY_HEAVY listed in cost order, ordinals 0 and
+# 1 are owned by shards 1 and 2 respectively. Executed against the real
+# selector rather than assumed from the list.
+if [ -f "$CONSUMER_HARNESS" ] && [ -f "$SELECTION_HELPER" ]; then
+  first_heavy=$(sed -n '/^REPLAY_HEAVY=(/,/^)/p' "$CONSUMER_HARNESS" | grep -o 'check_[a-z0-9_]*' | head -2 | tr '\n' ' ')
+  if [ "$first_heavy" = "check_codex_scripts check_gh_as_author " ] \
+     && REPO_LINT_SHARD=1/3 bash -c '. "$1"; repo_lint_shard_owns 0 && ! repo_lint_shard_owns 1' _ "$SELECTION_HELPER" \
+     && REPO_LINT_SHARD=2/3 bash -c '. "$1"; repo_lint_shard_owns 1 && ! repo_lint_shard_owns 0' _ "$SELECTION_HELPER"; then
+    pass "the two heaviest replay wrappers land on different shards"
+  else
+    fail "REPLAY_HEAVY must list check_codex_scripts then check_gh_as_author first so round-robin puts them on shards 1 and 2 (got '$first_heavy')"
+  fi
 fi
 
 if sed -n '/Stale-ratchet sweep/,/Same ratchet/p' "$RESIDUE_HARNESS" \

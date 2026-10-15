@@ -67,7 +67,8 @@
       "scripts/workflow/approval-merge-continuation.sh",
       "scripts/workflow/heal-auto-clear-infra-check.sh",
       "scripts/workflow/report-approval-continuation-failures.sh",
-      "tests/test_approval_merge_continuation.sh"
+      "tests/test_approval_merge_continuation.sh",
+      "tests/test_merge_clearance_gate.sh"
     ],
     "check_bootstrap_board_and_summary": [
       "tests/test_bootstrap_board_and_summary.sh"
@@ -142,7 +143,8 @@
       "scripts/lib/ci-check-modes.sh",
       "scripts/coderabbit-wait.sh",
       "tests/test_coderabbit_wait_*.sh",
-      "tests/test_coderabbit_automerge_rate_limit_gate.sh"
+      "tests/test_coderabbit_automerge_rate_limit_gate.sh",
+      "tests/test_coderabbit_should_invoke.sh"
     ],
     "check_codex_p1_gate": [
       "tests/test_codex_p1_gate.sh",
@@ -246,6 +248,7 @@
       "scripts/lib/blocking-labels.sh",
       "scripts/lib/dependabot-commit-provenance.sh",
       "scripts/merge-clearance-gate.sh",
+      "scripts/gate-api-lineage-blocking.sh",
       "tests/test_merge_clearance_gate.sh",
       "tests/test_465_fail_closed.sh"
     ],
@@ -256,7 +259,8 @@
       "tests/test_check_mktemp_portability.sh"
     ],
     "check_no_token_in_output": [
-      "scripts/ci/token_output_gate.py"
+      "scripts/ci/token_output_gate.py",
+      "tests/test_repo_lint_consumer_safety.sh"
     ],
     "check_op_preflight_contract": [
       "tests/test_agent_capability_probe.sh",
@@ -315,12 +319,21 @@
     "check_repo_lint_latency_report": [
       "tests/test_repo_lint_latency_report.sh"
     ],
+    "check_repo_lint_prepush": [
+      "scripts/repo-lint-prepush.sh",
+      "scripts/install-git-hooks.sh",
+      "scripts/git-hooks/*",
+      "tests/test_repo_lint_prepush.sh"
+    ],
     "check_required_check_publisher": [
+      ".github/workflows/auto-clear-blocking-labels.yml",
       ".github/workflows/required-check-publisher.yml",
       "scripts/lib/ci-check-modes.sh",
       "tests/test_required_check_publisher_dedup.sh",
       "tests/test_required_check_publisher_summary_hold.sh",
-      "tests/test_required_check_publisher_due.sh"
+      "tests/test_required_check_publisher_due.sh",
+      "tests/test_consumer_residue_safety.sh",
+      "tests/test_merge_clearance_gate.sh"
     ],
     "check_resolve_pr_threads": [
       "tests/test_resolve_pr_threads_rationale_tag.sh",
@@ -390,6 +403,8 @@
     ],
     "check_workflow_parsers": [
       "tests/test_dependabot_auto_merge_check_wait.sh",
+      "tests/test_655_repo_lint_local_observed.sh",
+      "tests/test_load_review_config.sh",
       "scripts/ci/fixtures/workflow-parsers/*"
     ],
     "check_workflow_verify_propagation_templated": [

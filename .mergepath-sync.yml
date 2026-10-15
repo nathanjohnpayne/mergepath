@@ -525,6 +525,15 @@ paths:
       - "scripts/lib/coderabbit-fence.sh"
       - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
+      # #2253: the rate-limit failover invokes the Codex requester by path
+      # with flags the two scripts agree on (--allow-moving-head since #2166).
+      # A newer caller against an older requester passes a flag the requester
+      # rejects, and the reverse pairing is refused by the requester's
+      # moving-head guard. The edge is declared in BOTH entries so the
+      # requires-closure gate refuses to ship either file without the other
+      # current on the consumer. Fenced by scripts/ci/check_sync_manifest
+      # (coupled callers).
+      - "scripts/codex-review-request.sh"
   # #489 CodeRabbit-rate-limit auto-merge disposition gate. agent-review.yml's
   # exit-5 (rate-limited) branch calls this script to decide whether the
   # Codex-failover path may auto-merge. Absent on a consumer it exits 127 and
@@ -580,6 +589,7 @@ paths:
       - "scripts/lib/gh-api-scalar.sh"   # #799, fail-closed scalar API reads
       - "scripts/codex-review-ledger.sh"       # #1560 slice 3, blocking-review budget count (fails closed when absent)
       - "scripts/lib/codex-review-ledger.sh"   # the ledger's attribution and classification
+      - "scripts/lib/ensure-yq.sh"             # #2240, CI-only yq bootstrap for the request_by_default read (existence-guarded; absent, an unreadable policy requests)
       - "scripts/lib/gh-api-array.sh"    # #1008, hard-sourced paginated list reads
       - "scripts/review-feedback-accounting.sh"   # #1000, fail before another review round
       # #1100: the provider-scoped accounting refusal resolves its relax set from
@@ -595,6 +605,13 @@ paths:
       - "scripts/lib/feedback-policy-helpers.sh"    # #1100, policy_block_field_parsed (#1124)
       - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
+      # #2253: the reverse of the edge on scripts/coderabbit-wait.sh above.
+      # #2175 shipped this requester's moving-head guard together with the
+      # failover's --allow-moving-head; a commit-path sync of the requester
+      # alone (the #2240 canary, nathanpaynedotcom#1377) left the older caller
+      # on the consumer, whose rate-limit failover would then exit 8 without
+      # posting. A caller must travel with the callee whose contract it uses.
+      - "scripts/coderabbit-wait.sh"
   # Complete-history reviewer-feedback accounting gate (#1000). Reads every
   # paginated inline comment, review object, and PR-level comment; reconciles
   # classified findings with finding-bound disposition evidence. It hard-
@@ -723,6 +740,8 @@ paths:
     requires:
       - "scripts/review-feedback-accounting.sh"   # #1000, gate manual reviewer dispatch too
       - "scripts/lib/preflight-helpers.sh"
+      - "scripts/lib/pr-body-contract.sh"
+      - "scripts/workflow/resolve_base_policy.sh"
   - path: scripts/codex-p1-gate.sh
     type: canonical
     consumers: all
@@ -880,6 +899,14 @@ paths:
       - "scripts/lib/blocking-labels.sh"   # #1277, holds apply before clearance exemptions
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
       - "scripts/lib/dependabot-commit-provenance.sh"   # Dependabot arm requires Dependabot-only commits
+  - path: scripts/gate-api-lineage-blocking.sh
+    # #2247: the event-driven Merge clearance gate job runs it from the
+    # trusted checkout before concluding its job-native run non-failing while
+    # clearance is pending. Absent, that step leaves the native run failing
+    # (the pre-#2247 behaviour), so it degrades safely, but it must travel
+    # with the workflow for the fix to reach a consumer.
+    type: canonical
+    consumers: all
   - path: scripts/daily-feedback-rollup.sh
     # Cron workhorse invoked by .github/workflows/daily-feedback-rollup.yml.
     # Sources scripts/lib/daily-feedback-rollup-helpers.sh. The
@@ -1598,6 +1625,7 @@ paths:
       - "scripts/ci/check_merge_clearance_gate"
       - ".github/workflows/pr-review-policy.yml"  # #1249 sibling fixture
       - "scripts/merge-clearance-gate.sh"
+      - "scripts/gate-api-lineage-blocking.sh"   # #2247 Test 30 drives the helper
       # Test 22's positive controls are EXTRACTED from the workflow (#849), so
       # the test reads it directly at runtime. Without this edge the closure
       # gate could ship the test to a consumer whose workflow predates the
@@ -2320,6 +2348,7 @@ paths:
     requires:
       - "scripts/merge-clearance-gate.sh"
       - "scripts/codex-review-check.sh"
+      - "scripts/gate-api-lineage-blocking.sh"   # #2247 pending arm of the native conclusion
   - path: .github/workflows/required-check-publisher.yml
     type: canonical
     consumers: all
@@ -2338,6 +2367,10 @@ paths:
       # verdicts. Same orphaning failure as the gate parent if a scoped wave
       # ships the publisher without it (Codex P2 on #2171).
       - ".github/workflows/repo_lint.yml"
+      # The nominate-auto-clear job's listener (#2239): its dispatch type must
+      # match this workflow's repository_dispatch type, which the publisher
+      # fence (A17) cross-checks, so a scoped wave ships them together.
+      - ".github/workflows/auto-clear-blocking-labels.yml"
       - "scripts/merge-clearance-gate.sh"
       - "scripts/codex-p1-gate.sh"
       - "scripts/coderabbit-severity-gate.sh"
@@ -2527,6 +2560,7 @@ paths:
       - "scripts/coderabbit-severity-gate.sh"  # check_coderabbit_severity_gate (#577)
       - "scripts/lib/feedback-policy-helpers.sh"  # check_feedback_policy_helpers + both severity gates source it (#576/#577)
       - "scripts/merge-clearance-gate.sh"      # check_merge_clearance_gate
+      - "scripts/gate-api-lineage-blocking.sh"   # check_merge_clearance_gate (#2247 pending-arm helper)
       - "scripts/codex-review-request.sh"      # check_codex_scripts
       - "scripts/codex-review-check.sh"        # check_codex_scripts, check_canonical_bugs_263caf3
       - "scripts/codex-record-feedback.sh"     # check_codex_scripts (#487)

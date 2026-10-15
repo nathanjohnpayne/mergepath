@@ -21,8 +21,9 @@
 #      matches an exact manifest entry OR is strictly inside a kit
 #      manifest entry. Closes the propagation closure gap that
 #      surfaced as #264 on the original wave (check_gh_as_author
-#      hard-required tests/test_gh_pr_guard.sh, which was not in
-#      the manifest, so every consumer's lint job failed in pre-flight).
+#      hard-required the gh-pr-guard hook's test suite, which was not
+#      in the manifest, so every consumer's lint job failed in
+#      pre-flight).
 #   8. No per-repo-owned identity doc or hub-only doc is VERBATIM-mirrored
 #      to a consumer (#743, hardened in #745). Paths are normalized first
 #      ("./BRAND.md" ≡ "BRAND.md", "." ≡ repo root) so alternate spellings
@@ -956,6 +957,64 @@ if [ -z "${MERGEPATH_MANIFEST_PATH:-}" ] || [ "${MERGEPATH_ASSERT_REPO_LINT:-0}"
     echo "      checks are only enforced where the workflow that wires them travels (#601)."
     FAILED=1
   fi
+fi
+
+# 9. Coupled callers (#2253) — mergepath-only.
+#
+# A script that invokes another propagated script by path, using a flag or
+# exit code the two have to agree on, must travel with it. The commit-path
+# requires-closure gate in sync-to-downstream.sh checks only a target's own
+# `requires:`, so the coupling is declared as an edge in BOTH entries: then a
+# sync of either file is refused unless the other is current on the consumer.
+# Without the reverse edge, the #2240 canary shipped the Codex requester's
+# moving-head guard (#2166) to a consumer whose older coderabbit-wait.sh does
+# not pass --allow-moving-head, which breaks the CodeRabbit rate-limit
+# failover there.
+#
+# Each row is "<caller>|<callee>". Same scoping as step 8: off for fixture
+# runs unless MERGEPATH_ASSERT_COUPLED_CALLERS=1, and a fixture may supply its
+# own rows through MERGEPATH_COUPLED_CALLERS (newline-separated).
+COUPLED_CALLERS_DEFAULT='scripts/coderabbit-wait.sh|scripts/codex-review-request.sh'
+if [ -z "${MERGEPATH_MANIFEST_PATH:-}" ] || [ "${MERGEPATH_ASSERT_COUPLED_CALLERS:-0}" = "1" ]; then
+  coupled_rows="${MERGEPATH_COUPLED_CALLERS:-$COUPLED_CALLERS_DEFAULT}"
+  while IFS='|' read -r cc_caller cc_callee cc_extra; do
+    [ -z "$cc_caller$cc_callee$cc_extra" ] && continue
+    if [ -z "$cc_caller" ] || [ -z "$cc_callee" ] || [ -n "$cc_extra" ]; then
+      echo "FAIL: malformed coupled-caller row '$cc_caller|$cc_callee${cc_extra:+|$cc_extra}' (expected <caller>|<callee>) — #2253"
+      FAILED=1
+      continue
+    fi
+    for cc_pair in "$cc_caller|$cc_callee" "$cc_callee|$cc_caller"; do
+      cc_from=${cc_pair%%|*}
+      cc_to=${cc_pair#*|}
+      # shellcheck disable=SC2016  # $e is a yq variable, not a shell expansion
+      if ! cc_counts=$(CC_FROM="$cc_from" CC_TO="$cc_to" yq -r '
+        [.paths[] | select(.path == env(CC_FROM))] as $e
+        | ($e | length | tostring) + "|"
+          + ([$e[] | (.requires // [])[] | select(. == env(CC_TO))] | length | tostring)
+      ' "$MANIFEST" 2>&1); then
+        echo "FAIL: could not probe the coupled-caller edge '$cc_from' -> '$cc_to' (yq error):"
+        printf '%s\n' "$cc_counts"
+        echo "check_sync_manifest: FAIL"
+        exit 1
+      fi
+      cc_entries=${cc_counts%%|*}
+      cc_edges=${cc_counts#*|}
+      if ! [[ "$cc_entries" =~ ^[0-9]+$ ]] || ! [[ "$cc_edges" =~ ^[0-9]+$ ]]; then
+        echo "FAIL: unexpected coupled-caller probe output for '$cc_from' -> '$cc_to': '$cc_counts'"
+        echo "check_sync_manifest: FAIL"
+        exit 1
+      fi
+      if [ "$cc_entries" = "0" ]; then
+        echo "FAIL: coupled callers '$cc_caller' <-> '$cc_callee': '$cc_from' has no manifest entry (#2253)"
+        FAILED=1
+      elif [ "$cc_edges" = "0" ]; then
+        echo "FAIL: '$cc_from' must list '$cc_to' in requires: — they are coupled callers and must"
+        echo "      propagate together, or a commit-path sync ships one ahead of the other (#2253)."
+        FAILED=1
+      fi
+    done
+  done <<< "$coupled_rows"
 fi
 
 if [ "$FAILED" -eq 1 ]; then

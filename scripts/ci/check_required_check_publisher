@@ -1175,6 +1175,154 @@ for basename, (job_key, context, expected_display) in NATIVE_PRODUCERS.items():
                 "      that job's requires_relay output; without the dependency the expression",
                 "      cannot reliably select the non-required handoff name.")
 
+# ── A16 — the due threshold IS the gate sweep interval (#2220) ─────────
+#
+# DUE_MAX_AGE_SECONDS decides when an event pass re-evaluates a PR whose
+# green slot shows no activity, and it is documented as "a verdict older
+# than the sweep interval". It stayed at 900 when #2167 moved the sweep from
+# */15 to */30, so every green PR fell due again after 15 minutes and event
+# passes re-evaluated it twice as often as designed — one of the four causes
+# of the installation-budget exhaustion #2220 measured. The two values live
+# in different files, so only an assertion over both keeps them equal. The
+# cron is read from the GATE PARENT, the workflow whose schedule fires the
+# publisher's chained pass; a cron not of the form `*/N * * * *` fails here
+# rather than being guessed at. The two budget-guard knobs on the same step
+# are required non-negative integers (the per-PR cost must be positive): a
+# missing or malformed knob makes the pass fall back to evaluating without
+# a guard, which is silent.
+PUBLISH_STEP_NAME = REQUIRED_HEAD_ENV[PUBLISH_JOB][0]
+publish_step = None
+if publish_job is not None:
+    named = [s for s in (publish_job.get("steps") or [])
+             if isinstance(s, dict) and s.get("name") == PUBLISH_STEP_NAME]
+    publish_step = named[0] if len(named) == 1 else None
+publish_env = (publish_step or {}).get("env") if isinstance((publish_step or {}).get("env"), dict) else {}
+try:
+    gate_parent_doc = load(PARENT_WORKFLOW)
+except Exception:
+    gate_parent_doc = None  # unreadable parent is already reported by A6
+gate_parent_on = gate_parent_doc.get("on") if isinstance(gate_parent_doc, dict) else None
+gate_sched = gate_parent_on.get("schedule") if isinstance(gate_parent_on, dict) else None
+gate_crons = [e.get("cron") for e in gate_sched if isinstance(e, dict)] if isinstance(gate_sched, list) else []
+sweep_seconds = None
+if len(gate_crons) == 1 and isinstance(gate_crons[0], str):
+    m = re.fullmatch(r"\*/([1-9][0-9]*) \* \* \* \*", gate_crons[0].strip())
+    if m:
+        sweep_seconds = int(m.group(1)) * 60
+due_age = publish_env.get("DUE_MAX_AGE_SECONDS")
+if gate_parent_doc is not None and sweep_seconds is None:
+    bad("FAIL: [rcp due threshold] %s carries no single `*/N * * * *` schedule cron"
+        % PARENT_WORKFLOW,
+        "      (read %r), so the sweep interval DUE_MAX_AGE_SECONDS must equal" % gate_crons,
+        "      cannot be derived (#2220).")
+elif sweep_seconds is not None and str(due_age) != str(sweep_seconds):
+    bad("FAIL: [rcp due threshold] the publish step's DUE_MAX_AGE_SECONDS is %r, but the"
+        % due_age,
+        "      gate parent's sweep cron %r is every %d seconds. An event pass" % (gate_crons[0], sweep_seconds),
+        "      treats a quiet green as current only for this long, and it is defined",
+        "      as the sweep interval: shorter re-evaluates every green PR more often",
+        "      than the sweep (the 900-at-*/30 drift behind #2220), longer lets a",
+        "      verdict outlive a quiet period the sweep already allowed.")
+for knob, minimum in (("BUDGET_PER_PR_REQUESTS", 1), ("BUDGET_RESERVE_REQUESTS", 0),
+                      ("BUDGET_PER_PR_GRAPHQL_POINTS", 1), ("BUDGET_GRAPHQL_RESERVE_POINTS", 0)):
+    value = publish_env.get(knob)
+    if not (isinstance(value, str) and value.isdigit() and int(value) >= minimum):
+        bad("FAIL: [rcp budget guard] the publish step's %s is %r, not a quoted" % (knob, value),
+            "      integer >= %d. The budget guard (#2220) reads it to decide whether a" % minimum,
+            "      pass can afford every PR it would evaluate; a missing or malformed",
+            "      knob silently turns the guard off and lets a pass exhaust the",
+            "      installation budget again.")
+
+# ── A17 — the auto-clear nomination job (#2239, #2205) ─────────────────
+#
+# POST /dispatches needs `contents: write`, so the nomination lives in a job
+# of its own: the publish job runs the gate scripts and must never hold that
+# grant. The job is pinned WHOLE, because each addition that would keep it
+# looking right widens what runs with a write token: a `uses:` step (a
+# checkout or an action) executes code under the grant, a second scope or an
+# `environment:` widens the token, and a `concurrency:` block can cancel a
+# pending nomination. The publish job's hand-off (its step id and its one
+# output) is pinned with it, since a broken hand-off silently nominates
+# nothing. The dispatched event type is read out of the run text (the same
+# disclosed text exception as A2) and must be exactly the one type
+# auto-clear-blocking-labels.yml listens to: a rename on either side orphans
+# every nomination with nothing going red, the A6 failure in another file.
+NOMINATE_JOB = "nominate-auto-clear"
+NOMINATE_KEYS = {"name", "needs", "if", "runs-on", "permissions", "steps"}
+NOMINATE_IF = "${{ !cancelled() && needs.publish.outputs.autoclear_prs != '' }}"
+NOMINATE_STEP_KEYS = {"name", "env", "run"}
+NOMINATE_ENV = {
+    "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+    "REPO": "${{ github.repository }}",
+    "AUTOCLEAR_PRS": "${{ needs.publish.outputs.autoclear_prs }}",
+}
+PUBLISH_OUTPUTS = {"autoclear_prs": "${{ steps.publish.outputs.autoclear_prs }}"}
+nominate = jobs.get(NOMINATE_JOB)
+if not isinstance(nominate, dict):
+    bad("FAIL: [rcp auto-clear nomination] the publisher has no %r job mapping;" % NOMINATE_JOB,
+        "      a green clearance verdict on a labeled PR then reaches auto-clear only",
+        "      through its */5 sweep, which GitHub delays or drops under load (#2239).")
+else:
+    if set(nominate) != NOMINATE_KEYS:
+        bad("FAIL: [rcp auto-clear nomination] job %r keys are %s, not exactly %s."
+            % (NOMINATE_JOB, sorted(nominate), sorted(NOMINATE_KEYS)),
+            "      An `environment:`, `concurrency:`, `outputs:` or `container:` beside",
+            "      a contents: write token changes what the grant reaches.")
+    if nominate.get("needs") not in ("publish", ["publish"]):
+        bad("FAIL: [rcp auto-clear nomination] job %r needs %r, not the publish job."
+            % (NOMINATE_JOB, nominate.get("needs")))
+    if " ".join(str(nominate.get("if", "")).split()) != NOMINATE_IF:
+        bad("FAIL: [rcp auto-clear nomination] job %r condition is %r, not %r."
+            % (NOMINATE_JOB, nominate.get("if"), NOMINATE_IF),
+            "      It must run only when the pass nominated a PR (no runner otherwise),",
+            "      and must survive another PR's infra red in the publish job.")
+    if nominate.get("permissions") != {"contents": "write"}:
+        bad("FAIL: [rcp auto-clear nomination] job %r permissions are %r, not exactly"
+            % (NOMINATE_JOB, nominate.get("permissions")),
+            "      {'contents': 'write'}: POST /dispatches needs that and nothing else.")
+    nsteps = nominate.get("steps")
+    if not (isinstance(nsteps, list) and len(nsteps) == 1 and isinstance(nsteps[0], dict)):
+        bad("FAIL: [rcp auto-clear nomination] job %r must carry exactly one step." % NOMINATE_JOB)
+    else:
+        nstep = nsteps[0]
+        if set(nstep) != NOMINATE_STEP_KEYS:
+            bad("FAIL: [rcp auto-clear nomination] job %r step keys are %s, not exactly %s."
+                % (NOMINATE_JOB, sorted(nstep), sorted(NOMINATE_STEP_KEYS)),
+                "      A `uses:` step (a checkout or an action) would execute code under",
+                "      the contents: write grant.")
+        if nstep.get("env") != NOMINATE_ENV:
+            bad("FAIL: [rcp auto-clear nomination] job %r step env is %r, not %r."
+                % (NOMINATE_JOB, nstep.get("env"), NOMINATE_ENV),
+                "      The dispatch rides the job's own GITHUB_TOKEN, never a PAT.")
+        run_text = strip_shell_comments(str(nstep.get("run", "")))
+        sent = re.findall(r"event_type=([A-Za-z0-9_.-]+)", run_text)
+        listener_types = None
+        listener_path = os.path.join(WORKFLOW_DIR, "auto-clear-blocking-labels.yml")
+        try:
+            listener_on = (load(listener_path) or {}).get("on")
+            listener_rd = listener_on.get("repository_dispatch") if isinstance(listener_on, dict) else None
+            listener_types = listener_rd.get("types") if isinstance(listener_rd, dict) else None
+        except Exception as exc:
+            bad("FAIL: [rcp auto-clear nomination] could not read %s: %s"
+                % (listener_path, " ".join(str(exc).split())))
+        if not (isinstance(listener_types, list) and len(listener_types) == 1):
+            bad("FAIL: [rcp auto-clear nomination] %s does not listen to exactly one"
+                % listener_path,
+                "      repository_dispatch type (read %r), so the nomination event has" % listener_types,
+                "      no single listener to match.")
+        elif sent != listener_types:
+            bad("FAIL: [rcp auto-clear nomination] the job dispatches event_type %r, but" % sent,
+                "      auto-clear-blocking-labels.yml listens to %r. A mismatch orphans" % listener_types,
+                "      every nomination silently.")
+if publish_job is not None:
+    if publish_job.get("outputs") != PUBLISH_OUTPUTS:
+        bad("FAIL: [rcp auto-clear nomination] the publish job's outputs are %r, not %r."
+            % (publish_job.get("outputs"), PUBLISH_OUTPUTS))
+    if (publish_step or {}).get("id") != "publish":
+        bad("FAIL: [rcp auto-clear nomination] the publish step's id is %r, not 'publish';"
+            % (publish_step or {}).get("id"),
+            "      the job output reads steps.publish.outputs.autoclear_prs.")
+
 if failures:
     print("\n".join(failures))
     sys.exit(1)

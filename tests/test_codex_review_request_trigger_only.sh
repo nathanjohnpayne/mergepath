@@ -70,6 +70,7 @@ make_case() {
 author_identity: nathanjohnpayne
 codex:
   bot_login: "chatgpt-codex-connector[bot]"
+  request_by_default: true  # #2240: absent now means false; these cases exercise the request itself
   review_timeout_seconds: 0
   reaction_freshness_window_seconds: 999999999
   ack_wait_seconds: 0
@@ -262,9 +263,15 @@ run_guard() {
 }
 # A head pushed one minute ago (under the 300s default) and one pushed an hour
 # ago (over it). Computed with jq so the suite stays portable across BSD and
-# GNU date on every consumer.
-YOUNG_HEAD=$(jq -rn 'now - 60 | floor | todate')
-OLD_HEAD=$(jq -rn 'now - 3600 | floor | todate')
+# GNU date on every consumer. Recomputed at the start of every moving-head
+# case (#2253): those cases run after the rest of the suite, and a value taken
+# once at load ages past the 300s floor on a slow runner, turning the
+# young-head refusals into posts.
+refresh_head_dates() {
+  YOUNG_HEAD=$(jq -rn 'now - 60 | floor | todate')
+  OLD_HEAD=$(jq -rn 'now - 3600 | floor | todate')
+}
+refresh_head_dates
 
 # #1276: losing the shared selector cannot turn a known trigger into a new POST.
 dir=$(make_case missing-selector)
@@ -1254,6 +1261,7 @@ done
 
 # MH1: a head pushed 60s ago is under the 300s default → exit 8, no post
 test_guard_refuses_young_head() {
+  refresh_head_dates
   local dir rc before=$FAIL
   dir=$(make_case "guard-young")
   rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" completed "" --trigger-only)
@@ -1271,6 +1279,7 @@ test_guard_refuses_young_head() {
 
 # MH2: same young head, --allow-moving-head → warns and posts once
 test_guard_allow_flag_posts_with_warning() {
+  refresh_head_dates
   local dir rc before=$FAIL
   dir=$(make_case "guard-allow")
   rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" completed "" --trigger-only --allow-moving-head)
@@ -1283,6 +1292,7 @@ test_guard_allow_flag_posts_with_warning() {
 # MH3: old head, the repo has a repo-lint workflow, but no run of it exists for
 # the head yet → exit 8 (check-missing)
 test_guard_refuses_unscheduled_check() {
+  refresh_head_dates
   local dir rc before=$FAIL
   dir=$(make_case "guard-nolint")
   rc=$(run_guard "$dir" fresh "$OLD_HEAD" missing "" --trigger-only)
@@ -1307,6 +1317,7 @@ test_guard_refuses_unscheduled_check() {
 
 # MH4: both signals at once are reported together
 test_guard_reports_both_reasons() {
+  refresh_head_dates
   local dir rc before=$FAIL
   dir=$(make_case "guard-both")
   rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" missing "" --trigger-only)
@@ -1318,6 +1329,7 @@ test_guard_reports_both_reasons() {
 # MH5: a queued run counts as scheduled (the Actions backlog is not the signal);
 # an old head with one posts.
 test_guard_accepts_queued_check() {
+  refresh_head_dates
   local dir rc before=$FAIL
   dir=$(make_case "guard-queued")
   rc=$(run_guard "$dir" fresh "$OLD_HEAD" queued "" --trigger-only)
@@ -1330,6 +1342,7 @@ test_guard_accepts_queued_check() {
 # MH6: an unreadable check-runs read fails OPEN with a distinct log line (this
 # is a cycle-time guard, not a merge gate); the age signal still decides.
 test_guard_unreadable_check_runs_fails_open() {
+  refresh_head_dates
   local dir rc before=$FAIL
   dir=$(make_case "guard-unreadable")
   rc=$(run_guard "$dir" fresh "$OLD_HEAD" unreadable "" --trigger-only)
@@ -1348,6 +1361,7 @@ test_guard_unreadable_check_runs_fails_open() {
 
 # MH7: the policy knobs disable each signal: age 0 and an empty check name
 test_guard_policy_knobs_disable_signals() {
+  refresh_head_dates
   local dir rc before=$FAIL
   dir=$(make_case "guard-knobs-off")
   printf '  request_min_head_age_seconds: 0\n  request_requires_check: ""\n' >>"$dir/.github/review-policy.yml"
@@ -1379,6 +1393,7 @@ test_guard_policy_knobs_disable_signals() {
 # fires on CodeRabbit's rate limit, not on a push the agent is amending, and a
 # refusal would strand the head with no caller left to re-request.
 test_guard_exempts_automatic_caller() {
+  refresh_head_dates
   local dir rc before=$FAIL
   dir=$(make_case "guard-auto")
   rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" missing true --trigger-only)
@@ -1392,6 +1407,7 @@ test_guard_exempts_automatic_caller() {
 # one that already carries a fresh author trigger, posts nothing and is never
 # refused -- the dedup/idempotency contract is untouched.
 test_guard_does_not_run_on_no_write_paths() {
+  refresh_head_dates
   local dir rc before=$FAIL
   dir=$(make_case "guard-dup")
   rc=$(run_guard "$dir" dup_author "$YOUNG_HEAD" missing "" --trigger-only)
@@ -1404,6 +1420,7 @@ test_guard_does_not_run_on_no_write_paths() {
 # MH10: the guard also covers the full (polling) mode, which the agent runs in
 # Phase 4a -- not only --trigger-only.
 test_guard_applies_in_polling_mode() {
+  refresh_head_dates
   local dir rc before=$FAIL
   dir=$(make_case "guard-poll")
   rc=$(run_guard "$dir" fresh "$YOUNG_HEAD" completed "")
@@ -1417,6 +1434,7 @@ test_guard_applies_in_polling_mode() {
 # PR's branch. Runs of the same SHA on another branch, and earlier pushes of
 # it to this branch, must not make the head look settled.
 test_guard_anchors_on_push_dispatch() {
+  refresh_head_dates
   local dir rc before=$FAIL
   # (a) Old commit; the SHA ran repo-lint on another branch 3h ago; this
   # branch dispatched it a minute ago. Anchor = the minute-old dispatch.
@@ -1455,7 +1473,7 @@ test_guard_anchors_on_push_dispatch() {
 test_policy_resolved_from_script_checkout() {
   local dir rc before=$FAIL
   dir=$(make_case "policy-subdir")
-  printf '  request_by_default: false\n' >>"$dir/.github/review-policy.yml"
+  sed -i.bak 's/^  request_by_default: true.*/  request_by_default: false/' "$dir/.github/review-policy.yml"
   rc=0
   ( cd "$dir/scripts" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
       CODEX_TEST_SCENARIO=fresh ./codex-review-request.sh --trigger-only 999 owner/repo \
@@ -1463,7 +1481,7 @@ test_policy_resolved_from_script_checkout() {
   [ "$rc" = "5" ] && [ "$(trig_count "$dir")" = "0" ] \
     || fail "MH12: run from scripts/, request_by_default: false must skip with exit 5 (rc=$rc posts=$(trig_count "$dir")); err=$(cat "$dir/err.log")"
   dir=$(make_case "policy-foreign-cwd")
-  printf '  request_by_default: false\n' >>"$dir/.github/review-policy.yml"
+  sed -i.bak 's/^  request_by_default: true.*/  request_by_default: false/' "$dir/.github/review-policy.yml"
   rc=0
   ( cd "$WORKDIR" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
       CODEX_TEST_SCENARIO=fresh "$dir/scripts/codex-review-request.sh" --trigger-only 999 owner/repo \
@@ -1476,6 +1494,7 @@ test_policy_resolved_from_script_checkout() {
 # MH13: the CI-pickup signal is the repo-lint WORKFLOW RUN, which survives job
 # renames and sharding; a repo without the workflow is not refused forever.
 test_guard_workflow_signal_shapes() {
+  refresh_head_dates
   local dir rc before=$FAIL
   # (a) #2173 shards lint-fast into lint-fast (1)..(4). An exact check-name
   # match on `lint-fast` would refuse every request; the run signal does not
@@ -1519,6 +1538,7 @@ test_guard_workflow_signal_shapes() {
 # MH14 (Codex P1 + P2 on #2175): the exact-name OVERRIDE reads every page of
 # check runs, and only runs from the PR branch's check suites count.
 test_guard_override_paginates_and_scopes() {
+  refresh_head_dates
   local dir rc before=$FAIL
   # (a) The matching run is on page 2 behind 100 other runs: found.
   dir=$(make_case "guard-override-paged")
@@ -1535,6 +1555,21 @@ test_guard_override_paginates_and_scopes() {
   [ "$rc" = "8" ] && [ "$(trig_count "$dir")" = "0" ] && [ "$(jqf "$dir" '.moving_head.check_status')" = "missing" ] \
     || fail "MH14b: an exact-name run from another branch's check suite must not satisfy the override (rc=$rc status=$(jqf "$dir" '.moving_head.check_status'))"
   [ "$FAIL" -ne "$before" ] || pass "MH14: the check-run override paginates and counts only the PR branch's check suites"
+}
+
+# MH15 (#2253): the guard protects a NEW write only, so it runs after the
+# request-cap branch. At a spent cap a young head must still get the real stop
+# (exit 7, cap_exhausted), not exit 8 "rerun later". Polling mode's reuse of
+# the existing final request is covered in tests/test_codex_review_request_ack.sh.
+test_guard_runs_after_the_cap_branch() {
+  refresh_head_dates
+  local dir rc before=$FAIL
+  dir=$(make_case "guard-cap-spent")
+  rc=$(run_guard "$dir" cap_at_limit "$YOUNG_HEAD" missing "" --trigger-only)
+  [ "$rc" = "7" ] && [ "$(trig_count "$dir")" = "0" ] || fail "MH15: a spent cap on a young head must exit 7 with no post (rc=$rc posts=$(trig_count "$dir")); err=$(cat "$dir/err.log")"
+  [ "$(jqf "$dir" '.cap_exhausted.kind')" = "request-ceiling" ] || fail "MH15: expected cap_exhausted.kind request-ceiling, got $(jqf "$dir" '.cap_exhausted.kind')"
+  grep -q 'moving-head guard' "$dir/err.log" && fail "MH15: the guard must not run when no new trigger can be written"
+  [ "$FAIL" -ne "$before" ] || pass "MH15: a spent request cap on a young head exits 7 (cap_exhausted), not 8"
 }
 
 test_fresh_posts_once_no_poll
@@ -1587,6 +1622,7 @@ test_guard_anchors_on_push_dispatch
 test_policy_resolved_from_script_checkout
 test_guard_workflow_signal_shapes
 test_guard_override_paginates_and_scopes
+test_guard_runs_after_the_cap_branch
 
 echo "----"
 echo "test_codex_review_request_trigger_only: $PASS passed, $FAIL failed"

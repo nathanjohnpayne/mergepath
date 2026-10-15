@@ -1144,9 +1144,9 @@
     // default and in the Standard preset since #2166 (owner decision
     // 2026-10-13): under-threshold PRs clear by reviewer approval plus the
     // required gates, and Codex stays mandatory on every Phase 4 PR. Strict
-    // keeps it on as an explicit opt-in. A repo whose policy omits the key
-    // still reads the script default (true), so existing repos are unchanged
-    // until they set it.
+    // keeps it on as an explicit opt-in. Since #2240 a repo whose policy
+    // omits the key reads the script default, false, as well; the preview
+    // always writes the key, so a copied policy says which it means.
     codexRequestByDefault: false,
     reviewers: { claude: true, cursor: true, codex: true },
     // Feedback disposition policy (#574/#578). Mirrors the `feedback_policy`

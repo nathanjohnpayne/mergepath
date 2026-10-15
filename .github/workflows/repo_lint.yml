@@ -662,6 +662,14 @@ jobs:
         if: matrix.shard == 4
         run: ./scripts/ci/check_repo_lint_latency_report || { rc=$?; if [ ! -f scripts/ci/check_repo_lint_latency_report ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_repo_lint_latency_report not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
+      # The hub-only git pre-push mirror of this workflow (#2221) must
+      # select what the scope job and the if: expressions here select; its
+      # suite evaluates them, so it reads this file and needs yq. The
+      # wrapper SKIPs on consumers, which do not receive the mirror.
+      - name: check_repo_lint_prepush
+        if: matrix.shard == 2
+        run: ./scripts/ci/check_repo_lint_prepush || { rc=$?; if [ ! -f scripts/ci/check_repo_lint_prepush ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_repo_lint_prepush not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
       # Hermetic suite for the stalled-PR finder + resume entry point
       # (scripts/workflow/stalled-prs.sh, resume-stalled-pr.sh; #2165).
       # Both travel with the scripts/workflow/ kit, so the suite runs on
@@ -998,9 +1006,9 @@ jobs:
   #                        critical path is one shard, not the whole set —
   #                        main pushes, the schedule, propagation-lane heads
   #                        and PRs that change the consumer shape.
-  #   deep_self_tests      the enrolled `--self-test` suites, split into two
-  #                        legs so the critical path is the slowest suite —
-  #                        only when a selected wrapper is enrolled.
+  #   deep_self_tests      the enrolled `--self-test` suites, split into
+  #                        three legs so the critical path is the slowest
+  #                        suite — only when a selected wrapper is enrolled.
   # Every leg carries the same kit-less setup and #777 hygiene bookends.
   deep_safety:
     name: deep-safety (${{ matrix.safety }})
@@ -1140,14 +1148,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Legs are balanced by measured step time (run 38433656174,
-        # 2026-10-13): phase-4b = automation 6.0m + accounting 1.1m; gates =
-        # CodeRabbit wait 3.5m, token output 1.4m, doc ownership 1.1m,
-        # merge clearance 1.0m, Cockpit 0.6m, nudge/auto-clear/publisher/
-        # projects under 0.5m together. A suite's enrolment here must also be
-        # listed in repo-lint-dependencies.json `self_tests`, which the scope
-        # job uses to decide whether these legs have work.
-        suite: [phase-4b, gates]
+        # Legs are balanced by measured step time (PR #2172 run 38451869092,
+        # 2026-10-13): phase-4b = automation 6.8m + accounting 1.4m;
+        # coderabbit = CodeRabbit wait 4.5m plus the nudge, auto-clear,
+        # publisher and projects suites (under 1m together); gates = token
+        # output 1.4m, doc ownership 1.5m, merge clearance 1.5m, Cockpit
+        # 0.7m. A suite's enrolment here must also be listed in
+        # repo-lint-dependencies.json `self_tests`, which the scope job uses
+        # to decide whether these legs have work.
+        suite: [phase-4b, coderabbit, gates]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1191,7 +1200,7 @@ jobs:
         run: ./scripts/ci/check_phase_4b_accounting --self-test || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_accounting ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_phase_4b_accounting not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_coderabbit_wait --self-test
-        if: matrix.suite == 'gates' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_coderabbit_wait'))
+        if: matrix.suite == 'coderabbit' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_coderabbit_wait'))
         run: ./scripts/ci/check_coderabbit_wait --self-test || { rc=$?; if [ ! -f scripts/ci/check_coderabbit_wait ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_coderabbit_wait not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_no_token_in_output --self-test
@@ -1211,19 +1220,19 @@ jobs:
         run: ./scripts/ci/check_cockpit --self-test || { rc=$?; if [ ! -f scripts/ci/check_cockpit ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_cockpit not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_required_check_publisher --self-test
-        if: matrix.suite == 'gates' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_required_check_publisher'))
+        if: matrix.suite == 'coderabbit' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_required_check_publisher'))
         run: ./scripts/ci/check_required_check_publisher --self-test || { rc=$?; if [ ! -f scripts/ci/check_required_check_publisher ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_required_check_publisher not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_pr_review_policy_nudge --self-test
-        if: matrix.suite == 'gates' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_pr_review_policy_nudge'))
+        if: matrix.suite == 'coderabbit' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_pr_review_policy_nudge'))
         run: ./scripts/ci/check_pr_review_policy_nudge --self-test || { rc=$?; if [ ! -f scripts/ci/check_pr_review_policy_nudge ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_pr_review_policy_nudge not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_gh_projects_move_item --self-test
-        if: matrix.suite == 'gates' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_gh_projects_move_item'))
+        if: matrix.suite == 'coderabbit' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_gh_projects_move_item'))
         run: ./scripts/ci/check_gh_projects_move_item --self-test || { rc=$?; if [ ! -f scripts/ci/check_gh_projects_move_item ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_gh_projects_move_item not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_auto_clear_workflow --self-test
-        if: matrix.suite == 'gates' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_auto_clear_workflow'))
+        if: matrix.suite == 'coderabbit' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_auto_clear_workflow'))
         run: ./scripts/ci/check_auto_clear_workflow --self-test || { rc=$?; if [ ! -f scripts/ci/check_auto_clear_workflow ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_auto_clear_workflow not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_dependabot_coupled_groups --self-test

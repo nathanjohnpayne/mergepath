@@ -100,6 +100,7 @@ make_case() {
   cat >"$dir/.github/review-policy.yml" <<EOF
 codex:
   bot_login: "chatgpt-codex-connector[bot]"
+  request_by_default: true  # #2240: absent now means false; these cases exercise the request itself
   review_timeout_seconds: $review_timeout
   reaction_freshness_window_seconds: 999999999
   ack_wait_seconds: $ack_wait
@@ -601,6 +602,28 @@ test_reused_final_slot_trigger_polls_arriving_response() {
   [ "$(jq -r '.trigger_posted' "$dir/out.json")" = false ] || fail "#813 reused final slot: trigger_posted must remain false for a reused command"
   [ "$review_body" = "reused final-slot response" ] || fail "#813 reused final slot: did not report the reused request response"
   [ "$FAIL" -ne "$before" ] || pass "#813: normal mode polls a final-slot trigger-only request without another write"
+}
+
+# #2253: the moving-head guard (#2166) protects a NEW write only. Reusing the
+# final pending request writes nothing, so a head that reads as young (here,
+# every head does: the age floor is raised far past any stub date) must still
+# be polled, not refused with exit 8.
+test_reused_final_slot_polls_on_a_young_head() {
+  local dir rc count before=$FAIL
+  dir=$(make_case "reused-final-slot-young" 0 1)
+  sed -i.bak 's/^  request_min_head_age_seconds: 0$/  request_min_head_age_seconds: 999999999/' "$dir/.github/review-policy.yml"
+  grep -q '^  request_min_head_age_seconds: 999999999$' "$dir/.github/review-policy.yml" \
+    || fail "#2253 young-head reuse: fixture did not raise the age floor"
+  printf '  max_review_rounds: 1\n' >>"$dir/state/base-review-policy.yml"
+  seed_author_trigger "$dir" 9901 "2026-06-04T00:00:00Z"
+  rc=$(run_case "$dir" reused-final-slot-arrival)
+  count=$(trigger_count "$dir")
+  [ "$rc" = 0 ] || fail "#2253 young-head reuse: exit $rc, expected 0 (the reused request was polled); stderr=$(cat "$dir/err.log")"
+  [ "$count" = 0 ] || fail "#2253 young-head reuse: posted $count trigger(s)"
+  grep -q 'polling the existing final request without a new trigger' "$dir/err.log" \
+    || fail "#2253 young-head reuse: did not take the cap-reuse poll"
+  grep -q 'moving-head guard' "$dir/err.log" && fail "#2253 young-head reuse: the guard ran on a path that writes nothing"
+  [ "$FAIL" -ne "$before" ] || pass "#2253: the cap-reuse poll is not refused by the moving-head guard on a young head"
 }
 
 # #1560 canary (finding 4): reusing the final pending request posts nothing,
@@ -1495,6 +1518,7 @@ test_ack_retry_ignores_blocking_budget_value
 test_retry_cap_respected
 test_request_attempt_cap_suppresses_ack_retry_but_polls
 test_reused_final_slot_trigger_polls_arriving_response
+test_reused_final_slot_polls_on_a_young_head
 test_reused_final_slot_polls_despite_unreadable_ledger
 test_reused_final_slot_pending_stops_without_timeout_authority
 test_reused_final_slot_preserves_recorded_timeout

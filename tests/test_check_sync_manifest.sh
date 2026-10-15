@@ -818,6 +818,124 @@ else
   fail "Case 25 unexpected (rc=$rc): $out"
 fi
 
+# --- coupled callers (#2253) ------------------------------------------
+#
+# The mergepath-only assertion (step 9 in check_sync_manifest) requires each
+# coupled caller/callee pair to list the other in requires:, so the
+# requires-closure gate refuses to ship either one alone. Off for fixture runs
+# unless MERGEPATH_ASSERT_COUPLED_CALLERS=1; MERGEPATH_COUPLED_CALLERS
+# replaces the default pair list. Each case runs the check exactly once.
+run_with_fixture_assert_cc() {
+  local manifest_content="$1" paths="$2" rows="${3-}"
+  local fix
+  fix="$(mktemp -d "$WORKDIR/fix.XXXXXX")"
+  printf '%s' "$manifest_content" > "$fix/manifest.yml"
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    mkdir -p "$(dirname "$fix/$p")"; : > "$fix/$p"
+  done <<< "$paths"
+  if [ -n "$rows" ]; then
+    MERGEPATH_MANIFEST_PATH="$fix/manifest.yml" MERGEPATH_REPO_ROOT="$fix" \
+      MERGEPATH_ASSERT_COUPLED_CALLERS=1 MERGEPATH_COUPLED_CALLERS="$rows" bash "$CHECK" 2>&1
+  else
+    MERGEPATH_MANIFEST_PATH="$fix/manifest.yml" MERGEPATH_REPO_ROOT="$fix" \
+      MERGEPATH_ASSERT_COUPLED_CALLERS=1 bash "$CHECK" 2>&1
+  fi
+}
+cc_manifest() { # $1 = requires block for the caller, $2 = for the callee
+  printf '%s\n' "$MIN_HEADER
+  - path: scripts/coderabbit-wait.sh
+    type: canonical
+    consumers: all
+$1
+  - path: scripts/codex-review-request.sh
+    type: canonical
+    consumers: all
+$2"
+}
+CC_FWD='    requires:
+      - "scripts/codex-review-request.sh"'
+CC_REV='    requires:
+      - "scripts/coderabbit-wait.sh"'
+PATHS_CC="scripts/coderabbit-wait.sh
+scripts/codex-review-request.sh"
+
+# Case CC1: the default pair (the requester and its rate-limit-failover
+# caller) declared in both directions passes.
+set +e
+out=$(run_with_fixture_assert_cc "$(cc_manifest "$CC_FWD" "$CC_REV")" "$PATHS_CC"); rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+  pass "Case CC1: coupled callers declared in both directions pass (#2253)"
+else
+  fail "Case CC1 unexpected (rc=$rc): $out"
+fi
+
+# Case CC2: the callee does not require its caller (the #2240 canary shape:
+# the requester shipped alone ahead of coderabbit-wait.sh) → FAIL.
+set +e
+out=$(run_with_fixture_assert_cc "$(cc_manifest "$CC_FWD" "")" "$PATHS_CC"); rc=$?
+set -e
+if [ "$rc" = "1" ] && \
+   echo "$out" | grep -q "'scripts/codex-review-request.sh' must list 'scripts/coderabbit-wait.sh' in requires:" && \
+   ! echo "$out" | grep -q "'scripts/coderabbit-wait.sh' must list"; then
+  pass "Case CC2: a callee that does not require its caller fails closed (#2253)"
+else
+  fail "Case CC2 unexpected (rc=$rc): $out"
+fi
+
+# Case CC3: the caller does not require the callee → FAIL on that edge only.
+set +e
+out=$(run_with_fixture_assert_cc "$(cc_manifest "" "$CC_REV")" "$PATHS_CC"); rc=$?
+set -e
+if [ "$rc" = "1" ] && \
+   echo "$out" | grep -q "'scripts/coderabbit-wait.sh' must list 'scripts/codex-review-request.sh' in requires:" && \
+   ! echo "$out" | grep -q "'scripts/codex-review-request.sh' must list"; then
+  pass "Case CC3: a caller that does not require its callee fails closed (#2253)"
+else
+  fail "Case CC3 unexpected (rc=$rc): $out"
+fi
+
+# Case CC4: pair members with no manifest entry → FAIL naming them, never a
+# silent pass. Both are absent here, so no missing edge can mask the result.
+MANIFEST_CC_NONE="$MIN_HEADER
+  - path: scripts/other.sh
+    type: canonical
+    consumers: all
+"
+set +e
+out=$(run_with_fixture_assert_cc "$MANIFEST_CC_NONE" "scripts/other.sh"); rc=$?
+set -e
+if [ "$rc" = "1" ] && \
+   echo "$out" | grep -q "'scripts/codex-review-request.sh' has no manifest entry" && \
+   echo "$out" | grep -q "'scripts/coderabbit-wait.sh' has no manifest entry"; then
+  pass "Case CC4: a coupled pair member missing from the manifest fails closed (#2253)"
+else
+  fail "Case CC4 unexpected (rc=$rc): $out"
+fi
+
+# Case CC5: rows come from MERGEPATH_COUPLED_CALLERS; a malformed row (no
+# callee) fails closed instead of being skipped.
+set +e
+out=$(run_with_fixture_assert_cc "$(cc_manifest "$CC_FWD" "$CC_REV")" "$PATHS_CC" 'scripts/coderabbit-wait.sh'); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "malformed coupled-caller row"; then
+  pass "Case CC5: a malformed coupled-caller row fails closed (#2253)"
+else
+  fail "Case CC5 unexpected (rc=$rc): $out"
+fi
+
+# Case CC6: the assertion stays OFF for fixture runs that do not opt in, so
+# the earlier fixture manifests (which carry neither file) stay valid.
+set +e
+out=$(run_with_fixture "$(cc_manifest "" "")" "$PATHS_CC"); rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+  pass "Case CC6: #2253 assertion scoped off for non-opted-in fixture runs"
+else
+  fail "Case CC6 unexpected (rc=$rc): $out"
+fi
+
 # --- identity/hub-only-doc denylist (#743) --------------------------
 # A per-repo-owned identity doc or hub-only doc must never be a verbatim
 # canonical/kit manifest entry — directly, via dest:, or inside a kit
