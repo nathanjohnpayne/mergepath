@@ -4,6 +4,10 @@ Feature: corroborated CodeRabbit barrier evidence on the Phase 4b rc-7 path. Whe
 
 ## Acceptance criteria
 
+### Outside-diff section headings (#1407)
+
+The shared tier extractor treats exact bold or HTML `summary` lines headed `Outside diff range comments (N)` as structure, optionally carrying `⚠️`, blockquote presentation and a trailing opening `blockquote` on an HTML summary. It excludes the heading's warning and category markers while retaining every nested finding's own severity. Unknown counts, changed wording and extra finding text on the same line retain classification. This bounded line exclusion applies equally to whole-body extraction and the severity gate's numbered-line scan; it changes neither run selection nor original bodies, acknowledgement fingerprints or reported line numbers. The helper, production severity-gate and complete-history accounting suites cover Minor containers, required Major controls and unrecognized heading shapes.
+
 ### Successful-trigger acknowledgements in polling (#1386)
 
 Polling comment selection treats a supported provider-owned successful review-trigger acknowledgement (`Actions performed` with `Review triggered` or `Full review triggered`) as `in_progress`. It retains the newest such acknowledgement instead of exposing an older clean or benign publication; older acknowledgements cannot replace it, and a newer substantive publication is selected normally. The next older substantive pause or rate-limit notice still takes precedence over the acknowledgement, preserving its existing recovery and exit routing.

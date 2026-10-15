@@ -12,6 +12,8 @@ The shared pull-request body parser and its standalone generated runtime are spe
 
 Explicitly deferred CodeRabbit findings retain the `deferred-to-followup` ledger disposition and resolver tag. The recorder and resolver evidence contract is in `specs/review_feedback_accounting.md`.
 
+CodeRabbit's exact outside-diff section headings do not contribute finding severity; nested findings keep their own badges and configured policy. The bounded shared-classifier contract and regression coverage are documented in `specs/coderabbit_review_sensing.md` and `specs/review_feedback_accounting.md` (#1407).
+
 The CodeRabbit waiter honors published included-review availability through the existing mutable-comment freshness anchor and safety buffer. Missing or malformed durations stall without an optimistic retry; the existing Codex failover and retry deduplication remain intact. The timing contract and production-parser/virtual-clock coverage live in `specs/coderabbit_review_sensing.md` and `tests/test_coderabbit_wait_ratelimit_window.sh` (#2031).
 
 The waiter’s missing-deadline controls exercise real polling and probe consumers of an unknown duration, verify freshness fixture changes, and check successful, failed and opted-out Codex failover before the stall. Unsupported duration presentation remains fail-safe and documented in `specs/coderabbit_review_sensing.md`; the regression coverage is in `tests/test_coderabbit_wait_ratelimit_window.sh` (#2093–#2097).
