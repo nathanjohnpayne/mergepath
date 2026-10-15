@@ -392,6 +392,14 @@ if [ "$PY_OK" -ne 1 ]; then
   exit 2
 fi
 
+# ShellCheck is on every runner; locally its absence makes several wrappers
+# warn, skip their lint step and pass (they hard-fail only under CI). Missing
+# it is an environment error here for the same reason as the Python packages.
+if ! command -v shellcheck >/dev/null 2>&1; then
+  echo "$PREFIX: shellcheck is not installed; several checks skip their ShellCheck step locally and would pass where CI fails (brew install shellcheck), or bypass with --no-verify / MERGEPATH_PREPUSH_SKIP=1." >&2
+  exit 2
+fi
+
 RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/repo-lint-prepush.XXXXXX")
 mkdir -p "$RUN_DIR/steps" "$RUN_DIR/logs" "$RUN_DIR/results"
 printf '%s\n' "$ROOT" > "$RUN_DIR/root"

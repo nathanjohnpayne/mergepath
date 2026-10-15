@@ -488,6 +488,24 @@ check "installer --force replaces it" "$(git -C "$FIX" config --local --get core
 rc=0; (cd "$FIX" && bash scripts/install-git-hooks.sh --check >/dev/null) || rc=$?
 check "installer --uninstall removes it" "$rc" "1"
 (cd "$FIX" && bash scripts/install-git-hooks.sh >/dev/null)
+# A hook git would skip (no executable bit) is not reported as installed.
+chmod -x "$FIX/scripts/git-hooks/pre-push"
+rc=0; (cd "$FIX" && bash scripts/install-git-hooks.sh --check >/dev/null) || rc=$?
+check "installer --check fails when the hook is not executable" "$rc" "1"
+rc=0; (cd "$FIX" && bash scripts/install-git-hooks.sh >/dev/null 2>&1) || rc=$?
+check "installer rerun fails when the hook is not executable" "$rc" "1"
+chmod +x "$FIX/scripts/git-hooks/pre-push"
+# A duplicated key: --force normalizes it to one value, --uninstall clears
+# every copy of ours.
+git -C "$FIX" config --local --add core.hooksPath other-hooks
+rc=0; (cd "$FIX" && bash scripts/install-git-hooks.sh >/dev/null 2>&1) || rc=$?
+check "installer refuses a duplicated core.hooksPath without --force" "$rc" "1"
+(cd "$FIX" && bash scripts/install-git-hooks.sh --force >/dev/null)
+check "installer --force leaves exactly one value" "$(git -C "$FIX" config --local --get-all core.hooksPath)" "scripts/git-hooks"
+git -C "$FIX" config --local --add core.hooksPath scripts/git-hooks
+(cd "$FIX" && bash scripts/install-git-hooks.sh --uninstall >/dev/null)
+check "installer --uninstall removes every copy of its value" "$(git -C "$FIX" config --local --get-all core.hooksPath | wc -l | tr -d ' ')" "0"
+(cd "$FIX" && bash scripts/install-git-hooks.sh >/dev/null)
 
 # The fixture checks need no Python; a stub stands in for an interpreter
 # with CI's packages, and a failing one for an interpreter without them.

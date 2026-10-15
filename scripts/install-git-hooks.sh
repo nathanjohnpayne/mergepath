@@ -42,31 +42,45 @@ if [ ! -f "$root/$HOOKS_PATH/pre-push" ]; then
   exit 2
 fi
 
-current=$(git -C "$root" config --local --get core.hooksPath 2>/dev/null || true)
+# All values, not the last one: a duplicated key is ambiguous to git and is
+# normalized (--force) rather than reported as installed.
+values=$(git -C "$root" config --local --get-all core.hooksPath 2>/dev/null || true)
+count=$(printf '%s' "$values" | grep -c '' || true)
+current=$(printf '%s\n' "$values" | tail -n 1)
+[ "$count" -le 1 ] || current="$(printf '%s' "$values" | tr '\n' ',') ($count values)"
+hook_executable=0
+[ -x "$root/$HOOKS_PATH/pre-push" ] && hook_executable=1
 
 case "$ACTION" in
   check)
-    if [ "$current" = "$HOOKS_PATH" ]; then
+    if [ "$current" = "$HOOKS_PATH" ] && [ "$hook_executable" -eq 1 ]; then
       echo "install-git-hooks: installed (core.hooksPath=$HOOKS_PATH)"
       exit 0
     fi
-    echo "install-git-hooks: not installed (core.hooksPath=${current:-unset})"
+    if [ "$current" = "$HOOKS_PATH" ]; then
+      echo "install-git-hooks: core.hooksPath is set but $HOOKS_PATH/pre-push is not executable, so git skips it (restore its mode with git checkout)"
+    else
+      echo "install-git-hooks: not installed (core.hooksPath=${current:-unset})"
+    fi
     exit 1
     ;;
   uninstall)
-    if [ "$current" = "$HOOKS_PATH" ]; then
-      git -C "$root" config --local --unset core.hooksPath
+    if [ -n "$values" ] && [ -z "$(printf '%s\n' "$values" | grep -v -x -F "$HOOKS_PATH" || true)" ]; then
+      git -C "$root" config --local --unset-all core.hooksPath
       echo "install-git-hooks: removed core.hooksPath"
     else
-      echo "install-git-hooks: nothing to remove (core.hooksPath=${current:-unset})"
+      echo "install-git-hooks: nothing to remove (core.hooksPath=${current:-unset} is not only ours)"
     fi
     exit 0
     ;;
 esac
 
-if [ "$current" = "$HOOKS_PATH" ]; then
+if [ "$current" = "$HOOKS_PATH" ] && [ "$hook_executable" -eq 1 ]; then
   echo "install-git-hooks: already installed (core.hooksPath=$HOOKS_PATH)"
   exit 0
+fi
+if [ "$current" = "$HOOKS_PATH" ]; then
+  current=''   # ours, but the hook is not executable: fall through to the mode check
 fi
 if [ -n "$current" ] && [ "$FORCE" -ne 1 ]; then
   echo "install-git-hooks: core.hooksPath is already set to '$current'; rerun with --force to replace it" >&2
@@ -89,8 +103,8 @@ if [ -d "$common/hooks" ]; then
   done
 fi
 
-git -C "$root" config --local core.hooksPath "$HOOKS_PATH"
-if [ "$(git -C "$root" config --local --get core.hooksPath)" != "$HOOKS_PATH" ]; then
+git -C "$root" config --local --replace-all core.hooksPath "$HOOKS_PATH"
+if [ "$(git -C "$root" config --local --get-all core.hooksPath)" != "$HOOKS_PATH" ]; then
   echo "install-git-hooks: core.hooksPath did not read back as $HOOKS_PATH" >&2
   exit 1
 fi
