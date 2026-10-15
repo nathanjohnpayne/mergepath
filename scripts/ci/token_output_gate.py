@@ -257,6 +257,10 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     graded on what its body writes, not on where that write GOES, so a helper
     whose emitter feeds a pipe is treated as emitting -- declared conservatism
     below.
+    Helper capture/pipeline routing retains existing any-output and fd-1
+    redirection facts from positional-emitting segments and here-doc owners,
+    propagated through the same fixed point (#1495). Facts union all recognized
+    definitions and do not emulate descriptor state or later shielding.
   * The body of an INTERPOLATING here-doc (unquoted delimiter) owned by `cat`,
     `tee` or an emitter.  ALL here-doc openers on a line are tracked, not just
     the first (#1014), and the owner is the command of the SEGMENT the opener
@@ -3327,7 +3331,7 @@ def _test_numeric_operand(seg, name):
     return False
 
 
-def reaches_output(ref, emitter_helpers):
+def reaches_output(ref, emitter_helpers, helper_routing=None):
     """Does this reference reach a stream?  Returns (bool, reason)."""
     if ref.in_error_word:
         # Decided BEFORE the command word, and deliberately ahead of the
@@ -3424,6 +3428,12 @@ def reaches_output(ref, emitter_helpers):
         # get the same verdict rather than a third one.
         has_out_redir = has_out_redir or escaped_any
         stdout_moved = redirects_stdout(seg) or escaped_fd1
+        if helper_routing is not None and not via_stdin and not from_subshell:
+            # The helper's emitting body can redirect before this call's
+            # capture or pipe. Preserve the existing two redirection readings;
+            # their union does not emulate later descriptor shielding (#1495).
+            has_out_redir = has_out_redir or cmd in helper_routing[0]
+            stdout_moved = stdout_moved or cmd in helper_routing[1]
         # `via_stdin` and `from_subshell` are exclusive by construction: each
         # hop below clears the other, because a value cannot arrive on a
         # segment's standard input AND already be on its standard output.
@@ -3759,8 +3769,8 @@ def _printf_callback_changes_lookup(seg):
     return False
 
 
-def discover_emitter_helpers(text):
-    """Names with any recognized body writing their positionals VERBATIM."""
+def discover_emitter_helpers(text, return_routing=False):
+    """Emitting names; optionally also their two finite redirection fact sets."""
     bodies = {}
     definitions = list(_iter_function_definitions(text))
     # NOT `^[ \t]*`.  A function definition is valid at any COMMAND POSITION,
@@ -3830,17 +3840,21 @@ def discover_emitter_helpers(text):
                         availability_changed = True
     shadowed = "printf" in bodies or any(name in PASSTHRU for name in bodies)
     helpers = {"printf"} if shadowed or availability_changed else set()
+    redirected_any = set()
+    redirected_fd1 = set()
     # A FIXED POINT, not a fixed number of rounds.  Each round can promote at
     # most one link of a call chain, so a chain longer than the round budget
     # left its outermost helper undiscovered -- `a` calls `b` calls `c` calls
     # `d` calls `echo "$1"` needs four (#1032 F6).  The set only ever grows and
     # is bounded by the number of functions in the file, so this terminates.
+    # Redirection facts also grow monotonically; revisit promoted helpers and
+    # all bodies so a later-discovered callee or emitter retains its routing.
     while True:
         grew = False
         for name, body_text, lx in lexed:
-            if name in helpers:
-                continue
             emits = False
+            moves_any = False
+            moves_fd1 = False
             for ll in lx.logical:
                 for seg in ll.segments:
                     cmd, _redir = resolve_command(seg)
@@ -3865,11 +3879,9 @@ def discover_emitter_helpers(text):
                     for w in seg.words:
                         if _word_has_verbatim_positional(w):
                             emits = True
+                            moves_any |= _redir or cmd in redirected_any
+                            moves_fd1 |= redirects_stdout(seg) or cmd in redirected_fd1
                             break
-                    if emits:
-                        break
-                if emits:
-                    break
             # A helper body can put a positional on a stream without naming
             # an emitter at all: BASH writes a `${VAR:?WORD}` error word
             # itself, and under xtrace it writes every expanded command.  This
@@ -3892,14 +3904,27 @@ def discover_emitter_helpers(text):
                         and _word_has_verbatim_positional(body_text):
                     emits = True
             # A nested or direct HD uses the same bounded admission rule.
-            if not emits:
-                emits = any(_heredoc_has_positional(hd, helpers) for hd in lx.heredocs)
-            if emits:
+            for hd in lx.heredocs:
+                if _heredoc_has_positional(hd, helpers):
+                    emits = True
+                    _cmd, redir = resolve_command(hd.owner)
+                    moves_any |= redir
+                    moves_fd1 |= redirects_stdout(hd.owner)
+            if emits and name not in helpers:
                 helpers.add(name)
+                grew = True
+            if moves_any and name not in redirected_any:
+                redirected_any.add(name)
+                grew = True
+            if moves_fd1 and name not in redirected_fd1:
+                redirected_fd1.add(name)
                 grew = True
         if not grew:
             break
-    return frozenset(helpers)
+    names = frozenset(helpers)
+    if return_routing:
+        return names, frozenset(redirected_any), frozenset(redirected_fd1)
+    return names
 
 
 def _heredoc_bracket_close(text, open_idx, parameter_words=False):
@@ -4805,7 +4830,7 @@ def _text_enables_xtrace(text, outer_only=False):
 def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
     """Return (findings, pragma_errors)."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    helpers = discover_emitter_helpers(text)
+    helpers, routed_any, routed_fd1 = discover_emitter_helpers(text, return_routing=True)
     lx = Lexer(text)
     findings = []
     pragma_errors = []
@@ -4931,7 +4956,7 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
             xtrace = outer
             continue
         for ref in ll.refs:
-            hit, why = reaches_output(ref, helpers)
+            hit, why = reaches_output(ref, helpers, (routed_any, routed_fd1))
             if not hit and xtrace_at.get(
                 ref.seg.sid if ref.seg is not None else None, xtrace
             ):
@@ -10872,6 +10897,156 @@ CORPUS = [
     ('read-helper-positional-index-inherited', MUST_NOT_FLAG, 'leak() { read $\'a[$(: \\\\\\\'; echo "$1" >&2)]\' <<< x; }\nleak "$GH_TOKEN"\n'),
     ('printf-v-helper-positional-index-inherited', MUST_NOT_FLAG, 'leak() { printf -v $\'a[$(: \\\\\\\'; echo "$1" >&2)]\' %s x; }\nleak "$GH_TOKEN"\n'),
     ('read-ansi-index-no-apostrophe-inherited', MUST_NOT_FLAG, 'read $\'a[$(echo "$GH_TOKEN" >&2)]\' <<< x\n'),
+    (
+        'helper-routing-stdout-direct',
+        MUST_FLAG,
+        'die() { echo "fatal: $1"; }\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-routing-stdout-capture',
+        MUST_NOT_FLAG,
+        'die() { echo "fatal: $1"; }\nv=$(die "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-stdout-pipeline',
+        MUST_NOT_FLAG,
+        'die() { echo "fatal: $1"; }\ndie "$GH_TOKEN" | grep -qF zz\n',
+    ),
+    (
+        'helper-routing-stdout-subshell-capture',
+        MUST_NOT_FLAG,
+        'die() { echo "fatal: $1"; }\nv=$( ( die "$GH_TOKEN" ) )\n',
+    ),
+    (
+        'helper-routing-stdout-backtick-capture',
+        MUST_NOT_FLAG,
+        'die() { echo "fatal: $1"; }\nv=`die "$GH_TOKEN"`\n',
+    ),
+    (
+        'helper-routing-stderr-direct',
+        MUST_FLAG,
+        'die() { echo "fatal: $1" >&2; }\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-routing-stderr-capture',
+        MUST_FLAG,
+        'die() { echo "fatal: $1" >&2; }\nv=$(die "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-stderr-pipeline',
+        MUST_FLAG,
+        'die() { echo "fatal: $1" >&2; }\ndie "$GH_TOKEN" | grep -qF zz\n',
+    ),
+    (
+        'helper-routing-stderr-subshell-capture',
+        MUST_FLAG,
+        'die() { echo "fatal: $1" >&2; }\nv=$( ( die "$GH_TOKEN" ) )\n',
+    ),
+    (
+        'helper-routing-stderr-backtick-capture',
+        MUST_FLAG,
+        'die() { echo "fatal: $1" >&2; }\nv=`die "$GH_TOKEN"`\n',
+    ),
+    (
+        'helper-routing-recursive-stderr-capture',
+        MUST_FLAG,
+        'outer() { inner "$1"; }\ninner() { echo "$1" >&2; }\nv=$(outer "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-recursive-stderr-pipeline',
+        MUST_FLAG,
+        'outer() { inner "$1"; }\ninner() { echo "$1" >&2; }\nouter "$GH_TOKEN" | grep -qF zz\n',
+    ),
+    (
+        'helper-routing-recursive-stdout-capture',
+        MUST_NOT_FLAG,
+        'outer() { inner "$1"; }\ninner() { echo "$1"; }\nv=$(outer "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-recursive-stdout-pipeline',
+        MUST_NOT_FLAG,
+        'outer() { inner "$1"; }\ninner() { echo "$1"; }\nouter "$GH_TOKEN" | grep -qF zz\n',
+    ),
+    (
+        'helper-routing-promoted-before-routing',
+        MUST_FLAG,
+        'outer() { echo "$1"; inner "$1"; }\ninner() { echo "$1" >&2; }\nv=$(outer "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-stdout-before-stderr-body',
+        MUST_FLAG,
+        'die() { echo "$1"; echo "$1" >&2; }\nv=$(die "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-later-safe-body',
+        MUST_FLAG,
+        'die() { echo "$1" >&2; }\nv=$(die "$GH_TOKEN")\ndie() { echo "$1"; }\n',
+    ),
+    (
+        'helper-routing-later-stderr-body',
+        MUST_FLAG,
+        'die() { echo "$1"; }\nv=$(die "$GH_TOKEN")\ndie() { echo "$1" >&2; }\n',
+    ),
+    (
+        'helper-routing-unrelated-stderr-capture',
+        MUST_NOT_FLAG,
+        'die() { echo safe >&2; echo "$1"; }\nv=$(die "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-unrelated-stderr-pipeline',
+        MUST_NOT_FLAG,
+        'die() { echo safe >&2; echo "$1"; }\ndie "$GH_TOKEN" | grep -qF zz\n',
+    ),
+    (
+        'helper-routing-caller-shields-stderr-pipeline',
+        MUST_FLAG,
+        'die() { echo "$1" >&2; }\ndie "$GH_TOKEN" 2>/dev/null | grep -qF zz\n',
+    ),
+    (
+        'helper-routing-caller-joins-stderr-capture',
+        MUST_FLAG,
+        'die() { echo "$1" >&2; }\nv=$(die "$GH_TOKEN" 2>&1)\n',
+    ),
+    (
+        'helper-routing-body-file-capture',
+        MUST_FLAG,
+        'die() { echo "$1" > out.txt; }\nv=$(die "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-body-file-pipeline',
+        MUST_FLAG,
+        'die() { echo "$1" > out.txt; }\ndie "$GH_TOKEN" | grep -qF zz\n',
+    ),
+    (
+        'helper-routing-stdout-stderr-redirection-capture',
+        MUST_FLAG,
+        'die() { echo "$1" 2>/dev/null; }\nv=$(die "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-stdout-stderr-redirection-pipeline',
+        MUST_NOT_FLAG,
+        'die() { echo "$1" 2>/dev/null; }\ndie "$GH_TOKEN" | grep -qF zz\n',
+    ),
+    (
+        'helper-routing-herestring-stderr-capture',
+        MUST_FLAG,
+        'die() { cat <<< "$1" >&2; }\nv=$(die "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-herestring-stdout-capture',
+        MUST_NOT_FLAG,
+        'die() { cat <<< "$1"; }\nv=$(die "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-heredoc-stderr-capture',
+        MUST_FLAG,
+        'die() {\ncat >&2 <<EOF\n$1\nEOF\n}\nv=$(die "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-heredoc-stdout-capture',
+        MUST_NOT_FLAG,
+        'die() {\ncat <<EOF\n$1\nEOF\n}\nv=$(die "$GH_TOKEN")\n',
+    ),
 ]
 
 CORPUS.extend([
@@ -12862,6 +13037,12 @@ KNOWN_BROADER = {
     'printf-v-value-ordinary-default': (
         'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
     ),
+    'helper-routing-body-file-capture': 'Helper routing unions existing output-redirection facts from all recognized emitting bodies. It does not prove descriptor ordering, later call-site shielding or which definition executed; file writes and the existing any-redirection capture rule remain conservative (#1495; #1042).',
+    'helper-routing-body-file-pipeline': 'Helper routing unions existing output-redirection facts from all recognized emitting bodies. It does not prove descriptor ordering, later call-site shielding or which definition executed; file writes and the existing any-redirection capture rule remain conservative (#1495; #1042).',
+    'helper-routing-caller-joins-stderr-capture': 'Helper routing unions existing output-redirection facts from all recognized emitting bodies. It does not prove descriptor ordering, later call-site shielding or which definition executed; file writes and the existing any-redirection capture rule remain conservative (#1495; #1042).',
+    'helper-routing-caller-shields-stderr-pipeline': 'Helper routing unions existing output-redirection facts from all recognized emitting bodies. It does not prove descriptor ordering, later call-site shielding or which definition executed; file writes and the existing any-redirection capture rule remain conservative (#1495; #1042).',
+    'helper-routing-later-stderr-body': 'Helper routing unions existing output-redirection facts from all recognized emitting bodies. It does not prove descriptor ordering, later call-site shielding or which definition executed; file writes and the existing any-redirection capture rule remain conservative (#1495; #1042).',
+    'helper-routing-stdout-stderr-redirection-capture': 'Helper routing unions existing output-redirection facts from all recognized emitting bodies. It does not prove descriptor ordering, later call-site shielding or which definition executed; file writes and the existing any-redirection capture rule remain conservative (#1495; #1042).',
 }
 
 
