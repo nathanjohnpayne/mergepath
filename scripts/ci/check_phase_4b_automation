@@ -39,6 +39,8 @@ REQUIRED_EXEC=(
 )
 REQUIRED_FILES=(
   "scripts/phase-4b/lib.sh"
+  "scripts/phase-4b/escalation.cjs"
+  "tests/test_phase_4b_escalation.cjs"
   "scripts/phase-4b/heartbeat.sh"
   "tests/test_phase_4b_heartbeat.sh"
   "tests/test_phase_4b_immutable_input.sh"
@@ -136,6 +138,7 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 echo "check_phase_4b_automation: running $TEST"
+node --test "$REPO_ROOT/tests/test_phase_4b_escalation.cjs"
 bash "$REPO_ROOT/$TEST" --rate-limit-only
 bash "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh" --status-refusal-only
 bash "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh" --marker-led-heading-only

@@ -783,7 +783,11 @@ hold_for_external_review() {
 
 stop_for_human_tiebreaker() {
   local payload="$1"
-  p4b_warn "Codex human stop holds (spent blocking-review budget, runaway, untested rebuttal or disagreement at a spent request ceiling); stopping for a human tiebreaker without adapter dispatch or Phase 4b handoff"
+  if printf '%s' "$payload" | jq -e '.tripwire' >/dev/null 2>&1; then
+    p4b_warn "Deterministic Phase 4b tripwire requires human-mediated review; no adapter or approval dispatched"
+  else
+    p4b_warn "Codex human stop holds (spent blocking-review budget, runaway, untested rebuttal or disagreement at a spent request ceiling); stopping for a human tiebreaker without adapter dispatch or Phase 4b handoff"
+  fi
   jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
         --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" '
@@ -1276,6 +1280,18 @@ revalidate_immutable_input() {
   [ "$(p4b_input_digest "$INPUT_DIR/input.json")" = "$INPUT_METADATA_DIGEST" ] \
     && p4b_revalidate_input "$REPO" "$PR" "$INPUT_DIR"
 }
+
+# #1757: the complete immutable PR input, before trimming or model dispatch,
+# owns deterministic egregious-case escalation. Existing barrier stops above
+# remain authoritative. Offline previews have no posting authority.
+if [ "$OFFLINE_DIFF" != true ]; then
+  escalation="$(node "$ROOT/phase-4b/escalation.cjs" "$INPUT_DIR")" \
+    || p4b_die 3 "could not verify deterministic Phase 4b escalation input"
+  if ! printf '%s' "$escalation" | jq -e '.decision == "model-review" and .tripwires == []' >/dev/null; then
+    stop_for_human_tiebreaker "$(jq -nc --argjson escalation "$escalation" \
+      '{decision:"human-tiebreaker",reason:"Deterministic Phase 4b tripwire requires human-mediated review",tripwire:$escalation}')"
+  fi
+fi
 
 # --- run the adapter (reasoning plane; never posts) ------------------------
 ADAPTER_ARGS=( --pr "$PR" )
