@@ -874,14 +874,14 @@ Context: <one line — content classification (novel work, verbatim
 Gate: (b) APPROVED as <cross-agent reviewer> on the listed HEAD, AND
       (c) a HEAD-anchored Codex clearance or that same APPROVED review
       as the Phase 4b substitute where governing policy allows it.
-Threads: <N> unresolved (resolve addressed bot or agent-reviewer threads
+Threads: <N> undispositioned findings (resolve addressed bot or agent-reviewer threads
          per the pre-merge gate; never resolve real-human threads
          automatically).
 ```
 
 **Batch variant** (>1 PR) — emit a markdown table with one row per PR, followed by a single fenced prompt the human can paste into the external reviewer's CLI session:
 
-| Repo | PR # | HEAD short SHA | Unresolved threads | Content note | Reviewer |
+| Repo | PR # | HEAD short SHA | Undispositioned findings | Content note | Reviewer |
 |------|------|---------------|-------------------|--------------|----------|
 | `nathanjohnpayne/<repo-a>` | [#<num>](https://github.com/nathanjohnpayne/<repo-a>/pull/<num>) | `<short_sha>` | <N> | <content classification> | `<reviewer>` |
 | `nathanjohnpayne/<repo-b>` | [#<num>](https://github.com/nathanjohnpayne/<repo-b>/pull/<num>) | `<short_sha>` | <N> | <content classification> | `<reviewer>` |
@@ -899,7 +899,7 @@ Context: <one line — shared content classification if all PRs share
 Gate: for each PR, (b) APPROVED as its listed cross-agent reviewer on HEAD, AND
       (c) a HEAD-anchored Codex clearance or that same APPROVED review
       as the Phase 4b substitute where governing policy allows it.
-Threads: see "Unresolved threads" column (resolve addressed bot or
+Threads: see "Undispositioned findings" column (resolve addressed bot or
          agent-reviewer threads per the pre-merge gate; never resolve
          real-human threads automatically).
 ```

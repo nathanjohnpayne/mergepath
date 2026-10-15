@@ -63,6 +63,12 @@ The governing policy is parsed once into JSON and all accounting decisions consu
 - Exit `1`: one or more findings are unaccounted. JSON is still emitted and stderr names the remediation for each missing finding.
 - Exit `2`: usage, configuration, cryptographic-tooling, or GitHub API failure. Callers fail closed.
 
+## Manual handoff freshness (#2157)
+
+The manual Phase 4b renderer uses the shared Codex Review Summary parser before emitting any single or batch artifact. A current-head Running or unknown summary at least as recent as the latest exact-head review or verdict holds with exit `5` and empty stdout. A configured author's exact request newer than the head anchor and within the governing review timeout likewise holds until a substantive exact-head review, anchored verdict, or Completed summary answers it. A later request supersedes an older response. A timed-out request with no active summary permits the existing Phase 4b fallback; a genuinely Running summary still holds independently of the request budget. Unreadable provider history, policy or head fencing fails with exit `3`, never a ready handoff.
+
+`Threads:` and the batch count come from complete-history accounting's undispositioned finding count, rather than raw unresolved conversations. Accounting must succeed with a valid matching repo/PR result and reconciled totals before rendering. The handoff still instructs reviewers to resolve outstanding conversations through the normal pre-merge gate. Counts and provider state are observations of this rendering pass; later activity requires a fresh render. No review request, comment or label is posted.
+
 ## Enforcement points
 
 - `scripts/codex-review-request.sh` runs the gate immediately before an author-attributed `@codex review` write. An accounting miss **from a provider that gates this request** exits `6` and posts no trigger (#1100): Codex's own findings, and any reviewer identity including a Phase 4b adapter review. An outstanding CodeRabbit or code-scanning finding does not refuse this one write. The exception is structural, not a relaxation of the accounting answer: the Phase 4b barrier waits for Codex to be terminal on the current head while its Codex arm is read-only, so this write is the only thing that can make Codex terminal, and an all-provider precondition here is a livelock rather than a checkpoint — each fix commit dispositioning CodeRabbit is a new head for CodeRabbit to find more on. Every other enforcement point below, and the pre-merge run, still require `posted == accounted` across all providers.

@@ -45,6 +45,7 @@
 #   2  usage / argument error.
 #   3  `gh` not available or a required field could not be fetched.
 #   4  prior reviewer feedback is unaccounted; no handoff was rendered.
+#   5  Codex review is in flight on HEAD; rerun after it reports.
 
 set -euo pipefail
 
@@ -69,6 +70,10 @@ EOF
 [[ $# -ge 1 ]] || usage
 # shellcheck source=lib/pr-body-contract.sh
 . "$SCRIPT_DIR/lib/pr-body-contract.sh"
+# shellcheck source=lib/codex-request-evidence.sh
+. "$SCRIPT_DIR/lib/codex-request-evidence.sh"
+# shellcheck source=lib/feedback-policy-helpers.sh
+. "$SCRIPT_DIR/lib/feedback-policy-helpers.sh"
 
 command -v gh >/dev/null 2>&1 || {
   echo "post-phase-4b-handoff.sh: gh not on PATH" >&2
@@ -123,6 +128,7 @@ command -v "$FEEDBACK_ACCOUNTING_GATE" >/dev/null 2>&1 || {
   echo "post-phase-4b-handoff.sh: review feedback accounting gate unavailable: $FEEDBACK_ACCOUNTING_GATE" >&2
   exit 3
 }
+ACCOUNTING_TSV=""
 while IFS=$'\t' read -r accounting_repo accounting_pr; do
   [[ -n "$accounting_repo" && -n "$accounting_pr" ]] || continue
   accounting_json=""
@@ -142,7 +148,64 @@ while IFS=$'\t' read -r accounting_repo accounting_pr; do
       exit 3
       ;;
   esac
+  if ! printf '%s' "$accounting_json" | jq -e --arg repo "$accounting_repo" --argjson pr "$accounting_pr" '
+    .status == "clear" and .repo == $repo and .pr_number == $pr and
+    (.posted | type == "number" and . >= 0 and floor == .) and
+    .accounted == .posted and .missing_count == 0
+  ' >/dev/null 2>&1; then
+    echo "post-phase-4b-handoff.sh: invalid accounting result for ${accounting_repo}#${accounting_pr}" >&2
+    exit 3
+  fi
+  ACCOUNTING_TSV+="$(printf '%s\t%s\t%s' "$accounting_repo" "$accounting_pr" "$(jq -r .missing_count <<<"$accounting_json")")"$'\n'
 done <<<"$REFS_TSV"
+
+fetch_history_array() {
+  local pages
+  pages=$(gh api --paginate --slurp "$1") || return 1
+  printf '%s' "$pages" | jq -ce '
+    if type == "array" and all(.[]; type == "array") and all(.[][]; type == "object") then add // []
+    else error("incomplete history") end'
+}
+
+# Reuse the merge checker's summary/run selectors. This is sensing, never a
+# request or cap reset; an unanswered expired request permits timeout fallback.
+ensure_codex_idle() {
+  local repo="$1" num="$2" head="$3" policy_json="$4"
+  local bot author timeout comments reviews inline summary trigger response committed floor since enabled
+  bot=$(jq -er '.codex.bot_login // "chatgpt-codex-connector[bot]" | select(type == "string" and length > 0)' <<<"$policy_json") || exit 3
+  author=$(crqe_policy_author "$policy_json") || exit 3
+  timeout=$(jq -er '.codex.review_timeout_seconds // 1800 | select(type == "number" and . > 0 and floor == .)' <<<"$policy_json") || exit 3
+  enabled=$(jq -r 'if (.codex | type) == "object" and (.codex | has("enabled")) then .codex.enabled else true end | if type == "boolean" then . else error("codex.enabled") end' <<<"$policy_json") || exit 3
+  comments=$(fetch_history_array "repos/$repo/issues/$num/comments") &&
+    reviews=$(fetch_history_array "repos/$repo/pulls/$num/reviews") &&
+    inline=$(fetch_history_array "repos/$repo/pulls/$num/comments") || {
+      echo "post-phase-4b-handoff.sh: unreadable Codex history for $repo#$num" >&2; exit 3;
+    }
+  summary=$(crqe_select_codex_review_summary "$comments" "$bot" "$head") || exit 3
+  response=$(crqe_select_head_review "$reviews" "$inline" "$bot" "$head" | jq -r '.submitted_at // ""') || exit 3
+  response=$(crqe_verdicts "$comments" "$bot" | jq -r --arg head "$head" --arg response "$response" '
+    [ $response, (.[] | select(.reviewed_shas == [$head]) | .created_at) ] | max // ""') || exit 3
+  if [[ "$(jq -r '.status // ""' <<<"$summary")" =~ ^(running|unknown)$ ]] \
+     && [[ "$(jq -r '.observed_at // ""' <<<"$summary")" > "$response" || "$(jq -r '.observed_at // ""' <<<"$summary")" == "$response" ]]; then
+    echo "post-phase-4b-handoff.sh: Codex review in flight on HEAD $head; rerun after it reports" >&2
+    exit 5
+  fi
+  # A disabled provider has no expected request response, but an observed
+  # active summary above still prevents briefing over actual ongoing work.
+  if [[ "$enabled" != false ]]; then
+    committed=$(gh api "repos/$repo/commits/$head" --jq .commit.committer.date) || exit 3
+    [[ -n "$committed" && "$committed" != null ]] || exit 3
+    floor=$(($(date +%s) - timeout))
+    since=$(date -u -r "$floor" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$floor" +%Y-%m-%dT%H:%M:%SZ) || exit 3
+    [[ "$since" > "$committed" ]] || since="$committed"
+    trigger=$(crqe_select_trigger "$comments" "$author" "$since") || exit 3
+    response=$(jq -r --arg response "$response" '[ $response, (if .status == "completed" then .observed_at else "" end) ] | max // ""' <<<"$summary") || exit 3
+    if [[ "$trigger" != null && "$(jq -r .created_at <<<"$trigger")" > "$response" ]]; then
+      echo "post-phase-4b-handoff.sh: Codex request in flight on HEAD $head; rerun after it reports" >&2
+      exit 5
+    fi
+  fi
+}
 
 # Classify a head ref string into a content note.
 # Inputs: head_ref (branch name), commits_count (int)
@@ -244,74 +307,14 @@ fetch_pr_metadata() {
     exit 3
   fi
 
-  # Unresolved review threads — best-effort via GraphQL. On failure
-  # (auth scope, network), emit "?" rather than hard-failing the
-  # handoff render. Paginate beyond 100 — the prior `first: 100` form
-  # silently undercounted on PRs with >100 review threads (rare but
-  # observable on long-running canonical PRs after multi-round Phase 4b
-  # iterations + heavy CodeRabbit traffic). (nathanpayne-codex Phase 4b
-  # r1 on PR #291.)
-  local unresolved="?"
-  local owner repo_name
-  owner="${owner_name%%/*}"
-  repo_name="${owner_name#*/}"
-  local cursor="null"  # GraphQL `after: null` = start of stream
-  local running_total=0
-  local pages=0
-  local saw_error=0
-  while :; do
-    local gql
-    gql=$(gh api graphql -f query="
-      query(\$owner: String!, \$name: String!, \$num: Int!, \$cursor: String) {
-        repository(owner: \$owner, name: \$name) {
-          pullRequest(number: \$num) {
-            reviewThreads(first: 100, after: \$cursor) {
-              pageInfo { hasNextPage endCursor }
-              nodes { isResolved }
-            }
-          }
-        }
-      }" -F owner="$owner" -F name="$repo_name" -F num="$num" \
-         -F cursor="$cursor" 2>/dev/null || true)
-    if [[ -z "$gql" ]]; then
-      saw_error=1
-      break
-    fi
-    local page_count
-    page_count=$(printf '%s' "$gql" \
-      | jq -r '[.data.repository.pullRequest.reviewThreads.nodes[]?
-                | select(.isResolved == false)] | length' 2>/dev/null || echo "")
-    if [[ ! "$page_count" =~ ^[0-9]+$ ]]; then
-      saw_error=1
-      break
-    fi
-    running_total=$((running_total + page_count))
-    local has_next
-    has_next=$(printf '%s' "$gql" \
-      | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // false' 2>/dev/null)
-    if [[ "$has_next" != "true" ]]; then
-      break
-    fi
-    cursor=$(printf '%s' "$gql" \
-      | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // empty' 2>/dev/null)
-    if [[ -z "$cursor" || "$cursor" == "null" ]]; then
-      # Defensive: hasNextPage=true but no cursor returned — bail
-      # rather than infinite-loop.
-      saw_error=1
-      break
-    fi
-    pages=$((pages + 1))
-    if [[ "$pages" -gt 100 ]]; then
-      # Cap at 10,000 threads (100 pages × 100 per page) to prevent
-      # runaway loops on pathological inputs. Vanishingly unlikely to
-      # hit in practice — Phase 4b handoff renders don't fire on PRs
-      # this large — but the cap is cheap insurance.
-      saw_error=1
-      break
-    fi
-  done
-  if [[ "$saw_error" -eq 0 ]]; then
-    unresolved="$running_total"
+  local policy_json unresolved live_head
+  policy_json=$(policy_yaml_to_json "$policy") || exit 3
+  ensure_codex_idle "$repo" "$num" "$head_sha" "$policy_json"
+  unresolved=$(awk -F '\t' -v repo="$repo" -v num="$num" '$1 == repo && $2 == num {print $3; exit}' <<<"$ACCOUNTING_TSV")
+  [[ "$unresolved" =~ ^[0-9]+$ ]] || exit 3
+  live_head=$(gh api "repos/$repo/pulls/$num" --jq .head.sha) || exit 3
+  if [[ "$live_head" != "$head_sha" ]]; then
+    echo "post-phase-4b-handoff.sh: HEAD moved during rendering for $repo#$num" >&2; exit 3
   fi
 
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -334,7 +337,7 @@ Context: ${content}
 Gate: (b) APPROVED as ${reviewer} on the listed HEAD, AND
       (c) a HEAD-anchored Codex clearance or that same APPROVED review
       as the Phase 4b substitute where governing policy allows it.
-Threads: ${unresolved} unresolved (resolve addressed bot or agent-reviewer
+Threads: ${unresolved} undispositioned findings (resolve addressed bot or agent-reviewer
          threads per the pre-merge gate; never resolve real-human
          threads automatically).
 EOF
@@ -366,7 +369,7 @@ fi
 # -----------------------------------------------------------------------
 # Batch variant: table + paste prompt.
 # -----------------------------------------------------------------------
-echo "| Repo | PR # | HEAD short SHA | Unresolved threads | Content note | Reviewer |"
+echo "| Repo | PR # | HEAD short SHA | Undispositioned findings | Content note | Reviewer |"
 echo "|------|------|---------------|-------------------|--------------|----------|"
 while IFS=$'\t' read -r repo num url head_short base_short content unresolved reviewer; do
   [[ -n "$repo" ]] || continue
@@ -407,7 +410,7 @@ echo "Context: ${SHARED_CONTEXT}"
 echo 'Gate: for each PR, (b) APPROVED as its listed reviewer on HEAD, AND'
 echo '      (c) a HEAD-anchored Codex clearance or that same APPROVED review'
 echo '      as the Phase 4b substitute where governing policy allows it.'
-echo 'Threads: see "Unresolved threads" column (resolve addressed bot or'
+echo 'Threads: see "Undispositioned findings" column (resolve addressed bot or'
 echo '         agent-reviewer threads per the pre-merge gate; never resolve'
 echo '         real-human threads automatically).'
 echo '```'

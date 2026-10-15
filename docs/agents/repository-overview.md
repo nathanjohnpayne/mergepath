@@ -10,6 +10,8 @@ The publisher structural fence prevents workflow and job concurrency for all thr
 
 The shared pull-request body parser and its standalone generated runtime are specified in [`specs/pr_body_contract.md`](../../specs/pr_body_contract.md). The weekly audit records per-PR parser timeouts, continues auditing later PRs, reports unaudited PRs when its time budget is spent, and fails incomplete runs.
 
+Manual Phase 4b handoffs hold while a current-head Codex review is in flight and report accounting's undispositioned finding count. The sensing and timeout-fallback contract is documented in `specs/review_feedback_accounting.md` (#2157).
+
 Explicitly deferred CodeRabbit findings retain the `deferred-to-followup` ledger disposition and resolver tag. The recorder and resolver evidence contract is in `specs/review_feedback_accounting.md`.
 
 The CodeRabbit waiter honors published included-review availability through the existing mutable-comment freshness anchor and safety buffer. Missing or malformed durations stall without an optimistic retry; the existing Codex failover and retry deduplication remain intact. The timing contract and production-parser/virtual-clock coverage live in `specs/coderabbit_review_sensing.md` and `tests/test_coderabbit_wait_ratelimit_window.sh` (#2031).
