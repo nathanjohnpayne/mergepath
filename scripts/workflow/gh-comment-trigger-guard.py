@@ -123,6 +123,9 @@ def inspect(argv, role, state=None):
         args[i:i] = prefix_options
         while i < len(args):
             value = args[i]
+            value_flags = "bFR" + ("c" if verb == "close" else "") + ("r" if channel == "issue-close" else "")
+            if value.startswith("-") and not value.startswith("--") and len(value) > 2 and value[1] not in value_flags:
+                raise Refused("Split clustered comment flags before writing.")
             found = option(i, ("--repo", "-R"))
             if found:
                 repo, _, _, i = found
@@ -162,6 +165,9 @@ def inspect(argv, role, state=None):
         fields = []
         inputs = []
         while i < len(args):
+            value = args[i]
+            if value.startswith("-") and not value.startswith("--") and len(value) > 2 and value[1] not in "fFHqtpXR":
+                raise Refused("Split clustered API flags before writing.")
             found = option(i, ("--method", "-X"))
             if found:
                 method, _, _, i = found

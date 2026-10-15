@@ -182,6 +182,23 @@ class TriggerGuardTests(unittest.TestCase):
             self.assertTrue(meta["guarded"])
             self.assertFalse(meta["trigger"])
 
+    def test_clustered_short_flags_fail_closed(self):
+        body = "Avoid @codex review in prose"
+        for args in (["api", "repos/o/r/issues/123/comments", "-iFbody=" + body],
+                     ["-iFbody=" + body, "api", "repos/o/r/issues/123/comments"],
+                     ["api", "repos/o/r/issues/123/comments", "-iXPOST", "-f", "body=" + body],
+                     ["pr", "review", "123", "-ab" + body],
+                     ["pr", "comment", "123", "-ebSafe", "-b", "Safe"]):
+            with self.subTest(args=args), self.assertRaises(guard.Refused):
+                self.check(args)
+        for args in (["api", "repos/o/r/issues/123/comments", "-i", "-Fbody=Safe"],
+                     ["pr", "review", "123", "-a", "-bSafe"],
+                     ["pr", "close", "123", "-cSafe"],
+                     ["issue", "close", "123", "-rcompleted", "-cSafe"]):
+            _, meta = self.check(args)
+            self.assertTrue(meta["guarded"])
+            self.assertFalse(meta["trigger"])
+
     def test_authorization_metadata_errors_cannot_dispatch(self):
         fixture = self.root / "authorization"
         (fixture / "scripts").mkdir(parents=True)
