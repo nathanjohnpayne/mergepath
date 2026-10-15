@@ -459,6 +459,8 @@ Inside double quotes, the bounded ordinary-name `:-` default-word reader treats
 apostrophes as literal and retains plain named or numbered positional expansions
 (#1452). Ordinary-name heads retain raw offsets across backslash-LF continuations
 in the name or between the colon and minus; special parameters remain excluded.
+An admitted plain word expansion also consumes immediate backslash-LF suffixes;
+other word escapes retain the existing fallback.
 Unquoted single-quote suppression and the measured non-expanding `:?` diagnostic
 forms remain unchanged. Nested quotes, substitutions, braces and other parameter
 operators retain the previous fallback; this is not general parameter parsing.
@@ -2228,7 +2230,8 @@ def _simple_parameter_end(text, i):
     """End of a double-quoted `${ }` span, with bounded :- word support.
 
     Only ordinary-name defaults admit literal apostrophes and plain named or
-    numbered positional expansions. Nested constructs retain the exact-reader fallback.
+    numbered positional expansions. Their immediate backslash-LF suffixes
+    retain raw offsets; other escapes and nested constructs keep the fallback.
     """
     word_start = _double_quoted_default_word_start(text, i)
     j = word_start if word_start is not None else i + 2
@@ -2246,6 +2249,8 @@ def _simple_parameter_end(text, i):
                 plain = re.match(r"(?:[A-Za-z_][A-Za-z0-9_]*|[1-9][0-9]*)", text[j + 1:])
                 if plain:
                     j += 1 + plain.end()
+                    while text[j:j + 2] == "\\\n":
+                        j += 2  # Only after an already admitted expansion.
                     continue
         if c in "'\"`\\${":
             raise _ExactReadUnavailable()
@@ -14047,15 +14052,17 @@ def _quoted_default_head_cases():
     """Nonexecuting parser spans retain raw continuation offsets and bounds."""
     failures = []
     for raw in ("${UNSET_VALUE:-'data'}", "${UNSET_\\\nVALUE:-'data'}",
-                "${UNSET_VALUE:\\\n-'data'}"):
+                "${UNSET_VALUE:\\\n-'data'}", "${UNSET_VALUE:-'$value\\\n'}",
+                "${UNSET_VALUE:-'$1\\\n'}"):
         # Read a span at a nonzero raw offset; physical newlines stay present.
         text = 'prefix "' + raw + '" suffix'
         start = text.index("${")
-        if (_double_quoted_default_word_start(text, start) != text.index("'data'")
+        if (_double_quoted_default_word_start(text, start) != text.index("'")
                 or _simple_parameter_end(text, start) != text.index("}") + 1):
             failures.append("quoted default raw head/span offset: " + repr(raw))
     for raw in ("${UNSET_VALUE:?'data'}", "${UNSET_\\\nVALUE:?'data'}",
-                "${UNSET_VALUE:\\\n?'data'}"):
+                "${UNSET_VALUE:\\\n?'data'}", "${UNSET_VALUE:?'$value\\\n'}",
+                "${UNSET_VALUE:?'$1\\\n'}"):
         if _double_quoted_default_word_start(raw, 0) is not None:
             failures.append("quoted default admitted error operator: " + repr(raw))
         try:
@@ -14070,6 +14077,11 @@ def _quoted_default_head_cases():
         if (not _word_has_verbatim_positional(quoted)
                 or _word_has_verbatim_positional(unquoted)):
             failures.append("quoted default positional quote boundary: " + repr(head))
+    quoted_tail = '"${UNSET_VALUE:-\'$1\\\n\'}"'
+    unquoted_tail = '${UNSET_VALUE:-\'$1\\\n\'}'
+    if (not _word_has_verbatim_positional(quoted_tail)
+            or _word_has_verbatim_positional(unquoted_tail)):
+        failures.append("quoted default positional continuation quote boundary")
     return failures
 
 
