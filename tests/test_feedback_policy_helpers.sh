@@ -188,6 +188,50 @@ eq ""        "$(coderabbit_tier_of 'This is Trivial, no finding badge.')"       
 eq "p2"      "$(coderabbit_tier_of '_📐 Maintainability_ | _🟡 Minor_: This cleanup is Trivial but visible')" "cr_tier_of: Minor badge beats Trivial-in-prose -> p2 (#581 4b F2)"
 eq "p3 p1 p2" "$(coderabbit_tiers_of '🔵 Trivial first, 🟠 Major second, 🟡 Minor third')" "cr_tiers_of: emits every canonical marker in document order"
 
+# #1407: these exact provider section headings describe a container, while
+# the nested comment carries its own severity. Test both tier entry points:
+# the gate grades individual lines and accounting extracts all body markers.
+for heading in \
+  '<summary>⚠️ Outside diff range comments (1)</summary>' \
+  '<summary>Outside diff range comments (1)</summary><blockquote>' \
+  '**⚠️ Outside diff range comments (1)**' \
+  '> **⚠️ Outside diff range comments (1)**' \
+  '> **Outside diff range comments (12)**'; do
+  eq "" "$(coderabbit_tier_of "$heading")" "cr_heading: structural line has no tier: $heading"
+  eq "" "$(coderabbit_tiers_of "$heading")" "cr_headings: structural line has no markers: $heading"
+  body="$heading
+> <details>
+> <summary><strong>🟡 Minor</strong> · Restrict Phase 0 preflight to local sessions.</summary><blockquote>
+> **🟡 Minor** Real finding.
+> </blockquote></details>"
+  eq p2 "$(coderabbit_tier_of "$body")" "cr_heading: nested Minor keeps p2: $heading"
+  eq "p2 p2" "$(coderabbit_tiers_of "$body")" "cr_headings: only nested Minor markers remain: $heading"
+  eq p1 "$(coderabbit_tier_of "$body
+_🟠 Major_ Real required finding in the same container.")" "cr_heading: nested Major still requires disposition: $heading"
+done
+eq p3 "$(coderabbit_tier_of 'Outside diff range: standalone category finding')" "cr_heading: existing category marker remains gradeable"
+eq p3 "$(coderabbit_tier_of '<summary>⚠️ Outside diff range comments (1)</summary>
+_🔵 Trivial_ Real nested finding.')" "cr_heading: nested Trivial keeps its actual tier"
+for near_miss in \
+  '**⚠️ Outside diff range comments (1)** _🟠 Major_ real finding on same line' \
+  '<summary>⚠️ Outside diff range comments (1): investigate this</summary>' \
+  '**⚠️ Outside diff range comments (unknown)**'; do
+  eq p1 "$(coderabbit_tier_of "$near_miss")" "cr_heading: nonexact heading remains classified: $near_miss"
+done
+
+# A failed heading read must discard partial output just like marker extraction.
+for classifier in coderabbit_tiers_of coderabbit_tier_of; do
+  if (
+    awk() { printf '_🟠 Major_\n'; return 2; }
+    rc=0; out=$("$classifier" '_🟠 Major_') || rc=$?
+    [ "$rc" = 2 ] && [ -z "$out" ]
+  ); then
+    pass "$classifier: failed heading read discards partial output"
+  else
+    fail "$classifier: failed heading read became a classification or absence"
+  fi
+done
+
 # A failed marker read is neither absence nor a usable partial classification.
 for partial in '' '🟠 Major'; do
   for classifier in coderabbit_tiers_of coderabbit_tier_of; do

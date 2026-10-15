@@ -3400,6 +3400,55 @@ else
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
+# #1407: the current blockquoted bold heading and the legacy HTML summary
+# contain structural warning/category markers, not a required finding. Keep
+# the real nested Major control in the same accepted review-object shape.
+for heading in '> **⚠️ Outside diff range comments (1)**' \
+  '<summary>⚠️ Outside diff range comments (1)</summary>'; do
+  for tier_case in minor major required-minor; do
+    heading_scratch=$SCRATCH
+    finding='<strong>🟡 Minor</strong> Real nested finding.'
+    expected=0
+    expected_tier=P2
+    case "$tier_case" in
+      major)
+        finding='<strong>🟠 Major</strong> Real nested finding.'
+        expected=1; expected_tier=P1 ;;
+      required-minor)
+        heading_scratch=$(make_scratch_with_policy "${DEFAULT_POLICY/p2: discretionary/p2: required}")
+        expected=1 ;;
+    esac
+    FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA" COMMENTED "2026-08-04T00:00:10Z" \
+      "**Actionable comments posted: 0**
+
+$heading
+> <details>
+> <summary>$finding</summary><blockquote>
+> </blockquote></details>")
+    set +e
+    OUT=$(
+      REQUIRE_REVIEW_SUMMARY=true \
+      FIXTURE_PR="$FIXTURE_PR" \
+      FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_THREADS="$FIXTURE_THREADS" \
+      FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+      FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+        run_gate "$heading_scratch" 99 owner/repo 2>&1
+    )
+    RC=$?
+    set -e
+    if [ "$RC" = "$expected" ] \
+      && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: $expected" \
+      && echo "$OUT" | grep -q 'markerless full-review summary in review object 8001' \
+      && { [ "$expected" = 0 ] || echo "$OUT" | grep -qF "[$expected_tier] (PR-level summary comment):5"; }; then
+      pass "outside-diff heading preserves nested tier and policy: $heading / $tier_case"
+    else
+      fail "outside-diff heading expected rc=$expected, got rc=$RC: $heading / $finding"
+      echo "$OUT" | sed 's/^/      /' >&2
+    fi
+  done
+done
+
 # The scope anchor is the object's GitHub-owned commit_id, not its timestamp: a
 # review object on ANOTHER head contributes nothing, however recent it is. Pairs
 # with 47d0b — without an anchor there is no hold either, because this gate does

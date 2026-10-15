@@ -337,6 +337,27 @@ coderabbit_finding_scan() {
 
 coderabbit_tiers_of() {
   local body=${1:-} markers marker rc=0
+  # Outside-diff section headings carry both a warning glyph and a category
+  # phrase, but the nested comment supplies the actual severity (#1407).
+  # Exclude only complete known heading lines, including their blockquote
+  # presentation. Keep this at the shared extraction boundary: callers grade
+  # either whole bodies or numbered lines, and retain their original text for
+  # fingerprints and reporting. Extra finding text on a heading line must not
+  # disappear along with its structural markers.
+  body=$(printf '%s\n' "$body" | awk '
+    {
+      heading = $0
+      sub(/\r$/, "", heading)
+      sub(/^[ \t]*(>[ \t]*)*/, "", heading)
+      sub(/[ \t]+$/, "", heading)
+      if (heading ~ /^\*\*(⚠️ )?Outside diff range comments \([0-9]+\)\*\*$/ \
+          || heading ~ /^<summary>(⚠️ )?Outside diff range comments \([0-9]+\)<\/summary>(<blockquote>)?$/) next
+      print
+    }
+  ') || {
+    echo "ERROR: could not read CodeRabbit section headings" >&2
+    return 2
+  }
   markers=$(grep -oE '🟠 Major|Potential issue|⚠️|🧹 Nitpick|🔵 Trivial|Outside diff range|🟡 Minor' <<<"$body") || rc=$?
   case "$rc" in
     0) ;;
