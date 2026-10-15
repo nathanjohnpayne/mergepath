@@ -54,6 +54,15 @@ test('the native/API lineage gate entrypoint is an exact sensitive path', () => 
   }
 });
 
+test('the retained-evidence wave caller is an exact sensitive path', () => {
+  assert.deepEqual(classify('+ordinary change', ['scripts/wave-audit.sh']), {
+    decision: 'human-review', tripwires: ['authorization-policy-publisher-or-credentials'],
+  });
+  for (const file of ['scripts/wave-audit.sh.example', 'scripts/wave-audit-extra.sh', 'scripts/Wave-audit.sh', 'nested/scripts/wave-audit.sh']) {
+    assert.deepEqual(classify('+ordinary change', [file]), { decision: 'model-review', tripwires: [] }, file);
+  }
+});
+
 test('captured Git objects determine both rename sides and complete wave scope', t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'p4b-escalation-test-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
