@@ -324,6 +324,7 @@
       "tests/test_repo_lint_prepush.sh"
     ],
     "check_required_check_publisher": [
+      ".github/workflows/auto-clear-blocking-labels.yml",
       ".github/workflows/required-check-publisher.yml",
       "scripts/lib/ci-check-modes.sh",
       "tests/test_required_check_publisher_dedup.sh",

@@ -3501,8 +3501,11 @@ mkdir -p "$RCP_DIR"
 # Populated from the real .github/workflows so the controls cannot drift.
 RCP_WFDIR="$RCP_DIR/workflows"
 mkdir -p "$RCP_WFDIR"
+# auto-clear-blocking-labels.yml is the listener the A17 nomination job's
+# dispatch type is cross-checked against (#2239).
 for _f in required-check-publisher.yml merge-clearance-gate.yml pr-review-policy.yml \
-          codex-p1-gate.yml coderabbit-severity-gate.yml repo_lint.yml; do
+          codex-p1-gate.yml coderabbit-severity-gate.yml repo_lint.yml \
+          auto-clear-blocking-labels.yml; do
   cp "$ROOT/.github/workflows/$_f" "$RCP_WFDIR/$_f"
 done
 
@@ -4764,6 +4767,71 @@ rcp_case budget-reserve-missing \
 rcp_case budget-gql-per-pr-missing \
   's{^          BUDGET_PER_PR_GRAPHQL_POINTS: "10"\n}{}m' \
   fail '[rcp budget guard]'
+unset RCP_TAG
+fi
+
+# ---------------------------------------------------------------------------
+# Test 29 (#2239, #2205): the auto-clear nomination job (fence A17).
+#
+# The publisher dispatches `auto-clear-evaluate` from a job of its own,
+# because POST /dispatches needs `contents: write` and the publish job runs
+# the gate scripts. Every addition that keeps that job looking right while
+# widening what runs under the grant must trip the fence, and so must a
+# dispatch type that no longer matches its listener, from either side.
+# Same posture as Tests 25 and 28: derived fixtures, no-op guards, needles.
+# ---------------------------------------------------------------------------
+if [ ! -x "$RCP_CHECK" ] || [ ! -f "$RCP_WF" ]; then
+  echo; echo "SKIP: Test 29 (#2239) — publisher or its fence absent"
+elif ! python3 -c "import yaml" >/dev/null 2>&1; then
+  echo; echo "SKIP: Test 29 (#2239) — PyYAML unavailable, the fence's tier does not run"
+elif ! command -v perl >/dev/null 2>&1 || ! declare -f rcp_dir_case >/dev/null 2>&1; then
+  echo; echo "SKIP: Test 29 (#2239) — perl or the Test 25 harness unavailable"
+else
+echo; echo "--- Test 29 (#2239): the auto-clear nomination job"
+RCP_TAG='#2239'
+RCP_DIR="${RCP_DIR:-$WORKDIR/rcp}"
+mkdir -p "$RCP_DIR"
+
+rcp_case nominate-canonical '' pass
+rcp_case nominate-missing \
+  's{^  nominate-auto-clear:$}{  nominate-renamed:}m' \
+  fail "[rcp auto-clear nomination] the publisher has no 'nominate-auto-clear' job"
+rcp_case nominate-uses-step \
+  's{^(      - name: Dispatch auto-clear evaluations\n)}{      - uses: actions/checkout\@3d3c42e5aac5ba805825da76410c181273ba90b1\n$1}m' \
+  fail 'must carry exactly one step'
+rcp_case nominate-step-uses-key \
+  's{^(      - name: Dispatch auto-clear evaluations\n)}{$1        uses: ./local-action\n}m' \
+  fail 'step keys are'
+rcp_case nominate-extra-scope \
+  's{(^  nominate-auto-clear:\n.*?^      contents: write\n)}{$1      actions: write\n}ms' \
+  fail 'permissions are'
+rcp_case nominate-concurrency \
+  's{(^  nominate-auto-clear:\n.*?^    runs-on: ubuntu-latest\n)}{$1    concurrency: nominate\n}ms' \
+  fail "job 'nominate-auto-clear' keys are"
+rcp_case nominate-pat \
+  's{(Dispatch auto-clear evaluations\n.*?GH_TOKEN: )\$\{\{ secrets\.GITHUB_TOKEN \}\}}{$1\${{ secrets.CI_ACTOR_TOKEN }}}ms' \
+  fail 'step env is'
+rcp_case nominate-if-not-cancelled \
+  's|if: \$\{\{ !cancelled\(\) && needs\.publish\.outputs\.autoclear_prs|if: \${{ needs.publish.outputs.autoclear_prs|' \
+  fail 'condition is'
+rcp_case nominate-needs \
+  's{^    needs: publish$}{    needs: open}m' \
+  fail 'not the publish job'
+rcp_case nominate-type-renamed \
+  's{event_type=auto-clear-evaluate}{event_type=auto-clear-eval}' \
+  fail 'the job dispatches event_type'
+rcp_dir_case nominate-listener-renamed \
+  'perl -0777 -i -pe "s{types: \[auto-clear-evaluate\]}{types: [auto-clear-recheck]}" auto-clear-blocking-labels.yml' \
+  fail 'the job dispatches event_type'
+rcp_dir_case nominate-listener-absent \
+  'perl -0777 -i -pe "s{^  repository_dispatch:\n    types: \[auto-clear-evaluate\]\n}{}m" auto-clear-blocking-labels.yml' \
+  fail 'does not listen to exactly one'
+rcp_case publish-output-dropped \
+  's{^    outputs:\n      autoclear_prs: [^\n]*\n}{}m' \
+  fail "the publish job's outputs are"
+rcp_case publish-step-id \
+  's{^        id: publish$}{        id: evaluate}m' \
+  fail "the publish step's id is"
 unset RCP_TAG
 fi
 

@@ -47,6 +47,13 @@
 #      head too expensive to evaluate, a lint-only refresh that must not write,
 #      and a token so empty that no write after the failure lands.
 #  13. #2229: a proof read that fails after one page is charged two requests.
+#  14. #2239/#2205 auto-clear nominations: a green clearance verdict on a PR
+#      carrying needs-external-review is nominated once; a red, withheld or
+#      moved-head verdict, an unlabeled PR and a pass that evaluated nothing
+#      nominate nothing; on full-coverage passes only, an unlabeled green PR
+#      whose newest auto-clear-blocking-labels run is a failure is nominated
+#      (one read per such PR), and the nominate-auto-clear job sends exactly
+#      one repository_dispatch per nominated PR carrying only its number.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -60,10 +67,14 @@ command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 is required" >&2; e
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/rcp-due.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
-ruby - "$WORKFLOW" "$TMP/publish.sh" "$TMP/env.json" "$TMP/step-env.sh" <<'RUBY'
+ruby - "$WORKFLOW" "$TMP/publish.sh" "$TMP/env.json" "$TMP/step-env.sh" "$TMP/nominate.sh" <<'RUBY'
 require "yaml"
 require "json"
 workflow = YAML.load_file(ARGV[0])
+# #2239: the nominate-auto-clear job's single run block, for case 14.
+nominate = workflow.fetch("jobs").fetch("nominate-auto-clear").fetch("steps")
+abort("could not extract the nominate-auto-clear step") unless nominate.length == 1 && nominate[0]["run"].is_a?(String)
+File.write(ARGV[4], nominate[0]["run"])
 steps = workflow.fetch("jobs").fetch("publish").fetch("steps")
 matches = steps.select { |step| step["name"] == "Resolve targets, evaluate gates, publish" }
 abort("could not extract the publisher publish step") unless matches.length == 1 && matches[0]["run"].is_a?(String)
@@ -99,7 +110,11 @@ if [ "${RL_FAIL_PR:-}" = "$1" ]; then
   fi
   exit 2
 fi
-[ "$(basename "$0")" = merge-clearance-gate.sh ] && echo "Merge clearance: PASS"
+if [ "$(basename "$0")" = merge-clearance-gate.sh ]; then
+  # MCG_RED_PRS (#2239): these PRs get a red clearance verdict.
+  case " ${MCG_RED_PRS:-} " in *" $1 "*) echo "Merge clearance: FAIL"; exit 1 ;; esac
+  echo "Merge clearance: PASS"
+fi
 exit 0
 SH
   chmod +x "$TMP/work/scripts/$g"
@@ -160,7 +175,16 @@ elif method == "GET" and path == "/pulls":
     body = fx["prs"]
 elif method == "GET" and re.fullmatch(r"/pulls/\d+", path):
     n = int(path.rsplit("/", 1)[1])
-    body = {"head": {"sha": next(p["head"]["sha"] for p in fx["prs"] if p["number"] == n)}}
+    # moved_heads (#2239): the live head differs from the enumerated one.
+    sha = fx.get("moved_heads", {}).get(str(n)) or next(p["head"]["sha"] for p in fx["prs"] if p["number"] == n)
+    body = {"head": {"sha": sha}}
+elif method == "GET" and re.fullmatch(r"/commits/[^/]+/check-runs", path) \
+        and fields.get("check_name") == "auto-clear-blocking-labels":
+    # #2205: the nomination step's read of the newest auto-clear run.
+    sha = path.split("/")[2]
+    if sha in fx.get("autoclear_fail_reads", []):
+        sys.stderr.write("HTTP 502\n"); sys.exit(1)
+    body = {"check_runs": fx.get("autoclear_runs", {}).get(sha, [])}
 elif method == "GET" and re.fullmatch(r"/commits/[^/]+/check-runs", path):
     sha = path.split("/")[2]
     if fields.get("filter") == "all":
@@ -251,13 +275,14 @@ json.dump(fx, open(sys.argv[1], "w"))
 PY
 
 run_pass() {  # run_pass <label> <event_name> <run_head> <parent_event> <dispatch_pr>
-  : >"$TMP/gates.log"; : >"$TMP/gh.log"; rm -f "$TMP/exhausted" "$TMP/gh.log.rejected"
+  : >"$TMP/gates.log"; : >"$TMP/gh.log"; : >"$TMP/github-output"; rm -f "$TMP/exhausted" "$TMP/gh.log.rejected"
   local rc=0
   (
     cd "$TMP/work"
     export PATH="$TMP/bin:$PATH" FIXTURE="$TMP/fixture.json" GH_LOG="$TMP/gh.log" GATE_LOG="$TMP/gates.log"
     export REPO="acme/widget" GITHUB_RUN_ID=4242 GH_TOKEN=x EXHAUST_FLAG="$TMP/exhausted"
     export EVENT_NAME="$2" RUN_HEAD="$3" PARENT_EVENT="$4" DISPATCH_PR="$5"
+    export GITHUB_OUTPUT="$TMP/github-output"
     export PARENT_NAME="${CASE_PARENT_NAME:-Merge Clearance Gate}"
     [ -z "${CASE_FIXTURE:-}" ] || FIXTURE="$CASE_FIXTURE"
     export MCG_CONTEXT="Merge clearance gate" CODEX_P1_CONTEXT="Codex P1 unresolved threads"
@@ -587,6 +612,88 @@ RL_FAIL_PR=1 RL_EXHAUST_WRITES=1 run_pass stop-no-writes workflow_run h1 pull_re
 check "exhausted token after the failure: no write lands and the holds stay pending" \
   eval '[ "$(posts h1 in_progress)" = 3 ] && [ "$(posts h1 completed)" = 0 ] && [ -z "$(writes_outside h1)" ] && [ "$RC" -ne 0 ] && ! grep -q "\"conclusion\": \"success\"" "$TMP/gh.log" "$TMP/gh.log.rejected"'
 unset RL_FAIL_PR RL_EXHAUST_WRITES
+
+# ── 14. auto-clear nominations (#2239, #2205) ─────────────────────────
+echo "#2239/#2205 auto-clear nomination cases"
+# nominated: the space-separated autoclear_prs the step wrote for its job.
+nominated() { sed -n 's/^autoclear_prs=//p' "$TMP/github-output"; }
+# ac_reads: requests the nomination step spent on auto-clear check-run reads.
+ac_reads() { grep -c '"check_name": "auto-clear-blocking-labels"' "$TMP/gh.log" || true; }
+# Fixture: PRs 1, 3 and 4 carry needs-external-review (4 gets a red verdict
+# below); h2's newest auto-clear run is a stale failure listed FIRST (array
+# order must not decide), h5's newest is a success over an older failure, and
+# h6 has none.
+python3 - "$TMP/fixture.json" "$TMP" <<'PY2'
+import copy, json, sys
+fx = json.load(open(sys.argv[1]))
+def ac(c, t, i):
+    return {"name": "auto-clear-blocking-labels", "id": i, "status": "completed", "conclusion": c,
+            "completed_at": t, "started_at": t}
+for p in fx["prs"]:
+    p["labels"] = [{"name": "other"}] + ([{"name": "needs-external-review"}] if p["number"] in (1, 3, 4) else [])
+fx["autoclear_runs"] = {
+    "h2": [ac("failure", "2026-10-14T02:50:00Z", 20), ac("success", "2026-10-14T01:00:00Z", 10)],
+    "h5": [ac("success", "2026-10-14T02:55:00Z", 30), ac("failure", "2026-10-14T02:50:00Z", 21)],
+}
+json.dump(fx, open(f"{sys.argv[2]}/fx-ac.json", "w"))
+moved = copy.deepcopy(fx); moved["moved_heads"] = {"3": "h3-moved"}
+json.dump(moved, open(f"{sys.argv[2]}/fx-ac-moved.json", "w"))
+unread = copy.deepcopy(fx); unread["autoclear_fail_reads"] = ["h2"]
+json.dump(unread, open(f"{sys.argv[2]}/fx-ac-unread.json", "w"))
+PY2
+
+MCG_RED_PRS=4 CASE_FIXTURE="$TMP/fx-ac.json" run_pass ac-event workflow_run h1 pull_request ""
+check "event pass: green verdicts on labeled PRs are nominated once each; a red one is not" \
+  eval '[ "$(nominated)" = "1 3" ] && [ "$(grep -c "^autoclear_prs=" "$TMP/github-output")" = 1 ]'
+check "event pass: no auto-clear check-run read is spent (heal nominations are full-pass only)" \
+  [ "$(ac_reads)" = 0 ]
+
+MCG_RED_PRS=4 CASE_FIXTURE="$TMP/fx-ac.json" run_pass ac-full workflow_run maintip schedule ""
+check "full pass: labeled greens plus the unlabeled green whose newest auto-clear run failed" \
+  [ "$(nominated)" = "1 2 3" ]
+check "full pass: one auto-clear read per unlabeled green PR, none for labeled or red PRs" \
+  [ "$(ac_reads)" = 8 ]
+
+CASE_FIXTURE="$TMP/fx-ac-moved.json" run_pass ac-moved workflow_run maintip schedule ""
+check "a verdict turned red because the head moved nominates nothing for that PR" \
+  eval '[ "$(nominated)" = "1 2 4" ] && grep -q "head moved during evaluation" "$TMP/gh.log"'
+
+CASE_FIXTURE="$TMP/fx-ac-unread.json" run_pass ac-unread workflow_run maintip schedule ""
+check "an unreadable auto-clear read nominates nothing for that PR and warns" \
+  eval '[ "$(nominated)" = "1 3 4" ] && grep -q "Could not read the auto-clear-blocking-labels check-runs on PR #2" "$TMP/out.log" && [ "$RC" -eq 0 ]'
+
+run_pass ac-unlabeled workflow_run maintip schedule ""
+check "unlabeled PRs with no stale auto-clear failure nominate nothing" \
+  eval '[ -z "$(nominated)" ] && grep -qx "autoclear_prs=" "$TMP/github-output"'
+
+RL_REMAINING=130 CASE_FIXTURE="$TMP/fx-ac.json" run_pass ac-nothing workflow_run maintip schedule ""
+unset RL_REMAINING
+check "a pass that evaluated nothing nominates nothing and reads nothing" \
+  eval '[ -z "$(nominated)" ] && [ "$(ac_reads)" = 0 ]'
+
+RL_FAIL_PR=3 CASE_FIXTURE="$TMP/fx-ac.json" run_pass ac-stopped workflow_run maintip schedule ""
+unset RL_FAIL_PR
+check "after a rate-limit stop no auto-clear read is spent; greens posted before it still nominate" \
+  eval '[ "$(nominated)" = "1" ] && [ "$(ac_reads)" = 0 ]'
+
+# The nominate-auto-clear job: one dispatch per nominated PR, payload = the PR
+# number only, malformed entries ignored, a failed dispatch warns and moves on.
+mkdir -p "$TMP/nbin"
+cat >"$TMP/nbin/gh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$NOMINATE_LOG"
+case "$*" in *"client_payload[pr]=${NOMINATE_FAIL_PR:-none}"*) echo "HTTP 502" >&2; exit 1 ;; esac
+exit 0
+SH
+chmod +x "$TMP/nbin/gh"
+: >"$TMP/nominate.log"
+nominate_rc=0
+PATH="$TMP/nbin:$PATH" NOMINATE_LOG="$TMP/nominate.log" NOMINATE_FAIL_PR=3 REPO=acme/widget GH_TOKEN=x \
+  AUTOCLEAR_PRS="1 3 07 2x 12" bash "$TMP/nominate.sh" >"$TMP/out.log" 2>&1 || nominate_rc=$?
+check "nominate job: exactly one auto-clear-evaluate dispatch per valid PR, carrying only its number" \
+  eval '[ "$nominate_rc" -eq 0 ] && [ "$(cat "$TMP/nominate.log")" = "$(printf "%s\n" "api -X POST repos/acme/widget/dispatches -f event_type=auto-clear-evaluate -F client_payload[pr]=1" "api -X POST repos/acme/widget/dispatches -f event_type=auto-clear-evaluate -F client_payload[pr]=3" "api -X POST repos/acme/widget/dispatches -f event_type=auto-clear-evaluate -F client_payload[pr]=12")" ]'
+check "nominate job: malformed entries are ignored and a failed dispatch only warns" \
+  eval 'grep -q "Ignoring malformed auto-clear nomination .07." "$TMP/out.log" && grep -q "Ignoring malformed auto-clear nomination .2x." "$TMP/out.log" && grep -q "Could not dispatch auto-clear-evaluate for PR #3" "$TMP/out.log"'
 
 echo "required-check publisher due-only targeting tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

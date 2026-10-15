@@ -76,6 +76,21 @@ on:
       - "repo-lint-local"
       - ".github/workflows/repo_lint_local.yml"
     types: [completed]
+  # #2239: the authoritative `Merge clearance gate` verdict is posted by
+  # required-check-publisher.yml, which none of the workflow_run parents above
+  # observes. When a publisher pass posts a GREEN verdict on the head of a PR
+  # that still carries needs-external-review, its nominate-auto-clear job sends
+  # this event carrying only the PR number, so the label goes within one run
+  # instead of waiting for the sweep below. The same job nominates a
+  # label-absent PR whose newest auto-clear-blocking-labels check-run is a
+  # failure, so a heal that failed after a removal is retried (#2205).
+  # repository_dispatch has no ref: GitHub runs only the default branch's copy
+  # of this file, and a GITHUB_TOKEN dispatch does start a run. The payload is
+  # trusted for nothing beyond the PR number: the evaluate-and-clear job
+  # re-derives clearance from live state exactly as for every other event, and
+  # fences the live head/base before the DELETE.
+  repository_dispatch:
+    types: [auto-clear-evaluate]
   # Periodic sweep — catches the 👍-after-last-push case (codex
   # reacts on the PR issue but no synchronize / review / workflow_run
   # event fires, so the event-driven path stays inert). Runs every
@@ -234,6 +249,26 @@ jobs:
                 fi
               fi
               ;;
+            repository_dispatch)
+              # #2239/#2205: a publisher nomination. Only the PR number is
+              # read from the payload, and only a positive integer is
+              # accepted; everything else is re-derived from live state by
+              # the next step. Anything malformed fails the run as an alarm
+              # (the publisher only ever sends an integer) and evaluates
+              # nothing.
+              action=$(jq -r '.action // empty' <<<"$EVENT_JSON")
+              if [ "$action" != "auto-clear-evaluate" ]; then
+                echo "repository_dispatch action '$action' is not auto-clear-evaluate; skipping." >&2
+                echo "numbers=" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              prs=$(jq -r '.client_payload.pr // empty | tostring' <<<"$EVENT_JSON")
+              if ! [[ "$prs" =~ ^[1-9][0-9]{0,9}$ ]]; then
+                echo "::error::repository_dispatch client_payload.pr is not a positive integer: '$prs'"
+                echo "numbers=" >> "$GITHUB_OUTPUT"
+                exit 1
+              fi
+              ;;
             *)
               echo "Unsupported event: $EVENT_NAME" >&2
               exit 0  # don't fail; just skip
@@ -340,8 +375,13 @@ jobs:
               # workflow_run fires several times per push, so either would
               # spend installation-token reads for nothing. The heal step
               # itself posts only when the newest run on the head is a failure.
-              if [ "${EVENT_NAME:-}" = "pull_request_target" ] \
-                 && [ "${EVENT_ACTION:-}" != "synchronize" ]; then
+              # A repository_dispatch nomination of a label-absent PR is the
+              # routine retry (#2205): the publisher sends one only after it
+              # read a failed newest auto-clear-blocking-labels run on the
+              # head, so this candidate is the case the heal exists for.
+              if { [ "${EVENT_NAME:-}" = "pull_request_target" ] \
+                   && [ "${EVENT_ACTION:-}" != "synchronize" ]; } \
+                 || [ "${EVENT_NAME:-}" = "repository_dispatch" ]; then
                 heal_prs="$heal_prs $PR"
               fi
               echo "::endgroup::"
@@ -483,10 +523,27 @@ jobs:
                 ;;
               1)
                 echo "Dependabot pin-bump lane: not applicable — $PIN_REASON"
-                set +e
-                scripts/codex-review-check.sh "$PR"
-                rc=$?
-                set -e
+                # #2239: capture the live head/base the merge gate is about to
+                # judge, so the DELETE below can be fenced against it. The
+                # lane's own read above is reused when it ran; otherwise one
+                # read under the workflow token, here.
+                if ! [[ "$LANE_HEAD" =~ ^[0-9a-f]{40}$ ]] || ! [[ "$LANE_BASE" =~ ^[0-9a-f]{40}$ ]]; then
+                  set +e
+                  LANE_PAIR=$(GH_TOKEN="$WORKFLOW_TOKEN" gh api "repos/$REPO/pulls/$PR" \
+                    --jq '[.head.sha, .base.sha] | @tsv')
+                  set -e
+                  LANE_HEAD=$(cut -f1 <<<"$LANE_PAIR")
+                  LANE_BASE=$(cut -f2 <<<"$LANE_PAIR")
+                fi
+                if ! [[ "$LANE_HEAD" =~ ^[0-9a-f]{40}$ ]] || ! [[ "$LANE_BASE" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "::error::Could not read the live head/base of PR #$PR before evaluating the merge gate."
+                  rc=3
+                else
+                  set +e
+                  scripts/codex-review-check.sh "$PR"
+                  rc=$?
+                  set -e
+                fi
                 ;;
               *)
                 echo "::error::Dependabot pin-bump lane could not reach a verdict on PR #$PR (rc=$pin_rc): $PIN_REASON"
@@ -582,6 +639,30 @@ jobs:
                   fi
                   if [ "$live_owner" != 'labeled:github-actions[bot]' ]; then
                     echo "PR #$PR needs-external-review was re-applied by $live_owner after the pin-bump proof; leaving it for the next evaluation."
+                    echo "::endgroup::"
+                    continue
+                  fi
+                else
+                  # #2239: the same fence for the merge-gate path.
+                  # codex-review-check.sh judged whatever head was live while
+                  # it ran, and a push during it or during the protective
+                  # retraction would otherwise have the label removed from a
+                  # head nobody evaluated (the publisher's repository_dispatch
+                  # nomination makes this path run while a PR is still being
+                  # pushed to). The pair captured before the gate must still
+                  # be live; a move leaves the label for the new head's own
+                  # events, an unreadable pair is an infrastructure error.
+                  if ! live_pair=$(GH_TOKEN="$WORKFLOW_TOKEN" gh api "repos/$REPO/pulls/$PR" \
+                       --jq '[.head.sha, .base.sha] | @tsv'); then
+                    echo "::error::Could not re-read the live head/base of PR #$PR before removing needs-external-review."
+                    had_infra_error=1
+                    failing_prs="$failing_prs $PR"
+                    echo "::endgroup::"
+                    continue
+                  fi
+                  captured_pair=$(printf '%s\t%s' "$LANE_HEAD" "$LANE_BASE")
+                  if [ -z "$live_pair" ] || [ "$live_pair" != "$captured_pair" ]; then
+                    echo "PR #$PR head/base moved while the merge gate was evaluated (evaluated: $captured_pair; live: ${live_pair:-unreadable}); leaving needs-external-review for the next evaluation."
                     echo "::endgroup::"
                     continue
                   fi
@@ -885,7 +966,12 @@ jobs:
         # otherwise stays the newest run on the head, drives the PR UNSTABLE
         # and makes gh-pr-guard.sh refuse the merge. The helper posts only
         # when the newest such run on the live head is a failure, and fences
-        # the POST on a fresh head/label read. Last in the job so a helper
+        # the POST on a fresh head/label read before each of its retried
+        # attempts (#2205). A heal that still fails is retried by the next
+        # publisher full pass that posts a green clearance verdict on the
+        # head: it reads the newest run and nominates the PR back here
+        # through repository_dispatch (see required-check-publisher.yml's
+        # nominate-auto-clear job). Last in the job so a helper
         # fault can never skip the label-clear or continuation steps;
         # !cancelled() so it still runs when the clear step exited non-zero
         # for a DIFFERENT PR's infrastructure error.
@@ -1193,10 +1279,27 @@ jobs:
                 ;;
               1)
                 echo "Dependabot pin-bump lane: not applicable — $PIN_REASON"
-                set +e
-                scripts/codex-review-check.sh "$PR"
-                rc=$?
-                set -e
+                # #2239: capture the live head/base the merge gate is about to
+                # judge, so the DELETE below can be fenced against it. The
+                # lane's own read above is reused when it ran; otherwise one
+                # read under the workflow token, here.
+                if ! [[ "$LANE_HEAD" =~ ^[0-9a-f]{40}$ ]] || ! [[ "$LANE_BASE" =~ ^[0-9a-f]{40}$ ]]; then
+                  set +e
+                  LANE_PAIR=$(GH_TOKEN="$WORKFLOW_TOKEN" gh api "repos/$REPO/pulls/$PR" \
+                    --jq '[.head.sha, .base.sha] | @tsv')
+                  set -e
+                  LANE_HEAD=$(cut -f1 <<<"$LANE_PAIR")
+                  LANE_BASE=$(cut -f2 <<<"$LANE_PAIR")
+                fi
+                if ! [[ "$LANE_HEAD" =~ ^[0-9a-f]{40}$ ]] || ! [[ "$LANE_BASE" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "::error::Could not read the live head/base of PR #$PR before evaluating the merge gate."
+                  rc=3
+                else
+                  set +e
+                  scripts/codex-review-check.sh "$PR"
+                  rc=$?
+                  set -e
+                fi
                 ;;
               *)
                 echo "::error::Dependabot pin-bump lane could not reach a verdict on PR #$PR (rc=$pin_rc): $PIN_REASON"
@@ -1289,6 +1392,30 @@ jobs:
                   fi
                   if [ "$live_owner" != 'labeled:github-actions[bot]' ]; then
                     echo "PR #$PR needs-external-review was re-applied by $live_owner after the pin-bump proof; leaving it for the next evaluation."
+                    echo "::endgroup::"
+                    continue
+                  fi
+                else
+                  # #2239: the same fence for the merge-gate path.
+                  # codex-review-check.sh judged whatever head was live while
+                  # it ran, and a push during it or during the protective
+                  # retraction would otherwise have the label removed from a
+                  # head nobody evaluated (the publisher's repository_dispatch
+                  # nomination makes this path run while a PR is still being
+                  # pushed to). The pair captured before the gate must still
+                  # be live; a move leaves the label for the new head's own
+                  # events, an unreadable pair is an infrastructure error.
+                  if ! live_pair=$(GH_TOKEN="$WORKFLOW_TOKEN" gh api "repos/$REPO/pulls/$PR" \
+                       --jq '[.head.sha, .base.sha] | @tsv'); then
+                    echo "::error::Could not re-read the live head/base of PR #$PR before removing needs-external-review."
+                    had_infra_error=1
+                    failing_prs="$failing_prs $PR"
+                    echo "::endgroup::"
+                    continue
+                  fi
+                  captured_pair=$(printf '%s\t%s' "$LANE_HEAD" "$LANE_BASE")
+                  if [ -z "$live_pair" ] || [ "$live_pair" != "$captured_pair" ]; then
+                    echo "PR #$PR head/base moved while the merge gate was evaluated (evaluated: $captured_pair; live: ${live_pair:-unreadable}); leaving needs-external-review for the next evaluation."
                     echo "::endgroup::"
                     continue
                   fi
