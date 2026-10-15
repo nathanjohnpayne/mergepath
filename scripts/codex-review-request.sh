@@ -813,6 +813,24 @@ esac
 # the matcher, and a PR whose head, base, default branch or labels changed
 # during the reads. A skip therefore needs every signal positively read as
 # "not gated" for one snapshot of the PR.
+#
+# NO CREDENTIALS IN BASE HELPERS (#2272). The parser and the matcher are
+# code fetched from the PR's base, and the base can be any branch the PR
+# targets, including an unprotected one. This script usually runs with the
+# author or reviewer PAT in its environment (GH_TOKEN, OP_PREFLIGHT_*), so
+# both helpers run through run_base_helper, which starts them with an EMPTY
+# environment plus PATH (to find bash and awk), HOME, and
+# LC_ALL=C.UTF-8. Neither helper reads any other variable: the parser reads
+# its file argument, the matcher its arguments and stdin. The locale is
+# UTF-8, not C, because the matcher compiles `?` to `[^/]`, and under C a
+# multibyte character in a file name is several characters, so `?` would
+# match LESS than the labeler does: the unsafe direction. The EXCLUDE_RE
+# read executes nothing (jq decodes the file and sed extracts one line), so
+# it needs no isolation. The helpers keep their base-sha origin for parity
+# with the labeler, which runs the same helpers from the PR base.
+run_base_helper() {  # <script> [args...]; stdin passes through
+  env -i PATH="$PATH" HOME="${HOME:-/}" LC_ALL=C.UTF-8 bash "$@"
+}
 phase_4a_gate_failsafe() {  # <cause>
   PHASE_4A_GATED=true
   PHASE_4A_GATE_REASON="$1"
@@ -958,7 +976,7 @@ derive_phase_4a_gate() {
     phase_4a_gate_failsafe "cannot read the policy list parser scripts/workflow/parse_policy_list.sh at $base_sha"
     return 0
   fi
-  paths_out=$(bash "$parser" "$base_cfg" external_review_paths 2>/dev/null) || parser_rc=$?
+  paths_out=$(run_base_helper "$parser" "$base_cfg" external_review_paths 2>/dev/null) || parser_rc=$?
   rm -f "$parser"
   [ "$base_cfg" = "$CONFIG" ] || rm -f "$base_cfg" 2>/dev/null || true
   if [ "${parser_rc:-0}" -ne 0 ]; then
@@ -1028,7 +1046,7 @@ derive_phase_4a_gate() {
     # Both sides of a rename (#763): moving a protected file out of a
     # protected path must still match.
     changed=$(printf '%s' "$files_json" | jq -r '.[] | (.filename, (.previous_filename // empty))')
-    matched=$(printf '%s\n' "$changed" | bash "$matcher" "${patterns[@]}") || rc=$?
+    matched=$(printf '%s\n' "$changed" | run_base_helper "$matcher" "${patterns[@]}") || rc=$?
     rm -f "$matcher"
     if [ "$rc" -ne 0 ]; then
       phase_4a_gate_failsafe "the protected-path matcher failed (rc=$rc)"

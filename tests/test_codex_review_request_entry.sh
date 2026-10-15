@@ -956,6 +956,70 @@ CASES
   [ "$FAIL" -ne "$before" ] || pass "#2257 derive: external_review_paths is read exactly as the labeler reads it, on every spelling"
 }
 
+# #2272: the parser and matcher are code fetched from the PR base, which can
+# be any branch the PR targets. Plant base copies that dump their whole
+# environment, run the derivation with every credential variable this script
+# can hold set, and require that neither helper saw any of them: the dump may
+# hold only the variables run_base_helper passes plus those bash sets itself.
+# The derivation must still read correctly through the planted helpers.
+plant_env_dump() {  # <dir>: wrap the staged base parser and matcher
+  local dir=$1 helper
+  for helper in parser matcher; do
+    { sed -n 1p "$dir/state/base-$helper.sh"
+      printf 'env >"%s"\n' "$dir/state/$helper-env.txt"
+      sed 1d "$dir/state/base-$helper.sh"
+    } >"$dir/state/base-$helper.sh.planted"
+    mv "$dir/state/base-$helper.sh.planted" "$dir/state/base-$helper.sh"
+  done
+}
+assert_helper_env_clean() {  # <label> <dir> <helper>
+  local label=$1 dir=$2 helper=$3 dump="$2/state/$3-env.txt" leaked
+  if [ ! -s "$dump" ]; then
+    fail "helper env $label: the planted base $helper never ran (no $dump); stderr=$(cat "$dir/err.log")"
+    return
+  fi
+  if grep -Eq 'test-token|planted-secret' "$dump"; then
+    fail "helper env $label: a credential VALUE reached the base $helper: $(grep -E 'test-token|planted-secret' "$dump" | cut -d= -f1 | tr '\n' ' ')"
+    return
+  fi
+  # grep -v exits 1 when nothing leaked; that is the passing case.
+  leaked=$(cut -d= -f1 "$dump" | { grep -vxE 'PATH|HOME|LC_ALL|PWD|OLDPWD|SHLVL|_' || true; } | tr '\n' ' ')
+  if [ -n "$leaked" ]; then
+    fail "helper env $label: the base $helper inherited variables beyond PATH/HOME/LC_ALL: $leaked"
+  elif ! grep -qx 'LC_ALL=C.UTF-8' "$dump"; then
+    fail "helper env $label: the base $helper must run under LC_ALL=C.UTF-8; got $(grep '^LC_ALL=' "$dump" || echo 'no LC_ALL')"
+  else
+    pass "#2272: $label: the base $helper ran with no inherited credentials"
+  fi
+}
+run_case_with_credentials() {  # <dir>: run_case with every credential variable set
+  GITHUB_TOKEN=planted-secret-github OP_PREFLIGHT_AUTHOR_PAT=planted-secret-author \
+    OP_PREFLIGHT_REVIEWER_PAT=planted-secret-reviewer OP_SERVICE_ACCOUNT_TOKEN=planted-secret-op \
+    GH_ENTERPRISE_TOKEN=planted-secret-ghe CODEX_TEST_FILES_JSON="${2:-}" run_case "$1" false
+}
+test_derive_helpers_get_no_credentials() {
+  local dir rc protected='external_review_paths:'$'\n''  - "src/auth/**"'$'\n''  - "docs/a?b.md"'
+  # A protected path: both helpers run, and the PR is gated by the match.
+  dir=$(derive_case helper-env-gated "$protected")
+  plant_env_dump "$dir"
+  rc=$(run_case_with_credentials "$dir" '[{"filename":"src/auth/login.ts","additions":1,"deletions":0}]')
+  assert_derived_request "planted helpers, protected path" "$dir" "$rc" "protected paths changed: src/auth/login.ts"
+  assert_helper_env_clean "gated run" "$dir" parser
+  assert_helper_env_clean "gated run" "$dir" matcher
+  # No match: both helpers run, and the PR is still skipped with exit 5.
+  dir=$(derive_case helper-env-skip "$protected")
+  plant_env_dump "$dir"
+  rc=$(run_case_with_credentials "$dir" '[{"filename":"src/app.ts","additions":1,"deletions":0}]')
+  assert_derived_skip "planted helpers, unprotected path" "$dir" "$rc"
+  assert_helper_env_clean "skip run" "$dir" parser
+  assert_helper_env_clean "skip run" "$dir" matcher
+  # The isolated locale keeps the labeler's match: `?` is one character, so a
+  # multibyte file name still matches `docs/a?b.md` (under C it would not).
+  dir=$(derive_case helper-env-utf8 "$protected")
+  rc=$(run_case_with_credentials "$dir" "$(jq -cn --arg f "docs/a$(printf '\303\251')b.md" '[{filename: $f, additions: 1, deletions: 0}]')")
+  assert_derived_request "a multibyte name under a ? pattern" "$dir" "$rc" "protected paths changed: docs/a"
+}
+
 # The threshold and paths come from the GOVERNING base policy, not the
 # script checkout's copy (Codex P1 on #2258).
 test_derive_reads_governing_policy() {
@@ -1075,6 +1139,7 @@ test_derive_failsafe
 test_derive_reads_governing_policy
 test_derive_threshold_parity
 test_derive_paths_parity
+test_derive_helpers_get_no_credentials
 test_derive_not_run_when_decided
 test_timeout_head_drift_fails_closed_without_marker
 test_new_trigger_replaces_superseded_timeout_marker
