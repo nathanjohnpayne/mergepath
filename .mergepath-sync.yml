@@ -514,6 +514,15 @@ paths:
       - "scripts/lib/coderabbit-fence.sh"
       - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
+      # #2253: the rate-limit failover invokes the Codex requester by path
+      # with flags the two scripts agree on (--allow-moving-head since #2166).
+      # A newer caller against an older requester passes a flag the requester
+      # rejects, and the reverse pairing is refused by the requester's
+      # moving-head guard. The edge is declared in BOTH entries so the
+      # requires-closure gate refuses to ship either file without the other
+      # current on the consumer. Fenced by scripts/ci/check_sync_manifest
+      # (coupled callers).
+      - "scripts/codex-review-request.sh"
   # #489 CodeRabbit-rate-limit auto-merge disposition gate. agent-review.yml's
   # exit-5 (rate-limited) branch calls this script to decide whether the
   # Codex-failover path may auto-merge. Absent on a consumer it exits 127 and
@@ -585,6 +594,13 @@ paths:
       - "scripts/lib/feedback-policy-helpers.sh"    # #1100, policy_block_field_parsed (#1124)
       - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
+      # #2253: the reverse of the edge on scripts/coderabbit-wait.sh above.
+      # #2175 shipped this requester's moving-head guard together with the
+      # failover's --allow-moving-head; a commit-path sync of the requester
+      # alone (the #2240 canary, nathanpaynedotcom#1377) left the older caller
+      # on the consumer, whose rate-limit failover would then exit 8 without
+      # posting. A caller must travel with the callee whose contract it uses.
+      - "scripts/coderabbit-wait.sh"
   # Complete-history reviewer-feedback accounting gate (#1000). Reads every
   # paginated inline comment, review object, and PR-level comment; reconciles
   # classified findings with finding-bound disposition evidence. It hard-
