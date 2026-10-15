@@ -1166,6 +1166,55 @@ def _ansi_c_quote_end(text, start):
     return len(text), False
 
 
+def _ansi_c_index_prefix(word):
+    """Unclosed literal name/index prefixes withhold new ANSI DATA proof.
+
+    This finite raw-word inventory recognizes name[ and ${name[ heads,
+    including the existing numbered and #/! parameter spellings. It does not
+    decide array type, index value or execution; closed brackets restore the
+    ordinary proof. Quoted/escaped prefix data is not an index opener.
+    """
+    depth = 0
+    i = 0
+    name, end = ident_at(word, 0)
+    if name is not None and word[end:end + 1] == "[":
+        depth = 1
+        i = end + 1
+    while i < len(word):
+        c = word[i]
+        if c == "\\":
+            i += 2
+            continue
+        if word[i:i + 2] == "$'":
+            i, _closed = _ansi_c_quote_end(word, i)
+            continue
+        if c in "'\"":
+            quote = c
+            i += 1
+            while i < len(word) and word[i] != quote:
+                i += 2 if quote == '"' and word[i] == "\\" else 1
+            i += 1
+            continue
+        if word[i:i + 2] == "${":
+            start = i + 2
+            if word[start:start + 1] in ("#", "!"):
+                start += 1
+            name, end = ident_at(word, start)
+            if name is None:
+                positional = re.match(r"[1-9][0-9]*", word[start:])
+                end = start + positional.end() if positional else start
+            if end > start and word[end:end + 1] == "[":
+                depth += 1
+                i = end + 1
+                continue
+        if depth and c == "[":
+            depth += 1
+        elif depth and c == "]":
+            depth -= 1
+        i += 1
+    return depth > 0
+
+
 def _find_substitutions(s, quotes_are_literal=False):
     """Yield (body, start_offset, end_offset) for every COMMAND SUBSTITUTION.
 
@@ -1656,8 +1705,9 @@ class Lexer:
             # ---- expansions and quotes ----
             if c == "$" and i + 1 < n:
                 nxt = text[i + 1]
-                if (nxt == "'" and '"' not in quotes
-                        and (not quotes or quotes[-1] in ("${", "${?", "$(("))):
+                if (nxt == "'" and '"' not in quotes and "$((" not in quotes
+                        and (not quotes or quotes[-1] in ("${", "${?"))
+                        and not _ansi_c_index_prefix("".join(cur_level()["word"]))):
                     end, closed = _ansi_c_quote_end(text, i)
                     token = text[i:end]
                     self.ansi_c_quote_spans.append((i, end))
@@ -14394,6 +14444,37 @@ def _ansi_c_quote_cases():
                 real = ": `" + real + "`"
             if "leak" not in discover_emitter_helpers("leak() { " + real + "; }\n"):
                 failures.append("ANSI literal prefix erased a real error-word suffix")
+    # ANSI literal proof is withheld in the existing arithmetic quote state.
+    # A real command substitution resets that state for its inner command.
+    literal = "$'plain'"
+    for text, literal_data in [
+        (": $(( " + literal + " ))\n", False),
+        (": $(( ${PLAIN:-" + literal + "} ))\n", False),
+        (": $(( $( : " + literal + " ) ))\n", True),
+    ]:
+        start = text.index(literal)
+        expected = [(start, start + len(literal))] if literal_data else []
+        if Lexer(text).ansi_c_quote_spans != expected:
+            failures.append("ANSI-C arithmetic context/span boundary: " + repr(text))
+    # Data-only prefix controls: no array value/type or runtime is evaluated.
+    for prefix, indexed in [
+        ("array[", True), ("array[1 + [2]", True),
+        ("${array[", True), ("${#array[", True), ("${!array[", True),
+        ("${1[", True), ("array[0]=", False), ("${array[0]:-", False),
+        ("${NAME:-literal[", False), ("\\${array[", False),
+        ("'$'\"{array[\"", False), ("$'${array['", False),
+    ]:
+        if _ansi_c_index_prefix(prefix) != indexed:
+            failures.append("ANSI-C index-prefix DATA boundary: " + repr(prefix))
+    for prefix, suffix, indexed in [
+        ("array[", "]=0", True), ("${array[", "]}", True),
+        ("array[0]=", "", False), ("${array[0]:-", "}", False),
+        ("${NAME:-literal[", "}", False),
+    ]:
+        text = prefix + literal + suffix + "\n"
+        expected = [] if indexed else [(len(prefix), len(prefix) + len(literal))]
+        if Lexer(text).ansi_c_quote_spans != expected:
+            failures.append("ANSI-C index-context source offsets: " + repr(text))
     return failures
 
 
