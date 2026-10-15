@@ -62,17 +62,26 @@ assert_grep "D2: shared continuation fails closed when durable-arm cleanup canno
   scripts/workflow/approval-merge-continuation.sh 'could not retract and verify a post-independence auto-merge request'
 
 # Defect 3: label removal verifies end-state instead of retrying the non-idempotent write.
-assert_grep "D3: auto-clear verifies label end-state (still_present)" \
-  "$W/auto-clear-blocking-labels.yml" 'still_present'
-refute_grep "D3: auto-clear no longer retries the --remove-label write" \
-  "$W/auto-clear-blocking-labels.yml" 'with_gh_retry gh pr edit "$PR" --repo "$REPO" --remove-label needs-external-review'
-# #530: the attribution-comment POST is non-idempotent (a retry after a
-# timeout-after-accept duplicates the comment), so it must NOT be retried;
-# the idempotent (name,head_sha) check-run POSTs stay wrapped.
-refute_grep "D3: auto-clear no longer retries the non-idempotent comment POST (#530)" \
-  "$W/auto-clear-blocking-labels.yml" 'with_gh_retry gh pr comment "$PR" --repo "$REPO" --body "$comment_body"'
-assert_grep "D3: auto-clear keeps check-run POSTs retried (idempotent name,head_sha) (#530)" \
-  "$W/auto-clear-blocking-labels.yml" 'with_gh_retry gh api "repos/$REPO/check-runs"'
+# #1547 moved the writers into these fixed trusted drivers. Both are inspected;
+# the parsed invocation checks below fail if a present workflow loses a driver.
+if [ -f "$W/auto-clear-blocking-labels.yml" ]; then
+  for driver in scripts/workflow/auto-clear-event.sh scripts/workflow/auto-clear-sweep.sh; do
+    assert_grep "D3: $driver verifies label end-state (still_present)" \
+      "$driver" 'still_present='
+    refute_grep "D3: $driver no longer retries the --remove-label write" \
+      "$driver" 'with_gh_retry gh pr edit "$PR" --repo "$REPO" --remove-label needs-external-review'
+    refute_grep "D3: $driver never retries its non-idempotent REST DELETE" \
+      "$driver" 'with_gh_retry gh api "repos/$REPO/issues/$PR/labels/needs-external-review"'
+    # #530: retrying a comment POST after timeout-after-accept duplicates it.
+    refute_grep "D3: $driver no longer retries the non-idempotent comment POST (#530)" \
+      "$driver" 'with_gh_retry gh pr comment "$PR" --repo "$REPO" --body "$comment_body"'
+  done
+  # Idempotent check-run publication remains in the workflow's protective jobs.
+  assert_grep "D3: auto-clear keeps check-run POSTs retried (idempotent name,head_sha) (#530)" \
+    "$W/auto-clear-blocking-labels.yml" 'with_gh_retry gh api "repos/$REPO/check-runs"'
+else
+  echo "SKIP: D3 auto-clear (workflow absent)"; SKIP=$((SKIP + 1))
+fi
 
 # Defect 4: codex-review-request re-scans at the deadline before emitting.
 assert_grep "D4: codex-review-request final scan at deadline" \
@@ -246,21 +255,27 @@ fi
 # issue) rather than `gh pr edit --remove-label`, which is backed by the
 # idempotent GraphQL removeLabelsFromLabelable mutation and exits 0 even when
 # the label was never present — carrying no signal to gate on.
-assert_grep "D10: auto-clear removes via REST DELETE so the HTTP status attributes the removal (#827)" \
-  "$W/auto-clear-blocking-labels.yml" '-X DELETE -i --silent'
-assert_grep "D10: auto-clear branches the attribution comment on the DELETE status (#827)" \
-  "$W/auto-clear-blocking-labels.yml" 'case "$del_status" in'
-refute_grep "D10: auto-clear no longer removes via the unattributable gh pr edit path (#827)" \
-  "$W/auto-clear-blocking-labels.yml" 'gh pr edit "$PR" --repo "$REPO" --remove-label needs-external-review'
-assert_grep "D10: the scheduled sweep re-verifies the label against live state, not the search index (#827)" \
-  "$W/auto-clear-blocking-labels.yml" 'stale search-index hit'
+if [ -f "$W/auto-clear-blocking-labels.yml" ]; then
+  for driver in scripts/workflow/auto-clear-event.sh scripts/workflow/auto-clear-sweep.sh; do
+    assert_grep "D10: $driver removes via REST DELETE so HTTP status attributes removal (#827)" \
+      "$driver" '-X DELETE -i --silent'
+    assert_grep "D10: $driver branches attribution on the DELETE status (#827)" \
+      "$driver" 'case "$del_status" in'
+    refute_grep "D10: $driver no longer uses the unattributable gh pr edit path (#827)" \
+      "$driver" 'gh pr edit "$PR" --repo "$REPO" --remove-label needs-external-review'
+  done
+  assert_grep "D10: the scheduled sweep re-verifies live labels, not the search index (#827)" \
+    scripts/workflow/auto-clear-sweep.sh 'stale search-index hit'
+else
+  echo "SKIP: D10 auto-clear (workflow absent)"; SKIP=$((SKIP + 1))
+fi
 
 # Read direct YAML nodes, not active-looking text inside scalar values or
 # another step. Psych is Ruby's standard-library YAML parser (already used by
 # Hub CI); no objects are loaded and aliases/merge keys are unsupported here.
 # Write decoded scalar bytes directly to files: command substitution would
 # discard trailing newlines, and line-oriented extraction changes folded runs.
-extract_step_data() {  # <workflow> <job id> <exact step name> <output dir> [inputs]
+extract_step_data() {  # <workflow> <job id> <exact step name> <output dir> [inputs|auto-clear]
   if ! command -v ruby >/dev/null 2>&1; then
     echo "workflow step extraction: Ruby/Psych is required for a present workflow" >&2
     return 1
@@ -309,6 +324,18 @@ begin
       values[key] = string(env[key], "step.env.#{key}")
     end
   end
+  if inputs == 'auto-clear'
+    env = mapping(step['env'], 'step.env')
+    values['CLEAR_PHASE'] = string(env['CLEAR_PHASE'], 'step.env.CLEAR_PHASE')
+    values['environment'] = string(job['environment'], 'job.environment')
+    checkouts = steps.children.map do |node|
+      candidate = mapping(node, 'checkout step')
+      candidate if candidate.key?('uses') && string(candidate['uses'], 'step.uses').start_with?('actions/checkout@')
+    end.compact
+    raise 'expected exactly one trusted checkout' unless checkouts.length == 1
+    checkout_with = mapping(checkouts.first['with'], 'checkout.with')
+    values['checkout-ref'] = string(checkout_with['ref'], 'checkout.with.ref')
+  end
   values.each { |name, value| File.binwrite(File.join(output, name), value) }
 rescue StandardError => error
   warn "workflow step extraction: #{error.message}"
@@ -326,6 +353,27 @@ YAML_FIXTURES="$(mktemp -d "${TMPDIR:-/tmp}/test465-yaml.XXXXXX")"
 D12="" D13="" D14=""
 cleanup_465() { rm -rf "$YAML_FIXTURES" ${D12:+"$D12"} ${D13:+"$D13"} ${D14:+"$D14"}; }
 trap cleanup_465 EXIT
+
+# Bind each inspected writer to its actual direct mutation step and trusted ref.
+if [ -f "$W/auto-clear-blocking-labels.yml" ]; then
+  for lane in event sweep; do
+    driver="scripts/workflow/auto-clear-$lane.sh"
+    mkdir -p "$YAML_FIXTURES/auto-clear-$lane"
+    if [ -f "$driver" ] \
+      && extract_step_data "$W/auto-clear-blocking-labels.yml" "clear-$lane-labels" \
+        "Re-evaluate the protected tuple and remove its label" "$YAML_FIXTURES/auto-clear-$lane" auto-clear \
+      && [ "$(cat "$YAML_FIXTURES/auto-clear-$lane/step.sh")" = "bash $driver" ] \
+      && [ "$(cat "$YAML_FIXTURES/auto-clear-$lane/CLEAR_PHASE")" = mutate ] \
+      && [ "$(cat "$YAML_FIXTURES/auto-clear-$lane/environment")" = review-automation ] \
+      && [ "$(cat "$YAML_FIXTURES/auto-clear-$lane/checkout-ref")" = '${{ github.workflow_sha }}' ]; then
+      pass "D3/D10: $lane mutation invokes its present matching driver from trusted workflow source"
+    else
+      fail "D3/D10: $lane mutation must invoke its present matching trusted driver"
+    fi
+  done
+else
+  echo "SKIP: D3/D10 driver binding (workflow absent)"; SKIP=$((SKIP + 1))
+fi
 if command -v ruby >/dev/null 2>&1 && ! ruby - "$YAML_FIXTURES" <<'RUBY'
 dir = ARGV.fetch(0)
 prefix = "jobs:\n  rollup:\n    steps:\n"

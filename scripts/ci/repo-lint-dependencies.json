@@ -161,6 +161,8 @@
       "scripts/lib/feedback-archive-identities.sh"
     ],
     "check_codex_scripts": [
+      "scripts/workflow/auto-clear-event.sh",
+      "scripts/workflow/auto-clear-sweep.sh",
       "scripts/lib/codex-request-evidence.sh",
       "tests/test_codex_request_evidence.sh",
       "scripts/codex-review-ledger.sh",

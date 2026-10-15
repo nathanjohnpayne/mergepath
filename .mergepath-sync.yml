@@ -1578,6 +1578,9 @@ paths:
   - path: tests/test_465_fail_closed.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/workflow/auto-clear-event.sh"
+      - "scripts/workflow/auto-clear-sweep.sh"
   # Cross-workflow structural guard for #655 (agent-review.yml's required-
   # check wait + auto-clear-blocking-labels.yml's workflow_run trigger both
   # observing the repo_lint_local.yml annex). check_codex_scripts hard-runs
