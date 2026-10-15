@@ -100,6 +100,7 @@ make_case() {
   cat >"$dir/.github/review-policy.yml" <<EOF
 codex:
   bot_login: "chatgpt-codex-connector[bot]"
+  request_by_default: true  # #2240: absent now means false; these cases exercise the request itself
   review_timeout_seconds: $review_timeout
   reaction_freshness_window_seconds: 999999999
   ack_wait_seconds: $ack_wait

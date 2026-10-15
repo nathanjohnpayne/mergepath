@@ -70,6 +70,7 @@ make_case() {
 author_identity: nathanjohnpayne
 codex:
   bot_login: "chatgpt-codex-connector[bot]"
+  request_by_default: true  # #2240: absent now means false; these cases exercise the request itself
   review_timeout_seconds: 0
   reaction_freshness_window_seconds: 999999999
   ack_wait_seconds: 0
@@ -1455,7 +1456,7 @@ test_guard_anchors_on_push_dispatch() {
 test_policy_resolved_from_script_checkout() {
   local dir rc before=$FAIL
   dir=$(make_case "policy-subdir")
-  printf '  request_by_default: false\n' >>"$dir/.github/review-policy.yml"
+  sed -i.bak 's/^  request_by_default: true.*/  request_by_default: false/' "$dir/.github/review-policy.yml"
   rc=0
   ( cd "$dir/scripts" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
       CODEX_TEST_SCENARIO=fresh ./codex-review-request.sh --trigger-only 999 owner/repo \
@@ -1463,7 +1464,7 @@ test_policy_resolved_from_script_checkout() {
   [ "$rc" = "5" ] && [ "$(trig_count "$dir")" = "0" ] \
     || fail "MH12: run from scripts/, request_by_default: false must skip with exit 5 (rc=$rc posts=$(trig_count "$dir")); err=$(cat "$dir/err.log")"
   dir=$(make_case "policy-foreign-cwd")
-  printf '  request_by_default: false\n' >>"$dir/.github/review-policy.yml"
+  sed -i.bak 's/^  request_by_default: true.*/  request_by_default: false/' "$dir/.github/review-policy.yml"
   rc=0
   ( cd "$WORKDIR" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
       CODEX_TEST_SCENARIO=fresh "$dir/scripts/codex-review-request.sh" --trigger-only 999 owner/repo \
