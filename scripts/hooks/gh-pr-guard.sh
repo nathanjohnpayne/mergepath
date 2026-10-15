@@ -1402,12 +1402,18 @@ guard_review_gh() {
 # guard_review_reads_github_com: 0 iff the self-approve read goes to
 # github.com, so lending it the reviewer PAT cannot send the PAT elsewhere.
 # gh sends GH_TOKEN to github.localhost and *.ghe.com too, and takes the host
-# from GH_HOST, a host-qualified --repo or GH_REPO, or a URL selector (Phase
-# 4b on #2178). Anything else keeps gh's own credentials, which fail closed.
+# from GH_HOST, from a repository value (the --repo the read is given, or
+# GH_REPO) or from a URL selector (Phase 4b on #2178). A repository value
+# must be a plain OWNER/REPO: gh also reads git@HOST:OWNER/REPO, URLs and
+# HOST/OWNER/REPO there, so screening for bad shapes misses forms. Anything
+# else keeps gh's own credentials, which fail closed.
+guard_canonical_repo() {
+  [[ "$1" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+}
 guard_review_reads_github_com() {
   case "${GH_HOST:-github.com}" in github.com) ;; *) return 1 ;; esac
-  case "${GH_REPO:-}" in */*/*) return 1 ;; esac
-  case "${REVIEW_REPO:-}" in */*/*) return 1 ;; esac
+  if [ -n "${GH_REPO:-}" ] && ! guard_canonical_repo "$GH_REPO"; then return 1; fi
+  if [ -n "${REVIEW_REPO:-}" ] && ! guard_canonical_repo "$REVIEW_REPO"; then return 1; fi
   case "${REVIEW_PR_SELECTOR:-}" in
     [Hh][Tt][Tt][Pp]://*|[Hh][Tt][Tt][Pp][Ss]://*)
       case "$REVIEW_PR_SELECTOR" in https://github.com/*) ;; *) return 1 ;; esac

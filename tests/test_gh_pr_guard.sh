@@ -612,15 +612,18 @@ fi
 # --repo, a GH_HOST elsewhere, or a URL selector on another host keeps gh's
 # own (absent) credentials, so the read fails closed without sending the PAT
 # (Phase 4b on #2178).
-for variant in "--repo github.localhost/o/r" "GH_HOST=tenant.ghe.com" "https://github.localhost/o/r/pull/123"; do
+for variant in "--repo github.localhost/o/r" "GH_HOST=tenant.ghe.com" "https://github.localhost/o/r/pull/123" \
+    "--repo git@tenant.ghe.com:o/r" "--repo=git@tenant.ghe.com:o/r" "--repo=https://tenant.ghe.com/o/r" "GH_REPO=git@tenant.ghe.com:o/r"; do
   : >"$API_LOG"
+  ghrepo=""
   case "$variant" in
     GH_HOST=*) cmd='scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"'; host="${variant#GH_HOST=}" ;;
+    GH_REPO=*) cmd='scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"'; host=""; ghrepo="${variant#GH_REPO=}" ;;
     https://*) cmd="scripts/gh-as-reviewer.sh -- gh pr review $variant --approve --body lgtm"; host="" ;;
     *) cmd="scripts/gh-as-reviewer.sh -- gh pr review 123 $variant --approve --body lgtm"; host="" ;;
   esac
   set +e
-  out=$(unset GH_TOKEN GITHUB_TOKEN; if [ -n "$host" ]; then export GH_HOST="$host"; fi; \
+  out=$(unset GH_TOKEN GITHUB_TOKEN; if [ -n "$host" ]; then export GH_HOST="$host"; fi; if [ -n "$ghrepo" ]; then export GH_REPO="$ghrepo"; fi; \
     OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-pat STUB_EXPECT_TOKEN=fixture-reviewer-pat STUB_REQUIRE_TOKEN=1 STUB_API_LOG="$API_LOG" \
     run_hook "$cmd" "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0" 2>&1)
   rc=$?

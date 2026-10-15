@@ -161,6 +161,15 @@ gh_payload_is_hosted_repo() {
   [[ "$1" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+/[^/[:space:]]+/[^/[:space:]]+$ ]]
 }
 
+# gh_payload_is_canonical_repo <value>: 0 iff <value> is a plain OWNER/REPO.
+# A repository value is held to this allowlist rather than screened for bad
+# shapes: gh also reads git@HOST:OWNER/REPO, URLs and HOST/OWNER/REPO there,
+# and a screen that misses one form sends the verified token to that host
+# (Phase 4b on #2178). Anything else can only be over-refused.
+gh_payload_is_canonical_repo() {
+  [[ "$1" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+}
+
 # gh_payload_is_foreign_url <value>: 0 iff <value> begins with a URL whose
 # host is not GitHub's own (github.com, www.github.com, api.github.com).
 # gh reads a repository selector as a URL when it starts with git@ or with
@@ -206,12 +215,10 @@ gh_payload_refuse_credential_overrides() {
   shift
   case "${1:-}" in gh|*/gh) ;; *) return 0 ;; esac
   shift
-  case "${GH_REPO:-}" in
-    */*/*)
-      echo "$label: refusing an inherited host-qualified GH_REPO ('$GH_REPO'): gh would send the verified token to that host; unset it and pass --repo OWNER/REPO (#1542)." >&2
-      return 1
-      ;;
-  esac
+  if [ -n "${GH_REPO:-}" ] && ! gh_payload_is_canonical_repo "$GH_REPO"; then
+    echo "$label: refusing an inherited GH_REPO ('$GH_REPO') that is not a plain OWNER/REPO: gh could take a host from it and send the verified token there; unset it and pass --repo OWNER/REPO (#1542)." >&2
+    return 1
+  fi
   for arg in "$@"; do
     [ "$arg" != "api" ] || is_api=1
   done
@@ -222,18 +229,27 @@ gh_payload_refuse_credential_overrides() {
         return 1
         ;;
     esac
+    # A repository value in every form gh accepts: --repo=V, -RV, -R=V, a
+    # short-option cluster ending in R (-wRV), and the argument after --repo,
+    # -R or such a cluster. Each must be a plain OWNER/REPO.
     value=""
     case "$arg" in
       --repo=*) value="${arg#--repo=}" ;;
       -R?*) value="${arg#-R}"; value="${value#=}" ;;
-    esac
-    case "$prev" in --repo|-R) value="$arg" ;; esac
-    case "$value" in
-      */*/*)
-        echo "$label: refusing a host-qualified --repo ('$value'): guarded writes go to github.com only, where the token was verified; pass OWNER/REPO (#1542)." >&2
-        return 1
+      *)
+        if [[ "$arg" =~ ^-[A-Za-z]+R(.*)$ ]]; then
+          value="${BASH_REMATCH[1]}"
+          value="${value#=}"
+        fi
         ;;
     esac
+    if [ "$prev" = "--repo" ] || [[ "$prev" =~ ^-[A-Za-z]*R$ ]]; then
+      value="$arg"
+    fi
+    if [ -n "$value" ] && ! gh_payload_is_canonical_repo "$value"; then
+      echo "$label: refusing the repository '$value': guarded writes take a plain OWNER/REPO only, because gh could take a host from any other form and send the verified token there (#1542)." >&2
+      return 1
+    fi
     if gh_payload_is_hosted_repo "$arg"; then
       echo "$label: refusing the host-qualified repository '$arg': whatever option it belongs to, gh could send the verified token to that host; pass OWNER/REPO (#1542)." >&2
       return 1

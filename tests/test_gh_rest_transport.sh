@@ -385,7 +385,6 @@ refused_rest "comment --edit-last" as_reviewer gh pr comment 1 --repo o/r --body
 refused_rest "comment --body-file -" as_reviewer gh pr comment 1 --repo o/r --body-file -
 refused_rest "comment with two bodies" as_reviewer gh pr comment 1 --repo o/r --body x --body-file "$COMMENT_FILE"
 refused_rest "comment with a missing body file" as_reviewer gh pr comment 1 --repo o/r --body-file "$WORKDIR/absent.md"
-refused_rest "comment with a --repo that is not OWNER/REPO" as_reviewer gh pr comment 1 --repo r --body x
 refused_rest "options before the verb" as_reviewer gh pr --repo o/r comment 1 --body x
 refused_rest "a pr verb the transport does not run (view)" as_reviewer gh pr view 1 --repo o/r
 refused_rest "a pr verb the transport does not run (ready)" as_author gh pr ready 1 --repo o/r
@@ -1344,6 +1343,29 @@ override_refused "userinfo that names github.com" as_reviewer gh repo view https
 override_refused "a port on the foreign host" as_reviewer gh repo view https://tenant.ghe.com:443/o/r
 override_refused "a repository URL behind a --jq value" as_reviewer gh repo view --jq https://tenant.ghe.com/o/r
 override_refused "an argument that begins with a foreign URL" as_reviewer gh repo view 'https://tenant.ghe.com/o/r extra'
+# A repository value is held to a plain OWNER/REPO in every form gh reads
+# one, and so is an inherited GH_REPO: gh run list --repo=git@HOST:O/R
+# targets that host (Phase 4b on #2178).
+override_refused "a --repo that is not OWNER/REPO" as_reviewer gh pr comment 1 --repo r --body x
+override_refused "an scp-like repository in --repo=" as_reviewer gh run list --repo=git@tenant.ghe.com:o/r
+override_refused "an scp-like repository in -RVALUE" as_reviewer gh run list -Rgit@tenant.ghe.com:o/r
+override_refused "an scp-like repository in -R=VALUE" as_reviewer gh run list -R=git@tenant.ghe.com:o/r
+override_refused "a repository URL in --repo=" as_author gh run list --repo=https://tenant.ghe.com/o/r
+override_refused "a repository in a short-option cluster ending in R" as_reviewer gh pr view 1 -wRgit@tenant.ghe.com:o/r
+override_refused "a repository after a short-option cluster ending in R" as_reviewer gh pr view 1 -wR tenant.ghe.com:o/r
+for gr in git@tenant.ghe.com:o/r https://tenant.ghe.com/o/r; do
+  for t in gh rest; do
+    new_case
+    set +e
+    err="$(GH_REPO=$gr MERGEPATH_GH_TRANSPORT=$t as_reviewer -- gh run list 2>&1 >/dev/null)"; rc=$?
+    set -e
+    if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'not a plain OWNER/REPO' && [ ! -s "$LOGF" ]; then
+      pass "inherited GH_REPO $gr ($t transport): refused before any gh call"
+    else
+      fail "inherited GH_REPO $gr ($t transport): rc=$rc err=$err"; cat "$LOGF" >&2
+    fi
+  done
+done
 override_refused "short header flag with an equals sign" as_reviewer gh api repos/o/r/issues/1/comments -H='Authorization: Bearer x' -f body=x
 override_refused "header flag clustered after another short flag" as_reviewer gh api repos/o/r/issues/1/comments -iHAuthorization:x -f body=x
 override_refused "Authorization header behind a --preview value" as_reviewer gh api repos/o/r/issues/1/comments --preview --header --header 'Authorization: Bearer x' -f body=x
@@ -1355,7 +1377,7 @@ for t in gh rest; do
   set +e
   err="$(GH_REPO=tenant.ghe.com/o/r MERGEPATH_GH_TRANSPORT=$t as_reviewer -- gh pr comment 1 --repo o/r --body x 2>&1 >/dev/null)"; rc=$?
   set -e
-  if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'inherited host-qualified GH_REPO' && [ ! -s "$LOGF" ]; then
+  if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'inherited GH_REPO (.tenant.ghe.com/o/r.) that is not a plain OWNER/REPO' && [ ! -s "$LOGF" ]; then
     pass "inherited host-qualified GH_REPO ($t transport): refused before any gh call"
   else
     fail "inherited GH_REPO ($t transport): rc=$rc err=$err"; cat "$LOGF" >&2
@@ -1371,6 +1393,18 @@ else
   fail "plain GH_REPO: rc=$rc"; cat "$LOGF" >&2
 fi
 
+# A plain OWNER/REPO passes in every repository form.
+for form in --repo=Org-1/repo.name_x -RO/r -R=o/r; do
+  new_case
+  set +e
+  MERGEPATH_GH_TRANSPORT=gh as_reviewer -- gh run list "$form" >/dev/null 2>&1; rc=$?
+  set -e
+  if [ "$rc" -eq 0 ] && log_has $'gh\trun\tlist\t'"$form"; then
+    pass "a plain OWNER/REPO passes as $form"
+  else
+    fail "plain repo $form: rc=$rc"; cat "$LOGF" >&2
+  fi
+done
 # GitHub's own hosts, and text that merely contains a URL, are not refused.
 for t in gh rest; do
   new_case
