@@ -4,6 +4,8 @@ This repository is **Mergepath**, the reference implementation of the AI Agent T
 
 Primary stack: Markdown documentation, shell automation, YAML review-policy configuration, and the Mergepath Playground (static HTML + JS at `mergepath/playground/`). Agent role: maintain Mergepath's structure, the review-policy tooling and Playground, and the supporting developer workflows — ensuring documentation and tooling behavior do not drift over time. See [`BRAND.md`](../../BRAND.md) at repo root for the umbrella vocabulary.
 
+Scoped owner admin authorization inventories check runs and commit statuses through exact-head cursor pagination, validates complete counts and compares observations before publication and at the final writer boundary. Its unchanged authorization-record format, safety gates and malformed/drifting-page controls are specified in [`specs/owner_admin_override.md`](../../specs/owner_admin_override.md) and exercised by `tests/test_owner_admin_override.py`.
+
 The read-only credential-isolation audit reports matched authority names from its fixed inventory, without copying secret metadata into diagnostic labels. The output contract and regression coverage are in `specs/credential_isolation.md` and `tests/test_credential_isolation.py`.
 
 The publisher structural fence prevents workflow and job concurrency for all three native required producers. The contract and mutation coverage are in `specs/required_check_publisher.md` and `tests/test_merge_clearance_gate.sh`.
