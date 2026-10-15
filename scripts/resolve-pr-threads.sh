@@ -17,6 +17,9 @@
 #                                  | --resolve-verified-propagation]
 #                                 [--dry-run] [--rationale <text>]
 #                                 [--no-tag-reply]
+#   scripts/resolve-pr-threads.sh <PR#> --thread <node-id|comment-id>
+#     --disposition fixed|rebuttal|deferred-to-followup|addressed-elsewhere
+#     [--issue <number>] [--commit <SHA>] [--rationale <text>] [--dry-run]
 #
 # Modes — split by DISPOSITION (#575). Pick the mode that matches what
 # actually HAPPENED to the feedback, because each mode records a
@@ -433,6 +436,14 @@ Resolve modes are split by DISPOSITION (#575) — pick the one that matches
 what actually happened to the feedback (the recorded tag is read by the
 daily rollup / weekly sweep as the disposition of record):
 
+  --thread <id>         Select exactly one bot thread by its node ID or original
+                        review-comment database ID; requires --disposition.
+  --disposition <kind>  Explicit fixed, rebuttal, deferred-to-followup or
+                        addressed-elsewhere; no file-touch inference.
+  --issue <number>      Follow-up issue; required for deferred-to-followup.
+  --commit <SHA>        Optional 7–40 hex commit citation for the marker.
+                        Targeted mode cannot combine bulk/list modes or
+                        --no-tag-reply; its marker must post before resolving.
   --list                List unresolved threads (default).
   --resolve-actioned    FIXED/REBUTTED feedback — the default on a PR you
                         pushed fixes to. Resolves ONLY current-HEAD bot
@@ -467,11 +478,11 @@ daily rollup / weekly sweep as the disposition of record):
                         truthful actioned class instead (#575 upgrade).
   --dry-run             With any resolve mode, print would-resolve /
                         would-skip per thread without mutating.
-  --rationale <text>    With --auto-resolve-bots, free-form rationale
+  --rationale <text>    With --auto-resolve-bots or --thread, free-form rationale
                         appended after the [mergepath-resolve: deferred-to-followup]
                         tag (overrides auto-classification; the #575
                         actioned auto-upgrade still applies to the class).
-  --no-tag-reply        With any resolve mode, suppress the
+  --no-tag-reply        With bulk resolve modes, suppress the
                         [mergepath-resolve:<class>] reply emission
                         (the resolve mutation still runs).
 EOF
@@ -485,6 +496,11 @@ DRY_RUN=false
 RATIONALE_OVERRIDE=""
 RATIONALE_FLAG_USED=false
 NO_TAG_REPLY=false
+TARGET_THREAD=""
+EXPLICIT_DISPOSITION=""
+TARGET_ISSUE=""
+TARGET_COMMIT=""
+BULK_MODE_USED=false
 # Match both REST and GraphQL bot-login formats. The REST API returns
 # `coderabbitai[bot]`; GraphQL `author{login}` returns `coderabbitai`
 # (un-suffixed user-facing handle). The trailing `(\[bot\])?` accepts
@@ -511,10 +527,22 @@ while [ $# -gt 0 ]; do
         usage
       fi
       REPO="$2"; shift 2 ;;
-    --list) MODE="list"; shift ;;
-    --auto-resolve-bots) MODE="auto-resolve-bots"; shift ;;
-    --resolve-actioned) MODE="resolve-actioned"; shift ;;
-    --resolve-verified-propagation) MODE="resolve-verified-propagation"; shift ;;
+    --list) MODE="list"; BULK_MODE_USED=true; shift ;;
+    --auto-resolve-bots) MODE="auto-resolve-bots"; BULK_MODE_USED=true; shift ;;
+    --resolve-actioned) MODE="resolve-actioned"; BULK_MODE_USED=true; shift ;;
+    --resolve-verified-propagation) MODE="resolve-verified-propagation"; BULK_MODE_USED=true; shift ;;
+    --thread|--disposition|--issue|--commit)
+      if [ $# -lt 2 ] || [ -z "$2" ] || [[ "$2" = --* ]]; then
+        echo "Error: $1 requires a non-empty value" >&2
+        usage
+      fi
+      case "$1" in
+        --thread) TARGET_THREAD="$2" ;;
+        --disposition) EXPLICIT_DISPOSITION="$2" ;;
+        --issue) TARGET_ISSUE="$2" ;;
+        --commit) TARGET_COMMIT="$2" ;;
+      esac
+      shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --rationale)
       # Same defensive value check as --repo (Codex r2 on PR #172):
@@ -565,6 +593,43 @@ if { [ "$MODE" = "resolve-actioned" ] || [ "$MODE" = "resolve-verified-propagati
   echo "       (action / byte-verified propagation); use" >&2
   echo "       --auto-resolve-bots --rationale to deliberately resolve a" >&2
   echo "       deferred thread with a rationale." >&2
+  exit 1
+fi
+
+# Explicit disposition is an operator attestation bound to one finding,
+# independent of the bulk modes' file-touch proxies (#2196).
+if [ -n "$TARGET_THREAD" ]; then
+  if $BULK_MODE_USED || $NO_TAG_REPLY; then
+    echo "Error: --thread cannot combine bulk/list modes or --no-tag-reply" >&2
+    exit 1
+  fi
+  if ! [[ "$TARGET_THREAD" =~ ^[A-Za-z0-9_=-]+$ ]]; then
+    echo "Error: invalid thread node ID or original comment ID" >&2
+    exit 1
+  fi
+  case "$EXPLICIT_DISPOSITION" in
+    fixed|addressed-elsewhere) TARGET_CLASS="addressed-elsewhere" ;;
+    rebuttal) TARGET_CLASS="rebuttal-recorded" ;;
+    deferred-to-followup) TARGET_CLASS="deferred-to-followup"
+      if [ -z "$TARGET_ISSUE" ]; then
+        echo "Error: deferred-to-followup requires --issue <number>" >&2
+        exit 1
+      fi ;;
+    *) echo "Error: --thread requires a supported --disposition" >&2; exit 1 ;;
+  esac
+  if [ -n "$TARGET_ISSUE" ] && ! [[ "$TARGET_ISSUE" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: --issue must be a positive integer" >&2; exit 1
+  fi
+  if [ -n "$TARGET_COMMIT" ] && ! [[ "$TARGET_COMMIT" =~ ^[a-fA-F0-9]{7,40}$ ]]; then
+    echo "Error: --commit must be a 7–40 character hexadecimal SHA" >&2; exit 1
+  fi
+  MODE="resolve-targeted"
+  TARGET_RATIONALE="Explicit disposition: $EXPLICIT_DISPOSITION."
+  [ -z "$TARGET_ISSUE" ] || TARGET_RATIONALE+=" Follow-up: #$TARGET_ISSUE."
+  [ -z "$TARGET_COMMIT" ] || TARGET_RATIONALE+=" Commit: $TARGET_COMMIT."
+  [ -z "$RATIONALE_OVERRIDE" ] || TARGET_RATIONALE+=" $RATIONALE_OVERRIDE"
+elif [ -n "$EXPLICIT_DISPOSITION$TARGET_ISSUE$TARGET_COMMIT" ]; then
+  echo "Error: --disposition, --issue and --commit require --thread" >&2
   exit 1
 fi
 
@@ -775,6 +840,7 @@ QUERY='
             # (rare but possible — bot churn).
             commentsFirst: comments(first: 1) {
               nodes {
+                databaseId
                 author { login }
                 path
                 body
@@ -945,6 +1011,21 @@ ERROR: GraphQL count mismatch on $REPO#$PR_NUM.
        CLAUDE.md § 7.6.
 EOF
   exit 2
+fi
+
+if [ "$MODE" = "resolve-targeted" ]; then
+  TARGET_MATCHES=$(printf '%s' "$THREADS_JSON" | jq -c --arg selector "$TARGET_THREAD" '
+    [.[] | select(.id == $selector or
+      ((.commentsFirst.nodes[0].databaseId // "") | tostring) == $selector)]')
+  if [ "$(printf '%s' "$TARGET_MATCHES" | jq 'length')" -ne 1 ]; then
+    echo "Error: --thread must identify exactly one thread on this PR" >&2
+    exit 1
+  fi
+  THREADS_JSON="$TARGET_MATCHES"
+  if [ "$(printf '%s' "$THREADS_JSON" | jq -r '.[0].isResolved')" = true ]; then
+    echo "Selected thread is already resolved; no writes performed."
+    exit 0
+  fi
 fi
 
 UNRESOLVED=$(echo "$THREADS_JSON" | jq -c '
@@ -3142,6 +3223,13 @@ post_tag_reply() {
     printf 'tag-reply mutation failed: %s\n' "$err" >&2
     return 1
   fi
+  if [ "$MODE" = "resolve-targeted" ] && ! printf '%s' "$err" | jq -e '
+    ((.errors // []) | length) == 0 and
+    (.data.addPullRequestReviewThreadReply.comment.id | type == "string" and length > 0)
+  ' >/dev/null 2>&1; then
+    echo "tag-reply mutation did not confirm the explicit marker" >&2
+    return 1
+  fi
   return 0
 }
 
@@ -3248,6 +3336,9 @@ while IFS= read -r thread; do
   # target population is backlog threads on long-merged sync PRs — where
   # the PR-HEAD anchor proxy is meaningless.
   #
+  # --thread ALSO bypasses it (#2196): the operator explicitly dispositions
+  # one finding, including cross-file fixes on a later head.
+  #
   # Codex r1 on PR #172 caught that the previous check
   # `if [ -n "$COMMIT_OID" ] && [ "$COMMIT_OID" != "$HEAD_OID" ]`
   # treated EMPTY commit_oid as "matches HEAD" → bot threads with no
@@ -3255,6 +3346,7 @@ while IFS= read -r thread; do
   # silently. The safe default is the opposite: missing oid is
   # treated as stale.
   if [ "$MODE" != "resolve-actioned" ] && [ "$MODE" != "resolve-verified-propagation" ] \
+     && [ "$MODE" != "resolve-targeted" ] \
      && { [ -z "$COMMIT_OID" ] || [ "$COMMIT_OID" = "null" ] || [ "$COMMIT_OID" != "$HEAD_OID" ]; }; then
     if [ -z "$COMMIT_OID" ] || [ "$COMMIT_OID" = "null" ]; then
       reason="no commit linkage"
@@ -3468,7 +3560,9 @@ while IFS= read -r thread; do
   if $DRY_RUN; then
     echo "  WOULD RESOLVE [$AUTHOR] $PATH_"
     echo "    $EXCERPT"
-    if [ "$MODE" = "resolve-verified-propagation" ]; then
+    if [ "$MODE" = "resolve-targeted" ]; then
+      echo "    → [mergepath-resolve: $TARGET_CLASS] $TARGET_RATIONALE"
+    elif [ "$MODE" = "resolve-verified-propagation" ]; then
       # thread_class is verified-propagation for a byte-verified thread,
       # or the truthful actioned class after the #616 upgrade above.
       echo "    → [mergepath-resolve: $thread_class] $VERIFIED_RATIONALE"
@@ -3489,7 +3583,10 @@ while IFS= read -r thread; do
   # behavior the script had before #305 — losing the tag is a soft
   # regression, not a correctness bug.
   if ! $NO_TAG_REPLY; then
-    if $RATIONALE_FLAG_USED; then
+    if [ "$MODE" = "resolve-targeted" ]; then
+      tag_class="$TARGET_CLASS"
+      tag_rationale="$TARGET_RATIONALE"
+    elif $RATIONALE_FLAG_USED; then
       tag_class="deferred-to-followup"
       tag_rationale="$RATIONALE_OVERRIDE"
       # #575 guard on the EXPLICIT-DEFERRAL override: --rationale is exactly
@@ -3633,8 +3730,13 @@ while IFS= read -r thread; do
       echo "  TAGGED [$AUTHOR] $PATH_ → [mergepath-resolve: $tag_class]"
       TAG_REPLY_POSTED=$((TAG_REPLY_POSTED + 1))
     else
-      echo "  WARN: tag-reply post failed for [$AUTHOR] $PATH_ (resolving anyway)" >&2
       TAG_REPLY_FAILED=$((TAG_REPLY_FAILED + 1))
+      if [ "$MODE" = "resolve-targeted" ]; then
+        echo "  FAILED: explicit disposition reply did not post; leaving thread open" >&2
+        FAILED_COUNT=$((FAILED_COUNT + 1))
+        continue
+      fi
+      echo "  WARN: tag-reply post failed for [$AUTHOR] $PATH_ (resolving anyway)" >&2
     fi
   else
     TAG_REPLY_SKIPPED=$((TAG_REPLY_SKIPPED + 1))

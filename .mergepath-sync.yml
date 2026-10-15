@@ -742,6 +742,8 @@ paths:
       - "scripts/lib/preflight-helpers.sh"
       - "scripts/lib/pr-body-contract.sh"
       - "scripts/workflow/resolve_base_policy.sh"
+      - "scripts/lib/codex-request-evidence.sh"
+      - "scripts/lib/feedback-policy-helpers.sh"
   - path: scripts/codex-p1-gate.sh
     type: canonical
     consumers: all
@@ -1191,6 +1193,7 @@ paths:
     consumers: all
     requires:
       - "scripts/workflow/owner-admin-override.py"
+      - "scripts/gh-as-author.sh"  # production writer-boundary regressions
 
   - path: tests/test_gh_as_author.sh
     type: canonical

@@ -145,6 +145,9 @@ case "\$1" in
         # Pull out the query body from argv (already logged above);
         # branch on substring matches.
         if grep -q "addPullRequestReviewThreadReply" "\$GH_ARGV_LOG.lastcall"; then
+          # A failed marker write must not resolve an explicit selection.
+          [ "\${GH_STUB_TAG_FAIL:-}" = tag-failure ] && exit 1
+          if [ "\${GH_STUB_TAG_FAIL:-}" = tag-null ]; then echo '{"data":{"addPullRequestReviewThreadReply":null},"errors":[{"message":"refused"}]}'; exit 0; fi
           # Tag-reply mutation — return a minimal success response.
           echo '{"data":{"addPullRequestReviewThreadReply":{"comment":{"id":"C_kwT1"}}}}'
         elif grep -q "resolveReviewThread" "\$GH_ARGV_LOG.lastcall"; then
@@ -2301,6 +2304,77 @@ if [ "$rc" -eq 3 ] && [ -z "$malformed_resolved" ] \
 else
   fail=$((fail + 1)); echo "  FAIL: #1010 malformed ledger erased a deferral (rc=$rc)" >&2; echo "$out" >&2
 fi
+
+
+# #2196: explicit single-thread disposition must survive conflicting file
+# proxies, leave its neighbor alone, and retain all write/readback guards.
+TARGET_THREADS=$(jq -c '
+  .data.repository.pullRequest.reviewThreads.nodes[0].commentsFirst.nodes[0].databaseId=1001
+  | .data.repository.pullRequest.reviewThreads.nodes[0].commentsLast.nodes[0].commit.oid="OLDHEAD"
+  | .data.repository.pullRequest.reviewThreads.nodes += [
+      (.data.repository.pullRequest.reviewThreads.nodes[0] | .id="PRT_OTHER"
+       | .commentsFirst.nodes[0].databaseId=2001)]
+  | .data.repository.pullRequest.reviewThreads.totalCount=2
+' <<<"$THREADS_T1")
+for scenario in deferred-touched fixed-cross-file rebuttal node-selector missing-issue invalid-issue invalid-commit unknown-selector ambiguous-selector human agent tag-failure tag-null readback-failure dry-run bulk-conflict list-conflict no-tag orphan already-resolved; do
+  fixture="$TARGET_THREADS"
+  args=(--thread 1001 --disposition fixed --commit abc1234567)
+  expected_tag=addressed-elsewhere
+  expected_rc=0
+  case "$scenario" in
+    deferred-touched) args=(--thread 1001 --disposition deferred-to-followup --issue 2196); expected_tag=deferred-to-followup ;;
+    fixed-cross-file) args+=(--rationale 'Fixed the shared caller in another file.') ;;
+    rebuttal) args=(--thread 1001 --disposition rebuttal --rationale 'The finding assumes an input this interface cannot accept.'); expected_tag=rebuttal-recorded ;;
+    node-selector) args=(--thread PRT_1 --disposition addressed-elsewhere) ;;
+    missing-issue) args=(--thread 1001 --disposition deferred-to-followup); expected_rc=1 ;;
+    invalid-issue) args=(--thread 1001 --disposition deferred-to-followup --issue abc); expected_rc=1 ;;
+    invalid-commit) args=(--thread 1001 --disposition fixed --commit bogus); expected_rc=1 ;;
+    unknown-selector) args=(--thread 9999 --disposition fixed); expected_rc=1 ;;
+    ambiguous-selector) fixture=$(jq -c '.data.repository.pullRequest.reviewThreads.nodes[1].commentsFirst.nodes[0].databaseId=1001' <<<"$fixture"); expected_rc=1 ;;
+    human|agent) login=real-human; [ "$scenario" = agent ] && login=nathanpayne-claude
+      fixture=$(jq -c --arg login "$login" '.data.repository.pullRequest.reviewThreads.nodes[0].commentsFirst.nodes[0].author.login=$login' <<<"$fixture"); expected_rc=3 ;;
+    tag-failure|tag-null|readback-failure) expected_rc=2 ;;
+    dry-run) expected_rc=3; args+=(--dry-run) ;;
+    bulk-conflict) args+=(--auto-resolve-bots); expected_rc=1 ;;
+    list-conflict) args+=(--list); expected_rc=1 ;;
+    no-tag) args+=(--no-tag-reply); expected_rc=1 ;;
+    orphan) args=(--disposition fixed); expected_rc=1 ;;
+    already-resolved) fixture=$(jq -c '.data.repository.pullRequest.reviewThreads.nodes[0].isResolved=true' <<<"$fixture") ;;
+  esac
+  GH_ARGV_LOG="$SCRATCH/target-$scenario.log"; : > "$GH_ARGV_LOG"
+  commit_map='{"abc1234567":["scripts/bar.sh"]}'
+  [ "$scenario" != deferred-touched ] || commit_map='{"abc1234567":["scripts/foo.sh"]}'
+  make_gh_stub "$SCRATCH/gh-real" "$fixture" "$FILES_T1" "$COMMITS_T1" "$commit_map"
+  make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+  set +e
+  out=$(GH_ARGV_LOG="$GH_ARGV_LOG" GH_STUB_TAG_FAIL="$scenario" \
+    GH_STUB_READBACK_UNRESOLVED="$([ "$scenario" = readback-failure ] && echo PRT_1)" \
+    PATH="$SCRATCH:$PATH" env -u GH_TOKEN -u OP_PREFLIGHT_REVIEWER_PAT \
+    bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 778 --repo test/repo "${args[@]}" 2>&1)
+  rc=$?
+  set -e
+  ok=true
+  [ "$rc" -eq "$expected_rc" ] || ok=false
+  if [ "$expected_rc" -eq 0 ] && [ "$scenario" != already-resolved ]; then
+    tag_before_resolve "$GH_ARGV_LOG" || ok=false
+    grep -q "FIELD: body=\[mergepath-resolve: $expected_tag\]" "$GH_ARGV_LOG" || ok=false
+    grep -q 'FIELD: id=PRT_1' "$GH_ARGV_LOG" || ok=false
+    if grep -q 'FIELD: id=PRT_OTHER' "$GH_ARGV_LOG"; then ok=false; fi
+    if [ "$scenario" = deferred-touched ]; then grep -q '#2196' "$GH_ARGV_LOG" || ok=false; fi
+    if [ "$scenario" = fixed-cross-file ]; then grep -q 'abc1234567' "$GH_ARGV_LOG" || ok=false; fi
+  elif [ "$scenario" != readback-failure ]; then
+    if grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then ok=false; fi
+    case "$scenario" in
+      tag-failure|tag-null) ;; # The marker attempt fails before resolution.
+      *) if grep -q 'addPullRequestReviewThreadReply' "$GH_ARGV_LOG"; then ok=false; fi ;;
+    esac
+  fi
+  if $ok; then
+    pass=$((pass+1)); echo "  PASS: #2196 targeted $scenario"
+  else
+    fail=$((fail+1)); echo "  FAIL: #2196 targeted $scenario (rc=$rc expected=$expected_rc)" >&2; echo "$out" >&2
+  fi
+done
 
 echo
 if [ "$fail" -eq 0 ]; then

@@ -95,8 +95,8 @@ case "$1" in
     case "$2" in
       view)
         case "$*" in
-          *'--json url,headRefOid,baseRefOid,labels'*)
-            echo '{"url":"https://github.com/test/current/pull/99999","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","baseRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","labels":[],"statusCheckRollup":[]}'
+          *'--json url,headRefOid,baseRefOid,baseRefName,state,labels'*)
+            echo '{"url":"https://github.com/test/current/pull/99999","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","baseRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","baseRefName":"main","state":"OPEN","labels":[]}'
             exit 0 ;;
           *'--json url,headRefOid'*)
             if [ "${STUB_MOVE_BEFORE_RESOLVE:-0}" = 1 ]; then
@@ -120,7 +120,12 @@ case "$1" in
   api)
     case "$2" in
       graphql)
-        if grep -q "statusCheckRollup" "$GH_ARGV_LOG.lastcall"; then
+        if grep -q 'object(expression: \$head)' "$GH_ARGV_LOG.lastcall"; then
+          # The owner helper's separate exact-head inventory is complete and
+          # empty in these authorization-boundary fixtures. Gate 2's own
+          # off-page-check cases continue to use their existing pages below.
+          echo '{"data":{"repository":{"pullRequest":{"url":"https://github.com/test/current/pull/99999","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","baseRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","baseRefName":"main","state":"OPEN"},"object":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","statusCheckRollup":{"contexts":{"totalCount":0,"checkRunCount":0,"statusContextCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}}'
+        elif grep -q "statusCheckRollup" "$GH_ARGV_LOG.lastcall"; then
           if grep -q "cursor=ROLLCURSOR2" "$GH_ARGV_LOG.lastcall"; then
             cat "$ROLLUP_PAGE2_FILE"
           else
