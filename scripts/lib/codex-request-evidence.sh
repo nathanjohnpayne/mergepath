@@ -70,7 +70,9 @@ crqe_count_triggers() { # comments-json author
 crqe_request_threshold() { # head-committer-date timeline-json freshness-seconds epoch-now
   local committed="$1" timeline="$2" seconds="$3" epoch="$4"
   local forced pushed source floor fresh threshold threshold_source
-  case "$seconds:$epoch" in *[!0-9:]*) return 1 ;; esac
+  [ -n "$committed" ] || return 1
+  case "$seconds" in ''|*[!0-9]*) return 1 ;; esac
+  case "$epoch" in ''|*[!0-9]*) return 1 ;; esac
   forced=$(printf '%s' "$timeline" | jq -er \
     '[.[] | select(.event == "head_ref_force_pushed") | .created_at] | max // ""') \
     || return 1
