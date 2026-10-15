@@ -1454,11 +1454,15 @@ class Lexer:
         )
         self.comment_offsets.update(body_offset + i for i in sub.comment_offsets)
         self.function_source_children.append((body_offset, sub))
+        self._absorb_ansi_context(sub, body_offset)
+
+    def _absorb_ansi_context(self, sub, source_offset):
+        """Import only already-proved ANSI literal spans and failure offsets."""
         self.unterminated_ansi_c_quotes.extend(
-            body_offset + i for i in sub.unterminated_ansi_c_quotes
+            source_offset + i for i in sub.unterminated_ansi_c_quotes
         )
         self.ansi_c_quote_spans.extend(
-            (body_offset + start, body_offset + end)
+            (source_offset + start, source_offset + end)
             for start, end in sub.ansi_c_quote_spans
         )
 
@@ -1729,21 +1733,33 @@ class Lexer:
             # ---- expansions and quotes ----
             if c == "$" and i + 1 < n:
                 nxt = text[i + 1]
+                if nxt == "[":
+                    # A raw legacy arithmetic bound withholds new ANSI proof
+                    # without changing this loop's existing token semantics.
+                    close = _heredoc_bracket_close(text, i + 1)
+                    cur_level()["ansi_arithmetic_until"] = max(
+                        cur_level().get("ansi_arithmetic_until", -1),
+                        n if close is None else close,
+                    )
                 if (nxt == "'" and '"' not in quotes
                         and not any(q in ("$((", "${") for q in quotes)
                         and not cur_level().get("ansi_arithmetic", False)
-                        and (not quotes or quotes[-1] in ("${w", "${?"))
-                        and not _ansi_c_index_prefix("".join(cur_level()["word"]))):
+                        and i > cur_level().get("ansi_arithmetic_until", -1)
+                        and (not quotes or quotes[-1] in ("${w", "${?"))):
                     end, closed = _ansi_c_quote_end(text, i)
-                    token = text[i:end]
-                    self.ansi_c_quote_spans.append((i, end))
-                    self.quoted_data_offsets.update(range(i + 2, end - 1 if closed else end))
                     if not closed:
+                        # Ordinary WORD syntax can fail even when an index
+                        # prefix withholds inert-DATA proof. Keep scanning
+                        # that excluded prefix through the prior loop below.
                         self.unterminated_ansi_c_quotes.append(i)
-                    cur_level()["word"].append(token)
-                    line += token.count("\n")
-                    i = end
-                    continue
+                    if not _ansi_c_index_prefix("".join(cur_level()["word"])):
+                        token = text[i:end]
+                        self.ansi_c_quote_spans.append((i, end))
+                        self.quoted_data_offsets.update(range(i + 2, end - 1 if closed else end))
+                        cur_level()["word"].append(token)
+                        line += token.count("\n")
+                        i = end
+                        continue
                 if nxt == "(" and i + 2 < n and text[i + 2] == "(":
                     quotes.append("$((")
                     cur_level()["word"].append("$((")
@@ -2103,12 +2119,9 @@ class Lexer:
                         inner, cur_level()["seg"], line, cur_ll, source_offset=i
                     )
                     # Children already contributed their errors. Inspect only
-                    # masked array DATA for lost ANSI failure offsets; import
-                    # no references, findings, functions or literal spans.
-                    data_lexer = Lexer(data)
-                    self.unterminated_ansi_c_quotes.extend(
-                        i + offset for offset in data_lexer.unterminated_ansi_c_quotes
-                    )
+                    # masked array DATA for proved ANSI spans/failure offsets;
+                    # import no references, findings or functions.
+                    self._absorb_ansi_context(Lexer(data), i)
                     cur_level()["word"].append(inner.replace("\n", " "))
                     line += inner.count("\n")
                     i = j
@@ -2156,6 +2169,9 @@ class Lexer:
                             "ansi_arithmetic": (
                                 cur_level().get("ansi_arithmetic", False)
                                 or text[i:i + 2] == "(("
+                            ),
+                            "ansi_arithmetic_until": cur_level().get(
+                                "ansi_arithmetic_until", -1
                             ),
                             "kind": "subshell",
                             "word": [],
@@ -14537,6 +14553,30 @@ def _ansi_c_quote_cases():
     ]:
         if Lexer(text).unterminated_ansi_c_quotes != expected:
             failures.append("ANSI-C array DATA failure offset: " + repr(text))
+    # Syntax proof is independent of narrower inert-index DATA proof.
+    for text, expected_errors in [
+        ("a[$'unterminated", [2]),
+        (": $(( $'unterminated", []),
+        (": ${v:$'unterminated", []),
+        (": $[ $'unterminated", []),
+    ]:
+        lx = Lexer(text)
+        if lx.unterminated_ansi_c_quotes != expected_errors or lx.ansi_c_quote_spans:
+            failures.append("ANSI-C ordinary syntax failure boundary: " + repr(text))
+    for prefix, suffix, literal_data in [
+        (": $[ 1 + ", " ]", False),
+        (": $[ 1 ] ", "", True),
+        (": $[ $( : ", " ) ]", True),
+    ]:
+        text = prefix + literal + suffix + "\n"
+        expected = [(len(prefix), len(prefix) + len(literal))] if literal_data else []
+        if Lexer(text).ansi_c_quote_spans != expected:
+            failures.append("ANSI-C raw arithmetic interval/reset: " + repr(text))
+    array_literal = "$'plain ${UNSET:?value}'"
+    for text in ["a=( " + array_literal + " )", "a=(\n  " + array_literal + " )"]:
+        start = text.index(array_literal)
+        if Lexer(text).ansi_c_quote_spans != [(start, start + len(array_literal))]:
+            failures.append("ANSI-C array DATA literal source span: " + repr(text))
     return failures
 
 
