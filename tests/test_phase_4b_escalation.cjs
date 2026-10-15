@@ -27,6 +27,17 @@ test('authorization, policy, publishers and credential-handling paths require a 
   }
 });
 
+test('agent guard configuration paths are exact case-sensitive authorization surfaces', () => {
+  for (const file of ['.codex/hooks.json', '.claude/settings.json']) {
+    assert.deepEqual(classify('+ordinary change', [file]), {
+      decision: 'human-review', tripwires: ['authorization-policy-publisher-or-credentials'],
+    }, file);
+  }
+  for (const file of ['.codex/hooks.json.example', '.codex/hooks.json/child', '.codex/hook.json', '.codex/Hooks.json', '.Codex/hooks.json', 'nested/.codex/hooks.json', '.claude/settings.local.json', '.claude/settings.json.example', '.claude/settings.json/child', '.claude/Settings.json', '.Claude/settings.json', 'nested/.claude/settings.json']) {
+    assert.deepEqual(classify('+ordinary change', [file]), { decision: 'model-review', tripwires: [] }, file);
+  }
+});
+
 test('captured Git objects determine both rename sides and complete wave scope', t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'p4b-escalation-test-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));

@@ -9,6 +9,8 @@ const { execFileSync } = require('node:child_process');
 
 const SENSITIVE_PATHS = [
   /^REVIEW_POLICY\.md$/,
+  /^\.codex\/hooks\.json$/,
+  /^\.claude\/settings\.json$/,
   /^\.github\/review-policy\.yml$/,
   /^\.github\/(?:workflows|actions)\//,
   /^scripts\/(?:phase-4b(?:\/|-)|gh-as-|identity-check\.sh$|op-preflight\.sh$)/,
