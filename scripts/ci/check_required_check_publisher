@@ -145,6 +145,7 @@ WORKFLOW_DIR="${REQUIRED_CHECK_PUBLISHER_WORKFLOW_DIR:-.github/workflows}"
 DEDUP_TEST="tests/test_required_check_publisher_dedup.sh"
 SUMMARY_HOLD_TEST="tests/test_required_check_publisher_summary_hold.sh"
 DUE_TEST="tests/test_required_check_publisher_due.sh"
+GENERATION_TEST="tests/test_required_check_generations.py"
 HUB_MARKER="scripts/sync-to-downstream.sh"
 
 FAILED=0
@@ -419,13 +420,12 @@ FIELD_FLAG_ARG = re.compile(
                                        # line continuation, as they do here
     r'(?P<arg>"(?:[^"\\\n]|\\.)*"|\'[^\'\n]*\'|\S+)'
 )
-# The number of head_sha binding sites in the canonical publisher: the
-# phase-1 hold POST, the phase-2 verdict POST, the sweep POST, the
-# gate() helper's POST, and the ambiguity red. The count is what makes the
-# allowlist reach a binding site nobody added yet: a new POST must arrive
-# as a conspicuous diff against this fence, where its head binding gets
-# read, rather than as one more line nobody had to look at.
-EXPECTED_HEAD_SHA_BINDINGS = 5
+# Only the early pre-checkout phase-1 hold binds head_sha inline now (#906).
+# Evaluating producers open and close through required-check-generation.sh;
+# tests/test_required_check_generations.py executes its immutable tuple binding
+# together with the actual workflow callers. This count retains the disclosed
+# text-level protection for the one early binding, not a claim about dataflow.
+EXPECTED_HEAD_SHA_BINDINGS = 1
 # Backstop only; the allowlist above is the fence. Case-insensitive
 # because a backstop evaded by pressing shift is not one.
 GITHUB_SHA_REF = re.compile(r"github\s*\.\s*sha", re.IGNORECASE)
@@ -1256,7 +1256,8 @@ NOMINATE_ENV = {
     "REPO": "${{ github.repository }}",
     "AUTOCLEAR_PRS": "${{ needs.publish.outputs.autoclear_prs }}",
 }
-PUBLISH_OUTPUTS = {"autoclear_prs": "${{ steps.publish.outputs.autoclear_prs }}"}
+PUBLISH_OUTPUTS = {"autoclear_prs": "${{ steps.publish.outputs.autoclear_prs }}",
+                   "evidence_escalations": "${{ steps.publish.outputs.evidence_escalations }}"}
 nominate = jobs.get(NOMINATE_JOB)
 if not isinstance(nominate, dict):
     bad("FAIL: [rcp auto-clear nomination] the publisher has no %r job mapping;" % NOMINATE_JOB,
@@ -1355,6 +1356,10 @@ if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ] \
   if [ ! -f "$DEDUP_TEST" ]; then
     echo "FAIL: $DEDUP_TEST is missing; first-attempt deduplication behavior is untested."
     echo "check_required_check_publisher: FAIL"
+    exit 1
+  fi
+  if ! python3 "$GENERATION_TEST"; then
+    echo "check_required_check_publisher: FAIL (owned generation and recovery runtime suite)"
     exit 1
   fi
   if ! bash "$DEDUP_TEST"; then

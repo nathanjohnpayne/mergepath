@@ -307,7 +307,74 @@ die() {
   local code=$1
   shift
   echo "[coderabbit-severity-gate] ERROR: $*" >&2
+  if [ "$code" -eq 2 ] && [ -n "${CR_FAILURE_FILE:-}" ]; then
+    case "$*" in
+      *'failed to fetch'*|*'failed to query'*|*'malformed reviewThreads'*|*'could not READ'*|*'failed to read'*)
+        printf '%s' "$*" >"$CR_FAILURE_FILE" ;;
+    esac
+  fi
   exit "$code"
+}
+
+# Narrow recovery runs only after an evidence failure, never after a readable
+# blocking verdict. The report file lets the owned publisher place machine
+# evidence ahead of quoted provider text in its check summary.
+cr_evidence_hold() {
+  local kind="$1" evidence="$2" revision budget report result probe retry_after=0 rc=0
+  if [ "${CR_FINDINGS_KNOWN_CLEAN:-0}" -ne 1 ]; then
+    [ "${BLOCKING_COUNT:-0}" -eq 0 ] && [ "${SUMMARY_BLOCKING_COUNT:-0}" -eq 0 ] || return 3
+  fi
+  if [ -n "${CR_EVIDENCE_FAILURE:-}" ]; then
+    kind=unreadable
+    evidence="$CR_EVIDENCE_FAILURE:$evidence"
+  fi
+  revision=$(git rev-parse HEAD) || return 3
+  budget=$(policy_block_field_parsed coderabbit max_wait_seconds "$CONFIG") || return 3
+  budget=${budget:-1245}
+  [[ "$budget" =~ ^[0-9]+$ ]] || return 3
+  if [ "$kind" = unreadable ]; then
+    probe=$("$SCRIPT_ROOT/coderabbit-wait.sh" --probe "$PR_NUMBER" "$REPO" 2>/dev/null) || true
+    if [ -n "$probe" ]; then
+      retry_after=$(jq -er '[.. | objects | .rate_limit_remaining_seconds? // empty] | if length == 0 then 0 else max end | select(type == "number" and . >= 0)' <<<"$probe") || return 3
+    fi
+  fi
+  # Stream provider bodies through a fixed stdlib hash, so a long review
+  # history never crosses the operating system's per-argument size limit.
+  evidence=$(printf '%s' "$evidence" | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())') || return 3
+  report=$(jq -nc --arg repo "$REPO" --argjson pr "$PR_NUMBER" --arg head "$HEAD_SHA" \
+    --arg revision "$revision" --arg kind "$kind" --arg evidence "$evidence" \
+    --argjson budget "$budget" --argjson retry "$retry_after" \
+    '{repo:$repo,pr:$pr,head:$head,revision:$revision,kind:$kind,evidence:$evidence,max_wait_seconds:$budget,retry_after:$retry}') || return 3
+  result=$(printf '%s' "$report" | python3 "$SCRIPT_ROOT/workflow/coderabbit-evidence-recovery.py") || rc=$?
+  if [ -n "$result" ] && jq -e 'type == "object" and (.state | IN("pending","escalate","recovery"))' <<<"$result" >/dev/null; then
+    if [ -n "${CR_EVIDENCE_REPORT:-}" ]; then
+      printf '%s\n' "$result" >"$CR_EVIDENCE_REPORT" || return 3
+    fi
+    printf 'CodeRabbit evidence hold: %s\n' "$result"
+  fi
+  if [ "$rc" -eq 0 ]; then
+    printf 'CodeRabbit gate RECOVERY (not a clean provider review): %s\n' "$(jq -r '.decision + " — " + .reason' <<<"$result")"
+    return 0
+  fi
+  return 3
+}
+
+cr_fingerprint_hold() {
+  [ -n "${CR_EVIDENCE_FAILURE:-}" ] || return 0
+  if cr_evidence_hold unreadable "$CR_EVIDENCE_FAILURE"; then exit 0; fi
+  exit 3
+}
+
+# Explicit evidence that the evaluator reached a readable provider verdict.
+# Publishers retain this header only after their final binding fence succeeds.
+cr_readable_report() {
+  [ -n "${CR_EVIDENCE_REPORT:-}" ] || return 0
+  local revision
+  revision=$(git rev-parse HEAD) || return 2
+  [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || return 2
+  jq -nc --arg repo "$REPO" --argjson pr "$PR_NUMBER" --arg head "$HEAD_SHA" \
+    --arg revision "$revision" \
+    '{repo:$repo,pr:$pr,head:$head,revision:$revision,state:"readable"}' >"$CR_EVIDENCE_REPORT" || return 2
 }
 
 # --- nitpick-under-chill no-op warning (#577) -------------------------------
@@ -372,6 +439,20 @@ if [ -z "$HEAD_SHA" ] || [ "$HEAD_SHA" = "null" ]; then
   die 2 "could not determine HEAD sha for PR #$PR_NUMBER"
 fi
 log "HEAD = $HEAD_SHA    bot_login = $BOT_LOGIN"
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CR_FAILURE_FILE=$(mktemp "${TMPDIR:-/tmp}/coderabbit-evidence-failure.XXXXXX" 2>/dev/null) || CR_FAILURE_FILE=""
+cr_evidence_exit() {
+  local original="$?" recovered=0
+  trap - EXIT
+  if [ "$BASH_SUBSHELL" -eq 0 ] && [ "$original" -eq 2 ] && [ -s "$CR_FAILURE_FILE" ]; then
+    cr_evidence_hold unreadable "$(cat "$CR_FAILURE_FILE")" && recovered=1
+  fi
+  if [ "$BASH_SUBSHELL" -eq 0 ] && [ -n "$CR_FAILURE_FILE" ]; then rm -f "$CR_FAILURE_FILE"; fi
+  if [ "$recovered" -eq 1 ]; then exit 0; fi
+  exit "$original"
+}
+trap cr_evidence_exit EXIT
+
 
 # --- fetch CodeRabbit blocking-tier inline comments -------------------------
 
@@ -1340,6 +1421,7 @@ if [ "$SUMMARY_CANDIDATE_COUNT" -eq 0 ]; then
     # ordered-publisher work this gate's two publishers need.
     echo "CodeRabbit current-HEAD review is awaiting its PR-level summary; holding this gate run. (head-pinned review run object(s): $HEAD_REVIEW_RUN_IDS)" >&2
     echo "CodeRabbit blocking-tier unresolved: pending (summary publication in flight)"
+    if cr_evidence_hold unrecognized "$HEAD_REVIEW_RUNS_JSON"; then exit 0; fi
     exit 3
   fi
   log "no CodeRabbit PR-level summary comment found — no summary findings in scope"
@@ -1554,11 +1636,14 @@ hold_on_unrecognised_newer_run() {
   [ -n "$HEAD_UNRECOGNISED_NEWER_IDS" ] || return 0
   echo "CodeRabbit published a later review run on $HEAD_SHA whose body matches no summary acceptor, so the clean verdict in hand is from an earlier publication; holding this gate run. (unrecognised head-pinned review run object(s): $HEAD_UNRECOGNISED_NEWER_IDS)" >&2
   echo "CodeRabbit blocking-tier unresolved: pending (summary publication in flight)"
+  if cr_evidence_hold unrecognized "$HEAD_REVIEW_RUNS_JSON"; then exit 0; fi
   exit 3
 }
 
 if [ "$BLOCKING_COUNT" -eq 0 ] && [ "$SUMMARY_BLOCKING_COUNT" -eq 0 ]; then
   hold_on_unrecognised_newer_run
+  cr_fingerprint_hold
+  cr_readable_report || exit 2
   echo "CodeRabbit blocking-tier unresolved: 0"
   exit 0
 fi
@@ -1617,6 +1702,7 @@ report_verdict() {
   fi
 
   if [ "$count" -gt 0 ]; then
+    cr_readable_report || exit 2
     echo "CodeRabbit blocking-tier unresolved: $count"
     exit 1
   fi
@@ -1624,7 +1710,10 @@ report_verdict() {
   # subject to the same unread-newer-run hold as the summary-only exit above.
   # The verdict line is printed inside each branch rather than before them
   # because the hold prints its own, and a run must emit exactly one.
+  CR_FINDINGS_KNOWN_CLEAN=1
   hold_on_unrecognised_newer_run
+  cr_fingerprint_hold
+  cr_readable_report || exit 2
   echo "CodeRabbit blocking-tier unresolved: $count"
   exit 0
 }

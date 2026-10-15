@@ -332,6 +332,9 @@
       "tests/test_required_check_publisher_dedup.sh",
       "tests/test_required_check_publisher_summary_hold.sh",
       "tests/test_required_check_publisher_due.sh",
+      "tests/test_required_check_generations.py",
+      "scripts/workflow/required-check-generation.sh",
+      "scripts/workflow/coderabbit-evidence-recovery.py",
       "tests/test_consumer_residue_safety.sh",
       "tests/test_merge_clearance_gate.sh"
     ],
