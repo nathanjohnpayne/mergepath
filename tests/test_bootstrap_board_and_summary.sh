@@ -280,42 +280,42 @@ fi
   || fail "create-issues.sh not executable"
 
 # Summary block contains all required sections on stdout.
-echo "$out" | grep -q "==> Bootstrap complete: nathanjohnpayne/newboard-repo" \
+grep -q "==> Bootstrap complete: nathanjohnpayne/newboard-repo" <<<"$out" \
   && pass "summary block emits 'Bootstrap complete' header on stdout" \
   || fail "summary missing header on stdout"
-echo "$out" | grep -q "^REPO: " \
+grep -q "^REPO: " <<<"$out" \
   && pass "summary has REPO line" || fail "summary missing REPO line"
-echo "$out" | grep -q "^PROJECT: " \
+grep -q "^PROJECT: " <<<"$out" \
   && pass "summary has PROJECT line" || fail "summary missing PROJECT line"
-echo "$out" | grep -q "^LOCAL DIR: " \
+grep -q "^LOCAL DIR: " <<<"$out" \
   && pass "summary has LOCAL DIR line" || fail "summary missing LOCAL DIR"
-echo "$out" | grep -q "^DONE:" \
+grep -q "^DONE:" <<<"$out" \
   && pass "summary has DONE section" || fail "summary missing DONE"
-echo "$out" | grep -q "^SKIPPED:" \
+grep -q "^SKIPPED:" <<<"$out" \
   && pass "summary has SKIPPED section" || fail "summary missing SKIPPED"
-echo "$out" | grep -q "^WARNINGS:" \
+grep -q "^WARNINGS:" <<<"$out" \
   && pass "summary has WARNINGS section" || fail "summary missing WARNINGS"
-echo "$out" | grep -q "^CROSS-REPO LOOP UPDATE:" \
+grep -q "^CROSS-REPO LOOP UPDATE:" <<<"$out" \
   && pass "summary has CROSS-REPO LOOP UPDATE section" \
   || fail "summary missing CROSS-REPO LOOP UPDATE"
-echo "$out" | grep -q "^NEXT STEPS" \
+grep -q "^NEXT STEPS" <<<"$out" \
   && pass "summary has NEXT STEPS section" || fail "summary missing NEXT STEPS"
 # A created board needs its built-in workflow targets set by hand (the
 # Projects API cannot set them), so NEXT STEPS names the step, numbered
 # in sequence before the spend-cap and Sprint 0 steps.
-echo "$out" | grep -qE "^  5\. Set board #[0-9]+'s built-in workflow targets" \
-  && echo "$out" | grep -qE "^  6\. Set provider-level spend caps" \
-  && echo "$out" | grep -qE "^  7\. Drive Sprint 0 PR #1" \
+grep -qE "^  5\. Set board #[0-9]+'s built-in workflow targets" <<<"$out" \
+  && grep -qE "^  6\. Set provider-level spend caps" <<<"$out" \
+  && grep -qE "^  7\. Drive Sprint 0 PR #1" <<<"$out" \
   && pass "NEXT STEPS includes the board workflow-target step, numbered in sequence" \
   || fail "NEXT STEPS missing or misnumbering the workflow-target step; got: $(echo "$out" | sed -n '/^NEXT STEPS/,/^DOC:/p')"
 # Regression guard for the gaycruisebingo gap (mergepath#741): the
 # summary must steer the operator to enroll the repo as a
 # .mergepath-sync.yml consumer, since the bootstrap does the one-time
 # rsync + loop-doc registration but NOT ongoing sync enrollment.
-echo "$out" | grep -q ".mergepath-sync.yml consumer" \
+grep -q ".mergepath-sync.yml consumer" <<<"$out" \
   && pass "summary reminds operator to enroll as a sync consumer (#741)" \
   || fail "summary missing .mergepath-sync.yml enrollment reminder (#741)"
-echo "$out" | grep -q "docs/agents/bootstrap-runbook.md" \
+grep -q "docs/agents/bootstrap-runbook.md" <<<"$out" \
   && pass "summary cross-links to docs/agents/bootstrap-runbook.md" \
   || fail "summary missing runbook cross-link"
 
@@ -330,7 +330,7 @@ grep -q "^DONE:" "$TARGET1/.bootstrap-log" \
   || fail ".bootstrap-log missing key sections"
 
 # PROJECT URL in summary points at project #99 (from the shim's JSON).
-echo "$out" | grep -q "https://github.com/users/nathanjohnpayne/projects/99" \
+grep -q "https://github.com/users/nathanjohnpayne/projects/99" <<<"$out" \
   && pass "summary PROJECT URL uses the parsed number (99)" \
   || fail "PROJECT URL did not reflect parsed number; got: $(echo "$out" | grep PROJECT)"
 
@@ -367,11 +367,11 @@ if grep -q "^gh project edit" "$SHIM_LOG"; then
 else
   pass "--project 7 skips gh project edit --readme"
 fi
-echo "$out2" | grep -q "reusing existing Project v2 #7" \
+grep -q "reusing existing Project v2 #7" <<<"$out2" \
   && pass "--project 7 logs the reuse decision" \
   || fail "--project 7 should log 'reusing existing Project v2 #7'; got: $out2"
 # PROJECT URL in summary points at #7.
-echo "$out2" | grep -q "https://github.com/users/nathanjohnpayne/projects/7" \
+grep -q "https://github.com/users/nathanjohnpayne/projects/7" <<<"$out2" \
   && pass "summary PROJECT URL uses the reused number (7)" \
   || fail "PROJECT URL did not reflect reused number; got: $(echo "$out2" | grep PROJECT)"
 
@@ -402,18 +402,18 @@ fi
   && pass "--skip-board still writes specs scaffold" \
   || fail "--skip-board should still write specs scaffold"
 # Summary still emitted; PROJECT line says skipped.
-echo "$out3" | grep -q "==> Bootstrap complete: " \
+grep -q "==> Bootstrap complete: " <<<"$out3" \
   && pass "--skip-board still emits summary" \
   || fail "--skip-board should still emit summary"
-echo "$out3" | grep -q "PROJECT: *(skipped: --skip-board)" \
+grep -q "PROJECT: *(skipped: --skip-board)" <<<"$out3" \
   && pass "--skip-board summary shows project skipped with reason" \
   || fail "summary PROJECT line missing skip reason; got: $(echo "$out3" | grep PROJECT)"
 # No board, so no board workflows to set: the step is omitted and the
 # remaining steps renumber without a gap.
-if echo "$out3" | grep -q "built-in workflow targets"; then
+if grep -q "built-in workflow targets" <<<"$out3"; then
   fail "--skip-board summary still lists the board workflow-target step"
-elif echo "$out3" | grep -qE "^  5\. Set provider-level spend caps" \
-  && echo "$out3" | grep -qE "^  6\. Drive Sprint 0 PR #1"; then
+elif grep -qE "^  5\. Set provider-level spend caps" <<<"$out3" \
+  && grep -qE "^  6\. Drive Sprint 0 PR #1" <<<"$out3"; then
   pass "--skip-board summary omits the workflow-target step and renumbers"
 else
   fail "--skip-board NEXT STEPS misnumbered; got: $(echo "$out3" | sed -n '/^NEXT STEPS/,/^DOC:/p')"
@@ -440,11 +440,11 @@ if [ -s "$SHIM_LOG" ]; then
 else
   pass "dry-run did not invoke gh (bootstrap::run honors --dry-run)"
 fi
-echo "$out4" | grep -q "DRY-RUN" \
+grep -q "DRY-RUN" <<<"$out4" \
   && pass "dry-run output includes [DRY-RUN] tags" \
   || fail "dry-run missing [DRY-RUN] markers"
 # Summary still printed (with the placeholder <N> for the project number).
-echo "$out4" | grep -q "==> Bootstrap complete:" \
+grep -q "==> Bootstrap complete:" <<<"$out4" \
   && pass "dry-run still emits summary block" \
   || fail "dry-run should still emit summary"
 
@@ -498,7 +498,7 @@ if grep -q "^gh project" "$SHIM_LOG"; then
 else
   pass "BOOTSTRAP_INPUT_PROJECT=skip emits zero gh project invocations"
 fi
-echo "$out5" | grep -q "project board skipped (project=skip)" \
+grep -q "project board skipped (project=skip)" <<<"$out5" \
   && pass "stage logs project=skip reason" \
   || fail "stage should log 'project=skip' reason; got: $out5"
 
@@ -542,10 +542,10 @@ set -e
   || fail "resume-from-state-seed failed; rc=$ec6; out: $out6"
 
 # Summary's DONE block must include all four stages now.
-echo "$out6" | grep -q "Template mirror" \
+grep -q "Template mirror" <<<"$out6" \
   && pass "summary DONE lists template-mirror (from seeded state)" \
   || fail "summary should list template-mirror; got: $out6"
-echo "$out6" | grep -q "GitHub repo created" \
+grep -q "GitHub repo created" <<<"$out6" \
   && pass "summary DONE lists github-infra (from seeded state)" \
   || fail "summary should list github-infra; got: $out6"
 
@@ -584,7 +584,7 @@ set -e
   && pass "stage-only invocation (B/C in state, D skipped) completes" \
   || fail "stage-only invocation failed; rc=$ec7; out: $out7"
 # firebase NOT in state file → SKIPPED section.
-echo "$out7" | grep -q "Firebase + CodeRabbit + Codex posture (not in state file)" \
+grep -q "Firebase + CodeRabbit + Codex posture (not in state file)" <<<"$out7" \
   && pass "summary SKIPPED reflects firebase NOT in state file" \
   || fail "summary should flag firebase-and-codereview as skipped (not in state); got: $out7"
 
@@ -631,16 +631,16 @@ set -e
 [ "$ec8" -eq 0 ] \
   && pass "summary renders a mixed outstanding/resolved warnings sidecar (rc=0)" \
   || fail "mixed-sidecar summary failed; rc=$ec8; out: $out8"
-echo "$out8" | grep -qF "  !! - something else is still broken" \
+grep -qF "  !! - something else is still broken" <<<"$out8" \
   && pass "keyed outstanding failure stays in RECORDED FAILURES" \
   || fail "keyed outstanding failure missing from RECORDED FAILURES; out: $out8"
-echo "$out8" | grep -qF "  !! - an unkeyed recorded failure" \
+grep -qF "  !! - an unkeyed recorded failure" <<<"$out8" \
   && pass "unkeyed record stays in RECORDED FAILURES (fail-closed default)" \
   || fail "unkeyed record missing from RECORDED FAILURES; out: $out8"
-echo "$out8" | grep -qF "  ok - token provisioning failed earlier and was fixed on a later attempt" \
+grep -qF "  ok - token provisioning failed earlier and was fixed on a later attempt" <<<"$out8" \
   && pass "resolved record renders under RESOLVED with the marker stripped" \
   || fail "resolved record not rendered under RESOLVED; out: $out8"
-echo "$out8" | grep -qF "  !! - RESOLVED:" \
+grep -qF "  !! - RESOLVED:" <<<"$out8" \
   && fail "resolved record leaked into RECORDED FAILURES; out: $out8" \
   || pass "resolved record does not appear as an outstanding failure"
 
@@ -668,10 +668,10 @@ set -e
 [ "$ec9" -eq 0 ] \
   && pass "summary renders an all-resolved warnings sidecar (rc=0)" \
   || fail "all-resolved summary failed; rc=$ec9; out: $out9"
-echo "$out9" | grep -q "RECORDED FAILURES" \
+grep -q "RECORDED FAILURES" <<<"$out9" \
   && fail "all-resolved sidecar still printed a RECORDED FAILURES header; out: $out9" \
   || pass "all-resolved sidecar prints no RECORDED FAILURES header"
-echo "$out9" | grep -qF "  ok - fixed on the retry" \
+grep -qF "  ok - fixed on the retry" <<<"$out9" \
   && pass "all-resolved sidecar still surfaces the record under RESOLVED" \
   || fail "all-resolved sidecar dropped the record; out: $out9"
 
@@ -715,13 +715,13 @@ set -e
 [ "$ec10" -eq 0 ] \
   && pass "summary renders an unkeyed marker-lookalike sidecar (rc=0)" \
   || fail "unkeyed-lookalike summary failed; rc=$ec10; out: $out10"
-echo "$out10" | grep -qF "  !! - RESOLVED: an unkeyed record that merely starts with the marker text" \
+grep -qF "  !! - RESOLVED: an unkeyed record that merely starts with the marker text" <<<"$out10" \
   && pass "unkeyed record starting with the marker stays in RECORDED FAILURES (#781 item 3)" \
   || fail "unkeyed marker-lookalike was misclassified as resolved; out: $out10"
-echo "$out10" | grep -qF "  ok - an unkeyed record that merely starts with the marker text" \
+grep -qF "  ok - an unkeyed record that merely starts with the marker text" <<<"$out10" \
   && fail "unkeyed marker-lookalike rendered under RESOLVED; out: $out10" \
   || pass "unkeyed marker-lookalike does not appear under RESOLVED"
-echo "$out10" | grep -qF "  ok - a genuinely keyed resolution record" \
+grep -qF "  ok - a genuinely keyed resolution record" <<<"$out10" \
   && pass "a keyed resolution record in the same sidecar is still downgraded" \
   || fail "narrowing disabled the RESOLVED block for keyed records; out: $out10"
 
