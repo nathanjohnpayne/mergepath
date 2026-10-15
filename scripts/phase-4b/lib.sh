@@ -1960,22 +1960,30 @@ p4b_same_head_barrier() {
     initial_cls_cx="$cls_cx"
     case "$initial_cls_cx" in
       reported)
-        live_report_head=$(gh_api_scalar --shape sha "Codex reported-signal live PR head" \
-          "repos/$repo/pulls/$pr" --jq '.head.sha') || live_report_head=""
-        if [ -z "$live_report_head" ]; then
+        if ! command -v gh_api_scalar >/dev/null 2>&1; then
           cls_cx="escalate"
-          cx_evidence="head-read-failed"
+          cx_evidence="scalar-reader-unavailable"
           budget_unsafe=true
-          cx_budget_json='{"state":"unreadable","reason":"reported-signal-head-read-failed"}'
-          why="Codex reported, but the live PR head could not be verified; refusing authority for the reviewed head"
-        elif [ "$live_report_head" != "$head" ]; then
-          cls_cx="escalate"
-          cx_evidence="drift"
-          budget_unsafe=true
-          cx_budget_json="$(jq -nc --arg h "$head" --arg l "$live_report_head" '{state:"drift",reason:"head-moved",reviewed_head:$h,live_head:$l}')"
-          why="PR head moved after the Codex report check (reviewing $head, live $live_report_head) — rerun on the new head"
+          cx_budget_json='{"state":"unreadable","reason":"scalar-reader-unavailable"}'
+          why="Codex reported, but the scalar reader is unavailable; refusing authority for the reviewed head"
         else
-          cx_evidence="signal"
+          live_report_head=$(gh_api_scalar --shape sha "Codex reported-signal live PR head" \
+            "repos/$repo/pulls/$pr" --jq '.head.sha') || live_report_head=""
+          if [ -z "$live_report_head" ]; then
+            cls_cx="escalate"
+            cx_evidence="head-read-failed"
+            budget_unsafe=true
+            cx_budget_json='{"state":"unreadable","reason":"reported-signal-head-read-failed"}'
+            why="Codex reported, but the live PR head could not be verified; refusing authority for the reviewed head"
+          elif [ "$live_report_head" != "$head" ]; then
+            cls_cx="escalate"
+            cx_evidence="drift"
+            budget_unsafe=true
+            cx_budget_json="$(jq -nc --arg h "$head" --arg l "$live_report_head" '{state:"drift",reason:"head-moved",reviewed_head:$h,live_head:$l}')"
+            why="PR head moved after the Codex report check (reviewing $head, live $live_report_head) — rerun on the new head"
+          else
+            cx_evidence="signal"
+          fi
         fi
         ;;
       *)
