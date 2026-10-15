@@ -541,7 +541,16 @@ done
 [ ! -f "$PROBE_DIR/ran.check_graphed" ] && ok "unselected graph wrapper not run by default" || bad "unselected graph wrapper ran"
 check "concurrency cap 1 holds" "$(sort -n "$PROBE_DIR/concurrency" | tail -n 1)" "1"
 base_nice=$(ps -o nice= -p $$ | tr -d ' ')
-want_nice=$((base_nice + 10)); [ "$want_nice" -le 20 ] || want_nice=20
+# Discover the kernel's ceiling independently of the runner. Only this
+# disposable Python child changes priority: Linux clamps 20 to 19, while
+# macOS permits 20. The suite may itself inherit nice 10 from the hook.
+nice_ceiling=$(python3 -I -S - <<'PY'
+import os
+os.setpriority(os.PRIO_PROCESS, 0, 20)
+print(os.getpriority(os.PRIO_PROCESS, 0))
+PY
+)
+want_nice=$((base_nice + 10)); [ "$want_nice" -le "$nice_ceiling" ] || want_nice=$nice_ceiling
 check "checks run 10 nice levels below the push" "$(cat "$PROBE_DIR/nice.check_ok")" "$want_nice"
 
 # MERGEPATH_PREPUSH_LIVE=all runs CI's whole fast lane.
