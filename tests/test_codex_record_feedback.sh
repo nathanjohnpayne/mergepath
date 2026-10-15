@@ -106,6 +106,9 @@ make_real_wrapper_case() {
   chmod +x "$dir/scripts/codex-record-feedback.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
   cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"     # #1008, hard-sourced
+  mkdir -p "$dir/scripts/workflow"
+  cp "$ROOT/scripts/lib/gh-comment-trigger-guard.sh" "$dir/scripts/lib/gh-comment-trigger-guard.sh"
+  cp "$ROOT/scripts/workflow/gh-comment-trigger-guard.py" "$dir/scripts/workflow/gh-comment-trigger-guard.py"
   cp "$ROOT/scripts/gh-as-reviewer.sh" "$dir/scripts/gh-as-reviewer.sh"
   chmod +x "$dir/scripts/gh-as-reviewer.sh"
   cp "$ROOT/scripts/lib/gh-rest-transport.sh" "$dir/scripts/lib/gh-rest-transport.sh"  # gh-as-reviewer.sh sources it (#1057 A)

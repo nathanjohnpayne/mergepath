@@ -122,6 +122,16 @@ if [ "$AUTHOR_PAYLOAD_KIND" = "gh" ]; then
   gh_payload_refuse_credential_overrides gh-as-author "$@" || exit 1
 fi
 
+# shellcheck source=lib/gh-comment-trigger-guard.sh
+. "$ROOT/scripts/lib/gh-comment-trigger-guard.sh"
+if [ "$AUTHOR_PAYLOAD_KIND" = gh ]; then
+  # shellcheck disable=SC2034 # consumed by the sourced comment guard
+  GH_COMMENT_GUARD_ROLE=author
+  trap 'gh_comment_guard_cleanup' EXIT
+  gh_comment_guard_prepare "$@" || exit 1
+  set -- "${GH_COMMENT_GUARD_ARGS[@]}"
+fi
+
 set +e
 gh_resolve_token_for_identity "$AUTHOR" "OP_PREFLIGHT_AUTHOR_PAT" "gh-as-author"
 RESOLVE_RC=$?
@@ -130,6 +140,9 @@ if [ "$RESOLVE_RC" -ne 0 ]; then
   exit "$RESOLVE_RC"
 fi
 TOKEN="$GH_RESOLVED_TOKEN"
+if [ "$AUTHOR_PAYLOAD_KIND" = gh ]; then
+  gh_comment_guard_authorize || exit 1
+fi
 
 if [ "$AUTHOR_PAYLOAD_KIND" = "git-push" ]; then
   shift
@@ -261,8 +274,9 @@ fi
 # validated PR-create body arrives as --body. Locally the wrapped command
 # runs through gh, as before. See scripts/lib/gh-rest-transport.sh.
 TRANSPORT="$(gh_transport_select)" || exit 1
+gh_comment_guard_check_transport "$TRANSPORT" || exit 1
 if [ "$TRANSPORT" = "rest" ]; then
-  trap 'gh_rest_cleanup' EXIT
+  trap 'gh_comment_guard_cleanup; gh_rest_cleanup' EXIT
   # shellcheck disable=SC2034  # read by gh_rest_run (scripts/lib/gh-rest-transport.sh)
   GH_REST_TRACE_MARKER="$TRACE_MARKER"
   set +e
@@ -314,7 +328,7 @@ run_with_author_token() {
 
 if [ "$IS_PR_CREATE" -eq 1 ]; then
   TMP_OUT=$(mktemp)
-  trap 'rm -f "$TMP_OUT"' EXIT
+  trap 'gh_comment_guard_cleanup; rm -f "$TMP_OUT"' EXIT
   set +e
   run_with_author_token "$@" | tee "$TMP_OUT"
   WRAPPED_RC=${PIPESTATUS[0]}
