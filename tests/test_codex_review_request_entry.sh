@@ -504,6 +504,32 @@ test_enabled_false_never_triggers() {
   fi
 }
 
+# --- a malformed moving-head age floor fails only the write path (#2253) ----
+# codex.request_min_head_age_seconds is read by the moving-head guard (#2166),
+# which runs only before a new trigger write. A malformed value must not turn
+# the disabled or skip paths, which post nothing, from exit 5 into exit 3; on
+# the write path it is still a configuration error, refused before any post.
+test_malformed_head_age_fails_only_the_write_path() {
+  local dir rc count before=$FAIL
+  dir=$(make_case "bad-age-skip" "  enabled: true"$'\n'"  request_min_head_age_seconds: soon")
+  rc=$(run_case "$dir" false)
+  [ "$rc" = "5" ] && [ "$(trigger_count "$dir")" = "0" ] \
+    || fail "bad age floor, skip path: exit $rc, expected 5 with no trigger; stderr=$(cat "$dir/err.log")"
+  dir=$(make_case "bad-age-disabled" "  enabled: false"$'\n'"  request_min_head_age_seconds: soon")
+  rc=$(run_case "$dir" true)
+  [ "$rc" = "5" ] && [ "$(trigger_count "$dir")" = "0" ] \
+    || fail "bad age floor, disabled path: exit $rc, expected 5 with no trigger; stderr=$(cat "$dir/err.log")"
+  dir=$(make_case "bad-age-gated" "  enabled: true"$'\n'"  request_min_head_age_seconds: soon")
+  rc=$(run_case "$dir" true)
+  count=$(trigger_count "$dir")
+  if [ "$rc" != "3" ] || [ "$count" != "0" ]; then
+    fail "bad age floor, gated write path: exit $rc with $count trigger(s), expected 3 and none; stderr=$(cat "$dir/err.log")"
+  elif ! grep -q "codex.request_min_head_age_seconds must be a non-negative integer; got 'soon'" "$dir/err.log"; then
+    fail "bad age floor, gated write path: the refusal must name the knob; stderr=$(cat "$dir/err.log")"
+  fi
+  [ "$FAIL" -ne "$before" ] || pass "a malformed request_min_head_age_seconds keeps the skip and disabled paths at exit 5 and refuses only the write path with exit 3 (#2253)"
+}
+
 # --- timeout record is fenced against a push landing before the write -------
 test_timeout_head_drift_fails_closed_without_marker() {
   local dir rc count terminals moved
@@ -570,6 +596,7 @@ test_gated_requests_in_every_case
 test_request_by_default_false_skips_under_threshold
 test_request_by_default_false_triggers_when_gated
 test_enabled_false_never_triggers
+test_malformed_head_age_fails_only_the_write_path
 test_timeout_head_drift_fails_closed_without_marker
 test_new_trigger_replaces_superseded_timeout_marker
 

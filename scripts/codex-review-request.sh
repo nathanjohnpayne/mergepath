@@ -837,12 +837,12 @@ fi
 # Both are read from the checkout's policy: this guard protects the agent's
 # own cycle time, not a merge decision, so a candidate-controlled value costs
 # the candidate only wasted rounds.
+#
+# The value is validated inside the guard, not here (#2253): a malformed knob
+# must not turn the disabled (codex.enabled: false) or skip
+# (request_by_default) paths, which post nothing, from exit 5 into exit 3.
 REQUEST_MIN_HEAD_AGE_SECONDS=$(codex_field request_min_head_age_seconds)
 REQUEST_MIN_HEAD_AGE_SECONDS=${REQUEST_MIN_HEAD_AGE_SECONDS:-300}
-if ! [[ "$REQUEST_MIN_HEAD_AGE_SECONDS" =~ ^[0-9]+$ ]]; then
-  echo "ERROR: codex.request_min_head_age_seconds must be a non-negative integer; got '$REQUEST_MIN_HEAD_AGE_SECONDS'" >&2
-  exit 3
-fi
 # REQUEST_SIGNAL_MODE: workflow (key absent), check (key set to a name) or
 # off (key present and empty). codex_field returns empty for both absent and
 # empty, so the presence test is made separately.
@@ -1820,6 +1820,13 @@ MOVING_HEAD_CHECK_STATUS=""
 MOVING_HEAD_ANCHOR=""
 refuse_moving_head_unless_allowed() {
   local reasons="" pushed_epoch now_epoch age runs status allow=false
+  # A malformed knob is a configuration error on the write path: refuse
+  # before the guard's own reads and before any write (#2253; it used to be
+  # checked at load time, which also failed the no-write paths).
+  if ! [[ "$REQUEST_MIN_HEAD_AGE_SECONDS" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: codex.request_min_head_age_seconds must be a non-negative integer; got '$REQUEST_MIN_HEAD_AGE_SECONDS'" >&2
+    exit 3
+  fi
   case "${MERGEPATH_CODEX_AUTO_TRIGGER:-}" in
     true|TRUE|True|1|yes|YES) allow=true ;;
   esac
@@ -2026,9 +2033,6 @@ post_codex_trigger() {
   # idempotently-reused paths spend no request attempt and retain their
   # established behavior even if a later budget edit is malformed.
   local max_review_rounds request_comments request_count
-  # The moving-head guard (#2166) runs before any budget read: a refused
-  # request spends nothing and must not be counted against anything.
-  [ "$TRIGGER_POSTED" = "true" ] || refuse_moving_head_unless_allowed
   governing_request_attempt_cap
   max_review_rounds="$GOVERNING_REQUEST_ATTEMPT_CAP"
   request_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "Codex request-attempt evidence") \
@@ -2040,6 +2044,15 @@ post_codex_trigger() {
   # to be reported (check_blocking_budget), never on the reuse branch, which
   # posts nothing and only polls the existing final request (#1560 canary).
   if [ "$request_count" -lt "$max_review_rounds" ] && [ "$TRIGGER_POSTED" != "true" ]; then
+    # The moving-head guard (#2166) runs only here, where a NEW trigger is
+    # about to be written, and before any budget it could be counted against.
+    # It runs after the request-cap branch below the ceiling only (#2253): at
+    # the ceiling every path either polls the existing final request without
+    # writing or stops with exit 7, and neither may be turned into an exit 8
+    # "rerun later" by a young head. Every path that reaches the write below
+    # passes through this branch, because the ceiling branch always returns
+    # or exits.
+    refuse_moving_head_unless_allowed
     check_blocking_budget "$request_count" "$max_review_rounds"
   fi
   if [ "$request_count" -ge "$max_review_rounds" ]; then
