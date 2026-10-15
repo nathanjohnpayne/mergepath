@@ -1191,6 +1191,7 @@ paths:
     consumers: all
     requires:
       - "scripts/workflow/owner-admin-override.py"
+      - "scripts/gh-as-author.sh"  # production writer-boundary regressions
 
   - path: tests/test_gh_as_author.sh
     type: canonical
