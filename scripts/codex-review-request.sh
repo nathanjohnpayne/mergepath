@@ -30,15 +30,18 @@
 #                              determination comments are posted through
 #                              gh-as-author.sh, which verifies and uses the
 #                              author token for those writes.
-#   MERGEPATH_PHASE_4A_GATED   Optional. Set to true/1 by the caller when
-#                              the PR independently qualifies for Phase 4a
-#                              (lines >= external_review_threshold, a file
-#                              matches external_review_paths, or the PR
+#   MERGEPATH_PHASE_4A_GATED   Optional, recommended. Set to true/1 by the
+#                              caller when the PR independently qualifies for
+#                              Phase 4a (lines >= external_review_threshold, a
+#                              file matches external_review_paths, or the PR
 #                              carries needs-external-review). A gated PR is
 #                              always requested, whatever
 #                              codex.request_by_default says, because Phase 4
-#                              review is mandatory (#2240). Unset/false ⇒ the
-#                              PR is treated as under-threshold.
+#                              review is mandatory (#2240). When it is not set
+#                              to true and request_by_default resolves to
+#                              false, the requester derives the gate from the
+#                              PR itself (#2257) before it would skip; an
+#                              input it cannot read counts as gated.
 #   MERGEPATH_CODEX_AUTO_TRIGGER
 #                              Optional. Set to true/1 by an AUTOMATIC caller
 #                              (CI), never by an agent invoking this script by
@@ -63,7 +66,11 @@
 #      script exits 5 without triggering. A PR the caller flagged via
 #      MERGEPATH_PHASE_4A_GATED is always requested. Otherwise, when
 #      request_by_default is true the trigger is posted on EVERY PR; when
-#      false or unset it is not. A policy that cannot be read (missing,
+#      false or unset, the requester derives the Phase 4 gate from the PR
+#      (the needs-external-review label, lines changed against
+#      external_review_threshold, changed files against
+#      external_review_paths) and requests only a gated PR (#2257); an input
+#      it cannot read counts as gated. A policy that cannot be read (missing,
 #      unparseable, no YAML parser, a non-boolean value) requests, with a
 #      warning naming the cause.
 #      request_by_default is orthogonal to enabled — it governs only WHEN
@@ -207,8 +214,9 @@
 #   5   NO_TRIGGER_REQUESTED — the Phase 4a entry decision (#486) chose
 #       NOT to request a Codex review on this PR: either codex.enabled is
 #       false (route to Phase 4b), or codex.request_by_default is false
-#       or unset and the PR is not Phase-4a-gated (under-threshold, no
-#       protected path). JSON on stdout with trigger_requested:false and all Codex
+#       or unset and the PR is not Phase-4a-gated: the caller did not flag it
+#       and the derivation (#2257) read no needs-external-review label, a
+#       line count under the threshold, and no protected path. JSON on stdout with trigger_requested:false and all Codex
 #       signals null. This is a deliberate skip, not an error or a
 #       timeout.
 #   6   FEEDBACK_UNACCOUNTED — at least one earlier reviewer finding has no
@@ -619,10 +627,13 @@ fi
 # Phase 4a (lines ≥ external_review_threshold, a file matches
 # external_review_paths, or the PR carries needs-external-review). Set it
 # to `true`/`1` for a gated PR: that PR is requested whatever
-# request_by_default says, because Phase 4 review is mandatory. This
-# script does not recompute the threshold itself — the entry decision
-# upstream already did. When unset/false and request_by_default resolves
-# to false, an under-threshold PR is skipped (exit 5, NO_TRIGGER_REQUESTED).
+# request_by_default says, because Phase 4 review is mandatory, and no PR
+# read is spent on the decision. When the flag is unset/false and
+# request_by_default resolves to false, the script derives the gate from the
+# PR itself (derive_phase_4a_gate, #2257) before it would skip: consumers'
+# per-repo docs call this script without the flag, and a Phase 4 PR must not
+# lose its mandatory request because of that. Only a PR the derivation reads
+# as under-threshold is skipped (exit 5, NO_TRIGGER_REQUESTED).
 CODEX_ENABLED=$(codex_field enabled)
 CODEX_ENABLED=${CODEX_ENABLED:-true}
 
@@ -754,9 +765,320 @@ resolve_request_by_default() {
 # Normalize the caller's gate signal to a strict true/false. Accept the
 # common truthy spellings; anything else (including unset) is false.
 PHASE_4A_GATED=false
+PHASE_4A_GATE_REASON=""
 case "${MERGEPATH_PHASE_4A_GATED:-}" in
   true|TRUE|True|1|yes|YES) PHASE_4A_GATED=true ;;
 esac
+
+# --- Phase 4a gate derivation (#2257) ----------------------------------------
+# With request_by_default unset or false, a PR is requested only when it is
+# Phase-4a-gated. Callers that follow this repo's AGENTS.md pass
+# MERGEPATH_PHASE_4A_GATED=true, but consumers' per-repo docs (never
+# propagated) still show the bare call, so a Phase 4 PR there would lose its
+# mandatory request (Codex P1 on nathanpaynedotcom#1378). When the caller has
+# not set the flag, the gate is derived from the PR itself. It is gated when
+# any of these holds, checked in this order and reported by the first that
+# fires:
+#
+#   label      the PR carries needs-external-review (the labeler's verdict
+#              under the governing policy, or a human's force-on);
+#   size       lines changed >= external_review_threshold (default 300 when
+#              the key is absent), counted with the labeler's generated-file
+#              exclusion, the EXCLUDE_RE constant read from
+#              external_review_fingerprint.sh at the PR's base sha; a
+#              listing at GitHub's 3000-file cap is gated outright;
+#   paths      a changed file, or a rename's source, matches the
+#              external_review_paths patterns that scripts/workflow/
+#              parse_policy_list.sh prints, through scripts/workflow/
+#              match_protected_paths.sh: the labeler's parser and matcher,
+#              both loaded from the PR's base sha.
+#
+# READER PARITY (Codex P1 x4 on #2258). Every input is read with the reader
+# the labeler (pr-review-policy.yml through external_review_fingerprint.sh)
+# or the merge clearance gate uses, never with a reader of its own: the label
+# from the PR's label list; the size from the paginated file list with
+# EXCLUDE_RE; the threshold from the raw top-level line's second token; the
+# paths from parse_policy_list.sh; the match from match_protected_paths.sh.
+# The policy text, the exclusion constant, the parser and the matcher all
+# come from the base revision, never from this checkout, which may be another
+# repository or the candidate's own edit; so these helpers have no requires:
+# edge in .mergepath-sync.yml. No YAML parser reads the policy here.
+#
+# FAIL-SAFE (owner rule): any input that cannot be read counts as gated, and
+# the PR is requested with a WARN naming the cause. That includes the PR
+# metadata, its label list, the paginated file list, a file list that is
+# EMPTY or disagrees with the PR's changed_files count (a short read is not a
+# small PR), the governing base policy, a threshold the labeler would not
+# read as written, the base copies of the exclusion constant, the parser and
+# the matcher, and a PR whose head, base, default branch or labels changed
+# during the reads. A skip therefore needs every signal positively read as
+# "not gated" for one snapshot of the PR.
+phase_4a_gate_failsafe() {  # <cause>
+  PHASE_4A_GATED=true
+  PHASE_4A_GATE_REASON="$1"
+  echo "[codex-review-request] WARN: cannot derive the Phase 4 gate: $1 — treating the PR as Phase-4a-gated and requesting Codex (an unreadable input never skips a mandatory review, #2257)" >&2
+}
+phase_4a_gate_derived() {  # <reason>
+  PHASE_4A_GATED=true
+  PHASE_4A_GATE_REASON="$1"
+  log "Phase 4 gate derived from the PR: $1 — requesting Codex (#2257)"
+}
+derive_phase_4a_gate() {
+  local pr_json has_label changed_files files_json files_tmp files_count head_sha base_ref base_sha default_branch
+  local base_cfg fp_json default_json default_sha raw_threshold raw_lines matcher_json live_default
+  local parser parser_json parser_rc paths_out
+  local threshold exclude_re lines pattern matcher changed matched live_json live_fence rc=0
+  local -a patterns=()
+
+  pr_json=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>/dev/null) || {
+    phase_4a_gate_failsafe "could not read the PR metadata for $REPO#$PR_NUMBER"
+    return 0
+  }
+  if ! printf '%s' "$pr_json" | jq -e '
+      type == "object"
+      and (.labels | type) == "array"
+      and all(.labels[]; type == "object" and ((.name | type) == "string"))
+      and (.changed_files | type) == "number"' >/dev/null 2>&1; then
+    phase_4a_gate_failsafe "the PR metadata for $REPO#$PR_NUMBER has no readable labels or changed_files count"
+    return 0
+  fi
+  # The snapshot every later read is bound to: the head the decision is about
+  # and the base whose policy governs it.
+  head_sha=$(printf '%s' "$pr_json" | jq -r '.head.sha // "" | strings') || head_sha=""
+  base_ref=$(printf '%s' "$pr_json" | jq -r '.base.ref // "" | strings') || base_ref=""
+  base_sha=$(printf '%s' "$pr_json" | jq -r '.base.sha // "" | strings') || base_sha=""
+  default_branch=$(printf '%s' "$pr_json" | jq -r '.base.repo.default_branch // "" | strings') || default_branch=""
+  if [ -z "$head_sha" ] || [ -z "$base_ref" ] || [ -z "$base_sha" ] || [ -z "$default_branch" ]; then
+    phase_4a_gate_failsafe "the PR metadata for $REPO#$PR_NUMBER has no readable head sha, base ref, base sha or default branch"
+    return 0
+  fi
+  has_label=$(printf '%s' "$pr_json" | jq -r '[.labels[].name] | index("needs-external-review") != null') || has_label=""
+  case "$has_label" in
+    true) phase_4a_gate_derived "the PR carries the needs-external-review label"; return 0 ;;
+    false) ;;
+    *) phase_4a_gate_failsafe "could not test the PR labels for needs-external-review"; return 0 ;;
+  esac
+  changed_files=$(printf '%s' "$pr_json" | jq -r '.changed_files') || changed_files=""
+
+  # Called in this shell, not in $( ), so GH_API_ARRAY_ERROR survives to name
+  # the cause; the array goes through a scratch file.
+  files_tmp=$(mktemp "${TMPDIR:-/tmp}/codex-request-files.XXXXXX" 2>/dev/null) || files_tmp=""
+  if [ -z "$files_tmp" ]; then
+    phase_4a_gate_failsafe "could not allocate a scratch file for the PR file list"
+    return 0
+  fi
+  if ! gh_api_array "repos/$REPO/pulls/$PR_NUMBER/files" "PR files" >"$files_tmp"; then
+    rm -f "$files_tmp"
+    phase_4a_gate_failsafe "${GH_API_ARRAY_ERROR:-could not read the PR file list}"
+    return 0
+  fi
+  files_json=$(cat "$files_tmp") || files_json=""
+  rm -f "$files_tmp"
+  if ! printf '%s' "$files_json" | jq -e '
+      type == "array"
+      and all(.[]; type == "object"
+        and ((.filename | type) == "string") and (.filename | length) > 0
+        and ((.additions | type) == "number") and ((.deletions | type) == "number")
+        and ((.previous_filename == null) or ((.previous_filename | type) == "string")))' >/dev/null 2>&1; then
+    phase_4a_gate_failsafe "the PR file list is not an array of file entries with filename, additions and deletions"
+    return 0
+  fi
+  # The matcher reads one path per line, so a name containing a newline would
+  # reach it as two harmless-looking paths (CodeRabbit on #2258): unreadable.
+  if ! printf '%s' "$files_json" | jq -e '
+      all(.[]; ((.filename | test("\n")) | not)
+        and ((.previous_filename == null) or ((.previous_filename | test("\n")) | not)))' >/dev/null 2>&1; then
+    phase_4a_gate_failsafe "a changed file name contains a newline, which the line-based path matcher cannot read"
+    return 0
+  fi
+  files_count=$(printf '%s' "$files_json" | jq 'length') || files_count=""
+  if ! [[ "$files_count" =~ ^[0-9]+$ ]] || ! [[ "$changed_files" =~ ^[0-9]+$ ]]; then
+    phase_4a_gate_failsafe "could not count the PR files"
+    return 0
+  fi
+  if [ "$files_count" -eq 0 ]; then
+    phase_4a_gate_failsafe "the PR file list is empty"
+    return 0
+  fi
+  if [ "$files_count" -ge 3000 ]; then
+    phase_4a_gate_derived "the PR file list has $files_count entries, at GitHub's 3000-file cap"
+    return 0
+  fi
+  if [ "$files_count" -ne "$changed_files" ]; then
+    phase_4a_gate_failsafe "the PR file list has $files_count entries but the PR reports $changed_files changed files"
+    return 0
+  fi
+
+  # Pin the default branch's head before the policy read (Codex P2 on #2258):
+  # when the base predates review-policy.yml the resolver falls back to the
+  # default branch BY NAME, so a commit landing there during the derivation
+  # could swap in a stricter policy with every other fence part unchanged.
+  # The fence below re-reads this sha.
+  default_json=$(gh api "repos/$REPO/branches/$default_branch" 2>/dev/null) || default_json=""
+  default_sha=$(printf '%s' "$default_json" | jq -r '.commit.sha // "" | strings' 2>/dev/null) || default_sha=""
+  if [ -z "$default_sha" ]; then
+    phase_4a_gate_failsafe "could not read the head commit of the default branch $default_branch"
+    return 0
+  fi
+
+  # Threshold and protected paths come from the policy that GOVERNS the PR:
+  # its base, fetched at the base sha of the snapshot above (Codex P1 on
+  # #2258). The script's own checkout may be another repository, or the
+  # candidate's own edited policy.
+  base_cfg=$("$__CODEX_REQUEST_DIR/workflow/resolve_base_policy.sh" --repo "$REPO" \
+    --base-ref "$base_ref" --base-sha "$base_sha" --default-branch "$default_branch" \
+    --default-config "$CONFIG" --materialize-default 2>/dev/null) || base_cfg=""
+  if [ -z "$base_cfg" ] || [ ! -r "$base_cfg" ]; then
+    phase_4a_gate_failsafe "could not resolve the governing review policy at $base_ref@$base_sha"
+    return 0
+  fi
+  # Every value below is read the way the labeler reads it, with the
+  # labeler's own readers wherever they exist (Codex P1 x4 on #2258):
+  #   threshold  the raw top-level line's second token, exactly as
+  #              external_review_fingerprint.sh and merge-clearance-gate.sh
+  #              read it: grep '^external_review_threshold:' | awk '{print $2}';
+  #   paths      scripts/workflow/parse_policy_list.sh, loaded from the base;
+  #   exclusion  EXCLUDE_RE from external_review_fingerprint.sh at the base;
+  #   matcher    scripts/workflow/match_protected_paths.sh at the base.
+  # No YAML parser is consulted. A second reader can disagree with the
+  # labeler (anchors and aliases, flow lists, numeric spellings) and skip a
+  # PR the labeler gates.
+  raw_threshold=$(grep -E '^external_review_threshold:' "$base_cfg" 2>/dev/null) || raw_threshold=""
+  parser=$(mktemp "${TMPDIR:-/tmp}/codex-request-parser.XXXXXX" 2>/dev/null) || parser=""
+  if [ -z "$parser" ]; then
+    [ "$base_cfg" = "$CONFIG" ] || rm -f "$base_cfg" 2>/dev/null || true
+    phase_4a_gate_failsafe "could not allocate a scratch file for the policy list parser"
+    return 0
+  fi
+  parser_json=$(gh api "repos/$REPO/contents/scripts/workflow/parse_policy_list.sh?ref=$base_sha" 2>/dev/null) || parser_json=""
+  if ! printf '%s' "$parser_json" | jq -r '.content | gsub("\n"; "") | @base64d' >"$parser" 2>/dev/null \
+     || [ ! -s "$parser" ]; then
+    rm -f "$parser"
+    [ "$base_cfg" = "$CONFIG" ] || rm -f "$base_cfg" 2>/dev/null || true
+    phase_4a_gate_failsafe "cannot read the policy list parser scripts/workflow/parse_policy_list.sh at $base_sha"
+    return 0
+  fi
+  paths_out=$(bash "$parser" "$base_cfg" external_review_paths 2>/dev/null) || parser_rc=$?
+  rm -f "$parser"
+  [ "$base_cfg" = "$CONFIG" ] || rm -f "$base_cfg" 2>/dev/null || true
+  if [ "${parser_rc:-0}" -ne 0 ]; then
+    phase_4a_gate_failsafe "the policy list parser failed on external_review_paths (rc=$parser_rc)"
+    return 0
+  fi
+  # The labeler's own line split: one pattern per non-empty line.
+  while IFS= read -r pattern; do
+    [ -n "$pattern" ] && patterns+=("$pattern")
+  done <<<"$paths_out"
+
+  # Absent (no line) is the documented default 300, which the labeler also
+  # uses. One line whose token is plain digits is used as written. Any other
+  # token, or the key on more than one line, is a value the labeler would
+  # not read as written (it falls back to 300), so it is unreadable here.
+  raw_lines=0
+  [ -z "$raw_threshold" ] || raw_lines=$(printf '%s\n' "$raw_threshold" | wc -l | tr -d ' ')
+  if [ "$raw_lines" = 0 ]; then
+    threshold=300
+  elif [ "$raw_lines" = 1 ]; then
+    threshold=$(printf '%s\n' "$raw_threshold" | awk '{print $2}')
+    if ! [[ "$threshold" =~ ^[0-9]+$ ]]; then
+      phase_4a_gate_failsafe "external_review_threshold in the governing policy is not a plain digit scalar ('$threshold'); the labeler would not read it as written"
+      return 0
+    fi
+  else
+    phase_4a_gate_failsafe "external_review_threshold appears on $raw_lines top-level lines of the governing policy; the labeler would not read one value"
+    return 0
+  fi
+  # The generated-file exclusion is read from the fingerprint helper AT THE
+  # BASE, the copy the labeler's classification runs (Codex P1 on #2258), not
+  # from this checkout, which may be another repository or the candidate.
+  fp_json=$(gh api "repos/$REPO/contents/scripts/workflow/external_review_fingerprint.sh?ref=$base_sha" 2>/dev/null) || fp_json=""
+  exclude_re=$(printf '%s' "$fp_json" | jq -r '.content | gsub("\n"; "") | @base64d' 2>/dev/null \
+    | sed -n "s/^EXCLUDE_RE='\(.*\)'\$/\1/p" | head -1) || exclude_re=""
+  if [ -z "$exclude_re" ]; then
+    phase_4a_gate_failsafe "cannot read the generated-file exclusion (EXCLUDE_RE) from scripts/workflow/external_review_fingerprint.sh at $base_sha"
+    return 0
+  fi
+  lines=$(printf '%s' "$files_json" | jq --arg re "$exclude_re" '
+    [ .[] | select((.filename | test($re)) | not) | (.additions + .deletions) ] | add // 0' 2>/dev/null) || lines=""
+  if ! [[ "$lines" =~ ^[0-9]+$ ]]; then
+    phase_4a_gate_failsafe "could not count the changed lines"
+    return 0
+  fi
+  if [ "$lines" -ge "$threshold" ]; then
+    phase_4a_gate_derived "$lines lines changed >= external_review_threshold $threshold"
+    return 0
+  fi
+
+  if [ "${#patterns[@]}" -gt 0 ]; then
+    # The matcher is loaded from the base too (Codex P1 on #2258): the
+    # labeler runs the base revision's helper tree, and a checkout copy,
+    # from another repository or edited by the candidate, could match less.
+    matcher=$(mktemp "${TMPDIR:-/tmp}/codex-request-matcher.XXXXXX" 2>/dev/null) || matcher=""
+    if [ -z "$matcher" ]; then
+      phase_4a_gate_failsafe "could not allocate a scratch file for the protected-path matcher"
+      return 0
+    fi
+    matcher_json=$(gh api "repos/$REPO/contents/scripts/workflow/match_protected_paths.sh?ref=$base_sha" 2>/dev/null) || matcher_json=""
+    if ! printf '%s' "$matcher_json" | jq -r '.content | gsub("\n"; "") | @base64d' >"$matcher" 2>/dev/null \
+       || [ ! -s "$matcher" ]; then
+      rm -f "$matcher"
+      phase_4a_gate_failsafe "cannot read the protected-path matcher scripts/workflow/match_protected_paths.sh at $base_sha"
+      return 0
+    fi
+    # Both sides of a rename (#763): moving a protected file out of a
+    # protected path must still match.
+    changed=$(printf '%s' "$files_json" | jq -r '.[] | (.filename, (.previous_filename // empty))')
+    matched=$(printf '%s\n' "$changed" | bash "$matcher" "${patterns[@]}") || rc=$?
+    rm -f "$matcher"
+    if [ "$rc" -ne 0 ]; then
+      phase_4a_gate_failsafe "the protected-path matcher failed (rc=$rc)"
+      return 0
+    fi
+    if [ -n "$matched" ]; then
+      phase_4a_gate_derived "protected paths changed: $(printf '%s\n' "$matched" | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/ $//')"
+      return 0
+    fi
+  fi
+
+  # Snapshot fence (Codex P1 x2 on #2258): every read above describes one
+  # snapshot of the PR: its head, its base (whose policy was read), the
+  # repository default branch the resolver can fall back through and that
+  # branch's head commit, and its label state. A push, a base move to a stricter policy, or a
+  # needs-external-review label landing during the reads would leave this
+  # skip describing a PR that no longer exists, and the skip path never
+  # reaches the moving-head guard. Re-read the PR immediately before
+  # reporting "not gated": a label now present gates it; any other change, or
+  # an unreadable re-read, counts as gated.
+  live_json=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>/dev/null) || live_json=""
+  live_fence=$(printf '%s' "$live_json" | jq -r '
+    if type == "object" and (.labels | type) == "array"
+       and all(.labels[]; type == "object" and ((.name | type) == "string"))
+    then [(.head.sha // "" | strings), (.base.ref // "" | strings), (.base.sha // "" | strings),
+          (.base.repo.default_branch // "" | strings),
+          ([.labels[].name] | index("needs-external-review") != null | tostring)] | join(" ")
+    else "" end' 2>/dev/null) || live_fence=""
+  if [ -z "$live_fence" ]; then
+    phase_4a_gate_failsafe "could not re-read the PR before skipping"
+    return 0
+  fi
+  if [ "$live_fence" = "$head_sha $base_ref $base_sha $default_branch true" ]; then
+    phase_4a_gate_derived "the PR carries the needs-external-review label (added during the derivation)"
+    return 0
+  fi
+  if [ "$live_fence" != "$head_sha $base_ref $base_sha $default_branch false" ]; then
+    phase_4a_gate_failsafe "the PR moved during the derivation (head/base/default/label was '$head_sha $base_ref $base_sha $default_branch false', now '$live_fence')"
+    return 0
+  fi
+  live_default=$(gh api "repos/$REPO/branches/$default_branch" 2>/dev/null | jq -r '.commit.sha // "" | strings' 2>/dev/null) || live_default=""
+  if [ "$live_default" != "$default_sha" ]; then
+    phase_4a_gate_failsafe "the default branch $default_branch moved during the derivation (was ${default_sha}, now ${live_default:-unreadable}); its policy may be the fallback that governs this PR"
+    return 0
+  fi
+
+  PHASE_4A_GATED=false
+  PHASE_4A_GATE_REASON="no needs-external-review label, $lines lines changed < external_review_threshold $threshold, no file matches external_review_paths (head $head_sha)"
+  log "Phase 4 gate derived from the PR: not gated ($PHASE_4A_GATE_REASON) — #2257"
+}
 
 # Decide whether to request a Codex review on this PR. Returns 0 (request)
 # or 1 (skip). Kept as a function so the decision is testable in one place
@@ -764,13 +1086,16 @@ esac
 should_request_codex() {
   # Codex off ⇒ never trigger (orthogonality rule).
   [ "$CODEX_ENABLED" = "true" ] || return 1
-  # A Phase-4a-gated PR is always requested: Phase 4 review is mandatory,
-  # whatever request_by_default says (#2240). Checked first, so a gated run
-  # never depends on the policy read below.
+  # A caller-flagged Phase-4a-gated PR is always requested: Phase 4 review is
+  # mandatory, whatever request_by_default says (#2240). Checked first, so a
+  # flagged run never depends on the policy read or the PR reads below.
   [ "$PHASE_4A_GATED" = "true" ] && return 0
   # Otherwise request_by_default decides: true ⇒ trigger on every PR.
   resolve_request_by_default
-  [ "$REQUEST_BY_DEFAULT" = "true" ]
+  [ "$REQUEST_BY_DEFAULT" = "true" ] && return 0
+  # false/unset: request only a PR the derivation reads as gated (#2257).
+  derive_phase_4a_gate
+  [ "$PHASE_4A_GATED" = "true" ]
 }
 
 # ack_wait_seconds: the 👀 eyes-ack window (#419). Default 30s aligned to the
@@ -976,10 +1301,11 @@ if ! should_request_codex; then
     else
       log "codex.request_by_default is false and this PR is not Phase-4a-gated (MERGEPATH_PHASE_4A_GATED!=true) — not requesting a Codex review"
     fi
-    # Codex P1 on #2175: with request_by_default false, a Phase 4 caller that
-    # omits the gate flag gets this skip instead of the mandatory review.
-    # Say so, so the skip is never mistaken for "Codex not needed".
-    log "if this PR meets external_review_threshold or touches external_review_paths (a Phase 4 PR), Codex is mandatory: rerun with MERGEPATH_PHASE_4A_GATED=true"
+    # Codex P1 on #2175: say why, so the skip is never mistaken for "Codex not
+    # needed". Since #2257 the gate is derived from the PR before this skip,
+    # so this line reports what was read; the flag remains the override for a
+    # PR the derivation misreads.
+    log "Phase 4 gate derived from the PR: ${PHASE_4A_GATE_REASON:-not gated}. If this PR meets external_review_threshold or touches external_review_paths (a Phase 4 PR), Codex is mandatory: rerun with MERGEPATH_PHASE_4A_GATED=true"
   fi
   jq -n \
     --argjson pr_number "$PR_NUMBER" \

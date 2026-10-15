@@ -64,6 +64,9 @@ make_case() {
   cp "$ROOT/scripts/lib/codex-failure-markers.sh" "$dir/scripts/lib/codex-failure-markers.sh"
   cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
   cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$dir/scripts/workflow/resolve_base_policy.sh"
+  cp "$ROOT/scripts/workflow/external_review_fingerprint.sh" "$dir/state/base-fingerprint.sh"  # #2257: served at the base by the stub
+  cp "$ROOT/scripts/workflow/match_protected_paths.sh" "$dir/state/base-matcher.sh"  # #2257: served at the base by the stub
+  cp "$ROOT/scripts/workflow/parse_policy_list.sh" "$dir/state/base-parser.sh"  # #2257: served at the base by the stub
   chmod +x "$dir/scripts/workflow/resolve_base_policy.sh"
 
   cat >"$dir/.github/review-policy.yml" <<'EOF'
@@ -111,7 +114,20 @@ paginated=0
 [ "${1:-}" = "-X" ] && shift 2
 endpoint=${1:-}
 case "$endpoint" in
-  repos/owner/repo/pulls/999)            jq -cn --arg h "$head_sha" '{head:{sha:$h,ref:"feature"},base:{ref:"main",sha:"base-sha",repo:{default_branch:"main"}}}' ;;
+  # labels and changed_files feed the #2257 Phase 4 gate derivation, which the
+  # request_by_default: false cases reach; the default PR is under-threshold.
+  repos/owner/repo/pulls/999)
+    if [ "${2:-}" = "--jq" ]; then printf '%s\n' "$head_sha"   # the #2257 head re-read
+    else jq -cn --arg h "$head_sha" '{head:{sha:$h,ref:"feature"},base:{ref:"main",sha:"base-sha",repo:{default_branch:"main"}},labels:[],changed_files:1}'; fi ;;
+  repos/owner/repo/pulls/999/files)      printf '%s\n' '[{"filename":"src/app.ts","additions":10,"deletions":2}]' ;;
+  repos/owner/repo/branches/main)        printf '%s\n' '{"name":"main","commit":{"sha":"main-sha-1"}}' ;;  # #2257 default-branch pin
+  'repos/owner/repo/contents/scripts/workflow/parse_policy_list.sh?ref=base-sha')
+    jq -cn --arg c "$(base64 <"$CODEX_TEST_STATE_DIR/base-parser.sh" | tr -d '\n')" '{encoding: "base64", content: $c}' ;;
+  'repos/owner/repo/contents/scripts/workflow/match_protected_paths.sh?ref=base-sha')
+    jq -cn --arg c "$(base64 <"$CODEX_TEST_STATE_DIR/base-matcher.sh" | tr -d '\n')" '{encoding: "base64", content: $c}' ;;
+  'repos/owner/repo/contents/scripts/workflow/external_review_fingerprint.sh?ref=base-sha')
+    # #2257: the fingerprint helper at the base, for its EXCLUDE_RE constant.
+    jq -cn --arg c "$(base64 <"$CODEX_TEST_STATE_DIR/base-fingerprint.sh" | tr -d '\n')" '{encoding: "base64", content: $c}' ;;
   'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha')
     printf '1\n' >>"$CODEX_TEST_STATE_DIR/base-policy-read-count"
     if [ "${CODEX_TEST_BASE_POLICY_MODE:-ok}" = fail ]; then
