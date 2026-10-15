@@ -3000,11 +3000,12 @@ SWEEP_JOB=$(awk '
 ' "$ROOT/.github/workflows/coderabbit-severity-gate.yml")
 if grep -Fq 'REQUIRE_REVIEW_SUMMARY: "true"' <<<"$SWEEP_JOB" \
     && grep -Fq 'if [ "$rc" -eq 3 ]; then' "$ROOT/.github/workflows/coderabbit-severity-gate.yml" \
-    && grep -Fq "skipping this publication so the review run's verdict stands" "$ROOT/.github/workflows/coderabbit-severity-gate.yml" \
+    && grep -Fq '3) conclusion="failure" ;;' <<<"$SWEEP_JOB" \
+    && grep -Fq 'rcg_close "$REPO"' <<<"$SWEEP_JOB" \
     && grep -Fq "holding this run non-green until it does" "$ROOT/.github/workflows/coderabbit-severity-gate.yml"; then
-  pass "the sweep opts into the hold and skips publication; the event-driven job goes non-green"
+  pass "the sweep closes only its owned hold red; the event-driven job goes non-green"
 else
-  fail "expected the sweep to set REQUIRE_REVIEW_SUMMARY and skip on rc 3, and the event job to fail on it"
+  fail "expected both publishers to retain the rc-3 evidence hold without a clean verdict"
 fi
 
 # A CodeRabbit conversational REPLY creates a head-pinned COMMENTED review
@@ -3192,6 +3193,58 @@ else
   fail "expected cr_surface_fp to sample all four surfaces and fail closed on each read (fail-closed lines: $FP_FAILCLOSED)"
 fi
 
+# ---------------------------------------------------------------------------
+# Test 47d1f (#2247): this gate has no pending verdict, so the event-driven
+# job fails its job-native run on every non-green exit. #2247 lets the Merge
+# clearance gate's native run conclude non-failing while external review has
+# merely not cleared yet. Neither non-green state here is that: rc 1 is an
+# unresolved blocking-tier finding, a real block; rc 3 is a current-head
+# review run this gate cannot classify, an unknown verdict. Both keep failing
+# the native run, and the step never asks the script for the pending
+# distinction. Behavioural: the step body is extracted and run.
+# ---------------------------------------------------------------------------
+echo "--- Test 47d1f (#2247): the event-driven job fails on every non-green exit"
+T2247="$WORKDIR/t2247"
+mkdir -p "$T2247/scripts"
+CR_STEP=$(awk '
+  index($0, "- name: Run scripts/coderabbit-severity-gate.sh") { instep = 1; next }
+  instep && !inrun && /^        run: \|/ { inrun = 1; next }
+  inrun {
+    if ($0 ~ /^[[:space:]]*$/) { print ""; next }
+    if ($0 !~ /^          /) exit
+    sub(/^          /, "")
+    print
+  }
+' "$ROOT/.github/workflows/coderabbit-severity-gate.yml")
+cat >"$T2247/scripts/coderabbit-severity-gate.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${MERGEPATH_GATE_VERDICT_FILE-unset}" >>"$T2247_LOG"
+[ -z "${MERGEPATH_GATE_VERDICT_FILE:-}" ] || printf 'pending\n' >"$MERGEPATH_GATE_VERDICT_FILE"
+exit "$T2247_RC"
+SH
+chmod +x "$T2247/scripts/coderabbit-severity-gate.sh"
+bad=""
+[ -n "$CR_STEP" ] || bad="$bad step-not-extracted"
+for rc in 0 1 2 3; do
+  set +e
+  ( cd "$T2247" && T2247_LOG="$T2247/log" T2247_RC="$rc" PR_NUMBER=7 REPO=o/r \
+      bash -c "$CR_STEP" >/dev/null 2>&1 )
+  got=$?
+  set -e
+  if [ "$rc" = 0 ]; then
+    [ "$got" = 0 ] || bad="$bad rc0($got)"
+  else
+    [ "$got" != 0 ] || bad="$bad rc$rc-non-failing"
+  fi
+done
+grep -qv '^unset$' "$T2247/log" && bad="$bad asked-for-pending"
+[ "$(grep -c '^unset$' "$T2247/log" || true)" = 4 ] || bad="$bad script-not-run"
+if [ -z "$bad" ]; then
+  pass "rc 1 (real block), rc 2 (infra) and rc 3 (unknown verdict) all fail the native run; the step never asks for a pending verdict"
+else
+  fail "event-driven CodeRabbit native mapping changed:$bad"
+fi
+
 # A raw C0 control byte anywhere in the workflow makes the YAML document
 # unloadable — Ruby Psych rejects the file with "control characters are not
 # allowed" — and GitHub then refuses to register the workflow at all. For a
@@ -3347,6 +3400,55 @@ else
   fail "expected rc=1 from the review-object body's own finding; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
 fi
+
+# #1407: the current blockquoted bold heading and the legacy HTML summary
+# contain structural warning/category markers, not a required finding. Keep
+# the real nested Major control in the same accepted review-object shape.
+for heading in '> **⚠️ Outside diff range comments (1)**' \
+  '<summary>⚠️ Outside diff range comments (1)</summary>'; do
+  for tier_case in minor major required-minor; do
+    heading_scratch=$SCRATCH
+    finding='<strong>🟡 Minor</strong> Real nested finding.'
+    expected=0
+    expected_tier=P2
+    case "$tier_case" in
+      major)
+        finding='<strong>🟠 Major</strong> Real nested finding.'
+        expected=1; expected_tier=P1 ;;
+      required-minor)
+        heading_scratch=$(make_scratch_with_policy "${DEFAULT_POLICY/p2: discretionary/p2: required}")
+        expected=1 ;;
+    esac
+    FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA" COMMENTED "2026-08-04T00:00:10Z" \
+      "**Actionable comments posted: 0**
+
+$heading
+> <details>
+> <summary>$finding</summary><blockquote>
+> </blockquote></details>")
+    set +e
+    OUT=$(
+      REQUIRE_REVIEW_SUMMARY=true \
+      FIXTURE_PR="$FIXTURE_PR" \
+      FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_THREADS="$FIXTURE_THREADS" \
+      FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+      FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+        run_gate "$heading_scratch" 99 owner/repo 2>&1
+    )
+    RC=$?
+    set -e
+    if [ "$RC" = "$expected" ] \
+      && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: $expected" \
+      && echo "$OUT" | grep -q 'markerless full-review summary in review object 8001' \
+      && { [ "$expected" = 0 ] || echo "$OUT" | grep -qF "[$expected_tier] (PR-level summary comment):5"; }; then
+      pass "outside-diff heading preserves nested tier and policy: $heading / $tier_case"
+    else
+      fail "outside-diff heading expected rc=$expected, got rc=$RC: $heading / $finding"
+      echo "$OUT" | sed 's/^/      /' >&2
+    fi
+  done
+done
 
 # The scope anchor is the object's GitHub-owned commit_id, not its timestamp: a
 # review object on ANOTHER head contributes nothing, however recent it is. Pairs
@@ -3801,13 +3903,13 @@ if ! grep -Fq '__unreadable__' "$WORKFLOW" \
     && grep -Fq '{ [ "$pre_fp_rc" -ne 0 ] || [ "$post_fp_rc" -ne 0 ]; }; then' "$WORKFLOW" \
     && awk '
       /\{ \[ "\$pre_fp_rc" -ne 0 \] \|\| \[ "\$post_fp_rc" -ne 0 \]; \}; then/ { guarding=1; next }
-      guarding && /continue/ { found=1; exit }
+      guarding && /CR_EVIDENCE_FAILURE="fingerprint-read-failed"/ { found=1; exit }
       guarding && /^            fi/ { exit }
       END { exit(found ? 0 : 1) }
     ' "$WORKFLOW"; then
-  pass "unreadable fingerprint snapshots skip publication without a random sentinel"
+  pass "unreadable fingerprint snapshots close only their owned generation red without a random sentinel"
 else
-  fail "workflow must retain fingerprint read status and continue on either read failure"
+  fail "workflow must retain fingerprint read status and fail the owned generation on either read failure"
 fi
 
 # ---------------------------------------------------------------------------

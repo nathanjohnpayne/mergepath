@@ -878,6 +878,7 @@ while :; do
                     nodes {
                       __typename
                       ... on CheckRun {
+                        databaseId
                         name
                         status
                         conclusion
@@ -1016,6 +1017,7 @@ ROLLUP_JSON=$(echo "$ROLLUP_CONTEXTS" | jq '{
       # the suite is finer than the rule and reintroduces the #1076 permanent
       # deadlock, refuted by #1119.
       appId: ((.checkSuite.app.databaseId // "") | tostring),
+      databaseId: .databaseId,
       startedAt: .startedAt,
       completedAt: .completedAt,
       # A StatusContext (legacy commit status) has NO startedAt/completedAt —
@@ -1741,6 +1743,17 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
       else (sort_by(if .completedAt != "" then .completedAt else .startedAt end) | last)
       end;
 
+  # Controlled API generations are ordered by opening, never by completion.
+  # databaseId is server-assigned, monotonic and breaks whole-second ties.
+  # An incomplete older opening is retired by a newer generation; native
+  # Actions and foreign-app/legacy status contracts remain unchanged.
+  def current_api_entry:
+    if all(.[]; (.databaseId | type == "number") and .databaseId > 0
+        and .databaseId <= 9007199254740991 and (.databaseId | floor) == .databaseId)
+    then sort_by(.databaseId) | last
+    else {label:(.[0].label),result:"ERROR",status:"COMPLETED"}
+    end;
+
   # One required context, TWO surfaces. GitHub satisfies a required context
   # from a check run OR a legacy commit status, and when a head carries both
   # under one name it evaluates each as its own row and holds the merge until
@@ -1795,7 +1808,8 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
               and (($labels[0]) as $ctx | ($lineage_contexts | index($ctx)) != null)
            then (([$of_kind[] | (.lineage // "")] | unique)) as $lineages
                 | ($lineages[] as $l
-                   | ($of_kind | map(select((.lineage // "") == $l)) | current_entry))
+                   | ($of_kind | map(select((.lineage // "") == $l))
+                    | if $l == "api" then current_api_entry else current_entry end))
            else ($of_kind | current_entry)
            end) ];
 
@@ -1817,6 +1831,7 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
         # otherwise every legacy status compares equal and the winner is
         # whichever node sorted last, letting an older SUCCESS hide the current
         # FAILURE.
+        databaseId: (.databaseId // null),
         startedAt: (.startedAt // .createdAt // ""),
         completedAt: (.completedAt // .createdAt // ""),
         isRequired: .isRequired,

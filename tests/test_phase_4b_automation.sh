@@ -891,7 +891,7 @@ cp "$DIFF" "$WORK/tripwire-original.diff"
 mk_fake fake-codex-tripwire-preview \
   "printf ran > \"$WORK/integrity-adapter-ran\"
    printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"reviewed\",\"findings\":[]}'"
-for tripwire_case in reviewer verdict policy codex-hooks claude-settings coderabbit-wait; do
+for tripwire_case in reviewer verdict policy codex-hooks claude-settings coderabbit-wait gate-lineage; do
   cp "$WORK/tripwire-original.diff" "$DIFF"
   rm -f "$WORK/tripwire-paths" "$P4B_TEST_POSTED_REVIEW" "$WORK/integrity-adapter-ran"
   case "$tripwire_case" in
@@ -901,6 +901,7 @@ for tripwire_case in reviewer verdict policy codex-hooks claude-settings coderab
     codex-hooks) printf '.codex/hooks.json\0' > "$WORK/tripwire-paths" ;;
     claude-settings) printf '.claude/settings.json\0' > "$WORK/tripwire-paths" ;;
     coderabbit-wait) printf 'scripts/coderabbit-wait.sh\0' > "$WORK/tripwire-paths" ;;
+    gate-lineage) printf 'scripts/gate-api-lineage-blocking.sh\0' > "$WORK/tripwire-paths" ;;
   esac
   set +e
   out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \

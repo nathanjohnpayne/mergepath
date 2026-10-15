@@ -13,6 +13,7 @@ const SENSITIVE_PATHS = [
   /^\.claude\/settings\.json$/,
   /^\.github\/review-policy\.yml$/,
   /^scripts\/coderabbit-wait\.sh$/,
+  /^scripts\/gate-api-lineage-blocking\.sh$/,
   /^\.github\/(?:workflows|actions)\//,
   /^scripts\/(?:phase-4b(?:\/|-)|gh-as-|identity-check\.sh$|op-preflight\.sh$)/,
   /^scripts\/(?:codex-review-|codex-p1-gate|coderabbit-severity-gate|merge-clearance-gate|required-head-checks|admin-merge|resolve-pr-threads|request-label-removal|render-feedback-archive|dispatch-thread-resolution)/,

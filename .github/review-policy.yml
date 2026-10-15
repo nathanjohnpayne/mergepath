@@ -551,10 +551,18 @@ codex:
   #   true  → Mergepath posts the `@codex review` trigger on every PR,
   #           independent of `external_review_threshold` /
   #           `external_review_paths`. An under-threshold PR gets a Codex
-  #           review too. This is the full-automation default (#483).
+  #           review too. This was the full-automation default (#483)
+  #           until #2240; it is now an explicit opt-in.
   #   false → pre-#486 behavior: the trigger fires only when the PR
   #           independently qualifies for Phase 4a (lines ≥ threshold OR a
   #           protected-path match).
+  #   absent → false, by owner decision on 2026-10-15 (#2240).
+  #
+  # A Phase-4a-gated PR (MERGEPATH_PHASE_4A_GATED=true) is requested
+  # whatever this key says. An unreadable policy fails toward requesting:
+  # a missing or unparseable file, no yq, an empty or null codex: block, a
+  # duplicated key or codex: block in any YAML style, or a non-boolean value
+  # (a quoted 'false' is a string) posts the trigger with a warning.
   #
   # ORTHOGONAL to `enabled` above: `request_by_default` governs only WHEN
   # the trigger is posted, never WHETHER Codex participates. When
@@ -562,10 +570,12 @@ codex:
   # of this key.
   #
   # Parsed by `scripts/codex-review-request.sh` (the Phase 4a entry
-  # decision) via the same `codex_field` helper the rest of the codex:
-  # block uses. Absent ⇒ true. The script learns whether a PR is
-  # threshold-gated from the caller's `MERGEPATH_PHASE_4A_GATED` env, so
-  # it does not recompute the threshold itself.
+  # decision) through yq with an explicit has() presence test (never `//`,
+  # which reads an explicit false as missing). Absent ⇒ false. The script
+  # learns whether a PR is threshold-gated from the caller's
+  # `MERGEPATH_PHASE_4A_GATED` env when it is set; otherwise, when this key
+  # resolves to false, it derives the gate from the PR itself (label,
+  # threshold, protected paths; an unreadable input counts as gated, #2257).
   #
   # Set to false by owner decision on 2026-10-13 (#2166). This narrows the
   # owner rule of 2026-07-04 ("Codex must always be invoked"): Codex remains

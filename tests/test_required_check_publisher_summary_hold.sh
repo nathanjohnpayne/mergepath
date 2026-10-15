@@ -49,6 +49,14 @@ case "$name" in
   merge-clearance-gate.sh)
     rc=$MCG_RC
     [ "$rc" -ne 0 ] || echo "Merge clearance: PASS"
+    # #2247: a not-yet-cleared head. The real script writes the pending
+    # verdict only when the caller names a file, and exits 1 either way.
+    if [ "${MCG_PENDING:-0}" = 1 ]; then
+      printf '%s\n' "${MERGEPATH_GATE_VERDICT_FILE-unset}" >>"$GATE_VERDICT_LOG"
+      [ -z "${MERGEPATH_GATE_VERDICT_FILE:-}" ] \
+        || printf 'pending\n' >"$MERGEPATH_GATE_VERDICT_FILE"
+      echo "Merge clearance: BLOCKED — external review is NOT cleared"
+    fi
     ;;
   codex-p1-gate.sh) rc=$CODEX_RC ;;
   coderabbit-severity-gate.sh) rc=$CR_RC ;;
@@ -67,7 +75,12 @@ cat >"$TMP/gh" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$GH_CALL_LOG"
 case "$*" in
-  *"-X POST"*"/check-runs"*) printf '{}\n' ;;
+  *"-X POST"*"/check-runs"*)
+    [ "${OPEN_FAIL:-0}" = 0 ] || exit 1
+    printf '{}\n' ;;
+  *"-X PATCH"*"/check-runs/"*)
+    [ "${CLOSE_FAIL:-0}" = 0 ] || exit 1
+    printf '{}\n' ;;
   *"/commits/"*"/check-runs"*)
     # FRESH_FAILS_FILE holds how many freshness lookups still fail (a
     # simulated transient 502) before the endpoint answers normally.
@@ -98,8 +111,22 @@ unset REQUIRE_REVIEW_SUMMARY
 # shellcheck disable=SC1090,SC1091
 . "$TMP/gate-helper.sh"
 export PATH="$TMP:$PATH"
-export REPO=example/repo PASS_START=2026-09-25T00:00:00Z OWN_PENDING_IDS=""
+export REPO=example/repo PASS_START=2026-09-25T00:00:00Z OWN_PENDING_IDS="" OWN_GENERATIONS=""
+# Gate-mapping boundary doubles. The production generation binding, interleave
+# and reader contract run independently in test_required_check_generations.py.
+rcg_open() {
+  gh api -X POST "repos/$1/check-runs" -f name="$4" -f head_sha="$3" -f status=in_progress >/dev/null || return 1
+  printf '17\n'
+}
+rcg_close() {
+  gh api -X PATCH "repos/$1/check-runs/$5" -f status=completed -f conclusion="$6" \
+    -f "output[title]=$7" -f "output[summary]=$8" >/dev/null
+}
 export GATE_ENV_LOG="$TMP/gate-env" GH_CALL_LOG="$TMP/gh-calls"
+export GATE_VERDICT_LOG="$TMP/gate-verdict"
+# The real workflow never names a verdict file; clear an ambient export so the
+# pending case below proves the publisher does not ask for one.
+unset MERGEPATH_GATE_VERDICT_FILE
 export PR=7 head_sha=abc123
 export MCG_CONTEXT="Merge clearance gate"
 export CODEX_P1_CONTEXT="Codex P1 unresolved threads"
@@ -120,7 +147,8 @@ reset_case() {
 }
 
 one_post() {
-  [ "$(grep -c -- '-X POST .*check-runs' "$GH_CALL_LOG" || true)" -eq 1 ]
+  [ "$(grep -c -- '-X POST .*check-runs' "$GH_CALL_LOG" || true)" -eq 1 ] \
+    && [ "$(grep -c -- '-X PATCH .*check-runs/' "$GH_CALL_LOG" || true)" -eq 1 ]
 }
 
 pass=0
@@ -174,11 +202,11 @@ CR_RC=3; export CR_RC
 run_call "$CR_CALL" >"$TMP/cr3.out"
 set +e
 grep -qx $'coderabbit-severity-gate.sh\ttrue' "$GATE_ENV_LOG" \
-  && [ "$had_infra_error" -eq 0 ] && [ ! -s "$GH_CALL_LOG" ] \
-  && grep -qF 'withholding CodeRabbit unresolved blocking findings publication' "$TMP/cr3.out"
+  && [ "$had_infra_error" -eq 0 ] && one_post \
+  && grep -q -- '-f conclusion=failure' "$GH_CALL_LOG"
 case_rc=$?
 set -e
-record "unknown current-head CodeRabbit run withholds without a write" "$case_rc"
+record "unknown current-head CodeRabbit run closes its owned generation red" "$case_rc"
 
 reset_case
 MCG_RC=3; export MCG_RC
@@ -211,42 +239,54 @@ hold_writes=$(grep -c -- '-X POST .*check-runs' "$GH_CALL_LOG" || true)
 CR_RC=0; export CR_RC
 run_call "$CR_CALL" >"$TMP/recovery-clean.out"
 set +e
-[ "$hold_writes" -eq 0 ] \
-  && [ "$(grep -c -- '-X POST .*check-runs' "$GH_CALL_LOG" || true)" -eq 1 ] \
+[ "$hold_writes" -eq 1 ] \
+  && [ "$(grep -c -- '-X POST .*check-runs' "$GH_CALL_LOG" || true)" -eq 2 ] \
   && grep -q -- '-f conclusion=success' "$GH_CALL_LOG"
 case_rc=$?
 set -e
 record "recognized terminal result retires a prior rc-3 hold" "$case_rc"
 
-# Freshness lookup retry: two transient failures are absorbed and the verdict
-# still publishes; three consecutive failures withhold it (fail closed) and
-# flag the pass as an infra error.
+# #2247: a pending clearance verdict keeps the job-native run of the event job
+# non-failing only because the Checks-API lineage carries the block. The
+# publisher is that lineage's writer, so it must keep publishing FAILURE for
+# the same verdict: it never asks for the pending distinction, and rc 1 maps
+# to a red verdict exactly as before, with no infra flag.
 reset_case
-: >"$TMP_SLEEP_LOG"
-printf '2\n' >"$TMP/fresh-fails"
-FRESH_FAILS_FILE="$TMP/fresh-fails"; export FRESH_FAILS_FILE
-run_call "$MCG_CALL" >"$TMP/fresh-retry.out" 2>&1
+: >"$GATE_VERDICT_LOG"
+MCG_RC=1 MCG_PENDING=1; export MCG_RC MCG_PENDING
+run_call "$MCG_CALL" >"$TMP/mcg-pending.out"
 set +e
-[ "$(grep -c -- '/commits/abc123/check-runs' "$GH_CALL_LOG" || true)" -eq 3 ] \
-  && one_post && [ "$had_infra_error" -eq 0 ] \
-  && [ "$(tr '\n' ' ' <"$TMP_SLEEP_LOG")" = "1 2 " ]
+[ "$(cat "$GATE_VERDICT_LOG")" = unset ] \
+  && [ "$had_infra_error" -eq 0 ] && one_post \
+  && grep -q -- '-f conclusion=failure' "$GH_CALL_LOG" \
+  && ! grep -q -- '-f conclusion=success' "$GH_CALL_LOG"
 case_rc=$?
 set -e
-record "freshness lookup retries two transient failures and still publishes" "$case_rc"
+record "pending clearance verdict still publishes a red Checks-API run, and the publisher never asks for the pending distinction" "$case_rc"
+MCG_RC=0 MCG_PENDING=0; export MCG_RC MCG_PENDING
+
+# An opening failure authorizes no evaluation or completion; a closing
+# failure leaves the owned opening pending and reports infrastructure failure.
+reset_case
+OPEN_FAIL=1; export OPEN_FAIL
+run_call "$MCG_CALL" >"$TMP/open-failed.out" 2>&1
+set +e
+[ ! -s "$GATE_ENV_LOG" ] && [ "$had_infra_error" -eq 1 ] \
+  && [ "$(grep -c -- '-X PATCH' "$GH_CALL_LOG" || true)" -eq 0 ]
+case_rc=$?
+set -e
+record "opening failure cannot evaluate or mint an unleased completion" "$case_rc"
+unset OPEN_FAIL
 
 reset_case
-: >"$TMP_SLEEP_LOG"
-printf '3\n' >"$TMP/fresh-fails"
-run_call "$MCG_CALL" >"$TMP/fresh-exhausted.out" 2>&1
+CLOSE_FAIL=1; export CLOSE_FAIL
+run_call "$MCG_CALL" >"$TMP/close-failed.out" 2>&1
 set +e
-[ "$(grep -c -- '/commits/abc123/check-runs' "$GH_CALL_LOG" || true)" -eq 3 ] \
-  && [ "$(grep -c -- '-X POST .*check-runs' "$GH_CALL_LOG" || true)" -eq 0 ] \
-  && [ "$had_infra_error" -eq 1 ] \
-  && grep -q 'after 3 attempts; withholding' "$TMP/fresh-exhausted.out"
+one_post && [ "$had_infra_error" -eq 1 ]
 case_rc=$?
 set -e
-record "freshness lookup that fails three times withholds the verdict (fail closed)" "$case_rc"
-unset FRESH_FAILS_FILE
+record "failed owned-ID PATCH leaves a visible pending opening and infra error" "$case_rc"
+unset CLOSE_FAIL
 
 if [ "$fail" -ne 0 ]; then
   echo "$fail failed, $pass passed"
@@ -276,19 +316,19 @@ if REQUIRED_CHECK_PUBLISHER_WORKFLOW="$TMP/no-opt-in.yml" \
 fi
 echo "PASS: runtime suite rejects removal of the CodeRabbit opt-in"
 
-python3 - "$WORKFLOW" "$TMP/no-withhold.yml" <<'PY'
+python3 - "$WORKFLOW" "$TMP/no-withhold.yml" <<'PY2'
 from pathlib import Path
 import sys
 text = Path(sys.argv[1]).read_text()
-old = 'if [ "$summary_hold" = true ] && [ "$rc" -eq 3 ]; then'
+old = 'title="$context — evidence hold; explicit recovery required after escalation"'
 assert text.count(old) == 1
-Path(sys.argv[2]).write_text(text.replace(old, 'if false; then', 1))
-PY
+Path(sys.argv[2]).write_text(text.replace(old, 'conclusion="success"; ' + old, 1))
+PY2
 if REQUIRED_CHECK_PUBLISHER_WORKFLOW="$TMP/no-withhold.yml" \
     SUMMARY_HOLD_MUTATION_CHILD=1 bash "$0" >"$TMP/no-withhold.out" 2>&1; then
-  echo "FAIL: runtime suite accepted removal of the rc-3 withhold"
+  echo "FAIL: runtime suite accepted an unrecognized-evidence success"
   exit 1
 fi
-echo "PASS: runtime suite rejects removal of the rc-3 withhold"
+echo "PASS: runtime suite rejects an unrecognized-evidence success"
 
 echo "All $pass required-check publisher summary-hold behavior tests and 2 mutations passed."

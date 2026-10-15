@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -30,30 +31,83 @@ AUTH = {'version': 1, 'pr_url': URL, 'head_sha': HEAD, 'authorized_at': '2026-01
         'allow_codex_inflight': False}
 
 
+def check_run(identity, name='lint', conclusion='SUCCESS', *, status='COMPLETED', producer='actions'):
+    return {'__typename': 'CheckRun', 'id': str(identity), 'name': name, 'status': status,
+            'conclusion': conclusion, 'startedAt': '2026-01-01T00:00:00Z',
+            'completedAt': '2026-01-01T00:01:00Z' if status == 'COMPLETED' else None,
+            'checkSuite': {'id': 'suite-' + str(identity), 'app': {'id': producer}}}
+
+
+def commit_status(identity, name='legacy-ci', state='SUCCESS', *, producer='legacy'):
+    return {'__typename': 'StatusContext', 'id': str(identity), 'context': name, 'state': state,
+            'createdAt': '2026-01-01T00:00:00Z', 'updatedAt': '2026-01-01T00:01:00Z',
+            'creator': {'login': producer}}
+
+
+def inventory_pages(pr, checks, size=100):
+    counts = {'totalCount': len(checks), 'checkRunCount': sum(c['__typename'] == 'CheckRun' for c in checks),
+              'statusContextCount': sum(c['__typename'] == 'StatusContext' for c in checks)}
+    chunks = [checks[index:index + size] for index in range(0, len(checks), size)] or [[]]
+    return [{'data': {'repository': {'pullRequest': {key: pr[key] for key in override.PR_FIELDS.split(',')},
+                                    'object': {'oid': HEAD, 'statusCheckRollup': {'contexts': {
+                                        **counts, 'nodes': chunk, 'pageInfo': {
+                                            'hasNextPage': index + 1 < len(chunks),
+                                            'endCursor': f'page-{index + 1}' if chunk else None}}}}}}}
+            for index, chunk in enumerate(chunks)]
+
+
 class OverrideTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name)
-        self.state = {'pr': {'url': URL, 'headRefOid': HEAD, 'baseRefOid': 'b' * 40, 'labels': [],
-                            'statusCheckRollup': [{'name': 'Merge clearance gate', 'conclusion': 'FAILURE'}]},
+        self.state = {'pr': {'url': URL, 'headRefOid': HEAD, 'baseRefOid': 'b' * 40,
+                            'baseRefName': 'main', 'state': 'OPEN', 'labels': []},
                       'comments': [], 'reviews': [], 'timeline': []}
+        self.state['inventory_pages'] = inventory_pages(self.state['pr'], [check_run('gate', 'Merge clearance gate', 'FAILURE')])
         stub = self.path / 'gh'
         stub.write_text('''#!/usr/bin/env python3
 import base64, json, os, sys
 from pathlib import Path
 p=Path(os.environ['OVERRIDE_CASE']); s=json.loads((p/'state.json').read_text()); a=sys.argv[1:]
 with (p/'calls').open('a') as f: f.write(json.dumps(a)+'\\n')
-if a[:2]==['pr','view']:
+if a[:2]==['api','user']:
+ print(s.get('identity','nathanjohnpayne')); sys.exit(0)
+elif a[:2]==['pr','merge']:
+ (p/'merged.json').write_text(json.dumps(a)); sys.exit(0)
+elif a[:2]==['pr','view']:
  result=s['pr'].copy()
+ counter=p/'pr-reads'; read=int(counter.read_text())+1 if counter.exists() else 1; counter.write_text(str(read))
+ result.update(s.get('pr_read_changes',{}).get(str(read),{}))
  if (p/'posted.json').exists() and s.get('move'): result['headRefOid']='b'*40
  if (p/'posted.json').exists() and s.get('late_label'): result['labels']=[{'name':s['late_label']}]
 elif a[0]=='api' and '/contents/.github/review-policy.yml?ref=' in a[1]:
  result={'encoding':'base64','content':base64.b64encode(json.dumps(s.get('policy',{})).encode()).decode()}
+elif a[:2]==['api','graphql']:
+ cursor=next(value[7:] for value in a if value.startswith('cursor='))
+ page=0 if cursor=='null' else int(cursor.split('-')[1])
+ counter=p/'inventory-round'
+ round=int(counter.read_text()) if counter.exists() else 0
+ if cursor=='null':
+  round+=1; counter.write_text(str(round))
+ inventories=s.get('inventory_passes',[s['inventory_pages']])
+ pages=inventories[min(round-1,len(inventories)-1)]
+ if s.get('inventory_fail_page')==page or page>=len(pages): sys.exit(8)
+ if (p/'posted.json').exists() and s.get('inventory_fail_after_post'): sys.exit(8)
+ result=pages[page]
+ if s.get('page_pr_change') and page==1:
+  result['data']['repository']['pullRequest'].update(s['page_pr_change'])
+ if (p/'posted.json').exists() and s.get('post_inventory_change'):
+  result['data']['repository']['object']['statusCheckRollup']['contexts']['nodes'][0]['conclusion']='SUCCESS'
 elif a[:3]==['api','--paginate','--slurp']:
  suffix=a[3].split('/')[-1]; result=[s.get('inline' if '/pulls/' in a[3] and suffix=='comments' else suffix,[])]
  if (p/'posted.json').exists() and s.get('late_codex') and '/issues/' in a[3] and suffix=='comments':
   result=[[*result[0],{'user':{'login':'nathanjohnpayne'},'body':'@codex review','created_at':'2026-01-01T00:01:01Z'}]]
+ if s.get('prepost_codex') and (p/'inventory-round').exists() and int((p/'inventory-round').read_text())>=2 and '/issues/' in a[3] and suffix=='comments':
+  result=[[*result[0],{'user':{'login':'nathanjohnpayne'},'body':'@codex review','created_at':'2026-01-01T00:01:01Z'}]]
+ if suffix=='timeline' and ((s.get('late_escalation') and (p/'posted.json').exists()) or
+    (s.get('prepost_escalation') and (p/'inventory-round').exists() and int((p/'inventory-round').read_text())>=2)):
+  result=[[*result[0],{'event':'labeled','label':{'name':'needs-human-review'},'created_at':'2026-01-01T00:01:01Z'}]]
 elif a[0]=='api' and '/issues/comments/' in a[1]:
  result=json.loads((p/'posted.json').read_text())
 elif a[0]=='api' and a[1].endswith('/comments') and '-f' in a:
@@ -65,15 +119,36 @@ print(json.dumps(result))
 ''')
         stub.chmod(0o755)
 
-    def run_prepare(self, record=None, args=None, pin=None):
+    def run_prepare(self, record=None, args=None, pin=None, *, mode='prepare', wrapper=False):
         (self.path / 'state.json').write_text(json.dumps(self.state))
+        for counter in ('inventory-round', 'pr-reads', 'calls'):
+            (self.path / counter).unlink(missing_ok=True)
         env = {**os.environ, 'PATH': str(self.path) + os.pathsep + os.environ['PATH'],
                'OVERRIDE_CASE': str(self.path), 'GH_AS_AUTHOR_RECORD_IDENTITY': 'nathanjohnpayne',
                'BREAK_GLASS_ADMIN': pin or URL + '@' + HEAD,
                'MERGEPATH_OWNER_ADMIN_AUTHORIZATION': json.dumps(record or AUTH)}
-        return subprocess.run(['python3', str(SCRIPT), 'prepare', 'gh', 'pr', 'merge', '123',
+        for key in ('GH_TOKEN', 'GITHUB_TOKEN', 'OP_PREFLIGHT_AUTHOR_PAT', 'OP_PREFLIGHT_REVIEWER_PAT'):
+            env.pop(key, None)
+        env['OP_PREFLIGHT_CACHE_DIR'] = str(self.path / 'cache')
+        command = ['python3', str(SCRIPT), mode]
+        if wrapper:
+            command = ['bash', str(self.path / 'wrapper/scripts/gh-as-author.sh'), '--']
+            env.update(OP_PREFLIGHT_AUTHOR_PAT='ghp_fixture', GH_AS_AUTHOR_IDENTITY='nathanjohnpayne',
+                       MERGEPATH_GH_TRANSPORT='gh',
+                       GH_AS_AUTHOR_TRACE_MARKER=str(self.path / 'write-trace'))
+        return subprocess.run([*command, 'gh', 'pr', 'merge', '123',
                                *(args or ['--admin', '--match-head-commit', HEAD])], env=env,
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, timeout=60)
+
+    def assert_inventory_refused(self, pages, message=None, *, mode='prepare'):
+        self.state['inventory_pages'] = pages
+        result = self.run_prepare(mode=mode)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        if message:
+            self.assertIn(message, result.stderr)
+        self.assertFalse((self.path / 'posted.json').exists())
+        calls = [json.loads(line) for line in (self.path / 'calls').read_text().splitlines()]
+        self.assertFalse(any('-f' in call and any(value.startswith('body=') for value in call) for call in calls))
 
     def test_exact_record_posts_quote_red_gates_before_writer(self):
         result = self.run_prepare()
@@ -82,28 +157,248 @@ print(json.dumps(result))
         self.assertIn(AUTH['authorization_quote'], posted['body'])
         self.assertIn('Merge clearance gate', posted['body'])
         calls = [json.loads(line) for line in (self.path / 'calls').read_text().splitlines()]
-        self.assertEqual(calls[-1][:3], ['api', '--paginate', '--slurp'])
+        self.assertEqual(calls[-1][:3], ['pr', 'view', URL])
+        self.assertEqual(calls[-1][-1], override.PR_FIELDS + ',labels')
 
-    def test_rollup_at_cli_ceiling_refuses_before_recording(self):
-        self.state['pr']['statusCheckRollup'] = [{'name': 'green', 'conclusion': 'SUCCESS'}] * 100
-        result = self.run_prepare()
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn('may be truncated', result.stderr)
-        self.assertFalse((self.path / 'posted.json').exists())
-        self.state['pr']['statusCheckRollup'].pop()
-        self.assertEqual(self.run_prepare().returncode, 0)
+    def test_complete_histories_at_and_above_cli_ceiling_publish_all_non_green_names(self):
+        for count in (99, 100, 101, 203):
+            with self.subTest(count=count):
+                checks = [check_run(index, f'green-{index}') for index in range(count - 1)]
+                checks.append(commit_status('red', 'off-page-status', 'PENDING'))
+                self.state['inventory_pages'] = inventory_pages(self.state['pr'], checks)
+                result = self.run_prepare()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                posted = json.loads((self.path / 'posted.json').read_text())
+                record = json.loads(posted['body'].split('```json\n')[1].split('\n```')[0])
+                self.assertEqual(record['observed_red_gates'], ['off-page-status'])
+                calls = [json.loads(line) for line in (self.path / 'calls').read_text().splitlines()]
+                cursors = [value for call in calls if call[:2] == ['api', 'graphql']
+                           for value in call if value.startswith('cursor=')]
+                self.assertEqual(cursors, ['cursor=null', *[f'cursor=page-{index}' for index in range(1, len(self.state['inventory_pages']))]] * 3)
+                (self.path / 'calls').unlink()
+                (self.path / 'posted.json').unlink()
 
     def test_read_only_authorization_check_performs_no_github_write(self):
-        (self.path / 'state.json').write_text(json.dumps(self.state))
-        env = {**os.environ, 'PATH': str(self.path) + os.pathsep + os.environ['PATH'],
-               'OVERRIDE_CASE': str(self.path), 'GH_AS_AUTHOR_RECORD_IDENTITY': 'nathanjohnpayne',
-               'BREAK_GLASS_ADMIN': URL + '@' + HEAD,
-               'MERGEPATH_OWNER_ADMIN_AUTHORIZATION': json.dumps(AUTH)}
-        result = subprocess.run(['python3', str(SCRIPT), 'check', 'gh', 'pr', 'merge', '123',
-                                 '--admin', '--match-head-commit', HEAD], env=env,
-                                capture_output=True, text=True)
+        checks = [check_run(index) for index in range(203)]
+        self.state['inventory_pages'] = inventory_pages(self.state['pr'], checks)
+        result = self.run_prepare(mode='check')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.path / 'posted.json').exists())
+        calls = [json.loads(line) for line in (self.path / 'calls').read_text().splitlines()]
+        self.assertEqual(sum(call[:2] == ['api', 'graphql'] for call in calls), 6)
+
+    def test_empty_inventory_is_distinguished_from_missing_rollup(self):
+        empty = inventory_pages(self.state['pr'], [])
+        null = copy.deepcopy(empty)
+        null[0]['data']['repository']['object']['statusCheckRollup'] = None
+        for pages in (empty, null):
+            with self.subTest(pages=pages):
+                self.state['inventory_pages'] = pages
+                result = self.run_prepare()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                (self.path / 'posted.json').unlink()
+        missing = copy.deepcopy(empty)
+        del missing[0]['data']['repository']['object']['statusCheckRollup']
+        self.assert_inventory_refused(missing)
+
+    def test_missing_failed_and_disappearing_later_pages_refuse_before_publication(self):
+        pages = inventory_pages(self.state['pr'], [check_run(index) for index in range(101)])
+        self.assert_inventory_refused(pages[:1])
+        self.state['inventory_fail_page'] = 1
+        self.assert_inventory_refused(pages)
+        del self.state['inventory_fail_page']
+        pages[1]['data']['repository']['object']['statusCheckRollup'] = None
+        self.assert_inventory_refused(pages, 'disappeared')
+
+    def test_malformed_graphql_envelopes_and_contexts_never_publish(self):
+        baseline = self.state['inventory_pages']
+        for page in (None, [], {}, {'errors': [{'message': 'partial read'}], **baseline[0]},
+                     {'data': {'repository': None}}):
+            with self.subTest(page=page):
+                self.assert_inventory_refused([page])
+        for node in (None, 'bad', {}, {'id': 'x', '__typename': 'OtherContext'},
+                     {**check_run('x'), 'status': None}, {**check_run('x'), 'conclusion': 1},
+                     {**check_run('x'), 'checkSuite': None}, {**commit_status('x'), 'creator': []}):
+            with self.subTest(node=node):
+                pages = copy.deepcopy(baseline)
+                pages[0]['data']['repository']['object']['statusCheckRollup']['contexts']['nodes'] = [node]
+                self.assert_inventory_refused(pages)
+
+    def test_malformed_counts_pagination_and_wrong_commit_refuse(self):
+        baseline = inventory_pages(self.state['pr'], [check_run(index) for index in range(101)])
+        cases = [
+            ('totalCount', True), ('totalCount', -1), ('totalCount', 102),
+            ('checkRunCount', '101'), ('statusContextCount', 1),
+            ('nodes', None), ('pageInfo', None), ('pageInfo', {}),
+            ('pageInfo', {'hasNextPage': 'true', 'endCursor': 'page-1'}),
+            ('pageInfo', {'hasNextPage': True, 'endCursor': None}),
+            ('pageInfo', {'hasNextPage': True, 'endCursor': 7}),
+            ('pageInfo', {'hasNextPage': False, 'endCursor': 'page-1'}),
+        ]
+        for key, value in cases:
+            with self.subTest(key=key, value=value):
+                pages = copy.deepcopy(baseline)
+                pages[0]['data']['repository']['object']['statusCheckRollup']['contexts'][key] = value
+                self.assert_inventory_refused(pages)
+        pages = copy.deepcopy(baseline)
+        pages[0]['data']['repository']['object']['oid'] = 'c' * 40
+        self.assert_inventory_refused(pages, 'different commit')
+        for field in ('totalCount', 'nodes', 'pageInfo'):
+            pages = copy.deepcopy(baseline)
+            del pages[0]['data']['repository']['object']['statusCheckRollup']['contexts'][field]
+            self.assert_inventory_refused(pages)
+
+    def test_duplicate_contexts_count_drift_and_repeated_cursor_refuse(self):
+        baseline = inventory_pages(self.state['pr'], [check_run(index) for index in range(203)])
+        pages = copy.deepcopy(baseline)
+        connection = pages[1]['data']['repository']['object']['statusCheckRollup']['contexts']
+        connection['nodes'][0]['id'] = '0'
+        self.assert_inventory_refused(pages, 'duplicate contexts')
+        pages = copy.deepcopy(baseline)
+        connection = pages[1]['data']['repository']['object']['statusCheckRollup']['contexts']
+        connection['totalCount'] += 1
+        connection['checkRunCount'] += 1
+        self.assert_inventory_refused(pages, 'changed during pagination')
+        pages = copy.deepcopy(baseline)
+        pages[1]['data']['repository']['object']['statusCheckRollup']['contexts']['pageInfo']['endCursor'] = 'page-1'
+        self.assert_inventory_refused(pages, 'cursor does not advance')
+
+    def test_per_type_counts_must_match_the_observed_nodes(self):
+        pages = inventory_pages(self.state['pr'], [commit_status('legacy', state='FAILURE')])
+        connection = pages[0]['data']['repository']['object']['statusCheckRollup']['contexts']
+        connection.update(checkRunCount=1, statusContextCount=0)
+        self.assert_inventory_refused(pages, 'incomplete')
+
+    def test_same_name_success_never_masks_a_later_non_green_producer(self):
+        checks = [check_run('old-run', 'shared-check', producer='old-producer'),
+                  commit_status('old-status', 'shared-status')]
+        checks += [check_run(index, f'green-{index}') for index in range(98)]
+        checks += [check_run('new-run', 'shared-check', 'FAILURE', producer='new-producer'),
+                   commit_status('new-status', 'shared-status', 'PENDING'),
+                   check_run('pending-run', 'pending-check', 'SUCCESS', status='IN_PROGRESS'),
+                   check_run('skipped', conclusion='SKIPPED'), check_run('neutral', conclusion='NEUTRAL')]
+        self.state['inventory_pages'] = inventory_pages(self.state['pr'], checks)
+        result = self.run_prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        posted = json.loads((self.path / 'posted.json').read_text())
+        record = json.loads(posted['body'].split('```json\n')[1].split('\n```')[0])
+        self.assertEqual(record['observed_red_gates'], ['pending-check', 'shared-check', 'shared-status'])
+        self.assertEqual(set(record), override.FIELDS | {'observed_codex_bot_login', 'observed_red_gates',
+                                                       'observed_codex_inflight', 'observed_fresh_escalation'})
+
+    def test_head_base_branch_and_state_changes_during_pagination_refuse(self):
+        pages = inventory_pages(self.state['pr'], [check_run(index) for index in range(101)])
+        for changes in ({'url': URL.replace('123', '124')}, {'headRefOid': 'c' * 40},
+                        {'baseRefOid': 'c' * 40}, {'baseRefName': 'other'}, {'state': 'CLOSED'}):
+            with self.subTest(changes=changes):
+                self.state['page_pr_change'] = changes
+                self.assert_inventory_refused(pages, 'open PR' if 'state' in changes else 'changed during check pagination')
+
+    def test_prepublication_inventory_drift_refuses_even_with_the_same_red_gate_names(self):
+        baseline = self.state['inventory_pages']
+        for field, value in (('id', 'replacement'), ('status', 'IN_PROGRESS'),
+                             ('startedAt', '2026-01-01T00:00:01Z'),
+                             ('checkSuite', {'id': 'other-suite', 'app': {'id': 'other-producer'}})):
+            with self.subTest(field=field):
+                changed = copy.deepcopy(baseline)
+                changed[0]['data']['repository']['object']['statusCheckRollup']['contexts']['nodes'][0][field] = value
+                self.state['inventory_passes'] = [baseline, changed]
+                for mode in ('prepare', 'check'):
+                    self.assert_inventory_refused(baseline, 'changed before recording', mode=mode)
+
+    def test_inventory_order_changes_do_not_change_the_observation(self):
+        checks = [check_run('a'), commit_status('b', state='PENDING')]
+        self.state['inventory_passes'] = [inventory_pages(self.state['pr'], checks),
+                                          inventory_pages(self.state['pr'], list(reversed(checks)))]
+        result = self.run_prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_final_read_failure_or_check_change_refuses_after_recording(self):
+        for key in ('post_inventory_change', 'inventory_fail_after_post'):
+            with self.subTest(key=key):
+                self.state[key] = True
+                result = self.run_prepare()
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertTrue((self.path / 'posted.json').exists())
+                self.state.pop(key)
+                (self.path / 'posted.json').unlink()
+
+    def test_final_pr_fences_apply_before_and_after_publication(self):
+        for read in (2, 3):
+            for field, value in (('url', URL.replace('123', '124')), ('headRefOid', 'c' * 40),
+                                 ('baseRefOid', 'c' * 40), ('baseRefName', 'other'),
+                                 ('state', 'CLOSED'), ('labels', [{'name': 'human-hold'}]), ('labels', None)):
+                with self.subTest(read=read, field=field):
+                    self.state['pr_read_changes'] = {str(read): {field: value}}
+                    result = self.run_prepare()
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual((self.path / 'posted.json').exists(), read == 3)
+                    (self.path / 'posted.json').unlink(missing_ok=True)
+
+    def test_unanswered_request_arriving_before_publication_blocks_without_writing(self):
+        self.state['prepost_codex'] = True
+        result = self.run_prepare()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse((self.path / 'posted.json').exists())
+        result = self.run_prepare({**AUTH, 'allow_codex_inflight': True})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        posted = json.loads((self.path / 'posted.json').read_text())
+        record = json.loads(posted['body'].split('```json\n')[1].split('\n```')[0])
+        self.assertTrue(record['observed_codex_inflight'])
+
+    def test_escalation_arriving_before_or_after_publication_keeps_its_explicit_exception(self):
+        for key in ('prepost_escalation', 'late_escalation'):
+            with self.subTest(key=key):
+                self.state[key] = True
+                result = self.run_prepare()
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual((self.path / 'posted.json').exists(), key == 'late_escalation')
+                (self.path / 'posted.json').unlink(missing_ok=True)
+                result = self.run_prepare({**AUTH, 'allow_needs_human_review': True})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                (self.path / 'posted.json').unlink()
+                self.state.pop(key)
+
+    def test_actual_author_wrapper_only_reaches_writer_after_complete_stable_inventory(self):
+        # Canonical tests also run in consumers whose governing author can
+        # differ. Exercise production files under a fixture-owned policy.
+        wrapper_root = self.path / 'wrapper'
+        for relative in ('scripts/gh-as-author.sh', 'scripts/identity-check.sh',
+                         'scripts/workflow/owner-admin-override.py', 'scripts/lib/gh-token-resolver.sh',
+                         'scripts/lib/gh-command-classifier.sh', 'scripts/lib/gh-rest-transport.sh',
+                         'scripts/lib/credential-class.sh',
+                         'scripts/lib/pr-body-contract.sh', 'scripts/lib/pr-body-contract.mjs',
+                         'scripts/lib/reviewers-helpers.sh', 'scripts/lib/feedback-policy-helpers.sh'):
+            target = wrapper_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / relative, target)
+        (wrapper_root / '.github').mkdir()
+        (wrapper_root / '.github/review-policy.yml').write_text('author_identity: nathanjohnpayne\n')
+        baseline = copy.deepcopy(self.state)
+        cases = {
+            'complete-large-history': {'inventory_pages': inventory_pages(self.state['pr'], [check_run(index) for index in range(203)])},
+            'failed-page': {'inventory_pages': inventory_pages(self.state['pr'], [check_run(index) for index in range(101)]),
+                            'inventory_fail_page': 1},
+            'prepublication-drift': {'inventory_passes': [self.state['inventory_pages'], inventory_pages(self.state['pr'], [])]},
+            'postpublication-drift': {'post_inventory_change': True},
+            'bad-comment-author': {'bad_readback': True},
+            'wrong-identity': {'identity': 'nathanpayne-codex'},
+        }
+        for name, changes in cases.items():
+            with self.subTest(name=name):
+                self.state = {**copy.deepcopy(baseline), **changes}
+                for artifact in ('posted.json', 'merged.json', 'write-trace'):
+                    (self.path / artifact).unlink(missing_ok=True)
+                result = self.run_prepare(wrapper=True)
+                success = name == 'complete-large-history'
+                self.assertEqual(result.returncode, 0 if success else 2, result.stderr)
+                self.assertEqual((self.path / 'merged.json').exists(), success)
+                self.assertEqual((self.path / 'write-trace').exists(), success)
+                self.assertEqual((self.path / 'posted.json').exists(),
+                                 name in ('complete-large-history', 'postpublication-drift', 'bad-comment-author'))
+                if success:
+                    self.assertEqual(json.loads((self.path / 'merged.json').read_text()),
+                                     ['pr', 'merge', '123', '--admin', '--match-head-commit', HEAD])
 
     def test_different_head_and_boolean_pin_refuse_without_post(self):
         for pin in ('1', URL + '@' + 'b' * 40):
@@ -320,6 +615,12 @@ const github={rest:{issues:{listComments:'comments'},pulls:{listReviews:'reviews
             ['graphql', '--input', 'payload.json'],
             ['graphql', '--input=-'],
             ['graphql', '-f', 'query=query { viewer {login}}', '-f', 'query=mutation {mergePullRequest(input:{}){clientMutationId}}'],
+            # Arming auto-merge or entering the queue merges without the gates too.
+            ['graphql', '-f', 'query=mutation { enablePullRequestAutoMerge(input:{pullRequestId:"PR_x"}) {clientMutationId}}'],
+            ['graphql', '-f', 'query=mutation { disablePullRequestAutoMerge(input:{pullRequestId:"PR_x"}) {clientMutationId}}'],
+            ['graphql', '-f', 'query=mutation { addPullRequestToMergeQueue(input:{pullRequestId:"PR_x"}) {clientMutationId}}'],
+            ['graphql', '-f', 'query=mutation { enqueuePullRequest(input:{pullRequestId:"PR_x"}) {clientMutationId}}'],
+            ['graphql', '-f', 'query=mutation { dequeuePullRequest(input:{id:"MQE_x"}) {clientMutationId}}'],
         ]
         for request in requests:
             with self.subTest(request=request), self.assertRaisesRegex(ValueError, 'merge|literal query'):

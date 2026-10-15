@@ -45,6 +45,15 @@ test('the CodeRabbit provider barrier entrypoint is an exact sensitive path', ()
   }
 });
 
+test('the native/API lineage gate entrypoint is an exact sensitive path', () => {
+  assert.deepEqual(classify('+ordinary change', ['scripts/gate-api-lineage-blocking.sh']), {
+    decision: 'human-review', tripwires: ['authorization-policy-publisher-or-credentials'],
+  });
+  for (const file of ['scripts/gate-api-lineage-blocking.sh.example', 'scripts/gate-api-lineage-blocking-extra.sh', 'scripts/gate-api-lineage-Blocking.sh', 'nested/scripts/gate-api-lineage-blocking.sh']) {
+    assert.deepEqual(classify('+ordinary change', [file]), { decision: 'model-review', tripwires: [] }, file);
+  }
+});
+
 test('captured Git objects determine both rename sides and complete wave scope', t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'p4b-escalation-test-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));

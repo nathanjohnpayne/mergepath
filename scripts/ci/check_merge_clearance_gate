@@ -32,6 +32,9 @@ if ! ci_check_select_mode "$@"; then
 fi
 
 SCRIPT="scripts/merge-clearance-gate.sh"
+# #2247: the event job's pending arm runs this helper from the trusted
+# checkout; without it every pending verdict keeps failing the native run.
+LINEAGE_HELPER="scripts/gate-api-lineage-blocking.sh"
 # WORKFLOW path is overridable so the test suite can point the workflow-shape
 # assertions (in particular the job-name contract below) at a fixture without
 # touching the canonical workflow on disk. Defaults to the real workflow.
@@ -41,7 +44,7 @@ TEST="tests/test_merge_clearance_gate.sh"
 FAILED=0
 
 # Existence + executability checks.
-for rel in "$SCRIPT" "$TEST"; do
+for rel in "$SCRIPT" "$LINEAGE_HELPER" "$TEST"; do
   if [ ! -f "$rel" ]; then
     echo "FAIL: Missing required file: $rel"
     FAILED=1
@@ -412,8 +415,17 @@ if [ -f "$WORKFLOW" ]; then
         FAILED=1
         continue
       fi
-      if ! mcg_has "$mcg_pblock" 'gh api -X POST "repos/$REPO/check-runs"' \
-         || ! mcg_has "$mcg_pblock" '-f name="$CHECK_NAME"'; then
+      # #906's trusted sweep/dispatch use the narrow owned-generation helper.
+      # Runtime tests execute the actual callers and the helper together; this
+      # legacy text fence recognizes its exact tuple, not an arbitrary command.
+      mcg_owned_generation=0
+      if mcg_has "$mcg_pblock" '. scripts/workflow/required-check-generation.sh' \
+          && mcg_has "$mcg_pblock" 'generation_id=$(rcg_open "$REPO" "$PR" "$head_sha" "$CHECK_NAME")' \
+          && mcg_has "$mcg_pblock" 'rcg_close "$REPO" "$PR" "$head_sha" "$CHECK_NAME" "$generation_id" "$conclusion"'; then
+        mcg_owned_generation=1
+      fi
+      if [ "$mcg_owned_generation" -ne 1 ] && { ! mcg_has "$mcg_pblock" 'gh api -X POST "repos/$REPO/check-runs"' \
+         || ! mcg_has "$mcg_pblock" '-f name="$CHECK_NAME"'; }; then
         echo "FAIL: the '$mcg_producer' job must POST a check_run under CHECK_NAME."
         echo "      A POST without the name flag, or a CHECK_NAME declaration without"
         echo "      a POST, leaves that trigger path no longer refreshing the required"
@@ -462,7 +474,7 @@ if [ -f "$WORKFLOW" ]; then
         echo "      (a gh read loop or gh pr list), not from an arbitrary assignment."
         FAILED=1
       fi
-      if ! grep -qE -- '-f head_sha="\$(HEAD_SHA|head_sha)"' <<<"$mcg_pblock"; then
+      if [ "$mcg_owned_generation" -ne 1 ] && ! grep -qE -- '-f head_sha="\$(HEAD_SHA|head_sha)"' <<<"$mcg_pblock"; then
         echo "FAIL: the '$mcg_producer' job must POST head_sha as the per-PR head it"
         echo "      resolved (a shell variable), not a workflow expression. The Checks"
         echo "      API rejects a create-check-run without head_sha at all, and a"
@@ -495,7 +507,7 @@ if [ -f "$WORKFLOW" ]; then
       # The POST must publish the MAPPED value (Codex P2 on #849). Pinning the
       # case arms proves the mapping exists; it says nothing about what the
       # POST actually sends, and -f conclusion="success" satisfied both.
-      if ! mcg_has "$mcg_pblock" '-f conclusion="$conclusion"'; then
+      if [ "$mcg_owned_generation" -ne 1 ] && ! mcg_has "$mcg_pblock" '-f conclusion="$conclusion"'; then
         echo "FAIL: the '$mcg_producer' job must POST -f conclusion=\"\$conclusion\" —"
         echo "      the value it mapped from the gate. A literal publishes a verdict"
         echo "      the mapping never produced."
@@ -1106,6 +1118,12 @@ STEP_IF_ALLOWED = {
         "steps.find.outputs.prs != ''",
     ("merge-clearance-gate", "Close the required check_run (#841 phase 2)"):
         "${{ !cancelled() && steps.open.outputs.id != '' }}",
+    # #2247: the lineage confirmation runs only for the script's explicit
+    # pending verdict on a run that opened its own Checks-API hold. Any other
+    # condition either skips it (fail closed: the native run stays red) or
+    # runs it where there is no hold of this run's own to rely on.
+    ("merge-clearance-gate", "Confirm the Checks-API lineage blocks while pending (#2247)"):
+        "${{ steps.gate.outputs.pending == 'true' && steps.open.outputs.id != '' }}",
 }
 for key in PRODUCERS:
     job = jobs.get(key)
@@ -1229,6 +1247,53 @@ for key in PRODUCERS:
                 "      token-free, but its run body invokes gh. That exemption is only",
                 "      for steps making no authenticated call at all: drop the pin and",
                 "      bind GH_TOKEN to ${{ secrets.GITHUB_TOKEN }} (#854).")
+
+# Property 5 (#2247)—the pending arm of the native conclusion is bound to
+# the evaluation and to the lineage confirmation, never to constants. The
+# arm turns a blocked verdict into a non-failing job-native run; it is safe
+# only because the script said `pending` AND the Checks-API lineage was
+# confirmed red or in progress on this head. Rebinding either input to a
+# literal, or confirming a different context or run, makes every blocked
+# verdict non-failing while the shell text still reads correctly.
+PENDING_STEP = "Confirm the Checks-API lineage blocks while pending (#2247)"
+report_step = step_named(event_job or {}, "Report gate verdict")
+lineage_step = step_named(event_job or {}, PENDING_STEP)
+if report_step == "ambiguous" or lineage_step == "ambiguous":
+    bad("FAIL: [#2247 pending arm] more than one step in merge-clearance-gate",
+        "      carries the report or lineage-confirmation step name; a decoy",
+        "      sharing the name can shadow the real step's bindings.")
+elif report_step is None:
+    bad("FAIL: [#2247 pending arm] the merge-clearance-gate job has no",
+        "      'Report gate verdict' step, so nothing sets the native conclusion.")
+else:
+    renv = report_step.get("env") or {}
+    if renv.get("PENDING") != "${{ steps.gate.outputs.pending }}" \
+            or renv.get("API_BLOCKING") != "${{ steps.lineage.outputs.api_blocking }}":
+        bad("FAIL: [#2247 pending arm] 'Report gate verdict' must bind PENDING to",
+            "      exactly ${{ steps.gate.outputs.pending }} and API_BLOCKING to exactly",
+            "      ${{ steps.lineage.outputs.api_blocking }} (got %r / %r)." % (renv.get("PENDING"), renv.get("API_BLOCKING")),
+            "      Any other binding lets a blocked verdict conclude the required",
+            "      job-native run non-failing without the script saying pending or",
+            "      the Checks-API lineage being confirmed red on the head.")
+    if lineage_step is None:
+        bad("FAIL: [#2247 pending arm] the merge-clearance-gate job has no",
+            "      %r step, so API_BLOCKING has no producer." % PENDING_STEP)
+    else:
+        lenv = lineage_step.get("env") or {}
+        lrun = strip_comments(lineage_step.get("run") or "")
+        if lineage_step.get("id") != "lineage":
+            bad("FAIL: [#2247 pending arm] the lineage-confirmation step must carry",
+                "      id: lineage; the report step reads steps.lineage.outputs.")
+        if lenv.get("CHECK_NAME") != "Merge clearance gate" \
+                or lenv.get("RUN_ID") != "${{ github.run_id }}":
+            bad("FAIL: [#2247 pending arm] the lineage-confirmation step must bind",
+                "      CHECK_NAME to exactly 'Merge clearance gate' and RUN_ID to exactly",
+                "      ${{ github.run_id }} (got %r / %r). Confirming another context," % (lenv.get("CHECK_NAME"), lenv.get("RUN_ID")),
+                "      or another run's suite, proves nothing about this one.")
+        if "scripts/gate-api-lineage-blocking.sh" not in lrun:
+            bad("FAIL: [#2247 pending arm] the lineage-confirmation step must run",
+                "      scripts/gate-api-lineage-blocking.sh, the helper that states and",
+                "      checks each condition the pending arm relies on.")
 
 if failures:
     print("\n".join(failures))
