@@ -47,7 +47,9 @@ class TriggerGuardTests(unittest.TestCase):
                      ["api", "-X", "POST", "repos/o/r/pulls/123/reviews", "--input", str(payload)],
                      ["api", "repos/o/r/pulls/123/reviews", "-f", "body=" + body.read_text()],
                      ["api", "-X", "PUT", "repos/o/r/pulls/123/reviews/456", "-f", "body=" + body.read_text()],
-                     ["api", "repos/o/r/pulls/123/comments/456/replies", "-f", "body=" + body.read_text()]):
+                     ["api", "repos/o/r/pulls/123/comments/456/replies", "-f", "body=" + body.read_text()],
+                     ["api", "repos/o/r/pulls/123/reviews/456/events", "-f", "body=" + body.read_text(), "-f", "event=COMMENT"],
+                     ["api", "repos/o/r/pulls/123/reviews/456/events", "--input", str(payload)]):
             with self.subTest(args=args), self.assertRaises(guard.Refused):
                 self.check(args)
 
@@ -138,6 +140,48 @@ class TriggerGuardTests(unittest.TestCase):
         result = subprocess.run(["bash", str(fixture / "scripts/gh-as-author.sh"), "--", "gh", "pr", "comment", "123", "--repo", "o/r", "--body", "  @CoDeX  review\n"], env=env, capture_output=True, timeout=10)
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(["pr comment 123 --repo o/r --body @codex review"], (fixture / "writes").read_text().splitlines())
+
+    def test_attached_short_options_preserve_supported_spellings(self):
+        body = self.root / "attached.md"
+        body.write_text("Safe attached body\n")
+        for args in (["pr", "comment", "123", "-Ro/r", "-bSafe body"],
+                     ["pr", "comment", "123", "-R=o/r", "-F=" + str(body)],
+                     ["api", "-XPOST", "repos/o/r/pulls/123/reviews/456/events", "-fbody=Safe body"]):
+            with self.subTest(args=args):
+                _, meta = self.check(args)
+                self.assertTrue(meta["guarded"])
+                self.assertFalse(meta["trigger"])
+
+    def test_authorization_metadata_errors_cannot_dispatch(self):
+        fixture = self.root / "authorization"
+        (fixture / "scripts").mkdir(parents=True)
+        call = fixture / "called"
+        requester = fixture / "scripts/codex-review-request.sh"
+        requester.write_text("#!/bin/sh\ntouch "+str(call)+"\nexit 0\n")
+        requester.chmod(0o755)
+        helper = ROOT / "scripts/lib/gh-comment-trigger-guard.sh"
+        command = 'source "$1"; ROOT="$2"; GH_COMMENT_GUARD_STATE="$3"; gh_comment_guard_authorize'
+        metadata = self.state / "metadata.json"
+        for body in (None, "{", '{"trigger":"false"}', '{"trigger":null}'):
+            if body is None:
+                metadata.unlink(missing_ok=True)
+            else:
+                metadata.write_text(body)
+            result = subprocess.run(["bash", "-c", command, "test", str(helper), str(fixture), str(self.state)], capture_output=True)
+            self.assertNotEqual(0, result.returncode, body)
+            self.assertFalse(call.exists())
+        metadata.write_text('{"trigger":false}')
+        result = subprocess.run(["bash", "-c", command, "test", str(helper), str(fixture), str(self.state)], capture_output=True)
+        self.assertEqual(0, result.returncode)
+        fakebin = fixture / "bin"
+        fakebin.mkdir()
+        (fakebin / "jq").write_text("#!/bin/sh\nexit 127\n")
+        (fakebin / "jq").chmod(0o755)
+        env = dict(os.environ, PATH=str(fakebin)+os.pathsep+os.environ["PATH"])
+        metadata.write_text('{"trigger":true}')
+        result = subprocess.run(["bash", "-c", command, "test", str(helper), str(fixture), str(self.state)], env=env, capture_output=True)
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse(call.exists())
 
     def test_unreadable_payload_and_interactive_edits_refuse(self):
         for args in (["pr", "comment", "123", "-F", str(self.root / "missing")],

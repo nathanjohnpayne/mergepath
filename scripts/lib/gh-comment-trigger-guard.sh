@@ -17,15 +17,21 @@ gh_comment_guard_prepare() {
 # Preserve the REST transport's existing materialized-file-only CLI grammar.
 # Raw API stdin remains a separate documented transport form.
 gh_comment_guard_check_transport() {
-  if [ "$1" = rest ] && jq -e '.cli_stdin == true' "$GH_COMMENT_GUARD_STATE/metadata.json" >/dev/null; then
+  local cli_stdin
+  if [ "$1" != rest ]; then return 0; fi
+  cli_stdin=$(jq -er '(.cli_stdin // false) | if type == "boolean" then tostring else error("invalid stdin metadata") end' \
+    "$GH_COMMENT_GUARD_STATE/metadata.json") || return 1
+  if [ "$cli_stdin" = true ]; then
     echo "comment-trigger-guard: the REST transport accepts exactly a materialized body file; write stdin to a file first." >&2
     return 1
   fi
 }
 
 gh_comment_guard_authorize() {
-  local metadata="$GH_COMMENT_GUARD_STATE/metadata.json" repo pr head result
-  if ! jq -e '.trigger == true' "$metadata" >/dev/null; then return 0; fi
+  local metadata="$GH_COMMENT_GUARD_STATE/metadata.json" repo pr head result trigger
+  trigger=$(jq -er '.trigger | if type == "boolean" then tostring else error("invalid trigger metadata") end' \
+    "$metadata") || return 1
+  if [ "$trigger" = false ]; then return 0; fi
   repo=$(jq -er .repo "$metadata") && pr=$(jq -er .pr "$metadata") && head=$(jq -er .head "$metadata") || return 1
   result=$(MERGEPATH_PHASE_4A_GATED=true MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$head" \
     GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-$TOKEN}" \

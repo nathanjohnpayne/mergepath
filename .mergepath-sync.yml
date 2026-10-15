@@ -2189,6 +2189,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/gh-comment-trigger-guard.sh" # author-wrapper comment payload guard (#2158)
       - "scripts/workflow/merge-writer.py"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/workflow/owner-admin-override.py"
@@ -2217,6 +2218,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/gh-comment-trigger-guard.sh" # author-wrapper comment payload guard (#2158)
       - "scripts/workflow/merge-writer.py"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/workflow/owner-admin-override.py"
@@ -2239,6 +2241,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/gh-comment-trigger-guard.sh" # author-wrapper comment payload guard (#2158)
       - "scripts/workflow/merge-writer.py"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/workflow/owner-admin-override.py"
@@ -2515,6 +2518,7 @@ paths:
     # wave (check_gh_as_author missing its tests on every consumer).
     requires:
       - "tests/test_required_check_generations.py"
+      - "scripts/lib/gh-comment-trigger-guard.sh" # author-wrapper comment payload guard (#2158)
       - "tests/test_gh_comment_trigger_guard.py"
       - "tests/test_feedback_archive_identities.sh"   # #1437, offline enrollment and producer/relay cases
       - "scripts/lib/feedback-archive-identities.sh"   # #1437, direct CI-kit runtime closure
@@ -2683,6 +2687,7 @@ paths:
     # helpers (parse_manifest_paths.sh, match_protected_paths.sh) are
     # already inside this kit; the two scripts/lib/ deps are declared here.
     requires:
+      - "scripts/lib/gh-comment-trigger-guard.sh" # author-wrapper comment payload guard (#2158)
       - "scripts/workflow/merge-writer.py"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/workflow/owner-admin-override.py"

@@ -65,7 +65,7 @@ def inspect(argv, role, state=None):
             if value.startswith(name + "="):
                 return value[len(name) + 1:], index, name + "=", index + 1
             if len(name) == 2 and value.startswith(name) and len(value) > 2:
-                return value[2:].removeprefix("="), index, name, index + 1
+                return (value[3:] if value[2:3] == "=" else value[2:]), index, name, index + 1
         return None
 
     # Wrappers already require a literal built-in gh payload. Allow its global
@@ -164,7 +164,7 @@ def inspect(argv, role, state=None):
         path = unquote(urlsplit(endpoint).path).lstrip("/")
         method = method.upper() if method else ("POST" if fields or inputs else "GET")
         if method not in ("POST", "PATCH", "PUT") or not re.fullmatch(
-            r"repos/[^/]+/[^/]+/(?:issues/(?:[0-9]+/comments|comments/[0-9]+)|pulls/(?:[0-9]+/(?:comments(?:/[0-9]+/replies)?|reviews(?:/[0-9]+)?)|comments/[0-9]+))", path
+            r"repos/[^/]+/[^/]+/(?:issues/(?:[0-9]+/comments|comments/[0-9]+)|pulls/(?:[0-9]+/(?:comments(?:/[0-9]+/replies)?|reviews(?:/[0-9]+(?:/events)?)?)|comments/[0-9]+))", path
         ):
             return args, {"guarded": False, "trigger": False}
         channel = "api-comment"
