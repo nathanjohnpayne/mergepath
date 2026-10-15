@@ -176,11 +176,26 @@ class TriggerGuardTests(unittest.TestCase):
         normalized, meta = guard.inspect(original, "author", self.state)
         self.assertEqual(original, normalized)
         self.assertFalse(meta["guarded"])
-        for args in (["pr", "close", "123"], ["pr", "close", "123", "--comment", "Done"],
+        for args in (["pr", "close", "123", "--comment", "Done"],
                      ["-b", "Safe body", "pr", "comment", "123"]):
             _, meta = self.check(args)
             self.assertTrue(meta["guarded"])
             self.assertFalse(meta["trigger"])
+
+    def test_comment_free_closes_preserve_hook_scope(self):
+        for role in ("hook", "author", "reviewer"):
+            for args in (["pr", "close", "123"], ["pr", "close", "123", "--delete-branch"],
+                         ["issue", "close", "123"], ["issue", "close", "123", "--reason", "completed"],
+                         ["-r", "completed", "issue", "close", "123"],
+                         ["issue", "-rcompleted", "close", "123"],
+                         ["pr", "close", "123", "-dd"], ["pr", "close", "123", "--comment", ""]):
+                with self.subTest(role=role, args=args):
+                    normalized, meta = self.check(args, role=role)
+                    self.assertEqual(["gh", *args], normalized)
+                    self.assertFalse(meta["guarded"])
+                    self.assertFalse(meta["trigger"])
+        with self.assertRaises(guard.Refused):
+            self.check(["-r", "completed", "pr", "review", "123", "--body", "Avoid @codex review"])
 
     def test_clustered_short_flags_fail_closed(self):
         body = "Avoid @codex review in prose"

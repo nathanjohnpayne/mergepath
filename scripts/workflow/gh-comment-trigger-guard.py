@@ -70,9 +70,17 @@ def inspect(argv, role, state=None):
         return None
 
     prefix_options = []
+    prefix_reason = False
 
     def take_prefix(index):
+        nonlocal prefix_reason
         value = args[index]
+        reason = option(index, ("-r",))
+        if reason and reason[0] in ("completed", "not planned", "duplicate"):
+            prefix_reason = True
+            prefix_options.extend(args[index:reason[3]])
+            del args[index:reason[3]]
+            return
         if value == "--":
             raise Refused("Place the command before the end-of-options marker.")
         # Review flags overlap closing-comment and issue-reason options.
@@ -117,6 +125,13 @@ def inspect(argv, role, state=None):
     channel = ""
     pr = ""
     if noun in ("pr", "issue") and verb in ("comment", "review", "close"):
+        if verb == "close" and not any(
+            value in ("--comment", "-c") or value.startswith("--comment=") or re.match(r"^-d*c", value)
+            for value in [*prefix_options, *args[i + 1:]]
+        ):
+            return original_args, {"guarded": False, "trigger": False}
+        if prefix_reason:
+            raise Refused("Place ambiguous reason options after their command verb.")
         channel = f"{noun}-{verb}"
         has_text = False
         i += 1
@@ -155,6 +170,8 @@ def inspect(argv, role, state=None):
             if not value.startswith("-") and not pr:
                 pr = value
             i += 1
+        if verb == "close" and not any(bodies) and not deferred:
+            return original_args, {"guarded": False, "trigger": False}
         if verb != "close" and not has_text and not deferred and "--delete-last" not in args:
             if channel != "pr-review" or not any(x in args for x in ("--approve", "-a")):
                 raise Refused("Provide an explicit comment body or body file before writing.")

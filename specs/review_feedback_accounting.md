@@ -122,6 +122,6 @@ Disposition replies and top-level acknowledgements are posted through the identi
 
 Missing-handoff provenance outages publish a failed check on the bound PR head. Artifact retirement is a separate best-effort step after successful persistence, and cleanup recognizes both completion-marker versions. Live lane verification classifies the configured branch prefix before requiring author metadata, and wave policy resolution uses its initially observed base SHA.
 
-Comment payload inspection includes the documented closing-comment form and value-taking options before the command group. Explicit API GET requests keep their read semantics. Ambiguous pre-verb comment and reason flags must move after the verb, where review flags and closing text have distinct meanings.
+Comment payload inspection includes the documented closing-comment form and value-taking options before the command group. Comment-free closes retain their existing hook scope. Explicit API GET requests keep their read semantics. Within comment writes, ambiguous pre-verb comment and reason flags must move after the verb, where review flags and closing text have distinct meanings.
 
 Spell short Boolean flags separately from body or API parameter flags; ambiguous clusters are refused before any write. Raw GraphQL mutation inspection is outside the CLI/REST write boundary and is tracked in [#2276](https://github.com/nathanjohnpayne/mergepath/issues/2276).

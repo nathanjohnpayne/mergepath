@@ -503,6 +503,22 @@ assert_rc_contains "raw REST trigger containment blocks" 2 "Reword the comment" 
   'scripts/gh-as-reviewer.sh -- gh api repos/o/r/issues/123/comments -f "body=Do not quote @codex review here."'
 assert_rc_contains "canonical requester invocation remains allowed" 0 "" \
   'scripts/codex-review-request.sh 123 o/r'
+assert_rc_contains "comment-free issue close retains existing hook scope" 0 "" \
+  'gh issue close 123'
+assert_rc_contains "comment-free PR close retains existing hook scope" 0 "" \
+  'gh pr close 123 --delete-branch'
+assert_rc_contains "comment-free prefix reason close retains existing hook scope" 0 "" \
+  'gh -r completed issue close 123'
+assert_rc_contains "comment-free pre-verb reason close retains existing hook scope" 0 "" \
+  'gh issue -rcompleted close 123'
+assert_rc_contains "comment-free clustered delete flags retain existing hook scope" 0 "" \
+  'gh pr close 123 -dd'
+assert_rc_contains "empty closing comment retains existing hook scope" 0 "" \
+  'gh pr close 123 --comment ""'
+assert_rc_contains "issue closing comment requires the verified wrapper" 2 "token-verifying wrapper" \
+  'gh issue close 123 --comment "Done"'
+assert_rc_contains "PR closing comment requires the verified wrapper" 2 "token-verifying wrapper" \
+  'gh pr close 123 --comment "Done"'
 
 assert_rc_contains "author wrapper codex trigger echo spoof blocked" 2 "reviewer token" \
   'echo "@codex review" && scripts/gh-as-author.sh -- gh pr comment 123 --body "ping"'
