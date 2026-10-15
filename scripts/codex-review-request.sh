@@ -797,9 +797,9 @@ esac
 # metadata, its label list, the paginated file list, a file list that is
 # EMPTY or disagrees with the PR's changed_files count (a short read is not a
 # small PR), the governing base policy or its threshold or path list, the
-# exclusion constant, the matcher, and a head that moved during the reads. A
-# skip therefore needs every signal positively read as "not gated" for one
-# head. Threshold and paths come from the policy that governs the PR (its
+# exclusion constant, the matcher, and a PR whose head, base or labels
+# changed during the reads. A skip therefore needs every signal positively
+# read as "not gated" for one snapshot of the PR. Threshold and paths come from the policy that governs the PR (its
 # base, at the base sha), as the labeler and the merge clearance gate read
 # them, not from this checkout's copy.
 phase_4a_gate_failsafe() {  # <cause>
@@ -814,7 +814,7 @@ phase_4a_gate_derived() {  # <reason>
 }
 derive_phase_4a_gate() {
   local pr_json has_label changed_files files_json files_tmp files_count head_sha base_ref base_sha default_branch
-  local policy_json threshold exclude_re lines patterns_json pattern_count pattern matcher changed matched live_head rc=0
+  local policy_json threshold exclude_re lines patterns_json pattern_count pattern matcher changed matched live_json live_fence rc=0
   local -a patterns=()
 
   pr_json=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>/dev/null) || {
@@ -965,18 +965,31 @@ derive_phase_4a_gate() {
     fi
   fi
 
-  # Head fence (Codex P1 on #2258): every read above describes $head_sha. A
-  # push landing during them could put a gated head behind an under-threshold
-  # verdict, and this skip path never reaches the moving-head guard. Re-read
-  # the head immediately before reporting "not gated"; drift or an unreadable
-  # head counts as gated.
-  live_head=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha' 2>/dev/null) || live_head=""
-  if [ -z "$live_head" ]; then
-    phase_4a_gate_failsafe "could not re-read the PR head before skipping"
+  # Snapshot fence (Codex P1 x2 on #2258): every read above describes one
+  # snapshot of the PR: its head, its base (whose policy was read) and its
+  # label state. A push, a base move to a stricter policy, or a
+  # needs-external-review label landing during the reads would leave this
+  # skip describing a PR that no longer exists, and the skip path never
+  # reaches the moving-head guard. Re-read the PR immediately before
+  # reporting "not gated": a label now present gates it; any other change, or
+  # an unreadable re-read, counts as gated.
+  live_json=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>/dev/null) || live_json=""
+  live_fence=$(printf '%s' "$live_json" | jq -r '
+    if type == "object" and (.labels | type) == "array"
+       and all(.labels[]; type == "object" and ((.name | type) == "string"))
+    then [(.head.sha // "" | strings), (.base.ref // "" | strings), (.base.sha // "" | strings),
+          ([.labels[].name] | index("needs-external-review") != null | tostring)] | join(" ")
+    else "" end' 2>/dev/null) || live_fence=""
+  if [ -z "$live_fence" ]; then
+    phase_4a_gate_failsafe "could not re-read the PR before skipping"
     return 0
   fi
-  if [ "$live_head" != "$head_sha" ]; then
-    phase_4a_gate_failsafe "the PR head moved from $head_sha to $live_head during the derivation"
+  if [ "$live_fence" = "$head_sha $base_ref $base_sha true" ]; then
+    phase_4a_gate_derived "the PR carries the needs-external-review label (added during the derivation)"
+    return 0
+  fi
+  if [ "$live_fence" != "$head_sha $base_ref $base_sha false" ]; then
+    phase_4a_gate_failsafe "the PR moved during the derivation (head/base/label was '$head_sha $base_ref $base_sha false', now '$live_fence')"
     return 0
   fi
 

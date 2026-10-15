@@ -156,16 +156,27 @@ case "$endpoint" in
     fi
     if [ "${2:-}" = "--jq" ]; then
       printf '%s\n' "${CODEX_TEST_LIVE_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+    elif [ "$n" -ge 2 ] && [ "${CODEX_TEST_FENCE_MODE:-}" = garbage ]; then
+      # #2257: the snapshot-fence re-read (the 2nd metadata read) is unreadable.
+      printf 'not json\n'
     else
       # #2257: labels and changed_files feed the Phase 4 gate derivation.
+      # CODEX_TEST_FENCE_MODE changes the PR from the 2nd metadata read on,
+      # i.e. between the derivation's snapshot and its fence re-read.
+      fence=""
+      [ "$n" -ge 2 ] && fence="${CODEX_TEST_FENCE_MODE:-}"
       jq -cn --argjson labels "${CODEX_TEST_PR_LABELS:-[]}" \
         --argjson changed "${CODEX_TEST_PR_CHANGED_FILES:-1}" \
-        --arg mode "${CODEX_TEST_PR_META:-ok}" '
+        --arg mode "${CODEX_TEST_PR_META:-ok}" --arg fence "$fence" '
         {head:{sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},base:{ref:"main",sha:"base-sha",repo:{default_branch:"main"}},
          labels:$labels, changed_files:$changed}
         | if $mode == "no-labels" then del(.labels)
           elif $mode == "no-changed-files" then del(.changed_files)
           elif $mode == "no-base" then del(.base)
+          else . end
+        | if $fence == "head-moved" then .head.sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          elif $fence == "base-moved" then .base.sha = "base-sha-2"
+          elif $fence == "label-added" then .labels += [{name: "needs-external-review"}]
           else . end'
     fi ;;
   repos/owner/repo/pulls/999/files)
@@ -642,6 +653,13 @@ test_derive_signals() {
   dir=$(derive_case label)
   rc=$(CODEX_TEST_PR_LABELS='[{"name":"bug"},{"name":"needs-external-review"}]' run_case "$dir" false)
   assert_derived_request "needs-external-review label" "$dir" "$rc" "the PR carries the needs-external-review label"
+  # The label is read from the first snapshot and short-circuits: no file list
+  # is fetched and the late-label fence branch is not what gated it.
+  if [ "$(files_reads "$dir")" = "0" ] && ! grep -q 'added during the derivation' "$dir/err.log"; then
+    pass "#2257 derive: the label gates from the first snapshot, before any file-list read"
+  else
+    fail "derive label short-circuit: files reads $(files_reads "$dir"); stderr=$(cat "$dir/err.log")"
+  fi
   # Size, at the default threshold: 300 is gated, 299 is not.
   dir=$(derive_case size-at)
   rc=$(CODEX_TEST_FILES_JSON='[{"filename":"src/a.ts","additions":200,"deletions":100}]' run_case "$dir" false)
@@ -753,18 +771,22 @@ test_derive_failsafe() {
   dir=$(derive_case meta-no-base)
   rc=$(CODEX_TEST_PR_META=no-base run_case "$dir" false)
   assert_failsafe_request_at_fetch "PR metadata without a base" "$dir" "$rc" "has no readable head sha, base ref, base sha or default branch"
-  # Head fence: the re-read before a skip sees another head, so the verdict
-  # (an under-threshold PR) no longer describes the PR.
-  local count
-  dir=$(derive_case head-moved)
-  rc=$(run_case "$dir" false bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)
-  count=$(trigger_count "$dir")
-  if [ "$count" = "1" ] && [ "$rc" != "5" ] \
-     && grep -q 'WARN: cannot derive the Phase 4 gate: the PR head moved from aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa to bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' "$dir/err.log"; then
-    pass "#2257 derive fail-safe: a head that moves during the derivation ⇒ requested with a warning naming the cause"
-  else
-    fail "derive fail-safe head-moved: exit $rc / trigger count $count, expected a request with the head-moved warning; stderr=$(cat "$dir/err.log")"
-  fi
+  # Snapshot fence: the re-read before a skip sees another PR, so the
+  # under-threshold verdict no longer describes it.
+  local mode
+  # The moved PR also fails the stub's later reads, so these end at exit 3
+  # past "fetching HEAD commit metadata": the decision was to request.
+  for mode in head-moved base-moved; do
+    dir=$(derive_case "fence-$mode")
+    rc=$(CODEX_TEST_FENCE_MODE=$mode run_case "$dir" false)
+    assert_failsafe_request_at_fetch "a PR whose $mode during the derivation" "$dir" "$rc" "the PR moved during the derivation"
+  done
+  dir=$(derive_case fence-garbage)
+  rc=$(CODEX_TEST_FENCE_MODE=garbage CODEX_TEST_FAIL_PR_FETCH=3 run_case "$dir" false)
+  assert_failsafe_request_at_fetch "an unreadable fence re-read" "$dir" "$rc" "could not re-read the PR before skipping"
+  dir=$(derive_case fence-label-added)
+  rc=$(CODEX_TEST_FENCE_MODE=label-added run_case "$dir" false)
+  assert_derived_request "a needs-external-review label added during the derivation" "$dir" "$rc" "added during the derivation"
 }
 
 # The threshold and paths come from the GOVERNING base policy, not the
