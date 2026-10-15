@@ -38,6 +38,13 @@ test('agent guard configuration paths are exact case-sensitive authorization sur
   }
 });
 
+test('the CodeRabbit provider barrier entrypoint is an exact sensitive path', () => {
+  assert.equal(classify('+ordinary change', ['scripts/coderabbit-wait.sh']).decision, 'human-review');
+  for (const file of ['scripts/coderabbit-wait.sh.example', 'scripts/coderabbit-Wait.sh', 'nested/scripts/coderabbit-wait.sh']) {
+    assert.equal(classify('+ordinary change', [file]).decision, 'model-review', file);
+  }
+});
+
 test('captured Git objects determine both rename sides and complete wave scope', t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'p4b-escalation-test-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));

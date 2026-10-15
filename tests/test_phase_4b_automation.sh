@@ -891,7 +891,7 @@ cp "$DIFF" "$WORK/tripwire-original.diff"
 mk_fake fake-codex-tripwire-preview \
   "printf ran > \"$WORK/integrity-adapter-ran\"
    printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"reviewed\",\"findings\":[]}'"
-for tripwire_case in reviewer verdict policy codex-hooks claude-settings; do
+for tripwire_case in reviewer verdict policy codex-hooks claude-settings coderabbit-wait; do
   cp "$WORK/tripwire-original.diff" "$DIFF"
   rm -f "$WORK/tripwire-paths" "$P4B_TEST_POSTED_REVIEW" "$WORK/integrity-adapter-ran"
   case "$tripwire_case" in
@@ -900,6 +900,7 @@ for tripwire_case in reviewer verdict policy codex-hooks claude-settings; do
     policy) printf 'REVIEW_POLICY.md\0' > "$WORK/tripwire-paths" ;;
     codex-hooks) printf '.codex/hooks.json\0' > "$WORK/tripwire-paths" ;;
     claude-settings) printf '.claude/settings.json\0' > "$WORK/tripwire-paths" ;;
+    coderabbit-wait) printf 'scripts/coderabbit-wait.sh\0' > "$WORK/tripwire-paths" ;;
   esac
   set +e
   out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
@@ -933,6 +934,24 @@ for tripwire_case in reviewer verdict policy codex-hooks claude-settings; do
   else
     fail "matching $tripwire_case preview (rc=$rc): $(tail -n 3 "$WORK/tripwire-$tripwire_case-preview.stderr")"
   fi
+  # A bound dry run whose verdict will be retained is not a pure preview.
+  rm -f "$P4B_TEST_POSTED_REVIEW" "$WORK/integrity-adapter-ran"
+  set +e
+  out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+    CODEX_BIN="$BIN/fake-codex-tripwire-preview" P4B_ADAPTER_TIMEOUT_SECONDS=3 \
+    P4B_ACCT_STATE_DIR="$WORK/tripwire-$tripwire_case-retained-state" \
+    P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" \
+    bash "$ORCH" 1757 --repo o/r --author claude --dry-run --retain-evidence \
+    --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" \
+    2>"$WORK/tripwire-$tripwire_case-retained.stderr")"; rc=$?
+  set -e
+  if [ "$rc" = 8 ] && [ ! -e "$WORK/integrity-adapter-ran" ] \
+    && [ ! -e "$P4B_TEST_POSTED_REVIEW" ] \
+    && printf '%s' "$out" | jq -e '.human_tiebreaker_required and .review_posted == false' >/dev/null; then
+    pass "retained $tripwire_case evidence stops before adapter or reusable verdict"
+  else
+    fail "retained $tripwire_case evidence refusal (rc=$rc): $(tail -n 3 "$WORK/tripwire-$tripwire_case-retained.stderr")"
+  fi
 done
 # Near-name/case controls keep the ordinary production model dispatch path.
 for ordinary_path in .codex/Hooks.json .claude/settings.local.json; do
@@ -956,9 +975,47 @@ for ordinary_path in .codex/Hooks.json .claude/settings.local.json; do
   else
     fail "ordinary $ordinary_path dispatch control (rc=$rc): $(tail -n 3 "$WORK/ordinary-path.stderr")"
   fi
+  rm -f "$P4B_TEST_POSTED_REVIEW" "$WORK/integrity-adapter-ran"
+  rc=0
+  out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+    CODEX_BIN="$BIN/fake-codex-tripwire-preview" P4B_ADAPTER_TIMEOUT_SECONDS=3 \
+    P4B_ACCT_STATE_DIR="$WORK/ordinary-retained-${ordinary_path//\//_}-state" \
+    P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" \
+    bash "$ORCH" 1757 --repo o/r --author claude --dry-run --retain-evidence \
+    --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" \
+    2>"$WORK/ordinary-retained.stderr")" || rc=$?
+  if [ "$rc" = 0 ] && [ -e "$WORK/integrity-adapter-ran" ] \
+    && [ ! -e "$P4B_TEST_POSTED_REVIEW" ] \
+    && printf '%s' "$out" | jq -e '.dry_run and .review_posted == false and .validated_verdict.verdict == "APPROVED"' >/dev/null; then
+    pass "ordinary retained $ordinary_path keeps a validated non-posting model verdict"
+  else
+    fail "ordinary retained $ordinary_path control (rc=$rc): $(tail -n 3 "$WORK/ordinary-retained.stderr")"
+  fi
 done
 cp "$WORK/tripwire-original.diff" "$DIFF"
 rm -f "$WORK/tripwire-paths"
+
+for retained_args in no-dry offline; do
+  extra_args=(--retain-evidence)
+  [ "$retained_args" != offline ] || extra_args+=(--dry-run --offline-diff)
+  rc=0
+  out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+    bash "$ORCH" 1757 --repo o/r --author claude "${extra_args[@]}" \
+    --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" 2>&1)" || rc=$?
+  if [ "$rc" = 3 ] && [[ "$out" == *'--retain-evidence requires a bound, non-offline --dry-run'* ]]; then
+    pass "retained evidence rejects $retained_args input"
+  else
+    fail "retained evidence accepted $retained_args input (rc=$rc): $out"
+  fi
+done
+
+# Focused tripwire regression mode: fixture setup and real orchestrator only;
+# expected about 90s, no model/network, use a 240s outer process-group cap.
+if [ "${1:-}" = --escalation-only ]; then
+  printf 'Escalation summary: %s passed, %s failed\n' "$PASS" "$FAIL"
+  [ "$FAIL" = 0 ]
+  exit
+fi
 
 # #1955: dependency/auth unavailability retains the ordinary manual handoff,
 # while the immutable-input cases above retain the wave's hard-stop status.

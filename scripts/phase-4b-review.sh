@@ -40,6 +40,8 @@
 #   --wave-scope-file structured canonical range; trusted wave code regenerates
 #                    the curated bytes after live canary byte verification.
 #   --offline-diff   preview supplied bytes with --dry-run; never posts.
+#   --retain-evidence require tripwires for a bound --dry-run whose verdict
+#                     the caller will retain (historical prefix receipts).
 #   --dry-run        do everything EXCEPT post the review; print intended
 #                    action.
 #   --force-enabled  run this one invocation even when
@@ -98,9 +100,10 @@
 #      Before dispatch, account for findings and rerun (#1000). After a posted
 #      approval, review_posted:true identifies an acknowledgment to repair
 #      without repeating the review. No handoff block is emitted.
-#   8  HUMAN_TIEBREAKER_REQUIRED — the governing Codex request cap is
-#      exhausted with no automated response path left. No adapter is run and
-#      no Phase 4b handoff is rendered; a human must decide the PR's state.
+#   8  HUMAN_TIEBREAKER_REQUIRED — a deterministic tripwire matched, or a
+#      governing Codex-cap human stop holds. Tripwires stop before adapter
+#      dispatch. No review authority or Phase 4b handoff is produced; a human
+#      must select the review/disposition path.
 #   10 BARRIER_EVIDENCE_ERROR — request-budget evidence was unreadable or the
 #      head moved. No adapter is run and no Phase 4b handoff is rendered.
 
@@ -231,7 +234,7 @@ GH_AS_AUTHOR="${P4B_GH_AS_AUTHOR:-$ROOT/gh-as-author.sh}"
 ADAPTER_TIMEOUT_ENV="${P4B_ADAPTER_TIMEOUT_SECONDS:-}"
 ADAPTER_TIMEOUT=""
 
-PR="" ; REPO="" ; REVIEWER="" ; AUTHOR="" ; HEAD="" ; EXPECTED_BASE_SHA="" ; EXPECTED_BASE_SHA_SET=false ; DIFF_FILE="" ; DRY_RUN=false ; OFFLINE_DIFF=false ; WAVE_SCOPE_FILE=""
+PR="" ; REPO="" ; REVIEWER="" ; AUTHOR="" ; HEAD="" ; EXPECTED_BASE_SHA="" ; EXPECTED_BASE_SHA_SET=false ; DIFF_FILE="" ; DRY_RUN=false ; RETAIN_EVIDENCE=false ; OFFLINE_DIFF=false ; WAVE_SCOPE_FILE=""
 INPUT_DIR=""
 INPUT_METADATA_DIGEST=""
 FORCE_ENABLED=false
@@ -240,7 +243,7 @@ case "${P4B_FORCE_ENABLED:-}" in
 esac
 
 usage() {
-  echo "usage: phase-4b-review.sh <PR#> [--repo owner/repo] [--reviewer <login>] [--author <agent>] [--head <sha>] [--expected-base-sha <40-hex>] [--diff-file <path>] [--dry-run] [--force-enabled]" >&2
+  echo "usage: phase-4b-review.sh <PR#> [--repo owner/repo] [--reviewer <login>] [--author <agent>] [--head <sha>] [--expected-base-sha <40-hex>] [--diff-file <path>] [--dry-run] [--retain-evidence] [--force-enabled]" >&2
   exit 3
 }
 
@@ -256,6 +259,7 @@ while [ $# -gt 0 ]; do
     --diff-file)     DIFF_FILE="${2:-}"; shift 2 ;;
     --wave-scope-file) WAVE_SCOPE_FILE="${2:-}"; shift 2 ;;
     --dry-run)       DRY_RUN=true; shift ;;
+    --retain-evidence) RETAIN_EVIDENCE=true; shift ;;
     --offline-diff)  OFFLINE_DIFF=true; shift ;;
     --force-enabled) FORCE_ENABLED=true; shift ;;
     -h|--help)       usage ;;
@@ -265,6 +269,11 @@ while [ $# -gt 0 ]; do
       shift ;;
   esac
 done
+
+if [ "$RETAIN_EVIDENCE" = true ]; then
+  [ "$DRY_RUN" = true ] && [ "$OFFLINE_DIFF" = false ] \
+    || p4b_die 3 "--retain-evidence requires a bound, non-offline --dry-run"
+fi
 
 if [ "$OFFLINE_DIFF" = true ]; then
   [ -z "$WAVE_SCOPE_FILE" ] || p4b_die 3 "offline input cannot request wave scope"
@@ -1283,8 +1292,9 @@ revalidate_immutable_input() {
 
 # #1757: the complete immutable PR input, before trimming or model dispatch,
 # owns deterministic egregious-case escalation. Existing barrier stops above
-# remain authoritative. Offline previews have no posting authority.
-if [ "$OFFLINE_DIFF" != true ] && [ "$DRY_RUN" != true ]; then
+# remain authoritative. Pure previews retain their exemption; historical
+# callers retaining reusable review evidence request the same tripwire fence.
+if [ "$OFFLINE_DIFF" != true ] && { [ "$DRY_RUN" != true ] || [ "$RETAIN_EVIDENCE" = true ]; }; then
   escalation="$(node "$ROOT/phase-4b/escalation.cjs" "$INPUT_DIR")" \
     || p4b_die 3 "could not verify deterministic Phase 4b escalation input"
   if ! printf '%s' "$escalation" | jq -e '.decision == "model-review" and .tripwires == []' >/dev/null; then
