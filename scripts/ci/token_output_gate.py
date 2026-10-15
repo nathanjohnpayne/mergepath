@@ -1166,6 +1166,30 @@ def _ansi_c_quote_end(text, start):
     return len(text), False
 
 
+def _ansi_c_parameter_word_start(text, brace_open):
+    """Prove only a written ordinary parameter WORD operator, not a value.
+
+    A closed index uses the existing raw bracket bound solely to locate the
+    following operator. Offset/length and unknown modifier operands are not
+    ordinary WORD proof; array type and index evaluation are never inferred.
+    """
+    start = brace_open + 2
+    name, end = ident_at(text, start)
+    if name is None:
+        positional = re.match(r"[1-9][0-9]*", text[start:])
+        if positional is None:
+            return None
+        end = start + positional.end()
+    if text[end:end + 1] == "[":
+        close = _heredoc_bracket_close(text, end)
+        if close is None:
+            return None
+        end = close + 1
+    if text[end:end + 1] == ":":
+        end += 1
+    return end + 1 if text[end:end + 1] in ("-", "+", "=", "?") else None
+
+
 def _ansi_c_index_prefix(word):
     """Unclosed literal name/index prefixes withhold new ANSI DATA proof.
 
@@ -1705,8 +1729,10 @@ class Lexer:
             # ---- expansions and quotes ----
             if c == "$" and i + 1 < n:
                 nxt = text[i + 1]
-                if (nxt == "'" and '"' not in quotes and "$((" not in quotes
-                        and (not quotes or quotes[-1] in ("${", "${?"))
+                if (nxt == "'" and '"' not in quotes
+                        and not any(q in ("$((", "${") for q in quotes)
+                        and not cur_level().get("ansi_arithmetic", False)
+                        and (not quotes or quotes[-1] in ("${w", "${?"))
                         and not _ansi_c_index_prefix("".join(cur_level()["word"]))):
                     end, closed = _ansi_c_quote_end(text, i)
                     token = text[i:end]
@@ -1756,7 +1782,8 @@ class Lexer:
                             pass  # Unsupported words retain their prior reading.
                     quotes.append(
                         "${d" if double_default else
-                        "${?" if error_word_expansion_at(text, i) else "${"
+                        "${?" if error_word_expansion_at(text, i) else
+                        "${w" if _ansi_c_parameter_word_start(text, i) is not None else "${"
                     )
                     cur_level()["word"].append("${")
                     # `${NAME...}`: `braced_ref_at` is the single decider,
@@ -1793,7 +1820,7 @@ class Lexer:
                 i += 1
                 continue
 
-            if c == "}" and quotes and quotes[-1] in ("${", "${?", "${d"):
+            if c == "}" and quotes and quotes[-1] in ("${", "${?", "${d", "${w"):
                 quotes.pop()
                 cur_level()["word"].append(c)
                 i += 1
@@ -1806,7 +1833,7 @@ class Lexer:
                     i += 2
                     continue
 
-            if c == "'" and (not quotes or quotes[-1] in ("${", "${?", "$((")):
+            if c == "'" and (not quotes or quotes[-1] in ("${", "${?", "${w", "$((")):
                 quotes.append("'")
                 cur_level()["word"].append(c)
                 i += 1
@@ -2072,8 +2099,15 @@ class Lexer:
                     # is flagged exactly as it is anywhere else.
                     j = _skip_balanced_parens(text, i)
                     inner = text[i:j]
-                    self._absorb_substitutions(
+                    data = self._absorb_substitutions(
                         inner, cur_level()["seg"], line, cur_ll, source_offset=i
+                    )
+                    # Children already contributed their errors. Inspect only
+                    # masked array DATA for lost ANSI failure offsets; import
+                    # no references, findings, functions or literal spans.
+                    data_lexer = Lexer(data)
+                    self.unterminated_ansi_c_quotes.extend(
+                        i + offset for offset in data_lexer.unterminated_ansi_c_quotes
                     )
                     cur_level()["word"].append(inner.replace("\n", " "))
                     line += inner.count("\n")
@@ -2117,6 +2151,12 @@ class Lexer:
                             "seg": seg,
                             "capture": False,
                             "subshell": True,
+                            # Refuse new DATA proof in a written bare ((...)).
+                            # Actual command/process substitutions reset levels.
+                            "ansi_arithmetic": (
+                                cur_level().get("ansi_arithmetic", False)
+                                or text[i:i + 2] == "(("
+                            ),
                             "kind": "subshell",
                             "word": [],
                             "saved_quotes": quotes,
@@ -14475,6 +14515,28 @@ def _ansi_c_quote_cases():
         expected = [] if indexed else [(len(prefix), len(prefix) + len(literal))]
         if Lexer(text).ansi_c_quote_spans != expected:
             failures.append("ANSI-C index-context source offsets: " + repr(text))
+    # Harmless parsing data only: arithmetic operands do not prove a WORD.
+    for prefix, suffix, literal_data in [
+        ("(( 1 + ", " ))", False), ("${v:", "}", False),
+        ("${v:0:", "}", False), ("${v:-", "}", True),
+        ("${v:+", "}", True), ("${v:=", "}", True),
+        ("${v:?", "}", True), ("${v[0]:-", "}", True),
+        ("(( $( : ", " ) ))", True),
+    ]:
+        text = prefix + literal + suffix + "\n"
+        start = len(prefix)
+        expected = [(start, start + len(literal))] if literal_data else []
+        if Lexer(text).ansi_c_quote_spans != expected:
+            failures.append("ANSI-C positive WORD/arithmetic boundary: " + repr(text))
+    for text, expected in [
+        ("a=( $'unterminated", [4]),
+        ("a=(\n  $'unterminated", [6]),
+        ("a=( $( : $'unterminated", [9]),
+        ("a=( \"$'literal\" )", []),
+        ("a=( $'closed' )", []),
+    ]:
+        if Lexer(text).unterminated_ansi_c_quotes != expected:
+            failures.append("ANSI-C array DATA failure offset: " + repr(text))
     return failures
 
 
