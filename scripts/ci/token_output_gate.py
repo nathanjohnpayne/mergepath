@@ -456,7 +456,9 @@ An array assignment's parenthesised list is data, and a `$( )` among its
 elements is a capture under that assignment.
 
 Inside double quotes, the bounded ordinary-name `:-` default-word reader treats
-apostrophes as literal and retains plain named or positional expansions (#1452).
+apostrophes as literal and retains plain named or numbered positional expansions
+(#1452). Ordinary-name heads retain raw offsets across backslash-LF continuations
+in the name or between the colon and minus; special parameters remain excluded.
 Unquoted single-quote suppression and the measured non-expanding `:?` diagnostic
 forms remain unchanged. Nested quotes, substitutions, braces and other parameter
 operators retain the previous fallback; this is not general parameter parsing.
@@ -1651,7 +1653,7 @@ class Lexer:
                     # `}` has to stay exactly symmetric with the push.
                     double_default = False
                     if quotes and quotes[-1] == '"' \
-                            and _DOUBLE_QUOTED_DEFAULT_HEAD_RE.match(text, i):
+                            and _double_quoted_default_word_start(text, i) is not None:
                         try:
                             _simple_parameter_end(text, i)
                             double_default = True
@@ -2204,18 +2206,33 @@ def _simple_arithmetic_end(text, i):
     raise _ExactReadUnavailable()
 
 
-_DOUBLE_QUOTED_DEFAULT_HEAD_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:-")
+def _double_quoted_default_word_start(text, i):
+    """Raw word offset for an ordinary-name :- head, or None.
+
+    Reuse the existing identifier continuation rule; only backslash-LF may
+    separate the colon and minus. Other operators and special parameters
+    retain the previous bounded-reader fallback.
+    """
+    if not text.startswith("${", i):
+        return None
+    name, end = ident_at(text, i + 2)
+    if name is None or text[end:end + 1] != ":":
+        return None
+    end += 1
+    while text[end:end + 2] == "\\\n":
+        end += 2
+    return end + 1 if text[end:end + 1] == "-" else None
 
 
 def _simple_parameter_end(text, i):
     """End of a double-quoted `${ }` span, with bounded :- word support.
 
     Only ordinary-name defaults admit literal apostrophes and plain named or
-    positional expansions. Nested constructs retain the exact-reader fallback.
+    numbered positional expansions. Nested constructs retain the exact-reader fallback.
     """
-    head = _DOUBLE_QUOTED_DEFAULT_HEAD_RE.match(text, i)
-    word_start = head.end() if head else len(text)
-    j = i + 2
+    word_start = _double_quoted_default_word_start(text, i)
+    j = word_start if word_start is not None else i + 2
+    word_start = word_start if word_start is not None else len(text)
     n = len(text)
     while j < n:
         c = text[j]
@@ -14026,6 +14043,36 @@ def _heredoc_echo_conservatism_cases():
     return failures
 
 
+def _quoted_default_head_cases():
+    """Nonexecuting parser spans retain raw continuation offsets and bounds."""
+    failures = []
+    for raw in ("${UNSET_VALUE:-'data'}", "${UNSET_\\\nVALUE:-'data'}",
+                "${UNSET_VALUE:\\\n-'data'}"):
+        # Read a span at a nonzero raw offset; physical newlines stay present.
+        text = 'prefix "' + raw + '" suffix'
+        start = text.index("${")
+        if (_double_quoted_default_word_start(text, start) != text.index("'data'")
+                or _simple_parameter_end(text, start) != text.index("}") + 1):
+            failures.append("quoted default raw head/span offset: " + repr(raw))
+    for raw in ("${UNSET_VALUE:?'data'}", "${UNSET_\\\nVALUE:?'data'}",
+                "${UNSET_VALUE:\\\n?'data'}"):
+        if _double_quoted_default_word_start(raw, 0) is not None:
+            failures.append("quoted default admitted error operator: " + repr(raw))
+        try:
+            _simple_parameter_end(raw, 0)
+        except _ExactReadUnavailable:
+            pass
+        else:
+            failures.append("quoted default error-word fallback changed")
+    for head in ("UNSET_\\\nVALUE:-", "UNSET_VALUE:\\\n-"):
+        quoted = '"${' + head + "'$1'}\""
+        unquoted = '${' + head + "'$1'}"
+        if (not _word_has_verbatim_positional(quoted)
+                or _word_has_verbatim_positional(unquoted)):
+            failures.append("quoted default positional quote boundary: " + repr(head))
+    return failures
+
+
 def self_test():
     failures = []
     passed = 0
@@ -14036,6 +14083,7 @@ def self_test():
     failures.extend(_corpus_id_cases())
     failures.extend(_printf_allowlist_cases())
     failures.extend(_function_definition_cases())
+    failures.extend(_quoted_default_head_cases())
     failures.extend(_heredoc_conservatism_cases())
     failures.extend(_heredoc_echo_conservatism_cases())
 
