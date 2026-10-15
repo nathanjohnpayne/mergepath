@@ -69,7 +69,7 @@ Follow REVIEW_POLICY.md's workflow. The scripts it relies on are listed below. A
 | Reviewer writes | `GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> scripts/gh-as-reviewer.sh -- gh …` |
 | Should CodeRabbit be invoked? | `scripts/coderabbit-should-invoke.sh <PR#> --repo <owner/repo>` |
 | Wait out a CodeRabbit window | `scripts/coderabbit-wait.sh <PR#> <owner/repo>` (sleep only the remaining `retry_after` window) |
-| Request Codex | `MERGEPATH_PHASE_4A_GATED=true scripts/codex-review-request.sh <PR#> <owner/repo>` on a Phase 4 PR; without the flag, `codex.request_by_default: false` skips with exit `5` (never hand-roll the `@codex review` trigger) |
+| Request Codex | `MERGEPATH_PHASE_4A_GATED=true scripts/codex-review-request.sh <PR#> <owner/repo>` on a Phase 4 PR; without the flag, `codex.request_by_default` false or unset (the default since #2240) skips with exit `5` (never hand-roll the `@codex review` trigger) |
 | Read the Codex verdict | `scripts/codex-review-check.sh <PR#> <owner/repo>` |
 | Record per-finding verdicts | `scripts/codex-record-feedback.sh <PR#> <owner/repo> --verdict …`, `scripts/coderabbit-record-feedback.sh <PR#> --repo <owner/repo> …` |
 | Complete-history accounting | `scripts/review-feedback-accounting.sh <PR#> <owner/repo>` (require exit `0` and `posted == accounted`) |

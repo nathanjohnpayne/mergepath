@@ -32,11 +32,12 @@
 #                              author token for those writes.
 #   MERGEPATH_PHASE_4A_GATED   Optional. Set to true/1 by the caller when
 #                              the PR independently qualifies for Phase 4a
-#                              (lines >= external_review_threshold OR a file
-#                              matches external_review_paths). Only consulted
-#                              when codex.request_by_default is false; lets
-#                              the threshold-gated PR still get a trigger
-#                              under the pre-#486 behavior. Unset/false ⇒ the
+#                              (lines >= external_review_threshold, a file
+#                              matches external_review_paths, or the PR
+#                              carries needs-external-review). A gated PR is
+#                              always requested, whatever
+#                              codex.request_by_default says, because Phase 4
+#                              review is mandatory (#2240). Unset/false ⇒ the
 #                              PR is treated as under-threshold.
 #   MERGEPATH_CODEX_AUTO_TRIGGER
 #                              Optional. Set to true/1 by an AUTOMATIC caller
@@ -56,11 +57,15 @@
 #
 # Behavior:
 #   0. Reads codex.enabled (default true) and codex.request_by_default
-#      (default true, #486) and decides whether to request a Codex review
-#      at all (the Phase 4a entry decision). When codex.enabled is false,
-#      Phase 4a is off and the script exits 5 without triggering. When
-#      request_by_default is true, the trigger is posted on EVERY PR; when
-#      false, only on a PR the caller flagged via MERGEPATH_PHASE_4A_GATED.
+#      (default false since #2240; it was true under #486) and decides
+#      whether to request a Codex review at all (the Phase 4a entry
+#      decision). When codex.enabled is false, Phase 4a is off and the
+#      script exits 5 without triggering. A PR the caller flagged via
+#      MERGEPATH_PHASE_4A_GATED is always requested. Otherwise, when
+#      request_by_default is true the trigger is posted on EVERY PR; when
+#      false or unset it is not. A policy that cannot be read (missing,
+#      unparseable, no YAML parser, a non-boolean value) requests, with a
+#      warning naming the cause.
 #      request_by_default is orthogonal to enabled — it governs only WHEN
 #      the trigger is posted, never WHETHER Codex participates.
 #   1. Reads codex.review_timeout_seconds, codex.ack_wait_seconds,
@@ -202,8 +207,8 @@
 #   5   NO_TRIGGER_REQUESTED — the Phase 4a entry decision (#486) chose
 #       NOT to request a Codex review on this PR: either codex.enabled is
 #       false (route to Phase 4b), or codex.request_by_default is false
-#       and the PR is not Phase-4a-gated (under-threshold, no protected
-#       path). JSON on stdout with trigger_requested:false and all Codex
+#       or unset and the PR is not Phase-4a-gated (under-threshold, no
+#       protected path). JSON on stdout with trigger_requested:false and all Codex
 #       signals null. This is a deliberate skip, not an error or a
 #       timeout.
 #   6   FEEDBACK_UNACCOUNTED — at least one earlier reviewer finding has no
@@ -396,8 +401,9 @@ fi
 # the way coderabbit-should-invoke.sh and phase-4b-classifier.sh already do.
 # A cwd-relative path read no file at all when the script ran from a
 # subdirectory or by absolute path from elsewhere, and every codex: key then
-# took its default -- request_by_default silently back to true, the
-# moving-head knobs to their defaults. A hand install with no policy beside
+# took its default -- request_by_default then to true (since #2240 a
+# missing file instead requests with a warning), the moving-head knobs to
+# their defaults. A hand install with no policy beside
 # it keeps the cwd-relative read it always had.
 CONFIG="$__CODEX_REQUEST_DIR/../.github/review-policy.yml"
 [ -f "$CONFIG" ] || CONFIG=".github/review-policy.yml"
@@ -595,27 +601,132 @@ fi
 #                              Phase 4b.
 #   codex.request_by_default — whether `@codex review` is requested on
 #                              EVERY PR, not only the threshold/path-gated
-#                              ones. Absent ⇒ true (owner-decided default,
-#                              #486 / #483). When false, the trigger is
-#                              gated on the caller's Phase 4a entry signal
-#                              (MERGEPATH_PHASE_4A_GATED), restoring the
-#                              pre-#486 threshold-only behavior.
+#                              ones. Absent ⇒ false (owner decision
+#                              2026-10-15, #2240; it was true under #486).
+#                              When false, the trigger is gated on the
+#                              caller's Phase 4a entry signal
+#                              (MERGEPATH_PHASE_4A_GATED), the pre-#486
+#                              threshold-only behavior. Read by
+#                              resolve_request_by_default below, which
+#                              fails toward REQUESTING on any policy it
+#                              cannot read.
 #
 # request_by_default is ORTHOGONAL to enabled: it only governs WHEN the
 # trigger is posted and has no effect when Codex is disabled.
 #
 # MERGEPATH_PHASE_4A_GATED is how the caller (the authoring agent, or a
 # workflow) tells this worker that the PR independently qualifies for
-# Phase 4a (lines ≥ external_review_threshold OR a file matches
-# external_review_paths). Set it to `true`/`1` for a gated PR. This
+# Phase 4a (lines ≥ external_review_threshold, a file matches
+# external_review_paths, or the PR carries needs-external-review). Set it
+# to `true`/`1` for a gated PR: that PR is requested whatever
+# request_by_default says, because Phase 4 review is mandatory. This
 # script does not recompute the threshold itself — the entry decision
-# upstream already did. When unset/false and request_by_default is also
-# false, an under-threshold PR is skipped (exit 5, NO_TRIGGER_REQUESTED).
+# upstream already did. When unset/false and request_by_default resolves
+# to false, an under-threshold PR is skipped (exit 5, NO_TRIGGER_REQUESTED).
 CODEX_ENABLED=$(codex_field enabled)
 CODEX_ENABLED=${CODEX_ENABLED:-true}
 
-REQUEST_BY_DEFAULT=$(codex_field request_by_default)
-REQUEST_BY_DEFAULT=${REQUEST_BY_DEFAULT:-true}
+# Resolve codex.request_by_default (#2240). Sets REQUEST_BY_DEFAULT to
+# true|false and REQUEST_BY_DEFAULT_SOURCE to explicit|unset|failsafe.
+#
+#   explicit  the key holds a YAML boolean; its value is used.
+#   unset     the policy parses, and the key (or the whole codex: block) is
+#             absent: false, the owner-decided default since #2240.
+#   failsafe  the policy cannot be trusted to answer, so the trigger IS
+#             requested, with a warning naming the cause: the file is
+#             missing, no YAML parser is available, the file does not parse
+#             or holds more than one document, the root or codex: is not a
+#             mapping, the key or codex: block is duplicated, or the value
+#             is not a boolean (a quoted 'false' is a string, not a boolean).
+#
+# The two outcomes are not symmetric: requesting wrongly costs one Codex
+# round, while skipping wrongly silently drops a review. So a skip needs a
+# real parser's answer, the same rule coderabbit-should-invoke.sh applies
+# to its suppressing decisions; codex_field's awk reader cannot tell an
+# absent key from a file it failed to read.
+#
+# Presence is tested with has(), never with `//`: yq's alternative operator
+# treats an explicit `false` like null, so `.request_by_default // "x"`
+# reports an explicit false as missing. go-yaml resolves a duplicated key
+# last-wins without complaint, so duplicates are counted separately.
+# MERGEPATH_YQ_BIN is a test seam for the parser-unavailable path.
+REQUEST_BY_DEFAULT=""
+REQUEST_BY_DEFAULT_SOURCE=""
+request_by_default_failsafe() {  # <cause>
+  REQUEST_BY_DEFAULT="true"
+  REQUEST_BY_DEFAULT_SOURCE=failsafe
+  echo "[codex-review-request] WARN: cannot read codex.request_by_default: $1 — requesting Codex anyway (an unreadable policy never opts out of review, #2240)" >&2
+}
+resolve_request_by_default() {
+  local yq_bin=${MERGEPATH_YQ_BIN:-yq} docs root_type codex_type dups present tag value
+  if [ ! -f "$CONFIG" ]; then
+    request_by_default_failsafe "policy file not found ($CONFIG)"
+    return 0
+  fi
+  if ! command -v "$yq_bin" >/dev/null 2>&1 \
+     && [ "$yq_bin" = "yq" ] \
+     && [ -x "$__CODEX_REQUEST_DIR/lib/ensure-yq.sh" ]; then
+    bash "$__CODEX_REQUEST_DIR/lib/ensure-yq.sh" --ci-only >/dev/null 2>&1 || true
+  fi
+  if ! command -v "$yq_bin" >/dev/null 2>&1; then
+    request_by_default_failsafe "no YAML parser (yq) is available to verify $CONFIG; install mikefarah/yq v4"
+    return 0
+  fi
+  if ! docs=$("$yq_bin" eval-all -o=json '[.] as $d ireduce ([]; . + $d) | length' "$CONFIG" 2>/dev/null); then
+    request_by_default_failsafe "$CONFIG is not valid YAML"
+    return 0
+  fi
+  if [ "$docs" != "1" ]; then
+    request_by_default_failsafe "$CONFIG must hold exactly one YAML document (found $docs)"
+    return 0
+  fi
+  root_type=$("$yq_bin" 'type' "$CONFIG" 2>/dev/null) || root_type=""
+  if [ "$root_type" != "!!map" ]; then
+    request_by_default_failsafe "$CONFIG is not a YAML mapping"
+    return 0
+  fi
+  codex_type=$("$yq_bin" '.codex | type' "$CONFIG" 2>/dev/null) || codex_type="?"
+  dups=$(awk '
+    /^codex[[:space:]]*:/ { blocks++; in_block=1; next }
+    in_block && /^[^[:space:]#]/ { in_block=0 }
+    in_block && /^[[:space:]]+["\047]?request_by_default["\047]?[[:space:]]*:/ { keys++ }
+    END { print ((blocks > 1 || keys > 1) ? "yes" : "no") }
+  ' "$CONFIG")
+  if [ "$dups" = "yes" ]; then
+    request_by_default_failsafe "$CONFIG has more than one codex: block or codex.request_by_default key"
+    return 0
+  fi
+  case "$codex_type" in
+    ""|"!!null")
+      REQUEST_BY_DEFAULT="false"
+      REQUEST_BY_DEFAULT_SOURCE="unset"
+      return 0 ;;
+    "!!map") ;;
+    *)
+      request_by_default_failsafe "codex: in $CONFIG is not a mapping"
+      return 0 ;;
+  esac
+  present=$("$yq_bin" '.codex | has("request_by_default")' "$CONFIG" 2>/dev/null) || present="?"
+  case "$present" in
+    false)
+      REQUEST_BY_DEFAULT="false"
+      REQUEST_BY_DEFAULT_SOURCE="unset"
+      return 0 ;;
+    true) ;;
+    *)
+      request_by_default_failsafe "the parser could not test for the key in $CONFIG"
+      return 0 ;;
+  esac
+  tag=$("$yq_bin" '.codex.request_by_default | tag' "$CONFIG" 2>/dev/null) || tag="?"
+  value=$("$yq_bin" '.codex.request_by_default' "$CONFIG" 2>/dev/null) || value="?"
+  if [ "$tag" = "!!bool" ]; then
+    case "$value" in
+      true|True|TRUE) REQUEST_BY_DEFAULT="true"; REQUEST_BY_DEFAULT_SOURCE=explicit; return 0 ;;
+      false|False|FALSE) REQUEST_BY_DEFAULT="false"; REQUEST_BY_DEFAULT_SOURCE=explicit; return 0 ;;
+    esac
+  fi
+  request_by_default_failsafe "value '$value' (YAML tag $tag) is not a boolean"
+}
 
 # Normalize the caller's gate signal to a strict true/false. Accept the
 # common truthy spellings; anything else (including unset) is false.
@@ -630,10 +741,13 @@ esac
 should_request_codex() {
   # Codex off ⇒ never trigger (orthogonality rule).
   [ "$CODEX_ENABLED" = "true" ] || return 1
-  # request_by_default ⇒ trigger on every PR.
-  [ "$REQUEST_BY_DEFAULT" = "true" ] && return 0
-  # Otherwise trigger only when the caller flagged the PR as Phase-4a-gated.
-  [ "$PHASE_4A_GATED" = "true" ]
+  # A Phase-4a-gated PR is always requested: Phase 4 review is mandatory,
+  # whatever request_by_default says (#2240). Checked first, so a gated run
+  # never depends on the policy read below.
+  [ "$PHASE_4A_GATED" = "true" ] && return 0
+  # Otherwise request_by_default decides: true ⇒ trigger on every PR.
+  resolve_request_by_default
+  [ "$REQUEST_BY_DEFAULT" = "true" ]
 }
 
 # ack_wait_seconds: the 👀 eyes-ack window (#419). Default 30s aligned to the
@@ -834,7 +948,11 @@ if ! should_request_codex; then
   if [ "$CODEX_ENABLED" != "true" ]; then
     log "codex.enabled is false — Phase 4a is off; not requesting a Codex review (route to Phase 4b)"
   else
-    log "codex.request_by_default is false and this PR is not Phase-4a-gated (MERGEPATH_PHASE_4A_GATED!=true) — not requesting a Codex review"
+    if [ "$REQUEST_BY_DEFAULT_SOURCE" = "unset" ]; then
+      log "codex.request_by_default is not set (the default is false since #2240) and this PR is not Phase-4a-gated (MERGEPATH_PHASE_4A_GATED!=true) — not requesting a Codex review"
+    else
+      log "codex.request_by_default is false and this PR is not Phase-4a-gated (MERGEPATH_PHASE_4A_GATED!=true) — not requesting a Codex review"
+    fi
     # Codex P1 on #2175: with request_by_default false, a Phase 4 caller that
     # omits the gate flag gets this skip instead of the mandatory review.
     # Say so, so the skip is never mistaken for "Codex not needed".
