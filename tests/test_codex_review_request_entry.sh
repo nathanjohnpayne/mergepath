@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Regression coverage for codex-review-request.sh's Phase 4a entry
 # decision (#486): codex.request_by_default + codex.enabled gating of
-# whether an `@codex review` trigger is posted at all. It also locks the
+# whether an `@codex review` trigger is posted at all, including the #2240
+# default (unset means false; an unreadable policy requests with a warning;
+# a Phase-4a-gated PR is always requested). It also locks the
 # #1085 handoff contract: a real, confirmed request that reaches the ordinary
 # timeout path must leave a durable exact-head terminal marker for Phase 4b.
 #
@@ -130,6 +132,14 @@ shift
 endpoint=${1:-}
 case "$endpoint" in
   repos/owner/repo/pulls/999)
+    # #2240: a case with no policy file runs on the script's default
+    # timings (an 1800s poll), so it ends the run at the first read past
+    # the entry decision instead. Reaching this read at all proves the
+    # decision was to request.
+    if [ -n "${CODEX_TEST_FAIL_PR_FETCH:-}" ]; then
+      echo "stub: PR fetch refused after the entry decision" >&2
+      exit 1
+    fi
     if [ "${2:-}" = "--jq" ]; then
       printf '%s\n' "${CODEX_TEST_LIVE_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
     else
@@ -191,11 +201,14 @@ terminal_body() {
   [ -f "$dir/state/terminal-body" ] && cat "$dir/state/terminal-body" || true
 }
 
-# --- defaults: absent keys ⇒ request on every PR (backward compat) ----------
-test_defaults_request_on_every_pr() {
+# --- defaults: absent keys on a gated PR ⇒ trigger + durable timeout ------
+# Absent enabled/request_by_default on a Phase-4a-gated PR: the request is
+# made (the gate does not depend on request_by_default, #2240) and its
+# ordinary timeout is durably head-pinned for Phase 4b (#1085).
+test_defaults_request_on_gated_pr() {
   local dir rc count requested terminals body expected
   dir=$(make_case "defaults" "  bot_login: \"chatgpt-codex-connector[bot]\"")
-  rc=$(run_case "$dir")
+  rc=$(run_case "$dir" true)
   count=$(trigger_count "$dir")
   terminals=$(terminal_count "$dir")
   body=$(terminal_body "$dir")
@@ -212,7 +225,29 @@ test_defaults_request_on_every_pr() {
   elif [ "$body" != "$expected" ]; then
     fail "defaults: terminal marker body '$body', expected '$expected'"
   else
-    pass "absent enabled/request_by_default ⇒ trigger posted and ordinary timeout is durably head-pinned for Phase 4b (#1085)"
+    pass "absent enabled/request_by_default on a gated PR ⇒ trigger posted and ordinary timeout is durably head-pinned for Phase 4b (#1085)"
+  fi
+}
+
+# --- request_by_default unset + not gated ⇒ skip (the #2240 default) --------
+test_request_by_default_unset_skips_under_threshold() {
+  local dir rc count requested
+  dir=$(make_case "rbd-unset" "  enabled: true")
+  rc=$(run_case "$dir" false)
+  count=$(trigger_count "$dir")
+  requested=$(jq -r '.trigger_requested' "$dir/out.json" 2>/dev/null || echo unreadable)
+  if [ "$rc" != "5" ]; then
+    fail "rbd unset ungated: exit $rc, expected 5 (NO_TRIGGER_REQUESTED, the #2240 default); stderr=$(cat "$dir/err.log")"
+  elif [ "$count" != "0" ]; then
+    fail "rbd unset ungated: trigger count $count, expected 0"
+  elif [ "$requested" != "false" ]; then
+    fail "rbd unset ungated: trigger_requested=$requested, expected false"
+  elif ! grep -q 'codex.request_by_default is not set (the default is false since #2240)' "$dir/err.log"; then
+    fail "rbd unset ungated: the skip must say the key is unset and defaults to false; stderr=$(cat "$dir/err.log")"
+  elif grep -q 'WARN: cannot read codex.request_by_default' "$dir/err.log"; then
+    fail "rbd unset ungated: a readable policy with the key absent must not warn; stderr=$(cat "$dir/err.log")"
+  else
+    pass "request_by_default unset + under-threshold ⇒ skip with exit 5 (#2240 default false)"
   fi
 }
 
@@ -227,29 +262,179 @@ test_request_by_default_true_triggers_under_threshold() {
     fail "rbd true: exit $rc, expected 4 (trigger posted, then timeout); stderr=$(cat "$dir/err.log")"
   elif [ "$count" != "1" ]; then
     fail "rbd true: trigger count $count, expected 1"
+  elif grep -q 'WARN: cannot read codex.request_by_default' "$dir/err.log"; then
+    fail "rbd true: an explicit boolean must be read cleanly, not through the fail-safe; stderr=$(cat "$dir/err.log")"
   else
     pass "request_by_default:true ⇒ under-threshold PR gets a trigger"
   fi
 }
 
-# --- single-quoted booleans ⇒ quotes stripped before the == "true" gate -----
-# Valid single-quoted YAML (`request_by_default: 'true'`, `enabled: 'true'`)
-# must parse as the boolean true, not the literal string "'true'". Before the
-# codex_field quote-stripping fix this triggered the wrong skip (exit 5).
-test_single_quoted_booleans_trigger_under_threshold() {
-  local dir rc count
-  dir=$(make_case "rbd-single-quoted" \
-    "  enabled: 'true'"$'\n'"  request_by_default: 'true'")
-  # Not gated (under threshold): only request_by_default can drive the trigger.
+# --- unreadable request_by_default ⇒ request, with a warning naming why -----
+# #2240: an unreadable policy never opts out. Each shape must post the
+# trigger on an UNGATED PR (so only the fail-safe can drive it) and warn with
+# its cause. Args: <case> <expected cause substring> <codex block>
+# [extra top-level YAML appended after the codex: block].
+assert_unreadable_requests() {
+  local name=$1 cause=$2 block=$3 extra=${4:-} dir rc count
+  dir=$(make_case "rbd-$name" "$block")
+  if [ -n "$extra" ]; then
+    printf '%s\n' "$extra" >>"$dir/.github/review-policy.yml"
+  fi
   rc=$(run_case "$dir" false)
   count=$(trigger_count "$dir")
   if [ "$rc" != "4" ]; then
-    fail "single-quoted: exit $rc, expected 4 (trigger posted, then timeout); stderr=$(cat "$dir/err.log")"
+    fail "rbd $name: exit $rc, expected 4 (fail-safe request, then timeout); stderr=$(cat "$dir/err.log")"
   elif [ "$count" != "1" ]; then
-    fail "single-quoted: trigger count $count, expected 1 (quotes must be stripped before == \"true\")"
+    fail "rbd $name: trigger count $count, expected 1 (an unreadable policy must request)"
+  elif ! grep -F 'WARN: cannot read codex.request_by_default' "$dir/err.log" | grep -Fq "$cause"; then
+    fail "rbd $name: missing a warning naming '$cause'; stderr=$(cat "$dir/err.log")"
   else
-    pass "single-quoted enabled/request_by_default ⇒ quotes stripped, trigger posted"
+    pass "request_by_default $name ⇒ requested with a warning naming the cause (#2240)"
   fi
+}
+
+test_request_by_default_unreadable_requests() {
+  # A non-boolean value.
+  assert_unreadable_requests "non-boolean" "value 'maybe' (YAML tag !!str) is not a boolean" \
+    "  enabled: true"$'\n'"  request_by_default: maybe"
+  # A quoted 'false' is a YAML string, not the boolean false: it must not
+  # opt out. (codex_field strips quotes for the other keys; this one is read
+  # by a parser so the distinction survives.)
+  assert_unreadable_requests "quoted-false" "value 'false' (YAML tag !!str) is not a boolean" \
+    "  enabled: true"$'\n'"  request_by_default: 'false'"
+  # A single-quoted 'true' still requests (enabled: 'true' keeps the
+  # codex_field quote stripping), now through the fail-safe.
+  assert_unreadable_requests "quoted-true" "value 'true' (YAML tag !!str) is not a boolean" \
+    "  enabled: 'true'"$'\n'"  request_by_default: 'true'"
+  # Unparseable YAML elsewhere in the file: the awk reader would still find a
+  # clean `request_by_default: false`, which is exactly why a skip needs the
+  # parser's answer.
+  assert_unreadable_requests "unparseable" "is not valid YAML" \
+    "  enabled: true"$'\n'"  request_by_default: false" "broken: [1, 2"
+  # Duplicated key: go-yaml resolves last-wins without complaint.
+  assert_unreadable_requests "duplicate" "has 2 codex.request_by_default keys" \
+    "  enabled: true"$'\n'"  request_by_default: true"$'\n'"  request_by_default: false"
+  # A duplicated key spelled with quotes inside a block mapping (#2245).
+  assert_unreadable_requests "quoted-duplicate-key" "has 2 codex.request_by_default keys" \
+    "  enabled: true"$'\n'"  request_by_default: true"$'\n'"  \"request_by_default\": false"
+  # A duplicate codex: block spelled with a quoted key: the parser treats
+  # "codex": as the same key and keeps the last block's false, so the count
+  # must see both spellings (Codex task on #2243).
+  assert_unreadable_requests "quoted-duplicate-block" "has 2 codex: blocks" \
+    "  enabled: true"$'\n'"  request_by_default: true" '"codex":'$'\n''  request_by_default: false'
+  # No YAML parser to verify the file with.
+  local dir rc count
+  dir=$(make_case "rbd-no-parser" "  enabled: true"$'\n'"  request_by_default: false")
+  rc=$(MERGEPATH_YQ_BIN="$dir/bin/no-such-yq" run_case "$dir" false)
+  count=$(trigger_count "$dir")
+  if [ "$rc" != "4" ] || [ "$count" != "1" ]; then
+    fail "rbd no-parser: exit $rc / trigger count $count, expected 4 / 1 (no parser ⇒ request); stderr=$(cat "$dir/err.log")"
+  elif ! grep -q 'WARN: cannot read codex.request_by_default: no YAML parser (yq)' "$dir/err.log"; then
+    fail "rbd no-parser: missing the parser-unavailable warning; stderr=$(cat "$dir/err.log")"
+  else
+    pass "request_by_default with no YAML parser ⇒ requested with a warning naming the cause (#2240)"
+  fi
+}
+
+# --- whole-policy shapes the codex:-block fixture cannot express (#2245) ----
+# Each writes the ENTIRE policy, so codex_field's line reader finds none of
+# the fast timing keys and the run would use the default 1800s poll. As in
+# the missing-policy case below, the gh stub refuses the first read past the
+# entry decision: exit 3 after "fetching HEAD commit metadata" proves a
+# request, where a skip exits 5 before any read. Args: <case> <cause> <policy>
+assert_policy_requests_at_fetch() {
+  local name=$1 cause=$2 policy=$3 dir rc
+  dir=$(make_case "rbd-$name" "  enabled: true")
+  printf '%s\n' "$policy" >"$dir/.github/review-policy.yml"
+  rc=$(CODEX_TEST_FAIL_PR_FETCH=1 run_case "$dir" false)
+  if [ "$rc" != "3" ] || ! grep -q 'fetching HEAD commit metadata' "$dir/err.log"; then
+    fail "rbd $name: exit $rc, expected 3 at the PR fetch past a request decision; stderr=$(cat "$dir/err.log")"
+  elif ! grep -F 'WARN: cannot read codex.request_by_default' "$dir/err.log" | grep -Fq "$cause"; then
+    fail "rbd $name: missing a warning naming '$cause'; stderr=$(cat "$dir/err.log")"
+  else
+    pass "request_by_default $name ⇒ requested with a warning naming the cause (#2245)"
+  fi
+}
+
+# Args: <case> <policy>. The policy parses and states no request_by_default,
+# so the run must skip with exit 5 and no warning.
+assert_policy_skips_unset() {
+  local name=$1 policy=$2 dir rc
+  dir=$(make_case "rbd-$name" "  enabled: true")
+  printf '%s\n' "$policy" >"$dir/.github/review-policy.yml"
+  rc=$(CODEX_TEST_FAIL_PR_FETCH=1 run_case "$dir" false)
+  if [ "$rc" != "5" ]; then
+    fail "rbd $name: exit $rc, expected 5 (unset ⇒ false); stderr=$(cat "$dir/err.log")"
+  elif grep -q 'WARN: cannot read codex.request_by_default' "$dir/err.log"; then
+    fail "rbd $name: a parseable policy with the key absent must not warn; stderr=$(cat "$dir/err.log")"
+  elif ! grep -q 'codex.request_by_default is not set' "$dir/err.log"; then
+    fail "rbd $name: the skip must report the key as not set; stderr=$(cat "$dir/err.log")"
+  else
+    pass "request_by_default $name ⇒ unset, skip with exit 5"
+  fi
+}
+
+test_request_by_default_policy_shapes() {
+  # Duplicated key inside a flow mapping: go-yaml keeps the last value.
+  assert_policy_requests_at_fetch "flow-duplicate-key" "has 2 codex.request_by_default keys" \
+    'codex: {enabled: true, request_by_default: true, request_by_default: false}'
+  # Duplicated codex key in a flow-style root mapping.
+  assert_policy_requests_at_fetch "flow-duplicate-block" "has 2 codex: blocks" \
+    '{codex: {request_by_default: true}, codex: {request_by_default: false}}'
+  # A present but empty codex: block, an explicit null and a tilde null.
+  assert_policy_requests_at_fetch "empty-codex" "is present but empty or null" \
+    "author_identity: nathanjohnpayne"$'\n'"codex:"
+  assert_policy_requests_at_fetch "null-codex" "is present but empty or null" \
+    "author_identity: nathanjohnpayne"$'\n'"codex: null"
+  assert_policy_requests_at_fetch "tilde-codex" "is present but empty or null" \
+    "author_identity: nathanjohnpayne"$'\n'"codex: ~"
+  # Controls: an absent codex: key still means unset, and so does a
+  # well-formed empty mapping, which states no value rather than a broken one.
+  assert_policy_skips_unset "absent-codex" "author_identity: nathanjohnpayne"
+  assert_policy_skips_unset "empty-mapping-codex" "author_identity: nathanjohnpayne"$'\n'"codex: {}"
+}
+
+# --- missing policy file ⇒ request, with a warning --------------------------
+# With no policy the script runs on its default timings (an 1800s poll), so
+# the gh stub refuses the first read past the entry decision: exit 3 after
+# "fetching HEAD commit metadata" proves the decision was to request, where a
+# skip would have exited 5 before any read.
+test_request_by_default_missing_policy_requests() {
+  local dir rc gated
+  for gated in false true; do
+    dir=$(make_case "rbd-missing-$gated" "  enabled: true")
+    rm -f "$dir/.github/review-policy.yml"
+    rc=$(CODEX_TEST_FAIL_PR_FETCH=1 run_case "$dir" "$gated")
+    if [ "$rc" != "3" ] || ! grep -q 'fetching HEAD commit metadata' "$dir/err.log"; then
+      fail "rbd missing (gated=$gated): exit $rc, expected 3 at the PR fetch past a request decision; stderr=$(cat "$dir/err.log")"
+    elif [ "$gated" = false ] && ! grep -q 'WARN: cannot read codex.request_by_default: policy file not found' "$dir/err.log"; then
+      fail "rbd missing (gated=$gated): missing the policy-not-found warning; stderr=$(cat "$dir/err.log")"
+    else
+      pass "missing policy file (gated=$gated) ⇒ Codex requested (#2240)"
+    fi
+  done
+}
+
+# --- a Phase-4a-gated PR is requested whatever the policy says --------------
+# #2240: mandatory review does not depend on request_by_default. Every shape,
+# explicit false included, must post the trigger on a gated PR.
+test_gated_requests_in_every_case() {
+  local name block dir rc count
+  while IFS='|' read -r name block; do
+    dir=$(make_case "gated-$name" "  enabled: true"$'\n'"$block")
+    rc=$(run_case "$dir" true)
+    count=$(trigger_count "$dir")
+    if [ "$rc" != "4" ] || [ "$count" != "1" ]; then
+      fail "gated $name: exit $rc / trigger count $count, expected 4 / 1 (a gated PR is always requested); stderr=$(cat "$dir/err.log")"
+    else
+      pass "Phase-4a-gated PR with request_by_default $name ⇒ trigger posted"
+    fi
+  done <<'CASES'
+false|  request_by_default: false
+true|  request_by_default: true
+unset|  bot_login: "chatgpt-codex-connector[bot]"
+non-boolean|  request_by_default: maybe
+CASES
 }
 
 # --- request_by_default: false + not gated ⇒ skip (exit 5, no trigger) ------
@@ -275,6 +460,12 @@ test_request_by_default_false_skips_under_threshold() {
     # Codex P1 on #2175: a Phase 4 caller that forgot the gate flag must be
     # told, not left to read the skip as "Codex not needed".
     fail "rbd false ungated: the skip must name MERGEPATH_PHASE_4A_GATED=true for a Phase 4 PR; stderr=$(cat "$dir/err.log")"
+  elif grep -q 'WARN: cannot read codex.request_by_default' "$dir/err.log"; then
+    fail "rbd false ungated: an explicit false must be read cleanly, not through the fail-safe; stderr=$(cat "$dir/err.log")"
+  elif ! grep -q 'codex.request_by_default is false and this PR' "$dir/err.log"; then
+    # #2240: an explicit false must be seen as set. A `//` read loses it
+    # (yq's alternative operator treats false like null) and reports "not set".
+    fail "rbd false ungated: an explicit false must be reported as set to false, not as unset; stderr=$(cat "$dir/err.log")"
   else
     pass "request_by_default:false + under-threshold ⇒ skip with exit 5, naming the Phase 4 gate flag"
   fi
@@ -369,9 +560,13 @@ test_new_trigger_replaces_superseded_timeout_marker() {
   fi
 }
 
-test_defaults_request_on_every_pr
+test_defaults_request_on_gated_pr
+test_request_by_default_unset_skips_under_threshold
 test_request_by_default_true_triggers_under_threshold
-test_single_quoted_booleans_trigger_under_threshold
+test_request_by_default_unreadable_requests
+test_request_by_default_policy_shapes
+test_request_by_default_missing_policy_requests
+test_gated_requests_in_every_case
 test_request_by_default_false_skips_under_threshold
 test_request_by_default_false_triggers_when_gated
 test_enabled_false_never_triggers

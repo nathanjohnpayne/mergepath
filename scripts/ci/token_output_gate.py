@@ -1153,6 +1153,98 @@ def redirects_stdout(seg):
     return any(_STDOUT_REDIR_RE.match(w) for w in seg.words)
 
 
+def _ansi_c_quote_end(text, start):
+    """Return (end, closed) for an ANSI-C token, preserving its raw text."""
+    i = start + 2
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2  # A quoted apostrophe cannot end the token.
+        elif text[i] == "'":
+            return i + 1, True
+        else:
+            i += 1
+    return len(text), False
+
+
+def _ansi_c_parameter_word_start(text, brace_open):
+    """Prove only a written ordinary parameter WORD operator, not a value.
+
+    A closed index uses the existing raw bracket bound solely to locate the
+    following operator. Offset/length and unknown modifier operands are not
+    ordinary WORD proof; array type and index evaluation are never inferred.
+    """
+    start = brace_open + 2
+    name, end = ident_at(text, start)
+    if name is None:
+        positional = re.match(r"[1-9][0-9]*", text[start:])
+        if positional is None:
+            return None
+        end = start + positional.end()
+    if text[end:end + 1] == "[":
+        close = _heredoc_bracket_close(text, end, parameter_words=True)
+        if close is None:
+            return None
+        end = close + 1
+    if text[end:end + 1] == ":":
+        end += 1
+    return end + 1 if text[end:end + 1] in ("-", "+", "=", "?") else None
+
+
+def _ansi_c_index_prefix(word):
+    """Unclosed literal name/index prefixes withhold new ANSI DATA proof.
+
+    This finite raw-word inventory recognizes name[ and ${name[ heads,
+    including the existing numbered and #/! parameter spellings. It does not
+    decide array type, index value or execution; closed brackets restore the
+    ordinary proof. Quoted/escaped prefix data is not an index opener.
+    """
+    depth = 0
+    i = 0
+    name, end = ident_at(word, 0)
+    if name is not None and word[end:end + 1] == "[":
+        depth = 1
+        i = end + 1
+    while i < len(word):
+        c = word[i]
+        if c == "\\":
+            i += 2
+            continue
+        if word[i:i + 2] == "$'":
+            i, _closed = _ansi_c_quote_end(word, i)
+            continue
+        if c in "'\"":
+            quote = c
+            i += 1
+            while i < len(word) and word[i] != quote:
+                i += 2 if quote == '"' and word[i] == "\\" else 1
+            i += 1
+            continue
+        if depth and (word[i:i + 2] in ("${", "$(") or c == "`"):
+            try:
+                i = _double_quoted_construct_end(word, i)
+            except _ExactReadUnavailable:
+                return True  # An unknown nested extent cannot prove index closure.
+            continue
+        if word[i:i + 2] == "${":
+            start = i + 2
+            if word[start:start + 1] in ("#", "!"):
+                start += 1
+            name, end = ident_at(word, start)
+            if name is None:
+                positional = re.match(r"[1-9][0-9]*", word[start:])
+                end = start + positional.end() if positional else start
+            if end > start and word[end:end + 1] == "[":
+                depth += 1
+                i = end + 1
+                continue
+        if depth and c == "[":
+            depth += 1
+        elif depth and c == "]":
+            depth -= 1
+        i += 1
+    return depth > 0
+
+
 def _find_substitutions(s, quotes_are_literal=False):
     """Yield (body, start_offset, end_offset) for every COMMAND SUBSTITUTION.
 
@@ -1270,6 +1362,9 @@ def _find_substitutions_exact(s):
                 in_single = False
             i += 1
             continue
+        if not in_double and s[i : i + 2] == "$'":
+            i, _closed = _ansi_c_quote_end(s, i)
+            continue
         if c == '"':
             in_double = not in_double
             i += 1
@@ -1302,6 +1397,7 @@ def _find_substitutions_legacy(s, quotes_are_literal=False):
     i = 0
     n = len(s)
     in_single = False
+    in_double = False
     while i < n:
         c = s[i]
         if c == "\\" and i + 1 < n:
@@ -1311,6 +1407,11 @@ def _find_substitutions_legacy(s, quotes_are_literal=False):
             if c == "'":
                 in_single = False
             i += 1
+            continue
+        if c == '"' and not quotes_are_literal:
+            in_double = not in_double
+        if not quotes_are_literal and not in_double and s[i : i + 2] == "$'":
+            i, _closed = _ansi_c_quote_end(s, i)
             continue
         if c == "'" and not quotes_are_literal:
             in_single = True
@@ -1341,6 +1442,10 @@ class Lexer:
         self.heredocs = []
         self.func_defs = []  # (name, body_start_index, body_end_index)
         self.quoted_data_offsets = set()  # Read-only function-header context.
+        self.unterminated_ansi_c_quotes = []  # Original source offsets.
+        self.unsupported_ansi_aliases = []  # Executable-context failure offsets.
+        self.unsupported_ansi_sources = []  # Non-alias source-proof failures.
+        self.ansi_c_quote_spans = []  # Literal DATA ranges, including child source.
         self.comment_offsets = set()
         self.function_source_children = []  # (original body offset, child Lexer)
         # Set when the text ends while a here-doc body is still open.  The
@@ -1357,6 +1462,32 @@ class Lexer:
         )
         self.comment_offsets.update(body_offset + i for i in sub.comment_offsets)
         self.function_source_children.append((body_offset, sub))
+        self.unsupported_ansi_aliases.extend(
+            body_offset + i for i in sub.unsupported_ansi_aliases
+        )
+        self.unsupported_ansi_sources.extend(
+            body_offset + i for i in sub.unsupported_ansi_sources
+        )
+        self._absorb_ansi_context(sub, body_offset)
+
+    def _ansi_alias_operand(self, seg, word, line):
+        """Existing literal alias operand seam, without caching a live segment."""
+        literal = _unquote_command_word(word)
+        if literal is None or _ALIAS_RE.match(literal) is None:
+            return False
+        probe = Segment(-1, None, False, line)
+        probe.words = list(seg.words)
+        return resolve_command(probe)[0] == "alias"
+
+    def _absorb_ansi_context(self, sub, source_offset):
+        """Import only already-proved ANSI literal spans and failure offsets."""
+        self.unterminated_ansi_c_quotes.extend(
+            source_offset + i for i in sub.unterminated_ansi_c_quotes
+        )
+        self.ansi_c_quote_spans.extend(
+            (source_offset + start, source_offset + end)
+            for start, end in sub.ansi_c_quote_spans
+        )
 
     def _absorb_substitutions(
         self, inner, parent_seg, base_line, cur_ll,
@@ -1625,6 +1756,43 @@ class Lexer:
             # ---- expansions and quotes ----
             if c == "$" and i + 1 < n:
                 nxt = text[i + 1]
+                if nxt == "[":
+                    # A raw legacy arithmetic bound withholds new ANSI proof
+                    # without changing this loop's existing token semantics.
+                    close = _heredoc_bracket_close(text, i + 1)
+                    cur_level()["ansi_arithmetic_until"] = max(
+                        cur_level().get("ansi_arithmetic_until", -1),
+                        n if close is None else close,
+                    )
+                if (nxt == "'" and '"' not in quotes
+                        and not any(q in ("$((", "${") for q in quotes)
+                        and not cur_level().get("ansi_arithmetic", False)
+                        and i > cur_level().get("ansi_arithmetic_until", -1)
+                        and (not quotes or quotes[-1] in ("${w", "${?"))):
+                    end, closed = _ansi_c_quote_end(text, i)
+                    if not closed:
+                        # Ordinary WORD syntax can fail even when an index
+                        # prefix withholds inert-DATA proof. Keep scanning
+                        # that excluded prefix through the prior loop below.
+                        self.unterminated_ansi_c_quotes.append(i)
+                    if (i > cur_level().get("ansi_index_until", -1)
+                            and not _ansi_c_index_prefix("".join(cur_level()["word"]))):
+                        token = text[i:end]
+                        if (closed and token.find("'", 2) < len(token) - 1
+                                and _iter_refs(token)):
+                            # Correct consume/sync is independent of whether
+                            # this raw-sensitive source can be proved inert.
+                            if self._ansi_alias_operand(
+                                    cur_level()["seg"], "".join(cur_level()["word"]), line):
+                                self.unsupported_ansi_aliases.append(i)
+                            else:
+                                self.unsupported_ansi_sources.append(i)
+                        self.ansi_c_quote_spans.append((i, end))
+                        self.quoted_data_offsets.update(range(i + 2, end - 1 if closed else end))
+                        cur_level()["word"].append(token)
+                        line += token.count("\n")
+                        i = end
+                        continue
                 if nxt == "(" and i + 2 < n and text[i + 2] == "(":
                     quotes.append("$((")
                     cur_level()["word"].append("$((")
@@ -1663,7 +1831,8 @@ class Lexer:
                             pass  # Unsupported words retain their prior reading.
                     quotes.append(
                         "${d" if double_default else
-                        "${?" if error_word_expansion_at(text, i) else "${"
+                        "${?" if error_word_expansion_at(text, i) else
+                        "${w" if _ansi_c_parameter_word_start(text, i) is not None else "${"
                     )
                     cur_level()["word"].append("${")
                     # `${NAME...}`: `braced_ref_at` is the single decider,
@@ -1700,7 +1869,7 @@ class Lexer:
                 i += 1
                 continue
 
-            if c == "}" and quotes and quotes[-1] in ("${", "${?", "${d"):
+            if c == "}" and quotes and quotes[-1] in ("${", "${?", "${d", "${w"):
                 quotes.pop()
                 cur_level()["word"].append(c)
                 i += 1
@@ -1713,7 +1882,7 @@ class Lexer:
                     i += 2
                     continue
 
-            if c == "'" and (not quotes or quotes[-1] in ("${", "${?", "$((")):
+            if c == "'" and (not quotes or quotes[-1] in ("${", "${?", "${w", "$((")):
                 quotes.append("'")
                 cur_level()["word"].append(c)
                 i += 1
@@ -1848,6 +2017,16 @@ class Lexer:
                 i = j
                 continue
 
+            if c == "[":
+                prefix = "".join(cur_level()["word"])
+                name, end = ident_at(prefix, 0)
+                if name is not None and end == len(prefix):
+                    close = _heredoc_bracket_close(text, i, parameter_words=True)
+                    cur_level()["ansi_index_until"] = max(
+                        cur_level().get("ansi_index_until", -1),
+                        n if close is None else close,
+                    )
+
             # ---- structure ----
             if c == "\n":
                 finish_word()
@@ -1964,6 +2143,12 @@ class Lexer:
 
             if c == "(":
                 word_so_far = "".join(cur_level()["word"])
+                if (text[i:i + 2] == "(("
+                        and word_so_far in RESERVED_WORDS | SAFE_COMMANDS | PASSTHRU):
+                    cur_level()["ansi_arithmetic_until"] = max(
+                        cur_level().get("ansi_arithmetic_until", -1),
+                        _skip_balanced_parens(text, i) - 1,
+                    )
                 if word_so_far.endswith("="):
                     # An ARRAY ASSIGNMENT.  `args=(echo "$PAT")` stores two
                     # strings and writes nothing; reading the `(` as a command
@@ -1979,9 +2164,13 @@ class Lexer:
                     # is flagged exactly as it is anywhere else.
                     j = _skip_balanced_parens(text, i)
                     inner = text[i:j]
-                    self._absorb_substitutions(
+                    data = self._absorb_substitutions(
                         inner, cur_level()["seg"], line, cur_ll, source_offset=i
                     )
+                    # Children already contributed their errors. Inspect only
+                    # masked array DATA for proved ANSI spans/failure offsets;
+                    # import no references, findings or functions.
+                    self._absorb_ansi_context(Lexer(data), i)
                     cur_level()["word"].append(inner.replace("\n", " "))
                     line += inner.count("\n")
                     i = j
@@ -2024,6 +2213,16 @@ class Lexer:
                             "seg": seg,
                             "capture": False,
                             "subshell": True,
+                            # Refuse new DATA proof in a written bare ((...)).
+                            # Actual command/process substitutions reset levels.
+                            "ansi_arithmetic": (
+                                cur_level().get("ansi_arithmetic", False)
+                                or text[i:i + 2] == "(("
+                            ),
+                            "ansi_arithmetic_until": cur_level().get(
+                                "ansi_arithmetic_until", -1
+                            ),
+                            "ansi_index_until": cur_level().get("ansi_index_until", -1),
                             "kind": "subshell",
                             "word": [],
                             "saved_quotes": quotes,
@@ -2137,8 +2336,9 @@ class _ExactReadUnavailable(Exception):
     read exactly: literal characters, backticks (bash ends one at the first
     unescaped backtick), and `$( )`, `$(( ))` and `${ }` spans simple enough
     that their end is unambiguous.  On anything else it raises this, and the
-    caller re-reads the WHOLE input with the walker's pre-#1494 `_legacy`
-    body, unchanged.  A file therefore gets either the exact reading or
+    caller re-reads the WHOLE input with the walker's legacy quoting
+    interpretation. Both readings share the ANSI-C token boundary rule;
+    otherwise the prior quoted-span fallback is retained.  A file therefore gets either the exact reading or
     exactly the reading it had before, never a mixture of the two.
     """
 
@@ -2173,6 +2373,9 @@ def _simple_substitution_end(text, i):
             elif c == "`" or (c == "$" and text[j + 1 : j + 2] in ("(", "{")):
                 raise _ExactReadUnavailable()
             j += 1
+            continue
+        if text[j : j + 2] == "$'":
+            j, _closed = _ansi_c_quote_end(text, j)
             continue
         if c in "'\"":
             quote = c
@@ -2297,6 +2500,9 @@ def _skip_balanced_parens_exact(text, start):
         if c == "\\":
             i += 2
             continue
+        if not quotes and text[i : i + 2] == "$'":
+            i, _closed = _ansi_c_quote_end(text, i)
+            continue
         if c == "'" and not quotes:
             quotes.append("'")
             i += 1
@@ -2336,6 +2542,9 @@ def _skip_balanced_parens_legacy(text, start):
             continue
         if c == "\\":
             i += 2
+            continue
+        if not quotes and text[i : i + 2] == "$'":
+            i, _closed = _ansi_c_quote_end(text, i)
             continue
         if c == "'":
             quotes.append("'")
@@ -2715,19 +2924,20 @@ def _unquote_command_word(w, allow_empty=False, eval_literal=False):
         # live leak (#1032 round 7 P1).  Only `$'` is decoded; every other `$`
         # is still an expansion and still refuses.
         if c == "$" and i + 1 < n and w[i + 1] == "'":
+            end, closed = _ansi_c_quote_end(w, i)
+            if not closed:
+                return None
             j = i + 2
             buf = []
-            while j < n and w[j] != "'":
+            while j < end - 1:
                 if w[j] == "\\" and j + 1 < n:
                     buf.append(_ANSI_C_ESCAPES.get(w[j + 1], w[j + 1]))
                     j += 2
                     continue
                 buf.append(w[j])
                 j += 1
-            if j >= n:
-                return None
             out.append("".join(buf))
-            i = j + 1
+            i = end
             continue
         if c in "$`":
             return None
@@ -3373,6 +3583,9 @@ def _find_compound_close_exact(text, open_idx):
             eol = text.find("\n", i)
             i = n if eol == -1 else eol
             continue
+        if not quotes and text[i : i + 2] == "$'":
+            i, _closed = _ansi_c_quote_end(text, i)
+            continue
         if c == "'" and not quotes:
             quotes.append("'")
             i += 1
@@ -3418,6 +3631,9 @@ def _find_compound_close_legacy(text, open_idx):
         if c == "#" and not quotes and (i == 0 or text[i - 1] in _WORD_BREAK_BEFORE_COMMENT):
             eol = text.find("\n", i)
             i = n if eol == -1 else eol
+            continue
+        if not quotes and text[i : i + 2] == "$'":
+            i, _closed = _ansi_c_quote_end(text, i)
             continue
         if c == "'":
             quotes.append("'")
@@ -3663,7 +3879,13 @@ def discover_emitter_helpers(text):
             # which is what those two mechanisms actually act on.
             if not emits:
                 for a, b in _error_word_spans(body_text):
-                    if _word_has_verbatim_positional(body_text[a:b]):
+                    candidate = list(body_text[a:b])
+                    for start, end in lx.ansi_c_quote_spans:
+                        lo, hi = max(a, start) - a, min(b, end) - a
+                        if lo < hi:
+                            candidate[lo:hi] = " " * (hi - lo)
+                    # Ignore only proven literal DATA, preserving real suffixes.
+                    if _word_has_verbatim_positional("".join(candidate)):
                         emits = True
                         break
                 if not emits and _text_enables_xtrace(body_text) \
@@ -3680,14 +3902,18 @@ def discover_emitter_helpers(text):
     return frozenset(helpers)
 
 
-def _heredoc_bracket_close(text, open_idx):
-    """Existing bracket bounds, isolated from the ordinary compound reader."""
+def _heredoc_bracket_close(text, open_idx, parameter_words=False):
+    """Existing bracket bounds; ordinary ANSI proof alone skips nested WORDs."""
     try:
+        if parameter_words:
+            return _heredoc_bracket_close_exact(text, open_idx, parameter_words=True)
         return _heredoc_bracket_close_exact(text, open_idx)
     except _ExactReadUnavailable:
+        if parameter_words:
+            return None  # Withhold new proof when a nested bound is unavailable.
         return _heredoc_bracket_close_legacy(text, open_idx)
 
-def _heredoc_bracket_close_exact(text, open_idx):
+def _heredoc_bracket_close_exact(text, open_idx, parameter_words=False):
     opener = text[open_idx]
     closer = "]"
     depth = 0
@@ -3707,6 +3933,10 @@ def _heredoc_bracket_close_exact(text, open_idx):
         if c == "#" and not quotes and (i == 0 or text[i - 1] in _WORD_BREAK_BEFORE_COMMENT):
             eol = text.find("\n", i)
             i = n if eol == -1 else eol
+            continue
+        if (parameter_words and not quotes
+                and (text[i:i + 2] in ("${", "$(") or c == "`")):
+            i = _double_quoted_construct_end(text, i)
             continue
         if c == "'" and not quotes:
             quotes.append("'")
@@ -3992,6 +4222,9 @@ def _word_has_verbatim_positional_exact(w):
         if c == "\\" and i + 1 < n:
             i += 2
             continue
+        if not in_double and w[i : i + 2] == "$'":
+            i, _closed = _ansi_c_quote_end(w, i)
+            continue
         if c == '"':
             in_double = not in_double
             i += 1
@@ -4036,10 +4269,16 @@ def _word_has_verbatim_positional_exact(w):
 def _word_has_verbatim_positional_legacy(w):
     i = 0
     n = len(w)
+    in_double = False
     while i < n:
         c = w[i]
         if c == "\\" and i + 1 < n:
             i += 2
+            continue
+        if c == '"':
+            in_double = not in_double
+        if not in_double and w[i : i + 2] == "$'":
+            i, _closed = _ansi_c_quote_end(w, i)
             continue
         if c == "'":
             j = w.find("'", i + 1)
@@ -4570,6 +4809,26 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
     lx = Lexer(text)
     findings = []
     pragma_errors = []
+    for offset in lx.unsupported_ansi_aliases:
+        opened_at = 1 + text[:offset].count("\n")
+        pragma_errors.append(
+            "%s:%d: unsupported ANSI-C alias replacement with a raw sensitive "
+            "reference and escaped apostrophe; rewrite as an ordinary shell function "
+            "or direct command (rewriting does not make secret output safe)"
+            % (path, opened_at)
+        )
+    for offset in lx.unsupported_ansi_sources:
+        opened_at = 1 + text[:offset].count("\n")
+        pragma_errors.append(
+            "%s:%d: unsupported ANSI-C source token with a raw sensitive "
+            "reference and escaped apostrophe; separate source from the ANSI literal "
+            "using an ordinary shell function or direct command "
+            "(rewriting does not make secret output safe)"
+            % (path, opened_at)
+        )
+    for offset in lx.unterminated_ansi_c_quotes:
+        opened_at = 1 + text[:offset].count("\n")
+        pragma_errors.append("%s:%d: unterminated ANSI-C quote" % (path, opened_at))
     if lx.unterminated_heredoc is not None:
         # The lexer reached end of file with a here-doc still open, so every
         # line after the opener was read as body text rather than as code.
@@ -10445,6 +10704,174 @@ CORPUS = [
         MUST_FLAG,
         'trap "eval \'echo \\\\\\"$GH_TOKEN\\\\\\"\'" EXIT\n',
     ),
+    (
+        'ansi-c-escaped-apostrophe-later-emitter',
+        MUST_FLAG,
+        'printf \'%s\\n\' $\'it\\\'s\'\necho "$GH_TOKEN"\n',
+    ),
+    (
+        'ansi-c-plain-later-emitter-control',
+        MUST_FLAG,
+        'printf \'%s\\n\' $\'its\'\necho "$GH_TOKEN"\n',
+    ),
+    (
+        'ansi-c-escaped-apostrophe-two-later-emitters',
+        MUST_FLAG,
+        ': $\'it\\\'s\'\necho "$GH_TOKEN"\nprintf %s "$GH_TOKEN" >&2\n',
+    ),
+    (
+        'ansi-c-escaped-apostrophe-nonemitter-control',
+        MUST_NOT_FLAG,
+        ': $\'it\\\'s\'\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'ansi-c-escaped-apostrophe-helper',
+        MUST_FLAG,
+        'leak() { : $\'it\\\'s\'; echo "$1"; }\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        'ansi-c-plain-helper-control',
+        MUST_FLAG,
+        'leak() { : $\'its\'; echo "$1"; }\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        'ansi-c-helper-literal-positional-control',
+        MUST_NOT_FLAG,
+        'leak() { echo $\'it\\\'s $1\'; }\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        'ansi-c-array-prefix-later-substitution',
+        MUST_FLAG,
+        'items=($\'it\\\'s\' $(echo "$GH_TOKEN" >&2))\n',
+    ),
+    (
+        'ansi-c-array-plain-prefix-control',
+        MUST_FLAG,
+        'items=($\'its\' $(echo "$GH_TOKEN" >&2))\n',
+    ),
+    (
+        'ansi-c-quoted-substitution-later-emitter',
+        MUST_FLAG,
+        ': "$(printf %s $\'it\\\'s\'; echo "$GH_TOKEN" >&2)"\n',
+    ),
+    (
+        'ansi-c-quoted-substitution-plain-control',
+        MUST_FLAG,
+        ': "$(printf %s $\'its\'; echo "$GH_TOKEN" >&2)"\n',
+    ),
+    (
+        'ansi-c-backtick-later-emitter',
+        MUST_FLAG,
+        'v=`: $\'it\\\'s\'; echo "$GH_TOKEN" >&2`\n',
+    ),
+    (
+        'ansi-c-backtick-plain-control',
+        MUST_FLAG,
+        'v=`: $\'its\'; echo "$GH_TOKEN" >&2`\n',
+    ),
+    (
+        'ansi-c-looking-double-quoted-text-control',
+        MUST_FLAG,
+        ': "$\'it\\\'s\'"\necho "$GH_TOKEN"\n',
+    ),
+    (
+        'ansi-c-looking-interpolating-heredoc-substitution',
+        MUST_FLAG,
+        'cat <<EOF\n$\'it\\\'s\' $(echo "$GH_TOKEN" >&2)\nEOF\n',
+    ),
+    (
+        'ansi-c-looking-quoted-heredoc-data-control',
+        MUST_NOT_FLAG,
+        'cat <<\'EOF\'\n$\'it\\\'s\' $(echo "$GH_TOKEN" >&2)\nEOF\n',
+    ),
+    (
+        'ansi-c-multiline-function-shaped-data-control',
+        MUST_NOT_FLAG,
+        'data=$\'\ntrue()\n{ echo "$1"; }\nit\\\'s\'\ntrue "$GH_TOKEN"\n',
+    ),
+    (
+        'ansi-c-helper-compound-delimiter-data',
+        MUST_FLAG,
+        'function leak\n{ : $\'it\\\'s } )\'; echo "$1"; }\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        'ansi-c-helper-legacy-compound-span',
+        MUST_FLAG,
+        'leak() { : "${A:-${B:-x}}"; : $\'it\\\'s\'; echo "$1"; }\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        'ansi-c-array-legacy-span',
+        MUST_FLAG,
+        'items=("${A:-${B:-x}}" $\'it\\\'s\' $(echo "$GH_TOKEN" >&2))\n',
+    ),
+    (
+        'ansi-c-helper-legacy-positional-data-control',
+        MUST_NOT_FLAG,
+        'leak() { echo "${A:-${B:-x}}"$\'it\\\'s $1\'; }\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        'ansi-c-quoted-substitution-delimiter-data',
+        MUST_FLAG,
+        ': "$(printf %s $\'it\\\'s ) # case { }\'; echo "$GH_TOKEN" >&2)"\n',
+    ),
+    (
+        'ansi-c-multiline-synchronization',
+        MUST_FLAG,
+        ': $\'first\\\nsecond\\\'s\'\necho "$GH_TOKEN"\n',
+    ),
+    (
+        'ansi-c-unquoted-default-word-later-emitter',
+        MUST_FLAG,
+        ': ${UNSET:-$\'it\\\'s\'}\necho "$GH_TOKEN"\n',
+    ),
+    (
+        'ansi-c-helper-literal-error-word-data-control',
+        MUST_NOT_FLAG,
+        'leak() { echo $\'it\\\'s ${UNSET:?$1}\'; }\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        'ansi-c-helper-following-real-error-word',
+        MUST_FLAG,
+        'leak() { : $\'it\\\'s\'; : "${UNSET:?$1}"; }\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        'ansi-c-helper-child-literal-error-word-data-control',
+        MUST_NOT_FLAG,
+        'leak() { echo `printf %s $\'it\\\'s ${UNSET:?$1}\'`; }\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        'ansi-c-helper-child-following-real-error-word',
+        MUST_FLAG,
+        'leak() { : `: $\'it\\\'s\'; : "${UNSET:?$1}"`; }\nleak "$GH_TOKEN"\n',
+    ),
+    ('ansi-c-cross-error-ANSI-prefix-following-positional', MUST_FLAG, 'die(){ : ${UNSET:?$\'literal\'$1}; }\ndie "$GH_TOKEN"\n'),
+    ('ansi-c-cross-error-ANSI-escaped-prefix-following-positional', MUST_FLAG, 'die(){ : ${UNSET:?$\'lit\\\'eral\'$1}; }\ndie "$GH_TOKEN"\n'),
+    ('ansi-c-cross-error-literal-prefix-following-positional', MUST_FLAG, 'die(){ : ${UNSET:?literal$1}; }\ndie "$GH_TOKEN"\n'),
+    ('ansi-c-cross-ANSI-literal-error-looking-data', MUST_NOT_FLAG, 'die(){ : $\'${UNSET:?$1}\'; }\ndie "$GH_TOKEN"\n'),
+    ('ansi-c-cross-error-ANSI-only-data-control', MUST_NOT_FLAG, 'die(){ : ${UNSET:?$\'literal\'}; }\ndie "$GH_TOKEN"\n'),
+    ('ansi-c-cross-default-ANSI-prefix-inert-control', MUST_NOT_FLAG, 'die(){ : ${UNSET:-$\'literal\'$1}; }\ndie "$GH_TOKEN"\n'),
+    ('ansi-c-cross-default-ANSI-prefix-emitter-control', MUST_FLAG, 'die(){ echo ${UNSET:-$\'literal\'$1}; }\ndie "$GH_TOKEN"\n'),
+    ('ansi-c-cross-heredoc-ANSI-looking-raw-error-control', MUST_FLAG, 'die(){ cat <<EOF\n${UNSET:?$\'literal\'$1}\nEOF\n}\ndie "$GH_TOKEN"\n'),
+    ('ansi-c-cross-child-error-ANSI-prefix-following-positional', MUST_FLAG, 'die(){ : `: ${UNSET:?$\'literal\'$1}`; }\ndie "$GH_TOKEN"\n'),
+    ('ansi-c-cross-child-ANSI-literal-error-looking-data', MUST_NOT_FLAG, 'die(){ : `: $\'${UNSET:?$1}\'`; }\ndie "$GH_TOKEN"\n'),
+    ('ansi-c-cross-active-parent-eval', MUST_FLAG, 'set -x\n: $\'it\\\'s\'\neval \': "$GH_TOKEN"\'\n'),
+    ('ansi-c-cross-same-line-deferred-enable', MUST_FLAG, ': $\'it\\\'s\'; eval \'set -x\'; eval \': "$GH_TOKEN"\'\n'),
+    ('ansi-c-cross-sub-shell-restores-quiet-parent', MUST_NOT_FLAG, '(set -x); : $\'it\\\'s\'; eval \': "$GH_TOKEN"\'\n'),
+    ('ansi-c-cross-capture-restores-quiet-parent', MUST_NOT_FLAG, 'value=$(set -x)\n: $\'it\\\'s\'\neval \': "$GH_TOKEN"\'\n'),
+    ('ansi-c-cross-isolate-retains-active-parent', MUST_FLAG, 'set -x\n(set +x); : $\'it\\\'s\'; eval \': "$GH_TOKEN"\'\n'),
+    ('ansi-c-cross-final-C-discards-ANSI-traced-callback', MUST_NOT_FLAG, 'mapfile -C $\'set -x # it\\\'s\' -C \':\' -c 1 items <<< x\neval \': "$GH_TOKEN"\'\n'),
+    ('ansi-c-cross-final-C-keeps-ANSI-traced-callback', MUST_FLAG, 'mapfile -C \':\' -C $\'set -x # it\\\'s\' -c 1 items <<< x\neval \': "$GH_TOKEN"\'\n'),
+    ('ansi-c-cross-active-trap-ANSI-callback', MUST_FLAG, 'set -x\ntrap $\': "$GH_TOKEN" # it\\\'s\' EXIT\n'),
+    # Owner-admitted inherited plain alias limit; source-proof design #2242.
+    (
+        'ansi-c-plain-alias-invoked-inherited',
+        MUST_NOT_FLAG,
+        'shopt -s expand_aliases; alias leak=$\'echo "$GH_TOKEN" >&2\'\nleak\n',
+    ),
+    # Owner-admitted inherited ANSI indexed-name limits; separate design #2246.
+    ('read-helper-positional-index-inherited', MUST_NOT_FLAG, 'leak() { read $\'a[$(: \\\\\\\'; echo "$1" >&2)]\' <<< x; }\nleak "$GH_TOKEN"\n'),
+    ('printf-v-helper-positional-index-inherited', MUST_NOT_FLAG, 'leak() { printf -v $\'a[$(: \\\\\\\'; echo "$1" >&2)]\' %s x; }\nleak "$GH_TOKEN"\n'),
+    ('read-ansi-index-no-apostrophe-inherited', MUST_NOT_FLAG, 'read $\'a[$(echo "$GH_TOKEN" >&2)]\' <<< x\n'),
 ]
 
 CORPUS.extend([
@@ -11391,6 +11818,10 @@ KNOWN_MISSES = {
         "the first segment and a bare `env` dumps it on the second, and "
         "neither segment names a `$`-reference"
     ),
+    'ansi-c-plain-alias-invoked-inherited': 'Inherited on actual parent fb09 and the owner-approved quote repair: an enabled plain ANSI alias replacement can execute its own raw credential reference on a following physical line, while the ordinary alias catalogue tracks emitter heads rather than replacement references. No escaped apostrophe means this remains outside the approved unsupported-source boundary. Both measured Mac/Linux fake-data samples leak while the scanner stays clean. Separate alias/source-proof design: https://github.com/nathanjohnpayne/mergepath/issues/2242 (#1453 owner decision).',
+    'read-helper-positional-index-inherited': 'Inherited on actual main cb69 (scanner fb09), published bf9a and frozen 1638 in the measured Mac/Linux fake-data samples: an invoked helper passes a positional-only ANSI indexed target to read and emits its argument, while all three scanners report clean. The approved global source-proof boundary uses existing raw sensitive names, not positional source reconstruction. Separate design: https://github.com/nathanjohnpayne/mergepath/issues/2246; owner acceptance #1453 comment6183821891.',
+    'printf-v-helper-positional-index-inherited': 'Inherited on actual main cb69 (scanner fb09), published bf9a and frozen 1638 in the measured Mac/Linux fake-data samples: an invoked helper passes a positional-only ANSI indexed target to separate printf -v and emits its argument, while all three scanners report clean. The approved global source-proof boundary uses existing raw sensitive names, not positional source reconstruction. Separate design: https://github.com/nathanjohnpayne/mergepath/issues/2246; owner acceptance #1453 comment6183821891.',
+    'read-ansi-index-no-apostrophe-inherited': 'Inherited on actual main cb69 (scanner fb09), published bf9a and frozen 1638 in the measured Mac/Linux fake-data samples: the ANSI indexed read target has a raw credential reference but no interior apostrophe and emits the fake value, while all three scanners report clean. It remains outside the approved two-conjunct raw source-proof boundary. Separate design: https://github.com/nathanjohnpayne/mergepath/issues/2246; owner acceptance #1453 comment6183821891.',
 }
 
 KNOWN_BROADER = {
@@ -14085,6 +14516,253 @@ def _quoted_default_head_cases():
     return failures
 
 
+def _ansi_c_quote_cases():
+    """Pin shared token bounds, context exclusions and explicit failure."""
+    failures = []
+    token = "$'it\\'s'"
+    for raw, closed in [("$'it\\'s'", True), ("$'a\\\\'", True), ("$'a\\'", False)]:
+        if _ansi_c_quote_end(raw, 0) != (len(raw), closed):
+            failures.append("ANSI-C token boundary: " + repr(raw))
+    if _unquote_command_word(token) != "it's":
+        failures.append("ANSI-C literal decoder lost its existing value")
+    for text in [': $\'unterminated\\\'\necho "$GH_TOKEN"\n', "v=`: $'unterminated\\'`\n"]:
+        _findings, errors = scan_text(text, "ansi-c-malformed")
+        if not any("unterminated ANSI-C quote" in e for e in errors):
+            failures.append("malformed ANSI-C token scanned clean: " + repr(text))
+    for text in [': "$\'literal text"\n', "cat <<'EOF'\n$'literal text\nEOF\n"]:
+        _findings, errors = scan_text(text, "ansi-c-data")
+        if errors:
+            failures.append("ANSI-C-looking DATA acquired a syntax error")
+    for read in (_skip_balanced_parens_exact, _skip_balanced_parens_legacy):
+        text = "( $'it\\'s )'; x )tail"
+        if read(text, 0) != text.rindex(")") + 1:
+            failures.append("ANSI-C balanced span: " + read.__name__)
+    for read in (_find_compound_close_exact, _find_compound_close_legacy):
+        text = "{ : $'it\\'s }'; x; }tail"
+        if read(text, 0) != text.rindex("}"):
+            failures.append("ANSI-C compound span: " + read.__name__)
+    text = "$( : $'it\\'s ) # case }'; echo foo )tail"
+    if _simple_substitution_end(text, 0) != text.rindex(")") + 1:
+        failures.append("ANSI-C simple substitution boundary")
+    for read in (_find_substitutions_exact, _find_substitutions_legacy):
+        text = token + ' $(echo "$GH_TOKEN" >&2)'
+        if len(read(text)) != 1 or read(text)[0][0] != 'echo "$GH_TOKEN" >&2':
+            failures.append("ANSI-C substitution inventory: " + read.__name__)
+    for read in (_word_has_verbatim_positional_exact, _word_has_verbatim_positional_legacy):
+        if read("$'it\\'s $1'") or not read(token + " $1"):
+            failures.append("ANSI-C positional DATA: " + read.__name__)
+    text = ': $\'first\\\nsecond\\\'s\'\necho "$GH_TOKEN"\n'
+    refs = [r for ll in Lexer(text).logical for r in ll.refs if r.name == "GH_TOKEN"]
+    if len(refs) != 1 or refs[0].line != 3:
+        failures.append("ANSI-C token lost physical-line reference offsets")
+    text = 'data=$\'\ntrue()\n{ echo "$1"; }\nit\\\'s\'\ntrue "$GH_TOKEN"\n'
+    if list(_iter_function_definitions(text)):
+        failures.append("ANSI-C quoted DATA acquired a function body")
+    literal = "$'it\\'s ${UNSET:?$1}'"
+    for text in [
+        "v=" + literal + "\n",
+        "v=`echo " + literal + "`\n",
+        "v=$(echo " + literal + ")\n",
+        "v=( $(echo " + literal + ") )\n",
+        "cat <<EOF\n$(echo " + literal + ")\nEOF\n",
+    ]:
+        start = text.index(literal)
+        if Lexer(text).ansi_c_quote_spans != [(start, start + len(literal))]:
+            failures.append("ANSI-C literal source span/remapping: " + repr(text))
+    for text in ['v="' + literal + '"\n', "cat <<'EOF'\n" + literal + "\nEOF\n"]:
+        if Lexer(text).ansi_c_quote_spans:
+            failures.append("ANSI-C-looking DATA acquired a literal span")
+    for child in [False, True]:
+        data = "echo " + literal
+        real = ': $\'it\\\'s\'; : "${UNSET:?$1}"'
+        if child:
+            data = "echo `" + data + "`"
+            real = ": `" + real + "`"
+        if "leak" in discover_emitter_helpers("leak() { " + data + "; }\n"):
+            failures.append("ANSI-C literal error-word DATA acquired a helper")
+        if "leak" not in discover_emitter_helpers("leak() { " + real + "; }\n"):
+            failures.append("ANSI-C synchronization lost following real error word")
+    for prefix in ["$'literal'", "$'lit\\'eral'"]:
+        for child in [False, True]:
+            real = ": ${UNSET:?" + prefix + "$1}"
+            if child:
+                real = ": `" + real + "`"
+            if "leak" not in discover_emitter_helpers("leak() { " + real + "; }\n"):
+                failures.append("ANSI literal prefix erased a real error-word suffix")
+    # ANSI literal proof is withheld in the existing arithmetic quote state.
+    # A real command substitution resets that state for its inner command.
+    literal = "$'plain'"
+    for text, literal_data in [
+        (": $(( " + literal + " ))\n", False),
+        (": $(( ${PLAIN:-" + literal + "} ))\n", False),
+        (": $(( $( : " + literal + " ) ))\n", True),
+    ]:
+        start = text.index(literal)
+        expected = [(start, start + len(literal))] if literal_data else []
+        if Lexer(text).ansi_c_quote_spans != expected:
+            failures.append("ANSI-C arithmetic context/span boundary: " + repr(text))
+    # Data-only prefix controls: no array value/type or runtime is evaluated.
+    for prefix, indexed in [
+        ("array[", True), ("array[1 + [2]", True),
+        ("${array[", True), ("${#array[", True), ("${!array[", True),
+        ("${1[", True), ("array[0]=", False), ("${array[0]:-", False),
+        ("${NAME:-literal[", False), ("\\${array[", False),
+        ("'$'\"{array[\"", False), ("$'${array['", False),
+    ]:
+        if _ansi_c_index_prefix(prefix) != indexed:
+            failures.append("ANSI-C index-prefix DATA boundary: " + repr(prefix))
+    for prefix, suffix, indexed in [
+        ("array[", "]=0", True), ("${array[", "]}", True),
+        ("array[0]=", "", False), ("${array[0]:-", "}", False),
+        ("${NAME:-literal[", "}", False),
+    ]:
+        text = prefix + literal + suffix + "\n"
+        expected = [] if indexed else [(len(prefix), len(prefix) + len(literal))]
+        if Lexer(text).ansi_c_quote_spans != expected:
+            failures.append("ANSI-C index-context source offsets: " + repr(text))
+    # Harmless parsing data only: arithmetic operands do not prove a WORD.
+    for prefix, suffix, literal_data in [
+        ("(( 1 + ", " ))", False), ("${v:", "}", False),
+        ("${v:0:", "}", False), ("${v:-", "}", True),
+        ("${v:+", "}", True), ("${v:=", "}", True),
+        ("${v:?", "}", True), ("${v[0]:-", "}", True),
+        ("(( $( : ", " ) ))", True),
+    ]:
+        text = prefix + literal + suffix + "\n"
+        start = len(prefix)
+        expected = [(start, start + len(literal))] if literal_data else []
+        if Lexer(text).ansi_c_quote_spans != expected:
+            failures.append("ANSI-C positive WORD/arithmetic boundary: " + repr(text))
+    for text, expected in [
+        ("a=( $'unterminated", [4]),
+        ("a=(\n  $'unterminated", [6]),
+        ("a=( $( : $'unterminated", [9]),
+        ("a=( \"$'literal\" )", []),
+        ("a=( $'closed' )", []),
+    ]:
+        if Lexer(text).unterminated_ansi_c_quotes != expected:
+            failures.append("ANSI-C array DATA failure offset: " + repr(text))
+    # Syntax proof is independent of narrower inert-index DATA proof.
+    for text, expected_errors in [
+        ("a[$'unterminated", [2]),
+        (": $(( $'unterminated", []),
+        (": ${v:$'unterminated", []),
+        (": $[ $'unterminated", []),
+    ]:
+        lx = Lexer(text)
+        if lx.unterminated_ansi_c_quotes != expected_errors or lx.ansi_c_quote_spans:
+            failures.append("ANSI-C ordinary syntax failure boundary: " + repr(text))
+    for prefix, suffix, literal_data in [
+        (": $[ 1 + ", " ]", False),
+        (": $[ 1 ] ", "", True),
+        (": $[ $( : ", " ) ]", True),
+    ]:
+        text = prefix + literal + suffix + "\n"
+        expected = [(len(prefix), len(prefix) + len(literal))] if literal_data else []
+        if Lexer(text).ansi_c_quote_spans != expected:
+            failures.append("ANSI-C raw arithmetic interval/reset: " + repr(text))
+    array_literal = "$'plain ${UNSET:?value}'"
+    for text in ["a=( " + array_literal + " )", "a=(\n  " + array_literal + " )"]:
+        start = text.index(array_literal)
+        if Lexer(text).ansi_c_quote_spans != [(start, start + len(array_literal))]:
+            failures.append("ANSI-C array DATA literal source span: " + repr(text))
+    # Raw bounds reuse existing readers; default bracket behavior is unchanged.
+    nested = "[${x:-abc]} + 0]"
+    for read in (_heredoc_bracket_close, _heredoc_bracket_close_exact):
+        if read(nested, 0) != nested.index("]") or read(nested, 0, False) != read(nested, 0):
+            failures.append("ANSI-C bracket opt-in changed an ordinary default")
+        if read(nested, 0, parameter_words=True) != nested.rindex("]"):
+            failures.append("ANSI-C nested WORD prematurely closed index")
+    if not _ansi_c_index_prefix("a[${x:-abc]} + "):
+        failures.append("ANSI-C raw prefix lost nested WORD index depth")
+    for prefix, suffix in [
+        ("if(( ", " ))"), ("while(( ", " ))"),
+        ("until(( ", " ))"), ("for(( ", " ))"),
+        ("a[${x:-abc]} + ", "]=value"),
+    ]:
+        if Lexer(prefix + literal + suffix).ansi_c_quote_spans:
+            failures.append("ANSI-C adjacent/arithmetic interval DATA proof")
+    # Harmless parser-only siblings: nested executable extents do not close
+    # an outer index, and local wrapper refusal includes the existing `time`.
+    for nested in ("[$( : ]) + 0]", "[` : ]` + 0]", "[$(( 1 )) + 0]"):
+        for read in (_heredoc_bracket_close, _heredoc_bracket_close_exact):
+            if read(nested, 0, parameter_words=True) != nested.rindex("]"):
+                failures.append("ANSI-C nested executable extent closed index")
+            if read(nested, 0) != read(nested, 0, False):
+                failures.append("ANSI-C nested extent changed default bracket mode")
+        if not _ansi_c_index_prefix("array" + nested[:-1]):
+            failures.append("ANSI-C nested executable extent lost open prefix")
+        if _ansi_c_index_prefix("array" + nested + "="):
+            failures.append("ANSI-C closed executable index retained refusal")
+        parameter = "${array" + nested + ":-value}"
+        if _ansi_c_parameter_word_start(parameter, 0) != parameter.index("value"):
+            failures.append("ANSI-C nested executable index lost WORD offset")
+    for nested in ("[$( ( ) ) + 0]", "[$( : ]", "[` : ]"):
+        if _heredoc_bracket_close(nested, 0, parameter_words=True) is not None:
+            failures.append("ANSI-C unavailable nested extent proved index close")
+        if not _ansi_c_index_prefix("array" + nested):
+            failures.append("ANSI-C unavailable nested extent lost refusal")
+    for prefix, suffix, literal_data in [
+        ("time(( ", " ))", False),
+        ("time(( $( : ", " ) ))", True),
+        ("array[$( : ]) + ", "]=value", False),
+        ("array[` : ]` + ", "]=value", False),
+        ("array[$( : ])]=", "", True),
+        ("array[` : ]`]=", "", True),
+    ]:
+        text = prefix + literal + suffix
+        start = len(prefix)
+        expected = [(start, start + len(literal))] if literal_data else []
+        if Lexer(text).ansi_c_quote_spans != expected:
+            failures.append("ANSI-C wrapper/nested index source span: " + repr(text))
+    # Narrow proof proposal: raw-sensitive escaped-apostrophe replacements.
+    prefix = "alias sample="
+    alias_token = '$\'printf "$GH_TOKEN" \\\'safe\\\'\''
+    text = prefix + alias_token + '\n: "$GH_TOKEN"\n'
+    lx = Lexer(text)
+    refs = [r for ll in lx.logical for r in ll.refs if r.name == "GH_TOKEN"]
+    if lx.unsupported_ansi_aliases != [len(prefix)] or len(refs) != 1 or refs[0].line != 2:
+        failures.append("ANSI-C alias failure lost escaped-quote synchronization")
+    text = "v=$(alias sample=" + alias_token + ")"
+    if Lexer(text).unsupported_ansi_aliases != [text.index(alias_token)]:
+        failures.append("ANSI-C executable child lost unsupported alias offset")
+    for text in ["a=( alias sample=" + alias_token + " )", "printf %s sample=" + alias_token]:
+        if Lexer(text).unsupported_ansi_aliases:
+            failures.append("ANSI-C alias-looking DATA acquired execution error")
+    for alias_data in ["$'printf safe'", "$'printf \\'safe\\''", '$\'printf "$GH_TOKEN"\'']:
+        if Lexer(prefix + alias_data).unsupported_ansi_aliases:
+            failures.append("ANSI-C narrow alias proof rejected a preserved control")
+    # Quoted/escaped literal names share the existing alias boundary. These
+    # are parser-only uninvoked controls, including its deliberate refusal.
+    for alias_name in ("'sample'", "\\sample"):
+        alias_prefix = "alias " + alias_name + "="
+        text = alias_prefix + alias_token
+        if Lexer(text).unsupported_ansi_aliases != [len(alias_prefix)]:
+            failures.append("ANSI-C literal alias name bypassed refusal")
+        safe_text = alias_prefix + token
+        if Lexer(safe_text).unsupported_ansi_aliases:
+            failures.append("ANSI-C literal alias name rejected safe replacement")
+    # Owner-approved global raw-sensitive/apostrophe proof boundary. These
+    # are nonexecuting parser controls, not an operand execution model.
+    text = ": " + alias_token + '\n: "$GH_TOKEN"\n'
+    lx = Lexer(text)
+    refs = [r for ll in lx.logical for r in ll.refs if r.name == "GH_TOKEN"]
+    if (lx.unsupported_ansi_sources != [2] or lx.unsupported_ansi_aliases
+            or len(refs) != 1 or refs[0].line != 2):
+        failures.append("ANSI-C global source refusal lost later-line synchronization")
+    text = "v=$( : " + alias_token + ")"
+    if Lexer(text).unsupported_ansi_sources != [text.index(alias_token)]:
+        failures.append("ANSI-C executable child lost global source failure offset")
+    if Lexer("a=( " + alias_token + " )").unsupported_ansi_sources:
+        failures.append("ANSI-C array DATA imported global source failure")
+    if Lexer(prefix + alias_token).unsupported_ansi_sources:
+        failures.append("ANSI-C alias refusal duplicated a global source failure")
+    for preserved in (token, '$\'printf "$GH_TOKEN"\''):
+        if Lexer(": " + preserved).unsupported_ansi_sources:
+            failures.append("ANSI-C global source refusal exceeded raw conjunction")
+    return failures
+
+
 def self_test():
     failures = []
     passed = 0
@@ -14095,6 +14773,7 @@ def self_test():
     failures.extend(_corpus_id_cases())
     failures.extend(_printf_allowlist_cases())
     failures.extend(_function_definition_cases())
+    failures.extend(_ansi_c_quote_cases())
     failures.extend(_quoted_default_head_cases())
     failures.extend(_heredoc_conservatism_cases())
     failures.extend(_heredoc_echo_conservatism_cases())

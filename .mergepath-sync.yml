@@ -569,6 +569,7 @@ paths:
       - "scripts/lib/gh-api-scalar.sh"   # #799, fail-closed scalar API reads
       - "scripts/codex-review-ledger.sh"       # #1560 slice 3, blocking-review budget count (fails closed when absent)
       - "scripts/lib/codex-review-ledger.sh"   # the ledger's attribution and classification
+      - "scripts/lib/ensure-yq.sh"             # #2240, CI-only yq bootstrap for the request_by_default read (existence-guarded; absent, an unreadable policy requests)
       - "scripts/lib/gh-api-array.sh"    # #1008, hard-sourced paginated list reads
       - "scripts/review-feedback-accounting.sh"   # #1000, fail before another review round
       # #1100: the provider-scoped accounting refusal resolves its relax set from
@@ -708,6 +709,8 @@ paths:
     requires:
       - "scripts/review-feedback-accounting.sh"   # #1000, gate manual reviewer dispatch too
       - "scripts/lib/preflight-helpers.sh"
+      - "scripts/lib/pr-body-contract.sh"
+      - "scripts/workflow/resolve_base_policy.sh"
   - path: scripts/codex-p1-gate.sh
     type: canonical
     consumers: all

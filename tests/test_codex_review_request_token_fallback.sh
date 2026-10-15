@@ -72,6 +72,7 @@ make_case() {
 author_identity: nathanjohnpayne
 codex:
   bot_login: "chatgpt-codex-connector[bot]"
+  request_by_default: true  # #2240: absent now means false; these cases exercise the request itself
   review_timeout_seconds: 0
   reaction_freshness_window_seconds: 999999999
   ack_wait_seconds: 0
