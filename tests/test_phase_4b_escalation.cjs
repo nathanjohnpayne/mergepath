@@ -70,6 +70,15 @@ test('the feedback-state fingerprint entrypoint is an exact sensitive path', () 
   }
 });
 
+test('the manual handoff renderer is an exact sensitive path', () => {
+  assert.deepEqual(classify('+ordinary change', ['scripts/post-phase-4b-handoff.sh']), {
+    decision: 'human-review', tripwires: ['authorization-policy-publisher-or-credentials'],
+  });
+  for (const file of ['scripts/post-phase-4b-handoff.sh.example', 'scripts/post-phase-4b-handoff.sh/child', 'scripts/post-phase-4b-handoff-extra.sh', 'scripts/Post-phase-4b-handoff.sh', 'nested/scripts/post-phase-4b-handoff.sh']) {
+    assert.deepEqual(classify('+ordinary change', [file]), { decision: 'model-review', tripwires: [] }, file);
+  }
+});
+
 test('captured Git objects determine both rename sides and complete wave scope', t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'p4b-escalation-test-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
