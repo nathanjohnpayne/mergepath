@@ -27,7 +27,7 @@ while [ "$#" -gt 0 ]; do
     --check) ACTION=check ;;
     --uninstall) ACTION=uninstall ;;
     --force) FORCE=1 ;;
-    -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;;
     *) echo "install-git-hooks: unknown argument: $1" >&2; exit 2 ;;
   esac
   shift

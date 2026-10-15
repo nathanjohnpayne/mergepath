@@ -45,7 +45,10 @@ fi
 
 # shellcheck disable=SC2046
 unset $(git rev-parse --local-env-vars) 2>/dev/null || true
-unset MERGEPATH_PREPUSH_SKIP MERGEPATH_PREPUSH_DEEP MERGEPATH_PREPUSH_JOBS MERGEPATH_PREPUSH_NICE GITHUB_OUTPUT 2>/dev/null || true
+# Every runner control, so a suite run from inside the hook (check_repo_lint_prepush
+# under MERGEPATH_PREPUSH_LIVE=all, say) does not leak its opt-ins into the fixtures.
+unset MERGEPATH_PREPUSH_SKIP MERGEPATH_PREPUSH_DEEP MERGEPATH_PREPUSH_LIVE MERGEPATH_PREPUSH_JOBS \
+  MERGEPATH_PREPUSH_NICE MERGEPATH_PREPUSH_PYTHON MERGEPATH_PREPUSH_KEEP_LOGS GITHUB_OUTPUT 2>/dev/null || true
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 export GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid
 export GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid
@@ -334,6 +337,14 @@ printf 'refs/heads/feat/orphan %s refs/heads/feat/orphan %s\n' "$(git -C "$HUB" 
 check "[no merge base] fails closed to the complete selection" \
   "$(sed -n 's/^scope\t//p' "$TMP/plan.orphan")" \
   'deep=true full=true checks=[] consumer_replay=true self_tests=true'
+
+# --help prints the whole header: the bypass, opt-in and exit-code lines.
+help_out=$(bash "$RUNNER" --help)
+for want in MERGEPATH_PREPUSH_SKIP MERGEPATH_PREPUSH_LIVE MERGEPATH_PREPUSH_PYTHON MERGEPATH_PREPUSH_KEEP_LOGS 'Exit: 0'; do
+  case "$help_out" in *"$want"*) ok "--help documents $want" ;; *) bad "--help omits $want" ;; esac
+done
+case "$help_out" in *'set -euo'*) bad "--help printed code past the header" ;; *) ok "--help stops at the end of the header" ;; esac
+case "$(bash "$INSTALLER" --help)" in *"--uninstall"*"no longer runs"*|*"--uninstall"*) ok "installer --help documents its flags" ;; *) bad "installer --help incomplete" ;; esac
 
 echo "Part 2: behaviour through git push with the installed hook"
 
