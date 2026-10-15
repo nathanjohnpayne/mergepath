@@ -3053,6 +3053,32 @@ fi
 
 log "gate (c): cleared — $CLEARANCE_REASON"
 
+# The substitution auto-merge caller combines these existing strict modes.
+# Its earlier approval cannot carry a review that arrived afterward. The
+# agent's pre-approval probe omits REQUIRE_APPROVAL_ON_HEAD and then approves.
+if [ "$REQUIRE_CODEX_ON_HEAD" = 1 ] && [ "$REQUIRE_APPROVAL_ON_HEAD" = 1 ]; then
+  AUDITED_REVIEWER=$(printf '%s' "$REVIEWS_JSON" | jq -r \
+    --argjson reviewers "$REVIEWERS_JSON" --arg author "$PR_AUTHOR" \
+    --arg sha "$HEAD_SHA" --arg cleared "$LATEST_SIGNAL_TIME" '
+      def epoch: try fromdateiso8601 catch null;
+      ($cleared | epoch) as $floor
+      | [ .[]
+          | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+          | select(.user.login != $author and (.user.login as $u | $reviewers | index($u)))
+        ] as $opinions
+      | if all($opinions[]; (.submitted_at | epoch) != null) then $opinions
+        else error("unreadable reviewer approval timestamp") end
+      | group_by(.user.login) | map(max_by(.submitted_at))
+      | map(select(.state == "APPROVED" and .commit_id == $sha)
+          | select((.submitted_at | epoch) as $when | $floor != null and $when != null and $when > $floor)
+          | select((.body // "") | test("CodeRabbit rate-limited; cleared by Codex on `?" + $sha + "`?([.[:space:]]|$)"; "i")))
+      | first | if . == null then empty else .user.login end
+    ') || die 3 "cannot read the substitution approval audit"
+  [ -n "$AUDITED_REVIEWER" ] \
+    || fail_gate "Codex cleared this commit at $LATEST_SIGNAL_TIME; a later reviewer approval must record CodeRabbit rate-limited; cleared by Codex on $HEAD_SHA."
+  log "substitution approval: audited approval for the current commit by $AUDITED_REVIEWER after $LATEST_SIGNAL_TIME"
+fi
+
 # --- all gates pass ---------------------------------------------------------
 
 # Policy clearance and GitHub approval requirements are separate. The

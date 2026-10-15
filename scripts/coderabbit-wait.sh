@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/coderabbit-wait.sh — Phase 2.5 CodeRabbit wait + rate-limit retry
+# scripts/coderabbit-wait.sh — Phase 2.5 wait + immediate Codex substitution
 #
 # Polls a pull request for a CodeRabbit review anchored on the current HEAD
 # commit. Handles three CodeRabbit behaviors that the naive "just wait"
@@ -9,9 +9,9 @@
 #      "Rate limit exceeded" with a specific retry window
 #      ("Please wait X minutes and Y seconds before requesting another
 #      review") and then does NOT auto-retry when the window elapses.
-#      This script detects that state, sleeps the window + buffer, posts
-#      `@coderabbitai, try again.` to re-trigger, and continues polling.
-#      See nathanjohnpayne/mergepath#138.
+#      This script detects the refusal, requests Codex immediately and exits
+#      with the substitution disposition. It never sleeps out that window
+#      or posts a CodeRabbit retry. See mergepath#2139.
 #
 #   2. **Auto-pause state.** After N reviewed commits
 #      (`reviews.auto_review.auto_pause_after_reviewed_commits`, default 5)
@@ -294,9 +294,9 @@
 #   3   API / infrastructure error. Error on stderr.
 #   4   Timeout — max_wait_seconds elapsed without a real review. Caller
 #       may log a warning and proceed (CodeRabbit is advisory), or block.
-#   5   Rate-limit stalled — retry/window budget exhausted, or a trusted
-#       notice-less refusal remains at timeout (#940). Distinct from timeout
-#       so callers can alert the human when Codex failover did not engage.
+#   5   Positive rate-limit refusal — published or trusted notice-less state.
+#       Immediate substitution reports proceed_on_codex_clearance, or
+#       human_attention_required when the Codex request is unavailable.
 #   6   Auto-review skipped and not (re-)invocable. Either the static
 #       skip — base branch ∉ base_branches, or draft when drafts:false —
 #       or an auto-pause whose `@coderabbitai resume` retries are
@@ -307,9 +307,9 @@
 #       the base, mark the PR ready, or escalate — not merely log and
 #       proceed. See nathanjohnpayne/mergepath#490.
 #   7   PROBE_NO_REVIEW — `--probe` only. No CodeRabbit review object is
-#       pinned to the current HEAD. NOT a timeout (4), NOT a stalled retry
-#       budget (5), NOT an un-invocable skip (6): a probe posts no retry and
-#       no `resume`, so it can never have exhausted either budget, and 5 or 6
+#       pinned to the current HEAD. NOT a timeout (4), NOT a provider refusal
+#       (5), NOT an un-invocable skip (6): a probe requests no substitution
+#       and posts no `resume`, so it cannot establish either outcome, and 5 or 6
 #       would escalate or excuse a PR CodeRabbit may be about to review.
 #       `probe.observed` names which surface the scan landed on. Callers
 #       using this as an ordering barrier re-probe on a bound of their own.

@@ -96,8 +96,9 @@ CLEARANCE_POLL_SECONDS="${CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_POLL_SECONDS:-30}
 # The probe is codex-review-check.sh under exactly the environment the #727
 # post-clearance probe and the workflow's final re-verify already use:
 #   SKIP_CI=1                     — CI greenness is a separate gate here.
-#   REQUIRE_APPROVAL_ON_HEAD=1    — a stale earlier-head APPROVED cannot ride
-#                                   a later push into clearance (#435).
+#   REQUIRE_APPROVAL_ON_HEAD=1    — combined with the strict Codex flag,
+#                                   requires a later current-head approval
+#                                   carrying the provider/full-SHA audit.
 #   ALLOW_PHASE_4B_SUBSTITUTE=false — LOAD-BEARING (#727, Codex P2 on #729):
 #                                   without it gate (c) accepts the very
 #                                   reviewer APPROVED that armed auto-merge as

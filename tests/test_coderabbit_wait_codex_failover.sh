@@ -339,12 +339,30 @@ case "$endpoint" in
   repos/owner/repo/pulls/999) jq -nc --arg head "$head" '{user:{login:"nathanjohnpayne"},body:"Authoring-Agent: codex",head:{sha:$head,ref:"fix"},base:{ref:"main"},labels:[],additions:10,deletions:1}' ;;
   repos/owner/repo/commits/*) printf '2026-06-01T00:00:00Z' ;;
   repos/owner/repo/pulls/999/reviews)
-    case "$CLEARANCE_SCENARIO" in
+    reviews=$(case "$CLEARANCE_SCENARIO" in
       clean-review|blocking-review) body='Completed clean review'; [ "$CLEARANCE_SCENARIO" != blocking-review ] || body='**P1** Real blocking finding'
         jq -nc --arg head "$head" --arg body "$body" '[{id:9,user:{login:"chatgpt-codex-connector[bot]"},submitted_at:"2026-06-01T00:01:00Z",commit_id:$head,state:"COMMENTED",body:$body}]' ;;
       substitute-only) jq -nc --arg head "$head" '[{id:9,user:{login:"nathanpayne-claude"},submitted_at:"2026-06-01T00:01:00Z",commit_id:$head,state:"APPROVED",body:"External review approval"}]' ;;
       *) printf '[]' ;;
-    esac ;;
+    esac)
+    if [ "${AUDIT_SCENARIO:-none}" = none ]; then printf '%s\n' "$reviews"; exit 0; fi
+    jq -nc --argjson reviews "$reviews" --arg head "$head" --arg mode "$AUDIT_SCENARIO" '
+      {id:7,user:{login:"nathanpayne-codex"},submitted_at:"2026-06-01T00:02:00Z",
+       commit_id:$head,state:"APPROVED",body:("CodeRabbit rate-limited; cleared by Codex on `"+$head+"`.")} as $approval
+      | ($approval
+          | if $mode == "before" then .submitted_at="2026-06-01T00:00:30Z"
+            elif $mode == "same-second" then .submitted_at="2026-06-01T00:01:00Z"
+            elif $mode == "no-audit" then .body="Reviewed"
+            elif $mode == "wrong-sha" then .body="CodeRabbit rate-limited; cleared by Codex on bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb."
+            elif $mode == "wrong-head" then .commit_id="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            elif $mode == "malformed-time" then .submitted_at="unreadable"
+            elif $mode == "author" then .user.login="nathanjohnpayne"
+            else . end) as $selected
+      | $reviews+[$selected]
+      | if $mode == "withdrawn" or $mode == "malformed-later-opinion" then
+          .+[$approval|.id=8|.state="CHANGES_REQUESTED"
+             |.submitted_at=(if $mode == "withdrawn" then "2026-06-01T00:03:00Z" else null end)]
+        else . end' ;;
   repos/owner/repo/issues/999/comments)
     case "$CLEARANCE_SCENARIO" in clean-review|blocking-review|substitute-only) printf '[]'; exit 0 ;; esac
     jq -nc --arg sha "${REVIEWED_HEAD:-$head}" '[{id:8,user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-06-01T00:01:00Z",body:("Codex Review: Didn\u0027t find any major issues.\nReviewed commit: " + $sha)}]' ;;
@@ -366,7 +384,7 @@ chmod +x "$fixture/bin/gh"
     rc=0
     GH_TOKEN=fixture-review-token CLEARANCE_SCENARIO="$scenario" REVIEWED_HEAD="$reviewed" \
       PATH="$fixture/bin:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$fixture/policy.yml" \
-      CODEX_REVIEW_CHECK_SKIP_CI=1 CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
+      CODEX_REVIEW_CHECK_SKIP_CI=1 \
       bash "$fixture/scripts/codex-review-check.sh" --require-codex-on-head 999 owner/repo \
       >"$APPROVAL_FIXTURE/out" 2>"$APPROVAL_FIXTURE/err" || rc=$?
     if [ "$rc" = 0 ]; then
@@ -391,6 +409,22 @@ chmod +x "$fixture/bin/gh"
       [ ! -e "$APPROVAL_FIXTURE/approved" ] || fail "substitution $scenario: invalid evidence reached approval"
     fi
     [ "$FAIL" -ne "$before" ] || pass "substitution $scenario: actual clearance checker controls reviewer approval"
+  done
+  # The merge probe runs after approval; the agent probe above runs before it.
+  for scenario in none before same-second after no-audit wrong-sha wrong-head withdrawn malformed-time malformed-later-opinion author; do
+    before=$FAIL;expected=1;[ "$scenario" != after ] || expected=0
+    APPROVAL_FIXTURE="$fixture/audit-$scenario";export APPROVAL_FIXTURE
+    mkdir -p "$APPROVAL_FIXTURE";rc=0
+    GH_TOKEN=fixture-review-token CLEARANCE_SCENARIO=clean-verdict AUDIT_SCENARIO="$scenario" \
+      PATH="$fixture/bin:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$fixture/policy.yml" \
+      CODERABBIT_RATE_LIMIT_GATE_CODEX_CHECK_BIN="$fixture/scripts/codex-review-check.sh" \
+      CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_WAIT_SECONDS=0 \
+      CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_POLL_SECONDS=0 \
+      bash "$ROOT/scripts/coderabbit-automerge-rate-limit-gate.sh" \
+        '{"status":"rate_limit_stalled","codex_failover_requested":true}' false 999 owner/repo \
+        >"$APPROVAL_FIXTURE/out" 2>"$APPROVAL_FIXTURE/err" || rc=$?
+    [ "$rc" = "$expected" ] || fail "approval audit $scenario: wanted $expected, got $rc; $(tail -3 "$APPROVAL_FIXTURE/err")"
+    [ "$FAIL" -ne "$before" ] || pass "approval audit $scenario: real automatic gate enforces later audited approval"
   done
 }
 
