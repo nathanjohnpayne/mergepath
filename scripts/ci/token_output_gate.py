@@ -368,6 +368,7 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     likewise refuse disable credit (#1458), without evaluating execution. The
     shared function iterator retains function exclusions and physical offsets;
     independent subshell behavior and standalone disables remain unchanged.
+    A continued &&/|| list stays open through its pending here-doc bodies.
   * A credential NAME split by a LINE CONTINUATION.  Bash removes
     `\\<newline>` before it parses the expansion, so `$GH_\\<newline>TOKEN`
     names GH_TOKEN and prints its value; matching the raw text stopped at the
@@ -1746,7 +1747,8 @@ class Lexer:
                         # of the logical line.  Ending the line here would
                         # reset only the OUTER level and strand the open one.
                         start_segment()
-                    else:
+                    elif not (list_open[0] and not cur_level()["seg"].words):
+                        # The right-hand command of &&/|| follows the bodies.
                         end_logical_line(line)
                 continue
 
@@ -11852,6 +11854,7 @@ CORPUS = [
         MUST_FLAG,
         'set -x\nselect item in one; do\n set +x\n break\ndone <<< 1\n: "$GH_TOKEN"\n',
     ),
+    ('conditional-xtrace-and-newline-after-heredoc', MUST_FLAG, 'set -x\nfalse <<EOF &&\nx\nEOF\nset +x\n: "$GH_TOKEN"\n'),
 ]
 
 CORPUS.extend([
@@ -15465,6 +15468,33 @@ def _heredoc_conservatism_cases():
     return failures
 
 
+def _heredoc_list_continuation_cases():
+    """Parse harmless DATA; never execute a shell or infer command truth."""
+    failures = []
+    for cid, body, joined, bodies, after_line in [
+        ("ordinary", "true <<EOF\nx\nEOF\nafter\n", False, [["x"]], 4),
+        ("and", "false <<EOF &&\nx\nEOF\nafter\n", True, [["x"]], 1),
+        ("or", "true <<EOF ||\nx\nEOF\nafter\n", True, [["x"]], 1),
+        ("pending-priority", "true <<FIRST <<SECOND &&\na\nFIRST\nb\nSECOND\nafter\n",
+         True, [["a"], ["b"]], 1),
+        ("nested-segment", "v=$(true <<EOF &&\nx\nEOF\nafter\n)\n",
+         True, [["x"]], 4),
+    ]:
+        lx = Lexer(body)
+        following = [(ll, seg) for ll in lx.logical for seg in ll.segments
+                     if seg.words == ["after"]]
+        if len(following) != 1 or not lx.heredocs or lx.unterminated_heredoc:
+            failures.append("heredoc list %s: lost DATA or following command" % cid)
+            continue
+        ll_after, after = following[0]
+        ll_owner = next(ll for ll in lx.logical if lx.heredocs[0].owner in ll.segments)
+        actual_bodies = [[raw for _line, raw in hd.body_lines] for hd in lx.heredocs]
+        if ((ll_owner is ll_after) != joined or actual_bodies != bodies
+                or after.line != after_line):
+            failures.append("heredoc list %s: wrong grouping, pending order or line" % cid)
+    return failures
+
+
 def _heredoc_echo_conservatism_cases():
     """Pin resolved echo conservatism and unchanged printf/plain DATA precision."""
     failures = []
@@ -15783,6 +15813,7 @@ def self_test():
     failures.extend(_ansi_c_quote_cases())
     failures.extend(_quoted_default_head_cases())
     failures.extend(_heredoc_conservatism_cases())
+    failures.extend(_heredoc_list_continuation_cases())
     failures.extend(_heredoc_echo_conservatism_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
