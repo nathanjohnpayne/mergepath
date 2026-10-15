@@ -42,7 +42,7 @@ Failed review triage preserves an exact-head registered approval only after two 
 
 The Codex requester and same-agent merge fallback share the substantive review-run selector and approval predicate. Threaded replies alone cannot suppress a needed request, and P0/P1 findings in review bodies retain their approval boundary. See [`specs/codex_request_evidence.md`](../../specs/codex_request_evidence.md).
 
-Blocked review diagnostics bind request age and acknowledgement to an exact the Codex review command command comment; later prose mentions do not replace that evidence. The diagnostic filter preserves requester deduplication and clearance behavior. Its contract and coverage are in [`specs/codex_request_evidence.md`](../../specs/codex_request_evidence.md) and `tests/test_codex_request_evidence.sh`.
+Blocked review diagnostics bind request age and acknowledgement to an exact `@codex review` command comment; later prose mentions do not replace that evidence. The diagnostic filter preserves requester deduplication and clearance behavior. Its contract and coverage are in [`specs/codex_request_evidence.md`](../../specs/codex_request_evidence.md) and `tests/test_codex_request_evidence.sh`.
 
 The publisher structural fence pins both complete permission maps, excludes extra Checks-API writers and requires the phase-1 token binding. Its contract and mutation coverage are in `specs/required_check_publisher.md` and `tests/test_merge_clearance_gate.sh`.
 
