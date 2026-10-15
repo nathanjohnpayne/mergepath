@@ -1181,6 +1181,14 @@ run_audit() {
       consumer_overrides="$consumer_root/$OVERRIDES_PATH"
     fi
 
+    # A dependency contradiction is configuration failure, not harmless
+    # override-only drift. JSON's existing private buffer is never flushed.
+    if ! override_requires_load "$manifest" "$consumer_overrides" \
+       || ! override_requires_check "$consumer_name"; then
+      err "requires-closure gate (#1041): $OVERRIDE_REQUIRES_DETAIL"
+      return 2
+    fi
+
     # Walk the manifest's paths. yq emits TSV: path<TAB>type<TAB>consumers_csv
     # where consumers_csv is "all" or a comma-joined list. Per-path
     # exclusions land in Layer 3; for v1 the exclusions block is
@@ -1826,6 +1834,11 @@ requires_closure_gate() {
   local consumer_overrides=$5
   local gate_context=$6
   local requires_manifest="$MERGEPATH_ROOT/$MANIFEST_PATH"
+  if ! override_requires_load "$requires_manifest" "$consumer_overrides" \
+     || ! override_requires_check "$consumer_name" "$targets"; then
+    err "$consumer_name: requires-closure gate (#1041): $OVERRIDE_REQUIRES_DETAIL"
+    return 1
+  fi
   local req_violations=""
   local manifest_entry_rows manifest_requires_rows
   local req_target edge_target req_entry req_files req_file
@@ -1871,11 +1884,9 @@ requires_closure_gate() {
       [ -z "$req_entry" ] && continue
 
       # Resolve the UNION of every manifest entry that covers this required
-      # path: exact entries plus every containing kit. Overrides are valid only
-      # for those manifest entries, so a requirement strictly inside an
-      # overridden kit must be skipped too. If multiple applicable entries
-      # cover the same path, all must be overridden before the runtime
-      # requirement is exempt; any unoverridden carrier can still write it.
+      # path: exact entries plus every containing kit. The metadata gate above
+      # rejects all-carriers-skipped contradictions; any surviving carrier
+      # still needs the existing current-artifact proof below.
       coverage_found=0
       applicable_coverage=0
       unoverridden_coverage=0
@@ -1926,6 +1937,7 @@ requires_closure_gate() {
         continue
       fi
       if [ "$unoverridden_coverage" -eq 0 ]; then
+        req_violations+="${req_violations:+$'\n'}$req_entry (required by $req_target; every applicable carrier is override-skipped)"
         continue
       fi
 

@@ -55,12 +55,23 @@ substitutions:
 | `version` is required on non-empty documents and must equal 1 | Exit 1 |
 | Every `skip_paths[].path` exactly matches a manifest consumer target (`.dest` for templated, `.path` otherwise) | Exit 1 |
 | Every `skip_paths[].reason` is non-empty (whitespace counts as empty) | Exit 1 |
+| Effective consumer skips preserve declared `requires:` coverage for every active entry | Exit 1; ambiguous consumer identity exits 2 |
 | Every `substitutions.<key>` matches a marker declared by a `type: templated` manifest path | Exit 1 |
 | Every `substitutions.<key>` is a map with non-empty `value` and non-empty `reason` fields (whitespace counts as empty for both) | Exit 1 |
 
 Absence of the file → exit 0. Empty file → exit 0 (no entries means no constraints to validate).
 
 The "every marker is declared" rule is the strictest of these and is intentional. A templated path may declare no substitution markers; any non-empty `substitutions:` content must still match a marker that a templated manifest entry actually declares.
+
+## Effective dependency closure
+
+A documented skip cannot withhold every applicable carrier of a manifest `requires:` path while leaving its requiring entry active (#1041). Sync fails closed before opening or pushing a propagation PR, naming the consumer, requiring entry and required path. Remove the dependency skip or skip the requiring entry as well. Independent skips remain valid. Exact entries and containing kits form a coverage union: a surviving applicable carrier is sufficient, including a kit without a trailing slash. Templated entries use their logical `.path` for dependency coverage and consumer `.dest` for skip ownership. Only declared direct edges are checked; this does not discover dependencies from file contents or infer runtime behavior.
+
+Sync checks the selected outgoing entries and retains its existing current-artifact content, executable-mode and template-render checks. An overridden requiring entry does not travel and creates no obligation. Audit checks the effective manifest for each selected consumer before classifying differences; a contradiction is a configuration error, not `override-only` success. JSON audit exits 2 with empty buffered stdout on this fatal error, while completed fetch-error and drift audits retain their existing status/exit precedence.
+
+The validator accepts `scripts/sync/validate-overrides.sh [overrides-file] [manifest-file] [consumer-name]`. Supply an explicit manifest consumer name when validating a scoped skip. Without it, the validator checks every declared consumer scope: uniform success passes, uniform contradiction exits 1, and differing outcomes exit 2 requesting the selector. An unknown selector exits 2 when a nonempty skip set needs closure validation. No identity is guessed from a directory, remote or environment. Absent, empty and no-skip documents keep their existing behavior.
+
+The two existing application readers still treat absent files and read errors as no override. The separate `override_requires_load` / `override_requires_check` metadata helpers fail closed on unavailable or malformed closure inputs and expose a diagnostic through `OVERRIDE_REQUIRES_DETAIL`. Their checks do not prove a consumer's required artifacts current; sync retains that separate proof. The engine and validator are hub/bootstrap machinery, so merging this change does not claim a canonical wave has upgraded every installed consumer validator. The previously cleared gaycruisebingo skip incident remains completed; this change supplies the structural guarantee.
 
 ## Worked examples
 

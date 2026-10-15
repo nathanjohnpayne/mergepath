@@ -1573,8 +1573,8 @@ grep -q "sync-all"          <<<"$help_out" || fail "--help missing --sync-all do
 # touching ONLY a requires-bearing canonical (repo_lint.yml) must not open a
 # consumer PR while the required kit is missing/stale on that consumer — the
 # shipped workflow would run: kit checks the consumer does not have. The gate
-# passes when the kit is byte-current, and honors consumer overrides for
-# required files (documented divergence).
+# passes when the kit is byte-current. A documented override must not withhold
+# every carrier of a requirement while still shipping its requiring entry.
 # ---------------------------------------------------------------------------
 req_workdir="$WORKDIR/requires-gate"
 REQ_MP="$req_workdir/mergepath"
@@ -1795,9 +1795,9 @@ echo "$output" | grep -q "requires-closure gate" \
   || fail "kit-current consumer did not get a PR: $output"
 echo "PASS: requires-closure gate passes a kit-current consumer and the PR opens (#624)"
 
-# (3) A required kit the consumer skips via .sync-overrides.yml is a
-#     documented divergence, not a gate violation: check_b absent but the
-#     manifest-level scripts/ci/ entry is override-skipped → PR opens.
+# (3) An unskipped workflow cannot ship while every carrier of a required
+#     path is override-skipped (#1041). Retain the original divergent fixture,
+#     reversing its former exemption rather than deleting the regression.
 remote3="$req_workdir/kitovr.git"; seed3="$req_workdir/kitovr-seed"
 req_setup_remote "$remote3" "$seed3"
 mkdir -p "$seed3/scripts/ci"
@@ -1815,10 +1815,26 @@ set +e
 output=$(req_run reqgate3 "$remote3")
 set -e
 echo "$output" | grep -q "requires-closure gate" \
-  && fail "requires gate fired on an override-skipped required kit: $output"
-[ -f "$REQ_CAPTURE/pr-title-reqgate3.txt" ] \
-  || fail "override-skipped consumer did not get a PR: $output"
-echo "PASS: requires-closure gate honors manifest-entry overrides for required kits (#624/#1058)"
+  || fail "override-skipped required kit bypassed closure: $output"
+echo "$output" | grep -q 'scripts/ci/check_a (required by .github/workflows/repo_lint.yml)' \
+  || fail "contradiction did not name both paths: $output"
+[ ! -f "$REQ_CAPTURE/pr-title-reqgate3.txt" ] \
+  || fail "contradictory override opened a PR: $output"
+[ -z "$(git -C "$remote3" for-each-ref --format='%(refname)' refs/heads/mergepath-sync/)" ] \
+  || fail "contradictory override pushed a branch"
+echo "PASS: required-kit override contradiction fails closed (#1041)"
+# The same documented skip cannot bypass filtered or full sync-all.
+for run_id in reqgate3filtered reqgate3full; do
+  set +e
+  if [ "$run_id" = reqgate3filtered ]; then
+    output=$(req_run_sync_all "$run_id" "$remote3")
+  else
+    output=$(req_run_full_sync_all "$run_id" "$remote3")
+  fi
+  set -e
+  echo "$output" | grep -q 'requires-closure gate' || fail "sync-all bypassed required skip: $output"
+  [ ! -f "$REQ_CAPTURE/pr-title-$run_id.txt" ] || fail 'contradictory sync-all opened PR'
+done
 
 # (4) Filtered sync-all has the same closure obligation. Selecting only the
 #     requires-bearing workflow must fail closed when its kit is absent; the
@@ -1949,6 +1965,8 @@ skip_paths:
   - path: scripts/runtime/helper.sh
     reason: |
       Consumer owns this rendered helper; tracked for convergence in alpha#2.
+  - path: .github/workflows/templated_runtime.yml
+    reason: Consumer also owns the workflow that requires the skipped helper.
 YAML
 if ! override_validation=$(
   "$ROOT/scripts/sync/validate-overrides.sh" \

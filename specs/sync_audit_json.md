@@ -4,6 +4,8 @@
 
 The mode composes with `--repos`, `--paths`/`--files`, `--use-local-tree`, `--no-clone`, and `--no-refresh`. Existing consumer opt-in and filter validation apply before comparison. An unavailable local helper or failed hub kit enumeration is a script/source error (exit 2), never a clean consumer record. Empty hub kits still report a missing consumer directory as drift, matching text mode. `--json` is rejected for sync modes. Default audits retain #439's refreshed cache clone of the live default branch; they do not read stale sibling checkouts. A cache refresh failure reports `fetch-error` rather than reading stale cached bytes.
 
+Before comparing a selected consumer, audit resolves declared direct `requires:` edges against its effective override set (#1041). Each active requiring entry needs at least one applicable unskipped exact or containing-kit carrier; templated dependency keys remain logical `.path` values while skips use `.dest`. A skipped requiring entry creates no obligation. A contradiction or unreadable closure metadata is a fatal configuration/source error: exit 2, actionable stderr naming the paths when available, and empty buffered stdout even if earlier consumers completed. This metadata check does not require current artifact bytes and does not turn ordinary drift into a source error. It adds no record status or schema field. Existing completed fetch-error precedence remains unchanged.
+
 ## Consumer record
 
 | Field | Meaning |
@@ -26,7 +28,7 @@ Status precedence is `fetch-error` > any uncovered consumer-ahead path > any oth
 
 ## Comparison and direction evidence
 
-Comparisons use the existing byte comparators. JSON expands kits into differing managed files, preserving mixed directions; consumer-only kit extras remain allowed and omitted. A `.sync-overrides.yml` skip covers a whole manifest kit entry, or the consumer destination of a templated entry. Matching skipped files do not make an `override-only` record. Only actual differing bytes covered by a documented skip are emitted with `covered by .sync-overrides.yml` and its reason. Invalid/unreadable overrides retain the existing helper's conservative no-skip behavior.
+Comparisons use the existing byte comparators. JSON expands kits into differing managed files, preserving mixed directions; consumer-only kit extras remain allowed and omitted. A `.sync-overrides.yml` skip covers a whole manifest kit entry, or the consumer destination of a templated entry. Matching skipped files do not make an `override-only` record. Only actual differing bytes covered by a documented skip are emitted with `covered by .sync-overrides.yml` and its reason. The existing per-path override reader retains its conservative no-skip behavior on read errors; the separate closure preflight refuses malformed or unreadable dependency/skip metadata before comparison.
 
 Missing consumer files use `hub ahead` and remain drift. Differing templated output uses `re-render differs`, rendered with the same consumer facts as the text audit. Other differing canonical/kit files use the following conservative three-way proof, never timestamps or cross-repository commit counts:
 
