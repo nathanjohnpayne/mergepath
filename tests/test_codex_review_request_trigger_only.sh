@@ -64,6 +64,8 @@ make_case() {
   cp "$ROOT/scripts/lib/codex-failure-markers.sh" "$dir/scripts/lib/codex-failure-markers.sh"
   cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
   cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$dir/scripts/workflow/resolve_base_policy.sh"
+  cp "$ROOT/scripts/workflow/external_review_fingerprint.sh" "$dir/scripts/workflow/external_review_fingerprint.sh"  # #2257
+  cp "$ROOT/scripts/workflow/match_protected_paths.sh" "$dir/scripts/workflow/match_protected_paths.sh"  # #2257
   chmod +x "$dir/scripts/workflow/resolve_base_policy.sh"
 
   cat >"$dir/.github/review-policy.yml" <<'EOF'
@@ -111,7 +113,10 @@ paginated=0
 [ "${1:-}" = "-X" ] && shift 2
 endpoint=${1:-}
 case "$endpoint" in
-  repos/owner/repo/pulls/999)            jq -cn --arg h "$head_sha" '{head:{sha:$h,ref:"feature"},base:{ref:"main",sha:"base-sha",repo:{default_branch:"main"}}}' ;;
+  # labels and changed_files feed the #2257 Phase 4 gate derivation, which the
+  # request_by_default: false cases reach; the default PR is under-threshold.
+  repos/owner/repo/pulls/999)            jq -cn --arg h "$head_sha" '{head:{sha:$h,ref:"feature"},base:{ref:"main",sha:"base-sha",repo:{default_branch:"main"}},labels:[],changed_files:1}' ;;
+  repos/owner/repo/pulls/999/files)      printf '%s\n' '[{"filename":"src/app.ts","additions":10,"deletions":2}]' ;;
   'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha')
     printf '1\n' >>"$CODEX_TEST_STATE_DIR/base-policy-read-count"
     if [ "${CODEX_TEST_BASE_POLICY_MODE:-ok}" = fail ]; then

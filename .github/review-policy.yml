@@ -573,8 +573,9 @@ codex:
   # decision) through yq with an explicit has() presence test (never `//`,
   # which reads an explicit false as missing). Absent ⇒ false. The script
   # learns whether a PR is threshold-gated from the caller's
-  # `MERGEPATH_PHASE_4A_GATED` env, so it does not recompute the threshold
-  # itself.
+  # `MERGEPATH_PHASE_4A_GATED` env when it is set; otherwise, when this key
+  # resolves to false, it derives the gate from the PR itself (label,
+  # threshold, protected paths; an unreadable input counts as gated, #2257).
   #
   # Set to false by owner decision on 2026-10-13 (#2166). This narrows the
   # owner rule of 2026-07-04 ("Codex must always be invoked"): Codex remains

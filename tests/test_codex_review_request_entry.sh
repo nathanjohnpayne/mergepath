@@ -64,6 +64,10 @@ make_case() {
   cp "$ROOT/scripts/workflow/resolve-codex-verdict-anchors.py" "$dir/scripts/workflow/resolve-codex-verdict-anchors.py"
   cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
   cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$dir/scripts/workflow/resolve_base_policy.sh"
+  # #2257: the Phase 4 gate derivation reads the generated-file exclusion
+  # from the fingerprint helper and matches paths with the shared matcher.
+  cp "$ROOT/scripts/workflow/external_review_fingerprint.sh" "$dir/scripts/workflow/external_review_fingerprint.sh"
+  cp "$ROOT/scripts/workflow/match_protected_paths.sh" "$dir/scripts/workflow/match_protected_paths.sh"
   chmod +x "$dir/scripts/workflow/resolve_base_policy.sh"
 
   {
@@ -135,16 +139,43 @@ case "$endpoint" in
     # #2240: a case with no policy file runs on the script's default
     # timings (an 1800s poll), so it ends the run at the first read past
     # the entry decision instead. Reaching this read at all proves the
-    # decision was to request.
-    if [ -n "${CODEX_TEST_FAIL_PR_FETCH:-}" ]; then
+    # decision was to request. CODEX_TEST_FAIL_PR_FETCH=N refuses the Nth
+    # metadata read: 1 for a decision that reads nothing, 2 when the #2257
+    # derivation reads the metadata once inside the decision.
+    n=0
+    [ -f "$CODEX_TEST_STATE_DIR/pr-fetch-count" ] && n=$(cat "$CODEX_TEST_STATE_DIR/pr-fetch-count")
+    n=$((n + 1))
+    printf '%s\n' "$n" >"$CODEX_TEST_STATE_DIR/pr-fetch-count"
+    if [ -n "${CODEX_TEST_FAIL_PR_FETCH:-}" ] && [ "$n" -ge "$CODEX_TEST_FAIL_PR_FETCH" ]; then
       echo "stub: PR fetch refused after the entry decision" >&2
+      exit 1
+    fi
+    if [ "${CODEX_TEST_PR_META:-ok}" = fail ]; then
+      echo "stub: PR metadata read refused" >&2
       exit 1
     fi
     if [ "${2:-}" = "--jq" ]; then
       printf '%s\n' "${CODEX_TEST_LIVE_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
     else
-      printf '{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"base":{"ref":"main","sha":"base-sha","repo":{"default_branch":"main"}}}\n'
+      # #2257: labels and changed_files feed the Phase 4 gate derivation.
+      jq -cn --argjson labels "${CODEX_TEST_PR_LABELS:-[]}" \
+        --argjson changed "${CODEX_TEST_PR_CHANGED_FILES:-1}" \
+        --arg mode "${CODEX_TEST_PR_META:-ok}" '
+        {head:{sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},base:{ref:"main",sha:"base-sha",repo:{default_branch:"main"}},
+         labels:$labels, changed_files:$changed}
+        | if $mode == "no-labels" then del(.labels)
+          elif $mode == "no-changed-files" then del(.changed_files)
+          else . end'
     fi ;;
+  repos/owner/repo/pulls/999/files)
+    # #2257: the paginated file list for the Phase 4 gate derivation.
+    printf 'files\n' >>"$CODEX_TEST_STATE_DIR/files-reads"
+    if [ "${CODEX_TEST_FILES:-ok}" = fail ]; then
+      echo "stub: PR files read refused" >&2
+      exit 1
+    fi
+    default_files='[{"filename":"src/app.ts","additions":10,"deletions":2}]'
+    printf '%s\n' "${CODEX_TEST_FILES_JSON:-$default_files}" ;;
   'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha') cat "$CODEX_TEST_STATE_DIR/base-review-policy.yml" ;;
   repos/owner/repo/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa) printf '%s\n' "$now" ;;
   repos/owner/repo/issues/999/timeline)      printf '[]\n' ;;
@@ -362,7 +393,7 @@ assert_policy_skips_unset() {
   local name=$1 policy=$2 dir rc
   dir=$(make_case "rbd-$name" "  enabled: true")
   printf '%s\n' "$policy" >"$dir/.github/review-policy.yml"
-  rc=$(CODEX_TEST_FAIL_PR_FETCH=1 run_case "$dir" false)
+  rc=$(CODEX_TEST_FAIL_PR_FETCH=2 run_case "$dir" false)
   if [ "$rc" != "5" ]; then
     fail "rbd $name: exit $rc, expected 5 (unset ⇒ false); stderr=$(cat "$dir/err.log")"
   elif grep -q 'WARN: cannot read codex.request_by_default' "$dir/err.log"; then
@@ -530,6 +561,207 @@ test_malformed_head_age_fails_only_the_write_path() {
   [ "$FAIL" -ne "$before" ] || pass "a malformed request_min_head_age_seconds keeps the skip and disabled paths at exit 5 and refuses only the write path with exit 3 (#2253)"
 }
 
+# --- #2257: the Phase 4 gate is derived from the PR when the caller does not
+# flag it. Every case below runs ungated with request_by_default unset unless
+# it says otherwise. A request shows as exit 4 (trigger posted, then the zero
+# timeout) with one trigger; a skip as exit 5 with none.
+files_reads() {
+  if [ -f "$1/state/files-reads" ]; then wc -l <"$1/state/files-reads" | tr -d ' '; else printf '0\n'; fi
+}
+derive_case() {  # <name> [top-level policy lines]
+  local dir
+  dir=$(make_case "derive-$1" "  enabled: true")
+  [ -z "${2:-}" ] || printf '%s\n' "$2" >>"$dir/.github/review-policy.yml"
+  printf '%s\n' "$dir"
+}
+# Args: <label> <dir> <rc> <reason substring>
+assert_derived_request() {
+  local label=$1 dir=$2 rc=$3 reason=$4 count
+  count=$(trigger_count "$dir")
+  if [ "$rc" != "4" ] || [ "$count" != "1" ]; then
+    fail "derive $label: exit $rc / trigger count $count, expected 4 / 1 (a derived Phase 4 PR is requested); stderr=$(cat "$dir/err.log")"
+  elif ! grep -F 'Phase 4 gate derived from the PR:' "$dir/err.log" | grep -Fq "$reason"; then
+    fail "derive $label: the log must name the gating signal '$reason'; stderr=$(cat "$dir/err.log")"
+  elif grep -q 'WARN: cannot derive the Phase 4 gate' "$dir/err.log"; then
+    fail "derive $label: a readable PR must not take the fail-safe; stderr=$(cat "$dir/err.log")"
+  else
+    pass "#2257 derive: $label ⇒ requested, logging the signal"
+  fi
+}
+# Args: <label> <dir> <rc> <cause substring>
+assert_failsafe_request() {
+  local label=$1 dir=$2 rc=$3 cause=$4 count
+  count=$(trigger_count "$dir")
+  if [ "$rc" != "4" ] || [ "$count" != "1" ]; then
+    fail "derive fail-safe $label: exit $rc / trigger count $count, expected 4 / 1 (an unreadable input requests); stderr=$(cat "$dir/err.log")"
+  elif ! grep -F 'WARN: cannot derive the Phase 4 gate:' "$dir/err.log" | grep -Fq "$cause"; then
+    fail "derive fail-safe $label: missing a warning naming '$cause'; stderr=$(cat "$dir/err.log")"
+  else
+    pass "#2257 derive fail-safe: $label ⇒ requested with a warning naming the cause"
+  fi
+}
+# Args: <label> <dir> <rc>
+assert_derived_skip() {
+  local label=$1 dir=$2 rc=$3 count
+  count=$(trigger_count "$dir")
+  if [ "$rc" != "5" ] || [ "$count" != "0" ]; then
+    fail "derive $label: exit $rc / trigger count $count, expected 5 / 0 (an under-threshold PR is skipped); stderr=$(cat "$dir/err.log")"
+  elif ! grep -q 'codex.request_by_default is not set (the default is false since #2240)' "$dir/err.log"; then
+    fail "derive $label: the genuine skip must keep the exit-5 message; stderr=$(cat "$dir/err.log")"
+  elif ! grep -q 'Phase 4 gate derived from the PR: not gated' "$dir/err.log"; then
+    fail "derive $label: the skip must report the derivation; stderr=$(cat "$dir/err.log")"
+  elif grep -q 'WARN: cannot derive the Phase 4 gate' "$dir/err.log"; then
+    fail "derive $label: a readable PR must not warn; stderr=$(cat "$dir/err.log")"
+  else
+    pass "#2257 derive: $label ⇒ skipped with exit 5"
+  fi
+}
+
+test_derive_signals() {
+  local dir rc
+  # Label.
+  dir=$(derive_case label)
+  rc=$(CODEX_TEST_PR_LABELS='[{"name":"bug"},{"name":"needs-external-review"}]' run_case "$dir" false)
+  assert_derived_request "needs-external-review label" "$dir" "$rc" "the PR carries the needs-external-review label"
+  # Size, at the default threshold: 300 is gated, 299 is not.
+  dir=$(derive_case size-at)
+  rc=$(CODEX_TEST_FILES_JSON='[{"filename":"src/a.ts","additions":200,"deletions":100}]' run_case "$dir" false)
+  assert_derived_request "300 lines at the default threshold" "$dir" "$rc" "300 lines changed >= external_review_threshold 300"
+  dir=$(derive_case size-under)
+  rc=$(CODEX_TEST_FILES_JSON='[{"filename":"src/a.ts","additions":200,"deletions":99}]' run_case "$dir" false)
+  assert_derived_skip "299 lines under the default threshold" "$dir" "$rc"
+  # Size, at a configured threshold.
+  dir=$(derive_case size-configured "external_review_threshold: 50")
+  rc=$(CODEX_TEST_FILES_JSON='[{"filename":"src/a.ts","additions":30,"deletions":20}]' run_case "$dir" false)
+  assert_derived_request "a configured threshold" "$dir" "$rc" "50 lines changed >= external_review_threshold 50"
+  # Generated files do not count toward the size, as for the labeler.
+  dir=$(derive_case size-generated)
+  rc=$(CODEX_TEST_PR_CHANGED_FILES=2 CODEX_TEST_FILES_JSON='[{"filename":"package-lock.json","additions":5000,"deletions":0},{"filename":"src/a.ts","additions":3,"deletions":1}]' run_case "$dir" false)
+  assert_derived_skip "a large lockfile change excluded from the size" "$dir" "$rc"
+  # Protected path, and a rename out of one.
+  dir=$(derive_case paths-direct 'external_review_paths:'$'\n''  - ".github/**"'$'\n''  - "src/auth/**"')
+  rc=$(CODEX_TEST_FILES_JSON='[{"filename":".github/workflows/ci.yml","additions":1,"deletions":1}]' run_case "$dir" false)
+  assert_derived_request "a changed protected path" "$dir" "$rc" "protected paths changed: .github/workflows/ci.yml"
+  dir=$(derive_case paths-rename 'external_review_paths:'$'\n''  - "src/auth/**"')
+  rc=$(CODEX_TEST_FILES_JSON='[{"filename":"src/open/login.ts","previous_filename":"src/auth/login.ts","additions":0,"deletions":0}]' run_case "$dir" false)
+  assert_derived_request "a rename out of a protected path" "$dir" "$rc" "protected paths changed: src/auth/login.ts"
+  dir=$(derive_case paths-miss 'external_review_paths:'$'\n''  - "src/auth/**"')
+  rc=$(run_case "$dir" false)
+  assert_derived_skip "no protected path touched" "$dir" "$rc"
+  # Empty forms that are legitimately "no protected paths".
+  dir=$(derive_case paths-empty-list 'external_review_paths: []')
+  rc=$(run_case "$dir" false)
+  assert_derived_skip "an empty external_review_paths list" "$dir" "$rc"
+  dir=$(derive_case paths-null 'external_review_paths:')
+  rc=$(run_case "$dir" false)
+  assert_derived_skip "a null external_review_paths" "$dir" "$rc"
+  # GitHub's 3000-file cap is gated outright.
+  dir=$(derive_case files-cap)
+  rc=$(CODEX_TEST_PR_CHANGED_FILES=3000 CODEX_TEST_FILES_JSON="$(jq -cn '[range(3000) | {filename: "f\(.).txt", additions: 0, deletions: 0}]')" run_case "$dir" false)
+  assert_derived_request "a file list at the 3000-file cap" "$dir" "$rc" "at GitHub's 3000-file cap"
+  # An explicit request_by_default: false derives the same way.
+  dir=$(make_case "derive-explicit-false" "  enabled: true"$'\n'"  request_by_default: false")
+  rc=$(CODEX_TEST_PR_LABELS='[{"name":"needs-external-review"}]' run_case "$dir" false)
+  assert_derived_request "explicit request_by_default: false with the label" "$dir" "$rc" "the PR carries the needs-external-review label"
+}
+
+test_derive_failsafe() {
+  local dir rc
+  dir=$(derive_case meta-unread)
+  rc=$(CODEX_TEST_PR_META=fail run_case "$dir" false)
+  # The metadata read after the decision fails too, so the run ends with exit 3
+  # at "fetching HEAD commit metadata": proof the decision was to request.
+  if [ "$rc" = "3" ] && grep -q 'fetching HEAD commit metadata' "$dir/err.log" \
+     && grep -q 'WARN: cannot derive the Phase 4 gate: could not read the PR metadata' "$dir/err.log"; then
+    pass "#2257 derive fail-safe: unreadable PR metadata ⇒ requested with a warning naming the cause"
+  else
+    fail "derive fail-safe metadata: exit $rc, expected 3 past a request decision with the warning; stderr=$(cat "$dir/err.log")"
+  fi
+  dir=$(derive_case meta-no-labels)
+  rc=$(CODEX_TEST_PR_META=no-labels run_case "$dir" false)
+  assert_failsafe_request "PR metadata without labels" "$dir" "$rc" "has no readable labels or changed_files count"
+  dir=$(derive_case meta-bad-labels)
+  rc=$(CODEX_TEST_PR_LABELS='"needs-external-review"' run_case "$dir" false)
+  assert_failsafe_request "labels that are not a list" "$dir" "$rc" "has no readable labels or changed_files count"
+  dir=$(derive_case meta-no-count)
+  rc=$(CODEX_TEST_PR_META=no-changed-files run_case "$dir" false)
+  assert_failsafe_request "PR metadata without changed_files" "$dir" "$rc" "has no readable labels or changed_files count"
+  dir=$(derive_case files-unread)
+  rc=$(CODEX_TEST_FILES=fail run_case "$dir" false)
+  assert_failsafe_request "a failed file-list read" "$dir" "$rc" "failed to fetch PR files"
+  dir=$(derive_case files-garbage)
+  rc=$(CODEX_TEST_FILES_JSON='not json' run_case "$dir" false)
+  assert_failsafe_request "a file list that is not JSON" "$dir" "$rc" "PR files"
+  dir=$(derive_case files-empty)
+  rc=$(CODEX_TEST_PR_CHANGED_FILES=0 CODEX_TEST_FILES_JSON='[]' run_case "$dir" false)
+  assert_failsafe_request "an empty file list" "$dir" "$rc" "the PR file list is empty"
+  dir=$(derive_case files-short)
+  rc=$(CODEX_TEST_PR_CHANGED_FILES=2 run_case "$dir" false)
+  assert_failsafe_request "a file list shorter than changed_files" "$dir" "$rc" "has 1 entries but the PR reports 2 changed files"
+  dir=$(derive_case files-shape)
+  rc=$(CODEX_TEST_FILES_JSON='[{"filename":"src/a.ts"}]' run_case "$dir" false)
+  assert_failsafe_request "a file entry without line counts" "$dir" "$rc" "is not an array of file entries"
+  dir=$(derive_case threshold-string "external_review_threshold: \"300\"")
+  rc=$(run_case "$dir" false)
+  assert_failsafe_request "a quoted threshold" "$dir" "$rc" "external_review_threshold in"
+  dir=$(derive_case threshold-word "external_review_threshold: lots")
+  rc=$(run_case "$dir" false)
+  assert_failsafe_request "a non-numeric threshold" "$dir" "$rc" "external_review_threshold in"
+  dir=$(derive_case paths-scalar 'external_review_paths: ".github/**"')
+  rc=$(run_case "$dir" false)
+  assert_failsafe_request "a scalar external_review_paths" "$dir" "$rc" "external_review_paths in"
+  dir=$(derive_case paths-nonstring 'external_review_paths:'$'\n''  - 7')
+  rc=$(run_case "$dir" false)
+  assert_failsafe_request "a non-string protected path" "$dir" "$rc" "is not a list of non-empty strings"
+  dir=$(derive_case paths-empty-entry 'external_review_paths:'$'\n''  - ""')
+  rc=$(run_case "$dir" false)
+  assert_failsafe_request "an empty-string protected path" "$dir" "$rc" "is not a list of non-empty strings"
+  dir=$(derive_case matcher-missing 'external_review_paths:'$'\n''  - ".github/**"')
+  rm -f "$dir/scripts/workflow/match_protected_paths.sh"
+  rc=$(run_case "$dir" false)
+  assert_failsafe_request "a missing protected-path matcher" "$dir" "$rc" "the protected-path matcher is missing"
+  dir=$(derive_case matcher-fails 'external_review_paths:'$'\n''  - ".github/**"')
+  printf '#!/usr/bin/env bash\nexit 2\n' >"$dir/scripts/workflow/match_protected_paths.sh"
+  rc=$(run_case "$dir" false)
+  assert_failsafe_request "a failing protected-path matcher" "$dir" "$rc" "the protected-path matcher failed (rc=2)"
+  dir=$(derive_case exclusion-missing)
+  rm -f "$dir/scripts/workflow/external_review_fingerprint.sh"
+  rc=$(run_case "$dir" false)
+  assert_failsafe_request "a missing generated-file exclusion" "$dir" "$rc" "cannot read the generated-file exclusion"
+}
+
+# The derivation never runs where the decision is already made: a caller
+# flag (the CodeRabbit failover passes it, with the CI auto-trigger env when
+# it runs from the auto-merge job), request_by_default: true, or Codex off.
+# Each case refuses the file list, so a derivation would show as a fail-safe
+# warning and a files read.
+test_derive_not_run_when_decided() {
+  local name gated block extra flags dir rc before=$FAIL
+  while IFS='|' read -r name gated block extra flags; do
+    dir=$(make_case "derive-skip-$name" "$(printf '%b' "$block")")
+    # shellcheck disable=SC2086,SC2016  # $extra and $flags are word lists; the bash -c body expands in the child
+    rc=$(env $extra CODEX_TEST_FILES=fail CODEX_TEST_PR_META=no-labels bash -c '
+      dir=$1 gated=$2; shift 2
+      cd "$dir" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
+        MERGEPATH_PHASE_4A_GATED="$gated" ./scripts/codex-review-request.sh "$@" 999 owner/repo >"$dir/out.json" 2>"$dir/err.log"
+      echo $?' _ "$dir" "$gated" $flags)
+    if [ "$(files_reads "$dir")" != "0" ] || grep -q 'Phase 4 gate derived\|cannot derive the Phase 4 gate' "$dir/err.log"; then
+      fail "derive not run ($name): the derivation ran (files reads $(files_reads "$dir")); stderr=$(cat "$dir/err.log")"
+    fi
+    case "$name" in
+      codex-off) [ "$rc" = "5" ] || fail "derive not run ($name): exit $rc, expected 5" ;;
+      failover) [ "$rc" = "0" ] && [ "$(trigger_count "$dir")" = "1" ] || fail "derive not run ($name): exit $rc / trigger count $(trigger_count "$dir"), expected 0 / 1; stderr=$(cat "$dir/err.log")" ;;
+      *) [ "$rc" = "4" ] && [ "$(trigger_count "$dir")" = "1" ] || fail "derive not run ($name): exit $rc / trigger count $(trigger_count "$dir"), expected 4 / 1; stderr=$(cat "$dir/err.log")" ;;
+    esac
+  done <<'CASES'
+caller-flag|true|  enabled: true|CODEX_TEST_X=1|
+failover|true|  enabled: true|MERGEPATH_CODEX_AUTO_TRIGGER=true|--trigger-only --allow-moving-head
+rbd-true|false|  enabled: true\n  request_by_default: true|CODEX_TEST_X=1|
+codex-off|false|  enabled: false|CODEX_TEST_X=1|
+CASES
+  [ "$FAIL" -ne "$before" ] || pass "#2257: a caller flag (as the CodeRabbit failover passes it, with the CI auto-trigger env and --trigger-only), request_by_default: true and codex.enabled: false never run the derivation"
+}
+
 # --- timeout record is fenced against a push landing before the write -------
 test_timeout_head_drift_fails_closed_without_marker() {
   local dir rc count terminals moved
@@ -597,6 +829,9 @@ test_request_by_default_false_skips_under_threshold
 test_request_by_default_false_triggers_when_gated
 test_enabled_false_never_triggers
 test_malformed_head_age_fails_only_the_write_path
+test_derive_signals
+test_derive_failsafe
+test_derive_not_run_when_decided
 test_timeout_head_drift_fails_closed_without_marker
 test_new_trigger_replaces_superseded_timeout_marker
 
