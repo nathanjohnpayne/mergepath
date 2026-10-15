@@ -125,9 +125,9 @@ async function check(name,fn) { await fn(); passed++; console.log(`PASS ${name}`
     const f=await disagreementFixture({conflict:true,hasLabel:false}); await f.run();
     assert.deepEqual(f.writes.map(w=>w.method),['addLabels','createComment']); assert.equal(f.liveReads,2);
   });
-  await check('stable live-head agreement removes an obsolete disagreement hold',async()=>{
+  await check('stable live-head agreement retains the disagreement hold for human release',async()=>{
     const f=await disagreementFixture(); await f.run();
-    assert.deepEqual(f.writes.map(w=>w.method),['removeLabel','createComment']); assert.equal(f.liveReads,2);
+    assert.deepEqual(f.writes,[]);
   });
   await check('stable live-head agreement without a hold makes no write',async()=>{
     const f=await disagreementFixture({hasLabel:false}); await f.run(); assert.deepEqual(f.writes,[]);
@@ -136,19 +136,19 @@ async function check(name,fn) { await fn(); passed++; console.log(`PASS ${name}`
     ['head drift',pr=>pr.head.sha='e'.repeat(40)],
     ['base drift',pr=>pr.base.sha='f'.repeat(40)],
     ['base retarget',pr=>pr.base.ref='release'],
-  ]) for (const apply of [false,true]) await check(`disagreement ${apply?'apply':'remove'} fenced on ${name}`,async()=>{
+  ]) for (const apply of [false,true]) await check(`disagreement ${apply?'application fenced':'hold retained'} on ${name}`,async()=>{
     const f=await disagreementFixture({conflict:apply,hasLabel:!apply,mutate}); await f.run();
-    assert.deepEqual(f.writes,[]); assert.equal(f.liveReads,2);
+    assert.deepEqual(f.writes,[]); if (apply) assert.equal(f.liveReads,2);
   });
   for (const failRead of [1,2]) await check(`disagreement fails closed on unreadable live pair at read ${failRead}`,async()=>{
-    const f=await disagreementFixture({failRead}); await assert.rejects(f.run(),/unreadable live pair/);
+    const f=await disagreementFixture({conflict:true,hasLabel:false,failRead}); await assert.rejects(f.run(),/unreadable live pair/);
     assert.deepEqual(f.writes,[]);
   });
   for (const [name,mutate] of [
     ['malformed head',pr=>pr.head.sha='main'],['malformed base',pr=>pr.base.sha='main'],
     ['foreign base repository',pr=>pr.base.repo.full_name='evil/repo'],['closed PR',pr=>pr.state='closed'],
   ]) await check(`disagreement writer rejects ${name}`,async()=>{
-    const f=await disagreementFixture({mutate}); await assert.rejects(f.run(),/Unreadable live PR head\/base/);
+    const f=await disagreementFixture({conflict:true,hasLabel:false,mutate}); await assert.rejects(f.run(),/Unreadable live PR head\/base/);
     assert.deepEqual(f.writes,[]);
   });
   console.log(`${passed} tests passed`);

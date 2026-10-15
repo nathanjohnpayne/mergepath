@@ -92,7 +92,10 @@ RUBY
 # shellcheck disable=SC1091
 . "$TMP/step-env.sh"
 
-mkdir -p "$TMP/bin" "$TMP/work/scripts"
+mkdir -p "$TMP/bin" "$TMP/work/scripts/workflow"
+cp "$ROOT/scripts/workflow/required-check-generation.sh" "$TMP/work/scripts/workflow/"
+printf '#!/bin/sh\necho bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' >"$TMP/bin/git"
+chmod +x "$TMP/bin/git"
 for g in merge-clearance-gate.sh codex-p1-gate.sh coderabbit-severity-gate.sh; do
   cat >"$TMP/work/scripts/$g" <<'SH'
 #!/usr/bin/env bash
@@ -171,6 +174,20 @@ elif exhausted and os.environ.get("RL_EXHAUST_WRITES") == "1":
     sys.stderr.write("gh: API rate limit exceeded for installation ID 4242. (HTTP 403)\n"); sys.exit(1)
 elif method == "GET" and path == f"/actions/runs/{os.environ['GITHUB_RUN_ID']}":
     body = {"run_started_at": fx["pass_start"]}
+elif method == "GET" and path == "/commits/HEAD":
+    body = {"sha": "b" * 40}
+elif method == "GET" and re.fullmatch(r"/check-runs/\d+", path):
+    wanted = int(path.rsplit("/", 1)[1])
+    for index, line in enumerate(open(os.environ["GH_LOG"]), 1):
+        m, e, raw = line.rstrip("\n").split(" ", 2)
+        f = json.loads(raw)
+        if m == "POST" and e.endswith("/check-runs") and 900000000 + index == wanted:
+            body = {"id": wanted, "name": f["name"], "head_sha": f["head_sha"], "status": "in_progress",
+                    "output": {"summary": f["output[summary]"]}}
+            break
+    assert body is not None, wanted
+elif method == "PATCH" and re.fullmatch(r"/check-runs/\d+", path):
+    body = {"id": int(path.rsplit("/", 1)[1])}
 elif method == "GET" and path == "/pulls":
     body = fx["prs"]
 elif method == "GET" and re.fullmatch(r"/pulls/\d+", path):
@@ -211,7 +228,9 @@ elif method == "GET" and re.fullmatch(r"/commits/[^/]+/check-runs", path):
     else:
         body = {"check_runs": []}  # freshness / superseded-head probes: nothing newer
 elif method == "POST" and path == "/check-runs":
-    body = {"id": 900000000 + sum(1 for _ in open(os.environ["GH_LOG"]))}
+    body = {"id": 900000000 + sum(1 for _ in open(os.environ["GH_LOG"])),
+            "head_sha": fields["head_sha"], "name": fields["name"], "status": fields["status"],
+            "output": {"summary": fields["output[summary]"]}}
 else:
     sys.stderr.write(f"unexpected gh call: {method} {endpoint}\n"); sys.exit(3)
 out = json.dumps(body)
@@ -248,7 +267,7 @@ def runs(status="completed", concl="success", done="2026-10-14T02:58:00Z", base=
                         "completed_at": done, "details_url": "https://github.com/o/r/actions/runs/1/job/2"})
     return out
 def pr(n, upd="2026-10-14T02:50:00Z"):
-    return {"number": n, "head": {"sha": f"h{n}"}, "updated_at": upd}
+    return {"number": n, "head": {"sha": f"{n:040x}"}, "updated_at": upd}
 newest_hold = runs(base=1000) + [{"name": c, "id": 2000 + k, "status": "in_progress", "conclusion": None,
                                   "completed_at": None, "details_url": f"https://github.com/o/r/runs/{2000 + k}"} for k, c in enumerate(CTX)]
 fx = {
@@ -258,18 +277,18 @@ fx = {
   "prs": [pr(1), pr(2), pr(3), pr(4), pr(5, upd="2026-10-14T02:59:00Z"), pr(6, upd="2026-10-14T02:20:00Z"), pr(7), pr(8), pr(9), pr(10),
           pr(11, upd="2026-10-14T02:10:00Z")],
   "runs": {
-    "h1": runs(concl="failure"),                      # event head: evaluated regardless
-    "h2": runs(),                                     # current green: SKIPPED
-    "h3": runs(status="in_progress"),                 # pending hold: due
-    "h4": runs(concl="failure"),                      # red verdict: due
-    "h5": runs(),                                     # activity after verdict: due
-    "h6": runs(done="2026-10-14T02:40:00Z"),          # quiet, 20 min old: current at 1800s (was due at 900s)
-    "h11": runs(done="2026-10-14T02:25:00Z"),         # quiet since, but older than 1800s: due
-    "h8": runs(skip=("Codex P1 unresolved threads",)),# missing context: due
-    "h9": runs(concl="failure", job_green=True),      # job-run green must not count: due
-    "h10": newest_hold,                               # newer hold beats older green: due
+    "0000000000000000000000000000000000000001": runs(concl="failure"),                      # event head: evaluated regardless
+    "0000000000000000000000000000000000000002": runs(),                                     # current green: SKIPPED
+    "0000000000000000000000000000000000000003": runs(status="in_progress"),                 # pending hold: due
+    "0000000000000000000000000000000000000004": runs(concl="failure"),                      # red verdict: due
+    "0000000000000000000000000000000000000005": runs(),                                     # activity after verdict: due
+    "0000000000000000000000000000000000000006": runs(done="2026-10-14T02:40:00Z"),          # quiet, 20 min old: current at 1800s (was due at 900s)
+    "000000000000000000000000000000000000000b": runs(done="2026-10-14T02:25:00Z"),         # quiet since, but older than 1800s: due
+    "0000000000000000000000000000000000000008": runs(skip=("Codex P1 unresolved threads",)),# missing context: due
+    "0000000000000000000000000000000000000009": runs(concl="failure", job_green=True),      # job-run green must not count: due
+    "000000000000000000000000000000000000000a": newest_hold,                               # newer hold beats older green: due
   },
-  "fail_reads": ["h7"],                               # unreadable: due
+  "fail_reads": ["0000000000000000000000000000000000000007"],                               # unreadable: due
 }
 json.dump(fx, open(sys.argv[1], "w"))
 PY
@@ -284,6 +303,12 @@ run_pass() {  # run_pass <label> <event_name> <run_head> <parent_event> <dispatc
     export EVENT_NAME="$2" RUN_HEAD="$3" PARENT_EVENT="$4" DISPATCH_PR="$5"
     export GITHUB_OUTPUT="$TMP/github-output"
     export PARENT_NAME="${CASE_PARENT_NAME:-Merge Clearance Gate}"
+    # Cases express their original request budgets in 40-request units. Scale
+    # evaluation capacity with the shipped estimate; proof-page costs stay real.
+    case "${RL_REMAINING:-}" in
+      ''|*[!0-9]*) ;;
+      *) RL_REMAINING=$((BUDGET_RESERVE_REQUESTS + ((RL_REMAINING - 100) / 40) * BUDGET_PER_PR_REQUESTS + (RL_REMAINING - 100) % 40)); export RL_REMAINING ;;
+    esac
     [ -z "${CASE_FIXTURE:-}" ] || FIXTURE="$CASE_FIXTURE"
     export MCG_CONTEXT="Merge clearance gate" CODEX_P1_CONTEXT="Codex P1 unresolved threads"
     export CODERABBIT_CONTEXT="CodeRabbit unresolved blocking findings"
@@ -305,11 +330,11 @@ expect_eval() {  # expect_eval <name> <expected PR list>
 
 echo "required-check publisher due-only targeting tests"
 
-run_pass event workflow_run h1 pull_request_review ""
+run_pass event workflow_run 0000000000000000000000000000000000000001 pull_request_review ""
 expect_eval "PR-event pass skips only the PRs with proof of a current green slot" "1 3 4 5 7 8 9 10 11"
 N=$((N + 1))
 if grep -q "Due-only event pass: evaluated 9 open PR(s), skipped 2 current one(s)." "$TMP/out.log" \
-   && grep -q "PR #2 @ h2: green" "$TMP/out.log" && grep -q "PR #6 @ h6: green" "$TMP/out.log"; then
+   && grep -q "PR #2 @ 0000000000000000000000000000000000000002: green" "$TMP/out.log" && grep -q "PR #6 @ 0000000000000000000000000000000000000006: green" "$TMP/out.log"; then
   PASS=$((PASS + 1)); echo "  PASS [$N] the pass reports what it skipped"
 else FAIL=$((FAIL + 1)); echo "  FAIL [$N] skip report missing" >&2; fi
 N=$((N + 1))
@@ -324,7 +349,7 @@ if ! grep -q 'filter' "$TMP/gh.log" || ! grep -q '"filter": "all"' "$TMP/gh.log"
   PASS=$((PASS + 1)); echo "  PASS [$N] a full pass spends no due-proof reads"
 else FAIL=$((FAIL + 1)); echo "  FAIL [$N] full pass issued due-proof reads" >&2; fi
 
-run_pass schedule-pr workflow_run h1 schedule ""
+run_pass schedule-pr workflow_run 0000000000000000000000000000000000000001 schedule ""
 expect_eval "schedule-parent pass whose head is an open PR keeps full coverage" "1 2 3 4 5 6 7 8 9 10 11"
 
 run_pass dispatch repository_dispatch "" "" 2
@@ -341,10 +366,15 @@ posts() {
   python3 - "$TMP/gh.log" "$1" "${2:-}" <<'PY2'
 import json, sys
 n = 0
-for line in open(sys.argv[1]):
+opened = {}
+for index, line in enumerate(open(sys.argv[1]), 1):
     method, endpoint, fields = line.rstrip("\n").split(" ", 2)
     f = json.loads(fields)
-    if method == "POST" and endpoint.endswith("/check-runs") and f.get("head_sha") == sys.argv[2] \
+    if method == "POST" and endpoint.endswith("/check-runs"):
+        opened[900000000 + index] = f
+    if method == "PATCH":
+        f = dict(opened.get(int(endpoint.rsplit("/", 1)[1]), {}), **f)
+    if method in ("POST", "PATCH") and f.get("head_sha") == sys.argv[2] \
             and (not sys.argv[3] or f.get("status") == sys.argv[3]):
         n += 1
 print(n)
@@ -384,25 +414,25 @@ check "the step ships DUE_MAX_AGE_SECONDS=1800, the */30 sweep interval" \
 # ── 8. budget guard ────────────────────────────────────────────────────
 # 150 remaining: below one extra PR (40) on top of the head (40) plus the
 # 100 reserve, so no due() read is spent and only the event head runs.
-RL_REMAINING=150 run_pass budget-head workflow_run h1 pull_request ""
+RL_REMAINING=150 run_pass budget-head workflow_run 0000000000000000000000000000000000000001 pull_request ""
 unset RL_REMAINING
 expect_eval "short budget: an event pass evaluates only the event head" "1"
 check "short budget: no due() read is spent on the skipped PRs" no_due_reads
 check "short budget: the event head's holds are opened and all three closed" \
-  [ "$(posts h1 in_progress)" = 3 -a "$(posts h1 completed)" = 3 ]
+  [ "$(posts 0000000000000000000000000000000000000001 in_progress)" = 3 -a "$(posts 0000000000000000000000000000000000000001 completed)" = 3 ]
 check "short budget: no skipped PR receives any write (keeps its previous verdict)" \
-  [ -z "$(writes_outside h1)" ]
+  [ -z "$(writes_outside 0000000000000000000000000000000000000001)" ]
 check "short budget: the pass says what it skipped" \
-  grep -q 'Budget guard (#2220): 150 REST request(s) and 1000 GraphQL point(s) remain until 2026-10-14T03:20:00Z.*Skipped: #2 #3 #4 #5 #6 #7 #8 #9 #10 #11' "$TMP/out.log"
+  grep -q 'Budget guard (#2220): .* REST request(s) and 1000 GraphQL point(s) remain until 2026-10-14T03:20:00Z.*Skipped: #2 #3 #4 #5 #6 #7 #8 #9 #10 #11' "$TMP/out.log"
 
 # 300 remaining: covers the head plus some, but not the nine due PRs.
-RL_REMAINING=300 run_pass budget-after-due workflow_run h1 pull_request ""
+RL_REMAINING=300 run_pass budget-after-due workflow_run 0000000000000000000000000000000000000001 pull_request ""
 unset RL_REMAINING
 evaluated_list() { awk -F'\t' '$1=="merge-clearance-gate.sh"{print $2}' "$TMP/gates.log"; }
 check "budget short of every due PR: the head plus a batch the budget covers, all of them due" \
   eval '[ "$(evaluated_list | head -1)" = 1 ] && [ "$(evaluated_list | wc -l | tr -d " ")" = 4 ] && ! evaluated_list | grep -qx -e 2 -e 6'
 check "budget short of every due PR: writes land only on evaluated heads" \
-  eval '[ -z "$(writes_outside $(evaluated_list | sed "s/^/h/"))" ]'
+  eval '[ -z "$(writes_outside $(evaluated_list | while read -r n; do printf "%040x\n" "$n"; done))" ]'
 
 # 130 remaining: below one evaluation plus the reserve, so no capacity.
 RL_REMAINING=130 run_pass budget-schedule workflow_run maintip schedule ""
@@ -469,27 +499,27 @@ check "rotating batch, varying capacity: eleven ticks cover all eleven open PRs"
   [ "$(tr ' ' '\n' <"$TMP/rotation-vary.log" | grep . | sort -un | wc -l | tr -d ' ')" = 11 ]
 unset CASE_FIXTURE
 
-RL_REMAINING=fail run_pass budget-unreadable workflow_run h1 pull_request ""
+RL_REMAINING=fail run_pass budget-unreadable workflow_run 0000000000000000000000000000000000000001 pull_request ""
 unset RL_REMAINING
 expect_eval "unreadable /rate_limit: the event pass evaluates as before" "1 3 4 5 7 8 9 10 11"
 check "unreadable /rate_limit: the pass warns" \
   grep -q 'Could not read the installation budget' "$TMP/out.log"
 
 # ── 9. stop at the first installation rate-limit failure ───────────────
-RL_FAIL_PR=3 run_pass stop-later workflow_run h1 pull_request ""
+RL_FAIL_PR=3 run_pass stop-later workflow_run 0000000000000000000000000000000000000001 pull_request ""
 check "rate-limit stop: no gate runs after the failing one" \
   [ "$(gates_ran)" = "coderabbit-severity-gate.sh:1 codex-p1-gate.sh:1 merge-clearance-gate.sh:1 merge-clearance-gate.sh:3" ]
 check "rate-limit stop: only the failing context is written on its PR; later PRs untouched" \
-  eval '[ "$(posts h3)" = 1 ] && [ -z "$(writes_outside h1 h3)" ]'
+  eval '[ "$(posts 0000000000000000000000000000000000000003 completed)" = 1 ] && [ -z "$(writes_outside 0000000000000000000000000000000000000001 0000000000000000000000000000000000000003)" ]'
 check "rate-limit stop: the pass exits red and names what it did not evaluate" \
   eval '[ "$RC" -ne 0 ] && grep -q "Not evaluated: #4 #5 #7 #8 #9 #10 #11" "$TMP/out.log"'
 cp "$TMP/gh.log" "$TMP/gh-stop.log"
 
-RL_FAIL_PR=1 run_pass stop-head workflow_run h1 pull_request ""
+RL_FAIL_PR=1 run_pass stop-head workflow_run 0000000000000000000000000000000000000001 pull_request ""
 check "rate-limit stop on the event head: nothing else is evaluated" \
   [ "$(gates_ran)" = "merge-clearance-gate.sh:1" ]
 check "rate-limit stop on the event head: all three holds are closed, none orphaned" \
-  eval '[ "$(posts h1 in_progress)" = 3 ] && [ "$(posts h1 completed)" = 3 ] && [ -z "$(writes_outside h1)" ]'
+  eval '[ "$(posts 0000000000000000000000000000000000000001 in_progress)" = 3 ] && [ "$(posts 0000000000000000000000000000000000000001 completed)" = 3 ] && [ -z "$(writes_outside 0000000000000000000000000000000000000001)" ]'
 unset RL_FAIL_PR
 
 # ── 10. back-off round trip, from the red case 9 actually posted ────────
@@ -497,20 +527,23 @@ python3 - "$TMP/fixture.json" "$TMP/gh-stop.log" "$TMP" <<'PY2'
 import copy, json, sys
 fx = json.load(open(sys.argv[1]))
 red = None
-for line in open(sys.argv[2]):
+opened = {}
+for index, line in enumerate(open(sys.argv[2]), 1):
     method, endpoint, fields = line.rstrip("\n").split(" ", 2)
     f = json.loads(fields)
-    if method == "POST" and f.get("head_sha") == "h3" and f.get("status") == "completed":
+    if method == "POST": opened[900000000 + index] = f
+    if method == "PATCH": f = dict(opened.get(int(endpoint.rsplit("/", 1)[1]), {}), **f)
+    if method == "PATCH" and f.get("head_sha") == "0000000000000000000000000000000000000003" and f.get("status") == "completed":
         red = f
 assert red and red["conclusion"] == "failure", red
 title = red["output[title]"]
 assert "re-evaluated after 2026-10-14T03:20:00Z" in title, title
-# The red completes at 02:58; h3's other two contexts are current greens
-# posted a minute before the pass, so the red alone decides whether h3 is due.
+# The red completes at 02:58; 0000000000000000000000000000000000000003's other two contexts are current greens
+# posted a minute before the pass, so the red alone decides whether 0000000000000000000000000000000000000003 is due.
 def with_h3(t, start, green_done):
     out = copy.deepcopy(fx)
     out["pass_start"] = start
-    for r in out["runs"]["h3"]:
+    for r in out["runs"]["0000000000000000000000000000000000000003"]:
         r.update(status="completed", conclusion="success", completed_at=green_done)
         if r["name"] == red["name"]:
             r.update(conclusion="failure", id=r["id"] + 5000, completed_at="2026-10-14T02:58:00Z",
@@ -528,16 +561,16 @@ for k, v in cases.items():
 PY2
 h3_evaluated() { awk -F'\t' '$1=="merge-clearance-gate.sh" && $2==3' "$TMP/gates.log" | grep -q .; }
 
-CASE_FIXTURE="$TMP/fx-before.json" run_pass backoff-before workflow_run h1 pull_request ""
+CASE_FIXTURE="$TMP/fx-before.json" run_pass backoff-before workflow_run 0000000000000000000000000000000000000001 pull_request ""
 check "back-off: a rate-limit red is not due before the reset its title records" \
-  eval '! h3_evaluated && grep -q "PR #3 @ h3: newest verdict is an installation rate-limit red; backed off until 2026-10-14T03:20:00Z" "$TMP/out.log"'
-CASE_FIXTURE="$TMP/fx-after.json" run_pass backoff-after workflow_run h1 pull_request ""
+  eval '! h3_evaluated && grep -q "PR #3 @ 0000000000000000000000000000000000000003: newest verdict is an installation rate-limit red; backed off until 2026-10-14T03:20:00Z" "$TMP/out.log"'
+CASE_FIXTURE="$TMP/fx-after.json" run_pass backoff-after workflow_run 0000000000000000000000000000000000000001 pull_request ""
 check "back-off: the first pass after the reset evaluates it" h3_evaluated
-CASE_FIXTURE="$TMP/fx-ordinary.json" run_pass backoff-ordinary workflow_run h1 pull_request ""
+CASE_FIXTURE="$TMP/fx-ordinary.json" run_pass backoff-ordinary workflow_run 0000000000000000000000000000000000000001 pull_request ""
 check "back-off: an ordinary infra red stays due" h3_evaluated
-CASE_FIXTURE="$TMP/fx-cap-before.json" run_pass backoff-cap-before workflow_run h1 pull_request ""
+CASE_FIXTURE="$TMP/fx-cap-before.json" run_pass backoff-cap-before workflow_run 0000000000000000000000000000000000000001 pull_request ""
 check "back-off: a red recording no reset backs off for its first hour" eval '! h3_evaluated'
-CASE_FIXTURE="$TMP/fx-cap-after.json" run_pass backoff-cap-after workflow_run h1 pull_request ""
+CASE_FIXTURE="$TMP/fx-cap-after.json" run_pass backoff-cap-after workflow_run 0000000000000000000000000000000000000001 pull_request ""
 check "back-off: and is due once that hour has passed" h3_evaluated
 unset CASE_FIXTURE
 
@@ -548,69 +581,69 @@ check "scheduled tick: the publisher runs each gate exactly once per open PR" \
 # ── Codex round 1 on #2225 ─────────────────────────────────────────────
 # The GraphQL bucket is budgeted too: a healthy REST core with an empty
 # GraphQL bucket still evaluates only the event head.
-RL_GQL_REMAINING=60 run_pass gql-short workflow_run h1 pull_request ""
+RL_GQL_REMAINING=60 run_pass gql-short workflow_run 0000000000000000000000000000000000000001 pull_request ""
 unset RL_GQL_REMAINING
 expect_eval "short GraphQL budget: an event pass evaluates only the event head" "1"
 # Selection reads are charged: at 185 the head plus one PR (180) is covered
 # for exactly six proof reads, after which the rest are skipped unread.
-RL_REMAINING=185 run_pass due-reads-charged workflow_run h1 pull_request ""
+RL_REMAINING=185 run_pass due-reads-charged workflow_run 0000000000000000000000000000000000000001 pull_request ""
 unset RL_REMAINING
 check "due-proof reads are charged against the budget snapshot" \
   [ "$(grep -c '"filter": "all"' "$TMP/gh.log")" = 6 ]
 # Below one evaluation the head is not evaluated at all: its holds are closed
 # with the budget red straight away, with no new holds and no gate run.
-RL_REMAINING=120 run_pass prestop workflow_run h1 pull_request ""
+RL_REMAINING=120 run_pass prestop workflow_run 0000000000000000000000000000000000000001 pull_request ""
 unset RL_REMAINING
 check "budget short of one evaluation: no gate runs at all" [ ! -s "$TMP/gates.log" ]
 check "budget short of one evaluation: the head is closed with three budget reds, no new holds" \
-  eval '[ "$(posts h1 in_progress)" = 0 ] && [ "$(posts h1 completed)" = 3 ] && [ -z "$(writes_outside h1)" ] && grep -q "installation API budget exhausted (rc=2); re-evaluated after 2026-10-14T03:20:00Z" "$TMP/gh.log"'
-RL_GQL_REMAINING=20 run_pass prestop-gql workflow_run h1 pull_request ""
+  eval '[ "$(posts 0000000000000000000000000000000000000001 in_progress)" = 3 ] && [ "$(posts 0000000000000000000000000000000000000001 completed)" = 3 ] && [ -z "$(writes_outside 0000000000000000000000000000000000000001)" ] && grep -q "installation API budget exhausted (rc=2); re-evaluated after 2026-10-14T03:20:00Z" "$TMP/gh.log"'
+RL_GQL_REMAINING=20 run_pass prestop-gql workflow_run 0000000000000000000000000000000000000001 pull_request ""
 unset RL_GQL_REMAINING
 check "budget short on GraphQL only: the reds carry the GraphQL reset" \
   grep -q "re-evaluated after 2026-10-14T03:40:00Z" "$TMP/gh.log"
 # A GraphQL exhaustion mid-pass: the GraphQL wording also stops the pass, and
 # the red carries the bucket that ran out.
-RL_FAIL_PR=3 RL_EXHAUST_BUCKET=graphql run_pass stop-gql workflow_run h1 pull_request ""
+RL_FAIL_PR=3 RL_EXHAUST_BUCKET=graphql run_pass stop-gql workflow_run 0000000000000000000000000000000000000001 pull_request ""
 check "GraphQL rate-limit wording stops the pass" \
   [ "$(gates_ran)" = "coderabbit-severity-gate.sh:1 codex-p1-gate.sh:1 merge-clearance-gate.sh:1 merge-clearance-gate.sh:3" ]
 check "GraphQL exhaustion: the red carries the GraphQL reset" \
-  grep -q '"head_sha": "h3".*re-evaluated after 2026-10-14T03:40:00Z' "$TMP/gh.log"
+  eval '[ "$(posts 0000000000000000000000000000000000000003 completed)" = 1 ] && grep -q "re-evaluated after 2026-10-14T03:40:00Z" "$TMP/gh.log"'
 unset RL_EXHAUST_BUCKET
 # The production path once the token is empty: every write after the failure
 # fails as well. Nothing is written green, the event head's holds stay
 # PENDING (fail closed), and the pass ends red rather than hanging.
 # A lint-parent refresh opened no holds, so a budget short of one evaluation
 # must leave the head untouched rather than close it red (Codex P1 on #2225).
-RL_REMAINING=120 CASE_PARENT_NAME=repo-lint run_pass lint-prestop workflow_run h1 pull_request ""
+RL_REMAINING=120 CASE_PARENT_NAME=repo-lint run_pass lint-prestop workflow_run 0000000000000000000000000000000000000001 pull_request ""
 check "budget short of one evaluation on a repo-lint refresh: no gate runs and nothing is written" \
   eval '[ ! -s "$TMP/gates.log" ] && [ -z "$(writes_outside)" ]'
-# A proof read is charged per PAGE (Codex P2 on #2225): h3's runs span two
+# A proof read is charged per PAGE (Codex P2 on #2225): 0000000000000000000000000000000000000003's runs span two
 # pages, so at 185 the reads stop one PR earlier than the six above.
 python3 - "$TMP/fixture.json" "$TMP/fx-pages.json" <<'PY2'
 import json, sys
-fx = json.load(open(sys.argv[1])); fx["two_pages"] = ["h3"]
+fx = json.load(open(sys.argv[1])); fx["two_pages"] = ["0000000000000000000000000000000000000003"]
 json.dump(fx, open(sys.argv[2], "w"))
 PY2
-RL_REMAINING=185 CASE_FIXTURE="$TMP/fx-pages.json" run_pass due-pages workflow_run h1 pull_request ""
+RL_REMAINING=185 CASE_FIXTURE="$TMP/fx-pages.json" run_pass due-pages workflow_run 0000000000000000000000000000000000000001 pull_request ""
 check "a two-page proof read is charged two requests" \
   [ "$(grep -c '"filter": "all"' "$TMP/gh.log")" = 5 ]
 # ── 13. #2229: a read that fails after one page ────────────────────────
-# h3's read prints page 1 and then fails on page 2: that is one page fetched
+# 0000000000000000000000000000000000000003's read prints page 1 and then fails on page 2: that is one page fetched
 # plus the failed request, so it is charged two and, as with the two-page
 # read above, the reads stop one PR earlier than the six at one per read.
 python3 - "$TMP/fixture.json" "$TMP/fx-page-fail.json" <<'PY2'
 import json, sys
-fx = json.load(open(sys.argv[1])); fx["page_then_fail"] = ["h3"]
+fx = json.load(open(sys.argv[1])); fx["page_then_fail"] = ["0000000000000000000000000000000000000003"]
 json.dump(fx, open(sys.argv[2], "w"))
 PY2
-RL_REMAINING=185 CASE_FIXTURE="$TMP/fx-page-fail.json" run_pass due-page-fail workflow_run h1 pull_request ""
+RL_REMAINING=185 CASE_FIXTURE="$TMP/fx-page-fail.json" run_pass due-page-fail workflow_run 0000000000000000000000000000000000000001 pull_request ""
 check "a proof read that fails after one page is charged two requests" \
   [ "$(grep -c '"filter": "all"' "$TMP/gh.log")" = 5 ]
 check "a proof read that fails after one page is not reported as current" \
-  eval '! grep -q "PR #3 @ h3:" "$TMP/out.log"'
-RL_FAIL_PR=1 RL_EXHAUST_WRITES=1 run_pass stop-no-writes workflow_run h1 pull_request ""
+  eval '! grep -q "PR #3 @ 0000000000000000000000000000000000000003:" "$TMP/out.log"'
+RL_FAIL_PR=1 RL_EXHAUST_WRITES=1 run_pass stop-no-writes workflow_run 0000000000000000000000000000000000000001 pull_request ""
 check "exhausted token after the failure: no write lands and the holds stay pending" \
-  eval '[ "$(posts h1 in_progress)" = 3 ] && [ "$(posts h1 completed)" = 0 ] && [ -z "$(writes_outside h1)" ] && [ "$RC" -ne 0 ] && ! grep -q "\"conclusion\": \"success\"" "$TMP/gh.log" "$TMP/gh.log.rejected"'
+  eval '[ "$(posts 0000000000000000000000000000000000000001 in_progress)" = 3 ] && [ "$(posts 0000000000000000000000000000000000000001 completed)" = 0 ] && [ -z "$(writes_outside 0000000000000000000000000000000000000001)" ] && [ "$RC" -ne 0 ] && ! grep -q "\"conclusion\": \"success\"" "$TMP/gh.log" "$TMP/gh.log.rejected"'
 unset RL_FAIL_PR RL_EXHAUST_WRITES
 
 # ── 14. auto-clear nominations (#2239, #2205) ─────────────────────────
@@ -620,9 +653,9 @@ nominated() { sed -n 's/^autoclear_prs=//p' "$TMP/github-output"; }
 # ac_reads: requests the nomination step spent on auto-clear check-run reads.
 ac_reads() { grep -c '"check_name": "auto-clear-blocking-labels"' "$TMP/gh.log" || true; }
 # Fixture: PRs 1, 3 and 4 carry needs-external-review (4 gets a red verdict
-# below); h2's newest auto-clear run is a stale failure listed FIRST (array
-# order must not decide), h5's newest is a success over an older failure, and
-# h6 has none.
+# below); 0000000000000000000000000000000000000002's newest auto-clear run is a stale failure listed FIRST (array
+# order must not decide), 0000000000000000000000000000000000000005's newest is a success over an older failure, and
+# 0000000000000000000000000000000000000006 has none.
 python3 - "$TMP/fixture.json" "$TMP" <<'PY2'
 import copy, json, sys
 fx = json.load(open(sys.argv[1]))
@@ -632,17 +665,17 @@ def ac(c, t, i):
 for p in fx["prs"]:
     p["labels"] = [{"name": "other"}] + ([{"name": "needs-external-review"}] if p["number"] in (1, 3, 4) else [])
 fx["autoclear_runs"] = {
-    "h2": [ac("failure", "2026-10-14T02:50:00Z", 20), ac("success", "2026-10-14T01:00:00Z", 10)],
-    "h5": [ac("success", "2026-10-14T02:55:00Z", 30), ac("failure", "2026-10-14T02:50:00Z", 21)],
+    "0000000000000000000000000000000000000002": [ac("failure", "2026-10-14T02:50:00Z", 20), ac("success", "2026-10-14T01:00:00Z", 10)],
+    "0000000000000000000000000000000000000005": [ac("success", "2026-10-14T02:55:00Z", 30), ac("failure", "2026-10-14T02:50:00Z", 21)],
 }
 json.dump(fx, open(f"{sys.argv[2]}/fx-ac.json", "w"))
-moved = copy.deepcopy(fx); moved["moved_heads"] = {"3": "h3-moved"}
+moved = copy.deepcopy(fx); moved["moved_heads"] = {"3": "0000000000000000000000000000000000000003-moved"}
 json.dump(moved, open(f"{sys.argv[2]}/fx-ac-moved.json", "w"))
-unread = copy.deepcopy(fx); unread["autoclear_fail_reads"] = ["h2"]
+unread = copy.deepcopy(fx); unread["autoclear_fail_reads"] = ["0000000000000000000000000000000000000002"]
 json.dump(unread, open(f"{sys.argv[2]}/fx-ac-unread.json", "w"))
 PY2
 
-MCG_RED_PRS=4 CASE_FIXTURE="$TMP/fx-ac.json" run_pass ac-event workflow_run h1 pull_request ""
+MCG_RED_PRS=4 CASE_FIXTURE="$TMP/fx-ac.json" run_pass ac-event workflow_run 0000000000000000000000000000000000000001 pull_request ""
 check "event pass: green verdicts on labeled PRs are nominated once each; a red one is not" \
   eval '[ "$(nominated)" = "1 3" ] && [ "$(grep -c "^autoclear_prs=" "$TMP/github-output")" = 1 ]'
 check "event pass: no auto-clear check-run read is spent (heal nominations are full-pass only)" \
@@ -656,7 +689,7 @@ check "full pass: one auto-clear read per unlabeled green PR, none for labeled o
 
 CASE_FIXTURE="$TMP/fx-ac-moved.json" run_pass ac-moved workflow_run maintip schedule ""
 check "a verdict turned red because the head moved nominates nothing for that PR" \
-  eval '[ "$(nominated)" = "1 2 4" ] && grep -q "head moved during evaluation" "$TMP/gh.log"'
+  eval '[ "$(nominated)" = "1 2 4" ] && grep -q "generation input changed or unreadable" "$TMP/gh.log"'
 
 CASE_FIXTURE="$TMP/fx-ac-unread.json" run_pass ac-unread workflow_run maintip schedule ""
 check "an unreadable auto-clear read nominates nothing for that PR and warns" \

@@ -144,6 +144,15 @@ still fails, the same hardening `NO_BARE_GH_WRITE_EXEMPT` got in #466.
 `scripts/op-preflight.sh` is the canonical legitimate emitter: writing those
 values to its cache IS its contract.
 
+The marker exempts references on its physical source line or in the same
+continued executable segment carrying the comment. It never exempts sibling
+or nested segments on another physical line just because they share a
+LogicalLine. Child source coordinates are remapped without inheriting an
+ancestor's claim. Deferred start-line claims also require the same existing
+parent scope, while exact-owner claims retain continued commands. Direct trace
+flags stay within their existing child scope; a quoted/deferred program retains
+its existing one-hop and claimed-command policy.
+
 The marker counts ONLY inside a real shell comment -- a `#` that is unquoted,
 unescaped, word-initial, and at parameter-expansion nesting depth zero.  #1012
 was bypassable in two independent ways and both are re-established here as
@@ -257,6 +266,10 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     graded on what its body writes, not on where that write GOES, so a helper
     whose emitter feeds a pipe is treated as emitting -- declared conservatism
     below.
+    Helper capture/pipeline routing retains existing any-output and fd-1
+    redirection facts from positional-emitting segments and here-doc owners,
+    propagated through the same fixed point (#1495). Facts union all recognized
+    definitions and do not emulate descriptor state or later shielding.
   * The body of an INTERPOLATING here-doc (unquoted delimiter) owned by `cat`,
     `tee` or an emitter.  ALL here-doc openers on a line are tracked, not just
     the first (#1014), and the owner is the command of the SEGMENT the opener
@@ -1082,8 +1095,8 @@ class LogicalLine:
         self.first_line = first_line
         self.segments = []
         self.refs = []
-        self.pragma_reasons = []
-        self.pragma_bare = False
+        self.pragma_reasons = []  # (physical line, owning segment, reason)
+        self.pragma_bare = []
 
 
 _WORD_BREAK_BEFORE_COMMENT = set(" \t\n;&|()")
@@ -1489,6 +1502,20 @@ class Lexer:
             for start, end in sub.ansi_c_quote_spans
         )
 
+    def _absorb_pragma_context(self, sub, base_line, cur_ll):
+        """Keep child claims on their segment in original source coordinates."""
+        for ll in sub.logical:
+            cur_ll.pragma_reasons.extend(
+                (base_line + lno - 1, seg, reason)
+                for lno, seg, reason in ll.pragma_reasons
+            )
+            cur_ll.pragma_bare.extend(
+                (base_line + lno - 1, seg)
+                for lno, seg in ll.pragma_bare
+            )
+            for seg in ll.segments:
+                seg.line = base_line + seg.line - 1
+
     def _absorb_substitutions(
         self, inner, parent_seg, base_line, cur_ll,
         in_heredoc_body=False, source_offset=0,
@@ -1520,6 +1547,7 @@ class Lexer:
             prefix = 2 if inner[start : start + 2] == "$(" else 1
             body_offset = source_offset + start + prefix
             self._absorb_function_context(sub, body_offset)
+            self._absorb_pragma_context(sub, body_line, cur_ll)
             for ll in sub.logical:
                 for seg in ll.segments:
                     if seg.parent is None:
@@ -1747,9 +1775,9 @@ class Lexer:
                 if m:
                     reason = (m.group(1) or "").strip()
                     if reason:
-                        cur_ll.pragma_reasons.append(reason)
+                        cur_ll.pragma_reasons.append((line, cur_level()["seg"], reason))
                     else:
-                        cur_ll.pragma_bare = True
+                        cur_ll.pragma_bare.append((line, cur_level()["seg"]))
                 i = eol
                 continue
 
@@ -1915,6 +1943,7 @@ class Lexer:
                 parent_seg = cur_level()["seg"]
                 sub = Lexer(inner)
                 self._absorb_function_context(sub, i + 1)
+                self._absorb_pragma_context(sub, line, cur_ll)
                 for ll in sub.logical:
                     # Re-parent the segments the sub-lexer left PARENTLESS,
                     # the same rule `_absorb_substitutions` uses.  Re-parenting
@@ -1934,7 +1963,7 @@ class Lexer:
                         # `in_error_word`, so ``v=`: "${U:?$PAT}"` `` -- which
                         # bash writes to stderr past the capture -- read clean
                         # (#1564 review).
-                        ref = Ref(r.name, line, r.seg, r.in_assign_prefix)
+                        ref = Ref(r.name, line + r.line - 1, r.seg, r.in_assign_prefix)
                         ref.in_error_word = r.in_error_word
                         ref.heredoc_owner = r.heredoc_owner
                         ref.in_heredoc_body = r.in_heredoc_body
@@ -3327,7 +3356,7 @@ def _test_numeric_operand(seg, name):
     return False
 
 
-def reaches_output(ref, emitter_helpers):
+def reaches_output(ref, emitter_helpers, helper_routing=None):
     """Does this reference reach a stream?  Returns (bool, reason)."""
     if ref.in_error_word:
         # Decided BEFORE the command word, and deliberately ahead of the
@@ -3424,6 +3453,12 @@ def reaches_output(ref, emitter_helpers):
         # get the same verdict rather than a third one.
         has_out_redir = has_out_redir or escaped_any
         stdout_moved = redirects_stdout(seg) or escaped_fd1
+        if helper_routing is not None and not via_stdin and not from_subshell:
+            # The helper's emitting body can redirect before this call's
+            # capture or pipe. Preserve the existing two redirection readings;
+            # their union does not emulate later descriptor shielding (#1495).
+            has_out_redir = has_out_redir or cmd in helper_routing[0]
+            stdout_moved = stdout_moved or cmd in helper_routing[1]
         # `via_stdin` and `from_subshell` are exclusive by construction: each
         # hop below clears the other, because a value cannot arrive on a
         # segment's standard input AND already be on its standard output.
@@ -3759,8 +3794,8 @@ def _printf_callback_changes_lookup(seg):
     return False
 
 
-def discover_emitter_helpers(text):
-    """Names with any recognized body writing their positionals VERBATIM."""
+def discover_emitter_helpers(text, return_routing=False):
+    """Emitting names; optionally also their two finite redirection fact sets."""
     bodies = {}
     definitions = list(_iter_function_definitions(text))
     # NOT `^[ \t]*`.  A function definition is valid at any COMMAND POSITION,
@@ -3830,17 +3865,21 @@ def discover_emitter_helpers(text):
                         availability_changed = True
     shadowed = "printf" in bodies or any(name in PASSTHRU for name in bodies)
     helpers = {"printf"} if shadowed or availability_changed else set()
+    redirected_any = set()
+    redirected_fd1 = set()
     # A FIXED POINT, not a fixed number of rounds.  Each round can promote at
     # most one link of a call chain, so a chain longer than the round budget
     # left its outermost helper undiscovered -- `a` calls `b` calls `c` calls
     # `d` calls `echo "$1"` needs four (#1032 F6).  The set only ever grows and
     # is bounded by the number of functions in the file, so this terminates.
+    # Redirection facts also grow monotonically; revisit promoted helpers and
+    # all bodies so a later-discovered callee or emitter retains its routing.
     while True:
         grew = False
         for name, body_text, lx in lexed:
-            if name in helpers:
-                continue
             emits = False
+            moves_any = False
+            moves_fd1 = False
             for ll in lx.logical:
                 for seg in ll.segments:
                     cmd, _redir = resolve_command(seg)
@@ -3865,11 +3904,9 @@ def discover_emitter_helpers(text):
                     for w in seg.words:
                         if _word_has_verbatim_positional(w):
                             emits = True
+                            moves_any |= _redir or cmd in redirected_any
+                            moves_fd1 |= redirects_stdout(seg) or cmd in redirected_fd1
                             break
-                    if emits:
-                        break
-                if emits:
-                    break
             # A helper body can put a positional on a stream without naming
             # an emitter at all: BASH writes a `${VAR:?WORD}` error word
             # itself, and under xtrace it writes every expanded command.  This
@@ -3892,14 +3929,27 @@ def discover_emitter_helpers(text):
                         and _word_has_verbatim_positional(body_text):
                     emits = True
             # A nested or direct HD uses the same bounded admission rule.
-            if not emits:
-                emits = any(_heredoc_has_positional(hd, helpers) for hd in lx.heredocs)
-            if emits:
+            for hd in lx.heredocs:
+                if _heredoc_has_positional(hd, helpers):
+                    emits = True
+                    _cmd, redir = resolve_command(hd.owner)
+                    moves_any |= redir
+                    moves_fd1 |= redirects_stdout(hd.owner)
+            if emits and name not in helpers:
                 helpers.add(name)
+                grew = True
+            if moves_any and name not in redirected_any:
+                redirected_any.add(name)
+                grew = True
+            if moves_fd1 and name not in redirected_fd1:
+                redirected_fd1.add(name)
                 grew = True
         if not grew:
             break
-    return frozenset(helpers)
+    names = frozenset(helpers)
+    if return_routing:
+        return names, frozenset(redirected_any), frozenset(redirected_fd1)
+    return names
 
 
 def _heredoc_bracket_close(text, open_idx, parameter_words=False):
@@ -4805,7 +4855,7 @@ def _text_enables_xtrace(text, outer_only=False):
 def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
     """Return (findings, pragma_errors)."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    helpers = discover_emitter_helpers(text)
+    helpers, routed_any, routed_fd1 = discover_emitter_helpers(text, return_routing=True)
     lx = Lexer(text)
     findings = []
     pragma_errors = []
@@ -4846,11 +4896,16 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
     aliases = _alias_emitters(lx, helpers)
     base_helpers = set(helpers)
     for ll in lx.logical:
-        if ll.pragma_bare and not ll.pragma_reasons:
+        for pragma_line, _owner in ll.pragma_bare:
             pragma_errors.append(
                 "%s:%d: %s: with no reason -- the reason is mandatory"
-                % (path, ll.first_line, PRAGMA)
+                % (path, pragma_line, PRAGMA)
             )
+        exempt_lines = {lno for lno, _seg, _reason in ll.pragma_reasons}
+        exempt_segments = {seg for _lno, seg, _reason in ll.pragma_reasons}
+        exempt_deferred_sites = {
+            (lno, owner.parent) for lno, owner, _reason in ll.pragma_reasons
+        }
         # xtrace is shell STATE and it changes WITHIN a logical line as well
         # as between them: `( set -x; : "$GH_TOKEN" )` is one line whose
         # second segment runs traced.  So the state is resolved per SEGMENT,
@@ -4871,6 +4926,7 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
         xtrace_at = {}
         effective_xtrace_at = {}
         effective_xtrace_scopes = {None: effective_xtrace}
+        ordinary_xtrace_scopes = {None: xtrace}
         state = xtrace
         # `state` grades the segments of THIS line, including the ones inside a
         # subshell -- `( set -x; : "$PAT" )` really is traced.  `outer` is what
@@ -4889,6 +4945,13 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
             while parent is not None:
                 scopes.append(parent.sid)
                 parent = parent.parent
+            # Direct flags inherit their enclosing shell, not a completed
+            # command/process substitution or sibling subshell.
+            state = next(
+                ordinary_xtrace_scopes[scope]
+                for scope in scopes[1:] + [None]
+                if scope in ordinary_xtrace_scopes
+            )
             xtrace_at[seg.sid] = state or any(
                 scope in deferred_xtrace_scopes for scope in scopes
             )
@@ -4903,18 +4966,22 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
             st = _segment_sets_xtrace(seg)
             if st is True:
                 effective_xtrace_scopes[current_scope] = True
+                ordinary_xtrace_scopes[current_scope] = True
                 state = True
-                if not seg.parent_is_subshell:
+                if seg.parent is None:
                     outer = True
             elif st is False and line_delta is False:
                 effective_xtrace_scopes[current_scope] = False
+                ordinary_xtrace_scopes[current_scope] = False
                 state = False
-                if not seg.parent_is_subshell:
+                if seg.parent is None:
                     outer = False
             # The same bounded extractor/enable predicate used below must
             # contribute before later segments consume this map. This retains
             # written enable evidence, not a claim that a trap/callback ran.
-            if not ll.pragma_reasons and _depth < _DEFERRED_SHELL_DEPTH:
+            if ((seg.line, seg.parent) not in exempt_deferred_sites
+                    and seg not in exempt_segments
+                    and _depth < _DEFERRED_SHELL_DEPTH):
                 deferred_operands = _deferred_shell_operands(seg)
                 if any(_text_enables_xtrace(inner, outer_only=True)
                        for inner in deferred_operands):
@@ -4925,13 +4992,10 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
                         seg.parent.sid if seg.parent is not None else None
                     )
         effective_xtrace = effective_xtrace_scopes[None]
-        if ll.pragma_reasons:
-            # A pragma'd line is exempt, and so is any xtrace it turns on --
-            # the exemption is the author's written statement about THIS line.
-            xtrace = outer
-            continue
         for ref in ll.refs:
-            hit, why = reaches_output(ref, helpers)
+            if ref.line in exempt_lines or ref.seg in exempt_segments:
+                continue
+            hit, why = reaches_output(ref, helpers, (routed_any, routed_fd1))
             if not hit and xtrace_at.get(
                 ref.seg.sid if ref.seg is not None else None, xtrace
             ):
@@ -4943,6 +5007,9 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
                 findings.append(Finding(path, ref.line, ref.name, why))
         if _depth < _DEFERRED_SHELL_DEPTH:
             for seg in ll.segments:
+                if ((seg.line, seg.parent) in exempt_deferred_sites
+                        or seg in exempt_segments):
+                    continue  # Keep claimed deferred commands' existing policy.
                 for inner in _deferred_shell_operands(seg):
                     sub, sub_errors = scan_text(
                         inner, path=path, _depth=_depth + 1,
@@ -10872,6 +10939,351 @@ CORPUS = [
     ('read-helper-positional-index-inherited', MUST_NOT_FLAG, 'leak() { read $\'a[$(: \\\\\\\'; echo "$1" >&2)]\' <<< x; }\nleak "$GH_TOKEN"\n'),
     ('printf-v-helper-positional-index-inherited', MUST_NOT_FLAG, 'leak() { printf -v $\'a[$(: \\\\\\\'; echo "$1" >&2)]\' %s x; }\nleak "$GH_TOKEN"\n'),
     ('read-ansi-index-no-apostrophe-inherited', MUST_NOT_FLAG, 'read $\'a[$(echo "$GH_TOKEN" >&2)]\' <<< x\n'),
+    (
+        'helper-routing-stdout-direct',
+        MUST_FLAG,
+        'die() { echo "fatal: $1"; }\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-routing-stdout-capture',
+        MUST_NOT_FLAG,
+        'die() { echo "fatal: $1"; }\nv=$(die "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-stdout-pipeline',
+        MUST_NOT_FLAG,
+        'die() { echo "fatal: $1"; }\ndie "$GH_TOKEN" | grep -qF zz\n',
+    ),
+    (
+        'helper-routing-stdout-subshell-capture',
+        MUST_NOT_FLAG,
+        'die() { echo "fatal: $1"; }\nv=$( ( die "$GH_TOKEN" ) )\n',
+    ),
+    (
+        'helper-routing-stdout-backtick-capture',
+        MUST_NOT_FLAG,
+        'die() { echo "fatal: $1"; }\nv=`die "$GH_TOKEN"`\n',
+    ),
+    (
+        'helper-routing-stderr-direct',
+        MUST_FLAG,
+        'die() { echo "fatal: $1" >&2; }\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        'helper-routing-stderr-capture',
+        MUST_FLAG,
+        'die() { echo "fatal: $1" >&2; }\nv=$(die "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-stderr-pipeline',
+        MUST_FLAG,
+        'die() { echo "fatal: $1" >&2; }\ndie "$GH_TOKEN" | grep -qF zz\n',
+    ),
+    (
+        'helper-routing-stderr-subshell-capture',
+        MUST_FLAG,
+        'die() { echo "fatal: $1" >&2; }\nv=$( ( die "$GH_TOKEN" ) )\n',
+    ),
+    (
+        'helper-routing-stderr-backtick-capture',
+        MUST_FLAG,
+        'die() { echo "fatal: $1" >&2; }\nv=`die "$GH_TOKEN"`\n',
+    ),
+    (
+        'helper-routing-recursive-stderr-capture',
+        MUST_FLAG,
+        'outer() { inner "$1"; }\ninner() { echo "$1" >&2; }\nv=$(outer "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-recursive-stderr-pipeline',
+        MUST_FLAG,
+        'outer() { inner "$1"; }\ninner() { echo "$1" >&2; }\nouter "$GH_TOKEN" | grep -qF zz\n',
+    ),
+    (
+        'helper-routing-recursive-stdout-capture',
+        MUST_NOT_FLAG,
+        'outer() { inner "$1"; }\ninner() { echo "$1"; }\nv=$(outer "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-recursive-stdout-pipeline',
+        MUST_NOT_FLAG,
+        'outer() { inner "$1"; }\ninner() { echo "$1"; }\nouter "$GH_TOKEN" | grep -qF zz\n',
+    ),
+    (
+        'helper-routing-promoted-before-routing',
+        MUST_FLAG,
+        'outer() { echo "$1"; inner "$1"; }\ninner() { echo "$1" >&2; }\nv=$(outer "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-stdout-before-stderr-body',
+        MUST_FLAG,
+        'die() { echo "$1"; echo "$1" >&2; }\nv=$(die "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-later-safe-body',
+        MUST_FLAG,
+        'die() { echo "$1" >&2; }\nv=$(die "$GH_TOKEN")\ndie() { echo "$1"; }\n',
+    ),
+    (
+        'helper-routing-later-stderr-body',
+        MUST_FLAG,
+        'die() { echo "$1"; }\nv=$(die "$GH_TOKEN")\ndie() { echo "$1" >&2; }\n',
+    ),
+    (
+        'helper-routing-unrelated-stderr-capture',
+        MUST_NOT_FLAG,
+        'die() { echo safe >&2; echo "$1"; }\nv=$(die "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-unrelated-stderr-pipeline',
+        MUST_NOT_FLAG,
+        'die() { echo safe >&2; echo "$1"; }\ndie "$GH_TOKEN" | grep -qF zz\n',
+    ),
+    (
+        'helper-routing-caller-shields-stderr-pipeline',
+        MUST_FLAG,
+        'die() { echo "$1" >&2; }\ndie "$GH_TOKEN" 2>/dev/null | grep -qF zz\n',
+    ),
+    (
+        'helper-routing-caller-joins-stderr-capture',
+        MUST_FLAG,
+        'die() { echo "$1" >&2; }\nv=$(die "$GH_TOKEN" 2>&1)\n',
+    ),
+    (
+        'helper-routing-body-file-capture',
+        MUST_FLAG,
+        'die() { echo "$1" > out.txt; }\nv=$(die "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-body-file-pipeline',
+        MUST_FLAG,
+        'die() { echo "$1" > out.txt; }\ndie "$GH_TOKEN" | grep -qF zz\n',
+    ),
+    (
+        'helper-routing-stdout-stderr-redirection-capture',
+        MUST_FLAG,
+        'die() { echo "$1" 2>/dev/null; }\nv=$(die "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-stdout-stderr-redirection-pipeline',
+        MUST_NOT_FLAG,
+        'die() { echo "$1" 2>/dev/null; }\ndie "$GH_TOKEN" | grep -qF zz\n',
+    ),
+    (
+        'helper-routing-herestring-stderr-capture',
+        MUST_FLAG,
+        'die() { cat <<< "$1" >&2; }\nv=$(die "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-herestring-stdout-capture',
+        MUST_NOT_FLAG,
+        'die() { cat <<< "$1"; }\nv=$(die "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-heredoc-stderr-capture',
+        MUST_FLAG,
+        'die() {\ncat >&2 <<EOF\n$1\nEOF\n}\nv=$(die "$GH_TOKEN")\n',
+    ),
+    (
+        'helper-routing-heredoc-stdout-capture',
+        MUST_NOT_FLAG,
+        'die() {\ncat <<EOF\n$1\nEOF\n}\nv=$(die "$GH_TOKEN")\n',
+    ),
+    (
+        'pragma-line-backtick-before',
+        MUST_FLAG,
+        'echo `\ntrue # TOKEN_OUTPUT_EXEMPT: deliberate backtick site\necho "$GH_TOKEN"\n`\n',
+    ),
+    (
+        'pragma-line-backtick-after',
+        MUST_FLAG,
+        'echo `\necho "$GH_TOKEN"\ntrue # TOKEN_OUTPUT_EXEMPT: deliberate backtick site\n`\n',
+    ),
+    (
+        'pragma-line-backtick-claimed-and-unclaimed',
+        MUST_FLAG,
+        'echo `\necho "$GH_TOKEN" # TOKEN_OUTPUT_EXEMPT: deliberate backtick site\necho "$GH_TOKEN"\n`\n',
+    ),
+    (
+        'pragma-line-backtick-claimed',
+        MUST_NOT_FLAG,
+        'echo `\necho "$GH_TOKEN" # TOKEN_OUTPUT_EXEMPT: deliberate backtick site\n`\n',
+    ),
+    (
+        'pragma-line-backtick-same-line-siblings',
+        MUST_NOT_FLAG,
+        'echo `\necho "$GH_TOKEN"; true # TOKEN_OUTPUT_EXEMPT: deliberate backtick site\n`\n',
+    ),
+    (
+        'pragma-line-ancestor-comment',
+        MUST_FLAG,
+        'echo "$(\necho "$GH_TOKEN"\n)" # TOKEN_OUTPUT_EXEMPT: parent line only\n',
+    ),
+    (
+        'pragma-line-subshell-before',
+        MUST_FLAG,
+        '(\ntrue # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\necho "$GH_TOKEN"\n)\n',
+    ),
+    (
+        'pragma-line-subshell-after',
+        MUST_FLAG,
+        '(\necho "$GH_TOKEN"\ntrue # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\n)\n',
+    ),
+    (
+        'pragma-line-subshell-claimed-and-unclaimed',
+        MUST_FLAG,
+        '(\necho "$GH_TOKEN" # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\necho "$GH_TOKEN"\n)\n',
+    ),
+    (
+        'pragma-line-subshell-claimed',
+        MUST_NOT_FLAG,
+        '(\necho "$GH_TOKEN" # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\n)\n',
+    ),
+    (
+        'pragma-line-substitution-before',
+        MUST_FLAG,
+        'echo "$(\ntrue # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\necho "$GH_TOKEN"\n)"\n',
+    ),
+    (
+        'pragma-line-substitution-after',
+        MUST_FLAG,
+        'echo "$(\necho "$GH_TOKEN"\ntrue # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\n)"\n',
+    ),
+    (
+        'pragma-line-substitution-claimed-and-unclaimed',
+        MUST_FLAG,
+        'echo "$(\necho "$GH_TOKEN" # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\necho "$GH_TOKEN"\n)"\n',
+    ),
+    (
+        'pragma-line-substitution-claimed',
+        MUST_NOT_FLAG,
+        'echo "$(\necho "$GH_TOKEN" # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\n)"\n',
+    ),
+    (
+        'pragma-line-function-subshell-before',
+        MUST_FLAG,
+        'f() (\ntrue # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\necho "$GH_TOKEN"\n)\nf\n',
+    ),
+    (
+        'pragma-line-function-subshell-after',
+        MUST_FLAG,
+        'f() (\necho "$GH_TOKEN"\ntrue # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\n)\nf\n',
+    ),
+    (
+        'pragma-line-function-subshell-claimed-and-unclaimed',
+        MUST_FLAG,
+        'f() (\necho "$GH_TOKEN" # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\necho "$GH_TOKEN"\n)\nf\n',
+    ),
+    (
+        'pragma-line-function-subshell-claimed',
+        MUST_NOT_FLAG,
+        'f() (\necho "$GH_TOKEN" # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\n)\nf\n',
+    ),
+    (
+        'pragma-line-continued-command',
+        MUST_NOT_FLAG,
+        'printf "%s\\n" \\\n  "$GH_TOKEN" \\\n  plain # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\n',
+    ),
+    (
+        'pragma-line-same-line-siblings',
+        MUST_NOT_FLAG,
+        'echo "$GH_TOKEN"; echo "$GH_TOKEN" # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\n',
+    ),
+    (
+        'pragma-line-same-line-nested',
+        MUST_NOT_FLAG,
+        'echo "$(echo "$GH_TOKEN")" # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\n',
+    ),
+    (
+        'pragma-line-array-child-claimed',
+        MUST_NOT_FLAG,
+        'values=( "$(\n  echo "$GH_TOKEN" >&2 # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\n)" )\n',
+    ),
+    (
+        'pragma-line-heredoc-child-claimed',
+        MUST_NOT_FLAG,
+        'read x <<EOF\n$(\n  echo "$GH_TOKEN" >&2 # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\n)\nEOF\n',
+    ),
+    (
+        'pragma-line-top-level-control',
+        MUST_FLAG,
+        'true # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\necho "$GH_TOKEN"\n',
+    ),
+    (
+        'pragma-line-array-child-foreign',
+        MUST_FLAG,
+        'values=( "$(\n  echo "$GH_TOKEN" >&2\n  true # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\n)" )\n',
+    ),
+    (
+        'pragma-line-heredoc-child-foreign',
+        MUST_FLAG,
+        'read x <<EOF\n$(\n  echo "$GH_TOKEN" >&2\n  true # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\n)\nEOF\n',
+    ),
+    (
+        'pragma-line-deferred-foreign',
+        MUST_FLAG,
+        '(\ntrue # TOKEN_OUTPUT_EXEMPT: fixture deliberate emission\neval \'echo "$GH_TOKEN"\'\n)\n',
+    ),
+    (
+        'pragma-cross-bundled-trace-later-unclaimed',
+        MUST_FLAG,
+        '(\nset -euo xtrace # TOKEN_OUTPUT_EXEMPT: enabling line only\n: "$GH_TOKEN"\n)\n',
+    ),
+    (
+        'pragma-cross-ordered-trace-later-unclaimed',
+        MUST_FLAG,
+        '(\nset -oz xtrace # TOKEN_OUTPUT_EXEMPT: enabling line only\n: "$GH_TOKEN"\n)\n',
+    ),
+    (
+        'pragma-cross-unknown-shopt-later-unclaimed',
+        MUST_FLAG,
+        'mode=-so\n(\nshopt "$mode" xtrace # TOKEN_OUTPUT_EXEMPT: enabling line only\n: "$GH_TOKEN"\n)\n',
+    ),
+    (
+        'pragma-cross-traced-claimed-and-unclaimed',
+        MUST_FLAG,
+        '(\nset -x\n: "$GH_TOKEN" # TOKEN_OUTPUT_EXEMPT: deliberate traced site\n: "$GH_TOKEN"\n)\n',
+    ),
+    (
+        'pragma-cross-disable-control',
+        MUST_NOT_FLAG,
+        'set -x\nset +x # TOKEN_OUTPUT_EXEMPT: disabling line only\n: "$GH_TOKEN"\n',
+    ),
+    (
+        'pragma-cross-continued-claimed-and-unclaimed',
+        MUST_FLAG,
+        '(\nprintf \'%s\' \\\n "$GH_TOKEN" # TOKEN_OUTPUT_EXEMPT: deliberate continued emitter\nprintf \'%s\' "$GH_TOKEN"\n)\n',
+    ),
+    (
+        'pragma-cross-backtick-traced-unclaimed',
+        MUST_FLAG,
+        'echo `\nset -x # TOKEN_OUTPUT_EXEMPT: enabling child line only\n: "$GH_TOKEN"\n`\n',
+    ),
+    (
+        'pragma-cross-heredoc-quoted-marker-data',
+        MUST_FLAG,
+        '(\ncat <<\'EOF\'\n# TOKEN_OUTPUT_EXEMPT: quoted body data\nEOF\necho "$GH_TOKEN"\n)\n',
+    ),
+    (
+        'pragma-cross-heredoc-interpolating-child-unclaimed',
+        MUST_FLAG,
+        'cat <<EOF\n$(\ntrue # TOKEN_OUTPUT_EXEMPT: unrelated child line\necho "$GH_TOKEN" >&2\n)\nEOF\n',
+    ),
+    (
+        'pragma-cross-quoted-marker-data',
+        MUST_FLAG,
+        '(\nprintf \'%s\' \'# TOKEN_OUTPUT_EXEMPT: quoted argument data\'\necho "$GH_TOKEN"\n)\n',
+    ),
+    ('pragma-b9-inherited-active-deferred-unclaimed', MUST_FLAG, 'set -x\n(\ntrue # TOKEN_OUTPUT_EXEMPT: unrelated physical line\neval \': "$GH_TOKEN"\'\n)\n'),
+    ('pragma-b9-same-line-known-enable-unclaimed', MUST_FLAG, '(\ntrue # TOKEN_OUTPUT_EXEMPT: unrelated physical line\neval \'set -x\'; eval \': "$GH_TOKEN"\'\n)\n'),
+    ('pragma-b9-backtick-known-enable-unclaimed', MUST_FLAG, 'echo `\ntrue # TOKEN_OUTPUT_EXEMPT: unrelated physical line\neval \'set -x\'; eval \': "$GH_TOKEN"\'\n`\n'),
+    ('pragma-b9-isolated-enable-restores-quiet', MUST_NOT_FLAG, '(\ntrue # TOKEN_OUTPUT_EXEMPT: unrelated physical line\n(set -x); eval \': "$GH_TOKEN"\'\n)\n'),
+    ('pragma-b9-isolated-disable-retains-active', MUST_FLAG, 'set -x\n(\ntrue # TOKEN_OUTPUT_EXEMPT: unrelated physical line\n(set +x); eval \': "$GH_TOKEN"\'\n)\n'),
+    ('pragma-b9-final-C-discards-enable', MUST_NOT_FLAG, '(\ntrue # TOKEN_OUTPUT_EXEMPT: unrelated physical line\nmapfile -C \'set -x\' -C \':\' -c 1 items <<< x\neval \': "$GH_TOKEN"\'\n)\n'),
+    ('pragma-b9-final-C-retains-enable', MUST_FLAG, '(\ntrue # TOKEN_OUTPUT_EXEMPT: unrelated physical line\nmapfile -C \':\' -C \'set -x\' -c 1 items <<< x\neval \': "$GH_TOKEN"\'\n)\n'),
+    ('pragma-b9-quoted-marker-retains-deferred', MUST_FLAG, '(\n: \'# TOKEN_OUTPUT_EXEMPT: quoted data\'\nset -x\neval \': "$GH_TOKEN"\'\n)\n'),
+    ('pragma-review-child-foreign-deferred-owner', MUST_FLAG, 'eval "$(true # TOKEN_OUTPUT_EXEMPT: child only\n)" \'echo "$GH_TOKEN"\''),
+    ('pragma-review-child-direct-xtrace-isolation', MUST_NOT_FLAG, 'echo "$(set -x # TOKEN_OUTPUT_EXEMPT: child only\ntrue\n)"; : "$GH_TOKEN"'),
 ]
 
 CORPUS.extend([
@@ -11822,6 +12234,16 @@ KNOWN_MISSES = {
     'read-helper-positional-index-inherited': 'Inherited on actual main cb69 (scanner fb09), published bf9a and frozen 1638 in the measured Mac/Linux fake-data samples: an invoked helper passes a positional-only ANSI indexed target to read and emits its argument, while all three scanners report clean. The approved global source-proof boundary uses existing raw sensitive names, not positional source reconstruction. Separate design: https://github.com/nathanjohnpayne/mergepath/issues/2246; owner acceptance #1453 comment6183821891.',
     'printf-v-helper-positional-index-inherited': 'Inherited on actual main cb69 (scanner fb09), published bf9a and frozen 1638 in the measured Mac/Linux fake-data samples: an invoked helper passes a positional-only ANSI indexed target to separate printf -v and emits its argument, while all three scanners report clean. The approved global source-proof boundary uses existing raw sensitive names, not positional source reconstruction. Separate design: https://github.com/nathanjohnpayne/mergepath/issues/2246; owner acceptance #1453 comment6183821891.',
     'read-ansi-index-no-apostrophe-inherited': 'Inherited on actual main cb69 (scanner fb09), published bf9a and frozen 1638 in the measured Mac/Linux fake-data samples: the ANSI indexed read target has a raw credential reference but no interior apostrophe and emits the fake value, while all three scanners report clean. It remains outside the approved two-conjunct raw source-proof boundary. Separate design: https://github.com/nathanjohnpayne/mergepath/issues/2246; owner acceptance #1453 comment6183821891.',
+    'pragma-line-backtick-claimed': 'An intentional real comment owns the existing backtick child source line/segment. Bash still emits the fake value by design; the location repair honors the claim without changing backtick tokenization or spans (#1447).',
+    'pragma-line-backtick-same-line-siblings': 'An intentional real comment owns the existing backtick child source line/segment. Bash still emits the fake value by design; the location repair honors the claim without changing backtick tokenization or spans (#1447).',
+    'pragma-line-subshell-claimed': 'An intentional inline review marker owns this physical line or continued executable segment. The oracle still leaks by design; this exemption is a declared author claim, not scanner blindness (#1447, like pragma-honoured).',
+    'pragma-line-substitution-claimed': 'An intentional inline review marker owns this physical line or continued executable segment. The oracle still leaks by design; this exemption is a declared author claim, not scanner blindness (#1447, like pragma-honoured).',
+    'pragma-line-function-subshell-claimed': 'An intentional inline review marker owns this physical line or continued executable segment. The oracle still leaks by design; this exemption is a declared author claim, not scanner blindness (#1447, like pragma-honoured).',
+    'pragma-line-continued-command': 'An intentional inline review marker owns this physical line or continued executable segment. The oracle still leaks by design; this exemption is a declared author claim, not scanner blindness (#1447, like pragma-honoured).',
+    'pragma-line-same-line-siblings': 'An intentional inline review marker owns this physical line or continued executable segment. The oracle still leaks by design; this exemption is a declared author claim, not scanner blindness (#1447, like pragma-honoured).',
+    'pragma-line-same-line-nested': 'An intentional inline review marker owns this physical line or continued executable segment. The oracle still leaks by design; this exemption is a declared author claim, not scanner blindness (#1447, like pragma-honoured).',
+    'pragma-line-array-child-claimed': 'An intentional inline review marker owns this physical line or continued executable segment. The oracle still leaks by design; this exemption is a declared author claim, not scanner blindness (#1447, like pragma-honoured).',
+    'pragma-line-heredoc-child-claimed': 'An intentional inline review marker owns this physical line or continued executable segment. The oracle still leaks by design; this exemption is a declared author claim, not scanner blindness (#1447, like pragma-honoured).',
 }
 
 KNOWN_BROADER = {
@@ -12862,6 +13284,12 @@ KNOWN_BROADER = {
     'printf-v-value-ordinary-default': (
         'Option A exempts only a bare printf with a lower-case ordinary target, literal plain-text/%s format, and literal or double-quoted plain-name values; wrappers, prefixes, redirections and other expansion shapes intentionally retain conservative output verdicts even when this noninteractive fixture emits nothing'
     ),
+    'helper-routing-body-file-capture': 'Helper routing unions existing output-redirection facts from all recognized emitting bodies. It does not prove descriptor ordering, later call-site shielding or which definition executed; file writes and the existing any-redirection capture rule remain conservative (#1495; #1042).',
+    'helper-routing-body-file-pipeline': 'Helper routing unions existing output-redirection facts from all recognized emitting bodies. It does not prove descriptor ordering, later call-site shielding or which definition executed; file writes and the existing any-redirection capture rule remain conservative (#1495; #1042).',
+    'helper-routing-caller-joins-stderr-capture': 'Helper routing unions existing output-redirection facts from all recognized emitting bodies. It does not prove descriptor ordering, later call-site shielding or which definition executed; file writes and the existing any-redirection capture rule remain conservative (#1495; #1042).',
+    'helper-routing-caller-shields-stderr-pipeline': 'Helper routing unions existing output-redirection facts from all recognized emitting bodies. It does not prove descriptor ordering, later call-site shielding or which definition executed; file writes and the existing any-redirection capture rule remain conservative (#1495; #1042).',
+    'helper-routing-later-stderr-body': 'Helper routing unions existing output-redirection facts from all recognized emitting bodies. It does not prove descriptor ordering, later call-site shielding or which definition executed; file writes and the existing any-redirection capture rule remain conservative (#1495; #1042).',
+    'helper-routing-stdout-stderr-redirection-capture': 'Helper routing unions existing output-redirection facts from all recognized emitting bodies. It does not prove descriptor ordering, later call-site shielding or which definition executed; file writes and the existing any-redirection capture rule remain conservative (#1495; #1042).',
 }
 
 
@@ -15094,6 +15522,37 @@ def _pragma_cases():
                 "pragma %s: a pragma WITH a reason was rejected (%s)"
                 % (cid, pragma_errors)
             )
+    # These harmless programs are parsed only. Preserve same-parent line
+    # siblings and exact continued owners while distinguishing a child claim.
+    for cid, body, continued, foreign_parent in [
+        ("deferred-same-parent-siblings",
+         "eval ':'; true # TOKEN_OUTPUT_EXEMPT: parser owner\n", False, False),
+        ("deferred-nested-same-parent-siblings",
+         "(\neval ':'; true # TOKEN_OUTPUT_EXEMPT: parser owner\n)\n",
+         False, False),
+        ("deferred-continued-owner",
+         "eval \\\n ':' # TOKEN_OUTPUT_EXEMPT: parser owner\n", True, False),
+        ("deferred-child-foreign-parent",
+         "eval \"$(true # TOKEN_OUTPUT_EXEMPT: parser child\n)\" ':'\n",
+         False, True),
+    ]:
+        lx = Lexer(body)
+        owners = [item for ll in lx.logical for item in ll.pragma_reasons]
+        deferred = [seg for ll in lx.logical for seg in ll.segments
+                    if _deferred_shell_operands(seg)]
+        if len(owners) != 1 or len(deferred) != 1:
+            failures.append("pragma %s: lost parser owner or deferred segment" % cid)
+            continue
+        lno, owner, _reason = owners[0]
+        seg = deferred[0]
+        if continued:
+            good = owner is seg and lno > seg.line
+        elif foreign_parent:
+            good = owner is not seg and lno == seg.line and owner.parent is not seg.parent
+        else:
+            good = owner is not seg and lno == seg.line and owner.parent is seg.parent
+        if not good:
+            failures.append("pragma %s: wrong physical-line/parent/continued owner" % cid)
     return failures
 
 

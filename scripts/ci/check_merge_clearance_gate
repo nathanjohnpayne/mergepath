@@ -356,8 +356,17 @@ if [ -f "$WORKFLOW" ]; then
         FAILED=1
         continue
       fi
-      if ! mcg_has "$mcg_pblock" 'gh api -X POST "repos/$REPO/check-runs"' \
-         || ! mcg_has "$mcg_pblock" '-f name="$CHECK_NAME"'; then
+      # #906's trusted sweep/dispatch use the narrow owned-generation helper.
+      # Runtime tests execute the actual callers and the helper together; this
+      # legacy text fence recognizes its exact tuple, not an arbitrary command.
+      mcg_owned_generation=0
+      if mcg_has "$mcg_pblock" '. scripts/workflow/required-check-generation.sh' \
+          && mcg_has "$mcg_pblock" 'generation_id=$(rcg_open "$REPO" "$PR" "$head_sha" "$CHECK_NAME")' \
+          && mcg_has "$mcg_pblock" 'rcg_close "$REPO" "$PR" "$head_sha" "$CHECK_NAME" "$generation_id" "$conclusion"'; then
+        mcg_owned_generation=1
+      fi
+      if [ "$mcg_owned_generation" -ne 1 ] && { ! mcg_has "$mcg_pblock" 'gh api -X POST "repos/$REPO/check-runs"' \
+         || ! mcg_has "$mcg_pblock" '-f name="$CHECK_NAME"'; }; then
         echo "FAIL: the '$mcg_producer' job must POST a check_run under CHECK_NAME."
         echo "      A POST without the name flag, or a CHECK_NAME declaration without"
         echo "      a POST, leaves that trigger path no longer refreshing the required"
@@ -406,7 +415,7 @@ if [ -f "$WORKFLOW" ]; then
         echo "      (a gh read loop or gh pr list), not from an arbitrary assignment."
         FAILED=1
       fi
-      if ! grep -qE -- '-f head_sha="\$(HEAD_SHA|head_sha)"' <<<"$mcg_pblock"; then
+      if [ "$mcg_owned_generation" -ne 1 ] && ! grep -qE -- '-f head_sha="\$(HEAD_SHA|head_sha)"' <<<"$mcg_pblock"; then
         echo "FAIL: the '$mcg_producer' job must POST head_sha as the per-PR head it"
         echo "      resolved (a shell variable), not a workflow expression. The Checks"
         echo "      API rejects a create-check-run without head_sha at all, and a"
@@ -439,7 +448,7 @@ if [ -f "$WORKFLOW" ]; then
       # The POST must publish the MAPPED value (Codex P2 on #849). Pinning the
       # case arms proves the mapping exists; it says nothing about what the
       # POST actually sends, and -f conclusion="success" satisfied both.
-      if ! mcg_has "$mcg_pblock" '-f conclusion="$conclusion"'; then
+      if [ "$mcg_owned_generation" -ne 1 ] && ! mcg_has "$mcg_pblock" '-f conclusion="$conclusion"'; then
         echo "FAIL: the '$mcg_producer' job must POST -f conclusion=\"\$conclusion\" —"
         echo "      the value it mapped from the gate. A literal publishes a verdict"
         echo "      the mapping never produced."

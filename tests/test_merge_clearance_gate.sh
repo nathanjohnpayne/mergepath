@@ -445,6 +445,54 @@ mcg_step_body() {  # workflow step-name -> real run body
   ' "$1"
 }
 
+# Fake only the Git/API boundary while trusted runtime tests execute #906's
+# canonical owned-generation helper. Shared by Test23 and nested Test30;
+# producer/reader interleaving controls live in test_required_check_generations.py.
+mcg_generation_fixture() { # scratch directory
+  mkdir -p "$1/bin" "$1/wd/scripts/workflow"
+  cp "$ROOT/scripts/workflow/required-check-generation.sh" "$1/wd/scripts/workflow/"
+  cat > "$1/bin/git" <<'STUB'
+#!/bin/sh
+printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+STUB
+  cat > "$1/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$GH_LOG"
+case "$*" in
+  *'-X POST'*)
+    [ "${DENY_WRITES:-1}" = 0 ] || exit 89
+    [ "${GH_WRITE_FAIL:-0}" = 0 ] || exit 1
+    name=''; head=''; summary=''
+    for field in "$@"; do
+      case "$field" in
+        name=*) name=${field#name=} ;;
+        head_sha=*) head=${field#head_sha=} ;;
+        'output[summary]='*) summary=${field#*=} ;;
+      esac
+    done
+    jq -nc --arg head "$head" --arg name "$name" --arg summary "$summary" \
+      '{id:42,head_sha:$head,name:$name,status:"in_progress",output:{summary:$summary}}' > "$GH_LOG.generation"
+    cat "$GH_LOG.generation" ;;
+  *'-X PATCH'*)
+    [ "${DENY_WRITES:-1}" = 0 ] || exit 89
+    [ "${GH_WRITE_FAIL:-0}" = 0 ] || exit 1 ;;
+  'pr list '*)
+    if [[ "$*" == *select* ]]; then
+      printf '%s\n' "$FIXTURE_ROWS" | cut -f2
+    else
+      printf '%s\n' "$FIXTURE_ROWS"
+    fi ;;
+  *'/check-runs/42'*) cat "$GH_LOG.generation" ;;
+  *'/commits/HEAD'*) printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
+  *'/pulls/7 '*) printf '%s\n' "$GENERATION_HEAD" ;;
+  *'/pulls '*) printf '7\n' ;;
+  *) echo "Unexpected generation fixture API call: $*" >&2; exit 88 ;;
+esac
+STUB
+  chmod +x "$1/bin/gh" "$1/bin/git"
+}
+
 # Test 1: Dependabot, reviewer_gate disabled → exit 0, no reviews API call.
 # ---------------------------------------------------------------------------
 echo; echo "--- Test 1: Dependabot, gate disabled"
@@ -1138,7 +1186,7 @@ fi
 echo; echo "--- Test 13: missing GH_TOKEN"
 SCRATCH=$(make_scratch true true)
 set +e
-OUT=$(cd "$SCRATCH" && PATH="$STUB_DIR:$PATH" "$SCRIPT" 99 owner/repo 2>&1)
+OUT=$(cd "$SCRATCH" && env -u GH_TOKEN -u GITHUB_TOKEN PATH="$STUB_DIR:$PATH" "$SCRIPT" 99 owner/repo 2>&1)
 RC=$?
 set -e
 if [ "$RC" = 2 ] && echo "$OUT" | grep -q "GH_TOKEN is required"; then
@@ -1707,22 +1755,15 @@ if [ -f "$WF_841" ]; then
   echo; echo "--- Test 23 (#1547): read-only native and retained trusted writers"
   T23="$(mktemp -d "${TMPDIR:-/tmp}/mcg1547.XXXXXX")"
   mkdir -p "$T23/bin" "$T23/wd/scripts"
-  cat > "$T23/bin/gh" <<'STUB'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$GH_LOG"
-case "$*" in
-  *'-X POST'*|*'-X PATCH'*)
-    [ "${DENY_WRITES:-1}" = 0 ] || exit 89
-    [ "${GH_WRITE_FAIL:-0}" = 0 ] || exit 1
-    printf '{}\n'; exit 0 ;;
-  'pr list '*)
-    if [[ "$*" == *select* ]]; then printf '%s\n' "$FIXTURE_ROWS" | cut -f2; else printf '%s\n' "$FIXTURE_ROWS"; fi
-    exit 0 ;;
-esac
-printf '{}\n'
-STUB
+  mcg_generation_fixture "$T23"
   cat > "$T23/wd/scripts/merge-clearance-gate.sh" <<'STUB'
 #!/usr/bin/env bash
+# Trusted evaluation may start only after the real helper opened its hold;
+# the read-only native invocation has no such publisher duty.
+if [ "${DENY_WRITES:-1}" = 0 ]; then
+  [ -s "$GH_LOG.generation" ] || exit 88
+  jq -e '.id == 42 and .status == "in_progress"' "$GH_LOG.generation" >/dev/null || exit 88
+fi
 printf '%s\n' "${T23_GATE_TEXT:-Merge clearance: PASS}"
 exit "${T23_GATE_RC:-0}"
 STUB
@@ -1758,7 +1799,7 @@ STUB
     for code23 in 0 1 2; do
       : > "$T23/gh.log"
       set +e
-      DENY_WRITES=0 T23_GATE_RC="$code23" PR=7 REPO=o/r CHECK_NAME='Merge clearance gate' \
+      DENY_WRITES=0 GENERATION_HEAD="$SHA23" T23_GATE_RC="$code23" PR=7 REPO=o/r CHECK_NAME='Merge clearance gate' \
         PRS="$(printf '7\t%s' "$SHA23")" FIXTURE_ROWS="$(printf '7\t%s' "$SHA23")" \
         run23 "$body23" >"$T23/$writer-$code23.out" 2>&1
       rc23=$?
@@ -1775,7 +1816,7 @@ STUB
     done
     : > "$T23/gh.log"
     set +e
-    DENY_WRITES=0 GH_WRITE_FAIL=1 T23_GATE_RC=0 PR=7 REPO=o/r CHECK_NAME='Merge clearance gate' \
+    DENY_WRITES=0 GENERATION_HEAD="$SHA23" GH_WRITE_FAIL=1 T23_GATE_RC=0 PR=7 REPO=o/r CHECK_NAME='Merge clearance gate' \
       PRS="$(printf '7\t%s' "$SHA23")" FIXTURE_ROWS="$(printf '7\t%s' "$SHA23")" \
       run23 "$body23" >/dev/null 2>&1
     [ "$?" != 0 ] || bad="$bad ignored-publication-failure"
@@ -1860,13 +1901,14 @@ mcg22_case K 's{HEAD_SHA: \$\{\{ github.event.pull_request.head.sha \}\}}{HEAD_S
 # L and M are the two halves of the same assertion, and they fail in OPPOSITE
 # directions — which is why the producer check has to be a conjunction, per
 # scope, rather than a count of either half.
-# L — delete a producer's POST but keep its CHECK_NAME env. A name-count
-#     assertion still sees three and passes (Codex P2 on #849).
-mcg22_case L 's{(  scheduled-sweep:.*?)gh api -X POST "repos/\$REPO/check-runs"}{$1true #}s' fail 'must POST a check_run under CHECK_NAME'
-# M — keep a POST but publish a DIFFERENT check name. A POST-count assertion
-#     still sees three and passes, while that trigger path has stopped
-#     refreshing this required context (CodeRabbit Major on #849).
-mcg22_case M 's{(.*)-f name="\$CHECK_NAME"}{$1-f name="Some Other Check"}s' fail 'must POST a check_run under CHECK_NAME'
+# L — delete a trusted producer's owned completion but keep CHECK_NAME and
+#     its opening. The named producer assertion must reject the missing write.
+mcg22_case L 's{(  scheduled-sweep:.*?)rcg_close "\$REPO" "\$PR" "\$head_sha" "\$CHECK_NAME" "\$generation_id" "\$conclusion"}{$1true #}s' fail 'must POST a check_run under CHECK_NAME'
+# M — keep the completion but pass a DIFFERENT context to the canonical
+#     helper. An unrelated publication does not refresh this required context.
+# Greedy capture targets the last (dispatch) producer, independently of L.
+mcg22_case M 's{(.*)rcg_close "\$REPO" "\$PR" "\$head_sha" "\$CHECK_NAME"}{$1rcg_close "\$REPO" "\$PR" "\$head_sha" "Some Other Check"}s' fail 'must POST a check_run under CHECK_NAME'
+
 # I — positive control.
 mcg22_case I '' pass
 
@@ -3722,16 +3764,16 @@ rcp_case head-post-quoted-arg \
   's{-f head_sha="\$HEAD_SHA" \\}{-f "head_sha=\$GITHUB_SHA" \\}' \
   fail 'a check-run POST binds head_sha='
 rcp_case head-post-typed-flag \
-  's{-f head_sha="\$hd" \\}{-F head_sha="\$GITHUB_SHA" \\}' \
+  's{-f head_sha="\$HEAD_SHA" \\}{-F head_sha="\$GITHUB_SHA" \\}' \
   fail 'a check-run POST binds head_sha='
 rcp_case head-post-long-flag \
-  's{-f head_sha="\$RUN_HEAD" \\}{--field head_sha="\$GITHUB_SHA" \\}' \
+  's{-f head_sha="\$HEAD_SHA" \\}{--field head_sha="\$GITHUB_SHA" \\}' \
   fail 'a check-run POST binds head_sha='
 # Non-vacuity in the other direction: judging the VALUE, not the spelling.
 # A respelled site that still binds an allowlisted variable is legal, and a
 # fence that reddened on it would be trading one leak for a false positive.
 rcp_case head-post-respelled-legal \
-  's{-f head_sha="\$head" \\}{-f "head_sha=\$head" \\}' \
+  's{-f head_sha="\$HEAD_SHA" \\}{-f "head_sha=\$HEAD_SHA" \\}' \
   pass
 # The count is pinned alongside the allowlist so a NEW POST cannot arrive
 # without its head binding being read — an added site binds an allowlisted
@@ -3750,18 +3792,18 @@ rcp_case head-post-count \
 # against a broken fence is not coverage.
 #
 # 1. Removal direction: commenting a binding site out must drop the count to
-#    4. Unstripped, the count would still read 5 and the fence would go
+#    0. Unstripped, the count would still read 1 and the fence would go
 #    green while the site was gone — certifying a shape it never saw.
 rcp_case head-comment-full \
-  's{^([ \t]*)(-f head_sha="\$RUN_HEAD" \\)$}{$1# $2}m' \
+  's{^([ \t]*)(-f head_sha="\$HEAD_SHA" \\)$}{$1# $2}m' \
   fail '[rcp head binding count]'
 # 2. Addition direction, INLINE (`[ \t]#` — a comment after code), and it
 #    must PASS: a commented-out off-allowlist binding is prose, not a
-#    binding. Unstripped it reads as a sixth site binding $GITHUB_SHA and
+#    binding. Unstripped it reads as an additional site binding $GITHUB_SHA and
 #    trips both the allowlist and the count — a false positive on a file
 #    whose own style is to explain each POST beside it.
 rcp_case head-comment-inline \
-  's{^([ \t]*-f head_sha="\$head" \\)$}{$1 # -f head_sha="\$GITHUB_SHA"}m' \
+  's{^([ \t]*-f head_sha="\$HEAD_SHA" \\)$}{$1 # -f head_sha="\$GITHUB_SHA"}m' \
   pass
 # 3. Addition direction, COLUMN 0 (`^[ \t]*#` — a whole-line comment). This
 #    is the case the inline regex cannot cover: it requires whitespace
@@ -4600,10 +4642,10 @@ rcp_dir_case due-cron-unreadable \
   fail 'carries no single'
 # ── budget-guard knobs ──────────────────────────────────────────────────
 rcp_case budget-per-pr-malformed \
-  's{BUDGET_PER_PR_REQUESTS: "40"}{BUDGET_PER_PR_REQUESTS: "forty"}' \
+  's{BUDGET_PER_PR_REQUESTS: "60"}{BUDGET_PER_PR_REQUESTS: "forty"}' \
   fail '[rcp budget guard]'
 rcp_case budget-per-pr-zero \
-  's{BUDGET_PER_PR_REQUESTS: "40"}{BUDGET_PER_PR_REQUESTS: "0"}' \
+  's{BUDGET_PER_PR_REQUESTS: "60"}{BUDGET_PER_PR_REQUESTS: "0"}' \
   fail '[rcp budget guard]'
 rcp_case budget-reserve-missing \
   's{^          BUDGET_RESERVE_REQUESTS: "100"\n}{}m' \
@@ -4965,12 +5007,7 @@ echo; echo "--- Test 30e (#2247): several pending events, then clearance, reach 
 # cleared one. A stand-in for GitHub's combination of the two lineages: the
 # head blocks while ANY job-native run of the context failed (each sits in its
 # own suite and is never retired) or the newest Checks-API run is not green.
-cat > "$T30/bin/gh" <<'STUB'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$GH_LOG"
-printf '{}\n'
-STUB
-chmod +x "$T30/bin/gh"
+mcg_generation_fixture "$T30"
 bad=""
 native_failures=0
 api_latest=""
@@ -4993,7 +5030,8 @@ t30_event() {  # <gate-rc> <line> <write> -> updates native_failures, api_latest
   set -e
   [ "$rc" = 0 ] || native_failures=$((native_failures + 1))
   : > "$T30/gh.log"
-  PRS="$(printf '7\t%s' "$SHA30")" PR=7 REPO=o/r CHECK_NAME='Merge clearance gate' \
+  DENY_WRITES=0 GENERATION_HEAD="$SHA30" FIXTURE_ROWS="$(printf '7\t%s' "$SHA30")" \
+    PRS="$(printf '7\t%s' "$SHA30")" PR=7 REPO=o/r CHECK_NAME='Merge clearance gate' \
     T30_RC="$1" T30_LINE="$2" T30_WRITE='' t30_run "$SWEEP_BODY" >/dev/null
   if grep -q 'conclusion=success' "$T30/gh.log"; then api_latest=success; else api_latest=failure; fi
 }

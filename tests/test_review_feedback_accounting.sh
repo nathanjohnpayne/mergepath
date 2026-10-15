@@ -2169,6 +2169,33 @@ run_gate
 assert_eq 1 "$RUN_RC" "CodeRabbit finding outside sanitized regions still blocks"
 assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "sanitized CodeRabbit body preserves the real finding tier"
 
+# #1407: warning headings cannot manufacture a P1 inventory obligation, and
+# removing the warning glyph alone must not leave an invented P3 category.
+cp "$TMP/fixtures/reviews.json" "$TMP/fixtures/reviews.before-headings.json"
+for heading in '> **⚠️ Outside diff range comments (1)**' \
+  '<summary>Outside diff range comments (1)</summary>'; do
+  jq --arg heading "$heading" '.[0].body = ($heading + "\n> <details>\n> <summary><strong>🟡 Minor</strong> · Restrict Phase 0 preflight to local sessions.</summary><blockquote>\n> </blockquote></details>")' \
+    "$TMP/fixtures/reviews.json" >"$TMP/fixtures/reviews.next"
+  mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "outside-diff container retains the real unaccounted finding"
+  assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "outside-diff container inventories one review-body finding"
+  assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "outside-diff heading does not change nested Minor severity"
+  assert_eq "$(jq -r '.[0].body' "$TMP/fixtures/reviews.json")" \
+    "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].body')" "outside-diff classification preserves original review text"
+  expected_fingerprint=$(printf '%s' "$(jq -c '.[0].body' "$TMP/fixtures/reviews.json")" | archive_test_sha | cut -c 1-12)
+  assert_eq "$expected_fingerprint" "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].body_fingerprint')" \
+    "outside-diff acknowledgement fingerprint retains the original heading"
+
+  jq '.[0].body += "\n_🟠 Major_ Real required finding in the same container."' \
+    "$TMP/fixtures/reviews.json" >"$TMP/fixtures/reviews.next"
+  mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "outside-diff container still blocks on nested Major"
+  assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "outside-diff container preserves strongest real finding"
+done
+mv "$TMP/fixtures/reviews.before-headings.json" "$TMP/fixtures/reviews.json"
+
 # An unmatched pre-merge-check START earlier in the body must not extend the
 # later, properly paired block back over the intervening text. Pairing on the
 # FIRST start swallowed a real Major badge sitting between the two markers and

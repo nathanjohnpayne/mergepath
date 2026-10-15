@@ -283,6 +283,7 @@ jobs:
           COMMENT_PR: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
+          . scripts/workflow/required-check-generation.sh
           # issue_comment path (#832): re-evaluate ONLY the PR that received
           # the comment. Sweeping all open PRs on every PR comment would turn
           # ordinary conversation into a repo-wide gate re-run.
@@ -351,6 +352,7 @@ jobs:
           REQUIRE_REVIEW_SUMMARY: "true"
         run: |
           set -euo pipefail
+          . scripts/workflow/required-check-generation.sh
           # Bootstrap (see the event-driven job): the trusted script is run from
           # the default-branch checkout. Until this gate merges to the default
           # branch the script is absent there, so the sweep has nothing to run —
@@ -363,6 +365,13 @@ jobs:
           while IFS= read -r PR; do
             [ -z "$PR" ] && continue
             echo "::group::Sweep PR #$PR"
+
+            head_sha=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha) || { had_infra_error=1; echo "::endgroup::"; continue; }
+            if ! generation_id=$(rcg_open "$REPO" "$PR" "$head_sha" "$CHECK_NAME"); then
+              had_infra_error=1
+              echo "::endgroup::"
+              continue
+            fi
 
             # Look up the PR's head SHA so the check_run lands on the
             # branch-protection-relevant commit (NOT the schedule's
@@ -494,6 +503,11 @@ jobs:
             pre_fp_rc=$?
             set -e
 
+            CR_EVIDENCE_REPORT=$(mktemp) || { had_infra_error=1; echo "::endgroup::"; continue; }
+            export CR_EVIDENCE_REPORT
+            CR_EVIDENCE_FAILURE=""
+            [ "$pre_fp_rc" -eq 0 ] || CR_EVIDENCE_FAILURE="fingerprint-read-failed"
+            export CR_EVIDENCE_FAILURE
             set +e
             output=$(scripts/coderabbit-severity-gate.sh "$PR" "$REPO" 2>&1)
             rc=$?
@@ -529,37 +543,30 @@ jobs:
             esac
             if [ "$gate_infra_error" -eq 0 ] \
               && { [ "$pre_fp_rc" -ne 0 ] || [ "$post_fp_rc" -ne 0 ]; }; then
-              echo "::warning::PR #$PR comment surface could not be fingerprinted before and after the gate; skipping this publication for a fresh retry"
-              echo "::endgroup::"
-              continue
+              echo "::error::PR #$PR comment surface could not be fingerprinted; closing only this generation red."
+              if [ "$rc" -eq 0 ]; then
+                : >"$CR_EVIDENCE_REPORT"
+                set +e
+                output=$(CR_EVIDENCE_FAILURE="fingerprint-read-failed" scripts/coderabbit-severity-gate.sh "$PR" "$REPO" 2>&1)
+                rc=$?
+                set -e
+              fi
+              had_infra_error=1
             fi
             if [ "$gate_infra_error" -eq 0 ] && [ "$pre_fp" != "$post_fp" ]; then
               # Deliberately a NOTICE, not a warning or error: a superseded
               # snapshot is the guard working, not a failure. The run that
               # caused the change publishes the current verdict.
-              echo "::notice::PR #$PR comment surface changed while the gate ran; skipping this publication so the newer run's verdict stands"
-              echo "::endgroup::"
-              continue
+              echo "::notice::PR #$PR comment surface changed while the gate ran; closing this generation red for a fresh evaluation."
+              : >"$CR_EVIDENCE_REPORT"
+              rc=2
+              had_infra_error=1
             fi
 
-            if [ "$rc" -eq 3 ]; then
-              # The ONE case where declining to publish is correct. A review run
-              # is on this head and its PR-level summary has not landed, so the
-              # findings on that surface are not knowable yet — and the only
-              # verdict this sweep could compute is read off the PREVIOUS
-              # publication. Publishing success would overwrite the event-driven
-              # run's red with a stale clean read; publishing failure would let
-              # this arm pin a required check red with no ack channel and no
-              # break-glass under `enforce_admins: true`. Skipping leaves the
-              # event run's verdict standing and self-clears on the next sweep
-              # once the summary publishes (#886).
-              echo "::notice::PR #$PR has a current-HEAD CodeRabbit review awaiting its PR-level summary; skipping this publication so the review run's verdict stands"
-              echo "::endgroup::"
-              continue
-            fi
             case "$rc" in
               0) conclusion="success" ;;
               1) conclusion="failure" ;;
+              3) conclusion="failure" ;;
               *)
                 # rc 2 PUBLISHES A FAILURE, it does not skip (Codex P1 round 6
                 # on #886). Skipping left whatever check_run was already on the
@@ -591,14 +598,8 @@ jobs:
             # supersedes the stale red required-check after a UI
             # thread-resolve. If the POST fails, the sweep did not do its
             # job; that's an infra error, not a warning.
-            if ! gh api -X POST "repos/$REPO/check-runs" \
-              -f name="$CHECK_NAME" \
-              -f head_sha="$head_sha" \
-              -f status="completed" \
-              -f conclusion="$conclusion" \
-              -f "output[title]=CodeRabbit severity gate (scheduled re-evaluation)" \
-              -f "output[summary]=$summary" \
-              >/dev/null; then
+            if ! rcg_close "$REPO" "$PR" "$head_sha" "$CHECK_NAME" "$generation_id" "$conclusion" \
+              "CodeRabbit severity gate (scheduled re-evaluation)" "$summary"; then
               echo "::error::Failed to post check_run for PR #$PR — stale required check not refreshed."
               had_infra_error=1
             fi

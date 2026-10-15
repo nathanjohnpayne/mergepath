@@ -1207,9 +1207,9 @@ jobs:
               hasLabel,
             });
 
-            if (decision !== 'noop') {
-              // Fence both writers against a push, base update or retarget
-              // during the reads above. Failure preserves the existing hold.
+            if (decision === 'apply') {
+              // Fence the application against a push, base update or retarget
+              // during the reads above. Failure preserves the existing state.
               // GitHub's subsequent write is not atomic with this observation.
               const writerPair = await readLivePair();
               if (writerPair.head !== classifiedPair.head || writerPair.base !== classifiedPair.base ||
@@ -1234,26 +1234,10 @@ jobs:
                 body: '**Agent disagreement detected.** One reviewer approved and another requested changes on the current HEAD. Escalating to @nathanjohnpayne for human tiebreaker per REVIEW_POLICY.md.',
               });
             } else if (decision === 'remove') {
-              // No live disagreement on the current HEAD — remove the
-              // label. Covers the #259 case: a stale CHANGES_REQUESTED
-              // on an older SHA is superseded by an APPROVED on HEAD.
-              try {
-                await github.rest.issues.removeLabel({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: context.payload.pull_request.number,
-                  name: 'needs-human-review',
-                });
-                await github.rest.issues.createComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: context.payload.pull_request.number,
-                  body: '**Agent disagreement resolved.** No live conflict on the current HEAD (latest review per reviewer, non-DISMISSED, commit_id == HEAD). Removing `needs-human-review` label.',
-                });
-              } catch (e) {
-                // Label may already be removed — ignore 404
-                if (e.status !== 404) throw e;
-              }
+              // The classifier can observe agreement, but it cannot release a
+              // human-action hold. REVIEW_POLICY.md makes needs-human-review
+              // manual-only even after the underlying disagreement clears.
+              core.notice('No live reviewer conflict on the current HEAD; retaining needs-human-review for human release per REVIEW_POLICY.md.');
             }
             // decision === 'noop' — nothing to do.
 
