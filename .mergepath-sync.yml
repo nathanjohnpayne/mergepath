@@ -728,6 +728,8 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/workflow/coderabbit-evidence-recovery.py"
+      - "scripts/coderabbit-wait.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
       - "scripts/lib/coderabbit-fence.sh"  # #1178, was inline here until the waiter needed it too
@@ -2247,6 +2249,7 @@ paths:
     # no-op (always green) when coderabbit.severity_gate.enabled is unset
     # (the default everywhere), so it is safe to add as a required check.
     requires:
+      - "scripts/workflow/required-check-generation.sh"
       - "scripts/coderabbit-severity-gate.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
   - path: .github/workflows/merge-clearance-gate.yml
@@ -2258,6 +2261,7 @@ paths:
     # those scripts fails-closed on `command not found`. Same coupling
     # class as codex-p1-gate.yml above (#427/#428).
     requires:
+      - "scripts/workflow/required-check-generation.sh"
       - "scripts/merge-clearance-gate.sh"
       - "scripts/codex-review-check.sh"
   - path: .github/workflows/required-check-publisher.yml
@@ -2269,6 +2273,8 @@ paths:
     # scripts directly — same coupling class as the gate-workflow
     # entries above; missing scripts fail-closed on missing-file.
     requires:
+      - "scripts/workflow/required-check-generation.sh"
+      - "scripts/workflow/coderabbit-evidence-recovery.py"
       # The parent workflow is the trigger source: workflow_run fires only
       # on its exact top-level name, so a consumer missing (or renaming)
       # it gets no event-driven publishes at all (cross-agent round 3 on
@@ -2374,6 +2380,17 @@ paths:
     # depend on these files as one versioned package; consumer repos may add
     # local notes/scripts in this directory without forking the canonical
     # files.
+  - path: tests/test_required_check_generations.py
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/required-check-generation.sh"
+      - "scripts/workflow/coderabbit-evidence-recovery.py"
+      - "scripts/codex-review-check.sh"
+      - ".github/workflows/required-check-publisher.yml"
+      - ".github/workflows/merge-clearance-gate.yml"
+      - ".github/workflows/coderabbit-severity-gate.yml"
+
   - path: scripts/ci/
     type: kit
     consumers: all
@@ -2384,6 +2401,7 @@ paths:
     # closure gap that surfaced as #264 on the original propagation
     # wave (check_gh_as_author missing its tests on every consumer).
     requires:
+      - "tests/test_required_check_generations.py"
       - "tests/test_feedback_archive_identities.sh"   # #1437, offline enrollment and producer/relay cases
       - "scripts/lib/feedback-archive-identities.sh"   # #1437, direct CI-kit runtime closure
       - "scripts/workflow/merge-writer.py"

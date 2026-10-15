@@ -3000,11 +3000,12 @@ SWEEP_JOB=$(awk '
 ' "$ROOT/.github/workflows/coderabbit-severity-gate.yml")
 if grep -Fq 'REQUIRE_REVIEW_SUMMARY: "true"' <<<"$SWEEP_JOB" \
     && grep -Fq 'if [ "$rc" -eq 3 ]; then' "$ROOT/.github/workflows/coderabbit-severity-gate.yml" \
-    && grep -Fq "skipping this publication so the review run's verdict stands" "$ROOT/.github/workflows/coderabbit-severity-gate.yml" \
+    && grep -Fq '3) conclusion="failure" ;;' <<<"$SWEEP_JOB" \
+    && grep -Fq 'rcg_close "$REPO"' <<<"$SWEEP_JOB" \
     && grep -Fq "holding this run non-green until it does" "$ROOT/.github/workflows/coderabbit-severity-gate.yml"; then
-  pass "the sweep opts into the hold and skips publication; the event-driven job goes non-green"
+  pass "the sweep closes only its owned hold red; the event-driven job goes non-green"
 else
-  fail "expected the sweep to set REQUIRE_REVIEW_SUMMARY and skip on rc 3, and the event job to fail on it"
+  fail "expected both publishers to retain the rc-3 evidence hold without a clean verdict"
 fi
 
 # A CodeRabbit conversational REPLY creates a head-pinned COMMENTED review
@@ -3801,13 +3802,13 @@ if ! grep -Fq '__unreadable__' "$WORKFLOW" \
     && grep -Fq '{ [ "$pre_fp_rc" -ne 0 ] || [ "$post_fp_rc" -ne 0 ]; }; then' "$WORKFLOW" \
     && awk '
       /\{ \[ "\$pre_fp_rc" -ne 0 \] \|\| \[ "\$post_fp_rc" -ne 0 \]; \}; then/ { guarding=1; next }
-      guarding && /continue/ { found=1; exit }
+      guarding && /CR_EVIDENCE_FAILURE="fingerprint-read-failed"/ { found=1; exit }
       guarding && /^            fi/ { exit }
       END { exit(found ? 0 : 1) }
     ' "$WORKFLOW"; then
-  pass "unreadable fingerprint snapshots skip publication without a random sentinel"
+  pass "unreadable fingerprint snapshots close only their owned generation red without a random sentinel"
 else
-  fail "workflow must retain fingerprint read status and continue on either read failure"
+  fail "workflow must retain fingerprint read status and fail the owned generation on either read failure"
 fi
 
 # ---------------------------------------------------------------------------

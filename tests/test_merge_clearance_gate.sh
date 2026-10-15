@@ -1128,7 +1128,7 @@ fi
 echo; echo "--- Test 13: missing GH_TOKEN"
 SCRATCH=$(make_scratch true true)
 set +e
-OUT=$(cd "$SCRATCH" && PATH="$STUB_DIR:$PATH" "$SCRIPT" 99 owner/repo 2>&1)
+OUT=$(cd "$SCRATCH" && env -u GH_TOKEN -u GITHUB_TOKEN PATH="$STUB_DIR:$PATH" "$SCRIPT" 99 owner/repo 2>&1)
 RC=$?
 set -e
 if [ "$RC" = 2 ] && echo "$OUT" | grep -q "GH_TOKEN is required"; then
@@ -1740,6 +1740,7 @@ if [ "$1" = api ]; then
     *"-X POST"*)
       [ "${GH_POST_FAIL:-0}" = 1 ] && exit 1
       printf '%s\n' "${GH_POST_ID:-42}"; exit 0 ;;
+    *"/commits/HEAD"*) printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; exit 0 ;;
     *"-X PATCH"*)
       [ "${GH_PATCH_FAIL:-0}" = 1 ] && exit 1
       exit 0 ;;
@@ -1752,6 +1753,8 @@ if [ "$1" = pr ] && [ "$2" = view ]; then
 fi
 exit 0
 STUB
+  printf '#!/bin/sh\necho bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' > "$T23/bin/git"
+  chmod +x "$T23/bin/git"
   # No-op sleep: the retry loops would otherwise burn ~2 minutes of real time.
   printf '#!/bin/sh\nexit 0\n' > "$T23/bin/sleep"
   chmod +x "$T23/bin/gh" "$T23/bin/sleep"
@@ -3877,16 +3880,16 @@ rcp_case head-post-quoted-arg \
   's{-f head_sha="\$HEAD_SHA" \\}{-f "head_sha=\$GITHUB_SHA" \\}' \
   fail 'a check-run POST binds head_sha='
 rcp_case head-post-typed-flag \
-  's{-f head_sha="\$hd" \\}{-F head_sha="\$GITHUB_SHA" \\}' \
+  's{-f head_sha="\$HEAD_SHA" \\}{-F head_sha="\$GITHUB_SHA" \\}' \
   fail 'a check-run POST binds head_sha='
 rcp_case head-post-long-flag \
-  's{-f head_sha="\$RUN_HEAD" \\}{--field head_sha="\$GITHUB_SHA" \\}' \
+  's{-f head_sha="\$HEAD_SHA" \\}{--field head_sha="\$GITHUB_SHA" \\}' \
   fail 'a check-run POST binds head_sha='
 # Non-vacuity in the other direction: judging the VALUE, not the spelling.
 # A respelled site that still binds an allowlisted variable is legal, and a
 # fence that reddened on it would be trading one leak for a false positive.
 rcp_case head-post-respelled-legal \
-  's{-f head_sha="\$head" \\}{-f "head_sha=\$head" \\}' \
+  's{-f head_sha="\$HEAD_SHA" \\}{-f "head_sha=\$HEAD_SHA" \\}' \
   pass
 # The count is pinned alongside the allowlist so a NEW POST cannot arrive
 # without its head binding being read — an added site binds an allowlisted
@@ -3905,18 +3908,18 @@ rcp_case head-post-count \
 # against a broken fence is not coverage.
 #
 # 1. Removal direction: commenting a binding site out must drop the count to
-#    4. Unstripped, the count would still read 5 and the fence would go
+#    0. Unstripped, the count would still read 1 and the fence would go
 #    green while the site was gone — certifying a shape it never saw.
 rcp_case head-comment-full \
-  's{^([ \t]*)(-f head_sha="\$RUN_HEAD" \\)$}{$1# $2}m' \
+  's{^([ \t]*)(-f head_sha="\$HEAD_SHA" \\)$}{$1# $2}m' \
   fail '[rcp head binding count]'
 # 2. Addition direction, INLINE (`[ \t]#` — a comment after code), and it
 #    must PASS: a commented-out off-allowlist binding is prose, not a
-#    binding. Unstripped it reads as a sixth site binding $GITHUB_SHA and
+#    binding. Unstripped it reads as an additional site binding $GITHUB_SHA and
 #    trips both the allowlist and the count — a false positive on a file
 #    whose own style is to explain each POST beside it.
 rcp_case head-comment-inline \
-  's{^([ \t]*-f head_sha="\$head" \\)$}{$1 # -f head_sha="\$GITHUB_SHA"}m' \
+  's{^([ \t]*-f head_sha="\$HEAD_SHA" \\)$}{$1 # -f head_sha="\$GITHUB_SHA"}m' \
   pass
 # 3. Addition direction, COLUMN 0 (`^[ \t]*#` — a whole-line comment). This
 #    is the case the inline regex cannot cover: it requires whitespace
@@ -4756,10 +4759,10 @@ rcp_dir_case due-cron-unreadable \
   fail 'carries no single'
 # ── budget-guard knobs ──────────────────────────────────────────────────
 rcp_case budget-per-pr-malformed \
-  's{BUDGET_PER_PR_REQUESTS: "40"}{BUDGET_PER_PR_REQUESTS: "forty"}' \
+  's{BUDGET_PER_PR_REQUESTS: "60"}{BUDGET_PER_PR_REQUESTS: "forty"}' \
   fail '[rcp budget guard]'
 rcp_case budget-per-pr-zero \
-  's{BUDGET_PER_PR_REQUESTS: "40"}{BUDGET_PER_PR_REQUESTS: "0"}' \
+  's{BUDGET_PER_PR_REQUESTS: "60"}{BUDGET_PER_PR_REQUESTS: "0"}' \
   fail '[rcp budget guard]'
 rcp_case budget-reserve-missing \
   's{^          BUDGET_RESERVE_REQUESTS: "100"\n}{}m' \

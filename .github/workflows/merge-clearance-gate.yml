@@ -339,7 +339,13 @@ jobs:
           # paginated calls, and a PR past position 500 reads as unknown).
           current=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
                       --json headRefOid --jq .headRefOid 2>/dev/null || true)
-          if [ "$current" != "$HEAD_SHA" ]; then
+          trusted_revision=$(git rev-parse HEAD 2>/dev/null || true)
+          current_trusted=$(gh api "repos/$REPO/commits/HEAD" --jq .sha 2>/dev/null || true)
+          if [ -z "$trusted_revision" ] || [ "$current_trusted" != "$trusted_revision" ]; then
+            conclusion="failure"
+            title="Merge clearance gate — trusted revision changed or unreadable"
+            summary="$title"
+          elif [ "$current" != "$HEAD_SHA" ]; then
             # Head moved, or could not be read. Do NOT publish nothing: a
             # silent skip leaves whatever verdict is standing on $HEAD_SHA, and
             # a force-push back to $HEAD_SHA would then merge on it. Close the
@@ -440,6 +446,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          . scripts/workflow/required-check-generation.sh
           # List ALL open PRs. The gate script itself short-circuits to a
           # clean pass when both per-class knobs are off, so we don't
           # filter by label/author here. `--limit 500` mirrors
@@ -489,6 +496,7 @@ jobs:
           CHECK_NAME: "Merge clearance gate"
         run: |
           set -euo pipefail
+          . scripts/workflow/required-check-generation.sh
           had_infra_error=0
           while IFS=$'\t' read -r PR head_sha; do
             [ -z "$PR" ] && continue
@@ -509,6 +517,11 @@ jobs:
               continue
             fi
 
+            if ! generation_id=$(rcg_open "$REPO" "$PR" "$head_sha" "$CHECK_NAME"); then
+              had_infra_error=1
+              echo "::endgroup::"
+              continue
+            fi
             set +e
             output=$(scripts/merge-clearance-gate.sh "$PR" "$REPO" 2>&1)
             rc=$?
@@ -551,14 +564,7 @@ jobs:
             # clearance transition (or pins a fail-closed red on infra
             # error). A failed POST means the sweep did not do its job;
             # that's an infra error.
-            if ! gh api -X POST "repos/$REPO/check-runs" \
-              -f name="$CHECK_NAME" \
-              -f head_sha="$head_sha" \
-              -f status="completed" \
-              -f conclusion="$conclusion" \
-              -f "output[title]=$check_title" \
-              -f "output[summary]=$summary" \
-              >/dev/null; then
+            if ! rcg_close "$REPO" "$PR" "$head_sha" "$CHECK_NAME" "$generation_id" "$conclusion" "$check_title" "$summary"; then
               echo "::error::Failed to post check_run for PR #$PR — stale required check not refreshed."
               had_infra_error=1
             fi
@@ -627,6 +633,7 @@ jobs:
           CHECK_NAME: "Merge clearance gate"
         run: |
           set -euo pipefail
+          . scripts/workflow/required-check-generation.sh
           # Validate the dispatched PR number before it reaches any API call —
           # the payload is attacker-influenceable (anyone with repo write can
           # dispatch), so reject anything that is not a bare positive integer.
@@ -655,6 +662,7 @@ jobs:
             echo "::error::PR #$PR not found in the open-PR list; cannot resolve its head to refresh the Merge clearance gate (fail closed, #658/#465)."
             exit 1
           fi
+          generation_id=$(rcg_open "$REPO" "$PR" "$head_sha" "$CHECK_NAME") || exit 1
           set +e
           output=$(scripts/merge-clearance-gate.sh "$PR" "$REPO" 2>&1)
           rc=$?
@@ -680,14 +688,7 @@ jobs:
           # the stale required check on the PR head after the marker lands
           # (or pins a fail-closed red on infra error). A failed POST means the
           # job did not do its job; that's an infra error.
-          if ! gh api -X POST "repos/$REPO/check-runs" \
-            -f name="$CHECK_NAME" \
-            -f head_sha="$head_sha" \
-            -f status="completed" \
-            -f conclusion="$conclusion" \
-            -f "output[title]=$check_title" \
-            -f "output[summary]=$summary" \
-            >/dev/null; then
+          if ! rcg_close "$REPO" "$PR" "$head_sha" "$CHECK_NAME" "$generation_id" "$conclusion" "$check_title" "$summary"; then
             echo "::error::Failed to post check_run for PR #$PR — stale required check not refreshed."
             exit 1
           fi

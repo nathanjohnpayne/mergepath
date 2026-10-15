@@ -2053,8 +2053,8 @@ if [ "$G1193_EXTRACTION_OK" -eq 1 ]; then
   # The synthetic lineage coalesces into whichever suite was created first on
   # the head, so its reported workflow is one that publishes nothing. That is
   # exactly why workflowName is the wrong key.
-  G1215_API_OK='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:05:00Z","completedAt":"2026-05-21T10:05:00Z","externalId":"","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":9,"workflow":{"name":".github/workflows/agent-review.yml","resourcePath":"/o/r/actions/workflows/agent-review.yml"}}}}'
-  G1215_API_BAD='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:04:00Z","completedAt":"2026-05-21T10:04:00Z","externalId":"","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":9,"workflow":{"name":".github/workflows/agent-review.yml","resourcePath":"/o/r/actions/workflows/agent-review.yml"}}}}'
+  G1215_API_OK='{"databaseId":101,"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:05:00Z","completedAt":"2026-05-21T10:05:00Z","externalId":"","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":9,"workflow":{"name":".github/workflows/agent-review.yml","resourcePath":"/o/r/actions/workflows/agent-review.yml"}}}}'
+  G1215_API_BAD='{"databaseId":100,"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:04:00Z","completedAt":"2026-05-21T10:04:00Z","externalId":"","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":9,"workflow":{"name":".github/workflows/agent-review.yml","resourcePath":"/o/r/actions/workflows/agent-review.yml"}}}}'
   G1215_NAT_STALE_BAD='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T09:00:00Z","completedAt":"2026-05-21T09:00:20Z","externalId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":0,"workflow":{"name":"Merge Clearance Gate","resourcePath":"/o/r/actions/workflows/merge-clearance-gate.yml"}}}}'
 
   GOT=$(g1215 "[$G1215_NAT_BAD,$G1215_API_OK]")
@@ -2204,7 +2204,7 @@ elif [ -z "$G1215_EXTID_SETTERS" ]; then
 else
   fail "#1215: a check-run publisher now sets external_id ($G1215_EXTID_SETTERS) — its synthetic run would be classified native and the lineage split would silently collapse"
 fi
-if grep -qF 'map(select((.lineage // "") == $l)) | current_entry' "$SCRIPT" \
+if grep -qF 'if $l == "api" then current_api_entry else current_entry end' "$SCRIPT" \
    && grep -qF '($apps | length) == 1 and ($apps[0] == "15368")' "$SCRIPT" \
    && grep -qF '($lineage_contexts | index($ctx)) != null' "$SCRIPT"; then
   pass "#1215: the lineage split is scoped to one surface, one app, and a named owned context"
