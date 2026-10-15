@@ -593,11 +593,10 @@ paths:
       - "scripts/workflow/resolve_base_policy.sh"   # #1100, governing base policy for the relax set
       # #2257: the Phase 4 gate derivation, which runs when the caller does not
       # pass MERGEPATH_PHASE_4A_GATED, matches changed files with the shared
-      # matcher and counts lines with the fingerprint helper's EXCLUDE_RE.
-      # Both are read at run time; an absent copy, or one without the
-      # EXCLUDE_RE line, makes the derivation fail safe (request), never skip.
+      # matcher. An absent matcher makes the derivation fail safe (request),
+      # never skip. (The EXCLUDE_RE constant is read from the fingerprint
+      # helper at the PR's base sha through the API, not from this checkout.)
       - "scripts/workflow/match_protected_paths.sh"
-      - "scripts/workflow/external_review_fingerprint.sh"
       - "scripts/lib/feedback-policy-helpers.sh"    # #1100, policy_block_field_parsed (#1124)
       - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)

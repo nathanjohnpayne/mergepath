@@ -784,9 +784,9 @@ esac
 #              under the governing policy, or a human's force-on);
 #   size       lines changed >= external_review_threshold (default 300 when
 #              the key is absent), counted with the labeler's generated-file
-#              exclusion read from external_review_fingerprint.sh, the same
-#              constant dependabot_pin_bump_exemption.sh reads; a listing at
-#              GitHub's 3000-file cap is gated outright;
+#              exclusion, the EXCLUDE_RE constant read from
+#              external_review_fingerprint.sh at the PR's base sha; a
+#              listing at GitHub's 3000-file cap is gated outright;
 #   paths      a changed file, or a rename's source, matches
 #              external_review_paths through scripts/workflow/
 #              match_protected_paths.sh, the matcher the labeler and the merge
@@ -796,8 +796,8 @@ esac
 # the PR is requested with a WARN naming the cause. That includes the PR
 # metadata, its label list, the paginated file list, a file list that is
 # EMPTY or disagrees with the PR's changed_files count (a short read is not a
-# small PR), the governing base policy or its threshold or path list, the
-# exclusion constant, the matcher, and a PR whose head, base or labels
+# small PR), the governing base policy (including a duplicated threshold or
+# paths key) or its threshold or path list, the exclusion constant at the base, the matcher, and a PR whose head, base or labels
 # changed during the reads. A skip therefore needs every signal positively
 # read as "not gated" for one snapshot of the PR. Threshold and paths come from the policy that governs the PR (its
 # base, at the base sha), as the labeler and the merge clearance gate read
@@ -814,6 +814,7 @@ phase_4a_gate_derived() {  # <reason>
 }
 derive_phase_4a_gate() {
   local pr_json has_label changed_files files_json files_tmp files_count head_sha base_ref base_sha default_branch
+  local yq_bin=${MERGEPATH_YQ_BIN:-yq} base_cfg dup_threshold dup_paths fp_json
   local policy_json threshold exclude_re lines patterns_json pattern_count pattern matcher changed matched live_json live_fence rc=0
   local -a patterns=()
 
@@ -892,11 +893,25 @@ derive_phase_4a_gate() {
   # its base, fetched at the base sha of the snapshot above (Codex P1 on
   # #2258). The script's own checkout may be another repository, or the
   # candidate's own edited policy.
-  policy_json=$(crqe_governing_policy_json "$REPO" "$PR_NUMBER" "$CONFIG" \
-    "$__CODEX_REQUEST_DIR/workflow/resolve_base_policy.sh" \
-    "$base_ref" "$base_sha" "$default_branch") || policy_json=""
-  if [ -z "$policy_json" ]; then
+  base_cfg=$("$__CODEX_REQUEST_DIR/workflow/resolve_base_policy.sh" --repo "$REPO" \
+    --base-ref "$base_ref" --base-sha "$base_sha" --default-branch "$default_branch" \
+    --default-config "$CONFIG" --materialize-default 2>/dev/null) || base_cfg=""
+  if [ -z "$base_cfg" ] || [ ! -r "$base_cfg" ]; then
     phase_4a_gate_failsafe "could not resolve the governing review policy at $base_ref@$base_sha"
+    return 0
+  fi
+  # A duplicated key parses last-wins, while the labeler's line readers see
+  # both lines (Codex P1 on #2258): a duplicate is unreadable, never a value.
+  dup_threshold=$("$yq_bin" '[keys[] | select(. == "external_review_threshold")] | length' "$base_cfg" 2>/dev/null) || dup_threshold=""
+  dup_paths=$("$yq_bin" '[keys[] | select(. == "external_review_paths")] | length' "$base_cfg" 2>/dev/null) || dup_paths=""
+  policy_json=$("$yq_bin" -o=json -I=0 '.' "$base_cfg" 2>/dev/null) || policy_json=""
+  [ "$base_cfg" = "$CONFIG" ] || rm -f "$base_cfg" 2>/dev/null || true
+  if ! [[ "$dup_threshold" =~ ^[01]$ ]] || ! [[ "$dup_paths" =~ ^[01]$ ]]; then
+    phase_4a_gate_failsafe "the governing policy at $base_ref@$base_sha repeats external_review_threshold or external_review_paths (or the keys cannot be counted)"
+    return 0
+  fi
+  if ! printf '%s' "$policy_json" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    phase_4a_gate_failsafe "the governing policy at $base_ref@$base_sha does not parse as a mapping"
     return 0
   fi
   # Absent means the documented default 300; present must be a non-negative
@@ -912,9 +927,14 @@ derive_phase_4a_gate() {
     phase_4a_gate_failsafe "external_review_threshold in the governing policy is not a non-negative integer"
     return 0
   fi
-  exclude_re=$(sed -n "s/^EXCLUDE_RE='\(.*\)'\$/\1/p" "$__CODEX_REQUEST_DIR/workflow/external_review_fingerprint.sh" 2>/dev/null | head -1) || exclude_re=""
+  # The generated-file exclusion is read from the fingerprint helper AT THE
+  # BASE, the copy the labeler's classification runs (Codex P1 on #2258), not
+  # from this checkout, which may be another repository or the candidate.
+  fp_json=$(gh api "repos/$REPO/contents/scripts/workflow/external_review_fingerprint.sh?ref=$base_sha" 2>/dev/null) || fp_json=""
+  exclude_re=$(printf '%s' "$fp_json" | jq -r '.content | gsub("\n"; "") | @base64d' 2>/dev/null \
+    | sed -n "s/^EXCLUDE_RE='\(.*\)'\$/\1/p" | head -1) || exclude_re=""
   if [ -z "$exclude_re" ]; then
-    phase_4a_gate_failsafe "cannot read the generated-file exclusion (EXCLUDE_RE) from scripts/workflow/external_review_fingerprint.sh"
+    phase_4a_gate_failsafe "cannot read the generated-file exclusion (EXCLUDE_RE) from scripts/workflow/external_review_fingerprint.sh at $base_sha"
     return 0
   fi
   lines=$(printf '%s' "$files_json" | jq --arg re "$exclude_re" '
@@ -966,8 +986,9 @@ derive_phase_4a_gate() {
   fi
 
   # Snapshot fence (Codex P1 x2 on #2258): every read above describes one
-  # snapshot of the PR: its head, its base (whose policy was read) and its
-  # label state. A push, a base move to a stricter policy, or a
+  # snapshot of the PR: its head, its base (whose policy was read), the
+  # repository default branch the resolver fell back through, and its label
+  # state. A push, a base move to a stricter policy, or a
   # needs-external-review label landing during the reads would leave this
   # skip describing a PR that no longer exists, and the skip path never
   # reaches the moving-head guard. Re-read the PR immediately before
@@ -978,18 +999,19 @@ derive_phase_4a_gate() {
     if type == "object" and (.labels | type) == "array"
        and all(.labels[]; type == "object" and ((.name | type) == "string"))
     then [(.head.sha // "" | strings), (.base.ref // "" | strings), (.base.sha // "" | strings),
+          (.base.repo.default_branch // "" | strings),
           ([.labels[].name] | index("needs-external-review") != null | tostring)] | join(" ")
     else "" end' 2>/dev/null) || live_fence=""
   if [ -z "$live_fence" ]; then
     phase_4a_gate_failsafe "could not re-read the PR before skipping"
     return 0
   fi
-  if [ "$live_fence" = "$head_sha $base_ref $base_sha true" ]; then
+  if [ "$live_fence" = "$head_sha $base_ref $base_sha $default_branch true" ]; then
     phase_4a_gate_derived "the PR carries the needs-external-review label (added during the derivation)"
     return 0
   fi
-  if [ "$live_fence" != "$head_sha $base_ref $base_sha false" ]; then
-    phase_4a_gate_failsafe "the PR moved during the derivation (head/base/label was '$head_sha $base_ref $base_sha false', now '$live_fence')"
+  if [ "$live_fence" != "$head_sha $base_ref $base_sha $default_branch false" ]; then
+    phase_4a_gate_failsafe "the PR moved during the derivation (head/base/default/label was '$head_sha $base_ref $base_sha $default_branch false', now '$live_fence')"
     return 0
   fi
 

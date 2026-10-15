@@ -64,7 +64,7 @@ make_case() {
   cp "$ROOT/scripts/lib/codex-failure-markers.sh" "$dir/scripts/lib/codex-failure-markers.sh"
   cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
   cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$dir/scripts/workflow/resolve_base_policy.sh"
-  cp "$ROOT/scripts/workflow/external_review_fingerprint.sh" "$dir/scripts/workflow/external_review_fingerprint.sh"  # #2257
+  cp "$ROOT/scripts/workflow/external_review_fingerprint.sh" "$dir/state/base-fingerprint.sh"  # #2257: served at the base by the stub
   cp "$ROOT/scripts/workflow/match_protected_paths.sh" "$dir/scripts/workflow/match_protected_paths.sh"  # #2257
   chmod +x "$dir/scripts/workflow/resolve_base_policy.sh"
 
@@ -119,6 +119,9 @@ case "$endpoint" in
     if [ "${2:-}" = "--jq" ]; then printf '%s\n' "$head_sha"   # the #2257 head re-read
     else jq -cn --arg h "$head_sha" '{head:{sha:$h,ref:"feature"},base:{ref:"main",sha:"base-sha",repo:{default_branch:"main"}},labels:[],changed_files:1}'; fi ;;
   repos/owner/repo/pulls/999/files)      printf '%s\n' '[{"filename":"src/app.ts","additions":10,"deletions":2}]' ;;
+  'repos/owner/repo/contents/scripts/workflow/external_review_fingerprint.sh?ref=base-sha')
+    # #2257: the fingerprint helper at the base, for its EXCLUDE_RE constant.
+    jq -cn --arg c "$(base64 <"$CODEX_TEST_STATE_DIR/base-fingerprint.sh" | tr -d '\n')" '{encoding: "base64", content: $c}' ;;
   'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha')
     printf '1\n' >>"$CODEX_TEST_STATE_DIR/base-policy-read-count"
     if [ "${CODEX_TEST_BASE_POLICY_MODE:-ok}" = fail ]; then

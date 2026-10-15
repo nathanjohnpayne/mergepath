@@ -64,10 +64,11 @@ make_case() {
   cp "$ROOT/scripts/workflow/resolve-codex-verdict-anchors.py" "$dir/scripts/workflow/resolve-codex-verdict-anchors.py"
   cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
   cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$dir/scripts/workflow/resolve_base_policy.sh"
-  # #2257: the Phase 4 gate derivation reads the generated-file exclusion
-  # from the fingerprint helper and matches paths with the shared matcher.
-  cp "$ROOT/scripts/workflow/external_review_fingerprint.sh" "$dir/scripts/workflow/external_review_fingerprint.sh"
+  # #2257: the Phase 4 gate derivation matches paths with the shared matcher
+  # and reads the generated-file exclusion from the fingerprint helper AT THE
+  # BASE, which the gh stub serves from state/ (never from this checkout).
   cp "$ROOT/scripts/workflow/match_protected_paths.sh" "$dir/scripts/workflow/match_protected_paths.sh"
+  cp "$ROOT/scripts/workflow/external_review_fingerprint.sh" "$dir/state/base-fingerprint.sh"
   chmod +x "$dir/scripts/workflow/resolve_base_policy.sh"
 
   {
@@ -177,6 +178,7 @@ case "$endpoint" in
         | if $fence == "head-moved" then .head.sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
           elif $fence == "base-moved" then .base.sha = "base-sha-2"
           elif $fence == "label-added" then .labels += [{name: "needs-external-review"}]
+          elif $fence == "default-moved" then .base.repo.default_branch = "trunk"
           else . end'
     fi ;;
   repos/owner/repo/pulls/999/files)
@@ -188,6 +190,14 @@ case "$endpoint" in
     fi
     default_files='[{"filename":"src/app.ts","additions":10,"deletions":2}]'
     printf '%s\n' "${CODEX_TEST_FILES_JSON:-$default_files}" ;;
+  'repos/owner/repo/contents/scripts/workflow/external_review_fingerprint.sh?ref=base-sha')
+    # #2257: the fingerprint helper at the base, for its EXCLUDE_RE constant.
+    case "${CODEX_TEST_BASE_HELPER:-ok}" in
+      fail) echo "stub: base helper read refused" >&2; exit 1 ;;
+      noexclude) content=$(grep -v '^EXCLUDE_RE=' "$CODEX_TEST_STATE_DIR/base-fingerprint.sh" | base64 | tr -d '\n') ;;
+      *) content=$(base64 <"$CODEX_TEST_STATE_DIR/base-fingerprint.sh" | tr -d '\n') ;;
+    esac
+    jq -cn --arg c "$content" '{encoding: "base64", content: $c}' ;;
   'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha')
     if [ "${CODEX_TEST_BASE_POLICY:-ok}" = fail ]; then
       echo "stub: base policy read refused" >&2
@@ -762,9 +772,24 @@ test_derive_failsafe() {
   rc=$(run_case "$dir" false)
   assert_failsafe_request "a failing protected-path matcher" "$dir" "$rc" "the protected-path matcher failed (rc=2)"
   dir=$(derive_case exclusion-missing)
+  rc=$(CODEX_TEST_BASE_HELPER=noexclude run_case "$dir" false)
+  assert_failsafe_request "a base fingerprint helper without EXCLUDE_RE" "$dir" "$rc" "cannot read the generated-file exclusion"
+  dir=$(derive_case exclusion-unread)
+  rc=$(CODEX_TEST_BASE_HELPER=fail run_case "$dir" false)
+  assert_failsafe_request "an unreadable base fingerprint helper" "$dir" "$rc" "cannot read the generated-file exclusion"
+  # A local copy is never consulted: with no checkout copy at all, the base
+  # copy still drives the count (a lockfile-only size stays excluded).
+  dir=$(derive_case exclusion-from-base)
   rm -f "$dir/scripts/workflow/external_review_fingerprint.sh"
+  rc=$(CODEX_TEST_PR_CHANGED_FILES=2 CODEX_TEST_FILES_JSON='[{"filename":"package-lock.json","additions":5000,"deletions":0},{"filename":"src/a.ts","additions":3,"deletions":1}]' run_case "$dir" false)
+  assert_derived_skip "the exclusion read from the base, with no checkout copy" "$dir" "$rc"
+  # Duplicated keys parse last-wins; the labeler's line readers see both.
+  dir=$(derive_case dup-threshold 'external_review_threshold: 300'$'\n''external_review_threshold: 999999')
   rc=$(run_case "$dir" false)
-  assert_failsafe_request "a missing generated-file exclusion" "$dir" "$rc" "cannot read the generated-file exclusion"
+  assert_failsafe_request "a duplicated external_review_threshold" "$dir" "$rc" "repeats external_review_threshold or external_review_paths"
+  dir=$(derive_case dup-paths 'external_review_paths:'$'\n''  - ".github/**"'$'\n''external_review_paths: []')
+  rc=$(run_case "$dir" false)
+  assert_failsafe_request "a duplicated external_review_paths" "$dir" "$rc" "repeats external_review_threshold or external_review_paths"
   dir=$(derive_case base-policy-unread)
   rc=$(CODEX_TEST_BASE_POLICY=fail run_case "$dir" false)
   assert_failsafe_request_at_fetch "an unreadable governing base policy" "$dir" "$rc" "could not resolve the governing review policy at main@base-sha"
@@ -781,6 +806,11 @@ test_derive_failsafe() {
     rc=$(CODEX_TEST_FENCE_MODE=$mode run_case "$dir" false)
     assert_failsafe_request_at_fetch "a PR whose $mode during the derivation" "$dir" "$rc" "the PR moved during the derivation"
   done
+  # A default-branch switch changes which fallback policy governs; the later
+  # reads still succeed, so this one posts and times out normally.
+  dir=$(derive_case fence-default-moved)
+  rc=$(CODEX_TEST_FENCE_MODE=default-moved run_case "$dir" false)
+  assert_failsafe_request "a repository default branch that changed during the derivation" "$dir" "$rc" "the PR moved during the derivation"
   dir=$(derive_case fence-garbage)
   rc=$(CODEX_TEST_FENCE_MODE=garbage CODEX_TEST_FAIL_PR_FETCH=3 run_case "$dir" false)
   assert_failsafe_request_at_fetch "an unreadable fence re-read" "$dir" "$rc" "could not re-read the PR before skipping"
