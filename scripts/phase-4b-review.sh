@@ -1198,14 +1198,16 @@ if [ "$DRY_RUN" = true ]; then
   export P4B_ACCT_STATE_DIR
 fi
 
+ADAPTER_MISSING=false
 if [ ! -x "$ADAPTER_SCRIPT" ]; then
+  ADAPTER_MISSING=true
   # No adapter is an infrastructure fallback, never authority to bypass the
   # governing Codex cap. This mode makes no provider-triggering writes and
-  # leaves below-cap fallback behavior unchanged. Offline dry runs stay offline.
+  # still requires authority-bearing input classification before fallback.
+  # Pure previews keep their existing offline/unavailable behavior.
   if [ "$DRY_RUN" != true ]; then
     run_same_head_barrier "pre-fallback" cap-only
   fi
-  fall_back_to_manual "no adapter for reviewer '$REVIEWER' (expected $ADAPTER_SCRIPT)"
 fi
 
 # First barrier evaluation (#814), before the adapter run — the expensive part
@@ -1224,7 +1226,9 @@ fi
 # with fake CLIs)"), which exists precisely to validate adapter dispatch and
 # verdict parsing with no network and no credentials. That workflow is also
 # how tests/test_phase_4b_automation.sh exercises the package.
-if [ "$DRY_RUN" = true ]; then
+if [ "$ADAPTER_MISSING" = true ]; then
+  : # The cap-only barrier above owns this path; no provider-triggering probe.
+elif [ "$DRY_RUN" = true ]; then
   p4b_warn "dry-run: skipping the same-head barrier — it guards the review POST, and a dry-run posts nothing (offline dry-runs stay offline)"
 else
   run_same_head_barrier "pre-adapter"
@@ -1236,7 +1240,7 @@ fi
 # its bounded wait) instead of spending an adapter run that the post-adapter
 # fence would only discard. It runs before the accounting gate below, so that
 # gate stays the last read before dispatch.
-if [ "$DRY_RUN" != true ]; then
+if [ "$DRY_RUN" != true ] && [ "$ADAPTER_MISSING" != true ]; then
   revalidate_request_ceiling_authority pre-dispatch
 fi
 
@@ -1244,41 +1248,44 @@ fi
 # unread or undispositioned. Unlike the provider-ordering barrier, this also
 # applies to dry-runs: invoking the reasoning adapter is the scarce action the
 # gate protects. The command override keeps the orchestrator hermetic in tests.
-require_feedback_accounted
+# An unavailable pure preview needs no captured input. Posting and retained
+# evidence must cross the same input fence even when no adapter can run.
+if [ "$ADAPTER_MISSING" != true ] || [ "$DRY_RUN" != true ] || [ "$RETAIN_EVIDENCE" = true ]; then
+  require_feedback_accounted
 
-# Resolve exact objects in an isolated store, never through a mutable PR diff
-# endpoint. A supplied diff is only a compatibility assertion of these bytes.
-INPUT_DIR="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/p4b-input.XXXXXX")" \
-  || p4b_die 3 "could not create protected review input"
-if [ "$OFFLINE_DIFF" = true ]; then
-  [ -f "$DIFF_FILE" ] && [ ! -L "$DIFF_FILE" ] \
-    || p4b_die 3 "offline diff must be a regular file"
-  cp "$DIFF_FILE" "$INPUT_DIR/review.diff" || p4b_die 3 "could not protect offline input"
-  chmod 400 "$INPUT_DIR/review.diff"
-  DIFF_FILE="$INPUT_DIR/review.diff"
-  OFFLINE_INPUT_DIGEST="$(p4b_input_digest "$DIFF_FILE")" || p4b_die 3 "could not fingerprint offline input"
-else
-if ! p4b_run_with_timeout 90 "$ROOT/phase-4b/immutable-input.sh" capture \
-     "$REPO" "$PR" "$EXPECTED_BASE_SHA" "$HEAD" "$INPUT_DIR"; then
-  p4b_die 3 "could not capture immutable PR base/head objects"
-fi
-if [ -n "$WAVE_SCOPE_FILE" ]; then
-  if ! p4b_run_with_timeout 180 "$ROOT/phase-4b/immutable-input.sh" wave-capture \
-      "$REPO" "$PR" "$EXPECTED_BASE_SHA" "$HEAD" \
-      "$WAVE_SCOPE_FILE" "$INPUT_DIR" "$(p4b_config)"; then
-    p4b_die 3 "could not regenerate trusted canonical wave input"
+  # Resolve exact objects in an isolated store, never through a mutable PR diff
+  # endpoint. A supplied diff is only a compatibility assertion of these bytes.
+  INPUT_DIR="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/p4b-input.XXXXXX")" \
+    || p4b_die 3 "could not create protected review input"
+  if [ "$OFFLINE_DIFF" = true ]; then
+    [ -f "$DIFF_FILE" ] && [ ! -L "$DIFF_FILE" ] \
+      || p4b_die 3 "offline diff must be a regular file"
+    cp "$DIFF_FILE" "$INPUT_DIR/review.diff" || p4b_die 3 "could not protect offline input"
+    chmod 400 "$INPUT_DIR/review.diff"
+    DIFF_FILE="$INPUT_DIR/review.diff"
+    OFFLINE_INPUT_DIGEST="$(p4b_input_digest "$DIFF_FILE")" || p4b_die 3 "could not fingerprint offline input"
+  else
+    if ! p4b_run_with_timeout 90 "$ROOT/phase-4b/immutable-input.sh" capture \
+         "$REPO" "$PR" "$EXPECTED_BASE_SHA" "$HEAD" "$INPUT_DIR"; then
+      p4b_die 3 "could not capture immutable PR base/head objects"
+    fi
+    if [ -n "$WAVE_SCOPE_FILE" ]; then
+      if ! p4b_run_with_timeout 180 "$ROOT/phase-4b/immutable-input.sh" wave-capture \
+          "$REPO" "$PR" "$EXPECTED_BASE_SHA" "$HEAD" \
+          "$WAVE_SCOPE_FILE" "$INPUT_DIR" "$(p4b_config)"; then
+        p4b_die 3 "could not regenerate trusted canonical wave input"
+      fi
+    fi
+    INPUT_METADATA_DIGEST="$(p4b_input_digest "$INPUT_DIR/input.json")" \
+      || p4b_die 3 "could not fingerprint review input metadata"
+    if [ -n "$DIFF_FILE" ]; then
+      SUPPLIED_DIGEST="$(p4b_input_digest "$DIFF_FILE")" \
+        || p4b_die 3 "supplied diff is unreadable or unprotected"
+      [ "$SUPPLIED_DIGEST" = "$(jq -er '.diff_sha256' "$INPUT_DIR/input.json")" ] \
+        || p4b_die 3 "supplied diff differs from captured immutable objects"
+    fi
+    DIFF_FILE="$INPUT_DIR/review.diff"
   fi
-fi
-INPUT_METADATA_DIGEST="$(p4b_input_digest "$INPUT_DIR/input.json")" \
-  || p4b_die 3 "could not fingerprint review input metadata"
-if [ -n "$DIFF_FILE" ]; then
-  SUPPLIED_DIGEST="$(p4b_input_digest "$DIFF_FILE")" \
-    || p4b_die 3 "supplied diff is unreadable or unprotected"
-  [ "$SUPPLIED_DIGEST" = "$(jq -er '.diff_sha256' "$INPUT_DIR/input.json")" ] \
-    || p4b_die 3 "supplied diff differs from captured immutable objects"
-fi
-DIFF_FILE="$INPUT_DIR/review.diff"
-
 fi
 
 revalidate_immutable_input() {
@@ -1301,6 +1308,10 @@ if [ "$OFFLINE_DIFF" != true ] && { [ "$DRY_RUN" != true ] || [ "$RETAIN_EVIDENC
     stop_for_human_tiebreaker "$(jq -nc --argjson escalation "$escalation" \
       '{decision:"human-tiebreaker",reason:"Deterministic Phase 4b tripwire requires human-mediated review",tripwire:$escalation}')"
   fi
+fi
+
+if [ "$ADAPTER_MISSING" = true ]; then
+  fall_back_to_manual "no adapter for reviewer '$REVIEWER' (expected $ADAPTER_SCRIPT)"
 fi
 
 # --- run the adapter (reasoning plane; never posts) ------------------------

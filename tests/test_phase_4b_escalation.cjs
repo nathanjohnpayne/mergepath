@@ -63,6 +63,13 @@ test('the retained-evidence wave caller is an exact sensitive path', () => {
   }
 });
 
+test('the feedback-state fingerprint entrypoint is an exact sensitive path', () => {
+  assert.equal(classify('+ordinary change', ['scripts/review-feedback-surface-fingerprint.sh']).decision, 'human-review');
+  for (const file of ['scripts/review-feedback-surface-fingerprint.sh.example', 'scripts/review-feedback-surface-fingerprint-extra.sh', 'scripts/review-feedback-surface-Fingerprint.sh', 'nested/scripts/review-feedback-surface-fingerprint.sh']) {
+    assert.equal(classify('+ordinary change', [file]).decision, 'model-review', file);
+  }
+});
+
 test('captured Git objects determine both rename sides and complete wave scope', t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'p4b-escalation-test-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
