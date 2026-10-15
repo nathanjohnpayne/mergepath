@@ -2581,6 +2581,22 @@ for i in "${!TOKENS[@]}"; do
       continue
       ;;
     gh|*/gh)
+      # #2158: inspect literal argv and readable body files before the
+      # noun walk can return early for raw REST writes. Runtime wrappers
+      # inspect again after expansion and snapshot any deferred input.
+      comment_guard_argv=()
+      for ((comment_arg=i; comment_arg<${#TOKENS[@]}; comment_arg++)); do
+        case "${TOKENS[$comment_arg]}" in
+          "&&"|"||"|";"|"|"|"|&"|"&"|"("|")") break ;;
+        esac
+        comment_guard_argv+=("${TOKENS[$comment_arg]}")
+      done
+      comment_guard_result=$(python3 "$REPO_ROOT/scripts/workflow/gh-comment-trigger-guard.py" \
+        --role hook -- "${comment_guard_argv[@]}") || exit 2
+      if [ -z "$WRAPPER_KIND" ] && printf '%s' "$comment_guard_result" | jq -e '.guarded == true' >/dev/null; then
+        echo "BLOCKED: comment/review writes must use a token-verifying wrapper and its runtime body guard." >&2
+        exit 2
+      fi
       SAW_GH=1
       continue
       ;;
@@ -2744,47 +2760,6 @@ case "$PR_SUBCOMMAND" in
 esac
 [ "$IS_ISSUE_COMMENT" -eq 1 ] && cmd_label="gh issue comment"
 
-PR_COMMENT_BODY_HAS_CODEX_TRIGGER=0
-if [ "$PR_SUBCOMMAND" = "comment" ] && [ "$IS_ISSUE_COMMENT" -eq 0 ]; then
-  # Only author-wrapper pr comments that actually pass @codex review in
-  # the gh pr comment body are allowed. Looking at the whole shell
-  # command would let an earlier `echo "@codex review"` spoof this gate.
-  comment_walk_start=$((PR_SUBCOMMAND_INDEX + 1))
-  comment_skip_next=""
-  for j in "${!TOKENS[@]}"; do
-    if [ "$j" -lt "$comment_walk_start" ]; then
-      continue
-    fi
-    tok="${TOKENS[$j]}"
-    case "$tok" in
-      "&&"|"||"|";"|"|"|"|&"|"&"|"("|")") break ;;
-    esac
-    if [ -n "$comment_skip_next" ]; then
-      comment_skip_next=""
-      continue
-    fi
-    case "$tok" in
-      --body|-b)
-        next_index=$((j + 1))
-        body_value="${TOKENS[$next_index]:-}"
-        case "$body_value" in
-          *"@codex review"*) PR_COMMENT_BODY_HAS_CODEX_TRIGGER=1 ;;
-        esac
-        comment_skip_next=1
-        ;;
-      --body=*)
-        body_value="${tok#--body=}"
-        case "$body_value" in
-          *"@codex review"*) PR_COMMENT_BODY_HAS_CODEX_TRIGGER=1 ;;
-        esac
-        ;;
-      --body-file|-F)
-        comment_skip_next=1
-        ;;
-    esac
-  done
-fi
-
 if [ -z "$WRAPPER_KIND" ]; then
   echo "BLOCKED: $cmd_label is a guarded GitHub write and must use a token-verifying wrapper (#411)." >&2
   echo "" >&2
@@ -2797,7 +2772,7 @@ if [ -z "$WRAPPER_KIND" ]; then
       ;;
     comment:0)
       echo "    scripts/gh-as-reviewer.sh -- $cmd_label ..." >&2
-      echo "    scripts/gh-as-author.sh -- gh pr comment ... --body '@codex review'   # Codex trigger only" >&2
+      echo "    scripts/codex-review-request.sh <PR> <owner/repo>   # reserved review command" >&2
       ;;
     review:*)
       echo "    scripts/gh-as-reviewer.sh -- $cmd_label ..." >&2
@@ -2816,9 +2791,6 @@ REVIEWER_WRAPPER_ALLOWED=0
 case "$PR_SUBCOMMAND:$IS_ISSUE_COMMENT" in
   create:*|merge:*|edit:*) AUTHOR_WRAPPER_ALLOWED=1 ;;
   comment:0)
-    if [ "$PR_COMMENT_BODY_HAS_CODEX_TRIGGER" -eq 1 ]; then
-      AUTHOR_WRAPPER_ALLOWED=1
-    fi
     REVIEWER_WRAPPER_ALLOWED=1
     ;;
   review:*) REVIEWER_WRAPPER_ALLOWED=1 ;;

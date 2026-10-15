@@ -231,7 +231,10 @@
       "tests/test_gh_rest_transport.sh",
       "tests/test_gh_wrapper_parallel.sh",
       "tests/test_identity_check_fail_closed.sh",
-      "tests/test_owner_admin_override.py"
+      "tests/test_owner_admin_override.py",
+      "scripts/lib/gh-comment-trigger-guard.sh",
+      "scripts/workflow/gh-comment-trigger-guard.py",
+      "tests/test_gh_comment_trigger_guard.py"
     ],
     "check_gh_projects_move_item": [
       "scripts/gh-projects/move-item.sh",

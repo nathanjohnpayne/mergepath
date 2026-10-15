@@ -12,6 +12,8 @@ The publisher structural fence prevents workflow and job concurrency for all thr
 
 The shared pull-request body parser and its standalone generated runtime are specified in [`specs/pr_body_contract.md`](../../specs/pr_body_contract.md). The weekly audit records per-PR parser timeouts, continues auditing later PRs, reports unaudited PRs when its time budget is spent, and fails incomplete runs.
 
+The token-verifying wrappers inspect comment and review bodies before writing, including file, stdin and REST JSON inputs. Reserved Codex trigger text in prose is refused; a complete command requires fresh canonical request authorization on the expected head. The hook shares the parser and delegates unavailable files to the runtime wrapper. The contract and coverage are in `specs/review_feedback_accounting.md` and `tests/test_gh_comment_trigger_guard.py`.
+
 Manual Phase 4b handoffs hold while a current-head Codex review is in flight and report accounting's undispositioned finding count. The sensing and timeout-fallback contract is documented in `specs/review_feedback_accounting.md` (#2157).
 
 Explicitly deferred CodeRabbit findings retain the `deferred-to-followup` ledger disposition and resolver tag. The recorder and resolver evidence contract is in `specs/review_feedback_accounting.md`. Targeted bot-thread resolution accepts an explicit disposition and requires its marker before resolving exactly the selected thread (#2196).
