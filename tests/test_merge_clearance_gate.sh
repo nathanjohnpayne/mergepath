@@ -4839,6 +4839,387 @@ unset RCP_TAG
 fi
 
 # ---------------------------------------------------------------------------
+# Test 30 (#2247): a merely-pending clearance verdict leaves the event job's
+# job-native run non-failing, while the Checks-API lineage keeps the block.
+#
+# Branch protection never retires an earlier failed job-native run of a
+# required context, so every review event during a long review used to leave
+# a failed `Merge clearance gate` run that had to be rerun after the PR
+# cleared. Four layers, each tested on its own:
+#
+#   30a the script's explicit pending verdict (MERGEPATH_GATE_VERDICT_FILE),
+#       written only from the not-yet-cleared site and never for a real
+#       block, an infra exit or a fail-closed applicability fallback;
+#   30b the extracted gate step: pending only for rc 1 + BLOCKED line + a
+#       file reading exactly `pending`, with a stale file removed first;
+#   30c scripts/gate-api-lineage-blocking.sh: established only when every
+#       current Checks-API run blocks in a suite other than this run's own;
+#   30d the extracted lineage-confirmation and report steps: the native run
+#       is non-failing only on the full conjunction, and the phase-2 PATCH
+#       still publishes failure for the same verdict.
+#   30e a review with several pending events, then clearance: no job-native
+#       failure accumulates, and the head is blocked until the Checks-API
+#       lineage turns green and clean after it, with no rerun.
+# The fence pins for the step bindings are mutation-tested at the end of the
+# file, inside the re-entrancy guard with the other mcg22 cases.
+# ---------------------------------------------------------------------------
+echo; echo "--- Test 30a (#2247): the script's explicit pending verdict"
+T30_VF="$WORKDIR/t30-verdict"
+t30_gate() {  # <scratch> ; env from caller
+  rm -f "$T30_VF"
+  set +e
+  OUT=$(MERGEPATH_GATE_VERDICT_FILE="$T30_VF" run_gate "$1" 99 owner/repo 2>&1)
+  RC=$?
+  set -e
+  VF_CONTENT=$(cat "$T30_VF" 2>/dev/null || printf '<absent>')
+}
+bad=""
+# Not yet cleared: external review applies (label) and the delegate says 1.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" "$EXT_LABEL")
+export FIXTURE_PR
+MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_RC=1 t30_gate "$SCRATCH"
+[ "$RC" = 1 ] || bad="$bad pending-rc($RC)"
+[ "$VF_CONTENT" = pending ] || bad="$bad pending-file($VF_CONTENT)"
+PENDING_OUT=$(printf '%s\n' "$OUT" | grep '^Merge clearance:' || true)
+# Byte-identical stdout without the variable: no caller that does not ask can
+# see a difference.
+set +e
+PLAIN_OUT=$(MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_RC=1 \
+            run_gate "$SCRATCH" 99 owner/repo 2>/dev/null)
+PLAIN_RC=$?
+set -e
+[ "$PLAIN_RC" = 1 ] || bad="$bad plain-rc($PLAIN_RC)"
+[ "$(printf '%s\n' "$PLAIN_OUT" | grep '^Merge clearance:' || true)" = "$PENDING_OUT" ] \
+  || bad="$bad plain-stdout-differs"
+# Cleared: no pending.
+MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_RC=0 t30_gate "$SCRATCH"
+{ [ "$RC" = 0 ] && [ "$VF_CONTENT" = '<absent>' ]; } || bad="$bad cleared($RC/$VF_CONTENT)"
+# Delegate infra: rc 2, no pending.
+MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_RC=3 t30_gate "$SCRATCH"
+{ [ "$RC" = 2 ] && [ "$VF_CONTENT" = '<absent>' ]; } || bad="$bad delegate-infra($RC/$VF_CONTENT)"
+# Real block: a human-controlled hold, even with a delegate that would clear.
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[{"name":"needs-external-review"},{"name":"human-hold"}]')
+MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_RC=1 t30_gate "$SCRATCH"
+{ [ "$RC" = 1 ] && [ "$VF_CONTENT" = '<absent>' ]; } || bad="$bad human-hold($RC/$VF_CONTENT)"
+# Real block: a Dependabot head without a reviewer approval.
+SCRATCH=$(make_scratch true true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT" "$EXT_LABEL")
+FIXTURE_REVIEWS=$(make_reviews_fixture '[]')
+FIXTURE_REVIEWS="$FIXTURE_REVIEWS" MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
+  CODEX_STUB_RC=1 t30_gate "$SCRATCH"
+{ [ "$RC" = 1 ] && [ "$VF_CONTENT" = '<absent>' ] && printf '%s' "$OUT" | grep -qi dependabot; } \
+  || bad="$bad dependabot($RC/$VF_CONTENT)"
+# Fail-closed applicability: the protected-paths matcher cannot run, so the
+# gate does not know whether external review applies at all. Not cleared on
+# top of that is a plain block, never pending.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]')
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/x.js","additions":1,"deletions":0}]')
+FIXTURE_FILES="$FIXTURE_FILES" MERGE_CLEARANCE_WORKFLOW_DIR="$WORKDIR/no-such-matcher-dir" \
+  MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_RC=1 t30_gate "$SCRATCH"
+{ [ "$RC" = 1 ] && [ "$VF_CONTENT" = '<absent>' ] && printf '%s' "$OUT" | grep -q 'failing closed'; } \
+  || bad="$bad fail-closed-applicability($RC/$VF_CONTENT)"
+# Pending text in delegated output is not a verdict: the file is the only
+# channel, and here the script reaches a real block.
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[{"name":"needs-external-review"},{"name":"policy-violation"}]')
+CODEX_STUB_STDOUT=pending MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
+  CODEX_STUB_RC=1 t30_gate "$SCRATCH"
+{ [ "$RC" = 1 ] && [ "$VF_CONTENT" = '<absent>' ]; } || bad="$bad policy-violation($RC/$VF_CONTENT)"
+unset FIXTURE_PR
+if [ -z "$bad" ]; then
+  pass "#2247: pending is written only for a not-yet-cleared head; stdout and rc are unchanged; every real block, infra exit and fail-closed fallback writes nothing"
+else
+  fail "#2247 script pending verdict wrong:$bad"
+  printf '%s\n' "$OUT" | sed 's/^/      /' | tail -5 >&2
+fi
+
+WF_2247="$ROOT/.github/workflows/merge-clearance-gate.yml"
+T30="$(mktemp -d "${TMPDIR:-/tmp}/mcg2247.XXXXXX")"
+mkdir -p "$T30/bin" "$T30/wd/scripts"
+# Same extractor as Test 23 (that one is scoped to its own block).
+t30_step_body() {  # <workflow> <step name>
+  awk -v want="$2" '
+    index($0, "- name: " want) { instep = 1; next }
+    instep && !inrun && /^        run: \|/ { inrun = 1; next }
+    inrun {
+      if ($0 ~ /^[[:space:]]*$/) { print ""; next }
+      if ($0 !~ /^          /) exit
+      sub(/^          /, "")
+      print
+    }
+  ' "$1"
+}
+GATE_BODY="$(t30_step_body "$WF_2247" 'Run scripts/merge-clearance-gate.sh')"
+LIN_BODY="$(t30_step_body "$WF_2247" 'Confirm the Checks-API lineage blocks while pending (#2247)')"
+RV2_BODY="$(t30_step_body "$WF_2247" 'Report gate verdict')"
+P2B_BODY="$(t30_step_body "$WF_2247" 'Close the required check_run (#841 phase 2)')"
+t30_run() {  # <body> ; runs in $T30/wd with env from caller
+  ( cd "$T30/wd" && GH_LOG="$T30/gh.log" PATH="$T30/bin:$PATH" \
+      GITHUB_OUTPUT="$T30/out.txt" RUNNER_TEMP="$T30" bash -c "$1" 2>&1 )
+}
+t30_reset() { : > "$T30/gh.log"; : > "$T30/out.txt"; }
+# Never fails: an unset output is an empty answer, and the suite runs errexit.
+t30_out() { { grep "^$1=" "$T30/out.txt" || true; } | tail -1 | cut -d= -f2-; }
+
+echo; echo "--- Test 30b (#2247): the gate step reports pending only on the explicit verdict"
+# A stand-in gate script: writes T30_WRITE to the verdict file when asked,
+# prints T30_LINE, exits T30_RC.
+cat > "$T30/wd/scripts/merge-clearance-gate.sh" <<'SH'
+#!/usr/bin/env bash
+if [ -n "${T30_WRITE:-}" ] && [ -n "${MERGEPATH_GATE_VERDICT_FILE:-}" ]; then
+  printf '%s\n' "$T30_WRITE" > "$MERGEPATH_GATE_VERDICT_FILE"
+fi
+[ -z "${T30_LINE:-}" ] || printf '%s\n' "$T30_LINE"
+exit "${T30_RC:-0}"
+SH
+chmod +x "$T30/wd/scripts/merge-clearance-gate.sh"
+BLK='Merge clearance: BLOCKED — external review is NOT cleared'
+t30_gstep() {  # <rc> <line> <write> ; echoes pending output
+  t30_reset
+  T30_RC="$1" T30_LINE="$2" T30_WRITE="$3" PR_NUMBER=7 REPO=o/r t30_run "$GATE_BODY" >/dev/null
+  t30_out pending
+}
+bad=""
+[ "$(t30_gstep 1 "$BLK" pending)" = true ] || bad="$bad positive"
+[ "$(t30_gstep 1 "$BLK" '')" = false ] || bad="$bad no-file"
+[ "$(t30_gstep 1 "$BLK" blocked)" = false ] || bad="$bad other-word"
+[ "$(t30_gstep 1 "$BLK" 'pending now')" = false ] || bad="$bad not-exact"
+[ "$(t30_gstep 0 'Merge clearance: PASS — ok' pending)" = false ] || bad="$bad rc0"
+[ "$(t30_gstep 2 "$BLK" pending)" = false ] || bad="$bad rc2"
+[ "$(t30_gstep 1 'no verdict line at all' pending)" = false ] || bad="$bad no-blocked-line"
+# Pending text in the OUTPUT is not the verdict.
+[ "$(t30_gstep 1 "$BLK pending" '')" = false ] || bad="$bad output-spoof"
+# A stale file from an earlier step cannot speak for this evaluation.
+t30_reset
+printf 'pending\n' > "$T30/mcg-verdict"
+T30_RC=1 T30_LINE="$BLK" T30_WRITE='' PR_NUMBER=7 REPO=o/r t30_run "$GATE_BODY" >/dev/null
+[ "$(t30_out pending)" = false ] || bad="$bad stale-file"
+if [ -z "$bad" ]; then
+  pass "#2247: the gate step sets pending=true only for rc 1 + BLOCKED + a file reading exactly pending, and removes a stale file first"
+else
+  fail "#2247 gate step pending wrong:$bad"
+fi
+
+echo; echo "--- Test 30c (#2247): scripts/gate-api-lineage-blocking.sh"
+HELPER="$ROOT/scripts/gate-api-lineage-blocking.sh"
+mkdir -p "$T30/hbin"
+# Stub gh: records argv, answers the check-runs listing from T30_RUNS (one
+# JSON object per line, already in the helper's --jq projection).
+cat > "$T30/hbin/gh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_LOG"
+[ "${T30_GH_FAIL:-0}" = 1 ] && exit 1
+printf '%s' "${T30_RUNS:-}"
+exit 0
+STUB
+chmod +x "$T30/hbin/gh"
+OWN='{"id":5,"status":"in_progress","conclusion":null,"ext":"uuid-own","suite":10,"app":"github-actions","url":"https://github.com/o/r/actions/runs/777/job/5"}'
+OTHER_NATIVE='{"id":4,"status":"completed","conclusion":"success","ext":"uuid-x","suite":11,"app":"github-actions","url":"https://github.com/o/r/actions/runs/700/job/4"}'
+api() {  # <id> <status> <conclusion|null> <suite>
+  local c=$3
+  [ "$c" = null ] || c="\"$c\""
+  printf '{"id":%s,"status":"%s","conclusion":%s,"ext":"","suite":%s,"app":"github-actions","url":"https://github.com/o/r/runs/%s"}' "$1" "$2" "$c" "$4" "$1"
+}
+t30_helper() {  # <runs> -> rc
+  : > "$T30/gh.log"
+  set +e
+  HOUT=$(T30_RUNS="$1" GH_LOG="$T30/gh.log" PATH="$T30/hbin:$PATH" \
+         "$HELPER" o/r "$SHA30" "Merge clearance gate" 777 2>&1)
+  HRC=$?
+  set -e
+  echo "$HRC"
+}
+SHA30=0123456789abcdef0123456789abcdef01234567
+nl=$'\n'
+bad=""
+[ "$(t30_helper "$OWN$nl$(api 9 in_progress null 20)$nl$OTHER_NATIVE")" = 0 ] || bad="$bad api-in-progress"
+grep -q 'check_name=Merge clearance gate' "$T30/gh.log" || bad="$bad request-name"
+grep -q 'filter=latest' "$T30/gh.log" || bad="$bad request-filter"
+grep -q "commits/$SHA30/check-runs" "$T30/gh.log" || bad="$bad request-head"
+[ "$(t30_helper "$OWN$nl$(api 9 completed failure 20)")" = 0 ] || bad="$bad api-failure"
+[ "$(t30_helper "$OWN$nl$(api 9 completed cancelled 20)")" = 0 ] || bad="$bad api-cancelled"
+[ "$(t30_helper "$OWN$nl$(api 9 completed success 20)")" = 1 ] || bad="$bad api-success"
+[ "$(t30_helper "$OWN$nl$(api 9 completed neutral 20)")" = 1 ] || bad="$bad api-neutral"
+[ "$(t30_helper "$OWN$nl$(api 9 completed skipped 20)")" = 1 ] || bad="$bad api-skipped"
+[ "$(t30_helper "$OWN$nl$(api 9 completed failure 20)$nl$(api 8 completed success 21)")" = 1 ] \
+  || bad="$bad one-api-green"
+[ "$(t30_helper "$OWN$nl$(api 9 completed failure 10)")" = 1 ] || bad="$bad shared-suite"
+[ "$(t30_helper "$OWN$nl$(api 9 completed failure null)")" = 1 ] || bad="$bad api-no-suite"
+[ "$(t30_helper "$OTHER_NATIVE$nl$(api 9 completed failure 20)")" = 1 ] || bad="$bad own-missing"
+[ "$(t30_helper "$OWN$nl$OTHER_NATIVE")" = 1 ] || bad="$bad no-api"
+[ "$(t30_helper "")" = 1 ] || bad="$bad empty"
+[ "$(t30_helper "not json")" = 1 ] || bad="$bad malformed"
+# A run id that is only a PREFIX of this run's id is not this run.
+PREFIX_OWN='{"id":5,"status":"in_progress","conclusion":null,"ext":"uuid-own","suite":10,"app":"github-actions","url":"https://github.com/o/r/actions/runs/7777/job/5"}'
+[ "$(t30_helper "$PREFIX_OWN$nl$(api 9 completed failure 20)")" = 1 ] || bad="$bad run-id-prefix"
+# Another app's run of the same name is not this lineage, either way.
+FOREIGN='{"id":12,"status":"completed","conclusion":"success","ext":"","suite":30,"app":"some-other-app","url":"https://example.invalid/12"}'
+[ "$(t30_helper "$OWN$nl$(api 9 completed failure 20)$nl$FOREIGN")" = 0 ] || bad="$bad foreign-ignored"
+[ "$(t30_helper "$OWN$nl$FOREIGN")" = 1 ] || bad="$bad foreign-not-api"
+rc=$(T30_GH_FAIL=1 t30_helper "$OWN$nl$(api 9 completed failure 20)"); [ "$rc" = 1 ] || bad="$bad gh-fail"
+set +e
+"$HELPER" o/r not-a-sha "Merge clearance gate" 777 >/dev/null 2>&1; [ $? = 2 ] || bad="$bad usage-sha"
+"$HELPER" o/r "$SHA30" "Merge clearance gate" 77x >/dev/null 2>&1; [ $? = 2 ] || bad="$bad usage-run"
+"$HELPER" o/r "$SHA30" "" 777 >/dev/null 2>&1; [ $? = 2 ] || bad="$bad usage-name"
+set -e
+if [ -z "$bad" ]; then
+  pass "#2247: the lineage helper is established only when every current Checks-API run blocks, outside this run's own suite"
+else
+  fail "#2247 lineage helper wrong:$bad"
+fi
+
+echo; echo "--- Test 30d (#2247): lineage confirmation, native conclusion and the Checks-API write"
+# Lineage step with a stand-in helper.
+bad=""
+# Called with a redirect rather than inside $( ), so LOUT survives the call.
+t30_lin() {  # <helper-rc|absent> ; writes the api_blocking output to $T30/lin.res
+  t30_reset
+  rm -f "$T30/wd/scripts/gate-api-lineage-blocking.sh"
+  if [ "$1" != absent ]; then
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s/helper-args"\nexit %s\n' "$T30" "$1" \
+      > "$T30/wd/scripts/gate-api-lineage-blocking.sh"
+    chmod +x "$T30/wd/scripts/gate-api-lineage-blocking.sh"
+  fi
+  : > "$T30/helper-args"
+  set +e
+  LOUT=$(REPO=o/r HEAD_SHA="$SHA30" RUN_ID=777 CHECK_NAME="Merge clearance gate" t30_run "$LIN_BODY")
+  LRC=$?
+  set -e
+  { [ "$LRC" = 0 ] || echo "step-failed"; t30_out api_blocking; } > "$T30/lin.res"
+}
+t30_lin 0; [ "$(cat "$T30/lin.res")" = true ] || bad="$bad helper-ok"
+grep -qx "o/r $SHA30 Merge clearance gate 777" "$T30/helper-args" || bad="$bad helper-args"
+t30_lin 1; [ -z "$(cat "$T30/lin.res")" ] || bad="$bad helper-no"
+printf '%s' "$LOUT" | grep -q '::warning::' || bad="$bad helper-no-warn"
+t30_lin 2; [ -z "$(cat "$T30/lin.res")" ] || bad="$bad helper-usage"
+t30_lin absent; [ -z "$(cat "$T30/lin.res")" ] || bad="$bad helper-absent"
+printf '%s' "$LOUT" | grep -q '::warning::' || bad="$bad absent-warn"
+rm -f "$T30/wd/scripts/gate-api-lineage-blocking.sh"
+# Report step: the full conjunction, and nothing less.
+rv2() { RC="$1" VERDICT="$2" PENDING="$3" API_BLOCKING="$4" t30_run "$RV2_BODY" >/dev/null 2>&1; }
+rv2 1 blocked true true    || bad="$bad rv-pending"
+rv2 1 blocked true ''      && bad="$bad rv-pending-unconfirmed"
+rv2 1 blocked false true   && bad="$bad rv-not-pending"
+rv2 1 blocked '' ''        && bad="$bad rv-blocked"
+rv2 1 absent true true     && bad="$bad rv-no-blocked-line"
+rv2 2 absent true true     && bad="$bad rv-infra"
+rv2 0 absent true true     && bad="$bad rv-rc0-no-pass"
+rv2 3 absent true true     && bad="$bad rv-unknown-rc"
+rv2 0 pass '' ''           || bad="$bad rv-pass"
+RVOUT=$(RC=1 VERDICT=blocked PENDING=true API_BLOCKING=true t30_run "$RV2_BODY")
+printf '%s' "$RVOUT" | grep -q '::notice::Merge clearance is PENDING' || bad="$bad rv-notice"
+# The same pending verdict still closes the Checks-API hold as FAILURE.
+# #906 also binds this write to the trusted default revision. Both fake
+# reads must agree so the later clearance case exercises a genuine success.
+export T30_TRUSTED_REVISION="$SHA30"
+cat > "$T30/bin/gh" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >> "$GH_LOG"
+if [ "$1" = pr ] && [ "$2" = view ]; then printf '%s\n' "$T30_HEAD"; fi
+if [ "$1" = api ] && [ "$2" = repos/o/r/commits/HEAD ]; then printf '%s\n' "$T30_TRUSTED_REVISION"; fi
+exit 0
+STUB
+cat > "$T30/bin/git" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$T30_TRUSTED_REVISION"
+STUB
+printf '#!/bin/sh\nexit 0\n' > "$T30/bin/sleep"
+chmod +x "$T30/bin/gh" "$T30/bin/git" "$T30/bin/sleep"
+t30_reset
+printf 'gate output\n' > "$T30/mcg-summary.txt"
+T30_HEAD="$SHA30" REPO=o/r PR_NUMBER=7 CHECK_ID=42 HEAD_SHA="$SHA30" RC=1 VERDICT=blocked \
+  t30_run "$P2B_BODY" >/dev/null
+grep -q 'conclusion=failure' "$T30/gh.log" || bad="$bad api-not-red"
+grep -q 'conclusion=success' "$T30/gh.log" && bad="$bad api-green"
+if [ -z "$bad" ]; then
+  pass "#2247: native non-failing needs pending AND a confirmed blocking lineage; every real block, infra exit and unrecognised rc still fails; the Checks-API hold still closes as failure"
+else
+  fail "#2247 native/lineage mapping wrong:$bad"
+fi
+
+echo; echo "--- Test 30e (#2247): several pending events, then clearance, reach CLEAN with no rerun"
+# Drive the extracted steps through a review: four pending events, then the
+# cleared one. A stand-in for GitHub's combination of the two lineages: the
+# head blocks while ANY job-native run of the context failed (each sits in its
+# own suite and is never retired) or the newest Checks-API run is not green.
+bad=""
+native_failures=0
+api_latest=""
+t30_event() {  # <gate-rc> <line> <write> -> updates native_failures, api_latest
+  local pending rc
+  t30_reset
+  T30_RC="$1" T30_LINE="$2" T30_WRITE="$3" PR_NUMBER=7 REPO=o/r t30_run "$GATE_BODY" >/dev/null
+  pending=$(t30_out pending)
+  # Phase 2 publishes the evaluation into the Checks-API lineage.
+  T30_HEAD="$SHA30" REPO=o/r PR_NUMBER=7 CHECK_ID=42 HEAD_SHA="$SHA30" RC="$1" \
+    VERDICT="$(t30_out verdict)" t30_run "$P2B_BODY" >/dev/null
+  if grep -q 'conclusion=success' "$T30/gh.log"; then api_latest=success; else api_latest=failure; fi
+  # The lineage helper reads that newest Checks-API run.
+  local lin=''
+  if [ "$pending" = true ] && [ "$api_latest" != success ]; then lin=true; fi
+  set +e
+  RC="$1" VERDICT="$(t30_out verdict)" PENDING="$pending" API_BLOCKING="$lin" \
+    t30_run "$RV2_BODY" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" = 0 ] || native_failures=$((native_failures + 1))
+}
+merge_state() {
+  if [ "$native_failures" -gt 0 ] || [ "$api_latest" != success ]; then echo BLOCKED; else echo CLEAN; fi
+}
+set +e
+for _ in 1 2 3 4; do t30_event 1 "$BLK" pending; done
+[ "$native_failures" = 0 ] || bad="$bad native-failures-accumulated($native_failures)"
+[ "$(merge_state)" = BLOCKED ] || bad="$bad open-before-clearance"
+t30_event 0 'Merge clearance: PASS — cleared' ''
+[ "$(merge_state)" = CLEAN ] || bad="$bad not-clean-after-clearance"
+# Control: the same review before #2247 (no pending verdict reaches the job)
+# leaves four failed job-native runs, so the head stays blocked after clearance.
+native_failures=0
+for _ in 1 2 3 4; do t30_event 1 "$BLK" ''; done
+t30_event 0 'Merge clearance: PASS — cleared' ''
+{ [ "$native_failures" = 4 ] && [ "$(merge_state)" = BLOCKED ]; } || bad="$bad control($native_failures)"
+set -e
+if [ -z "$bad" ]; then
+  pass "#2247: four pending review events leave no failed job-native run; the head is blocked until clearance and clean after it, with no rerun (control without the verdict stays blocked)"
+else
+  fail "#2247 review-to-clearance sequence wrong:$bad"
+fi
+rm -rf "$T30"
+
+# Test 30f (#2247): the fence pins on the pending arm reject each unbound
+# shape. Inside the re-entrancy guard, like every other mcg22 case.
+if [ -z "${MCG_SKIP_FIX3_SELFTEST:-}" ] && declare -f mcg22_case >/dev/null 2>&1; then
+MCG_TAG='#2247'
+mcg22_case pending-const \
+  's{PENDING: \$\{\{ steps\.gate\.outputs\.pending \}\}}{PENDING: "true"}' \
+  fail '[#2247 pending arm]'
+mcg22_case api-blocking-const \
+  's{API_BLOCKING: \$\{\{ steps\.lineage\.outputs\.api_blocking \}\}}{API_BLOCKING: "true"}' \
+  fail '[#2247 pending arm]'
+mcg22_case lineage-id \
+  's{^        id: lineage$}{        id: lineage2}m' \
+  fail '[#2247 pending arm]'
+mcg22_case lineage-context \
+  's{(Confirm the Checks-API lineage blocks while pending.*?CHECK_NAME: )"Merge clearance gate"}{$1"Codex P1 unresolved threads"}s' \
+  fail '[#2247 pending arm]'
+mcg22_case lineage-run-id \
+  's{RUN_ID: \$\{\{ github\.run_id \}\}}{RUN_ID: "1"}' \
+  fail '[#2247 pending arm]'
+mcg22_case lineage-helper-dropped \
+  's{helper=scripts/gate-api-lineage-blocking\.sh}{helper=scripts/true.sh}' \
+  fail '[#2247 pending arm]'
+mcg22_case lineage-if-unguarded \
+  's{if: \$\{\{ steps\.gate\.outputs\.pending == .true. && steps\.open\.outputs\.id != .. \}\}}{if: \$\{\{ always() && steps.open.outputs.id != \x27\x27 \}\}}' \
+  fail '[#850 producer eligibility]'
+mcg22_case lineage-step-removed \
+  's{      - name: Confirm the Checks-API lineage blocks while pending \(#2247\)\n.*?(      - name: Report gate verdict)}{$1}s' \
+  fail '[#2247 pending arm]'
+unset MCG_TAG
+fi
+
+# ---------------------------------------------------------------------------
 echo
 echo "============================================"
 echo "test_merge_clearance_gate.sh: $PASS passed, $FAIL failed"

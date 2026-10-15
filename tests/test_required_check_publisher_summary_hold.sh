@@ -49,6 +49,14 @@ case "$name" in
   merge-clearance-gate.sh)
     rc=$MCG_RC
     [ "$rc" -ne 0 ] || echo "Merge clearance: PASS"
+    # #2247: a not-yet-cleared head. The real script writes the pending
+    # verdict only when the caller names a file, and exits 1 either way.
+    if [ "${MCG_PENDING:-0}" = 1 ]; then
+      printf '%s\n' "${MERGEPATH_GATE_VERDICT_FILE-unset}" >>"$GATE_VERDICT_LOG"
+      [ -z "${MERGEPATH_GATE_VERDICT_FILE:-}" ] \
+        || printf 'pending\n' >"$MERGEPATH_GATE_VERDICT_FILE"
+      echo "Merge clearance: BLOCKED — external review is NOT cleared"
+    fi
     ;;
   codex-p1-gate.sh) rc=$CODEX_RC ;;
   coderabbit-severity-gate.sh) rc=$CR_RC ;;
@@ -115,6 +123,10 @@ rcg_close() {
     -f "output[title]=$7" -f "output[summary]=$8" >/dev/null
 }
 export GATE_ENV_LOG="$TMP/gate-env" GH_CALL_LOG="$TMP/gh-calls"
+export GATE_VERDICT_LOG="$TMP/gate-verdict"
+# The real workflow never names a verdict file; clear an ambient export so the
+# pending case below proves the publisher does not ask for one.
+unset MERGEPATH_GATE_VERDICT_FILE
 export PR=7 head_sha=abc123
 export MCG_CONTEXT="Merge clearance gate"
 export CODEX_P1_CONTEXT="Codex P1 unresolved threads"
@@ -233,6 +245,25 @@ set +e
 case_rc=$?
 set -e
 record "recognized terminal result retires a prior rc-3 hold" "$case_rc"
+
+# #2247: a pending clearance verdict keeps the job-native run of the event job
+# non-failing only because the Checks-API lineage carries the block. The
+# publisher is that lineage's writer, so it must keep publishing FAILURE for
+# the same verdict: it never asks for the pending distinction, and rc 1 maps
+# to a red verdict exactly as before, with no infra flag.
+reset_case
+: >"$GATE_VERDICT_LOG"
+MCG_RC=1 MCG_PENDING=1; export MCG_RC MCG_PENDING
+run_call "$MCG_CALL" >"$TMP/mcg-pending.out"
+set +e
+[ "$(cat "$GATE_VERDICT_LOG")" = unset ] \
+  && [ "$had_infra_error" -eq 0 ] && one_post \
+  && grep -q -- '-f conclusion=failure' "$GH_CALL_LOG" \
+  && ! grep -q -- '-f conclusion=success' "$GH_CALL_LOG"
+case_rc=$?
+set -e
+record "pending clearance verdict still publishes a red Checks-API run, and the publisher never asks for the pending distinction" "$case_rc"
+MCG_RC=0 MCG_PENDING=0; export MCG_RC MCG_PENDING
 
 # An opening failure authorizes no evaluation or completion; a closing
 # failure leaves the owned opening pending and reports infrastructure failure.

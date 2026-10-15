@@ -3193,6 +3193,58 @@ else
   fail "expected cr_surface_fp to sample all four surfaces and fail closed on each read (fail-closed lines: $FP_FAILCLOSED)"
 fi
 
+# ---------------------------------------------------------------------------
+# Test 47d1f (#2247): this gate has no pending verdict, so the event-driven
+# job fails its job-native run on every non-green exit. #2247 lets the Merge
+# clearance gate's native run conclude non-failing while external review has
+# merely not cleared yet. Neither non-green state here is that: rc 1 is an
+# unresolved blocking-tier finding, a real block; rc 3 is a current-head
+# review run this gate cannot classify, an unknown verdict. Both keep failing
+# the native run, and the step never asks the script for the pending
+# distinction. Behavioural: the step body is extracted and run.
+# ---------------------------------------------------------------------------
+echo "--- Test 47d1f (#2247): the event-driven job fails on every non-green exit"
+T2247="$WORKDIR/t2247"
+mkdir -p "$T2247/scripts"
+CR_STEP=$(awk '
+  index($0, "- name: Run scripts/coderabbit-severity-gate.sh") { instep = 1; next }
+  instep && !inrun && /^        run: \|/ { inrun = 1; next }
+  inrun {
+    if ($0 ~ /^[[:space:]]*$/) { print ""; next }
+    if ($0 !~ /^          /) exit
+    sub(/^          /, "")
+    print
+  }
+' "$ROOT/.github/workflows/coderabbit-severity-gate.yml")
+cat >"$T2247/scripts/coderabbit-severity-gate.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${MERGEPATH_GATE_VERDICT_FILE-unset}" >>"$T2247_LOG"
+[ -z "${MERGEPATH_GATE_VERDICT_FILE:-}" ] || printf 'pending\n' >"$MERGEPATH_GATE_VERDICT_FILE"
+exit "$T2247_RC"
+SH
+chmod +x "$T2247/scripts/coderabbit-severity-gate.sh"
+bad=""
+[ -n "$CR_STEP" ] || bad="$bad step-not-extracted"
+for rc in 0 1 2 3; do
+  set +e
+  ( cd "$T2247" && T2247_LOG="$T2247/log" T2247_RC="$rc" PR_NUMBER=7 REPO=o/r \
+      bash -c "$CR_STEP" >/dev/null 2>&1 )
+  got=$?
+  set -e
+  if [ "$rc" = 0 ]; then
+    [ "$got" = 0 ] || bad="$bad rc0($got)"
+  else
+    [ "$got" != 0 ] || bad="$bad rc$rc-non-failing"
+  fi
+done
+grep -qv '^unset$' "$T2247/log" && bad="$bad asked-for-pending"
+[ "$(grep -c '^unset$' "$T2247/log" || true)" = 4 ] || bad="$bad script-not-run"
+if [ -z "$bad" ]; then
+  pass "rc 1 (real block), rc 2 (infra) and rc 3 (unknown verdict) all fail the native run; the step never asks for a pending verdict"
+else
+  fail "event-driven CodeRabbit native mapping changed:$bad"
+fi
+
 # A raw C0 control byte anywhere in the workflow makes the YAML document
 # unloadable — Ruby Psych rejects the file with "control characters are not
 # allowed" — and GitHub then refuses to register the workflow at all. For a

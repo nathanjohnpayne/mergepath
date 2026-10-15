@@ -284,6 +284,17 @@ paths:
     requires:
       - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
+  # REST transport for the guarded writes (#1057 item A, #1542). On a cloud
+  # surface every `gh pr` / `gh issue` subcommand is a GraphQL call the proxy
+  # refuses, so both wrappers run those verbs as REST calls under the verified
+  # token and read each byline back; locally the wrapped command runs through
+  # gh as before. Both wrappers source it at startup, so it travels in their
+  # requires: closure.
+  - path: scripts/lib/gh-rest-transport.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/owner-admin-override.py"  # classifies every merge spelling before dispatch
   # Capability probe (#1057): measures what an agent session (local, Claude
   # cloud, Codex cloud, CI) can do on GitHub before it tries, and caches a
   # tier `--check --print-exports` re-exports. It resolves write tokens
@@ -514,6 +525,15 @@ paths:
       - "scripts/lib/coderabbit-fence.sh"
       - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
+      # #2253: the rate-limit failover invokes the Codex requester by path
+      # with flags the two scripts agree on (--allow-moving-head since #2166).
+      # A newer caller against an older requester passes a flag the requester
+      # rejects, and the reverse pairing is refused by the requester's
+      # moving-head guard. The edge is declared in BOTH entries so the
+      # requires-closure gate refuses to ship either file without the other
+      # current on the consumer. Fenced by scripts/ci/check_sync_manifest
+      # (coupled callers).
+      - "scripts/codex-review-request.sh"
   # #489 CodeRabbit-rate-limit auto-merge disposition gate. agent-review.yml's
   # exit-5 (rate-limited) branch calls this script to decide whether the
   # Codex-failover path may auto-merge. Absent on a consumer it exits 127 and
@@ -585,6 +605,13 @@ paths:
       - "scripts/lib/feedback-policy-helpers.sh"    # #1100, policy_block_field_parsed (#1124)
       - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
+      # #2253: the reverse of the edge on scripts/coderabbit-wait.sh above.
+      # #2175 shipped this requester's moving-head guard together with the
+      # failover's --allow-moving-head; a commit-path sync of the requester
+      # alone (the #2240 canary, nathanpaynedotcom#1377) left the older caller
+      # on the consumer, whose rate-limit failover would then exit 8 without
+      # posting. A caller must travel with the callee whose contract it uses.
+      - "scripts/coderabbit-wait.sh"
   # Complete-history reviewer-feedback accounting gate (#1000). Reads every
   # paginated inline comment, review object, and PR-level comment; reconciles
   # classified findings with finding-bound disposition evidence. It hard-
@@ -654,6 +681,8 @@ paths:
     consumers: all
     requires:
       - "scripts/gh-as-reviewer.sh"
+      - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
       - "scripts/identity-check.sh"         # --expect-write-identity (#1057 A2); an older checker rejects the flag
@@ -679,6 +708,8 @@ paths:
       - "scripts/lib/codex-failure-markers.sh"   # #1085, exact-head Phase 4a timeout handoff parsed by phase-4b/lib.sh
       - "scripts/lib/gh-api-array.sh"   # #1008/#1085, strict paginated timeout-evidence read
       - "scripts/gh-as-reviewer.sh"
+      - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/post-phase-4b-handoff.sh"
       # The #814 same-head barrier invokes both of these directly, by path,
       # on every non-dry run. A consumer that receives the orchestrator
@@ -870,6 +901,14 @@ paths:
       - "scripts/lib/blocking-labels.sh"   # #1277, holds apply before clearance exemptions
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
       - "scripts/lib/dependabot-commit-provenance.sh"   # Dependabot arm requires Dependabot-only commits
+  - path: scripts/gate-api-lineage-blocking.sh
+    # #2247: the event-driven Merge clearance gate job runs it from the
+    # trusted checkout before concluding its job-native run non-failing while
+    # clearance is pending. Absent, that step leaves the native run failing
+    # (the pre-#2247 behaviour), so it degrades safely, but it must travel
+    # with the workflow for the fix to reach a consumer.
+    type: canonical
+    consumers: all
   - path: scripts/daily-feedback-rollup.sh
     # Cron workhorse invoked by .github/workflows/daily-feedback-rollup.yml.
     # Sources scripts/lib/daily-feedback-rollup-helpers.sh. The
@@ -964,6 +1003,7 @@ paths:
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/identity-check.sh"         # gh-token-resolver.sh executes it before any write
       - "scripts/lib/gh-command-classifier.sh"  # shared guard/wrapper prefix vocabulary
+      - "scripts/lib/gh-rest-transport.sh"  # sourced; the REST transport and readback on a cloud surface (#1057 A)
       - "scripts/lib/pr-body-contract.sh"   # sourced; provides pr_body_validate
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/lib/reviewers-helpers.sh"  # pr-body-contract.sh hard-sources it
@@ -985,6 +1025,8 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/lib/gh-rest-transport.sh"  # sourced; the REST transport and readback on a cloud surface (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/identity-check.sh"         # gh-token-resolver.sh executes it before any write
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it
   # Pre-action identity check (#284) — the assertion helper that every
@@ -1011,6 +1053,7 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/gh-command-classifier.sh"  # shared guard/wrapper prefix vocabulary
+      - "scripts/lib/graphql-ceiling.sh"    # recognizes the cloud proxy's GraphQL refusal; the self-approve read falls back to REST (#1057 A)
       - "scripts/lib/pr-body-contract.sh"   # sourced directly; missing = guard aborts
       - "scripts/lib/pr-body-contract.mjs"  # invoked by the lib; missing = helpers return empty
   # The PR-body parsing contract, extracted so the guard and the author wrapper
@@ -1070,6 +1113,8 @@ paths:
       # two above and this is the list that governs them.
       - "scripts/codex-review-check.sh"     # scanned for Authoring-Agent parse parity
       - "scripts/gh-as-author.sh"           # is_pr_create_command() is extracted and sourced
+      - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/hooks/gh-pr-guard.sh"      # self-approval refusal string is asserted
   - path: scripts/hooks/label-removal-guard.sh
     type: canonical
@@ -1133,6 +1178,8 @@ paths:
     consumers: all
     requires:
       - "scripts/gh-as-author.sh"
+      - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/identity-check.sh"
       - "scripts/hooks/gh-pr-guard.sh"
       - "scripts/merge-clearance-gate.sh"
@@ -1153,6 +1200,8 @@ paths:
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
       - "scripts/gh-as-author.sh"                         # changed by #1057 A2; the test asserts its new behavior
       - "scripts/lib/gh-token-resolver.sh"                # changed by #1057 A2; the test asserts its new behavior
+      - "scripts/lib/gh-rest-transport.sh"                # the wrapper sources it; the pin fixture copies it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
   - path: tests/test_gh_as_reviewer.sh
     type: canonical
     consumers: all
@@ -1161,6 +1210,26 @@ paths:
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
       - "scripts/gh-as-reviewer.sh"                       # changed by #1057 A2; the test asserts its new behavior
       - "scripts/lib/gh-token-resolver.sh"                # changed by #1057 A2; the test asserts its new behavior
+      - "scripts/lib/gh-rest-transport.sh"                # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
+  # The REST transport suite (#1057 A, #1542): the closed argv grammar, each
+  # verb's REST calls and the byline readback, run through both wrappers
+  # against a gh stub. The create cases go through the author wrapper's
+  # PR-body validation, so the contract libs travel with it.
+  - path: tests/test_gh_rest_transport.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/gh-rest-transport.sh"
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
+      - "scripts/gh-as-author.sh"
+      - "scripts/gh-as-reviewer.sh"
+      - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/identity-check.sh"
+      - "scripts/lib/credential-class.sh"
+      - "scripts/lib/pr-body-contract.sh"   # the create cases run the wrapper's body validation
+      - "scripts/lib/pr-body-contract.mjs"
+      - "scripts/lib/reviewers-helpers.sh"
   - path: tests/test_gh_wrapper_parallel.sh
     type: canonical
     consumers: all
@@ -1519,6 +1588,8 @@ paths:
       - "scripts/lib/credential-class.sh"   # identity-check.sh --expect-write-identity sources it (#1057)
       - "scripts/codex-record-feedback.sh"                # changed by #1057 A2; the test asserts its new behavior
       - "scripts/gh-as-reviewer.sh"                       # changed by #1057 A2; the test asserts its new behavior
+      - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/lib/gh-token-resolver.sh"                # changed by #1057 A2; the test asserts its new behavior
   # Codex usage-limit / not-connected marker detection (#722): the shared
   # scripts/lib/codex-failure-markers.sh regexes, codex-review-request.sh's
@@ -1556,6 +1627,7 @@ paths:
       - "scripts/ci/check_merge_clearance_gate"
       - ".github/workflows/pr-review-policy.yml"  # #1249 sibling fixture
       - "scripts/merge-clearance-gate.sh"
+      - "scripts/gate-api-lineage-blocking.sh"   # #2247 Test 30 drives the helper
       # Test 22's positive controls are EXTRACTED from the workflow (#849), so
       # the test reads it directly at runtime. Without this edge the closure
       # gate could ship the test to a consumer whose workflow predates the
@@ -1605,6 +1677,8 @@ paths:
       - "scripts/lib/branch-requirements.sh"
       - "scripts/lib/coderabbit-fence.sh"
       - "scripts/gh-as-reviewer.sh"
+      - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/post-phase-4b-handoff.sh"
       - "scripts/coderabbit-wait.sh"
       - "scripts/codex-review-check.sh"
@@ -1645,6 +1719,8 @@ paths:
       - "scripts/lib/branch-requirements.sh"
       - "scripts/lib/coderabbit-fence.sh"
       - "scripts/gh-as-reviewer.sh"
+      - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/post-phase-4b-handoff.sh"
       - "scripts/coderabbit-wait.sh"
       - "scripts/codex-review-check.sh"
@@ -1716,6 +1792,8 @@ paths:
     consumers: all
     requires:
       - "scripts/gh-as-reviewer.sh"
+      - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/lib/gh-token-resolver.sh"
   # Dispatches the thread-resolution lane and waits for its own run (#1057
   # G). Dispatches through the author wrapper, so it repeats that wrapper's
@@ -1726,6 +1804,8 @@ paths:
     requires:
       - ".github/workflows/thread-resolution-lane.yml"
       - "scripts/gh-as-author.sh"
+      - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/identity-check.sh"
       - "scripts/lib/gh-command-classifier.sh"
@@ -1745,6 +1825,8 @@ paths:
       - "scripts/lib/pr-body-contract.mjs"
       - "scripts/lib/reviewers-helpers.sh"
       - "scripts/gh-as-reviewer.sh"
+      - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
+      - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
       - "scripts/identity-check.sh"
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/lib/credential-class.sh"
@@ -2093,6 +2175,7 @@ paths:
       - "scripts/lib/gh-api-array.sh"
       - "scripts/lib/review-policy-scalar.sh"
       - "scripts/gh-as-author.sh"
+      - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/identity-check.sh"
       - "scripts/lib/gh-command-classifier.sh"
@@ -2120,6 +2203,7 @@ paths:
       - "scripts/lib/gh-api-array.sh"
       - "scripts/lib/review-policy-scalar.sh"
       - "scripts/gh-as-author.sh"
+      - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/identity-check.sh"
       - "scripts/lib/gh-command-classifier.sh"
@@ -2140,6 +2224,7 @@ paths:
       - "scripts/lib/gh-api-array.sh"
       - "scripts/lib/review-policy-scalar.sh"
       - "scripts/gh-as-author.sh"
+      - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/identity-check.sh"
       - "scripts/lib/gh-command-classifier.sh"
@@ -2267,6 +2352,7 @@ paths:
       - "scripts/workflow/required-check-generation.sh"
       - "scripts/merge-clearance-gate.sh"
       - "scripts/codex-review-check.sh"
+      - "scripts/gate-api-lineage-blocking.sh"   # #2247 pending arm of the native conclusion
   - path: .github/workflows/required-check-publisher.yml
     type: canonical
     consumers: all
@@ -2419,6 +2505,7 @@ paths:
       - "tests/test_pr_body_contract_parity.sh"  # check_gh_as_author (#1121) — invoked by the wrapper, so a path-scoped kit sync without it reds the consumer lint
       - "tests/test_gh_as_author.sh"           # check_gh_as_author
       - "tests/test_gh_as_reviewer.sh"         # check_gh_as_author
+      - "tests/test_gh_rest_transport.sh"      # check_gh_as_author (#1057 A)
       - "tests/test_gh_wrapper_parallel.sh"    # check_gh_as_author
       - "tests/test_check_no_bare_gh_writes.sh"  # check_gh_as_author (#466)
       - "tests/test_identity_check_fail_closed.sh"  # check_gh_as_author (#284/#405)
@@ -2491,6 +2578,7 @@ paths:
       - "scripts/coderabbit-severity-gate.sh"  # check_coderabbit_severity_gate (#577)
       - "scripts/lib/feedback-policy-helpers.sh"  # check_feedback_policy_helpers + both severity gates source it (#576/#577)
       - "scripts/merge-clearance-gate.sh"      # check_merge_clearance_gate
+      - "scripts/gate-api-lineage-blocking.sh"   # check_merge_clearance_gate (#2247 pending-arm helper)
       - "scripts/codex-review-request.sh"      # check_codex_scripts
       - "scripts/codex-review-check.sh"        # check_codex_scripts, check_canonical_bugs_263caf3
       - "scripts/codex-record-feedback.sh"     # check_codex_scripts (#487)
@@ -2519,6 +2607,7 @@ paths:
       - "scripts/lib/reviewers-helpers.sh"     # pr-body-contract.sh runtime closure (#1058)
       - "scripts/lib/credential-class.sh"    # identity-check.sh --expect-write-identity (#1057)
       - "scripts/gh-as-reviewer.sh"            # check_gh_as_author (transitive)
+      - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
       - "scripts/hooks/gh-pr-guard.sh"         # tests/test_gh_pr_guard.sh runs it
       - "scripts/coderabbit-automerge-rate-limit-gate.sh"  # tests/test_coderabbit_automerge_rate_limit_gate.sh runs it (#489/#521)
       - "scripts/gh-projects/move-item.sh"     # check_gh_projects_move_item subject
@@ -2588,6 +2677,7 @@ paths:
       - "scripts/lib/merge-queue-protection.sh"   # #1058, safe native-arm preservation + bridge topology
       - "scripts/lib/merge-queue-authorization.sh" # #1058, exact-head queue authorization history
       - "scripts/gh-as-author.sh"                 # #1058, final target-audit marker write
+      - "scripts/lib/gh-rest-transport.sh"  # the wrapper sources it (#1057 A)
       - "scripts/lib/gh-token-resolver.sh"         # gh-as-author.sh runtime closure (#1058)
       - "scripts/identity-check.sh"                # gh-token-resolver.sh runtime closure (#1058)
       - "scripts/lib/credential-class.sh"    # identity-check.sh --expect-write-identity (#1057)

@@ -19,6 +19,18 @@ name: Merge Clearance Gate
 # PRs and when the relevant knob is off — so it is safe as a required
 # check on every PR.
 #
+# Pending is not a failure of the job-native run (#2247). When the only
+# reason for exit 1 is that external review has not cleared yet, the script
+# says so explicitly (MERGEPATH_GATE_VERDICT_FILE), and the event-driven job
+# concludes its native run non-failing once it has confirmed the Checks-API
+# lineage of this context is red or in progress on the head. Branch
+# protection never retires an earlier failed job-native run of a required
+# context, so every review event during a long review used to leave a failed
+# run that had to be rerun after the PR cleared. The Checks-API writes are
+# unchanged: phase 2 below, the publisher, the sweep and the dispatch job all
+# still publish failure while clearance is pending. Real blocks, infra exits
+# and unrecognised output still fail the native run.
+#
 # Gate ON/OFF is controlled per-class in .github/review-policy.yml
 # (dependabot.reviewer_gate.enabled, codex.external_review_gate.enabled).
 # Mergepath sets both true (canonical source). Downstream consumers
@@ -150,9 +162,14 @@ jobs:
     # So the block trades a transient wrong-verdict window for a PERMANENT
     # blocker, on a PR that emits several review events in quick succession.
     # The clobber race stays open and is recorded as residual risk instead:
-    # the native producer still carries the correct verdict for the later run,
-    # and the scheduled sweep re-evaluates. Serialization is only safe once the
-    # required context has a single producer that is not a cancelable job.
+    # the native producer still carries the correct verdict for the later run
+    # on every real block, and the scheduled sweep re-evaluates. Since #2247
+    # a merely-pending verdict leaves the native run non-failing, so for that
+    # state the residual rests on the Checks-API lineage alone: the pending
+    # arm requires that lineage to be red or in progress at the moment this
+    # run concludes, and the publisher withholds a verdict whenever a newer
+    # hold was opened after its pass began. Serialization is only safe once
+    # the required context has a single producer that is not a cancelable job.
     #
     # #841: this job now ALSO publishes its verdict as a Checks-API check_run
     # under the required-check name, so `checks: write` is needed here.
@@ -296,6 +313,15 @@ jobs:
           # conclusion is set by "Report gate verdict" below, so that phase 2
           # can run in between and publish the same verdict to the Checks-API
           # slot (#841).
+          #
+          # #2247: the script's explicit pending verdict travels in a file
+          # this step owns, never in the output (which carries delegated,
+          # attacker-influenceable text). The script writes exactly
+          # `pending` there from its one not-yet-cleared site and touches it
+          # nowhere else; removing it first means a stale file cannot speak.
+          verdict_file="$RUNNER_TEMP/mcg-verdict"
+          rm -f "$verdict_file"
+          export MERGEPATH_GATE_VERDICT_FILE="$verdict_file"
           set +e
           output=$(scripts/merge-clearance-gate.sh "$PR_NUMBER" "$REPO" 2>&1)
           rc=$?
@@ -320,6 +346,17 @@ jobs:
             *"Merge clearance: BLOCKED"*) verdict=blocked ;;
           esac
           echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+          # Pending is a positive verdict, never an inference (#2247): rc 1,
+          # the BLOCKED line, and the file reading exactly `pending`. Any
+          # other combination (an older script that never writes the file, a
+          # real block, an infra exit, an unreadable file) is not pending and
+          # the native run fails exactly as before.
+          pending=false
+          if [ "$rc" -eq 1 ] && [ "$verdict" = blocked ] && [ -f "$verdict_file" ] \
+             && [ "$(cat "$verdict_file" 2>/dev/null)" = pending ]; then
+            pending=true
+          fi
+          echo "pending=$pending" >> "$GITHUB_OUTPUT"
 
       - name: Close the required check_run (#841 phase 2)
         # !cancelled(), NOT always(): on cancellation we deliberately leave the
@@ -388,12 +425,64 @@ jobs:
           echo "::warning::Could not close check_run $CHECK_ID; the required context stays PENDING until the scheduled sweep supersedes it (#841)."
           exit 0
 
+      - name: Confirm the Checks-API lineage blocks while pending (#2247)
+        # Runs only for the script's explicit pending verdict, and only when
+        # this run opened its own Checks-API hold (a fork or Dependabot run
+        # cannot, and keeps the pre-#2247 failing native run). Reads the
+        # head's current runs of this context and sets api_blocking=true only
+        # when the Checks-API lineage blocks on its own: every current
+        # Checks-API run is in progress or red, and none shares this run's
+        # check suite (scripts/gate-api-lineage-blocking.sh states each
+        # condition and why). A missing helper, a failed read or any unmet
+        # condition leaves the output unset, so the native run fails as
+        # before. Never fails the job itself: the next step decides. No
+        # status function in the condition, so the implicit success() also
+        # skips it after any earlier failed step or a cancellation.
+        id: lineage
+        if: ${{ steps.gate.outputs.pending == 'true' && steps.open.outputs.id != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ID: ${{ github.run_id }}
+          CHECK_NAME: "Merge clearance gate"
+        run: |
+          set -uo pipefail
+          helper=scripts/gate-api-lineage-blocking.sh
+          if [ ! -x "$helper" ]; then
+            echo "::warning::$helper is not on the default branch; the native run stays failing while clearance is pending (#2247)."
+            exit 0
+          fi
+          if "$helper" "$REPO" "$HEAD_SHA" "$CHECK_NAME" "$RUN_ID"; then
+            echo "api_blocking=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Could not confirm the Checks-API lineage blocks $HEAD_SHA; the native run stays failing (#2247)."
+          fi
+          exit 0
+
       - name: Report gate verdict
         # The job's NATIVE check conclusion. Mapping is identical to pre-#841
-        # except for the sentinel guard.
+        # except for the sentinel guard and the #2247 pending arm.
+        #
+        # #2247: while clearance is merely pending, this run concludes
+        # non-failing. Actions jobs cannot conclude `neutral`, and a skipped
+        # job would need a second job keyed on this one's output, so the
+        # pending arm exits 0 and says why in the log. Branch protection keeps
+        # every earlier failed job-native run of a required context on the
+        # head until it is rerun, so a run that failed only because review
+        # was still in progress used to block the PR after it cleared. The
+        # block now lives only in the Checks-API lineage, which the
+        # previous step confirmed is red or in progress on this head; the
+        # publisher and the scheduled sweep turn it green only from their own
+        # evaluation of a cleared head. Every other non-green state (a
+        # human-controlled hold, a Dependabot head without approval, a
+        # fail-closed applicability fallback, an infra exit, a missing
+        # verdict line) still fails here.
         env:
           RC: ${{ steps.gate.outputs.rc }}
           VERDICT: ${{ steps.gate.outputs.verdict }}
+          PENDING: ${{ steps.gate.outputs.pending }}
+          API_BLOCKING: ${{ steps.lineage.outputs.api_blocking }}
         run: |
           set -euo pipefail
           if [ "$RC" -eq 0 ] && [ "$VERDICT" != "pass" ]; then
@@ -403,6 +492,11 @@ jobs:
           if [ "$RC" -eq 2 ]; then
             echo "::error::merge-clearance-gate.sh exited 2 (config/usage/infra error)"
             exit 1
+          fi
+          if [ "$RC" -eq 1 ] && [ "$VERDICT" = blocked ] && [ "$PENDING" = true ] \
+             && [ "$API_BLOCKING" = true ]; then
+            echo "::notice::Merge clearance is PENDING: external review has not cleared this head yet. This job-native run concludes non-failing by design (#2247); the Checks-API run of the same name carries the block until clearance."
+            exit 0
           fi
           exit "$RC"
 

@@ -228,6 +228,7 @@
       "tests/test_gh_as_author.sh",
       "tests/test_gh_as_reviewer.sh",
       "tests/test_gh_pr_guard.sh",
+      "tests/test_gh_rest_transport.sh",
       "tests/test_gh_wrapper_parallel.sh",
       "tests/test_identity_check_fail_closed.sh",
       "tests/test_owner_admin_override.py"
@@ -247,6 +248,7 @@
       "scripts/lib/blocking-labels.sh",
       "scripts/lib/dependabot-commit-provenance.sh",
       "scripts/merge-clearance-gate.sh",
+      "scripts/gate-api-lineage-blocking.sh",
       "tests/test_merge_clearance_gate.sh",
       "tests/test_465_fail_closed.sh"
     ],

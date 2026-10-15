@@ -267,6 +267,7 @@ author_wrapper_runtime = [
   "scripts/lib/gh-token-resolver.sh",
   "scripts/identity-check.sh",
   "scripts/lib/gh-command-classifier.sh",
+  "scripts/lib/gh-rest-transport.sh",
   "scripts/lib/pr-body-contract.sh",
   "scripts/lib/pr-body-contract.mjs",
   "scripts/lib/reviewers-helpers.sh",

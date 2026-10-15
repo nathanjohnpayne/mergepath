@@ -21,10 +21,20 @@
 # ~/.netrc, injected config and hooks out of reach and gh's credential helper
 # (the verified token) alone (#1541).
 #
+# Transport: locally the wrapped gh command runs as given. On a cloud
+# surface (MERGEPATH_AGENT_SURFACE claude-cloud / codex-cloud, or
+# CLAUDE_CODE_REMOTE=true) every `gh pr` / `gh issue` subcommand is a GraphQL
+# call the proxy refuses, so the wrapper runs the same write as REST calls
+# under the verified token and reads its byline back, in one canonical argv
+# form per verb; `gh pr merge` is refused there because the merge gates read
+# GraphQL. MERGEPATH_GH_TRANSPORT=gh|rest|auto overrides the choice. See
+# scripts/lib/gh-rest-transport.sh (#1057 item A).
+#
 # Environment:
 #   GH_AS_AUTHOR_IDENTITY   author login to verify.
 #                           Default: nathanjohnpayne
 #   OP_PREFLIGHT_AUTHOR_PAT preferred cached author token.
+#   MERGEPATH_GH_TRANSPORT  gh | rest | auto (default auto; see above).
 #   GH_AS_AUTHOR_PUSH_REPO  owner/repo the git form must push to (required
 #                           for it; from the caller's trusted input).
 #   GH_AS_AUTHOR_TRACE_MARKER  optional path, created after every check
@@ -37,7 +47,9 @@
 #   2    token verification failed
 #   3    token lookup failed
 #   5    post-create author verification failed or could not complete, or
-#        the git push destination or repo config was refused
+#        the git push destination or repo config was refused, or (REST
+#        transport) a write's byline could not be read back as the author
+#   6    REST transport: `gh pr merge` is not run on a cloud surface
 #   70   GH_AS_AUTHOR_TRACE_MARKER could not be written; nothing ran
 #   *    propagated from the wrapped command otherwise
 #
@@ -55,6 +67,8 @@ gh_wrapper_validate_path || exit 5
 . "$ROOT/scripts/lib/pr-body-contract.sh"
 # shellcheck source=lib/gh-command-classifier.sh
 . "$ROOT/scripts/lib/gh-command-classifier.sh"
+# shellcheck source=lib/gh-rest-transport.sh
+. "$ROOT/scripts/lib/gh-rest-transport.sh"
 
 AUTHOR="${GH_AS_AUTHOR_IDENTITY:-nathanjohnpayne}"
 
@@ -100,6 +114,12 @@ unset GH_AS_AUTHOR_TRACE_MARKER
 if [ -n "$TRACE_MARKER" ] && [ "$AUTHOR_PAYLOAD_KIND" != "gh" ]; then
   echo "gh-as-author: GH_AS_AUTHOR_TRACE_MARKER applies to gh writes only." >&2
   exit 1
+fi
+# Arguments that would send the verified token elsewhere or replace it
+# (--hostname, a host-qualified --repo, an Authorization header on gh api)
+# are refused before any token is looked up (#1542).
+if [ "$AUTHOR_PAYLOAD_KIND" = "gh" ]; then
+  gh_payload_refuse_credential_overrides gh-as-author "$@" || exit 1
 fi
 
 set +e
@@ -149,7 +169,10 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
       echo "gh-as-author: PR body file is not readable: $body_file" >&2
       exit 1
     fi
-    PR_BODY="$(cat "$body_file")"
+    # Byte-exact: command substitution would strip trailing newlines, and
+    # the body sent must be the file's, as gh --body-file sends it.
+    PR_BODY="$(cat "$body_file"; printf x)"
+    PR_BODY="${PR_BODY%x}"
   }
 
   while [ "$#" -gt 0 ]; do
@@ -231,6 +254,24 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
   set -- "${NORMALIZED_COMMAND[@]}"
 fi
 
+# Transport. On a cloud surface every `gh pr` / `gh issue` subcommand is a
+# GraphQL call the proxy refuses, so the write runs as REST calls under the
+# verified token and its byline is read back there; `gh pr merge` is refused
+# there, because the merge gates below read GraphQL (#1057 item A). The
+# validated PR-create body arrives as --body. Locally the wrapped command
+# runs through gh, as before. See scripts/lib/gh-rest-transport.sh.
+TRANSPORT="$(gh_transport_select)" || exit 1
+if [ "$TRANSPORT" = "rest" ]; then
+  trap 'gh_rest_cleanup' EXIT
+  # shellcheck disable=SC2034  # read by gh_rest_run (scripts/lib/gh-rest-transport.sh)
+  GH_REST_TRACE_MARKER="$TRACE_MARKER"
+  set +e
+  gh_rest_run gh-as-author "$AUTHOR" "$TOKEN" "$@"
+  WRAPPED_RC=$?
+  set -e
+  exit "$WRAPPED_RC"
+fi
+
 # The verified token goes to github.com only. Any other host gets the resolver's
 # non-credential sentinel in place of an Enterprise token or stored login, so
 # it can neither carry the write nor receive the PAT (see gh-token-resolver.sh).
@@ -255,7 +296,9 @@ run_with_author_token() {
     echo "gh-as-author: cannot write the trace marker $TRACE_MARKER; refusing to run the write unrecorded." >&2
     exit 70
   fi
-  GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+  # GH_HOST is pinned to github.com, where the token was verified: with it
+  # unset, gh targets the only host in its hosts file (Phase 4b on #2178).
+  GH_HOST=github.com GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
     GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" "$@"
 }
 
@@ -291,7 +334,7 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
 
   ACTUAL_AUTHOR=$(
     unset GITHUB_TOKEN
-    GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
+    GH_HOST=github.com GH_TOKEN="$TOKEN" GH_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" \
       GITHUB_ENTERPRISE_TOKEN="$GH_WRAPPER_NO_ENTERPRISE_CREDENTIAL" gh pr view "$PR_NUM" --repo "$PR_REPO" --json author --jq .author.login 2>/dev/null || echo ""
   )
   if [ -z "$ACTUAL_AUTHOR" ]; then
