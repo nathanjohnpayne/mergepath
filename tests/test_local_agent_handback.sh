@@ -11,6 +11,11 @@
 #
 # Bash 3.2 portable.
 
+# These cases drive the gh transport. Pin it so a cloud session's
+# CLAUDE_CODE_REMOTE (or MERGEPATH_AGENT_SURFACE) cannot switch the wrappers
+# to the REST transport, which tests/test_gh_rest_transport.sh covers.
+export MERGEPATH_GH_TRANSPORT=gh
+
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -27,7 +32,7 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 FIX="$WORKDIR/repo"
 mkdir -p "$FIX/scripts/lib" "$FIX/.github"
 cp "$ROOT/scripts/post-local-agent-handback.sh" "$ROOT/scripts/gh-as-reviewer.sh" "$ROOT/scripts/identity-check.sh" "$FIX/scripts/"
-cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$ROOT/scripts/lib/credential-class.sh" "$FIX/scripts/lib/"
+cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$ROOT/scripts/lib/credential-class.sh" "$ROOT/scripts/lib/gh-rest-transport.sh" "$FIX/scripts/lib/"
 cat >"$FIX/scripts/agent-capability-probe.sh" <<'P'
 #!/usr/bin/env bash
 printf 'export MERGEPATH_AGENT_TIER=%s\nexport MERGEPATH_AGENT_SURFACE_MEASURED=%s\n' "${STUB_TIER:-author-writes,reviewer-writes}" "${STUB_SURFACE:-claude-cloud}"
@@ -336,7 +341,7 @@ DFIX="$WORKDIR/dispatch"
 mkdir -p "$DFIX/scripts/lib" "$DFIX/scripts/workflow" "$DFIX/bin"
 cp "$ROOT/scripts/dispatch-thread-resolution-lane.sh" "$ROOT/scripts/gh-as-author.sh" "$ROOT/scripts/identity-check.sh" "$DFIX/scripts/"
 cp "$ROOT/scripts/workflow/owner-admin-override.py" "$DFIX/scripts/workflow/"
-for f in gh-token-resolver.sh credential-class.sh gh-command-classifier.sh pr-body-contract.sh pr-body-contract.mjs reviewers-helpers.sh feedback-policy-helpers.sh; do
+for f in gh-token-resolver.sh credential-class.sh gh-command-classifier.sh gh-rest-transport.sh pr-body-contract.sh pr-body-contract.mjs reviewers-helpers.sh feedback-policy-helpers.sh; do
   [ -f "$ROOT/scripts/lib/$f" ] && cp "$ROOT/scripts/lib/$f" "$DFIX/scripts/lib/"
 done
 cat >"$DFIX/bin/gh" <<'G'

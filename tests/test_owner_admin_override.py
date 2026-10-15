@@ -320,6 +320,12 @@ const github={rest:{issues:{listComments:'comments'},pulls:{listReviews:'reviews
             ['graphql', '--input', 'payload.json'],
             ['graphql', '--input=-'],
             ['graphql', '-f', 'query=query { viewer {login}}', '-f', 'query=mutation {mergePullRequest(input:{}){clientMutationId}}'],
+            # Arming auto-merge or entering the queue merges without the gates too.
+            ['graphql', '-f', 'query=mutation { enablePullRequestAutoMerge(input:{pullRequestId:"PR_x"}) {clientMutationId}}'],
+            ['graphql', '-f', 'query=mutation { disablePullRequestAutoMerge(input:{pullRequestId:"PR_x"}) {clientMutationId}}'],
+            ['graphql', '-f', 'query=mutation { addPullRequestToMergeQueue(input:{pullRequestId:"PR_x"}) {clientMutationId}}'],
+            ['graphql', '-f', 'query=mutation { enqueuePullRequest(input:{pullRequestId:"PR_x"}) {clientMutationId}}'],
+            ['graphql', '-f', 'query=mutation { dequeuePullRequest(input:{id:"MQE_x"}) {clientMutationId}}'],
         ]
         for request in requests:
             with self.subTest(request=request), self.assertRaisesRegex(ValueError, 'merge|literal query'):

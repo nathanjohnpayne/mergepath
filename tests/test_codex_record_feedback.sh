@@ -7,6 +7,11 @@
 # touching GitHub. The reaction WRITE path is asserted to go through
 # gh-as-reviewer.sh under the reviewer identity (never a bare gh write).
 
+# These cases drive the gh transport. Pin it so a cloud session's
+# CLAUDE_CODE_REMOTE (or MERGEPATH_AGENT_SURFACE) cannot switch the wrappers
+# to the REST transport, which tests/test_gh_rest_transport.sh covers.
+export MERGEPATH_GH_TRANSPORT=gh
+
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -103,6 +108,7 @@ make_real_wrapper_case() {
   cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"     # #1008, hard-sourced
   cp "$ROOT/scripts/gh-as-reviewer.sh" "$dir/scripts/gh-as-reviewer.sh"
   chmod +x "$dir/scripts/gh-as-reviewer.sh"
+  cp "$ROOT/scripts/lib/gh-rest-transport.sh" "$dir/scripts/lib/gh-rest-transport.sh"  # gh-as-reviewer.sh sources it (#1057 A)
   cp "$ROOT/scripts/identity-check.sh" "$dir/scripts/identity-check.sh"
   chmod +x "$dir/scripts/identity-check.sh"
   cp "$ROOT/scripts/lib/credential-class.sh" "$dir/scripts/lib/credential-class.sh"    # identity-check --expect-write-identity (#1057)

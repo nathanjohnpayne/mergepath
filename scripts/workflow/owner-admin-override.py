@@ -108,7 +108,10 @@ def reject_merge_api(args):
         # A literal immutable query is the only inspectable wrapper payload.
         if opaque or len(queries) != 1:
             raise ValueError('author GraphQL API calls require one literal query; opaque merge payloads are forbidden')
-        if re.search(r'\bmergePullRequest\b', queries[0]):
+        # Arming auto-merge or entering the queue merges later without the
+        # gates too, so those mutations are refused with the merge itself.
+        if re.search(r'\b(mergePullRequest|enablePullRequestAutoMerge|disablePullRequestAutoMerge'
+                     r'|addPullRequestToMergeQueue|enqueuePullRequest|dequeuePullRequest)\b', queries[0]):
             raise ValueError('merge API mutations are forbidden; use the head-pinned PR merge command')
 
 
