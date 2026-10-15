@@ -8,6 +8,9 @@
 # Usage:
 #   scripts/codex-review-check.sh <PR_NUMBER> [REPO]
 #   scripts/codex-review-check.sh --approval-readiness-only <PR_NUMBER> [REPO]
+#   scripts/codex-review-check.sh --require-codex-on-head <PR_NUMBER> [REPO]
+#     Full checks, but no older-content carry-forward or Phase 4b substitute
+#     may stand in for Codex on this exact head (#2139).
 #
 # Arguments:
 #   PR_NUMBER  Required. The pull request number (integer).
@@ -256,11 +259,13 @@ fi
 # one is not.
 DIAGNOSTIC_SIGNAL_ONLY=0
 APPROVAL_READINESS_ONLY=0
+REQUIRE_CODEX_ON_HEAD=0
 _crc_positional=()
 for _arg in "$@"; do
   case "$_arg" in
     --diagnostic-signal-only) DIAGNOSTIC_SIGNAL_ONLY=1 ;;
     --approval-readiness-only) APPROVAL_READINESS_ONLY=1 ;;
+    --require-codex-on-head) REQUIRE_CODEX_ON_HEAD=1 ;;
     *) _crc_positional+=("$_arg") ;;
   esac
 done
@@ -271,8 +276,13 @@ if [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ] && [ "$APPROVAL_READINESS_ONLY" = "1" ]; 
   exit 3
 fi
 
+if [ "$REQUIRE_CODEX_ON_HEAD" = 1 ] && { [ "$DIAGNOSTIC_SIGNAL_ONLY" = 1 ] || [ "$APPROVAL_READINESS_ONLY" = 1 ]; }; then
+  echo "ERROR: --require-codex-on-head requires the full clearance check" >&2
+  exit 3
+fi
+
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-  echo "Usage: $0 [--diagnostic-signal-only|--approval-readiness-only] <PR_NUMBER> [REPO]" >&2
+  echo "Usage: $0 [--diagnostic-signal-only|--approval-readiness-only|--require-codex-on-head] <PR_NUMBER> [REPO]" >&2
   exit 3
 fi
 
@@ -517,6 +527,7 @@ SKIP_REVIEWER_APPROVAL="$DIAGNOSTIC_SIGNAL_ONLY"
 # question "did Codex speak on this head", and splitting them would let a
 # caller ask half of it.
 REQUIRE_HEAD_SIGNAL="$DIAGNOSTIC_SIGNAL_ONLY"
+[ "$REQUIRE_CODEX_ON_HEAD" != 1 ] || REQUIRE_HEAD_SIGNAL=1
 
 # Honor codex.allow_phase_4b_substitute. When true (default), gate (c)
 # also accepts an APPROVED review on the current HEAD from an
@@ -539,6 +550,9 @@ REQUIRE_HEAD_SIGNAL="$DIAGNOSTIC_SIGNAL_ONLY"
 # CodeRabbit wait and reopen the pre-review merge race. Unset ⇒ policy value.
 ALLOW_PHASE_4B_SUBSTITUTE=${CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE:-$(codex_field allow_phase_4b_substitute)}
 ALLOW_PHASE_4B_SUBSTITUTE=${ALLOW_PHASE_4B_SUBSTITUTE:-true}
+# #2139 under-threshold substitution needs Codex itself on this head, with
+# ordinary finding disposition and approval checks still active.
+[ "$REQUIRE_CODEX_ON_HEAD" != 1 ] || ALLOW_PHASE_4B_SUBSTITUTE=false
 case "$ALLOW_PHASE_4B_SUBSTITUTE" in
   true|false) ;;
   *)
@@ -2362,7 +2376,11 @@ if [ "$CODEX_ENABLED" = "true" ]; then
   if [ "$REQUIRE_HEAD_SIGNAL" = "1" ]; then
     # #814: the caller is asking whether Codex spoke on THIS head. A
     # same-content verdict on an older commit is not that answer.
-    log "codex verdict carry-forward: SKIPPED (--diagnostic-signal-only — current-head signal required)"
+    if [ "$DIAGNOSTIC_SIGNAL_ONLY" = 1 ]; then
+      log "codex verdict carry-forward: SKIPPED (--diagnostic-signal-only — current-head signal required)"
+    else
+      log "codex verdict carry-forward: SKIPPED (--require-codex-on-head)"
+    fi
   elif [ -x "$CARRY_BIN" ]; then
     # #1092: capture the helper's stderr instead of discarding it. Sending it
     # to /dev/null is why an rc=126 ("Argument list too long") went unnoticed

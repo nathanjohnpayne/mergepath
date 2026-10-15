@@ -1250,14 +1250,14 @@ test_ratelimited_description_without_notice_never_clears() {
   rc=$(run_case "$dir")
   [ "$rc" != "0" ] || fail "6: FALSE-CLEARED (exit 0) on a 'Review rate limited' success with no notice comment; err=$(tail -4 "$dir/err.log")"
   [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "6: status=cleared on a head CodeRabbit declined to review"
-  [ "$rc" = "5" ] || fail "6: expected exit 5 (notice-less rate-limit stall at timeout), got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$rc" = "5" ] || fail "6: expected exit 5 (immediate notice-less rate-limit substitution), got $rc; err=$(tail -4 "$dir/err.log")"
   grep -q 'does not name a completed review' "$dir/err.log" || fail "6: expected the description-guard log line; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
   [ "$(jqf "$dir" '.codex_failover_requested')" = true ] || fail "6: notice-less refusal did not engage failover"
   [ "$(stub_calls "$dir")" = 1 ] || fail "6: expected one failover request"
-  [ "$(cat "$dir/state/fake-time")" = 2000000300 ] || fail "6: refusal changed the existing 300s wait"
+  [ "$(cat "$dir/state/fake-time")" = 2000000000 ] || fail "6: notice-less refusal waited instead of substituting Codex immediately"
   [ "$(jqf "$dir" '.review.created_at')" = "$STATUS_TIME" ] || fail "6: source status timestamp was lost"
   [ "$(jqf "$dir" '.rate_limit_retries')" = 0 ] || fail "6: invented a retry without a published window"
-  [ "$FAIL" -ne "$before" ] || pass "6: #940 — notice-less refusal stalls and requests Codex once at the existing timeout"
+  [ "$FAIL" -ne "$before" ] || pass "6: #2139 — notice-less refusal requests Codex immediately without sleeping"
 }
 
 # --- Test 7: description guard — an UNRECOGNIZED non-empty description ------

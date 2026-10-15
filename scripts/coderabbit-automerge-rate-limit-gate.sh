@@ -139,12 +139,12 @@ await_codex_head_clearance() {
     CODEX_REVIEW_CHECK_SKIP_CI=1 \
       CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
       CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false \
-      bash "$CODEX_CHECK_BIN" "$PR_NUMBER" "$REPO" >&2
+      bash "$CODEX_CHECK_BIN" --require-codex-on-head "$PR_NUMBER" "$REPO" >&2
     crc=$?
     set -e
     case "$crc" in
       0)
-        echo "rate-limit-gate: current-head Codex/Phase-4b clearance confirmed on probe ${attempt} — the failover really did review this head (#825)" >&2
+        echo "rate-limit-gate: current-head Codex clearance confirmed on probe ${attempt} — the failover really did review this head (#825)" >&2
         return 0
         ;;
       1) ;;

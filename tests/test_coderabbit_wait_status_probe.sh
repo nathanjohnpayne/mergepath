@@ -3787,13 +3787,17 @@ test_940_fallback_status_veto() {
         [ "$(jq -r '.status' "$dir/out.json")" = timeout ] || bad="$bad not-timeout"
         [ "$(jq -r '.codex_failover_requested' "$dir/out.json")" = false ] || bad="$bad invented-failover"
       fi
-      [ "$(probe_count "$dir")" = 1 ] || bad="$bad no-terminal-probe"
-      grep -q 'post-probe terminal-review check:' "$dir/err.log" || bad="$bad no-terminal-check"
+      if [ "$expected" = 5 ]; then
+        [ "$(probe_count "$dir")" = 0 ] || bad="$bad refusal-posted-a-status-question"
+      else
+        [ "$(probe_count "$dir")" = 1 ] || bad="$bad no-terminal-probe"
+        grep -q 'post-probe terminal-review check:' "$dir/err.log" || bad="$bad no-terminal-check"
+      fi
     fi
   done <<'EOF'
-fallback_summary|success|Review rate limited|5|non-completion description 'Review rate limited'
+fallback_summary|success|Review rate limited|5|trusted per-SHA CodeRabbit rate-limit refusal
 fallback_summary|pending|Review in progress|4|is pending
-fallback_summary_during_probe|success|Review rate limited|5|non-completion description 'Review rate limited'
+fallback_summary_during_probe|success|Review rate limited|5|trusted per-SHA CodeRabbit rate-limit refusal
 fallback_summary_during_probe|pending|Review in progress|4|is pending
 fallback_summary|unreadable||3|could not read CodeRabbit fallback
 fallback_summary_during_probe|unreadable||4|could not be read

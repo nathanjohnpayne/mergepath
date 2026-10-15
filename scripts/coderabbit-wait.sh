@@ -3636,14 +3636,16 @@ request_codex_rate_limit_failover() {
 emit_rate_limit_stall_at_timeout_if_present() {
   local rec state desc evidence
   [ "${TRUST_STATUS_CONTEXT:-false}" = true ] || return 0
-  rec=$(check_status_context_record) || return 0
+  if [ "$#" -gt 0 ]; then rec=$1; else rec=$(check_status_context_record) || return 0; fi
   state=$(crw_status_record_state "$rec")
   [ "$state" = success ] || return 0
   desc=$(printf '%s' "$rec" | jq -r '.description // ""') || return 0
   desc=$(crw_normalize_status_description "$desc") || return 0
   [ "$desc" = "review rate limited" ] || return 0
+  # An explicit record is checked only after the normal strict poll has
+  # graded current provider evidence, immediately before it would sleep.
   evidence=$(printf '%s' "$rec" | jq -c '{id:null, created_at, endpoint:"status_context", body_excerpt:.description}') || return 0
-  log "timeout reached with a trusted per-SHA CodeRabbit rate-limit refusal — reporting rate_limit_stalled (exit 5)"
+  log "trusted per-SHA CodeRabbit rate-limit refusal — proceeding immediately on Codex clearance (exit 5)"
   request_codex_rate_limit_failover
   emit_json_and_exit "rate_limit_stalled" 5 "$evidence" 0
 }
@@ -3686,7 +3688,6 @@ probe_not_yet() {
 START_EPOCH=$(date +%s)
 RATE_LIMIT_RETRIES=0
 RESUME_RETRIES=0
-LAST_RATE_LIMIT_COMMENT_ID=""
 LAST_PAUSED_COMMENT_ID=""
 # Latched the first time a "Reviews paused" NOTE is seen. Once a pause has
 # been OBSERVED, the timeout path must NOT fall back to the advisory exit 4
@@ -3735,7 +3736,11 @@ STATUS_PROBE_JSON=$(jq -nc \
 # are what close those — so the invariant below is only assertable this way.
 emit_json_and_exit() {
   local status=$1 exit_code=$2 review_json=$3 potential_issues=$4
-  local now_epoch waited skip_reason_json
+  local now_epoch waited skip_reason_json disposition=""
+  if [ "$status" = rate_limit_stalled ]; then
+    if [ "$CODEX_FAILOVER_REQUESTED" = true ]; then disposition=proceed_on_codex_clearance
+    else disposition=human_attention_required; fi
+  fi
 
   # #985. `--argjson review "$review_json"` at the bottom of this function
   # rejects an empty or unparseable value by DYING INSIDE jq: the process exits
@@ -3866,6 +3871,7 @@ emit_json_and_exit() {
     --argjson probe "$PROBE_JSON" \
     --argjson waited_seconds "$waited" \
     --argjson codex_failover_requested "$CODEX_FAILOVER_REQUESTED" \
+    --arg disposition "$disposition" \
     '{
       pr_number: $pr_number,
       repo: $repo,
@@ -3882,7 +3888,8 @@ emit_json_and_exit() {
       status_probe: $status_probe,
       probe: $probe,
       waited_seconds: $waited_seconds,
-      codex_failover_requested: $codex_failover_requested
+      codex_failover_requested: $codex_failover_requested,
+      disposition: (if $disposition == "" then null else $disposition end)
     }'
 
   exit "$exit_code"
@@ -3902,6 +3909,12 @@ emit_json_and_exit() {
 # timeout. See #140 round-3 CodeRabbit finding (Major, line 380)
 # and #140 round-4 Codex finding (P2, line 391).
 sleep_or_timeout() {
+  # #2139: a notice-less refusal must not consume a polling interval. Grade
+  # the normal strict inputs first, so unreadable history still fails closed
+  # and a completed head review still wins; only then replace this sleep.
+  if [ "${PAUSE_OBSERVED:-false}" != true ] && [ -n "${POLLED_STATUS_RECORD:-}" ]; then
+    emit_rate_limit_stall_at_timeout_if_present "$POLLED_STATUS_RECORD"
+  fi
   local requested=$1
   local now elapsed remaining actual
   now=$(date +%s)
@@ -5632,6 +5645,7 @@ if [ "$TRUST_STATUS_CONTEXT" = "true" ]; then
   INITIAL_CTX_CREATED=$(echo "$INITIAL_CTX_RECORD" | jq -r '.created_at // ""' 2>/dev/null || printf '')
   INITIAL_CTX_DESC=$(echo "$INITIAL_CTX_RECORD" | jq -r '.description // ""' 2>/dev/null || printf '')
   log "initial CodeRabbit StatusContext = $INITIAL_CTX on $HEAD_SHA (description: ${INITIAL_CTX_DESC:-<none>})"
+  POLLED_STATUS_RECORD="$INITIAL_CTX_RECORD"
   # #936: this arm only ever ACTS on `success`, so `unreadable` was already
   # fail-closed here — it falls through to the comment-driven poll, which is
   # the conservative path and the one a failed read should take. Named
@@ -5665,6 +5679,7 @@ while :; do
     LOOP_CTX=$(crw_status_record_state "$LOOP_CTX_RECORD")
     LOOP_CTX_CREATED=$(echo "$LOOP_CTX_RECORD" | jq -r '.created_at // ""' 2>/dev/null || printf '')
     LOOP_CTX_DESC=$(echo "$LOOP_CTX_RECORD" | jq -r '.description // ""' 2>/dev/null || printf '')
+    POLLED_STATUS_RECORD="$LOOP_CTX_RECORD"
     # #936: same shape as the pre-loop arm — acts only on `success`, so an
     # unreadable read keeps polling rather than clearing. Stated, not implied.
     if [ "$LOOP_CTX" = "unreadable" ]; then
@@ -5735,75 +5750,12 @@ while :; do
 
   case "$CLASS" in
     rate_limit)
-      if [ "$COMMENT_ID" = "$LAST_RATE_LIMIT_COMMENT_ID" ]; then
-        # Same rate-limit comment as last iteration — still sleeping/waiting
-        # through our own retry window. Don't double-count retries.
-        log "still inside prior rate-limit window; sleeping ${POLL_INTERVAL_SECONDS}s"
-        sleep_or_timeout "$POLL_INTERVAL_SECONDS"
-        continue
-      fi
-      LAST_RATE_LIMIT_COMMENT_ID=$COMMENT_ID
-
-      # #489: fire the Codex failover once, on the first rate-limit notice, so
-      # Codex (the real blocking gate) reviews in parallel instead of the PR
-      # idling on CodeRabbit's hourly allowance. Fired BEFORE the stall checks
-      # below so a budget/retry stall still leaves Codex engaged. Idempotent +
-      # HEAD-pinned: --trigger-only posts at most one @codex trigger per HEAD
-      # (its own scan dedupes across runs); the FIRED latch prevents re-posting
-      # across this run's retries. MERGEPATH_PHASE_4A_GATED=true forces the
-      # request even when codex.request_by_default is false; if Codex is
-      # disabled/opted out the helper no-ops and the failover stays unrecorded.
       request_codex_rate_limit_failover
-
-      if [ "$RATE_LIMIT_RETRIES" -ge "$MAX_RATE_LIMIT_RETRIES" ]; then
-        log "max_rate_limit_retries ($MAX_RATE_LIMIT_RETRIES) exceeded — stalling"
-        RATE_LIMIT_REVIEW=$(echo "$LATEST" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}')
-        emit_json_and_exit "rate_limit_stalled" 5 "$RATE_LIMIT_REVIEW" 0
-      fi
-
-      WINDOW_SECONDS=$(parse_rate_limit_window "$COMMENT_BODY" || echo "")
-      if [ -z "$WINDOW_SECONDS" ]; then
-        log "rate-limit notice has no usable published window — stalling without a CodeRabbit retry"
-        RATE_LIMIT_REVIEW=$(echo "$LATEST" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200]), window_parse_reason: "missing-or-malformed"}')
-        emit_json_and_exit "rate_limit_stalled" 5 "$RATE_LIMIT_REVIEW" 0
-      fi
-      # #727: sleep only the window that REMAINS. The published window runs
-      # from the notice's post time (COMMENT_FRESH_AT), so subtract however
-      # much of it already elapsed before we reached this point. An
-      # already-expired window ⇒ SLEEP_FOR clamps to 0 and we fall straight
-      # through to the retry + re-poll instead of re-waiting time that has
-      # already passed (auto-merge PR #725 re-waited a fresh 210s for a window
-      # that expired ~5 min earlier). A genuinely-fresh notice (elapsed≈0)
-      # still sleeps ~the full window, so the rate-limit contract is unchanged
-      # for the common case.
-      NOW_EPOCH=$(date +%s)
-      WINDOW_ELAPSED=$(rate_limit_window_elapsed_seconds "$COMMENT_FRESH_AT" "$NOW_EPOCH")
-      SLEEP_FOR=$((WINDOW_SECONDS + RATE_LIMIT_BUFFER_SECONDS - WINDOW_ELAPSED))
-      if [ "$SLEEP_FOR" -lt 0 ]; then SLEEP_FOR=0; fi
-      # Clamp against remaining budget — if the (remaining) rate-limit
-      # window still exceeds max_wait_seconds, there's no point burning
-      # through the entire sleep. Surface it as the same hard rate-limit
-      # stalled state callers already treat as non-advisory instead of a
-      # generic timeout that auto-merge may skip past. See #140 round-2 Codex
-      # finding (P2, line 392), then #386. Uses the remaining SLEEP_FOR (not
-      # the full window), so a window that mostly elapsed no longer stalls a
-      # PR that can afford the small remainder (#727).
-      ELAPSED=$((NOW_EPOCH - START_EPOCH))
-      REMAINING=$((MAX_WAIT_SECONDS - ELAPSED))
-      if [ "$SLEEP_FOR" -ge "$REMAINING" ]; then
-        log "rate-limit window (${SLEEP_FOR}s remaining) exceeds remaining budget (${REMAINING}s) — stalling"
-        RATE_LIMIT_REVIEW=$(echo "$LATEST" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}')
-        emit_json_and_exit "rate_limit_stalled" 5 "$RATE_LIMIT_REVIEW" 0
-      fi
-      log "rate-limited; sleeping ${SLEEP_FOR}s (window=${WINDOW_SECONDS}s + ${RATE_LIMIT_BUFFER_SECONDS}s buffer, ${WINDOW_ELAPSED}s already elapsed)"
-      sleep "$SLEEP_FOR"
-      # Pass the notice's freshness anchor so the cross-run dedupe scan only
-      # considers triggers posted for THIS rate-limit window (#829). Checked
-      # after the sleep, so a concurrent run's nudge during the wait is seen.
-      post_retry_trigger "$COMMENT_FRESH_AT" "$COMMENT_ID"
-      RATE_LIMIT_RETRIES=$((RATE_LIMIT_RETRIES + 1))
-      continue
+      RATE_LIMIT_REVIEW=$(echo "$LATEST" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}')
+      log "CodeRabbit rate-limited — not sleeping or retrying its window; Codex carries this head only after clearance (#2139)"
+      emit_json_and_exit "rate_limit_stalled" 5 "$RATE_LIMIT_REVIEW" 0
       ;;
+
     paused)
       # Auto-pause (#490 / #485). Re-invoke with `@coderabbitai resume`
       # (NOT a one-shot `review` — that re-pauses after the next push),
