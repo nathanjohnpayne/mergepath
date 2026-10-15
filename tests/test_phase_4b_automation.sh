@@ -888,6 +888,9 @@ for integrity_case in positive capture binding transition late-transition; do
 # #1757: exercise the production dispatch boundary, not a model's promise to
 # ignore instructions. A tripwire must spend no model round or approval write.
 cp "$DIFF" "$WORK/tripwire-original.diff"
+mk_fake fake-codex-tripwire-preview \
+  "printf ran > \"$WORK/integrity-adapter-ran\"
+   printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"reviewed\",\"findings\":[]}'"
 for tripwire_case in reviewer verdict policy; do
   cp "$WORK/tripwire-original.diff" "$DIFF"
   rm -f "$WORK/tripwire-paths" "$P4B_TEST_POSTED_REVIEW" "$WORK/integrity-adapter-ran"
@@ -911,6 +914,22 @@ for tripwire_case in reviewer verdict policy; do
     pass "deterministic $tripwire_case tripwire stops before adapter and review"
   else
     fail "deterministic $tripwire_case dispatch refusal (rc=$rc): $(tail -n 3 "$WORK/tripwire-$tripwire_case.stderr")"
+  fi
+  set +e
+  out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+    CODEX_BIN="$BIN/fake-codex-tripwire-preview" P4B_ADAPTER_TIMEOUT_SECONDS=3 \
+    P4B_ACCT_STATE_DIR="$WORK/tripwire-$tripwire_case-preview-state" \
+    P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" \
+    bash "$ORCH" 1757 --repo o/r --author claude --dry-run \
+    --head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --diff-file "$DIFF" \
+    2>"$WORK/tripwire-$tripwire_case-preview.stderr")"; rc=$?
+  set -e
+  if [ "$rc" = 0 ] && [ -e "$WORK/integrity-adapter-ran" ] \
+    && [ ! -e "$P4B_TEST_POSTED_REVIEW" ] \
+    && printf '%s' "$out" | jq -e '.dry_run and .review_posted == false' >/dev/null; then
+    pass "matching $tripwire_case dry-run retains adapter preview without review publication"
+  else
+    fail "matching $tripwire_case preview (rc=$rc): $(tail -n 3 "$WORK/tripwire-$tripwire_case-preview.stderr")"
   fi
 done
 cp "$WORK/tripwire-original.diff" "$DIFF"

@@ -1284,7 +1284,7 @@ revalidate_immutable_input() {
 # #1757: the complete immutable PR input, before trimming or model dispatch,
 # owns deterministic egregious-case escalation. Existing barrier stops above
 # remain authoritative. Offline previews have no posting authority.
-if [ "$OFFLINE_DIFF" != true ]; then
+if [ "$OFFLINE_DIFF" != true ] && [ "$DRY_RUN" != true ]; then
   escalation="$(node "$ROOT/phase-4b/escalation.cjs" "$INPUT_DIR")" \
     || p4b_die 3 "could not verify deterministic Phase 4b escalation input"
   if ! printf '%s' "$escalation" | jq -e '.decision == "model-review" and .tripwires == []' >/dev/null; then
