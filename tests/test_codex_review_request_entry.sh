@@ -69,6 +69,7 @@ make_case() {
   # state/. Neither is staged in this checkout, so a passing case proves the
   # base copies were used.
   cp "$ROOT/scripts/workflow/match_protected_paths.sh" "$dir/state/base-matcher.sh"
+  cp "$ROOT/scripts/workflow/parse_policy_list.sh" "$dir/state/base-parser.sh"
   cp "$ROOT/scripts/workflow/external_review_fingerprint.sh" "$dir/state/base-fingerprint.sh"
   chmod +x "$dir/scripts/workflow/resolve_base_policy.sh"
 
@@ -200,6 +201,14 @@ case "$endpoint" in
       fail) echo "stub: base matcher read refused" >&2; exit 1 ;;
       broken) content=$(printf '#!/usr/bin/env bash\nexit 2\n' | base64 | tr -d '\n') ;;
       *) content=$(base64 <"$CODEX_TEST_STATE_DIR/base-matcher.sh" | tr -d '\n') ;;
+    esac
+    jq -cn --arg c "$content" '{encoding: "base64", content: $c}' ;;
+  'repos/owner/repo/contents/scripts/workflow/parse_policy_list.sh?ref=base-sha')
+    # #2257: the labeler's policy list parser at the base.
+    case "${CODEX_TEST_BASE_PARSER:-ok}" in
+      fail) echo "stub: base parser read refused" >&2; exit 1 ;;
+      broken) content=$(printf '#!/usr/bin/env bash\nexit 3\n' | base64 | tr -d '\n') ;;
+      *) content=$(base64 <"$CODEX_TEST_STATE_DIR/base-parser.sh" | tr -d '\n') ;;
     esac
     jq -cn --arg c "$content" '{encoding: "base64", content: $c}' ;;
   repos/owner/repo/branches/main)
@@ -785,15 +794,13 @@ test_derive_failsafe() {
   dir=$(derive_case threshold-word "external_review_threshold: lots")
   rc=$(run_case "$dir" false)
   assert_failsafe_request "a non-numeric threshold" "$dir" "$rc" "external_review_threshold in"
-  dir=$(derive_case paths-scalar 'external_review_paths: ".github/**"')
-  rc=$(run_case "$dir" false)
-  assert_failsafe_request "a scalar external_review_paths" "$dir" "$rc" "external_review_paths in"
-  dir=$(derive_case paths-nonstring 'external_review_paths:'$'\n''  - 7')
-  rc=$(run_case "$dir" false)
-  assert_failsafe_request "a non-string protected path" "$dir" "$rc" "is not a list of non-empty strings"
-  dir=$(derive_case paths-empty-entry 'external_review_paths:'$'\n''  - ""')
-  rc=$(run_case "$dir" false)
-  assert_failsafe_request "an empty-string protected path" "$dir" "$rc" "is not a list of non-empty strings"
+  # The labeler's policy list parser, loaded from the base.
+  dir=$(derive_case parser-unread 'external_review_paths:'$'\n''  - ".github/**"')
+  rc=$(CODEX_TEST_BASE_PARSER=fail run_case "$dir" false)
+  assert_failsafe_request "an unreadable base policy list parser" "$dir" "$rc" "cannot read the policy list parser"
+  dir=$(derive_case parser-fails 'external_review_paths:'$'\n''  - ".github/**"')
+  rc=$(CODEX_TEST_BASE_PARSER=broken run_case "$dir" false)
+  assert_failsafe_request "a base policy list parser that exits nonzero" "$dir" "$rc" "the policy list parser failed on external_review_paths (rc=3)"
   dir=$(derive_case matcher-unread 'external_review_paths:'$'\n''  - ".github/**"')
   rc=$(CODEX_TEST_BASE_MATCHER=fail run_case "$dir" false)
   assert_failsafe_request "an unreadable base protected-path matcher" "$dir" "$rc" "cannot read the protected-path matcher"
@@ -825,13 +832,11 @@ test_derive_failsafe() {
   rm -f "$dir/scripts/workflow/external_review_fingerprint.sh"
   rc=$(CODEX_TEST_PR_CHANGED_FILES=2 CODEX_TEST_FILES_JSON='[{"filename":"package-lock.json","additions":5000,"deletions":0},{"filename":"src/a.ts","additions":3,"deletions":1}]' run_case "$dir" false)
   assert_derived_skip "the exclusion read from the base, with no checkout copy" "$dir" "$rc"
-  # Duplicated keys parse last-wins; the labeler's line readers see both.
+  # A threshold on two lines: the labeler's reader yields two tokens and
+  # falls back to 300, so no single value is read as written.
   dir=$(derive_case dup-threshold 'external_review_threshold: 300'$'\n''external_review_threshold: 999999')
   rc=$(run_case "$dir" false)
-  assert_failsafe_request "a duplicated external_review_threshold" "$dir" "$rc" "repeats external_review_threshold or external_review_paths"
-  dir=$(derive_case dup-paths 'external_review_paths:'$'\n''  - ".github/**"'$'\n''external_review_paths: []')
-  rc=$(run_case "$dir" false)
-  assert_failsafe_request "a duplicated external_review_paths" "$dir" "$rc" "repeats external_review_threshold or external_review_paths"
+  assert_failsafe_request "a duplicated external_review_threshold" "$dir" "$rc" "appears on 2 top-level lines"
   dir=$(derive_case base-policy-unread)
   rc=$(CODEX_TEST_BASE_POLICY=fail run_case "$dir" false)
   assert_failsafe_request_at_fetch "an unreadable governing base policy" "$dir" "$rc" "could not resolve the governing review policy at main@base-sha"
@@ -898,14 +903,57 @@ test_derive_threshold_parity() {
 +300
 0x12C
 SPELLINGS
-  # A key the parser sees but the labeler's line reader does not: a flow-style
-  # policy. The labeler falls back to 300; the parser reads 50.
+  # A flow-style policy: the labeler's line reader finds no line and uses
+  # 300 (a YAML parser would read 50). The requester agrees with the labeler:
+  # a 60-line PR is under 300, so it skips.
   dir=$(derive_case parity-flow)
   printf '%s\n' '{author_identity: nathanjohnpayne, external_review_threshold: 50, codex: {bot_login: "chatgpt-codex-connector[bot]", max_review_rounds: 10}}' >"$dir/state/base-review-policy.yml"
-  rc=$(run_case "$dir" false)
-  [ "$rc" = "4" ] && grep -q 'cannot be read the way the labeler reads it' "$dir/err.log" \
-    || fail "parity flow-style: a parser-only threshold must be unreadable and request (rc=$rc); stderr=$(cat "$dir/err.log")"
-  [ "$FAIL" -ne "$before" ] || pass "#2257 derive: the threshold is read exactly as the labeler reads it; spellings it rejects, and a parser-only key, request"
+  rc=$(CODEX_TEST_FILES_JSON='[{"filename":"src/a.ts","additions":40,"deletions":20}]' run_case "$dir" false)
+  [ "$rc" = "5" ] && ! grep -q 'cannot derive the Phase 4 gate' "$dir/err.log" \
+    || fail "parity flow-style: the labeler reads no threshold line (300), so a 60-line PR must skip (rc=$rc); stderr=$(cat "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "#2257 derive: the threshold is read exactly as the labeler reads it; spellings it would not read as written request"
+}
+
+# Path parity with the labeler (Codex P1 on #2258, round 5). For each
+# spelling of external_review_paths, run the labeler's own parser and matcher
+# (scripts/workflow/parse_policy_list.sh | match_protected_paths.sh) on the
+# same changed file, and require the requester to gate exactly when the
+# labeler matches: request on a match, skip otherwise.
+# shellcheck disable=SC2015  # `check && check || fail` is the assertion idiom here
+test_derive_paths_parity() {
+  local name body file labeler_patterns labeler_match dir rc before=$FAIL
+  local -a pats
+  while IFS='|' read -r name body file; do
+    dir=$(derive_case "pparity-$name" "$(printf '%b' "$body")")
+    labeler_patterns=$(bash "$ROOT/scripts/workflow/parse_policy_list.sh" "$dir/state/base-review-policy.yml" external_review_paths)
+    pats=()
+    while IFS= read -r line; do [ -n "$line" ] && pats+=("$line"); done <<<"$labeler_patterns"
+    labeler_match=""
+    if [ "${#pats[@]}" -gt 0 ]; then
+      labeler_match=$(printf '%s\n' "$file" | bash "$ROOT/scripts/workflow/match_protected_paths.sh" "${pats[@]}")
+    fi
+    rc=$(CODEX_TEST_FILES_JSON="$(jq -cn --arg f "$file" '[{filename: $f, additions: 1, deletions: 0}]')" run_case "$dir" false)
+    if [ -n "$labeler_match" ]; then
+      [ "$rc" = "4" ] && grep -Fq "protected paths changed: $file" "$dir/err.log" \
+        || fail "paths parity $name: the labeler matches '$file' (patterns: $(printf '%s' "$labeler_patterns" | tr '\n' ' ')), so the requester must request (rc=$rc); stderr=$(cat "$dir/err.log")"
+    else
+      [ "$rc" = "5" ] && ! grep -q 'cannot derive the Phase 4 gate' "$dir/err.log" \
+        || fail "paths parity $name: the labeler does not match '$file' (patterns: $(printf '%s' "$labeler_patterns" | tr '\n' ' ')), so the requester must skip (rc=$rc); stderr=$(cat "$dir/err.log")"
+    fi
+  done <<'CASES'
+block|external_review_paths:\n  - ".github/**"\n  - src/auth/**|src/auth/login.ts
+block-miss|external_review_paths:\n  - ".github/**"|src/app.ts
+quoted-single|external_review_paths:\n  - 'src/**'|src/app.ts
+commented|external_review_paths:\n  # - "docs/**"\n  - "src/**" # tail comment|src/app.ts
+commented-out|external_review_paths:\n  # - "docs/**"\n  - "src/**"|docs/x.md
+flow-list|external_review_paths: [".github/**", "src/**"]|src/app.ts
+scalar|external_review_paths: "src/**"|src/app.ts
+empty-entry|external_review_paths:\n  - ""|src/app.ts
+anchor-alias|common_path: &common "*p"\nexternal_review_paths:\n  - *common|common
+anchor-alias-p|common_path: &common "*p"\nexternal_review_paths:\n  - *common|top
+duplicate-key|external_review_paths:\n  - "a/**"\nexternal_review_paths:\n  - "b/**"|b/x.ts
+CASES
+  [ "$FAIL" -ne "$before" ] || pass "#2257 derive: external_review_paths is read exactly as the labeler reads it, on every spelling"
 }
 
 # The threshold and paths come from the GOVERNING base policy, not the
@@ -1026,6 +1074,7 @@ test_derive_signals
 test_derive_failsafe
 test_derive_reads_governing_policy
 test_derive_threshold_parity
+test_derive_paths_parity
 test_derive_not_run_when_decided
 test_timeout_head_drift_fails_closed_without_marker
 test_new_trigger_replaces_superseded_timeout_marker

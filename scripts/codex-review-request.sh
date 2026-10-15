@@ -787,26 +787,32 @@ esac
 #              exclusion, the EXCLUDE_RE constant read from
 #              external_review_fingerprint.sh at the PR's base sha; a
 #              listing at GitHub's 3000-file cap is gated outright;
-#   paths      a changed file, or a rename's source, matches
-#              external_review_paths through scripts/workflow/
-#              match_protected_paths.sh, the matcher the labeler and the merge
-#              clearance gate use, loaded from the PR's base sha.
+#   paths      a changed file, or a rename's source, matches the
+#              external_review_paths patterns that scripts/workflow/
+#              parse_policy_list.sh prints, through scripts/workflow/
+#              match_protected_paths.sh: the labeler's parser and matcher,
+#              both loaded from the PR's base sha.
 #
-# Nothing the classification depends on is read from this checkout, which may
-# be another repository or the candidate's own edit: the policy, the
-# exclusion constant and the matcher all come from the base revision. These
-# helpers therefore have no requires: edge in .mergepath-sync.yml.
+# READER PARITY (Codex P1 x4 on #2258). Every input is read with the reader
+# the labeler (pr-review-policy.yml through external_review_fingerprint.sh)
+# or the merge clearance gate uses, never with a reader of its own: the label
+# from the PR's label list; the size from the paginated file list with
+# EXCLUDE_RE; the threshold from the raw top-level line's second token; the
+# paths from parse_policy_list.sh; the match from match_protected_paths.sh.
+# The policy text, the exclusion constant, the parser and the matcher all
+# come from the base revision, never from this checkout, which may be another
+# repository or the candidate's own edit; so these helpers have no requires:
+# edge in .mergepath-sync.yml. No YAML parser reads the policy here.
 #
 # FAIL-SAFE (owner rule): any input that cannot be read counts as gated, and
 # the PR is requested with a WARN naming the cause. That includes the PR
 # metadata, its label list, the paginated file list, a file list that is
 # EMPTY or disagrees with the PR's changed_files count (a short read is not a
-# small PR), the governing base policy (including a duplicated threshold or
-# paths key) or its threshold or path list, the exclusion constant at the base, the matcher, and a PR whose head, base or labels
-# changed during the reads. A skip therefore needs every signal positively
-# read as "not gated" for one snapshot of the PR. Threshold and paths come from the policy that governs the PR (its
-# base, at the base sha), as the labeler and the merge clearance gate read
-# them, not from this checkout's copy.
+# small PR), the governing base policy, a threshold the labeler would not
+# read as written, the base copies of the exclusion constant, the parser and
+# the matcher, and a PR whose head, base, default branch or labels changed
+# during the reads. A skip therefore needs every signal positively read as
+# "not gated" for one snapshot of the PR.
 phase_4a_gate_failsafe() {  # <cause>
   PHASE_4A_GATED=true
   PHASE_4A_GATE_REASON="$1"
@@ -819,9 +825,9 @@ phase_4a_gate_derived() {  # <reason>
 }
 derive_phase_4a_gate() {
   local pr_json has_label changed_files files_json files_tmp files_count head_sha base_ref base_sha default_branch
-  local yq_bin=${MERGEPATH_YQ_BIN:-yq} base_cfg dup_threshold dup_paths fp_json default_json default_sha
-  local raw_threshold raw_lines matcher_json live_default
-  local policy_json threshold exclude_re lines patterns_json pattern_count pattern matcher changed matched live_json live_fence rc=0
+  local base_cfg fp_json default_json default_sha raw_threshold raw_lines matcher_json live_default
+  local parser parser_json parser_rc paths_out
+  local threshold exclude_re lines pattern matcher changed matched live_json live_fence rc=0
   local -a patterns=()
 
   pr_json=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>/dev/null) || {
@@ -926,43 +932,60 @@ derive_phase_4a_gate() {
     phase_4a_gate_failsafe "could not resolve the governing review policy at $base_ref@$base_sha"
     return 0
   fi
-  # A duplicated key parses last-wins, while the labeler's line readers see
-  # both lines (Codex P1 on #2258): a duplicate is unreadable, never a value.
-  dup_threshold=$("$yq_bin" '[keys[] | select(. == "external_review_threshold")] | length' "$base_cfg" 2>/dev/null) || dup_threshold=""
-  dup_paths=$("$yq_bin" '[keys[] | select(. == "external_review_paths")] | length' "$base_cfg" 2>/dev/null) || dup_paths=""
-  policy_json=$("$yq_bin" -o=json -I=0 '.' "$base_cfg" 2>/dev/null) || policy_json=""
-  # The threshold is read the way the labeler and the merge clearance gate
-  # read it (Codex P1 on #2258): the raw `external_review_threshold:` line's
-  # single token. A structured parse accepts spellings those readers reject
-  # (`300_000`, an octal-looking `0o400`), and they then fall back to 300, so
-  # the two would classify the same PR differently.
+  # Every value below is read the way the labeler reads it, with the
+  # labeler's own readers wherever they exist (Codex P1 x4 on #2258):
+  #   threshold  the raw top-level line's second token, exactly as
+  #              external_review_fingerprint.sh and merge-clearance-gate.sh
+  #              read it: grep '^external_review_threshold:' | awk '{print $2}';
+  #   paths      scripts/workflow/parse_policy_list.sh, loaded from the base;
+  #   exclusion  EXCLUDE_RE from external_review_fingerprint.sh at the base;
+  #   matcher    scripts/workflow/match_protected_paths.sh at the base.
+  # No YAML parser is consulted. A second reader can disagree with the
+  # labeler (anchors and aliases, flow lists, numeric spellings) and skip a
+  # PR the labeler gates.
   raw_threshold=$(grep -E '^external_review_threshold:' "$base_cfg" 2>/dev/null) || raw_threshold=""
+  parser=$(mktemp "${TMPDIR:-/tmp}/codex-request-parser.XXXXXX" 2>/dev/null) || parser=""
+  if [ -z "$parser" ]; then
+    [ "$base_cfg" = "$CONFIG" ] || rm -f "$base_cfg" 2>/dev/null || true
+    phase_4a_gate_failsafe "could not allocate a scratch file for the policy list parser"
+    return 0
+  fi
+  parser_json=$(gh api "repos/$REPO/contents/scripts/workflow/parse_policy_list.sh?ref=$base_sha" 2>/dev/null) || parser_json=""
+  if ! printf '%s' "$parser_json" | jq -r '.content | gsub("\n"; "") | @base64d' >"$parser" 2>/dev/null \
+     || [ ! -s "$parser" ]; then
+    rm -f "$parser"
+    [ "$base_cfg" = "$CONFIG" ] || rm -f "$base_cfg" 2>/dev/null || true
+    phase_4a_gate_failsafe "cannot read the policy list parser scripts/workflow/parse_policy_list.sh at $base_sha"
+    return 0
+  fi
+  paths_out=$(bash "$parser" "$base_cfg" external_review_paths 2>/dev/null) || parser_rc=$?
+  rm -f "$parser"
   [ "$base_cfg" = "$CONFIG" ] || rm -f "$base_cfg" 2>/dev/null || true
-  if ! [[ "$dup_threshold" =~ ^[01]$ ]] || ! [[ "$dup_paths" =~ ^[01]$ ]]; then
-    phase_4a_gate_failsafe "the governing policy at $base_ref@$base_sha repeats external_review_threshold or external_review_paths (or the keys cannot be counted)"
+  if [ "${parser_rc:-0}" -ne 0 ]; then
+    phase_4a_gate_failsafe "the policy list parser failed on external_review_paths (rc=$parser_rc)"
     return 0
   fi
-  if ! printf '%s' "$policy_json" | jq -e 'type == "object"' >/dev/null 2>&1; then
-    phase_4a_gate_failsafe "the governing policy at $base_ref@$base_sha does not parse as a mapping"
-    return 0
-  fi
-  # Absent (no key and no line) is the documented default 300, which is also
-  # what the labeler uses. A present key must be one top-level line whose
-  # token is plain digits, the only spelling the labeler accepts as written;
-  # anything it would replace with 300 instead is unreadable here, and a key
-  # the parser sees but the line reader does not (flow style) is too.
+  # The labeler's own line split: one pattern per non-empty line.
+  while IFS= read -r pattern; do
+    [ -n "$pattern" ] && patterns+=("$pattern")
+  done <<<"$paths_out"
+
+  # Absent (no line) is the documented default 300, which the labeler also
+  # uses. One line whose token is plain digits is used as written. Any other
+  # token, or the key on more than one line, is a value the labeler would
+  # not read as written (it falls back to 300), so it is unreadable here.
   raw_lines=0
   [ -z "$raw_threshold" ] || raw_lines=$(printf '%s\n' "$raw_threshold" | wc -l | tr -d ' ')
-  if [ "$dup_threshold" = 0 ] && [ "$raw_lines" = 0 ]; then
+  if [ "$raw_lines" = 0 ]; then
     threshold=300
-  elif [ "$dup_threshold" = 1 ] && [ "$raw_lines" = 1 ]; then
+  elif [ "$raw_lines" = 1 ]; then
     threshold=$(printf '%s\n' "$raw_threshold" | awk '{print $2}')
     if ! [[ "$threshold" =~ ^[0-9]+$ ]]; then
       phase_4a_gate_failsafe "external_review_threshold in the governing policy is not a plain digit scalar ('$threshold'); the labeler would not read it as written"
       return 0
     fi
   else
-    phase_4a_gate_failsafe "external_review_threshold in the governing policy cannot be read the way the labeler reads it (parser keys $dup_threshold, top-level lines $raw_lines)"
+    phase_4a_gate_failsafe "external_review_threshold appears on $raw_lines top-level lines of the governing policy; the labeler would not read one value"
     return 0
   fi
   # The generated-file exclusion is read from the fingerprint helper AT THE
@@ -986,21 +1009,7 @@ derive_phase_4a_gate() {
     return 0
   fi
 
-  # Paths: absent or null means no protected paths; anything other than a
-  # list of non-empty strings is unreadable.
-  patterns_json=$(printf '%s' "$policy_json" | jq -c '
-    if has("external_review_paths") | not then []
-    elif .external_review_paths == null then []
-    elif (.external_review_paths | type) == "array"
-         and all(.external_review_paths[]; type == "string" and length > 0)
-    then .external_review_paths
-    else "invalid" end' 2>/dev/null) || patterns_json=""
-  pattern_count=$(printf '%s' "$patterns_json" | jq 'if type == "array" then length else "invalid" end' 2>/dev/null) || pattern_count=""
-  if ! [[ "$pattern_count" =~ ^[0-9]+$ ]]; then
-    phase_4a_gate_failsafe "external_review_paths in the governing policy is not a list of non-empty strings"
-    return 0
-  fi
-  if [ "$pattern_count" -gt 0 ]; then
+  if [ "${#patterns[@]}" -gt 0 ]; then
     # The matcher is loaded from the base too (Codex P1 on #2258): the
     # labeler runs the base revision's helper tree, and a checkout copy,
     # from another repository or edited by the candidate, could match less.
@@ -1016,9 +1025,6 @@ derive_phase_4a_gate() {
       phase_4a_gate_failsafe "cannot read the protected-path matcher scripts/workflow/match_protected_paths.sh at $base_sha"
       return 0
     fi
-    while IFS= read -r pattern; do
-      patterns+=("$pattern")
-    done < <(printf '%s' "$patterns_json" | jq -r '.[]')
     # Both sides of a rename (#763): moving a protected file out of a
     # protected path must still match.
     changed=$(printf '%s' "$files_json" | jq -r '.[] | (.filename, (.previous_filename // empty))')
