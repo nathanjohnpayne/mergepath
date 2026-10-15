@@ -247,6 +247,7 @@
       "scripts/lib/blocking-labels.sh",
       "scripts/lib/dependabot-commit-provenance.sh",
       "scripts/merge-clearance-gate.sh",
+      "scripts/gate-api-lineage-blocking.sh",
       "tests/test_merge_clearance_gate.sh",
       "tests/test_465_fail_closed.sh"
     ],
