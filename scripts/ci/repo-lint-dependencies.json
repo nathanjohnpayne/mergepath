@@ -362,6 +362,9 @@
       "scripts/workflow/verified-relay-markers.py"
     ],
     "check_self_approval_detector": [
+      ".github/workflows/agent-review-events.yml",
+      "scripts/workflow/trusted-pr-event.cjs",
+      "tests/test_trusted_pr_event.cjs",
       ".github/workflows/agent-review.yml",
       "scripts/merge-clearance-gate.sh",
       "scripts/self-approval-detector.cjs",

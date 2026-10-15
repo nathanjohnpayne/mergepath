@@ -2558,6 +2558,8 @@ paths:
     requires:
       - "tests/test_dependabot_auto_merge.sh"
       - "tests/test_trusted_pr_event.cjs"
+      - ".github/workflows/agent-review-events.yml"  # direct self-approval native/trusted role check
+      - "scripts/workflow/trusted-pr-event.cjs"      # direct immutable source-binding preflight
       - "tests/test_trusted_workflow_boundaries.py"
       - ".github/workflows/trusted-pr-policy.yml"
       - "tests/test_required_check_generations.py"
