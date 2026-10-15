@@ -67,7 +67,8 @@ EOF
 }
 
 [[ $# -ge 1 ]] || usage
-REVIEWER_IDENTITY="${PHASE_4B_REVIEWER_IDENTITY:-nathanpayne-codex}"
+# shellcheck source=lib/pr-body-contract.sh
+. "$SCRIPT_DIR/lib/pr-body-contract.sh"
 
 command -v gh >/dev/null 2>&1 || {
   echo "post-phase-4b-handoff.sh: gh not on PATH" >&2
@@ -175,7 +176,7 @@ classify_content() {
 #   $1: owner/repo  $2: pr_number
 # Outputs (tab-separated, one line):
 #   head_sha  head_short  base_sha  base_short  head_ref  commits_count
-#   unresolved_threads  url
+#   unresolved_threads  url  reviewer
 fetch_pr_metadata() {
   local repo="$1"
   local num="$2"
@@ -195,6 +196,51 @@ fetch_pr_metadata() {
 
   if [[ -z "$head_sha" || -z "$base_sha" || -z "$head_ref" || -z "$url" ]]; then
     echo "post-phase-4b-handoff.sh: PR metadata missing required fields for ${owner_name}#${num}" >&2
+    exit 3
+  fi
+
+  # Resolve each target's governing policy, including cross-repository batches.
+  # Candidate checkout policy must not choose its own external reviewer.
+  local policy body author_count author reviewer candidate
+  policy=$("$SCRIPT_DIR/workflow/resolve_base_policy.sh" --repo "$repo" \
+    --base-ref "$(printf '%s' "$json" | jq -r '.base.ref // empty')" \
+    --base-sha "$base_sha" \
+    --default-branch "$(printf '%s' "$json" | jq -r '.base.repo.default_branch // empty')" \
+    --materialize-default) || {
+      echo "post-phase-4b-handoff.sh: cannot resolve governing reviewer policy for ${repo}#${num}" >&2
+      exit 3
+    }
+  # fetch_pr_metadata runs in a command substitution; own that subshell's file.
+  # shellcheck disable=SC2064 # Bind the escaped path before function-local scope ends.
+  trap "$(printf 'rm -f -- %q' "$policy")" EXIT
+  body=$(printf '%s' "$json" | jq -r '.body // ""')
+  author_count=$(pr_body_authoring_agent_count "$body") && \
+    author=$(pr_body_authoring_agent "$body") || {
+      echo "post-phase-4b-handoff.sh: Authoring-Agent parser failed for ${repo}#${num}" >&2
+      exit 3
+    }
+  if [[ "$author_count" != 1 || -z "$author" ]] \
+     || ! pr_body_agent_is_allowed "$author" "$policy"; then
+    echo "post-phase-4b-handoff.sh: expected exactly one configured Authoring-Agent for ${repo}#${num}" >&2
+    exit 3
+  fi
+  reviewer=$(printf '%s' "${PHASE_4B_REVIEWER_IDENTITY:-}" | tr '[:upper:]' '[:lower:]')
+  if [[ -z "$reviewer" ]]; then
+    while IFS= read -r candidate; do
+      candidate=$(printf '%s' "$candidate" | tr '[:upper:]' '[:lower:]')
+      case "$candidate" in
+        nathanpayne-*)
+          if [[ "${candidate#nathanpayne-}" != "$author" ]]; then
+            reviewer="$candidate"
+            break
+          fi
+          ;;
+      esac
+    done <<<"$(read_available_reviewers "$policy")"
+  fi
+  if [[ -z "$reviewer" || "$reviewer" == "nathanpayne-$author" ]] \
+     || ! login_is_available_reviewer "$reviewer" "$policy"; then
+    echo "post-phase-4b-handoff.sh: reviewer must be configured and differ from Authoring-Agent '$author' for ${repo}#${num}" >&2
     exit 3
   fi
 
@@ -268,25 +314,26 @@ fetch_pr_metadata() {
     unresolved="$running_total"
   fi
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$head_sha" "${head_sha:0:7}" \
     "$base_sha" "${base_sha:0:7}" \
     "$head_ref" "$commits" \
-    "$unresolved" "$url"
+    "$unresolved" "$url" "$reviewer"
 }
 
 # Render the single-PR variant.
 #   Inputs: $1 url, $2 head_short, $3 base_short, $4 content_note, $5 unresolved
 render_single() {
-  local url="$1" head_short="$2" base_short="$3" content="$4" unresolved="$5"
+  local url="$1" head_short="$2" base_short="$3" content="$4" unresolved="$5" reviewer="$6"
   cat <<EOF
 PR ready for external review (Phase 4b):
 
   ${url}  head ${head_short}  (base ${base_short})
 
 Context: ${content}
-Gate: post APPROVED as ${REVIEWER_IDENTITY} on the listed HEAD, OR a
-      Codex bot review or affirmative verdict anchored to the listed HEAD.
+Gate: (b) APPROVED as ${reviewer} on the listed HEAD, AND
+      (c) a HEAD-anchored Codex clearance or that same APPROVED review
+      as the Phase 4b substitute where governing policy allows it.
 Threads: ${unresolved} unresolved (resolve addressed bot or agent-reviewer
          threads per the pre-merge gate; never resolve real-human
          threads automatically).
@@ -300,10 +347,10 @@ ROWS_TSV=""
 while IFS=$'\t' read -r repo num; do
   [[ -n "$repo" && -n "$num" ]] || continue
   meta=$(fetch_pr_metadata "$repo" "$num")
-  IFS=$'\t' read -r head_sha head_short base_sha base_short head_ref commits unresolved url <<<"$meta"
+  IFS=$'\t' read -r head_sha head_short base_sha base_short head_ref commits unresolved url reviewer <<<"$meta"
   content=$(classify_content "$head_ref" "$commits")
-  ROWS_TSV+="$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
-    "$repo" "$num" "$url" "$head_short" "$base_short" "$content" "$unresolved")"$'\n'
+  ROWS_TSV+="$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+    "$repo" "$num" "$url" "$head_short" "$base_short" "$content" "$unresolved" "$reviewer")"$'\n'
 done <<<"$REFS_TSV"
 
 # Count populated rows for variant selection.
@@ -311,20 +358,20 @@ ROW_COUNT=$(printf '%s' "$ROWS_TSV" | grep -c $'\t' || true)
 
 if [[ "$ROW_COUNT" -eq 1 ]]; then
   # Single-PR variant.
-  IFS=$'\t' read -r _repo _num url head_short base_short content unresolved <<<"$(printf '%s' "$ROWS_TSV" | head -n 1)"
-  render_single "$url" "$head_short" "$base_short" "$content" "$unresolved"
+  IFS=$'\t' read -r _repo _num url head_short base_short content unresolved reviewer <<<"$(printf '%s' "$ROWS_TSV" | head -n 1)"
+  render_single "$url" "$head_short" "$base_short" "$content" "$unresolved" "$reviewer"
   exit 0
 fi
 
 # -----------------------------------------------------------------------
 # Batch variant: table + paste prompt.
 # -----------------------------------------------------------------------
-echo "| Repo | PR # | HEAD short SHA | Unresolved threads | Content note |"
-echo "|------|------|---------------|-------------------|--------------|"
-while IFS=$'\t' read -r repo num url head_short base_short content unresolved; do
+echo "| Repo | PR # | HEAD short SHA | Unresolved threads | Content note | Reviewer |"
+echo "|------|------|---------------|-------------------|--------------|----------|"
+while IFS=$'\t' read -r repo num url head_short base_short content unresolved reviewer; do
   [[ -n "$repo" ]] || continue
-  printf '| `%s` | [#%s](%s) | `%s` | %s | %s |\n' \
-    "$repo" "$num" "$url" "$head_short" "$unresolved" "$content"
+  printf '| `%s` | [#%s](%s) | `%s` | %s | %s | `%s` |\n' \
+    "$repo" "$num" "$url" "$head_short" "$unresolved" "$content" "$reviewer"
 done <<<"$ROWS_TSV"
 echo
 
@@ -333,7 +380,7 @@ echo
 SHARED_CONTEXT=""
 ALL_SAME=1
 FIRST_CONTENT=""
-while IFS=$'\t' read -r _repo _num _url _head_short _base_short content _unresolved; do
+while IFS=$'\t' read -r _repo _num _url _head_short _base_short content _unresolved _reviewer; do
   [[ -n "$_repo" ]] || continue
   if [[ -z "$FIRST_CONTENT" ]]; then
     FIRST_CONTENT="$content"
@@ -351,15 +398,15 @@ echo '```'
 echo 'PRs ready for external review (Phase 4b):'
 echo
 # Print one URL line per row, with head + base shorts.
-while IFS=$'\t' read -r _repo _num url head_short base_short _content _unresolved; do
+while IFS=$'\t' read -r _repo _num url head_short base_short _content _unresolved reviewer; do
   [[ -n "$_repo" ]] || continue
-  printf '  %s  head %s  (base %s)\n' "$url" "$head_short" "$base_short"
+  printf '  %s  head %s  (base %s)  reviewer %s\n' "$url" "$head_short" "$base_short" "$reviewer"
 done <<<"$ROWS_TSV"
 echo
 echo "Context: ${SHARED_CONTEXT}"
-echo "Gate: for each PR, post APPROVED as ${REVIEWER_IDENTITY} on the listed"
-echo '      HEAD, OR a Codex bot review or affirmative verdict anchored to'
-echo '      the listed HEAD.'
+echo 'Gate: for each PR, (b) APPROVED as its listed reviewer on HEAD, AND'
+echo '      (c) a HEAD-anchored Codex clearance or that same APPROVED review'
+echo '      as the Phase 4b substitute where governing policy allows it.'
 echo 'Threads: see "Unresolved threads" column (resolve addressed bot or'
 echo '         agent-reviewer threads per the pre-merge gate; never resolve'
 echo '         real-human threads automatically).'

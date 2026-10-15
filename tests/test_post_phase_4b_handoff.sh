@@ -102,6 +102,12 @@ if [ "$1" = "api" ]; then
     esac
   done
 
+  if [[ "$endpoint" == */contents/.github/review-policy.yml* ]]; then
+    [ "${MOCK_POLICY_UNREADABLE:-0}" != 1 ] || exit 1
+    cat "$FIXTURE_DIR/review-policy.yml"
+    exit 0
+  fi
+
   if [ "$endpoint" = "graphql" ]; then
     f="$FIXTURE_DIR/${owner}__${name}__${num}.threads.json"
   else
@@ -121,6 +127,12 @@ chmod +x "$STUB_DIR/gh"
 
 export PATH="$STUB_DIR:$PATH"
 export FIXTURE_DIR
+cat >"$FIXTURE_DIR/review-policy.yml" <<'YAML'
+available_reviewers:
+  - nathanpayne-codex
+  - nathanpayne-claude
+  - nathanpayne-cursor
+YAML
 
 # ---------------------------------------------------------------------------
 # Fixture builders.
@@ -134,9 +146,11 @@ write_pr_fixture() {
   "html_url": "https://github.com/${owner}/${repo}/pull/${num}",
   "commits": ${commits},
   "head": { "sha": "${head_sha}", "ref": "${head_ref}" },
-  "base": { "sha": "${base_sha}" }
+  "base": { "sha": "${base_sha}", "ref": "main", "repo": {"default_branch": "main"} }
 }
 EOF
+  jq --arg body "${8-Authoring-Agent: codex}" '. + {body: $body}' "$f" >"$f.tmp"
+  mv "$f.tmp" "$f"
 }
 
 write_threads_fixture() {
@@ -185,15 +199,16 @@ write_pr_fixture nathanjohnpayne mergepath 281 \
   1
 write_threads_fixture nathanjohnpayne mergepath 281 2
 
-OUT="$("$SCRIPT" nathanjohnpayne/mergepath#281)"
-if printf '%s' "$OUT" | grep -q "PR ready for external review (Phase 4b):" \
+OUT="$("$SCRIPT" nathanjohnpayne/mergepath#281 2>"$WORKDIR/render-error")"
+if [ ! -s "$WORKDIR/render-error" ] \
+   && printf '%s' "$OUT" | grep -q "PR ready for external review (Phase 4b):" \
    && printf '%s' "$OUT" | grep -q "verbatim mirror of mergepath@abcdef123456" \
    && printf '%s' "$OUT" | grep -q "https://github.com/nathanjohnpayne/mergepath/pull/281" \
    && printf '%s' "$OUT" | grep -q "head 1111111" \
    && printf '%s' "$OUT" | grep -q "(base 2222222)" \
    && printf '%s' "$OUT" | grep -q "Threads: 2 unresolved" \
    && printf '%s' "$OUT" | grep -q "resolve addressed bot or agent-reviewer" \
-   && printf '%s' "$OUT" | grep -q "affirmative verdict anchored to the listed HEAD" \
+   && printf '%s' "$OUT" | grep -q "(b) APPROVED as nathanpayne-claude on the listed HEAD, AND" \
    && ! printf '%s' "$OUT" | grep -q "reaction newer"; then
   pass "single-PR mirror render contains expected fields"
 else
@@ -290,13 +305,13 @@ write_pr_fixture nathanjohnpayne swipewatch 200 \
 write_threads_fixture nathanjohnpayne swipewatch 200 0
 
 OUT="$("$SCRIPT" nathanjohnpayne/matchline#100 nathanjohnpayne/swipewatch#200)"
-if printf '%s' "$OUT" | grep -q "| Repo | PR # | HEAD short SHA | Unresolved threads | Content note |" \
+if printf '%s' "$OUT" | grep -q "| Repo | PR # | HEAD short SHA | Unresolved threads | Content note | Reviewer |" \
    && printf '%s' "$OUT" | grep -q "nathanjohnpayne/matchline" \
    && printf '%s' "$OUT" | grep -q "nathanjohnpayne/swipewatch" \
    && printf '%s' "$OUT" | grep -q "Context: verbatim mirror of mergepath@abcdef123456" \
    && printf '%s' "$OUT" | grep -q "real-human threads automatically" \
    && ! printf '%s' "$OUT" | grep -q "Context: mixed" \
-   && printf '%s' "$OUT" | grep -q "affirmative verdict anchored to" \
+   && printf '%s' "$OUT" | grep -q "(c) a HEAD-anchored Codex clearance" \
    && ! printf '%s' "$OUT" | grep -q "reaction newer"; then
   pass "batch all-same-mirror render surfaces shared context"
 else
@@ -383,6 +398,59 @@ if [ "$rc" -eq 4 ] \
 else
   fail "unaccounted feedback returned rc=$rc or rendered a handoff"
   printf '%s\n' "$OUT" >&2
+fi
+
+# Cross-agent selection is per PR, including mixed-author batches.
+write_pr_fixture nathanjohnpayne mergepath 43 feat/claude \
+  3333333333333333333333333333333333333333 \
+  4444444444444444444444444444444444444444 1 'Authoring-Agent: claude'
+write_threads_fixture nathanjohnpayne mergepath 43 0
+OUT=$("$SCRIPT" nathanjohnpayne/mergepath#43)
+if printf '%s' "$OUT" | grep -q '(b) APPROVED as nathanpayne-codex' \
+   && ! printf '%s' "$OUT" | grep -q 'HEAD, OR'; then
+  pass "Claude author selects a registered cross-agent reviewer and AND gate"
+else
+  fail "Claude author got an invalid reviewer or gate"
+fi
+OUT=$("$SCRIPT" nathanjohnpayne/mergepath#42 nathanjohnpayne/mergepath#43)
+if printf '%s' "$OUT" | grep -q 'head 3333333.*reviewer nathanpayne-claude' \
+   && printf '%s' "$OUT" | grep -q 'head 3333333.*reviewer nathanpayne-codex' \
+   && printf '%s' "$OUT" | grep -q 'its listed reviewer on HEAD, AND'; then
+  pass "mixed-author batch retains each PR's cross-agent reviewer"
+else
+  fail "mixed-author batch lost its reviewer association or conjunction"
+fi
+OUT=$(PHASE_4B_REVIEWER_IDENTITY=nathanpayne-cursor "$SCRIPT" nathanjohnpayne/mergepath#42)
+printf '%s' "$OUT" | grep -q '(b) APPROVED as nathanpayne-cursor' \
+  && pass "registered cross-agent override is honored" \
+  || fail "valid cross-agent override was lost"
+for override in nathanpayne-codex NathanPayne-Codex unregistered-reviewer; do
+  rc=0
+  OUT=$(PHASE_4B_REVIEWER_IDENTITY="$override" "$SCRIPT" nathanjohnpayne/mergepath#42 2>"$WORKDIR/error") || rc=$?
+  if [ "$rc" -eq 3 ] && [ -z "$OUT" ]; then
+    pass "invalid reviewer override $override renders no handoff"
+  else
+    fail "invalid reviewer override $override returned $rc or rendered"
+  fi
+done
+for body in '' 'Authoring-Agent: unknown' $'Authoring-Agent: codex\nAuthoring-Agent: claude' $'```\nAuthoring-Agent: codex\n```'; do
+  write_pr_fixture nathanjohnpayne mergepath 44 feat/invalid \
+    3333333333333333333333333333333333333333 \
+    4444444444444444444444444444444444444444 1 "$body"
+  rc=0
+  OUT=$("$SCRIPT" nathanjohnpayne/mergepath#44 2>"$WORKDIR/error") || rc=$?
+  if [ "$rc" -eq 3 ] && [ -z "$OUT" ]; then
+    pass "missing, unknown, ambiguous or fenced author renders no handoff"
+  else
+    fail "invalid author returned $rc or rendered"
+  fi
+done
+rc=0
+OUT=$(MOCK_POLICY_UNREADABLE=1 "$SCRIPT" nathanjohnpayne/mergepath#42 2>"$WORKDIR/error") || rc=$?
+if [ "$rc" -eq 3 ] && [ -z "$OUT" ]; then
+  pass "unreadable governing policy renders no handoff"
+else
+  fail "unreadable policy returned $rc or rendered"
 fi
 
 echo

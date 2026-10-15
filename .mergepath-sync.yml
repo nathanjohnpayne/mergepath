@@ -709,6 +709,8 @@ paths:
     requires:
       - "scripts/review-feedback-accounting.sh"   # #1000, gate manual reviewer dispatch too
       - "scripts/lib/preflight-helpers.sh"
+      - "scripts/lib/pr-body-contract.sh"
+      - "scripts/workflow/resolve_base_policy.sh"
   - path: scripts/codex-p1-gate.sh
     type: canonical
     consumers: all
