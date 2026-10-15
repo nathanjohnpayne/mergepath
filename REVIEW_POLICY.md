@@ -869,9 +869,9 @@ PR ready for external review (Phase 4b):
 
 Context: <one line — content classification (novel work, verbatim
          mirror of mergepath@<sha>, sync + N convergence commits, ...)>
-Gate: post APPROVED as nathanpayne-codex on the listed HEAD, OR a
-      Codex bot review with a full-HEAD `commit_id`, or an affirmative
-      issue-comment verdict whose `Reviewed commit` value prefixes HEAD.
+Gate: (b) APPROVED as <cross-agent reviewer> on the listed HEAD, AND
+      (c) a HEAD-anchored Codex clearance or that same APPROVED review
+      as the Phase 4b substitute where governing policy allows it.
 Threads: <N> unresolved (resolve addressed bot or agent-reviewer threads
          per the pre-merge gate; never resolve real-human threads
          automatically).
@@ -879,10 +879,10 @@ Threads: <N> unresolved (resolve addressed bot or agent-reviewer threads
 
 **Batch variant** (>1 PR) — emit a markdown table with one row per PR, followed by a single fenced prompt the human can paste into the external reviewer's CLI session:
 
-| Repo | PR # | HEAD short SHA | Unresolved threads | Content note |
-|------|------|---------------|-------------------|--------------|
-| `nathanjohnpayne/<repo-a>` | [#<num>](https://github.com/nathanjohnpayne/<repo-a>/pull/<num>) | `<short_sha>` | <N> | <content classification> |
-| `nathanjohnpayne/<repo-b>` | [#<num>](https://github.com/nathanjohnpayne/<repo-b>/pull/<num>) | `<short_sha>` | <N> | <content classification> |
+| Repo | PR # | HEAD short SHA | Unresolved threads | Content note | Reviewer |
+|------|------|---------------|-------------------|--------------|----------|
+| `nathanjohnpayne/<repo-a>` | [#<num>](https://github.com/nathanjohnpayne/<repo-a>/pull/<num>) | `<short_sha>` | <N> | <content classification> | `<reviewer>` |
+| `nathanjohnpayne/<repo-b>` | [#<num>](https://github.com/nathanjohnpayne/<repo-b>/pull/<num>) | `<short_sha>` | <N> | <content classification> | `<reviewer>` |
 
 ```
 PRs ready for external review (Phase 4b):
@@ -894,9 +894,9 @@ PRs ready for external review (Phase 4b):
 Context: <one line — shared content classification if all PRs share
          one, e.g. "all verbatim mirrors of mergepath@<sha>"; otherwise
          "mixed — see table above">
-Gate: for each PR, post APPROVED as nathanpayne-codex on the listed
-      HEAD, OR a Codex bot review with a full-HEAD `commit_id`, or an affirmative
-      issue-comment verdict whose `Reviewed commit` value prefixes HEAD.
+Gate: for each PR, (b) APPROVED as its listed cross-agent reviewer on HEAD, AND
+      (c) a HEAD-anchored Codex clearance or that same APPROVED review
+      as the Phase 4b substitute where governing policy allows it.
 Threads: see "Unresolved threads" column (resolve addressed bot or
          agent-reviewer threads per the pre-merge gate; never resolve
          real-human threads automatically).
