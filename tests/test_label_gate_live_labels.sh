@@ -651,6 +651,8 @@ fi
 # needs: the suite can therefore run from a depth-1 Actions checkout too.
 CLASSIFIER_REPO="$WORK/classifier-repo"
 mkdir -p "$CLASSIFIER_REPO/.github" "$CLASSIFIER_REPO/scripts/workflow" "$CLASSIFIER_REPO/src"
+# Match the classifier's $PWD spelling when TMPDIR has a trailing separator.
+CLASSIFIER_REPO="$(cd "$CLASSIFIER_REPO" && pwd)"
 git -C "$CLASSIFIER_REPO" init --quiet -b main
 git -C "$CLASSIFIER_REPO" config user.name "NathanPayne"
 git -C "$CLASSIFIER_REPO" config user.email "github@nathanpayne.com"
@@ -995,9 +997,8 @@ fi
 pin_call=$(cat "$D1/pin-call" 2>/dev/null || true)
 if [[ "$pin_call" == *"--head $EVENT_HEAD --base $EVENT_BASE --config "*"/.github/review-policy.yml --files-json "* ]] \
    && [[ "$pin_call" != *"--config $CLASSIFIER_REPO/.github/review-policy.yml"* ]] \
-   && [[ "$pin_call" != "$CLASSIFIER_REPO/scripts/workflow/dependabot_pin_bump_exemption.sh "* ]] \
-   && [[ "$pin_call" == *"/scripts/workflow/dependabot_pin_bump_exemption.sh --repo o/r --pr 42 "* ]]; then
-  pass "the lane helper runs from the trusted base worktree, pinned to the event pair, with the base config and the fetched files payload"
+   && [[ "$pin_call" == "$CLASSIFIER_REPO/scripts/workflow/dependabot_pin_bump_exemption.sh --repo o/r --pr 42 "* ]]; then
+  pass "the lane helper runs from the trusted default checkout, pinned to the event pair, with the base config and the fetched files payload"
 else
   fail "lane helper invocation is wrong: $pin_call"
 fi
