@@ -2127,6 +2127,7 @@ class Lexer:
             if c == ";":
                 if text[i:i + 2] in (";;", ";&") and text[i - 1:i] != ";":
                     end_op = text[i:i + 3] if text.startswith(";;&", i) else text[i:i + 2]
+                    finish_word()
                     self.xtrace_context_events.append((i, cur_level()["seg"], end_op, True))
                 start_segment()
                 i += 1
@@ -11875,6 +11876,13 @@ CORPUS = [
         'set -x\nselect item in one; do\n set +x\n break\ndone <<< 1\n: "$GH_TOKEN"\n',
     ),
     ('conditional-xtrace-and-newline-after-heredoc', MUST_FLAG, 'set -x\nfalse <<EOF &&\nx\nEOF\nset +x\n: "$GH_TOKEN"\n'),
+    # #1458 review: exact measured reconstructions from the abutting-terminator fragment.
+    ('conditional-xtrace-case-final-word-stop-abutting', MUST_NOT_FLAG, 'set -x\ncase yes in\nyes) :;;\nesac\nset +x\n: "$GH_TOKEN"\n'),
+    ('conditional-xtrace-case-final-word-stop-spaced', MUST_NOT_FLAG, 'set -x\ncase yes in\nyes) : ;;\nesac\nset +x\n: "$GH_TOKEN"\n'),
+    ('conditional-xtrace-case-final-word-fallthrough-abutting', MUST_NOT_FLAG, 'set -x\ncase yes in\nyes) :;&\nesac\nset +x\n: "$GH_TOKEN"\n'),
+    ('conditional-xtrace-case-final-word-fallthrough-spaced', MUST_NOT_FLAG, 'set -x\ncase yes in\nyes) : ;&\nesac\nset +x\n: "$GH_TOKEN"\n'),
+    ('conditional-xtrace-case-final-word-retest-abutting', MUST_NOT_FLAG, 'set -x\ncase yes in\nyes) :;;&\nesac\nset +x\n: "$GH_TOKEN"\n'),
+    ('conditional-xtrace-case-final-word-retest-spaced', MUST_NOT_FLAG, 'set -x\ncase yes in\nyes) : ;;&\nesac\nset +x\n: "$GH_TOKEN"\n'),
     # #1458 review: measured multiline prefixes; not the already-flagged one-line example.
     ('conditional-xtrace-prefix-time_-p-multiline', MUST_FLAG, 'set -x\ntime -p if false; then\n set +x\nfi\n: "$GH_TOKEN"\n'),
     ('conditional-xtrace-prefix-time_---multiline', MUST_FLAG, 'set -x\ntime -- if false; then\n set +x\nfi\n: "$GH_TOKEN"\n'),
@@ -15497,6 +15505,35 @@ def _heredoc_conservatism_cases():
     return failures
 
 
+def _case_terminator_event_cases():
+    """Harmless parser DATA retains body-before-terminator source ordering."""
+    failures = []
+    for op in (";;", ";&", ";;&"):
+        for gap in ("", " "):
+            lx = Lexer("case yes in\nyes) :" + gap + op + "\nesac\nafter\n")
+            events = lx.xtrace_context_events
+            body_events = [(j, event) for j, event in enumerate(events) if event[2] == ":"]
+            end_events = [(j, event) for j, event in enumerate(events) if event[2] == op]
+            after = [seg for ll in lx.logical for seg in ll.segments if seg.words == ["after"]]
+            if len(body_events) != 1 or len(end_events) != 1 or len(after) != 1:
+                failures.append("case terminator lost body/end/after event: " + gap + op)
+                continue
+            bj, (bp, bs, _bw, _be) = body_events[0]
+            ej, (ep, es, _ew, _ee) = end_events[0]
+            guarded = _conditional_xtrace_segments(lx, [])
+            if (bj >= ej or bs is not es or bp > ep or (not gap and bp != ep)
+                    or bs not in guarded or after[0] in guarded):
+                failures.append("case terminator order/owner/closure: " + gap + op)
+    lx = Lexer("case outer in\n*) case inner in\n*) :;;\nesac\ninside;;\nesac\nafter\n")
+    guarded = _conditional_xtrace_segments(lx, [])
+    inside = [seg for ll in lx.logical for seg in ll.segments if seg.words == ["inside"]]
+    after = [seg for ll in lx.logical for seg in ll.segments if seg.words == ["after"]]
+    if (len(inside) != 1 or len(after) != 1 or inside[0] not in guarded
+            or after[0] in guarded):
+        failures.append("case terminator nested closure lost outer/after boundary")
+    return failures
+
+
 def _xtrace_prefix_cases():
     """Harmless parser DATA pins finite raw prefixes without shell execution."""
     failures = []
@@ -15881,6 +15918,7 @@ def self_test():
     failures.extend(_heredoc_conservatism_cases())
     failures.extend(_heredoc_list_continuation_cases())
     failures.extend(_xtrace_prefix_cases())
+    failures.extend(_case_terminator_event_cases())
     failures.extend(_heredoc_echo_conservatism_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
