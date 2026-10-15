@@ -1233,6 +1233,96 @@ for knob, minimum in (("BUDGET_PER_PR_REQUESTS", 1), ("BUDGET_RESERVE_REQUESTS",
             "      knob silently turns the guard off and lets a pass exhaust the",
             "      installation budget again.")
 
+# ── A17 — the auto-clear nomination job (#2239, #2205) ─────────────────
+#
+# POST /dispatches needs `contents: write`, so the nomination lives in a job
+# of its own: the publish job runs the gate scripts and must never hold that
+# grant. The job is pinned WHOLE, because each addition that would keep it
+# looking right widens what runs with a write token: a `uses:` step (a
+# checkout or an action) executes code under the grant, a second scope or an
+# `environment:` widens the token, and a `concurrency:` block can cancel a
+# pending nomination. The publish job's hand-off (its step id and its one
+# output) is pinned with it, since a broken hand-off silently nominates
+# nothing. The dispatched event type is read out of the run text (the same
+# disclosed text exception as A2) and must be exactly the one type
+# auto-clear-blocking-labels.yml listens to: a rename on either side orphans
+# every nomination with nothing going red, the A6 failure in another file.
+NOMINATE_JOB = "nominate-auto-clear"
+NOMINATE_KEYS = {"name", "needs", "if", "runs-on", "permissions", "steps"}
+NOMINATE_IF = "${{ !cancelled() && needs.publish.outputs.autoclear_prs != '' }}"
+NOMINATE_STEP_KEYS = {"name", "env", "run"}
+NOMINATE_ENV = {
+    "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+    "REPO": "${{ github.repository }}",
+    "AUTOCLEAR_PRS": "${{ needs.publish.outputs.autoclear_prs }}",
+}
+PUBLISH_OUTPUTS = {"autoclear_prs": "${{ steps.publish.outputs.autoclear_prs }}"}
+nominate = jobs.get(NOMINATE_JOB)
+if not isinstance(nominate, dict):
+    bad("FAIL: [rcp auto-clear nomination] the publisher has no %r job mapping;" % NOMINATE_JOB,
+        "      a green clearance verdict on a labeled PR then reaches auto-clear only",
+        "      through its */5 sweep, which GitHub delays or drops under load (#2239).")
+else:
+    if set(nominate) != NOMINATE_KEYS:
+        bad("FAIL: [rcp auto-clear nomination] job %r keys are %s, not exactly %s."
+            % (NOMINATE_JOB, sorted(nominate), sorted(NOMINATE_KEYS)),
+            "      An `environment:`, `concurrency:`, `outputs:` or `container:` beside",
+            "      a contents: write token changes what the grant reaches.")
+    if nominate.get("needs") not in ("publish", ["publish"]):
+        bad("FAIL: [rcp auto-clear nomination] job %r needs %r, not the publish job."
+            % (NOMINATE_JOB, nominate.get("needs")))
+    if " ".join(str(nominate.get("if", "")).split()) != NOMINATE_IF:
+        bad("FAIL: [rcp auto-clear nomination] job %r condition is %r, not %r."
+            % (NOMINATE_JOB, nominate.get("if"), NOMINATE_IF),
+            "      It must run only when the pass nominated a PR (no runner otherwise),",
+            "      and must survive another PR's infra red in the publish job.")
+    if nominate.get("permissions") != {"contents": "write"}:
+        bad("FAIL: [rcp auto-clear nomination] job %r permissions are %r, not exactly"
+            % (NOMINATE_JOB, nominate.get("permissions")),
+            "      {'contents': 'write'}: POST /dispatches needs that and nothing else.")
+    nsteps = nominate.get("steps")
+    if not (isinstance(nsteps, list) and len(nsteps) == 1 and isinstance(nsteps[0], dict)):
+        bad("FAIL: [rcp auto-clear nomination] job %r must carry exactly one step." % NOMINATE_JOB)
+    else:
+        nstep = nsteps[0]
+        if set(nstep) != NOMINATE_STEP_KEYS:
+            bad("FAIL: [rcp auto-clear nomination] job %r step keys are %s, not exactly %s."
+                % (NOMINATE_JOB, sorted(nstep), sorted(NOMINATE_STEP_KEYS)),
+                "      A `uses:` step (a checkout or an action) would execute code under",
+                "      the contents: write grant.")
+        if nstep.get("env") != NOMINATE_ENV:
+            bad("FAIL: [rcp auto-clear nomination] job %r step env is %r, not %r."
+                % (NOMINATE_JOB, nstep.get("env"), NOMINATE_ENV),
+                "      The dispatch rides the job's own GITHUB_TOKEN, never a PAT.")
+        run_text = strip_shell_comments(str(nstep.get("run", "")))
+        sent = re.findall(r"event_type=([A-Za-z0-9_.-]+)", run_text)
+        listener_types = None
+        listener_path = os.path.join(WORKFLOW_DIR, "auto-clear-blocking-labels.yml")
+        try:
+            listener_on = (load(listener_path) or {}).get("on")
+            listener_rd = listener_on.get("repository_dispatch") if isinstance(listener_on, dict) else None
+            listener_types = listener_rd.get("types") if isinstance(listener_rd, dict) else None
+        except Exception as exc:
+            bad("FAIL: [rcp auto-clear nomination] could not read %s: %s"
+                % (listener_path, " ".join(str(exc).split())))
+        if not (isinstance(listener_types, list) and len(listener_types) == 1):
+            bad("FAIL: [rcp auto-clear nomination] %s does not listen to exactly one"
+                % listener_path,
+                "      repository_dispatch type (read %r), so the nomination event has" % listener_types,
+                "      no single listener to match.")
+        elif sent != listener_types:
+            bad("FAIL: [rcp auto-clear nomination] the job dispatches event_type %r, but" % sent,
+                "      auto-clear-blocking-labels.yml listens to %r. A mismatch orphans" % listener_types,
+                "      every nomination silently.")
+if publish_job is not None:
+    if publish_job.get("outputs") != PUBLISH_OUTPUTS:
+        bad("FAIL: [rcp auto-clear nomination] the publish job's outputs are %r, not %r."
+            % (publish_job.get("outputs"), PUBLISH_OUTPUTS))
+    if (publish_step or {}).get("id") != "publish":
+        bad("FAIL: [rcp auto-clear nomination] the publish step's id is %r, not 'publish';"
+            % (publish_step or {}).get("id"),
+            "      the job output reads steps.publish.outputs.autoclear_prs.")
+
 if failures:
     print("\n".join(failures))
     sys.exit(1)

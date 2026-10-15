@@ -523,6 +523,20 @@ for trig in 'pull_request_target' 'workflow_run'; do
   fi
 done
 
+# #2239: the publisher's nominate-auto-clear job dispatches exactly this
+# type. repository_dispatch runs only the default branch's copy of the file,
+# so it is safe beside the queue credentials; workflow_dispatch would run the
+# dispatcher's chosen ref and must stay absent.
+if workflow_source_has_trigger repository_dispatch < "$WORKFLOW" \
+   && [ "$(awk '/^  repository_dispatch:$/ { f=1; next } f && /^    types:/ { print; exit } f && /^  [^ ]/ { exit }' "$WORKFLOW")" = '    types: [auto-clear-evaluate]' ] \
+   && workflow_source_lacks_trigger workflow_dispatch < "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: repository_dispatch auto-clear-evaluate is the only dispatch trigger (#2239)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: the workflow must listen to repository_dispatch types [auto-clear-evaluate] and carry no workflow_dispatch (#2239)" >&2
+fi
+
 # pull_request_review runs on the PR merge ref. Keeping that trigger in a
 # workflow that names the queue-policy environment would let a same-repo PR
 # rewrite the workflow definition and request administrator credentials.
@@ -842,6 +856,20 @@ case "${1:-} ${2:-}" in
   'pr comment')
     printf 'comment:%s\n' "${GH_TOKEN:-unset}" >>"${CLEAR_STUB_LOG:?}"
     ;;
+  'api repos/owner/repo/pulls/7')
+    # #2239: the live head/base pair. Read N answers line N of CLEAR_PAIRS
+    # (the last line once they run out); a line `fail` is a failed read.
+    n=$(( $(cat "${CLEAR_PAIR_READS:?}") + 1 ))
+    printf '%s\n' "$n" >"$CLEAR_PAIR_READS"
+    printf 'pair:%s\n' "${GH_TOKEN:-unset}" >>"${CLEAR_STUB_LOG:?}"
+    line=$(sed -n "${n}p" "${CLEAR_PAIRS:?}")
+    [ -n "$line" ] || line=$(tail -n 1 "$CLEAR_PAIRS")
+    if [ "$line" = fail ]; then
+      echo 'HTTP 502: Bad Gateway' >&2
+      exit 1
+    fi
+    printf '%s\n' "$line"
+    ;;
   'api repos/owner/repo/issues/7/labels/needs-external-review')
     printf 'delete:%s\n' "${GH_TOKEN:-unset}" >>"${CLEAR_STUB_LOG:?}"
     printf 'absent\n' >"${CLEAR_LABEL_STATE:?}"
@@ -857,12 +885,19 @@ chmod +x "$clear_harness_dir/bin/gh" \
   "$clear_harness_dir/scripts/codex-review-check.sh" \
   "$clear_harness_dir/scripts/workflow/approval-merge-continuation.sh"
 
+clear_sha_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+clear_sha_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+clear_sha_c=cccccccccccccccccccccccccccccccccccccccc
 run_clear_harness() {
   # Optional 4th-6th arguments (#2193): the initial label state and the
   # triggering event name and action the event-driven block reads.
+  # CLEAR_PAIR_LINES (#2239): the live head/base answers, one per read;
+  # default a stable pair.
   local script="$1" input_name="$2" protective_rc="$3"
   local label_state="${4:-present}" event_name="${5:-}" event_action="${6:-}"
   printf '%s\n' "$label_state" >"$clear_harness_dir/label-state"
+  printf '%s\n' "${CLEAR_PAIR_LINES:-$(printf '%s\t%s' "$clear_sha_a" "$clear_sha_b")}" >"$clear_harness_dir/pairs"
+  printf '0\n' >"$clear_harness_dir/pair-reads"
   : >"$clear_harness_dir/calls.log"
   : >"$clear_harness_dir/github-env"
   : >"$clear_harness_dir/github-output"
@@ -883,6 +918,8 @@ run_clear_harness() {
       EVENT_ACTION="$event_action" \
       CLEAR_STUB_LOG="$clear_harness_dir/calls.log" \
       CLEAR_LABEL_STATE="$clear_harness_dir/label-state" \
+      CLEAR_PAIRS="$clear_harness_dir/pairs" \
+      CLEAR_PAIR_READS="$clear_harness_dir/pair-reads" \
       GITHUB_ENV="$clear_harness_dir/github-env" \
       GITHUB_OUTPUT="$clear_harness_dir/github-output" \
       bash "$script" >"$clear_harness_dir/run.out" 2>&1
@@ -977,6 +1014,75 @@ clear_absent_case "$clear_harness_dir/event-clear.sh" PR_NUMBERS pull_request_ta
 clear_absent_case "$clear_harness_dir/event-clear.sh" PR_NUMBERS pull_request_target synchronize ''
 clear_absent_case "$clear_harness_dir/event-clear.sh" PR_NUMBERS workflow_run completed ''
 clear_absent_case "$clear_harness_dir/scheduled-clear.sh" PRS '' '' 7
+# #2205: a publisher nomination of a label-absent PR is the routine heal retry.
+clear_absent_case "$clear_harness_dir/event-clear.sh" PR_NUMBERS repository_dispatch auto-clear-evaluate 7
+
+# #2239: the publisher's repository_dispatch reaches the same evaluation. A
+# labeled PR whose gate passes on a head that stayed put loses the label; a
+# head (or base) that moves between the capture before the gate and the
+# pre-DELETE read removes nothing and is not an infrastructure error; an
+# unreadable pre-DELETE pair removes nothing and IS one. Both jobs carry the
+# fence, so both are exercised; the event block runs as a dispatch.
+fence_ok=1
+for clear_case in event scheduled; do
+  if [ "$clear_case" = event ]; then
+    clear_script="$clear_harness_dir/event-clear.sh"; clear_input=PR_NUMBERS
+    fence_event=repository_dispatch; fence_action=auto-clear-evaluate
+  else
+    clear_script="$clear_harness_dir/scheduled-clear.sh"; clear_input=PRS
+    fence_event=''; fence_action=''
+  fi
+  set +e
+  run_clear_harness "$clear_script" "$clear_input" 0 present "$fence_event" "$fence_action"
+  fence_rc=$?
+  set -e
+  if [ "$fence_rc" -ne 0 ] \
+     || [ "$(grep -E '^(protect|delete|comment):' "$clear_harness_dir/calls.log" | tr '\n' ' ')" != \
+          'protect:workflow-token delete:pat-token comment:pat-token ' ] \
+     || [ "$(grep -c '^pair:workflow-token$' "$clear_harness_dir/calls.log")" -ne 2 ]; then
+    echo "  INFO: $clear_case stable-head pass rc=$fence_rc (expected one removal and two workflow-token pair reads)" >&2
+    sed 's/^/        call: /' "$clear_harness_dir/calls.log" >&2
+    sed 's/^/        /' "$clear_harness_dir/run.out" >&2
+    fence_ok=0
+  fi
+  for moved_pair in "$clear_sha_c"$'\t'"$clear_sha_b" "$clear_sha_a"$'\t'"$clear_sha_c"; do
+    set +e
+    CLEAR_PAIR_LINES="$(printf '%s\t%s\n%s' "$clear_sha_a" "$clear_sha_b" "$moved_pair")" \
+      run_clear_harness "$clear_script" "$clear_input" 0 present "$fence_event" "$fence_action"
+    fence_rc=$?
+    set -e
+    if [ "$fence_rc" -ne 0 ] \
+       || grep -Eq '^(delete|comment):' "$clear_harness_dir/calls.log" \
+       || [ "$(cat "$clear_harness_dir/label-state")" != present ] \
+       || grep -Fxq 'HAD_INFRA_ERROR=1' "$clear_harness_dir/github-env" \
+       || ! grep -Fxq 'heal_prs=' "$clear_harness_dir/github-output" \
+       || ! grep -q 'moved while the merge gate was evaluated' "$clear_harness_dir/run.out"; then
+      echo "  INFO: $clear_case moved pair ($moved_pair) rc=$fence_rc removed the label or failed" >&2
+      sed 's/^/        call: /' "$clear_harness_dir/calls.log" >&2
+      sed 's/^/        /' "$clear_harness_dir/run.out" >&2
+      fence_ok=0
+    fi
+  done
+  set +e
+  CLEAR_PAIR_LINES="$(printf '%s\t%s\nfail' "$clear_sha_a" "$clear_sha_b")" \
+    run_clear_harness "$clear_script" "$clear_input" 0 present "$fence_event" "$fence_action"
+  fence_rc=$?
+  set -e
+  if [ "$fence_rc" -ne 1 ] \
+     || grep -Eq '^(delete|comment):' "$clear_harness_dir/calls.log" \
+     || ! grep -Fxq 'HAD_INFRA_ERROR=1' "$clear_harness_dir/github-env"; then
+    echo "  INFO: $clear_case unreadable pre-delete pair rc=$fence_rc (expected 1, no removal, infra sentinel)" >&2
+    sed 's/^/        /' "$clear_harness_dir/run.out" >&2
+    fence_ok=0
+  fi
+done
+if [ "$fence_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: both clear blocks (the event block run as a #2239 dispatch) remove the label only when the head/base captured before the gate is still live, and treat an unreadable pair as an infra error"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: a merge-gate removal must be fenced on the live head/base captured before the gate; a moved pair removes nothing (#2239)" >&2
+fi
 
 if [ "$heal_candidates_ok" -eq 1 ]; then
   pass=$((pass + 1))
@@ -1037,7 +1143,9 @@ case "$method $endpoint" in
     reads=$(cat "$HEAL_STUB_DIR/pr-reads")
     reads=$((reads + 1))
     printf '%s\n' "$reads" >"$HEAL_STUB_DIR/pr-reads"
-    if [ "$reads" -gt 1 ] && [ -f "$HEAL_STUB_DIR/pr-after-first-read.json" ]; then
+    # move-after (#2205): reads beyond this many answer the moved PR.
+    if [ "$reads" -gt "$(cat "$HEAL_STUB_DIR/move-after" 2>/dev/null || echo 1)" ] \
+       && [ -f "$HEAL_STUB_DIR/pr-after-first-read.json" ]; then
       jq -r "$jq_filter" "$HEAL_STUB_DIR/pr-after-first-read.json"
     else
       jq -r "$jq_filter" "$HEAL_STUB_DIR/pr.json"
@@ -1048,6 +1156,14 @@ case "$method $endpoint" in
     jq -r "$jq_filter" "$HEAL_STUB_DIR/runs.json"
     ;;
   'POST repos/owner/repo/check-runs')
+    # post-fails (#2205): this many POSTs fail first, with post-fail-text.
+    fails=$(cat "$HEAL_STUB_DIR/post-fails" 2>/dev/null || echo 0)
+    if [ "$fails" -gt 0 ]; then
+      printf '%s\n' $((fails - 1)) >"$HEAL_STUB_DIR/post-fails"
+      printf 'post-fail:pr-reads=%s\n' "$(cat "$HEAL_STUB_DIR/pr-reads")" >>"$HEAL_STUB_DIR/calls.log"
+      cat "$HEAL_STUB_DIR/post-fail-text" >&2
+      exit 1
+    fi
     printf 'post:%s:%s\n' "${GH_TOKEN:-unset}" "${args[*]}" >>"$HEAL_STUB_DIR/calls.log"
     printf '{}\n'
     ;;
@@ -1077,13 +1193,16 @@ heal_run() {
   fi
   printf '%s\n' "$runs_json" >"$heal_dir/runs.json"
   printf '0\n' >"$heal_dir/pr-reads"
+  printf '%s\n' "${HEAL_MOVE_AFTER:-1}" >"$heal_dir/move-after"
+  printf '%s\n' "${HEAL_POST_FAILS:-0}" >"$heal_dir/post-fails"
+  printf '%s\n' "${HEAL_POST_FAIL_TEXT:-HTTP 502: Bad Gateway}" >"$heal_dir/post-fail-text"
   : >"$heal_dir/calls.log"
   (
     cd "$heal_dir"
     env \
       PATH="$heal_dir/bin:$PATH" \
       GH_TOKEN=workflow-token \
-      GH_RETRY_ATTEMPTS=1 \
+      GH_RETRY_ATTEMPTS="${HEAL_ATTEMPTS:-1}" \
       GH_RETRY_BACKOFF_SECONDS=0 \
       HEAL_STUB_DIR="$heal_dir" \
       REPO=owner/repo \
@@ -1137,6 +1256,7 @@ heal_expect_no_post() {
 heal_stale_failure_ok=1
 heal_quiet_ok=1
 heal_fence_ok=1
+heal_retry_ok=1
 for heal_case in event sweep; do
   block="$heal_dir/$heal_case-heal.sh"
   title='Auto-clear confirmed needs-external-review absent'
@@ -1169,6 +1289,36 @@ for heal_case in event sweep; do
     echo "  INFO: $heal_case head-moved case did not reach the fence" >&2
     heal_fence_ok=0
   fi
+  # #2205: a transient POST failure is retried, and the PR is re-read before
+  # EVERY attempt: the second attempt's POST follows the third PR read.
+  HEAL_ATTEMPTS=3 HEAL_POST_FAILS=1 \
+    heal_run "$block" absent "$(heal_runs failure@2026-10-14T00:50:00Z@20)"
+  if ! heal_expect_post 'retried POST' "$heal_case" "$title" \
+     || [ "$(grep -c '^post-fail:pr-reads=2$' "$heal_dir/calls.log")" -ne 1 ] \
+     || [ "$(cat "$heal_dir/pr-reads")" -ne 3 ]; then
+    echo "  INFO: $heal_case retried POST: expected one failed attempt after read 2, then a re-fenced success" >&2
+    sed 's/^/        call: /' "$heal_dir/calls.log" >&2
+    heal_retry_ok=0
+  fi
+  # The head moves between the failed attempt and the retry: the retry's own
+  # fence stops it, so nothing is posted.
+  HEAL_ATTEMPTS=3 HEAL_POST_FAILS=1 HEAL_MOVE_AFTER=2 \
+    heal_run "$block" absent "$(heal_runs failure@2026-10-14T00:50:00Z@20)" "$heal_sha_b"
+  if ! heal_expect_no_post 'retry after a head move' "$heal_case" \
+     || ! grep -q '^post-fail:' "$heal_dir/calls.log" \
+     || ! grep -Fq 'head moved' "$heal_dir/run.out"; then
+    echo "  INFO: $heal_case: a retry after the head moved must be stopped by its own fence" >&2
+    heal_retry_ok=0
+  fi
+  # A permanent failure (a 4xx other than a rate limit) is not retried.
+  HEAL_ATTEMPTS=3 HEAL_POST_FAILS=3 HEAL_POST_FAIL_TEXT='HTTP 422: Unprocessable Entity' \
+    heal_run "$block" absent "$(heal_runs failure@2026-10-14T00:50:00Z@20)"
+  if [ "$(grep -c '^post-fail:' "$heal_dir/calls.log")" -ne 1 ] \
+     || grep -q '^post:' "$heal_dir/calls.log"; then
+    echo "  INFO: $heal_case: a permanent POST failure must not be retried" >&2
+    sed 's/^/        call: /' "$heal_dir/calls.log" >&2
+    heal_retry_ok=0
+  fi
 done
 
 if [ "$heal_stale_failure_ok" -eq 1 ]; then
@@ -1191,6 +1341,13 @@ if [ "$heal_fence_ok" -eq 1 ]; then
 else
   fail=$((fail + 1))
   echo "  FAIL: heal steps must fence the POST on a fresh head read (#2193)" >&2
+fi
+if [ "$heal_retry_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: heal steps retry a transiently failed POST, re-fencing before each attempt, and never retry a permanent failure (#2205)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: a failed heal POST must be retried under with_gh_retry with a fresh fence before every attempt (#2205)" >&2
 fi
 rm -rf "$heal_dir"
 fi
@@ -1791,6 +1948,48 @@ else
   echo "  FAIL: #730 non-matching head_sha should yield empty (got: $out)" >&2
 fi
 unset GH_STUB_PRS
+
+# #2239: the LIVE resolve step (not the mirror above), run as the publisher's
+# repository_dispatch. Only a positive-integer client_payload.pr is resolved,
+# every other payload field is ignored, another dispatch action is skipped,
+# and a malformed selector fails the run without resolving anything.
+resolve_dir=$(mktemp -d "${TMPDIR:-/tmp}/auto-clear-resolve.XXXXXX")
+awk '
+  $0 == "      - name: Resolve PR number from event" { in_step=1; next }
+  in_step && $0 == "        run: |" { in_run=1; next }
+  in_run && /^          / { sub(/^          /, ""); print; next }
+  in_run && /^[[:space:]]*$/ { print; next }
+  in_run { exit }
+' "$WORKFLOW" >"$resolve_dir/resolve.sh"
+resolve_case() {  # <label> <event-json> <expected numbers> <expected rc>
+  local label="$1" json="$2" want="$3" want_rc="$4" rc=0 got
+  : >"$resolve_dir/out"
+  env EVENT_NAME=repository_dispatch EVENT_JSON="$json" REPO=owner/repo GH_TOKEN=x \
+    GITHUB_OUTPUT="$resolve_dir/out" bash "$resolve_dir/resolve.sh" >"$resolve_dir/log" 2>&1 || rc=$?
+  got=$(awk '/^numbers=/ { sub(/^numbers=/, ""); print; next }
+             /^numbers<<EOF$/ { f=1; next } f && /^EOF$/ { f=0; next } f { print }' "$resolve_dir/out")
+  if [ -s "$resolve_dir/resolve.sh" ] && [ "$rc" -eq "$want_rc" ] && [ "$got" = "$want" ]; then
+    pass=$((pass + 1))
+    echo "  PASS: #2239 resolve step: $label"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: #2239 resolve step: $label (rc=$rc want $want_rc, numbers='$got' want '$want')" >&2
+    sed 's/^/        /' "$resolve_dir/log" >&2
+  fi
+}
+resolve_case 'a dispatch resolves exactly its PR number' \
+  '{"action":"auto-clear-evaluate","client_payload":{"pr":42,"head_sha":"ffff","labels":["x"]}}' 42 0
+resolve_case 'a string PR number resolves the same' \
+  '{"action":"auto-clear-evaluate","client_payload":{"pr":"42"}}' 42 0
+resolve_case 'another dispatch action resolves nothing' \
+  '{"action":"merge-clearance-recheck","client_payload":{"pr":42}}' '' 0
+resolve_case 'a non-integer selector fails and resolves nothing' \
+  '{"action":"auto-clear-evaluate","client_payload":{"pr":"42; rm -rf /"}}' '' 1
+resolve_case 'a zero or zero-padded selector fails' \
+  '{"action":"auto-clear-evaluate","client_payload":{"pr":"042"}}' '' 1
+resolve_case 'a missing selector fails' \
+  '{"action":"auto-clear-evaluate","client_payload":{}}' '' 1
+rm -rf "$resolve_dir"
 
 # Unsupported event → exit 0 with stderr message (matches workflow
 # behavior; CR Minor on PR #202 r1 fixed the prior return-1 mismatch)

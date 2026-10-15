@@ -321,6 +321,11 @@ jobs:
       # it, this job's GITHUB_TOKEN 403s on that read once a PR carries a
       # real CodeQL comment.
       security-events: read
+    # #2239/#2205: PRs the pass nominated to auto-clear, space-separated, for
+    # the nominate-auto-clear job below. Written before the step's final
+    # exit, so another PR's infra error does not drop a nomination.
+    outputs:
+      autoclear_prs: ${{ steps.publish.outputs.autoclear_prs }}
     steps:
       - name: Checkout repo (default branch — trusted scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -330,6 +335,7 @@ jobs:
           persist-credentials: false
 
       - name: Resolve targets, evaluate gates, publish
+        id: publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -393,10 +399,13 @@ jobs:
           # Exhaustive pagination, not a fixed cap: a capped list silently
           # exempts every head beyond it from both phases (cross-agent
           # round 3). One query carries number AND head so no per-PR
-          # resolve call can fail independently (#465).
+          # resolve call can fail independently (#465). The fourth column is
+          # whether the PR carries needs-external-review (#2239), read from
+          # the same response, so nominating a labeled PR to auto-clear below
+          # costs no request.
           if ! prs_raw=$(gh api --paginate -X GET "repos/$REPO/pulls" -f state=open \
               -f per_page=100 \
-              --jq '.[] | "\(.number)\t\(.head.sha)\t\(.updated_at)"'); then
+              --jq '.[] | "\(.number)\t\(.head.sha)\t\(.updated_at)\t\(any(.labels[]?; .name == "needs-external-review"))"'); then
             echo "::error::Failed to list open PRs on $REPO; leaving any pending entries standing (fail closed)."
             exit 1
           fi
@@ -971,6 +980,11 @@ jobs:
               >/dev/null; then
               echo "::error::Failed to post $context for PR #$pr — its slot was not refreshed."
               had_infra_error=1
+            elif [ "$context" = "$MCG_CONTEXT" ] && [ "$conclusion" = "success" ]; then
+              # #2239: a green clearance verdict that LANDED on the live head
+              # (a moved head was turned red above). The nomination step
+              # after the loop decides whether auto-clear should run on it.
+              MCG_GREEN_PRS="${MCG_GREEN_PRS:-} $pr"
             fi
           }
 
@@ -979,7 +993,7 @@ jobs:
           # only known once due() has read each PR's proof.
           selected=""
           budget_skipped=""
-          while IFS=$'\t' read -r PR head_sha pr_updated; do
+          while IFS=$'\t' read -r PR head_sha pr_updated _pr_labeled; do
             [ -z "$PR" ] && continue
             if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
               echo "::error::No head SHA for PR #$PR from the open-PR list; cannot refresh its contexts."
@@ -1099,6 +1113,49 @@ jobs:
             echo "::endgroup::"
           done <<<"$selected"
 
+          # Auto-clear nominations (#2239, #2205). auto-clear-blocking-labels.yml
+          # listens to no run of this workflow, so a green `Merge clearance
+          # gate` verdict posted here used to reach the label only through its
+          # */5 sweep, which GitHub delays or drops under load. Each PR this
+          # pass gave a green verdict is nominated, for the nominate-auto-clear
+          # job to dispatch, when:
+          #   * it carries needs-external-review (the open-PR list above, no
+          #     extra request): auto-clear re-derives clearance from live
+          #     state and removes the label if the merge gate passes; or
+          #   * on a full-coverage pass only (the */30 chained sweep pass, a
+          #     dispatch), it does not, and the newest auto-clear-blocking-labels
+          #     check-run on its head is a failure: a heal that failed after a
+          #     removal, which nothing else retries (#2205). One request per
+          #     such PR, inside the per-PR budget, and none after a rate-limit
+          #     stop.
+          # A red verdict, a withheld one, an unlabeled PR with no stale
+          # failure, and a pass that evaluated nothing nominate nothing.
+          autoclear_prs=""
+          for green_pr in ${MCG_GREEN_PRS:-}; do
+            case " $autoclear_prs " in *" $green_pr "*) continue ;; esac
+            green_row=$(awk -F'\t' -v n="$green_pr" '$1 == n { print; exit }' <<<"$prs_raw")
+            green_head=$(cut -f2 <<<"$green_row")
+            if [ "$(cut -f4 <<<"$green_row")" = "true" ]; then
+              echo "PR #$green_pr: green clearance verdict on a PR carrying needs-external-review; nominating it to auto-clear (#2239)."
+              autoclear_prs="$autoclear_prs $green_pr"
+              continue
+            fi
+            [ "$due_only" -eq 0 ] && [ "${RATE_LIMITED:-0}" -eq 0 ] || continue
+            if ! ac_runs=$(gh api --paginate -X GET "repos/$REPO/commits/$green_head/check-runs" \
+                -f check_name=auto-clear-blocking-labels -f filter=latest -f per_page=100 \
+                --jq '.check_runs[] | select(.name == "auto-clear-blocking-labels") | [(.completed_at // .started_at // ""), (.id | tostring), (.conclusion // .status // "unknown")] | @tsv'); then
+              echo "::warning::Could not read the auto-clear-blocking-labels check-runs on PR #$green_pr head $green_head; the next full pass retries the read (#2205)."
+              continue
+            fi
+            [ -n "$ac_runs" ] || continue
+            if [ "$(sort -t $'\t' -k1,1 -k2,2n <<<"$ac_runs" | tail -n 1 | cut -f3)" = "failure" ]; then
+              echo "PR #$green_pr: label absent and the newest auto-clear-blocking-labels run on $green_head is a failure; nominating it to auto-clear to heal it (#2205)."
+              autoclear_prs="$autoclear_prs $green_pr"
+            fi
+          done
+          # shellcheck disable=SC2086  # intentional word-splitting to trim
+          echo "autoclear_prs=$(echo $autoclear_prs)" >> "$GITHUB_OUTPUT"
+
           if [ -n "$stopped" ]; then
             echo "::warning::Stopped at an installation API rate-limit failure (#2220). Not evaluated:$stopped. Each keeps its previous verdict on its own head; a pass after ${RATE_LIMIT_RESET_ISO:-the budget resets} evaluates them."
           fi
@@ -1109,3 +1166,51 @@ jobs:
             echo "::error::Publisher finished with one or more infra errors"
             exit 1
           fi
+
+  # Phase 3 (#2239, #2205). Sends one `auto-clear-evaluate` repository_dispatch
+  # per PR the publish pass nominated (see "Auto-clear nominations" in its
+  # step), carrying only the PR number. auto-clear-blocking-labels.yml handles
+  # it on its default-branch definition, re-derives clearance from live state,
+  # fences the live head/base before any label DELETE and runs its heal step.
+  #
+  # A SEPARATE job because POST /dispatches needs `contents: write`, and a job
+  # is the narrowest scope a GITHUB_TOKEN permission can have: the publish job
+  # runs the gate scripts and must not hold it. This job checks out nothing and
+  # runs one inline loop over integers it validates, so no candidate or
+  # repository code ever executes with that grant. It writes no check-run and
+  # opens no hold, and it is skipped (no runner) whenever the pass nominated
+  # nothing, which is almost every pass. No PAT: a GITHUB_TOKEN
+  # repository_dispatch starts the run.
+  nominate-auto-clear:
+    name: nominate-auto-clear
+    needs: publish
+    if: ${{ !cancelled() && needs.publish.outputs.autoclear_prs != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Dispatch auto-clear evaluations
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          AUTOCLEAR_PRS: ${{ needs.publish.outputs.autoclear_prs }}
+        run: |
+          set -euo pipefail
+          # Best effort, single attempt per PR: auto-clear's */5 sweep still
+          # bounds a dropped nomination for a labeled PR, and the next full
+          # publisher pass repeats a heal nomination. A failed dispatch warns
+          # instead of reddening the publisher run, whose red means a verdict
+          # was not published.
+          for pr in $AUTOCLEAR_PRS; do
+            if ! [[ "$pr" =~ ^[1-9][0-9]{0,9}$ ]]; then
+              echo "::warning::Ignoring malformed auto-clear nomination '$pr'."
+              continue
+            fi
+            if gh api -X POST "repos/$REPO/dispatches" \
+                -f event_type=auto-clear-evaluate \
+                -F "client_payload[pr]=$pr" >/dev/null; then
+              echo "Dispatched auto-clear-evaluate for PR #$pr."
+            else
+              echo "::warning::Could not dispatch auto-clear-evaluate for PR #$pr; the auto-clear sweep or the next publisher full pass covers it."
+            fi
+          done
