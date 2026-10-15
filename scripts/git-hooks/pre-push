@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# git pre-push hook (#2221): run the repo-lint checks CI would select for the
+# pushed range before the push leaves the machine. Installed per clone by
+# scripts/install-git-hooks.sh (sets core.hooksPath to this directory).
+#
+# The required `lint` check in Actions stays authoritative; this only
+# surfaces its failures earlier. Bypass for emergencies:
+#   git push --no-verify
+#   MERGEPATH_PREPUSH_SKIP=1 git push
+#
+# A checkout without the runner (an older branch, or a consumer repository
+# that never received this hub-only tooling) passes without checking.
+
+if [ "${MERGEPATH_PREPUSH_SKIP:-0}" = "1" ]; then
+  echo "repo-lint pre-push: skipped (MERGEPATH_PREPUSH_SKIP=1); CI lint remains authoritative"
+  exit 0
+fi
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+runner="$root/scripts/repo-lint-prepush.sh"
+if [ ! -f "$runner" ]; then
+  echo "repo-lint pre-push: SKIP (scripts/repo-lint-prepush.sh is not in this checkout)"
+  exit 0
+fi
+
+exec bash "$runner" --hook "$@"

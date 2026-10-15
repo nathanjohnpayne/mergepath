@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# check_repo_lint_prepush
+#
+# Runs tests/test_repo_lint_prepush.sh (#2221): the hub-only git pre-push
+# mirror of repo-lint must select, for any changed-path list, exactly the
+# wrappers and self-tests the CI scope job and the workflow's `if:`
+# expressions select, and must block a push on a failing selected check.
+# Wired in lint_fast so a workflow or classifier change that the mirror does
+# not follow fails here, on the PR that makes it, rather than leaving the
+# local hook quietly stale.
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_repo_lint_prepush.sh"
+
+# Consumer-safety guard (#601), marker-FIRST: the scripts/ci kit travels to
+# every consumer, but the pre-push mirror and its suite are hub-only (not
+# manifest-propagated). Gating on the hub marker alone keeps the verdict a
+# SKIP on a consumer that carries the suite as bootstrap residue, which the
+# both-absent pair would run instead (the residue-invariance net toggles
+# exactly that file). On the hub, a missing suite is a hard error.
+if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+  echo "check_repo_lint_prepush: SKIP (consumer checkout: scripts/sync-to-downstream.sh absent; the pre-push mirror is hub-only)"
+  exit 0
+fi
+if [ ! -f "$TEST_SCRIPT" ]; then
+  echo "check_repo_lint_prepush: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"
+echo "check_repo_lint_prepush: PASS"
