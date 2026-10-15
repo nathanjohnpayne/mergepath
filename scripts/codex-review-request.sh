@@ -803,8 +803,10 @@ esac
 # paths from parse_policy_list.sh; the match from match_protected_paths.sh.
 # The policy text, the exclusion constant, the parser and the matcher all
 # come from the base revision, never from this checkout, which may be another
-# repository or the candidate's own edit; so these helpers have no requires:
-# edge in .mergepath-sync.yml. No YAML parser reads the policy here.
+# repository or the candidate's own edit. The parser and the matcher are
+# code, so the base copies are read as data and only this requester's
+# byte-identical own copy runs (#2272, below). No YAML parser reads the
+# policy here.
 #
 # FAIL-SAFE (owner rule): any input that cannot be read counts as gated, and
 # the PR is requested with a WARN naming the cause. That includes the PR
@@ -812,9 +814,65 @@ esac
 # EMPTY or disagrees with the PR's changed_files count (a short read is not a
 # small PR), the governing base policy, a threshold the labeler would not
 # read as written, the base copies of the exclusion constant, the parser and
-# the matcher, and a PR whose head, base, default branch or labels changed
+# the matcher (including a base copy that is not byte-identical to this
+# requester's own), and a PR whose head, base, default branch or labels changed
 # during the reads. A skip therefore needs every signal positively read as
 # "not gated" for one snapshot of the PR.
+#
+# FETCHED CODE NEVER RUNS (#2272). The parser and the matcher are code, and
+# the base can be any branch the PR targets, including an unprotected one.
+# This script usually runs with the author or reviewer PAT reachable: in its
+# environment (GH_TOKEN, OP_PREFLIGHT_*), in its parent's environment, and in
+# the op-preflight cache under $HOME. Stripping the child's environment does
+# not stop same-user code from reading the other two (Codex P1 on #2277), so
+# the base copies are never executed. Each is fetched as DATA and compared
+# byte for byte with this requester's own copy beside it, which travels with
+# it (requires: in .mergepath-sync.yml). Only that own copy runs, and only
+# when the bytes are identical, so labeler parity holds exactly: the code
+# that runs IS the base revision's helper. A base copy that differs, or a
+# missing own copy, takes the fail-safe and requests: version skew or a
+# candidate's edit costs a Codex request, never a skipped one.
+#
+# The own copy still runs through run_policy_helper, which starts it with an
+# empty environment plus PATH (to find bash and awk) and LC_ALL=C.UTF-8:
+# neither helper reads anything else, and an empty environment keeps a
+# future helper from silently depending on a credential. The locale is
+# UTF-8, not C, because the matcher compiles `?` to `[^/]`; under C a
+# multibyte character in a file name is several characters, so `?` would
+# match LESS than the labeler: the unsafe direction. The EXCLUDE_RE read
+# executes nothing (jq decodes the file and sed extracts one line).
+run_policy_helper() {  # <script> [args...]; stdin passes through
+  env -i PATH="$PATH" LC_ALL=C.UTF-8 bash "$@"
+}
+# Fetch a base helper as data and confirm it is byte-identical to this
+# requester's own copy. Prints nothing; returns 0 when identical, else sets
+# BASE_HELPER_CAUSE and returns 1. Args: <repo path> <base sha> <own copy>
+BASE_HELPER_CAUSE=""
+base_helper_matches_own() {
+  local path=$1 sha=$2 own=$3 json fetched rc=0
+  BASE_HELPER_CAUSE=""
+  fetched=$(mktemp "${TMPDIR:-/tmp}/codex-request-helper.XXXXXX" 2>/dev/null) || fetched=""
+  if [ -z "$fetched" ]; then
+    BASE_HELPER_CAUSE="could not allocate a scratch file to read $path"
+    return 1
+  fi
+  json=$(gh api "repos/$REPO/contents/$path?ref=$sha" 2>/dev/null) || json=""
+  # -j: the decoded bytes exactly, with no newline appended, so the compare
+  # below sees the file as committed.
+  if ! printf '%s' "$json" | jq -j '.content | gsub("\n"; "") | @base64d' >"$fetched" 2>/dev/null \
+     || [ ! -s "$fetched" ]; then
+    BASE_HELPER_CAUSE="cannot read $path at $sha"
+    rc=1
+  elif [ ! -s "$own" ]; then
+    BASE_HELPER_CAUSE="this requester has no copy of $path to run (it travels with the requester; fetched base code is never executed, #2272)"
+    rc=1
+  elif ! cmp -s "$fetched" "$own"; then
+    BASE_HELPER_CAUSE="$path at $sha is not byte-identical to this requester's own copy; fetched base code is never executed (#2272)"
+    rc=1
+  fi
+  rm -f "$fetched"
+  return "$rc"
+}
 phase_4a_gate_failsafe() {  # <cause>
   PHASE_4A_GATED=true
   PHASE_4A_GATE_REASON="$1"
@@ -827,8 +885,8 @@ phase_4a_gate_derived() {  # <reason>
 }
 derive_phase_4a_gate() {
   local pr_json has_label changed_files files_json files_tmp files_count head_sha base_ref base_sha default_branch
-  local base_cfg fp_json default_json default_sha raw_threshold raw_lines matcher_json live_default
-  local parser parser_json parser_rc paths_out
+  local base_cfg fp_json default_json default_sha raw_threshold raw_lines live_default
+  local parser parser_rc paths_out
   local threshold exclude_re lines pattern matcher changed matched live_json live_fence rc=0
   local -a patterns=()
 
@@ -946,22 +1004,13 @@ derive_phase_4a_gate() {
   # labeler (anchors and aliases, flow lists, numeric spellings) and skip a
   # PR the labeler gates.
   raw_threshold=$(grep -E '^external_review_threshold:' "$base_cfg" 2>/dev/null) || raw_threshold=""
-  parser=$(mktemp "${TMPDIR:-/tmp}/codex-request-parser.XXXXXX" 2>/dev/null) || parser=""
-  if [ -z "$parser" ]; then
+  parser="$__CODEX_REQUEST_DIR/workflow/parse_policy_list.sh"
+  if ! base_helper_matches_own scripts/workflow/parse_policy_list.sh "$base_sha" "$parser"; then
     [ "$base_cfg" = "$CONFIG" ] || rm -f "$base_cfg" 2>/dev/null || true
-    phase_4a_gate_failsafe "could not allocate a scratch file for the policy list parser"
+    phase_4a_gate_failsafe "the policy list parser: $BASE_HELPER_CAUSE"
     return 0
   fi
-  parser_json=$(gh api "repos/$REPO/contents/scripts/workflow/parse_policy_list.sh?ref=$base_sha" 2>/dev/null) || parser_json=""
-  if ! printf '%s' "$parser_json" | jq -r '.content | gsub("\n"; "") | @base64d' >"$parser" 2>/dev/null \
-     || [ ! -s "$parser" ]; then
-    rm -f "$parser"
-    [ "$base_cfg" = "$CONFIG" ] || rm -f "$base_cfg" 2>/dev/null || true
-    phase_4a_gate_failsafe "cannot read the policy list parser scripts/workflow/parse_policy_list.sh at $base_sha"
-    return 0
-  fi
-  paths_out=$(bash "$parser" "$base_cfg" external_review_paths 2>/dev/null) || parser_rc=$?
-  rm -f "$parser"
+  paths_out=$(run_policy_helper "$parser" "$base_cfg" external_review_paths 2>/dev/null) || parser_rc=$?
   [ "$base_cfg" = "$CONFIG" ] || rm -f "$base_cfg" 2>/dev/null || true
   if [ "${parser_rc:-0}" -ne 0 ]; then
     phase_4a_gate_failsafe "the policy list parser failed on external_review_paths (rc=$parser_rc)"
@@ -1015,23 +1064,15 @@ derive_phase_4a_gate() {
     # The matcher is loaded from the base too (Codex P1 on #2258): the
     # labeler runs the base revision's helper tree, and a checkout copy,
     # from another repository or edited by the candidate, could match less.
-    matcher=$(mktemp "${TMPDIR:-/tmp}/codex-request-matcher.XXXXXX" 2>/dev/null) || matcher=""
-    if [ -z "$matcher" ]; then
-      phase_4a_gate_failsafe "could not allocate a scratch file for the protected-path matcher"
-      return 0
-    fi
-    matcher_json=$(gh api "repos/$REPO/contents/scripts/workflow/match_protected_paths.sh?ref=$base_sha" 2>/dev/null) || matcher_json=""
-    if ! printf '%s' "$matcher_json" | jq -r '.content | gsub("\n"; "") | @base64d' >"$matcher" 2>/dev/null \
-       || [ ! -s "$matcher" ]; then
-      rm -f "$matcher"
-      phase_4a_gate_failsafe "cannot read the protected-path matcher scripts/workflow/match_protected_paths.sh at $base_sha"
+    matcher="$__CODEX_REQUEST_DIR/workflow/match_protected_paths.sh"
+    if ! base_helper_matches_own scripts/workflow/match_protected_paths.sh "$base_sha" "$matcher"; then
+      phase_4a_gate_failsafe "the protected-path matcher: $BASE_HELPER_CAUSE"
       return 0
     fi
     # Both sides of a rename (#763): moving a protected file out of a
     # protected path must still match.
     changed=$(printf '%s' "$files_json" | jq -r '.[] | (.filename, (.previous_filename // empty))')
-    matched=$(printf '%s\n' "$changed" | bash "$matcher" "${patterns[@]}") || rc=$?
-    rm -f "$matcher"
+    matched=$(printf '%s\n' "$changed" | run_policy_helper "$matcher" "${patterns[@]}") || rc=$?
     if [ "$rc" -ne 0 ]; then
       phase_4a_gate_failsafe "the protected-path matcher failed (rc=$rc)"
       return 0

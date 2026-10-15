@@ -612,6 +612,12 @@ paths:
       # on the consumer, whose rate-limit failover would then exit 8 without
       # posting. A caller must travel with the callee whose contract it uses.
       - "scripts/coderabbit-wait.sh"
+      # #2272: the Phase 4 gate derivation reads the labeler's parser and
+      # matcher at the PR base as DATA and runs only these own copies, after a
+      # byte compare. Absent or skewed, the derivation fails safe (requests),
+      # so the edge keeps a sync from turning every PR into a Codex request.
+      - "scripts/workflow/parse_policy_list.sh"
+      - "scripts/workflow/match_protected_paths.sh"
   # Complete-history reviewer-feedback accounting gate (#1000). Reads every
   # paginated inline comment, review object, and PR-level comment; reconciles
   # classified findings with finding-bound disposition evidence. It hard-
