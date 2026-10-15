@@ -64,10 +64,11 @@ make_case() {
   cp "$ROOT/scripts/workflow/resolve-codex-verdict-anchors.py" "$dir/scripts/workflow/resolve-codex-verdict-anchors.py"
   cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
   cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$dir/scripts/workflow/resolve_base_policy.sh"
-  # #2257: the Phase 4 gate derivation matches paths with the shared matcher
-  # and reads the generated-file exclusion from the fingerprint helper AT THE
-  # BASE, which the gh stub serves from state/ (never from this checkout).
-  cp "$ROOT/scripts/workflow/match_protected_paths.sh" "$dir/scripts/workflow/match_protected_paths.sh"
+  # #2257: the Phase 4 gate derivation loads the shared matcher and the
+  # fingerprint helper's EXCLUDE_RE AT THE BASE, which the gh stub serves from
+  # state/. Neither is staged in this checkout, so a passing case proves the
+  # base copies were used.
+  cp "$ROOT/scripts/workflow/match_protected_paths.sh" "$dir/state/base-matcher.sh"
   cp "$ROOT/scripts/workflow/external_review_fingerprint.sh" "$dir/state/base-fingerprint.sh"
   chmod +x "$dir/scripts/workflow/resolve_base_policy.sh"
 
@@ -193,6 +194,28 @@ case "$endpoint" in
     # env string at 128 KiB) comes from a file instead.
     if [ -n "${CODEX_TEST_FILES_JSON_FILE:-}" ]; then cat "$CODEX_TEST_FILES_JSON_FILE"
     else printf '%s\n' "${CODEX_TEST_FILES_JSON:-$default_files}"; fi ;;
+  'repos/owner/repo/contents/scripts/workflow/match_protected_paths.sh?ref=base-sha')
+    # #2257: the protected-path matcher at the base.
+    case "${CODEX_TEST_BASE_MATCHER:-ok}" in
+      fail) echo "stub: base matcher read refused" >&2; exit 1 ;;
+      broken) content=$(printf '#!/usr/bin/env bash\nexit 2\n' | base64 | tr -d '\n') ;;
+      *) content=$(base64 <"$CODEX_TEST_STATE_DIR/base-matcher.sh" | tr -d '\n') ;;
+    esac
+    jq -cn --arg c "$content" '{encoding: "base64", content: $c}' ;;
+  repos/owner/repo/branches/main)
+    # #2257: the default branch's head, pinned before the policy read and
+    # re-read by the fence. CODEX_TEST_DEFAULT_MODE=advanced moves it on the
+    # second read; =fail refuses every read.
+    d=0
+    [ -f "$CODEX_TEST_STATE_DIR/default-reads" ] && d=$(cat "$CODEX_TEST_STATE_DIR/default-reads")
+    d=$((d + 1))
+    printf '%s\n' "$d" >"$CODEX_TEST_STATE_DIR/default-reads"
+    case "${CODEX_TEST_DEFAULT_MODE:-ok}" in
+      fail) echo "stub: branch read refused" >&2; exit 1 ;;
+      advanced) [ "$d" -ge 2 ] && sha=main-sha-2 || sha=main-sha-1 ;;
+      *) sha=main-sha-1 ;;
+    esac
+    jq -cn --arg s "$sha" '{name: "main", commit: {sha: $s}}' ;;
   'repos/owner/repo/contents/scripts/workflow/external_review_fingerprint.sh?ref=base-sha')
     # #2257: the fingerprint helper at the base, for its EXCLUDE_RE constant.
     case "${CODEX_TEST_BASE_HELPER:-ok}" in
@@ -771,14 +794,25 @@ test_derive_failsafe() {
   dir=$(derive_case paths-empty-entry 'external_review_paths:'$'\n''  - ""')
   rc=$(run_case "$dir" false)
   assert_failsafe_request "an empty-string protected path" "$dir" "$rc" "is not a list of non-empty strings"
-  dir=$(derive_case matcher-missing 'external_review_paths:'$'\n''  - ".github/**"')
-  rm -f "$dir/scripts/workflow/match_protected_paths.sh"
-  rc=$(run_case "$dir" false)
-  assert_failsafe_request "a missing protected-path matcher" "$dir" "$rc" "the protected-path matcher is missing"
+  dir=$(derive_case matcher-unread 'external_review_paths:'$'\n''  - ".github/**"')
+  rc=$(CODEX_TEST_BASE_MATCHER=fail run_case "$dir" false)
+  assert_failsafe_request "an unreadable base protected-path matcher" "$dir" "$rc" "cannot read the protected-path matcher"
   dir=$(derive_case matcher-fails 'external_review_paths:'$'\n''  - ".github/**"')
-  printf '#!/usr/bin/env bash\nexit 2\n' >"$dir/scripts/workflow/match_protected_paths.sh"
+  rc=$(CODEX_TEST_BASE_MATCHER=broken run_case "$dir" false)
+  assert_failsafe_request "a failing base protected-path matcher" "$dir" "$rc" "the protected-path matcher failed (rc=2)"
+  # A narrower matcher in this checkout is never consulted: the base copy
+  # still matches the protected path.
+  dir=$(derive_case matcher-local-narrow 'external_review_paths:'$'\n''  - "src/**"')
+  printf '#!/usr/bin/env bash\ncat >/dev/null\nexit 0\n' >"$dir/scripts/workflow/match_protected_paths.sh"
   rc=$(run_case "$dir" false)
-  assert_failsafe_request "a failing protected-path matcher" "$dir" "$rc" "the protected-path matcher failed (rc=2)"
+  assert_derived_request "a narrower checkout matcher (the base copy decides)" "$dir" "$rc" "protected paths changed: src/app.ts"
+  # The default branch: its head is pinned before the policy read.
+  dir=$(derive_case default-unread)
+  rc=$(CODEX_TEST_DEFAULT_MODE=fail run_case "$dir" false)
+  assert_failsafe_request "an unreadable default-branch head" "$dir" "$rc" "could not read the head commit of the default branch main"
+  dir=$(derive_case default-advanced)
+  rc=$(CODEX_TEST_DEFAULT_MODE=advanced run_case "$dir" false)
+  assert_failsafe_request "a default branch that advances during the derivation" "$dir" "$rc" "the default branch main moved during the derivation"
   dir=$(derive_case exclusion-missing)
   rc=$(CODEX_TEST_BASE_HELPER=noexclude run_case "$dir" false)
   assert_failsafe_request "a base fingerprint helper without EXCLUDE_RE" "$dir" "$rc" "cannot read the generated-file exclusion"
@@ -825,6 +859,53 @@ test_derive_failsafe() {
   dir=$(derive_case fence-label-added)
   rc=$(CODEX_TEST_FENCE_MODE=label-added run_case "$dir" false)
   assert_derived_request "a needs-external-review label added during the derivation" "$dir" "$rc" "added during the derivation"
+}
+
+# Threshold parity with the labeler (Codex P1 on #2258). The labeler and the
+# merge clearance gate read `grep -E '^external_review_threshold:' | awk
+# '{print $2}'` and fall back to 300 unless the token is all digits. For each
+# spelling, run that same reader: a digit token must be used as written (a
+# 299-line PR is under 300 and 0300, over 50); any other token must be
+# unreadable here and request, never a silent 300.
+# shellcheck disable=SC2015  # `check && check || fail` is the assertion idiom here
+test_derive_threshold_parity() {
+  local spelling token dir rc expected before=$FAIL
+  while IFS= read -r spelling; do
+    token=$(printf 'external_review_threshold: %s\n' "$spelling" | grep -E '^external_review_threshold:' | awk '{print $2}')
+    dir=$(derive_case "parity-$(printf '%s' "$spelling" | tr -c 'A-Za-z0-9' '_')" "external_review_threshold: $spelling")
+    rc=$(CODEX_TEST_FILES_JSON='[{"filename":"src/a.ts","additions":200,"deletions":99}]' run_case "$dir" false)
+    if [[ "$token" =~ ^[0-9]+$ ]]; then
+      if [ 299 -ge "$token" ]; then expected=request; else expected=skip; fi
+      if [ "$expected" = skip ]; then
+        [ "$rc" = "5" ] && ! grep -q 'cannot derive the Phase 4 gate' "$dir/err.log" \
+          || fail "parity '$spelling': the labeler reads $token, so a 299-line PR must skip (rc=$rc); stderr=$(cat "$dir/err.log")"
+      else
+        [ "$rc" = "4" ] && grep -q "299 lines changed >= external_review_threshold $token" "$dir/err.log" \
+          || fail "parity '$spelling': the labeler reads $token, so a 299-line PR must be gated by size (rc=$rc); stderr=$(cat "$dir/err.log")"
+      fi
+    else
+      [ "$rc" = "4" ] && grep -q 'is not a plain digit scalar' "$dir/err.log" \
+        || fail "parity '$spelling': the labeler rejects token '$token' (falls back to 300), so it must be unreadable and request (rc=$rc); stderr=$(cat "$dir/err.log")"
+    fi
+  done <<'SPELLINGS'
+300
+300 # tuned for this repo
+0300
+50
+300_000
+"300"
+3e2
++300
+0x12C
+SPELLINGS
+  # A key the parser sees but the labeler's line reader does not: a flow-style
+  # policy. The labeler falls back to 300; the parser reads 50.
+  dir=$(derive_case parity-flow)
+  printf '%s\n' '{author_identity: nathanjohnpayne, external_review_threshold: 50, codex: {bot_login: "chatgpt-codex-connector[bot]", max_review_rounds: 10}}' >"$dir/state/base-review-policy.yml"
+  rc=$(run_case "$dir" false)
+  [ "$rc" = "4" ] && grep -q 'cannot be read the way the labeler reads it' "$dir/err.log" \
+    || fail "parity flow-style: a parser-only threshold must be unreadable and request (rc=$rc); stderr=$(cat "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "#2257 derive: the threshold is read exactly as the labeler reads it; spellings it rejects, and a parser-only key, request"
 }
 
 # The threshold and paths come from the GOVERNING base policy, not the
@@ -944,6 +1025,7 @@ test_malformed_head_age_fails_only_the_write_path
 test_derive_signals
 test_derive_failsafe
 test_derive_reads_governing_policy
+test_derive_threshold_parity
 test_derive_not_run_when_decided
 test_timeout_head_drift_fails_closed_without_marker
 test_new_trigger_replaces_superseded_timeout_marker

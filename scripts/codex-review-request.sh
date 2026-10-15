@@ -790,7 +790,12 @@ esac
 #   paths      a changed file, or a rename's source, matches
 #              external_review_paths through scripts/workflow/
 #              match_protected_paths.sh, the matcher the labeler and the merge
-#              clearance gate use.
+#              clearance gate use, loaded from the PR's base sha.
+#
+# Nothing the classification depends on is read from this checkout, which may
+# be another repository or the candidate's own edit: the policy, the
+# exclusion constant and the matcher all come from the base revision. These
+# helpers therefore have no requires: edge in .mergepath-sync.yml.
 #
 # FAIL-SAFE (owner rule): any input that cannot be read counts as gated, and
 # the PR is requested with a WARN naming the cause. That includes the PR
@@ -814,7 +819,8 @@ phase_4a_gate_derived() {  # <reason>
 }
 derive_phase_4a_gate() {
   local pr_json has_label changed_files files_json files_tmp files_count head_sha base_ref base_sha default_branch
-  local yq_bin=${MERGEPATH_YQ_BIN:-yq} base_cfg dup_threshold dup_paths fp_json
+  local yq_bin=${MERGEPATH_YQ_BIN:-yq} base_cfg dup_threshold dup_paths fp_json default_json default_sha
+  local raw_threshold raw_lines matcher_json live_default
   local policy_json threshold exclude_re lines patterns_json pattern_count pattern matcher changed matched live_json live_fence rc=0
   local -a patterns=()
 
@@ -897,6 +903,18 @@ derive_phase_4a_gate() {
     return 0
   fi
 
+  # Pin the default branch's head before the policy read (Codex P2 on #2258):
+  # when the base predates review-policy.yml the resolver falls back to the
+  # default branch BY NAME, so a commit landing there during the derivation
+  # could swap in a stricter policy with every other fence part unchanged.
+  # The fence below re-reads this sha.
+  default_json=$(gh api "repos/$REPO/branches/$default_branch" 2>/dev/null) || default_json=""
+  default_sha=$(printf '%s' "$default_json" | jq -r '.commit.sha // "" | strings' 2>/dev/null) || default_sha=""
+  if [ -z "$default_sha" ]; then
+    phase_4a_gate_failsafe "could not read the head commit of the default branch $default_branch"
+    return 0
+  fi
+
   # Threshold and protected paths come from the policy that GOVERNS the PR:
   # its base, fetched at the base sha of the snapshot above (Codex P1 on
   # #2258). The script's own checkout may be another repository, or the
@@ -913,6 +931,12 @@ derive_phase_4a_gate() {
   dup_threshold=$("$yq_bin" '[keys[] | select(. == "external_review_threshold")] | length' "$base_cfg" 2>/dev/null) || dup_threshold=""
   dup_paths=$("$yq_bin" '[keys[] | select(. == "external_review_paths")] | length' "$base_cfg" 2>/dev/null) || dup_paths=""
   policy_json=$("$yq_bin" -o=json -I=0 '.' "$base_cfg" 2>/dev/null) || policy_json=""
+  # The threshold is read the way the labeler and the merge clearance gate
+  # read it (Codex P1 on #2258): the raw `external_review_threshold:` line's
+  # single token. A structured parse accepts spellings those readers reject
+  # (`300_000`, an octal-looking `0o400`), and they then fall back to 300, so
+  # the two would classify the same PR differently.
+  raw_threshold=$(grep -E '^external_review_threshold:' "$base_cfg" 2>/dev/null) || raw_threshold=""
   [ "$base_cfg" = "$CONFIG" ] || rm -f "$base_cfg" 2>/dev/null || true
   if ! [[ "$dup_threshold" =~ ^[01]$ ]] || ! [[ "$dup_paths" =~ ^[01]$ ]]; then
     phase_4a_gate_failsafe "the governing policy at $base_ref@$base_sha repeats external_review_threshold or external_review_paths (or the keys cannot be counted)"
@@ -922,17 +946,23 @@ derive_phase_4a_gate() {
     phase_4a_gate_failsafe "the governing policy at $base_ref@$base_sha does not parse as a mapping"
     return 0
   fi
-  # Absent means the documented default 300; present must be a non-negative
-  # integer (a quoted "300" is a string, not a number).
-  threshold=$(printf '%s' "$policy_json" | jq -r '
-    if has("external_review_threshold") | not then 300
-    elif (.external_review_threshold | type) == "number"
-         and .external_review_threshold >= 0
-         and (.external_review_threshold | floor) == .external_review_threshold
-    then .external_review_threshold
-    else "invalid" end' 2>/dev/null) || threshold=""
-  if ! [[ "$threshold" =~ ^[0-9]+$ ]]; then
-    phase_4a_gate_failsafe "external_review_threshold in the governing policy is not a non-negative integer"
+  # Absent (no key and no line) is the documented default 300, which is also
+  # what the labeler uses. A present key must be one top-level line whose
+  # token is plain digits, the only spelling the labeler accepts as written;
+  # anything it would replace with 300 instead is unreadable here, and a key
+  # the parser sees but the line reader does not (flow style) is too.
+  raw_lines=0
+  [ -z "$raw_threshold" ] || raw_lines=$(printf '%s\n' "$raw_threshold" | wc -l | tr -d ' ')
+  if [ "$dup_threshold" = 0 ] && [ "$raw_lines" = 0 ]; then
+    threshold=300
+  elif [ "$dup_threshold" = 1 ] && [ "$raw_lines" = 1 ]; then
+    threshold=$(printf '%s\n' "$raw_threshold" | awk '{print $2}')
+    if ! [[ "$threshold" =~ ^[0-9]+$ ]]; then
+      phase_4a_gate_failsafe "external_review_threshold in the governing policy is not a plain digit scalar ('$threshold'); the labeler would not read it as written"
+      return 0
+    fi
+  else
+    phase_4a_gate_failsafe "external_review_threshold in the governing policy cannot be read the way the labeler reads it (parser keys $dup_threshold, top-level lines $raw_lines)"
     return 0
   fi
   # The generated-file exclusion is read from the fingerprint helper AT THE
@@ -971,9 +1001,19 @@ derive_phase_4a_gate() {
     return 0
   fi
   if [ "$pattern_count" -gt 0 ]; then
-    matcher="$__CODEX_REQUEST_DIR/workflow/match_protected_paths.sh"
-    if [ ! -f "$matcher" ]; then
-      phase_4a_gate_failsafe "the protected-path matcher is missing ($matcher)"
+    # The matcher is loaded from the base too (Codex P1 on #2258): the
+    # labeler runs the base revision's helper tree, and a checkout copy,
+    # from another repository or edited by the candidate, could match less.
+    matcher=$(mktemp "${TMPDIR:-/tmp}/codex-request-matcher.XXXXXX" 2>/dev/null) || matcher=""
+    if [ -z "$matcher" ]; then
+      phase_4a_gate_failsafe "could not allocate a scratch file for the protected-path matcher"
+      return 0
+    fi
+    matcher_json=$(gh api "repos/$REPO/contents/scripts/workflow/match_protected_paths.sh?ref=$base_sha" 2>/dev/null) || matcher_json=""
+    if ! printf '%s' "$matcher_json" | jq -r '.content | gsub("\n"; "") | @base64d' >"$matcher" 2>/dev/null \
+       || [ ! -s "$matcher" ]; then
+      rm -f "$matcher"
+      phase_4a_gate_failsafe "cannot read the protected-path matcher scripts/workflow/match_protected_paths.sh at $base_sha"
       return 0
     fi
     while IFS= read -r pattern; do
@@ -983,6 +1023,7 @@ derive_phase_4a_gate() {
     # protected path must still match.
     changed=$(printf '%s' "$files_json" | jq -r '.[] | (.filename, (.previous_filename // empty))')
     matched=$(printf '%s\n' "$changed" | bash "$matcher" "${patterns[@]}") || rc=$?
+    rm -f "$matcher"
     if [ "$rc" -ne 0 ]; then
       phase_4a_gate_failsafe "the protected-path matcher failed (rc=$rc)"
       return 0
@@ -995,8 +1036,8 @@ derive_phase_4a_gate() {
 
   # Snapshot fence (Codex P1 x2 on #2258): every read above describes one
   # snapshot of the PR: its head, its base (whose policy was read), the
-  # repository default branch the resolver fell back through, and its label
-  # state. A push, a base move to a stricter policy, or a
+  # repository default branch the resolver can fall back through and that
+  # branch's head commit, and its label state. A push, a base move to a stricter policy, or a
   # needs-external-review label landing during the reads would leave this
   # skip describing a PR that no longer exists, and the skip path never
   # reaches the moving-head guard. Re-read the PR immediately before
@@ -1020,6 +1061,11 @@ derive_phase_4a_gate() {
   fi
   if [ "$live_fence" != "$head_sha $base_ref $base_sha $default_branch false" ]; then
     phase_4a_gate_failsafe "the PR moved during the derivation (head/base/default/label was '$head_sha $base_ref $base_sha $default_branch false', now '$live_fence')"
+    return 0
+  fi
+  live_default=$(gh api "repos/$REPO/branches/$default_branch" 2>/dev/null | jq -r '.commit.sha // "" | strings' 2>/dev/null) || live_default=""
+  if [ "$live_default" != "$default_sha" ]; then
+    phase_4a_gate_failsafe "the default branch $default_branch moved during the derivation (was ${default_sha}, now ${live_default:-unreadable}); its policy may be the fallback that governs this PR"
     return 0
   fi
 
