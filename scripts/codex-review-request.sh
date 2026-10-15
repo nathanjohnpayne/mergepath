@@ -352,11 +352,13 @@ __CRR_ORIGINAL_ARGS=("$@")
 # #2166: --allow-moving-head downgrades the moving-head refusal (exit 8) to a
 # warning. See refuse_moving_head_unless_allowed below.
 TRIGGER_ONLY=false
+AUTHORIZE_TRIGGER_WRITE=false
 ALLOW_MOVING_HEAD=false
 __POSITIONAL=()
 for __arg in "$@"; do
   case "$__arg" in
     --trigger-only) TRIGGER_ONLY=true ;;
+    --authorize-trigger-write) AUTHORIZE_TRIGGER_WRITE=true; TRIGGER_ONLY=true ;;
     --allow-moving-head) ALLOW_MOVING_HEAD=true ;;
     *) __POSITIONAL+=("$__arg") ;;
   esac
@@ -2421,6 +2423,21 @@ post_codex_trigger() {
   # round may hide undispositioned feedback (#1000).
   run_feedback_accounting_gate
 
+  # #2158: wrappers independently re-check the same canonical authorization
+  # at the write boundary. This mode never posts, even when a context marker
+  # was supplied by a caller other than this script.
+  if [ "$AUTHORIZE_TRIGGER_WRITE" = true ]; then
+    local expected="${MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD:-}" live
+    [[ "$expected" =~ ^[0-9a-f]{40}$ && "$expected" = "$HEAD_SHA" ]] \
+      || die 3 "canonical trigger authorization has a missing or stale expected head"
+    live=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha) \
+      || die 3 "cannot fence the authorized trigger head"
+    [ "$live" = "$expected" ] || die 3 "trigger head moved during authorization"
+    jq -n --arg repo "$REPO" --argjson pr "$PR_NUMBER" --arg head "$HEAD_SHA" --arg author "$AUTHOR_IDENTITY" \
+      '{authorized:true,repo:$repo,pr_number:$pr,head_sha:$head,author_identity:$author}'
+    exit 0
+  fi
+
   # The Codex GitHub App ONLY monitors '@codex review' comments authored
   # by the repo's AUTHOR/human identity (nathanjohnpayne). A trigger
   # posted by a reviewer/bot identity (nathanpayne-claude/-codex/-cursor)
@@ -2432,7 +2449,8 @@ post_codex_trigger() {
   # guard, which fail-closed on the WRONG identity for this particular
   # write.
   log "posting '@codex review' trigger comment (as author identity $AUTHOR_IDENTITY; request attempts $request_count/$max_review_rounds)"
-  post_author_pr_comment "@codex review" "'@codex review' trigger comment" inline
+  MERGEPATH_CODEX_TRIGGER_WRITE=1 MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$HEAD_SHA" \
+    post_author_pr_comment "@codex review" "'@codex review' trigger comment" inline
   POST_OUTPUT="$AUTHOR_COMMENT_OUTPUT"
   TRIGGER_POSTED=true
 
@@ -2853,6 +2871,11 @@ RESUMED_TRIGGER=false
 RESUMED_EVER=false
 [ "${MERGEPATH_CODEX_RESUME_EXPIRED:-}" != 1 ] || RESUMED_EVER=true
 RESUMED_TRIGGER_ID=""
+
+if [ "$AUTHORIZE_TRIGGER_WRITE" = true ]; then
+  post_codex_trigger
+  die 3 "trigger authorization returned without an authorization record"
+fi
 
 if has_cleared_signal "$INITIAL_SCAN"; then
   log "Codex has already cleared on HEAD (no-blocking-tier review or affirmative verdict comment) — skipping trigger comment"

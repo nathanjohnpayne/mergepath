@@ -348,10 +348,10 @@ fi
 
 new_case
 set +e
-MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr comment 5 --repo=o/r --body '@codex review' >/dev/null 2>&1; rc=$?
+MERGEPATH_GH_TRANSPORT=rest as_author -- gh pr comment 5 --repo=o/r --body 'review status' >/dev/null 2>&1; rc=$?
 set -e
-if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/issues/5/comments\t--input\t'"$(printf '%s' '{"body":"@codex review"}')" && log_token_clean ghp_author-token; then
-  pass "forced REST locally: the author's Codex trigger comment posts with --repo=OWNER/REPO attached"
+if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/issues/5/comments\t--input\t'"$(printf '%s' '{"body":"review status"}')" && log_token_clean ghp_author-token; then
+  pass "forced REST locally: the author's status comment posts with --repo=OWNER/REPO attached"
 else
   fail "forced REST author comment: rc=$rc"; cat "$LOGF" >&2
 fi
@@ -376,7 +376,7 @@ refused_rest() { # <label> <wrapper fn> <args...>; expects rc 1, the form in the
   set +e
   err="$(MERGEPATH_GH_TRANSPORT=rest "$fn" -- "$@" 2>&1 >/dev/null)"; rc=$?
   set -e
-  if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -q 'the REST transport accepts exactly' && log_lacks $'--method\tPOST' && log_lacks $'--method\tPATCH' && log_lacks $'--method\tDELETE'; then
+  if [ "$rc" -eq 1 ] && printf '%s' "$err" | grep -qE 'the REST transport accepts exactly|comment-trigger-guard:' && log_lacks $'--method\tPOST' && log_lacks $'--method\tPATCH' && log_lacks $'--method\tDELETE'; then
     pass "refused before any write: $label"
   else
     fail "$label: rc=$rc err=$err"; cat "$LOGF" >&2
@@ -1114,7 +1114,7 @@ done
 new_case
 : >"$HOST_LOG"
 set +e
-(unset GH_HOST; MERGEPATH_GH_TRANSPORT=gh STUB_HOST_LOG="$HOST_LOG" as_author -- gh pr comment 5 --repo o/r --body '@codex review' >/dev/null 2>&1); rc=$?
+(unset GH_HOST; MERGEPATH_GH_TRANSPORT=gh STUB_HOST_LOG="$HOST_LOG" as_author -- gh pr comment 5 --repo o/r --body 'review status' >/dev/null 2>&1); rc=$?
 set -e
 if [ "$rc" -eq 0 ] && grep -q $'^github.com\tpr comment 5' "$HOST_LOG"; then
   pass "gh transport, author wrapper: the wrapped write runs with GH_HOST=github.com"
@@ -1570,7 +1570,7 @@ new_case
 MARKER="$WORKDIR/marker"
 rm -f "$MARKER"
 set +e
-MERGEPATH_GH_TRANSPORT=rest GH_AS_AUTHOR_TRACE_MARKER="$MARKER" as_author -- gh pr comment 5 --repo o/r --body '@codex review' >/dev/null 2>&1; rc=$?
+MERGEPATH_GH_TRANSPORT=rest GH_AS_AUTHOR_TRACE_MARKER="$MARKER" as_author -- gh pr comment 5 --repo o/r --body 'review status' >/dev/null 2>&1; rc=$?
 set -e
 if [ "$rc" -eq 0 ] && [ -e "$MARKER" ] && log_lacks 'GH_AS_AUTHOR_TRACE_MARKER'; then
   pass "trace marker: created before the REST write"
@@ -1595,6 +1595,30 @@ if [ "$rc" -eq 70 ] && log_lacks 'POST'; then
 else
   fail "trace marker unwritable: rc=$rc"; cat "$LOGF" >&2
 fi
+
+# #2158: both transports refuse accidental provider commands before a write.
+TRIGGER_BODY="$WORKDIR/accidental-command.md"
+printf '%s\n' 'Do not quote `@CoDeX review` in a status comment.' > "$TRIGGER_BODY"
+for transport in gh rest; do
+  for role in author reviewer; do
+    new_case
+    rc=0
+    MERGEPATH_GH_TRANSPORT="$transport" "as_$role" -- gh pr comment 5 --repo o/r --body-file "$TRIGGER_BODY" > /dev/null 2>"$WORKDIR/err" || rc=$?
+    if [ "$rc" -ne 0 ] && grep -q 'Reword the comment' "$WORKDIR/err" && log_lacks 'POST' && log_lacks $'pr\tcomment'; then
+      pass "$transport $role: accidental trigger body file refused before writing"
+    else
+      fail "$transport $role trigger guard: rc=$rc"; cat "$LOGF" >&2
+    fi
+  done
+  new_case
+  rc=0
+  MERGEPATH_GH_TRANSPORT="$transport" as_author -- gh pr comment 5 --repo o/r --body '@codex review' > /dev/null 2>"$WORKDIR/err" || rc=$?
+  if [ "$rc" -ne 0 ] && grep -q 'canonical\|reserved review command' "$WORKDIR/err" && log_lacks 'POST' && log_lacks $'pr\tcomment'; then
+    pass "$transport: genuine command without canonical authorization is refused"
+  else
+    fail "$transport unauthorized command: rc=$rc"; cat "$LOGF" >&2
+  fi
+done
 
 # ---------------------------------------------------------------------------
 # the brokered placeholder is still refused before the transport is chosen

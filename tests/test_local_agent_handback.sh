@@ -30,9 +30,11 @@ pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
 FIX="$WORKDIR/repo"
-mkdir -p "$FIX/scripts/lib" "$FIX/.github"
+mkdir -p "$FIX/scripts/lib" "$FIX/scripts/workflow" "$FIX/.github"
 cp "$ROOT/scripts/post-local-agent-handback.sh" "$ROOT/scripts/gh-as-reviewer.sh" "$ROOT/scripts/identity-check.sh" "$FIX/scripts/"
 cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$ROOT/scripts/lib/credential-class.sh" "$ROOT/scripts/lib/gh-rest-transport.sh" "$FIX/scripts/lib/"
+cp "$ROOT/scripts/lib/gh-comment-trigger-guard.sh" "$FIX/scripts/lib/"
+cp "$ROOT/scripts/workflow/gh-comment-trigger-guard.py" "$FIX/scripts/workflow/"
 cat >"$FIX/scripts/agent-capability-probe.sh" <<'P'
 #!/usr/bin/env bash
 printf 'export MERGEPATH_AGENT_TIER=%s\nexport MERGEPATH_AGENT_SURFACE_MEASURED=%s\n' "${STUB_TIER:-author-writes,reviewer-writes}" "${STUB_SURFACE:-claude-cloud}"
@@ -340,8 +342,8 @@ fi
 DFIX="$WORKDIR/dispatch"
 mkdir -p "$DFIX/scripts/lib" "$DFIX/scripts/workflow" "$DFIX/bin"
 cp "$ROOT/scripts/dispatch-thread-resolution-lane.sh" "$ROOT/scripts/gh-as-author.sh" "$ROOT/scripts/identity-check.sh" "$DFIX/scripts/"
-cp "$ROOT/scripts/workflow/owner-admin-override.py" "$DFIX/scripts/workflow/"
-for f in gh-token-resolver.sh credential-class.sh gh-command-classifier.sh gh-rest-transport.sh pr-body-contract.sh pr-body-contract.mjs reviewers-helpers.sh feedback-policy-helpers.sh; do
+cp "$ROOT/scripts/workflow/owner-admin-override.py" "$ROOT/scripts/workflow/gh-comment-trigger-guard.py" "$DFIX/scripts/workflow/"
+for f in gh-comment-trigger-guard.sh gh-token-resolver.sh credential-class.sh gh-command-classifier.sh gh-rest-transport.sh pr-body-contract.sh pr-body-contract.mjs reviewers-helpers.sh feedback-policy-helpers.sh; do
   [ -f "$ROOT/scripts/lib/$f" ] && cp "$ROOT/scripts/lib/$f" "$DFIX/scripts/lib/"
 done
 cat >"$DFIX/bin/gh" <<'G'

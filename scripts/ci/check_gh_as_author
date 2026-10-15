@@ -49,6 +49,10 @@ if ! python3 "$REPO_ROOT/tests/test_owner_admin_override.py"; then
   echo "check_gh_as_author: FAIL (owner admin override)" >&2
   FAILED=1
 fi
+if ! python3 "$REPO_ROOT/tests/test_gh_comment_trigger_guard.py"; then
+  echo "check_gh_as_author: FAIL (comment trigger guard)" >&2
+  FAILED=1
+fi
 for rel in "${TESTS[@]}"; do
   full="$REPO_ROOT/$rel"
   if [ ! -f "$full" ]; then

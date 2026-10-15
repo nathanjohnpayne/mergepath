@@ -1588,6 +1588,38 @@ test_guard_runs_after_the_cap_branch() {
   [ "$FAIL" -ne "$before" ] || pass "MH15: a spent request cap on a young head exits 7 (cap_exhausted), not 8"
 }
 
+
+# #2158: fresh write-boundary authorization shares the production budgets,
+# performs no POST, and cannot authorize a different expected head.
+test_write_boundary_authorization() {
+  local scenario dir rc expected before=$FAIL
+  for scenario in fresh cap_at_limit stale_head; do
+    dir=$(make_case "authorize-$scenario")
+    expected=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    [ "$scenario" != stale_head ] || expected=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    rc=0
+    (
+      cd "$dir"
+      PATH="$dir/bin:$PATH" GH_TOKEN=test-token CODEX_TEST_STATE_DIR="$dir/state" \
+        CODEX_TEST_SCENARIO="$scenario" CODEX_TEST_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+        MERGEPATH_PHASE_4A_GATED=true MERGEPATH_CODEX_TRIGGER_EXPECTED_HEAD="$expected" \
+        ./scripts/codex-review-request.sh --authorize-trigger-write --allow-moving-head 999 owner/repo \
+        >"$dir/out.json" 2>"$dir/err.log"
+    ) || rc=$?
+    case "$scenario" in
+      fresh)
+        [ "$rc" = 0 ] && jq -e '.authorized == true and .head_sha == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" and .author_identity == "nathanjohnpayne"' "$dir/out.json" >/dev/null \
+          || fail "authorization: fresh governing budget should authorize (rc=$rc; $(cat "$dir/err.log"))" ;;
+      cap_at_limit) [ "$rc" = 7 ] || fail "authorization: spent request ceiling must refuse (rc=$rc)" ;;
+      stale_head) [ "$rc" = 3 ] || fail "authorization: stale expected head must refuse (rc=$rc)" ;;
+    esac
+    [ "$(trig_count "$dir")" = 0 ] || fail "authorization must never post ($scenario)"
+  done
+  [ "$FAIL" -ne "$before" ] || pass "write-boundary authorization enforces budget and head without a POST"
+}
+
+test_write_boundary_authorization
+
 test_fresh_posts_once_no_poll
 test_dup_author_skips
 test_uppercase_author_command_skips

@@ -999,6 +999,7 @@ paths:
     # `--body-file` path with no Authoring-Agent or Self-Review check at all.
     # Declaring the contract libs here keeps the two halves inseparable.
     requires:
+      - "scripts/lib/gh-comment-trigger-guard.sh"
       - "scripts/workflow/owner-admin-override.py"
       - "scripts/workflow/merge-writer.py"
       - "scripts/lib/feedback-policy-helpers.sh"  # owner preflight parses the immutable base policy
@@ -1026,6 +1027,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/gh-comment-trigger-guard.sh"
       - "scripts/lib/gh-token-resolver.sh"
       - "scripts/lib/gh-rest-transport.sh"  # sourced; the REST transport and readback on a cloud surface (#1057 A)
       - "scripts/workflow/owner-admin-override.py"  # the REST transport classifies merge spellings with it (#1057 A)
@@ -1054,6 +1056,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/workflow/gh-comment-trigger-guard.py"
       - "scripts/lib/gh-command-classifier.sh"  # shared guard/wrapper prefix vocabulary
       - "scripts/lib/graphql-ceiling.sh"    # recognizes the cloud proxy's GraphQL refusal; the self-approve read falls back to REST (#1057 A)
       - "scripts/lib/pr-body-contract.sh"   # sourced directly; missing = guard aborts
@@ -1073,6 +1076,24 @@ paths:
   - path: scripts/lib/pr-body-contract.mjs
     type: canonical
     consumers: all
+  # The wrapper runtime snapshots comment payloads and independently checks
+  # canonical request authority; hook inspection uses the same parser (#2158).
+  - path: scripts/lib/gh-comment-trigger-guard.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/gh-comment-trigger-guard.py"
+      - "scripts/codex-review-request.sh"
+  - path: scripts/workflow/gh-comment-trigger-guard.py
+    type: canonical
+    consumers: all
+  - path: tests/test_gh_comment_trigger_guard.py
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/gh-comment-trigger-guard.sh"
+      - "scripts/gh-as-author.sh"
+      - "scripts/gh-as-reviewer.sh"
   - path: scripts/lib/gh-command-classifier.sh
     type: canonical
     consumers: all
@@ -2173,6 +2194,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/gh-comment-trigger-guard.sh" # author-wrapper comment payload guard (#2158)
       - "scripts/workflow/merge-writer.py"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/workflow/owner-admin-override.py"
@@ -2201,6 +2223,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/gh-comment-trigger-guard.sh" # author-wrapper comment payload guard (#2158)
       - "scripts/workflow/merge-writer.py"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/workflow/owner-admin-override.py"
@@ -2223,6 +2246,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/gh-comment-trigger-guard.sh" # author-wrapper comment payload guard (#2158)
       - "scripts/workflow/merge-writer.py"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/workflow/owner-admin-override.py"
@@ -2499,6 +2523,8 @@ paths:
     # wave (check_gh_as_author missing its tests on every consumer).
     requires:
       - "tests/test_required_check_generations.py"
+      - "scripts/lib/gh-comment-trigger-guard.sh" # author-wrapper comment payload guard (#2158)
+      - "tests/test_gh_comment_trigger_guard.py"
       - "tests/test_feedback_archive_identities.sh"   # #1437, offline enrollment and producer/relay cases
       - "scripts/lib/feedback-archive-identities.sh"   # #1437, direct CI-kit runtime closure
       - "scripts/workflow/merge-writer.py"
@@ -2667,6 +2693,7 @@ paths:
     # helpers (parse_manifest_paths.sh, match_protected_paths.sh) are
     # already inside this kit; the two scripts/lib/ deps are declared here.
     requires:
+      - "scripts/lib/gh-comment-trigger-guard.sh" # author-wrapper comment payload guard (#2158)
       - "scripts/workflow/merge-writer.py"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/workflow/owner-admin-override.py"
