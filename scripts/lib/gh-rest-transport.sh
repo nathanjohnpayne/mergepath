@@ -155,10 +155,22 @@ gh_transport_select() {
 
 # --- caller-supplied credential re-routing (#1542) ----------------------------
 
-# gh_payload_is_hosted_repo <value>: 0 iff <value> is HOST/OWNER/REPO with a
-# dotted host (github.com, *.ghe.com, github.localhost and the like).
+# gh_payload_is_hosted_repo <value>: 0 iff <value> is the HOST/OWNER/REPO form
+# gh reads as a repository on HOST: exactly three non-empty segments, whose
+# host contains a dot once any userinfo and port are removed. gh strips the
+# port before it picks a credential, and userinfo before the host reaches the
+# request, so github.localhost:443/o/r and x@tenant.ghe.com/o/r target those
+# hosts with GH_TOKEN (Phase 4b on #2178). Every host gh sends GH_TOKEN to
+# (github.com, *.ghe.com, github.localhost) has a dot; a dotless host gets the
+# Enterprise sentinel. A host with whitespace makes no request, but OWNER and
+# REPO may hold any character but '/', since the request still goes to the
+# host.
 gh_payload_is_hosted_repo() {
-  [[ "$1" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+/[^/[:space:]]+/[^/[:space:]]+$ ]]
+  local host
+  [[ "$1" =~ ^([^/[:space:]]+)/[^/]+/[^/]+$ ]] || return 1
+  host="${BASH_REMATCH[1]##*@}"
+  host="${host%%:*}"
+  [[ "$host" =~ [A-Za-z0-9-]\.[A-Za-z0-9-] ]]
 }
 
 # gh_payload_is_canonical_repo <value>: 0 iff <value> is a plain OWNER/REPO.
@@ -215,6 +227,32 @@ gh_payload_refuse_credential_overrides() {
   shift
   case "${1:-}" in gh|*/gh) ;; *) return 0 ;; esac
   shift
+  # The command must be one of gh's own command groups. An alias or an
+  # extension runs under the verified token and expands where the checks
+  # below cannot see it (a shell alias or an extension binary receives the
+  # token itself); neither can shadow a built-in name, so an allowlist of
+  # built-in groups closes both. gh also takes the repository flag before
+  # the group (gh -R O/R pr merge N), and both alias expansion and extension
+  # dispatch read only the first argument, so a leading --repo or -R and its
+  # value are skipped; the value is checked below like any other. Any other
+  # leading option is refused, since gh may take the argument after it as
+  # its value and the one after that as the command.
+  local -a cmd_args=("$@")
+  local k=0
+  while [ "$k" -lt "${#cmd_args[@]}" ]; do
+    case "${cmd_args[$k]}" in
+      --repo|-R) k=$((k + 2)) ;;
+      --repo=*|-R?*) k=$((k + 1)) ;;
+      *) break ;;
+    esac
+  done
+  case "${cmd_args[$k]:-}" in
+    api|cache|gist|issue|label|org|pr|project|release|repo|ruleset|run|search|secret|status|variable|workflow) ;;
+    *)
+      echo "$label: refusing 'gh ${cmd_args[$k]:-}': the wrappers run only gh's own command groups (api, issue, pr, repo, run, secret, variable, workflow and the like), optionally after --repo/-R. An alias, an extension or a command behind another leading option would run under the verified token where these checks cannot see it (#1542)." >&2
+      return 1
+      ;;
+  esac
   if [ -n "${GH_REPO:-}" ] && ! gh_payload_is_canonical_repo "$GH_REPO"; then
     echo "$label: refusing an inherited GH_REPO ('$GH_REPO') that is not a plain OWNER/REPO: gh could take a host from it and send the verified token there; unset it and pass --repo OWNER/REPO (#1542)." >&2
     return 1
@@ -681,6 +719,10 @@ gh_rest_check_edit_events() { # <events>
 
 gh_rest_check_close_events() { # <events>
   gh_rest_attribute "$1" closed 'true' "" "closing PR #$number"
+}
+
+gh_rest_check_branch_delete_events() { # <events>
+  gh_rest_attribute "$1" head_ref_deleted 'true' "" "deleting branch $head_ref"
 }
 
 # gh_rest_partial_failure <repo> <N> <events before, or ""> <url> <checker>
@@ -1389,7 +1431,18 @@ gh_rest_pr_close() {
     # GitHub repository names are case-insensitive.
     if [ -n "$head_ref" ] && [ "$(printf '%s' "$head_repo" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]')" ]; then
       if gh_rest_api DELETE "repos/$repo/git/refs/heads/$(gh_rest_uri "$head_ref")" >/dev/null; then
-        gh_rest_err "deleted branch $head_ref on $repo (a ref delete has no byline; not attributed)."
+        # The delete is attributed from the head_ref_deleted event it records
+        # on the pull request, against the pre-close read (Phase 4b on #2178).
+        rc=0
+        gh_rest_readback "$repo" "$number" "$before" gh_rest_check_branch_delete_events || rc=$?
+        if [ "$rc" -eq 3 ]; then
+          gh_rest_err "ERROR branch $head_ref was deleted but the events of PR #$number could not be read back, so the delete is unattributed."
+        fi
+        if [ "$rc" -ne 0 ]; then
+          gh_rest_recovery "the branch delete (restore branch $head_ref)" "$url"
+          return 5
+        fi
+        gh_rest_err "verified delete of branch $head_ref on $repo by $GH_REST_EXPECTED"
       else
         gh_rest_err "PR #$number is closed, but branch $head_ref could not be deleted."
         return 1

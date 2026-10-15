@@ -223,6 +223,12 @@ case "$method $endpoint" in
     echo '{}' ;;
   "DELETE repos/$REPO/git/refs/heads/"*)
     [ -z "${STUB_DELETE_REF_FAIL:-}" ] || { echo "gh: Unprocessable (HTTP 422)" >&2; exit 1; }
+    # GitHub records head_ref_deleted on the pull request; STUB_REF_EVENT_ACTOR
+    # attributes it to another login, STUB_NO_REF_EVENT records none.
+    if [ -z "${STUB_NO_REF_EVENT:-}" ]; then
+      actor="${STUB_REF_EVENT_ACTOR:-$actor}"
+      add_event head_ref_deleted '{}'
+    fi
     exit 0 ;;
   *)
     echo "stub gh: unhandled $method $endpoint" >&2
@@ -868,12 +874,33 @@ if [ "$rc" -eq 0 ] && [ -z "$out" ] \
    && log_has $'PATCH\trepos/o/r/pulls/42\t--input\t'"$(printf '%s' '{"state":"closed"}')" \
    && log_has $'DELETE\trepos/o/r/git/refs/heads/feature' \
    && grep -q 'verified close of PR #42 by nathanjohnpayne' "$WORKDIR/err" \
-   && grep -q 'deleted branch feature on o/r (a ref delete has no byline; not attributed)' "$WORKDIR/err"; then
-  pass "pr close: comment, PATCH closed attributed through the closed event, head ref deleted and reported as unattributed"
+   && grep -q 'verified delete of branch feature on o/r by nathanjohnpayne' "$WORKDIR/err"; then
+  pass "pr close: comment, PATCH closed attributed through the closed event, head ref delete attributed through head_ref_deleted"
 else
   fail "pr close: rc=$rc out=$out"; cat "$LOGF" "$WORKDIR/err" >&2
 fi
 
+# The head-ref delete is attributed from its head_ref_deleted event: one by
+# another login, or none at all, is unattributed (5) with the recovery text
+# (Phase 4b on #2178).
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_REF_EVENT_ACTOR='claude[bot]' as_author -- gh pr close 42 --repo o/r --delete-branch 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'verified close of PR #42' && printf '%s' "$err" | grep -q 'restore branch feature' && ! printf '%s' "$err" | grep -q 'verified delete of branch'; then
+  pass "pr close --delete-branch: a head_ref_deleted event by another login exits 5"
+else
+  fail "pr close foreign ref delete: rc=$rc err=$err"; cat "$LOGF" >&2
+fi
+new_case
+set +e
+err="$(MERGEPATH_GH_TRANSPORT=rest STUB_NO_REF_EVENT=1 MERGEPATH_GH_READBACK_ATTEMPTS=2 as_author -- gh pr close 42 --repo o/r --delete-branch 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" -eq 5 ] && printf '%s' "$err" | grep -q 'head_ref_deleted' && printf '%s' "$err" | grep -q 'restore branch feature'; then
+  pass "pr close --delete-branch: no head_ref_deleted event leaves the delete unattributed (5)"
+else
+  fail "pr close missing ref event: rc=$rc err=$err"; cat "$LOGF" >&2
+fi
 new_case
 set +e
 err="$(MERGEPATH_GH_TRANSPORT=rest STUB_EVENTS_FAIL=1 as_author -- gh pr close 42 --repo o/r --comment bye 2>&1 >/dev/null)"; rc=$?
@@ -1366,6 +1393,22 @@ for gr in git@tenant.ghe.com:o/r https://tenant.ghe.com/o/r; do
     fi
   done
 done
+# The positional HOST/OWNER/REPO form with a port or userinfo targets that
+# host too: gh strips both before it picks a credential (Phase 4b on #2178).
+override_refused "a positional HOST:PORT/OWNER/REPO" as_reviewer gh repo view github.localhost:443/o/r --json name
+override_refused "a positional USER@HOST/OWNER/REPO" as_reviewer gh repo view x@tenant.ghe.com/o/r
+override_refused "a positional host-qualified repo whose repo segment holds a space" as_reviewer gh repo view 'tenant.ghe.com/o/r x'
+# Only gh's own command groups run as the first argument: an alias or an
+# extension expands where the checks cannot see it, and a leading option
+# shifts which argument gh takes as the command (Phase 4b on #2178).
+override_refused "an alias or extension name as the command" as_reviewer gh rv
+override_refused "a gh alias management command" as_reviewer gh alias set rv 'repo view github.localhost:443/o/r'
+override_refused "a gh extension command" as_author gh extension exec myext
+override_refused "a leading option before an extension name" as_reviewer gh --x pr myext
+override_refused "an extension name behind a leading --repo" as_reviewer gh --repo o/r myext
+override_refused "a leading -R with a value that is not OWNER/REPO" as_reviewer gh -R git@tenant.ghe.com:o/r pr view 1
+override_refused "gh auth under the verified token" as_reviewer gh auth token
+override_refused "no command at all" as_reviewer gh
 override_refused "short header flag with an equals sign" as_reviewer gh api repos/o/r/issues/1/comments -H='Authorization: Bearer x' -f body=x
 override_refused "header flag clustered after another short flag" as_reviewer gh api repos/o/r/issues/1/comments -iHAuthorization:x -f body=x
 override_refused "Authorization header behind a --preview value" as_reviewer gh api repos/o/r/issues/1/comments --preview --header --header 'Authorization: Bearer x' -f body=x
@@ -1393,6 +1436,19 @@ else
   fail "plain GH_REPO: rc=$rc"; cat "$LOGF" >&2
 fi
 
+# Text with a dotted word before two slashes is not a host-qualified repo
+# when the would-be host holds whitespace, and ./a/b has no host at all.
+for body in 'Update foo.sh: handles a/b/c' ./a/b; do
+  new_case
+  set +e
+  MERGEPATH_GH_TRANSPORT=rest as_reviewer -- gh pr comment 1 --repo o/r --body "$body" >/dev/null 2>&1; rc=$?
+  set -e
+  if [ "$rc" -eq 0 ] && log_has $'POST\trepos/o/r/issues/1/comments'; then
+    pass "a body of '$body' is not read as a host-qualified repository"
+  else
+    fail "body '$body': rc=$rc"; cat "$LOGF" >&2
+  fi
+done
 # A plain OWNER/REPO passes in every repository form.
 for form in --repo=Org-1/repo.name_x -RO/r -R=o/r; do
   new_case
