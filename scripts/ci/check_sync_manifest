@@ -21,8 +21,9 @@
 #      matches an exact manifest entry OR is strictly inside a kit
 #      manifest entry. Closes the propagation closure gap that
 #      surfaced as #264 on the original wave (check_gh_as_author
-#      hard-required tests/test_gh_pr_guard.sh, which was not in
-#      the manifest, so every consumer's lint job failed in pre-flight).
+#      hard-required the gh-pr-guard hook's test suite, which was not
+#      in the manifest, so every consumer's lint job failed in
+#      pre-flight).
 #   8. No per-repo-owned identity doc or hub-only doc is VERBATIM-mirrored
 #      to a consumer (#743, hardened in #745). Paths are normalized first
 #      ("./BRAND.md" ≡ "BRAND.md", "." ≡ repo root) so alternate spellings
