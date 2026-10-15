@@ -1,7 +1,7 @@
 name: Codex Feedback Archive Relay
 
-# Fork- and Dependabot-triggered pull-request workflows receive a read-only
-# GITHUB_TOKEN. The unprivileged Codex P1 Gate run uploads a small, inert JSON
+# All PR-controlled archive events, including same-repository events, use a
+# read-only GITHUB_TOKEN (#1547 adopted existing-relay extraction). The unprivileged Codex P1 Gate run uploads a small, inert JSON
 # handoff under a distinct non-required check name. This default-branch
 # workflow_run consumer receives a write token, validates the handoff without
 # executing artifact content, persists any prior finding version, and only

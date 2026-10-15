@@ -47,6 +47,7 @@ permissions:
 
 jobs:
   rollup:
+    environment: reviewer-maintenance
     name: Classify + post rollup issues
     # Reject manual dispatch from a non-default ref (#550 Codex P1): on
     # workflow_dispatch GitHub runs the workflow DEFINITION from the chosen

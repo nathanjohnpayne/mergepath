@@ -27,7 +27,7 @@ name: Merge Clearance Gate
 # protection never retires an earlier failed job-native run of a required
 # context, so every review event during a long review used to leave a failed
 # run that had to be rerun after the PR cleared. The Checks-API writes are
-# unchanged: phase 2 below, the publisher, the sweep and the dispatch job all
+# trusted: the publisher, the sweep and the dispatch job all
 # still publish failure while clearance is pending. Real blocks, infra exits
 # and unrecognised output still fail the native run.
 #
@@ -118,14 +118,10 @@ on:
   schedule:
     - cron: "*/30 * * * *"
 
-# Least-privilege default for the whole workflow: read-only. `checks: write`
-# is granted, job-scoped, to every job that EVALUATES the gate — the
-# scheduled sweep, the #658 dispatch-recheck job, and since #841 the
-# event-driven job too. The event job used to rely on its native check alone
-# ("produces its check natively and needs no write scope", CodeRabbit ⚠️ on
-# PR #429); that is now false by design. It publishes through the Checks API
-# as well, so that no two producers of this required context can carry
-# different verdicts on one head.
+# Least-privilege default for the whole workflow: read-only. The candidate
+# event job produces only its native check and reads the existing trusted
+# publisher's current-parent hold when pending. Checks-API writes remain in
+# the trusted publisher, scheduled sweep and dispatch recheck jobs.
 #
 # `issues: read` is required (Codex P2 on PR #429): clearance and feedback
 # helpers read issue comments for anchored review verdicts and diagnostic
@@ -171,15 +167,15 @@ jobs:
     # hold was opened after its pass began. Serialization is only safe once
     # the required context has a single producer that is not a cancelable job.
     #
-    # #841: this job now ALSO publishes its verdict as a Checks-API check_run
-    # under the required-check name, so `checks: write` is needed here.
+    # #1547: this PR-controlled job is read-only. Existing publisher
+    # requested/in_progress deliveries open its exact parent-bound hold.
     # Job-level `permissions:` REPLACES the workflow map above wholesale, so
     # every scope this job uses has to be listed, not just the new one.
     permissions:
       contents: read
       pull-requests: read
       issues: read
-      checks: write
+      checks: read
     # Event-driven path (native check on the PR head). The scheduled sweep
     # and the #658 dispatch-recheck job run the same gate via the Checks API;
     # gating this job to the PR/review events avoids paying for an empty
@@ -190,72 +186,6 @@ jobs:
       github.event_name != 'schedule'
       && github.event_name != 'repository_dispatch'
     steps:
-      - name: Open the required check_run (#841 phase 1)
-        id: open
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          # Bind to the PR HEAD. NOT github.sha — on a pull_request event that
-          # is the refs/pull/N/merge commit, which branch protection never
-          # consults. Publishing there would leave the required context ABSENT
-          # on every head: a permanent block, fleet-wide, with no partial
-          # degradation to warn you.
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
-          # Dependabot PRs are SAME-REPO, so IS_FORK is false for them, but
-          # their GITHUB_TOKEN is read-only all the same — this repo documents
-          # that at dependabot-auto-merge.yml:5-6, which is why that workflow
-          # uses pull_request_target. Without this the publish fails every
-          # retry, takes the hard-error branch below, and fails the required
-          # check on every Dependabot PR. Dependabot runs weekly here
-          # (.github/dependabot.yml), so that is not a corner case.
-          PR_ACTOR: ${{ github.event.pull_request.user.login }}
-          # Same name as the sweep/dispatch CHECK_NAME and as
-          # audit-branch-protection.sh's CANONICAL_REQUIRED_CHECKS entry.
-          CHECK_NAME: "Merge clearance gate"
-        run: |
-          set -uo pipefail
-          # Two-phase publish (#841). This in_progress entry immediately
-          # retires whatever the sweep or dispatch last left in the Checks-API
-          # slot, so from here until phase 2 the required context is PENDING
-          # (blocking) rather than a stale verdict. Everything that can go
-          # wrong after this line — checkout, PR resolve, a gate crash, runner
-          # death, a failed phase-2 PATCH, a cancelled run — therefore fails
-          # CLOSED. That is the property #841 lacked: a job-native completion
-          # cannot retire a Checks-API entry, so the event path has to write
-          # the same slot the sweep writes.
-          [ -n "$HEAD_SHA" ] || { echo "::error::No PR head SHA on this event."; exit 1; }
-          id=""
-          for attempt in 1 2 3; do
-            id=$(gh api -X POST "repos/$REPO/check-runs" \
-                   -f name="$CHECK_NAME" \
-                   -f head_sha="$HEAD_SHA" \
-                   -f status="in_progress" \
-                   -f "output[title]=Merge clearance gate (event-driven re-evaluation in progress)" \
-                   -f "output[summary]=Evaluating scripts/merge-clearance-gate.sh on $HEAD_SHA." \
-                   --jq .id 2>/dev/null) && [ -n "$id" ] && break
-            id=""; sleep $((attempt * 5))
-          done
-          if [ -z "$id" ]; then
-            # A restricted GITHUB_TOKEN cannot publish, and that must NOT be
-            # turned into a failed required check. Two contexts have one: fork
-            # PRs, and Dependabot PRs — which are same-repo, so IS_FORK is
-            # false for them. Degrade to the pre-#841 shape in both: this job's
-            # NATIVE check still carries the verdict under the required name on
-            # the PR head, and the scheduled sweep still refreshes the Checks-API
-            # entry. Not fixed, but not regressed either.
-            #
-            # `[ = ]` rather than a case pattern: "dependabot[bot]" in a case
-            # arm is a glob character class and would match "dependabott".
-            if [ "$IS_FORK" = "true" ] || [ "$PR_ACTOR" = "dependabot[bot]" ]; then
-              echo "::warning::Restricted token (fork or Dependabot) — cannot publish the '$CHECK_NAME' check_run. Native check + sweep remain (#841)."
-              exit 0
-            fi
-            echo "::error::Could not open the '$CHECK_NAME' check_run on $HEAD_SHA. Refusing to report a verdict we cannot publish (#841)."
-            exit 1
-          fi
-          echo "id=$id" >> "$GITHUB_OUTPUT"
-
       - name: Checkout repo (default branch — trusted gate scripts)
         # Pin to the default branch, NOT the PR HEAD. This is a REQUIRED
         # status check: if it ran scripts/merge-clearance-gate.sh (and the
@@ -358,71 +288,10 @@ jobs:
           fi
           echo "pending=$pending" >> "$GITHUB_OUTPUT"
 
-      - name: Close the required check_run (#841 phase 2)
-        # !cancelled(), NOT always(): on cancellation we deliberately leave the
-        # run in_progress, i.e. the required context PENDING = merge blocked.
-        if: ${{ !cancelled() && steps.open.outputs.id != '' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-          CHECK_ID: ${{ steps.open.outputs.id }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          RC: ${{ steps.gate.outputs.rc }}
-          VERDICT: ${{ steps.gate.outputs.verdict }}
-        run: |
-          set -uo pipefail
-          # ONE request (gh pr view), not `gh pr list --limit 500` (5+
-          # paginated calls, and a PR past position 500 reads as unknown).
-          current=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
-                      --json headRefOid --jq .headRefOid 2>/dev/null || true)
-          if [ "$current" != "$HEAD_SHA" ]; then
-            # Head moved, or could not be read. Do NOT publish nothing: a
-            # silent skip leaves whatever verdict is standing on $HEAD_SHA, and
-            # a force-push back to $HEAD_SHA would then merge on it. Close the
-            # run we opened as a FAILURE, pinned to the head we bound to. That
-            # SHA is no longer the PR head so the red blocks nothing current,
-            # and it retires any stale green sitting there.
-            conclusion="failure"
-            title="Merge clearance gate — head moved during evaluation (${HEAD_SHA:0:7} -> ${current:0:7}); awaiting re-evaluation on the new head"
-            summary="$title"
-          else
-            case "$RC" in
-              0)
-                if [ "$VERDICT" = "pass" ]; then
-                  conclusion="success"
-                  title="Merge clearance gate (event-driven re-evaluation)"
-                else
-                  conclusion="failure"
-                  title="Merge clearance gate — infra/config error (rc=0 with no PASS verdict line)"
-                fi
-                ;;
-              1) conclusion="failure"
-                 title="Merge clearance gate (event-driven re-evaluation)" ;;
-              *) conclusion="failure"
-                 title="Merge clearance gate — infra/config error (rc=$RC)" ;;
-            esac
-            summary=$(cat "$RUNNER_TEMP/mcg-summary.txt" 2>/dev/null || echo "(no gate output captured)")
-          fi
-          # A PATCH that never lands leaves the run in_progress = the required
-          # context PENDING = merge blocked. Fail-closed in BOTH verdict
-          # directions, which is why this step needs no asymmetric error
-          # handling and must never fail the job.
-          for attempt in 1 2 3; do
-            gh api -X PATCH "repos/$REPO/check-runs/$CHECK_ID" \
-              -f status="completed" \
-              -f conclusion="$conclusion" \
-              -f "output[title]=$title" \
-              -f "output[summary]=$summary" >/dev/null && exit 0
-            sleep $((attempt * 5))
-          done
-          echo "::warning::Could not close check_run $CHECK_ID; the required context stays PENDING until the scheduled sweep supersedes it (#841)."
-          exit 0
-
       - name: Confirm the Checks-API lineage blocks while pending (#2247)
-        # Runs only for the script's explicit pending verdict, and only when
-        # this run opened its own Checks-API hold (a fork or Dependabot run
-        # cannot, and keeps the pre-#2247 failing native run). Reads the
+        # Runs only for the script's explicit pending verdict. The existing
+        # trusted publisher must have opened its hold for THIS parent run and
+        # attempt/full head before the unchanged current-lineage proof. Reads the
         # head's current runs of this context and sets api_blocking=true only
         # when the Checks-API lineage blocks on its own: every current
         # Checks-API run is in progress or red, and none shares this run's
@@ -433,12 +302,13 @@ jobs:
         # status function in the condition, so the implicit success() also
         # skips it after any earlier failed step or a cancellation.
         id: lineage
-        if: ${{ steps.gate.outputs.pending == 'true' && steps.open.outputs.id != '' }}
+        if: ${{ steps.gate.outputs.pending == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           CHECK_NAME: "Merge clearance gate"
         run: |
           set -uo pipefail
@@ -447,7 +317,7 @@ jobs:
             echo "::warning::$helper is not on the default branch; the native run stays failing while clearance is pending (#2247)."
             exit 0
           fi
-          if "$helper" "$REPO" "$HEAD_SHA" "$CHECK_NAME" "$RUN_ID"; then
+          if "$helper" "$REPO" "$HEAD_SHA" "$CHECK_NAME" "$RUN_ID" "$RUN_ATTEMPT"; then
             echo "api_blocking=true" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::Could not confirm the Checks-API lineage blocks $HEAD_SHA; the native run stays failing (#2247)."

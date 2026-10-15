@@ -1262,6 +1262,13 @@ paths:
     # fail on every consumer, so the helper and the libs it sources travel
     # with it.
     requires:
+      - ".github/workflows/dependabot-auto-merge.yml"
+      - ".github/workflows/trusted-pr-policy.yml"
+      - ".github/workflows/pr-review-policy.yml"
+      - ".github/workflows/auto-clear-blocking-labels.yml"
+      - "scripts/workflow/dependabot-approved-merge.sh"
+      - "scripts/workflow/auto-clear-event.sh"
+      - "scripts/workflow/auto-clear-sweep.sh"
       - "scripts/workflow/dependabot_pin_bump_exemption.sh"
       - "scripts/lib/gh-api-array.sh"
       - "scripts/lib/dependabot-commit-provenance.sh"
@@ -2037,6 +2044,48 @@ paths:
   - path: .github/pull_request_template.md
     type: canonical
     consumers: all
+  - path: .github/workflows/agent-review-events.yml
+    type: canonical
+    consumers: all
+  - path: .github/workflows/trusted-pr-policy.yml
+    type: canonical
+    consumers: all
+    requires:
+      - ".github/workflows/pr-review-policy.yml"
+      - "scripts/workflow/"
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/dependabot-commit-provenance.sh"
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/lib/reviewers-helpers.sh"
+      - "scripts/codex-review-check.sh"
+  - path: tests/test_trusted_pr_event.cjs
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/trusted-pr-event.cjs"
+  - path: tests/test_trusted_workflow_boundaries.py
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/gate-api-lineage-blocking.sh"
+      - ".github/workflows/merge-clearance-gate.yml"
+      - ".github/workflows/auto-clear-blocking-labels.yml"
+      - ".github/workflows/agent-review-events.yml"
+      - ".github/workflows/pr-review-policy.yml"
+      - ".github/workflows/codex-p1-gate.yml"
+      - ".github/workflows/coderabbit-severity-gate.yml"
+      - ".github/workflows/daily-feedback-rollup.yml"
+      - ".github/workflows/pr-audit.yml"
+      - ".github/workflows/thread-resolution-lane.yml"
+  - path: tests/test_dependabot_auto_merge.sh
+    type: canonical
+    consumers: all
+    requires:
+      - ".github/workflows/dependabot-auto-merge.yml"
+      - "scripts/workflow/dependabot-approved-merge.sh"
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/dependabot-commit-provenance.sh"
+      - "scripts/lib/reviewers-helpers.sh"
   - path: .github/workflows/agent-review.yml
     type: canonical
     consumers: all
@@ -2059,6 +2108,8 @@ paths:
     # wave that moved the workflow without the kit would break every
     # consumer's load-config step.
     requires:
+      - ".github/workflows/agent-review-events.yml"
+      - "scripts/workflow/trusted-pr-event.cjs"
       - "scripts/workflow/approval-triage.cjs"
       - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
@@ -2081,6 +2132,7 @@ paths:
     # coupling explicit so the check_sync_manifest invariant flags any
     # future split of the parser kit from the workflow.
     requires:
+      - "scripts/codex-review-check.sh"
       - "scripts/workflow/"
       # The required Self-Review gate shells out to the validator by path and
       # runs it from a DEFAULT-BRANCH checkout. A consumer receiving this
@@ -2115,6 +2167,11 @@ paths:
     # missing. Declaring the closure keeps a consumer from receiving the
     # workflow ahead of the gate it now depends on (#1000).
     requires:
+      - "scripts/workflow/dependabot-approved-merge.sh"
+      - "scripts/workflow/"
+      - "scripts/lib/reviewers-helpers.sh"
+      - "scripts/codex-review-check.sh"
+      - "scripts/merge-clearance-gate.sh"
       - "scripts/review-feedback-accounting.sh"
       # Invoked by both merge gates in this workflow; a path-scoped sync
       # that shipped the workflow without it would leave the gate
@@ -2134,6 +2191,8 @@ paths:
     # auto-clear is dead. Same closure logic as codex-review-check.sh
     # above.
     requires:
+      - "scripts/workflow/auto-clear-event.sh"
+      - "scripts/workflow/auto-clear-sweep.sh"
       - "scripts/lib/gh-retry-helpers.sh"
       - "scripts/lib/blocking-labels.sh"
       - "scripts/workflow/approval-merge-continuation.sh"
@@ -2473,6 +2532,10 @@ paths:
     # closure gap that surfaced as #264 on the original propagation
     # wave (check_gh_as_author missing its tests on every consumer).
     requires:
+      - "tests/test_dependabot_auto_merge.sh"
+      - "tests/test_trusted_pr_event.cjs"
+      - "tests/test_trusted_workflow_boundaries.py"
+      - ".github/workflows/trusted-pr-policy.yml"
       - "tests/test_feedback_archive_identities.sh"   # #1437, offline enrollment and producer/relay cases
       - "scripts/lib/feedback-archive-identities.sh"   # #1437, direct CI-kit runtime closure
       - "scripts/workflow/merge-writer.py"
@@ -2640,6 +2703,9 @@ paths:
     # helpers (parse_manifest_paths.sh, match_protected_paths.sh) are
     # already inside this kit; the two scripts/lib/ deps are declared here.
     requires:
+      - "scripts/required-head-checks.sh"
+      - "scripts/review-feedback-accounting.sh"
+      - "scripts/codex-review-check.sh"
       - "scripts/workflow/merge-writer.py"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/workflow/owner-admin-override.py"

@@ -18,6 +18,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKFLOW="$ROOT/.github/workflows/dependabot-auto-merge.yml"
+DRIVER="$ROOT/scripts/workflow/dependabot-approved-merge.sh"
 
 [ -r "$WORKFLOW" ] || { echo "missing workflow: $WORKFLOW" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not available" >&2; exit 0; }
@@ -36,7 +37,7 @@ mkdir -p "$SHIM_DIR"
 
 extract_function() {
   local name="$1"
-  local file="${2:-$WORKFLOW}"
+  local file="${2:-$DRIVER}"
   # The strip width is derived from the MATCHED header line's own
   # indentation, not hardcoded (#904): a hardcoded `sub(/^          /,
   # "")` (10 spaces) is silently wrong the moment the workflow's `run:
@@ -172,7 +173,7 @@ run_functions() {
     FAKE_HEAD=test-head \
     FAKE_CHECK_NAME='Label Gate' \
     GITHUB_REPOSITORY=owner/repo \
-    PR_URL=https://example.test/owner/repo/pull/1 \
+    WORKFLOW_GH_TOKEN=fake-workflow PR_URL=https://example.test/owner/repo/pull/1 \
     REQUIRED_HEAD_CHECK_NAME='Label Gate' \
     TEST_CHECK_WAIT_SECONDS=0 \
     TEST_CHECK_POLL_SECONDS=0 \
@@ -378,7 +379,7 @@ extract_function require_dependabot_provenance >"$PROV_DIR/recheck.sh"
 run_recheck() {  # <commits_file> <mode> [armed]
   ( cd "$ROOT" && PATH="$PROV_DIR/bin:$PATH" PROV_LOG="$PROV_DIR/gh.log" \
       PROV_COMMITS="$1" PROV_MODE="$2" PROV_ARMED="${3:-false}" GITHUB_REPOSITORY=owner/repo PR_NUMBER=1 \
-      PR_URL=https://example.test/owner/repo/pull/1 \
+      WORKFLOW_GH_TOKEN=fake-workflow PR_URL=https://example.test/owner/repo/pull/1 \
       bash -c 'set -euo pipefail
         . scripts/lib/gh-api-array.sh
         . scripts/lib/dependabot-commit-provenance.sh
@@ -403,17 +404,17 @@ fi
 
 # Ordering: the approve is bound to a verified SHA, and each merge path
 # re-verifies the SHA it is pinned to.
-approve_block=$(awk '/APPROVE_SHA=\$\(gh pr view/{p=1} p{print} /event=APPROVE/{exit}' "$WORKFLOW")
+approve_block=$(awk '/APPROVE_SHA=\$\(gh pr view/{p=1} p{print} /event=APPROVE/{exit}' "$DRIVER")
 if [[ "$approve_block" == *'require_dependabot_provenance "$APPROVE_SHA"'* ]] \
    && [[ "$approve_block" == *'-f commit_id="$APPROVE_SHA"'* ]] \
-   && ! grep -Fq 'gh pr review --approve' "$WORKFLOW"; then
+   && ! grep -Fq 'gh pr review --approve' "$DRIVER"; then
   pass "approve is pinned to a provenance-verified commit_id"
 else
   fail "approve must verify provenance and bind commit_id to the verified SHA"
 fi
 recheck_before_merge=$(awk '
   /^[[:space:]]*require_current_head_checks_success[[:space:]]*$/ { getline nxt; if (nxt ~ /require_dependabot_provenance "\$CURRENT_HEAD_SHA"/) n++ }
-  END { print n + 0 }' "$WORKFLOW")
+  END { print n + 0 }' "$DRIVER")
 if [ "$recheck_before_merge" -ge 2 ] \
    && grep -Fq "steps.provenance.outputs.trusted == 'true'" "$WORKFLOW"; then
   pass "both merge paths re-verify provenance on the pinned head; approve step gated on trusted"
@@ -813,7 +814,8 @@ fi
 # ---------------------------------------------------------------------------
 PRP_WORKFLOW="$ROOT/.github/workflows/pr-review-policy.yml"
 AUTO_CLEAR_WORKFLOW="$ROOT/.github/workflows/auto-clear-blocking-labels.yml"
-if command -v yq >/dev/null 2>&1 && [ -r "$PRP_WORKFLOW" ] && [ -r "$AUTO_CLEAR_WORKFLOW" ]; then
+TRUSTED_POLICY_WORKFLOW="$ROOT/.github/workflows/trusted-pr-policy.yml"
+if command -v yq >/dev/null 2>&1 && [ -r "$PRP_WORKFLOW" ] && [ -r "$AUTO_CLEAR_WORKFLOW" ] && [ -r "$TRUSTED_POLICY_WORKFLOW" ]; then
   CLASSIFIER=$(yq -r '.jobs."external-review-labeling".steps[] | select(.id == "check") | .run' "$PRP_WORKFLOW")
   if grep -Fq 'PIN_HELPER="$TRUSTED_HELPER_DIR/dependabot_pin_bump_exemption.sh"' <<<"$CLASSIFIER" \
      && grep -Fq -- '--config "$TRUSTED_CONFIG"' <<<"$CLASSIFIER" \
@@ -848,11 +850,11 @@ if command -v yq >/dev/null 2>&1 && [ -r "$PRP_WORKFLOW" ] && [ -r "$AUTO_CLEAR_
   else
     fail "labeler's exempt arm is incomplete: $exempt_arm"
   fi
-  LANE_IF=$(yq -r '.jobs."external-review-labeling".steps[] | select(.name == "Dependabot action-pin bump lane") | .if' "$PRP_WORKFLOW")
-  LANE_TOKEN=$(yq -r '.jobs."external-review-labeling".steps[] | select(.name == "Dependabot action-pin bump lane") | .env.GH_TOKEN' "$PRP_WORKFLOW")
-  LANE_RUN=$(yq -r '.jobs."external-review-labeling".steps[] | select(.name == "Dependabot action-pin bump lane") | .run' "$PRP_WORKFLOW")
+  LANE_IF=$(yq -r '.jobs."classify-and-mutate".steps[] | select(.name == "Dependabot action-pin bump lane") | .if' "$TRUSTED_POLICY_WORKFLOW")
+  LANE_TOKEN=$(yq -r '.jobs."classify-and-mutate".steps[] | select(.name == "Dependabot action-pin bump lane") | .env.GH_TOKEN' "$TRUSTED_POLICY_WORKFLOW")
+  LANE_RUN=$(yq -r '.jobs."classify-and-mutate".steps[] | select(.name == "Dependabot action-pin bump lane") | .run' "$TRUSTED_POLICY_WORKFLOW")
   if [ "$LANE_IF" = "steps.check.outputs.dependabot_pin_bump == 'true'" ] \
-     && [ "$LANE_TOKEN" = '${{ secrets.GITHUB_TOKEN }}' ] \
+     && [ "$LANE_TOKEN" = '${{ github.token }}' ] \
      && ! grep -Fq -- '--remove-label' <<<"$LANE_RUN" \
      && ! grep -Fq 'DELETE' <<<"$LANE_RUN" \
      && ! grep -Fq 'LABEL_REMOVAL_TOKEN' <<<"$LANE_RUN" \
@@ -941,7 +943,16 @@ SHIM
 
   # auto-clear: both clearing loops consult the lane before the merge gate.
   for job in evaluate-and-clear scheduled-sweep; do
-    LOOP=$(yq -r ".jobs.\"$job\".steps[] | select(.run != null) | select(.run | test(\"codex-review-check.sh \\\"\\\\\$PR\\\"\")) | .run" "$AUTO_CLEAR_WORKFLOW")
+    case "$job" in
+      evaluate-and-clear) clear_helper=scripts/workflow/auto-clear-event.sh ;;
+      scheduled-sweep) clear_helper=scripts/workflow/auto-clear-sweep.sh ;;
+    esac
+    CLEAR_STEP=$(yq -r ".jobs.\"$job\".steps[] | select(.run != null) | select(.run | contains(\"bash $clear_helper\")) | .run" "$AUTO_CLEAR_WORKFLOW")
+    if [ "$CLEAR_STEP" != "bash $clear_helper" ] || [ ! -r "$ROOT/$clear_helper" ]; then
+      fail "auto-clear $job: missing fixed trusted clearing helper reference"
+      continue
+    fi
+    LOOP=$(cat "$ROOT/$clear_helper")
     if [ -z "$LOOP" ]; then
       fail "auto-clear $job: could not locate the clearing loop step"
       continue
@@ -1016,7 +1027,7 @@ SHIM
     else
       fail "auto-clear $job: the pre-delete fence must re-check both the captured pair and the label ownership (fence=$fence_line owner=$fence_owner_line delete=$delete_line)"
     fi
-    STEP_ENV=$(yq -r ".jobs.\"$job\".steps[] | select(.run != null) | select(.run | test(\"codex-review-check.sh \\\"\\\\\$PR\\\"\")) | .env.DEFAULT_BRANCH // \"\"" "$AUTO_CLEAR_WORKFLOW")
+    STEP_ENV=$(yq -r ".jobs.\"$job\".steps[] | select(.run != null) | select(.run | contains(\"bash $clear_helper\")) | .env.DEFAULT_BRANCH // \"\"" "$AUTO_CLEAR_WORKFLOW")
     if [ "$STEP_ENV" = '${{ github.event.repository.default_branch }}' ]; then
       pass "auto-clear $job: the clearing step exports DEFAULT_BRANCH for the base-pinned policy resolution"
     else

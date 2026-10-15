@@ -68,7 +68,9 @@
       "scripts/workflow/heal-auto-clear-infra-check.sh",
       "scripts/workflow/report-approval-continuation-failures.sh",
       "tests/test_approval_merge_continuation.sh",
-      "tests/test_merge_clearance_gate.sh"
+      "tests/test_merge_clearance_gate.sh",
+      "scripts/workflow/auto-clear-event.sh",
+      "scripts/workflow/auto-clear-sweep.sh"
     ],
     "check_bootstrap_board_and_summary": [
       "tests/test_bootstrap_board_and_summary.sh"
@@ -308,7 +310,8 @@
       "tests/test_pr_review_policy_nudge.sh",
       "scripts/lib/ci-check-modes.sh",
       ".github/workflows/pr-review-policy.yml",
-      "tests/test_label_gate_live_labels.sh"
+      "tests/test_label_gate_live_labels.sh",
+      ".github/workflows/trusted-pr-policy.yml"
     ],
     "check_project_doc_sync": [
       "tests/test_project_doc_sync.sh"
@@ -405,7 +408,18 @@
       "tests/test_dependabot_auto_merge_check_wait.sh",
       "tests/test_655_repo_lint_local_observed.sh",
       "tests/test_load_review_config.sh",
-      "scripts/ci/fixtures/workflow-parsers/*"
+      "scripts/ci/fixtures/workflow-parsers/*",
+      "tests/test_dependabot_auto_merge.sh",
+      "tests/test_trusted_pr_event.cjs",
+      "tests/test_trusted_workflow_boundaries.py",
+      ".github/workflows/agent-review.yml",
+      ".github/workflows/agent-review-events.yml",
+      ".github/workflows/trusted-pr-policy.yml",
+      ".github/workflows/dependabot-auto-merge.yml",
+      "scripts/workflow/dependabot-approved-merge.sh",
+      "scripts/workflow/trusted-pr-event.cjs",
+      "scripts/workflow/run-pr-policy-classifier.py",
+      ".github/workflows/pr-review-policy.yml"
     ],
     "check_workflow_verify_propagation_templated": [
       "tests/test_verify_propagation_pr_templated.sh"

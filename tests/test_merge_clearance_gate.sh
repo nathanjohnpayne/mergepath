@@ -435,6 +435,16 @@ DEPENDABOT='dependabot[bot]'
 EXT_LABEL='[{"name":"needs-external-review"}]'
 
 # ---------------------------------------------------------------------------
+# Extract a checked-in workflow shell step for the native/trusted runtime cases.
+mcg_step_body() {  # workflow step-name -> real run body
+  awk -v want="$2" '
+    index($0, "- name: " want) { instep=1; next }
+    instep && !inrun && /^        run: \|/ { inrun=1; next }
+    inrun { if ($0 ~ /^[[:space:]]*$/) { print ""; next }
+      if ($0 !~ /^          /) exit; sub(/^          /, ""); print }
+  ' "$1"
+}
+
 # Test 1: Dependabot, reviewer_gate disabled → exit 0, no reviews API call.
 # ---------------------------------------------------------------------------
 echo; echo "--- Test 1: Dependabot, gate disabled"
@@ -1687,228 +1697,101 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 23 (#841): the two-phase Checks-API publish in the event-driven job.
-#
-# BEHAVIOURAL, not structural. The real `run:` bodies are extracted from the
-# live workflow and executed against a stub `gh`, so these cases fail if the
-# published shape stops matching what the workflow actually does — a grep for
-# the POST would keep passing while the mapping underneath it rotted.
-#
-# Why the job publishes at all: a job-native completion cannot retire a
-# Checks-API entry, so before #841 a stale synthetic FAILURE outlived ten
-# job-native successes on an unchanged head and blocked the PR indefinitely.
-# The event job now writes the same slot the sweep writes.
-# ---------------------------------------------------------------------------
+# Test 23 (#1547): the native candidate job no longer owns a POST/PATCH.
+# Its former phase-1/phase-2 execution cases are superseded by denied-write
+# native controls and actual trusted sweep/dispatch publication controls.
+# The gate/report semantics remain covered here and by Test30 below.
 WF_841="$ROOT/.github/workflows/merge-clearance-gate.yml"
+
 if [ -f "$WF_841" ]; then
-  echo; echo "--- Test 23 (#841): two-phase Checks-API publish"
-  # Every case below deliberately runs commands that are EXPECTED to fail
-  # (a stub gh returning 1, a grep that must not match), and several are
-  # written as `cmd && bad=...`, whose status is non-zero when cmd fails.
-  # Under the suite's errexit that exits the whole run, so drop it for the
-  # duration and restore it at the end of the block — the same idiom the
-  # older cases in this file use around run_gate.
-  set +e
-
-  # Extract one step's run: body and dedent it. Body lines sit at 10 spaces;
-  # the first non-blank line shallower than that ends the block.
-  mcg_step_body() {  # <workflow> <step name>
-    awk -v want="$2" '
-      index($0, "- name: " want) { instep = 1; next }
-      instep && !inrun && /^        run: \|/ { inrun = 1; next }
-      inrun {
-        if ($0 ~ /^[[:space:]]*$/) { print ""; next }
-        if ($0 !~ /^          /) exit
-        sub(/^          /, "")
-        print
-      }
-    ' "$1"
-  }
-
-  P1_BODY="$(mcg_step_body "$WF_841" 'Open the required check_run (#841 phase 1)')"
-  P2_BODY="$(mcg_step_body "$WF_841" 'Close the required check_run (#841 phase 2)')"
-  RV_BODY="$(mcg_step_body "$WF_841" 'Report gate verdict')"
-
-  T23="$(mktemp -d "${TMPDIR:-/tmp}/mcg841.XXXXXX")"
-  mkdir -p "$T23/bin"
-  # Stub gh: logs argv, behaviour driven by env.
+  echo; echo "--- Test 23 (#1547): read-only native and retained trusted writers"
+  T23="$(mktemp -d "${TMPDIR:-/tmp}/mcg1547.XXXXXX")"
+  mkdir -p "$T23/bin" "$T23/wd/scripts"
   cat > "$T23/bin/gh" <<'STUB'
-#!/bin/sh
+#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$GH_LOG"
-if [ "$1" = api ]; then
-  case "$*" in
-    *"-X POST"*)
-      [ "${GH_POST_FAIL:-0}" = 1 ] && exit 1
-      printf '%s\n' "${GH_POST_ID:-42}"; exit 0 ;;
-    *"-X PATCH"*)
-      [ "${GH_PATCH_FAIL:-0}" = 1 ] && exit 1
-      exit 0 ;;
-  esac
-  exit 0
-fi
-if [ "$1" = pr ] && [ "$2" = view ]; then
-  [ "${GH_PRVIEW_FAIL:-0}" = 1 ] && exit 1
-  printf '%s\n' "${GH_PRVIEW_SHA:-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef}"; exit 0
-fi
-exit 0
+case "$*" in
+  *'-X POST'*|*'-X PATCH'*)
+    [ "${DENY_WRITES:-1}" = 0 ] || exit 89
+    [ "${GH_WRITE_FAIL:-0}" = 0 ] || exit 1
+    printf '{}\n'; exit 0 ;;
+  'pr list '*)
+    if [[ "$*" == *select* ]]; then printf '%s\n' "$FIXTURE_ROWS" | cut -f2; else printf '%s\n' "$FIXTURE_ROWS"; fi
+    exit 0 ;;
+esac
+printf '{}\n'
 STUB
-  # No-op sleep: the retry loops would otherwise burn ~2 minutes of real time.
-  printf '#!/bin/sh\nexit 0\n' > "$T23/bin/sleep"
-  chmod +x "$T23/bin/gh" "$T23/bin/sleep"
-
-  SHA1=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
-  run23() {  # <body> ; env supplied by caller
-    GH_LOG="$T23/gh.log" PATH="$T23/bin:$PATH" \
-    GITHUB_OUTPUT="$T23/out.txt" RUNNER_TEMP="$T23" \
-      bash -c "$1" 2>&1
-  }
-  reset23() { : > "$T23/gh.log"; : > "$T23/out.txt"; }
-
+  cat > "$T23/wd/scripts/merge-clearance-gate.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "${T23_GATE_TEXT:-Merge clearance: PASS}"
+exit "${T23_GATE_RC:-0}"
+STUB
+  chmod +x "$T23/bin/gh" "$T23/wd/scripts/merge-clearance-gate.sh"
+  NATIVE_GATE_BODY="$(mcg_step_body "$WF_841" 'Run scripts/merge-clearance-gate.sh')"
+  NATIVE_REPORT_BODY="$(mcg_step_body "$WF_841" 'Report gate verdict')"
+  SWEEP_BODY="$(mcg_step_body "$WF_841" 'Re-evaluate gate per PR and post check_run')"
+  DISPATCH_BODY="$(mcg_step_body "$WF_841" 'Re-evaluate gate for the dispatched PR and post check_run')"
+  run23() { ( cd "$T23/wd" && GH_LOG="$T23/gh.log" PATH="$T23/bin:$PATH" \
+    GITHUB_OUTPUT="$T23/out" RUNNER_TEMP="$T23" bash -c "$1" ); }
+  : > "$T23/gh.log"; : > "$T23/out"
   bad=""
-  # -- phase 1 -------------------------------------------------------------
-  reset23
-  OUT=$(REPO=o/r HEAD_SHA="$SHA1" IS_FORK=false CHECK_NAME="Merge clearance gate" \
-        run23 "$P1_BODY"); RC=$?
-  posts=$(grep -c -- "-X POST" "$T23/gh.log" || true)
-  [ "$RC" = 0 ] || bad="$bad p1-ok-rc"
-  [ "$posts" = 1 ] || bad="$bad p1-ok-postcount"
-  grep -q "id=42" "$T23/out.txt" || bad="$bad p1-ok-id"
-  grep -q "status=in_progress" "$T23/gh.log" || bad="$bad p1-ok-inprogress"
-  grep -q "head_sha=$SHA1" "$T23/gh.log" || bad="$bad p1-ok-headsha"
-  grep -q "name=Merge clearance gate" "$T23/gh.log" || bad="$bad p1-ok-name"
-
-  reset23
-  OUT=$(REPO=o/r HEAD_SHA="$SHA1" IS_FORK=true CHECK_NAME=X GH_POST_FAIL=1 \
-        run23 "$P1_BODY"); RC=$?
-  [ "$RC" = 0 ] || bad="$bad p1-fork-rc"
-  printf '%s' "$OUT" | grep -q "::warning::" || bad="$bad p1-fork-warn"
-  grep -q "^id=" "$T23/out.txt" && bad="$bad p1-fork-idleak"
-
-  reset23
-  OUT=$(REPO=o/r HEAD_SHA="$SHA1" IS_FORK=false PR_ACTOR=someone CHECK_NAME=X \
-        GH_POST_FAIL=1 run23 "$P1_BODY"); RC=$?
-  [ "$RC" = 1 ] || bad="$bad p1-samerepo-rc"
-  printf '%s' "$OUT" | grep -q "::error::" || bad="$bad p1-samerepo-err"
-
-  # Dependabot PRs are SAME-REPO (IS_FORK=false) but carry a read-only token.
-  # Without this branch the publish fails every retry and fails the required
-  # check on every Dependabot PR, which run weekly here (Codex P1 on #843).
-  reset23
-  OUT=$(REPO=o/r HEAD_SHA="$SHA1" IS_FORK=false PR_ACTOR="dependabot[bot]" \
-        CHECK_NAME=X GH_POST_FAIL=1 run23 "$P1_BODY"); RC=$?
-  [ "$RC" = 0 ] || bad="$bad p1-dependabot-rc"
-  printf '%s' "$OUT" | grep -q "::warning::" || bad="$bad p1-dependabot-warn"
-
-  # "dependabot[bot]" is a glob character class in a case arm, so a case-based
-  # match would also accept "dependabott" and let a spoofable actor name take
-  # the degrade path. Pin that it does not.
-  reset23
-  OUT=$(REPO=o/r HEAD_SHA="$SHA1" IS_FORK=false PR_ACTOR="dependabott" \
-        CHECK_NAME=X GH_POST_FAIL=1 run23 "$P1_BODY"); RC=$?
-  [ "$RC" = 1 ] || bad="$bad p1-dependabot-globtrap"
-
-  reset23
-  OUT=$(REPO=o/r HEAD_SHA="" IS_FORK=false CHECK_NAME=X run23 "$P1_BODY"); RC=$?
-  [ "$RC" = 1 ] || bad="$bad p1-nohead-rc"
-  [ -s "$T23/gh.log" ] && bad="$bad p1-nohead-posted"
-
-  if [ -z "$bad" ]; then
-    pass "#841 phase 1: opens an in_progress run on the PR head, tolerates a fork, and refuses to proceed when it cannot publish"
-  else
-    fail "#841 phase 1 wrong:$bad"
-  fi
-
-  # -- phase 2 -------------------------------------------------------------
-  bad=""
-  p2() {  # <rc> <verdict> ; extra env via caller prefix
-    reset23
-    printf 'gate said things\n' > "$T23/mcg-summary.txt"
-    REPO=o/r PR_NUMBER=7 CHECK_ID=42 HEAD_SHA="$SHA1" RC="$1" VERDICT="$2" \
-      run23 "$P2_BODY"
-  }
-  OUT=$(p2 0 pass); RC=$?
-  grep -q -- "-X PATCH" "$T23/gh.log" || bad="$bad p2-pass-nopatch"
-  grep -q "check-runs/42" "$T23/gh.log" || bad="$bad p2-pass-target"
-  grep -q "conclusion=success" "$T23/gh.log" || bad="$bad p2-pass-conclusion"
-
-  OUT=$(p2 1 blocked)
-  grep -q "conclusion=failure" "$T23/gh.log" || bad="$bad p2-blocked"
-  grep -q "infra/config" "$T23/gh.log" && bad="$bad p2-blocked-mislabelled"
-
-  OUT=$(p2 0 absent)
-  grep -q "conclusion=failure" "$T23/gh.log" || bad="$bad p2-absent"
-  grep -q "rc=0 with no PASS verdict" "$T23/gh.log" || bad="$bad p2-absent-title"
-
-  OUT=$(p2 7 absent)
-  grep -q "infra/config error (rc=7)" "$T23/gh.log" || bad="$bad p2-rc7"
-
-  # Head moved, and head unreadable: both must publish a red pinned to the
-  # head we bound to, never a silent skip that leaves a stale green standing.
-  reset23; printf 'x\n' > "$T23/mcg-summary.txt"
-  OUT=$(REPO=o/r PR_NUMBER=7 CHECK_ID=42 HEAD_SHA="$SHA1" RC=0 VERDICT=pass \
-        GH_PRVIEW_SHA=cafebabecafebabecafebabecafebabecafebabe run23 "$P2_BODY")
-  grep -q "conclusion=failure" "$T23/gh.log" || bad="$bad p2-drift-conclusion"
-  grep -q "head moved" "$T23/gh.log" || bad="$bad p2-drift-title"
-  grep -q "check-runs/42" "$T23/gh.log" || bad="$bad p2-drift-target"
-
-  reset23; printf 'x\n' > "$T23/mcg-summary.txt"
-  OUT=$(REPO=o/r PR_NUMBER=7 CHECK_ID=42 HEAD_SHA="$SHA1" RC=0 VERDICT=pass \
-        GH_PRVIEW_FAIL=1 run23 "$P2_BODY")
-  grep -q "conclusion=failure" "$T23/gh.log" || bad="$bad p2-unreadable"
-
-  reset23; printf 'x\n' > "$T23/mcg-summary.txt"
-  OUT=$(REPO=o/r PR_NUMBER=7 CHECK_ID=42 HEAD_SHA="$SHA1" RC=0 VERDICT=pass \
-        GH_PATCH_FAIL=1 run23 "$P2_BODY"); RC=$?
-  patches=$(grep -c -- "-X PATCH" "$T23/gh.log" || true)
-  [ "$RC" = 0 ] || bad="$bad p2-patchfail-rc"
-  [ "$patches" = 3 ] || bad="$bad p2-patchfail-attempts($patches)"
-  printf '%s' "$OUT" | grep -q "::warning::" || bad="$bad p2-patchfail-warn"
-
-  if [ -z "$bad" ]; then
-    pass "#841 phase 2: maps rc/verdict to a conclusion, publishes a red on head drift rather than skipping, and never fails the job"
-  else
-    fail "#841 phase 2 wrong:$bad"
-  fi
-
-  # -- native conclusion mapping is unchanged ------------------------------
-  bad=""
-  rv() { RC="$1" VERDICT="$2" run23 "$RV_BODY" >/dev/null 2>&1; }
-  rv 0 pass   || bad="$bad rv-pass"
-  rv 0 absent && bad="$bad rv-absent-should-fail"
-  rv 1 blocked && bad="$bad rv-blocked-should-fail"
-  rv 2 absent && bad="$bad rv-rc2-should-fail"
-  if [ -z "$bad" ]; then
-    pass "#841: the job's NATIVE conclusion mapping is unchanged apart from the rc-0-without-PASS sentinel"
-  else
-    fail "#841 native mapping changed:$bad"
-  fi
-
-  rm -rf "$T23"
+  [ -n "$NATIVE_GATE_BODY" ] && [ -n "$NATIVE_REPORT_BODY" ] || bad="$bad missing-native-body"
+  [ -z "$(mcg_step_body "$WF_841" 'Open the required check_run')" ] || bad="$bad candidate-open"
+  [ -z "$(mcg_step_body "$WF_841" 'Close the required check_run')" ] || bad="$bad candidate-close"
+  set +e
+  T23_GATE_RC=0 PR_NUMBER=7 REPO=o/r run23 "$NATIVE_GATE_BODY" >/dev/null
+  [ "$?" = 0 ] || bad="$bad native-gate"
+  RC=0 VERDICT=pass PENDING=false API_BLOCKING='' run23 "$NATIVE_REPORT_BODY" >/dev/null
+  [ "$?" = 0 ] || bad="$bad native-pass"
+  [ ! -s "$T23/gh.log" ] || bad="$bad native-api-call"
+  for verb in POST PATCH; do
+    run23 "gh api -X $verb repos/o/r/check-runs" >/dev/null 2>&1
+    [ "$?" = 89 ] || bad="$bad allowed-candidate-$verb"
+  done
   set -e
-else
-  echo "SKIP: Test 23 (#841) — merge-clearance-gate.yml absent"
+  if [ -z "$bad" ]; then pass '#1547 native execution needs no write; fake candidate POST/PATCH are denied'; else fail "#1547 native boundary:$bad"; fi
+  SHA23=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+  for writer in sweep dispatch; do
+    case "$writer" in sweep) body23="$SWEEP_BODY" ;; dispatch) body23="$DISPATCH_BODY" ;; esac
+    bad=""
+    [ -n "$body23" ] || bad="$bad missing-writer"
+    for code23 in 0 1 2; do
+      : > "$T23/gh.log"
+      set +e
+      DENY_WRITES=0 T23_GATE_RC="$code23" PR=7 REPO=o/r CHECK_NAME='Merge clearance gate' \
+        PRS="$(printf '7\t%s' "$SHA23")" FIXTURE_ROWS="$(printf '7\t%s' "$SHA23")" \
+        run23 "$body23" >"$T23/$writer-$code23.out" 2>&1
+      rc23=$?
+      set -e
+      expected23=failure; [ "$code23" != 0 ] || expected23=success
+      grep -q -- "-f conclusion=$expected23" "$T23/gh.log" || bad="$bad rc$code23-mapping"
+      grep -q -- "-f head_sha=$SHA23" "$T23/gh.log" || bad="$bad rc$code23-head"
+      grep -q -- '-f name=Merge clearance gate' "$T23/gh.log" || bad="$bad rc$code23-context"
+      if [ "$code23" = 2 ] && [ "$writer" = sweep ]; then
+        [ "$rc23" != 0 ] || bad="$bad missing-infra-exit"
+      else
+        [ "$rc23" = 0 ] || bad="$bad verdict-exit"
+      fi
+    done
+    : > "$T23/gh.log"
+    set +e
+    DENY_WRITES=0 GH_WRITE_FAIL=1 T23_GATE_RC=0 PR=7 REPO=o/r CHECK_NAME='Merge clearance gate' \
+      PRS="$(printf '7\t%s' "$SHA23")" FIXTURE_ROWS="$(printf '7\t%s' "$SHA23")" \
+      run23 "$body23" >/dev/null 2>&1
+    [ "$?" != 0 ] || bad="$bad ignored-publication-failure"
+    set -e
+    if [ -z "$bad" ]; then pass "#1547 trusted $writer retains head/context/rc mapping and publication failure"; else fail "#1547 trusted $writer:$bad"; fi
+  done
+  rm -rf "$T23"
 fi
 
-
 # ---------------------------------------------------------------------------
-# Test 22 (#845): the two-phase Checks-API publish assertions must actually
-# reject a workflow that lost the property they name.
-#
-# Each case appends a deliberately-broken variant of write_wf_gate_job to a
-# shape-valid header and asserts the check FAILS. Case I is the positive
-# control. Two of these are worth more than the rest:
-#
-#   B proves COMMENT STRIPPING. #843 documents this design in prose right next
-#     to the code, so an unstripped grep matches the explanation after the
-#     implementation is gone.
-#   D proves BLOCK SCOPING. The header's sweep job POSTs under the same
-#     CHECK_NAME, so a whole-file grep passes even with the event job's
-#     publish deleted — which is exactly the pre-#843 workflow.
-#
-# Without B and D the other assertions are decorative: they would pass on the
-# very shape they exist to reject.
+# Test22 replaces the obsolete #845 candidate-write mutations with denied
+# native writes and exact causal-proof bindings. Trusted sweep/dispatch
+# publication/name/head/rc mutations remain below; the harness still requires
+# each mutation to change bytes and fail for its own named reason.
 # ---------------------------------------------------------------------------
-echo; echo "--- Test 22 (#845): two-phase publish assertions reject each broken shape"
+echo; echo "--- Test 22 (#1547): native denied-write and retained trusted-publisher mutations"
 
 mcg22_run() {  # <fixture-path> -> echoes rc
   local out rc
@@ -1954,30 +1837,25 @@ mcg22_case() {  # <name> <perl-program-or-empty> <expect: fail|pass> [expected-F
   fi
 }
 
-# A — no POST at all.
-mcg22_case A 's{(  merge-clearance-gate:.*?)gh api -X POST "repos/\$REPO/check-runs" \\}{$1true \\}s' fail "must open the required check_run"
-# B — the POST survives only as a full-line comment.
-mcg22_case B 's{^(\s*)id=\$\(gh api -X POST}{$1# id=\$(gh api -X POST}m' fail "must open the required check_run"
-# C — no job-scoped checks: write.
-mcg22_case C 's{^\s*checks: write\n}{}m' fail "checks: write"
-# D — the event job loses its publish; the header sweep still POSTs.
+# A/B/C/F/J — reintroduced candidate write authority or missing read capability.
+mcg22_case A 's{^(      checks:) read$}{$1 write}m' fail '[#1547 read-only native]'
+# B — an added native step attempts a forbidden POST.
+mcg22_case B 's{(      - name: Resolve PR number)}{      - name: Forbidden POST\n        run: gh api -X POST repos/o/r/check-runs\n$1}' fail '[#1547 read-only native]'
+# C — the native job loses required pull-request read capability.
+mcg22_case C 's{(  merge-clearance-gate:.*?)(      pull-requests: read\n)}{$1}s' fail '[#1547 read-only native]'
+# D — the native job key disappears while the trusted header still publishes.
 mcg22_case D 's{  merge-clearance-gate:}{  merge-clearance-renamed:}' fail 'the #845'
 # E — bound to the merge commit instead of the PR head.
 mcg22_case E 's{HEAD_SHA: \$\{\{ github.event.pull_request.head.sha \}\}}{HEAD_SHA: head_sha="\$\{\{ github.sha \}\}"}' fail "must NOT bind to github.sha"
-# F — opens the run but never closes it.
-mcg22_case F 's{gh api -X PATCH "repos/\$REPO/check-runs/\$CHECK_ID"}{true}' fail "must close the check_run it opened"
-# G — no verdict sentinel, so a query-mode rc 0 could publish green.
+# F — an added native step attempts a forbidden PATCH.
+mcg22_case F 's{(      - name: Resolve PR number)}{      - name: Forbidden PATCH\n        run: gh api -X PATCH repos/o/r/check-runs/42\n$1}' fail '[#1547 read-only native]'
+# G — no verdict sentinel, so a query-mode rc 0 could look cleared.
 mcg22_case G 's{\*"Merge clearance: PASS"\*\)}{*"nope"*)}' fail "verdict sentinel"
-# H — always() instead of !cancelled(): publishes on a cancelled run.
-mcg22_case H 's{if: \$\{\{ !cancelled\(\) && steps.open.outputs.id != .. \}\}}{if: always()}' fail "guarded by !cancelled()"
-# J — valid YAML that DISABLES the permission while an inline comment still
-#     carries the string. Stripping only full-line comments accepts this
-#     (Codex P2 on #849), which would have made every assertion bypassable by
-#     leaving the old code behind a `#`.
-mcg22_case J 's{^(\s*)checks: write}{$1checks: read # checks: write}m' fail 'checks: write'
-# K — rebind phase 1 to the merge commit WITHOUT the one literal spelling the
-#     first version of this assertion forbade. Phase 2's unchanged line kept
-#     satisfying the positive grep, so the mutation slipped through (Codex P2).
+# H — lineage confirmation runs without the explicit pending predicate.
+mcg22_case H 's{if: \$\{\{ steps.gate.outputs.pending == .true. \}\}}{if: always()}' fail '[#850 producer eligibility]'
+# J — a write grant cannot hide behind an inline read-permission comment.
+mcg22_case J 's{^(      checks:) read$}{$1 write # checks: read}m' fail '[#1547 read-only native]'
+# K — rebind the lineage proof to the merge commit in the direct spelling.
 mcg22_case K 's{HEAD_SHA: \$\{\{ github.event.pull_request.head.sha \}\}}{HEAD_SHA: \$\{\{ github.sha \}\}}' fail 'must NOT bind to github.sha'
 # L and M are the two halves of the same assertion, and they fail in OPPOSITE
 # directions — which is why the producer check has to be a conjunction, per
@@ -2014,23 +1892,16 @@ if python3 -c "import yaml" >/dev/null 2>&1; then
 echo; echo "--- Test 24 (#850): structural assertions over the parsed workflow"
 MCG_TAG='#850'
 
-# a — phase 1 demoted below the checkout. Every string assertion still passes:
-#     the POST and status=in_progress are present, just no longer first, so a
-#     checkout failure now happens before anything retires the stale verdict.
-mcg22_case a 's{(      - name: Open the required check_run.*?)(      - name: Checkout repo.*?)(      - name: Resolve PR number)}{$2$1$3}s' \
-  fail '[#850 phase-1 position]'
-# b — phase 1 made conditional. success() is TRUTHY on purpose: the property is
-#     that phase 1 carries no step-level if: AT ALL, not that its if is falsy.
-mcg22_case b 's{(      - name: Open the required check_run[^\n]*\n)}{$1        if: success()\n}' \
-  fail '[#850 phase-1 unconditional]'
+# a — native trusted checkout moved after PR resolution (#1547 replacement).
+mcg22_case a 's{(  merge-clearance-gate:.*?)(      - name: Checkout repo.*?)(      - name: Resolve PR number.*?)(      - name: Run scripts/merge-clearance-gate.sh)}{$1$3$2$4}s' fail '[#1547 trusted checkout]'
+# b — native trusted checkout made conditional (#1547 replacement).
+mcg22_case b 's{(  merge-clearance-gate:.*?      - name: Checkout repo[^\n]*\n)}{$1        if: success()\n}s' fail '[#1547 trusted checkout]'
 # c — the sweep can never run. Trigger, CHECK_NAME, POST, permissions all
 #     intact; only the parse sees that the job is unreachable.
 mcg22_case c 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: false}sm' \
   fail "[#850 producer eligibility] job 'scheduled-sweep'"
-# d — #849 hole 1: phase 2 loses its own HEAD_SHA. A job-scoped grep for the
-#     binding is satisfied by phase 1's.
-mcg22_case d 's{(      - name: Close the required check_run.*?)^          HEAD_SHA: [^\n]*\n}{$1}sm' \
-  fail '[#850 phase-2 head binding]'
+# d — lineage proof loses its full-head binding (#1547 replacement).
+mcg22_case d 's{(      - name: Confirm the Checks-API lineage.*?)(          HEAD_SHA: [^\n]*\n)}{$1}s' fail '[#2247 pending arm]'
 # e — #849 hole 2: a gh-invoking step loses its token, so gh falls back to
 #     unauthenticated and the sweep cannot list PRs at all.
 mcg22_case e 's{(      - name: Find open PRs.*?)^          GH_TOKEN: [^\n]*\n}{$1}sm' \
@@ -2051,12 +1922,8 @@ mcg22_case h 's{\z}{  merge-clearance-gate: ["not-a-mapping"]\n}' \
 #      failures are buffered until the end).
 mcg22_case h2 's{^  merge-clearance-gate:\n}{  merge-clearance-gate: ["not-a-mapping"]\n  relocated-original:\n}m' \
   fail "[#850 producer eligibility] job 'merge-clearance-gate'"
-# a2 — a preliminary first step whose run body merely MENTIONS the phase-1
-#      strings. Substrings alone accept it (the real publisher still satisfies
-#      the text layer later in the job); only the step-identity conjunct sees
-#      that the first step is not the publisher.
-mcg22_case a2 's{(    steps:\n)(      - name: Open the required check_run)}{$1      - name: Preliminary\n        run: echo check-runs in_progress\n$2}' \
-  fail '[#850 phase-1 position]'
+# a2 — a preliminary step shadows the trusted first checkout (#1547 replacement).
+mcg22_case a2 's{(  merge-clearance-gate:.*?    steps:\n)(      - name: Checkout repo)}{$1      - name: Preliminary\n        run: echo read-only\n$2}s' fail '[#1547 trusted checkout]'
 # c2 — the same unreachable sweep spelled as an expression-wrapped literal,
 #      which GitHub evaluates exactly like the bare one.
 mcg22_case c2 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ 0 \}\}}sm' \
@@ -2081,10 +1948,8 @@ mcg22_case i 's{^  scheduled-sweep:$}{  ? [scheduled-sweep]\n  :}m' \
 #      wrapped branch.
 mcg22_case c5 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: 0.0}sm' \
   fail "[#850 producer eligibility] job 'scheduled-sweep'"
-# j — a steps entry that parses to a bare string. .get on it would raise; the
-#     first-step property must fail with its own named cause instead.
-mcg22_case j 's{(    steps:\n)(      - name: Open the required check_run)}{$1      - just-a-string\n$2}' \
-  fail '[#850 phase-1 position]'
+# j — the first native step becomes a malformed string (#1547 replacement).
+mcg22_case j 's{(  merge-clearance-gate:.*?    steps:\n)(      - name: Checkout repo)}{$1      - just-a-string\n$2}s' fail '[#1547 trusted checkout]'
 # c7 — the EMPTY quoted literal is the one falsy quoted form.
 mcg22_case c7 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ \x27\x27 \}\}}sm' \
   fail "[#850 producer eligibility] job 'scheduled-sweep'"
@@ -2103,11 +1968,8 @@ mcg22_case k 's{(      - name: Re-evaluate gate per PR and post check_run\n)(   
 #     Actions accepts; raw-scalar-text comparison must pass it (cross-agent
 #     P2, round 4: a quoted "true" constructed the string and proved nothing).
 mcg22_case n 's{\z}{  on:\n    name: on-shaped job id\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n  true:\n    name: true-shaped job id\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n}' pass
-# o — the close step's condition extended with a falsy conjunct: both required
-#     substrings survive, the step never runs, phase 1's pending entry is
-#     never closed.
-mcg22_case o 's{(        if: )\$\{\{ !cancelled\(\) && steps.open.outputs.id != \x27\x27 \}\}}{$1\$\{\{ !cancelled\(\) && steps.open.outputs.id != \x27\x27 && false \}\}}' \
-  fail "[#850 producer eligibility] step"
+# o — the pending proof is made unreachable (#1547 replacement).
+mcg22_case o 's{if: \$\{\{ steps.gate.outputs.pending == .true. \}\}}{if: \$\{\{ steps.gate.outputs.pending == \x27true\x27 && false \}\}}' fail '[#850 producer eligibility]'
 # p — the sweep's publish step on a NON-literal condition false on schedule.
 mcg22_case p 's{(      - name: Re-evaluate gate per PR and post check_run\n)(        if: )steps.find.outputs.prs[^\n]*}{$1$2github.event_name == \x27push\x27}sm' \
   fail "[#850 producer eligibility] step"
@@ -2116,47 +1978,28 @@ mcg22_case p 's{(      - name: Re-evaluate gate per PR and post check_run\n)(   
 #     per-producer condition allowlist.
 mcg22_case m 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: github.event_name == \x27push\x27}sm' \
   fail "[#850 producer eligibility] job 'scheduled-sweep'"
-# l — a path-qualified gh invocation must still demand its token binding.
-mcg22_case l 's{(      - name: Open the required check_run.*?\n        run: \|\n)}{$1          /usr/bin/gh api /rate_limit >/dev/null\n}s && s{^          GH_TOKEN: [^\n]*\n(          REPO: \$\{\{ github.repository \}\}\n          # Bind to the PR HEAD)}{$1}m' \
-  fail "[#850 gh token binding]"
-# q — a first step with the canonical NAME and env whose body merely echoes
-#     the strings: the exact POST command set is what distinguishes a
-#     publisher from a decoy that satisfies name, env and substrings.
-mcg22_case q 's{(id: open\n(?:(?!gh api -X POST).)*?)gh api -X POST "repos/\$REPO/check-runs"}{$1echo posted-nothing}s' \
-  fail '[#850 phase-1 position]'
-# r — the close step wearing the SWEEP's guard: valid in the allowlist
-#     globally, falsy in a job with no find step — pins are per (job, step).
-mcg22_case r 's{(        if: )\$\{\{ !cancelled\(\) && steps.open.outputs.id != \x27\x27 \}\}}{$1steps.find.outputs.prs != \x27\x27}' \
-  fail "[#850 producer eligibility] step"
-# s — a DECOY sharing the exact close-step name ahead of the real one: two
-#     steps may legally share a name, so first-match selection is forgeable.
-mcg22_case s 's{(      - name: Close the required check_run \(#841 phase 2\)\n)}{      - name: Close the required check_run (#841 phase 2)\n        env:\n          HEAD_SHA: \$\{\{ github.event.pull_request.head.sha \}\}\n        run: echo decoy\n$1}s' \
-  fail '[#850 phase-2 head binding]'
+# l — the actual evaluator loses its read token (#1547 replacement).
+mcg22_case l 's{(      - name: Run scripts/merge-clearance-gate.sh.*?)(          GH_TOKEN: [^\n]*\n)}{$1}s' fail '[#850 gh token binding]'
+# q — an echoed promise replaces the causal helper invocation (#1547 replacement).
+mcg22_case q 's{if "\$helper" "\$REPO" "\$HEAD_SHA" "\$CHECK_NAME" "\$RUN_ID" "\$RUN_ATTEMPT"; then}{if echo no-proof; then}' fail '[#2247 pending arm]'
+# r — the lineage step wears an unrelated sweep condition (#1547 replacement).
+mcg22_case r 's{if: \$\{\{ steps.gate.outputs.pending == .true. \}\}}{if: steps.find.outputs.prs != \x27\x27}' fail '[#850 producer eligibility]'
+# s — a duplicate lineage step shadows the proof (#1547 replacement).
+mcg22_case s 's{(      - name: Confirm the Checks-API lineage blocks while pending \(#2247\)\n)}{$1        run: echo decoy\n$1}' fail '[#2247 pending arm]'
 # t — a needs: dependency on a producer job: GitHub skips the producer when
 #     the dependency fails or is skipped, BEFORE its own condition is even
 #     evaluated — trigger, condition pins and every string stay intact while
 #     that path stops refreshing the required context (cross-agent P1, r4).
 mcg22_case t 's{^(  merge-clearance-gate:\n)}{$1    needs: preflight\n}m' \
   fail "declares needs"
-# u — continue-on-error on the phase-1 publisher: its failed POST is
-#     tolerated, the job runs on with no pending entry, phase 2 skips on its
-#     empty open id, and the previous synthetic verdict is never retired
-#     (cross-agent P1, round 4).
-mcg22_case u 's{^(      - name: Open the required check_run \(#841 phase 1\)\n)}{$1        continue-on-error: true\n}m' \
-  fail "continue-on-error"
-# u2 — an EXPRESSION continue-on-error is not provably disabled either.
-mcg22_case u2 's{^(      - name: Open the required check_run \(#841 phase 1\)\n)}{$1        continue-on-error: \$\{\{ always() \}\}\n}m' \
-  fail "continue-on-error"
-# v — the phase-1 POST drops head_sha: GitHub rejects a check-run create
-#     without it, so nothing pending opens; the command must carry head_sha
-#     on the SAME step the position assertion pins (App P2 on #852).
-mcg22_case v 's{(id: open\n.*?)[ ]*-f head_sha="\$HEAD_SHA" \\\n}{$1}s' \
-  fail "[#850 phase-1 position]"
-# w — the close step's CHECK_ID rebound to another output: set -u no longer
-#     saves it (the value exists) and the PATCH hits a different run id,
-#     leaving the entry phase 1 opened PENDING (App P2 on #852).
-mcg22_case w 's{^(          CHECK_ID: )\$\{\{ steps.open.outputs.id \}\}$}{$1\$\{\{ steps.gate.outputs.rc \}\}}m' \
-  fail "binds CHECK_ID"
+# u — a tolerated evaluator failure (#1547 replacement).
+mcg22_case u 's{^(      - name: Run scripts/merge-clearance-gate.sh\n)}{$1        continue-on-error: true\n}m' fail 'continue-on-error'
+# u2 — an expression-based tolerated evaluator failure (#1547 replacement).
+mcg22_case u2 's{^(      - name: Run scripts/merge-clearance-gate.sh\n)}{$1        continue-on-error: \$\{\{ always() \}\}\n}m' fail 'continue-on-error'
+# v — the causal invocation drops the current attempt (#1547 replacement).
+mcg22_case v 's{ "\$RUN_ID" "\$RUN_ATTEMPT"; then}{ "\$RUN_ID"; then}' fail '[#2247 pending arm]'
+# w — the attempt binding is replaced by a constant (#1547 replacement).
+mcg22_case w 's{RUN_ATTEMPT: \$\{\{ github.run_attempt \}\}}{RUN_ATTEMPT: "1"}' fail '[#2247 pending arm]'
 # x — a concurrency group on the event producer: a queued second member
 #     cancels the pending one and the cancelled NATIVE run of this required
 #     lineage blocks the PR permanently (measured on #843; App P2 on #852).
@@ -2255,7 +2098,9 @@ if [ "$RC" -eq 0 ]; then
   pass "#850 case g: the unmodified canonical workflow passes the whole check"
 else
   fail "#850 case g: the canonical workflow must pass the check; got rc=$RC"
-  grep '^FAIL' <<<"$OUT" | sed 's/^/      /' | head -4 >&2
+  # Shell/runtime errors may not begin with FAIL. Keep their actual cause and
+  # let later assertions run instead of aborting on an empty grep result.
+  printf '%s\n' "$OUT" | tail -12 | sed 's/^/      /' >&2
 fi
 else
   echo; echo "SKIP: Test 24 (#850) — PyYAML unavailable (the check soft-skips it too)"
@@ -4161,9 +4006,8 @@ rcp_dir_case native-producer-unparseable \
 rcp_dir_case native-producer-name-drift \
   'perl -0777 -i -pe "s{Codex P1 read-only archive handoff}{Something Else}" codex-p1-gate.yml' \
   fail 'reports as'
-# The conditional name reads an output from archive-edited-feedback. Keeping
-# the string while dropping `needs` makes the expression unresolved rather
-# than safely selecting the read-only handoff name.
+# The read-only handoff still consumes the archived event's PR/head outputs.
+# Retaining its static name while dropping `needs` must not erase that edge.
 rcp_dir_case native-producer-needs-drift \
   'perl -0777 -i -pe "s{needs: \[archive-edited-feedback\]}{needs: []}" codex-p1-gate.yml' \
   fail 'does not need'
@@ -4849,11 +4693,10 @@ fi
 #       block, an infra exit or a fail-closed applicability fallback;
 #   30b the extracted gate step: pending only for rc 1 + BLOCKED line + a
 #       file reading exactly `pending`, with a stale file removed first;
-#   30c scripts/gate-api-lineage-blocking.sh: established only when every
-#       current Checks-API run blocks in a suite other than this run's own;
-#   30d the extracted lineage-confirmation and report steps: the native run
-#       is non-failing only on the full conjunction, and the phase-2 PATCH
-#       still publishes failure for the same verdict.
+#   30c scripts/gate-api-lineage-blocking.sh: every current API run blocks
+#       in a distinct suite, with the exact causal summary in native mode;
+#   30d the extracted lineage-confirmation and read-only report steps: the
+#       native run is non-failing only on the full conjunction;
 #   30e a review with several pending events, then clearance: no job-native
 #       failure accumulates, and the head is blocked until the Checks-API
 #       lineage turns green and clean after it, with no rerun.
@@ -4934,23 +4777,13 @@ fi
 WF_2247="$ROOT/.github/workflows/merge-clearance-gate.yml"
 T30="$(mktemp -d "${TMPDIR:-/tmp}/mcg2247.XXXXXX")"
 mkdir -p "$T30/bin" "$T30/wd/scripts"
-# Same extractor as Test 23 (that one is scoped to its own block).
-t30_step_body() {  # <workflow> <step name>
-  awk -v want="$2" '
-    index($0, "- name: " want) { instep = 1; next }
-    instep && !inrun && /^        run: \|/ { inrun = 1; next }
-    inrun {
-      if ($0 ~ /^[[:space:]]*$/) { print ""; next }
-      if ($0 !~ /^          /) exit
-      sub(/^          /, "")
-      print
-    }
-  ' "$1"
-}
-GATE_BODY="$(t30_step_body "$WF_2247" 'Run scripts/merge-clearance-gate.sh')"
-LIN_BODY="$(t30_step_body "$WF_2247" 'Confirm the Checks-API lineage blocks while pending (#2247)')"
-RV2_BODY="$(t30_step_body "$WF_2247" 'Report gate verdict')"
-P2B_BODY="$(t30_step_body "$WF_2247" 'Close the required check_run (#841 phase 2)')"
+
+GATE_BODY="$(mcg_step_body "$WF_2247" 'Run scripts/merge-clearance-gate.sh')"
+LIN_BODY="$(mcg_step_body "$WF_2247" 'Confirm the Checks-API lineage blocks while pending (#2247)')"
+RV2_BODY="$(mcg_step_body "$WF_2247" 'Report gate verdict')"
+# Test23 is skipped by the nested canonical run; extract this dependency here.
+SWEEP_BODY="$(mcg_step_body "$WF_2247" 'Re-evaluate gate per PR and post check_run')"
+
 t30_run() {  # <body> ; runs in $T30/wd with env from caller
   ( cd "$T30/wd" && GH_LOG="$T30/gh.log" PATH="$T30/bin:$PATH" \
       GITHUB_OUTPUT="$T30/out.txt" RUNNER_TEMP="$T30" bash -c "$1" 2>&1 )
@@ -5018,11 +4851,11 @@ api() {  # <id> <status> <conclusion|null> <suite>
   [ "$c" = null ] || c="\"$c\""
   printf '{"id":%s,"status":"%s","conclusion":%s,"ext":"","suite":%s,"app":"github-actions","url":"https://github.com/o/r/runs/%s"}' "$1" "$2" "$c" "$4" "$1"
 }
-t30_helper() {  # <runs> -> rc
+t30_helper() {  # <runs> [attempt] -> rc
   : > "$T30/gh.log"
   set +e
   HOUT=$(T30_RUNS="$1" GH_LOG="$T30/gh.log" PATH="$T30/hbin:$PATH" \
-         "$HELPER" o/r "$SHA30" "Merge clearance gate" 777 2>&1)
+         "$HELPER" o/r "$SHA30" "Merge clearance gate" 777 ${2:+"$2"} 2>&1)
   HRC=$?
   set -e
   echo "$HRC"
@@ -5060,13 +4893,24 @@ set +e
 "$HELPER" o/r "$SHA30" "Merge clearance gate" 77x >/dev/null 2>&1; [ $? = 2 ] || bad="$bad usage-run"
 "$HELPER" o/r "$SHA30" "" 777 >/dev/null 2>&1; [ $? = 2 ] || bad="$bad usage-name"
 set -e
+# #1547: a generic old red is insufficient for the candidate pending arm.
+CAUSAL="Publisher phase 1: evaluation queued for $SHA30. <!-- required-check-publisher:pending:777:2 -->"
+causal_api() { api "${1:-9}" "${2:-in_progress}" "${3:-null}" "${4:-20}" | jq -c --arg s "${5:-$CAUSAL}" '. + {summary:$s}'; }
+[ "$(t30_helper "$OWN$nl$(causal_api)" 2)" = 0 ] || bad="$bad causal-positive"
+[ "$(t30_helper "$OWN$nl$(api 9 completed failure 20)" 2)" = 1 ] || bad="$bad generic-red"
+for changed in "${CAUSAL/777:2/776:2}" "${CAUSAL/777:2/777:1}" "${CAUSAL/$SHA30/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" "quoted $CAUSAL"; do
+  [ "$(t30_helper "$OWN$nl$(causal_api 9 in_progress null 20 "$changed")" 2)" = 1 ] || bad="$bad wrong-causal-binding"
+done
+[ "$(t30_helper "$OWN$nl$(causal_api 9 completed success 20)" 2)" = 1 ] || bad="$bad causal-green"
+[ "$(t30_helper "$OWN$nl$(causal_api 9 in_progress null 10)" 2)" = 1 ] || bad="$bad causal-same-suite"
+grep -q -- '--paginate' "$T30/gh.log" || bad="$bad causal-pagination"
 if [ -z "$bad" ]; then
   pass "#2247: the lineage helper is established only when every current Checks-API run blocks, outside this run's own suite"
 else
   fail "#2247 lineage helper wrong:$bad"
 fi
 
-echo; echo "--- Test 30d (#2247): lineage confirmation, native conclusion and the Checks-API write"
+echo; echo "--- Test 30d (#2247): lineage confirmation, native conclusion and the read-only boundary"
 # Lineage step with a stand-in helper.
 bad=""
 # Called with a redirect rather than inside $( ), so LOUT survives the call.
@@ -5080,13 +4924,13 @@ t30_lin() {  # <helper-rc|absent> ; writes the api_blocking output to $T30/lin.r
   fi
   : > "$T30/helper-args"
   set +e
-  LOUT=$(REPO=o/r HEAD_SHA="$SHA30" RUN_ID=777 CHECK_NAME="Merge clearance gate" t30_run "$LIN_BODY")
+  LOUT=$(REPO=o/r HEAD_SHA="$SHA30" RUN_ID=777 RUN_ATTEMPT=2 CHECK_NAME="Merge clearance gate" t30_run "$LIN_BODY")
   LRC=$?
   set -e
   { [ "$LRC" = 0 ] || echo "step-failed"; t30_out api_blocking; } > "$T30/lin.res"
 }
 t30_lin 0; [ "$(cat "$T30/lin.res")" = true ] || bad="$bad helper-ok"
-grep -qx "o/r $SHA30 Merge clearance gate 777" "$T30/helper-args" || bad="$bad helper-args"
+grep -qx "o/r $SHA30 Merge clearance gate 777 2" "$T30/helper-args" || bad="$bad helper-args"
 t30_lin 1; [ -z "$(cat "$T30/lin.res")" ] || bad="$bad helper-no"
 printf '%s' "$LOUT" | grep -q '::warning::' || bad="$bad helper-no-warn"
 t30_lin 2; [ -z "$(cat "$T30/lin.res")" ] || bad="$bad helper-usage"
@@ -5106,23 +4950,12 @@ rv2 3 absent true true     && bad="$bad rv-unknown-rc"
 rv2 0 pass '' ''           || bad="$bad rv-pass"
 RVOUT=$(RC=1 VERDICT=blocked PENDING=true API_BLOCKING=true t30_run "$RV2_BODY")
 printf '%s' "$RVOUT" | grep -q '::notice::Merge clearance is PENDING' || bad="$bad rv-notice"
-# The same pending verdict still closes the Checks-API hold as FAILURE.
-cat > "$T30/bin/gh" <<'STUB'
-#!/bin/sh
-printf '%s\n' "$*" >> "$GH_LOG"
-if [ "$1" = pr ] && [ "$2" = view ]; then printf '%s\n' "$T30_HEAD"; fi
-exit 0
-STUB
-printf '#!/bin/sh\nexit 0\n' > "$T30/bin/sleep"
-chmod +x "$T30/bin/gh" "$T30/bin/sleep"
-t30_reset
-printf 'gate output\n' > "$T30/mcg-summary.txt"
-T30_HEAD="$SHA30" REPO=o/r PR_NUMBER=7 CHECK_ID=42 HEAD_SHA="$SHA30" RC=1 VERDICT=blocked \
-  t30_run "$P2B_BODY" >/dev/null
-grep -q 'conclusion=failure' "$T30/gh.log" || bad="$bad api-not-red"
-grep -q 'conclusion=success' "$T30/gh.log" && bad="$bad api-green"
+# The candidate report performs no Checks-API write. Trusted writer mapping
+# and publication-failure controls now live in Test23, not a retired native
+# phase-2 body.
+[ ! -s "$T30/gh.log" ] || bad="$bad candidate-wrote"
 if [ -z "$bad" ]; then
-  pass "#2247: native non-failing needs pending AND a confirmed blocking lineage; every real block, infra exit and unrecognised rc still fails; the Checks-API hold still closes as failure"
+  pass "#2247: native non-failing needs pending AND a confirmed blocking lineage; every real block, infra exit and unrecognised rc still fails; the candidate performs no publication"
 else
   fail "#2247 native/lineage mapping wrong:$bad"
 fi
@@ -5132,6 +4965,12 @@ echo; echo "--- Test 30e (#2247): several pending events, then clearance, reach 
 # cleared one. A stand-in for GitHub's combination of the two lineages: the
 # head blocks while ANY job-native run of the context failed (each sits in its
 # own suite and is never retired) or the newest Checks-API run is not green.
+cat > "$T30/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_LOG"
+printf '{}\n'
+STUB
+chmod +x "$T30/bin/gh"
 bad=""
 native_failures=0
 api_latest=""
@@ -5140,19 +4979,23 @@ t30_event() {  # <gate-rc> <line> <write> -> updates native_failures, api_latest
   t30_reset
   T30_RC="$1" T30_LINE="$2" T30_WRITE="$3" PR_NUMBER=7 REPO=o/r t30_run "$GATE_BODY" >/dev/null
   pending=$(t30_out pending)
-  # Phase 2 publishes the evaluation into the Checks-API lineage.
-  T30_HEAD="$SHA30" REPO=o/r PR_NUMBER=7 CHECK_ID=42 HEAD_SHA="$SHA30" RC="$1" \
-    VERDICT="$(t30_out verdict)" t30_run "$P2B_BODY" >/dev/null
-  if grep -q 'conclusion=success' "$T30/gh.log"; then api_latest=success; else api_latest=failure; fi
-  # The lineage helper reads that newest Checks-API run.
-  local lin=''
-  if [ "$pending" = true ] && [ "$api_latest" != success ]; then lin=true; fi
+  # The existing publisher's opening is independent of the candidate.
+  # Confirm its exact causal summary through the actual read-only helper.
+  local lin='' marker runs
+  marker="Publisher phase 1: evaluation queued for $SHA30. <!-- required-check-publisher:pending:777:2 -->"
+  [ "${4:-}" != stale ] || marker="Publisher phase 1: evaluation queued for $SHA30. <!-- required-check-publisher:pending:776:2 -->"
+  runs="$(api 9 in_progress null 20 | jq -c --arg s "$marker" '. + {summary:$s}')"
+  if [ "$pending" = true ] && [ "$(t30_helper "$OWN$nl$runs" 2)" = 0 ]; then lin=true; fi
   set +e
   RC="$1" VERDICT="$(t30_out verdict)" PENDING="$pending" API_BLOCKING="$lin" \
     t30_run "$RV2_BODY" >/dev/null 2>&1
   rc=$?
   set -e
   [ "$rc" = 0 ] || native_failures=$((native_failures + 1))
+  : > "$T30/gh.log"
+  PRS="$(printf '7\t%s' "$SHA30")" PR=7 REPO=o/r CHECK_NAME='Merge clearance gate' \
+    T30_RC="$1" T30_LINE="$2" T30_WRITE='' t30_run "$SWEEP_BODY" >/dev/null
+  if grep -q 'conclusion=success' "$T30/gh.log"; then api_latest=success; else api_latest=failure; fi
 }
 merge_state() {
   if [ "$native_failures" -gt 0 ] || [ "$api_latest" != success ]; then echo BLOCKED; else echo CLEAN; fi
@@ -5169,6 +5012,10 @@ native_failures=0
 for _ in 1 2 3 4; do t30_event 1 "$BLK" ''; done
 t30_event 0 'Merge clearance: PASS — cleared' ''
 { [ "$native_failures" = 4 ] && [ "$(merge_state)" = BLOCKED ]; } || bad="$bad control($native_failures)"
+native_failures=0
+for _ in 1 2 3 4; do t30_event 1 "$BLK" pending stale; done
+t30_event 0 'Merge clearance: PASS — cleared' ''
+{ [ "$native_failures" = 4 ] && [ "$(merge_state)" = BLOCKED ]; } || bad="$bad stale-causal-control($native_failures)"
 set -e
 if [ -z "$bad" ]; then
   pass "#2247: four pending review events leave no failed job-native run; the head is blocked until clearance and clean after it, with no rerun (control without the verdict stays blocked)"
@@ -5199,9 +5046,7 @@ mcg22_case lineage-run-id \
 mcg22_case lineage-helper-dropped \
   's{helper=scripts/gate-api-lineage-blocking\.sh}{helper=scripts/true.sh}' \
   fail '[#2247 pending arm]'
-mcg22_case lineage-if-unguarded \
-  's{if: \$\{\{ steps\.gate\.outputs\.pending == .true. && steps\.open\.outputs\.id != .. \}\}}{if: \$\{\{ always() && steps.open.outputs.id != \x27\x27 \}\}}' \
-  fail '[#850 producer eligibility]'
+mcg22_case lineage-if-unguarded 's{if: \$\{\{ steps.gate.outputs.pending == .true. \}\}}{if: always()}' fail '[#850 producer eligibility]'
 mcg22_case lineage-step-removed \
   's{      - name: Confirm the Checks-API lineage blocks while pending \(#2247\)\n.*?(      - name: Report gate verdict)}{$1}s' \
   fail '[#2247 pending arm]'

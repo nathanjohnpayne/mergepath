@@ -5,9 +5,12 @@ on:
     types: [opened, edited, synchronize, labeled, unlabeled]
 
 permissions:
-  pull-requests: write
+  pull-requests: read
   contents: read
   issues: read
+  actions: read
+  checks: read
+  security-events: read
 
 jobs:
   self-review-check:
@@ -69,6 +72,8 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     env:
+      CLASSIFIER_NEEDS_REVIEW: ${{ needs.external-review-labeling.outputs.needs_review }}
+      CLASSIFIER_CLASSIFICATION: ${{ needs.external-review-labeling.outputs.classification }}
       CLASSIFIER_RESULT: ${{ needs.external-review-labeling.result }}
     steps:
       - name: Block merge if blocking labels present
@@ -84,6 +89,14 @@ jobs:
                 `External Review Check finished with ${process.env.CLASSIFIER_RESULT || 'an unknown result'}; ` +
                 `failing closed before evaluating labels.`
               );
+              return;
+            }
+            // The trusted writer runs independently. An absent label before its
+            // first mutation cannot stand in for a completed classification.
+            // Retain this native required check on the PR head (ADR 0003).
+            if (process.env.CLASSIFIER_NEEDS_REVIEW !== 'false' ||
+                process.env.CLASSIFIER_CLASSIFICATION === 'stale-event') {
+              core.setFailed('The read-only classifier requires external review or could not bind current PR metadata.');
               return;
             }
             // check_pr_review_policy_nudge asserts parity with the shared
@@ -129,21 +142,25 @@ jobs:
   external-review-labeling:
     name: External Review Check
     runs-on: ubuntu-latest
+    outputs:
+      needs_review: ${{ steps.check.outputs.needs_review }}
+      classification: ${{ steps.check.outputs.classification }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
           # The external-review check only reads local history (git diff / show
-          # / worktree) and clones PUBLIC mergepath unauthenticated; it never
-          # pushes or uses the workspace remote, so don't leave the checkout
+          # / worktree), fetches inert objects through a temporary askpass,
+          # and clones PUBLIC mergepath unauthenticated; don't leave the checkout
           # token in .git/config (#548 defense-in-depth).
           persist-credentials: false
 
       - name: Check for external review triggers from review-policy.yml
         id: check
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           EVENT_ACTION: ${{ github.event.action }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -171,6 +188,66 @@ jobs:
           # rather than waved through. That is the intended direction — the
           # policy exists on the default branch by then — but it can newly label
           # such a PR.
+          # Candidate objects are inert data, fetched only from the repository
+          # independently bound by GitHub/the trusted consumer. No PR URL,
+          # checkout, persisted token or ambient credential helper is used.
+          fetch_inert_candidate() (
+            case "$PR_NUMBER" in ''|*[!0-9]*) exit 1 ;; esac
+            [[ "$REPO" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || exit 1
+            [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ && "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+            [ -n "${GH_TOKEN:-}" ] || { echo 'A workflow token is required for candidate object reads.' >&2; exit 1; }
+            expected_origin="https://github.com/$REPO"
+            trusted_fetch_git() {
+              env -u GIT_CONFIG -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT \
+                GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+                GIT_TERMINAL_PROMPT=0 SSH_ASKPASS= LC_ALL=C \
+                git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+                -c credential.helper= -c credential.useHttpPath=true \
+                -c http.followRedirects=false -c protocol.allow=never \
+                -c protocol.https.allow=always "$@"
+            }
+            origin=$(trusted_fetch_git config --local --get remote.origin.url) || exit 1
+            case "$origin" in "$expected_origin"|"$expected_origin.git") ;; *)
+              echo 'Refusing candidate fetch from an untrusted origin.' >&2; exit 1 ;;
+            esac
+            # Local URL rewriting must not redirect the verified destination.
+            trusted_fetch_git config --local --get-regexp '^url\..*\.(insteadof|pushinsteadof)$' >/dev/null 2>&1
+            rewrite_rc=$?
+            [ "$rewrite_rc" -eq 1 ] || { echo 'Refusing unreadable or rewritten Git destination.' >&2; exit 1; }
+            FETCH_DIR=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/mergepath-fetch.XXXXXX") || exit 1
+            trap 'rm -rf "$FETCH_DIR"' EXIT
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            cat >"$FETCH_DIR/askpass" <<'ASKPASS'
+          #!/bin/sh
+          case "$1" in
+            "Username for 'https://github.com/$FETCH_REPO.git': ") printf '%s\n' x-access-token ;;
+            "Password for 'https://x-access-token@github.com/$FETCH_REPO.git': ") printf '%s\n' "$GH_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          ASKPASS
+            chmod 700 "$FETCH_DIR/askpass" || exit 1
+            # Native caller: entirely read-only workflow token. Trusted policy
+            # writer: existing PR-write token, but Contents-read only here.
+            HOME="$FETCH_DIR" FETCH_REPO="$REPO" GIT_ASKPASS="$FETCH_DIR/askpass" \
+              trusted_fetch_git fetch --no-tags "$expected_origin.git" "refs/pull/$PR_NUMBER/head" || exit 1
+            [ "$(git rev-parse FETCH_HEAD)" = "$HEAD_SHA" ] || exit 4
+            HOME="$FETCH_DIR" FETCH_REPO="$REPO" GIT_ASKPASS="$FETCH_DIR/askpass" \
+              trusted_fetch_git fetch --no-tags "$expected_origin.git" "$BASE_SHA" || exit 1
+          )
+          set +e
+          fetch_inert_candidate
+          fetch_rc=$?
+          set -e
+          if [ "$fetch_rc" -eq 4 ]; then
+            echo "classification=stale-event" >> "$GITHUB_OUTPUT"
+            echo "needs_review=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          elif [ "$fetch_rc" -ne 0 ]; then
+            echo 'Could not fetch candidate objects from the verified repository.' >&2
+            exit 1
+          fi
+
           BASE_HAS_POLICY=true
           if ! git cat-file -e "$BASE_SHA:.github/review-policy.yml" 2>/dev/null; then
             BASE_HAS_POLICY=false
@@ -333,7 +410,7 @@ jobs:
                 # guarantees BASE_SHA is present for the worktree add.
                 BASE_TREE=$(mktemp -d)
                 if git worktree add --quiet --detach "$BASE_TREE" "$BASE_SHA" 2>/dev/null; then
-                  VERIFIER="$BASE_TREE/scripts/workflow/verify-propagation-pr.sh"
+                  VERIFIER="$PWD/scripts/workflow/verify-propagation-pr.sh"
                   if [ ! -f "$VERIFIER" ]; then
                     echo "Propagation lane: base commit has no scripts/workflow/verify-propagation-pr.sh (consumer not yet on the vendored verifier) — not lane-eligible; falls through to normal review."
                   elif ! grep -q 'mergepath-verifier-contract: self-sourced-helpers-v1' "$VERIFIER"; then
@@ -420,6 +497,7 @@ jobs:
             # it once so the second pass can't log a spurious failure.
             for _t in "$TRUSTED_CONFIG_TREE" "$TRUSTED_HELPER_TREE" "$TRUSTED_BASE_TREE"; do
               [ -n "$_t" ] || continue
+              [ "$_t" != "$PWD" ] || continue
               git worktree remove --force "$_t" >/dev/null 2>&1 || rm -rf "$_t"
               # Stop after the base tree: in the common case the helper tree
               # IS the base tree, so a second pass would log a spurious failure.
@@ -472,20 +550,10 @@ jobs:
             echo "NOTE: using the trusted origin/$DEFAULT_BRANCH review policy (the PR base predates the policy file)."
           fi
 
-          TRUSTED_SOURCE=""
-          if [ -x "$TRUSTED_BASE_TREE/scripts/workflow/external_review_fingerprint.sh" ]; then
-            TRUSTED_HELPER_TREE="$TRUSTED_BASE_TREE"
-            TRUSTED_SOURCE="the PR base ($BASE_SHA)"
-          elif git rev-parse --verify --quiet "origin/$DEFAULT_BRANCH^{commit}" >/dev/null 2>&1; then
-            TRUSTED_HELPER_TREE=$(mktemp -d)
-            rmdir "$TRUSTED_HELPER_TREE" 2>/dev/null || true
-            if git worktree add --quiet --detach "$TRUSTED_HELPER_TREE" "origin/$DEFAULT_BRANCH" 2>/dev/null \
-               && [ -x "$TRUSTED_HELPER_TREE/scripts/workflow/external_review_fingerprint.sh" ]; then
-              TRUSTED_SOURCE="origin/$DEFAULT_BRANCH (fallback: the PR base predates the helper)"
-            else
-              git worktree remove --force "$TRUSTED_HELPER_TREE" >/dev/null 2>&1 || rm -rf "$TRUSTED_HELPER_TREE"
-              TRUSTED_HELPER_TREE=""
-            fi
+          TRUSTED_SOURCE="the checked-out default branch"
+          TRUSTED_HELPER_TREE="$PWD"
+          if [ ! -x "$TRUSTED_HELPER_TREE/scripts/workflow/external_review_fingerprint.sh" ]; then
+            TRUSTED_SOURCE=""
           fi
 
           if [ -z "$TRUSTED_SOURCE" ]; then
@@ -670,8 +738,9 @@ jobs:
           # remains eligible for #1321 reconciliation alongside under-threshold.
           # A later canonical gate clearance suppresses application but grants
           # no additional label-removal authority.
-          if [ "$NEEDS_REVIEW" = "true" ] \
-             && { [ "$EVENT_ACTION" = labeled ] || [ "$EVENT_ACTION" = unlabeled ]; }; then
+          # Re-runs replay the original event action. Always re-read exact-head
+          # clearance so an old native failure can recover after a valid review.
+          if [ "$NEEDS_REVIEW" = "true" ]; then
             if [ ! -x "$CLEARANCE_HELPER" ]; then
               publish_clearance_failure "trusted canonical helper is unavailable"
               exit 0
@@ -717,430 +786,3 @@ jobs:
 
           echo "needs_review=$NEEDS_REVIEW" >> "$GITHUB_OUTPUT"
           echo "reasons=$REASONS" >> "$GITHUB_OUTPUT"
-
-      - name: Apply label and comment
-        # A PAT-driven auto-clear removal intentionally triggers this workflow.
-        # Re-evaluate and publish External Review Check, but do not undo that
-        # same removal by re-adding the label (#969). Every other label event
-        # follows the ordinary classification result (#1254).
-        if: >-
-          steps.check.outputs.needs_review == 'true' &&
-          !(github.event.action == 'unlabeled' &&
-            github.event.label.name == 'needs-external-review')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REASONS: ${{ steps.check.outputs.reasons }}
-          CLASSIFICATION: ${{ steps.check.outputs.classification }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          # Check if label already applied to avoid duplicate comments
-          EXISTING=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '.labels[].name' | grep '^needs-external-review$' || true)
-          if [ -n "$EXISTING" ]; then
-            echo "Label already applied, skipping."
-            exit 0
-          fi
-
-          # #1254: label-event runs can outlive the event head or base. Fence
-          # the write against both live identities immediately before applying
-          # the label. An unreadable or malformed pair fails this job (and
-          # therefore Label Gate) closed; a confirmed move/retarget is a
-          # successful stale-run no-op.
-          if ! LIVE_PAIR=$(gh api \
-            "repos/${{ github.repository }}/pulls/$PR_NUMBER" \
-            --jq '{head:.head.sha,base:.base.sha}'); then
-            echo "::error::Could not read the live PR head/base before applying needs-external-review." >&2
-            exit 1
-          fi
-          if ! jq -e '
-              select((.head | type) == "string" and (.head | test("^[0-9a-fA-F]{40}$")))
-              | select((.base | type) == "string" and (.base | test("^[0-9a-fA-F]{40}$")))
-            ' <<<"$LIVE_PAIR" >/dev/null; then
-            echo "::error::Live PR head/base is malformed; refusing to apply needs-external-review." >&2
-            exit 1
-          fi
-          LIVE_HEAD=$(jq -r '.head' <<<"$LIVE_PAIR")
-          LIVE_BASE=$(jq -r '.base' <<<"$LIVE_PAIR")
-          if [ "$LIVE_HEAD" != "$HEAD_SHA" ] || [ "$LIVE_BASE" != "$BASE_SHA" ]; then
-            echo "PR head/base moved from $HEAD_SHA/$BASE_SHA to $LIVE_HEAD/$LIVE_BASE; skipping stale needs-external-review application."
-            exit 0
-          fi
-
-          gh pr edit "$PR_NUMBER" --add-label "needs-external-review" \
-            --repo "${{ github.repository }}"
-
-          FORMATTED_REASONS=$(echo "$REASONS" | sed 's/%0A/\n/g')
-          PROVENANCE=""
-          if [ "$CLASSIFICATION" = fail-closed ]; then
-            PROVENANCE="<!-- mergepath-external-review-label:v1 head=$HEAD_SHA cause=fail-closed -->"
-          fi
-
-          gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body "$(cat <<EOF
-          $PROVENANCE
-          **External Review Required**
-
-          This PR has been labeled \`needs-external-review\` based on .github/review-policy.yml:
-
-          $FORMATTED_REASONS
-
-          Per REVIEW_POLICY.md, the authoring agent must post a handoff message and alert the human. The human will coordinate external review by a different agent.
-
-          > Automated check per .github/review-policy.yml
-          EOF
-          )"
-
-      - name: Reconcile a policy-owned fail-closed label
-        if: >-
-          steps.check.outputs.classification == 'under-threshold' ||
-          steps.check.outputs.classification == 'carried-forward'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          LABEL_REMOVAL_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          EXPECTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          # #1321: a successful no-review classification may retract only a
-          # label this workflow previously applied because an earlier read
-          # failed closed. This includes an ordinary under-threshold result and
-          # a same-fingerprint carry-forward. An old comment is not ownership:
-          # a human could have removed and re-applied the label since then. Bind
-          # the decision to the latest label event and adjacent automation comment.
-          fetch_array() { # <endpoint> <output-file>
-            local endpoint=$1 output=$2 raw err rc=0
-            raw=$(mktemp)
-            err=$(mktemp)
-            gh api --paginate "$endpoint" >"$raw" 2>"$err" || rc=$?
-            if [ "$rc" -ne 0 ] || ! jq -s 'add // []' "$raw" >"$output"; then
-              echo "::warning::Could not read complete $endpoint data; preserving needs-external-review." >&2
-              cat "$err" >&2 || true
-              rm -f "$raw" "$err"
-              return 1
-            fi
-            rm -f "$raw" "$err"
-          }
-
-          read_live_pr() { # <output-file>
-            local output=$1 raw err rc=0
-            raw=$(mktemp)
-            err=$(mktemp)
-            gh api "repos/$REPO/pulls/$PR_NUMBER" >"$raw" 2>"$err" || rc=$?
-            if [ "$rc" -ne 0 ] \
-               || ! jq -e '
-                    select((.head.sha | type) == "string" and (.head.sha | test("^[0-9a-fA-F]{40}$")))
-                    | select((.base.sha | type) == "string" and (.base.sha | test("^[0-9a-fA-F]{40}$")))
-                    | select((.labels | type) == "array")
-                    | {head_sha:.head.sha, base_sha:.base.sha,
-                       labels:[.labels[] | select((.name | type) == "string") | .name]}
-                  ' "$raw" >"$output"; then
-              echo "::warning::Could not read current PR head, base, and labels; preserving needs-external-review." >&2
-              cat "$err" >&2 || true
-              rm -f "$raw" "$err"
-              return 1
-            fi
-            rm -f "$raw" "$err"
-          }
-
-          LIVE=$(mktemp)
-          TIMELINE=$(mktemp)
-          COMMENTS=$(mktemp)
-          cleanup_reconcile() { rm -f "$LIVE" "$TIMELINE" "$COMMENTS"; }
-          trap cleanup_reconcile EXIT
-
-          if ! read_live_pr "$LIVE"; then
-            exit 0
-          fi
-          LIVE_HEAD=$(jq -r '.head_sha' "$LIVE")
-          LIVE_BASE=$(jq -r '.base_sha' "$LIVE")
-          if [ "$LIVE_HEAD" != "$EXPECTED_HEAD_SHA" ] || [ "$LIVE_BASE" != "$EXPECTED_BASE_SHA" ]; then
-            echo "::warning::PR head/base moved from $EXPECTED_HEAD_SHA/$EXPECTED_BASE_SHA to $LIVE_HEAD/$LIVE_BASE during classification; preserving needs-external-review." >&2
-            exit 0
-          fi
-          if ! jq -e '.labels | index("needs-external-review") != null' "$LIVE" >/dev/null; then
-            echo "needs-external-review is already absent; nothing to reconcile."
-            exit 0
-          fi
-
-          if ! fetch_array "repos/$REPO/issues/$PR_NUMBER/timeline" "$TIMELINE" \
-             || ! fetch_array "repos/$REPO/issues/$PR_NUMBER/comments" "$COMMENTS"; then
-            exit 0
-          fi
-          LATEST=$(jq -c '
-            [ .[]
-              | select((.event == "labeled" or .event == "unlabeled")
-                       and .label.name == "needs-external-review") ]
-            | sort_by(.created_at, .id) | last // null
-          ' "$TIMELINE")
-          if ! jq -e '.event == "labeled" and .actor.login == "github-actions[bot]"' \
-               <<<"$LATEST" >/dev/null; then
-            echo "Latest needs-external-review timeline event is not a github-actions label application; preserving it."
-            exit 0
-          fi
-          LABEL_EVENT_ID=$(jq -r '.id' <<<"$LATEST")
-          LABEL_EVENT_TIME=$(jq -r '.created_at' <<<"$LATEST")
-
-          # New applications carry an exact-head marker as the first line of
-          # the application envelope. Legacy applications are admitted only
-          # when the complete body matches one of the historical fail-closed
-          # templates. A title or reason substring can be supplied by an
-          # ordinary protected-path filename, so neither proves ownership.
-          OWNER_COMMENT=$(jq -c --arg applied "$LABEL_EVENT_TIME" --arg head "$EXPECTED_HEAD_SHA" '
-            def application_prefix:
-              "**External Review Required**\n\n"
-              + "This PR has been labeled `needs-external-review` based on .github/review-policy.yml:\n\n";
-            def application_suffix:
-              "\n\nPer REVIEW_POLICY.md, the authoring agent must post a handoff message and alert the human. "
-              + "The human will coordinate external review by a different agent.\n\n"
-              + "> Automated check per .github/review-policy.yml";
-            def application_body($reason):
-              application_prefix + $reason + application_suffix;
-            def legacy_body:
-              . == application_body("- Could not fetch PR files for external-review fingerprint; requiring review fail-closed")
-              or . == application_body("- Could not materialize the PR base tree for the external-review calculation; requiring review fail-closed")
-              or . == application_body("- No trusted review-policy.yml on the PR base or the default branch; requiring review fail-closed")
-              or . == application_body("- Trusted external-review fingerprint helper is unavailable on the PR base and the default branch; requiring review fail-closed")
-              or . == application_body("- External-review fingerprint helper failed; requiring review fail-closed");
-            def marked_body($expected_head):
-              ("<!-- mergepath-external-review-label:v1 head=" + $expected_head
-               + " cause=fail-closed -->\n" + application_prefix) as $prefix
-              | . as $body
-              | ($body | startswith($prefix))
-                and ($body | endswith(application_suffix))
-                and (($body | ltrimstr($prefix) | rtrimstr(application_suffix))
-                     | test("^- [^\\n]+; requiring review fail-closed$"));
-            ($applied | fromdateiso8601) as $at
-            | [ .[]
-                | select(.user.login == "github-actions[bot]")
-                | select((.created_at | fromdateiso8601) >= $at
-                         and (.created_at | fromdateiso8601) <= ($at + 300))
-                | select(.body | legacy_body or marked_body($head)) ]
-            | sort_by(.created_at, .id) | first // null
-          ' "$COMMENTS")
-          if [ "$OWNER_COMMENT" = null ]; then
-            echo "No adjacent github-actions fail-closed application comment proves ownership; preserving needs-external-review."
-            exit 0
-          fi
-          # Close the read/delete race as far as the API permits: repeat both
-          # mutable facts immediately before deletion. A human re-application,
-          # an unlinking event, a head/base move, or any read failure holds the label.
-          if ! fetch_array "repos/$REPO/issues/$PR_NUMBER/timeline" "$TIMELINE"; then
-            exit 0
-          fi
-          LATEST_AGAIN=$(jq -c '
-            [ .[]
-              | select((.event == "labeled" or .event == "unlabeled")
-                       and .label.name == "needs-external-review") ]
-            | sort_by(.created_at, .id) | last // null
-          ' "$TIMELINE")
-          if ! read_live_pr "$LIVE"; then
-            exit 0
-          fi
-          if [ "$(jq -r '.id // ""' <<<"$LATEST_AGAIN")" != "$LABEL_EVENT_ID" ] \
-             || [ "$(jq -r '.event // ""' <<<"$LATEST_AGAIN")" != labeled ] \
-             || [ "$(jq -r '.actor.login // ""' <<<"$LATEST_AGAIN")" != 'github-actions[bot]' ] \
-             || [ "$(jq -r '.head_sha' "$LIVE")" != "$EXPECTED_HEAD_SHA" ] \
-             || [ "$(jq -r '.base_sha' "$LIVE")" != "$EXPECTED_BASE_SHA" ] \
-             || ! jq -e '.labels | index("needs-external-review") != null' "$LIVE" >/dev/null; then
-            echo "::warning::PR head, base, label, or ownership changed during reconciliation; preserving needs-external-review." >&2
-            exit 0
-          fi
-          if [ -z "$LABEL_REMOVAL_TOKEN" ]; then
-            echo "::warning::Label-removal token is unavailable; preserving needs-external-review." >&2
-            exit 0
-          fi
-          if ! GH_TOKEN="$LABEL_REMOVAL_TOKEN" gh api -X DELETE \
-            "repos/$REPO/issues/$PR_NUMBER/labels/needs-external-review"; then
-            echo "::warning::Could not remove needs-external-review; preserving the label for Label Gate." >&2
-            exit 0
-          fi
-          echo "Removed workflow-owned fail-closed needs-external-review after a trusted no-review classification."
-
-      - name: Propagation PR review lane
-        if: steps.check.outputs.propagation_lane == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # #620 (Codex r6): the needs-external-review removal below must fire
-          # agent-review.yml's `unlabeled` settle re-arm, and GITHUB_TOKEN-driven
-          # events create no workflow runs (the #315/#324 auto-clear lesson) —
-          # a GITHUB_TOKEN removal here leaves an approved, settled PR
-          # CLEAN-but-unmerged. The PAT is scoped to the two commands that must
-          # create workflow runs GITHUB_TOKEN cannot: the label removal below,
-          # and the #658 merge-clearance-recheck repository_dispatch. The
-          # lane-marker diagnostic stays on GITHUB_TOKEN; its authorship grants
-          # no clearance and its publication fires no run. The PAT dispatch nudges
-          # merge-clearance-gate. Every other command keeps the restricted
-          # default token.
-          LABEL_REMOVAL_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          # Embedded in the diagnostic marker to report the checked pair.
-          # Consumers independently verify their live head/base pair; this
-          # snapshot cannot authorize an exemption after a push or retarget.
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          # Recognized propagation PR (see REVIEW_POLICY.md § Propagation
-          # PR review lane): the check step VERIFIED it is a byte-for-byte
-          # faithful mirror of mergepath@<sha> — every changed file
-          # byte-matches mergepath's content under a manifest path, as
-          # independently confirmed by the trusted live verifier at use time.
-          # It is exempt from the Phase 4 external-review requirement —
-          # but still subject to CI green, CodeRabbit advisory review,
-          # and an internal reviewer-identity APPROVED (the standard
-          # under-threshold path).
-          #
-          # Post a head/base-pinned diagnostic marker once per verified pair.
-          # Actions-bot authorship alone is not proof of this workflow's origin.
-          # Clearance and triage consumers independently verify the live pair
-          # with their trusted base-checkout verifier and governing policy;
-          # copied markers, old pairs and label events grant no exemption.
-          # Keep the v2 diagnostic shape in sync with its reporting consumers.
-          # A dispatch after publication schedules another live verification;
-          # neither the marker nor that dispatch supplies clearance authority.
-          fence_event_pair() { # <operation-description>
-            local operation=$1 pair live_head live_base
-            if ! pair=$(gh api \
-              "repos/${{ github.repository }}/pulls/$PR_NUMBER" \
-              --jq '{head:.head.sha,base:.base.sha}'); then
-              echo "::error::Could not read the live PR head/base before $operation." >&2
-              exit 1
-            fi
-            if ! jq -e '
-                select((.head | type) == "string" and (.head | test("^[0-9a-fA-F]{40}$")))
-                | select((.base | type) == "string" and (.base | test("^[0-9a-fA-F]{40}$")))
-              ' <<<"$pair" >/dev/null; then
-              echo "::error::Live PR head/base is malformed; refusing $operation." >&2
-              exit 1
-            fi
-            live_head=$(jq -r '.head' <<<"$pair")
-            live_base=$(jq -r '.base' <<<"$pair")
-            if [ "$live_head" != "$HEAD_SHA" ] || [ "$live_base" != "$BASE_SHA" ]; then
-              echo "PR head/base moved from $HEAD_SHA/$BASE_SHA to $live_head/$live_base; refusing stale $operation."
-              exit 0
-            fi
-          }
-
-          MARKER="<!-- mergepath-propagation-lane:v2 verified-head=$HEAD_SHA verified-base=$BASE_SHA -->"
-          ALREADY=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json comments --jq '.comments[].body' | grep -F "$MARKER" || true)
-          if [ -z "$ALREADY" ]; then
-            # Fence the complete event pair before publishing its diagnostic
-            # marker. Receivers independently verify the live pair.
-            fence_event_pair "publishing verified-propagation diagnostics"
-            gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body "$(cat <<EOF
-          $MARKER
-          **Propagation PR review lane** — verified faithful mirror ✅ (head \`$HEAD_SHA\`, base \`$BASE_SHA\`)
-
-          This PR was checked out against \`mergepath\` at the source commit named in its branch and **verified byte-for-byte at this head/base pair**: every changed file is under a \`.mergepath-sync.yml\` path AND matches \`mergepath@<sha>\`'s content (\`scripts/workflow/verify-propagation-pr.sh\`). Its content was already reviewed in the upstream mergepath PR(s). Per REVIEW_POLICY.md § Propagation PR review lane it is **exempt from the Phase 4 external-review requirement**.
-
-          This marker is diagnostic; clearance consumers independently verify their live head/base pair.
-
-          It is still subject to: CI green, CodeRabbit advisory review, and an internal reviewer-identity \`APPROVED\` — the standard under-threshold path. Merge as the author once those clear.
-
-          > Automated check per .github/review-policy.yml
-          EOF
-          )"
-            # #658: the marker just posted is a GITHUB_TOKEN github-actions[bot]
-            # issue comment, and GITHUB_TOKEN-authored events create no workflow
-            # runs — so merge-clearance-gate.yml cannot re-run via issue_comment
-            # for this freshly verified head. Nudge it directly with a
-            # repository_dispatch (its `merge-clearance-recheck` trigger) so a
-            # verified sync PR clears the Merge clearance gate promptly instead
-            # of waiting for the scheduled sweep (up to 30 min since #2167). PAT-driven: the
-            # workflow token is contents:read (cannot POST /dispatches), and
-            # keeping the dispatch on the PAT avoids widening the GITHUB_TOKEN
-            # scope. Best-effort — the gate independently byte-verifies its live
-            # head/base pair and never trusts the marker or dispatch payload,
-            # so on any failure the scheduled sweep still recovers the gate; a failed
-            # dispatch must never fail the lane. Keep the event type in sync with
-            # merge-clearance-gate.yml's repository_dispatch trigger.
-            GH_TOKEN="$LABEL_REMOVAL_TOKEN" gh api -X POST \
-              "repos/${{ github.repository }}/dispatches" \
-              -f event_type=merge-clearance-recheck \
-              -F "client_payload[pr]=$PR_NUMBER" \
-              || echo "note: merge-clearance-recheck dispatch failed (#658); the scheduled sweep will recover the Merge clearance gate."
-          fi
-
-          # If a prior run (or a stale label-prefixed edit) applied
-          # needs-external-review before this PR qualified, remove it so
-          # the Label Gate stops blocking. The workflow REMOVING a label
-          # it is responsible for applying is not an agent override — the
-          # human-action-label prohibition (REVIEW_POLICY.md § Agent
-          # prohibitions) is about agents clearing labels, not about the
-          # policy automation reconciling its own decision. This lane is
-          # a sanctioned automation alongside auto-clear-blocking-labels.yml.
-          # Runs AFTER the marker post above — see ORDER MATTERS.
-          EXISTING=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '.labels[].name' | grep '^needs-external-review$' || true)
-          if [ -n "$EXISTING" ]; then
-            # Repeat the event-pair fence immediately before deletion: marker
-            # publication and dispatch above can take long enough for the PR to
-            # move again. This bounds both authority writes without claiming an
-            # atomic read-to-write guarantee.
-            fence_event_pair "removing needs-external-review for verified propagation"
-
-            # PAT-driven so the removal fires the #620 unlabeled settle
-            # re-arm (see LABEL_REMOVAL_TOKEN above).
-            GH_TOKEN="$LABEL_REMOVAL_TOKEN" gh pr edit "$PR_NUMBER" --remove-label "needs-external-review" \
-              --repo "${{ github.repository }}"
-            echo "Removed needs-external-review — PR qualifies for the propagation review lane."
-          fi
-
-      - name: Dependabot action-pin bump lane
-        if: steps.check.outputs.dependabot_pin_bump == 'true'
-        env:
-          # Diagnostic only: this step writes one github-actions[bot] marker
-          # comment per verified head/base pair and nothing else. It removes
-          # no label (auto-clear-blocking-labels.yml owns that, on a trusted
-          # trigger, against the live pair) and it grants no clearance — the
-          # Merge clearance gate judges a Dependabot PR by its own provenance
-          # arm. A copied marker, an old pair, or a bot byline exempts nothing.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          EVIDENCE: ${{ steps.check.outputs.dependabot_pin_bump_evidence }}
-        run: |
-          set -euo pipefail
-          MARKER="<!-- mergepath-dependabot-pin-bump:v1 verified-head=$HEAD_SHA verified-base=$BASE_SHA -->"
-          # Paginated read: a long-lived PR's comments routinely exceed one page.
-          ALREADY=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" --jq '.[].body' | grep -F "$MARKER" || true)
-          if [ -n "$ALREADY" ]; then
-            echo "Diagnostic marker already posted for head $HEAD_SHA / base $BASE_SHA; nothing to do."
-            exit 0
-          fi
-          # Fence the event pair against the live PR before publishing. An
-          # unreadable or malformed pair fails this step closed; a confirmed
-          # move is a successful stale-run no-op.
-          if ! LIVE_PAIR=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '{head:.head.sha,base:.base.sha}'); then
-            echo "::error::Could not read the live PR head/base before publishing the pin-bump marker." >&2
-            exit 1
-          fi
-          if ! jq -e '
-              select((.head | type) == "string" and (.head | test("^[0-9a-fA-F]{40}$")))
-              | select((.base | type) == "string" and (.base | test("^[0-9a-fA-F]{40}$")))
-            ' <<<"$LIVE_PAIR" >/dev/null; then
-            echo "::error::Live PR head/base is malformed; refusing to publish the pin-bump marker." >&2
-            exit 1
-          fi
-          if [ "$(jq -r '.head' <<<"$LIVE_PAIR")" != "$HEAD_SHA" ] || [ "$(jq -r '.base' <<<"$LIVE_PAIR")" != "$BASE_SHA" ]; then
-            echo "PR head/base moved from $HEAD_SHA/$BASE_SHA; skipping the stale pin-bump marker."
-            exit 0
-          fi
-          if ! jq -e '.exempt == true and (.provenance | type) == "string" and (.files | type) == "array"' <<<"$EVIDENCE" >/dev/null; then
-            echo "::error::Pin-bump evidence from the check step is malformed; refusing to publish a marker." >&2
-            exit 1
-          fi
-          BODY=$(mktemp)
-          {
-            printf '%s\n' "$MARKER"
-            printf '**Dependabot action-pin bump lane** — verified pin-only bump ✅ (head `%s`, base `%s`)\n\n' "$HEAD_SHA" "$BASE_SHA"
-            printf 'This Dependabot PR touches `.github/workflows/` only through action pins, so it is **exempt from the `.github/**` protected-path external-review rule** (REVIEW_POLICY.md § Dependabot action-pin bump lane) and is not labeled `needs-external-review`. Proven at this head/base pair by the trusted `scripts/workflow/dependabot_pin_bump_exemption.sh`:\n\n'
-            printf -- '- Commit provenance: %s\n' "$(jq -r '.provenance' <<<"$EVIDENCE")"
-            printf -- '- Diff shape: %s action pin line(s) across %s workflow file(s); every changed line is a `uses:` ref or its pin comment, and nothing else changed\n' "$(jq -r '.pins' <<<"$EVIDENCE")" "$(jq -r '.files | length' <<<"$EVIDENCE")"
-            jq -r '.files[] | "  - `\(.filename)`: \(.pins) pin line(s)"' <<<"$EVIDENCE"
-            printf '\nThis marker is diagnostic. Any other change under `.github/**`, a commit not produced by Dependabot, or a new head re-enters the ordinary protected-path review. The PR still needs CI green and the Dependabot reviewer-identity `APPROVED` on this head (Merge clearance gate).\n\n> Automated check per .github/review-policy.yml\n'
-          } >"$BODY"
-          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$BODY"
-          rm -f "$BODY"
