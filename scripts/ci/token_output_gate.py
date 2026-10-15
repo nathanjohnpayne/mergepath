@@ -148,8 +148,10 @@ The marker exempts references on its physical source line or in the same
 continued executable segment carrying the comment. It never exempts sibling
 or nested segments on another physical line just because they share a
 LogicalLine. Child source coordinates are remapped without inheriting an
-ancestor's claim; a quoted/deferred program retains its existing one-hop and
-claimed-command policy.
+ancestor's claim. Deferred start-line claims also require the same existing
+parent scope, while exact-owner claims retain continued commands. Direct trace
+flags stay within their existing child scope; a quoted/deferred program retains
+its existing one-hop and claimed-command policy.
 
 The marker counts ONLY inside a real shell comment -- a `#` that is unquoted,
 unescaped, word-initial, and at parameter-expansion nesting depth zero.  #1012
@@ -4901,6 +4903,9 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
             )
         exempt_lines = {lno for lno, _seg, _reason in ll.pragma_reasons}
         exempt_segments = {seg for _lno, seg, _reason in ll.pragma_reasons}
+        exempt_deferred_sites = {
+            (lno, owner.parent) for lno, owner, _reason in ll.pragma_reasons
+        }
         # xtrace is shell STATE and it changes WITHIN a logical line as well
         # as between them: `( set -x; : "$GH_TOKEN" )` is one line whose
         # second segment runs traced.  So the state is resolved per SEGMENT,
@@ -4921,6 +4926,7 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
         xtrace_at = {}
         effective_xtrace_at = {}
         effective_xtrace_scopes = {None: effective_xtrace}
+        ordinary_xtrace_scopes = {None: xtrace}
         state = xtrace
         # `state` grades the segments of THIS line, including the ones inside a
         # subshell -- `( set -x; : "$PAT" )` really is traced.  `outer` is what
@@ -4939,6 +4945,13 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
             while parent is not None:
                 scopes.append(parent.sid)
                 parent = parent.parent
+            # Direct flags inherit their enclosing shell, not a completed
+            # command/process substitution or sibling subshell.
+            state = next(
+                ordinary_xtrace_scopes[scope]
+                for scope in scopes[1:] + [None]
+                if scope in ordinary_xtrace_scopes
+            )
             xtrace_at[seg.sid] = state or any(
                 scope in deferred_xtrace_scopes for scope in scopes
             )
@@ -4953,18 +4966,21 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
             st = _segment_sets_xtrace(seg)
             if st is True:
                 effective_xtrace_scopes[current_scope] = True
+                ordinary_xtrace_scopes[current_scope] = True
                 state = True
-                if not seg.parent_is_subshell:
+                if seg.parent is None:
                     outer = True
             elif st is False and line_delta is False:
                 effective_xtrace_scopes[current_scope] = False
+                ordinary_xtrace_scopes[current_scope] = False
                 state = False
-                if not seg.parent_is_subshell:
+                if seg.parent is None:
                     outer = False
             # The same bounded extractor/enable predicate used below must
             # contribute before later segments consume this map. This retains
             # written enable evidence, not a claim that a trap/callback ran.
-            if (seg.line not in exempt_lines and seg not in exempt_segments
+            if ((seg.line, seg.parent) not in exempt_deferred_sites
+                    and seg not in exempt_segments
                     and _depth < _DEFERRED_SHELL_DEPTH):
                 deferred_operands = _deferred_shell_operands(seg)
                 if any(_text_enables_xtrace(inner, outer_only=True)
@@ -4991,7 +5007,8 @@ def scan_text(text, path="<text>", _depth=0, _initial_xtrace=False):
                 findings.append(Finding(path, ref.line, ref.name, why))
         if _depth < _DEFERRED_SHELL_DEPTH:
             for seg in ll.segments:
-                if seg.line in exempt_lines or seg in exempt_segments:
+                if ((seg.line, seg.parent) in exempt_deferred_sites
+                        or seg in exempt_segments):
                     continue  # Keep claimed deferred commands' existing policy.
                 for inner in _deferred_shell_operands(seg):
                     sub, sub_errors = scan_text(
@@ -11265,6 +11282,8 @@ CORPUS = [
     ('pragma-b9-final-C-discards-enable', MUST_NOT_FLAG, '(\ntrue # TOKEN_OUTPUT_EXEMPT: unrelated physical line\nmapfile -C \'set -x\' -C \':\' -c 1 items <<< x\neval \': "$GH_TOKEN"\'\n)\n'),
     ('pragma-b9-final-C-retains-enable', MUST_FLAG, '(\ntrue # TOKEN_OUTPUT_EXEMPT: unrelated physical line\nmapfile -C \':\' -C \'set -x\' -c 1 items <<< x\neval \': "$GH_TOKEN"\'\n)\n'),
     ('pragma-b9-quoted-marker-retains-deferred', MUST_FLAG, '(\n: \'# TOKEN_OUTPUT_EXEMPT: quoted data\'\nset -x\neval \': "$GH_TOKEN"\'\n)\n'),
+    ('pragma-review-child-foreign-deferred-owner', MUST_FLAG, 'eval "$(true # TOKEN_OUTPUT_EXEMPT: child only\n)" \'echo "$GH_TOKEN"\''),
+    ('pragma-review-child-direct-xtrace-isolation', MUST_NOT_FLAG, 'echo "$(set -x # TOKEN_OUTPUT_EXEMPT: child only\ntrue\n)"; : "$GH_TOKEN"'),
 ]
 
 CORPUS.extend([
@@ -15503,6 +15522,37 @@ def _pragma_cases():
                 "pragma %s: a pragma WITH a reason was rejected (%s)"
                 % (cid, pragma_errors)
             )
+    # These harmless programs are parsed only. Preserve same-parent line
+    # siblings and exact continued owners while distinguishing a child claim.
+    for cid, body, continued, foreign_parent in [
+        ("deferred-same-parent-siblings",
+         "eval ':'; true # TOKEN_OUTPUT_EXEMPT: parser owner\n", False, False),
+        ("deferred-nested-same-parent-siblings",
+         "(\neval ':'; true # TOKEN_OUTPUT_EXEMPT: parser owner\n)\n",
+         False, False),
+        ("deferred-continued-owner",
+         "eval \\\n ':' # TOKEN_OUTPUT_EXEMPT: parser owner\n", True, False),
+        ("deferred-child-foreign-parent",
+         "eval \"$(true # TOKEN_OUTPUT_EXEMPT: parser child\n)\" ':'\n",
+         False, True),
+    ]:
+        lx = Lexer(body)
+        owners = [item for ll in lx.logical for item in ll.pragma_reasons]
+        deferred = [seg for ll in lx.logical for seg in ll.segments
+                    if _deferred_shell_operands(seg)]
+        if len(owners) != 1 or len(deferred) != 1:
+            failures.append("pragma %s: lost parser owner or deferred segment" % cid)
+            continue
+        lno, owner, _reason = owners[0]
+        seg = deferred[0]
+        if continued:
+            good = owner is seg and lno > seg.line
+        elif foreign_parent:
+            good = owner is not seg and lno == seg.line and owner.parent is not seg.parent
+        else:
+            good = owner is not seg and lno == seg.line and owner.parent is seg.parent
+        if not good:
+            failures.append("pragma %s: wrong physical-line/parent/continued owner" % cid)
     return failures
 
 
