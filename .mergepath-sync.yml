@@ -865,6 +865,14 @@ paths:
       - "scripts/lib/blocking-labels.sh"   # #1277, holds apply before clearance exemptions
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
       - "scripts/lib/dependabot-commit-provenance.sh"   # Dependabot arm requires Dependabot-only commits
+  - path: scripts/gate-api-lineage-blocking.sh
+    # #2247: the event-driven Merge clearance gate job runs it from the
+    # trusted checkout before concluding its job-native run non-failing while
+    # clearance is pending. Absent, that step leaves the native run failing
+    # (the pre-#2247 behaviour), so it degrades safely, but it must travel
+    # with the workflow for the fix to reach a consumer.
+    type: canonical
+    consumers: all
   - path: scripts/daily-feedback-rollup.sh
     # Cron workhorse invoked by .github/workflows/daily-feedback-rollup.yml.
     # Sources scripts/lib/daily-feedback-rollup-helpers.sh. The
@@ -1551,6 +1559,7 @@ paths:
       - "scripts/ci/check_merge_clearance_gate"
       - ".github/workflows/pr-review-policy.yml"  # #1249 sibling fixture
       - "scripts/merge-clearance-gate.sh"
+      - "scripts/gate-api-lineage-blocking.sh"   # #2247 Test 30 drives the helper
       # Test 22's positive controls are EXTRACTED from the workflow (#849), so
       # the test reads it directly at runtime. Without this edge the closure
       # gate could ship the test to a consumer whose workflow predates the
@@ -2260,6 +2269,7 @@ paths:
     requires:
       - "scripts/merge-clearance-gate.sh"
       - "scripts/codex-review-check.sh"
+      - "scripts/gate-api-lineage-blocking.sh"   # #2247 pending arm of the native conclusion
   - path: .github/workflows/required-check-publisher.yml
     type: canonical
     consumers: all
@@ -2470,6 +2480,7 @@ paths:
       - "scripts/coderabbit-severity-gate.sh"  # check_coderabbit_severity_gate (#577)
       - "scripts/lib/feedback-policy-helpers.sh"  # check_feedback_policy_helpers + both severity gates source it (#576/#577)
       - "scripts/merge-clearance-gate.sh"      # check_merge_clearance_gate
+      - "scripts/gate-api-lineage-blocking.sh"   # check_merge_clearance_gate (#2247 pending-arm helper)
       - "scripts/codex-review-request.sh"      # check_codex_scripts
       - "scripts/codex-review-check.sh"        # check_codex_scripts, check_canonical_bugs_263caf3
       - "scripts/codex-record-feedback.sh"     # check_codex_scripts (#487)

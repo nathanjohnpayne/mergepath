@@ -121,6 +121,20 @@
 #   1   Clearance NOT satisfied on the current HEAD — gate BLOCKS.
 #   2   Usage / config / infrastructure error. Message on stderr.
 #
+# Pending verdict (#2247). Exit 1 covers two different states: a real block
+# (a human-controlled hold, a Dependabot head without a reviewer approval, a
+# Dependabot auto-merge request armed for an earlier head) and external review
+# that simply has not cleared yet. Every caller keeps treating both as exit 1.
+# A caller that needs to tell them apart sets MERGEPATH_GATE_VERDICT_FILE to a
+# path it owns, and the script writes exactly `pending` there, and nothing
+# else, from the one site where external review applies, is derived without a
+# fail-closed fallback, and codex-review-check.sh answered "not cleared" (rc
+# 1). Every other exit leaves the file untouched, so an absent, empty or
+# different file means "not pending" and the caller must fail as before. The
+# exit code and stdout are byte-identical with or without the variable.
+# Only the event-driven job of merge-clearance-gate.yml reads it, to keep its
+# job-native run non-failing while the Checks-API lineage carries the block.
+#
 # Design notes:
 #   - Read-only. Only GETs against the GitHub API (plus a read-only
 #     delegate to codex-review-check.sh on the external-review path).
@@ -354,6 +368,18 @@ block() {  # <reason>
   echo "Merge clearance: BLOCKED — $*"
   echo ""
   exit 1
+}
+
+# #2247: the explicit pending verdict. Same exit code and the same stdout as
+# block(), so no caller that does not ask for the distinction can see one; the
+# distinction exists only in MERGEPATH_GATE_VERDICT_FILE (see Exit codes
+# above). A failed write is ignored on purpose: the caller then reads no
+# `pending` and fails closed, which is the pre-#2247 behaviour.
+block_pending() {  # <reason>
+  if [ -n "${MERGEPATH_GATE_VERDICT_FILE:-}" ]; then
+    printf 'pending\n' 2>/dev/null >"$MERGEPATH_GATE_VERDICT_FILE" || true
+  fi
+  block "$@"
 }
 
 clear_pass() {  # <reason>
@@ -1228,6 +1254,10 @@ fi
 if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$PHASE_4_DERIVE_ONLY" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; then
   REQUIRES_EXTERNAL=false
   REQUIRES_REASON=""
+  # #2247: set where applicability is forced on because the derivation could
+  # not run. A not-cleared verdict reached through it is not reported as
+  # pending: the gate does not know whether external review applies at all.
+  REQUIRES_FAIL_CLOSED=false
 
   if [ "$HAS_EXTERNAL_LABEL" = "true" ]; then
     # Label present forces the arm on (a human may add it to a small PR;
@@ -1323,6 +1353,7 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$PHASE_4_DERIVE_ONLY" = "true" ] 
       if [ ! -f "$PARSE" ] || [ ! -f "$MATCH" ]; then
         REQUIRES_EXTERNAL=true
         REQUIRES_REASON="protected-paths check unavailable (parser/matcher missing under $WF_DIR) — failing closed"
+        REQUIRES_FAIL_CLOSED=true
       else
         set +e
         PATHS=$(bash "$PARSE" "$POLICY_CONFIG" external_review_paths)
@@ -1331,6 +1362,7 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$PHASE_4_DERIVE_ONLY" = "true" ] 
         if [ "$parse_rc" -ne 0 ]; then
           REQUIRES_EXTERNAL=true
           REQUIRES_REASON="protected-paths parse failed (rc=$parse_rc) — failing closed"
+          REQUIRES_FAIL_CLOSED=true
         elif [ -n "$PATHS" ]; then
           PATTERNS=()
           while IFS= read -r pline; do
@@ -1352,6 +1384,7 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$PHASE_4_DERIVE_ONLY" = "true" ] 
             if [ "$match_rc" -ne 0 ]; then
               REQUIRES_EXTERNAL=true
               REQUIRES_REASON="protected-paths match failed (rc=$match_rc) — failing closed"
+              REQUIRES_FAIL_CLOSED=true
             elif [ -n "$MATCHED" ]; then
               REQUIRES_EXTERNAL=true
               REQUIRES_REASON="protected paths modified: $(printf '%s' "$MATCHED" | tr '\n' ' ')"
@@ -1453,7 +1486,16 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$PHASE_4_DERIVE_ONLY" = "true" ] 
     set -e
     case "$crc" in
       0) clear_pass "external review cleared on HEAD $HEAD_SHA ($REQUIRES_REASON; reviewer APPROVED + Codex/Phase-4b on HEAD)" ;;
-      1) block "external review is NOT cleared on the merge HEAD $HEAD_SHA ($REQUIRES_REASON; no APPROVED CLI review and/or no Codex clearance on this HEAD). See codex-review-check.sh stderr above (mergepath#428)." ;;
+      1)
+        # The only reason this gate is not green is that clearance has not
+        # been reached yet, so it is the pending verdict (#2247)—unless
+        # applicability itself was a fail-closed fallback, which stays a
+        # plain block.
+        if [ "$REQUIRES_FAIL_CLOSED" = "true" ]; then
+          block "external review is NOT cleared on the merge HEAD $HEAD_SHA ($REQUIRES_REASON; no APPROVED CLI review and/or no Codex clearance on this HEAD). See codex-review-check.sh stderr above (mergepath#428)."
+        fi
+        block_pending "external review is NOT cleared on the merge HEAD $HEAD_SHA ($REQUIRES_REASON; no APPROVED CLI review and/or no Codex clearance on this HEAD). See codex-review-check.sh stderr above (mergepath#428)."
+        ;;
       *) die 2 "codex-review-check.sh returned rc=$crc (config/infrastructure error) on PR #$PR_NUMBER" ;;
     esac
   fi
