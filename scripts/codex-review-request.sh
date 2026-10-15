@@ -871,6 +871,14 @@ derive_phase_4a_gate() {
     phase_4a_gate_failsafe "the PR file list is not an array of file entries with filename, additions and deletions"
     return 0
   fi
+  # The matcher reads one path per line, so a name containing a newline would
+  # reach it as two harmless-looking paths (CodeRabbit on #2258): unreadable.
+  if ! printf '%s' "$files_json" | jq -e '
+      all(.[]; ((.filename | test("\n")) | not)
+        and ((.previous_filename == null) or ((.previous_filename | test("\n")) | not)))' >/dev/null 2>&1; then
+    phase_4a_gate_failsafe "a changed file name contains a newline, which the line-based path matcher cannot read"
+    return 0
+  fi
   files_count=$(printf '%s' "$files_json" | jq 'length') || files_count=""
   if ! [[ "$files_count" =~ ^[0-9]+$ ]] || ! [[ "$changed_files" =~ ^[0-9]+$ ]]; then
     phase_4a_gate_failsafe "could not count the PR files"

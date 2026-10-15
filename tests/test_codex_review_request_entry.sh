@@ -189,7 +189,10 @@ case "$endpoint" in
       exit 1
     fi
     default_files='[{"filename":"src/app.ts","additions":10,"deletions":2}]'
-    printf '%s\n' "${CODEX_TEST_FILES_JSON:-$default_files}" ;;
+    # A list too large for one environment variable (Linux caps a single
+    # env string at 128 KiB) comes from a file instead.
+    if [ -n "${CODEX_TEST_FILES_JSON_FILE:-}" ]; then cat "$CODEX_TEST_FILES_JSON_FILE"
+    else printf '%s\n' "${CODEX_TEST_FILES_JSON:-$default_files}"; fi ;;
   'repos/owner/repo/contents/scripts/workflow/external_review_fingerprint.sh?ref=base-sha')
     # #2257: the fingerprint helper at the base, for its EXCLUDE_RE constant.
     case "${CODEX_TEST_BASE_HELPER:-ok}" in
@@ -704,7 +707,8 @@ test_derive_signals() {
   assert_derived_skip "a null external_review_paths" "$dir" "$rc"
   # GitHub's 3000-file cap is gated outright.
   dir=$(derive_case files-cap)
-  rc=$(CODEX_TEST_PR_CHANGED_FILES=3000 CODEX_TEST_FILES_JSON="$(jq -cn '[range(3000) | {filename: "f\(.).txt", additions: 0, deletions: 0}]')" run_case "$dir" false)
+  jq -cn '[range(3000) | {filename: "f\(.).txt", additions: 0, deletions: 0}]' >"$dir/state/files-3000.json"
+  rc=$(CODEX_TEST_PR_CHANGED_FILES=3000 CODEX_TEST_FILES_JSON_FILE="$dir/state/files-3000.json" run_case "$dir" false)
   assert_derived_request "a file list at the 3000-file cap" "$dir" "$rc" "at GitHub's 3000-file cap"
   # An explicit request_by_default: false derives the same way.
   dir=$(make_case "derive-explicit-false" "  enabled: true"$'\n'"  request_by_default: false")
@@ -745,6 +749,10 @@ test_derive_failsafe() {
   dir=$(derive_case files-short)
   rc=$(CODEX_TEST_PR_CHANGED_FILES=2 run_case "$dir" false)
   assert_failsafe_request "a file list shorter than changed_files" "$dir" "$rc" "has 1 entries but the PR reports 2 changed files"
+  # A newline inside a name would reach the line-based matcher as two paths.
+  dir=$(derive_case files-newline 'external_review_paths:'$'\n''  - "src/auth/*.ts"')
+  rc=$(CODEX_TEST_FILES_JSON='[{"filename":"src/auth/secret\n.ts","additions":1,"deletions":0}]' run_case "$dir" false)
+  assert_failsafe_request "a file name containing a newline" "$dir" "$rc" "contains a newline"
   dir=$(derive_case files-shape)
   rc=$(CODEX_TEST_FILES_JSON='[{"filename":"src/a.ts"}]' run_case "$dir" false)
   assert_failsafe_request "a file entry without line counts" "$dir" "$rc" "is not an array of file entries"
