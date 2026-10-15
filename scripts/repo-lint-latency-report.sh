@@ -62,6 +62,7 @@ else
 fi
 WINDOW_START_EPOCH=$((AS_OF_EPOCH - WINDOW_DAYS * 86400))
 WINDOW_START=$(jq -rn --argjson t "$WINDOW_START_EPOCH" '$t | strftime("%Y-%m-%dT%H:%M:%SZ")')
+AS_OF_BOUND=$(jq -rn --argjson t "$AS_OF_EPOCH" '$t | strftime("%Y-%m-%dT%H:%M:%SZ")')
 mkdir -p "$OUT_DIR"
 
 DATA="$OUT_DIR/runs.json"
@@ -110,10 +111,11 @@ else
   # The report is intentionally bounded to one Actions page. Using
   # --paginate and slicing afterward still downloads the repository's entire
   # workflow history before jq can apply LIMIT — minutes of needless API work.
-  # The server-side `created>=` filter bounds that page by time as well
-  # (#1062); window_runs below re-applies the same bound on created_at so the
-  # verdict never depends on the server honouring the filter.
-  if ! with_gh_retry gh api "repos/$REPO/actions/workflows/repo_lint.yml/runs?status=completed&per_page=$LIMIT&created=%3E%3D$WINDOW_START" --jq '.workflow_runs[]' \
+  # The server-side closed `created` range bounds that page by both the window
+  # start and the requested as-of instant (#1062, #1633); window_runs below
+  # re-applies both bounds on created_at so the verdict never depends on the
+  # server honouring the filter.
+  if ! with_gh_retry gh api "repos/$REPO/actions/workflows/repo_lint.yml/runs?status=completed&per_page=$LIMIT&created=$WINDOW_START..$AS_OF_BOUND" --jq '.workflow_runs[]' \
       | jq -s '.' > "$OUT_DIR/workflow-runs-raw.json"; then
     echo "repo-lint latency: could not fetch workflow runs" >&2
     exit 3
