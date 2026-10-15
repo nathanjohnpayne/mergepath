@@ -10,11 +10,11 @@
 # the tools are right, then runs scripts/agent-capability-probe.sh (which
 # caches its answer for `--check`) and prints a short summary on stdout, which
 # Claude Code adds to the session's context. Setup is bounded to 60 seconds
-# with `timeout` so the probe still fits the hook's 120-second timeout; a setup
-# that fails or times out is reported in the summary, and the probe runs
-# regardless. Where `timeout` is unavailable nothing could bound setup (one
-# download alone may take 300 seconds), so setup is skipped with a one-line
-# notice and the probe still runs.
+# and the probe uses the remaining time within the hook's 120-second limit,
+# leaving five seconds to print the summary. A setup or probe timeout is
+# reported through the existing summary path. The timeout executable may be
+# `timeout` or `gtimeout`; if neither exists, setup is skipped with a notice
+# and the probe keeps its existing unbounded behavior.
 #
 # It never fails the session: every path exits 0. A probe that cannot run is
 # reported in the summary, because a session that silently lacks the answer
@@ -24,9 +24,19 @@
 
 [ "${CLAUDE_CODE_REMOTE:-}" = "true" ] || exit 0
 
+# Keep this as a snapshot: assigning to SECONDS would reset Bash's timer.
+hook_started=$SECONDS
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PROBE="$ROOT/scripts/agent-capability-probe.sh"
 SETUP="$ROOT/scripts/cloud-setup.sh"
+
+timeout_bin=""
+if command -v timeout >/dev/null 2>&1; then
+  timeout_bin=timeout
+elif command -v gtimeout >/dev/null 2>&1; then
+  timeout_bin=gtimeout
+fi
 
 # The setup bound is 60 seconds. MERGEPATH_CLOUD_SETUP_TIMEOUT may lower it to a
 # whole number of seconds from 1 to 60; anything else keeps 60, so setup always
@@ -42,10 +52,10 @@ if [ -n "${MERGEPATH_CLOUD_SETUP_TIMEOUT:-}" ] && [ "$setup_bound" != "$MERGEPAT
 fi
 
 if [ -r "$SETUP" ]; then
-  if ! command -v timeout >/dev/null 2>&1; then
+  if [ -z "$timeout_bin" ]; then
     echo "mergepath cloud session: tool setup skipped because timeout is not available to bound it; run bash scripts/cloud-setup.sh by hand."
   # stderr is the setup's whole report; stdout is unused.
-  elif setup_log="$(timeout "$setup_bound" bash "$SETUP" 2>&1 >/dev/null)"; then
+  elif setup_log="$("$timeout_bin" "$setup_bound" bash "$SETUP" 2>&1 >/dev/null)"; then
     installed="$(printf '%s\n' "$setup_log" | sed -n 's/^cloud-setup: installed \([^ ]* [^ ]*\) .*/\1/p' | paste -sd, - | sed 's/,/, /g')"
     [ -z "$installed" ] || echo "mergepath cloud session: installed $installed (scripts/cloud-setup.sh)."
   else
@@ -58,7 +68,41 @@ if [ ! -x "$PROBE" ]; then
   exit 0
 fi
 
-result="$("$PROBE" --quiet 2>/dev/null)" || result=""
+probe_timeout=90
+probe_timeout_input="${MERGEPATH_CLOUD_PROBE_TIMEOUT:-}"
+probe_timeout_normalized="$probe_timeout_input"
+case "$probe_timeout_input" in
+  ''|*[!0-9]*) ;;
+  *)
+    # Cap input length before stripping zeroes, so hostile values cannot make
+    # normalization quadratic or consume the hook's remaining time.
+    if [ "${#probe_timeout_input}" -le 9 ]; then
+      while [ "${probe_timeout_normalized#0}" != "$probe_timeout_normalized" ]; do
+        probe_timeout_normalized="${probe_timeout_normalized#0}"
+      done
+      [ -n "$probe_timeout_normalized" ] || probe_timeout_normalized=0
+      case "$probe_timeout_normalized" in
+        [1-9]|[1-9][0-9]|10[0-9]|11[0-9]) probe_timeout="$probe_timeout_normalized" ;;
+      esac
+    else
+      probe_timeout_normalized=invalid-length
+    fi
+    ;;
+esac
+if [ -n "$probe_timeout_input" ] && [ "$probe_timeout" != "$probe_timeout_normalized" ]; then
+  echo "mergepath cloud session: MERGEPATH_CLOUD_PROBE_TIMEOUT must be a positive whole number below 120; using $probe_timeout."
+fi
+
+probe_elapsed=$((SECONDS - hook_started))
+probe_remaining=$((120 - probe_elapsed - 5))
+if [ -n "$timeout_bin" ] && [ "$probe_remaining" -gt 0 ]; then
+  [ "$probe_timeout" -le "$probe_remaining" ] || probe_timeout="$probe_remaining"
+  result="$("$timeout_bin" "$probe_timeout" "$PROBE" --quiet 2>/dev/null)" || result=""
+elif [ -n "$timeout_bin" ]; then
+  result=""
+else
+  result="$("$PROBE" --quiet 2>/dev/null)" || result=""
+fi
 if [ -z "$result" ] || ! printf '%s' "$result" | jq -e . >/dev/null 2>&1; then
   echo "mergepath cloud session: the capability probe did not produce a result; capabilities unknown. Run scripts/agent-capability-probe.sh to see why. See docs/agents/cloud-environments.md."
   exit 0
