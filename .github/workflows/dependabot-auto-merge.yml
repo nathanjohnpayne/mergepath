@@ -1,6 +1,14 @@
 name: Dependabot Auto-merge
 # Existing approval and merge duties use separate protected environments.
 # Only inert PR/full-head/base metadata crosses; the author repeats all gates.
+# Owner provisioning: store AUTHOR_MERGE_TOKEN only under
+# Settings → Environments → merge-queue-policy → Environment secrets,
+# never as a repository or organization secret. The protected environment
+# retains exactly AUTHOR_MERGE_TOKEN, MERGE_QUEUE_POLICY_TOKEN and
+# MERGE_QUEUE_SOURCE_TOKEN, pairwise distinct; the reviewer credential belongs
+# separately in reviewer-maintenance. Protect/read back before source activation;
+# provision afterward under the owner-run sequence. This workflow grants no
+# authority to create settings or enable a queue.
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]

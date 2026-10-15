@@ -24,6 +24,13 @@ spec_test_map:
   owner_admin_override: tests/test_owner_admin_override.py
   stalled_pr_resume: tests/test_stalled_pr_resume.sh
   credential_isolation: tests/test_credential_isolation.py
+  trusted_workflow_credentials:
+    - tests/test_trusted_workflow_boundaries.py
+    - tests/test_trusted_pr_event.cjs
+    - tests/test_dependabot_auto_merge.sh
+    - tests/test_dependabot_auto_merge_check_wait.sh
+    - tests/test_feedback_archive_relay_source.sh
+    - tests/test_feedback_archive_identities.sh
   cockpit_sync:
     - tests/test_cockpit_sync.py
     - tests/test_cockpit_sync_ui.cjs
