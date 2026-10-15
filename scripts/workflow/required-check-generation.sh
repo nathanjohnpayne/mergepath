@@ -20,10 +20,7 @@ rcg_open() { # repo pr full-head context; prints owned check id
   binding=$(rcg_binding "$repo" "$pr" "$head" "$context" "$revision") || return 1
   # Never retry an ambiguous POST: its response may have been lost after the
   # server opened a generation. An incomplete opening remains non-green.
-  reply=$(gh api -X POST "repos/$repo/check-runs" -f name="$context" \
-    -f head_sha="$head" -f status=in_progress \
-    -f "output[title]=$context (evaluation in progress)" \
-    -f "output[summary]=<!-- mergepath-generation:v1 $binding -->") || return 1
+  reply=$(gh api -X POST "repos/$repo/check-runs" -f name="$context" -f head_sha="$head" -f status=in_progress -f "output[title]=$context (evaluation in progress)" -f "output[summary]=<!-- mergepath-generation:v1 $binding -->") || return 1 # NO_BARE_GH_WRITE_EXEMPT: Actions-only owned Checks API generation under workflow GITHUB_TOKEN (checks:write), never interactive author/reviewer PATs.
   printf '%s\n' "$reply" | jq -er --arg head "$head" --arg context "$context" \
     --arg marker "<!-- mergepath-generation:v1 $binding -->" '
     select(.head_sha == $head and .name == $context and .status == "in_progress"
@@ -76,9 +73,8 @@ $summary"
   fi
   # Updating an older owned id cannot change its opening order. In particular,
   # a newer pending/failing generation wins even if it opens after these reads.
-  gh api -X PATCH "repos/$repo/check-runs/$id" -f status=completed \
-    -f conclusion="$conclusion" -f "output[title]=$title" \
-    -f "output[summary]=<!-- mergepath-generation:v1 $binding -->
-${summary:0:59000}" >/dev/null || return 1
+  summary="<!-- mergepath-generation:v1 $binding -->
+${summary:0:59000}"
+  gh api -X PATCH "repos/$repo/check-runs/$id" -f status=completed -f conclusion="$conclusion" -f "output[title]=$title" -f "output[summary]=$summary" >/dev/null || return 1 # NO_BARE_GH_WRITE_EXEMPT: Actions-only owned Checks API generation under workflow GITHUB_TOKEN (checks:write), never interactive author/reviewer PATs.
   [ "$failed" -eq 0 ]
 }

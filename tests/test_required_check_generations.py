@@ -7,9 +7,14 @@ from pathlib import Path
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
+
+# Import the production selector without leaving binary cache files in the
+# scripts tree scanned by repository source checks.
+sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE = ROOT / "scripts/workflow/coderabbit-evidence-recovery.py"
