@@ -67,6 +67,8 @@ make_case() {
   cp "$ROOT/scripts/workflow/external_review_fingerprint.sh" "$dir/state/base-fingerprint.sh"  # #2257: served at the base by the stub
   cp "$ROOT/scripts/workflow/match_protected_paths.sh" "$dir/state/base-matcher.sh"  # #2257: served at the base by the stub
   cp "$ROOT/scripts/workflow/parse_policy_list.sh" "$dir/state/base-parser.sh"  # #2257: served at the base by the stub
+  cp "$ROOT/scripts/workflow/match_protected_paths.sh" "$dir/scripts/workflow/match_protected_paths.sh"  # #2272: the copy that runs
+  cp "$ROOT/scripts/workflow/parse_policy_list.sh" "$dir/scripts/workflow/parse_policy_list.sh"  # #2272: the copy that runs
   chmod +x "$dir/scripts/workflow/resolve_base_policy.sh"
 
   cat >"$dir/.github/review-policy.yml" <<'EOF'
